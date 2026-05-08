@@ -151,6 +151,55 @@ async def test_fetch_chat_history_auto_does_not_backfill_without_force(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_fetch_chat_history_without_chat_stream_uses_latest_external_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """life_engine heartbeat 没有当前 chat_stream 时，应默认落到最近外部流。"""
+    tool = _make_tool()
+
+    monkeypatch.setattr(
+        "plugins.life_engine.tools.chat_history_tools._pick_latest_target_stream_id",
+        lambda _plugin: "latest-stream",
+    )
+
+    class _FakeQuery:
+        def __init__(self, _model: object) -> None:
+            self.filters: dict[str, Any] = {}
+
+        def filter(self, **kwargs: Any) -> "_FakeQuery":
+            self.filters.update(kwargs)
+            return self
+
+        async def first(self) -> Any:
+            assert self.filters["stream_id"] == "latest-stream"
+            return SimpleNamespace(
+                stream_id="latest-stream",
+                platform="qq",
+                chat_type="private",
+                group_id="",
+                group_name="",
+            )
+
+    monkeypatch.setattr("plugins.life_engine.tools.chat_history_tools.QueryBuilder", _FakeQuery)
+
+    candidates = await tool._resolve_stream_candidates(
+        stream_ids=[],
+        cross_stream=False,
+        platform="",
+    )
+
+    assert candidates == [
+        {
+            "stream_id": "latest-stream",
+            "platform": "qq",
+            "chat_type": "private",
+            "group_id": "",
+            "group_name": "",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_fetch_chat_history_local_db_no_backfill(monkeypatch: pytest.MonkeyPatch) -> None:
     """local_db 模式下不应触发回补。"""
     tool = _make_tool()

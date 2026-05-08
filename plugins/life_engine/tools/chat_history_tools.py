@@ -16,6 +16,7 @@ from src.kernel.db import QueryBuilder
 
 from ..core.config import LifeEngineConfig
 from ..service import LifeEngineService
+from ._utils import _pick_latest_target_stream_id
 
 logger = log_api.get_logger("life_engine.chat_history_tools")
 
@@ -145,7 +146,7 @@ class LifeEngineFetchChatHistoryTool(BaseTool):
 
     tool_name: str = "fetch_chat_history"
     tool_description: str = (
-        "检索聊天历史消息。默认只检索当前聊天流；需要跨流时必须显式传 cross_stream=true "
+        "检索聊天历史消息。默认只检索当前聊天流；如果当前不是聊天态，则自动选择最近外部聊天流。需要跨流时必须显式传 cross_stream=true "
         "或 stream_ids。支持关键词/正则、时间范围、上下文窗口。"
         "默认优先本地历史；只有 source_mode='napcat' 或 force_backfill=true 时才通过 NapCat 回补。"
     )
@@ -210,6 +211,8 @@ class LifeEngineFetchChatHistoryTool(BaseTool):
 
         if not cross_stream:
             target_stream = current_stream_id.strip()
+            if not target_stream:
+                target_stream = _pick_latest_target_stream_id(self.plugin) or ""
             if not target_stream:
                 return []
             record = await QueryBuilder(ChatStreams).filter(stream_id=target_stream).first()

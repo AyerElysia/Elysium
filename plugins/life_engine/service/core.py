@@ -1345,11 +1345,11 @@ class LifeEngineService(BaseService):
         content_type = str(event.content_type or "").strip().lower()
         source = str(event.source or "").strip().lower()
 
-        if current_stream_id and stream_id == current_stream_id:
-            return content_type != "text"
-
         if unified_chatter_context and stream_id:
             return True
+
+        if current_stream_id and stream_id == current_stream_id:
+            return content_type != "text"
 
         if content_type in {"heartbeat_reply", "chatter_inner_monologue", "tool_call", "tool_result"}:
             return True

@@ -402,11 +402,11 @@ async def test_life_chatter_unified_runtime_context_uses_global_cursor() -> None
     )
 
     assert "A_STREAM_EVENT" in first_text
-    assert "B_CURRENT_STREAM_TEXT" not in first_text
-    assert first_high_water == 1
-    assert service._state.chatter_context_cursors[LIFE_CHATTER_GLOBAL_CURSOR_KEY] == 1
+    assert "B_CURRENT_STREAM_TEXT" in first_text
+    assert first_high_water == 2
+    assert service._state.chatter_context_cursors[LIFE_CHATTER_GLOBAL_CURSOR_KEY] == 2
     assert second_text == ""
-    assert second_high_water == 1
+    assert second_high_water == 2
 
 
 @pytest.mark.asyncio
