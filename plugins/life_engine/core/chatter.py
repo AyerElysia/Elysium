@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import threading
 from collections import deque
@@ -24,6 +25,8 @@ from src.core.models.message import Message, MessageType
 from src.kernel.llm import Audio, Content, Image, LLMPayload, ROLE, Text, ToolResult, Video
 from src.kernel.logger import get_logger, COLOR
 from ..memory.prompting import load_memory_prompt_data, render_memory_prompt
+from ..constants import LIFE_CHATTER_GLOBAL_CURSOR_KEY
+from .chat_history import build_chat_history_text, message_flag
 from .multimodal import (
     MediaBudget,
     MediaItem,
@@ -42,12 +45,31 @@ _T = TypeVar("_T")
 # ── 控制流常量 ────────────────────────────────────────────────
 _PASS_AND_WAIT = "action-life_pass_and_wait"
 _SEND_TEXT = "action-life_send_text"
+_SEND_FILE = "action-life_send_file"
 _SEND_EMOJI_MEME = "action-send_emoji_meme"
 _RECORD_INNER_MONOLOGUE = "action-record_inner_monologue"
 _SUSPEND_TEXT = "__SUSPEND__"
+_MAX_PLAIN_TEXT_RETRIES = 2
 _MAX_THINK_ONLY_RETRIES = 2
 _MAX_MUST_REPLY_RETRIES = 2
 _MAX_INNER_MONOLOGUE_RETRIES = 2
+_PLAIN_TEXT_RETRY_REMINDER = (
+    "（系统提醒：上一轮你直接输出了普通文本，而不是 action/tool call，这在当前对话器中无效。"
+    "请立刻改为返回可执行 action 列表，不要再直接输出解释文本。"
+    "如果决定回复用户，必须使用 action-life_send_text，"
+    "并把回复写得自然、具体、充实；"
+    "如果需要拒绝，也要通过 action-life_send_text 给出明确边界、原因和可行替代建议，"
+    "不要只给一句笼统的“高风险/不能做”。"
+    "如果本轮确实无需回复，再使用 action-life_pass_and_wait。）"
+)
+_PLAIN_TEXT_RETRY_REMINDER_STRICT = (
+    "（最后提醒：你又一次直接输出了普通文本。"
+    "本轮必须返回合法 action，而不是自然语言解释。"
+    "允许的收敛路径只有两种："
+    "A) 用 action-life_send_text 给用户一条自然、具体、充实的回复/拒绝说明；"
+    "B) 确实无需回复时使用 action-life_pass_and_wait。"
+    "不要再次只输出一句抽象拒绝或风险提示。）"
+)
 _THINK_ONLY_RETRY_REMINDER = (
     "（系统阻断：本轮仅调用了 action-think，属于无效轮次。"
     "你现在必须立刻二选一重发 action 列表："
@@ -179,6 +201,7 @@ class _WorkflowRuntime:
     pending_transient_context_text: str = ""
     pending_life_context_high_water: int = 0
     media_seen: set[str] = field(default_factory=set)
+    active_stream_id: str = ""
 
 
 # ── Actions ───────────────────────────────────────────────────
@@ -427,6 +450,134 @@ class LifeSendTextAction(BaseAction):
         return True, f"已发送{sent_count}条消息: {preview}"
 
 
+class LifeSendFileAction(BaseAction):
+    """发送本地文件（life_chatter 专用）。"""
+
+    action_name = "life_send_file"
+    action_description = (
+        "发送本地文件给当前聊天流。"
+        "path 必须是一个本地文件的绝对路径，或以 ~ 开头的用户目录路径。"
+        "只支持发送单个普通文件，不支持目录、通配符或多个文件。"
+        "如果需要解释文件内容或补一句话，另行调用 life_send_text。"
+    )
+    chatter_allow: list[str] = ["life_chatter"]
+    MAX_FILE_BYTES: int = 100 * 1024 * 1024
+
+    @classmethod
+    def _resolve_sendable_file(cls, raw_path: str) -> tuple[Path | None, str]:
+        path_text = str(raw_path or "").strip()
+        if not path_text:
+            return None, "文件路径为空"
+        if any(char in path_text for char in "*?[]"):
+            return None, "文件路径不能包含通配符"
+        if not (path_text.startswith("~") or Path(path_text).is_absolute()):
+            return None, "文件路径必须是绝对路径，或以 ~ 开头"
+
+        try:
+            resolved = Path(path_text).expanduser().resolve()
+        except Exception as exc:  # noqa: BLE001
+            return None, f"文件路径无效: {exc}"
+
+        if not resolved.exists():
+            return None, f"文件不存在: {resolved}"
+        if not resolved.is_file():
+            return None, f"不是普通文件: {resolved}"
+        if not os.access(resolved, os.R_OK):
+            return None, f"文件不可读: {resolved}"
+
+        try:
+            size = resolved.stat().st_size
+        except OSError as exc:
+            return None, f"读取文件信息失败: {exc}"
+        if size > cls.MAX_FILE_BYTES:
+            return None, (
+                f"文件过大: {cls._format_file_size(size)}，"
+                f"上限 {cls._format_file_size(cls.MAX_FILE_BYTES)}"
+            )
+        return resolved, ""
+
+    @staticmethod
+    def _format_file_size(size: int) -> str:
+        value = float(max(0, int(size)))
+        for unit in ("B", "KB", "MB", "GB"):
+            if value < 1024 or unit == "GB":
+                if unit == "B":
+                    return f"{int(value)}{unit}"
+                return f"{value:.1f}{unit}"
+            value /= 1024
+        return f"{value:.1f}GB"
+
+    async def execute(
+        self,
+        path: Annotated[
+            str,
+            "要发送的本地文件路径。必须是绝对路径，或以 ~ 开头；只支持单个普通文件。",
+        ],
+    ) -> tuple[bool, str]:
+        resolved, error = self._resolve_sendable_file(path)
+        if resolved is None:
+            return False, error
+
+        platform = self.chat_stream.platform
+        chat_type = self.chat_stream.chat_type
+        target_stream_id = self.chat_stream.stream_id
+        context = self.chat_stream.context
+
+        from src.core.managers.adapter_manager import get_adapter_manager
+        from src.core.transport.message_send import get_message_sender
+        from uuid import uuid4
+
+        bot_info = await get_adapter_manager().get_bot_info_by_platform(platform)
+        last_msg = self._get_context_message_for_target()
+
+        target_user_id = None
+        target_user_name = None
+        target_group_id = None
+        target_group_name = None
+        if chat_type == "group":
+            if last_msg:
+                last_extra = getattr(last_msg, "extra", {}) or {}
+                target_group_id = last_extra.get("group_id") or last_extra.get("target_group_id")
+                target_group_name = last_extra.get("group_name") or last_extra.get("target_group_name")
+        else:
+            target_user_id, target_user_name = await self._resolve_private_target_from_context(
+                context,
+                last_msg,
+            )
+
+        extra: dict[str, str] = {
+            "file_name": resolved.name,
+            "file_size": str(resolved.stat().st_size),
+        }
+        if target_user_id:
+            extra["target_user_id"] = str(target_user_id)
+        if target_user_name:
+            extra["target_user_name"] = str(target_user_name)
+        if target_group_id:
+            extra["target_group_id"] = str(target_group_id)
+        if target_group_name:
+            extra["target_group_name"] = str(target_group_name)
+
+        display_text = f"[发送文件] {resolved.name}"
+        message = Message(
+            message_id=f"action_{self.action_name}_{uuid4().hex}",
+            content={"path": str(resolved)},
+            processed_plain_text=display_text,
+            message_type=MessageType.FILE,
+            sender_id=bot_info.get("bot_id", "") if bot_info else "",
+            sender_name=bot_info.get("bot_name", "Bot") if bot_info else "Bot",
+            platform=platform,
+            chat_type=chat_type,
+            stream_id=target_stream_id,
+        )
+        message.extra.update(extra)
+
+        success = await get_message_sender().send_message(message)
+        if not success:
+            return False, f"文件发送失败: {resolved.name}"
+        return True, f"已发送文件: {resolved.name}"
+
+
 class LifePassAndWaitAction(BaseAction):
     """跳过本次动作，等待新消息（life_chatter 专用）。"""
 
@@ -452,8 +603,67 @@ class LifeChatter(BaseChatter):
     associated_platforms: list[str] = []
     chat_type: ChatType = ChatType.ALL
     dependencies: list[str] = []
+    global_runtime_key: str = LIFE_CHATTER_GLOBAL_CURSOR_KEY
+
+    _GLOBAL_RUNTIME_LOCK: asyncio.Lock | None = None
+    _GLOBAL_RUNTIME_LOCK_LOOP: asyncio.AbstractEventLoop | None = None
+    _GLOBAL_RUNTIME: _WorkflowRuntime | None = None
+    _GLOBAL_USABLE_MAP: Any | None = None
 
     # ── helpers ──────────────────────────────────────────────
+
+    @classmethod
+    def _get_global_runtime_lock(cls) -> asyncio.Lock:
+        """返回 life_chatter 全局运行态锁。
+
+        多个聊天流仍会各自唤醒 stream loop，但它们必须串行推进同一条
+        LLM payload 链，避免同一主意识被并发写入。
+        """
+        loop = asyncio.get_running_loop()
+        if cls._GLOBAL_RUNTIME_LOCK is None or cls._GLOBAL_RUNTIME_LOCK_LOOP is not loop:
+            cls._GLOBAL_RUNTIME_LOCK = asyncio.Lock()
+            cls._GLOBAL_RUNTIME_LOCK_LOOP = loop
+        return cls._GLOBAL_RUNTIME_LOCK
+
+    @classmethod
+    def reset_global_runtime(cls) -> None:
+        """清空 life_chatter 全局 LLM 上下文。插件卸载或测试可调用。"""
+        cls._GLOBAL_RUNTIME = None
+        cls._GLOBAL_USABLE_MAP = None
+
+    async def _get_or_create_global_runtime(
+        self,
+        service: LifeEngineService | None,
+        chat_stream: ChatStream,
+    ) -> tuple[_WorkflowRuntime, Any]:
+        """懒创建统一主意识的 LLM 请求、工具注册表和 FSM 状态。"""
+        if self.__class__._GLOBAL_RUNTIME is not None and self.__class__._GLOBAL_USABLE_MAP is not None:
+            return self.__class__._GLOBAL_RUNTIME, self.__class__._GLOBAL_USABLE_MAP
+
+        request = self.create_request("actor", request_name="life_chatter")
+
+        # System prompt 只放主体人格和全局工具规则，不绑定任何具体聊天流。
+        # 直播/私聊/群聊等场景提示放到每轮 USER prompt 中，避免第一条消息的
+        # stream 类型污染后续所有流。
+        system_text = self._build_chat_system_prompt(service, None)
+        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_text)))
+
+        # 工具 schema 仍需一个现实聊天流用于 go_activate / adapter capability 判断；
+        # 后续真正执行 Action 时会用 trigger_msg 恢复当前来源 stream。
+        self._active_chat_stream = chat_stream
+        usable_map = await self.inject_usables(request)
+
+        runtime = _WorkflowRuntime(
+            response=request,
+            phase=_Phase.WAIT_USER,
+            history_merged=False,
+            unreads=[],
+            cross_round_seen_signatures=set(),
+            unread_msgs_to_flush=[],
+        )
+        self.__class__._GLOBAL_RUNTIME = runtime
+        self.__class__._GLOBAL_USABLE_MAP = usable_map
+        return runtime, usable_map
 
     def _get_life_service(self) -> LifeEngineService | None:
         """获取 life_engine 服务实例。"""
@@ -538,9 +748,11 @@ class LifeChatter(BaseChatter):
 
         from src.core.managers import get_stream_manager
 
-        chat_stream = await get_stream_manager().get_or_create_stream(
-            stream_id=self.stream_id
-        )
+        chat_stream = getattr(self, "_active_chat_stream", None)
+        if chat_stream is None:
+            chat_stream = await get_stream_manager().get_or_create_stream(
+                stream_id=self.stream_id
+            )
         if not self._is_live_stream(chat_stream):
             return available
 
@@ -664,8 +876,11 @@ class LifeChatter(BaseChatter):
             "- 如果你准备回复用户，`action-think` 必须和至少一个可执行动作同轮出现，通常是 `life_send_text`。\n"
             "- 不要只调用 `action-think`；如果本轮决定不回复，就直接用 `action-life_pass_and_wait`，不要调用 think。\n"
             "- 需要直接给用户发文字时，使用 `life_send_text`。\n"
+            "- 需要发送本地文件时，使用 `life_send_file`；需要解释文件时另用 `life_send_text`。\n"
             "- `content` 只能写给用户看的纯文本正文；长内容可用 `content` 数组分段发送。\n"
+            "- 需要查看或操作电脑终端、执行脚本或处理文件系统时，调用 `nucleus_bash`。\n"
             "- 需要了解 Ayer 当前电脑屏幕时，调用 `nucleus_view_screen`，不要凭空猜屏幕内容。\n"
+            "- 需要把承诺落地时，可用 `nucleus_manage_todo` 创建 TODO；必须写清 `next_action` 和复盘/提醒时间，shared TODO 创建后要自然告诉用户。\n"
             "- 不要把 `reason`、`thought` 等元信息写进 `content`。"
         )
 
@@ -710,6 +925,7 @@ class LifeChatter(BaseChatter):
         chat_stream: ChatStream,
         service: LifeEngineService | None,
         runtime_context_text: str = "",
+        include_recent_chat_history: bool = True,
     ) -> tuple[str, int]:
         """构建仅本次请求可见的 life 运行态快照。"""
         if service is None:
@@ -727,6 +943,8 @@ class LifeChatter(BaseChatter):
         context_text, high_water = await service.build_chatter_runtime_context(
             chat_stream,
             runtime_context_text=runtime_context_text,
+            unified_chatter_context=True,
+            include_recent_chat_history=include_recent_chat_history,
         )
         if not context_text:
             return "", high_water
@@ -813,32 +1031,16 @@ class LifeChatter(BaseChatter):
         chat_stream: ChatStream,
         *,
         max_messages: int | None = 30,
+        global_history: bool = False,
+        stream_manager: Any | None = None,
     ) -> str:
-        """从 chat_stream 构建历史消息文本。"""
-        context = chat_stream.context
-        history_msgs = list(context.history_messages) if context.history_messages else []
-        if not history_msgs:
-            return ""
-
-        history_msgs = [
-            msg
-            for msg in history_msgs
-            if not (
-                LifeChatter._message_flag(msg, "is_inner_monologue")
-                or LifeChatter._message_flag(msg, "is_proactive_opportunity_trigger")
-                or LifeChatter._message_flag(msg, "is_proactive_followup_trigger")
-            )
-        ]
-        if not history_msgs:
-            return ""
-
-        if max_messages is not None:
-            if max_messages <= 0:
-                return ""
-            history_msgs = history_msgs[-max_messages:]
-
-        lines = [BaseChatter.format_message_line(msg) for msg in history_msgs]
-        return "\n".join(lines)
+        """构建聊天历史文本；统一模式下按全局时间线合并多个聊天流。"""
+        return build_chat_history_text(
+            chat_stream,
+            max_messages=max_messages,
+            global_history=global_history,
+            stream_manager=stream_manager,
+        )
 
     def _get_initial_history_message_limit(self) -> int | None:
         """读取首轮 chat_history 注入条数。
@@ -926,9 +1128,13 @@ class LifeChatter(BaseChatter):
     @staticmethod
     def _transition(rt: _WorkflowRuntime, to_phase: _Phase, reason: str) -> None:
         if rt.phase == to_phase:
+            if to_phase == _Phase.WAIT_USER:
+                rt.active_stream_id = ""
             return
         logger.debug(f"[FSM] {rt.phase.value} -> {to_phase.value}: {reason}")
         rt.phase = to_phase
+        if to_phase == _Phase.WAIT_USER:
+            rt.active_stream_id = ""
 
     @staticmethod
     def _upsert_pending_unread_payload(
@@ -1074,12 +1280,7 @@ class LifeChatter(BaseChatter):
 
     @staticmethod
     def _message_flag(message: Message, flag_name: str) -> bool:
-        if bool(getattr(message, flag_name, False)):
-            return True
-        extra = getattr(message, "extra", None)
-        if isinstance(extra, dict):
-            return bool(extra.get(flag_name, False))
-        return False
+        return message_flag(message, flag_name)
 
     @classmethod
     def _is_proactive_trigger_message(cls, message: Message) -> bool:
@@ -1147,6 +1348,33 @@ class LifeChatter(BaseChatter):
         logger.warning("检测到本轮仅调用 action-think，已注入系统阻断提醒并触发重试")
 
     @staticmethod
+    def _append_plain_text_retry_instruction(
+        response: Any,
+        *,
+        response_text: str,
+        retry_count: int = 1,
+    ) -> None:
+        reminder = (
+            _PLAIN_TEXT_RETRY_REMINDER_STRICT
+            if retry_count >= _MAX_PLAIN_TEXT_RETRIES
+            else _PLAIN_TEXT_RETRY_REMINDER
+        )
+        snippet = str(response_text or "").strip()
+        if len(snippet) > 120:
+            snippet = snippet[:117] + "..."
+        response.add_payload(
+            LLMPayload(
+                ROLE.USER,
+                Text(
+                    f"（上一轮无效纯文本示例：{snippet}）\n{reminder}"
+                    if snippet
+                    else reminder
+                ),
+            )
+        )
+        logger.warning("检测到 life_chatter 返回纯文本，已注入充实回复提醒并触发重试")
+
+    @staticmethod
     def _should_encourage_segment_send(call_name: str, call_args: dict[str, object]) -> bool:
         if call_name != _SEND_TEXT:
             return False
@@ -1179,6 +1407,7 @@ class LifeChatter(BaseChatter):
         normalized = str(call_name or "").strip().lower()
         return normalized in {
             _SEND_TEXT,
+            _SEND_FILE,
             _SEND_EMOJI_MEME,
             "action-draw_image",
             "action-generate_selfie",
@@ -1202,6 +1431,7 @@ class LifeChatter(BaseChatter):
             "think",
             _RECORD_INNER_MONOLOGUE,
             _SEND_TEXT,
+            _SEND_FILE,
             _SEND_EMOJI_MEME,
             _PASS_AND_WAIT,
         }
@@ -1241,6 +1471,30 @@ class LifeChatter(BaseChatter):
             return raw_results
         return []
 
+    @staticmethod
+    def _is_tool_call_blocked_for_trigger(
+        call: Any,
+        usable_map: Any,
+        trigger_msg: Message | None,
+    ) -> bool:
+        """按当前触发消息做最终工具屏蔽。
+
+        统一主意识的工具 registry 只注入一次；这里补一层执行期过滤，避免
+        后续切换到直播等特殊 stream 时沿用第一条流的工具可用性。
+        """
+        if str(getattr(trigger_msg, "platform", "") or "").strip().lower() != "live":
+            return False
+
+        try:
+            usable_cls = usable_map.get(getattr(call, "name", ""))
+        except Exception:
+            usable_cls = None
+        if usable_cls is None:
+            return False
+
+        signature = getattr(usable_cls, "get_signature", lambda: None)()
+        return str(signature or "") in _LIVE_BRIDGE_BLOCKED_USABLE_SIGNATURES
+
     async def run_tool_call(
         self,
         call: Any,
@@ -1251,10 +1505,47 @@ class LifeChatter(BaseChatter):
         """执行工具；兼容单调用和批量调用，并压缩低信息动作回执。"""
         is_batch = isinstance(call, list)
         call_list = list(call) if is_batch else [call]
-        raw_results = await self._await_with_watchdog_keepalive(
-            super().run_tool_call(call_list, response, usable_map, trigger_msg)
-        )
-        results = list(raw_results or [])
+        blocked_calls = [
+            current_call
+            for current_call in call_list
+            if self._is_tool_call_blocked_for_trigger(
+                current_call,
+                usable_map,
+                trigger_msg,
+            )
+        ]
+        if blocked_calls:
+            results = []
+            for current_call in call_list:
+                call_name = str(getattr(current_call, "name", "") or "")
+                if self._is_tool_call_blocked_for_trigger(
+                    current_call,
+                    usable_map,
+                    trigger_msg,
+                ):
+                    response.add_payload(
+                        LLMPayload(
+                            ROLE.TOOL_RESULT,
+                            ToolResult(
+                                value="当前直播桥接场景已屏蔽该工具，请改用文字回复。",
+                                call_id=getattr(current_call, "id", ""),
+                                name=call_name,
+                            ),
+                        )
+                    )
+                    results.append((True, False))
+                    continue
+
+                raw_result = await self._await_with_watchdog_keepalive(
+                    super().run_tool_call([current_call], response, usable_map, trigger_msg)
+                )
+                normalized = self._normalize_tool_execution_results(raw_result, 1)
+                results.append(normalized[0] if normalized else (False, False))
+        else:
+            raw_results = await self._await_with_watchdog_keepalive(
+                super().run_tool_call(call_list, response, usable_map, trigger_msg)
+            )
+            results = list(raw_results or [])
 
         for current_call, (appended, success) in zip(call_list, results, strict=False):
             call_name = str(getattr(current_call, "name", "") or "")
@@ -1270,54 +1561,27 @@ class LifeChatter(BaseChatter):
 
     # ── main execute ─────────────────────────────────────────
 
-    async def execute(self) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:
-        """执行聊天器的主要逻辑。"""
-        from src.core.managers.stream_manager import get_stream_manager
+    async def _drive_global_runtime_until_yield(
+        self,
+        chat_stream: ChatStream,
+        service: LifeEngineService | None,
+    ) -> Wait | Success | Failure | Stop:
+        """在全局锁内推进统一 life_chatter runtime，直到需要向驱动器 yield。"""
         from src.kernel.concurrency import get_watchdog
 
-        stream_manager = get_stream_manager()
-        chat_stream = await stream_manager.activate_stream(self.stream_id)
-        if chat_stream is None:
-            logger.error(f"无法激活聊天流: {self.stream_id}")
-            yield Failure("无法激活聊天流")
-            return
-
-        service = self._get_life_service()
-
-        # 创建 LLM 请求
-        try:
-            request = self.create_request("actor", request_name="life_chatter")
-        except (ValueError, KeyError) as e:
-            logger.error(f"获取模型配置失败: {e}")
-            yield Failure(f"模型配置错误: {e}")
-            return
-
-        # System prompt: 静态人格/规则（内含场景引导）
-        system_text = self._build_chat_system_prompt(service, chat_stream)
-        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_text)))
-
-        # 历史文本只在首轮合并一次；后续依赖长连接 payload 中的真实对话链。
-        history_text = self._build_history_text(
-            chat_stream,
-            max_messages=self._get_initial_history_message_limit(),
-        )
-
-        # 注入工具
-        usable_map = await self.inject_usables(request)
-
-        # 初始化运行时
-        rt = _WorkflowRuntime(
-            response=request,
-            phase=_Phase.WAIT_USER,
-            history_merged=False,
-            unreads=[],
-            cross_round_seen_signatures=set(),
-            unread_msgs_to_flush=[],
-        )
-
+        self._active_chat_stream = chat_stream
+        rt, usable_map = await self._get_or_create_global_runtime(service, chat_stream)
+        stream_id = str(getattr(chat_stream, "stream_id", "") or self.stream_id or "").strip()
+        if rt.phase != _Phase.WAIT_USER:
+            active_stream_id = str(getattr(rt, "active_stream_id", "") or "").strip()
+            if active_stream_id and active_stream_id != stream_id:
+                return Wait()
+            if not active_stream_id:
+                rt.active_stream_id = stream_id
         max_rounds = self._get_max_rounds()
 
         while True:
+            # 每次循环都刷新当前来源流，避免等待全局锁期间新增/flush 状态变化。
             _, unread_msgs = await self.fetch_unreads()
 
             # 安全兜底
@@ -1327,8 +1591,7 @@ class LifeChatter(BaseChatter):
             # ── WAIT_USER ────────────────────────────────
             if rt.phase == _Phase.WAIT_USER:
                 if not unread_msgs:
-                    yield Wait()
-                    continue
+                    return Wait()
 
                 rt.cross_round_seen_signatures.clear()
                 rt.plain_text_retry_count = 0
@@ -1355,18 +1618,25 @@ class LifeChatter(BaseChatter):
                     rt.must_reply = False
                     rt.must_reply_retry_count = 0
                     await self.flush_unreads(unread_msgs)
-                    yield Wait()
-                    continue
+                    return Wait()
 
                 runtime_context_text = self._format_runtime_context_text(
                     self._consume_runtime_assistant_context(chat_stream)
                 )
+                rt.active_stream_id = stream_id
+
+                history_text = self._build_history_text(
+                    chat_stream,
+                    max_messages=self._get_initial_history_message_limit(),
+                    global_history=True,
+                )
+                include_history_in_prompt = bool(history_text and not rt.history_merged)
 
                 # 构建 user prompt
                 user_prompt_text = self._build_chat_user_prompt(
                     chat_stream,
                     unread_lines=unread_lines,
-                    history_text=history_text if not rt.history_merged else "",
+                    history_text=history_text if include_history_in_prompt else "",
                 )
                 (
                     rt.pending_transient_context_text,
@@ -1375,6 +1645,7 @@ class LifeChatter(BaseChatter):
                     chat_stream,
                     service,
                     runtime_context_text=runtime_context_text,
+                    include_recent_chat_history=not include_history_in_prompt,
                 )
 
                 self._upsert_pending_unread_payload(
@@ -1419,6 +1690,7 @@ class LifeChatter(BaseChatter):
                             await service.mark_chatter_runtime_context_seen(
                                 chat_stream.stream_id,
                                 rt.pending_life_context_high_water,
+                                unified_chatter_context=True,
                             )
                             await service._save_runtime_context()
                         rt.pending_life_context_high_water = 0
@@ -1433,9 +1705,8 @@ class LifeChatter(BaseChatter):
                 except Exception as error:
                     self._strip_transient_context(rt.response)
                     logger.error(f"LLM 请求失败: {error}", exc_info=True)
-                    yield Failure("LLM 请求失败", error)
                     self._transition(rt, _Phase.WAIT_USER, "request failed")
-                    continue
+                    return Failure("LLM 请求失败", error)
 
                 self._transition(rt, _Phase.TOOL_EXEC, "model responded")
                 continue
@@ -1458,6 +1729,18 @@ class LifeChatter(BaseChatter):
                             logger.warning(
                                 f"LLM 返回了纯文本而非 tool call: {response_text[:100]}"
                             )
+                            rt.plain_text_retry_count += 1
+                            self._append_plain_text_retry_instruction(
+                                llm_response,
+                                response_text=response_text,
+                                retry_count=rt.plain_text_retry_count,
+                            )
+                            if rt.plain_text_retry_count <= _MAX_PLAIN_TEXT_RETRIES:
+                                self._transition(rt, _Phase.FOLLOW_UP, "plain-text guard retry")
+                                continue
+                            logger.warning("纯文本回退达到重试上限，本轮回到等待")
+                    else:
+                        rt.plain_text_retry_count = 0
                     # 不再 yield Stop 销毁生成器：保留累积的 payload 上下文，
                     # 回到 Wait 等待新消息，避免整个 LLM 对话链被清零。
                     # 补 ASSISTANT 占位：TOOL_RESULT 尾部必须接 ASSISTANT 才能接 USER。
@@ -1465,9 +1748,8 @@ class LifeChatter(BaseChatter):
                         llm_response.add_payload(
                             LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT))
                         )
-                    yield Wait()
                     self._transition(rt, _Phase.WAIT_USER, "no call_list")
-                    continue
+                    return Wait()
 
                 logger.info(f"本轮调用: {[c.name for c in call_list]}")
 
@@ -1575,7 +1857,7 @@ class LifeChatter(BaseChatter):
                                 LLMPayload(
                                     ROLE.TOOL_RESULT,
                                     ToolResult(
-                                        value="当前轮已判定需要回复，不能 pass_and_wait；请改为 life_send_text。",
+                                        value="当前轮已判定需要回复，不能 pass_and_wait；请改为 life_send_text 或 life_send_file。",
                                         call_id=call.id,
                                         name=call_name,
                                     ),
@@ -1663,9 +1945,8 @@ class LifeChatter(BaseChatter):
                     # 补 ASSISTANT 占位防止下一轮误判
                     if self._has_tool_result_tail(llm_response):
                         llm_response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
-                    yield Wait()
                     self._transition(rt, _Phase.WAIT_USER, "pass_and_wait")
-                    continue
+                    return Wait()
 
                 # 全部为 action 时补 SUSPEND
                 if call_list and all(c.name.startswith("action-") for c in call_list):
@@ -1673,3 +1954,46 @@ class LifeChatter(BaseChatter):
 
                 self._transition(rt, _Phase.WAIT_USER, "tool exec done")
                 continue
+
+    async def execute(self) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:
+        """执行聊天器的主要逻辑。
+
+        每个聊天流仍由自己的 stream loop 唤醒，但所有 life_chatter 实例共享
+        一个全局 LLM runtime；全局锁确保同一时间只有一个来源流推进主意识。
+        """
+        from src.core.managers.stream_manager import get_stream_manager
+
+        stream_manager = get_stream_manager()
+        service = self._get_life_service()
+
+        while True:
+            chat_stream = await stream_manager.activate_stream(self.stream_id)
+            if chat_stream is None:
+                logger.error(f"无法激活聊天流: {self.stream_id}")
+                yield Failure("无法激活聊天流")
+                return
+
+            # 无未读时不争抢全局锁，让其它聊天流可以立刻推进共享主意识。
+            _, unread_msgs = await self.fetch_unreads()
+            rt = self.__class__._GLOBAL_RUNTIME
+            if rt is not None and rt.phase != _Phase.WAIT_USER:
+                active_stream_id = str(getattr(rt, "active_stream_id", "") or "").strip()
+                if active_stream_id and active_stream_id != self.stream_id:
+                    yield Wait()
+                    continue
+            elif not unread_msgs:
+                yield Wait()
+                continue
+
+            lock = self._get_global_runtime_lock()
+            async with lock:
+                try:
+                    result = await self._drive_global_runtime_until_yield(
+                        chat_stream,
+                        service,
+                    )
+                except (ValueError, KeyError) as error:
+                    logger.error(f"获取模型配置失败: {error}")
+                    result = Failure(f"模型配置错误: {error}")
+
+            yield result

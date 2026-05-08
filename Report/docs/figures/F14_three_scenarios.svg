@@ -57,7 +57,7 @@
       <text x="120" y="625" font-size="10" fill="#5A5A6E">• 无明显情绪变化</text>
       <text x="120" y="645" font-size="10" fill="#5A5A6E">• 主动询问，保持参与感</text>
       <text x="120" y="670" font-size="9" fill="#9B9BAA">传统系统：无差异</text>
-      <text x="120" y="687" font-size="9" fill="#4CAF50" font-weight="600">Neo-MoFox：微调语气</text>
+      <text x="120" y="687" font-size="9" fill="#4CAF50" font-weight="600">Neo-MoFox-Soul：微调语气</text>
     </g>
   </g>
 
@@ -98,7 +98,7 @@
       <text x="555" y="625" font-size="10" fill="#5A5A6E">  （可能是做梦/离线巩固）</text>
       <text x="555" y="645" font-size="10" fill="#5A5A6E">• 唤醒需要 2-3 个心跳周期</text>
       <text x="555" y="670" font-size="9" fill="#9B9BAA">传统系统：无差异</text>
-      <text x="555" y="687" font-size="9" fill="#F9A825" font-weight="600">Neo-MoFox：明显情感变化</text>
+      <text x="555" y="687" font-size="9" fill="#F9A825" font-weight="600">Neo-MoFox-Soul：明显情感变化</text>
     </g>
   </g>
 
@@ -139,14 +139,14 @@
       <text x="990" y="625" font-size="10" fill="#5A5A6E">• 可能触发了做梦机制</text>
       <text x="990" y="645" font-size="10" fill="#5A5A6E">• 调质大幅刷新，能量恢复</text>
       <text x="990" y="670" font-size="9" fill="#9B9BAA">传统系统：无差异</text>
-      <text x="990" y="687" font-size="9" fill="#8E24AA" font-weight="600">Neo-MoFox：离线巩固生效</text>
+      <text x="990" y="687" font-size="9" fill="#8E24AA" font-weight="600">Neo-MoFox-Soul：离线巩固生效</text>
     </g>
   </g>
 
   <!-- Bottom summary -->
   <g>
     <rect x="80" y="755" width="1240" height="35" rx="8" fill="#FFF8E1" stroke="#F57F17" stroke-width="1.5"/>
-    <text x="700" y="777" text-anchor="middle" font-size="12" fill="#3D3D4E">对比总结：传统系统在任意时长后响应无差异；Neo-MoFox 的状态衰减使时间流逝"可见"，3hr 场景可触发做梦机制。</text>
+    <text x="700" y="777" text-anchor="middle" font-size="12" fill="#3D3D4E">对比总结：传统系统在任意时长后响应无差异；Neo-MoFox-Soul 的状态衰减使时间流逝"可见"，3hr 场景可触发做梦机制。</text>
   </g>
 
   <text x="700" y="795" text-anchor="middle" font-size="11" fill="#9B9BAA" font-style="italic">Figure F14 · Three Scenarios: State Evolution under 5min / 30min / 3hr User Absence</text>

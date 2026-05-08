@@ -16,7 +16,7 @@
   <rect width="1600" height="900" fill="url(#bgGrad)"/>
 
   <text x="800" y="45" text-anchor="middle" font-size="30" font-weight="700" fill="#2D2D3E">同行对比矩阵 · 15 系统 × 7 维度</text>
-  <text x="800" y="78" text-anchor="middle" font-size="14" fill="#6B6B7E">✓ 完全支持 · ◐ 部分支持 · ✗ 不支持 · Neo-MoFox 行高亮</text>
+  <text x="800" y="78" text-anchor="middle" font-size="14" fill="#6B6B7E">✓ 完全支持 · ◐ 部分支持 · ✗ 不支持 · Neo-MoFox-Soul 行高亮</text>
 
   <!-- Table structure: header row + 15 data rows -->
   <!-- Column widths: 200, 150, 150, 150, 150, 150, 150, 150 = 1400 total -->
@@ -218,10 +218,10 @@
     <text x="1400" y="725" text-anchor="middle" font-size="11" fill="#6B6B7E">开源研究</text>
   </g>
 
-  <!-- Row 15: Neo-MoFox - HIGHLIGHTED -->
+  <!-- Row 15: Neo-MoFox-Soul - HIGHLIGHTED -->
   <g filter="url(#softShadow)">
     <rect x="100" y="740" width="1400" height="50" fill="#FFD700" stroke="#E91E63" stroke-width="3"/>
-    <text x="300" y="770" text-anchor="middle" font-size="14" font-weight="700" fill="#880E4F">🌟 Neo-MoFox</text>
+    <text x="300" y="770" text-anchor="middle" font-size="14" font-weight="700" fill="#880E4F">🌟 Neo-MoFox-Soul</text>
     <text x="500" y="770" text-anchor="middle" font-size="18" fill="#4CAF50">✓</text>
     <text x="650" y="770" text-anchor="middle" font-size="18" fill="#4CAF50">✓</text>
     <text x="800" y="770" text-anchor="middle" font-size="18" fill="#4CAF50">✓</text>
@@ -234,9 +234,9 @@
   <!-- Bottom note -->
   <g>
     <rect x="100" y="820" width="1400" height="60" rx="8" fill="#FFF8E1" stroke="#F57F17" stroke-width="1.5"/>
-    <text x="800" y="845" text-anchor="middle" font-size="13" font-weight="600" fill="#2D2D3E">对比总结：Neo-MoFox 是唯一集成"连续运行 + SNN + 在线学习 + 做梦 + 调质 ODE + 多模态"的完整框架</text>
+    <text x="800" y="845" text-anchor="middle" font-size="13" font-weight="600" fill="#2D2D3E">对比总结：Neo-MoFox-Soul 是唯一集成"连续运行 + SNN + 在线学习 + 做梦 + 调质 ODE + 多模态"的完整框架</text>
     <text x="800" y="865" text-anchor="middle" font-size="11" fill="#6B6B7E">其创新本质为系统层级涌现性（System-Level Emergent Intelligence），而非单一维度超越。</text>
   </g>
 
-  <text x="800" y="895" text-anchor="middle" font-size="11" fill="#9B9BAA" font-style="italic">Figure F16 · Comparison Matrix: 15 Systems × 7 Core Dimensions with Neo-MoFox Highlighted</text>
+  <text x="800" y="895" text-anchor="middle" font-size="11" fill="#9B9BAA" font-style="italic">Figure F16 · Comparison Matrix: 15 Systems × 7 Core Dimensions with Neo-MoFox-Soul Highlighted</text>
 </svg>

@@ -1,4 +1,4 @@
-site_name: "Neo-MoFox 课程报告"
+site_name: "Neo-MoFox-Soul 课程报告"
 site_description: "面向自主 Agent 的连续感知-决策-执行系统架构 · 《智能感知与无人系统》课程报告"
 site_author: "Elysia (爱莉希雅)"
 site_url: "https://neo-mofox.github.io/report"
@@ -102,21 +102,21 @@ nav:
     - 第 3 章 · 三条工程约束: chapters/03_three_principles.md
   - 第二部分 · 系统架构:
     - 第 4 章 · 工程系统总览: chapters/04_system_overview.md
-  - 第三部分 · 子系统:
-    - 第 5 章 · 脉冲神经网络: chapters/05_snn.md
-    - 第 6 章 · 神经调质与昼夜节律: chapters/06_neuromodulation.md
-    - 第 7 章 · 记忆系统: chapters/07_memory.md
-    - 第 8 章 · 睡眠与做梦: chapters/08_sleep_and_dreams.md
-  - 第四部分 · 中枢与接口:
-    - 第 9 章 · 心跳与持久化: chapters/09_heartbeat_persistence.md
-    - 第 10 章 · LifeChatter ↔ Life Engine 同步: chapters/10_dfc_nucleus_interface.md
-    - 第 10.5 章 · LifeChatter Agent 工程: chapters/10b_agent_framework.md
-  - 第五部分 · 验证与对比:
-    - 第 11 章 · 涌现行为案例: chapters/11_case_studies.md
-    - 第 12 章 · 系统定位与课程视角比较: chapters/12_comparison.md
+  - 第三部分 · 主意识与子系统:
+    - 第 5 章 · LifeChatter ↔ Life Engine 同步: chapters/05_consciousness_sync.md
+    - 第 6 章 · 脉冲神经网络: chapters/06_snn.md
+    - 第 7 章 · 神经调质与昼夜节律: chapters/07_neuromodulation.md
+    - 第 8 章 · 记忆系统: chapters/08_memory.md
+    - 第 9 章 · 睡眠与做梦: chapters/09_sleep_and_dreams.md
+  - 第四部分 · 心跳与执行:
+    - 第 10 章 · 心跳与持久化: chapters/10_heartbeat_persistence.md
+    - 第 11 章 · LifeChatter Agent 工程: chapters/11_agent_framework.md
+  - 第五部分 · 验证:
+    - 第 12 章 · 涌现行为案例: chapters/12_case_studies.md
   - 第六部分 · 反思与展望:
     - 第 13 章 · 局限、伦理与未来: chapters/13_limitations.md
     - 第 14 章 · 结论: chapters/14_conclusion.md
+    - 参考文献: chapters/14b_references.md
   - 附录:
     - 附录 A · 术语表: chapters/15_appendix_A_glossary.md
     - 附录 B · 关键配置参数摘要: chapters/15_appendix_B_config.md

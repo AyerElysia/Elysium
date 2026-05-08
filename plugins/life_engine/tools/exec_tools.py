@@ -41,6 +41,14 @@ _SENSITIVE_ENV_TOKENS = (
     "SSH_",
 )
 
+_BLACKLISTED_COMMANDS = (
+    "rm ",
+    "rm\t",
+    ">",  # 防止重定向覆盖重要文件
+    "mv ",
+    "mv\t",
+)
+
 
 def _resolve_cwd(plugin: Any, cwd: str) -> tuple[bool, Path | str]:
     """把 cwd 解析到 workspace 内的实际目录。"""
@@ -167,7 +175,7 @@ class LifeEngineBashTool(BaseTool):
         "- 只保证工作目录限制在 workspace 内\n"
         "- 这是 best-effort shell，不是 OS 级强隔离沙箱"
     )
-    chatter_allow: list[str] = ["life_engine_internal"]
+    chatter_allow: list[str] = ["life_engine_internal", "life_chatter"]
 
     async def execute(
         self,
@@ -180,6 +188,14 @@ class LifeEngineBashTool(BaseTool):
         command_text = str(command or "").strip()
         if not command_text:
             return False, {"error": "command 不能为空"}
+
+        # 安全审计：检查黑名单
+        for blacklisted in _BLACKLISTED_COMMANDS:
+            if blacklisted in command_text:
+                return False, {
+                    "error": f"命令审计失败：禁止使用危险指令 '{blacklisted.strip()}'。如有必要，请使用专门的安全文件工具。",
+                    "command": command_text
+                }
 
         try:
             timeout_seconds = max(1, min(_MAX_TIMEOUT_SECONDS, int(timeout_seconds)))

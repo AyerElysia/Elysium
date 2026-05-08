@@ -1,18 +1,18 @@
-# 第 10.5 章 · LifeChatter Agent 框架工程
+# 第 11 章 · LifeChatter Agent 框架工程
 
 > *"让 LifeChatter 有手有脚，是让主意识能够行动；让它能读到潜意识，是让行动不只是即时反射。"*
 
 ---
 
-## 10.5.1 本章定位
+## 11.1 本章定位
 
 前一章解释了 LifeChatter 与 Life Engine 如何形成主意识–潜意识同步。本章转向工程实现：LifeChatter 如何把人格、历史、记忆、运行态快照、ThoughtStream 和工具列表组装成一次可执行的 LLM 请求，并在多轮推理中决定回复、等待、调用工具或记录内心独白。
 
-早期报告把这一层写成 DFC 工程；当前应以 `plugins/life_engine/core/chatter.py` 中的 `LifeChatter` 为准。它不是 default_chatter 的附属壳，而是 Neo-MoFox 当前社交主意识的执行器。
+早期报告把这一层写成 DFC 工程；当前应以 `plugins/life_engine/core/chatter.py` 中的 `LifeChatter` 为准。它不是 default_chatter 的附属壳，而是 Neo-MoFox-Soul 当前社交主意识的执行器。
 
-## 10.5.2 Tool / Action / Agent 三分类
+## 11.2 Tool / Action / Agent 三分类
 
-Neo-MoFox 仍然沿用框架层的三类可调用组件：
+Neo-MoFox-Soul 仍然沿用框架层的三类可调用组件：
 
 | 类型 | 工程语义 | 是否直接产生外部动作 | LifeChatter 中的典型例子 |
 |---|---|---|---|
@@ -26,7 +26,7 @@ Neo-MoFox 仍然沿用框架层的三类可调用组件：
 
 *Figure F18 · 工具类通过类型注解生成 Schema，经注册表进入 LLM 可调用组件列表。该机制对 LifeChatter 与其他 chatter 通用。*
 
-## 10.5.3 LifeChatter 专用 Action
+## 11.3 LifeChatter 专用 Action
 
 当前主意识最关键的不是“能不能调用工具”，而是“怎样把行动边界收紧”。LifeChatter 专用 Action 提供了这种边界。
 
@@ -42,7 +42,7 @@ Neo-MoFox 仍然沿用框架层的三类可调用组件：
 
 `record_inner_monologue` 把主意识此刻的理解写回 Life Engine。它不是用户可见回复，而是系统内部闭环的一部分。主动机会轮次通常要求先记录内心独白，再决定发送或等待，这能避免 LifeChatter 只做外部动作而不回写内部状态。
 
-## 10.5.4 上下文组装：主意识看到什么
+## 11.4 上下文组装：主意识看到什么
 
 LifeChatter 每轮 LLM 请求不是简单拼接最近聊天记录，而是把多类上下文压成一个可控输入：
 
@@ -61,9 +61,9 @@ LifeChatter 每轮 LLM 请求不是简单拼接最近聊天记录，而是把多
 | ThoughtStream | `ThoughtStreamManager.format_for_prompt()` | 提供当前焦点与背景在意 |
 | Usables | Tool / Action / Agent 注册表 | 告诉 LLM 当前能做什么 |
 
-这种组装方式对应第 10 章的同步目标：潜意识提供状态，主意识保留表达决策。
+这种组装方式对应第 5 章的同步目标：潜意识提供状态，主意识保留表达决策。
 
-## 10.5.5 ThoughtStream 的 prompt 经济性
+## 11.5 ThoughtStream 的 prompt 经济性
 
 ThoughtStream 不能全量注入，否则会把对话上下文变成思考流数据库。当前实现采用三个约束：
 
@@ -73,7 +73,7 @@ ThoughtStream 不能全量注入，否则会把对话上下文变成思考流数
 
 这种设计兼顾了连续性和上下文经济性：LifeChatter 能知道潜意识最近在意什么，但不会被全部历史淹没。
 
-## 10.5.6 多轮推理循环
+## 11.6 多轮推理循环
 
 LifeChatter 的执行不是一次模型调用后直接结束，而是一个受控的多轮状态机。其核心相位包括：
 
@@ -97,7 +97,7 @@ LifeChatter 的执行不是一次模型调用后直接结束，而是一个受�
 
 这些约束让 LifeChatter 更像一个可控的行动主体，而不是一个任意输出文本的裸 LLM。
 
-## 10.5.7 与无人系统课程主题的对应
+## 11.7 与无人系统课程主题的对应
 
 从无人系统视角看，LifeChatter 的工程层相当于“决策与执行控制器”：
 
@@ -108,8 +108,8 @@ LifeChatter 的执行不是一次模型调用后直接结束，而是一个受�
 - pass-and-wait 相当于“不行动也是一种决策”；
 - inner monologue 回写相当于将执行器状态反馈给系统内部模型。
 
-因此，Neo-MoFox 的社交对话不是单纯聊天功能，而是自主系统闭环中的执行端。
+因此，Neo-MoFox-Soul 的社交对话不是单纯聊天功能，而是自主系统闭环中的执行端。
 
-## 10.5.8 小结
+## 11.8 小结
 
 本章把 Agent 工程层从旧 DFC 叙事迁移到了当前 LifeChatter 实现。LifeChatter 通过 Tool / Action / Agent 获得行动能力，通过多层上下文组装获得自我状态，通过多轮状态机控制回复、等待和内心独白回写。它与 Life Engine 的关系不是“前台问后台”，而是同一主体的主意识与潜意识在不同节律下同步运行。

@@ -6,11 +6,12 @@ import asyncio
 from types import SimpleNamespace
 
 from plugins.life_engine.core.config import LifeEngineConfig
-from plugins.life_engine.core.chatter import LifeChatter
+from plugins.life_engine.core.chatter import LifeChatter, _Phase, _WorkflowRuntime
+from plugins.life_engine.constants import LIFE_CHATTER_GLOBAL_CURSOR_KEY
 from plugins.life_engine.service.core import LifeEngineService
 from plugins.life_engine.service.event_builder import EventType, LifeEngineEvent
 from plugins.life_engine.tools.file_tools import LifeEngineWakeDFCTool
-from src.core.components.base.chatter import BaseChatter
+from src.core.components.base.chatter import BaseChatter, Wait
 from src.core.models.message import Message
 from src.kernel.llm import LLMPayload, ROLE, Text
 import pytest
@@ -73,6 +74,95 @@ def test_life_chatter_persistent_user_prompt_excludes_dynamic_context() -> None:
     assert "<inner_state>" not in prompt
     assert "<recent_context>" not in prompt
     assert "<runtime_assistant_context>" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_life_chatter_global_runtime_is_reused(monkeypatch) -> None:
+    LifeChatter.reset_global_runtime()
+    created_requests: list[SimpleNamespace] = []
+
+    def fake_create_request(self, *_args, **_kwargs):
+        request = SimpleNamespace(payloads=[])
+        request.add_payload = lambda payload: request.payloads.append(payload)
+        created_requests.append(request)
+        return request
+
+    async def fake_inject_usables(self, request):
+        return {"request_id": id(request)}
+
+    monkeypatch.setattr(LifeChatter, "create_request", fake_create_request)
+    monkeypatch.setattr(LifeChatter, "inject_usables", fake_inject_usables)
+
+    first = LifeChatter.__new__(LifeChatter)
+    first.plugin = SimpleNamespace(config=None)
+    first.stream_id = "stream-a"
+    second = LifeChatter.__new__(LifeChatter)
+    second.plugin = SimpleNamespace(config=None)
+    second.stream_id = "stream-b"
+
+    stream_a = SimpleNamespace(stream_id="stream-a")
+    stream_b = SimpleNamespace(stream_id="stream-b")
+
+    rt_a, usable_a = await first._get_or_create_global_runtime(None, stream_a)
+    rt_b, usable_b = await second._get_or_create_global_runtime(None, stream_b)
+
+    assert rt_a is rt_b
+    assert usable_a is usable_b
+    assert len(created_requests) == 1
+
+    LifeChatter.reset_global_runtime()
+
+
+@pytest.mark.asyncio
+async def test_life_chatter_global_runtime_follow_up_stays_on_owner_stream(monkeypatch) -> None:
+    LifeChatter.reset_global_runtime()
+    rt = _WorkflowRuntime(
+        response=SimpleNamespace(payloads=[]),
+        phase=_Phase.FOLLOW_UP,
+        history_merged=True,
+        unreads=[],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[],
+        active_stream_id="stream-a",
+    )
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=None)
+    chatter.stream_id = "stream-b"
+
+    async def fail_fetch_unreads():
+        raise AssertionError("non-owner stream must not inspect or advance shared runtime")
+
+    monkeypatch.setattr(chatter, "fetch_unreads", fail_fetch_unreads)
+
+    result = await chatter._drive_global_runtime_until_yield(
+        SimpleNamespace(stream_id="stream-b"),
+        service=None,
+    )
+
+    assert isinstance(result, Wait)
+    assert rt.phase == _Phase.FOLLOW_UP
+    assert rt.active_stream_id == "stream-a"
+
+    LifeChatter.reset_global_runtime()
+
+
+def test_life_chatter_wait_transition_clears_global_runtime_owner() -> None:
+    rt = _WorkflowRuntime(
+        response=SimpleNamespace(payloads=[]),
+        phase=_Phase.TOOL_EXEC,
+        history_merged=True,
+        unreads=[],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[],
+        active_stream_id="stream-a",
+    )
+
+    LifeChatter._transition(rt, _Phase.WAIT_USER, "done")
+
+    assert rt.active_stream_id == ""
 
 
 def test_life_chatter_live_system_prompt_adds_broadcast_guidance(tmp_path) -> None:
@@ -264,6 +354,89 @@ async def test_life_chatter_runtime_context_cursor_avoids_repeat_injection() -> 
     assert second_high_water == 2
     assert third_text == ""
     assert third_high_water == 2
+
+
+@pytest.mark.asyncio
+async def test_life_chatter_unified_runtime_context_uses_global_cursor() -> None:
+    service = LifeEngineService(SimpleNamespace(config=None))
+    service._event_history = [
+        LifeEngineEvent(
+            event_id="evt-a",
+            event_type=EventType.MESSAGE,
+            timestamp="2026-04-25T22:00:00+08:00",
+            sequence=1,
+            source="qq",
+            source_detail="qq | 入站 | 私聊 | A",
+            content="A_STREAM_EVENT",
+            content_type="text",
+            stream_id="stream-a",
+            sender="A",
+        ),
+        LifeEngineEvent(
+            event_id="evt-b",
+            event_type=EventType.MESSAGE,
+            timestamp="2026-04-25T22:01:00+08:00",
+            sequence=2,
+            source="qq",
+            source_detail="qq | 入站 | 私聊 | B",
+            content="B_CURRENT_STREAM_TEXT",
+            content_type="text",
+            stream_id="stream-b",
+            sender="B",
+        ),
+    ]
+
+    chat_stream = SimpleNamespace(stream_id="stream-b")
+    first_text, first_high_water = await service.build_chatter_runtime_context(
+        chat_stream,
+        unified_chatter_context=True,
+    )
+    await service.mark_chatter_runtime_context_seen(
+        chat_stream.stream_id,
+        first_high_water,
+        unified_chatter_context=True,
+    )
+    second_text, second_high_water = await service.build_chatter_runtime_context(
+        chat_stream,
+        unified_chatter_context=True,
+    )
+
+    assert "A_STREAM_EVENT" in first_text
+    assert "B_CURRENT_STREAM_TEXT" not in first_text
+    assert first_high_water == 1
+    assert service._state.chatter_context_cursors[LIFE_CHATTER_GLOBAL_CURSOR_KEY] == 1
+    assert second_text == ""
+    assert second_high_water == 1
+
+
+@pytest.mark.asyncio
+async def test_life_chatter_unified_runtime_context_summarizes_event_flood() -> None:
+    service = LifeEngineService(SimpleNamespace(config=None))
+    service._event_history = [
+        LifeEngineEvent(
+            event_id=f"evt-{index}",
+            event_type=EventType.MESSAGE,
+            timestamp="2026-04-25T22:00:00+08:00",
+            sequence=index,
+            source="live",
+            source_detail="live | 入站 | 弹幕",
+            content=f"BULK_EVENT_{index:03d}",
+            content_type="text",
+            stream_id="live-stream",
+            sender="viewer",
+        )
+        for index in range(1, 101)
+    ]
+
+    first_text, first_high_water = await service.build_chatter_runtime_context(
+        SimpleNamespace(stream_id="chat-stream"),
+        unified_chatter_context=True,
+    )
+
+    assert first_high_water == 100
+    assert "潜意识已压缩" in first_text
+    assert "BULK_EVENT_100" in first_text
+    assert "BULK_EVENT_001" not in first_text
 
 
 def test_life_chatter_transient_context_can_be_stripped() -> None:

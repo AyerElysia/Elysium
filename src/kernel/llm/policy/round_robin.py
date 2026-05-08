@@ -8,6 +8,7 @@ import itertools
 import threading
 from typing import Any
 
+from ..exceptions import should_retry_same_model
 from .base import ModelStep, Policy, PolicySession
 
 
@@ -77,9 +78,10 @@ class _RoundRobinSession(PolicySession):
         model = self._models[self._idx]
         max_retry_int = _normalize_max_retry(model.get("max_retry"))
         delay = _normalize_retry_interval(model.get("retry_interval"))
+        retry_same_model = should_retry_same_model(error)
 
         # 同模型重试
-        if self._model_retry_used < max_retry_int:
+        if retry_same_model and self._model_retry_used < max_retry_int:
             self._model_retry_used += 1
             self._attempts_used += 1
             return ModelStep(
@@ -88,11 +90,22 @@ class _RoundRobinSession(PolicySession):
                 meta={"model_index": self._idx, "attempt": self._attempts_used, "retry": self._model_retry_used},
             )
 
+        if len(self._models) == 1:
+            return ModelStep(
+                model=None,
+                meta={
+                    "reason": "non_retryable_error" if not retry_same_model else "exhausted",
+                },
+            )
+
         # 换下一个模型
         self._idx = (self._idx + 1) % len(self._models)
         self._model_retry_used = 0
         self._attempts_used += 1
-        return ModelStep(model=self._models[self._idx], meta={"model_index": self._idx, "attempt": self._attempts_used, "switch": True})
+        meta = {"model_index": self._idx, "attempt": self._attempts_used, "switch": True}
+        if not retry_same_model:
+            meta["reason"] = "non_retryable_error"
+        return ModelStep(model=self._models[self._idx], delay_seconds=0.0, meta=meta)
 
     def record_success(self, *, latency: float = 0.0, tokens: int = 0) -> None:
         return None

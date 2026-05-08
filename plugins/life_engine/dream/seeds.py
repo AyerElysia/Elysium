@@ -223,31 +223,28 @@ async def collect_unfinished_tension(
         if todo.status
         not in {
             TodoStatus.COMPLETED.value,
-            TodoStatus.RELEASED.value,
-            TodoStatus.CHERISHED.value,
+            TodoStatus.CANCELLED.value,
+            TodoStatus.ARCHIVED.value,
         }
     ]
     if not active_todos:
         return []
 
-    desire_weight = {
-        "dreaming": 0.2,
-        "curious": 0.45,
-        "wanting": 0.72,
-        "eager": 0.9,
-        "passionate": 1.0,
+    priority_weight = {
+        "low": 0.25,
+        "normal": 0.45,
+        "high": 0.75,
+        "urgent": 1.0,
     }
     status_weight = {
-        "idea": 0.4,
-        "planning": 0.62,
-        "waiting": 0.78,
-        "enjoying": 0.3,
-        "paused": 0.7,
+        "pending": 0.62,
+        "in_progress": 0.48,
+        "blocked": 0.8,
     }
     scored = sorted(
         active_todos,
         key=lambda todo: (
-            desire_weight.get(str(todo.desire or ""), 0.3)
+            priority_weight.get(str(getattr(todo, "priority", "") or ""), 0.45)
             + status_weight.get(str(todo.status or ""), 0.2)
         ),
         reverse=True,
@@ -256,10 +253,10 @@ async def collect_unfinished_tension(
     if not chosen:
         return []
 
-    notes = [f"{todo.title}（{todo.status}/{todo.desire}）" for todo in chosen]
+    notes = [f"{todo.title}（{todo.status}/{getattr(todo, 'priority', 'normal')}）" for todo in chosen]
     score = min(
         0.45
-        + sum(desire_weight.get(str(todo.desire or ""), 0.3) for todo in chosen[:1]) * 0.35,
+        + sum(priority_weight.get(str(getattr(todo, "priority", "") or ""), 0.45) for todo in chosen[:1]) * 0.35,
         0.96,
     )
     todo_ref = "todos.json"
@@ -272,7 +269,7 @@ async def collect_unfinished_tension(
         DreamSeed(
             seed_id=f"seed_todo_{uuid.uuid4().hex[:6]}",
             seed_type=DreamSeedType.UNFINISHED_TENSION.value,
-            title="还没有真正合上的愿望与待办",
+            title="还没有真正推进完的承诺行动",
             summary="、".join(notes),
             core_refs=[f"todos.json#{todo.id}" for todo in chosen] + [todo_ref],
             core_node_ids=core_node_ids,
@@ -285,7 +282,7 @@ async def collect_unfinished_tension(
             unfinished_score=0.92,
             dreamability=0.78,
             score=score,
-            tension_reason="这些愿望并没有消失，只是白天一直没被真正接上。",
+            tension_reason="这些承诺行动还没有被真正推进、完成或放下。",
         )
     ]
 

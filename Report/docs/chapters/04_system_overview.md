@@ -1,12 +1,12 @@
 # 第 4 章 · 工程系统总览：app / core / kernel 与 life_engine 插件
 
-> *"Neo-MoFox 的关键不是又写了一个聊天插件，而是把插件、消息、LLM、调度、存储和后台心跳组织成一个能长期运行的系统。"*
+> *"Neo-MoFox-Soul 的关键不是又写了一个聊天插件，而是把插件、消息、LLM、调度、存储和后台心跳组织成一个能长期运行的系统。"*
 
 ---
 
 ## 4.0 为什么先讲工程总览
 
-前几章已经说明课程定位和三条工程约束。本章开始直接落到实现：Neo-MoFox 的主体不是一个单文件 Bot，也不是单次 LLM 调用，而是由 `src/app`、`src/core`、`src/kernel` 和 `plugins/life_engine` 共同组成的运行系统。
+前几章已经说明课程定位和三条工程约束。本章开始直接落到实现：Neo-MoFox-Soul 的主体不是一个单文件 Bot，也不是单次 LLM 调用，而是由 `src/app`、`src/core`、`src/kernel` 和 `plugins/life_engine` 共同组成的运行系统。
 
 图 F0 已在导论中给出总览。本章按同一结构展开：先讲框架三层，再讲 Life Engine 插件如何挂载，最后讲消息、状态和心跳如何形成闭环。
 
@@ -41,7 +41,7 @@ main.py
 
 ## 4.2 `core` 层：组件模型、管理器与消息框架
 
-`src/core` 是 Neo-MoFox 的领域框架层，负责把插件能力统一成系统组件。它主要包含五类能力：
+`src/core` 是 Neo-MoFox-Soul 的领域框架层，负责把插件能力统一成系统组件。它主要包含五类能力：
 
 - **组件模型**（`components/`）：定义 Plugin、Action、Tool、Agent、Chatter、Service、Router 等组件基类与注册语义。
 - **管理器**（`managers/`）：管理插件、Action、Chatter、Command、Router、Service、Stream、Permission 等运行时对象。
@@ -124,11 +124,11 @@ Adapter / HTTP / User Message
 
 *Figure F5 · 从外部消息到 LifeChatter、Life Engine、调质、记忆、思考流，再回写到事件流的典型闭环时序。*
 
-因此，Neo-MoFox 的对话不是单纯“历史消息 + LLM”，而是“消息框架 + 插件事件流 + 后台状态 + LLM 行动控制”的组合。
+因此，Neo-MoFox-Soul 的对话不是单纯“历史消息 + LLM”，而是“消息框架 + 插件事件流 + 后台状态 + LLM 行动控制”的组合。
 
 ## 4.7 LifeChatter + Life Engine：双意识异步运行
 
-在上述框架之上，当前 Neo-MoFox 使用 **LifeChatter + Life Engine** 作为核心运行范式。
+在上述框架之上，当前 Neo-MoFox-Soul 使用 **LifeChatter + Life Engine** 作为核心运行范式。
 
 ![Figure F4 · 双意识异步运行：LifeChatter + Life Engine](/root/Elysia/Neo-MoFox/Report/04_figures/F4_dual_consciousness_async.png)
 
@@ -165,7 +165,7 @@ Life Engine 插件内部又包含多类仿生子系统。它们不是单独解�
 
 ## 4.9 多时间尺度与持久化
 
-Neo-MoFox 的连续性来自多时间尺度并行运行：
+Neo-MoFox-Soul 的连续性来自多时间尺度并行运行：
 
 - **秒级**：SNN 神经元活动度和 drive 通过 LIF step、decay-only 和 EMA 演化，典型触发是 SNN tick。
 - **30 秒级**：Life Engine 心跳状态通过事件采样、状态推进和持久化演化，典型触发是 heartbeat。
@@ -187,7 +187,7 @@ system_state(t) = (
 )
 ```
 
-Neo-MoFox 追求的连续性不是“每一层每一秒都改变”，而是：在外部输入间隙中，至少有一个内部状态分量会随时间推进，并在后续表达、检索或持久化记录中留下可检查的变化。
+Neo-MoFox-Soul 追求的连续性不是“每一层每一秒都改变”，而是：在外部输入间隙中，至少有一个内部状态分量会随时间推进，并在后续表达、检索或持久化记录中留下可检查的变化。
 
 ## 4.10 小结
 

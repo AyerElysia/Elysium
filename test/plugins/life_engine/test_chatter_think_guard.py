@@ -3,16 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from plugins.life_engine.core.chatter import LifeChatter, LifeSendTextAction
+from plugins.life_engine.core.chatter import (
+    LifeChatter,
+    LifeSendFileAction,
+    LifeSendTextAction,
+)
+from plugins.life_engine.core.config import LifeEngineConfig
+from plugins.life_engine.core.plugin import LifeEnginePlugin
 from plugins.life_engine.core.tool_parallel import (
     is_life_tool_call_parallel_safe,
     iter_life_tool_call_batches,
 )
 from src.core.components.base.chatter import BaseChatter
+from src.core.models.message import Message, MessageType
 from src.kernel.llm import LLMPayload, ROLE, ToolResult
 
 
@@ -46,6 +54,35 @@ def test_append_think_only_retry_instruction_adds_system_payload() -> None:
     assert getattr(payload, "role", None) == ROLE.SYSTEM
 
 
+def test_append_plain_text_retry_instruction_adds_user_payload() -> None:
+    response = _FakeResponse()
+
+    LifeChatter._append_plain_text_retry_instruction(
+        response,
+        response_text="The request was rejected because it was considered high risk",
+    )
+
+    assert len(response.payloads) == 1
+    payload = response.payloads[0]
+    assert getattr(payload, "role", None) == ROLE.USER
+    assert payload.content[0].text
+    assert "充实" in payload.content[0].text
+    assert "高风险" in payload.content[0].text or "high risk" in payload.content[0].text
+
+
+def test_append_plain_text_retry_instruction_uses_strict_reminder_on_last_retry() -> None:
+    response = _FakeResponse()
+
+    LifeChatter._append_plain_text_retry_instruction(
+        response,
+        response_text="too vague",
+        retry_count=2,
+    )
+
+    payload = response.payloads[0]
+    assert "最后提醒" in payload.content[0].text
+
+
 def test_should_encourage_segment_send_for_long_single_content() -> None:
     call_args = {"content": "这是一条比较长的消息" * 8}
     assert LifeChatter._should_encourage_segment_send("action-life_send_text", call_args) is True
@@ -73,6 +110,169 @@ def test_life_send_text_rejects_placeholder_only_content() -> None:
 
     assert ok is False
     assert "占位符" in message
+
+
+class _FakeAdapterManager:
+    async def get_bot_info_by_platform(self, _platform: str) -> dict[str, str]:
+        return {"bot_id": "bot-1", "bot_name": "Elysia"}
+
+
+class _FakeStreamManager:
+    async def get_stream_info(self, _stream_id: str) -> None:
+        return None
+
+
+class _FakeMessageSender:
+    def __init__(self, *, success: bool = True) -> None:
+        self.success = success
+        self.messages: list[Message] = []
+
+    async def send_message(self, message: Message) -> bool:
+        self.messages.append(message)
+        return self.success
+
+
+def _make_file_action(chat_type: str, last_message: Message) -> LifeSendFileAction:
+    context = SimpleNamespace(
+        unread_messages=[last_message],
+        history_messages=[],
+        current_message=last_message,
+        message_cache=[],
+        triggering_user_id="",
+    )
+    action = LifeSendFileAction.__new__(LifeSendFileAction)
+    action.chat_stream = SimpleNamespace(
+        stream_id=f"stream-{chat_type}",
+        platform="qq",
+        chat_type=chat_type,
+        context=context,
+    )
+    action.plugin = SimpleNamespace()
+    return action
+
+
+def test_life_send_file_rejects_invalid_paths(tmp_path: Path) -> None:
+    action = LifeSendFileAction.__new__(LifeSendFileAction)
+    missing = tmp_path / "missing.txt"
+
+    ok_relative, message_relative = asyncio.run(action.execute("relative.txt"))
+    ok_missing, message_missing = asyncio.run(action.execute(str(missing)))
+    ok_dir, message_dir = asyncio.run(action.execute(str(tmp_path)))
+    ok_glob, message_glob = asyncio.run(action.execute(str(tmp_path / "*.txt")))
+
+    assert ok_relative is False
+    assert "绝对路径" in message_relative
+    assert ok_missing is False
+    assert "不存在" in message_missing
+    assert ok_dir is False
+    assert "普通文件" in message_dir
+    assert ok_glob is False
+    assert "通配符" in message_glob
+
+
+def test_life_send_file_rejects_oversized_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    file_path = tmp_path / "large.bin"
+    file_path.write_bytes(b"xx")
+    action = LifeSendFileAction.__new__(LifeSendFileAction)
+    monkeypatch.setattr(LifeSendFileAction, "MAX_FILE_BYTES", 1)
+
+    ok, message = asyncio.run(action.execute(str(file_path)))
+
+    assert ok is False
+    assert "文件过大" in message
+
+
+def test_life_send_file_sends_private_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = tmp_path / "note.txt"
+    file_path.write_text("hello", encoding="utf-8")
+    last_message = Message(
+        message_id="m1",
+        content="send it",
+        sender_id="user-1",
+        sender_name="Ayer",
+        platform="qq",
+        chat_type="private",
+        stream_id="stream-private",
+    )
+    sender = _FakeMessageSender()
+    action = _make_file_action("private", last_message)
+
+    monkeypatch.setattr(
+        "src.core.managers.adapter_manager.get_adapter_manager",
+        lambda: _FakeAdapterManager(),
+    )
+    monkeypatch.setattr(
+        "src.core.managers.stream_manager.get_stream_manager",
+        lambda: _FakeStreamManager(),
+    )
+    monkeypatch.setattr("src.core.transport.message_send.get_message_sender", lambda: sender)
+
+    ok, message = asyncio.run(action.execute(str(file_path)))
+
+    assert ok is True
+    assert "已发送文件" in message
+    assert len(sender.messages) == 1
+    sent = sender.messages[0]
+    assert sent.message_type == MessageType.FILE
+    assert sent.content == {"path": str(file_path.resolve())}
+    assert sent.processed_plain_text == "[发送文件] note.txt"
+    assert sent.stream_id == "stream-private"
+    assert sent.extra["target_user_id"] == "user-1"
+    assert sent.extra["target_user_name"] == "Ayer"
+    assert sent.extra["file_name"] == "note.txt"
+
+
+def test_life_send_file_sends_group_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = tmp_path / "report.pdf"
+    file_path.write_bytes(b"%PDF")
+    last_message = Message(
+        message_id="m1",
+        content="send it",
+        sender_id="user-1",
+        sender_name="Ayer",
+        platform="qq",
+        chat_type="group",
+        stream_id="stream-group",
+        group_id="12345",
+        group_name="群聊",
+    )
+    sender = _FakeMessageSender()
+    action = _make_file_action("group", last_message)
+
+    monkeypatch.setattr(
+        "src.core.managers.adapter_manager.get_adapter_manager",
+        lambda: _FakeAdapterManager(),
+    )
+    monkeypatch.setattr("src.core.transport.message_send.get_message_sender", lambda: sender)
+
+    ok, message = asyncio.run(action.execute(str(file_path)))
+
+    assert ok is True
+    assert "已发送文件" in message
+    sent = sender.messages[0]
+    assert sent.message_type == MessageType.FILE
+    assert sent.extra["target_group_id"] == "12345"
+    assert sent.extra["target_group_name"] == "群聊"
+
+
+def test_life_send_file_action_only_registered_with_life_chatter() -> None:
+    enabled_config = LifeEngineConfig()
+    enabled_config.chatter.enabled = True
+    enabled_components = LifeEnginePlugin(enabled_config).get_components()
+
+    disabled_config = LifeEngineConfig()
+    disabled_config.chatter.enabled = False
+    disabled_components = LifeEnginePlugin(disabled_config).get_components()
+
+    assert LifeSendFileAction.chatter_allow == ["life_chatter"]
+    assert LifeSendFileAction in enabled_components
+    assert LifeSendFileAction not in disabled_components
 
 
 def test_append_segment_send_retry_instruction_adds_system_payload() -> None:
@@ -104,6 +304,7 @@ def test_append_inner_monologue_retry_instruction_adds_system_payload() -> None:
 
 def test_visible_reply_action_accepts_emoji_send() -> None:
     assert LifeChatter._is_visible_reply_action("action-life_send_text") is True
+    assert LifeChatter._is_visible_reply_action("action-life_send_file") is True
     assert LifeChatter._is_visible_reply_action("action-send_emoji_meme") is True
     assert LifeChatter._is_visible_reply_action("action-schedule_followup_message") is False
 
@@ -148,6 +349,7 @@ def test_should_force_reply_only_for_real_external_messages() -> None:
 def test_compact_successful_tool_result_only_targets_low_information_actions() -> None:
     assert LifeChatter._should_compact_successful_tool_result("action-record_inner_monologue") is True
     assert LifeChatter._should_compact_successful_tool_result("action-life_send_text") is True
+    assert LifeChatter._should_compact_successful_tool_result("action-life_send_file") is True
     assert LifeChatter._should_compact_successful_tool_result("action-send_emoji_meme") is True
     assert LifeChatter._should_compact_successful_tool_result("action-think") is True
     assert LifeChatter._should_compact_successful_tool_result("search_life_memory") is False
@@ -219,11 +421,27 @@ def test_life_tool_parallel_batches_only_consecutive_safe_calls() -> None:
     ]
 
 
+def test_life_chatter_blocks_live_bridge_tool_at_execution_time() -> None:
+    class FakeTTSAction:
+        @classmethod
+        def get_signature(cls) -> str:
+            return "tts_voice_plugin:action:tts_voice_action"
+
+    usable_map = {"action-tts_voice_action": FakeTTSAction}
+    call = SimpleNamespace(name="action-tts_voice_action")
+    live_msg = SimpleNamespace(platform="live")
+    qq_msg = SimpleNamespace(platform="qq")
+
+    assert LifeChatter._is_tool_call_blocked_for_trigger(call, usable_map, live_msg)
+    assert not LifeChatter._is_tool_call_blocked_for_trigger(call, usable_map, qq_msg)
+
+
 @pytest.mark.asyncio
 async def test_life_chatter_run_tool_call_accepts_single_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     chatter = LifeChatter.__new__(LifeChatter)
+    chatter.stream_id = "life-test-stream"
     response = _FakeResponse()
     response.add_payload(
         LLMPayload(
@@ -264,6 +482,7 @@ async def test_life_chatter_run_tool_call_preserves_batch_shape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     chatter = LifeChatter.__new__(LifeChatter)
+    chatter.stream_id = "life-test-stream"
     response = _FakeResponse()
     calls = [
         SimpleNamespace(id="send-1", name="action-life_send_text", args={}),

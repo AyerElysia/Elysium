@@ -8,31 +8,31 @@
 
 本报告是《智能感知与无人系统》课程报告，基于本人正在维护的开源项目 **Neo-MoFox-Soul** 改写而成。项目地址为 <https://github.com/AyerElysia/Neo-MoFox-Soul>。
 
-原项目的产品形态偏向 AI 伙伴，但本报告不把重点放在“聊天陪伴”本身，而是把 Neo-MoFox 作为一个**软件形态的自主 Agent 无人系统原型**来分析：它如何接收外部消息，如何在无输入时继续运行，如何把内部状态持久化，如何用 LifeChatter 对外行动，又如何用 Life Engine 在后台维护记忆、调质、SNN、做梦和 ThoughtStream。
+原项目的产品形态偏向 AI 伙伴，但本报告不把重点放在“聊天陪伴”本身，而是把 Neo-MoFox-Soul 作为一个**软件形态的自主 Agent 无人系统原型**来分析：它如何接收外部消息，如何在无输入时继续运行，如何把内部状态持久化，如何用 LifeChatter 对外行动，又如何用 Life Engine 在后台维护记忆、调质、SNN、做梦和 ThoughtStream。
 
 换句话说，本文讨论的不是“模型会不会说得像人”，而是一个更工程化的问题：
 
 > 一个长期运行的软件 Agent，如何把感知、状态、决策、行动和反馈组织成闭环？
 
-![Figure F0 · Neo-MoFox 工程总览架构](/root/Elysia/Neo-MoFox/Report/04_figures/F0_engineering_architecture_overview.png)
+![Figure F0 · Neo-MoFox-Soul 工程总览架构](/root/Elysia/Neo-MoFox/Report/04_figures/F0_engineering_architecture_overview.png)
 
-*Figure F0 · Neo-MoFox 的工程总览：`app` 负责运行时生命周期，`core` 负责组件与消息框架，`kernel` 提供基础设施能力，`life_engine` 插件在其上注册 LifeChatter、Life Engine Service 与各类仿生子系统。*
+*Figure F0 · Neo-MoFox-Soul 的工程总览：`app` 负责运行时生命周期，`core` 负责组件与消息框架，`kernel` 提供基础设施能力，`life_engine` 插件在其上注册 LifeChatter、Life Engine Service 与各类仿生子系统。*
 
 ## 1.1 为什么软件 Agent 可以放进无人系统课程
 
 传统无人系统通常被描述为“感知 → 规划 → 控制”闭环。无人车、无人机和服务机器人依赖传感器、状态估计、控制器、执行器和健康监测来维持长期运行。软件 Agent 没有轮子、机翼或激光雷达，但它仍然面对同类工程问题。本文采用以下映射：
 
-- **通信中断时状态如何保持**：对应“用户不说话时系统是否仍在演化”。Neo-MoFox 依赖 Life Engine 心跳、SNN tick 和调质 ODE 保持后台状态推进。
+- **通信中断时状态如何保持**：对应“用户不说话时系统是否仍在演化”。Neo-MoFox-Soul 依赖 Life Engine 心跳、SNN tick 和调质 ODE 保持后台状态推进。
 - **状态估计如何持续更新**：对应“对话器如何知道当前系统状态”。实现线索包括 runtime snapshot、事件高水位和 ThoughtStream。
 - **控制器如何选择行动**：对应“Agent 如何决定回复、等待或调用工具”。实现线索是 LifeChatter 多轮状态机与 Action 执行链路。
 - **系统如何恢复**：对应“崩溃或重启后是否从原状态继续”。实现线索包括 JSON 状态文件、SQLite 数据库和向量索引持久化。
 - **内部状态如何审计**：对应“报告论证是否能被代码和日志检查”。实现线索包括 monitor router、事件流、配置文件和状态文件。
 
-因此，本报告把 Neo-MoFox 视为一个**软件无人系统样例**。它的价值不在于替代真实无人车/无人机，而在于提供一个可运行、可检查、可修改的 Agent 系统，用课程中的闭环思想来分析。
+因此，本报告把 Neo-MoFox-Soul 视为一个**软件无人系统样例**。它的价值不在于替代真实无人车/无人机，而在于提供一个可运行、可检查、可修改的 Agent 系统，用课程中的闭环思想来分析。
 
 ## 1.2 工程架构先于概念隐喻
 
-Neo-MoFox 当前最重要的工程边界是三层框架加一个关键插件域：
+Neo-MoFox-Soul 当前最重要的工程边界是三层框架加一个关键插件域：
 
 1. **`src/app`：运行时装配层**  
    `Bot` 负责启动、初始化、插件发现、插件加载、运行循环和优雅关闭。`app/plugin_system` 则为插件作者提供稳定入口，避免插件直接耦合底层实现路径。
@@ -50,7 +50,7 @@ Neo-MoFox 当前最重要的工程边界是三层框架加一个关键插件域�
 
 ## 1.3 当前系统的核心运行范式
 
-在工程框架之上，Neo-MoFox 当前采用 **LifeChatter + Life Engine** 的双意识异步运行范式：
+在工程框架之上，Neo-MoFox-Soul 当前采用 **LifeChatter + Life Engine** 的双意识异步运行范式：
 
 - **LifeChatter** 是社交主意识，负责用户可见表达、工具调用、上下文组装、行动输出和内心独白回写。
 - **Life Engine** 是潜意识后台服务，负责心跳、事件流、SNN、调质、记忆、做梦、习惯和 ThoughtStream。
@@ -70,6 +70,6 @@ Neo-MoFox 当前最重要的工程边界是三层框架加一个关键插件域�
 
 ## 1.5 文档结构
 
-第 2 章给出压缩后的相关工作背景；第 3 章把“连续性、自下而上学习、系统涌现”收敛为三条工程约束；第 4 章提前展开 `app/core/kernel` 与 `life_engine` 插件的系统总览；第 5–10 章深入 SNN、调质、记忆、做梦、心跳和主意识–潜意识同步；第 10.5 章补充 LifeChatter 的 Agent 执行细节；第 11–14 章分别给出案例、课程定位、局限和结论。
+第 2 章给出压缩后的相关工作背景；第 3 章把“连续性、自下而上学习、系统涌现”收敛为三条工程约束；第 4 章展开 `app/core/kernel` 与 `life_engine` 插件的系统总览；第 5 章提前说明 LifeChatter 与 Life Engine 的主意识–潜意识同步；第 6–10 章分别展开 SNN、调质、记忆、做梦和心跳持久化；第 11 章补充 LifeChatter 的 Agent 执行细节；第 12–14 章给出案例、局限和结论。
 
-> **阅读建议**：如果只想快速把握工程实现，优先阅读第 1、4、9、10、10.5 章和附录 B–D。
+> **阅读建议**：如果只想快速把握工程实现，优先阅读第 1、4、5、10、11 章和附录 B–D。

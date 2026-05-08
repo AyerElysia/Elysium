@@ -136,3 +136,12 @@ PROACTIVE_WAKE_KEYWORDS: tuple[str, ...] = (
     "上下文",
     "目标",
 )
+
+
+# ============================================================================
+# life_chatter 主意识常量
+# ============================================================================
+
+# 统一 life_chatter 主意识读取 life runtime 的全局 cursor key。
+# 旧的 per-stream cursor 仍保留用于兼容，但主链路使用这个 key。
+LIFE_CHATTER_GLOBAL_CURSOR_KEY: str = "__life_chatter_global__"

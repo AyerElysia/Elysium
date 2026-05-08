@@ -607,7 +607,7 @@ class LifeEngineConfig(BaseConfig):
 
         native_when_available: bool = Field(
             default=True,
-            description="auto 模式下，如果 multimodal.enabled 且 native_image=true，优先用 life 模型任务原生看图。",
+            description="auto 模式下优先用 screen.native_task_name 指定的模型任务原生看图；与 life_chatter 原生媒体注入开关独立。",
         )
 
         native_task_name: str = Field(

@@ -33,7 +33,7 @@
 
   <rect width="1400" height="900" fill="url(#bgGrad)"/>
 
-  <text x="700" y="55" text-anchor="middle" font-size="32" font-weight="700" fill="#2D2D3E">Neo-MoFox · 皮层–皮层下三层架构</text>
+  <text x="700" y="55" text-anchor="middle" font-size="32" font-weight="700" fill="#2D2D3E">Neo-MoFox-Soul · 皮层–皮层下三层架构</text>
   <text x="700" y="86" text-anchor="middle" font-size="16" fill="#6B6B7E">Cortex / Limbic / Subcortical · 双轨执行 · 多时间尺度耦合</text>
 
   <!-- Three layers -->

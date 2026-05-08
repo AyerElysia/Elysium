@@ -1,12 +1,12 @@
-# 第 10 章 · 主意识–潜意识同步：LifeChatter 与 Life Engine
+# 第 5 章 · 主意识–潜意识同步：LifeChatter 与 Life Engine
 
 > *"主意识不是孤立的嘴，潜意识也不是沉默的后台任务。系统真正有生命感的地方，在于二者以不同节律异步运行，却能在表达时同步成同一个主体。"*
 
 ---
 
-## 10.1 为什么旧 DFC 接口不再是核心
+## 5.1 为什么旧 DFC 接口不再是核心
 
-早期 Neo-MoFox 使用 `default_chatter` / DFC 作为对外对话入口，再通过 `consult_nucleus`、`nucleus_tell_dfc`、runtime injection 等桥接机制与 Life Engine 通信。这个设计解决了“后台状态如何影响对话”的第一版问题，但它有一个根本缺陷：**对话系统与生命中枢仍然是两个外置模块，信息传递像跨系统通信，而不是同一主体的内部同步**。
+早期 Neo-MoFox-Soul 使用 `default_chatter` / DFC 作为对外对话入口，再通过 `consult_nucleus`、`nucleus_tell_dfc`、runtime injection 等桥接机制与 Life Engine 通信。这个设计解决了“后台状态如何影响对话”的第一版问题，但它有一个根本缺陷：**对话系统与生命中枢仍然是两个外置模块，信息传递像跨系统通信，而不是同一主体的内部同步**。
 
 当前架构已经迁移到 **LifeChatter + Life Engine**：
 
@@ -20,7 +20,7 @@
 
 *Figure F13 · 潜意识侧的梦境残影、状态摘要、内心独白和 ThoughtStream 经异步同步层进入 LifeChatter 的表达上下文。*
 
-## 10.2 同步目标：不是传命令，而是传状态
+## 5.2 同步目标：不是传命令，而是传状态
 
 Life Engine 向 LifeChatter 同步的信息，不应该被理解成“后台命令前台说什么”。更准确的理解是：潜意识提供状态，主意识保留表达决策。
 
@@ -33,7 +33,7 @@ Life Engine 向 LifeChatter 同步的信息，不应该被理解成“后台命�
 
 这个设计比“让 LLM 假装有内心”更强：内心独白、思考流和梦境残影都有独立的生成、存储和同步路径。
 
-## 10.3 同步通道一：运行态快照
+## 5.3 同步通道一：运行态快照
 
 LifeChatter 每次构建上下文时，会读取 Life Engine 提供的同源运行态快照。该快照可以包含：
 
@@ -47,7 +47,7 @@ LifeChatter 每次构建上下文时，会读取 Life Engine 提供的同源运�
 
 运行态快照的意义在于：LifeChatter 不需要重新计算潜意识，只需要读取潜意识已经维护好的“当前我是什么状态”。这类似无人系统中的状态估计模块：控制器不必每次从原始传感器重新推导完整世界模型，而是读取已经融合过的状态估计。
 
-## 10.4 同步通道二：内心独白记录
+## 5.4 同步通道二：内心独白记录
 
 LifeChatter 本身也会向潜意识回写。当前实现中，`action-record_inner_monologue` 用于记录对话器视角下的内心独白。它的作用不是发给用户，而是把“主意识此刻如何理解局面”写回 Life Engine 运行态。
 
@@ -63,7 +63,7 @@ Life Engine 状态
 
 这个闭环很关键。否则主意识只是读取潜意识，却不会把自己的理解反馈回去；系统就会退化成“后台状态注入前台 prompt”。内心独白让 LifeChatter 的判断成为潜意识后续演化的输入。
 
-## 10.5 同步通道三：主动机会与 pass-and-wait
+## 5.5 同步通道三：主动机会与 pass-and-wait
 
 LifeChatter 不只在用户明确发消息时运行。系统还存在主动机会和续话机会：当 Life Engine 判断某个时刻可能适合表达，LifeChatter 会被触发进入一轮决策。
 
@@ -75,11 +75,11 @@ LifeChatter 不只在用户明确发消息时运行。系统还存在主动机�
 
 这比“潜意识直接发话”更自然。潜意识只提供机会和状态，主意识决定是否开口。对课程报告而言，这相当于把无人系统中的“自主决策”拆成两层：后台状态估计与动机生成，前台行动选择与执行。
 
-## 10.6 ThoughtStream：注意力脑区的工程类比
+## 5.6 ThoughtStream：注意力脑区的工程类比
 
 ThoughtStream 是潜意识管理、主意识可见的中期注意力结构。它保存系统近期持续在意的问题，并通过 `revision` 和焦点窗口同步给 LifeChatter。
 
-脑科学中，注意力常被拆成不同网络。例如，Corbetta 与 Shulman 关于 goal-directed / stimulus-driven attention 的区分，把注意力分为目标驱动的背侧系统与显著事件驱动的腹侧系统；Petersen 与 Posner 的注意网络理论也强调警觉、定向和执行控制等功能分工。Neo-MoFox 不复刻真实脑区，而是借用这一功能划分来设计 ThoughtStream。
+脑科学中，注意力常被拆成不同网络。例如，Corbetta 与 Shulman 关于 goal-directed / stimulus-driven attention 的区分，把注意力分为目标驱动的背侧系统与显著事件驱动的腹侧系统；Petersen 与 Posner 的注意网络理论也强调警觉、定向和执行控制等功能分工。Neo-MoFox-Soul 不复刻真实脑区，而是借用这一功能划分来设计 ThoughtStream。
 
 对应关系如下：
 
@@ -97,7 +97,7 @@ ThoughtStream 是潜意识管理、主意识可见的中期注意力结构。它
 
 *Figure F21 · ThoughtStream 借用背侧/腹侧注意网络的功能划分来组织“当前焦点 / 背景在意 / 重定向”。图为工程隐喻，不是医学或神经科学等价断言。*
 
-## 10.7 上下文同步的边界
+## 5.7 上下文同步的边界
 
 同步层有意避免两种极端。
 
@@ -105,7 +105,7 @@ ThoughtStream 是潜意识管理、主意识可见的中期注意力结构。它
 
 **第二，避免完全按需查询。** 如果主意识必须显式调用某个工具才知道潜意识状态，那么它很容易因为没有调用工具而“忘记自己有潜意识”。当前实现通过 transient context 和 ThoughtStream 同步，让关键状态自然出现在主意识上下文中。
 
-因此，Neo-MoFox 采用折中策略：
+因此，Neo-MoFox-Soul 采用折中策略：
 
 - 稳定人格与规则放在 system 层；
 - 聊天历史和未读消息放在 user 层；
@@ -113,7 +113,7 @@ ThoughtStream 是潜意识管理、主意识可见的中期注意力结构。它
 - ThoughtStream 按焦点/背景分组裁剪；
 - 需要深入细节时再调用检索或工具。
 
-## 10.8 失败模式与约束
+## 5.8 失败模式与约束
 
 这套同步机制仍有明确局限。
 
@@ -125,12 +125,6 @@ ThoughtStream 是潜意识管理、主意识可见的中期注意力结构。它
 
 这些局限是第 13 章局限性讨论的一部分。它们不削弱双意识架构的价值，反而说明这个设计比“写一段 prompt 让模型装作有内心”更可检查。
 
-## 10.9 小结
+## 5.9 小结
 
-本章完成了从旧 DFC 桥接到当前双意识同步的重写。LifeChatter 是社交主意识，Life Engine 是潜意识；ThoughtStream 是潜意识维护、主意识可见的注意力流；内心独白和运行态快照让二者形成闭环。下一章将从 Agent 工程角度展开 LifeChatter 如何组装上下文、调用工具并维持多轮推理。
-
-**参考资料**：
-
-- Corbetta, M., & Shulman, G. L. (2002). *Control of goal-directed and stimulus-driven attention in the brain*. Nature Reviews Neuroscience. <https://www.nature.com/articles/nrn755>
-- Petersen, S. E., & Posner, M. I. (2012). *The Attention System of the Human Brain: 20 Years After*. Annual Review of Neuroscience. <https://pmc.ncbi.nlm.nih.gov/articles/PMC3413263/>
-- Vossel, S., Geng, J. J., & Fink, G. R. (2014). *Dorsal and Ventral Attention Systems: Distinct Neural Circuits but Collaborative Roles*. The Neuroscientist. <https://pmc.ncbi.nlm.nih.gov/articles/PMC4107817/>
+本章完成了从旧 DFC 桥接到当前双意识同步的重写。LifeChatter 是社交主意识，Life Engine 是潜意识；ThoughtStream 是潜意识维护、主意识可见的注意力流；内心独白和运行态快照让二者形成闭环。下一章转向 SNN，说明后台快层如何提供时间连续的状态基质。

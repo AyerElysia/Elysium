@@ -20,16 +20,17 @@ from .chat_history_tools import (
 from .todo_tools import TODO_TOOLS
 from .grep_tools import GREP_TOOLS
 from .web_tools import WEB_TOOLS
-from .social_tools import SOCIAL_TOOLS
 from .rest_tools import REST_TOOLS, LifeEngineRestHeartbeatTool
 from .screen_tools import SCREEN_TOOLS, LifeEngineViewScreenTool
 from ..streams.tools import STREAM_TOOLS
+from .exec_tools import EXEC_TOOLS
 
 ALL_TOOLS = [
     *FILE_TOOLS,
     *CHAT_HISTORY_TOOLS,
     *REST_TOOLS,
     *SCREEN_TOOLS,
+    *EXEC_TOOLS,
 ]
 
 __all__ = [
@@ -38,7 +39,6 @@ __all__ = [
     "GREP_TOOLS",
     "WEB_TOOLS",
     "STREAM_TOOLS",
-    "SOCIAL_TOOLS",
     "REST_TOOLS",
     "SCREEN_TOOLS",
     "LifeEngineFetchChatHistoryTool",

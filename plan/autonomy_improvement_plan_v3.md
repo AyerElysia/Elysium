@@ -226,33 +226,6 @@ In `_build_prompt_header()` (file: `plugins/life_engine/service/core.py`), repla
 记住：想到就说，不要等"合适的时机"。
 ```
 
-### 3.4 Direct Expression Tool: `nucleus_initiate_topic`
-
-In addition to the reframed express_to_social_self, add a **direct action tool** that can send a message to a specific chat stream. This bypasses the indirect "leave a note and hope DFC picks it up" path.
-
-New file: `plugins/life_engine/tools/social_tools.py`
-
-```python
-class NucleusInitiateTopicTool(BaseTool):
-    """直接在聊天流中发起话题。"""
-    tool_name = "nucleus_initiate_topic"
-    tool_description = (
-        "直接在指定聊天流中发起一个话题或说一句话。"
-        "这是你主动表达的最直接方式——不是留言，而是直接说出来。"
-        "使用场景：想分享什么、想主动关心某人、想打破沉默、"
-        "想讨论一个你正在思考的话题。"
-    )
-
-    async def execute(
-        self,
-        content: str,         # 要说的话
-        stream_id: str = "",   # 目标流（空=最近活跃的流）
-        reason: str = "",      # 为什么想说
-    ) -> tuple[bool, str]:
-        # Find target stream, construct message, send via message_sender
-        # Record in event history as self-initiated
-```
-
 ### 3.5 Files to Modify/Create
 
 | File | Action |
@@ -260,7 +233,6 @@ class NucleusInitiateTopicTool(BaseTool):
 | `plugins/life_engine/tools/file_tools.py` | MODIFY - Rename `LifeEngineWakeDFCTool` → `LifeEngineExpressToSocialSelfTool`, update `tool_name` to `express_to_social_self`, rewrite `tool_description` |
 | `plugins/life_engine/service/core.py` | MODIFY - `_build_prompt_header()` replace "信息差" section with "表达" section |
 | `plugins/life_engine/service/core.py` | MODIFY - Update references to `nucleus_tell_dfc` in prompt text |
-| `plugins/life_engine/tools/social_tools.py` | NEW - `NucleusInitiateTopicTool` |
 | `plugins/life_engine/tools/__init__.py` | MODIFY - Export new tool |
 | `plugins/life_engine/service/integrations.py` | MODIFY - Update DFCIntegration references if needed |
 
@@ -337,7 +309,7 @@ The original thread concept (2026-03-31) was about "persistent interests that sl
 
 ### 5.2 Thought Stream → Expression Bridge
 
-When a Thought Stream advances to a point where Elysia has something to share, the natural next step is `express_to_social_self` or `nucleus_initiate_topic`. The impulse engine (Phase 2) can detect "just advanced a thought stream + high sociability" and suggest expression.
+When a Thought Stream advances to a point where Elysia has something to share, the natural next step is `express_to_social_self`. The impulse engine (Phase 2) can detect "just advanced a thought stream + high sociability" and suggest expression.
 
 ### 5.3 Dream Integration
 
@@ -385,7 +357,6 @@ Replace the current `_build_prompt_header()` with a restructured version:
 
 ### 表达方式
 - express_to_social_self: 把心里话说出来（不是汇报，是表达）
-- nucleus_initiate_topic: 直接在聊天中说一句话
 
 ### 原则
 - 行动是默认，静默是例外——但如果你真的在休息，那就休息
@@ -433,7 +404,6 @@ Phase 2: Drive-to-Action Pipeline
 
 Phase 3: Expression Bridge
   ├── MODIFY: file_tools.py (rename + reframe)
-  ├── NEW: tools/social_tools.py (nucleus_initiate_topic)
   ├── MODIFY: core.py (prompt section replacement)
   └── No strict dependencies, but works best after Phase 6 (prompt restructure)
 
@@ -497,7 +467,7 @@ class StreamsSection(SectionBase):
 | Risk | Mitigation |
 |------|------------|
 | API cost increase from more tool calls | Impulse engine has cooldown per rule; Thought Stream advancement is lightweight (mostly memory reads) |
-| Over-active Elysia (spamming) | `nucleus_initiate_topic` has built-in rate limiting (max N per hour, configurable); impulse suggestions are not forced |
+| Over-active Elysia (spamming) | Expression path has built-in rate limiting (max N per hour, configurable); impulse suggestions are not forced |
 | Thought Streams become stale TODO items | `curiosity_score` auto-decays; dormant after 24h; LLM can retire at any time |
 | Expression bridge rename breaks existing integration | Keep `nucleus_tell_dfc` as internal alias; `record_tell_dfc()` method stays; event log format unchanged |
 | Prompt too long after adding sections | Thought Streams summary limited to top 3 active; impulse suggestions max 3; total new tokens < 200 |

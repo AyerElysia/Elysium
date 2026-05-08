@@ -12,6 +12,7 @@ import threading
 from collections import namedtuple
 from typing import Any
 
+from ..exceptions import should_retry_same_model
 from .base import ModelStep, Policy, PolicySession
 
 # 定义用于跟踪模型使用情况的具名元组
@@ -191,9 +192,10 @@ class _LoadBalancedSession(PolicySession):
         # 获取重试配置
         max_retry_int = _normalize_max_retry(current_model.get("max_retry"))
         delay = _normalize_retry_interval(current_model.get("retry_interval"))
+        retry_same_model = should_retry_same_model(error)
         
         # 判断是否应该重试当前模型
-        if self._model_retry_used < max_retry_int:
+        if retry_same_model and self._model_retry_used < max_retry_int:
             self._model_retry_used += 1
             self._attempts_used += 1
             return ModelStep(
@@ -213,7 +215,12 @@ class _LoadBalancedSession(PolicySession):
         # 选择下一个最佳模型
         next_model = self._select_best_model()
         if next_model is None:
-            return ModelStep(model=None, meta={"reason": "all_models_failed"})
+            return ModelStep(
+                model=None,
+                meta={
+                    "reason": "non_retryable_error" if not retry_same_model else "all_models_failed",
+                },
+            )
         
         next_model_name = next_model.get("model_identifier", "unknown")
         self._current_model_name = next_model_name
@@ -225,10 +232,12 @@ class _LoadBalancedSession(PolicySession):
         
         return ModelStep(
             model=next_model,
+            delay_seconds=0.0,
             meta={
                 "model_name": next_model_name,
                 "attempt": self._attempts_used,
                 "switch": True,
+                **({"reason": "non_retryable_error"} if not retry_same_model else {}),
             },
         )
 

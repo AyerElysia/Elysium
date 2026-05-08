@@ -1,11 +1,11 @@
 # 附录 D · 可观测性 API 摘要
 
-> **用途**：说明 Neo-MoFox 如何把内部状态暴露给调试、监控和课程验收。完整端点实现以开源仓库为准：<https://github.com/AyerElysia/Neo-MoFox-Soul>。  
+> **用途**：说明 Neo-MoFox-Soul 如何把内部状态暴露给调试、监控和课程验收。完整端点实现以开源仓库为准：<https://github.com/AyerElysia/Neo-MoFox-Soul>。
 > **主要实现位置**：`plugins/life_engine/monitor/router.py`
 
 ---
 
-本附录不再列出完整 REST 文档和所有字段示例，只保留课程报告需要的可观测性证据。可观测性是 Neo-MoFox 与单纯聊天 prompt 的关键区别：系统内部变量可以被读取、比较和复查。
+本附录不再列出完整 REST 文档和所有字段示例，只保留课程报告需要的可观测性证据。可观测性是 Neo-MoFox-Soul 与单纯聊天 prompt 的关键区别：系统内部变量可以被读取、比较和复查。
 
 ## D.1 快照接口
 

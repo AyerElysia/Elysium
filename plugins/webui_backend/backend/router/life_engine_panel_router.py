@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import tomllib
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +27,7 @@ _LIFE_CONFIG_PATH = Path("config/plugins/life_engine/config.toml")
 _DEFAULT_WORKSPACE = Path("data/life_engine_workspace")
 _CONTEXT_FILE = "life_engine_context.json"
 _TODO_FILE = "todos.json"
-_INACTIVE_TODO_STATUSES = {"completed", "released", "cherished"}
+_INACTIVE_TODO_STATUSES = {"completed", "cancelled", "archived", "released", "cherished"}
 
 
 def _load_json_file(path: Path, default: Any) -> Any:
@@ -59,6 +60,56 @@ def _resolve_life_workspace() -> Path:
     return resolved
 
 
+def _extract_todos_payload(todos_data: Any) -> tuple[int, list[dict[str, Any]], bool]:
+    """兼容旧 list 型 TODO 和 v2 结构。"""
+    if isinstance(todos_data, dict):
+        version = int(todos_data.get("version") or 0)
+        tasks = todos_data.get("tasks")
+        return version, [item for item in tasks if isinstance(item, dict)] if isinstance(tasks, list) else [], False
+    if isinstance(todos_data, list):
+        return 1, [item for item in todos_data if isinstance(item, dict)], True
+    return 0, [], False
+
+
+def _todo_needs_review(todo: dict[str, Any]) -> bool:
+    review_at = str(todo.get("next_review_at") or "").strip()
+    if not review_at:
+        return False
+    try:
+        text = f"{review_at[:-1]}+00:00" if review_at.endswith("Z") else review_at
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.astimezone()
+        else:
+            dt = dt.astimezone()
+        return dt <= datetime.now().astimezone()
+    except Exception:
+        return False
+
+
+def _todo_is_overdue(todo: dict[str, Any]) -> bool:
+    due_at = str(todo.get("due_at") or todo.get("deadline") or "").strip()
+    if not due_at:
+        return False
+    try:
+        text = f"{due_at[:-1]}+00:00" if due_at.endswith("Z") else due_at
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.astimezone()
+        else:
+            dt = dt.astimezone()
+        return dt < datetime.now().astimezone()
+    except Exception:
+        return False
+
+
+def _todo_is_recurring(todo: dict[str, Any]) -> bool:
+    recurrence = todo.get("recurrence")
+    if isinstance(recurrence, dict):
+        return str(recurrence.get("kind") or "none") != "none"
+    return bool(recurrence and str(recurrence) != "none")
+
+
 def _build_panel_snapshot(event_limit: int = 200, include_completed_todos: bool = False) -> dict[str, Any]:
     """构建 life_engine 面板快照。"""
     workspace = _resolve_life_workspace()
@@ -66,7 +117,7 @@ def _build_panel_snapshot(event_limit: int = 200, include_completed_todos: bool 
     todo_path = workspace / _TODO_FILE
 
     context_data = _load_json_file(context_path, default={})
-    todos_data = _load_json_file(todo_path, default=[])
+    todos_data = _load_json_file(todo_path, default={})
 
     state = context_data.get("state", {}) if isinstance(context_data, dict) else {}
     history_events = context_data.get("event_history", []) if isinstance(context_data, dict) else []
@@ -86,17 +137,16 @@ def _build_panel_snapshot(event_limit: int = 200, include_completed_todos: bool 
     if event_limit > 0:
         all_events = all_events[-event_limit:]
 
+    todo_version, todo_items, legacy_todos = _extract_todos_payload(todos_data)
     todos: list[dict[str, Any]] = []
-    if isinstance(todos_data, list):
-        for item in todos_data:
-            if not isinstance(item, dict):
-                continue
-            status = str(item.get("status") or "")
-            if not include_completed_todos and status in _INACTIVE_TODO_STATUSES:
-                continue
-            todos.append(item)
+    for item in todo_items:
+        status = str(item.get("status") or "")
+        if not include_completed_todos and status in _INACTIVE_TODO_STATUSES:
+            continue
+        todos.append(item)
 
     todos.sort(key=lambda t: str(t.get("updated_at") or t.get("created_at") or ""), reverse=True)
+    active_todos = [item for item in todo_items if str(item.get("status") or "") not in _INACTIVE_TODO_STATUSES]
 
     return {
         "workspace_path": str(workspace),
@@ -108,6 +158,12 @@ def _build_panel_snapshot(event_limit: int = 200, include_completed_todos: bool 
             "history_event_count": len(history_events),
             "pending_event_count": len(pending_events),
             "todo_count": len(todos),
+            "todo_version": todo_version,
+            "legacy_todos": legacy_todos,
+            "active_todo_count": len(active_todos),
+            "overdue_todo_count": sum(1 for item in active_todos if _todo_is_overdue(item)),
+            "needs_review_todo_count": sum(1 for item in active_todos if _todo_needs_review(item)),
+            "recurring_todo_count": sum(1 for item in active_todos if _todo_is_recurring(item)),
         },
         "events": all_events,
         "todos": todos,

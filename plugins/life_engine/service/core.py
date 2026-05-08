@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Any
 from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
 from src.app.plugin_system.api.log_api import get_logger
 from src.core.components.base import BaseService
-from src.core.components.base.chatter import BaseChatter
 from src.core.components.utils import should_strip_auto_reason_argument
 from src.core.models.message import Message
 from src.kernel.concurrency import get_task_manager
@@ -39,6 +38,7 @@ from .audit import (
     log_message_received,
     log_wake_context_injected,
 )
+from ..core.chat_history import build_chat_history_text, message_flag
 from ..core.config import LifeEngineConfig
 from ..core.tool_parallel import iter_life_tool_call_batches
 from ..streams.manager import ThoughtStreamManager
@@ -47,6 +47,7 @@ from ..drives.rules import DEFAULT_RULES
 from ..constants import (
     HEARTBEAT_IDLE_CRITICAL_THRESHOLD,
     HEARTBEAT_IDLE_WARNING_THRESHOLD,
+    LIFE_CHATTER_GLOBAL_CURSOR_KEY,
 )
 from ..memory.prompting import (
     build_memory_maintenance_prompt,
@@ -72,6 +73,8 @@ from .state_manager import (
     get_file_metadata,
     minutes_since_time,
 )
+from .attention import AttentionRouter
+from .event_bus import LifeEventBus, RawEventStore
 from .integrations import (
     DFCIntegration,
     SNNIntegration,
@@ -146,6 +149,8 @@ class LifeEngineService(BaseService):
 
         # 状态持久化
         self._state_persistence: StatePersistence | None = None
+        self._event_bus: LifeEventBus | None = None
+        self._attention_router: AttentionRouter | None = None
         self._legacy_config_warning_emitted: bool = False
         self._last_memory_maintenance_prompt_at: str | None = None
 
@@ -159,6 +164,16 @@ class LifeEngineService(BaseService):
         if self._lock is None:
             self._lock = asyncio.Lock()
         return self._lock
+
+    def _get_event_bus(self) -> LifeEventBus:
+        if self._event_bus is None:
+            self._event_bus = LifeEventBus(RawEventStore(self._workspace_dir()))
+        return self._event_bus
+
+    def _get_attention_router(self) -> AttentionRouter:
+        if self._attention_router is None:
+            self._attention_router = AttentionRouter()
+        return self._attention_router
 
     def _cfg(self) -> LifeEngineConfig:
         config = getattr(self.plugin, "config", None)
@@ -523,6 +538,23 @@ class LifeEngineService(BaseService):
             "tool_success": event.tool_success,
         }
 
+    async def _publish_raw_events(self, events: list[LifeEngineEvent]) -> None:
+        """Mirror legacy service events into the unified raw event log."""
+        if not events:
+            return
+        try:
+            await self._get_event_bus().publish_legacy_events(events)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"life_engine raw event 写入失败（已跳过）: {exc}", exc_info=True)
+
+    async def _queue_pending_event(self, event: LifeEngineEvent) -> None:
+        """Append an event to the compatibility pending queue and raw bus."""
+        async with self._get_lock():
+            self._pending_events.append(event)
+            self._state.pending_event_count = len(self._pending_events)
+        await self._publish_raw_events([event])
+        await self._save_runtime_context()
+
     def _serialize_stream_message(
         self,
         message: Message,
@@ -877,6 +909,7 @@ class LifeEngineService(BaseService):
             if direction == "received":
                 self._state.last_external_message_at = event.timestamp
                 unlocked_self_pause = self._clear_self_pause_state()
+        await self._publish_raw_events([event])
         await self._save_runtime_context()
         if unlocked_self_pause:
             logger.info(
@@ -926,10 +959,7 @@ class LifeEngineService(BaseService):
             sender_name=sender_name,
         )
 
-        async with self._get_lock():
-            self._pending_events.append(event)
-            self._state.pending_event_count = len(self._pending_events)
-        await self._save_runtime_context()
+        await self._queue_pending_event(event)
 
         log_message_received(
             received_at=event.timestamp,
@@ -1004,10 +1034,7 @@ class LifeEngineService(BaseService):
             sender_name=sender_name,
         )
 
-        async with self._get_lock():
-            self._pending_events.append(event)
-            self._state.pending_event_count = len(self._pending_events)
-        await self._save_runtime_context()
+        await self._queue_pending_event(event)
 
         log_message_received(
             received_at=event.timestamp,
@@ -1064,10 +1091,7 @@ class LifeEngineService(BaseService):
             sender_name=sender_name,
         )
 
-        async with self._get_lock():
-            self._pending_events.append(event)
-            self._state.pending_event_count = len(self._pending_events)
-        await self._save_runtime_context()
+        await self._queue_pending_event(event)
 
         logger.info(
             "life_engine 已接收主动机会事件: "
@@ -1113,10 +1137,7 @@ class LifeEngineService(BaseService):
             topic=topic,
         )
 
-        async with self._get_lock():
-            self._pending_events.append(event)
-            self._state.pending_event_count = len(self._pending_events)
-        await self._save_runtime_context()
+        await self._queue_pending_event(event)
 
         logger.info(
             "life_engine 已记录对话器内心独白: "
@@ -1140,7 +1161,11 @@ class LifeEngineService(BaseService):
         decision: str = "",
         expected_response: str = "",
     ) -> dict[str, Any]:
-        """记录当前聊天流最近一次 action-think 快照。"""
+        """记录 life_chatter 最近一次 action-think 快照。
+
+        新的统一主意识链路使用全局快照；同时保留按 stream 写入，兼容旧工具和
+        已持久化状态。
+        """
         if not self._is_enabled():
             raise RuntimeError("life_engine 未启用")
 
@@ -1161,11 +1186,13 @@ class LifeEngineService(BaseService):
 
         async with self._get_lock():
             latest = dict(self._state.last_chatter_think_by_stream or {})
-            latest[sid] = {
+            compact_snapshot = {
                 key: value
                 for key, value in snapshot.items()
                 if isinstance(value, str) and value.strip()
             }
+            latest[sid] = compact_snapshot
+            latest[LIFE_CHATTER_GLOBAL_CURSOR_KEY] = compact_snapshot
             self._state.last_chatter_think_by_stream = latest
         await self._save_runtime_context()
 
@@ -1178,18 +1205,12 @@ class LifeEngineService(BaseService):
     async def record_tool_call(self, tool_name: str, tool_args: dict[str, Any]) -> None:
         """记录工具调用事件。"""
         event = self._event_builder.build_tool_call_event(tool_name, tool_args)
-        async with self._get_lock():
-            self._pending_events.append(event)
-            self._state.pending_event_count = len(self._pending_events)
-        await self._save_runtime_context()
+        await self._queue_pending_event(event)
 
     async def record_tool_result(self, tool_name: str, result: str, success: bool) -> None:
         """记录工具返回结果事件。"""
         event = self._event_builder.build_tool_result_event(tool_name, result, success)
-        async with self._get_lock():
-            self._pending_events.append(event)
-            self._state.pending_event_count = len(self._pending_events)
-        await self._save_runtime_context()
+        await self._queue_pending_event(event)
 
     async def _collect_background_agent_results(self) -> None:
         """收集已完成的后台智能体结果，注入为事件。"""
@@ -1222,7 +1243,12 @@ class LifeEngineService(BaseService):
             self._state.pending_event_count = 0
         return pending
 
-    async def _append_history(self, events: list[LifeEngineEvent]) -> None:
+    async def _append_history(
+        self,
+        events: list[LifeEngineEvent],
+        *,
+        publish_raw: bool = True,
+    ) -> None:
         """将事件追加到滚动历史中，支持压缩。"""
         if not events:
             return
@@ -1236,6 +1262,8 @@ class LifeEngineService(BaseService):
                 self._event_history = compress_history(self._event_history, limit)
 
             self._state.history_event_count = len(self._event_history)
+        if publish_raw:
+            await self._publish_raw_events(events)
         await self._save_runtime_context()
 
     async def clear_runtime_context(self) -> None:
@@ -1266,7 +1294,10 @@ class LifeEngineService(BaseService):
                 line = f"[{time_display}] 📨 {source_short}"
                 line += f"\n    └─ {event.sender}: {event.content}"
             elif event.event_type == EventType.HEARTBEAT:
-                line = f"[{time_display}] 💭 心跳#{event.heartbeat_index}"
+                if str(event.content_type or "").strip().lower() == "attention_summary":
+                    line = f"[{time_display}] 🧠 潜意识摘要"
+                else:
+                    line = f"[{time_display}] 💭 心跳#{event.heartbeat_index}"
                 line += f"\n    └─ {event.content}"
             elif event.event_type == EventType.TOOL_CALL:
                 line = f"[{time_display}] 🔧 {event.tool_name}"
@@ -1298,11 +1329,14 @@ class LifeEngineService(BaseService):
         event: LifeEngineEvent,
         *,
         current_stream_id: str,
+        unified_chatter_context: bool = False,
     ) -> bool:
         """判断事件是否应自动给 life_chatter 作为同源运行态可见。"""
         event_type = event.event_type
         if event_type == EventType.HEARTBEAT:
             stream_id = str(event.stream_id or "").strip()
+            if unified_chatter_context:
+                return True
             return bool(not stream_id or stream_id == current_stream_id)
         if event_type in {EventType.TOOL_CALL, EventType.TOOL_RESULT, EventType.AGENT_RESULT}:
             return True
@@ -1314,14 +1348,35 @@ class LifeEngineService(BaseService):
         if current_stream_id and stream_id == current_stream_id:
             return content_type != "text"
 
+        if unified_chatter_context and stream_id:
+            return True
+
         if content_type in {"heartbeat_reply", "chatter_inner_monologue", "tool_call", "tool_result"}:
             return True
         if content_type in {"proactive_opportunity", "dfc_message", "direct_message"}:
             return bool(not stream_id or stream_id == current_stream_id)
         return source == "life_engine" and not stream_id
 
-    def _chatter_event_cursor(self, stream_id: str) -> int:
-        sid = str(stream_id or "").strip()
+    @staticmethod
+    def _chatter_cursor_key(
+        stream_id: str,
+        *,
+        unified_chatter_context: bool = False,
+    ) -> str:
+        if unified_chatter_context:
+            return LIFE_CHATTER_GLOBAL_CURSOR_KEY
+        return str(stream_id or "").strip()
+
+    def _chatter_event_cursor(
+        self,
+        stream_id: str,
+        *,
+        unified_chatter_context: bool = False,
+    ) -> int:
+        sid = self._chatter_cursor_key(
+            stream_id,
+            unified_chatter_context=unified_chatter_context,
+        )
         if not sid:
             return 0
         return int((self._state.chatter_context_cursors or {}).get(sid, 0) or 0)
@@ -1330,8 +1385,16 @@ class LifeEngineService(BaseService):
     def _chatter_context_cursor(self, stream_id: str) -> int:
         return self._chatter_event_cursor(stream_id)
 
-    def _chatter_thought_cursor(self, stream_id: str) -> int:
-        sid = str(stream_id or "").strip()
+    def _chatter_thought_cursor(
+        self,
+        stream_id: str,
+        *,
+        unified_chatter_context: bool = False,
+    ) -> int:
+        sid = self._chatter_cursor_key(
+            stream_id,
+            unified_chatter_context=unified_chatter_context,
+        )
         if not sid:
             return 0
         return int((self._state.chatter_thought_cursors or {}).get(sid, 0) or 0)
@@ -1340,13 +1403,18 @@ class LifeEngineService(BaseService):
         self,
         stream_id: str,
         sequence: int,
+        *,
+        unified_chatter_context: bool = False,
     ) -> None:
         """标记某个聊天流已经看过的 life 事件流高水位（event cursor）。
 
         thought_revision cursor 在 build_chatter_runtime_context 渲染时已内部提交，
         外部调用方仍只需要传 event 序列高水位。
         """
-        sid = str(stream_id or "").strip()
+        sid = self._chatter_cursor_key(
+            stream_id,
+            unified_chatter_context=unified_chatter_context,
+        )
         if not sid or sequence <= 0:
             return
         async with self._get_lock():
@@ -1357,8 +1425,13 @@ class LifeEngineService(BaseService):
         self,
         stream_id: str,
         revision: int,
+        *,
+        unified_chatter_context: bool = False,
     ) -> None:
-        sid = str(stream_id or "").strip()
+        sid = self._chatter_cursor_key(
+            stream_id,
+            unified_chatter_context=unified_chatter_context,
+        )
         if not sid or revision <= 0:
             return
         async with self._get_lock():
@@ -1409,8 +1482,16 @@ class LifeEngineService(BaseService):
             logger.debug(f"构建 chatter 思考流快照失败: {exc}")
             return "", 0
 
-    def _format_latest_chatter_think(self, stream_id: str) -> str:
-        sid = str(stream_id or "").strip()
+    def _format_latest_chatter_think(
+        self,
+        stream_id: str,
+        *,
+        unified_chatter_context: bool = False,
+    ) -> str:
+        sid = self._chatter_cursor_key(
+            stream_id,
+            unified_chatter_context=unified_chatter_context,
+        )
         if not sid:
             return ""
         snapshot = (self._state.last_chatter_think_by_stream or {}).get(sid)
@@ -1440,12 +1521,7 @@ class LifeEngineService(BaseService):
 
     @staticmethod
     def _message_flag(message: Message, flag_name: str) -> bool:
-        if bool(getattr(message, flag_name, False)):
-            return True
-        extra = getattr(message, "extra", None)
-        if isinstance(extra, dict):
-            return bool(extra.get(flag_name, False))
-        return False
+        return message_flag(message, flag_name)
 
     @classmethod
     def _build_recent_chat_history_text(
@@ -1453,29 +1529,13 @@ class LifeEngineService(BaseService):
         chat_stream: Any,
         *,
         max_messages: int,
+        unified_chatter_context: bool = False,
     ) -> str:
-        if max_messages <= 0:
-            return ""
-
-        context = getattr(chat_stream, "context", None)
-        history_messages = list(getattr(context, "history_messages", []) or [])
-        if not history_messages:
-            return ""
-
-        filtered = [
-            message
-            for message in history_messages
-            if not (
-                cls._message_flag(message, "is_inner_monologue")
-                or cls._message_flag(message, "is_proactive_opportunity_trigger")
-                or cls._message_flag(message, "is_proactive_followup_trigger")
-            )
-        ]
-        if not filtered:
-            return ""
-
-        lines = [BaseChatter.format_message_line(msg) for msg in filtered[-max_messages:]]
-        return "\n".join(lines)
+        return build_chat_history_text(
+            chat_stream,
+            max_messages=max_messages,
+            global_history=unified_chatter_context,
+        )
 
     @staticmethod
     def _is_salient_event(
@@ -1483,6 +1543,7 @@ class LifeEngineService(BaseService):
         *,
         current_stream_id: str,
         cfg_runtime: Any,
+        unified_chatter_context: bool = False,
     ) -> bool:
         """判定事件是否进入 chatter 的"最近关键活动"尾巴。
 
@@ -1497,6 +1558,8 @@ class LifeEngineService(BaseService):
         if event_type == EventType.HEARTBEAT:
             # 只保留 chatter 自己产生的 inner_monologue 心跳
             if content_type == "chatter_inner_monologue" and getattr(cfg_runtime, "salient_tail_include_inner_monologue", True):
+                if unified_chatter_context:
+                    return True
                 return bool(not stream_id or stream_id == current_stream_id)
             return False
 
@@ -1516,6 +1579,8 @@ class LifeEngineService(BaseService):
             if content_type in {"dfc_message", "direct_message", "proactive_opportunity"}:
                 if not getattr(cfg_runtime, "salient_tail_include_direct_messages", True):
                     return False
+                if unified_chatter_context:
+                    return True
                 return bool(not stream_id or stream_id == current_stream_id)
             # 其它消息不进入 salient tail（chat history 已覆盖）
             return False
@@ -1553,6 +1618,7 @@ class LifeEngineService(BaseService):
         cursor: int,
         *,
         current_stream_id: str,
+        unified_chatter_context: bool = False,
     ) -> tuple[str, int]:
         """从事件流派生最近关键活动尾巴。
 
@@ -1571,7 +1637,10 @@ class LifeEngineService(BaseService):
             e for e in events
             if int(getattr(e, "sequence", 0) or 0) > cursor
             and self._is_salient_event(
-                e, current_stream_id=current_stream_id, cfg_runtime=cfg_runtime
+                e,
+                current_stream_id=current_stream_id,
+                cfg_runtime=cfg_runtime,
+                unified_chatter_context=unified_chatter_context,
             )
         ]
         if not candidates:
@@ -1625,6 +1694,8 @@ class LifeEngineService(BaseService):
         *,
         runtime_context_text: str = "",
         event_limit: int = 80,
+        unified_chatter_context: bool = False,
+        include_recent_chat_history: bool = True,
     ) -> tuple[str, int]:
         """构建给 life_chatter 的同源运行态快照。
 
@@ -1641,8 +1712,14 @@ class LifeEngineService(BaseService):
           7. ### 最近关键活动  （仅在没有新增事件流时作为兜底摘要）
         """
         stream_id = str(getattr(chat_stream, "stream_id", "") or "").strip()
-        event_cursor = self._chatter_event_cursor(stream_id)
-        thought_cursor = self._chatter_thought_cursor(stream_id)
+        event_cursor = self._chatter_event_cursor(
+            stream_id,
+            unified_chatter_context=unified_chatter_context,
+        )
+        thought_cursor = self._chatter_thought_cursor(
+            stream_id,
+            unified_chatter_context=unified_chatter_context,
+        )
         _ = event_limit  # 兼容老签名；新逻辑用配置项控制条数
 
         cfg = self._cfg()
@@ -1677,14 +1754,26 @@ class LifeEngineService(BaseService):
             and self._event_belongs_to_life_runtime(
                 event,
                 current_stream_id=stream_id,
+                unified_chatter_context=unified_chatter_context,
             )
         ]
-        omitted_event_count = max(0, len(relevant_events) - limit)
-        selected_events = relevant_events[-limit:]
-        new_event_high_water = max(
-            (int(event.sequence or 0) for event in relevant_events),
-            default=event_cursor,
-        )
+        if unified_chatter_context:
+            attention_window = self._get_attention_router().select(
+                relevant_events,
+                cursor=event_cursor,
+                current_stream_id=stream_id,
+                max_events=min(limit, 40),
+            )
+            selected_events = attention_window.events
+            omitted_event_count = attention_window.dropped_count
+            new_event_high_water = max(attention_window.high_water, event_cursor)
+        else:
+            omitted_event_count = max(0, len(relevant_events) - limit)
+            selected_events = relevant_events[-limit:]
+            new_event_high_water = max(
+                (int(event.sequence or 0) for event in relevant_events),
+                default=event_cursor,
+            )
 
         sections: list[str] = []
 
@@ -1705,7 +1794,10 @@ class LifeEngineService(BaseService):
             new_thought_revision = max(thought_cursor, current_revision)
 
         if latest_think_enabled:
-            latest_think_text = self._format_latest_chatter_think(stream_id)
+            latest_think_text = self._format_latest_chatter_think(
+                stream_id,
+                unified_chatter_context=unified_chatter_context,
+            )
             if latest_think_text:
                 sections.append(f"### 最近一次 action-think\n{latest_think_text}")
 
@@ -1713,10 +1805,11 @@ class LifeEngineService(BaseService):
         if runtime_text:
             sections.append(f"### 运行时内心独白\n{runtime_text}")
 
-        if recent_chat_enabled and recent_chat_messages > 0:
+        if include_recent_chat_history and recent_chat_enabled and recent_chat_messages > 0:
             recent_chat_text = self._build_recent_chat_history_text(
                 chat_stream,
                 max_messages=recent_chat_messages,
+                unified_chatter_context=unified_chatter_context,
             )
             if recent_chat_text:
                 sections.append(
@@ -1727,14 +1820,17 @@ class LifeEngineService(BaseService):
             event_text = self._build_wake_context_text(selected_events)
             if omitted_event_count:
                 event_text = (
-                    f"（还有 {omitted_event_count} 条更早的 life 事件未自动展开；"
-                    "需要时用 grep_life_events 检索。）\n"
+                    f"（潜意识已压缩 {omitted_event_count} 条低显著 life 事件；"
+                    "需要时用 grep_life_events 检索历史事件。）\n"
                     f"{event_text}"
                 )
             sections.append(f"### 新增 life 事件流\n{event_text}")
 
         salient_body, salient_high_water = self._build_salient_activity_tail(
-            events, event_cursor, current_stream_id=stream_id
+            events,
+            event_cursor,
+            current_stream_id=stream_id,
+            unified_chatter_context=unified_chatter_context,
         )
         if salient_body and not selected_events:
             sections.append(f"### 最近关键活动\n{salient_body}")
@@ -1742,7 +1838,11 @@ class LifeEngineService(BaseService):
 
         # thought delta cursor 在渲染阶段直接提交（不等待 LLM 调用成功）
         if new_thought_revision > thought_cursor:
-            await self._commit_chatter_thought_cursor(stream_id, new_thought_revision)
+            await self._commit_chatter_thought_cursor(
+                stream_id,
+                new_thought_revision,
+                unified_chatter_context=unified_chatter_context,
+            )
 
         if not sections:
             return "", new_event_high_water
@@ -1783,7 +1883,7 @@ class LifeEngineService(BaseService):
         """把当前待处理事件注入到系统提醒。"""
         events = await self.drain_pending_events()
         if events:
-            await self._append_history(events)
+            await self._append_history(events, publish_raw=False)
 
         async with self._get_lock():
             context_events = list(self._event_history)
@@ -1792,6 +1892,12 @@ class LifeEngineService(BaseService):
             clear_wake_context_reminder()
             return ""
 
+        window = self._get_attention_router().select(
+            context_events,
+            cursor=0,
+            current_stream_id="",
+        )
+        context_events = window.events
         content = self._build_wake_context_text(context_events)
         from src.core.prompt import get_system_reminder_store
         from .state_manager import _TARGET_REMINDER_BUCKET, _TARGET_REMINDER_NAME
@@ -1944,11 +2050,25 @@ class LifeEngineService(BaseService):
                         neuromod_state = self._inner_state.get_full_state()
                     except Exception:  # noqa: BLE001
                         pass
+                has_urgent_todos = False
+                try:
+                    from ..tools.todo_tools import TodoStorage
+
+                    active_todos = [
+                        todo for todo in TodoStorage(self._workspace_dir()).load()
+                        if todo.status not in {"completed", "cancelled", "archived"}
+                    ]
+                    has_urgent_todos = any(
+                        todo.priority == "urgent" or todo.is_overdue() or todo.needs_review()
+                        for todo in active_todos
+                    )
+                except Exception:  # noqa: BLE001
+                    has_urgent_todos = False
                 context = {
                     "silence_minutes": minutes_since_external or 0,
                     "idle_heartbeats": idle_heartbeats,
                     "has_active_thoughts": bool(self._thought_manager and self._thought_manager.list_active()),
-                    "has_urgent_todos": False,  # TODO: integrate with TODO system
+                    "has_urgent_todos": has_urgent_todos,
                 }
                 suggestions = self._impulse_engine.evaluate(neuromod_state, context)
                 impulse_text = self._impulse_engine.format_for_prompt(
@@ -1977,12 +2097,16 @@ class LifeEngineService(BaseService):
             "1. **思考** — 推进你正在想的思考流（`nucleus_manage_thought_stream` action=advance）",
             "2. **探索** — 搜索感兴趣的东西（`nucleus_web_search`）、阅读记忆（`nucleus_search_memory`）",
             "3. **补充上下文** — 给表达层补充它当前看不到、但对对话可能重要的信息差（`nucleus_tell_dfc`）",
-            "4. **直接开口** — 如果你自己就想说一句，直接在聊天里发出去（`nucleus_initiate_topic`）",
-            "5. **记录** — 写下感悟（`nucleus_write_file`）、管理待办（`nucleus_manage_todo`）",
-            "6. **新建思考流** — 开始琢磨一个新话题（`nucleus_manage_thought_stream` action=create）",
-            "7. **主动休息** — 如果你觉得需要安静下来，可以用 `nucleus_rest_heartbeat` 暂停心跳一段时间；外界有新消息会自动醒来",
-            "8. **看见屏幕** — 如果你需要了解 Ayer 电脑上正在发生什么，可以用 `nucleus_view_screen` 截屏并观察",
-            "9. **什么都不做** — 休息也是可以的", "",
+            "4. **记录** — 写下感悟（`nucleus_write_file`）、管理待办（`nucleus_manage_todo`）",
+            "5. **新建思考流** — 开始琢磨一个新话题（`nucleus_manage_thought_stream` action=create）",
+            "6. **主动休息** — 如果你觉得需要安静下来，可以用 `nucleus_rest_heartbeat` 暂停心跳一段时间；外界有新消息会自动醒来",
+            "7. **看见屏幕** — 如果你需要了解 Ayer 电脑上正在发生什么，可以用 `nucleus_view_screen` 截屏并观察",
+            "8. **什么都不做** — 休息也是可以的", "",
+            "### `nucleus_manage_todo` — 承诺行动", "",
+            "TODO 是承诺行动，不是愿望清单。只有当你能说明下一步和复盘/提醒时间时才创建。",
+            "创建 TODO 时必须有 `next_action`，并且有 `due_at`、`remind_at`、`next_review_at` 或 `recurrence` 至少一项。",
+            "如果 TODO 涉及你对 Ayer 的承诺或共同目标，设为 `visibility=shared`，并让表达层在自然对话中告诉她。",
+            "TODO 到点提醒只是主动机会：先判断是否适合推进、复盘或开口，不要机械发送提醒。", "",
             "### `nucleus_tell_dfc` — 给表达层补充信息差", "",
             "这个工具用于补充背景，不用于指导表达层怎么说、怎么做。", "",
             "你应该用它：",
@@ -1992,7 +2116,7 @@ class LifeEngineService(BaseService):
             "你不该用它：",
             "- 替表达层写回复、写台词、写步骤",
             "- 告诉表达层“立刻去做什么”“不要怎么说”“应该怎么问”",
-            "- 你自己其实就想直接说一句：这种情况用 `nucleus_initiate_topic`", "",
+            "- 你自己其实就想直接说一句：这种情况交给表达层在正常对话里处理", "",
             "记住：`nucleus_tell_dfc` 是补信息差，不是遥控器。", "",
             "### 工具边界", "",
             "- `nucleus_search_memory` 是历史检索，不要反复重搜同一主题",
@@ -2023,7 +2147,8 @@ class LifeEngineService(BaseService):
             "- 你可以行动，也可以休息——两者都是正常的",
             "- 不要重复上一轮的想法",
             "- 有冲动就行动，不要等「完美时机」",
-            "- 思考流比待办更重要：待办是别人给你的，思考流是你自己的",
+            "- 思考流用于持续探索，TODO 用于把承诺落地；不要让承诺只停在漂亮的自我叙述里",
+            "- 看到需要复盘、逾期或卡住的 TODO，要选择推进、重排、取消或归档",
             "- 如果你没有什么想做的事，看看你的思考流有没有可以推进的",
             "- 休息的时候，就是在休息——不需要为此感到不安", "",
             "---", "",
@@ -2151,14 +2276,14 @@ class LifeEngineService(BaseService):
 
     def _get_nucleus_tools(self) -> list[type]:
         """获取中枢可用的工具类列表。"""
-        from ..tools import ALL_TOOLS, TODO_TOOLS, WEB_TOOLS, SOCIAL_TOOLS
+        from ..tools import ALL_TOOLS, TODO_TOOLS, WEB_TOOLS
         from ..memory.tools import MEMORY_TOOLS
         from ..streams.tools import STREAM_TOOLS
         from ..tools.grep_tools import GREP_TOOLS
         from ..tools.schedule_tools import SCHEDULE_TOOLS
         from ..tools.event_grep_tools import EVENT_GREP_TOOLS
 
-        return ALL_TOOLS + TODO_TOOLS + MEMORY_TOOLS + GREP_TOOLS + WEB_TOOLS + STREAM_TOOLS + SOCIAL_TOOLS + SCHEDULE_TOOLS + EVENT_GREP_TOOLS
+        return ALL_TOOLS + TODO_TOOLS + MEMORY_TOOLS + GREP_TOOLS + WEB_TOOLS + STREAM_TOOLS + SCHEDULE_TOOLS + EVENT_GREP_TOOLS
 
     @staticmethod
     def _heartbeat_tool_call_metadata(call: Any) -> tuple[str, dict[str, Any]]:

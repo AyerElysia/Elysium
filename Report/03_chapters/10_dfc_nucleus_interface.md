@@ -31,10 +31,10 @@ Neo-MoFox 的双轨架构（Dual-Track Architecture）在逻辑上划分为两�
 
 `nucleus_wake_dfc` 并不是一个单一函数，而是一条由两个协议共同构成的**中枢主动唤醒 DFC**的通道。其核心语义是：生命中枢在心跳中决定"我要向用户主动说点什么"，并将这一意图发送给 DFC 执行。
 
-实现上，这条通道通过 `DFCIntegration`（`plugins/life_engine/service/integrations.py:79`）管理。当 LLM 心跳调用 `nucleus_tell_dfc` 工具（`social_tools.py`）时，工具执行逻辑如下：
+实现上，这条通道通过 `DFCIntegration`（`plugins/life_engine/service/integrations.py:79`）管理。当 LLM 心跳调用 `nucleus_tell_dfc` 工具（`file_tools.py`）时，工具执行逻辑如下：
 
 ```python
-# social_tools.py 内部执行路径
+# file_tools.py 内部执行路径
 1. await service.record_tell_dfc()          # 更新 last_tell_dfc_at 时间戳
 2. push_runtime_assistant_injection(        # 注入 DFC 的 runtime payload 队列
        stream_id=target_stream_id,
@@ -86,7 +86,7 @@ class ConsultNucleusTool(BaseTool):
 
 ### 10.2.3 `nucleus_tell_dfc`：中枢→DFC 的 Runtime Injection
 
-从功能上看，`nucleus_tell_dfc`（`social_tools.py`）是 §10.2.1 描述的 `nucleus_wake_dfc` 通道的具体工具形式——是 LLM 在心跳中调用以"传话给 DFC"的入口。但从实现层面看，它还涉及另一条更通用的机制：**运行时注入（Runtime Injection）**。
+从功能上看，`nucleus_tell_dfc`（`file_tools.py`）是 §10.2.1 描述的 `nucleus_wake_dfc` 通道的具体工具形式——是 LLM 在心跳中调用以"传话给 DFC"的入口。但从实现层面看，它还涉及另一条更通用的机制：**运行时注入（Runtime Injection）**。
 
 运行时注入的核心是 `push_runtime_assistant_injection` 函数（`default_chatter/plugin.py:719`）。该函数维护一个全局字典：
 
@@ -293,4 +293,4 @@ B 报告的原文措辞值得原文引用：
 
 ---
 
-*本章代码锚点汇总：`integrations.py:79`（DFCIntegration 类定义）、`integrations.py:130`（状态摘要构建）、`integrations.py:241`（梦境注入）、`integrations.py:266`（裸引用锚点）、`social_tools.py`（nucleus\_tell\_dfc 工具）、`consult_nucleus.py:26`（ConsultNucleusTool）、`consult_nucleus.py:103`（IntelligentMemoryRetrievalTool）、`default_chatter/plugin.py:719`（push\_runtime\_assistant\_injection）、`prompt_builder.py:119`（system prompt 构建）、`prompt_builder.py:185`（user prompt 构建）。*
+*本章代码锚点汇总：`integrations.py:79`（DFCIntegration 类定义）、`integrations.py:130`（状态摘要构建）、`integrations.py:241`（梦境注入）、`integrations.py:266`（裸引用锚点）、`file_tools.py`（nucleus\_tell\_dfc 工具）、`consult_nucleus.py:26`（ConsultNucleusTool）、`consult_nucleus.py:103`（IntelligentMemoryRetrievalTool）、`default_chatter/plugin.py:719`（push\_runtime\_assistant\_injection）、`prompt_builder.py:119`（system prompt 构建）、`prompt_builder.py:185`（user prompt 构建）。*

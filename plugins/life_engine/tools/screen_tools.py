@@ -288,13 +288,8 @@ async def _capture_screen(plugin: Any) -> CapturedScreen:
 
 
 def _native_image_enabled(plugin: Any) -> bool:
-    multimodal_cfg = _get_multimodal_cfg(plugin)
     screen_cfg = _get_screen_cfg(plugin)
-    return (
-        bool(getattr(screen_cfg, "native_when_available", True))
-        and bool(getattr(multimodal_cfg, "enabled", False))
-        and bool(getattr(multimodal_cfg, "native_image", False))
-    )
+    return bool(getattr(screen_cfg, "native_when_available", True))
 
 
 def _build_observation_prompt(focus: str, detail: str) -> str:
@@ -425,8 +420,8 @@ class LifeEngineViewScreenTool(BaseTool):
         "- 只靠聊天上下文就能回答\n"
         "- 没有必要看屏幕却频繁窥探；屏幕可能包含隐私信息\n"
         "\n"
-        "**路径策略：** auto 模式下，life_engine.multimodal.enabled 且 native_image=true 时走原生图片视觉；"
-        "否则走 VLM/媒体识别降级路径。"
+        "**路径策略：** auto 模式下，screen.native_when_available=true 时走原生图片视觉；"
+        "否则走 VLM 降级路径。屏幕视觉与 life_chatter 原生媒体注入是独立开关。"
     )
     chatter_allow: list[str] = ["life_engine_internal", "life_chatter"]
 

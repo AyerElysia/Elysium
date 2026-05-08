@@ -150,10 +150,10 @@
     <text x="1033" y="215" text-anchor="middle" font-size="8" font-weight="600" fill="#2D2D3E">Loihi</text>
   </g>
 
-  <!-- Neo-MoFox: top-right - high continuity (9), high learning (8.5), LARGEST and HIGHLIGHTED with STAR -->
+  <!-- Neo-MoFox-Soul: top-right - high continuity (9), high learning (8.5), LARGEST and HIGHLIGHTED with STAR -->
   <g filter="url(#softShadow)">
     <circle cx="986" cy="223" r="35" fill="url(#starGrad)" stroke="#E91E63" stroke-width="3" opacity="0.95"/>
-    <text x="986" y="220" text-anchor="middle" font-size="12" font-weight="700" fill="#880E4F">Neo-MoFox</text>
+    <text x="986" y="220" text-anchor="middle" font-size="12" font-weight="700" fill="#880E4F">Neo-MoFox-Soul</text>
     <text x="986" y="235" text-anchor="middle" font-size="8" fill="#6B6B7E">★ 本工作 ★</text>
   </g>
 
@@ -178,5 +178,5 @@
     <text x="900" y="643" font-size="10" fill="#6B6B7E">气泡大小 ∝ 智能来源复杂度</text>
   </g>
 
-  <text x="600" y="775" text-anchor="middle" font-size="11" fill="#9B9BAA" font-style="italic">Figure F2 · Peer Landscape: Continuity × Learning Paradigm with Neo-MoFox Highlighted</text>
+  <text x="600" y="775" text-anchor="middle" font-size="11" fill="#9B9BAA" font-style="italic">Figure F2 · Peer Landscape: Continuity × Learning Paradigm with Neo-MoFox-Soul Highlighted</text>
 </svg>

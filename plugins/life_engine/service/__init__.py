@@ -23,6 +23,15 @@ from .state_manager import (
     clear_wake_context_reminder,
     get_file_metadata,
 )
+from .attention import AttentionRouter, AttentionWindow
+from .event_bus import (
+    LifeEvent,
+    LifeEventBus,
+    LifeEventChannel,
+    LifeEventPriority,
+    RawEventStore,
+    life_event_from_legacy,
+)
 from .integrations import (
     DFCIntegration,
     SNNIntegration,
@@ -38,6 +47,14 @@ __all__ = [
     "LifeEngineEvent",
     "LifeEngineState",
     "EventBuilder",
+    "LifeEvent",
+    "LifeEventBus",
+    "LifeEventChannel",
+    "LifeEventPriority",
+    "RawEventStore",
+    "life_event_from_legacy",
+    "AttentionRouter",
+    "AttentionWindow",
     # 状态管理
     "StatePersistence",
     "event_to_dict",

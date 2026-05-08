@@ -72,7 +72,6 @@ plugins/life_engine/
 │   ├── file_tools.py / grep_tools.py / exec_tools.py
 │   ├── web_tools.py  # Tavily API
 │   ├── todo_tools.py
-│   ├── social_tools.py  # nucleus_tell_dfc / nucleus_initiate_topic
 │   ├── schedule_tools.py
 │   ├── chat_history_tools.py
 │   └── event_grep_tools.py
@@ -276,7 +275,7 @@ async def query_actor_context(self, query: str) -> str:
 
 **② `nucleus_tell_dfc`（生命中枢主动传话给DFC）**
 
-这是 `social_tools.py` 中的工具，LLM 在心跳中调用它。执行时：
+这是 `file_tools.py` 中的工具，LLM 在心跳中调用它。执行时：
 1. 调用 `service.record_tell_dfc()` 更新时间戳
 2. 将内容注入 DFC 的 runtime assistant payload（通过 `default_chatter.push_runtime_assistant_injection`）
 
@@ -1004,7 +1003,7 @@ class ImpulseRule:
 | exec_tools.py | nucleus_exec | 受限代码执行 |
 | web_tools.py | nucleus_web_search, nucleus_browser_fetch | Tavily搜索/网页抓取 |
 | todo_tools.py | nucleus_list_todos, nucleus_create_todo, nucleus_complete_todo | TODO管理 |
-| social_tools.py | nucleus_tell_dfc, nucleus_initiate_topic | 对外发声 |
+| file_tools.py | nucleus_tell_dfc | 对外发声 |
 | schedule_tools.py | nucleus_schedule_reminder | 定时提醒 |
 | chat_history_tools.py | LifeEngineFetchChatHistoryTool | 聊天历史检索 |
 | event_grep_tools.py | nucleus_grep_life_events | 事件流搜索 |

@@ -14,8 +14,9 @@ from plugins.life_engine.tools.screen_tools import CapturedScreen
 def _make_plugin() -> SimpleNamespace:
     cfg = LifeEngineConfig()
     cfg.screen.enabled = True
+    cfg.screen.native_task_name = "vlm"
     cfg.multimodal.enabled = True
-    cfg.multimodal.native_image = True
+    cfg.multimodal.native_image = False
     cfg.model.task_name = "life"
     return SimpleNamespace(config=cfg)
 
@@ -35,7 +36,7 @@ def _fake_capture() -> CapturedScreen:
 
 
 @pytest.mark.asyncio
-async def test_view_screen_uses_native_when_multimodal_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_view_screen_uses_native_when_screen_native_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     from plugins.life_engine.tools import screen_tools
 
     plugin = _make_plugin()
@@ -58,7 +59,7 @@ async def test_view_screen_uses_native_when_multimodal_enabled(monkeypatch: pyte
     assert isinstance(result, dict)
     assert result["mode"] == "native_image"
     assert result["observation"] == "屏幕上有一个测试窗口。"
-    assert calls == ["life"]
+    assert calls == ["vlm"]
 
 
 @pytest.mark.asyncio
@@ -66,7 +67,7 @@ async def test_view_screen_falls_back_when_native_disabled(monkeypatch: pytest.M
     from plugins.life_engine.tools import screen_tools
 
     plugin = _make_plugin()
-    plugin.config.multimodal.enabled = False
+    plugin.config.screen.native_when_available = False
     calls: list[str] = []
 
     async def fake_capture(_plugin: object) -> CapturedScreen:

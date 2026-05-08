@@ -11,7 +11,9 @@ from types import SimpleNamespace
 import pytest
 
 from plugins.life_engine.core.config import LifeEngineConfig
+from plugins.life_engine.constants import LIFE_CHATTER_GLOBAL_CURSOR_KEY
 from plugins.life_engine.service import LifeEngineService
+from plugins.life_engine.service.event_bus import RAW_EVENT_LOG_FILE
 from src.kernel.llm import ROLE, ToolRegistry
 
 
@@ -172,6 +174,14 @@ async def test_enqueue_dfc_message_appends_pending_event(tmp_path: Path) -> None
     assert persisted["pending_events"][0]["event_id"] == event.event_id
     assert persisted["pending_events"][0]["content_type"] == "dfc_message"
 
+    raw_events = [
+        json.loads(line)
+        for line in (tmp_path / RAW_EVENT_LOG_FILE).read_text(encoding="utf-8").splitlines()
+    ]
+    assert raw_events[0]["event_id"] == event.event_id
+    assert raw_events[0]["channel"] == "chat"
+    assert raw_events[0]["reply_target"]["stream_id"] == "stream-1"
+
 
 @pytest.mark.asyncio
 async def test_enqueue_dfc_message_rejects_empty_message(tmp_path: Path) -> None:
@@ -297,10 +307,10 @@ async def test_heartbeat_tool_execution_keeps_declared_reason_parameter(
             return True, content
 
     registry = ToolRegistry()
-    registry.register(ReasonTool, name="nucleus_initiate_topic")
+    registry.register(ReasonTool, name="nucleus_dummy_action")
 
     result_text, success = await service._run_heartbeat_tool_call_execution(
-        "nucleus_initiate_topic",
+        "nucleus_dummy_action",
         {"content": "hello", "reason": "主动表达"},
         registry,
     )
@@ -341,7 +351,11 @@ async def test_chatter_think_snapshot_persists_across_restart(tmp_path: Path) ->
     await restored._load_runtime_context()
 
     snapshot = restored._state.last_chatter_think_by_stream["stream-1"]
+    global_snapshot = restored._state.last_chatter_think_by_stream[
+        LIFE_CHATTER_GLOBAL_CURSOR_KEY
+    ]
     assert snapshot["thought"] == "先接住她的不安，再继续聊。"
+    assert global_snapshot["thought"] == "先接住她的不安，再继续聊。"
     assert snapshot["mood"] == "认真"
     assert snapshot["decision"] == "先安抚"
     assert snapshot["expected_response"] == "她会安心一点"

@@ -16,7 +16,7 @@
   <rect width="1200" height="700" fill="url(#bgGrad)"/>
 
   <text x="600" y="42" text-anchor="middle" font-size="26" font-weight="700" fill="#2D2D3E">STDP 学习曲线对比 · 经典 vs 软 STDP</text>
-  <text x="600" y="68" text-anchor="middle" font-size="13" fill="#6B6B7E">左：经典指数 STDP 时间窗 · 右：Neo-MoFox 基于 sigmoid 膜电位的软 STDP</text>
+  <text x="600" y="68" text-anchor="middle" font-size="13" fill="#6B6B7E">左：经典指数 STDP 时间窗 · 右：Neo-MoFox-Soul 基于 sigmoid 膜电位的软 STDP</text>
 
   <!-- Left panel: Classic STDP -->
   <g>
@@ -88,7 +88,7 @@
 
   <!-- Right panel: Soft STDP -->
   <g>
-    <text x="900" y="110" text-anchor="middle" font-size="18" font-weight="700" fill="#E91E63">软 STDP (Neo-MoFox)</text>
+    <text x="900" y="110" text-anchor="middle" font-size="18" font-weight="700" fill="#E91E63">软 STDP (Neo-MoFox-Soul)</text>
     <text x="900" y="132" text-anchor="middle" font-size="11" fill="#6B6B7E">基于 sigmoid(u) 的平滑调制 · 避免硬阈值</text>
 
     <!-- Axes -->
@@ -164,8 +164,8 @@
   <g>
     <rect x="100" y="620" width="1000" height="60" rx="10" fill="#FFF8E1" stroke="#F57F17" stroke-width="1.5"/>
     <text x="600" y="645" text-anchor="middle" font-size="13" font-weight="600" fill="#2D2D3E">关键差异：经典 STDP 依赖精确脉冲时序；软 STDP 通过 sigmoid(u) 调制，允许亚阈值积分影响学习</text>
-    <text x="600" y="665" text-anchor="middle" font-size="11" fill="#6B6B7E">Neo-MoFox 的软 STDP 使得非发放神经元也能累积微弱学习信号，更接近生物突触可塑性的连续性质。</text>
+    <text x="600" y="665" text-anchor="middle" font-size="11" fill="#6B6B7E">Neo-MoFox-Soul 的软 STDP 使得非发放神经元也能累积微弱学习信号，更接近生物突触可塑性的连续性质。</text>
   </g>
 
-  <text x="600" y="693" text-anchor="middle" font-size="11" fill="#9B9BAA" font-style="italic">Figure F7 · STDP Learning Curves: Classic Exponential Window vs. Neo-MoFox Soft STDP with Sigmoid Modulation</text>
+  <text x="600" y="693" text-anchor="middle" font-size="11" fill="#9B9BAA" font-style="italic">Figure F7 · STDP Learning Curves: Classic Exponential Window vs. Neo-MoFox-Soul Soft STDP with Sigmoid Modulation</text>
 </svg>

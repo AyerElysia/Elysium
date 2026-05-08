@@ -104,22 +104,6 @@ vim config/plugins/life_engine/config.toml
 
 ---
 
-#### 2. 增加"主动发起话题"工具
-
-**计划**: 新增 `nucleus_initiate_topic` 工具
-
-**状态**: ❌ 未实施
-
-**原因**: 需要创建新的 Python 文件和工具类
-
-**下一步**:
-```python
-# 创建 plugins/life_engine/tools/social_tools.py
-class NucleusInitiateTopicTool(BaseTool):
-    tool_name = "nucleus_initiate_topic"
-    # ... 实现主动发起话题功能
-```
-
 ---
 
 #### 3. 修改 DFC 决策逻辑
@@ -296,12 +280,7 @@ async def _execute_drive_behaviors(self):
 
 ### 短期行动（1-3天）
 
-1. ❌ **实现主动发起话题工具**:
-   - 创建 `social_tools.py`
-   - 实现 `nucleus_initiate_topic`
-   - 测试功能
-
-2. ❌ **修改 DFC 决策逻辑**:
+1. ❌ **修改 DFC 决策逻辑**:
    - 修改 `decision_agent.py`
    - 增加话题相关性判断
    - 测试主动参与功能
@@ -371,4 +350,3 @@ async def _execute_drive_behaviors(self):
 **报告生成时间**: 2026-04-18 22:00  
 **Git 提交**: `6579a22` - feat: add proactivity guidance to TOOL.md  
 **下一步**: 测试当前改进，完成心跳间隔调整
-

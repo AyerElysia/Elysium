@@ -103,75 +103,6 @@ nucleus_tell_dfc 不是"打扰"，而是"表达"。
 
 ---
 
-### 1.3 增加"主动发起话题"工具 🛠️
-
-**当前问题**: 没有直接"主动发起话题"的工具
-
-**改进方案**: 新增工具 `nucleus_initiate_topic`
-
-**工具定义**:
-
-```python
-# plugins/life_engine/tools/social_tools.py
-
-class NucleusInitiateTopicTool(BaseTool):
-    """主动发起话题工具（中枢专用）"""
-    
-    tool_name = "nucleus_initiate_topic"
-    tool_description = """
-    主动在指定聊天流中发起一个话题。
-    
-    使用场景:
-    - 外界安静太久，想打破沉默
-    - 有有趣的想法想分享
-    - 想主动关心某个人
-    - 想发起一个讨论
-    
-    参数:
-    - stream_id: 目标聊天流 ID（可选，默认最近活跃的流）
-    - topic: 话题内容，应该是开放式的、能引发讨论的
-    - reason: 为什么要发起这个话题
-    
-    示例:
-    - topic: "刚才看到一个超可爱的甜品店，有草莓味的马卡龙♪ 你们最近有发现什么好吃的吗？"
-    - topic: "Hunter，你之前说的梦幻森林视频，我有个改进想法想和你聊聊～"
-    - topic: "外面下雨了呢，这种天气最适合窝在家里看书了。你们喜欢雨天吗？"
-    """
-    
-    async def execute(
-        self,
-        topic: str,
-        stream_id: str | None = None,
-        reason: str = "主动发起话题"
-    ) -> tuple[bool, str]:
-        # 1. 确定目标流
-        if not stream_id:
-            stream_id = await self._get_most_active_stream()
-        
-        # 2. 构建消息
-        message = self._build_topic_message(topic, stream_id)
-        
-        # 3. 发送
-        from src.core.transport.message_send import get_message_sender
-        sender = get_message_sender()
-        success = await sender.send_message(message)
-        
-        # 4. 记录
-        if success:
-            service = LifeEngineService.get_instance()
-            service.record_outer_sync()
-            return True, f"已发起话题: {topic[:50]}"
-        else:
-            return False, "发送失败"
-```
-
-**预期效果**:
-- 爱莉可以直接主动发起话题
-- 不需要通过 nucleus_tell_dfc 间接传话
-- 更自然、更直接
-
----
-
 ### 1.4 修改 DFC 决策逻辑 - 增加主动参与 🎯
 
 **当前问题**: DFC 只在被@时响应，即使话题很有趣也不参与
@@ -536,7 +467,6 @@ class ProactivityMetrics:
 
 ### 第 2-3 天: 工具增强
 
-- [ ] 实现 nucleus_initiate_topic 工具
 - [ ] 修改 DFC 决策逻辑，增加主动参与
 - [ ] 测试主动发起话题功能
 

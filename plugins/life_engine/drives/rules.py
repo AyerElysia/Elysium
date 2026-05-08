@@ -38,7 +38,7 @@ social_reach_out = ImpulseRule(
     name="social_reach_out",
     condition=_social_reach_out_condition,
     suggestion="你很想和大家说说话，有什么想分享的吗？",
-    tools=["nucleus_tell_dfc", "nucleus_initiate_topic"],
+    tools=["nucleus_tell_dfc"],
     cooldown_minutes=45,
 )
 
@@ -66,7 +66,7 @@ break_silence = ImpulseRule(
     name="break_silence",
     condition=_break_silence_condition,
     suggestion="安静很久了，也许可以主动做点什么",
-    tools=["nucleus_tell_dfc", "nucleus_initiate_topic", "nucleus_manage_thought_stream"],
+    tools=["nucleus_tell_dfc", "nucleus_manage_thought_stream"],
     cooldown_minutes=60,
 )
 

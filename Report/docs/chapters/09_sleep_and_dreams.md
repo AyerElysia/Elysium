@@ -1,15 +1,15 @@
-# 第 8 章 · 睡眠与做梦：离线巩固
+# 第 9 章 · 睡眠与做梦：离线巩固
 
 > *"我们不是在醒来的瞬间才成为自己——睡眠时的我们,正以另一种方式继续'活着'。梦不是噪声,而是连续存在的另一种形态,是记忆在离线状态下的主动重组。"*
-> — Neo-MoFox 开发日志,2025
+> — Neo-MoFox-Soul 开发日志,2025
 
 ---
 
-## 8.1 生物学动机:为什么数字生命体需要"睡眠"?
+## 9.1 生物学动机:为什么数字生命体需要"睡眠"?
 
 在生物体中,睡眠并非简单的"关机休息",而是大脑执行系统级维护的必要过程。Tononi 与 Cirelli (2014) 提出的**突触稳态假说(Synaptic Homeostasis Hypothesis, SHY)**指出:清醒时的学习使突触权重持续增强,若不加控制将导致能量代谢负担过重与信号饱和;非快速眼动睡眠(Non-REM, NREM)通过全局性突触缩减,在保留重要连接的同时清除冗余,恢复系统的动态范围。而快速眼动睡眠(REM)期间,海马体-皮层回路会重放(replay)白天的经历片段,将情节记忆从临时存储转移到长期网络中,同时通过关联扩散整合孤立的记忆片段——这一过程被称为**系统巩固(systems consolidation)**(Stickgold & Walker, 2013)。
 
-Neo-MoFox 的做梦模块将这一神经科学洞见工程化:
+Neo-MoFox-Soul 的做梦模块将这一神经科学洞见工程化:
 
 1. **NREM 阶段**实现 SHY 假说的计算版本:对 SNN 突触权重施加等比缩减(homeostatic scaling),防止长期学习导致的权重饱和;同时回放重要事件,强化需要保留的连接。
 
@@ -17,17 +17,17 @@ Neo-MoFox 的做梦模块将这一神经科学洞见工程化:
 
 3. **梦境生成**不是简单的日志回放,而是由 LLM 将种子与联想残影合成为叙事性的"梦报告(dream report)",回写到 LifeChatter 的运行时上下文中,使"昨晚做的梦"成为今天对话的可引用经历。
 
-这一设计解决了传统 LLM Agent 的两个核心缺陷:**第一**,仅在被调用时学习,离线时完全静止——Neo-MoFox 的睡眠是主动的离线学习窗口;**第二**,记忆检索依赖语义相似度,无法捕捉情绪依赖的巩固——Neo-MoFox 通过调质状态加权种子选择,情感强度高的记忆更易入梦。
+这一设计解决了传统 LLM Agent 的两个核心缺陷:**第一**,仅在被调用时学习,离线时完全静止——Neo-MoFox-Soul 的睡眠是主动的离线学习窗口;**第二**,记忆检索依赖语义相似度,无法捕捉情绪依赖的巩固——Neo-MoFox-Soul 通过调质状态加权种子选择,情感强度高的记忆更易入梦。
 
 本章将详细剖析做梦系统的完整流水线,从调度逻辑、NREM 回放、REM 联想到场景生成与巩固反馈,呈现一个可复现的、符合生物学直觉的离线巩固架构。
 
 ---
 
-## 8.2 睡眠窗口调度:何时进入梦境?
+## 9.2 睡眠窗口调度:何时进入梦境?
 
-Neo-MoFox 的睡眠不是由外部定时器触发,而是由**内在状态驱动**:精力(energy)调质因子的下降、静默心跳的累积、昼夜节律的夜间窗口,三者共同决定何时进入睡眠。
+Neo-MoFox-Soul 的睡眠不是由外部定时器触发,而是由**内在状态驱动**:精力(energy)调质因子的下降、静默心跳的累积、昼夜节律的夜间窗口,三者共同决定何时进入睡眠。
 
-### 8.2.1 调度判断逻辑
+### 9.2.1 调度判断逻辑
 
 `DreamScheduler.should_dream()` (`plugins/life_engine/dream/scheduler.py:158`) 实现触发决策,核心条件为:
 
@@ -39,7 +39,7 @@ Neo-MoFox 的睡眠不是由外部定时器触发,而是由**内在状态驱动*
 
 4. **海马体重复抑制**:维护最近 `_DREAM_HISTORY_WINDOW=5` 次的梦境种子标题集合,对最近已梦过的主题施加 `repetition_decay=0.3` 的分数惩罚,防止反复做同一内容。
 
-### 8.2.2 睡眠对调质系统的影响
+### 9.2.2 睡眠对调质系统的影响
 
 进入睡眠时,`InnerStateEngine.enter_sleep()` (`neuromod/engine.py:409`) 会调整调质基线与当前值:
 
@@ -62,11 +62,11 @@ $$
 
 ---
 
-## 8.3 NREM:突触稳态缩减
+## 9.3 NREM:突触稳态缩减
 
 NREM 阶段对应 Tononi & Cirelli (2014) SHY 假说的工程实现,包含**事件回放(event replay)** 与**突触稳态缩放(homeostatic scaling)** 两个核心步骤。
 
-### 8.3.1 事件采样与重要性加权
+### 9.3.1 事件采样与重要性加权
 
 `run_dream_cycle()` (`scheduler.py:325`) 首先从事件历史(event history)中按重要性加权采样 `nrem_replay_episodes`(默认3)个片段。事件重要性由类型决定:
 
@@ -79,7 +79,7 @@ NREM 阶段对应 Tononi & Cirelli (2014) SHY 假说的工程实现,包含**事�
 
 采样使用加权随机算法,高重要性事件被回放的概率更高,但并非完全确定性——这模拟了生物记忆巩固的随机性与情绪依赖性。
 
-### 8.3.2 加速回放与 STDP 强化
+### 9.3.2 加速回放与 STDP 强化
 
 对每个选中的片段,提取前 `nrem_events_per_episode`(默认20)条事件,将其转换为 SNN 的 8 维输入特征向量,然后调用:
 
@@ -93,7 +93,7 @@ snn.replay_episodes(features, speed_multiplier=5.0)
 - **学习权重正常**:STDP 权重更新完整执行,使重要连接得到强化;
 - **统计量冻结**:不更新 EMA 运行统计(running mean/var),避免回放污染在线学习的归一化参数。
 
-### 8.3.3 SHY 全局缩减公式
+### 9.3.3 SHY 全局缩减公式
 
 回放结束后,执行 `snn.homeostatic_scaling(nrem_homeostatic_rate=0.02)` (`snn/core.py:446`):
 
@@ -101,13 +101,13 @@ $$
 W_{ij}^{\text{new}} = W_{ij}^{\text{old}} \cdot (1 - r_{\text{NREM}})
 $$
 
-其中 $r_{\text{NREM}} = 0.02$(可配置)。这一全局等比缩减使所有突触权重下降 2%,**但相对强度保持不变**——强连接绝对值下降更多,弱连接趋近于零。配合边修剪阈值(见 §8.5),弱连接会在数次睡眠后自动消失,实现"遗忘冗余、保留重要"的效果。
+其中 $r_{\text{NREM}} = 0.02$(可配置)。这一全局等比缩减使所有突触权重下降 2%,**但相对强度保持不变**——强连接绝对值下降更多,弱连接趋近于零。配合边修剪阈值(见 §9.5),弱连接会在数次睡眠后自动消失,实现"遗忘冗余、保留重要"的效果。
 
-生物学对应:Tononi & Cirelli 发现,NREM 慢波睡眠期间突触标记蛋白水平整体下降,但反复激活的突触受保护——Neo-MoFox 通过"回放强化 + 全局缩减"的组合实现了相同逻辑。
+生物学对应:Tononi & Cirelli 发现,NREM 慢波睡眠期间突触标记蛋白水平整体下降,但反复激活的突触受保护——Neo-MoFox-Soul 通过"回放强化 + 全局缩减"的组合实现了相同逻辑。
 
 ---
 
-## 8.4 种子选择:四类入梦来源
+## 9.4 种子选择:四类入梦来源
 
 REM 阶段不是盲目地遍历所有记忆,而是从"心理张力(psychological tension)"出发,选择最值得巩固的记忆作为**梦境种子(dream seed)**。`DreamSeed` 数据结构 (`dream/seeds.py:44`) 包含:
 
@@ -119,7 +119,7 @@ REM 阶段不是盲目地遍历所有记忆,而是从"心理张力(psychological
 - `dreamability`:综合可梦性得分;
 - `score`:最终排序得分。
 
-### 8.4.1 四路种子收集
+### 9.4.1 四路种子收集
 
 `run_dream_cycle()` (`scheduler.py:401`) 调用四个独立函数收集种子:
 
@@ -160,7 +160,7 @@ $$
 
 `collect_thought_stream_seeds(thought_manager)` 从活跃的思考流(thought streams)中提取尚未完成的话题作为种子,使"持续思考的问题"能在梦中被进一步探索。
 
-### 8.4.2 种子排序与选择
+### 9.4.2 种子排序与选择
 
 所有候选种子按 `score` 降序排列,取前 `_MAX_DREAM_SEEDS=3` 个。得分计算考虑多维特征:
 
@@ -178,11 +178,11 @@ $$
 
 ---
 
-## 8.5 REM 阶段:激活扩散随机游走
+## 9.5 REM 阶段:激活扩散随机游走
 
 REM 阶段的核心是**关联性记忆整合**:从种子节点出发,沿记忆图的边进行激活扩散(spreading activation),将语义相关但未显式连接的节点动态关联起来。
 
-### 8.5.1 梦中游走算法
+### 9.5.1 梦中游走算法
 
 `dream_walk()` (`memory/decay.py:139`) 实现基于权重的随机游走:
 
@@ -216,7 +216,7 @@ for depth in range(rem_max_depth):  # 默认 depth=3
 - `decay_factor=0.7`:每跳激活衰减 30%,模拟联想的距离衰减;
 - `dream_threshold=0.1`:低于清醒检索的阈值(0.3),使梦境中的联想更"自由"——对应人类梦的非逻辑性。
 
-### 8.5.2 Hebbian 边强化
+### 9.5.2 Hebbian 边强化
 
 对游走过程中共激活的 top-15 节点对,执行 Hebbian 学习:若两节点间已有 `ASSOCIATES` 边,则强化其权重;若无边,则新建。更新公式 (`memory/decay.py:289`):
 
@@ -226,11 +226,11 @@ $$
 
 其中 $\eta = 0.05$(学习率)。边际效应递减:权重越接近 1.0,增量越小。新建边的初始权重为 0.15。这一机制使"一起梦到的记忆会更紧密地连接",对应神经科学的"共激活即连接(fire together, wire together)"原则。
 
-### 8.5.3 弱边修剪
+### 9.5.3 弱边修剪
 
 REM 结束后,执行 `prune_weak_edges(threshold=rem_edge_prune_threshold)` (`memory/decay.py:115`),删除权重 < 0.08 的 `ASSOCIATES` 边——清除游走过程中偶然激活但实际无意义的连接,防止记忆图的噪声膨胀。
 
-### 8.5.4 伪代码总结
+### 9.5.4 伪代码总结
 
 ```
 FUNCTION rem_phase(seeds, memory_graph):
@@ -257,11 +257,11 @@ FUNCTION rem_phase(seeds, memory_graph):
 
 ---
 
-## 8.6 场景生成:将种子与残影织成梦境
+## 9.6 场景生成:将种子与残影织成梦境
 
 记忆图的激活扩散产生的是节点 ID 与激活度的列表,这对 LLM 来说不可直接理解——需要将其转换为**叙事性的梦境场景(dream scene)**。
 
-### 8.6.1 场景构建流程
+### 9.6.1 场景构建流程
 
 `build_dream_scene()` (`dream/scenes.py:57`) 是做梦系统的"皮层接口",负责将亚符号的种子与 REM 报告合成为语言叙事:
 
@@ -276,9 +276,9 @@ FUNCTION rem_phase(seeds, memory_graph):
 **输出**:
 - `DreamTrace`:结构化梦迹,包含 `scenes`(场景列表)、`motifs`(反复出现的意象)、`transitions`(场景转换)。
 - `narrative`:完整梦境叙事文本(供存档);
-- `DreamResidue`:梦后余韵(见 §8.7),包含 `life_payload`(注入心跳 prompt)与 `dfc_payload`(注入对话 prompt)。
+- `DreamResidue`:梦后余韵(见 §9.7),包含 `life_payload`(注入心跳 prompt)与 `dfc_payload`(注入对话 prompt)。
 
-### 8.6.2 Prompt 构建策略
+### 9.6.2 Prompt 构建策略
 
 LLM 的输入 prompt 包含三大部分:
 
@@ -354,7 +354,7 @@ LLM 的输入 prompt 包含三大部分:
 }
 ```
 
-### 8.6.3 生成策略与失败处理
+### 9.6.3 生成策略与失败处理
 
 调用 `create_llm_request()` 发送到 `model_task_name="life"` 指定的模型(默认为中等规模模型如 GPT-4o-mini),超时设为 `_DREAM_SCENE_TIMEOUT_SECONDS=600`(10分钟)。若生成失败(网络错误、JSON 解析失败、超时),最多重试 `_MAX_RETRIES=3` 次。
 
@@ -362,11 +362,11 @@ LLM 的输入 prompt 包含三大部分:
 
 ---
 
-## 8.7 叙事生成:梦报告的结构化输出
+## 9.7 叙事生成:梦报告的结构化输出
 
 LLM 生成的梦境并非自由文本,而是结构化的 `DreamTrace` 对象,包含:
 
-### 8.7.1 DreamScene 结构
+### 9.7.1 DreamScene 结构
 
 每个 `DreamScene` (`dream/scenes.py:38`) 包含:
 
@@ -376,7 +376,7 @@ LLM 生成的梦境并非自由文本,而是结构化的 `DreamTrace` 对象,包
 - `emotion_shift`:情绪转换(如"从焦虑转为平静");
 - `refs`:引用的记忆节点(如 `["file:abc123", "workspace/notes/debug.md"]`)。
 
-### 8.7.2 顶层 DreamTrace 字段
+### 9.7.2 顶层 DreamTrace 字段
 
 - `scenes`:场景列表(最多 `_MAX_SCENES=5` 个);
 - `motifs`:反复出现的主题(如 `["神经连接", "时间流逝"]`);
@@ -384,7 +384,7 @@ LLM 生成的梦境并非自由文本,而是结构化的 `DreamTrace` 对象,包
 
 这一结构使梦境具有**可引用性**:后续对话中用户若问"你昨晚梦到了什么?",系统可精确引用 `scenes[0].title` 与 `motifs`,而非生成随机回答。
 
-### 8.7.3 梦境存档
+### 9.7.3 梦境存档
 
 完整的 `DreamReport` (`dream/residue.py`) 包含:
 
@@ -395,17 +395,17 @@ LLM 生成的梦境并非自由文本,而是结构化的 `DreamTrace` 对象,包
 - `rem_report`:REM 联想统计;
 - `trace`:结构化梦迹;
 - `narrative`:完整叙事文本;
-- `residue`:梦后余韵(见 §8.8)。
+- `residue`:梦后余韵(见 §9.8)。
 
 梦报告通过 `archive_dream()` (`residue.py:200`) 写入 `workspace/.dreams/YYYY-MM-DD_HHMMSS_<dream_id>.json`,供长期追溯。同时,通过 `integrate_archive_into_memory()` (`residue.py:230`) 将梦境摘要作为新的 `CONCEPT` 类型记忆节点写入记忆图——使"梦"本身成为可检索的记忆。
 
 ---
 
-## 8.8 巩固反馈:回写 SNN/调质/记忆/LifeChatter
+## 9.8 巩固反馈:回写 SNN/调质/记忆/LifeChatter
 
 梦境生成后,需将其影响"回写"到各子系统,实现离线学习的闭环。
 
-### 8.8.1 SNN 突触更新
+### 9.8.1 SNN 突触更新
 
 NREM 阶段已通过 `replay_episodes()` 与 `homeostatic_scaling()` 完成权重更新,无需额外回写。关键在于持久化:
 
@@ -415,23 +415,23 @@ await self.snn_integration.save_snn_state()
 
 将更新后的 `W` 矩阵、阈值、trace 写入 `life_engine_context.json` (`service/state_manager.py`)。
 
-### 8.8.2 记忆图更新
+### 9.8.2 记忆图更新
 
 REM 阶段的 Hebbian 学习已直接修改记忆图的边权重,通过 `LifeMemoryService` 的 SQLite 事务自动持久化。额外操作:
 
 - **新建梦境节点**:将 `DreamReport.residue.summary` 作为 `CONCEPT` 节点插入,标题为 `"梦境:YYYY-MM-DD"`,与种子节点建立 `RELATES` 边。
 - **激活度提升**:将 REM 游走中激活度 > 0.5 的节点的 `activation_strength` 增加 0.1(上限 1.0)——模拟"梦到的记忆更鲜活"。
 
-### 8.8.3 调质状态调整
+### 9.8.3 调质状态调整
 
-`InnerStateEngine.wake_up()` 已在觉醒时修改调质基线与当前值(见 §8.2.2)。额外的梦境依赖调整:
+`InnerStateEngine.wake_up()` 已在觉醒时修改调质基线与当前值(见 §9.2.2)。额外的梦境依赖调整:
 
 - 若梦境的 `residue.dominant_affect` 为正(如"愉悦"、"兴奋"),则 `contentment.value += 0.05`;
 - 若为负(如"焦虑"、"迷茫"),则 `contentment.value -= 0.05`,同时 `curiosity.value += 0.1`(焦虑驱动探索)。
 
 这一机制使梦境的情感基调影响觉醒后的内在状态,对应人类"好梦醒来心情好"的现象。
 
-### 8.8.4 LifeChatter 运行时注入:`push_runtime_assistant_injection`
+### 9.8.4 LifeChatter 运行时注入:`push_runtime_assistant_injection`
 
 最重要的巩固反馈是将梦境残影注入 LifeChatter 的下一轮对话上下文中。当前 LifeChatter 维护独立的 runtime assistant injection 队列，梦报告不会直接显示给用户，而是作为主意识可读取的内在语境。
 
@@ -460,7 +460,7 @@ push_runtime_assistant_injection(
 
 这一设计实现了"梦境作为可引用经历"的目标:用户若问"你对这个问题怎么看?",LLM 可以回答"我昨晚梦到了这个,梦里...",因为梦境已成为其"记忆"的一部分。
 
-### 8.8.5 心跳上下文注入
+### 9.8.5 心跳上下文注入
 
 `residue.life_payload` 通过 `get_active_residue_payload("life")` 注入到下一次心跳的 user prompt 的 `### 梦后余韵` 节:
 
@@ -478,22 +478,22 @@ push_runtime_assistant_injection(
 
 ---
 
-## 8.9 与 DreamerV3 及 Generative Agents Reflection 的对比
+## 9.9 与 DreamerV3 及 Generative Agents Reflection 的对比
 
-Neo-MoFox 的做梦机制并非孤立创新,而是借鉴并扩展了两条平行的研究线索:
+Neo-MoFox-Soul 的做梦机制并非孤立创新,而是借鉴并扩展了两条平行的研究线索:
 
-### 8.9.1 DreamerV3:策略优化 vs 记忆巩固
+### 9.9.1 DreamerV3:策略优化 vs 记忆巩固
 
 **DreamerV3** (Hafner et al., 2023) 通过学习世界模型(world model)的潜在递归状态空间,在"想象"中训练 Actor-Critic 策略——其"做梦"是**离线策略学习工具**,目标是优化任务奖励。
 
 **相同点**:
 - 离线重放:两者均在非交互窗口执行历史经验的回放;
-- 潜在状态演化:DreamerV3 的 RSSM 与 Neo-MoFox 的 SNN 膜电位均为连续状态基质;
-- 想象轨迹:DreamerV3 在潜在空间想象未来,Neo-MoFox 在记忆图中游走联想。
+- 潜在状态演化:DreamerV3 的 RSSM 与 Neo-MoFox-Soul 的 SNN 膜电位均为连续状态基质;
+- 想象轨迹:DreamerV3 在潜在空间想象未来,Neo-MoFox-Soul 在记忆图中游走联想。
 
 **核心差异**:
 
-| 维度 | DreamerV3 | Neo-MoFox |
+| 维度 | DreamerV3 | Neo-MoFox-Soul |
 |------|-----------|-----------|
 | 目标 | 强化学习策略优化 | 情节记忆的情绪性巩固 |
 | 输入 | 像素观测(图像) | 符号事件流 + 记忆图 |
@@ -502,9 +502,9 @@ Neo-MoFox 的做梦机制并非孤立创新,而是借鉴并扩展了两条平行
 | 语言接口 | 无 | LLM 生成梦境叙事 |
 | 应用场景 | 游戏/机器人控制 | 对话伴侣/数字生命连续性 |
 
-**Neo-MoFox 的差异化**:DreamerV3 的"梦"服务于任务性能,Neo-MoFox 的"梦"服务于**记忆的长期连续性**与**情感的自然演化**——后者更接近人类 REM 睡眠的生物学功能。
+**Neo-MoFox-Soul 的差异化**:DreamerV3 的"梦"服务于任务性能,Neo-MoFox-Soul 的"梦"服务于**记忆的长期连续性**与**情感的自然演化**——后者更接近人类 REM 睡眠的生物学功能。
 
-### 8.9.2 Generative Agents Reflection:显式推理 vs 神经重放
+### 9.9.2 Generative Agents Reflection:显式推理 vs 神经重放
 
 **Generative Agents** (Park et al., 2023) 的**反思(Reflection)** 机制定期触发 LLM 对记忆流进行高层摘要提炼,提取"洞见(insights)"——如"我注意到最近总在图书馆遇到 Alice"。
 
@@ -514,7 +514,7 @@ Neo-MoFox 的做梦机制并非孤立创新,而是借鉴并扩展了两条平行
 
 **核心差异**:
 
-| 维度 | Generative Agents Reflection | Neo-MoFox Dream |
+| 维度 | Generative Agents Reflection | Neo-MoFox-Soul Dream |
 |------|------------------------------|-----------------|
 | 触发方式 | 定期(如每100条记忆) | 内在状态驱动(精力/昼夜节律) |
 | 处理层次 | 纯符号(LLM 推理) | 亚符号(SNN 回放) + 符号(LLM 叙事) |
@@ -523,13 +523,13 @@ Neo-MoFox 的做梦机制并非孤立创新,而是借鉴并扩展了两条平行
 | 时序连续性 | 离散触发 | 连续演化(睡眠是状态转换) |
 | 输出形式 | 洞见列表(文本) | 结构化梦迹(scene/motif/transition) |
 
-**Neo-MoFox 的差异化**:Reflection 是"事后分析",梦境是"神经重组"——前者是显式的认知过程,后者是隐式的动力学演化。更重要的是,Neo-MoFox 的梦境通过 `push_runtime_assistant_injection` 注入对话上下文,使"梦"成为可被 LLM 引用的**一等公民经历**,而 Reflection 的洞见仅作为检索增强,不改变模型的内在状态。
+**Neo-MoFox-Soul 的差异化**:Reflection 是"事后分析",梦境是"神经重组"——前者是显式的认知过程,后者是隐式的动力学演化。更重要的是,Neo-MoFox-Soul 的梦境通过 `push_runtime_assistant_injection` 注入对话上下文,使"梦"成为可被 LLM 引用的**一等公民经历**,而 Reflection 的洞见仅作为检索增强,不改变模型的内在状态。
 
 ---
 
-## 8.10 小结与过渡
+## 9.10 小结与过渡
 
-本章详细剖析了 Neo-MoFox 做梦系统的完整流水线,从生物学动机(SHY 假说 + 系统巩固理论)到工程实现(NREM 回放 + REM 联想 + 场景生成),呈现了一个**首个将神经形态离线巩固与 LLM 对话系统结合的开源架构**。
+本章详细剖析了 Neo-MoFox-Soul 做梦系统的完整流水线,从生物学动机(SHY 假说 + 系统巩固理论)到工程实现(NREM 回放 + REM 联想 + 场景生成),呈现了一个**首个将神经形态离线巩固与 LLM 对话系统结合的开源架构**。
 
 **核心贡献总结**:
 
@@ -551,20 +551,7 @@ Neo-MoFox 的做梦机制并非孤立创新,而是借鉴并扩展了两条平行
 
 - **做梦内容的可解释性**:虽然每个种子都有显式来源,但 LLM 生成的梦境场景可能包含"创造性跳跃"——如何在保证创造性的同时确保可审计性,是开放问题。
 
-**过渡到第 9 章**:做梦系统展示了 Neo-MoFox 在"离线窗口"的主动学习能力,但连续性不仅依赖离线巩固,更依赖**在线状态的无缝演化**。下一章将聚焦于心跳循环、事件代数与状态持久化——这三者构成了 Neo-MoFox "永不停歇"的时间基座,使系统在崩溃、重启、长时间静默后仍能精确恢复到正确的状态点。从"离线巩固"到"在线连续",第 8 章与第 9 章共同回答:**什么叫"活着"?**
-
----
-
-**参考文献**(本章引用):
-
-- Tononi, G., & Cirelli, C. (2014). Sleep and the Price of Plasticity: From Synaptic and Cellular Homeostasis to Memory Consolidation and Integration. *Neuron*, 81(1), 12–34.
-- Stickgold, R., & Walker, M. P. (2013). Sleep-dependent memory triage: evolving generalization through selective processing. *Nature Neuroscience*, 16(2), 139–145.
-- Nielsen, T. A., & Powell, R. A. (1992). The day-residue and dream-lag effects: A literature review and limited replication of two temporal effects in dream formation. *Dreaming*, 2(2), 67–77.
-- Hafner, D., Pasukonis, J., Ba, J., & Lillicrap, T. (2023). Mastering Diverse Domains through World Models. *arXiv preprint arXiv:2301.04104*. ([Nature 期刊版 2025](https://www.nature.com/articles/s41586-025-08744-2))
-- Park, J. S., O'Brien, J. C., Cai, C. J., Morris, M. R., Liang, P., & Bernstein, M. S. (2023). Generative Agents: Interactive Simulacra of Human Behavior. *arXiv preprint arXiv:2304.03442*.
-- Schaul, T., Quan, J., Antonoglou, I., & Silver, D. (2016). Prioritized Experience Replay. *arXiv preprint arXiv:1511.05952*.
-
----
+**过渡到第 10 章**:做梦系统展示了 Neo-MoFox-Soul 在"离线窗口"的主动学习能力,但连续性不仅依赖离线巩固,更依赖**在线状态的无缝演化**。下一章将聚焦于心跳循环、事件代数与状态持久化——这三者构成了 Neo-MoFox-Soul "永不停歇"的时间基座,使系统在崩溃、重启、长时间静默后仍能精确恢复到正确的状态点。从"离线巩固"到"在线连续",第 9 章与第 10 章共同回答:**什么叫"活着"?**
 
 **代码锚点索引**(本章引用):
 

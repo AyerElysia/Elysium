@@ -37,10 +37,10 @@
 
 | # | 变更 | 文件 | 前 | 后 |
 |---|------|------|-----|-----|
-| 2.1 | 提高发起频率 | `social_tools.py:41` | 2次/小时 | 5次/小时 |
-| 2.2 | 增加聊天流回退 | `social_tools.py:73-79` | 无目标流直接失败 | 从活跃流中寻找候选；温和失败消息 |
-| 2.3 | 冲动规则加工具 | `rules.py` | social_reach_out 只推荐 nucleus_tell_dfc | 加入 nucleus_initiate_topic |
-| 2.4 | 工具列表更新 | `core.py:1100-1106` | 表达只有 nucleus_tell_dfc | 加入 nucleus_initiate_topic |
+| 2.1 | 提高发起频率 | `file_tools.py:41` | 2次/小时 | 5次/小时 |
+| 2.2 | 增加聊天流回退 | `file_tools.py:73-79` | 无目标流直接失败 | 从活跃流中寻找候选；温和失败消息 |
+| 2.3 | 冲动规则收敛 | `rules.py` | social_reach_out 只推荐 nucleus_tell_dfc | 保持现有表达路径 |
+| 2.4 | 工具列表更新 | `core.py:1100-1106` | 表达只有 nucleus_tell_dfc | 不新增主动发话工具 |
 
 ## Phase 3：身份校准 ✅
 
@@ -82,5 +82,5 @@
 - `plugins/life_engine/neuromod/engine.py` — 标签、精力公式
 - `plugins/life_engine/drives/impulse.py` — 移除双重束缚
 - `plugins/life_engine/drives/rules.py` — 工具推荐、rest_well 规则
-- `plugins/life_engine/tools/social_tools.py` — 频率限制、回退逻辑
+- `plugins/life_engine/tools/file_tools.py` — 频率限制、回退逻辑
 - `plugins/life_engine/constants.py` — 空闲阈值

@@ -320,13 +320,15 @@ class DFCIntegration:
         storage = TodoStorage(self._workspace_dir())
         inactive_statuses = {
             TodoStatus.COMPLETED.value,
-            TodoStatus.RELEASED.value,
-            TodoStatus.CHERISHED.value,
+            TodoStatus.CANCELLED.value,
+            TodoStatus.ARCHIVED.value,
         }
         todos = [todo for todo in storage.load() if todo.status not in inactive_statuses]
         lines: list[str] = []
         for todo in todos[:limit]:
-            lines.append(f"- {todo.title} ({todo.status})")
+            next_action = str(getattr(todo, "next_action", "") or "").strip()
+            suffix = f"；下一步：{next_action}" if next_action else ""
+            lines.append(f"- {todo.title} ({todo.status}/{todo.priority}){suffix}")
         return lines
 
     def _load_recent_diary_lines(self, *, limit: int = 2) -> list[str]:

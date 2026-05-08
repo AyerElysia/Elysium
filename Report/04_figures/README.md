@@ -1,6 +1,6 @@
-# Neo-MoFox 学术报告图表汇总
+# Neo-MoFox-Soul 学术报告图表汇总
 
-本目录包含 Neo-MoFox 学术报告所需的 SVG 源图与当前正文使用的 AI 生成 PNG 图。旧 SVG 继续保留，新增 PNG 用于当前 LifeChatter / Life Engine / 工程框架叙事。
+本目录包含 Neo-MoFox-Soul 学术报告所需的 SVG 源图与当前正文使用的 AI 生成 PNG 图。旧 SVG 继续保留，新增 PNG 用于当前 LifeChatter / Life Engine / 工程框架叙事。
 
 ## 风格规范
 
@@ -14,18 +14,18 @@
 ### 第 1-2 章：引言与相关工作
 
 0. **F0_engineering_architecture_overview.png**  
-   当前主图：Neo-MoFox 工程总览，展示 `app` / `core` / `kernel` 三层框架与 `life_engine` 插件域。
+   当前主图：Neo-MoFox-Soul 工程总览，展示 `app` / `core` / `kernel` 三层框架与 `life_engine` 插件域。
 
 1. **F1_lifechatter_three_layer.png** (1536×1024)  
    当前主图：LifeChatter 主意识 + Life Engine 潜意识 + SNN/调质/记忆/梦/ThoughtStream。旧 `F1_three_layer_architecture.svg` 保留为历史 SVG。
 
 2. **F2_peer_landscape.svg** (1200×800) ✅ 新创建  
-   同行光谱图：14 个系统按"连续性 × 学习方式"二维分布，Neo-MoFox 金色星形高亮
+   同行光谱图：14 个系统按"连续性 × 学习方式"二维分布，Neo-MoFox-Soul 金色星形高亮
 
 3. **F3_three_principles.svg** (1200×800)  
    三原则关系图：连续性（底）、学习（左）、涌现（右）的三角形哲学闭环
 
-### 第 4-5 章：架构与 SNN
+### 第 4-6 章：架构、同步与 SNN
 
 4. **F4_dual_consciousness_async.png** (1536×1024)  
    当前主图：LifeChatter 与 Life Engine 双意识异步运行。旧 `F4_dual_track.svg` 保留为历史 SVG。
@@ -37,9 +37,9 @@
    SNN 微观结构：8 输入 → 16 隐藏 LIF → 6 drives，突触粗细代表权重
 
 7. **F7_stdp_curve.svg** (1200×700) ✅ 新创建  
-   左：经典指数 STDP 时间窗；右：Neo-MoFox 基于 sigmoid 的软 STDP 对比
+   左：经典指数 STDP 时间窗；右：Neo-MoFox-Soul 基于 sigmoid 的软 STDP 对比
 
-### 第 6-7 章：调质与记忆
+### 第 7-8 章：调质与记忆
 
 8. **F8_modulator_decay.svg** (1200×700)  
    五大调质（τ ∈ {1800, 3600, 5400, 10800}s）的衰减曲线，6 小时横轴
@@ -50,7 +50,7 @@
 10. **F10_memory_graph.svg** (1400×600) ✅ 新创建  
     记忆图演化：t=0 / t=7d / t=30d 三个快照，节点边强度动态变化
 
-### 第 8-9 章：做梦与心跳
+### 第 9-10 章：做梦与心跳
 
 11. **F11_sleep_pipeline.svg** (1400×800)  
     NREM（稳态缩减）→ REM（关联整合）→ 叙事生成 → 巩固反馈四阶段流水线
@@ -58,7 +58,7 @@
 12. **F12_heartbeat_timeline.svg** (1600×600) ✅ 新创建  
     90 秒内 SNN tick（10s）、心跳（30s）、调质 ODE、用户消息、工具调用多层级交错
 
-### 第 10-11 章：接口与场景
+### 第 5、11、12 章：同步、Agent 工程与场景
 
 13. **F13_consciousness_sync.png** (1536×1024)  
     当前主图：Life Engine 梦境残影、状态摘要、内心独白、ThoughtStream 同步给 LifeChatter。旧 `F13_interface.svg` 保留为历史 SVG。
@@ -69,18 +69,18 @@
 15. **F15_habit_trajectory.svg** (1200×700) ✅ 新创建  
     30 天习惯形成：streak 阶梯增长 + strength 平滑曲线，第 7 天阈值、第 21 天饱和
 
-### 第 12 章：同行对比
+### 已保留但当前正文未使用：同行对比
 
 16. **F16_comparison_matrix.svg** (1600×900) ✅ 新创建  
-    15 系统 × 7 维度对比矩阵：✓/◐/✗ 彩色单元格，Neo-MoFox 金色高亮最后一行
+    15 系统 × 7 维度对比矩阵：✓/◐/✗ 彩色单元格，Neo-MoFox-Soul 金色高亮最后一行
 
 17. **F17_design_space.svg** (1200×800) ✅ 新创建  
-    设计空间散点图：连续性 × 学习本地化，Neo-MoFox 星形标记右上角
+    设计空间散点图：连续性 × 学习本地化，Neo-MoFox-Soul 星形标记右上角
 
-### 第 14 章：愿景
+### 已保留但当前正文未使用：愿景
 
 18. **F18_vision.svg** (1400×800) ✅ 新创建  
-    左：传统 LLM（离散切片堆叠）；右：Neo-MoFox（连续河流演化）；中央箭头演化方向
+    左：传统 LLM（离散切片堆叠）；右：Neo-MoFox-Soul（连续河流演化）；中央箭头演化方向
 
 ---
 

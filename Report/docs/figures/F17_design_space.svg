@@ -20,7 +20,7 @@
   <rect width="1200" height="800" fill="url(#bgGrad)"/>
 
   <text x="600" y="45" text-anchor="middle" font-size="28" font-weight="700" fill="#2D2D3E">设计空间散点图 · 连续性 × 学习本地化</text>
-  <text x="600" y="72" text-anchor="middle" font-size="13" fill="#6B6B7E">X 轴：连续性程度（0-10） · Y 轴：学习+涌现的本地化程度（0-10） · Neo-MoFox 星形高亮</text>
+  <text x="600" y="72" text-anchor="middle" font-size="13" fill="#6B6B7E">X 轴：连续性程度（0-10） · Y 轴：学习+涌现的本地化程度（0-10） · Neo-MoFox-Soul 星形高亮</text>
 
   <!-- Axes -->
   <g stroke="#2D2D3E" stroke-width="2" fill="none">
@@ -148,13 +148,13 @@
     <text x="1032" y="226" text-anchor="middle" font-size="7" fill="#2D2D3E">Loihi</text>
   </g>
 
-  <!-- Neo-MoFox: (9, 8) - STAR HIGHLIGHT -->
+  <!-- Neo-MoFox-Soul: (9, 8) - STAR HIGHLIGHT -->
   <g filter="url(#softShadow)">
     <!-- Star shape using polygon -->
     <polygon points="984,221 991,238 1009,238 995,249 1001,266 984,255 967,266 973,249 959,238 977,238"
              fill="url(#starGrad)" stroke="#E91E63" stroke-width="3" opacity="0.95"/>
     <circle cx="984" cy="248" r="28" fill="url(#starGrad)" stroke="#E91E63" stroke-width="3" opacity="0.95"/>
-    <text x="984" y="245" text-anchor="middle" font-size="11" font-weight="700" fill="#880E4F">Neo-MoFox</text>
+    <text x="984" y="245" text-anchor="middle" font-size="11" font-weight="700" fill="#880E4F">Neo-MoFox-Soul</text>
     <text x="984" y="258" text-anchor="middle" font-size="8" fill="#6B6B7E">★ 本工作 ★</text>
   </g>
 
@@ -177,10 +177,10 @@
     <text x="880" y="555" font-size="10" fill="#3D3D4E">  （无需全量反向传播）</text>
     <text x="880" y="580" font-size="10" fill="#6B6B7E">理想系统：右上角</text>
     <text x="880" y="600" font-size="10" fill="#6B6B7E">• 持续运行 + 在线学习</text>
-    <text x="880" y="620" font-size="10" fill="#6B6B7E">• Neo-MoFox 为目前唯一完整</text>
+    <text x="880" y="620" font-size="10" fill="#6B6B7E">• Neo-MoFox-Soul 为目前唯一完整</text>
     <text x="880" y="638" font-size="10" fill="#6B6B7E">  实现"SNN + LLM + 调质 ODE"</text>
     <text x="880" y="655" font-size="10" fill="#6B6B7E">  的数字伴侣框架</text>
   </g>
 
-  <text x="600" y="775" text-anchor="middle" font-size="11" fill="#9B9BAA" font-style="italic">Figure F17 · Design Space Scatter Plot: Continuity × Learning Localization with Neo-MoFox Highlighted</text>
+  <text x="600" y="775" text-anchor="middle" font-size="11" fill="#9B9BAA" font-style="italic">Figure F17 · Design Space Scatter Plot: Continuity × Learning Localization with Neo-MoFox-Soul Highlighted</text>
 </svg>

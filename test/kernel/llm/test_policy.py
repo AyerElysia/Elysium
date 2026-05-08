@@ -6,7 +6,7 @@ import threading
 
 import pytest
 
-from src.kernel.llm.exceptions import LLMTimeoutError
+from src.kernel.llm.exceptions import LLMAPIError, LLMTimeoutError
 from src.kernel.llm.policy.base import ModelStep, Policy, PolicySession
 from src.kernel.llm.policy.load_balanced import LoadBalancedPolicy
 from src.kernel.llm.policy.round_robin import RoundRobinPolicy, _RoundRobinSession
@@ -277,6 +277,20 @@ class TestRoundRobinSession:
         assert step2.model == mock_model_set[0]
         assert step2.delay_seconds == 1.0
         assert step2.meta["retry"] == 1
+
+    def test_next_after_error_skips_same_model_retry_for_not_found(
+        self, mock_model_set: list[dict]
+    ) -> None:
+        """404 类永久错误应直接切换到下一个模型。"""
+        session = _RoundRobinSession(model_set=mock_model_set, start_index=0)
+
+        session.first()
+        step = session.next_after_error(LLMAPIError("Not found", status_code=404))
+
+        assert step.model == mock_model_set[1]
+        assert step.delay_seconds == 0.0
+        assert step.meta["switch"] is True
+        assert step.meta["reason"] == "non_retryable_error"
 
     def test_next_after_error_switches_model_after_retries(
         self, mock_model_set: list[dict]
@@ -816,6 +830,22 @@ class TestLoadBalancedSession:
         assert step2.model is not None
         assert step2.meta["model_name"] == model_name
         assert step2.meta["retry"] == 1
+
+    def test_next_after_error_skips_same_model_retry_for_not_found(
+        self, policy: LoadBalancedPolicy, mock_model_set: list[dict]
+    ) -> None:
+        """404 类永久错误应直接切到下一模型。"""
+        session = policy.new_session(model_set=mock_model_set, request_name="test")
+
+        step1 = session.first()
+        model_name = step1.meta["model_name"]
+
+        step2 = session.next_after_error(LLMAPIError("Not found", status_code=404))
+
+        assert step2.model is not None
+        assert step2.meta["model_name"] != model_name
+        assert step2.meta["switch"] is True
+        assert step2.meta["reason"] == "non_retryable_error"
 
     def test_next_after_error_updates_failure_penalty(self, policy: LoadBalancedPolicy, mock_model_set: list[dict]) -> None:
         """Test that next_after_error updates failure penalty."""

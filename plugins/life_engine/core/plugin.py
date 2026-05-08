@@ -98,11 +98,17 @@ class LifeEnginePlugin(BasePlugin):
         if isinstance(self.config, LifeEngineConfig) and getattr(
             getattr(self.config, "chatter", None), "enabled", False
         ):
-            from .chatter import LifeChatter, LifeSendTextAction, LifePassAndWaitAction
+            from .chatter import (
+                LifeChatter,
+                LifePassAndWaitAction,
+                LifeSendFileAction,
+                LifeSendTextAction,
+            )
 
             components.extend([
                 LifeChatter,
                 LifeSendTextAction,
+                LifeSendFileAction,
                 LifePassAndWaitAction,
                 LifeThinkAction,
                 LifeRecordInnerMonologueAction,
@@ -134,6 +140,12 @@ class LifeEnginePlugin(BasePlugin):
         """插件卸载前停止心跳。"""
         if self._service is not None:
             await self._service.stop()
+        try:
+            from .chatter import LifeChatter
+
+            LifeChatter.reset_global_runtime()
+        except Exception:
+            pass
         log_lifecycle(
             "unloaded",
             log_file_path=str(get_life_log_file()),

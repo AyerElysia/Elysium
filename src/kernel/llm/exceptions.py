@@ -77,6 +77,41 @@ class LLMAPIError(LLMError):
         self.model = model
 
 
+def should_retry_same_model(error: BaseException) -> bool:
+    """判断同一模型是否值得继续重试。
+
+    说明：
+    - 返回 ``True`` 表示当前模型还可以重试一次；
+    - 返回 ``False`` 表示应直接切到下一个模型，不要在当前模型上空转。
+    """
+    if isinstance(error, (LLMTimeoutError, LLMRateLimitError)):
+        return True
+
+    if isinstance(
+        error,
+        (
+            LLMConfigurationError,
+            LLMAuthenticationError,
+            LLMContentFilterError,
+            LLMTokenLimitError,
+        ),
+    ):
+        return False
+
+    if isinstance(error, LLMAPIError):
+        status_code = error.status_code
+        if status_code is None:
+            return True
+        if status_code == 429:
+            return True
+        return status_code >= 500
+
+    if isinstance(error, TimeoutError):
+        return True
+
+    return True
+
+
 def classify_exception(error: BaseException, model: str | None = None) -> BaseException:
     """将第三方 SDK 异常转换为标准化的 LLM 异常。
 

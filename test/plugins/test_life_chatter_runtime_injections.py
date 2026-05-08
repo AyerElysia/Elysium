@@ -31,7 +31,14 @@ def _payload_text(payload: Any) -> str:
     return str(content)
 
 
-def _message(index: int, content: str) -> Message:
+def _message(
+    index: int,
+    content: str,
+    *,
+    stream_id: str = "stream_history",
+    platform: str = "qq",
+    chat_type: str = "private",
+) -> Message:
     return Message(
         message_id=f"m{index}",
         time=1_700_000_000 + index,
@@ -41,9 +48,9 @@ def _message(index: int, content: str) -> Message:
         sender_id=f"u{index}",
         sender_name=f"user{index}",
         sender_role="user",
-        platform="qq",
-        chat_type="private",
-        stream_id="stream_history",
+        platform=platform,
+        chat_type=chat_type,
+        stream_id=stream_id,
     )
 
 
@@ -135,6 +142,44 @@ def test_life_chatter_history_text_can_keep_short_tail_after_first_merge() -> No
     assert "刚刚真正讨论的重点" in tail_history
     assert "上一句追问" in tail_history
     assert "第二条旧消息" not in tail_history
+
+
+def test_life_chatter_global_history_merges_streams_with_source_labels() -> None:
+    current_stream = SimpleNamespace(
+        stream_id="stream-a",
+        stream_name="A 私聊",
+        platform="qq",
+        chat_type="private",
+        context=SimpleNamespace(
+            history_messages=[
+                _message(1, "A_OLDER", stream_id="stream-a"),
+                _message(4, "A_NEWER", stream_id="stream-a"),
+            ]
+        ),
+    )
+    other_stream = SimpleNamespace(
+        stream_id="stream-b",
+        stream_name="B 直播间",
+        platform="live",
+        chat_type="group",
+        context=SimpleNamespace(
+            history_messages=[
+                _message(2, "B_MIDDLE", stream_id="stream-b", platform="live", chat_type="group"),
+            ]
+        ),
+    )
+    manager = SimpleNamespace(_streams={"stream-b": other_stream})
+
+    history = LifeChatter._build_history_text(
+        current_stream,
+        max_messages=3,
+        global_history=True,
+        stream_manager=manager,
+    )
+
+    assert "〔当前聊天流 | A 私聊 | qq/private | stream-a〕" in history
+    assert "〔其他聊天流 | B 直播间 | live/group | stream-b〕" in history
+    assert history.index("A_OLDER") < history.index("B_MIDDLE") < history.index("A_NEWER")
 
 
 def test_life_chatter_initial_history_limit_reads_config() -> None:
@@ -261,3 +306,51 @@ async def test_build_chatter_runtime_includes_latest_think_and_recent_chat() -> 
     assert "### 最近 10 条聊天记录" in text
     assert "旧消息 1" in text
     assert "旧消息 3" in text
+
+
+@pytest.mark.asyncio
+async def test_build_chatter_runtime_unified_recent_chat_merges_streams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = LifeEngineService(SimpleNamespace(config=LifeEngineConfig()))
+    current_stream = SimpleNamespace(
+        stream_id="stream-a",
+        stream_name="A 私聊",
+        platform="qq",
+        chat_type="private",
+        context=SimpleNamespace(
+            history_messages=[
+                _message(1, "A_HISTORY", stream_id="stream-a"),
+            ]
+        ),
+    )
+    other_stream = SimpleNamespace(
+        stream_id="stream-b",
+        stream_name="B 直播间",
+        platform="live",
+        chat_type="group",
+        context=SimpleNamespace(
+            history_messages=[
+                _message(2, "B_HISTORY", stream_id="stream-b", platform="live", chat_type="group"),
+            ]
+        ),
+    )
+    manager = SimpleNamespace(_streams={"stream-a": current_stream, "stream-b": other_stream})
+    monkeypatch.setattr("src.core.managers.get_stream_manager", lambda: manager)
+
+    text, _ = await service.build_chatter_runtime_context(
+        current_stream,
+        unified_chatter_context=True,
+    )
+    without_recent, _ = await service.build_chatter_runtime_context(
+        current_stream,
+        unified_chatter_context=True,
+        include_recent_chat_history=False,
+    )
+
+    assert "### 最近 10 条聊天记录" in text
+    assert "〔当前聊天流 | A 私聊 | qq/private | stream-a〕" in text
+    assert "〔其他聊天流 | B 直播间 | live/group | stream-b〕" in text
+    assert "A_HISTORY" in text
+    assert "B_HISTORY" in text
+    assert "### 最近 10 条聊天记录" not in without_recent
