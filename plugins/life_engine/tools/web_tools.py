@@ -282,10 +282,9 @@ def _sync_post_json(url: str, payload: dict[str, Any], timeout_seconds: int) -> 
         },
         method="POST",
     )
-    # Tavily 请求默认直连，避免被全局 http_proxy/https_proxy 劫持导致 TLS EOF。
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    # 使用默认 opener 以遵循系统代理环境变量
     try:
-        with opener.open(req, timeout=timeout_seconds) as resp:
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
             status = getattr(resp, "status", 200)
     except urllib.error.HTTPError as exc:
