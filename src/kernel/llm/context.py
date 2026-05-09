@@ -86,7 +86,22 @@ class LLMContextManager:
         if position is not None:
             updated.insert(int(position), payload)
         elif updated and updated[-1].role == payload.role:
-            updated[-1].content.extend(payload.content)
+            if payload.role == ROLE.TOOL_RESULT:
+                # 合并相邻 TOOL_RESULT 时去重：跳过 call_id 已在末尾 payload 中存在的条目，
+                # 防止浅拷贝导致同一 ToolResult 对象被 extend 两次引发 LLMContextError。
+                existing_ids = {
+                    str(p.call_id)
+                    for p in updated[-1].content
+                    if isinstance(p, ToolResult) and p.call_id
+                }
+                new_parts = [
+                    p for p in payload.content
+                    if not (isinstance(p, ToolResult) and str(p.call_id) in existing_ids)
+                ]
+                if new_parts:
+                    updated[-1].content.extend(new_parts)
+            else:
+                updated[-1].content.extend(payload.content)
         else:
             updated.append(payload)
 
