@@ -1,0 +1,20 @@
+{
+  "name": "Live-Bridge",
+  "version": "1.1.0",
+  "description": "为直播框架和 STS2 操作AI提供 OpenAI 兼容桥接",
+  "author": "Antigravity",
+  "license": "GPL-3.0",
+  "min_core_version": "0.1.0",
+  "entry_point": "plugin.py",
+  "keywords": ["live", "openai", "bridge", "vtuber", "sts2", "game"],
+  "categories": ["utility"],
+  "dependencies": {
+    "plugins": [],
+    "components": []
+  },
+  "python_dependencies": [
+    "fastapi",
+    "pydantic"
+  ],
+  "include": []
+}

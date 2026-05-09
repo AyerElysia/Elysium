@@ -1,0 +1,1 @@
+"""Live bridge plugin."""

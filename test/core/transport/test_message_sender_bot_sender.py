@@ -9,6 +9,12 @@ from src.core.models.message import Message, MessageType
 from src.core.transport.message_send.message_sender import MessageSender
 
 
+def test_virtual_send_includes_sts2_operator_platform() -> None:
+    assert MessageSender._should_use_virtual_send(Message(platform="live"))
+    assert MessageSender._should_use_virtual_send(Message(platform="game.sts2.operator"))
+    assert not MessageSender._should_use_virtual_send(Message(platform="qq"))
+
+
 @pytest.mark.asyncio
 async def test_send_message_overrides_sender_with_bot_info(monkeypatch: pytest.MonkeyPatch) -> None:
     """发送消息时应使用 adapter 的 bot 信息覆盖 sender 字段。"""

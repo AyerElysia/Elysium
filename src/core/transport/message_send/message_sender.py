@@ -159,7 +159,8 @@ class MessageSender:
     @staticmethod
     def _should_use_virtual_send(message: "Message") -> bool:
         """判断当前消息是否应走虚拟发送分支。"""
-        return str(getattr(message, "platform", "") or "").strip().lower() == "live"
+        virtual_platforms = {"live", "game.sts2.operator"}
+        return str(getattr(message, "platform", "") or "").strip().lower() in virtual_platforms
 
     async def _send_virtual_message(self, message: "Message") -> bool:
         """处理不依赖外部 Adapter 的虚拟平台发送。
