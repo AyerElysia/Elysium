@@ -14,11 +14,12 @@ Recommended STS2 teammate environment:
 
 ```bash
 AITEAMMATE_BACKEND=openai
-AITEAMMATE_API_BASE_URL=http://127.0.0.1:8000/v1
+AITEAMMATE_API_BASE_URL=http://127.0.0.1:18000/v1
 AITEAMMATE_API_KEY=local-elysia
 AITEAMMATE_API_MODEL=elysia-sts2
 AITEAMMATE_DECISION_TIMEOUT_MS=10000
 AITEAMMATE_API_MAX_TOKENS=240
 ```
 
-Adjust the port if Neo-MoFox is running on a different HTTP port.
+Restart Steam/the game after changing Windows environment variables. Adjust the
+port if Neo-MoFox is running on a different HTTP port.
