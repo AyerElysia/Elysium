@@ -550,7 +550,10 @@ class LifeEngineConfig(BaseConfig):
 
         capture_method: str = Field(
             default="auto",
-            description="截屏方式：auto / ffmpeg / grim / pil。Linux X11 推荐 auto 或 ffmpeg。",
+            description="截屏方式：auto / ffmpeg / grim / pil / powershell。"
+            "auto 模式在 WSL 环境下自动优先使用 powershell（避免 x11grab 黑屏问题）；"
+            "非 WSL 环境下优先使用 ffmpeg。"
+            "powershell 仅在 WSL（Windows Subsystem for Linux）中有效，通过 .NET SetProcessDPIAware 截取完整物理分辨率桌面。",
         )
 
         display: str = Field(

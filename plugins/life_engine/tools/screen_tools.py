@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import tempfile
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -43,6 +44,29 @@ _SCREEN_SYSTEM_PROMPT = (
     "如果有密码、token、cookie、私钥、验证码等敏感信息，不要逐字复述，只说明看到了敏感内容。"
     "如果画面模糊或内容太多，请明确说看不清哪些部分。"
 )
+
+# 判断当前是否运行在 WSL（Windows Subsystem for Linux）环境中。
+_WSL_DETECTED: bool | None = None
+
+
+def _is_wsl() -> bool:
+    """检测是否运行在 WSL 环境中（通过 /proc/version 中是否含 microsoft 关键字判断）。"""
+    global _WSL_DETECTED
+    if _WSL_DETECTED is None:
+        try:
+            version = Path("/proc/version").read_text(encoding="utf-8", errors="ignore").lower()
+            _WSL_DETECTED = "microsoft" in version
+        except Exception:
+            _WSL_DETECTED = False
+    return _WSL_DETECTED
+
+
+# PowerShell 截图的临时文件落点（Windows Temp 目录通过 /mnt/c 访问）。
+_POWERSHELL_EXE = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+_WINDOWS_TEMP_MOUNT = "/mnt/c/Windows/Temp"
+
+# 黑图平均像素亮度阈值：低于此值视为全黑截图（深色主题仍有内容时通常远高于 5）。
+_BLANK_IMAGE_MEAN_THRESHOLD = 5.0
 
 
 @dataclass(slots=True)
@@ -174,6 +198,89 @@ def _resize_and_resave(path: Path, screen_cfg: Any) -> tuple[int, int, str]:
         return image.width, image.height, output_format
 
 
+def _is_blank_image(path: Path) -> bool:
+    """检测截图是否为全黑/空白图（平均像素亮度低于阈值）。
+
+    用于过滤 ffmpeg x11grab 在 WSLg 环境下返回全黑截图但 exit code 0 的假成功情况。
+    """
+    try:
+        with PILImage.open(path) as img:
+            img.load()
+            # 转灰度后取平均值，速度快且跨格式
+            gray = img.convert("L")
+            pixels = list(gray.getdata())
+            if not pixels:
+                return True
+            mean = sum(pixels) / len(pixels)
+            return mean < _BLANK_IMAGE_MEAN_THRESHOLD
+    except Exception:
+        return True
+
+
+async def _capture_with_powershell(path: Path, screen_cfg: Any) -> tuple[bool, str]:
+    """使用 PowerShell + .NET System.Drawing 截取 Windows 桌面（仅 WSL 环境有效）。
+
+    通过 SetProcessDPIAware() 确保截取物理像素分辨率（2K 等高分屏不被缩放）。
+    截图先写入 Windows Temp 目录，再通过 /mnt/c 路径复制到 Linux 临时文件。
+    """
+    if not shutil.which(_POWERSHELL_EXE) and not Path(_POWERSHELL_EXE).exists():
+        return False, f"未找到 PowerShell: {_POWERSHELL_EXE}"
+
+    win_temp_dir = Path(_WINDOWS_TEMP_MOUNT)
+    if not win_temp_dir.is_dir():
+        return False, f"Windows Temp 目录不可访问: {_WINDOWS_TEMP_MOUNT}"
+
+    # 使用唯一文件名避免并发冲突
+    unique_name = f"elysia_screen_{uuid.uuid4().hex}.png"
+    win_save_path = win_temp_dir / unique_name
+    # PowerShell 看到的路径（反斜杠，Windows 格式）
+    win_path_ps = f"C:\\Windows\\Temp\\{unique_name}"
+
+    timeout_seconds = int(
+        getattr(screen_cfg, "capture_timeout_seconds", _DEFAULT_TIMEOUT_SECONDS)
+        or _DEFAULT_TIMEOUT_SECONDS
+    )
+
+    ps_script = (
+        "Add-Type @'\n"
+        "using System;\n"
+        "using System.Runtime.InteropServices;\n"
+        "public class DpiHelper {\n"
+        "    [DllImport(\"user32.dll\")]\n"
+        "    public static extern bool SetProcessDPIAware();\n"
+        "}\n"
+        "'@\n"
+        "[DpiHelper]::SetProcessDPIAware() | Out-Null\n"
+        "Add-Type -AssemblyName System.Windows.Forms\n"
+        "Add-Type -AssemblyName System.Drawing\n"
+        "$screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds\n"
+        "$bitmap = New-Object System.Drawing.Bitmap $screen.Width, $screen.Height\n"
+        "$graphics = [System.Drawing.Graphics]::FromImage($bitmap)\n"
+        "$graphics.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size)\n"
+        f"$bitmap.Save('{win_path_ps}', [System.Drawing.Imaging.ImageFormat]::Png)\n"
+        "$graphics.Dispose()\n"
+        "$bitmap.Dispose()\n"
+        "Write-Output 'OK'\n"
+    )
+
+    try:
+        ok, result = await _run_command(
+            [_POWERSHELL_EXE, "-NonInteractive", "-Command", ps_script],
+            timeout_seconds=timeout_seconds,
+        )
+        if not ok:
+            return False, f"PowerShell 截图失败: {result}"
+
+        if not win_save_path.exists() or win_save_path.stat().st_size == 0:
+            return False, "PowerShell 截图文件未生成或为空"
+
+        # 复制到 Linux 目标路径
+        shutil.copyfile(win_save_path, path)
+        return True, ""
+    finally:
+        win_save_path.unlink(missing_ok=True)
+
+
 async def _capture_with_ffmpeg(path: Path, screen_cfg: Any) -> tuple[bool, str]:
     if not shutil.which("ffmpeg"):
         return False, "未安装 ffmpeg"
@@ -227,7 +334,7 @@ async def _capture_with_pil(path: Path, screen_cfg: Any) -> tuple[bool, str]:
 async def _capture_screen(plugin: Any) -> CapturedScreen:
     screen_cfg = _get_screen_cfg(plugin)
     method = str(getattr(screen_cfg, "capture_method", "auto") or "auto").strip().lower()
-    if method not in {"auto", "ffmpeg", "grim", "pil"}:
+    if method not in {"auto", "ffmpeg", "grim", "pil", "powershell"}:
         method = "auto"
 
     fd, temp_name = tempfile.mkstemp(prefix="life_screen_", suffix=".png")
@@ -236,7 +343,22 @@ async def _capture_screen(plugin: Any) -> CapturedScreen:
 
     methods: list[tuple[str, Any]]
     if method == "auto":
-        methods = [("ffmpeg", _capture_with_ffmpeg), ("grim", _capture_with_grim), ("pil", _capture_with_pil)]
+        if _is_wsl():
+            # WSL 环境：优先用 PowerShell 截取真实 Windows 桌面，x11grab 在 WSLg 下返回黑屏
+            methods = [
+                ("powershell", _capture_with_powershell),
+                ("grim", _capture_with_grim),
+                ("ffmpeg", _capture_with_ffmpeg),
+                ("pil", _capture_with_pil),
+            ]
+        else:
+            methods = [
+                ("ffmpeg", _capture_with_ffmpeg),
+                ("grim", _capture_with_grim),
+                ("pil", _capture_with_pil),
+            ]
+    elif method == "powershell":
+        methods = [("powershell", _capture_with_powershell)]
     elif method == "ffmpeg":
         methods = [("ffmpeg", _capture_with_ffmpeg)]
     elif method == "grim":
@@ -252,6 +374,10 @@ async def _capture_screen(plugin: Any) -> CapturedScreen:
                 temp_path.unlink(missing_ok=True)
             ok, detail = await capture_func(temp_path, screen_cfg)
             if ok and temp_path.exists() and temp_path.stat().st_size > 0:
+                if _is_blank_image(temp_path):
+                    errors.append(f"{method_name}: 截图为全黑/空白，已跳过")
+                    logger.warning(f"截图方法 {method_name} 返回全黑图片，跳过（常见于 WSLg x11grab）")
+                    continue
                 used_method = method_name
                 break
             errors.append(f"{method_name}: {detail}")
@@ -473,4 +599,7 @@ __all__ = [
     "SCREEN_TOOLS",
     "_capture_screen",
     "_observe_screen",
+    "_is_wsl",
+    "_is_blank_image",
+    "_capture_with_powershell",
 ]
