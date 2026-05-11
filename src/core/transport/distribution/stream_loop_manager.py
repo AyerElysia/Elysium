@@ -390,6 +390,14 @@ class StreamLoopManager:
             # 配置未初始化时不阻塞
             return True
 
+        if self._message_buffer_bypass_requested(context):
+            context.message_buffer_skip_count = 0
+            logger.debug(
+                f"[缓冲] stream={stream_id[:8]}, "
+                "收到内部同步消息，跳过消息缓冲"
+            )
+            return True
+
         # 功能关闭时直接放行
         if buffer_window <= 0:
             return True
@@ -422,6 +430,17 @@ class StreamLoopManager:
             f"消息缓冲中 (elapsed={elapsed:.2f}s < window={buffer_window}s, "
             f"skip={context.message_buffer_skip_count}/{max_skip})，跳过本次 Tick"
         )
+        return False
+
+    @staticmethod
+    def _message_buffer_bypass_requested(context: "StreamContext") -> bool:
+        """Return True when unread messages request immediate processing."""
+
+        unread_messages = getattr(context, "unread_messages", None) or []
+        for message in reversed(list(unread_messages)):
+            extra = getattr(message, "extra", None) or {}
+            if isinstance(extra, dict) and extra.get("bypass_message_buffer"):
+                return True
         return False
 
     @staticmethod

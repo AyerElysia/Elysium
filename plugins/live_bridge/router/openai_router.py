@@ -144,6 +144,8 @@ class OpenAIRouter(BaseRouter):
     _SEGMENT_TIMEOUT: float = 5.5
     # 总超时
     _TOTAL_TIMEOUT: float = 120.0
+    # 游戏 operator 是同步请求链路：需要覆盖一次模型调用和强制回复重试。
+    _GAME_DECISION_TOTAL_TIMEOUT: float = 45.0
 
     def register_endpoints(self) -> None:
 
@@ -271,9 +273,10 @@ class OpenAIRouter(BaseRouter):
             content=prompt,
             timeout_reply="",
             adapter_signature="live_bridge:router:sts2_operator",
-            total_timeout=8.0,
-            segment_timeout=1.25,
+            total_timeout=self._GAME_DECISION_TOTAL_TIMEOUT,
+            segment_timeout=self._SEGMENT_TIMEOUT,
             scene="slay_the_spire_2",
+            bypass_message_buffer=True,
             sts2_request_id=request.request_id,
             sts2_snapshot_id=request.snapshot_id,
             sts2_actor_id=request.actor_id,
@@ -306,9 +309,10 @@ class OpenAIRouter(BaseRouter):
             content=persistent_event_text,
             timeout_reply="",
             adapter_signature="live_bridge:router:minecraft_operator",
-            total_timeout=10.0,
-            segment_timeout=1.25,
+            total_timeout=self._GAME_DECISION_TOTAL_TIMEOUT,
+            segment_timeout=self._SEGMENT_TIMEOUT,
             scene="minecraft",
+            bypass_message_buffer=True,
             minecraft_model=request.model,
             minecraft_tool_names=request.tool_names,
         )

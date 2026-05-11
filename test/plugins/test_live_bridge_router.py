@@ -7,6 +7,7 @@ from plugins.live_bridge.router.openai_router import (
     _get_last_user_content,
     _normalize_live_comment,
 )
+from plugins.live_bridge.minecraft_operator import parse_minecraft_decision_request
 
 
 def test_live_bridge_prefers_last_user_message() -> None:
@@ -62,3 +63,38 @@ def test_minecraft_completion_response_keeps_text_reply_shape() -> None:
     )
 
     assert response.choices[0].message == ChatMessage(role="assistant", content="先等等。")
+
+
+async def test_minecraft_decision_dispatch_bypasses_chat_buffer(monkeypatch) -> None:
+    request = parse_minecraft_decision_request(
+        [ChatMessage(role="user", content="爱莉，是你么？")],
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "query_game_context",
+                    "description": "query context",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        model="elysia-minecraft",
+    )
+    assert request is not None
+
+    router = object.__new__(OpenAIRouter)
+    captured = {}
+
+    async def fake_dispatch(**kwargs):
+        captured.update(kwargs)
+        return '{"mode":"say","content":"在呢。","reason":"回应玩家"}'
+
+    monkeypatch.setattr(router, "_dispatch_message_and_collect", fake_dispatch)
+
+    reply = await router._ask_elysia_for_minecraft_decision(request, "temporary protocol")
+
+    assert reply
+    assert captured["platform"] == "game.minecraft.operator"
+    assert captured["bypass_message_buffer"] is True
+    assert captured["total_timeout"] == router._GAME_DECISION_TOTAL_TIMEOUT
+    assert captured["segment_timeout"] == router._SEGMENT_TIMEOUT

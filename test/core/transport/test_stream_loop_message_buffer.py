@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.core.transport.distribution.distributor import _on_message_received
+from src.core.models.message import Message
 from src.core.transport.distribution.stream_loop_manager import StreamLoopManager
 from src.core.models.stream import StreamContext
 
@@ -56,6 +57,33 @@ def test_message_buffer_check_forces_release_under_high_pressure(monkeypatch: py
     assert context.message_buffer_skip_count == 0
 
 
+def test_message_buffer_check_bypasses_for_internal_sync_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """内部同步桥接消息不应被普通聊天缓冲窗口阻塞。"""
+
+    monkeypatch.setattr(
+        "src.core.config.get_core_config",
+        lambda: _fake_core_config(window=60.0, max_skip=3),
+    )
+
+    manager = StreamLoopManager()
+    context = StreamContext(stream_id="game_minecraft_agent")
+    context.last_message_time = time.time()
+    context.message_buffer_skip_count = 2
+    context.add_unread_message(
+        Message(
+            message_id="minecraft-sync-1",
+            content="Minecraft decision request",
+            stream_id="game_minecraft_agent",
+            bypass_message_buffer=True,
+        )
+    )
+
+    assert manager._message_buffer_check("game_minecraft_agent", context) is True
+    assert context.message_buffer_skip_count == 0
+
+
 @pytest.mark.asyncio
 async def test_distributor_does_not_reset_message_buffer_skip_count(monkeypatch: pytest.MonkeyPatch) -> None:
     """收到新消息时不应清零 skip_count，否则高压群聊会无限缓冲。"""
@@ -95,6 +123,7 @@ async def test_distributor_does_not_reset_message_buffer_skip_count(monkeypatch:
 
     # 构造最小 Message
     message = SimpleNamespace(
+        content="",
         platform="test",
         stream_id="stream-001",
         chat_type="group",
