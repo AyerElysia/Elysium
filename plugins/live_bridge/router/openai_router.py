@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import binascii
 import json
 import os
 import re
@@ -7,7 +9,7 @@ import urllib.error
 import urllib.request
 import uuid
 from typing import Any, Dict, List
-from fastapi import HTTPException
+from fastapi import HTTPException, Response
 from pydantic import BaseModel, Field
 
 from src.core.components.base.router import BaseRouter
@@ -158,6 +160,12 @@ class ChatCompletionRequest(BaseModel):
     response_format: Dict[str, Any] | None = None
     stream: bool = False
 
+class MinecraftTTSRequest(BaseModel):
+    text: str = ""
+    speed: float = 1.0
+    play_in_app: bool = Field(default=False, alias="play_in_app")
+    voice_ids: List[str] = Field(default_factory=list, alias="voice_ids")
+
 class ChatCompletionResponseChoice(BaseModel):
     index: int = 0
     message: ChatMessage
@@ -195,6 +203,8 @@ class OpenAIRouter(BaseRouter):
     _TOTAL_TIMEOUT: float = 120.0
     # 游戏 operator 是同步请求链路：需要覆盖一次模型调用和强制回复重试。
     _GAME_DECISION_TOTAL_TIMEOUT: float = 45.0
+    # AI-Vtuber 镜像播放默认关闭；Minecraft 自身通过 /tts/speak 拿 MiMO 音频。
+    _MINECRAFT_TTS_MIRROR_ENABLED: bool = False
 
     def register_endpoints(self) -> None:
 
@@ -227,6 +237,17 @@ class OpenAIRouter(BaseRouter):
 
             reply_text = await self._handle_live_chat(request.messages)
             return self._completion_response(request.model, reply_text)
+
+        @self.app.post("/tts/speak")
+        async def minecraft_tts_speak(request: MinecraftTTSRequest):
+            """Player2-compatible TTS endpoint for Touhou Little Maid."""
+
+            text = str(request.text or "").strip()
+            if not text:
+                raise HTTPException(status_code=400, detail="text is required")
+
+            audio_bytes = await self._synthesize_minecraft_tts(text)
+            return Response(content=audio_bytes, media_type="audio/wav")
 
     async def _handle_live_chat(self, messages: List[ChatMessage]) -> str:
         raw_content = _get_last_user_content(messages)
@@ -313,7 +334,7 @@ class OpenAIRouter(BaseRouter):
     def _queue_minecraft_say_tts(self, content: str, *, source: str = "") -> None:
         """Best-effort voice playback for Minecraft say decisions via AI-Vtuber."""
 
-        if not _env_flag(_MINECRAFT_TTS_ENABLED_ENV, default=True):
+        if not _env_flag(_MINECRAFT_TTS_ENABLED_ENV, default=self._MINECRAFT_TTS_MIRROR_ENABLED):
             return
         if not str(content or "").strip():
             return
@@ -370,6 +391,54 @@ class OpenAIRouter(BaseRouter):
                 "Minecraft MiMo TTS 转发异常: "
                 f"endpoint={endpoint} error={_log_preview(exc, limit=240)}"
             )
+
+    @staticmethod
+    def _get_tts_voice_service() -> Any | None:
+        try:
+            from src.core.managers import get_plugin_manager
+
+            plugin = get_plugin_manager().get_plugin("tts_voice_plugin")
+            service = getattr(plugin, "tts_service", None) if plugin is not None else None
+            if service is not None and hasattr(service, "generate_voice"):
+                return service
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"获取已加载 TTSService 失败，将尝试 Service API: {exc}")
+
+        try:
+            from src.app.plugin_system.api.service_api import get_service
+
+            service = get_service("tts_voice_plugin:service:tts")
+            if service is not None and hasattr(service, "generate_voice"):
+                return service
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"通过 Service API 获取 TTSService 失败: {exc}")
+        return None
+
+    async def _synthesize_minecraft_tts(self, text: str) -> bytes:
+        service = self._get_tts_voice_service()
+        if service is None:
+            raise HTTPException(status_code=503, detail="tts_voice_plugin service is not available")
+
+        try:
+            audio_b64 = await service.generate_voice(text, "default")
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Minecraft MiMo TTS 合成异常: {exc}")
+            raise HTTPException(status_code=502, detail="minecraft tts synthesis failed") from exc
+
+        if not audio_b64:
+            raise HTTPException(status_code=502, detail="minecraft tts synthesis returned no audio")
+
+        try:
+            audio_bytes = base64.b64decode(audio_b64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            logger.error(f"Minecraft MiMo TTS 返回了非法 base64 音频: {exc}")
+            raise HTTPException(status_code=502, detail="minecraft tts returned invalid audio") from exc
+
+        if not audio_bytes:
+            raise HTTPException(status_code=502, detail="minecraft tts returned empty audio")
+
+        logger.info(f"Minecraft MiMo TTS 合成完成: text={_log_preview(text, limit=160)} bytes={len(audio_bytes)}")
+        return audio_bytes
 
     async def _ask_elysia_for_sts2_decision(
         self,

@@ -1,9 +1,14 @@
 """live_bridge 输入规范化测试。"""
 
+import base64
 from types import SimpleNamespace
+
+import pytest
+from fastapi import HTTPException
 
 from plugins.live_bridge.router.openai_router import (
     ChatMessage,
+    MinecraftTTSRequest,
     MinecraftDecisionResult,
     OpenAIRouter,
     _get_last_user_content,
@@ -67,7 +72,7 @@ def test_minecraft_completion_response_keeps_text_reply_shape() -> None:
     assert response.choices[0].message == ChatMessage(role="assistant", content="先等等。")
 
 
-def test_minecraft_tts_payload_uses_ai_vtuber_send_contract(monkeypatch) -> None:
+def test_minecraft_tts_mirror_payload_uses_ai_vtuber_send_contract(monkeypatch) -> None:
     monkeypatch.delenv("LIVE_BRIDGE_MINECRAFT_TTS_TYPE", raising=False)
     monkeypatch.delenv("LIVE_BRIDGE_MINECRAFT_TTS_USERNAME", raising=False)
 
@@ -82,6 +87,45 @@ def test_minecraft_tts_payload_uses_ai_vtuber_send_contract(monkeypatch) -> None
             "source": "minecraft",
         },
     }
+
+
+def test_minecraft_player2_tts_request_accepts_alias_fields() -> None:
+    request = MinecraftTTSRequest(
+        text="早呀",
+        speed=1.2,
+        play_in_app=True,
+        voice_ids=["voice-a"],
+    )
+
+    assert request.text == "早呀"
+    assert request.speed == 1.2
+    assert request.play_in_app is True
+    assert request.voice_ids == ["voice-a"]
+
+
+async def test_minecraft_tts_synthesis_returns_audio_bytes(monkeypatch) -> None:
+    router = object.__new__(OpenAIRouter)
+    audio = b"RIFFfake-wav"
+
+    class FakeTTSService:
+        async def generate_voice(self, text, style):
+            assert text == "早呀"
+            assert style == "default"
+            return base64.b64encode(audio).decode("ascii")
+
+    monkeypatch.setattr(router, "_get_tts_voice_service", lambda: FakeTTSService())
+
+    assert await router._synthesize_minecraft_tts("早呀") == audio
+
+
+async def test_minecraft_tts_synthesis_requires_service(monkeypatch) -> None:
+    router = object.__new__(OpenAIRouter)
+    monkeypatch.setattr(router, "_get_tts_voice_service", lambda: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await router._synthesize_minecraft_tts("早呀")
+
+    assert exc_info.value.status_code == 503
 
 
 async def test_minecraft_say_decision_triggers_ai_vtuber_tts(monkeypatch) -> None:
