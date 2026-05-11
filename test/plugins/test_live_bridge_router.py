@@ -1,5 +1,7 @@
 """live_bridge 输入规范化测试。"""
 
+from types import SimpleNamespace
+
 from plugins.live_bridge.router.openai_router import (
     ChatMessage,
     MinecraftDecisionResult,
@@ -63,6 +65,78 @@ def test_minecraft_completion_response_keeps_text_reply_shape() -> None:
     )
 
     assert response.choices[0].message == ChatMessage(role="assistant", content="先等等。")
+
+
+def test_minecraft_tts_payload_uses_ai_vtuber_send_contract(monkeypatch) -> None:
+    monkeypatch.delenv("LIVE_BRIDGE_MINECRAFT_TTS_TYPE", raising=False)
+    monkeypatch.delenv("LIVE_BRIDGE_MINECRAFT_TTS_USERNAME", raising=False)
+
+    payload = OpenAIRouter._minecraft_tts_payload("  爱莉听到了。 ")
+
+    assert payload == {
+        "type": "reread_top_priority",
+        "data": {
+            "type": "reread_top_priority",
+            "username": "Minecraft",
+            "content": "爱莉听到了。",
+            "source": "minecraft",
+        },
+    }
+
+
+async def test_minecraft_say_decision_triggers_ai_vtuber_tts(monkeypatch) -> None:
+    router = object.__new__(OpenAIRouter)
+    request = SimpleNamespace(latest_user_content="爱莉，是你么？")
+    queued = []
+
+    class FakeOperator:
+        async def decide(self, decision_request, ask_callback):
+            return MinecraftDecisionResult(mode="say", content="在呢。", source="elysia")
+
+        async def record_life_event(self, text, *, stream_id):
+            return None
+
+    monkeypatch.setattr(router, "_minecraft_operator", FakeOperator())
+    monkeypatch.setattr(
+        router,
+        "_queue_minecraft_say_tts",
+        lambda content, *, source="": queued.append((content, source)),
+    )
+
+    result = await router._handle_minecraft_decision(request)
+
+    assert result.content == "在呢。"
+    assert queued == [("在呢。", "elysia")]
+
+
+async def test_minecraft_tool_decision_does_not_trigger_tts(monkeypatch) -> None:
+    router = object.__new__(OpenAIRouter)
+    request = SimpleNamespace(latest_user_content="坐下")
+    queued = []
+
+    class FakeOperator:
+        async def decide(self, decision_request, ask_callback):
+            return MinecraftDecisionResult(
+                mode="tool",
+                tool_name="switch_sit",
+                arguments={"sit": True},
+                source="elysia",
+            )
+
+        async def record_life_event(self, text, *, stream_id):
+            return None
+
+    monkeypatch.setattr(router, "_minecraft_operator", FakeOperator())
+    monkeypatch.setattr(
+        router,
+        "_queue_minecraft_say_tts",
+        lambda content, *, source="": queued.append((content, source)),
+    )
+
+    result = await router._handle_minecraft_decision(request)
+
+    assert result.is_tool_call
+    assert queued == []
 
 
 async def test_minecraft_decision_dispatch_bypasses_chat_buffer(monkeypatch) -> None:

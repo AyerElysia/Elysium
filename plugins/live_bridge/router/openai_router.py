@@ -1,7 +1,10 @@
 import asyncio
 import json
+import os
 import re
 import time
+import urllib.error
+import urllib.request
 import uuid
 from typing import Any, Dict, List
 from fastapi import HTTPException
@@ -39,6 +42,15 @@ _LIVE_VIEWER_RE = re.compile(
     r'^\s*观众[“"](?P<viewer>.+?)[”"]说[:：]\s*(?P<comment>.*)\s*$',
     re.DOTALL,
 )
+_MINECRAFT_TTS_ENABLED_ENV = "LIVE_BRIDGE_MINECRAFT_TTS_ENABLED"
+_MINECRAFT_TTS_ENDPOINT_ENV = "LIVE_BRIDGE_MINECRAFT_TTS_ENDPOINT"
+_MINECRAFT_TTS_TYPE_ENV = "LIVE_BRIDGE_MINECRAFT_TTS_TYPE"
+_MINECRAFT_TTS_USERNAME_ENV = "LIVE_BRIDGE_MINECRAFT_TTS_USERNAME"
+_MINECRAFT_TTS_TIMEOUT_ENV = "LIVE_BRIDGE_MINECRAFT_TTS_TIMEOUT"
+_DEFAULT_MINECRAFT_TTS_ENDPOINT = "http://127.0.0.1:18082/send"
+_DEFAULT_MINECRAFT_TTS_TYPE = "reread_top_priority"
+_DEFAULT_MINECRAFT_TTS_USERNAME = "Minecraft"
+_DEFAULT_MINECRAFT_TTS_TIMEOUT = 2.5
 
 
 def _get_last_user_content(messages: List["ChatMessage"]) -> str:
@@ -84,6 +96,42 @@ def _log_preview(value: Any, *, limit: int = 360) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 1)] + "..."
+
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off", "disabled"}
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _post_json_sync(url: str, payload: dict[str, Any], *, timeout: float) -> tuple[int, Any]:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - local bridge endpoint
+        status = int(response.getcode() or 0)
+        raw = response.read(4096).decode("utf-8", errors="replace")
+    try:
+        parsed = json.loads(raw) if raw else None
+    except json.JSONDecodeError:
+        parsed = raw
+    return status, parsed
 
 # ==================== OpenAI 协议模型 ====================
 
@@ -139,6 +187,7 @@ class OpenAIRouter(BaseRouter):
     _lock = asyncio.Lock()
     _sts2_operator = Sts2Operator()
     _minecraft_operator = MinecraftOperator()
+    _background_tasks: set[asyncio.Task[Any]] = set()
 
     # 段落间超时：需大于 LifeSendTextAction 最大打字延迟 (4.0s)，留 1s 余量
     _SEGMENT_TIMEOUT: float = 5.5
@@ -257,7 +306,70 @@ class OpenAIRouter(BaseRouter):
             f"source={result.source} action={_log_preview(action_desc, limit=500)} "
             f"reason={_log_preview(result.reason, limit=360)}"
         )
+        if not result.is_tool_call and result.content:
+            self._queue_minecraft_say_tts(result.content, source=result.source)
         return result
+
+    def _queue_minecraft_say_tts(self, content: str, *, source: str = "") -> None:
+        """Best-effort voice playback for Minecraft say decisions via AI-Vtuber."""
+
+        if not _env_flag(_MINECRAFT_TTS_ENABLED_ENV, default=True):
+            return
+        if not str(content or "").strip():
+            return
+
+        task = asyncio.create_task(self._post_minecraft_say_tts(content, source=source))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    @staticmethod
+    def _minecraft_tts_payload(content: str) -> dict[str, Any]:
+        message_type = os.environ.get(_MINECRAFT_TTS_TYPE_ENV, _DEFAULT_MINECRAFT_TTS_TYPE).strip()
+        if message_type not in {"reread", "reread_top_priority"}:
+            message_type = _DEFAULT_MINECRAFT_TTS_TYPE
+        username = os.environ.get(_MINECRAFT_TTS_USERNAME_ENV, _DEFAULT_MINECRAFT_TTS_USERNAME).strip()
+        return {
+            "type": message_type,
+            "data": {
+                "type": message_type,
+                "username": username or _DEFAULT_MINECRAFT_TTS_USERNAME,
+                "content": str(content or "").strip(),
+                "source": "minecraft",
+            },
+        }
+
+    async def _post_minecraft_say_tts(self, content: str, *, source: str = "") -> None:
+        endpoint = os.environ.get(_MINECRAFT_TTS_ENDPOINT_ENV, _DEFAULT_MINECRAFT_TTS_ENDPOINT).strip()
+        endpoint = endpoint or _DEFAULT_MINECRAFT_TTS_ENDPOINT
+        timeout = _env_float(_MINECRAFT_TTS_TIMEOUT_ENV, _DEFAULT_MINECRAFT_TTS_TIMEOUT)
+        payload = self._minecraft_tts_payload(content)
+        try:
+            status, response = await asyncio.to_thread(
+                _post_json_sync,
+                endpoint,
+                payload,
+                timeout=timeout,
+            )
+            if status >= 400:
+                logger.warning(
+                    "Minecraft MiMo TTS 转发失败: "
+                    f"endpoint={endpoint} status={status} response={_log_preview(response, limit=240)}"
+                )
+                return
+            logger.info(
+                "Minecraft say 已转发到 AI-Vtuber MiMo TTS: "
+                f"source={source or '-'} content={_log_preview(content, limit=160)}"
+            )
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            logger.warning(
+                "Minecraft MiMo TTS 转发失败: "
+                f"endpoint={endpoint} error={_log_preview(exc, limit=240)}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Minecraft MiMo TTS 转发异常: "
+                f"endpoint={endpoint} error={_log_preview(exc, limit=240)}"
+            )
 
     async def _ask_elysia_for_sts2_decision(
         self,
