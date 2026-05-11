@@ -332,6 +332,7 @@ class EventManager:
                     self._unregister_temporary_handler_locked(temporary_id)
             return (decision, next_params)
 
+        safe_execute.__name__ = f"temporary_event_handler:{temporary_id}"
         return safe_execute
 
     def _make_safe_wrapper(
@@ -359,6 +360,7 @@ class EventManager:
                 logger.error(f"事件处理器 {signature} 执行失败: {e}")
                 return (EventDecision.PASS, params)
 
+        safe_execute.__name__ = signature
         return safe_execute
 
     async def publish_event(

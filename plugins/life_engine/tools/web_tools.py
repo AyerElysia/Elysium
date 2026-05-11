@@ -270,43 +270,90 @@ def _validate_public_url(url: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _sync_post_json(url: str, payload: dict[str, Any], timeout_seconds: int) -> dict[str, Any]:
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        url=url,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
+import requests
+
+
+def _has_proxy_env() -> bool:
+    return any(
+        os.getenv(name)
+        for name in (
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        )
+    )
+
+
+def _is_retryable_proxy_tls_error(exc: requests.exceptions.RequestException) -> bool:
+    if not _has_proxy_env():
+        return False
+    message = str(exc)
+    return (
+        isinstance(exc, requests.exceptions.ProxyError)
+        or "UNEXPECTED_EOF_WHILE_READING" in message
+        or "EOF occurred in violation of protocol" in message
+        or "SSL_ERROR_SYSCALL" in message
+    )
+
+
+def _requests_post_json(
+    url: str,
+    payload: dict[str, Any],
+    timeout_seconds: int,
+    *,
+    trust_env: bool = True,
+) -> requests.Response:
+    kwargs = {
+        "url": url,
+        "json": payload,
+        "headers": {
             "Accept": "application/json",
             "User-Agent": "life_engine/3.3.0",
         },
-        method="POST",
-    )
-    # 使用默认 opener 以遵循系统代理环境变量
+        "timeout": timeout_seconds,
+    }
+    if trust_env:
+        return requests.post(**kwargs)
+
+    session = requests.Session()
+    session.trust_env = False
     try:
-        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            status = getattr(resp, "status", 200)
-    except urllib.error.HTTPError as exc:
-        detail = ""
+        return session.post(**kwargs)
+    finally:
+        session.close()
+
+
+def _sync_post_json(url: str, payload: dict[str, Any], timeout_seconds: int) -> dict[str, Any]:
+    # 使用 requests 替代 urllib 以获得更稳健的代理 TLS 处理能力
+    try:
+        # 默认沿用系统代理；如果本地代理对 Tavily TLS 握手提前断开，再直连重试一次。
+        resp = _requests_post_json(url, payload, timeout_seconds, trust_env=True)
+    except requests.exceptions.RequestException as exc:
+        if not _is_retryable_proxy_tls_error(exc):
+            raise RuntimeError(f"Tavily 网络请求失败: {exc}") from exc
+        logger.warning(
+            "Tavily 经系统代理请求失败，尝试绕过代理直连重试: "
+            f"{type(exc).__name__}: {exc}"
+        )
         try:
-            detail = exc.read().decode("utf-8", errors="replace")
-        except (OSError, UnicodeDecodeError) as e:
-            logger.debug(f"Failed to read HTTP error detail: {e}")
-            detail = str(exc)
-        raise RuntimeError(f"Tavily 请求失败（HTTP {exc.code}）: {detail[:500]}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Tavily 网络请求失败: {exc.reason}") from exc
+            resp = _requests_post_json(url, payload, timeout_seconds, trust_env=False)
+        except requests.exceptions.RequestException as direct_exc:
+            raise RuntimeError(
+                f"Tavily 网络请求失败: proxy={exc}; direct={direct_exc}"
+            ) from direct_exc
+
+    try:
+        status = resp.status_code
+        raw = resp.text
+        data = resp.json()
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"Tavily 请求异常: {exc}") from exc
 
-    try:
-        data = json.loads(raw) if raw else {}
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Tavily 返回了非 JSON 响应（HTTP {status}）") from exc
-
     if status >= 400:
-        raise RuntimeError(f"Tavily 请求失败（HTTP {status}）: {str(data)[:500]}")
+        raise RuntimeError(f"Tavily 请求失败（HTTP {status}）: {raw[:500]}")
     if not isinstance(data, dict):
         raise RuntimeError("Tavily 返回格式异常：顶层不是对象")
     return data

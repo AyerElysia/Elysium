@@ -968,7 +968,11 @@ class LifeChatter(BaseChatter):
 
         # Layer 1: 私聊 → 始终响应
         if chat_type_str == "private":
-            return {"reason": "私聊场景，直接响应", "should_respond": True}
+            return {
+                "reason": "私聊场景，直接响应",
+                "should_respond": True,
+                "force_reply": True,
+            }
 
         # Layer 2: @mention
         bot_nickname = str(chat_stream.bot_nickname or "").strip()
@@ -976,9 +980,17 @@ class LifeChatter(BaseChatter):
         for msg in unread_msgs:
             text = str(getattr(msg, "processed_plain_text", "") or getattr(msg, "content", "") or "")
             if bot_nickname and bot_nickname in text:
-                return {"reason": f"消息中提到了 {bot_nickname}", "should_respond": True}
+                return {
+                    "reason": f"消息中提到了 {bot_nickname}",
+                    "should_respond": True,
+                    "force_reply": True,
+                }
             if bot_id and f"@{bot_id}" in text:
-                return {"reason": "消息中 @提及了机器人", "should_respond": True}
+                return {
+                    "reason": "消息中 @提及了机器人",
+                    "should_respond": True,
+                    "force_reply": True,
+                }
 
         # Layer 3: 简单关键词启发
         keywords = [bot_nickname] if bot_nickname else []
@@ -987,7 +999,11 @@ class LifeChatter(BaseChatter):
             text = str(getattr(msg, "processed_plain_text", "") or getattr(msg, "content", "") or "").lower()
             for kw in keywords:
                 if kw and kw.lower() in text:
-                    return {"reason": f"消息中包含关键词 {kw}", "should_respond": True}
+                    return {
+                        "reason": f"消息中包含关键词 {kw}",
+                        "should_respond": True,
+                        "force_reply": True,
+                    }
 
         if unread_msgs and all(self._is_proactive_trigger_message(msg) for msg in unread_msgs):
             service = self._get_life_service()
@@ -1297,6 +1313,22 @@ class LifeChatter(BaseChatter):
             if str(getattr(msg, "sender_role", "") or "").lower() == "bot":
                 continue
             return True
+        return False
+
+    @classmethod
+    def _should_force_reply_for_decision(
+        cls,
+        decision: dict[str, Any],
+        unread_msgs: list[Message],
+    ) -> bool:
+        """只有硬路由判定才覆盖模型最终选择等待的权利。"""
+
+        if not bool(decision.get("should_respond", False)):
+            return False
+        if "force_reply" in decision:
+            if not bool(decision.get("force_reply", False)):
+                return False
+            return cls._should_force_reply_for_unread_batch(unread_msgs)
         return False
 
     def _consume_runtime_assistant_context(
@@ -1657,7 +1689,10 @@ class LifeChatter(BaseChatter):
                 rt.history_merged = True
                 rt.requires_inner_monologue = self._requires_inner_monologue_for_unread_batch(unread_msgs)
                 rt.inner_monologue_retry_count = 0
-                rt.must_reply = self._should_force_reply_for_unread_batch(unread_msgs)
+                rt.must_reply = self._should_force_reply_for_decision(
+                    decision,
+                    unread_msgs,
+                )
                 rt.must_reply_retry_count = 0
                 self._transition(rt, _Phase.MODEL_TURN, "accepted unread batch")
                 rt.unread_msgs_to_flush = unread_msgs

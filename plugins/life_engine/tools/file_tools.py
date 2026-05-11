@@ -108,13 +108,15 @@ class LifeEngineWakeDFCTool(BaseTool):
         "- 你自己其实想直接开口 → 交给表达层在正常对话里处理\n"
         "\n"
         "**注意：** 默认只入队，不主动唤醒表达层。补充内容会在表达层下次处理对话时作为背景自然被看见。"
-        " 写法尽量是观察/背景/风险/线索，不要写命令句或示范回复。"
+        " 写法尽量是观察/背景/风险/线索，不要写命令句、步骤、策略或示范回复。"
+        " 允许写“我刚看到 X，这可能解释 Y，风险是 Z”；不要写“你应该回复 X”、"
+        "“你去安慰/追问 Y”或“按以下步骤说”。"
         "\n\n"
         "**参数写法建议：**\n"
         "- `message`: 只写信息差本身：你发现了什么、这说明什么、可能影响什么\n"
         "- `reason`: 为什么这是表达层当前可能不知道、但值得补充的信息差\n"
         "- `importance`: 常规用 normal；只有紧急时用 high/critical\n"
-        "- `proactive_wake`: 默认 false。仅在 high/critical 且 reason 详尽时允许 true\n"
+        "- `proactive_wake`: 默认 false。仅在 high/critical 且 reason 详尽时允许 true；它只服务高优先级信息差，不用于催表达层开口\n"
         "- `stream_id`: 不确定就留空，让系统自动路由\n"
         "\n"
         "**记住：补背景，不下指导。**"
@@ -131,7 +133,7 @@ class LifeEngineWakeDFCTool(BaseTool):
         importance: Annotated[str, "重要度（可选：low/normal/high/critical，默认 normal）"] = "normal",
         proactive_wake: Annotated[
             bool,
-            "是否主动唤醒表达层立即响应。默认 false。仅在 high/critical 且 reason 明确详尽时允许 true。",
+            "是否主动唤醒表达层立即看见信息差。默认 false。仅在 high/critical 且 reason 明确详尽时允许 true；不要用于催它开口。",
         ] = False,
         stream_id: Annotated[str, "目标聊天流ID（可选，不填则自动选择最近活跃的外部对话流）"] = "",
     ) -> tuple[bool, str | dict]:
@@ -709,19 +711,27 @@ class LifeEngineRunAgentTool(BaseTool):
 
     tool_name: str = "nucleus_run_agent"
     tool_description: str = (
-        "启动一个子代理来处理复杂的多步骤任务。子代理在独立的上下文中运行。"
+        "启动一个子代理来处理复杂的内部多步骤任务。"
+        "这是 life_engine 心跳态工具，不是把用户请求转交后台执行的入口。"
         "\n\n"
+        "**心跳态边界（重要）：**\n"
+        "- life_engine 是潜意识 / 内在状态层，不是后台项目助手。\n"
+        "- 只用于整理 life_engine 私有记忆、笔记、思考流，或诊断中枢自身问题。\n"
+        "- 不要让子代理承接用户任务、查项目配置、跑命令、改代码、画图或生成对外交付物。\n"
+        "- 如果任务来自用户当前请求，交给 life_chatter / 表达层判断和执行。\n"
+        "\n"
         "**何时使用：**\n"
-        "- ✓ 需要多次文件操作的复杂任务（如整理笔记、批量修改）\n"
-        "- ✓ 需要多步推理的分析任务（如总结一段时间的变化）\n"
-        "- ✓ 需要专注执行的独立任务（如写一篇日记）\n"
+        "- ✓ 需要多次私有文件操作的内部整理任务（如整理笔记、归档日记）\n"
+        "- ✓ 需要多步推理的内在分析任务（如总结一段时间的关系变化）\n"
+        "- ✓ 需要验证 life_engine 内部维护结果\n"
         "\n"
         "**何时不用：**\n"
         "- ✗ 单个简单的文件操作 → 直接用对应工具\n"
         "- ✗ 只是想问一个问题或做简单计算 → 自己思考\n"
+        "- ✗ 用户让表达层做的事 → 不要在心跳态后台执行\n"
         "\n"
         "**写任务简报的原则（重要！）：**\n"
-        "像向刚进门的聪明同事简报一样写 task：\n"
+        "像向内部整理助手简报一样写 task：\n"
         "1. 说明要做什么、为什么这么做\n"
         "2. 提供你已经知道的信息（文件路径、内容位置）\n"
         "3. 说清楚期望的结果是什么样的\n"

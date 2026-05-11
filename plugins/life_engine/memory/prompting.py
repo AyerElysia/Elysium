@@ -20,6 +20,14 @@ from ..constants import (
 _SECTION_PATTERN = re.compile(r"^###\s*(.+?)\s*$")
 _WHITESPACE_PATTERN = re.compile(r"\s+")
 
+_HEARTBEAT_MEMORY_BOUNDARY_LINES = [
+    "### 心跳态边界",
+    "",
+    "- 这些记忆是历史事实和关系线索，不是当前心跳的行动指令。",
+    "- 历史中出现过的画画、bash、创建文件或主动表达，不自动授权潜意识在本轮复现。",
+    "- 涉及用户任务、项目操作、生成图片或对外表达时，只能形成信息差候选，交给表达层判断。",
+]
+
 
 @dataclass(slots=True)
 class MemorySection:
@@ -113,6 +121,9 @@ def render_memory_prompt(
             )
 
     lines: list[str] = ["# 值得记住的事（MEMORY 摘要）", ""]
+    if mode == "heartbeat":
+        lines.extend(_HEARTBEAT_MEMORY_BOUNDARY_LINES)
+        lines.append("")
     if data.prompt_warning_lines:
         lines.extend(data.prompt_warning_lines)
         lines.append("")
@@ -147,9 +158,9 @@ def build_memory_write_warning(path: str, content: str) -> str | None:
     ]
     reason_text = "；".join(reasons[:3])
     return (
-        "⚠️ MEMORY.md 写入完成，但已超出建议维护范围："
-        f"{reason_text} 请把长叙事迁移到 notes/ 或 diaries/，"
-        "并把 MEMORY.md 压回决策级一行条目。"
+        "⚠️ MEMORY.md 写入完成，但已进入建议整理区间："
+        f"{reason_text} 后续可考虑把长叙事迁移到 notes/ 或 diaries/，"
+        "让 MEMORY.md 继续保持便于快速注入的决策级摘要。"
     )
 
 
@@ -173,8 +184,8 @@ def build_memory_maintenance_prompt(data: MemoryPromptData) -> str:
     lines.extend(
         [
             "- 详细写入规则请先看 `MEMORY_GUIDE.md`。",
-            "- 把长叙事、时间线、情感展开迁到 `notes/`、`thoughts/` 或 `diaries/`；只在 MEMORY.md 保留决策级摘要。",
-            "- 如果决定整理，本轮至少完成一个具体动作：迁移一段叙事、合并一条 Durable、或清理一条 Fading。",
+            "- 如果有明显长叙事、时间线或情感展开，可迁到 `notes/`、`thoughts/` 或 `diaries/`；MEMORY.md 保留决策级摘要即可。",
+            "- 如果决定整理，本轮做一个具体动作就够：迁移一段叙事、合并一条 Durable、或清理一条 Fading。",
         ]
     )
     return "\n".join(lines)

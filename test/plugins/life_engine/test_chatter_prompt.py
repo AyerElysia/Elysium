@@ -10,7 +10,8 @@ from plugins.life_engine.core.chatter import LifeChatter, _Phase, _WorkflowRunti
 from plugins.life_engine.constants import LIFE_CHATTER_GLOBAL_CURSOR_KEY
 from plugins.life_engine.service.core import LifeEngineService
 from plugins.life_engine.service.event_builder import EventType, LifeEngineEvent
-from plugins.life_engine.tools.file_tools import LifeEngineWakeDFCTool
+from plugins.life_engine.tools.exec_tools import LifeEngineBashTool
+from plugins.life_engine.tools.file_tools import LifeEngineRunAgentTool, LifeEngineWakeDFCTool
 from src.core.components.base.chatter import BaseChatter, Wait
 from src.core.models.message import Message
 from src.kernel.llm import LLMPayload, ROLE, Text
@@ -523,3 +524,56 @@ def test_tell_dfc_tool_description_frames_as_runtime_mode_sync() -> None:
     assert "不是在和另一个意识体对话" in description
     assert "信息差" in description
     assert "不用于指导" in description
+    assert "事实、背景、记忆线索、情绪来源或潜在风险" in description
+    assert "台词、步骤或策略" in description
+    assert "你应该回复 X" in description
+    assert "不用于催表达层开口" in description
+
+
+def test_execution_tool_descriptions_respect_heartbeat_boundary() -> None:
+    """执行类工具 schema 自身也要约束心跳态，不只依赖系统 prompt。"""
+    bash_description = LifeEngineBashTool.tool_description
+    agent_description = LifeEngineRunAgentTool.tool_description
+
+    assert "潜意识 / 内在状态层" in bash_description
+    assert "只在诊断 life_engine 自己的 workspace、日志、工具链异常时使用" in bash_description
+    assert "不要用它查用户项目配置、跑用户任务、生成图片、改代码或处理外部系统" in bash_description
+    assert "交给 life_chatter / 表达层" in bash_description
+
+    assert "不是把用户请求转交后台执行的入口" in agent_description
+    assert "只用于整理 life_engine 私有记忆、笔记、思考流" in agent_description
+    assert "不要让子代理承接用户任务、查项目配置、跑命令、改代码、画图" in agent_description
+    assert "交给 life_chatter / 表达层判断和执行" in agent_description
+
+
+def test_heartbeat_prompt_bounds_tell_dfc_to_context_gap(tmp_path) -> None:
+    """心跳 prompt 应把 nucleus_tell_dfc 限定为补信息差，而不是指导表达层。"""
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(tmp_path)
+    service = LifeEngineService(SimpleNamespace(config=config))
+
+    prompt = "\n".join(service._build_prompt_header())
+
+    assert "观察、思考、联想和沉淀" in prompt
+    assert "不是后台执行器，也不是表达层" in prompt
+    assert "主动表达" not in prompt
+    assert "是否画画、是否查配置或跑命令，由表达层结合用户请求自行决定" in prompt
+    assert "只在表达层当前看不到事实、背景、线索或风险时" in prompt
+    assert "这个工具用于补充背景，不用于指导表达层怎么说、怎么做" in prompt
+    assert "不要拿它查项目配置、跑用户任务或处理外部操作" in prompt
+    assert "不要用子智能体承接用户任务、画图、查项目配置、跑命令" in prompt
+    assert "你应该回复 X" in prompt
+    assert "你去安慰/追问 Y" in prompt
+    assert "只服务高优先级信息差，不用于催表达层开口" in prompt
+    assert "如果没有明确需要，可以不调用工具" in prompt
+    assert "有冲动就行动" not in prompt
+
+
+def test_social_impulses_do_not_route_directly_to_tell_dfc() -> None:
+    """社交类冲动不应默认把 nucleus_tell_dfc 当作主动表达出口。"""
+    from plugins.life_engine.drives.rules import break_silence, social_reach_out
+
+    assert "nucleus_tell_dfc" not in social_reach_out.tools
+    assert "nucleus_tell_dfc" not in break_silence.tools
+    assert "表达层缺失的关键背景" in social_reach_out.suggestion
+    assert "明确的信息差" in break_silence.suggestion

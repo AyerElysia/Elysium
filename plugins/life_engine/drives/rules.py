@@ -37,8 +37,8 @@ def _social_reach_out_condition(neuromod_state: dict, context: dict) -> bool:
 social_reach_out = ImpulseRule(
     name="social_reach_out",
     condition=_social_reach_out_condition,
-    suggestion="你很想和大家说说话，有什么想分享的吗？",
-    tools=["nucleus_tell_dfc"],
+    suggestion="你很想和大家说说话；先看看是否真的有表达层缺失的关键背景，没有就把这股社交欲写进思考流",
+    tools=["nucleus_manage_thought_stream"],
     cooldown_minutes=45,
 )
 
@@ -65,8 +65,8 @@ def _break_silence_condition(neuromod_state: dict, context: dict) -> bool:
 break_silence = ImpulseRule(
     name="break_silence",
     condition=_break_silence_condition,
-    suggestion="安静很久了，也许可以主动做点什么",
-    tools=["nucleus_tell_dfc", "nucleus_manage_thought_stream"],
+    suggestion="安静很久了；可以推进思考流，只有发现明确的信息差时才补充给表达层",
+    tools=["nucleus_manage_thought_stream"],
     cooldown_minutes=60,
 )
 

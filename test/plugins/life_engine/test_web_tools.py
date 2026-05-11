@@ -7,12 +7,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+import requests
 
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.tools.web_tools import (
     LifeEngineBrowserFetchTool,
     LifeEngineWebSearchTool,
     _pick_tavily_target,
+    _sync_post_json,
     _tavily_selector,
 )
 
@@ -26,6 +28,14 @@ def _make_plugin(tmp_path: Path) -> _DummyPlugin:
     cfg = LifeEngineConfig()
     cfg.settings.workspace_path = str(tmp_path)
     return _DummyPlugin(config=cfg)
+
+
+class _FakeTavilyResponse:
+    status_code = 200
+    text = '{"results": []}'
+
+    def json(self) -> dict:
+        return {"results": [], "query": "test"}
 
 
 def test_web_search_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -97,6 +107,31 @@ def test_web_search_does_not_use_env_api_key(
 
     assert ok is False
     assert "config/plugins/life_engine/config.toml" in data["error"]
+
+
+def test_sync_post_json_retries_direct_when_proxy_tls_eof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """系统代理 TLS EOF 时，应绕过代理直连重试一次。"""
+    calls: list[bool] = []
+
+    def _fake_post(*_args, trust_env: bool = True, **_kwargs) -> _FakeTavilyResponse:
+        calls.append(trust_env)
+        if trust_env:
+            raise requests.exceptions.SSLError("UNEXPECTED_EOF_WHILE_READING")
+        return _FakeTavilyResponse()
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7890")
+    monkeypatch.setattr("plugins.life_engine.tools.web_tools._requests_post_json", _fake_post)
+
+    data = _sync_post_json(
+        "https://api.tavily.com/search",
+        {"query": "test", "api_key": "tvly-test"},
+        5,
+    )
+
+    assert data["query"] == "test"
+    assert calls == [True, False]
 
 
 def test_pick_tavily_target_supports_round_robin_lists(

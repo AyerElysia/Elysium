@@ -1,7 +1,7 @@
 """life_engine 命令执行工具。
 
-提供一个 workspace-scoped 的 Bash 工具，风格参考 Claude Code：
-优先用最少轮次、最短命令拿到结果，适合快速查看、批量处理和轻量自动化。
+提供一个 workspace-scoped 的 Bash 工具。
+表达层可在用户请求需要终端时使用；life_engine 心跳态只用于诊断自身工作区或工具链。
 
 注意：
 - 这是 best-effort shell，不是 OS 级强隔离沙箱
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import signal
 import time
 from contextlib import suppress
@@ -41,13 +42,10 @@ _SENSITIVE_ENV_TOKENS = (
     "SSH_",
 )
 
-_BLACKLISTED_COMMANDS = (
-    "rm ",
-    "rm\t",
-    ">",  # 防止重定向覆盖重要文件
-    "mv ",
-    "mv\t",
+_DANGEROUS_COMMAND_PATTERN = re.compile(
+    r"(^|[\s;&|()])(?P<command>rm|mv)(?=$|[\s;&|()])"
 )
+_FD_DUPLICATION_PATTERN = re.compile(r"\d+|-")
 
 
 def _resolve_cwd(plugin: Any, cwd: str) -> tuple[bool, Path | str]:
@@ -123,6 +121,101 @@ def _decode_output(data: bytes | None, limit: int) -> tuple[str, bool]:
     return _truncate_text(text, limit)
 
 
+def _is_escaped(text: str, index: int) -> bool:
+    backslashes = 0
+    cursor = index - 1
+    while cursor >= 0 and text[cursor] == "\\":
+        backslashes += 1
+        cursor -= 1
+    return backslashes % 2 == 1
+
+
+def _find_unquoted_output_redirection_error(command_text: str) -> str | None:
+    """Reject file-writing redirection while allowing common discard patterns."""
+
+    quote: str | None = None
+    index = 0
+    length = len(command_text)
+
+    while index < length:
+        char = command_text[index]
+        if char in {"'", '"'} and not _is_escaped(command_text, index):
+            if quote == char:
+                quote = None
+            elif quote is None:
+                quote = char
+            index += 1
+            continue
+
+        if quote is not None or char != ">" or _is_escaped(command_text, index):
+            index += 1
+            continue
+
+        if index > 0 and command_text[index - 1] == "<":
+            return "禁止使用可能写文件的重定向 '<>'。如需编辑文件，请使用专门的文件工具。"
+
+        target_start = index + 1
+        if target_start < length and command_text[target_start] in {">", "|"}:
+            target_start += 1
+
+        fd_duplication = False
+        if target_start < length and command_text[target_start] == "&":
+            fd_duplication = True
+            target_start += 1
+
+        while target_start < length and command_text[target_start].isspace():
+            target_start += 1
+
+        if target_start >= length:
+            return "禁止使用缺少目标的输出重定向。"
+
+        target_end = target_start
+        target_quote: str | None = None
+        while target_end < length:
+            target_char = command_text[target_end]
+            if target_char in {"'", '"'} and not _is_escaped(command_text, target_end):
+                if target_quote == target_char:
+                    target_quote = None
+                elif target_quote is None:
+                    target_quote = target_char
+                target_end += 1
+                continue
+            if target_quote is None and (
+                target_char.isspace() or target_char in {";", "|", "&", "(", ")"}
+            ):
+                break
+            target_end += 1
+
+        target = command_text[target_start:target_end].strip().strip("'\"")
+        if target == "/dev/null":
+            index = max(target_end, index + 1)
+            continue
+        if fd_duplication and _FD_DUPLICATION_PATTERN.fullmatch(target):
+            index = max(target_end, index + 1)
+            continue
+
+        return (
+            f"命令审计失败：禁止输出重定向到 '{target or '<empty>'}'。"
+            "如需写文件，请使用专门的安全文件工具；丢弃输出可使用 /dev/null。"
+        )
+
+    return None
+
+
+def _audit_command(command_text: str) -> str | None:
+    """Return an audit error message when a command should not run."""
+
+    dangerous = _DANGEROUS_COMMAND_PATTERN.search(command_text)
+    if dangerous:
+        command = dangerous.group("command")
+        return (
+            f"命令审计失败：禁止使用危险指令 '{command}'。"
+            "如有必要，请使用专门的安全文件工具。"
+        )
+
+    return _find_unquoted_output_redirection_error(command_text)
+
+
 def _stop_process(process: Any) -> None:
     """尽力终止子进程。"""
     if getattr(process, "returncode", None) is not None:
@@ -154,17 +247,19 @@ class LifeEngineBashTool(BaseTool):
 
     tool_name: str = "nucleus_bash"
     tool_description: str = (
-        "在 workspace 内执行 bash 命令，用于快速查看、批量处理和轻量自动化。"
+        "在 workspace 内执行 bash 命令。这个工具同时暴露给表达层和 life_engine 心跳态，"
+        "两种运行态的边界不同。"
         "\n\n"
-        "**风格要求：**\n"
-        "- 优先用最少轮次拿结果，能一条命令解决就别拆成多次调用。\n"
-        "- 尽量直接、短、快，风格参考 Claude Code 的高性能 shell 使用方式。\n"
-        "- 更适合读、查、拼接、批处理，不要把它当成交互式解释器。\n"
+        "**life_engine 心跳态边界（重要）：**\n"
+        "- 你是潜意识 / 内在状态层，不是后台终端助手。\n"
+        "- 只在诊断 life_engine 自己的 workspace、日志、工具链异常时使用。\n"
+        "- 不要用它查用户项目配置、跑用户任务、生成图片、改代码或处理外部系统。\n"
+        "- 如果只是因为用户提到 API、画图、项目或配置而想运行命令，应该停下，把这交给 life_chatter / 表达层。\n"
         "\n"
-        "**何时使用：**\n"
-        "- 查看 workspace 内文件、目录、日志和产物\n"
-        "- 做轻量批处理、文本加工、脚本执行\n"
-        "- 需要 shell 管道、重定向或命令组合\n"
+        "**life_chatter / 表达层用法：**\n"
+        "- 只有用户请求或当前对话处理确实需要终端时使用。\n"
+        "- 适合查看 workspace 内文件、日志和产物，或做轻量批处理。\n"
+        "- 优先用最少轮次拿结果，能一条命令解决就别拆成多次调用。\n"
         "\n"
         "**何时不用：**\n"
         "- 只是想读写单个文件 → 用 file 工具\n"
@@ -189,13 +284,9 @@ class LifeEngineBashTool(BaseTool):
         if not command_text:
             return False, {"error": "command 不能为空"}
 
-        # 安全审计：检查黑名单
-        for blacklisted in _BLACKLISTED_COMMANDS:
-            if blacklisted in command_text:
-                return False, {
-                    "error": f"命令审计失败：禁止使用危险指令 '{blacklisted.strip()}'。如有必要，请使用专门的安全文件工具。",
-                    "command": command_text
-                }
+        audit_error = _audit_command(command_text)
+        if audit_error:
+            return False, {"error": audit_error, "command": command_text}
 
         try:
             timeout_seconds = max(1, min(_MAX_TIMEOUT_SECONDS, int(timeout_seconds)))

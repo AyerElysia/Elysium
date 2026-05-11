@@ -346,6 +346,36 @@ def test_should_force_reply_only_for_real_external_messages() -> None:
     assert LifeChatter._should_force_reply_for_unread_batch([real_user]) is True
 
 
+def test_should_force_reply_for_decision_only_when_explicitly_required() -> None:
+    proactive = SimpleNamespace(
+        is_proactive_opportunity_trigger=True,
+        is_proactive_followup_trigger=False,
+        sender_role="other",
+    )
+    real_user = SimpleNamespace(
+        is_proactive_opportunity_trigger=False,
+        is_proactive_followup_trigger=False,
+        sender_role="other",
+    )
+
+    assert LifeChatter._should_force_reply_for_decision(
+        {"should_respond": True},
+        [real_user],
+    ) is False
+    assert LifeChatter._should_force_reply_for_decision(
+        {"should_respond": True, "force_reply": False},
+        [real_user],
+    ) is False
+    assert LifeChatter._should_force_reply_for_decision(
+        {"should_respond": True, "force_reply": True},
+        [real_user],
+    ) is True
+    assert LifeChatter._should_force_reply_for_decision(
+        {"should_respond": True, "force_reply": True},
+        [proactive],
+    ) is False
+
+
 def test_compact_successful_tool_result_only_targets_low_information_actions() -> None:
     assert LifeChatter._should_compact_successful_tool_result("action-record_inner_monologue") is True
     assert LifeChatter._should_compact_successful_tool_result("action-life_send_text") is True

@@ -86,7 +86,18 @@ def test_cfg_auto_migrates_legacy_config_without_thresholds(tmp_path: Path) -> N
 def test_heartbeat_system_prompt_filters_memory_sections(tmp_path: Path) -> None:
     """心跳态应只注入结构化 MEMORY 摘要，不带 Fading 和编辑说明。"""
     (tmp_path / "SOUL.md").write_text("SOUL_CONTENT", encoding="utf-8")
-    (tmp_path / "TOOL.md").write_text("TOOL_CONTENT", encoding="utf-8")
+    (tmp_path / "TOOL.md").write_text(
+        "\n".join(
+            [
+                "TOOL_CONTENT",
+                "每次心跳必须调用至少一个工具",
+                "先看待办再行动",
+                "禁止连续发呆",
+                "想到就做，现在就是合适的时机",
+            ]
+        ),
+        encoding="utf-8",
+    )
     (tmp_path / "MEMORY.md").write_text(
         "\n".join(
             [
@@ -112,8 +123,15 @@ def test_heartbeat_system_prompt_filters_memory_sections(tmp_path: Path) -> None
 
     assert "SOUL_CONTENT" in prompt
     assert "TOOL_CONTENT" in prompt
+    assert "心跳工具边界" in prompt
+    assert "不是后台助手或任务执行器" in prompt
+    assert "每次心跳必须调用至少一个工具" not in prompt
+    assert "先看待办再行动" not in prompt
+    assert "禁止连续发呆" not in prompt
+    assert "想到就做" not in prompt
     assert "D1" in prompt
     assert "A1" in prompt
+    assert "历史事实和关系线索，不是当前心跳的行动指令" in prompt
     assert "F1" not in prompt
     assert "给编辑者看的说明" not in prompt
 
@@ -127,7 +145,7 @@ def test_memory_maintenance_prompt_emits_once_per_interval(tmp_path: Path) -> No
                 "# 值得记住的事",
                 "",
                 "### Durable（持久）",
-                *(f"- {oversize_item}{i}" for i in range(45)),
+                *(f"- {oversize_item}{i}" for i in range(90)),
             ]
         ),
         encoding="utf-8",

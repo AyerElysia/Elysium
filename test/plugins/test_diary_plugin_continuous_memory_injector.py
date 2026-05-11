@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 from plugins.diary_plugin.config import DiaryConfig
 from plugins.diary_plugin.event_handler import (
+    AutoDiaryEventHandler,
     ContinuousMemoryPromptInjector,
     _PENDING_RUNTIME_USER_PROMPT_INJECTIONS,
     _push_runtime_user_prompt_injection,
@@ -109,3 +110,53 @@ def test_auto_diary_runtime_user_prompt_injection_is_one_shot() -> None:
     decision_twice, out_twice = asyncio.run(handler.execute("on_prompt_build", params_twice))
     assert decision_twice is EventDecision.SUCCESS
     assert out_twice["values"]["extra"] == "keep"
+
+
+def test_auto_diary_threshold_starts_background_task_without_waiting() -> None:
+    """自动日记达到阈值时应启动后台任务并立刻重置计数。"""
+
+    config = DiaryConfig()
+    config.auto_diary.enabled = True
+    config.auto_diary.message_threshold = 2
+    config.auto_diary.summary_timeout_seconds = 99
+
+    handler = AutoDiaryEventHandler(plugin=SimpleNamespace(config=config))
+    calls: list[tuple[str, int, int]] = []
+
+    def fake_start(
+        stream_id: str,
+        *,
+        summary_count: int,
+        timeout_seconds: int,
+    ) -> bool:
+        calls.append((stream_id, summary_count, timeout_seconds))
+        return True
+
+    handler._start_auto_summary_task = fake_start  # type: ignore[method-assign]
+
+    params = {"stream_id": "sid_auto", "chat_type": "private"}
+    decision_one, _ = asyncio.run(handler.execute("on_chatter_step", params))
+    decision_two, _ = asyncio.run(handler.execute("on_chatter_step", params))
+
+    assert decision_one is EventDecision.SUCCESS
+    assert decision_two is EventDecision.SUCCESS
+    assert calls == [("sid_auto", 2, 99)]
+    assert handler._message_counts["sid_auto"] == 0
+
+
+def test_auto_diary_inflight_summary_prevents_retry_storm() -> None:
+    """已有后台总结时不应重复启动，也不应让计数无限增长。"""
+
+    config = DiaryConfig()
+    config.auto_diary.enabled = True
+    config.auto_diary.message_threshold = 2
+
+    handler = AutoDiaryEventHandler(plugin=SimpleNamespace(config=config))
+    handler._summary_streams.add("sid_auto")
+
+    params = {"stream_id": "sid_auto", "chat_type": "private"}
+    asyncio.run(handler.execute("on_chatter_step", params))
+    asyncio.run(handler.execute("on_chatter_step", params))
+    asyncio.run(handler.execute("on_chatter_step", params))
+
+    assert handler._message_counts["sid_auto"] == 2

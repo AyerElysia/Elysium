@@ -12,16 +12,28 @@ from .payload import LLMPayload, Text, ToolCall, ToolResult
 from .payload.content import Audio, File, Image, Video
 
 
+class _FallbackEncoding:
+    def encode(self, text: str) -> list[int]:
+        # 简单的 token 估算：每个中文字符约 0.6 token，英文单词约 0.3 token
+        # 这里用一种极简的方案：len(text) // 2 作为保底估算，避免无法计数导致崩溃
+        return [0] * (len(text) // 2 + 1)
+
+
 def _get_tiktoken_encoding(model_identifier: str):
     """
     获取指定模型的 tiktoken 编码器。
     """
     import tiktoken
+    from src.kernel.logger import logger
 
     try:
-        return tiktoken.encoding_for_model(model_identifier)
-    except Exception:
-        return tiktoken.get_encoding("cl100k_base")
+        try:
+            return tiktoken.encoding_for_model(model_identifier)
+        except Exception:
+            return tiktoken.get_encoding("cl100k_base")
+    except Exception as e:
+        logger.error(f"tiktoken 编码器加载失败 (可能是网络问题无法下载): {e}")
+        return _FallbackEncoding()
 
 
 def _serialize_payload(payload: LLMPayload) -> str:
