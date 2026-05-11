@@ -173,9 +173,17 @@ def _last_user_content(messages: Sequence[Any]) -> str:
     return ""
 
 
-def _message_tail(messages: Sequence[Any], *, limit: int = 8) -> list[str]:
+def _message_tail(
+    messages: Sequence[Any],
+    *,
+    limit: int = 8,
+    include_system: bool = True,
+) -> list[str]:
     tail: list[str] = []
-    for message in messages[-limit:]:
+    source_messages = messages if include_system else [
+        message for message in messages if _read_message_role(message) != "system"
+    ]
+    for message in source_messages[-limit:]:
         role = _read_message_role(message) or "unknown"
         content = _shorten(_read_message_content(message), limit=900)
         if role == "assistant":
@@ -258,7 +266,7 @@ def parse_minecraft_decision_request(
 
 
 def build_decision_prompt(request: MinecraftDecisionRequest) -> str:
-    """Compress Touhou Little Maid's OpenAI request into a main-consciousness prompt."""
+    """Build the transient Minecraft protocol/tool context for one model turn."""
 
     tool_lines: list[str] = []
     for index, tool in enumerate(request.tools, start=1):
@@ -273,13 +281,12 @@ def build_decision_prompt(request: MinecraftDecisionRequest) -> str:
             f"   parameters: {_shorten(params_text, limit=900)}"
         )
 
-    recent_tool_results = _recent_tool_results(request.messages)
-    tool_result_text = "\n\n".join(recent_tool_results) if recent_tool_results else "无"
-
     return (
-        "【Minecraft 实时事件 -> 爱莉决策】\n"
-        "你正在作为统一主意识陪玩家玩 Minecraft。外部执行器会负责实际调用游戏工具；"
-        "你只需要给出本轮决策，不要解释系统机制。\n"
+        "【Minecraft 决策临时协议】\n"
+        "你正在作为统一主意识陪玩家玩 Minecraft。"
+        "Minecraft 的真实消息、游戏状态和工具结果已作为普通外界消息进入 <new_messages>/<chat_history>，"
+        "与 QQ/直播消息同等对待；本段只提供本轮临时输出协议和可用工具，不会长期留在对话 payload。\n"
+        "外部执行器会负责实际调用游戏工具；你只需要给出本轮决策，不要解释系统机制。\n"
         "提交方式：只调用 action-life_send_text 一次，content 必须是单行 JSON。"
         "系统只会读取这条 JSON；只有 mode=say 的 content 会作为女仆发言出现在游戏里。\n"
         "本轮不要调用表情包、文件、bash、web 或其他发送动作；action-think 可选，但最后只提交一条 JSON。\n"
@@ -292,14 +299,38 @@ def build_decision_prompt(request: MinecraftDecisionRequest) -> str:
         '{"mode":"say","content":"要让女仆说的话","reason":"一句话原因"}\n\n'
         f"model: {request.model}\n"
         f"tool_call_count_so_far: {_tool_call_count(request.messages)}\n\n"
-        f"本轮最后玩家输入：{_shorten(request.latest_user_content, limit=700) or '无'}\n\n"
-        "最近消息：\n"
-        + ("\n\n".join(_message_tail(request.messages)) or "无")
-        + "\n\n最近工具结果：\n"
-        + tool_result_text
-        + "\n\n可用工具：\n"
+        "可用工具：\n"
         + ("\n".join(tool_lines) if tool_lines else "无")
     )
+
+
+def build_persistent_event_text(request: MinecraftDecisionRequest) -> str:
+    """Render the real Minecraft event/state as persistent chat context.
+
+    The TLM system prompt and tool schemas are deliberately excluded here. Those
+    are transient protocol details; player messages, game context and tool
+    results are real external events and should accumulate like other channels.
+    """
+
+    recent_messages = _message_tail(request.messages, limit=8, include_system=False)
+    recent_tool_results = _recent_tool_results(request.messages)
+
+    parts: list[str] = [
+        "【Minecraft事件】",
+        f"model: {request.model}",
+    ]
+
+    latest_user = _shorten(request.latest_user_content, limit=1000)
+    if latest_user:
+        parts.append(f"最新玩家/环境输入：\n{latest_user}")
+
+    if recent_messages:
+        parts.append("最近 Minecraft 消息：\n" + "\n\n".join(recent_messages))
+
+    if recent_tool_results:
+        parts.append("最近工具结果：\n" + "\n\n".join(recent_tool_results))
+
+    return "\n\n".join(parts)
 
 
 def extract_decision_result(reply_text: str, request: MinecraftDecisionRequest) -> MinecraftDecisionResult | None:

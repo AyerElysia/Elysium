@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from plugins.live_bridge.minecraft_operator import (
     build_decision_prompt,
     build_fallback_decision,
+    build_persistent_event_text,
     extract_decision_result,
     parse_minecraft_decision_request,
 )
@@ -77,7 +78,35 @@ def test_build_decision_prompt_keeps_transport_details_out_of_prompt() -> None:
     assert "Adapter" not in prompt
     assert "life_chatter" not in prompt
     assert "私聊流" not in prompt
-    assert "本轮最后玩家输入：爱莉，是你么？" in prompt
+    assert "爱莉，是你么？" not in prompt
+
+
+def test_persistent_event_keeps_game_state_but_drops_tool_schema() -> None:
+    request = parse_minecraft_decision_request(
+        [
+            MessageStub("system", "你是一个 Minecraft AI，请遵守大量使用说明"),
+            MessageStub("assistant", "我先稳一下，等看清楚情况再行动。"),
+            MessageStub(
+                "user",
+                "<context>- Time: 12:04, - Weather: Sunny\nSelf health: 20.0</context>",
+            ),
+            MessageStub("assistant", "", [{"function": {"name": "query_game_context"}}]),
+            MessageStub("tool", "Main-hand item: Empty\nBackpack items: [泥土]x11"),
+        ],
+        _tools(),
+    )
+    assert request is not None
+
+    event_text = build_persistent_event_text(request)
+
+    assert "Minecraft事件" in event_text
+    assert "Weather: Sunny" in event_text
+    assert "Main-hand item: Empty" in event_text
+    assert "Backpack items" in event_text
+    assert "assistant_tool_calls: query_game_context" in event_text
+    assert "大量使用说明" not in event_text
+    assert "parameters" not in event_text
+    assert "query live context" not in event_text
 
 
 def test_extract_decision_result_returns_valid_tool_call() -> None:

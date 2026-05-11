@@ -21,6 +21,7 @@ from ..minecraft_operator import (
     MinecraftDecisionRequest,
     MinecraftDecisionResult,
     MinecraftOperator,
+    build_persistent_event_text,
     parse_minecraft_decision_request,
 )
 
@@ -283,12 +284,26 @@ class OpenAIRouter(BaseRouter):
         request: MinecraftDecisionRequest,
         prompt: str,
     ) -> str:
+        stream_id = "game_minecraft_agent"
+        persistent_event_text = build_persistent_event_text(request)
+        try:
+            from plugins.life_engine.core.chatter import push_runtime_assistant_injection
+
+            push_runtime_assistant_injection(
+                stream_id,
+                prompt,
+                max_per_stream=4,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Minecraft 临时协议注入失败，将降级写入本轮消息: {exc}")
+            persistent_event_text = f"{persistent_event_text}\n\n{prompt}"
+
         reply_text = await self._dispatch_message_and_collect(
-            stream_id="game_minecraft_agent",
+            stream_id=stream_id,
             platform="game.minecraft.operator",
             sender_id="minecraft_operator",
             sender_name="Minecraft操作AI",
-            content=prompt,
+            content=persistent_event_text,
             timeout_reply="",
             adapter_signature="live_bridge:router:minecraft_operator",
             total_timeout=10.0,
