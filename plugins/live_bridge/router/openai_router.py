@@ -1,4 +1,5 @@
 import asyncio
+import json
 import re
 import time
 import uuid
@@ -15,6 +16,12 @@ from ..sts2_operator import (
     Sts2DecisionRequest,
     Sts2Operator,
     parse_sts2_decision_request,
+)
+from ..minecraft_operator import (
+    MinecraftDecisionRequest,
+    MinecraftDecisionResult,
+    MinecraftOperator,
+    parse_minecraft_decision_request,
 )
 
 logger = get_logger("LiveBridge", display="直播桥接", color="#F5C2E7")
@@ -68,15 +75,38 @@ def _normalize_live_comment(content: str) -> tuple[str, str]:
     normalized = normalized or _strip_legacy_live_prefixes(content) or str(content or "").strip()
     return viewer_name, normalized
 
+
+def _log_preview(value: Any, *, limit: int = 360) -> str:
+    """Return a compact single-line value for bridge diagnostics."""
+
+    text = str(value or "").replace("\r", "\\r").replace("\n", "\\n").strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)] + "..."
+
 # ==================== OpenAI 协议模型 ====================
+
+class ChatToolCallFunction(BaseModel):
+    name: str
+    arguments: str = "{}"
+
+class ChatToolCall(BaseModel):
+    id: str = Field(default_factory=lambda: f"call_{uuid.uuid4().hex}")
+    type: str = "function"
+    function: ChatToolCallFunction
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: Any = ""
+    tool_calls: List[ChatToolCall] | None = None
+    tool_call_id: str | None = None
 
 class ChatCompletionRequest(BaseModel):
     model: str = "elysia"
     messages: List[ChatMessage]
+    tools: List[Dict[str, Any]] | None = None
+    tool_choice: Any = None
+    response_format: Dict[str, Any] | None = None
     stream: bool = False
 
 class ChatCompletionResponseChoice(BaseModel):
@@ -107,6 +137,7 @@ class OpenAIRouter(BaseRouter):
     _reply_queues: Dict[str, asyncio.Queue] = {}
     _lock = asyncio.Lock()
     _sts2_operator = Sts2Operator()
+    _minecraft_operator = MinecraftOperator()
 
     # 段落间超时：需大于 LifeSendTextAction 最大打字延迟 (4.0s)，留 1s 余量
     _SEGMENT_TIMEOUT: float = 5.5
@@ -126,6 +157,21 @@ class OpenAIRouter(BaseRouter):
             if sts2_request is not None:
                 reply_text = await self._handle_sts2_decision(sts2_request)
                 return self._completion_response(request.model, reply_text)
+
+            minecraft_request = parse_minecraft_decision_request(
+                request.messages,
+                request.tools,
+                model=request.model,
+            )
+            if minecraft_request is not None:
+                logger.info(
+                    "Minecraft 请求已接入: "
+                    f"model={minecraft_request.model} messages={len(minecraft_request.messages)} "
+                    f"tools={minecraft_request.tool_names} "
+                    f"latest_user={_log_preview(minecraft_request.latest_user_content, limit=240)}"
+                )
+                decision = await self._handle_minecraft_decision(minecraft_request)
+                return self._minecraft_completion_response(request.model, decision)
 
             reply_text = await self._handle_live_chat(request.messages)
             return self._completion_response(request.model, reply_text)
@@ -178,6 +224,38 @@ class OpenAIRouter(BaseRouter):
         )
         return result.to_openai_content()
 
+    async def _handle_minecraft_decision(
+        self,
+        request: MinecraftDecisionRequest,
+    ) -> MinecraftDecisionResult:
+        """Let the Minecraft operator ask Elysia, then return OpenAI tool-call compatible output."""
+
+        result = await self._minecraft_operator.decide(request, self._ask_elysia_for_minecraft_decision)
+        if result.is_tool_call:
+            action_desc = f"tool={result.tool_name} args={json.dumps(result.arguments, ensure_ascii=False)}"
+        else:
+            action_desc = f"say={result.content}"
+        if result.source == "operator_fallback":
+            logger.warning(
+                "Minecraft 决策进入 fallback: "
+                f"latest_user={_log_preview(request.latest_user_content, limit=240)} "
+                f"reason={_log_preview(result.reason, limit=360)}"
+            )
+        await self._minecraft_operator.record_life_event(
+            (
+                "Minecraft 决策完成："
+                f"{action_desc} source={result.source} reason={result.reason}"
+            ),
+            stream_id="game:minecraft:agent",
+        )
+        logger.info(
+            "Minecraft 操作AI 已返回决策: "
+            f"mode={result.mode} tool={result.tool_name or '-'} "
+            f"source={result.source} action={_log_preview(action_desc, limit=500)} "
+            f"reason={_log_preview(result.reason, limit=360)}"
+        )
+        return result
+
     async def _ask_elysia_for_sts2_decision(
         self,
         request: Sts2DecisionRequest,
@@ -199,6 +277,37 @@ class OpenAIRouter(BaseRouter):
             sts2_snapshot_id=request.snapshot_id,
             sts2_actor_id=request.actor_id,
         )
+
+    async def _ask_elysia_for_minecraft_decision(
+        self,
+        request: MinecraftDecisionRequest,
+        prompt: str,
+    ) -> str:
+        reply_text = await self._dispatch_message_and_collect(
+            stream_id="game_minecraft_agent",
+            platform="game.minecraft.operator",
+            sender_id="minecraft_operator",
+            sender_name="Minecraft操作AI",
+            content=prompt,
+            timeout_reply="",
+            adapter_signature="live_bridge:router:minecraft_operator",
+            total_timeout=10.0,
+            segment_timeout=1.25,
+            scene="minecraft",
+            minecraft_model=request.model,
+            minecraft_tool_names=request.tool_names,
+        )
+        if reply_text.strip():
+            logger.info(
+                "Minecraft 主意识原始回复: "
+                f"{_log_preview(reply_text, limit=700)}"
+            )
+        else:
+            logger.warning(
+                "Minecraft 主意识未在超时内返回可解析文本: "
+                f"latest_user={_log_preview(request.latest_user_content, limit=240)}"
+            )
+        return reply_text
 
     async def _dispatch_message_and_collect(
         self,
@@ -292,6 +401,31 @@ class OpenAIRouter(BaseRouter):
                 )
             ],
         )
+
+    @staticmethod
+    def _minecraft_completion_response(
+        model: str,
+        decision: MinecraftDecisionResult,
+    ) -> ChatCompletionResponse:
+        if decision.is_tool_call:
+            arguments = json.dumps(decision.arguments, ensure_ascii=False, separators=(",", ":"))
+            tool_call = ChatToolCall(
+                function=ChatToolCallFunction(
+                    name=decision.tool_name,
+                    arguments=arguments,
+                )
+            )
+            return ChatCompletionResponse(
+                model=model,
+                choices=[
+                    ChatCompletionResponseChoice(
+                        message=ChatMessage(role="assistant", content="", tool_calls=[tool_call]),
+                        finish_reason="tool_calls",
+                    )
+                ],
+            )
+
+        return OpenAIRouter._completion_response(model, decision.content)
 
     async def startup(self) -> None:
         """启动时订阅发送事件，用于截获回复"""

@@ -9,9 +9,10 @@ from src.core.models.message import Message, MessageType
 from src.core.transport.message_send.message_sender import MessageSender
 
 
-def test_virtual_send_includes_sts2_operator_platform() -> None:
+def test_virtual_send_includes_operator_platforms() -> None:
     assert MessageSender._should_use_virtual_send(Message(platform="live"))
     assert MessageSender._should_use_virtual_send(Message(platform="game.sts2.operator"))
+    assert MessageSender._should_use_virtual_send(Message(platform="game.minecraft.operator"))
     assert not MessageSender._should_use_virtual_send(Message(platform="qq"))
 
 

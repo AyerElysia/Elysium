@@ -81,7 +81,7 @@ class MessageSender:
         try:
             # 1. 确定目标 Adapter
             if not adapter_signature:
-                # live 平台走虚拟发送，无需查找 Adapter，优先判断以避免误报 WARNING
+                # live / game operator 平台走虚拟发送，无需查找 Adapter，优先判断以避免误报 WARNING
                 if self._should_use_virtual_send(message):
                     return await self._send_virtual_message(message)
                 adapter_signature = self._infer_adapter_signature(message)
@@ -159,7 +159,7 @@ class MessageSender:
     @staticmethod
     def _should_use_virtual_send(message: "Message") -> bool:
         """判断当前消息是否应走虚拟发送分支。"""
-        virtual_platforms = {"live", "game.sts2.operator"}
+        virtual_platforms = {"live", "game.sts2.operator", "game.minecraft.operator"}
         return str(getattr(message, "platform", "") or "").strip().lower() in virtual_platforms
 
     async def _send_virtual_message(self, message: "Message") -> bool:
