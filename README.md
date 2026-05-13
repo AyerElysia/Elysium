@@ -1,153 +1,204 @@
-# Neo-MoFox 🦊
+# Neo-MoFox
 
-> **下一代 AI 数字生命体框架**  
-> 不只是聊天机器人，而是真正属于你的 AI 伙伴
+> 一个面向长期陪伴、插件化对话和数字生命实验的 AI Bot 框架。
 
-[![Python Version](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/license-GPL--3.0-green.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/license-AGPL--3.0-green.svg)](LICENSE)
 
----
+Neo-MoFox-Soul 是 MoFox 系列的新一代运行时。它不是一个单文件聊天脚本，而是一个由运行时、领域层、内核层和插件层组成的异步 Bot 系统。当前代码重点服务于长期会话、人格一致性、主动性、记忆、工具调用和 life_engine 数字生命实验。
 
-## 🌟 什么是 Neo-MoFox？
+项目仍处于 alpha 阶段，接口和配置会继续演进。运行前请先检查 `config/` 中的本地配置，尤其是模型供应商、平台适配器和插件开关。
 
-Neo-MoFox 是一个全新重构的 AI 聊天机器人框架，它的目标不仅仅是回答问题，而是创造一个真正的**数字生命体**。
+## 当前定位
 
-与传统的 AI 助手不同，Neo-MoFox 强调：
-- 🧠 **独立的个性与记忆** - 它会记住你们之间的每次对话，形成独特的相处模式
-- 💭 **情感化的交互** - 不是冷冰冰的问答机器，而是有温度的陪伴者
-- 🎨 **高度的可定制性** - 你可以塑造它的性格、说话方式、兴趣爱好
-- 🔒 **完全的数据隐私** - 所有数据都在你的设备上，完全属于你
+Neo-MoFox 主要包含三条能力线：
 
----
+- 对话执行：通过 `default_chatter` 或 `life_chatter` 驱动模型回复、工具调用、多模态输入和消息发送。
+- 后台中枢：`life_engine` 持续维护事件流、状态、记忆、做梦、SNN/调质状态和主动性线索。
+- 插件运行时：统一加载插件、配置、Action、Service、Router、Adapter、Chatter、事件处理器和模型请求。
 
-## ✨ 核心特性
+一个重要边界：`life_engine` 是后台中枢和潜意识层，负责补充信息差、维护状态和形成线索；具体对外表达、发消息、画图、文件发送、平台动作等，应由 Chatter 或对应工具层执行。
 
-### 📚 长期记忆系统
-- 自动记录和整理你们的对话历史
-- 智能提取重要信息和关键时刻
-- 基于记忆的个性化回复
+## 核心特性
 
-### 🫀 life_engine 中枢（并行数字生命骨架）
-- 与 DFC 聊天链路并行运行，**不影响原有“来一条回一条”**
-- 统一事件流：同时采集外部消息、自己发言、心跳、工具调用与结果
-- 中枢上下文持久化：重启后自动恢复（`data/life_engine_workspace/life_engine_context.json`）
-- 中枢工具箱：受限工作区文件工具 + TODO 工具（仅 life_engine 内部可见）
-- 主动唤醒 DFC：`nucleus_wake_dfc` 可让中枢在需要时向指定会话“带话”
-- 灵魂/记忆/工具习惯文件：`SOUL.md` / `MEMORY.md` / `TOOL.md`（位于 `data/life_engine_workspace/`）
+- 插件化组件系统：插件可声明 Action、Service、Router、Adapter、Chatter、Command、Tool 和 EventHandler。
+- 统一模型调度：模型供应商、模型列表和任务参数集中放在 `config/model.toml`，运行时通过任务名选择模型。
+- 会话流驱动：支持消息缓冲、未读合并、流级 watchdog、Chatter 单步超时和多平台 stream 管理。
+- 工具调用闭环：支持模型工具调用、工具结果回填、跨轮去重、Action 执行和 follow-up 推理。
+- 长期运行状态：运行数据、日志、记忆、life workspace 都落在本地目录，便于备份和排查。
+- life_engine 实验能力：事件账本、心跳、主动线索、TODO/日程、历史检索、SNN 状态层、神经调质、做梦系统和可视化 Router。
+- 多模态输入：默认对话器和 life_chatter 可按配置处理图片、表情包、视频等媒体输入。
+- Web 与平台适配：当前仓库包含 NapCat/QQ 适配、WebUI 后端、直播桥接、TTS、表情包、记忆和主动消息等插件。
 
-> 说明：`nucleus_wake_dfc` 不做硬编码节流，是否唤醒由中枢模型结合上下文自主判断。
+## 快速开始
 
-### 🎭 可塑造的个性
-- 自定义角色背景和性格特征
-- 调整说话风格和情绪表达
-- 培养专属于你的 AI 伙伴
+### 1. 准备环境
 
-### 🌐 多平台支持
-- QQ、Discord、Telegram 等多种聊天平台
-- 统一的交互体验
-- 灵活的部署方式
+需要 Python 3.11 或更高版本。推荐使用 `uv` 管理依赖。
 
-### 🔐 数据安全
-- 本地部署，数据完全掌控
-- 支持自定义 LLM 后端
-- 敏感信息加密存储
+```bash
+cd /root/Elysia/Neo-MoFox
+uv sync
+```
 
-### 🎯 智能对话
-- 上下文理解与记忆关联
-- 主动话题发起
-- 情感识别与回应
+如果不使用 `uv`，也可以用你自己的虚拟环境安装 `pyproject.toml` 中的依赖。
 
----
+### 2. 配置模型和平台
 
-## 🚀 快速开始
+至少需要检查这些文件：
 
-### 系统要求
+- `config/core.toml`：基础运行时、人格、日志、会话和数据库配置。
+- `config/model.toml`：API provider、模型列表和 `[model_tasks]`。
+- `config/plugins/*/config.toml`：各插件自己的配置。
 
-- **Python**: 3.11 或更高版本
-- **操作系统**: Windows / Linux / macOS
-- **内存**: 建议 4GB 以上
+常见必配项：
 
-### 安装步骤
-请参考**Neo-MoFox 文档**中的 [安装指南](https://docs.mofox-sama.com/docs/guides/) 获取详细的安装和配置说明。
+- LLM API provider 的 `base_url`、`api_key`、`client_type` 和 `timeout`。
+- `[model_tasks.actor]`、`[model_tasks.life]`、`[model_tasks.sub_actor]` 等任务使用的模型列表。
+- 平台适配器配置，例如 `config/plugins/napcat_adapter/config.toml`。
+- 是否启用 `life_engine`、`proactive_message_plugin`、`default_chatter` 等插件。
 
+不要把真实 API Key、QQ 数据、运行日志、记忆文件和个人资料提交到远程仓库。
 
----
+### 3. 启动
 
-## ⚙️ 基础配置
+Linux/macOS:
 
-配置文件位于 `config/` 目录下：
-### 角色设定
-在配置文件中定义你的 AI 伙伴的：
-- 名字和身份
-- 性格特征
-- 说话风格
-- 兴趣爱好
-- 行为准则
+```bash
+uv run main.py
+```
 
-### life_engine 最小配置
-- 插件配置：`config/plugins/life_engine/config.toml`
-- 模型任务：`config/model.toml` 中需存在 `[model_tasks.life]`
-- 核心项：
-  - `settings.enabled`
-  - `settings.heartbeat_interval_seconds`
-  - `settings.context_history_max_events`
-  - `settings.workspace_path`
-  - `model.task_name`
+Windows:
 
----
+```bat
+start.bat
+```
 
-## 💡 使用提示
+Docker Compose:
 
-1. **多与它交流** - AI 会从对话中学习和成长
-2. **给予反馈** - 告诉它你喜欢或不喜欢的回复方式
-3. **定期备份** - 记忆数据很珍贵，记得备份 `data/` 目录
-4. **调整参数** - 尝试不同的配置找到最适合你的设定
+```bash
+docker compose up -d
+```
 
----
+Docker Compose 会挂载 `config/`、`data/`、`logs/` 和 `plugins/`，适合长期部署和 NapCat 联动。
 
-## 🤔 常见问题
+## 目录结构
 
-### Q: Neo-MoFox 和其他聊天机器人有什么不同？
-A: Neo-MoFox 专注于创造一个有"生命感"的 AI 伙伴，而不仅仅是一个工具。它强调长期记忆、个性化和情感连接。
+```text
+Neo-MoFox/
+├── main.py                         # 应用入口
+├── config/                         # 核心配置、模型配置、插件配置
+├── data/                           # 本地运行数据和 life workspace
+├── logs/                           # 运行日志
+├── docs/                           # 架构文档和插件开发文档
+├── plugins/                        # 内置和本地插件
+├── scripts/                        # 辅助脚本
+├── src/
+│   ├── app/                        # Bot runtime 和插件系统 API
+│   ├── core/                       # 领域层：组件、管理器、传输、配置、模型
+│   └── kernel/                     # 内核层：LLM、DB、事件、调度、日志、并发、存储
+└── test/                           # 测试
+```
 
-### Q: 需要联网使用吗？
-A: 核心框架在本地运行，但需要连接 LLM API（如 OpenAI、Claude 等）。你可以使用本地模型实现完全离线。
+## 关键插件
 
-### Q: 数据存储在哪里？
-A: 所有对话记忆和配置都存储在本地 `data/` 目录，完全由你掌控。
+| 插件 | 作用 |
+| --- | --- |
+| `default_chatter` | 默认对话执行器，负责群聊/私聊判定、prompt 组装、工具调用、多模态输入和消息发送 |
+| `life_engine` | 后台数字生命中枢，负责事件流、心跳、记忆、主动线索、SNN/调质、做梦和运行态同步 |
+| `proactive_message_plugin` | 主动续话和沉默检查，不再依赖“外界长期静默暂停”机制 |
+| `booku_memory` | 记忆读写和闪回注入 |
+| `emoji_sender` | 表情包入库、检索和发送 |
+| `napcat_adapter` | QQ/NapCat 平台适配 |
+| `live_bridge` | 直播桥接场景支持 |
+| `skill_manager` | 本地技能发现和管理 |
+| `webui_backend` | WebUI 后端接口 |
 
-### Q: 支持哪些 AI 模型？
-A: 支持所有兼容 OpenAI API 格式的模型，包括 GPT-4、Claude、本地部署的 LLaMA 等。
+更完整的插件开发说明见 [docs/guides/plugin-authoring](docs/guides/plugin-authoring/README.md)。
 
-### Q: 可以同时在多个平台使用吗？
-A: 可以！配置相应的平台适配器即可同时在 QQ、Discord、Telegram 等平台使用。
+## life_engine 与 Chatter 的边界
 
----
+当前架构里，life 相关能力分为两层：
 
-## 📖 进一步了解
+- `life_engine`：后台中枢。它观察事件、维护状态、沉淀记忆、形成提醒和补充上下文。它不应该替表达层下命令，也不应该越权代替 Chatter 操作平台。
+- `life_chatter` / `default_chatter`：表达层。它读取可见上下文，决定是否回复、如何回复、是否调用发送消息/发送文件/画图等工具。
 
-- 📘 [详细文档](docs/) - 完整的使用指南和配置说明
-- 💬 [社区讨论](https://github.com/MoFox-Studio/Neo-MoFox/discussions) - 与其他用户交流经验
-- 🐛 [问题反馈](https://github.com/MoFox-Studio/Neo-MoFox/issues) - 报告 bug 或提出建议
+这样做的目的，是让后台中枢保持“潜意识”和“信息差补全”的角色，而把对外行为留给明确的对话执行器。
 
----
+## 配置要点
 
-## 🙏 致谢
+### `config/core.toml`
 
-Neo-MoFox 是 [MoFox-Core](https://github.com/MoFox-Studio/MoFox-Core) 的全新重构版本，感谢所有为这个项目做出贡献的开发者和用户。
+主要控制：
 
----
+- `bot.ui_level`、`bot.tick_interval`、`bot.stream_step_timeout`
+- `chat.max_history_messages`、`chat.max_llm_messages`
+- `personality.*`
+- `database.*`
 
-## 📄 开源协议
+### `config/model.toml`
 
-本项目采用 [AGPL-3.0](LICENSE) 协议开源。
+主要控制：
 
----
+- `[[api_providers]]`：模型 API 后端。
+- `[[models]]`：模型别名、上下文、价格、额外参数。
+- `[model_tasks]`：不同任务使用哪些模型，例如 `actor`、`life`、`sub_actor`、`vlm`、`tool_use`。
 
-<div align="center">
+### `config/plugins/life_engine/config.toml`
 
-**用心创造，用爱陪伴** ❤️
+主要控制：
 
-如果这个项目对你有帮助，欢迎给一个 ⭐ Star！
+- `settings.enabled`
+- `settings.heartbeat_interval_seconds`
+- `settings.context_history_max_events`
+- `settings.workspace_path`
+- `model.task_name`
+- `snn`、`neuromod`、`dream`、`memory`、`screen` 等子系统开关。
 
-</div>
+## 开发与测试
+
+运行测试：
+
+```bash
+uv run pytest
+```
+
+运行单个测试文件：
+
+```bash
+uv run pytest test/plugins/life_engine/test_heartbeat_pause.py
+```
+
+查看文档入口：
+
+- [docs/README.md](docs/README.md)
+- [插件开发指南](docs/guides/plugin-authoring/README.md)
+- [app runtime](docs/app/runtime.md)
+- [core 总览](docs/core/README.md)
+- [kernel/llm](docs/llm/README.md)
+
+## 本地数据与仓库卫生
+
+这些内容属于本地运行态，不应提交到远程：
+
+- `data/`
+- `logs/`
+- `Report/`
+- `report/`
+- `plan/`
+- `notion/`
+- `Abstract/`
+- `Assignment/`
+- 任何包含 API Key、聊天记录、账号数据、私有记忆或本地实验报告的文件
+
+如果文件已经被 Git 跟踪，`.gitignore` 不会自动移除它。需要使用：
+
+```bash
+git rm --cached -r <path>
+```
+
+这样可以从仓库索引中移除，同时保留本地文件。
+
+## 许可证
+
+本项目使用 [AGPL-3.0](LICENSE) 协议。
