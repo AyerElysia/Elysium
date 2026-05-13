@@ -1,1 +1,0 @@
-../03_chapters/09_heartbeat_persistence.md

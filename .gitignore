@@ -59,6 +59,12 @@ secrets.yml
 # Data files
 *.sqlite3
 *.db
+Abstract/
+Assignment/
+notion/
+plan/
+report/
+Report/
 
 # Jupyter
 .ipynb_checkpoints
