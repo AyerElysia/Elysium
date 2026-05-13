@@ -353,9 +353,6 @@ class ProactiveMessagePlugin(BasePlugin):
         if not stream_id:
             return
 
-        if self._suspend_if_life_external_silence_paused(stream_id):
-            return
-
         # 检查是否已在等待中
         state = self.service.get_state(stream_id)
         if state is not None and state.is_waiting:
@@ -398,9 +395,6 @@ class ProactiveMessagePlugin(BasePlugin):
         state = self.service.get_state(stream_id)
         if state is None or not state.is_waiting or state.active_check_kind != "silence_wait":
             logger.debug(f"[{stream_id[:8]}] 跳过过期的沉默检查任务")
-            return
-
-        if self._suspend_if_life_external_silence_paused(stream_id):
             return
 
         logger.info(f"检查超时，触发主动机会：{stream_id[:8]}...")
@@ -539,9 +533,6 @@ class ProactiveMessagePlugin(BasePlugin):
                 self.service.clear_followup_trigger(stream_id)
                 return
             if self._should_ignore(chat_stream):
-                self.service.clear_followup_trigger(stream_id)
-                return
-            if self._suspend_if_life_external_silence_paused(stream_id):
                 self.service.clear_followup_trigger(stream_id)
                 return
             if not await self._is_platform_connected(chat_stream.platform):
@@ -860,9 +851,6 @@ class ProactiveMessagePlugin(BasePlugin):
         if state is None:
             return
 
-        if self._suspend_if_life_external_silence_paused(stream_id):
-            return
-
         # 应用最大等待时间限制（累计）
         max_wait = self.config.settings.max_wait_minutes
         total_wait = self.service.get_total_wait_minutes(stream_id)
@@ -892,9 +880,6 @@ class ProactiveMessagePlugin(BasePlugin):
         if not stream_id:
             return
 
-        if self._suspend_if_life_external_silence_paused(stream_id):
-            return
-
         async def _timeout_callback() -> None:
             await self._on_check_timeout(stream_id)
 
@@ -909,41 +894,6 @@ class ProactiveMessagePlugin(BasePlugin):
             wait_minutes=wait_minutes,
             callback=_timeout_callback,
         )
-
-    def _get_life_external_silence_pause_status(self) -> tuple[bool, int | None, int]:
-        """读取 life 的外界静默暂停状态；life 不可用时静默降级。"""
-        try:
-            from plugins.life_engine.service.core import LifeEngineService
-
-            service = LifeEngineService.get_instance()
-            if service is None:
-                return False, None, 0
-
-            getter = getattr(service, "get_external_silence_pause_status", None)
-            if callable(getter):
-                return getter()
-
-            fallback = getattr(service, "_should_pause_llm_heartbeat_for_external_silence", None)
-            if callable(fallback):
-                return fallback()
-        except Exception as exc:
-            logger.debug(f"读取 life 外界静默暂停状态失败：{exc}")
-        return False, None, 0
-
-    def _suspend_if_life_external_silence_paused(self, stream_id: str) -> bool:
-        """若 life 已进入外界静默暂停，则停止 proactive 的后续检查。"""
-        paused, silence_minutes, threshold = self._get_life_external_silence_pause_status()
-        if not paused:
-            return False
-
-        self.service.suspend_waiting(stream_id)
-        silence_label = f"{silence_minutes}min" if silence_minutes is not None else "unknown"
-        logger.info(
-            f"[{stream_id[:8]}] life 外界静默暂停已生效，停止主动机会检查: "
-            f"silence={silence_label} threshold={threshold}min"
-        )
-        return True
-
 
 # 全局插件实例引用
 _plugin_instance: ProactiveMessagePlugin | None = None

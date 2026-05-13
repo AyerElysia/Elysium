@@ -13,6 +13,7 @@ PLUGIN_ROOT = Path("/root/Elysia/Neo-MoFox/plugins")
 if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
+from plugins.proactive_message_plugin.config import ProactiveMessageConfig  # noqa: E402
 from plugins.proactive_message_plugin.plugin import ProactiveMessagePlugin  # noqa: E402
 
 class _FakeSender:
@@ -138,8 +139,9 @@ def test_proactive_opportunity_prompt_requires_inner_monologue_record(
     assert "不要假装对方刚刚发了新消息" in prompt
 
 
-def test_schedule_continue_waiting_skips_when_life_external_silence_paused() -> None:
+def test_schedule_continue_waiting_ignores_life_external_silence() -> None:
     plugin = ProactiveMessagePlugin()
+    plugin.config = ProactiveMessageConfig()
     plugin.service.clear_all()
 
     state = plugin.service.get_or_create_state("sid_pause")
@@ -154,13 +156,12 @@ def test_schedule_continue_waiting_skips_when_life_external_silence_paused() -> 
         return "task"
 
     plugin.service.start_waiting = fake_start_waiting  # type: ignore[method-assign]
-    plugin._get_life_external_silence_pause_status = lambda: (True, 35, 30)  # type: ignore[method-assign]
 
     asyncio.run(plugin._schedule_continue_waiting("sid_pause", 30.0))
 
     current = plugin.service.get_state("sid_pause")
-    assert calls == []
+    assert calls == [("sid_pause", 30.0)]
     assert current is not None
-    assert current.is_waiting is False
-    assert current.active_check_kind is None
-    assert current.scheduler_task_name is None
+    assert current.is_waiting is True
+    assert current.active_check_kind == "silence_wait"
+    assert current.scheduler_task_name == "proactive_check_sid_pause"

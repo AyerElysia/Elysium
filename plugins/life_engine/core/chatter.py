@@ -1005,24 +1005,6 @@ class LifeChatter(BaseChatter):
                         "force_reply": True,
                     }
 
-        if unread_msgs and all(self._is_proactive_trigger_message(msg) for msg in unread_msgs):
-            service = self._get_life_service()
-            if service is not None:
-                paused, silence_minutes, threshold = service.get_external_silence_pause_status()
-                if paused:
-                    silence_label = (
-                        f"{silence_minutes} 分钟"
-                        if silence_minutes is not None
-                        else "未知时长"
-                    )
-                    return {
-                        "reason": (
-                            "当前仅收到主动机会触发，且已命中 life 外界静默暂停阈值 "
-                            f"({silence_label} / {threshold} 分钟)，本轮继续等待"
-                        ),
-                        "should_respond": False,
-                    }
-
         # Layer 4: LLM sub_agent fallback
         try:
             from plugins.default_chatter.decision_agent import decide_should_respond

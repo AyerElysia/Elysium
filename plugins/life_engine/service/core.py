@@ -301,25 +301,6 @@ class LifeEngineService(BaseService):
         """计算距离上一次同步给对外运行模式过去了多少分钟。"""
         return self._minutes_since_tell_dfc()
 
-    def _should_pause_llm_heartbeat_for_external_silence(self) -> tuple[bool, int | None, int]:
-        """判断是否因外界长期静默暂停 LLM 心跳。"""
-        cfg = self._cfg()
-        threshold = int(
-            getattr(cfg.settings, "idle_pause_after_external_silence_minutes", 0)
-            or 0
-        )
-        if threshold <= 0:
-            return False, self._minutes_since_external_message(), threshold
-
-        minutes_since_external = self._minutes_since_external_message()
-        if minutes_since_external is None:
-            return False, None, threshold
-        return minutes_since_external >= threshold, minutes_since_external, threshold
-
-    def get_external_silence_pause_status(self) -> tuple[bool, int | None, int]:
-        """返回外界静默暂停状态，供其它插件复用。"""
-        return self._should_pause_llm_heartbeat_for_external_silence()
-
     def _parse_self_pause_until(self) -> datetime | None:
         """解析主动休息锁的结束时间。"""
         raw = self._state.self_pause_until
@@ -451,14 +432,7 @@ class LifeEngineService(BaseService):
         data = asdict(self._state)
         in_sleep_window, sleep_window_desc = self._in_sleep_window_now()
         data["heartbeat_interval_seconds"] = int(self._cfg().settings.heartbeat_interval_seconds)
-        data["idle_pause_after_external_silence_minutes"] = int(
-            getattr(self._cfg().settings, "idle_pause_after_external_silence_minutes", 0)
-            or 0
-        )
-        paused, silence_minutes, pause_threshold = self._should_pause_llm_heartbeat_for_external_silence()
-        data["llm_heartbeat_paused_by_external_silence"] = paused
-        data["external_silence_minutes"] = silence_minutes
-        data["external_silence_pause_threshold_minutes"] = pause_threshold
+        data["external_silence_minutes"] = self._minutes_since_external_message()
         self_paused, self_pause_remaining, self_pause_until, self_pause_reason = self._self_pause_status()
         data["llm_heartbeat_paused_by_self"] = self_paused
         data["self_pause_remaining_minutes"] = self_pause_remaining
@@ -2840,20 +2814,6 @@ class LifeEngineService(BaseService):
                     last_wake_context_at=self._state.last_wake_context_at,
                     last_wake_context_size=self._state.last_wake_context_size,
                 )
-
-                paused_by_silence, silence_minutes, pause_threshold = (
-                    self._should_pause_llm_heartbeat_for_external_silence()
-                )
-                if paused_by_silence:
-                    if self._snn_integration is not None:
-                        await self._snn_integration.heartbeat_post()
-                    await self._save_runtime_context()
-                    if should_log_heartbeat:
-                        logger.info(
-                            "life_engine heartbeat LLM 已因外界静默暂停: "
-                            f"silence={silence_minutes}min threshold={pause_threshold}min"
-                        )
-                    continue
 
                 try:
                     model_reply = await self._run_heartbeat_model(injected_content)

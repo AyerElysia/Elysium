@@ -7,9 +7,14 @@ token 计数器
 from __future__ import annotations
 
 import json
+from functools import lru_cache
+
+from src.kernel.logger import get_logger
 
 from .payload import LLMPayload, Text, ToolCall, ToolResult
 from .payload.content import Audio, File, Image, Video
+
+logger = get_logger("kernel.llm.token_counter", display="LLM TokenCounter")
 
 
 class _FallbackEncoding:
@@ -19,14 +24,14 @@ class _FallbackEncoding:
         return [0] * (len(text) // 2 + 1)
 
 
+@lru_cache(maxsize=32)
 def _get_tiktoken_encoding(model_identifier: str):
     """
     获取指定模型的 tiktoken 编码器。
     """
-    import tiktoken
-    from src.kernel.logger import logger
-
     try:
+        import tiktoken
+
         try:
             return tiktoken.encoding_for_model(model_identifier)
         except Exception:

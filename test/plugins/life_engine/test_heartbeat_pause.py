@@ -1,4 +1,4 @@
-"""life heartbeat pause tests."""
+"""life heartbeat self-pause tests."""
 
 from __future__ import annotations
 
@@ -13,47 +13,27 @@ from plugins.life_engine.tools import LifeEngineRestHeartbeatTool
 from src.core.models.message import Message
 
 
-def _service(threshold: int = 30, workspace_path: Path | None = None) -> LifeEngineService:
+def _service(workspace_path: Path | None = None) -> LifeEngineService:
     config = LifeEngineConfig()
-    config.settings.idle_pause_after_external_silence_minutes = threshold
     if workspace_path is not None:
         config.settings.workspace_path = str(workspace_path)
     return LifeEngineService(SimpleNamespace(config=config))
 
 
-def test_should_pause_llm_heartbeat_after_external_silence() -> None:
-    service = _service(threshold=30)
-    service._state.last_external_message_at = (
-        datetime.now(timezone.utc).astimezone() - timedelta(minutes=31)
-    ).isoformat()
-
-    paused, minutes, threshold = service._should_pause_llm_heartbeat_for_external_silence()
-
-    assert paused is True
-    assert minutes is not None and minutes >= 30
-    assert threshold == 30
-
-
-def test_should_not_pause_llm_heartbeat_when_disabled() -> None:
-    service = _service(threshold=0)
+def test_external_silence_no_longer_exposes_pause_mechanism() -> None:
+    service = _service()
     service._state.last_external_message_at = (
         datetime.now(timezone.utc).astimezone() - timedelta(hours=6)
     ).isoformat()
 
-    paused, _minutes, threshold = service._should_pause_llm_heartbeat_for_external_silence()
+    snapshot = service.snapshot()
 
-    assert paused is False
-    assert threshold == 0
-
-
-def test_should_not_pause_llm_heartbeat_without_external_message_record() -> None:
-    service = _service(threshold=30)
-
-    paused, minutes, threshold = service._should_pause_llm_heartbeat_for_external_silence()
-
-    assert paused is False
-    assert minutes is None
-    assert threshold == 30
+    assert not hasattr(service, "_should_pause_llm_heartbeat_for_external_silence")
+    assert not hasattr(service, "get_external_silence_pause_status")
+    assert not hasattr(service._cfg().settings, "idle_pause_after_external_silence_minutes")
+    assert snapshot["external_silence_minutes"] is not None
+    assert "llm_heartbeat_paused_by_external_silence" not in snapshot
+    assert "external_silence_pause_threshold_minutes" not in snapshot
 
 
 def test_request_self_pause_clamps_and_sets_status(tmp_path: Path) -> None:
@@ -77,8 +57,8 @@ def test_request_self_pause_clamps_and_sets_status(tmp_path: Path) -> None:
     assert status["will_wake_on_external_message"] is True
 
 
-def test_self_pause_expires_without_clearing_external_silence_state() -> None:
-    service = _service(threshold=30)
+def test_self_pause_expires() -> None:
+    service = _service()
     service._state.self_pause_until = (
         datetime.now(timezone.utc).astimezone() - timedelta(minutes=1)
     ).isoformat()

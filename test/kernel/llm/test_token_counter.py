@@ -2,11 +2,40 @@
 
 from __future__ import annotations
 
+import sys
+from types import SimpleNamespace
+
 from src.kernel.llm.context import LLMContextManager
 from src.kernel.llm.payload import LLMPayload, Text
 from src.kernel.llm.payload.content import Audio, Image, Video
 from src.kernel.llm.roles import ROLE
-from src.kernel.llm.token_counter import count_payload_tokens
+from src.kernel.llm.token_counter import _get_tiktoken_encoding, count_payload_tokens
+
+
+def test_tiktoken_load_failure_uses_fallback(monkeypatch) -> None:
+    """Token counting should degrade to an estimate when tiktoken cannot load data."""
+
+    def raise_load_error(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("tiktoken data unavailable")
+
+    _get_tiktoken_encoding.cache_clear()
+    monkeypatch.setitem(
+        sys.modules,
+        "tiktoken",
+        SimpleNamespace(
+            encoding_for_model=raise_load_error,
+            get_encoding=raise_load_error,
+        ),
+    )
+
+    payloads = [LLMPayload(ROLE.USER, Text("网络不通时也不能因为 token 计数崩溃"))]
+
+    try:
+        tokens = count_payload_tokens(payloads, model_identifier="gpt-4")
+    finally:
+        _get_tiktoken_encoding.cache_clear()
+
+    assert tokens > 0
 
 
 def test_multimodal_base64_is_counted_as_placeholder() -> None:
