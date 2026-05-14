@@ -12,6 +12,108 @@ Neo-MoFox is a refactored chatbot framework with a strict three-layer architectu
 
 See [MoFox 重构指导总览.md](MoFox 重构指导总览.md) for complete architecture documentation.
 
+## Unified Consciousness Design
+
+`life_chatter` is the single main consciousness of the project. Do not model
+private chats, QQ groups, live rooms, games, terminals, or future channels as
+separate minds or separate long-lived LLM sessions. Different streams are only
+event sources, wake-up queues, and reply targets. The subject that perceives,
+remembers, decides, and speaks is one shared `life_chatter` runtime.
+
+Current implementation anchors:
+
+- `plugins/life_engine/core/chatter.py` shares one global runtime through
+  `_GLOBAL_RUNTIME`, `_GLOBAL_RUNTIME_LOCK`, and
+  `LIFE_CHATTER_GLOBAL_CURSOR_KEY`.
+- The global runtime lock is mandatory. Multiple stream loops may wake
+  `life_chatter`, but only one source may advance the shared LLM payload chain
+  at a time.
+- The `life_chatter` system prompt must stay stream-agnostic. Platform-specific
+  or scene-specific instructions belong in the current turn's user prompt or
+  transient runtime context, not in the persistent system prompt.
+- `life_engine` is the subconscious/runtime substrate. It observes events,
+  maintains state, records memory, and supplies incremental context. It should
+  not bypass the chatter/action layer to perform user-facing expression.
+
+### Adding New Information Channels
+
+When adding a new channel such as a live room, Minecraft, another game, browser
+activity, screen state, or device telemetry:
+
+1. Normalize incoming data into the unified life event model first.
+   Use channel/source metadata (`channel`, `source`, `event_type`,
+   `stream_id`, `reply_target`, `priority`, `salience`, `metadata`) instead of
+   inventing a new memory/session model.
+2. If the event is something the consciousness genuinely experienced
+   (user text, danmaku, game chat, meaningful game state, tool result, operator
+   result), record it as part of the unified event timeline. Do not hide real
+   experiences only in transient context.
+3. Use transient context only for derived or replaceable state: current screen
+   snapshot, current game HUD, latest inventory summary, connection status,
+   repeated operator instructions, response-format manuals, and other data that
+   should not accumulate forever in the LLM payload chain.
+4. High-frequency channels must be summarized, rate-limited, prioritized, or
+   stored as current state before reaching `life_chatter`. Never dump every
+   tick, frame, log line, or full game state into persistent chat history.
+5. A channel bridge may create a `ChatStream`/`Message` when the data is
+   conversation-like, but that stream still does not own a separate identity or
+   private memory. It only tells the main consciousness where the event came
+   from and where a reply should go.
+6. Reply routing must preserve the original target. If the triggering event
+   came from a QQ private chat, reply there; if it came from live chat, reply
+   through the live/TTS path; if it came from a game operator bridge, return the
+   structured decision to that bridge. Do not send through a generic adapter
+   unless the platform target is known.
+
+### Chat History vs Transient Runtime Context
+
+`<chat_history>` is durable conversational history for the unified
+consciousness. In unified mode it may merge visible messages from multiple
+streams in chronological order, with stream labels when needed. It should
+contain real external/user-facing dialogue and meaningful first-class events.
+
+`<transient_life_context>` is a temporary attention/state block appended before
+an LLM call and stripped afterward. It is for the latest runtime state, not for
+durable memory. It must not become a second hidden chat history.
+
+Keep these boundaries:
+
+- Visible user/assistant messages, live danmaku, game chat, and meaningful
+  external events may naturally accumulate in the unified history/event stream.
+- Inner monologue, proactive triggers, follow-up triggers, tool boilerplate,
+  operator manuals, repeated response schemas, and high-volume telemetry should
+  not be inserted as normal chat history.
+- If a channel needs both long-term experience and current-state awareness,
+  split them: record the meaningful event durably, and expose the latest
+  volatile state through transient context.
+
+### Game and Tool Boundaries
+
+For game integrations, keep concrete operation tools out of the main
+consciousness unless they are genuinely part of expression. Prefer a separate
+operator/worker agent for low-level controls. The operator reports state and
+asks `life_chatter` for high-level decisions; `life_chatter` responds with the
+decision; the operator executes it and reports the result back as an event.
+
+For user-facing actions, expose tools narrowly to `life_chatter` through
+`chatter_allow` and adapter capability checks. File sending, TTS/live speech,
+message sending, image generation, and platform actions should always preserve
+the active stream/reply target.
+
+### Required Review Checklist
+
+Before merging a new channel or life-related feature, check:
+
+- Does it reuse the unified `life_chatter` runtime instead of creating a second
+  long-lived consciousness/session?
+- Are meaningful external events recorded once, with source metadata?
+- Are repeated instructions and volatile state kept transient or summarized?
+- Is the reply target explicit and adapter routing testable?
+- Can high-frequency input apply backpressure, salience filtering, or
+  summarization?
+- Are tests or manual verification included for event ingestion, context
+  rendering, transient stripping, and reply routing?
+
 ## Development Commands
 
 ### Dependency Management
