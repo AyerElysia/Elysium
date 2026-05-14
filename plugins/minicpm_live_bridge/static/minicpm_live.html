@@ -507,19 +507,28 @@
 
     async function startCapture() {
       state.screenStream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: Math.max(1, Math.round(state.config.capture.screen_fps || 5)) },
+        video: {
+          frameRate: Math.max(1, Math.round(state.config.capture.screen_fps || 5)),
+          displaySurface: 'monitor',
+        },
         audio: false,
+        preferCurrentTab: false,
+        selfBrowserSurface: 'exclude',
       });
+      const track = state.screenStream.getVideoTracks()[0];
+      const surface = track?.getSettings()?.displaySurface || 'unknown';
+      postClientDebug('info', 'screen capture surface', { surface });
       state.audioStream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
         video: false,
       });
       el.screenPreview.srcObject = state.screenStream;
       el.emptyText.hidden = true;
-      setBadge(el.captureBadge, 'capture on', 'ok');
+      setBadge(el.captureBadge, `capture on (${surface})`, 'ok');
       postClientDebug('info', 'capture started', {
         screen_tracks: state.screenStream.getVideoTracks().length,
         audio_tracks: state.audioStream.getAudioTracks().length,
+        surface,
       });
       state.screenStream.getVideoTracks()[0]?.addEventListener('ended', stop);
     }
@@ -910,9 +919,14 @@
         });
         if (response?.text) {
           addLog('assistant', response.text, 'assistant');
-          speakText(response.text);
+          if (response.tts_audio) {
+            playAudioMessage({ audio_base64: response.tts_audio, mime_type: response.tts_mime_type || 'audio/wav', text: response.text });
+          } else {
+            speakText(response.text);
+          }
           postClientDebug('info', 'local api turn completed', {
             reply_chars: response.text.length,
+            tts_source: response.tts_audio ? 'gpt_sovits' : 'browser',
           });
         }
       } catch (error) {

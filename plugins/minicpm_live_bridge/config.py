@@ -220,6 +220,16 @@ class MiniCPMLiveBridgeConfig(BaseConfig):
             tag="ai",
             order=8,
         )
+        tts_style: str = Field(
+            default="default",
+            description=(
+                "本地单轮 API 模式回复后使用的 GPT-SoVITS 风格名称（对应 tts_voice_plugin 中配置的 style_name）。"
+                "留空则跳过 GPT-SoVITS，前端回退到浏览器 TTS。"
+            ),
+            label="TTS 风格",
+            tag="ai",
+            order=9,
+        )
 
     @config_section("unified_event_stream", title="实时统一事件流", tag="network", order=40)
     class UnifiedEventStreamSection(SectionBase):

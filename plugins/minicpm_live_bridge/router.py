@@ -95,7 +95,10 @@ class MiniCPMLiveRouter(BaseRouter):
             html_path = _STATIC_ROOT / "minicpm_live.html"
             if not html_path.exists():
                 return HTMLResponse("<h1>MiniCPM Live page not found</h1>", status_code=404)
-            return HTMLResponse(html_path.read_text(encoding="utf-8"))
+            return HTMLResponse(
+                html_path.read_text(encoding="utf-8"),
+                headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+            )
 
         @self.app.get("/api/config")
         async def get_client_config(_: str = VerifiedDep) -> dict[str, Any]:
@@ -316,7 +319,43 @@ class MiniCPMLiveRouter(BaseRouter):
                 f"session={self._short_id(request.session_id)} "
                 f"reply_chars={len(text)} reply={self._preview(text)}"
             )
-            return {"success": True, "text": text}
+
+            tts_audio: str | None = None
+            tts_mime_type: str = "audio/wav"
+            tts_style = (config.session.tts_style or "").strip()
+            if tts_style:
+                try:
+                    tts_service = self._get_tts_service()
+                    if tts_service is not None:
+                        try:
+                            media_type = str(
+                                getattr(getattr(tts_service, "_config", None), "tts_advanced", None) and
+                                getattr(tts_service._config.tts_advanced, "media_type", None) or "wav"
+                            ).strip().lstrip(".") or "wav"
+                            tts_mime_type = f"audio/{media_type}"
+                        except Exception:
+                            pass
+                        tts_audio = await tts_service.generate_voice(text, tts_style)
+                        if tts_audio:
+                            self._log_live(
+                                "MiniCPM Live TTS done: "
+                                f"session={self._short_id(request.session_id)} "
+                                f"style={tts_style} b64_len={len(tts_audio)} mime={tts_mime_type}"
+                            )
+                        else:
+                            self._log_live(
+                                "MiniCPM Live TTS returned None, frontend will use browser TTS",
+                                level="warning",
+                            )
+                    else:
+                        self._log_live(
+                            "MiniCPM Live TTS skipped: tts_voice_plugin service unavailable",
+                            level="warning",
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"MiniCPM Live TTS 合成失败: {exc}")
+
+            return {"success": True, "text": text, "tts_audio": tts_audio, "tts_mime_type": tts_mime_type}
 
         @self.app.get("/api/sessions/{session_id}")
         async def get_session(session_id: str, _: str = VerifiedDep) -> JSONResponse:
@@ -479,6 +518,30 @@ class MiniCPMLiveRouter(BaseRouter):
         return payload
 
     @staticmethod
+    def _get_tts_service() -> Any | None:
+        """获取 tts_voice_plugin 的 TTSService 实例，失败时返回 None。"""
+        try:
+            from src.core.managers import get_plugin_manager
+
+            plugin = get_plugin_manager().get_plugin("tts_voice_plugin")
+            service = getattr(plugin, "tts_service", None) if plugin is not None else None
+            if service is not None and hasattr(service, "generate_voice"):
+                return service
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"MiniCPM Live 获取 TTSService (plugin manager) 失败: {exc}")
+
+        try:
+            from src.app.plugin_system.api.service_api import get_service
+
+            service = get_service("tts_voice_plugin:service:tts")
+            if service is not None and hasattr(service, "generate_voice"):
+                return service
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"MiniCPM Live 获取 TTSService (service API) 失败: {exc}")
+
+        return None
+
+    @staticmethod
     def _is_valid_api_key(api_key: str) -> bool:
         try:
             from src.core.config.core_config import get_core_config
@@ -538,6 +601,7 @@ class MiniCPMLiveRouter(BaseRouter):
                 "dispatch_user_transcript_to_chatter": bool(
                     config.session.dispatch_user_transcript_to_chatter
                 ),
+                "tts_style": config.session.tts_style,
             },
             "unified_event_stream": {
                 "sync_core_events_to_live": bool(config.unified_event_stream.sync_core_events_to_live),
