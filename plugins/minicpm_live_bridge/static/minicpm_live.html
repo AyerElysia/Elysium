@@ -314,6 +314,8 @@
       currentTurn: null,
       audioQueue: [],
       audioPlaying: false,
+      stopping: false,
+      wsReconnectTimer: null,
       pendingUnifiedEvents: [],
       contextSnapshot: null,
       contextSnapshotPromise: null,
@@ -582,6 +584,10 @@
     }
 
     function connectWebSocket() {
+      if (state.wsReconnectTimer) {
+        window.clearTimeout(state.wsReconnectTimer);
+        state.wsReconnectTimer = null;
+      }
       const template = state.config.server?.websocket_url || '';
       const url = resolveWebSocketUrlTemplate(template);
       if (!url) {
@@ -615,10 +621,19 @@
       };
       state.ws.onclose = event => {
         setBadge(el.wsBadge, 'ws closed', 'warn');
+        state.ws = null;
         postClientDebug('warning', 'external websocket closed', {
           code: event.code,
           reason: event.reason || '',
         });
+        if (!state.stopping && state.sessionId) {
+          state.wsReconnectTimer = window.setTimeout(() => {
+            if (!state.stopping && state.sessionId && !state.ws) {
+              postClientDebug('info', 'reconnecting external websocket', { session_id: state.sessionId });
+              connectWebSocket();
+            }
+          }, 300);
+        }
       };
       state.ws.onerror = () => {
         setBadge(el.wsBadge, 'ws error', 'err');
@@ -1065,6 +1080,7 @@
     async function start() {
       try {
         el.startBtn.disabled = true;
+        state.stopping = false;
         postClientDebug('info', 'start requested');
         if (!state.config) await loadConfig();
         if (!state.config?.enabled) throw new Error('MiniCPM Live Bridge disabled');
@@ -1100,7 +1116,12 @@
     }
 
     async function stop() {
+      state.stopping = true;
       postClientDebug('info', 'stop requested', { session_id: state.sessionId || '' });
+      if (state.wsReconnectTimer) {
+        window.clearTimeout(state.wsReconnectTimer);
+        state.wsReconnectTimer = null;
+      }
       if (state.frameTimer) window.clearInterval(state.frameTimer);
       state.frameTimer = null;
       cancelLocalVoiceRecording();
@@ -1604,12 +1625,22 @@
           },
           onSpeechEnd: (audio) => {
             // audio: Float32Array at 16000 Hz, Silero-confirmed human speech
-            if (isMiniCPMRealtimeAdapter() && state.ws?.readyState === WebSocket.OPEN) {
-              if (state.vad) setBadge(el.vadBadge, 'vad listening', 'warn');
-              postClientDebug('info', 'VAD segment ignored because realtime PCM stream is active', {
-                duration_ms: Math.round(audio.length / 16000 * 1000),
-              });
-              return;
+            if (isMiniCPMRealtimeAdapter()) {
+              if (state.ws?.readyState === WebSocket.OPEN) {
+                if (state.vad) setBadge(el.vadBadge, 'vad listening', 'warn');
+                postClientDebug('info', 'VAD segment ignored because realtime PCM stream is active', {
+                  duration_ms: Math.round(audio.length / 16000 * 1000),
+                });
+                return;
+              }
+              if (state.sessionId && !state.ws) {
+                postClientDebug('warning', 'realtime websocket unavailable; reconnecting instead of falling back', {
+                  duration_ms: Math.round(audio.length / 16000 * 1000),
+                });
+                connectWebSocket();
+                if (state.vad) setBadge(el.vadBadge, 'vad reconnecting', 'warn');
+                return;
+              }
             }
             if (state.vadTurnBusy && !state.fullDuplex) {
               if (state.vad) setBadge(el.vadBadge, 'vad listening', 'warn');
