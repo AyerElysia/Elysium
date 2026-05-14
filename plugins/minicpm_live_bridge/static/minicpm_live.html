@@ -908,6 +908,15 @@
       }
 
       const type = message.type || 'message';
+      if (
+        type === 'status' &&
+        (
+          message.status === 'upstream.ack' ||
+          message.text === 'MiniCPM upstream acknowledged request'
+        )
+      ) {
+        return;
+      }
       if (type === 'partial') {
         const text = message.text || '';
         if (text) addLog(message.role || 'assistant', text, 'assistant');
