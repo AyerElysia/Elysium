@@ -278,6 +278,24 @@ class MiniCPMLiveBridgeConfig(BaseConfig):
             tag="ai",
             order=4,
         )
+        sensitivity: float = Field(
+            default=3.0,
+            ge=1.0,
+            le=20.0,
+            description="噪底倍数：语音触发阈值 = 环境噪底 × sensitivity。越大越不灵敏，越小越容易触发。建议 2.5–5.0。",
+            label="灵敏度倍数",
+            tag="ai",
+            order=5,
+        )
+        speech_ratio: float = Field(
+            default=0.35,
+            ge=0.1,
+            le=0.8,
+            description="触发人声检测所需的语音频段（200–3500 Hz）能量占总能量的最低比例。提高此值可更严格地排除非人声（如音乐、敲击声）；建议 0.30–0.50。",
+            label="语音频段占比",
+            tag="ai",
+            order=6,
+        )
 
     @config_section("unified_event_stream", title="实时统一事件流", tag="network", order=40)
     class UnifiedEventStreamSection(SectionBase):

@@ -1121,33 +1121,82 @@
     // ── VAD (实时语音活动检测) ─────────────────────────────────────────
     function updateVadLevel(rms) {
       if (!el.vadLevelBar) return;
-      const threshold = state.config?.vad?.threshold ?? 0.012;
       const pct = Math.min(100, Math.round(rms / 0.12 * 100));
       el.vadLevelBar.style.width = `${pct}%`;
-      el.vadLevelBar.style.background = rms >= threshold ? 'var(--accent)' : 'var(--muted)';
+      const speaking = el.vadBadge?.textContent === 'vad speaking';
+      el.vadLevelBar.style.background = speaking ? 'var(--accent)' : 'var(--muted)';
     }
 
     async function startVad() {
       if (state.vad) return;
       if (!state.audioStream) { addLog('system', 'VAD: 麦克风未启动', 'error'); return; }
 
-      const cfg = state.config?.vad || {};
-      const threshold    = Number(cfg.threshold    ?? 0.012);
-      const silenceMs    = Number(cfg.silence_ms   ?? 800);
+      const cfg          = state.config?.vad || {};
+      const silenceMs    = Number(cfg.silence_ms    ?? 800);
       const minSpeechMs  = Number(cfg.min_speech_ms ?? 300);
       const maxMs        = Number(cfg.max_ms        ?? 15000);
       const preSpeechMs  = Number(cfg.pre_speech_ms ?? 200);
+      const sensitivity  = Number(cfg.sensitivity   ?? 3.0);   // noise-floor multiplier
+      const speechRatio  = Number(cfg.speech_ratio  ?? 0.35);  // min speech-band energy fraction
       const BUFFER_SIZE  = 2048;
+      const FFT_SIZE     = 1024;   // 512 frequency bins
+      const POLL_MS      = 40;     // spectral detection interval (ms)
 
       const AudioContextClass = window.AudioContext || window.webkitAudioContext;
       if (!AudioContextClass) throw new Error('当前浏览器不支持 AudioContext');
-      const audioContext    = new AudioContextClass();
-      const sampleRate      = audioContext.sampleRate;
-      const maxPreRollChunks = Math.max(1, Math.ceil((preSpeechMs / 1000) * sampleRate / BUFFER_SIZE));
+      const audioContext = new AudioContextClass();
+      const sampleRate   = audioContext.sampleRate;
+
+      // Speech band 200–3500 Hz expressed as FFT bin indices
+      const binWidth      = sampleRate / FFT_SIZE;
+      const freqBinCount  = FFT_SIZE / 2;
+      const speechLowBin  = Math.max(1, Math.ceil(200  / binWidth));
+      const speechHighBin = Math.min(freqBinCount - 1, Math.floor(3500 / binWidth));
+      const maxPreRoll    = Math.max(1, Math.ceil((preSpeechMs / 1000) * sampleRate / BUFFER_SIZE));
 
       const source    = audioContext.createMediaStreamSource(state.audioStream);
-      const processor = audioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);
+      const analyser  = audioContext.createAnalyser();
+      analyser.fftSize = FFT_SIZE;
+      analyser.smoothingTimeConstant = 0.3;
+      const byteFreqData = new Uint8Array(freqBinCount);
 
+      // Immediately mark active so stopVad can teardown during calibration
+      state.vad = { audioContext };
+      el.vadBtn.textContent = '关闭自动';
+      el.vadBtn.classList.add('primary');
+      el.voiceBtn.disabled = true;
+
+      // ── 1.5 s noise-floor calibration ────────────────────────────────
+      setBadge(el.vadBadge, 'vad 校准中…', 'warn');
+      addLog('system', 'VAD 正在校准环境噪声（1.5 秒），请保持安静…');
+      source.connect(analyser);
+
+      const calibSamples = [];
+      const calibId = setInterval(() => {
+        analyser.getByteFrequencyData(byteFreqData);
+        let e = 0;
+        for (let i = speechLowBin; i <= speechHighBin; i++) e += byteFreqData[i];
+        calibSamples.push(e);
+      }, POLL_MS);
+
+      await new Promise(r => setTimeout(r, 1500));
+      clearInterval(calibId);
+
+      if (!state.vad) {
+        // stopVad() was called while we were waiting — clean up and abort
+        try { source.disconnect(); } catch {}
+        return;
+      }
+
+      // 85th-percentile of ambient as noise floor (tolerates occasional sounds during calib)
+      calibSamples.sort((a, b) => a - b);
+      const noiseFloor      = calibSamples[Math.floor(calibSamples.length * 0.85)] || 0;
+      const absMin          = 8 * (speechHighBin - speechLowBin + 1); // sanity floor
+      const speechThreshold = Math.max(noiseFloor * sensitivity, absMin);
+
+      addLog('system', `VAD 校准完成 — 噪底=${Math.round(noiseFloor)}, 阈值=${Math.round(speechThreshold)} (×${sensitivity}), 语音占比≥${speechRatio}`);
+
+      // ── State machine ─────────────────────────────────────────────────
       let speaking      = false;
       let silenceTimer  = null;
       let maxTimer      = null;
@@ -1155,10 +1204,14 @@
       let recordChunks  = [];
       let preRollBuffer = [];
 
-      function calcRms(ch) {
-        let s = 0;
-        for (let i = 0; i < ch.length; i++) s += ch[i] * ch[i];
-        return Math.sqrt(s / ch.length);
+      function getScore() {
+        analyser.getByteFrequencyData(byteFreqData);
+        let speechE = 0, totalE = 0;
+        for (let i = 1; i < freqBinCount; i++) {
+          totalE += byteFreqData[i];
+          if (i >= speechLowBin && i <= speechHighBin) speechE += byteFreqData[i];
+        }
+        return { speechE, ratio: totalE > 0 ? speechE / totalE : 0 };
       }
 
       function triggerSend() {
@@ -1181,68 +1234,71 @@
             audioMimeType: 'audio/wav',
             payload: { input_mode: 'vad_voice', duration_ms: dur },
           });
-        }).catch(err => {
-          addLog('system', `VAD 发送失败: ${err}`, 'error');
-        }).finally(() => {
-          if (state.vad) setBadge(el.vadBadge, 'vad listening', 'warn');
-        });
+        }).catch(err => addLog('system', `VAD 发送失败: ${err}`, 'error'))
+          .finally(() => { if (state.vad) setBadge(el.vadBadge, 'vad listening', 'warn'); });
       }
 
+      // ScriptProcessor: audio chunk accumulation + level meter
+      const processor = audioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);
       processor.onaudioprocess = event => {
         if (!state.vad) return;
-        const channelData = event.inputBuffer.getChannelData(0);
-        const rms         = calcRms(channelData);
-        const chunk       = new Float32Array(channelData);
-        updateVadLevel(rms);
-
+        const ch    = event.inputBuffer.getChannelData(0);
+        const chunk = new Float32Array(ch);
+        let sum = 0;
+        for (let i = 0; i < ch.length; i++) sum += ch[i] * ch[i];
+        updateVadLevel(Math.sqrt(sum / ch.length));
         if (!speaking) {
           preRollBuffer.push(chunk);
-          if (preRollBuffer.length > maxPreRollChunks) preRollBuffer.shift();
+          if (preRollBuffer.length > maxPreRoll) preRollBuffer.shift();
+        } else {
+          recordChunks.push(chunk);
+        }
+        event.outputBuffer.getChannelData(0).fill(0);
+      };
+      source.connect(processor);
+      processor.connect(audioContext.destination);
 
-          if (rms >= threshold && !state.vadTurnBusy) {
+      // Polling timer: spectral human-voice detection
+      const pollTimer = setInterval(() => {
+        if (!state.vad) { clearInterval(pollTimer); return; }
+        const { speechE, ratio } = getScore();
+        if (!speaking) {
+          // Both energy AND spectral ratio must exceed thresholds
+          if (speechE >= speechThreshold && ratio >= speechRatio && !state.vadTurnBusy) {
             speaking      = true;
             speechStartAt = Date.now();
-            recordChunks  = preRollBuffer.concat([chunk]);
+            recordChunks  = preRollBuffer.splice(0);
             preRollBuffer = [];
             setBadge(el.vadBadge, 'vad speaking', 'ok');
             stopSpokenOutput();
             maxTimer = setTimeout(() => { if (speaking) triggerSend(); }, maxMs);
           }
         } else {
-          recordChunks.push(chunk);
-          const stopThreshold = threshold * 0.55;
-          if (rms < stopThreshold) {
-            if (!silenceTimer) {
-              silenceTimer = setTimeout(() => {
-                silenceTimer = null;
-                if (speaking) triggerSend();
-              }, silenceMs);
-            }
-          } else if (rms >= threshold) {
-            if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
-          }
+          // Hysteresis: stop at 50% energy or 70% ratio thresholds
+          const isSilent = speechE < speechThreshold * 0.5 || ratio < speechRatio * 0.7;
+          if (isSilent) {
+            if (!silenceTimer) silenceTimer = setTimeout(() => {
+              silenceTimer = null;
+              if (speaking) triggerSend();
+            }, silenceMs);
+          } else if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
         }
-        event.outputBuffer.getChannelData(0).fill(0);
-      };
+      }, POLL_MS);
 
-      source.connect(processor);
-      processor.connect(audioContext.destination);
-
-      state.vad = { audioContext, source, processor };
+      state.vad = { audioContext, source, analyser, processor, pollTimer };
       setBadge(el.vadBadge, 'vad listening', 'warn');
-      el.vadBtn.textContent = '关闭自动';
-      el.vadBtn.classList.add('primary');
-      el.voiceBtn.disabled = true;
-      addLog('system', `VAD 已启动 (阈值=${threshold}, 静音=${silenceMs}ms, 最短=${minSpeechMs}ms)`);
+      addLog('system', `VAD 已启动 (静音截断=${silenceMs}ms, 最短语音=${minSpeechMs}ms)`);
     }
 
     function stopVad() {
       const vad = state.vad;
       if (!vad) return;
       state.vad = null;
-      try { vad.processor.disconnect(); } catch {}
-      try { vad.source.disconnect();    } catch {}
-      try { vad.audioContext.close();   } catch {}
+      if (vad.pollTimer) clearInterval(vad.pollTimer);
+      try { vad.processor?.disconnect(); } catch {}
+      try { vad.analyser?.disconnect();  } catch {}
+      try { vad.source?.disconnect();    } catch {}
+      try { vad.audioContext?.close();   } catch {}
       setBadge(el.vadBadge, 'vad off', '');
       el.vadBtn.textContent = '自动语音';
       el.vadBtn.classList.remove('primary');

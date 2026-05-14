@@ -294,6 +294,7 @@ class MiniCPMLiveRouter(BaseRouter):
             if not (request.text.strip() or request.screen_image.strip() or request.audio_data.strip()):
                 raise HTTPException(status_code=400, detail="text, screen_image or audio_data is required")
 
+            t_turn_start = time.perf_counter()
             self._log_live(
                 "MiniCPM Live local turn start: "
                 f"session={self._short_id(request.session_id)} "
@@ -323,6 +324,7 @@ class MiniCPMLiveRouter(BaseRouter):
             tts_audio: str | None = None
             tts_mime_type: str = "audio/wav"
             tts_style = (config.session.tts_style or "").strip()
+            t_tts_start = time.perf_counter()
             if tts_style:
                 try:
                     tts_service = self._get_tts_service()
@@ -355,6 +357,8 @@ class MiniCPMLiveRouter(BaseRouter):
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(f"MiniCPM Live TTS 合成失败: {exc}")
 
+            t_done = time.perf_counter()
+            self._log_live(f"Local turn total latency: {(t_done - t_turn_start):.3f}s (TTS: {(t_done - t_tts_start):.3f}s)")
             return {"success": True, "text": text, "tts_audio": tts_audio, "tts_mime_type": tts_mime_type}
 
         @self.app.get("/api/sessions/{session_id}")
@@ -634,6 +638,8 @@ class MiniCPMLiveRouter(BaseRouter):
                 "min_speech_ms": int(config.vad.min_speech_ms),
                 "max_ms": int(config.vad.max_ms),
                 "pre_speech_ms": int(config.vad.pre_speech_ms),
+                "sensitivity": float(config.vad.sensitivity),
+                "speech_ratio": float(config.vad.speech_ratio),
             },
             "protocol": "neo-minicpm-live-v0",
         }
@@ -708,6 +714,7 @@ class MiniCPMLiveRouter(BaseRouter):
             await self._record_message_without_chatter(message, direction="sent")
 
     async def _run_local_api_turn(self, request: LiveTurnRequest) -> str:
+        t0 = time.perf_counter()
         """使用 config/model.toml 的 live 任务跑一轮半双工多模态 API。"""
         from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
         from src.kernel.llm import Audio, Image, LLMPayload, ROLE, Text
@@ -720,10 +727,13 @@ class MiniCPMLiveRouter(BaseRouter):
         user_text = request.text.strip()
         turn_event_type = "voice_input" if request.audio_data.strip() and not user_text else "text_input"
         display_user_text = user_text or "[语音输入]"
+        t_prompt_start = time.perf_counter()
         prompt_bundle = await self._build_life_chatter_prompt_for_live_turn(
             request=request,
             display_user_text=display_user_text,
         )
+        t_prompt_done = time.perf_counter()
+        self._log_live(f"Prompt built in {(t_prompt_done - t_prompt_start):.3f}s")
         self._log_prompt_bundle_summary(
             prompt_bundle,
             session_id=request.session_id,
@@ -793,9 +803,12 @@ class MiniCPMLiveRouter(BaseRouter):
                 )
             )
 
+        t_llm_start = time.perf_counter()
         llm_request.add_payload(LLMPayload(ROLE.USER, content))
         response = await llm_request.send(stream=False)
         text = (await response).strip()
+        t_llm_done = time.perf_counter()
+        self._log_live(f"LLM request done in {(t_llm_done - t_llm_start):.3f}s")
         if not text:
             text = "我这边没有拿到有效回复。"
 
