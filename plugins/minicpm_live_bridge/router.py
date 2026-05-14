@@ -1700,21 +1700,26 @@ class MiniCPMLiveRouter(BaseRouter):
         adapter: Any,
         session_id: str,
     ) -> None:
-        while True:
-            message = await client_websocket.receive()
-            if message.get("type") == "websocket.disconnect":
-                raise WebSocketDisconnect(code=int(message.get("code") or 1000))
-            raw = message.get("bytes")
-            if raw is None:
-                raw = message.get("text", "")
-            payload = self._parse_realtime_message(raw)
-            result = await adapter.on_client_message(payload)
-            await self._flush_realtime_adapter_result(
-                client_websocket=client_websocket,
-                upstream_websocket=upstream_websocket,
-                result=result,
-            )
-            self._ensure_live_session(session_id)
+        try:
+            while True:
+                message = await client_websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    raise WebSocketDisconnect(code=int(message.get("code") or 1000))
+                raw = message.get("bytes")
+                if raw is None:
+                    raw = message.get("text", "")
+                payload = self._parse_realtime_message(raw)
+                result = await adapter.on_client_message(payload)
+                await self._flush_realtime_adapter_result(
+                    client_websocket=client_websocket,
+                    upstream_websocket=upstream_websocket,
+                    result=result,
+                )
+                self._ensure_live_session(session_id)
+        except Exception as exc:
+            if self._is_benign_realtime_close(exc):
+                return
+            raise
 
     @staticmethod
     def _connect_upstream_websocket(
@@ -1755,15 +1760,28 @@ class MiniCPMLiveRouter(BaseRouter):
         adapter: Any,
         session_id: str,
     ) -> None:
-        async for raw in upstream_websocket:
-            payload = self._parse_realtime_message(raw)
-            result = await adapter.on_upstream_message(payload)
-            await self._flush_realtime_adapter_result(
-                client_websocket=client_websocket,
-                upstream_websocket=upstream_websocket,
-                result=result,
-            )
-            self._ensure_live_session(session_id)
+        try:
+            async for raw in upstream_websocket:
+                payload = self._parse_realtime_message(raw)
+                result = await adapter.on_upstream_message(payload)
+                await self._flush_realtime_adapter_result(
+                    client_websocket=client_websocket,
+                    upstream_websocket=upstream_websocket,
+                    result=result,
+                )
+                self._ensure_live_session(session_id)
+        except Exception as exc:
+            if self._is_benign_realtime_close(exc):
+                return
+            raise
+
+    @staticmethod
+    def _is_benign_realtime_close(exc: Exception) -> bool:
+        text = str(exc).lower()
+        name = exc.__class__.__name__
+        if name in {"ConnectionClosed", "ConnectionClosedOK", "ConnectionClosedError"}:
+            return True
+        return "no close frame received or sent" in text
 
     async def _safe_send_proxy_error(self, websocket: WebSocket, message: str) -> None:
         try:
@@ -1940,6 +1958,8 @@ class MiniCPMLiveRouter(BaseRouter):
         except WebSocketDisconnect:
             pass
         except Exception as exc:  # noqa: BLE001
+            if self._is_benign_realtime_close(exc):
+                return
             logger.warning(f"MiniCPM Live realtime proxy 失败: {exc}", exc_info=True)
             self._log_live(
                 "MiniCPM Live realtime proxy failed: "
