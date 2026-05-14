@@ -231,6 +231,54 @@ class MiniCPMLiveBridgeConfig(BaseConfig):
             order=9,
         )
 
+    @config_section("vad", title="实时语音检测 (VAD)", tag="ai", order=35)
+    class VadSection(SectionBase):
+        threshold: float = Field(
+            default=0.012,
+            ge=0.001,
+            le=0.5,
+            description="判断为语音的麦克风 RMS 能量阈值（0.001–0.5）。越小越灵敏，建议 0.008–0.02。",
+            label="语音阈值",
+            tag="ai",
+            order=0,
+        )
+        silence_ms: int = Field(
+            default=800,
+            ge=200,
+            le=5000,
+            description="停止说话后，静音持续多少毫秒触发发送。",
+            label="静音截断 (ms)",
+            tag="ai",
+            order=1,
+        )
+        min_speech_ms: int = Field(
+            default=300,
+            ge=100,
+            le=3000,
+            description="触发发送所需的最短语音时长（毫秒）；低于此时长的片段将被丢弃。",
+            label="最短语音 (ms)",
+            tag="ai",
+            order=2,
+        )
+        max_ms: int = Field(
+            default=15000,
+            ge=2000,
+            le=60000,
+            description="单次语音录制的最大时长（毫秒）；超出后强制发送。",
+            label="最长录制 (ms)",
+            tag="ai",
+            order=3,
+        )
+        pre_speech_ms: int = Field(
+            default=200,
+            ge=0,
+            le=1000,
+            description="发送语音时在起始前额外保留多少毫秒的预录缓冲，捕捉音头。",
+            label="预录缓冲 (ms)",
+            tag="ai",
+            order=4,
+        )
+
     @config_section("unified_event_stream", title="实时统一事件流", tag="network", order=40)
     class UnifiedEventStreamSection(SectionBase):
         sync_core_events_to_live: bool = Field(
@@ -376,6 +424,7 @@ class MiniCPMLiveBridgeConfig(BaseConfig):
     server: ServerSection = Field(default_factory=ServerSection)
     capture: CaptureSection = Field(default_factory=CaptureSection)
     session: SessionSection = Field(default_factory=SessionSection)
+    vad: VadSection = Field(default_factory=VadSection)
     unified_event_stream: UnifiedEventStreamSection = Field(default_factory=UnifiedEventStreamSection)
     context: ContextSection = Field(default_factory=ContextSection)
     debug: DebugSection = Field(default_factory=DebugSection)

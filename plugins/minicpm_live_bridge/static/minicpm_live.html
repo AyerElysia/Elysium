@@ -218,6 +218,23 @@
       header { align-items: flex-start; flex-direction: column; }
       .status-row { justify-content: flex-start; }
     }
+    .vad-meter {
+      display: flex;
+      align-items: center;
+      width: 72px;
+      height: 8px;
+      background: rgba(255,255,255,.12);
+      border-radius: 4px;
+      overflow: hidden;
+      flex-shrink: 0;
+    }
+    .vad-level-bar {
+      height: 100%;
+      width: 0%;
+      background: var(--muted);
+      border-radius: 4px;
+      transition: width 0.07s linear;
+    }
   </style>
 </head>
 <body>
@@ -230,6 +247,7 @@
         <span id="captureBadge" class="badge">capture idle</span>
         <span id="eventBadge" class="badge">events idle</span>
         <span id="wsBadge" class="badge">ws idle</span>
+        <span id="vadBadge" class="badge">vad off</span>
       </div>
     </header>
     <main>
@@ -239,12 +257,14 @@
             <button id="startBtn" class="primary">开始</button>
             <button id="stopBtn" class="danger" disabled>停止</button>
             <button id="voiceBtn" disabled>语音</button>
+            <button id="vadBtn" disabled>自动语音</button>
             <button id="interruptBtn" disabled>打断</button>
             <a id="externalLink" class="button" target="_blank" rel="noreferrer" hidden>外部前端</a>
           </div>
           <div class="metric">
             <span id="sessionText">session: -</span>
             <span id="frameText">frames: 0</span>
+            <div class="vad-meter"><div id="vadLevelBar" class="vad-level-bar"></div></div>
           </div>
         </div>
         <div class="preview-wrap">
@@ -281,6 +301,8 @@
       neoWs: null,
       recorder: null,
       localVoice: null,
+      vad: null,
+      vadTurnBusy: false,
       frameTimer: null,
       frameCount: 0,
       currentAudio: null,
@@ -299,6 +321,9 @@
       startBtn: document.getElementById('startBtn'),
       stopBtn: document.getElementById('stopBtn'),
       voiceBtn: document.getElementById('voiceBtn'),
+      vadBtn: document.getElementById('vadBtn'),
+      vadBadge: document.getElementById('vadBadge'),
+      vadLevelBar: document.getElementById('vadLevelBar'),
       interruptBtn: document.getElementById('interruptBtn'),
       externalLink: document.getElementById('externalLink'),
       sessionText: document.getElementById('sessionText'),
@@ -822,6 +847,7 @@
         el.interruptBtn.disabled = false;
         el.sendTextBtn.disabled = false;
         el.voiceBtn.disabled = false;
+        el.vadBtn.disabled = false;
         addLog('system', 'live session started');
         postEvent('session_started', 'system', 'live session started');
       } catch (error) {
@@ -837,6 +863,7 @@
       if (state.frameTimer) window.clearInterval(state.frameTimer);
       state.frameTimer = null;
       cancelLocalVoiceRecording();
+      stopVad();
       if (state.recorder && state.recorder.state !== 'inactive') state.recorder.stop();
       state.recorder = null;
       if (state.ws && state.ws.readyState === WebSocket.OPEN) {
@@ -861,6 +888,9 @@
       el.stopBtn.disabled = true;
       el.voiceBtn.disabled = true;
       el.voiceBtn.textContent = '语音';
+      el.vadBtn.disabled = true;
+      el.vadBtn.textContent = '自动语音';
+      el.vadBtn.classList.remove('primary');
       el.interruptBtn.disabled = true;
       el.sendTextBtn.disabled = true;
       stopSpokenOutput();
@@ -892,6 +922,8 @@
     }
 
     async function runLocalApiTurn(text, options = {}) {
+      state.vadTurnBusy = true;
+      if (state.vad) setBadge(el.vadBadge, 'vad busy', 'warn');
       el.sendTextBtn.disabled = true;
       el.voiceBtn.disabled = true;
       try {
@@ -933,8 +965,10 @@
         addLog('system', String(error), 'error');
         postClientDebug('error', 'local api turn failed', { error: String(error) });
       } finally {
+        state.vadTurnBusy = false;
+        if (state.vad) setBadge(el.vadBadge, 'vad listening', 'warn');
         el.sendTextBtn.disabled = !state.sessionId;
-        el.voiceBtn.disabled = !state.sessionId;
+        if (!state.vad) el.voiceBtn.disabled = !state.sessionId;
       }
     }
 
@@ -1084,9 +1118,148 @@
       }
     }
 
+    // ── VAD (实时语音活动检测) ─────────────────────────────────────────
+    function updateVadLevel(rms) {
+      if (!el.vadLevelBar) return;
+      const threshold = state.config?.vad?.threshold ?? 0.012;
+      const pct = Math.min(100, Math.round(rms / 0.12 * 100));
+      el.vadLevelBar.style.width = `${pct}%`;
+      el.vadLevelBar.style.background = rms >= threshold ? 'var(--accent)' : 'var(--muted)';
+    }
+
+    async function startVad() {
+      if (state.vad) return;
+      if (!state.audioStream) { addLog('system', 'VAD: 麦克风未启动', 'error'); return; }
+
+      const cfg = state.config?.vad || {};
+      const threshold    = Number(cfg.threshold    ?? 0.012);
+      const silenceMs    = Number(cfg.silence_ms   ?? 800);
+      const minSpeechMs  = Number(cfg.min_speech_ms ?? 300);
+      const maxMs        = Number(cfg.max_ms        ?? 15000);
+      const preSpeechMs  = Number(cfg.pre_speech_ms ?? 200);
+      const BUFFER_SIZE  = 2048;
+
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) throw new Error('当前浏览器不支持 AudioContext');
+      const audioContext    = new AudioContextClass();
+      const sampleRate      = audioContext.sampleRate;
+      const maxPreRollChunks = Math.max(1, Math.ceil((preSpeechMs / 1000) * sampleRate / BUFFER_SIZE));
+
+      const source    = audioContext.createMediaStreamSource(state.audioStream);
+      const processor = audioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);
+
+      let speaking      = false;
+      let silenceTimer  = null;
+      let maxTimer      = null;
+      let speechStartAt = null;
+      let recordChunks  = [];
+      let preRollBuffer = [];
+
+      function calcRms(ch) {
+        let s = 0;
+        for (let i = 0; i < ch.length; i++) s += ch[i] * ch[i];
+        return Math.sqrt(s / ch.length);
+      }
+
+      function triggerSend() {
+        speaking = false;
+        if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+        if (maxTimer)     { clearTimeout(maxTimer);     maxTimer = null;     }
+        const dur      = Date.now() - (speechStartAt || Date.now());
+        const captured = recordChunks.splice(0);
+        speechStartAt  = null;
+        if (dur < minSpeechMs || !captured.length) {
+          if (state.vad) setBadge(el.vadBadge, 'vad listening', 'warn');
+          return;
+        }
+        setBadge(el.vadBadge, 'vad sending', 'ok');
+        const wavBlob = encodeWav(captured, sampleRate);
+        blobToDataUrl(wavBlob).then(audioData => {
+          addLog('user', `[自动语音 ${(dur / 1000).toFixed(1)}s]`, 'user');
+          return runLocalApiTurn('', {
+            audioData,
+            audioMimeType: 'audio/wav',
+            payload: { input_mode: 'vad_voice', duration_ms: dur },
+          });
+        }).catch(err => {
+          addLog('system', `VAD 发送失败: ${err}`, 'error');
+        }).finally(() => {
+          if (state.vad) setBadge(el.vadBadge, 'vad listening', 'warn');
+        });
+      }
+
+      processor.onaudioprocess = event => {
+        if (!state.vad) return;
+        const channelData = event.inputBuffer.getChannelData(0);
+        const rms         = calcRms(channelData);
+        const chunk       = new Float32Array(channelData);
+        updateVadLevel(rms);
+
+        if (!speaking) {
+          preRollBuffer.push(chunk);
+          if (preRollBuffer.length > maxPreRollChunks) preRollBuffer.shift();
+
+          if (rms >= threshold && !state.vadTurnBusy) {
+            speaking      = true;
+            speechStartAt = Date.now();
+            recordChunks  = preRollBuffer.concat([chunk]);
+            preRollBuffer = [];
+            setBadge(el.vadBadge, 'vad speaking', 'ok');
+            stopSpokenOutput();
+            maxTimer = setTimeout(() => { if (speaking) triggerSend(); }, maxMs);
+          }
+        } else {
+          recordChunks.push(chunk);
+          const stopThreshold = threshold * 0.55;
+          if (rms < stopThreshold) {
+            if (!silenceTimer) {
+              silenceTimer = setTimeout(() => {
+                silenceTimer = null;
+                if (speaking) triggerSend();
+              }, silenceMs);
+            }
+          } else if (rms >= threshold) {
+            if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+          }
+        }
+        event.outputBuffer.getChannelData(0).fill(0);
+      };
+
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+
+      state.vad = { audioContext, source, processor };
+      setBadge(el.vadBadge, 'vad listening', 'warn');
+      el.vadBtn.textContent = '关闭自动';
+      el.vadBtn.classList.add('primary');
+      el.voiceBtn.disabled = true;
+      addLog('system', `VAD 已启动 (阈值=${threshold}, 静音=${silenceMs}ms, 最短=${minSpeechMs}ms)`);
+    }
+
+    function stopVad() {
+      const vad = state.vad;
+      if (!vad) return;
+      state.vad = null;
+      try { vad.processor.disconnect(); } catch {}
+      try { vad.source.disconnect();    } catch {}
+      try { vad.audioContext.close();   } catch {}
+      setBadge(el.vadBadge, 'vad off', '');
+      el.vadBtn.textContent = '自动语音';
+      el.vadBtn.classList.remove('primary');
+      if (state.sessionId) el.voiceBtn.disabled = false;
+      updateVadLevel(0);
+      addLog('system', 'VAD 已停止');
+    }
+
+    function toggleVad() {
+      if (state.vad) stopVad();
+      else startVad().catch(err => addLog('system', String(err), 'error'));
+    }
+
     el.startBtn.addEventListener('click', start);
     el.stopBtn.addEventListener('click', stop);
     el.voiceBtn.addEventListener('click', toggleVoiceTurn);
+    el.vadBtn.addEventListener('click', toggleVad);
     el.interruptBtn.addEventListener('click', interrupt);
     el.sendTextBtn.addEventListener('click', sendTextEvent);
     el.textInput.addEventListener('keydown', event => {

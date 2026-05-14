@@ -628,6 +628,13 @@ class MiniCPMLiveRouter(BaseRouter):
                 "stderr_mirror_enabled": bool(config.debug.stderr_mirror_enabled),
                 "preview_chars": int(config.debug.preview_chars),
             },
+            "vad": {
+                "threshold": float(config.vad.threshold),
+                "silence_ms": int(config.vad.silence_ms),
+                "min_speech_ms": int(config.vad.min_speech_ms),
+                "max_ms": int(config.vad.max_ms),
+                "pre_speech_ms": int(config.vad.pre_speech_ms),
+            },
             "protocol": "neo-minicpm-live-v0",
         }
 
