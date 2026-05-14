@@ -463,16 +463,9 @@ class MiniCPMRealtimeAdapter(BaseRealtimeAdapter):
             return RealtimeAdapterResult(client_messages=self._map_legacy_duplex_result(payload))
 
         if "choices" in payload:
-            return RealtimeAdapterResult(
-                client_messages=[
-                    {
-                        "type": "status",
-                        "status": "upstream.ack",
-                        "text": "MiniCPM upstream acknowledged request",
-                        "payload": payload,
-                    }
-                ]
-            )
+            # The model server sends an ack for every audio chunk — suppress it.
+            # Real responses arrive via the SSE side-channel (on_sse_event).
+            return RealtimeAdapterResult()
 
         return RealtimeAdapterResult(client_messages=[payload])
 
