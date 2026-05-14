@@ -451,3 +451,26 @@ def test_handle_raw_message_keeps_normal_private_message() -> None:
     )
 
     assert envelope is not None
+
+
+@pytest.mark.asyncio
+async def test_meta_event_handler_reconnects_when_heartbeat_times_out(monkeypatch) -> None:
+    """心跳超时时应触发适配器自动重连。"""
+
+    plugin = _build_napcat_plugin()
+    adapter = NapcatAdapter(core_sink=cast(Any, _FakeCoreSink()), plugin=plugin)
+    adapter.reconnect = AsyncMock()
+
+    handler = adapter.meta_event_handler
+    handler.last_heart_beat = 0.0
+    handler.interval = 0.01
+
+    monkeypatch.setattr(
+        "plugins.napcat_adapter.src.handlers.to_core.meta_event_handler.time.time",
+        lambda: 0.03,
+    )
+
+    await handler.check_heartbeat(123456789)
+
+    adapter.reconnect.assert_awaited_once()
+    assert handler._interval_checking is False

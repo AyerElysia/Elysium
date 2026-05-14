@@ -10,6 +10,7 @@ import asyncio
 import uuid
 from typing import TYPE_CHECKING, Any
 
+from src.kernel.concurrency import get_task_manager
 from src.kernel.event import get_event_bus, EventDecision
 from src.kernel.logger import get_logger
 from src.core.components.registry import get_global_registry
@@ -454,6 +455,19 @@ def initialize_adapter_manager() -> None:
     get_event_bus().subscribe(EventType.ON_ALL_PLUGIN_LOADED, on_all_plugins_loaded)
 
 
+async def _start_adapter_in_background(signature: str) -> None:
+    """后台启动单个适配器。"""
+    manager = get_adapter_manager()
+    try:
+        success = await manager.start_adapter(signature)
+        if success:
+            logger.info(f"适配器后台启动成功: {signature}")
+        else:
+            logger.error(f"❌ 适配器后台启动失败: {signature}")
+    except Exception as e:
+        logger.error(f"❌ 适配器后台启动异常 '{signature}': {e}")
+
+
 async def on_all_plugins_loaded(_: str, params: dict) -> tuple[EventDecision, dict]:
     """所有插件加载完毕后，启动所有注册的适配器。
 
@@ -475,26 +489,27 @@ async def on_all_plugins_loaded(_: str, params: dict) -> tuple[EventDecision, di
     logger.info(f"发现 {len(adapter_components)} 个适配器，开始启动...")
 
     # 启动所有适配器
-    manager = get_adapter_manager()
-    started_adapters = []
+    scheduled_adapters = []
     failed_adapters = []
+    tm = get_task_manager()
 
     for adapter_signature in adapter_components.keys():
         try:
-            success = await manager.start_adapter(adapter_signature)
-            if success:
-                started_adapters.append(adapter_signature)
-            else:
-                failed_adapters.append(adapter_signature)
-                logger.error(f"❌ 自动启动适配器失败: {adapter_signature}")
+            tm.create_task(
+                _start_adapter_in_background(adapter_signature),
+                name=f"start_{adapter_signature.replace(':', '_')}",
+                daemon=True,
+            )
+            scheduled_adapters.append(adapter_signature)
+            logger.info(f"适配器已转入后台启动: {adapter_signature}")
         except Exception as e:
             failed_adapters.append(adapter_signature)
             logger.error(f"❌ 启动适配器 '{adapter_signature}' 时发生异常: {e}")
 
     # 记录结果
     total = len(adapter_components)
-    success_count = len(started_adapters)
-    logger.info(f"适配器启动完成: 成功 {success_count}/{total}")
+    scheduled_count = len(scheduled_adapters)
+    logger.info(f"适配器启动完成: 已调度后台启动 {scheduled_count}/{total}")
 
     if failed_adapters:
         logger.warning(f"以下适配器启动失败: {', '.join(failed_adapters)}")
