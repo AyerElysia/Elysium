@@ -1874,6 +1874,12 @@ class MiniCPMLiveRouter(BaseRouter):
         try:
             import websockets
 
+            # Reset the upstream server's uid state before opening the WebSocket.
+            # For MiniCPM-o the server only resets stream_manager.uid on POST
+            # /api/v1/completions, so without this every first WS message gets
+            # "UID changed in stream".
+            await adapter.upstream_pre_connect()
+
             async with self._connect_upstream_websocket(
                 websockets,
                 url=adapter.upstream_connect_url(),

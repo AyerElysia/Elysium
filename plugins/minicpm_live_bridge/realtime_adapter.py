@@ -58,6 +58,13 @@ class BaseRealtimeAdapter:
     def upstream_connect_headers(self) -> dict[str, str]:
         return dict(self._upstream_headers)
 
+    async def upstream_pre_connect(self) -> None:
+        """Optional async hook called before the WebSocket connection is opened.
+
+        Override to perform any handshake/reset that must happen over HTTP
+        before the persistent WS connection is established.
+        """
+
     def upstream_sse_url(self) -> str | None:
         """Optional HTTP URL for the server-sent-events response stream.
 
@@ -206,6 +213,36 @@ class MiniCPMRealtimeAdapter(BaseRealtimeAdapter):
         except Exception:
             pass
         return base_url
+
+    async def upstream_pre_connect(self) -> None:
+        """POST to /api/v1/completions before the WS connection.
+
+        The model server only resets stream_manager.uid when POST /api/v1/completions
+        is called with the correct uid header.  Without this the server will reject
+        the first few WS messages with {"error":"UID changed in stream"} because
+        stream_manager.uid still holds the previous session's uid.
+        """
+        import aiohttp
+
+        uid_value = str(self.session_id or "neo_live")[:32]
+        try:
+            parsed = urllib.parse.urlparse(self._upstream_url)
+            scheme = "https" if parsed.scheme == "wss" else "http"
+            reset_url = urllib.parse.urlunparse(
+                (scheme, parsed.netloc, "/api/v1/completions", "", "", "")
+            )
+            headers = {"uid": uid_value, "Content-Type": "application/json"}
+            # Send a minimal payload so the endpoint doesn't 422 on missing body
+            body = {"messages": [], "reset_only": True}
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(reset_url, headers=headers, json=body) as resp:
+                    # We don't care about the response body — the important side
+                    # effect is that stream_manager.uid is now set to our uid.
+                    pass
+        except Exception:
+            # Best-effort; if the reset call fails we still proceed with WS.
+            pass
 
     def upstream_sse_url(self) -> str | None:
         """Derive the SSE response URL from the WebSocket upstream URL.
