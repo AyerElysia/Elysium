@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 from src.core.components.base.config import BaseConfig, Field, SectionBase, config_section
 
@@ -57,13 +57,34 @@ class MiniCPMLiveBridgeConfig(BaseConfig):
             tag="network",
             order=3,
         )
+        transport_mode: Literal["browser_direct", "neo_proxy"] = Field(
+            default="browser_direct",
+            description=(
+                "浏览器是直接连接外部 WebSocket，还是先连接 Neo 的代理 WebSocket。"
+                "neo_proxy 用于后续接入 provider-specific realtime adapter。"
+            ),
+            label="WebSocket 传输模式",
+            tag="network",
+            order=4,
+        )
+        protocol_adapter: Literal["passthrough", "minicpm_realtime_v0"] = Field(
+            default="passthrough",
+            description=(
+                "Neo 代理模式下使用的实时协议适配器。"
+                "passthrough 直接转发当前 neo live 协议；"
+                "minicpm_realtime_v0 适配 MiniCPM-o Realtime API。"
+            ),
+            label="实时协议适配器",
+            tag="network",
+            order=5,
+        )
         frontend_url: str = Field(
             default="",
             description="可选：外部服务器自带 WebRTC 前端地址；配置后页面会提供直接打开入口",
             label="外部前端地址",
             placeholder="http://127.0.0.1:7860",
             tag="network",
-            order=4,
+            order=6,
         )
         livekit_url: str = Field(
             default="",
@@ -71,7 +92,7 @@ class MiniCPMLiveBridgeConfig(BaseConfig):
             label="LiveKit 地址",
             placeholder="ws://127.0.0.1:7880",
             tag="network",
-            order=5,
+            order=7,
         )
         token_url: str = Field(
             default="",
@@ -79,14 +100,14 @@ class MiniCPMLiveBridgeConfig(BaseConfig):
             label="Token 地址",
             placeholder="/api/token",
             tag="security",
-            order=6,
+            order=8,
         )
         auth_header: str = Field(
             default="Authorization",
             description="Neo 服务端访问外部服务器时使用的认证 Header 名称",
             label="认证 Header",
             tag="security",
-            order=7,
+            order=9,
         )
         auth_token: str = Field(
             default="",
@@ -94,7 +115,7 @@ class MiniCPMLiveBridgeConfig(BaseConfig):
             label="服务器 Token",
             input_type="password",
             tag="security",
-            order=8,
+            order=10,
         )
         request_timeout_seconds: float = Field(
             default=3.0,
@@ -103,7 +124,7 @@ class MiniCPMLiveBridgeConfig(BaseConfig):
             description="健康检查和会话创建请求超时时间",
             label="请求超时",
             tag="performance",
-            order=9,
+            order=11,
         )
 
     @config_section("capture", title="浏览器采集", tag="general", order=20)
@@ -229,6 +250,25 @@ class MiniCPMLiveBridgeConfig(BaseConfig):
             label="TTS 风格",
             tag="ai",
             order=9,
+        )
+        full_duplex_default: bool = Field(
+            default=False,
+            description=(
+                "页面默认是否开启全双工模式（流式 LLM + 按句 TTS + 随时可打断）。"
+                "开启后用户讲话会立刻中止当前回复，模拟 Gemini Live 体验。"
+            ),
+            label="默认开启全双工",
+            tag="ai",
+            order=10,
+        )
+        full_duplex_sentence_min_chars: int = Field(
+            default=8,
+            ge=1,
+            le=200,
+            description="全双工模式下凑够多少字符就强制切句（防止长句缺标点不发声）。",
+            label="全双工最小句长",
+            tag="ai",
+            order=11,
         )
 
     @config_section("vad", title="实时语音检测 (VAD)", tag="ai", order=35)

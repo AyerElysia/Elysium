@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import inspect
 import time
 import urllib.error
 import urllib.parse
@@ -11,10 +12,10 @@ import urllib.request
 import uuid
 from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 from fastapi import HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from src.core.components.base.router import BaseRouter
@@ -25,6 +26,7 @@ from src.kernel.logger import get_logger
 
 from .config import MiniCPMLiveBridgeConfig
 from .debug_log import live_terminal_log
+from .realtime_adapter import build_realtime_adapter
 
 logger = get_logger("MiniCPM_Live", display="MiniCPM Live", color="#A6E3A1")
 
@@ -361,6 +363,37 @@ class MiniCPMLiveRouter(BaseRouter):
             self._log_live(f"Local turn total latency: {(t_done - t_turn_start):.3f}s (TTS: {(t_done - t_tts_start):.3f}s)")
             return {"success": True, "text": text, "tts_audio": tts_audio, "tts_mime_type": tts_mime_type}
 
+        @self.app.post("/api/turn/stream")
+        async def local_api_turn_stream(request: LiveTurnRequest, _: str = VerifiedDep) -> StreamingResponse:
+            config = self._config()
+            if not config.plugin.enabled:
+                raise HTTPException(status_code=503, detail="MiniCPM Live Bridge disabled")
+            if not config.session.enable_local_api_turn:
+                raise HTTPException(status_code=503, detail="local API turn disabled")
+            if not request.session_id:
+                raise HTTPException(status_code=400, detail="session_id is required")
+            if not (request.text.strip() or request.screen_image.strip() or request.audio_data.strip()):
+                raise HTTPException(status_code=400, detail="text, screen_image or audio_data is required")
+
+            self._log_live(
+                "MiniCPM Live full-duplex turn start: "
+                f"session={self._short_id(request.session_id)} "
+                f"text={self._preview(request.text)} "
+                f"has_audio={bool(request.audio_data.strip())} "
+                f"has_screen={bool(request.screen_image.strip())}"
+            )
+
+            generator = self._stream_local_api_turn(request)
+            return StreamingResponse(
+                generator,
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                    "Connection": "keep-alive",
+                },
+            )
+
         @self.app.get("/api/sessions/{session_id}")
         async def get_session(session_id: str, _: str = VerifiedDep) -> JSONResponse:
             session = self._sessions.get(session_id)
@@ -439,6 +472,17 @@ class MiniCPMLiveRouter(BaseRouter):
                     "MiniCPM Live unified ws disconnected: "
                     f"connections={connection_count}"
                 )
+
+        @self.app.websocket("/api/realtime/ws")
+        async def realtime_proxy_ws(
+            websocket: WebSocket,
+            session_id: str = Query(..., description="live session id"),
+            api_key: str = Query(..., description="API 密钥"),
+        ) -> None:
+            if not self._is_valid_api_key(api_key):
+                await websocket.close(code=4003, reason="无效的 API 密钥")
+                return
+            await self._serve_realtime_proxy(websocket=websocket, session_id=session_id)
 
     def _config(self) -> MiniCPMLiveBridgeConfig:
         config = getattr(self.plugin, "config", None)
@@ -556,17 +600,50 @@ class MiniCPMLiveRouter(BaseRouter):
             logger.warning(f"MiniCPM Live WebSocket API key 校验失败: {exc}")
             return False
 
+    @staticmethod
+    def _transport_mode(config: MiniCPMLiveBridgeConfig) -> str:
+        mode = str(getattr(config.server, "transport_mode", "browser_direct") or "browser_direct").strip().lower()
+        if mode not in {"browser_direct", "neo_proxy"}:
+            return "browser_direct"
+        return mode
+
+    @staticmethod
+    def _protocol_adapter_name(config: MiniCPMLiveBridgeConfig) -> str:
+        name = str(getattr(config.server, "protocol_adapter", "passthrough") or "passthrough").strip().lower()
+        if name not in {"passthrough", "minicpm_realtime_v0"}:
+            return "passthrough"
+        return name
+
+    def _upstream_websocket_url(self, config: MiniCPMLiveBridgeConfig, *, session_id: str = "") -> str:
+        url = self._resolve_ws_url(config, config.server.websocket_url)
+        return self._with_session_placeholder(url, session_id)
+
+    def _client_websocket_url(self, config: MiniCPMLiveBridgeConfig, *, session_id: str = "") -> str:
+        upstream_url = self._upstream_websocket_url(config, session_id=session_id)
+        if not upstream_url:
+            return ""
+        if self._transport_mode(config) == "neo_proxy":
+            proxy_url = (
+                f"{self.custom_route_path}/api/realtime/ws"
+                f"?session_id={{session_id}}&api_key={{api_key}}"
+            )
+            return self._with_session_placeholder(proxy_url, session_id)
+        return upstream_url
+
     def _client_config(self, *, session_id: str = "") -> dict[str, Any]:
         config = self._config()
         external_frontend_url = self._resolve_url(config, config.server.frontend_url)
-        websocket_url = self._resolve_ws_url(config, config.server.websocket_url)
+        websocket_url = self._client_websocket_url(config, session_id=session_id)
+        upstream_websocket_url = self._upstream_websocket_url(config, session_id=session_id)
         session_url = self._resolve_url(config, config.server.session_url)
         livekit_url = self._resolve_ws_url(config, config.server.livekit_url)
         token_url = self._resolve_url(config, config.server.token_url)
+        transport_mode = self._transport_mode(config)
+        protocol_adapter = self._protocol_adapter_name(config)
 
         mode = "unconfigured"
         if websocket_url:
-            mode = "ws_ingest"
+            mode = "neo_proxy_ws" if transport_mode == "neo_proxy" else "ws_ingest"
         elif external_frontend_url:
             mode = "external_frontend"
         elif bool(config.session.enable_local_api_turn):
@@ -581,7 +658,10 @@ class MiniCPMLiveRouter(BaseRouter):
                 "base_url": config.server.base_url.strip(),
                 "health_url": self._health_url(config),
                 "session_url": session_url,
-                "websocket_url": self._with_session_placeholder(websocket_url, session_id),
+                "websocket_url": websocket_url,
+                "upstream_websocket_url": upstream_websocket_url,
+                "transport_mode": transport_mode,
+                "protocol_adapter": protocol_adapter,
                 "frontend_url": external_frontend_url,
                 "livekit_url": livekit_url,
                 "token_url": token_url,
@@ -606,6 +686,8 @@ class MiniCPMLiveRouter(BaseRouter):
                     config.session.dispatch_user_transcript_to_chatter
                 ),
                 "tts_style": config.session.tts_style,
+                "full_duplex_default": bool(config.session.full_duplex_default),
+                "full_duplex_sentence_min_chars": int(config.session.full_duplex_sentence_min_chars),
             },
             "unified_event_stream": {
                 "sync_core_events_to_live": bool(config.unified_event_stream.sync_core_events_to_live),
@@ -638,8 +720,6 @@ class MiniCPMLiveRouter(BaseRouter):
                 "min_speech_ms": int(config.vad.min_speech_ms),
                 "max_ms": int(config.vad.max_ms),
                 "pre_speech_ms": int(config.vad.pre_speech_ms),
-                "sensitivity": float(config.vad.sensitivity),
-                "speech_ratio": float(config.vad.speech_ratio),
             },
             "protocol": "neo-minicpm-live-v0",
         }
@@ -713,9 +793,8 @@ class MiniCPMLiveRouter(BaseRouter):
             )
             await self._record_message_without_chatter(message, direction="sent")
 
-    async def _run_local_api_turn(self, request: LiveTurnRequest) -> str:
-        t0 = time.perf_counter()
-        """使用 config/model.toml 的 live 任务跑一轮半双工多模态 API。"""
+    async def _prepare_local_api_turn(self, request: LiveTurnRequest) -> dict[str, Any]:
+        """构建 LLM 请求所需的全部信息；半双工和全双工共享此逻辑。"""
         from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
         from src.kernel.llm import Audio, Image, LLMPayload, ROLE, Text
 
@@ -726,14 +805,17 @@ class MiniCPMLiveRouter(BaseRouter):
 
         user_text = request.text.strip()
         turn_event_type = "voice_input" if request.audio_data.strip() and not user_text else "text_input"
-        display_user_text = user_text or "[语音输入]"
+        display_user_text, turn_payload_patch = await self._resolve_live_turn_user_text(request)
+        turn_payload = dict(request.payload or {})
+        turn_payload.update(turn_payload_patch)
+
         t_prompt_start = time.perf_counter()
         prompt_bundle = await self._build_life_chatter_prompt_for_live_turn(
             request=request,
             display_user_text=display_user_text,
+            payload=turn_payload,
         )
-        t_prompt_done = time.perf_counter()
-        self._log_live(f"Prompt built in {(t_prompt_done - t_prompt_start):.3f}s")
+        self._log_live(f"Prompt built in {(time.perf_counter() - t_prompt_start):.3f}s")
         self._log_prompt_bundle_summary(
             prompt_bundle,
             session_id=request.session_id,
@@ -744,6 +826,7 @@ class MiniCPMLiveRouter(BaseRouter):
             request=request,
             event_type=turn_event_type,
             text=display_user_text,
+            payload=turn_payload,
         )
 
         system_prompt = str(prompt_bundle.get("system_prompt") or "").strip()
@@ -755,10 +838,7 @@ class MiniCPMLiveRouter(BaseRouter):
         session_events = list(prompt_bundle.get("session_events") or [])
         content: list[Any] = []
         user_prompt = str(prompt_bundle.get("user_prompt") or "").strip()
-        if user_prompt:
-            content.append(Text(user_prompt))
-        else:
-            content.append(Text(display_user_text))
+        content.append(Text(user_prompt or display_user_text))
 
         dynamic_context = str(prompt_bundle.get("dynamic_context") or "").strip()
         if dynamic_context:
@@ -803,15 +883,25 @@ class MiniCPMLiveRouter(BaseRouter):
                 )
             )
 
-        t_llm_start = time.perf_counter()
         llm_request.add_payload(LLMPayload(ROLE.USER, content))
-        response = await llm_request.send(stream=False)
-        text = (await response).strip()
-        t_llm_done = time.perf_counter()
-        self._log_live(f"LLM request done in {(t_llm_done - t_llm_start):.3f}s")
-        if not text:
-            text = "我这边没有拿到有效回复。"
 
+        return {
+            "llm_request": llm_request,
+            "model_task_name": model_task_name,
+            "display_user_text": display_user_text,
+            "turn_payload": turn_payload,
+        }
+
+    async def _finalize_local_api_turn(
+        self,
+        *,
+        request: LiveTurnRequest,
+        prep: dict[str, Any],
+        text: str,
+    ) -> None:
+        """LLM 回复完成后写入 ingest_live_event；半双工和全双工共用。"""
+        turn_payload = prep.get("turn_payload") or {}
+        model_task_name = prep.get("model_task_name") or "live"
         await self._ingest_live_event(
             LiveEventRequest(
                 session_id=request.session_id,
@@ -823,6 +913,9 @@ class MiniCPMLiveRouter(BaseRouter):
                     "mode": "local_api_turn",
                     "has_screen_image": bool(request.screen_image.strip()),
                     "has_audio_data": bool(request.audio_data.strip()),
+                    "voice_transcript": turn_payload.get("voice_transcript", ""),
+                    "voice_transcript_available": bool(turn_payload.get("voice_transcript_available")),
+                    "voice_transcript_source": turn_payload.get("voice_transcript_source", ""),
                     "request_payload": self._truncate_payload(request.payload),
                 },
             ),
@@ -836,7 +929,228 @@ class MiniCPMLiveRouter(BaseRouter):
                 "time": time.time(),
             },
         )
+
+    async def _run_local_api_turn(self, request: LiveTurnRequest) -> str:
+        """使用 config/model.toml 的 live 任务跑一轮半双工多模态 API。"""
+        t0 = time.perf_counter()
+        prep = await self._prepare_local_api_turn(request)
+        llm_request = prep["llm_request"]
+
+        t_llm_start = time.perf_counter()
+        response = await llm_request.send(stream=False)
+        text = (await response).strip()
+        self._log_live(f"LLM request done in {(time.perf_counter() - t_llm_start):.3f}s")
+        if not text:
+            text = "我这边没有拿到有效回复。"
+
+        await self._finalize_local_api_turn(request=request, prep=prep, text=text)
         return text
+
+    async def _stream_local_api_turn(self, request: LiveTurnRequest) -> AsyncIterator[bytes]:
+        """全双工 SSE 流：流式 LLM → 按句 TTS → 顺序推送 audio chunk。"""
+        config = self._config()
+        tts_style = (config.session.tts_style or "").strip()
+        min_chars = max(1, int(getattr(config.session, "full_duplex_sentence_min_chars", 8)))
+        sentence_punct = set("。！？.!?\n；;")
+
+        def sse(event: str, data: dict[str, Any]) -> bytes:
+            return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
+
+        try:
+            prep = await self._prepare_local_api_turn(request)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"MiniCPM Live 全双工 prep 失败: {exc}", exc_info=True)
+            yield sse("error", {"error": str(exc)})
+            return
+
+        llm_request = prep["llm_request"]
+        tts_service = self._get_tts_service() if tts_style else None
+        tts_mime_type = "audio/wav"
+        if tts_service is not None:
+            try:
+                media_type = str(
+                    getattr(getattr(tts_service, "_config", None), "tts_advanced", None) and
+                    getattr(tts_service._config.tts_advanced, "media_type", None) or "wav"
+                ).strip().lstrip(".") or "wav"
+                tts_mime_type = f"audio/{media_type}"
+            except Exception:
+                pass
+
+        sentence_queue: asyncio.Queue[tuple[int, str] | None] = asyncio.Queue()
+        audio_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        full_text_parts: list[str] = []
+
+        async def tts_worker() -> None:
+            """从 sentence_queue 取句子，按 seq 顺序串行 TTS，结果丢进 audio_queue。"""
+            while True:
+                item = await sentence_queue.get()
+                if item is None:
+                    await audio_queue.put(None)
+                    return
+                seq, sentence = item
+                if tts_service is None or not sentence.strip():
+                    await audio_queue.put({
+                        "seq": seq, "text": sentence, "audio": None, "mime": tts_mime_type,
+                    })
+                    continue
+                try:
+                    audio_b64 = await tts_service.generate_voice(sentence, tts_style)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"MiniCPM Live 全双工 TTS 失败 seq={seq}: {exc}")
+                    audio_b64 = None
+                await audio_queue.put({
+                    "seq": seq, "text": sentence, "audio": audio_b64, "mime": tts_mime_type,
+                })
+
+        tts_task = asyncio.create_task(tts_worker())
+
+        async def llm_worker() -> None:
+            """流式跑 LLM；按句切并入 sentence_queue。"""
+            buffer: list[str] = []
+            seq = [0]
+
+            async def flush_if_ready(force: bool) -> None:
+                joined = "".join(buffer)
+                if not joined.strip():
+                    if force:
+                        buffer.clear()
+                    return
+                if not force:
+                    last = joined[-1]
+                    if last not in sentence_punct and len(joined.strip()) < min_chars:
+                        return
+                    if last not in sentence_punct and len(joined.strip()) < min_chars * 2:
+                        return
+                seq[0] += 1
+                await sentence_queue.put((seq[0], joined.strip()))
+                buffer.clear()
+
+            try:
+                response = await llm_request.send(stream=True)
+
+                async def on_chunk(text_delta: str) -> None:
+                    if not text_delta:
+                        return
+                    full_text_parts.append(text_delta)
+                    for ch in text_delta:
+                        buffer.append(ch)
+                        if ch in sentence_punct:
+                            await flush_if_ready(force=True)
+                    if buffer and "".join(buffer).strip().__len__() >= min_chars * 3:
+                        await flush_if_ready(force=False)
+
+                await response.stream_with_callback(on_chunk)
+                await flush_if_ready(force=True)
+            finally:
+                await sentence_queue.put(None)
+
+        llm_task = asyncio.create_task(llm_worker())
+
+        text_seq = 0
+        try:
+            yield sse("start", {"session_id": request.session_id})
+
+            async def text_pump() -> AsyncIterator[bytes]:
+                nonlocal text_seq
+                # 我们靠 audio_queue 的 text 字段把文字也带回去；但希望 token 级延迟低，
+                # 因此每收到一个 audio 项就一起发 text_delta + audio。
+                while True:
+                    item = await audio_queue.get()
+                    if item is None:
+                        return
+                    text_seq += 1
+                    yield sse("text_delta", {"seq": text_seq, "text": item["text"]})
+                    if item.get("audio"):
+                        yield sse("audio", {
+                            "seq": text_seq,
+                            "audio_base64": item["audio"],
+                            "mime_type": item["mime"],
+                            "text": item["text"],
+                        })
+
+            async for chunk in text_pump():
+                yield chunk
+
+            await llm_task
+            await tts_task
+
+            final_text = "".join(full_text_parts).strip() or "我这边没有拿到有效回复。"
+            await self._finalize_local_api_turn(request=request, prep=prep, text=final_text)
+            yield sse("done", {"text": final_text})
+        except asyncio.CancelledError:
+            llm_task.cancel()
+            tts_task.cancel()
+            self._log_live("MiniCPM Live 全双工流被取消（客户端断开）")
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"MiniCPM Live 全双工流失败: {exc}", exc_info=True)
+            llm_task.cancel()
+            tts_task.cancel()
+            yield sse("error", {"error": str(exc)})
+
+
+    async def _resolve_live_turn_user_text(
+        self,
+        request: LiveTurnRequest,
+    ) -> tuple[str, dict[str, Any]]:
+        user_text = request.text.strip()
+        if user_text:
+            return user_text, {}
+
+        audio_data = request.audio_data.strip()
+        if not audio_data:
+            return "", {}
+
+        transcript = await self._transcribe_live_audio(
+            audio_data=audio_data,
+            audio_mime_type=request.audio_mime_type.strip(),
+        )
+        if transcript:
+            return transcript, {
+                "voice_transcript": transcript,
+                "voice_transcript_available": True,
+                "voice_transcript_source": "neo_media_manager_asr",
+            }
+
+        return "[语音输入]", {
+            "voice_transcript": "",
+            "voice_transcript_available": False,
+            "voice_transcript_source": "neo_media_manager_asr",
+        }
+
+    async def _transcribe_live_audio(
+        self,
+        *,
+        audio_data: str,
+        audio_mime_type: str,
+    ) -> str:
+        try:
+            from src.core.managers.media_manager import get_media_manager
+
+            payload: dict[str, Any] = {"base64": audio_data}
+            if audio_mime_type:
+                payload["mime_type"] = audio_mime_type
+
+            transcript = await get_media_manager().recognize_voice(payload, use_cache=True)
+            text = str(transcript or "").strip()
+            if text:
+                self._log_live(
+                    "MiniCPM Live ASR transcript: "
+                    f"chars={len(text)} text={self._preview(text)}"
+                )
+            else:
+                self._log_live(
+                    "MiniCPM Live ASR returned empty transcript",
+                    level="warning",
+                )
+            return text
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"MiniCPM Live 语音转写失败: {exc}", exc_info=True)
+            self._log_live(
+                f"MiniCPM Live ASR failed: {exc}",
+                level="warning",
+            )
+            return ""
 
     def _log_prompt_bundle_summary(
         self,
@@ -879,10 +1193,12 @@ class MiniCPMLiveRouter(BaseRouter):
         *,
         request: LiveTurnRequest,
         display_user_text: str,
+        payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         config = self._config()
         context_config = config.context
         prompt_bundle: dict[str, Any] = {}
+        message_payload = dict(payload or request.payload or {})
 
         chat_stream = await self._get_live_chat_stream()
         current_message = self._build_live_message(
@@ -893,7 +1209,7 @@ class MiniCPMLiveRouter(BaseRouter):
                 or f"live_current_{uuid.uuid4().hex}"
             ),
             event_type="voice_input" if request.audio_data.strip() and not request.text.strip() else "text_input",
-            metadata=request.payload,
+            metadata=message_payload,
         )
 
         try:
@@ -954,20 +1270,21 @@ class MiniCPMLiveRouter(BaseRouter):
         request: LiveTurnRequest,
         event_type: str,
         text: str,
+        payload: dict[str, Any] | None = None,
     ) -> None:
-        payload = dict(request.payload or {})
-        payload.setdefault("mode", "local_api_turn")
-        payload.setdefault("has_audio_data", bool(request.audio_data.strip()))
-        payload.setdefault("has_screen_image", bool(request.screen_image.strip()))
+        payload_data = dict(payload or request.payload or {})
+        payload_data.setdefault("mode", "local_api_turn")
+        payload_data.setdefault("has_audio_data", bool(request.audio_data.strip()))
+        payload_data.setdefault("has_screen_image", bool(request.screen_image.strip()))
         if request.audio_mime_type.strip():
-            payload.setdefault("audio_mime_type", request.audio_mime_type.strip())
+            payload_data.setdefault("audio_mime_type", request.audio_mime_type.strip())
         await self._ingest_live_event(
             LiveEventRequest(
                 session_id=request.session_id,
                 event_type=event_type,
                 role="user",
                 text=text,
-                payload=payload,
+                payload=payload_data,
             ),
             {
                 "id": f"evt_{uuid.uuid4().hex}",
@@ -975,7 +1292,7 @@ class MiniCPMLiveRouter(BaseRouter):
                 "event_type": event_type,
                 "role": "user",
                 "text": text,
-                "payload": payload,
+                "payload": payload_data,
                 "time": time.time(),
             },
         )
@@ -1311,6 +1628,252 @@ class MiniCPMLiveRouter(BaseRouter):
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"live 状态事件写入 life_engine 失败: {exc}")
+
+    def _ensure_live_session(self, session_id: str) -> None:
+        now = time.time()
+        session = self._sessions.setdefault(
+            session_id,
+            {
+                "session_id": session_id,
+                "client_name": "neo-web",
+                "mode": "screen_voice",
+                "metadata": {},
+                "created_at": now,
+            },
+        )
+        session["updated_at"] = now
+        self._events.setdefault(session_id, [])
+
+    @staticmethod
+    def _parse_realtime_message(raw: str | bytes) -> Any:
+        if isinstance(raw, (bytes, bytearray)):
+            return bytes(raw)
+        text = str(raw or "")
+        try:
+            return json.loads(text)
+        except Exception:
+            return text
+
+    async def _send_client_ws_payload(
+        self,
+        websocket: WebSocket,
+        payload: str | bytes | dict[str, Any],
+    ) -> None:
+        if isinstance(payload, (bytes, bytearray)):
+            await websocket.send_bytes(bytes(payload))
+            return
+        if isinstance(payload, dict):
+            await websocket.send_json(payload)
+            return
+        await websocket.send_text(str(payload))
+
+    @staticmethod
+    async def _send_upstream_ws_payload(
+        websocket: Any,
+        payload: str | bytes | dict[str, Any],
+    ) -> None:
+        if isinstance(payload, (bytes, bytearray)):
+            await websocket.send(bytes(payload))
+            return
+        if isinstance(payload, dict):
+            await websocket.send(json.dumps(payload, ensure_ascii=False))
+            return
+        await websocket.send(str(payload))
+
+    async def _flush_realtime_adapter_result(
+        self,
+        *,
+        client_websocket: WebSocket,
+        upstream_websocket: Any,
+        result: Any,
+    ) -> None:
+        for payload in list(getattr(result, "upstream_messages", []) or []):
+            await self._send_upstream_ws_payload(upstream_websocket, payload)
+        for payload in list(getattr(result, "client_messages", []) or []):
+            await self._send_client_ws_payload(client_websocket, payload)
+
+    async def _proxy_client_messages(
+        self,
+        *,
+        client_websocket: WebSocket,
+        upstream_websocket: Any,
+        adapter: Any,
+        session_id: str,
+    ) -> None:
+        while True:
+            message = await client_websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                raise WebSocketDisconnect(code=int(message.get("code") or 1000))
+            raw = message.get("bytes")
+            if raw is None:
+                raw = message.get("text", "")
+            payload = self._parse_realtime_message(raw)
+            result = await adapter.on_client_message(payload)
+            await self._flush_realtime_adapter_result(
+                client_websocket=client_websocket,
+                upstream_websocket=upstream_websocket,
+                result=result,
+            )
+            self._ensure_live_session(session_id)
+
+    @staticmethod
+    def _connect_upstream_websocket(
+        websockets_module: Any,
+        *,
+        url: str,
+        headers: dict[str, str],
+        open_timeout: float,
+    ) -> Any:
+        connect = websockets_module.connect
+        kwargs: dict[str, Any] = {
+            "open_timeout": open_timeout,
+            "close_timeout": 3,
+            "max_size": 16 * 1024 * 1024,
+        }
+        try:
+            parameters = inspect.signature(connect).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+
+        if "additional_headers" in parameters:
+            kwargs["additional_headers"] = headers
+        elif "extra_headers" in parameters:
+            kwargs["extra_headers"] = headers
+        elif headers:
+            kwargs["additional_headers"] = headers
+
+        if "proxy" in parameters:
+            kwargs["proxy"] = None
+
+        return connect(url, **kwargs)
+
+    async def _proxy_upstream_messages(
+        self,
+        *,
+        client_websocket: WebSocket,
+        upstream_websocket: Any,
+        adapter: Any,
+        session_id: str,
+    ) -> None:
+        async for raw in upstream_websocket:
+            payload = self._parse_realtime_message(raw)
+            result = await adapter.on_upstream_message(payload)
+            await self._flush_realtime_adapter_result(
+                client_websocket=client_websocket,
+                upstream_websocket=upstream_websocket,
+                result=result,
+            )
+            self._ensure_live_session(session_id)
+
+    async def _safe_send_proxy_error(self, websocket: WebSocket, message: str) -> None:
+        try:
+            await websocket.send_json({"type": "error", "message": message})
+        except Exception:
+            return
+
+    async def _serve_realtime_proxy(
+        self,
+        *,
+        websocket: WebSocket,
+        session_id: str,
+    ) -> None:
+        config = self._config()
+        if not config.plugin.enabled:
+            await websocket.close(code=4403, reason="MiniCPM Live Bridge disabled")
+            return
+        if self._transport_mode(config) != "neo_proxy":
+            await websocket.close(code=4404, reason="realtime proxy disabled")
+            return
+
+        upstream_url = self._upstream_websocket_url(config, session_id=session_id)
+        if not upstream_url:
+            await websocket.close(code=4404, reason="upstream websocket_url is empty")
+            return
+
+        self._ensure_live_session(session_id)
+        await websocket.accept()
+
+        adapter = build_realtime_adapter(
+            adapter_name=self._protocol_adapter_name(config),
+            session_id=session_id,
+            upstream_url=upstream_url,
+            upstream_headers=self._server_headers(config),
+        )
+
+        self._log_live(
+            "MiniCPM Live realtime proxy opening: "
+            f"session={self._short_id(session_id)} "
+            f"adapter={adapter.adapter_name} "
+            f"upstream={self._preview(upstream_url)}"
+        )
+
+        try:
+            import websockets
+
+            async with self._connect_upstream_websocket(
+                websockets,
+                url=adapter.upstream_connect_url(),
+                headers=adapter.upstream_connect_headers(),
+                open_timeout=float(config.server.request_timeout_seconds),
+            ) as upstream_websocket:
+                self._log_live(
+                    "MiniCPM Live realtime proxy connected: "
+                    f"session={self._short_id(session_id)} "
+                    f"state={self._preview(adapter.describe_state())}"
+                )
+                client_task = asyncio.create_task(
+                    self._proxy_client_messages(
+                        client_websocket=websocket,
+                        upstream_websocket=upstream_websocket,
+                        adapter=adapter,
+                        session_id=session_id,
+                    )
+                )
+                upstream_task = asyncio.create_task(
+                    self._proxy_upstream_messages(
+                        client_websocket=websocket,
+                        upstream_websocket=upstream_websocket,
+                        adapter=adapter,
+                        session_id=session_id,
+                    )
+                )
+
+                done, pending = await asyncio.wait(
+                    {client_task, upstream_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                for task in done:
+                    if task.cancelled():
+                        continue
+                    exc = task.exception()
+                    if exc is not None:
+                        raise exc
+        except WebSocketDisconnect:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"MiniCPM Live realtime proxy 失败: {exc}", exc_info=True)
+            self._log_live(
+                "MiniCPM Live realtime proxy failed: "
+                f"session={self._short_id(session_id)} "
+                f"adapter={adapter.adapter_name} error={exc}",
+                level="error",
+            )
+            await self._safe_send_proxy_error(websocket, f"realtime proxy error: {exc}")
+        finally:
+            self._log_live(
+                "MiniCPM Live realtime proxy closed: "
+                f"session={self._short_id(session_id)} "
+                f"adapter={adapter.adapter_name} "
+                f"state={self._preview(adapter.describe_state())}"
+            )
+            try:
+                await websocket.close()
+            except Exception:
+                return
 
     def _health_url(self, config: MiniCPMLiveBridgeConfig) -> str:
         if config.server.health_url.strip():

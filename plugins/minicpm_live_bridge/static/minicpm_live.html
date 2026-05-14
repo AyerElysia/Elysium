@@ -258,6 +258,7 @@
             <button id="stopBtn" class="danger" disabled>停止</button>
             <button id="voiceBtn" disabled>语音</button>
             <button id="vadBtn" disabled>自动语音</button>
+            <button id="duplexBtn" disabled>全双工: 关</button>
             <button id="interruptBtn" disabled>打断</button>
             <a id="externalLink" class="button" target="_blank" rel="noreferrer" hidden>外部前端</a>
           </div>
@@ -300,6 +301,8 @@
       ws: null,
       neoWs: null,
       recorder: null,
+      realtimePcm: null,
+      pcmPlayer: null,
       localVoice: null,
       vad: null,
       vadTurnBusy: false,
@@ -307,6 +310,10 @@
       frameCount: 0,
       currentAudio: null,
       currentSpeech: null,
+      fullDuplex: false,
+      currentTurn: null,
+      audioQueue: [],
+      audioPlaying: false,
       pendingUnifiedEvents: [],
       contextSnapshot: null,
       contextSnapshotPromise: null,
@@ -324,6 +331,7 @@
       vadBtn: document.getElementById('vadBtn'),
       vadBadge: document.getElementById('vadBadge'),
       vadLevelBar: document.getElementById('vadLevelBar'),
+      duplexBtn: document.getElementById('duplexBtn'),
       interruptBtn: document.getElementById('interruptBtn'),
       externalLink: document.getElementById('externalLink'),
       sessionText: document.getElementById('sessionText'),
@@ -424,6 +432,8 @@
         enabled: Boolean(config.enabled),
         local_api: Boolean(config.session?.enable_local_api_turn),
         websocket: Boolean(config.server?.websocket_url),
+        transport_mode: config.server?.transport_mode || '',
+        protocol_adapter: config.server?.protocol_adapter || '',
       });
 
       try {
@@ -448,14 +458,27 @@
     function renderConfig(config) {
       el.modeText.textContent = config.mode || '-';
       el.serverText.textContent = config.server?.base_url || '-';
-      el.wsText.textContent = config.server?.websocket_url || (
-        config.session?.enable_local_api_turn ? `local api: ${config.session?.model_task_name || 'live'}` : '-'
-      );
+      if (config.server?.websocket_url) {
+        if (config.server?.transport_mode === 'neo_proxy' && config.server?.upstream_websocket_url) {
+          el.wsText.textContent = `proxy -> ${config.server.upstream_websocket_url}`;
+        } else {
+          el.wsText.textContent = config.server.websocket_url;
+        }
+      } else {
+        el.wsText.textContent = config.session?.enable_local_api_turn
+          ? `local api: ${config.session?.model_task_name || 'live'}`
+          : '-';
+      }
       if (config.server?.frontend_url) {
         el.externalLink.hidden = false;
         el.externalLink.href = config.server.frontend_url;
       } else {
         el.externalLink.hidden = true;
+      }
+      if (typeof config.session?.full_duplex_default === 'boolean') {
+        state.fullDuplex = config.session.full_duplex_default;
+        el.duplexBtn.textContent = `全双工: ${state.fullDuplex ? '开' : '关'}`;
+        el.duplexBtn.classList.toggle('primary', state.fullDuplex);
       }
     }
 
@@ -559,7 +582,8 @@
     }
 
     function connectWebSocket() {
-      const url = state.config.server?.websocket_url || '';
+      const template = state.config.server?.websocket_url || '';
+      const url = resolveWebSocketUrlTemplate(template);
       if (!url) {
         setBadge(el.wsBadge, 'ws unset', 'warn');
         addLog('system', '未配置 websocket_url，仅启动本地采集预览。');
@@ -569,7 +593,11 @@
       state.ws = new WebSocket(url);
       state.ws.onopen = () => {
         setBadge(el.wsBadge, 'ws connected', 'ok');
-        postClientDebug('info', 'external websocket opened', { url });
+        postClientDebug('info', 'external websocket opened', {
+          url,
+          transport_mode: state.config.server?.transport_mode || '',
+          protocol_adapter: state.config.server?.protocol_adapter || '',
+        });
         sendJson({
           type: 'session.start',
           protocol: state.config.protocol,
@@ -597,6 +625,24 @@
         postClientDebug('error', 'external websocket error', { url });
       };
       state.ws.onmessage = event => handleServerMessage(event.data);
+    }
+
+    function resolveWebSocketUrlTemplate(template) {
+      let text = String(template || '').trim();
+      if (!text) return '';
+      if (state.sessionId) text = text.replaceAll('{session_id}', encodeURIComponent(state.sessionId));
+      if (token) text = text.replaceAll('{api_key}', encodeURIComponent(token));
+      if (text.startsWith('ws://') || text.startsWith('wss://')) return text;
+      if (text.startsWith('http://') || text.startsWith('https://')) {
+        const url = new URL(text);
+        url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+        return url.toString();
+      }
+      if (text.startsWith('/')) {
+        const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        return `${scheme}//${window.location.host}${text}`;
+      }
+      return text;
     }
 
     function connectNeoUnifiedStream() {
@@ -729,6 +775,10 @@
 
     function startAudioChunks() {
       if (!state.ws || !state.audioStream) return;
+      if (isMiniCPMRealtimeAdapter()) {
+        startRealtimePcmChunks();
+        return;
+      }
       const preferred = state.config.capture.audio_mime_type || 'audio/webm;codecs=opus';
       const mimeType = MediaRecorder.isTypeSupported(preferred) ? preferred : '';
       state.recorder = new MediaRecorder(state.audioStream, mimeType ? { mimeType } : undefined);
@@ -746,6 +796,68 @@
       state.recorder.start(Number(state.config.capture.audio_chunk_ms || 250));
     }
 
+    function isMiniCPMRealtimeAdapter() {
+      return state.config?.server?.transport_mode === 'neo_proxy'
+        && state.config?.server?.protocol_adapter === 'minicpm_realtime_v0';
+    }
+
+    function startRealtimePcmChunks() {
+      if (state.realtimePcm || !state.audioStream) return;
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) throw new Error('当前浏览器不支持 AudioContext。');
+
+      const audioContext = new AudioContextClass();
+      const source = audioContext.createMediaStreamSource(state.audioStream);
+      const processor = audioContext.createScriptProcessor(4096, 1, 1);
+      const chunkMs = Math.max(250, Number(state.config.capture.audio_chunk_ms || 250));
+      const targetSampleRate = 16000;
+      const buffers = [];
+      let bufferedSamples = 0;
+
+      processor.onaudioprocess = event => {
+        if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+        const input = event.inputBuffer.getChannelData(0);
+        const copy = new Float32Array(input);
+        buffers.push(copy);
+        bufferedSamples += copy.length;
+
+        const threshold = Math.max(1, Math.round(audioContext.sampleRate * chunkMs / 1000));
+        if (bufferedSamples < threshold) return;
+
+        const merged = mergeFloat32(buffers.splice(0));
+        bufferedSamples = 0;
+        const pcm16k = resampleFloat32(merged, audioContext.sampleRate, targetSampleRate);
+        sendJson({
+          type: 'audio.chunk',
+          session_id: state.sessionId,
+          timestamp: Date.now(),
+          encoding: 'pcm_float32',
+          sample_rate: targetSampleRate,
+          channels: 1,
+          mime_type: 'audio/pcm;encoding=float32;rate=16000',
+          data: float32ToBase64(pcm16k),
+        });
+      };
+
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+      state.realtimePcm = { audioContext, source, processor };
+      postClientDebug('info', 'realtime pcm capture started', {
+        source_sample_rate: audioContext.sampleRate,
+        target_sample_rate: targetSampleRate,
+        chunk_ms: chunkMs,
+      });
+    }
+
+    function stopRealtimePcmChunks() {
+      const pcm = state.realtimePcm;
+      if (!pcm) return;
+      state.realtimePcm = null;
+      try { pcm.processor.disconnect(); } catch {}
+      try { pcm.source.disconnect(); } catch {}
+      try { pcm.audioContext.close(); } catch {}
+    }
+
     function blobToDataUrl(blob) {
       return new Promise((resolve, reject) => {
         const reader = new FileReader();
@@ -753,6 +865,38 @@
         reader.onerror = () => reject(reader.error);
         reader.readAsDataURL(blob);
       });
+    }
+
+    function float32ToBase64(samples) {
+      const bytes = new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength);
+      let binary = '';
+      const step = 0x8000;
+      for (let i = 0; i < bytes.length; i += step) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + step));
+      }
+      return btoa(binary);
+    }
+
+    function base64ToFloat32(base64) {
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+      return new Float32Array(bytes.buffer);
+    }
+
+    function resampleFloat32(input, fromRate, toRate) {
+      if (!input?.length || fromRate === toRate) return input || new Float32Array();
+      const ratio = fromRate / toRate;
+      const outputLength = Math.max(1, Math.round(input.length / ratio));
+      const output = new Float32Array(outputLength);
+      for (let i = 0; i < outputLength; i += 1) {
+        const position = i * ratio;
+        const left = Math.floor(position);
+        const right = Math.min(input.length - 1, left + 1);
+        const weight = position - left;
+        output[i] = input[left] * (1 - weight) + input[right] * weight;
+      }
+      return output;
     }
 
     function handleServerMessage(raw) {
@@ -764,7 +908,10 @@
       }
 
       const type = message.type || 'message';
-      if (type === 'transcript' || type === 'partial' || type === 'final') {
+      if (type === 'partial') {
+        const text = message.text || '';
+        if (text) addLog(message.role || 'assistant', text, 'assistant');
+      } else if (type === 'transcript' || type === 'final') {
         const role = message.role || 'assistant';
         const text = message.text || '';
         addLog(role, text, role === 'user' ? 'user' : 'assistant');
@@ -775,6 +922,11 @@
           postEvent('audio.reply', 'assistant', message.text, message);
         }
         playAudioMessage(message);
+      } else if (type === 'listen') {
+        stopPcmOutput();
+        setBadge(el.wsBadge, 'ws listening', 'ok');
+      } else if (type === 'status') {
+        addLog('server', message.text || message.status || JSON.stringify(message));
       } else if (String(type).startsWith('screen.')) {
         const text = message.text || message.summary || message.description || '';
         addLog('screen', text || JSON.stringify(message));
@@ -787,6 +939,10 @@
     }
 
     function playAudioMessage(message) {
+      if (message.encoding === 'pcm_float32' && message.audio_base64) {
+        playPcmFloat32Chunk(message.audio_base64, Number(message.sample_rate || 24000));
+        return;
+      }
       let src = message.audio_url || '';
       if (!src && message.audio_base64) {
         const mime = message.mime_type || 'audio/wav';
@@ -798,11 +954,59 @@
       state.currentAudio.play().catch(error => addLog('audio', String(error), 'error'));
     }
 
+    function ensurePcmPlayer(sampleRate) {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) throw new Error('当前浏览器不支持 AudioContext。');
+      if (!state.pcmPlayer || state.pcmPlayer.audioContext.state === 'closed') {
+        const audioContext = new AudioContextClass();
+        state.pcmPlayer = {
+          audioContext,
+          nextTime: 0,
+          sources: [],
+          sampleRate: sampleRate || 24000,
+        };
+      }
+      return state.pcmPlayer;
+    }
+
+    function playPcmFloat32Chunk(base64, sourceSampleRate) {
+      const player = ensurePcmPlayer(sourceSampleRate);
+      const ctx = player.audioContext;
+      if (ctx.state === 'suspended') ctx.resume();
+
+      const samples = base64ToFloat32(base64);
+      if (!samples.length) return;
+      const output = resampleFloat32(samples, sourceSampleRate || 24000, ctx.sampleRate);
+      const buffer = ctx.createBuffer(1, output.length, ctx.sampleRate);
+      buffer.getChannelData(0).set(output);
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      const startAt = Math.max(ctx.currentTime + 0.04, player.nextTime || 0);
+      source.start(startAt);
+      player.nextTime = startAt + buffer.duration;
+      player.sources.push(source);
+      source.onended = () => {
+        const index = player.sources.indexOf(source);
+        if (index >= 0) player.sources.splice(index, 1);
+      };
+    }
+
+    function stopPcmOutput() {
+      const player = state.pcmPlayer;
+      if (!player) return;
+      for (const source of player.sources.splice(0)) {
+        try { source.stop(); } catch {}
+      }
+      player.nextTime = player.audioContext.currentTime;
+    }
+
     function stopSpokenOutput() {
       if (state.currentAudio) {
         state.currentAudio.pause();
         state.currentAudio = null;
       }
+      stopPcmOutput();
       if ('speechSynthesis' in window) window.speechSynthesis.cancel();
       state.currentSpeech = null;
     }
@@ -828,19 +1032,18 @@
         if (!state.config) await loadConfig();
         if (!state.config?.enabled) throw new Error('MiniCPM Live Bridge disabled');
         await createSession();
+        const initialContext = await loadContextSnapshot();
         await startCapture();
         connectNeoUnifiedStream();
         connectWebSocket();
-        loadContextSnapshot().then(snapshot => {
-          if (!snapshot) return;
-          const unifiedCount = snapshot.unified_events?.length || 0;
-          const sessionCount = snapshot.session_events?.length || 0;
+        if (initialContext) {
+          const unifiedCount = initialContext.unified_events?.length || 0;
+          const sessionCount = initialContext.session_events?.length || 0;
           addLog(
             'system',
-            `context ready: life=${snapshot.life_runtime_available ? 'on' : 'empty'}, unified=${unifiedCount}, session=${sessionCount}`
+            `context ready: life=${initialContext.life_runtime_available ? 'on' : 'empty'}, unified=${unifiedCount}, session=${sessionCount}`
           );
-          sendContextSnapshot(snapshot);
-        });
+        }
         startScreenFrames();
         window.setTimeout(startAudioChunks, 300);
         el.stopBtn.disabled = false;
@@ -848,6 +1051,7 @@
         el.sendTextBtn.disabled = false;
         el.voiceBtn.disabled = false;
         el.vadBtn.disabled = false;
+        el.duplexBtn.disabled = false;
         addLog('system', 'live session started');
         postEvent('session_started', 'system', 'live session started');
       } catch (error) {
@@ -866,6 +1070,7 @@
       stopVad();
       if (state.recorder && state.recorder.state !== 'inactive') state.recorder.stop();
       state.recorder = null;
+      stopRealtimePcmChunks();
       if (state.ws && state.ws.readyState === WebSocket.OPEN) {
         sendJson({ type: 'session.stop', session_id: state.sessionId, timestamp: Date.now() });
       }
@@ -891,9 +1096,14 @@
       el.vadBtn.disabled = true;
       el.vadBtn.textContent = '自动语音';
       el.vadBtn.classList.remove('primary');
+      el.duplexBtn.disabled = true;
       el.interruptBtn.disabled = true;
       el.sendTextBtn.disabled = true;
       stopSpokenOutput();
+      if (state.pcmPlayer) {
+        try { state.pcmPlayer.audioContext.close(); } catch {}
+        state.pcmPlayer = null;
+      }
       if (state.sessionId) await postEvent('session_stopped', 'system', 'live session stopped');
     }
 
@@ -922,6 +1132,9 @@
     }
 
     async function runLocalApiTurn(text, options = {}) {
+      if (state.fullDuplex) {
+        return runLocalApiTurnStreaming(text, options);
+      }
       state.vadTurnBusy = true;
       if (state.vad) setBadge(el.vadBadge, 'vad busy', 'warn');
       el.sendTextBtn.disabled = true;
@@ -965,6 +1178,164 @@
         addLog('system', String(error), 'error');
         postClientDebug('error', 'local api turn failed', { error: String(error) });
       } finally {
+        state.vadTurnBusy = false;
+        if (state.vad) setBadge(el.vadBadge, 'vad listening', 'warn');
+        el.sendTextBtn.disabled = !state.sessionId;
+        if (!state.vad) el.voiceBtn.disabled = !state.sessionId;
+      }
+    }
+
+    function toggleFullDuplex() {
+      state.fullDuplex = !state.fullDuplex;
+      el.duplexBtn.textContent = `全双工: ${state.fullDuplex ? '开' : '关'}`;
+      el.duplexBtn.classList.toggle('primary', state.fullDuplex);
+      addLog('system', `full-duplex mode ${state.fullDuplex ? 'ON' : 'OFF'}`);
+      postClientDebug('info', 'full_duplex toggled', { enabled: state.fullDuplex });
+      if (!state.fullDuplex) {
+        abortStreamingTurn();
+      }
+    }
+
+    function abortStreamingTurn() {
+      if (state.currentTurn) {
+        try { state.currentTurn.abort(); } catch {}
+        state.currentTurn = null;
+      }
+      state.audioQueue = [];
+      state.audioPlaying = false;
+      stopSpokenOutput();
+    }
+
+    function enqueueAudioChunk(item) {
+      state.audioQueue.push(item);
+      state.audioQueue.sort((a, b) => a.seq - b.seq);
+      drainAudioQueue();
+    }
+
+    function drainAudioQueue() {
+      if (state.audioPlaying) return;
+      const next = state.audioQueue.shift();
+      if (!next) return;
+      state.audioPlaying = true;
+      try {
+        const src = `data:${next.mime_type};base64,${next.audio_base64}`;
+        const audio = new Audio(src);
+        state.currentAudio = audio;
+        audio.addEventListener('ended', () => {
+          state.audioPlaying = false;
+          if (state.currentAudio === audio) state.currentAudio = null;
+          drainAudioQueue();
+        });
+        audio.addEventListener('error', () => {
+          state.audioPlaying = false;
+          if (state.currentAudio === audio) state.currentAudio = null;
+          drainAudioQueue();
+        });
+        audio.play().catch(err => {
+          addLog('audio', String(err), 'error');
+          state.audioPlaying = false;
+          drainAudioQueue();
+        });
+      } catch (err) {
+        addLog('audio', String(err), 'error');
+        state.audioPlaying = false;
+        drainAudioQueue();
+      }
+    }
+
+    async function runLocalApiTurnStreaming(text, options = {}) {
+      // 打断旧轮（如果有）
+      abortStreamingTurn();
+      const controller = new AbortController();
+      state.currentTurn = controller;
+      state.vadTurnBusy = true;
+      if (state.vad) setBadge(el.vadBadge, 'vad full-duplex', 'warn');
+      el.sendTextBtn.disabled = true;
+      el.voiceBtn.disabled = true;
+
+      let assistantBuf = '';
+      try {
+        const frame = captureScreenFrame();
+        postClientDebug('info', 'full-duplex turn requested', {
+          has_text: Boolean(text),
+          has_audio: Boolean(options.audioData),
+          has_screen: Boolean(frame?.image),
+        });
+        const headers = { 'Content-Type': 'application/json' };
+        if (token) headers['X-API-Key'] = token;
+        const response = await fetch(`${apiBase}/turn/stream`, {
+          method: 'POST',
+          headers,
+          signal: controller.signal,
+          body: JSON.stringify({
+            session_id: state.sessionId,
+            text,
+            screen_image: frame?.image || '',
+            audio_data: options.audioData || '',
+            audio_mime_type: options.audioMimeType || '',
+            payload: Object.assign({}, options.payload || {}, frame ? {
+              screen_width: frame.width,
+              screen_height: frame.height,
+              screen_timestamp: frame.timestamp,
+            } : {}),
+          }),
+        });
+        if (!response.ok || !response.body) {
+          const errText = await response.text().catch(() => '');
+          throw new Error(`stream failed: ${response.status} ${errText}`);
+        }
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let buffer = '';
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let idx;
+          while ((idx = buffer.indexOf('\n\n')) !== -1) {
+            const block = buffer.slice(0, idx);
+            buffer = buffer.slice(idx + 2);
+            if (!block.trim()) continue;
+            let evt = 'message';
+            let dataStr = '';
+            for (const line of block.split('\n')) {
+              if (line.startsWith('event:')) evt = line.slice(6).trim();
+              else if (line.startsWith('data:')) dataStr += line.slice(5).trim();
+            }
+            if (!dataStr) continue;
+            let data;
+            try { data = JSON.parse(dataStr); } catch { continue; }
+            if (evt === 'text_delta') {
+              assistantBuf += data.text || '';
+            } else if (evt === 'audio') {
+              if (data.audio_base64) {
+                enqueueAudioChunk({
+                  seq: data.seq || 0,
+                  audio_base64: data.audio_base64,
+                  mime_type: data.mime_type || 'audio/wav',
+                });
+              }
+            } else if (evt === 'done') {
+              if (data.text) {
+                addLog('assistant', data.text, 'assistant');
+              } else if (assistantBuf) {
+                addLog('assistant', assistantBuf, 'assistant');
+              }
+            } else if (evt === 'error') {
+              addLog('system', `full-duplex stream error: ${data.error}`, 'error');
+            }
+          }
+        }
+        postClientDebug('info', 'full-duplex turn completed', { reply_chars: assistantBuf.length });
+      } catch (error) {
+        if (error?.name === 'AbortError') {
+          addLog('system', 'full-duplex turn aborted');
+        } else {
+          addLog('system', String(error), 'error');
+          postClientDebug('error', 'full-duplex turn failed', { error: String(error) });
+        }
+      } finally {
+        if (state.currentTurn === controller) state.currentTurn = null;
         state.vadTurnBusy = false;
         if (state.vad) setBadge(el.vadBadge, 'vad listening', 'warn');
         el.sendTextBtn.disabled = !state.sessionId;
@@ -1040,7 +1411,7 @@
       addLog('user', `[voice ${Math.round(durationMs / 100) / 10}s]`, 'user');
 
       if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-        await postEvent('voice_input', 'user', '[语音输入]', {
+        postClientDebug('info', 'voice turn sent to external websocket', {
           duration_ms: durationMs,
           mime_type: 'audio/wav',
         });
@@ -1179,8 +1550,12 @@
           redemptionMs:   silenceMs,
 
           onSpeechStart: () => {
-            if (!state.vadTurnBusy) {
-              setBadge(el.vadBadge, 'vad speaking', 'ok');
+            setBadge(el.vadBadge, 'vad speaking', 'ok');
+            if (state.fullDuplex) {
+              // 全双工：用户开口立刻打断当前回复
+              abortStreamingTurn();
+              postClientDebug('info', 'full-duplex barge-in');
+            } else if (!state.vadTurnBusy) {
               stopSpokenOutput();
             }
           },
@@ -1189,7 +1564,14 @@
           },
           onSpeechEnd: (audio) => {
             // audio: Float32Array at 16000 Hz, Silero-confirmed human speech
-            if (state.vadTurnBusy) {
+            if (isMiniCPMRealtimeAdapter() && state.ws?.readyState === WebSocket.OPEN) {
+              if (state.vad) setBadge(el.vadBadge, 'vad listening', 'warn');
+              postClientDebug('info', 'VAD segment ignored because realtime PCM stream is active', {
+                duration_ms: Math.round(audio.length / 16000 * 1000),
+              });
+              return;
+            }
+            if (state.vadTurnBusy && !state.fullDuplex) {
               if (state.vad) setBadge(el.vadBadge, 'vad listening', 'warn');
               return;
             }
@@ -1253,6 +1635,7 @@
     el.stopBtn.addEventListener('click', stop);
     el.voiceBtn.addEventListener('click', toggleVoiceTurn);
     el.vadBtn.addEventListener('click', toggleVad);
+    el.duplexBtn.addEventListener('click', toggleFullDuplex);
     el.interruptBtn.addEventListener('click', interrupt);
     el.sendTextBtn.addEventListener('click', sendTextEvent);
     el.textInput.addEventListener('keydown', event => {
