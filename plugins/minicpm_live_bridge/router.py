@@ -1814,8 +1814,9 @@ class MiniCPMLiveRouter(BaseRouter):
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     async with session.get(sse_url, headers=headers) as resp:
                         if resp.status != 200:
+                            body_preview = (await resp.text())[:200]
                             self._log_live(
-                                f"SSE upstream returned {resp.status}: {await resp.text()[:200]}",
+                                f"SSE upstream returned {resp.status}: {body_preview}",
                                 level="warning",
                             )
                             await asyncio.sleep(2)

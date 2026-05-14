@@ -1589,8 +1589,11 @@
           onSpeechStart: () => {
             setBadge(el.vadBadge, 'vad speaking', 'ok');
             if (state.fullDuplex) {
-              // 全双工：用户开口立刻打断当前回复
+              // 全双工：用户开口立刻打断当前回复，并通知上游停止生成
               abortStreamingTurn();
+              if (isMiniCPMRealtimeAdapter() && state.ws?.readyState === WebSocket.OPEN) {
+                sendJson({ type: 'session.interrupt', session_id: state.sessionId, timestamp: Date.now() });
+              }
               postClientDebug('info', 'full-duplex barge-in');
             } else if (!state.vadTurnBusy) {
               stopSpokenOutput();

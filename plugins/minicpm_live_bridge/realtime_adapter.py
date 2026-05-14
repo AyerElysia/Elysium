@@ -58,6 +58,9 @@ class BaseRealtimeAdapter:
     def upstream_connect_headers(self) -> dict[str, str]:
         return dict(self._upstream_headers)
 
+    async def interrupt_upstream(self) -> None:
+        """Optional async hook to stop upstream generation for barge-in."""
+
     async def upstream_pre_connect(self) -> None:
         """Optional async hook called before the WebSocket connection is opened.
 
@@ -214,6 +217,11 @@ class MiniCPMRealtimeAdapter(BaseRealtimeAdapter):
             pass
         return base_url
 
+    def _upstream_http_url(self, path: str) -> str:
+        parsed = urllib.parse.urlparse(self._upstream_url)
+        scheme = "https" if parsed.scheme == "wss" else "http"
+        return urllib.parse.urlunparse((scheme, parsed.netloc, path, "", "", ""))
+
     async def upstream_pre_connect(self) -> None:
         """POST to /api/v1/completions before the WS connection.
 
@@ -226,11 +234,7 @@ class MiniCPMRealtimeAdapter(BaseRealtimeAdapter):
 
         uid_value = str(self.session_id or "neo_live")[:32]
         try:
-            parsed = urllib.parse.urlparse(self._upstream_url)
-            scheme = "https" if parsed.scheme == "wss" else "http"
-            reset_url = urllib.parse.urlunparse(
-                (scheme, parsed.netloc, "/api/v1/completions", "", "", "")
-            )
+            reset_url = self._upstream_http_url("/api/v1/completions")
             headers = {"uid": uid_value, "Content-Type": "application/json"}
             # Send a minimal payload so the endpoint doesn't 422 on missing body
             body = {"messages": [], "reset_only": True}
@@ -243,6 +247,17 @@ class MiniCPMRealtimeAdapter(BaseRealtimeAdapter):
         except Exception:
             # Best-effort; if the reset call fails we still proceed with WS.
             pass
+
+    async def interrupt_upstream(self) -> None:
+        import aiohttp
+
+        uid_value = str(self.session_id or "neo_live")[:32]
+        stop_url = self._upstream_http_url("/api/v1/stop")
+        headers = {"uid": uid_value, "Content-Type": "application/json"}
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(stop_url, headers=headers, json={}) as _resp:
+                return
 
     def upstream_sse_url(self) -> str | None:
         """Derive the SSE response URL from the WebSocket upstream URL.
@@ -350,18 +365,19 @@ class MiniCPMRealtimeAdapter(BaseRealtimeAdapter):
             return self._handle_audio_input(payload)
 
         if packet_type == "session.interrupt":
-            # Send a silent WAV chunk with force_listen to signal barge-in
+            await self.interrupt_upstream()
             return RealtimeAdapterResult(
-                upstream_messages=[
-                    self._build_audio_append(
-                        self._silence_pcm_base64(samples=4000),
-                        force_listen=True,
-                    )
+                client_messages=[
+                    {
+                        "type": "status",
+                        "status": "session.interrupt",
+                        "text": "interrupt sent to upstream",
+                    }
                 ]
             )
 
         if packet_type == "session.stop":
-            # Model server uses /api/v1/stop — just close gracefully on our side
+            await self.interrupt_upstream()
             return RealtimeAdapterResult()
 
         if packet_type == "text.input":
