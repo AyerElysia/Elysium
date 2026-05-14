@@ -194,3 +194,151 @@ def build_chat_history_text(
         )
         for entry in entries
     )
+
+
+async def collect_global_chat_history_entries_from_db(
+    current_stream: Any,
+    *,
+    max_messages: int | None = 30,
+    stream_manager: Any | None = None,
+    exclude_message_ids: set[str] | None = None,
+) -> list[ChatHistoryEntry]:
+    """从统一消息库构建跨 stream 的最近聊天历史。
+
+    `build_chat_history_text(..., global_history=True)` 只能看到当前进程内已加载
+    的 ChatStream。QQ、直播等旧流如果没有在本进程激活，就不会进内存快照。
+    这里直接读 `messages` 表，恢复为 Message 后复用同一套格式化逻辑。
+    """
+    if max_messages is not None and max_messages <= 0:
+        return []
+
+    manager = stream_manager
+    if manager is None:
+        try:
+            from src.core.managers import get_stream_manager
+
+            manager = get_stream_manager()
+        except Exception:
+            manager = None
+    if manager is None:
+        return []
+
+    try:
+        from src.core.models.sql_alchemy import ChatStreams, Messages
+        from src.kernel.db import QueryBuilder
+    except Exception:
+        return []
+
+    wanted = max_messages if max_messages is not None else 30
+    wanted = max(1, int(wanted or 1))
+    scan_limit = max(wanted * 4, wanted + 20)
+    excluded = {str(item) for item in (exclude_message_ids or set()) if str(item)}
+
+    try:
+        records = await QueryBuilder(Messages).order_by("-id").limit(scan_limit).all()
+    except Exception:
+        return []
+    if not records:
+        return []
+
+    records = list(reversed(records))
+    stream_ids = {
+        str(getattr(record, "stream_id", "") or "")
+        for record in records
+        if str(getattr(record, "stream_id", "") or "")
+    }
+    stream_meta: dict[str, Any] = {}
+    if stream_ids:
+        try:
+            stream_records = await QueryBuilder(ChatStreams).filter(
+                stream_id__in=list(stream_ids)
+            ).all()
+            stream_meta = {str(item.stream_id): item for item in stream_records}
+        except Exception:
+            stream_meta = {}
+
+    converter = getattr(manager, "_db_message_to_runtime", None)
+    if not callable(converter):
+        return []
+
+    entries: list[ChatHistoryEntry] = []
+    for order, record in enumerate(records):
+        message_id = str(getattr(record, "message_id", "") or "")
+        if message_id and message_id in excluded:
+            continue
+
+        try:
+            message = await converter(record)
+        except Exception:
+            continue
+        if not is_visible_chat_history_message(message):
+            continue
+
+        stream_id = str(
+            getattr(message, "stream_id", "")
+            or getattr(record, "stream_id", "")
+            or ""
+        )
+        meta = stream_meta.get(stream_id)
+        stream_name = ""
+        if meta is not None:
+            stream_name = str(getattr(meta, "group_name", "") or "").strip()
+        if not stream_name:
+            stream_name = stream_id[:8] if stream_id else "unknown"
+
+        entries.append(
+            ChatHistoryEntry(
+                message=message,
+                stream_id=stream_id,
+                stream_name=stream_name,
+                platform=str(
+                    getattr(message, "platform", "")
+                    or getattr(record, "platform", "")
+                    or getattr(meta, "platform", "")
+                    or ""
+                ),
+                chat_type=str(
+                    getattr(message, "chat_type", "")
+                    or getattr(meta, "chat_type", "")
+                    or ""
+                ),
+                order=order,
+            )
+        )
+
+    entries.sort(
+        key=lambda entry: (
+            message_timestamp(entry.message),
+            entry.order,
+            entry.stream_id,
+        )
+    )
+    return entries[-wanted:]
+
+
+async def build_global_chat_history_text_from_db(
+    current_stream: Any,
+    *,
+    max_messages: int | None = 30,
+    include_stream_label: bool = True,
+    stream_manager: Any | None = None,
+    exclude_message_ids: set[str] | None = None,
+) -> str:
+    entries = await collect_global_chat_history_entries_from_db(
+        current_stream,
+        max_messages=max_messages,
+        stream_manager=stream_manager,
+        exclude_message_ids=exclude_message_ids,
+    )
+    if not entries:
+        return ""
+
+    current_stream_id = str(getattr(current_stream, "stream_id", "") or "").strip()
+    return "\n".join(
+        format_chat_history_entry(
+            entry,
+            current_stream_id=current_stream_id,
+            include_stream_label=include_stream_label,
+        )
+        for entry in entries
+    )

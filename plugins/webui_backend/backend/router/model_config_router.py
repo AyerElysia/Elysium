@@ -77,6 +77,7 @@ class ModelTasksData(BaseModel):
     vlm: TaskConfigData | None = None
     voice: TaskConfigData | None = None
     video: TaskConfigData | None = None
+    live: TaskConfigData | None = None
     tool_use: TaskConfigData | None = None
     embedding: TaskConfigData | None = None
 
@@ -168,6 +169,7 @@ _TASK_META: dict[str, tuple[str, str, str]] = {
     "vlm":                      ("图像识别模型",   "用于图像内容识别的视觉语言模型",                                      "media"),
     "voice":                    ("语音识别模型",   "用于语音消息识别的模型",                                              "media"),
     "video":                    ("视频分析模型",   "用于视频内容分析的模型",                                              "media"),
+    "live":                     ("实时 Live 模型", "用于实时语音/屏幕 live server 或后续 Neo 侧 realtime adapter",          "media"),
     "embedding":                ("嵌入模型",       "用于文本向量化的嵌入模型",                                            "memory"),
 }
 

@@ -1670,6 +1670,8 @@ class LifeEngineService(BaseService):
         event_limit: int = 80,
         unified_chatter_context: bool = False,
         include_recent_chat_history: bool = True,
+        commit_cursors: bool = True,
+        event_cursor_override: int | None = None,
     ) -> tuple[str, int]:
         """构建给 life_chatter 的同源运行态快照。
 
@@ -1686,10 +1688,13 @@ class LifeEngineService(BaseService):
           7. ### 最近关键活动  （仅在没有新增事件流时作为兜底摘要）
         """
         stream_id = str(getattr(chat_stream, "stream_id", "") or "").strip()
-        event_cursor = self._chatter_event_cursor(
-            stream_id,
-            unified_chatter_context=unified_chatter_context,
-        )
+        if event_cursor_override is None:
+            event_cursor = self._chatter_event_cursor(
+                stream_id,
+                unified_chatter_context=unified_chatter_context,
+            )
+        else:
+            event_cursor = max(0, int(event_cursor_override or 0))
         thought_cursor = self._chatter_thought_cursor(
             stream_id,
             unified_chatter_context=unified_chatter_context,
@@ -1811,7 +1816,7 @@ class LifeEngineService(BaseService):
             new_event_high_water = max(new_event_high_water, salient_high_water)
 
         # thought delta cursor 在渲染阶段直接提交（不等待 LLM 调用成功）
-        if new_thought_revision > thought_cursor:
+        if commit_cursors and new_thought_revision > thought_cursor:
             await self._commit_chatter_thought_cursor(
                 stream_id,
                 new_thought_revision,

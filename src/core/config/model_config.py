@@ -257,6 +257,10 @@ class ModelTasksSection(SectionBase):
         default_factory=lambda: TaskConfigSection(model_list=["qwen2.5-vl-72b"]),
         description="视频分析模型配置",
     )
+    live: TaskConfigSection = Field(
+        default_factory=lambda: TaskConfigSection(model_list=["siliconflow-deepseek-ai/DeepSeek-V3.2"]),
+        description="实时 live 通话任务配置，用于外部 live server 或后续 Neo 侧 realtime adapter",
+    )
     tool_use: TaskConfigSection = Field(
         default_factory=lambda: TaskConfigSection(model_list=["qwen3-8b"]),
         description="工具调用模型，需要使用支持工具调用的模型",

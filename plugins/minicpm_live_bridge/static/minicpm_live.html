@@ -1,0 +1,1085 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MiniCPM Live</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101114;
+      --panel: #181a20;
+      --panel-2: #20232b;
+      --text: #f2f4f8;
+      --muted: #a7adbb;
+      --line: #343946;
+      --accent: #6ee7b7;
+      --danger: #fb7185;
+      --warn: #fbbf24;
+      --blue: #93c5fd;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .app {
+      min-height: 100vh;
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--line);
+      background: #14161b;
+    }
+    h1 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 650;
+      letter-spacing: 0;
+    }
+    .status-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 0 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    .badge.ok { color: var(--accent); border-color: rgba(110, 231, 183, .45); }
+    .badge.warn { color: var(--warn); border-color: rgba(251, 191, 36, .45); }
+    .badge.err { color: var(--danger); border-color: rgba(251, 113, 133, .45); }
+    main {
+      display: grid;
+      grid-template-columns: minmax(0, 1.6fr) minmax(360px, .8fr);
+      gap: 14px;
+      padding: 14px;
+      min-height: 0;
+    }
+    .stage, .side {
+      min-height: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      overflow: hidden;
+    }
+    .stage {
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+    .toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel-2);
+    }
+    .buttons {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    button, a.button {
+      min-height: 34px;
+      padding: 0 12px;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: #272b35;
+      color: var(--text);
+      font: inherit;
+      font-size: 14px;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    button.primary { background: #154f3e; border-color: #267a5f; }
+    button.danger { background: #54202a; border-color: #8f3343; }
+    button:disabled {
+      opacity: .48;
+      cursor: not-allowed;
+    }
+    .metric {
+      display: flex;
+      gap: 10px;
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    .preview-wrap {
+      position: relative;
+      min-height: 0;
+      display: grid;
+      place-items: center;
+      background: #050609;
+    }
+    video {
+      width: 100%;
+      height: 100%;
+      max-height: calc(100vh - 120px);
+      object-fit: contain;
+      background: #050609;
+    }
+    .empty {
+      position: absolute;
+      color: var(--muted);
+      font-size: 15px;
+      pointer-events: none;
+    }
+    .side {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+    }
+    .side-head {
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+      display: grid;
+      gap: 8px;
+    }
+    .field {
+      display: grid;
+      grid-template-columns: 88px minmax(0, 1fr);
+      gap: 8px;
+      align-items: center;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .value {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--text);
+    }
+    .log {
+      min-height: 0;
+      overflow: auto;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .entry {
+      border-left: 3px solid var(--line);
+      padding: 7px 8px;
+      background: rgba(255, 255, 255, .025);
+      border-radius: 4px;
+      font-size: 14px;
+      line-height: 1.45;
+      word-break: break-word;
+    }
+    .entry.user { border-left-color: var(--blue); }
+    .entry.assistant { border-left-color: var(--accent); }
+    .entry.error { border-left-color: var(--danger); color: #fecdd3; }
+    .entry .meta {
+      display: block;
+      margin-bottom: 3px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .composer {
+      display: flex;
+      gap: 8px;
+      padding: 10px;
+      border-top: 1px solid var(--line);
+      background: var(--panel-2);
+    }
+    input {
+      width: 100%;
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #111318;
+      color: var(--text);
+      padding: 0 10px;
+      font: inherit;
+    }
+    @media (max-width: 980px) {
+      main { grid-template-columns: 1fr; }
+      .side { min-height: 360px; }
+      header { align-items: flex-start; flex-direction: column; }
+      .status-row { justify-content: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1>MiniCPM Live</h1>
+      <div class="status-row">
+        <span id="authBadge" class="badge warn">auth pending</span>
+        <span id="serverBadge" class="badge warn">server unknown</span>
+        <span id="captureBadge" class="badge">capture idle</span>
+        <span id="eventBadge" class="badge">events idle</span>
+        <span id="wsBadge" class="badge">ws idle</span>
+      </div>
+    </header>
+    <main>
+      <section class="stage">
+        <div class="toolbar">
+          <div class="buttons">
+            <button id="startBtn" class="primary">开始</button>
+            <button id="stopBtn" class="danger" disabled>停止</button>
+            <button id="voiceBtn" disabled>语音</button>
+            <button id="interruptBtn" disabled>打断</button>
+            <a id="externalLink" class="button" target="_blank" rel="noreferrer" hidden>外部前端</a>
+          </div>
+          <div class="metric">
+            <span id="sessionText">session: -</span>
+            <span id="frameText">frames: 0</span>
+          </div>
+        </div>
+        <div class="preview-wrap">
+          <video id="screenPreview" autoplay muted playsinline></video>
+          <div id="emptyText" class="empty">screen idle</div>
+        </div>
+      </section>
+      <aside class="side">
+        <div class="side-head">
+          <div class="field"><span>mode</span><span id="modeText" class="value">-</span></div>
+          <div class="field"><span>server</span><span id="serverText" class="value">-</span></div>
+          <div class="field"><span>ws</span><span id="wsText" class="value">-</span></div>
+        </div>
+        <div id="log" class="log"></div>
+        <div class="composer">
+          <input id="textInput" placeholder="发送文本事件">
+          <button id="sendTextBtn" disabled>发送</button>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <script>
+    const rootPath = window.location.pathname.replace(/\/$/, '');
+    const apiBase = `${rootPath}/api`;
+    const token = localStorage.getItem('mofox_token') || '';
+
+    const state = {
+      config: null,
+      sessionId: '',
+      screenStream: null,
+      audioStream: null,
+      ws: null,
+      neoWs: null,
+      recorder: null,
+      localVoice: null,
+      frameTimer: null,
+      frameCount: 0,
+      currentAudio: null,
+      currentSpeech: null,
+      pendingUnifiedEvents: [],
+      contextSnapshot: null,
+      contextSnapshotPromise: null,
+    };
+
+    const el = {
+      authBadge: document.getElementById('authBadge'),
+      serverBadge: document.getElementById('serverBadge'),
+      captureBadge: document.getElementById('captureBadge'),
+      eventBadge: document.getElementById('eventBadge'),
+      wsBadge: document.getElementById('wsBadge'),
+      startBtn: document.getElementById('startBtn'),
+      stopBtn: document.getElementById('stopBtn'),
+      voiceBtn: document.getElementById('voiceBtn'),
+      interruptBtn: document.getElementById('interruptBtn'),
+      externalLink: document.getElementById('externalLink'),
+      sessionText: document.getElementById('sessionText'),
+      frameText: document.getElementById('frameText'),
+      screenPreview: document.getElementById('screenPreview'),
+      emptyText: document.getElementById('emptyText'),
+      modeText: document.getElementById('modeText'),
+      serverText: document.getElementById('serverText'),
+      wsText: document.getElementById('wsText'),
+      log: document.getElementById('log'),
+      textInput: document.getElementById('textInput'),
+      sendTextBtn: document.getElementById('sendTextBtn'),
+    };
+
+    function setBadge(node, text, cls) {
+      node.className = `badge ${cls || ''}`.trim();
+      node.textContent = text;
+    }
+
+    function compactDebugPayload(payload = {}) {
+      const result = {};
+      for (const [key, value] of Object.entries(payload || {})) {
+        const lowerKey = String(key).toLowerCase();
+        if (lowerKey.includes('image') || lowerKey.includes('audio') || lowerKey === 'data') {
+          result[key] = '[omitted]';
+        } else if (typeof value === 'string' && value.length > 420) {
+          result[key] = `${value.slice(0, 420)}...[truncated]`;
+        } else {
+          result[key] = value;
+        }
+      }
+      return result;
+    }
+
+    function compactDebugMessage(message) {
+      const text = String(message || '');
+      if (text.startsWith('data:image/') || text.startsWith('data:audio/')) return '[omitted data url]';
+      if (text.length > 900) return `${text.slice(0, 900)}...[truncated]`;
+      return text;
+    }
+
+    function postClientDebug(level, message, payload = {}) {
+      if (!token) return;
+      const headers = { 'Content-Type': 'application/json' };
+      headers['X-API-Key'] = token;
+      fetch(`${apiBase}/debug/log`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          session_id: state.sessionId || '',
+          level: level || 'info',
+          source: 'browser',
+          message: compactDebugMessage(message),
+          payload: compactDebugPayload(payload),
+        }),
+      }).catch(error => console.warn('live debug log post failed', error));
+    }
+
+    function addLog(role, text, kind = '') {
+      const item = document.createElement('div');
+      item.className = `entry ${kind || role || ''}`.trim();
+      const meta = document.createElement('span');
+      meta.className = 'meta';
+      meta.textContent = `${new Date().toLocaleTimeString()} ${role || 'system'}`;
+      item.appendChild(meta);
+      item.appendChild(document.createTextNode(text || ''));
+      el.log.appendChild(item);
+      el.log.scrollTop = el.log.scrollHeight;
+      postClientDebug(kind === 'error' ? 'error' : 'info', text, { role, kind });
+    }
+
+    async function apiFetch(path, options = {}) {
+      const headers = Object.assign({}, options.headers || {});
+      if (token) headers['X-API-Key'] = token;
+      if (options.body && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
+      const response = await fetch(`${apiBase}${path}`, Object.assign({}, options, { headers }));
+      const text = await response.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+      if (!response.ok) {
+        throw new Error(typeof data === 'string' ? data : JSON.stringify(data));
+      }
+      return data;
+    }
+
+    async function loadConfig() {
+      if (!token) {
+        setBadge(el.authBadge, 'auth missing', 'err');
+        addLog('system', '未找到 WebUI token，请先登录 WebUI。', 'error');
+        return;
+      }
+      setBadge(el.authBadge, 'auth ok', 'ok');
+      const config = await apiFetch('/config');
+      state.config = config;
+      renderConfig(config);
+      postClientDebug('info', 'config loaded', {
+        mode: config.mode || '',
+        enabled: Boolean(config.enabled),
+        local_api: Boolean(config.session?.enable_local_api_turn),
+        websocket: Boolean(config.server?.websocket_url),
+      });
+
+      try {
+        const status = await apiFetch('/status');
+        setBadge(
+          el.serverBadge,
+          status.server_reachable ? 'server ok' : (status.configured ? 'server down' : 'server unset'),
+          status.server_reachable ? 'ok' : 'warn'
+        );
+        postClientDebug(status.server_reachable ? 'info' : 'warning', 'status checked', {
+          configured: Boolean(status.configured),
+          reachable: Boolean(status.server_reachable),
+          checked_url: status.checked_url || '',
+          detail: status.detail || '',
+        });
+      } catch (error) {
+        setBadge(el.serverBadge, 'server check failed', 'err');
+        addLog('system', String(error), 'error');
+      }
+    }
+
+    function renderConfig(config) {
+      el.modeText.textContent = config.mode || '-';
+      el.serverText.textContent = config.server?.base_url || '-';
+      el.wsText.textContent = config.server?.websocket_url || (
+        config.session?.enable_local_api_turn ? `local api: ${config.session?.model_task_name || 'live'}` : '-'
+      );
+      if (config.server?.frontend_url) {
+        el.externalLink.hidden = false;
+        el.externalLink.href = config.server.frontend_url;
+      } else {
+        el.externalLink.hidden = true;
+      }
+    }
+
+    async function createSession() {
+      const response = await apiFetch('/sessions', {
+        method: 'POST',
+        body: JSON.stringify({
+          client_name: 'neo-web',
+          mode: 'screen_voice',
+          metadata: { user_agent: navigator.userAgent },
+        }),
+      });
+      state.sessionId = response.session_id;
+      state.config = response.client_config || state.config;
+      renderConfig(state.config);
+      el.sessionText.textContent = `session: ${state.sessionId}`;
+      postClientDebug('info', 'session created', {
+        session_id: state.sessionId,
+        mode: state.config?.mode || '',
+      });
+      return state.sessionId;
+    }
+
+    async function postEvent(eventType, role, text, payload = {}) {
+      if (!state.sessionId || !token) return;
+      try {
+        await apiFetch('/events', {
+          method: 'POST',
+          body: JSON.stringify({
+            session_id: state.sessionId,
+            event_type: eventType,
+            role,
+            text,
+            payload,
+          }),
+        });
+      } catch (error) {
+        console.warn('event post failed', error);
+      }
+    }
+
+    async function loadContextSnapshot() {
+      if (state.contextSnapshot) return state.contextSnapshot;
+      if (state.contextSnapshotPromise) return state.contextSnapshotPromise;
+      if (!state.sessionId || !token) return null;
+      state.contextSnapshotPromise = (async () => {
+        try {
+          const snapshot = await apiFetch(`/context?session_id=${encodeURIComponent(state.sessionId)}`);
+          state.contextSnapshot = snapshot;
+          return snapshot;
+        } catch (error) {
+          addLog('system', `context load failed: ${String(error)}`, 'error');
+          return null;
+        } finally {
+          state.contextSnapshotPromise = null;
+        }
+      })();
+      try {
+        return await state.contextSnapshotPromise;
+      } catch {
+        return null;
+      }
+    }
+
+    function sendContextSnapshot(snapshot) {
+      if (!snapshot) return false;
+      return sendJson({
+        type: 'context.snapshot',
+        session_id: state.sessionId,
+        timestamp: Date.now(),
+        context: snapshot,
+      });
+    }
+
+    async function startCapture() {
+      state.screenStream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: Math.max(1, Math.round(state.config.capture.screen_fps || 5)) },
+        audio: false,
+      });
+      state.audioStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        video: false,
+      });
+      el.screenPreview.srcObject = state.screenStream;
+      el.emptyText.hidden = true;
+      setBadge(el.captureBadge, 'capture on', 'ok');
+      postClientDebug('info', 'capture started', {
+        screen_tracks: state.screenStream.getVideoTracks().length,
+        audio_tracks: state.audioStream.getAudioTracks().length,
+      });
+      state.screenStream.getVideoTracks()[0]?.addEventListener('ended', stop);
+    }
+
+    function connectWebSocket() {
+      const url = state.config.server?.websocket_url || '';
+      if (!url) {
+        setBadge(el.wsBadge, 'ws unset', 'warn');
+        addLog('system', '未配置 websocket_url，仅启动本地采集预览。');
+        postClientDebug('warning', 'external websocket unset');
+        return;
+      }
+      state.ws = new WebSocket(url);
+      state.ws.onopen = () => {
+        setBadge(el.wsBadge, 'ws connected', 'ok');
+        postClientDebug('info', 'external websocket opened', { url });
+        sendJson({
+          type: 'session.start',
+          protocol: state.config.protocol,
+          session_id: state.sessionId,
+          stream_id: state.config.session?.stream_id || '',
+          model_task_name: state.config.session?.model_task_name || 'live',
+          capture: state.config.capture,
+        });
+        if (state.contextSnapshot) {
+          sendContextSnapshot(state.contextSnapshot);
+        } else {
+          loadContextSnapshot().then(sendContextSnapshot);
+        }
+        flushPendingUnifiedEvents();
+      };
+      state.ws.onclose = event => {
+        setBadge(el.wsBadge, 'ws closed', 'warn');
+        postClientDebug('warning', 'external websocket closed', {
+          code: event.code,
+          reason: event.reason || '',
+        });
+      };
+      state.ws.onerror = () => {
+        setBadge(el.wsBadge, 'ws error', 'err');
+        postClientDebug('error', 'external websocket error', { url });
+      };
+      state.ws.onmessage = event => handleServerMessage(event.data);
+    }
+
+    function connectNeoUnifiedStream() {
+      if (!token) return;
+      if (state.neoWs) state.neoWs.close();
+
+      const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const url = `${scheme}//${window.location.host}${apiBase}/unified/ws?api_key=${encodeURIComponent(token)}`;
+      state.neoWs = new WebSocket(url);
+      state.neoWs.onopen = () => {
+        setBadge(el.eventBadge, 'events connected', 'ok');
+        postClientDebug('info', 'neo unified event websocket opened');
+      };
+      state.neoWs.onclose = event => {
+        setBadge(el.eventBadge, 'events closed', 'warn');
+        postClientDebug('warning', 'neo unified event websocket closed', {
+          code: event.code,
+          reason: event.reason || '',
+        });
+      };
+      state.neoWs.onerror = () => {
+        setBadge(el.eventBadge, 'events error', 'err');
+        postClientDebug('error', 'neo unified event websocket error');
+      };
+      state.neoWs.onmessage = event => {
+        let packet = null;
+        try { packet = JSON.parse(event.data); } catch { return; }
+        const events = packet.type === 'snapshot' ? (packet.events || []) : [packet.event].filter(Boolean);
+        for (const unifiedEvent of events) forwardUnifiedEvent(unifiedEvent);
+      };
+    }
+
+    function sendJson(payload) {
+      if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return false;
+      state.ws.send(JSON.stringify(payload));
+      return true;
+    }
+
+    function forwardUnifiedEvent(event) {
+      if (!event) return;
+      if (
+        state.config?.unified_event_stream?.ignore_live_echo_to_live &&
+        event.stream_id &&
+        event.stream_id === state.config?.session?.stream_id
+      ) {
+        return;
+      }
+
+      const packet = {
+        type: 'unified.event',
+        session_id: state.sessionId,
+        timestamp: Date.now(),
+        event,
+      };
+      if (sendJson(packet)) {
+        setBadge(el.eventBadge, `events #${event.sequence || '-'}`, 'ok');
+        return;
+      }
+
+      state.pendingUnifiedEvents.push(packet);
+      if (state.pendingUnifiedEvents.length > 200) state.pendingUnifiedEvents.shift();
+      setBadge(el.eventBadge, `events queued ${state.pendingUnifiedEvents.length}`, 'warn');
+      postClientDebug('warning', 'unified event queued for external websocket', {
+        sequence: event.sequence || '',
+        origin: event.origin || '',
+        source: event.source || '',
+        event_type: event.event_type || '',
+        queued: state.pendingUnifiedEvents.length,
+      });
+    }
+
+    function flushPendingUnifiedEvents() {
+      if (!state.pendingUnifiedEvents.length) return;
+      const pending = state.pendingUnifiedEvents.splice(0);
+      for (const packet of pending) {
+        if (!sendJson(packet)) {
+          state.pendingUnifiedEvents.unshift(packet);
+          break;
+        }
+      }
+      if (state.pendingUnifiedEvents.length) {
+        setBadge(el.eventBadge, `events queued ${state.pendingUnifiedEvents.length}`, 'warn');
+      }
+    }
+
+    function startScreenFrames() {
+      const fps = Math.max(0.5, Number(state.config.capture.screen_fps || 5));
+      const interval = Math.round(1000 / fps);
+      state.frameTimer = window.setInterval(sendScreenFrame, interval);
+    }
+
+    function sendScreenFrame() {
+      if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+      const frame = captureScreenFrame();
+      if (!frame) return;
+      state.frameCount += 1;
+      el.frameText.textContent = `frames: ${state.frameCount}`;
+      sendJson({
+        type: 'screen.frame',
+        session_id: state.sessionId,
+        timestamp: frame.timestamp,
+        width: frame.width,
+        height: frame.height,
+        image: frame.image,
+      });
+    }
+
+    function captureScreenFrame() {
+      const video = el.screenPreview;
+      if (!video.videoWidth || !video.videoHeight) return;
+
+      const maxWidth = Number(state.config.capture.screen_max_width || 1280);
+      const scale = Math.min(1, maxWidth / video.videoWidth);
+      const width = Math.max(1, Math.round(video.videoWidth * scale));
+      const height = Math.max(1, Math.round(video.videoHeight * scale));
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(video, 0, 0, width, height);
+      const quality = Math.max(0.1, Math.min(1, Number(state.config.capture.jpeg_quality || 0.72)));
+      const image = canvas.toDataURL('image/jpeg', quality);
+      return {
+        timestamp: Date.now(),
+        width,
+        height,
+        image,
+      };
+    }
+
+    function startAudioChunks() {
+      if (!state.ws || !state.audioStream) return;
+      const preferred = state.config.capture.audio_mime_type || 'audio/webm;codecs=opus';
+      const mimeType = MediaRecorder.isTypeSupported(preferred) ? preferred : '';
+      state.recorder = new MediaRecorder(state.audioStream, mimeType ? { mimeType } : undefined);
+      state.recorder.ondataavailable = async event => {
+        if (!event.data || event.data.size === 0) return;
+        const data = await blobToDataUrl(event.data);
+        sendJson({
+          type: 'audio.chunk',
+          session_id: state.sessionId,
+          timestamp: Date.now(),
+          mime_type: event.data.type || mimeType || 'audio/webm',
+          data,
+        });
+      };
+      state.recorder.start(Number(state.config.capture.audio_chunk_ms || 250));
+    }
+
+    function blobToDataUrl(blob) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ''));
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(blob);
+      });
+    }
+
+    function handleServerMessage(raw) {
+      let message = raw;
+      try { message = JSON.parse(raw); } catch {}
+      if (typeof message === 'string') {
+        addLog('server', message);
+        return;
+      }
+
+      const type = message.type || 'message';
+      if (type === 'transcript' || type === 'partial' || type === 'final') {
+        const role = message.role || 'assistant';
+        const text = message.text || '';
+        addLog(role, text, role === 'user' ? 'user' : 'assistant');
+        postEvent(type, role, text, message);
+      } else if (type === 'audio') {
+        if (message.text) {
+          addLog('assistant', message.text, 'assistant');
+          postEvent('audio.reply', 'assistant', message.text, message);
+        }
+        playAudioMessage(message);
+      } else if (String(type).startsWith('screen.')) {
+        const text = message.text || message.summary || message.description || '';
+        addLog('screen', text || JSON.stringify(message));
+        postEvent(type, 'system', text, message);
+      } else if (type === 'error') {
+        addLog('server', message.error || message.message || 'server error', 'error');
+      } else {
+        addLog('server', JSON.stringify(message));
+      }
+    }
+
+    function playAudioMessage(message) {
+      let src = message.audio_url || '';
+      if (!src && message.audio_base64) {
+        const mime = message.mime_type || 'audio/wav';
+        src = `data:${mime};base64,${message.audio_base64}`;
+      }
+      if (!src) return;
+      stopSpokenOutput();
+      state.currentAudio = new Audio(src);
+      state.currentAudio.play().catch(error => addLog('audio', String(error), 'error'));
+    }
+
+    function stopSpokenOutput() {
+      if (state.currentAudio) {
+        state.currentAudio.pause();
+        state.currentAudio = null;
+      }
+      if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+      state.currentSpeech = null;
+    }
+
+    function speakText(text) {
+      if (!text || !('speechSynthesis' in window)) return;
+      stopSpokenOutput();
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = 'zh-CN';
+      utterance.rate = 1;
+      utterance.pitch = 1;
+      utterance.onend = () => {
+        if (state.currentSpeech === utterance) state.currentSpeech = null;
+      };
+      state.currentSpeech = utterance;
+      window.speechSynthesis.speak(utterance);
+    }
+
+    async function start() {
+      try {
+        el.startBtn.disabled = true;
+        postClientDebug('info', 'start requested');
+        if (!state.config) await loadConfig();
+        if (!state.config?.enabled) throw new Error('MiniCPM Live Bridge disabled');
+        await createSession();
+        await startCapture();
+        connectNeoUnifiedStream();
+        connectWebSocket();
+        loadContextSnapshot().then(snapshot => {
+          if (!snapshot) return;
+          const unifiedCount = snapshot.unified_events?.length || 0;
+          const sessionCount = snapshot.session_events?.length || 0;
+          addLog(
+            'system',
+            `context ready: life=${snapshot.life_runtime_available ? 'on' : 'empty'}, unified=${unifiedCount}, session=${sessionCount}`
+          );
+          sendContextSnapshot(snapshot);
+        });
+        startScreenFrames();
+        window.setTimeout(startAudioChunks, 300);
+        el.stopBtn.disabled = false;
+        el.interruptBtn.disabled = false;
+        el.sendTextBtn.disabled = false;
+        el.voiceBtn.disabled = false;
+        addLog('system', 'live session started');
+        postEvent('session_started', 'system', 'live session started');
+      } catch (error) {
+        addLog('system', String(error), 'error');
+        await stop();
+      } finally {
+        el.startBtn.disabled = false;
+      }
+    }
+
+    async function stop() {
+      postClientDebug('info', 'stop requested', { session_id: state.sessionId || '' });
+      if (state.frameTimer) window.clearInterval(state.frameTimer);
+      state.frameTimer = null;
+      cancelLocalVoiceRecording();
+      if (state.recorder && state.recorder.state !== 'inactive') state.recorder.stop();
+      state.recorder = null;
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        sendJson({ type: 'session.stop', session_id: state.sessionId, timestamp: Date.now() });
+      }
+      if (state.ws) state.ws.close();
+      state.ws = null;
+      if (state.neoWs) state.neoWs.close();
+      state.neoWs = null;
+      state.pendingUnifiedEvents = [];
+      state.contextSnapshot = null;
+      state.contextSnapshotPromise = null;
+      for (const stream of [state.screenStream, state.audioStream]) {
+        stream?.getTracks().forEach(track => track.stop());
+      }
+      state.screenStream = null;
+      state.audioStream = null;
+      el.screenPreview.srcObject = null;
+      el.emptyText.hidden = false;
+      setBadge(el.captureBadge, 'capture idle', '');
+      setBadge(el.wsBadge, 'ws idle', '');
+      el.stopBtn.disabled = true;
+      el.voiceBtn.disabled = true;
+      el.voiceBtn.textContent = '语音';
+      el.interruptBtn.disabled = true;
+      el.sendTextBtn.disabled = true;
+      stopSpokenOutput();
+      if (state.sessionId) await postEvent('session_stopped', 'system', 'live session stopped');
+    }
+
+    function interrupt() {
+      stopSpokenOutput();
+      cancelLocalVoiceRecording();
+      sendJson({ type: 'session.interrupt', session_id: state.sessionId, timestamp: Date.now() });
+      postEvent('interrupt', 'user', 'interrupt');
+      addLog('user', 'interrupt', 'user');
+    }
+
+    async function sendTextEvent() {
+      const text = el.textInput.value.trim();
+      if (!text) return;
+      const packet = { type: 'text.input', session_id: state.sessionId, timestamp: Date.now(), text };
+      const sentToExternal = sendJson(packet);
+      addLog('user', text, 'user');
+      el.textInput.value = '';
+      if (!sentToExternal && state.config?.session?.enable_local_api_turn) {
+        await runLocalApiTurn(text);
+      } else if (!sentToExternal) {
+        addLog('system', '未连接外部 WebSocket，且本地 API 单轮模式未启用。', 'error');
+      } else {
+        await postEvent('text_input', 'user', text);
+      }
+    }
+
+    async function runLocalApiTurn(text, options = {}) {
+      el.sendTextBtn.disabled = true;
+      el.voiceBtn.disabled = true;
+      try {
+        const frame = captureScreenFrame();
+        postClientDebug('info', 'local api turn requested', {
+          has_text: Boolean(text),
+          has_audio: Boolean(options.audioData),
+          has_screen: Boolean(frame?.image),
+          input_mode: options.payload?.input_mode || 'text',
+        });
+        const response = await apiFetch('/turn', {
+          method: 'POST',
+          body: JSON.stringify({
+            session_id: state.sessionId,
+            text,
+            screen_image: frame?.image || '',
+            audio_data: options.audioData || '',
+            audio_mime_type: options.audioMimeType || '',
+            payload: Object.assign({}, options.payload || {}, frame ? {
+              screen_width: frame.width,
+              screen_height: frame.height,
+              screen_timestamp: frame.timestamp,
+            } : {}),
+          }),
+        });
+        if (response?.text) {
+          addLog('assistant', response.text, 'assistant');
+          speakText(response.text);
+          postClientDebug('info', 'local api turn completed', {
+            reply_chars: response.text.length,
+          });
+        }
+      } catch (error) {
+        addLog('system', String(error), 'error');
+        postClientDebug('error', 'local api turn failed', { error: String(error) });
+      } finally {
+        el.sendTextBtn.disabled = !state.sessionId;
+        el.voiceBtn.disabled = !state.sessionId;
+      }
+    }
+
+    function toggleVoiceTurn() {
+      if (state.localVoice?.recording) {
+        stopLocalVoiceRecording().catch(error => addLog('system', String(error), 'error'));
+      } else {
+        startLocalVoiceRecording().catch(error => addLog('system', String(error), 'error'));
+      }
+    }
+
+    async function startLocalVoiceRecording() {
+      if (!state.sessionId) return;
+      if (!state.config?.session?.enable_local_api_turn && !state.ws) {
+        addLog('system', '未连接外部 WebSocket，且本地 API 单轮模式未启用。', 'error');
+        return;
+      }
+      if (!state.audioStream) throw new Error('麦克风未启动，请先点击开始。');
+      stopSpokenOutput();
+
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) throw new Error('当前浏览器不支持 AudioContext。');
+      const audioContext = new AudioContextClass();
+      const source = audioContext.createMediaStreamSource(state.audioStream);
+      const processor = audioContext.createScriptProcessor(4096, 1, 1);
+      const chunks = [];
+
+      processor.onaudioprocess = event => {
+        const input = event.inputBuffer.getChannelData(0);
+        chunks.push(new Float32Array(input));
+        const output = event.outputBuffer.getChannelData(0);
+        output.fill(0);
+      };
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+
+      state.localVoice = {
+        recording: true,
+        audioContext,
+        source,
+        processor,
+        chunks,
+        sampleRate: audioContext.sampleRate,
+        startedAt: Date.now(),
+      };
+      el.voiceBtn.textContent = '发送语音';
+      el.voiceBtn.classList.add('primary');
+      addLog('system', 'voice recording started');
+    }
+
+    async function stopLocalVoiceRecording() {
+      const voice = state.localVoice;
+      if (!voice?.recording) return;
+      state.localVoice = null;
+      voice.processor.disconnect();
+      voice.source.disconnect();
+      await voice.audioContext.close();
+      el.voiceBtn.textContent = '语音';
+      el.voiceBtn.classList.remove('primary');
+
+      const durationMs = Date.now() - voice.startedAt;
+      if (durationMs < 250 || !voice.chunks.length) {
+        addLog('system', 'voice recording too short');
+        return;
+      }
+
+      const wavBlob = encodeWav(voice.chunks, voice.sampleRate);
+      const audioData = await blobToDataUrl(wavBlob);
+      addLog('user', `[voice ${Math.round(durationMs / 100) / 10}s]`, 'user');
+
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        await postEvent('voice_input', 'user', '[语音输入]', {
+          duration_ms: durationMs,
+          mime_type: 'audio/wav',
+        });
+        sendJson({
+          type: 'audio.turn',
+          session_id: state.sessionId,
+          timestamp: Date.now(),
+          mime_type: 'audio/wav',
+          data: audioData,
+        });
+        return;
+      }
+
+      await runLocalApiTurn('', {
+        audioData,
+        audioMimeType: 'audio/wav',
+        payload: {
+          input_mode: 'voice',
+          duration_ms: durationMs,
+        },
+      });
+    }
+
+    function cancelLocalVoiceRecording() {
+      const voice = state.localVoice;
+      if (!voice) return;
+      state.localVoice = null;
+      try { voice.processor.disconnect(); } catch {}
+      try { voice.source.disconnect(); } catch {}
+      try { voice.audioContext.close(); } catch {}
+      el.voiceBtn.textContent = '语音';
+      el.voiceBtn.classList.remove('primary');
+    }
+
+    function encodeWav(chunks, sampleRate) {
+      const samples = mergeFloat32(chunks);
+      const buffer = new ArrayBuffer(44 + samples.length * 2);
+      const view = new DataView(buffer);
+      writeAscii(view, 0, 'RIFF');
+      view.setUint32(4, 36 + samples.length * 2, true);
+      writeAscii(view, 8, 'WAVE');
+      writeAscii(view, 12, 'fmt ');
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, 1, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, sampleRate * 2, true);
+      view.setUint16(32, 2, true);
+      view.setUint16(34, 16, true);
+      writeAscii(view, 36, 'data');
+      view.setUint32(40, samples.length * 2, true);
+      let offset = 44;
+      for (let i = 0; i < samples.length; i += 1) {
+        const sample = Math.max(-1, Math.min(1, samples[i]));
+        view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+        offset += 2;
+      }
+      return new Blob([view], { type: 'audio/wav' });
+    }
+
+    function mergeFloat32(chunks) {
+      const length = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+      const result = new Float32Array(length);
+      let offset = 0;
+      for (const chunk of chunks) {
+        result.set(chunk, offset);
+        offset += chunk.length;
+      }
+      return result;
+    }
+
+    function writeAscii(view, offset, text) {
+      for (let i = 0; i < text.length; i += 1) {
+        view.setUint8(offset + i, text.charCodeAt(i));
+      }
+    }
+
+    el.startBtn.addEventListener('click', start);
+    el.stopBtn.addEventListener('click', stop);
+    el.voiceBtn.addEventListener('click', toggleVoiceTurn);
+    el.interruptBtn.addEventListener('click', interrupt);
+    el.sendTextBtn.addEventListener('click', sendTextEvent);
+    el.textInput.addEventListener('keydown', event => {
+      if (event.key === 'Enter') sendTextEvent();
+    });
+
+    loadConfig().catch(error => addLog('system', String(error), 'error'));
+  </script>
+</body>
+</html>

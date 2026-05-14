@@ -26,7 +26,11 @@ from src.kernel.llm import Audio, Content, Image, LLMPayload, ROLE, Text, ToolRe
 from src.kernel.logger import get_logger, COLOR
 from ..memory.prompting import load_memory_prompt_data, render_memory_prompt
 from ..constants import LIFE_CHATTER_GLOBAL_CURSOR_KEY
-from .chat_history import build_chat_history_text, message_flag
+from .chat_history import (
+    build_chat_history_text,
+    build_global_chat_history_text_from_db,
+    message_flag,
+)
 from .multimodal import (
     MediaBudget,
     MediaItem,
@@ -926,6 +930,8 @@ class LifeChatter(BaseChatter):
         service: LifeEngineService | None,
         runtime_context_text: str = "",
         include_recent_chat_history: bool = True,
+        commit_cursors: bool = True,
+        event_cursor_override: int | None = None,
     ) -> tuple[str, int]:
         """构建仅本次请求可见的 life 运行态快照。"""
         if service is None:
@@ -945,6 +951,8 @@ class LifeChatter(BaseChatter):
             runtime_context_text=runtime_context_text,
             unified_chatter_context=True,
             include_recent_chat_history=include_recent_chat_history,
+            commit_cursors=commit_cursors,
+            event_cursor_override=event_cursor_override,
         )
         if not context_text:
             return "", high_water
@@ -954,6 +962,56 @@ class LifeChatter(BaseChatter):
             "</life_runtime_context>",
             high_water,
         )
+
+    async def build_live_bridge_prompt(
+        self,
+        chat_stream: ChatStream,
+        service: LifeEngineService | None,
+        *,
+        unread_lines: str,
+        runtime_context_text: str = "",
+        include_history_in_prompt: bool = True,
+        include_recent_chat_history: bool = True,
+        commit_cursors: bool = True,
+        event_cursor_override: int | None = None,
+    ) -> dict[str, Any]:
+        """为外部 live 通道构建与 life_chatter 同源的提示词包。
+
+        该方法只负责 prompt 组装，不推进 life_chatter 的全局 LLM runtime，
+        也不执行工具。所有静态系统提示词、历史格式、新消息格式和动态
+        life_runtime_context 都复用 life_chatter 自身的构建逻辑，避免 live
+        通道维护一份漂移的提示词副本。
+        """
+        history_text = ""
+        if include_history_in_prompt:
+            history_text = await self._build_history_text_async(
+                chat_stream,
+                max_messages=self._get_initial_history_message_limit(),
+                global_history=True,
+            )
+
+        user_prompt_text = self._build_chat_user_prompt(
+            chat_stream,
+            unread_lines=unread_lines,
+            history_text=history_text,
+        )
+        dynamic_context_text, high_water = await self._build_dynamic_context_text(
+            chat_stream,
+            service,
+            runtime_context_text=runtime_context_text,
+            include_recent_chat_history=include_recent_chat_history,
+            commit_cursors=commit_cursors,
+            event_cursor_override=event_cursor_override,
+        )
+
+        return {
+            "system_prompt": self._build_chat_system_prompt(service, None),
+            "user_prompt": user_prompt_text,
+            "dynamic_context": dynamic_context_text,
+            "life_context_high_water": int(high_water or 0),
+            "history_included": bool(history_text),
+            "prompt_source": "life_chatter",
+        }
 
     # ── sub-agent decision ───────────────────────────────────
 
@@ -1034,6 +1092,39 @@ class LifeChatter(BaseChatter):
     ) -> str:
         """构建聊天历史文本；统一模式下按全局时间线合并多个聊天流。"""
         return build_chat_history_text(
+            chat_stream,
+            max_messages=max_messages,
+            global_history=global_history,
+            stream_manager=stream_manager,
+        )
+
+    @classmethod
+    async def _build_history_text_async(
+        cls,
+        chat_stream: ChatStream,
+        *,
+        max_messages: int | None = 30,
+        global_history: bool = False,
+        stream_manager: Any | None = None,
+        exclude_message_ids: set[str] | None = None,
+    ) -> str:
+        """构建聊天历史文本。
+
+        跨流统一历史优先从数据库读取，覆盖未加载到当前进程内存的 QQ/直播
+        stream；失败时回退到原内存流合并。
+        """
+        if global_history:
+            db_text = await build_global_chat_history_text_from_db(
+                chat_stream,
+                max_messages=max_messages,
+                include_stream_label=True,
+                stream_manager=stream_manager,
+                exclude_message_ids=exclude_message_ids,
+            )
+            if db_text:
+                return db_text
+
+        return cls._build_history_text(
             chat_stream,
             max_messages=max_messages,
             global_history=global_history,
@@ -1639,10 +1730,15 @@ class LifeChatter(BaseChatter):
                 )
                 rt.active_stream_id = stream_id
 
-                history_text = self._build_history_text(
+                history_text = await self._build_history_text_async(
                     chat_stream,
                     max_messages=self._get_initial_history_message_limit(),
                     global_history=True,
+                    exclude_message_ids={
+                        str(getattr(msg, "message_id", "") or "")
+                        for msg in unread_msgs
+                        if str(getattr(msg, "message_id", "") or "")
+                    },
                 )
                 include_history_in_prompt = bool(history_text and not rt.history_merged)
 

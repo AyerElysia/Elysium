@@ -109,6 +109,10 @@ plugins/*
 !plugins/emoji_sender/
 !plugins/life_engine/
 !plugins/live_bridge/
+!plugins/minicpm_live_bridge/
+!plugins/minicpm_live_bridge/**
+plugins/minicpm_live_bridge/**/__pycache__/
+plugins/minicpm_live_bridge/**/*.py[cod]
 !plugins/perm_plugin/
 !plugins/proactive_message_plugin/
 !plugins/skill_manager/
