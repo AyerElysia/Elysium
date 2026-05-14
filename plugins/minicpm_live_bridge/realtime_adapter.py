@@ -329,8 +329,11 @@ class MiniCPMRealtimeAdapter(BaseRealtimeAdapter):
             )
 
         if packet_type == "context.snapshot":
+            # Model server doesn't use session.update — just acknowledge
             return RealtimeAdapterResult(
-                upstream_messages=[self._build_session_update(reason="context.snapshot")]
+                client_messages=[
+                    {"type": "status", "status": "context.snapshot", "text": "context snapshot received"}
+                ]
             )
 
         if packet_type == "unified.event":
@@ -347,24 +350,19 @@ class MiniCPMRealtimeAdapter(BaseRealtimeAdapter):
             return self._handle_audio_input(payload)
 
         if packet_type == "session.interrupt":
-            messages = self._ensure_session_update_messages(reason="session.interrupt")
-            messages.append(
-                self._build_audio_append(
-                    self._silence_pcm_base64(samples=4000),
-                    force_listen=True,
-                )
-            )
-            return RealtimeAdapterResult(upstream_messages=messages)
-
-        if packet_type == "session.stop":
+            # Send a silent WAV chunk with force_listen to signal barge-in
             return RealtimeAdapterResult(
                 upstream_messages=[
-                    json.dumps(
-                        {"type": "session.close", "reason": "user_stop"},
-                        ensure_ascii=False,
+                    self._build_audio_append(
+                        self._silence_pcm_base64(samples=4000),
+                        force_listen=True,
                     )
                 ]
             )
+
+        if packet_type == "session.stop":
+            # Model server uses /api/v1/stop — just close gracefully on our side
+            return RealtimeAdapterResult()
 
         if packet_type == "text.input":
             text = str(payload.get("text") or "").strip()
@@ -693,6 +691,11 @@ class MiniCPMRealtimeAdapter(BaseRealtimeAdapter):
         return value[: max_chars - 16] + "\n...[truncated]"
 
     def _payload_to_minicpm_pcm_base64(self, payload: dict[str, Any]) -> tuple[str, str]:
+        """Convert browser audio payload → base64-encoded 16kHz mono int16 WAV.
+
+        The MiniCPM-o model server calls wave.open() on each chunk so it requires
+        proper WAV/RIFF bytes, NOT raw PCM bytes.
+        """
         data_value = payload.get("audio_base64") or payload.get("data") or payload.get("audio") or ""
         audio_base64, mime_type = self._extract_media_base64(data_value, expected_prefix="audio/")
         mime_type = str(payload.get("mime_type") or payload.get("audio_mime_type") or mime_type or "").lower()
@@ -703,23 +706,22 @@ class MiniCPMRealtimeAdapter(BaseRealtimeAdapter):
         if not audio_base64:
             return "", "audio packet has no audio data"
 
+        # Case 1: browser sent us float32 PCM at 16kHz — wrap in WAV header
         if encoding in {"pcm_float32", "float32"} and sample_rate == 16000 and channels == 1:
-            return audio_base64, ""
+            try:
+                return self._float32_pcm_base64_to_wav_base64(audio_base64), ""
+            except Exception as exc:
+                return "", f"failed to wrap float32 PCM in WAV: {exc}"
 
+        # Case 2: already a WAV — resample/convert to 16kHz mono int16 WAV
         if mime_type.startswith("audio/wav") or mime_type.startswith("audio/x-wav"):
             try:
-                return self._wav_base64_to_float32_16k_base64(audio_base64), ""
-            except Exception as exc:  # noqa: BLE001
-                return "", f"failed to convert WAV audio for MiniCPM realtime: {exc}"
-
-        if encoding in {"pcm_float32", "float32"} and sample_rate and sample_rate != 16000:
-            return "", (
-                "pcm_float32 audio must be 16kHz before reaching MiniCPM realtime; "
-                f"got {sample_rate}Hz"
-            )
+                return self._wav_base64_to_16k_mono_wav_base64(audio_base64), ""
+            except Exception as exc:
+                return "", f"failed to convert WAV to 16kHz for MiniCPM: {exc}"
 
         return "", (
-            "MiniCPM realtime requires 16kHz mono float32 PCM base64. "
+            "MiniCPM realtime requires WAV or 16kHz float32 PCM audio. "
             f"Unsupported audio mime/encoding: mime={mime_type or '-'} encoding={encoding or '-'}"
         )
 
@@ -746,7 +748,26 @@ class MiniCPMRealtimeAdapter(BaseRealtimeAdapter):
             return default
 
     @classmethod
-    def _wav_base64_to_float32_16k_base64(cls, audio_base64: str) -> str:
+    def _float32_pcm_base64_to_wav_base64(cls, audio_base64: str) -> str:
+        """Wrap raw float32 LE PCM at 16kHz mono in a WAV/RIFF container."""
+        import array
+
+        raw_f32 = base64.b64decode(audio_base64)
+        # Convert float32 → int16
+        samples_f32 = array.array("f")
+        samples_f32.frombytes(raw_f32)
+        if sys.byteorder != "little":
+            samples_f32.byteswap()
+        samples_i16 = array.array("h", (
+            max(-32768, min(32767, int(s * 32767))) for s in samples_f32
+        ))
+        if sys.byteorder != "little":
+            samples_i16.byteswap()
+        return cls._pcm16_to_wav_base64(samples_i16.tobytes(), sample_rate=16000, channels=1)
+
+    @classmethod
+    def _wav_base64_to_16k_mono_wav_base64(cls, audio_base64: str) -> str:
+        """Resample/convert an arbitrary WAV to 16kHz mono int16 WAV."""
         if audioop is None:
             raise RuntimeError("audioop is unavailable; cannot resample WAV audio")
 
@@ -759,27 +780,42 @@ class MiniCPMRealtimeAdapter(BaseRealtimeAdapter):
 
         if channels > 1:
             frames = audioop.tomono(frames, sample_width, 1.0 / channels, 1.0 / channels)
-            channels = 1
         if sample_width != 2:
             frames = audioop.lin2lin(frames, sample_width, 2)
             sample_width = 2
         if sample_rate != 16000:
-            frames, _ = audioop.ratecv(frames, sample_width, channels, sample_rate, 16000, None)
+            frames, _ = audioop.ratecv(frames, sample_width, 1, sample_rate, 16000, None)
 
-        import array
+        return cls._pcm16_to_wav_base64(frames, sample_rate=16000, channels=1)
 
-        samples_i16 = array.array("h")
-        samples_i16.frombytes(frames)
-        if sys.byteorder != "little":
-            samples_i16.byteswap()
-        samples_f32 = array.array("f", (max(-1.0, min(1.0, sample / 32768.0)) for sample in samples_i16))
-        if sys.byteorder != "little":
-            samples_f32.byteswap()
-        return base64.b64encode(samples_f32.tobytes()).decode("ascii")
+    @staticmethod
+    def _pcm16_to_wav_base64(pcm_bytes: bytes, *, sample_rate: int, channels: int) -> str:
+        """Wrap int16 PCM bytes in a minimal WAV/RIFF container and return base64."""
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as writer:
+            writer.setnchannels(channels)
+            writer.setsampwidth(2)  # 16-bit
+            writer.setframerate(sample_rate)
+            writer.writeframes(pcm_bytes)
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
+    # Keep the old name as an alias so any surviving callers don't break
+    @classmethod
+    def _wav_base64_to_float32_16k_base64(cls, audio_base64: str) -> str:
+        return cls._wav_base64_to_16k_mono_wav_base64(audio_base64)
 
     @staticmethod
     def _silence_pcm_base64(*, samples: int) -> str:
-        return base64.b64encode(b"\x00" * max(1, int(samples or 1)) * 4).decode("ascii")
+        """Return base64 of a silent 16kHz mono int16 WAV chunk (not raw PCM)."""
+        n = max(1, int(samples or 1))
+        pcm = b"\x00" * n * 2  # int16 zeros
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as writer:
+            writer.setnchannels(1)
+            writer.setsampwidth(2)
+            writer.setframerate(16000)
+            writer.writeframes(pcm)
+        return base64.b64encode(buf.getvalue()).decode("ascii")
 
     @staticmethod
     def _map_session_status(payload: dict[str, Any]) -> dict[str, Any]:
