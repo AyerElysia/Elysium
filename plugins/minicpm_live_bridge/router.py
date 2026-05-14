@@ -1771,6 +1771,70 @@ class MiniCPMLiveRouter(BaseRouter):
         except Exception:
             return
 
+    async def _proxy_upstream_sse_loop(
+        self,
+        *,
+        client_websocket: WebSocket,
+        adapter: Any,
+        session_id: str,
+    ) -> None:
+        """Poll the upstream SSE endpoint and forward events to the client WebSocket.
+
+        Re-subscribes after each response stream ends so that continuous
+        conversation works (the model server's SSE stream ends after each turn).
+        """
+        import aiohttp  # lightweight HTTP client already available in the venv
+
+        sse_url = adapter.upstream_sse_url()
+        if not sse_url:
+            return
+        headers = adapter.upstream_sse_headers()
+
+        while True:
+            try:
+                timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_read=120)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(sse_url, headers=headers) as resp:
+                        if resp.status != 200:
+                            self._log_live(
+                                f"SSE upstream returned {resp.status}: {await resp.text()[:200]}",
+                                level="warning",
+                            )
+                            await asyncio.sleep(2)
+                            continue
+                        async for raw_line in resp.content:
+                            line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                            if not line.startswith("data:"):
+                                continue
+                            data_str = line[5:].strip()
+                            if not data_str or data_str == "[DONE]":
+                                continue
+                            try:
+                                data = json.loads(data_str)
+                            except Exception:
+                                continue
+                            result = await adapter.on_sse_event(data)
+                            for msg in list(getattr(result, "client_messages", []) or []):
+                                try:
+                                    if isinstance(msg, (str, bytes)):
+                                        await client_websocket.send_text(
+                                            msg if isinstance(msg, str) else msg.decode()
+                                        )
+                                    else:
+                                        await client_websocket.send_json(msg)
+                                except Exception:
+                                    return
+                # Brief pause before re-connecting for next response turn
+                await asyncio.sleep(0.3)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                self._log_live(
+                    f"SSE upstream error for session={self._short_id(session_id)}: {exc}",
+                    level="warning",
+                )
+                await asyncio.sleep(2)
+
     async def _serve_realtime_proxy(
         self,
         *,
@@ -1838,8 +1902,22 @@ class MiniCPMLiveRouter(BaseRouter):
                     )
                 )
 
+                all_tasks: set[asyncio.Task] = {client_task, upstream_task}
+
+                # Optional: SSE side-channel for adapters that respond via HTTP SSE
+                sse_task: asyncio.Task | None = None
+                if adapter.upstream_sse_url():
+                    sse_task = asyncio.create_task(
+                        self._proxy_upstream_sse_loop(
+                            client_websocket=websocket,
+                            adapter=adapter,
+                            session_id=session_id,
+                        )
+                    )
+                    all_tasks.add(sse_task)
+
                 done, pending = await asyncio.wait(
-                    {client_task, upstream_task},
+                    all_tasks,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 for task in pending:
@@ -1850,7 +1928,8 @@ class MiniCPMLiveRouter(BaseRouter):
                     if task.cancelled():
                         continue
                     exc = task.exception()
-                    if exc is not None:
+                    # SSE task ending on its own is not an error
+                    if exc is not None and task is not sse_task:
                         raise exc
         except WebSocketDisconnect:
             pass

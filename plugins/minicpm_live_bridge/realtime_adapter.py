@@ -58,6 +58,22 @@ class BaseRealtimeAdapter:
     def upstream_connect_headers(self) -> dict[str, str]:
         return dict(self._upstream_headers)
 
+    def upstream_sse_url(self) -> str | None:
+        """Optional HTTP URL for the server-sent-events response stream.
+
+        When non-None the proxy will open a parallel SSE subscription and
+        forward the events to the client WebSocket via on_sse_event().
+        """
+        return None
+
+    def upstream_sse_headers(self) -> dict[str, str]:
+        """Extra headers for the SSE subscription request."""
+        return {}
+
+    async def on_sse_event(self, data: dict[str, Any]) -> RealtimeAdapterResult:
+        """Called for each parsed SSE data event from the upstream SSE stream."""
+        return RealtimeAdapterResult(client_messages=[data])
+
     async def on_client_message(self, payload: Any) -> RealtimeAdapterResult:
         self._remember_client_payload(payload)
         wire = self._to_wire_message(payload)
@@ -181,7 +197,6 @@ class MiniCPMRealtimeAdapter(BaseRealtimeAdapter):
             parsed = urllib.parse.urlparse(base_url)
             qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
             if "uid" not in qs:
-                # Use session_id as uid (truncated to 32 chars for safety)
                 uid_value = str(self.session_id or "neo_live")[:32]
                 qs["uid"] = [uid_value]
                 new_query = urllib.parse.urlencode(
@@ -191,6 +206,72 @@ class MiniCPMRealtimeAdapter(BaseRealtimeAdapter):
         except Exception:
             pass
         return base_url
+
+    def upstream_sse_url(self) -> str | None:
+        """Derive the SSE response URL from the WebSocket upstream URL.
+
+        ws://host:port/ws/api/v1/stream  →  http://host:port/api/v1/stream
+        ws://host:port/ws/stream         →  http://host:port/api/v1/stream
+        """
+        try:
+            parsed = urllib.parse.urlparse(self._upstream_url)
+            scheme = "https" if parsed.scheme == "wss" else "http"
+            path = parsed.path.rstrip("/")
+            # Strip leading /ws prefix if present
+            if path.startswith("/ws"):
+                path = path[3:] or "/"
+            # Map to /api/v1/stream regardless of original suffix
+            if path in {"", "/"}:
+                path = "/api/v1/stream"
+            elif not path.startswith("/api"):
+                path = "/api/v1/stream"
+            return urllib.parse.urlunparse((scheme, parsed.netloc, path, "", "", ""))
+        except Exception:
+            return None
+
+    def upstream_sse_headers(self) -> dict[str, str]:
+        uid_value = str(self.session_id or "neo_live")[:32]
+        headers: dict[str, str] = {"uid": uid_value}
+        headers.update(self._upstream_headers)
+        return headers
+
+    async def on_sse_event(self, data: dict[str, Any]) -> RealtimeAdapterResult:
+        """Map an SSE response chunk from the model server to client messages.
+
+        The model server sends chunks like:
+        {
+          "id": uid,
+          "response_id": N,
+          "choices": [{"role": "assistant", "audio": "<b64>", "text": "...",
+                        "finish_reason": "processing"}]
+        }
+        """
+        messages: list[Any] = []
+        choices = data.get("choices") or []
+        if isinstance(choices, dict):
+            choices = [choices]
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            finish = str(choice.get("finish_reason") or "")
+            if finish == "stop":
+                messages.extend(self._finalize_assistant_text(reason="sse.stop"))
+                messages.append({"type": "listen", "role": "assistant", "upstream_type": "sse.stop"})
+                continue
+            text_fragment = str(choice.get("text") or "")
+            audio_b64 = str(choice.get("audio") or "")
+            if text_fragment:
+                self._assistant_text_parts.append(text_fragment)
+                messages.append({"type": "text_delta", "role": "assistant", "delta": text_fragment})
+            if audio_b64:
+                messages.append({
+                    "type": "audio_delta",
+                    "role": "assistant",
+                    "audio": audio_b64,
+                    "sample_rate": 24000,
+                    "encoding": "pcm_f32le",
+                })
+        return RealtimeAdapterResult(client_messages=messages)
 
     async def on_client_message(self, payload: Any) -> RealtimeAdapterResult:
         self._remember_client_payload(payload)
@@ -387,8 +468,8 @@ class MiniCPMRealtimeAdapter(BaseRealtimeAdapter):
         return "audio" if mode == "audio" else "video"
 
     def _handle_unified_event_refresh(self) -> RealtimeAdapterResult:
-        messages = self._maybe_build_context_refresh(reason="unified.event", force=False)
-        return RealtimeAdapterResult(upstream_messages=messages)
+        # Model server protocol doesn't use session.update; nothing to send
+        return RealtimeAdapterResult()
 
     def _handle_audio_input(self, payload: dict[str, Any]) -> RealtimeAdapterResult:
         audio_base64, error = self._payload_to_minicpm_pcm_base64(payload)
@@ -403,30 +484,24 @@ class MiniCPMRealtimeAdapter(BaseRealtimeAdapter):
                 ]
             )
 
-        messages = self._ensure_session_update_messages(reason="audio.input")
-        messages.append(
-            self._build_audio_append(
-                audio_base64,
-                force_listen=bool(payload.get("force_listen")),
-            )
-        )
         self._chunks_sent += 1
-        return RealtimeAdapterResult(upstream_messages=messages)
+        return RealtimeAdapterResult(
+            upstream_messages=[
+                self._build_audio_append(
+                    audio_base64,
+                    force_listen=bool(payload.get("force_listen")),
+                )
+            ]
+        )
 
     def _ensure_session_update_messages(self, *, reason: str) -> list[str]:
-        if self._session_update_sent:
-            return []
-        return [self._build_session_update(reason=reason)]
+        # Model server protocol doesn't need a session.update handshake
+        self._session_update_sent = True
+        return []
 
     def _maybe_build_context_refresh(self, *, reason: str, force: bool) -> list[str]:
-        if not self._session_update_sent:
-            return []
-        now = time.monotonic()
-        if not force and (
-            now - self._last_session_update_monotonic
-            < self._CONTEXT_REFRESH_MIN_INTERVAL_SECONDS
-        ):
-            return []
+        # No-op for model server protocol
+        return []
         return [self._build_session_update(reason=reason)]
 
     def _build_session_update(self, *, reason: str) -> str:
@@ -443,15 +518,26 @@ class MiniCPMRealtimeAdapter(BaseRealtimeAdapter):
         return json.dumps(payload, ensure_ascii=False)
 
     def _build_audio_append(self, audio_base64: str, *, force_listen: bool = False) -> str:
+        """Build an audio input message for the MiniCPM-o model server.
+
+        Protocol: /ws/api/v1/stream expects
+          {"messages": [{"role": "user", "content": [
+              {"type": "input_audio", "input_audio": {"data": "<b64>"}},
+              {"type": "image_data", "image_data": {"data": "<b64>"}}  // optional
+          ]}]}
+        """
+        content: list[dict[str, Any]] = [
+            {"type": "input_audio", "input_audio": {"data": audio_base64, "timestamp": ""}}
+        ]
+        if self._last_video_frame_base64:
+            content.append(
+                {"type": "image_data", "image_data": {"data": self._last_video_frame_base64}}
+            )
         payload: dict[str, Any] = {
-            "type": "input_audio_buffer.append",
-            "audio": audio_base64,
+            "messages": [{"role": "user", "content": content}]
         }
         if force_listen:
             payload["force_listen"] = True
-        if self._realtime_mode == "video" and self._last_video_frame_base64:
-            payload["video_frames"] = [self._last_video_frame_base64]
-            payload["max_slice_nums"] = self._max_slice_nums()
         return json.dumps(payload, ensure_ascii=False)
 
     def _max_slice_nums(self) -> int:

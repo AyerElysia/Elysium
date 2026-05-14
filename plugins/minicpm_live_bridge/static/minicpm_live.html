@@ -924,7 +924,35 @@
         playAudioMessage(message);
       } else if (type === 'listen') {
         stopPcmOutput();
+        state._streamingLogEntry = null;
         setBadge(el.wsBadge, 'ws listening', 'ok');
+      } else if (type === 'audio_delta') {
+        // Native PCM audio chunk from MiniCPM-o model server via SSE side-channel
+        if (message.audio) {
+          const enc = message.encoding || 'pcm_f32le';
+          const sr = Number(message.sample_rate || 24000);
+          if (enc === 'pcm_f32le') {
+            playPcmFloat32Chunk(message.audio, sr);
+          } else {
+            // Fallback: treat as WAV/generic base64
+            const src = `data:audio/wav;base64,${message.audio}`;
+            stopSpokenOutput();
+            state.currentAudio = new Audio(src);
+            state.currentAudio.play().catch(e => addLog('audio', String(e), 'error'));
+          }
+        }
+      } else if (type === 'text_delta') {
+        // Streaming text fragment from model
+        const delta = message.delta || message.text || '';
+        if (delta) {
+          // Accumulate into a live partial log entry
+          if (!state._streamingLogEntry) {
+            state._streamingLogEntry = addLog('assistant', delta, 'assistant');
+          } else {
+            const cur = state._streamingLogEntry.textContent || '';
+            state._streamingLogEntry.textContent = cur + delta;
+          }
+        }
       } else if (type === 'status') {
         addLog('server', message.text || message.status || JSON.stringify(message));
       } else if (String(type).startsWith('screen.')) {
