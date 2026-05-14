@@ -76,6 +76,12 @@ class BaseRealtimeAdapter:
         """
         return None
 
+    def upstream_sse_method(self) -> str:
+        return "GET"
+
+    def upstream_sse_payload(self) -> dict[str, Any] | None:
+        return None
+
     def upstream_sse_headers(self) -> dict[str, str]:
         """Extra headers for the SSE subscription request."""
         return {}
@@ -260,26 +266,17 @@ class MiniCPMRealtimeAdapter(BaseRealtimeAdapter):
                 return
 
     def upstream_sse_url(self) -> str | None:
-        """Derive the SSE response URL from the WebSocket upstream URL.
-
-        ws://host:port/ws/api/v1/stream  →  http://host:port/api/v1/stream
-        ws://host:port/ws/stream         →  http://host:port/api/v1/stream
-        """
+        """MiniCPM-o streams model responses from POST /api/v1/completions."""
         try:
-            parsed = urllib.parse.urlparse(self._upstream_url)
-            scheme = "https" if parsed.scheme == "wss" else "http"
-            path = parsed.path.rstrip("/")
-            # Strip leading /ws prefix if present
-            if path.startswith("/ws"):
-                path = path[3:] or "/"
-            # Map to /api/v1/stream regardless of original suffix
-            if path in {"", "/"}:
-                path = "/api/v1/stream"
-            elif not path.startswith("/api"):
-                path = "/api/v1/stream"
-            return urllib.parse.urlunparse((scheme, parsed.netloc, path, "", "", ""))
+            return self._upstream_http_url("/api/v1/completions")
         except Exception:
             return None
+
+    def upstream_sse_method(self) -> str:
+        return "POST"
+
+    def upstream_sse_payload(self) -> dict[str, Any] | None:
+        return {"messages": []}
 
     def upstream_sse_headers(self) -> dict[str, str]:
         uid_value = str(self.session_id or "neo_live")[:32]

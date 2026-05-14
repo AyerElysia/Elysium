@@ -1806,17 +1806,24 @@ class MiniCPMLiveRouter(BaseRouter):
         sse_url = adapter.upstream_sse_url()
         if not sse_url:
             return
+        method = str(getattr(adapter, "upstream_sse_method", lambda: "GET")() or "GET").upper()
+        payload = getattr(adapter, "upstream_sse_payload", lambda: None)()
         headers = adapter.upstream_sse_headers()
 
         while True:
             try:
                 timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_read=120)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(sse_url, headers=headers) as resp:
+                    async with session.request(
+                        method,
+                        sse_url,
+                        headers=headers,
+                        json=payload,
+                    ) as resp:
                         if resp.status != 200:
                             body_preview = (await resp.text())[:200]
                             self._log_live(
-                                f"SSE upstream returned {resp.status}: {body_preview}",
+                                f"SSE upstream returned {resp.status} via {method}: {body_preview}",
                                 level="warning",
                             )
                             await asyncio.sleep(2)
