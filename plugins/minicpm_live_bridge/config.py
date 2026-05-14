@@ -278,21 +278,21 @@ class MiniCPMLiveBridgeConfig(BaseConfig):
             tag="ai",
             order=4,
         )
-        sensitivity: float = Field(
-            default=3.0,
-            ge=1.0,
-            le=20.0,
-            description="噪底倍数：语音触发阈值 = 环境噪底 × sensitivity。越大越不灵敏，越小越容易触发。建议 2.5–5.0。",
-            label="灵敏度倍数",
+        speech_start_threshold: float = Field(
+            default=0.50,
+            ge=0.1,
+            le=0.95,
+            description="Silero 神经网络判定「开始说话」的概率阈值（0.1–0.95）。越小越灵敏，越大越严格；默认 0.50。",
+            label="开始说话阈值",
             tag="ai",
             order=5,
         )
-        speech_ratio: float = Field(
+        speech_end_threshold: float = Field(
             default=0.35,
-            ge=0.1,
-            le=0.8,
-            description="触发人声检测所需的语音频段（200–3500 Hz）能量占总能量的最低比例。提高此值可更严格地排除非人声（如音乐、敲击声）；建议 0.30–0.50。",
-            label="语音频段占比",
+            ge=0.05,
+            le=0.90,
+            description="Silero 神经网络判定「停止说话」的概率阈值（0.05–0.90）；应低于 speech_start_threshold，默认 0.35。",
+            label="停止说话阈值",
             tag="ai",
             order=6,
         )
