@@ -256,11 +256,11 @@
           <div class="buttons">
             <button id="startBtn" class="primary">开始</button>
             <button id="stopBtn" class="danger" disabled>停止</button>
-            <button id="voiceBtn" disabled>语音</button>
-            <button id="vadBtn" disabled>自动语音</button>
-            <button id="duplexBtn" disabled>全双工: 关</button>
-            <button id="interruptBtn" disabled>打断</button>
+            <button id="duplexBtn" disabled>模式：非全双工</button>
             <a id="externalLink" class="button" target="_blank" rel="noreferrer" hidden>外部前端</a>
+            <button id="voiceBtn" disabled hidden aria-hidden="true" tabindex="-1">语音</button>
+            <button id="vadBtn" disabled hidden aria-hidden="true" tabindex="-1">自动语音</button>
+            <button id="interruptBtn" disabled hidden aria-hidden="true" tabindex="-1">打断</button>
           </div>
           <div class="metric">
             <span id="sessionText">session: -</span>
@@ -405,6 +405,27 @@
       postClientDebug(kind === 'error' ? 'error' : 'info', text, { role, kind });
     }
 
+    function updateModeButton() {
+      el.duplexBtn.textContent = state.fullDuplex ? '模式：全双工' : '模式：非全双工';
+      el.duplexBtn.classList.toggle('primary', state.fullDuplex);
+    }
+
+    function ensureAutomaticListening(reason = 'auto') {
+      if (!state.sessionId || !state.audioStream || state.vad || state.stopping) return;
+      startVad()
+        .then(() => {
+          postClientDebug('info', 'automatic vad enabled', { reason, full_duplex: state.fullDuplex });
+        })
+        .catch(error => {
+          addLog('system', `自动语音启动失败: ${error}`, 'error');
+          postClientDebug('error', 'automatic vad failed', {
+            reason,
+            full_duplex: state.fullDuplex,
+            error: String(error),
+          });
+        });
+    }
+
     async function apiFetch(path, options = {}) {
       const headers = Object.assign({}, options.headers || {});
       if (token) headers['X-API-Key'] = token;
@@ -479,9 +500,8 @@
       }
       if (typeof config.session?.full_duplex_default === 'boolean') {
         state.fullDuplex = config.session.full_duplex_default;
-        el.duplexBtn.textContent = `全双工: ${state.fullDuplex ? '开' : '关'}`;
-        el.duplexBtn.classList.toggle('primary', state.fullDuplex);
       }
+      updateModeButton();
     }
 
     async function createSession() {
@@ -1099,6 +1119,7 @@
         }
         startScreenFrames();
         window.setTimeout(startAudioChunks, 300);
+        window.setTimeout(() => ensureAutomaticListening('session.start'), 350);
         el.stopBtn.disabled = false;
         el.interruptBtn.disabled = false;
         el.sendTextBtn.disabled = false;
@@ -1245,10 +1266,10 @@
 
     function toggleFullDuplex() {
       state.fullDuplex = !state.fullDuplex;
-      el.duplexBtn.textContent = `全双工: ${state.fullDuplex ? '开' : '关'}`;
-      el.duplexBtn.classList.toggle('primary', state.fullDuplex);
+      updateModeButton();
       addLog('system', `full-duplex mode ${state.fullDuplex ? 'ON' : 'OFF'}`);
       postClientDebug('info', 'full_duplex toggled', { enabled: state.fullDuplex });
+      ensureAutomaticListening('mode.toggle');
       if (!state.fullDuplex) {
         abortStreamingTurn();
       }
