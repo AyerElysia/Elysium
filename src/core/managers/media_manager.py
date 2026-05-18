@@ -884,9 +884,7 @@ class MediaManager:
                 return None
 
             # 创建 VLM 请求
-            context_manager = LLMContextManager(
-                max_payloads=3,
-            )
+            context_manager = LLMContextManager()
             request = create_llm_request(
                 self._vlm_model_set,
                 "image_recognition",
@@ -1061,7 +1059,7 @@ class MediaManager:
             request = create_llm_request(
                 model_set,
                 "video_frame_summary",
-                context_manager=LLMContextManager(max_payloads=4),
+                context_manager=LLMContextManager(),
             )
 
             filename = str(metadata.get("filename", "video.mp4") or "video.mp4")

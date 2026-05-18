@@ -45,13 +45,12 @@ class LLMContextManager:
     1. 接管 payload 列表写入（add_payload/system/tool）；
     2. 接管 reminder 的延迟登记；
     3. 在写入后执行结构校验（strict，不做自动修复）；
-    4. 最后按 max_payloads/token_budget 执行裁剪。
+    4. 发送前按模型 token budget 执行裁剪。
 
     对于 reminder：固定注入为前置 SYSTEM 块（靠前且稳定），
     每次注入前会先清理旧 reminder，避免在上下文中重复堆积。
     """
 
-    max_payloads: int | None = None
     compression_hook: CompressionHook | None = None
     _reminders: list[RegisteredReminder] | None = None
     _reminder_sources: list[RegisteredReminderSource] | None = None
@@ -418,7 +417,7 @@ class LLMContextManager:
         token_counter: TokenCounter | None = None,
     ) -> list[LLMPayload]:
         """
-        根据 max_payloads 和 max_token_budget 对 payloads 进行裁剪。
+        根据 max_token_budget 对 payloads 进行裁剪。
 
         裁剪策略：
         1. 保留开头的系统/工具消息（pinned prefix）。
@@ -427,26 +426,15 @@ class LLMContextManager:
         4. 如果 max_token_budget 仍然超出，则继续裁剪剩余的对话组，直到满足预算。
         """
 
-        trimmed = payloads
-
-        # 首先根据 max_payloads 进行裁剪
-        if (
-            self.max_payloads is not None
-            and self.max_payloads > 0
-            and len(trimmed) > self.max_payloads
-        ):
-            trimmed = self._trim_by_payloads(trimmed, self.max_payloads)
-
-        # 然后根据 max_token_budget 进行裁剪
         if (
             max_token_budget is not None
             and max_token_budget > 0
             and token_counter is not None
-            and token_counter(trimmed) > max_token_budget
+            and token_counter(payloads) > max_token_budget
         ):
-            trimmed = self._trim_by_tokens(trimmed, max_token_budget, token_counter)
+            return self._trim_by_tokens(payloads, max_token_budget, token_counter)
 
-        return trimmed
+        return payloads
 
     def _trim_by_tokens(
         self,
@@ -486,43 +474,6 @@ class LLMContextManager:
             return combined
 
         return pinned + remaining_payloads
-
-    def _trim_by_payloads(
-        self, payloads: list[LLMPayload], max_payloads: int
-    ) -> list[LLMPayload]:
-        """
-        根据 max_payloads 对 payloads 进行裁剪
-        """
-        pinned, tail = self._split_pinned_prefix(payloads)
-        groups = self._build_qa_groups(tail)
-        if not groups:
-            return payloads
-
-        kept_groups = list(groups)
-        dropped_groups: list[list[LLMPayload]] = []
-
-        # 先尝试直接裁剪对话组，保留 pinned 和尽可能多的对话组，直到满足 max_payloads 约束
-        while (
-            len(kept_groups) > 1
-            and self._payload_len(pinned, kept_groups) > max_payloads
-        ):
-            dropped_groups.append(kept_groups.pop(0))
-
-        remaining_payloads = self._flatten_groups(kept_groups)
-
-        # 如果提供了 compression_hook，则在裁剪掉一批对话组后，调用该 hook 生成压缩后的消息，并将其插入剩余消息的开头
-        hook_payloads = self._apply_compression_hook(dropped_groups, remaining_payloads)
-        if hook_payloads:
-            remaining_payloads = self._flatten_groups(kept_groups)
-
-        # 最后检查一次总长度，如果仍然超出 max_payloads，则继续裁剪剩余的对话组，直到满足约束
-        while len(kept_groups) > 1 and (
-            len(pinned) + len(hook_payloads) + len(remaining_payloads) > max_payloads
-        ):
-            kept_groups.pop(0)
-            remaining_payloads = self._flatten_groups(kept_groups)
-
-        return pinned + hook_payloads + remaining_payloads
 
     def _split_pinned_prefix(
         self, payloads: list[LLMPayload]
@@ -580,11 +531,3 @@ class LLMContextManager:
     def _flatten_groups(self, groups: list[list[LLMPayload]]) -> list[LLMPayload]:
         """将分组扁平化为单一列表"""
         return [payload for group in groups for payload in group]
-
-    def _payload_len(
-        self, pinned: list[LLMPayload], groups: list[list[LLMPayload]]
-    ) -> int:
-        """
-        计算有效负载的总长度，包括 pinned 消息和对话组消息
-        """
-        return len(pinned) + sum(len(group) for group in groups)

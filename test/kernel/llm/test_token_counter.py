@@ -67,7 +67,7 @@ def test_multimodal_payload_does_not_force_context_tail_drop() -> None:
         LLMPayload(ROLE.ASSISTANT, Text("上一轮回复")),
         LLMPayload(ROLE.USER, [Text("这一轮发了表情包"), Image(f"base64|{huge_b64}")]),
     ]
-    manager = LLMContextManager(max_payloads=100)
+    manager = LLMContextManager()
 
     trimmed = manager.maybe_trim(
         payloads,

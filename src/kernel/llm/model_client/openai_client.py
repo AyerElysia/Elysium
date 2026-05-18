@@ -830,6 +830,7 @@ class OpenAIChatClient:
     - ``trust_env``：是否信任系统代理环境变量，默认 True。
     - ``force_ipv4``：是否强制使用 IPv4 出口，默认 False。
     - ``context_reserve_ratio`` / ``context_reserve_tokens``：由上层策略使用，此处忽略。
+    - ``context_compression_trigger_tokens`` / ``context_compression_trigger_ratio``：由上层上下文压缩策略使用，此处忽略。
     - ``force_sync_http``：已废弃，忽略。
     """
 
@@ -1032,6 +1033,8 @@ class OpenAIChatClient:
         # 以下键由上层策略消费，client 侧不传给 API
         extra_params.pop("context_reserve_ratio", None)
         extra_params.pop("context_reserve_tokens", None)
+        extra_params.pop("context_compression_trigger_tokens", None)
+        extra_params.pop("context_compression_trigger_ratio", None)
         extra_params.pop("force_sync_http", None)
 
         timeout_float = float(timeout) if isinstance(timeout, (int, float)) else None

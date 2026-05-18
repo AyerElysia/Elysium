@@ -37,6 +37,7 @@ def dummy_model_set():
             "price_out": 0.0,
             "temperature": 0.1,
             "max_tokens": 10,
+            "max_context": 4096,
             "extra_params": {},
         }
     ]
@@ -448,7 +449,7 @@ async def test_response_add_payload_uses_context_manager_add_payload() -> None:
 
     class SpyManager(LLMContextManager):
         def __init__(self) -> None:
-            super().__init__(max_payloads=20)
+            super().__init__()
             self.called = False
 
         def add_payload(self, payloads, payload, position=None):
@@ -477,7 +478,7 @@ async def test_response_add_call_reflex_uses_context_manager_add_payload() -> No
 
     class SpyManager(LLMContextManager):
         def __init__(self) -> None:
-            super().__init__(max_payloads=20)
+            super().__init__()
             self.called_count = 0
 
         def add_payload(self, payloads, payload, position=None):

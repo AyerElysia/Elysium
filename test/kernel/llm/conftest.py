@@ -52,6 +52,7 @@ def mock_model_config() -> dict[str, Any]:
         "price_out": 0.00006,
         "temperature": 0.7,
         "max_tokens": 4096,
+        "max_context": 32768,
         "extra_params": {},
     }
 

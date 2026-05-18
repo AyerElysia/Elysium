@@ -450,7 +450,7 @@ async def _analyze_screenshot_with_model(
     request = create_llm_request(
         model_set,
         request_name=request_name,
-        context_manager=LLMContextManager(max_payloads=4),
+        context_manager=LLMContextManager(),
     )
     request.add_payload(LLMPayload(ROLE.SYSTEM, Text(_SCREEN_SYSTEM_PROMPT)))
     request.add_payload(LLMPayload(ROLE.USER, [Text(prompt), Image(image_data_url)]))

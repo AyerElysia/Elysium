@@ -146,7 +146,7 @@ class ModelInfoSection(SectionBase):
     )
     max_context: int = Field(
         default=32768,
-        description="模型最大输入上下文 token 数",
+        description="模型最大输入上下文 token 数；发送前上下文压缩会以此作为硬预算。",
     )
     tool_call_compat: bool = Field(
         default=False,
@@ -154,7 +154,11 @@ class ModelInfoSection(SectionBase):
     )
     extra_params: dict[str, Any] = Field(
         default_factory=dict,
-        description="额外参数（用于 API 调用时的额外配置）",
+        description=(
+            "额外参数（用于 API 调用时的额外配置）。"
+            "上下文策略保留键：context_reserve_tokens/context_reserve_ratio、"
+            "context_compression_trigger_tokens/context_compression_trigger_ratio。"
+        ),
     )
     anti_truncation: bool = Field(
         default=False,

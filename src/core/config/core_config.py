@@ -120,11 +120,6 @@ class CoreConfig(ConfigBase):
             default=20,
             description="每个聊天流在内存中保留的最大历史消息数",
         )
-        max_llm_messages: int = Field(
-            default=20,
-            ge=0,
-            description="单次 LLM 请求允许携带的最大消息数，设为 0 表示不限制",
-        )
         image_recognition_prompt: str = Field(
             default="",
             description="自定义识图提示词，留空则使用内置默认提示词",
@@ -134,11 +129,13 @@ class CoreConfig(ConfigBase):
         @classmethod
         def _migrate_legacy_max_context_size(cls, data):
             """兼容旧字段 max_context_size。"""
-            if isinstance(data, dict) and "max_context_size" in data:
+            if isinstance(data, dict):
                 data = dict(data)
-                legacy_value = data.pop("max_context_size")
-                data.setdefault("max_history_messages", legacy_value)
-                data.setdefault("max_llm_messages", legacy_value)
+                if "max_context_size" in data:
+                    legacy_value = data.pop("max_context_size")
+                    data.setdefault("max_history_messages", legacy_value)
+                # 旧版 LLM 上下文按消息数限制；现在改为模型级 token 触发压缩。
+                data.pop("max_llm_messages", None)
             return data
 
         @property
@@ -456,7 +453,7 @@ def _inject_kernel_llm_policy(config: CoreConfig) -> None:
 
 
 def _migrate_legacy_chat_context_config(config_path: "Path") -> None:
-    """迁移旧的 chat.max_context_size 到拆分后的配置字段。"""
+    """迁移旧的 chat.max_context_size，并移除废弃的 chat.max_llm_messages。"""
     import tomllib
 
     if not config_path.exists():
@@ -469,12 +466,20 @@ def _migrate_legacy_chat_context_config(config_path: "Path") -> None:
         return
 
     chat_config = raw_config.get("chat")
-    if not isinstance(chat_config, dict) or "max_context_size" not in chat_config:
+    if not isinstance(chat_config, dict):
         return
 
-    legacy_value = chat_config.pop("max_context_size")
-    chat_config.setdefault("max_history_messages", legacy_value)
-    chat_config.setdefault("max_llm_messages", legacy_value)
+    changed = False
+    if "max_context_size" in chat_config:
+        legacy_value = chat_config.pop("max_context_size")
+        chat_config.setdefault("max_history_messages", legacy_value)
+        changed = True
+    if "max_llm_messages" in chat_config:
+        chat_config.pop("max_llm_messages")
+        changed = True
+
+    if not changed:
+        return
 
     from src.kernel.config.core import (
         _merge_with_model_defaults,

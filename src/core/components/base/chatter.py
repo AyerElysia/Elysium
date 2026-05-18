@@ -479,7 +479,6 @@ class BaseChatter(ABC):
         self,
         task: str = "actor",
         request_name: str = "",
-        max_context: int | None = None,
         with_reminder: str | SystemReminderBucket | None = None,
     ) -> "LLMRequest":
         """快速创建 LLM 请求，自动加载任务模型集与上下文管理器。
@@ -490,7 +489,6 @@ class BaseChatter(ABC):
         Args:
             task: 模型任务名称（对应 config/model.toml 中的 task key），默认 "actor"
             request_name: LLM 请求名称，默认使用 chatter_name
-            max_context: 上下文最大 payload 数，None 时从 core config 读取；0 表示不限制
             with_reminder: 可选的 system reminder bucket；传入后会自动登记到上下文管理器
 
         Returns:
@@ -499,19 +497,12 @@ class BaseChatter(ABC):
         Raises:
             KeyError: 当 task 在模型配置中不存在时
         """
-        from src.core.config import get_model_config, get_core_config
+        from src.core.config import get_model_config
         from src.kernel.llm.request import LLMRequest
         from src.kernel.llm.context import LLMContextManager
 
         model_set = get_model_config().get_task(task)
-        chat_config = get_core_config().chat
-        default_max_payloads = getattr(chat_config, "max_llm_messages", None)
-        if not isinstance(default_max_payloads, int):
-            default_max_payloads = getattr(chat_config, "max_context_size", 20)
-        max_payloads = max_context if max_context is not None else default_max_payloads
-        context_manager = LLMContextManager(
-            max_payloads=max_payloads,
-        )
+        context_manager = LLMContextManager()
 
         _logger = get_logger("chatter")
         if model_set:

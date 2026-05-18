@@ -548,7 +548,7 @@ class EmojiSenderService(BaseService):
 
         from src.kernel.llm import Image, LLMContextManager, LLMPayload, ROLE, Text
 
-        context_manager = LLMContextManager(max_payloads=2)
+        context_manager = LLMContextManager()
         request = create_llm_request(
             model_set=model_set,
             request_name="emoji_sender_label",

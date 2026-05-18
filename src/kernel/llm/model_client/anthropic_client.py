@@ -512,6 +512,8 @@ class AnthropicChatClient:
         force_ipv4 = bool(extra_params.pop("force_ipv4", False))
         extra_params.pop("context_reserve_ratio", None)
         extra_params.pop("context_reserve_tokens", None)
+        extra_params.pop("context_compression_trigger_tokens", None)
+        extra_params.pop("context_compression_trigger_ratio", None)
         extra_params.pop("force_sync_http", None)
 
         timeout_float = float(timeout) if isinstance(timeout, (int, float)) else None

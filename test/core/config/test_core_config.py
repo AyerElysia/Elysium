@@ -20,7 +20,7 @@ class TestChatSection:
         assert config.default_chat_mode == "normal"
         assert config.max_context_size == 20
         assert config.max_history_messages == 20
-        assert config.max_llm_messages == 20
+        assert not hasattr(config, "max_llm_messages")
 
     def test_custom_chat_config(self):
         """测试自定义聊天配置。"""
@@ -33,15 +33,15 @@ class TestChatSection:
         assert config.default_chat_mode == "focus"
         assert config.max_history_messages == 200
         assert config.max_context_size == 200
-        assert config.max_llm_messages == 0
+        assert not hasattr(config, "max_llm_messages")
 
     def test_legacy_max_context_size_config(self):
-        """旧 max_context_size 应同时映射历史保留和 LLM 携带上限。"""
+        """旧 max_context_size 只映射聊天流历史保留。"""
         config = CoreConfig.ChatSection(max_context_size=200)
 
         assert config.max_context_size == 200
         assert config.max_history_messages == 200
-        assert config.max_llm_messages == 200
+        assert not hasattr(config, "max_llm_messages")
 
 
 class TestLLMSection:
@@ -163,13 +163,13 @@ context_validation_mode = \"repair\"
             assert config.chat.default_chat_mode == "focus"
             assert config.chat.max_context_size == 150
             assert config.chat.max_history_messages == 150
-            assert config.chat.max_llm_messages == 150
+            assert not hasattr(config.chat, "max_llm_messages")
 
             updated = config_file.read_text(encoding="utf-8")
             assert "context_validation_mode" not in updated
             assert "max_context_size" not in updated
             assert "max_history_messages" in updated
-            assert "max_llm_messages" in updated
+            assert "max_llm_messages" not in updated
         finally:
             core_config_module._global_config = original_config
 
@@ -198,7 +198,7 @@ class TestCoreConfig:
 
         assert config.chat.default_chat_mode == "proactive"
         assert config.chat.max_history_messages == 150
-        assert config.chat.max_llm_messages == 75
+        assert not hasattr(config.chat, "max_llm_messages")
 
     def test_database_settings(self):
         """测试数据库配置设置。"""
@@ -240,7 +240,7 @@ class TestCoreConfig:
 
         assert config.chat.default_chat_mode == "priority"
         assert config.chat.max_history_messages == 200
-        assert config.chat.max_llm_messages == 0
+        assert not hasattr(config.chat, "max_llm_messages")
         assert config.llm.default_policy == "round_robin"
         assert config.database.database_type == "postgresql"
         assert len(config.permissions.owner_list) == 2
@@ -294,7 +294,7 @@ allow_operator_promotion = true
             assert config.chat.default_chat_mode == "focus"
             assert config.chat.max_context_size == 150
             assert config.chat.max_history_messages == 150
-            assert config.chat.max_llm_messages == 150
+            assert not hasattr(config.chat, "max_llm_messages")
             assert config.llm.default_policy == "round_robin"
             assert config.database.database_type == "postgresql"
             assert len(config.permissions.owner_list) == 2
@@ -397,7 +397,7 @@ class TestCoreConfigScenarios:
         )
 
         assert config.chat.max_history_messages == 50
-        assert config.chat.max_llm_messages == 25
+        assert not hasattr(config.chat, "max_llm_messages")
         assert config.permissions.strict_mode is False
         assert config.permissions.log_permission_granted is True
 
@@ -421,7 +421,7 @@ class TestCoreConfigScenarios:
 
         assert config.database.database_type == "postgresql"
         assert config.chat.max_history_messages == 200
-        assert config.chat.max_llm_messages == 0
+        assert not hasattr(config.chat, "max_llm_messages")
         assert config.permissions.enable_permission_cache is True
 
     def test_multi_owner_config(self):

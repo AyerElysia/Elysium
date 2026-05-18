@@ -319,6 +319,7 @@ class TestValidateModelEntry:
             "price_out": 0.00006,
             "temperature": 0.7,
             "max_tokens": 4096,
+            "max_context": 32768,
             "extra_params": {},
         }
         result = _validate_model_entry(model)
@@ -349,6 +350,7 @@ class TestValidateModelEntry:
             "price_out": 0.00006,
             "temperature": 0.7,
             "max_tokens": 4096,
+            "max_context": 32768,
             "extra_params": "not_a_dict",  # type: ignore
         }
         with pytest.raises(LLMConfigurationError, match="model.extra_params 必须是 dict"):
@@ -371,6 +373,7 @@ class TestValidateModelEntry:
             "price_out": 0.00006,
             "temperature": 0.7,
             "max_tokens": 4096,
+            "max_context": 32768,
             "tool_call_compat": "true",  # type: ignore
             "extra_params": {},
         }
@@ -552,6 +555,41 @@ class TestLLMRequestSend:
         assert len(response.payloads) == 12
 
     @pytest.mark.asyncio
+    async def test_send_applies_context_compression_trigger_tokens(
+        self, mock_model_set: list[dict[str, Any]], monkeypatch
+    ) -> None:
+        """Test that per-model trigger tokens compress before hard max_context."""
+
+        class CaptureClient(MockChatClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.last_payloads: list[LLMPayload] = []
+
+            async def create(self, **kwargs):  # type: ignore[override]
+                self.last_payloads = kwargs["payloads"]
+                return "ok", None, None
+
+        mock_model_set[0]["max_context"] = 1000
+        mock_model_set[0]["extra_params"]["context_compression_trigger_tokens"] = 120
+
+        request = LLMRequest(mock_model_set, "test")
+        for idx in range(6):
+            request.add_payload(LLMPayload(ROLE.USER, Text(f"q{idx}")))
+            request.add_payload(LLMPayload(ROLE.ASSISTANT, Text(f"a{idx}")))
+
+        monkeypatch.setattr(
+            "src.kernel.llm.request.count_payload_tokens",
+            lambda payloads, model_identifier: len(payloads) * 30,
+        )
+
+        capture_client = CaptureClient()
+        request.clients.openai = capture_client
+
+        await request.send(stream=False)
+
+        assert len(capture_client.last_payloads) <= 4
+
+    @pytest.mark.asyncio
     async def test_send_success_streaming(
         self, mock_model_set: list[dict[str, Any]]
     ) -> None:
@@ -691,6 +729,7 @@ class TestLLMRequestSend:
                 "price_out": 0.00006,
                 "temperature": 0.7,
                 "max_tokens": 4096,
+                "max_context": 32768,
                 "extra_params": {},
             }
         ]
@@ -792,6 +831,7 @@ class TestLLMRequestSend:
                 "price_out": 0.00006,
                 "temperature": 0.7,
                 "max_tokens": 4096,
+                "max_context": 32768,
                 "extra_params": {},
             }
         ]

@@ -42,7 +42,8 @@ FIELD_NAMES_CN: dict[str, str] = {
     "tick_interval":                    "主循环间隔",
     # chat
     "default_chat_mode":                "默认聊天模式",
-    "max_context_size":                 "最大上下文条数",
+    "max_history_messages":             "最大历史消息数",
+    "max_context_size":                 "最大历史消息数",
     # personality
     "nickname":                         "Bot 昵称",
     "alias_names":                      "别名列表",

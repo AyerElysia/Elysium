@@ -78,7 +78,7 @@ def test_life_chatter_persistent_user_prompt_excludes_dynamic_context() -> None:
 
 
 def test_life_chatter_context_compression_hook_preserves_dropped_history() -> None:
-    manager = LLMContextManager(max_payloads=4)
+    manager = LLMContextManager()
     request = SimpleNamespace(context_manager=manager)
 
     LifeChatter._install_context_compression_hook(request)
@@ -91,7 +91,11 @@ def test_life_chatter_context_compression_hook_preserves_dropped_history() -> No
         LLMPayload(ROLE.ASSISTANT, Text("新回复")),
     ]
 
-    trimmed = manager.maybe_trim(payloads)
+    trimmed = manager.maybe_trim(
+        payloads,
+        max_token_budget=4,
+        token_counter=lambda items: len(items),
+    )
 
     assert len(trimmed) == 4
     assert trimmed[0].role == ROLE.SYSTEM

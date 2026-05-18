@@ -206,35 +206,68 @@ class LLMRequest:
         effective_budget = max_context - reserve
         return effective_budget if effective_budget > 0 else 1
 
+    def _compute_context_compression_trigger(self, model: ModelEntry) -> int | None:
+        """计算当前模型的上下文压缩触发阈值。
+
+        优先读取 ``extra_params.context_compression_trigger_tokens``，例如
+        max_context=100000 时可设为 90000。未设置时可用
+        ``extra_params.context_compression_trigger_ratio`` 指定比例；都未设置则
+        使用有效上下文预算。
+        """
+
+        effective_budget = self._compute_effective_context_budget(model)
+        if effective_budget is None:
+            return None
+
+        extra_params = model.get("extra_params")
+        if not isinstance(extra_params, dict):
+            extra_params = {}
+
+        trigger_tokens = extra_params.get("context_compression_trigger_tokens")
+        if isinstance(trigger_tokens, int) and trigger_tokens > 0:
+            return min(trigger_tokens, effective_budget)
+
+        trigger_ratio = extra_params.get("context_compression_trigger_ratio")
+        max_context = model.get("max_context")
+        if (
+            isinstance(trigger_ratio, (int, float))
+            and trigger_ratio > 0
+            and isinstance(max_context, int)
+            and max_context > 0
+        ):
+            ratio_budget = int(math.floor(max_context * float(trigger_ratio)))
+            return min(max(1, ratio_budget), effective_budget)
+
+        return effective_budget
+
     def _maybe_trim_payloads_for_model(
         self, payloads: list[LLMPayload], model: ModelEntry
     ) -> list[LLMPayload]:
         """
-        根据模型的上下文限制和保留策略，裁剪 payloads 以适应当前模型。
+        根据模型的上下文触发阈值，裁剪/压缩 payloads 以适应当前模型。
         """
         if not self.context_manager:
             return payloads
         
-        budget = self._compute_effective_context_budget(model)
+        budget = self._compute_context_compression_trigger(model)
         model_identifier = model.get("model_identifier")
 
-        # 如果无法计算有效预算，或者 model_identifier 无效，则直接使用 context_manager 的默认裁剪逻辑（基于 max_payloads）。
         if (
             budget is None
             or not isinstance(model_identifier, str)
             or not model_identifier
         ):
-            return self.context_manager.maybe_trim(payloads)
+            return payloads
 
         try:
-            # 首先快速检查当前 payloads 是否已经在预算内，如果是，则直接返回（避免不必要的裁剪和 token 计数）。
+            # 未达到触发阈值时不做任何历史裁剪，保持长生命周期上下文完整。
             if (
                 count_payload_tokens(payloads, model_identifier=model_identifier)
                 <= budget
             ):
-                return self.context_manager.maybe_trim(payloads)
+                return payloads
         except RuntimeError:
-            return self.context_manager.maybe_trim(payloads)
+            return payloads
 
         def token_counter(items: list[LLMPayload]) -> int:
             """
@@ -511,6 +544,7 @@ def _validate_model_entry(model: dict[str, Any]) -> ModelEntry:
         "price_out",
         "temperature",
         "max_tokens",
+        "max_context",
         "extra_params",
     ]
 
@@ -529,8 +563,8 @@ def _validate_model_entry(model: dict[str, Any]) -> ModelEntry:
         model.get("force_stream_mode"), bool
     ):
         raise LLMConfigurationError("model.force_stream_mode 必须是 bool")
-    if "max_context" in model and not isinstance(model.get("max_context"), int):
-        raise LLMConfigurationError("model.max_context 必须是 int")
+    if not isinstance(model.get("max_context"), int) or model.get("max_context", 0) <= 0:
+        raise LLMConfigurationError("model.max_context 必须是正整数")
 
     extra_params = model.get("extra_params", {})
     if isinstance(extra_params, dict):
@@ -546,11 +580,21 @@ def _validate_model_entry(model: dict[str, Any]) -> ModelEntry:
             raise LLMConfigurationError(
                 "model.extra_params.context_reserve_tokens 必须是 int"
             )
+        if "context_compression_trigger_tokens" in extra_params and not isinstance(
+            extra_params.get("context_compression_trigger_tokens"), int
+        ):
+            raise LLMConfigurationError(
+                "model.extra_params.context_compression_trigger_tokens 必须是 int"
+            )
+        if "context_compression_trigger_ratio" in extra_params and not isinstance(
+            extra_params.get("context_compression_trigger_ratio"), (int, float)
+        ):
+            raise LLMConfigurationError(
+                "model.extra_params.context_compression_trigger_ratio 必须是 number"
+            )
 
     model.setdefault("tool_call_compat", False)
     model.setdefault("force_stream_mode", False)
-    model.setdefault("max_context", 0)
-
     return model  # type: ignore[return-value]
 
 
