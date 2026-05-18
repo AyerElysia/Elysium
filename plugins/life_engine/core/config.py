@@ -33,6 +33,84 @@ class LifeEngineConfig(BaseConfig):
 
     config_name: ClassVar[str] = "config"
     config_description: ClassVar[str] = "生命中枢最小原型配置"
+    # 仅控制 WebUI 配置页暴露面；完整运行时/TOML 配置仍保留。
+    __config_schema_visible_fields__: ClassVar[dict[str, set[str]]] = {
+        "settings": {
+            "enabled",
+            "heartbeat_interval_seconds",
+            "sleep_time",
+            "wake_time",
+            "workspace_path",
+            "max_rounds_per_heartbeat",
+        },
+        "model": {"task_name"},
+        "history_retrieval": {
+            "enabled",
+            "default_cross_stream",
+            "adapter_signature",
+        },
+        "web": {
+            "tavily_api_key",
+            "tavily_api_keys",
+            "tavily_base_url",
+        },
+        "snn": {
+            "enabled",
+            "shadow_only",
+            "inject_to_heartbeat",
+        },
+        "neuromod": {
+            "enabled",
+            "inject_to_heartbeat",
+        },
+        "dream": {
+            "enabled",
+            "dream_interval_minutes",
+            "nap_enabled",
+        },
+        "chatter": {
+            "enabled",
+            "mode",
+            "max_rounds_per_chat",
+            "initial_history_messages",
+        },
+        "multimodal": {
+            "enabled",
+            "native_image",
+            "native_emoji",
+            "native_video",
+            "native_audio",
+            "max_images_per_payload",
+            "include_history_media",
+        },
+        "screen": {
+            "enabled",
+            "capture_method",
+            "display",
+            "native_when_available",
+            "native_task_name",
+            "fallback_task_name",
+            "save_latest",
+            "latest_path",
+            "max_observation_chars",
+        },
+        "drives": {
+            "enabled",
+            "inject_to_heartbeat",
+        },
+        "streams": {
+            "enabled",
+            "max_active_streams",
+            "inject_to_heartbeat",
+            "sync_to_chatter",
+        },
+        "runtime_sync": {
+            "latest_action_think_enabled",
+            "recent_chat_enabled",
+            "recent_chat_messages",
+            "salient_tail_enabled",
+        },
+    }
 
     @config_section("settings")
     class SettingsSection(SectionBase):

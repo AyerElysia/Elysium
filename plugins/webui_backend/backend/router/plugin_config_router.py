@@ -389,6 +389,15 @@ def _generate_plugin_schema(config_cls: type) -> list[SchemaSection]:
     2. 每个 section 下的字段定义（通过 _extract_schema_field）
     """
     sections: list[SchemaSection] = []
+    visible_fields = getattr(config_cls, "__config_schema_visible_fields__", None)
+    hidden_sections = set(getattr(config_cls, "__config_schema_hidden_sections__", set()) or set())
+    hidden_fields = getattr(config_cls, "__config_schema_hidden_fields__", {}) or {}
+    visible_fields_by_section = (
+        {section: set(fields or set()) for section, fields in visible_fields.items()}
+        if visible_fields is not None
+        else None
+    )
+    hidden_fields_by_section = {section: set(fields or set()) for section, fields in hidden_fields.items()}
 
     for section_name, section_field in config_cls.model_fields.items():
         section_type = section_field.annotation
@@ -399,6 +408,8 @@ def _generate_plugin_schema(config_cls: type) -> list[SchemaSection]:
 
         # section 键名（从装饰器读取）
         section_key = getattr(section_type, "__config_section_name__", section_name)
+        if section_key in hidden_sections:
+            continue
 
         # 从装饰器读取 section 元数据
         section_title_from_decorator = getattr(section_type, "__config_section_title__", None)
@@ -420,9 +431,19 @@ def _generate_plugin_schema(config_cls: type) -> list[SchemaSection]:
         fields: list[SchemaField] = []
         for field_name, field_info in section_type.model_fields.items():
             try:
+                ui_attrs = field_info.json_schema_extra or {}
+                if ui_attrs.get("hidden", False):
+                    continue
+                if visible_fields_by_section is not None and field_name not in visible_fields_by_section.get(section_key, set()):
+                    continue
+                if field_name in hidden_fields_by_section.get(section_key, set()):
+                    continue
                 fields.append(_extract_schema_field(section_key, field_name, field_info))
             except Exception as e:
                 logger.warning(f"提取字段 {section_key}.{field_name} Schema 失败: {e}")
+
+        if not fields:
+            continue
 
         # 按 order 排序字段
         fields.sort(key=lambda f: f.order)
