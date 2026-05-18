@@ -97,7 +97,7 @@ _MUST_REPLY_RETRY_REMINDER = (
 _SEGMENT_ENCOURAGE_MIN_CHARS = 56
 _SEGMENT_SEND_RETRY_REMINDER = (
     "（系统提醒：你刚才把较长回复作为单段发送。"
-    "请优先使用 action-life_send_text 的 content 数组分段表达，"
+    "请优先在 action-life_send_text 的 content 中用 \\n 分段表达，"
     "把同一条长回复拆成 2~4 段，每段只放一个核心意图。"
     "这样更自然，也更符合当前对话规范。）"
 )
@@ -216,12 +216,11 @@ class LifeSendTextAction(BaseAction):
     action_name = "life_send_text"
     action_description = (
         "发送文本消息给用户。"
-        "content 只能是字符串或字符串数组（分段发送），例如"
-        "\"content\": [\"你好\", \"请问你是谁？\", \"找我有什么事吗？\"]。"
+        "content 只能是字符串；若需分多条发送，用换行符（\\n）分隔各段，"
+        "例如 \"你好\\n请问你是谁？\\n找我有什么事吗？\"，将依次发出 3 条消息。"
         "content 中只能包含要发给用户的纯文本正文。"
         "严禁把 reason/thought/expected_reaction 等元信息写进 content。"
         "分段消息会按顺序发送，并自动模拟段间打字延迟。"
-        "不要在单条 content 中使用换行；需要分条就使用 content 数组。"
         "私聊场景下 reply_to 默认不要使用，除非确实需要引用某条历史消息来避免歧义。"
     )
 
@@ -414,8 +413,9 @@ class LifeSendTextAction(BaseAction):
     async def execute(
         self,
         content: Annotated[
-            str | list[str],
-            "要发送给用户的纯文本内容。仅允许 string 或 string[]；"
+            str,
+            "要发送给用户的纯文本内容。仅允许 string；"
+            "多段用换行符（\\n）分隔，每段将作为独立消息依次发送。"
             "禁止把 reason/thought 等元信息写进 content。",
         ],
         reply_to: Annotated[
@@ -881,7 +881,7 @@ class LifeChatter(BaseChatter):
             "- 不要只调用 `action-think`；如果本轮决定不回复，就直接用 `action-life_pass_and_wait`，不要调用 think。\n"
             "- 需要直接给用户发文字时，使用 `life_send_text`。\n"
             "- 需要发送本地文件时，使用 `life_send_file`；需要解释文件时另用 `life_send_text`。\n"
-            "- `content` 只能写给用户看的纯文本正文；长内容可用 `content` 数组分段发送。\n"
+            "- `content` 只能写给用户看的纯文本正文；长内容用 `\\n` 分隔分段发送。\n"
             "- 需要查看或操作电脑终端、执行脚本或处理文件系统时，调用 `nucleus_bash`。\n"
             "- 需要了解 Ayer 当前电脑屏幕时，调用 `nucleus_view_screen`，不要凭空猜屏幕内容。\n"
             "- 需要把承诺落地时，可用 `nucleus_manage_todo` 创建 TODO；必须写清 `next_action` 和复盘/提醒时间，shared TODO 创建后要自然告诉用户。\n"

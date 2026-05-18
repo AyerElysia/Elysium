@@ -161,8 +161,8 @@ class ToolUse:
             # 记录开始执行
             logger.debug(f"开始执行工具: {tool_instance.tool_name}, 参数: {kwargs}")
 
-            # 调用 Tool 的 execute 方法
-            success, result = await tool_instance.execute(**kwargs)
+            # 统一走 LLMUsableExecution，兼容 coroutine 和 async iterator 两种工具实现。
+            success, result = await tool_instance._wrap_execute(**kwargs).wait_done()
 
             # 格式化结果（确保是字典形式以兼容 ToolHistory）
             if isinstance(result, str):

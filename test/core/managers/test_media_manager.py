@@ -101,6 +101,24 @@ class TestMediaManagerSkipVLM:
             assert manager.should_skip_vlm("stream_456") is False
 
 
+class TestMediaManagerMimeType:
+    """测试图片 MIME 类型提取。"""
+
+    def test_extract_image_mime_type_from_data_url(self) -> None:
+        """应保留 data URL 中的真实图片 MIME。"""
+        mime_type = MediaManager._extract_image_mime_type(
+            "data:image/jpeg;base64,ZmFrZQ=="
+        )
+
+        assert mime_type == "image/jpeg"
+
+    def test_extract_image_mime_type_falls_back_to_png(self) -> None:
+        """纯 base64 或无法识别时应回退为 PNG。"""
+        mime_type = MediaManager._extract_image_mime_type("ZmFrZQ==")
+
+        assert mime_type == "image/png"
+
+
 class TestMediaManagerRecognizeMedia:
     """测试媒体识别功能。"""
     
@@ -252,21 +270,33 @@ class TestMediaManagerSaveAndGetMediaInfo:
         with patch('src.core.managers.media_manager.get_model_set_by_task'):
             manager = MediaManager()
             
-            with patch('src.core.managers.media_manager.CRUDBase') as mock_crud_class:
-                mock_crud = MagicMock()
-                
+            with patch('src.core.managers.media_manager.get_db_session') as mock_session:
                 mock_media = MagicMock()
-                mock_media.media_hash = "abc123"
-                mock_media.media_type = "image"
+                mock_media.id = 1
+                mock_media.image_id = "abc123"
+                mock_media.path = "/tmp/test.png"
+                mock_media.type = "image"
                 mock_media.description = "Test image"
-                
-                mock_crud.get_by = AsyncMock(return_value=mock_media)
-                mock_crud_class.return_value = mock_crud
-                
+                mock_media.count = 2
+                mock_media.timestamp = 123.0
+                mock_media.vlm_processed = True
+
+                mock_result = MagicMock()
+                mock_result.scalars.return_value.first.return_value = mock_media
+
+                mock_session_obj = MagicMock()
+                mock_session_obj.execute = AsyncMock(return_value=mock_result)
+
+                mock_session_ctx = MagicMock()
+                mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_session_obj)
+                mock_session_ctx.__aexit__ = AsyncMock()
+                mock_session.return_value = mock_session_ctx
+
                 result = await manager.get_media_info("abc123")
                 
                 assert result is not None
-                assert result["media_hash"] == "abc123"
+                assert result["image_id"] == "abc123"
+                assert result["type"] == "image"
     
     @pytest.mark.asyncio
     async def test_get_media_info_not_exists(self) -> None:
@@ -274,11 +304,18 @@ class TestMediaManagerSaveAndGetMediaInfo:
         with patch('src.core.managers.media_manager.get_model_set_by_task'):
             manager = MediaManager()
             
-            with patch('src.core.managers.media_manager.CRUDBase') as mock_crud_class:
-                mock_crud = MagicMock()
-                mock_crud.get_by = AsyncMock(return_value=None)
-                mock_crud_class.return_value = mock_crud
-                
+            with patch('src.core.managers.media_manager.get_db_session') as mock_session:
+                mock_result = MagicMock()
+                mock_result.scalars.return_value.first.return_value = None
+
+                mock_session_obj = MagicMock()
+                mock_session_obj.execute = AsyncMock(return_value=mock_result)
+
+                mock_session_ctx = MagicMock()
+                mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_session_obj)
+                mock_session_ctx.__aexit__ = AsyncMock()
+                mock_session.return_value = mock_session_ctx
+
                 result = await manager.get_media_info("non_existent_hash")
                 
                 assert result is None

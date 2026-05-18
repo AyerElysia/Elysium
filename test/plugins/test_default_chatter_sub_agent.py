@@ -13,6 +13,8 @@ from plugins.default_chatter.plugin import (
     DefaultChatter,
     DefaultChatterPlugin,
     SendTextAction,
+    _SEND_TEXT_TYPING_DELAY_MAX_SECONDS,
+    _SEND_TEXT_TYPING_DELAY_PER_CHAR,
 )
 from src.core.models.message import Message
 from src.core.models.stream import ChatStream
@@ -20,7 +22,7 @@ from src.core.models.stream import ChatStream
 
 def _build_chatter() -> DefaultChatter:
     """构造默认聊天器实例。"""
-    config = DefaultChatterConfig.from_dict({"plugin": {"enabled": True, "mode": "enhanced"}})
+    config = DefaultChatterConfig.from_dict({"plugin": {"enabled": True}})
     plugin = DefaultChatterPlugin(config=config)
     return DefaultChatter(stream_id="test_stream", plugin=plugin)
 
@@ -28,7 +30,7 @@ def _build_chatter() -> DefaultChatter:
 def _build_chatter_with_config(plugin_overrides: dict[str, object]) -> DefaultChatter:
     """使用指定插件配置覆盖项构造默认聊天器实例。"""
     config = DefaultChatterConfig.from_dict(
-        {"plugin": {"enabled": True, "mode": "enhanced", **plugin_overrides}}
+        {"plugin": {"enabled": True, **plugin_overrides}}
     )
     plugin = DefaultChatterPlugin(config=config)
     return DefaultChatter(stream_id="test_stream", plugin=plugin)
@@ -137,10 +139,170 @@ async def test_send_text_marks_next_tick_bonus_after_success(
 
     monkeypatch.setattr(action, "_send_to_stream", AsyncMock(return_value=True))
 
-    success, _detail = await action.execute(content="你好")
+    success, _detail = await action._wrap_execute(content="你好").wait_done()
 
     assert success is True
     assert getattr(stream.context, "_default_chatter_next_tick_bonus", None) == 0.5
+
+
+@pytest.mark.asyncio
+async def test_send_text_yields_before_typing_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """send_text 应先进入 READY，再执行 typing delay。"""
+
+    stream = ChatStream(stream_id="s_group", platform="qq", chat_type="group")
+    action = SendTextAction(
+        chat_stream=stream,
+        plugin=DefaultChatterPlugin(config=DefaultChatterConfig()),
+    )
+
+    sleep_mock = AsyncMock()
+    send_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(action, "_sleep_for_typing_delay", sleep_mock)
+    monkeypatch.setattr(action, "_send_to_stream", send_mock)
+
+    execution = action.execute(content="你好")
+
+    first = await anext(execution)
+    assert first is None
+    sleep_mock.assert_not_awaited()
+    send_mock.assert_not_awaited()
+
+    second = await anext(execution)
+    assert second == (True, "已发送消息:你好")
+    sleep_mock.assert_awaited_once_with("你好")
+    send_mock.assert_awaited_once_with("你好")
+
+
+def test_send_text_typing_delay_uses_length_and_max_cap() -> None:
+    """send_text 打字延迟应随字符长度增长，并受最大等待时间限制。"""
+    short_delay = SendTextAction._typing_delay_seconds("你好呀")
+    long_delay = SendTextAction._typing_delay_seconds("x" * 10_000)
+
+    assert short_delay == pytest.approx(3 * _SEND_TEXT_TYPING_DELAY_PER_CHAR)
+    assert long_delay == _SEND_TEXT_TYPING_DELAY_MAX_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_send_text_reply_to_uses_quoted_group_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = ChatStream(stream_id="s_group", platform="qq", chat_type="group")
+    quoted = Message(
+        message_id="msg_a",
+        sender_id="user_a",
+        sender_name="A",
+        platform="qq",
+        chat_type="group",
+        stream_id="s_group",
+        group_id="group_a",
+        group_name="Group A",
+    )
+    later = Message(
+        message_id="msg_b",
+        sender_id="user_b",
+        sender_name="B",
+        platform="qq",
+        chat_type="group",
+        stream_id="s_group",
+        group_id="group_b",
+        group_name="Group B",
+    )
+    stream.context.history_messages = [quoted]
+    stream.context.unread_messages = [later]
+
+    sent: dict[str, Message] = {}
+    monkeypatch.setattr(SendTextAction, "_sleep_for_typing_delay", AsyncMock())
+    monkeypatch.setattr(
+        "src.core.managers.adapter_manager.get_adapter_manager",
+        lambda: SimpleNamespace(
+            get_bot_info_by_platform=AsyncMock(
+                return_value={"bot_id": "bot", "bot_name": "Bot"}
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "src.core.transport.message_send.get_message_sender",
+        lambda: SimpleNamespace(
+            send_message=AsyncMock(
+                side_effect=lambda message: (sent.__setitem__("message", message), True)[1]
+            )
+        ),
+    )
+
+    action = SendTextAction(
+        chat_stream=stream,
+        plugin=DefaultChatterPlugin(config=DefaultChatterConfig()),
+    )
+    success, _detail = await action._wrap_execute(
+        content="reply",
+        reply_to="msg_a",
+    ).wait_done()
+
+    assert success is True
+    assert sent["message"].reply_to == "msg_a"
+    assert sent["message"].extra["target_group_id"] == "group_a"
+    assert sent["message"].extra["target_group_name"] == "Group A"
+
+
+@pytest.mark.asyncio
+async def test_send_text_reply_to_uses_quoted_private_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = ChatStream(stream_id="s_private", platform="qq", chat_type="private")
+    quoted = Message(
+        message_id="msg_a",
+        sender_id="user_a",
+        sender_name="A",
+        platform="qq",
+        chat_type="private",
+        stream_id="s_private",
+    )
+    later = Message(
+        message_id="msg_b",
+        sender_id="user_b",
+        sender_name="B",
+        platform="qq",
+        chat_type="private",
+        stream_id="s_private",
+    )
+    stream.context.history_messages = [quoted]
+    stream.context.unread_messages = [later]
+    stream.context.triggering_user_id = "user_b"
+
+    sent: dict[str, Message] = {}
+    monkeypatch.setattr(SendTextAction, "_sleep_for_typing_delay", AsyncMock())
+    monkeypatch.setattr(
+        "src.core.managers.adapter_manager.get_adapter_manager",
+        lambda: SimpleNamespace(
+            get_bot_info_by_platform=AsyncMock(
+                return_value={"bot_id": "bot", "bot_name": "Bot"}
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "src.core.transport.message_send.get_message_sender",
+        lambda: SimpleNamespace(
+            send_message=AsyncMock(
+                side_effect=lambda message: (sent.__setitem__("message", message), True)[1]
+            )
+        ),
+    )
+
+    action = SendTextAction(
+        chat_stream=stream,
+        plugin=DefaultChatterPlugin(config=DefaultChatterConfig()),
+    )
+    success, _detail = await action._wrap_execute(
+        content="reply",
+        reply_to="msg_a",
+    ).wait_done()
+
+    assert success is True
+    assert sent["message"].reply_to == "msg_a"
+    assert sent["message"].extra["target_user_id"] == "user_a"
+    assert sent["message"].extra["target_user_name"] == "A"
 
 
 @pytest.mark.asyncio
@@ -198,7 +360,7 @@ async def test_send_text_does_not_mark_bonus_when_controller_disabled(
 
     monkeypatch.setattr(action, "_send_to_stream", AsyncMock(return_value=True))
 
-    success, _detail = await action.execute(content="你好")
+    success, _detail = await action._wrap_execute(content="你好").wait_done()
 
     assert success is True
     assert getattr(stream.context, "_default_chatter_next_tick_bonus", None) in (None, 0.0)

@@ -14,14 +14,6 @@ from src.core.components.base.tool import BaseTool
 from src.core.managers import get_plugin_manager
 from src.kernel.llm import LLMPayload, ROLE, Text, ToolRegistry, ToolResult
 
-from plugins.default_chatter.consult_nucleus import (
-    ConsultNucleusTool as _DefaultConsultNucleusTool,
-    SearchLifeMemoryTool as _DefaultSearchLifeMemoryTool,
-)
-from plugins.default_chatter.nucleus_bridge import (
-    MessageNucleusTool as _DefaultMessageNucleusTool,
-)
-
 
 logger = get_logger("life_engine.compat_tools")
 
@@ -193,9 +185,16 @@ class LifeScheduleFollowupMessageAction(BaseAction):
         return ok, message
 
 
-class LifeMessageNucleusTool(_DefaultMessageNucleusTool):
+class LifeMessageNucleusTool(BaseTool):
     """向生命中枢留言，不等待即时回复。"""
 
+    tool_name = "message_nucleus"
+    tool_description = (
+        "向生命中枢留言，请它慢慢思考后再主动回到对话里。"
+        "这个工具不会同步返回中枢答案，只负责投递消息。"
+        "适合请中枢补充信息差、整理最近状态，或把某个话题交给它继续琢磨。"
+        "调用后不要假装已经拿到中枢回复。"
+    )
     chatter_allow: list[str] = ["life_chatter"]
 
     async def execute(
@@ -236,9 +235,15 @@ class LifeMessageNucleusTool(_DefaultMessageNucleusTool):
         )
 
 
-class LifeConsultNucleusTool(_DefaultConsultNucleusTool):
+class LifeConsultNucleusTool(BaseTool):
     """同步查询当前状态层信息。"""
 
+    tool_name = "consult_nucleus"
+    tool_description = (
+        "向生命中枢同步查询当前状态层信息。"
+        "适合查询最近在想什么、当前内在状态、活跃 TODO、最近日记等。"
+        "这个工具只补充当前信息差，不负责替你规划行动。"
+    )
     chatter_allow: list[str] = ["life_chatter"]
 
     async def execute(
@@ -274,9 +279,15 @@ class LifeConsultNucleusTool(_DefaultConsultNucleusTool):
             return False, f"查询失败: {exc}"
 
 
-class LifeSearchLifeMemoryTool(_DefaultSearchLifeMemoryTool):
+class LifeSearchLifeMemoryTool(BaseTool):
     """同步检索 life_engine 深层记忆。"""
 
+    tool_name = "search_life_memory"
+    tool_description = (
+        "深度检索生命中枢的记忆文件与联想结果。"
+        "适合查询过去聊过的事、旧计划、历史文件记录、被记住的线索。"
+        "这是记忆检索，不是当前状态摘要。"
+    )
     chatter_allow: list[str] = ["life_chatter"]
 
     async def execute(

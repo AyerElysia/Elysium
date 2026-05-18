@@ -300,10 +300,14 @@ async def run_chat_stream(
                         logger.warning(f"[驱动器] stream={stream_id[:8]}, Chatter 返回 Failure: {result.error}")
                     elif isinstance(result, Wait):
                         # 记录等待状态（直接保存上次 yield 对象）
+                        unread_count = getattr(result, "evaluated_messages_count", None)
+                        if unread_count is None:
+                            unread_count = len(context.unread_messages)
+                            
                         manager._wait_states[stream_id] = (
                             result,
                             time.time(),
-                            len(context.unread_messages),
+                            unread_count,
                         )
                         logger.debug(f"[驱动器] stream={stream_id[:8]}, 进入 Wait 状态 (time={result.time})")
                     elif isinstance(result, Stop):

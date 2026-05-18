@@ -21,16 +21,16 @@ class ToolCallOutcome:
 
     Attributes:
         should_wait: 是否需要等待用户新消息。
+        wait_seconds: 等待秒数；为 None 表示仅等待新消息。
         should_stop: 是否需要停止当前对话一段时间。
         stop_minutes: 停止对话的分钟数。
-        sent_once: 本轮是否已经成功执行过 send_text。
         has_pending_tool_results: 是否写入了需要下一轮 LLM 继续推理的非 action 结果。
     """
 
     should_wait: bool = False
+    wait_seconds: float | None = None
     should_stop: bool = False
     stop_minutes: float = 0.0
-    sent_once: bool = False
     has_pending_tool_results: bool = False
 
 
@@ -41,14 +41,12 @@ async def process_tool_calls(
     response: LLMResponseLike,
     run_tool_call: Callable[
         [list[ToolCall], LLMResponseLike, ToolRegistry, Message | None],
-        Awaitable[list[tuple[bool, bool]] | tuple[bool, bool]],
+        Awaitable[list[tuple[bool, bool]]],
     ],
     usable_map: ToolRegistry,
     trigger_msg: Message | None,
     pass_call_name: str,
     stop_call_name: str,
-    send_text_call_name: str | None,
-    break_on_send_text: bool,
     cross_round_seen_signatures: set[str] | None = None,
 ) -> ToolCallOutcome:
     """处理单轮 LLM 的 tool calls 并返回控制流结果。
@@ -66,8 +64,6 @@ async def process_tool_calls(
         trigger_msg: 触发本轮对话的消息；为 None 时普通调用会被执行器跳过。
         pass_call_name: “等待新消息”控制流调用名。
         stop_call_name: “结束对话”控制流调用名。
-        send_text_call_name: 发送文本 Action 的调用名；为 None 时不启用特殊处理。
-        break_on_send_text: 成功发送文本后，是否跳过后续第一个非 action 及其之后的调用。
         cross_round_seen_signatures: 跨轮去重集合；为 None 时只做本轮去重。
 
     Returns:
@@ -75,70 +71,25 @@ async def process_tool_calls(
     """
     outcome = ToolCallOutcome()
     seen_call_signatures: set[str] = set()
-    sent_text_successfully = False
     pending_calls: list[ToolCall] = []
-
-    def normalize_results(raw_results: object, expected_count: int) -> list[tuple[bool, bool]]:
-        """兼容旧版单调用回调返回 ``(appended, success)`` 的形态。"""
-        if (
-            expected_count == 1
-            and isinstance(raw_results, tuple)
-            and len(raw_results) >= 2
-            and isinstance(raw_results[0], bool)
-            and isinstance(raw_results[1], bool)
-        ):
-            return [(raw_results[0], raw_results[1])]
-        if isinstance(raw_results, list):
-            return raw_results
-        return []
 
     async def flush_pending_calls() -> None:
         """批量执行暂存的普通调用，并更新本轮控制流状态。"""
-        nonlocal sent_text_successfully
-
         if not pending_calls:
             return
 
         current_pending = list(pending_calls)
         pending_calls.clear()
-        raw_results = await run_tool_call(current_pending, response, usable_map, trigger_msg)
-        results = normalize_results(raw_results, len(current_pending))
+        results = await run_tool_call(current_pending, response, usable_map, trigger_msg)
 
         for pending_call, (appended, success) in zip(current_pending, results, strict=False):
-            if send_text_call_name and success and pending_call.name == send_text_call_name:
-                sent_text_successfully = True
+            _ = success
 
             if appended and not pending_call.name.startswith("action-"):
                 outcome.has_pending_tool_results = True
 
-    for idx, call in enumerate(calls):
-        if (
-            break_on_send_text
-            and pending_calls
-            and send_text_call_name
-            and any(pending.name == send_text_call_name for pending in pending_calls)
-            and not call.name.startswith("action-")
-        ):
-            await flush_pending_calls()
-
+    for call in calls:
         get_watchdog().feed_dog(stream_id)  # 喂狗，防止工具调用过久导致 Watchdog 误判超时
-
-        # classical 模式可配置为“发出一次 send_text 后不再继续推理型工具调用”。
-        # 但若后续仍是 action（例如再次 send_text 分段回复），则应允许继续执行。
-        if break_on_send_text and sent_text_successfully and not call.name.startswith("action-"):
-            for skipped in calls[idx:]:
-                response.add_payload(
-                    LLMPayload(
-                        ROLE.TOOL_RESULT,
-                        ToolResult(  # type: ignore[arg-type]
-                            value="已成功发送消息，本轮后续非 action 调用已自动跳过",
-                            call_id=getattr(skipped, "id", None),
-                            name=getattr(skipped, "name", ""),
-                        ),
-                    )
-                )
-            outcome.sent_once = True
-            break
 
         args = call.args if isinstance(call.args, dict) else {}
         dedupe_args = (
@@ -180,11 +131,18 @@ async def process_tool_calls(
 
         if call.name == pass_call_name:
             await flush_pending_calls()
+            wait_seconds = args.get("seconds")
+            outcome.wait_seconds = None if wait_seconds is None else float(wait_seconds)
+            wait_text = (
+                "已登记等待，本轮动作完成后等待用户新消息"
+                if outcome.wait_seconds is None
+                else f"已登记等待，本轮动作完成后等待 {outcome.wait_seconds} 秒后继续对话"
+            )
             response.add_payload(
                 LLMPayload(
                     ROLE.TOOL_RESULT,
                     ToolResult(  # type: ignore[arg-type]
-                        value="已跳过，等待用户新消息",
+                        value=wait_text,
                         call_id=call.id,
                         name=call.name,
                     ),
@@ -209,20 +167,7 @@ async def process_tool_calls(
             outcome.should_stop = True
             continue
 
-        if call.name.startswith("action-"):
-            await flush_pending_calls()
-            raw_results = await run_tool_call([call], response, usable_map, trigger_msg)
-            results = normalize_results(raw_results, 1)
-            _appended, success = results[0] if results else (False, False)
-            if send_text_call_name and success and call.name == send_text_call_name:
-                sent_text_successfully = True
-            continue
-
         pending_calls.append(call)
-
-        # 注意：不在 send_text 本身处立即 break。
-        # 这样可以支持 LLM 在同一轮内多次 action-send_text 分段回复；
-        # 但一旦后续出现非 action 调用，会在循环开头被统一跳过并写回 TOOL_RESULT。
 
     await flush_pending_calls()
     return outcome
@@ -256,6 +201,7 @@ def append_suspend_payload_if_action_only(
     calls: list[ToolCall],
     response: LLMResponseLike,
     suspend_text: str,
+    enable_action_suspend: bool,
     logger: Logger,
 ) -> None:
     """当本轮全是 action 调用时，补充 SUSPEND 占位 assistant 消息。
@@ -264,8 +210,9 @@ def append_suspend_payload_if_action_only(
         calls: 本轮 LLM 响应中的 tool call 列表。
         response: 当前 LLM 响应对象；需要时会写入 assistant 占位消息。
         suspend_text: 占位消息文本。
+        enable_action_suspend: 是否启用纯 Action 回合的挂起注入。
         logger: 用于记录调试信息的 logger。
     """
-    if calls and all(call.name.startswith("action-") for call in calls):
+    if enable_action_suspend and calls and all(call.name.startswith("action-") for call in calls):
         response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(suspend_text)))
         logger.debug("已注入 SUSPEND 占位符（本轮全部为 action 调用）")

@@ -156,6 +156,22 @@ class StreamContext:
         self.unread_messages.clear()
         return flushed
 
+    def clear_messages(self) -> None:
+        """清空当前流的运行时消息上下文。
+
+        保留流级运行状态，如 ``is_active``、``is_cache_enabled`` 和 ``stream_loop_task``，
+        仅重置消息与处理中的上下文状态。
+        """
+        self.unread_messages.clear()
+        self.history_messages.clear()
+        self.current_message = None
+        self.triggering_user_id = None
+        self.processing_message_id = None
+        self.message_cache.clear()
+        self.last_message_time = None
+        self.message_buffer_skip_count = 0
+        self.is_chatter_processing = False
+
 
 class ChatStream:
     """聊天流对象，存储一个完整的聊天上下文。
@@ -209,6 +225,7 @@ class ChatStream:
         self.stream_name = stream_name
         self.create_time = time.time()
         self.last_active_time = time.time()
+        self.context_cleared_at: float | None = None
 
         # 初始化 StreamContext
         self.context: StreamContext = StreamContext(

@@ -133,6 +133,49 @@ class TestStreamAPI:
             result = await stream_api.get_stream_messages("stream_123", limit=100)
             
             assert len(result) == 2
+
+    @pytest.mark.asyncio
+    async def test_clear_stream_context(self) -> None:
+        """测试清空指定流上下文。"""
+        with patch('src.app.plugin_system.api.stream_api._get_stream_manager') as mock_get_mgr:
+            mock_manager = MagicMock()
+            mock_manager.clear_stream_context = AsyncMock(return_value=True)
+            mock_get_mgr.return_value = mock_manager
+
+            result = await stream_api.clear_stream_context("stream_123", cleared_at=12.3)
+
+            assert result is True
+            mock_manager.clear_stream_context.assert_awaited_once_with(
+                "stream_123",
+                cleared_at=12.3,
+            )
+
+    @pytest.mark.asyncio
+    async def test_load_and_clear_context(self) -> None:
+        """测试清空指定流上下文包装器。"""
+        with patch('src.app.plugin_system.api.stream_api._get_stream_manager') as mock_get_mgr:
+            mock_manager = MagicMock()
+            mock_stream = MagicMock(spec=ChatStream)
+            mock_manager.load_and_clear_context = AsyncMock(return_value=mock_stream)
+            mock_get_mgr.return_value = mock_manager
+
+            result = await stream_api.load_and_clear_context("stream_123")
+
+            assert result == mock_stream
+            mock_manager.load_and_clear_context.assert_awaited_once_with("stream_123")
+
+    @pytest.mark.asyncio
+    async def test_bulk_clear_streams(self) -> None:
+        """测试批量清空流上下文包装器。"""
+        with patch('src.app.plugin_system.api.stream_api._get_stream_manager') as mock_get_mgr:
+            mock_manager = MagicMock()
+            mock_manager.bulk_clear_streams = AsyncMock(return_value=5)
+            mock_get_mgr.return_value = mock_manager
+
+            result = await stream_api.bulk_clear_streams("private")
+
+            assert result == 5
+            mock_manager.bulk_clear_streams.assert_awaited_once_with("private")
     
     def test_clear_stream_cache(self) -> None:
         """测试清除流缓存。"""

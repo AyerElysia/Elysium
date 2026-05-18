@@ -1148,8 +1148,10 @@ class OpenAIChatClient:
                 params["extra_body"] = extra_body
 
         # 若上下文中已存在带 reasoning_content 的 assistant 响应，
+        # 或者启用了 thinking 模式（API 要求所有 assistant 消息必须包含 reasoning_content），
         # 则为其余缺失字段的 assistant 历史统一回填，避免 follow-up 400。
-        if _should_backfill_reasoning_content(messages):
+        thinking_enabled = bool(extra_params.get("enable_thinking"))
+        if thinking_enabled or _should_backfill_reasoning_content(messages):
             for msg in messages:
                 if (
                     msg.get("role") == "assistant"

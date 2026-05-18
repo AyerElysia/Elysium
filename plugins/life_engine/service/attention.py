@@ -58,53 +58,13 @@ class AttentionRouter:
             source = str(event.source or "unknown")
             source_stats[source] = source_stats.get(source, 0) + 1
 
-        event_limit = max(1, int(max_events or self.max_events))
-        char_limit = max(500, int(max_chars or self.max_chars))
-        if len(candidates) <= event_limit and self._events_text_size(candidates) <= char_limit:
-            return AttentionWindow(
-                selected_events=candidates,
-                summary_events=[],
-                high_water=high_water,
-                source_stats=source_stats,
-                context_char_count=self._events_text_size(candidates),
-            )
-
-        scored = [
-            (self._score_event(event, current_stream_id=current_stream_id), int(event.sequence or 0), event)
-            for event in candidates
-        ]
-        high_priority = [item for item in scored if item[0] >= 75]
-        normal_priority = [item for item in scored if item[0] < 75]
-
-        keep_slots = max(1, event_limit - 1)
-        keep_items = sorted(high_priority, key=lambda item: (item[0], item[1]), reverse=True)[:keep_slots]
-        remaining_slots = max(0, keep_slots - len(keep_items))
-        if remaining_slots:
-            keep_items.extend(normal_priority[-remaining_slots:])
-
-        selected = [event for _score, _seq, event in sorted(keep_items, key=lambda item: item[1])]
-
-        while selected and self._events_text_size(selected) > char_limit:
-            lowest_index = min(
-                range(len(selected)),
-                key=lambda index: (
-                    self._score_event(selected[index], current_stream_id=current_stream_id),
-                    int(selected[index].sequence or 0),
-                ),
-            )
-            selected.pop(lowest_index)
-
-        selected_ids = {event.event_id for event in selected}
-        omitted = [event for event in candidates if event.event_id not in selected_ids]
-        summary_events = self._summarize_omitted(omitted)
-        context_size = self._events_text_size([*summary_events, *selected])
+        # 注意：此处的硬截断限制已应要求被关闭，始终返回全体候选事件。
         return AttentionWindow(
-            selected_events=selected,
-            summary_events=summary_events,
+            selected_events=candidates,
+            summary_events=[],
             high_water=high_water,
-            dropped_count=len(omitted),
             source_stats=source_stats,
-            context_char_count=context_size,
+            context_char_count=self._events_text_size(candidates),
         )
 
     @staticmethod

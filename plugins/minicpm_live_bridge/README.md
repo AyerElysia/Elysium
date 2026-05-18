@@ -1,6 +1,6 @@
 # MiniCPM Live Bridge
 
-这是 MiniCPM-o live 的外部服务器桥接毛坯房。
+这是 MiniCPM-o live 的外部服务器桥接层。
 
 Neo-MoFox 不在主进程里下载、加载或运行 MiniCPM-o 模型。真正的全双工多模态推理由你后续接入的外部服务器负责；本插件只提供：
 
@@ -13,6 +13,7 @@ Neo-MoFox 不在主进程里下载、加载或运行 MiniCPM-o 模型。真正�
 - `/minicpm-live/api/context` 暴露 live 可读的统一意识运行态、实时统一事件流和当前 live session 短期上下文。
 - `/minicpm-live/api/turn` 在未配置外部 WebSocket 时，直接调用 `model_tasks.live` 跑一轮文本 + 屏幕截图的半双工 API。
 - `/minicpm-live/api/unified/ws` 把 Neo 核心消息事件实时推给 live 前端，再转发给外部 live 服务器。
+- `/minicpm-live/api/realtime/ws` Neo 自己的 realtime proxy WebSocket。开启代理模式后，前端只连 Neo；Neo 再把消息翻译后转给上游双工模型。
 
 边界：live 的 realtime 模型可以维护自己的低延迟音频会话，但它不是新的 Neo 主意识。它只作为一个实时通道接入统一事件流：
 
@@ -26,6 +27,30 @@ Neo-MoFox 不在主进程里下载、加载或运行 MiniCPM-o 模型。真正�
 如果 `server.websocket_url` 留空且 `session.enable_local_api_turn = true`，页面会进入本地单轮 API 模式：发送文本时同时截取当前屏幕帧，调用 `config/model.toml` 的 `[model_tasks.live]`。这适合先测试非全双工的全模态 API，例如 `MiMo-V2-Omni`。
 
 本地单轮 API 模式也支持语音回合：点击页面上的 `语音` 开始录音，再次点击发送。浏览器会把麦克风音频编码成 WAV，连同当前屏幕截图一起提交给 `/api/turn`；模型返回文本后，页面会用浏览器 TTS 朗读。
+
+## 传输模式
+
+`[server].transport_mode` 现在有两种：
+
+- `browser_direct`：浏览器直接连接 `server.websocket_url`。这适合上游已经兼容 Neo live v0 协议的服务。
+- `neo_proxy`：浏览器连接 Neo 的 `/api/realtime/ws`，Neo 再连接真正的上游 WebSocket。后续要接 MiniCPM、Gemini 风格 live、或者任何 provider-specific realtime 协议，都从这里做 adapter，不再修改前端页面。
+
+`[server].protocol_adapter` 当前提供：
+
+- `passthrough`：前后都说同一套 Neo live v0 协议。
+- `minicpm_realtime_v0`：MiniCPM-o Realtime API 适配。Neo 会把前端的 `session.start/context.snapshot/unified.event/screen.frame/audio.chunk/session.stop` 翻译成 MiniCPM 的 `session.update/input_audio_buffer.append/session.close`，并把 `response.output_audio.delta/response.listen/session.closed/error` 翻译回页面可消费的字幕、PCM 音频和状态事件。
+
+MiniCPM-o 4.5 的官方 realtime 入口推荐配置：
+
+```toml
+[server]
+base_url = "http://127.0.0.1:8010"
+websocket_url = "ws://127.0.0.1:8010/v1/realtime?mode=video"
+transport_mode = "neo_proxy"
+protocol_adapter = "minicpm_realtime_v0"
+```
+
+`mode=video` 会把实时屏幕帧作为 `video_frames` 附在音频包上；如果只想纯语音，可以改成 `mode=audio`，adapter 会停止附带屏幕帧。
 
 ## 终端调试日志
 
@@ -42,7 +67,7 @@ Neo-MoFox 不在主进程里下载、加载或运行 MiniCPM-o 模型。真正�
 
 ## 外部服务器协议 v0
 
-配置 `websocket_url` 后，浏览器会直连外部服务器，并发送 JSON 消息：
+配置 `websocket_url` 后，live 页面始终发送同一套 Neo live v0 JSON 协议；如果 `transport_mode = browser_direct`，这些消息会由浏览器直接发给外部服务器；如果 `transport_mode = neo_proxy`，浏览器发给 Neo proxy，再由 Neo adapter 决定如何转给上游：
 
 ```json
 {"type":"session.start","protocol":"neo-minicpm-live-v0","session_id":"...","stream_id":"live_voice_main","model_task_name":"live","capture":{}}
@@ -55,6 +80,8 @@ Neo-MoFox 不在主进程里下载、加载或运行 MiniCPM-o 模型。真正�
 {"type":"session.stop","session_id":"...","timestamp":0}
 ```
 
+在 `minicpm_realtime_v0` 下，浏览器会改用 16kHz mono float32 PCM 推送实时麦克风音频；旧的 `audio/webm` MediaRecorder 分片只用于 passthrough/其它外部服务。
+
 外部服务器可以回传：
 
 ```json
@@ -63,6 +90,7 @@ Neo-MoFox 不在主进程里下载、加载或运行 MiniCPM-o 模型。真正�
 {"type":"final","role":"assistant","text":"..."}
 {"type":"audio","text":"...","audio_url":"https://..."}
 {"type":"audio","text":"...","mime_type":"audio/wav","audio_base64":"..."}
+{"type":"audio","encoding":"pcm_float32","sample_rate":24000,"channels":1,"audio_base64":"..."}
 {"type":"screen.summary","text":"当前屏幕里..."}
 {"type":"error","message":"..."}
 ```

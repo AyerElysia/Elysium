@@ -41,6 +41,7 @@ class Wait:
     """
 
     time: float | int | None = None
+    evaluated_messages_count: int | None = None
 
 
 @dataclass(frozen=True)

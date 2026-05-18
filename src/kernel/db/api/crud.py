@@ -105,20 +105,25 @@ def _model_to_dict(instance: Any) -> dict[str, Any]:
 
     model = type(instance)
     column_names = _get_model_column_names(model)
-    fetch_values = _get_model_value_fetcher(model)
 
     try:
-        values = fetch_values(instance)
-        return dict(zip(column_names, values))
-    except Exception as exc:
-        logger.warning(f"无法转换模型 {model.__name__}: {exc}")
-        fallback = {}
-        for column in column_names:
+        from sqlalchemy import inspect
+        state = inspect(instance)
+        unloaded_cols = state.unloaded if state else frozenset()
+    except Exception:
+        unloaded_cols = frozenset()
+
+    result_dict = {}
+    for column in column_names:
+        if column in unloaded_cols:
+            # 如果列被 defer 或者是未加载状态，直接设为 None，避免触发 lazy-load (这在异步 Session 下会抛出 greenlet_spawn 异常)
+            result_dict[column] = None
+        else:
             try:
-                fallback[column] = getattr(instance, column)
+                result_dict[column] = getattr(instance, column)
             except Exception:
-                fallback[column] = None
-        return fallback
+                result_dict[column] = None
+    return result_dict
 
 
 def _dict_to_model(model_class: type[T], data: dict[str, Any]) -> T:

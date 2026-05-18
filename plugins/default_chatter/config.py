@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import ClassVar, Literal
+from typing import ClassVar
 
 from src.core.components.base.config import BaseConfig, Field, SectionBase, config_section
 
@@ -13,11 +13,11 @@ class DefaultChatterConfig(BaseConfig):
     config_name: ClassVar[str] = "config"
     config_description: ClassVar[str] = "DefaultChatter 配置"
 
-    @config_section("plugin", title="插件设置", tag="plugin", order=0)
+    @config_section("plugin", title="插件设置", tag="plugin")
     class PluginSection(SectionBase):
         """插件基础配置。"""
 
-        @config_section("theme_guide", title="场景引导", tag="text", order=10)
+        @config_section("theme_guide", title="场景引导", tag="text")
         class ThemeGuideSection(SectionBase):
             """不同聊天类型的人设/语气引导。"""
 
@@ -27,8 +27,7 @@ class DefaultChatterConfig(BaseConfig):
                 label="私聊场景提示",
                 input_type="textarea",
                 rows=3,
-                tag="text",
-                order=0
+                tag="text"
             )
             group: str = Field(
                 default="你当前正处于“群聊”环境中。群聊里通常同时有很多活跃用户，而你只是其中的一员，不是唯一的中心，也不该默认自己随时都必须发言。请时刻注意多人对话的整体节奏、当前话题的流向，以及别人是否真的在和你互动。每次你想插话、接梗、跟风、冒泡、整活或表达观点之前，都先判断你的介入是否自然，是否会打断气氛，是否可能引起他人的不满、尴尬或反感。当你决定参与互动时，就认真地参与，拿出真实的互动感，而不是爱答不理、敷衍应付，也不要过度热情、强行活跃、唠唠叨叨、喧宾夺主。你应当像一个正常群友那样去说话和相处，既能在合适的时候接住话题、顺势玩梗、自然回应，也懂得在不适合的时候克制表达、不过度刷存在感。请在热情、分寸与互动感之间找到恰到好处的平衡，让你的出现显得自然、舒服、有参与感，而不是突兀、冷场或打扰。",
@@ -36,172 +35,87 @@ class DefaultChatterConfig(BaseConfig):
                 label="群聊场景提示",
                 input_type="textarea",
                 rows=3,
-                tag="text",
-                order=1
-            )
-
-        @config_section("debug", title="调试设置", tag="debug", order=20)
-        class DebugSection(SectionBase):
-            """调试输出相关配置。"""
-
-            show_prompt: bool = Field(
-                default=False,
-                description="是否输出发送给 LLM 的完整提示词",
-                label="显示完整上下文",
-                tag="debug",
-                hint="开启后会打印系统提示词、历史消息、未读消息和工具列表",
-                order=0
-            )
-            show_response: bool = Field(
-                default=False,
-                description="是否输出 LLM 响应调试摘要",
-                label="显示响应摘要",
-                tag="debug",
-                hint="开启后会打印模型返回的工具调用和文本摘要",
-                order=0
-            )
-
-        @config_section("reply", title="回复节奏", tag="performance", order=30)
-        class ReplySection(SectionBase):
-            """send_text 分段发送节奏配置。"""
-
-            typing_chars_per_sec: float = Field(
-                default=15.0,
-                ge=0.0,
-                description="模拟打字速度(字/秒)，小于等于 0 时不添加分段延迟",
-                label="打字速度",
-                tag="performance",
-                hint="用于分段发送时计算段间延迟",
-                order=0
-            )
-            typing_delay_min: float = Field(
-                default=0.8,
-                ge=0.0,
-                description="分段发送时的最小段间延迟(秒)",
-                label="最小延迟",
-                tag="performance",
-                order=1
-            )
-            typing_delay_max: float = Field(
-                default=4.0,
-                ge=0.0,
-                description="分段发送时的最大段间延迟(秒)",
-                label="最大延迟",
-                tag="performance",
-                order=2
+                tag="text"
             )
 
         enabled: bool = Field(
             default=True,
             description="是否启用 DefaultChatter",
             label="启用插件",
-            tag="plugin",
-            order=0
-        )
-        mode: Literal["enhanced", "classical"] = Field(
-            default="enhanced",
-            description="执行模式: enhanced/classical",
-            label="执行模式",
-            input_type="select",
-            choices=["enhanced", "classical"],
-            tag="performance",
-            hint="enhanced 模式更智能但消耗更多资源",
-            order=1
+            tag="plugin"
         )
         reinforce_negative_behaviors: bool = Field(
             default=True,
             description="是否在每轮 user 提示词的 extra 板块中再次强调负面行为约束",
             label="增强负面行为约束",
             tag="ai",
-            hint="开启后会在每轮对话中强调禁止行为",
-            order=2
+            hint="开启后会在每轮对话中强调禁止行为"
         )
-        native_multimodal: bool = Field(
-            default=False,
-            description=(
-                "原生多模态模式。启用后，图片直接打包进 LLM payload，"
-                "由主模型在对话上下文中理解图片内容并做出响应。"
-                "需确保对应模型支持多模态输入。"
-            ),
-            label="原生多模态",
-            tag="ai",
-            hint="开启后可直接看图，绕过 VLM 转译",
-            order=3
-        )
-        max_images_per_payload: int = Field(
-            default=4,
-            description=(
-                "原生多模态模式下单次 payload 的图片上限。"
-                "用户新消息图片优先，其次是历史图片。"
-            ),
-            label="单次图片上限",
-            tag="ai",
-            hint="建议保持在 4 左右，避免上下文过重",
-            order=4
-        )
-        max_videos_per_payload: int = Field(
-            default=1,
-            description=(
-                "原生多模态模式下单次 payload 的视频上限。"
-                "超出部分仅保留文本摘要，不再以原生视频输入。"
-            ),
-            label="单次视频上限",
-            tag="ai",
-            hint="建议保持 1，避免 payload 过重或上游拒绝",
-            order=5
-        )
-        native_video_multimodal: bool = Field(
+        enable_cooldown: bool = Field(
             default=True,
-            description=(
-                "原生多模态模式下是否启用原生视频输入。"
-                "关闭后视频仅以文本摘要参与对话。"
-            ),
-            label="启用原生视频",
-            tag="ai",
-            hint="建议在上游模型明确支持视频输入时开启",
-            order=6
+            description="是否启用回复后冷却功能。开启后 stop_conversation 工具指定的冷却时间将生效，期间新消息不会触发回复；关闭时冷却时间归零，消息可立即触发新对话",
+            label="启用回复后冷却",
+            tag="performance",
+            hint="关闭可避免因 LLM 设置过长冷却时间导致长时间无法回复"
         )
         enable_programmatic_controller: bool = Field(
             default=True,
             description="是否启用 sub-agent 的程序化控制器。开启后会先按本地概率规则判断是否直接响应，关闭后始终交由 LLM sub-agent 决策。",
             label="启用程序化控制器",
             tag="ai",
-            hint="关闭后群聊消息将始终经过 LLM sub-agent 过滤，不再使用本地概率直通逻辑",
-            order=7
+            hint="关闭后群聊消息将始终经过 LLM sub-agent 过滤，不再使用本地概率直通逻辑"
+        )
+        enable_action_suspend: bool = Field(
+            default=True,
+            description="是否启用纯 Action 回合的 SUSPEND 挂起机制。关闭后，纯 Action 结果会像常规工具结果一样继续 follow-up，而不是立即挂起等待。",
+            label="启用 Action 后暂停",
+            tag="ai",
+            hint="关闭后，纯 Action 回合不会注入 __SUSPEND__，模型会继续基于 Action 回执决定下一步调用"
+        )
+        enable_sub_agent_collaboration: bool = Field(
+            default=False,
+            description="是否启用 default chatter 的子代理协作模式。开启后主工具列表将隐藏 MCP 工具，并改为通过 create_agent/get_agent/kill_agent 把指定工具和 MCP 能力委托给子代理。",
+            label="启用子代理协作",
+            tag="ai",
+            hint="开启后主代理不能直接使用 MCP 工具，只能把它们分配给子代理"
+        )
+        sub_agent_task_name: str = Field(
+            default="actor",
+            description="子代理创建 LLM request 时使用的模型任务名，对应 config/model.toml 中的 task key。",
+            label="子代理任务名",
+            tag="ai",
+            hint="留空时回退为 actor；可配置为单独的子代理模型任务，例如 sub_agent_actor"
         )
         enable_stop_direct_message_wake: bool = Field(
             default=False,
             description="是否允许私聊或 @Bot 消息按概率提前解除 stop 冷却。",
             label="启用 stop 直接唤醒",
             tag="performance",
-            hint="开启后，stop 冷却期间收到新私聊或 @Bot 消息时，可能在冷却结束前重新启动 chatter。",
-            order=5
+            hint="开启后，stop 冷却期间收到新私聊或 @Bot 消息时，可能在冷却结束前重新启动 chatter。"
         )
         stop_direct_message_wake_probability: float = Field(
             default=0.5,
             description="私聊或 @Bot 消息提前解除 stop 冷却的概率。",
             label="stop 唤醒概率",
             tag="performance",
-            hint="有效范围为 0.0 到 1.0。",
-            order=6
+            hint="有效范围为 0.0 到 1.0。"
+        )
+        native_multimodal: bool = Field(
+            default=False,
+            description=(
+                "原生多模态模式。启用后，图片直接以 base64 形式打包进 LLM payload，"
+                "由主模型在对话上下文中理解图片内容，跳过框架的 VLM 文字识别环节，"
+                "避免空转浪费 token；表情包仍走 VLM 识别以利用哈希缓存。"
+                "需确保 actor 任务对应的模型支持多模态输入。"
+            ),
+            label="原生多模态",
+            tag="ai",
+            hint="启用前请确认 actor 模型支持图片输入"
         )
         theme_guide: ThemeGuideSection = Field(
             default_factory=ThemeGuideSection,
             description="按聊天类型区分的额外提示词",
-            label="场景引导配置",
-            order=8
-        )
-        reply: ReplySection = Field(
-            default_factory=ReplySection,
-            description="发送分段与节奏配置",
-            label="回复节奏配置",
-            order=9
-        )
-        debug: DebugSection = Field(
-            default_factory=DebugSection,
-            description="调试输出配置",
-            label="调试配置",
-            order=10
+            label="场景引导配置"
         )
 
     plugin: PluginSection = Field(default_factory=PluginSection)

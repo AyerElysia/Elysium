@@ -5,10 +5,18 @@
 """
 
 import mcp.types
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from src.kernel.logger import get_logger
 
+if TYPE_CHECKING:
+    from src.core.managers.tool_manager.mcp_manager import MCPManager
+
 logger = get_logger("mcp_adapter")
+
+
+def _normalize_tool_name_part(value: str) -> str:
+    """将 MCP 工具名片段规范化为 LLM tool name 友好的短横线格式。"""
+    return value.strip().replace("_", "-")
 
 
 class MCPToolAdapter:
@@ -32,16 +40,25 @@ class MCPToolAdapter:
         >>> result = await adapter.execute({"city": "Beijing"})
     """
 
-    def __init__(self, server_name: str, mcp_tool: "mcp.types.Tool") -> None:
+    def __init__(
+        self,
+        server_name: str,
+        mcp_tool: "mcp.types.Tool",
+        manager: "MCPManager | None" = None,
+    ) -> None:
         """初始化 MCP 工具适配器。
 
         Args:
             server_name: MCP 服务器名称
             mcp_tool: MCP 工具对象
+            manager: 负责底层调用的 MCP 管理器，未提供时使用全局管理器
         """
         self.server_name = server_name
         self.mcp_tool = mcp_tool
-        self.tool_name = f"mcp_{server_name}_{mcp_tool.name}"
+        self.manager = manager
+        normalized_server_name = _normalize_tool_name_part(server_name)
+        normalized_tool_name = _normalize_tool_name_part(mcp_tool.name)
+        self.tool_name = f"mcp-{normalized_server_name}-{normalized_tool_name}"
         self.description = mcp_tool.description or f"MCP tool from {server_name}"
 
         logger.debug(f"创建 MCP 工具适配器: {self.tool_name}")
@@ -100,10 +117,11 @@ class MCPToolAdapter:
                 f"服务器: {self.server_name} | 参数: {arguments}"
             )
 
-            # 调用 MCP 客户端管理器执行工具
-            from src.core.managers.tool_manager import get_mcp_manager
-            
-            manager = get_mcp_manager()
+            manager = self.manager
+            if manager is None:
+                from src.core.managers.tool_manager import get_mcp_manager
+
+                manager = get_mcp_manager()
             result = await manager.call_tool(
                 server_name=self.server_name,
                 tool_name=self.mcp_tool.name,
@@ -215,7 +233,7 @@ async def load_mcp_tools(server_name: str) -> list[MCPToolAdapter]:
         adapters = []
         for mcp_tool in tools:
             try:
-                adapter = MCPToolAdapter(server_name, mcp_tool)
+                adapter = MCPToolAdapter(server_name, mcp_tool, manager)
                 adapters.append(adapter)
                 logger.debug(f" 加载工具: {adapter.tool_name}")
             except Exception as e:

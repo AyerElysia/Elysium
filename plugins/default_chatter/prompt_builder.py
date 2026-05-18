@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 from collections.abc import Callable
+from typing import Any
 
 from src.core.components.types import ChatType
 from src.core.config import get_core_config
@@ -18,11 +19,65 @@ class DefaultChatterPromptBuilder:
     """Default Chatter 提示词构建器。"""
 
     @staticmethod
-    def get_mode(plugin_config: DefaultChatterConfig | None) -> str:
-        """读取 DefaultChatter 执行模式。"""
-        if plugin_config is not None:
-            return plugin_config.plugin.mode
-        return "enhanced"
+    def build_sub_agent_collaboration_extra(
+        server_metadata: list[Any],
+    ) -> str:
+        """构建子代理协作模式的额外系统提示段。"""
+        lines = [
+            "子代理协作：你可以通过 create_agent、get_agent、kill_agent 工具创建和管理子代理，帮助你完成明确的局部任务。",
+        ]
+
+        if not server_metadata:
+            lines.append("当前没有已连接的 MCP 服务器。")
+            return "\n".join(lines)
+
+        deferred_servers = [
+            metadata for metadata in server_metadata if bool(getattr(metadata, "defer_loading", True))
+        ]
+        direct_servers = [
+            metadata for metadata in server_metadata if not bool(getattr(metadata, "defer_loading", True))
+        ]
+
+        if deferred_servers:
+            lines.append(
+                "以下 MCP 服务器为延迟加载模式，你不能直接使用它们；如需使用，请通过 create_agent 将对应 MCP 能力委托给子代理。"
+            )
+            for metadata in deferred_servers:
+                server_name = str(
+                    getattr(metadata, "server_name", None)
+                    or getattr(metadata, "name", None)
+                    or "unknown_mcp"
+                )
+                instructions = str(getattr(metadata, "instructions", "") or "未提供 instructions")
+                lines.append(f"- {server_name}: {instructions}")
+
+        if direct_servers:
+            lines.append("以下 MCP 服务器已直接暴露给你，可按普通工具直接调用。")
+            for metadata in direct_servers:
+                server_name = str(
+                    getattr(metadata, "server_name", None)
+                    or getattr(metadata, "name", None)
+                    or "unknown_mcp"
+                )
+                instructions = str(getattr(metadata, "instructions", "") or "未提供 instructions")
+                lines.append(f"- {server_name}: {instructions}")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def build_action_suspend_guidance(plugin_config: DefaultChatterConfig | None) -> str:
+        """构建 Action-only 回合的提示词说明。"""
+        enabled = True if plugin_config is None else bool(plugin_config.plugin.enable_action_suspend)
+        if enabled:
+            return (
+                'Action: 是你在互动过程中的“动作”，他是你主动的一个“行为”，例如发送消息、结束对话等。'
+                'Action本身不会给你返回信息，为满足上下文格式要求，当你只接收到Action的返回信息时，只需要输出"__SUSPEND__"表示挂起对话等待下一步指令即可；'
+            )
+        return (
+            'Action: 是你在互动过程中的“动作”，他是你主动的一个“行为”，例如发送消息、结束对话等。'
+            'Action会返回执行回执；当你只接收到Action的返回信息时，不要输出"__SUSPEND__"，而应把这些回执当作常规工具结果，继续决定下一步要调用的工具或动作。'
+            '如果你调用的是 pass_and_wait（或其他明确表示“等待”的动作），会进入等待，而不是继续追加新的调用。通常在你话说完后调用来暂时挂起对话。'
+        )
 
     @staticmethod
     def build_negative_behaviors_extra(plugin_config: DefaultChatterConfig | None) -> str:
@@ -41,144 +96,32 @@ class DefaultChatterPromptBuilder:
         return "行为提醒：请在本轮回复中严格遵守以下约束：\n" f"{lines}"
 
     @staticmethod
-    def _select_theme_guide(
-        plugin_config: DefaultChatterConfig | None,
-        chat_stream: ChatStream,
-    ) -> str:
-        """根据 chat_type 选择场景引导文本。"""
-        if plugin_config is None:
-            return ""
-
-        chat_type_raw = str(chat_stream.chat_type or "").lower()
-        if chat_type_raw == ChatType.PRIVATE.value:
-            return plugin_config.plugin.theme_guide.private
-        if chat_type_raw == ChatType.GROUP.value:
-            return plugin_config.plugin.theme_guide.group
-        return ""
-
-    @staticmethod
-    def merge_extra_blocks(*blocks: str) -> str:
-        """合并多个 extra 文本块（忽略空块）。"""
-        parts = [str(block).strip() for block in blocks if str(block or "").strip()]
-        return "\n\n".join(parts)
-
-    @staticmethod
-    def build_runtime_context_extra(
-        plugin_config: DefaultChatterConfig | None,
-        chat_stream: ChatStream,
-    ) -> str:
-        """构建 user extra 中的动态会话上下文块。"""
-        theme_guide = DefaultChatterPromptBuilder._select_theme_guide(
-            plugin_config,
-            chat_stream,
-        ).strip()
-        platform = str(chat_stream.platform or "unknown")
-        chat_type = str(chat_stream.chat_type or "unknown")
-        nickname = str(chat_stream.bot_nickname or "unknown")
-        bot_id = str(chat_stream.bot_id or "unknown")
-
-        lines = [
-            "会话上下文（动态）：",
-            f"- 平台：{platform}",
-            f"- 聊天类型：{chat_type}",
-            f"- 当前机器人昵称：{nickname}",
-            f"- 当前机器人ID：{bot_id}",
-        ]
-        if theme_guide:
-            lines.append("- 场景引导：")
-            lines.append(theme_guide)
-        return "\n".join(lines)
-
-    @staticmethod
-    def build_scene_guide_system_block(
-        plugin_config: DefaultChatterConfig | None,
-        chat_stream: ChatStream,
-    ) -> str:
-        """构建场景引导 SYSTEM 固定块。"""
-        theme_guide = DefaultChatterPromptBuilder._select_theme_guide(
-            plugin_config,
-            chat_stream,
-        ).strip()
-        platform = str(chat_stream.platform or "unknown")
-        chat_type = str(chat_stream.chat_type or "unknown")
-        nickname = str(chat_stream.bot_nickname or "unknown")
-        bot_id = str(chat_stream.bot_id or "unknown")
-
-        lines = [
-            "## 会话场景固定引导",
-            f"- 平台：{platform}",
-            f"- 聊天类型：{chat_type}",
-            f"- 当前机器人昵称：{nickname}",
-            f"- 当前机器人ID：{bot_id}",
-        ]
-        if theme_guide:
-            lines.append("- 场景引导：")
-            lines.append(theme_guide)
-        return "\n".join(lines).strip()
-
-    @staticmethod
     async def build_system_prompt(
         plugin_config: DefaultChatterConfig | None,
         chat_stream: ChatStream,
+        extra: str = "",
     ) -> str:
         """构建系统提示词。"""
-        from src.app.plugin_system.api import adapter_api
+        selected_theme_guide = ""
+        if plugin_config is not None:
+            chat_type_raw = str(chat_stream.chat_type or "").lower()
 
-        platform = str(chat_stream.platform or "").strip()
-        bot_info: dict[str, str] = {}
-        if platform:
-            bot_info = await adapter_api.get_bot_info_by_platform(platform) or {}
-        platform_name = str(
-            bot_info.get("bot_name")
-            or chat_stream.bot_nickname
-            or "未知"
-        )
-        platform_id = str(
-            bot_info.get("bot_id")
-            or chat_stream.bot_id
-            or "未知"
-        )
-
-        selected_theme_guide = DefaultChatterPromptBuilder._select_theme_guide(
-            plugin_config,
-            chat_stream,
-        )
+            if chat_type_raw == ChatType.PRIVATE.value:
+                selected_theme_guide = plugin_config.plugin.theme_guide.private
+            elif chat_type_raw == ChatType.GROUP.value:
+                selected_theme_guide = plugin_config.plugin.theme_guide.group
 
         tmpl = get_prompt_manager().get_template("default_chatter_system_prompt")
         if not tmpl:
             return ""
-
-        personality_core = ""
-        personality_side = ""
-        reply_style = ""
-        identity = ""
-        background_story = ""
-
-        try:
-            personality = get_core_config().personality
-        except Exception:
-            personality = None
-
-        if personality is not None:
-            personality_core = getattr(personality, "personality_core", "") or ""
-            personality_side = getattr(personality, "personality_side", "") or ""
-            reply_style = getattr(personality, "reply_style", "") or ""
-            identity = getattr(personality, "identity", "") or ""
-            background_story = getattr(personality, "background_story", "") or ""
-
         return await (
-            tmpl.set("platform", chat_stream.platform)
-            .set("chat_type", chat_stream.chat_type)
-            .set("nickname", chat_stream.bot_nickname)
-            .set("bot_id", platform_id)
-            .set("platform_name", platform_name)
-            .set("platform_id", platform_id)
+            tmpl.set("nickname", chat_stream.bot_nickname)
             .set("theme_guide", selected_theme_guide)
-            .set("personality_core", personality_core)
-            .set("personality_side", personality_side)
-            .set("reply_style", reply_style)
-            .set("identity", identity)
-            .set("background_story", background_story)
+            .set("sub_agent_collaboration_extra", extra)
+            .set(
+                "action_suspend_guidance",
+                DefaultChatterPromptBuilder.build_action_suspend_guidance(plugin_config),
+            )
             .build()
         )
 
@@ -188,15 +131,11 @@ class DefaultChatterPromptBuilder:
         history_text: str,
         unread_lines: str,
         extra: str = "",
-        include_continuous_memory: bool = True,
     ) -> str:
         """通过 user prompt 模板构建用户提示词。"""
         from src.app.plugin_system.api import adapter_api
 
-        platform = str(chat_stream.platform or "").strip()
-        bot_info: dict[str, str] = {}
-        if platform:
-            bot_info = await adapter_api.get_bot_info_by_platform(platform) or {}
+        bot_info = await adapter_api.get_bot_info_by_platform(chat_stream.platform) or {}
         platform_name = str(
             bot_info.get("bot_name")
             or chat_stream.bot_nickname
@@ -207,7 +146,6 @@ class DefaultChatterPromptBuilder:
             or chat_stream.bot_id
             or "未知"
         )
-
         stream_name = chat_stream.stream_name
         tmpl = get_prompt_manager().get_template("default_chatter_user_prompt")
         assert tmpl, "缺少 default_chatter_user_prompt 模板，请检查提示词管理器配置"
@@ -221,13 +159,11 @@ class DefaultChatterPromptBuilder:
             .set("platform_id", platform_id)
             .set("platform_name", platform_name)
             .set("extra_info", "")
-            .set("continuous_memory", "")
-            .set("inject_continuous_memory", include_continuous_memory)
             .set("history", history_text)
             .set("unreads", unread_lines)
             .set("extra", extra)
-            # stream_id 不在模板正文中，仅作为元数据随 on_prompt_build 事件 values 传递，
-            # 供连续记忆/notice 等插件按会话区分并注入内容
+            # stream_id 不在模板占位符中，仅作为元数据随 on_prompt_build 事件 values 传递，
+            # 供 notice_injector 等插件按会话区分并注入内容
             .set("stream_id", chat_stream.stream_id or "")
             .build()
         )
@@ -237,36 +173,9 @@ class DefaultChatterPromptBuilder:
         chat_stream: ChatStream,
         formatter: Callable[[Message], str],
     ) -> str:
-        """构建 enhanced 模式的历史消息文本。"""
+        """构建历史消息文本。"""
         history_lines: list[str] = []
         for msg in chat_stream.context.history_messages:
             history_lines.append(formatter(msg))
 
         return "\n".join(history_lines)
-
-    @staticmethod
-    async def build_classical_user_text(
-        chat_stream: ChatStream,
-        unread_msgs: list[Message],
-        formatter: Callable[[Message], str],
-        extra: str,
-    ) -> str:
-        """构建 classical 模式 user 提示词。"""
-        history_lines = []
-        for msg in chat_stream.context.history_messages:
-            history_lines.append(formatter(msg))
-
-        unread_lines = []
-        for msg in unread_msgs:
-            unread_lines.append(formatter(msg))
-
-        history_block = "\n".join(history_lines) if history_lines else ""
-        unread_block = "\n".join(unread_lines) if unread_lines else ""
-
-        return await DefaultChatterPromptBuilder.build_user_prompt(
-            chat_stream,
-            history_text=history_block,
-            unread_lines=unread_block,
-            extra=extra,
-            include_continuous_memory=False,
-        )

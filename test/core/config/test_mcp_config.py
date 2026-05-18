@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from src.core.config.mcp_config import MCPConfig, get_mcp_config, init_mcp_config
+from src.core.config.mcp_config import (
+    MCPConfig,
+    get_mcp_config,
+    init_mcp_config,
+    is_mcp_server_defer_loading,
+)
 
 
 class TestMCPSection:
@@ -19,6 +24,7 @@ class TestMCPSection:
         assert config.mcp.enabled is True
         assert config.mcp.stdio_servers == {}
         assert config.mcp.sse_servers == {}
+        assert config.mcp.streamable_http_servers == {}
 
     def test_mcp_section_disabled(self):
         """测试禁用 MCP。"""
@@ -75,6 +81,21 @@ class TestMCPSection:
 
         assert len(config.stdio_servers) == 1
         assert len(config.sse_servers) == 1
+
+    def test_mcp_section_with_streamable_http_servers(self):
+        """测试带 Streamable HTTP 服务器的配置。"""
+        config = MCPConfig.MCPSection(
+            streamable_http_servers={
+                "code": {
+                    "url": "https://api.example.com/mcp",
+                    "headers": {"Authorization": "Bearer token"},
+                    "timeout": 30,
+                },
+            }
+        )
+
+        assert len(config.streamable_http_servers) == 1
+        assert config.streamable_http_servers["code"]["url"] == "https://api.example.com/mcp"
 
 
 class TestMCPConfig:
@@ -136,6 +157,23 @@ class TestMCPConfig:
 
         assert config.mcp.sse_servers["server1"] == "https://example.com/sse1"
         assert config.mcp.sse_servers["server2"] == "https://example.com/sse2"
+
+    def test_access_streamable_http_servers(self):
+        """测试访问 Streamable HTTP 服务器配置。"""
+        config = MCPConfig(
+            mcp=MCPConfig.MCPSection(
+                streamable_http_servers={
+                    "server1": "https://example.com/mcp1",
+                    "server2": {
+                        "url": "https://example.com/mcp2",
+                        "headers": {"X-Test": "1"},
+                    },
+                },
+            )
+        )
+
+        assert config.mcp.streamable_http_servers["server1"] == "https://example.com/mcp1"
+        assert config.mcp.streamable_http_servers["server2"]["url"] == "https://example.com/mcp2"
 
 
 class TestGlobalMCPConfig:
@@ -300,3 +338,16 @@ class TestMCPConfigScenarios:
 
         assert len(config.mcp.stdio_servers) == 2
         assert len(config.mcp.sse_servers) == 1
+
+
+class TestMCPDeferLoadingHelper:
+    """测试 MCP defer_loading 辅助函数。"""
+
+    def test_defer_loading_defaults_to_true(self) -> None:
+        """未显式配置时应默认延迟加载。"""
+        assert is_mcp_server_defer_loading({}) is True
+        assert is_mcp_server_defer_loading("https://example.com/mcp") is True
+
+    def test_defer_loading_respects_explicit_false(self) -> None:
+        """显式关闭时应返回 False。"""
+        assert is_mcp_server_defer_loading({"defer_loading": False}) is False

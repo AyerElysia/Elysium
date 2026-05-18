@@ -2,42 +2,19 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, AsyncGenerator, TypeGuard
 
-from src.core.components.base import Wait, Success, Failure, Stop
+from src.core.components.base import Wait, WaitResumeEvent, Success, Failure, Stop
 from src.core.models.message import Message
 from src.core.models.stream import ChatStream
 from src.kernel.logger import Logger
 from src.kernel.llm import LLMPayload, ROLE, Text
 
-from .config import DefaultChatterConfig
-from .debug import format_prompt_for_log, log_dc_result
-from .multimodal import build_multimodal_content, extract_media_from_messages
 from .type_defs import DefaultChatterRuntime, LLMConversationState, LLMResponseLike
 from .tool_flow import append_suspend_payload_if_action_only, process_tool_calls
-async def _get_life_state_for_current_turn(logger: Logger) -> str:
-    """获取当前轮次的 Life State（简单模板，不调用 LLM）。
-
-    Args:
-        logger: 日志记录器
-
-    Returns:
-        Life State 文本，如果获取失败则返回空字符串
-    """
-    try:
-        from src.app.plugin_system.api import service_api
-
-        life_service = service_api.get_service("life_engine:service:life_engine")
-        if not life_service:
-            return ""
-
-        state_digest = await life_service.get_state_digest_for_dfc()
-        return state_digest
-    except Exception as e:
-        logger.warning(f"获取 Life State 失败: {e}")
-        return ""
 
 # LLM 返回纯文本（非 tool call）时的最大重试次数
 _MAX_PLAIN_TEXT_RETRIES = 0
@@ -46,17 +23,6 @@ _MAX_PLAIN_TEXT_RETRIES = 0
 _PLAIN_TEXT_RETRY_REMINDER = (
     "（系统提示：你刚才返回了纯文本而非工具调用。"
     "请务必通过工具调用来完成任务，不要直接输出文字回复。）"
-)
-
-# 仅调用 think 时的强制重试次数
-_MAX_THINK_ONLY_RETRIES = 1
-
-# 仅调用 think 时注入的提醒
-_THINK_ONLY_RETRY_REMINDER = (
-    "（系统提醒：你本轮只调用了 action-think。"
-    "think 只能用于内在思考，不能作为唯一动作。"
-    "请立刻再来一轮，至少补充一个可执行动作（例如 action-send_text、"
-    "action-pass_and_wait，或其他可用的 tool/action）。）"
 )
 
 
@@ -88,8 +54,6 @@ class _EnhancedWorkflowRuntime:
     cross_round_seen_signatures: set[str]
     unread_msgs_to_flush: list[Message]
     plain_text_retry_count: int = 0
-    think_only_retry_count: int = 0
-    last_continuous_memory_updated_at: str = ""
 
     def has_tool_result_tail(self) -> bool:
         """当前上下文尾部是否为 TOOL_RESULT。"""
@@ -107,88 +71,6 @@ def _require_response(response: LLMConversationState) -> LLMResponseLike:
     if _is_response_like(response):
         return response
     raise TypeError("当前会话状态尚未进入响应阶段")
-
-
-def _get_multimodal_settings(chatter: DefaultChatterRuntime) -> tuple[bool, int, int]:
-    """读取 default_chatter 的原生多模态配置。"""
-    plugin = getattr(chatter, "plugin", None)
-    config = getattr(plugin, "config", None)
-    if isinstance(config, DefaultChatterConfig):
-        enable_video = bool(getattr(config.plugin, "native_video_multimodal", True))
-        return (
-            config.plugin.native_multimodal,
-            max(0, config.plugin.max_images_per_payload),
-            max(0, getattr(config.plugin, "max_videos_per_payload", 1)) if enable_video else 0,
-        )
-    return False, 0, 0
-
-
-def _log_response_debug(chatter: DefaultChatterRuntime, response: LLMConversationState) -> None:
-    """按配置输出 LLM 调试摘要。"""
-    plugin = getattr(chatter, "plugin", None)
-    config = getattr(plugin, "config", None)
-    if isinstance(config, DefaultChatterConfig):
-        log_dc_result(response, config)
-    else:
-        return
-
-
-def _log_prompt_debug(
-    chatter: DefaultChatterRuntime,
-    response: LLMConversationState,
-    logger: Logger,
-) -> None:
-    """按配置输出完整提示词上下文。"""
-    plugin = getattr(chatter, "plugin", None)
-    config = getattr(plugin, "config", None)
-    if not isinstance(config, DefaultChatterConfig):
-        return
-    plugin_cfg = getattr(config, "plugin", None)
-    debug_cfg = getattr(plugin_cfg, "debug", None)
-    if debug_cfg is None or not getattr(debug_cfg, "show_prompt", False):
-        return
-
-    prompt_text = format_prompt_for_log(response)
-    logger.print_panel(
-        prompt_text,
-        title=f"DefaultChatter 提示词 (stream={getattr(chatter, 'stream_id', '')[:8]})",
-        border_style="cyan",
-    )
-
-
-def _build_multimodal_payload(
-    prompt_text: str,
-    unread_msgs: list[Message],
-    *,
-    history_msgs: list[Message] | None = None,
-    max_images: int = 0,
-    max_videos: int = 0,
-    include_history_media: bool = False,
-) -> list[object]:
-    """将文本提示与媒体组装为原生多模态 content。"""
-    unread_media = extract_media_from_messages(
-        unread_msgs,
-        max_images=max_images,
-        max_videos=max_videos,
-    )
-    content = build_multimodal_content(prompt_text, unread_media)
-
-    unread_image_count = sum(1 for item in unread_media if item.media_type in ("image", "emoji"))
-    unread_video_count = sum(1 for item in unread_media if item.media_type == "video")
-
-    if include_history_media:
-        remaining_images = max(0, max_images - unread_image_count)
-        remaining_videos = max(0, max_videos - unread_video_count)
-        if history_msgs and (remaining_images > 0 or remaining_videos > 0):
-            history_media = extract_media_from_messages(
-                list(reversed(history_msgs)),
-                max_images=remaining_images,
-                max_videos=remaining_videos,
-            )
-            if history_media:
-                content.extend(build_multimodal_content("[历史媒体参考]", history_media))
-
-    return content
 
 
 def _format_tool_args(args: Any) -> str:
@@ -209,6 +91,130 @@ def _is_suspend_message(message: str | None, suspend_text: str) -> bool:
     return isinstance(message, str) and message.strip() == suspend_text
 
 
+def _is_timer_resume_event(event: WaitResumeEvent | None) -> bool:
+    """判断本轮是否由定时 wait 主动恢复。"""
+    return event is not None and event.source == "timer"
+
+
+def _is_sub_agent_resume_event(event: WaitResumeEvent | None) -> bool:
+    """判断本轮是否由子代理后台完成主动恢复。"""
+    return event is not None and event.source == "sub_agent"
+
+
+def _append_suspend_payload_if_tool_result_tail(
+    *,
+    response: LLMResponseLike,
+    suspend_text: str,
+    logger: Logger,
+) -> None:
+    """在进入等待前用占位 assistant 闭合尾部 TOOL_RESULT。"""
+    payloads = getattr(response, "payloads", None)
+    if not payloads or payloads[-1].role != ROLE.TOOL_RESULT:
+        return
+
+    response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(suspend_text)))
+    logger.debug("已注入 SUSPEND 占位符（等待前闭合工具结果）")
+
+
+def _extract_latest_user_text(response: LLMConversationState) -> str:
+    """从当前请求上下文里提取最近一条 USER 文本。"""
+    payloads = getattr(response, "payloads", None) or []
+    for payload in reversed(payloads):
+        if str(getattr(payload, "role", "")) != str(ROLE.USER):
+            continue
+
+        text_parts: list[str] = []
+        for item in getattr(payload, "content", None) or []:
+            text = getattr(item, "text", None)
+            if isinstance(text, str) and text.strip():
+                text_parts.append(text)
+
+        if text_parts:
+            return "\n".join(text_parts)
+
+    return ""
+
+
+def _build_synthetic_trigger_message(chat_stream: ChatStream, prompt_text: str) -> Message:
+    """为主动恢复轮次构造最小触发消息，避免工具调用因缺少 message 被跳过。"""
+    return Message(
+        message_id=f"actor-{int(time.time() * 1000)}",
+        content=prompt_text,
+        processed_plain_text=prompt_text,
+        platform=str(getattr(chat_stream, "platform", "") or ""),
+        chat_type=str(getattr(chat_stream, "chat_type", "") or "private"),
+        stream_id=str(getattr(chat_stream, "stream_id", "") or ""),
+        sender_name="actor",
+    )
+
+
+def _pick_actor_trigger_message(
+    *,
+    chat_stream: ChatStream,
+    rt: _EnhancedWorkflowRuntime,
+) -> Message:
+    """为 actor 当前轮工具调用选择触发消息。"""
+    if rt.unreads:
+        return rt.unreads[-1]
+
+    context = getattr(chat_stream, "context", None)
+    if context is not None:
+        current_message = getattr(context, "current_message", None)
+        if current_message is not None:
+            return current_message
+
+        unread_messages = getattr(context, "unread_messages", None) or []
+        if unread_messages:
+            return unread_messages[-1]
+
+        history_messages = getattr(context, "history_messages", None) or []
+        if history_messages:
+            return history_messages[-1]
+
+    return _build_synthetic_trigger_message(
+        chat_stream,
+        _extract_latest_user_text(rt.response),
+    )
+
+
+def _build_wait_timeout_prompt(event: WaitResumeEvent) -> str:
+    """构建 wait 定时到期后的主动恢复提示词。"""
+    waited_text = (
+        "你之前设置的等待时间已经结束。"
+        if event.wait_time is None
+        else f"你之前设置的等待 {event.wait_time} 秒已经结束。"
+    )
+    return (
+        f"系统事件：{waited_text} 当前没有新的用户消息。"
+        "请基于已有上下文主动决定下一步。"
+        "如果现在不应继续，请再次调用 pass_and_wait；"
+        "如果需要回复或执行动作，请直接使用相应工具。"
+    )
+
+
+def _build_sub_agent_resume_prompt(_: WaitResumeEvent) -> str:
+    """构建子代理后台完成后的主动恢复提示词。"""
+    return (
+        "系统事件：有子代理已在后台完成一轮任务。"
+        "请查看动态 system reminder 中的子代理最新 assistant 动态，"
+        "并结合已有上下文决定下一步。"
+        "如果现在无需继续处理，请调用 pass_and_wait；"
+        "如果需要继续回复、委派或执行动作，请直接使用相应工具。"
+    )
+
+
+def _build_sub_agent_result_user_prompt(events: list[dict[str, Any]]) -> str:
+    """把子代理完成结果拼成一次性的 USER 消息。"""
+    lines = ["以下是子代理刚刚返回的结果，请基于这些结果继续处理："]
+    for event in events:
+        name = str(event.get("name", "unknown"))
+        status = str(event.get("status", "completed"))
+        content = str(event.get("content", "")).strip() or "(无文本结果)"
+        lines.append(f"[{name}] {status}")
+        lines.append(content)
+    return "\n".join(lines)
+
+
 def _build_actor_decision_panel(chat_stream: ChatStream, response: LLMResponseLike) -> str:
     """构建 actor 本次决策摘要面板内容。"""
     stream_name = (
@@ -216,6 +222,7 @@ def _build_actor_decision_panel(chat_stream: ChatStream, response: LLMResponseLi
         or getattr(chat_stream, "stream_id", "")
         or "未知聊天流"
     )
+    thought = response.reasoning_content.strip() if response.reasoning_content else "（无）"
     monologue = response.message.strip() if response.message else "（无）"
 
     tool_lines = []
@@ -229,6 +236,7 @@ def _build_actor_decision_panel(chat_stream: ChatStream, response: LLMResponseLi
     tools_text = "\n".join(tool_lines) if tool_lines else "    （无）"
     return (
         f"聊天流名称：{stream_name}\n\n"
+        f"思考：{thought}\n\n"
         f"独白：{monologue}\n\n"
         f"调用工具：\n{tools_text}"
     )
@@ -268,154 +276,30 @@ def _transition(
     rt.phase = to_phase
 
 
-def _append_suspend_if_tool_result_tail(
-    response: LLMConversationState,
-    suspend_text: str,
-    logger: Logger,
-) -> None:
-    """若当前尾部是 TOOL_RESULT，补一条 ASSISTANT 占位，阻止无消息 follow-up 空转。"""
-    payloads = getattr(response, "payloads", None)
-    if payloads and payloads[-1].role == ROLE.TOOL_RESULT:
-        response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(suspend_text)))
-        logger.debug("已注入 SUSPEND 占位符（pass_and_wait 优先结束本轮）")
-
-
-def _is_think_call_name(name: str) -> bool:
-    """判断调用名是否为 think 动作。"""
-    normalized = str(name or "").strip().lower()
-    if not normalized:
-        return False
-    if normalized in {"action-think", "think"}:
-        return True
-    return normalized.endswith(":action:think")
-
-
-def _is_think_only_calls(calls: list[object]) -> bool:
-    """判断本轮是否“仅调用了 think”。"""
-    if not calls:
-        return False
-    return all(_is_think_call_name(getattr(call, "name", "")) for call in calls)
-
-
-def _append_think_only_retry_instruction(
-    response: LLMConversationState,
-    logger: Logger,
-) -> None:
-    """向上下文注入“think 不能单独结束本轮”的系统提醒。"""
-    response.add_payload(LLMPayload(ROLE.SYSTEM, Text(_THINK_ONLY_RETRY_REMINDER)))
-    logger.warning("检测到本轮仅调用 action-think，已注入系统提醒并触发重试")
-
-
-def _inject_runtime_assistant_payloads(
-    rt: _EnhancedWorkflowRuntime,
-    chat_stream: ChatStream,
-    logger: Logger,
-) -> None:
-    """将外部插件注入的运行时 assistant 文本写入当前上下文。"""
-    payloads = getattr(rt.response, "payloads", None)
-    if not isinstance(payloads, list) or not payloads:
-        return
-
-    # 对话不能以 assistant 开始，必须已有 user 才可注入。
-    has_user = any(payload.role == ROLE.USER for payload in payloads)
-    if not has_user:
-        return
-
-    try:
-        from default_chatter import plugin as default_chatter_plugin_module
-
-        consume_runtime_assistant_injections = getattr(
-            default_chatter_plugin_module,
-            "consume_runtime_assistant_injections",
-            None,
-        )
-        if not callable(consume_runtime_assistant_injections):
-            return
-
-        texts = consume_runtime_assistant_injections(
-            chat_stream.stream_id,
-            max_items=8,
-        )
-        if not texts:
-            return
-
-        injected_count = 0
-        for text in texts:
-            normalized = str(text or "").strip()
-            if not normalized:
-                continue
-            rt.response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(normalized)))
-            injected_count += 1
-
-        if injected_count > 0:
-            logger.info(f"[payload] 已注入运行时 assistant 上下文 {injected_count} 条")
-    except Exception as exc:
-        logger.debug(f"注入运行时 assistant 上下文失败：{exc}")
-
-
-def _drop_oldest_conversation_payloads(
-    response: LLMConversationState,
-    max_drop_count: int,
-) -> int:
-    """按会话顺序裁剪最旧对话 payload，保留 SYSTEM/TOOL 前缀。"""
-    if max_drop_count <= 0:
-        return 0
-
-    payloads = getattr(response, "payloads", None)
-    if not isinstance(payloads, list) or not payloads:
-        return 0
-
-    pinned_roles = {ROLE.SYSTEM, ROLE.TOOL}
-    pinned = [p for p in payloads if p.role in pinned_roles]
-    convo = [p for p in payloads if p.role not in pinned_roles]
-    if not convo:
-        return 0
-
-    groups: list[list[LLMPayload]] = []
-    current: list[LLMPayload] = []
-    for payload in convo:
-        if payload.role == ROLE.USER:
-            if current:
-                groups.append(current)
-            current = [payload]
-            continue
-        if not current:
-            groups.append([payload])
-            continue
-        current.append(payload)
-    if current:
-        groups.append(current)
-
-    # 至少保留一段最近上下文（按 max_drop_count 作为保留基线），
-    # 避免裁剪后会话内容被清空。
-    removable = max(0, len(convo) - max_drop_count)
-    if removable <= 0:
-        return 0
-
-    target_drop = min(max_drop_count, removable)
-    dropped = 0
-    while groups and dropped < target_drop:
-        dropped += len(groups.pop(0))
-
-    remaining = [payload for group in groups for payload in group]
-    while remaining and remaining[0].role != ROLE.USER:
-        remaining.pop(0)
-        dropped += 1
-
-    response.payloads = pinned + remaining
-    return dropped
-
-
 async def run_enhanced(
     chatter: DefaultChatterRuntime,
     chat_stream: ChatStream,
     logger: Logger,
     pass_call_name: str,
-    send_text_call_name: str,
+    stop_call_name: str,
     suspend_text: str,
-    stop_call_name: str = "action-stop_conversation",
-) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:
-    """enhanced 模式执行流程。"""
+    enable_action_suspend: bool = True,
+    enable_cooldown: bool = False,
+    native_multimodal: bool = False,
+) -> AsyncGenerator[Wait | Success | Failure | Stop, WaitResumeEvent | None]:
+    """enhanced 模式执行流程。
+
+    Args:
+        native_multimodal: 启用后将 image 媒体以 base64 直接打包进 USER payload，
+            同时为当前 stream 注册 "image" 类型的 VLM 跳过（表情包 emoji 仍由框架
+            VLM 生成描述，受益于哈希缓存）。执行结束后会自动取消注册，避免残留副作用。
+            历史消息不传图片，仅未读消息携带图片。
+    """
+    if native_multimodal:
+        from src.core.managers.media_manager import get_media_manager
+        get_media_manager().skip_vlm_for_stream(chat_stream.stream_id, ["image"])
+        logger.debug(f"已为 stream {chat_stream.stream_id[:8]} 注册跳过 image 类型的 VLM 识别")
+
     try:
         request = chatter.create_request("actor", with_reminder="actor")
     except (ValueError, KeyError) as error:
@@ -427,7 +311,6 @@ async def run_enhanced(
     request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt_text)))
 
     history_text = chatter._build_enhanced_history_text(chat_stream)
-    native_multimodal, max_images, max_videos = _get_multimodal_settings(chatter)
     usable_map = await chatter.inject_usables(request)
 
     rt = _EnhancedWorkflowRuntime(
@@ -439,7 +322,11 @@ async def run_enhanced(
         unread_msgs_to_flush=[],
     )
 
+    resume_event: WaitResumeEvent | None = None
+
     while True:
+        current_resume_event = resume_event
+        resume_event = None
         _, unread_msgs = await chatter.fetch_unreads()
 
         # 安全兜底：若上下文尾部为 TOOL_RESULT，必须进入 FOLLOW_UP
@@ -451,20 +338,55 @@ async def run_enhanced(
                 reason="context tail is TOOL_RESULT; must follow-up before new USER",
             )
 
-        # 在 WAIT_USER 且链路闭合时，消费外部运行时 assistant 注入。
-        if rt.phase == _ToolCallWorkflowPhase.WAIT_USER and not rt.has_tool_result_tail():
-            _inject_runtime_assistant_payloads(rt, chat_stream, logger)
-
         # FSM 驱动：每次循环只推进一个相位（或 yield）
         if rt.phase == _ToolCallWorkflowPhase.WAIT_USER:
+            if _is_timer_resume_event(current_resume_event) or _is_sub_agent_resume_event(
+                current_resume_event
+            ):
+                assert current_resume_event is not None
+                rt.cross_round_seen_signatures.clear()
+                rt.plain_text_retry_count = 0
+                rt.unreads = []
+                rt.unread_msgs_to_flush = []
+                reminder_text = (
+                    _build_sub_agent_resume_prompt(current_resume_event)
+                    if _is_sub_agent_resume_event(current_resume_event)
+                    else _build_wait_timeout_prompt(current_resume_event)
+                )
+                if _is_sub_agent_resume_event(current_resume_event):
+                    from .sub_agent_collaboration import (
+                        get_sub_agent_collaboration_manager,
+                    )
+
+                    completed_events = get_sub_agent_collaboration_manager().drain_completed_events(
+                        chatter.stream_id
+                    )
+                    if completed_events:
+                        reminder_text = _build_sub_agent_result_user_prompt(completed_events)
+
+                chatter._upsert_pending_unread_payload(
+                    response=rt.response,
+                    formatted_text=reminder_text,
+                )
+                _transition(
+                    rt=rt,
+                    to_phase=_ToolCallWorkflowPhase.MODEL_TURN,
+                    logger=logger,
+                    reason=(
+                        "sub-agent completed"
+                        if _is_sub_agent_resume_event(current_resume_event)
+                        else "wait timer elapsed"
+                    ),
+                )
+                continue
+
             if not unread_msgs:
-                yield Wait()
+                resume_event = yield Wait(evaluated_messages_count=0)
                 continue
 
             # 仅在采纳新未读消息时清空跨轮去重状态；FOLLOW_UP 阶段不应清空。
             rt.cross_round_seen_signatures.clear()
             rt.plain_text_retry_count = 0
-            rt.think_only_retry_count = 0
             rt.unreads = unread_msgs
 
             unread_lines = "\n".join(
@@ -474,20 +396,9 @@ async def run_enhanced(
                 chat_stream,
                 history_text=history_text if not rt.history_merged else "",
                 unread_lines=unread_lines,
-                extra=chatter._build_user_extra(chat_stream),
+                extra=chatter._build_negative_behaviors_extra(),
             )
-
-            if native_multimodal:
-                unread_user_content = _build_multimodal_payload(
-                    unread_user_prompt,
-                    unread_msgs,
-                    history_msgs=chat_stream.context.history_messages,
-                    max_images=max_images,
-                    max_videos=max_videos,
-                    include_history_media=not rt.history_merged,
-                )
-            else:
-                unread_user_content = Text(unread_user_prompt)
+            rt.history_merged = True
 
             decision = await chatter.sub_agent(
                 unread_lines,
@@ -500,14 +411,16 @@ async def run_enhanced(
 
             if not decision["should_respond"]:
                 logger.info("Sub-agent 决定不响应，继续等待...")
-                yield Wait()
+                resume_event = yield Wait(evaluated_messages_count=len(rt.unreads))
                 continue
 
             chatter._upsert_pending_unread_payload(
                 response=rt.response,
-                formatted_content=unread_user_content,
+                formatted_text=unread_user_prompt,
+                unread_msgs=unread_msgs,
+                native_multimodal=native_multimodal,
+                logger_override=logger,
             )
-            rt.history_merged = True
             _transition(rt=rt, to_phase=_ToolCallWorkflowPhase.MODEL_TURN, logger=logger, reason="accepted unread batch")
 
             # MODEL_TURN 阶段发送后才 flush 本轮采纳的 unread
@@ -516,23 +429,9 @@ async def run_enhanced(
 
         if rt.phase in (_ToolCallWorkflowPhase.MODEL_TURN, _ToolCallWorkflowPhase.FOLLOW_UP):
             # FOLLOW_UP 阶段严禁 flush 新未读；MODEL_TURN 才 flush 本轮采纳的 unread。
-
-            # ✅ 在发送请求前，临时添加 Life State（不保存到历史）
-            life_state_text = await _get_life_state_for_current_turn(logger)
-
-            if life_state_text:
-                try:
-                    life_state_payload = LLMPayload(ROLE.USER, Text(f"<life_state>\n{life_state_text}\n</life_state>"))
-                    rt.response.add_payload(life_state_payload)
-                    logger.debug(f"已添加 Life State: {len(life_state_text)} chars")
-                except Exception as e:
-                    logger.warning(f"添加 Life State 失败: {e}")
-
             try:
-                _log_prompt_debug(chatter, rt.response, logger)
                 rt.response = await rt.response.send(stream=False)
                 await rt.response
-                _log_response_debug(chatter, rt.response)
                 if rt.phase == _ToolCallWorkflowPhase.MODEL_TURN:
                     if rt.unread_msgs_to_flush:
                         await chatter.flush_unreads(rt.unread_msgs_to_flush)
@@ -554,7 +453,7 @@ async def run_enhanced(
 
             if not llm_response.call_list:
                 if _is_suspend_message(llm_response.message, suspend_text):
-                    yield Wait()
+                    resume_event = yield Wait(evaluated_messages_count=0)
                     _transition(rt=rt, to_phase=_ToolCallWorkflowPhase.WAIT_USER, logger=logger, reason="model returned suspend")
                     continue
                 if llm_response.message and llm_response.message.strip():
@@ -564,7 +463,7 @@ async def run_enhanced(
                     )
                     yield Stop(0)
                     return
-                yield Wait()
+                resume_event = yield Wait(evaluated_messages_count=0)
                 _transition(rt=rt, to_phase=_ToolCallWorkflowPhase.WAIT_USER, logger=logger, reason="no call_list")
                 continue
 
@@ -580,239 +479,54 @@ async def run_enhanced(
                 response=llm_response,
                 run_tool_call=chatter.run_tool_call,
                 usable_map=usable_map,
-                trigger_msg=rt.unreads[-1] if rt.unreads else None,
+                trigger_msg=_pick_actor_trigger_message(
+                    chat_stream=chat_stream,
+                    rt=rt,
+                ),
                 pass_call_name=pass_call_name,
                 stop_call_name=stop_call_name,
-                send_text_call_name=send_text_call_name,
-                break_on_send_text=False,
                 cross_round_seen_signatures=rt.cross_round_seen_signatures,
             )
 
             if call_outcome.should_stop:
-                _append_suspend_if_tool_result_tail(rt.response, suspend_text, logger)
-                yield Stop(call_outcome.stop_minutes * 60)
-                _transition(rt=rt, to_phase=_ToolCallWorkflowPhase.WAIT_USER, logger=logger, reason="stop_conversation")
+                cooldown_seconds = call_outcome.stop_minutes * 60 if enable_cooldown else 0
+                logger.info(f"对话已结束，冷却 {call_outcome.stop_minutes} 分钟（{'已启用' if enable_cooldown else '已禁用，实际不冷却'}）")
+                yield Stop(cooldown_seconds)
                 return
-
-            think_only_calls = _is_think_only_calls(llm_response.call_list or [])
-            if (
-                think_only_calls
-                and not call_outcome.should_wait
-                and not call_outcome.has_pending_tool_results
-            ):
-                if rt.think_only_retry_count < _MAX_THINK_ONLY_RETRIES:
-                    rt.think_only_retry_count += 1
-                    _append_think_only_retry_instruction(rt.response, logger)
-                    _transition(
-                        rt=rt,
-                        to_phase=_ToolCallWorkflowPhase.FOLLOW_UP,
-                        logger=logger,
-                        reason="think-only guard retry",
-                    )
-                    continue
-                logger.warning("连续仅调用 action-think，达到重试上限，本轮按普通 action-only 处理")
-            else:
-                rt.think_only_retry_count = 0
 
             if call_outcome.has_pending_tool_results:
                 _transition(rt=rt, to_phase=_ToolCallWorkflowPhase.FOLLOW_UP, logger=logger, reason="pending tool results")
                 continue
 
-            # pass_and_wait 只在工具链已闭合时结束本轮。
-            # 为避免下一轮被“尾部 TOOL_RESULT”强制 FOLLOW_UP，这里补一个 ASSISTANT 占位。
-            if call_outcome.should_wait:
-                _append_suspend_if_tool_result_tail(rt.response, suspend_text, logger)
-                yield Wait()
-                _transition(rt=rt, to_phase=_ToolCallWorkflowPhase.WAIT_USER, logger=logger, reason="pass_and_wait priority")
-                continue
-
+            action_only_round = bool(current_calls) and all(
+                call.name.startswith("action-") for call in current_calls
+            )
             append_suspend_payload_if_action_only(
                 calls=current_calls,
                 response=llm_response,
                 suspend_text=suspend_text,
+                enable_action_suspend=enable_action_suspend,
                 logger=logger,
             )
 
             # 工具链已闭合，可以进入等待或接受新 user。
-            yield Wait()
-            _transition(rt=rt, to_phase=_ToolCallWorkflowPhase.WAIT_USER, logger=logger, reason="tool exec done")
-            continue
-
-
-async def run_classical(
-    chatter: DefaultChatterRuntime,
-    chat_stream: ChatStream,
-    logger: Logger,
-    pass_call_name: str,
-    send_text_call_name: str,
-    suspend_text: str,
-    stop_call_name: str = "action-stop_conversation",
-) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:
-    """classical 模式执行流程。"""
-    try:
-        base_request = chatter.create_request("actor", with_reminder="actor")
-    except (ValueError, KeyError) as error:
-        logger.error(f"获取模型配置失败: {error}")
-        yield Failure(f"模型配置错误: {error}")
-        return
-
-    usable_map = await chatter.inject_usables(base_request)
-    native_multimodal, max_images, max_videos = _get_multimodal_settings(chatter)
-    history_media_injected = False
-
-    while True:
-        _, unread_msgs = await chatter.fetch_unreads()
-        unreads = unread_msgs
-
-        if not unread_msgs:
-            yield Wait()
-            continue
-
-        classical_user_text = await chatter._build_classical_user_text(
-            chat_stream,
-            unread_msgs,
-        )
-
-        unread_lines = "\n".join(
-            chatter.format_message_line(msg) for msg in unread_msgs
-        )
-        decision = await chatter.sub_agent(
-            unread_lines,
-            unread_msgs,
-            chat_stream,
-        )
-        logger.info(
-            f"Sub-agent 决策: {decision['reason']} (响应: {decision['should_respond']})"
-        )
-
-        if not decision["should_respond"]:
-            logger.info("Sub-agent 决定不响应，继续等待...")
-            yield Wait()
-            continue
-
-        request = chatter.create_request("actor", with_reminder="actor")
-        request.add_payload(
-            LLMPayload(
-                ROLE.SYSTEM,
-                Text(await chatter._build_system_prompt(chat_stream)),
-            )
-        )
-        if native_multimodal:
-            user_content = _build_multimodal_payload(
-                classical_user_text,
-                unread_msgs,
-                history_msgs=chat_stream.context.history_messages,
-                max_images=max_images,
-                max_videos=max_videos,
-                include_history_media=not history_media_injected,
-            )
-            request.add_payload(LLMPayload(ROLE.USER, user_content))
-            history_media_injected = True
-        else:
-            request.add_payload(LLMPayload(ROLE.USER, Text(classical_user_text)))
-        if usable_map.get_all():
-            request.add_payload(LLMPayload(ROLE.TOOL, usable_map.get_all()))  # type: ignore[arg-type]
-
-        response = request
-        cross_round_seen_signatures: set[str] = set()
-        has_pending_tool_results = False
-        think_only_retry_count = 0
-
-        while True:
-            try:
-                _log_prompt_debug(chatter, response, logger)
-                response = await response.send(stream=False)
-                await response
-                _log_response_debug(chatter, response)
-            except Exception as error:
-                logger.error(f"LLM 请求失败: {error}", exc_info=True)
-                yield Failure("LLM 请求失败", error)
-                break
-
-            _print_actor_decision_panel(chat_stream, response, logger)
-
-            if not response.call_list:
-                if _is_suspend_message(response.message, suspend_text):
-                    await chatter.flush_unreads(unread_msgs)
-                    yield Wait()
-                    break
-                if response.message and response.message.strip():
-                    logger.warning(
-                        f"LLM 返回了纯文本而非 tool call: "
-                        f"{response.message[:100]}"
-                    )
-                await chatter.flush_unreads(unread_msgs)
-                yield Stop(0)
-                return
-
-            current_calls = response.call_list or []
-
-            for call in current_calls:
-                args = call.args if isinstance(call.args, dict) else {}
-                reason = args.pop("reason", "未提供原因")
-                logger.info(f"LLM 调用 {call.name}，原因: {reason}，参数: {args}")
-
-            call_outcome = await process_tool_calls(
-                stream_id=chat_stream.stream_id,
-                calls=current_calls,
-                response=response,
-                run_tool_call=chatter.run_tool_call,
-                usable_map=usable_map,
-                trigger_msg=unreads[-1] if unreads else None,
-                pass_call_name=pass_call_name,
-                stop_call_name=stop_call_name,
-                send_text_call_name=send_text_call_name,
-                break_on_send_text=True,
-                cross_round_seen_signatures=cross_round_seen_signatures,
-            )
-            has_pending_tool_results = call_outcome.has_pending_tool_results
-
-            think_only_calls = _is_think_only_calls(response.call_list or [])
-            if (
-                think_only_calls
-                and not call_outcome.should_wait
-                and not has_pending_tool_results
-                and not call_outcome.sent_once
-            ):
-                if think_only_retry_count < _MAX_THINK_ONLY_RETRIES:
-                    think_only_retry_count += 1
-                    _append_think_only_retry_instruction(response, logger)
+            if action_only_round and not call_outcome.should_wait:
+                if enable_action_suspend:
+                    resume_event = yield Wait(evaluated_messages_count=0)
+                    _transition(rt=rt, to_phase=_ToolCallWorkflowPhase.WAIT_USER, logger=logger, reason="action-only round suspended")
                     continue
-                logger.warning("classical 模式连续仅调用 action-think，达到重试上限，本轮转入等待")
-            else:
-                think_only_retry_count = 0
+                _transition(rt=rt, to_phase=_ToolCallWorkflowPhase.FOLLOW_UP, logger=logger, reason="action-only round continues follow-up")
+                continue
 
-            if call_outcome.should_stop:
-                _append_suspend_if_tool_result_tail(response, suspend_text, logger)
-                await chatter.flush_unreads(unread_msgs)
-                yield Stop(call_outcome.stop_minutes * 60)
-                return
-
-            if not call_outcome.has_pending_tool_results:
-                append_suspend_payload_if_action_only(
-                    calls=current_calls,
-                    response=response,
+            if call_outcome.should_wait:
+                _append_suspend_payload_if_tool_result_tail(
+                    response=llm_response,
                     suspend_text=suspend_text,
                     logger=logger,
                 )
-
-            if call_outcome.sent_once:
-                logger.info("classical 模式已发送一次消息，强制结束当前对话")
-                await chatter.flush_unreads(unread_msgs)
-                yield Stop(0)
-                return
-
-            if call_outcome.should_wait:
-                _append_suspend_if_tool_result_tail(response, suspend_text, logger)
-                await chatter.flush_unreads(unread_msgs)
-                yield Wait()
-                break
-
-            # 未要求等待时，若存在 pending 工具结果则继续 follow-up。
-            if has_pending_tool_results:
-                continue
-
-            # 兜底：action-only 且未显式 wait/stop 的场景（例如仅 think），本轮收敛为等待。
-            await chatter.flush_unreads(unread_msgs)
-            yield Wait()
-            break
+                resume_event = yield Wait(
+                    time=getattr(call_outcome, "wait_seconds", None),
+                    evaluated_messages_count=0
+                )
+            _transition(rt=rt, to_phase=_ToolCallWorkflowPhase.WAIT_USER, logger=logger, reason="tool exec done")
+            continue

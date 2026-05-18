@@ -904,12 +904,12 @@ class MediaManager:
             if template:
                 prompt = await template.build()
 
-            # 处理 base64 数据：提取纯净的 base64 内容
+            # 处理 base64 数据：提取纯净的 base64 内容，并尽量保留原始 MIME
             clean_base64 = self._extract_clean_base64(base64_data)
-            
+            mime_type = self._extract_image_mime_type(base64_data)
+
             # 使用标准的 data URL 格式（大多数 VLM API 都支持）
-            # 假设是 PNG 图片，如果需要可以根据实际情况调整
-            image_value = f"data:image/png;base64,{clean_base64}"
+            image_value = f"data:{mime_type};base64,{clean_base64}"
 
             # 添加 payload 并发送请求
             request.add_payload(LLMPayload(ROLE.USER, [Text(prompt), Image(image_value)]))
@@ -1181,6 +1181,22 @@ class MediaManager:
         data = data.replace("\n", "").replace("\r", "").replace(" ", "")
         
         return data
+
+    @staticmethod
+    def _extract_image_mime_type(data: str) -> str:
+        """从图片 data URL 中提取 MIME 类型。
+
+        Args:
+            data: 原始图片数据，可能是 data URL 或纯 base64
+
+        Returns:
+            图片 MIME 类型，无法识别时回退为 ``image/png``
+        """
+        if data.startswith("data:") and ";base64," in data:
+            mime_type = data.split(";", 1)[0][len("data:") :].strip().lower()
+            if mime_type.startswith("image/"):
+                return mime_type
+        return "image/png"
 
     @staticmethod
     def _extract_video_payload(video_data: str | dict[str, Any]) -> tuple[str, dict[str, Any]]:

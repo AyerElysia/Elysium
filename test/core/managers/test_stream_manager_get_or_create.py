@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -8,6 +9,7 @@ import pytest
 
 from src.core.managers.stream_manager import _serialize_content_for_db
 from src.core.models.message import Message
+from src.core.models.stream import ChatStream
 
 
 @pytest.mark.asyncio
@@ -246,6 +248,7 @@ async def test_get_stream_info_normalizes_raw_person_id(monkeypatch) -> None:
             person_id="qq:12345",
             last_active_time=100.0,
             created_at=90.0,
+            context_cleared_at=None,
         )
     )
     manager._streams_crud.update = AsyncMock(return_value=None)
@@ -314,6 +317,146 @@ async def test_add_message_normalizes_direct_raw_person_id(monkeypatch) -> None:
 
     created_data = manager._messages_crud.create.await_args.args[0]
     assert created_data["person_id"] == "hash_qq_user_123"
+
+
+@pytest.mark.asyncio
+async def test_clear_stream_context_resets_cached_runtime_context() -> None:
+    """清空上下文应同步重置内存中的运行态。"""
+    from src.core.managers.stream_manager import StreamManager
+
+    manager = StreamManager()
+    stream = ChatStream(stream_id="stream-clear-001", platform="qq", chat_type="private")
+    stream.context.history_messages.append(SimpleNamespace(message_id="h1"))
+    stream.context.unread_messages.append(SimpleNamespace(message_id="u1"))
+    stream.context.current_message = SimpleNamespace(message_id="c1")
+    stream.context.triggering_user_id = "user-1"
+    stream.context.processing_message_id = "msg-1"
+    stream.context.message_cache.append(SimpleNamespace(message_id="cache-1"))
+    stream.context.last_message_time = 1.0
+    stream.context.message_buffer_skip_count = 3
+    stream.context.is_chatter_processing = True
+    manager._streams[stream.stream_id] = stream
+
+    manager._streams_crud.get_by = AsyncMock(return_value=SimpleNamespace(id=9))
+    manager._streams_crud.update = AsyncMock(return_value=None)
+
+    result = await manager.clear_stream_context(stream.stream_id, cleared_at=123.0)
+
+    assert result is True
+    assert stream.context.history_messages == []
+    assert stream.context.unread_messages == []
+    assert stream.context.current_message is None
+    assert stream.context.triggering_user_id is None
+    assert stream.context.processing_message_id is None
+    assert list(stream.context.message_cache) == []
+    assert stream.context.last_message_time is None
+    assert stream.context.message_buffer_skip_count == 0
+    assert stream.context.is_chatter_processing is False
+    assert stream.context_cleared_at == 123.0
+    manager._streams_crud.update.assert_awaited_once_with(9, {"context_cleared_at": 123.0})
+
+
+@pytest.mark.asyncio
+async def test_load_stream_context_respects_context_cleared_at(monkeypatch) -> None:
+    """加载上下文时应过滤清空时间点之前的消息。"""
+    from src.core.managers.stream_manager import StreamManager
+
+    manager = StreamManager()
+    manager._streams_crud.get_by = AsyncMock(
+        return_value=SimpleNamespace(
+            stream_id="stream-clear-002",
+            chat_type="private",
+            context_cleared_at=50.0,
+        )
+    )
+
+    class _FakeQuery:
+        def __init__(self) -> None:
+            self.filters: list[dict[str, object]] = []
+            self.order: str | None = None
+            self.limit_value: int | None = None
+
+        def filter(self, **kwargs):
+            self.filters.append(kwargs)
+            return self
+
+        def order_by(self, value: str):
+            self.order = value
+            return self
+
+        def limit(self, value: int):
+            self.limit_value = value
+            return self
+
+        async def all(self):
+            return []
+
+    fake_query = _FakeQuery()
+    monkeypatch.setattr(
+        "src.core.managers.stream_manager.QueryBuilder",
+        lambda _model: fake_query,
+    )
+
+    context = await manager.load_stream_context("stream-clear-002", max_messages=20)
+
+    assert context.stream_id == "stream-clear-002"
+    assert {"stream_id": "stream-clear-002"} in fake_query.filters
+    assert {"time__gt": 50.0} in fake_query.filters
+    assert fake_query.order == "-id"
+    assert fake_query.limit_value == 20
+
+
+@pytest.mark.asyncio
+async def test_bulk_clear_streams_clears_matching_cached_streams(monkeypatch) -> None:
+    """批量清空应只影响匹配类型的内存流，并持久化到数据库。"""
+    from src.core.managers.stream_manager import StreamManager
+
+    manager = StreamManager()
+    private_stream = ChatStream(
+        stream_id="stream-private-001",
+        platform="qq",
+        chat_type="private",
+    )
+    private_stream.context.history_messages.append(SimpleNamespace(message_id="p1"))
+    private_stream.context.unread_messages.append(SimpleNamespace(message_id="p2"))
+
+    group_stream = ChatStream(
+        stream_id="stream-group-001",
+        platform="qq",
+        chat_type="group",
+    )
+    group_stream.context.history_messages.append(SimpleNamespace(message_id="g1"))
+    group_stream.context.unread_messages.append(SimpleNamespace(message_id="g2"))
+
+    manager._streams[private_stream.stream_id] = private_stream
+    manager._streams[group_stream.stream_id] = group_stream
+
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(rowcount=3)),
+        commit=AsyncMock(return_value=None),
+    )
+
+    @asynccontextmanager
+    async def _fake_db_session():
+        yield session
+
+    monkeypatch.setattr(
+        "src.core.managers.stream_manager.get_db_session",
+        _fake_db_session,
+    )
+    monkeypatch.setattr("src.core.managers.stream_manager.time.time", lambda: 77.0)
+
+    count = await manager.bulk_clear_streams("private")
+
+    assert count == 3
+    assert private_stream.context.history_messages == []
+    assert private_stream.context.unread_messages == []
+    assert private_stream.context_cleared_at == 77.0
+    assert len(group_stream.context.history_messages) == 1
+    assert len(group_stream.context.unread_messages) == 1
+    assert group_stream.context_cleared_at is None
+    session.execute.assert_awaited_once()
+    session.commit.assert_awaited_once()
 
 
 def test_serialize_content_for_db_keeps_small_binary_media_data() -> None:

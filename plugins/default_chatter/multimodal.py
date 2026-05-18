@@ -1,201 +1,107 @@
-"""Default Chatter 多模态辅助模块。
+"""DefaultChatter 原生多模态辅助模块。
 
-负责提取消息中的图片/表情包/视频，并组装为 LLM 原生多模态 payload 内容。
+提供与 KFC 多模态相同语义的图片提取与 LLM 内容拼装能力，但默认仅
+处理 ``image`` 类型；表情包仍交由框架的 VLM 走文字描述路径，以利用
+其哈希缓存。
+
+模块保持纯函数形态，不依赖运行时单例，便于单测覆盖。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from src.kernel.llm import Content, Image, Text, Video
-
-if TYPE_CHECKING:
-    from src.core.models.message import Message
+from src.core.models.message import Message
+from src.kernel.llm import Content, Image, Text
+from src.kernel.llm.payload.tooling import LLMUsable
 
 
-@dataclass
-class MediaItem:
-    """从消息中提取的媒体条目。"""
+def get_image_media_list(msg: Message) -> list[dict[str, Any]]:
+    """从 ``Message`` 中提取仅包含 ``image`` 类型的媒体列表。
 
-    media_type: str
-    raw_data: str
-    source_message_id: str
+    DFC 多模态模式下，表情包继续走 VLM 文字描述（受益于哈希缓存），
+    因此这里显式过滤掉 ``emoji`` / ``voice`` 等非图片类型。
 
+    Args:
+        msg: 消息对象
 
-class ImageBudget:
-    """图片预算追踪器。"""
-
-    def __init__(self, total_max: int = 4) -> None:
-        self._total_max = max(0, total_max)
-        self._used = 0
-
-    @property
-    def remaining(self) -> int:
-        return max(0, self._total_max - self._used)
-
-    def consume(self, count: int) -> None:
-        self._used += max(0, count)
-
-    def is_exhausted(self) -> bool:
-        return self._used >= self._total_max
-
-    def reset(self) -> None:
-        self._used = 0
+    Returns:
+        仅含 ``{"type": "image", "data": ...}`` 的字典列表；无图片返回空
+    """
+    media = _read_raw_media(msg)
+    return [item for item in media if item.get("type") == "image" and item.get("data")]
 
 
-def extract_media_from_messages(
+def extract_images_from_messages(
     messages: list[Message],
-    max_images: int = 4,
-    max_videos: int = 1,
-) -> list[MediaItem]:
-    """从消息列表中提取图片/表情包/视频媒体。"""
-    items: list[MediaItem] = []
-    image_like_count = 0
-    video_count = 0
+) -> list[dict[str, Any]]:
+    """按顺序从消息列表中提取全部图片。
 
+    Args:
+        messages: 待扫描的消息（可为未读消息或历史消息子集）
+
+    Returns:
+        提取到的媒体字典列表，保持原始消息顺序
+    """
+    items: list[dict[str, Any]] = []
     for msg in messages:
-        if image_like_count >= max_images and video_count >= max_videos:
-            break
-
-        media_list = get_media_list(msg)
-        if not media_list:
-            continue
-
-        msg_id = getattr(msg, "message_id", "")
-        for media in media_list:
-            media_type = str(media.get("type", "image")).lower()
-            if media_type not in ("image", "emoji", "video"):
-                continue
-
-            data = _extract_media_data(media_type, media.get("data", ""))
-            if not data:
-                continue
-
-            if media_type in ("image", "emoji"):
-                if image_like_count >= max_images:
-                    continue
-                image_like_count += 1
-            elif media_type == "video":
-                if video_count >= max_videos:
-                    continue
-                video_count += 1
-
-            items.append(
-                MediaItem(
-                    media_type=media_type,
-                    raw_data=data,
-                    source_message_id=str(msg_id),
-                )
-            )
-
+        for media in get_image_media_list(msg):
+            items.append(media)
     return items
 
 
 def build_multimodal_content(
     text: str,
-    media_items: list[MediaItem],
-) -> list[Content]:
-    """构建 Text + Image/Video 混合 content 列表。"""
-    content_list: list[Content] = [Text(text)]
+    media_items: list[dict[str, Any]],
+) -> list[Content | LLMUsable]:
+    """将文本与图片打包为 LLMPayload 可接受的 content 列表。
+
+    Args:
+        text: 文本主体
+        media_items: 按消息时序排列的图片媒体字典列表
+
+    Returns:
+        ``[Text(text), Image(data1), Image(data2), ...]`` 格式的内容列表
+    """
+    content_list: list[Content | LLMUsable] = [Text(text)]
     for item in media_items:
-        if item.media_type == "emoji":
-            content_list.append(Text("[表情包]"))
-            content_list.append(Image(item.raw_data))
-            continue
-        if item.media_type == "image":
-            content_list.append(Image(item.raw_data))
-            continue
-        if item.media_type == "video":
-            content_list.append(Text("[视频]"))
-            content_list.append(Video(item.raw_data))
+        content_list.append(Image(str(item["data"])))
     return content_list
 
 
-def _extract_media_data(media_type: str, raw_data: Any) -> str:
-    """提取媒体原始数据（base64/data-url/path）。"""
-    if isinstance(raw_data, str):
-        return _normalize_multimodal_media_data(raw_data)
-
-    if isinstance(raw_data, dict):
-        if media_type == "video":
-            keys = ("base64", "data", "video_base64", "url", "path", "file")
-        else:
-            keys = ("data", "base64", "url", "path", "file")
-
-        for key in keys:
-            value = raw_data.get(key)
-            if isinstance(value, str) and value.strip():
-                return value
-
-        nested_media = raw_data.get("media")
-        if isinstance(nested_media, list):
-            for item in nested_media:
-                if not isinstance(item, dict):
-                    continue
-                for key in ("data", "base64", "url", "path", "file"):
-                    value = item.get(key)
-                    if isinstance(value, str) and value.strip():
-                        return _normalize_multimodal_media_data(value)
-    return ""
+# ──────────────────────────────────────────
+# 内部辅助
+# ──────────────────────────────────────────
 
 
-def _normalize_multimodal_media_data(value: str) -> str:
-    """把不同来源的媒体前缀统一成多模态链路可消费的形式。"""
-    if value.startswith("base64://"):
-        return f"base64|{value[len('base64://'):]}"
-    return value
+def _extract_dict_list(raw: Any) -> list[dict[str, Any]] | None:
+    """将原始值转换为仅含 dict 元素的列表；非列表或空列表返回 None。"""
+    if isinstance(raw, list) and raw:
+        return [item for item in raw if isinstance(item, dict)]
+    return None
 
 
-def get_media_list(msg: Message) -> list[dict[str, Any]]:
-    """从 Message 对象中提取 media 列表。"""
-    collected: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
+def _read_raw_media(msg: Message) -> list[dict[str, Any]]:
+    """读取消息中尚未被剥离 base64 的原始 media 列表。
 
-    def extend_media(source: Any) -> None:
-        if not isinstance(source, list):
-            return
-        for item in source:
-            if not isinstance(item, dict):
-                continue
-            media_type = str(item.get("type", "")).lower()
-            if not media_type:
-                continue
-            raw_key = (
-                item.get("data")
-                or item.get("base64")
-                or item.get("path")
-                or item.get("url")
-                or item.get("file")
-            )
-            key = (media_type, str(raw_key))
-            if key in seen:
-                continue
-            seen.add(key)
-            collected.append(item)
+    按优先级依次检查三个候选位置：
+    1. ``msg.content["media"]`` — 要求至少一项含 ``data`` 字段（完整媒体）
+    2. ``msg.extra["media"]`` — 非空列表即可
+    3. ``msg.media`` 属性 — 非空列表即可
 
-    content = getattr(msg, "content", None)
+    stream_manager 持久化时会剔除超大 ``data``，此处仅在 Chatter 运行期
+    内使用，因此能拿到完整字节。
+    """
+    content = msg.content
     if isinstance(content, dict):
-        extend_media(content.get("media"))
+        items = _extract_dict_list(content.get("media"))
+        if items and any(item.get("data") for item in items):
+            return items
 
-    extra = getattr(msg, "extra", {})
+    extra = msg.extra
     if isinstance(extra, dict):
-        extend_media(extra.get("media"))
-
-    media = getattr(msg, "media", None)
-    extend_media(media)
-
-    if collected:
-        return collected
-
-    msg_type = getattr(msg, "message_type", None)
-    if (
-        msg_type is not None
-        and str(msg_type).lower() == "emoji"
-        and isinstance(content, str)
-        and len(content) > 100
-    ):
-        data = content if content.startswith("base64|") else f"base64|{content}"
-        return [{"type": "emoji", "data": data}]
+        items = _extract_dict_list(extra.get("media"))
+        if items:
+            return items
 
     return []

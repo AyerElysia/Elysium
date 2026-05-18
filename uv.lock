@@ -1639,6 +1639,7 @@ dependencies = [
     { name = "rich" },
     { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "tiktoken" },
+    { name = "websockets" },
 ]
 
 [package.dev-dependencies]
@@ -1670,6 +1671,7 @@ requires-dist = [
     { name = "rich", specifier = ">=14.3.1" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.46" },
     { name = "tiktoken", specifier = ">=0.12.0" },
+    { name = "websockets", specifier = ">=14.2" },
 ]
 
 [package.metadata.requires-dev]

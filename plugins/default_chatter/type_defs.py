@@ -8,6 +8,7 @@ from typing import Protocol, TypedDict, TypeAlias
 from src.core.models.message import Message
 from src.core.models.stream import ChatStream
 from src.kernel.llm import LLMPayload, LLMRequest, ToolCall, ToolRegistry
+from src.kernel.logger import Logger
 
 
 class SubAgentDecision(TypedDict):
@@ -53,11 +54,12 @@ LLMConversationState: TypeAlias = LLMRequest | LLMResponseLike
 class DefaultChatterRuntime(Protocol):
     """default_chatter 运行流程依赖的最小 chatter 能力集合。"""
 
+    stream_id: str
+
     def create_request(
         self,
         task: str = "actor",
         request_name: str = "",
-        max_context: int | None = None,
         with_reminder: str | None = None,
     ) -> LLMRequest:
         """创建 LLM 请求。"""
@@ -68,19 +70,11 @@ class DefaultChatterRuntime(Protocol):
         ...
 
     def _build_enhanced_history_text(self, chat_stream: ChatStream) -> str:
-        """构建 enhanced 模式历史文本。"""
+        """构建历史文本。"""
         ...
 
     async def inject_usables(self, request: LLMRequest) -> ToolRegistry:
         """向请求注入可用工具。"""
-        ...
-
-    def _register_vlm_skip(self) -> None:
-        """为当前聊天流注册原生多模态所需的 VLM 跳过。"""
-        ...
-
-    def _unregister_vlm_skip(self) -> None:
-        """注销当前聊天流的 VLM 跳过。"""
         ...
 
     async def fetch_unreads(
@@ -104,21 +98,12 @@ class DefaultChatterRuntime(Protocol):
         history_text: str,
         unread_lines: str,
         extra: str = "",
-        include_continuous_memory: bool = True,
     ) -> str:
         """构建增强模式用户提示词。"""
         ...
 
     def _build_negative_behaviors_extra(self) -> str:
         """构建附加负面行为约束。"""
-        ...
-
-    def _build_user_extra(self, chat_stream: ChatStream) -> str:
-        """构建 user 提示词动态 extra。"""
-        ...
-
-    def _build_scene_guide_system_block(self, chat_stream: ChatStream) -> str:
-        """构建会话场景引导的 SYSTEM 固定块。"""
         ...
 
     async def sub_agent(
@@ -133,7 +118,10 @@ class DefaultChatterRuntime(Protocol):
     def _upsert_pending_unread_payload(
         self,
         response: LLMConversationState,
-        formatted_content: object,
+        formatted_text: str,
+        unread_msgs: list[Message] | None = None,
+        native_multimodal: bool = False,
+        logger_override: Logger | None = None,
     ) -> None:
         """将未读消息写入待发送上下文。"""
         ...
@@ -163,15 +151,6 @@ class DefaultChatterRuntime(Protocol):
         """
         ...
 
-    async def _build_classical_user_text(
-        self,
-        chat_stream: ChatStream,
-        unread_msgs: list[Message],
-    ) -> str:
-        """构建 classical 模式用户提示词。"""
-        ...
-
-
 class SupportsRequestCreation(Protocol):
     """支持创建 LLM 请求的最小能力集合。"""
 
@@ -179,7 +158,6 @@ class SupportsRequestCreation(Protocol):
         self,
         task: str = "actor",
         request_name: str = "",
-        max_context: int | None = None,
         with_reminder: str | None = None,
     ) -> LLMRequest:
         """创建 LLM 请求。"""

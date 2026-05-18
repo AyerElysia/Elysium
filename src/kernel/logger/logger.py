@@ -660,7 +660,7 @@ def install_rich_traceback_formatter():
         console=Console(stderr=True),
         width=None,
         word_wrap=False,
-        show_locals=True,
+        show_locals=False,
     )
 
 

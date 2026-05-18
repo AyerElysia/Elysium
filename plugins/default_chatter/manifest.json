@@ -24,18 +24,8 @@
             "dependencies": []
         },
         {
-            "component_type": "tool",
-            "component_name": "message_nucleus",
-            "dependencies": []
-        },
-        {
-            "component_type": "tool",
-            "component_name": "consult_nucleus",
-            "dependencies": []
-        },
-        {
-            "component_type": "agent",
-            "component_name": "life_memory_explorer",
+            "component_type": "action",
+            "component_name": "stop_conversation",
             "dependencies": []
         }
     ],

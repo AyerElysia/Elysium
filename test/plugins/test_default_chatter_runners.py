@@ -10,12 +10,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
 
-from plugins.default_chatter.runners import run_classical, run_enhanced
-from src.core.components.base import Stop
+from plugins.default_chatter.plugin import DefaultChatter
+from plugins.default_chatter.runners import run_enhanced
+from src.app.plugin_system.api.llm_api import create_llm_request
+from src.core.components.base import Stop, Wait, WaitResumeEvent, Success
+from src.core.prompt.system_reminder import get_system_reminder_store, reset_system_reminder_store
 from src.kernel.llm import ROLE
+from src.kernel.llm.payload import LLMPayload, Text
 
 
 @dataclass
@@ -23,6 +28,7 @@ class _FakePayload:
     """最小 payload。"""
 
     role: str
+    content: list[Any] | None = None
 
 
 class _FakeResponse:
@@ -41,7 +47,7 @@ class _FakeResponse:
         reasoning_content: str | None = None,
         model_set: list[dict[str, object]] | None = None,
     ) -> None:
-        self.payloads: list[_FakePayload] = [_FakePayload(r) for r in payload_roles]
+        self.payloads: list[_FakePayload] = [_FakePayload(r, []) for r in payload_roles]
         self.message: str = message
         self.reasoning_content: str | None = reasoning_content
         self.call_list: list[Any] = []
@@ -50,10 +56,11 @@ class _FakeResponse:
 
     def add_payload(self, payload: Any) -> None:
         role = getattr(payload, "role", None)
+        content = list(getattr(payload, "content", None) or [])
         if role == ROLE.SYSTEM:
-            self.payloads.insert(0, _FakePayload(str(role)))
+            self.payloads.insert(0, _FakePayload(str(role), content))
             return
-        self.payloads.append(_FakePayload(str(role)))
+        self.payloads.append(_FakePayload(str(role), content))
 
     async def send(self, *, stream: bool = False) -> "_FakeResponse":
         _ = stream
@@ -89,11 +96,11 @@ class _FakeLogger:
         return None
 
     @staticmethod
-    def debug(*_args: Any, **_kwargs: Any) -> None:
+    def error(*_args: Any, **_kwargs: Any) -> None:
         return None
 
     @staticmethod
-    def error(*_args: Any, **_kwargs: Any) -> None:
+    def debug(*_args: Any, **_kwargs: Any) -> None:
         return None
 
     def print_panel(
@@ -111,15 +118,15 @@ class _FakeChatter:
     def __init__(self, response: _FakeResponse) -> None:
         self._response = response
         self.create_request_calls: list[tuple[str, str | None]] = []
+        self.stream_id = "s1"
 
     def create_request(
         self,
         task: str = "actor",
         request_name: str = "",
-        max_context: int | None = None,
         with_reminder: str | None = None,
     ) -> _FakeResponse:
-        _ = (request_name, max_context)
+        _ = request_name
         self.create_request_calls.append((task, with_reminder))
         return self._response
 
@@ -151,21 +158,11 @@ class _FakeChatter:
     def _build_negative_behaviors_extra(self) -> str:
         return ""
 
-    def _build_user_extra(self, _chat_stream: Any) -> str:
-        return ""
-
-    async def _build_classical_user_text(
-        self,
-        _chat_stream: Any,
-        _unread_msgs: list[Any],
-    ) -> str:
-        return "user"
-
     async def sub_agent(self, *_args: Any, **_kwargs: Any) -> dict:
         return {"reason": "", "should_respond": True}
 
-    async def run_tool_call(self, *_args: Any, **_kwargs: Any) -> tuple[bool, bool]:
-        return True, True
+    async def run_tool_call(self, calls: list[Any], *_args: Any, **_kwargs: Any) -> list[tuple[bool, bool]]:
+        return [(True, True) for _call in calls]
 
     @staticmethod
     def _upsert_pending_unread_payload(*_args: Any, **_kwargs: Any) -> None:
@@ -181,33 +178,177 @@ class _FakeChatterAllowUser(_FakeChatter):
     """允许 enhanced 正常注入 USER payload 的 chatter 替身。"""
 
     @staticmethod
-    def _upsert_pending_unread_payload(response: Any, formatted_content: Any) -> None:
-        _ = formatted_content
-        response.add_payload(SimpleNamespace(role=ROLE.USER))
+    def _upsert_pending_unread_payload(
+        response: Any,
+        formatted_text: str,
+        unread_msgs: list[Any] | None = None,
+        native_multimodal: bool = False,
+        logger_override: Any = None,
+    ) -> None:
+        _ = (
+            formatted_text,
+            unread_msgs,
+            native_multimodal,
+            logger_override,
+        )
+        response.add_payload(
+            SimpleNamespace(role=ROLE.USER, content=[Text(formatted_text)])
+        )
 
     async def flush_unreads(self, _unread_messages: list[Any]) -> int:
         return 0
 
 
 @pytest.mark.asyncio
-async def test_get_life_state_for_current_turn_uses_service_api(monkeypatch) -> None:
-    """Life State 应通过 service_api 获取，而不是 plugin_api。"""
+async def test_run_enhanced_consumes_sub_agent_results_only_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """sub-agent 完成结果应转成一次性的 USER 消息，并在首次恢复后被消费。"""
+    class _CaptureChatter(_FakeChatterAllowUser):
+        def __init__(self, response: _FakeResponse) -> None:
+            super().__init__(response)
+            self.upsert_texts: list[str] = []
 
-    class _FakeLifeService:
-        async def get_state_digest_for_dfc(self) -> str:
-            return "life-state-ok"
+        def _upsert_pending_unread_payload(
+            self,
+            response: Any,
+            formatted_text: str,
+            unread_msgs: list[Any] | None = None,
+            native_multimodal: bool = False,
+            logger_override: Any = None,
+        ) -> None:
+            _ = (unread_msgs, native_multimodal, logger_override)
+            self.upsert_texts.append(formatted_text)
+            response.add_payload(SimpleNamespace(role=ROLE.USER))
 
-    from plugins.default_chatter import runners as runners_mod
+    resp = _FakeResponse(payload_roles=[ROLE.USER], message="")
+
+    async def _send(*, stream: bool = False) -> _FakeResponse:
+        _ = stream
+        resp.send_count += 1
+        resp.call_list = [
+            SimpleNamespace(name="action-pass_and_wait", args={}, id="1")
+        ]
+        resp.message = ""
+        return resp
+
+    resp.send = _send  # type: ignore[method-assign]
+    chatter = _CaptureChatter(resp)
+    chat_stream = cast(Any, SimpleNamespace(stream_id="s1", stream_name="测试流"))
+    fake_logger = cast(Any, _FakeLogger())
+
+    class _FakeManager:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def drain_completed_events(self, stream_id: str) -> list[dict[str, Any]]:
+            assert stream_id == "s1"
+            self.calls += 1
+            if self.calls == 1:
+                return [
+                    {
+                        "name": "worker",
+                        "status": "completed",
+                        "content": "任务完成",
+                    }
+                ]
+            return []
+
+    fake_manager = _FakeManager()
 
     monkeypatch.setattr(
-        "src.app.plugin_system.api.service_api.get_service",
-        lambda _sig: _FakeLifeService(),
+        "plugins.default_chatter.sub_agent_collaboration.get_sub_agent_collaboration_manager",
+        lambda: fake_manager,
     )
 
-    result = await runners_mod._get_life_state_for_current_turn(  # type: ignore[attr-defined]
-        SimpleNamespace(warning=lambda *_a, **_k: None),
+    gen = run_enhanced(
+        chatter=cast(Any, chatter),
+        chat_stream=chat_stream,
+        logger=fake_logger,
+        pass_call_name="action-pass_and_wait",
+        stop_call_name="action-stop_conversation",
+        suspend_text="__SUSPEND__",
     )
-    assert result == "life-state-ok"
+
+    first = await anext(gen)
+    assert isinstance(first, Wait)
+
+    second = await gen.asend(WaitResumeEvent(source="sub_agent"))
+    assert isinstance(second, Wait)
+    result_texts = [text for text in chatter.upsert_texts if "任务完成" in text]
+    assert result_texts == [
+        "以下是子代理刚刚返回的结果，请基于这些结果继续处理：\n[worker] completed\n任务完成"
+    ]
+    assert fake_manager.calls == 1
+
+
+class _FakeChatterWithUnreadSequence(_FakeChatterAllowUser):
+    """按预设顺序返回未读消息的 chatter 替身。"""
+
+    def __init__(self, response: _FakeResponse, unread_batches: list[list[Any]]) -> None:
+        super().__init__(response)
+        self._unread_batches = unread_batches
+        self._fetch_index = 0
+
+    async def fetch_unreads(self) -> tuple[str, list[Any]]:
+        if self._fetch_index >= len(self._unread_batches):
+            return "", []
+        batch = self._unread_batches[self._fetch_index]
+        self._fetch_index += 1
+        return "", batch
+
+
+def test_upsert_pending_unread_payload_keeps_fixed_reminder_on_first_user_only() -> None:
+    """pending unread 合并必须经过 context manager，避免 fixed reminder 泄漏到中间 USER。"""
+
+    reset_system_reminder_store()
+    store = get_system_reminder_store()
+    store.set("actor", "booku_memory", "Booku Memory 命令手册")
+
+    request = create_llm_request(
+        model_set=[
+            {
+                "api_provider": "openai",
+                "base_url": "https://api.openai.com/v1",
+                "model_identifier": "test-model",
+                "api_key": "sk-test-key",
+                "client_type": "openai",
+                "max_retry": 1,
+                "timeout": 5.0,
+                "retry_interval": 0.0,
+                "price_in": 0.0,
+                "cache_hit_price_in": 0.0,
+                "price_out": 0.0,
+                "temperature": 0.0,
+                "max_tokens": 1024,
+                "max_context": 8192,
+                "tool_call_compat": False,
+                "extra_params": {},
+            }
+        ],
+        request_name="chat_test",
+        with_reminder="actor",
+    )
+
+    DefaultChatter._upsert_pending_unread_payload(request, "第一条")
+    request.add_payload(LLMPayload(ROLE.ASSISTANT, Text("收到一")))
+    DefaultChatter._upsert_pending_unread_payload(request, "第二条")
+    request.add_payload(LLMPayload(ROLE.ASSISTANT, Text("收到二")))
+    DefaultChatter._upsert_pending_unread_payload(request, "第三条")
+
+    user_payloads = [payload for payload in request.payloads if payload.role == ROLE.USER]
+    assert len(user_payloads) == 3
+    assert isinstance(user_payloads[0].content[0], Text)
+    assert user_payloads[0].content[0].text == "<system_reminder>\n[booku_memory]\nBooku Memory 命令手册\n</system_reminder>"
+
+    for payload in user_payloads[1:]:
+        assert all(
+            not isinstance(part, Text)
+            or part.text != "<system_reminder>\n[booku_memory]\nBooku Memory 命令手册\n</system_reminder>"
+            for part in payload.content
+        )
+
+    reset_system_reminder_store()
 
 
 @pytest.mark.asyncio
@@ -239,7 +380,6 @@ async def test_run_enhanced_prioritizes_tool_followup_when_tool_result_tail() ->
         logger=fake_logger,
         pass_call_name="action-pass_and_wait",
         stop_call_name="action-stop_conversation",
-        send_text_call_name="action-send_text",
         suspend_text="__SUSPEND__",
     )
 
@@ -276,12 +416,19 @@ async def test_run_enhanced_does_not_yield_wait_when_pending_tool_results(monkey
     # 2) monkeypatch process_tool_calls：返回 should_wait=True 且 has_pending_tool_results=True
     from plugins.default_chatter import runners as runners_mod
 
-    async def _fake_process_tool_calls(**_kwargs: Any) -> Any:
+    expected_panels: list[str] = []
+
+    async def _fake_process_tool_calls(**kwargs: Any) -> Any:
+        expected_panels.append(
+            runners_mod._build_actor_decision_panel(
+                chat_stream,
+                cast(Any, kwargs["response"]),
+            )
+        )
         return SimpleNamespace(
             should_wait=True,
             should_stop=False,
             stop_minutes=0.0,
-            sent_once=False,
             has_pending_tool_results=True,
         )
 
@@ -298,7 +445,6 @@ async def test_run_enhanced_does_not_yield_wait_when_pending_tool_results(monkey
         logger=fake_logger,
         pass_call_name="action-pass_and_wait",
         stop_call_name="action-stop_conversation",
-        send_text_call_name="action-send_text",
         suspend_text="__SUSPEND__",
     )
 
@@ -308,10 +454,7 @@ async def test_run_enhanced_does_not_yield_wait_when_pending_tool_results(monkey
     assert chatter.create_request_calls == [("actor", "actor")]
     assert fake_logger.panels == [
         (
-            "聊天流名称：s1\n\n"
-            "独白：（无）\n\n"
-            "调用工具：\n"
-            "    tool-x",
+            expected_panels[0],
             "Actor 决策",
             "cyan",
         )
@@ -329,6 +472,7 @@ async def test_run_enhanced_prints_actor_decision_panel_before_processing_tool_c
     resp = _FakeResponse(
         payload_roles=[ROLE.USER],
         message="先回一句，再调工具",
+        reasoning_content="先判断语境，再安排动作。",
     )
     resp.call_list = [
         SimpleNamespace(name="tool-x", args={"reason": "测试", "foo": "bar"}, id="1"),
@@ -340,7 +484,6 @@ async def test_run_enhanced_prints_actor_decision_panel_before_processing_tool_c
             should_wait=True,
             should_stop=False,
             stop_minutes=0.0,
-            sent_once=False,
             has_pending_tool_results=False,
         )
 
@@ -356,7 +499,6 @@ async def test_run_enhanced_prints_actor_decision_panel_before_processing_tool_c
         logger=fake_logger,
         pass_call_name="action-pass_and_wait",
         stop_call_name="action-stop_conversation",
-        send_text_call_name="action-send_text",
         suspend_text="__SUSPEND__",
     )
 
@@ -364,11 +506,7 @@ async def test_run_enhanced_prints_actor_decision_panel_before_processing_tool_c
     assert first.__class__.__name__ == "Wait"
     assert fake_logger.panels == [
         (
-            "聊天流名称：测试流\n\n"
-            "独白：先回一句，再调工具\n\n"
-            "调用工具：\n"
-            "    tool-x (foo: bar)\n"
-            "    tool-y (count: 2)",
+            runners_mod._build_actor_decision_panel(chat_stream, cast(Any, resp)),
             "Actor 决策",
             "cyan",
         )
@@ -396,7 +534,6 @@ async def test_run_enhanced_waits_after_anthropic_action_only_suspend() -> None:
         logger=fake_logger,
         pass_call_name="action-pass_and_wait",
         stop_call_name="action-stop_conversation",
-        send_text_call_name="action-send_text",
         suspend_text="__SUSPEND__",
     )
 
@@ -406,30 +543,373 @@ async def test_run_enhanced_waits_after_anthropic_action_only_suspend() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_classical_waits_after_anthropic_action_only_suspend() -> None:
-    """classical 下 Anthropic action-only 回合注入 SUSPEND 后应直接等待。"""
-    resp = _FakeResponse(
-        payload_roles=[ROLE.USER],
-        message="",
-        model_set=[{"client_type": "anthropic"}],
-    )
-    resp.call_list = [SimpleNamespace(name="action-send_text", args={}, id="1")]
-    resp.reasoning_content = "think"
+async def test_run_enhanced_action_only_follows_up_when_suspend_disabled() -> None:
+    """enhanced 模式关闭 action suspend 后，纯 action 回合应直接继续 follow-up。"""
+
+    resp = _FakeResponse(payload_roles=[ROLE.USER], message="")
+
+    async def _send(*, stream: bool = False) -> _FakeResponse:
+        _ = stream
+        resp.send_count += 1
+        if resp.send_count == 1:
+            resp.call_list = [SimpleNamespace(name="action-send_text", args={}, id="1")]
+            resp.message = ""
+        else:
+            resp.call_list = []
+            resp.message = "finish"
+        return resp
+
+    resp.send = _send  # type: ignore[method-assign]
 
     chatter = _FakeChatterAllowUser(resp)
     chat_stream = cast(Any, SimpleNamespace(stream_id="s1", stream_name="测试流"))
     fake_logger = cast(Any, _FakeLogger())
 
-    gen = run_classical(
+    gen = run_enhanced(
         chatter=cast(Any, chatter),
         chat_stream=chat_stream,
         logger=fake_logger,
         pass_call_name="action-pass_and_wait",
         stop_call_name="action-stop_conversation",
-        send_text_call_name="action-send_text",
+        suspend_text="__SUSPEND__",
+        enable_action_suspend=False,
+    )
+
+    first = await anext(gen)
+    assert isinstance(first, Stop)
+    assert resp.send_count == 2
+
+
+@pytest.mark.asyncio
+async def test_run_enhanced_pass_and_wait_still_waits_when_suspend_disabled() -> None:
+    """关闭 action suspend 后，pass_and_wait 仍应保持等待语义。"""
+
+    resp = _FakeResponse(payload_roles=[ROLE.USER], message="")
+    resp.call_list = [
+        SimpleNamespace(name="action-pass_and_wait", args={"seconds": 5}, id="1")
+    ]
+
+    chatter = _FakeChatterAllowUser(resp)
+    chat_stream = cast(Any, SimpleNamespace(stream_id="s1", stream_name="测试流"))
+    fake_logger = cast(Any, _FakeLogger())
+
+    gen = run_enhanced(
+        chatter=cast(Any, chatter),
+        chat_stream=chat_stream,
+        logger=fake_logger,
+        pass_call_name="action-pass_and_wait",
+        stop_call_name="action-stop_conversation",
+        suspend_text="__SUSPEND__",
+        enable_action_suspend=False,
+    )
+
+    first = await anext(gen)
+    assert first.__class__.__name__ == "Wait"
+    assert getattr(first, "time", None) == 5.0
+    assert resp.send_count == 1
+
+
+@pytest.mark.asyncio
+async def test_run_enhanced_pass_and_wait_does_not_follow_up_immediately() -> None:
+    """enhanced 模式下纯 pass_and_wait 不应在同轮额外 follow-up。"""
+
+    resp = _FakeResponse(payload_roles=[ROLE.USER], message="")
+    resp.call_list = [
+        SimpleNamespace(name="action-pass_and_wait", args={"seconds": 5}, id="1")
+    ]
+
+    chatter = _FakeChatterWithUnreadSequence(
+        resp,
+        unread_batches=[[SimpleNamespace(message_id="m1")], []],
+    )
+    chat_stream = cast(Any, SimpleNamespace(stream_id="s1", stream_name="测试流"))
+    fake_logger = cast(Any, _FakeLogger())
+
+    gen = run_enhanced(
+        chatter=cast(Any, chatter),
+        chat_stream=chat_stream,
+        logger=fake_logger,
+        pass_call_name="action-pass_and_wait",
+        stop_call_name="action-stop_conversation",
         suspend_text="__SUSPEND__",
     )
 
     first = await anext(gen)
     assert first.__class__.__name__ == "Wait"
+    assert getattr(first, "time", None) == 5.0
     assert resp.send_count == 1
+
+    second = await gen.asend(None)
+    assert second.__class__.__name__ == "Wait"
+    assert resp.send_count == 1
+
+
+@pytest.mark.asyncio
+async def test_run_enhanced_proactively_resumes_after_timed_wait() -> None:
+    """enhanced 模式下 Wait(seconds) 到期后应主动继续，不依赖新消息。"""
+    resp = _FakeResponse(payload_roles=[ROLE.USER], message="")
+
+    async def _send(*, stream: bool = False) -> _FakeResponse:
+        _ = stream
+        resp.send_count += 1
+        if resp.send_count == 1:
+            resp.call_list = [
+                SimpleNamespace(
+                    name="action-pass_and_wait",
+                    args={"seconds": 5},
+                    id="1",
+                )
+            ]
+            resp.message = ""
+        else:
+            resp.call_list = []
+            resp.message = "finish"
+        return resp
+
+    resp.send = _send  # type: ignore[method-assign]
+
+    chatter = _FakeChatterWithUnreadSequence(
+        resp,
+        unread_batches=[[SimpleNamespace(message_id="m1")], []],
+    )
+    chat_stream = cast(Any, SimpleNamespace(stream_id="s1", stream_name="测试流"))
+    fake_logger = cast(Any, _FakeLogger())
+
+    gen = run_enhanced(
+        chatter=cast(Any, chatter),
+        chat_stream=chat_stream,
+        logger=fake_logger,
+        pass_call_name="action-pass_and_wait",
+        stop_call_name="action-stop_conversation",
+        suspend_text="__SUSPEND__",
+    )
+
+    first = await anext(gen)
+    assert first.__class__.__name__ == "Wait"
+    assert getattr(first, "time", None) == 5.0
+
+    second = await gen.asend(WaitResumeEvent(source="timer", wait_time=5.0))
+    assert isinstance(second, Stop)
+    assert resp.send_count == 2
+
+
+@pytest.mark.asyncio
+async def test_run_enhanced_uses_synthetic_trigger_message_for_timer_resume_tool_calls() -> None:
+    """主动恢复轮次没有 unread 时，actor 也应给工具执行提供最小 Message。"""
+    resp = _FakeResponse(payload_roles=[ROLE.USER], message="")
+
+    async def _send(*, stream: bool = False) -> _FakeResponse:
+        _ = stream
+        resp.send_count += 1
+        resp.call_list = [
+            SimpleNamespace(
+                name="action-send_text",
+                args={"content": "继续处理"},
+                id="1",
+            )
+        ]
+        resp.message = ""
+        return resp
+
+    resp.send = _send  # type: ignore[method-assign]
+
+    class _CaptureTriggerChatter(_FakeChatterWithUnreadSequence):
+        def __init__(self, response: _FakeResponse) -> None:
+            super().__init__(response, unread_batches=[[], []])
+            self.trigger_messages: list[Any] = []
+
+        async def run_tool_call(
+            self,
+            calls: list[Any],
+            response: Any,
+            usable_map: Any,
+            trigger_msg: Any,
+        ) -> list[tuple[bool, bool]]:
+            _ = (calls, response, usable_map)
+            self.trigger_messages.append(trigger_msg)
+            return [(True, True)]
+
+    chatter = _CaptureTriggerChatter(resp)
+    chat_stream = cast(
+        Any,
+        SimpleNamespace(
+            stream_id="s1",
+            stream_name="测试流",
+            platform="qq",
+            chat_type="group",
+        ),
+    )
+    fake_logger = cast(Any, _FakeLogger())
+
+    gen = run_enhanced(
+        chatter=cast(Any, chatter),
+        chat_stream=chat_stream,
+        logger=fake_logger,
+        pass_call_name="action-pass_and_wait",
+        stop_call_name="action-stop_conversation",
+        suspend_text="__SUSPEND__",
+    )
+
+    first = await anext(gen)
+    assert isinstance(first, Wait)
+
+    second = await gen.asend(WaitResumeEvent(source="timer", wait_time=5.0))
+    assert isinstance(second, Wait)
+    assert len(chatter.trigger_messages) == 1
+
+    trigger_msg = chatter.trigger_messages[0]
+    assert trigger_msg is not None
+    assert getattr(trigger_msg, "stream_id") == "s1"
+    assert getattr(trigger_msg, "platform") == "qq"
+    assert getattr(trigger_msg, "chat_type") == "group"
+    assert "等待 5.0 秒已经结束" in str(getattr(trigger_msg, "processed_plain_text"))
+
+
+@pytest.mark.asyncio
+async def test_run_enhanced_prefers_real_stream_message_for_resume_tool_calls() -> None:
+    """主动恢复轮次应优先复用流里的真实消息，而不是过早退化为 synthetic message。"""
+    resp = _FakeResponse(payload_roles=[ROLE.USER], message="")
+
+    async def _send(*, stream: bool = False) -> _FakeResponse:
+        _ = stream
+        resp.send_count += 1
+        resp.call_list = [
+            SimpleNamespace(
+                name="action-send_text",
+                args={"content": "继续处理"},
+                id="1",
+            )
+        ]
+        resp.message = ""
+        return resp
+
+    resp.send = _send  # type: ignore[method-assign]
+
+    class _CaptureTriggerChatter(_FakeChatterWithUnreadSequence):
+        def __init__(self, response: _FakeResponse) -> None:
+            super().__init__(response, unread_batches=[[], []])
+            self.trigger_messages: list[Any] = []
+
+        async def run_tool_call(
+            self,
+            calls: list[Any],
+            response: Any,
+            usable_map: Any,
+            trigger_msg: Any,
+        ) -> list[tuple[bool, bool]]:
+            _ = (calls, response, usable_map)
+            self.trigger_messages.append(trigger_msg)
+            return [(True, True)]
+
+    chatter = _CaptureTriggerChatter(resp)
+    real_message = SimpleNamespace(
+        message_id="m-real",
+        processed_plain_text="原始用户消息",
+        content="原始用户消息",
+        platform="qq",
+        chat_type="group",
+        stream_id="s1",
+        extra={"group_id": "123"},
+    )
+    chat_stream = cast(
+        Any,
+        SimpleNamespace(
+            stream_id="s1",
+            stream_name="测试流",
+            platform="qq",
+            chat_type="group",
+            context=SimpleNamespace(
+                current_message=None,
+                unread_messages=[],
+                history_messages=[real_message],
+            ),
+        ),
+    )
+    fake_logger = cast(Any, _FakeLogger())
+
+    gen = run_enhanced(
+        chatter=cast(Any, chatter),
+        chat_stream=chat_stream,
+        logger=fake_logger,
+        pass_call_name="action-pass_and_wait",
+        stop_call_name="action-stop_conversation",
+        suspend_text="__SUSPEND__",
+    )
+
+    first = await anext(gen)
+    assert isinstance(first, Wait)
+
+    second = await gen.asend(WaitResumeEvent(source="sub_agent"))
+    assert isinstance(second, Wait)
+    assert chatter.trigger_messages == [real_message]
+
+
+@pytest.mark.asyncio
+async def test_run_enhanced_supports_action_then_timed_wait() -> None:
+    """enhanced 模式应允许其他 action 与 pass_and_wait(seconds) 同轮组合。"""
+    resp = _FakeResponse(payload_roles=[ROLE.USER], message="")
+    resp.call_list = [
+        SimpleNamespace(name="action-send_text", args={"content": "马上回来"}, id="1"),
+        SimpleNamespace(name="action-pass_and_wait", args={"seconds": 6}, id="2"),
+    ]
+
+    chatter = _FakeChatterAllowUser(resp)
+    chat_stream = cast(Any, SimpleNamespace(stream_id="s1", stream_name="测试流"))
+    fake_logger = cast(Any, _FakeLogger())
+
+    gen = run_enhanced(
+        chatter=cast(Any, chatter),
+        chat_stream=chat_stream,
+        logger=fake_logger,
+        pass_call_name="action-pass_and_wait",
+        stop_call_name="action-stop_conversation",
+        suspend_text="__SUSPEND__",
+    )
+
+    first = await anext(gen)
+    assert first.__class__.__name__ == "Wait"
+    assert getattr(first, "time", None) == 6.0
+    assert resp.send_count == 1
+
+
+@pytest.mark.asyncio
+async def test_default_chatter_execute_forwards_timer_resume_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DefaultChatter 包装层应把驱动器 asend 的 timer 事件传给 runner。"""
+    from plugins.default_chatter import plugin as plugin_mod
+
+    received_events: list[WaitResumeEvent | None] = []
+
+    async def _fake_runner(**_kwargs: Any) -> Any:
+        resume_event = yield Wait(time=0.0)
+        received_events.append(resume_event)
+        yield Success(message="ok")
+
+    chat_stream = SimpleNamespace(
+        stream_id="s1",
+        chat_type="private",
+        platform="test",
+    )
+    stream_manager = SimpleNamespace(
+        activate_stream=AsyncMock(return_value=chat_stream),
+    )
+    monkeypatch.setattr(
+        "src.core.managers.stream_manager.get_stream_manager",
+        lambda: stream_manager,
+    )
+    monkeypatch.setattr(plugin_mod, "run_enhanced", _fake_runner)
+
+    chatter = DefaultChatter(
+        stream_id="s1",
+        plugin=cast(Any, SimpleNamespace(config=None)),
+    )
+    gen = chatter.execute()
+    first = await anext(gen)
+    assert isinstance(first, Wait)
+
+    event = WaitResumeEvent(source="timer", wait_time=0.0)
+    second = await gen.asend(event)
+
+    assert isinstance(second, Success)
+    assert received_events == [event]

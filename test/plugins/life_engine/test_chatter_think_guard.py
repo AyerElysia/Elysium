@@ -88,8 +88,8 @@ def test_should_encourage_segment_send_for_long_single_content() -> None:
     assert LifeChatter._should_encourage_segment_send("action-life_send_text", call_args) is True
 
 
-def test_should_not_encourage_segment_send_for_segment_array() -> None:
-    call_args = {"content": ["第一段", "第二段"]}
+def test_should_not_encourage_segment_send_for_newline_segmented_content() -> None:
+    call_args = {"content": "第一段\n第二段"}
     assert LifeChatter._should_encourage_segment_send("action-life_send_text", call_args) is False
 
 
@@ -98,8 +98,8 @@ def test_life_send_text_normalize_splits_newlines_in_plain_text() -> None:
     assert result == ["第一条", "第二条", "第三条"]
 
 
-def test_life_send_text_normalize_splits_escaped_newlines_in_list() -> None:
-    result = LifeSendTextAction._normalize_content_segments(["第一条\\n第二条", "第三条"])
+def test_life_send_text_normalize_splits_escaped_newlines_in_string() -> None:
+    result = LifeSendTextAction._normalize_content_segments("第一条\\n第二条\n第三条")
     assert result == ["第一条", "第二条", "第三条"]
 
 

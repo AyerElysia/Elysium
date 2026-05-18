@@ -23,7 +23,7 @@ from .signal_handler import SignalHandler
 if TYPE_CHECKING:
     from src.core.config import CoreConfig
     from src.core.components import PluginLoader, PluginManifest
-    from src.core.managers import PluginManager
+    from src.core.managers import MCPManager, PluginManager
     from src.core.transport import MessageReceiver, HTTPServer, SinkManager
     from src.kernel.concurrency import TaskManager, WatchDog
     from src.kernel.event import EventBus
@@ -96,6 +96,7 @@ class Bot:
         self.sink_manager: SinkManager | None = None
         self.plugin_loader: PluginLoader | None = None
         self.plugin_manager: PluginManager | None = None
+        self.mcp_manager: MCPManager | None = None
         self.http_server: HTTPServer | None = None
         self.load_order: list[str] = []
         self.manifests: dict[str, PluginManifest] = {}
@@ -264,10 +265,11 @@ class Bot:
         self.ui.update_phase_status("初始化内核", "启动中...")
 
         # Step 1: Config
-        from src.core.config import init_core_config, init_model_config
+        from src.core.config import init_core_config, init_mcp_config, init_model_config
 
         self.config = init_core_config(self.config_path)
         init_model_config("config/model.toml")
+        init_mcp_config("config/mcp.toml")
         self.ui.update_phase_status("配置", "已加载")
 
         # Step 2: Logger
@@ -514,8 +516,15 @@ class Bot:
         initialize_distribution()
 
         self.ui.update_phase_status("核心管理器", "已初始化")
+
+        # Step 3: 初始化 MCP 客户端工具接入
+        from src.core.managers import get_mcp_manager
+
+        self.mcp_manager = get_mcp_manager()
+        await self.mcp_manager.initialize()
+        self.ui.update_phase_status("MCP", "已初始化")
         
-        # Step 3: 启动 HTTP 服务器
+        # Step 4: 启动 HTTP 服务器
         from src.core.transport.router.http_server import get_http_server
         
         if self.config.http_router.enable_http_router:
@@ -873,11 +882,17 @@ class Bot:
                     self.logger.info("停止 HTTP 服务器...")
                 await self.http_server.stop()
 
-            # 6. 停止 WatchDog
+            # 6. 关闭 MCP 客户端连接
+            if self.mcp_manager:
+                if self.logger:
+                    self.logger.info("关闭 MCP 客户端连接...")
+                await self.mcp_manager.cleanup()
+
+            # 7. 停止 WatchDog
             if self.watchdog:
                 self.watchdog.stop()
 
-            # 7. 停止任务管理器（取消所有活动任务）
+            # 8. 停止任务管理器（取消所有活动任务）
             if self.task_manager:
                 active_tasks = self.task_manager.get_active_tasks()
                 for task_info in active_tasks:
@@ -890,18 +905,18 @@ class Bot:
                 self.task_manager.cleanup_tasks()
                 self.task_manager.shutdown_process_pool(wait=False)
 
-            # 8. 关闭数据库
+            # 9. 关闭数据库
             from src.kernel.db import close_engine
 
             await close_engine()
             self._stats["db_connected"] = False
 
-            # 9. 关闭向量数据库
+            # 10. 关闭向量数据库
             from src.kernel.vector_db import close_all_vector_db_services
 
             await close_all_vector_db_services()
 
-            # 10. 关闭日志系统（停止事件广播）
+            # 11. 关闭日志系统（停止事件广播）
             from src.kernel.logger import shutdown_logger_system
 
             shutdown_logger_system()

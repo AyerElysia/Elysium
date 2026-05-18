@@ -85,12 +85,10 @@ async def test_decide_should_respond_requests_sub_actor_reminder(
             self,
             task: str = "actor",
             request_name: str = "",
-            max_context: int | None = None,
             with_reminder: str | None = None,
         ) -> _FakeResponse:
             captured["task"] = task
             captured["request_name"] = request_name
-            captured["max_context"] = max_context
             captured["with_reminder"] = with_reminder
             return _FakeResponse()
 
@@ -107,7 +105,7 @@ async def test_decide_should_respond_requests_sub_actor_reminder(
         chatter=_FakeChatter(),
         logger=SimpleNamespace(info=lambda *_a, **_k: None, warning=lambda *_a, **_k: None, debug=lambda *_a, **_k: None, error=lambda *_a, **_k: None),
         unreads_text="hello",
-        chat_stream=SimpleNamespace(stream_id="s1"),
+        chat_stream=SimpleNamespace(stream_id="s1", bot_id=""),
         fallback_prompt="hello {nickname}",
     )
 
@@ -115,19 +113,18 @@ async def test_decide_should_respond_requests_sub_actor_reminder(
     assert captured == {
         "task": "sub_actor",
         "request_name": "sub_agent",
-        "max_context": 5,
         "with_reminder": "sub_actor",
     }
 
 
 @pytest.mark.asyncio
-async def test_decide_should_respond_allows_missing_fallback_prompt(
+async def test_decide_should_respond_allows_legacy_call_without_fallback_prompt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """fallback_prompt 省略时也应继续工作。"""
+    """旧调用方不传 fallback_prompt 时也应正常执行。"""
 
     class _FakeResponse:
-        message = '{"should_respond": false, "reason": "skip"}'
+        message = '{"should_respond": false, "reason": "legacy-ok"}'
 
         def add_payload(self, _payload: Any) -> None:
             return None
@@ -147,10 +144,9 @@ async def test_decide_should_respond_allows_missing_fallback_prompt(
             self,
             task: str = "actor",
             request_name: str = "",
-            max_context: int | None = None,
             with_reminder: str | None = None,
         ) -> _FakeResponse:
-            _ = (task, request_name, max_context, with_reminder)
+            _ = (task, request_name, with_reminder)
             return _FakeResponse()
 
     monkeypatch.setattr(
@@ -166,7 +162,65 @@ async def test_decide_should_respond_allows_missing_fallback_prompt(
         chatter=_FakeChatter(),
         logger=SimpleNamespace(info=lambda *_a, **_k: None, warning=lambda *_a, **_k: None, debug=lambda *_a, **_k: None, error=lambda *_a, **_k: None),
         unreads_text="hello",
-        chat_stream=SimpleNamespace(stream_id="s1"),
+        chat_stream=SimpleNamespace(stream_id="s1", bot_id="123456"),
     )
 
-    assert result == {"should_respond": False, "reason": "skip"}
+    assert result == {
+        "should_respond": False,
+        "reason": "legacy-ok",
+    }
+
+
+@pytest.mark.asyncio
+async def test_decide_should_respond_formats_unknown_fallback_placeholders_as_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fallback prompt 带额外占位符时不应抛 KeyError。"""
+
+    class _FakeResponse:
+        message = '{"should_respond": true, "reason": "format-ok"}'
+
+        def add_payload(self, _payload: Any) -> None:
+            return None
+
+        async def send(self, stream: bool = False) -> "_FakeResponse":
+            _ = stream
+            return self
+
+        def __await__(self):  # type: ignore[no-untyped-def]
+            async def _done() -> "_FakeResponse":
+                return self
+
+            return _done().__await__()
+
+    class _FakeChatter:
+        def create_request(
+            self,
+            task: str = "actor",
+            request_name: str = "",
+            with_reminder: str | None = None,
+        ) -> _FakeResponse:
+            _ = (task, request_name, with_reminder)
+            return _FakeResponse()
+
+    monkeypatch.setattr(
+        "plugins.default_chatter.decision_agent.get_core_config",
+        lambda: SimpleNamespace(personality=SimpleNamespace(nickname="Neo")),
+    )
+    monkeypatch.setattr(
+        "plugins.default_chatter.decision_agent.get_prompt_manager",
+        lambda: SimpleNamespace(get_template=lambda _name: None),
+    )
+
+    result = await decide_should_respond(
+        chatter=_FakeChatter(),
+        logger=SimpleNamespace(info=lambda *_a, **_k: None, warning=lambda *_a, **_k: None, debug=lambda *_a, **_k: None, error=lambda *_a, **_k: None),
+        unreads_text="hello",
+        chat_stream=SimpleNamespace(stream_id="s1", bot_id="123456"),
+        fallback_prompt="name={nickname}; extra={unknown_key}; bot={bot_id}; {personality_core_section}",
+    )
+
+    assert result == {
+        "should_respond": True,
+        "reason": "format-ok",
+    }

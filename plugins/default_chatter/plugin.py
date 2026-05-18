@@ -1,11 +1,9 @@
 """DefaultChatter 插件。
 
-提供默认的聊天对话逻辑，包含两个核心 Action 与一组中枢桥接 Tool：
+提供默认的聊天对话逻辑，包含三个核心 Action：
 - send_text: 发送文本消息给用户
 - pass_and_wait: 跳过本次动作，等待新消息
-- message_nucleus: 向生命中枢异步留言，不等待即时回复
-- consult_nucleus: 同步读取生命中枢当前状态层
-- life_memory_explorer: 探索式检索生命中枢深层记忆
+- stop_conversation: 结束当前对话轮次，设置冷却时间
 
 使用 personality 配置动态构建系统提示词。
 """
@@ -13,13 +11,8 @@
 from __future__ import annotations
 
 import asyncio
-import datetime
-import json
 import random
-import re
-import threading
-from collections import deque
-from typing import Annotated, AsyncGenerator
+from typing import Any, AsyncGenerator
 
 from src.core.components.types import ChatType
 from src.app.plugin_system.api.log_api import get_logger
@@ -27,6 +20,7 @@ from src.core.components.base import (
     BaseChatter,
     BasePlugin,
     Wait,
+    WaitResumeEvent,
     Success,
     Failure,
     Stop,
@@ -34,34 +28,30 @@ from src.core.components.base import (
 from src.core.models.stream import ChatStream
 from src.core.models.message import MessageType
 from src.core.components.base.action import BaseAction
+from src.core.components.base.agent import BaseAgent
 from src.core.components.loader import register_plugin
+from src.core.components.utils import parse_function_signature
 from src.core.config import get_core_config
 from src.core.prompt import get_prompt_manager
 from src.core.models.message import Message
 from src.kernel.llm import LLMPayload, ROLE, Text
+from src.kernel.llm.payload.content import Content
+from src.kernel.llm.payload.tooling import LLMUsable
+from src.kernel.logger import Logger
 
 from .config import DefaultChatterConfig
 from .decision_agent import decide_should_respond
-from .life_memory_explorer import LifeMemoryExplorerAgent
-from .multimodal import get_media_list
-from .nucleus_bridge import MessageNucleusTool
-from .consult_nucleus import ConsultNucleusTool
+from .multimodal import build_multimodal_content, extract_images_from_messages
 from .prompt_builder import DefaultChatterPromptBuilder
-from .runners import run_classical, run_enhanced
+from .runners import run_enhanced
+from .sub_agent_collaboration import (
+    FIXED_SUB_AGENT_SYSTEM_PROMPT,
+    get_active_sub_agent_name,
+    get_sub_agent_collaboration_manager,
+)
 from .type_defs import LLMConversationState, LLMResponseLike, SubAgentDecision
 
 logger = get_logger("default_chatter")
-_REASON_LEAK_PATTERN = re.compile(
-    r'[,，]?\s*["\']?reason["\']?\s*[:：]',
-    re.IGNORECASE,
-)
-_NOISY_PROMPT_MSG_ID_PREFIXES = (
-    "action_",
-    "api_",
-    "inner_monologue_",
-    "tool_",
-    "fc_tooluse_",
-)
 
 _SUB_AGENT_BASE_BYPASS_PROBABILITY = 0.1
 _SUB_AGENT_NAME_MENTION_BONUS = 0.7
@@ -69,6 +59,8 @@ _SUB_AGENT_ALIAS_MENTION_BONUS = 0.4
 _SUB_AGENT_UNREAD_MESSAGE_BONUS = 0.05
 _SUB_AGENT_NEXT_TICK_REPLY_BONUS = 0.5
 _SUB_AGENT_NEXT_TICK_BONUS_ATTR = "_default_chatter_next_tick_bonus"
+_SEND_TEXT_TYPING_DELAY_PER_CHAR = 0.5
+_SEND_TEXT_TYPING_DELAY_MAX_SECONDS = 10.0
 
 
 def _set_next_tick_sub_agent_bonus(chat_stream: ChatStream, bonus: float) -> None:
@@ -115,7 +107,7 @@ MoFox项目的目的是探究AI在真实人类社会中社交互动的能力，�
 
 你应当尽可能的保持你的语言风格和表达习惯，保持对话的温度和人情味，同时你也应当尽量避免重复使用同样的回复、口癖或表达，并且不要以一个模板化的口吻来“评价”任何话题。
 
-不要乱用emoji，除非你是直接模仿对方的表达方式。
+不要乱用emoji，在别人没有使用emoji之前你不能使用任何emoji；如果有人用过emoji那么你可以使用他用过的emoji。禁止每句话都用emoji！
 
 - 注意：请重视你的名字！设定中没有提到的名字或昵称则表示那些都不是在叫你，请*绝对*不要弄错了自己的名字，否则会产生非常尴尬的局面！
 </personality>
@@ -179,11 +171,13 @@ MoFox项目的目的是探究AI在真实人类社会中社交互动的能力，�
 <tool_usage>
 你的所有交互行为都是基于工具的。工具分为三类：Action、Tool、Agent。
 
-Action: 是你在互动过程中的"动作"，他是你主动的一个"行为"，例如发送消息、结束对话等。Action本身不会给你返回信息，为满足上下文格式要求，当你只接收到Action的返回信息时，只需要输出"__SUSPEND__"表示挂起对话等待下一步指令即可；
+{action_suspend_guidance}
 
 Tool：通常是你在对话中用来查询信息或执行特定功能时调用的工具，例如查询天气、计算器等。你可以调用 tool 来获取这些信息或功能。这类工具通常会返回一些结果信息，因此当你调用tool并收到返回结果后，你应该根据结果信息继续进行合理的回复或进一步执行其他工具。
 
 Agent：通常是你在对话中需要调用的AI智能体，类似于你的助手，例如执行复杂任务、处理多轮对话等。你可以调用 agent 来完成这些任务。这类工具通常和Tool一样会返回一些结果信息，因此当你调用agent并收到返回结果后，你应该根据结果信息继续进行合理的回复或进一步执行其他工具。
+
+{sub_agent_collaboration_extra}
 
 # 思考链条
 
@@ -192,12 +186,6 @@ Agent：通常是你在对话中需要调用的AI智能体，类似于你的助�
 你可以一次调用多个工具组合使用，善用工具组合往往可以让你的行为更丰富，达到事半功倍的效果。
 
 多工具组合调用时，你需要自行决定调用顺序，通常回复动作应当优先，除非有明确的理由需要先执行其他工具。
-
-# 工具边界
-- `consult_nucleus` 只查当前状态、近期日记、TODO、内在变化，不做深层历史检索。
-- `agent-life_memory_explorer` 探索式检索生命中枢深层记忆，适合查询过去聊过的事、旧计划、历史文件记录、被记住的线索。它会自动决定是否读取全文并整合结果（推荐使用）。
-- 如果已经对同一问题搜索过一次，且没有出现新线索，不要换一组近义词继续搜同一个方向；改为总结已知信息、换工具，或直接给出不确定结论。
-- 如果需要读取明确的本地文件或路径，优先走对应的本地文件工具；`nucleus_browser_fetch` 也兼容 workspace 内本地路径，但它的主职仍然是网页提取。
 
 工具调用时，各参数只填工具执行所需的信息，思考过程和行动依据留在内心，不属于任何参数。
 
@@ -208,24 +196,22 @@ message: 根据之前的消息，他应该还是在继续讨论之前的游戏�
 tool_call: [send_text, send_emoji]
 </tool_usage>
 
-<extra_info>
-{extra_info}
-</extra_info>
 """
 
 user_prompt = """你当前正在名为"{stream_name}"的对话中。
 消息格式说明：【时间】<群组角色> [平台ID] 昵称$群名片 [消息ID]： 消息内容
 
-{continuous_memory}
-
 {history}
-
+    
 {unreads}
 
-{extra}
+---
+请基于上述信息决定接下来你要调用的工具或动作。
+重申：请务必使用工具来实现你的任何行为，不要直接在文本里写出你想说的话。
+请务必保持你的回复符合你的人设和表达风格，
+同时请确保你的回复有理有据，禁止无根据地编造信息或胡乱回复。
 
 <extra_info>
-# 其他信息
 现在是 {current_time}。
 你目前正在聊天的平台是：{platform}，聊天类型是 {chat_type}。
 
@@ -235,16 +221,8 @@ user_prompt = """你当前正在名为"{stream_name}"的对话中。
 - 昵称：{platform_name}
 - id：{platform_id}
 
-# 会话适配
-- 你需要根据这些上下文调整表达方式与互动策略：私聊更自然亲近，群聊更克制简洁，避免刷屏与过度热情。
-
-{extra_info}
+{extra}
 </extra_info>
----
-请基于上述信息决定接下来你要调用的工具或动作。
-重申：请务必使用工具来实现你的任何行为，不要直接在文本里写出你想说的话。
-请务必保持你的回复符合你的人设和表达风格，
-同时请确保你的回复有理有据，禁止无根据地编造信息或胡乱回复。
 """
 
 sub_agent_system_prompt = """你是一个聊天意图识别助手。
@@ -252,18 +230,22 @@ sub_agent_system_prompt = """你是一个聊天意图识别助手。
 
 # 关于主机器人
 主机器人的名字是 {nickname}。
-{personality_core_section}{personality_side_section}
+{bot_id_section}{personality_core_section}{personality_side_section}
 # 判定准则
 你应该在以下情况判定为 "需要回复" (should_respond = true)：
-1. 明确提及：消息中明确提到了机器人的名字({nickname})或代称。
+1. 明确提及：
+   - 消息中明确提到了机器人的名字({nickname})或代称。
+   - 消息中存在艾特(@)行为，且艾特的 QQ 号必须是 {bot_id}。**注意：如果艾特的 QQ 号不是 {bot_id}，则绝对不是在叫它，即使艾特的昵称看起来像。**
 2. 话题相关：消息内容与当前正在进行的话题高度相关，需要机器人进一步说明、回答或参与。
 3. 话语完整：对方的话已经说完，或者是一个完整的问题/指令。
 4. 情感互动：对方在表达某种需要回应的情绪（如问候、告别、称赞、抱怨等）。
 
 你应该在以下情况判定为 "不需要回复" (should_respond = false)：
 1. 话题无关：消息是群聊中的闲聊，且机器人并非话题参与者。
-2. 话未说完：明显是一连串消息中的中间部分，可以继续等待后续。
-
+2. 艾特他人：消息艾特了其他人（QQ 号不是 {bot_id}）。
+3. 话未说完：明显是一连串消息中的中间部分，可以继续等待后续。
+4. 机器博弈：检测到是其他 Bot 的自动回复或无意义的刷屏消息。
+5. 纯粹表情：只有单个表情且不携带任何需要回复的语义。
 
 # 输出格式
 请务必返回 JSON 格式，如下所示：
@@ -282,21 +264,7 @@ class SendTextAction(BaseAction):
     """发送文本消息"""
 
     action_name = "send_text"
-    action_description = (
-        "发送文本消息给用户。"
-        "content 只能是字符串或字符串数组（分段发送），例如"
-        "\"content\": [\"你好\", \"请问你是谁？\", \"找我有什么事吗？\"。"
-        "content 中只能包含要发给用户的纯文本正文。"
-        "严禁把 reason/thought/expected_reaction/max_wait_seconds/mood/"
-        "delay_seconds/followup_type/topic 等元信息写进 content。"
-        "严禁把多个 JSON 对象或 <br/> 拼接进 content。"
-        "如果还需要其他 action/tool，请单独调用，不要塞到 content 里。"
-        "分段消息会按顺序发送，并自动模拟段间打字延迟。"
-        "不要在单条 content 中使用换行；需要分条就使用 content 数组。"
-        "私聊场景下 reply_to 默认不要使用，除非确实需要引用某条历史消息来避免歧义。"
-        "所有@对象都应该通过at参数而不是直接写在文本里，以确保正确解析和发送。"
-        "注意：本工具无法发送表情包等非文本内容。"
-    )
+    action_description = "发送一段文本消息给用户。这是你唯一发送文本消息的方式。你可以一次调用多个 send_text 来分多段回复，但每次调用必须提供你想说的话的文本内容，不要添加任何标记或格式，只写纯文本即可。content 参数只能包含发送给用户的正文，严禁将行为理由、内心独白或格式说明混入 content。你也可以选择引用或回复之前某条消息作为背景，使用 reply_to 参数指定；若不引用消息，可用 at 参数指定要@的对象。注意：本工具无法发送表情包等非文本内容。所有@对象都应该通过at参数而不是直接写在文本里，以确保正确解析和发送。"
 
     chatter_allow: list[str] = ["default_chatter"]
 
@@ -316,209 +284,84 @@ class SendTextAction(BaseAction):
             )
 
     @staticmethod
-    def _to_non_empty_segments(raw: list[object]) -> list[str]:
-        """将任意列表转换为非空字符串段。"""
-        segments: list[str] = []
-        for item in raw:
-            if isinstance(item, str):
-                segments.extend(SendTextAction._split_text_segments(item))
-        return segments
+    def _typing_delay_seconds(content: str) -> float:
+        """根据文本长度估算发送前的打字等待时间。"""
+        delay = len(content) * _SEND_TEXT_TYPING_DELAY_PER_CHAR
+        return min(delay, _SEND_TEXT_TYPING_DELAY_MAX_SECONDS)
 
-    @staticmethod
-    def _split_text_segments(text: str) -> list[str]:
-        """将模型塞进单段文本里的换行兜底拆成多条消息。"""
-        if not text:
-            return []
-        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-        normalized = normalized.replace("\\n", "\n")
-        return [part.strip() for part in re.split(r"\n+", normalized) if part.strip()]
+    async def _sleep_for_typing_delay(self, content: str) -> None:
+        delay = self._typing_delay_seconds(content)
+        if delay > 0:
+            await asyncio.sleep(delay)
 
-    @staticmethod
-    def _extract_leading_json_array(text: str) -> str | None:
-        """从文本开头提取首个平衡的 JSON 数组字符串。"""
-        if not text.startswith("["):
-            return None
-
-        depth = 0
-        in_string = False
-        escaped = False
-
-        for index, char in enumerate(text):
-            if in_string:
-                if escaped:
-                    escaped = False
-                    continue
-                if char == "\\":
-                    escaped = True
-                    continue
-                if char == '"':
-                    in_string = False
-                continue
-
-            if char == '"':
-                in_string = True
-                continue
-            if char == "[":
-                depth += 1
-                continue
-            if char == "]":
-                depth -= 1
-                if depth == 0:
-                    return text[: index + 1]
-
-        return None
-
-    @classmethod
-    def _try_parse_segments_from_text(cls, text: str) -> list[str] | None:
-        """尝试从文本中解析分段列表，失败返回 None。"""
-        if not text:
-            return None
-
-        try:
-            parsed = json.loads(text)
-        except Exception:
-            parsed = None
-
-        if isinstance(parsed, list):
-            return cls._to_non_empty_segments(parsed)
-        if isinstance(parsed, dict):
-            content_val = parsed.get("content")
-            if isinstance(content_val, list):
-                return cls._to_non_empty_segments(content_val)
-            if isinstance(content_val, str):
-                stripped = content_val.strip()
-                return [stripped] if stripped else []
-
-        leading_array = cls._extract_leading_json_array(text)
-        if leading_array:
-            try:
-                parsed_array = json.loads(leading_array)
-                if isinstance(parsed_array, list):
-                    return cls._to_non_empty_segments(parsed_array)
-            except Exception:
-                return None
-        return None
-
-    @classmethod
-    def _normalize_content_segments(cls, content: str | list[str]) -> list[str]:
-        """将 content 统一规范为分段文本列表。"""
-        if isinstance(content, list):
-            return cls._to_non_empty_segments(content)
-
-        if not isinstance(content, str):
-            return []
-
-        stripped = content.strip()
-        if not stripped:
-            return []
-
-        # 某些模型会把多个 JSON 块用 <br/> 串联，send_text 只消费首块 content。
-        first_block = re.split(r"<br\s*/?>", stripped, maxsplit=1, flags=re.IGNORECASE)[0]
-        first_block = first_block.strip()
-        if not first_block:
-            return []
-
-        parsed_segments = cls._try_parse_segments_from_text(first_block)
-        if parsed_segments is not None:
-            return parsed_segments
-
-        return cls._split_text_segments(first_block)
-
-    @staticmethod
-    def _sanitize_segment(content: str) -> str:
-        """清洗 LLM 可能侧漏到正文里的元字段。"""
-        if not content:
-            return ""
-        return _REASON_LEAK_PATTERN.split(content, maxsplit=1)[0].strip()
-
-    @staticmethod
-    def _resolve_reply_timing_config(
-        plugin_config: DefaultChatterConfig | None,
-    ) -> tuple[float, float, float]:
-        """读取发送节奏配置并返回 (chars_per_sec, min_delay, max_delay)。"""
-        default_chars_per_sec = 15.0
-        default_min_delay = 0.8
-        default_max_delay = 4.0
-
-        if not isinstance(plugin_config, DefaultChatterConfig):
-            return default_chars_per_sec, default_min_delay, default_max_delay
-
-        reply_config = getattr(plugin_config.plugin, "reply", None)
-        if reply_config is None:
-            return default_chars_per_sec, default_min_delay, default_max_delay
-
-        chars_per_sec = float(
-            getattr(reply_config, "typing_chars_per_sec", default_chars_per_sec)
-        )
-        min_delay = float(
-            getattr(reply_config, "typing_delay_min", default_min_delay)
-        )
-        max_delay = float(
-            getattr(reply_config, "typing_delay_max", default_max_delay)
-        )
-        return chars_per_sec, min_delay, max_delay
-
-    @classmethod
-    def _calculate_typing_delay(
-        cls,
-        content: str,
-        plugin_config: DefaultChatterConfig | None,
-    ) -> float:
-        """根据文本长度计算分段发送延迟。"""
-        chars_per_sec, min_delay, max_delay = cls._resolve_reply_timing_config(
-            plugin_config
-        )
-        if chars_per_sec <= 0:
-            return 0.0
-
-        base_delay = len(content) / chars_per_sec
-        lower = max(0.0, min_delay)
-        upper = max(0.0, max_delay)
-        if upper < lower:
-            upper = lower
-        return max(lower, min(base_delay, upper))
-
-    def _get_plugin_config(self) -> DefaultChatterConfig | None:
-        plugin_config = getattr(self.plugin, "config", None)
-        if isinstance(plugin_config, DefaultChatterConfig):
-            return plugin_config
-        return None
-
-    async def _send_one_segment(
+    async def execute(
         self,
         content: str,
         reply_to: str | None = None,
-        at_hint: str | None = None,
-    ) -> bool:
-        """发送单条分段消息。"""
+        at: str | None = None,
+    ) -> AsyncGenerator[tuple[bool, str] | None, None]:
+        """执行发送文本消息的逻辑
+
+        Args:
+            content: 要发送的文本内容，不用添加标记，只写你想说的话即可
+            reply_to: 可选，要引用回复的目标消息 ID。若指定此参数，发送的消息将作为对该消息的回复
+            at: 可选，不使用 reply_to 时指定要 @ 的对象（用户 ID）
+        """
+        import re
+        from src.core.models.message import Message
+
+        # 清洗 LLM 可能侧漏的 reason 字段
+        if content:
+            # 匹配 ,reason: 或 reason: 及其后的所有内容
+            content = re.split(r'[,，]?\s*reason[:：]', content, flags=re.IGNORECASE)[0].strip()
+
+        # 解析 content 开头的 @对象，并从正文中移除。
+        # 示例: "@小明 你好" -> at_prefix_hint="小明", content="你好"
+        at_prefix_hint: str | None = None
+        if content:
+            at_match = re.match(r"^\s*@([^\s]+)\s*", content)
+            if at_match:
+                at_prefix_hint = at_match.group(1).strip()
+                content = content[at_match.end():].lstrip()
+
+        if not (content or at_prefix_hint):
+            yield True, "内容为空，跳过发送"
+            return
+
+        if not content:
+            yield True, "内容为空，跳过发送"
+            return
+        
+        # 如果需要引用消息，创建带reply_to的Message对象
         if reply_to:
             target_stream_id = self.chat_stream.stream_id
             platform = self.chat_stream.platform
             chat_type = self.chat_stream.chat_type
             context = self.chat_stream.context
-
+            
             from src.core.managers.adapter_manager import get_adapter_manager
             from uuid import uuid4
-
+            
             bot_info = await get_adapter_manager().get_bot_info_by_platform(platform)
-
+            
             target_user_id = None
             target_group_id = None
             target_user_name = None
             target_group_name = None
-
+            
             target_msg = self._get_context_message_for_target(reply_to)
-
+            
             if chat_type == "group":
                 if target_msg:
                     target_group_id = target_msg.extra.get("group_id")
                     target_group_name = target_msg.extra.get("group_name")
             else:
-                target_user_id, target_user_name = await self._resolve_private_target_from_context(
-                    context,
-                    target_msg,
-                )
-
+                if target_msg:
+                    target_user_id = target_msg.sender_id
+                    target_user_name = target_msg.sender_name
+                if not target_user_id:
+                    target_user_id = context.triggering_user_id
+            
             extra: dict[str, str] = {}
             if target_user_id:
                 extra["target_user_id"] = target_user_id
@@ -528,66 +371,81 @@ class SendTextAction(BaseAction):
                 extra["target_group_id"] = target_group_id
             if target_group_name:
                 extra["target_group_name"] = target_group_name
-
+            
             message = Message(
                 message_id=f"action_{self.action_name}_{uuid4().hex}",
                 content=content,
                 processed_plain_text=content,
                 message_type=MessageType.TEXT,
                 sender_id=bot_info.get("bot_id", "") if bot_info else "",
-                sender_name=bot_info.get("bot_nickname", "Bot") if bot_info else "Bot",
+                sender_name=bot_info.get("bot_name", "Bot") if bot_info else "Bot",
                 platform=platform,
                 chat_type=chat_type,
                 stream_id=target_stream_id,
                 reply_to=reply_to,
             )
             message.extra.update(extra)
-
+            
             from src.core.transport.message_send import get_message_sender
-
             sender = get_message_sender()
+            yield None
+            await self._sleep_for_typing_delay(content)
             success = await sender.send_message(message)
             self._mark_sub_agent_bonus_on_success(success)
-            return success
+            yield success, f"已发送消息:{content}"
+            return
+        else:
+            # 非引用回复时可使用显式 at 参数；reply_to 存在时已在上分支处理并忽略 at。
+            at_hint = (at or at_prefix_hint or "").strip().lstrip("@").strip()
 
-        if at_hint:
-            at_hint = at_hint.strip().lstrip("@").strip()
+            if not at_hint:
+                yield None
+                await self._sleep_for_typing_delay(content)
+                success = await self._send_to_stream(content)
+                self._mark_sub_agent_bonus_on_success(success)
+                yield success, f"已发送消息:{content}"
+                return
+
+            target_stream_id = self.chat_stream.stream_id
+            platform = self.chat_stream.platform
             chat_type = self.chat_stream.chat_type
+            context = self.chat_stream.context
 
             if chat_type != "group":
                 # 私聊场景不需要显式 @，按普通发送处理。
+                yield None
+                await self._sleep_for_typing_delay(content)
                 success = await self._send_to_stream(content)
                 self._mark_sub_agent_bonus_on_success(success)
-                return success
+                yield success, f"已发送消息:{content}"
+                return
 
-            platform = self.chat_stream.platform
-            context = self.chat_stream.context
-            target_stream_id = self.chat_stream.stream_id
+            from src.core.managers.adapter_manager import get_adapter_manager
+            from src.core.utils.user_query_helper import get_user_query_helper
+            from uuid import uuid4
+
+            bot_info = await get_adapter_manager().get_bot_info_by_platform(platform)
 
             if at_hint.isdigit():
                 at_user_id = at_hint
             else:
-                from src.core.utils.user_query_helper import get_user_query_helper
                 at_user_id = await get_user_query_helper().resolve_user_id(platform, at_hint)
 
             if not at_user_id:
                 logger.info(f"无法定位 at 目标: {at_hint}，降级为普通回复")
+                yield None
+                await self._sleep_for_typing_delay(content)
                 success = await self._send_to_stream(content)
                 self._mark_sub_agent_bonus_on_success(success)
-                return success
+                yield success, f"已发送消息:{content}"
+                return
 
             target_group_id = None
             target_group_name = None
-
             last_msg = self._get_context_message_for_target()
             if last_msg:
                 target_group_id = last_msg.extra.get("group_id")
                 target_group_name = last_msg.extra.get("group_name")
-
-            from src.core.managers.adapter_manager import get_adapter_manager
-            from uuid import uuid4
-
-            bot_info = await get_adapter_manager().get_bot_info_by_platform(platform)
 
             extra: dict[str, str] = {
                 "at_user_id": str(at_user_id),
@@ -603,7 +461,7 @@ class SendTextAction(BaseAction):
                 processed_plain_text=content,
                 message_type=MessageType.TEXT,
                 sender_id=bot_info.get("bot_id", "") if bot_info else "",
-                sender_name=bot_info.get("bot_nickname", "Bot") if bot_info else "Bot",
+                sender_name=bot_info.get("bot_name", "Bot") if bot_info else "Bot",
                 platform=platform,
                 chat_type=chat_type,
                 stream_id=target_stream_id,
@@ -613,112 +471,131 @@ class SendTextAction(BaseAction):
             from src.core.transport.message_send import get_message_sender
 
             sender = get_message_sender()
+            yield None
+            await self._sleep_for_typing_delay(content)
             success = await sender.send_message(message)
             self._mark_sub_agent_bonus_on_success(success)
-            return success
-
-        success = await self._send_to_stream(content)
-        self._mark_sub_agent_bonus_on_success(success)
-        return success
-
-    async def execute(
-        self,
-        content: Annotated[
-            str | list[str],
-            "要发送给用户的纯文本内容。仅允许 string 或 string[]；"
-            "禁止把 reason/thought/expected_reaction 等元信息、多个 JSON 块或 <br/> 拼进 content。",
-        ],
-        reply_to: Annotated[
-            str | None,
-            "可选，要引用回复的目标消息 ID。私聊默认留空，只有必须引用才能消歧时才填写。分条发送时仅第一条使用。",
-        ] = None,
-        at: str | None = None,
-    ) -> tuple[bool, str]:
-        """执行发送文本消息的逻辑
-
-        Args:
-            content: 要发送的文本内容。支持字符串或字符串数组
-            reply_to: 可选，要引用回复的目标消息 ID。分条发送时仅首条应用
-            at: 可选，不使用 reply_to 时指定要 @ 的对象（用户 ID 或昵称）
-        """
-        # 解析 content 开头的 @对象，并从正文中移除。
-        at_prefix_hint: str | None = None
-        if isinstance(content, str) and content:
-            at_match = re.match(r"^\s*@([^\s]+)\s*", content)
-            if at_match:
-                at_prefix_hint = at_match.group(1).strip()
-                content = content[at_match.end():].lstrip()
-
-        segments = self._normalize_content_segments(content)
-        cleaned_segments = [
-            self._sanitize_segment(segment) for segment in segments
-        ]
-        cleaned_segments = [segment for segment in cleaned_segments if segment]
-
-        if not cleaned_segments:
-            return True, "内容为空，跳过发送"
-
-        # 确定最终 at 目标：显式 at 参数 > 内容前缀解析；reply_to 优先时不使用 at。
-        at_target = (at or at_prefix_hint or "").strip().lstrip("@").strip()
-        if reply_to:
-            at_target = None
-
-        plugin_config = self._get_plugin_config()
-        sent_count = 0
-
-        for index, segment in enumerate(cleaned_segments):
-            if index > 0:
-                delay = self._calculate_typing_delay(segment, plugin_config)
-                if delay > 0:
-                    await asyncio.sleep(delay)
-
-            segment_reply_to = reply_to if index == 0 else None
-            segment_at = at_target if index == 0 else None
-            success = await self._send_one_segment(segment, segment_reply_to, segment_at)
-            if not success:
-                return False, f"第{index + 1}条消息发送失败"
-            sent_count += 1
-
-        preview = cleaned_segments[0][:80] if cleaned_segments else ""
-        return True, f"已发送{sent_count}条消息: {preview}"
+            yield success, f"已发送消息:{content}"
+            return
 
 
 class PassAndWaitAction(BaseAction):
-    """跳过本次动作，等待新消息"""
+    """跳过本次动作，等待新消息或定时继续。"""
 
     action_name = "pass_and_wait"
-    action_description = "跳过本次动作，不进行任何操作，但保持对话继续，等待用户新消息。若当前不需要回复，就使用本工具等待用户的下一条消息。"
+    action_description = "为当前对话登记一个等待点。你可以单独调用它，让本轮什么都不做直接等待；也可以在同一轮先调用其他 action（例如 send_text、发送表情等），再调用本工具，表示这些动作执行完成后进入等待。默认会等待用户新消息；如果传入 seconds 参数，则会在指定秒数到达后由框架主动恢复对话流程，即使期间没有收到新消息。适合需要回复后稍后主动继续、定时追问或延时确认的场景。"
 
     chatter_allow: list[str] = ["default_chatter"]
 
-    async def execute(self) -> tuple[bool, str]:
-        """跳过本次动作，不执行任何操作"""
-        return True, "已跳过，等待新消息"
+    async def execute(self, seconds: float | None = None) -> tuple[bool, str]:
+        """跳过本次动作，不执行任何操作。
+
+        Args:
+            seconds: 等待秒数；为 None 时等待新消息，为数字时到时主动继续。
+                可与其他 action 同轮组合，表示本轮动作完成后再进入等待。
+        """
+        if seconds is None:
+            return True, "已登记等待，将在本轮动作完成后等待新消息"
+        return True, f"已登记等待，将在本轮动作完成后等待 {seconds} 秒再继续对话"
 
 
 class StopConversationAction(BaseAction):
-    """结束当前对话轮次。"""
+    """结束当前对话轮次"""
 
     action_name = "stop_conversation"
-    action_description = (
-        "结束当前对话，过一段时间后再允许开启新对话。"
-        "如果对话已经自然结束，或者你认为本轮对话可以告一段落，"
-        "或者你暂时不想继续对话，使用本工具结束这轮对话。"
-        "通常当你已经做出回应，且后续的消息很可能是新的话题时，使用本工具结束对话。"
-    )
+    action_description = "结束当前对话，过一段时间后再允许开启新对话。如果对话已经自然结束，或者你认为本轮对话可以告一段落，或者你暂时不想继续对话，使用本工具结束这轮对话。通常当你已经做出回应，且后续的消息很可能是新的话题时，使用本工具结束对话。你可以指定一个冷却时间（分钟），在此期间即使有新消息也不会触发新的对话，直到冷却时间结束后才会重新允许开启新对话。"
 
     chatter_allow: list[str] = ["default_chatter"]
 
+    async def execute(self, minutes: float) -> tuple[bool, str]:
+        """结束对话并设置冷却时间
+
+        Args:
+            minutes: 冷却时间（分钟），在此期间不会开启新对话
+        """
+        return True, f"对话已结束，将在 {minutes} 分钟后允许新对话"
+
+
+class _SubAgentManagementUsable(BaseAgent):
+    """default chatter 子代理管理工具基类。"""
+    
+    chatter_allow: list[str] = ["default_chatter"]
+
+
+class CreateAgentUsable(_SubAgentManagementUsable):
+    """创建一个新的子代理。"""
+
+    agent_name = "create_agent"
+    agent_description = "创建一个新的子代理，并把指定的普通工具与 MCP 服务器能力委托给它。"
+
     async def execute(
         self,
-        minutes: Annotated[
-            float,
-            "冷却时间，单位分钟。默认 5 分钟，最小 0 分钟。",
-        ] = 5.0,
-    ) -> tuple[bool, str]:
-        """结束当前对话轮次。"""
-        normalized_minutes = max(0.0, float(minutes))
-        return True, f"对话已结束，将在 {normalized_minutes:g} 分钟后允许新对话"
+        name: str,
+        system_prompt: str,
+        tools: list[str] | None = None,
+        mcp: list[str] | None = None,
+        allow_create_sub_agent: bool = False,
+    ) -> tuple[bool, dict[str, Any]]:
+        """创建子代理。
+
+        Args:
+            name: 子代理的唯一标识名
+            system_prompt: 追加到固定系统提示词末尾的任务描述与约束
+            tools: 分配给子代理的普通工具名列表，只填工具名即可
+            mcp: 分配给子代理的 MCP 服务器名列表，只填 MCP 名即可
+            allow_create_sub_agent: 是否继续授予 create_agent/get_agent/kill_agent
+        """
+        chatter = DefaultChatter(self.stream_id, self.plugin)
+        return await chatter.create_managed_sub_agent(
+            name=name,
+            system_prompt=system_prompt,
+            tools=tools or [],
+            mcp=mcp or [],
+            allow_create_sub_agent=allow_create_sub_agent,
+        )
+
+
+class GetAgentUsable(_SubAgentManagementUsable):
+    """与已存在的子代理交互。"""
+
+    agent_name = "get_agent"
+    agent_description = "查看子代理最近的活动记录，并可附带一条新的问题或指令驱动它继续执行。"
+
+    async def execute(
+        self,
+        name: str,
+        message_limit: int = 10,
+        question: str = "",
+    ) -> tuple[bool, dict[str, Any]]:
+        """获取子代理状态或向其发送新指令。
+
+        Args:
+            name: 子代理标识名
+            message_limit: 最近活动记录条数，0 表示全部
+            question: 要发送给子代理的问题或指令，留空则只查看状态
+        """
+        chatter = DefaultChatter(self.stream_id, self.plugin)
+        return await chatter.query_managed_sub_agent(
+            name=name,
+            message_limit=message_limit,
+            question=question,
+        )
+
+
+class KillAgentUsable(_SubAgentManagementUsable):
+    """销毁一个子代理。"""
+
+    agent_name = "kill_agent"
+    agent_description = "销毁指定子代理；如果它创建过后代子代理，将级联一起销毁。"
+
+    async def execute(self, name: str) -> tuple[bool, dict[str, Any]]:
+        """销毁子代理。
+
+        Args:
+            name: 子代理标识名
+        """
+        chatter = DefaultChatter(self.stream_id, self.plugin)
+        return await chatter.kill_managed_sub_agent(name=name)
 
 
 # ─── Chatter ────────────────────────────────────────────────
@@ -726,69 +603,9 @@ class StopConversationAction(BaseAction):
 # 控制流标记名称，与 BaseAction.to_schema() 生成的 name 保持一致（含 action- 前缀）
 _PASS_AND_WAIT = "action-pass_and_wait"
 _STOP_CONVERSATION = "action-stop_conversation"
-_SEND_TEXT = "action-send_text"
-_MESSAGE_NUCLEUS = "tool-message_nucleus"
 
 # SUSPEND 占位符：当 LLM 本轮全部调用的都是 action 时，注入此占位防止上下文缺少 assistant 轮次
 _SUSPEND_TEXT = "__SUSPEND__"
-
-# 运行时 assistant 注入队列：
-# 用于接收其它插件（如 proactive）的“伪装 assistant”上下文，
-# 在 default_chatter 的 WAIT_USER 阶段按会话顺序注入到 payloads。
-_RUNTIME_ASSISTANT_INJECTION_MAX_PER_STREAM = 24
-_RUNTIME_ASSISTANT_INJECTIONS: dict[str, deque[str]] = {}
-_RUNTIME_ASSISTANT_INJECTION_LOCK = threading.Lock()
-
-
-def push_runtime_assistant_injection(
-    stream_id: str,
-    content: str,
-    *,
-    max_per_stream: int | None = None,
-) -> None:
-    """向运行时队列写入一条 assistant 注入文本。"""
-    sid = str(stream_id or "").strip()
-    text = str(content or "").strip()
-    if not sid or not text:
-        return
-
-    limit = max_per_stream
-    if limit is None or limit <= 0:
-        limit = _RUNTIME_ASSISTANT_INJECTION_MAX_PER_STREAM
-
-    with _RUNTIME_ASSISTANT_INJECTION_LOCK:
-        queue = _RUNTIME_ASSISTANT_INJECTIONS.get(sid)
-        if queue is None:
-            queue = deque()
-            _RUNTIME_ASSISTANT_INJECTIONS[sid] = queue
-        queue.append(text)
-        while len(queue) > limit:
-            queue.popleft()
-
-
-def consume_runtime_assistant_injections(
-    stream_id: str,
-    *,
-    max_items: int | None = None,
-) -> list[str]:
-    """消费并返回某个会话的运行时 assistant 注入文本。"""
-    sid = str(stream_id or "").strip()
-    if not sid:
-        return []
-
-    with _RUNTIME_ASSISTANT_INJECTION_LOCK:
-        queue = _RUNTIME_ASSISTANT_INJECTIONS.get(sid)
-        if not queue:
-            return []
-
-        take_count = len(queue)
-        if max_items is not None and max_items > 0:
-            take_count = min(take_count, max_items)
-
-        result = [queue.popleft() for _ in range(take_count)]
-        if not queue:
-            _RUNTIME_ASSISTANT_INJECTIONS.pop(sid, None)
-        return result
 
 
 class DefaultChatter(BaseChatter):
@@ -798,7 +615,7 @@ class DefaultChatter(BaseChatter):
     1. 构建 LLM 上下文（系统提示 + 历史消息 + 当前未读消息）
     2. 注册所有可用的 LLMUsable 工具
     3. 循环调用 LLM 并执行其返回的 tool calls
-    4. 根据 pass_and_wait 控制对话流程
+    4. 根据 pass_and_wait / stop_conversation 控制对话流程
     """
 
     chatter_name: str = "default_chatter"
@@ -808,11 +625,6 @@ class DefaultChatter(BaseChatter):
     chat_type: ChatType = ChatType.ALL
 
     dependencies: list[str] = []
-
-    def _get_mode(self) -> str:
-        """读取 DefaultChatter 执行模式。"""
-        plugin_config = getattr(self.plugin, "config", None)
-        return DefaultChatterPromptBuilder.get_mode(plugin_config)
 
     @staticmethod
     def _message_text_for_probability(message: Message) -> str:
@@ -927,6 +739,13 @@ class DefaultChatter(BaseChatter):
             direct_message_wake_probability=probability,
         )
 
+    def _is_action_suspend_enabled(self) -> bool:
+        """读取纯 Action 回合的 SUSPEND 开关。"""
+        plugin_config = getattr(self.plugin, "config", None)
+        return not isinstance(plugin_config, DefaultChatterConfig) or bool(
+            plugin_config.plugin.enable_action_suspend
+        )
+
     def _build_negative_behaviors_extra(self) -> str:
         """若配置启用，构建用于 user extra 板块的负面行为再次强调文本。
 
@@ -936,123 +755,64 @@ class DefaultChatter(BaseChatter):
         plugin_config = getattr(self.plugin, "config", None)
         return DefaultChatterPromptBuilder.build_negative_behaviors_extra(plugin_config)
 
-    def _build_runtime_context_extra(self, chat_stream: ChatStream) -> str:
-        """构建动态会话上下文 extra（平台/聊天类型/场景引导等）。"""
+    def _is_sub_agent_collaboration_enabled(self) -> bool:
+        """读取子代理协作模式开关。"""
         plugin_config = getattr(self.plugin, "config", None)
-        return DefaultChatterPromptBuilder.build_runtime_context_extra(
-            plugin_config if isinstance(plugin_config, DefaultChatterConfig) else None,
-            chat_stream,
-        )
-
-    def _build_scene_guide_system_block(self, chat_stream: ChatStream) -> str:
-        """构建场景引导 SYSTEM 固定块。"""
-        plugin_config = getattr(self.plugin, "config", None)
-        return DefaultChatterPromptBuilder.build_scene_guide_system_block(
-            plugin_config if isinstance(plugin_config, DefaultChatterConfig) else None,
-            chat_stream,
-        )
-
-    def _build_user_extra(self, chat_stream: ChatStream) -> str:
-        """构建 user extra：仅保留行为约束增强与一次性运行时补充。"""
-        return DefaultChatterPromptBuilder.merge_extra_blocks(
-            self._build_negative_behaviors_extra(),
-        )
-
-    def _is_native_multimodal_enabled(self) -> bool:
-        """当前聊天流是否启用原生多模态。"""
-        plugin_config = getattr(self.plugin, "config", None)
+        plugin_section = getattr(plugin_config, "plugin", None)
         return bool(
-            isinstance(plugin_config, DefaultChatterConfig)
-            and plugin_config.plugin.native_multimodal
+            getattr(plugin_section, "enable_sub_agent_collaboration", False)
         )
+
+    def _get_sub_agent_task_name(self) -> str:
+        """读取协作子代理使用的模型任务名。"""
+        plugin_config = getattr(self.plugin, "config", None)
+        plugin_section = getattr(plugin_config, "plugin", None)
+        task_name = str(getattr(plugin_section, "sub_agent_task_name", "actor") or "").strip()
+        return task_name or "actor"
 
     @staticmethod
-    def _count_media_suffix(msg: Message) -> str:
-        """为消息补充媒体摘要。"""
-        media_list = get_media_list(msg)
-        if not media_list:
+    def _is_mcp_usable_class(usable_cls: type[LLMUsable]) -> bool:
+        """判断一个 usable 是否来源于 MCP 动态工具。"""
+        signature = getattr(usable_cls, "get_signature", lambda: None)()
+        if isinstance(signature, str) and signature.startswith("mcp_provider:tool:"):
+            return True
+
+        schema = usable_cls.to_schema()
+        function_name = schema.get("function", {}).get("name")
+        return isinstance(function_name, str) and function_name.startswith("mcp-")
+
+    @staticmethod
+    def _normalized_usable_names(usable_cls: type[LLMUsable]) -> set[str]:
+        """生成一个 usable 可匹配的名字集合。"""
+        schema = usable_cls.to_schema()
+        function_name = schema.get("function", {}).get("name")
+        names: set[str] = set()
+        if isinstance(function_name, str) and function_name:
+            names.add(function_name)
+            if "-" in function_name:
+                names.add(function_name.split("-", 1)[1])
+        return names
+
+    def _get_sub_agent_collaboration_usables(self) -> list[type[LLMUsable]]:
+        """返回主代理协作模式下注入的管理工具。"""
+        return [CreateAgentUsable, GetAgentUsable, KillAgentUsable]
+
+    @staticmethod
+    def _get_deferred_mcp_usable_classes() -> set[type[LLMUsable]]:
+        """返回仅允许子代理使用的 MCP 工具类集合。"""
+        from src.core.managers.tool_manager import get_mcp_manager
+
+        return set(get_mcp_manager().get_deferred_tool_classes())
+
+    def _build_sub_agent_collaboration_system_extra(self) -> str:
+        """构建子代理协作模式下追加到系统提示词的额外说明。"""
+        if not self._is_sub_agent_collaboration_enabled():
             return ""
 
-        image_count = 0
-        emoji_count = 0
-        video_count = 0
-        for media in media_list:
-            media_type = str(media.get("type", "")).lower()
-            if media_type == "emoji":
-                emoji_count += 1
-            elif media_type == "image":
-                image_count += 1
-            elif media_type == "video":
-                video_count += 1
+        from src.core.managers.tool_manager import get_mcp_manager
 
-        parts: list[str] = []
-        if image_count:
-            parts.append(f"图片×{image_count}")
-        if emoji_count:
-            parts.append(f"表情包×{emoji_count}")
-        if video_count:
-            parts.append(f"视频×{video_count}")
-        if not parts:
-            return ""
-        return f" [媒体: {'，'.join(parts)}]"
-
-    def format_message_line(
-        self,
-        msg: Message,
-        time_format: str = "%H:%M",
-    ) -> str:
-        """格式化消息时附带媒体摘要，并避免泄露原始媒体结构。"""
-        if not self._is_native_multimodal_enabled():
-            return BaseChatter.format_message_line(msg, time_format)
-
-        raw_time = getattr(msg, "time", None)
-        if isinstance(raw_time, (int, float)):
-            time_str = datetime.datetime.fromtimestamp(raw_time).strftime(time_format)
-        elif isinstance(raw_time, datetime.datetime):
-            time_str = raw_time.strftime(time_format)
-        else:
-            time_str = str(raw_time or "")
-
-        role_raw = getattr(msg, "sender_role", None)
-        role_str = BaseChatter._format_role(role_raw)
-        role_part = f"<{role_str}> " if role_str else ""
-
-        platform_id = getattr(msg, "sender_id", "") or ""
-        id_part = f"[{platform_id}] " if platform_id else ""
-
-        nickname = getattr(msg, "sender_name", "") or ""
-        cardname = getattr(msg, "sender_cardname", None)
-        if cardname and cardname != nickname:
-            name_part = f"{nickname}${cardname}"
-        else:
-            name_part = nickname or "未知发送者"
-
-        message_id_raw = str(getattr(msg, "message_id", "") or "").strip()
-        # 过滤内部调用轨迹 ID，避免把 action/tool 运行噪声塞进用户历史上下文。
-        if message_id_raw.lower().startswith(_NOISY_PROMPT_MSG_ID_PREFIXES):
-            msg_id_part = ""
-        else:
-            msg_id_part = f"[{message_id_raw}]" if message_id_raw else ""
-
-        media_suffix = DefaultChatter._count_media_suffix(msg)
-        content = getattr(msg, "processed_plain_text", None)
-        if content and str(content).strip():
-            content = str(content)
-            if media_suffix:
-                content = f"{content}{media_suffix}"
-        else:
-            raw_content = getattr(msg, "content", "")
-            if media_suffix:
-                if isinstance(raw_content, str) and raw_content.strip():
-                    content = f"{raw_content}{media_suffix}"
-                else:
-                    content = media_suffix.strip()
-            else:
-                content = str(raw_content)
-
-        if msg_id_part:
-            return f"【{time_str}】{role_part}{id_part}{name_part} {msg_id_part}： {content}"
-        return f"【{time_str}】{role_part}{id_part}{name_part}： {content}"
+        metadata = get_mcp_manager().get_connected_server_metadata()
+        return DefaultChatterPromptBuilder.build_sub_agent_collaboration_extra(metadata)
 
     async def _build_system_prompt(self, chat_stream: ChatStream) -> str:
         """构建系统提示词"""
@@ -1060,23 +820,11 @@ class DefaultChatter(BaseChatter):
         return await DefaultChatterPromptBuilder.build_system_prompt(
             plugin_config if isinstance(plugin_config, DefaultChatterConfig) else None,
             chat_stream,
-        )
-
-    async def _build_classical_user_text(
-        self,
-        chat_stream: ChatStream,
-        unread_msgs: list[Message],
-    ) -> str:
-        """构建 classical 模式 user 提示词。"""
-        return await DefaultChatterPromptBuilder.build_classical_user_text(
-            chat_stream,
-            unread_msgs,
-            self.format_message_line,
-            self._build_user_extra(chat_stream),
+            extra=self._build_sub_agent_collaboration_system_extra(),
         )
 
     def _build_enhanced_history_text(self, chat_stream: ChatStream) -> str:
-        """构建 enhanced 模式的历史消息文本。"""
+        """构建历史消息文本。"""
         return DefaultChatterPromptBuilder.build_enhanced_history_text(
             chat_stream,
             self.format_message_line,
@@ -1088,7 +836,6 @@ class DefaultChatter(BaseChatter):
         history_text: str,
         unread_lines: str,
         extra: str = "",
-        include_continuous_memory: bool = True,
     ) -> str:
         """通过 user prompt 模板构建用户提示词。
 
@@ -1097,7 +844,6 @@ class DefaultChatter(BaseChatter):
             history_text: 格式化后的历史消息文本（各行已用统一格式）
             unread_lines: 格式化后的未读消息文本
             extra: 额外信息文本
-            include_continuous_memory: 是否在本轮注入连续记忆块
 
         Returns:
             str: 渲染后的 user 提示词
@@ -1107,30 +853,26 @@ class DefaultChatter(BaseChatter):
             history_text,
             unread_lines,
             extra,
-            include_continuous_memory=include_continuous_memory,
         )
 
     @staticmethod
     def _upsert_pending_unread_payload(
         response: LLMConversationState,
-        formatted_content: object,
+        formatted_text: str,
+        unread_msgs: list[Message] | None = None,
+        native_multimodal: bool = False,
+        logger_override: Logger | None = None,
     ) -> None:
         """在未发送前合并未读消息到最后一个 USER payload。"""
-        if isinstance(formatted_content, list):
-            new_content = list(formatted_content)
-        elif isinstance(formatted_content, Text):
-            new_content = [formatted_content]
+        content_list: list[Content | LLMUsable]
+        if native_multimodal and unread_msgs:
+            images = extract_images_from_messages(unread_msgs)
+            content_list = build_multimodal_content(formatted_text, images)
+            if images:
+                (logger_override or logger).debug(f"已提取 {len(images)} 张图片")
         else:
-            new_content = [Text(str(formatted_content))]
-
-        if response.payloads:
-            last_payload = response.payloads[-1]
-            if last_payload.role == ROLE.USER:
-                last_payload.content.extend(new_content)
-                return
-
-        payload_content = new_content[0] if len(new_content) == 1 else new_content
-        response.add_payload(LLMPayload(ROLE.USER, payload_content))
+            content_list = [Text(formatted_text)]
+        response.add_payload(LLMPayload(ROLE.USER, content_list))
 
     async def sub_agent(
         self,
@@ -1175,12 +917,14 @@ class DefaultChatter(BaseChatter):
             fallback_prompt=sub_agent_system_prompt,
         )
 
-    async def execute(self) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:
+    async def execute(
+        self,
+    ) -> AsyncGenerator[Wait | Success | Failure | Stop, WaitResumeEvent | None]:
         """执行聊天器的对话循环。
 
         一轮对话包含完整的上下文消息（系统提示 + 历史 + 未读 + LLM call history）。
-        新的 LLM 交互记录会不断追加到上下文中；当本轮自然结束后，
-        下次触发将使用全新的上下文。
+        新的 LLM 交互记录会不断追加到上下文中。当 stop_conversation 被调用后，
+        本轮对话结束，下次触发将使用全新的上下文。
 
         Yields:
             Wait | Success | Failure | Stop: 执行结果
@@ -1194,63 +938,57 @@ class DefaultChatter(BaseChatter):
             yield Failure("无法激活聊天流")
             return
 
-        self._register_vlm_skip()
-        try:
-            mode = self._get_mode()
-            logger.info(f"DefaultChatter 当前模式: {mode}")
+        runner = self._execute_enhanced(chat_stream)
+        resume_event: WaitResumeEvent | None = None
 
-            if mode == "classical":
-                async for result in self._execute_classical(chat_stream):
-                    yield result
+        while True:
+            try:
+                result = await runner.asend(resume_event)
+            except StopAsyncIteration:
                 return
-
-            async for result in self._execute_enhanced(chat_stream):
-                yield result
-        finally:
-            self._unregister_vlm_skip()
+            resume_event = yield result
 
     async def _execute_enhanced(
         self, chat_stream: ChatStream
-    ) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:
-        """enhanced 模式执行流程（保留原有行为）。"""
-        async for result in run_enhanced(
-            chatter=self,
-            chat_stream=chat_stream,
-            logger=logger,
-            pass_call_name=_PASS_AND_WAIT,
-            stop_call_name=_STOP_CONVERSATION,
-            send_text_call_name=_SEND_TEXT,
-            suspend_text=_SUSPEND_TEXT,
-        ):
-            if isinstance(result, Stop):
-                result = self._apply_stop_wake_config(result)
-            yield result
+    ) -> AsyncGenerator[Wait | Success | Failure | Stop, WaitResumeEvent | None]:
+        """执行 DefaultChatter 对话流程。"""
+        plugin_config = getattr(self.plugin, "config", None)
+        if isinstance(plugin_config, DefaultChatterConfig):
+            enable_cooldown = plugin_config.plugin.enable_cooldown
+            native_multimodal = plugin_config.plugin.native_multimodal
+        else:
+            enable_cooldown = False
+            native_multimodal = False
 
-    async def _execute_classical(
-        self, chat_stream: ChatStream
-    ) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:
-        """classical 模式执行流程。"""
-        async for result in run_classical(
+        runner = run_enhanced(
             chatter=self,
             chat_stream=chat_stream,
             logger=logger,
             pass_call_name=_PASS_AND_WAIT,
             stop_call_name=_STOP_CONVERSATION,
-            send_text_call_name=_SEND_TEXT,
             suspend_text=_SUSPEND_TEXT,
-        ):
+            enable_action_suspend=self._is_action_suspend_enabled(),
+            enable_cooldown=enable_cooldown,
+            native_multimodal=native_multimodal,
+        )
+        resume_event: WaitResumeEvent | None = None
+
+        while True:
+            try:
+                result = await runner.asend(resume_event)
+            except StopAsyncIteration:
+                return
             if isinstance(result, Stop):
                 result = self._apply_stop_wake_config(result)
-            yield result
+            resume_event = yield result
 
     async def run_tool_call(
         self,
-        calls=None,
-        response: LLMResponseLike | None = None,
-        usable_map=None,
-        trigger_msg: Message | None = None,
-        **legacy_kwargs,
-    ) -> list[tuple[bool, bool]] | tuple[bool, bool]:
+        calls,
+        response: LLMResponseLike,
+        usable_map,
+        trigger_msg: Message | None,
+    ) -> list[tuple[bool, bool]]:
         """执行一次响应中的一批普通工具调用并写回响应上下文。
 
         Args:
@@ -1263,132 +1001,188 @@ class DefaultChatter(BaseChatter):
             list[tuple[bool, bool]]: 与 ``calls`` 顺序一致的
             ``(是否已写回 TOOL_RESULT, execute 是否成功)`` 列表。
         """
-        legacy_single = False
-        if calls is None and "call" in legacy_kwargs:
-            calls = legacy_kwargs["call"]
-            legacy_single = True
-        elif calls is not None and not isinstance(calls, list):
-            legacy_single = True
+        return await super().run_tool_call(calls, response, usable_map, trigger_msg)
 
-        call_list = [calls] if legacy_single else list(calls or [])
-        normalized_calls = []
-        for call in call_list:
-            if call.name == _MESSAGE_NUCLEUS and trigger_msg is not None:
-                raw_args = (
-                    dict(call.args)
-                    if isinstance(getattr(call, "args", None), dict)
-                    else {}
-                )
-                legacy_message = raw_args.pop("message", None)
-                if legacy_message is not None and "content" not in raw_args:
-                    raw_args["content"] = legacy_message
-                raw_args.setdefault(
-                    "stream_id",
-                    str(getattr(trigger_msg, "stream_id", "") or self.stream_id),
-                )
-                raw_args.setdefault(
-                    "platform",
-                    str(getattr(trigger_msg, "platform", "") or ""),
-                )
-                raw_args.setdefault(
-                    "chat_type",
-                    str(getattr(trigger_msg, "chat_type", "") or ""),
-                )
-                raw_args.setdefault(
-                    "sender_name",
-                    str(getattr(trigger_msg, "sender_name", "") or "DFC"),
-                )
+    async def inject_usables(self, request) -> Any:
+        """按模式注入可用工具；子代理协作开启时隐藏 defer_loading 的 MCP 工具。"""
+        if not self._is_sub_agent_collaboration_enabled():
+            return await super().inject_usables(request)
 
-                from src.kernel.llm import ToolCall
+        from src.kernel.llm import LLMPayload, ROLE, ToolRegistry
 
-                call = ToolCall(
-                    id=getattr(call, "id", None),
-                    name=call.name,
-                    args=raw_args,
-                )
-            normalized_calls.append(call)
+        usables = await self.get_llm_usables()
+        usables = await self.modify_llm_usables(usables)
+        deferred_mcp_usables = self._get_deferred_mcp_usable_classes()
+        filtered_usables = [
+            usable_cls
+            for usable_cls in usables
+            if usable_cls not in deferred_mcp_usables
+        ]
+        filtered_usables.extend(self._get_sub_agent_collaboration_usables())
 
-        if legacy_single:
-            call = normalized_calls[0]
-            from src.kernel.llm import LLMPayload, ROLE, ToolResult
+        registry = ToolRegistry()
+        for usable_cls in filtered_usables:
+            registry.register(usable_cls)
 
-            args = dict(call.args) if isinstance(call.args, dict) else {}
-            args.pop("reason", None)
-            exec_success = False
-            usable_cls = usable_map.get(call.name) if usable_map is not None else None
-            if not usable_cls:
-                result_text = f"未知的工具: {call.name}"
-                logger.warning(result_text)
-            elif trigger_msg is None:
-                result_text = "无触发消息，跳过执行"
-                logger.debug(f"[{self.chatter_name}] 无触发消息，跳过工具调用: {call.name}")
-            else:
-                try:
-                    exec_success, result = await self.exec_llm_usable(
-                        usable_cls,
-                        trigger_msg,
-                        **args,
-                    )
-                    result_text = str(result) if exec_success else f"执行失败: {result}"
-                except Exception as exc:
-                    result_text = f"执行异常: {exc}"
-                    logger.error(f"执行 {call.name} 异常: {exc}", exc_info=True)
+        if registry.get_all():
+            request.add_payload(LLMPayload(ROLE.TOOL, registry.get_all()))  # type: ignore[arg-type]
 
-            if response is not None:
-                response.add_payload(
-                    LLMPayload(
-                        ROLE.TOOL_RESULT,
-                        ToolResult(
-                            value=result_text,
-                            call_id=call.id,
-                            name=call.name,
-                        ),
-                    )
-                )
-            return True, exec_success
+        return registry
 
-        if response is None or usable_map is None:
-            return []
+    async def _resolve_sub_agent_usable_classes(
+        self,
+        tools: list[str],
+        mcp: list[str],
+        allow_create_sub_agent: bool,
+    ) -> tuple[list[type[LLMUsable]], list[str], list[str], list[str], list[str]]:
+        """解析子代理请求的普通工具与 MCP 能力。"""
+        requested_tools = [tool_name.strip() for tool_name in tools if tool_name.strip()]
+        requested_mcp = [mcp_name.strip() for mcp_name in mcp if mcp_name.strip()]
 
-        return await super().run_tool_call(
-            normalized_calls,
-            response,
-            usable_map,
-            trigger_msg,
+        usables = await self.get_llm_usables()
+        usables = await self.modify_llm_usables(usables)
+
+        normal_usable_map: dict[str, type[LLMUsable]] = {}
+        for usable_cls in usables:
+            if self._is_mcp_usable_class(usable_cls):
+                continue
+            for alias_name in self._normalized_usable_names(usable_cls):
+                normal_usable_map.setdefault(alias_name, usable_cls)
+
+        resolved_usables: list[type[LLMUsable]] = []
+        resolved_tool_names: list[str] = []
+        invalid_tools: list[str] = []
+        seen_classes: set[type[LLMUsable]] = set()
+
+        for tool_name in requested_tools:
+            usable_cls = normal_usable_map.get(tool_name)
+            if usable_cls is None:
+                invalid_tools.append(tool_name)
+                continue
+            if usable_cls in seen_classes:
+                continue
+            seen_classes.add(usable_cls)
+            resolved_usables.append(usable_cls)
+            resolved_tool_names.append(tool_name)
+
+        from src.core.managers.tool_manager import get_mcp_manager
+
+        mcp_manager = get_mcp_manager()
+        connected_mcp_names = {
+            metadata.server_name for metadata in mcp_manager.get_connected_server_metadata()
+        }
+        invalid_mcp = [mcp_name for mcp_name in requested_mcp if mcp_name not in connected_mcp_names]
+        resolved_mcp_names = [mcp_name for mcp_name in requested_mcp if mcp_name in connected_mcp_names]
+
+        for usable_cls in mcp_manager.get_tool_classes_for_servers(resolved_mcp_names):
+            if usable_cls in seen_classes:
+                continue
+            seen_classes.add(usable_cls)
+            resolved_usables.append(usable_cls)
+
+        if allow_create_sub_agent:
+            for usable_cls in self._get_sub_agent_collaboration_usables():
+                if usable_cls in seen_classes:
+                    continue
+                seen_classes.add(usable_cls)
+                resolved_usables.append(usable_cls)
+
+        return (
+            resolved_usables,
+            resolved_tool_names,
+            resolved_mcp_names,
+            invalid_tools,
+            invalid_mcp,
         )
 
-    def _register_vlm_skip(self) -> None:
-        """启用原生多模态时，跳过当前聊天流的 VLM 转译。"""
-        plugin_config = getattr(self.plugin, "config", None)
-        if not (
-            isinstance(plugin_config, DefaultChatterConfig)
-            and plugin_config.plugin.native_multimodal
-        ):
-            return
+    @staticmethod
+    def _build_sub_agent_system_prompt(
+        system_prompt: str,
+        mcp_names: list[str],
+    ) -> str:
+        """拼接固定子代理系统提示词与委托提示。"""
+        sections = [FIXED_SUB_AGENT_SYSTEM_PROMPT.strip()]
+        if mcp_names:
+            sections.append(
+                "你被分配到了以下 MCP 服务器的能力：" + "、".join(mcp_names)
+            )
+        if system_prompt.strip():
+            sections.append(system_prompt.strip())
+        return "\n\n".join(section for section in sections if section)
 
+    async def create_managed_sub_agent(
+        self,
+        *,
+        name: str,
+        system_prompt: str,
+        tools: list[str],
+        mcp: list[str],
+        allow_create_sub_agent: bool,
+    ) -> tuple[bool, dict[str, Any]]:
+        """创建一个受管子代理。"""
+        usable_classes, resolved_tool_names, resolved_mcp_names, invalid_tools, invalid_mcp = (
+            await self._resolve_sub_agent_usable_classes(
+                tools=tools,
+                mcp=mcp,
+                allow_create_sub_agent=allow_create_sub_agent,
+            )
+        )
+        if invalid_tools or invalid_mcp:
+            return False, {
+                "invalid_tools": invalid_tools,
+                "invalid_mcp": invalid_mcp,
+                "name": name,
+            }
+
+        manager = get_sub_agent_collaboration_manager()
         try:
-            from src.core.managers import get_media_manager
+            snapshot = manager.create_agent(
+                chatter=self,
+                name=name,
+                system_prompt=self._build_sub_agent_system_prompt(
+                    system_prompt=system_prompt,
+                    mcp_names=resolved_mcp_names,
+                ),
+                usable_classes=usable_classes,
+                allowed_tool_names=resolved_tool_names,
+                allowed_mcp_names=resolved_mcp_names,
+                allow_create_sub_agent=allow_create_sub_agent,
+                enable_action_suspend=self._is_action_suspend_enabled(),
+                parent_name=get_active_sub_agent_name(),
+            )
+        except ValueError as error:
+            return False, {"error": str(error), "name": name}
+        return True, snapshot
 
-            get_media_manager().skip_vlm_for_stream(self.stream_id)
-            logger.info(f"DefaultChatter 已为聊天流 {self.stream_id[:8]} 启用原生多模态")
-        except Exception as exc:
-            logger.warning(f"DefaultChatter 启用原生多模态失败: {exc}")
-
-    def _unregister_vlm_skip(self) -> None:
-        """退出时恢复当前聊天流的 VLM 转译。"""
-        plugin_config = getattr(self.plugin, "config", None)
-        if not (
-            isinstance(plugin_config, DefaultChatterConfig)
-            and plugin_config.plugin.native_multimodal
-        ):
-            return
-
+    async def query_managed_sub_agent(
+        self,
+        *,
+        name: str,
+        message_limit: int,
+        question: str,
+    ) -> tuple[bool, dict[str, Any]]:
+        """查询或驱动一个受管子代理。"""
+        manager = get_sub_agent_collaboration_manager()
         try:
-            from src.core.managers import get_media_manager
+            snapshot = await manager.get_agent(
+                chatter=self,
+                name=name,
+                question=question,
+                message_limit=max(0, int(message_limit)),
+                enable_action_suspend=self._is_action_suspend_enabled(),
+            )
+        except ValueError as error:
+            return False, {"error": str(error), "name": name}
+        return True, snapshot
 
-            get_media_manager().unskip_vlm_for_stream(self.stream_id)
-        except Exception as exc:
-            logger.debug(f"DefaultChatter 取消原生多模态失败: {exc}")
+    async def kill_managed_sub_agent(self, *, name: str) -> tuple[bool, dict[str, Any]]:
+        """销毁一个受管子代理。"""
+        manager = get_sub_agent_collaboration_manager()
+        try:
+            result = manager.kill_agent(stream_id=self.stream_id, name=name)
+        except ValueError as error:
+            return False, {"error": str(error), "name": name}
+        return True, result
 
 
 # ─── Plugin ─────────────────────────────────────────────────
@@ -1430,7 +1224,7 @@ class DefaultChatterPlugin(BasePlugin):
                 "reply_style": optional(personality.reply_style),
                 "safety_guidelines": optional("\n".join(personality.safety_guidelines)),
                 "negative_behaviors": optional("\n".join(personality.negative_behaviors)),
-                "extra_info": optional(""),
+                "sub_agent_collaboration_extra": optional(""),
             },
         )
 
@@ -1439,6 +1233,8 @@ class DefaultChatterPlugin(BasePlugin):
             template=sub_agent_system_prompt,
             policies={
                 "nickname": optional(personality.nickname),
+                "bot_id": optional(""),
+                "bot_id_section": optional(""),
                 "personality_core_section": optional(personality.personality_core)
                 .then(wrap("它的核心人格是：", "\n")),
                 "personality_side_section": optional(personality.personality_side)
@@ -1457,7 +1253,6 @@ class DefaultChatterPlugin(BasePlugin):
                 "platform_name": optional("未知"),
                 "platform_id": optional("未知ID"),
                 "extra_info": optional(""),
-                "continuous_memory": optional(""),
                 "history": optional("")
                 .then(min_len(2))
                 .then(
@@ -1491,7 +1286,4 @@ class DefaultChatterPlugin(BasePlugin):
             SendTextAction,
             PassAndWaitAction,
             StopConversationAction,
-            MessageNucleusTool,
-            ConsultNucleusTool,
-            LifeMemoryExplorerAgent,
         ]

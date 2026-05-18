@@ -241,6 +241,32 @@ async def get_stream_messages(
     )
 
 
+async def clear_stream_context(
+    stream_id: str,
+    *,
+    cleared_at: float | None = None,
+) -> bool:
+    """清空指定流的上下文，并持久化清空时间戳。"""
+    _validate_non_empty(stream_id, "stream_id")
+    return await _get_stream_manager().clear_stream_context(
+        stream_id,
+        cleared_at=cleared_at,
+    )
+
+
+async def load_and_clear_context(stream_id: str) -> "ChatStream | None":
+    """清空指定流的上下文。"""
+    _validate_non_empty(stream_id, "stream_id")
+    return await _get_stream_manager().load_and_clear_context(stream_id)
+
+
+async def bulk_clear_streams(chat_type: str | None = None) -> int:
+    """按聊天类型批量清空流上下文。"""
+    if chat_type is not None and not isinstance(chat_type, str):
+        raise TypeError("chat_type 必须是 str 或 None")
+    return await _get_stream_manager().bulk_clear_streams(chat_type)
+
+
 def clear_stream_cache(stream_id: str | None = None) -> None:
     """清理流实例缓存。
 
@@ -283,6 +309,7 @@ async def activate_stream(stream_id: str) -> "ChatStream | None":
 
 __all__ = [
     "get_or_create_stream",
+    "get_stream",
     "build_stream_from_database",
     "load_stream_context",
     "add_message_to_stream",
@@ -291,6 +318,9 @@ __all__ = [
     "delete_stream",
     "get_stream_info",
     "get_stream_messages",
+    "clear_stream_context",
+    "load_and_clear_context",
+    "bulk_clear_streams",
     "clear_stream_cache",
     "refresh_stream",
     "activate_stream",

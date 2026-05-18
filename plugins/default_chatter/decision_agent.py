@@ -15,6 +15,44 @@ from src.kernel.llm.token_counter import count_text_tokens
 from .type_defs import SubAgentDecision, SupportsRequestCreation
 
 
+_DEFAULT_SUB_AGENT_FALLBACK_PROMPT = """你是一个聊天意图识别助手。
+你的任务是分析新收到的聊天消息，结合历史上下文，判断主机器人是否有必要进行响应。
+
+# 关于主机器人
+主机器人的名字是 {nickname}。
+{bot_id_section}
+# 判定准则
+你应该在以下情况判定为 "需要回复" (should_respond = true)：
+1. 消息中明确提到了机器人的名字({nickname})或代称。
+2. 消息中存在艾特(@)行为，且艾特的 QQ 号必须是 {bot_id}。
+3. 消息内容与当前正在进行的话题高度相关，需要机器人进一步说明、回答或参与。
+4. 对方在表达某种需要回应的情绪（如问候、告别、称赞、抱怨等）。
+
+你应该在以下情况判定为 "不需要回复" (should_respond = false)：
+1. 消息是群聊中的闲聊，且机器人并非话题参与者。
+2. 消息艾特了其他人（QQ 号不是 {bot_id}）。
+3. 明显是一连串消息中的中间部分，可以继续等待后续。
+4. 检测到是其他 Bot 的自动回复或无意义的刷屏消息。
+5. 只有单个表情且不携带任何需要回复的语义。
+
+# 输出格式
+请务必返回 JSON 格式，如下所示：
+```json
+{{
+    "reason": "简短的判定理由",
+    "should_respond": true/false
+}}
+```
+"""
+
+
+class _SafeFormatDict(dict[str, str]):
+    """安全的 format_map 字典，缺失字段返回空字符串。"""
+
+    def __missing__(self, key: str) -> str:
+        return ""
+
+
 def _safe_count_tokens(text: str, model_identifier: str) -> int:
     """安全计算文本 token 数量，失败时返回 0。"""
     try:
@@ -104,42 +142,48 @@ async def decide_should_respond(
         request = chatter.create_request(
             "sub_actor",
             "sub_agent",
-            max_context=5,
             with_reminder="sub_actor",
         )
     except (ValueError, KeyError):
         return {"should_respond": True, "reason": "未找到 sub_actor 配置，默认响应"}
 
     nickname = get_core_config().personality.nickname
+    bot_id = chat_stream.bot_id or ""
+    bot_id_section = f"它的 QQ 号是 {bot_id}。\n" if bot_id else ""
     tmpl = get_prompt_manager().get_template("default_chatter_sub_agent_prompt")
     if tmpl:
-        sub_prompt = await tmpl.set("nickname", nickname).build()
+        sub_prompt = (
+            await tmpl
+            .set("nickname", nickname)
+            .set("bot_id", bot_id)
+            .set("bot_id_section", bot_id_section)
+            .build()
+        )
     else:
-        if fallback_prompt is None:
-            fallback_prompt = (
-                "你是一个聊天意图识别助手。"
-                "你的任务是分析新收到的聊天消息，结合历史上下文，判断主机器人是否有必要进行响应。"
-                "主机器人的名字是 {nickname}。"
-                "请务必返回 JSON，格式为 {{\"reason\": \"...\", \"should_respond\": true/false}}。"
+        prompt_template = fallback_prompt or _DEFAULT_SUB_AGENT_FALLBACK_PROMPT
+        sub_prompt = prompt_template.format_map(
+            _SafeFormatDict(
+                {
+                    "nickname": nickname,
+                    "bot_id": bot_id,
+                    "bot_id_section": bot_id_section,
+                    "personality_core_section": "",
+                    "personality_side_section": "",
+                }
             )
-        sub_prompt = fallback_prompt.format(nickname=nickname)
+        )
 
     request.add_payload(LLMPayload(ROLE.SYSTEM, Text(sub_prompt)))
 
     fitted_unreads = _fit_unreads_to_sub_agent_budget(request, unreads_text)
-    # 提取最近 10 条历史记录作为决策背景
-    history_context = ""
-    try:
-        # 使用 chatter 的内置方法构建历史文本，限制在 10 条以内以节省 token
-        history_context = chatter._build_history_text(chat_stream, max_messages=30)
-    except Exception as e:
-        logger.warning(f"决策代理提取历史记录失败: {e}")
+    if len(fitted_unreads) < len(unreads_text):
+        logger.info(
+            "Sub-agent 输入已截断以控制上下文长度: "
+            f"{len(unreads_text)} -> {len(fitted_unreads)} 字符"
+        )
 
     request.add_payload(
-        LLMPayload(ROLE.USER, Text(
-            f"【对话背景（历史记录）】\n{history_context}\n\n"
-            f"【新收到待判定消息】\n{fitted_unreads}"
-        ))
+        LLMPayload(ROLE.USER, Text(f"【新收到待判定消息】\n{fitted_unreads}"))
     )
 
     try:

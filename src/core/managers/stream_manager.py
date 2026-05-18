@@ -15,11 +15,13 @@
 import asyncio
 import time
 from typing import TYPE_CHECKING, Any
-from async_lru import alru_cache
 
-from src.kernel.db import CRUDBase, QueryBuilder
-from src.kernel.logger import get_logger
+from async_lru import alru_cache
+from sqlalchemy import update as sa_update
+
 from src.core.config import get_core_config
+from src.kernel.db import CRUDBase, QueryBuilder, get_db_session
+from src.kernel.logger import get_logger
 
 if TYPE_CHECKING:
     from src.core.models.message import Message
@@ -257,6 +259,7 @@ class StreamManager:
         )
         chat_stream.create_time = stream_record.created_at
         chat_stream.last_active_time = stream_record.last_active_time
+        chat_stream.context_cleared_at = stream_record.context_cleared_at
 
         # 加载上下文
         chat_config = get_core_config().chat
@@ -302,16 +305,24 @@ class StreamManager:
                 chat_type="private",
             )
 
-        # 查询历史消息
-        query = QueryBuilder(self._Messages).filter(stream_id=stream_id).order_by("-id")
+        from sqlalchemy.orm import defer
+
+        # 查询历史消息（如果有清空时间戳，只取该时间点之后的消息）
+        query = QueryBuilder(self._Messages).filter(stream_id=stream_id)
+        if stream_record.context_cleared_at is not None:
+            query = query.filter(time__gt=stream_record.context_cleared_at)
+        query = query.order_by("-id")
         if max_messages is not None:
             query = query.limit(max_messages)
+        
+        # Defer loading the potentially huge content column (containing base64) to optimize speed
+        query._stmt = query._stmt.options(defer(self._Messages.content))
         messages_records = await query.all()
 
         # 转换为运行时 Message 对象
         history_messages = []
         for msg_record in reversed(messages_records):  # 按时间正序
-            history_messages.append(await self._db_message_to_runtime(msg_record))  # type: ignore    
+            history_messages.append(await self._db_message_to_runtime(msg_record, defer_content=True))  # type: ignore
 
         # 创建 StreamContext
         context = StreamContext(
@@ -543,6 +554,7 @@ class StreamManager:
             "message_count": message_count,
             "last_active_time": stream.last_active_time,
             "created_at": stream.created_at,
+            "context_cleared_at": stream.context_cleared_at,
         }
 
     async def get_stream_messages(
@@ -550,6 +562,7 @@ class StreamManager:
         stream_id: str,
         limit: int = 100,
         offset: int = 0,
+        defer_content: bool = True,
     ) -> list["Message"]:
         """获取流的消息（支持分页）。
 
@@ -557,6 +570,7 @@ class StreamManager:
             stream_id: 流ID
             limit: 最大返回消息数
             offset: 跳过的消息数
+            defer_content: 是否延迟加载内容字段（优化性能）
 
         Returns:
             list[Message]: 运行时消息对象列表
@@ -564,9 +578,14 @@ class StreamManager:
         Examples:
             >>> messages = await sm.get_stream_messages("abc123", limit=50, offset=0)
         """
+        from sqlalchemy.orm import defer
+
+        query = QueryBuilder(self._Messages).filter(stream_id=stream_id)
+        if defer_content:
+            query._stmt = query._stmt.options(defer(self._Messages.content))
+
         messages_records = (
-            await QueryBuilder(self._Messages)
-            .filter(stream_id=stream_id)
+            await query
             .order_by("-id")
             .limit(limit)
             .offset(offset)
@@ -574,7 +593,7 @@ class StreamManager:
         )
 
         return [
-            await self._db_message_to_runtime(msg) for msg in reversed(messages_records) # type: ignore
+            await self._db_message_to_runtime(msg, defer_content=defer_content) for msg in reversed(messages_records) # type: ignore
         ]
 
     def clear_cache(self, stream_id: str | None = None) -> None:
@@ -597,6 +616,7 @@ class StreamManager:
             self._streams.clear()
             self._stream_locks.clear()
             logger.debug("清理全部流实例")
+        self.get_stream_info.cache_clear()
 
     async def refresh_stream(self, stream_id: str) -> "ChatStream | None":
         """强制从数据库刷新流。
@@ -645,6 +665,60 @@ class StreamManager:
             stream.update_active_time()
             await self._update_stream_active_time(stream_id)
 
+        return stream
+
+    async def clear_stream_context(
+        self,
+        stream_id: str,
+        *,
+        cleared_at: float | None = None,
+    ) -> bool:
+        """清空指定流的上下文，并持久化清空时间戳。"""
+        clear_time = cleared_at if cleared_at is not None else time.time()
+
+        stream = self._streams.get(stream_id)
+        if stream is not None:
+            stream.context.clear_messages()
+            stream.context_cleared_at = clear_time
+            logger.debug(f"已清空内存流上下文: {stream_id}")
+
+        record = await self._streams_crud.get_by(stream_id=stream_id)
+        if record:
+            await self._streams_crud.update(record.id, {"context_cleared_at": clear_time})
+            logger.debug(f"已持久化清空时间戳: {stream_id}")
+
+        self.get_stream_info.cache_clear()
+        return True
+
+    async def bulk_clear_streams(self, chat_type: str | None = None) -> int:
+        """批量清空流上下文，并持久化清空时间戳。"""
+        normalized_chat_type = chat_type or None
+        clear_time = time.time()
+
+        for stream in self._streams.values():
+            if normalized_chat_type and stream.chat_type != normalized_chat_type:
+                continue
+            stream.context.clear_messages()
+            stream.context_cleared_at = clear_time
+
+        async with get_db_session() as session:
+            stmt = sa_update(self._ChatStreams).values(context_cleared_at=clear_time)
+            if normalized_chat_type:
+                stmt = stmt.where(self._ChatStreams.chat_type == normalized_chat_type)
+            result = await session.execute(stmt)
+            await session.commit()
+            count = int(result.rowcount or 0)
+
+        self.get_stream_info.cache_clear()
+        logger.debug(
+            f"批量清空上下文，类型={normalized_chat_type or '全部'}，影响 {count} 条记录"
+        )
+        return count
+
+    async def load_and_clear_context(self, stream_id: str) -> "ChatStream | None":
+        """加载流并清空其上下文。"""
+        stream = self._streams.get(stream_id)
+        await self.clear_stream_context(stream_id)
         return stream
         
     # ==================== Private Helper Methods ====================
@@ -763,11 +837,16 @@ class StreamManager:
             self._stream_locks[stream_id] = asyncio.Lock()
         return self._stream_locks[stream_id]
 
-    async def _db_message_to_runtime(self, db_message: "Messages") -> "Message":
+    async def _db_message_to_runtime(
+        self,
+        db_message: "Messages",
+        defer_content: bool = False,
+    ) -> "Message":
         """将数据库消息转换为运行时消息。
 
         Args:
             db_message: 数据库消息对象
+            defer_content: 是否延迟加载内容字段（优化性能）
 
         Returns:
             Message: 运行时消息对象
@@ -823,14 +902,18 @@ class StreamManager:
                 sender_name = "Bot"
 
         normalized_plain_text = db_message.processed_plain_text
-        if normalized_plain_text is None:
-            normalized_plain_text = str(db_message.content)
+        if defer_content and normalized_plain_text is not None:
+            content = "[Content deferred]"
+        else:
+            content = db_message.content
+            if normalized_plain_text is None:
+                normalized_plain_text = str(content)
         
         return Message(
             message_id=db_message.message_id,
             time=db_message.time,
             reply_to=db_message.reply_to,
-            content=db_message.content,
+            content=content,
             processed_plain_text=normalized_plain_text,
             message_type=MessageType(db_message.message_type),
             sender_id=sender_id,
