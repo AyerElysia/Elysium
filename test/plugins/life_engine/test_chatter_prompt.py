@@ -14,7 +14,7 @@ from plugins.life_engine.tools.exec_tools import LifeEngineBashTool
 from plugins.life_engine.tools.file_tools import LifeEngineRunAgentTool, LifeEngineWakeDFCTool
 from src.core.components.base.chatter import BaseChatter, Wait
 from src.core.models.message import Message
-from src.kernel.llm import LLMPayload, ROLE, Text
+from src.kernel.llm import LLMContextManager, LLMPayload, ROLE, Text
 import pytest
 
 def test_life_chatter_system_prompt_includes_memory_not_tool(tmp_path) -> None:
@@ -75,6 +75,32 @@ def test_life_chatter_persistent_user_prompt_excludes_dynamic_context() -> None:
     assert "<inner_state>" not in prompt
     assert "<recent_context>" not in prompt
     assert "<runtime_assistant_context>" not in prompt
+
+
+def test_life_chatter_context_compression_hook_preserves_dropped_history() -> None:
+    manager = LLMContextManager(max_payloads=4)
+    request = SimpleNamespace(context_manager=manager)
+
+    LifeChatter._install_context_compression_hook(request)
+
+    payloads = [
+        LLMPayload(ROLE.SYSTEM, Text("system")),
+        LLMPayload(ROLE.USER, Text("旧用户消息")),
+        LLMPayload(ROLE.ASSISTANT, Text("旧回复")),
+        LLMPayload(ROLE.USER, Text("新用户消息")),
+        LLMPayload(ROLE.ASSISTANT, Text("新回复")),
+    ]
+
+    trimmed = manager.maybe_trim(payloads)
+
+    assert len(trimmed) == 4
+    assert trimmed[0].role == ROLE.SYSTEM
+    assert trimmed[1].role == ROLE.USER
+    compressed = trimmed[1].content[0].text
+    assert "<compressed_life_chatter_context>" in compressed
+    assert "旧用户消息" in compressed
+    assert "旧回复" in compressed
+    assert trimmed[2].content[0].text == "新用户消息"
 
 
 @pytest.mark.asyncio

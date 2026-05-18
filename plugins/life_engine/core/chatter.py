@@ -22,7 +22,7 @@ from src.core.components.types import ChatType
 from src.core.components.base.chatter import BaseChatter, Wait, Success, Failure, Stop
 from src.core.components.base.action import BaseAction
 from src.core.models.message import Message, MessageType
-from src.kernel.llm import Audio, Content, Image, LLMPayload, ROLE, Text, ToolResult, Video
+from src.kernel.llm import Audio, Content, Image, LLMPayload, ROLE, Text, ToolCall, ToolResult, Video
 from src.kernel.logger import get_logger, COLOR
 from ..memory.prompting import load_memory_prompt_data, render_memory_prompt
 from ..constants import LIFE_CHATTER_GLOBAL_CURSOR_KEY
@@ -125,6 +125,8 @@ _LIVE_BRIDGE_BLOCKED_USABLE_SIGNATURES = frozenset(
 _RUNTIME_ASSISTANT_INJECTION_MAX_PER_STREAM = 24
 _RUNTIME_ASSISTANT_INJECTIONS: dict[str, deque[str]] = {}
 _RUNTIME_ASSISTANT_INJECTION_LOCK = threading.Lock()
+_CONTEXT_COMPRESSION_MAX_GROUPS = 12
+_CONTEXT_COMPRESSION_MAX_PART_CHARS = 360
 
 
 def push_runtime_assistant_injection(
@@ -645,6 +647,7 @@ class LifeChatter(BaseChatter):
             return self.__class__._GLOBAL_RUNTIME, self.__class__._GLOBAL_USABLE_MAP
 
         request = self.create_request("actor", request_name="life_chatter")
+        self._install_context_compression_hook(request)
 
         # System prompt 只放主体人格和全局工具规则，不绑定任何具体聊天流。
         # 直播/私聊/群聊等场景提示放到每轮 USER prompt 中，避免第一条消息的
@@ -668,6 +671,84 @@ class LifeChatter(BaseChatter):
         self.__class__._GLOBAL_RUNTIME = runtime
         self.__class__._GLOBAL_USABLE_MAP = usable_map
         return runtime, usable_map
+
+    @classmethod
+    def _install_context_compression_hook(cls, request: Any) -> None:
+        """为 life_chatter 的长生命周期 request 安装轻量上下文压缩 hook。"""
+        context_manager = getattr(request, "context_manager", None)
+        if context_manager is None or not hasattr(context_manager, "compression_hook"):
+            return
+
+        existing_hook = getattr(context_manager, "compression_hook", None)
+        if existing_hook is not None:
+            return
+
+        context_manager.compression_hook = cls._compress_dropped_payload_groups
+
+    @classmethod
+    def _compress_dropped_payload_groups(
+        cls,
+        dropped_groups: list[list[LLMPayload]],
+        remaining_payloads: list[LLMPayload],
+    ) -> list[LLMPayload]:
+        """把被 LLMContextManager 裁掉的旧对话组压成一条可继续引用的摘要。"""
+        del remaining_payloads
+        if not dropped_groups:
+            return []
+
+        groups = dropped_groups[-_CONTEXT_COMPRESSION_MAX_GROUPS:]
+        omitted = max(0, len(dropped_groups) - len(groups))
+        lines = [
+            "以下是因上下文窗口限制而压缩的旧 life_chatter 对话片段；请把它视为此前已经发生的背景，不要当作新的用户消息：",
+            "<compressed_life_chatter_context>",
+        ]
+        if omitted:
+            lines.append(f"- 更早的 {omitted} 组上下文已进一步省略。")
+
+        for index, group in enumerate(groups, start=1):
+            lines.append(f"## 片段 {index}")
+            for payload in group:
+                summary = cls._summarize_payload_for_context_compression(payload)
+                if summary:
+                    lines.append(summary)
+
+        lines.append("</compressed_life_chatter_context>")
+        return [LLMPayload(ROLE.USER, Text("\n".join(lines)))]
+
+    @classmethod
+    def _summarize_payload_for_context_compression(cls, payload: LLMPayload) -> str:
+        role = getattr(payload, "role", None)
+        role_text = getattr(role, "value", str(role))
+        parts: list[str] = []
+        for item in getattr(payload, "content", []) or []:
+            part = cls._summarize_content_part_for_context_compression(item)
+            if part:
+                parts.append(part)
+        if not parts:
+            return ""
+        return f"- {role_text}: " + " | ".join(parts)
+
+    @staticmethod
+    def _summarize_content_part_for_context_compression(item: object) -> str:
+        if isinstance(item, Text):
+            text = item.text
+        elif isinstance(item, ToolCall):
+            text = f"[工具调用] {item.name}({item.args})"
+        elif isinstance(item, ToolResult):
+            text = f"[工具结果] {item.name}: {item.value}"
+        elif isinstance(item, Image):
+            text = "[图片]"
+        elif isinstance(item, Video):
+            text = "[视频]"
+        elif isinstance(item, Audio):
+            text = "[语音]"
+        else:
+            text = str(item)
+
+        text = re.sub(r"\s+", " ", str(text or "")).strip()
+        if len(text) > _CONTEXT_COMPRESSION_MAX_PART_CHARS:
+            text = text[: _CONTEXT_COMPRESSION_MAX_PART_CHARS - 3].rstrip() + "..."
+        return text
 
     def _get_life_service(self) -> LifeEngineService | None:
         """获取 life_engine 服务实例。"""
