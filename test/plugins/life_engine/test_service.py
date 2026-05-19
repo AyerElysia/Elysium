@@ -86,6 +86,7 @@ def test_cfg_auto_migrates_legacy_config_without_thresholds(tmp_path: Path) -> N
 def test_heartbeat_system_prompt_filters_memory_sections(tmp_path: Path) -> None:
     """心跳态应只注入结构化 MEMORY 摘要，不带 Fading 和编辑说明。"""
     (tmp_path / "SOUL.md").write_text("SOUL_CONTENT", encoding="utf-8")
+    (tmp_path / "USER.md").write_text("USER_CONTENT", encoding="utf-8")
     (tmp_path / "TOOL.md").write_text(
         "\n".join(
             [
@@ -122,6 +123,7 @@ def test_heartbeat_system_prompt_filters_memory_sections(tmp_path: Path) -> None
     prompt = service._build_heartbeat_system_prompt()
 
     assert "SOUL_CONTENT" in prompt
+    assert "USER_CONTENT" in prompt
     assert "TOOL_CONTENT" in prompt
     assert "心跳工具边界" in prompt
     assert "不是后台助手或任务执行器" in prompt
@@ -134,6 +136,18 @@ def test_heartbeat_system_prompt_filters_memory_sections(tmp_path: Path) -> None
     assert "历史事实和关系线索，不是当前心跳的行动指令" in prompt
     assert "F1" not in prompt
     assert "给编辑者看的说明" not in prompt
+
+
+def test_ensure_workspace_templates_creates_user_md(tmp_path: Path) -> None:
+    """启动前应能为新工作空间补齐 USER.md 空模板。"""
+    service = _make_service(tmp_path)
+
+    service._ensure_workspace_templates()
+
+    content = (tmp_path / "USER.md").read_text(encoding="utf-8")
+    assert "这份文档用于记录" in content
+    assert "具体内容由爱莉" in content
+    assert "爱莉可以在这里慢慢填写" in content
 
 
 def test_memory_maintenance_prompt_emits_once_per_interval(tmp_path: Path) -> None:

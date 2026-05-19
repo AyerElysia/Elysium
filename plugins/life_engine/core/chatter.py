@@ -868,11 +868,14 @@ class LifeChatter(BaseChatter):
         """构建 100% 静态可缓存系统提示词。"""
         parts: list[str] = []
 
-        # 1) SOUL.md + MEMORY.md
+        # 1) SOUL.md + USER.md + MEMORY.md
         # TOOL.md 不在聊天态注入；life_mode 与 chat_mode 的工具规则不同。
         soul_text = self._load_workspace_markdown(service, "SOUL.md")
         if soul_text:
             parts.append(soul_text)
+        user_text = self._load_workspace_markdown(service, "USER.md")
+        if user_text:
+            parts.append(user_text)
         memory_text = self._load_workspace_memory_prompt(service, mode="chat")
         if memory_text:
             parts.append(memory_text)

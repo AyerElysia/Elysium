@@ -23,8 +23,15 @@ class SkillManagerConfig(BaseConfig):
             description="是否启用 SkillManager",
         )
         paths: list[str] = Field(
-            default_factory=lambda: ["skill", "skills"],
-            description="skill 根目录路径列表；相对路径默认相对项目根目录。兼容上游 skill/ 和旧版 skills/。",
+            default_factory=lambda: [
+                "skill",
+                "skills",
+                "data/life_engine_workspace",
+                "~/.agents/skills",
+                "~/.agents/skills/huashu-nuwa/examples",
+                "~/.codex/skills/.system",
+            ],
+            description="skill 根目录路径列表；相对路径默认相对项目根目录。兼容上游 skill/、旧版 skills/ 和用户级 skills。",
         )
         inject_actor_reminder: bool = Field(
             default=True,

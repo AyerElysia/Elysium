@@ -43,6 +43,25 @@ def _register_skill(plugin: SkillManagerPlugin, root_dir: Path, name: str = "dem
 
 
 @pytest.mark.asyncio
+async def test_refresh_discovers_life_engine_workspace_without_skill_md(tmp_path: Path) -> None:
+    """life_engine_workspace 没有 SKILL.md 时，也应作为可读取 skill 暴露。"""
+
+    workspace = tmp_path / "life_engine_workspace"
+    workspace.mkdir()
+    (workspace / "SOUL.md").write_text("SOUL_CONTENT", encoding="utf-8")
+    (workspace / "MEMORY.md").write_text("MEMORY_CONTENT", encoding="utf-8")
+
+    plugin = _build_plugin()
+    plugin.config.manager.paths = [str(workspace)]
+
+    await plugin.refresh_skill_catalog()
+
+    entry = plugin.skills["life_engine_workspace"]
+    assert entry.skill_md_path == workspace / "SOUL.md"
+    assert "MEMORY.md" in entry.files
+
+
+@pytest.mark.asyncio
 async def test_get_script_executes_python_script(tmp_path: Path) -> None:
     """应继续支持原有 Python 脚本执行路径。"""
 

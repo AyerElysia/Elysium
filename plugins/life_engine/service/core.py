@@ -86,6 +86,7 @@ if TYPE_CHECKING:
 
 
 logger = get_logger("life_engine", display="life_engine")
+_USER_TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "templates" / "USER.md"
 
 _SELF_PAUSE_MINUTES_MIN = 5
 _SELF_PAUSE_MINUTES_MAX = 480
@@ -426,6 +427,20 @@ class LifeEngineService(BaseService):
         workspace = Path(self._cfg().settings.workspace_path).resolve()
         workspace.mkdir(parents=True, exist_ok=True)
         return workspace
+
+    def _ensure_workspace_templates(self) -> None:
+        """补齐可由运行态长期维护的工作空间模板文件。"""
+
+        workspace = self._workspace_dir()
+        user_file = workspace / "USER.md"
+        if user_file.exists():
+            return
+        try:
+            template = _USER_TEMPLATE_PATH.read_text(encoding="utf-8")
+            user_file.write_text(template, encoding="utf-8")
+            logger.info(f"已创建 USER.md 使用说明模板: {user_file}")
+        except Exception as e:
+            logger.warning(f"创建 USER.md 使用说明模板失败: {e}")
 
     def snapshot(self) -> dict[str, Any]:
         """返回当前状态快照。"""
@@ -2274,6 +2289,14 @@ class LifeEngineService(BaseService):
             logger.warning("SOUL.md 不存在，使用默认人设")
             soul_content = "你是爱莉希雅，一个并行存在的生命中枢。"
 
+        user_file = workspace / "USER.md"
+        user_content = ""
+        if user_file.exists():
+            try:
+                user_content = user_file.read_text(encoding="utf-8").strip()
+            except Exception as e:
+                logger.warning(f"无法读取 USER.md: {e}")
+
         memory_content = ""
         try:
             memory_data = load_memory_prompt_data(workspace)
@@ -2292,6 +2315,8 @@ class LifeEngineService(BaseService):
         tool_content = self._render_heartbeat_tool_prompt(tool_content)
 
         parts = [soul_content]
+        if user_content:
+            parts.extend(["", "---", "", user_content])
         if memory_content:
             parts.extend(["", "---", "", memory_content])
         if tool_content:
@@ -2612,6 +2637,7 @@ class LifeEngineService(BaseService):
             await self.clear_runtime_context()
             return
 
+        self._ensure_workspace_templates()
         await self._load_runtime_context()
         sleep_enabled, sleep_desc = self._sleep_window_status()
         if not sleep_enabled and sleep_desc != "disabled":

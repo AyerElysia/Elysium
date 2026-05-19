@@ -16,6 +16,13 @@ from .tools import SkillGetReferenceTool, SkillGetScriptTool, SkillGetTool
 
 logger = get_logger("skill_manager")
 _FRONT_MATTER_FIELD_RE = re.compile(r"^(name|description)\s*:\s*(.+)$", re.IGNORECASE)
+_LIFE_WORKSPACE_MAIN_DOCS = (
+    "SOUL.md",
+    "USER.md",
+    "MEMORY.md",
+    "SUBCONSCIOUS.md",
+    "TOOL.md",
+)
 
 
 def _is_path_inside(base_dir: Path, target_path: Path) -> bool:
@@ -115,15 +122,21 @@ class SkillManagerPlugin(BasePlugin):
 
         configured_paths = self._resolve_skill_paths()
         self.paths = [str(item) for item in configured_paths]
+        logger.info(
+            "skill_manager 开始刷新 skill 索引: "
+            f"paths={', '.join(self.paths) if self.paths else '(none)'}"
+        )
 
         discovered: dict[str, SkillEntry] = {}
+        per_path_counts: dict[str, int] = {}
         for base_dir in configured_paths:
+            path_key = str(base_dir)
+            per_path_counts[path_key] = 0
             if not base_dir.exists() or not base_dir.is_dir():
                 logger.warning(f"skill 路径不存在或不可读，已跳过: {base_dir}")
                 continue
 
-            for skill_root in self._iter_skill_roots(base_dir):
-                skill_md_path = skill_root / "SKILL.md"
+            for skill_root, skill_md_path in self._iter_skill_roots(base_dir):
                 if not skill_md_path.is_file():
                     continue
 
@@ -132,7 +145,7 @@ class SkillManagerPlugin(BasePlugin):
                 skill_name = (parsed_name or skill_root.name).strip()
                 skill_description = (
                     parsed_description
-                    or f"Skill {skill_name}，通过 get_skill 读取后可使用扩展引用与脚本"
+                    or self._build_default_skill_description(skill_name, skill_md_path)
                 ).strip()
 
                 markdown_files = [
@@ -148,9 +161,23 @@ class SkillManagerPlugin(BasePlugin):
                     skill_md_path=skill_md_path,
                     files=markdown_files,
                 )
+                per_path_counts[path_key] += 1
 
         self.apply_discovered_skills(discovered)
-        logger.info(f"skill_manager 已刷新 skill 索引，数量: {len(self.skills)}")
+        path_summary = ", ".join(
+            f"{path}={count}" for path, count in per_path_counts.items()
+        )
+        if self.skills:
+            skill_names = ", ".join(sorted(self.skills.keys(), key=str.lower))
+            logger.info(
+                "skill_manager 已刷新 skill 索引: "
+                f"count={len(self.skills)} paths=({path_summary}) skills=[{skill_names}]"
+            )
+        else:
+            logger.warning(
+                "skill_manager 已刷新 skill 索引但未发现任何 skill: "
+                f"paths=({path_summary})"
+            )
 
     def _resolve_skill_paths(self) -> list[Path]:
         """将配置中的路径转换为绝对路径列表。"""
@@ -180,18 +207,47 @@ class SkillManagerPlugin(BasePlugin):
                 seen_paths.add(resolved)
         return resolved_paths
 
-    @staticmethod
-    def _iter_skill_roots(base_dir: Path) -> list[Path]:
+    @classmethod
+    def _iter_skill_roots(cls, base_dir: Path) -> list[tuple[Path, Path]]:
         """从基目录中解析 skill 根目录集合。"""
 
-        if (base_dir / "SKILL.md").is_file():
-            return [base_dir]
+        direct_main_doc = cls._resolve_skill_main_doc(base_dir)
+        if direct_main_doc is not None:
+            return [(base_dir, direct_main_doc)]
 
-        skill_roots: list[Path] = []
+        skill_roots: list[tuple[Path, Path]] = []
         for child in sorted(base_dir.iterdir()):
-            if child.is_dir() and (child / "SKILL.md").is_file():
-                skill_roots.append(child)
+            if not child.is_dir():
+                continue
+            main_doc = cls._resolve_skill_main_doc(child)
+            if main_doc is not None:
+                skill_roots.append((child, main_doc))
         return skill_roots
+
+    @staticmethod
+    def _resolve_skill_main_doc(skill_root: Path) -> Path | None:
+        """解析 skill 主文档，兼容 life_engine_workspace 这类无 SKILL.md 目录。"""
+
+        skill_md_path = skill_root / "SKILL.md"
+        if skill_md_path.is_file():
+            return skill_md_path
+
+        for filename in _LIFE_WORKSPACE_MAIN_DOCS:
+            candidate = skill_root / filename
+            if candidate.is_file():
+                return candidate
+        return None
+
+    @staticmethod
+    def _build_default_skill_description(skill_name: str, main_doc_path: Path) -> str:
+        """为没有 front matter 的 skill 生成可读描述。"""
+
+        if main_doc_path.name in _LIFE_WORKSPACE_MAIN_DOCS:
+            return (
+                f"Life workspace {skill_name}，主文档为 {main_doc_path.name}，"
+                "可用 get_reference 继续读取同目录 Markdown。"
+            )
+        return f"Skill {skill_name}，通过 get_skill 读取后可使用扩展引用与脚本"
 
     def apply_discovered_skills(self, discovered: dict[str, SkillEntry]) -> None:
         """应用刷新后的 skill 索引并清理运行态缓存。"""
