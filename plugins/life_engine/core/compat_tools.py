@@ -236,13 +236,13 @@ class LifeMessageNucleusTool(BaseTool):
 
 
 class LifeConsultNucleusTool(BaseTool):
-    """同步查询当前状态层信息。"""
+    """同生命中枢（潜意识）进行同步咨询与深度交流。"""
 
     tool_name = "consult_nucleus"
     tool_description = (
-        "向生命中枢同步查询当前状态层信息。"
-        "适合查询最近在想什么、当前内在状态、活跃 TODO、最近日记等。"
-        "这个工具只补充当前信息差，不负责替你规划行动。"
+        "同生命中枢（潜意识）进行同步咨询与深度交流。"
+        "适合交流或咨询最近内心的真实想法、情绪起伏、长期顾虑、活跃任务与日记细节等。"
+        "中枢会结合当前的全部内在状态，以深邃、真诚的潜意识视角给予你直接的解答和反馈。"
     )
     chatter_allow: list[str] = ["life_chatter"]
 
@@ -250,7 +250,7 @@ class LifeConsultNucleusTool(BaseTool):
         self,
         query: Annotated[
             str,
-            "想问中枢的状态问题，例如“最近在想什么”“现在有什么 TODO”“最近写了什么日记”",
+            "向中枢咨询的问题，例如询问近期的内心顾虑、状态看法，或者如何调整自己等",
         ],
     ) -> tuple[bool, str]:
         query_text = str(query or "").strip()
@@ -267,16 +267,48 @@ class LifeConsultNucleusTool(BaseTool):
                 return False, "life_engine 服务不可用"
 
             if hasattr(service, "query_outer_context"):
-                result = await service.query_outer_context(query_text)
+                base_context = await service.query_outer_context("")
             else:
-                result = await service.query_actor_context(query_text)
+                base_context = await service.query_actor_context("")
 
-            if not result:
-                return True, "暂时没有找到相关状态信息"
-            return True, result
+            if not base_context:
+                base_context = "暂无活跃的内在状态或记忆摘要。"
+
+            # 使用 sub_actor 模型与中枢进行真正的对话式交流
+            agent_prompt = f"""你是生命中枢（Subconscious/Sub-Actor）。你代表着当前主体的潜意识、内在状态与记忆深处。
+主意识（表达层/当前运行模式）正在向你进行同步咨询与交流。
+
+【你的当前内在状态与背景信息】：
+{base_context}
+
+【主意识的咨询问题】：
+{query_text}
+
+【你的任务】：
+请结合当前的内在情绪、最近思考、TODO 任务和日记，站在“生命中枢/潜意识”的温和、真实、深邃的视角，给主意识一个高内聚、有共鸣且充满智慧的同步回复。
+- 语气应当温和、细腻、真诚、符合主体角色（爱莉希雅）的底色，同时带着潜意识独有的洞察力。
+- 重点解答主意识的疑问，补充它可能忽略的信息差（例如最近的担忧、想要做的事或内心真实感受）。
+- 不要说“我是AI”或任何元信息，直接以生命中枢（潜意识）的口吻同主意识对话。
+"""
+            model_set = get_model_set_by_task("sub_actor")
+            request = create_llm_request(
+                model_set=model_set,
+                request_name="nucleus_consultation_agent",
+            )
+            request.add_payload(LLMPayload(ROLE.SYSTEM, Text(agent_prompt)))
+            request.add_payload(LLMPayload(ROLE.USER, Text(f"请对主意识的问题进行解答与交流")))
+
+            response = await request.send(stream=False)
+            response_text = await response
+
+            final_result = str(response_text or "").strip()
+            if not final_result:
+                return True, base_context  # 降级返回原始 dump
+
+            return True, final_result
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"查询生命中枢状态失败: {exc}")
-            return False, f"查询失败: {exc}"
+            logger.warning(f"与生命中枢交流失败: {exc}", exc_info=True)
+            return False, f"交流失败: {exc}"
 
 
 class LifeSearchLifeMemoryTool(BaseTool):

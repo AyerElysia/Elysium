@@ -97,7 +97,7 @@ async def test_envelope_to_message_transcribes_voice(monkeypatch: pytest.MonkeyP
             "recognize_media": AsyncMock(return_value="图片描述"),
             "recognize_voice": AsyncMock(return_value="这是语音转写"),
             "recognize_video": AsyncMock(return_value=None),
-            "should_skip_vlm": lambda self, stream_id: False,
+            "should_skip_vlm": lambda self, stream_id, media_type=None: False,
         },
     )()
     monkeypatch.setattr(
@@ -130,4 +130,54 @@ async def test_envelope_to_message_transcribes_voice(monkeypatch: pytest.MonkeyP
     assert "听一下：" in message.processed_plain_text
     assert "[语音:这是语音转写]" in message.processed_plain_text
     fake_manager.recognize_voice.assert_awaited_once()
+    fake_manager.recognize_media.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_envelope_to_message_skips_registered_image_vlm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """stream 注册跳过 image VLM 时，图片文本只保留占位，避免和原生 Image 双路并存。"""
+    converter = MessageConverter()
+
+    fake_manager = type(
+        "FakeMediaManager",
+        (),
+        {
+            "recognize_media": AsyncMock(return_value="不应该注入的图片描述"),
+            "recognize_voice": AsyncMock(return_value=None),
+            "recognize_video": AsyncMock(return_value=None),
+            "should_skip_vlm": lambda self, stream_id, media_type=None: media_type == "image",
+        },
+    )()
+
+    monkeypatch.setattr(
+        "src.core.managers.media_manager.get_media_manager",
+        lambda: fake_manager,
+    )
+
+    envelope = {
+        "message_info": {
+            "message_id": "msg-image-native-1",
+            "time": 1710000000.0,
+            "platform": "qq",
+            "user_info": {
+                "user_id": "user-image",
+                "user_nickname": "Alice",
+            },
+            "extra": {},
+        },
+        "message_segment": [
+            {"type": "text", "data": "看图："},
+            {"type": "image", "data": "base64|QUJD"},
+        ],
+        "raw_message": {"source": "unit-test"},
+    }
+
+    message = await converter.envelope_to_message(envelope)
+
+    assert message.message_type == MessageType.IMAGE
+    assert message.processed_plain_text == "看图：[图片]"
+    assert isinstance(message.content, dict)
+    assert message.content["media"][0]["data"] == "base64|QUJD"
     fake_manager.recognize_media.assert_not_awaited()

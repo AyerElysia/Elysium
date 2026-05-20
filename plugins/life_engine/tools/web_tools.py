@@ -165,6 +165,13 @@ def _resolve_default_search_max_results(plugin: Any) -> int:
     return _DEFAULT_SEARCH_MAX_RESULTS
 
 
+def _resolve_tavily_trust_env(plugin: Any) -> bool:
+    cfg = _get_life_config(plugin)
+    if cfg is not None:
+        return bool(getattr(cfg.web, "trust_env", True))
+    return True
+
+
 def _resolve_default_fetch_max_chars(plugin: Any) -> int:
     cfg = _get_life_config(plugin)
     if cfg is not None:
@@ -326,24 +333,35 @@ def _requests_post_json(
         session.close()
 
 
-def _sync_post_json(url: str, payload: dict[str, Any], timeout_seconds: int) -> dict[str, Any]:
+def _sync_post_json(
+    url: str,
+    payload: dict[str, Any],
+    timeout_seconds: int,
+    trust_env: bool = True,
+) -> dict[str, Any]:
     # 使用 requests 替代 urllib 以获得更稳健的代理 TLS 处理能力
-    try:
-        # 默认沿用系统代理；如果本地代理对 Tavily TLS 握手提前断开，再直连重试一次。
-        resp = _requests_post_json(url, payload, timeout_seconds, trust_env=True)
-    except requests.exceptions.RequestException as exc:
-        if not _is_retryable_proxy_tls_error(exc):
-            raise RuntimeError(f"Tavily 网络请求失败: {exc}") from exc
-        logger.warning(
-            "Tavily 经系统代理请求失败，尝试绕过代理直连重试: "
-            f"{type(exc).__name__}: {exc}"
-        )
+    if not trust_env:
         try:
             resp = _requests_post_json(url, payload, timeout_seconds, trust_env=False)
-        except requests.exceptions.RequestException as direct_exc:
-            raise RuntimeError(
-                f"Tavily 网络请求失败: proxy={exc}; direct={direct_exc}"
-            ) from direct_exc
+        except requests.exceptions.RequestException as exc:
+            raise RuntimeError(f"Tavily 网络请求失败: {exc}") from exc
+    else:
+        try:
+            # 默认沿用系统代理；如果本地代理对 Tavily TLS 握手提前断开，再直连重试一次。
+            resp = _requests_post_json(url, payload, timeout_seconds, trust_env=True)
+        except requests.exceptions.RequestException as exc:
+            if not _is_retryable_proxy_tls_error(exc):
+                raise RuntimeError(f"Tavily 网络请求失败: {exc}") from exc
+            logger.warning(
+                "Tavily 经系统代理请求失败，尝试绕过代理直连重试: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            try:
+                resp = _requests_post_json(url, payload, timeout_seconds, trust_env=False)
+            except requests.exceptions.RequestException as direct_exc:
+                raise RuntimeError(
+                    f"Tavily 网络请求失败: proxy={exc}; direct={direct_exc}"
+                ) from direct_exc
 
     try:
         status = resp.status_code
@@ -369,7 +387,13 @@ async def _tavily_post_json(
     body = dict(payload)
     body["api_key"] = api_key
     url = _resolve_endpoint(base_url, endpoint)
-    return await asyncio.to_thread(_sync_post_json, url, body, timeout_seconds)
+    return await asyncio.to_thread(
+        _sync_post_json,
+        url,
+        body,
+        timeout_seconds,
+        _resolve_tavily_trust_env(plugin),
+    )
 
 
 class LifeEngineWebSearchTool(BaseTool):

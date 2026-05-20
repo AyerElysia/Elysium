@@ -3,7 +3,6 @@
 覆盖：
 - LifeChatter._compose_unread_user_content：启用/禁用、image/voice/video 注入
 - 跨轮 dedup（失败重试场景）：相同 unread 二次 compose 不重复 extend 媒体
-- _prune_sent_media：成功送达后 USER payload 媒体替换为占位 Text
 - _strip_transient_context 精确匹配：用户原文含 marker 不被误删
 - 协议级：构造好的 USER payload 经 openai_client._payloads_to_openai_messages
   转换后，input_audio.format / image_url / video_url 字段正确
@@ -48,9 +47,10 @@ class _FakeResponse:
         self.payloads.append(payload)
 
 
-def _make_chatter(*, multimodal_enabled: bool = True, **mm_overrides: Any) -> LifeChatter:
+def _make_chatter(*, multimodal_enabled: bool | None = None, **mm_overrides: Any) -> LifeChatter:
     config = LifeEngineConfig()
-    config.multimodal.enabled = multimodal_enabled
+    if multimodal_enabled is not None:
+        config.multimodal.enabled = multimodal_enabled
     for k, v in mm_overrides.items():
         setattr(config.multimodal, k, v)
     chatter = LifeChatter.__new__(LifeChatter)
@@ -73,29 +73,15 @@ def _new_runtime() -> _WorkflowRuntime:
 
 
 def test_compose_disabled_returns_text_only() -> None:
-    chatter = _make_chatter(multimodal_enabled=False)
+    chatter = _make_chatter()
     rt = _new_runtime()
     msgs = [_msg("m1", media=[{"type": "voice", "data": _b64("a")}])]
     out = chatter._compose_unread_user_content(rt, msgs, "user prompt")
     assert len(out) == 1 and isinstance(out[0], Text)
 
 
-def test_compose_defaults_to_native_image_only() -> None:
-    chatter = _make_chatter()
-    rt = _new_runtime()
-    msgs = [
-        _msg("m1", media=[{"type": "image", "data": _png_b64()}]),
-        _msg("m2", media=[{"type": "voice", "data": _b64("vo"), "format": "wav"}]),
-        _msg("m3", media=[{"type": "video", "data": _b64("vid"), "mime_type": "video/mp4"}]),
-    ]
-    out = chatter._compose_unread_user_content(rt, msgs, "hi")
-    assert any(isinstance(p, Image) for p in out)
-    assert all(not isinstance(p, Audio) for p in out)
-    assert all(not isinstance(p, Video) for p in out)
-
-
-def test_compose_can_enable_voice_video_explicitly() -> None:
-    chatter = _make_chatter(native_audio=True, native_video=True)
+def test_compose_can_enable_all_native_modalities() -> None:
+    chatter = _make_chatter(multimodal_enabled=True)
     rt = _new_runtime()
     msgs = [
         _msg("m1", media=[{"type": "image", "data": _png_b64()}]),
@@ -108,26 +94,40 @@ def test_compose_can_enable_voice_video_explicitly() -> None:
     assert any(isinstance(p, Video) for p in out)
 
 
-def test_compose_skips_emoji_by_default() -> None:
-    chatter = _make_chatter()
+def test_compose_can_disable_voice_video_explicitly() -> None:
+    chatter = _make_chatter(multimodal_enabled=True, native_audio=False, native_video=False)
     rt = _new_runtime()
-    msgs = [_msg("m1", media=[{"type": "emoji", "data": _b64("emo")}])]
+    msgs = [
+        _msg("m1", media=[{"type": "image", "data": _png_b64()}]),
+        _msg("m2", media=[{"type": "voice", "data": _b64("vo"), "format": "wav"}]),
+        _msg("m3", media=[{"type": "video", "data": _b64("vid"), "mime_type": "video/mp4"}]),
+    ]
     out = chatter._compose_unread_user_content(rt, msgs, "hi")
-    assert all(not isinstance(p, Image) for p in out)
-    assert len(out) == 1 and isinstance(out[0], Text)
+    assert any(isinstance(p, Image) for p in out)
+    assert all(not isinstance(p, Audio) for p in out)
+    assert all(not isinstance(p, Video) for p in out)
 
 
-def test_compose_can_enable_emoji_explicitly() -> None:
-    chatter = _make_chatter(native_emoji=True)
+def test_compose_includes_emoji_by_default() -> None:
+    chatter = _make_chatter(multimodal_enabled=True)
     rt = _new_runtime()
     msgs = [_msg("m1", media=[{"type": "emoji", "data": _png_b64()}])]
     out = chatter._compose_unread_user_content(rt, msgs, "hi")
     assert any(isinstance(p, Image) for p in out)
 
 
+def test_compose_can_disable_emoji_explicitly() -> None:
+    chatter = _make_chatter(multimodal_enabled=True, native_emoji=False)
+    rt = _new_runtime()
+    msgs = [_msg("m1", media=[{"type": "emoji", "data": _png_b64()}])]
+    out = chatter._compose_unread_user_content(rt, msgs, "hi")
+    assert all(not isinstance(p, Image) for p in out)
+    assert len(out) == 1 and isinstance(out[0], Text)
+
+
 def test_compose_dedup_across_retries() -> None:
     """失败重试场景：相同 unread 二次 compose 不重复发出媒体。"""
-    chatter = _make_chatter()
+    chatter = _make_chatter(multimodal_enabled=True)
     rt = _new_runtime()
     msgs = [_msg("m1", media=[{"type": "image", "data": _png_b64()}])]
 
@@ -141,7 +141,7 @@ def test_compose_dedup_across_retries() -> None:
 
 
 def test_compose_skips_invalid_image_payload() -> None:
-    chatter = _make_chatter()
+    chatter = _make_chatter(multimodal_enabled=True)
     rt = _new_runtime()
     msgs = [_msg("m1", media=[{"type": "image", "data": _b64("not an image")}])]
     out = chatter._compose_unread_user_content(rt, msgs, "hi")
@@ -153,7 +153,7 @@ def test_compose_skips_invalid_image_payload() -> None:
 
 
 def test_compose_can_include_recent_history_image() -> None:
-    chatter = _make_chatter(include_history_media=True)
+    chatter = _make_chatter(multimodal_enabled=True, include_history_media=True)
     rt = _new_runtime()
     history_image = _msg(
         "drawn-1",
@@ -176,53 +176,12 @@ def test_compose_can_include_recent_history_image() -> None:
 
 
 def test_compose_silk_audio_downgraded_to_text_placeholder() -> None:
-    chatter = _make_chatter(native_audio=True)
+    chatter = _make_chatter(multimodal_enabled=True, native_audio=True)
     rt = _new_runtime()
     msgs = [_msg("m1", media=[{"type": "voice", "data": _b64("v"), "mime_type": "audio/silk"}])]
     out = chatter._compose_unread_user_content(rt, msgs, "hi")
     assert all(not isinstance(p, Audio) for p in out)
     assert any(isinstance(p, Text) and p.text == "[语音消息]" for p in out)
-
-
-# ─── _prune_sent_media ─────────────────────────────────────────
-
-
-def test_prune_replaces_media_with_text_placeholders() -> None:
-    chatter = _make_chatter()
-    response = _FakeResponse([
-        LLMPayload(
-            ROLE.USER,
-            [
-                Text("hello"),
-                Image(_b64("img")),
-                Text("[语音]"),
-                Audio(_b64("vo"), mime_type="audio/wav"),
-                Video(_b64("vd")),
-            ],
-        )
-    ])
-    chatter._prune_sent_media(response)
-    content = response.payloads[0].content
-    assert all(not isinstance(p, (Image, Audio, Video)) for p in content)
-    assert any(isinstance(p, Text) and p.text == "[已发送图片]" for p in content)
-    assert any(isinstance(p, Text) and p.text == "[已发送语音]" for p in content)
-    assert any(isinstance(p, Text) and p.text == "[已发送视频]" for p in content)
-
-
-def test_prune_disabled_when_flag_off() -> None:
-    chatter = _make_chatter(prune_old_media_after_send=False)
-    img = Image(_b64("x"))
-    response = _FakeResponse([LLMPayload(ROLE.USER, [Text("hi"), img])])
-    chatter._prune_sent_media(response)
-    assert any(isinstance(p, Image) for p in response.payloads[0].content)
-
-
-def test_prune_skipped_when_multimodal_disabled() -> None:
-    chatter = _make_chatter(multimodal_enabled=False)
-    img = Image(_b64("x"))
-    response = _FakeResponse([LLMPayload(ROLE.USER, [img])])
-    chatter._prune_sent_media(response)
-    assert any(isinstance(p, Image) for p in response.payloads[0].content)
 
 
 # ─── _strip_transient_context 精确匹配 ─────────────────────────
@@ -255,7 +214,7 @@ def test_strip_transient_context_removes_only_trailing_wrapper() -> None:
 
 
 def test_user_payload_serializes_audio_with_correct_format() -> None:
-    chatter = _make_chatter(native_audio=True)
+    chatter = _make_chatter(multimodal_enabled=True, native_audio=True)
     rt = _new_runtime()
     msgs = [_msg("m1", media=[{"type": "voice", "data": _b64("au"), "format": "wav"}])]
     content = chatter._compose_unread_user_content(rt, msgs, "请听这条语音")
@@ -268,7 +227,7 @@ def test_user_payload_serializes_audio_with_correct_format() -> None:
 
 
 def test_user_payload_serializes_image_and_video() -> None:
-    chatter = _make_chatter(native_video=True)
+    chatter = _make_chatter(multimodal_enabled=True, native_video=True)
     rt = _new_runtime()
     msgs = [
         _msg("m1", media=[{"type": "image", "data": _png_b64()}]),

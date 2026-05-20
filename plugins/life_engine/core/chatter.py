@@ -868,8 +868,9 @@ class LifeChatter(BaseChatter):
         """构建 100% 静态可缓存系统提示词。"""
         parts: list[str] = []
 
-        # 1) SOUL.md + USER.md + MEMORY.md
-        # TOOL.md 不在聊天态注入；life_mode 与 chat_mode 的工具规则不同。
+        # 1) SOUL.md + USER.md + MEMORY.md + TOOLS.md
+        # TOOL.md 是 life_engine/heartbeat 的工具边界；life_chatter 使用独立的
+        # TOOLS.md，避免把潜意识中枢的工具规则混入表达层。
         soul_text = self._load_workspace_markdown(service, "SOUL.md")
         if soul_text:
             parts.append(soul_text)
@@ -879,6 +880,9 @@ class LifeChatter(BaseChatter):
         memory_text = self._load_workspace_memory_prompt(service, mode="chat")
         if memory_text:
             parts.append(memory_text)
+        tools_text = self._load_workspace_markdown(service, "TOOLS.md")
+        if tools_text:
+            parts.append(tools_text)
         live_guidance = self._build_live_scene_guidance(chat_stream)
         if live_guidance:
             parts.append(live_guidance)
@@ -1355,9 +1359,9 @@ class LifeChatter(BaseChatter):
             max_audios=int(getattr(cfg, "max_audios_per_payload", 2) or 0),
         )
         enable_image = bool(getattr(cfg, "native_image", True))
-        enable_emoji = bool(getattr(cfg, "native_emoji", False))
-        enable_video = bool(getattr(cfg, "native_video", False))
-        enable_audio = bool(getattr(cfg, "native_audio", False))
+        enable_emoji = bool(getattr(cfg, "native_emoji", True))
+        enable_video = bool(getattr(cfg, "native_video", True))
+        enable_audio = bool(getattr(cfg, "native_audio", True))
         audio_max_seconds = int(getattr(cfg, "audio_max_seconds", 60) or 60)
 
         candidates = extract_media_from_messages(
@@ -1414,35 +1418,31 @@ class LifeChatter(BaseChatter):
         cfg = self._get_config()
         return getattr(cfg, "multimodal", None) if cfg is not None else None
 
-    def _prune_sent_media(self, response: Any) -> None:
-        """成功发送后，把 USER payload 中的 Image/Audio/Video 替换为占位 Text。
-
-        避免后续轮次重复携带 base64 体积；占位文本保留语义信息。
-        受 multimodal.prune_old_media_after_send 控制。
-        """
+    def _sync_native_visual_vlm_skip(self, chat_stream: ChatStream) -> None:
+        """按原生视觉配置同步当前 stream 的 VLM 跳过规则。"""
         cfg = self._get_multimodal_cfg()
         if cfg is None or not getattr(cfg, "enabled", False):
             return
-        if not bool(getattr(cfg, "prune_old_media_after_send", True)):
+        stream_id = str(getattr(chat_stream, "stream_id", "") or "").strip()
+        if not stream_id:
             return
 
-        payloads = getattr(response, "payloads", None)
-        if not isinstance(payloads, list):
-            return
-        for payload in payloads:
-            if getattr(payload, "role", None) != ROLE.USER:
-                continue
-            new_content: list[Content] = []
-            for part in getattr(payload, "content", []) or []:
-                if isinstance(part, Image):
-                    new_content.append(Text("[已发送图片]"))
-                elif isinstance(part, Video):
-                    new_content.append(Text("[已发送视频]"))
-                elif isinstance(part, Audio):
-                    new_content.append(Text("[已发送语音]"))
-                else:
-                    new_content.append(part)
-            payload.content = new_content
+        try:
+            from src.core.managers.media_manager import get_media_manager
+
+            manager = get_media_manager()
+            visual_types = {
+                media_type
+                for media_type, enabled in (
+                    ("image", bool(getattr(cfg, "native_image", True))),
+                    ("emoji", bool(getattr(cfg, "native_emoji", True))),
+                )
+                if enabled
+            }
+            if visual_types:
+                manager.skip_vlm_for_stream(stream_id, visual_types)
+        except Exception:
+            logger.debug("同步原生视觉 VLM 跳过规则失败", exc_info=True)
 
     @staticmethod
     def _format_runtime_context_text(texts: list[str]) -> str:
@@ -1761,6 +1761,7 @@ class LifeChatter(BaseChatter):
         self._active_chat_stream = chat_stream
         rt, usable_map = await self._get_or_create_global_runtime(service, chat_stream)
         stream_id = str(getattr(chat_stream, "stream_id", "") or self.stream_id or "").strip()
+        self._sync_native_visual_vlm_skip(chat_stream)
         if rt.phase != _Phase.WAIT_USER:
             active_stream_id = str(getattr(rt, "active_stream_id", "") or "").strip()
             if active_stream_id and active_stream_id != stream_id:
@@ -1892,9 +1893,6 @@ class LifeChatter(BaseChatter):
                             await service._save_runtime_context()
                         rt.pending_life_context_high_water = 0
                         rt.pending_transient_context_text = ""
-                        # 已成功送达：把先前 USER payload 中的多模态媒体替换为文本占位，
-                        # 避免后续轮次的 LLMRequest 重复携带 base64 体积。
-                        self._prune_sent_media(rt.response)
                         # 媒体去重只用于失败重试时防止同一轮重复 append。
                         # 成功进入下一轮后允许 history 中的图片重新作为原生视觉输入注入。
                         rt.media_seen.clear()

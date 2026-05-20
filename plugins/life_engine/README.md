@@ -233,6 +233,7 @@
 [web]
 tavily_api_key = "tvly-..."  # 在 config/plugins/life_engine/config.toml 中填写
 tavily_base_url = "https://api.tavily.com"
+trust_env = true  # 是否信任系统代理；本地代理对 Tavily 握手不稳时可设为 false
 search_timeout_seconds = 30
 extract_timeout_seconds = 60
 default_search_max_results = 5

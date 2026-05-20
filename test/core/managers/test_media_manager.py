@@ -81,6 +81,18 @@ class TestMediaManagerSkipVLM:
             manager.skip_vlm_for_stream("stream_123")
             
             assert manager.should_skip_vlm("stream_123") is True
+            assert manager.should_skip_vlm("stream_123", "image") is True
+
+    def test_skip_vlm_for_stream_media_types(self) -> None:
+        """测试为特定流按媒体类型跳过 VLM。"""
+        with patch('src.core.managers.media_manager.get_model_set_by_task'):
+            manager = MediaManager()
+
+            manager.skip_vlm_for_stream("stream_123", ["image"])
+
+            assert manager.should_skip_vlm("stream_123") is True
+            assert manager.should_skip_vlm("stream_123", "image") is True
+            assert manager.should_skip_vlm("stream_123", "emoji") is False
     
     def test_unskip_vlm_for_stream(self) -> None:
         """测试恢复特定流的 VLM。"""
@@ -92,6 +104,17 @@ class TestMediaManagerSkipVLM:
             
             manager.unskip_vlm_for_stream("stream_123")
             assert manager.should_skip_vlm("stream_123") is False
+
+    def test_unskip_vlm_for_stream_media_types(self) -> None:
+        """测试恢复特定流的部分媒体类型 VLM。"""
+        with patch('src.core.managers.media_manager.get_model_set_by_task'):
+            manager = MediaManager()
+
+            manager.skip_vlm_for_stream("stream_123", ["image", "emoji"])
+            manager.unskip_vlm_for_stream("stream_123", ["image"])
+
+            assert manager.should_skip_vlm("stream_123", "image") is False
+            assert manager.should_skip_vlm("stream_123", "emoji") is True
     
     def test_should_skip_vlm_not_in_list(self) -> None:
         """测试未跳过的流。"""

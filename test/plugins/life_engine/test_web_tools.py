@@ -14,6 +14,7 @@ from plugins.life_engine.tools.web_tools import (
     LifeEngineBrowserFetchTool,
     LifeEngineWebSearchTool,
     _pick_tavily_target,
+    _resolve_tavily_trust_env,
     _sync_post_json,
     _tavily_selector,
 )
@@ -132,6 +133,37 @@ def test_sync_post_json_retries_direct_when_proxy_tls_eof(
 
     assert data["query"] == "test"
     assert calls == [True, False]
+
+
+def test_sync_post_json_skips_proxy_when_trust_env_disabled() -> None:
+    """禁用 trust_env 后，应直接绕过系统代理。"""
+    calls: list[bool] = []
+
+    def _fake_post(*_args, trust_env: bool = True, **_kwargs) -> _FakeTavilyResponse:
+        calls.append(trust_env)
+        return _FakeTavilyResponse()
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7890")
+        monkeypatch.setattr("plugins.life_engine.tools.web_tools._requests_post_json", _fake_post)
+
+        data = _sync_post_json(
+            "https://api.tavily.com/search",
+            {"query": "test", "api_key": "tvly-test"},
+            5,
+            trust_env=False,
+        )
+
+    assert data["query"] == "test"
+    assert calls == [False]
+
+
+def test_resolve_tavily_trust_env_reads_config(tmp_path: Path) -> None:
+    """应从 life_engine web 配置读取 trust_env。"""
+    plugin = _make_plugin(tmp_path)
+    plugin.config.web.trust_env = False
+
+    assert _resolve_tavily_trust_env(plugin) is False
 
 
 def test_pick_tavily_target_supports_round_robin_lists(

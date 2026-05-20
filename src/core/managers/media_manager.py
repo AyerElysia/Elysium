@@ -118,7 +118,8 @@ class MediaManager:
         self._video_model_set = None
         self._vlm_available = False
         self._voice_available = False
-        self._skip_vlm_stream_ids: set[str] = set()  # 已注册跳过 VLM 识别的聊天流 ID
+        self._skip_vlm_stream_ids: set[str] = set()  # 已注册跳过所有 VLM 识别的聊天流 ID
+        self._skip_vlm_media_types_by_stream: dict[str, set[str]] = {}
         self._media_chain_stats = MediaChainStats()
         self._media_stats_lock = ThreadLock()
         self._recognition_locks: dict[str, asyncio.Lock] = {}
@@ -278,38 +279,82 @@ class MediaManager:
     # 公共 API：VLM 识别控制
     # ──────────────────────────────────────────
 
-    def skip_vlm_for_stream(self, stream_id: str) -> None:
+    def skip_vlm_for_stream(
+        self,
+        stream_id: str,
+        media_types: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> None:
         """注册指定聊天流跳过 VLM 识别。
 
         调用后，该 stream_id 的消息在 MessageConverter 中将不再触发
-        VLM 图片/表情包识别，媒体数据仅保留原始 base64。
+        指定媒体类型的 VLM 识别，媒体数据仅保留原始 base64。
         适用于聊天流程自行处理多模态内容的场景。
 
         Args:
             stream_id: 要跳过 VLM 识别的聊天流 ID
+            media_types: 要跳过的媒体类型。为 None 时跳过该流全部 VLM 识别。
         """
-        self._skip_vlm_stream_ids.add(stream_id)
-        logger.debug(f"已注册跳过 VLM 识别: stream_id={stream_id[:8]}")
+        if media_types is None:
+            self._skip_vlm_stream_ids.add(stream_id)
+            self._skip_vlm_media_types_by_stream.pop(stream_id, None)
+            logger.debug(f"已注册跳过全部 VLM 识别: stream_id={stream_id[:8]}")
+            return
 
-    def unskip_vlm_for_stream(self, stream_id: str) -> None:
+        normalized = {str(item).strip().lower() for item in media_types if str(item).strip()}
+        if not normalized:
+            return
+        existing = self._skip_vlm_media_types_by_stream.setdefault(stream_id, set())
+        existing.update(normalized)
+        logger.debug(
+            f"已注册跳过 VLM 识别: stream_id={stream_id[:8]}, media_types={sorted(existing)}"
+        )
+
+    def unskip_vlm_for_stream(
+        self,
+        stream_id: str,
+        media_types: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> None:
         """取消指定聊天流的 VLM 识别跳过。
 
         Args:
             stream_id: 要恢复 VLM 识别的聊天流 ID
+            media_types: 要恢复的媒体类型。为 None 时清除该流全部跳过配置。
         """
-        self._skip_vlm_stream_ids.discard(stream_id)
-        logger.debug(f"已取消跳过 VLM 识别: stream_id={stream_id[:8]}")
+        if media_types is None:
+            self._skip_vlm_stream_ids.discard(stream_id)
+            self._skip_vlm_media_types_by_stream.pop(stream_id, None)
+            logger.debug(f"已取消跳过全部 VLM 识别: stream_id={stream_id[:8]}")
+            return
 
-    def should_skip_vlm(self, stream_id: str) -> bool:
+        configured = self._skip_vlm_media_types_by_stream.get(stream_id)
+        if configured is None:
+            return
+        for item in media_types:
+            configured.discard(str(item).strip().lower())
+        if not configured:
+            self._skip_vlm_media_types_by_stream.pop(stream_id, None)
+        logger.debug(
+            f"已取消部分 VLM 跳过: stream_id={stream_id[:8]}, media_types={list(media_types)}"
+        )
+
+    def should_skip_vlm(self, stream_id: str, media_type: str | None = None) -> bool:
         """查询指定聊天流是否应跳过 VLM 识别。
 
         Args:
             stream_id: 聊天流 ID
+            media_type: 媒体类型。为 None 时只要该流存在任意跳过配置就返回 True。
 
         Returns:
-            True 表示该聊天流已注册跳过 VLM 识别
+            True 表示该聊天流已注册跳过指定 VLM 识别
         """
-        return stream_id in self._skip_vlm_stream_ids
+        if stream_id in self._skip_vlm_stream_ids:
+            return True
+        configured = self._skip_vlm_media_types_by_stream.get(stream_id)
+        if not configured:
+            return False
+        if media_type is None:
+            return True
+        return str(media_type).strip().lower() in configured
 
     # ──────────────────────────────────────────
     # 公共 API：媒体识别

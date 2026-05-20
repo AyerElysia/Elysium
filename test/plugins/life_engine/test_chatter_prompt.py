@@ -17,8 +17,8 @@ from src.core.models.message import Message
 from src.kernel.llm import LLMContextManager, LLMPayload, ROLE, Text
 import pytest
 
-def test_life_chatter_system_prompt_includes_memory_not_tool(tmp_path) -> None:
-    """聊天态应共享 SOUL/USER/MEMORY，并仅追加一个核心工具说明。"""
+def test_life_chatter_system_prompt_includes_memory_and_chatter_tools_not_heartbeat_tool(tmp_path) -> None:
+    """聊天态应共享 SOUL/USER/MEMORY/TOOLS，并保留核心工具说明。"""
     (tmp_path / "SOUL.md").write_text("SOUL_CONTENT", encoding="utf-8")
     (tmp_path / "USER.md").write_text("USER_CONTENT", encoding="utf-8")
     (tmp_path / "MEMORY.md").write_text(
@@ -41,6 +41,7 @@ def test_life_chatter_system_prompt_includes_memory_not_tool(tmp_path) -> None:
         encoding="utf-8",
     )
     (tmp_path / "TOOL.md").write_text("TOOL_CONTENT", encoding="utf-8")
+    (tmp_path / "TOOLS.md").write_text("CHATTER_TOOLS_CONTENT", encoding="utf-8")
 
     config = LifeEngineConfig()
     config.settings.workspace_path = str(tmp_path)
@@ -55,6 +56,7 @@ def test_life_chatter_system_prompt_includes_memory_not_tool(tmp_path) -> None:
     assert "MEMORY_FADING" not in prompt
     assert "给编辑者看的说明" not in prompt
     assert "TOOL_CONTENT" not in prompt
+    assert "CHATTER_TOOLS_CONTENT" in prompt
     assert "action-think" in prompt
     assert "action-life_pass_and_wait" in prompt
     assert "life_send_text" in prompt

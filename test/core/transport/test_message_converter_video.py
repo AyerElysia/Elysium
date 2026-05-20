@@ -67,8 +67,8 @@ async def test_converter_skip_vlm_still_handles_video(monkeypatch: pytest.Monkey
     )
     monkeypatch.setattr(
         MessageConverter,
-        "_should_skip_vlm_for_stream",
-        staticmethod(lambda _stream_id: True),
+        "_skip_vlm_media_types_for_stream",
+        staticmethod(lambda _stream_id, _media_types: {"image", "emoji"}),
     )
 
     envelope = _build_private_envelope(
@@ -85,4 +85,3 @@ async def test_converter_skip_vlm_still_handles_video(monkeypatch: pytest.Monkey
     assert "[视频:视频大致在讲一次对话场景。]" in message.processed_plain_text
     fake_manager.recognize_media.assert_not_awaited()
     fake_manager.recognize_video.assert_awaited_once()
-

@@ -53,6 +53,7 @@ class LifeEngineConfig(BaseConfig):
             "tavily_api_key",
             "tavily_api_keys",
             "tavily_base_url",
+            "trust_env",
         },
         "snn": {
             "enabled",
@@ -81,7 +82,6 @@ class LifeEngineConfig(BaseConfig):
             "native_video",
             "native_audio",
             "max_images_per_payload",
-            "include_history_media",
         },
         "screen": {
             "enabled",
@@ -256,6 +256,11 @@ class LifeEngineConfig(BaseConfig):
         tavily_base_urls: list[str] = Field(
             default_factory=list,
             description="多个 Tavily API 基础地址。配置后 web_tools 会按轮询方式选择，用于负载均衡。",
+        )
+
+        trust_env: bool = Field(
+            default=True,
+            description="是否信任系统代理环境变量（HTTP_PROXY/HTTPS_PROXY）。关闭后 Tavily 请求始终直连。",
         )
 
         search_timeout_seconds: int = Field(
@@ -541,7 +546,8 @@ class LifeEngineConfig(BaseConfig):
         """life_chatter 原生多模态输入配置（MiMo-V2-Omni 等模型）。
 
         启用后会把 unread_msgs 中允许的媒体转为 LLM 原生 Content。
-        当前默认只开启图片；视频/音频保留降级路径，避免模型拒收导致上下文链路中断。
+        默认关闭，避免普通聊天持续携带图片/音频/视频导致 token 与上下文体积膨胀。
+        需要原生多模态测试时再显式打开。
         """
 
         enabled: bool = Field(
@@ -553,15 +559,15 @@ class LifeEngineConfig(BaseConfig):
             description="是否把 image 媒体作为原生 Image Content 注入。",
         )
         native_emoji: bool = Field(
-            default=False,
-            description="是否把 emoji / 表情包媒体作为原生 Image Content 注入。默认关闭，避免浪费多模态预算。",
+            default=True,
+            description="是否把 emoji / 表情包媒体作为原生 Image Content 注入。",
         )
         native_video: bool = Field(
-            default=False,
+            default=True,
             description="是否把 video 媒体作为原生 Video Content 注入。",
         )
         native_audio: bool = Field(
-            default=False,
+            default=True,
             description="是否把 voice / record / audio 媒体作为原生 Audio Content 注入。",
         )
         max_images_per_payload: int = Field(
@@ -597,10 +603,10 @@ class LifeEngineConfig(BaseConfig):
             description="单段语音/音频最大时长（秒）；超过则降级为 [语音消息] 文本占位。",
         )
         prune_old_media_after_send: bool = Field(
-            default=True,
+            default=False,
             description=(
-                "回复成功后，把已发送的 USER payload 中的 Image/Audio/Video 替换为文本占位"
-                "（如 [已发送语音:#mid]），避免后续轮次重复携带 base64 体积。"
+                "兼容旧配置项。life_chatter 现在默认保留 payload 中的原生 Image/Audio/Video，"
+                "不再把已发送媒体剪成文本占位。"
             ),
         )
         unsupported_audio_placeholder: str = Field(

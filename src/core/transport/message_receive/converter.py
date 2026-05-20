@@ -133,19 +133,23 @@ class MessageConverter:
         # 递归解析段列表
         result = self._parse_segments(segments, depth=0)
         
-        # 如果解析过程中发现有媒体资源，则后续需要考虑是否运行视觉语言模型识别
+        # 如果解析过程中发现有媒体资源，则后续需要考虑是否运行视觉语言模型识别。
+        # 上层流程可按 stream 注册跳过 image/emoji VLM，让原生多模态模型直接看媒体。
         if result.media:
             # 提前提取 stream_id 用于判断是否跳过 VLM
             stream_id = extract_stream_id(message_info)
-            skip_image_emoji = self._should_skip_vlm_for_stream(stream_id)
-            if skip_image_emoji:
+            skip_vlm_types = self._skip_vlm_media_types_for_stream(
+                stream_id,
+                {"image", "emoji"},
+            )
+            if skip_vlm_types:
                 logger.debug(
-                    f"聊天流 {stream_id[:8]} 已注册跳过 VLM 图片识别，"
-                    "将保留 image/emoji 原始媒体；video 仍会走非原生摘要链路"
+                    f"聊天流 {stream_id[:8]} 已跳过 VLM 图片识别，"
+                    f"media_types={sorted(skip_vlm_types)}；video 仍会走非原生摘要链路"
                 )
             result = await self._recognize_media_with_manager(
                 result,
-                skip_image_emoji=skip_image_emoji,
+                skip_vlm_types=skip_vlm_types,
             )
 
         # 确定消息类型
@@ -208,44 +212,9 @@ class MessageConverter:
         """
         seg_list: list[SegPayload] = []
 
-        # 非文本类型：根据 message_type 直接构建对应媒体段
-        _MEDIA_TYPES = {
-            MessageType.IMAGE,
-            MessageType.EMOJI,
-            MessageType.VOICE,
-            MessageType.VIDEO,
-            MessageType.FILE,
-        }
-        if message.message_type in _MEDIA_TYPES:
-            content = message.content
-            content_data: str
-            if isinstance(content, str):
-                content_data = content
-            elif isinstance(content, dict):
-                # send_file 等 API 传入 dict（如 {"path": "...", "name": "..."}）
-                # FILE 类型取 path 字段作为数据；其他类型取 data/path/url
-                if message.message_type == MessageType.FILE:
-                    content_data = content.get("path", "")
-                else:
-                    content_data = (
-                        content.get("data", "")
-                        or content.get("path", "")
-                        or content.get("url", "")
-                    )
-            else:
-                content_data = ""
-            if content_data:
-                seg_list.append({
-                    "type": message.message_type.value,
-                    "data": content_data,
-                })
-        else:
-            # 文本 / 混合消息
-            text = message.processed_plain_text or (
-                message.content if isinstance(message.content, str) else ""
-            )
-            if text:
-                seg_list.append({"type": "text", "data": text})
+        text = self._extract_outbound_text(message)
+        if text:
+            seg_list.append({"type": "text", "data": text})
 
         # 去重：对 seg_list 中已有的媒体段建 key 集合，避免主媒体重复追加
         media_seed = {
@@ -764,13 +733,13 @@ class MessageConverter:
         self,
         result: _ParseResult,
         *,
-        skip_image_emoji: bool = False,
+        skip_vlm_types: set[str] | None = None,
     ) -> _ParseResult:
         """使用 MediaManager 识别媒体内容（图片、表情包、语音、视频）并更新文本描述。
         
         Args:
             result: 解析结果
-            skip_image_emoji: 是否跳过图片/表情包的 VLM 识别
+            skip_vlm_types: 要跳过 VLM 文本识别的媒体类型
             
         Returns:
             更新后的解析结果
@@ -780,6 +749,7 @@ class MessageConverter:
             from src.core.managers.media_manager import get_media_manager
             
             manager = get_media_manager()
+            skip_vlm_types = skip_vlm_types or set()
             
             image_descriptions: list[str | None] = []
             emoji_descriptions: list[str | None] = []
@@ -791,7 +761,7 @@ class MessageConverter:
                 media_type = str(media.get("type", ""))
                 if media_type in ("image", "emoji"):
                     has_recognition_target = True
-                    if skip_image_emoji:
+                    if media_type in skip_vlm_types:
                         if media_type == "image":
                             image_descriptions.append(None)
                         else:
@@ -873,21 +843,30 @@ class MessageConverter:
         return result
     
     @staticmethod
-    def _should_skip_vlm_for_stream(stream_id: str) -> bool:
-        """检查指定聊天流是否已注册跳过 VLM 识别。
+    def _skip_vlm_media_types_for_stream(
+        stream_id: str,
+        media_types: set[str],
+    ) -> set[str]:
+        """返回指定聊天流已注册跳过 VLM 识别的媒体类型。
 
         Args:
             stream_id: 聊天流 ID
+            media_types: 待检查媒体类型
 
         Returns:
-            True 表示应跳过 VLM 识别
+            已注册跳过的媒体类型集合
         """
-        # 如果查询发生异常则安全起见返回 False
         try:
             from src.core.managers.media_manager import get_media_manager
-            return get_media_manager().should_skip_vlm(stream_id)
+
+            manager = get_media_manager()
+            return {
+                media_type
+                for media_type in media_types
+                if manager.should_skip_vlm(stream_id, media_type)
+            }
         except Exception:
-            return False
+            return set()
 
     @staticmethod
     def _build_content(result: _ParseResult, message_type: MessageType) -> str | Any:
