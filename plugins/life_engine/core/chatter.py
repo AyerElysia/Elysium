@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Annotated, Any, AsyncGenerator, Awaitable, Typ
 from src.core.components.types import ChatType
 from src.core.components.base.chatter import BaseChatter, Wait, Success, Failure, Stop
 from src.core.components.base.action import BaseAction
+from src.core.components.base.tool import BaseTool
 from src.core.models.message import Message, MessageType
 from src.kernel.llm import Audio, Content, Image, LLMPayload, ROLE, Text, ToolCall, ToolResult, Video
 from src.kernel.logger import get_logger, COLOR
@@ -50,7 +51,6 @@ _T = TypeVar("_T")
 _PASS_AND_WAIT = "action-life_pass_and_wait"
 _SEND_TEXT = "action-life_send_text"
 _SEND_FILE = "action-life_send_file"
-_INSPECT_MEDIA = "action-inspect_media"
 _SEND_EMOJI_MEME = "action-send_emoji_meme"
 _RECORD_INNER_MONOLOGUE = "action-record_inner_monologue"
 _SUSPEND_TEXT = "__SUSPEND__"
@@ -613,11 +613,11 @@ class _SelectedMedia:
     mime_type: str
 
 
-class LifeInspectMediaAction(BaseAction):
+class LifeInspectMediaTool(BaseTool):
     """按需启动媒体观察子代理（life_chatter 专用）。"""
 
-    action_name = "inspect_media"
-    action_description = (
+    tool_name = "inspect_media"
+    tool_description = (
         "按需观察用户发来的图片、表情包、视频或语音。"
         "当你需要真正看清某条媒体，而不是仅凭聊天文本猜测时使用。"
         "你可以用 focus 指明观察重点，例如“重点看视频里发生了什么”、"
@@ -2503,10 +2503,7 @@ class LifeChatter(BaseChatter):
                         rt.requires_inner_monologue = False
                         rt.inner_monologue_retry_count = 0
 
-                    if appended and (
-                        not executed_name.startswith("action-")
-                        or executed_name == _INSPECT_MEDIA
-                    ):
+                    if appended and not executed_name.startswith("action-"):
                         has_pending_tool_results = True
 
                 async def flush_parallel_calls() -> None:

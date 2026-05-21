@@ -4,22 +4,22 @@ from types import SimpleNamespace
 
 import pytest
 
-from plugins.life_engine.core.chatter import LifeInspectMediaAction
+from plugins.life_engine.core.chatter import LifeInspectMediaTool
 from plugins.life_engine.core.config import LifeEngineConfig
 from src.core.models.message import Message, MessageType
 
 
-def _make_action(messages: list[Message]) -> LifeInspectMediaAction:
-    action = LifeInspectMediaAction.__new__(LifeInspectMediaAction)
-    action.chat_stream = SimpleNamespace(
+def _make_tool(messages: list[Message]) -> LifeInspectMediaTool:
+    tool = LifeInspectMediaTool.__new__(LifeInspectMediaTool)
+    tool.chat_stream = SimpleNamespace(
         context=SimpleNamespace(
             unread_messages=messages,
             current_message=None,
             history_messages=[],
         )
     )
-    action.plugin = SimpleNamespace(config=LifeEngineConfig())
-    return action
+    tool.plugin = SimpleNamespace(config=LifeEngineConfig())
+    return tool
 
 
 def _message(
@@ -42,12 +42,12 @@ def _message(
 
 
 def test_selects_latest_unread_media() -> None:
-    action = _make_action([
+    tool = _make_tool([
         _message("m1", media=[{"type": "image", "data": "base64|QUJD"}]),
         _message("m2", media=[{"type": "video", "data": {"base64": "base64|REVG"}}]),
     ])
 
-    selected = action._select_media("latest", "auto")
+    selected = tool._select_media("latest", "auto")
 
     assert selected is not None
     assert selected.message.message_id == "m2"
@@ -56,12 +56,12 @@ def test_selects_latest_unread_media() -> None:
 
 
 def test_filters_by_media_type() -> None:
-    action = _make_action([
+    tool = _make_tool([
         _message("m1", media=[{"type": "image", "data": "base64|QUJD"}]),
         _message("m2", media=[{"type": "video", "data": {"base64": "base64|REVG"}}]),
     ])
 
-    selected = action._select_media("latest", "image")
+    selected = tool._select_media("latest", "image")
 
     assert selected is not None
     assert selected.message.message_id == "m1"
@@ -74,14 +74,20 @@ def test_model_capability_detection() -> None:
         "extra_params": {"capabilities": ["image", "video"]},
     }
 
-    assert LifeInspectMediaAction._model_supports_native_media(model, "image") is True
-    assert LifeInspectMediaAction._model_supports_native_media(model, "video") is True
-    assert LifeInspectMediaAction._model_supports_native_media(model, "audio") is False
+    assert LifeInspectMediaTool._model_supports_native_media(model, "image") is True
+    assert LifeInspectMediaTool._model_supports_native_media(model, "video") is True
+    assert LifeInspectMediaTool._model_supports_native_media(model, "audio") is False
+
+
+def test_inspect_media_is_registered_as_tool_schema() -> None:
+    schema = LifeInspectMediaTool.to_schema()
+
+    assert schema["function"]["name"] == "tool-inspect_media"
 
 
 @pytest.mark.asyncio
 async def test_execute_returns_plaintext_when_media_data_missing() -> None:
-    action = _make_action([
+    tool = _make_tool([
         _message(
             "m1",
             media=[{"type": "image"}],
@@ -89,9 +95,8 @@ async def test_execute_returns_plaintext_when_media_data_missing() -> None:
         )
     ])
 
-    success, result = await action.execute(focus="看图片内容")
+    success, result = await tool.execute(focus="看图片内容")
 
     assert success is True
     assert "原始媒体数据不在当前运行态" in result
     assert "[图片:一张粉色角色图]" in result
-

@@ -125,6 +125,14 @@ async def create_llm_usable_execution(
 
     if issubclass(usable_cls, BaseTool):
         instance = usable_cls(plugin=plugin)
+        setattr(instance, "stream_id", stream_id or "")
+        setattr(instance, "trigger_message", message)
+        if stream_id:
+            from src.core.managers.stream_manager import get_stream_manager
+
+            chat_stream = get_stream_manager()._streams.get(stream_id)
+            if chat_stream is not None:
+                setattr(instance, "chat_stream", chat_stream)
     elif issubclass(usable_cls, BaseAction):
         chat_stream = await _get_action_chat_stream(stream_id=stream_id, message=message)
         instance = usable_cls(chat_stream=chat_stream, plugin=plugin)
@@ -327,4 +335,3 @@ async def run_tool_call(
         )
 
     return [(True, item.exec_success) for item in prepared]
-

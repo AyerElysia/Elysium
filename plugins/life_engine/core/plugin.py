@@ -94,13 +94,13 @@ class LifeEnginePlugin(BasePlugin):
             *EVENT_GREP_TOOLS,
         ]
 
-        # 启用 LifeChatter 时注册对话器及其专用 Action
+        # 启用 LifeChatter 时注册对话器及其专用 Action / Tool
         if isinstance(self.config, LifeEngineConfig) and getattr(
             getattr(self.config, "chatter", None), "enabled", False
         ):
             from .chatter import (
                 LifeChatter,
-                LifeInspectMediaAction,
+                LifeInspectMediaTool,
                 LifePassAndWaitAction,
                 LifeSendFileAction,
                 LifeSendTextAction,
@@ -110,7 +110,7 @@ class LifeEnginePlugin(BasePlugin):
                 LifeChatter,
                 LifeSendTextAction,
                 LifeSendFileAction,
-                LifeInspectMediaAction,
+                LifeInspectMediaTool,
                 LifePassAndWaitAction,
                 LifeThinkAction,
                 LifeRecordInnerMonologueAction,
