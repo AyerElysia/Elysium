@@ -2672,7 +2672,7 @@ class LifeChatter(BaseChatter):
                     llm_response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
 
                 self._transition(rt, _Phase.WAIT_USER, "tool exec done")
-                continue
+                return Wait()
 
     async def execute(self) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:
         """执行聊天器的主要逻辑。

@@ -342,20 +342,15 @@ async def run_chat_stream(
                     logger.error(f"[驱动器] stream={stream_id[:8]}, 执行 Chatter 出错: {e}")
                     manager._chatter_genes.pop(stream_id, None)
                     manager._stats["total_failures"] += 1
-                    # LLM 上下文损坏时（如重复 ToolResult.call_id），_GLOBAL_RUNTIME 须
-                    # 一并清除，否则下一 tick 会复用相同的坏上下文，导致无限重试循环。
+                    # 当执行出错时（例如 TimeoutError 或 LLMContextError 导致生成器销毁），
+                    # 必须重置 life_chatter 全局运行态，避免残余的坏状态在下一轮被复用。
                     try:
-                        from src.kernel.llm.exceptions import LLMContextError
-                        if isinstance(e, LLMContextError):
-                            try:
-                                from plugins.life_engine.core.chatter import LifeChatter
-                                LifeChatter.reset_global_runtime()
-                                logger.warning(
-                                    f"[驱动器] stream={stream_id[:8]}, "
-                                    "LLMContextError 已重置 _GLOBAL_RUNTIME，下轮将从头重建"
-                                )
-                            except Exception:
-                                pass
+                        from plugins.life_engine.core.chatter import LifeChatter
+                        LifeChatter.reset_global_runtime()
+                        logger.warning(
+                            f"[驱动器] stream={stream_id[:8]}, "
+                            f"执行出错 ({type(e).__name__})，已重置 _GLOBAL_RUNTIME，下轮将从头重建"
+                        )
                     except Exception:
                         pass
                 finally:
