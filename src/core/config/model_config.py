@@ -261,6 +261,10 @@ class ModelTasksSection(SectionBase):
         default_factory=lambda: TaskConfigSection(model_list=["qwen2.5-vl-72b"]),
         description="视频分析模型配置",
     )
+    media_observer: TaskConfigSection = Field(
+        default_factory=lambda: TaskConfigSection(model_list=["qwen2.5-vl-72b"], max_tokens=800, temperature=0.2),
+        description="life_chatter 按需观察图片/视频/语音的专用子代理模型配置",
+    )
     live: TaskConfigSection = Field(
         default_factory=lambda: TaskConfigSection(model_list=["siliconflow-deepseek-ai/DeepSeek-V3.2"]),
         description="实时 live 通话任务配置，用于外部 live server 或后续 Neo 侧 realtime adapter",

@@ -74,7 +74,7 @@ def test_attention_router_summarizes_low_salience_flood() -> None:
     rendered = "\n".join(event.content for event in window.events)
 
     assert window.high_water == 101
-    assert window.dropped_count > 0
-    assert len(window.events) <= 10
-    assert "潜意识已压缩低显著事件" in rendered
+    assert window.dropped_count == 0
+    assert len(window.events) == 101
+    assert "潜意识已压缩低显著事件" not in rendered
     assert "Ayer 直接问你一个重要问题" in rendered

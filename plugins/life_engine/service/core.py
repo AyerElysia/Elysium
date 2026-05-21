@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import traceback
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -21,6 +21,7 @@ from src.core.components.utils import should_strip_auto_reason_argument
 from src.core.models.message import Message
 from src.kernel.concurrency import get_task_manager
 from src.kernel.llm import LLMPayload, ROLE, Text, ToolRegistry, ToolResult
+from src.kernel.scheduler import get_unified_scheduler, TriggerType
 
 if TYPE_CHECKING:
     from ..dream.scheduler import DreamScheduler
@@ -92,6 +93,31 @@ _SELF_PAUSE_MINUTES_MIN = 5
 _SELF_PAUSE_MINUTES_MAX = 480
 
 
+@dataclass
+class PendingFollowup:
+    """等待中的延迟续话任务。"""
+
+    topic: str
+    thought: str
+    followup_type: str
+    delay_seconds: float
+    scheduled_at: datetime
+    check_at: datetime
+    source: str = "post_reply"
+
+
+@dataclass
+class FollowupState:
+    stream_id: str
+    pending_followup: PendingFollowup | None = None
+    followup_chain_count: int = 0
+    followup_cooldown_until: datetime | None = None
+    next_check_time: datetime | None = None
+    is_waiting: bool = False
+    scheduler_task_name: str | None = None
+    active_check_kind: str | None = None
+
+
 class LifeEngineService(BaseService):
     """life_engine 心跳服务。
 
@@ -154,6 +180,8 @@ class LifeEngineService(BaseService):
         self._attention_router: AttentionRouter | None = None
         self._legacy_config_warning_emitted: bool = False
         self._last_memory_maintenance_prompt_at: str | None = None
+        self._followup_states: dict[str, FollowupState] = {}
+        self._scheduler = None
 
     @property
     def memory_service(self) -> LifeMemoryService | None:
@@ -898,6 +926,21 @@ class LifeEngineService(BaseService):
             if direction == "received":
                 self._state.last_external_message_at = event.timestamp
                 unlocked_self_pause = self._clear_self_pause_state()
+
+                # 收到外界新消息时，重置并清除对应流的延迟续话状态
+                stream_id = getattr(message, "stream_id", "")
+                if stream_id and stream_id in self._followup_states:
+                    state = self._followup_states[stream_id]
+                    state.followup_chain_count = 0
+                    state.followup_cooldown_until = None
+                    if state.scheduler_task_name and self._scheduler:
+                        try:
+                            await self._scheduler.cancel_schedule(state.scheduler_task_name)
+                        except Exception:
+                            pass
+                    state.pending_followup = None
+                    state.is_waiting = False
+                    state.active_check_kind = None
         await self._publish_raw_events([event])
         await self._save_runtime_context()
         if unlocked_self_pause:
@@ -922,6 +965,200 @@ class LifeEngineService(BaseService):
             direction=direction,
             pending_message_count=self._state.pending_event_count,
         )
+
+    def get_or_create_followup_state(self, stream_id: str) -> FollowupState:
+        if stream_id not in self._followup_states:
+            self._followup_states[stream_id] = FollowupState(stream_id=stream_id)
+        return self._followup_states[stream_id]
+
+    async def schedule_followup_for_stream(
+        self,
+        chat_stream: Any,
+        *,
+        delay_seconds: float,
+        thought: str,
+        topic: str,
+        followup_type: str,
+        source: str,
+    ) -> tuple[bool, str]:
+        """为某个聊天流登记一次延迟续话。"""
+        stream_id = getattr(chat_stream, "stream_id", "")
+        if not stream_id:
+            return False, "缺少 stream_id"
+
+        state = self.get_or_create_followup_state(stream_id)
+
+        # 检查冷却
+        if state.followup_cooldown_until and datetime.now() < state.followup_cooldown_until:
+            return False, "当前仍处于延迟续话冷却期"
+
+        # 延迟续话链已达上限
+        max_chain = 2
+        if state.followup_chain_count >= max_chain:
+            return False, "延迟续话链已达上限"
+
+        min_delay = 20.0
+        max_delay = 90.0
+        delay_seconds = max(float(delay_seconds or 0), min_delay)
+        delay_seconds = min(delay_seconds, max_delay)
+
+        next_check_time = datetime.now() + timedelta(seconds=delay_seconds)
+
+        followup = PendingFollowup(
+            topic=str(topic or "未命名话题").strip() or "未命名话题",
+            thought=str(thought or "").strip(),
+            followup_type=str(followup_type or "share_new_thought").strip() or "share_new_thought",
+            delay_seconds=delay_seconds,
+            scheduled_at=datetime.now(),
+            check_at=next_check_time,
+            source=source,
+        )
+
+        state.pending_followup = followup
+        state.next_check_time = next_check_time
+        state.is_waiting = True
+        state.active_check_kind = "followup"
+
+        task_name = f"life_followup_check_{stream_id}"
+        state.scheduler_task_name = task_name
+
+        if self._scheduler is None:
+            self._scheduler = get_unified_scheduler()
+
+        async def _timeout_callback() -> None:
+            await self._on_followup_timeout(stream_id)
+
+        try:
+            await self._scheduler.create_schedule(
+                callback=_timeout_callback,
+                trigger_type=TriggerType.TIME,
+                trigger_config={"trigger_at": next_check_time},
+                task_name=task_name,
+                force_overwrite=True,
+            )
+            logger.info(f"[{stream_id[:8]}] 已登记延迟续话，会在 {delay_seconds:.0f} 秒后重新判断。")
+            return True, f"已登记一条延迟续话，会在 {delay_seconds:.0f} 秒后重新判断。"
+        except Exception as e:
+            logger.error(f"调度续话检查任务失败：{e}")
+            return False, f"调度续话检查任务失败：{e}"
+
+    async def _on_followup_timeout(self, stream_id: str) -> None:
+        """延迟续话到点后执行判断。"""
+        state = self._followup_states.get(stream_id)
+        if (
+            state is None
+            or not state.is_waiting
+            or state.active_check_kind != "followup"
+            or state.pending_followup is None
+        ):
+            logger.debug(f"[{stream_id[:8]}] 跳过过期的延迟续话任务")
+            return
+
+        followup = state.pending_followup
+        state.pending_followup = None
+        state.is_waiting = False
+        state.active_check_kind = None
+
+        try:
+            from src.app.plugin_system.api.stream_api import get_stream
+            from src.core.managers.stream_manager import get_stream_manager
+
+            chat_stream = await get_stream(stream_id)
+            if chat_stream is None:
+                chat_stream = get_stream_manager()._streams.get(stream_id)
+            if chat_stream is None:
+                logger.warning(f"[{stream_id[:8]}] 延迟续话未找到 chat_stream")
+                return
+
+            max_chain = 2
+            if state.followup_chain_count >= max_chain:
+                logger.info(f"[{stream_id[:8]}] 延迟续话链已达上限，结束本轮续话")
+                state.followup_cooldown_until = datetime.now() + timedelta(minutes=10)
+                state.followup_chain_count = 0
+                return
+
+            state.followup_chain_count += 1
+            await self._wake_stream_for_followup(chat_stream, followup)
+        except Exception as exc:
+            logger.error(f"[{stream_id[:8]}] 延迟续话处理失败：{exc}", exc_info=True)
+            state.followup_cooldown_until = datetime.now() + timedelta(minutes=10)
+            state.followup_chain_count = 0
+
+    async def _wake_stream_for_followup(self, chat_stream: Any, followup: PendingFollowup) -> None:
+        """向目标流注入一条续话机会触发消息，并唤醒当前运行模式。"""
+        from src.core.models.message import Message
+        from src.core.transport.distribution.stream_loop_manager import get_stream_loop_manager
+        import time
+        import uuid
+
+        stream_id = chat_stream.stream_id
+        context = chat_stream.context
+        target_user_id, target_user_name = self._resolve_followup_target(chat_stream)
+
+        # 从聊天历史提取最近一次 bot 消息
+        history = list(getattr(chat_stream.context, "history_messages", []) or [])
+        last_bot_message = ""
+        for msg in reversed(history):
+            if str(getattr(msg, "sender_role", "") or "").lower() == "bot":
+                last_bot_message = str(getattr(msg, "content", "") or "")
+                break
+
+        elapsed_seconds = followup.delay_seconds
+
+        prompt = (
+            "[延迟续话机会] 这不是用户的新消息，而是一次由系统交给你的主动续话机会。"
+            "你必须先调用 action-record_inner_monologue，记录你此刻新的心理推进；"
+            "然后再二选一：如果你觉得刚才的话头还值得延续，就像平时一样使用当前对话器的动作自己回复；"
+            "如果觉得现在不该继续说，可以 pass_and_wait。"
+            f"\n- 当前执行者：{chat_stream.bot_nickname or '你'}"
+            f"\n- 距离你上一条显式消息已过去约 {elapsed_seconds:.0f} 秒"
+            f"\n- 你刚刚对对方说的是：{last_bot_message or '（上一条消息为空）'}"
+            f"\n- 你当时留下的未尽之意：{followup.thought or '（未填写）'}"
+            f"\n- 续话主题：{followup.topic}"
+            f"\n- 续话类型：{followup.followup_type}"
+            "\n- 重要：不要机械续话，不要为了说而说；如果不自然，就先停住。"
+        )
+
+        trigger_message = Message(
+            message_id=f"proactive_followup_{uuid.uuid4().hex[:12]}",
+            platform=chat_stream.platform or "unknown",
+            stream_id=stream_id,
+            sender_id=target_user_id or "system",
+            sender_name="系统（续话触发）",
+            sender_role="other",
+            content=prompt,
+            processed_plain_text=prompt,
+            time=time.time(),
+            target_user_id=target_user_id,
+            target_user_name=target_user_name,
+            is_proactive_followup_trigger=True,
+            proactive_followup_topic=followup.topic,
+            proactive_followup_type=followup.followup_type,
+        )
+        context.add_unread_message(trigger_message)
+        loop_mgr = get_stream_loop_manager()
+        removed = loop_mgr._wait_states.pop(stream_id, None)
+        if removed:
+            logger.debug(f"[{stream_id[:8]}] 已清除等待锁，准备让对话器处理续话机会")
+        logger.info(
+            f"[{stream_id[:8]}] 已注入续话机会触发消息：topic={followup.topic}, type={followup.followup_type}"
+        )
+
+    @staticmethod
+    def _resolve_followup_target(chat_stream: Any) -> tuple[str, str]:
+        """从当前流上下文推断续话对象。"""
+        bot_id = str(getattr(chat_stream, "bot_id", "") or "")
+        history = list(getattr(chat_stream.context, "history_messages", []) or [])
+        for msg in reversed(history):
+            sender_id = str(getattr(msg, "sender_id", "") or "")
+            sender_role = str(getattr(msg, "sender_role", "") or "").lower()
+            if sender_role == "bot":
+                continue
+            if bot_id and sender_id == bot_id:
+                continue
+            if sender_id:
+                return sender_id, str(getattr(msg, "sender_name", "") or "")
+        return "", ""
 
     async def enqueue_dfc_message(
         self,

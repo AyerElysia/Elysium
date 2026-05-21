@@ -116,3 +116,50 @@ async def test_think_action_delegates_snapshot_to_life_service(monkeypatch: pyte
             "expected_response": "她会觉得我还在认真听",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_schedule_followup_message_action_delegates_to_life_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    class _FakeService:
+        @classmethod
+        def get_instance(cls):
+            return cls()
+
+        async def schedule_followup_for_stream(self, chat_stream, **kwargs):
+            calls.append((chat_stream, kwargs))
+            return True, "Fake schedule registered"
+
+    monkeypatch.setattr(
+        "plugins.life_engine.service.core.LifeEngineService",
+        _FakeService,
+    )
+
+    from plugins.life_engine.core.compat_tools import LifeScheduleFollowupMessageAction
+
+    action = LifeScheduleFollowupMessageAction.__new__(LifeScheduleFollowupMessageAction)
+    fake_stream = SimpleNamespace(stream_id="stream-3")
+    action.chat_stream = fake_stream
+
+    ok, message = await action.execute(
+        delay_seconds=30.0,
+        thought="继续想一下",
+        topic="脑内思考",
+        followup_type="add_detail",
+    )
+
+    assert ok is True
+    assert "Fake schedule registered" in message
+    assert calls == [
+        (
+            fake_stream,
+            {
+                "delay_seconds": 30.0,
+                "thought": "继续想一下",
+                "topic": "脑内思考",
+                "followup_type": "add_detail",
+                "source": "life_engine",
+            },
+        )
+    ]

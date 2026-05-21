@@ -25,7 +25,7 @@ from ..constants import (
 
 
 # 默认工作空间路径
-_DEFAULT_WORKSPACE = str(Path(__file__).parent.parent.parent / "data" / "life_engine_workspace")
+_DEFAULT_WORKSPACE = str(Path(__file__).parent.parent.parent.parent / "data" / "life_engine_workspace")
 
 
 class LifeEngineConfig(BaseConfig):
@@ -82,6 +82,10 @@ class LifeEngineConfig(BaseConfig):
             "native_video",
             "native_audio",
             "max_images_per_payload",
+        },
+        "media_observer": {
+            "enabled",
+            "task_name",
         },
         "screen": {
             "enabled",
@@ -614,6 +618,44 @@ class LifeEngineConfig(BaseConfig):
             description="未知/不支持的音频格式（如 silk/amr）降级为该文本占位。",
         )
 
+    @config_section("media_observer")
+    class MediaObserverSection(SectionBase):
+        """life_chatter 按需观察图片/视频/语音的专用子代理配置。"""
+
+        enabled: bool = Field(
+            default=True,
+            description="是否启用 life_chatter 的按需媒体观察工具。",
+        )
+        task_name: str = Field(
+            default="media_observer",
+            description="媒体观察子代理使用的模型任务名。",
+        )
+        fallback_task_name: str = Field(
+            default="sub_actor",
+            description="原生媒体不可用时，用于整合文字观察结果的文本模型任务名。",
+        )
+        max_image_bytes: int = Field(
+            default=12 * 1024 * 1024,
+            ge=1,
+            description="单张图片/表情包允许传给原生观察模型的最大字节数。",
+        )
+        max_audio_bytes: int = Field(
+            default=30 * 1024 * 1024,
+            ge=1,
+            description="单段音频允许传给原生观察模型的最大字节数。",
+        )
+        max_video_bytes: int = Field(
+            default=200 * 1024 * 1024,
+            ge=1,
+            description="单个视频允许传给原生观察模型或降级摘要链路的最大字节数。",
+        )
+        fallback_video_frames: int = Field(
+            default=4,
+            ge=1,
+            le=12,
+            description="视频不走原生输入时，降级抽取的最大关键帧数量。",
+        )
+
     @config_section("screen")
     class ScreenSection(SectionBase):
         """电脑屏幕观察工具配置。"""
@@ -879,6 +921,7 @@ class LifeEngineConfig(BaseConfig):
     memory_algorithm: MemoryAlgorithmSection = Field(default_factory=MemoryAlgorithmSection)
     chatter: ChatterSection = Field(default_factory=ChatterSection)
     multimodal: MultimodalSection = Field(default_factory=MultimodalSection)
+    media_observer: MediaObserverSection = Field(default_factory=MediaObserverSection)
     screen: ScreenSection = Field(default_factory=ScreenSection)
     streams: StreamsSection = Field(default_factory=StreamsSection)
     runtime_sync: RuntimeSyncSection = Field(default_factory=RuntimeSyncSection)

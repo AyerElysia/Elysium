@@ -29,7 +29,7 @@ def _get_workspace(plugin: Any) -> Path:
     if isinstance(config, LifeEngineConfig):
         workspace = config.settings.workspace_path
     else:
-        workspace = str(Path(__file__).parent.parent.parent / "data" / "life_engine_workspace")
+        workspace = str(Path(__file__).parent.parent.parent.parent / "data" / "life_engine_workspace")
     path = Path(workspace).resolve()
     path.mkdir(parents=True, exist_ok=True)
     return path

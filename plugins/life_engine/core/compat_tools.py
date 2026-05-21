@@ -158,20 +158,18 @@ class LifeScheduleFollowupMessageAction(BaseAction):
             "续话类型，例如 add_detail / clarify / soft_emotion / share_new_thought。",
         ] = "share_new_thought",
     ) -> tuple[bool, str]:
-        life_plugin = get_plugin_manager().get_plugin("proactive_message_plugin")
-        if life_plugin is None:
-            return False, "proactive_message_plugin 未加载，无法登记延迟续话"
+        from plugins.life_engine.service.core import LifeEngineService
 
-        schedule = getattr(life_plugin, "schedule_followup_for_stream", None)
-        if not callable(schedule):
-            return False, "proactive_message_plugin 当前不可登记延迟续话"
+        service = LifeEngineService.get_instance()
+        if service is None:
+            return False, "life_engine 服务未就绪，无法登记延迟续话"
 
         chat_stream = getattr(self, "chat_stream", None)
         if chat_stream is None:
             return False, "缺少当前聊天流，无法登记延迟续话"
 
         try:
-            ok, message = await schedule(
+            ok, message = await service.schedule_followup_for_stream(
                 chat_stream,
                 delay_seconds=delay_seconds,
                 thought=thought,

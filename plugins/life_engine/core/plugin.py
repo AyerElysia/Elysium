@@ -100,6 +100,7 @@ class LifeEnginePlugin(BasePlugin):
         ):
             from .chatter import (
                 LifeChatter,
+                LifeInspectMediaAction,
                 LifePassAndWaitAction,
                 LifeSendFileAction,
                 LifeSendTextAction,
@@ -109,6 +110,7 @@ class LifeEnginePlugin(BasePlugin):
                 LifeChatter,
                 LifeSendTextAction,
                 LifeSendFileAction,
+                LifeInspectMediaAction,
                 LifePassAndWaitAction,
                 LifeThinkAction,
                 LifeRecordInnerMonologueAction,
