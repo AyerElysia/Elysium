@@ -12,7 +12,7 @@ from plugins.life_engine.service.core import LifeEngineService
 from plugins.life_engine.service.event_builder import EventType, LifeEngineEvent
 from plugins.life_engine.tools.exec_tools import LifeEngineBashTool
 from plugins.life_engine.tools.file_tools import LifeEngineRunAgentTool, LifeEngineWakeDFCTool
-from src.core.components.base.chatter import BaseChatter, Wait
+from src.core.components.base.chatter import BaseChatter, Success, Wait
 from src.core.models.message import Message
 from src.kernel.llm import LLMContextManager, LLMPayload, ROLE, Text
 import pytest
@@ -180,6 +180,62 @@ async def test_life_chatter_global_runtime_follow_up_stays_on_owner_stream(monke
     assert isinstance(result, Wait)
     assert rt.phase == _Phase.FOLLOW_UP
     assert rt.active_stream_id == "stream-a"
+
+    LifeChatter.reset_global_runtime()
+
+
+@pytest.mark.asyncio
+async def test_life_chatter_think_only_retry_yields_between_model_turns(monkeypatch) -> None:
+    """think-only 纠偏应跨 tick 继续，避免单个驱动器步进内连续 LLM 请求超时。"""
+
+    LifeChatter.reset_global_runtime()
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.payloads = []
+            self.call_list = [
+                SimpleNamespace(id="think-1", name="action-think", args={"thought": "先想想"})
+            ]
+            self.message = ""
+
+        def add_payload(self, payload) -> None:
+            self.payloads.append(payload)
+
+    response = FakeResponse()
+    rt = _WorkflowRuntime(
+        response=response,
+        phase=_Phase.TOOL_EXEC,
+        history_merged=True,
+        unreads=[],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[],
+        active_stream_id="stream-a",
+    )
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=None)
+    chatter.stream_id = "stream-a"
+
+    async def fake_fetch_unreads():
+        return [], []
+
+    async def fake_run_tool_call(*_args, **_kwargs):
+        return [(False, True)]
+
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+    monkeypatch.setattr(chatter, "run_tool_call", fake_run_tool_call)
+
+    result = await chatter._drive_global_runtime_until_yield(
+        SimpleNamespace(stream_id="stream-a"),
+        service=None,
+    )
+
+    assert isinstance(result, Success)
+    assert rt.phase == _Phase.FOLLOW_UP
+    assert rt.think_only_retry_count == 1
+    assert response.payloads
 
     LifeChatter.reset_global_runtime()
 

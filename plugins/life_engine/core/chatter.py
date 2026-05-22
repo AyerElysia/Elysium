@@ -2451,7 +2451,7 @@ class LifeChatter(BaseChatter):
                             )
                             if rt.plain_text_retry_count <= _MAX_PLAIN_TEXT_RETRIES:
                                 self._transition(rt, _Phase.FOLLOW_UP, "plain-text guard retry")
-                                continue
+                                return Success("plain-text guard retry scheduled")
                             logger.warning("纯文本回退达到重试上限，本轮回到等待")
                     else:
                         rt.plain_text_retry_count = 0
@@ -2623,7 +2623,7 @@ class LifeChatter(BaseChatter):
                             retry_count=rt.think_only_retry_count,
                         )
                         self._transition(rt, _Phase.FOLLOW_UP, "think-only guard retry")
-                        continue
+                        return Success("think-only guard retry scheduled")
                     logger.warning("连续仅调用 action-think，达到重试上限，本轮按 action-only 收敛等待")
                 else:
                     rt.think_only_retry_count = 0
@@ -2633,7 +2633,7 @@ class LifeChatter(BaseChatter):
                     self._append_inner_monologue_retry_instruction(llm_response)
                     if rt.inner_monologue_retry_count <= _MAX_INNER_MONOLOGUE_RETRIES:
                         self._transition(rt, _Phase.FOLLOW_UP, "inner monologue guard retry")
-                        continue
+                        return Success("inner monologue guard retry scheduled")
                     logger.warning("主动机会轮次未记录内心独白，达到重试上限，放弃继续强推")
                     rt.requires_inner_monologue = False
                     rt.inner_monologue_retry_count = 0
@@ -2643,7 +2643,7 @@ class LifeChatter(BaseChatter):
                     self._append_must_reply_retry_instruction(llm_response)
                     if rt.must_reply_retry_count <= _MAX_MUST_REPLY_RETRIES:
                         self._transition(rt, _Phase.FOLLOW_UP, "must-reply guard retry")
-                        continue
+                        return Success("must-reply guard retry scheduled")
                     logger.warning("应回复约束达到重试上限，本轮放弃强制回复以避免死循环")
                     rt.must_reply = False
                     rt.must_reply_retry_count = 0
@@ -2657,7 +2657,7 @@ class LifeChatter(BaseChatter):
                         self._transition(rt, _Phase.WAIT_USER, "max rounds reached")
                         continue
                     self._transition(rt, _Phase.FOLLOW_UP, "pending tool results")
-                    continue
+                    return Success("follow-up scheduled")
 
                 # pass_and_wait 只在工具链已闭合时结束本轮。
                 if should_wait:
