@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from types import SimpleNamespace
 
@@ -89,19 +90,29 @@ async def test_distributor_does_not_reset_message_buffer_skip_count(monkeypatch:
     """收到新消息时不应清零 skip_count，否则高压群聊会无限缓冲。"""
 
     # 准备 chat_stream/context 替身
-    context = SimpleNamespace(last_message_time=None, message_buffer_skip_count=2, stream_loop_task=None)
-    chat_stream = SimpleNamespace(stream_id="stream-001", context=context)
+    unread_messages = []
+    context = SimpleNamespace(
+        last_message_time=None,
+        message_buffer_skip_count=2,
+        stream_loop_task=None,
+        add_unread_message=lambda msg: unread_messages.append(msg),
+    )
+    chat_stream = SimpleNamespace(
+        stream_id="stream-001",
+        context=context,
+        update_active_time=lambda: None,
+    )
 
     # 伪造 StreamManager
     fake_sm = SimpleNamespace(
         get_or_create_stream=lambda **_kwargs: chat_stream,  # type: ignore[assignment]
-        add_message=lambda _msg: None,  # type: ignore[assignment]
+        add_message=lambda _msg, **_kwargs: None,  # type: ignore[assignment]
     )
 
     async def _async_get_or_create_stream(**_kwargs):
         return chat_stream
 
-    async def _async_add_message(_msg):
+    async def _async_add_message(_msg, **_kwargs):
         return None
 
     fake_sm.get_or_create_stream = _async_get_or_create_stream
@@ -139,3 +150,67 @@ async def test_distributor_does_not_reset_message_buffer_skip_count(monkeypatch:
     # 验证：skip_count 未被清零，但时间戳被更新
     assert context.message_buffer_skip_count == 2
     assert isinstance(context.last_message_time, float)
+    assert unread_messages == [message]
+
+
+@pytest.mark.asyncio
+async def test_distributor_starts_loop_before_slow_persistence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """入站消息应先进入未读队列并启动驱动器，慢持久化不能阻塞回复链路。"""
+
+    unread_messages = []
+    context = SimpleNamespace(
+        last_message_time=None,
+        message_buffer_skip_count=0,
+        stream_loop_task=None,
+        add_unread_message=lambda msg: unread_messages.append(msg),
+    )
+    chat_stream = SimpleNamespace(
+        stream_id="stream-001",
+        context=context,
+        update_active_time=lambda: None,
+    )
+    persist_started = asyncio.Event()
+    persist_release = asyncio.Event()
+
+    async def _async_get_or_create_stream(**_kwargs):
+        return chat_stream
+
+    async def _slow_add_message(_msg, **_kwargs):
+        persist_started.set()
+        await persist_release.wait()
+
+    fake_sm = SimpleNamespace(
+        get_or_create_stream=_async_get_or_create_stream,
+        add_message=_slow_add_message,
+    )
+
+    started_streams = []
+
+    async def _async_start_stream_loop(stream_id: str) -> None:
+        started_streams.append(stream_id)
+
+    fake_slm = SimpleNamespace(is_running=True, start_stream_loop=_async_start_stream_loop)
+
+    monkeypatch.setattr("src.core.managers.stream_manager.get_stream_manager", lambda: fake_sm)
+    monkeypatch.setattr(
+        "src.core.transport.distribution.stream_loop_manager.get_stream_loop_manager",
+        lambda: fake_slm,
+    )
+
+    message = SimpleNamespace(
+        content="",
+        platform="test",
+        stream_id="stream-001",
+        chat_type="group",
+        sender_id="u1",
+        sender_name="U",
+        sender_cardname="",
+        extra={"group_id": "g1", "group_name": "G"},
+    )
+
+    await _on_message_received("ON_MESSAGE_RECEIVED", {"message": message})
+
+    assert unread_messages == [message]
+    assert started_streams == ["stream-001"]
+    await asyncio.wait_for(persist_started.wait(), timeout=1.0)
+    persist_release.set()

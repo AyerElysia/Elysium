@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import cast
 
 from src.core.components.types import EventType
+from src.kernel.concurrency import get_task_manager
 from src.kernel.event import EventDecision, get_event_bus
 from src.kernel.logger import get_logger, COLOR
 from src.core.models.message import Message
@@ -91,8 +92,23 @@ async def _on_message_received(_: str, params: dict) -> tuple[EventDecision, dic
         stream_id = chat_stream.stream_id
         context = chat_stream.context
 
-        # 2. 持久化消息到数据库 + 更新未读消息
-        await sm.add_message(message)
+        # 2. 先写入内存未读队列并启动驱动器，再后台持久化。
+        # 事件总线单个处理器默认只有 5 秒超时；若把数据库写入放在前面，
+        # DB/冷启动稍慢就会导致消息只被旁路收集器看到，life_chatter 不会被唤醒。
+        context.add_unread_message(message)
+        chat_stream.update_active_time()
+
+        async def _persist_message() -> None:
+            try:
+                await sm.add_message(message, add_to_unread=False)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"后台持久化入站消息失败: {exc}", exc_info=True)
+
+        get_task_manager().create_task(
+            _persist_message(),
+            name=f"persist_inbound_message_{message.stream_id[:8]}",
+            daemon=True,
+        )
 
         # 3. 更新消息缓冲时间戳。
         # 注意：不要在“每次收到新消息”时重置 message_buffer_skip_count。

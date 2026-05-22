@@ -349,6 +349,8 @@ class StreamManager:
     async def add_message(
         self,
         message: "Message",
+        *,
+        add_to_unread: bool = True,
     ) -> "Messages":
         """添加消息到流。
 
@@ -394,7 +396,7 @@ class StreamManager:
 
             # 更新流实例内容
             chat_stream = self._streams.get(stream_id)
-            if chat_stream:
+            if chat_stream and add_to_unread:
                 chat_stream.context.add_unread_message(message)
                 chat_stream.update_active_time()
 
