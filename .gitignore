@@ -107,6 +107,10 @@ plugins/*
 !plugins/desktop_pet/**
 plugins/desktop_pet/**/__pycache__/
 plugins/desktop_pet/**/*.py[cod]
+!plugins/werewolf_game/
+!plugins/werewolf_game/**
+plugins/werewolf_game/**/__pycache__/
+plugins/werewolf_game/**/*.py[cod]
 !plugins/default_chatter/
 !plugins/napcat_adapter/
 !plugins/booku_memory/
