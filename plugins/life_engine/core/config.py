@@ -628,11 +628,11 @@ class LifeEngineConfig(BaseConfig):
         )
         task_name: str = Field(
             default="media_observer",
-            description="媒体观察子代理使用的模型任务名。",
+            description="兼容旧配置保留；当前 inspect_media 不再调用媒体观察子代理模型。",
         )
         fallback_task_name: str = Field(
             default="sub_actor",
-            description="原生媒体不可用时，用于整合文字观察结果的文本模型任务名。",
+            description="兼容旧配置保留；当前 inspect_media 不再调用降级整合模型。",
         )
         max_image_bytes: int = Field(
             default=12 * 1024 * 1024,

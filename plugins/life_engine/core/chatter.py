@@ -613,16 +613,29 @@ class _SelectedMedia:
     mime_type: str
 
 
+@dataclass(slots=True)
+class _PromotedNativeMedia:
+    """已由 life_chatter 主动请求提升为原生多模态输入的媒体。"""
+
+    selected: _SelectedMedia
+    focus: str
+    detail_level: str
+
+
+_PROMOTED_MEDIA_LOCK = threading.Lock()
+_PROMOTED_MEDIA_BY_STREAM: dict[str, deque[_PromotedNativeMedia]] = {}
+
+
 class LifeInspectMediaTool(BaseTool):
-    """按需启动媒体观察子代理（life_chatter 专用）。"""
+    """按需把媒体提升为 life_chatter 自己可见的原生多模态输入。"""
 
     tool_name = "inspect_media"
     tool_description = (
-        "按需观察用户发来的图片、表情包、视频或语音。"
-        "当你需要真正看清某条媒体，而不是仅凭聊天文本猜测时使用。"
-        "你可以用 focus 指明观察重点，例如“重点看视频里发生了什么”、"
-        "“看图片中的文字和人物表情”、“判断这段语音在表达什么情绪”。"
-        "工具只返回观察报告，不会直接发送给用户；收到结果后再决定是否回复。"
+        "按需把用户发来的图片、表情包、视频或语音提升为下一轮原生多模态输入。"
+        "默认情况下你只看到轻量文字摘要；当摘要不够、需要自己真正看清/听清媒体时使用。"
+        "你可以用 focus 指明观察重点，例如“看图片中的文字和人物表情”、"
+        "“重点看视频里发生了什么”、“判断这段语音在表达什么情绪”。"
+        "工具不会另起顾问，也不会直接回复用户；调用后你会在下一轮亲自收到原始媒体。"
     )
     chatter_allow: list[str] = ["life_chatter"]
 
@@ -674,33 +687,98 @@ class LifeInspectMediaTool(BaseTool):
                 f"上限 {self._format_size(max_bytes)}"
             )
 
-        model_set = self._get_model_set(
-            str(getattr(cfg, "task_name", "media_observer") if cfg is not None else "media_observer")
-        )
-        native_model_set = self._filter_native_capable_models(model_set, selected.kind)
-        if native_model_set:
-            native_result = await self._observe_with_native_model(
-                selected,
-                focus=focus_text,
-                detail_level=normalized_detail,
-                model_set=native_model_set,
-            )
-            if native_result:
-                return True, native_result
+        stream_id = self._resolve_stream_id(selected)
+        if not stream_id:
+            return False, "无法确定当前聊天流，不能提升媒体输入"
 
-        fallback_result = await self._observe_with_fallback(
-            selected,
+        promoted = _PromotedNativeMedia(
+            selected=selected,
             focus=focus_text,
             detail_level=normalized_detail,
-            cfg=cfg,
         )
-        if fallback_result:
-            return True, fallback_result
-        return False, "媒体观察失败：原生模型不可用，降级链路也没有得到有效结果"
+        try:
+            self._build_promoted_content(promoted)
+        except Exception as exc:
+            return False, f"媒体无法作为原生多模态输入：{exc}"
+
+        self._queue_promoted_media(stream_id, promoted)
+        return True, self._format_promoted_result(selected, focus_text, normalized_detail)
 
     def _get_cfg(self) -> Any:
         plugin_cfg = getattr(getattr(self, "plugin", None), "config", None)
         return getattr(plugin_cfg, "media_observer", None)
+
+    def _resolve_stream_id(self, selected: _SelectedMedia) -> str:
+        for value in (
+            getattr(self, "stream_id", ""),
+            getattr(getattr(self, "chat_stream", None), "stream_id", ""),
+            getattr(selected.message, "stream_id", ""),
+        ):
+            sid = str(value or "").strip()
+            if sid:
+                return sid
+        return ""
+
+    @staticmethod
+    def _queue_promoted_media(stream_id: str, promoted: _PromotedNativeMedia) -> None:
+        sid = str(stream_id or "").strip()
+        if not sid:
+            return
+        with _PROMOTED_MEDIA_LOCK:
+            queue = _PROMOTED_MEDIA_BY_STREAM.setdefault(sid, deque())
+            queue.append(promoted)
+
+    @staticmethod
+    def _consume_promoted_media(stream_id: str, *, max_items: int = 4) -> list[_PromotedNativeMedia]:
+        sid = str(stream_id or "").strip()
+        if not sid:
+            return []
+        with _PROMOTED_MEDIA_LOCK:
+            queue = _PROMOTED_MEDIA_BY_STREAM.get(sid)
+            if not queue:
+                return []
+            take_count = min(len(queue), max(1, int(max_items or 1)))
+            result = [queue.popleft() for _ in range(take_count)]
+            if not queue:
+                _PROMOTED_MEDIA_BY_STREAM.pop(sid, None)
+            return result
+
+    @classmethod
+    def _build_promoted_content(
+        cls,
+        promoted_items: _PromotedNativeMedia | list[_PromotedNativeMedia],
+    ) -> list[Content]:
+        items = promoted_items if isinstance(promoted_items, list) else [promoted_items]
+        content: list[Content] = [
+            Text(
+                "你刚刚调用了 tool-inspect_media。以下媒体已被提升为原生多模态输入，"
+                "请你自己直接观察，不要声称是子代理或顾问看的。"
+            )
+        ]
+        for promoted in items:
+            selected = promoted.selected
+            message_id = str(getattr(selected.message, "message_id", "") or "unknown")
+            sender = str(
+                getattr(selected.message, "sender_name", "")
+                or getattr(selected.message, "sender_id", "")
+                or "unknown"
+            )
+            content.append(
+                Text(
+                    f"观察对象：{selected.kind} / {selected.original_type or selected.kind}\n"
+                    f"消息ID：{message_id}\n"
+                    f"发送者：{sender}\n"
+                    f"关注点：{promoted.focus}\n"
+                    f"详细程度：{promoted.detail_level}"
+                )
+            )
+            if selected.kind == "video":
+                content.append(Video(selected.data_for_native, mime_type=selected.mime_type))
+            elif selected.kind == "audio":
+                content.append(Audio(selected.data_for_native, mime_type=selected.mime_type))
+            else:
+                content.append(Image(selected.data_for_native))
+        return content
 
     def _select_media(self, target: str, media_type: str) -> _SelectedMedia | None:
         expected_message_id = "" if target.lower() in {"", "latest", "recent"} else target
@@ -876,229 +954,20 @@ class LifeInspectMediaTool(BaseTool):
         return int(getattr(cfg, "max_image_bytes", 12 * 1024 * 1024) if cfg is not None else 12 * 1024 * 1024)
 
     @staticmethod
-    def _get_model_set(task_name: str) -> list[dict[str, Any]]:
-        try:
-            from src.app.plugin_system.api.llm_api import get_model_set_by_task
-
-            return list(get_model_set_by_task(task_name))
-        except Exception:
-            if task_name == "sub_actor":
-                return []
-            try:
-                from src.app.plugin_system.api.llm_api import get_model_set_by_task
-
-                return list(get_model_set_by_task("sub_actor"))
-            except Exception:
-                return []
-
-    @classmethod
-    def _filter_native_capable_models(
-        cls,
-        model_set: list[dict[str, Any]],
-        kind: str,
-    ) -> list[dict[str, Any]]:
-        return [model for model in model_set if cls._model_supports_native_media(model, kind)]
-
-    @staticmethod
-    def _model_supports_native_media(model: dict[str, Any], kind: str) -> bool:
-        extra = model.get("extra_params")
-        extra_params = extra if isinstance(extra, dict) else {}
-        capability_values: list[Any] = [
-            extra_params.get("capabilities"),
-            extra_params.get("modalities"),
-            extra_params.get("native_modalities"),
-            extra_params.get("supports_native_modalities"),
-        ]
-        normalized_caps: set[str] = set()
-        for value in capability_values:
-            if isinstance(value, str):
-                normalized_caps.update(item.strip().lower() for item in value.split(","))
-            elif isinstance(value, (list, tuple, set)):
-                normalized_caps.update(str(item).strip().lower() for item in value)
-
-        aliases = {
-            "image": {"image", "vision", "visual"},
-            "video": {"video"},
-            "audio": {"audio", "voice", "speech"},
-        }.get(kind, {kind})
-        if normalized_caps.intersection(aliases):
-            return True
-
-        keys = {
-            f"supports_native_{kind}",
-            f"supports_{kind}",
-            f"native_{kind}",
-        }
-        if kind == "image":
-            keys.update({"supports_vision", "vision"})
-        return any(bool(extra_params.get(key)) for key in keys)
-
-    async def _observe_with_native_model(
-        self,
+    def _format_promoted_result(
         selected: _SelectedMedia,
-        *,
         focus: str,
         detail_level: str,
-        model_set: list[dict[str, Any]],
-    ) -> str | None:
-        try:
-            from src.app.plugin_system.api.llm_api import create_llm_request
-            from src.kernel.llm import LLMContextManager
-
-            request = create_llm_request(
-                model_set=model_set,
-                request_name="life_chatter_media_observer",
-                context_manager=LLMContextManager(),
-            )
-            request.add_payload(LLMPayload(ROLE.SYSTEM, Text(self._system_prompt())))
-            content: list[Content] = [
-                Text(self._user_prompt(selected, focus=focus, detail_level=detail_level, native=True))
-            ]
-            if selected.kind == "video":
-                content.append(Video(selected.data_for_native, mime_type=selected.mime_type))
-            elif selected.kind == "audio":
-                content.append(Audio(selected.data_for_native, mime_type=selected.mime_type))
-            else:
-                content.append(Image(selected.data_for_native))
-
-            request.add_payload(LLMPayload(ROLE.USER, content))
-            response = await request.send(stream=False)
-            text = str(await response or "").strip()
-            if not text:
-                return None
-            return self._format_observation_result(selected, text, focus, mode="原生媒体观察")
-        except Exception as exc:
-            logger.debug(f"原生媒体观察失败: {exc}", exc_info=True)
-            return None
-
-    async def _observe_with_fallback(
-        self,
-        selected: _SelectedMedia,
-        *,
-        focus: str,
-        detail_level: str,
-        cfg: Any,
-    ) -> str | None:
-        try:
-            from src.core.managers.media_manager import get_media_manager
-
-            manager = get_media_manager()
-            if selected.kind == "video":
-                summary = await manager.recognize_video(
-                    selected.data,
-                    use_cache=True,
-                    max_frames=int(getattr(cfg, "fallback_video_frames", 4) if cfg is not None else 4),
-                )
-            elif selected.kind == "audio":
-                summary = await manager.recognize_voice(selected.data_for_native, use_cache=True)
-            else:
-                summary = await manager.recognize_media(selected.data_for_native, selected.original_type or "image", use_cache=True)
-        except Exception as exc:
-            logger.debug(f"媒体降级观察失败: {exc}", exc_info=True)
-            summary = None
-
-        if not summary:
-            plain_text = str(getattr(selected.message, "processed_plain_text", "") or "").strip()
-            summary = plain_text or None
-        if not summary:
-            return None
-
-        refined = await self._refine_fallback_summary(
-            selected,
-            raw_summary=str(summary),
-            focus=focus,
-            detail_level=detail_level,
-            cfg=cfg,
-        )
-        return refined or self._format_observation_result(selected, str(summary), focus, mode="降级媒体摘要")
-
-    async def _refine_fallback_summary(
-        self,
-        selected: _SelectedMedia,
-        *,
-        raw_summary: str,
-        focus: str,
-        detail_level: str,
-        cfg: Any,
-    ) -> str | None:
-        fallback_task = str(getattr(cfg, "fallback_task_name", "sub_actor") if cfg is not None else "sub_actor")
-        model_set = self._get_model_set(fallback_task)
-        if not model_set:
-            return None
-        try:
-            from src.app.plugin_system.api.llm_api import create_llm_request
-            from src.kernel.llm import LLMContextManager
-
-            request = create_llm_request(
-                model_set=model_set,
-                request_name="life_chatter_media_observer_fallback",
-                context_manager=LLMContextManager(),
-            )
-            request.add_payload(LLMPayload(ROLE.SYSTEM, Text(self._system_prompt())))
-            prompt = (
-                self._user_prompt(selected, focus=focus, detail_level=detail_level, native=False)
-                + "\n\n"
-                "降级链路得到的媒体描述如下。请只基于这些信息回答，不要编造：\n"
-                f"{raw_summary}"
-            )
-            request.add_payload(LLMPayload(ROLE.USER, Text(prompt)))
-            response = await request.send(stream=False)
-            text = str(await response or "").strip()
-            if not text:
-                return None
-            return self._format_observation_result(selected, text, focus, mode="降级媒体摘要")
-        except Exception as exc:
-            logger.debug(f"媒体降级摘要整合失败: {exc}", exc_info=True)
-            return None
-
-    @staticmethod
-    def _system_prompt() -> str:
-        return (
-            "你是 life_chatter 的媒体观察子代理。你的任务是替爱莉观察用户发来的图片、视频或语音，"
-            "并围绕主意识给出的关注点返回事实性报告。只报告看见/听见/能推断的内容；"
-            "不替爱莉回复用户，不做社交寒暄，不编造未观察到的信息。"
-        )
-
-    def _user_prompt(
-        self,
-        selected: _SelectedMedia,
-        *,
-        focus: str,
-        detail_level: str,
-        native: bool,
-    ) -> str:
-        msg = selected.message
-        sender = str(getattr(msg, "sender_name", "") or getattr(msg, "sender_id", "") or "unknown")
-        message_id = str(getattr(msg, "message_id", "") or "")
-        mode = "你会直接收到原始媒体。" if native else "你只能收到降级链路提供的文字描述。"
-        return (
-            f"观察对象：{selected.kind}（原始类型：{selected.original_type or selected.kind}）\n"
-            f"来源消息：{message_id or 'unknown'}，发送者：{sender}\n"
-            f"报告详细程度：{detail_level}\n"
-            f"主意识关注点：{focus}\n"
-            f"{mode}\n\n"
-            "请用中文返回：\n"
-            "1. 直接结论\n"
-            "2. 与关注点相关的具体证据\n"
-            "3. 不确定或看不清/听不清的地方"
-        )
-
-    @staticmethod
-    def _format_observation_result(
-        selected: _SelectedMedia,
-        observation: str,
-        focus: str,
-        *,
-        mode: str,
     ) -> str:
         message_id = str(getattr(selected.message, "message_id", "") or "")
         return (
-            f"【媒体观察报告】\n"
-            f"方式：{mode}\n"
+            f"【媒体已提升为原生输入】\n"
             f"对象：{selected.kind} / {selected.original_type or selected.kind}\n"
             f"消息ID：{message_id or 'unknown'}\n"
-            f"关注点：{focus}\n\n"
-            f"{observation.strip()}"
+            f"关注点：{focus}\n"
+            f"详细程度：{detail_level}\n\n"
+            "下一轮你会直接收到这条原始媒体。请基于自己看到/听到的内容继续判断，"
+            "不要把这条工具结果当作媒体内容本身。"
         )
 
     @staticmethod
@@ -1488,6 +1357,7 @@ class LifeChatter(BaseChatter):
             "- 不要只调用 `action-think`；如果本轮决定不回复，就直接用 `action-life_pass_and_wait`，不要调用 think。\n"
             "- 需要直接给用户发文字时，使用 `life_send_text`。\n"
             "- 需要发送本地文件时，使用 `life_send_file`；需要解释文件时另用 `life_send_text`。\n"
+            "- 收到图片/表情包/视频/语音时，默认先基于摘要判断；如果摘要不够，需要自己看清原始媒体，调用 `tool-inspect_media` 把它提升为下一轮原生多模态输入。\n"
             "- `content` 只能写给用户看的纯文本正文；长内容用 `\\n` 分隔分段发送。\n"
             "- 需要查看或操作电脑终端、执行脚本或处理文件系统时，调用 `nucleus_bash`。\n"
             "- 需要了解 Ayer 当前电脑屏幕时，调用 `nucleus_view_screen`，不要凭空猜屏幕内容。\n"
@@ -1853,6 +1723,15 @@ class LifeChatter(BaseChatter):
 
         payload_content = new_content[0] if len(new_content) == 1 else new_content
         response.add_payload(LLMPayload(ROLE.USER, payload_content))
+
+    @staticmethod
+    def _consume_promoted_media_content(stream_id: str) -> list[Content]:
+        """消费由 inspect_media 提升的原生媒体，供下一次模型轮直接观察。"""
+
+        promoted = LifeInspectMediaTool._consume_promoted_media(stream_id)
+        if not promoted:
+            return []
+        return LifeInspectMediaTool._build_promoted_content(promoted)
 
     def _compose_unread_user_content(
         self,
@@ -2387,6 +2266,9 @@ class LifeChatter(BaseChatter):
                         rt.response,
                         rt.pending_transient_context_text,
                     )
+                promoted_media_content = self._consume_promoted_media_content(stream_id)
+                if promoted_media_content:
+                    rt.response.add_payload(LLMPayload(ROLE.USER, promoted_media_content))
                 try:
                     async def _send_and_collect_response() -> Any:
                         response = await rt.response.send(stream=False)
