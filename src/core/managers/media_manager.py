@@ -18,10 +18,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import shutil
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from tempfile import TemporaryDirectory
 from pathlib import Path
@@ -46,6 +47,7 @@ logger = get_logger("media_manager")
 # 单例实例
 _media_manager: "MediaManager | None" = None
 _MAX_MEDIA_DATA_BYTES = 8 * 1024 * 1024
+_MAX_RECOGNITION_LOCKS = 1024
 _MAX_VIDEO_DATA_BYTES = 200 * 1024 * 1024
 _FAILURE_ALERT_WINDOW_SECONDS = 300.0
 _FAILURE_ALERT_THRESHOLD = 5
@@ -122,7 +124,7 @@ class MediaManager:
         self._skip_vlm_media_types_by_stream: dict[str, set[str]] = {}
         self._media_chain_stats = MediaChainStats()
         self._media_stats_lock = ThreadLock()
-        self._recognition_locks: dict[str, asyncio.Lock] = {}
+        self._recognition_locks: OrderedDict[str, asyncio.Lock] = OrderedDict()
         self._initialize_vlm()
         self._initialize_asr()
         self._register_prompts()
@@ -426,11 +428,15 @@ class MediaManager:
             return len(clean.encode("utf-8"))
 
     def _get_recognition_lock(self, media_hash: str) -> asyncio.Lock:
-        """获取指定媒体哈希的去重锁。"""
+        """获取指定媒体哈希的去重锁（LRU 淘汰，最多保留 _MAX_RECOGNITION_LOCKS 条）。"""
         lock = self._recognition_locks.get(media_hash)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._recognition_locks[media_hash] = lock
+        if lock is not None:
+            self._recognition_locks.move_to_end(media_hash)
+            return lock
+        lock = asyncio.Lock()
+        self._recognition_locks[media_hash] = lock
+        while len(self._recognition_locks) > _MAX_RECOGNITION_LOCKS:
+            self._recognition_locks.popitem(last=False)
         return lock
 
     def _extract_voice_payload(self, voice_data: str | dict[str, Any]) -> tuple[str, dict[str, Any]]:

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import zipfile
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -581,11 +582,11 @@ class PluginDependencyResolver:
                     in_degree[plugin_name] += 1
 
         # Kahn 算法拓扑排序
-        queue = [name for name, degree in in_degree.items() if degree == 0]
+        queue = deque(name for name, degree in in_degree.items() if degree == 0)
         load_order = []
 
         while queue:
-            current = queue.pop(0)
+            current = queue.popleft()
             load_order.append(current)
 
             for dependent in graph[current]:

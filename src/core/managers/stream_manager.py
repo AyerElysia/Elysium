@@ -835,9 +835,7 @@ class StreamManager:
         Returns:
             asyncio.Lock: 流的锁
         """
-        if stream_id not in self._stream_locks:
-            self._stream_locks[stream_id] = asyncio.Lock()
-        return self._stream_locks[stream_id]
+        return self._stream_locks.setdefault(stream_id, asyncio.Lock())
 
     async def _db_message_to_runtime(
         self,

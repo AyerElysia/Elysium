@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable
 from uuid import uuid4
 
 if TYPE_CHECKING:
@@ -26,9 +26,9 @@ from src.core.components.types import EventType
 logger = get_logger("event_manager")
 
 TemporaryEventHandler = Callable[
-    [str, Dict[str, Any]],
-    tuple[EventDecision, Dict[str, Any]]
-    | Awaitable[tuple[EventDecision, Dict[str, Any]]],
+    [str, dict[str, Any]],
+    tuple[EventDecision, dict[str, Any]]
+    | Awaitable[tuple[EventDecision, dict[str, Any]]],
 ]
 
 
@@ -59,12 +59,12 @@ class EventManager:
     def __init__(self) -> None:
         """初始化事件管理器。"""
         self._event_bus = get_event_bus()
-        self._handler_map: Dict[str, BaseEventHandler] = {}
-        self._handler_wrappers: Dict[str, List[Callable[[], None]]] = (
+        self._handler_map: dict[str, BaseEventHandler] = {}
+        self._handler_wrappers: dict[str, list[Callable[[], None]]] = (
             {}
         )  # signature -> unsubscribe functions
-        self._temporary_wrappers: Dict[str, List[Callable[[], None]]] = {}
-        self._temporary_handlers: Dict[str, TemporaryEventHandler] = {}
+        self._temporary_wrappers: dict[str, list[Callable[[], None]]] = {}
+        self._temporary_handlers: dict[str, TemporaryEventHandler] = {}
         self._lock = asyncio.Lock()
 
         logger.info("事件管理器初始化完成")
@@ -157,7 +157,7 @@ class EventManager:
             registry = get_global_registry()
 
             # 获取所有 EVENT_HANDLER 类型的组件
-            event_handler_classes: Dict[str, type[BaseEventHandler]] = (
+            event_handler_classes: dict[str, type[BaseEventHandler]] = (
                 registry.get_by_type(ComponentType.EVENT_HANDLER)
             )
 
@@ -238,7 +238,7 @@ class EventManager:
 
     async def create_temporary_handler(
         self,
-        event_names: List[EventType | str],
+        event_names: list[EventType | str],
         handle_func: TemporaryEventHandler,
         priority: int = 0,
     ) -> str:
@@ -310,12 +310,12 @@ class EventManager:
         self,
         temporary_id: str,
         handle_func: TemporaryEventHandler,
-    ) -> Callable[[str, Dict[str, Any]], Any]:
+    ) -> Callable[[str, dict[str, Any]], Any]:
         """为临时监听器创建自动清理包装。"""
 
         async def safe_execute(
-            event_name: str, params: Dict[str, Any]
-        ) -> tuple[EventDecision, Dict[str, Any]]:
+            event_name: str, params: dict[str, Any]
+        ) -> tuple[EventDecision, dict[str, Any]]:
             try:
                 result = handle_func(event_name, params)
                 if asyncio.iscoroutine(result) or isinstance(result, Awaitable):
@@ -337,7 +337,7 @@ class EventManager:
 
     def _make_safe_wrapper(
         self, handler: BaseEventHandler, signature: str
-    ) -> Callable[[str, Dict[str, Any]], Any]:
+    ) -> Callable[[str, dict[str, Any]], Any]:
         """为事件处理器创建异常防护包装，直接透传 EventBus 协议。
 
         handler.execute 与 EventBus 订阅者协议完全一致：接受 (event_name, params)
@@ -352,8 +352,8 @@ class EventManager:
         """
 
         async def safe_execute(
-            event_name: str, params: Dict[str, Any]
-        ) -> tuple[EventDecision, Dict[str, Any]]:
+            event_name: str, params: dict[str, Any]
+        ) -> tuple[EventDecision, dict[str, Any]]:
             try:
                 return await handler.execute(event_name, params)
             except Exception as e:
@@ -364,8 +364,8 @@ class EventManager:
         return safe_execute
 
     async def publish_event(
-        self, event: EventType | str, kwargs: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+        self, event: EventType | str, kwargs: dict[str, Any | None] = None
+    ) -> dict[str, Any]:
         """发布事件给订阅者。
 
         支持系统事件（EventType 枚举）和自定义事件（字符串）。
@@ -375,7 +375,7 @@ class EventManager:
             kwargs: 事件参数字典
 
         Returns:
-            Dict[str, Any]: 发布结果，包含最终决策和参数
+            dict[str, Any]: 发布结果，包含最终决策和参数
 
         Examples:
             >>> # 发布系统事件
@@ -436,14 +436,14 @@ class EventManager:
 
     def get_handlers_for_event(
         self, event: EventType | str
-    ) -> List[Tuple[BaseEventHandler, str]]:
+    ) -> list[tuple[BaseEventHandler, str]]:
         """获取指定事件的所有处理器。
 
         Args:
             event: 事件类型（EventType 枚举或字符串）
 
         Returns:
-            List[Tuple[BaseEventHandler, str]]: 处理器列表，包含处理器实例和签名
+            list[tuple[BaseEventHandler, str]]: 处理器列表，包含处理器实例和签名
 
         Examples:
             >>> handlers = manager.get_handlers_for_event(EventType.ON_MESSAGE_RECEIVED)
@@ -467,25 +467,25 @@ class EventManager:
         result.sort(key=lambda x: x[0].weight, reverse=True)
         return result
 
-    def get_handler(self, signature: str) -> Optional[BaseEventHandler]:
+    def get_handler(self, signature: str) -> BaseEventHandler | None:
         """获取指定签名的事件处理器。
 
         Args:
             signature: 处理器签名
 
         Returns:
-            Optional[BaseEventHandler]: 处理器实例，不存在返回 None
+            BaseEventHandler | None: 处理器实例，不存在返回 None
 
         Examples:
             >>> handler = manager.get_handler("my_plugin:event_handler:log")
         """
         return self._handler_map.get(signature)
 
-    def get_all_handlers(self) -> Dict[str, BaseEventHandler]:
+    def get_all_handlers(self) -> dict[str, BaseEventHandler]:
         """获取所有事件处理器。
 
         Returns:
-            Dict[str, BaseEventHandler]: 处理器映射表
+            dict[str, BaseEventHandler]: 处理器映射表
 
         Examples:
             >>> handlers = manager.get_all_handlers()
@@ -510,11 +510,11 @@ class EventManager:
 
         logger.debug("已清除所有事件处理器订阅")
 
-    def get_event_stats(self) -> Dict[str, int]:
+    def get_event_stats(self) -> dict[str, int]:
         """获取事件统计信息。
 
         Returns:
-            Dict[str, int]: 统计信息，包含处理器数量和事件类型数量
+            dict[str, int]: 统计信息，包含处理器数量和事件类型数量
 
         Examples:
             >>> stats = manager.get_event_stats()
@@ -530,7 +530,7 @@ class EventManager:
 
 
 # 全局单例
-_event_manager: Optional[EventManager] = None
+_event_manager: EventManager | None = None
 
 
 def get_event_manager() -> EventManager:
@@ -568,8 +568,8 @@ def initialize_event_manager() -> None:
 
 
 async def on_all_plugins_loaded(
-    _: str, params: Dict[str, Any]
-) -> Tuple[EventDecision, Dict[str, Any]]:
+    _: str, params: dict[str, Any]
+) -> tuple[EventDecision, dict[str, Any]]:
     """所有插件加载完毕后，构建事件订阅映射。
 
     Args:

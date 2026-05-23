@@ -6,6 +6,7 @@ Neo-MoFox 框架的核心协调器，负责系统初始化、插件加载和生�
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
@@ -171,7 +172,8 @@ class Bot:
         loop = asyncio.get_running_loop()
 
         # 默认线程池：承载 to_thread / run_in_executor(None, ...)
-        loop.set_default_executor(ThreadPoolExecutor(max_workers=192))
+        max_workers = min(32, (os.cpu_count() or 1) + 4)
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=max_workers))
 
         # DNS 专用线程池：避免 getaddrinfo 被通用任务挤占
         dns_executor = ThreadPoolExecutor(max_workers=16)
@@ -308,10 +310,8 @@ class Bot:
         self.scheduler = get_unified_scheduler()
         self.ui.update_phase_status("调度器", "已初始化")
 
-        # Step 6: WatchDog
-        from src.kernel.concurrency import WatchDog
-
-        self.watchdog = WatchDog()
+        # Step 6: WatchDog（复用 Step 4 已启动的全局单例）
+        self.watchdog = get_watchdog()
         self.ui.update_phase_status("看门狗", "已初始化")
 
         # Step 7: Database
@@ -421,7 +421,7 @@ class Bot:
 
         self.ui.update_phase_status("LLM 预检", "已完成")
 
-    def _check_http_security(self, host: str, api_keys: list[str]) -> None:
+    async def _check_http_security(self, host: str, api_keys: list[str]) -> None:
         """检查 HTTP 服务器安全配置
 
         检测以下不安全的配置组合并发出警告：
@@ -481,7 +481,9 @@ class Bot:
             self.logger.warning("")
             self.logger.warning("=" * 80)
             self.logger.warning("")
-            input("输入回车来继续:")
+            await asyncio.get_running_loop().run_in_executor(
+                None, input, "输入回车来继续:"
+            )
 
             # 同时在 UI 中显示警告状态
             self.ui.update_phase_status("HTTP服务器", "⚠️ 不安全配置")
@@ -533,7 +535,7 @@ class Bot:
             api_keys = self.config.http_router.api_keys
             
             # 安全检查：检测对外开放且无有效密钥的情况
-            self._check_http_security(host, api_keys)
+            await self._check_http_security(host, api_keys)
             
             self.http_server = get_http_server(host=host, port=port)
             await self.http_server.start()

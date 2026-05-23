@@ -595,61 +595,56 @@ class PluginManager:
         try:
             folder = Path(folder_path)
 
-            # 添加插件目录的父目录到 sys.path
+            # 添加插件目录的父目录到 sys.path（保留以支持插件延迟导入）
             parent_dir = str(folder.parent)
             sys.path.insert(0, parent_dir)
 
+            entry_point = folder / manifest.entry_point
+            if not entry_point.exists():
+                logger.error(f"入口点不存在: {manifest.entry_point}")
+                return None
+
+            # 构建包名（使用插件文件夹名作为包名）
+            package_name = folder.name
+
+            # 计算入口点相对于插件文件夹的模块路径
             try:
-                entry_point = folder / manifest.entry_point
-                if not entry_point.exists():
-                    logger.error(f"入口点不存在: {manifest.entry_point}")
-                    return None
-
-                # 构建包名（使用插件文件夹名作为包名）
-                package_name = folder.name
-
-                # 计算入口点相对于插件文件夹的模块路径
-                try:
-                    entry_relative = entry_point.relative_to(folder)
-                    # 将路径转换为模块名 (例如: plugin.py -> plugin, src/main.py -> src.main)
-                    module_parts = list(entry_relative.parts[:-1]) + [
-                        entry_relative.stem
-                    ]
-                    module_name = (
-                        f"{package_name}.{'.'.join(module_parts)}"
-                        if module_parts[0] != entry_relative.stem
-                        else package_name + "." + entry_relative.stem
-                    )
-                except ValueError:
-                    logger.error(f"入口点不在插件文件夹内: {entry_point}")
-                    return None
-
-                # 使用 spec_from_file_location 并设置正确的包信息
-                spec = importlib.util.spec_from_file_location(
-                    module_name,
-                    str(entry_point),
-                    submodule_search_locations=[str(folder)],
+                entry_relative = entry_point.relative_to(folder)
+                # 将路径转换为模块名 (例如: plugin.py -> plugin, src/main.py -> src.main)
+                module_parts = list(entry_relative.parts[:-1]) + [
+                    entry_relative.stem
+                ]
+                module_name = (
+                    f"{package_name}.{'.'.join(module_parts)}"
+                    if module_parts[0] != entry_relative.stem
+                    else package_name + "." + entry_relative.stem
                 )
-                if spec is None or spec.loader is None:
-                    logger.error(f"无法创建模块规范: {entry_point}")
-                    return None
+            except ValueError:
+                logger.error(f"入口点不在插件文件夹内: {entry_point}")
+                return None
 
-                module = importlib.util.module_from_spec(spec)
+            # 使用 spec_from_file_location 并设置正确的包信息
+            spec = importlib.util.spec_from_file_location(
+                module_name,
+                str(entry_point),
+                submodule_search_locations=[str(folder)],
+            )
+            if spec is None or spec.loader is None:
+                logger.error(f"无法创建模块规范: {entry_point}")
+                return None
 
-                # 设置 __package__ 以支持相对导入
-                if "." in module_name:
-                    module.__package__ = module_name.rsplit(".", 1)[0]
-                else:
-                    module.__package__ = package_name
+            module = importlib.util.module_from_spec(spec)
 
-                sys.modules[module_name] = module
-                spec.loader.exec_module(module)
+            # 设置 __package__ 以支持相对导入
+            if "." in module_name:
+                module.__package__ = module_name.rsplit(".", 1)[0]
+            else:
+                module.__package__ = package_name
 
-                return module
-            finally:
-                # 从 sys.path 移除
-                if parent_dir in sys.path:
-                    sys.path.remove(parent_dir)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+
+            return module
 
         except Exception as e:
             logger.error(f"从文件夹加载插件模块失败 ({folder_path}): {e}")
