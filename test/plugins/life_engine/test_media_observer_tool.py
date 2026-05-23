@@ -7,7 +7,7 @@ import pytest
 from plugins.life_engine.core.chatter import LifeChatter, LifeInspectMediaTool
 from plugins.life_engine.core.config import LifeEngineConfig
 from src.core.models.message import Message, MessageType
-from src.kernel.llm import Image, Text
+from src.kernel.llm import Image, LLMPayload, ROLE, Text, ToolResult
 
 
 def _make_tool(messages: list[Message]) -> LifeInspectMediaTool:
@@ -110,3 +110,31 @@ async def test_execute_promotes_media_for_next_native_turn() -> None:
     assert any(isinstance(part, Text) and "看图中文字" in part.text for part in content)
     assert any(isinstance(part, Image) for part in content)
     assert LifeChatter._consume_promoted_media_content("stream-1") == []
+
+
+@pytest.mark.asyncio
+async def test_promoted_media_after_tool_result_gets_assistant_bridge() -> None:
+    LifeInspectMediaTool._consume_promoted_media("stream-1")
+    tool = _make_tool(
+        [_message("m1", media=[{"type": "image", "data": "base64|QUJD"}])]
+    )
+    await tool.execute(focus="确认是否能直接看图")
+
+    response = SimpleNamespace(payloads=[])
+    response.add_payload = lambda payload: response.payloads.append(payload)
+    response.add_payload(
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            ToolResult(value="ok", call_id="call-1", name="tool-inspect_media"),
+        )
+    )
+
+    appended = LifeChatter._append_promoted_media_payload(response, "stream-1")
+
+    assert appended is True
+    assert [payload.role for payload in response.payloads] == [
+        ROLE.TOOL_RESULT,
+        ROLE.ASSISTANT,
+        ROLE.USER,
+    ]
+    assert any(isinstance(part, Image) for part in response.payloads[-1].content)

@@ -1733,6 +1733,18 @@ class LifeChatter(BaseChatter):
             return []
         return LifeInspectMediaTool._build_promoted_content(promoted)
 
+    @staticmethod
+    def _append_promoted_media_payload(response: Any, stream_id: str) -> bool:
+        """把已提升媒体追加为 USER payload，并补齐 TOOL_RESULT 后的 assistant 承接。"""
+
+        promoted_media_content = LifeChatter._consume_promoted_media_content(stream_id)
+        if not promoted_media_content:
+            return False
+        if LifeChatter._has_tool_result_tail(response):
+            response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
+        response.add_payload(LLMPayload(ROLE.USER, promoted_media_content))
+        return True
+
     def _compose_unread_user_content(
         self,
         rt: "_WorkflowRuntime",
@@ -2266,9 +2278,7 @@ class LifeChatter(BaseChatter):
                         rt.response,
                         rt.pending_transient_context_text,
                     )
-                promoted_media_content = self._consume_promoted_media_content(stream_id)
-                if promoted_media_content:
-                    rt.response.add_payload(LLMPayload(ROLE.USER, promoted_media_content))
+                self._append_promoted_media_payload(rt.response, stream_id)
                 try:
                     async def _send_and_collect_response() -> Any:
                         response = await rt.response.send(stream=False)
