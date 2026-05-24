@@ -40,7 +40,7 @@ from src.kernel.concurrency import get_task_manager
 from src.kernel.scheduler import get_unified_scheduler, TriggerType
 from src.kernel.db.core.session import get_db_session
 from src.core.models.sql_alchemy import Images, ImageDescriptions
-from src.kernel.llm import LLMContextManager, LLMPayload, ROLE, Text, Image
+from src.kernel.llm import LLMContextManager, LLMPayload, ROLE, Text, Image, Audio
 
 logger = get_logger("media_manager")
 
@@ -118,6 +118,7 @@ class MediaManager:
         self._vlm_model_set = None
         self._voice_model_set = None
         self._video_model_set = None
+        self._audio_understanding_model_set = None
         self._vlm_available = False
         self._voice_available = False
         self._skip_vlm_stream_ids: set[str] = set()  # 已注册跳过所有 VLM 识别的聊天流 ID
@@ -140,6 +141,15 @@ class MediaManager:
             self._voice_model_set = get_model_set_by_task("voice")
             self._voice_available = self._voice_model_set is not None
             self._video_model_set = get_model_set_by_task("video")
+            self._audio_understanding_model_set = None
+            for task_name in ("audio_observer", "media_observer"):
+                try:
+                    self._audio_understanding_model_set = get_model_set_by_task(task_name)
+                    if self._audio_understanding_model_set:
+                        break
+                except ValueError:
+                    continue
+
             
             if self._vlm_available:
                 logger.info("VLM 模型已加载，媒体识别功能可用")
@@ -155,6 +165,11 @@ class MediaManager:
                 logger.info("视频摘要模型已加载（非原生视频，将走抽帧摘要链路）")
             else:
                 logger.info("未配置 video 任务模型，视频摘要将回退到关键帧描述拼接")
+
+            if self._audio_understanding_model_set:
+                logger.info("音频理解模型已加载，语音/音频摘要将优先走原生 Audio 链路")
+            else:
+                logger.info("未配置 audio_observer/media_observer 任务模型，语音摘要将回退到 ASR")
         except Exception as e:
             logger.error(f"初始化 VLM 模型失败: {e}")
 
@@ -453,6 +468,67 @@ class MediaManager:
 
         return "", {}
 
+    async def _resolve_voice_payload(self, voice_data: str | dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        """解析语音输入为 base64 数据。
+
+        支持适配器直接给 base64，也支持音频文件消息携带的本地路径或下载 URL。
+        """
+        base64_data, metadata = self._extract_voice_payload(voice_data)
+        if base64_data:
+            return base64_data, metadata
+
+        if not isinstance(voice_data, dict):
+            return "", metadata
+
+        for key in ("path", "file", "file_path", "local_path", "localPath", "temp_path"):
+            value = voice_data.get(key)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            path_value = value.strip()
+            if path_value.startswith("file://"):
+                path_value = path_value[7:]
+            try:
+                path = Path(path_value)
+                if path.exists() and path.is_file():
+                    raw = await asyncio.to_thread(path.read_bytes)
+                    return base64.b64encode(raw).decode("utf-8"), voice_data
+            except OSError:
+                continue
+
+        for key in ("url", "file_url", "download_url", "downloadUrl", "src"):
+            value = voice_data.get(key)
+            if not isinstance(value, str) or not value.startswith(("http://", "https://")):
+                continue
+            downloaded = await self._download_media_url_as_base64(value, max_bytes=_MAX_MEDIA_DATA_BYTES)
+            if downloaded:
+                return downloaded, voice_data
+
+        return "", voice_data
+
+    async def _download_media_url_as_base64(self, url: str, *, max_bytes: int) -> str | None:
+        """下载小型媒体 URL 并编码为 base64。"""
+        try:
+            import aiohttp
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=30.0)) as response:
+                    if response.status != 200:
+                        logger.warning(f"媒体下载失败: status={response.status}, url={url}")
+                        return None
+                    content_length = response.headers.get("content-length")
+                    if content_length and int(content_length) > max_bytes:
+                        logger.warning(f"媒体过大，跳过下载: bytes={content_length}, url={url}")
+                        return None
+                    raw = await response.read()
+        except Exception as e:
+            logger.warning(f"媒体下载失败: {e!s}")
+            return None
+
+        if len(raw) > max_bytes:
+            logger.warning(f"媒体过大，跳过处理: bytes={len(raw)}, url={url}")
+            return None
+        return base64.b64encode(raw).decode("utf-8")
+
     async def recognize_media(
         self, 
         base64_data: str, 
@@ -587,9 +663,12 @@ class MediaManager:
         voice_data: str | dict[str, Any],
         use_cache: bool = True,
     ) -> str | None:
-        """识别语音内容并返回转写文本。"""
+        """理解语音/音频内容并返回摘要文本。
+
+        优先使用原生 Audio 多模态模型理解音频；失败时才回退到 ASR 转写。
+        """
         try:
-            base64_data, metadata = self._extract_voice_payload(voice_data)
+            base64_data, metadata = await self._resolve_voice_payload(voice_data)
             if not base64_data:
                 return None
 
@@ -608,7 +687,7 @@ class MediaManager:
                     media_bytes=voice_bytes,
                 )
                 logger.warning(
-                    f"语音过大，跳过转写: bytes={voice_bytes}, hash={voice_hash[:8]}..."
+                    f"语音过大，跳过理解: bytes={voice_bytes}, hash={voice_hash[:8]}..."
                 )
                 return None
 
@@ -617,7 +696,7 @@ class MediaManager:
                 if use_cache:
                     cached_description = await self._get_cached_description(
                         voice_hash,
-                        "voice",
+                        "voice_understanding",
                     )
                     if cached_description:
                         await self._record_media_event(
@@ -632,19 +711,24 @@ class MediaManager:
                             event="success",
                             media_type="voice",
                         )
-                        logger.debug(f"从缓存获取 voice 转写: {voice_hash[:8]}...")
+                        logger.debug(f"从缓存获取 voice 理解摘要: {voice_hash[:8]}...")
                         return cached_description
                 await self._record_media_event(
                     event="cache_miss",
                     media_type="voice",
                 )
 
-                transcription = await self._recognize_with_asr(base64_data)
-                if not transcription:
+                summary = await self._recognize_with_audio_understanding(base64_data, metadata)
+                if not summary:
+                    summary = await self._recognize_with_asr(base64_data)
+                    if summary:
+                        summary = f"语音转写：{summary}"
+
+                if not summary:
                     await self._record_media_event(
                         event="failure",
                         media_type="voice",
-                        failure_type="asr_failed",
+                        failure_type="audio_understanding_failed",
                     )
                     return None
 
@@ -654,19 +738,19 @@ class MediaManager:
                 )
                 await self._save_description_cache(
                     voice_hash,
-                    "voice",
-                    transcription,
+                    "voice_understanding",
+                    summary,
                 )
                 await self.save_media_info(
                     media_hash=voice_hash,
                     media_type="voice",
                     file_path=str(metadata.get("filename") or f"voice:{voice_hash[:16]}"),
-                    description=transcription,
+                    description=summary,
                     vlm_processed=True,
                 )
-                return transcription
+                return summary
         except Exception as e:
-            logger.error(f"语音转写失败: {e}", exc_info=True)
+            logger.error(f"语音理解失败: {e}", exc_info=True)
             await self._record_media_event(
                 event="failure",
                 media_type="voice",
@@ -1015,6 +1099,82 @@ class MediaManager:
         except Exception as e:
             logger.error(f"ASR 请求失败: {e}", exc_info=True)
             return None
+
+    async def _recognize_with_audio_understanding(
+        self,
+        audio_base64: str,
+        metadata: dict[str, Any],
+    ) -> str | None:
+        """用原生音频多模态模型理解音频，不只做 ASR。"""
+        model_set = getattr(self, "_audio_understanding_model_set", None)
+        if not model_set:
+            return None
+
+        try:
+            from src.app.plugin_system.api.llm_api import create_llm_request
+
+            request = create_llm_request(
+                model_set,
+                "audio_understanding",
+                context_manager=LLMContextManager(),
+            )
+
+            filename = str(metadata.get("filename") or metadata.get("name") or "audio")
+            mime_type = self._guess_audio_mime(metadata)
+            prompt = (
+                "请直接听这段音频，生成一段中文理解摘要。不要只做逐字 ASR。\n"
+                "请覆盖：\n"
+                "1. 如果有人声，概括说了什么、语气和情绪；\n"
+                "2. 如果是音乐/环境声，概括旋律氛围、节奏、情绪、主要声音元素；\n"
+                "3. 说明它在当前聊天里可能传达的感觉；\n"
+                "4. 不确定的地方明确说不确定，不要编造。\n"
+                f"文件名：{filename}\n"
+                f"MIME：{mime_type}"
+            )
+            request.add_payload(
+                LLMPayload(
+                    ROLE.USER,
+                    [
+                        Text(prompt),
+                        Audio(audio_base64, mime_type=mime_type),
+                    ],
+                )
+            )
+            response = await request.send(stream=False)
+            await response
+
+            message = (response.message or "").strip()
+            if not message:
+                return None
+            return message[:800] if len(message) > 800 else message
+        except Exception as e:
+            logger.warning(f"原生音频理解失败，准备回退 ASR: {e}")
+            return None
+
+    @staticmethod
+    def _guess_audio_mime(metadata: dict[str, Any]) -> str:
+        raw = str(
+            metadata.get("mime_type")
+            or metadata.get("mime")
+            or metadata.get("format")
+            or ""
+        ).strip().lower()
+        if raw.startswith("audio/"):
+            return raw
+        filename = str(metadata.get("filename") or metadata.get("name") or "").lower()
+        suffix = Path(filename.split("?", 1)[0].split("#", 1)[0]).suffix
+        return {
+            ".mp3": "audio/mpeg",
+            ".wav": "audio/wav",
+            ".m4a": "audio/mp4",
+            ".aac": "audio/aac",
+            ".flac": "audio/flac",
+            ".ogg": "audio/ogg",
+            ".oga": "audio/ogg",
+            ".opus": "audio/ogg",
+            ".amr": "audio/amr",
+            ".silk": "audio/silk",
+        }.get(suffix, "audio/mpeg")
 
     async def _get_cached_description(
         self,

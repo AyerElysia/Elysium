@@ -897,10 +897,15 @@ class LifeInspectMediaTool(BaseTool):
 
     @staticmethod
     def _guess_mime_type(media: dict[str, Any], kind: str, original_type: str) -> str:
+        data = media.get("data")
+        nested: dict[str, Any] = data if isinstance(data, dict) else {}
         raw = str(
             media.get("mime")
             or media.get("mime_type")
+            or nested.get("mime")
+            or nested.get("mime_type")
             or media.get("format")
+            or nested.get("format")
             or ""
         ).strip().lower()
         if raw.startswith(("image/", "video/", "audio/")):

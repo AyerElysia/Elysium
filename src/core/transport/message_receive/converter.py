@@ -579,6 +579,22 @@ class MessageConverter:
                 "data": normalize_base64(data),
             })
             result.text_parts.append("[语音]")
+            return
+
+        if isinstance(data, dict):
+            normalized = dict(data)
+            for key in ("base64", "data", "audio_base64"):
+                value = normalized.get(key)
+                if isinstance(value, str) and value.strip():
+                    normalized[key] = normalize_base64(value)
+                    break
+            result.media.append({
+                "type": "voice",
+                "data": normalized,
+            })
+            filename = normalized.get("filename") or normalized.get("name")
+            result.text_parts.append(f"[语音文件:{filename}]" if filename else "[语音]")
+            return
 
     @staticmethod
     def _handle_video(data: Any, result: _ParseResult) -> None:
@@ -823,10 +839,16 @@ class MessageConverter:
                     description = emoji_descriptions[emoji_idx] if emoji_idx < len(emoji_descriptions) else None
                     emoji_idx += 1
                     new_text_parts.append(f"[表情包:{description}]" if description else part)
-                elif part == "[语音]":
+                elif part == "[语音]" or part.startswith("[语音文件:"):
                     description = voice_descriptions[voice_idx] if voice_idx < len(voice_descriptions) else None
                     voice_idx += 1
-                    new_text_parts.append(f"[语音:{description}]" if description else part)
+                    if description:
+                        if part.startswith("[语音文件:") and part.endswith("]"):
+                            new_text_parts.append(f"{part[:-1]} | {description}]")
+                        else:
+                            new_text_parts.append(f"[语音:{description}]")
+                    else:
+                        new_text_parts.append(part)
                 elif part == "[视频]":
                     description = video_descriptions[video_idx] if video_idx < len(video_descriptions) else None
                     video_idx += 1

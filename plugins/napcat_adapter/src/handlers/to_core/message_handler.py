@@ -36,6 +36,20 @@ logger = get_logger("napcat_adapter")
 class MessageHandler:
     """处理来自 Napcat 的消息事件"""
 
+    _AUDIO_FILE_EXTENSIONS = frozenset(
+        {
+            ".mp3",
+            ".wav",
+            ".m4a",
+            ".aac",
+            ".flac",
+            ".ogg",
+            ".oga",
+            ".opus",
+            ".amr",
+            ".silk",
+        }
+    )
     _VIDEO_FILE_EXTENSIONS = frozenset(
         {
             ".mp4",
@@ -602,6 +616,13 @@ class MessageHandler:
         return {"type": "seglist", "data": seg_list}, image_count
 
     @classmethod
+    def _is_audio_file_name(cls, file_name: Any) -> bool:
+        if not isinstance(file_name, str) or not file_name:
+            return False
+        normalized_name = file_name.split("?", 1)[0].split("#", 1)[0].lower()
+        return Path(normalized_name).suffix in cls._AUDIO_FILE_EXTENSIONS
+
+    @classmethod
     def _is_video_file_name(cls, file_name: Any) -> bool:
         if not isinstance(file_name, str) or not file_name:
             return False
@@ -609,8 +630,8 @@ class MessageHandler:
         return Path(normalized_name).suffix in cls._VIDEO_FILE_EXTENSIONS
 
     @staticmethod
-    def _extract_video_source_from_file_data(file_data: dict[str, Any]) -> tuple[str | None, str | None]:
-        """从 file 段 data 中提取可用的视频 URL/文件路径。"""
+    def _extract_media_source_from_file_data(file_data: dict[str, Any]) -> tuple[str | None, str | None]:
+        """从 file 段 data 中提取可用的媒体 URL/文件路径。"""
         if not isinstance(file_data, dict):
             return None, None
 
@@ -645,8 +666,10 @@ class MessageHandler:
 
         return None, None
 
+    _extract_video_source_from_file_data = _extract_media_source_from_file_data
+
     @staticmethod
-    def _extract_video_base64_from_file_data(file_data: dict[str, Any]) -> str | None:
+    def _extract_media_base64_from_file_data(file_data: dict[str, Any]) -> str | None:
         if not isinstance(file_data, dict):
             return None
         raw = file_data.get("base64")
@@ -655,6 +678,8 @@ class MessageHandler:
                 return raw[len("base64://") :]
             return raw
         return None
+
+    _extract_video_base64_from_file_data = _extract_media_base64_from_file_data
 
     async def _try_resolve_video_source_by_file_api(
         self,
@@ -712,6 +737,131 @@ class MessageHandler:
                 return video_url, file_path, None, payload
 
         return None, None, None, None
+
+    async def _try_resolve_audio_source_by_file_api(
+        self,
+        *,
+        file_id: str | None,
+        file_name: str | None,
+        group_id: str | int | None,
+    ) -> tuple[str | None, str | None, str | None, dict[str, Any] | None]:
+        """通过 Napcat File API 尝试解析音频源（base64 / url / path）。"""
+        if not self.adapter:
+            return None, None, None, None
+
+        api_calls: list[tuple[str, dict[str, Any]]] = []
+        if file_id:
+            api_calls.append(("get_file", {"file_id": file_id}))
+        if file_name:
+            api_calls.append(("get_file", {"file": file_name}))
+        if file_id:
+            api_calls.append(("get_private_file_url", {"file_id": file_id}))
+            if group_id:
+                api_calls.append(("get_group_file_url", {"group_id": str(group_id), "file_id": file_id}))
+
+        for action, params in api_calls:
+            try:
+                resp = await self.adapter.send_napcat_api(action, params, timeout=8.0)
+            except Exception as e:
+                logger.debug(f"{action} 调用失败，params={params}: {e!s}")
+                continue
+
+            if not isinstance(resp, dict):
+                continue
+            if resp.get("status") not in ("ok", None):
+                logger.debug(f"{action} 返回非成功状态: {resp}")
+                continue
+
+            data = resp.get("data")
+            payload: dict[str, Any] | None = data if isinstance(data, dict) else None
+
+            if isinstance(data, str) and data.startswith(("http://", "https://")):
+                logger.info(f"{action} 成功获取音频 URL")
+                return data, None, None, None
+
+            if not payload:
+                continue
+
+            base64_data = self._extract_media_base64_from_file_data(payload)
+            if base64_data:
+                logger.info(f"{action} 成功获取音频 base64 数据")
+                return None, None, base64_data, payload
+
+            audio_url, file_path = self._extract_media_source_from_file_data(payload)
+            if audio_url or file_path:
+                logger.info(f"{action} 成功获取音频源: {'url' if audio_url else 'path'}")
+                return audio_url, file_path, None, payload
+
+        return None, None, None, None
+
+    @staticmethod
+    def _audio_mime_for_file_name(file_name: Any) -> str:
+        suffix = Path(str(file_name or "").split("?", 1)[0].split("#", 1)[0]).suffix.lower()
+        return {
+            ".mp3": "audio/mpeg",
+            ".wav": "audio/wav",
+            ".m4a": "audio/mp4",
+            ".aac": "audio/aac",
+            ".flac": "audio/flac",
+            ".ogg": "audio/ogg",
+            ".oga": "audio/ogg",
+            ".opus": "audio/ogg",
+            ".amr": "audio/amr",
+            ".silk": "audio/silk",
+        }.get(suffix, "audio/mpeg")
+
+    @staticmethod
+    async def _read_audio_file_as_base64(file_path: str) -> tuple[str | None, float | None]:
+        if not file_path or not Path(file_path).exists():
+            return None, None
+        audio_data = await asyncio.to_thread(Path(file_path).read_bytes)
+        audio_base64 = await get_task_manager().to_process(
+            base64_encode_bytes,
+            audio_data,
+        )
+        return audio_base64, len(audio_data) / (1024 * 1024)
+
+    async def _download_audio_url_as_base64(self, url: str) -> tuple[str | None, float | None]:
+        if not url.startswith(("http://", "https://")):
+            return None, None
+        max_size_mb = 30.0
+        timeout_seconds = 30.0
+        if self.adapter.plugin and self.adapter.plugin.config:
+            try:
+                max_size_mb = float(self.adapter.plugin.config.features.video_max_size_mb)
+                timeout_seconds = float(self.adapter.plugin.config.features.video_download_timeout)
+            except Exception:
+                max_size_mb = 30.0
+                timeout_seconds = 30.0
+
+        try:
+            import aiohttp
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout_seconds)) as response:
+                    if response.status != 200:
+                        logger.warning(f"音频下载失败: status={response.status}, url={url}")
+                        return None, None
+                    content_length = response.headers.get("content-length")
+                    if content_length:
+                        size_mb = int(content_length) / (1024 * 1024)
+                        if size_mb > max_size_mb:
+                            logger.warning(f"音频文件过大，跳过下载: {size_mb:.2f}MB > {max_size_mb:.2f}MB")
+                            return None, None
+                    audio_data = await response.read()
+        except Exception as e:
+            logger.warning(f"音频下载失败: {e!s}")
+            return None, None
+
+        size_mb = len(audio_data) / (1024 * 1024)
+        if size_mb > max_size_mb:
+            logger.warning(f"音频文件过大，跳过处理: {size_mb:.2f}MB > {max_size_mb:.2f}MB")
+            return None, None
+        audio_base64 = await get_task_manager().to_process(
+            base64_encode_bytes,
+            audio_data,
+        )
+        return audio_base64, size_mb
 
     async def _handle_file_message(self, segment: dict, raw_message: dict | None = None) -> SegPayload | None:
         """处理文件消息"""
@@ -812,6 +962,89 @@ class MessageHandler:
                 if file_id:
                     logger.info("视频文件 File API 补全失败：未获取到 base64/url/path")
                 logger.info("检测到视频文件扩展名，但缺少可用 URL/路径，回退为普通文件消息")
+
+        if self._is_audio_file_name(file_name):
+            audio_url, file_path = self._extract_media_source_from_file_data(message_data)
+            audio_base64 = self._extract_media_base64_from_file_data(message_data)
+            api_payload: dict[str, Any] | None = None
+
+            if not audio_url and not file_path and not audio_base64 and raw_message:
+                message_id = raw_message.get("message_id")
+                if message_id:
+                    try:
+                        detail = await get_message_detail(message_id=message_id, adapter=self.adapter)
+                    except Exception as e:
+                        logger.warning(f"音频文件消息补拉详情失败(message_id={message_id}): {e!s}")
+                        detail = None
+
+                    if isinstance(detail, dict):
+                        for sub_seg in detail.get("message", []):
+                            if not isinstance(sub_seg, dict):
+                                continue
+                            if sub_seg.get("type") != RealMessageType.file:
+                                continue
+                            sub_data = sub_seg.get("data", {})
+                            if not isinstance(sub_data, dict):
+                                continue
+                            audio_url, file_path = self._extract_media_source_from_file_data(sub_data)
+                            audio_base64 = self._extract_media_base64_from_file_data(sub_data)
+                            if audio_url or file_path or audio_base64:
+                                logger.info("音频文件消息补拉详情成功，已提取可用音频源")
+                                break
+
+            if not audio_url and not file_path and not audio_base64:
+                group_id = raw_message.get("group_id") if raw_message else None
+                audio_url, file_path, audio_base64, api_payload = await self._try_resolve_audio_source_by_file_api(
+                    file_id=str(file_id) if file_id else None,
+                    file_name=str(file_name) if file_name else None,
+                    group_id=group_id,
+                )
+
+            filename = str(
+                (api_payload or {}).get("file_name")
+                or (api_payload or {}).get("name")
+                or file_name
+                or "audio.mp3"
+            )
+            size_field = (api_payload or {}).get("file_size") or (api_payload or {}).get("size") or file_size
+            size_mb: float | None = None
+            if size_field:
+                try:
+                    size_mb = float(size_field) / (1024 * 1024)
+                except Exception:
+                    size_mb = None
+
+            if file_path and not audio_base64:
+                try:
+                    audio_base64, local_size_mb = await self._read_audio_file_as_base64(file_path)
+                    size_mb = local_size_mb if local_size_mb is not None else size_mb
+                except Exception as e:
+                    logger.warning(f"读取音频文件失败(file_path={file_path}): {e!s}")
+
+            if audio_url and not audio_base64:
+                audio_base64, downloaded_size_mb = await self._download_audio_url_as_base64(audio_url)
+                size_mb = downloaded_size_mb if downloaded_size_mb is not None else size_mb
+
+            payload: dict[str, Any] = {
+                "filename": filename,
+                "mime_type": self._audio_mime_for_file_name(filename),
+            }
+            if size_mb is not None:
+                payload["size_mb"] = size_mb
+
+            if audio_base64:
+                logger.info("检测到音频文件扩展名，已按语音链路处理")
+                payload["base64"] = audio_base64
+                return {"type": "voice", "data": payload}
+
+            if file_path:
+                logger.info("检测到音频文件扩展名，已保留本地路径供按需原生音频观察")
+                payload["path"] = file_path
+                return {"type": "voice", "data": payload}
+
+            if file_id:
+                logger.info("音频文件 File API 补全失败：未获取到 base64/url/path")
+            logger.info("检测到音频文件扩展名，但缺少可用 URL/路径，回退为普通文件消息")
 
         # 将文件信息打包成字典
         file_data = {

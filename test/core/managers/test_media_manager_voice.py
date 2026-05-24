@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from threading import Lock as ThreadLock
@@ -28,7 +29,7 @@ async def test_recognize_voice_uses_cache() -> None:
     manager = MediaManager.__new__(MediaManager)
     manager._media_chain_stats = MediaChainStats()
     manager._media_stats_lock = ThreadLock()
-    manager._recognition_locks = {}
+    manager._recognition_locks = OrderedDict()
     manager._voice_model_set = [
         {
             "model_identifier": "sensevoice-small",
@@ -58,11 +59,11 @@ async def test_recognize_voice_uses_cache() -> None:
 
 @pytest.mark.asyncio
 async def test_recognize_voice_runs_asr_and_persists() -> None:
-    """语音未命中缓存时应调用 ASR 并保存结果。"""
+    """语音未命中缓存时优先调用原生音频理解，并保存结果。"""
     manager = MediaManager.__new__(MediaManager)
     manager._media_chain_stats = MediaChainStats()
     manager._media_stats_lock = ThreadLock()
-    manager._recognition_locks = {}
+    manager._recognition_locks = OrderedDict()
     manager._voice_model_set = [
         {
             "model_identifier": "sensevoice-small",
@@ -72,16 +73,19 @@ async def test_recognize_voice_runs_asr_and_persists() -> None:
         }
     ]
     manager._voice_available = True
+    manager._audio_understanding_model_set = [{"model_identifier": "MiMo-V2.5"}]
     manager._skip_vlm_stream_ids = set()
     manager._get_cached_description = AsyncMock(return_value=None)
+    manager._recognize_with_audio_understanding = AsyncMock(return_value="声音理解摘要")
     manager._recognize_with_asr = AsyncMock(return_value="你好世界")
     manager._save_description_cache = AsyncMock()
     manager.save_media_info = AsyncMock()
 
     result = await MediaManager.recognize_voice(manager, "base64|QUJD", use_cache=True)
 
-    assert result == "你好世界"
-    manager._recognize_with_asr.assert_awaited_once()
+    assert result == "声音理解摘要"
+    manager._recognize_with_audio_understanding.assert_awaited_once()
+    manager._recognize_with_asr.assert_not_awaited()
     manager._save_description_cache.assert_awaited_once()
     manager.save_media_info.assert_awaited_once()
     stats = await MediaManager.get_media_chain_stats(manager)
@@ -96,7 +100,7 @@ async def test_recognize_media_rejects_oversized_payload() -> None:
     manager = MediaManager.__new__(MediaManager)
     manager._media_chain_stats = MediaChainStats()
     manager._media_stats_lock = ThreadLock()
-    manager._recognition_locks = {}
+    manager._recognition_locks = OrderedDict()
     manager._voice_model_set = None
     manager._vlm_model_set = None
     manager._video_model_set = None
@@ -123,7 +127,7 @@ async def test_recognize_video_allows_payload_above_generic_media_limit() -> Non
     manager = MediaManager.__new__(MediaManager)
     manager._media_chain_stats = MediaChainStats()
     manager._media_stats_lock = ThreadLock()
-    manager._recognition_locks = {}
+    manager._recognition_locks = OrderedDict()
     manager._video_model_set = None
     manager._vlm_model_set = None
     manager._skip_vlm_stream_ids = set()
@@ -156,7 +160,7 @@ async def test_recognize_video_rejects_payload_above_video_limit() -> None:
     manager = MediaManager.__new__(MediaManager)
     manager._media_chain_stats = MediaChainStats()
     manager._media_stats_lock = ThreadLock()
-    manager._recognition_locks = {}
+    manager._recognition_locks = OrderedDict()
     manager._skip_vlm_stream_ids = set()
     manager._estimate_media_size_bytes = lambda _data: MAX_VIDEO_DATA_BYTES + 1
     manager._get_cached_description = AsyncMock(return_value=None)
@@ -184,7 +188,7 @@ async def test_voice_failure_alert_triggers() -> None:
     manager = MediaManager.__new__(MediaManager)
     manager._media_chain_stats = MediaChainStats()
     manager._media_stats_lock = ThreadLock()
-    manager._recognition_locks = {}
+    manager._recognition_locks = OrderedDict()
     manager._voice_model_set = [
         {
             "model_identifier": "sensevoice-small",
@@ -194,6 +198,7 @@ async def test_voice_failure_alert_triggers() -> None:
         }
     ]
     manager._voice_available = True
+    manager._audio_understanding_model_set = None
     manager._skip_vlm_stream_ids = set()
     manager._get_cached_description = AsyncMock(return_value=None)
     manager._recognize_with_asr = AsyncMock(return_value=None)
@@ -207,4 +212,4 @@ async def test_voice_failure_alert_triggers() -> None:
     assert warn_mock.call_count >= 1
     stats = await MediaManager.get_media_chain_stats(manager)
     assert stats["failure"] >= 5
-    assert stats["failure_types"]["asr_failed"] >= 5
+    assert stats["failure_types"]["audio_understanding_failed"] >= 5

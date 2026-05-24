@@ -417,7 +417,7 @@ class TestMediaManagerRecognizeVoice:
 
                 result = await manager.recognize_voice(audio_b64)
 
-                assert result == "你好，世界"
+                assert result == "语音转写：你好，世界"
                 mock_asr.assert_called_once_with(audio_b64)
 
     @pytest.mark.asyncio

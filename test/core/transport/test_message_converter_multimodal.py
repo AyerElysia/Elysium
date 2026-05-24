@@ -134,6 +134,61 @@ async def test_envelope_to_message_transcribes_voice(monkeypatch: pytest.MonkeyP
 
 
 @pytest.mark.asyncio
+async def test_envelope_to_message_adds_audio_file_understanding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """音频文件占位符也应写入理解摘要，而不是只保留文件名。"""
+    converter = MessageConverter()
+
+    fake_manager = type(
+        "FakeMediaManager",
+        (),
+        {
+            "recognize_media": AsyncMock(return_value=None),
+            "recognize_voice": AsyncMock(return_value="音乐氛围明亮，像在往星空下奔跑"),
+            "recognize_video": AsyncMock(return_value=None),
+            "should_skip_vlm": lambda self, stream_id, media_type=None: False,
+        },
+    )()
+    monkeypatch.setattr(
+        "src.core.managers.media_manager.get_media_manager",
+        lambda: fake_manager,
+    )
+
+    envelope = {
+        "message_info": {
+            "message_id": "msg-audio-file-1",
+            "time": 1710000000.0,
+            "platform": "qq",
+            "user_info": {
+                "user_id": "user-audio",
+                "user_nickname": "Alice",
+            },
+            "extra": {},
+        },
+        "message_segment": [
+            {
+                "type": "voice",
+                "data": {
+                    "base64": "base64|QUJD",
+                    "filename": "粉色夜灯.mp3",
+                    "mime_type": "audio/mpeg",
+                },
+            },
+        ],
+        "raw_message": {"source": "unit-test"},
+    }
+
+    message = await converter.envelope_to_message(envelope)
+
+    assert message.processed_plain_text is not None
+    assert "[语音文件:粉色夜灯.mp3 | 音乐氛围明亮，像在往星空下奔跑]" in message.processed_plain_text
+    assert isinstance(message.content, dict)
+    assert message.content["media"][0]["type"] == "voice"
+    fake_manager.recognize_voice.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_envelope_to_message_skips_registered_image_vlm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

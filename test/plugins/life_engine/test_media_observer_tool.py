@@ -7,7 +7,7 @@ import pytest
 from plugins.life_engine.core.chatter import LifeChatter, LifeInspectMediaTool
 from plugins.life_engine.core.config import LifeEngineConfig
 from src.core.models.message import Message, MessageType
-from src.kernel.llm import Image, LLMPayload, ROLE, Text, ToolResult
+from src.kernel.llm import Audio, Image, LLMPayload, ROLE, Text, ToolResult
 
 
 def _make_tool(messages: list[Message]) -> LifeInspectMediaTool:
@@ -71,6 +71,56 @@ def test_filters_by_media_type() -> None:
     assert selected.kind == "image"
 
 
+def test_filters_audio_media_type() -> None:
+    tool = _make_tool([
+        _message("m1", media=[{"type": "image", "data": "base64|QUJD"}]),
+        _message(
+            "m2",
+            media=[
+                {
+                    "type": "voice",
+                    "data": {
+                        "base64": "base64|UklGRg==",
+                        "filename": "sound.mp3",
+                        "mime_type": "audio/mpeg",
+                    },
+                }
+            ],
+        ),
+    ])
+
+    selected = tool._select_media("latest", "audio")
+
+    assert selected is not None
+    assert selected.message.message_id == "m2"
+    assert selected.kind == "audio"
+    assert selected.data_for_native == "base64|UklGRg=="
+    assert selected.mime_type == "audio/mpeg"
+
+
+def test_audio_media_type_uses_nested_mime() -> None:
+    tool = _make_tool([
+        _message(
+            "m1",
+            media=[
+                {
+                    "type": "voice",
+                    "data": {
+                        "base64": "base64|UklGRg==",
+                        "filename": "sound.wav",
+                        "mime_type": "audio/wav",
+                    },
+                }
+            ],
+        ),
+    ])
+
+    selected = tool._select_media("latest", "audio")
+
+    assert selected is not None
+    assert selected.mime_type == "audio/wav"
+
+
 def test_inspect_media_is_registered_as_tool_schema() -> None:
     schema = LifeInspectMediaTool.to_schema()
 
@@ -110,6 +160,37 @@ async def test_execute_promotes_media_for_next_native_turn() -> None:
     assert any(isinstance(part, Text) and "看图中文字" in part.text for part in content)
     assert any(isinstance(part, Image) for part in content)
     assert LifeChatter._consume_promoted_media_content("stream-1") == []
+
+
+@pytest.mark.asyncio
+async def test_execute_promotes_audio_for_next_native_turn() -> None:
+    LifeInspectMediaTool._consume_promoted_media("stream-1")
+    tool = _make_tool(
+        [
+            _message(
+                "m1",
+                media=[
+                    {
+                        "type": "voice",
+                        "data": {
+                            "base64": "base64|UklGRg==",
+                            "filename": "sound.mp3",
+                            "mime_type": "audio/mpeg",
+                        },
+                    }
+                ],
+            )
+        ]
+    )
+
+    success, result = await tool.execute(media_type="audio", focus="理解这段声音的情绪")
+
+    assert success is True
+    assert "媒体已提升为原生输入" in result
+
+    content = LifeChatter._consume_promoted_media_content("stream-1")
+    assert any(isinstance(part, Text) and "理解这段声音的情绪" in part.text for part in content)
+    assert any(isinstance(part, Audio) for part in content)
 
 
 @pytest.mark.asyncio
