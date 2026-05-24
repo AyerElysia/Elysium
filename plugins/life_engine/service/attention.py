@@ -45,6 +45,9 @@ class AttentionRouter:
         max_events: int | None = None,
         max_chars: int | None = None,
     ) -> AttentionWindow:
+        limit_events = max_events if max_events is not None else self.max_events
+        limit_chars = max_chars if max_chars is not None else self.max_chars
+
         candidates = [
             event for event in sorted(events, key=lambda item: int(item.sequence or 0))
             if int(event.sequence or 0) > int(cursor or 0)
@@ -58,14 +61,47 @@ class AttentionRouter:
             source = str(event.source or "unknown")
             source_stats[source] = source_stats.get(source, 0) + 1
 
-        # 注意：此处的硬截断限制已应要求被关闭，始终返回全体候选事件。
-        return AttentionWindow(
-            selected_events=candidates,
-            summary_events=[],
-            high_water=high_water,
-            source_stats=source_stats,
-            context_char_count=self._events_text_size(candidates),
+        def event_size(event: LifeEngineEvent) -> int:
+            return (
+                len(str(event.content or ""))
+                + len(str(event.source_detail or ""))
+                + len(str(event.sender or ""))
+                + 32
+            )
+
+        # Sort candidates by priority (highest score first, then earliest sequence first)
+        scored_candidates = sorted(
+            candidates,
+            key=lambda e: (self._score_event(e, current_stream_id=current_stream_id), -int(e.sequence or 0)),
+            reverse=True,
         )
+
+        selected: list[LifeEngineEvent] = []
+        omitted: list[LifeEngineEvent] = []
+        current_chars = 0
+
+        for event in scored_candidates:
+            size = event_size(event)
+            if len(selected) < limit_events and (current_chars + size) <= limit_chars:
+                selected.append(event)
+                current_chars += size
+            else:
+                omitted.append(event)
+
+        # Re-sort selected events by sequence to preserve chronological order
+        selected.sort(key=lambda event: int(event.sequence or 0))
+
+        summary_events = self._summarize_omitted(omitted) if omitted else []
+
+        return AttentionWindow(
+            selected_events=selected,
+            summary_events=summary_events,
+            high_water=high_water,
+            dropped_count=len(omitted),
+            source_stats=source_stats,
+            context_char_count=current_chars + self._events_text_size(summary_events),
+        )
+
 
     @staticmethod
     def _events_text_size(events: list[LifeEngineEvent]) -> int:

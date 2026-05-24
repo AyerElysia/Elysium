@@ -1581,7 +1581,7 @@ class MiniCPMLiveRouter(BaseRouter):
             if service is not None and hasattr(service, "record_message"):
                 await service.record_message(message, direction=direction)
         except Exception as exc:  # noqa: BLE001
-            logger.debug(f"live 消息写入 life_engine 事件流失败: {exc}")
+            logger.warning(f"live 消息写入 life_engine 事件流失败: {exc}")
 
     async def _record_life_event_only(
         self,
@@ -1627,7 +1627,7 @@ class MiniCPMLiveRouter(BaseRouter):
                 f"type={content_type} sender={sender} text={self._preview(content)}"
             )
         except Exception as exc:  # noqa: BLE001
-            logger.debug(f"live 状态事件写入 life_engine 失败: {exc}")
+            logger.warning(f"live 状态事件写入 life_engine 失败: {exc}")
 
     def _ensure_live_session(self, session_id: str) -> None:
         now = time.time()

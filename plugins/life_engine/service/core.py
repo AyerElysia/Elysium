@@ -127,7 +127,7 @@ class LifeEngineService(BaseService):
 
     service_name: str = "life_engine"
     service_description: str = "生命中枢服务，维持并行心跳与事件流上下文"
-    version: str = "3.3.0"
+    version: str = "3.4.0"
 
     @classmethod
     def get_instance(cls) -> "LifeEngineService | None":
@@ -139,6 +139,7 @@ class LifeEngineService(BaseService):
     def __init__(self, plugin) -> None:
         super().__init__(plugin)
         self._state = LifeEngineState()
+        self._state_dirty: bool = False
         self._heartbeat_task_id: str | None = None
         self._stop_event: asyncio.Event | None = None
         self._pending_events: list[LifeEngineEvent] = []
@@ -2823,20 +2824,33 @@ class LifeEngineService(BaseService):
 
     async def _save_runtime_context(self) -> None:
         """持久化当前上下文。"""
+        from .state_manager import PersistenceError
+
         if self._state_persistence is None:
             self._state_persistence = StatePersistence(
                 self._cfg().settings.workspace_path,
                 self._history_limit,
                 self._lock,
             )
-        await self._state_persistence.save_runtime_context(
-            self._state,
-            self._pending_events,
-            self._event_history,
-            self._snn_network,
-            self._inner_state,
-            self._dream_scheduler,
-        )
+        try:
+            await self._state_persistence.save_runtime_context(
+                self._state,
+                self._pending_events,
+                self._event_history,
+                self._snn_network,
+                self._inner_state,
+                self._dream_scheduler,
+            )
+            self._state_dirty = False
+        except PersistenceError as exc:
+            self._state_dirty = True
+            logger.error(f"life_engine 关键状态持久化失败: {exc}", exc_info=True)
+            log_error(
+                "critical_persistence_failed",
+                str(exc),
+                pending_count=len(self._pending_events),
+                history_count=len(self._event_history),
+            )
 
     async def _load_runtime_context(self) -> None:
         """从持久化文件恢复上下文。"""

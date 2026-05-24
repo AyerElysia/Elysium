@@ -527,7 +527,7 @@ async def test_life_chatter_unified_runtime_context_summarizes_event_flood() -> 
     )
 
     assert first_high_water == 100
-    assert "潜意识已压缩" not in first_text
+    assert "潜意识已压缩" in first_text
     assert "BULK_EVENT_100" in first_text
     assert "BULK_EVENT_001" in first_text
 

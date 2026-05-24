@@ -54,7 +54,7 @@ class LifeEnginePlugin(BasePlugin):
 
     plugin_name: str = "life_engine"
     plugin_description: str = "生命中枢，维护并行心跳与统一事件流上下文"
-    plugin_version: str = "3.3.0"
+    plugin_version: str = "3.4.0"
 
     configs: list[type] = [LifeEngineConfig]
     dependent_components: list[str] = []
@@ -146,8 +146,8 @@ class LifeEnginePlugin(BasePlugin):
             from .chatter import LifeChatter
 
             LifeChatter.reset_global_runtime()
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"重置 chatter 全局运行时失败: {exc}")
         log_lifecycle(
             "unloaded",
             log_file_path=str(get_life_log_file()),

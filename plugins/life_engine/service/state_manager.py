@@ -225,6 +225,10 @@ def compress_history(
     return result
 
 
+class PersistenceError(RuntimeError):
+    """运行时上下文持久化失败时抛出的异常。"""
+
+
 class StatePersistence:
     """状态持久化管理器。
 
@@ -333,6 +337,7 @@ class StatePersistence:
             temp_path.replace(path)
         except Exception as exc:  # noqa: BLE001
             logger.error(f"life_engine 持久化上下文失败: {exc}")
+            raise PersistenceError(f"Failed to persist runtime context: {exc}") from exc
 
     async def load_runtime_context(
         self,

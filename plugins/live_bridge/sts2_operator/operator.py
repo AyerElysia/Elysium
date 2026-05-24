@@ -11,6 +11,10 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from src.kernel.logger import get_logger
+
+logger = get_logger("sts2_operator", display="STS2")
+
 from .decision import (
     Sts2DecisionRequest,
     Sts2DecisionResult,
@@ -89,8 +93,8 @@ class Sts2Operator:
                 sender_name=sender_name,
                 sender_id="sts2_operator",
             )
-        except Exception:
-            return
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"STS2 操作 AI 同步生命中枢事件失败: {exc}")
 
     def _remember(self, key: str, result: Sts2DecisionResult) -> None:
         self._decision_cache[key] = result
