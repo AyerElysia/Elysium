@@ -202,7 +202,7 @@ class LifeEngineService(BaseService):
 
     def _get_attention_router(self) -> AttentionRouter:
         if self._attention_router is None:
-            self._attention_router = AttentionRouter()
+            self._attention_router = AttentionRouter(max_events=self._history_limit())
         return self._attention_router
 
     def _cfg(self) -> LifeEngineConfig:
@@ -2128,6 +2128,7 @@ class LifeEngineService(BaseService):
             context_events,
             cursor=0,
             current_stream_id="",
+            max_events=self._history_limit(),
         )
         context_events = window.events
         content = self._build_wake_context_text(context_events)
