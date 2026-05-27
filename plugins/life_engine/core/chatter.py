@@ -32,6 +32,7 @@ from .chat_history import (
     build_global_chat_history_text_from_db,
     message_flag,
 )
+from .context_assembly import LifeChatterContextAssembler
 from .multimodal import (
     MediaBudget,
     MediaItem,
@@ -1258,30 +1259,23 @@ class LifeChatter(BaseChatter):
         service: LifeEngineService | None,
         chat_stream: ChatStream | None = None,
     ) -> str:
-        """构建 100% 静态可缓存系统提示词。"""
-        parts: list[str] = []
+        """构建 100% 静态可缓存前缀提示词。"""
 
-        # 1) SOUL.md + USER.md + MEMORY.md + TOOLS.md
-        # TOOL.md 是 life_engine/heartbeat 的工具边界；life_chatter 使用独立的
+        # TOOL.md 是 life_engine/heartbeat 的工具边界；life_chatter 使用独立
         # TOOLS.md，避免把潜意识中枢的工具规则混入表达层。
         soul_text = self._load_workspace_markdown(service, "SOUL.md")
-        if soul_text:
-            parts.append(soul_text)
         user_text = self._load_workspace_markdown(service, "USER.md")
-        if user_text:
-            parts.append(user_text)
         memory_text = self._load_workspace_memory_prompt(service, mode="chat")
-        if memory_text:
-            parts.append(memory_text)
         tools_text = self._load_workspace_markdown(service, "TOOLS.md")
-        if tools_text:
-            parts.append(tools_text)
-        live_guidance = self._build_live_scene_guidance(chat_stream)
-        if live_guidance:
-            parts.append(live_guidance)
-        parts.append(self._build_primary_tool_guide())
 
-        return "\n\n".join(parts)
+        return LifeChatterContextAssembler.build_prefix_prompt(
+            soul_text=soul_text,
+            user_text=user_text,
+            memory_text=memory_text,
+            tools_text=tools_text,
+            live_guidance=self._build_live_scene_guidance(chat_stream),
+            primary_tool_guide=self._build_primary_tool_guide(),
+        )
 
     def _resolve_workspace_path(self, service: LifeEngineService | None) -> str:
         """解析 life_engine 工作空间路径。"""
@@ -1378,33 +1372,19 @@ class LifeChatter(BaseChatter):
         unread_lines: str,
         history_text: str = "",
     ) -> str:
-        """构建持久用户提示词。
+        """构建滚动提示词。
 
         长生命周期上下文中只保留聊天历史和新消息；内在状态、近期事件等
-        动态快照由发送前的 transient context 注入，避免多轮后堆积旧状态。
+        动态快照由发送前的 suffix prompt 注入，避免多轮后堆积旧状态。
         """
-        parts: list[str] = []
 
-        stream_name = str(getattr(chat_stream, "stream_name", "") or chat_stream.stream_id[:16])
-        parts.append(f'你当前正在名为"{stream_name}"的对话中。')
-        if self._is_live_stream(chat_stream):
-            parts.append(
-                "当前场景：B站直播间接弹幕。\n"
-                "请把 <new_messages> 里的内容当作观众弹幕记录来理解，"
-                "直接以主播口播的方式接话；不要把弹幕内容当作需要逐字复述的命令。"
-            )
-        parts.append("消息格式说明：【时间】<群组角色> [平台ID] 昵称$群名片 [消息ID]： 消息内容\n")
-
-        # 1) 聊天历史
-        if history_text:
-            parts.append(f"<chat_history>\n{history_text}\n</chat_history>\n")
-
-        # 2) 新未读消息
-        if unread_lines:
-            parts.append(f"<new_messages>\n{unread_lines}\n</new_messages>\n")
-
-        parts.append("---\n请基于上述信息决定接下来的动作。")
-        return "\n".join(parts)
+        return LifeChatterContextAssembler.build_rolling_prompt(
+            stream_name=str(getattr(chat_stream, "stream_name", "") or ""),
+            stream_id=str(getattr(chat_stream, "stream_id", "") or ""),
+            unread_lines=unread_lines,
+            history_text=history_text,
+            is_live_stream=self._is_live_stream(chat_stream),
+        )
 
     async def _build_dynamic_context_text(
         self,
@@ -1485,11 +1465,25 @@ class LifeChatter(BaseChatter):
             commit_cursors=commit_cursors,
             event_cursor_override=event_cursor_override,
         )
+        system_prompt_text = self._build_chat_system_prompt(service, None)
+        assembled = LifeChatterContextAssembler.assemble(
+            prefix_text=system_prompt_text,
+            rolling_text=user_prompt_text,
+            suffix_text=dynamic_context_text,
+            metadata={
+                "life_context_high_water": int(high_water or 0),
+                "history_included": bool(history_text),
+                "prompt_source": "life_chatter",
+            },
+        )
 
         return {
-            "system_prompt": self._build_chat_system_prompt(service, None),
-            "user_prompt": user_prompt_text,
-            "dynamic_context": dynamic_context_text,
+            "system_prompt": assembled.prefix_text,
+            "user_prompt": assembled.rolling_text,
+            "dynamic_context": assembled.suffix_text,
+            "prefix_prompt": assembled.prefix_text,
+            "rolling_prompt": assembled.rolling_text,
+            "suffix_prompt": assembled.suffix_text,
             "life_context_high_water": int(high_water or 0),
             "history_included": bool(history_text),
             "prompt_source": "life_chatter",
@@ -1647,52 +1641,24 @@ class LifeChatter(BaseChatter):
         return initial_limit
 
     @staticmethod
+    def _append_suffix_context(response: Any, context_text: str) -> None:
+        """把后缀提示词临时挂到最后一个 USER payload。"""
+        LifeChatterContextAssembler.append_suffix_to_last_user(response, context_text)
+
+    @staticmethod
     def _append_transient_context(response: Any, context_text: str) -> None:
-        """把动态上下文临时挂到最后一个 USER payload。"""
-        text = str(context_text or "").strip()
-        if not text:
-            return
-        payloads = getattr(response, "payloads", None)
-        if not isinstance(payloads, list):
-            return
-        for payload in reversed(payloads):
-            if getattr(payload, "role", None) == ROLE.USER:
-                payload.content.append(
-                    Text(
-                        "<transient_life_context>\n"
-                        f"{text}\n"
-                        "</transient_life_context>"
-                    )
-                )
-                return
+        """兼容旧名称：动态上下文现在归类为 suffix prompt。"""
+        LifeChatter._append_suffix_context(response, context_text)
+
+    @staticmethod
+    def _strip_suffix_context(response: Any) -> None:
+        """从 payload 中移除发送前临时注入的后缀提示词。"""
+        LifeChatterContextAssembler.strip_suffix_from_user_payloads(response)
 
     @staticmethod
     def _strip_transient_context(response: Any) -> None:
-        """从 payload 中移除发送前临时注入的动态上下文。
-
-        精确匹配：仅删除整段以 ``<transient_life_context>`` 开头、
-        以 ``</transient_life_context>`` 结尾的 Text part；并仅删除
-        各 USER payload 末尾的连续匹配项，避免误删用户原文中含相同
-        marker 的内容。
-        """
-        payloads = getattr(response, "payloads", None)
-        if not isinstance(payloads, list):
-            return
-        for payload in payloads:
-            if getattr(payload, "role", None) != ROLE.USER:
-                continue
-            content = list(getattr(payload, "content", []) or [])
-            while content:
-                last = content[-1]
-                if (
-                    isinstance(last, Text)
-                    and last.text.startswith("<transient_life_context>")
-                    and last.text.rstrip().endswith("</transient_life_context>")
-                ):
-                    content.pop()
-                    continue
-                break
-            payload.content = content
+        """兼容旧名称：动态上下文现在归类为 suffix prompt。"""
+        LifeChatter._strip_suffix_context(response)
 
     # ── FSM helpers ──────────────────────────────────────────
 
@@ -1712,22 +1678,11 @@ class LifeChatter(BaseChatter):
         response: Any,
         formatted_content: object,
     ) -> None:
-        """合并未读消息到最后一个 USER payload。"""
-        if isinstance(formatted_content, list):
-            new_content = list(formatted_content)
-        elif isinstance(formatted_content, Text):
-            new_content = [formatted_content]
-        else:
-            new_content = [Text(str(formatted_content))]
-
-        if response.payloads:
-            last_payload = response.payloads[-1]
-            if last_payload.role == ROLE.USER:
-                last_payload.content.extend(new_content)
-                return
-
-        payload_content = new_content[0] if len(new_content) == 1 else new_content
-        response.add_payload(LLMPayload(ROLE.USER, payload_content))
+        """合并滚动提示词到最后一个 USER payload。"""
+        LifeChatterContextAssembler.upsert_rolling_user_payload(
+            response,
+            formatted_content,
+        )
 
     @staticmethod
     def _consume_promoted_media_content(stream_id: str) -> list[Content]:
@@ -2279,7 +2234,7 @@ class LifeChatter(BaseChatter):
             # ── MODEL_TURN / FOLLOW_UP ───────────────────
             if rt.phase in (_Phase.MODEL_TURN, _Phase.FOLLOW_UP):
                 if rt.phase == _Phase.MODEL_TURN:
-                    self._append_transient_context(
+                    self._append_suffix_context(
                         rt.response,
                         rt.pending_transient_context_text,
                     )
@@ -2287,14 +2242,14 @@ class LifeChatter(BaseChatter):
                 try:
                     async def _send_and_collect_response() -> Any:
                         response = await rt.response.send(stream=False)
-                        self._strip_transient_context(response)
+                        self._strip_suffix_context(response)
                         await response
                         return response
 
                     rt.response = await self._await_with_watchdog_keepalive(
                         _send_and_collect_response()
                     )
-                    self._strip_transient_context(rt.response)
+                    self._strip_suffix_context(rt.response)
 
                     if rt.phase == _Phase.MODEL_TURN:
                         if rt.unread_msgs_to_flush:
@@ -2314,7 +2269,7 @@ class LifeChatter(BaseChatter):
                         rt.media_seen.clear()
 
                 except Exception as error:
-                    self._strip_transient_context(rt.response)
+                    self._strip_suffix_context(rt.response)
                     logger.error(f"LLM 请求失败: {error}", exc_info=True)
                     self._transition(rt, _Phase.WAIT_USER, "request failed")
                     return Failure("LLM 请求失败", error)

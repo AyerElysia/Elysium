@@ -297,6 +297,31 @@ def test_life_chatter_live_user_prompt_mentions_broadcast_context() -> None:
 
 
 @pytest.mark.asyncio
+async def test_live_bridge_prompt_exposes_three_layer_aliases() -> None:
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=LifeEngineConfig())
+    chat_stream = SimpleNamespace(
+        stream_name="Live",
+        stream_id="live-stream-1",
+        platform="live",
+    )
+
+    bundle = await chatter.build_live_bridge_prompt(
+        chat_stream,
+        service=None,
+        unread_lines="【02:40】[live_user] 观众A [m1]： 000",
+        runtime_context_text="RUNTIME_NOW",
+        include_history_in_prompt=False,
+    )
+
+    assert bundle["prefix_prompt"] == bundle["system_prompt"]
+    assert bundle["rolling_prompt"] == bundle["user_prompt"]
+    assert bundle["suffix_prompt"] == bundle["dynamic_context"]
+    assert "RUNTIME_NOW" in bundle["suffix_prompt"]
+    assert "当前场景：B站直播间接弹幕。" in bundle["rolling_prompt"]
+
+
+@pytest.mark.asyncio
 async def test_life_chatter_dynamic_context_is_separate_snapshot() -> None:
     """动态上下文应能单独构建，用于本次请求 transient 注入。"""
     chatter = LifeChatter.__new__(LifeChatter)
