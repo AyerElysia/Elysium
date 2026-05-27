@@ -2349,6 +2349,8 @@ class LifeEngineService(BaseService):
             "- 你自己其实就想直接说一句：这种情况交给表达层在正常对话里处理", "",
             "可接受写法：`我刚看到 X 事实；这可能解释 Y；风险是 Z。`",
             "不可接受写法：`你应该回复 X`、`你去安慰/追问 Y`、`按以下步骤说`。",
+            "默认目标是最近收到消息的聊天；如果你明确想去某个私聊或群聊，可以设置 `target_type=private/group`，并填写 `platform` 与 `target_user_id` 或 `target_group_id`。",
+            "如果你已经知道精确聊天流，可以直接填写 `stream_id`；不确定就不要填，让系统回退当前聊天。",
             "`proactive_wake=true` 只服务高优先级信息差，不用于催表达层开口。", "",
             "记住：`nucleus_tell_dfc` 是补信息差，不是遥控器。", "",
             "### 工具边界", "",

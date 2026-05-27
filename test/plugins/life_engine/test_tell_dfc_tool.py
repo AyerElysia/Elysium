@@ -29,16 +29,71 @@ class _DummyStream:
 
 class _DummyStreamManager:
     def __init__(self, stream: _DummyStream) -> None:
-        self._stream = stream
+        self._streams: dict[str, _DummyStream] = {stream.stream_id: stream}
+        self._stream_info: dict[str, dict[str, str]] = {stream.stream_id: {}}
+        self.calls: list[dict[str, str]] = []
 
-    async def get_or_create_stream(self, stream_id: str) -> _DummyStream | None:
-        if stream_id != self._stream.stream_id:
-            return None
-        return self._stream
+    async def get_or_create_stream(
+        self,
+        stream_id: str = "",
+        platform: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        group_name: str = "",
+        chat_type: str = "private",
+    ) -> _DummyStream | None:
+        self.calls.append(
+            {
+                "stream_id": stream_id,
+                "platform": platform,
+                "user_id": user_id,
+                "group_id": group_id,
+                "group_name": group_name,
+                "chat_type": chat_type,
+            }
+        )
+        if stream_id:
+            return self._streams.get(stream_id)
 
-    async def get_stream_info(self, _stream_id: str) -> dict[str, str]:
-        # 返回空信息，避免触发 user_query_helper 分支。
-        return {}
+        if group_id:
+            generated_stream_id = f"{platform}:group:{group_id}"
+            stream = self._streams.get(generated_stream_id)
+            if stream is None:
+                stream = _DummyStream(
+                    stream_id=generated_stream_id,
+                    platform=platform,
+                    chat_type="group",
+                )
+                self._streams[generated_stream_id] = stream
+                self._stream_info[generated_stream_id] = {
+                    "platform": platform,
+                    "chat_type": "group",
+                    "group_id": group_id,
+                    "group_name": group_name,
+                }
+            return stream
+
+        if user_id:
+            generated_stream_id = f"{platform}:private:{user_id}"
+            stream = self._streams.get(generated_stream_id)
+            if stream is None:
+                stream = _DummyStream(
+                    stream_id=generated_stream_id,
+                    platform=platform,
+                    chat_type="private",
+                )
+                self._streams[generated_stream_id] = stream
+                self._stream_info[generated_stream_id] = {
+                    "platform": platform,
+                    "chat_type": "private",
+                }
+            return stream
+
+        return None
+
+    async def get_stream_info(self, stream_id: str) -> dict[str, str]:
+        # 默认返回空信息，避免触发 user_query_helper 分支。
+        return self._stream_info.get(stream_id, {})
 
 
 class _DummyLoopManager:
@@ -117,6 +172,186 @@ def test_tell_dfc_default_is_queue_only(monkeypatch: pytest.MonkeyPatch) -> None
     wake_message = stream.context.unread_messages[0]
     assert "[信息差补充]" in wake_message.content
     assert "不是命令" in wake_message.content
+
+
+def test_tell_dfc_falls_back_to_latest_received_chat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """未指定目标时，应回退到最近收到消息的聊天流。"""
+    stream = _DummyStream()
+    stream_manager = _DummyStreamManager(stream)
+    loop_manager = _DummyLoopManager(start_ok=True)
+    life_service = _DummyLifeService()
+    _patch_runtime(
+        monkeypatch,
+        stream_manager=stream_manager,
+        loop_manager=loop_manager,
+        life_service=life_service,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.tools.file_tools._pick_latest_target_stream_id",
+        lambda _plugin: "stream-1",
+    )
+
+    tool = LifeEngineWakeDFCTool(plugin=object())
+    ok, result = asyncio.run(
+        tool.execute(
+            message="[信息差] 刚才那句可能有额外背景。",
+            reason="最近收到消息的聊天是最自然的回退目标。",
+            importance="normal",
+        )
+    )
+
+    assert ok is True
+    assert isinstance(result, dict)
+    assert result["stream_id"] == "stream-1"
+    assert result["target_type"] == "current"
+    assert len(stream.context.unread_messages) == 1
+    assert stream_manager.calls[-1]["stream_id"] == "stream-1"
+
+
+def test_tell_dfc_routes_to_private_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """指定 private 目标时，应创建/加载对应私聊流并写入 target_user_id。"""
+    stream = _DummyStream()
+    stream_manager = _DummyStreamManager(stream)
+    loop_manager = _DummyLoopManager(start_ok=True)
+    life_service = _DummyLifeService()
+    _patch_runtime(
+        monkeypatch,
+        stream_manager=stream_manager,
+        loop_manager=loop_manager,
+        life_service=life_service,
+    )
+
+    tool = LifeEngineWakeDFCTool(plugin=object())
+    ok, result = asyncio.run(
+        tool.execute(
+            message="我想把这段背景留给这个私聊。",
+            reason="这是给指定私聊的上下文。",
+            target_type="private",
+            platform="qq",
+            target_user_id="user-a",
+            target_user_name="Ayer",
+        )
+    )
+
+    assert ok is True
+    assert isinstance(result, dict)
+    assert result["stream_id"] == "qq:private:user-a"
+    assert result["chat_type"] == "private"
+    assert result["target_type"] == "private"
+    assert result["target_user_id"] == "user-a"
+    target_stream = stream_manager._streams["qq:private:user-a"]
+    wake_message = target_stream.context.unread_messages[0]
+    assert wake_message.extra["target_user_id"] == "user-a"
+    assert wake_message.extra["target_user_name"] == "Ayer"
+
+
+def test_tell_dfc_routes_to_group_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """指定 group 目标时，应创建/加载对应群聊流并写入 target_group_id。"""
+    stream = _DummyStream()
+    stream_manager = _DummyStreamManager(stream)
+    loop_manager = _DummyLoopManager(start_ok=True)
+    life_service = _DummyLifeService()
+    _patch_runtime(
+        monkeypatch,
+        stream_manager=stream_manager,
+        loop_manager=loop_manager,
+        life_service=life_service,
+    )
+
+    tool = LifeEngineWakeDFCTool(plugin=object())
+    ok, result = asyncio.run(
+        tool.execute(
+            message="我想把这段背景留给这个群聊。",
+            reason="这是给指定群聊的上下文。",
+            target_type="group",
+            platform="qq",
+            target_group_id="group-a",
+            target_group_name="大家庭",
+        )
+    )
+
+    assert ok is True
+    assert isinstance(result, dict)
+    assert result["stream_id"] == "qq:group:group-a"
+    assert result["chat_type"] == "group"
+    assert result["target_type"] == "group"
+    assert result["target_group_id"] == "group-a"
+    target_stream = stream_manager._streams["qq:group:group-a"]
+    wake_message = target_stream.context.unread_messages[0]
+    assert wake_message.extra["target_group_id"] == "group-a"
+    assert wake_message.extra["target_group_name"] == "大家庭"
+
+
+def test_tell_dfc_stream_id_takes_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """stream_id 是最高优先级，兼容旧的精确流路由。"""
+    stream = _DummyStream()
+    stream_manager = _DummyStreamManager(stream)
+    loop_manager = _DummyLoopManager(start_ok=True)
+    life_service = _DummyLifeService()
+    _patch_runtime(
+        monkeypatch,
+        stream_manager=stream_manager,
+        loop_manager=loop_manager,
+        life_service=life_service,
+    )
+
+    tool = LifeEngineWakeDFCTool(plugin=object())
+    ok, result = asyncio.run(
+        tool.execute(
+            message="这应该仍然进入精确 stream。",
+            reason="旧参数兼容。",
+            stream_id="stream-1",
+            target_type="private",
+            platform="qq",
+            target_user_id="other-user",
+        )
+    )
+
+    assert ok is True
+    assert isinstance(result, dict)
+    assert result["stream_id"] == "stream-1"
+    assert result["target_type"] == "stream"
+    assert result["target_user_id"] == ""
+    assert len(stream.context.unread_messages) == 1
+
+
+def test_tell_dfc_private_target_requires_platform_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """指定私聊但既无 platform 也无法从当前聊天推断时，应给出明确错误。"""
+    stream = _DummyStream()
+    stream_manager = _DummyStreamManager(stream)
+    loop_manager = _DummyLoopManager(start_ok=True)
+    life_service = _DummyLifeService()
+    _patch_runtime(
+        monkeypatch,
+        stream_manager=stream_manager,
+        loop_manager=loop_manager,
+        life_service=life_service,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.tools.file_tools._pick_latest_target_stream_id",
+        lambda _plugin: None,
+    )
+
+    tool = LifeEngineWakeDFCTool(plugin=object())
+    ok, result = asyncio.run(
+        tool.execute(
+            message="这条应该失败。",
+            reason="缺少平台。",
+            target_type="private",
+            target_user_id="user-a",
+        )
+    )
+
+    assert ok is False
+    assert isinstance(result, str)
+    assert "platform" in result
+    assert len(stream.context.unread_messages) == 0
 
 
 def test_tell_dfc_accepts_guidance_style_message(
