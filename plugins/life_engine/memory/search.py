@@ -15,11 +15,10 @@ from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 from src.app.plugin_system.api import log_api
 
 if TYPE_CHECKING:
-    from src.app.plugin_system.api.llm_api import create_embedding_request, get_model_set_by_task
-    from src.kernel.vector_db import get_vector_db_service
+    pass
 
-from .nodes import MemoryNode, NodeType, row_to_node
-from .edges import EdgeType, MemoryEdge, row_to_edge, get_edges_from
+from .nodes import MemoryNode, row_to_node
+from .edges import get_edges_from
 
 logger = log_api.get_logger("life_engine.memory.search")
 

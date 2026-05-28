@@ -11,16 +11,15 @@
 
 from __future__ import annotations
 
-import json
 import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 from uuid import uuid4
 
-from src.core.components import BaseTool
 from src.app.plugin_system.api import log_api
+from src.app.plugin_system.base import BaseTool
 from src.core.models.message import Message, MessageType
 
 from ..constants import (
@@ -34,10 +33,11 @@ from ..memory.prompting import build_memory_write_warning
 from ._utils import (
     _get_workspace,
     _resolve_path,
-    _load_life_context_events,
     _pick_latest_target_stream_id,
 )
 
+if TYPE_CHECKING:
+    from ..agents.coordinator import AgentCoordinator
 
 logger = log_api.get_logger("life_engine.tools")
 
@@ -925,7 +925,6 @@ class LifeEngineRunAgentTool(BaseTool):
         try:
             from ..agents.registry import get_agent_type_registry
             from ..agents.runner import AgentRunner
-            from ..agents.coordinator import AgentCoordinator
 
             registry = get_agent_type_registry()
             type_def = registry.get(subagent_type)

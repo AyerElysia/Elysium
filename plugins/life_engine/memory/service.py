@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -20,7 +19,6 @@ from src.app.plugin_system.api import log_api
 
 from .nodes import (
     MemoryNode,
-    NodeType,
     generate_file_node_id,
     get_or_create_file_node,
     get_node_by_file_path,
@@ -44,15 +42,12 @@ from .search import (
     get_chroma_collection,
     search_memory,
     sync_embedding,
-    embed_text,
     vector_search,
     fts_search,
-    rrf_fusion,
     spread_activation,
     filter_existing_scores,
     get_node_by_id,
     get_snippet,
-    filter_results,
 )
 from .lineage import (
     CANONICAL_EDGE_TYPES,

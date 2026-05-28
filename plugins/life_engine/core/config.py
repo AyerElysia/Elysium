@@ -8,7 +8,7 @@ from typing import ClassVar
 
 from pydantic import field_validator
 
-from src.core.components.base.config import BaseConfig, Field, SectionBase, config_section
+from src.app.plugin_system.base import BaseConfig, Field, SectionBase, config_section
 
 from ..constants import (
     HEARTBEAT_IDLE_CRITICAL_THRESHOLD,

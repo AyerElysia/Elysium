@@ -11,10 +11,10 @@ import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from src.core.components import BaseTool
 from src.app.plugin_system.api import log_api
+from src.app.plugin_system.base import BaseTool
 
-from ._utils import _get_workspace
+from ._utils import _get_workspace, _resolve_path
 
 logger = log_api.get_logger("life_engine.grep")
 
@@ -159,12 +159,10 @@ class LifeEngineGrepFileTool(BaseTool):
 
         # 确定搜索根路径
         if path.strip():
-            clean_path = path.strip().lstrip("/\\")
-            search_root = (workspace / clean_path).resolve()
-            try:
-                search_root.relative_to(workspace)
-            except ValueError:
-                return False, f"路径超出工作空间范围"
+            ok, resolved_path = _resolve_path(self.plugin, path)
+            if not ok:
+                return False, str(resolved_path)
+            search_root = resolved_path
             if not search_root.exists():
                 return False, f"路径不存在: {path}"
         else:

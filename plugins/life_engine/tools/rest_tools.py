@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Annotated
 
 from src.app.plugin_system.api import log_api
-from src.core.components import BaseTool
+from src.app.plugin_system.base import BaseTool
 
 from ..service.registry import get_life_engine_service
 

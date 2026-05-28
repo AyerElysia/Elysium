@@ -2,20 +2,17 @@
 
 from __future__ import annotations
 
-import os
 import time
 from typing import TYPE_CHECKING, Any
 
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from src.core.components.base.router import BaseRouter
+from src.app.plugin_system.base import BaseRouter
+
+from ..service.static_page import render_dashboard
 
 if TYPE_CHECKING:
     from ..core.plugin import LifeEnginePlugin
-
-# static/ 位于 plugins/life_engine/static/，即本文件的上两级目录
-_PLUGIN_ROOT = os.path.dirname(os.path.dirname(__file__))
-
 
 class SNNRouter(BaseRouter):
     """SNN 状态可视化路由。"""
@@ -28,13 +25,7 @@ class SNNRouter(BaseRouter):
         @self.app.get("/", response_class=HTMLResponse)
         async def get_dashboard() -> Any:
             """返回可视化面板 HTML。"""
-            static_dir = os.path.join(_PLUGIN_ROOT, "static")
-            dashboard_path = os.path.join(static_dir, "snn_dashboard.html")
-            if not os.path.exists(dashboard_path):
-                return HTMLResponse(content="<h1>Dashboard HTML not found!</h1>", status_code=404)
-            with open(dashboard_path, "r", encoding="utf-8") as f:
-                html_content = f.read()
-            return HTMLResponse(content=html_content)
+            return render_dashboard("snn_dashboard.html", "Dashboard")
 
         @self.app.get("/api/state")
         async def get_state() -> Any:

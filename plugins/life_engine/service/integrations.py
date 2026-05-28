@@ -7,17 +7,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-import traceback
-from datetime import datetime
-from typing import Any
-
-from src.app.plugin_system.api.log_api import get_logger
-
-logger = get_logger("life_engine.integrations")
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.api.log_api import get_logger
 

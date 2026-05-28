@@ -23,7 +23,7 @@ from PIL import ImageGrab
 
 from src.app.plugin_system.api import log_api
 from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
-from src.core.components import BaseTool
+from src.app.plugin_system.base import BaseTool
 from src.kernel.llm import Image, LLMContextManager, LLMPayload, ROLE, Text
 
 from ..core.multimodal import _is_supported_image_data

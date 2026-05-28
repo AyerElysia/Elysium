@@ -11,8 +11,8 @@ from __future__ import annotations
 
 from typing import Annotated, Any, List, Optional
 
-from src.core.components import BaseTool
 from src.app.plugin_system.api import log_api
+from src.app.plugin_system.base import BaseTool
 
 from .service import LifeMemoryService
 from .edges import EdgeType

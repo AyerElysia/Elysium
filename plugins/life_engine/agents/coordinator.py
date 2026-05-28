@@ -10,12 +10,12 @@ import asyncio
 import uuid
 from typing import TYPE_CHECKING
 
-from .definitions import AgentResult, AgentTypeDefinition
+from .definitions import AgentResult
 from .registry import get_agent_type_registry
 from .runner import AgentRunner
 
 if TYPE_CHECKING:
-    from src.core.components import BasePlugin
+    from src.app.plugin_system.base import BasePlugin
 
 
 class AgentCoordinator:

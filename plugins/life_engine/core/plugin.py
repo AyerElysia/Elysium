@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from src.core.components import BasePlugin, register_plugin
+from src.app.plugin_system.base import BasePlugin, register_plugin
 from src.kernel.logger import get_logger
 
 from ..service.audit import (

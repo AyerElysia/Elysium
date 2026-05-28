@@ -9,7 +9,7 @@ from typing import Annotated, Any, Literal
 
 from src.app.plugin_system.api import log_api
 from src.app.plugin_system.api.adapter_api import send_adapter_command
-from src.core.components import BaseTool
+from src.app.plugin_system.base import BaseTool
 from src.core.models.message import Message
 from src.core.models.sql_alchemy import ChatStreams
 from src.kernel.db import QueryBuilder

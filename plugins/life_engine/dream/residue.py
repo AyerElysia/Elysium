@@ -10,11 +10,14 @@ import json
 import logging
 import re
 import time
-import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .scenes import DreamTrace
+    from .seeds import DreamSeed
 
 logger = logging.getLogger("life_engine.dream")
 

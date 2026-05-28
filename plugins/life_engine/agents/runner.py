@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -19,7 +18,7 @@ from .definitions import AgentResult, AgentTypeDefinition
 from .registry import get_agent_type_registry
 
 if TYPE_CHECKING:
-    from src.core.components import BasePlugin
+    from src.app.plugin_system.base import BasePlugin
 
 
 class AgentRunner:

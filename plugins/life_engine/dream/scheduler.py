@@ -6,18 +6,10 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import time
-
-from src.app.plugin_system.api.log_api import get_logger
-
-logger = get_logger("life_engine.dream.scheduler")
-import random
 import time
 import uuid
 from collections import deque
-from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
@@ -35,7 +27,6 @@ from .residue import (
     _residue_from_payload,
     archive_dream,
     integrate_archive_into_memory,
-    _unique_preserve,
     _REMINDER_MAX_HISTORY,
     _RESIDUE_TTL_SECONDS,
 )

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import time
 from typing import Any, Callable, ParamSpec, TypeVar
 
 from src.app.plugin_system.api.log_api import get_logger

@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 import signal
 import time
 from contextlib import suppress
@@ -21,9 +20,11 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from src.app.plugin_system.api import log_api
-from src.core.components import BaseTool
+from src.app.plugin_system.base import BaseTool
 
 from ._utils import _get_workspace
+from .results import decode_output as _decode_output
+from .security import audit_shell_command as _audit_command
 
 logger = log_api.get_logger("life_engine.exec_tools")
 
@@ -41,12 +42,6 @@ _SENSITIVE_ENV_TOKENS = (
     "AUTH",
     "SSH_",
 )
-
-_DANGEROUS_COMMAND_PATTERN = re.compile(
-    r"(^|[\s;&|()])(?P<command>rm|mv)(?=$|[\s;&|()])"
-)
-_FD_DUPLICATION_PATTERN = re.compile(r"\d+|-")
-
 
 def _resolve_cwd(plugin: Any, cwd: str) -> tuple[bool, Path | str]:
     """把 cwd 解析到 workspace 内的实际目录。"""
@@ -106,114 +101,6 @@ def _build_shell_env(workspace: Path, cwd: Path) -> dict[str, str]:
         os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
     )
     return env
-
-
-def _truncate_text(text: str, limit: int) -> tuple[str, bool]:
-    if len(text) <= limit:
-        return text, False
-    if limit <= 3:
-        return text[:limit], True
-    return text[: limit - 3] + "...", True
-
-
-def _decode_output(data: bytes | None, limit: int) -> tuple[str, bool]:
-    text = (data or b"").decode("utf-8", errors="replace")
-    return _truncate_text(text, limit)
-
-
-def _is_escaped(text: str, index: int) -> bool:
-    backslashes = 0
-    cursor = index - 1
-    while cursor >= 0 and text[cursor] == "\\":
-        backslashes += 1
-        cursor -= 1
-    return backslashes % 2 == 1
-
-
-def _find_unquoted_output_redirection_error(command_text: str) -> str | None:
-    """Reject file-writing redirection while allowing common discard patterns."""
-
-    quote: str | None = None
-    index = 0
-    length = len(command_text)
-
-    while index < length:
-        char = command_text[index]
-        if char in {"'", '"'} and not _is_escaped(command_text, index):
-            if quote == char:
-                quote = None
-            elif quote is None:
-                quote = char
-            index += 1
-            continue
-
-        if quote is not None or char != ">" or _is_escaped(command_text, index):
-            index += 1
-            continue
-
-        if index > 0 and command_text[index - 1] == "<":
-            return "禁止使用可能写文件的重定向 '<>'。如需编辑文件，请使用专门的文件工具。"
-
-        target_start = index + 1
-        if target_start < length and command_text[target_start] in {">", "|"}:
-            target_start += 1
-
-        fd_duplication = False
-        if target_start < length and command_text[target_start] == "&":
-            fd_duplication = True
-            target_start += 1
-
-        while target_start < length and command_text[target_start].isspace():
-            target_start += 1
-
-        if target_start >= length:
-            return "禁止使用缺少目标的输出重定向。"
-
-        target_end = target_start
-        target_quote: str | None = None
-        while target_end < length:
-            target_char = command_text[target_end]
-            if target_char in {"'", '"'} and not _is_escaped(command_text, target_end):
-                if target_quote == target_char:
-                    target_quote = None
-                elif target_quote is None:
-                    target_quote = target_char
-                target_end += 1
-                continue
-            if target_quote is None and (
-                target_char.isspace() or target_char in {";", "|", "&", "(", ")"}
-            ):
-                break
-            target_end += 1
-
-        target = command_text[target_start:target_end].strip().strip("'\"")
-        if target == "/dev/null":
-            index = max(target_end, index + 1)
-            continue
-        if fd_duplication and _FD_DUPLICATION_PATTERN.fullmatch(target):
-            index = max(target_end, index + 1)
-            continue
-
-        return (
-            f"命令审计失败：禁止输出重定向到 '{target or '<empty>'}'。"
-            "如需写文件，请使用专门的安全文件工具；丢弃输出可使用 /dev/null。"
-        )
-
-    return None
-
-
-def _audit_command(command_text: str) -> str | None:
-    """Return an audit error message when a command should not run."""
-
-    dangerous = _DANGEROUS_COMMAND_PATTERN.search(command_text)
-    if dangerous:
-        command = dangerous.group("command")
-        return (
-            f"命令审计失败：禁止使用危险指令 '{command}'。"
-            "如有必要，请使用专门的安全文件工具。"
-        )
-
-    return _find_unquoted_output_redirection_error(command_text)
 
 
 def _stop_process(process: Any) -> None:

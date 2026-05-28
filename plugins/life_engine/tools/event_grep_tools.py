@@ -6,7 +6,7 @@ import re
 from typing import Annotated, Any, Literal
 
 from src.app.plugin_system.api import log_api
-from src.core.components import BaseTool
+from src.app.plugin_system.base import BaseTool
 
 from ..service import LifeEngineService
 from ..service.event_builder import EventType

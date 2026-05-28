@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from src.core.components.base.chatter import BaseChatter
+from src.app.plugin_system.base import BaseChatter
 from src.core.models.message import Message
 
 

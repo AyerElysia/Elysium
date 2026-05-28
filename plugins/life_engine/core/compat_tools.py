@@ -9,8 +9,7 @@ from typing import Annotated, Any
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
-from src.core.components.base.action import BaseAction
-from src.core.components.base.tool import BaseTool
+from src.app.plugin_system.base import BaseAction, BaseTool
 from src.core.managers import get_plugin_manager
 from src.kernel.llm import LLMPayload, ROLE, Text, ToolRegistry, ToolResult
 
@@ -294,7 +293,7 @@ class LifeConsultNucleusTool(BaseTool):
                 request_name="nucleus_consultation_agent",
             )
             request.add_payload(LLMPayload(ROLE.SYSTEM, Text(agent_prompt)))
-            request.add_payload(LLMPayload(ROLE.USER, Text(f"请对主意识的问题进行解答与交流")))
+            request.add_payload(LLMPayload(ROLE.USER, Text("请对主意识的问题进行解答与交流")))
 
             response = await request.send(stream=False)
             response_text = await response

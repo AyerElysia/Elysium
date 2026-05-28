@@ -17,10 +17,9 @@ from __future__ import annotations
 import logging
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
 
 logger = logging.getLogger("life_engine.snn")
 
@@ -128,7 +127,6 @@ class ModulatorSystem:
         )
 
         # --- contentment ---
-        arousal = snn_drives.get("arousal", 0.0)
         valence = snn_drives.get("valence", 0.0)
         stimuli["contentment"] = (
             0.4 * valence
@@ -212,7 +210,7 @@ class Habit:
             return  # 同一天不重复计 streak
         if self.last_triggered_date:
             # 检查是否连续（简化：只比较日期字符串的排序）
-            from datetime import datetime, timedelta
+            from datetime import datetime
             try:
                 last = datetime.strptime(self.last_triggered_date, "%Y-%m-%d")
                 curr = datetime.strptime(date_str, "%Y-%m-%d")

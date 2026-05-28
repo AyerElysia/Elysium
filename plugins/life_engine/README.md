@@ -345,7 +345,7 @@ default_fetch_max_chars = 12000
 
 ---
 
-## 10. SNN 皮层下系统（实验性）
+## 10. SNN 皮层下系统（核心默认组成部分）
 
 > **Phase 0 · 2026-04 引入**
 
@@ -385,10 +385,10 @@ life_engine 现在拥有一个可选的 **SNN（脉冲神经网络）皮层下�
 
 | 文件 | 职责 |
 |---|---|
-| `snn_core.py` | LIF 神经元、STDP 突触、DriveCoreNetwork |
-| `snn_bridge.py` | 事件→特征、奖赏计算、prompt 格式化 |
-| `config.py` | `[snn]` 配置节 |
-| `config.toml` | 运行时配置 |
+| `plugins/life_engine/snn/core.py` | LIF 神经元、STDP 突触、DriveCoreNetwork |
+| `plugins/life_engine/snn/bridge.py` | 事件→特征、奖赏计算、prompt 格式化 |
+| `plugins/life_engine/core/config.py` | `[snn]` 配置节 |
+| `config/plugins/life_engine/config.toml` | 运行时配置 |
 
 ### 配置
 
@@ -416,7 +416,7 @@ feature_window_seconds = 600  # 特征窗口(秒)
 
 ---
 
-## 11. Web 可视化看板 (Experimental)
+## 11. Web 可视化看板
 
 > **2026-04 引入**
 
@@ -441,4 +441,6 @@ feature_window_seconds = 600  # 特征窗口(秒)
 
 当主应用运行时，直接访问以下路径（具体端口取决于主应用配置）：
 - `http://localhost:<port>/router/snn/`
-- `http://localhost:<port>/router/memory/`
+- `http://localhost:<port>/router/memory_vis/`
+- `http://localhost:<port>/router/dream_vis/`
+- `http://localhost:<port>/router/message_timeline/`

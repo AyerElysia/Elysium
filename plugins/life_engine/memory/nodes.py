@@ -14,8 +14,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 from src.app.plugin_system.api import log_api
 
@@ -326,7 +325,6 @@ async def migrate_node_identity(
     Returns:
         是否迁移成功
     """
-    from .edges import EdgeType
 
     if old_node_id == new_node_id:
         def _update_path() -> bool:

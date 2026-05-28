@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, TYPE_CHECKING
 
 import numpy as np
 
 if TYPE_CHECKING:
-    from ..service import LifeEngineEvent, LifeEngineService
+    from ..service import LifeEngineService
 
 logger = logging.getLogger("life_engine.snn")
 

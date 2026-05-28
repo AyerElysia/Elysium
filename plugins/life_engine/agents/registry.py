@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 from .definitions import AgentTypeDefinition
 
 if TYPE_CHECKING:
-    from src.core.components.base import BaseTool
+    from src.app.plugin_system.base import BaseTool
 
 
 # 写入能力工具——只读智能体应排除

@@ -315,7 +315,7 @@ def build_reference_previews(
     if workspace is None:
         return []
 
-    from .residue import _iter_seed_file_refs, _unique_preserve
+    from .residue import _iter_seed_file_refs
 
     previews: list[dict[str, str]] = []
     refs = _iter_seed_file_refs(seeds, workspace)

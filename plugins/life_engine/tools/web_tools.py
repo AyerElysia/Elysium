@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
-import json
 import os
 import threading
 import urllib.error
@@ -18,11 +17,14 @@ import urllib.request
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
+import requests
+
 from src.app.plugin_system.api import log_api
-from src.core.components import BaseTool
+from src.app.plugin_system.base import BaseTool
 
 from ..core.config import LifeEngineConfig
 from ._utils import _get_workspace
+from .results import truncate_text as _truncate_text
 
 logger = log_api.get_logger("life_engine.web_tools")
 
@@ -194,16 +196,6 @@ def _resolve_endpoint(base_url: str, path: str) -> str:
     return base.rstrip("/") + "/" + path.lstrip("/")
 
 
-def _truncate_text(text: str, max_chars: int) -> tuple[str, bool]:
-    if max_chars <= 0:
-        return "", True
-    if len(text) <= max_chars:
-        return text, False
-    if max_chars <= 3:
-        return text[:max_chars], True
-    return text[: max_chars - 3] + "...", True
-
-
 def _resolve_local_path(plugin: Any, raw_path: str) -> tuple[bool, Path | str]:
     """解析本地文件路径，只允许 workspace 内的文件。"""
     workspace = _get_workspace(plugin)
@@ -275,9 +267,6 @@ def _validate_public_url(url: str) -> tuple[bool, str]:
     if _is_blocked_host(parsed.hostname):
         return False, "出于安全原因，禁止访问本地或内网地址"
     return True, ""
-
-
-import requests
 
 
 def _has_proxy_env() -> bool:

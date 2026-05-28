@@ -1,7 +1,7 @@
 # 记忆系统可视化分析与方案
 
 ## 数据结构分析
-基于 `memory_service.py` 和 `snn_core.py` 的分析，记忆系统主要由两部分构成：
+基于 `plugins/life_engine/memory/service.py` 和 `plugins/life_engine/snn/core.py` 的分析，记忆系统主要由两部分构成：
 1. **显式记忆（知识图谱）**:
    - `MemoryNode` (节点): 包含属性如 `node_id`, `node_type` (FILE/CONCEPT), `activation_strength` (激活强度), `emotional_valence` (情感效价), `importance` (重要性)。
    - `MemoryEdge` (边): 包含属性如 `edge_id`, `source_id`, `target_id`, `edge_type` (RELATES, CAUSES, ASSOCIATES等), `weight` (权重), `activation_count` (激活次数)。
@@ -51,6 +51,6 @@
   - 点击节点视角自动飞行拉近。
 
 ## 实现步骤
-1. **编写 `memory_router.py`**: 实现读取 SQLite `memory_nodes` 和 `memory_edges` 并转换为 Graph JSON 的接口。
+1. **维护 `memory/router.py`**: 实现读取 SQLite `memory_nodes` 和 `memory_edges` 并转换为 Graph JSON 的接口。
 2. **编写 `static/memory_dashboard.html`**: 引入 `3d-force-graph`，编写绚丽的渲染和交互逻辑。
-3. **在 `plugin.py` 中注册**: 将 `MemoryRouter` 添加到插件的路由列表中。
+3. **在 `core/plugin.py` 中注册**: 将 `MemoryRouter` 添加到插件的路由列表中。

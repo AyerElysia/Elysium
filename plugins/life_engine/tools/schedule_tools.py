@@ -22,7 +22,7 @@ from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 from src.app.plugin_system.api import log_api
-from src.core.components import BaseTool
+from src.app.plugin_system.base import BaseTool
 from src.kernel.scheduler import TriggerType, get_unified_scheduler
 
 from ._utils import _get_workspace

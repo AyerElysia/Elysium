@@ -6,8 +6,8 @@ import re
 from typing import Any
 
 from src.app.plugin_system.api.log_api import get_logger
-from src.core.components.base.event_handler import BaseEventHandler
-from src.core.components.types import EventType
+from src.app.plugin_system.base import BaseEventHandler
+from src.app.plugin_system.types import EventType
 from src.kernel.event import EventDecision
 
 logger = get_logger("life_engine", display="life_engine")

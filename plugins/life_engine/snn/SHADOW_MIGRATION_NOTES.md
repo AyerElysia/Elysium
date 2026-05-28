@@ -1,8 +1,8 @@
 # SNN Shadow Mode Migration Notes
 
 **Date**: 2026-04-20
-**Status**: SNN temporarily demoted to shadow_only mode
-**Future**: SNN is a core system and will be re-enabled once technical issues are resolved
+**Status**: Historical note. SNN remains part of the core life_engine subsystem, with prompt injection still controlled by runtime config.
+**Future**: Re-enable stronger SNN prompt influence only after the validation criteria below are satisfied.
 
 ---
 

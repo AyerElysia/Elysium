@@ -9,14 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import traceback
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
 from src.app.plugin_system.api.log_api import get_logger
-from src.core.components.base import BaseService
+from src.app.plugin_system.base import BaseService
 from src.core.components.utils import should_strip_auto_reason_argument
 from src.core.models.message import Message
 from src.kernel.concurrency import get_task_manager
@@ -67,6 +67,7 @@ from .event_builder import (
     _parse_hhmm,
     _shorten_text,
 )
+from .followup import FollowupState, PendingFollowup
 from .state_manager import (
     StatePersistence,
     compress_history,
@@ -81,6 +82,12 @@ from .integrations import (
     SNNIntegration,
     MemoryIntegration,
 )
+from .self_pause import (
+    apply_self_pause,
+    build_self_pause_status,
+    clear_self_pause_state,
+    self_pause_status,
+)
 
 if TYPE_CHECKING:
     from ..memory.service import LifeMemoryService
@@ -88,35 +95,6 @@ if TYPE_CHECKING:
 
 logger = get_logger("life_engine", display="life_engine")
 _USER_TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "templates" / "USER.md"
-
-_SELF_PAUSE_MINUTES_MIN = 5
-_SELF_PAUSE_MINUTES_MAX = 480
-
-
-@dataclass
-class PendingFollowup:
-    """等待中的延迟续话任务。"""
-
-    topic: str
-    thought: str
-    followup_type: str
-    delay_seconds: float
-    scheduled_at: datetime
-    check_at: datetime
-    source: str = "post_reply"
-
-
-@dataclass
-class FollowupState:
-    stream_id: str
-    pending_followup: PendingFollowup | None = None
-    followup_chain_count: int = 0
-    followup_cooldown_until: datetime | None = None
-    next_check_time: datetime | None = None
-    is_waiting: bool = False
-    scheduler_task_name: str | None = None
-    active_check_kind: str | None = None
-
 
 class LifeEngineService(BaseService):
     """life_engine 心跳服务。
@@ -331,67 +309,17 @@ class LifeEngineService(BaseService):
         """计算距离上一次同步给对外运行模式过去了多少分钟。"""
         return self._minutes_since_tell_dfc()
 
-    def _parse_self_pause_until(self) -> datetime | None:
-        """解析主动休息锁的结束时间。"""
-        raw = self._state.self_pause_until
-        if not raw:
-            return None
-        try:
-            paused_until = datetime.fromisoformat(raw)
-        except Exception:
-            return None
-        if paused_until.tzinfo is None:
-            paused_until = paused_until.replace(tzinfo=timezone.utc).astimezone()
-        return paused_until
-
     def _self_pause_status(self) -> tuple[bool, int | None, str | None, str | None]:
         """返回主动休息锁状态。"""
-        paused_until = self._parse_self_pause_until()
-        if paused_until is None:
-            return False, None, None, self._state.self_pause_reason
-
-        now = datetime.now(paused_until.tzinfo or timezone.utc)
-        remaining_seconds = (paused_until - now).total_seconds()
-        if remaining_seconds <= 0:
-            return False, 0, paused_until.isoformat(), self._state.self_pause_reason
-
-        remaining_minutes = max(1, int((remaining_seconds + 59) // 60))
-        return (
-            True,
-            remaining_minutes,
-            paused_until.isoformat(),
-            self._state.self_pause_reason,
-        )
+        return self_pause_status(self._state)
 
     def get_self_pause_status(self) -> dict[str, Any]:
         """返回主动休息锁状态，供工具、监控面板或调试命令复用。"""
-        paused, remaining_minutes, paused_until, reason = self._self_pause_status()
-        return {
-            "paused": paused,
-            "remaining_minutes": remaining_minutes,
-            "paused_until": paused_until,
-            "reason": reason,
-            "started_at": self._state.self_pause_started_at,
-            "duration_minutes": self._state.self_pause_duration_minutes,
-            "will_wake_on_external_message": True,
-        }
+        return build_self_pause_status(self._state, self._self_pause_status())
 
     def _clear_self_pause_state(self) -> bool:
         """清除主动休息锁。调用方负责持锁和保存。"""
-        changed = any(
-            (
-                self._state.self_pause_until,
-                self._state.self_pause_started_at,
-                self._state.self_pause_reason,
-                self._state.self_pause_duration_minutes,
-            )
-        )
-        if changed:
-            self._state.self_pause_until = None
-            self._state.self_pause_started_at = None
-            self._state.self_pause_reason = None
-            self._state.self_pause_duration_minutes = 0
-        return changed
+        return clear_self_pause_state(self._state)
 
     async def clear_self_pause(self, *, source: str = "manual") -> bool:
         """清除主动休息锁。"""
@@ -409,38 +337,21 @@ class LifeEngineService(BaseService):
         reason: str = "",
     ) -> dict[str, Any]:
         """设置主动休息锁，让 LLM 心跳暂停一段时间。"""
-        requested_minutes = int(duration_minutes or 0)
-        clamped_minutes = max(
-            _SELF_PAUSE_MINUTES_MIN,
-            min(_SELF_PAUSE_MINUTES_MAX, requested_minutes),
-        )
-        started_at = datetime.now(timezone.utc).astimezone()
-        paused_until = started_at + timedelta(minutes=clamped_minutes)
-        cleaned_reason = " ".join(str(reason or "").split())
-
         async with self._get_lock():
-            self._state.self_pause_started_at = started_at.isoformat()
-            self._state.self_pause_until = paused_until.isoformat()
-            self._state.self_pause_reason = cleaned_reason
-            self._state.self_pause_duration_minutes = clamped_minutes
+            payload = apply_self_pause(
+                self._state,
+                duration_minutes=duration_minutes,
+                reason=reason,
+            )
 
         await self._save_runtime_context()
         logger.info(
             "life_engine 进入主动休息: "
-            f"duration={clamped_minutes}min requested={requested_minutes}min "
-            f"until={paused_until.isoformat()} reason={cleaned_reason or '-'}"
+            f"duration={payload['duration_minutes']}min requested={payload['requested_minutes']}min "
+            f"until={payload['paused_until']} reason={payload['reason'] or '-'}"
         )
 
-        return {
-            "paused": True,
-            "duration_minutes": clamped_minutes,
-            "requested_minutes": requested_minutes,
-            "paused_until": paused_until.isoformat(),
-            "reason": cleaned_reason,
-            "min_minutes": _SELF_PAUSE_MINUTES_MIN,
-            "max_minutes": _SELF_PAUSE_MINUTES_MAX,
-            "will_wake_on_external_message": True,
-        }
+        return payload
 
     def record_tell_dfc(self) -> None:
         """记录一次传话给 DFC 的时间。"""
