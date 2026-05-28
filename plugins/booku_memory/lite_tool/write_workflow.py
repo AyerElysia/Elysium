@@ -3,26 +3,21 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from datetime import datetime
 from typing import Annotated, Any, Literal, cast
 
-from json_repair import repair_json
-
-from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
-from src.core.components import BaseTool
+from src.app.plugin_system.base import BaseTool
 from src.kernel.concurrency import get_task_manager
-from src.kernel.llm import LLMPayload, ROLE, Text
 from src.kernel.logger import get_logger
 
 from ..config import PREDEFINED_FOLDERS, BookuMemoryConfig
-from ..agent.shared import get_internal_task_name
 from ..agent.tools import (
     BookuMemoryCreateTool,
     BookuMemoryReadFullContentTool,
     BookuMemoryRetrieveTool,
     BookuMemoryUpdateByIdTool,
 )
+from .shared import call_llm_json
 
 logger = get_logger("booku_memory_write_tool")
 
@@ -586,36 +581,16 @@ class BookuMemoryWriteTool(BaseTool):
     async def _call_llm_json(
         self, system_prompt: str, payload: dict[str, Any], *, config: BookuMemoryConfig
     ) -> dict[str, Any]:
-        """调用内部模型并解析 JSON 响应。
-
-        解析策略：
-        1. 直接 json.loads；
-        2. 失败后使用 json_repair 修复并重试；
-        3. 仍失败则返回空字典。
-        """
-        model_set = get_model_set_by_task(get_internal_task_name(config))
-        request = create_llm_request(
-            model_set=model_set,
+        """调用内部模型并解析 JSON 响应。"""
+        data = await call_llm_json(
+            system_prompt,
+            payload,
+            config=config,
             request_name="booku_memory_write_workflow",
         )
-        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
-        request.add_payload(
-            LLMPayload(ROLE.USER, Text(json.dumps(payload, ensure_ascii=False)))
-        )
-        response = await request.send(stream=False)
-        await response
-        message = (response.message or "").strip()
-        if not message:
-            return {}
-        try:
-            return json.loads(message)
-        except Exception:
-            try:
-                repaired = repair_json(message)
-                return json.loads(repaired)
-            except Exception:
-                logger.warning("无法解析子任务 JSON 输出")
-                return {}
+        if not data:
+            logger.warning("无法解析子任务 JSON 输出")
+        return data
 
     @staticmethod
     def _build_audit_summary(

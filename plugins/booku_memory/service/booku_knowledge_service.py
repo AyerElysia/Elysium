@@ -406,6 +406,7 @@ async def _split_document_semantically(
 async def _merge_short_chunks_by_title_similarity(
     chunks: list[_ChunkDraft],
     *,
+    max_chunk_chars: int,
     min_chunk_chars: int,
     memory_service: BookuMemoryService,
 ) -> list[_ChunkDraft]:
@@ -445,7 +446,16 @@ async def _merge_short_chunks_by_title_similarity(
             index += 1
             continue
 
-        best_pos, best_score = max(candidate_positions, key=lambda item: item[1])
+        viable_positions: list[tuple[int, float]] = []
+        for pos, score in candidate_positions:
+            merged_size = len(f"{working[index].content}\n\n{working[pos].content}".strip())
+            if merged_size <= max_chunk_chars:
+                viable_positions.append((pos, score))
+        if not viable_positions:
+            index += 1
+            continue
+
+        best_pos, best_score = max(viable_positions, key=lambda item: item[1])
         if best_score < _SEMANTIC_MIN_TITLE_MERGE_SIMILARITY:
             index += 1
             continue
@@ -498,6 +508,7 @@ async def _build_document_chunks(
     min_chunk_chars = max(80, int(max_chunk_chars * _SHORT_CHUNK_RATIO))
     return await _merge_short_chunks_by_title_similarity(
         drafts,
+        max_chunk_chars=max_chunk_chars,
         min_chunk_chars=min_chunk_chars,
         memory_service=memory_service,
     )
@@ -819,5 +830,6 @@ class BookuKnowledgeService(BaseService):
         return {"action": "booku_knowledge_dump", "total": len(items), "items": items}
 
     async def remember_titles_json(self) -> str:
-        titles = await self.export_document_titles()
+        records = await self._list_knowledge_records(limit=1000)
+        titles = _collect_unique_titles(records)
         return json.dumps(titles, ensure_ascii=False)

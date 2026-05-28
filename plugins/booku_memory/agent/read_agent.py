@@ -12,7 +12,7 @@ from src.core.components.types import ChatType
 from src.kernel.llm import LLMPayload, ROLE, Text, ToolResult
 from src.kernel.logger import get_logger
 
-from ..config import PREDEFINED_FOLDERS, BookuMemoryConfig
+from ..config import PREDEFINED_FOLDERS
 from .shared import (
     build_step_reminder,
     get_internal_task_name,

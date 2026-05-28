@@ -4,7 +4,7 @@ import os
 import re
 from pathlib import Path
 
-from src.core.components import BasePlugin, register_plugin
+from src.app.plugin_system.base import BasePlugin, register_plugin
 from src.core.prompt import SystemReminderInsertType
 from src.kernel.logger import get_logger
 

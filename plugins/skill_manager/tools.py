@@ -12,30 +12,16 @@ from contextlib import suppress, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Annotated, Any, cast
 
-from src.core.components import BaseTool
+from src.app.plugin_system.base import BaseTool
 from src.kernel.logger import get_logger
+
+from .shared import limit_text, manager_config_value, read_cached_skill_content
 
 
 logger = get_logger("skill_manager.tool")
 SUPPORTED_SCRIPT_SUFFIXES: tuple[str, ...] = (".py", ".ps1", ".bat", ".cmd", ".sh")
 EXTERNAL_SCRIPT_TIMEOUT_SECONDS = 15.0
 EXTERNAL_SCRIPT_KILL_GRACE_SECONDS = 3.0
-
-
-def _manager_config_value(plugin: Any, name: str, default: Any) -> Any:
-    """读取 SkillManager 配置值，兼容测试桩和异常配置。"""
-
-    manager = getattr(getattr(plugin, "config", None), "manager", None)
-    return getattr(manager, name, default)
-
-
-def _limit_text(text: str, max_chars: int, label: str) -> str:
-    """限制返回给 LLM 的文本长度，避免一次性塞爆上下文。"""
-
-    resolved_limit = max(512, int(max_chars))
-    if len(text) <= resolved_limit:
-        return text
-    return text[:resolved_limit].rstrip() + f"\n\n...（{label} 过长，已截断）"
 
 
 class SkillGetTool(BaseTool):
@@ -59,14 +45,15 @@ class SkillGetTool(BaseTool):
         if entry is None:
             return False, f"未找到 skill: {resolved_name}"
 
-        content = plugin.skill_contents.get(resolved_name)
-        if content is None:
-            content = entry.skill_md_path.read_text(encoding="utf-8")
-            plugin.skill_contents[resolved_name] = content
+        content = read_cached_skill_content(
+            plugin,
+            resolved_name,
+            entry.skill_md_path,
+        )
 
         plugin.injected_skills.add(resolved_name)
-        max_chars = _manager_config_value(plugin, "max_skill_body_chars", 8192)
-        return True, _limit_text(content, max_chars, "SKILL.md")
+        max_chars = manager_config_value(plugin, "max_skill_body_chars", 8192)
+        return True, limit_text(content, max_chars, "SKILL.md")
 
 
 class SkillGetReferenceTool(BaseTool):
@@ -106,8 +93,8 @@ class SkillGetReferenceTool(BaseTool):
             return False, error or "引用文件路径无效"
 
         content = resolved_path.read_text(encoding="utf-8")
-        max_chars = _manager_config_value(plugin, "max_reference_chars", 16384)
-        return True, _limit_text(content, max_chars, "引用文档")
+        max_chars = manager_config_value(plugin, "max_reference_chars", 16384)
+        return True, limit_text(content, max_chars, "引用文档")
 
 
 class SkillGetScriptTool(BaseTool):
@@ -142,7 +129,7 @@ class SkillGetScriptTool(BaseTool):
         if resolved_name not in plugin.injected_skills:
             return False, f"skill '{resolved_name}' 尚未注入，请先调用 get_skill"
 
-        if not bool(_manager_config_value(plugin, "allow_script_execution", True)):
+        if not bool(manager_config_value(plugin, "allow_script_execution", True)):
             return False, "get_script 已被配置关闭。可改用 get_reference 读取脚本文档或说明。"
 
         entry = plugin.skills.get(resolved_name)

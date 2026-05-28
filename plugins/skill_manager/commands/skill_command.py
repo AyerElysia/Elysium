@@ -11,6 +11,8 @@ from src.app.plugin_system.base import BaseCommand, cmd_route
 from src.app.plugin_system.types import PermissionLevel
 from src.core.prompt import SystemReminderInsertType, get_system_reminder_store
 
+from ..shared import limit_text, manager_config_value, read_cached_skill_content
+
 
 class _SkillManagerPluginProtocol(Protocol):
     """SkillManagerCommand 依赖的最小插件接口。"""
@@ -88,11 +90,12 @@ class SkillManagerCommand(BaseCommand):
         return first if first in plugin.skills else ""
 
     def _limit_skill_body(self, text: str) -> str:
-        manager = getattr(getattr(self._get_plugin(), "config", None), "manager", None)
-        max_chars = max(512, int(getattr(manager, "max_skill_body_chars", 8192)))
-        if len(text) <= max_chars:
-            return text
-        return text[:max_chars].rstrip() + "\n\n...（SKILL.md 过长，已截断）"
+        max_chars = manager_config_value(
+            self._get_plugin(),
+            "max_skill_body_chars",
+            8192,
+        )
+        return limit_text(text, max_chars, "SKILL.md")
 
     async def _handle_direct_skill_invocation(self, name: str, args: str) -> tuple[bool, str]:
         """处理 /<skill-name> 直接注入。"""
@@ -103,10 +106,7 @@ class SkillManagerCommand(BaseCommand):
             await self._reply(f"skill '{name}' 不存在。")
             return False, "not found"
 
-        content = plugin.skill_contents.get(name)
-        if content is None:
-            content = entry.skill_md_path.read_text(encoding="utf-8")
-            plugin.skill_contents[name] = content
+        content = read_cached_skill_content(plugin, name, entry.skill_md_path)
         if args:
             content = content.replace("$ARGUMENTS", args)
         content = self._limit_skill_body(content)
