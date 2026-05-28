@@ -18,10 +18,9 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, AsyncGenerator, Awaitable, TypeVar
 
-from src.core.components.types import ChatType
-from src.core.components.base.chatter import BaseChatter, Wait, Success, Failure, Stop
-from src.core.components.base.action import BaseAction
-from src.core.components.base.tool import BaseTool
+from src.app.plugin_system.base import BaseAction, BaseChatter, BaseTool, Failure, Stop, Success, Wait
+from src.app.plugin_system.types import ChatType
+from src.core.config import get_core_config
 from src.core.models.message import Message, MessageType
 from src.kernel.llm import Audio, Content, Image, LLMPayload, ROLE, Text, ToolCall, ToolResult, Video
 from src.kernel.logger import get_logger, COLOR
@@ -88,6 +87,15 @@ _THINK_ONLY_RETRY_REMINDER_STRICT = (
     "本轮必须马上给出有效组合，否则将按无回复收敛。"
     "合法组合只允许两种："
     "[action-think + action-life_send_text] 或 [action-life_pass_and_wait(无 think)]。）"
+)
+_THINK_ONLY_FORCE_SEND_REMINDER = (
+    "（系统强制收敛：你已连续多轮只调用 action-think，没有实际发送任何消息。"
+    "你最近一次 action-think 中自己决定的下一步行动是：\n"
+    "『{decision}』\n"
+    "现在请立即执行你自己的决定——调用 action-life_send_text，"
+    "把你想好的内容写入 content 参数发出去。"
+    "不要再调用 action-think，也不要调用 action-life_pass_and_wait。"
+    "这是本轮最后一次机会，如果仍然只调用 think 将被直接丢弃。）"
 )
 _MUST_REPLY_RETRY_REMINDER = (
     "（系统提醒：当前批消息已判定为“需要回复”。"
@@ -1848,15 +1856,19 @@ class LifeChatter(BaseChatter):
         decision: dict[str, Any],
         unread_msgs: list[Message],
     ) -> bool:
-        """只有硬路由判定才覆盖模型最终选择等待的权利。"""
+        """决策层已判定要响应时，必须闭合为一次可见回复。
+
+        sub-agent 只负责判断这批外部消息是否值得接入主对话。一旦它返回
+        should_respond=true，后续主模型可以先查历史、看媒体或 think，但不能
+        在没有任何可见回应的情况下静默收敛。
+        """
 
         if not bool(decision.get("should_respond", False)):
             return False
         if "force_reply" in decision:
             if not bool(decision.get("force_reply", False)):
                 return False
-            return cls._should_force_reply_for_unread_batch(unread_msgs)
-        return False
+        return cls._should_force_reply_for_unread_batch(unread_msgs)
 
     def _consume_runtime_assistant_context(
         self,
@@ -1895,6 +1907,21 @@ class LifeChatter(BaseChatter):
                 return False
             names.append(name)
         return all(cls._is_think_call_name(name) for name in names)
+
+    @classmethod
+    def _extract_last_think_decision(cls, calls: list[object]) -> str:
+        """从 call_list 中提取最后一个 action-think 的 decision 字段。"""
+        for call in reversed(calls):
+            name = str(getattr(call, "name", "") or "")
+            if not cls._is_think_call_name(name):
+                continue
+            args = getattr(call, "args", None)
+            if not isinstance(args, dict):
+                continue
+            decision = str(args.get("decision") or args.get("thought") or "").strip()
+            if decision:
+                return decision
+        return ""
 
     @staticmethod
     def _append_think_only_retry_instruction(response: Any, *, retry_count: int = 1) -> None:
@@ -2307,6 +2334,15 @@ class LifeChatter(BaseChatter):
                             logger.warning("纯文本回退达到重试上限，本轮回到等待")
                     else:
                         rt.plain_text_retry_count = 0
+                    if rt.must_reply and rt.must_reply_retry_count < _MAX_MUST_REPLY_RETRIES:
+                        rt.must_reply_retry_count += 1
+                        self._append_must_reply_retry_instruction(llm_response)
+                        self._transition(rt, _Phase.FOLLOW_UP, "must-reply empty-turn retry")
+                        return Success("must-reply empty-turn retry scheduled")
+                    if rt.must_reply:
+                        logger.warning("应回复轮次返回空 action，达到重试上限，本轮放弃强制回复以避免死循环")
+                        rt.must_reply = False
+                        rt.must_reply_retry_count = 0
                     # 不再 yield Stop 销毁生成器：保留累积的 payload 上下文，
                     # 回到 Wait 等待新消息，避免整个 LLM 对话链被清零。
                     # 补 ASSISTANT 占位：TOOL_RESULT 尾部必须接 ASSISTANT 才能接 USER。
@@ -2476,6 +2512,23 @@ class LifeChatter(BaseChatter):
                         )
                         self._transition(rt, _Phase.FOLLOW_UP, "think-only guard retry")
                         return Success("think-only guard retry scheduled")
+                    # think-only 达到重试上限
+                    if rt.must_reply:
+                        # 提取模型自己的 decision，注入更有针对性的强制发送提醒
+                        decision_text = self._extract_last_think_decision(call_list)
+                        if decision_text:
+                            forced_reminder = _THINK_ONLY_FORCE_SEND_REMINDER.format(
+                                decision=decision_text[:200],
+                            )
+                            llm_response.add_payload(LLMPayload(ROLE.SYSTEM, Text(forced_reminder)))
+                            logger.warning(
+                                f"连续仅调用 action-think 达到上限且 must_reply，"
+                                f"已注入强制发送提醒（decision={decision_text[:80]}）"
+                            )
+                            # 用掉 must_reply 的一次重试配额，避免后续再级联
+                            rt.must_reply_retry_count += 1
+                            self._transition(rt, _Phase.FOLLOW_UP, "think-only force-send retry")
+                            return Success("think-only force-send retry scheduled")
                     logger.warning("连续仅调用 action-think，达到重试上限，本轮按 action-only 收敛等待")
                 else:
                     rt.think_only_retry_count = 0
@@ -2508,6 +2561,9 @@ class LifeChatter(BaseChatter):
                             llm_response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
                         self._transition(rt, _Phase.WAIT_USER, "max rounds reached")
                         continue
+                    logger.info(
+                        "工具结果已接入上下文，进入 follow-up 让 life_chatter 继续生成可见回应"
+                    )
                     self._transition(rt, _Phase.FOLLOW_UP, "pending tool results")
                     return Success("follow-up scheduled")
 

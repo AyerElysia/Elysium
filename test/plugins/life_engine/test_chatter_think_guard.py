@@ -346,7 +346,7 @@ def test_should_force_reply_only_for_real_external_messages() -> None:
     assert LifeChatter._should_force_reply_for_unread_batch([real_user]) is True
 
 
-def test_should_force_reply_for_decision_only_when_explicitly_required() -> None:
+def test_should_force_reply_for_decision_when_response_is_accepted() -> None:
     proactive = SimpleNamespace(
         is_proactive_opportunity_trigger=True,
         is_proactive_followup_trigger=False,
@@ -361,7 +361,7 @@ def test_should_force_reply_for_decision_only_when_explicitly_required() -> None
     assert LifeChatter._should_force_reply_for_decision(
         {"should_respond": True},
         [real_user],
-    ) is False
+    ) is True
     assert LifeChatter._should_force_reply_for_decision(
         {"should_respond": True, "force_reply": False},
         [real_user],

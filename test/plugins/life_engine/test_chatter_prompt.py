@@ -240,6 +240,57 @@ async def test_life_chatter_think_only_retry_yields_between_model_turns(monkeypa
     LifeChatter.reset_global_runtime()
 
 
+@pytest.mark.asyncio
+async def test_life_chatter_must_reply_retries_empty_tool_turn(monkeypatch) -> None:
+    """应回复轮次不能在空 action 结果下静默收敛。"""
+
+    LifeChatter.reset_global_runtime()
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.payloads = []
+            self.call_list = []
+            self.message = ""
+
+        def add_payload(self, payload) -> None:
+            self.payloads.append(payload)
+
+    response = FakeResponse()
+    rt = _WorkflowRuntime(
+        response=response,
+        phase=_Phase.TOOL_EXEC,
+        history_merged=True,
+        unreads=[],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[],
+        active_stream_id="stream-a",
+        must_reply=True,
+    )
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=None)
+    chatter.stream_id = "stream-a"
+
+    async def fake_fetch_unreads():
+        return [], []
+
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+
+    result = await chatter._drive_global_runtime_until_yield(
+        SimpleNamespace(stream_id="stream-a"),
+        service=None,
+    )
+
+    assert isinstance(result, Success)
+    assert rt.phase == _Phase.FOLLOW_UP
+    assert rt.must_reply_retry_count == 1
+    assert response.payloads
+
+    LifeChatter.reset_global_runtime()
+
+
 def test_life_chatter_wait_transition_clears_global_runtime_owner() -> None:
     rt = _WorkflowRuntime(
         response=SimpleNamespace(payloads=[]),
