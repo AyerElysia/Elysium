@@ -10,14 +10,10 @@ import queue
 import threading
 from typing import TYPE_CHECKING, Any, Callable
 
+from .exceptions import CommandExecutionError
+
 if TYPE_CHECKING:
     from .bot import Bot
-
-
-class CommandExecutionError(Exception):
-    """命令执行异常"""
-
-    pass
 
 
 class CommandParser:
@@ -125,6 +121,8 @@ class CommandParser:
         Raises:
             CommandExecutionError: 命令执行失败
         """
+        command_name = "<input>"
+
         try:
             input_item = await self._get_next_input()
             if input_item is None:
@@ -182,10 +180,10 @@ class CommandParser:
         except KeyboardInterrupt:
             # 用户中断（如 Ctrl+C）
             return False
+        except CommandExecutionError:
+            raise
         except Exception as e:
-            raise CommandExecutionError(
-                f"Failed to execute command: {e}"
-            ) from e
+            raise CommandExecutionError(command_name, str(e)) from e
 
     async def cmd_help(self, args: list[str]) -> None:
         """显示帮助信息

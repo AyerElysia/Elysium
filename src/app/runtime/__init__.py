@@ -4,12 +4,13 @@
 """
 
 from .bot import Bot
-from .command_parser import CommandParser, CommandExecutionError
+from .command_parser import CommandParser
 from .console_ui import ConsoleUIManager, UILevel
 from .exceptions import (
     BotInitializationError,
     BotRuntimeError,
     BotShutdownError,
+    CommandExecutionError,
     PluginLoadError,
 )
 from .signal_handler import SignalHandler

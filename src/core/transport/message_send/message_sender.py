@@ -302,7 +302,6 @@ class MessageSender:
             # 尝试从事件管理器获取
             from src.core.managers.event_manager import get_event_manager
             from src.core.components.types import EventType
-            from src.kernel.event import EventDecision
 
             event_mgr = get_event_manager()
             result = await event_mgr.publish_event(

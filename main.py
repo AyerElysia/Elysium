@@ -2,12 +2,14 @@
 
 启动 Neo-MoFox Bot 应用。
 """
-import tomllib
 import asyncio
+from pathlib import Path
+import tomllib
 
 from src.app.runtime import UILevel
 
-def load_ui_level_from_config(config_path: str = "config/core.toml") -> "UILevel":  # type: ignore
+
+def load_ui_level_from_config(config_path: str = "config/core.toml") -> UILevel:
     """从配置文件加载 UI 级别
 
     Args:
@@ -16,21 +18,31 @@ def load_ui_level_from_config(config_path: str = "config/core.toml") -> "UILevel
     Returns:
         UILevel: UI 级别枚举值
     """
-    
-
     level_map = {
         "minimal": UILevel.MINIMAL,
         "standard": UILevel.STANDARD,
         "verbose": UILevel.VERBOSE,
     }
 
-    try:
-        with open(config_path, "rb") as f:
-            config = tomllib.load(f)
-            ui_level_str = config.get("bot", {}).get("ui_level", "standard").lower()
-            return level_map.get(ui_level_str, UILevel.STANDARD)
-    except Exception:
+    path = Path(config_path)
+    if not path.exists():
         return UILevel.STANDARD
+
+    with path.open("rb") as f:
+        config = tomllib.load(f)
+
+    ui_level = config.get("bot", {}).get("ui_level", "standard")
+    if not isinstance(ui_level, str):
+        raise ValueError("bot.ui_level must be a string")
+
+    ui_level_key = ui_level.lower()
+    if ui_level_key not in level_map:
+        valid_levels = ", ".join(level_map)
+        raise ValueError(
+            f"Invalid bot.ui_level '{ui_level}'. Expected one of: {valid_levels}"
+        )
+
+    return level_map[ui_level_key]
 
 
 async def main() -> None:
