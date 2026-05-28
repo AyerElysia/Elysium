@@ -5,19 +5,8 @@
 """
 
 import numpy as np
-import pytest
 
-
-# ── 直接导入被测模块 ──
-import sys
-from pathlib import Path
-
-# 确保插件路径可导入
-_plugin_root = Path(__file__).resolve().parent.parent / "plugins" / "life_engine"
-if str(_plugin_root.parent) not in sys.path:
-    sys.path.insert(0, str(_plugin_root.parent))
-
-from life_engine.snn_core import DriveCoreNetwork, LIFNeuronGroup, STDPSynapse
+from plugins.life_engine.snn.core import DriveCoreNetwork, LIFNeuronGroup, STDPSynapse
 
 
 # ================================================================
@@ -148,9 +137,6 @@ class TestSTDPSynapse:
         syn_pos.update(pre, post, reward=0.8)
         syn_neg.update(pre, post, reward=-0.8)
 
-        # 正奖赏下增强应更大
-        diff_pos = np.sum(np.abs(syn_pos.W))
-        diff_neg = np.sum(np.abs(syn_neg.W))
         # 不做严格大小比较因为 LTD 也受影响，只确保不崩溃
         assert np.all(np.isfinite(syn_pos.W))
         assert np.all(np.isfinite(syn_neg.W))

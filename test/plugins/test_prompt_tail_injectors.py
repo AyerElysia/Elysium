@@ -6,15 +6,35 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 
-from plugins.drive_core_plugin.components.events.drive_core_prompt_injector import (
-    DriveCorePromptInjector,
-)
-from plugins.drive_core_plugin.config import DriveCoreConfig
-from plugins.unfinished_thought_plugin.components.events.prompt_injector import (
-    UnfinishedThoughtPromptInjector,
-)
-from plugins.unfinished_thought_plugin.config import UnfinishedThoughtConfig
+import pytest
+
 from src.kernel.event import EventDecision
+
+drive_core_injector = pytest.importorskip(
+    "plugins.drive_core_plugin.components.events.drive_core_prompt_injector",
+    reason="drive_core_plugin is not present in this checkout",
+)
+drive_core_config = pytest.importorskip(
+    "plugins.drive_core_plugin.config",
+    reason="drive_core_plugin is not present in this checkout",
+)
+unfinished_injector = pytest.importorskip(
+    "plugins.unfinished_thought_plugin.components.events.prompt_injector",
+    reason="unfinished_thought_plugin is not present in this checkout",
+)
+unfinished_config = pytest.importorskip(
+    "plugins.unfinished_thought_plugin.config",
+    reason="unfinished_thought_plugin is not present in this checkout",
+)
+
+DriveCorePromptInjector = (
+    drive_core_injector.DriveCorePromptInjector
+)
+DriveCoreConfig = drive_core_config.DriveCoreConfig
+UnfinishedThoughtPromptInjector = (
+    unfinished_injector.UnfinishedThoughtPromptInjector
+)
+UnfinishedThoughtConfig = unfinished_config.UnfinishedThoughtConfig
 
 
 def test_unfinished_thought_injects_into_user_prompt() -> None:

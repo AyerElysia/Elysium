@@ -4,22 +4,14 @@
 """
 
 import time
+from dataclasses import dataclass
+from enum import Enum
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
-import sys
-from pathlib import Path
-from unittest.mock import MagicMock
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Optional
 
-# 确保插件路径可导入
-_plugin_root = Path(__file__).resolve().parent.parent / "plugins" / "life_engine"
-if str(_plugin_root.parent) not in sys.path:
-    sys.path.insert(0, str(_plugin_root.parent))
-
-from life_engine.snn_bridge import extract_features, compute_reward, SNNBridge
+from plugins.life_engine.snn.bridge import SNNBridge, compute_reward, extract_features
 
 
 # ── 模拟事件类 ──
@@ -180,7 +172,7 @@ class TestSNNBridge:
             "rest_drive": "低",
         }
         text = bridge.format_drive_for_prompt(drives)
-        assert "内在驱动态" in text
+        assert "SNN快层" in text
         assert "激活高" in text
         assert "任务高" in text
 
