@@ -12,9 +12,6 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from src.kernel.logger import get_logger
-
-logger = get_logger("sts2_operator", display="STS2")
-
 from .decision import (
     Sts2DecisionRequest,
     Sts2DecisionResult,
@@ -22,6 +19,8 @@ from .decision import (
     build_fallback_decision,
     extract_decision_result,
 )
+
+logger = get_logger("sts2_operator", display="STS2")
 
 
 AskElysia = Callable[[Sts2DecisionRequest, str], Awaitable[str]]

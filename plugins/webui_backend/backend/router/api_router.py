@@ -5,7 +5,7 @@
 
 from src.kernel.logger import get_logger
 from src.core.components.base.router import BaseRouter
-from src.core.utils.security import VerifiedDep, get_api_key
+from src.core.utils.security import get_api_key
 from fastapi import Depends
 from pydantic import BaseModel
 

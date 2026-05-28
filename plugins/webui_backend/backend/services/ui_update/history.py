@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from src.kernel.logger import get_logger
-from .runner import is_ui_git_repo, run_ui_git, get_ui_version
+from .runner import is_ui_git_repo, run_ui_git
 from .models import UIBackupInfo, UIBackupsResponse, UICommitDetail, FileChange
 
 logger = get_logger(name="UIHistory", color="#CBA6F7")
@@ -167,7 +167,7 @@ async def get_ui_commit_detail(commit_hash: str) -> UICommitDetail:
             "show", "--stat", "--no-patch", commit_hash
         )
         # stat 最后一行类似 "3 files changed, 42 insertions(+), 5 deletions(-)"
-        stat_lines = [l for l in stat_out.splitlines() if l.strip()]
+        stat_lines = [line for line in stat_out.splitlines() if line.strip()]
         stats = stat_lines[-1].strip() if stat_lines else None
 
         return UICommitDetail(

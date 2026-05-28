@@ -19,10 +19,10 @@ API 路径前缀：/webui/api/relationship
 
 import json
 import time
-from typing import Any, Literal
+from typing import Any
 
 from fastapi import HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from src.kernel.logger import get_logger
 from src.core.components.base.router import BaseRouter

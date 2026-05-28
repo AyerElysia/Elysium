@@ -163,18 +163,6 @@ export async function updateCoreConfig(updates: Record<string, unknown>) {
 }
 
 /**
- * 批量更新多个配置项
- *
- * 这是 updateCoreConfig 的别名，提供更清晰的语义
- *
- * @param updates - 配置更新对象
- * @returns Promise<ConfigUpdateResponse> 更新结果
- */
-export async function batchUpdateCoreConfig(updates: Record<string, unknown>) {
-  return updateCoreConfig(updates)
-}
-
-/**
  * 获取原始 TOML 文件内容
  */
 export async function getCoreConfigRaw(): Promise<ConfigRawResponse> {

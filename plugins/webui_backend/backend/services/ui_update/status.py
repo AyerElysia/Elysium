@@ -90,7 +90,7 @@ async def get_ui_status() -> UIStatusResult:
             log_out, _, _ = await run_ui_git(
                 "log", "--oneline", "--no-decorate", "HEAD..@{u}"
             )
-            changelog = [l.strip() for l in log_out.splitlines() if l.strip()]
+            changelog = [line.strip() for line in log_out.splitlines() if line.strip()]
 
         # ---------- 7. 远程最新 commit 与版本 ----------
         remote_out, _, remote_code = await run_ui_git("rev-parse", "@{u}")

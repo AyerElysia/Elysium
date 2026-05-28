@@ -246,7 +246,7 @@ class MiniCPMRealtimeAdapter(BaseRealtimeAdapter):
             body = {"messages": [], "reset_only": True}
             timeout = aiohttp.ClientTimeout(total=5)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(reset_url, headers=headers, json=body) as resp:
+                async with session.post(reset_url, headers=headers, json=body):
                     # We don't care about the response body — the important side
                     # effect is that stream_manager.uid is now set to our uid.
                     pass

@@ -10,7 +10,7 @@ import random
 from collections import Counter
 from dataclasses import dataclass
 
-from .models import GameState, NightState, Phase, Player, Role, ROLE_LABELS
+from .models import GameState, NightState, Phase, Player, Role
 
 
 MIN_PLAYERS = 6

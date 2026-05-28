@@ -4,11 +4,10 @@
 """
 
 from src.kernel.logger import get_logger
-from src.core.components.base.plugin import BasePlugin
+from src.app.plugin_system.base import BasePlugin, register_plugin
 from .backend.router import FrontendRouter, CoreConfigRouter, ApiRouter, StatsRouter, ModelStatsRouter, SettingRouter, ModelConfigRouter, PluginConfigRouter, PluginManageRouter, LogViewerRouter, RealtimeLogRouter, LiveChatRouter, ChatroomRouter, InitializationRouter, GitEnvRouter, GitUpdateRouter, UIUpdateRouter, LifeEnginePanelRouter, RelationshipRouter, EmojiRouter
 from .backend.adapter import ChatroomAdapter
 from .backend.event_handler import LogEventHandler, LiveChatEventHandler
-from src.core.components.loader import register_plugin
 
 logger = get_logger("webui_plugin")
 

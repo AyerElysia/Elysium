@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import urllib.parse
 import wave
 
 import pytest
@@ -38,7 +39,13 @@ async def test_build_realtime_adapter_returns_minicpm_adapter() -> None:
     )
 
     assert isinstance(adapter, MiniCPMRealtimeAdapter)
-    assert adapter.upstream_connect_url() == "ws://127.0.0.1:8010/v1/realtime?mode=video"
+    parsed = urllib.parse.urlparse(adapter.upstream_connect_url())
+    query = urllib.parse.parse_qs(parsed.query)
+    assert parsed.scheme == "ws"
+    assert parsed.netloc == "127.0.0.1:8010"
+    assert parsed.path == "/v1/realtime"
+    assert query["mode"] == ["video"]
+    assert query["uid"] == ["live-session"]
     assert adapter.upstream_connect_headers() == {"Authorization": "Bearer test"}
 
 
@@ -68,12 +75,11 @@ async def test_minicpm_adapter_builds_session_update_from_context_snapshot() -> 
         }
     )
 
-    assert len(result.upstream_messages) == 1
-    session_update = json.loads(result.upstream_messages[0])
-    assert session_update["type"] == "session.update"
-    assert "life_chatter_system_prompt" in session_update["session"]["instructions"]
-    assert "realtime_unified_events" in session_update["session"]["instructions"]
-    assert session_update["session"]["max_slice_nums"] == 1
+    assert result.upstream_messages == []
+    assert result.client_messages == [
+        {"type": "status", "status": "context.snapshot", "text": "context snapshot received"}
+    ]
+    assert adapter.context_snapshot["life_runtime_context"] == "ctx"
 
 
 @pytest.mark.asyncio
@@ -115,10 +121,10 @@ async def test_minicpm_adapter_turns_pcm_audio_into_append_and_attaches_video_fr
 
     assert len(result.upstream_messages) == 1
     audio_packet = json.loads(result.upstream_messages[0])
-    assert audio_packet["type"] == "input_audio_buffer.append"
-    assert audio_packet["audio"]
-    assert audio_packet["video_frames"] == ["AAAA"]
-    assert audio_packet["max_slice_nums"] == 1
+    content = audio_packet["messages"][0]["content"]
+    assert content[0]["type"] == "input_audio"
+    assert content[0]["input_audio"]["data"]
+    assert content[1] == {"type": "image_data", "image_data": {"data": "AAAA"}}
 
 
 @pytest.mark.asyncio
@@ -139,8 +145,8 @@ async def test_minicpm_adapter_converts_wav_turn_and_emits_client_audio_and_fina
         }
     )
 
-    assert any(json.loads(msg)["type"] == "session.update" for msg in result.upstream_messages)
-    assert any(json.loads(msg)["type"] == "input_audio_buffer.append" for msg in result.upstream_messages)
+    assert len(result.upstream_messages) == 1
+    assert json.loads(result.upstream_messages[0])["messages"][0]["content"][0]["type"] == "input_audio"
 
     upstream = await adapter.on_upstream_message(
         {

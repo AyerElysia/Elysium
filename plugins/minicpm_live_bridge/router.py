@@ -932,7 +932,6 @@ class MiniCPMLiveRouter(BaseRouter):
 
     async def _run_local_api_turn(self, request: LiveTurnRequest) -> str:
         """使用 config/model.toml 的 live 任务跑一轮半双工多模态 API。"""
-        t0 = time.perf_counter()
         prep = await self._prepare_local_api_turn(request)
         llm_request = prep["llm_request"]
 

@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import ABC
 from typing import Any, ClassVar
 
 from src.kernel.storage import json_store

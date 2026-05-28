@@ -68,7 +68,7 @@ async def check_updates() -> UpdateCheck:
             log_out, _, _ = await run_git(
                 "log", "--oneline", "HEAD..@{u}", "--no-decorate"
             )
-            logs = [l.strip() for l in log_out.splitlines() if l.strip()]
+            logs = [line.strip() for line in log_out.splitlines() if line.strip()]
 
         return UpdateCheck(
             success=True,

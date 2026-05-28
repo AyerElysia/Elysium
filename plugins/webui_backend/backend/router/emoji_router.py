@@ -23,7 +23,7 @@ import base64
 import hashlib
 import time
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 from fastapi import HTTPException, UploadFile, File
 from pydantic import BaseModel, Field
@@ -549,9 +549,7 @@ class EmojiRouter(BaseRouter):
                         # 计算 hash
                         file_hash = hashlib.sha256(content).hexdigest()
 
-                        # 解析格式
                         ext = Path(upload_file.filename).suffix.lower() or ".png"
-                        format_name = _parse_format(ext)
 
                         # 保存文件
                         filename = f"{file_hash[:16]}_emoji{ext}"

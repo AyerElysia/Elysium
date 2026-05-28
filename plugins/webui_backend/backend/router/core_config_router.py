@@ -163,7 +163,7 @@ def _extract_field_info(section_key: str, field_name: str, field_info: Any) -> C
     # 检测特殊编辑器（SPECIAL_EDITOR_FIELDS 显式指定 > array 自动推断）
     special_editor: str | None = SPECIAL_EDITOR_FIELDS.get(field_name)
     if special_editor is None and type_str == "array":
-        if hasattr(field_type, "__args__") and field_type.__args__ and field_type.__args__[0] == str:
+        if hasattr(field_type, "__args__") and field_type.__args__ and field_type.__args__[0] is str:
             special_editor = "string_array"
 
     return ConfigFieldSchema(

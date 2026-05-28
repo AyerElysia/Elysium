@@ -22,7 +22,6 @@ from src.kernel.logger import get_logger
 from src.core.components.base.router import BaseRouter
 from src.core.utils.security import VerifiedDep
 from src.core.managers import get_plugin_manager
-from src.core.managers.config_manager import get_config_manager
 
 logger = get_logger(name="PluginConfigRouter", color="green")
 

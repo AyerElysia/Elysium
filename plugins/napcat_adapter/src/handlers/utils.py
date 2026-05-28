@@ -1,7 +1,6 @@
 import io
 import time
 import weakref
-import asyncio
 from typing import TYPE_CHECKING, Any
 
 import httpx

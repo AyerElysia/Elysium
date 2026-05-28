@@ -25,7 +25,6 @@ from ..services.git_update import (
     UpdateCheck,
     UpdateResult,
     SwitchBranchResult,
-    MainBackupInfo,
     MainBackupsResponse,
     MainCommitDetail,
     # 服务函数

@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel
 
 from src.kernel.logger import get_logger
@@ -26,11 +28,6 @@ from ..services.git_env import (
 )
 
 logger = get_logger(name="GitEnvRouter", color="#CBA6F7")
-
-
-# ==================== Pydantic Models ====================
-
-from typing import Literal
 
 
 class GitEnvStatus(BaseModel):
