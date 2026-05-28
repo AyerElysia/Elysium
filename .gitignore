@@ -92,6 +92,7 @@ poetry.lock
 # Project-specific
 /.pytest_cache/
 /test/__pycache__/
+.codex-backups/
 
 logs/*
 htmlcov/
@@ -99,7 +100,7 @@ htmlcov/
 old/
 data/
 .claude/
-config/
+/config/
 
 plugins/*
 
