@@ -58,6 +58,7 @@ _MAX_PLAIN_TEXT_RETRIES = 2
 _MAX_THINK_ONLY_RETRIES = 2
 _MAX_MUST_REPLY_RETRIES = 2
 _MAX_INNER_MONOLOGUE_RETRIES = 2
+_GLOBAL_RUNTIME_BUSY_RETRY_SECONDS = 1.0
 _PLAIN_TEXT_RETRY_REMINDER = (
     "（系统提醒：上一轮你直接输出了普通文本，而不是 action/tool call，这在当前对话器中无效。"
     "请立刻改为返回可执行 action 列表，不要再直接输出解释文本。"
@@ -2162,7 +2163,10 @@ class LifeChatter(BaseChatter):
         if rt.phase != _Phase.WAIT_USER:
             active_stream_id = str(getattr(rt, "active_stream_id", "") or "").strip()
             if active_stream_id and active_stream_id != stream_id:
-                return Wait()
+                logger.debug(
+                    f"[{stream_id}] 统一 life_chatter runtime 正由 {active_stream_id} 推进，稍后重试"
+                )
+                return Wait(time=_GLOBAL_RUNTIME_BUSY_RETRY_SECONDS)
             if not active_stream_id:
                 rt.active_stream_id = stream_id
         max_rounds = self._get_max_rounds()
@@ -2606,7 +2610,10 @@ class LifeChatter(BaseChatter):
             if rt is not None and rt.phase != _Phase.WAIT_USER:
                 active_stream_id = str(getattr(rt, "active_stream_id", "") or "").strip()
                 if active_stream_id and active_stream_id != self.stream_id:
-                    yield Wait()
+                    logger.debug(
+                        f"[{self.stream_id}] 统一 life_chatter runtime 正由 {active_stream_id} 推进，稍后重试"
+                    )
+                    yield Wait(time=_GLOBAL_RUNTIME_BUSY_RETRY_SECONDS)
                     continue
             elif not unread_msgs:
                 yield Wait()

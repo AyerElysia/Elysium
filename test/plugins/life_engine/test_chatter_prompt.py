@@ -6,7 +6,12 @@ import asyncio
 from types import SimpleNamespace
 
 from plugins.life_engine.core.config import LifeEngineConfig
-from plugins.life_engine.core.chatter import LifeChatter, _Phase, _WorkflowRuntime
+from plugins.life_engine.core.chatter import (
+    LifeChatter,
+    _GLOBAL_RUNTIME_BUSY_RETRY_SECONDS,
+    _Phase,
+    _WorkflowRuntime,
+)
 from plugins.life_engine.constants import LIFE_CHATTER_GLOBAL_CURSOR_KEY
 from plugins.life_engine.service.core import LifeEngineService
 from plugins.life_engine.service.event_builder import EventType, LifeEngineEvent
@@ -178,6 +183,57 @@ async def test_life_chatter_global_runtime_follow_up_stays_on_owner_stream(monke
     )
 
     assert isinstance(result, Wait)
+    assert result.time == _GLOBAL_RUNTIME_BUSY_RETRY_SECONDS
+    assert rt.phase == _Phase.FOLLOW_UP
+    assert rt.active_stream_id == "stream-a"
+
+    LifeChatter.reset_global_runtime()
+
+
+@pytest.mark.asyncio
+async def test_life_chatter_execute_uses_timed_retry_when_runtime_is_busy(monkeypatch) -> None:
+    LifeChatter.reset_global_runtime()
+    rt = _WorkflowRuntime(
+        response=SimpleNamespace(payloads=[]),
+        phase=_Phase.FOLLOW_UP,
+        history_merged=True,
+        unreads=[],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[],
+        active_stream_id="stream-a",
+    )
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+
+    class DummyStreamManager:
+        async def activate_stream(self, stream_id: str):
+            return SimpleNamespace(stream_id=stream_id)
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=None)
+    chatter.stream_id = "stream-b"
+
+    async def fake_fetch_unreads():
+        return [], [SimpleNamespace(content="new message")]
+
+    import src.core.managers.stream_manager as stream_manager_module
+
+    monkeypatch.setattr(chatter, "_get_life_service", lambda: None)
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+    monkeypatch.setattr(
+        stream_manager_module,
+        "get_stream_manager",
+        lambda: DummyStreamManager(),
+    )
+
+    gen = chatter.execute()
+    try:
+        result = await anext(gen)
+    finally:
+        await gen.aclose()
+
+    assert isinstance(result, Wait)
+    assert result.time == _GLOBAL_RUNTIME_BUSY_RETRY_SECONDS
     assert rt.phase == _Phase.FOLLOW_UP
     assert rt.active_stream_id == "stream-a"
 
