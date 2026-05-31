@@ -219,3 +219,39 @@ async def test_promoted_media_after_tool_result_gets_assistant_bridge() -> None:
         ROLE.USER,
     ]
     assert any(isinstance(part, Image) for part in response.payloads[-1].content)
+
+
+@pytest.mark.asyncio
+async def test_promoted_media_after_tool_result_with_system_reminder_gets_assistant_bridge() -> None:
+    LifeInspectMediaTool._consume_promoted_media("stream-1")
+    tool = _make_tool(
+        [_message("m1", media=[{"type": "image", "data": "base64|QUJD"}])]
+    )
+    await tool.execute(focus="确认是否能直接看图")
+
+    response = SimpleNamespace(payloads=[])
+    response.add_payload = lambda payload: response.payloads.append(payload)
+    response.add_payload(
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            ToolResult(value="ok", call_id="call-1", name="tool-inspect_media"),
+        )
+    )
+    response.add_payload(LLMPayload(ROLE.SYSTEM, Text("必须回复用户")))
+
+    appended = LifeChatter._append_promoted_media_payload(response, "stream-1")
+
+    assert appended is True
+    assert [payload.role for payload in response.payloads] == [
+        ROLE.TOOL_RESULT,
+        ROLE.SYSTEM,
+        ROLE.ASSISTANT,
+        ROLE.USER,
+    ]
+    convo_roles = [
+        payload.role
+        for payload in response.payloads
+        if payload.role not in {ROLE.SYSTEM, ROLE.TOOL}
+    ]
+    assert convo_roles == [ROLE.TOOL_RESULT, ROLE.ASSISTANT, ROLE.USER]
+    assert any(isinstance(part, Image) for part in response.payloads[-1].content)

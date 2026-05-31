@@ -1443,6 +1443,7 @@ class LifeChatter(BaseChatter):
         runtime_context_text: str = "",
         include_history_in_prompt: bool = True,
         include_recent_chat_history: bool = True,
+        history_message_limit: int | None = None,
         commit_cursors: bool = True,
         event_cursor_override: int | None = None,
     ) -> dict[str, Any]:
@@ -1455,9 +1456,11 @@ class LifeChatter(BaseChatter):
         """
         history_text = ""
         if include_history_in_prompt:
+            if history_message_limit is None:
+                history_message_limit = self._get_initial_history_message_limit()
             history_text = await self._build_history_text_async(
                 chat_stream,
-                max_messages=self._get_initial_history_message_limit(),
+                max_messages=history_message_limit,
                 global_history=True,
             )
 
@@ -1891,7 +1894,15 @@ class LifeChatter(BaseChatter):
     @staticmethod
     def _has_tool_result_tail(response: Any) -> bool:
         payloads = getattr(response, "payloads", None)
-        return bool(payloads and payloads[-1].role == ROLE.TOOL_RESULT)
+        if not payloads:
+            return False
+        pinned_roles = {ROLE.SYSTEM, ROLE.TOOL}
+        for payload in reversed(payloads):
+            role = getattr(payload, "role", None)
+            if role in pinned_roles:
+                continue
+            return role == ROLE.TOOL_RESULT
+        return False
 
     @staticmethod
     def _is_think_call_name(call_name: str) -> bool:

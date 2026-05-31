@@ -216,3 +216,76 @@ async def test_minecraft_decision_dispatch_bypasses_chat_buffer(monkeypatch) -> 
     assert captured["bypass_message_buffer"] is True
     assert captured["total_timeout"] == router._GAME_DECISION_TOTAL_TIMEOUT
     assert captured["segment_timeout"] == router._SEGMENT_TIMEOUT
+
+
+async def test_live_chat_uses_full_chatter_by_default(monkeypatch) -> None:
+    router = object.__new__(OpenAIRouter)
+    captured = {}
+
+    async def fake_fast(**kwargs):
+        raise AssertionError("fast reply path should be opt-in")
+
+    async def fake_dispatch(**kwargs):
+        captured.update(kwargs)
+        return "在呢。"
+
+    monkeypatch.delenv("LIVE_BRIDGE_FAST_REPLY_ENABLED", raising=False)
+    monkeypatch.setattr(router, "_handle_live_chat_fast", fake_fast)
+    monkeypatch.setattr(router, "_dispatch_message_and_collect", fake_dispatch)
+
+    reply = await router._handle_live_chat(
+        [ChatMessage(role="user", content="观众“测试用户”说：爱莉爱莉")]
+    )
+
+    assert reply == "在呢。"
+    assert captured["stream_id"] == "live_broadcast"
+    assert captured["platform"] == "live"
+    assert captured["sender_name"] == "测试用户"
+
+
+async def test_live_chat_uses_fast_reply_when_enabled(monkeypatch) -> None:
+    router = object.__new__(OpenAIRouter)
+    captured = {}
+
+    async def fake_fast(**kwargs):
+        captured.update(kwargs)
+        return "在呢。"
+
+    async def fake_dispatch(**kwargs):
+        raise AssertionError("full chatter path should not be used")
+
+    monkeypatch.setenv("LIVE_BRIDGE_FAST_REPLY_ENABLED", "true")
+    monkeypatch.setattr(router, "_handle_live_chat_fast", fake_fast)
+    monkeypatch.setattr(router, "_dispatch_message_and_collect", fake_dispatch)
+
+    reply = await router._handle_live_chat(
+        [ChatMessage(role="user", content="观众“测试用户”说：爱莉爱莉")]
+    )
+
+    assert reply == "在呢。"
+    assert captured["stream_id"] == "live_broadcast"
+    assert captured["platform"] == "live"
+    assert captured["viewer_name"] == "测试用户"
+
+
+async def test_live_chat_fast_failure_does_not_fallback_to_full_chatter_by_default(monkeypatch) -> None:
+    router = object.__new__(OpenAIRouter)
+
+    async def fake_fast(**kwargs):
+        raise RuntimeError("fast model timeout")
+
+    async def fake_dispatch(**kwargs):
+        raise AssertionError("full chatter fallback should be opt-in")
+
+    monkeypatch.setenv("LIVE_BRIDGE_FAST_REPLY_ENABLED", "true")
+    monkeypatch.delenv("LIVE_BRIDGE_FAST_REPLY_FALLBACK_TO_CHATTER", raising=False)
+    monkeypatch.setattr(router, "_handle_live_chat_fast", fake_fast)
+    monkeypatch.setattr(router, "_dispatch_message_and_collect", fake_dispatch)
+
+    reply = await router._handle_live_chat([ChatMessage(role="user", content="爱莉爱莉")])
+
+    assert "卡了一下" in reply
+
+
+def test_live_fast_reply_sanitizer_strips_wrappers() -> None:
+    assert OpenAIRouter._sanitize_live_fast_reply("```text\n爱莉：看到啦。\n```") == "看到啦。"

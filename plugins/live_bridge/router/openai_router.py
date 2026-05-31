@@ -53,6 +53,22 @@ _DEFAULT_MINECRAFT_TTS_ENDPOINT = "http://127.0.0.1:18082/send"
 _DEFAULT_MINECRAFT_TTS_TYPE = "reread_top_priority"
 _DEFAULT_MINECRAFT_TTS_USERNAME = "Minecraft"
 _DEFAULT_MINECRAFT_TTS_TIMEOUT = 2.5
+_LIVE_FAST_REPLY_ENABLED_ENV = "LIVE_BRIDGE_FAST_REPLY_ENABLED"
+_LIVE_FAST_REPLY_MODEL_ENV = "LIVE_BRIDGE_FAST_REPLY_MODEL"
+_LIVE_FAST_REPLY_TIMEOUT_ENV = "LIVE_BRIDGE_FAST_REPLY_TIMEOUT"
+_LIVE_FAST_REPLY_HISTORY_LIMIT_ENV = "LIVE_BRIDGE_FAST_REPLY_HISTORY_LIMIT"
+_LIVE_FAST_REPLY_PREFIX_CACHE_TTL_ENV = "LIVE_BRIDGE_FAST_REPLY_PREFIX_CACHE_TTL"
+_LIVE_FAST_REPLY_FALLBACK_TO_CHATTER_ENV = "LIVE_BRIDGE_FAST_REPLY_FALLBACK_TO_CHATTER"
+_DEFAULT_LIVE_FAST_REPLY_MODEL = "MiMo-V2.5"
+_DEFAULT_LIVE_FAST_REPLY_TIMEOUT = 12.0
+_DEFAULT_LIVE_FAST_REPLY_HISTORY_LIMIT = 160
+_DEFAULT_LIVE_FAST_REPLY_PREFIX_CACHE_TTL = 60.0
+_LIVE_FAST_REPLY_OUTPUT_CONTRACT = (
+    "你正在直播快速回复通道中。"
+    "只输出要直接口播给直播间的正文，1-2句，优先短、自然、接得住弹幕。"
+    "不要解释系统、不要写工具调用、不要写 JSON、不要复述完整提示词。"
+    "如果上下文不足，就自然承接当前弹幕，不要编造具体事实。"
+)
 
 
 def _get_last_user_content(messages: List["ChatMessage"]) -> str:
@@ -116,6 +132,17 @@ def _env_float(name: str, default: float) -> float:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
 
 
 def _post_json_sync(url: str, payload: dict[str, Any], *, timeout: float) -> tuple[int, Any]:
@@ -205,6 +232,7 @@ class OpenAIRouter(BaseRouter):
     _GAME_DECISION_TOTAL_TIMEOUT: float = 45.0
     # AI-Vtuber 镜像播放默认关闭；Minecraft 自身通过 /tts/speak 拿 MiMO 音频。
     _MINECRAFT_TTS_MIRROR_ENABLED: bool = False
+    _fast_prefix_cache: tuple[float, str] | None = None
 
     def register_endpoints(self) -> None:
 
@@ -257,6 +285,28 @@ class OpenAIRouter(BaseRouter):
 
         stream_id = "live_broadcast"
         platform = "live"
+
+        if _env_flag(_LIVE_FAST_REPLY_ENABLED_ENV, default=False):
+            try:
+                reply_text = await self._handle_live_chat_fast(
+                    stream_id=stream_id,
+                    platform=platform,
+                    sender_id=sender_id,
+                    sender_name=sender_name,
+                    content=content,
+                    raw_bridge_content=raw_content,
+                    viewer_name=viewer_name,
+                )
+                preview = content[:20] + ("..." if len(content) > 20 else "")
+                if viewer_name:
+                    logger.info(f"直播快速通道已回复: {viewer_name} -> {preview}")
+                else:
+                    logger.info(f"直播快速通道已回复: {preview}")
+                return reply_text
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"直播快速通道失败: {exc}", exc_info=True)
+                if not _env_flag(_LIVE_FAST_REPLY_FALLBACK_TO_CHATTER_ENV, default=False):
+                    return "爱莉这边刚刚卡了一下，我先接住这条弹幕。"
 
         reply_text = await self._dispatch_message_and_collect(
             stream_id=stream_id,
@@ -330,6 +380,241 @@ class OpenAIRouter(BaseRouter):
         if not result.is_tool_call and result.content:
             self._queue_minecraft_say_tts(result.content, source=result.source)
         return result
+
+    async def _handle_live_chat_fast(
+        self,
+        *,
+        stream_id: str,
+        platform: str,
+        sender_id: str,
+        sender_name: str,
+        content: str,
+        raw_bridge_content: str,
+        viewer_name: str,
+    ) -> str:
+        """Low-latency live reply path.
+
+        The inbound live message is still published to the unified event stream
+        and persisted to global chat history, but it is not added to the
+        life_chatter unread queue.  That keeps QQ/life_chatter state coherent
+        without letting the full global runtime block live TTS.
+        """
+
+        message_id = str(uuid.uuid4())
+        msg_obj = Message(
+            message_id=message_id,
+            time=time.time(),
+            content=content,
+            processed_plain_text=content,
+            message_type=MessageType.TEXT,
+            sender_id=sender_id,
+            sender_name=sender_name,
+            platform=platform,
+            chat_type=ChatType.PRIVATE.value,
+            stream_id=stream_id,
+            raw_bridge_content=raw_bridge_content,
+            viewer_name=viewer_name,
+            live_fast_reply=True,
+            skip_chatter_distribution=True,
+        )
+
+        from src.core.managers.event_manager import get_event_manager
+
+        await get_event_manager().publish_event(
+            EventType.ON_MESSAGE_RECEIVED,
+            {
+                "message": msg_obj,
+                "adapter_signature": "live_bridge:router:openai_fast",
+                "skip_chatter_distribution": True,
+            },
+        )
+
+        reply_text = await self._generate_live_fast_reply(
+            msg_obj,
+            viewer_name=viewer_name,
+        )
+        reply_text = self._sanitize_live_fast_reply(reply_text)
+        if not reply_text:
+            reply_text = "嗯嗯，爱莉看到啦。"
+
+        await self._record_live_fast_reply(
+            stream_id=stream_id,
+            platform=platform,
+            content=reply_text,
+        )
+        return reply_text
+
+    async def _generate_live_fast_reply(
+        self,
+        message: Message,
+        *,
+        viewer_name: str,
+    ) -> str:
+        from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_name
+        from src.kernel.llm import LLMContextManager, LLMPayload, ROLE, Text
+
+        timeout = _env_float(_LIVE_FAST_REPLY_TIMEOUT_ENV, _DEFAULT_LIVE_FAST_REPLY_TIMEOUT)
+        model_name = os.environ.get(_LIVE_FAST_REPLY_MODEL_ENV, _DEFAULT_LIVE_FAST_REPLY_MODEL).strip()
+        model_name = model_name or _DEFAULT_LIVE_FAST_REPLY_MODEL
+        history_limit = _env_int(
+            _LIVE_FAST_REPLY_HISTORY_LIMIT_ENV,
+            _DEFAULT_LIVE_FAST_REPLY_HISTORY_LIMIT,
+        )
+
+        try:
+            model_set = get_model_set_by_name(model_name, temperature=0.75, max_tokens=220)
+        except KeyError:
+            if model_name != _DEFAULT_LIVE_FAST_REPLY_MODEL:
+                logger.warning(
+                    f"直播快速通道模型 {model_name!r} 未找到，降级到 {_DEFAULT_LIVE_FAST_REPLY_MODEL}"
+                )
+                model_set = get_model_set_by_name(
+                    _DEFAULT_LIVE_FAST_REPLY_MODEL,
+                    temperature=0.75,
+                    max_tokens=220,
+                )
+            else:
+                raise
+
+        tuned_model_set: list[dict[str, Any]] = []
+        for model in model_set:
+            tuned = dict(model)
+            tuned["timeout"] = timeout
+            extra_params = dict(tuned.get("extra_params") or {})
+            extra_params["enable_thinking"] = False
+            tuned["extra_params"] = extra_params
+            tuned_model_set.append(tuned)
+
+        system_prompt = await self._build_live_fast_system_prompt()
+        user_prompt = await self._build_live_fast_user_prompt(
+            message,
+            viewer_name=viewer_name,
+            history_limit=history_limit,
+        )
+
+        request = create_llm_request(
+            tuned_model_set,
+            request_name="live_fast_reply",
+            context_manager=LLMContextManager(),
+        )
+        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
+        request.add_payload(LLMPayload(ROLE.USER, Text(user_prompt)))
+
+        response = await request.send(stream=False)
+        result = await asyncio.wait_for(response, timeout=timeout + 1.0)
+        return str(result or getattr(response, "message", "") or "").strip()
+
+    async def _build_live_fast_system_prompt(self) -> str:
+        now = time.monotonic()
+        ttl = _env_float(
+            _LIVE_FAST_REPLY_PREFIX_CACHE_TTL_ENV,
+            _DEFAULT_LIVE_FAST_REPLY_PREFIX_CACHE_TTL,
+        )
+        cached = self._fast_prefix_cache
+        if cached is not None:
+            cached_at, cached_text = cached
+            if now - cached_at <= ttl and cached_text:
+                return cached_text
+
+        system_prompt = ""
+        try:
+            from plugins.life_engine.core.chatter import LifeChatter
+
+            life_plugin, service = self._get_life_plugin_and_service()
+            if life_plugin is not None:
+                chatter = LifeChatter(stream_id="live_broadcast", plugin=life_plugin)
+                system_prompt = str(chatter._build_chat_system_prompt(service, None) or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"直播快速通道读取 life_chatter 前缀失败，使用最小前缀: {exc}")
+
+        if system_prompt:
+            system_prompt = f"{system_prompt}\n\n{_LIVE_FAST_REPLY_OUTPUT_CONTRACT}"
+        else:
+            system_prompt = _LIVE_FAST_REPLY_OUTPUT_CONTRACT
+        self._fast_prefix_cache = (now, system_prompt)
+        return system_prompt
+
+    async def _build_live_fast_user_prompt(
+        self,
+        message: Message,
+        *,
+        viewer_name: str,
+        history_limit: int,
+    ) -> str:
+        chat_history = ""
+        if history_limit > 0:
+            try:
+                from plugins.life_engine.core.chat_history import build_global_chat_history_text_from_db
+                from src.core.managers.stream_manager import get_stream_manager
+
+                chat_stream = await get_stream_manager().get_or_create_stream(
+                    stream_id=message.stream_id,
+                    platform=message.platform,
+                    user_id=message.sender_id,
+                    chat_type=message.chat_type,
+                )
+                chat_history = await build_global_chat_history_text_from_db(
+                    chat_stream,
+                    max_messages=history_limit,
+                    include_stream_label=True,
+                    exclude_message_ids={message.message_id},
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"直播快速通道读取全局聊天历史失败: {exc}", exc_info=True)
+
+        viewer = viewer_name or getattr(message, "sender_name", "") or "直播间观众"
+        content = str(message.processed_plain_text or message.content or "").strip()
+        parts = [
+            "这是直播快速回复请求。请参考少量历史，但优先回复当前弹幕。",
+        ]
+        if chat_history.strip():
+            parts.append(f"<chat_history>\n{chat_history.strip()}\n</chat_history>")
+        parts.append(
+            "<current_live_comment>\n"
+            f"观众：{viewer}\n"
+            f"弹幕：{content}\n"
+            "</current_live_comment>"
+        )
+        parts.append("请直接给出爱莉要在直播间口播的回复正文。")
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _sanitize_live_fast_reply(reply_text: str) -> str:
+        text = str(reply_text or "").strip()
+        if not text:
+            return ""
+        text = re.sub(r"^```(?:text|json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text).strip()
+        for prefix in ("爱莉：", "爱莉:", "回复：", "回复:"):
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+        return text[:360].strip()
+
+    async def _record_live_fast_reply(
+        self,
+        *,
+        stream_id: str,
+        platform: str,
+        content: str,
+    ) -> None:
+        from src.core.transport.message_send import get_message_sender
+
+        reply_message = Message(
+            message_id=str(uuid.uuid4()),
+            time=time.time(),
+            content=content,
+            processed_plain_text=content,
+            message_type=MessageType.TEXT,
+            sender_id="elysia",
+            sender_name="爱莉希雅",
+            platform=platform,
+            chat_type=ChatType.PRIVATE.value,
+            stream_id=stream_id,
+            live_fast_reply=True,
+        )
+        success = await get_message_sender().send_message(reply_message)
+        if not success:
+            logger.warning(f"直播快速通道回复历史写入失败: {_log_preview(content, limit=180)}")
 
     def _queue_minecraft_say_tts(self, content: str, *, source: str = "") -> None:
         """Best-effort voice playback for Minecraft say decisions via AI-Vtuber."""
@@ -413,6 +698,18 @@ class OpenAIRouter(BaseRouter):
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"通过 Service API 获取 TTSService 失败: {exc}")
         return None
+
+    @staticmethod
+    def _get_life_plugin_and_service() -> tuple[Any | None, Any | None]:
+        try:
+            from src.core.managers.plugin_manager import get_plugin_manager
+
+            life_plugin = get_plugin_manager().get_plugin("life_engine")
+            service = getattr(life_plugin, "service", None) if life_plugin is not None else None
+            return life_plugin, service
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"读取 life_engine 插件失败: {exc}")
+            return None, None
 
     async def _synthesize_minecraft_tts(self, text: str) -> bytes:
         service = self._get_tts_voice_service()

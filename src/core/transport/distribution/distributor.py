@@ -93,6 +93,22 @@ async def _on_message_received(_: str, params: dict) -> tuple[EventDecision, dic
 
             stream_id = chat_stream.stream_id
             context = chat_stream.context
+            skip_chatter_distribution = bool(
+                params.get("skip_chatter_distribution")
+                or (
+                    hasattr(message, "extra")
+                    and getattr(message, "extra", {}).get("skip_chatter_distribution")
+                )
+            )
+
+            if skip_chatter_distribution:
+                await sm.add_message(message, add_to_unread=False)
+                chat_stream.update_active_time()
+                logger.debug(
+                    "消息已持久化但跳过 Chatter 分发: "
+                    f"stream_id={stream_id[:8]}, platform={message.platform}"
+                )
+                return
 
             # 2. 先写入内存未读队列并启动驱动器，再后台持久化。
             # 事件总线单个处理器默认只有 5 秒超时；若把数据库写入放在前面，
