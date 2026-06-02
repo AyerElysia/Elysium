@@ -292,7 +292,7 @@ class FeishuAdapter(BaseAdapter):
                 "chat_id": chat_id,
                 "open_id": open_id,
                 "sender_type": normalized.get("sender_type", ""),
-                "message_type": normalized.get("message_type", ""),
+                "feishu_message_type": normalized.get("message_type", ""),
                 "format_info": {"accept_format": ["text"]},
             }
             if chat_type == "group":

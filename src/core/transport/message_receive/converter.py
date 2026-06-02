@@ -31,6 +31,23 @@ logger = get_logger("message_converter")
 # 递归深度硬上限
 _MAX_NESTING_DEPTH: int = 5
 
+_MESSAGE_INIT_KEYS = {
+    "message_id",
+    "time",
+    "reply_to",
+    "content",
+    "processed_plain_text",
+    "message_type",
+    "sender_id",
+    "sender_name",
+    "sender_cardname",
+    "sender_role",
+    "platform",
+    "chat_type",
+    "stream_id",
+    "raw_data",
+}
+
 
 # ──────────────────────────────────────────────
 #  段解析返回结构
@@ -172,9 +189,8 @@ class MessageConverter:
         if raw_role is not None:
             sender_role = raw_role.value
 
-        # 提取 extra 元数据
-        # any 附加字段允许上层扩展，直接透传到 Message 对象
-        extra_data = message_info.get("extra") or {}
+        # 提取 extra 元数据。附加字段允许上层扩展，但不能覆盖 Message 核心构造字段。
+        extra_data = self._sanitize_extra_data(message_info.get("extra") or {})
         
         return Message(
             message_id=message_info.get("message_id", ""),
@@ -198,6 +214,19 @@ class MessageConverter:
             group_name=group_name,
             **extra_data,
         )
+
+    @staticmethod
+    def _sanitize_extra_data(extra_data: Any) -> dict[str, Any]:
+        if not isinstance(extra_data, dict):
+            return {}
+
+        sanitized: dict[str, Any] = {}
+        for key, value in extra_data.items():
+            if key in _MESSAGE_INIT_KEYS:
+                sanitized[f"adapter_{key}"] = value
+            else:
+                sanitized[key] = value
+        return sanitized
 
     # ─── message → envelope ───────────────────
 

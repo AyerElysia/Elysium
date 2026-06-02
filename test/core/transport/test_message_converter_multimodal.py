@@ -134,6 +134,39 @@ async def test_envelope_to_message_transcribes_voice(monkeypatch: pytest.MonkeyP
 
 
 @pytest.mark.asyncio
+async def test_envelope_to_message_prefixes_extra_keys_that_collide_with_message_fields() -> None:
+    """适配器 extra 中的同名字段不应覆盖 Message 核心字段。"""
+    converter = MessageConverter()
+
+    envelope = {
+        "message_info": {
+            "message_id": "msg-extra-collision",
+            "time": 1710000000.0,
+            "platform": "feishu",
+            "user_info": {
+                "user_id": "user-feishu",
+                "user_nickname": "Alice",
+            },
+            "extra": {
+                "message_type": "text",
+                "platform": "adapter-platform",
+                "custom_field": "custom-value",
+            },
+        },
+        "message_segment": [{"type": "text", "data": "爱莉爱莉"}],
+        "raw_message": {"source": "unit-test"},
+    }
+
+    message = await converter.envelope_to_message(envelope)
+
+    assert message.platform == "feishu"
+    assert message.message_type == MessageType.TEXT
+    assert message.extra["adapter_message_type"] == "text"
+    assert message.extra["adapter_platform"] == "adapter-platform"
+    assert message.extra["custom_field"] == "custom-value"
+
+
+@pytest.mark.asyncio
 async def test_envelope_to_message_adds_audio_file_understanding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

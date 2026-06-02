@@ -8,6 +8,8 @@ from fastapi.testclient import TestClient
 from plugins.feishu_adapter.adapter import FeishuAdapter, set_feishu_adapter
 from plugins.feishu_adapter.config import FeishuAdapterConfig
 from plugins.feishu_adapter.router import FeishuRouter
+from src.core.models.message import MessageType
+from src.core.transport.message_receive.converter import MessageConverter
 
 
 class DummySink:
@@ -91,6 +93,41 @@ async def test_feishu_handle_event_sends_to_core_sink() -> None:
 
     assert result["success"] is True
     assert adapter.core_sink.messages[0]["message_info"]["user_info"]["user_id"] == "ou_2"
+
+
+@pytest.mark.asyncio
+async def test_feishu_envelope_converts_to_core_message() -> None:
+    adapter = make_adapter()
+    payload = {
+        "schema": "2.0",
+        "header": {"event_id": "evt_3"},
+        "event": {
+            "sender": {
+                "sender_type": "user",
+                "sender_id": {"open_id": "ou_private"},
+            },
+            "message": {
+                "message_id": "om_private",
+                "chat_id": "oc_private",
+                "chat_type": "p2p",
+                "message_type": "text",
+                "content": "{\"text\":\"爱莉爱莉\"}",
+                "create_time": "1710000000000",
+            },
+        },
+    }
+
+    envelope = await adapter.from_platform_message(payload)
+    assert envelope is not None
+
+    message = await MessageConverter().envelope_to_message(envelope)
+
+    assert message.platform == "feishu"
+    assert message.message_id == "om_private"
+    assert message.message_type == MessageType.TEXT
+    assert message.content == "爱莉爱莉"
+    assert message.extra["feishu_message_type"] == "text"
+    assert "message_type" not in message.extra
 
 
 @pytest.mark.asyncio
