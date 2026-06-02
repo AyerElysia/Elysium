@@ -266,6 +266,26 @@ class TestMediaManagerRecognizeBatch:
 
 class TestMediaManagerSaveAndGetMediaInfo:
     """测试媒体信息保存和查询功能。"""
+
+    def test_normalize_media_db_path_adds_hash_for_generic_video_filename(self) -> None:
+        """普通视频文件名入库时应带 hash，避免 images.path 唯一约束冲突。"""
+        path = MediaManager._normalize_media_db_path(
+            "abcdef1234567890fedcba",
+            "video",
+            "video.mp4",
+        )
+
+        assert path == "video:abcdef1234567890:video.mp4"
+
+    def test_normalize_media_db_path_keeps_real_image_path(self) -> None:
+        """真实落盘图片路径保持不变。"""
+        path = MediaManager._normalize_media_db_path(
+            "abcdef1234567890",
+            "image",
+            "/tmp/image.jpg",
+        )
+
+        assert path == "/tmp/image.jpg"
     
     @pytest.mark.asyncio
     async def test_save_media_info(self) -> None:

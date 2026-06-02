@@ -28,7 +28,7 @@ from tempfile import TemporaryDirectory
 from pathlib import Path
 from threading import Lock as ThreadLock
 from typing import Any
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from src.kernel.logger import get_logger
 from src.app.plugin_system.api.llm_api import get_model_set_by_task
@@ -914,13 +914,15 @@ class MediaManager:
             description: 描述文本（可选）
             vlm_processed: 是否已经过 VLM 处理
         """
+        resolved_path = self._normalize_media_db_path(media_hash, media_type, file_path)
         try:
             async with get_db_session() as session:
-                # 查找现有记录（使用 image_id 作为唯一标识）
+                # 查找现有记录（image_id 或 path 任一命中都视为同一条媒体记录）
+                # path 在 images 表上有唯一约束，重复文件名（如 video.mp4）不能裸 insert。
                 # 这里使用 scalars().first() 来避免数据库中存在多条重复记录导致的 MultipleResultsFound 错误
                 stmt = (
                     select(Images)
-                    .where(Images.image_id == media_hash)
+                    .where(or_(Images.image_id == media_hash, Images.path == resolved_path))
                     .order_by(Images.timestamp.desc())
                     .limit(1)
                 )
@@ -930,6 +932,10 @@ class MediaManager:
                 if existing:
                     # 更新现有记录
                     existing.count += 1
+                    existing.image_id = media_hash
+                    existing.path = resolved_path
+                    existing.type = media_type
+                    existing.timestamp = time.time()
                     if description:
                         existing.description = description
                     if vlm_processed:
@@ -939,7 +945,7 @@ class MediaManager:
                     # 创建新记录
                     new_image = Images(
                         image_id=media_hash,
-                        path=file_path or media_hash,  # 如果没有路径，用哈希值
+                        path=resolved_path,
                         type=media_type,
                         description=description,
                         timestamp=time.time(),
@@ -953,6 +959,31 @@ class MediaManager:
 
         except Exception as e:
             logger.error(f"保存媒体信息失败: {e}", exc_info=True)
+
+    @staticmethod
+    def _normalize_media_db_path(
+        media_hash: str,
+        media_type: str,
+        file_path: str | None,
+    ) -> str:
+        """生成数据库中唯一且稳定的媒体 path。
+
+        图片/表情通常有真实落盘路径；视频/语音经常只有平台给的普通文件名
+        （如 video.mp4），直接写入会撞 images.path 唯一约束。对这类无目录的
+        普通文件名加上 hash 前缀，既保留原始文件名，也保证不同媒体不会冲突。
+        """
+        media_hash_text = str(media_hash or "").strip()
+        media_type_text = str(media_type or "").strip().lower()
+        raw_path = str(file_path or "").strip()
+        if not raw_path:
+            return media_hash_text
+
+        path_obj = Path(raw_path)
+        has_directory = bool(path_obj.parent and str(path_obj.parent) not in {"", "."})
+        if media_type_text in {"video", "voice", "audio"} and not has_directory:
+            suffix = media_hash_text[:16] or "unknown"
+            return f"{media_type_text}:{suffix}:{path_obj.name or raw_path}"
+        return raw_path
 
     async def get_media_info(self, media_hash: str) -> dict[str, Any] | None:
         """根据哈希值获取媒体信息。
