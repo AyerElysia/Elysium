@@ -41,10 +41,15 @@ class FeishuRouter(BaseRouter):
         @self.app.get("/api/status")
         async def status() -> dict[str, Any]:
             adapter = get_feishu_adapter()
+            config = adapter._config() if adapter is not None else None
             return {
                 "ok": adapter is not None,
                 "platform": PLATFORM,
                 "adapter_ready": adapter is not None,
+                "subscription_mode": (
+                    config.connection.subscription_mode if config is not None else None
+                ),
+                "connected": adapter.is_connected() if adapter is not None else False,
                 "time": time.time(),
             }
 

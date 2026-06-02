@@ -27,6 +27,7 @@
   "python_dependencies": [
     "fastapi",
     "httpx",
+    "lark-oapi",
     "pydantic"
   ],
   "dependencies_required": true

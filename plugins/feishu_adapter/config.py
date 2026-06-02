@@ -77,6 +77,36 @@ class FeishuAdapterConfig(BaseConfig):
             order=4,
         )
 
+    @config_section("connection", title="连接方式", tag="network", order=15)
+    class ConnectionSection(SectionBase):
+        """How to receive Feishu events."""
+
+        subscription_mode: str = Field(
+            default="long_connection",
+            description="事件订阅方式: long_connection/http_callback。没有公网域名时使用 long_connection。",
+            label="订阅方式",
+            input_type="select",
+            choices=["long_connection", "http_callback"],
+            tag="network",
+            order=0,
+        )
+        auto_start_long_connection: bool = Field(
+            default=True,
+            description="订阅方式为 long_connection 时，适配器启动后自动连接飞书",
+            label="自动启动长连接",
+            tag="network",
+            order=1,
+        )
+        long_connection_log_level: str = Field(
+            default="INFO",
+            description="飞书 SDK 长连接日志等级",
+            label="长连接日志等级",
+            input_type="select",
+            choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+            tag="network",
+            order=2,
+        )
+
     @config_section("bot", title="Bot 身份", tag="user", order=20)
     class BotSection(SectionBase):
         """Bot identity used by outgoing messages."""
@@ -153,5 +183,6 @@ class FeishuAdapterConfig(BaseConfig):
 
     plugin: PluginSection = Field(default_factory=PluginSection)
     app: AppSection = Field(default_factory=AppSection)
+    connection: ConnectionSection = Field(default_factory=ConnectionSection)
     bot: BotSection = Field(default_factory=BotSection)
     behavior: BehaviorSection = Field(default_factory=BehaviorSection)

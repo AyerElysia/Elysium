@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 import time
 import uuid
 from typing import Any, cast
@@ -48,6 +50,9 @@ class FeishuAdapter(BaseAdapter):
         self._tenant_access_token: str = ""
         self._tenant_access_token_expires_at: float = 0.0
         self._seen_event_ids: list[str] = []
+        self._main_loop: asyncio.AbstractEventLoop | None = None
+        self._long_connection_thread: threading.Thread | None = None
+        self._long_connection_client: Any | None = None
         set_feishu_adapter(self)
         logger.info("FeishuAdapter 初始化完成")
 
@@ -58,9 +63,15 @@ class FeishuAdapter(BaseAdapter):
             return
         if not config.app.app_id or not config.app.app_secret:
             logger.warning("FeishuAdapter 缺少 app_id/app_secret；入站可接收，出站发送会失败")
+        if (
+            config.connection.subscription_mode == "long_connection"
+            and config.connection.auto_start_long_connection
+        ):
+            self._start_long_connection()
         logger.info("FeishuAdapter 已加载，等待飞书事件回调")
 
     async def on_adapter_unloaded(self) -> None:
+        await self._stop_long_connection()
         set_feishu_adapter(None)
         self._tenant_access_token = ""
         self._tenant_access_token_expires_at = 0.0
@@ -71,7 +82,13 @@ class FeishuAdapter(BaseAdapter):
         return self._config().plugin.enabled
 
     def is_connected(self) -> bool:  # type: ignore[override]
-        return self._config().plugin.enabled
+        config = self._config()
+        if not config.plugin.enabled:
+            return False
+        if config.connection.subscription_mode == "long_connection":
+            thread = self._long_connection_thread
+            return bool(thread and thread.is_alive())
+        return True
 
     async def get_bot_info(self) -> dict[str, str]:  # type: ignore[override]
         config = self._config()
@@ -101,6 +118,152 @@ class FeishuAdapter(BaseAdapter):
             raise ValueError("无法转换飞书消息")
         await self.core_sink.send(envelope)
         return raw_message
+
+    def _start_long_connection(self) -> None:
+        config = self._config()
+        if not config.app.app_id or not config.app.app_secret:
+            logger.warning("飞书长连接未启动：缺少 app_id/app_secret")
+            return
+        if self._long_connection_thread and self._long_connection_thread.is_alive():
+            logger.info("飞书长连接已经在运行")
+            return
+
+        try:
+            self._main_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._main_loop = None
+
+        thread = threading.Thread(
+            target=self._run_long_connection_client,
+            name="feishu_long_connection",
+            daemon=True,
+        )
+        self._long_connection_thread = thread
+        thread.start()
+        logger.info("飞书长连接后台线程已启动")
+
+    async def _stop_long_connection(self) -> None:
+        client = self._long_connection_client
+        self._long_connection_client = None
+        if client is None:
+            return
+        # lark-oapi 的 ws.Client 当前没有公开 stop()。这里尽力断开底层连接；
+        # daemon 线程会在进程退出时自动释放，插件重载时由运行状态检查避免重复启动。
+        try:
+            disconnect = getattr(client, "_disconnect", None)
+            if disconnect is not None:
+                await asyncio.to_thread(self._run_sdk_disconnect, client)
+        except Exception as exc:
+            logger.warning(f"飞书长连接关闭失败: {exc}")
+
+    @staticmethod
+    def _run_sdk_disconnect(client: Any) -> None:
+        try:
+            import lark_oapi.ws.client as ws_client_module
+
+            ws_client_module.loop.run_until_complete(client._disconnect())
+        except Exception:
+            raise
+
+    def _run_long_connection_client(self) -> None:
+        try:
+            import lark_oapi as lark
+            import lark_oapi.ws as lark_ws
+        except Exception as exc:
+            logger.error(
+                f"飞书长连接启动失败：缺少 lark-oapi。请安装 `pip install lark-oapi`。error={exc}",
+                exc_info=True,
+            )
+            return
+
+        config = self._config()
+        event_handler = self._build_lark_event_handler(lark)
+        log_level = getattr(lark.LogLevel, config.connection.long_connection_log_level, lark.LogLevel.INFO)
+        client = lark_ws.Client(
+            app_id=config.app.app_id,
+            app_secret=config.app.app_secret,
+            log_level=log_level,
+            event_handler=event_handler,
+            domain=config.app.api_base_url,
+            auto_reconnect=True,
+            source="neo-mofox-feishu-adapter",
+        )
+        self._long_connection_client = client
+        logger.info("飞书长连接正在连接开放平台")
+        try:
+            client.start()
+        except Exception as exc:
+            logger.error(f"飞书长连接已退出: {exc}", exc_info=True)
+
+    def _build_lark_event_handler(self, lark_module: Any) -> Any:
+        config = self._config()
+
+        def on_message(event: Any) -> None:
+            payload = self._lark_event_to_payload(event)
+            loop = self._main_loop
+            if loop and loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(self.handle_event(payload), loop)
+                try:
+                    future.result(timeout=30)
+                except Exception as exc:
+                    logger.error(f"飞书长连接事件投递失败: {exc}", exc_info=True)
+            else:
+                asyncio.run(self.handle_event(payload))
+
+        return (
+            lark_module.EventDispatcherHandler
+            .builder(config.app.encrypt_key, config.app.verification_token)
+            .register_p2_im_message_receive_v1(on_message)
+            .build()
+        )
+
+    @staticmethod
+    def _lark_event_to_payload(event: Any) -> dict[str, Any]:
+        try:
+            from lark_oapi.core.json import JSON
+
+            serialized = JSON.marshal(event)
+            if isinstance(serialized, str):
+                loaded = json.loads(serialized)
+                if isinstance(loaded, dict):
+                    return loaded
+        except Exception:
+            pass
+
+        header = getattr(event, "header", None)
+        data = getattr(event, "event", None)
+        sender = getattr(data, "sender", None)
+        message = getattr(data, "message", None)
+        sender_id = getattr(sender, "sender_id", None)
+        return {
+            "schema": "2.0",
+            "header": {
+                "event_id": str(getattr(header, "event_id", "") or ""),
+                "event_type": str(getattr(header, "event_type", "im.message.receive_v1") or ""),
+                "token": str(getattr(header, "token", "") or ""),
+            },
+            "event": {
+                "sender": {
+                    "sender_type": str(getattr(sender, "sender_type", "") or ""),
+                    "sender_id": {
+                        "open_id": str(getattr(sender_id, "open_id", "") or ""),
+                        "user_id": str(getattr(sender_id, "user_id", "") or ""),
+                        "union_id": str(getattr(sender_id, "union_id", "") or ""),
+                    },
+                },
+                "message": {
+                    "message_id": str(getattr(message, "message_id", "") or ""),
+                    "root_id": str(getattr(message, "root_id", "") or ""),
+                    "parent_id": str(getattr(message, "parent_id", "") or ""),
+                    "create_time": getattr(message, "create_time", None),
+                    "chat_id": str(getattr(message, "chat_id", "") or ""),
+                    "chat_type": str(getattr(message, "chat_type", "") or ""),
+                    "message_type": str(getattr(message, "message_type", "") or ""),
+                    "content": getattr(message, "content", "") or "",
+                    "mentions": getattr(message, "mentions", None) or [],
+                },
+            },
+        }
 
     async def from_platform_message(  # type: ignore[override]
         self,
