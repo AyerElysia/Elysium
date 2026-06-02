@@ -2088,6 +2088,60 @@ class LifeChatter(BaseChatter):
         logger.warning("检测到应回复轮次却未产生面向用户的回复，已注入强制回复提醒")
 
     @staticmethod
+    def _build_must_reply_fallback_text(unread_msgs: list[Message]) -> str:
+        """模型连续空 action 时的最小可见回应。
+
+        这里只覆盖已被判定为 must_reply 的外界消息。内容保持短确认，不替模型
+        续写复杂表达，避免把主体性兜底变成规则化代答。
+        """
+        latest_text = ""
+        if unread_msgs:
+            latest = unread_msgs[-1]
+            latest_text = str(
+                getattr(latest, "processed_plain_text", None)
+                or getattr(latest, "content", "")
+                or ""
+            ).strip()
+
+        if latest_text and len(latest_text) <= 12:
+            return "在呢，我看到你啦。"
+        return "我看到你的消息了。"
+
+    async def _send_must_reply_fallback(
+        self,
+        chat_stream: ChatStream,
+        unread_msgs: list[Message],
+    ) -> bool:
+        from src.app.plugin_system.api.send_api import send_text
+
+        stream_id = str(
+            getattr(chat_stream, "stream_id", "")
+            or getattr(self, "stream_id", "")
+            or ""
+        ).strip()
+        if not stream_id:
+            return False
+
+        platform = str(
+            getattr(chat_stream, "platform", "")
+            or (getattr(unread_msgs[-1], "platform", "") if unread_msgs else "")
+            or ""
+        ).strip() or None
+        content = self._build_must_reply_fallback_text(unread_msgs)
+
+        try:
+            ok = await send_text(content, stream_id=stream_id, platform=platform)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"must_reply 兜底发送失败: {exc}", exc_info=True)
+            return False
+
+        if ok:
+            logger.warning(f"must_reply 空 action 重试耗尽，已发送最小兜底回复: {content}")
+        else:
+            logger.warning("must_reply 空 action 重试耗尽，最小兜底回复发送失败")
+        return bool(ok)
+
+    @staticmethod
     def _append_inner_monologue_retry_instruction(response: Any) -> None:
         LifeChatter._append_follow_up_user_instruction(response, _INNER_MONOLOGUE_RETRY_REMINDER)
         logger.warning("主动机会轮次缺少内心独白记录，已注入重试提醒")
@@ -2455,7 +2509,8 @@ class LifeChatter(BaseChatter):
                         self._transition(rt, _Phase.FOLLOW_UP, "must-reply empty-turn retry")
                         return Success("must-reply empty-turn retry scheduled")
                     if rt.must_reply:
-                        logger.warning("应回复轮次返回空 action，达到重试上限，本轮放弃强制回复以避免死循环")
+                        logger.warning("应回复轮次返回空 action，达到重试上限，尝试最小兜底回复")
+                        await self._send_must_reply_fallback(chat_stream, rt.unreads)
                         rt.must_reply = False
                         rt.must_reply_retry_count = 0
                     # 不再 yield Stop 销毁生成器：保留累积的 payload 上下文，

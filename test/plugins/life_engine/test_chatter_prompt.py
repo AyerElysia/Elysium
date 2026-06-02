@@ -9,6 +9,7 @@ from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.core.chatter import (
     LifeChatter,
     _GLOBAL_RUNTIME_BUSY_RETRY_SECONDS,
+    _MAX_MUST_REPLY_RETRIES,
     _Phase,
     _WorkflowRuntime,
 )
@@ -343,6 +344,82 @@ async def test_life_chatter_must_reply_retries_empty_tool_turn(monkeypatch) -> N
     assert rt.phase == _Phase.FOLLOW_UP
     assert rt.must_reply_retry_count == 1
     assert response.payloads
+
+    LifeChatter.reset_global_runtime()
+
+
+@pytest.mark.asyncio
+async def test_life_chatter_must_reply_empty_turn_falls_back_after_retries(monkeypatch) -> None:
+    """must_reply 空 action 重试耗尽后，至少发送一条最小可见回应。"""
+
+    LifeChatter.reset_global_runtime()
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.payloads = []
+            self.call_list = []
+            self.message = ""
+
+        def add_payload(self, payload) -> None:
+            self.payloads.append(payload)
+
+    response = FakeResponse()
+    unread = Message(
+        content="爱莉爱莉",
+        processed_plain_text="爱莉爱莉",
+        platform="feishu",
+        stream_id="stream-a",
+    )
+    rt = _WorkflowRuntime(
+        response=response,
+        phase=_Phase.TOOL_EXEC,
+        history_merged=True,
+        unreads=[unread],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[],
+        active_stream_id="stream-a",
+        must_reply=True,
+        must_reply_retry_count=_MAX_MUST_REPLY_RETRIES,
+    )
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=None)
+    chatter.stream_id = "stream-a"
+    sent: dict[str, object] = {}
+
+    async def fake_fetch_unreads():
+        return [], []
+
+    async def fake_send_text(content, stream_id, platform=None, reply_to=None):
+        sent.update(
+            {
+                "content": content,
+                "stream_id": stream_id,
+                "platform": platform,
+                "reply_to": reply_to,
+            }
+        )
+        return True
+
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+    monkeypatch.setattr("src.app.plugin_system.api.send_api.send_text", fake_send_text)
+
+    result = await chatter._drive_global_runtime_until_yield(
+        SimpleNamespace(stream_id="stream-a", platform="feishu"),
+        service=None,
+    )
+
+    assert isinstance(result, Wait)
+    assert rt.phase == _Phase.WAIT_USER
+    assert rt.must_reply is False
+    assert sent == {
+        "content": "在呢，我看到你啦。",
+        "stream_id": "stream-a",
+        "platform": "feishu",
+        "reply_to": None,
+    }
 
     LifeChatter.reset_global_runtime()
 
