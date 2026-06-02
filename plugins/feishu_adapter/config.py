@@ -181,8 +181,23 @@ class FeishuAdapterConfig(BaseConfig):
             order=5,
         )
 
+    @config_section("identity", title="身份显示", tag="user", order=40)
+    class IdentitySection(SectionBase):
+        """Display-name aliases for Feishu users."""
+
+        user_name_aliases: list[str] = Field(
+            default_factory=list,
+            description="飞书用户显示名映射，格式为 'open_id或union_id=昵称'",
+            label="用户昵称映射",
+            input_type="list",
+            item_type="str",
+            tag="user",
+            order=0,
+        )
+
     plugin: PluginSection = Field(default_factory=PluginSection)
     app: AppSection = Field(default_factory=AppSection)
     connection: ConnectionSection = Field(default_factory=ConnectionSection)
     bot: BotSection = Field(default_factory=BotSection)
     behavior: BehaviorSection = Field(default_factory=BehaviorSection)
+    identity: IdentitySection = Field(default_factory=IdentitySection)

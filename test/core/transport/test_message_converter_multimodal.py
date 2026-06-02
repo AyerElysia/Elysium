@@ -150,6 +150,7 @@ async def test_envelope_to_message_prefixes_extra_keys_that_collide_with_message
             "extra": {
                 "message_type": "text",
                 "platform": "adapter-platform",
+                "group_id": "adapter-group",
                 "custom_field": "custom-value",
             },
         },
@@ -163,6 +164,7 @@ async def test_envelope_to_message_prefixes_extra_keys_that_collide_with_message
     assert message.message_type == MessageType.TEXT
     assert message.extra["adapter_message_type"] == "text"
     assert message.extra["adapter_platform"] == "adapter-platform"
+    assert message.extra["adapter_group_id"] == "adapter-group"
     assert message.extra["custom_field"] == "custom-value"
 
 

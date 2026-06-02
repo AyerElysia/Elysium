@@ -46,6 +46,11 @@ _MESSAGE_INIT_KEYS = {
     "chat_type",
     "stream_id",
     "raw_data",
+    "media",
+    "at_users",
+    "unknown_segments",
+    "group_id",
+    "group_name",
 }
 
 

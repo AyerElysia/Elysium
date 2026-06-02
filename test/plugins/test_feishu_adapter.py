@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -131,6 +132,47 @@ async def test_feishu_envelope_converts_to_core_message() -> None:
 
 
 @pytest.mark.asyncio
+async def test_feishu_user_name_alias_maps_sender_display_name() -> None:
+    config = FeishuAdapterConfig()
+    config.identity.user_name_aliases = [
+        "ou_ayer=AyerElysia",
+        "on_ayer=AyerElysia",
+    ]
+    adapter = make_adapter(config)
+    payload = {
+        "schema": "2.0",
+        "header": {"event_id": "evt_alias"},
+        "event": {
+            "sender": {
+                "sender_type": "user",
+                "sender_id": {
+                    "open_id": "ou_ayer",
+                    "union_id": "on_ayer",
+                },
+            },
+            "message": {
+                "message_id": "om_alias",
+                "chat_id": "oc_private",
+                "chat_type": "p2p",
+                "message_type": "text",
+                "content": "{\"text\":\"笨蛋爱莉\"}",
+                "create_time": "1710000000000",
+            },
+        },
+    }
+
+    envelope = await adapter.from_platform_message(payload)
+
+    assert envelope is not None
+    user_info = envelope["message_info"]["user_info"]
+    extra = envelope["message_info"]["extra"]
+    assert user_info["user_id"] == "ou_ayer"
+    assert user_info["user_nickname"] == "AyerElysia"
+    assert extra["feishu_open_id"] == "ou_ayer"
+    assert extra["feishu_union_id"] == "on_ayer"
+
+
+@pytest.mark.asyncio
 async def test_feishu_deduplicates_by_message_id() -> None:
     adapter = make_adapter()
 
@@ -211,6 +253,42 @@ async def test_feishu_outgoing_reply_text(monkeypatch: pytest.MonkeyPatch) -> No
     })
 
     assert calls[0][0] == "/open-apis/im/v1/messages/om_1/reply"
+
+
+@pytest.mark.asyncio
+async def test_feishu_outgoing_voice_sends_audio_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = make_adapter()
+    calls = []
+
+    async def fake_upload_audio(voice_data: str):
+        assert voice_data == "UklGRg=="
+        return "file-key-1", 1200
+
+    async def fake_post(path, body):
+        calls.append((path, body))
+        return {"code": 0}
+
+    monkeypatch.setattr(adapter, "_upload_audio", fake_upload_audio)
+    monkeypatch.setattr(adapter, "_post_json", fake_post)
+
+    await adapter._send_platform_message({
+        "direction": "outgoing",
+        "message_info": {
+            "platform": "feishu",
+            "message_id": "out_voice",
+            "time": 1.0,
+            "user_info": {"platform": "feishu", "user_id": "ou_1", "user_nickname": ""},
+        },
+        "message_segment": [{"type": "voice", "data": "UklGRg=="}],
+    })
+
+    assert calls[0][0] == "/open-apis/im/v1/messages?receive_id_type=open_id"
+    assert calls[0][1]["receive_id"] == "ou_1"
+    assert calls[0][1]["msg_type"] == "audio"
+    assert json.loads(calls[0][1]["content"]) == {
+        "file_key": "file-key-1",
+        "duration": 1200,
+    }
 
 
 def test_lark_event_object_to_payload() -> None:

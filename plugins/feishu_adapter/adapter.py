@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import base64
 import asyncio
 import json
+import subprocess
+import tempfile
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any, cast
 
 import httpx
@@ -280,6 +284,8 @@ class FeishuAdapter(BaseAdapter):
             chat_id = normalized["chat_id"]
             chat_type = normalized["chat_type"]
             open_id = normalized["open_id"]
+            user_id = normalized.get("user_id", "")
+            union_id = normalized.get("union_id", "")
             sender_name = normalized["sender_name"]
             content = normalized["content"]
             timestamp = normalized["timestamp"]
@@ -291,12 +297,14 @@ class FeishuAdapter(BaseAdapter):
                 "feishu_chat_id": chat_id,
                 "chat_id": chat_id,
                 "open_id": open_id,
+                "feishu_open_id": open_id,
+                "feishu_user_id": user_id,
+                "feishu_union_id": union_id,
                 "sender_type": normalized.get("sender_type", ""),
                 "feishu_message_type": normalized.get("message_type", ""),
                 "format_info": {"accept_format": ["text"]},
             }
             if chat_type == "group":
-                extra["group_id"] = chat_id
                 extra["target_group_id"] = chat_id
             else:
                 extra["target_user_id"] = open_id
@@ -343,8 +351,12 @@ class FeishuAdapter(BaseAdapter):
         self,
         envelope: MessageEnvelope,
     ) -> None:
-        text, reply_to = self._extract_outgoing_text(envelope)
-        if not text:
+        outgoing = self._extract_outgoing_message(envelope)
+        text = outgoing["text"]
+        reply_to = outgoing["reply_to"]
+        voice_data = outgoing["voice_data"]
+
+        if not text and not voice_data:
             logger.info("飞书出站消息为空，跳过发送")
             return
 
@@ -353,6 +365,15 @@ class FeishuAdapter(BaseAdapter):
         user_info = message_info.get("user_info") or {}
         chat_id = str(group_info.get("group_id") or "")
         open_id = str(user_info.get("user_id") or "")
+
+        if voice_data:
+            await self._send_audio_message(
+                chat_id=chat_id,
+                open_id=open_id,
+                reply_to=reply_to,
+                voice_data=voice_data,
+            )
+            return
 
         if self._config().behavior.reply_to_message and reply_to:
             await self._reply_text(reply_to, text)
@@ -409,6 +430,8 @@ class FeishuAdapter(BaseAdapter):
                 "chat_type": chat_type,
                 "chat_name": str(message.get("chat_name") or ""),
                 "open_id": str(sender_id.get("open_id") or sender_id.get("user_id") or ""),
+                "user_id": str(sender_id.get("user_id") or ""),
+                "union_id": str(sender_id.get("union_id") or ""),
                 "sender_name": self._sender_name(sender, sender_id),
                 "sender_type": str(sender.get("sender_type") or ""),
                 "content": content_text,
@@ -426,7 +449,9 @@ class FeishuAdapter(BaseAdapter):
             "chat_type": str(raw.get("chat_type") or "private"),
             "chat_name": str(raw.get("chat_name") or ""),
             "open_id": str(raw.get("open_id") or raw.get("user_id") or ""),
-            "sender_name": str(raw.get("sender_name") or raw.get("nickname") or "Feishu User"),
+            "user_id": str(raw.get("user_id") or ""),
+            "union_id": str(raw.get("union_id") or ""),
+            "sender_name": self._sender_name(raw, raw),
             "sender_type": str(raw.get("sender_type") or "user"),
             "content": str(raw.get("content") or ""),
             "timestamp": float(raw.get("timestamp") or time.time()),
@@ -519,13 +544,41 @@ class FeishuAdapter(BaseAdapter):
                             parts.append(str(item["text"]))
         return "\n".join(part for part in parts if part).strip()
 
-    @staticmethod
-    def _sender_name(sender: dict[str, Any], sender_id: dict[str, Any]) -> str:
+    def _sender_name(self, sender: dict[str, Any], sender_id: dict[str, Any]) -> str:
+        alias = self._sender_name_alias(sender, sender_id)
+        if alias:
+            return alias
+
         for key in ("sender_name", "name", "union_id", "user_id", "open_id"):
             value = sender.get(key) or sender_id.get(key)
             if value:
                 return str(value)
         return "Feishu User"
+
+    def _sender_name_alias(self, sender: dict[str, Any], sender_id: dict[str, Any]) -> str:
+        aliases = self._parse_user_name_aliases(self._config().identity.user_name_aliases)
+        if not aliases:
+            return ""
+
+        for key in ("open_id", "user_id", "union_id"):
+            value = str(sender_id.get(key) or sender.get(key) or "").strip()
+            if value and value in aliases:
+                return aliases[value]
+        return ""
+
+    @staticmethod
+    def _parse_user_name_aliases(items: list[str]) -> dict[str, str]:
+        aliases: dict[str, str] = {}
+        for item in items:
+            raw = str(item or "").strip()
+            if not raw or "=" not in raw:
+                continue
+            key, name = raw.split("=", 1)
+            key = key.strip()
+            name = name.strip()
+            if key and name:
+                aliases[key] = name
+        return aliases
 
     @staticmethod
     def _parse_time(raw_time: Any) -> float:
@@ -558,11 +611,17 @@ class FeishuAdapter(BaseAdapter):
 
     @staticmethod
     def _extract_outgoing_text(envelope: MessageEnvelope) -> tuple[str, str]:
+        outgoing = FeishuAdapter._extract_outgoing_message(envelope)
+        return outgoing["text"], outgoing["reply_to"]
+
+    @staticmethod
+    def _extract_outgoing_message(envelope: MessageEnvelope) -> dict[str, Any]:
         segments = envelope.get("message_segment", []) or []
         if isinstance(segments, dict):
             segments = [segments]
         text_parts: list[str] = []
         reply_to = ""
+        voice_data = ""
         for seg in segments:
             if not isinstance(seg, dict):
                 continue
@@ -572,7 +631,213 @@ class FeishuAdapter(BaseAdapter):
                 reply_to = str(data or "")
             elif seg_type == "text":
                 text_parts.append(str(data or ""))
-        return "".join(text_parts).strip(), reply_to
+            elif seg_type == "voice" and not voice_data:
+                voice_data = FeishuAdapter._stringify_media_data(data)
+        return {
+            "text": "".join(text_parts).strip(),
+            "reply_to": reply_to,
+            "voice_data": voice_data,
+        }
+
+    async def _send_audio_message(
+        self,
+        *,
+        chat_id: str,
+        open_id: str,
+        reply_to: str,
+        voice_data: str,
+    ) -> None:
+        try:
+            file_key, duration_ms = await self._upload_audio(voice_data)
+        except Exception as exc:
+            logger.error(f"飞书语音上传失败，将降级为文本提示: {exc}", exc_info=True)
+            fallback_text = "[语音发送失败：飞书音频上传没有成功]"
+            if self._config().behavior.reply_to_message and reply_to:
+                await self._reply_text(reply_to, fallback_text)
+                return
+            if chat_id:
+                await self._send_text("chat_id", chat_id, fallback_text)
+                return
+            if open_id:
+                await self._send_text("open_id", open_id, fallback_text)
+                return
+            raise ValueError("飞书出站语音缺少 chat_id/open_id，无法确定发送目标") from exc
+
+        if self._config().behavior.reply_to_message and reply_to:
+            await self._reply_audio(reply_to, file_key, duration_ms)
+            logger.info(f"飞书引用语音发送成功: reply_to={reply_to} file_key={file_key}")
+            return
+
+        if chat_id:
+            await self._send_audio(
+                receive_id_type="chat_id",
+                receive_id=chat_id,
+                file_key=file_key,
+                duration_ms=duration_ms,
+            )
+            logger.info(f"飞书群语音发送成功: chat_id={chat_id} file_key={file_key}")
+            return
+
+        if open_id:
+            await self._send_audio(
+                receive_id_type="open_id",
+                receive_id=open_id,
+                file_key=file_key,
+                duration_ms=duration_ms,
+            )
+            logger.info(f"飞书私聊语音发送成功: open_id={open_id} file_key={file_key}")
+            return
+
+        raise ValueError("飞书出站语音缺少 chat_id/open_id，无法确定发送目标")
+
+    async def _upload_audio(self, voice_data: str) -> tuple[str, int]:
+        audio_bytes = self._decode_media_data(voice_data)
+        opus_bytes, duration_ms = await asyncio.to_thread(self._convert_audio_to_opus, audio_bytes)
+        token = await self._get_tenant_access_token()
+        url = self._api_url("/open-apis/im/v1/files")
+        filename = "voice.opus"
+        files = {
+            "file": (
+                filename,
+                opus_bytes,
+                "audio/opus",
+            ),
+        }
+        data = {
+            "file_type": "opus",
+            "file_name": filename,
+            "duration": str(duration_ms),
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                data=data,
+                files=files,
+            )
+        payload = self._decode_response(resp)
+        file_key = str((payload.get("data") or {}).get("file_key") or "")
+        if not file_key:
+            raise ValueError(f"飞书文件上传响应缺少 file_key: {payload}")
+        return file_key, duration_ms
+
+    async def _reply_audio(self, message_id: str, file_key: str, duration_ms: int) -> dict[str, Any]:
+        return await self._post_json(
+            f"/open-apis/im/v1/messages/{message_id}/reply",
+            {
+                "msg_type": "audio",
+                "content": json.dumps(
+                    {"file_key": file_key, "duration": duration_ms},
+                    ensure_ascii=False,
+                ),
+            },
+        )
+
+    async def _send_audio(
+        self,
+        receive_id_type: str,
+        receive_id: str,
+        file_key: str,
+        duration_ms: int,
+    ) -> dict[str, Any]:
+        return await self._post_json(
+            f"/open-apis/im/v1/messages?receive_id_type={receive_id_type}",
+            {
+                "receive_id": receive_id,
+                "msg_type": "audio",
+                "content": json.dumps(
+                    {"file_key": file_key, "duration": duration_ms},
+                    ensure_ascii=False,
+                ),
+            },
+        )
+
+    @staticmethod
+    def _convert_audio_to_opus(audio_bytes: bytes) -> tuple[bytes, int]:
+        if not audio_bytes:
+            raise ValueError("音频数据为空")
+
+        with tempfile.TemporaryDirectory(prefix="feishu_audio_") as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            input_path = tmp_path / "input_audio"
+            output_path = tmp_path / "voice.opus"
+            input_path.write_bytes(audio_bytes)
+
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(input_path),
+                    "-acodec",
+                    "libopus",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "16000",
+                    str(output_path),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+
+            duration_ms = FeishuAdapter._probe_audio_duration_ms(output_path)
+            return output_path.read_bytes(), duration_ms
+
+    @staticmethod
+    def _probe_audio_duration_ms(path: Path) -> int:
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            seconds = float(result.stdout.strip() or "0")
+            return max(1, int(seconds * 1000))
+        except Exception:
+            return 1
+
+    @staticmethod
+    def _stringify_media_data(data: Any) -> str:
+        if isinstance(data, str):
+            return data
+        if isinstance(data, dict):
+            for key in ("data", "base64", "url", "path"):
+                value = data.get(key)
+                if value:
+                    return str(value)
+        return str(data or "")
+
+    @staticmethod
+    def _decode_media_data(data: str) -> bytes:
+        raw = str(data or "").strip()
+        if not raw:
+            raise ValueError("音频数据为空")
+        if raw.startswith("data:"):
+            _, _, raw = raw.partition(",")
+        if raw.startswith("base64|"):
+            raw = raw.removeprefix("base64|")
+        if raw.startswith(("http://", "https://")):
+            raise ValueError("飞书语音暂不支持 URL 直传")
+        if len(raw) < 4096:
+            try:
+                path = Path(raw)
+                if path.exists() and path.is_file():
+                    return path.read_bytes()
+            except OSError:
+                pass
+        return base64.b64decode(raw, validate=False)
 
     async def _reply_text(self, message_id: str, text: str) -> dict[str, Any]:
         return await self._post_json(
