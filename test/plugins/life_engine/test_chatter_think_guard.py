@@ -19,9 +19,11 @@ from plugins.life_engine.core.tool_parallel import (
     is_life_tool_call_parallel_safe,
     iter_life_tool_call_batches,
 )
+from src.kernel.llm.exceptions import LLMContextError
+from src.kernel.llm.context import LLMContextManager
 from src.core.components.base.chatter import BaseChatter
 from src.core.models.message import Message, MessageType
-from src.kernel.llm import LLMPayload, ROLE, ToolResult
+from src.kernel.llm import LLMPayload, ROLE, Text, ToolCall, ToolResult
 
 
 class _FakeResponse:
@@ -45,13 +47,13 @@ def test_is_think_only_calls_false_for_mixed_actions() -> None:
     assert LifeChatter._is_think_only_calls(calls) is False
 
 
-def test_append_think_only_retry_instruction_adds_system_payload() -> None:
+def test_append_think_only_retry_instruction_adds_user_payload() -> None:
     response = _FakeResponse()
     LifeChatter._append_think_only_retry_instruction(response)
 
     assert len(response.payloads) == 1
     payload = response.payloads[0]
-    assert getattr(payload, "role", None) == ROLE.SYSTEM
+    assert getattr(payload, "role", None) == ROLE.USER
 
 
 def test_append_plain_text_retry_instruction_adds_user_payload() -> None:
@@ -284,22 +286,64 @@ def test_append_segment_send_retry_instruction_adds_system_payload() -> None:
     assert getattr(payload, "role", None) == ROLE.SYSTEM
 
 
-def test_append_must_reply_retry_instruction_adds_system_payload() -> None:
+def test_append_must_reply_retry_instruction_adds_user_payload() -> None:
     response = _FakeResponse()
     LifeChatter._append_must_reply_retry_instruction(response)
 
     assert len(response.payloads) == 1
     payload = response.payloads[0]
-    assert getattr(payload, "role", None) == ROLE.SYSTEM
+    assert getattr(payload, "role", None) == ROLE.USER
 
 
-def test_append_inner_monologue_retry_instruction_adds_system_payload() -> None:
+def test_append_inner_monologue_retry_instruction_adds_user_payload() -> None:
     response = _FakeResponse()
     LifeChatter._append_inner_monologue_retry_instruction(response)
 
     assert len(response.payloads) == 1
     payload = response.payloads[0]
-    assert getattr(payload, "role", None) == ROLE.SYSTEM
+    assert getattr(payload, "role", None) == ROLE.USER
+
+
+def test_follow_up_retry_instruction_turns_assistant_tail_into_user_turn() -> None:
+    response = _FakeResponse()
+    response.add_payload(LLMPayload(ROLE.USER, Text("上一轮用户消息")))
+    response.add_payload(
+        LLMPayload(
+            ROLE.ASSISTANT,
+            [Text("需要回复"), ToolCall(id="call-1", name="tool-inspect_media", args="{}")],
+        )
+    )
+    response.add_payload(
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            ToolResult(value="ok", call_id="call-1", name="tool-inspect_media"),
+        )
+    )
+    response.add_payload(LLMPayload(ROLE.ASSISTANT, Text("__SUSPEND__")))
+
+    LifeChatter._append_must_reply_retry_instruction(response)
+
+    assert [payload.role for payload in response.payloads] == [
+        ROLE.USER,
+        ROLE.ASSISTANT,
+        ROLE.TOOL_RESULT,
+        ROLE.ASSISTANT,
+        ROLE.USER,
+    ]
+
+    manager = LLMContextManager()
+    validated = list(response.payloads)
+    manager._validate_payloads(validated, allow_incomplete_tail=True)
+
+    with pytest.raises(LLMContextError):
+        manager._validate_payloads(
+            [
+                LLMPayload(ROLE.USER, Text("上一轮用户消息")),
+                LLMPayload(ROLE.ASSISTANT, Text("上一轮助手消息")),
+                LLMPayload(ROLE.ASSISTANT, Text("非法的连续 assistant")),
+            ],
+            allow_incomplete_tail=True,
+        )
 
 
 def test_visible_reply_action_accepts_emoji_send() -> None:

@@ -1942,7 +1942,7 @@ class LifeChatter(BaseChatter):
             if retry_count >= _MAX_THINK_ONLY_RETRIES
             else _THINK_ONLY_RETRY_REMINDER
         )
-        response.add_payload(LLMPayload(ROLE.SYSTEM, Text(reminder)))
+        LifeChatter._append_follow_up_user_instruction(response, reminder)
         logger.warning("检测到本轮仅调用 action-think，已注入系统阻断提醒并触发重试")
 
     @staticmethod
@@ -1992,13 +1992,21 @@ class LifeChatter(BaseChatter):
 
     @staticmethod
     def _append_must_reply_retry_instruction(response: Any) -> None:
-        response.add_payload(LLMPayload(ROLE.SYSTEM, Text(_MUST_REPLY_RETRY_REMINDER)))
+        LifeChatter._append_follow_up_user_instruction(response, _MUST_REPLY_RETRY_REMINDER)
         logger.warning("检测到应回复轮次却未产生面向用户的回复，已注入强制回复提醒")
 
     @staticmethod
     def _append_inner_monologue_retry_instruction(response: Any) -> None:
-        response.add_payload(LLMPayload(ROLE.SYSTEM, Text(_INNER_MONOLOGUE_RETRY_REMINDER)))
+        LifeChatter._append_follow_up_user_instruction(response, _INNER_MONOLOGUE_RETRY_REMINDER)
         logger.warning("主动机会轮次缺少内心独白记录，已注入重试提醒")
+
+    @staticmethod
+    def _append_follow_up_user_instruction(response: Any, reminder: str) -> None:
+        """为 FOLLOW_UP 续轮注入一个新的 USER 轮次，避免 assistant -> assistant 非法链路。"""
+
+        if LifeChatter._has_tool_result_tail(response):
+            response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
+        response.add_payload(LLMPayload(ROLE.USER, Text(reminder)))
 
     @staticmethod
     def _is_visible_reply_action(call_name: str) -> bool:
@@ -2535,7 +2543,7 @@ class LifeChatter(BaseChatter):
                             forced_reminder = _THINK_ONLY_FORCE_SEND_REMINDER.format(
                                 decision=decision_text[:200],
                             )
-                            llm_response.add_payload(LLMPayload(ROLE.SYSTEM, Text(forced_reminder)))
+                            self._append_follow_up_user_instruction(llm_response, forced_reminder)
                             logger.warning(
                                 f"连续仅调用 action-think 达到上限且 must_reply，"
                                 f"已注入强制发送提醒（decision={decision_text[:80]}）"
