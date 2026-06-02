@@ -1,0 +1,2 @@
+"""Feishu adapter plugin."""
+

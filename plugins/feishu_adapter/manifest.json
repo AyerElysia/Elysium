@@ -1,0 +1,33 @@
+{
+  "name": "feishu_adapter",
+  "version": "0.1.0",
+  "description": "飞书自建应用通道桥接：将飞书消息接入统一 life_chatter 主意识",
+  "author": "MoFox Team",
+  "license": "GPL-3.0",
+  "dependencies": {
+    "plugins": [],
+    "components": []
+  },
+  "include": [
+    {
+      "component_type": "router",
+      "component_name": "feishu",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "adapter",
+      "component_name": "feishu_adapter",
+      "dependencies": [],
+      "enabled": true
+    }
+  ],
+  "entry_point": "plugin.py",
+  "min_core_version": "1.0.0",
+  "python_dependencies": [
+    "fastapi",
+    "httpx",
+    "pydantic"
+  ],
+  "dependencies_required": true
+}
