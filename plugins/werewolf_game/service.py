@@ -66,6 +66,10 @@ class WerewolfGameService(BaseService):
             )
 
         game = self.games.get(key)
+
+        if command in {"帮助", "help", "指令", "commands"}:
+            return self._help_text(game)
+
         if not game:
             return "这个群还没有狼人杀房间。发送 /狼人杀 开局 创建。"
 
@@ -77,6 +81,8 @@ class WerewolfGameService(BaseService):
                 user_id=str(message.sender_id),
                 display_name=self._sender_name(message),
             )
+            if result.ok:
+                return f"{result.message}\n{self.engine.public_guidance(game)}"
             return result.message
 
         if command in {"退出", "离开", "quit", "leave"}:
@@ -125,7 +131,7 @@ class WerewolfGameService(BaseService):
         if command in {"杀", "刀", "验", "查验", "救", "毒", "跳过", "过", "kill", "check", "heal", "poison", "pass"}:
             return "夜晚身份行动不要发在群里，请私聊我发送同样命令。"
 
-        return "未知狼人杀命令。常用：开局、加入、加入 爱莉、开始、测试开始、状态、投票 编号、结束。"
+        return self._help_text(game)
 
     async def handle_private_command(self, message: Message, args: list[str]) -> str:
         command = args[0] if args else "视角"
@@ -245,7 +251,25 @@ class WerewolfGameService(BaseService):
             display_name=bot_name or "爱莉",
             is_bot=True,
         )
+        if result.ok:
+            return f"{result.message}\n{self.engine.public_guidance(game)}"
         return result.message
+
+    def _help_text(self, game: GameState | None = None) -> str:
+        lines = [
+            "狼人杀指令：",
+            "/狼人杀 状态 - 查看当前阶段、玩家列表和下一步",
+            "/狼人杀 加入 - 加入当前房间",
+            "/狼人杀 加入 爱莉 - 让爱莉作为玩家加入",
+            "/狼人杀 开始 - 正式开局，至少 6 人，房主可用",
+            "/狼人杀 测试开始 - 三人测试开局，房主可用",
+            "/狼人杀 投票 编号 - 白天在群里投票",
+            "/狼人杀 结束 - 房主结束本局",
+            "夜晚行动请私聊爱莉：/狼人杀 身份、杀 编号、验 编号、救、毒 编号、跳过",
+        ]
+        if game:
+            lines.extend(["", self.engine.public_guidance(game)])
+        return "\n".join(lines)
 
     async def _send_private_referee_message(self, platform: str, user_id: str, text: str) -> bool:
         adapter_signature = self._adapter_signature_for_platform(platform)

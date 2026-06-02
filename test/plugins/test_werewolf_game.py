@@ -73,6 +73,19 @@ def test_three_player_test_game_can_start_but_normal_game_still_requires_six() -
     assert roles == {Role.WEREWOLF, Role.SEER, Role.VILLAGER}
 
 
+def test_public_status_includes_next_step_guidance() -> None:
+    engine, game = _game_with_players(count=3)
+
+    waiting_status = engine.public_status(game)
+    assert "下一步：" in waiting_status
+    assert "/狼人杀 测试开始" in waiting_status
+
+    result = engine.start_test_game(game, rng=random.Random(1))
+    assert result.public_messages
+    assert "下一步：" in result.public_messages[0]
+    assert "私聊里行动或跳过" in result.public_messages[0]
+
+
 @pytest.mark.asyncio
 async def test_private_werewolf_command_is_intercepted(monkeypatch) -> None:
     class DummyPlugin:

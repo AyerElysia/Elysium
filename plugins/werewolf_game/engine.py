@@ -107,7 +107,9 @@ class WerewolfEngine:
         return ActionResult(
             True,
             "身份已分配，游戏开始。",
-            public_messages=[f"{prefix}。请所有玩家查看私聊身份，夜晚行动请私聊我。"],
+            public_messages=[
+                f"{prefix}。请所有玩家查看私聊身份，夜晚行动请私聊我。\n{self.public_guidance(game)}"
+            ],
         )
 
     def public_status(self, game: GameState) -> str:
@@ -125,7 +127,45 @@ class WerewolfEngine:
             lines.append(f"人数：{len(game.players)}/{MIN_PLAYERS}+")
         if game.phase == Phase.ENDED and game.ended_reason:
             lines.append(f"结局：{game.ended_reason}")
+        guidance = self.public_guidance(game)
+        if guidance:
+            lines.append("")
+            lines.append(guidance)
         return "\n".join(lines)
+
+    def public_guidance(self, game: GameState) -> str:
+        if game.phase == Phase.WAITING:
+            count = len(game.players)
+            if count < MIN_TEST_PLAYERS:
+                return (
+                    f"下一步：继续发 /狼人杀 加入 凑人。"
+                    f"满 {MIN_TEST_PLAYERS} 人可测试开始，满 {MIN_PLAYERS} 人可正式开始。"
+                )
+            if count < MIN_PLAYERS:
+                return (
+                    "下一步：房主可发 /狼人杀 测试开始 进行三人测试；"
+                    f"正式局还需要 {MIN_PLAYERS - count} 人。"
+                )
+            return "下一步：房主可发 /狼人杀 开始 正式发牌。"
+
+        if game.phase == Phase.NIGHT:
+            return (
+                f"下一步：现在是第 {game.day_number} 夜。"
+                "收到私聊夜晚提示的玩家请在私聊里行动或跳过；"
+                "没有夜晚技能的玩家等待天亮。"
+            )
+
+        if game.phase == Phase.DAY:
+            alive_count = len(game.alive_players())
+            return (
+                f"下一步：现在是第 {game.day_number} 天公开讨论和投票。"
+                f"存活玩家在群里发 /狼人杀 投票 编号；当前投票 {len(game.votes)}/{alive_count}。"
+            )
+
+        if game.phase == Phase.ENDED:
+            return "下一步：本局已结束。可以发 /狼人杀 开局 创建新房间。"
+
+        return ""
 
     def player_view(self, game: GameState, user_id: str) -> str:
         player = game.players.get(str(user_id))
@@ -297,6 +337,7 @@ class WerewolfEngine:
         game.day_number += 1
         game.night = NightState()
         public_messages.append(f"进入第 {game.day_number} 个夜晚，请相关玩家私聊行动。")
+        public_messages.append(self.public_guidance(game))
         return ActionResult(True, "投票结算完成，进入夜晚。", public_messages)
 
     def resolve_target(self, game: GameState, raw: str) -> str | None:
@@ -387,6 +428,7 @@ class WerewolfEngine:
             return ActionResult(True, private_message, public_messages, True)
 
         public_messages.append("进入白天讨论和投票阶段。存活玩家可在群里发送：/狼人杀 投票 编号")
+        public_messages.append(self.public_guidance(game))
         return ActionResult(True, private_message, public_messages)
 
     def _night_ready(self, game: GameState) -> bool:
