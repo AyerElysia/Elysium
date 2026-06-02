@@ -186,10 +186,11 @@ class TestPayloadsToOpenAIMessages:
         mock_message.tool_calls = [mock_tool_call]
         mock_message.function_call = None
 
-        message, tool_calls = _parse_completion_message(mock_message)
+        message, tool_calls, reasoning_content = _parse_completion_message(mock_message)
 
         assert message == ""
         assert tool_calls == [{"id": "call_1", "name": "calculator", "args": {"a": 1, "b": "x"}}]
+        assert reasoning_content is None
 
     def test_multimodal_content(self):
         """测试多模态内容（文本+图片）。"""
@@ -599,7 +600,7 @@ class TestOpenAIChatClient:
             "extra_params": {},
         }
 
-        message, tool_calls, stream_iter, reasoning_content = await client.create(
+        message, tool_calls, stream_iter, reasoning_content, request_record_id = await client.create(
             model_name="gpt-4",
             payloads=payloads,
             tools=[],
@@ -612,6 +613,7 @@ class TestOpenAIChatClient:
         assert tool_calls == []
         assert stream_iter is None
         assert reasoning_content is None
+        assert isinstance(request_record_id, int)
 
     @pytest.mark.asyncio
     async def test_create_stores_usage_with_cache_fields(self):
@@ -706,7 +708,7 @@ class TestOpenAIChatClient:
             "extra_params": {},
         }
 
-        message, tool_calls, stream_iter, reasoning_content = await client.create(
+        message, tool_calls, stream_iter, reasoning_content, request_record_id = await client.create(
             model_name="gpt-4",
             payloads=payloads,
             tools=[],
@@ -722,6 +724,7 @@ class TestOpenAIChatClient:
         assert tool_calls[0]["name"] == "calculator"
         assert tool_calls[0]["args"] == {"a": 1, "b": 2}
         assert reasoning_content is None
+        assert isinstance(request_record_id, int)
 
     @pytest.mark.asyncio
     async def test_create_omits_tool_choice_without_tool_payloads(self):
@@ -1059,6 +1062,120 @@ class TestOpenAIChatClient:
         assert reasoning_content is None
         assert isinstance(request_record_id, int)
         assert mock_chat.completions.create.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_create_retries_without_native_image_when_endpoint_lacks_image_support(self):
+        """图片输入不被当前端点支持时，应自动去掉图片块并重试。"""
+        from src.kernel.llm.model_client.openai_client import OpenAIChatClient
+
+        mock_completion = MagicMock()
+        mock_completion.choices = [MagicMock()]
+        mock_completion.choices[0].message.content = "fallback-ok"
+        mock_completion.choices[0].message.tool_calls = None
+
+        mock_chat = AsyncMock()
+        mock_chat.completions.create = AsyncMock(
+            side_effect=[
+                Exception("Error code: 404 - {'error': {'message': 'No endpoints found that support image input'}}"),
+                mock_completion,
+            ]
+        )
+
+        mock_openai_client = MagicMock()
+        mock_openai_client.chat.completions.create = mock_chat.completions.create
+
+        client = OpenAIChatClient()
+        client._clients = {}
+        client._get_client = MagicMock(return_value=mock_openai_client)
+
+        payloads = [LLMPayload(ROLE.USER, [Text("描述一下"), Image("base64|aGVsbG8=")])]
+        model_set = {
+            "api_key": "test-key",
+            "base_url": None,
+            "timeout": None,
+            "max_tokens": None,
+            "temperature": None,
+            "extra_params": {},
+        }
+
+        message, tool_calls, stream_iter, reasoning_content, request_record_id = await client.create(
+            model_name="mimo-v2.5-pro",
+            payloads=payloads,
+            tools=[],
+            request_name="test",
+            model_set=model_set,
+            stream=False,
+        )
+
+        assert message == "fallback-ok"
+        assert tool_calls == []
+        assert stream_iter is None
+        assert reasoning_content is None
+        assert isinstance(request_record_id, int)
+        assert mock_chat.completions.create.await_count == 2
+
+        first_call_kwargs = mock_chat.completions.create.await_args_list[0].kwargs
+        second_call_kwargs = mock_chat.completions.create.await_args_list[1].kwargs
+        first_content = first_call_kwargs["messages"][0]["content"]
+        second_content = second_call_kwargs["messages"][0]["content"]
+        assert any(item.get("type") == "image_url" for item in first_content if isinstance(item, dict))
+        assert all(item.get("type") != "image_url" for item in second_content if isinstance(item, dict))
+
+    @pytest.mark.asyncio
+    async def test_create_stream_retries_without_native_image_when_endpoint_lacks_image_support(self):
+        """流式图片输入不被支持时，也应自动去掉图片块并重试。"""
+        from src.kernel.llm.model_client.openai_client import OpenAIChatClient
+
+        fake_stream = AsyncMock()
+        fake_stream.__aiter__.return_value = iter([])
+
+        mock_chat = AsyncMock()
+        mock_chat.completions.create = AsyncMock(
+            side_effect=[
+                Exception("Error code: 404 - {'error': {'message': 'No endpoints found that support image input'}}"),
+                fake_stream,
+            ]
+        )
+
+        mock_openai_client = MagicMock()
+        mock_openai_client.chat.completions.create = mock_chat.completions.create
+
+        client = OpenAIChatClient()
+        client._clients = {}
+        client._get_client = MagicMock(return_value=mock_openai_client)
+
+        payloads = [LLMPayload(ROLE.USER, [Text("描述一下"), Image("base64|aGVsbG8=")])]
+        model_set = {
+            "api_key": "test-key",
+            "base_url": None,
+            "timeout": None,
+            "max_tokens": None,
+            "temperature": None,
+            "extra_params": {},
+        }
+
+        message, tool_calls, stream_iter, reasoning_content, request_record_id = await client.create(
+            model_name="mimo-v2.5-pro",
+            payloads=payloads,
+            tools=[],
+            request_name="test",
+            model_set=model_set,
+            stream=True,
+        )
+
+        assert message is None
+        assert tool_calls is None
+        assert stream_iter is not None
+        assert reasoning_content is None
+        assert isinstance(request_record_id, int)
+        assert mock_chat.completions.create.await_count == 2
+
+        first_call_kwargs = mock_chat.completions.create.await_args_list[0].kwargs
+        second_call_kwargs = mock_chat.completions.create.await_args_list[1].kwargs
+        first_content = first_call_kwargs["messages"][0]["content"]
+        second_content = second_call_kwargs["messages"][0]["content"]
+        assert any(item.get("type") == "image_url" for item in first_content if isinstance(item, dict))
+        assert all(item.get("type") != "image_url" for item in second_content if isinstance(item, dict))
 
     @pytest.mark.asyncio
     async def test_create_inject_reasoning_content_for_thinking_tool_calls(self):
@@ -1422,7 +1539,7 @@ class TestOpenAIChatClient:
             "extra_params": {},
         }
 
-        message, tool_calls, _, reasoning_content = await client.create(
+        message, tool_calls, _, reasoning_content, request_record_id = await client.create(
             model_name="gpt-4",
             payloads=payloads,
             tools=[],
@@ -1443,6 +1560,7 @@ class TestOpenAIChatClient:
         assert tool_calls[0]["name"] == "calculator"
         assert tool_calls[0]["args"] == {"a": 1}
         assert reasoning_content is None
+        assert isinstance(request_record_id, int)
 
     @pytest.mark.asyncio
     async def test_stream_iterator_closes_underlying_stream_on_early_stop(self):
@@ -1499,7 +1617,7 @@ class TestOpenAIChatClient:
             "extra_params": {},
         }
 
-        message, tool_calls, stream_iter, reasoning_content = await client.create(
+        message, tool_calls, stream_iter, reasoning_content, request_record_id = await client.create(
             model_name="gpt-4",
             payloads=payloads,
             tools=[],
@@ -1512,6 +1630,7 @@ class TestOpenAIChatClient:
         assert tool_calls is None
         assert stream_iter is not None
         assert reasoning_content is None
+        assert isinstance(request_record_id, int)
 
         event = await anext(stream_iter)
         assert event.text_delta == "hello"

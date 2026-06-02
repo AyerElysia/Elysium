@@ -251,6 +251,18 @@ def _messages_contain_native_video(messages: list[dict[str, Any]]) -> bool:
     return False
 
 
+def _messages_contain_native_image(messages: list[dict[str, Any]]) -> bool:
+    """检查 messages 中是否包含原生图片内容块。"""
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if _is_native_image_message_item(item):
+                return True
+    return False
+
+
 def _is_native_video_message_item(item: Any) -> bool:
     """判断单个 content item 是否承载原生视频输入。"""
     if not isinstance(item, dict):
@@ -271,6 +283,26 @@ def _is_native_video_message_item(item: Any) -> bool:
         url = str(item.get("url") or "")
 
     return url.startswith("data:video/")
+
+
+def _is_native_image_message_item(item: Any) -> bool:
+    """判断单个 content item 是否承载原生图片输入。"""
+    if not isinstance(item, dict):
+        return False
+
+    if item.get("type") != "image_url":
+        return False
+
+    image_url_obj = item.get("image_url")
+    url = ""
+    if isinstance(image_url_obj, dict):
+        url = str(image_url_obj.get("url") or "")
+    elif isinstance(item.get("url"), str):
+        url = str(item.get("url") or "")
+
+    if url.startswith("data:video/"):
+        return False
+    return bool(url)
 
 
 def _strip_native_video_from_messages(
@@ -309,6 +341,42 @@ def _strip_native_video_from_messages(
     return rebuilt, removed
 
 
+def _strip_native_image_from_messages(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """移除 messages 中的图片内容块，返回新 messages 和移除数量。"""
+    removed = 0
+    rebuilt: list[dict[str, Any]] = []
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            rebuilt.append(msg)
+            continue
+
+        cloned = dict(msg)
+        content = cloned.get("content")
+        if not isinstance(content, list):
+            rebuilt.append(cloned)
+            continue
+
+        new_content: list[Any] = []
+        local_removed = 0
+        for item in content:
+            if _is_native_image_message_item(item):
+                local_removed += 1
+                continue
+            new_content.append(item)
+
+        if local_removed > 0 and not new_content:
+            new_content.append({"type": "text", "text": "[图片原生输入已降级为文字描述]"})
+
+        removed += local_removed
+        cloned["content"] = new_content
+        rebuilt.append(cloned)
+
+    return rebuilt, removed
+
+
 def _is_native_video_unsupported_error(error: Exception) -> bool:
     """判断异常是否属于“视频输入不被当前端点支持”。"""
     error_name = type(error).__name__.lower()
@@ -339,6 +407,33 @@ def _is_native_video_unsupported_error(error: Exception) -> bool:
         return True
 
     return any(marker in haystack for marker in video_markers) and any(
+        marker in haystack for marker in unsupported_markers
+    )
+
+
+def _is_native_image_unsupported_error(error: Exception) -> bool:
+    """判断异常是否属于“图片输入不被当前端点支持”。"""
+    error_name = type(error).__name__.lower()
+    error_text = str(error).lower()
+    haystack = f"{error_name} {error_text}"
+
+    image_markers = (
+        "image input",
+        "image_url",
+        "input_image",
+        "vision",
+        "multimodal",
+    )
+    unsupported_markers = (
+        "no endpoints found that support image input",
+        "not support image input",
+        "does not support image input",
+        "unsupported image input",
+        "image input not supported",
+        "vision is not supported",
+    )
+
+    return any(marker in haystack for marker in image_markers) and any(
         marker in haystack for marker in unsupported_markers
     )
 
@@ -1096,6 +1191,7 @@ class OpenAIChatClient:
         )
         messages, openai_tools = _payloads_to_openai_messages(payloads)
         has_native_video = _messages_contain_native_video(messages)
+        has_native_image = _messages_contain_native_image(messages)
         tool_call_compat = bool(model_set.get("tool_call_compat", False))
 
         if tool_call_compat and openai_tools:
@@ -1178,6 +1274,7 @@ class OpenAIChatClient:
                 tool_call_compat=tool_call_compat,
                 openai_tools=openai_tools,
                 has_native_video=has_native_video,
+                has_native_image=has_native_image,
                 api_key=api_key,
                 base_url=base_url,
                 timeout=timeout,
@@ -1197,6 +1294,7 @@ class OpenAIChatClient:
             client=client,
             params=params,
             has_native_video=has_native_video,
+            has_native_image=has_native_image,
         )
         return (
             message_content,
@@ -1214,6 +1312,7 @@ class OpenAIChatClient:
         tool_call_compat: bool,
         openai_tools: list[dict[str, Any]],
         has_native_video: bool,
+        has_native_image: bool,
         api_key: str,
         base_url: str | None,
         timeout: float | None,
@@ -1255,6 +1354,22 @@ class OpenAIChatClient:
                         logger.warning(
                             "检测到上游不支持原生视频输入，自动降级为文本摘要模式重试。"
                             f"移除视频块数量: {removed}"
+                        )
+                        fallback_params["messages"] = downgraded_messages
+                        resp = await client.chat.completions.create(**fallback_params)
+                    else:
+                        raise
+                else:
+                    raise
+            elif has_native_image and _is_native_image_unsupported_error(e):
+                fallback_params = dict(params)
+                original_messages = fallback_params.get("messages")
+                if isinstance(original_messages, list):
+                    downgraded_messages, removed = _strip_native_image_from_messages(original_messages)
+                    if removed > 0:
+                        logger.warning(
+                            "检测到上游不支持原生图片输入，自动降级为文字描述模式重试。"
+                            f"移除图片块数量: {removed}"
                         )
                         fallback_params["messages"] = downgraded_messages
                         resp = await client.chat.completions.create(**fallback_params)
@@ -1308,6 +1423,7 @@ class OpenAIChatClient:
         client: Any,
         params: dict[str, Any],
         has_native_video: bool,
+        has_native_image: bool,
     ) -> tuple[None, None, AsyncIterator[StreamEvent], None]:
         """执行流式聊天请求并返回事件迭代器。
 
@@ -1330,6 +1446,22 @@ class OpenAIChatClient:
                         logger.warning(
                             "流式请求检测到上游不支持原生视频输入，自动降级为文本摘要模式重试。"
                             f"移除视频块数量: {removed}"
+                        )
+                        fallback_params["messages"] = downgraded_messages
+                        stream_resp = await client.chat.completions.create(**fallback_params, stream=True)
+                    else:
+                        raise
+                else:
+                    raise
+            elif has_native_image and _is_native_image_unsupported_error(e):
+                fallback_params = dict(params)
+                original_messages = fallback_params.get("messages")
+                if isinstance(original_messages, list):
+                    downgraded_messages, removed = _strip_native_image_from_messages(original_messages)
+                    if removed > 0:
+                        logger.warning(
+                            "流式请求检测到上游不支持原生图片输入，自动降级为文字描述模式重试。"
+                            f"移除图片块数量: {removed}"
                         )
                         fallback_params["messages"] = downgraded_messages
                         stream_resp = await client.chat.completions.create(**fallback_params, stream=True)
