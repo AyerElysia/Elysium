@@ -1,0 +1,144 @@
+"""life_engine autonomy intent tests."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from plugins.life_engine.autonomy import AutonomyIntentStore, build_intent
+from plugins.life_engine.core.chatter import LifeChatter
+from plugins.life_engine.core.config import LifeEngineConfig
+from plugins.life_engine.service.core import LifeEngineService
+from plugins.life_engine.tools.autonomy_tools import LifeEngineScheduleAutonomyIntentTool
+from src.core.models.message import Message
+
+
+def _make_service(tmp_path: Path) -> LifeEngineService:
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(tmp_path)
+    plugin = SimpleNamespace(config=config)
+    service = LifeEngineService(plugin)
+    plugin.service = service
+    return service
+
+
+def test_build_intent_uses_delay_minutes_and_rejects_out_of_range() -> None:
+    intent = build_intent(
+        kind="reflect",
+        motivation="我想等一会儿继续想这件事",
+        delay_minutes=5,
+        min_delay_minutes=1,
+        max_delay_minutes=60,
+    )
+
+    assert intent.kind == "reflect"
+    assert intent.delay_minutes == 5
+    assert intent.status == "scheduled"
+    assert intent.scheduled_at
+    assert intent.task_name.startswith("life_autonomy::")
+
+    with pytest.raises(ValueError, match="delay_minutes"):
+        build_intent(
+            kind="reflect",
+            motivation="太久了",
+            delay_minutes=120,
+            min_delay_minutes=1,
+            max_delay_minutes=60,
+        )
+
+
+@pytest.mark.asyncio
+async def test_schedule_autonomy_intent_persists_and_records_event(tmp_path: Path, monkeypatch) -> None:
+    service = _make_service(tmp_path)
+
+    async def fake_schedule(_plugin, intent):
+        intent.schedule_id = "schedule-1"
+        return "schedule-1"
+
+    monkeypatch.setattr("plugins.life_engine.service.core.register_autonomy_schedule", fake_schedule)
+
+    receipt = await service.schedule_autonomy_intent(
+        kind="speak",
+        motivation="我想过一会儿再确认要不要靠近",
+        delay_minutes=3,
+        target_hint="AyerElysia 私聊",
+        target_stream_id="stream-1",
+        constraints=["短一点", "不要催"],
+    )
+
+    assert receipt["created"] is True
+    assert receipt["kind"] == "speak"
+    assert receipt["delay_minutes"] == 3
+    assert receipt["target_stream_id"] == "stream-1"
+
+    stored = AutonomyIntentStore(tmp_path).get(receipt["intent_id"])
+    assert stored is not None
+    assert stored.schedule_id == "schedule-1"
+    assert stored.constraints == ["短一点", "不要催"]
+
+    assert len(service._pending_events) == 1
+    assert service._pending_events[0].content_type == "autonomy_intent_scheduled"
+
+
+@pytest.mark.asyncio
+async def test_autonomy_tool_calls_service(tmp_path: Path, monkeypatch) -> None:
+    service = _make_service(tmp_path)
+
+    async def fake_schedule(_plugin, intent):
+        intent.schedule_id = "schedule-1"
+        return "schedule-1"
+
+    monkeypatch.setattr("plugins.life_engine.service.core.register_autonomy_schedule", fake_schedule)
+    tool = LifeEngineScheduleAutonomyIntentTool(plugin=service.plugin)
+
+    ok, result = await tool.execute(
+        kind="silence",
+        motivation="我想确认自己可以不打扰",
+        delay_minutes=2,
+    )
+
+    assert ok is True
+    assert isinstance(result, dict)
+    assert result["kind"] == "silence"
+    assert result["delay_minutes"] == 2
+
+
+@pytest.mark.asyncio
+async def test_trigger_speak_without_target_downgrades_to_life_event(tmp_path: Path, monkeypatch) -> None:
+    service = _make_service(tmp_path)
+
+    async def fake_schedule(_plugin, intent):
+        intent.schedule_id = "schedule-1"
+        return "schedule-1"
+
+    monkeypatch.setattr("plugins.life_engine.service.core.register_autonomy_schedule", fake_schedule)
+    receipt = await service.schedule_autonomy_intent(
+        kind="speak",
+        motivation="我想稍后再决定要不要说话",
+        delay_minutes=1,
+    )
+    service._pending_events.clear()
+
+    result = await service.trigger_autonomy_intent(receipt["intent_id"])
+
+    assert result["triggered"] is True
+    assert result["dispatch"] == "life_event"
+    stored = AutonomyIntentStore(tmp_path).get(receipt["intent_id"])
+    assert stored is not None
+    assert stored.status == "triggered"
+    assert len(service._pending_events) == 1
+    assert service._pending_events[0].content_type == "autonomy_intent_due"
+
+
+def test_life_chatter_treats_autonomy_trigger_as_internal_opportunity() -> None:
+    message = Message(
+        message_id="autonomy-1",
+        content="自主意向浮现",
+        processed_plain_text="自主意向浮现",
+        is_autonomy_intent_trigger=True,
+    )
+
+    assert LifeChatter._is_proactive_trigger_message(message) is True
+    assert LifeChatter._should_force_reply_for_unread_batch([message]) is False

@@ -34,6 +34,7 @@ def is_visible_chat_history_message(message: Message) -> bool:
         message_flag(message, "is_inner_monologue")
         or message_flag(message, "is_proactive_opportunity_trigger")
         or message_flag(message, "is_proactive_followup_trigger")
+        or message_flag(message, "is_autonomy_intent_trigger")
     )
 
 

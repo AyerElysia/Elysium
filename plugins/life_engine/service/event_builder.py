@@ -495,3 +495,38 @@ class EventBuilder:
             chat_type=chat_type_name,
             stream_id=target_stream_id or None,
         )
+
+    def build_autonomy_intent_event(
+        self,
+        message: str,
+        *,
+        content_type: str,
+        stream_id: str = "",
+        chat_type: str = "",
+        sender_name: str = "",
+    ) -> LifeEngineEvent:
+        """构建 life_engine 自主意向事件。"""
+        seq = self._next_sequence()
+        target_stream_id = str(stream_id or "").strip()
+        content_type_name = str(content_type or "autonomy_intent").strip() or "autonomy_intent"
+        detail_parts = [
+            "life_engine_autonomy",
+            "自主意向",
+            content_type_name,
+        ]
+        if target_stream_id:
+            detail_parts.append(f"stream_id={target_stream_id}")
+
+        return LifeEngineEvent(
+            event_id=f"autonomy_{seq}",
+            event_type=EventType.MESSAGE,
+            timestamp=_now_iso(),
+            sequence=seq,
+            source="life_engine_autonomy",
+            source_detail=" | ".join(detail_parts),
+            content=_shorten_text(str(message or "").strip(), max_length=700),
+            content_type=content_type_name,
+            sender=str(sender_name or "自主意向").strip() or "自主意向",
+            chat_type=str(chat_type or "internal").strip() or "internal",
+            stream_id=target_stream_id or None,
+        )

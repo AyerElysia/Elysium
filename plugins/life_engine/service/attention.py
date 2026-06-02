@@ -121,8 +121,12 @@ class AttentionRouter:
             return 100
         if content_type in {"direct_message", "dfc_message"}:
             return 95
+        if content_type == "autonomy_intent_due":
+            return 93
         if content_type == "proactive_opportunity":
             return 90
+        if content_type in {"autonomy_intent_scheduled", "autonomy_intent_silence"}:
+            return 84
         if event.event_type == EventType.AGENT_RESULT:
             return 88 if event.tool_success is not False else 96
         if content_type == "chatter_inner_monologue":

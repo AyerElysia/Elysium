@@ -22,6 +22,7 @@ from .grep_tools import GREP_TOOLS
 from .web_tools import WEB_TOOLS
 from .rest_tools import REST_TOOLS, LifeEngineRestHeartbeatTool
 from .screen_tools import SCREEN_TOOLS, LifeEngineViewScreenTool
+from .autonomy_tools import AUTONOMY_TOOLS, LifeEngineScheduleAutonomyIntentTool
 from ..streams.tools import STREAM_TOOLS
 from .exec_tools import EXEC_TOOLS
 
@@ -41,9 +42,11 @@ __all__ = [
     "STREAM_TOOLS",
     "REST_TOOLS",
     "SCREEN_TOOLS",
+    "AUTONOMY_TOOLS",
     "LifeEngineFetchChatHistoryTool",
     "LifeEngineRestHeartbeatTool",
     "LifeEngineViewScreenTool",
+    "LifeEngineScheduleAutonomyIntentTool",
     "LifeEngineReadFileTool",
     "LifeEngineWriteFileTool",
     "LifeEngineEditFileTool",

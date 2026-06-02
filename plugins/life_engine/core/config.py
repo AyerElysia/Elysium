@@ -108,6 +108,11 @@ class LifeEngineConfig(BaseConfig):
             "inject_to_heartbeat",
             "sync_to_chatter",
         },
+        "autonomy": {
+            "enabled",
+            "min_delay_minutes",
+            "max_delay_minutes",
+        },
         "runtime_sync": {
             "latest_action_think_enabled",
             "recent_chat_enabled",
@@ -172,6 +177,27 @@ class LifeEngineConfig(BaseConfig):
         task_name: str = Field(
             default="life",
             description="中枢任务使用的模型任务名称，对应 config/model.toml 中的 [model_tasks.life]。",
+        )
+
+    @config_section("autonomy")
+    class AutonomySection(SectionBase):
+        """自主意向循环配置。"""
+
+        enabled: bool = Field(
+            default=True,
+            description="是否启用 life_engine 自主意向登记与到点浮现。",
+        )
+
+        min_delay_minutes: int = Field(
+            default=1,
+            ge=1,
+            description="自主意向允许的最小延迟分钟数。",
+        )
+
+        max_delay_minutes: int = Field(
+            default=1440,
+            ge=1,
+            description="自主意向允许的最大延迟分钟数。",
         )
 
     @config_section("history_retrieval")

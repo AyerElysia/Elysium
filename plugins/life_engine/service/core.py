@@ -18,7 +18,7 @@ from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import BaseService
 from src.core.components.utils import should_strip_auto_reason_argument
-from src.core.models.message import Message
+from src.core.models.message import Message, MessageType
 from src.kernel.concurrency import get_task_manager
 from src.kernel.llm import LLMPayload, ROLE, Text, ToolRegistry, ToolResult
 from src.kernel.scheduler import get_unified_scheduler, TriggerType
@@ -43,6 +43,15 @@ from ..core.chat_history import build_chat_history_text, message_flag
 from ..core.config import LifeEngineConfig
 from ..core.send_targets import format_send_targets_for_prompt, list_recent_send_targets
 from ..core.tool_parallel import iter_life_tool_call_batches
+from ..autonomy import (
+    AutonomyIntent,
+    AutonomyIntentStore,
+    build_intent,
+    cleanup_autonomy_schedules,
+    format_due_message,
+    restore_autonomy_intents,
+    schedule_autonomy_intent as register_autonomy_schedule,
+)
 from ..streams.manager import ThoughtStreamManager
 from ..drives.impulse import ImpulseEngine
 from ..drives.rules import DEFAULT_RULES
@@ -1245,6 +1254,199 @@ class LifeEngineService(BaseService):
             "channel": "proactive_opportunity",
         }
 
+    def _autonomy_store(self) -> AutonomyIntentStore:
+        return AutonomyIntentStore(self._workspace_dir())
+
+    async def _resolve_autonomy_target_stream_id(
+        self,
+        *,
+        target_stream_id: str = "",
+        target_key: str = "",
+    ) -> str:
+        explicit = str(target_stream_id or "").strip()
+        if explicit:
+            return explicit
+        key = str(target_key or "").strip()
+        if not key:
+            return ""
+        try:
+            from ..core.send_targets import resolve_send_target_key
+
+            runtime_cfg = getattr(self._cfg(), "runtime_sync", None)
+            target = await resolve_send_target_key(
+                key,
+                current_stream_id="",
+                limit=int(getattr(runtime_cfg, "send_targets_limit", 8) or 8),
+                active_window_hours=float(getattr(runtime_cfg, "send_targets_window_hours", 24.0) or 24.0),
+            )
+            if target is not None:
+                return str(target.stream_id or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"解析自主意向 target_key 失败: {exc}")
+        return ""
+
+    async def schedule_autonomy_intent(
+        self,
+        *,
+        kind: str,
+        motivation: str,
+        delay_minutes: int,
+        target_hint: str = "",
+        target_stream_id: str = "",
+        target_key: str = "",
+        constraints: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """登记一个 life_engine 自主形成的延迟意向。"""
+        cfg = self._cfg()
+        autonomy_cfg = getattr(cfg, "autonomy", None)
+        if autonomy_cfg is not None and not bool(getattr(autonomy_cfg, "enabled", True)):
+            raise RuntimeError("自主意向循环未启用")
+
+        resolved_stream_id = await self._resolve_autonomy_target_stream_id(
+            target_stream_id=target_stream_id,
+            target_key=target_key,
+        )
+        intent = build_intent(
+            kind=kind,
+            motivation=motivation,
+            delay_minutes=int(delay_minutes or 0),
+            min_delay_minutes=int(getattr(autonomy_cfg, "min_delay_minutes", 1) or 1),
+            max_delay_minutes=int(getattr(autonomy_cfg, "max_delay_minutes", 1440) or 1440),
+            target_hint=target_hint,
+            target_key=target_key,
+            target_stream_id=resolved_stream_id,
+            constraints=constraints or [],
+        )
+
+        async with self._get_lock():
+            store = self._autonomy_store()
+            try:
+                await register_autonomy_schedule(self.plugin, intent)
+            except RuntimeError as exc:
+                raise RuntimeError("调度器尚未启动，稍后再登记自主意向") from exc
+            store.upsert(intent)
+
+        event_text = (
+            f"已登记自主意向：kind={intent.kind} delay={intent.delay_minutes}分钟 "
+            f"motivation={intent.motivation}"
+        )
+        event = self._event_builder.build_autonomy_intent_event(
+            event_text,
+            content_type="autonomy_intent_scheduled",
+            stream_id=intent.target_stream_id,
+            sender_name="自主意向",
+        )
+        await self._queue_pending_event(event)
+
+        logger.info(
+            "新意向: "
+            f"kind={intent.kind} delay={intent.delay_minutes}m "
+            f"intent_id={intent.intent_id[:12]} "
+            f"stream={intent.target_stream_id or '-'}"
+        )
+        return {
+            "created": True,
+            "intent_id": intent.intent_id,
+            "kind": intent.kind,
+            "delay_minutes": intent.delay_minutes,
+            "scheduled_at": intent.scheduled_at,
+            "status": intent.status,
+            "target_stream_id": intent.target_stream_id,
+            "target_hint": intent.target_hint,
+            "schedule_id": intent.schedule_id,
+        }
+
+    async def trigger_autonomy_intent(self, intent_id: str) -> dict[str, Any]:
+        """触发到点的自主意向。"""
+        store = self._autonomy_store()
+        intent = store.get(intent_id)
+        if intent is None:
+            logger.warning(f"到点意向不存在: intent_id={intent_id}")
+            return {"triggered": False, "reason": "not_found"}
+        if intent.status != "scheduled":
+            logger.debug(
+                f"跳过非 scheduled 自主意向: intent_id={intent.intent_id[:12]} status={intent.status}"
+            )
+            return {"triggered": False, "reason": f"status={intent.status}"}
+
+        intent.status = "triggered"
+        intent.triggered_at = _now_iso()
+        intent.updated_at = intent.triggered_at
+        store.upsert(intent)
+
+        logger.info(
+            "到点: "
+            f"intent_id={intent.intent_id[:12]} kind={intent.kind} "
+            f"stream={intent.target_stream_id or '-'}"
+        )
+
+        if intent.kind == "speak":
+            if not intent.target_stream_id:
+                event = self._event_builder.build_autonomy_intent_event(
+                    format_due_message(intent),
+                    content_type="autonomy_intent_due",
+                    sender_name="自主意向",
+                )
+                await self._queue_pending_event(event)
+                logger.info(f"仲裁: downgraded intent_id={intent.intent_id[:12]} reason=no_target_stream")
+                return {"triggered": True, "dispatch": "life_event", "reason": "no_target_stream"}
+            await self._wake_stream_for_autonomy(intent)
+            logger.info(f"承接: life_chatter intent_id={intent.intent_id[:12]}")
+            return {"triggered": True, "dispatch": "life_chatter", "stream_id": intent.target_stream_id}
+
+        if intent.kind == "reflect":
+            event = self._event_builder.build_autonomy_intent_event(
+                format_due_message(intent),
+                content_type="autonomy_intent_due",
+                sender_name="自主意向",
+            )
+            await self._queue_pending_event(event)
+            logger.info(f"承接: life_engine intent_id={intent.intent_id[:12]}")
+            return {"triggered": True, "dispatch": "life_engine"}
+
+        event = self._event_builder.build_autonomy_intent_event(
+            f"自主意向到点后选择沉默：{intent.motivation}",
+            content_type="autonomy_intent_silence",
+            sender_name="自主意向",
+        )
+        await self._queue_pending_event(event)
+        logger.info(f"承接: silence intent_id={intent.intent_id[:12]}")
+        return {"triggered": True, "dispatch": "silence"}
+
+    async def _wake_stream_for_autonomy(self, intent: AutonomyIntent) -> None:
+        """把到点自主意向注入目标聊天流，交给 life_chatter 承接。"""
+        from src.core.managers import get_stream_manager
+        from src.core.transport.distribution.stream_loop_manager import get_stream_loop_manager
+        import time
+
+        stream_id = str(intent.target_stream_id or "").strip()
+        chat_stream = await get_stream_manager().get_or_create_stream(stream_id=stream_id)
+        context = chat_stream.context
+        target_user_id, target_user_name = self._resolve_followup_target(chat_stream)
+        prompt = format_due_message(intent)
+        trigger_message = Message(
+            message_id=f"autonomy_intent_{intent.intent_id[:16]}",
+            platform=chat_stream.platform or "unknown",
+            stream_id=stream_id,
+            sender_id=target_user_id or "life_engine_autonomy",
+            sender_name="系统（自主意向浮现）",
+            sender_role="other",
+            content=prompt,
+            processed_plain_text=prompt,
+            message_type=MessageType.TEXT,
+            time=time.time(),
+            target_user_id=target_user_id,
+            target_user_name=target_user_name,
+            is_autonomy_intent_trigger=True,
+            autonomy_intent_id=intent.intent_id,
+            autonomy_intent_kind=intent.kind,
+        )
+        context.add_unread_message(trigger_message)
+        loop_mgr = get_stream_loop_manager()
+        removed = loop_mgr._wait_states.pop(stream_id, None)
+        if removed:
+            logger.debug(f"[{stream_id[:8]}] 已清除等待锁，准备处理自主意向")
+
     async def record_chatter_inner_monologue(
         self,
         thought: str,
@@ -1492,7 +1694,14 @@ class LifeEngineService(BaseService):
 
         if content_type in {"heartbeat_reply", "chatter_inner_monologue", "tool_call", "tool_result"}:
             return True
-        if content_type in {"proactive_opportunity", "dfc_message", "direct_message"}:
+        if content_type in {
+            "proactive_opportunity",
+            "dfc_message",
+            "direct_message",
+            "autonomy_intent_due",
+            "autonomy_intent_scheduled",
+            "autonomy_intent_silence",
+        }:
             return bool(not stream_id or stream_id == current_stream_id)
         return source == "life_engine" and not stream_id
 
@@ -1715,7 +1924,14 @@ class LifeEngineService(BaseService):
             return False
 
         if event_type == EventType.MESSAGE:
-            if content_type in {"dfc_message", "direct_message", "proactive_opportunity"}:
+            if content_type in {
+                "dfc_message",
+                "direct_message",
+                "proactive_opportunity",
+                "autonomy_intent_due",
+                "autonomy_intent_scheduled",
+                "autonomy_intent_silence",
+            }:
                 if not getattr(cfg_runtime, "salient_tail_include_direct_messages", True):
                     return False
                 if unified_chatter_context:
@@ -1747,6 +1963,9 @@ class LifeEngineService(BaseService):
                 "dfc_message": "📮 DFC",
                 "direct_message": "📨 私信",
                 "proactive_opportunity": "✨ 主动机会",
+                "autonomy_intent_due": "🌱 自主意向",
+                "autonomy_intent_scheduled": "🌱 意向登记",
+                "autonomy_intent_silence": "🌱 选择沉默",
             }.get(content_type, "📩")
             return f"[{time_display}] {label} {sender}: {_shorten_text(content, max_length=160)}"
         return f"[{time_display}] {_shorten_text(content, max_length=120)}"
@@ -2289,6 +2508,14 @@ class LifeEngineService(BaseService):
             "如果你已经知道精确聊天流，可以直接填写 `stream_id`；不确定就不要填，让系统回退当前聊天。",
             "`proactive_wake=true` 只服务高优先级信息差，不用于催表达层开口。", "",
             "记住：`nucleus_tell_dfc` 是补信息差，不是遥控器。", "",
+            "### `nucleus_schedule_autonomy_intent` — 登记延迟自主意向", "",
+            "当你不是要立刻补信息差，而是自己形成了一个“过一会儿再让它浮上来”的意向时，用这个工具。",
+            "它不是规则触发器，也不是命令表达层；它只是给未来的你留下一个意向。",
+            "只填写 `delay_minutes`，不要填写绝对时间；系统会自动换算真实触发时间。",
+            "可用 kind：`speak`（到点交给 life_chatter 重新判断）、`reflect`（到点回到中枢继续想）、`silence`（到点记录选择沉默）。",
+            "`speak` 只能写动机、目标提示和约束；不要写最终回复话术，不要教表达层具体怎么说。",
+            "如果知道精确 `stream_id`，可以填 `target_stream_id`；不知道就留空，让意向只进入事件流，不要猜测发送目标。",
+            "保持沉默也是主体选择：如果你想确认自己不会打扰，可以登记 `kind=silence`。", "",
             "### 工具边界", "",
             "- `nucleus_search_memory` 是历史检索，不要反复重搜同一主题",
             "- 本地文件工具只用于你的私有工作区、日记、笔记和 MEMORY 维护，不用于替用户查项目或改项目",
@@ -2508,9 +2735,10 @@ class LifeEngineService(BaseService):
         from ..streams.tools import STREAM_TOOLS
         from ..tools.grep_tools import GREP_TOOLS
         from ..tools.schedule_tools import SCHEDULE_TOOLS
+        from ..tools.autonomy_tools import AUTONOMY_TOOLS
         from ..tools.event_grep_tools import EVENT_GREP_TOOLS
 
-        return ALL_TOOLS + TODO_TOOLS + MEMORY_TOOLS + GREP_TOOLS + WEB_TOOLS + STREAM_TOOLS + SCHEDULE_TOOLS + EVENT_GREP_TOOLS
+        return ALL_TOOLS + TODO_TOOLS + MEMORY_TOOLS + GREP_TOOLS + WEB_TOOLS + STREAM_TOOLS + SCHEDULE_TOOLS + AUTONOMY_TOOLS + EVENT_GREP_TOOLS
 
     @staticmethod
     def _heartbeat_tool_call_metadata(call: Any) -> tuple[str, dict[str, Any]]:
@@ -2879,6 +3107,12 @@ class LifeEngineService(BaseService):
 
         register_life_engine_service(self)
 
+        if getattr(getattr(cfg, "autonomy", None), "enabled", True):
+            try:
+                await restore_autonomy_intents(self.plugin, cfg.settings.workspace_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"恢复自主意向失败: {exc}")
+
         self._stop_event = asyncio.Event()
         task = get_task_manager().create_task(
             self._heartbeat_loop(),
@@ -2924,6 +3158,10 @@ class LifeEngineService(BaseService):
         if self._snn_tick_task_id:
             safe_cancel_task(self._snn_tick_task_id, get_task_manager())
             self._snn_tick_task_id = None
+        try:
+            await cleanup_autonomy_schedules(self._cfg().settings.workspace_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"清理自主意向调度失败: {exc}")
         self._stop_event = None
         unregister_life_engine_service()
         await self._save_runtime_context()

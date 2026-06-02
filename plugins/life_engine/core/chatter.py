@@ -1594,6 +1594,15 @@ class LifeChatter(BaseChatter):
         """多层决策：是否需要响应。"""
         chat_type_str = str(chat_stream.chat_type or "").lower()
 
+        # Layer 0: 内部主动机会/自主意向 → 交给主模型重新判断。
+        # 这不是强制回复，只是让表达层看到这个机会。
+        if unread_msgs and all(self._is_proactive_trigger_message(msg) for msg in unread_msgs):
+            return {
+                "reason": "内部主动机会或自主意向浮现，交给表达层判断",
+                "should_respond": True,
+                "force_reply": False,
+            }
+
         # Layer 1: 私聊 → 始终响应
         if chat_type_str == "private":
             return {
@@ -1924,6 +1933,7 @@ class LifeChatter(BaseChatter):
         return bool(
             cls._message_flag(message, "is_proactive_opportunity_trigger")
             or cls._message_flag(message, "is_proactive_followup_trigger")
+            or cls._message_flag(message, "is_autonomy_intent_trigger")
         )
 
     @classmethod

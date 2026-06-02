@@ -64,6 +64,8 @@ def _legacy_channel(event: LifeEngineEvent) -> LifeEventChannel:
         return LifeEventChannel.AGENT
     if content_type == "proactive_opportunity":
         return LifeEventChannel.PROACTIVE
+    if content_type.startswith("autonomy_intent_"):
+        return LifeEventChannel.LIFE
     if event.event_type == EventType.HEARTBEAT:
         return LifeEventChannel.LIFE
     if str(event.source or "").strip().lower() == "system":
@@ -79,6 +81,10 @@ def _legacy_priority_and_salience(event: LifeEngineEvent) -> tuple[int, float]:
         return int(LifeEventPriority.HIGH), 0.9
     if content_type == "proactive_opportunity":
         return int(LifeEventPriority.HIGH), 0.82
+    if content_type == "autonomy_intent_due":
+        return int(LifeEventPriority.HIGH), 0.86
+    if content_type.startswith("autonomy_intent_"):
+        return int(LifeEventPriority.NORMAL), 0.74
     if event.event_type == EventType.AGENT_RESULT:
         return int(LifeEventPriority.HIGH), 0.8
     if content_type == "chatter_inner_monologue":
