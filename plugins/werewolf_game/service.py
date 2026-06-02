@@ -59,7 +59,11 @@ class WerewolfGameService(BaseService):
                 user_id=str(message.sender_id),
                 display_name=self._sender_name(message),
             )
-            return f"狼人杀房间已创建。\n{result.message}\n发送 /狼人杀 加入 参与，房主发送 /狼人杀 开始 发牌。"
+            return (
+                f"狼人杀房间已创建。\n{result.message}\n"
+                "发送 /狼人杀 加入 参与，房主发送 /狼人杀 开始 发牌。\n"
+                "三人测试可用 /狼人杀 测试开始。"
+            )
 
         game = self.games.get(key)
         if not game:
@@ -82,6 +86,16 @@ class WerewolfGameService(BaseService):
             if str(message.sender_id) != game.owner_id:
                 return "只有房主可以开始本局。"
             result = self.engine.start_game(game)
+            if not result.ok:
+                return result.message
+            await self._send_role_notices(game)
+            await self._send_night_prompts(game)
+            return "\n".join(result.public_messages or [result.message])
+
+        if command in {"测试开始", "测试", "teststart", "test"}:
+            if str(message.sender_id) != game.owner_id:
+                return "只有房主可以开始本局。"
+            result = self.engine.start_test_game(game)
             if not result.ok:
                 return result.message
             await self._send_role_notices(game)
@@ -111,7 +125,7 @@ class WerewolfGameService(BaseService):
         if command in {"杀", "刀", "验", "查验", "救", "毒", "跳过", "过", "kill", "check", "heal", "poison", "pass"}:
             return "夜晚身份行动不要发在群里，请私聊我发送同样命令。"
 
-        return "未知狼人杀命令。常用：开局、加入、加入 爱莉、开始、状态、投票 编号、结束。"
+        return "未知狼人杀命令。常用：开局、加入、加入 爱莉、开始、测试开始、状态、投票 编号、结束。"
 
     async def handle_private_command(self, message: Message, args: list[str]) -> str:
         command = args[0] if args else "视角"

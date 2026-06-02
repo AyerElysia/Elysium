@@ -14,6 +14,7 @@ from .models import GameState, NightState, Phase, Player, Role
 
 
 MIN_PLAYERS = 6
+MIN_TEST_PLAYERS = 3
 
 
 @dataclass(slots=True)
@@ -72,12 +73,25 @@ class WerewolfEngine:
         return ActionResult(True, f"{player.display_name} 已退出房间。")
 
     def start_game(self, game: GameState, *, rng: random.Random | None = None) -> ActionResult:
+        return self._start_game(game, min_players=MIN_PLAYERS, test_mode=False, rng=rng)
+
+    def start_test_game(self, game: GameState, *, rng: random.Random | None = None) -> ActionResult:
+        return self._start_game(game, min_players=MIN_TEST_PLAYERS, test_mode=True, rng=rng)
+
+    def _start_game(
+        self,
+        game: GameState,
+        *,
+        min_players: int,
+        test_mode: bool,
+        rng: random.Random | None = None,
+    ) -> ActionResult:
         if game.phase != Phase.WAITING:
             return ActionResult(False, "本局已经开始。")
-        if len(game.players) < MIN_PLAYERS:
-            return ActionResult(False, f"至少需要 {MIN_PLAYERS} 名玩家才能开始。")
+        if len(game.players) < min_players:
+            return ActionResult(False, f"至少需要 {min_players} 名玩家才能开始。")
 
-        roles = self._roles_for_count(len(game.players))
+        roles = self._roles_for_count(len(game.players), test_mode=test_mode)
         shuffler = rng or random.SystemRandom()
         shuffler.shuffle(roles)
         for player, role in zip(game.players.values(), roles, strict=True):
@@ -89,10 +103,11 @@ class WerewolfEngine:
         game.night = NightState()
         game.votes.clear()
         game.public_log.append("游戏开始，进入第 1 个夜晚。")
+        prefix = "测试狼人杀开始" if test_mode else "狼人杀开始"
         return ActionResult(
             True,
             "身份已分配，游戏开始。",
-            public_messages=["狼人杀开始。请所有玩家查看私聊身份，夜晚行动请私聊我。"],
+            public_messages=[f"{prefix}。请所有玩家查看私聊身份，夜晚行动请私聊我。"],
         )
 
     def public_status(self, game: GameState) -> str:
@@ -300,7 +315,12 @@ class WerewolfEngine:
                 return player.user_id
         return None
 
-    def _roles_for_count(self, count: int) -> list[Role]:
+    def _roles_for_count(self, count: int, *, test_mode: bool = False) -> list[Role]:
+        if test_mode and count < MIN_PLAYERS:
+            roles = [Role.WEREWOLF, Role.SEER]
+            roles.extend([Role.VILLAGER] * (count - len(roles)))
+            return roles
+
         wolves = 2 if count < 8 else 3
         roles = [Role.WEREWOLF] * wolves + [Role.SEER, Role.WITCH]
         if count >= 7:

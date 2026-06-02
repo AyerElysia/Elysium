@@ -58,6 +58,21 @@ def test_wolf_view_only_exposes_wolf_teammates() -> None:
     assert "女巫" not in view
 
 
+def test_three_player_test_game_can_start_but_normal_game_still_requires_six() -> None:
+    engine, game = _game_with_players(count=3)
+
+    normal = engine.start_game(game, rng=random.Random(1))
+    assert normal.ok is False
+    assert "至少需要 6 名玩家" in normal.message
+
+    test_result = engine.start_test_game(game, rng=random.Random(1))
+    assert test_result.ok is True
+    assert game.phase == Phase.NIGHT
+
+    roles = {player.role for player in game.players.values()}
+    assert roles == {Role.WEREWOLF, Role.SEER, Role.VILLAGER}
+
+
 @pytest.mark.asyncio
 async def test_private_werewolf_command_is_intercepted(monkeypatch) -> None:
     class DummyPlugin:
