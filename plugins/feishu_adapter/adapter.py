@@ -289,6 +289,7 @@ class FeishuAdapter(BaseAdapter):
             sender_name = normalized["sender_name"]
             content = normalized["content"]
             timestamp = normalized["timestamp"]
+            media_refs = normalized.get("media_refs") or []
 
             extra: dict[str, Any] = {
                 "source": "feishu",
@@ -302,8 +303,10 @@ class FeishuAdapter(BaseAdapter):
                 "feishu_union_id": union_id,
                 "sender_type": normalized.get("sender_type", ""),
                 "feishu_message_type": normalized.get("message_type", ""),
-                "format_info": {"accept_format": ["text"]},
+                "format_info": {"accept_format": ["text", "image"]},
             }
+            if media_refs:
+                extra["feishu_media_refs"] = media_refs
             if chat_type == "group":
                 extra["target_group_id"] = chat_id
             else:
@@ -331,7 +334,13 @@ class FeishuAdapter(BaseAdapter):
             if normalized.get("root_message_id"):
                 segments.append({"type": "reply", "data": normalized["root_message_id"]})
             segments.extend(self._mention_segments(normalized.get("mentions") or []))
-            segments.append({"type": "text", "data": content})
+            media_segments = await self._download_incoming_media_segments(message_id, media_refs)
+            if media_segments:
+                if content and content != "[图片]":
+                    segments.append({"type": "text", "data": content})
+                segments.extend(media_segments)
+            elif content:
+                segments.append({"type": "text", "data": content})
 
             envelope: MessageEnvelope = {  # type: ignore[typeddict-item]
                 "direction": "incoming",
@@ -414,18 +423,23 @@ class FeishuAdapter(BaseAdapter):
             message = event.get("message") or {}
             sender = event.get("sender") or {}
             sender_id = sender.get("sender_id") or {}
+            message_type = str(message.get("message_type") or "")
             content_text = self._parse_content_text(
-                message_type=str(message.get("message_type") or ""),
+                message_type=message_type,
                 content=message.get("content"),
             )
-            if not content_text:
+            media_refs = self._extract_incoming_media_refs(
+                message_type=message_type,
+                content=message.get("content"),
+            )
+            if not content_text and not media_refs:
                 return None
 
             chat_type = "private" if message.get("chat_type") == "p2p" else "group"
             return {
                 "event_id": str(header.get("event_id") or ""),
                 "message_id": str(message.get("message_id") or f"feishu_{uuid.uuid4().hex}"),
-                "message_type": str(message.get("message_type") or ""),
+                "message_type": message_type,
                 "chat_id": str(message.get("chat_id") or ""),
                 "chat_type": chat_type,
                 "chat_name": str(message.get("chat_name") or ""),
@@ -438,13 +452,19 @@ class FeishuAdapter(BaseAdapter):
                 "timestamp": self._parse_time(message.get("create_time")),
                 "mentions": message.get("mentions") or [],
                 "root_message_id": message.get("root_id") or message.get("parent_id") or "",
+                "media_refs": media_refs,
             }
 
         # Normalized/local test payload.
+        message_type = str(raw.get("message_type") or "text")
+        media_refs = self._extract_incoming_media_refs(
+            message_type=message_type,
+            content=raw.get("content"),
+        )
         return {
             "event_id": str(raw.get("event_id") or ""),
             "message_id": str(raw.get("message_id") or f"feishu_local_{uuid.uuid4().hex}"),
-            "message_type": str(raw.get("message_type") or "text"),
+            "message_type": message_type,
             "chat_id": str(raw.get("chat_id") or raw.get("group_id") or ""),
             "chat_type": str(raw.get("chat_type") or "private"),
             "chat_name": str(raw.get("chat_name") or ""),
@@ -457,6 +477,7 @@ class FeishuAdapter(BaseAdapter):
             "timestamp": float(raw.get("timestamp") or time.time()),
             "mentions": raw.get("mentions") or [],
             "root_message_id": raw.get("root_message_id") or raw.get("reply_to") or "",
+            "media_refs": raw.get("media_refs") or media_refs,
         }
 
     def _is_event_duplicate(self, raw: dict[str, Any]) -> bool:
@@ -508,13 +529,18 @@ class FeishuAdapter(BaseAdapter):
         return value not in normalized
 
     @staticmethod
-    def _parse_content_text(message_type: str, content: Any) -> str:
+    def _parse_content_payload(content: Any) -> Any:
         parsed: Any = content
         if isinstance(content, str):
             try:
                 parsed = json.loads(content)
             except json.JSONDecodeError:
                 parsed = {"text": content}
+        return parsed
+
+    @staticmethod
+    def _parse_content_text(message_type: str, content: Any) -> str:
+        parsed = FeishuAdapter._parse_content_payload(content)
         if not isinstance(parsed, dict):
             return str(parsed or "")
         if message_type == "text":
@@ -522,8 +548,112 @@ class FeishuAdapter(BaseAdapter):
         if message_type == "post":
             return FeishuAdapter._flatten_post_content(parsed)
         if message_type:
+            if message_type == "image" and parsed.get("image_key"):
+                return "[图片]"
             return f"[飞书{message_type}消息: {json.dumps(parsed, ensure_ascii=False)[:300]}]"
         return str(parsed.get("text") or parsed.get("content") or "")
+
+    @staticmethod
+    def _extract_incoming_media_refs(message_type: str, content: Any) -> list[dict[str, str]]:
+        parsed = FeishuAdapter._parse_content_payload(content)
+        refs: list[dict[str, str]] = []
+        if not isinstance(parsed, dict):
+            return refs
+
+        if message_type == "image":
+            image_key = str(parsed.get("image_key") or "").strip()
+            if image_key:
+                refs.append({"type": "image", "key": image_key})
+            return refs
+
+        if message_type == "post":
+            refs.extend(FeishuAdapter._extract_post_image_refs(parsed))
+        return refs
+
+    @staticmethod
+    def _extract_post_image_refs(content: dict[str, Any]) -> list[dict[str, str]]:
+        refs: list[dict[str, str]] = []
+        post = content.get("post")
+        if not isinstance(post, dict):
+            return refs
+
+        for locale_content in post.values():
+            if not isinstance(locale_content, dict):
+                continue
+            for line in locale_content.get("content") or []:
+                if not isinstance(line, list):
+                    continue
+                for item in line:
+                    if not isinstance(item, dict):
+                        continue
+                    if str(item.get("tag") or "") not in {"img", "image"}:
+                        continue
+                    image_key = str(item.get("image_key") or "").strip()
+                    if image_key:
+                        refs.append({"type": "image", "key": image_key})
+        return refs
+
+    async def _download_incoming_media_segments(
+        self,
+        message_id: str,
+        media_refs: list[Any],
+    ) -> list[dict[str, Any]]:
+        segments: list[dict[str, Any]] = []
+        for media_ref in media_refs:
+            if not isinstance(media_ref, dict):
+                continue
+            media_type = str(media_ref.get("type") or "").strip()
+            media_key = str(media_ref.get("key") or "").strip()
+            if media_type != "image" or not media_key:
+                continue
+            try:
+                image_base64 = await self._download_message_resource_as_base64(
+                    message_id=message_id,
+                    resource_key=media_key,
+                    resource_type="image",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"飞书图片下载失败，保留文本占位: message_id={message_id}, image_key={media_key}, error={exc}"
+                )
+                continue
+            segments.append({"type": "image", "data": image_base64})
+        return segments
+
+    async def _download_message_resource_as_base64(
+        self,
+        *,
+        message_id: str,
+        resource_key: str,
+        resource_type: str,
+    ) -> str:
+        token = await self._get_tenant_access_token()
+        url = self._api_url(
+            f"/open-apis/im/v1/messages/{message_id}/resources/{resource_key}"
+        )
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                url,
+                params={"type": resource_type},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json; charset=utf-8",
+                },
+            )
+
+        content_type = str(resp.headers.get("content-type") or "").lower()
+        if resp.status_code >= 400:
+            if "json" in content_type:
+                raise RuntimeError(f"Feishu resource API failed: {self._decode_response(resp)}")
+            raise RuntimeError(f"Feishu resource API http error: status={resp.status_code}")
+        if "json" in content_type:
+            data = self._decode_response(resp)
+            if int(data.get("code", 0)) != 0:
+                raise RuntimeError(f"Feishu resource API failed: {data}")
+            raise RuntimeError(f"Feishu resource API returned json without binary resource: {data}")
+        if not resp.content:
+            raise RuntimeError("Feishu resource API returned empty body")
+        return base64.b64encode(resp.content).decode("ascii")
 
     @staticmethod
     def _flatten_post_content(content: dict[str, Any]) -> str:

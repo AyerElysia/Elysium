@@ -132,6 +132,86 @@ async def test_feishu_envelope_converts_to_core_message() -> None:
 
 
 @pytest.mark.asyncio
+async def test_feishu_image_event_downloads_to_image_segment(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = make_adapter()
+    downloaded: dict[str, str] = {}
+
+    async def fake_download_resource(*, message_id: str, resource_key: str, resource_type: str) -> str:
+        downloaded.update(
+            {
+                "message_id": message_id,
+                "resource_key": resource_key,
+                "resource_type": resource_type,
+            }
+        )
+        return "ZmFrZV9pbWFnZQ=="
+
+    monkeypatch.setattr(adapter, "_download_message_resource_as_base64", fake_download_resource)
+
+    payload = {
+        "schema": "2.0",
+        "header": {"event_id": "evt_image"},
+        "event": {
+            "sender": {"sender_type": "user", "sender_id": {"open_id": "ou_1"}},
+            "message": {
+                "message_id": "om_image",
+                "chat_id": "oc_private",
+                "chat_type": "p2p",
+                "message_type": "image",
+                "content": "{\"image_key\":\"img_v3_demo\"}",
+            },
+        },
+    }
+
+    envelope = await adapter.from_platform_message(payload)
+
+    assert envelope is not None
+    assert envelope["message_segment"] == [
+        {"type": "image", "data": "ZmFrZV9pbWFnZQ=="}
+    ]
+    assert envelope["message_info"]["extra"]["feishu_media_refs"] == [
+        {"type": "image", "key": "img_v3_demo"}
+    ]
+    assert downloaded == {
+        "message_id": "om_image",
+        "resource_key": "img_v3_demo",
+        "resource_type": "image",
+    }
+
+
+@pytest.mark.asyncio
+async def test_feishu_image_event_falls_back_to_text_when_download_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = make_adapter()
+
+    async def fake_download_resource(*_args, **_kwargs) -> str:
+        raise RuntimeError("missing permission")
+
+    monkeypatch.setattr(adapter, "_download_message_resource_as_base64", fake_download_resource)
+
+    payload = {
+        "schema": "2.0",
+        "header": {"event_id": "evt_image_fallback"},
+        "event": {
+            "sender": {"sender_type": "user", "sender_id": {"open_id": "ou_1"}},
+            "message": {
+                "message_id": "om_image_fallback",
+                "chat_id": "oc_private",
+                "chat_type": "p2p",
+                "message_type": "image",
+                "content": "{\"image_key\":\"img_v3_demo\"}",
+            },
+        },
+    }
+
+    envelope = await adapter.from_platform_message(payload)
+
+    assert envelope is not None
+    assert envelope["message_segment"] == [{"type": "text", "data": "[图片]"}]
+
+
+@pytest.mark.asyncio
 async def test_feishu_user_name_alias_maps_sender_display_name() -> None:
     config = FeishuAdapterConfig()
     config.identity.user_name_aliases = [
