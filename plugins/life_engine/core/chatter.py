@@ -38,6 +38,7 @@ from .multimodal import (
     build_multimodal_content,
     extract_media_from_messages,
 )
+from .send_targets import SendTarget, resolve_send_target_key
 from .tool_parallel import is_life_tool_call_parallel_safe
 
 if TYPE_CHECKING:
@@ -235,6 +236,8 @@ class LifeSendTextAction(BaseAction):
         "严禁把 reason/thought/expected_reaction 等元信息写进 content。"
         "分段消息会按顺序发送，并自动模拟段间打字延迟。"
         "私聊场景下 reply_to 默认不要使用，除非确实需要引用某条历史消息来避免歧义。"
+        "target_key 通常留空，表示回复当前聊天；只有明确要发到后缀提示词"
+        "“可发送目标”列表中的其他聊天时，才填写列表给出的 target_key。"
     )
 
     chatter_allow: list[str] = ["life_chatter"]
@@ -352,11 +355,69 @@ class LifeSendTextAction(BaseAction):
         base_delay = len(content) / chars_per_sec
         return max(min_delay, min(base_delay, max_delay))
 
+    def _send_target_options(self) -> tuple[int, float]:
+        cfg = getattr(self.plugin, "config", None)
+        runtime_cfg = getattr(cfg, "runtime_sync", None)
+        limit = int(getattr(runtime_cfg, "send_targets_limit", 8) or 8)
+        window_hours = float(getattr(runtime_cfg, "send_targets_window_hours", 24.0) or 24.0)
+        return max(1, limit), max(0.1, window_hours)
+
+    async def _resolve_send_target(self, target_key: str) -> SendTarget | None:
+        limit, window_hours = self._send_target_options()
+        return await resolve_send_target_key(
+            target_key,
+            current_stream_id=str(getattr(self.chat_stream, "stream_id", "") or ""),
+            limit=limit,
+            active_window_hours=window_hours,
+        )
+
+    async def _send_one_segment_to_target(
+        self,
+        content: str,
+        target: SendTarget,
+    ) -> bool:
+        from src.core.managers.adapter_manager import get_adapter_manager
+        from src.core.transport.message_send import get_message_sender
+        from uuid import uuid4
+
+        bot_info = await get_adapter_manager().get_bot_info_by_platform(target.platform)
+
+        extra: dict[str, str] = {}
+        if target.chat_type == "group":
+            if target.group_id:
+                extra["target_group_id"] = target.group_id
+            if target.group_name:
+                extra["target_group_name"] = target.group_name
+        else:
+            if target.target_user_id:
+                extra["target_user_id"] = target.target_user_id
+            if target.target_user_name:
+                extra["target_user_name"] = target.target_user_name
+
+        message = Message(
+            message_id=f"action_{self.action_name}_{uuid4().hex}",
+            content=content,
+            processed_plain_text=content,
+            message_type=MessageType.TEXT,
+            sender_id=bot_info.get("bot_id", "") if bot_info else "",
+            sender_name=bot_info.get("bot_name", "Bot") if bot_info else "Bot",
+            platform=target.platform,
+            chat_type=target.chat_type,
+            stream_id=target.stream_id,
+        )
+        message.extra.update(extra)
+
+        return await get_message_sender().send_message(message)
+
     async def _send_one_segment(
         self,
         content: str,
         reply_to: str | None = None,
+        target: SendTarget | None = None,
     ) -> bool:
+        if target is not None:
+            return await self._send_one_segment_to_target(content, target)
+
         if reply_to:
             target_stream_id = self.chat_stream.stream_id
             platform = self.chat_stream.platform
@@ -435,6 +496,12 @@ class LifeSendTextAction(BaseAction):
             str | None,
             "可选，要引用回复的目标消息 ID。私聊默认留空。",
         ] = None,
+        target_key: Annotated[
+            str,
+            "可选发送目标。通常留空表示按旧逻辑回复当前聊天；"
+            "只有明确要发到后缀提示词“可发送目标”列表中的某个聊天时，"
+            "才填写列表里的 target_key，禁止凭空编写。",
+        ] = "",
     ) -> tuple[bool, str]:
         segments = self._normalize_content_segments(content)
         cleaned_segments = [self._sanitize_segment(s) for s in segments]
@@ -450,6 +517,15 @@ class LifeSendTextAction(BaseAction):
         if not cleaned_segments:
             return False, "发送内容不能只是省略号或占位符"
 
+        resolved_target: SendTarget | None = None
+        normalized_target_key = str(target_key or "").strip()
+        if normalized_target_key:
+            if reply_to:
+                return False, "跨聊天发送不能同时使用 reply_to；请去掉 reply_to 或不填 target_key"
+            resolved_target = await self._resolve_send_target(normalized_target_key)
+            if resolved_target is None:
+                return False, f"未知或不可用的发送目标 target_key: {normalized_target_key}"
+
         sent_count = 0
         for index, segment in enumerate(cleaned_segments):
             if index > 0:
@@ -458,13 +534,18 @@ class LifeSendTextAction(BaseAction):
                     await asyncio.sleep(delay)
 
             segment_reply_to = reply_to if index == 0 else None
-            success = await self._send_one_segment(segment, segment_reply_to)
+            success = await self._send_one_segment(
+                segment,
+                segment_reply_to,
+                target=resolved_target,
+            )
             if not success:
                 return False, f"第{index + 1}条消息发送失败"
             sent_count += 1
 
         preview = cleaned_segments[0][:80] if cleaned_segments else ""
-        return True, f"已发送{sent_count}条消息: {preview}"
+        target_desc = f" -> {resolved_target.display_name}" if resolved_target else ""
+        return True, f"已发送{sent_count}条消息{target_desc}: {preview}"
 
 
 class LifeSendFileAction(BaseAction):
@@ -1364,6 +1445,7 @@ class LifeChatter(BaseChatter):
             "- 如果你准备回复用户，`action-think` 必须和至少一个可执行动作同轮出现，通常是 `life_send_text`。\n"
             "- 不要只调用 `action-think`；如果本轮决定不回复，就直接用 `action-life_pass_and_wait`，不要调用 think。\n"
             "- 需要直接给用户发文字时，使用 `life_send_text`。\n"
+            "- `life_send_text.target_key` 通常留空，表示回复当前聊天；只有明确要发到 suffix 中“可发送目标”列出的其他聊天时，才填写列表里的 target_key。\n"
             "- 需要发送本地文件时，使用 `life_send_file`；需要解释文件时另用 `life_send_text`。\n"
             "- 收到图片/表情包/视频/语音时，默认先基于摘要判断；如果摘要不够，需要自己看清原始媒体，调用 `tool-inspect_media` 把它提升为下一轮原生多模态输入。\n"
             "- `content` 只能写给用户看的纯文本正文；长内容用 `\\n` 分隔分段发送。\n"

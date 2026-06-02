@@ -112,6 +112,9 @@ class LifeEngineConfig(BaseConfig):
             "latest_action_think_enabled",
             "recent_chat_enabled",
             "recent_chat_messages",
+            "send_targets_enabled",
+            "send_targets_limit",
+            "send_targets_window_hours",
             "salient_tail_enabled",
         },
     }
@@ -869,6 +872,25 @@ class LifeEngineConfig(BaseConfig):
             ge=0,
             le=50,
             description="最近聊天记录快照最多保留多少条。设为 0 表示关闭该块。",
+        )
+
+        send_targets_enabled: bool = Field(
+            default=True,
+            description="是否在 chatter suffix 中注入近期可发送目标列表。",
+        )
+
+        send_targets_limit: int = Field(
+            default=8,
+            ge=1,
+            le=20,
+            description="近期可发送目标列表最多展示多少个聊天流。",
+        )
+
+        send_targets_window_hours: float = Field(
+            default=24.0,
+            ge=0.1,
+            le=168.0,
+            description="近期可发送目标列表的活跃窗口，单位小时。",
         )
 
         salient_tail_enabled: bool = Field(

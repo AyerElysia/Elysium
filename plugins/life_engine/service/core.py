@@ -41,6 +41,7 @@ from .audit import (
 )
 from ..core.chat_history import build_chat_history_text, message_flag
 from ..core.config import LifeEngineConfig
+from ..core.send_targets import format_send_targets_for_prompt, list_recent_send_targets
 from ..core.tool_parallel import iter_life_tool_call_batches
 from ..streams.manager import ThoughtStreamManager
 from ..drives.impulse import ImpulseEngine
@@ -1883,6 +1884,19 @@ class LifeEngineService(BaseService):
             if runtime_cfg is not None
             else 10
         )
+        send_targets_enabled = bool(
+            runtime_cfg is None or getattr(runtime_cfg, "send_targets_enabled", True)
+        )
+        send_targets_limit = (
+            int(getattr(runtime_cfg, "send_targets_limit", 8) or 8)
+            if runtime_cfg is not None
+            else 8
+        )
+        send_targets_window_hours = (
+            float(getattr(runtime_cfg, "send_targets_window_hours", 24.0) or 24.0)
+            if runtime_cfg is not None
+            else 24.0
+        )
 
         async with self._get_lock():
             events = list(self._event_history)
@@ -1958,6 +1972,17 @@ class LifeEngineService(BaseService):
                 sections.append(
                     f"### 最近 {recent_chat_messages} 条聊天记录\n{recent_chat_text}"
                 )
+
+        if send_targets_enabled:
+            send_targets_text = format_send_targets_for_prompt(
+                await list_recent_send_targets(
+                    current_stream_id=stream_id,
+                    limit=send_targets_limit,
+                    active_window_hours=send_targets_window_hours,
+                )
+            )
+            if send_targets_text:
+                sections.append(f"### 可发送目标\n{send_targets_text}")
 
         if selected_events:
             event_text = self._build_wake_context_text(selected_events)
