@@ -200,6 +200,15 @@ def test_life_chatter_initial_history_limit_supports_legacy_field() -> None:
 
     assert chatter._get_initial_history_message_limit() == 6
 
+
+def test_life_chatter_router_history_limit_is_fixed_to_10() -> None:
+    config = LifeEngineConfig()
+    config.chatter.initial_history_messages = 80
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=config)
+
+    assert chatter._get_router_history_message_limit() == 10
+
 # ---- 新增：runtime context 事件流 + thought delta cursor 去重 ---------------
 
 

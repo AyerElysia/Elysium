@@ -227,10 +227,6 @@ user_prompt = """你当前正在名为"{stream_name}"的对话中。
 sub_agent_system_prompt = """你是当前主体的对话路由器。
 你的任务不是按硬规则拦截消息，而是站在主体自己的视角，结合近期聊天记录和新消息，判断此刻要不要开口。
 
-# 主体背景
-主体的常用名字是 {nickname}。
-{personality_core_section}{personality_side_section}
-
 # 路由原则
 - 不要使用“艾特 ID 是否匹配”“是否私聊”“是否关键词命中”这类机械硬规则替主体做决定。
 - @、昵称、平台 ID、群名片、表情、图片摘要都只是上下文线索，不是绝对规则。

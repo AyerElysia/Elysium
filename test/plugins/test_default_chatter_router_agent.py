@@ -231,3 +231,8 @@ def test_router_fallback_prompt_removes_mention_id_hard_rules() -> None:
     assert "QQ 号必须" not in _DEFAULT_ROUTER_FALLBACK_PROMPT
     assert "艾特了其他人" not in _DEFAULT_ROUTER_FALLBACK_PROMPT
     assert "不是绝对规则" in _DEFAULT_ROUTER_FALLBACK_PROMPT
+
+
+def test_router_fallback_prompt_has_no_subject_background_section() -> None:
+    assert "主体背景" not in _DEFAULT_ROUTER_FALLBACK_PROMPT
+    assert "主体的常用名字" not in _DEFAULT_ROUTER_FALLBACK_PROMPT

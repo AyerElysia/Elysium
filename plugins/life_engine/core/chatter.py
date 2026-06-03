@@ -1630,7 +1630,7 @@ class LifeChatter(BaseChatter):
         service = self._get_life_service()
         history_text = await self._build_history_text_async(
             chat_stream,
-            max_messages=self._get_initial_history_message_limit(),
+            max_messages=self._get_router_history_message_limit(),
             global_history=True,
             exclude_message_ids={
                 str(getattr(msg, "message_id", "") or "")
@@ -1741,6 +1741,11 @@ class LifeChatter(BaseChatter):
         if initial_limit < 0:
             return 0
         return initial_limit
+
+    @staticmethod
+    def _get_router_history_message_limit() -> int:
+        """路由器只读取最近 10 条聊天记录。"""
+        return 10
 
     @staticmethod
     def _append_suffix_context(response: Any, context_text: str) -> None:
