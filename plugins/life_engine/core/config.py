@@ -113,6 +113,12 @@ class LifeEngineConfig(BaseConfig):
             "min_delay_minutes",
             "max_delay_minutes",
         },
+        "curiosity": {
+            "enabled",
+            "inject_to_chatter",
+            "task_name",
+            "history_messages",
+        },
         "runtime_sync": {
             "latest_action_think_enabled",
             "recent_chat_enabled",
@@ -198,6 +204,46 @@ class LifeEngineConfig(BaseConfig):
             default=1440,
             ge=1,
             description="自主意向允许的最大延迟分钟数。",
+        )
+
+    @config_section("curiosity")
+    class CuriositySection(SectionBase):
+        """异步好奇层配置。"""
+
+        enabled: bool = Field(
+            default=True,
+            description="是否启用同主体异步好奇层。",
+        )
+
+        inject_to_chatter: bool = Field(
+            default=True,
+            description="是否将已完成的好奇牵引注入 life_chatter suffix。",
+        )
+
+        task_name: str = Field(
+            default="",
+            description="好奇代理使用的模型任务名。留空时跟随 [model].task_name。",
+        )
+
+        history_messages: int = Field(
+            default=20,
+            ge=0,
+            le=80,
+            description="好奇代理决策时携带的最近统一聊天历史条数。",
+        )
+
+        timeout_seconds: float = Field(
+            default=30.0,
+            ge=3.0,
+            le=120.0,
+            description="单次好奇异步判断的 LLM 超时秒数。",
+        )
+
+        max_prompt_chars: int = Field(
+            default=1200,
+            ge=200,
+            le=4000,
+            description="注入 chatter suffix 的好奇牵引最大字符数。",
         )
 
     @config_section("history_retrieval")
@@ -960,6 +1006,7 @@ class LifeEngineConfig(BaseConfig):
 
     settings: SettingsSection = Field(default_factory=SettingsSection)
     model: ModelSection = Field(default_factory=ModelSection)
+    curiosity: CuriositySection = Field(default_factory=CuriositySection)
     history_retrieval: HistoryRetrievalSection = Field(default_factory=HistoryRetrievalSection)
     web: WebSection = Field(default_factory=WebSection)
     snn: SNNSection = Field(default_factory=SNNSection)

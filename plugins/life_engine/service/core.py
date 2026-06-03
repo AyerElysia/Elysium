@@ -39,8 +39,13 @@ from .audit import (
     log_message_received,
     log_wake_context_injected,
 )
-from ..core.chat_history import build_chat_history_text, message_flag
+from ..core.chat_history import (
+    build_chat_history_text,
+    build_global_chat_history_text_from_db,
+    message_flag,
+)
 from ..core.config import LifeEngineConfig
+from ..core.context_assembly import LifeChatterContextAssembler
 from ..core.send_targets import format_send_targets_for_prompt, list_recent_send_targets
 from ..core.tool_parallel import iter_life_tool_call_batches
 from ..autonomy import (
@@ -55,6 +60,7 @@ from ..autonomy import (
 from ..streams.manager import ThoughtStreamManager
 from ..drives.impulse import ImpulseEngine
 from ..drives.rules import DEFAULT_RULES
+from ..curiosity import CuriosityEngine
 from ..constants import (
     HEARTBEAT_IDLE_CRITICAL_THRESHOLD,
     HEARTBEAT_IDLE_WARNING_THRESHOLD,
@@ -162,6 +168,10 @@ class LifeEngineService(BaseService):
 
         # 冲动引擎
         self._impulse_engine: ImpulseEngine | None = None
+
+        # 异步好奇层
+        self._curiosity_engine: CuriosityEngine | None = None
+        self._curiosity_inflight: bool = False
 
         # 状态持久化
         self._state_persistence: StatePersistence | None = None
@@ -865,6 +875,8 @@ class LifeEngineService(BaseService):
                     state.active_check_kind = None
         await self._publish_raw_events([event])
         await self._save_runtime_context()
+        if direction == "received":
+            self._schedule_curiosity_review(message, event)
         if unlocked_self_pause:
             logger.info(
                 "life_engine 收到外界消息，主动休息锁已解除: "
@@ -886,6 +898,144 @@ class LifeEngineService(BaseService):
             content=event.content,
             direction=direction,
             pending_message_count=self._state.pending_event_count,
+        )
+
+    def _get_curiosity_engine(self) -> CuriosityEngine:
+        cfg = self._cfg()
+        curiosity_cfg = getattr(cfg, "curiosity", None)
+        task_name = (
+            str(getattr(curiosity_cfg, "task_name", "") or "").strip()
+            or str(getattr(cfg.model, "task_name", "") or "").strip()
+            or "life"
+        )
+        timeout = float(getattr(curiosity_cfg, "timeout_seconds", 30.0) or 30.0)
+        workspace = str(getattr(cfg.settings, "workspace_path", "") or self._workspace_dir())
+        if (
+            self._curiosity_engine is None
+            or self._curiosity_engine.workspace_path != workspace
+            or self._curiosity_engine.model_task_name != task_name
+        ):
+            self._curiosity_engine = CuriosityEngine(
+                workspace_path=workspace,
+                model_task_name=task_name,
+                timeout_seconds=timeout,
+            )
+        return self._curiosity_engine
+
+    def _schedule_curiosity_review(self, message: Message, event: LifeEngineEvent) -> None:
+        cfg = self._cfg()
+        curiosity_cfg = getattr(cfg, "curiosity", None)
+        if curiosity_cfg is not None and not bool(getattr(curiosity_cfg, "enabled", True)):
+            return
+        if self._curiosity_inflight:
+            logger.debug("好奇异步判断仍在运行，跳过本次重复调度")
+            return
+
+        self._curiosity_inflight = True
+        get_task_manager().create_task(
+            self._run_curiosity_review(message, event),
+            name=f"life_curiosity_{event.sequence}",
+            daemon=True,
+            timeout=float(getattr(curiosity_cfg, "timeout_seconds", 30.0) or 30.0) + 5.0,
+        )
+
+    async def _run_curiosity_review(self, message: Message, event: LifeEngineEvent) -> None:
+        try:
+            cfg = self._cfg()
+            curiosity_cfg = getattr(cfg, "curiosity", None)
+            max_history = (
+                int(getattr(curiosity_cfg, "history_messages", 20) or 20)
+                if curiosity_cfg is not None
+                else 20
+            )
+            prefix_prompt = self._build_curiosity_prefix_prompt()
+            history_text = await self._build_curiosity_history_text(message, max_messages=max_history)
+            signal = await self._get_curiosity_engine().review(
+                prefix_prompt=prefix_prompt,
+                history_text=history_text,
+                new_event_text=self._format_curiosity_event(event),
+                source_event_id=event.event_id,
+                source_stream_id=event.stream_id or "",
+            )
+            if signal.active:
+                logger.info(f"好奇牵引已更新: {signal.anchor or signal.unknown}")
+            else:
+                logger.debug("好奇异步判断：暂无值得保留的刺点")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"好奇异步判断失败: {exc}")
+        finally:
+            self._curiosity_inflight = False
+
+    def _build_curiosity_prefix_prompt(self) -> str:
+        workspace = self._workspace_dir()
+        soul_text = self._read_workspace_text(workspace, "SOUL.md")
+        user_text = self._read_workspace_text(workspace, "USER.md")
+        memory_text = ""
+        try:
+            memory_data = load_memory_prompt_data(workspace)
+            memory_text = render_memory_prompt(memory_data, mode="chat") if memory_data.raw_text else ""
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"好奇层读取 MEMORY.md 失败: {exc}")
+
+        return LifeChatterContextAssembler.build_prefix_prompt(
+            soul_text=soul_text,
+            user_text=user_text,
+            memory_text=memory_text,
+            tools_text="",
+            live_guidance="",
+            primary_tool_guide="",
+        )
+
+    @staticmethod
+    def _read_workspace_text(workspace: str, filename: str) -> str:
+        try:
+            path = Path(workspace) / filename
+            if path.exists() and path.is_file():
+                return path.read_text(encoding="utf-8").strip()
+        except Exception:
+            return ""
+        return ""
+
+    async def _build_curiosity_history_text(self, message: Message, *, max_messages: int) -> str:
+        if max_messages <= 0:
+            return ""
+        stream_id = str(getattr(message, "stream_id", "") or "").strip()
+        chat_stream = None
+        if stream_id:
+            try:
+                from src.core.managers import get_stream_manager
+
+                chat_stream = get_stream_manager()._streams.get(stream_id)
+            except Exception:
+                chat_stream = None
+        if chat_stream is not None:
+            text = await build_global_chat_history_text_from_db(
+                chat_stream,
+                max_messages=max_messages,
+                include_stream_label=True,
+                exclude_message_ids={
+                    str(getattr(message, "message_id", "") or "").strip()
+                } - {""},
+            )
+            if text:
+                return text
+
+        async with self._get_lock():
+            message_events = [
+                item for item in [*self._event_history, *self._pending_events]
+                if item.event_type == EventType.MESSAGE
+            ][-max_messages:]
+        return "\n".join(self._format_curiosity_event(item) for item in message_events)
+
+    @staticmethod
+    def _format_curiosity_event(event: LifeEngineEvent) -> str:
+        sender = event.sender or "未知"
+        stream = (event.stream_id or "")[:8]
+        source = event.source_detail or event.source or "unknown"
+        return (
+            f"[{_format_time_display(event.timestamp)}] "
+            f"{source} stream={stream} sender={sender}: "
+            f"{_shorten_text(event.content, max_length=500)}"
         )
 
     def get_or_create_followup_state(self, stream_id: str) -> FollowupState:
@@ -2180,6 +2330,25 @@ class LifeEngineService(BaseService):
         runtime_text = str(runtime_context_text or "").strip()
         if runtime_text:
             sections.append(f"### 运行时内心独白\n{runtime_text}")
+
+        curiosity_cfg = getattr(cfg, "curiosity", None)
+        curiosity_enabled = bool(
+            curiosity_cfg is None or getattr(curiosity_cfg, "enabled", True)
+        )
+        curiosity_inject = bool(
+            curiosity_cfg is None or getattr(curiosity_cfg, "inject_to_chatter", True)
+        )
+        if curiosity_enabled and curiosity_inject:
+            try:
+                curiosity_text = await self._get_curiosity_engine().format_for_prompt(
+                    max_chars=int(getattr(curiosity_cfg, "max_prompt_chars", 1200) or 1200)
+                    if curiosity_cfg is not None
+                    else 1200
+                )
+                if curiosity_text:
+                    sections.append(curiosity_text)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"读取好奇牵引失败: {exc}")
 
         if include_recent_chat_history and recent_chat_enabled and recent_chat_messages > 0:
             recent_chat_text = self._build_recent_chat_history_text(
