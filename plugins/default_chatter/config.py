@@ -60,10 +60,10 @@ class DefaultChatterConfig(BaseConfig):
         )
         enable_programmatic_controller: bool = Field(
             default=True,
-            description="是否启用 sub-agent 的程序化控制器。开启后会先按本地概率规则判断是否直接响应，关闭后始终交由 LLM sub-agent 决策。",
+            description="是否启用响应路由器的程序化控制器。开启后会先按本地概率规则判断是否直接响应，关闭后始终交由 LLM 路由器判断。",
             label="启用程序化控制器",
             tag="ai",
-            hint="关闭后群聊消息将始终经过 LLM sub-agent 过滤，不再使用本地概率直通逻辑"
+            hint="关闭后群聊消息将始终经过 LLM 路由器过滤，不再使用本地概率直通逻辑"
         )
         enable_action_suspend: bool = Field(
             default=True,

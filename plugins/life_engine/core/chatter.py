@@ -1367,6 +1367,31 @@ class LifeChatter(BaseChatter):
             primary_tool_guide=self._build_primary_tool_guide(),
         )
 
+    def _build_chat_router_prefix_prompt(
+        self,
+        service: LifeEngineService | None,
+        chat_stream: ChatStream | None = None,
+    ) -> str:
+        """构建路由器前缀提示词。
+
+        路由器与 life_chatter 共享 SOUL/USER/MEMORY 前缀，但不注入
+        TOOLS.md 和工具定义。它只判断“要不要把消息交给表达层”，不负责
+        具体行动。
+        """
+
+        soul_text = self._load_workspace_markdown(service, "SOUL.md")
+        user_text = self._load_workspace_markdown(service, "USER.md")
+        memory_text = self._load_workspace_memory_prompt(service, mode="chat")
+
+        return LifeChatterContextAssembler.build_prefix_prompt(
+            soul_text=soul_text,
+            user_text=user_text,
+            memory_text=memory_text,
+            tools_text="",
+            live_guidance=self._build_live_scene_guidance(chat_stream),
+            primary_tool_guide="",
+        )
+
     def _resolve_workspace_path(self, service: LifeEngineService | None) -> str:
         """解析 life_engine 工作空间路径。"""
         cfg = self._get_config()
@@ -1583,7 +1608,7 @@ class LifeChatter(BaseChatter):
             "prompt_source": "life_chatter",
         }
 
-    # ── sub-agent decision ───────────────────────────────────
+    # ── response router ──────────────────────────────────────
 
     async def _should_respond(
         self,
@@ -1591,10 +1616,9 @@ class LifeChatter(BaseChatter):
         unread_msgs: list[Message],
         chat_stream: ChatStream,
     ) -> dict[str, Any]:
-        """多层决策：是否需要响应。"""
-        chat_type_str = str(chat_stream.chat_type or "").lower()
+        """路由：是否把这批消息交给表达层继续处理。"""
 
-        # Layer 0: 内部主动机会/自主意向 → 交给主模型重新判断。
+        # 内部主动机会/自主意向 → 交给主模型重新判断。
         # 这不是强制回复，只是让表达层看到这个机会。
         if unread_msgs and all(self._is_proactive_trigger_message(msg) for msg in unread_msgs):
             return {
@@ -1603,61 +1627,36 @@ class LifeChatter(BaseChatter):
                 "force_reply": False,
             }
 
-        # Layer 1: 私聊 → 始终响应
-        if chat_type_str == "private":
-            return {
-                "reason": "私聊场景，直接响应",
-                "should_respond": True,
-                "force_reply": True,
-            }
+        service = self._get_life_service()
+        history_text = await self._build_history_text_async(
+            chat_stream,
+            max_messages=self._get_initial_history_message_limit(),
+            global_history=True,
+            exclude_message_ids={
+                str(getattr(msg, "message_id", "") or "")
+                for msg in unread_msgs
+                if str(getattr(msg, "message_id", "") or "")
+            },
+        )
+        prefix_prompt = self._build_chat_router_prefix_prompt(service, chat_stream)
 
-        # Layer 2: @mention
-        bot_nickname = str(chat_stream.bot_nickname or "").strip()
-        bot_id = str(chat_stream.bot_id or "").strip()
-        for msg in unread_msgs:
-            text = str(getattr(msg, "processed_plain_text", "") or getattr(msg, "content", "") or "")
-            if bot_nickname and bot_nickname in text:
-                return {
-                    "reason": f"消息中提到了 {bot_nickname}",
-                    "should_respond": True,
-                    "force_reply": True,
-                }
-            if bot_id and f"@{bot_id}" in text:
-                return {
-                    "reason": "消息中 @提及了机器人",
-                    "should_respond": True,
-                    "force_reply": True,
-                }
-
-        # Layer 3: 简单关键词启发
-        keywords = [bot_nickname] if bot_nickname else []
-        # Also check common nicknames
-        for msg in unread_msgs:
-            text = str(getattr(msg, "processed_plain_text", "") or getattr(msg, "content", "") or "").lower()
-            for kw in keywords:
-                if kw and kw.lower() in text:
-                    return {
-                        "reason": f"消息中包含关键词 {kw}",
-                        "should_respond": True,
-                        "force_reply": True,
-                    }
-
-        # Layer 4: LLM sub_agent fallback
         try:
-            from plugins.default_chatter.decision_agent import decide_should_respond
+            from plugins.default_chatter.router_agent import route_should_respond
 
             result = await self._await_with_watchdog_keepalive(
-                decide_should_respond(
+                route_should_respond(
                     chatter=self,
                     logger=logger,
                     unreads_text=unread_lines,
                     chat_stream=chat_stream,
+                    history_text=history_text,
+                    prefix_prompt=prefix_prompt,
                 )
             )
             return result
         except Exception as e:
-            logger.warning(f"sub_agent 决策失败, 默认不响应: {e}")
-            return {"reason": f"sub_agent 异常: {e}", "should_respond": False}
+            logger.warning(f"router 路由失败, 默认不响应: {e}")
+            return {"reason": f"router 异常: {e}", "should_respond": False}
 
     # ── history builder ──────────────────────────────────────
 
@@ -1952,9 +1951,9 @@ class LifeChatter(BaseChatter):
         decision: dict[str, Any],
         unread_msgs: list[Message],
     ) -> bool:
-        """决策层已判定要响应时，必须闭合为一次可见回复。
+        """路由层已判定要响应时，必须闭合为一次可见回复。
 
-        sub-agent 只负责判断这批外部消息是否值得接入主对话。一旦它返回
+        路由器只负责判断这批外部消息是否值得接入主对话。一旦它返回
         should_respond=true，后续主模型可以先查历史、看媒体或 think，但不能
         在没有任何可见回应的情况下静默收敛。
         """
@@ -2359,12 +2358,12 @@ class LifeChatter(BaseChatter):
                     self.format_message_line(msg) for msg in unread_msgs
                 )
 
-                # 决策：是否响应
+                # 路由：是否把这批消息交给表达层继续处理
                 decision = await self._should_respond(
                     unread_lines, unread_msgs, chat_stream,
                 )
                 logger.info(
-                    f"决策: {decision.get('reason', '')} (响应: {decision.get('should_respond', False)})"
+                    f"路由: {decision.get('reason', '')} (响应: {decision.get('should_respond', False)})"
                 )
 
                 if not decision.get("should_respond", False):

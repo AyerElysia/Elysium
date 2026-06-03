@@ -1,4 +1,4 @@
-"""default_chatter.decision_agent 模块测试。"""
+"""default_chatter.router_agent 模块测试。"""
 
 from __future__ import annotations
 
@@ -7,9 +7,10 @@ from typing import Any
 
 import pytest
 
-from plugins.default_chatter.decision_agent import (
+from plugins.default_chatter.router_agent import (
+    _DEFAULT_ROUTER_FALLBACK_PROMPT,
     _fit_unreads_to_sub_agent_budget,
-    decide_should_respond,
+    route_should_respond,
 )
 
 
@@ -20,7 +21,7 @@ async def test_fit_unreads_keeps_text_when_within_budget(
     """当输入未超过预算时应保持原样。"""
 
     monkeypatch.setattr(
-        "plugins.default_chatter.decision_agent._safe_count_tokens",
+        "plugins.default_chatter.router_agent._safe_count_tokens",
         lambda text, _model_identifier: len(text),
     )
 
@@ -41,7 +42,7 @@ async def test_fit_unreads_trims_old_prefix_when_over_budget(
     """超过预算时应裁剪前缀，优先保留最新未读内容。"""
 
     monkeypatch.setattr(
-        "plugins.default_chatter.decision_agent._safe_count_tokens",
+        "plugins.default_chatter.router_agent._safe_count_tokens",
         lambda text, _model_identifier: len(text),
     )
 
@@ -57,7 +58,7 @@ async def test_fit_unreads_trims_old_prefix_when_over_budget(
 
 
 @pytest.mark.asyncio
-async def test_decide_should_respond_requests_sub_actor_reminder(
+async def test_route_should_respond_requests_sub_actor_reminder(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """子代理创建请求时应传入 sub_actor reminder bucket。"""
@@ -93,15 +94,15 @@ async def test_decide_should_respond_requests_sub_actor_reminder(
             return _FakeResponse()
 
     monkeypatch.setattr(
-        "plugins.default_chatter.decision_agent.get_core_config",
+        "plugins.default_chatter.router_agent.get_core_config",
         lambda: SimpleNamespace(personality=SimpleNamespace(nickname="Neo")),
     )
     monkeypatch.setattr(
-        "plugins.default_chatter.decision_agent.get_prompt_manager",
+        "plugins.default_chatter.router_agent.get_prompt_manager",
         lambda: SimpleNamespace(get_template=lambda _name: None),
     )
 
-    result = await decide_should_respond(
+    result = await route_should_respond(
         chatter=_FakeChatter(),
         logger=SimpleNamespace(info=lambda *_a, **_k: None, warning=lambda *_a, **_k: None, debug=lambda *_a, **_k: None, error=lambda *_a, **_k: None),
         unreads_text="hello",
@@ -112,13 +113,13 @@ async def test_decide_should_respond_requests_sub_actor_reminder(
     assert result["should_respond"] is True
     assert captured == {
         "task": "sub_actor",
-        "request_name": "sub_agent",
+        "request_name": "router",
         "with_reminder": "sub_actor",
     }
 
 
 @pytest.mark.asyncio
-async def test_decide_should_respond_allows_legacy_call_without_fallback_prompt(
+async def test_route_should_respond_allows_call_without_fallback_prompt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """旧调用方不传 fallback_prompt 时也应正常执行。"""
@@ -150,15 +151,15 @@ async def test_decide_should_respond_allows_legacy_call_without_fallback_prompt(
             return _FakeResponse()
 
     monkeypatch.setattr(
-        "plugins.default_chatter.decision_agent.get_core_config",
+        "plugins.default_chatter.router_agent.get_core_config",
         lambda: SimpleNamespace(personality=SimpleNamespace(nickname="Neo")),
     )
     monkeypatch.setattr(
-        "plugins.default_chatter.decision_agent.get_prompt_manager",
+        "plugins.default_chatter.router_agent.get_prompt_manager",
         lambda: SimpleNamespace(get_template=lambda _name: None),
     )
 
-    result = await decide_should_respond(
+    result = await route_should_respond(
         chatter=_FakeChatter(),
         logger=SimpleNamespace(info=lambda *_a, **_k: None, warning=lambda *_a, **_k: None, debug=lambda *_a, **_k: None, error=lambda *_a, **_k: None),
         unreads_text="hello",
@@ -172,7 +173,7 @@ async def test_decide_should_respond_allows_legacy_call_without_fallback_prompt(
 
 
 @pytest.mark.asyncio
-async def test_decide_should_respond_formats_unknown_fallback_placeholders_as_empty(
+async def test_route_should_respond_formats_unknown_fallback_placeholders_as_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """fallback prompt 带额外占位符时不应抛 KeyError。"""
@@ -204,15 +205,15 @@ async def test_decide_should_respond_formats_unknown_fallback_placeholders_as_em
             return _FakeResponse()
 
     monkeypatch.setattr(
-        "plugins.default_chatter.decision_agent.get_core_config",
+        "plugins.default_chatter.router_agent.get_core_config",
         lambda: SimpleNamespace(personality=SimpleNamespace(nickname="Neo")),
     )
     monkeypatch.setattr(
-        "plugins.default_chatter.decision_agent.get_prompt_manager",
+        "plugins.default_chatter.router_agent.get_prompt_manager",
         lambda: SimpleNamespace(get_template=lambda _name: None),
     )
 
-    result = await decide_should_respond(
+    result = await route_should_respond(
         chatter=_FakeChatter(),
         logger=SimpleNamespace(info=lambda *_a, **_k: None, warning=lambda *_a, **_k: None, debug=lambda *_a, **_k: None, error=lambda *_a, **_k: None),
         unreads_text="hello",
@@ -224,3 +225,9 @@ async def test_decide_should_respond_formats_unknown_fallback_placeholders_as_em
         "should_respond": True,
         "reason": "format-ok",
     }
+
+
+def test_router_fallback_prompt_removes_mention_id_hard_rules() -> None:
+    assert "QQ 号必须" not in _DEFAULT_ROUTER_FALLBACK_PROMPT
+    assert "艾特了其他人" not in _DEFAULT_ROUTER_FALLBACK_PROMPT
+    assert "不是绝对规则" in _DEFAULT_ROUTER_FALLBACK_PROMPT

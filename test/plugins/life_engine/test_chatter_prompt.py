@@ -69,6 +69,41 @@ def test_life_chatter_system_prompt_includes_memory_and_chatter_tools_not_heartb
     assert "reason" in prompt
 
 
+def test_life_chatter_router_prefix_excludes_tools(tmp_path) -> None:
+    """路由器共享主体前缀，但不注入 TOOLS.md 和工具定义。"""
+    (tmp_path / "SOUL.md").write_text("SOUL_CONTENT", encoding="utf-8")
+    (tmp_path / "USER.md").write_text("USER_CONTENT", encoding="utf-8")
+    (tmp_path / "MEMORY.md").write_text(
+        "\n".join(
+            [
+                "# 值得记住的事",
+                "",
+                "### Durable（持久）",
+                "- MEMORY_DURABLE",
+                "",
+                "### Active（活跃）",
+                "- MEMORY_ACTIVE",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "TOOLS.md").write_text("CHATTER_TOOLS_CONTENT", encoding="utf-8")
+
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(tmp_path)
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=config)
+
+    prompt = chatter._build_chat_router_prefix_prompt(service=None)
+
+    assert "SOUL_CONTENT" in prompt
+    assert "USER_CONTENT" in prompt
+    assert "MEMORY_DURABLE" in prompt
+    assert "MEMORY_ACTIVE" in prompt
+    assert "CHATTER_TOOLS_CONTENT" not in prompt
+    assert "life_send_text" not in prompt
+
+
 def test_life_chatter_persistent_user_prompt_excludes_dynamic_context() -> None:
     """持久 USER prompt 不应写入 inner_state/recent_context 等动态快照。"""
     chatter = LifeChatter.__new__(LifeChatter)

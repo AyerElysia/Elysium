@@ -406,11 +406,11 @@ async def run_enhanced(
                 chat_stream,
             )
             logger.info(
-                f"Sub-agent 决策: {decision['reason']} (响应: {decision['should_respond']})"
+                f"路由: {decision['reason']} (响应: {decision['should_respond']})"
             )
 
             if not decision["should_respond"]:
-                logger.info("Sub-agent 决定不响应，继续等待...")
+                logger.info("路由器决定不响应，继续等待...")
                 resume_event = yield Wait(evaluated_messages_count=len(rt.unreads))
                 continue
 

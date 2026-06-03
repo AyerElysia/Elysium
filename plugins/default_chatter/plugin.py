@@ -39,7 +39,7 @@ from src.kernel.llm.payload.tooling import LLMUsable
 from src.kernel.logger import Logger
 
 from .config import DefaultChatterConfig
-from .decision_agent import decide_should_respond
+from .router_agent import route_should_respond
 from .multimodal import build_multimodal_content, extract_images_from_messages
 from .prompt_builder import DefaultChatterPromptBuilder
 from .runners import run_enhanced
@@ -63,7 +63,7 @@ _SEND_TEXT_TYPING_DELAY_MAX_SECONDS = 10.0
 
 
 def _set_next_tick_sub_agent_bonus(chat_stream: ChatStream, bonus: float) -> None:
-    """为下一次群聊 sub-agent 判定写入概率加成。"""
+    """为下一次群聊路由写入概率加成。"""
     current_bonus = getattr(chat_stream.context, _SUB_AGENT_NEXT_TICK_BONUS_ATTR, 0.0)
     setattr(
         chat_stream.context,
@@ -73,7 +73,7 @@ def _set_next_tick_sub_agent_bonus(chat_stream: ChatStream, bonus: float) -> Non
 
 
 def _consume_next_tick_sub_agent_bonus(chat_stream: ChatStream) -> float:
-    """读取并清空下一次群聊 sub-agent 判定的概率加成。"""
+    """读取并清空下一次群聊路由概率加成。"""
     bonus = float(getattr(chat_stream.context, _SUB_AGENT_NEXT_TICK_BONUS_ATTR, 0.0))
     setattr(chat_stream.context, _SUB_AGENT_NEXT_TICK_BONUS_ATTR, 0.0)
     return bonus
@@ -224,27 +224,20 @@ user_prompt = """你当前正在名为"{stream_name}"的对话中。
 </extra_info>
 """
 
-sub_agent_system_prompt = """你是一个聊天意图识别助手。
-你的任务是分析新收到的聊天消息，结合历史上下文，判断主机器人是否有必要进行响应。
+sub_agent_system_prompt = """你是当前主体的对话路由器。
+你的任务不是按硬规则拦截消息，而是站在主体自己的视角，结合近期聊天记录和新消息，判断此刻要不要开口。
 
-# 关于主机器人
-主机器人的名字是 {nickname}。
-{bot_id_section}{personality_core_section}{personality_side_section}
-# 判定准则
-你应该在以下情况判定为 "需要回复" (should_respond = true)：
-1. 明确提及：
-   - 消息中明确提到了机器人的名字({nickname})或代称。
-   - 消息中存在艾特(@)行为，且艾特的 QQ 号必须是 {bot_id}。**注意：如果艾特的 QQ 号不是 {bot_id}，则绝对不是在叫它，即使艾特的昵称看起来像。**
-2. 话题相关：消息内容与当前正在进行的话题高度相关，需要机器人进一步说明、回答或参与。
-3. 话语完整：对方的话已经说完，或者是一个完整的问题/指令。
-4. 情感互动：对方在表达某种需要回应的情绪（如问候、告别、称赞、抱怨等）。
+# 主体背景
+主体的常用名字是 {nickname}。
+{personality_core_section}{personality_side_section}
 
-你应该在以下情况判定为 "不需要回复" (should_respond = false)：
-1. 话题无关：消息是群聊中的闲聊，且机器人并非话题参与者。
-2. 艾特他人：消息艾特了其他人（QQ 号不是 {bot_id}）。
-3. 话未说完：明显是一连串消息中的中间部分，可以继续等待后续。
-4. 机器博弈：检测到是其他 Bot 的自动回复或无意义的刷屏消息。
-5. 纯粹表情：只有单个表情且不携带任何需要回复的语义。
+# 路由原则
+- 不要使用“艾特 ID 是否匹配”“是否私聊”“是否关键词命中”这类机械硬规则替主体做决定。
+- @、昵称、平台 ID、群名片、表情、图片摘要都只是上下文线索，不是绝对规则。
+- 你只需要判断：如果我是这个主体，看到近期聊天和这批新消息，此刻开口是否自然、必要、有生命力。
+- 可以选择不说话：例如话还没说完、别人正在对话、接话会打断氛围、或此刻沉默更合适。
+- 也可以选择开口：例如对方明显在叫我、话题与我有关、情绪需要被接住、或我自然想参与。
+- 不要替主体生成具体回复内容；只输出是否把这批消息路由给表达层继续处理。
 
 # 输出格式
 请务必返回 JSON 格式，如下所示：
@@ -275,7 +268,7 @@ class SendTextAction(BaseAction):
         )
 
     def _mark_sub_agent_bonus_on_success(self, success: bool) -> None:
-        """发送成功后提高下一次 tick 的 sub-agent 直通概率。"""
+        """发送成功后提高下一次 tick 的路由直通概率。"""
         if success and self._is_programmatic_controller_enabled():
             _set_next_tick_sub_agent_bonus(
                 self.chat_stream,
@@ -627,7 +620,7 @@ class DefaultChatter(BaseChatter):
 
     @staticmethod
     def _message_text_for_probability(message: Message) -> str:
-        """提取消息文本，供 sub-agent 概率门做关键词判定。"""
+        """提取消息文本，供路由概率门做关键词判定。"""
         if isinstance(message.processed_plain_text, str) and message.processed_plain_text:
             return message.processed_plain_text
         if isinstance(message.content, str):
@@ -653,7 +646,7 @@ class DefaultChatter(BaseChatter):
 
     @staticmethod
     def _get_sub_agent_identity_names(chat_stream: ChatStream) -> tuple[str, list[str]]:
-        """获取 sub-agent 概率门使用的 bot 名字与别名。"""
+        """获取路由概率门使用的 bot 名字与别名。"""
         fallback_nickname = (
             chat_stream.bot_nickname.strip()
             if isinstance(chat_stream.bot_nickname, str)
@@ -681,7 +674,7 @@ class DefaultChatter(BaseChatter):
         unread_msgs: list[Message],
         chat_stream: ChatStream,
     ) -> tuple[float, str]:
-        """计算本地概率直通 sub-agent 的放行概率。"""
+        """计算本地概率直通路由器的放行概率。"""
         nickname, alias_names = self._get_sub_agent_identity_names(chat_stream)
 
         probability = _SUB_AGENT_BASE_BYPASS_PROBABILITY
@@ -879,9 +872,9 @@ class DefaultChatter(BaseChatter):
         unread_msgs: list[Message],
         chat_stream: ChatStream,
     ) -> SubAgentDecision:
-        """子代理决策：判断是否需要响应未读消息。
+        """响应路由：判断是否需要把未读消息交给表达层。
 
-        独立构建上下文，只包含历史消息摘要与未读消息，
+        独立构建上下文，只包含近期聊天与未读消息。
 
         Args:
             unreads_text: 格式化后的未读消息文本
@@ -893,7 +886,7 @@ class DefaultChatter(BaseChatter):
         """
         if str(chat_stream.chat_type).lower() == "private":
             return {
-                "reason": "私聊场景跳过 sub-agent，直接响应",
+                "reason": "私聊场景跳过路由器，直接响应",
                 "should_respond": True,
             }
 
@@ -908,7 +901,7 @@ class DefaultChatter(BaseChatter):
                     "should_respond": True,
                 }
 
-        return await decide_should_respond(
+        return await route_should_respond(
             chatter=self,
             logger=logger,
             unreads_text=unreads_text,
@@ -1224,6 +1217,20 @@ class DefaultChatterPlugin(BasePlugin):
                 "safety_guidelines": optional("\n".join(personality.safety_guidelines)),
                 "negative_behaviors": optional("\n".join(personality.negative_behaviors)),
                 "sub_agent_collaboration_extra": optional(""),
+            },
+        )
+
+        get_prompt_manager().get_or_create(
+            name="default_chatter_router_prompt",
+            template=sub_agent_system_prompt,
+            policies={
+                "nickname": optional(personality.nickname),
+                "bot_id": optional(""),
+                "bot_id_section": optional(""),
+                "personality_core_section": optional(personality.personality_core)
+                .then(wrap("它的核心人格是：", "\n")),
+                "personality_side_section": optional(personality.personality_side)
+                .then(wrap("它的人格侧面是：", "\n")),
             },
         )
 
