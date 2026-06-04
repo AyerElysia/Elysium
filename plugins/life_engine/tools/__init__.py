@@ -23,11 +23,13 @@ from .web_tools import WEB_TOOLS
 from .rest_tools import REST_TOOLS, LifeEngineRestHeartbeatTool
 from .screen_tools import SCREEN_TOOLS, LifeEngineViewScreenTool
 from .autonomy_tools import AUTONOMY_TOOLS, LifeEngineScheduleAutonomyIntentTool
+from ..trace.tools import LIFE_TRACE_TOOLS
 from ..streams.tools import STREAM_TOOLS
 from .exec_tools import EXEC_TOOLS
 
 ALL_TOOLS = [
     *FILE_TOOLS,
+    *LIFE_TRACE_TOOLS,
     *CHAT_HISTORY_TOOLS,
     *REST_TOOLS,
     *SCREEN_TOOLS,
@@ -43,6 +45,7 @@ __all__ = [
     "REST_TOOLS",
     "SCREEN_TOOLS",
     "AUTONOMY_TOOLS",
+    "LIFE_TRACE_TOOLS",
     "LifeEngineFetchChatHistoryTool",
     "LifeEngineRestHeartbeatTool",
     "LifeEngineViewScreenTool",

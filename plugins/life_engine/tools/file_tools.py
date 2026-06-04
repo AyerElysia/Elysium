@@ -30,6 +30,7 @@ from ..constants import (
     PROACTIVE_WAKE_KEYWORDS,
 )
 from ..memory.prompting import build_memory_write_warning
+from ..trace.store import LifeTraceStore
 from ._utils import (
     _get_workspace,
     _resolve_path,
@@ -74,6 +75,42 @@ async def _sync_memory_embedding_for_file(plugin: Any, path: str, content: str) 
             await service._memory_service.sync_embedding(path, content)
     except Exception as e:
         logger.warning(f"同步记忆 embedding 失败 {path}: {e}")
+
+
+def _read_trace_before_content(target: Path, encoding: str) -> str | None:
+    if not target.exists() or not target.is_file():
+        return None
+    try:
+        return target.read_text(encoding=encoding)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"追溯系统读取修改前内容失败 {target}: {exc}")
+        return None
+
+
+def _record_file_trace(
+    plugin: Any,
+    *,
+    path: str,
+    before_content: str | None,
+    after_content: str | None,
+    operation: str,
+    tool_name: str,
+    reason: str = "",
+) -> str:
+    try:
+        record = LifeTraceStore(_get_workspace(plugin)).record_change(
+            path=path,
+            before_content=before_content,
+            after_content=after_content,
+            operation=operation,
+            tool_name=tool_name,
+            actor="life_engine",
+            reason=reason,
+        )
+        return record.trace_id if record is not None else ""
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"记录 Life Trace 失败 {path}: {exc}")
+        return ""
 
 
 def _is_detailed_proactive_wake_reason(reason: str) -> bool:
@@ -591,6 +628,7 @@ class LifeEngineWriteFileTool(BaseTool):
         path: Annotated[str, "相对于工作空间的文件路径"],
         content: Annotated[str, "要写入的内容"],
         encoding: Annotated[str, "文件编码，默认utf-8"] = "utf-8",
+        reason: Annotated[str, "可选：这次写入/覆盖文件的原因，便于未来追溯"] = "",
     ) -> tuple[bool, str | dict]:
         """写入文件（覆盖模式）。
 
@@ -604,11 +642,21 @@ class LifeEngineWriteFileTool(BaseTool):
 
         target = result
         existed = target.exists()
+        before_content = _read_trace_before_content(target, encoding)
 
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding=encoding)
             stat = target.stat()
+            trace_id = _record_file_trace(
+                self.plugin,
+                path=path,
+                before_content=before_content,
+                after_content=content,
+                operation="write",
+                tool_name=self.tool_name,
+                reason=reason,
+            )
 
             # 触发记忆系统同步 embedding
             await _sync_memory_embedding_for_file(self.plugin, path, content)
@@ -618,6 +666,7 @@ class LifeEngineWriteFileTool(BaseTool):
                 "path": path,
                 "size_human": _format_size(stat.st_size),
                 "created": not existed,
+                "trace_id": trace_id,
                 **(
                     {"warning": warning}
                     if (warning := build_memory_write_warning(path, content)) is not None
@@ -659,6 +708,7 @@ class LifeEngineEditFileTool(BaseTool):
         new_text: Annotated[str, "替换后的新文本"],
         replace_all: Annotated[bool, "是否替换所有出现的位置（默认只替换第一处）"] = False,
         encoding: Annotated[str, "文件编码，默认utf-8"] = "utf-8",
+        reason: Annotated[str, "可选：这次编辑文件的原因，便于未来追溯"] = "",
     ) -> tuple[bool, str | dict]:
         """编辑文件中的特定内容。
 
@@ -701,6 +751,15 @@ class LifeEngineEditFileTool(BaseTool):
                 replacements = 1
 
             target.write_text(new_content, encoding=encoding)
+            trace_id = _record_file_trace(
+                self.plugin,
+                path=path,
+                before_content=content,
+                after_content=new_content,
+                operation="edit",
+                tool_name=self.tool_name,
+                reason=reason,
+            )
 
             # 触发记忆系统同步 embedding
             await _sync_memory_embedding_for_file(self.plugin, path, new_content)
@@ -709,6 +768,7 @@ class LifeEngineEditFileTool(BaseTool):
                 "action": "edit_file",
                 "path": path,
                 "replacements": replacements,
+                "trace_id": trace_id,
             }
         except UnicodeDecodeError as e:
             return False, f"文件编码错误: {e}"
