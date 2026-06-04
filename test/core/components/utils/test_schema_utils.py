@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 
 from src.core.components.utils.schema_utils import (
+    build_type_schema,
     extract_description_from_docstring,
     map_type_to_json,
     parse_function_signature,
@@ -148,6 +149,17 @@ class TestMapTypeToJson:
         result = map_type_to_json(set)
         # 由于 set 在容器类型列表中，会被映射到 "object"
         assert result == "object" or result == "string"
+
+
+class TestBuildTypeSchema:
+    """测试 Python 类型到 JSON Schema 片段的转换。"""
+
+    def test_literal_string_values_keep_string_schema_type(self):
+        """Literal 字符串枚举值 'none' 不应被误判为 null 类型。"""
+        schema = build_type_schema(Literal["none", "low", "high"])
+
+        assert schema["type"] == "string"
+        assert schema["enum"] == ["none", "low", "high"]
 
 
 class TestParseFunctionSignature:

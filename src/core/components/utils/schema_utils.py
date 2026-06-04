@@ -72,7 +72,13 @@ def build_type_schema(type_hint: Any) -> dict[str, Any]:
         if not literal_values:
             return {"type": "string"}
         value_types = {type(value) for value in literal_values}
-        schema_type = map_type_to_json(literal_values[0]) if len(value_types) == 1 else "string"
+        # 使用值的 Python 类型（而非值本身）来推断 JSON Schema 类型，
+        # 避免字符串值 "none" 被 map_type_to_json 错误地解析为 null 类型。
+        schema_type = (
+            _TYPE_MAPPING.get(type(literal_values[0]), "string")
+            if len(value_types) == 1
+            else "string"
+        )
         return {
             "type": schema_type,
             "enum": literal_values,
