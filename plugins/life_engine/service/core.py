@@ -72,6 +72,7 @@ from ..memory.prompting import (
     render_memory_prompt,
     should_emit_memory_maintenance_prompt,
 )
+from ..trace.store import LifeTraceRecord, LifeTraceStore
 from .event_builder import (
     EventBuilder,
     EventType,
@@ -1952,6 +1953,30 @@ class LifeEngineService(BaseService):
                 return ""
             return "\n".join(f"{key}: {value}" for key, value in state_dict.items())
 
+    def _format_chatter_trace_recent_changes(self, *, limit: int = 3) -> str:
+        """渲染最近文件追溯块（用于 chatter suffix）。"""
+        if limit <= 0:
+            return ""
+        try:
+            records = LifeTraceStore(self._workspace_dir()).recent(limit=limit)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"读取最近文件追溯失败: {exc}")
+            return ""
+        if not records:
+            return ""
+        return "\n".join(self._format_trace_record_line(record) for record in records)
+
+    @staticmethod
+    def _format_trace_record_line(record: LifeTraceRecord) -> str:
+        timestamp = str(record.timestamp or "")
+        operation = str(record.operation or "modify")
+        path = str(record.path or "未知文件")
+        reason = str(record.reason or "").strip()
+        trace_id = str(record.trace_id or "")
+        detail = f"，原因：{reason}" if reason else ""
+        trace_ref = f"，trace_id={trace_id}" if trace_id else ""
+        return f"- {timestamp} {operation} {path}{detail}{trace_ref}"
+
     def _format_chatter_thought_streams(
         self,
         *,
@@ -2253,6 +2278,15 @@ class LifeEngineService(BaseService):
             if runtime_cfg is not None
             else 10
         )
+        trace_recent_enabled = bool(
+            runtime_cfg is None
+            or getattr(runtime_cfg, "trace_recent_changes_enabled", True)
+        )
+        trace_recent_limit = (
+            int(getattr(runtime_cfg, "trace_recent_changes_limit", 3))
+            if runtime_cfg is not None
+            else 3
+        )
         send_targets_enabled = bool(
             runtime_cfg is None or getattr(runtime_cfg, "send_targets_enabled", True)
         )
@@ -2360,6 +2394,13 @@ class LifeEngineService(BaseService):
                 sections.append(
                     f"### 最近 {recent_chat_messages} 条聊天记录\n{recent_chat_text}"
                 )
+
+        if trace_recent_enabled and trace_recent_limit > 0:
+            trace_recent_text = self._format_chatter_trace_recent_changes(
+                limit=trace_recent_limit,
+            )
+            if trace_recent_text:
+                sections.append(f"### 最近文件修改\n{trace_recent_text}")
 
         if send_targets_enabled:
             send_targets_text = format_send_targets_for_prompt(

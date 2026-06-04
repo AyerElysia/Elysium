@@ -219,6 +219,7 @@ from plugins.life_engine.service.event_builder import (  # noqa: E402
     EventType,
     LifeEngineEvent,
 )
+from plugins.life_engine.trace.store import LifeTraceStore  # noqa: E402
 
 
 def _make_event(seq: int, **kwargs) -> LifeEngineEvent:
@@ -315,6 +316,39 @@ async def test_build_chatter_runtime_includes_latest_think_and_recent_chat() -> 
     assert "### 最近 10 条聊天记录" in text
     assert "旧消息 1" in text
     assert "旧消息 3" in text
+
+
+@pytest.mark.asyncio
+async def test_build_chatter_runtime_includes_recent_file_trace(tmp_path) -> None:
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(tmp_path)
+    config.runtime_sync.recent_chat_enabled = False
+    config.runtime_sync.send_targets_enabled = False
+    config.runtime_sync.trace_recent_changes_enabled = True
+    config.runtime_sync.trace_recent_changes_limit = 3
+    service = LifeEngineService(SimpleNamespace(config=config))
+    chat = SimpleNamespace(stream_id="stream-trace")
+
+    store = LifeTraceStore(tmp_path)
+    for index in range(4):
+        store.record_change(
+            path=f"notes/{index}.md",
+            before_content=None,
+            after_content=f"note {index}\n",
+            operation="write",
+            tool_name="nucleus_write_file",
+            reason=f"reason {index}",
+        )
+
+    text, _ = await service.build_chatter_runtime_context(chat)
+
+    assert "### 最近文件修改" in text
+    assert "notes/3.md" in text
+    assert "notes/2.md" in text
+    assert "notes/1.md" in text
+    assert "reason 3" in text
+    assert "trace_id=trace_" in text
+    assert "notes/0.md" not in text
 
 
 @pytest.mark.asyncio

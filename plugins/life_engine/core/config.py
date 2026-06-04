@@ -123,6 +123,8 @@ class LifeEngineConfig(BaseConfig):
             "latest_action_think_enabled",
             "recent_chat_enabled",
             "recent_chat_messages",
+            "trace_recent_changes_enabled",
+            "trace_recent_changes_limit",
             "send_targets_enabled",
             "send_targets_limit",
             "send_targets_window_hours",
@@ -944,6 +946,18 @@ class LifeEngineConfig(BaseConfig):
             ge=0,
             le=50,
             description="最近聊天记录快照最多保留多少条。设为 0 表示关闭该块。",
+        )
+
+        trace_recent_changes_enabled: bool = Field(
+            default=True,
+            description="是否在 chatter suffix 中注入最近文件修改追溯。",
+        )
+
+        trace_recent_changes_limit: int = Field(
+            default=3,
+            ge=0,
+            le=10,
+            description="最近文件修改追溯最多展示多少条。设为 0 表示关闭该块。",
         )
 
         send_targets_enabled: bool = Field(
