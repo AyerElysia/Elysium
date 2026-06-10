@@ -40,11 +40,13 @@ class DesktopPetRouter(BaseRouter):
 
         @self.app.get("/api/status")
         async def status() -> dict[str, Any]:
+            """返回桌宠桥接运行状态。"""
             adapter = get_desktop_pet_adapter()
             return {
                 "ok": adapter is not None,
                 "platform": PLATFORM,
                 "adapter_ready": adapter is not None,
+                "connected_clients": adapter.connected_client_count() if adapter else 0,
                 "time": time.time(),
             }
 

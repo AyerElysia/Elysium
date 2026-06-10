@@ -77,10 +77,49 @@ class DesktopPetAdapter(BaseAdapter):
         return {"bot_id": "elysia_desktop_pet", "bot_name": "爱莉"}
 
     async def register_client(self, websocket: WebSocket) -> None:
+        """注册桌宠 WebSocket 客户端，并刷新桌宠聊天流活跃时间。"""
         self._clients.add(websocket)
+        try:
+            await self._touch_desktop_stream()
+        except Exception as exc:
+            logger.warning(f"刷新桌宠聊天流活跃时间失败: {exc}", exc_info=True)
 
     async def unregister_client(self, websocket: WebSocket) -> None:
+        """注销桌宠 WebSocket 客户端，不写入聊天历史。"""
         self._clients.discard(websocket)
+        logger.info(f"桌宠 WebSocket 客户端已断开，当前连接数: {len(self._clients)}")
+
+    def is_client_connected(self) -> bool:
+        """返回是否存在已连接的桌宠客户端。"""
+        return bool(self._clients)
+
+    def connected_client_count(self) -> int:
+        """返回当前已注册的桌宠客户端数量。"""
+        return len(self._clients)
+
+    async def _touch_desktop_stream(self) -> None:
+        """确保桌宠私聊流存在，并刷新最后活跃时间。"""
+        from src.core.managers.stream_manager import get_stream_manager
+
+        stream_manager = get_stream_manager()
+        stream = await stream_manager.get_or_create_stream(
+            platform=PLATFORM,
+            user_id="desktop_owner",
+            group_name="主人",
+            chat_type="private",
+        )
+        await stream_manager.activate_stream(stream.stream_id)
+        await self._touch_desktop_person()
+
+    async def _touch_desktop_person(self) -> None:
+        """确保桌宠主人用户资料存在，并刷新用户交互信息。"""
+        from src.core.utils.user_query_helper import get_user_query_helper
+
+        await get_user_query_helper().update_person_info(
+            platform=PLATFORM,
+            user_id="desktop_owner",
+            nickname="主人",
+        )
 
     async def send_message(self, raw_message: dict[str, Any]) -> dict[str, Any]:
         """将桌宠用户输入推入 Neo-MoFox 核心。"""
