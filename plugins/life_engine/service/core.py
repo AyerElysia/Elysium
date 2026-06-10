@@ -1413,6 +1413,30 @@ class LifeEngineService(BaseService):
     def _autonomy_store(self) -> AutonomyIntentStore:
         return AutonomyIntentStore(self._workspace_dir())
 
+    def _record_life_moment(
+        self,
+        *,
+        kind: str,
+        summary: str,
+        operation: str,
+        reason: str = "",
+        source_event_id: str = "",
+        stream_id: str = "",
+    ) -> None:
+        """转折点入长河；长河故障绝不影响主流程。"""
+        try:
+            LifeTraceStore(self._workspace_dir()).record_moment(
+                kind=kind,
+                summary=summary,
+                operation=operation,
+                actor="life_engine",
+                reason=reason,
+                source_event_id=source_event_id,
+                stream_id=stream_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"长河留痕失败 kind={kind}: {exc}")
+
     async def _resolve_autonomy_target_stream_id(
         self,
         *,
@@ -1493,6 +1517,13 @@ class LifeEngineService(BaseService):
             sender_name="自主意向",
         )
         await self._queue_pending_event(event)
+        self._record_life_moment(
+            kind="intent",
+            summary=f"形成意向（{intent.kind}）：{intent.motivation[:120]}",
+            operation="formed",
+            source_event_id=intent.intent_id,
+            stream_id=intent.target_stream_id,
+        )
 
         logger.info(
             "新意向: "
@@ -1582,9 +1613,22 @@ class LifeEngineService(BaseService):
                     sender_name="自主意向",
                 )
                 await self._queue_pending_event(event)
+                self._record_life_moment(
+                    kind="intent",
+                    summary=f"意向到点无目标，浮现给心跳：{intent.motivation[:120]}",
+                    operation="surfaced",
+                    source_event_id=intent.intent_id,
+                )
                 logger.info(f"仲裁: downgraded intent_id={intent.intent_id[:12]} reason=no_target_stream")
                 return {"triggered": True, "dispatch": "life_event", "reason": "no_target_stream"}
             await self._wake_stream_for_autonomy(intent)
+            self._record_life_moment(
+                kind="intent",
+                summary=f"意向到点，交给表达层：{intent.motivation[:120]}",
+                operation="spoke",
+                source_event_id=intent.intent_id,
+                stream_id=intent.target_stream_id,
+            )
             logger.info(f"承接: life_chatter intent_id={intent.intent_id[:12]}")
             return {"triggered": True, "dispatch": "life_chatter", "stream_id": intent.target_stream_id}
 
@@ -1595,6 +1639,12 @@ class LifeEngineService(BaseService):
                 sender_name="自主意向",
             )
             await self._queue_pending_event(event)
+            self._record_life_moment(
+                kind="intent",
+                summary=f"意向到点，回到心跳继续思考：{intent.motivation[:120]}",
+                operation="reflected",
+                source_event_id=intent.intent_id,
+            )
             logger.info(f"承接: life_engine intent_id={intent.intent_id[:12]}")
             return {"triggered": True, "dispatch": "life_engine"}
 
@@ -1604,6 +1654,12 @@ class LifeEngineService(BaseService):
             sender_name="自主意向",
         )
         await self._queue_pending_event(event)
+        self._record_life_moment(
+            kind="intent",
+            summary=f"意向到点，选择沉默：{intent.motivation[:120]}",
+            operation="silence",
+            source_event_id=intent.intent_id,
+        )
         logger.info(f"承接: silence intent_id={intent.intent_id[:12]}")
         return {"triggered": True, "dispatch": "silence"}
 
@@ -1997,13 +2053,13 @@ class LifeEngineService(BaseService):
             return "\n".join(f"{key}: {value}" for key, value in state_dict.items())
 
     def _format_chatter_trace_recent_changes(self, *, limit: int = 3) -> str:
-        """渲染最近文件追溯块（用于 chatter suffix）。"""
+        """渲染长河最近留痕块（用于 chatter suffix）。"""
         if limit <= 0:
             return ""
         try:
             records = LifeTraceStore(self._workspace_dir()).recent(limit=limit)
         except Exception as exc:  # noqa: BLE001
-            logger.debug(f"读取最近文件追溯失败: {exc}")
+            logger.debug(f"读取长河留痕失败: {exc}")
             return ""
         if not records:
             return ""
@@ -2012,12 +2068,15 @@ class LifeEngineService(BaseService):
     @staticmethod
     def _format_trace_record_line(record: LifeTraceRecord) -> str:
         timestamp = str(record.timestamp or "")
+        trace_id = str(record.trace_id or "")
+        trace_ref = f"，trace_id={trace_id}" if trace_id else ""
+        if record.kind and record.kind != "file_change":
+            summary = str(record.summary or record.reason or record.operation or "").strip()
+            return f"- {timestamp} [{record.kind}] {summary}{trace_ref}"
         operation = str(record.operation or "modify")
         path = str(record.path or "未知文件")
         reason = str(record.reason or "").strip()
-        trace_id = str(record.trace_id or "")
         detail = f"，原因：{reason}" if reason else ""
-        trace_ref = f"，trace_id={trace_id}" if trace_id else ""
         return f"- {timestamp} {operation} {path}{detail}{trace_ref}"
 
     def _format_chatter_thought_streams(

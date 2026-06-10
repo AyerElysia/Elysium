@@ -1,4 +1,9 @@
-"""Persistent file trace storage for life_engine workspace files."""
+"""长河：append-only 经历留痕仓库。
+
+长河法则：事件流是她的现在，长河是她的来路。
+凡是她亲历的转折——写下的字、形成的意图与其归宿、闭合的思考、
+承接的好奇——都汇入同一条长河；长河只追加、不改写、永可回溯。
+"""
 
 from __future__ import annotations
 
@@ -13,12 +18,12 @@ from uuid import uuid4
 
 
 TRACE_DIR_NAME = ".life_trace"
-TRACE_VERSION = 1
+TRACE_VERSION = 2
 
 
 @dataclass(slots=True)
 class LifeTraceRecord:
-    """One tracked workspace file change."""
+    """One moment in the river: a file change or any other lived turning point."""
 
     trace_id: str
     timestamp: str
@@ -36,6 +41,8 @@ class LifeTraceRecord:
     diff_path: str
     source_event_id: str = ""
     stream_id: str = ""
+    kind: str = "file_change"
+    summary: str = ""
     version: int = TRACE_VERSION
 
     @classmethod
@@ -57,6 +64,8 @@ class LifeTraceRecord:
             diff_path=str(data.get("diff_path", "") or ""),
             source_event_id=str(data.get("source_event_id", "") or ""),
             stream_id=str(data.get("stream_id", "") or ""),
+            kind=str(data.get("kind", "") or "file_change"),
+            summary=str(data.get("summary", "") or ""),
             version=int(data.get("version", TRACE_VERSION) or TRACE_VERSION),
         )
 
@@ -138,16 +147,98 @@ class LifeTraceStore:
             source_event_id=str(source_event_id or ""),
             stream_id=str(stream_id or ""),
         )
-        with self.index_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record.to_dict(), ensure_ascii=False) + "\n")
+        self._append_record(record)
         return record
 
-    def recent(self, *, limit: int = 10, path: str = "") -> list[LifeTraceRecord]:
+    def record_moment(
+        self,
+        *,
+        kind: str,
+        summary: str,
+        operation: str,
+        tool_name: str = "",
+        actor: str = "life_engine",
+        reason: str = "",
+        source_event_id: str = "",
+        stream_id: str = "",
+        path: str = "",
+    ) -> LifeTraceRecord:
+        """Record one non-file turning point (intent outcome, closed thought, ...).
+
+        Lightweight: no blob, no diff — only an index entry in the same river.
+        """
+
+        normalized_kind = str(kind or "").strip()
+        normalized_summary = str(summary or "").strip()
+        if not normalized_kind:
+            raise ValueError("kind 不能为空")
+        if not normalized_summary:
+            raise ValueError("summary 不能为空")
+
+        self._ensure_dirs()
+        record = LifeTraceRecord(
+            trace_id=f"trace_{uuid4().hex[:16]}",
+            timestamp=_now_iso(),
+            path=self._normalize_rel_path(path) if str(path or "").strip() else "",
+            operation=str(operation or "").strip() or normalized_kind,
+            tool_name=str(tool_name or ""),
+            actor=str(actor or "life_engine"),
+            reason=str(reason or "").strip(),
+            before_exists=False,
+            after_exists=False,
+            before_hash="",
+            after_hash="",
+            before_size=0,
+            after_size=0,
+            diff_path="",
+            source_event_id=str(source_event_id or ""),
+            stream_id=str(stream_id or ""),
+            kind=normalized_kind,
+            summary=normalized_summary,
+        )
+        self._append_record(record)
+        return record
+
+    def recent(self, *, limit: int = 10, path: str = "", kind: str = "") -> list[LifeTraceRecord]:
         records = self._load_records()
         rel_path = self._normalize_rel_path(path) if path else ""
         if rel_path:
             records = [record for record in records if record.path == rel_path]
+        kind_filter = str(kind or "").strip()
+        if kind_filter:
+            records = [record for record in records if record.kind == kind_filter]
         return records[-max(0, limit):][::-1]
+
+    def origin(self) -> dict[str, Any]:
+        """长河概览：她是从哪里开始的、一路走了多远。"""
+
+        records = self._load_records()
+        if not records:
+            return {"total": 0}
+        first = records[0]
+        last = records[-1]
+        counts: dict[str, int] = {}
+        for record in records:
+            counts[record.kind] = counts.get(record.kind, 0) + 1
+        span_days = 0
+        first_dt = _parse_iso(first.timestamp)
+        last_dt = _parse_iso(last.timestamp)
+        if first_dt is not None and last_dt is not None:
+            span_days = max(0, (last_dt - first_dt).days)
+        return {
+            "total": len(records),
+            "first_timestamp": first.timestamp,
+            "first_record": {
+                "trace_id": first.trace_id,
+                "kind": first.kind,
+                "path": first.path,
+                "operation": first.operation,
+                "summary": first.summary or first.reason,
+            },
+            "last_timestamp": last.timestamp,
+            "span_days": span_days,
+            "counts_by_kind": counts,
+        }
 
     def history(self, path: str, *, limit: int = 20) -> list[LifeTraceRecord]:
         return self.recent(limit=limit, path=path)
@@ -197,9 +288,13 @@ class LifeTraceStore:
                 continue
             if isinstance(raw, dict):
                 record = LifeTraceRecord.from_dict(raw)
-                if record.trace_id and record.path:
+                if record.trace_id and (record.path or record.kind != "file_change"):
                     records.append(record)
         return records
+
+    def _append_record(self, record: LifeTraceRecord) -> None:
+        with self.index_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record.to_dict(), ensure_ascii=False) + "\n")
 
     def _ensure_dirs(self) -> None:
         self.trace_root.mkdir(parents=True, exist_ok=True)
@@ -234,6 +329,13 @@ def _sha256_text(content: str) -> str:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat()
+
+
+def _parse_iso(value: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value or "").strip())
+    except ValueError:
+        return None
 
 
 def _make_unified_diff(

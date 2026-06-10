@@ -47,7 +47,18 @@ def _apply_neuromod_pulse(pulses: dict[str, float], reason: str) -> None:
         logger.debug(f"调质脉冲施加失败: {e}")
 
 
-async def _absorb_curiosity_signal() -> None:
+def _record_river_moment(*, kind: str, summary: str, operation: str, reason: str = "") -> None:
+    """转折点入长河；长河故障绝不影响思考流操作。"""
+    try:
+        service = _get_service()
+        recorder = getattr(service, "_record_life_moment", None) if service else None
+        if recorder is not None:
+            recorder(kind=kind, summary=summary, operation=operation, reason=reason)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"长河留痕失败: {e}")
+
+
+async def _absorb_curiosity_signal(stream_title: str = "") -> None:
     """承接当前好奇牵引：刺点已被思考流接住，异步好奇层放下它。"""
     try:
         service = _get_service()
@@ -57,6 +68,11 @@ async def _absorb_curiosity_signal() -> None:
         signal = await engine.load_signal()
         if signal.active:
             await engine.clear()
+            _record_river_moment(
+                kind="curiosity",
+                summary=f"好奇刺点被思考流「{stream_title}」承接：{signal.anchor[:120]}",
+                operation="absorbed",
+            )
             logger.info(f"好奇牵引已被思考流承接并放下: {signal.anchor}")
     except Exception as e:  # noqa: BLE001
         logger.debug(f"承接好奇牵引失败: {e}")
@@ -116,7 +132,7 @@ class LifeEngineManageThoughtStreamTool(BaseTool):
                     return False, "title 不能为空"
                 ts = manager.create(title=title.strip(), reason=reason.strip())
                 if absorb_curiosity:
-                    await _absorb_curiosity_signal()
+                    await _absorb_curiosity_signal(stream_title=ts.title)
                 return True, (
                     f"已创建思考流「{ts.title}」({ts.id})，"
                     f"当前活跃思考流: {len(manager.list_active())}"
@@ -167,6 +183,10 @@ class LifeEngineManageThoughtStreamTool(BaseTool):
                     return False, "stream_id 不能为空"
                 if new_status not in ("completed", "dormant"):
                     return False, "new_status 必须是 'completed' 或 'dormant'"
+                target = next(
+                    (ts for ts in manager.list_all() if ts.id == stream_id.strip()), None
+                )
+                stream_title = target.title if target else stream_id.strip()
                 success, msg = manager.retire(
                     stream_id=stream_id.strip(),
                     new_status=new_status,
@@ -178,6 +198,14 @@ class LifeEngineManageThoughtStreamTool(BaseTool):
                     _apply_neuromod_pulse(
                         {"contentment": pulse},
                         reason="thought_stream_completed",
+                    )
+                if success:
+                    verb = "闭合" if new_status == "completed" else "搁置"
+                    detail = conclusion.strip() if conclusion and conclusion.strip() else "（无结论）"
+                    _record_river_moment(
+                        kind="thought_stream",
+                        summary=f"{verb}思考流「{stream_title}」：{detail[:120]}",
+                        operation=new_status,
                     )
                 return success, msg
 

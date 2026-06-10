@@ -96,6 +96,8 @@ def _record_file_trace(
     operation: str,
     tool_name: str,
     reason: str = "",
+    source_event_id: str = "",
+    stream_id: str = "",
 ) -> str:
     try:
         record = LifeTraceStore(_get_workspace(plugin)).record_change(
@@ -106,11 +108,22 @@ def _record_file_trace(
             tool_name=tool_name,
             actor="life_engine",
             reason=reason,
+            source_event_id=source_event_id,
+            stream_id=stream_id,
         )
         return record.trace_id if record is not None else ""
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"记录 Life Trace 失败 {path}: {exc}")
         return ""
+
+
+def _tool_trace_context(tool: Any) -> dict[str, str]:
+    """从工具运行态取当时的语境，让文件改写在长河里关联到事件与聊天流。"""
+    message = getattr(tool, "trigger_message", None)
+    return {
+        "source_event_id": str(getattr(message, "message_id", "") or ""),
+        "stream_id": str(tool.get_current_stream_id() or ""),
+    }
 
 
 def _is_detailed_proactive_wake_reason(reason: str) -> bool:
@@ -656,6 +669,7 @@ class LifeEngineWriteFileTool(BaseTool):
                 operation="write",
                 tool_name=self.tool_name,
                 reason=reason,
+                **_tool_trace_context(self),
             )
 
             # 触发记忆系统同步 embedding
@@ -759,6 +773,7 @@ class LifeEngineEditFileTool(BaseTool):
                 operation="edit",
                 tool_name=self.tool_name,
                 reason=reason,
+                **_tool_trace_context(self),
             )
 
             # 触发记忆系统同步 embedding

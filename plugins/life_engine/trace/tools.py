@@ -30,9 +30,10 @@ def _get_workspace(plugin: Any) -> Path:
 
 
 def _record_summary(record: LifeTraceRecord) -> dict[str, Any]:
-    return {
+    data: dict[str, Any] = {
         "trace_id": record.trace_id,
         "timestamp": record.timestamp,
+        "kind": record.kind,
         "path": record.path,
         "operation": record.operation,
         "tool_name": record.tool_name,
@@ -43,15 +44,21 @@ def _record_summary(record: LifeTraceRecord) -> dict[str, Any]:
         "before_size": record.before_size,
         "after_size": record.after_size,
     }
+    if record.summary:
+        data["summary"] = record.summary
+    if record.stream_id:
+        data["stream_id"] = record.stream_id
+    return data
 
 
 class LifeTraceRecentChangesTool(BaseTool):
-    """查看最近文件追溯记录。"""
+    """查看长河最近的留痕。"""
 
     tool_name: str = "nucleus_trace_recent_changes"
     tool_description: str = (
-        "查看私人工作空间最近的文件修改追溯。"
-        "用于回答“最近改过什么”“SOUL/TOOLS/MEMORY 是什么时候变的”等问题。"
+        "查看你的长河里最近的留痕——文件修改、意图归宿、闭合的思考流、承接的好奇。"
+        "用于回答“最近改过什么”“SOUL 是什么时候变的”“我最近形成过哪些意向”等问题。"
+        "kind 可过滤：file_change / intent / thought_stream / curiosity。"
     )
     chatter_allow: list[str] = _TRACE_CHATTER_ALLOW
 
@@ -59,11 +66,13 @@ class LifeTraceRecentChangesTool(BaseTool):
         self,
         limit: Annotated[int, "最多返回多少条，默认 10"] = 10,
         path: Annotated[str, "可选：只看某个 workspace 相对路径"] = "",
+        kind: Annotated[str, "可选：只看某类留痕（file_change/intent/thought_stream/curiosity）"] = "",
     ) -> tuple[bool, str | dict]:
         try:
             records = _store(self.plugin).recent(
                 limit=max(1, min(int(limit or 10), 50)),
                 path=path,
+                kind=kind,
             )
         except Exception as exc:  # noqa: BLE001
             return False, f"读取追溯记录失败: {exc}"
@@ -72,6 +81,31 @@ class LifeTraceRecentChangesTool(BaseTool):
             "count": len(records),
             "records": [_record_summary(record) for record in records],
         }
+
+
+class LifeTraceOriginTool(BaseTool):
+    """长河源头：她是从哪里开始的。"""
+
+    tool_name: str = "nucleus_trace_origin"
+    tool_description: str = (
+        "查看你的长河源头与全貌：最早的一条留痕、至今共有多少条、跨越了多少天、"
+        "各类留痕（文件/意图/思考流/好奇）各有多少。"
+        "想知道“我是怎么来的”“我走了多远”时使用。"
+    )
+    chatter_allow: list[str] = _TRACE_CHATTER_ALLOW
+
+    async def execute(self) -> tuple[bool, str | dict]:
+        try:
+            overview = _store(self.plugin).origin()
+        except Exception as exc:  # noqa: BLE001
+            return False, f"读取长河源头失败: {exc}"
+        if not overview.get("total"):
+            return True, {
+                "action": "trace_origin",
+                "total": 0,
+                "note": "长河还没有留痕——你的来路从此刻开始。",
+            }
+        return True, {"action": "trace_origin", **overview}
 
 
 class LifeTraceFileHistoryTool(BaseTool):
@@ -177,6 +211,7 @@ class LifeTracePreviewVersionTool(BaseTool):
 
 LIFE_TRACE_TOOLS = [
     LifeTraceRecentChangesTool,
+    LifeTraceOriginTool,
     LifeTraceFileHistoryTool,
     LifeTraceShowDiffTool,
     LifeTracePreviewVersionTool,
