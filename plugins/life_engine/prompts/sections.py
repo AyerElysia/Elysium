@@ -232,10 +232,86 @@ class SendTargetsSection(HeartbeatSectionProvider):
         return "\n".join(lines)
 
 
+class RiverReflectionSection(HeartbeatSectionProvider):
+    """回望长河：到期时把未沉淀的转折点摆给她，由她决定是否讲述。
+
+    沉淀必须经过她的语言——本段落只呈现素材与邀请，绝不替她总结；
+    低频（min_interval_hours）+ 邀请冷却（invite_cooldown_hours），回望是想起，不是作业。
+    """
+
+    section_id = "river_reflection"
+
+    def enabled(self, ctx: SectionContext) -> bool:
+        narrative_cfg = getattr(ctx.config, "narrative", None)
+        if narrative_cfg is None or getattr(ctx.service, "_workspace_dir", None) is None:
+            return False
+        return bool(getattr(narrative_cfg, "enabled", True)) and bool(
+            getattr(narrative_cfg, "inject_to_heartbeat", True)
+        )
+
+    async def render(self, ctx: SectionContext) -> str | None:
+        from datetime import datetime, timezone
+
+        from ..narrative.store import NarrativeStore, _parse_iso
+        from ..trace.store import LifeTraceStore
+
+        cfg = ctx.config.narrative
+        workspace = ctx.service._workspace_dir()
+        store = NarrativeStore(workspace)
+        state = store.load_state()
+        now = datetime.now(timezone.utc).astimezone()
+
+        last_consolidated = _parse_iso(state.get("last_consolidated_at", ""))
+        if last_consolidated is not None:
+            elapsed_hours = (now - last_consolidated).total_seconds() / 3600.0
+            if elapsed_hours < float(cfg.min_interval_hours):
+                return None
+
+        last_invited = _parse_iso(state.get("last_invited_at", ""))
+        if last_invited is not None:
+            since_invite = (now - last_invited).total_seconds() / 3600.0
+            if since_invite < float(cfg.invite_cooldown_hours):
+                return None
+
+        pending = store.pending_moments(
+            LifeTraceStore(workspace).recent(limit=500)
+        )
+        if len(pending) < int(cfg.min_moments):
+            return None
+
+        store.mark_invited(now=now)
+
+        shown = pending[-int(cfg.max_moments_shown):]
+        lines = [
+            "### 回望长河",
+            "",
+            f"自上次沉淀以来，你的长河里多了 {len(pending)} 条留痕：",
+            "",
+        ]
+        for record in shown:
+            label = record.summary or record.path or record.operation
+            lines.append(f"- {record.timestamp[:16]} [{record.kind}] {label}")
+        if len(pending) > len(shown):
+            lines.append(f"- ……以及更早的 {len(pending) - len(shown)} 条")
+        last_entry = store.last_entry()
+        if last_entry is not None and last_entry.text:
+            snippet = last_entry.text[:80]
+            lines.extend(["", f"上次你写道：「{snippet}」"])
+        lines.extend([
+            "",
+            "如果你愿意回望这段日子，可以用 `nucleus_write_narrative` 写下它对你意味着什么——"
+            "用你自己的话，长短不限。"
+            "如果你觉得没什么值得说的，传 nothing_to_say=true 也同样是一次完整的回望。"
+            "现在不想回望，跳过也很好。",
+        ])
+        return "\n".join(lines)
+
+
 DEFAULT_HEARTBEAT_SECTIONS: list[HeartbeatSectionProvider] = [
     InnerStateSection(),
     ThoughtStreamsSection(),
     CuriositySection(),
     ImpulseSection(),
     SendTargetsSection(),
+    RiverReflectionSection(),
 ]

@@ -213,6 +213,45 @@ class LifeEngineConfig(BaseConfig):
             description="是否在心跳 prompt 中呈现可触达的发送目标列表（主动性的行动空间）。",
         )
 
+    @config_section("narrative")
+    class NarrativeSection(SectionBase):
+        """沉淀器（长河→自我叙事）配置。"""
+
+        enabled: bool = Field(
+            default=True,
+            description="是否启用沉淀器：低频回望长河，由她自己写下叙事。",
+        )
+
+        inject_to_heartbeat: bool = Field(
+            default=True,
+            description="是否在心跳 prompt 中呈现「回望长河」段落（仅在到期时出现）。",
+        )
+
+        min_interval_hours: float = Field(
+            default=20.0,
+            ge=1.0,
+            description="两次沉淀之间的最小间隔小时数——回望是低频的，不是每次心跳的作业。",
+        )
+
+        min_moments: int = Field(
+            default=3,
+            ge=1,
+            description="长河中至少累积多少条未沉淀留痕，才呈现回望邀请。",
+        )
+
+        invite_cooldown_hours: float = Field(
+            default=6.0,
+            ge=0.5,
+            description="回望邀请呈现后，多少小时内不再重复呈现（她有不回应的自由）。",
+        )
+
+        max_moments_shown: int = Field(
+            default=12,
+            ge=1,
+            le=50,
+            description="回望段落最多摆出多少条未沉淀留痕。",
+        )
+
     @config_section("curiosity")
     class CuriositySection(SectionBase):
         """异步好奇层配置。"""
@@ -1046,6 +1085,7 @@ class LifeEngineConfig(BaseConfig):
     runtime_sync: RuntimeSyncSection = Field(default_factory=RuntimeSyncSection)
     drives: DrivesSection = Field(default_factory=DrivesSection)
     autonomy: AutonomySection = Field(default_factory=AutonomySection)
+    narrative: NarrativeSection = Field(default_factory=NarrativeSection)
 
     @field_validator("settings")
     @classmethod
