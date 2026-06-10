@@ -95,3 +95,29 @@ async def test_run_tool_call_runs_concurrently_and_appends_in_call_order() -> No
         "slow",
         "fast",
     ]
+
+
+@pytest.mark.asyncio
+async def test_run_tool_call_binds_tool_runtime_stream_context() -> None:
+    class StreamAwareTool(BaseTool):
+        tool_name = "stream_aware"
+        tool_description = "stream aware"
+
+        async def execute(self) -> tuple[bool, str]:
+            return True, self.get_current_stream_id()
+
+    registry = ToolRegistry()
+    registry.register(StreamAwareTool)
+    response = _FakeResponse()
+
+    result = await run_tool_call(
+        calls=[ToolCall(id="1", name="tool-stream_aware", args={})],
+        response=response,
+        usable_map=registry,
+        trigger_msg=SimpleNamespace(message_id="m1", stream_id="message-stream"),
+        plugin=MagicMock(),
+        stream_id="fallback-stream",
+    )
+
+    assert result == [(True, True)]
+    assert response.payloads[0].content[0].value == "message-stream"

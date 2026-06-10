@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
-from src.core.prompt import SystemReminderInsertType
+from src.core.prompt import SystemReminderConsumeType, SystemReminderInsertType
 
 from .payload import LLMPayload
 from .payload.content import Content, Text
@@ -25,6 +25,8 @@ class RegisteredReminder:
 
     text: str
     insert_type: SystemReminderInsertType
+    consume_type: SystemReminderConsumeType = SystemReminderConsumeType.FOREVER
+    source_key: tuple[str, str, str] | None = None
 
 
 @dataclass(slots=True)
@@ -54,6 +56,7 @@ class LLMContextManager:
     compression_hook: CompressionHook | None = None
     _reminders: list[RegisteredReminder] | None = None
     _reminder_sources: list[RegisteredReminderSource] | None = None
+    _consumed_once_reminder_keys: set[tuple[str, str, str]] = field(default_factory=set)
 
     def validate_for_send(self, payloads: list[LLMPayload]) -> None:
         """在发起 LLM 请求前校验上下文结构。
@@ -119,7 +122,7 @@ class LLMContextManager:
         约束（对对话消息 USER/ASSISTANT/TOOL_RESULT 生效；SYSTEM/TOOL 作为 pinned 不参与链路判断）：
         - TOOL_RESULT 必须紧随带 tool_calls 的 ASSISTANT 之后；
         - 若 ASSISTANT 含 tool_calls，则必须补齐所有对应 call_id 的 TOOL_RESULT；
-        - TOOL_RESULT 之后必须有 ASSISTANT 承接，才能进入下一条 USER。
+        - TOOL_RESULT 之后可以由 ASSISTANT 承接，也可以进入下一条 USER。
 
         Args:
             payloads: 待校验的 payload 列表。
@@ -190,14 +193,10 @@ class LLMContextManager:
                         return
                     _err(f"tool_result 未覆盖全部 tool_call: missing={sorted(missing)}")
 
-                # tool_result 后如果直接进入下一条 USER，是不合法的。
-                # 但 tool_result 作为尾部是合法且常见的（下一条 assistant 将由本次请求生成）。
-                if j < len(convo) and convo[j].role == ROLE.USER:
-                    _err("tool_result 后不能直接跟 user（缺少 assistant 承接）")
-
-                # 若后续还有消息且不是 USER，则必须是 ASSISTANT 才能继续对话。
-                if j < len(convo) and convo[j].role != ROLE.ASSISTANT:
-                    _err("tool_result 后只能是 assistant 或结束")
+                # tool_result 作为尾部是合法且常见的（下一条 assistant 将由本次请求生成）。
+                # 如果工具执行期间插入了新用户消息，也允许直接进入 USER，让调用方及时处理新输入。
+                if j < len(convo) and convo[j].role not in {ROLE.ASSISTANT, ROLE.USER}:
+                    _err("tool_result 后只能是 assistant、user 或结束")
 
                 idx = j
                 continue
@@ -317,7 +316,7 @@ class LLMContextManager:
         """根据插入类型将 reminder 注入目标 USER 消息首段。"""
 
         resolved_reminders, reminder_texts_for_stripping = self._resolve_reminders()
-        if not resolved_reminders:
+        if not resolved_reminders and not reminder_texts_for_stripping:
             return payloads
 
         updated = list(payloads)
@@ -330,14 +329,31 @@ class LLMContextManager:
         last_user_index = user_indices[-1]
         all_reminder_parts = [Text(text) for text in reminder_texts_for_stripping]
         target_parts: dict[int, list[Content | LLMUsable]] = {}
+        seen_targets: set[tuple[int, str]] = set()
+        consumed_now: set[tuple[str, str, str]] = set()
 
         for reminder in resolved_reminders:
+            if (
+                reminder.consume_type == SystemReminderConsumeType.ONCE
+                and reminder.source_key in self._consumed_once_reminder_keys
+            ):
+                continue
+
             target_index = (
                 first_user_index
                 if reminder.insert_type == SystemReminderInsertType.FIXED
                 else last_user_index
             )
-            target_parts.setdefault(target_index, []).append(Text(reminder.text))
+            target_key = (target_index, reminder.text)
+            if target_key not in seen_targets:
+                seen_targets.add(target_key)
+                target_parts.setdefault(target_index, []).append(Text(reminder.text))
+
+            if (
+                reminder.consume_type == SystemReminderConsumeType.ONCE
+                and reminder.source_key is not None
+            ):
+                consumed_now.add(reminder.source_key)
 
         for user_index in user_indices:
             prefix_parts = target_parts.get(user_index, [])
@@ -345,6 +361,7 @@ class LLMContextManager:
             rebuilt = prefix_parts + existing
             updated[user_index] = LLMPayload(ROLE.USER, rebuilt)
 
+        self._consumed_once_reminder_keys.update(consumed_now)
         return updated
 
     def _resolve_reminders(self) -> tuple[list[RegisteredReminder], list[str]]:
@@ -378,6 +395,8 @@ class LLMContextManager:
                         RegisteredReminder(
                             text=text,
                             insert_type=item.insert_type,
+                            consume_type=item.consume_type,
+                            source_key=(source.bucket, item.name, item.render()),
                         )
                     )
                 source.last_rendered_texts = tuple(current_texts)

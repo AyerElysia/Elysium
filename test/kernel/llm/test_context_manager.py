@@ -7,6 +7,7 @@ from typing import Any, cast
 import pytest
 
 from src.core.prompt import (
+    SystemReminderConsumeType,
     SystemReminderInsertType,
     get_system_reminder_store,
     reset_system_reminder_store,
@@ -302,6 +303,35 @@ def test_context_manager_reminder_bucket_refreshes_updated_dynamic_content() -> 
     reset_system_reminder_store()
 
 
+def test_context_manager_once_reminder_bucket_is_consumed_after_injection() -> None:
+    reset_system_reminder_store()
+    store = get_system_reminder_store()
+    store.set(
+        "actor",
+        "notice",
+        "只提醒一次",
+        insert_type=SystemReminderInsertType.DYNAMIC,
+        consume=SystemReminderConsumeType.ONCE,
+    )
+
+    manager = LLMContextManager()
+    payloads: list[LLMPayload] = []
+    manager.reminder_bucket("actor", wrap_with_system_tag=True)
+
+    payloads = manager.add_payload(payloads, LLMPayload(ROLE.USER, Text("第一条")))
+    assert cast(Text, payloads[0].content[0]).text == (
+        "<system_reminder>\n[notice]\n只提醒一次\n</system_reminder>"
+    )
+
+    payloads = manager.add_payload(payloads, LLMPayload(ROLE.ASSISTANT, Text("回复")))
+    payloads = manager.add_payload(payloads, LLMPayload(ROLE.USER, Text("第二条")))
+
+    assert cast(Text, payloads[0].content[0]).text == "第一条"
+    assert cast(Text, payloads[2].content[0]).text == "第二条"
+
+    reset_system_reminder_store()
+
+
 def test_context_manager_defers_missing_tool_result_placeholder_at_tail() -> None:
     manager = LLMContextManager()
     payloads = [LLMPayload(ROLE.USER, Text("帮我调用工具"))]
@@ -386,8 +416,8 @@ def test_context_manager_raises_when_tool_chain_is_broken_by_new_user() -> None:
         manager.add_payload(payloads, LLMPayload(ROLE.USER, Text("继续")))
 
 
-def test_context_manager_raises_when_user_follows_tool_result_without_assistant() -> None:
-    """strict 模式下：TOOL_RESULT 后必须由 ASSISTANT 承接；否则直接报错。"""
+def test_context_manager_allows_user_after_closed_tool_result_chain() -> None:
+    """工具结果已闭合后，允许新 USER 直接接入，避免工具执行期间的新消息被阻塞。"""
     manager = LLMContextManager()
     payloads = [LLMPayload(ROLE.USER, Text("先调用工具"))]
 
@@ -410,5 +440,11 @@ def test_context_manager_raises_when_user_follows_tool_result_without_assistant(
         ),
     )
 
-    with pytest.raises(LLMContextError):
-        manager.add_payload(payloads, LLMPayload(ROLE.USER, Text("继续")))
+    payloads = manager.add_payload(payloads, LLMPayload(ROLE.USER, Text("继续")))
+
+    assert [payload.role for payload in payloads] == [
+        ROLE.USER,
+        ROLE.ASSISTANT,
+        ROLE.TOOL_RESULT,
+        ROLE.USER,
+    ]

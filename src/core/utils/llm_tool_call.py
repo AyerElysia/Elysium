@@ -125,8 +125,14 @@ async def create_llm_usable_execution(
 
     if issubclass(usable_cls, BaseTool):
         instance = usable_cls(plugin=plugin)
-        setattr(instance, "stream_id", stream_id or "")
-        setattr(instance, "trigger_message", message)
+        instance._bind_runtime_context(
+            stream_id=(
+                str(getattr(message, "stream_id", "") or "").strip()
+                if message is not None
+                else str(stream_id or "").strip()
+            ),
+            message=message,
+        )
         if stream_id:
             from src.core.managers.stream_manager import get_stream_manager
 

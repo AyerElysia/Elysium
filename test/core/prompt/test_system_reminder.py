@@ -6,6 +6,7 @@ import pytest
 
 from src.core.prompt.system_reminder import (
     SystemReminderBucket,
+    SystemReminderConsumeType,
     SystemReminderInsertType,
     SystemReminderItem,
     SystemReminderStore,
@@ -62,12 +63,39 @@ def test_store_set_accepts_dynamic_insert_type() -> None:
     assert store.get_items("actor")[0].insert_type == SystemReminderInsertType.DYNAMIC
 
 
+def test_store_set_accepts_once_consume_for_dynamic_reminder() -> None:
+    """dynamic reminder 应支持一次性消费模式。"""
+    store = SystemReminderStore()
+
+    store.set("actor", name="notice", content="A", insert_type="dynamic", consume="once")
+
+    item = store.get_items("actor")[0]
+    assert item.insert_type == SystemReminderInsertType.DYNAMIC
+    assert item.consume_type == SystemReminderConsumeType.ONCE
+
+
 def test_store_set_rejects_invalid_insert_type() -> None:
     """非法 insert_type 应抛出 ValueError。"""
     store = SystemReminderStore()
 
     with pytest.raises(ValueError, match="insert_type 只能是 fixed 或 dynamic"):
         store.set("actor", name="goal", content="A", insert_type="tail")
+
+
+def test_store_set_rejects_once_consume_for_fixed_reminder() -> None:
+    """once 只能用于 dynamic，避免固定前缀被一次性消费后破坏长期身份提示。"""
+    store = SystemReminderStore()
+
+    with pytest.raises(ValueError, match="consume=once 只能与 insert_type=dynamic 组合使用"):
+        store.set("actor", name="goal", content="A", insert_type="fixed", consume="once")
+
+
+def test_store_set_rejects_invalid_consume_type() -> None:
+    """非法 consume 应抛出 ValueError。"""
+    store = SystemReminderStore()
+
+    with pytest.raises(ValueError, match="consume 只能是 forever 或 once"):
+        store.set("actor", name="goal", content="A", consume="daily")
 
 
 def test_store_get_all_in_bucket() -> None:
