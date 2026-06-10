@@ -18,14 +18,48 @@ logger = log_api.get_logger("life_engine.stream_tools")
 StreamAction = Literal["create", "list", "advance", "retire"]
 
 
-def _get_manager() -> ThoughtStreamManager | None:
-    """获取 ThoughtStreamManager 实例。"""
+def _get_service():
     from ..service.registry import get_life_engine_service
 
-    service = get_life_engine_service()
+    return get_life_engine_service()
+
+
+def _get_manager() -> ThoughtStreamManager | None:
+    """获取 ThoughtStreamManager 实例。"""
+    service = _get_service()
     if service is None or service._thought_manager is None:
         return None
     return service._thought_manager
+
+
+def _apply_neuromod_pulse(pulses: dict[str, float], reason: str) -> None:
+    """求知/探索的满足反馈：向调质层施加即时脉冲。
+
+    让"探索是值得的"成为可被身体记住的经验——好奇心回路的奖赏端。
+    失败时静默：满足感缺席不应阻断思考流操作本身。
+    """
+    try:
+        service = _get_service()
+        inner_state = getattr(service, "_inner_state", None) if service else None
+        if inner_state is not None:
+            inner_state.apply_pulse(pulses, reason=reason)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"调质脉冲施加失败: {e}")
+
+
+async def _absorb_curiosity_signal() -> None:
+    """承接当前好奇牵引：刺点已被思考流接住，异步好奇层放下它。"""
+    try:
+        service = _get_service()
+        if service is None:
+            return
+        engine = service._get_curiosity_engine()
+        signal = await engine.load_signal()
+        if signal.active:
+            await engine.clear()
+            logger.info(f"好奇牵引已被思考流承接并放下: {signal.anchor}")
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"承接好奇牵引失败: {e}")
 
 
 class LifeEngineManageThoughtStreamTool(BaseTool):
@@ -37,7 +71,8 @@ class LifeEngineManageThoughtStreamTool(BaseTool):
         "这不是待办事项，而是'我最近一直在琢磨这件事'。"
         "\n\n"
         "**action=create** — 创建新的思考流。遇到有趣的话题、未解答的疑问、或反复出现的想法时使用。"
-        " 参数：title（必填）、reason（为什么感兴趣，可选）"
+        " 参数：title（必填）、reason（为什么感兴趣，可选）、"
+        "absorb_curiosity（若此思考流承接的是当前好奇牵引的刺点，设为 true，承接后牵引会放下）"
         "\n\n"
         "**action=list** — 列出当前活跃的思考流，用于选择接下来想深入哪条线索。"
         " 参数：include_dormant（是否包含休眠中的，默认 false）"
@@ -60,6 +95,7 @@ class LifeEngineManageThoughtStreamTool(BaseTool):
         # create 参数
         title: Annotated[str, "思考流标题（action=create 时必填）"] = "",
         reason: Annotated[str, "为什么这件事引起了你的兴趣（action=create 时可选）"] = "",
+        absorb_curiosity: Annotated[bool, "此思考流是否承接当前好奇牵引的刺点（承接后牵引会放下）"] = False,
         # list 参数
         include_dormant: Annotated[bool, "是否包含休眠中的思考流（action=list 时有效）"] = False,
         # advance 参数
@@ -79,9 +115,12 @@ class LifeEngineManageThoughtStreamTool(BaseTool):
                 if not title or not title.strip():
                     return False, "title 不能为空"
                 ts = manager.create(title=title.strip(), reason=reason.strip())
+                if absorb_curiosity:
+                    await _absorb_curiosity_signal()
                 return True, (
                     f"已创建思考流「{ts.title}」({ts.id})，"
                     f"当前活跃思考流: {len(manager.list_active())}"
+                    + ("；好奇牵引已承接放下" if absorb_curiosity else "")
                 )
 
             if action == "list":
@@ -115,6 +154,12 @@ class LifeEngineManageThoughtStreamTool(BaseTool):
                     thought=thought.strip(),
                     curiosity_delta=curiosity_delta,
                 )
+                if success:
+                    # 探索本身有回报：小幅满足 + 维持求知欲
+                    _apply_neuromod_pulse(
+                        {"contentment": 0.04, "curiosity": 0.02},
+                        reason="thought_stream_advance",
+                    )
                 return success, msg
 
             if action == "retire":
@@ -127,6 +172,13 @@ class LifeEngineManageThoughtStreamTool(BaseTool):
                     new_status=new_status,
                     conclusion=conclusion.strip() if conclusion else "",
                 )
+                if success and new_status == "completed":
+                    # 求知得到满足：带结论的闭合给更强的满足反馈
+                    pulse = 0.10 if conclusion and conclusion.strip() else 0.05
+                    _apply_neuromod_pulse(
+                        {"contentment": pulse},
+                        reason="thought_stream_completed",
+                    )
                 return success, msg
 
             return False, f"未知 action: {action}，请使用 create/list/advance/retire"

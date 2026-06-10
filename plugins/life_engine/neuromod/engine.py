@@ -150,6 +150,18 @@ class ModulatorSystem:
 
         return stimuli
 
+    def apply_pulse(self, name: str, delta: float) -> float | None:
+        """对单个调质施加即时浓度脉冲（带 clamp）。
+
+        与 ODE 慢更新并存：用于事件级反馈（如求知满足、探索回报），
+        模拟相位性多巴胺释放——之后仍会按 tau 向基线回归。
+        """
+        mod = self._mod_map.get(name)
+        if mod is None:
+            return None
+        mod.value = max(0.0, min(1.0, mod.value + delta))
+        return mod.value
+
     def get_state_dict(self) -> dict[str, float]:
         return {m.name: round(m.value, 4) for m in self.modulators}
 
@@ -390,6 +402,16 @@ class InnerStateEngine:
 
     def record_tool_use(self, tool_name: str, date_str: str) -> None:
         self.habits.record_tool_use(tool_name, date_str)
+
+    def apply_pulse(self, pulses: dict[str, float], reason: str = "") -> None:
+        """批量施加调质脉冲。pulses: {modulator_name: delta}。"""
+        applied: dict[str, float] = {}
+        for name, delta in pulses.items():
+            new_value = self.modulators.apply_pulse(name, delta)
+            if new_value is not None:
+                applied[name] = round(new_value, 3)
+        if applied:
+            logger.info(f"调质脉冲已施加 ({reason or 'pulse'}): {applied}")
 
     def format_full_state_for_prompt(self, today_str: str) -> str:
         """生成完整的内在状态 prompt 注入（< 80 tokens）。"""

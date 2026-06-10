@@ -61,6 +61,11 @@ from ..streams.manager import ThoughtStreamManager
 from ..drives.impulse import ImpulseEngine
 from ..drives.rules import DEFAULT_RULES
 from ..curiosity import CuriosityEngine
+from ..prompts.sections import (
+    DEFAULT_HEARTBEAT_SECTIONS,
+    SectionContext,
+    render_heartbeat_sections,
+)
 from ..constants import (
     HEARTBEAT_IDLE_CRITICAL_THRESHOLD,
     HEARTBEAT_IDLE_WARNING_THRESHOLD,
@@ -1495,7 +1500,7 @@ class LifeEngineService(BaseService):
             f"intent_id={intent.intent_id[:12]} "
             f"stream={intent.target_stream_id or '-'}"
         )
-        return {
+        result: dict[str, Any] = {
             "created": True,
             "intent_id": intent.intent_id,
             "kind": intent.kind,
@@ -1506,6 +1511,44 @@ class LifeEngineService(BaseService):
             "target_hint": intent.target_hint,
             "schedule_id": intent.schedule_id,
         }
+        if intent.kind == "speak" and not intent.target_stream_id:
+            # 降级必须有声：不能让她以为表达层会被唤醒而实际只是事件浮现
+            result["note"] = (
+                "未指定目标：到点后这个意向只会以事件形式浮现给心跳，不会唤醒表达层。"
+                "如果你想让它真正交给表达层，可以重新登记并填 target_key 或 target_stream_id。"
+            )
+            targets = await self._list_autonomy_send_targets()
+            if targets:
+                result["available_targets"] = targets
+        return result
+
+    async def _list_autonomy_send_targets(self) -> list[dict[str, str]]:
+        """列出近期可触达的发送目标，供意向登记时参考。"""
+        try:
+            from ..core.send_targets import list_recent_send_targets
+
+            runtime_cfg = getattr(self._cfg(), "runtime_sync", None)
+            targets = await list_recent_send_targets(
+                current_stream_id="",
+                limit=int(getattr(runtime_cfg, "send_targets_limit", 8) or 8),
+                active_window_hours=float(
+                    getattr(runtime_cfg, "send_targets_window_hours", 24.0) or 24.0
+                ),
+            )
+            return [
+                {
+                    "target_key": target.target_key,
+                    "name": target.display_name,
+                    "type": (
+                        f"{target.platform}"
+                        f"{'群聊' if target.chat_type == 'group' else '私聊'}"
+                    ),
+                }
+                for target in targets
+            ]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"列出可发送目标失败: {exc}")
+            return []
 
     async def trigger_autonomy_intent(self, intent_id: str) -> dict[str, Any]:
         """触发到点的自主意向。"""
@@ -2552,11 +2595,23 @@ class LifeEngineService(BaseService):
         else:
             logger.info(f"life_engine 心跳模型回复为空: #{self._state.heartbeat_count}")
 
+    async def _render_heartbeat_sections(self) -> list[str]:
+        """渲染所有心跳注入段落（统一 SectionProvider 协议，见 prompts/sections.py）。"""
+        ctx = SectionContext(
+            service=self,
+            config=self._cfg(),
+            today_str=datetime.now().strftime("%Y-%m-%d"),
+            silence_minutes=self._minutes_since_external_message(),
+            idle_heartbeats=self._state.idle_heartbeat_count,
+        )
+        return await render_heartbeat_sections(DEFAULT_HEARTBEAT_SECTIONS, ctx)
+
     def _build_heartbeat_model_prompt(
         self,
         wake_context: str,
         *,
         memory_maintenance_prompt: str = "",
+        section_texts: list[str] | None = None,
     ) -> str:
         """构造心跳模型输入。"""
         minutes_since_external = self._minutes_since_external_message()
@@ -2615,65 +2670,10 @@ class LifeEngineService(BaseService):
         # 神经调质层（neuromod）已提供更清晰的驱动状态摘要
         # SNN 仍作为底层信号处理器运行，提供特征提取和奖赏计算
 
-        cfg = self._cfg()
-        if self._inner_state is not None and getattr(cfg, "neuromod", None) is not None:
-            if cfg.neuromod.enabled and cfg.neuromod.inject_to_heartbeat:
-                today_str = datetime.now().strftime("%Y-%m-%d")
-                neuromod_text = self._inner_state.format_full_state_for_prompt(today_str)
-                if neuromod_text:
-                    lines.extend([neuromod_text, ""])
-
-        # 思考流注入（heartbeat 内不分组、不做 delta，因为这是 life 自身上下文）
-        if self._thought_manager is not None:
-            streams_cfg = getattr(cfg, "streams", None)
-            if streams_cfg is None or getattr(streams_cfg, "inject_to_heartbeat", True):
-                focus_window = int(getattr(streams_cfg, "focus_window_minutes", 30) or 30) if streams_cfg else 30
-                streams_body = self._thought_manager.format_for_prompt(
-                    max_items=3,
-                    focus_window_minutes=focus_window,
-                    grouped=False,
-                    mark_delta=False,
-                )
-                if streams_body:
-                    lines.append("### 当前思考流")
-                    lines.extend([streams_body, ""])
-
-        # 冲动建议注入
-        if self._impulse_engine is not None:
-            drives_cfg = getattr(cfg, "drives", None)
-            if drives_cfg is None or getattr(drives_cfg, "inject_to_heartbeat", True):
-                neuromod_state = {}
-                if self._inner_state is not None:
-                    try:
-                        neuromod_state = self._inner_state.get_full_state()
-                    except Exception:  # noqa: BLE001
-                        pass
-                has_urgent_todos = False
-                try:
-                    from ..tools.todo_tools import TodoStorage
-
-                    active_todos = [
-                        todo for todo in TodoStorage(self._workspace_dir()).load()
-                        if todo.status not in {"completed", "cancelled", "archived"}
-                    ]
-                    has_urgent_todos = any(
-                        todo.priority == "urgent" or todo.is_overdue() or todo.needs_review()
-                        for todo in active_todos
-                    )
-                except Exception:  # noqa: BLE001
-                    has_urgent_todos = False
-                context = {
-                    "silence_minutes": minutes_since_external or 0,
-                    "idle_heartbeats": idle_heartbeats,
-                    "has_active_thoughts": bool(self._thought_manager and self._thought_manager.list_active()),
-                    "has_urgent_todos": has_urgent_todos,
-                }
-                suggestions = self._impulse_engine.evaluate(neuromod_state, context)
-                impulse_text = self._impulse_engine.format_for_prompt(
-                    suggestions, neuromod_state, max_items=3
-                )
-                if impulse_text:
-                    lines.extend([impulse_text, ""])
+        # 子系统注入段落（调质/思考流/好奇牵引/冲动/可触达目标等）
+        # 统一由 SectionProvider 协议渲染，见 prompts/sections.py
+        for section_text in section_texts or []:
+            lines.extend([section_text, ""])
 
         if idle_warning:
             lines.extend([idle_warning, ""])
@@ -2724,7 +2724,8 @@ class LifeEngineService(BaseService):
             "只填写 `delay_minutes`，不要填写绝对时间；系统会自动换算真实触发时间。",
             "可用 kind：`speak`（到点交给 life_chatter 重新判断）、`reflect`（到点回到中枢继续想）、`silence`（到点记录选择沉默）。",
             "`speak` 只能写动机、目标提示和约束；不要写最终回复话术，不要教表达层具体怎么说。",
-            "如果知道精确 `stream_id`，可以填 `target_stream_id`；不知道就留空，让意向只进入事件流，不要猜测发送目标。",
+            "`speak` 的目标可以填「你可以触达的人和地方」里列出的 `target_key`，或精确 `target_stream_id`。",
+            "都留空时，意向到点只会以事件浮现给心跳、不会唤醒表达层；不要猜测列表之外的目标。",
             "保持沉默也是主体选择：如果你想确认自己不会打扰，可以登记 `kind=silence`。", "",
             "### 工具边界", "",
             "- `nucleus_search_memory` 是历史检索，不要反复重搜同一主题",
@@ -3082,9 +3083,11 @@ class LifeEngineService(BaseService):
 
         system_prompt = self._build_heartbeat_system_prompt()
         memory_maintenance_prompt = self._build_memory_maintenance_prompt_if_due()
+        section_texts = await self._render_heartbeat_sections()
         user_prompt = self._build_heartbeat_model_prompt(
             wake_context,
             memory_maintenance_prompt=memory_maintenance_prompt,
+            section_texts=section_texts,
         )
         request.add_payload(
             LLMPayload(ROLE.SYSTEM, Text(system_prompt))

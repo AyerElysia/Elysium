@@ -22,7 +22,8 @@ class LifeEngineScheduleAutonomyIntentTool(BaseTool):
         "\n\n"
         "只能填写 delay_minutes，不要填写绝对时间。"
         "speak 只能写 motivation、target_hint 和 constraints，不能写最终回复话术。"
-        "如果知道精确聊天流可填 target_stream_id；否则留空，只让意向进入事件流，不猜测目标。"
+        "speak 的目标可填心跳里看到的 target_key，或精确 target_stream_id；"
+        "都留空时意向到点只会以事件浮现给心跳、不会唤醒表达层，不要猜测列表之外的目标。"
     )
     chatter_allow: list[str] = ["life_engine_internal"]
 
@@ -33,7 +34,7 @@ class LifeEngineScheduleAutonomyIntentTool(BaseTool):
         delay_minutes: Annotated[int, "隔多少分钟后让这个意向重新浮现"],
         target_hint: Annotated[str, "目标提示，例如某个群/私聊/关系对象；不用于直接路由"] = "",
         target_stream_id: Annotated[str, "可选：精确聊天流 ID。speak 到点后会唤醒该流"] = "",
-        target_key: Annotated[str, "可选：近期发送目标 key；通常留空"] = "",
+        target_key: Annotated[str, "可选：心跳里「你可以触达的人和地方」列出的目标 key"] = "",
         constraints: Annotated[list[str] | None, "表达层承接时应知道的约束，不是台词"] = None,
     ) -> tuple[bool, str | dict]:
         service = getattr(self.plugin, "service", None)

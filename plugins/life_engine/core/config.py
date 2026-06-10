@@ -208,6 +208,11 @@ class LifeEngineConfig(BaseConfig):
             description="自主意向允许的最大延迟分钟数。",
         )
 
+        show_targets_in_heartbeat: bool = Field(
+            default=True,
+            description="是否在心跳 prompt 中呈现可触达的发送目标列表（主动性的行动空间）。",
+        )
+
     @config_section("curiosity")
     class CuriositySection(SectionBase):
         """异步好奇层配置。"""
@@ -220,6 +225,11 @@ class LifeEngineConfig(BaseConfig):
         inject_to_chatter: bool = Field(
             default=True,
             description="是否将已完成的好奇牵引注入 life_chatter suffix。",
+        )
+
+        inject_to_heartbeat: bool = Field(
+            default=True,
+            description="是否将好奇牵引注入心跳 prompt，让心跳态可以看到并承接刺点。",
         )
 
         task_name: str = Field(
@@ -1035,6 +1045,7 @@ class LifeEngineConfig(BaseConfig):
     streams: StreamsSection = Field(default_factory=StreamsSection)
     runtime_sync: RuntimeSyncSection = Field(default_factory=RuntimeSyncSection)
     drives: DrivesSection = Field(default_factory=DrivesSection)
+    autonomy: AutonomySection = Field(default_factory=AutonomySection)
 
     @field_validator("settings")
     @classmethod
