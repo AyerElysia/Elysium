@@ -1122,6 +1122,55 @@ class TestOpenAIChatClient:
         assert all(item.get("type") != "image_url" for item in second_content if isinstance(item, dict))
 
     @pytest.mark.asyncio
+    async def test_life_inspect_media_native_image_error_is_preserved_for_chatter_fallback(self):
+        """tool-inspect_media 提升媒体时，不在底层静默删图，让 life_chatter 生成文字观察回退。"""
+        from src.kernel.llm.model_client.openai_client import OpenAIChatClient
+
+        upstream_error = Exception(
+            "Error code: 404 - {'error': {'message': 'No endpoints found that support image input'}}"
+        )
+
+        mock_chat = AsyncMock()
+        mock_chat.completions.create = AsyncMock(side_effect=upstream_error)
+
+        mock_openai_client = MagicMock()
+        mock_openai_client.chat.completions.create = mock_chat.completions.create
+
+        client = OpenAIChatClient()
+        client._clients = {}
+        client._get_client = MagicMock(return_value=mock_openai_client)
+
+        payloads = [
+            LLMPayload(
+                ROLE.USER,
+                [
+                    Text("你刚刚调用了 tool-inspect_media。以下媒体已被提升为原生多模态输入。"),
+                    Image("base64|aGVsbG8="),
+                ],
+            )
+        ]
+        model_set = {
+            "api_key": "test-key",
+            "base_url": None,
+            "timeout": None,
+            "max_tokens": None,
+            "temperature": None,
+            "extra_params": {},
+        }
+
+        with pytest.raises(Exception, match="No endpoints found that support image input"):
+            await client.create(
+                model_name="mimo-v2.5-pro",
+                payloads=payloads,
+                tools=[],
+                request_name="life_chatter",
+                model_set=model_set,
+                stream=False,
+            )
+
+        assert mock_chat.completions.create.await_count == 1
+
+    @pytest.mark.asyncio
     async def test_create_stream_retries_without_native_image_when_endpoint_lacks_image_support(self):
         """流式图片输入不被支持时，也应自动去掉图片块并重试。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient

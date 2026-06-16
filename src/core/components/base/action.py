@@ -368,7 +368,11 @@ class BaseAction(ABC, LLMUsable):
         raw = str(sender_id or "").strip()
         if not raw:
             return False
-        return raw in {"life_engine_nucleus", "system"} or raw.startswith("life_engine_")
+        return (
+            raw in {"life_engine_nucleus", "system"}
+            or raw.startswith("life_engine_")
+            or raw.startswith(("p-", "g-"))
+        )
 
     @classmethod
     def _is_internal_message(cls, message: "Message | None") -> bool:
@@ -417,6 +421,9 @@ class BaseAction(ABC, LLMUsable):
         if self._is_internal_sender_id(context_target_user_id):
             context_target_user_id = None
 
+        if self._is_internal_sender_id(extra_target_user_id):
+            extra_target_user_id = None
+
         if not target_user_id:
             target_user_id = context_target_user_id
 
@@ -425,7 +432,10 @@ class BaseAction(ABC, LLMUsable):
             target_user_name = extra_target_user_name or target_user_name
 
         if not target_user_id and last_msg and not self._is_internal_message(last_msg):
-            target_user_id = str(getattr(last_msg, "sender_id", "") or "").strip() or None
+            last_sender_id = str(getattr(last_msg, "sender_id", "") or "").strip() or None
+            if self._is_internal_sender_id(last_sender_id):
+                last_sender_id = None
+            target_user_id = last_sender_id
             target_user_name = str(getattr(last_msg, "sender_name", "") or "").strip() or None
 
         return target_user_id, target_user_name

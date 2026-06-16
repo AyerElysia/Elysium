@@ -141,6 +141,53 @@ _CONTEXT_COMPRESSION_MAX_GROUPS = 12
 _CONTEXT_COMPRESSION_MAX_PART_CHARS = 360
 
 
+def _is_native_multimodal_unsupported_error(error: BaseException) -> bool:
+    """判断异常是否属于当前模型/端点不支持原生多模态输入。"""
+
+    parts: list[str] = []
+    cursor: BaseException | None = error
+    seen: set[int] = set()
+    while cursor is not None and id(cursor) not in seen:
+        seen.add(id(cursor))
+        parts.append(type(cursor).__name__.lower())
+        parts.append(str(cursor).lower())
+        cursor = cursor.__cause__ or cursor.__context__
+
+    haystack = " ".join(parts)
+    exact_markers = (
+        "no endpoints found that support image input",
+        "no endpoint found that support image input",
+    )
+    if any(marker in haystack for marker in exact_markers):
+        return True
+
+    media_markers = (
+        "image input",
+        "image_url",
+        "input_image",
+        "vision",
+        "audio input",
+        "audio_url",
+        "input_audio",
+        "video input",
+        "video_url",
+        "input_video",
+        "multimodal",
+    )
+    unsupported_markers = (
+        "not support",
+        "not supported",
+        "does not support",
+        "unsupported",
+        "isn't supported",
+        "is not supported",
+        "no endpoints",
+    )
+    return any(marker in haystack for marker in media_markers) and any(
+        marker in haystack for marker in unsupported_markers
+    )
+
+
 def push_runtime_assistant_injection(
     stream_id: str,
     content: str,
@@ -1801,16 +1848,143 @@ class LifeChatter(BaseChatter):
         return LifeInspectMediaTool._build_promoted_content(promoted)
 
     @staticmethod
-    def _append_promoted_media_payload(response: Any, stream_id: str) -> bool:
+    def _append_promoted_media_payload(response: Any, stream_id: str) -> list[_PromotedNativeMedia]:
         """把已提升媒体追加为 USER payload，并补齐 TOOL_RESULT 后的 assistant 承接。"""
 
-        promoted_media_content = LifeChatter._consume_promoted_media_content(stream_id)
-        if not promoted_media_content:
-            return False
+        promoted = LifeInspectMediaTool._consume_promoted_media(stream_id)
+        if not promoted:
+            return []
+        promoted_media_content = LifeInspectMediaTool._build_promoted_content(promoted)
         if LifeChatter._has_tool_result_tail(response):
             response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
         response.add_payload(LLMPayload(ROLE.USER, promoted_media_content))
-        return True
+        return promoted
+
+    @staticmethod
+    def _snapshot_payloads(response: Any) -> list[LLMPayload]:
+        payloads = getattr(response, "payloads", None)
+        if not isinstance(payloads, list):
+            return []
+        snapshot: list[LLMPayload] = []
+        for payload in payloads:
+            role = getattr(payload, "role", None)
+            content = list(getattr(payload, "content", []) or [])
+            if role is not None:
+                snapshot.append(LLMPayload(role, content))
+        return snapshot
+
+    @staticmethod
+    def _restore_payloads(response: Any, payloads_snapshot: list[LLMPayload]) -> None:
+        if hasattr(response, "payloads"):
+            response.payloads = [
+                LLMPayload(payload.role, list(payload.content))
+                for payload in payloads_snapshot
+            ]
+
+    @staticmethod
+    def _format_promoted_media_fallback_header() -> str:
+        return (
+            "你刚刚调用了 tool-inspect_media，但当前对话模型不支持原生多模态输入。"
+            "系统已改用全模态/媒体观察模型生成文字观察结果，并把结果回灌给你。\n"
+            "请基于下面的观察结果继续判断；不要声称你无法查看这条媒体，也不要说是子代理在替你回复。"
+        )
+
+    @staticmethod
+    async def _recognize_promoted_media_for_fallback(
+        promoted: _PromotedNativeMedia,
+    ) -> str | None:
+        selected = promoted.selected
+        try:
+            from src.core.managers.media_manager import get_media_manager
+
+            manager = get_media_manager()
+            if selected.kind == "audio":
+                return await manager.recognize_voice(
+                    {
+                        "base64": selected.data_for_native,
+                        "mime_type": selected.mime_type,
+                        "filename": str(getattr(selected.message, "message_id", "") or "audio"),
+                    },
+                    use_cache=True,
+                )
+            if selected.kind == "video":
+                return await manager.recognize_video(
+                    {
+                        "base64": selected.data_for_native,
+                        "mime_type": selected.mime_type,
+                        "filename": str(getattr(selected.message, "message_id", "") or "video"),
+                    },
+                    use_cache=True,
+                )
+
+            media_type = "emoji" if selected.original_type == "emoji" else "image"
+            return await manager.recognize_media(
+                selected.data_for_native,
+                media_type,
+                use_cache=True,
+            )
+        except Exception as exc:
+            logger.warning(f"媒体观察文字回退失败: {exc}", exc_info=True)
+            return None
+
+    @classmethod
+    async def _build_promoted_media_fallback_text(
+        cls,
+        promoted_items: list[_PromotedNativeMedia],
+    ) -> str:
+        lines: list[str] = [cls._format_promoted_media_fallback_header()]
+
+        for index, promoted in enumerate(promoted_items, start=1):
+            selected = promoted.selected
+            message_id = str(getattr(selected.message, "message_id", "") or "unknown")
+            sender = str(
+                getattr(selected.message, "sender_name", "")
+                or getattr(selected.message, "sender_id", "")
+                or "unknown"
+            )
+            observed_text = await cls._recognize_promoted_media_for_fallback(promoted)
+            if not observed_text:
+                observed_text = str(
+                    getattr(selected.message, "processed_plain_text", "") or ""
+                ).strip()
+            if not observed_text:
+                observed_text = "媒体观察模型未能生成可靠描述；请只基于已知上下文保守回应。"
+
+            lines.extend(
+                [
+                    "",
+                    f"## 媒体观察结果 {index}",
+                    f"- 类型：{selected.kind} / {selected.original_type or selected.kind}",
+                    f"- 消息ID：{message_id}",
+                    f"- 发送者：{sender}",
+                    f"- 关注点：{promoted.focus}",
+                    f"- 详细程度：{promoted.detail_level}",
+                    f"- 观察结果：{observed_text}",
+                ]
+            )
+
+        return "\n".join(lines)
+
+    @classmethod
+    async def _retry_model_turn_with_promoted_media_fallback(
+        cls,
+        rt: _WorkflowRuntime,
+        promoted_items: list[_PromotedNativeMedia],
+        payloads_before_media: list[LLMPayload],
+        suffix_context_text: str,
+    ) -> Any:
+        cls._restore_payloads(rt.response, payloads_before_media)
+
+        fallback_text = await cls._build_promoted_media_fallback_text(promoted_items)
+        if cls._has_tool_result_tail(rt.response):
+            rt.response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
+        rt.response.add_payload(LLMPayload(ROLE.USER, Text(fallback_text)))
+        cls._append_suffix_context(rt.response, suffix_context_text)
+
+        response = await rt.response.send(stream=False)
+        cls._strip_suffix_context(response)
+        await response
+        return response
 
     def _compose_unread_user_content(
         self,
@@ -2210,6 +2384,37 @@ class LifeChatter(BaseChatter):
                     return
 
     @staticmethod
+    def _ensure_unique_tool_call_ids(call_list: list[Any]) -> None:
+        """保证同一轮模型返回的 tool_call id 唯一，避免 ToolResult.call_id 冲突。"""
+        seen: set[str] = set()
+        for index, call in enumerate(call_list, start=1):
+            raw_id = str(getattr(call, "id", "") or "").strip()
+            if raw_id and raw_id not in seen:
+                seen.add(raw_id)
+                continue
+
+            base = raw_id or "tooluse"
+            safe_name = re.sub(r"[^a-zA-Z0-9_]+", "_", str(getattr(call, "name", "") or "tool"))
+            new_id = f"{base}_{safe_name}_{index}"
+            suffix = 1
+            while new_id in seen:
+                suffix += 1
+                new_id = f"{base}_{safe_name}_{index}_{suffix}"
+            try:
+                object.__setattr__(call, "id", new_id)
+                logger.warning(
+                    "检测到重复或缺失的 tool_call id，已重写: "
+                    f"old={raw_id or '<empty>'}, new={new_id}, name={getattr(call, 'name', '')}"
+                )
+            except Exception:
+                logger.warning(
+                    "检测到重复或缺失的 tool_call id，但重写失败: "
+                    f"old={raw_id or '<empty>'}, name={getattr(call, 'name', '')}",
+                    exc_info=True,
+                )
+            seen.add(str(getattr(call, "id", "") or new_id))
+
+    @staticmethod
     def _normalize_tool_execution_results(
         raw_results: object,
         expected_count: int,
@@ -2433,12 +2638,13 @@ class LifeChatter(BaseChatter):
 
             # ── MODEL_TURN / FOLLOW_UP ───────────────────
             if rt.phase in (_Phase.MODEL_TURN, _Phase.FOLLOW_UP):
+                payloads_before_media = self._snapshot_payloads(rt.response)
                 if rt.phase == _Phase.MODEL_TURN:
                     self._append_suffix_context(
                         rt.response,
                         rt.pending_transient_context_text,
                     )
-                self._append_promoted_media_payload(rt.response, stream_id)
+                promoted_media_items = self._append_promoted_media_payload(rt.response, stream_id)
                 try:
                     async def _send_and_collect_response() -> Any:
                         response = await rt.response.send(stream=False)
@@ -2451,28 +2657,55 @@ class LifeChatter(BaseChatter):
                     )
                     self._strip_suffix_context(rt.response)
 
-                    if rt.phase == _Phase.MODEL_TURN:
-                        if rt.unread_msgs_to_flush:
-                            await self.flush_unreads(rt.unread_msgs_to_flush)
-                        rt.unread_msgs_to_flush = []
-                        if service is not None and rt.pending_life_context_high_water > 0:
-                            await service.mark_chatter_runtime_context_seen(
-                                chat_stream.stream_id,
-                                rt.pending_life_context_high_water,
-                                unified_chatter_context=True,
-                            )
-                            await service._save_runtime_context()
-                        rt.pending_life_context_high_water = 0
-                        rt.pending_transient_context_text = ""
-                        # 媒体去重只用于失败重试时防止同一轮重复 append。
-                        # 成功进入下一轮后允许 history 中的图片重新作为原生视觉输入注入。
-                        rt.media_seen.clear()
-
                 except Exception as error:
                     self._strip_suffix_context(rt.response)
-                    logger.error(f"LLM 请求失败: {error}", exc_info=True)
-                    self._transition(rt, _Phase.WAIT_USER, "request failed")
-                    return Failure("LLM 请求失败", error)
+                    if promoted_media_items and _is_native_multimodal_unsupported_error(error):
+                        logger.warning(
+                            "当前模型不支持原生多模态输入，改用媒体观察文字结果重试: "
+                            f"{error}"
+                        )
+                        try:
+                            rt.response = await self._await_with_watchdog_keepalive(
+                                self._retry_model_turn_with_promoted_media_fallback(
+                                    rt,
+                                    promoted_media_items,
+                                    payloads_before_media,
+                                    rt.pending_transient_context_text
+                                    if rt.phase == _Phase.MODEL_TURN
+                                    else "",
+                                )
+                            )
+                            self._strip_suffix_context(rt.response)
+                        except Exception as fallback_error:
+                            self._strip_suffix_context(rt.response)
+                            logger.error(
+                                "LLM 请求失败，媒体观察文字回退重试也失败: "
+                                f"{fallback_error}",
+                                exc_info=True,
+                            )
+                            self._transition(rt, _Phase.WAIT_USER, "request failed")
+                            return Failure("LLM 请求失败", fallback_error)
+                    else:
+                        logger.error(f"LLM 请求失败: {error}", exc_info=True)
+                        self._transition(rt, _Phase.WAIT_USER, "request failed")
+                        return Failure("LLM 请求失败", error)
+
+                if rt.phase == _Phase.MODEL_TURN:
+                    if rt.unread_msgs_to_flush:
+                        await self.flush_unreads(rt.unread_msgs_to_flush)
+                    rt.unread_msgs_to_flush = []
+                    if service is not None and rt.pending_life_context_high_water > 0:
+                        await service.mark_chatter_runtime_context_seen(
+                            chat_stream.stream_id,
+                            rt.pending_life_context_high_water,
+                            unified_chatter_context=True,
+                        )
+                        await service._save_runtime_context()
+                    rt.pending_life_context_high_water = 0
+                    rt.pending_transient_context_text = ""
+                    # 媒体去重只用于失败重试时防止同一轮重复 append。
+                    # 成功进入下一轮后允许 history 中的图片重新作为原生视觉输入注入。
+                    rt.media_seen.clear()
 
                 self._transition(rt, _Phase.TOOL_EXEC, "model responded")
                 continue
@@ -2527,6 +2760,7 @@ class LifeChatter(BaseChatter):
                     self._transition(rt, _Phase.WAIT_USER, "no call_list")
                     return Wait()
 
+                self._ensure_unique_tool_call_ids(call_list)
                 logger.info(f"本轮调用: {[c.name for c in call_list]}")
 
                 should_wait = False

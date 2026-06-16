@@ -263,6 +263,28 @@ def _messages_contain_native_image(messages: list[dict[str, Any]]) -> bool:
     return False
 
 
+def _messages_contain_life_inspect_media_promotion(messages: list[dict[str, Any]]) -> bool:
+    """检查是否是 life_chatter 的按需媒体观察提升请求。"""
+
+    marker = "tool-inspect_media"
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, str):
+            if marker in content:
+                return True
+            continue
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if isinstance(item, str) and marker in item:
+                return True
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str) and marker in text:
+                    return True
+    return False
+
+
 def _is_native_video_message_item(item: Any) -> bool:
     """判断单个 content item 是否承载原生视频输入。"""
     if not isinstance(item, dict):
@@ -1192,6 +1214,7 @@ class OpenAIChatClient:
         messages, openai_tools = _payloads_to_openai_messages(payloads)
         has_native_video = _messages_contain_native_video(messages)
         has_native_image = _messages_contain_native_image(messages)
+        preserve_native_multimodal_errors = _messages_contain_life_inspect_media_promotion(messages)
         tool_call_compat = bool(model_set.get("tool_call_compat", False))
 
         if tool_call_compat and openai_tools:
@@ -1275,6 +1298,7 @@ class OpenAIChatClient:
                 openai_tools=openai_tools,
                 has_native_video=has_native_video,
                 has_native_image=has_native_image,
+                preserve_native_multimodal_errors=preserve_native_multimodal_errors,
                 api_key=api_key,
                 base_url=base_url,
                 timeout=timeout,
@@ -1295,6 +1319,7 @@ class OpenAIChatClient:
             params=params,
             has_native_video=has_native_video,
             has_native_image=has_native_image,
+            preserve_native_multimodal_errors=preserve_native_multimodal_errors,
         )
         return (
             message_content,
@@ -1313,6 +1338,7 @@ class OpenAIChatClient:
         openai_tools: list[dict[str, Any]],
         has_native_video: bool,
         has_native_image: bool,
+        preserve_native_multimodal_errors: bool,
         api_key: str,
         base_url: str | None,
         timeout: float | None,
@@ -1345,7 +1371,11 @@ class OpenAIChatClient:
         try:
             resp = await client.chat.completions.create(**params)
         except Exception as e:
-            if has_native_video and _is_native_video_unsupported_error(e):
+            if (
+                has_native_video
+                and not preserve_native_multimodal_errors
+                and _is_native_video_unsupported_error(e)
+            ):
                 fallback_params = dict(params)
                 original_messages = fallback_params.get("messages")
                 if isinstance(original_messages, list):
@@ -1361,7 +1391,11 @@ class OpenAIChatClient:
                         raise
                 else:
                     raise
-            elif has_native_image and _is_native_image_unsupported_error(e):
+            elif (
+                has_native_image
+                and not preserve_native_multimodal_errors
+                and _is_native_image_unsupported_error(e)
+            ):
                 fallback_params = dict(params)
                 original_messages = fallback_params.get("messages")
                 if isinstance(original_messages, list):
@@ -1424,6 +1458,7 @@ class OpenAIChatClient:
         params: dict[str, Any],
         has_native_video: bool,
         has_native_image: bool,
+        preserve_native_multimodal_errors: bool,
     ) -> tuple[None, None, AsyncIterator[StreamEvent], None]:
         """执行流式聊天请求并返回事件迭代器。
 
@@ -1437,7 +1472,11 @@ class OpenAIChatClient:
         try:
             stream_resp = await client.chat.completions.create(**params, stream=True)
         except Exception as e:
-            if has_native_video and _is_native_video_unsupported_error(e):
+            if (
+                has_native_video
+                and not preserve_native_multimodal_errors
+                and _is_native_video_unsupported_error(e)
+            ):
                 fallback_params = dict(params)
                 original_messages = fallback_params.get("messages")
                 if isinstance(original_messages, list):
@@ -1453,7 +1492,11 @@ class OpenAIChatClient:
                         raise
                 else:
                     raise
-            elif has_native_image and _is_native_image_unsupported_error(e):
+            elif (
+                has_native_image
+                and not preserve_native_multimodal_errors
+                and _is_native_image_unsupported_error(e)
+            ):
                 fallback_params = dict(params)
                 original_messages = fallback_params.get("messages")
                 if isinstance(original_messages, list):

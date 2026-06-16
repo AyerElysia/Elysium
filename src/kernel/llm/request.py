@@ -411,6 +411,19 @@ class LLMRequest:
                         )
                         for tc in tool_calls
                     ]
+
+                if not stream and stream_iter is not None:
+                    collect_stream = resp.precollect_stream_for_non_stream()
+                    if (
+                        isinstance(timeout_seconds, (int, float))
+                        and timeout_seconds > 0
+                    ):
+                        await asyncio.wait_for(
+                            collect_stream,
+                            timeout=float(timeout_seconds),
+                        )
+                    else:
+                        await collect_stream
                 resp.attach_to_inspector()
 
                 # 记录成功指标

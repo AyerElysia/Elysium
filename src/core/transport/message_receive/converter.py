@@ -54,6 +54,17 @@ _MESSAGE_INIT_KEYS = {
 }
 
 
+def _is_internal_target_id(value: Any) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    return (
+        raw in {"life_engine_nucleus", "system"}
+        or raw.startswith("life_engine_")
+        or raw.startswith(("p-", "g-"))
+    )
+
+
 # ──────────────────────────────────────────────
 #  段解析返回结构
 # ──────────────────────────────────────────────
@@ -290,6 +301,8 @@ class MessageConverter:
             seg_list.insert(0, {"type": "at", "data": str(at_user_id)})
 
         target_user_id = message.extra.get("target_user_id")
+        if _is_internal_target_id(target_user_id):
+            target_user_id = None
         target_user_name = message.extra.get("target_user_name")
 
         stream_info: dict[str, Any] | None = None
@@ -316,7 +329,9 @@ class MessageConverter:
         # 最后兜底：使用 sender_id，但跳过 life_engine 内部虚拟发送者
         # （如 "life_engine_nucleus"、"life_schedule" 等），避免下游 int() 转换失败
         if not target_user_id and not message.extra.get("is_life_engine_wake"):
-            target_user_id = message.sender_id
+            fallback_sender_id = str(message.sender_id or "").strip()
+            if not _is_internal_target_id(fallback_sender_id):
+                target_user_id = fallback_sender_id
         if not target_user_name:
             target_user_name = message.sender_name
         user_info_dict: dict[str, Any] = {

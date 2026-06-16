@@ -65,3 +65,37 @@ async def test_message_to_envelope_private_target_prefers_stream_person(monkeypa
     assert user_info.get("user_nickname") == "NeoBot"
     fake_stream_manager.get_stream_info.assert_awaited_once_with("stream-private-1")
     helper.person_crud.get_by.assert_awaited_once_with(person_id="hash_person_888")
+
+
+@pytest.mark.asyncio
+async def test_message_to_envelope_private_target_drops_internal_route_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """内部 p-/g- 路由 key 不能作为平台私聊 user_id 传给适配器。"""
+    converter = MessageConverter()
+
+    fake_stream_manager = SimpleNamespace(get_stream_info=AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        "src.core.managers.stream_manager.get_stream_manager",
+        lambda: fake_stream_manager,
+    )
+
+    message = Message(
+        message_id="m3",
+        content="hello",
+        message_type=MessageType.TEXT,
+        sender_id="p-5750ede8",
+        sender_name="NeoBot",
+        platform="qq",
+        chat_type="private",
+        stream_id="stream-private-2",
+        target_user_id="p-5750ede8",
+    )
+
+    envelope = await converter.message_to_envelope(message)
+
+    message_info = envelope.get("message_info")
+    assert isinstance(message_info, dict)
+    user_info = message_info.get("user_info")
+    assert isinstance(user_info, dict)
+    assert user_info.get("user_id") is None

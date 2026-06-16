@@ -211,6 +211,43 @@ class LLMResponse:
 
         return self.message
 
+    async def precollect_stream_for_non_stream(self) -> None:
+        """预先收集强制流式响应，但不标记 consumed，也不追加到上下文。
+
+        用于 LLMRequest.send(stream=False) 遇到 force_stream_mode 模型时，
+        让流读取错误仍发生在请求重试循环内部。调用成功后，上层仍可正常
+        ``await response``，此时会按非流式响应追加上下文。
+        """
+        if self._stream is None:
+            return
+        if self._consumed:
+            raise LLMResponseConsumedError("Response has already been consumed.")
+
+        full_content: list[str] = []
+        tool_acc = _ToolCallAccumulator()
+        reasoning_acc = _ReasoningBlockAccumulator()
+        stream_error: Exception | None = None
+        try:
+            async for event in self._stream:
+                if event.text_delta:
+                    full_content.append(event.text_delta)
+                if event.reasoning_block_type or event.reasoning_delta or event.reasoning_signature_delta:
+                    reasoning_acc.apply(event)
+                if event.tool_name or event.tool_args_delta or event.tool_call_id:
+                    tool_acc.apply(event)
+        except Exception as e:
+            stream_error = e
+
+        self.message = "".join(full_content)
+        self.reasoning_parts = reasoning_acc.finalize() or self.reasoning_parts
+        if self.reasoning_parts and not self.reasoning_content:
+            self.reasoning_content = "".join(part.text for part in self.reasoning_parts) or None
+        self.call_list = tool_acc.finalize()
+        self._maybe_apply_tool_call_compat()
+        self._stream = None
+
+        if stream_error is not None:
+            raise stream_error
 
     def _maybe_append_response_to_context(self) -> None:
         """如果启用了自动追加响应到上下文，并且当前响应有内容，则将其作为新的 ASSISTANT 消息追加到 payloads 中，供后续请求使用。"""

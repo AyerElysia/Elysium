@@ -47,6 +47,35 @@ def test_is_think_only_calls_false_for_mixed_actions() -> None:
     assert LifeChatter._is_think_only_calls(calls) is False
 
 
+def test_ensure_unique_tool_call_ids_rewrites_duplicates() -> None:
+    calls = [
+        ToolCall(id="tooluse_same", name="action-think", args={}),
+        ToolCall(id="tooluse_same", name="action-life_send_text", args={"content": "hi"}),
+        ToolCall(id=None, name="action-life_send_text", args={"content": "again"}),
+    ]
+
+    LifeChatter._ensure_unique_tool_call_ids(calls)
+
+    ids = [call.id for call in calls]
+    assert ids[0] == "tooluse_same"
+    assert len(set(ids)) == len(ids)
+    assert ids[1] != "tooluse_same"
+    assert ids[2]
+
+    manager = LLMContextManager()
+    payloads = manager.add_payload([], LLMPayload(ROLE.USER, Text("run tools")))
+    payloads = manager.add_payload(payloads, LLMPayload(ROLE.ASSISTANT, calls))
+    for call in calls:
+        payloads = manager.add_payload(
+            payloads,
+            LLMPayload(
+                ROLE.TOOL_RESULT,
+                ToolResult(value="ok", call_id=call.id, name=call.name),
+            ),
+        )
+    manager.validate_for_send(payloads)
+
+
 def test_append_think_only_retry_instruction_adds_user_payload() -> None:
     response = _FakeResponse()
     LifeChatter._append_think_only_retry_instruction(response)
