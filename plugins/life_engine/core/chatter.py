@@ -50,6 +50,9 @@ _T = TypeVar("_T")
 
 # ── 控制流常量 ────────────────────────────────────────────────
 _PASS_AND_WAIT = "action-life_pass_and_wait"
+_SEND_TEXT = "action-life_send_text"
+_SEND_FILE = "action-life_send_file"
+_SEND_EMOJI_MEME = "action-send_emoji_meme"
 _SUSPEND_TEXT = "__SUSPEND__"
 _GLOBAL_RUNTIME_BUSY_RETRY_SECONDS = 1.0
 # 默认 loop 续轮提示：模型未调用任何工具时，轻量引导继续。
@@ -2078,6 +2081,19 @@ class LifeChatter(BaseChatter):
         if LifeChatter._has_tool_result_tail(response):
             response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
         response.add_payload(LLMPayload(ROLE.USER, Text(reminder)))
+
+    @staticmethod
+    def _is_visible_reply_action(call_name: str) -> bool:
+        """判断是否为面向用户的可见回复动作（用于 must_reply 兜底判断）。"""
+        normalized = str(call_name or "").strip().lower()
+        return normalized in {
+            _SEND_TEXT,
+            _SEND_FILE,
+            _SEND_EMOJI_MEME,
+            "action-draw_image",
+            "action-generate_selfie",
+            "action-tts_voice_action",
+        }
 
     @classmethod
     def _is_proactive_trigger_message(cls, message: Message) -> bool:

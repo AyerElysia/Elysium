@@ -9,7 +9,6 @@ from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.core.chatter import (
     LifeChatter,
     _GLOBAL_RUNTIME_BUSY_RETRY_SECONDS,
-    _MAX_MUST_REPLY_RETRIES,
     _Phase,
     _WorkflowRuntime,
 )
@@ -277,8 +276,8 @@ async def test_life_chatter_execute_uses_timed_retry_when_runtime_is_busy(monkey
 
 
 @pytest.mark.asyncio
-async def test_life_chatter_think_only_retry_yields_between_model_turns(monkeypatch) -> None:
-    """think-only 纠偏应跨 tick 继续，避免单个驱动器步进内连续 LLM 请求超时。"""
+async def test_life_chatter_think_only_continues_loop(monkeypatch) -> None:
+    """think-only 是合法轮次，应继续 loop 而不是 retry。"""
 
     LifeChatter.reset_global_runtime()
 
@@ -326,15 +325,14 @@ async def test_life_chatter_think_only_retry_yields_between_model_turns(monkeypa
 
     assert isinstance(result, Success)
     assert rt.phase == _Phase.FOLLOW_UP
-    assert rt.think_only_retry_count == 1
-    assert response.payloads
+    assert rt.follow_up_rounds == 1
 
     LifeChatter.reset_global_runtime()
 
 
 @pytest.mark.asyncio
-async def test_life_chatter_must_reply_retries_empty_tool_turn(monkeypatch) -> None:
-    """应回复轮次不能在空 action 结果下静默收敛。"""
+async def test_life_chatter_empty_turn_continues_loop_until_max_rounds(monkeypatch) -> None:
+    """空 action 轮次默认继续 loop，直到 max_rounds 收束。"""
 
     LifeChatter.reset_global_runtime()
 
@@ -358,6 +356,7 @@ async def test_life_chatter_must_reply_retries_empty_tool_turn(monkeypatch) -> N
         active_stream_id="stream-a",
         must_reply=True,
     )
+    rt.follow_up_rounds = 4
     LifeChatter._GLOBAL_RUNTIME = rt
     LifeChatter._GLOBAL_USABLE_MAP = {}
 
@@ -369,23 +368,22 @@ async def test_life_chatter_must_reply_retries_empty_tool_turn(monkeypatch) -> N
         return [], []
 
     monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+    monkeypatch.setattr(chatter, "_get_max_rounds", lambda: 5)
 
     result = await chatter._drive_global_runtime_until_yield(
         SimpleNamespace(stream_id="stream-a"),
         service=None,
     )
 
-    assert isinstance(result, Success)
-    assert rt.phase == _Phase.FOLLOW_UP
-    assert rt.must_reply_retry_count == 1
-    assert response.payloads
+    assert isinstance(result, Wait)
+    assert rt.phase == _Phase.WAIT_USER
 
     LifeChatter.reset_global_runtime()
 
 
 @pytest.mark.asyncio
-async def test_life_chatter_must_reply_empty_turn_falls_back_after_retries(monkeypatch) -> None:
-    """must_reply 空 action 重试耗尽后，至少发送一条最小可见回应。"""
+async def test_life_chatter_must_reply_fallback_at_max_rounds(monkeypatch) -> None:
+    """must_reply 在 max_rounds 仍未产生可见回复时，发最小兜底。"""
 
     LifeChatter.reset_global_runtime()
 
@@ -414,8 +412,8 @@ async def test_life_chatter_must_reply_empty_turn_falls_back_after_retries(monke
         unread_msgs_to_flush=[],
         active_stream_id="stream-a",
         must_reply=True,
-        must_reply_retry_count=_MAX_MUST_REPLY_RETRIES,
     )
+    rt.follow_up_rounds = 4
     LifeChatter._GLOBAL_RUNTIME = rt
     LifeChatter._GLOBAL_USABLE_MAP = {}
 
@@ -440,6 +438,7 @@ async def test_life_chatter_must_reply_empty_turn_falls_back_after_retries(monke
 
     monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
     monkeypatch.setattr("src.app.plugin_system.api.send_api.send_text", fake_send_text)
+    monkeypatch.setattr(chatter, "_get_max_rounds", lambda: 5)
 
     result = await chatter._drive_global_runtime_until_yield(
         SimpleNamespace(stream_id="stream-a", platform="feishu"),

@@ -1,4 +1,4 @@
-"""life_chatter think-only 约束测试。"""
+"""life_chatter default-loop 行为与工具执行测试。"""
 
 from __future__ import annotations
 
@@ -34,19 +34,6 @@ class _FakeResponse:
         self.payloads.append(payload)
 
 
-def _call(name: str) -> object:
-    return SimpleNamespace(name=name)
-
-
-def test_is_think_only_calls_true_for_single_think() -> None:
-    assert LifeChatter._is_think_only_calls([_call("action-think")]) is True
-
-
-def test_is_think_only_calls_false_for_mixed_actions() -> None:
-    calls = [_call("action-think"), _call("action-life_send_text")]
-    assert LifeChatter._is_think_only_calls(calls) is False
-
-
 def test_ensure_unique_tool_call_ids_rewrites_duplicates() -> None:
     calls = [
         ToolCall(id="tooluse_same", name="action-think", args={}),
@@ -76,54 +63,6 @@ def test_ensure_unique_tool_call_ids_rewrites_duplicates() -> None:
     manager.validate_for_send(payloads)
 
 
-def test_append_think_only_retry_instruction_adds_user_payload() -> None:
-    response = _FakeResponse()
-    LifeChatter._append_think_only_retry_instruction(response)
-
-    assert len(response.payloads) == 1
-    payload = response.payloads[0]
-    assert getattr(payload, "role", None) == ROLE.USER
-
-
-def test_append_plain_text_retry_instruction_adds_user_payload() -> None:
-    response = _FakeResponse()
-
-    LifeChatter._append_plain_text_retry_instruction(
-        response,
-        response_text="The request was rejected because it was considered high risk",
-    )
-
-    assert len(response.payloads) == 1
-    payload = response.payloads[0]
-    assert getattr(payload, "role", None) == ROLE.USER
-    assert payload.content[0].text
-    assert "充实" in payload.content[0].text
-    assert "高风险" in payload.content[0].text or "high risk" in payload.content[0].text
-
-
-def test_append_plain_text_retry_instruction_uses_strict_reminder_on_last_retry() -> None:
-    response = _FakeResponse()
-
-    LifeChatter._append_plain_text_retry_instruction(
-        response,
-        response_text="too vague",
-        retry_count=2,
-    )
-
-    payload = response.payloads[0]
-    assert "最后提醒" in payload.content[0].text
-
-
-def test_should_encourage_segment_send_for_long_single_content() -> None:
-    call_args = {"content": "这是一条比较长的消息" * 8}
-    assert LifeChatter._should_encourage_segment_send("action-life_send_text", call_args) is True
-
-
-def test_should_not_encourage_segment_send_for_newline_segmented_content() -> None:
-    call_args = {"content": "第一段\n第二段"}
-    assert LifeChatter._should_encourage_segment_send("action-life_send_text", call_args) is False
-
-
 def test_life_send_text_normalize_splits_newlines_in_plain_text() -> None:
     result = LifeSendTextAction._normalize_content_segments("第一条\n\n第二条\r\n第三条")
     assert result == ["第一条", "第二条", "第三条"]
@@ -136,9 +75,7 @@ def test_life_send_text_normalize_splits_escaped_newlines_in_string() -> None:
 
 def test_life_send_text_rejects_placeholder_only_content() -> None:
     action = LifeSendTextAction.__new__(LifeSendTextAction)
-
     ok, message = asyncio.run(action.execute("..."))
-
     assert ok is False
     assert "占位符" in message
 
@@ -208,7 +145,6 @@ def test_life_send_file_rejects_oversized_file(tmp_path: Path, monkeypatch: pyte
     monkeypatch.setattr(LifeSendFileAction, "MAX_FILE_BYTES", 1)
 
     ok, message = asyncio.run(action.execute(str(file_path)))
-
     assert ok is False
     assert "文件过大" in message
 
@@ -306,34 +242,8 @@ def test_life_send_file_action_only_registered_with_life_chatter() -> None:
     assert LifeSendFileAction not in disabled_components
 
 
-def test_append_segment_send_retry_instruction_adds_system_payload() -> None:
-    response = _FakeResponse()
-    LifeChatter._append_segment_send_retry_instruction(response)
-
-    assert len(response.payloads) == 1
-    payload = response.payloads[0]
-    assert getattr(payload, "role", None) == ROLE.SYSTEM
-
-
-def test_append_must_reply_retry_instruction_adds_user_payload() -> None:
-    response = _FakeResponse()
-    LifeChatter._append_must_reply_retry_instruction(response)
-
-    assert len(response.payloads) == 1
-    payload = response.payloads[0]
-    assert getattr(payload, "role", None) == ROLE.USER
-
-
-def test_append_inner_monologue_retry_instruction_adds_user_payload() -> None:
-    response = _FakeResponse()
-    LifeChatter._append_inner_monologue_retry_instruction(response)
-
-    assert len(response.payloads) == 1
-    payload = response.payloads[0]
-    assert getattr(payload, "role", None) == ROLE.USER
-
-
-def test_follow_up_retry_instruction_turns_assistant_tail_into_user_turn() -> None:
+def test_follow_up_instruction_turns_assistant_tail_into_user_turn() -> None:
+    """_append_follow_up_user_instruction 应把 TOOL_RESULT 尾部补成合法 USER 轮。"""
     response = _FakeResponse()
     response.add_payload(LLMPayload(ROLE.USER, Text("上一轮用户消息")))
     response.add_payload(
@@ -350,7 +260,7 @@ def test_follow_up_retry_instruction_turns_assistant_tail_into_user_turn() -> No
     )
     response.add_payload(LLMPayload(ROLE.ASSISTANT, Text("__SUSPEND__")))
 
-    LifeChatter._append_must_reply_retry_instruction(response)
+    LifeChatter._append_follow_up_user_instruction(response, "继续")
 
     assert [payload.role for payload in response.payloads] == [
         ROLE.USER,
@@ -380,27 +290,6 @@ def test_visible_reply_action_accepts_emoji_send() -> None:
     assert LifeChatter._is_visible_reply_action("action-life_send_file") is True
     assert LifeChatter._is_visible_reply_action("action-send_emoji_meme") is True
     assert LifeChatter._is_visible_reply_action("action-schedule_followup_message") is False
-
-
-def test_requires_inner_monologue_only_for_proactive_trigger_batch() -> None:
-    proactive = SimpleNamespace(
-        is_proactive_opportunity_trigger=True,
-        is_proactive_followup_trigger=False,
-    )
-    followup = SimpleNamespace(
-        is_proactive_opportunity_trigger=False,
-        is_proactive_followup_trigger=True,
-    )
-    real_user = SimpleNamespace(
-        is_proactive_opportunity_trigger=False,
-        is_proactive_followup_trigger=False,
-    )
-
-    assert LifeChatter._requires_inner_monologue_for_unread_batch([proactive]) is True
-    assert LifeChatter._requires_inner_monologue_for_unread_batch([followup]) is True
-    assert LifeChatter._requires_inner_monologue_for_unread_batch([proactive, followup]) is True
-    assert LifeChatter._requires_inner_monologue_for_unread_batch([real_user]) is False
-    assert LifeChatter._requires_inner_monologue_for_unread_batch([proactive, real_user]) is False
 
 
 def test_should_force_reply_only_for_real_external_messages() -> None:
@@ -447,38 +336,6 @@ def test_should_force_reply_for_decision_when_response_is_accepted() -> None:
         {"should_respond": True, "force_reply": True},
         [proactive],
     ) is False
-
-
-def test_compact_successful_tool_result_only_targets_low_information_actions() -> None:
-    assert LifeChatter._should_compact_successful_tool_result("action-record_inner_monologue") is True
-    assert LifeChatter._should_compact_successful_tool_result("action-life_send_text") is True
-    assert LifeChatter._should_compact_successful_tool_result("action-life_send_file") is True
-    assert LifeChatter._should_compact_successful_tool_result("action-send_emoji_meme") is True
-    assert LifeChatter._should_compact_successful_tool_result("action-think") is True
-    assert LifeChatter._should_compact_successful_tool_result("search_life_memory") is False
-    assert LifeChatter._should_compact_successful_tool_result("agent-life_memory_explorer") is False
-    assert LifeChatter._should_compact_successful_tool_result("nucleus_search_memory") is False
-    assert LifeChatter._should_compact_successful_tool_result("fetch_life_memory") is False
-
-
-def test_compact_successful_tool_result_preserves_other_tool_results() -> None:
-    response = _FakeResponse()
-    response.add_payload(
-        LLMPayload(
-            ROLE.TOOL_RESULT,
-            [
-                ToolResult(value="已发送3条消息: hello", call_id="send-1", name="action-life_send_text"),
-                ToolResult(value="记忆检索结果正文", call_id="memory-1", name="agent-life_memory_explorer"),
-            ],
-        )
-    )
-
-    LifeChatter._compact_successful_tool_result(response, "send-1")
-
-    payload = response.payloads[0]
-    send_result, memory_result = payload.content
-    assert send_result.value == "ok"
-    assert memory_result.value == "记忆检索结果正文"
 
 
 def test_life_tool_parallel_policy_only_allows_safe_reads() -> None:
@@ -543,6 +400,7 @@ def test_life_chatter_blocks_live_bridge_tool_at_execution_time() -> None:
 async def test_life_chatter_run_tool_call_accepts_single_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """单调用结果不再被压缩；值保持原样。"""
     chatter = LifeChatter.__new__(LifeChatter)
     chatter.stream_id = "life-test-stream"
     response = _FakeResponse()
@@ -577,7 +435,7 @@ async def test_life_chatter_run_tool_call_accepts_single_call(
     assert (appended, success) == (True, True)
     assert captured["calls"] == [call]
     payload = response.payloads[0]
-    assert payload.content[0].value == "ok"
+    assert payload.content[0].value == "已发送"
 
 
 @pytest.mark.asyncio
