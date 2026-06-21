@@ -198,6 +198,10 @@ class _WorkflowRuntime:
     pending_life_context_high_water: int = 0
     media_seen: set[str] = field(default_factory=set)
     active_stream_id: str = ""
+    # must_reply: 路由判定需要回复；在 max_rounds 兜底时检查
+    must_reply: bool = False
+    # sent_visible_reply: 本轮 loop 中是否已产生可见回复（跨 follow-up 轮累计）
+    sent_visible_reply: bool = False
 
 
 # ── Actions ───────────────────────────────────────────────────
@@ -2106,102 +2110,57 @@ class LifeChatter(BaseChatter):
         return False
 
     @staticmethod
-    def _is_think_call_name(call_name: str) -> bool:
-        return call_name.strip().lower() in {"action-think", "think"}
+    def _append_follow_up_user_instruction(response: Any, reminder: str) -> None:
+        """为 FOLLOW_UP 续轮注入一个新的 USER 轮次，避免 assistant -> assistant 非法链路。"""
+
+        if LifeChatter._has_tool_result_tail(response):
+            response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
+        response.add_payload(LLMPayload(ROLE.USER, Text(reminder)))
 
     @classmethod
-    def _is_think_only_calls(cls, calls: list[object]) -> bool:
-        if not calls:
+    def _is_proactive_trigger_message(cls, message: Message) -> bool:
+        return bool(
+            cls._message_flag(message, "is_proactive_opportunity_trigger")
+            or cls._message_flag(message, "is_proactive_followup_trigger")
+            or cls._message_flag(message, "is_autonomy_intent_trigger")
+        )
+
+    @classmethod
+    def _should_force_reply_for_unread_batch(cls, unread_msgs: list[Message]) -> bool:
+        for msg in unread_msgs:
+            if cls._is_proactive_trigger_message(msg):
+                continue
+            if str(getattr(msg, "sender_role", "") or "").lower() == "bot":
+                continue
+            return True
+        return False
+
+    @classmethod
+    def _should_force_reply_for_decision(
+        cls,
+        decision: dict[str, Any],
+        unread_msgs: list[Message],
+    ) -> bool:
+        """路由层已判定要响应时，标记需要在 max_rounds 兜底前闭合可见回复。
+
+        路由器只负责判断这批外部消息是否值得接入主对话。一旦它返回
+        should_respond=true，后续主模型可以自由 think / 调用工具 / 多轮，
+        但如果一直到 max_rounds 都没产生可见回复，则发一条最小兜底，
+        避免对外界消息完全沉默。
+        """
+
+        if not bool(decision.get("should_respond", False)):
             return False
-        names: list[str] = []
-        for call in calls:
-            name = str(getattr(call, "name", "") or "")
-            if not name:
+        if "force_reply" in decision:
+            if not bool(decision.get("force_reply", False)):
                 return False
-            names.append(name)
-        return all(cls._is_think_call_name(name) for name in names)
-
-    @classmethod
-    def _extract_last_think_decision(cls, calls: list[object]) -> str:
-        """从 call_list 中提取最后一个 action-think 的 decision 字段。"""
-        for call in reversed(calls):
-            name = str(getattr(call, "name", "") or "")
-            if not cls._is_think_call_name(name):
-                continue
-            args = getattr(call, "args", None)
-            if not isinstance(args, dict):
-                continue
-            decision = str(args.get("decision") or args.get("thought") or "").strip()
-            if decision:
-                return decision
-        return ""
-
-    @staticmethod
-    def _append_think_only_retry_instruction(response: Any, *, retry_count: int = 1) -> None:
-        reminder = (
-            _THINK_ONLY_RETRY_REMINDER_STRICT
-            if retry_count >= _MAX_THINK_ONLY_RETRIES
-            else _THINK_ONLY_RETRY_REMINDER
-        )
-        LifeChatter._append_follow_up_user_instruction(response, reminder)
-        logger.warning("检测到本轮仅调用 action-think，已注入系统阻断提醒并触发重试")
-
-    @staticmethod
-    def _append_plain_text_retry_instruction(
-        response: Any,
-        *,
-        response_text: str,
-        retry_count: int = 1,
-    ) -> None:
-        reminder = (
-            _PLAIN_TEXT_RETRY_REMINDER_STRICT
-            if retry_count >= _MAX_PLAIN_TEXT_RETRIES
-            else _PLAIN_TEXT_RETRY_REMINDER
-        )
-        snippet = str(response_text or "").strip()
-        if len(snippet) > 120:
-            snippet = snippet[:117] + "..."
-        response.add_payload(
-            LLMPayload(
-                ROLE.USER,
-                Text(
-                    f"（上一轮无效纯文本示例：{snippet}）\n{reminder}"
-                    if snippet
-                    else reminder
-                ),
-            )
-        )
-        logger.warning("检测到 life_chatter 返回纯文本，已注入充实回复提醒并触发重试")
-
-    @staticmethod
-    def _should_encourage_segment_send(call_name: str, call_args: dict[str, object]) -> bool:
-        if call_name != _SEND_TEXT:
-            return False
-        content = call_args.get("content")
-        if content is None:
-            return False
-        segments = LifeSendTextAction._normalize_content_segments(content)  # type: ignore[arg-type]
-        if len(segments) != 1:
-            return False
-        text = str(segments[0]).strip()
-        return len(text) >= _SEGMENT_ENCOURAGE_MIN_CHARS
-
-    @staticmethod
-    def _append_segment_send_retry_instruction(response: Any) -> None:
-        response.add_payload(LLMPayload(ROLE.SYSTEM, Text(_SEGMENT_SEND_RETRY_REMINDER)))
-        logger.info("检测到长文本单段发送，已注入分段发送提醒")
-
-    @staticmethod
-    def _append_must_reply_retry_instruction(response: Any) -> None:
-        LifeChatter._append_follow_up_user_instruction(response, _MUST_REPLY_RETRY_REMINDER)
-        logger.warning("检测到应回复轮次却未产生面向用户的回复，已注入强制回复提醒")
+        return cls._should_force_reply_for_unread_batch(unread_msgs)
 
     @staticmethod
     def _build_must_reply_fallback_text(unread_msgs: list[Message]) -> str:
-        """模型连续空 action 时的最小可见回应。
+        """模型在 max_rounds 内未产生可见回复时的最小兜底。
 
-        这里只覆盖已被判定为 must_reply 的外界消息。内容保持短确认，不替模型
-        续写复杂表达，避免把主体性兜底变成规则化代答。
+        内容保持短确认，不替模型续写复杂表达，避免把主体性兜底变成规则化代答。
         """
         latest_text = ""
         if unread_msgs:
@@ -2245,74 +2204,10 @@ class LifeChatter(BaseChatter):
             return False
 
         if ok:
-            logger.warning(f"must_reply 空 action 重试耗尽，已发送最小兜底回复: {content}")
+            logger.warning(f"max_rounds 内未产生可见回复，已发送最小兜底: {content}")
         else:
-            logger.warning("must_reply 空 action 重试耗尽，最小兜底回复发送失败")
+            logger.warning("max_rounds 内未产生可见回复，最小兜底回复发送失败")
         return bool(ok)
-
-    @staticmethod
-    def _append_inner_monologue_retry_instruction(response: Any) -> None:
-        LifeChatter._append_follow_up_user_instruction(response, _INNER_MONOLOGUE_RETRY_REMINDER)
-        logger.warning("主动机会轮次缺少内心独白记录，已注入重试提醒")
-
-    @staticmethod
-    def _append_follow_up_user_instruction(response: Any, reminder: str) -> None:
-        """为 FOLLOW_UP 续轮注入一个新的 USER 轮次，避免 assistant -> assistant 非法链路。"""
-
-        if LifeChatter._has_tool_result_tail(response):
-            response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
-        response.add_payload(LLMPayload(ROLE.USER, Text(reminder)))
-
-    @staticmethod
-    def _is_visible_reply_action(call_name: str) -> bool:
-        normalized = str(call_name or "").strip().lower()
-        return normalized in {
-            _SEND_TEXT,
-            _SEND_FILE,
-            _SEND_EMOJI_MEME,
-            "action-draw_image",
-            "action-generate_selfie",
-            "action-tts_voice_action",
-        }
-
-    @staticmethod
-    def _is_inner_monologue_record_action(call_name: str) -> bool:
-        return str(call_name or "").strip().lower() == _RECORD_INNER_MONOLOGUE
-
-    @classmethod
-    def _requires_inner_monologue_for_unread_batch(cls, unread_msgs: list[Message]) -> bool:
-        return bool(unread_msgs) and all(cls._is_proactive_trigger_message(msg) for msg in unread_msgs)
-
-    @staticmethod
-    def _should_compact_successful_tool_result(call_name: str) -> bool:
-        """仅压缩低信息动作回执，不压缩查询/读取类 tool 结果。"""
-        normalized = str(call_name or "").strip().lower()
-        return normalized in {
-            "action-think",
-            "think",
-            _RECORD_INNER_MONOLOGUE,
-            _SEND_TEXT,
-            _SEND_FILE,
-            _SEND_EMOJI_MEME,
-            _PASS_AND_WAIT,
-        }
-
-    @staticmethod
-    def _compact_successful_tool_result(response: Any, call_id: str | None) -> None:
-        """把低信息 TOOL_RESULT 压成结构占位，避免污染长上下文。"""
-        if not call_id:
-            return
-        payloads = getattr(response, "payloads", None)
-        if not isinstance(payloads, list):
-            return
-
-        for payload in reversed(payloads):
-            if getattr(payload, "role", None) != ROLE.TOOL_RESULT:
-                continue
-            for part in getattr(payload, "content", []) or []:
-                if isinstance(part, ToolResult) and str(part.call_id or "") == str(call_id):
-                    object.__setattr__(part, "value", "ok")
-                    return
 
     @staticmethod
     def _ensure_unique_tool_call_ids(call_list: list[Any]) -> None:
@@ -2642,63 +2537,48 @@ class LifeChatter(BaseChatter):
                 continue
 
             # ── TOOL_EXEC ────────────────────────────────
+            # 新设计：默认继续 loop（FOLLOW_UP），只有显式 pass 才退出。
+            # action / tool 不再区分，统一执行。
             if rt.phase == _Phase.TOOL_EXEC:
                 llm_response = rt.response
 
                 call_list = getattr(llm_response, "call_list", None) or []
                 response_msg = getattr(llm_response, "message", None)
 
+                # 空 call_list：纯文本或空响应，默认继续 loop（当作模型在想）。
                 if not call_list:
                     response_text = str(response_msg or "").strip()
-                    if response_text:
-                        # __SUSPEND__ 是 life_chatter 自己注入的占位符，
-                        # LLM 偶尔会在 tool_call 之外额外输出它，不应视为错误。
-                        if response_text == _SUSPEND_TEXT:
-                            logger.debug("LLM 返回了 __SUSPEND__ 纯文本，视为正常占位，回到等待")
-                        else:
-                            logger.warning(
-                                f"LLM 返回了纯文本而非 tool call: {response_text[:100]}"
-                            )
-                            rt.plain_text_retry_count += 1
-                            self._append_plain_text_retry_instruction(
-                                llm_response,
-                                response_text=response_text,
-                                retry_count=rt.plain_text_retry_count,
-                            )
-                            if rt.plain_text_retry_count <= _MAX_PLAIN_TEXT_RETRIES:
-                                self._transition(rt, _Phase.FOLLOW_UP, "plain-text guard retry")
-                                return Success("plain-text guard retry scheduled")
-                            logger.warning("纯文本回退达到重试上限，本轮回到等待")
-                    else:
-                        rt.plain_text_retry_count = 0
-                    if rt.must_reply and rt.must_reply_retry_count < _MAX_MUST_REPLY_RETRIES:
-                        rt.must_reply_retry_count += 1
-                        self._append_must_reply_retry_instruction(llm_response)
-                        self._transition(rt, _Phase.FOLLOW_UP, "must-reply empty-turn retry")
-                        return Success("must-reply empty-turn retry scheduled")
-                    if rt.must_reply:
-                        logger.warning("应回复轮次返回空 action，达到重试上限，尝试最小兜底回复")
-                        await self._send_must_reply_fallback(chat_stream, rt.unreads)
-                        rt.must_reply = False
-                        rt.must_reply_retry_count = 0
-                    # 不再 yield Stop 销毁生成器：保留累积的 payload 上下文，
-                    # 回到 Wait 等待新消息，避免整个 LLM 对话链被清零。
-                    # 补 ASSISTANT 占位：TOOL_RESULT 尾部必须接 ASSISTANT 才能接 USER。
-                    if self._has_tool_result_tail(llm_response):
-                        llm_response.add_payload(
-                            LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT))
+                    if response_text and response_text != _SUSPEND_TEXT:
+                        logger.info(
+                            f"life_chatter 本轮未调用工具，继续 loop（当作思考/自言自语）: "
+                            f"{response_text[:100]}"
                         )
-                    self._transition(rt, _Phase.WAIT_USER, "no call_list")
-                    return Wait()
+                    else:
+                        logger.debug("life_chatter 本轮空响应，继续 loop")
+
+                    rt.follow_up_rounds += 1
+                    if rt.follow_up_rounds >= max_rounds:
+                        logger.warning(
+                            f"已达最大轮数 ({max_rounds})，未产生可见回复，收束本轮"
+                        )
+                        if rt.must_reply:
+                            await self._send_must_reply_fallback(chat_stream, rt.unreads)
+                            rt.must_reply = False
+                        if self._has_tool_result_tail(llm_response):
+                            llm_response.add_payload(
+                                LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT))
+                            )
+                        self._transition(rt, _Phase.WAIT_USER, "max rounds reached")
+                        return Wait()
+                    self._transition(rt, _Phase.FOLLOW_UP, "empty turn, continue loop")
+                    return Success("follow-up scheduled")
 
                 self._ensure_unique_tool_call_ids(call_list)
                 logger.info(f"本轮调用: {[c.name for c in call_list]}")
 
                 should_wait = False
-                has_pending_tool_results = False
                 seen_sigs: set[str] = set()
                 sent_visible_reply_this_round = False
-                recorded_inner_monologue_this_round = False
                 pending_parallel_calls: list[Any] = []
                 trigger_msg = rt.unreads[-1] if rt.unreads else None
 
@@ -2707,31 +2587,12 @@ class LifeChatter(BaseChatter):
                     appended: bool,
                     success: bool,
                 ) -> None:
-                    nonlocal has_pending_tool_results
                     nonlocal sent_visible_reply_this_round
-                    nonlocal recorded_inner_monologue_this_round
 
                     executed_name = str(getattr(executed_call, "name", "") or "")
-                    executed_args = getattr(executed_call, "args", None)
-                    if (
-                        success
-                        and isinstance(executed_args, dict)
-                        and self._should_encourage_segment_send(executed_name, executed_args)
-                    ):
-                        self._append_segment_send_retry_instruction(llm_response)
-
                     if success and self._is_visible_reply_action(executed_name):
                         sent_visible_reply_this_round = True
                         rt.must_reply = False
-                        rt.must_reply_retry_count = 0
-
-                    if success and self._is_inner_monologue_record_action(executed_name):
-                        recorded_inner_monologue_this_round = True
-                        rt.requires_inner_monologue = False
-                        rt.inner_monologue_retry_count = 0
-
-                    if appended and not executed_name.startswith("action-"):
-                        has_pending_tool_results = True
 
                 async def flush_parallel_calls() -> None:
                     if not pending_parallel_calls:
@@ -2790,21 +2651,9 @@ class LifeChatter(BaseChatter):
                     seen_sigs.add(dedupe_key)
                     rt.cross_round_seen_signatures.add(dedupe_key)
 
-                    # pass_and_wait
+                    # pass：唯一的退出信号
                     if call_name == _PASS_AND_WAIT:
                         await flush_parallel_calls()
-                        if rt.must_reply:
-                            llm_response.add_payload(
-                                LLMPayload(
-                                    ROLE.TOOL_RESULT,
-                                    ToolResult(
-                                        value="当前轮已判定需要回复，不能 pass_and_wait；请改为 life_send_text 或 life_send_file。",
-                                        call_id=call.id,
-                                        name=call_name,
-                                    ),
-                                )
-                            )
-                            continue
                         llm_response.add_payload(
                             LLMPayload(
                                 ROLE.TOOL_RESULT,
@@ -2814,7 +2663,7 @@ class LifeChatter(BaseChatter):
                         should_wait = True
                         continue
 
-                    # 执行工具
+                    # 执行工具（action / tool 统一处理）
                     if is_life_tool_call_parallel_safe(call):
                         pending_parallel_calls.append(call)
                         continue
@@ -2832,94 +2681,29 @@ class LifeChatter(BaseChatter):
 
                 await flush_parallel_calls()
 
-                # 如果本轮记录了内心独白，但尚未发送可见回复且未选择等待，
-                # 需强制进入 FOLLOW_UP 状态，允许模型在下一回合输出可见回复。
-                if recorded_inner_monologue_this_round and not sent_visible_reply_this_round and not should_wait:
-                    has_pending_tool_results = True
-
-                think_only_calls = self._is_think_only_calls(call_list)
-                if (
-                    think_only_calls
-                    and not should_wait
-                    and not has_pending_tool_results
-                ):
-                    if rt.think_only_retry_count < _MAX_THINK_ONLY_RETRIES:
-                        rt.think_only_retry_count += 1
-                        self._append_think_only_retry_instruction(
-                            llm_response,
-                            retry_count=rt.think_only_retry_count,
-                        )
-                        self._transition(rt, _Phase.FOLLOW_UP, "think-only guard retry")
-                        return Success("think-only guard retry scheduled")
-                    # think-only 达到重试上限
-                    if rt.must_reply:
-                        # 提取模型自己的 decision，注入更有针对性的强制发送提醒
-                        decision_text = self._extract_last_think_decision(call_list)
-                        if decision_text:
-                            forced_reminder = _THINK_ONLY_FORCE_SEND_REMINDER.format(
-                                decision=decision_text[:200],
-                            )
-                            self._append_follow_up_user_instruction(llm_response, forced_reminder)
-                            logger.warning(
-                                f"连续仅调用 action-think 达到上限且 must_reply，"
-                                f"已注入强制发送提醒（decision={decision_text[:80]}）"
-                            )
-                            # 用掉 must_reply 的一次重试配额，避免后续再级联
-                            rt.must_reply_retry_count += 1
-                            self._transition(rt, _Phase.FOLLOW_UP, "think-only force-send retry")
-                            return Success("think-only force-send retry scheduled")
-                    logger.warning("连续仅调用 action-think，达到重试上限，本轮按 action-only 收敛等待")
-                else:
-                    rt.think_only_retry_count = 0
-
-                if rt.requires_inner_monologue and not recorded_inner_monologue_this_round:
-                    rt.inner_monologue_retry_count += 1
-                    self._append_inner_monologue_retry_instruction(llm_response)
-                    if rt.inner_monologue_retry_count <= _MAX_INNER_MONOLOGUE_RETRIES:
-                        self._transition(rt, _Phase.FOLLOW_UP, "inner monologue guard retry")
-                        return Success("inner monologue guard retry scheduled")
-                    logger.warning("主动机会轮次未记录内心独白，达到重试上限，放弃继续强推")
-                    rt.requires_inner_monologue = False
-                    rt.inner_monologue_retry_count = 0
-
-                if rt.must_reply and not sent_visible_reply_this_round:
-                    rt.must_reply_retry_count += 1
-                    self._append_must_reply_retry_instruction(llm_response)
-                    if rt.must_reply_retry_count <= _MAX_MUST_REPLY_RETRIES:
-                        self._transition(rt, _Phase.FOLLOW_UP, "must-reply guard retry")
-                        return Success("must-reply guard retry scheduled")
-                    logger.warning("应回复约束达到重试上限，本轮放弃强制回复以避免死循环")
-                    rt.must_reply = False
-                    rt.must_reply_retry_count = 0
-
-                if has_pending_tool_results:
-                    rt.follow_up_rounds += 1
-                    if rt.follow_up_rounds >= max_rounds:
-                        logger.warning(f"已达最大工具调用轮数 ({max_rounds})，强制等待")
-                        if self._has_tool_result_tail(llm_response):
-                            llm_response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
-                        self._transition(rt, _Phase.WAIT_USER, "max rounds reached")
-                        continue
-                    logger.info(
-                        "工具结果已接入上下文，进入 follow-up 让 life_chatter 继续生成可见回应"
-                    )
-                    self._transition(rt, _Phase.FOLLOW_UP, "pending tool results")
-                    return Success("follow-up scheduled")
-
-                # pass_and_wait 只在工具链已闭合时结束本轮。
+                # pass 退出
                 if should_wait:
-                    # 补 ASSISTANT 占位防止下一轮误判
                     if self._has_tool_result_tail(llm_response):
                         llm_response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
                     self._transition(rt, _Phase.WAIT_USER, "pass_and_wait")
                     return Wait()
 
-                # 全部为 action 时补 SUSPEND
-                if call_list and all(c.name.startswith("action-") for c in call_list):
-                    llm_response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
+                # 默认继续 loop：检查 max_rounds 安全阀
+                rt.follow_up_rounds += 1
+                if rt.follow_up_rounds >= max_rounds:
+                    logger.warning(
+                        f"已达最大轮数 ({max_rounds})，收束本轮"
+                    )
+                    if rt.must_reply and not sent_visible_reply_this_round:
+                        await self._send_must_reply_fallback(chat_stream, rt.unreads)
+                        rt.must_reply = False
+                    if self._has_tool_result_tail(llm_response):
+                        llm_response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
+                    self._transition(rt, _Phase.WAIT_USER, "max rounds reached")
+                    return Wait()
 
-                self._transition(rt, _Phase.WAIT_USER, "tool exec done")
-                return Wait()
+                self._transition(rt, _Phase.FOLLOW_UP, "default loop continue")
+                return Success("follow-up scheduled")
 
     async def execute(self) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:
         """执行聊天器的主要逻辑。
