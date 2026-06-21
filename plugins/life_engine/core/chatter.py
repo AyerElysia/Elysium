@@ -50,75 +50,12 @@ _T = TypeVar("_T")
 
 # ── 控制流常量 ────────────────────────────────────────────────
 _PASS_AND_WAIT = "action-life_pass_and_wait"
-_SEND_TEXT = "action-life_send_text"
-_SEND_FILE = "action-life_send_file"
-_SEND_EMOJI_MEME = "action-send_emoji_meme"
-_RECORD_INNER_MONOLOGUE = "action-record_inner_monologue"
 _SUSPEND_TEXT = "__SUSPEND__"
-_MAX_PLAIN_TEXT_RETRIES = 2
-_MAX_THINK_ONLY_RETRIES = 2
-_MAX_MUST_REPLY_RETRIES = 2
-_MAX_INNER_MONOLOGUE_RETRIES = 2
 _GLOBAL_RUNTIME_BUSY_RETRY_SECONDS = 1.0
-_PLAIN_TEXT_RETRY_REMINDER = (
-    "（系统提醒：上一轮你直接输出了普通文本，而不是 action/tool call，这在当前对话器中无效。"
-    "请立刻改为返回可执行 action 列表，不要再直接输出解释文本。"
-    "如果决定回复用户，必须使用 action-life_send_text，"
-    "并把回复写得自然、具体、充实；"
-    "如果需要拒绝，也要通过 action-life_send_text 给出明确边界、原因和可行替代建议，"
-    "不要只给一句笼统的“高风险/不能做”。"
-    "如果本轮确实无需回复，再使用 action-life_pass_and_wait。）"
-)
-_PLAIN_TEXT_RETRY_REMINDER_STRICT = (
-    "（最后提醒：你又一次直接输出了普通文本。"
-    "本轮必须返回合法 action，而不是自然语言解释。"
-    "允许的收敛路径只有两种："
-    "A) 用 action-life_send_text 给用户一条自然、具体、充实的回复/拒绝说明；"
-    "B) 确实无需回复时使用 action-life_pass_and_wait。"
-    "不要再次只输出一句抽象拒绝或风险提示。）"
-)
-_THINK_ONLY_RETRY_REMINDER = (
-    "（系统阻断：本轮仅调用了 action-think，属于无效轮次。"
-    "你现在必须立刻二选一重发 action 列表："
-    "A) 需要回复用户 -> 先 action-think，再 action-life_send_text；"
-    "B) 不需要回复用户 -> 直接 action-life_pass_and_wait（此路径不要调用 think）。"
-    "禁止再次只调用 action-think。请直接给出可执行 action，不要输出解释文本。）"
-)
-_THINK_ONLY_RETRY_REMINDER_STRICT = (
-    "（最后提醒：你再次触发了 think-only。"
-    "本轮必须马上给出有效组合，否则将按无回复收敛。"
-    "合法组合只允许两种："
-    "[action-think + action-life_send_text] 或 [action-life_pass_and_wait(无 think)]。）"
-)
-_THINK_ONLY_FORCE_SEND_REMINDER = (
-    "（系统强制收敛：你已连续多轮只调用 action-think，没有实际发送任何消息。"
-    "你最近一次 action-think 中自己决定的下一步行动是：\n"
-    "『{decision}』\n"
-    "现在请立即执行你自己的决定——调用 action-life_send_text，"
-    "把你想好的内容写入 content 参数发出去。"
-    "不要再调用 action-think，也不要调用 action-life_pass_and_wait。"
-    "这是本轮最后一次机会，如果仍然只调用 think 将被直接丢弃。）"
-)
-_MUST_REPLY_RETRY_REMINDER = (
-    "（系统提醒：当前批消息已判定为“需要回复”。"
-    "这一轮不能使用 action-life_pass_and_wait 结束。"
-    "请至少调用一个面向用户的回复动作。"
-    "如需发文字，请调用 action-life_send_text；"
-    "如需只发表情包，也必须确保那就是你此刻要给用户的实际回应。）"
-)
-_SEGMENT_ENCOURAGE_MIN_CHARS = 56
-_SEGMENT_SEND_RETRY_REMINDER = (
-    "（系统提醒：你刚才把较长回复作为单段发送。"
-    "请优先在 action-life_send_text 的 content 中用 \\n 分段表达，"
-    "把同一条长回复拆成 2~4 段，每段只放一个核心意图。"
-    "这样更自然，也更符合当前对话规范。）"
-)
-_INNER_MONOLOGUE_RETRY_REMINDER = (
-    "（系统提醒：这是一次主动机会/续话机会轮次。"
-    "在决定开口或继续等待前，你必须先调用 action-record_inner_monologue，"
-    "把你此刻新的心理推进记录下来；然后再二选一："
-    "A) 回复用户；B) action-life_pass_and_wait。"
-    "不要跳过内心独白记录。）"
+# 默认 loop 续轮提示：模型未调用任何工具时，轻量引导继续。
+_EMPTY_TURN_NUDGE = (
+    "（请继续。如需回复用户请调用 life_send_text；"
+    "如决定等待用户下一条消息请调用 action-life_pass_and_wait。）"
 )
 _REASON_LEAK_PATTERN = re.compile(
     r'[,，]?\s*["\']?reason["\']?\s*[:：]',
@@ -256,13 +193,7 @@ class _WorkflowRuntime:
     unreads: list[Message]
     cross_round_seen_signatures: set[str]
     unread_msgs_to_flush: list[Message]
-    plain_text_retry_count: int = 0
     follow_up_rounds: int = 0
-    think_only_retry_count: int = 0
-    must_reply: bool = False
-    must_reply_retry_count: int = 0
-    requires_inner_monologue: bool = False
-    inner_monologue_retry_count: int = 0
     pending_transient_context_text: str = ""
     pending_life_context_high_water: int = 0
     media_seen: set[str] = field(default_factory=set)
