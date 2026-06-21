@@ -2385,10 +2385,9 @@ class LifeChatter(BaseChatter):
                     return Wait()
 
                 rt.cross_round_seen_signatures.clear()
-                rt.plain_text_retry_count = 0
                 rt.follow_up_rounds = 0
-                rt.think_only_retry_count = 0
                 rt.unreads = unread_msgs
+                rt.sent_visible_reply = False
 
                 unread_lines = "\n".join(
                     self.format_message_line(msg) for msg in unread_msgs
@@ -2404,10 +2403,7 @@ class LifeChatter(BaseChatter):
 
                 if not decision.get("should_respond", False):
                     logger.info("决定不响应，继续等待...")
-                    rt.requires_inner_monologue = False
-                    rt.inner_monologue_retry_count = 0
                     rt.must_reply = False
-                    rt.must_reply_retry_count = 0
                     await self.flush_unreads(unread_msgs)
                     return Wait()
 
