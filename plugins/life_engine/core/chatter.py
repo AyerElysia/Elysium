@@ -2297,12 +2297,7 @@ class LifeChatter(BaseChatter):
             results = list(raw_results or [])
 
         for current_call, (appended, success) in zip(call_list, results, strict=False):
-            call_name = str(getattr(current_call, "name", "") or "")
-            if appended and success and self._should_compact_successful_tool_result(call_name):
-                self._compact_successful_tool_result(
-                    response,
-                    str(getattr(current_call, "id", "") or ""),
-                )
+            del current_call, appended, success
 
         if is_batch:
             return results
@@ -2598,7 +2593,7 @@ class LifeChatter(BaseChatter):
                     logger.warning(
                         f"已达最大轮数 ({max_rounds})，收束本轮"
                     )
-                    if rt.must_reply and not sent_visible_reply_this_round:
+                    if rt.must_reply and not rt.sent_visible_reply:
                         await self._send_must_reply_fallback(chat_stream, rt.unreads)
                         rt.must_reply = False
                     if self._has_tool_result_tail(llm_response):
