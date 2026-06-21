@@ -22,7 +22,7 @@ from src.app.plugin_system.base import BaseAction, BaseChatter, BaseTool, Failur
 from src.app.plugin_system.types import ChatType
 from src.core.config import get_core_config
 from src.core.models.message import Message, MessageType
-from src.kernel.llm import Audio, Content, Image, LLMPayload, ROLE, Text, ToolCall, ToolResult, Video
+from src.kernel.llm import Audio, Content, Image, LLMPayload, ReasoningText, ROLE, Text, ToolCall, ToolResult, Video
 from src.kernel.logger import get_logger, COLOR
 from ..memory.prompting import load_memory_prompt_data, render_memory_prompt
 from ..constants import LIFE_CHATTER_GLOBAL_CURSOR_KEY
@@ -65,6 +65,7 @@ _REASON_LEAK_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _PLACEHOLDER_ONLY_PATTERN = re.compile(r"^(?:\.{2,}|。{2,}|…+|⋯+|··+)$")
+_ROLLING_CONTEXT_SNAPSHOT_VERSION = 1
 _LIVE_BRIDGE_BLOCKED_USABLE_SIGNATURES = frozenset(
     {
         "tts_voice_plugin:action:tts_voice_action",
@@ -1128,11 +1129,18 @@ class LifeChatter(BaseChatter):
         # 后续真正执行 Action 时会用 trigger_msg 恢复当前来源 stream。
         self._active_chat_stream = chat_stream
         usable_map = await self.inject_usables(request)
+        restored_payloads = self._load_rolling_context_snapshot()
+        if restored_payloads:
+            request.payloads.extend(restored_payloads)
+            logger.info(
+                "已恢复 life_chatter 滚动上下文快照: "
+                f"payloads={len(restored_payloads)}"
+            )
 
         runtime = _WorkflowRuntime(
             response=request,
             phase=_Phase.WAIT_USER,
-            history_merged=False,
+            history_merged=bool(restored_payloads),
             unreads=[],
             cross_round_seen_signatures=set(),
             unread_msgs_to_flush=[],
@@ -1153,6 +1161,208 @@ class LifeChatter(BaseChatter):
             return
 
         context_manager.compression_hook = cls._compress_dropped_payload_groups
+
+    def _rolling_context_snapshot_path(self) -> Path:
+        """返回 life_chatter 滚动上下文快照文件路径。"""
+        cfg = self._get_config()
+        settings = getattr(cfg, "settings", None)
+        workspace = str(getattr(settings, "workspace_path", "") or "").strip()
+        if not workspace:
+            workspace = str(Path(__file__).parent.parent.parent.parent / "data" / "life_engine_workspace")
+        return Path(workspace).expanduser() / "runtime" / "life_chatter_rolling_context.json"
+
+    @staticmethod
+    def _json_safe_value(value: Any) -> Any:
+        try:
+            json.dumps(value, ensure_ascii=False)
+            return value
+        except Exception:
+            return str(value)
+
+    @classmethod
+    def _serialize_content_part(cls, part: object) -> dict[str, Any] | None:
+        if isinstance(part, Text):
+            return {"type": "text", "text": part.text}
+        if isinstance(part, ReasoningText):
+            data: dict[str, Any] = {"type": "reasoning_text", "text": part.text}
+            if part.signature:
+                data["signature"] = part.signature
+            if part.redacted_data:
+                data["redacted_data"] = part.redacted_data
+            return data
+        if isinstance(part, ToolCall):
+            return {
+                "type": "tool_call",
+                "id": part.id,
+                "name": part.name,
+                "args": cls._json_safe_value(part.args),
+            }
+        if isinstance(part, ToolResult):
+            return {
+                "type": "tool_result",
+                "value": cls._json_safe_value(part.value),
+                "call_id": part.call_id,
+                "name": part.name,
+            }
+        if isinstance(part, Image):
+            return {"type": "image", "value": part.value}
+        if isinstance(part, Audio):
+            return {
+                "type": "audio",
+                "value": part.value,
+                "mime_type": getattr(part, "mime_type", "audio/mpeg"),
+            }
+        if isinstance(part, Video):
+            return {
+                "type": "video",
+                "value": part.value,
+                "mime_type": getattr(part, "mime_type", "video/mp4"),
+            }
+        return None
+
+    @staticmethod
+    def _deserialize_content_part(data: Any) -> object | None:
+        if not isinstance(data, dict):
+            return None
+        part_type = str(data.get("type") or "")
+        try:
+            if part_type == "text":
+                return Text(str(data.get("text") or ""))
+            if part_type == "reasoning_text":
+                return ReasoningText(
+                    str(data.get("text") or ""),
+                    signature=data.get("signature") if isinstance(data.get("signature"), str) else None,
+                    redacted_data=data.get("redacted_data") if isinstance(data.get("redacted_data"), str) else None,
+                )
+            if part_type == "tool_call":
+                return ToolCall(
+                    id=data.get("id") if isinstance(data.get("id"), str) else None,
+                    name=str(data.get("name") or ""),
+                    args=data.get("args") if isinstance(data.get("args"), (dict, str)) else {},
+                )
+            if part_type == "tool_result":
+                return ToolResult(
+                    value=data.get("value"),
+                    call_id=data.get("call_id") if isinstance(data.get("call_id"), str) else None,
+                    name=data.get("name") if isinstance(data.get("name"), str) else None,
+                )
+            if part_type == "image":
+                return Image(str(data.get("value") or ""))
+            if part_type == "audio":
+                return Audio(
+                    str(data.get("value") or ""),
+                    mime_type=str(data.get("mime_type") or "audio/mpeg"),
+                )
+            if part_type == "video":
+                return Video(
+                    str(data.get("value") or ""),
+                    mime_type=str(data.get("mime_type") or "video/mp4"),
+                )
+        except Exception:
+            return None
+        return None
+
+    @classmethod
+    def _serialize_payload(cls, payload: LLMPayload) -> dict[str, Any] | None:
+        role = getattr(payload, "role", None)
+        if role in {ROLE.SYSTEM, ROLE.TOOL}:
+            return None
+        content = [
+            item
+            for item in (
+                cls._serialize_content_part(part)
+                for part in (getattr(payload, "content", None) or [])
+            )
+            if item is not None
+        ]
+        if not content:
+            return None
+        role_value = getattr(role, "value", str(role))
+        return {"role": role_value, "content": content}
+
+    @classmethod
+    def _deserialize_payload(cls, data: Any) -> LLMPayload | None:
+        if not isinstance(data, dict):
+            return None
+        try:
+            role = ROLE(str(data.get("role") or ""))
+        except ValueError:
+            return None
+        if role in {ROLE.SYSTEM, ROLE.TOOL}:
+            return None
+        content = [
+            item
+            for item in (
+                cls._deserialize_content_part(part)
+                for part in list(data.get("content") or [])
+            )
+            if item is not None
+        ]
+        if not content:
+            return None
+        return LLMPayload(role, content)  # type: ignore[arg-type]
+
+    def _load_rolling_context_snapshot(self) -> list[LLMPayload]:
+        path = self._rolling_context_snapshot_path()
+        if not path.exists():
+            return []
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"读取 life_chatter 滚动上下文快照失败: {exc}")
+            return []
+        if not isinstance(raw, dict):
+            return []
+        payload_items = raw.get("payloads")
+        if not isinstance(payload_items, list):
+            return []
+        payloads = [
+            payload
+            for payload in (
+                self._deserialize_payload(item)
+                for item in payload_items
+            )
+            if payload is not None
+        ]
+        return payloads
+
+    def _save_rolling_context_snapshot(self, response: Any) -> None:
+        payloads = getattr(response, "payloads", None)
+        if not isinstance(payloads, list):
+            return
+
+        serialized_payloads = [
+            item
+            for item in (
+                self._serialize_payload(payload)
+                for payload in payloads
+                if isinstance(payload, LLMPayload)
+            )
+            if item is not None
+        ]
+        if not serialized_payloads:
+            return
+
+        path = self._rolling_context_snapshot_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "version": _ROLLING_CONTEXT_SNAPSHOT_VERSION,
+            "runtime_key": self.global_runtime_key,
+            "payloads": serialized_payloads,
+        }
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        try:
+            tmp_path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(tmp_path, path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"保存 life_chatter 滚动上下文快照失败: {exc}")
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     @classmethod
     def _compress_dropped_payload_groups(
@@ -1234,6 +1444,32 @@ class LifeChatter(BaseChatter):
         """获取 LifeEngineConfig。"""
         return getattr(self.plugin, "config", None)
 
+    async def _record_plain_text_inner_monologue(
+        self,
+        chat_stream: ChatStream,
+        text: str,
+    ) -> None:
+        """把 assistant 纯文本响应记录为 life_chatter 内心独白。"""
+        monologue = str(text or "").strip()
+        if not monologue or _SUSPEND_TEXT in monologue:
+            return
+
+        service = self._get_life_service()
+        if service is None or not hasattr(service, "record_chatter_inner_monologue"):
+            return
+
+        try:
+            await service.record_chatter_inner_monologue(
+                monologue,
+                stream_id=str(getattr(chat_stream, "stream_id", "") or ""),
+                platform=str(getattr(chat_stream, "platform", "") or ""),
+                chat_type=str(getattr(chat_stream, "chat_type", "") or ""),
+                sender_name=str(getattr(chat_stream, "bot_nickname", "") or "当前对话器"),
+                topic="assistant_plain_text_monologue",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"记录纯文本内心独白失败: {exc}")
+
     def _get_max_rounds(self) -> int:
         """获取单轮最大工具调用轮数。"""
         cfg = self._get_config()
@@ -1297,7 +1533,7 @@ class LifeChatter(BaseChatter):
                 logger.debug(f"停止 watchdog keepalive 任务时忽略异常：{exc}")
 
     async def modify_llm_usables(self, llm_usables: list[Any]) -> list[type[Any]]:
-        """直播桥接场景下裁掉当前无法走通的组件。"""
+        """直播桥接场景下裁掉当前无法走通的组件；并按配置过滤 MCP 工具。"""
         available = await super().modify_llm_usables(llm_usables)
 
         from src.core.managers import get_stream_manager
@@ -1307,6 +1543,12 @@ class LifeChatter(BaseChatter):
             chat_stream = await get_stream_manager().get_or_create_stream(
                 stream_id=self.stream_id
             )
+
+        # MCP 可见性过滤
+        mcp_filtered = self._filter_mcp_usables(available)
+        if len(mcp_filtered) != len(available):
+            available = mcp_filtered
+
         if not self._is_live_stream(chat_stream):
             return available
 
@@ -1326,6 +1568,91 @@ class LifeChatter(BaseChatter):
             )
 
         return filtered
+
+    @staticmethod
+    def _is_mcp_usable_class(usable_cls: Any) -> bool:
+        """判断一个 usable 是否来源于 MCP 动态工具。"""
+        signature = getattr(usable_cls, "get_signature", lambda: None)()
+        if isinstance(signature, str) and signature.startswith("mcp_provider:tool:"):
+            return True
+
+        schema = usable_cls.to_schema()
+        function_name = schema.get("function", {}).get("name") if isinstance(schema, dict) else None
+        return isinstance(function_name, str) and function_name.startswith("mcp-")
+
+    def _filter_mcp_usables(self, usables: list[type[Any]]) -> list[type[Any]]:
+        """按 enable_mcp / defer_loading 策略过滤 MCP 工具。
+
+        - enable_mcp=false：移除所有 MCP 工具
+        - enable_mcp=true：移除 defer_loading 的 MCP 工具（这些应通过 life_run_agent 委托）
+        """
+        cfg = self._get_chatter_config_section()
+        enable_mcp = True
+        if cfg is not None:
+            enable_mcp = bool(getattr(cfg, "enable_mcp", True))
+
+        if enable_mcp:
+            # 过滤 defer_loading MCP
+            try:
+                from src.core.managers.tool_manager import get_mcp_manager
+
+                deferred_classes = set(get_mcp_manager().get_deferred_tool_classes())
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"读取 deferred MCP 工具失败，跳过 defer 过滤: {exc}")
+                return list(usables)
+
+            if not deferred_classes:
+                return list(usables)
+
+            filtered: list[type[Any]] = []
+            removed_names: list[str] = []
+            for usable_cls in usables:
+                if usable_cls in deferred_classes:
+                    schema = usable_cls.to_schema() if hasattr(usable_cls, "to_schema") else {}
+                    fn_name = (
+                        schema.get("function", {}).get("name")
+                        if isinstance(schema, dict) else None
+                    )
+                    removed_names.append(str(fn_name or usable_cls.__name__))
+                    continue
+                filtered.append(usable_cls)
+            if removed_names:
+                logger.info(
+                    f"life_chatter 已隐藏延迟加载 MCP 工具（请用 life_run_agent 委托）: "
+                    f"{', '.join(removed_names)}"
+                )
+            return filtered
+
+        # enable_mcp=false：移除所有 MCP 工具
+        filtered_all: list[type[Any]] = []
+        removed_all: list[str] = []
+        for usable_cls in usables:
+            if self._is_mcp_usable_class(usable_cls):
+                schema = usable_cls.to_schema() if hasattr(usable_cls, "to_schema") else {}
+                fn_name = (
+                    schema.get("function", {}).get("name")
+                    if isinstance(schema, dict) else None
+                )
+                removed_all.append(str(fn_name or usable_cls.__name__))
+                continue
+            filtered_all.append(usable_cls)
+        if removed_all:
+            logger.info(
+                f"life_chatter 已屏蔽所有 MCP 工具（enable_mcp=false）: "
+                f"{', '.join(removed_all)}"
+            )
+        return filtered_all
+
+    def _get_chatter_config_section(self) -> Any:
+        """读取 life_engine.chatter 配置段，失败时返回 None。"""
+        plugin_config = getattr(self, "plugin", None)
+        config = getattr(plugin_config, "config", None) if plugin_config is not None else None
+        return getattr(config, "chatter", None) if config is not None else None
+
+    def _is_sub_agent_enabled(self) -> bool:
+        """读取 life_chatter 子代理功能开关。"""
+        cfg = self._get_chatter_config_section()
+        return bool(cfg is not None and getattr(cfg, "enable_sub_agent", False))
 
     # ── system prompt ────────────────────────────────────────
 
@@ -1349,7 +1676,8 @@ class LifeChatter(BaseChatter):
             memory_text=memory_text,
             tools_text=tools_text,
             live_guidance=self._build_live_scene_guidance(chat_stream),
-            primary_tool_guide=self._build_primary_tool_guide(),
+            primary_tool_guide=self._build_primary_tool_guide()
+            + self._build_sub_agent_tool_guide(),
         )
 
     def _build_chat_router_prefix_prompt(
@@ -1452,24 +1780,48 @@ class LifeChatter(BaseChatter):
         """仅保留聊天态最核心的单个工具说明。"""
         return (
             "## 工具使用\n"
+            "### ⚠️ 最重要的规则：输出 vs 发送\n"
+            "- 你直接输出的 assistant 纯文本 **不会被发送给用户**，它只会作为你自己的内心独白记录下来。\n"
+            "- 想要让用户看到的话，**必须** 通过 `life_send_text` 工具发送。\n"
+            "- 错误示范：用户问你问题，你直接输出回答文本 → 用户什么都收不到。\n"
+            "- 正确示范：用户问你问题，调用 `life_send_text(content=\"你的回答\")` → 用户看到回答。\n"
             "### 对话循环规则\n"
             "- 每轮你收到的工具结果会自动回到上下文，系统默认让你继续行动——你不需要等待用户下一条消息就能继续调用工具。\n"
+            "- 若想先整理内心独白再行动，可以直接输出 assistant 纯文本（这会被记录为独白，不会发出）；然后下一轮调用 `life_send_text` 把要说的话真正发送。\n"
             "- 想结束本轮对话、等待用户回复时，调用 `action-life_pass_and_wait`。这是唯一退出循环的方式。\n"
-            "- 不要输出纯文本作为回复；回复必须通过 `life_send_text` 工具发送。\n"
             "### 一轮调用多个工具\n"
-            "- 你可以在同一轮同时调用多个工具（包括 `action-think` + `life_send_text`，或多个查询工具）。\n"
-            "- 例如：先 `action-think` 记录思考，再 `life_send_text` 发送回复，一次完成。\n"
+            "- 你可以在同一轮同时调用多个工具（例如多个查询工具，或查询后直接 `life_send_text`）。\n"
+            "- 例如：用户问问题 → 同轮调用 `life_send_text` 回复。一步到位。\n"
             "- 如果需要先查再回（如先 `nucleus_view_screen` 再 `life_send_text`），则分轮进行：第一轮查，第二轮回。\n"
             "### 核心工具\n"
-            "- `action-think`：记录内心思考（mood/decision/expected_response/thought）。可与其他工具同轮调用。\n"
-            "- `life_send_text`：发送文字给用户。`content` 只写纯文本正文，长内容用 `\\n` 分段。`target_key` 通常留空。\n"
-            "- `life_send_file`：发送本地文件。\n"
+            "- `life_send_text`：**发送文字给用户**（用户唯一能看到的途径）。`content` 只写纯文本正文，长内容用 `\\n` 分段。`target_key` 通常留空。\n"
+            "- `life_send_file`：发送本地文件给用户。\n"
             "- `action-life_pass_and_wait`：结束本轮，等待用户新消息。\n"
             "- `nucleus_bash`：查看或操作电脑终端。\n"
             "- `nucleus_view_screen`：查看 Ayer 当前屏幕。\n"
             "- `nucleus_manage_todo`：创建 TODO。\n"
             "- `tool-inspect_media`：把图片/视频/语音提升为原生多模态输入。\n"
             "- 不要把 `reason`、`thought` 等元信息写进 `content`。"
+        )
+
+    def _build_sub_agent_tool_guide(self) -> str:
+        """条件性生成 life_run_agent 工具说明。"""
+        if not self._is_sub_agent_enabled():
+            return ""
+        return (
+            "\n"
+            "### 子代理委托\n"
+            "- `life_run_agent`：启动一个子代理处理复杂的多步骤任务。子代理拥有独立 LLM 上下文和工具集。\n"
+            "- 适用场景：需要多次文件+记忆+网络复合操作、对抗性验证已完成的复杂工作、后台执行耗时任务。\n"
+            "- 子代理类型：\n"
+            "  - explore：只读检索专员，快速搜索信息\n"
+            "  - plan：只读规划专员，分析现状制定方案\n"
+            "  - general-purpose：全能子代理，完整读写能力\n"
+            "  - verification：只读验证专员，对抗性审查已完成工作\n"
+            "- 后台模式（run_in_background=true）：立即返回 agent_id，子代理在后台跑完后结果回流到 life_engine 事件流，下次你被唤醒时能看到。\n"
+            "- MCP 委托：通过 mcp_servers 参数把指定 MCP 服务器的能力委托给子代理。你工具列表里看不到的延迟加载 MCP 工具，可以通过这种方式让子代理使用。\n"
+            "- task 简报要具体，写清：要做什么、已知信息、期望结果。不要写「帮我整理一下」这种模糊指令。\n"
+            "- 不要把用户简单的单步请求拆成子代理任务；只有在真的需要多轮独立思考+工具调用时才用。"
         )
 
     # ── user prompt ──────────────────────────────────────────
@@ -2616,20 +2968,26 @@ class LifeChatter(BaseChatter):
                 response_msg = getattr(llm_response, "message", None)
                 self._print_life_decision_panel(chat_stream, llm_response)
 
-                # 空 call_list：纯文本或空响应，默认继续 loop（当作模型在想）。
+                # 空 call_list：纯文本是内心独白；空响应继续 loop（当作模型在想）。
                 if not call_list:
                     response_text = str(response_msg or "").strip()
                     is_suspend_echo = bool(response_text) and (
                         _SUSPEND_TEXT in response_text
                         or response_text.replace("<thinking>", "").replace("</thinking>", "").strip() == ""
                     )
+                    recorded_monologue = False
                     # 清除 SUSPEND echo，避免模型继续模仿
                     if is_suspend_echo:
                         if self._strip_suspend_echo_from_tail(llm_response):
                             logger.debug("已清除模型 echo 的 __SUSPEND__ 占位")
                     elif response_text:
+                        await self._record_plain_text_inner_monologue(
+                            chat_stream,
+                            response_text,
+                        )
+                        recorded_monologue = True
                         logger.info(
-                            f"life_chatter 本轮未调用工具，继续 loop（当作思考/自言自语）: "
+                            f"life_chatter 记录纯文本独白，继续 loop: "
                             f"{response_text[:100]}"
                         )
                     else:
@@ -2648,9 +3006,18 @@ class LifeChatter(BaseChatter):
                                 LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT))
                             )
                         self._transition(rt, _Phase.WAIT_USER, "max rounds reached")
+                        self._save_rolling_context_snapshot(llm_response)
                         return Wait()
+                    # must_reply 且本轮输出了独白却没发消息 → 立即提醒
+                    if rt.must_reply and recorded_monologue and not rt.sent_visible_reply:
+                        self._append_follow_up_user_instruction(
+                            llm_response,
+                            "（系统提醒：你刚才那段文字只被记录为内心独白，**用户没有收到**。"
+                            "如果想让用户看到，必须调用 `life_send_text(content=\"...\")`。"
+                            "如果本轮不打算回复，调用 `action-life_pass_and_wait` 等待。）",
+                        )
                     # 连续两轮以上空轮 → 注入引导提醒
-                    if rt.follow_up_rounds >= 2:
+                    elif rt.follow_up_rounds >= 2:
                         self._append_follow_up_user_instruction(
                             llm_response,
                             "（系统提醒：你已连续空响应。现在请二选一：A) 调用 life_send_text 回复用户；"
@@ -2658,6 +3025,7 @@ class LifeChatter(BaseChatter):
                             "不要再输出空文本或 __SUSPEND__。）",
                         )
                     self._transition(rt, _Phase.FOLLOW_UP, "empty turn, continue loop")
+                    self._save_rolling_context_snapshot(llm_response)
                     return Success("follow-up scheduled")
 
                 self._ensure_unique_tool_call_ids(call_list)
@@ -2770,6 +3138,7 @@ class LifeChatter(BaseChatter):
                     if self._has_tool_result_tail(llm_response):
                         llm_response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
                     self._transition(rt, _Phase.WAIT_USER, "pass_and_wait")
+                    self._save_rolling_context_snapshot(llm_response)
                     return Wait()
 
                 # 默认继续 loop：检查 max_rounds 安全阀
@@ -2784,6 +3153,7 @@ class LifeChatter(BaseChatter):
                     if self._has_tool_result_tail(llm_response):
                         llm_response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
                     self._transition(rt, _Phase.WAIT_USER, "max rounds reached")
+                    self._save_rolling_context_snapshot(llm_response)
                     return Wait()
 
                 # 补 ASSISTANT 占位：TOOL_RESULT 尾部必须接 ASSISTANT 才能接下一轮 USER/请求。
@@ -2791,6 +3161,7 @@ class LifeChatter(BaseChatter):
                     llm_response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
 
                 self._transition(rt, _Phase.FOLLOW_UP, "default loop continue")
+                self._save_rolling_context_snapshot(llm_response)
                 return Success("follow-up scheduled")
 
     async def execute(self) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:
