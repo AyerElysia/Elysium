@@ -2219,6 +2219,60 @@ class LifeChatter(BaseChatter):
             seen.add(str(getattr(call, "id", "") or new_id))
 
     @staticmethod
+    def _format_decision_tool_args(args: Any) -> str:
+        """格式化决策面板中的单个工具参数。"""
+        if not isinstance(args, dict):
+            return ""
+
+        display_items: list[str] = []
+        for key, value in args.items():
+            if key == "reason":
+                continue
+            display_items.append(f"{key}: {value}")
+        return ", ".join(display_items)
+
+    @classmethod
+    def _build_life_decision_panel(cls, chat_stream: ChatStream, response: Any) -> str:
+        """构建 life_chatter 本轮模型输出的决策摘要。"""
+        stream_name = (
+            getattr(chat_stream, "stream_name", "")
+            or getattr(chat_stream, "stream_id", "")
+            or "未知聊天流"
+        )
+        thought = str(getattr(response, "reasoning_content", "") or "").strip() or "（无）"
+        monologue = str(getattr(response, "message", "") or "").strip() or "（无）"
+
+        tool_lines: list[str] = []
+        for call in getattr(response, "call_list", None) or []:
+            call_name = str(getattr(call, "name", "") or "<unknown>")
+            formatted_args = cls._format_decision_tool_args(getattr(call, "args", None))
+            if formatted_args:
+                tool_lines.append(f"    {call_name} ({formatted_args})")
+            else:
+                tool_lines.append(f"    {call_name}")
+
+        tools_text = "\n".join(tool_lines) if tool_lines else "    （无）"
+        return (
+            f"聊天流名称：{stream_name}\n\n"
+            f"思考：{thought}\n\n"
+            f"独白：{monologue}\n\n"
+            f"调用工具：\n{tools_text}"
+        )
+
+    @classmethod
+    def _print_life_decision_panel(cls, chat_stream: ChatStream, response: Any) -> None:
+        """打印 life_chatter 的模型决策窗口。"""
+        print_panel = getattr(logger, "print_panel", None)
+        if not callable(print_panel):
+            return
+
+        print_panel(
+            cls._build_life_decision_panel(chat_stream, response),
+            title="Life Chatter 决策",
+            border_style="magenta",
+        )
+
+    @staticmethod
     def _normalize_tool_execution_results(
         raw_results: object,
         expected_count: int,
@@ -2510,6 +2564,7 @@ class LifeChatter(BaseChatter):
 
                 call_list = getattr(llm_response, "call_list", None) or []
                 response_msg = getattr(llm_response, "message", None)
+                self._print_life_decision_panel(chat_stream, llm_response)
 
                 # 空 call_list：纯文本或空响应，默认继续 loop（当作模型在想）。
                 if not call_list:
@@ -2664,6 +2719,10 @@ class LifeChatter(BaseChatter):
                         llm_response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
                     self._transition(rt, _Phase.WAIT_USER, "max rounds reached")
                     return Wait()
+
+                # 补 ASSISTANT 占位：TOOL_RESULT 尾部必须接 ASSISTANT 才能接下一轮 USER/请求。
+                if self._has_tool_result_tail(llm_response):
+                    llm_response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
 
                 self._transition(rt, _Phase.FOLLOW_UP, "default loop continue")
                 return Success("follow-up scheduled")

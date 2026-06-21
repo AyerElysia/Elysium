@@ -63,6 +63,46 @@ def test_ensure_unique_tool_call_ids_rewrites_duplicates() -> None:
     manager.validate_for_send(payloads)
 
 
+def test_life_decision_panel_maps_reasoning_message_and_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = [
+        ToolCall(
+            id="send-1",
+            name="action-life_send_text",
+            args={"content": "你好", "reason": "内部理由"},
+        )
+    ]
+    response = SimpleNamespace(
+        reasoning_content="先确认对方是不是在问新逻辑。",
+        message="我感觉到一点变化。",
+        call_list=calls,
+    )
+    chat_stream = SimpleNamespace(stream_name="始源之地", stream_id="stream-1")
+    panels: list[tuple[str, str, str]] = []
+
+    monkeypatch.setattr(
+        "plugins.life_engine.core.chatter.logger",
+        SimpleNamespace(
+            print_panel=lambda content, title, border_style: panels.append(
+                (content, title, border_style)
+            )
+        ),
+    )
+
+    LifeChatter._print_life_decision_panel(chat_stream, response)
+
+    assert panels
+    content, title, border_style = panels[0]
+    assert title == "Life Chatter 决策"
+    assert border_style == "magenta"
+    assert "聊天流名称：始源之地" in content
+    assert "思考：先确认对方是不是在问新逻辑。" in content
+    assert "独白：我感觉到一点变化。" in content
+    assert "action-life_send_text (content: 你好)" in content
+    assert "内部理由" not in content
+
+
 def test_life_send_text_normalize_splits_newlines_in_plain_text() -> None:
     result = LifeSendTextAction._normalize_content_segments("第一条\n\n第二条\r\n第三条")
     assert result == ["第一条", "第二条", "第三条"]
