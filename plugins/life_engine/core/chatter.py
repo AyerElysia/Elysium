@@ -2041,44 +2041,6 @@ class LifeChatter(BaseChatter):
     def _message_flag(message: Message, flag_name: str) -> bool:
         return message_flag(message, flag_name)
 
-    @classmethod
-    def _is_proactive_trigger_message(cls, message: Message) -> bool:
-        return bool(
-            cls._message_flag(message, "is_proactive_opportunity_trigger")
-            or cls._message_flag(message, "is_proactive_followup_trigger")
-            or cls._message_flag(message, "is_autonomy_intent_trigger")
-        )
-
-    @classmethod
-    def _should_force_reply_for_unread_batch(cls, unread_msgs: list[Message]) -> bool:
-        for msg in unread_msgs:
-            if cls._is_proactive_trigger_message(msg):
-                continue
-            if str(getattr(msg, "sender_role", "") or "").lower() == "bot":
-                continue
-            return True
-        return False
-
-    @classmethod
-    def _should_force_reply_for_decision(
-        cls,
-        decision: dict[str, Any],
-        unread_msgs: list[Message],
-    ) -> bool:
-        """路由层已判定要响应时，必须闭合为一次可见回复。
-
-        路由器只负责判断这批外部消息是否值得接入主对话。一旦它返回
-        should_respond=true，后续主模型可以先查历史、看媒体或 think，但不能
-        在没有任何可见回应的情况下静默收敛。
-        """
-
-        if not bool(decision.get("should_respond", False)):
-            return False
-        if "force_reply" in decision:
-            if not bool(decision.get("force_reply", False)):
-                return False
-        return cls._should_force_reply_for_unread_batch(unread_msgs)
-
     def _consume_runtime_assistant_context(
         self,
         chat_stream: ChatStream,
