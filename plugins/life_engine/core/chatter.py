@@ -2407,57 +2407,6 @@ class LifeChatter(BaseChatter):
                     await self.flush_unreads(unread_msgs)
                     return Wait()
 
-                runtime_context_text = self._format_runtime_context_text(
-                    self._consume_runtime_assistant_context(chat_stream)
-                )
-                rt.active_stream_id = stream_id
-
-                history_text = await self._build_history_text_async(
-                    chat_stream,
-                    max_messages=self._get_initial_history_message_limit(),
-                    global_history=True,
-                    exclude_message_ids={
-                        str(getattr(msg, "message_id", "") or "")
-                        for msg in unread_msgs
-                        if str(getattr(msg, "message_id", "") or "")
-                    },
-                )
-                include_history_in_prompt = bool(history_text and not rt.history_merged)
-
-                # 构建 user prompt
-                user_prompt_text = self._build_chat_user_prompt(
-                    chat_stream,
-                    unread_lines=unread_lines,
-                    history_text=history_text if include_history_in_prompt else "",
-                )
-                (
-                    rt.pending_transient_context_text,
-                    rt.pending_life_context_high_water,
-                ) = await self._build_dynamic_context_text(
-                    chat_stream,
-                    service,
-                    runtime_context_text=runtime_context_text,
-                    include_recent_chat_history=not include_history_in_prompt,
-                )
-
-                self._upsert_pending_unread_payload(
-                    response=rt.response,
-                    formatted_content=self._compose_unread_user_content(
-                        rt, unread_msgs, user_prompt_text, chat_stream
-                    ),
-                )
-                rt.history_merged = True
-                rt.requires_inner_monologue = self._requires_inner_monologue_for_unread_batch(unread_msgs)
-                rt.inner_monologue_retry_count = 0
-                rt.must_reply = self._should_force_reply_for_decision(
-                    decision,
-                    unread_msgs,
-                )
-                rt.must_reply_retry_count = 0
-                self._transition(rt, _Phase.MODEL_TURN, "accepted unread batch")
-                rt.unread_msgs_to_flush = unread_msgs
-                continue
-
             # ── MODEL_TURN / FOLLOW_UP ───────────────────
             if rt.phase in (_Phase.MODEL_TURN, _Phase.FOLLOW_UP):
                 payloads_before_media = self._snapshot_payloads(rt.response)
@@ -2574,7 +2523,6 @@ class LifeChatter(BaseChatter):
 
                 should_wait = False
                 seen_sigs: set[str] = set()
-                sent_visible_reply_this_round = False
                 pending_parallel_calls: list[Any] = []
                 trigger_msg = rt.unreads[-1] if rt.unreads else None
 
@@ -2583,11 +2531,9 @@ class LifeChatter(BaseChatter):
                     appended: bool,
                     success: bool,
                 ) -> None:
-                    nonlocal sent_visible_reply_this_round
-
                     executed_name = str(getattr(executed_call, "name", "") or "")
                     if success and self._is_visible_reply_action(executed_name):
-                        sent_visible_reply_this_round = True
+                        rt.sent_visible_reply = True
                         rt.must_reply = False
 
                 async def flush_parallel_calls() -> None:
