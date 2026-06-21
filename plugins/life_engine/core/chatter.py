@@ -1452,16 +1452,23 @@ class LifeChatter(BaseChatter):
         """仅保留聊天态最核心的单个工具说明。"""
         return (
             "## 工具使用\n"
-            "- 如果你准备回复用户，`action-think` 必须和至少一个可执行动作同轮出现，通常是 `life_send_text`。\n"
-            "- 不要只调用 `action-think`；如果本轮决定不回复，就直接用 `action-life_pass_and_wait`，不要调用 think。\n"
-            "- 需要直接给用户发文字时，使用 `life_send_text`。\n"
-            "- `life_send_text.target_key` 通常留空，表示回复当前聊天；只有明确要发到 suffix 中“可发送目标”列出的其他聊天时，才填写列表里的 target_key。\n"
-            "- 需要发送本地文件时，使用 `life_send_file`；需要解释文件时另用 `life_send_text`。\n"
-            "- 收到图片/表情包/视频/语音时，默认先基于摘要判断；如果摘要不够，需要自己看清原始媒体，调用 `tool-inspect_media` 把它提升为下一轮原生多模态输入。\n"
-            "- `content` 只能写给用户看的纯文本正文；长内容用 `\\n` 分隔分段发送。\n"
-            "- 需要查看或操作电脑终端、执行脚本或处理文件系统时，调用 `nucleus_bash`。\n"
-            "- 需要了解 Ayer 当前电脑屏幕时，调用 `nucleus_view_screen`，不要凭空猜屏幕内容。\n"
-            "- 需要把承诺落地时，可用 `nucleus_manage_todo` 创建 TODO；必须写清 `next_action` 和复盘/提醒时间，shared TODO 创建后要自然告诉用户。\n"
+            "### 对话循环规则\n"
+            "- 每轮你收到的工具结果会自动回到上下文，系统默认让你继续行动——你不需要等待用户下一条消息就能继续调用工具。\n"
+            "- 想结束本轮对话、等待用户回复时，调用 `action-life_pass_and_wait`。这是唯一退出循环的方式。\n"
+            "- 不要输出纯文本作为回复；回复必须通过 `life_send_text` 工具发送。\n"
+            "### 一轮调用多个工具\n"
+            "- 你可以在同一轮同时调用多个工具（包括 `action-think` + `life_send_text`，或多个查询工具）。\n"
+            "- 例如：先 `action-think` 记录思考，再 `life_send_text` 发送回复，一次完成。\n"
+            "- 如果需要先查再回（如先 `nucleus_view_screen` 再 `life_send_text`），则分轮进行：第一轮查，第二轮回。\n"
+            "### 核心工具\n"
+            "- `action-think`：记录内心思考（mood/decision/expected_response/thought）。可与其他工具同轮调用。\n"
+            "- `life_send_text`：发送文字给用户。`content` 只写纯文本正文，长内容用 `\\n` 分段。`target_key` 通常留空。\n"
+            "- `life_send_file`：发送本地文件。\n"
+            "- `action-life_pass_and_wait`：结束本轮，等待用户新消息。\n"
+            "- `nucleus_bash`：查看或操作电脑终端。\n"
+            "- `nucleus_view_screen`：查看 Ayer 当前屏幕。\n"
+            "- `nucleus_manage_todo`：创建 TODO。\n"
+            "- `tool-inspect_media`：把图片/视频/语音提升为原生多模态输入。\n"
             "- 不要把 `reason`、`thought` 等元信息写进 `content`。"
         )
 
@@ -2075,6 +2082,49 @@ class LifeChatter(BaseChatter):
         return False
 
     @staticmethod
+    def _strip_suspend_echo_from_tail(response: Any) -> bool:
+        """从 payload 尾部清除模型 echo 的 __SUSPEND__ ASSISTANT 消息。
+
+        模型偶尔会把系统注入的 SUSPEND 占位符当作可见文本模仿输出。
+        如果不清除，下一轮模型会看到这些 "__SUSPEND__" 文本，继续模仿，
+        形成 SUSPEND-only 死循环。
+
+        Returns:
+            bool: 是否清除了至少一条 SUSPEND echo。
+        """
+        payloads = getattr(response, "payloads", None)
+        if not isinstance(payloads, list):
+            return False
+
+        stripped = False
+        while payloads:
+            tail = payloads[-1]
+            if getattr(tail, "role", None) != ROLE.ASSISTANT:
+                break
+            content = getattr(tail, "content", []) or []
+            text_parts: list[str] = []
+            non_text = False
+            for part in content:
+                if isinstance(part, Text):
+                    text_parts.append(part.text)
+                else:
+                    non_text = True
+                    break
+            if non_text:
+                break
+            joined = "".join(text_parts).strip()
+            if not joined:
+                break
+            cleaned = joined.replace(_SUSPEND_TEXT, "").strip()
+            cleaned = cleaned.replace("<thinking>", "").replace("</thinking>", "").strip()
+            if cleaned:
+                break
+            payloads.pop()
+            stripped = True
+
+        return stripped
+
+    @staticmethod
     def _append_follow_up_user_instruction(response: Any, reminder: str) -> None:
         """为 FOLLOW_UP 续轮注入一个新的 USER 轮次，避免 assistant -> assistant 非法链路。"""
 
@@ -2569,7 +2619,15 @@ class LifeChatter(BaseChatter):
                 # 空 call_list：纯文本或空响应，默认继续 loop（当作模型在想）。
                 if not call_list:
                     response_text = str(response_msg or "").strip()
-                    if response_text and response_text != _SUSPEND_TEXT:
+                    is_suspend_echo = bool(response_text) and (
+                        _SUSPEND_TEXT in response_text
+                        or response_text.replace("<thinking>", "").replace("</thinking>", "").strip() == ""
+                    )
+                    # 清除 SUSPEND echo，避免模型继续模仿
+                    if is_suspend_echo:
+                        if self._strip_suspend_echo_from_tail(llm_response):
+                            logger.debug("已清除模型 echo 的 __SUSPEND__ 占位")
+                    elif response_text:
                         logger.info(
                             f"life_chatter 本轮未调用工具，继续 loop（当作思考/自言自语）: "
                             f"{response_text[:100]}"
@@ -2591,11 +2649,19 @@ class LifeChatter(BaseChatter):
                             )
                         self._transition(rt, _Phase.WAIT_USER, "max rounds reached")
                         return Wait()
+                    # 连续两轮以上空轮 → 注入引导提醒
+                    if rt.follow_up_rounds >= 2:
+                        self._append_follow_up_user_instruction(
+                            llm_response,
+                            "（系统提醒：你已连续空响应。现在请二选一：A) 调用 life_send_text 回复用户；"
+                            "B) 调用 action-life_pass_and_wait 结束本轮等待用户。"
+                            "不要再输出空文本或 __SUSPEND__。）",
+                        )
                     self._transition(rt, _Phase.FOLLOW_UP, "empty turn, continue loop")
                     return Success("follow-up scheduled")
 
                 self._ensure_unique_tool_call_ids(call_list)
-                logger.info(f"本轮调用: {[c.name for c in call_list]}")
+                logger.debug(f"本轮调用: {[c.name for c in call_list]}")
 
                 should_wait = False
                 seen_sigs: set[str] = set()
@@ -2646,7 +2712,7 @@ class LifeChatter(BaseChatter):
                     call_name = getattr(call, "name", "<unknown>")
                     log_args = dict(call.args) if isinstance(getattr(call, "args", None), dict) else {}
                     reason = log_args.pop("reason", "未提供原因")
-                    logger.info(
+                    logger.debug(
                         f"LLM 调用 {call_name}，原因: {reason}，参数: {log_args}"
                     )
 
