@@ -2135,6 +2135,87 @@ class LifeChatter(BaseChatter):
             formatted_content,
         )
 
+    async def _inject_delta_unreads_if_any(
+        self,
+        rt: _WorkflowRuntime,
+        chat_stream: ChatStream,
+    ) -> list[Message]:
+        """在 LLM 请求前注入"loop 开始后新到达的未读消息"。
+
+        loop 中 LLM 推理/工具执行可能耗时数秒，期间用户可能继续发消息。
+        如果不注入这些新消息，模型回复时不知道它们的存在，会造成"她不知道
+        我又说话了"的错位。
+
+        Returns:
+            list[Message]: 本次注入的新消息（已经合并到 rt.unreads 和
+            rt.unread_msgs_to_flush）；可能为空。
+        """
+        _, current_unreads = await self.fetch_unreads()
+        if not current_unreads:
+            return []
+
+        # 已在本轮 loop 中处理过/注入过的消息 id
+        seen_ids: set[str] = set()
+        for msg in rt.unread_msgs_to_flush or []:
+            mid = str(getattr(msg, "message_id", "") or "")
+            if mid:
+                seen_ids.add(mid)
+        for msg in rt.unreads or []:
+            mid = str(getattr(msg, "message_id", "") or "")
+            if mid:
+                seen_ids.add(mid)
+
+        delta: list[Message] = []
+        for msg in current_unreads:
+            mid = str(getattr(msg, "message_id", "") or "")
+            if not mid:
+                # 没有 message_id 的消息无法去重，谨慎跳过（依赖上游保证 id）
+                continue
+            if mid in seen_ids:
+                continue
+            delta.append(msg)
+            seen_ids.add(mid)
+
+        if not delta:
+            return []
+
+        logger.info(
+            f"loop 中检测到 {len(delta)} 条新未读，注入到下一次 LLM 请求"
+        )
+
+        # 构造新消息片段（轻量，不重复 chat_history）
+        unread_lines = "\n".join(self.format_message_line(msg) for msg in delta)
+        delta_text = (
+            "（loop 中收到的新消息——你上一轮还没看到这些）\n"
+            f"<new_messages>\n{unread_lines}\n</new_messages>"
+        )
+
+        # 注入前先确保 payload 尾部合法：TOOL_RESULT 尾部需要 ASSISTANT 占位
+        if self._has_tool_result_tail(rt.response):
+            rt.response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
+
+        # 追加 / 合并到末尾的 USER 轮次（让模型在下一次请求中看到这些消息）。
+        # upsert：如果尾部已是 USER（例如 WAIT_USER 刚 upsert 完 unread），会合并到同一个 USER；
+        # 否则（例如尾部是 ASSISTANT/SUSPEND），新建一个 USER。
+        self._upsert_pending_unread_payload(
+            response=rt.response,
+            formatted_content=Text(delta_text),
+        )
+
+        # 把 delta 合并到 runtime 状态：
+        # - rt.unreads: trigger_msg 取最新一条，must_reply 判断也会用
+        # - rt.unread_msgs_to_flush: 最终会被 flush 到 history，避免重复处理
+        rt.unreads = list(rt.unreads or []) + delta
+        rt.unread_msgs_to_flush = list(rt.unread_msgs_to_flush or []) + delta
+
+        # 如果 delta 里有真实外部消息，且当前不是 must_reply，重新评估
+        # （路由只在 WAIT_USER 跑过一次；新消息可能改变"必须回复"判定）
+        if not rt.must_reply and self._should_force_reply_for_unread_batch(delta):
+            rt.must_reply = True
+            logger.info("loop 中新消息含外部真实消息，重新置 must_reply=True")
+
+        return delta
+
     @staticmethod
     def _consume_promoted_media_content(stream_id: str) -> list[Content]:
         """消费由 inspect_media 提升的原生媒体，供下一次模型轮直接观察。"""
@@ -2886,6 +2967,13 @@ class LifeChatter(BaseChatter):
 
             # ── MODEL_TURN / FOLLOW_UP ───────────────────
             if rt.phase in (_Phase.MODEL_TURN, _Phase.FOLLOW_UP):
+                # 在发 LLM 请求前合并 loop 中新到达的未读消息（关键并发修复）：
+                # WAIT_USER 拿到的 unreads 是"那一刻的快照"；在路由 LLM、history
+                # DB 查询、上一轮 LLM 推理、工具执行等任何耗时操作期间，用户都
+                # 可能继续发消息。如果不在请求前合并，模型回复时会不知道这些
+                # 新消息存在，造成"她不知道我又说话了"的错位。
+                await self._inject_delta_unreads_if_any(rt, chat_stream)
+
                 payloads_before_media = self._snapshot_payloads(rt.response)
                 if rt.phase == _Phase.MODEL_TURN:
                     self._append_suffix_context(
