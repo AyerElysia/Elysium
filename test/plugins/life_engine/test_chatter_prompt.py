@@ -912,3 +912,211 @@ def test_social_impulses_do_not_route_directly_to_tell_dfc() -> None:
     assert "nucleus_tell_dfc" not in break_silence.tools
     assert "表达层缺失的关键背景" in social_reach_out.suggestion
     assert "明确的信息差" in break_silence.suggestion
+# ── loop 中收到新消息的并发回归测试 ────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_inject_delta_unreads_appends_new_messages_to_payload(monkeypatch) -> None:
+    """loop 中新到达的未读消息应在下一次 LLM 请求前被注入 payload。"""
+
+    LifeChatter.reset_global_runtime()
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.payloads: list[LLMPayload] = [
+                LLMPayload(ROLE.USER, Text("第一批消息")),
+            ]
+
+        def add_payload(self, payload) -> None:
+            self.payloads.append(payload)
+
+    response = FakeResponse()
+    old_msg = Message(
+        message_id="old-1",
+        content="第一条",
+        processed_plain_text="第一条",
+        sender_role="other",
+        platform="qq",
+        stream_id="stream-a",
+    )
+    rt = _WorkflowRuntime(
+        response=response,
+        phase=_Phase.FOLLOW_UP,
+        history_merged=True,
+        unreads=[old_msg],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[old_msg],
+        active_stream_id="stream-a",
+    )
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=None)
+    chatter.stream_id = "stream-a"
+
+    new_msg = Message(
+        message_id="new-1",
+        content="loop 中新发的",
+        processed_plain_text="loop 中新发的",
+        sender_role="other",
+        platform="qq",
+        stream_id="stream-a",
+    )
+
+    async def fake_fetch_unreads():
+        # 模拟：loop 期间用户又发了一条
+        return "", [old_msg, new_msg]
+
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+
+    chat_stream = SimpleNamespace(stream_id="stream-a")
+    delta = await chatter._inject_delta_unreads_if_any(rt, chat_stream)
+
+    # 应识别出 new-1 作为 delta
+    assert len(delta) == 1
+    assert delta[0].message_id == "new-1"
+
+    # rt 状态应已更新
+    assert new_msg in rt.unreads
+    assert new_msg in rt.unread_msgs_to_flush
+    assert rt.must_reply is True  # 外部消息应触发 must_reply
+
+    # payload 末尾应包含新消息文本（合并到末尾 USER 或新增 USER）
+    last_text = ""
+    for part in response.payloads[-1].content:
+        if isinstance(part, Text):
+            last_text += part.text
+    assert "loop 中新发的" in last_text
+    assert "<new_messages>" in last_text
+
+    LifeChatter.reset_global_runtime()
+
+
+@pytest.mark.asyncio
+async def test_inject_delta_unreads_no_op_when_no_new_messages(monkeypatch) -> None:
+    """没有新未读时不应注入任何 payload。"""
+
+    LifeChatter.reset_global_runtime()
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.payloads: list[LLMPayload] = [
+                LLMPayload(ROLE.USER, Text("已有消息")),
+            ]
+
+        def add_payload(self, payload) -> None:
+            self.payloads.append(payload)
+
+    response = FakeResponse()
+    old_msg = Message(
+        message_id="old-1",
+        content="x",
+        processed_plain_text="x",
+        sender_role="other",
+        stream_id="stream-a",
+    )
+    rt = _WorkflowRuntime(
+        response=response,
+        phase=_Phase.FOLLOW_UP,
+        history_merged=True,
+        unreads=[old_msg],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[old_msg],
+        active_stream_id="stream-a",
+    )
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=None)
+    chatter.stream_id = "stream-a"
+
+    async def fake_fetch_unreads():
+        return "", [old_msg]  # 没有新消息
+
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+
+    chat_stream = SimpleNamespace(stream_id="stream-a")
+    payload_count_before = len(response.payloads)
+    delta = await chatter._inject_delta_unreads_if_any(rt, chat_stream)
+
+    assert delta == []
+    # payloads 数量不变
+    assert len(response.payloads) == payload_count_before
+
+    LifeChatter.reset_global_runtime()
+
+
+@pytest.mark.asyncio
+async def test_inject_delta_unreads_handles_tool_result_tail(monkeypatch) -> None:
+    """payload 尾部是 TOOL_RESULT 时，注入前应补 ASSISTANT 占位。"""
+    from src.kernel.llm import ToolCall, ToolResult
+
+    LifeChatter.reset_global_runtime()
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.payloads: list[LLMPayload] = [
+                LLMPayload(ROLE.USER, Text("先前消息")),
+                LLMPayload(
+                    ROLE.ASSISTANT,
+                    [ToolCall(id="call-1", name="tool-x", args={})],
+                ),
+                LLMPayload(
+                    ROLE.TOOL_RESULT,
+                    ToolResult(value="ok", call_id="call-1", name="tool-x"),
+                ),
+            ]
+
+        def add_payload(self, payload) -> None:
+            self.payloads.append(payload)
+
+    response = FakeResponse()
+    old_msg = Message(
+        message_id="old-1",
+        content="x",
+        processed_plain_text="x",
+        sender_role="other",
+        stream_id="stream-a",
+    )
+    rt = _WorkflowRuntime(
+        response=response,
+        phase=_Phase.FOLLOW_UP,
+        history_merged=True,
+        unreads=[old_msg],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[old_msg],
+        active_stream_id="stream-a",
+    )
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=None)
+    chatter.stream_id = "stream-a"
+
+    new_msg = Message(
+        message_id="new-1",
+        content="新消息",
+        processed_plain_text="新消息",
+        sender_role="other",
+        stream_id="stream-a",
+    )
+
+    async def fake_fetch_unreads():
+        return "", [old_msg, new_msg]
+
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+
+    chat_stream = SimpleNamespace(stream_id="stream-a")
+    await chatter._inject_delta_unreads_if_any(rt, chat_stream)
+
+    roles = [p.role for p in response.payloads]
+    # 在 TOOL_RESULT 之后应有 ASSISTANT 占位，再之后才是新 USER
+    assert ROLE.TOOL_RESULT in roles
+    tool_result_idx = roles.index(ROLE.TOOL_RESULT)
+    after = roles[tool_result_idx + 1 :]
+    assert after[0] == ROLE.ASSISTANT  # SUSPEND 占位
+    assert ROLE.USER in after  # 新消息
+
+    LifeChatter.reset_global_runtime()
