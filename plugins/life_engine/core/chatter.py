@@ -8,8 +8,6 @@ chat_mode 负责对外交流。
 from __future__ import annotations
 
 import asyncio
-import base64
-import io
 import json
 import os
 import re
@@ -856,11 +854,7 @@ class LifeInspectMediaTool(BaseTool):
             elif selected.kind == "audio":
                 content.append(Audio(selected.data_for_native, mime_type=selected.mime_type))
             else:
-                # Gemini 不支持 GIF 格式，需要转换为 PNG
-                image_data = selected.data_for_native
-                if self._is_gif_image(image_data, selected.mime_type):
-                    image_data = self._convert_gif_to_png(image_data)
-                content.append(Image(image_data))
+                content.append(Image(selected.data_for_native))
         return content
 
     def _select_media(self, target: str, media_type: str) -> _SelectedMedia | None:
@@ -884,88 +878,6 @@ class LifeInspectMediaTool(BaseTool):
                     continue
                 return selected
         return None
-
-    @staticmethod
-    def _is_gif_image(data: str, mime_type: str) -> bool:
-        """检测图片是否为 GIF 格式。
-
-        Args:
-            data: base64 数据（可能带 data URL 前缀）
-            mime_type: MIME 类型
-
-        Returns:
-            是否为 GIF 格式
-        """
-        # 检查 MIME 类型
-        if mime_type == "image/gif":
-            return True
-
-        # 检查 data URL 前缀
-        if data.startswith("data:image/gif"):
-            return True
-
-        # 检查 base64 数据的 GIF 魔术字节 (GIF87a 或 GIF89a)
-        try:
-            check_data = data
-            if ";base64," in check_data:
-                check_data = check_data.split(";base64,", 1)[1]
-            # 解码前几个字节检查魔术字节
-            header = base64.b64decode(check_data[:20])[:6]
-            if header in (b'GIF87a', b'GIF89a'):
-                return True
-        except Exception:
-            pass
-
-        return False
-
-    @staticmethod
-    def _convert_gif_to_png(base64_data: str) -> str:
-        """将 GIF 图片转换为 PNG 格式（Gemini 不支持 GIF）。
-
-        Args:
-            base64_data: 原始 base64 数据（可能带 data URL 前缀）
-
-        Returns:
-            转换后的 base64 数据，如果转换失败则返回原数据
-        """
-        try:
-            from PIL import Image as PILImage
-
-            # 提取纯净的 base64 内容
-            clean_base64 = base64_data
-            if ";base64," in clean_base64:
-                clean_base64 = clean_base64.split(";base64,", 1)[1]
-
-            # 解码 base64
-            image_bytes = base64.b64decode(clean_base64)
-
-            # 打开并转换图片
-            with io.BytesIO(image_bytes) as input_buffer:
-                with PILImage.open(input_buffer) as img:
-                    # 如果是 GIF，取第一帧转换为 PNG
-                    if hasattr(img, "n_frames") and img.n_frames > 1:
-                        img.seek(0)  # 取第一帧
-
-                    # 转换为 RGB（PNG 不支持动画）
-                    if img.mode in ("RGBA", "LA", "P"):
-                        background = PILImage.new("RGB", img.size, (255, 255, 255))
-                        if img.mode == "P":
-                            img = img.convert("RGBA")
-                        background.paste(img, mask=img.split()[-1] if img.mode == "RGBA" else None)
-                        img = background
-                    elif img.mode != "RGB":
-                        img = img.convert("RGB")
-
-                    # 保存为 PNG
-                    with io.BytesIO() as output_buffer:
-                        img.save(output_buffer, format="PNG")
-                        return base64.b64encode(output_buffer.getvalue()).decode("utf-8")
-
-        except Exception:
-            pass
-
-        # 转换失败，返回原数据
-        return base64_data
 
     def _iter_candidate_messages(self) -> list[Message]:
         context = getattr(getattr(self, "chat_stream", None), "context", None)
@@ -1335,11 +1247,7 @@ class LifeChatter(BaseChatter):
                     name=data.get("name") if isinstance(data.get("name"), str) else None,
                 )
             if part_type == "image":
-                # Gemini 不支持 GIF 格式，需要转换为 PNG
-                image_data = str(data.get("value") or "")
-                if self._is_gif_image(image_data, data.get("mime_type")):
-                    image_data = self._convert_gif_to_png(image_data)
-                return Image(image_data)
+                return Image(str(data.get("value") or ""))
             if part_type == "audio":
                 return Audio(
                     str(data.get("value") or ""),
@@ -2471,13 +2379,16 @@ class LifeChatter(BaseChatter):
             from src.core.managers.media_manager import get_media_manager
 
             manager = get_media_manager()
-            # 只跳过普通图片的预识别。表情包即使会作为原生 Image 进入模型，
-            # 也仍需要 VLM 生成文本描述，供日志、历史和非视觉链路使用。
-            manager.unskip_vlm_for_stream(stream_id, ["emoji"])
-            if bool(getattr(cfg, "native_image", True)):
-                manager.skip_vlm_for_stream(stream_id, ["image"])
-            else:
-                manager.unskip_vlm_for_stream(stream_id, ["image"])
+            visual_types = {
+                media_type
+                for media_type, enabled in (
+                    ("image", bool(getattr(cfg, "native_image", True))),
+                    ("emoji", bool(getattr(cfg, "native_emoji", True))),
+                )
+                if enabled
+            }
+            if visual_types:
+                manager.skip_vlm_for_stream(stream_id, visual_types)
         except Exception:
             logger.debug("同步原生视觉 VLM 跳过规则失败", exc_info=True)
 
@@ -2630,36 +2541,18 @@ class LifeChatter(BaseChatter):
         """模型在 max_rounds 内未产生可见回复时的最小兜底。
 
         内容保持短确认，不替模型续写复杂表达，避免把主体性兜底变成规则化代答。
-        根据消息类型给出最克制的"我在"信号。
         """
-        if not unread_msgs:
-            return "我在这里。"
+        latest_text = ""
+        if unread_msgs:
+            latest = unread_msgs[-1]
+            latest_text = str(
+                getattr(latest, "processed_plain_text", None)
+                or getattr(latest, "content", "")
+                or ""
+            ).strip()
 
-        latest = unread_msgs[-1]
-        latest_text = str(
-            getattr(latest, "processed_plain_text", None)
-            or getattr(latest, "content", "")
-            or ""
-        ).strip()
-        message_type = str(
-            getattr(getattr(latest, "message_type", None), "value", "")
-            or getattr(latest, "message_type", "")
-            or ""
-        ).strip().lower()
-
-        # 表情包/图片：用户在用图像表达情绪，文字兜底应该克制、温柔
-        if (
-            message_type in {"emoji", "image"}
-            or "[表情包" in latest_text
-            or "[图片" in latest_text
-        ):
-            return "我在。"
-
-        # 极短文本（呼唤、撒娇）：轻盈接住
         if latest_text and len(latest_text) <= 12:
             return "在呢，我看到你啦。"
-
-        # 长文本：保守确认
         return "我看到你的消息了。"
 
     async def _send_must_reply_fallback(
@@ -3242,15 +3135,6 @@ class LifeChatter(BaseChatter):
 
                 # pass 退出
                 if should_wait:
-                    # 主体性原则：pass 始终允许（沉默是合法选择）。
-                    # 但路由层已判定要回复，且整轮都没产生可见回复 → 发一句最小兜底，
-                    # 避免用户感觉被完全忽略。她仍然可以选择"轻轻接住后不展开"。
-                    if rt.must_reply and not rt.sent_visible_reply:
-                        logger.warning(
-                            "pass_and_wait 时仍处于 must_reply 且无可见回复，发送最小兜底"
-                        )
-                        await self._send_must_reply_fallback(chat_stream, rt.unreads)
-                        rt.must_reply = False
                     if self._has_tool_result_tail(llm_response):
                         llm_response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
                     self._transition(rt, _Phase.WAIT_USER, "pass_and_wait")
