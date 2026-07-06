@@ -23,6 +23,7 @@ from .web_tools import WEB_TOOLS
 from .rest_tools import REST_TOOLS, LifeEngineRestHeartbeatTool
 from .screen_tools import SCREEN_TOOLS, LifeEngineViewScreenTool
 from .autonomy_tools import AUTONOMY_TOOLS, LifeEngineScheduleAutonomyIntentTool
+from .skill_tools import SKILL_TOOLS, LifeEngineManageSkillTool
 from ..trace.tools import LIFE_TRACE_TOOLS
 from ..streams.tools import STREAM_TOOLS
 from ..narrative.tools import NARRATIVE_TOOLS, LifeEngineWriteNarrativeTool
@@ -47,6 +48,7 @@ __all__ = [
     "REST_TOOLS",
     "SCREEN_TOOLS",
     "AUTONOMY_TOOLS",
+    "SKILL_TOOLS",
     "LIFE_TRACE_TOOLS",
     "NARRATIVE_TOOLS",
     "LifeEngineWriteNarrativeTool",
@@ -54,6 +56,7 @@ __all__ = [
     "LifeEngineRestHeartbeatTool",
     "LifeEngineViewScreenTool",
     "LifeEngineScheduleAutonomyIntentTool",
+    "LifeEngineManageSkillTool",
     "LifeEngineReadFileTool",
     "LifeEngineWriteFileTool",
     "LifeEngineEditFileTool",

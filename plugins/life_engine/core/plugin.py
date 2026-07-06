@@ -22,6 +22,7 @@ from ..tools.grep_tools import GREP_TOOLS
 from ..tools.web_tools import WEB_TOOLS
 from ..tools.schedule_tools import SCHEDULE_TOOLS
 from ..tools.autonomy_tools import AUTONOMY_TOOLS
+from ..tools.skill_tools import SKILL_TOOLS
 from ..tools.event_grep_tools import EVENT_GREP_TOOLS
 from .compat_tools import (
     LifeThinkAction,
@@ -93,6 +94,7 @@ class LifeEnginePlugin(BasePlugin):
             *WEB_TOOLS,
             *SCHEDULE_TOOLS,
             *AUTONOMY_TOOLS,
+            *SKILL_TOOLS,
             *EVENT_GREP_TOOLS,
         ]
 

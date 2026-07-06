@@ -135,6 +135,12 @@
       "enabled": true
     },
     {
+      "component_type": "tool",
+      "component_name": "nucleus_manage_skill",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
       "component_type": "chatter",
       "component_name": "life_chatter",
       "dependencies": [],

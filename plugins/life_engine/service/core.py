@@ -2786,6 +2786,12 @@ class LifeEngineService(BaseService):
             "`speak` 的目标可以填「你可以触达的人和地方」里列出的 `target_key`，或精确 `target_stream_id`。",
             "都留空时，意向到点只会以事件浮现给心跳、不会唤醒表达层；不要猜测列表之外的目标。",
             "保持沉默也是主体选择：如果你想确认自己不会打扰，可以登记 `kind=silence`。", "",
+            "### `nucleus_manage_skill` — 沉淀自己的工作方式", "",
+            "skill 是你对自己稳定工作方式的沉淀，不是替用户执行任务的后台脚本。",
+            "只有当你反复发现某种做事习惯、判断边界或内部流程值得保留下来，才考虑起草 skill。",
+            "先 draft，再观察，再 publish；发布不是命令表达层必须使用，只是让未来的你更容易想起这套方法。",
+            "当前只允许 instruction-only skill；包含脚本、shell、外部 API 或自动执行能力的内容不要静默发布。",
+            "不要为了单次用户请求创建 skill；那属于表达层当场处理，不应变成长期能力。", "",
             "### 工具边界", "",
             "- `nucleus_search_memory` 是历史检索，不要反复重搜同一主题",
             "- 本地文件工具只用于你的私有工作区、日记、笔记和 MEMORY 维护，不用于替用户查项目或改项目",
@@ -3006,9 +3012,10 @@ class LifeEngineService(BaseService):
         from ..tools.grep_tools import GREP_TOOLS
         from ..tools.schedule_tools import SCHEDULE_TOOLS
         from ..tools.autonomy_tools import AUTONOMY_TOOLS
+        from ..tools.skill_tools import SKILL_TOOLS
         from ..tools.event_grep_tools import EVENT_GREP_TOOLS
 
-        return ALL_TOOLS + TODO_TOOLS + MEMORY_TOOLS + GREP_TOOLS + WEB_TOOLS + STREAM_TOOLS + SCHEDULE_TOOLS + AUTONOMY_TOOLS + EVENT_GREP_TOOLS
+        return ALL_TOOLS + TODO_TOOLS + MEMORY_TOOLS + GREP_TOOLS + WEB_TOOLS + STREAM_TOOLS + SCHEDULE_TOOLS + AUTONOMY_TOOLS + SKILL_TOOLS + EVENT_GREP_TOOLS
 
     @staticmethod
     def _heartbeat_tool_call_metadata(call: Any) -> tuple[str, dict[str, Any]]:

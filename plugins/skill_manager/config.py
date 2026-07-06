@@ -27,6 +27,7 @@ class SkillManagerConfig(BaseConfig):
                 "skill",
                 "skills",
                 "data/life_engine_workspace",
+                "data/life_engine_workspace/skills",
                 "~/.agents/skills",
                 "~/.agents/skills/huashu-nuwa/examples",
                 "~/.codex/skills/.system",
