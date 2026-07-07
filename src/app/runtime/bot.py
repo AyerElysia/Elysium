@@ -919,9 +919,9 @@ class Bot:
             await close_all_vector_db_services()
 
             # 11. 关闭日志系统（停止事件广播）
-            from src.kernel.logger import shutdown_logger_system
+            from src.kernel.logger import shutdown_logger_system_async
 
-            shutdown_logger_system()
+            await shutdown_logger_system_async()
 
             self.ui.display_success("关闭完成")
 

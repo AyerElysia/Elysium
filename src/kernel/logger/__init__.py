@@ -52,6 +52,7 @@ from .logger import (
     get_all_loggers,
     clear_all_loggers,
     shutdown_logger_system,
+    shutdown_logger_system_async,
     install_rich_traceback_formatter,
     LOG_OUTPUT_EVENT,
 )
@@ -63,6 +64,7 @@ __all__ = [
     "initialize_logger_system",
     "get_global_log_config",
     "shutdown_logger_system",
+    "shutdown_logger_system_async",
     # 主要接口
     "get_logger",
     "Logger",

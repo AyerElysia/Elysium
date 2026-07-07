@@ -1257,6 +1257,43 @@ class TestEventBroadcast:
         finally:
             unsubscribe()
 
+    async def test_shutdown_drains_log_event_broadcast_tasks(self) -> None:
+        """关闭日志系统时应收尾已创建的日志事件广播任务。"""
+        from src.kernel.logger import initialize_logger_system, shutdown_logger_system_async
+
+        initialize_logger_system(enable_file=False, enable_event_broadcast=True)
+        console = Console(file=StringIO())
+        logger = get_logger(
+            "shutdown_broadcast_test",
+            enable_event_broadcast=True,
+            console=console,
+        )
+        received_logs: list[str] = []
+
+        async def log_handler(event_name: str, params: dict):
+            if params.get("logger_name") == "shutdown_broadcast_test":
+                await asyncio.sleep(0.01)
+                received_logs.append(params["message"])
+            from src.kernel.event import EventDecision
+            return (EventDecision.SUCCESS, params)
+
+        from src.kernel.event import get_event_bus
+        unsubscribe = get_event_bus().subscribe(LOG_OUTPUT_EVENT, log_handler)
+
+        try:
+            logger.info("before shutdown")
+
+            await shutdown_logger_system_async(timeout=1.0)
+
+            assert received_logs == ["before shutdown"]
+
+            logger.info("after shutdown")
+            await asyncio.sleep(0.05)
+            assert received_logs == ["before shutdown"]
+        finally:
+            unsubscribe()
+            initialize_logger_system(enable_file=False, enable_event_broadcast=True)
+
     async def test_log_event_timestamp_format(self) -> None:
         """测试日志事件时间戳格式"""
         from datetime import datetime

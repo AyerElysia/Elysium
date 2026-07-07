@@ -37,6 +37,10 @@ def _get_event_bus() -> EventBus:
 # 日志广播事件名称
 LOG_OUTPUT_EVENT = "log_output"
 
+_event_broadcast_tasks: set[asyncio.Task[Any]] = set()
+_event_broadcast_lock = threading.Lock()
+_event_broadcast_stopped = False
+
 # get_logger 默认颜色池（仅当未显式传 color 时使用）
 # 使用 16 个十六进制颜色，避免与 COLOR 枚举中的命名颜色重复。
 _DEFAULT_NAME_COLOR_PALETTE: tuple[str, ...] = (
@@ -57,6 +61,69 @@ _DEFAULT_NAME_COLOR_PALETTE: tuple[str, ...] = (
     "#C0CAF5",
     "#BB9AF7",
 )
+
+
+def _set_event_broadcast_stopped(value: bool) -> None:
+    global _event_broadcast_stopped
+    with _event_broadcast_lock:
+        _event_broadcast_stopped = value
+
+
+def _discard_event_broadcast_task(task: asyncio.Task[Any]) -> None:
+    with _event_broadcast_lock:
+        _event_broadcast_tasks.discard(task)
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except Exception:
+        pass
+
+
+def _schedule_event_broadcast(event_bus: EventBus, log_data: dict[str, Any]) -> None:
+    with _event_broadcast_lock:
+        if _event_broadcast_stopped:
+            return
+
+    task = asyncio.create_task(
+        event_bus.publish(LOG_OUTPUT_EVENT, log_data),
+        name="log_event_broadcast",
+    )
+
+    with _event_broadcast_lock:
+        if _event_broadcast_stopped:
+            task.cancel()
+        else:
+            _event_broadcast_tasks.add(task)
+    task.add_done_callback(_discard_event_broadcast_task)
+    if task.done():
+        _discard_event_broadcast_task(task)
+
+
+def _maybe_resume_event_broadcast() -> None:
+    with _config_lock:
+        enabled = bool(_global_config.get("enable_event_broadcast", True))
+    if enabled:
+        _set_event_broadcast_stopped(False)
+
+
+async def _drain_event_broadcast_tasks(timeout: float = 1.0) -> None:
+    with _event_broadcast_lock:
+        tasks = [task for task in _event_broadcast_tasks if not task.done()]
+
+    if not tasks:
+        return
+
+    done, pending = await asyncio.wait(tasks, timeout=max(0.0, float(timeout)))
+    for task in done:
+        _discard_event_broadcast_task(task)
+
+    if not pending:
+        return
+
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
 
 
 def _get_default_logger_color_by_name(name: str) -> str:
@@ -344,9 +411,7 @@ class Logger:
             # 尝试发布事件（即发即弃）
             try:
                 asyncio.get_running_loop()
-                # 有运行中的事件循环
-                # 直接使用 ensure_future 安排任务
-                asyncio.ensure_future(event_bus.publish(LOG_OUTPUT_EVENT, log_data))
+                _schedule_event_broadcast(event_bus, log_data)
             except RuntimeError:
                 # 没有运行中的事件循环
                 # 事件广播是可选功能，静默忽略
@@ -514,6 +579,7 @@ def initialize_logger_system(
         ... )
     """
     global _global_file_handler
+    _set_event_broadcast_stopped(False)
     
     with _config_lock:
         _global_config["log_dir"] = log_dir
@@ -590,6 +656,7 @@ def get_logger(
     """
     with _lock:
         if name not in _loggers:
+            _maybe_resume_event_broadcast()
             # 使用全局配置作为默认值
             with _config_lock:
                 actual_enable_file = enable_file if enable_file is not None else _global_config["enable_file"]
@@ -636,19 +703,40 @@ def get_all_loggers() -> dict[str, Logger]:
     with _lock:
         return dict(_loggers)
 
-def shutdown_logger_system() -> None:
-    """关闭日志系统，释放所有资源
-    
-    包括关闭全局文件处理器和清除所有logger。
-    建议在程序退出时调用。
-    """
+def _close_global_file_handler() -> None:
     global _global_file_handler
 
-    # 关闭全局文件处理器
     with _file_handler_lock:
         if _global_file_handler is not None:
             _global_file_handler.close()
             _global_file_handler = None
+
+
+async def shutdown_logger_system_async(timeout: float = 1.0) -> None:
+    """异步关闭日志系统，先收尾日志事件广播任务。"""
+    _set_event_broadcast_stopped(True)
+    await _drain_event_broadcast_tasks(timeout=timeout)
+    _close_global_file_handler()
+
+
+def shutdown_logger_system() -> None:
+    """关闭日志系统，释放所有资源。
+
+    在异步运行时中优先使用 shutdown_logger_system_async()，这样可以等待
+    已经创建的日志事件广播任务结束，避免事件循环关闭时报 pending task。
+    """
+    _set_event_broadcast_stopped(True)
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # 没有运行中的事件循环时，不能再有活跃 asyncio task。
+        pass
+    else:
+        with _event_broadcast_lock:
+            tasks = [task for task in _event_broadcast_tasks if not task.done()]
+        for task in tasks:
+            task.cancel()
+    _close_global_file_handler()
 
 
 def install_rich_traceback_formatter():
@@ -662,6 +750,3 @@ def install_rich_traceback_formatter():
         word_wrap=False,
         show_locals=False,
     )
-
-
-
