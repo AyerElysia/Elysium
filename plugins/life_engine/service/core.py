@@ -1475,6 +1475,8 @@ class LifeEngineService(BaseService):
         target_stream_id: str = "",
         target_key: str = "",
         constraints: list[str] | None = None,
+        repeat: bool = False,
+        interval_minutes: int | None = None,
     ) -> dict[str, Any]:
         """登记一个 life_engine 自主形成的延迟意向。"""
         cfg = self._cfg()
@@ -1496,6 +1498,8 @@ class LifeEngineService(BaseService):
             target_key=target_key,
             target_stream_id=resolved_stream_id,
             constraints=constraints or [],
+            repeat=repeat,
+            interval_minutes=interval_minutes,
         )
 
         async with self._get_lock():
@@ -1506,9 +1510,10 @@ class LifeEngineService(BaseService):
                 raise RuntimeError("调度器尚未启动，稍后再登记自主意向") from exc
             store.upsert(intent)
 
+        repeat_text = f"repeat=每隔{intent.interval_minutes}分钟 " if intent.repeat else ""
         event_text = (
             f"已登记自主意向：kind={intent.kind} delay={intent.delay_minutes}分钟 "
-            f"motivation={intent.motivation}"
+            f"{repeat_text}motivation={intent.motivation}"
         )
         event = self._event_builder.build_autonomy_intent_event(
             event_text,
@@ -1528,6 +1533,7 @@ class LifeEngineService(BaseService):
         logger.info(
             "新意向: "
             f"kind={intent.kind} delay={intent.delay_minutes}m "
+            f"repeat={intent.repeat} "
             f"intent_id={intent.intent_id[:12]} "
             f"stream={intent.target_stream_id or '-'}"
         )
@@ -1536,6 +1542,8 @@ class LifeEngineService(BaseService):
             "intent_id": intent.intent_id,
             "kind": intent.kind,
             "delay_minutes": intent.delay_minutes,
+            "repeat": intent.repeat,
+            "interval_minutes": intent.interval_minutes,
             "scheduled_at": intent.scheduled_at,
             "status": intent.status,
             "target_stream_id": intent.target_stream_id,
@@ -1594,14 +1602,23 @@ class LifeEngineService(BaseService):
             )
             return {"triggered": False, "reason": f"status={intent.status}"}
 
-        intent.status = "triggered"
         intent.triggered_at = _now_iso()
+        intent.occurrence_count = max(0, int(intent.occurrence_count or 0)) + 1
+        if intent.repeat:
+            next_minutes = int(intent.interval_minutes or intent.delay_minutes or 1)
+            intent.scheduled_at = (
+                datetime.now(timezone.utc).astimezone() + timedelta(minutes=next_minutes)
+            ).isoformat()
+            intent.status = "scheduled"
+        else:
+            intent.status = "triggered"
         intent.updated_at = intent.triggered_at
         store.upsert(intent)
 
         logger.info(
             "到点: "
             f"intent_id={intent.intent_id[:12]} kind={intent.kind} "
+            f"repeat={intent.repeat} occurrence={intent.occurrence_count} "
             f"stream={intent.target_stream_id or '-'}"
         )
 
@@ -1620,7 +1637,14 @@ class LifeEngineService(BaseService):
                     source_event_id=intent.intent_id,
                 )
                 logger.info(f"仲裁: downgraded intent_id={intent.intent_id[:12]} reason=no_target_stream")
-                return {"triggered": True, "dispatch": "life_event", "reason": "no_target_stream"}
+                return {
+                    "triggered": True,
+                    "dispatch": "life_event",
+                    "reason": "no_target_stream",
+                    "repeat": intent.repeat,
+                    "next_scheduled_at": intent.scheduled_at if intent.repeat else "",
+                    "occurrence_count": intent.occurrence_count,
+                }
             await self._wake_stream_for_autonomy(intent)
             self._record_life_moment(
                 kind="intent",
@@ -1630,7 +1654,14 @@ class LifeEngineService(BaseService):
                 stream_id=intent.target_stream_id,
             )
             logger.info(f"承接: life_chatter intent_id={intent.intent_id[:12]}")
-            return {"triggered": True, "dispatch": "life_chatter", "stream_id": intent.target_stream_id}
+            return {
+                "triggered": True,
+                "dispatch": "life_chatter",
+                "stream_id": intent.target_stream_id,
+                "repeat": intent.repeat,
+                "next_scheduled_at": intent.scheduled_at if intent.repeat else "",
+                "occurrence_count": intent.occurrence_count,
+            }
 
         if intent.kind == "reflect":
             event = self._event_builder.build_autonomy_intent_event(
@@ -1646,7 +1677,13 @@ class LifeEngineService(BaseService):
                 source_event_id=intent.intent_id,
             )
             logger.info(f"承接: life_engine intent_id={intent.intent_id[:12]}")
-            return {"triggered": True, "dispatch": "life_engine"}
+            return {
+                "triggered": True,
+                "dispatch": "life_engine",
+                "repeat": intent.repeat,
+                "next_scheduled_at": intent.scheduled_at if intent.repeat else "",
+                "occurrence_count": intent.occurrence_count,
+            }
 
         event = self._event_builder.build_autonomy_intent_event(
             f"自主意向到点后选择沉默：{intent.motivation}",
@@ -1661,7 +1698,13 @@ class LifeEngineService(BaseService):
             source_event_id=intent.intent_id,
         )
         logger.info(f"承接: silence intent_id={intent.intent_id[:12]}")
-        return {"triggered": True, "dispatch": "silence"}
+        return {
+            "triggered": True,
+            "dispatch": "silence",
+            "repeat": intent.repeat,
+            "next_scheduled_at": intent.scheduled_at if intent.repeat else "",
+            "occurrence_count": intent.occurrence_count,
+        }
 
     async def _wake_stream_for_autonomy(self, intent: AutonomyIntent) -> None:
         """把到点自主意向注入目标聊天流，交给 life_chatter 承接。"""
@@ -2781,6 +2824,8 @@ class LifeEngineService(BaseService):
             "当你不是要立刻补信息差，而是自己形成了一个“过一会儿再让它浮上来”的意向时，用这个工具。",
             "它不是规则触发器，也不是命令表达层；它只是给未来的你留下一个意向。",
             "只填写 `delay_minutes`，不要填写绝对时间；系统会自动换算真实触发时间。",
+            "如果你想让同一个意向每隔一段时间自然浮现，可以设置 `repeat=true`；`interval_minutes` 留空时默认等于 `delay_minutes`。",
+            "周期意向也不是机械任务：每次到点都要重新判断是否承接、是否开口、是否保持沉默。",
             "可用 kind：`speak`（到点交给 life_chatter 重新判断）、`reflect`（到点回到中枢继续想）、`silence`（到点记录选择沉默）。",
             "`speak` 只能写动机、目标提示和约束；不要写最终回复话术，不要教表达层具体怎么说。",
             "`speak` 的目标可以填「你可以触达的人和地方」里列出的 `target_key`，或精确 `target_stream_id`。",

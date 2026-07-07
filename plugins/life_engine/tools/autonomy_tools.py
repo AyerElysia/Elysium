@@ -14,6 +14,7 @@ class LifeEngineScheduleAutonomyIntentTool(BaseTool):
     tool_description = (
         "登记一个由 life_engine 自己形成的延迟自主意向。"
         "这不是命令表达层立刻行动，也不是规则触发；只是让某个意向在 delay_minutes 后重新浮现。"
+        "如果 repeat=true，则到点后会每隔 interval_minutes 继续浮现；interval_minutes 留空时使用 delay_minutes。"
         "\n\n"
         "kind 支持：speak / reflect / silence。"
         "\n- speak：到点后把意向交给 life_chatter 重新判断是否开口。"
@@ -21,6 +22,7 @@ class LifeEngineScheduleAutonomyIntentTool(BaseTool):
         "\n- silence：到点后只记录选择沉默，不打扰任何聊天。"
         "\n\n"
         "只能填写 delay_minutes，不要填写绝对时间。"
+        "周期意向也只是反复浮现，不代表必须行动或必须开口。"
         "speak 只能写 motivation、target_hint 和 constraints，不能写最终回复话术。"
         "speak 的目标可填心跳里看到的 target_key，或精确 target_stream_id；"
         "都留空时意向到点只会以事件浮现给心跳、不会唤醒表达层，不要猜测列表之外的目标。"
@@ -36,6 +38,8 @@ class LifeEngineScheduleAutonomyIntentTool(BaseTool):
         target_stream_id: Annotated[str, "可选：精确聊天流 ID。speak 到点后会唤醒该流"] = "",
         target_key: Annotated[str, "可选：心跳里「你可以触达的人和地方」列出的目标 key"] = "",
         constraints: Annotated[list[str] | None, "表达层承接时应知道的约束，不是台词"] = None,
+        repeat: Annotated[bool, "是否周期性重复浮现；默认 false"] = False,
+        interval_minutes: Annotated[int | None, "repeat=true 时每隔多少分钟再次浮现；留空则使用 delay_minutes"] = None,
     ) -> tuple[bool, str | dict]:
         service = getattr(self.plugin, "service", None)
         if service is None:
@@ -49,6 +53,8 @@ class LifeEngineScheduleAutonomyIntentTool(BaseTool):
                 target_stream_id=target_stream_id,
                 target_key=target_key,
                 constraints=constraints or [],
+                repeat=repeat,
+                interval_minutes=interval_minutes,
             )
         except Exception as exc:  # noqa: BLE001
             return False, str(exc)

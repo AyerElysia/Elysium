@@ -24,7 +24,7 @@ AutonomyIntentKind = Literal["speak", "reflect", "silence"]
 AutonomyIntentStatus = Literal["scheduled", "triggered", "expired", "cancelled", "rejected"]
 
 _STORE_FILE = "autonomy_intents.json"
-_STORE_VERSION = 1
+_STORE_VERSION = 2
 _LOCK: asyncio.Lock | None = None
 
 
@@ -89,6 +89,9 @@ class AutonomyIntent:
     rejected_reason: str = ""
     schedule_id: str = ""
     task_name: str = ""
+    repeat: bool = False
+    interval_minutes: int = 0
+    occurrence_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -97,6 +100,11 @@ class AutonomyIntent:
     def from_dict(cls, data: dict[str, Any]) -> "AutonomyIntent":
         intent_id = str(data.get("intent_id") or uuid4().hex)
         task_name = str(data.get("task_name") or normalize_intent_task_name(intent_id))
+        delay_minutes = int(data.get("delay_minutes") or 1)
+        repeat = bool(data.get("repeat") or data.get("recurring"))
+        interval_minutes = int(data.get("interval_minutes") or 0)
+        if repeat and interval_minutes <= 0:
+            interval_minutes = delay_minutes
         constraints_raw = data.get("constraints") or []
         constraints = [
             _shorten(item, max_length=120)
@@ -107,7 +115,7 @@ class AutonomyIntent:
             intent_id=intent_id,
             kind=str(data.get("kind") or "reflect"),  # type: ignore[arg-type]
             motivation=_shorten(data.get("motivation"), max_length=600),
-            delay_minutes=int(data.get("delay_minutes") or 1),
+            delay_minutes=delay_minutes,
             scheduled_at=str(data.get("scheduled_at") or iso_now()),
             status=str(data.get("status") or "scheduled"),  # type: ignore[arg-type]
             target_hint=_shorten(data.get("target_hint"), max_length=160),
@@ -120,6 +128,9 @@ class AutonomyIntent:
             rejected_reason=_shorten(data.get("rejected_reason"), max_length=240),
             schedule_id=str(data.get("schedule_id") or ""),
             task_name=task_name,
+            repeat=repeat,
+            interval_minutes=interval_minutes,
+            occurrence_count=max(0, int(data.get("occurrence_count") or 0)),
         )
 
 
@@ -200,6 +211,8 @@ def build_intent(
     target_key: str = "",
     target_stream_id: str = "",
     constraints: list[str] | None = None,
+    repeat: bool = False,
+    interval_minutes: int | None = None,
 ) -> AutonomyIntent:
     kind_value = str(kind or "").strip().lower()
     if kind_value not in {"speak", "reflect", "silence"}:
@@ -213,6 +226,11 @@ def build_intent(
     max_delay = max(min_delay, int(max_delay_minutes or 1440))
     if delay < min_delay or delay > max_delay:
         raise ValueError(f"delay_minutes 必须在 {min_delay} 到 {max_delay} 之间")
+
+    repeat_value = bool(repeat)
+    interval = int(interval_minutes or delay)
+    if repeat_value and (interval < min_delay or interval > max_delay):
+        raise ValueError(f"interval_minutes 必须在 {min_delay} 到 {max_delay} 之间")
 
     created = iso_now()
     scheduled = (now_local() + timedelta(minutes=delay)).isoformat()
@@ -235,17 +253,28 @@ def build_intent(
         created_at=created,
         updated_at=created,
         task_name=normalize_intent_task_name(intent_id),
+        repeat=repeat_value,
+        interval_minutes=interval if repeat_value else 0,
     )
 
 
 def format_due_message(intent: AutonomyIntent) -> str:
+    title = "周期性自主意向浮现" if intent.repeat else "自主意向浮现"
+    source = (
+        "这是 life_engine 之前自己留下的一个周期性意向；请像平时一样重新判断：现在是否还适合承接、是否要开口、如何开口，或者选择 pass_and_wait。"
+        if intent.repeat
+        else "这是 life_engine 之前自己留下的一个延迟意向；请像平时一样重新判断：现在是否还适合承接、是否要开口、如何开口，或者选择 pass_and_wait。"
+    )
     lines = [
-        "[自主意向浮现] 这不是用户的新消息，也不是系统命令。",
-        "这是 life_engine 之前自己留下的一个延迟意向；请像平时一样重新判断：现在是否还适合承接、是否要开口、如何开口，或者选择 pass_and_wait。",
+        f"[{title}] 这不是用户的新消息，也不是系统命令。",
+        source,
         f"- 意向类型：{intent.kind}",
         f"- 当时的动机：{intent.motivation}",
         f"- 主观延迟：{intent.delay_minutes} 分钟",
     ]
+    if intent.repeat:
+        lines.append(f"- 周期：每隔 {intent.interval_minutes or intent.delay_minutes} 分钟浮现一次")
+        lines.append(f"- 浮现次数：第 {max(1, intent.occurrence_count)} 次")
     if intent.target_hint:
         lines.append(f"- 目标提示：{intent.target_hint}")
     if intent.constraints:
@@ -267,11 +296,15 @@ async def schedule_autonomy_intent(plugin: Any, intent: AutonomyIntent) -> str:
     scheduled_at = parse_iso_datetime(intent.scheduled_at)
     if scheduled_at is None:
         raise ValueError("scheduled_at 无效")
+    trigger_config: dict[str, Any] = {"trigger_at": scheduled_at.replace(tzinfo=None)}
+    is_recurring = bool(intent.repeat)
+    if is_recurring:
+        trigger_config["interval_seconds"] = float(intent.interval_minutes or intent.delay_minutes) * 60.0
     schedule_id = await scheduler.create_schedule(
         callback=_callback,
         trigger_type=TriggerType.TIME,
-        trigger_config={"trigger_at": scheduled_at.replace(tzinfo=None)},
-        is_recurring=False,
+        trigger_config=trigger_config,
+        is_recurring=is_recurring,
         task_name=intent.task_name or normalize_intent_task_name(intent.intent_id),
         force_overwrite=True,
     )
