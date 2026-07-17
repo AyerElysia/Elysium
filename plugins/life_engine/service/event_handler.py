@@ -24,16 +24,16 @@ class LifeEngineMessageCollectorHandler(BaseEventHandler):
     intercept_message = False
     init_subscribe: list[EventType | str] = [
         EventType.ON_MESSAGE_RECEIVED,
-        EventType.ON_MESSAGE_SENT,
+        EventType.ON_MESSAGE_DELIVERED,
     ]
 
     async def execute(
         self, event_name: str, params: dict[str, Any]
     ) -> tuple[EventDecision, dict[str, Any]]:
-        """把收发消息事件中的 message 记录到 life_engine 服务队列。"""
+        """把已接收或已确认投递的 message 记录到 life_engine 服务队列。"""
         if event_name not in {
             EventType.ON_MESSAGE_RECEIVED.value,
-            EventType.ON_MESSAGE_SENT.value,
+            EventType.ON_MESSAGE_DELIVERED.value,
         }:
             return EventDecision.PASS, params
 
@@ -51,10 +51,16 @@ class LifeEngineMessageCollectorHandler(BaseEventHandler):
                 return EventDecision.SUCCESS, params
 
             direction = "received"
-            if event_name == EventType.ON_MESSAGE_SENT.value:
+            sent_confirmed = False
+            if event_name == EventType.ON_MESSAGE_DELIVERED.value:
                 direction = "sent"
+                sent_confirmed = True
 
-            await service.record_message(message, direction=direction)
+            await service.record_message(
+                message,
+                direction=direction,
+                sent_confirmed=sent_confirmed,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.error(f"life_engine 收集消息失败: {exc}")
             log_error(

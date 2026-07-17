@@ -43,8 +43,10 @@
 2. MessageSender 根据 platform 推断或使用指定 adapter_signature。
 3. MessageConverter.message_to_envelope 构建 MessageEnvelope。
 4. 发布 ON_MESSAGE_SENT 事件（允许拦截）。
-5. 调用 Adapter._send_platform_message 发送到平台。
-6. 写入 sent message 历史（StreamManager）。
+5. 在前置事件允许后检查投递状态未知消息的短窗重试。
+6. 调用 Adapter._send_platform_message 发送到平台。
+7. 写入 sent message 历史（StreamManager）。
+8. 历史实际写入后发布 ON_MESSAGE_DELIVERED 事件。
 
 ## 关键事件
 
@@ -53,6 +55,7 @@
 - ON_ALL_PLUGIN_LOADED: 启动 StreamLoopManager。
 - ON_CHATTER_STEP: 每个 tick 前的对话步进钩子。
 - ON_MESSAGE_SENT: 出站消息下发前的拦截与补充入口。
+- ON_MESSAGE_DELIVERED: 适配器成功且历史实际写入后的确认投递事件。
 
 ## 运行时协作关系
 

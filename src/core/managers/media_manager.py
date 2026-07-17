@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import io
 import shutil
 import time
 from collections import OrderedDict, deque
@@ -1072,6 +1073,11 @@ class MediaManager:
             clean_base64 = self._extract_clean_base64(base64_data)
             mime_type = self._extract_image_mime_type(base64_data)
 
+            # Gemini 不支持 GIF。data URL 的 MIME 和原始 base64 的文件头都要检查。
+            if self._is_gif_image_data(base64_data, mime_type):
+                image_data, mime_type = self._convert_gif_to_png(base64_data)
+                clean_base64 = self._extract_clean_base64(image_data)
+
             # 使用标准的 data URL 格式（大多数 VLM API 都支持）
             image_value = f"data:{mime_type};base64,{clean_base64}"
 
@@ -1437,6 +1443,56 @@ class MediaManager:
             if mime_type.startswith("image/"):
                 return mime_type
         return "image/png"
+
+    @staticmethod
+    def _is_gif_image_data(data: str, mime_type: str = "") -> bool:
+        """通过 data URL MIME 或二进制文件头检测 GIF。"""
+        if str(mime_type or "").strip().lower() == "image/gif":
+            return True
+
+        if data.startswith("data:"):
+            data_url_mime = data[5:].split(";", 1)[0].strip().lower()
+            if data_url_mime == "image/gif":
+                return True
+
+        try:
+            raw = base64.b64decode(
+                MediaManager._extract_clean_base64(data),
+                validate=True,
+            )
+        except Exception:
+            return False
+        return raw.startswith((b"GIF87a", b"GIF89a"))
+
+    @staticmethod
+    def _convert_gif_to_png(base64_data: str) -> tuple[str, str]:
+        """把 GIF 第一帧转为 PNG；不可转换时保留原始数据。"""
+        original_data = base64_data
+        try:
+            from PIL import Image as PILImage
+
+            image_bytes = base64.b64decode(
+                MediaManager._extract_clean_base64(base64_data),
+                validate=True,
+            )
+            with io.BytesIO(image_bytes) as input_buffer:
+                with PILImage.open(input_buffer) as img:
+                    if getattr(img, "n_frames", 1) > 1:
+                        img.seek(0)
+                    if img.mode in ("RGBA", "LA", "P"):
+                        background = PILImage.new("RGB", img.size, (255, 255, 255))
+                        if img.mode == "P":
+                            img = img.convert("RGBA")
+                        mask = img.split()[-1] if img.mode == "RGBA" else None
+                        background.paste(img, mask=mask)
+                        img = background
+                    elif img.mode != "RGB":
+                        img = img.convert("RGB")
+                    with io.BytesIO() as output_buffer:
+                        img.save(output_buffer, format="PNG")
+                        return base64.b64encode(output_buffer.getvalue()).decode("ascii"), "image/png"
+        except Exception:
+            return original_data, "image/gif"
 
     @staticmethod
     def _extract_video_payload(video_data: str | dict[str, Any]) -> tuple[str, dict[str, Any]]:

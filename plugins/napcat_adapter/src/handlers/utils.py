@@ -246,17 +246,25 @@ async def get_member_info(
 
 async def get_image_base64(url: str) -> str:
     # sourcery skip: raise-specific-error
-    """下载图片/视频并返回Base64"""
+    """下载图片/视频并返回Base64。"""
     logger.debug(f"下载图片: {url}")
     try:
         if not url:
             raise ValueError("图片URL为空")
 
         timeout = httpx.Timeout(timeout=10.0, connect=5.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            image_bytes = response.content
+        try:
+            # 默认遵循系统或应用配置的代理。
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                image_bytes = response.content
+        except (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout) as e:
+            logger.warning(f"图片下载代理/连接失败，重试直连: {e!s}")
+            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                image_bytes = response.content
 
         if not image_bytes:
             raise ValueError("图片内容为空")

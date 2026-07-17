@@ -33,7 +33,7 @@ class MiniCPMLiveUnifiedEventHandler(BaseEventHandler):
     intercept_message = False
     init_subscribe: list[EventType | str] = [
         EventType.ON_MESSAGE_RECEIVED,
-        EventType.ON_MESSAGE_SENT,
+        EventType.ON_MESSAGE_DELIVERED,
     ]
 
     async def execute(
@@ -59,7 +59,11 @@ class MiniCPMLiveUnifiedEventHandler(BaseEventHandler):
         ):
             return EventDecision.PASS, params
 
-        direction = "sent" if event_name == EventType.ON_MESSAGE_SENT.value else "received"
+        direction = (
+            "sent"
+            if event_name == EventType.ON_MESSAGE_DELIVERED.value
+            else "received"
+        )
         content = (
             getattr(message, "processed_plain_text", None)
             or (getattr(message, "content", "") if isinstance(getattr(message, "content", ""), str) else "")

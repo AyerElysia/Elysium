@@ -286,6 +286,28 @@ def test_send_platform_message_propagates_send_handler_error() -> None:
         asyncio.run(adapter._send_platform_message({"message_info": {}, "message_segment": {}}))
 
 
+@pytest.mark.asyncio
+async def test_send_platform_message_preserves_napcat_timeout_cause() -> None:
+    """Napcat API 超时应保留原始 TimeoutError 异常链。"""
+    plugin = _build_napcat_plugin()
+    adapter = NapcatAdapter(core_sink=cast(Any, _FakeCoreSink()), plugin=plugin)
+    adapter.send_napcat_api = AsyncMock(side_effect=TimeoutError("napcat timeout"))
+    envelope = {
+        "message_info": {
+            "user_info": {"user_id": "987654"},
+        },
+        "message_segment": [
+            {"type": "text", "data": "timeout"},
+        ],
+    }
+
+    with pytest.raises(RuntimeError, match="Napcat 消息发送超时") as exc_info:
+        await adapter._send_platform_message(envelope)
+
+    assert isinstance(exc_info.value.__cause__, TimeoutError)
+    assert str(exc_info.value.__cause__) == "napcat timeout"
+
+
 def test_send_normal_message_splits_multiline_text_into_multiple_napcat_messages() -> None:
     """NapCat 出站文本包含换行时，应拆成多条消息发送。"""
     plugin = _build_napcat_plugin()

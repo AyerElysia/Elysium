@@ -26,7 +26,7 @@ class LiveChatEventHandler(BaseEventHandler):
     handler_description = "监听消息事件并实时推送到 WebUI"
     weight = 0
     intercept_message = False
-    init_subscribe = [EventType.ON_MESSAGE_RECEIVED, EventType.ON_MESSAGE_SENT]
+    init_subscribe = [EventType.ON_MESSAGE_RECEIVED, EventType.ON_MESSAGE_DELIVERED]
 
     async def execute(
         self, event_name: str, params: dict[str, Any]
@@ -36,7 +36,7 @@ class LiveChatEventHandler(BaseEventHandler):
         Args:
             event_name: 触发本处理器的事件名称
             params: 事件参数字典，包含 message 对象
-                   ON_MESSAGE_RECEIVED / ON_MESSAGE_SENT: {
+                   ON_MESSAGE_RECEIVED / ON_MESSAGE_DELIVERED: {
                        'message': Message,
                        'envelope': MessageEnvelope,
                        'adapter_signature': str,
@@ -55,8 +55,13 @@ class LiveChatEventHandler(BaseEventHandler):
             if not message:
                 return EventDecision.PASS, params
 
-            # 判断是否为发送事件
-            is_sent = event_name == EventType.ON_MESSAGE_SENT or params.get("event_type") == EventType.ON_MESSAGE_SENT
+            # 仅确认投递事件代表已发送消息；发送前事件不在本处理器订阅范围内。
+            event_type = params.get("event_type")
+            is_sent = (
+                event_name == EventType.ON_MESSAGE_DELIVERED.value
+                or event_type == EventType.ON_MESSAGE_DELIVERED
+                or event_type == EventType.ON_MESSAGE_DELIVERED.value
+            )
 
             # 构建消息数据并广播
             message_data = await self._build_message_data(message, is_sent)

@@ -4,6 +4,11 @@
 参考 old/chat/message_receive/uni_message_sender.py 的设计。
 """
 
+import hashlib
+import json
+import threading
+import time
+from collections import deque
 from typing import TYPE_CHECKING, Any
 
 from mofox_wire import MessageEnvelope
@@ -15,6 +20,9 @@ if TYPE_CHECKING:
 
 logger = get_logger("message_sender")
 
+_DEDUP_WINDOW_SECONDS = 30.0
+_DEDUP_MAX_ENTRIES = 256
+
 
 class MessageSender:
     """消息发送器。
@@ -25,8 +33,8 @@ class MessageSender:
     1. 使用 MessageConverter 将 Message 转换为 MessageEnvelope
     2. 根据 platform 推断目标 Adapter
     3. 通过 AdapterManager 获取 Adapter 实例
-    4. 调用 Adapter._send_platform_message() 发送消息
-    5. 触发发送事件
+    4. 发布发送前事件并调用 Adapter._send_platform_message() 发送消息
+    5. 历史写入后发布确认投递事件
 
     Attributes:
         _converter: 消息转换器
@@ -43,6 +51,9 @@ class MessageSender:
 
         self._converter = MessageConverter()
         self._adapter_manager: Any = None
+        self._unknown_delivery_fingerprints: deque[tuple[float, str]] = deque()
+        self._unknown_delivery_fingerprint_set: set[str] = set()
+        self._dedupe_lock = threading.Lock()
         logger.info("MessageSender 初始化完成")
 
     def set_adapter_manager(self, adapter_manager: Any) -> None:
@@ -78,6 +89,9 @@ class MessageSender:
             >>> success = await sender.send_message(message)
             >>> success = await sender.send_message(message, "my_plugin:adapter:qq")
         """
+        adapter_send_started = False
+        adapter_send_completed = False
+        timeout_fingerprint = ""
         try:
             # 1. 确定目标 Adapter
             if not adapter_signature:
@@ -114,20 +128,44 @@ class MessageSender:
             # 4. 转换为 MessageEnvelope
             envelope = await self._converter.message_to_envelope(message)
 
-            # 5. 触发发送事件，检查是否被拦截
-            should_send = await self._emit_send_event(message, envelope, adapter_signature)
-            
+            # 5. 发布发送前事件，允许处理器拦截。
+            should_send = await self._emit_send_event(
+                message,
+                envelope,
+                adapter_signature,
+            )
             if not should_send:
-                logger.info(
-                    f"消息被事件处理器拦截，取消发送: {message.message_id}"
+                logger.info(f"消息被事件处理器拦截，取消发送: {message.message_id}")
+                return True
+
+            # 6. 仅在前置处理器允许发送后检查投递状态未知的短窗重试。
+            timeout_fingerprint = self._build_dedupe_fingerprint(
+                message,
+                envelope,
+                adapter_signature,
+            )
+            if (
+                timeout_fingerprint
+                and self._has_unknown_delivery_fingerprint(timeout_fingerprint)
+            ):
+                logger.warning(
+                    "检测到投递状态未知消息的短窗重试，已跳过: "
+                    f"message_id={message.message_id}, platform={message.platform}, "
+                    f"stream_id={message.stream_id}"
                 )
-                return True  # 返回成功，因为拦截是预期行为
+                return True
 
-            # 6. 发送
+            # 7. 调用开始后的超时无法判断平台是否已收到消息。
+            adapter_send_started = True
             await adapter._send_platform_message(envelope)
+            adapter_send_completed = True
 
-            # 7. 写入历史消息
-            await self._persist_sent_message_to_history(message)
+            # 8. 写入历史消息。
+            history_persisted = await self._persist_sent_message_to_history(message)
+
+            # 9. 适配器成功且历史实际写入后发布确认投递事件。
+            if history_persisted:
+                await self._emit_delivery_event(message, envelope, adapter_signature)
 
             # 提取消息文本用于日志
             msg_text = (
@@ -154,7 +192,173 @@ class MessageSender:
                 f"发送消息失败: message_id={message.message_id}, error={e}",
                 exc_info=True,
             )
+            delivery_unknown = (
+                adapter_send_started
+                and not adapter_send_completed
+                and self._is_timeout_exception(e)
+            )
+            if delivery_unknown and timeout_fingerprint:
+                self._remember_unknown_delivery_fingerprint(timeout_fingerprint)
+                logger.warning(
+                    "平台发送超时，投递状态未知；保留短窗指纹以抑制立即重复发送: "
+                    f"message_id={message.message_id}"
+                )
+            elif delivery_unknown:
+                logger.warning(
+                    "平台发送超时，投递状态未知；无法构造安全指纹，不抑制重试: "
+                    f"message_id={message.message_id}"
+                )
             return False
+
+    @staticmethod
+    def _is_timeout_exception(error: BaseException) -> bool:
+        """沿异常链识别内置及 httpx/httpcore 超时，不引入传输层依赖。"""
+
+        cursor: BaseException | None = error
+        seen: set[int] = set()
+        while cursor is not None and id(cursor) not in seen:
+            seen.add(id(cursor))
+            if isinstance(cursor, TimeoutError):
+                return True
+
+            error_type = type(cursor)
+            module = str(getattr(error_type, "__module__", "") or "").lower()
+            name = str(getattr(error_type, "__name__", "") or "").lower()
+            if module.startswith(("httpx", "httpcore")) and (
+                name.endswith("timeout") or name == "timeoutexception"
+            ):
+                return True
+            cursor = cursor.__cause__ or cursor.__context__
+        return False
+
+    @classmethod
+    def _build_dedupe_fingerprint(
+        cls,
+        message: "Message",
+        envelope: MessageEnvelope,
+        adapter_signature: str,
+    ) -> str:
+        """仅在出站目标和消息段均明确时构造未知投递重试指纹。"""
+
+        try:
+            extra = getattr(message, "extra", {}) or {}
+            if not isinstance(extra, dict):
+                extra = {}
+
+            message_info = envelope.get("message_info") or {}
+            if not isinstance(message_info, dict):
+                message_info = {}
+            user_info = message_info.get("user_info") or {}
+            group_info = message_info.get("group_info") or {}
+            if not isinstance(user_info, dict):
+                user_info = {}
+            if not isinstance(group_info, dict):
+                group_info = {}
+
+            target = {
+                "stream_id": str(getattr(message, "stream_id", "") or ""),
+                "group_id": str(
+                    group_info.get("group_id")
+                    or extra.get("target_group_id")
+                    or extra.get("group_id")
+                    or ""
+                ),
+                "user_id": str(
+                    user_info.get("user_id")
+                    or extra.get("target_user_id")
+                    or ""
+                ),
+            }
+            if not (target["group_id"] or target["user_id"]):
+                return ""
+
+            segments = envelope.get("message_segment") or envelope.get("message_chain")
+            if not (
+                isinstance(segments, (list, tuple, dict))
+                and segments
+                and cls._has_segment_payload_identity(segments)
+            ):
+                return ""
+            payload: Any = segments
+
+            identity = {
+                "adapter_signature": adapter_signature,
+                "platform": str(
+                    message_info.get("platform")
+                    or getattr(message, "platform", "")
+                    or ""
+                ),
+                "chat_type": str(getattr(message, "chat_type", "") or ""),
+                "target": target,
+                "reply_to": str(getattr(message, "reply_to", "") or ""),
+                "message_type": str(
+                    getattr(
+                        getattr(message, "message_type", ""),
+                        "value",
+                        getattr(message, "message_type", ""),
+                    )
+                    or ""
+                ),
+                "payload": payload,
+            }
+            serialized = json.dumps(
+                cls._normalize_dedupe_value(identity),
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        except Exception as e:
+            logger.debug(f"构造未知投递重试指纹失败: {e}")
+            return ""
+
+    @classmethod
+    def _normalize_dedupe_value(cls, value: Any) -> Any:
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, dict):
+            return {
+                str(key): cls._normalize_dedupe_value(item)
+                for key, item in sorted(value.items(), key=lambda item: str(item[0]))
+            }
+        if isinstance(value, (list, tuple)):
+            return [cls._normalize_dedupe_value(item) for item in value]
+        return str(value)
+
+    @classmethod
+    def _has_segment_payload_identity(cls, segments: Any) -> bool:
+        if isinstance(segments, dict):
+            return bool(segments.get("data"))
+        if isinstance(segments, (list, tuple)):
+            return any(cls._has_segment_payload_identity(segment) for segment in segments)
+        return bool(segments)
+
+    def _has_unknown_delivery_fingerprint(self, fingerprint: str) -> bool:
+        now = time.monotonic()
+        with self._dedupe_lock:
+            self._prune_unknown_delivery_fingerprints(now)
+            return fingerprint in self._unknown_delivery_fingerprint_set
+
+    def _remember_unknown_delivery_fingerprint(self, fingerprint: str) -> None:
+        now = time.monotonic()
+        with self._dedupe_lock:
+            self._prune_unknown_delivery_fingerprints(now)
+            if fingerprint in self._unknown_delivery_fingerprint_set:
+                return
+            self._unknown_delivery_fingerprints.append((now, fingerprint))
+            self._unknown_delivery_fingerprint_set.add(fingerprint)
+            while len(self._unknown_delivery_fingerprints) > _DEDUP_MAX_ENTRIES:
+                _, old = self._unknown_delivery_fingerprints.popleft()
+                self._unknown_delivery_fingerprint_set.discard(old)
+
+    def _prune_unknown_delivery_fingerprints(self, now: float) -> None:
+        expire_before = now - _DEDUP_WINDOW_SECONDS
+        while (
+            self._unknown_delivery_fingerprints
+            and self._unknown_delivery_fingerprints[0][0] < expire_before
+        ):
+            _, old = self._unknown_delivery_fingerprints.popleft()
+            self._unknown_delivery_fingerprint_set.discard(old)
 
     @staticmethod
     def _should_use_virtual_send(message: "Message") -> bool:
@@ -165,20 +369,25 @@ class MessageSender:
     async def _send_virtual_message(self, message: "Message") -> bool:
         """处理不依赖外部 Adapter 的虚拟平台发送。
 
-        live_bridge 会通过 ON_MESSAGE_SENT 事件回收回复，因此这里仍需构造
-        envelope 并触发发送事件，但不真正投递到外部平台。
+        虚拟发送同样先发布 ON_MESSAGE_SENT 供处理器拦截；历史写入完成后
+        再发布 ON_MESSAGE_DELIVERED，表示虚拟投递已确认。
         """
         adapter_signature = "live_bridge:adapter:virtual_live"
 
         try:
             envelope = await self._converter.message_to_envelope(message)
-
-            should_send = await self._emit_send_event(message, envelope, adapter_signature)
+            should_send = await self._emit_send_event(
+                message,
+                envelope,
+                adapter_signature,
+            )
             if not should_send:
                 logger.info(f"虚拟消息被事件处理器拦截: {message.message_id}")
                 return True
 
-            await self._persist_sent_message_to_history(message)
+            history_persisted = await self._persist_sent_message_to_history(message)
+            if history_persisted:
+                await self._emit_delivery_event(message, envelope, adapter_signature)
 
             msg_text = (
                 message.processed_plain_text
@@ -219,13 +428,13 @@ class MessageSender:
                 f"获取 Bot sender 信息失败，保留原 sender: message_id={message.message_id}, error={e}"
             )
 
-    async def _persist_sent_message_to_history(self, message: "Message") -> None:
-        """发送成功后，将消息写入聊天流历史。"""
+    async def _persist_sent_message_to_history(self, message: "Message") -> bool:
+        """发送成功后写入聊天流历史，并返回是否实际写入。"""
         if not message.stream_id:
             logger.warning(
                 f"发送消息缺少 stream_id，跳过历史写入: message_id={message.message_id}"
             )
-            return
+            return False
 
         from src.core.managers.stream_manager import get_stream_manager
 
@@ -246,6 +455,7 @@ class MessageSender:
             chat_type=message.chat_type,
         )
         await sm.add_sent_message_to_history(message)
+        return True
 
     def _infer_adapter_signature(self, message: "Message") -> str | None:
         """推断目标 Adapter 签名。
@@ -288,23 +498,13 @@ class MessageSender:
         envelope: MessageEnvelope,
         adapter_signature: str,
     ) -> bool:
-        """触发消息发送事件。
-
-        Args:
-            message: 消息对象
-            envelope: 消息信封
-            adapter_signature: 适配器签名
-            
-        Returns:
-            bool: 是否应该继续发送（False 表示被事件处理器拦截）
-        """
+        """发布发送前事件，并返回处理器是否允许继续发送。"""
         try:
-            # 尝试从事件管理器获取
-            from src.core.managers.event_manager import get_event_manager
             from src.core.components.types import EventType
+            from src.core.managers.event_manager import get_event_manager
+            from src.kernel.event import EventDecision
 
-            event_mgr = get_event_manager()
-            result = await event_mgr.publish_event(
+            result = await get_event_manager().publish_event(
                 EventType.ON_MESSAGE_SENT,
                 {
                     "message": message,
@@ -313,15 +513,35 @@ class MessageSender:
                     "continue_send": True,
                 },
             )
-            
-            # 检查事件决策，如果被拦截则返回 False
             final_params = result.get("params") or {}
-            continue_send = final_params.get("continue_send", True)
-            return continue_send
-            
+            if final_params.get("continue_send", True) is False:
+                return False
+            return result.get("decision") != EventDecision.STOP
         except Exception as e:
             logger.warning(f"触发发送事件失败: {e}")
-            return True  # 异常时默认继续发送
+            return True
+
+    async def _emit_delivery_event(
+        self,
+        message: "Message",
+        envelope: MessageEnvelope,
+        adapter_signature: str,
+    ) -> None:
+        """发布适配器成功且历史写入完成后的确认投递事件。"""
+        try:
+            from src.core.components.types import EventType
+            from src.core.managers.event_manager import get_event_manager
+
+            await get_event_manager().publish_event(
+                EventType.ON_MESSAGE_DELIVERED,
+                {
+                    "message": message,
+                    "envelope": envelope,
+                    "adapter_signature": adapter_signature,
+                },
+            )
+        except Exception as e:
+            logger.warning(f"触发确认投递事件失败: {e}")
 
 
 # 全局单例

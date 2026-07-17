@@ -685,6 +685,9 @@ class SendHandler:
         try:
             response = await self.adapter.send_napcat_api(action, params, timeout=timeout)
             return response or {"status": "error", "message": "no response"}
+        except TimeoutError as exc:
+            logger.error(f"发送消息超时: {exc}")
+            raise RuntimeError("Napcat 消息发送超时") from exc
         except Exception as e:
             logger.error(f"发送消息失败: {e}")
             return {"status": "error", "message": str(e)}

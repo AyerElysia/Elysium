@@ -53,6 +53,7 @@ class TestEventType:
         assert EventType.ON_STOP.value == "on_stop"
         assert EventType.ON_MESSAGE_RECEIVED.value == "on_message_received"
         assert EventType.ON_MESSAGE_SENT.value == "on_message_sent"
+        assert EventType.ON_MESSAGE_DELIVERED.value == "on_message_delivered"
         assert EventType.ON_CHATTER_STEP.value == "on_chatter_step"
         assert EventType.ON_ALL_PLUGIN_LOADED.value == "on_all_plugin_loaded"
         assert EventType.ON_PLUGIN_UNLOADED.value == "on_plugin_unloaded"
