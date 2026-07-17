@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import base64
+import io
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -196,13 +197,21 @@ def build_multimodal_content(
         if item.media_type == "emoji":
             if _is_supported_image_data(item.raw_data):
                 content_list.append(Text(_media_label(item, "表情包")))
-                content_list.append(Image(item.raw_data))
+                # Gemini 不支持 GIF 格式，需要转换为 PNG
+                image_data = item.raw_data
+                if _is_gif_image(image_data, item.mime_type):
+                    image_data = _convert_gif_to_png(image_data)
+                content_list.append(Image(image_data))
             else:
                 content_list.append(Text(_media_label(item, "表情包:格式不支持，已跳过原生视觉输入")))
         elif item.media_type == "image":
             if _is_supported_image_data(item.raw_data):
                 content_list.append(Text(_media_label(item, "图片")))
-                content_list.append(Image(item.raw_data))
+                # Gemini 不支持 GIF 格式，需要转换为 PNG
+                image_data = item.raw_data
+                if _is_gif_image(image_data, item.mime_type):
+                    image_data = _convert_gif_to_png(image_data)
+                content_list.append(Image(image_data))
             else:
                 content_list.append(Text(_media_label(item, "图片:格式不支持，已跳过原生视觉输入")))
         elif item.media_type == "video":
@@ -425,6 +434,19 @@ def _decode_base64(value: str) -> bytes | None:
         return None
 
 
+def _decode_inline_image_data(value: str) -> bytes | None:
+    """解码 data URL、``base64|`` 或纯 base64 图片数据。"""
+    data = str(value or "").strip()
+    if data.startswith("data:"):
+        header, separator, payload = data.partition(",")
+        if not separator or ";base64" not in header.lower():
+            return None
+        return _decode_base64(payload.strip())
+    if data.startswith("base64|"):
+        data = data.split("|", 1)[1].strip()
+    return _decode_base64(data)
+
+
 def _detect_supported_image_mime(raw: bytes) -> str | None:
     if raw.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
@@ -437,6 +459,51 @@ def _detect_supported_image_mime(raw: bytes) -> str | None:
     if len(raw) >= 12 and raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
         return "image/webp"
     return None
+
+
+def _is_gif_image(data: str, mime_type: str | None) -> bool:
+    """通过声明的 MIME 或图片头检测 GIF。"""
+    declared_mime = str(mime_type or "").strip().lower()
+    if declared_mime == "image/gif":
+        return True
+
+    inline_data = str(data or "").strip()
+    if inline_data.startswith("data:"):
+        data_url_mime = inline_data[5:].split(";", 1)[0].strip().lower()
+        if data_url_mime == "image/gif":
+            return True
+
+    raw = _decode_inline_image_data(inline_data)
+    return bool(raw and _detect_supported_image_mime(raw) == "image/gif")
+
+
+def _convert_gif_to_png(image_data: str) -> str:
+    """把 GIF 第一帧转为 PNG；Pillow 缺失或转换失败时保留原数据。"""
+    original_data = image_data
+    try:
+        from PIL import Image as PILImage
+
+        image_bytes = _decode_inline_image_data(image_data)
+        if not image_bytes:
+            return original_data
+        with io.BytesIO(image_bytes) as input_buffer:
+            with PILImage.open(input_buffer) as img:
+                if getattr(img, "n_frames", 1) > 1:
+                    img.seek(0)
+                if img.mode in ("RGBA", "LA", "P"):
+                    background = PILImage.new("RGB", img.size, (255, 255, 255))
+                    if img.mode == "P":
+                        img = img.convert("RGBA")
+                    mask = img.split()[-1] if img.mode == "RGBA" else None
+                    background.paste(img, mask=mask)
+                    img = background
+                elif img.mode != "RGB":
+                    img = img.convert("RGB")
+                with io.BytesIO() as output_buffer:
+                    img.save(output_buffer, format="PNG")
+                    return base64.b64encode(output_buffer.getvalue()).decode("ascii")
+    except Exception:
+        return original_data
 
 
 __all__ = [

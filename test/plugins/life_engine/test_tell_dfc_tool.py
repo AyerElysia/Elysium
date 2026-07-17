@@ -138,8 +138,8 @@ def _patch_runtime(
     )
 
 
-def test_tell_dfc_default_is_queue_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    """默认模式应只入队，不主动启动 stream loop。"""
+def test_tell_dfc_default_wakes_stream_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """默认模式应写入内在消息并唤醒表达层。"""
     stream = _DummyStream()
     stream_manager = _DummyStreamManager(stream)
     loop_manager = _DummyLoopManager(start_ok=True)
@@ -163,10 +163,10 @@ def test_tell_dfc_default_is_queue_only(monkeypatch: pytest.MonkeyPatch) -> None
 
     assert ok is True
     assert isinstance(result, dict)
-    assert result["proactive_wake"] is False
-    assert result["wake_triggered"] is False
+    assert result["proactive_wake"] is True
+    assert result["wake_triggered"] is True
     assert len(stream.context.unread_messages) == 1
-    assert loop_manager.calls == []
+    assert loop_manager.calls == [("stream-1", False)]
     assert life_service.tell_count == 1
 
     wake_message = stream.context.unread_messages[0]
@@ -384,10 +384,10 @@ def test_tell_dfc_accepts_guidance_style_message(
 
     assert ok is True
     assert isinstance(result, dict)
-    assert result["proactive_wake"] is False
-    assert result["wake_triggered"] is False
+    assert result["proactive_wake"] is True
+    assert result["wake_triggered"] is True
     assert len(stream.context.unread_messages) == 1
-    assert loop_manager.calls == []
+    assert loop_manager.calls == [("stream-1", False)]
     assert life_service.tell_count == 1
 
     wake_message = stream.context.unread_messages[0]
@@ -395,10 +395,10 @@ def test_tell_dfc_accepts_guidance_style_message(
     assert "不是命令" in wake_message.content
 
 
-def test_tell_dfc_proactive_wake_requires_detailed_reason(
+def test_tell_dfc_wakes_even_with_brief_reason(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """开启 proactive_wake 时，reason 不详尽应直接拒绝。"""
+    """默认唤醒不再要求 high/critical 或冗长 reason。"""
     stream = _DummyStream()
     stream_manager = _DummyStreamManager(stream)
     loop_manager = _DummyLoopManager(start_ok=True)
@@ -415,24 +415,22 @@ def test_tell_dfc_proactive_wake_requires_detailed_reason(
         tool.execute(
             message="[信息差] 我刚确认对方在这个话题上明显更敏感了。",
             reason="很急",
-            importance="high",
-            proactive_wake=True,
             stream_id="stream-1",
         )
     )
 
-    assert ok is False
-    assert isinstance(result, str)
-    assert "明确详尽" in result
-    assert len(stream.context.unread_messages) == 0
-    assert loop_manager.calls == []
-    assert life_service.tell_count == 0
+    assert ok is True
+    assert isinstance(result, dict)
+    assert result["wake_triggered"] is True
+    assert len(stream.context.unread_messages) == 1
+    assert loop_manager.calls == [("stream-1", False)]
+    assert life_service.tell_count == 1
 
 
-def test_tell_dfc_proactive_wake_starts_stream_loop(
+def test_tell_dfc_high_importance_starts_stream_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """合规开启 proactive_wake 时应主动唤醒 DFC。"""
+    """高优先级信息差也走同一套默认唤醒逻辑。"""
     stream = _DummyStream()
     stream_manager = _DummyStreamManager(stream)
     loop_manager = _DummyLoopManager(start_ok=True)
@@ -457,7 +455,6 @@ def test_tell_dfc_proactive_wake_starts_stream_loop(
                 "影响：如果不立即调整，下一轮回复会放大误读风险并损伤信任。"
             ),
             importance="high",
-            proactive_wake=True,
             stream_id="stream-1",
         )
     )
@@ -468,4 +465,84 @@ def test_tell_dfc_proactive_wake_starts_stream_loop(
     assert result["wake_triggered"] is True
     assert loop_manager.calls == [("stream-1", False)]
     assert len(stream.context.unread_messages) == 1
+    assert life_service.tell_count == 1
+
+
+def test_tell_dfc_preserves_queue_only_proactive_wake_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """旧调用显式关闭唤醒时，仍只写入待处理队列。"""
+    stream = _DummyStream()
+    stream_manager = _DummyStreamManager(stream)
+    loop_manager = _DummyLoopManager(start_ok=True)
+    life_service = _DummyLifeService()
+    _patch_runtime(
+        monkeypatch,
+        stream_manager=stream_manager,
+        loop_manager=loop_manager,
+        life_service=life_service,
+    )
+
+    tool = LifeEngineWakeDFCTool(plugin=object())
+    ok, result = asyncio.run(
+        tool.execute(
+            message="保留给下次对话处理的背景。",
+            reason="兼容旧的只入队调用。",
+            proactive_wake=False,
+            stream_id="stream-1",
+        )
+    )
+
+    assert ok is True
+    assert isinstance(result, dict)
+    assert result["proactive_wake"] is False
+    assert result["wake_triggered"] is False
+    assert loop_manager.calls == []
+    assert len(stream.context.unread_messages) == 1
+    assert life_service.tell_count == 1
+
+
+def test_tell_dfc_rolls_back_failed_wake_before_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """启动流循环失败后，重试不能留下两条相同的内在消息。"""
+    stream = _DummyStream()
+    stream_manager = _DummyStreamManager(stream)
+    loop_manager = _DummyLoopManager(start_ok=False)
+    life_service = _DummyLifeService()
+    _patch_runtime(
+        monkeypatch,
+        stream_manager=stream_manager,
+        loop_manager=loop_manager,
+        life_service=life_service,
+    )
+
+    tool = LifeEngineWakeDFCTool(plugin=object())
+    first_ok, first_result = asyncio.run(
+        tool.execute(
+            message="这次启动会失败。",
+            reason="测试失败回滚。",
+            stream_id="stream-1",
+        )
+    )
+
+    assert first_ok is False
+    assert "已撤回内在消息" in str(first_result)
+    assert stream.context.unread_messages == []
+    assert life_service.tell_count == 0
+
+    loop_manager.start_ok = True
+    second_ok, second_result = asyncio.run(
+        tool.execute(
+            message="这次启动会成功。",
+            reason="测试失败后的重试。",
+            stream_id="stream-1",
+        )
+    )
+
+    assert second_ok is True
+    assert isinstance(second_result, dict)
+    assert second_result["wake_triggered"] is True
+    assert len(stream.context.unread_messages) == 1
+    assert loop_manager.calls == [("stream-1", False), ("stream-1", False)]
     assert life_service.tell_count == 1

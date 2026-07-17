@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -38,10 +39,11 @@ def _message(
     stream_id: str = "stream_history",
     platform: str = "qq",
     chat_type: str = "private",
+    time: float | datetime | str | None = None,
 ) -> Message:
     return Message(
         message_id=f"m{index}",
-        time=1_700_000_000 + index,
+        time=1_700_000_000 + index if time is None else time,
         content=content,
         processed_plain_text=content,
         message_type=MessageType.TEXT,
@@ -142,6 +144,74 @@ def test_life_chatter_history_text_can_keep_short_tail_after_first_merge() -> No
     assert "刚刚真正讨论的重点" in tail_history
     assert "上一句追问" in tail_history
     assert "第二条旧消息" not in tail_history
+
+
+def test_life_chatter_history_groups_same_stream_messages_by_natural_day() -> None:
+    stream = SimpleNamespace(
+        stream_id="stream-a",
+        context=SimpleNamespace(
+            history_messages=[
+                _message(1, "DAY_ONE_EARLY", time=datetime(2026, 4, 25, 23, 58)),
+                _message(2, "DAY_ONE_LATE", time=datetime(2026, 4, 25, 23, 59)),
+                _message(3, "DAY_TWO", time=datetime(2026, 4, 26, 0, 1)),
+                _message(4, "BAD_TIME", time="not-a-time"),
+            ]
+        ),
+    )
+
+    history = LifeChatter._build_history_text(stream, max_messages=None)
+
+    assert history.count("2026-04-25") == 1
+    assert history.count("2026-04-26") == 1
+    assert "【23:58】" in history
+    assert "【23:59】" in history
+    assert "【00:01】" in history
+    assert history.index("2026-04-25") < history.index("DAY_ONE_EARLY")
+    assert history.index("DAY_ONE_LATE") < history.index("2026-04-26")
+    assert "1970-01-01" not in history
+
+
+def test_life_chatter_global_history_groups_cross_stream_messages_by_natural_day() -> None:
+    current_stream = SimpleNamespace(
+        stream_id="stream-a",
+        stream_name="A 私聊",
+        context=SimpleNamespace(
+            history_messages=[
+                _message(1, "A_DAY_ONE", stream_id="stream-a", time=datetime(2026, 4, 25, 23, 58)),
+                _message(3, "A_DAY_TWO", stream_id="stream-a", time=datetime(2026, 4, 26, 0, 2)),
+            ]
+        ),
+    )
+    other_stream = SimpleNamespace(
+        stream_id="stream-b",
+        stream_name="B 直播间",
+        platform="live",
+        chat_type="group",
+        context=SimpleNamespace(
+            history_messages=[
+                _message(
+                    2,
+                    "B_DAY_ONE",
+                    stream_id="stream-b",
+                    platform="live",
+                    chat_type="group",
+                    time=datetime(2026, 4, 25, 23, 59),
+                ),
+            ]
+        ),
+    )
+
+    history = LifeChatter._build_history_text(
+        current_stream,
+        max_messages=None,
+        global_history=True,
+        stream_manager=SimpleNamespace(_streams={"stream-b": other_stream}),
+    )
+
+    assert history.count("2026-04-25") == 1
+    assert history.count("2026-04-26") == 1
+    assert history.index("A_DAY_ONE") < history.index("B_DAY_ONE") < history.index("2026-04-26")
+    assert history.index("2026-04-26") < history.index("A_DAY_TWO")
 
 
 def test_life_chatter_global_history_merges_streams_with_source_labels() -> None:
@@ -311,7 +381,7 @@ async def test_build_chatter_runtime_includes_latest_think_and_recent_chat() -> 
 
     text, _ = await service.build_chatter_runtime_context(chat)
 
-    assert "### 最近一次 action-think" in text
+    assert "### 最近一次独白/思考快照" in text
     assert "她白天喊我的名字" in text
     assert "### 最近 10 条聊天记录" in text
     assert "旧消息 1" in text

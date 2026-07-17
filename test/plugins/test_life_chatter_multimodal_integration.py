@@ -13,9 +13,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from plugins.life_engine.core.chatter import LifeChatter, _Phase, _WorkflowRuntime
 from plugins.life_engine.core.config import LifeEngineConfig
-from src.core.models.message import MessageType
+from src.core.models.message import Message, MessageType
 from src.kernel.llm import Audio, Image, LLMPayload, ROLE, Text, Video
 from src.kernel.llm.model_client.openai_client import _payloads_to_openai_messages
 
@@ -125,6 +127,59 @@ def test_compose_can_disable_emoji_explicitly() -> None:
     assert len(out) == 1 and isinstance(out[0], Text)
 
 
+def test_native_visual_vlm_skip_keeps_emoji_vlm_and_skips_native_images(monkeypatch) -> None:
+    """原生图片直达模型时跳过图片 VLM，但表情包仍保留文字识别。"""
+    chatter = _make_chatter(multimodal_enabled=True, native_image=True, native_emoji=True)
+    skip_calls: list[tuple[str, tuple[str, ...]]] = []
+    unskip_calls: list[tuple[str, tuple[str, ...]]] = []
+
+    fake_manager = SimpleNamespace(
+        skip_vlm_for_stream=lambda stream_id, media_types: skip_calls.append(
+            (stream_id, tuple(media_types))
+        ),
+        unskip_vlm_for_stream=lambda stream_id, media_types: unskip_calls.append(
+            (stream_id, tuple(media_types))
+        ),
+    )
+    monkeypatch.setattr(
+        "src.core.managers.media_manager.get_media_manager",
+        lambda: fake_manager,
+    )
+
+    chatter._sync_native_visual_vlm_skip(SimpleNamespace(stream_id="stream-emoji"))
+
+    assert unskip_calls == [("stream-emoji", ("emoji",))]
+    assert skip_calls == [("stream-emoji", ("image",))]
+
+
+def test_native_visual_vlm_skip_clears_stale_image_rule_when_disabled(monkeypatch) -> None:
+    """关闭原生图片后应清除旧图片规则，且表情包始终保留 VLM。"""
+    chatter = _make_chatter(multimodal_enabled=True, native_image=False, native_emoji=True)
+    skip_calls: list[tuple[str, tuple[str, ...]]] = []
+    unskip_calls: list[tuple[str, tuple[str, ...]]] = []
+
+    fake_manager = SimpleNamespace(
+        skip_vlm_for_stream=lambda stream_id, media_types: skip_calls.append(
+            (stream_id, tuple(media_types))
+        ),
+        unskip_vlm_for_stream=lambda stream_id, media_types: unskip_calls.append(
+            (stream_id, tuple(media_types))
+        ),
+    )
+    monkeypatch.setattr(
+        "src.core.managers.media_manager.get_media_manager",
+        lambda: fake_manager,
+    )
+
+    chatter._sync_native_visual_vlm_skip(SimpleNamespace(stream_id="stream-image"))
+
+    assert unskip_calls == [
+        ("stream-image", ("emoji",)),
+        ("stream-image", ("image",)),
+    ]
+    assert skip_calls == []
+
+
 def test_compose_dedup_across_retries() -> None:
     """失败重试场景：相同 unread 二次 compose 不重复发出媒体。"""
     chatter = _make_chatter(multimodal_enabled=True)
@@ -138,6 +193,97 @@ def test_compose_dedup_across_retries() -> None:
     assert sum(isinstance(p, Image) for p in second) == 0
     # 第二次应只剩纯文本
     assert all(isinstance(p, Text) for p in second)
+
+
+@pytest.mark.asyncio
+async def test_delta_unread_native_image_is_restored_after_model_failure(
+    monkeypatch,
+) -> None:
+    """增量 unread 应走原生 compose，模型失败后同一图片仍可再次注入。"""
+    LifeChatter.reset_global_runtime()
+    image_seen_by_model: list[bool] = []
+
+    class FailingResponse(_FakeResponse):
+        async def send(self, *, stream: bool = False):
+            assert stream is False
+            image_seen_by_model.append(
+                any(
+                    isinstance(part, Image)
+                    for payload in self.payloads
+                    for part in payload.content
+                )
+            )
+            raise RuntimeError("model failed")
+
+    old_msg = Message(
+        message_id="old-1",
+        content="先前消息",
+        processed_plain_text="先前消息",
+        sender_role="other",
+        stream_id="stream-a",
+    )
+    image_msg = Message(
+        message_id="image-1",
+        content={"media": [{"type": "image", "data": _png_b64()}]},
+        processed_plain_text="请看这张新图",
+        message_type=MessageType.IMAGE,
+        sender_role="other",
+        stream_id="stream-a",
+    )
+    response = FailingResponse([LLMPayload(ROLE.USER, Text("existing"))])
+    rt = _WorkflowRuntime(
+        response=response,
+        phase=_Phase.FOLLOW_UP,
+        history_merged=True,
+        unreads=[old_msg],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[old_msg],
+        active_stream_id="stream-a",
+    )
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+
+    chatter = _make_chatter(multimodal_enabled=True)
+    chatter.stream_id = "stream-a"
+
+    async def fake_fetch_unreads():
+        return [], [old_msg, image_msg]
+
+    async def immediate_model_turn(awaitable):
+        return await awaitable
+
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+    monkeypatch.setattr(chatter, "_await_model_turn", immediate_model_turn)
+    monkeypatch.setattr(chatter, "_sync_native_visual_vlm_skip", lambda _stream: None)
+
+    result = await chatter._drive_global_runtime_until_yield(
+        SimpleNamespace(stream_id="stream-a"),
+        service=None,
+    )
+
+    assert result.__class__.__name__ == "Failure"
+    assert image_seen_by_model == [True]
+    assert rt.phase == _Phase.WAIT_USER
+    assert rt.media_seen == set()
+    assert all(
+        not isinstance(part, Image)
+        for payload in response.payloads
+        for part in payload.content
+    )
+
+    # 上游 unread 尚未 flush；恢复后再次注入时不能被 media_seen 错误去重。
+    delta = await chatter._inject_delta_unreads_if_any(
+        rt,
+        SimpleNamespace(stream_id="stream-a"),
+    )
+    assert image_msg in delta
+    assert any(
+        isinstance(part, Image)
+        for payload in response.payloads
+        for part in payload.content
+    )
+
+    LifeChatter.reset_global_runtime()
 
 
 def test_compose_skips_invalid_image_payload() -> None:

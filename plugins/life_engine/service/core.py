@@ -46,6 +46,10 @@ from ..core.chat_history import (
 )
 from ..core.config import LifeEngineConfig
 from ..core.context_assembly import LifeChatterContextAssembler
+from ..core.everos import (
+    is_everos_message_sync_enabled,
+    sync_message_to_everos,
+)
 from ..core.send_targets import format_send_targets_for_prompt, list_recent_send_targets
 from ..core.tool_parallel import iter_life_tool_call_batches
 from ..autonomy import (
@@ -187,6 +191,8 @@ class LifeEngineService(BaseService):
         self._last_memory_maintenance_prompt_at: str | None = None
         self._followup_states: dict[str, FollowupState] = {}
         self._scheduler = None
+        # EverOS writes are best-effort, but remain service-owned until completion.
+        self._everos_sync_task_ids: set[str] = set()
 
     @property
     def memory_service(self) -> LifeMemoryService | None:
@@ -848,8 +854,14 @@ class LifeEngineService(BaseService):
 
         return final_result
 
-    async def record_message(self, message: Message, direction: str = "received") -> None:
-        """记录一条来自聊天流的消息事件。"""
+    async def record_message(
+        self,
+        message: Message,
+        direction: str = "received",
+        *,
+        sent_confirmed: bool = False,
+    ) -> None:
+        """记录聊天消息；出站 EverOS 同步仅接受已确认送达的事件。"""
         if not self._is_enabled():
             return
 
@@ -881,6 +893,8 @@ class LifeEngineService(BaseService):
                     state.active_check_kind = None
         await self._publish_raw_events([event])
         await self._save_runtime_context()
+        if direction == "received" or sent_confirmed:
+            self._schedule_everos_message_sync(message, direction, event)
         if direction == "received":
             self._schedule_curiosity_review(message, event)
         if unlocked_self_pause:
@@ -905,6 +919,42 @@ class LifeEngineService(BaseService):
             direction=direction,
             pending_message_count=self._state.pending_event_count,
         )
+
+    def _schedule_everos_message_sync(
+        self,
+        message: Message,
+        direction: str,
+        event: LifeEngineEvent,
+    ) -> None:
+        cfg = self._cfg()
+        if not is_everos_message_sync_enabled(cfg, direction):
+            return
+
+        timeout = float(getattr(cfg.everos, "write_timeout_seconds", 15.0) or 15.0) + 2.0
+        coroutine = sync_message_to_everos(cfg, message, direction=direction)
+        try:
+            task_info = get_task_manager().create_task(
+                coroutine,
+                name=f"life_everos_sync_{event.sequence}",
+                daemon=True,
+                timeout=timeout,
+            )
+        except Exception:
+            coroutine.close()
+            logger.warning("EverOS 后台同步任务创建失败，已跳过", exc_info=True)
+            return
+
+        task_id = str(getattr(task_info, "task_id", "") or "").strip()
+        if not task_id:
+            return
+        self._everos_sync_task_ids.add(task_id)
+        task = getattr(task_info, "task", None)
+        if task is not None:
+            task.add_done_callback(
+                lambda _task, completed_id=task_id: self._everos_sync_task_ids.discard(
+                    completed_id
+                )
+            )
 
     def _get_curiosity_engine(self) -> CuriosityEngine:
         cfg = self._cfg()
@@ -1795,10 +1845,10 @@ class LifeEngineService(BaseService):
         decision: str = "",
         expected_response: str = "",
     ) -> dict[str, Any]:
-        """记录 life_chatter 最近一次 action-think 快照。
+        """记录 life_chatter 最近一次独白/思考快照。
 
-        新的统一主意识链路使用全局快照；同时保留按 stream 写入，兼容旧工具和
-        已持久化状态。
+        纯文本独白使用 chatter_inner_monologue 事件记录；这里保留按 stream
+        写入，兼容旧 action-think 工具和已持久化状态。
         """
         if not self._is_enabled():
             raise RuntimeError("life_engine 未启用")
@@ -2385,7 +2435,7 @@ class LifeEngineService(BaseService):
         结构：
           1. ### 当前内在状态  （neuromod）
           2. ### 当前思考流    （注意力脑区，分焦点/背景，带 🔄 delta 标记）
-          3. ### 最近一次 action-think
+          3. ### 最近一次独白/思考快照
           4. ### 运行时内心独白（push_runtime_assistant_injection 队列）
           5. ### 最近聊天记录
           6. ### 新增 life 事件流（完整可追溯事件窗口）
@@ -2504,7 +2554,7 @@ class LifeEngineService(BaseService):
                 unified_chatter_context=unified_chatter_context,
             )
             if latest_think_text:
-                sections.append(f"### 最近一次 action-think\n{latest_think_text}")
+                sections.append(f"### 最近一次独白/思考快照\n{latest_think_text}")
 
         runtime_text = str(runtime_context_text or "").strip()
         if runtime_text:
@@ -2818,7 +2868,7 @@ class LifeEngineService(BaseService):
             "不可接受写法：`你应该回复 X`、`你去安慰/追问 Y`、`按以下步骤说`。",
             "默认目标是最近收到消息的聊天；如果你明确想去某个私聊或群聊，可以设置 `target_type=private/group`，并填写 `platform` 与 `target_user_id` 或 `target_group_id`。",
             "如果你已经知道精确聊天流，可以直接填写 `stream_id`；不确定就不要填，让系统回退当前聊天。",
-            "`proactive_wake=true` 只服务高优先级信息差，不用于催表达层开口。", "",
+            "工具会默认唤醒表达层；唤醒只是让新上下文被看见，不代表表达层必须开口。", "",
             "记住：`nucleus_tell_dfc` 是补信息差，不是遥控器。", "",
             "### `nucleus_schedule_autonomy_intent` — 登记延迟自主意向", "",
             "当你不是要立刻补信息差，而是自己形成了一个“过一会儿再让它浮上来”的意向时，用这个工具。",
@@ -2839,7 +2889,9 @@ class LifeEngineService(BaseService):
             "不要为了单次用户请求创建 skill；那属于表达层当场处理，不应变成长期能力。", "",
             "### 工具边界", "",
             "- `nucleus_search_memory` 是历史检索，不要反复重搜同一主题",
-            "- 本地文件工具只用于你的私有工作区、日记、笔记和 MEMORY 维护，不用于替用户查项目或改项目",
+            "- 本地文件工具只用于你的私有工作区、日记、笔记、MEMORY 维护和 USER.md 长期画像维护，不用于替用户查项目或改项目",
+            "- `USER.md` 是对方的长期画像、稳定偏好和互动边界；当外界明确表达了长期偏好、称呼、边界或希望被记住的互动方式时，可以用文件工具谨慎更新",
+            "- 不要把一时情绪、当天事件、猜测和流水账写入 `USER.md`；这些应留在聊天历史、MEMORY、notes、thoughts 或 diaries",
             "- `nucleus_bash` 只用于诊断 life_engine 自己的工作区或工具链问题；不要拿它查项目配置、跑用户任务或处理外部操作",
             "- `nucleus_browser_fetch` / `nucleus_web_search` 只用于私有好奇心、记忆核验或长期主题整理，不用于替用户做即时检索任务",
             "- `nucleus_view_screen` 只在用户明确把屏幕上下文交给表达层时才应由表达层使用；心跳态不要为了好奇看屏幕",
@@ -3262,7 +3314,7 @@ class LifeEngineService(BaseService):
             if not call_list:
                 break
 
-            logger.info(
+            logger.debug(
                 f"life_engine 心跳#{self._state.heartbeat_count} 本轮调用列表："
                 f"{[getattr(call, 'name', '<unknown>') for call in call_list]}"
             )
@@ -3271,7 +3323,7 @@ class LifeEngineService(BaseService):
                 for call in batch:
                     args = dict(call.args) if isinstance(getattr(call, "args", None), dict) else {}
                     reason = args.pop("reason", "未提供原因")
-                    logger.info(
+                    logger.debug(
                         f"life_engine 心跳#{self._state.heartbeat_count} "
                         f"LLM 调用 {getattr(call, 'name', '<unknown>')}，原因: {reason}，参数: {args}"
                     )
@@ -3482,6 +3534,12 @@ class LifeEngineService(BaseService):
         if self._snn_tick_task_id:
             safe_cancel_task(self._snn_tick_task_id, get_task_manager())
             self._snn_tick_task_id = None
+
+        task_manager = get_task_manager()
+        for task_id in tuple(self._everos_sync_task_ids):
+            safe_cancel_task(task_id, task_manager)
+        self._everos_sync_task_ids.clear()
+
         try:
             await cleanup_autonomy_schedules(self._cfg().settings.workspace_path)
         except Exception as exc:  # noqa: BLE001

@@ -11,7 +11,6 @@
 
 from __future__ import annotations
 
-import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,13 +21,7 @@ from src.app.plugin_system.api import log_api
 from src.app.plugin_system.base import BaseTool
 from src.core.models.message import Message, MessageType
 
-from ..constants import (
-    EXTERNAL_MESSAGE_ACTIVE_WINDOW_MINUTES,
-    PROACTIVE_WAKE_MIN_REASON_CHARS,
-    PROACTIVE_WAKE_MIN_SEGMENTS,
-    PROACTIVE_WAKE_REQUIRED_IMPORTANCE,
-    PROACTIVE_WAKE_KEYWORDS,
-)
+from ..constants import EXTERNAL_MESSAGE_ACTIVE_WINDOW_MINUTES
 from ..memory.prompting import build_memory_write_warning
 from ..trace.store import LifeTraceStore
 from ._utils import (
@@ -124,17 +117,6 @@ def _tool_trace_context(tool: Any) -> dict[str, str]:
         "source_event_id": str(getattr(message, "message_id", "") or ""),
         "stream_id": str(tool.get_current_stream_id() or ""),
     }
-
-
-def _is_detailed_proactive_wake_reason(reason: str) -> bool:
-    """检查主动唤醒理由是否足够明确和详尽。"""
-    text = " ".join(str(reason or "").split())
-    if len(text) < PROACTIVE_WAKE_MIN_REASON_CHARS:
-        return False
-    segments = [seg.strip() for seg in re.split(r"[。！？!?\n；;]", text) if seg.strip()]
-    if len(segments) < PROACTIVE_WAKE_MIN_SEGMENTS:
-        return False
-    return any(keyword in text for keyword in PROACTIVE_WAKE_KEYWORDS)
 
 
 async def _resolve_tell_dfc_target(
@@ -239,14 +221,25 @@ async def _resolve_tell_dfc_target(
     return True, chat_stream, {}, "current"
 
 
+def _discard_tell_dfc_unread(context: Any, message: Message) -> None:
+    """撤回本次失败唤醒写入的消息，不影响并发到达的其他未读消息。"""
+    unread_messages = getattr(context, "unread_messages", None)
+    if not isinstance(unread_messages, list):
+        return
+    for index in range(len(unread_messages) - 1, -1, -1):
+        if unread_messages[index] is message:
+            del unread_messages[index]
+            return
+
+
 class LifeEngineWakeDFCTool(BaseTool):
-    """向同一主体的表达层补充信息差或主动唤醒社交。"""
+    """向同一主体的表达层补充信息差，并默认唤醒表达层。"""
 
     tool_name: str = "nucleus_tell_dfc"
     tool_description: str = (
-        "向同一主体的表达层补充信息差或主动唤醒社交。"
+        "向同一主体的表达层补充信息差，并唤醒表达层处理这段新上下文。"
         "一方面补一段它当前暂时看不到、但对接下来对话可能重要的背景；"
-        "另一方面，它也是主动向外界联系的工具，用于主动唤醒社交。如果想念对方了，可以随时使用此工具。"
+        "另一方面，如果你想念对方或想主动向外界联系，也可以用它把这个动机交给表达层自行判断。"
         "\n\n"
         "**这不是在遥控社交态，更不是替它写台词；它不用于指导表达层怎么回复。**"
         " 这不是在和另一个意识体对话，而是同一个你在不同运行状态之间补充上下文。"
@@ -255,14 +248,15 @@ class LifeEngineWakeDFCTool(BaseTool):
         "- 你掌握了表达层当前可能不知道的事实、背景、记忆线索、情绪来源或潜在风险\n"
         "- 你发现某段近期事件能解释对方现在为什么这样说/这样做\n"
         "- 你需要补一个隐藏前提，避免表达层误解上下文\n"
-        "- **【主动社交】你想念对方了，或者你想主动向外界发起联系，需要通过 proactive_wake=True 立即唤醒表达层进行社交。**\n"
+        "- **【主动社交】你想念对方了，或者你想主动向外界发起联系，需要把这个动机交给表达层。**\n"
         "\n"
         "**何时不用：**\n"
         "- 你想教表达层该怎么回、该怎么问、该怎么安慰\n"
         "- 你在替表达层写台词、步骤或策略\n"
         "- 你自己其实想直接开口 → 交给表达层在正常对话里处理\n"
         "\n"
-        "**注意：** 默认只入队，不主动唤醒表达层。补充内容会在表达层下次处理对话时作为背景自然被看见。"
+        "**注意：** 工具会默认唤醒表达层，让补充内容尽快进入对话判断；"
+        "这不用于催表达层开口，是否表达仍由它结合对话自行判断。"
         " 写法尽量是观察/背景/风险/线索。如果是主动社交，直接写明想念的缘由或主动开启对话的意图。"
         " 允许写“我刚看到 X，这可能解释 Y，风险是 Z”或“我想念他了，需要主动问候”；不要写“你应该回复 X”、"
         "“你去安慰/追问 Y”或“按以下步骤说”。"
@@ -271,7 +265,7 @@ class LifeEngineWakeDFCTool(BaseTool):
         "- `message`: 只写信息差本身或想念的理由/想主动联系的话题\n"
         "- `reason`: 为什么这是表达层当前可能不知道的背景。如果是主动社交，写明想念对方或主动建立联系\n"
         "- `importance`: 常规用 normal；只有紧急时用 high/critical\n"
-        "- `proactive_wake`: 默认 false。仅在 high/critical 且 reason 详尽时允许 true，它只服务高优先级信息差，常规情况下不用于催表达层开口；但若是【主动向外界联系/想念对方唤醒社交】场景，亦允许设置为 true。\n"
+        "- `proactive_wake`: 默认 true，会唤醒表达层；传 false 时只入队，保留旧调用的队列模式。\n"
         "- `target_type`: 默认 auto。不确定就留空，系统会回退到刚收到消息的聊天；要指定目标可用 private/group/stream/current\n"
         "- `platform`: 指定私聊/群聊目标时的平台，如 qq；留空时尽量从当前聊天推断\n"
         "- `target_user_id`: 想去某个私聊时填写对方平台用户 ID，并设置 target_type=private\n"
@@ -292,8 +286,8 @@ class LifeEngineWakeDFCTool(BaseTool):
         importance: Annotated[str, "重要度（可选：low/normal/high/critical，默认 normal）"] = "normal",
         proactive_wake: Annotated[
             bool,
-            "是否主动唤醒表达层立即看见并处理。想念对方或主动向外界发起联系时可设为 true；如果是日常信息同步请保持 false。",
-        ] = False,
+            "是否唤醒表达层立即看见新上下文。默认 true；传 false 仅写入待处理队列，兼容旧调用。",
+        ] = True,
         stream_id: Annotated[str, "目标聊天流ID（可选，不填则自动选择最近活跃的外部对话流）"] = "",
         target_type: Annotated[
             str,
@@ -305,8 +299,7 @@ class LifeEngineWakeDFCTool(BaseTool):
         target_group_id: Annotated[str, "目标群聊 ID（target_type=group 时使用）"] = "",
         target_group_name: Annotated[str, "目标群聊名称（可选，用于显示和下游发送信息）"] = "",
     ) -> tuple[bool, str | dict]:
-        # 记录工具调用参数，方便调试
-        logger.info(
+        logger.debug(
             f"[nucleus_tell_dfc] Life 调用表达层同步/社交工具:\n"
             f"  message: {message}\n"
             f"  reason: {reason}\n"
@@ -329,23 +322,6 @@ class LifeEngineWakeDFCTool(BaseTool):
         if normalized_importance not in {"low", "normal", "high", "critical"}:
             return False, "importance 仅支持 low/normal/high/critical"
 
-        if proactive_wake:
-            # 检查是否为主动向外界联系、主动唤醒社交或想念对方的场景，用于免去严苛的工程级校验
-            combined_text = (reason + " " + text).strip()
-            is_social_contact = any(
-                keyword in combined_text
-                for keyword in ("想念", "想他", "想她", "主动联系", "唤醒社交", "社交唤醒", "找他", "找她", "打招呼", "互动", "问候", "聊天")
-            )
-
-            if not is_social_contact:
-                if normalized_importance not in PROACTIVE_WAKE_REQUIRED_IMPORTANCE:
-                    return False, "proactive_wake=true 仅允许在 high/critical 使用，平时请保持关闭（主动社交唤醒除外）。"
-                if not _is_detailed_proactive_wake_reason(reason):
-                    return (
-                        False,
-                        f"proactive_wake=true 必须提供明确详尽的 reason（至少 {PROACTIVE_WAKE_MIN_REASON_CHARS} 字，且需包含信息差与影响说明）。",
-                    )
-
         # 获取服务实例以辅助路由判断
         life_service = _get_life_engine_service(self.plugin)
         if life_service:
@@ -358,7 +334,7 @@ class LifeEngineWakeDFCTool(BaseTool):
             ):
                 # 除非是 high 或 critical 级别，否则给出警告但不阻止
                 if normalized_importance not in ("high", "critical"):
-                    logger.info(
+                    logger.debug(
                         f"当前对话流正在活跃（{minutes_since_external} 分钟前有消息），"
                         f"同步可能会打扰表达层的正常对话节奏，但仍然允许执行。"
                     )
@@ -462,19 +438,22 @@ class LifeEngineWakeDFCTool(BaseTool):
             **target_extra,
         )
 
+        wake_requested = bool(proactive_wake)
+        wake_triggered = False
         chat_stream.context.add_unread_message(trigger_message)
 
-        wake_triggered = False
-        if proactive_wake:
+        if wake_requested:
             try:
                 wake_triggered = bool(
                     await get_stream_loop_manager().start_stream_loop(chat_stream.stream_id)
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.warning(f"主动唤醒表达层失败，将保留未读内在消息: {exc}")
-                return False, f"已写入内在队列，但主动唤醒失败: {exc}"
+                _discard_tell_dfc_unread(chat_stream.context, trigger_message)
+                logger.warning(f"唤醒表达层失败，已撤回内在消息: {exc}")
+                return False, f"唤醒表达层失败，已撤回内在消息: {exc}"
             if not wake_triggered:
-                return False, "已写入内在队列，但主动唤醒失败：start_stream_loop 返回 false"
+                _discard_tell_dfc_unread(chat_stream.context, trigger_message)
+                return False, "唤醒表达层失败：start_stream_loop 返回 false，已撤回内在消息"
 
         # 记录传话时间
         if life_service:
@@ -484,12 +463,13 @@ class LifeEngineWakeDFCTool(BaseTool):
             "中枢向内在状态池沉淀了想法碎片: "
             f"stream_id={chat_stream.stream_id} "
             f"importance={normalized_importance} "
+            f"proactive_wake={wake_requested} "
             f"reason={reason or '未说明'} "
         )
 
-        note = "已补充到同一主体的表达层待处理队列。表达层会自行判断是否吸收；这不是指令。"
-        if proactive_wake:
-            note = "已补充并主动唤醒同一主体的表达层。请仅在存在高优先级信息差且必须即时介入时使用此模式。"
+        note = "已补充并唤醒同一主体的表达层。表达层会自行判断是否吸收；这不是指令。"
+        if not wake_requested:
+            note = "已补充到同一主体的表达层待处理队列。表达层会自行判断是否吸收；这不是指令。"
 
         result = {
             "action": "message_to_dfc",
@@ -504,13 +484,12 @@ class LifeEngineWakeDFCTool(BaseTool):
             "importance": normalized_importance,
             "reason": reason,
             "message": text,
-            "proactive_wake": proactive_wake,
+            "proactive_wake": wake_requested,
             "wake_triggered": wake_triggered,
             "note": note,
         }
 
-        # 记录工具返回结果，方便调试
-        logger.info(
+        logger.debug(
             f"[nucleus_tell_dfc] 工具返回结果:\n"
             f"  stream_id: {result['stream_id']}\n"
             f"  platform: {result['platform']}\n"
@@ -521,7 +500,6 @@ class LifeEngineWakeDFCTool(BaseTool):
             f"  importance: {result['importance']}\n"
             f"  reason: {result['reason']}\n"
             f"  message: {result['message']}\n"
-            f"  proactive_wake: {result['proactive_wake']}\n"
             f"  wake_triggered: {result['wake_triggered']}\n"
             f"  note: {result['note']}"
         )
@@ -1023,6 +1001,7 @@ class LifeEngineRunAgentTool(BaseTool):
                     agent_type=subagent_type,
                     task=task,
                     context=full_context,
+                    agent_type_def=type_def,
                 )
                 return True, {
                     "action": "run_agent_background",
@@ -1058,10 +1037,15 @@ class LifeEngineRunAgentTool(BaseTool):
 
     def _get_coordinator(self) -> AgentCoordinator:
         """获取或创建 AgentCoordinator 单例。"""
-        if not hasattr(self.plugin, "_agent_coordinator"):
+        if bool(getattr(self.plugin, "_agent_coordinator_shutdown", False)):
+            raise RuntimeError("插件正在停止，不能启动后台智能体")
+        coordinator = getattr(self.plugin, "_agent_coordinator", None)
+        if coordinator is None or bool(getattr(coordinator, "is_closed", False)):
             from ..agents.coordinator import AgentCoordinator
-            self.plugin._agent_coordinator = AgentCoordinator(self.plugin)
-        return self.plugin._agent_coordinator
+
+            coordinator = AgentCoordinator(self.plugin)
+            self.plugin._agent_coordinator = coordinator
+        return coordinator
 
 
 class FetchLifeMemoryTool(BaseTool):

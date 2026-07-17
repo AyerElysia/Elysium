@@ -148,6 +148,18 @@ def test_ensure_workspace_templates_creates_user_md(tmp_path: Path) -> None:
     assert "这份文档用于记录" in content
     assert "具体内容由爱莉" in content
     assert "爱莉可以在这里慢慢填写" in content
+    assert "什么时候更新" in content
+
+
+def test_heartbeat_prompt_mentions_user_profile_maintenance(tmp_path: Path) -> None:
+    """心跳态应明确知道 USER.md 可用于长期用户画像维护。"""
+    service = _make_service(tmp_path)
+
+    prompt = "\n".join(service._build_prompt_header())
+
+    assert "USER.md 长期画像维护" in prompt
+    assert "长期画像、稳定偏好和互动边界" in prompt
+    assert "一时情绪、当天事件、猜测和流水账" in prompt
 
 
 def test_memory_maintenance_prompt_emits_once_per_interval(tmp_path: Path) -> None:
@@ -404,3 +416,36 @@ async def test_enqueue_dfc_message_rejects_when_disabled(tmp_path: Path) -> None
 
     with pytest.raises(RuntimeError, match="life_engine 未启用"):
         await service.enqueue_dfc_message("帮我记一下")
+
+
+@pytest.mark.asyncio
+async def test_web_search_accepts_empty_time_range_as_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """旧调用传入 time_range='' 时不应把空值发送给 Tavily。"""
+    from plugins.life_engine.tools.web_tools import LifeEngineWebSearchTool
+
+    captured: dict[str, object] = {}
+
+    async def _fake_tavily_post(
+        plugin: object,
+        endpoint: str,
+        payload: dict[str, object],
+        timeout_seconds: int,
+    ) -> dict[str, object]:
+        captured["endpoint"] = endpoint
+        captured["payload"] = payload
+        return {"results": []}
+
+    monkeypatch.setattr(
+        "plugins.life_engine.tools.web_tools._tavily_post_json",
+        _fake_tavily_post,
+    )
+
+    tool = LifeEngineWebSearchTool(plugin=SimpleNamespace(config=LifeEngineConfig()))
+    ok, result = await tool.execute(query="测试", time_range="")
+
+    assert ok is True
+    assert result["action"] == "web_search"
+    assert captured["endpoint"] == "/search"
+    assert "time_range" not in captured["payload"]

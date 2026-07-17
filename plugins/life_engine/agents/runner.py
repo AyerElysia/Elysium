@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
+from src.core.utils.llm_tool_call import exec_llm_usable
 from src.kernel.llm import LLMPayload, ROLE, Text, ToolRegistry, ToolResult
 
 from .definitions import AgentResult, AgentTypeDefinition
@@ -19,6 +20,7 @@ from .registry import get_agent_type_registry
 
 if TYPE_CHECKING:
     from src.app.plugin_system.base import BasePlugin
+    from src.core.models.message import Message
 
 
 class AgentRunner:
@@ -30,11 +32,17 @@ class AgentRunner:
         agent_type_def: AgentTypeDefinition,
         task_prompt: str,
         context: str = "",
+        extra_mcp_server_names: list[str] | None = None,
+        stream_id: str = "",
+        trigger_message: Message | None = None,
     ) -> None:
         self.plugin = plugin
         self.agent_type_def = agent_type_def
         self.task_prompt = task_prompt
         self.context = context
+        self.extra_mcp_server_names = list(extra_mcp_server_names or [])
+        self.stream_id = str(stream_id or "").strip()
+        self.trigger_message = trigger_message
 
     async def run(self) -> AgentResult:
         """同步执行智能体，返回结构化结果。"""
@@ -89,6 +97,32 @@ class AgentRunner:
             self.agent_type_def.agent_type, all_tool_classes
         )
 
+        # MCP 工具没有统一的只读元数据。只读智能体不能因显式服务器委托
+        # 获得任意外部副作用能力；general-purpose 才能接收这些工具。
+        is_read_only = (
+            self.agent_type_def.is_read_only
+            or self.agent_type_def.agent_type in {"explore", "plan", "verification"}
+        )
+        if self.extra_mcp_server_names and not is_read_only:
+            from src.core.managers.tool_manager import get_mcp_manager
+
+            mcp_manager = get_mcp_manager()
+            connected_names = {
+                metadata.server_name for metadata in mcp_manager.get_connected_server_metadata()
+            }
+            valid_names = [
+                name for name in self.extra_mcp_server_names if name in connected_names
+            ]
+            if valid_names:
+                mcp_tool_classes = mcp_manager.get_tool_classes_for_servers(valid_names)
+                # 已在 registry 过滤里出现过的不再重复
+                existing = set(filtered)
+                for cls in mcp_tool_classes:
+                    if cls in existing:
+                        continue
+                    existing.add(cls)
+                    filtered.append(cls)
+
         tool_registry = ToolRegistry()
         for cls in filtered:
             tool_registry.register(cls)
@@ -136,8 +170,13 @@ class AgentRunner:
                 usable_cls = tool_registry.get(tool_name)
                 if usable_cls:
                     try:
-                        tool_instance = usable_cls(plugin=self.plugin)
-                        success, result = await tool_instance.execute(**args)
+                        success, result = await exec_llm_usable(
+                            usable_cls,
+                            plugin=self.plugin,
+                            stream_id=self.stream_id,
+                            message=self.trigger_message,
+                            kwargs=args,
+                        )
                         result_text = str(result) if success else f"失败: {result}"
                     except Exception as exc:
                         result_text = f"异常: {exc}"

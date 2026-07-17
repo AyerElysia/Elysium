@@ -409,7 +409,7 @@ class LifeEngineWebSearchTool(BaseTool):
         topic: Annotated[Literal["general", "news", "finance"], "主题类型"] = "general",
         max_results: Annotated[int, "返回数量（1-20）"] = 0,
         include_answer: Annotated[bool, "是否包含 Tavily 生成的答案摘要"] = False,
-        time_range: Annotated[Literal["", "day", "week", "month", "year"], "时间范围过滤"] = "",
+        time_range: Annotated[Literal["day", "week", "month", "year"] | None, "时间范围过滤（None 表示不限）"] = None,
         include_domains: Annotated[list[str] | None, "仅包含这些域名"] = None,
         exclude_domains: Annotated[list[str] | None, "排除这些域名"] = None,
         include_raw_content: Annotated[bool, "是否附带较长原文片段（会截断）"] = False,
@@ -422,8 +422,13 @@ class LifeEngineWebSearchTool(BaseTool):
             return False, {"error": "search_depth 必须是 basic 或 advanced"}
         if topic not in ("general", "news", "finance"):
             return False, {"error": "topic 必须是 general/news/finance"}
-        if time_range not in ("", "day", "week", "month", "year"):
-            return False, {"error": "time_range 必须是 day/week/month/year 或空"}
+        normalized_time_range = (
+            None
+            if time_range is None or not str(time_range).strip()
+            else str(time_range).strip()
+        )
+        if normalized_time_range not in (None, "day", "week", "month", "year"):
+            return False, {"error": "time_range 必须是 day/week/month/year 或不传"}
         if include_domains and exclude_domains:
             return False, {"error": "include_domains 和 exclude_domains 不能同时设置"}
 
@@ -440,8 +445,8 @@ class LifeEngineWebSearchTool(BaseTool):
             "topic": topic,
             "include_answer": bool(include_answer),
         }
-        if time_range:
-            payload["time_range"] = time_range
+        if normalized_time_range is not None:
+            payload["time_range"] = normalized_time_range
         if include_domains:
             payload["include_domains"] = [d.strip() for d in include_domains if str(d).strip()]
         if exclude_domains:

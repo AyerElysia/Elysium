@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
+
+import plugins.life_engine.core.chatter as chatter_module
 
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.core.chatter import (
@@ -17,9 +20,9 @@ from plugins.life_engine.service.core import LifeEngineService
 from plugins.life_engine.service.event_builder import EventType, LifeEngineEvent
 from plugins.life_engine.tools.exec_tools import LifeEngineBashTool
 from plugins.life_engine.tools.file_tools import LifeEngineRunAgentTool, LifeEngineWakeDFCTool
-from src.core.components.base.chatter import BaseChatter, Success, Wait
-from src.core.models.message import Message
-from src.kernel.llm import LLMContextManager, LLMPayload, ROLE, Text
+from src.core.components.base.chatter import BaseChatter, Failure, Success, Wait
+from src.core.models.message import Message, MessageType
+from src.kernel.llm import Image, LLMContextManager, LLMPayload, ROLE, Text, ToolResult
 import pytest
 
 def test_life_chatter_system_prompt_includes_memory_and_chatter_tools_not_heartbeat_tool(tmp_path) -> None:
@@ -62,7 +65,8 @@ def test_life_chatter_system_prompt_includes_memory_and_chatter_tools_not_heartb
     assert "给编辑者看的说明" not in prompt
     assert "TOOL_CONTENT" not in prompt
     assert "CHATTER_TOOLS_CONTENT" in prompt
-    assert "action-think" in prompt
+    assert "assistant 纯文本 **不会被发送给用户**" in prompt
+    assert "自己的内心独白" in prompt
     assert "action-life_pass_and_wait" in prompt
     assert "life_send_text" in prompt
     assert "reason" in prompt
@@ -151,6 +155,159 @@ def test_life_chatter_context_compression_hook_preserves_dropped_history() -> No
     assert trimmed[2].content[0].text == "新用户消息"
 
 
+def test_life_chatter_context_compression_hook_uses_configured_limits() -> None:
+    manager = LLMContextManager()
+    request = SimpleNamespace(context_manager=manager)
+    chatter_config = SimpleNamespace(
+        context_compression_max_groups=1,
+        context_compression_max_part_chars=16,
+    )
+
+    LifeChatter._install_context_compression_hook(
+        request, chatter_config=chatter_config
+    )
+    compressed_payloads = manager.compression_hook(
+        [
+            [LLMPayload(ROLE.USER, Text("第一组用户消息" + "x" * 100))],
+            [LLMPayload(ROLE.USER, Text("第二组用户消息" + "a" * 100))],
+        ],
+        [],
+    )
+
+    compressed = compressed_payloads[0].content[0].text
+    assert "更早的 1 组上下文已进一步省略" in compressed
+    assert "第一组用户消息" not in compressed
+    assert "第二组用户消息" in compressed
+    assert "..." in compressed
+
+
+def test_life_chatter_rolling_context_snapshot_is_compacted_with_summary() -> None:
+    payloads = [
+        LLMPayload(ROLE.USER, Text(f"旧用户消息-{index}" + "x" * 20_000))
+        if index % 2 == 0
+        else LLMPayload(ROLE.ASSISTANT, Text(f"旧回复-{index}" + "y" * 20_000))
+        for index in range(30)
+    ]
+    payloads.extend(
+        [
+            LLMPayload(ROLE.USER, Text("最新用户消息")),
+            LLMPayload(ROLE.ASSISTANT, Text("最新回复")),
+        ]
+    )
+
+    compacted, before_chars, after_chars = LifeChatter._compact_rolling_context_payloads(
+        payloads,
+    )
+
+    assert after_chars < before_chars
+    assert after_chars <= 320_000
+    assert compacted[0].role == ROLE.USER
+    assert "<compressed_life_chatter_context>" in compacted[0].content[0].text
+    assert "旧用户消息" in compacted[0].content[0].text
+    assert any(
+        part.text == "最新用户消息"
+        for payload in compacted
+        for part in payload.content
+        if isinstance(part, Text)
+    )
+
+
+def test_life_chatter_single_huge_snapshot_payload_has_hard_cap() -> None:
+    payloads = [LLMPayload(ROLE.USER, Text("超大消息" + "x" * 400_000))]
+
+    compacted, before_chars, after_chars = LifeChatter._compact_rolling_context_payloads(
+        payloads,
+    )
+
+    assert before_chars > 320_000
+    assert after_chars <= 320_000
+    assert LifeChatter._estimate_payload_chars(compacted) == after_chars
+    assert "<compressed_life_chatter_context>" in compacted[0].content[0].text
+
+
+def test_life_chatter_snapshot_compaction_drops_large_binary_and_tool_payloads() -> None:
+    payloads = [
+        LLMPayload(ROLE.USER, [Text("请看附件"), Image("a" * 400_000)]),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            ToolResult(value={"raw": "z" * 400_000}, call_id="call-1", name="dump"),
+        ),
+        LLMPayload(ROLE.USER, Text("最新问题")),
+        LLMPayload(ROLE.ASSISTANT, Text("最新回答")),
+    ]
+
+    compacted, before_chars, after_chars = LifeChatter._compact_rolling_context_payloads(
+        payloads,
+        char_budget=2_000,
+    )
+
+    assert before_chars > 2_000
+    assert after_chars <= 2_000
+    assert LifeChatter._estimate_payload_chars(compacted) == after_chars
+    serialized = str(LifeChatter._snapshot_data_for_payloads(compacted))
+    assert "a" * 1_000 not in serialized
+    assert "z" * 1_000 not in serialized
+    assert "[图片]" in serialized
+    assert "[工具结果]" in serialized
+
+
+def test_life_chatter_snapshot_compaction_handles_budget_below_summary_envelope() -> None:
+    payloads = [LLMPayload(ROLE.USER, Text("x" * 10_000))]
+    empty_snapshot_chars = LifeChatter._estimate_payload_chars([])
+
+    compacted, before_chars, after_chars = LifeChatter._compact_rolling_context_payloads(
+        payloads,
+        char_budget=empty_snapshot_chars,
+    )
+
+    assert before_chars > empty_snapshot_chars
+    assert compacted == []
+    assert after_chars == empty_snapshot_chars
+
+
+@pytest.mark.parametrize("failure_stage", ["mkdir", "write", "replace"])
+def test_life_chatter_snapshot_save_failure_does_not_mutate_runtime(
+    tmp_path, monkeypatch, failure_stage
+) -> None:
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(tmp_path)
+    config.chatter.context_compaction_trigger_chars = 1_000
+    config.chatter.context_compaction_target_chars = 500
+    config.chatter.context_compaction_min_recent_groups = 1
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=config)
+    payloads = [
+        LLMPayload(ROLE.USER, Text(f"旧消息-{index}" + "x" * 2_000))
+        if index % 2 == 0
+        else LLMPayload(ROLE.ASSISTANT, Text(f"旧回复-{index}" + "y" * 2_000))
+        for index in range(8)
+    ]
+    response = SimpleNamespace(payloads=payloads)
+    original_list = response.payloads
+    original_payloads = list(original_list)
+    original_contents = [payload.content for payload in original_payloads]
+
+    compactable_response = SimpleNamespace(payloads=list(payloads))
+    result = chatter._maybe_compact_runtime_context(compactable_response)
+    assert result.triggered
+    assert compactable_response.payloads is not payloads
+    assert len(compactable_response.payloads) < len(payloads)
+
+    if failure_stage == "mkdir":
+        monkeypatch.setattr(Path, "mkdir", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("mkdir")))
+    elif failure_stage == "write":
+        monkeypatch.setattr(Path, "write_text", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("write")))
+    else:
+        monkeypatch.setattr(chatter_module.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("replace")))
+
+    chatter._save_rolling_context_snapshot(response)
+
+    assert response.payloads is original_list
+    assert response.payloads == original_payloads
+    assert all(actual is expected for actual, expected in zip(response.payloads, original_payloads, strict=True))
+    assert all(payload.content is content for payload, content in zip(response.payloads, original_contents, strict=True))
+
+
 @pytest.mark.asyncio
 async def test_life_chatter_global_runtime_is_reused(monkeypatch) -> None:
     LifeChatter.reset_global_runtime()
@@ -221,6 +378,195 @@ async def test_life_chatter_global_runtime_follow_up_stays_on_owner_stream(monke
     assert result.time == _GLOBAL_RUNTIME_BUSY_RETRY_SECONDS
     assert rt.phase == _Phase.FOLLOW_UP
     assert rt.active_stream_id == "stream-a"
+
+    LifeChatter.reset_global_runtime()
+
+
+@pytest.mark.asyncio
+async def test_life_chatter_follow_up_response_is_sent_once_without_initial_commit(
+    monkeypatch,
+) -> None:
+    """FOLLOW_UP 成功后应进入 TOOL_EXEC，且不执行初始轮的 flush/游标提交。"""
+    LifeChatter.reset_global_runtime()
+    send_calls = 0
+    unread = Message(
+        message_id="follow-up-unread",
+        content="续轮期间的未读",
+        processed_plain_text="续轮期间的未读",
+        sender_role="other",
+        stream_id="stream-a",
+    )
+
+    class FollowUpResponse:
+        def __init__(self) -> None:
+            self.payloads = [LLMPayload(ROLE.USER, Text("已有续轮上下文"))]
+            self.call_list = [
+                SimpleNamespace(
+                    id="pass-1",
+                    name="action-life_pass_and_wait",
+                    args={},
+                )
+            ]
+            self.message = ""
+
+        def add_payload(self, payload) -> None:
+            self.payloads.append(payload)
+
+        async def send(self, *, stream: bool = False):
+            nonlocal send_calls
+            assert stream is False
+            send_calls += 1
+            if send_calls > 1:
+                raise AssertionError("一次 FOLLOW_UP 成功响应不能重复 send")
+            return self
+
+        def __await__(self):
+            async def done():
+                return self
+
+            return done().__await__()
+
+    response = FollowUpResponse()
+    rt = _WorkflowRuntime(
+        response=response,
+        phase=_Phase.FOLLOW_UP,
+        history_merged=True,
+        unreads=[unread],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[unread],
+        pending_transient_context_text="INITIAL_ONLY_SUFFIX",
+        pending_life_context_high_water=17,
+        active_stream_id="stream-a",
+    )
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+
+    class CommitForbiddenService:
+        async def mark_chatter_runtime_context_seen(self, *_args, **_kwargs) -> None:
+            raise AssertionError("FOLLOW_UP 不应提交 life context 游标")
+
+        async def _save_runtime_context(self) -> None:
+            raise AssertionError("FOLLOW_UP 不应持久化 life context 游标")
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=None)
+    chatter.stream_id = "stream-a"
+
+    async def fake_fetch_unreads():
+        return [], [unread]
+
+    async def fail_flush_unreads(_messages) -> None:
+        raise AssertionError("FOLLOW_UP 不应 flush unread")
+
+    async def immediate_model_turn(awaitable):
+        return await awaitable
+
+    import src.kernel.concurrency as concurrency
+
+    monkeypatch.setattr(
+        concurrency,
+        "get_watchdog",
+        lambda: SimpleNamespace(feed_dog=lambda _stream_id: None),
+    )
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+    monkeypatch.setattr(chatter, "flush_unreads", fail_flush_unreads)
+    monkeypatch.setattr(chatter, "_await_model_turn", immediate_model_turn)
+    monkeypatch.setattr(chatter, "_sync_native_visual_vlm_skip", lambda _stream: None)
+    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", lambda _response: None)
+
+    result = await chatter._drive_global_runtime_until_yield(
+        SimpleNamespace(stream_id="stream-a"),
+        service=CommitForbiddenService(),
+    )
+
+    assert isinstance(result, Wait)
+    assert send_calls == 1
+    assert rt.phase == _Phase.WAIT_USER
+    assert rt.unread_msgs_to_flush == [unread]
+    assert rt.pending_transient_context_text == "INITIAL_ONLY_SUFFIX"
+    assert rt.pending_life_context_high_water == 17
+
+    LifeChatter.reset_global_runtime()
+
+
+@pytest.mark.asyncio
+async def test_life_chatter_wake_collects_completed_background_agent_results(
+    monkeypatch,
+) -> None:
+    """LifeChatter 被唤醒时应非阻塞收集结果，不必等待 heartbeat。"""
+    LifeChatter.reset_global_runtime()
+    collect_timeouts: list[float] = []
+    appended_events: list[object] = []
+    agent_result = SimpleNamespace(
+        agent_type="explore",
+        result_text="后台检查完成",
+        success=True,
+        rounds_used=2,
+        duration_ms=15,
+    )
+
+    class FakeCoordinator:
+        def has_pending(self) -> bool:
+            return True
+
+        async def collect_results(self, *, timeout_seconds: float):
+            collect_timeouts.append(timeout_seconds)
+            return {"agent-1": agent_result}
+
+    class FakeEventBuilder:
+        def build_agent_result_event(self, **kwargs):
+            return kwargs
+
+    async def append_history(events) -> None:
+        appended_events.extend(events)
+
+    service = SimpleNamespace(
+        _event_builder=FakeEventBuilder(),
+        _append_history=append_history,
+    )
+    plugin = SimpleNamespace(
+        config=None,
+        _service=service,
+        _agent_coordinator=FakeCoordinator(),
+    )
+
+    class DummyStreamManager:
+        async def activate_stream(self, stream_id: str):
+            return SimpleNamespace(stream_id=stream_id)
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = plugin
+    chatter.stream_id = "stream-a"
+
+    async def fake_fetch_unreads():
+        return [], []
+
+    import src.core.managers.stream_manager as stream_manager_module
+
+    monkeypatch.setattr(
+        stream_manager_module,
+        "get_stream_manager",
+        lambda: DummyStreamManager(),
+    )
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+
+    generator = chatter.execute()
+    try:
+        result = await anext(generator)
+    finally:
+        await generator.aclose()
+
+    assert isinstance(result, Wait)
+    assert collect_timeouts == [0.0]
+    assert appended_events == [
+        {
+            "agent_type": "explore",
+            "result_text": "后台检查完成",
+            "success": True,
+            "rounds": 2,
+            "duration_ms": 15,
+        }
+    ]
 
     LifeChatter.reset_global_runtime()
 
@@ -331,6 +677,193 @@ async def test_life_chatter_think_only_continues_loop(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_life_chatter_visible_reply_ends_turn(monkeypatch) -> None:
+    """发送可见回复后应结束本轮，避免 follow-up 再次回复同一事件。"""
+
+    LifeChatter.reset_global_runtime()
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.payloads = []
+            self.call_list = [
+                SimpleNamespace(
+                    id="send-1",
+                    name="action-life_send_text",
+                    args={"content": "我看到啦"},
+                )
+            ]
+            self.message = ""
+
+        def add_payload(self, payload) -> None:
+            self.payloads.append(payload)
+
+    response = FakeResponse()
+    rt = _WorkflowRuntime(
+        response=response,
+        phase=_Phase.TOOL_EXEC,
+        history_merged=True,
+        unreads=[],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[],
+        active_stream_id="stream-a",
+        must_reply=True,
+    )
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=None)
+    chatter.stream_id = "stream-a"
+
+    async def fake_fetch_unreads():
+        return [], []
+
+    async def fake_run_tool_call(*_args, **_kwargs):
+        return [(True, True)]
+
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+    monkeypatch.setattr(chatter, "run_tool_call", fake_run_tool_call)
+    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", lambda _response: None)
+
+    result = await chatter._drive_global_runtime_until_yield(
+        SimpleNamespace(stream_id="stream-a"),
+        service=None,
+    )
+
+    assert isinstance(result, Wait)
+    assert rt.phase == _Phase.WAIT_USER
+    assert rt.sent_visible_reply is True
+    assert rt.must_reply is False
+    assert rt.follow_up_rounds == 0
+
+    LifeChatter.reset_global_runtime()
+
+
+@pytest.mark.asyncio
+async def test_life_chatter_recent_duplicate_reply_is_suppressed_and_ends_turn(monkeypatch) -> None:
+    LifeChatter.reset_global_runtime()
+
+    call = SimpleNamespace(
+        id="send-duplicate",
+        name="action-life_send_text",
+        args={"content": "上一轮的完整答案"},
+    )
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.payloads = []
+            self.call_list = [call]
+            self.message = ""
+
+        def add_payload(self, payload) -> None:
+            self.payloads.append(payload)
+
+    rt = _WorkflowRuntime(
+        response=FakeResponse(),
+        phase=_Phase.TOOL_EXEC,
+        history_merged=True,
+        unreads=[],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[],
+        active_stream_id="stream-a",
+        must_reply=True,
+    )
+    entry = LifeChatter._visible_text_reply_cache_entry(call, "stream-a")
+    assert entry is not None
+    LifeChatter._remember_visible_text_reply(rt, entry)
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=None)
+    chatter.stream_id = "stream-a"
+
+    async def fake_fetch_unreads():
+        return [], []
+
+    async def fail_run_tool_call(*_args, **_kwargs):
+        raise AssertionError("duplicate reply must not reach the sender")
+
+    fallback_called = False
+
+    async def fail_fallback(*_args, **_kwargs):
+        nonlocal fallback_called
+        fallback_called = True
+        return True
+
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+    monkeypatch.setattr(chatter, "run_tool_call", fail_run_tool_call)
+    monkeypatch.setattr(chatter, "_send_must_reply_fallback", fail_fallback)
+    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", lambda _response: None)
+
+    result = await chatter._drive_global_runtime_until_yield(
+        SimpleNamespace(stream_id="stream-a"),
+        service=None,
+    )
+
+    assert isinstance(result, Wait)
+    assert rt.phase == _Phase.WAIT_USER
+    assert rt.sent_visible_reply is False
+    assert rt.must_reply is False
+    assert fallback_called is False
+
+    LifeChatter.reset_global_runtime()
+
+
+@pytest.mark.asyncio
+async def test_life_chatter_reaction_only_empty_turn_ends_without_fallback(monkeypatch) -> None:
+    LifeChatter.reset_global_runtime()
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.payloads = []
+            self.call_list = []
+            self.message = ""
+
+        def add_payload(self, payload) -> None:
+            self.payloads.append(payload)
+
+    rt = _WorkflowRuntime(
+        response=FakeResponse(),
+        phase=_Phase.TOOL_EXEC,
+        history_merged=True,
+        unreads=[],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[],
+        active_stream_id="stream-a",
+        must_reply=False,
+        reaction_only=True,
+    )
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=None)
+    chatter.stream_id = "stream-a"
+
+    async def fake_fetch_unreads():
+        return [], []
+
+    async def fail_fallback(*_args, **_kwargs):
+        raise AssertionError("reaction-only empty turn must not send fallback")
+
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+    monkeypatch.setattr(chatter, "_send_must_reply_fallback", fail_fallback)
+    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", lambda _response: None)
+
+    result = await chatter._drive_global_runtime_until_yield(
+        SimpleNamespace(stream_id="stream-a"),
+        service=None,
+    )
+
+    assert isinstance(result, Wait)
+    assert rt.phase == _Phase.WAIT_USER
+    assert rt.follow_up_rounds == 0
+
+    LifeChatter.reset_global_runtime()
+
+
+@pytest.mark.asyncio
 async def test_life_chatter_empty_turn_continues_loop_until_max_rounds(monkeypatch) -> None:
     """空 action 轮次默认继续 loop，直到 max_rounds 收束。"""
 
@@ -379,6 +912,76 @@ async def test_life_chatter_empty_turn_continues_loop_until_max_rounds(monkeypat
     assert rt.phase == _Phase.WAIT_USER
 
     LifeChatter.reset_global_runtime()
+
+
+def test_life_chatter_reaction_only_batch_does_not_force_reply() -> None:
+    reaction = Message(
+        content="base64-data",
+        processed_plain_text="[表情包:害羞]",
+        message_type=MessageType.EMOJI,
+        sender_role="other",
+    )
+    image_with_text = Message(
+        content={"media": [{"type": "image", "data": "base64-data"}]},
+        processed_plain_text="[图片:一只猫] 这是什么品种？",
+        message_type=MessageType.IMAGE,
+        sender_role="other",
+    )
+
+    assert LifeChatter._is_reaction_only_batch([reaction]) is True
+    assert LifeChatter._should_force_reply_for_unread_batch([reaction]) is False
+    assert LifeChatter._is_reaction_only_batch([image_with_text]) is False
+    assert LifeChatter._should_force_reply_for_unread_batch([image_with_text]) is True
+
+
+def test_life_chatter_recent_visible_text_reply_cache_is_scoped_and_expires() -> None:
+    rt = _WorkflowRuntime(
+        response=SimpleNamespace(payloads=[]),
+        phase=_Phase.WAIT_USER,
+        history_merged=True,
+        unreads=[],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[],
+    )
+    call = SimpleNamespace(
+        name="action-life_send_text",
+        args={"content": "第一段\n第二段", "target_key": ""},
+    )
+    same_turn = LifeChatter._visible_text_reply_cache_entry(
+        call,
+        "stream-a",
+        turn_key="turn-1",
+    )
+    other_stream = LifeChatter._visible_text_reply_cache_entry(
+        call,
+        "stream-b",
+        turn_key="turn-1",
+    )
+    later_turn = LifeChatter._visible_text_reply_cache_entry(
+        call,
+        "stream-a",
+        turn_key="turn-2",
+    )
+    changed = LifeChatter._visible_text_reply_cache_entry(
+        SimpleNamespace(
+            name="action-life_send_text",
+            args={"content": "另一条回复", "target_key": ""},
+        ),
+        "stream-a",
+        turn_key="turn-1",
+    )
+
+    assert same_turn is not None
+    assert other_stream is not None
+    assert later_turn is not None
+    assert changed is not None
+    LifeChatter._remember_visible_text_reply(rt, same_turn, now=100.0)
+
+    assert LifeChatter._was_recent_visible_text_reply(rt, same_turn, now=101.0) is True
+    assert LifeChatter._was_recent_visible_text_reply(rt, other_stream, now=101.0) is False
+    assert LifeChatter._was_recent_visible_text_reply(rt, later_turn, now=101.0) is False
+    assert LifeChatter._was_recent_visible_text_reply(rt, changed, now=101.0) is False
+    assert LifeChatter._was_recent_visible_text_reply(rt, same_turn, now=401.0) is False
 
 
 @pytest.mark.asyncio
@@ -645,9 +1248,364 @@ async def test_life_chatter_watchdog_keepalive_feeds_during_long_await(monkeypat
     assert all(stream_id == "live-stream-1" for stream_id in feed_calls)
 
 
+@pytest.mark.parametrize("outer_timeout", [0.001, 0.05, 1.0, 10.0, 95.0])
+def test_life_chatter_model_turn_timeout_is_strictly_inside_outer_deadline(
+    monkeypatch,
+    outer_timeout: float,
+) -> None:
+    monkeypatch.setattr(
+        "plugins.life_engine.core.chatter.get_core_config",
+        lambda: SimpleNamespace(
+            bot=SimpleNamespace(stream_step_timeout=outer_timeout),
+        ),
+    )
+
+    inner_timeout = LifeChatter._get_model_turn_timeout()
+
+    assert inner_timeout is not None
+    assert 0 < inner_timeout < outer_timeout
+
+
+@pytest.mark.parametrize("outer_timeout", [0.0, -1.0, float("nan"), float("inf")])
+def test_life_chatter_model_turn_timeout_uses_default_without_outer_deadline(
+    monkeypatch,
+    outer_timeout: float,
+) -> None:
+    monkeypatch.setattr(
+        "plugins.life_engine.core.chatter.get_core_config",
+        lambda: SimpleNamespace(
+            bot=SimpleNamespace(stream_step_timeout=outer_timeout),
+        ),
+    )
+
+    assert LifeChatter._get_model_turn_timeout() == 90.0
+
+
 @pytest.mark.asyncio
-async def test_life_chatter_runtime_context_cursor_avoids_repeat_injection() -> None:
-    service = LifeEngineService(SimpleNamespace(config=None))
+async def test_life_chatter_model_turn_timeout_releases_runtime_owner(monkeypatch) -> None:
+    LifeChatter.reset_global_runtime()
+
+    class DummyWatchDog:
+        def feed_dog(self, _stream_id: str) -> None:
+            return None
+
+    class SlowRequest:
+        def __init__(self) -> None:
+            self.payloads = [LLMPayload(ROLE.USER, Text("existing"))]
+
+        def add_payload(self, payload) -> None:
+            self.payloads.append(payload)
+
+        async def send(self, *, stream: bool = False):
+            del stream
+            await asyncio.sleep(1.0)
+            return self
+
+    request = SlowRequest()
+    unread = Message(message_id="m1", content="new", stream_id="stream-a")
+    rt = _WorkflowRuntime(
+        response=request,
+        phase=_Phase.MODEL_TURN,
+        history_merged=True,
+        unreads=[unread],
+        cross_round_seen_signatures={"old-call"},
+        unread_msgs_to_flush=[unread],
+        pending_transient_context_text="TRANSIENT",
+        pending_life_context_high_water=9,
+        media_seen={"media-1"},
+        active_stream_id="stream-a",
+        must_reply=True,
+        sent_visible_reply=True,
+        reaction_only=True,
+        active_unread_turn_key="turn-1",
+    )
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=None)
+    chatter.stream_id = "stream-a"
+
+    async def fake_fetch_unreads():
+        return [], []
+
+    import src.kernel.concurrency as concurrency
+
+    monkeypatch.setattr(concurrency, "get_watchdog", lambda: DummyWatchDog())
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+    monkeypatch.setattr(chatter, "_get_model_turn_timeout", lambda: 0.01)
+
+    result = await chatter._drive_global_runtime_until_yield(
+        SimpleNamespace(stream_id="stream-a"),
+        service=None,
+    )
+
+    assert isinstance(result, Failure)
+    assert rt.phase == _Phase.WAIT_USER
+    assert rt.active_stream_id == ""
+    assert rt.active_unread_turn_key == ""
+    assert rt.pending_transient_context_text == ""
+    assert rt.pending_life_context_high_water == 0
+    assert rt.unread_msgs_to_flush == []
+    assert rt.unreads == []
+    assert rt.cross_round_seen_signatures == set()
+    assert rt.media_seen == set()
+    assert rt.must_reply is False
+    assert rt.sent_visible_reply is False
+    assert rt.reaction_only is False
+    assert [part.text for part in request.payloads[0].content] == ["existing"]
+
+    LifeChatter.reset_global_runtime()
+
+
+@pytest.mark.asyncio
+async def test_life_chatter_cursor_persistence_cancellation_keeps_flushed_turn(
+    monkeypatch,
+) -> None:
+    LifeChatter.reset_global_runtime()
+
+    class CompletedResponse:
+        def __init__(self) -> None:
+            self.payloads = [
+                LLMPayload(ROLE.USER, Text("older turn")),
+                LLMPayload(ROLE.USER, Text("accepted unread")),
+            ]
+
+        async def send(self, *, stream: bool = False):
+            assert stream is False
+            self.payloads.append(
+                LLMPayload(ROLE.ASSISTANT, Text("completed model response"))
+            )
+            return self
+
+        def __await__(self):
+            async def done():
+                return self
+
+            return done().__await__()
+
+    response = CompletedResponse()
+    unread = Message(message_id="m1", content="new", stream_id="stream-a")
+    rt = _WorkflowRuntime(
+        response=response,
+        phase=_Phase.MODEL_TURN,
+        history_merged=True,
+        unreads=[unread],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[unread],
+        unread_payloads_before_turn=[LLMPayload(ROLE.USER, Text("older turn"))],
+        unread_history_merged_before_turn=False,
+        pending_transient_context_text="TRANSIENT",
+        pending_life_context_high_water=9,
+        active_stream_id="stream-a",
+        active_unread_turn_key="turn-1",
+    )
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+
+    class DummyStreamManager:
+        async def activate_stream(self, stream_id: str):
+            return SimpleNamespace(stream_id=stream_id)
+
+    class CancellingService:
+        async def mark_chatter_runtime_context_seen(self, *_args, **_kwargs) -> None:
+            raise asyncio.CancelledError
+
+        async def _save_runtime_context(self) -> None:
+            raise AssertionError("save must not run after cursor marking is cancelled")
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=None)
+    chatter.stream_id = "stream-a"
+    flushed: list[Message] = []
+
+    async def fake_fetch_unreads():
+        return [], []
+
+    async def fake_flush_unreads(messages) -> None:
+        flushed.extend(messages)
+
+    async def immediate_model_turn(awaitable):
+        return await awaitable
+
+    import src.core.managers.stream_manager as stream_manager_module
+
+    monkeypatch.setattr(stream_manager_module, "get_stream_manager", lambda: DummyStreamManager())
+    monkeypatch.setattr(chatter, "_get_life_service", lambda: CancellingService())
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+    monkeypatch.setattr(chatter, "flush_unreads", fake_flush_unreads)
+    monkeypatch.setattr(chatter, "_await_model_turn", immediate_model_turn)
+
+    generator = chatter.execute()
+    with pytest.raises(asyncio.CancelledError):
+        await anext(generator)
+
+    assert flushed == [unread]
+    assert [
+        part.text
+        for payload in response.payloads
+        for part in payload.content
+        if isinstance(part, Text)
+    ] == ["older turn", "accepted unread", "completed model response"]
+    assert rt.history_merged is True
+    assert rt.unread_payloads_before_turn is None
+    assert rt.unread_msgs_to_flush == []
+    assert rt.pending_transient_context_text == ""
+    assert rt.pending_life_context_high_water == 0
+    assert rt.phase == _Phase.WAIT_USER
+    assert rt.active_stream_id == ""
+    assert rt.active_unread_turn_key == ""
+
+    LifeChatter.reset_global_runtime()
+
+
+@pytest.mark.asyncio
+async def test_life_chatter_outer_cancellation_restores_empty_turn_snapshot(
+    monkeypatch,
+) -> None:
+    LifeChatter.reset_global_runtime()
+    response = SimpleNamespace(
+        payloads=[LLMPayload(ROLE.USER, Text("accepted unread"))],
+    )
+    unread = Message(message_id="m1", content="new", stream_id="stream-a")
+    rt = _WorkflowRuntime(
+        response=response,
+        phase=_Phase.MODEL_TURN,
+        history_merged=True,
+        unreads=[unread],
+        cross_round_seen_signatures={"old-call"},
+        unread_msgs_to_flush=[unread],
+        unread_payloads_before_turn=[],
+        unread_history_merged_before_turn=False,
+        active_stream_id="stream-a",
+        must_reply=True,
+        active_unread_turn_key="turn-1",
+    )
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+
+    class DummyStreamManager:
+        async def activate_stream(self, stream_id: str):
+            return SimpleNamespace(stream_id=stream_id)
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=None)
+    chatter.stream_id = "stream-a"
+
+    async def fake_fetch_unreads():
+        return [], []
+
+    async def cancel_drive(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    import src.core.managers.stream_manager as stream_manager_module
+
+    monkeypatch.setattr(stream_manager_module, "get_stream_manager", lambda: DummyStreamManager())
+    monkeypatch.setattr(chatter, "_get_life_service", lambda: None)
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+    monkeypatch.setattr(chatter, "_drive_global_runtime_until_yield", cancel_drive)
+
+    generator = chatter.execute()
+    with pytest.raises(asyncio.CancelledError):
+        await anext(generator)
+
+    assert response.payloads == []
+    assert rt.history_merged is False
+    assert rt.phase == _Phase.WAIT_USER
+    assert rt.active_stream_id == ""
+    assert rt.active_unread_turn_key == ""
+    assert rt.unread_payloads_before_turn is None
+    assert rt.unread_msgs_to_flush == []
+    assert rt.unreads == []
+    assert rt.cross_round_seen_signatures == set()
+    assert rt.must_reply is False
+
+    LifeChatter.reset_global_runtime()
+
+
+@pytest.mark.asyncio
+async def test_life_chatter_outer_cancellation_closes_tool_call_tail(
+    monkeypatch,
+) -> None:
+    from src.kernel.llm import ToolCall, ToolResult
+
+    LifeChatter.reset_global_runtime()
+    response = SimpleNamespace(
+        payloads=[
+            LLMPayload(ROLE.USER, Text("run tool")),
+            LLMPayload(
+                ROLE.ASSISTANT,
+                [ToolCall(id="call-1", name="tool-x", args={})],
+            ),
+        ],
+    )
+
+    def add_payload(payload) -> None:
+        response.payloads.append(payload)
+
+    response.add_payload = add_payload
+    rt = _WorkflowRuntime(
+        response=response,
+        phase=_Phase.TOOL_EXEC,
+        history_merged=True,
+        unreads=[],
+        cross_round_seen_signatures={"tool-x:{}"},
+        unread_msgs_to_flush=[],
+        active_stream_id="stream-a",
+        active_unread_turn_key="turn-1",
+    )
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+
+    class DummyStreamManager:
+        async def activate_stream(self, stream_id: str):
+            return SimpleNamespace(stream_id=stream_id)
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=None)
+    chatter.stream_id = "stream-a"
+
+    async def fake_fetch_unreads():
+        return [], []
+
+    async def cancel_drive(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    import src.core.managers.stream_manager as stream_manager_module
+
+    monkeypatch.setattr(stream_manager_module, "get_stream_manager", lambda: DummyStreamManager())
+    monkeypatch.setattr(chatter, "_get_life_service", lambda: None)
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+    monkeypatch.setattr(chatter, "_drive_global_runtime_until_yield", cancel_drive)
+
+    generator = chatter.execute()
+    with pytest.raises(asyncio.CancelledError):
+        await anext(generator)
+
+    tool_results = [
+        part
+        for payload in response.payloads
+        for part in payload.content
+        if isinstance(part, ToolResult)
+    ]
+    assert len(tool_results) == 1
+    assert tool_results[0].call_id == "call-1"
+    assert "结果未知" in str(tool_results[0].value)
+    assert response.payloads[-1].role == ROLE.ASSISTANT
+    assert response.payloads[-1].content[0].text == "__SUSPEND__"
+    LLMContextManager().validate_for_send(response.payloads)
+    assert rt.phase == _Phase.WAIT_USER
+    assert rt.active_stream_id == ""
+    assert rt.active_unread_turn_key == ""
+
+    LifeChatter.reset_global_runtime()
+
+
+@pytest.mark.asyncio
+async def test_life_chatter_runtime_context_cursor_avoids_repeat_injection(tmp_path) -> None:
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(tmp_path)
+    service = LifeEngineService(SimpleNamespace(config=config))
     service._event_history = [
         LifeEngineEvent(
             event_id="evt-1",
@@ -693,8 +1651,10 @@ async def test_life_chatter_runtime_context_cursor_avoids_repeat_injection() -> 
 
 
 @pytest.mark.asyncio
-async def test_life_chatter_unified_runtime_context_uses_global_cursor() -> None:
-    service = LifeEngineService(SimpleNamespace(config=None))
+async def test_life_chatter_unified_runtime_context_uses_global_cursor(tmp_path) -> None:
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(tmp_path)
+    service = LifeEngineService(SimpleNamespace(config=config))
     service._event_history = [
         LifeEngineEvent(
             event_id="evt-a",
@@ -899,8 +1859,9 @@ def test_heartbeat_prompt_bounds_tell_dfc_to_context_gap(tmp_path) -> None:
     assert "不要用子智能体承接用户任务、画图、查项目配置、跑命令" in prompt
     assert "你应该回复 X" in prompt
     assert "你去安慰/追问 Y" in prompt
-    assert "只服务高优先级信息差，不用于催表达层开口" in prompt
-    assert "如果没有明确需要，可以不调用工具" in prompt
+    assert "工具会默认唤醒表达层" in prompt
+    assert "唤醒只是让新上下文被看见，不代表表达层必须开口" in prompt
+    assert "没有明确信息差或私有维护需求时，可以安静结束本轮" in prompt
     assert "有冲动就行动" not in prompt
 
 

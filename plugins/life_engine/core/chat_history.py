@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import math
 from typing import Any
 
 from src.app.plugin_system.base import BaseChatter
@@ -168,6 +169,47 @@ def format_chat_history_entry(
     return f"〔{' | '.join(meta_parts)}〕 {line}"
 
 
+def _message_datetime(message: Message) -> datetime | None:
+    raw = getattr(message, "time", None)
+    if isinstance(raw, datetime):
+        return raw
+    try:
+        timestamp = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(timestamp):
+        return None
+    try:
+        return datetime.fromtimestamp(timestamp)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def format_chat_history_entries(
+    entries: list[ChatHistoryEntry],
+    *,
+    current_stream_id: str = "",
+    include_stream_label: bool = False,
+) -> str:
+    lines: list[str] = []
+    current_date: str | None = None
+    for entry in entries:
+        message_datetime = _message_datetime(entry.message)
+        if message_datetime is not None:
+            message_date = message_datetime.strftime("%Y-%m-%d")
+            if message_date != current_date:
+                lines.append(message_date)
+                current_date = message_date
+        lines.append(
+            format_chat_history_entry(
+                entry,
+                current_stream_id=current_stream_id,
+                include_stream_label=include_stream_label,
+            )
+        )
+    return "\n".join(lines)
+
+
 def build_chat_history_text(
     current_stream: Any,
     *,
@@ -187,13 +229,10 @@ def build_chat_history_text(
 
     current_stream_id = str(getattr(current_stream, "stream_id", "") or "").strip()
     should_label = global_history if include_stream_label is None else include_stream_label
-    return "\n".join(
-        format_chat_history_entry(
-            entry,
-            current_stream_id=current_stream_id,
-            include_stream_label=should_label,
-        )
-        for entry in entries
+    return format_chat_history_entries(
+        entries,
+        current_stream_id=current_stream_id,
+        include_stream_label=should_label,
     )
 
 
@@ -335,11 +374,8 @@ async def build_global_chat_history_text_from_db(
         return ""
 
     current_stream_id = str(getattr(current_stream, "stream_id", "") or "").strip()
-    return "\n".join(
-        format_chat_history_entry(
-            entry,
-            current_stream_id=current_stream_id,
-            include_stream_label=include_stream_label,
-        )
-        for entry in entries
+    return format_chat_history_entries(
+        entries,
+        current_stream_id=current_stream_id,
+        include_stream_label=include_stream_label,
     )

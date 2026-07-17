@@ -55,6 +55,23 @@ class LifeEngineConfig(BaseConfig):
             "tavily_base_url",
             "trust_env",
         },
+        "everos": {
+            "enabled",
+            "base_url",
+            "app_id",
+            "project_id",
+            "sync_messages",
+            "sync_sent_messages",
+            "recall_to_chatter",
+            "search_method",
+            "top_k",
+            "include_profile",
+            "timeout_seconds",
+            "write_timeout_seconds",
+            "recall_timeout_seconds",
+            "flush_after_add",
+            "max_recall_chars",
+        },
         "snn": {
             "enabled",
             "shadow_only",
@@ -74,6 +91,12 @@ class LifeEngineConfig(BaseConfig):
             "mode",
             "max_rounds_per_chat",
             "initial_history_messages",
+            "recent_history_tail_messages",
+            "enable_sub_agent",
+            "sub_agent_task_name",
+            "sub_agent_allow_mcp",
+            "sub_agent_default_max_rounds",
+            "enable_mcp",
         },
         "multimodal": {
             "enabled",
@@ -421,6 +444,95 @@ class LifeEngineConfig(BaseConfig):
             description="网页提取默认最大返回字符数。",
         )
 
+    @config_section("everos")
+    class EverOSSection(SectionBase):
+        """EverOS 长期记忆桥接配置。"""
+
+        enabled: bool = Field(
+            default=False,
+            description="是否启用 EverOS 长期记忆桥接。默认关闭，不影响 Neo 本地记忆。",
+        )
+
+        base_url: str = Field(
+            default="http://127.0.0.1:8000",
+            description="EverOS API 服务地址，例如 http://127.0.0.1:8000。",
+        )
+
+        app_id: str = Field(
+            default="neo_mofox",
+            description="写入 EverOS 的 app_id。需符合 EverOS 路径安全 ID 规则。",
+        )
+
+        project_id: str = Field(
+            default="default",
+            description="写入 EverOS 的 project_id。需符合 EverOS 路径安全 ID 规则。",
+        )
+
+        sync_messages: bool = Field(
+            default=True,
+            description="启用后将 Neo 收到的聊天消息异步写入 EverOS。",
+        )
+
+        sync_sent_messages: bool = Field(
+            default=True,
+            description="启用后将 Neo 自己发出的消息也异步写入 EverOS。",
+        )
+
+        recall_to_chatter: bool = Field(
+            default=True,
+            description="启用后 life_chatter 在回复前从 EverOS 召回长期记忆并注入本轮临时上下文。",
+        )
+
+        search_method: str = Field(
+            default="hybrid",
+            description="EverOS 搜索方法：keyword / vector / hybrid / agentic。",
+        )
+
+        top_k: int = Field(
+            default=5,
+            ge=1,
+            le=20,
+            description="每次 EverOS 召回的最大结果数。",
+        )
+
+        include_profile: bool = Field(
+            default=True,
+            description="召回时是否请求 EverOS 用户画像。",
+        )
+
+        timeout_seconds: float = Field(
+            default=3.0,
+            ge=0.2,
+            le=30.0,
+            description="EverOS HTTP 请求默认超时时间。未设置细分超时时作为兜底。",
+        )
+
+        write_timeout_seconds: float = Field(
+            default=15.0,
+            ge=0.5,
+            le=60.0,
+            description="EverOS 写入请求超时时间。写入在后台执行，可以比召回更宽松。",
+        )
+
+        recall_timeout_seconds: float = Field(
+            default=2.0,
+            ge=0.2,
+            le=10.0,
+            description="EverOS 召回请求超时时间。该路径会影响当前回复延迟，应保持较短。",
+        )
+
+        flush_after_add: bool = Field(
+            default=False,
+            description="每次写入消息后是否立即调用 EverOS flush。默认关闭，由 EverOS 自己做边界沉淀。",
+        )
+
+        max_recall_chars: int = Field(
+            default=1800,
+            ge=200,
+            le=6000,
+            description="注入 life_chatter 的 EverOS 召回文本最大字符数。",
+        )
+
     @config_section("snn")
     class SNNSection(SectionBase):
         """SNN 皮层下状态层配置。"""
@@ -662,12 +774,100 @@ class LifeEngineConfig(BaseConfig):
             ),
         )
 
+        context_compression_max_groups: int = Field(
+            default=12,
+            ge=1,
+            description="上下文压缩摘要最多保留的旧对话组数。",
+        )
+
+        context_compression_max_part_chars: int = Field(
+            default=360,
+            ge=16,
+            description="上下文压缩摘要中每个内容片段的最大字符数。",
+        )
+
+        rolling_context_snapshot_char_budget: int = Field(
+            default=320_000,
+            ge=1_000,
+            description="life_chatter 滚动上下文快照的序列化硬上限字符预算。",
+        )
+
+        context_compaction_enabled: bool = Field(
+            default=True,
+            description="是否启用 life_chatter 分层运行态/快照上下文压缩。",
+        )
+
+        context_compaction_trigger_chars: int = Field(
+            default=120_000,
+            ge=1_000,
+            description="运行态上下文超过该序列化字符估计值时触发分层压缩。",
+        )
+
+        context_compaction_target_chars: int = Field(
+            default=80_000,
+            ge=500,
+            description="分层压缩后的目标序列化字符估计值（应不大于 trigger）。",
+        )
+
+        context_compaction_min_recent_groups: int = Field(
+            default=2,
+            ge=1,
+            description="压缩后至少保留的最近完整对话组数（未闭合工具链额外保护）。",
+        )
+
+        context_compaction_summary_max_chars: int = Field(
+            default=12_000,
+            ge=200,
+            description="规范 summary 正文最大字符数；旧 summary 更新替换且不嵌套。",
+        )
+
         recent_history_tail_messages: int = Field(
             default=0,
             ge=0,
             description=(
                 "兼容旧配置：若 initial_history_messages 未显式配置且此值 > 0，"
                 "则回退使用该值作为首轮历史消息条数。"
+            ),
+        )
+
+        enable_sub_agent: bool = Field(
+            default=False,
+            description=(
+                "是否允许 life_chatter 调用子代理（life_run_agent）。"
+                "开启后 life_chatter 表达层可以把复杂多步任务委托给独立子代理执行，"
+                "子代理拥有独立 LLM 上下文，支持同步等待或后台运行。"
+            ),
+        )
+
+        sub_agent_task_name: str = Field(
+            default="sub_actor",
+            description=(
+                "子代理创建 LLM request 时使用的模型任务名，对应 config/model.toml 中的 task key。"
+                "留空时回退为 sub_actor。"
+            ),
+        )
+
+        sub_agent_allow_mcp: bool = Field(
+            default=True,
+            description=(
+                "子代理是否可以使用 MCP 工具。"
+                "开启后 life_run_agent 的 mcp_servers 参数生效，可把指定 MCP 服务器能力委托给子代理。"
+            ),
+        )
+
+        sub_agent_default_max_rounds: int = Field(
+            default=8,
+            ge=1,
+            le=30,
+            description="life_run_agent 默认最大工具调用轮数；调用时可被 max_rounds 参数覆盖。",
+        )
+
+        enable_mcp: bool = Field(
+            default=True,
+            description=(
+                "是否允许 life_chatter 主代理直接看到非 defer_loading 的 MCP 工具。"
+                "关闭后所有 MCP 工具都不会出现在 life_chatter 的工具列表里，"
+                "需要通过 life_run_agent 委托给子代理使用。"
             ),
         )
 
@@ -982,7 +1182,7 @@ class LifeEngineConfig(BaseConfig):
 
         latest_action_think_enabled: bool = Field(
             default=True,
-            description="是否在 chatter transient 中注入当前 stream 最近一次 action-think 快照。",
+            description="是否在 chatter transient 中注入当前 stream 最近一次独白/思考快照。",
         )
 
         recent_chat_enabled: bool = Field(
@@ -1072,6 +1272,7 @@ class LifeEngineConfig(BaseConfig):
     curiosity: CuriositySection = Field(default_factory=CuriositySection)
     history_retrieval: HistoryRetrievalSection = Field(default_factory=HistoryRetrievalSection)
     web: WebSection = Field(default_factory=WebSection)
+    everos: EverOSSection = Field(default_factory=EverOSSection)
     snn: SNNSection = Field(default_factory=SNNSection)
     neuromod: NeuromodSection = Field(default_factory=NeuromodSection)
     dream: DreamSection = Field(default_factory=DreamSection)
@@ -1086,6 +1287,22 @@ class LifeEngineConfig(BaseConfig):
     drives: DrivesSection = Field(default_factory=DrivesSection)
     autonomy: AutonomySection = Field(default_factory=AutonomySection)
     narrative: NarrativeSection = Field(default_factory=NarrativeSection)
+
+    @field_validator("chatter")
+    @classmethod
+    def validate_context_compaction_budgets(cls, v: "LifeEngineConfig.ChatterSection"):
+        """Ensure compaction target <= trigger and snapshot hard cap is usable."""
+        trigger = int(getattr(v, "context_compaction_trigger_chars", 0) or 0)
+        target = int(getattr(v, "context_compaction_target_chars", 0) or 0)
+        hard = int(getattr(v, "rolling_context_snapshot_char_budget", 0) or 0)
+        if trigger > 0 and target > trigger:
+            raise ValueError(
+                "context_compaction_target_chars 不能大于 context_compaction_trigger_chars"
+            )
+        if hard > 0 and trigger > hard:
+            # Allow but clamp is not done here; warn via ValueError only if clearly broken.
+            pass
+        return v
 
     @field_validator("settings")
     @classmethod

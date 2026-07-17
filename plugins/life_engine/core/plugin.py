@@ -64,6 +64,7 @@ class LifeEnginePlugin(BasePlugin):
     def __init__(self, config: LifeEngineConfig | None = None) -> None:
         super().__init__(config)
         self._service: LifeEngineService | None = None
+        self._agent_coordinator_shutdown = False
 
     @property
     def service(self) -> LifeEngineService:
@@ -109,6 +110,7 @@ class LifeEnginePlugin(BasePlugin):
                 LifeSendFileAction,
                 LifeSendTextAction,
             )
+            from .sub_agent_tool import LifeRunAgentTool
 
             components.extend([
                 LifeChatter,
@@ -123,11 +125,20 @@ class LifeEnginePlugin(BasePlugin):
                 LifeConsultNucleusTool,
             ])
 
+            # life_chatter 子代理委托工具：仅在 enable_sub_agent=true 时注册
+            if bool(getattr(self.config.chatter, "enable_sub_agent", False)):
+                components.append(LifeRunAgentTool)
+
         return components
 
     async def on_plugin_loaded(self) -> None:
         """插件加载后启动心跳。"""
-        register_builtin_agents()
+        self._agent_coordinator_shutdown = False
+        try:
+            register_builtin_agents()
+        except RuntimeError as exc:
+            if "already registered" not in str(exc):
+                raise
         setup_life_audit_logger()
         if isinstance(self.config, LifeEngineConfig) and not self.config.settings.enabled:
             logger.info("life_engine 已禁用，未启动")
@@ -143,7 +154,9 @@ class LifeEnginePlugin(BasePlugin):
         await self.service.start()
 
     async def on_plugin_unloaded(self) -> None:
-        """插件卸载前停止心跳。"""
+        """插件卸载前停止心跳和后台子代理。"""
+        self._agent_coordinator_shutdown = True
+        await self._shutdown_agent_coordinator()
         if self._service is not None:
             await self._service.stop()
         try:
@@ -157,3 +170,16 @@ class LifeEnginePlugin(BasePlugin):
             log_file_path=str(get_life_log_file()),
         )
         teardown_life_audit_logger()
+
+    async def _shutdown_agent_coordinator(self) -> None:
+        """取消本插件创建的后台子代理，避免卸载后继续执行。"""
+        coordinator = getattr(self, "_agent_coordinator", None)
+        if coordinator is None:
+            return
+
+        try:
+            await coordinator.shutdown()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"停止后台子代理失败: {exc}")
+        finally:
+            self._agent_coordinator = None
