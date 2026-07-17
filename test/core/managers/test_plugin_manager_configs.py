@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -213,3 +213,104 @@ async def test_register_components_supports_agent_type() -> None:
     agent_components = registry.get_by_type(ComponentType.AGENT)
     assert "agent_plugin:agent:planner" in agent_components
     assert agent_components["agent_plugin:agent:planner"] is _TestAgent
+
+
+def _prepare_loaded_plugin_for_unload(
+    manager: PluginManager,
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_name: str,
+) -> None:
+    manager._loaded_plugins[plugin_name] = MagicMock(
+        on_plugin_unloaded=AsyncMock()
+    )
+    manager._plugin_paths[plugin_name] = f"plugins/{plugin_name}"
+    monkeypatch.setattr(
+        "src.kernel.event.get_event_bus",
+        lambda: MagicMock(publish=AsyncMock()),
+    )
+    monkeypatch.setattr(
+        "src.core.components.state_manager.get_global_state_manager",
+        lambda: MagicMock(set_state_async=AsyncMock()),
+    )
+    monkeypatch.setattr(
+        "src.core.managers.event_manager.get_event_manager",
+        lambda: MagicMock(unregister_plugin_handlers=AsyncMock()),
+    )
+    monkeypatch.setattr("src.core.components.loader.unregister_plugin", MagicMock())
+    monkeypatch.setattr(manager, "_unregister_plugin_components", AsyncMock())
+    monkeypatch.setattr(manager, "_cleanup_sys_modules", MagicMock())
+
+
+@pytest.mark.asyncio
+async def test_reload_plugin_orders_unload_cache_removal_and_load(monkeypatch) -> None:
+    """重载顺序应为卸载、清除配置缓存、重新加载，且缓存只清一次。"""
+    operations: list[str] = []
+    remove_config = MagicMock(
+        side_effect=lambda plugin_name: operations.append("remove_config")
+    )
+    config_manager = MagicMock(remove_config=remove_config)
+    manager = PluginManager()
+    _prepare_loaded_plugin_for_unload(manager, monkeypatch, "reload_plugin")
+    original_unload = manager.unload_plugin
+
+    async def tracked_unload(plugin_name: str) -> bool:
+        operations.append("unload")
+        return await original_unload(plugin_name)
+
+    async def tracked_load(plugin_path: str) -> bool:
+        operations.append("load")
+        return True
+
+    monkeypatch.setattr(manager, "unload_plugin", AsyncMock(side_effect=tracked_unload))
+    monkeypatch.setattr(manager, "load_plugin", AsyncMock(side_effect=tracked_load))
+    monkeypatch.setattr(
+        "src.core.managers.config_manager.get_config_manager",
+        lambda: config_manager,
+    )
+
+    result = await manager.reload_plugin("reload_plugin")
+
+    assert result is True
+    assert operations == ["unload", "remove_config", "load"]
+    remove_config.assert_called_once_with("reload_plugin")
+    manager.unload_plugin.assert_awaited_once_with("reload_plugin")
+    manager.load_plugin.assert_awaited_once_with("plugins/reload_plugin")
+
+
+@pytest.mark.asyncio
+async def test_unload_plugin_removes_config_cache_on_success(monkeypatch) -> None:
+    """直接成功卸载插件时应清除该插件的配置缓存。"""
+    config_manager = MagicMock()
+    manager = PluginManager()
+    _prepare_loaded_plugin_for_unload(manager, monkeypatch, "cached_plugin")
+    monkeypatch.setattr(
+        "src.core.managers.config_manager.get_config_manager",
+        lambda: config_manager,
+    )
+
+    result = await manager.unload_plugin("cached_plugin")
+
+    assert result is True
+    config_manager.remove_config.assert_called_once_with("cached_plugin")
+
+
+@pytest.mark.asyncio
+async def test_unload_plugin_keeps_config_cache_on_failure(monkeypatch) -> None:
+    """卸载流程失败时不应清除插件配置缓存。"""
+    config_manager = MagicMock()
+    manager = PluginManager()
+    _prepare_loaded_plugin_for_unload(manager, monkeypatch, "failing_plugin")
+    monkeypatch.setattr(
+        manager,
+        "_unregister_plugin_components",
+        AsyncMock(side_effect=RuntimeError("unregister failed")),
+    )
+    monkeypatch.setattr(
+        "src.core.managers.config_manager.get_config_manager",
+        lambda: config_manager,
+    )
+
+    result = await manager.unload_plugin("failing_plugin")
+
+    assert result is False
+    config_manager.remove_config.assert_not_called()

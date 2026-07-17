@@ -173,6 +173,58 @@ class TestPayloadsToOpenAIMessages:
         assert len(tool_calls) == 1
         assert json.loads(tool_calls[0]["function"]["arguments"]) == {}
 
+    def test_tool_result_name_is_omitted_by_default(self):
+        """默认保持标准 OpenAI tool message 结构，不额外加入 name。"""
+        from src.kernel.llm.model_client.openai_client import _payloads_to_openai_messages
+
+        payloads = [
+            LLMPayload(
+                ROLE.ASSISTANT,
+                [ToolCall(id="call_1", name="calculator", args={})],
+            ),
+            LLMPayload(
+                ROLE.TOOL_RESULT,
+                [ToolResult(value="42", call_id="call_1", name="calculator")],
+            ),
+        ]
+
+        messages, tools = _payloads_to_openai_messages(payloads)
+
+        assert tools == []
+        assert messages[1] == {
+            "role": "tool",
+            "content": "42",
+            "tool_call_id": "call_1",
+        }
+
+    def test_tool_result_name_can_be_backfilled_for_gemini_compat(self):
+        """Gemini 兼容链路需要 tool message name 来生成 function_response.name。"""
+        from src.kernel.llm.model_client.openai_client import _payloads_to_openai_messages
+
+        payloads = [
+            LLMPayload(
+                ROLE.ASSISTANT,
+                [ToolCall(id="call_1", name="calculator", args={})],
+            ),
+            LLMPayload(
+                ROLE.TOOL_RESULT,
+                [ToolResult(value="42", call_id="call_1")],
+            ),
+        ]
+
+        messages, tools = _payloads_to_openai_messages(
+            payloads,
+            include_tool_result_name=True,
+        )
+
+        assert tools == []
+        assert messages[1] == {
+            "role": "tool",
+            "content": "42",
+            "tool_call_id": "call_1",
+            "name": "calculator",
+        }
+
     def test_parse_completion_message_repairs_non_json_tool_arguments(self):
         """测试响应解析会修复单引号形式的 tool arguments。"""
         from src.kernel.llm.model_client.openai_client import _parse_completion_message
@@ -191,6 +243,14 @@ class TestPayloadsToOpenAIMessages:
         assert message == ""
         assert tool_calls == [{"id": "call_1", "name": "calculator", "args": {"a": 1, "b": "x"}}]
         assert reasoning_content is None
+
+    def test_extract_reasoning_content_from_dict_message(self):
+        """测试 dict 形态 provider 响应中的 reasoning_content 会被提取。"""
+        from src.kernel.llm.model_client.openai_client import _extract_reasoning_content
+
+        message = {"reasoning_content": [{"text": "先判断。"}, {"content": "再调用工具。"}]}
+
+        assert _extract_reasoning_content(message) == "先判断。再调用工具。"
 
     def test_multimodal_content(self):
         """测试多模态内容（文本+图片）。"""
@@ -1279,6 +1339,59 @@ class TestOpenAIChatClient:
         tool_call_message = messages[1]
         assert tool_call_message["role"] == "assistant"
         assert "tool_calls" in tool_call_message
+        assert "reasoning_content" in tool_call_message
+        assert tool_call_message["reasoning_content"] == tool_call_message["content"]
+
+    @pytest.mark.asyncio
+    async def test_create_inject_reasoning_content_for_thinking_param(self):
+        """测试 Anthropic 风格 thinking 参数也会启用 reasoning_content 回填。"""
+        from src.kernel.llm.model_client.openai_client import OpenAIChatClient
+
+        mock_completion = MagicMock()
+        mock_completion.choices = [MagicMock()]
+        mock_completion.choices[0].message.content = "OK"
+        mock_completion.choices[0].message.tool_calls = None
+
+        mock_chat = AsyncMock()
+        mock_chat.completions.create = AsyncMock(return_value=mock_completion)
+
+        mock_openai_client = MagicMock()
+        mock_openai_client.chat.completions.create = mock_chat.completions.create
+
+        client = OpenAIChatClient()
+        client._clients = {}
+        client._get_client = MagicMock(return_value=mock_openai_client)
+
+        payloads = [
+            LLMPayload(ROLE.USER, Text("Hi")),
+            LLMPayload(
+                ROLE.ASSISTANT,
+                [
+                    Text("I'll call a tool"),
+                    ToolCall(id="call_1", name="calculator", args={"a": 1}),
+                ],
+            ),
+        ]
+        model_set = {
+            "api_key": "test-key",
+            "base_url": None,
+            "timeout": None,
+            "max_tokens": None,
+            "temperature": None,
+            "extra_params": {"thinking": {"type": "enabled", "budget_tokens": 1000}},
+        }
+
+        await client.create(
+            model_name="glm-5.2",
+            payloads=payloads,
+            tools=[],
+            request_name="test",
+            model_set=model_set,
+            stream=False,
+        )
+
+        messages = mock_chat.completions.create.call_args.kwargs["messages"]
+        tool_call_message = messages[1]
         assert "reasoning_content" in tool_call_message
         assert tool_call_message["reasoning_content"] == tool_call_message["content"]
 

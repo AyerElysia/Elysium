@@ -264,6 +264,10 @@ class PluginManager:
             if plugin_name in self._plugin_paths:
                 del self._plugin_paths[plugin_name]
 
+            from src.core.managers.config_manager import get_config_manager
+
+            get_config_manager().remove_config(plugin_name)
+
             logger.info(f"✅ 插件卸载成功: {plugin_name}")
             return True
 

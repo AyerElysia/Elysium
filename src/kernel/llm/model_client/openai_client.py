@@ -607,8 +607,21 @@ def _normalize_schema_for_grammar(schema: Any) -> None:
                 _normalize_schema_for_grammar(child)
 
 
+def _should_include_tool_result_name(model_name: str, model_set: Any) -> bool:
+    """Gemini 原生 function_response 要求 name；仅对 Gemini 兼容链路补充该字段。"""
+    markers = [model_name]
+    if isinstance(model_set, dict):
+        markers.extend(
+            str(model_set.get(key) or "")
+            for key in ("api_provider", "base_url", "model_identifier")
+        )
+    return any("gemini" in marker.lower() for marker in markers if marker)
+
+
 def _payloads_to_openai_messages(
     payloads: list[LLMPayload],
+    *,
+    include_tool_result_name: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """将内部 LLMPayload 列表转换为 OpenAI messages 与 tools 格式。
 
@@ -620,6 +633,7 @@ def _payloads_to_openai_messages(
     """
     messages: list[dict[str, Any]] = []
     tools: list[dict[str, Any]] = []
+    tool_call_names: dict[str, str] = {}
 
     for payload in payloads:
         if payload.role == ROLE.TOOL:
@@ -629,12 +643,12 @@ def _payloads_to_openai_messages(
             continue
 
         if payload.role == ROLE.TOOL_RESULT:
-            tool_payloads: list[tuple[str | None, str]] = []
+            tool_payloads: list[tuple[str | None, str | None, str]] = []
             fallback_text: str | None = None
 
             for part in payload.content:
                 if isinstance(part, ToolResult):
-                    tool_payloads.append((part.call_id, part.to_text()))
+                    tool_payloads.append((part.call_id, part.name, part.to_text()))
                     continue
 
                 if isinstance(part, Text) and fallback_text is None:
@@ -643,6 +657,8 @@ def _payloads_to_openai_messages(
 
                 call_id_value = getattr(part, "call_id", None)
                 call_id = call_id_value if isinstance(call_id_value, str) and call_id_value else None
+                name_value = getattr(part, "name", None)
+                name = name_value if isinstance(name_value, str) and name_value else None
 
                 to_text = getattr(part, "to_text", None)
                 if callable(to_text):
@@ -651,17 +667,22 @@ def _payloads_to_openai_messages(
                         text = text_value if isinstance(text_value, str) else str(text_value)
                     except Exception:
                         text = ""
-                    tool_payloads.append((call_id, text))
+                    tool_payloads.append((call_id, name, text))
 
             if tool_payloads:
-                for tool_call_id, content_text in tool_payloads:
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "content": content_text,
-                            **({"tool_call_id": tool_call_id} if tool_call_id else {}),
-                        }
-                    )
+                for tool_call_id, tool_name, content_text in tool_payloads:
+                    message = {
+                        "role": "tool",
+                        "content": content_text,
+                        **({"tool_call_id": tool_call_id} if tool_call_id else {}),
+                    }
+                    if include_tool_result_name:
+                        resolved_name = tool_name or (
+                            tool_call_names.get(tool_call_id) if tool_call_id else None
+                        )
+                        if resolved_name:
+                            message["name"] = resolved_name
+                    messages.append(message)
             else:
                 messages.append(
                     {
@@ -682,6 +703,8 @@ def _payloads_to_openai_messages(
                 if isinstance(part, ToolCall):
                     args_text = _coerce_tool_arguments_json(part.args)
                     call_id = part.id or f"call_{idx}"
+                    if call_id and part.name:
+                        tool_call_names[call_id] = part.name
                     tool_calls_list.append(
                         {
                             "id": call_id,
@@ -808,10 +831,29 @@ def _parse_completion_message(
 def _extract_reasoning_content(message: Any) -> str | None:
     """从 provider 响应对象中提取 reasoning_content。"""
     for attr_name in ("reasoning_content", "reasoning"):
-        normalized = _normalize_reasoning_value(getattr(message, attr_name, None))
+        if isinstance(message, dict):
+            raw_value = message.get(attr_name)
+        else:
+            raw_value = getattr(message, attr_name, None)
+        normalized = _normalize_reasoning_value(raw_value)
         if normalized:
             return normalized
     return None
+
+
+def _is_thinking_enabled(extra_params: dict[str, Any]) -> bool:
+    """判断当前 OpenAI-compatible 请求是否启用了 reasoning/thinking 模式。"""
+    enable_thinking = extra_params.get("enable_thinking")
+    if enable_thinking is not None:
+        return bool(enable_thinking)
+
+    thinking = extra_params.get("thinking")
+    if isinstance(thinking, dict):
+        thinking_type = thinking.get("type")
+        if isinstance(thinking_type, str):
+            return thinking_type.lower() not in {"disabled", "off", "none", "false"}
+        return bool(thinking)
+    return bool(thinking)
 
 
 def _normalize_reasoning_value(value: Any) -> str | None:
@@ -1211,7 +1253,10 @@ class OpenAIChatClient:
             trust_env=trust_env,
             force_ipv4=force_ipv4,
         )
-        messages, openai_tools = _payloads_to_openai_messages(payloads)
+        messages, openai_tools = _payloads_to_openai_messages(
+            payloads,
+            include_tool_result_name=_should_include_tool_result_name(model_name, model_set),
+        )
         has_native_video = _messages_contain_native_video(messages)
         has_native_image = _messages_contain_native_image(messages)
         preserve_native_multimodal_errors = _messages_contain_life_inspect_media_promotion(messages)
@@ -1236,10 +1281,9 @@ class OpenAIChatClient:
         # 允许每模型注入额外参数（如 top_p/response_format/tool_choice 等）
         params.update(extra_params)
 
-        # 判定是否开启了思考模式（兼容：SiliconFlow/DashScope 等参数名）
+        # 判定是否开启了思考模式（兼容：SiliconFlow/DashScope/Anthropic 风格参数名）
         # 思考模式通常与 tool_choice="required" 冲突。
-        enable_thinking = extra_params.get("enable_thinking")
-        thinking_enabled = bool(enable_thinking) if enable_thinking is not None else False
+        thinking_enabled = _is_thinking_enabled(extra_params)
 
         if openai_tools and not tool_call_compat:
             params["tools"] = openai_tools
@@ -1272,7 +1316,6 @@ class OpenAIChatClient:
         # 若上下文中已存在带 reasoning_content 的 assistant 响应，
         # 或者启用了 thinking 模式（API 要求所有 assistant 消息必须包含 reasoning_content），
         # 则为其余缺失字段的 assistant 历史统一回填，避免 follow-up 400。
-        thinking_enabled = bool(extra_params.get("enable_thinking"))
         if thinking_enabled or _should_backfill_reasoning_content(messages):
             for msg in messages:
                 if (
