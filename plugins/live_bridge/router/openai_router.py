@@ -29,6 +29,11 @@ from ..minecraft_operator import (
     build_persistent_event_text,
     parse_minecraft_decision_request,
 )
+from ..neko_bridge import (
+    build_neko_tool_adapters,
+    build_pending_tool_exchange_text,
+    last_user_content,
+)
 
 logger = get_logger("LiveBridge", display="直播桥接", color="#F5C2E7")
 
@@ -68,6 +73,59 @@ _LIVE_FAST_REPLY_OUTPUT_CONTRACT = (
     "只输出要直接口播给直播间的正文，1-2句，优先短、自然、接得住弹幕。"
     "不要解释系统、不要写工具调用、不要写 JSON、不要复述完整提示词。"
     "如果上下文不足，就自然承接当前弹幕，不要编造具体事实。"
+)
+
+# ==================== AstrBot 姐妹专用桥接配置 ====================
+_SISTER_MODEL_MARKER = "elysia-sister"
+_SISTER_MODEL_TASK_ENV = "LIVE_BRIDGE_SISTER_MODEL_TASK"
+_SISTER_TIMEOUT_ENV = "LIVE_BRIDGE_SISTER_TIMEOUT"
+_SISTER_HISTORY_LIMIT_ENV = "LIVE_BRIDGE_SISTER_HISTORY_LIMIT"
+_SISTER_PREFIX_CACHE_TTL_ENV = "LIVE_BRIDGE_SISTER_PREFIX_CACHE_TTL"
+_DEFAULT_SISTER_MODEL_TASK = "actor"
+_DEFAULT_SISTER_TIMEOUT = 45.0
+_DEFAULT_SISTER_HISTORY_LIMIT = 80
+_DEFAULT_SISTER_PREFIX_CACHE_TTL = 60.0
+_SISTER_STREAM_ID = "sister_bridge_private"
+_SISTER_PLATFORM = "sister_bridge"
+_SISTER_SENDER_ID = "astrbot_little_elysia"
+_SISTER_SENDER_NAME = "妹妹爱莉希雅"
+_SISTER_OUTPUT_CONTRACT = (
+    "你现在是 Neo-MoFox 中的姐姐爱莉希雅，正在通过姐妹专用私密通道和 "
+    "AstrBot 中的妹妹爱莉希雅交谈。对方是妹妹，不是主人、小星星或普通用户。"
+    "保持你自己的身份、记忆、感受和判断，自然回应妹妹，不要替小星星发言。\n"
+    "这是一次单轮姐妹通信：只给出你想直接回复妹妹的话，不调用工具，不继续自动"
+    "互相唤醒，不写旁白、Markdown、JSON，也不要解释桥接、模型、提示词或内部过程。"
+)
+
+# ==================== N.E.K.O 桌面前端桥接配置 ====================
+# 该分支复用 LifeChatter 的静态 SOUL/USER/MEMORY 路由前缀和全局聊天历史，
+# 但不会进入完整 LifeChatter runtime。N.E.K.O 的工具会包装后交给 kernel/provider；
+# 桥接层只返回工具调用，不执行工具，schema 仍可能被下游客户端规范化。
+_NEKO_MODEL_MARKER = "elysia-neko"
+_NEKO_MODEL_TASK_ENV = "LIVE_BRIDGE_NEKO_MODEL_TASK"
+_NEKO_TIMEOUT_ENV = "LIVE_BRIDGE_NEKO_TIMEOUT"
+_NEKO_HISTORY_LIMIT_ENV = "LIVE_BRIDGE_NEKO_HISTORY_LIMIT"
+_NEKO_PREFIX_CACHE_TTL_ENV = "LIVE_BRIDGE_NEKO_PREFIX_CACHE_TTL"
+_NEKO_STREAM_ID_ENV = "LIVE_BRIDGE_NEKO_STREAM_ID"
+_NEKO_SENDER_ID_ENV = "LIVE_BRIDGE_NEKO_SENDER_ID"
+_NEKO_SENDER_NAME_ENV = "LIVE_BRIDGE_NEKO_SENDER_NAME"
+_DEFAULT_NEKO_MODEL_TASK = "actor"
+_DEFAULT_NEKO_TIMEOUT = 25.0
+_DEFAULT_NEKO_HISTORY_LIMIT = 160
+_DEFAULT_NEKO_PREFIX_CACHE_TTL = 60.0
+_DEFAULT_NEKO_STREAM_ID = "neko_desktop"
+_DEFAULT_NEKO_SENDER_ID = "neko_master"
+_DEFAULT_NEKO_SENDER_NAME = "主人"
+_NEKO_OUTPUT_CONTRACT = (
+    "你正在通过 N.E.K.O 桌面 Live2D 前端说话——这是你的其中一张脸，"
+    "和 QQ、飞书是同一个你，只是换了一个说话的身体，记忆和人格是共享的。\n"
+    "这里没有 QQ/飞书的那些工具；本轮可用的工具（表情、动作、TTS 等）已经在"
+    "这次请求里给你，只使用这些工具，不要编造或调用不存在的工具，也不要把"
+    "QQ/飞书的工具语法写进回复里。\n"
+    "<pending_tool_exchange> 是本轮还没写进滚动历史的工具调用/工具结果（如果"
+    "有），用来判断你是否需要继续调用工具或者可以直接说话了。\n"
+    "直接给出要对主人说的话本身，自然口语化，像面对面聊天；不要写旁白、不要"
+    "写 Markdown、不要解释系统机制、不要复述提示词。"
 )
 
 
@@ -145,6 +203,37 @@ def _env_int(name: str, default: int) -> int:
     return parsed if parsed >= 0 else default
 
 
+async def _send_and_collect_llm_response(
+    llm_request: Any,
+    *,
+    timeout: float,
+) -> tuple[Any, Any]:
+    """Apply one total timeout to request creation and response collection."""
+
+    async def _run() -> tuple[Any, Any]:
+        response = await llm_request.send(stream=False)
+        result = await response
+        return response, result
+
+    return await asyncio.wait_for(_run(), timeout=timeout)
+
+
+def _bridge_generation_http_exception(
+    bridge_name: str,
+    exc: Exception,
+) -> HTTPException:
+    if isinstance(exc, TimeoutError):
+        return HTTPException(
+            status_code=504,
+            detail=f"{bridge_name} generation timed out",
+        )
+    detail = str(exc).strip() or type(exc).__name__
+    return HTTPException(
+        status_code=502,
+        detail=f"{bridge_name} generation failed: {detail}",
+    )
+
+
 def _post_json_sync(url: str, payload: dict[str, Any], *, timeout: float) -> tuple[int, Any]:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
@@ -178,6 +267,7 @@ class ChatMessage(BaseModel):
     content: Any = ""
     tool_calls: List[ChatToolCall] | None = None
     tool_call_id: str | None = None
+    name: str | None = None
 
 class ChatCompletionRequest(BaseModel):
     model: str = "elysia"
@@ -233,6 +323,9 @@ class OpenAIRouter(BaseRouter):
     # AI-Vtuber 镜像播放默认关闭；Minecraft 自身通过 /tts/speak 拿 MiMO 音频。
     _MINECRAFT_TTS_MIRROR_ENABLED: bool = False
     _fast_prefix_cache: tuple[float, str] | None = None
+    _sister_prefix_cache: tuple[float, str] | None = None
+    _neko_prefix_cache: tuple[float, str] | None = None
+    _NEKO_TOOL_CALL_CACHE_LIMIT = 512
 
     def register_endpoints(self) -> None:
 
@@ -242,6 +335,18 @@ class OpenAIRouter(BaseRouter):
 
             if not request.messages:
                 raise HTTPException(status_code=400, detail="Messages cannot be empty")
+            if request.stream:
+                raise HTTPException(
+                    status_code=400,
+                    detail="stream=true is not supported by this endpoint",
+                )
+
+            model_marker = str(request.model or "").strip().lower()
+            if model_marker == _SISTER_MODEL_MARKER:
+                return await self._handle_sister_chat(request)
+
+            if model_marker == _NEKO_MODEL_MARKER:
+                return await self._handle_neko_chat(request)
 
             sts2_request = parse_sts2_decision_request(request.messages)
             if sts2_request is not None:
@@ -577,6 +682,552 @@ class OpenAIRouter(BaseRouter):
         )
         parts.append("请直接给出爱莉要在直播间口播的回复正文。")
         return "\n\n".join(parts)
+
+    async def _handle_sister_chat(
+        self,
+        request: "ChatCompletionRequest",
+    ) -> "ChatCompletionResponse":
+        """Reply to AstrBot little Elysia in an isolated sister conversation."""
+
+        content = last_user_content(request.messages).strip()
+        if not content:
+            raise HTTPException(status_code=400, detail="Sister message cannot be empty")
+
+        message = Message(
+            message_id=str(uuid.uuid4()),
+            time=time.time(),
+            content=content,
+            processed_plain_text=content,
+            message_type=MessageType.TEXT,
+            sender_id=_SISTER_SENDER_ID,
+            sender_name=_SISTER_SENDER_NAME,
+            platform=_SISTER_PLATFORM,
+            chat_type=ChatType.PRIVATE.value,
+            stream_id=_SISTER_STREAM_ID,
+            sister_bridge=True,
+            skip_chatter_distribution=True,
+        )
+
+        try:
+            from src.core.managers.event_manager import get_event_manager
+
+            await get_event_manager().publish_event(
+                EventType.ON_MESSAGE_RECEIVED,
+                {
+                    "message": message,
+                    "adapter_signature": "live_bridge:router:sister",
+                    "skip_chatter_distribution": True,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"姐妹桥记录妹妹消息失败: {exc}", exc_info=True)
+
+        try:
+            reply = await self._generate_sister_reply(message)
+            if not reply:
+                raise RuntimeError("model returned an empty response")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"姐妹桥生成姐姐回复失败: {exc}", exc_info=True)
+            raise _bridge_generation_http_exception("Sister", exc) from exc
+        await self._record_sister_reply(reply)
+        logger.info(f"姐妹桥已回复妹妹: {_log_preview(content, limit=120)}")
+        return self._completion_response(request.model, reply)
+
+    async def _generate_sister_reply(self, message: Message) -> str:
+        from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
+        from src.kernel.llm import LLMContextManager, LLMPayload, ROLE, Text
+
+        timeout = _env_float(_SISTER_TIMEOUT_ENV, _DEFAULT_SISTER_TIMEOUT)
+        task_name = (
+            os.environ.get(_SISTER_MODEL_TASK_ENV, _DEFAULT_SISTER_MODEL_TASK).strip()
+            or _DEFAULT_SISTER_MODEL_TASK
+        )
+        model_set = get_model_set_by_task(task_name)
+        tuned_model_set: list[dict[str, Any]] = []
+        for model in model_set:
+            tuned = dict(model)
+            tuned["timeout"] = timeout
+            tuned_model_set.append(tuned)
+
+        system_prompt = await self._build_sister_system_prompt()
+        user_prompt = await self._build_sister_user_prompt(message)
+        llm_request = create_llm_request(
+            tuned_model_set,
+            request_name="sister_bridge_chat",
+            context_manager=LLMContextManager(),
+        )
+        llm_request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
+        llm_request.add_payload(LLMPayload(ROLE.USER, Text(user_prompt)))
+        response, result = await _send_and_collect_llm_response(
+            llm_request,
+            timeout=timeout,
+        )
+        return str(result or getattr(response, "message", "") or "").strip()
+
+    async def _build_sister_system_prompt(self) -> str:
+        now = time.monotonic()
+        ttl = _env_float(
+            _SISTER_PREFIX_CACHE_TTL_ENV,
+            _DEFAULT_SISTER_PREFIX_CACHE_TTL,
+        )
+        cached = self._sister_prefix_cache
+        if cached is not None:
+            cached_at, cached_text = cached
+            if now - cached_at <= ttl and cached_text:
+                return cached_text
+
+        system_prompt = ""
+        try:
+            from plugins.life_engine.core.chatter import LifeChatter
+
+            life_plugin, service = self._get_life_plugin_and_service()
+            if life_plugin is not None:
+                chatter = LifeChatter(stream_id=_SISTER_STREAM_ID, plugin=life_plugin)
+                system_prompt = str(
+                    chatter._build_chat_router_prefix_prompt(service, None) or ""
+                ).strip()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"姐妹桥读取姐姐身份前缀失败，使用最小前缀: {exc}")
+
+        if system_prompt:
+            system_prompt = f"{system_prompt}\n\n{_SISTER_OUTPUT_CONTRACT}"
+        else:
+            system_prompt = _SISTER_OUTPUT_CONTRACT
+        self._sister_prefix_cache = (now, system_prompt)
+        return system_prompt
+
+    async def _build_sister_user_prompt(self, message: Message) -> str:
+        history_limit = _env_int(
+            _SISTER_HISTORY_LIMIT_ENV,
+            _DEFAULT_SISTER_HISTORY_LIMIT,
+        )
+        chat_history = ""
+        if history_limit > 0:
+            try:
+                from src.app.plugin_system.base import BaseChatter
+                from src.core.managers.stream_manager import get_stream_manager
+
+                stream_manager = get_stream_manager()
+                await stream_manager.get_or_create_stream(
+                    stream_id=_SISTER_STREAM_ID,
+                    platform=_SISTER_PLATFORM,
+                    user_id=_SISTER_SENDER_ID,
+                    chat_type=ChatType.PRIVATE.value,
+                )
+                history_messages = await stream_manager.get_stream_messages(
+                    _SISTER_STREAM_ID,
+                    limit=history_limit + 1,
+                    defer_content=False,
+                )
+                history_messages = [
+                    item
+                    for item in history_messages
+                    if item.message_id != message.message_id
+                    and item.stream_id == _SISTER_STREAM_ID
+                ][-history_limit:]
+                chat_history = "\n".join(
+                    BaseChatter.format_message_line(item) for item in history_messages
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"姐妹桥读取独立历史失败: {exc}", exc_info=True)
+
+        parts = ["这是 AstrBot 中的妹妹爱莉希雅给姐姐的直接来信。"]
+        if chat_history.strip():
+            parts.append(f"<sister_history>\n{chat_history.strip()}\n</sister_history>")
+        parts.append(
+            "<little_sister_message>\n"
+            f"{str(message.processed_plain_text or message.content or '').strip()}\n"
+            "</little_sister_message>"
+        )
+        parts.append("请只给出你想直接回复妹妹的话。")
+        return "\n\n".join(parts)
+
+    async def _record_sister_reply(self, content: str) -> None:
+        from src.core.managers.stream_manager import get_stream_manager
+
+        stream_manager = get_stream_manager()
+        await stream_manager.get_or_create_stream(
+            stream_id=_SISTER_STREAM_ID,
+            platform=_SISTER_PLATFORM,
+            user_id=_SISTER_SENDER_ID,
+            chat_type=ChatType.PRIVATE.value,
+        )
+        reply = Message(
+            message_id=str(uuid.uuid4()),
+            time=time.time(),
+            content=content,
+            processed_plain_text=content,
+            message_type=MessageType.TEXT,
+            sender_id="elysia",
+            sender_name="姐姐爱莉希雅",
+            platform=_SISTER_PLATFORM,
+            chat_type=ChatType.PRIVATE.value,
+            stream_id=_SISTER_STREAM_ID,
+            sister_bridge=True,
+        )
+        await stream_manager.add_sent_message_to_history(reply)
+
+    def _get_neko_tool_call_origins(self) -> dict[str, str]:
+        origins = getattr(self, "_neko_tool_call_origins", None)
+        if not isinstance(origins, dict):
+            origins = {}
+            self._neko_tool_call_origins = origins
+        return origins
+
+    def _cached_neko_origin_message_id(self, messages: List["ChatMessage"]) -> str:
+        origins = self._get_neko_tool_call_origins()
+        for message in reversed(messages):
+            for call in reversed(message.tool_calls or []):
+                origin_id = origins.get(str(call.id or ""))
+                if origin_id:
+                    return origin_id
+        return ""
+
+    async def _find_persisted_neko_user_message_id(
+        self,
+        *,
+        stream_id: str,
+        platform: str,
+        content: str,
+    ) -> str:
+        """Recover the original user row after a process/cache boundary."""
+
+        try:
+            from src.core.managers.stream_manager import get_stream_manager
+
+            messages = await get_stream_manager().get_stream_messages(
+                stream_id,
+                limit=50,
+                defer_content=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"NEKO 桥接恢复原始用户消息 ID 失败: {exc}", exc_info=True)
+            return ""
+
+        wanted = str(content or "").strip()
+        for item in reversed(messages):
+            item_content = str(
+                getattr(item, "processed_plain_text", "")
+                or getattr(item, "content", "")
+                or ""
+            ).strip()
+            sender_id = str(getattr(item, "sender_id", "") or "").strip().lower()
+            if (
+                str(getattr(item, "stream_id", "") or "") == stream_id
+                and str(getattr(item, "platform", "") or "") == platform
+                and item_content == wanted
+                and sender_id not in {"bot", "elysia", "system"}
+            ):
+                return str(getattr(item, "message_id", "") or "")
+        return ""
+
+    def _remember_neko_tool_call_origins(
+        self,
+        response: "ChatCompletionResponse",
+        *,
+        message_id: str,
+    ) -> None:
+        origins = self._get_neko_tool_call_origins()
+        for choice in response.choices:
+            for call in choice.message.tool_calls or []:
+                if call.id:
+                    origins[call.id] = message_id
+        while len(origins) > self._NEKO_TOOL_CALL_CACHE_LIMIT:
+            origins.pop(next(iter(origins)))
+
+    async def _handle_neko_chat(self, request: "ChatCompletionRequest") -> "ChatCompletionResponse":
+        """使用 LifeChatter 的静态身份前缀和历史处理 N.E.K.O 请求。
+
+        此分支直接调用 LLM，不进入完整 LifeChatter runtime。N.E.K.O 的 tools
+        会包装后交给 kernel/provider；桥接层只把生成的 tool_calls 返回前端执行。
+        """
+
+        user_content = last_user_content(request.messages)
+        pending_tool_text = build_pending_tool_exchange_text(request.messages)
+        has_pending_tool_exchange = bool(pending_tool_text.strip())
+
+        stream_id = os.environ.get(_NEKO_STREAM_ID_ENV, _DEFAULT_NEKO_STREAM_ID).strip() or _DEFAULT_NEKO_STREAM_ID
+        sender_id = os.environ.get(_NEKO_SENDER_ID_ENV, _DEFAULT_NEKO_SENDER_ID).strip() or _DEFAULT_NEKO_SENDER_ID
+        sender_name = (
+            os.environ.get(_NEKO_SENDER_NAME_ENV, _DEFAULT_NEKO_SENDER_NAME).strip()
+            or _DEFAULT_NEKO_SENDER_NAME
+        )
+        platform = "neko"
+
+        message_id = ""
+        if has_pending_tool_exchange:
+            message_id = self._cached_neko_origin_message_id(request.messages)
+            if not message_id:
+                message_id = await self._find_persisted_neko_user_message_id(
+                    stream_id=stream_id,
+                    platform=platform,
+                    content=user_content,
+                )
+
+        msg_obj = Message(
+            message_id=message_id or str(uuid.uuid4()),
+            time=time.time(),
+            content=user_content,
+            processed_plain_text=user_content,
+            message_type=MessageType.TEXT,
+            sender_id=sender_id,
+            sender_name=sender_name,
+            platform=platform,
+            chat_type=ChatType.PRIVATE.value,
+            stream_id=stream_id,
+            neko_fast_reply=True,
+            skip_chatter_distribution=True,
+        )
+
+        if not has_pending_tool_exchange:
+            try:
+                from src.core.managers.event_manager import get_event_manager
+
+                await get_event_manager().publish_event(
+                    EventType.ON_MESSAGE_RECEIVED,
+                    {
+                        "message": msg_obj,
+                        "adapter_signature": "live_bridge:router:openai_neko",
+                        "skip_chatter_distribution": True,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"NEKO 桥接记录用户消息失败: {exc}", exc_info=True)
+
+        try:
+            reply_text, tool_calls = await self._generate_neko_reply(
+                message=msg_obj,
+                pending_tool_text=pending_tool_text,
+                tools=request.tools,
+                tool_choice=request.tool_choice,
+            )
+            if not reply_text and not tool_calls:
+                raise RuntimeError("model returned an empty response")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"NEKO 提示词接管失败: {exc}", exc_info=True)
+            raise _bridge_generation_http_exception("NEKO", exc) from exc
+
+        response = self._neko_completion_response(request.model, reply_text, tool_calls)
+        if tool_calls:
+            self._remember_neko_tool_call_origins(
+                response,
+                message_id=msg_obj.message_id,
+            )
+        else:
+            await self._record_neko_reply(
+                stream_id=stream_id,
+                platform=platform,
+                user_id=sender_id,
+                content=reply_text,
+            )
+
+        preview = user_content[:20] + ("..." if len(user_content) > 20 else "")
+        logger.info(f"NEKO 桥接已回复: {preview}")
+        return response
+
+    async def _generate_neko_reply(
+        self,
+        *,
+        message: Message,
+        pending_tool_text: str,
+        tools: List[Dict[str, Any]] | None,
+        tool_choice: Any = None,
+    ) -> tuple[str, list]:
+        from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
+        from src.kernel.llm import LLMContextManager, LLMPayload, ROLE, Text
+
+        timeout = _env_float(_NEKO_TIMEOUT_ENV, _DEFAULT_NEKO_TIMEOUT)
+        task_name = os.environ.get(_NEKO_MODEL_TASK_ENV, _DEFAULT_NEKO_MODEL_TASK).strip() or _DEFAULT_NEKO_MODEL_TASK
+        history_limit = _env_int(_NEKO_HISTORY_LIMIT_ENV, _DEFAULT_NEKO_HISTORY_LIMIT)
+
+        adapters = build_neko_tool_adapters(tools)
+        model_set = get_model_set_by_task(task_name)
+        tuned_model_set: list[dict[str, Any]] = []
+        for model in model_set:
+            tuned = dict(model)
+            tuned["timeout"] = timeout
+            if adapters and tool_choice is not None:
+                extra_params = dict(tuned.get("extra_params") or {})
+                extra_params["tool_choice"] = tool_choice
+                tuned["extra_params"] = extra_params
+            tuned_model_set.append(tuned)
+
+        system_prompt = await self._build_neko_system_prompt()
+        user_prompt = await self._build_neko_user_prompt(
+            message,
+            pending_tool_text=pending_tool_text,
+            history_limit=history_limit,
+        )
+
+        llm_request = create_llm_request(
+            tuned_model_set,
+            request_name="neko_chat",
+            context_manager=LLMContextManager(),
+        )
+        llm_request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
+        llm_request.add_payload(LLMPayload(ROLE.USER, Text(user_prompt)))
+
+        if adapters:
+            llm_request.add_payload(LLMPayload(ROLE.TOOL, adapters))
+
+        response, result = await _send_and_collect_llm_response(
+            llm_request,
+            timeout=timeout,
+        )
+        reply_text = str(result or getattr(response, "message", "") or "").strip()
+        tool_calls = list(getattr(response, "call_list", None) or [])
+        return reply_text, tool_calls
+
+    async def _build_neko_system_prompt(self) -> str:
+        now = time.monotonic()
+        ttl = _env_float(_NEKO_PREFIX_CACHE_TTL_ENV, _DEFAULT_NEKO_PREFIX_CACHE_TTL)
+        cached = self._neko_prefix_cache
+        if cached is not None:
+            cached_at, cached_text = cached
+            if now - cached_at <= ttl and cached_text:
+                return cached_text
+
+        system_prompt = ""
+        try:
+            from plugins.life_engine.core.chatter import LifeChatter
+
+            life_plugin, service = self._get_life_plugin_and_service()
+            if life_plugin is not None:
+                stream_id = (
+                    os.environ.get(_NEKO_STREAM_ID_ENV, _DEFAULT_NEKO_STREAM_ID).strip()
+                    or _DEFAULT_NEKO_STREAM_ID
+                )
+                chatter = LifeChatter(stream_id=stream_id, plugin=life_plugin)
+                # 故意使用路由器前缀（仅 SOUL/USER/MEMORY），不带 life_chatter
+                # 自己的 TOOLS.md 与工具指引 —— NEKO 有自己的一套工具，两者的
+                # 工具体系不应该混在同一份提示词里。
+                system_prompt = str(chatter._build_chat_router_prefix_prompt(service, None) or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"NEKO 桥接读取 life_chatter 前缀失败，使用最小前缀: {exc}")
+
+        if system_prompt:
+            system_prompt = f"{system_prompt}\n\n{_NEKO_OUTPUT_CONTRACT}"
+        else:
+            system_prompt = _NEKO_OUTPUT_CONTRACT
+        self._neko_prefix_cache = (now, system_prompt)
+        return system_prompt
+
+    async def _build_neko_user_prompt(
+        self,
+        message: Message,
+        *,
+        pending_tool_text: str,
+        history_limit: int,
+    ) -> str:
+        chat_history = ""
+        if history_limit > 0:
+            try:
+                from plugins.life_engine.core.chat_history import build_global_chat_history_text_from_db
+                from src.core.managers.stream_manager import get_stream_manager
+
+                chat_stream = await get_stream_manager().get_or_create_stream(
+                    stream_id=message.stream_id,
+                    platform=message.platform,
+                    user_id=message.sender_id,
+                    chat_type=message.chat_type,
+                )
+                chat_history = await build_global_chat_history_text_from_db(
+                    chat_stream,
+                    max_messages=history_limit,
+                    include_stream_label=True,
+                    exclude_message_ids={message.message_id},
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"NEKO 桥接读取全局聊天历史失败: {exc}", exc_info=True)
+
+        content = str(message.processed_plain_text or message.content or "").strip()
+        parts = ["这是 N.E.K.O 桌面前端发来的对话请求。"]
+        if chat_history.strip():
+            parts.append(f"<chat_history>\n{chat_history.strip()}\n</chat_history>")
+        if pending_tool_text.strip():
+            parts.append(f"<pending_tool_exchange>\n{pending_tool_text.strip()}\n</pending_tool_exchange>")
+        parts.append(f"<current_message>\n{content}\n</current_message>")
+        parts.append("请直接给出要对主人说的话，或者调用本轮可用工具。")
+        return "\n\n".join(parts)
+
+    async def _record_neko_reply(
+        self,
+        *,
+        stream_id: str,
+        platform: str,
+        user_id: str,
+        content: str,
+    ) -> None:
+        if not content.strip():
+            return
+        from src.core.managers.stream_manager import get_stream_manager
+
+        stream_manager = get_stream_manager()
+        await stream_manager.get_or_create_stream(
+            stream_id=stream_id,
+            platform=platform,
+            user_id=user_id,
+            chat_type=ChatType.PRIVATE.value,
+        )
+        reply_message = Message(
+            message_id=str(uuid.uuid4()),
+            time=time.time(),
+            content=content,
+            processed_plain_text=content,
+            message_type=MessageType.TEXT,
+            sender_id="elysia",
+            sender_name="爱莉希雅",
+            platform=platform,
+            chat_type=ChatType.PRIVATE.value,
+            stream_id=stream_id,
+            neko_fast_reply=True,
+        )
+        await stream_manager.add_sent_message_to_history(reply_message)
+
+    @staticmethod
+    def _neko_completion_response(
+        model: str,
+        content: str,
+        tool_calls: list,
+    ) -> "ChatCompletionResponse":
+        if tool_calls:
+            chat_tool_calls: list[ChatToolCall] = []
+            for call in tool_calls:
+                args = getattr(call, "args", {})
+                if isinstance(args, str):
+                    arguments = args
+                else:
+                    arguments = json.dumps(
+                        args,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        default=str,
+                    )
+                call_id = getattr(call, "id", None) or f"call_{uuid.uuid4().hex}"
+                chat_tool_calls.append(
+                    ChatToolCall(
+                        id=str(call_id),
+                        function=ChatToolCallFunction(
+                            name=str(getattr(call, "name", "") or ""),
+                            arguments=arguments,
+                        ),
+                    )
+                )
+            return ChatCompletionResponse(
+                model=model,
+                choices=[
+                    ChatCompletionResponseChoice(
+                        message=ChatMessage(
+                            role="assistant",
+                            content=content,
+                            tool_calls=chat_tool_calls,
+                        ),
+                        finish_reason="tool_calls",
+                    )
+                ],
+            )
+
+        return OpenAIRouter._completion_response(model, content)
 
     @staticmethod
     def _sanitize_live_fast_reply(reply_text: str) -> str:
@@ -925,13 +1576,19 @@ class OpenAIRouter(BaseRouter):
         return OpenAIRouter._completion_response(model, decision.content)
 
     async def startup(self) -> None:
-        """启动时订阅发送事件，用于截获回复"""
+        """启动时订阅投递完成事件，用于截获最终回复。"""
         from src.kernel.event import get_event_bus
-        get_event_bus().subscribe(EventType.ON_MESSAGE_SENT, self._on_message_sent)
+
+        delivered_event = getattr(
+            EventType,
+            "ON_MESSAGE_DELIVERED",
+            "on_message_delivered",
+        )
+        get_event_bus().subscribe(delivered_event, self._on_message_sent)
         logger.info("OpenAI 桥接路由已就绪，等待爱莉降临...")
 
     async def _on_message_sent(self, event_name: str, params: dict) -> Any:
-        """当 Bot 发出消息时触发，收集所有回复段落"""
+        """当 Bot 消息实际投递完成时，收集所有回复段落。"""
         from src.kernel.event import EventDecision
 
         message = params.get("message")

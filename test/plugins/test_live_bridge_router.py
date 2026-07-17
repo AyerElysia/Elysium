@@ -1,20 +1,27 @@
 """live_bridge 输入规范化测试。"""
 
+import asyncio
 import base64
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi import HTTPException
 
 from plugins.live_bridge.router.openai_router import (
+    ChatCompletionRequest,
     ChatMessage,
     MinecraftTTSRequest,
     MinecraftDecisionResult,
     OpenAIRouter,
+    _NEKO_MODEL_MARKER,
     _get_last_user_content,
     _normalize_live_comment,
+    _send_and_collect_llm_response,
 )
 from plugins.live_bridge.minecraft_operator import parse_minecraft_decision_request
+from src.core.components.types import EventType
+from src.kernel.llm import ToolCall
 
 
 def test_live_bridge_prefers_last_user_message() -> None:
@@ -289,3 +296,598 @@ async def test_live_chat_fast_failure_does_not_fallback_to_full_chatter_by_defau
 
 def test_live_fast_reply_sanitizer_strips_wrappers() -> None:
     assert OpenAIRouter._sanitize_live_fast_reply("```text\n爱莉：看到啦。\n```") == "看到啦。"
+
+
+def test_neko_completion_response_serializes_multiple_tool_calls() -> None:
+    calls = [
+        ToolCall(id="call_1", name="play_emote", args={"emote": "happy"}),
+        ToolCall(id=None, name="play_ear_animation", args="{}"),
+    ]
+
+    response = OpenAIRouter._neko_completion_response(
+        "elysia-neko",
+        "先帮主人换个表情。",
+        calls,
+    )
+
+    choice = response.choices[0]
+    assert choice.finish_reason == "tool_calls"
+    assert choice.message.content == "先帮主人换个表情。"
+    assert choice.message.tool_calls is not None
+    assert len(choice.message.tool_calls) == 2
+    assert choice.message.tool_calls[0].id == "call_1"
+    assert choice.message.tool_calls[0].function.name == "play_emote"
+    assert choice.message.tool_calls[0].function.arguments == '{"emote":"happy"}'
+    assert choice.message.tool_calls[1].function.name == "play_ear_animation"
+    assert choice.message.tool_calls[1].function.arguments == "{}"
+    # 没有传 id 时自动生成一个非空的 call id，保持 OpenAI 协议兼容
+    assert choice.message.tool_calls[1].id
+
+
+def test_neko_completion_response_keeps_plain_text_reply_shape() -> None:
+    response = OpenAIRouter._neko_completion_response("elysia-neko", "在的，主人~", [])
+
+    assert response.choices[0].message == ChatMessage(role="assistant", content="在的，主人~")
+    assert response.choices[0].finish_reason == "stop"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_stage", ["send", "response"])
+async def test_bridge_total_timeout_covers_send_and_response(blocked_stage: str) -> None:
+    class _BlockingResponse:
+        def __await__(self):
+            async def _collect():
+                await asyncio.Event().wait()
+
+            return _collect().__await__()
+
+    class _BlockingRequest:
+        async def send(self, *, stream: bool):
+            assert stream is False
+            if blocked_stage == "send":
+                await asyncio.Event().wait()
+            return _BlockingResponse()
+
+    with pytest.raises(TimeoutError):
+        await _send_and_collect_llm_response(
+            _BlockingRequest(),
+            timeout=0.01,
+        )
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_rejects_unsupported_streaming() -> None:
+    router = OpenAIRouter.__new__(OpenAIRouter)
+    handlers: dict[str, object] = {}
+
+    class _FakeApp:
+        def post(self, path, **_kwargs):
+            def _decorator(func):
+                handlers[path] = func
+                return func
+
+            return _decorator
+
+    router.app = _FakeApp()
+    router.register_endpoints()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await handlers["/chat/completions"](
+            ChatCompletionRequest(
+                model="elysia-neko",
+                messages=[ChatMessage(role="user", content="你好")],
+                stream=True,
+            )
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "stream=true" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_router_subscribes_reply_queue_to_delivered_event(monkeypatch) -> None:
+    router = OpenAIRouter.__new__(OpenAIRouter)
+    event_bus = SimpleNamespace(subscribe=Mock())
+    monkeypatch.setattr("src.kernel.event.get_event_bus", lambda: event_bus)
+
+    await router.startup()
+
+    event_bus.subscribe.assert_called_once()
+    event_name, callback = event_bus.subscribe.call_args.args
+    assert event_name == getattr(
+        EventType,
+        "ON_MESSAGE_DELIVERED",
+        "on_message_delivered",
+    )
+    assert event_name != EventType.ON_MESSAGE_SENT
+    assert callback == router._on_message_sent
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_routes_neko_marker_model_to_neko_handler(monkeypatch) -> None:
+    router = OpenAIRouter.__new__(OpenAIRouter)
+
+    async def fake_neko_handler(request: ChatCompletionRequest):
+        return SimpleNamespace(model=request.model, routed="neko")
+
+    monkeypatch.setattr(router, "_handle_neko_chat", fake_neko_handler)
+
+    handlers: dict[str, object] = {}
+
+    class _FakeApp:
+        def post(self, path, **_kwargs):
+            def _decorator(func):
+                handlers[path] = func
+                return func
+
+            return _decorator
+
+    router.app = _FakeApp()
+    router.register_endpoints()
+
+    chat_completions = handlers["/chat/completions"]
+    request = ChatCompletionRequest(
+        model=_NEKO_MODEL_MARKER,
+        messages=[ChatMessage(role="user", content="你好")],
+    )
+
+    result = await chat_completions(request)
+
+    assert getattr(result, "routed", None) == "neko"
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_routes_sister_marker_to_isolated_handler(monkeypatch) -> None:
+    router = OpenAIRouter.__new__(OpenAIRouter)
+
+    async def fake_sister_handler(request: ChatCompletionRequest):
+        return SimpleNamespace(model=request.model, routed="sister")
+
+    async def fail_neko(_request: ChatCompletionRequest):
+        raise AssertionError("sister traffic must not enter the N.E.K.O handler")
+
+    monkeypatch.setattr(router, "_handle_sister_chat", fake_sister_handler)
+    monkeypatch.setattr(router, "_handle_neko_chat", fail_neko)
+
+    handlers: dict[str, object] = {}
+
+    class _FakeApp:
+        def post(self, path, **_kwargs):
+            def _decorator(func):
+                handlers[path] = func
+                return func
+
+            return _decorator
+
+    router.app = _FakeApp()
+    router.register_endpoints()
+    request = ChatCompletionRequest(
+        model="elysia-sister",
+        messages=[ChatMessage(role="user", content="姐姐好")],
+    )
+
+    result = await handlers["/chat/completions"](request)
+
+    assert getattr(result, "routed", None) == "sister"
+
+
+@pytest.mark.asyncio
+async def test_record_neko_reply_persists_directly_to_stream_history(monkeypatch) -> None:
+    router = OpenAIRouter.__new__(OpenAIRouter)
+    stream_manager = SimpleNamespace(
+        get_or_create_stream=AsyncMock(return_value=SimpleNamespace()),
+        add_sent_message_to_history=AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "src.core.managers.stream_manager.get_stream_manager",
+        lambda: stream_manager,
+    )
+
+    await router._record_neko_reply(
+        stream_id="neko_test",
+        platform="neko",
+        user_id="owner_1",
+        content="收到啦。",
+    )
+
+    stream_manager.get_or_create_stream.assert_awaited_once_with(
+        stream_id="neko_test",
+        platform="neko",
+        user_id="owner_1",
+        chat_type="private",
+    )
+    stream_manager.add_sent_message_to_history.assert_awaited_once()
+    reply = stream_manager.add_sent_message_to_history.await_args.args[0]
+    assert reply.stream_id == "neko_test"
+    assert reply.platform == "neko"
+    assert reply.sender_id == "elysia"
+    assert reply.content == "收到啦。"
+    assert reply.extra["neko_fast_reply"] is True
+
+
+@pytest.mark.asyncio
+async def test_record_sister_reply_persists_directly_to_stream_history(monkeypatch) -> None:
+    router = OpenAIRouter.__new__(OpenAIRouter)
+    stream_manager = SimpleNamespace(
+        get_or_create_stream=AsyncMock(return_value=SimpleNamespace()),
+        add_sent_message_to_history=AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "src.core.managers.stream_manager.get_stream_manager",
+        lambda: stream_manager,
+    )
+
+    await router._record_sister_reply("妹妹，晚上好。")
+
+    stream_manager.get_or_create_stream.assert_awaited_once_with(
+        stream_id="sister_bridge_private",
+        platform="sister_bridge",
+        user_id="astrbot_little_elysia",
+        chat_type="private",
+    )
+    stream_manager.add_sent_message_to_history.assert_awaited_once()
+    reply = stream_manager.add_sent_message_to_history.await_args.args[0]
+    assert reply.stream_id == "sister_bridge_private"
+    assert reply.platform == "sister_bridge"
+    assert reply.sender_id == "elysia"
+    assert reply.content == "妹妹，晚上好。"
+    assert reply.extra["sister_bridge"] is True
+
+
+@pytest.mark.asyncio
+async def test_neko_new_user_request_publishes_received_event(monkeypatch) -> None:
+    router = OpenAIRouter.__new__(OpenAIRouter)
+    event_manager = SimpleNamespace(publish_event=AsyncMock(return_value=None))
+    generate_reply = AsyncMock(return_value=("收到。", []))
+    record_reply = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        "src.core.managers.event_manager.get_event_manager",
+        lambda: event_manager,
+    )
+    monkeypatch.setattr(router, "_generate_neko_reply", generate_reply)
+    monkeypatch.setattr(router, "_record_neko_reply", record_reply)
+
+    response = await router._handle_neko_chat(
+        ChatCompletionRequest(
+            model="elysia-neko",
+            messages=[ChatMessage(role="user", content="你好")],
+        )
+    )
+
+    event_manager.publish_event.assert_awaited_once()
+    event_payload = event_manager.publish_event.await_args.args[1]
+    assert event_payload["message"].content == "你好"
+    assert event_payload["skip_chatter_distribution"] is True
+    generate_reply.assert_awaited_once()
+    assert generate_reply.await_args.kwargs["pending_tool_text"] == ""
+    assert response.choices[0].message.content == "收到。"
+
+
+@pytest.mark.asyncio
+async def test_neko_tool_continuation_reuses_original_user_message_id(monkeypatch) -> None:
+    router = OpenAIRouter.__new__(OpenAIRouter)
+    event_manager = SimpleNamespace(publish_event=AsyncMock(return_value=None))
+    generate_reply = AsyncMock(
+        side_effect=[
+            (
+                "我先动一下耳朵。",
+                [
+                    ToolCall(
+                        id="call_1",
+                        name="play_ear_animation",
+                        args={"speed": 2},
+                    )
+                ],
+            ),
+            ("耳朵动好啦。", []),
+        ]
+    )
+    record_reply = AsyncMock(return_value=None)
+    find_persisted = AsyncMock(
+        side_effect=AssertionError("in-process continuation should use the call-id cache")
+    )
+    monkeypatch.setattr(
+        "src.core.managers.event_manager.get_event_manager",
+        lambda: event_manager,
+    )
+    monkeypatch.setattr(router, "_generate_neko_reply", generate_reply)
+    monkeypatch.setattr(router, "_record_neko_reply", record_reply)
+    monkeypatch.setattr(router, "_find_persisted_neko_user_message_id", find_persisted)
+
+    first_response = await router._handle_neko_chat(
+        ChatCompletionRequest(
+            model="elysia-neko",
+            messages=[ChatMessage(role="user", content="动一下猫耳朵")],
+        )
+    )
+    first_message = generate_reply.await_args_list[0].kwargs["message"]
+    first_call = first_response.choices[0].message.tool_calls[0]
+
+    final_response = await router._handle_neko_chat(
+        ChatCompletionRequest(
+            model="elysia-neko",
+            messages=[
+                ChatMessage(role="user", content="动一下猫耳朵"),
+                first_response.choices[0].message,
+                ChatMessage(
+                    role="tool",
+                    name="play_ear_animation",
+                    content="ok",
+                    tool_call_id=first_call.id,
+                ),
+            ],
+        )
+    )
+
+    event_manager.publish_event.assert_awaited_once()
+    find_persisted.assert_not_awaited()
+    assert generate_reply.await_count == 2
+    continuation = generate_reply.await_args_list[1].kwargs
+    assert continuation["message"].message_id == first_message.message_id
+    assert continuation["message"].content == "动一下猫耳朵"
+    assert '"id":"call_1"' in continuation["pending_tool_text"]
+    assert '"name":"play_ear_animation"' in continuation["pending_tool_text"]
+    assert '"arguments":"{\\"speed\\":2}"' in continuation["pending_tool_text"]
+    assert '"tool_call_id":"call_1"' in continuation["pending_tool_text"]
+    assert '"result":"ok"' in continuation["pending_tool_text"]
+    assert final_response.choices[0].message.content == "耳朵动好啦。"
+    record_reply.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("handler_name", "generation_result", "expected_status"),
+    [
+        ("neko", RuntimeError("provider failed"), 502),
+        ("neko", TimeoutError(), 504),
+        ("neko", ("", []), 502),
+        ("sister", RuntimeError("provider failed"), 502),
+        ("sister", TimeoutError(), 504),
+        ("sister", "", 502),
+    ],
+)
+async def test_sister_and_neko_generation_failures_remain_retryable_http_errors(
+    monkeypatch,
+    handler_name: str,
+    generation_result: object,
+    expected_status: int,
+) -> None:
+    router = OpenAIRouter.__new__(OpenAIRouter)
+    event_manager = SimpleNamespace(publish_event=AsyncMock(return_value=None))
+    record_neko = AsyncMock(return_value=None)
+    record_sister = AsyncMock(return_value=None)
+    generation = AsyncMock()
+    if isinstance(generation_result, BaseException):
+        generation.side_effect = generation_result
+    else:
+        generation.return_value = generation_result
+
+    monkeypatch.setattr(
+        "src.core.managers.event_manager.get_event_manager",
+        lambda: event_manager,
+    )
+    monkeypatch.setattr(router, "_record_neko_reply", record_neko)
+    monkeypatch.setattr(router, "_record_sister_reply", record_sister)
+
+    with pytest.raises(HTTPException) as exc_info:
+        if handler_name == "neko":
+            monkeypatch.setattr(router, "_generate_neko_reply", generation)
+            await router._handle_neko_chat(
+                ChatCompletionRequest(
+                    model="elysia-neko",
+                    messages=[ChatMessage(role="user", content="你好")],
+                )
+            )
+        else:
+            monkeypatch.setattr(router, "_generate_sister_reply", generation)
+            await router._handle_sister_chat(
+                ChatCompletionRequest(
+                    model="elysia-sister",
+                    messages=[ChatMessage(role="user", content="姐姐好")],
+                )
+            )
+
+    assert exc_info.value.status_code == expected_status
+    record_neko.assert_not_awaited()
+    record_sister.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_neko_prompt_excludes_original_user_from_history(monkeypatch) -> None:
+    from src.core.models.message import Message
+
+    router = OpenAIRouter.__new__(OpenAIRouter)
+    current_message = Message(
+        message_id="original_user_message",
+        time=1.0,
+        content="动一下猫耳朵",
+        processed_plain_text="动一下猫耳朵",
+        sender_id="neko_master",
+        sender_name="主人",
+        platform="neko",
+        chat_type="private",
+        stream_id="neko_desktop",
+    )
+    chat_stream = SimpleNamespace(stream_id="neko_desktop")
+    stream_manager = SimpleNamespace(
+        get_or_create_stream=AsyncMock(return_value=chat_stream),
+    )
+    build_history = AsyncMock(return_value="旧回复，不含当前消息")
+    monkeypatch.setattr(
+        "src.core.managers.stream_manager.get_stream_manager",
+        lambda: stream_manager,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.core.chat_history.build_global_chat_history_text_from_db",
+        build_history,
+    )
+
+    prompt = await router._build_neko_user_prompt(
+        current_message,
+        pending_tool_text='[工具结果] {"tool_call_id":"call_1","result":"ok"}',
+        history_limit=20,
+    )
+
+    build_history.assert_awaited_once_with(
+        chat_stream,
+        max_messages=20,
+        include_stream_label=True,
+        exclude_message_ids={"original_user_message"},
+    )
+    assert prompt.count("动一下猫耳朵") == 1
+    assert "旧回复，不含当前消息" in prompt
+
+
+@pytest.mark.asyncio
+async def test_sister_prompt_reads_only_isolated_stream_history(monkeypatch) -> None:
+    from src.core.models.message import Message
+
+    router = OpenAIRouter.__new__(OpenAIRouter)
+    sister_message = Message(
+        message_id="sister_old",
+        time=1.0,
+        content="姐姐，今天过得好吗？",
+        processed_plain_text="姐姐，今天过得好吗？",
+        sender_id="astrbot_little_elysia",
+        sender_name="妹妹爱莉希雅",
+        platform="sister_bridge",
+        chat_type="private",
+        stream_id="sister_bridge_private",
+    )
+    unrelated_message = Message(
+        message_id="other_old",
+        time=2.0,
+        content="这条来自其他会话",
+        processed_plain_text="这条来自其他会话",
+        sender_id="someone_else",
+        sender_name="其他人",
+        platform="qq",
+        chat_type="private",
+        stream_id="unrelated_stream",
+    )
+    current_message = Message(
+        message_id="sister_current",
+        time=3.0,
+        content="姐姐在吗？",
+        processed_plain_text="姐姐在吗？",
+        sender_id="astrbot_little_elysia",
+        sender_name="妹妹爱莉希雅",
+        platform="sister_bridge",
+        chat_type="private",
+        stream_id="sister_bridge_private",
+    )
+    stream_manager = SimpleNamespace(
+        get_or_create_stream=AsyncMock(return_value=SimpleNamespace()),
+        get_stream_messages=AsyncMock(
+            return_value=[sister_message, unrelated_message, current_message]
+        ),
+    )
+    monkeypatch.setenv("LIVE_BRIDGE_SISTER_HISTORY_LIMIT", "2")
+    monkeypatch.setattr(
+        "src.core.managers.stream_manager.get_stream_manager",
+        lambda: stream_manager,
+    )
+
+    prompt = await router._build_sister_user_prompt(current_message)
+
+    stream_manager.get_stream_messages.assert_awaited_once_with(
+        "sister_bridge_private",
+        limit=3,
+        defer_content=False,
+    )
+    assert "姐姐，今天过得好吗？" in prompt
+    assert "这条来自其他会话" not in prompt
+    assert prompt.count("姐姐在吗？") == 1
+
+
+@pytest.mark.asyncio
+async def test_generate_neko_reply_forwards_tool_choice_in_model_extra_params(
+    monkeypatch,
+) -> None:
+    router = OpenAIRouter.__new__(OpenAIRouter)
+    captured: dict[str, object] = {}
+    original_model_set = [
+        {"model": "first", "extra_params": {"top_p": 0.8}},
+        {"model": "second"},
+    ]
+
+    class _FakeResponse:
+        message = "收到"
+        call_list: list[object] = []
+
+        def __await__(self):
+            async def _collect():
+                return self.message
+
+            return _collect().__await__()
+
+    class _FakeRequest:
+        def __init__(self) -> None:
+            self.payloads: list[object] = []
+
+        def add_payload(self, payload) -> None:
+            self.payloads.append(payload)
+
+        async def send(self, *, stream: bool):
+            assert stream is False
+            return _FakeResponse()
+
+    fake_request = _FakeRequest()
+
+    def fake_create_llm_request(model_set, **kwargs):
+        captured["model_set"] = model_set
+        captured["request_name"] = kwargs["request_name"]
+        return fake_request
+
+    monkeypatch.setattr(
+        "src.app.plugin_system.api.llm_api.get_model_set_by_task",
+        lambda _task: original_model_set,
+    )
+    monkeypatch.setattr(
+        "src.app.plugin_system.api.llm_api.create_llm_request",
+        fake_create_llm_request,
+    )
+    monkeypatch.setattr(
+        router,
+        "_build_neko_system_prompt",
+        AsyncMock(return_value="system"),
+    )
+    monkeypatch.setattr(
+        router,
+        "_build_neko_user_prompt",
+        AsyncMock(return_value="user"),
+    )
+    tool_choice = {
+        "type": "function",
+        "function": {"name": "play_emote"},
+    }
+
+    reply_text, tool_calls = await router._generate_neko_reply(
+        message=SimpleNamespace(),
+        pending_tool_text="",
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "play_emote",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_choice=tool_choice,
+    )
+
+    assert reply_text == "收到"
+    assert tool_calls == []
+    assert captured["request_name"] == "neko_chat"
+    tuned_model_set = captured["model_set"]
+    assert isinstance(tuned_model_set, list)
+    assert tuned_model_set[0]["extra_params"] == {
+        "top_p": 0.8,
+        "tool_choice": tool_choice,
+    }
+    assert tuned_model_set[1]["extra_params"] == {"tool_choice": tool_choice}
+    assert original_model_set == [
+        {"model": "first", "extra_params": {"top_p": 0.8}},
+        {"model": "second"},
+    ]
