@@ -108,14 +108,12 @@ async def test_recognize_media_rejects_oversized_payload() -> None:
     manager._voice_available = False
     manager._skip_vlm_stream_ids = set()
     manager._get_cached_description = AsyncMock(return_value=None)
-    manager._save_to_pending = AsyncMock()
     manager._recognize_with_vlm = AsyncMock(return_value="不会被调用")
 
     huge_data = "base64|" + ("a" * (12 * 1024 * 1024))
     result = await MediaManager.recognize_media(manager, huge_data, "image")
 
     assert result is None
-    manager._save_to_pending.assert_not_awaited()
     manager._recognize_with_vlm.assert_not_awaited()
     stats = await MediaManager.get_media_chain_stats(manager)
     assert stats["rejected_too_large"] == 1
@@ -213,3 +211,32 @@ async def test_voice_failure_alert_triggers() -> None:
     stats = await MediaManager.get_media_chain_stats(manager)
     assert stats["failure"] >= 5
     assert stats["failure_types"]["audio_understanding_failed"] >= 5
+
+
+@pytest.mark.asyncio
+async def test_recognize_voice_rejects_path_only_without_file_access(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """适配器提供的路径或 URL 不能触发本地读取或远程下载。"""
+    media_path = tmp_path / "private.wav"
+    media_path.write_bytes(b"RIFF$\x00\x00\x00WAVEfmt ")
+    read_paths: list[Path] = []
+
+    def track_read(path: Path) -> bytes:
+        read_paths.append(path)
+        return b"unexpected"
+
+    monkeypatch.setattr(Path, "read_bytes", track_read)
+    manager = MediaManager.__new__(MediaManager)
+
+    result = await MediaManager.recognize_voice(
+        manager,
+        {
+            "path": str(media_path),
+            "url": "https://example.invalid/private.wav",
+        },
+    )
+
+    assert result is None
+    assert read_paths == []

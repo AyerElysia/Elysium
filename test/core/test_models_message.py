@@ -1,9 +1,22 @@
 """测试 src.core.models.message 模块。"""
 
+import base64
+from dataclasses import FrozenInstanceError
 from datetime import datetime
+import json
 
+import pytest
 
+from src.core.models.media import MediaAttachment, MediaSegmentType
 from src.core.models.message import Message, MessageType
+from src.kernel.llm.exceptions import MediaValidationError
+from src.kernel.llm.payload.media import MediaKind, MediaRef
+
+
+_PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
+_WAV_BYTES = b"RIFF$\x00\x00\x00WAVEfmt "
 
 
 class TestMessageType:
@@ -52,7 +65,8 @@ class TestMessage:
             platform="telegram",
             chat_type="private",
             stream_id="stream_789",
-            extra={"key": "value"},
+            extra={"key": "value", "platform_hint": "old"},
+            platform_hint="direct",
         )
 
         assert message.message_id == "msg_123"
@@ -66,8 +80,7 @@ class TestMessage:
         assert message.platform == "telegram"
         assert message.chat_type == "private"
         assert message.stream_id == "stream_789"
-        # extra 参数被收集到 **extra 中，所以会变成 {'extra': {'key': 'value'}}
-        assert message.extra == {"extra": {"key": "value"}}
+        assert message.extra == {"key": "value", "platform_hint": "direct"}
 
     def test_message_time_conversion(self):
         """测试时间转换为时间戳。"""
@@ -159,6 +172,383 @@ class TestMessage:
         )
         assert message.content == "<b>Raw HTML</b>"
         assert message.processed_plain_text == "Raw HTML"
+
+    def test_message_runtime_field_validation(self):
+        """测试显式运行时字段拒绝错误容器。"""
+        with pytest.raises(TypeError, match="extra"):
+            Message(extra=[("key", "value")])
+        with pytest.raises(TypeError, match="attachments"):
+            Message(attachments=())
+        with pytest.raises(TypeError, match="MediaAttachment"):
+            Message(attachments=[object()])
+
+    def test_message_from_dict_roundtrip_and_raw_data_policy(self):
+        """恢复 raw_data，但安全序列化时不再输出它。"""
+        attachment = MediaAttachment(
+            MediaSegmentType.IMAGE,
+            MediaRef.from_bytes(_PNG_BYTES, kind=MediaKind.IMAGE),
+            filename="pixel.png",
+        )
+        source = {
+            "message_id": "msg_roundtrip",
+            "time": 1710000000.0,
+            "content": "with image",
+            "message_type": "image",
+            "raw_data": {"adapter": "private"},
+            "attachments": [attachment.to_descriptor()],
+            "extra": {"trace_id": "trace-1"},
+        }
+
+        restored = Message.from_dict(source)
+        assert restored.raw_data == {"adapter": "private"}
+        assert not restored.attachments[0].media_ref.is_materialized
+
+        serialized = restored.to_dict()
+        assert "raw_data" not in serialized
+        assert serialized["attachments"] == [attachment.to_descriptor()]
+
+        roundtripped = Message.from_dict(serialized)
+        assert roundtripped.message_id == restored.message_id
+        assert roundtripped.message_type is MessageType.IMAGE
+        assert roundtripped.raw_data is None
+        assert roundtripped.extra == {"trace_id": "trace-1"}
+        assert roundtripped.attachments[0].to_descriptor() == attachment.to_descriptor()
+
+    def test_message_from_dict_merges_unknown_fields(self):
+        """未知顶层字段覆盖显式 extra 中的同名项。"""
+        message = Message.from_dict(
+            {
+                "content": "hello",
+                "message_type": "not-a-message-type",
+                "extra": {"inside": 1, "shared": "explicit"},
+                "future_field": 2,
+                "shared": "top-level",
+            }
+        )
+
+        assert message.message_type is MessageType.TEXT
+        assert message.extra == {
+            "inside": 1,
+            "future_field": 2,
+            "shared": "top-level",
+        }
+
+    def test_message_from_dict_rejects_invalid_explicit_extra(self):
+        """显式 extra 必须保持字典形状。"""
+        with pytest.raises(TypeError, match="extra"):
+            Message.from_dict({"extra": ["invalid"]})
+
+    def test_message_dict_is_json_safe_and_does_not_leak_media(self):
+        """附件序列化不包含 data/base64/path/raw bytes。"""
+        encoded = base64.b64encode(_PNG_BYTES).decode("ascii")
+        message = Message(
+            content="image",
+            raw_data={"bytes": _PNG_BYTES},
+            attachments=[
+                MediaAttachment(
+                    MediaSegmentType.IMAGE,
+                    MediaRef.from_bytes(_PNG_BYTES, kind=MediaKind.IMAGE),
+                )
+            ],
+            extra={"safe": True},
+        )
+
+        serialized = message.to_dict()
+        dumped = json.dumps(serialized)
+        assert encoded not in dumped
+        assert "raw_data" not in serialized
+
+        def assert_safe(value):
+            if isinstance(value, dict):
+                assert not ({"data", "base64", "path", "raw_data"} & value.keys())
+                for nested in value.values():
+                    assert_safe(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    assert_safe(nested)
+            else:
+                assert not isinstance(value, (bytes, bytearray, memoryview))
+
+        assert_safe(serialized)
+
+    def test_message_repr_and_dict_redact_nested_media_sources(self):
+        """消息日志与持久化结构只保留媒体元数据和文本。"""
+        image_secret = "base64|image-secret"
+        path_secret = "/tmp/private-image.png"
+        message = Message(
+            message_id="media-message",
+            message_type=MessageType.IMAGE,
+            content={
+                "text": "请看这张图",
+                "media": [
+                    {
+                        "type": "image",
+                        "data": image_secret,
+                        "filename": "visible.png",
+                    }
+                ],
+            },
+            extra={
+                "preview": {
+                    "type": "image",
+                    "path": path_secret,
+                    "width": 100,
+                }
+            },
+        )
+
+        safe_dict = message.to_dict()
+        safe_repr = repr(message)
+        dumped = json.dumps(safe_dict, ensure_ascii=False)
+
+        assert image_secret not in dumped
+        assert path_secret not in dumped
+        assert image_secret not in safe_repr
+        assert path_secret not in safe_repr
+        assert safe_dict["content"]["text"] == "请看这张图"
+        assert safe_dict["content"]["media"][0]["filename"] == "visible.png"
+        assert safe_dict["content"]["media"][0]["data"] == "[removed]"
+        assert safe_dict["extra"]["preview"] == {
+            "type": "image",
+            "path": "[removed]",
+            "width": 100,
+        }
+
+
+class TestMediaAttachment:
+    """测试核心消息附件模型。"""
+
+    @pytest.mark.parametrize(
+        ("segment_type", "kind", "payload"),
+        [
+            (MediaSegmentType.IMAGE, MediaKind.IMAGE, _PNG_BYTES),
+            (MediaSegmentType.EMOJI, MediaKind.IMAGE, _PNG_BYTES),
+            (MediaSegmentType.VOICE, MediaKind.AUDIO, _WAV_BYTES),
+            (MediaSegmentType.VIDEO, MediaKind.VIDEO, b"\x00\x00\x00\x18ftypmp42"),
+            (MediaSegmentType.FILE, MediaKind.FILE, b"plain file"),
+        ],
+    )
+    def test_segment_kind_mapping(self, segment_type, kind, payload):
+        """每种消息段只接受对应的 MediaKind。"""
+        attachment = MediaAttachment(
+            segment_type,
+            MediaRef.from_bytes(payload, kind=kind),
+        )
+        assert attachment.segment_type is segment_type
+        assert attachment.media_ref.kind is kind
+
+    def test_rejects_kind_mismatch_and_invalid_metadata(self):
+        """拒绝 kind 不匹配以及空白或非字符串 metadata。"""
+        file_ref = MediaRef.from_bytes(b"file", kind=MediaKind.FILE)
+        with pytest.raises(MediaValidationError, match="需要 kind"):
+            MediaAttachment(MediaSegmentType.IMAGE, file_ref)
+        with pytest.raises(MediaValidationError, match="filename"):
+            MediaAttachment(MediaSegmentType.FILE, file_ref, filename="  ")
+        with pytest.raises(MediaValidationError, match="resource_id"):
+            MediaAttachment(MediaSegmentType.FILE, file_ref, resource_id=123)
+
+    def test_is_frozen_and_slotted(self):
+        """附件对象不可变且没有实例字典。"""
+        attachment = MediaAttachment(
+            MediaSegmentType.FILE,
+            MediaRef.from_bytes(b"file", kind=MediaKind.FILE),
+        )
+        with pytest.raises(FrozenInstanceError):
+            attachment.filename = "changed.txt"
+        with pytest.raises(AttributeError):
+            attachment.__dict__
+
+    def test_descriptor_roundtrip_is_detached_and_json_safe(self):
+        """descriptor 往返只保留 JSON-safe 元数据。"""
+        attachment = MediaAttachment(
+            MediaSegmentType.IMAGE,
+            MediaRef.from_bytes(
+                _PNG_BYTES,
+                kind=MediaKind.IMAGE,
+                source_message_id="msg-1",
+            ),
+            filename="pixel.png",
+            resource_id="resource-1",
+            storage_key="media/pixel.png",
+        )
+
+        descriptor = attachment.to_descriptor()
+        json.dumps(descriptor)
+        restored = MediaAttachment.from_descriptor(descriptor)
+
+        assert restored.to_descriptor() == descriptor
+        assert not restored.media_ref.is_materialized
+        assert restored.filename == "pixel.png"
+        assert restored.resource_id == "resource-1"
+        assert restored.storage_key == "media/pixel.png"
+
+    @pytest.mark.parametrize("dangerous_key", ["data", "base64", "path", "file"])
+    def test_descriptor_rejects_dangerous_top_level_fields(self, dangerous_key):
+        """attachment descriptor 不接受任何可携带原始 source 的字段。"""
+        attachment = MediaAttachment(
+            MediaSegmentType.FILE,
+            MediaRef.from_bytes(b"file", kind=MediaKind.FILE),
+        )
+        descriptor = attachment.to_descriptor()
+        descriptor[dangerous_key] = "forbidden"
+        with pytest.raises(MediaValidationError, match="不支持的字段"):
+            MediaAttachment.from_descriptor(descriptor)
+
+    @pytest.mark.parametrize("dangerous_key", ["data", "base64", "path"])
+    def test_descriptor_rejects_dangerous_media_ref_fields(self, dangerous_key):
+        """MediaRef 的严格 descriptor 校验同样适用于附件。"""
+        attachment = MediaAttachment(
+            MediaSegmentType.IMAGE,
+            MediaRef.from_bytes(_PNG_BYTES, kind=MediaKind.IMAGE),
+        )
+        descriptor = attachment.to_descriptor()
+        descriptor["media_ref"][dangerous_key] = "forbidden"
+        with pytest.raises(MediaValidationError, match="不支持的字段"):
+            MediaAttachment.from_descriptor(descriptor)
+
+    @pytest.mark.parametrize(
+        "legacy_data",
+        [
+            base64.b64encode(_PNG_BYTES).decode("ascii"),
+            "base64|" + base64.b64encode(_PNG_BYTES).decode("ascii"),
+            "base64://" + base64.b64encode(_PNG_BYTES).decode("ascii"),
+            "data:image/png;base64," + base64.b64encode(_PNG_BYTES).decode("ascii"),
+            {"data": base64.b64encode(_PNG_BYTES).decode("ascii")},
+            {"base64": base64.b64encode(_PNG_BYTES).decode("ascii")},
+        ],
+    )
+    def test_from_legacy_accepts_inline_encodings(self, legacy_data):
+        """旧结构支持所有约定的内联编码形状。"""
+        attachment = MediaAttachment.from_legacy(
+            {"type": "image", "data": legacy_data},
+            source_message_id="source-msg",
+        )
+        assert attachment.media_ref.data == _PNG_BYTES
+        assert attachment.media_ref.source_message_id == "source-msg"
+        assert attachment.media_ref.mime_type == "image/png"
+
+    def test_from_legacy_accepts_audio_base64_and_metadata(self):
+        """字典 voice source 支持 audio_base64，并保留外层 metadata。"""
+        attachment = MediaAttachment.from_legacy(
+            {
+                "type": "voice",
+                "mime_type": "audio/wav",
+                "filename": "outer.wav",
+                "resource_id": "resource-voice",
+                "storage_key": "voice/1",
+                "data": {
+                    "audio_base64": base64.b64encode(_WAV_BYTES).decode("ascii"),
+                    "content_type": "audio/mpeg",
+                    "filename": "inner.mp3",
+                },
+            }
+        )
+
+        assert attachment.media_ref.data == _WAV_BYTES
+        assert attachment.media_ref.mime_type == "audio/wav"
+        assert attachment.filename == "outer.wav"
+        assert attachment.resource_id == "resource-voice"
+        assert attachment.storage_key == "voice/1"
+
+    @pytest.mark.parametrize("path_key", ["path", "file"])
+    def test_from_legacy_managed_paths_require_explicit_opt_in(
+        self, tmp_path, path_key
+    ):
+        """Adapter 默认无本地读取权限，内部调用必须显式授权。"""
+        media_path = tmp_path / "pixel.png"
+        media_path.write_bytes(_PNG_BYTES)
+        direct_item = {"type": "image", "data": media_path}
+        nested_item = {
+            "type": "image",
+            "data": {path_key: str(media_path), "name": "pixel.png"},
+        }
+
+        with pytest.raises(MediaValidationError, match="allow_managed_paths"):
+            MediaAttachment.from_legacy(direct_item)
+        with pytest.raises(MediaValidationError, match="allow_managed_paths"):
+            MediaAttachment.from_legacy(nested_item)
+
+        direct = MediaAttachment.from_legacy(
+            direct_item,
+            allow_managed_paths=True,
+        )
+        nested = MediaAttachment.from_legacy(
+            nested_item,
+            allow_managed_paths=True,
+        )
+
+        assert direct.media_ref.data == _PNG_BYTES
+        assert nested.media_ref.data == _PNG_BYTES
+        assert nested.filename == "pixel.png"
+        assert direct.media_ref.origin == "managed_path"
+        assert nested.media_ref.origin == "managed_path"
+
+    def test_from_legacy_never_treats_plain_string_as_path(self, tmp_path):
+        """即使普通字符串指向现存文件，也只会按 base64 解析。"""
+        media_path = tmp_path / "pixel.png"
+        media_path.write_bytes(_PNG_BYTES)
+        with pytest.raises(MediaValidationError, match="base64"):
+            MediaAttachment.from_legacy(
+                {"type": "image", "data": str(media_path)}
+            )
+
+    @pytest.mark.parametrize(
+        "legacy_data",
+        [
+            "https://example.invalid/pixel.png",
+            {"url": "http://example.invalid/pixel.png"},
+        ],
+    )
+    def test_from_legacy_rejects_remote_urls(self, legacy_data):
+        """旧消息 URL 不会触发网络下载。"""
+        with pytest.raises(MediaValidationError, match="远程 URL"):
+            MediaAttachment.from_legacy(
+                {"type": "image", "data": legacy_data}
+            )
+
+    @pytest.mark.parametrize(
+        "legacy_data",
+        [
+            {},
+            {"filename": "only-a-name.png"},
+            {"file": "missing-explicit-path.png", "name": "display.png"},
+        ],
+    )
+    def test_from_legacy_requires_real_source(self, legacy_data):
+        """没有 bytes 或有效显式路径时不能伪造 descriptor 哈希。"""
+        with pytest.raises(MediaValidationError):
+            MediaAttachment.from_legacy(
+                {"type": "image", "data": legacy_data}
+            )
+
+    def test_legacy_roundtrip_and_descriptor_only_output(self):
+        """物化附件输出 base64|，detached 附件永不伪造 data。"""
+        attachment = MediaAttachment(
+            MediaSegmentType.IMAGE,
+            MediaRef.from_bytes(_PNG_BYTES, kind=MediaKind.IMAGE),
+            filename="pixel.png",
+            resource_id="resource-1",
+            storage_key="images/pixel.png",
+        )
+
+        legacy = attachment.to_legacy()
+        assert legacy == {
+            "type": "image",
+            "mime_type": "image/png",
+            "data": "base64|" + base64.b64encode(_PNG_BYTES).decode("ascii"),
+            "filename": "pixel.png",
+            "resource_id": "resource-1",
+            "storage_key": "images/pixel.png",
+        }
+        restored = MediaAttachment.from_legacy(legacy)
+        assert restored.media_ref.data == _PNG_BYTES
+        assert restored.filename == attachment.filename
+        assert restored.resource_id == attachment.resource_id
+        assert restored.storage_key == attachment.storage_key
+
+        detached = MediaAttachment.from_descriptor(attachment.to_descriptor())
+        assert "data" not in detached.to_legacy()
+        assert "data" not in attachment.to_legacy(include_data=False)
 
 
 class TestMessageReplyChain:

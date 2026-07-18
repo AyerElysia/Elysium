@@ -1,12 +1,22 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
+import base64
 
 import pytest
 
+from src.core.models.media import MediaSegmentType
 from src.core.models.message import MessageType
 from src.core.transport.message_receive.converter import MessageConverter
+
+
+_PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
+_VIDEO_BYTES = b"\x00\x00\x00\x18ftypmp42"
+
+
+def _legacy_base64(data: bytes) -> str:
+    return "base64|" + base64.b64encode(data).decode("ascii")
 
 
 def _build_private_envelope(segments: list[dict]) -> dict:
@@ -27,61 +37,62 @@ def _build_private_envelope(segments: list[dict]) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_converter_recognizes_video_summary(monkeypatch: pytest.MonkeyPatch) -> None:
-    """视频段应走非原生摘要链路，并写入 [视频:xxx] 占位文本。"""
+async def test_converter_attaches_video_without_running_summary() -> None:
+    """视频只保留占位符和验证后的附件，不在 converter 内生成摘要。"""
     converter = MessageConverter()
+    legacy_video = {
+        "base64": _legacy_base64(_VIDEO_BYTES),
+        "filename": "run.mp4",
+        "mime_type": "video/mp4",
+    }
 
-    fake_manager = SimpleNamespace(
-        recognize_media=AsyncMock(return_value=None),
-        recognize_video=AsyncMock(return_value="画面中有人在室外慢跑，背景是街道和建筑。"),
-    )
-    monkeypatch.setattr(
-        "src.core.managers.media_manager.get_media_manager",
-        lambda: fake_manager,
+    message = await converter.envelope_to_message(
+        _build_private_envelope([{"type": "video", "data": legacy_video}])
     )
 
-    envelope = _build_private_envelope(
-        [{"type": "video", "data": {"base64": "base64|ZmFrZV92aWRlbw==", "filename": "run.mp4"}}]
-    )
-    message = await converter.envelope_to_message(envelope)
-
-    assert message.message_type == MessageType.VIDEO
-    assert message.processed_plain_text is not None
-    assert "[视频:画面中有人在室外慢跑，背景是街道和建筑。]" in message.processed_plain_text
-    fake_manager.recognize_video.assert_awaited_once()
-    fake_manager.recognize_media.assert_not_awaited()
+    assert message.message_type is MessageType.VIDEO
+    assert message.processed_plain_text == "[视频]"
+    assert isinstance(message.content, dict)
+    assert message.content["media"] == [
+        {"type": "video", "data": legacy_video}
+    ]
+    assert len(message.attachments) == 1
+    attachment = message.attachments[0]
+    assert attachment.segment_type is MediaSegmentType.VIDEO
+    assert attachment.media_ref.data == _VIDEO_BYTES
+    assert attachment.media_ref.mime_type == "video/mp4"
+    assert attachment.media_ref.source_message_id == "msg-video-1"
+    assert attachment.filename == "run.mp4"
+    assert "media_errors" not in message.extra
+    assert not hasattr(MessageConverter, "_recognize_media_with_manager")
+    assert not hasattr(MessageConverter, "_skip_vlm_media_types_for_stream")
 
 
 @pytest.mark.asyncio
-async def test_converter_skip_vlm_still_handles_video(monkeypatch: pytest.MonkeyPatch) -> None:
-    """注册 skip_vlm 时应跳过 image/emoji 识别，但 video 仍应摘要。"""
+async def test_converter_keeps_image_and_video_placeholders_and_attachments() -> None:
+    """混合媒体按原顺序附加，文本只含稳定占位符。"""
     converter = MessageConverter()
+    message = await converter.envelope_to_message(
+        _build_private_envelope(
+            [
+                {"type": "image", "data": _legacy_base64(_PNG_BYTES)},
+                {
+                    "type": "video",
+                    "data": {
+                        "base64": _legacy_base64(_VIDEO_BYTES),
+                        "filename": "talk.mp4",
+                    },
+                },
+            ]
+        )
+    )
 
-    fake_manager = SimpleNamespace(
-        recognize_media=AsyncMock(return_value="这是一张图片"),
-        recognize_video=AsyncMock(return_value="视频大致在讲一次对话场景。"),
-    )
-    monkeypatch.setattr(
-        "src.core.managers.media_manager.get_media_manager",
-        lambda: fake_manager,
-    )
-    monkeypatch.setattr(
-        MessageConverter,
-        "_skip_vlm_media_types_for_stream",
-        staticmethod(lambda _stream_id, _media_types: {"image", "emoji"}),
-    )
-
-    envelope = _build_private_envelope(
-        [
-            {"type": "image", "data": "base64|ZmFrZV9pbWFnZQ=="},
-            {"type": "video", "data": {"base64": "base64|ZmFrZV92aWRlbw==", "filename": "talk.mp4"}},
-        ]
-    )
-    message = await converter.envelope_to_message(envelope)
-
-    assert message.message_type == MessageType.IMAGE
-    assert message.processed_plain_text is not None
-    assert "[图片]" in message.processed_plain_text
-    assert "[视频:视频大致在讲一次对话场景。]" in message.processed_plain_text
-    fake_manager.recognize_media.assert_not_awaited()
-    fake_manager.recognize_video.assert_awaited_once()
+    assert message.message_type is MessageType.IMAGE
+    assert message.processed_plain_text == "[图片][视频]"
+    assert [attachment.segment_type for attachment in message.attachments] == [
+        MediaSegmentType.IMAGE,
+        MediaSegmentType.VIDEO,
+    ]
+    assert message.attachments[0].media_ref.data == _PNG_BYTES
+    assert message.attachments[1].media_ref.data == _VIDEO_BYTES
+    assert message.extra["media"] == message.content["media"]

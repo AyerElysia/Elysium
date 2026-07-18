@@ -8,6 +8,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
+from .media import MediaAttachment, redact_media_sources
+
 
 class MessageType(str, Enum):
     """消息类型枚举。
@@ -58,6 +60,7 @@ class Message:
 
         # 运行时字段
         raw_data: 原始平台数据
+        attachments: 已验证的媒体附件
         extra: 额外元数据
 
     Examples:
@@ -92,7 +95,9 @@ class Message:
         stream_id: str = "",
         # 运行时字段
         raw_data: Any = None,
-        **extra: Any,
+        attachments: list[MediaAttachment] | None = None,
+        extra: dict[str, Any] | None = None,
+        **extra_fields: Any,
     ) -> None:
         """初始化消息对象。
 
@@ -111,8 +116,21 @@ class Message:
             platform: 消息来源平台
             chat_type: 聊天类型
             raw_data: 原始平台数据
-            **extra: 额外元数据
+            attachments: 已验证的媒体附件
+            extra: 显式额外元数据
+            **extra_fields: 直接传入的额外元数据，同名时覆盖 ``extra``
         """
+        if extra is not None and not isinstance(extra, dict):
+            raise TypeError("extra 必须是 dict 或 None")
+        if attachments is not None and not isinstance(attachments, list):
+            raise TypeError("attachments 必须是 list 或 None")
+        normalized_attachments = [] if attachments is None else list(attachments)
+        if not all(
+            isinstance(attachment, MediaAttachment)
+            for attachment in normalized_attachments
+        ):
+            raise TypeError("attachments 的每个元素都必须是 MediaAttachment")
+
         # 基础字段
         self.message_id = message_id
         self.time = time if time is not None else datetime.now()
@@ -137,32 +155,55 @@ class Message:
         self.platform = platform
         self.chat_type = chat_type
         self.stream_id = stream_id
+
         # 运行时字段
         self.raw_data = raw_data
-        self.extra = extra
+        self.attachments = normalized_attachments
+        merged_extra = dict(extra or {})
+        merged_extra.update(extra_fields)
+        self.extra = merged_extra
 
     def __repr__(self) -> str:
-        """返回消息的字符串表示。"""
+        """返回不暴露媒体 source 的字符串表示。"""
+        is_media_message = self.message_type in {
+            MessageType.IMAGE,
+            MessageType.EMOJI,
+            MessageType.VOICE,
+            MessageType.VIDEO,
+            MessageType.FILE,
+        }
+        safe_content = redact_media_sources(
+            self.content,
+            media_context=is_media_message,
+            source_value=is_media_message,
+        )
         return (
             f"Message(id={self.message_id}, "
             f"sender={self.sender_name}, "
             f"type={self.message_type.value}, "
-            f"content={str(self.content)[:50]})"
+            f"content={str(safe_content)[:50]})"
         )
 
     def to_dict(self) -> dict[str, Any]:
-        """将消息转换为字典。
-
-        Returns:
-            dict[str, Any]: 包含所有消息字段的字典
-        """
+        """将消息转换为不含运行时原始数据和媒体 source 的字典。"""
+        is_media_message = self.message_type in {
+            MessageType.IMAGE,
+            MessageType.EMOJI,
+            MessageType.VOICE,
+            MessageType.VIDEO,
+            MessageType.FILE,
+        }
         return {
             # 基础字段
             "message_id": self.message_id,
             "time": self.time,
             "reply_to": self.reply_to,
             # 内容字段
-            "content": self.content,
+            "content": redact_media_sources(
+                self.content,
+                media_context=is_media_message,
+                source_value=is_media_message,
+            ),
             "processed_plain_text": self.processed_plain_text,
             # 类型字段
             "message_type": self.message_type.value,
@@ -175,56 +216,61 @@ class Message:
             "platform": self.platform,
             "chat_type": self.chat_type,
             "stream_id": self.stream_id,
-            "extra": self.extra,
+            # 运行时安全字段
+            "attachments": [
+                attachment.to_descriptor() for attachment in self.attachments
+            ],
+            "extra": redact_media_sources(self.extra),
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Message":
-        """从字典创建消息对象。
+        """从字典恢复消息，包括 descriptor-only 媒体附件。"""
+        if not isinstance(data, dict):
+            raise TypeError("Message.from_dict 的 data 必须是 dict")
 
-        Args:
-            data: 包含消息数据的字典
-
-        Returns:
-            Message: 消息对象
-
-        Examples:
-            >>> data = {
-            ...     "message_id": "msg_001",
-            ...     "content": "你好",
-            ...     "sender_id": "user_123",
-            ...     "sender_name": "Alice",
-            ...     "platform": "test"
-            ... }
-            >>> message = Message.from_dict(data)
-        """
-        # 处理 message_type
-        message_type_str = data.get("message_type", "text")
+        message_type_value = data.get("message_type", "text")
         try:
-            message_type = MessageType(message_type_str)
-        except ValueError:
+            message_type = MessageType(message_type_value)
+        except (TypeError, ValueError):
             message_type = MessageType.TEXT
 
-        # 提取额外字段
-        extra_fields = {
-            k: v
-            for k, v in data.items()
-            if k not in {
-                "message_id",
-                "time",
-                "stream_id",
-                "reply_to",
-                "content",
-                "processed_plain_text",
-                "message_type",
-                "sender_id",
-                "sender_name",
-                "sender_cardname",
-                "sender_role",
-                "platform",
-                "chat_type",
-            }
+        explicit_extra = data.get("extra", {})
+        if not isinstance(explicit_extra, dict):
+            raise TypeError("Message.from_dict 的 extra 必须是 dict")
+
+        attachment_values = data.get("attachments", [])
+        if attachment_values is None:
+            attachment_values = []
+        if not isinstance(attachment_values, list):
+            raise TypeError("Message.from_dict 的 attachments 必须是 list")
+        attachments = [
+            MediaAttachment.from_descriptor(descriptor)
+            for descriptor in attachment_values
+        ]
+
+        known_fields = {
+            "message_id",
+            "time",
+            "stream_id",
+            "reply_to",
+            "content",
+            "processed_plain_text",
+            "message_type",
+            "sender_id",
+            "sender_name",
+            "sender_cardname",
+            "sender_role",
+            "platform",
+            "chat_type",
+            "raw_data",
+            "attachments",
+            "extra",
         }
+        merged_extra = dict(explicit_extra)
+        merged_extra.update(
+            {key: value for key, value in data.items() if key not in known_fields}
+        )
 
         return cls(
             message_id=data.get("message_id", ""),
@@ -240,6 +286,7 @@ class Message:
             sender_role=data.get("sender_role"),
             platform=data.get("platform", ""),
             chat_type=data.get("chat_type", ""),
-            raw_data=None,
-            **extra_fields,
+            raw_data=data.get("raw_data"),
+            attachments=attachments,
+            extra=merged_extra,
         )

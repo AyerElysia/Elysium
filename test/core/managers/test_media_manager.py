@@ -13,9 +13,12 @@
 
 from __future__ import annotations
 
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+import asyncio
 import base64
+from collections import OrderedDict
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from src.core.managers.media_manager import MediaManager, get_media_manager
 
@@ -70,58 +73,19 @@ class TestMediaManagerInit:
             assert manager1 is manager2
 
 
-class TestMediaManagerSkipVLM:
-    """测试 VLM 跳过功能。"""
-    
-    def test_skip_vlm_for_stream(self) -> None:
-        """测试为特定流跳过 VLM。"""
-        with patch('src.core.managers.media_manager.get_model_set_by_task'):
-            manager = MediaManager()
-            
-            manager.skip_vlm_for_stream("stream_123")
-            
-            assert manager.should_skip_vlm("stream_123") is True
-            assert manager.should_skip_vlm("stream_123", "image") is True
+class TestMediaManagerLegacySkipVLM:
+    """旧跳过 API 保持兼容，但不得再保存 stream 级状态。"""
 
-    def test_skip_vlm_for_stream_media_types(self) -> None:
-        """测试为特定流按媒体类型跳过 VLM。"""
+    def test_skip_api_is_stateless_noop(self) -> None:
         with patch('src.core.managers.media_manager.get_model_set_by_task'):
             manager = MediaManager()
 
             manager.skip_vlm_for_stream("stream_123", ["image"])
-
-            assert manager.should_skip_vlm("stream_123") is True
-            assert manager.should_skip_vlm("stream_123", "image") is True
-            assert manager.should_skip_vlm("stream_123", "emoji") is False
-    
-    def test_unskip_vlm_for_stream(self) -> None:
-        """测试恢复特定流的 VLM。"""
-        with patch('src.core.managers.media_manager.get_model_set_by_task'):
-            manager = MediaManager()
-            
-            manager.skip_vlm_for_stream("stream_123")
-            assert manager.should_skip_vlm("stream_123") is True
-            
-            manager.unskip_vlm_for_stream("stream_123")
-            assert manager.should_skip_vlm("stream_123") is False
-
-    def test_unskip_vlm_for_stream_media_types(self) -> None:
-        """测试恢复特定流的部分媒体类型 VLM。"""
-        with patch('src.core.managers.media_manager.get_model_set_by_task'):
-            manager = MediaManager()
-
-            manager.skip_vlm_for_stream("stream_123", ["image", "emoji"])
             manager.unskip_vlm_for_stream("stream_123", ["image"])
 
             assert manager.should_skip_vlm("stream_123", "image") is False
-            assert manager.should_skip_vlm("stream_123", "emoji") is True
-    
-    def test_should_skip_vlm_not_in_list(self) -> None:
-        """测试未跳过的流。"""
-        with patch('src.core.managers.media_manager.get_model_set_by_task'):
-            manager = MediaManager()
-            
-            assert manager.should_skip_vlm("stream_456") is False
+            assert not hasattr(manager, "_skip_vlm_stream_ids")
+            assert not hasattr(manager, "_skip_vlm_media_types_by_stream")
 
 
 class TestMediaManagerMimeType:
@@ -140,6 +104,40 @@ class TestMediaManagerMimeType:
         mime_type = MediaManager._extract_image_mime_type("ZmFrZQ==")
 
         assert mime_type == "image/png"
+
+    def test_compute_hash_uses_decoded_media_bytes(self) -> None:
+        """同一媒体的兼容编码形式必须共享缓存键。"""
+        encoded = base64.b64encode(b"same-media-bytes").decode("ascii")
+        expected = MediaManager._compute_hash(encoded)
+
+        assert MediaManager._compute_hash(f"base64|{encoded}") == expected
+        assert MediaManager._compute_hash(f"base64://{encoded}") == expected
+        assert (
+            MediaManager._compute_hash(f"data:image/png;base64,{encoded}")
+            == expected
+        )
+        assert MediaManager._compute_hash(f"{encoded[:8]}\n{encoded[8:]}") == expected
+
+    @pytest.mark.asyncio
+    async def test_recognition_lock_lru_keeps_active_lock(self) -> None:
+        """容量清理不得让同一媒体在识别中获得第二把锁。"""
+        manager = MediaManager.__new__(MediaManager)
+        manager._recognition_locks = OrderedDict()
+
+        with patch("src.core.managers.media_manager._MAX_RECOGNITION_LOCKS", 2):
+            active_lock = manager._get_recognition_lock("active")
+            await active_lock.acquire()
+            try:
+                manager._get_recognition_lock("second")
+                manager._get_recognition_lock("third")
+
+                assert manager._get_recognition_lock("active") is active_lock
+                assert "active" in manager._recognition_locks
+            finally:
+                active_lock.release()
+
+            manager._get_recognition_lock("fourth")
+            assert len(manager._recognition_locks) <= 2
 
 
 class TestMediaManagerRecognizeMedia:
@@ -206,28 +204,45 @@ class TestMediaManagerRecognizeMedia:
                 
                 # VLM 不可用时应返回默认描述或 None
                 assert result is None or isinstance(result, str)
-    
+
     @pytest.mark.asyncio
-    async def test_recognize_media_skip_for_stream(self) -> None:
-        """测试跳过特定流的识别。"""
-        with patch('src.core.managers.media_manager.get_model_set_by_task'):
-            manager = MediaManager()
-            
-            manager.skip_vlm_for_stream("stream_123")
-            test_data = base64.b64encode(b"test_image_data").decode()
-            
-            # 跳过 VLM 识别的流使用缓存
-            with patch.object(manager, '_get_cached_description', new_callable=AsyncMock) as mock_cache:
-                mock_cache.return_value = None
-                
-                result = await manager.recognize_media(
-                    base64_data=test_data,
-                    media_type="image",
-                    use_cache=True
-                )
-                
-                # 应该跳过识别
-                assert result is None
+    async def test_recognize_with_vlm_uses_default_prompt_when_template_missing(self) -> None:
+        class AwaitableResponse:
+            message = "一张测试图片"
+
+            def __await__(self):
+                async def resolve():
+                    return self.message
+
+                return resolve().__await__()
+
+        manager = MediaManager.__new__(MediaManager)
+        manager._vlm_model_set = [{"model_identifier": "vision-model"}]
+        request = MagicMock()
+        request.send = AsyncMock(return_value=AwaitableResponse())
+        prompt_manager = MagicMock()
+        prompt_manager.get_template.return_value = None
+        image_data = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+            "AAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+        )
+
+        with (
+            patch(
+                "src.app.plugin_system.api.llm_api.create_llm_request",
+                return_value=request,
+            ),
+            patch(
+                "src.core.managers.media_manager.get_prompt_manager",
+                return_value=prompt_manager,
+            ),
+        ):
+            result = await manager._recognize_with_vlm(image_data, "image")
+
+        assert result == "一张测试图片"
+        payload = request.add_payload.call_args.args[0]
+        assert payload.content[0].text.startswith("描述这张图片的内容")
+        assert payload.content[1].mime_type == "image/png"
 
 
 class TestMediaManagerRecognizeBatch:

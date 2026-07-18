@@ -459,35 +459,39 @@ async def test_bulk_clear_streams_clears_matching_cached_streams(monkeypatch) ->
     session.commit.assert_awaited_once()
 
 
-def test_serialize_content_for_db_keeps_small_binary_media_data() -> None:
-    """小体积二进制媒体数据应保留，避免误删有效内容。"""
+def test_serialize_content_for_db_strips_small_binary_media_data() -> None:
+    """媒体 source 无论大小都不应持久化。"""
+    raw_data = "a" * 128
     content = {
         "text": "hello",
-        "media": [{"type": "image", "data": "a" * 128, "name": "small.png"}],
+        "media": [{"type": "image", "data": raw_data, "name": "small.png"}],
     }
 
     serialized = _serialize_content_for_db(content)
 
-    assert "'data': '" in serialized
+    assert raw_data not in serialized
+    assert "[removed]" in serialized
     assert "small.png" in serialized
 
 
 def test_serialize_content_for_db_strips_large_binary_media_data() -> None:
-    """超过阈值的二进制媒体数据应丢弃，仅保留必要元信息。"""
+    """大体积媒体同样只保留必要元信息。"""
+    raw_data = "a" * 2048
     content = {
         "text": "hello",
-        "media": [{"type": "image", "data": "a" * 2048, "name": "large.png"}],
+        "media": [{"type": "image", "data": raw_data, "name": "large.png"}],
     }
 
     serialized = _serialize_content_for_db(content)
 
+    assert raw_data not in serialized
     assert "large.png" in serialized
     assert "'type': 'image'" in serialized
-    assert "'data': '" not in serialized
+    assert "[removed]" in serialized
 
 
-def test_serialize_content_for_db_keeps_non_binary_media_data() -> None:
-    """非二进制媒体类型不参与裁剪，保持原始数据。"""
+def test_serialize_content_for_db_keeps_file_metadata_without_source() -> None:
+    """文件 source 被剔除，但其结构化元数据仍保留。"""
     content = {
         "media": [{"type": "file", "data": {"id": "file-001", "size": 99999}}],
     }

@@ -20,6 +20,7 @@ from async_lru import alru_cache
 from sqlalchemy import update as sa_update
 
 from src.core.config import get_core_config
+from src.core.models.media import redact_media_sources
 from src.kernel.db import CRUDBase, QueryBuilder, get_db_session
 from src.kernel.logger import get_logger
 
@@ -31,58 +32,26 @@ if TYPE_CHECKING:
 
 logger = get_logger("stream_manager", display="StreamMgr")
 
-# 含原始二进制的媒体类型，序列化入库时仅在 payload 过大时剔除 data 字段
-_BINARY_MEDIA_TYPES: frozenset[str] = frozenset({"image", "emoji", "voice", "video"})
-_MAX_MEDIA_DATA_BYTES = 1024
+_MEDIA_MESSAGE_TYPES: frozenset[str] = frozenset(
+    {"image", "emoji", "voice", "video", "file"}
+)
 
 
-def _get_content_size_bytes(content: Any) -> int:
-    """估算内容的 UTF-8 序列化字节数。"""
-    if isinstance(content, bytes):
-        return len(content)
-    if isinstance(content, str):
-        return len(content.encode("utf-8"))
-    return len(str(content).encode("utf-8"))
+def _serialize_content_for_db(content: Any, message_type: Any = None) -> str:
+    """Serialize content after removing every raw media source.
 
-
-def _strip_oversized_media_data(item: dict[str, Any]) -> dict[str, Any]:
-    """移除超出阈值的媒体 data 字段，保留其余元信息。"""
-    media_data = item.get("data")
-    if media_data is None:
-        return item
-
-    if _get_content_size_bytes(media_data) <= _MAX_MEDIA_DATA_BYTES:
-        return item
-
-    return {key: value for key, value in item.items() if key != "data"}
-
-
-def _serialize_content_for_db(content: Any) -> str:
-    """将消息 content 序列化为数据库存储字符串。
-
-    内存中的 content 字典可能包含图片/表情包/语音的原始 base64 数据（供 Chatter 多模态
-    使用），但这些数据不需要持久化，持久化会造成数据库存储暴涨。本函数在序列化前检查
-    image/emoji/voice 媒体项中的 ``data`` 实际大小，超过阈值时剔除该字段，其余元信息保留。
+    Runtime attachments retain validated bytes, but database history stores only
+    text and transport metadata. Small media bodies are redacted as strictly as
+    large ones so persistence behavior cannot depend on payload size.
     """
-    if not isinstance(content, dict):
-        return str(content)
-
-    media = content.get("media")
-    if not isinstance(media, list):
-        return str(content)
-
-    stripped_media = []
-    for item in media:
-        if not isinstance(item, dict):
-            continue
-
-        if item.get("type") in _BINARY_MEDIA_TYPES:
-            stripped_media.append(_strip_oversized_media_data(item))
-            continue
-
-        stripped_media.append(item)
-
-    return str({**content, "media": stripped_media})
+    normalized_type = str(getattr(message_type, "value", message_type) or "").lower()
+    is_media_message = normalized_type in _MEDIA_MESSAGE_TYPES
+    safe_content = redact_media_sources(
+        content,
+        media_context=is_media_message,
+        source_value=is_media_message,
+    )
+    return str(safe_content)
 
 
 class StreamManager:
@@ -315,8 +284,12 @@ class StreamManager:
         if max_messages is not None:
             query = query.limit(max_messages)
         
-        # Defer loading the potentially huge content column (containing base64) to optimize speed
-        query._stmt = query._stmt.options(defer(self._Messages.content))
+        # Production QueryBuilder exposes ``_stmt``; lightweight test/custom
+        # builders may not. Persisted media sources are already redacted, but
+        # deferring content remains useful for ordinary long text histories.
+        statement = getattr(query, "_stmt", None)
+        if statement is not None:
+            query._stmt = statement.options(defer(self._Messages.content))
         messages_records = await query.all()
 
         # 转换为运行时 Message 对象
@@ -379,7 +352,10 @@ class StreamManager:
                 "person_id": person_id,
                 "time": message.time,
                 "message_type": message.message_type.value,
-                "content": _serialize_content_for_db(message.content),
+                "content": _serialize_content_for_db(
+                    message.content,
+                    message.message_type,
+                ),
                 "processed_plain_text": message.processed_plain_text,
                 "reply_to": message.reply_to,
                 "platform": message.platform,
@@ -432,7 +408,10 @@ class StreamManager:
                 "person_id": "bot",
                 "time": message.time,
                 "message_type": message.message_type.value,
-                "content": _serialize_content_for_db(message.content),
+                "content": _serialize_content_for_db(
+                    message.content,
+                    message.message_type,
+                ),
                 "processed_plain_text": message.processed_plain_text,
                 "reply_to": message.reply_to,
                 "platform": message.platform,

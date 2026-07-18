@@ -1,5 +1,6 @@
 """Core models: DB and messaging schemas."""
 
+from .media import MediaAttachment, MediaSegmentType
 from .message import Message, MessageType
 from .sql_alchemy import (
     Base,
@@ -22,6 +23,8 @@ from .stream import ChatStream, StreamContext
 __all__ = [
     "Message",
     "MessageType",
+    "MediaAttachment",
+    "MediaSegmentType",
     "ChatStream",
     "StreamContext",
     "Base",

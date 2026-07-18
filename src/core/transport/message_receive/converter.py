@@ -1,22 +1,28 @@
 """消息转换器。
 
 负责 ``MessageEnvelope``（wire 层传输格式）与 ``Message``（核心业务模型）之间的
-双向转换。核心解析逻辑在 ``_parse_segments`` 中实现递归的 ``SegPayload`` 展开。
+双向转换。入站媒体只在这里解析、验证并附加为 ``MediaAttachment``；转换器不会
+下载远程资源，也不会执行 VLM、ASR、ffmpeg 或 ``MediaManager`` 识别。
 
 设计原则：
-- 适配器传入的媒体数据（图片、语音、视频等）**已经是 base64 编码**，转换器不做下载。
-- 嵌套 seglist 最多递归 3 层，超出以占位符替代。
+- 保留适配器传入的 legacy 媒体段与文本占位符，供旧调用方继续使用。
+- 媒体逐项验证；单项失败不会丢弃整条消息或原始 legacy 媒体项。
+- ``seglist`` / ``reply`` 嵌套最多递归 5 层，超出以占位符替代。
 - 单个段解析失败不影响整体，用占位符保留位置。
-- 图片和表情包会通过 VLM 识别转换为文字描述；视频走“抽帧+总结”的非原生链路。
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
+import copy
+import hashlib
 import time
 from typing import Any
 
 from mofox_wire import MessageEnvelope, MessageInfoPayload, SegPayload
 
+from src.core.models.media import MediaAttachment, MediaSegmentType
 from src.core.models.message import Message, MessageType
 from src.core.transport.message_receive.utils import (
     extract_stream_id,
@@ -30,6 +36,7 @@ logger = get_logger("message_converter")
 
 # 递归深度硬上限
 _MAX_NESTING_DEPTH: int = 5
+_MEDIA_SEGMENT_TYPES = {segment_type.value for segment_type in MediaSegmentType}
 
 _MESSAGE_INIT_KEYS = {
     "message_id",
@@ -46,7 +53,10 @@ _MESSAGE_INIT_KEYS = {
     "chat_type",
     "stream_id",
     "raw_data",
+    "attachments",
+    "extra",
     "media",
+    "media_errors",
     "at_users",
     "unknown_segments",
     "group_id",
@@ -65,6 +75,49 @@ def _is_internal_target_id(value: Any) -> bool:
     )
 
 
+def _safe_copy_media_data(value: Any, memo: dict[int, Any] | None = None) -> Any:
+    """复制适配器媒体容器；单个不可复制字段不会让整个段丢失。"""
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        pass
+
+    if memo is None:
+        memo = {}
+    object_id = id(value)
+    if object_id in memo:
+        return memo[object_id]
+
+    if isinstance(value, dict):
+        copied: dict[Any, Any] = {}
+        memo[object_id] = copied
+        for key, item in value.items():
+            try:
+                copied_key = copy.deepcopy(key)
+            except Exception:
+                copied_key = key
+            copied[copied_key] = _safe_copy_media_data(item, memo)
+        return copied
+    if isinstance(value, list):
+        copied_list: list[Any] = []
+        memo[object_id] = copied_list
+        copied_list.extend(_safe_copy_media_data(item, memo) for item in value)
+        return copied_list
+    if isinstance(value, tuple):
+        copied_tuple = tuple(_safe_copy_media_data(item, memo) for item in value)
+        memo[object_id] = copied_tuple
+        return copied_tuple
+    if isinstance(value, set):
+        copied_set = {_safe_copy_media_data(item, memo) for item in value}
+        memo[object_id] = copied_set
+        return copied_set
+
+    try:
+        return copy.copy(value)
+    except Exception:
+        return value
+
+
 # ──────────────────────────────────────────────
 #  段解析返回结构
 # ──────────────────────────────────────────────
@@ -74,17 +127,29 @@ class _ParseResult:
 
     Attributes:
         text_parts: 纯文本片段列表，最终用空字符串拼接
-        media: 媒体资源列表，每项为 ``{"type": str, "data": Any}``
+        media: legacy 媒体资源列表，每项为 ``{"type": str, "data": Any}``
+        attachments: 已成功验证的 canonical 媒体附件
+        media_errors: 不包含媒体 body 的逐项安全错误记录
         reply_to: 被回复消息的 ID（仅第一个 reply 段生效）
         at_users: 被 @ 用户列表 ``[{"nickname": str, "user_id": str}]``
         unknown_segments: 无法识别的段类型记录
     """
 
-    __slots__ = ("text_parts", "media", "reply_to", "at_users", "unknown_segments")
+    __slots__ = (
+        "text_parts",
+        "media",
+        "attachments",
+        "media_errors",
+        "reply_to",
+        "at_users",
+        "unknown_segments",
+    )
 
     def __init__(self) -> None:
         self.text_parts: list[str] = []
         self.media: list[dict[str, Any]] = []
+        self.attachments: list[MediaAttachment] = []
+        self.media_errors: list[dict[str, Any]] = []
         self.reply_to: str | None = None
         self.at_users: list[dict[str, str]] = []
         self.unknown_segments: list[dict[str, Any]] = []
@@ -100,6 +165,8 @@ class _ParseResult:
         """将另一个解析结果合并到自身。"""
         self.text_parts.extend(other.text_parts)
         self.media.extend(other.media)
+        self.attachments.extend(other.attachments)
+        self.media_errors.extend(other.media_errors)
         if other.reply_to and not self.reply_to:
             self.reply_to = other.reply_to
         self.at_users.extend(other.at_users)
@@ -114,12 +181,8 @@ class _ParseResult:
 class MessageConverter:
     """MessageEnvelope ↔ Message 双向转换器。
 
-    实例无状态，可以作为单例在整个应用中复用。
-    
-支持媒体识别功能：
-- 图片/表情包：VLM 识别
-- 语音：ASR 转写
-- 视频：关键帧摘要（非原生视频）
+    实例无状态，可以作为单例在整个应用中复用。媒体处理仅限 legacy 段的
+    规范化、验证和附件构造；媒体理解由转换器之外的上层流程负责。
 
     Examples:
         >>> converter = MessageConverter()
@@ -163,53 +226,42 @@ class MessageConverter:
         else:
             segments = list(raw_segments)
 
-        # 递归解析段列表
+        # 先递归保留所有 legacy 媒体，再按消息 ID 逐项构造 canonical 附件。
         result = self._parse_segments(segments, depth=0)
-        
-        # 如果解析过程中发现有媒体资源，则后续需要考虑是否运行视觉语言模型识别。
-        # 上层流程可按 stream 注册跳过 image/emoji VLM，让原生多模态模型直接看媒体。
-        if result.media:
-            # 提前提取 stream_id 用于判断是否跳过 VLM
-            stream_id = extract_stream_id(message_info)
-            skip_vlm_types = self._skip_vlm_media_types_for_stream(
-                stream_id,
-                {"image", "emoji"},
-            )
-            if skip_vlm_types:
-                logger.debug(
-                    f"聊天流 {stream_id[:8]} 已跳过 VLM 图片识别，"
-                    f"media_types={sorted(skip_vlm_types)}；video 仍会走非原生摘要链路"
-                )
-            result = await self._recognize_media_with_manager(
-                result,
-                skip_vlm_types=skip_vlm_types,
-            )
+        message_id = message_info.get("message_id", "")
+        self._attach_validated_media(result, message_id=message_id)
 
-        # 确定消息类型
-        # 根据最终解析结果决定消息类型，比如 TEXT/IMAGE 等
+        # 根据最终解析结果决定消息类型，比如 TEXT/IMAGE 等。
         message_type = self._infer_message_type(result)
-
-        # 构建内容
         content = self._build_content(result, message_type)
 
-        # 提取用户/群信息
-        # 提取发送者及群组信息，注意 user_info 可能为空，因此使用空 dict 作为 fallback
+        # 提取发送者及群组信息，user_info 可能为空。
         user_info = message_info.get("user_info") or {}
         group_info = message_info.get("group_info")
         group_id = group_info.get("group_id") if group_info else None
         group_name = group_info.get("group_name") if group_info else None
 
-        # 提取发送者角色（UserRole 枚举转字符串）
         raw_role = user_info.get("role")
         sender_role: str | None = None
         if raw_role is not None:
             sender_role = raw_role.value
 
-        # 提取 extra 元数据。附加字段允许上层扩展，但不能覆盖 Message 核心构造字段。
+        # 显式合并 extra，避免 canonical 字段与 legacy 兼容字段成为重复关键字。
         extra_data = self._sanitize_extra_data(message_info.get("extra") or {})
-        
+        extra_data.update(
+            {
+                "media": result.media,
+                "at_users": result.at_users,
+                "unknown_segments": result.unknown_segments,
+                "group_id": group_id,
+                "group_name": group_name,
+            }
+        )
+        if result.media_errors:
+            extra_data["media_errors"] = result.media_errors
+
         return Message(
-            message_id=message_info.get("message_id", ""),
+            message_id=message_id,
             time=message_info.get("time", time.time()),
             reply_to=result.reply_to,
             content=content,
@@ -223,13 +275,35 @@ class MessageConverter:
             chat_type=infer_chat_type(message_info),
             stream_id=extract_stream_id(message_info),
             raw_data=envelope.get("raw_message"),
-            media=result.media,
-            at_users=result.at_users,
-            unknown_segments=result.unknown_segments,
-            group_id=group_id,
-            group_name=group_name,
-            **extra_data,
+            attachments=result.attachments,
+            extra=extra_data,
         )
+
+    @staticmethod
+    def _attach_validated_media(result: _ParseResult, *, message_id: Any) -> None:
+        source_message_id = (
+            message_id
+            if isinstance(message_id, str) and message_id.strip()
+            else None
+        )
+        for index, item in enumerate(result.media):
+            media_type = str(item.get("type", "unknown"))
+            try:
+                attachment = MediaAttachment.from_legacy(
+                    item,
+                    source_message_id=source_message_id,
+                )
+            except Exception as exc:
+                error_name = type(exc).__name__
+                result.media_errors.append(
+                    {"index": index, "type": media_type, "error": error_name}
+                )
+                logger.warning(
+                    f"媒体附件验证失败 (index={index}, type={media_type}, "
+                    f"error={error_name})"
+                )
+                continue
+            result.attachments.append(attachment)
 
     @staticmethod
     def _sanitize_extra_data(extra_data: Any) -> dict[str, Any]:
@@ -261,21 +335,8 @@ class MessageConverter:
         if text:
             seg_list.append({"type": "text", "data": text})
 
-        # 去重：对 seg_list 中已有的媒体段建 key 集合，避免主媒体重复追加
-        media_seed = {
-            (str(seg.get("type", "")), str(seg.get("data", "")))
-            for seg in seg_list
-            if isinstance(seg, dict) and seg.get("type") != "text"
-        }
-
-        primary_media = self._extract_primary_outbound_media(message)
-        if primary_media:
-            key = (str(primary_media.get("type", "")), str(primary_media.get("data", "")))
-            if key not in media_seed:
-                media_seed.add(key)
-                seg_list.append(primary_media)
-
-        seg_list.extend(self._collect_outbound_media_segments(message, seed=media_seed))
+        # canonical 附件优先；descriptor-only 附件不物化、不发送，也不阻断 legacy 回退。
+        seg_list.extend(self._collect_outbound_media_segments(message))
 
         # 万一消息内容完全为空，至少构造一个空文本段，以避免适配器解析异常
         if not seg_list:
@@ -392,46 +453,140 @@ class MessageConverter:
         return ""
 
     @staticmethod
+    def _find_outbound_media_source(
+        raw_value: dict[str, Any],
+        source_keys: tuple[str, ...],
+    ) -> str:
+        """Find a source in one priority class without crossing into another."""
+        for key in source_keys:
+            candidate = raw_value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+
+        traversal_keys = (
+            "data",
+            "base64",
+            "image_base64",
+            "audio_base64",
+            "voice_base64",
+            "video_base64",
+            "source",
+            "image_url",
+            "path",
+            "file",
+            "file_path",
+            "filePath",
+            "url",
+            "uri",
+            "src",
+            "file_url",
+            "download_url",
+            "downloadUrl",
+        )
+        for key in traversal_keys:
+            candidate = raw_value.get(key)
+            if not isinstance(candidate, dict):
+                continue
+            nested = MessageConverter._find_outbound_media_source(
+                candidate,
+                source_keys,
+            )
+            if nested:
+                return nested
+        return ""
+
+    @staticmethod
     def _normalize_outbound_media_value(media_type: str, raw_value: Any) -> str:
-        """把媒体值规范成适合发送到 Napcat 的形式。"""
+        """提取出站媒体 source；始终优先使用内联数据而非路径或 URL。"""
         value = ""
         if isinstance(raw_value, str):
             value = raw_value.strip()
         elif isinstance(raw_value, dict):
-            keys = ("path", "file", "url", "data", "base64") if media_type != "file" else (
+            inline_keys = (
+                "data",
+                "base64",
+                "image_base64",
+                "audio_base64",
+                "voice_base64",
+                "video_base64",
+            )
+            external_keys = (
                 "path",
                 "file",
+                "file_path",
+                "filePath",
                 "url",
+                "uri",
+                "src",
+                "file_url",
+                "download_url",
+                "downloadUrl",
             )
-            for key in keys:
-                candidate = raw_value.get(key)
-                if isinstance(candidate, str) and candidate.strip():
-                    value = candidate.strip()
-                    break
-                if isinstance(candidate, dict):
-                    nested = MessageConverter._normalize_outbound_media_value(
-                        media_type,
-                        candidate,
-                    )
-                    if nested:
-                        value = nested
-                        break
+            value = MessageConverter._find_outbound_media_source(
+                raw_value,
+                inline_keys,
+            ) or MessageConverter._find_outbound_media_source(
+                raw_value,
+                external_keys,
+            )
         if not value:
             return ""
 
         if media_type != "file":
             if value.startswith("base64://"):
-                value = value[len("base64://") :]
-            elif value.startswith("base64|"):
-                value = value[len("base64|") :]
-            elif value.startswith("data:") and "base64," in value:
-                value = value.split("base64,", 1)[1]
-
+                return value[len("base64://") :]
+            if value.startswith("base64|"):
+                return value[len("base64|") :]
+            if value.startswith("data:") and "base64," in value:
+                return value.split("base64,", 1)[1]
         return value
+
+    @staticmethod
+    def _outbound_media_key(media_type: str, value: str) -> tuple[str, str]:
+        """为 canonical/legacy 媒体构造不包含 body 的稳定去重键。"""
+        encoded_value = value
+        if encoded_value.startswith("base64://"):
+            encoded_value = encoded_value[len("base64://") :]
+        elif encoded_value.startswith("base64|"):
+            encoded_value = encoded_value[len("base64|") :]
+        elif encoded_value.startswith("data:") and "base64," in encoded_value:
+            encoded_value = encoded_value.split("base64,", 1)[1]
+
+        try:
+            decoded = base64.b64decode(encoded_value, validate=True)
+        except (ValueError, binascii.Error):
+            digest = hashlib.sha256(
+                value.encode("utf-8", errors="surrogatepass")
+            ).hexdigest()
+        else:
+            digest = hashlib.sha256(decoded).hexdigest()
+        return media_type, digest
+
+    @classmethod
+    def _outbound_media_keys(
+        cls,
+        media_type: str,
+        raw_value: Any,
+        normalized: str,
+    ) -> set[tuple[str, str]]:
+        """同时索引首选 source 与 legacy 字典中的 inline source。"""
+        keys = {cls._outbound_media_key(media_type, normalized)}
+        if not isinstance(raw_value, dict):
+            return keys
+
+        for field in ("data", "base64", "audio_base64", "voice_base64"):
+            candidate = raw_value.get(field)
+            if isinstance(candidate, str) and candidate.strip():
+                keys.add(cls._outbound_media_key(media_type, candidate.strip()))
+            elif isinstance(candidate, dict):
+                nested = cls._normalize_outbound_media_value(media_type, candidate)
+                if nested:
+                    keys.update(cls._outbound_media_keys(media_type, candidate, nested))
+        return keys
 
     @classmethod
     def _extract_primary_outbound_media(cls, message: Message) -> SegPayload | None:
-        """提取主媒体段（image/emoji/voice/video/file）。"""
+        """提取主 legacy 媒体段（image/emoji/voice/video/file）。"""
         media_type = message.message_type.value
         if message.message_type not in {
             MessageType.IMAGE,
@@ -442,14 +597,43 @@ class MessageConverter:
         }:
             return None
 
-        content = message.content
-        normalized = cls._normalize_outbound_media_value(media_type, content)
-        if not normalized and isinstance(content, dict):
-            normalized = cls._normalize_outbound_media_value(media_type, content)
-        if not normalized:
+        # Converter 入站消息把媒体统一放在 content.media；这里不再把整个容器
+        # 猜成“主媒体”，否则验证失败的 adapter source 会绕过逐项隔离。
+        if isinstance(message.content, dict) and isinstance(
+            message.content.get("media"),
+            list,
+        ):
             return None
 
+        normalized = cls._normalize_outbound_media_value(media_type, message.content)
+        if not normalized:
+            return None
         return {"type": media_type, "data": normalized}
+
+    @staticmethod
+    def _rejected_legacy_media(message: Message) -> dict[int, str]:
+        """Return converter-rejected legacy indexes without trusting arbitrary shapes."""
+        errors = message.extra.get("media_errors")
+        if not isinstance(errors, list):
+            return {}
+
+        rejected: dict[int, str] = {}
+        for error in errors:
+            if not isinstance(error, dict):
+                continue
+            index = error.get("index")
+            media_type = error.get("type")
+            if (
+                isinstance(index, int)
+                and not isinstance(index, bool)
+                and index >= 0
+                and isinstance(media_type, str)
+                and media_type.strip()
+                and isinstance(error.get("error"), str)
+                and error["error"].strip()
+            ):
+                rejected[index] = media_type.strip().lower()
+        return rejected
 
     @classmethod
     def _collect_outbound_media_segments(
@@ -458,34 +642,62 @@ class MessageConverter:
         *,
         seed: set[tuple[str, str]] | None = None,
     ) -> list[SegPayload]:
-        """收集附加媒体段，来源包括 content.media 和 extra.media。"""
+        """按 canonical、主 legacy、content.media、extra.media 的顺序收集媒体。"""
         collected: list[SegPayload] = []
-        seen: set[tuple[str, str]] = set(seed or set())
+        seen = {
+            cls._outbound_media_key(media_type, value)
+            for media_type, value in (seed or set())
+        }
 
-        def add(media_type: str, raw_value: Any) -> None:
-            normalized = cls._normalize_outbound_media_value(media_type, raw_value)
+        for attachment in message.attachments:
+            if attachment.media_ref.data is None:
+                continue
+            legacy = attachment.to_legacy()
+            media_type = attachment.segment_type.value
+            normalized = cls._normalize_outbound_media_value(media_type, legacy)
             if not normalized:
-                return
-            key = (media_type, normalized)
+                continue
+            key = (media_type, attachment.media_ref.sha256)
             if key in seen:
-                return
+                continue
             seen.add(key)
             collected.append({"type": media_type, "data": normalized})
 
-        if isinstance(message.content, dict):
-            media_list = message.content.get("media")
-            if isinstance(media_list, list):
-                for item in media_list:
-                    if not isinstance(item, dict):
-                        continue
-                    add(str(item.get("type", "unknown")).lower(), item)
+        def add(media_type: str, raw_value: Any) -> None:
+            normalized_type = media_type.lower()
+            normalized = cls._normalize_outbound_media_value(
+                normalized_type,
+                raw_value,
+            )
+            if not normalized:
+                return
+            keys = cls._outbound_media_keys(normalized_type, raw_value, normalized)
+            if keys & seen:
+                return
+            seen.update(keys)
+            collected.append({"type": normalized_type, "data": normalized})
 
-        media_list = message.extra.get("media", [])
-        if isinstance(media_list, list):
-            for item in media_list:
+        primary = cls._extract_primary_outbound_media(message)
+        if primary is not None:
+            add(str(primary.get("type", "unknown")), message.content)
+
+        rejected = cls._rejected_legacy_media(message)
+
+        def add_legacy_list(media_list: Any) -> None:
+            if not isinstance(media_list, list):
+                return
+            for index, item in enumerate(media_list):
                 if not isinstance(item, dict):
                     continue
-                add(str(item.get("type", "unknown")).lower(), item)
+                media_type = str(item.get("type", "unknown")).lower()
+                if rejected.get(index) == media_type:
+                    continue
+                add(media_type, item)
+
+        if isinstance(message.content, dict):
+            add_legacy_list(message.content.get("media"))
+
+        add_legacy_list(message.extra.get("media", []))
 
         return collected
 
@@ -505,7 +717,7 @@ class MessageConverter:
         """
         result = _ParseResult()
 
-        if depth >= _MAX_NESTING_DEPTH:
+        if depth > _MAX_NESTING_DEPTH:
             logger.warning(f"SegPayload 嵌套深度超过 {_MAX_NESTING_DEPTH} 层，截断")
             result.text_parts.append("[嵌套内容过深]")
             return result
@@ -514,9 +726,12 @@ class MessageConverter:
             try:
                 # 每个段交给单段处理器；异常不会中断整个列表解析
                 self._parse_single_segment(seg, result, depth)
-            except Exception as e:
+            except Exception as exc:
                 seg_type = seg.get("type", "unknown") if isinstance(seg, dict) else "invalid"
-                logger.warning(f"解析消息段失败 (type={seg_type}): {e}")
+                error_name = type(exc).__name__
+                logger.warning(
+                    f"解析消息段失败 (type={seg_type}, error={error_name})"
+                )
                 # 记录错误位置，避免丢失整体文本结构
                 result.text_parts.append(f"[解析失败:{seg_type}]")
 
@@ -542,6 +757,7 @@ class MessageConverter:
 
         seg_type: str = seg.get("type", "")
         data = seg.get("data", "")
+        media_count = len(result.media)
 
         # 分发到专用 handler，便于各类型段独立演进
         match seg_type:
@@ -567,6 +783,12 @@ class MessageConverter:
                 # 未知类型统一记录，后续可能用于统计或插件扩展
                 self._handle_unknown(seg_type, data, result)
 
+        if seg_type in _MEDIA_SEGMENT_TYPES and len(result.media) > media_count:
+            media_item = result.media[-1]
+            for key, value in seg.items():
+                if key not in {"type", "data"}:
+                    media_item[key] = _safe_copy_media_data(value)
+
     # ─── 段处理器 ─────────────────────────────
 
     @staticmethod
@@ -582,46 +804,27 @@ class MessageConverter:
 
     @staticmethod
     def _handle_image(data: Any, result: _ParseResult) -> None:
-        """处理图片段（适配器已编码为 base64）。
-        
-        如果启用了 VLM，会尝试识别图片内容并添加到文本中。
-        """
+        """保留图片 legacy 数据并添加占位符。"""
         if isinstance(data, str):
-            normalized_data = normalize_base64(data)
-            result.media.append({
-                "type": "image",
-                "data": normalized_data,
-            })
-            
-            # 添加图片描述占位符，等待异步识别
-            result.text_parts.append("[图片]")
-        elif isinstance(data, list):
-            # data 是嵌套段 — 不常见，但规范允许
-            result.media.append({"type": "image", "data": str(data)})
-            result.text_parts.append("[图片]")
+            media_data: Any = normalize_base64(data)
+        else:
+            media_data = _safe_copy_media_data(data)
+        result.media.append({"type": "image", "data": media_data})
+        result.text_parts.append("[图片]")
 
     @staticmethod
-    def _handle_emoji( data: Any, result: _ParseResult) -> None:
-        """处理表情包段（适配器已编码为 base64）。
-        
-        如果启用了 VLM，会尝试识别表情包内容并添加到文本中。
-        """
+    def _handle_emoji(data: Any, result: _ParseResult) -> None:
+        """保留表情包 legacy 数据并添加占位符。"""
         if isinstance(data, str):
-            normalized_data = normalize_base64(data)
-            result.media.append({
-                "type": "emoji",
-                "data": normalized_data,
-            })
-            
-            # 表情包同样支持 VLM 识别，文本先占位
-            result.text_parts.append("[表情包]")
-        elif isinstance(data, list):
-            result.media.append({"type": "emoji", "data": str(data)})
-            result.text_parts.append("[表情包]")
+            media_data: Any = normalize_base64(data)
+        else:
+            media_data = _safe_copy_media_data(data)
+        result.media.append({"type": "emoji", "data": media_data})
+        result.text_parts.append("[表情包]")
 
     @staticmethod
     def _handle_voice(data: Any, result: _ParseResult) -> None:
-        """处理语音段（适配器已编码为 base64）。"""
+        """保留语音 legacy 数据并添加占位符。"""
         if isinstance(data, str):
             result.media.append({
                 "type": "voice",
@@ -630,70 +833,50 @@ class MessageConverter:
             result.text_parts.append("[语音]")
             return
 
-        if isinstance(data, dict):
-            normalized = dict(data)
-            for key in ("base64", "data", "audio_base64"):
+        normalized = _safe_copy_media_data(data)
+        if isinstance(normalized, dict):
+            for key in ("base64", "data", "audio_base64", "voice_base64"):
                 value = normalized.get(key)
                 if isinstance(value, str) and value.strip():
                     normalized[key] = normalize_base64(value)
                     break
-            result.media.append({
-                "type": "voice",
-                "data": normalized,
-            })
             filename = normalized.get("filename") or normalized.get("name")
             result.text_parts.append(f"[语音文件:{filename}]" if filename else "[语音]")
-            return
+        else:
+            result.text_parts.append("[语音]")
+        result.media.append({"type": "voice", "data": normalized})
 
     @staticmethod
     def _handle_video(data: Any, result: _ParseResult) -> None:
-        """处理视频段。
-
-        目前视频会走“非原生摘要链路”，因此这里先保留原始视频数据并打占位符。
-        """
-        if isinstance(data, dict):
-            result.media.append({
-                "type": "video",
-                "data": data,
-            })
-            result.text_parts.append("[视频]")
-            return
-
+        """保留视频 legacy 数据并添加占位符。"""
         if isinstance(data, str):
-            result.media.append({
-                "type": "video",
-                "data": {"base64": normalize_base64(data)},
-            })
-            result.text_parts.append("[视频]")
-            return
-
-        result.media.append({"type": "video", "data": data})
+            media_data: Any = {"base64": normalize_base64(data)}
+        else:
+            media_data = _safe_copy_media_data(data)
+        result.media.append({"type": "video", "data": media_data})
         result.text_parts.append("[视频]")
 
     @staticmethod
     def _handle_file(data: Any, result: _ParseResult) -> None:
-        """处理文件段。
-
-        data 可能是 JSON 字符串或已解析的字典。
-        """
-        parsed = data
-        if isinstance(data, str):
-            parsed = safe_json_loads(data)
+        """保真复制文件字段，并补齐兼容的 name/size/id aliases。"""
+        parsed = safe_json_loads(data) if isinstance(data, str) else data
 
         if isinstance(parsed, dict):
-            result.media.append({
-                "type": "file",
-                "data": {
-                    "name": parsed.get("name") or parsed.get("file", ""),
-                    "size": parsed.get("size") or parsed.get("file_size"),
-                    "id": parsed.get("id") or parsed.get("file_id"),
-                },
-            })
-            file_name = parsed.get("name") or parsed.get("file", "文件")
+            preserved = _safe_copy_media_data(parsed)
+            preserved.setdefault(
+                "name",
+                parsed.get("name") or parsed.get("filename") or parsed.get("file", ""),
+            )
+            preserved.setdefault("size", parsed.get("size") or parsed.get("file_size"))
+            preserved.setdefault("id", parsed.get("id") or parsed.get("file_id"))
+            result.media.append({"type": "file", "data": preserved})
+            file_name = preserved.get("name") or preserved.get("filename") or "文件"
             result.text_parts.append(f"[文件:{file_name}]")
         else:
-            # 无法解析结构，保留原始信息
-            result.media.append({"type": "file", "data": parsed})
+            result.media.append({
+                "type": "file",
+                "data": _safe_copy_media_data(parsed),
+            })
             result.text_parts.append("[文件]")
 
     @staticmethod
@@ -736,7 +919,7 @@ class MessageConverter:
                 result.reply_to = data
             result.text_parts.append(f"[回复:{data}]")
         elif isinstance(data, list):
-            # 嵌套段：递归解析
+            # 嵌套段：递归解析；回复文本需要包裹，其他聚合字段完整合并。
             inner = self._parse_segments(data, depth + 1)
             if not result.reply_to:
                 result.reply_to = inner.reply_to
@@ -745,9 +928,11 @@ class MessageConverter:
                 result.text_parts.append(f"「回复：{inner_text}」")
             else:
                 result.text_parts.append("[回复]")
-            # 合并媒体等内容
             result.media.extend(inner.media)
+            result.attachments.extend(inner.attachments)
+            result.media_errors.extend(inner.media_errors)
             result.at_users.extend(inner.at_users)
+            result.unknown_segments.extend(inner.unknown_segments)
 
     def _handle_seglist(
         self,
@@ -793,151 +978,6 @@ class MessageConverter:
         }
 
         return type_mapping.get(first_media_type, MessageType.UNKNOWN)
-
-    async def _recognize_media_with_manager(
-        self,
-        result: _ParseResult,
-        *,
-        skip_vlm_types: set[str] | None = None,
-    ) -> _ParseResult:
-        """使用 MediaManager 识别媒体内容（图片、表情包、语音、视频）并更新文本描述。
-        
-        Args:
-            result: 解析结果
-            skip_vlm_types: 要跳过 VLM 文本识别的媒体类型
-            
-        Returns:
-            更新后的解析结果
-        """
-        try:
-            # 延迟导入避免循环依赖
-            from src.core.managers.media_manager import get_media_manager
-            
-            manager = get_media_manager()
-            skip_vlm_types = skip_vlm_types or set()
-            
-            image_descriptions: list[str | None] = []
-            emoji_descriptions: list[str | None] = []
-            voice_descriptions: list[str | None] = []
-            video_descriptions: list[str | None] = []
-
-            has_recognition_target = False
-            for media in result.media:
-                media_type = str(media.get("type", ""))
-                if media_type in ("image", "emoji"):
-                    has_recognition_target = True
-                    if media_type in skip_vlm_types:
-                        if media_type == "image":
-                            image_descriptions.append(None)
-                        else:
-                            emoji_descriptions.append(None)
-                        continue
-                    try:
-                        description = await manager.recognize_media(
-                            media["data"],
-                            media_type,
-                            use_cache=True,
-                        )
-                    except Exception as e:
-                        logger.warning(f"识别{media_type}失败: {e}")
-                        description = None
-
-                    if media_type == "image":
-                        image_descriptions.append(description)
-                    else:
-                        emoji_descriptions.append(description)
-                elif media_type == "voice":
-                    has_recognition_target = True
-                    try:
-                        description = await manager.recognize_voice(
-                            media.get("data"),
-                            use_cache=True,
-                        )
-                    except Exception as e:
-                        logger.warning(f"识别 voice 失败: {e}")
-                        description = None
-                    voice_descriptions.append(description)
-                elif media_type == "video":
-                    has_recognition_target = True
-                    try:
-                        description = await manager.recognize_video(
-                            media.get("data"),
-                            use_cache=True,
-                        )
-                    except Exception as e:
-                        logger.warning(f"识别 video 失败: {e}")
-                        description = None
-                    video_descriptions.append(description)
-
-            # 早退策略：没有待识别媒体就直接返回原结果
-            if not has_recognition_target:
-                return result
-
-            # 将识别结果应用回 text_parts，按占位符顺序替换
-            new_text_parts = []
-            image_idx = 0
-            emoji_idx = 0
-            voice_idx = 0
-            video_idx = 0
-            for part in result.text_parts:
-                if part == "[图片]":
-                    description = image_descriptions[image_idx] if image_idx < len(image_descriptions) else None
-                    image_idx += 1
-                    new_text_parts.append(f"[图片:{description}]" if description else part)
-                elif part == "[表情包]":
-                    description = emoji_descriptions[emoji_idx] if emoji_idx < len(emoji_descriptions) else None
-                    emoji_idx += 1
-                    new_text_parts.append(f"[表情包:{description}]" if description else part)
-                elif part == "[语音]" or part.startswith("[语音文件:"):
-                    description = voice_descriptions[voice_idx] if voice_idx < len(voice_descriptions) else None
-                    voice_idx += 1
-                    if description:
-                        if part.startswith("[语音文件:") and part.endswith("]"):
-                            new_text_parts.append(f"{part[:-1]} | {description}]")
-                        else:
-                            new_text_parts.append(f"[语音:{description}]")
-                    else:
-                        new_text_parts.append(part)
-                elif part == "[视频]":
-                    description = video_descriptions[video_idx] if video_idx < len(video_descriptions) else None
-                    video_idx += 1
-                    new_text_parts.append(f"[视频:{description}]" if description else part)
-                else:
-                    new_text_parts.append(part)
-            
-            result.text_parts = new_text_parts
-            
-        except Exception as e:
-            # 如果整个识别流程失败，不应阻止消息继续处理，仅记录错误
-            logger.error(f"MediaManager 识别失败: {e}", exc_info=True)
-        
-        return result
-    
-    @staticmethod
-    def _skip_vlm_media_types_for_stream(
-        stream_id: str,
-        media_types: set[str],
-    ) -> set[str]:
-        """返回指定聊天流已注册跳过 VLM 识别的媒体类型。
-
-        Args:
-            stream_id: 聊天流 ID
-            media_types: 待检查媒体类型
-
-        Returns:
-            已注册跳过的媒体类型集合
-        """
-        try:
-            from src.core.managers.media_manager import get_media_manager
-
-            manager = get_media_manager()
-            return {
-                media_type
-                for media_type in media_types
-                if manager.should_skip_vlm(stream_id, media_type)
-            }
-        except Exception:
-            return set()
 
     @staticmethod
     def _build_content(result: _ParseResult, message_type: MessageType) -> str | Any:

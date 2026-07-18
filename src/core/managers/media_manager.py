@@ -24,6 +24,7 @@ import io
 import shutil
 import time
 from collections import OrderedDict, deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from tempfile import TemporaryDirectory
 from pathlib import Path
@@ -38,7 +39,6 @@ from src.core.prompt import PromptTemplate, get_prompt_manager
 from src.core.config import get_core_config
 from src.core.utils.base64_helper import base64_decode_to_bytes
 from src.kernel.concurrency import get_task_manager
-from src.kernel.scheduler import get_unified_scheduler, TriggerType
 from src.kernel.db.core.session import get_db_session
 from src.core.models.sql_alchemy import Images, ImageDescriptions
 from src.kernel.llm import LLMContextManager, LLMPayload, ROLE, Text, Image, Audio
@@ -122,17 +122,13 @@ class MediaManager:
         self._audio_understanding_model_set = None
         self._vlm_available = False
         self._voice_available = False
-        self._skip_vlm_stream_ids: set[str] = set()  # 已注册跳过所有 VLM 识别的聊天流 ID
-        self._skip_vlm_media_types_by_stream: dict[str, set[str]] = {}
         self._media_chain_stats = MediaChainStats()
         self._media_stats_lock = ThreadLock()
         self._recognition_locks: OrderedDict[str, asyncio.Lock] = OrderedDict()
+        self._recognition_lock_users: dict[str, int] = {}
         self._initialize_vlm()
         self._initialize_asr()
         self._register_prompts()
-        self._setup_media_folders()
-        self._cleanup_task_id = None
-        self._start_cleanup_scheduler()
 
     def _initialize_vlm(self) -> None:
         """初始化 VLM/视频/ASR 模型配置。"""
@@ -214,165 +210,26 @@ class MediaManager:
         except Exception as e:
             logger.warning(f"注册提示词模板失败: {e}")
 
-    def _setup_media_folders(self) -> None:
-        """设置媒体文件夹结构。"""
-        try:
-            # 媒体根目录
-            self.media_root = Path("data/media_cache")
-            
-            # 子文件夹
-            self.pending_folder = self.media_root / "pending"  # 待识别
-            self.images_folder = self.media_root / "images"    # 识别完成的图片
-            self.emojis_folder = self.media_root / "emojis"    # 识别完成的表情包
-            
-            # 创建所有必要的文件夹
-            for folder in [self.pending_folder, self.images_folder, self.emojis_folder]:
-                folder.mkdir(parents=True, exist_ok=True)
-            
-            logger.info(f"媒体文件夹已初始化: {self.media_root}")
-        except Exception as e:
-            logger.error(f"创建媒体文件夹失败: {e}")
-
-    def _start_cleanup_scheduler(self) -> None:
-        """启动定时清理任务（每5分钟清理一次缓存）。"""
-        try:
-            # 延迟导入，避免循环依赖
-            # 确保在异步上下文中创建任务
-            asyncio.create_task(self._register_cleanup_task())
-            
-            logger.info("媒体缓存清理调度器已启动(每5分钟)")
-        except Exception as e:
-            logger.error(f"启动清理调度器失败: {e}")
-
-    async def _register_cleanup_task(self) -> None:
-        """注册定时清理任务到调度器。"""
-        try:
-            scheduler = get_unified_scheduler()
-            
-            # 创建周期性清理任务（每5分钟 = 300秒）
-            schedule_id = await scheduler.create_schedule(
-                callback=self._cleanup_pending_folder,
-                trigger_type=TriggerType.TIME,
-                trigger_config={"delay_seconds": 300},  # 5分钟
-                is_recurring=True,
-                task_name="media_cache_cleanup"
-            )
-            
-            self._cleanup_task_id = schedule_id
-            logger.info(f"媒体缓存清理任务已注册: {schedule_id}")
-        except Exception as e:
-            logger.error(f"注册清理任务失败: {e}")
-
-    async def _cleanup_pending_folder(self) -> None:
-        """清理待识别文件夹中的陈旧文件。"""
-        try:
-            if not self.pending_folder.exists():
-                return
-            
-            current_time = time.time()
-            cleanup_count = 0
-            
-            # 遍历所有待识别文件
-            for file_path in self.pending_folder.iterdir():
-                if not file_path.is_file():
-                    continue
-                
-                # 获取文件修改时间
-                file_mtime = file_path.stat().st_mtime
-                
-                # 如果文件超过5分钟未处理，删除它
-                if current_time - file_mtime >= 300:  # 5分钟 = 300秒
-                    try:
-                        file_path.unlink()
-                        cleanup_count += 1
-                    except Exception as e:
-                        logger.warning(f"删除文件失败 {file_path.name}: {e}")
-            
-            if cleanup_count > 0:
-                logger.info(f"媒体缓存清理完成，删除了 {cleanup_count} 个陈旧文件")
-        except Exception as e:
-            logger.error(f"清理待识别文件夹失败: {e}")
-
-    # ──────────────────────────────────────────
-    # 公共 API：VLM 识别控制
-    # ──────────────────────────────────────────
-
+    # Legacy no-op API retained for third-party plugins. Message conversion no
+    # longer performs eager VLM recognition, so per-stream skip state is neither
+    # needed nor stored.
     def skip_vlm_for_stream(
         self,
         stream_id: str,
         media_types: list[str] | tuple[str, ...] | set[str] | None = None,
     ) -> None:
-        """注册指定聊天流跳过 VLM 识别。
-
-        调用后，该 stream_id 的消息在 MessageConverter 中将不再触发
-        指定媒体类型的 VLM 识别，媒体数据仅保留原始 base64。
-        适用于聊天流程自行处理多模态内容的场景。
-
-        Args:
-            stream_id: 要跳过 VLM 识别的聊天流 ID
-            media_types: 要跳过的媒体类型。为 None 时跳过该流全部 VLM 识别。
-        """
-        if media_types is None:
-            self._skip_vlm_stream_ids.add(stream_id)
-            self._skip_vlm_media_types_by_stream.pop(stream_id, None)
-            logger.debug(f"已注册跳过全部 VLM 识别: stream_id={stream_id[:8]}")
-            return
-
-        normalized = {str(item).strip().lower() for item in media_types if str(item).strip()}
-        if not normalized:
-            return
-        existing = self._skip_vlm_media_types_by_stream.setdefault(stream_id, set())
-        existing.update(normalized)
-        logger.debug(
-            f"已注册跳过 VLM 识别: stream_id={stream_id[:8]}, media_types={sorted(existing)}"
-        )
+        del stream_id, media_types
 
     def unskip_vlm_for_stream(
         self,
         stream_id: str,
         media_types: list[str] | tuple[str, ...] | set[str] | None = None,
     ) -> None:
-        """取消指定聊天流的 VLM 识别跳过。
-
-        Args:
-            stream_id: 要恢复 VLM 识别的聊天流 ID
-            media_types: 要恢复的媒体类型。为 None 时清除该流全部跳过配置。
-        """
-        if media_types is None:
-            self._skip_vlm_stream_ids.discard(stream_id)
-            self._skip_vlm_media_types_by_stream.pop(stream_id, None)
-            logger.debug(f"已取消跳过全部 VLM 识别: stream_id={stream_id[:8]}")
-            return
-
-        configured = self._skip_vlm_media_types_by_stream.get(stream_id)
-        if configured is None:
-            return
-        for item in media_types:
-            configured.discard(str(item).strip().lower())
-        if not configured:
-            self._skip_vlm_media_types_by_stream.pop(stream_id, None)
-        logger.debug(
-            f"已取消部分 VLM 跳过: stream_id={stream_id[:8]}, media_types={list(media_types)}"
-        )
+        del stream_id, media_types
 
     def should_skip_vlm(self, stream_id: str, media_type: str | None = None) -> bool:
-        """查询指定聊天流是否应跳过 VLM 识别。
-
-        Args:
-            stream_id: 聊天流 ID
-            media_type: 媒体类型。为 None 时只要该流存在任意跳过配置就返回 True。
-
-        Returns:
-            True 表示该聊天流已注册跳过指定 VLM 识别
-        """
-        if stream_id in self._skip_vlm_stream_ids:
-            return True
-        configured = self._skip_vlm_media_types_by_stream.get(stream_id)
-        if not configured:
-            return False
-        if media_type is None:
-            return True
-        return str(media_type).strip().lower() in configured
+        del stream_id, media_type
+        return False
 
     # ──────────────────────────────────────────
     # 公共 API：媒体识别
@@ -443,17 +300,55 @@ class MediaManager:
         except Exception:
             return len(clean.encode("utf-8"))
 
+    def _recognition_users(self) -> dict[str, int]:
+        users = getattr(self, "_recognition_lock_users", None)
+        if users is None:
+            users = {}
+            self._recognition_lock_users = users
+        return users
+
+    def _trim_recognition_locks(self, *, protected_hash: str | None = None) -> None:
+        users = self._recognition_users()
+        for candidate_hash, candidate_lock in list(self._recognition_locks.items()):
+            if len(self._recognition_locks) <= _MAX_RECOGNITION_LOCKS:
+                break
+            if (
+                candidate_hash == protected_hash
+                or candidate_lock.locked()
+                or users.get(candidate_hash, 0) > 0
+            ):
+                continue
+            self._recognition_locks.pop(candidate_hash, None)
+            users.pop(candidate_hash, None)
+
     def _get_recognition_lock(self, media_hash: str) -> asyncio.Lock:
-        """获取指定媒体哈希的去重锁（LRU 淘汰，最多保留 _MAX_RECOGNITION_LOCKS 条）。"""
+        """获取媒体去重锁；LRU 清理不淘汰持有者或排队等待者。"""
         lock = self._recognition_locks.get(media_hash)
         if lock is not None:
             self._recognition_locks.move_to_end(media_hash)
             return lock
+
         lock = asyncio.Lock()
         self._recognition_locks[media_hash] = lock
-        while len(self._recognition_locks) > _MAX_RECOGNITION_LOCKS:
-            self._recognition_locks.popitem(last=False)
+        self._trim_recognition_locks(protected_hash=media_hash)
         return lock
+
+    @asynccontextmanager
+    async def _recognition_guard(self, media_hash: str):
+        """Track lock users before they await acquisition to close the LRU race."""
+        lock = self._get_recognition_lock(media_hash)
+        users = self._recognition_users()
+        users[media_hash] = users.get(media_hash, 0) + 1
+        try:
+            async with lock:
+                yield
+        finally:
+            remaining = users.get(media_hash, 1) - 1
+            if remaining > 0:
+                users[media_hash] = remaining
+            else:
+                users.pop(media_hash, None)
+            self._trim_recognition_locks()
 
     def _extract_voice_payload(self, voice_data: str | dict[str, Any]) -> tuple[str, dict[str, Any]]:
         """提取语音 base64 数据和元信息。"""
@@ -468,67 +363,6 @@ class MediaManager:
             return voice_data, {}
 
         return "", {}
-
-    async def _resolve_voice_payload(self, voice_data: str | dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        """解析语音输入为 base64 数据。
-
-        支持适配器直接给 base64，也支持音频文件消息携带的本地路径或下载 URL。
-        """
-        base64_data, metadata = self._extract_voice_payload(voice_data)
-        if base64_data:
-            return base64_data, metadata
-
-        if not isinstance(voice_data, dict):
-            return "", metadata
-
-        for key in ("path", "file", "file_path", "local_path", "localPath", "temp_path"):
-            value = voice_data.get(key)
-            if not isinstance(value, str) or not value.strip():
-                continue
-            path_value = value.strip()
-            if path_value.startswith("file://"):
-                path_value = path_value[7:]
-            try:
-                path = Path(path_value)
-                if path.exists() and path.is_file():
-                    raw = await asyncio.to_thread(path.read_bytes)
-                    return base64.b64encode(raw).decode("utf-8"), voice_data
-            except OSError:
-                continue
-
-        for key in ("url", "file_url", "download_url", "downloadUrl", "src"):
-            value = voice_data.get(key)
-            if not isinstance(value, str) or not value.startswith(("http://", "https://")):
-                continue
-            downloaded = await self._download_media_url_as_base64(value, max_bytes=_MAX_MEDIA_DATA_BYTES)
-            if downloaded:
-                return downloaded, voice_data
-
-        return "", voice_data
-
-    async def _download_media_url_as_base64(self, url: str, *, max_bytes: int) -> str | None:
-        """下载小型媒体 URL 并编码为 base64。"""
-        try:
-            import aiohttp
-
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=30.0)) as response:
-                    if response.status != 200:
-                        logger.warning(f"媒体下载失败: status={response.status}, url={url}")
-                        return None
-                    content_length = response.headers.get("content-length")
-                    if content_length and int(content_length) > max_bytes:
-                        logger.warning(f"媒体过大，跳过下载: bytes={content_length}, url={url}")
-                        return None
-                    raw = await response.read()
-        except Exception as e:
-            logger.warning(f"媒体下载失败: {e!s}")
-            return None
-
-        if len(raw) > max_bytes:
-            logger.warning(f"媒体过大，跳过处理: bytes={len(raw)}, url={url}")
-            return None
-        return base64.b64encode(raw).decode("utf-8")
 
     async def recognize_media(
         self, 
@@ -571,8 +405,7 @@ class MediaManager:
                 )
                 return None
 
-            lock = self._get_recognition_lock(media_hash)
-            async with lock:
+            async with self._recognition_guard(media_hash):
                 # 尝试从缓存读取
                 if use_cache:
                     cached_description = await self._get_cached_description(
@@ -599,14 +432,6 @@ class MediaManager:
                     media_type=media_type,
                 )
 
-                # 保存到待识别文件夹
-                pending_file_path = await self._save_to_pending(
-                    base64_data,
-                    media_hash,
-                    media_type
-                )
-
-                # VLM 识别
                 description = await self._recognize_with_vlm(base64_data, media_type)
 
                 if description:
@@ -614,39 +439,26 @@ class MediaManager:
                         event="success",
                         media_type=media_type,
                     )
-                    # 保存到缓存
                     await self._save_description_cache(
                         media_hash,
                         media_type,
-                        description
+                        description,
                     )
-                    logger.info(f"成功识别{media_type}: {description[:50]}...")
-
-                    # 移动到对应的分类文件夹
-                    await self._move_to_category_folder(
-                        pending_file_path,
-                        media_type,
-                        media_hash
-                    )
-
-                    # 保存媒体信息到数据库
-                    target_folder = self.images_folder if media_type == "image" else self.emojis_folder
-                    target_file_path = target_folder / pending_file_path.name
                     await self.save_media_info(
                         media_hash=media_hash,
                         media_type=media_type,
-                        file_path=str(target_file_path),
+                        file_path=None,
                         description=description,
-                        vlm_processed=True
+                        vlm_processed=True,
                     )
+                    logger.info(f"成功识别{media_type}: {description[:50]}...")
                 else:
                     await self._record_media_event(
                         event="failure",
                         media_type=media_type,
                         failure_type="recognize_failed",
                     )
-                    # 识别失败，保持在待识别文件夹，等待定时清理
-                    logger.warning(f"识别失败，文件保留在待识别文件夹: {pending_file_path.name}")
+                    logger.warning(f"{media_type} 识别失败，未保留原始媒体")
 
                 return description
             
@@ -664,12 +476,13 @@ class MediaManager:
         voice_data: str | dict[str, Any],
         use_cache: bool = True,
     ) -> str | None:
-        """理解语音/音频内容并返回摘要文本。
+        """理解已内联的语音/音频并返回摘要文本。
 
-        优先使用原生 Audio 多模态模型理解音频；失败时才回退到 ASR 转写。
+        本方法不读取本地路径也不下载 URL；入口必须先提供内联媒体数据。
+        优先使用原生 Audio 模型理解音频，失败时回退到 ASR 转写。
         """
         try:
-            base64_data, metadata = await self._resolve_voice_payload(voice_data)
+            base64_data, metadata = self._extract_voice_payload(voice_data)
             if not base64_data:
                 return None
 
@@ -692,8 +505,7 @@ class MediaManager:
                 )
                 return None
 
-            lock = self._get_recognition_lock(voice_hash)
-            async with lock:
+            async with self._recognition_guard(voice_hash):
                 if use_cache:
                     cached_description = await self._get_cached_description(
                         voice_hash,
@@ -825,8 +637,7 @@ class MediaManager:
                 )
                 return None
 
-            lock = self._get_recognition_lock(video_hash)
-            async with lock:
+            async with self._recognition_guard(video_hash):
                 if use_cache:
                     cached = await self._get_cached_description(video_hash, "video")
                     if cached:
@@ -934,7 +745,8 @@ class MediaManager:
                     # 更新现有记录
                     existing.count += 1
                     existing.image_id = media_hash
-                    existing.path = resolved_path
+                    if isinstance(file_path, str) and file_path.strip():
+                        existing.path = resolved_path
                     existing.type = media_type
                     existing.timestamp = time.time()
                     if description:
@@ -1058,16 +870,19 @@ class MediaManager:
                 context_manager=context_manager,
             )
 
-            # 从提示词管理器获取提示词模板
-            prompt_manager = get_prompt_manager()
+            # 提示词模板缺失时仍保留可用的识别指令。
             if media_type == "emoji":
-                template = prompt_manager.get_template("media.emoji_recognition")
+                prompt = "请简要描述这个表情包的内容和含义，用一句话概括。"
+                template_name = "media.emoji_recognition"
             else:
-                template = prompt_manager.get_template("media.image_recognition")
-            
-            # 构建提示词（模板不需要参数，直接build）
+                prompt = "描述这张图片的内容，包含主题、主要元素。若有文字或代码，完整转述。"
+                template_name = "media.image_recognition"
+            prompt_manager = get_prompt_manager()
+            template = prompt_manager.get_template(template_name)
             if template:
-                prompt = await template.build()
+                built_prompt = await template.build()
+                if str(built_prompt or "").strip():
+                    prompt = str(built_prompt).strip()
 
             # 处理 base64 数据：提取纯净的 base64 内容，并尽量保留原始 MIME
             clean_base64 = self._extract_clean_base64(base64_data)
@@ -1422,7 +1237,9 @@ class MediaManager:
                 data = data.split("base64,", 1)[1]
         elif data.startswith("base64|"):
             data = data[7:]
-        
+        elif data.startswith("base64://"):
+            data = data[len("base64://") :]
+
         # 移除可能的换行符和空格
         data = data.replace("\n", "").replace("\r", "").replace(" ", "")
         
@@ -1509,98 +1326,15 @@ class MediaManager:
 
         return "", {}
     
-    async def _save_to_pending(
-        self,
-        base64_data: str,
-        media_hash: str,
-        media_type: str
-    ) -> Path:
-        """保存媒体文件到待识别文件夹。
-        
-        Args:
-            base64_data: base64 编码的媒体数据
-            media_hash: 媒体哈希值
-            media_type: 媒体类型
-            
-        Returns:
-            保存的文件路径
-        """
-        try:
-            # 提取纯净的 base64 数据
-            clean_base64 = self._extract_clean_base64(base64_data)
-            
-            # 解码为二进制数据
-            binary_data = await get_task_manager().to_process(
-                base64_decode_to_bytes,
-                clean_base64,
-            )
-            
-            # 根据类型确定文件扩展名
-            ext = ".jpg" if media_type == "image" else ".png"
-            
-            # 生成文件名（哈希值前16位 + 类型标记 + 扩展名）
-            filename = f"{media_hash[:16]}_{media_type}{ext}"
-            file_path = self.pending_folder / filename
-            
-            # 写入文件
-            file_path.write_bytes(binary_data)
-            logger.debug(f"媒体已保存到待识别文件夹: {filename}")
-            
-            return file_path
-        except Exception as e:
-            logger.error(f"保存到待识别文件夹失败: {e}")
-            # 返回一个虚拟路径，不影响后续流程
-            return self.pending_folder / f"{media_hash[:16]}_error.tmp"
-
-    async def _move_to_category_folder(
-        self,
-        source_path: Path,
-        media_type: str,
-        media_hash: str
-    ) -> None:
-        """将识别完成的文件移动到对应的分类文件夹。
-        
-        Args:
-            source_path: 源文件路径（待识别文件夹中的文件）
-            media_type: 媒体类型
-            media_hash: 媒体哈希值
-        """
-        try:
-            if not source_path.exists():
-                logger.debug(f"源文件不存在，跳过移动: {source_path.name}")
-                return
-            
-            # 确定目标文件夹
-            target_folder = self.images_folder if media_type == "image" else self.emojis_folder
-            
-            # 确定目标文件名
-            target_path = target_folder / source_path.name
-            
-            # 如果目标文件已存在，删除源文件即可（去重）
-            if target_path.exists():
-                source_path.unlink()
-                logger.debug(f"目标文件已存在，删除源文件: {source_path.name}")
-                return
-            
-            # 移动文件
-            source_path.rename(target_path)
-            logger.debug(f"文件已移动到 {media_type} 文件夹: {target_path.name}")
-        except Exception as e:
-            logger.error(f"移动文件失败: {e}")
-
     @staticmethod
     def _compute_hash(data: str) -> str:
-        """计算数据的 SHA256 哈希值。
-        
-        Args:
-            data: 待哈希的数据（base64 字符串）
-            
-        Returns:
-            十六进制哈希字符串
-        """
-        # 使用提取的纯净 base64 数据计算哈希
+        """按解码后的原始媒体字节计算 SHA256。"""
         clean_data = MediaManager._extract_clean_base64(data)
-        return hashlib.sha256(clean_data.encode()).hexdigest()
+        try:
+            raw = base64.b64decode(clean_data, validate=True)
+        except Exception:
+            raw = clean_data.encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
 
 
 # ──────────────────────────────────────────
