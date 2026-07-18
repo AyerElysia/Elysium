@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
+from src.kernel.llm.exceptions import LLMConfigurationError
 from src.kernel.llm.model_client.base import ChatModelClient, StreamEvent
-from src.kernel.llm.model_client.openai_client import OpenAIChatClient, _image_to_data_url, _is_data_url, _payloads_to_openai_messages
+from src.kernel.llm.model_client.openai_client import (
+    OpenAIChatClient,
+    _image_to_data_url,
+    _payloads_to_openai_messages,
+)
 from src.kernel.llm.model_client.registry import ModelClientRegistry
 from src.kernel.llm.payload import Image, LLMPayload, Text, ToolResult
 from src.kernel.llm.roles import ROLE
@@ -92,58 +96,29 @@ class TestStreamEvent:
 # ============================================================================
 
 
-class TestIsDataURL:
-    """Test cases for _is_data_url function."""
-
-    def test_is_data_url_with_valid_data_url(self) -> None:
-        """Test with valid data URL."""
-        assert _is_data_url("data:image/png;base64,ABC123") is True
-        assert _is_data_url("data:image/jpeg;base64,XYZ789") is True
-
-    def test_is_data_url_with_file_path(self) -> None:
-        """Test with file path."""
-        assert _is_data_url("pic.jpg") is False
-        assert _is_data_url("/path/to/image.png") is False
-
-    def test_is_data_url_with_base64_prefix(self) -> None:
-        """Test with base64| prefix."""
-        assert _is_data_url("base64|ABC123") is False
-
-    def test_is_data_url_with_empty_string(self) -> None:
-        """Test with empty string."""
-        assert _is_data_url("") is False
+_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+    "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
 
 
 class TestImageToDataURL:
-    """Test cases for _image_to_data_url function."""
+    """OpenAI serializer only accepts validated Image content."""
 
-    def test_with_base64_prefix(self) -> None:
-        """Test with base64| prefix format."""
-        b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
-        result = _image_to_data_url(f"base64|{b64}")
-        assert result.startswith("data:image/png;base64,")
-        assert b64 in result
-
-    def test_with_data_url(self) -> None:
-        """Test with existing data URL."""
-        data_url = "data:image/png;base64,ABC123"
-        result = _image_to_data_url(data_url)
-        assert result == data_url
-
-    def test_with_file_path(self, tmp_path: Path) -> None:
-        """Test with file path."""
-        # Create a temporary image file
-        img_file = tmp_path / "test.png"
-        img_data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100  # Minimal PNG
-        img_file.write_bytes(img_data)
-
-        result = _image_to_data_url(str(img_file))
+    def test_with_validated_base64_image(self) -> None:
+        image = Image(f"base64|{_PNG_BASE64}")
+        result = _image_to_data_url(image)
+        assert result == image.data_url
         assert result.startswith("data:image/png;base64,")
 
-    def test_with_nonexistent_file(self) -> None:
-        """Test with nonexistent file."""
-        with pytest.raises(FileNotFoundError, match="Image file not found"):
-            _image_to_data_url("nonexistent.jpg")
+    def test_with_validated_data_url_image(self) -> None:
+        data_url = f"data:image/png;base64,{_PNG_BASE64}"
+        image = Image(data_url)
+        assert _image_to_data_url(image) == data_url
+
+    def test_rejects_unvalidated_string(self) -> None:
+        with pytest.raises(AttributeError):
+            _image_to_data_url("/path/to/image.png")  # type: ignore[arg-type]
 
 
 class TestPayloadsToOpenAIMessages:
@@ -167,11 +142,11 @@ class TestPayloadsToOpenAIMessages:
         assert messages[0]["content"] == "You are helpful."
 
     def test_multimodal_payload(self) -> None:
-        """Test multimodal payload with text and image."""
+        """Test multimodal payload with text and validated image."""
         payloads = [
             LLMPayload(
                 ROLE.USER,
-                [Text(text="What's this?"), Image(value="base64|ABC123")],
+                [Text(text="What's this?"), Image(_PNG_BASE64)],
             )
         ]
         messages, tools = _payloads_to_openai_messages(payloads)
@@ -184,7 +159,7 @@ class TestPayloadsToOpenAIMessages:
 
     def test_tool_declaration(self) -> None:
         """Test tool declaration payload."""
-        payloads = [LLMPayload(ROLE.TOOL, Tool(tool=MockTool))]
+        payloads = [LLMPayload(ROLE.TOOL, MockTool)]
         messages, tools = _payloads_to_openai_messages(payloads)
         assert len(messages) == 0  # TOOL doesn't add messages
         assert len(tools) == 1
@@ -223,7 +198,7 @@ class TestPayloadsToOpenAIMessages:
         """Test mixing tool declarations and messages."""
         payloads = [
             LLMPayload(ROLE.SYSTEM, Text("System")),
-            LLMPayload(ROLE.TOOL, Tool(tool=MockTool)),
+            LLMPayload(ROLE.TOOL, MockTool),
             LLMPayload(ROLE.USER, Text("Hello")),
         ]
         messages, tools = _payloads_to_openai_messages(payloads)
@@ -296,7 +271,7 @@ class TestOpenAIChatClient:
         mock_response.choices = [mock_choice]
         mock_openai.chat.completions.create = AsyncMock(return_value=mock_response)
 
-        message, tool_calls, stream_iter = await client.create(
+        message, tool_calls, stream_iter, _, _ = await client.create(
             model_name="gpt-4",
             payloads=sample_payloads,
             tools=[],
@@ -335,7 +310,7 @@ class TestOpenAIChatClient:
         mock_stream = mock_stream_generator()
         mock_openai.chat.completions.create = AsyncMock(return_value=mock_stream)
 
-        message, tool_calls, stream_iter = await client.create(
+        message, tool_calls, stream_iter, _, _ = await client.create(
             model_name="gpt-4",
             payloads=sample_payloads,
             tools=[],
@@ -388,10 +363,10 @@ class TestOpenAIChatClient:
         mock_response.choices = [mock_choice]
         mock_openai.chat.completions.create = AsyncMock(return_value=mock_response)
 
-        message, tool_calls, stream_iter = await client.create(
+        message, tool_calls, stream_iter, _, _ = await client.create(
             model_name="gpt-4",
             payloads=sample_payloads,
-            tools=[Tool(tool=MockTool)],
+            tools=[MockTool],
             request_name="test",
             model_set=mock_model_config,
             stream=False,
@@ -448,7 +423,7 @@ class TestOpenAIChatClient:
             return original_import(name, *args, **kwargs)
 
         with patch("builtins.__import__", side_effect=mock_import):
-            with pytest.raises(RuntimeError, match="openai SDK 未安装"):
+            with pytest.raises(ImportError, match="No module named 'openai'"):
                 await client.create(
                     model_name="gpt-4",
                     payloads=sample_payloads,
@@ -535,8 +510,8 @@ class TestModelClientRegistry:
         client = registry.get_client_for_model(model)
         assert isinstance(client, OpenAIChatClient)
 
-    def test_get_client_with_unknown_type_falls_back_to_openai(self) -> None:
-        """Test that unknown client_type falls back to OpenAI."""
+    def test_get_client_with_unknown_type_fails_closed(self) -> None:
+        """Unknown client types must not silently fall back to OpenAI."""
         registry = ModelClientRegistry()
         model = {
             "client_type": "unknown",
@@ -554,8 +529,8 @@ class TestModelClientRegistry:
             "extra_params": {},
         }
 
-        client = registry.get_client_for_model(model)
-        assert isinstance(client, OpenAIChatClient)
+        with pytest.raises(LLMConfigurationError, match="不支持的 model.client_type"):
+            registry.get_client_for_model(model)
 
     def test_registry_with_custom_clients(self) -> None:
         """Test registry with custom client instances."""

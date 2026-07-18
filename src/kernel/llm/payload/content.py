@@ -1,290 +1,187 @@
-"""LLM payload 内容类型定义。
+"""LLM payload content types.
 
-定义了用于构建 LLM 消息的各类内容类型：Content（基类）、File、Text、Image、Audio、Video。
-File 支持文件路径、文件对象、base64 字符串三种输入，并在构造时统一规范化为纯 base64 编码字符串。
-Image 和 Audio 均继承自 File，共享相同的规范化逻辑，并在语义上区分媒体类型。
+Media facades retain the historical ``Content``/``File`` API while delegating all
+binary decoding and validation to :mod:`.media`.  A plain string is encoded media
+(base64, ``base64|`` or a data URL), never an implicit filesystem path.  Use a
+``Path`` instance or ``from_managed_path`` for an explicitly managed file.
 """
 
 from __future__ import annotations
 
-import base64
 from dataclasses import dataclass
-from io import RawIOBase, BufferedIOBase
 from os import PathLike
-from pathlib import Path
-from typing import BinaryIO, Union
+from typing import Any, BinaryIO, Self
+
+from .media import MediaKind, MediaPart, MediaRef, MediaValidationError
 
 
 @dataclass(frozen=True, slots=True)
 class Content:
-    """Payload content 基类。"""
-
-
-def _normalize_file_to_base64(
-    source: Union[str, "PathLike[str]", BinaryIO],
-) -> str:
-    """将文件路径、文件对象或 base64 字符串统一规范化为纯 base64 编码字符串。
-
-    Args:
-        source: 支持以下三种形式：
-            - 文件路径（``str`` 或 ``Path``）：读取文件内容并编码为 base64。
-            - 文件对象（``BinaryIO``，如 ``BytesIO``、``open(..., "rb")``）：读取内容并编码。
-            - base64 字符串：自动去除 ``data:...;base64,`` 或 ``base64|`` 前缀后原样返回。
-
-    Returns:
-        纯净的 base64 编码字符串（不含任何前缀）。
-
-    Raises:
-        ValueError: 当传入的字符串既不是有效的文件路径也无法识别为 base64 格式时。
-        TypeError: 当 ``source`` 类型不受支持时。
-    """
-    # 文件对象
-    if isinstance(source, (RawIOBase, BufferedIOBase)) or hasattr(source, "read"):
-        raw: bytes = source.read()  # type: ignore[union-attr]
-        return base64.b64encode(raw).decode("utf-8")
-
-    # 字符串或路径
-    if isinstance(source, (str, PathLike)):
-        s = str(source)
-
-        # data URL 前缀：data:...;base64,<payload>
-        if s.startswith("data:") and "base64," in s:
-            return s.split("base64,", 1)[1].strip()
-
-        # base64| 前缀
-        if s.startswith("base64|"):
-            return s[len("base64|"):].strip()
-
-        # 优先尝试验证是否为纯 base64 字符串
-        try:
-            cleaned = s.replace("\n", "").replace("\r", "").replace(" ", "")
-            base64.b64decode(cleaned, validate=True)
-            return cleaned
-        except Exception:
-            pass
-
-        # 尝试作为文件路径处理
-        path = Path(s)
-        try:
-            if path.exists() and path.is_file():
-                return base64.b64encode(path.read_bytes()).decode("utf-8")
-        except Exception:
-            raise ValueError(
-                f"无法识别的 File 输入：既不是有效的文件路径，也不是合法的 base64 字符串。"
-                f"收到：{s!r}"
-            ) from None
-
-    raise TypeError(
-        f"File 不支持的输入类型：{type(source).__name__}。"
-        f"请传入文件路径（str/Path）、文件对象（BinaryIO）或 base64 字符串。"
-    )
-
-
-class File(Content):
-    """文件内容。
-
-    接受三种输入，并在构造时统一规范化为纯 base64 编码字符串存储于 ``value``：
-
-    - **文件路径**（``str`` 或 ``Path``）：读取文件二进制内容并 base64 编码。
-    - **文件对象**（``BinaryIO``，如 ``BytesIO``、``open(..., "rb")``）：读取并编码。
-    - **base64 字符串**：自动剥离 ``data:...;base64,`` 或 ``base64|`` 前缀后存储。
-
-    示例::
-
-        # 文件路径
-        f1 = File("report.pdf")
-
-        # 文件对象
-        from io import BytesIO
-        f2 = File(BytesIO(b"hello"))
-
-        # 纯 base64 字符串
-        f3 = File("aGVsbG8=")
-
-        # data URL
-        f4 = File("data:application/pdf;base64,aGVsbG8=")
-
-    ``value`` 始终是纯净的 base64 字符串，可直接用于传输或存储。
-    """
-
-    __slots__ = ("value",)
-
-    value: str
-
-    def __init__(
-        self,
-        source: Union[str, "PathLike[str]", BinaryIO],
-    ) -> None:
-        """构造 File 实例，将 source 规范化为 base64 字符串后存入 value。
-
-        Args:
-            source: 文件路径（str/Path）、文件对象（BinaryIO）或 base64 字符串。
-        """
-        normalized = _normalize_file_to_base64(source)
-        object.__setattr__(self, "value", normalized)
-
-    def __setattr__(self, name: str, value: object) -> None:
-        """禁止属性修改，保持不可变语义。"""
-        raise AttributeError("File 实例是不可变的，不允许修改属性。")
-
-    def __delattr__(self, name: str) -> None:
-        """禁止属性删除，保持不可变语义。"""
-        raise AttributeError("File 实例是不可变的，不允许删除属性。")
-
-    def __eq__(self, other: object) -> bool:
-        """按 value 比较相等性。"""
-        if isinstance(other, File):
-            return self.value == other.value
-        return NotImplemented
-
-    def __hash__(self) -> int:
-        """基于 value 计算哈希值。"""
-        return hash(self.value)
-
-    def __repr__(self) -> str:
-        """返回对象的字符串表示。"""
-        preview = self.value[:16] + "..." if len(self.value) > 16 else self.value
-        return f"File(value={preview!r})"
+    """Payload content base class."""
 
 
 @dataclass(frozen=True, slots=True)
 class Text(Content):
-    """文本内容。"""
+    """Text content."""
 
     text: str
 
 
 @dataclass(frozen=True, slots=True)
 class ReasoningText(Content):
-    """思维链/推理内容。"""
+    """Thinking/reasoning content returned by a provider."""
 
     text: str
     signature: str | None = None
     redacted_data: str | None = None
 
 
-class Image(File):
-    """图片内容。
+class File(MediaPart, Content):
+    """Arbitrary binary content backed by a validated :class:`MediaRef`.
 
-    继承自 :class:`File`，在构造时将输入统一规范化为纯 base64 字符串。
-
-    支持与 :class:`File` 完全相同的三种输入形式：
-
-    - **文件路径**（``str`` 或 ``Path``）：读取图片文件并 base64 编码。
-    - **文件对象**（``BinaryIO``）：读取并编码。
-    - **base64 / data URL / base64| 字符串**：剥离前缀后存储纯 base64。
-
-    示例::
-
-        img1 = Image("photo.jpg")                          # 文件路径
-        img2 = Image(open("photo.jpg", "rb"))              # 文件对象
-        img3 = Image("data:image/png;base64,iVBOR...")     # data URL
-        img4 = Image("base64|iVBOR...")                    # base64| 前缀
-        img5 = Image("iVBOR...")                           # 纯 base64 字符串
+    ``str`` inputs must be strict base64 or a base64 data URL.  A ``PathLike``
+    input deliberately opts in to reading an existing managed local file.
     """
 
+    __slots__ = ()
+    _media_kind = MediaKind.FILE
+    _default_mime_type: str | None = None
+
+    def __init__(
+        self,
+        source: str | PathLike[str] | BinaryIO | bytes | bytearray | memoryview,
+        *,
+        mime_type: str | None = None,
+        max_item_bytes: int = MediaRef.DEFAULT_MAX_ITEM_BYTES,
+        source_message_id: str | None = None,
+        persistence_policy: str | None = None,
+        duration: float | None = None,
+        dimensions: tuple[int, int] | None = None,
+    ) -> None:
+        ref = self._build_ref(
+            source,
+            mime_type=mime_type,
+            max_item_bytes=max_item_bytes,
+            source_message_id=source_message_id,
+            persistence_policy=persistence_policy,
+            duration=duration,
+            dimensions=dimensions,
+        )
+        object.__setattr__(self, "media_ref", ref)
+
+    @classmethod
+    def _effective_mime_type(cls, mime_type: str | None) -> str | None:
+        return mime_type if mime_type is not None else cls._default_mime_type
+
+    @classmethod
+    def _build_ref(
+        cls,
+        source: str | PathLike[str] | BinaryIO | bytes | bytearray | memoryview,
+        *,
+        mime_type: str | None,
+        max_item_bytes: int,
+        source_message_id: str | None,
+        persistence_policy: str | None,
+        duration: float | None,
+        dimensions: tuple[int, int] | None,
+    ) -> MediaRef:
+        kwargs: dict[str, Any] = {
+            "kind": cls._media_kind,
+            "mime_type": cls._effective_mime_type(mime_type),
+            "max_item_bytes": max_item_bytes,
+            "source_message_id": source_message_id,
+            "duration": duration,
+            "dimensions": dimensions,
+        }
+        if persistence_policy is not None:
+            kwargs["persistence_policy"] = persistence_policy
+
+        if isinstance(source, (bytes, bytearray, memoryview)):
+            return MediaRef.from_bytes(source, origin="inline", **kwargs)
+        if isinstance(source, PathLike):
+            return MediaRef.from_managed_path(source, **kwargs)
+        if isinstance(source, str):
+            if source.startswith("data:"):
+                return MediaRef.from_data_url(source, **kwargs)
+            return MediaRef.from_base64(source, **kwargs)
+        if hasattr(source, "read"):
+            raw = source.read()
+            if not isinstance(raw, (bytes, bytearray, memoryview)):
+                raise TypeError("File 文件对象的 read() 必须返回 bytes-like 数据")
+            return MediaRef.from_bytes(raw, origin="stream", **kwargs)
+        raise TypeError(
+            f"File 不支持的输入类型：{type(source).__name__}。"
+            "请传入 base64/data URL、PathLike、bytes-like 或二进制文件对象。"
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes | bytearray | memoryview, **kwargs: Any) -> Self:
+        return cls._from_ref(MediaRef.from_bytes(data, kind=cls._media_kind, **kwargs))
+
+    @classmethod
+    def from_base64(cls, value: str, **kwargs: Any) -> Self:
+        return cls._from_ref(MediaRef.from_base64(value, kind=cls._media_kind, **kwargs))
+
+    @classmethod
+    def from_data_url(cls, value: str, **kwargs: Any) -> Self:
+        return cls._from_ref(MediaRef.from_data_url(value, kind=cls._media_kind, **kwargs))
+
+    @classmethod
+    def from_managed_path(cls, path: str | PathLike[str], **kwargs: Any) -> Self:
+        return cls._from_ref(
+            MediaRef.from_managed_path(path, kind=cls._media_kind, **kwargs)
+        )
+
+    @classmethod
+    def _from_ref(cls, ref: MediaRef) -> Self:
+        if ref.kind is not cls._media_kind:
+            raise ValueError(
+                f"{cls.__name__} 不能包装 kind={ref.kind.value!r} 的 MediaRef"
+            )
+        if not ref.is_materialized:
+            raise MediaValidationError(
+                f"{cls.__name__} 不能包装未物化的 MediaRef"
+            )
+        instance = cls.__new__(cls)
+        object.__setattr__(instance, "media_ref", ref)
+        return instance
+
     def __repr__(self) -> str:
-        """返回对象的字符串表示。"""
-        preview = self.value[:16] + "..." if len(self.value) > 16 else self.value
-        return f"Image(value={preview!r})"
+        return super().__repr__()
+
+
+class Image(File):
+    """Validated image content.
+
+    The true MIME type is inferred from an image signature for bytes/base64
+    inputs, or taken from a matching data URL.  ``Image("/path/file.png")`` is
+    intentionally invalid; use ``Image(Path(...))`` or ``Image.from_managed_path``.
+    """
+
+    __slots__ = ()
+    _media_kind = MediaKind.IMAGE
 
 
 class Audio(File):
-    """音频内容。
+    """Validated audio content with a true MIME type."""
 
-    继承自 :class:`File`，在构造时将输入统一规范化为纯 base64 字符串。
-    同时记录 MIME 类型（默认 ``audio/mpeg``），可从 data URL 自动推断。
-
-    支持与 :class:`File` 完全相同的三种输入形式：
-
-    - **文件路径**（``str`` 或 ``Path``）：读取音频文件并 base64 编码。
-    - **文件对象**（``BinaryIO``）：读取并编码。
-    - **base64 / data URL / base64| 字符串**：剥离前缀后存储纯 base64。
-
-    示例::
-
-        a1 = Audio("speech.mp3")                           # 默认 audio/mpeg
-        a2 = Audio("speech.wav", mime_type="audio/wav")    # 指定 MIME
-        a3 = Audio(open("speech.mp3", "rb"))               # 文件对象
-        a4 = Audio("data:audio/wav;base64,//uQR...")       # data URL，自动推断
-        a5 = Audio("//uQR...")                             # 纯 base64 字符串
-    """
-
-    __slots__ = ("value", "mime_type")
-
-    mime_type: str
-
-    def __init__(
-        self,
-        source: Union[str, "PathLike[str]", BinaryIO],
-        mime_type: str = "audio/mpeg",
-    ) -> None:
-        """构造 Audio 实例。
-
-        Args:
-            source: 文件路径（str/Path）、文件对象（BinaryIO）或 base64/data URL 字符串。
-            mime_type: 音频 MIME 类型，默认 ``audio/mpeg``（即 mp3）。
-                当 source 为 data URL 时，会自动从中提取 MIME 类型并忽略此参数。
-        """
-        if isinstance(source, str) and source.startswith("data:") and ";base64," in source:
-            extracted = source.split(";", 1)[0][len("data:"):]
-            if extracted:
-                mime_type = extracted
-        super().__init__(source)
-        object.__setattr__(self, "mime_type", mime_type)
-
-    def __repr__(self) -> str:
-        """返回对象的字符串表示。"""
-        preview = self.value[:16] + "..." if len(self.value) > 16 else self.value
-        return f"Audio(mime_type={self.mime_type!r}, value={preview!r})"
+    __slots__ = ()
+    _media_kind = MediaKind.AUDIO
 
 
 class Video(File):
-    """视频内容，用于多模态 LLM。
+    """Validated video content with a true MIME type."""
 
-    继承自 :class:`File`，在构造时将输入统一规范化为纯 base64 字符串。
-    同时记录 MIME 类型（默认 ``video/mp4``），可从 data URL 自动推断。
+    __slots__ = ()
+    _media_kind = MediaKind.VIDEO
 
-    支持与 :class:`File` 完全相同的三种输入形式：
 
-    - **文件路径**（``str`` 或 ``Path``）：读取视频文件并 base64 编码。
-    - **文件对象**（``BinaryIO``）：读取并编码。
-    - **base64 / data URL / base64| 字符串**：剥离前缀后存储纯 base64。
-
-    示例::
-
-        v1 = Video("clip.mp4")                             # 文件路径，默认 video/mp4
-        v2 = Video("clip.webm", mime_type="video/webm")    # 指定 MIME 类型
-        v3 = Video(open("clip.mp4", "rb"))                 # 文件对象
-        v4 = Video("data:video/webm;base64,AAAAB...")      # data URL，自动推断 mime_type
-        v5 = Video("AAAAB...")                             # 纯 base64 字符串
-    """
-
-    __slots__ = ("value", "mime_type")
-
-    mime_type: str
-
-    def __init__(
-        self,
-        source: Union[str, "PathLike[str]", BinaryIO],
-        mime_type: str = "video/mp4",
-    ) -> None:
-        """构造 Video 实例。
-
-        Args:
-            source: 文件路径（str/Path）、文件对象（BinaryIO）或 base64/data URL 字符串。
-            mime_type: 视频 MIME 类型，默认 ``video/mp4``。
-                当 source 为 data URL 时，会自动从中提取 MIME 类型并忽略此参数。
-        """
-        # 从 data URL 自动提取 mime_type
-        if isinstance(source, str) and source.startswith("data:") and ";base64," in source:
-            extracted = source.split(";", 1)[0][len("data:"):]
-            if extracted:
-                mime_type = extracted
-        super().__init__(source)
-        object.__setattr__(self, "mime_type", mime_type)
-
-    def __repr__(self) -> str:
-        """返回对象的字符串表示。"""
-        preview = self.value[:16] + "..." if len(self.value) > 16 else self.value
-        return f"Video(mime_type={self.mime_type!r}, value={preview!r})"
+__all__ = [
+    "Content",
+    "Text",
+    "ReasoningText",
+    "File",
+    "Image",
+    "Audio",
+    "Video",
+]

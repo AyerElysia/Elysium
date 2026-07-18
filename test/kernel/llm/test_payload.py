@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+import base64
+
 import pytest
 
 from src.kernel.llm.payload.content import Audio, Image, Text, Video
 from src.kernel.llm.payload.payload import LLMPayload, _normalize_content
 from src.kernel.llm.roles import ROLE
+
+
+_PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
+_WAV_BYTES = b"RIFF$\x00\x00\x00WAVEfmt "
+_MP4_BYTES = b"\x00\x00\x00\x18ftypmp42"
 
 
 class TestNormalizeContent:
@@ -21,7 +30,7 @@ class TestNormalizeContent:
 
     def test_normalize_content_list(self) -> None:
         """Test normalizing a list of Content items."""
-        content_list = [Text(text="Hello"), Image(value="pic.jpg")]
+        content_list = [Text(text="Hello"), Image.from_bytes(_PNG_BYTES)]
         result = _normalize_content(content_list)
         assert result == content_list
         assert isinstance(result, list)
@@ -35,9 +44,9 @@ class TestNormalizeContent:
         """Test normalizing mixed content types."""
         content_list = [
             Text(text="Text"),
-            Image(value="image.jpg"),
-            Audio(value="audio.mp3"),
-            Video(value="video.mp4"),
+            Image.from_bytes(_PNG_BYTES),
+            Audio.from_bytes(_WAV_BYTES),
+            Video.from_bytes(_MP4_BYTES),
         ]
         result = _normalize_content(content_list)
         assert len(result) == 4
@@ -61,7 +70,7 @@ class TestLLMPayload:
         """Test creating payload with content list."""
         content_list = [
             Text(text="Hello"),
-            Image(value="pic.jpg"),
+            Image.from_bytes(_PNG_BYTES),
         ]
         payload = LLMPayload(ROLE.USER, content_list)
         assert payload.role == ROLE.USER
@@ -95,7 +104,7 @@ class TestLLMPayload:
         """Test payload with multiple content types."""
         content = [
             Text(text="What's in this image?"),
-            Image(value="photo.jpg"),
+            Image.from_bytes(_PNG_BYTES),
         ]
         payload = LLMPayload(ROLE.USER, content)
         assert len(payload.content) == 2
@@ -168,7 +177,7 @@ class TestLLMPayloadIntegration:
             ROLE.USER,
             [
                 Text(text="Describe this image:"),
-                Image(value="photo.jpg"),
+                Image.from_bytes(_PNG_BYTES),
             ],
         )
         assert len(payload.content) == 2

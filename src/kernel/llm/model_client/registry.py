@@ -36,19 +36,28 @@ class ModelClientRegistry:
         """
 
         client_type = model.get("client_type")
-        if isinstance(client_type, str):
-            if client_type == "openai" and self.openai is not None:
-                return self.openai
-            if client_type == "anthropic" and self.anthropic is not None:
-                return self.anthropic
-            if client_type in {"gemini", "aiohttp_gemini"} and self.gemini is not None:
-                return self.gemini
-            if client_type == "bedrock" and self.bedrock is not None:
-                return self.bedrock
+        if not isinstance(client_type, str) or not client_type.strip():
+            raise LLMConfigurationError("model.client_type 必须是非空字符串")
 
-        if self.openai is None:
-            raise LLMConfigurationError("OpenAI client 未配置")
-        return self.openai
+        normalized_client_type = client_type.strip()
+        clients: dict[str, ChatModelClient | None] = {
+            "openai": self.openai,
+            "anthropic": self.anthropic,
+            "gemini": self.gemini,
+            "aiohttp_gemini": self.gemini,
+            "bedrock": self.bedrock,
+        }
+        if normalized_client_type not in clients:
+            raise LLMConfigurationError(
+                f"不支持的 model.client_type: {normalized_client_type!r}"
+            )
+
+        client = clients[normalized_client_type]
+        if client is None:
+            raise LLMConfigurationError(
+                f"{normalized_client_type} client 未配置"
+            )
+        return client
 
     def get_embedding_client_for_model(self, model: ModelEntry) -> EmbeddingModelClient:
         """根据单个模型配置获取 embedding client。"""

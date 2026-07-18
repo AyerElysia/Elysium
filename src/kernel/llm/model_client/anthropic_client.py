@@ -15,8 +15,8 @@ from typing import Any, AsyncIterator, cast
 
 from src.kernel.llm.payload.tooling import LLMUsable
 
-from ..exceptions import LLMConfigurationError
-from ..payload import Image, LLMPayload, ReasoningText, Text, ToolCall, ToolResult
+from ..exceptions import LLMConfigurationError, UnsupportedModalityError
+from ..payload import Audio, File, Image, LLMPayload, ReasoningText, Text, ToolCall, ToolResult, Video
 from ..roles import ROLE
 from ..token_counter import count_payload_tokens
 from .base import StreamEvent
@@ -215,7 +215,7 @@ def _image_to_anthropic_source(image: Image) -> dict[str, str]:
     """将内部 Image 转换为 Anthropic image source。"""
     return {
         "type": "base64",
-        "media_type": "image/png",
+        "media_type": image.mime_type,
         "data": image.value,
     }
 
@@ -229,6 +229,10 @@ def _to_plain_text(parts: list[object]) -> str:
             continue
         if isinstance(part, ReasoningText):
             continue
+        if isinstance(part, File):
+            raise UnsupportedModalityError(
+                f"Anthropic tool result 不支持媒体类型: {type(part).__name__}"
+            )
         to_text = getattr(part, "to_text", None)
         if callable(to_text):
             try:
@@ -313,6 +317,10 @@ def _payloads_to_anthropic_messages(
             for part in payload.content:
                 if isinstance(part, Text):
                     system_blocks.append({"type": "text", "text": part.text})
+                elif isinstance(part, File):
+                    raise UnsupportedModalityError(
+                        f"Anthropic system message 不支持媒体类型: {type(part).__name__}"
+                    )
                 else:
                     system_blocks.append({"type": "text", "text": str(part)})
             previous_role = payload.role
@@ -366,6 +374,11 @@ def _payloads_to_anthropic_messages(
                     }
                 )
                 continue
+
+            if isinstance(part, (Audio, Video, File)):
+                raise UnsupportedModalityError(
+                    f"Anthropic provider 不支持媒体类型: {type(part).__name__}"
+                )
 
             if isinstance(part, ToolCall) and role == "assistant":
                 raw_args = part.args

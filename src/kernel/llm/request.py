@@ -20,10 +20,22 @@ from src.kernel.logger import get_logger
 from src.kernel.llm.payload.tooling import LLMUsable
 
 from .context import LLMContextManager
-from .exceptions import LLMAPIError, LLMConfigurationError, LLMRateLimitError, LLMTimeoutError, classify_exception
+from .exceptions import (
+    LLMAPIError,
+    LLMConfigurationError,
+    LLMRateLimitError,
+    LLMTimeoutError,
+    UnsupportedModalityError,
+    classify_exception,
+)
+from .media_capabilities import (
+    extract_media_refs,
+    filter_model_set_for_media,
+    normalize_media_capabilities,
+)
 from .model_client import ModelClientRegistry
 from .monitor import RequestMetrics, RequestTimer, get_global_collector
-from .payload import LLMPayload, ReasoningText, Text, ToolResult
+from .payload import Content, LLMPayload, ReasoningText, Text, ToolResult
 from .policy import create_default_policy
 from .policy.base import Policy
 from .response import LLMResponse
@@ -49,6 +61,10 @@ def _normalize_tool_result_payload(payload: LLMPayload) -> LLMPayload:
         if isinstance(part, ToolResult):
             out_content.append(part)
         elif isinstance(part, Text):
+            out_content.append(part)
+        elif isinstance(part, Content):
+            # 保留媒体 Content，让 provider 在其不支持时显式拒绝；
+            # 不能把媒体的 repr 静默变成工具结果文本。
             out_content.append(part)
         else:
             out_content.append(Text(str(part)))
@@ -301,6 +317,20 @@ class LLMRequest:
         # TOOL_RESULT payload 规范化（确保 provider 端可读）
         payloads = [_normalize_tool_result_payload(p) for p in self.payloads]
         tools = _extract_tools(payloads)
+
+        # 在创建策略会话之前按已验证媒体过滤模型，避免重试链将同一
+        # 多模态请求交给声明为 text-only 的模型。
+        media_refs = extract_media_refs(payloads)
+        if media_refs:
+            compatible_model_set = filter_model_set_for_media(model_set, media_refs)
+            if not compatible_model_set:
+                requested_modalities = ", ".join(
+                    sorted({media.kind.value for media in media_refs})
+                )
+                raise UnsupportedModalityError(
+                    f"没有模型支持本次请求的媒体模态: {requested_modalities}"
+                )
+            model_set = compatible_model_set  # type: ignore[assignment]
 
         # 创建策略会话
         assert self.policy is not None
@@ -606,6 +636,9 @@ def _validate_model_entry(model: dict[str, Any]) -> ModelEntry:
                 "model.extra_params.context_compression_trigger_ratio 必须是 number"
             )
 
+    model["media_capabilities"] = normalize_media_capabilities(
+        model.get("media_capabilities")
+    )
     model.setdefault("tool_call_compat", False)
     model.setdefault("force_stream_mode", False)
     return model  # type: ignore[return-value]

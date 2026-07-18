@@ -7,11 +7,9 @@ OpenAI 模型客户端实现。
 
 from __future__ import annotations
 
-import base64
 import inspect
 import json
 import threading
-from pathlib import Path
 from typing import Any, AsyncIterator
 
 from json_repair import repair_json
@@ -23,8 +21,12 @@ from src.kernel.llm.tool_call_compat import (
     parse_tool_call_compat_response,
 )
 
-from ..exceptions import LLMConfigurationError, LLMContentFilterError
-from ..payload import Audio, Image, LLMPayload, ReasoningText, Text, ToolCall, ToolResult, Video
+from ..exceptions import (
+    LLMConfigurationError,
+    LLMContentFilterError,
+    UnsupportedModalityError,
+)
+from ..payload import Audio, File, Image, LLMPayload, ReasoningText, Text, ToolCall, ToolResult, Video
 from ..roles import ROLE
 from ..token_counter import count_payload_tokens
 from .base import StreamEvent
@@ -92,372 +94,25 @@ def _build_httpx_timeout(timeout: float | None) -> Any:
     )
 
 
-def _is_data_url(value: str) -> bool:
-    """判断字符串是否为 data URL 格式。
-
-    Args:
-        value: 待判断字符串。
-
-    Returns:
-        是 data URL 则返回 True，否则 False。
-    """
-    return value.startswith("data:")
-
-
-def _image_to_data_url(value: str) -> str:
-    """将各种图片表示转换为 data URL 字符串。
-
-    支持以下格式：
-    - ``base64|<b64>``：已有 base64 内容
-    - ``data:...``：已是 data URL，直接返回
-    - 文件路径：读取并编码
-    - 纯 base64 字符串
-
-    Args:
-        value: 图片表示字符串。
-
-    Returns:
-        ``data:image/png;base64,...`` 格式的 data URL。
-
-    Raises:
-        FileNotFoundError: 无法识别或文件不存在时抛出。
-    """
-    if value.startswith("base64|"):
-        b64 = value.split("|", 1)[1]
-        mime = _detect_image_mime_from_base64(b64) or "image/png"
-        return f"data:{mime};base64,{b64}"
-
-    if _is_data_url(value):
-        return value
-
-    # 尝试作为纯 base64 字符串处理（Image.value 规范化后为纯 base64）
-    try:
-        base64.b64decode(value, validate=True)
-        mime = _detect_image_mime_from_base64(value) or "image/png"
-        return f"data:{mime};base64,{value}"
-    except Exception:
-        pass
-
-    path = Path(value)
-    try:
-        if path.exists() and path.is_file():
-            data = path.read_bytes()
-            b64 = base64.b64encode(data).decode("ascii")
-            mime = _detect_image_mime_from_bytes(data) or "image/png"
-            return f"data:{mime};base64,{b64}"
-    except OSError:
-        pass
-
-    raise FileNotFoundError(f"Image file not found: {value}")
-
-
-def _detect_image_mime_from_base64(value: str) -> str | None:
-    try:
-        cleaned = value.replace("\n", "").replace("\r", "").replace(" ", "")
-        raw = base64.b64decode(cleaned, validate=True)
-    except Exception:
-        return None
-    return _detect_image_mime_from_bytes(raw)
-
-
-def _detect_image_mime_from_bytes(raw: bytes) -> str | None:
-    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if raw.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    if raw.startswith((b"GIF87a", b"GIF89a")):
-        return "image/gif"
-    if raw.startswith(b"BM"):
-        return "image/bmp"
-    if len(raw) >= 12 and raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
-        return "image/webp"
-    return None
+def _image_to_data_url(image: Image) -> str:
+    """Build an OpenAI image data URL from already-validated media only."""
+    return image.data_url
 
 
 _AUDIO_MIME_TO_FORMAT: dict[str, str] = {
     "audio/mpeg": "mp3",
-    "audio/mp3": "mp3",
-    "audio/mpeg3": "mp3",
-    "audio/x-mpeg-3": "mp3",
     "audio/wav": "wav",
-    "audio/x-wav": "wav",
-    "audio/wave": "wav",
-    "audio/vnd.wave": "wav",
 }
 
 
 def _audio_mime_to_format(mime_type: str) -> str:
-    """根据 Audio.mime_type 反推 OpenAI input_audio.format 字段值。
-
-    OpenAI Chat Completions API 仅接受 ``mp3`` / ``wav`` 两种 format 取值。
-    未识别的 MIME（如 silk/amr）会保守降级为 ``mp3``，避免 KeyError，
-    但调用方应在更上游就拦截不支持的格式（多模态预处理阶段降级为文本占位）。
-    """
-    if not mime_type:
-        return "mp3"
-    normalized = mime_type.lower().strip()
-    if normalized in _AUDIO_MIME_TO_FORMAT:
-        return _AUDIO_MIME_TO_FORMAT[normalized]
-    if "wav" in normalized:
-        return "wav"
-    return "mp3"
-
-
-def _video_to_data_url(value: str, mime: str = "video/mp4") -> str:
-    """将各种视频表示转换为 data URL 字符串。"""
-    if value.startswith("base64|"):
-        b64 = value.split("|", 1)[1]
-        return f"data:{mime};base64,{b64}"
-
-    if _is_data_url(value):
-        return value
-
+    """Map a validated audio MIME type to OpenAI's supported wire format."""
     try:
-        base64.b64decode(value, validate=True)
-        return f"data:{mime};base64,{value}"
-    except Exception:
-        pass
-
-    path = Path(value)
-    try:
-        if path.exists() and path.is_file():
-            data = path.read_bytes()
-            b64 = base64.b64encode(data).decode("ascii")
-            ext = path.suffix.lower()
-            ext_map = {
-                ".mp4": "video/mp4",
-                ".mov": "video/quicktime",
-                ".webm": "video/webm",
-                ".mkv": "video/x-matroska",
-                ".avi": "video/x-msvideo",
-            }
-            guessed_mime = ext_map.get(ext, mime)
-            return f"data:{guessed_mime};base64,{b64}"
-    except OSError:
-        pass
-
-    raise FileNotFoundError(f"Video file not found: {value}")
-
-
-def _messages_contain_native_video(messages: list[dict[str, Any]]) -> bool:
-    """检查 messages 中是否包含原生视频内容块。"""
-    for msg in messages:
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        for item in content:
-            if _is_native_video_message_item(item):
-                return True
-    return False
-
-
-def _messages_contain_native_image(messages: list[dict[str, Any]]) -> bool:
-    """检查 messages 中是否包含原生图片内容块。"""
-    for msg in messages:
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        for item in content:
-            if _is_native_image_message_item(item):
-                return True
-    return False
-
-
-def _messages_contain_life_inspect_media_promotion(messages: list[dict[str, Any]]) -> bool:
-    """检查是否是 life_chatter 的按需媒体观察提升请求。"""
-
-    marker = "tool-inspect_media"
-    for msg in messages:
-        content = msg.get("content")
-        if isinstance(content, str):
-            if marker in content:
-                return True
-            continue
-        if not isinstance(content, list):
-            continue
-        for item in content:
-            if isinstance(item, str) and marker in item:
-                return True
-            if isinstance(item, dict):
-                text = item.get("text")
-                if isinstance(text, str) and marker in text:
-                    return True
-    return False
-
-
-def _is_native_video_message_item(item: Any) -> bool:
-    """判断单个 content item 是否承载原生视频输入。"""
-    if not isinstance(item, dict):
-        return False
-
-    item_type = item.get("type")
-    if item_type in {"video_url", "input_video"}:
-        return True
-
-    if item_type != "image_url":
-        return False
-
-    image_url_obj = item.get("image_url")
-    url = ""
-    if isinstance(image_url_obj, dict):
-        url = str(image_url_obj.get("url") or "")
-    elif isinstance(item.get("url"), str):
-        url = str(item.get("url") or "")
-
-    return url.startswith("data:video/")
-
-
-def _is_native_image_message_item(item: Any) -> bool:
-    """判断单个 content item 是否承载原生图片输入。"""
-    if not isinstance(item, dict):
-        return False
-
-    if item.get("type") != "image_url":
-        return False
-
-    image_url_obj = item.get("image_url")
-    url = ""
-    if isinstance(image_url_obj, dict):
-        url = str(image_url_obj.get("url") or "")
-    elif isinstance(item.get("url"), str):
-        url = str(item.get("url") or "")
-
-    if url.startswith("data:video/"):
-        return False
-    return bool(url)
-
-
-def _strip_native_video_from_messages(
-    messages: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], int]:
-    """移除 messages 中的视频内容块，返回新 messages 和移除数量。"""
-    removed = 0
-    rebuilt: list[dict[str, Any]] = []
-
-    for msg in messages:
-        if not isinstance(msg, dict):
-            rebuilt.append(msg)
-            continue
-
-        cloned = dict(msg)
-        content = cloned.get("content")
-        if not isinstance(content, list):
-            rebuilt.append(cloned)
-            continue
-
-        new_content: list[Any] = []
-        local_removed = 0
-        for item in content:
-            if _is_native_video_message_item(item):
-                local_removed += 1
-                continue
-            new_content.append(item)
-
-        if local_removed > 0 and not new_content:
-            new_content.append({"type": "text", "text": "[视频原生输入降级为文本摘要]"})
-
-        removed += local_removed
-        cloned["content"] = new_content
-        rebuilt.append(cloned)
-
-    return rebuilt, removed
-
-
-def _strip_native_image_from_messages(
-    messages: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], int]:
-    """移除 messages 中的图片内容块，返回新 messages 和移除数量。"""
-    removed = 0
-    rebuilt: list[dict[str, Any]] = []
-
-    for msg in messages:
-        if not isinstance(msg, dict):
-            rebuilt.append(msg)
-            continue
-
-        cloned = dict(msg)
-        content = cloned.get("content")
-        if not isinstance(content, list):
-            rebuilt.append(cloned)
-            continue
-
-        new_content: list[Any] = []
-        local_removed = 0
-        for item in content:
-            if _is_native_image_message_item(item):
-                local_removed += 1
-                continue
-            new_content.append(item)
-
-        if local_removed > 0 and not new_content:
-            new_content.append({"type": "text", "text": "[图片原生输入已降级为文字描述]"})
-
-        removed += local_removed
-        cloned["content"] = new_content
-        rebuilt.append(cloned)
-
-    return rebuilt, removed
-
-
-def _is_native_video_unsupported_error(error: Exception) -> bool:
-    """判断异常是否属于“视频输入不被当前端点支持”。"""
-    error_name = type(error).__name__.lower()
-    error_text = str(error).lower()
-    haystack = f"{error_name} {error_text}"
-
-    video_markers = ("video_url", "input_video", "video")
-    unsupported_markers = (
-        "unsupported",
-        "not support",
-        "not supported",
-        "unknown",
-        "unrecognized",
-        "invalid",
-        "invalid_request",
-        "bad request",
-        "content type",
-        "schema",
-    )
-
-    image_format_markers = (
-        "invalid image format",
-        "only bmp/gif/png/jpeg/webp are supported",
-        "param incorrect",
-    )
-
-    if any(marker in haystack for marker in image_format_markers):
-        return True
-
-    return any(marker in haystack for marker in video_markers) and any(
-        marker in haystack for marker in unsupported_markers
-    )
-
-
-def _is_native_image_unsupported_error(error: Exception) -> bool:
-    """判断异常是否属于“图片输入不被当前端点支持”。"""
-    error_name = type(error).__name__.lower()
-    error_text = str(error).lower()
-    haystack = f"{error_name} {error_text}"
-
-    image_markers = (
-        "image input",
-        "image_url",
-        "input_image",
-        "vision",
-        "multimodal",
-    )
-    unsupported_markers = (
-        "no endpoints found that support image input",
-        "not support image input",
-        "does not support image input",
-        "unsupported image input",
-        "image input not supported",
-        "vision is not supported",
-    )
-
-    return any(marker in haystack for marker in image_markers) and any(
-        marker in haystack for marker in unsupported_markers
-    )
+        return _AUDIO_MIME_TO_FORMAT[mime_type]
+    except KeyError as exc:
+        raise UnsupportedModalityError(
+            f"OpenAI Chat Completions 不支持音频 MIME: {mime_type!r}"
+        ) from exc
 
 
 def _coerce_tool_arguments_json(args: Any) -> str:
@@ -647,6 +302,10 @@ def _payloads_to_openai_messages(
             fallback_text: str | None = None
 
             for part in payload.content:
+                if isinstance(part, File):
+                    raise UnsupportedModalityError(
+                        f"OpenAI tool result 不支持媒体类型: {type(part).__name__}"
+                    )
                 if isinstance(part, ToolResult):
                     tool_payloads.append((part.call_id, part.name, part.to_text()))
                     continue
@@ -758,8 +417,12 @@ def _payloads_to_openai_messages(
             elif isinstance(part, ReasoningText):
                 reasoning_parts.append(part.text)
             elif isinstance(part, Image):
-                url = _image_to_data_url(part.value)
-                parts.append({"type": "image_url", "image_url": {"url": url}})
+                parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": _image_to_data_url(part)},
+                    }
+                )
             elif isinstance(part, Audio):
                 parts.append(
                     {
@@ -771,10 +434,13 @@ def _payloads_to_openai_messages(
                     }
                 )
             elif isinstance(part, Video):
-                data_url = f"data:{part.mime_type};base64,{part.value}"
-                parts.append({"type": "image_url", "image_url": {"url": data_url}})
+                raise UnsupportedModalityError(
+                    "OpenAI Chat Completions 当前不支持视频输入"
+                )
             else:
-                parts.append({"type": "text", "text": str(part)})
+                raise UnsupportedModalityError(
+                    f"OpenAI serializer 不支持内容类型: {type(part).__name__}"
+                )
 
         message = {"role": role, "content": parts}
         if payload.role == ROLE.ASSISTANT and reasoning_parts:
@@ -1257,9 +923,6 @@ class OpenAIChatClient:
             payloads,
             include_tool_result_name=_should_include_tool_result_name(model_name, model_set),
         )
-        has_native_video = _messages_contain_native_video(messages)
-        has_native_image = _messages_contain_native_image(messages)
-        preserve_native_multimodal_errors = _messages_contain_life_inspect_media_promotion(messages)
         tool_call_compat = bool(model_set.get("tool_call_compat", False))
 
         if tool_call_compat and openai_tools:
@@ -1339,9 +1002,6 @@ class OpenAIChatClient:
                 params=params,
                 tool_call_compat=tool_call_compat,
                 openai_tools=openai_tools,
-                has_native_video=has_native_video,
-                has_native_image=has_native_image,
-                preserve_native_multimodal_errors=preserve_native_multimodal_errors,
                 api_key=api_key,
                 base_url=base_url,
                 timeout=timeout,
@@ -1360,9 +1020,6 @@ class OpenAIChatClient:
         message_content, tool_calls, stream_iter, reasoning_content = await self._create_stream(
             client=client,
             params=params,
-            has_native_video=has_native_video,
-            has_native_image=has_native_image,
-            preserve_native_multimodal_errors=preserve_native_multimodal_errors,
         )
         return (
             message_content,
@@ -1379,9 +1036,6 @@ class OpenAIChatClient:
         params: dict[str, Any],
         tool_call_compat: bool,
         openai_tools: list[dict[str, Any]],
-        has_native_video: bool,
-        has_native_image: bool,
-        preserve_native_multimodal_errors: bool,
         api_key: str,
         base_url: str | None,
         timeout: float | None,
@@ -1389,91 +1043,29 @@ class OpenAIChatClient:
         force_ipv4: bool,
         model_name: str,
     ) -> tuple[str | None, list[dict[str, Any]] | None, None, str | None]:
-        """执行非流式聊天请求并返回解析结果。
-
-        遇到网络/超时异常时会驱逐缓存的客户端，以便下次请求重建连接。
-
-        Args:
-            client: AsyncOpenAI 实例。
-            params: 请求参数 dict。
-            tool_call_compat: 是否使用工具调用兼容模式。
-            openai_tools: 已转换的 tools 列表。
-            api_key: API 密钥（用于驱逐缓存）。
-            base_url: base URL（用于驱逐缓存）。
-            timeout: 超时（用于驱逐缓存）。
-            trust_env: 代理环境变量开关（用于驱逐缓存）。
-            force_ipv4: IPv4 强制标志（用于驱逐缓存）。
-            model_name: 模型名称（用于错误信息）。
-
-        Returns:
-            四元组 ``(message_content, tool_calls, None, reasoning_content)``。
-
-        Raises:
-            LLMContentFilterError: 模型返回空 choices 时抛出。
-        """
+        """执行非流式聊天请求并返回解析结果。"""
         try:
             resp = await client.chat.completions.create(**params)
         except Exception as e:
-            if (
-                has_native_video
-                and not preserve_native_multimodal_errors
-                and _is_native_video_unsupported_error(e)
+            err_name = type(e).__name__.lower()
+            err_text = str(e).lower()
+            if any(
+                kw in err_name or kw in err_text
+                for kw in ("timeout", "connect", "network", "transport")
             ):
-                fallback_params = dict(params)
-                original_messages = fallback_params.get("messages")
-                if isinstance(original_messages, list):
-                    downgraded_messages, removed = _strip_native_video_from_messages(original_messages)
-                    if removed > 0:
-                        logger.warning(
-                            "检测到上游不支持原生视频输入，自动降级为文本摘要模式重试。"
-                            f"移除视频块数量: {removed}"
-                        )
-                        fallback_params["messages"] = downgraded_messages
-                        resp = await client.chat.completions.create(**fallback_params)
-                    else:
-                        raise
-                else:
-                    raise
-            elif (
-                has_native_image
-                and not preserve_native_multimodal_errors
-                and _is_native_image_unsupported_error(e)
-            ):
-                fallback_params = dict(params)
-                original_messages = fallback_params.get("messages")
-                if isinstance(original_messages, list):
-                    downgraded_messages, removed = _strip_native_image_from_messages(original_messages)
-                    if removed > 0:
-                        logger.warning(
-                            "检测到上游不支持原生图片输入，自动降级为文字描述模式重试。"
-                            f"移除图片块数量: {removed}"
-                        )
-                        fallback_params["messages"] = downgraded_messages
-                        resp = await client.chat.completions.create(**fallback_params)
-                    else:
-                        raise
-                else:
-                    raise
-            else:
-                err_name = type(e).__name__.lower()
-                err_text = str(e).lower()
-                if any(
-                    kw in err_name or kw in err_text
-                    for kw in ("timeout", "connect", "network", "transport")
-                ):
-                    stale = self._evict_client(
-                        api_key=api_key,
-                        base_url=base_url,
-                        timeout=timeout,
-                        trust_env=trust_env,
-                        force_ipv4=force_ipv4,
-                    )
-                    if stale is not None:
-                        try:
-                            await stale.close()
-                        except Exception:
-                            pass
-                raise
+                stale = self._evict_client(
+                    api_key=api_key,
+                    base_url=base_url,
+                    timeout=timeout,
+                    trust_env=trust_env,
+                    force_ipv4=force_ipv4,
+                )
+                if stale is not None:
+                    try:
+                        await stale.close()
+                    except Exception:
+                        pass
+            raise
 
         self._set_last_usage(_extract_usage_payload(resp))
         if not resp.choices:
@@ -1499,64 +1091,9 @@ class OpenAIChatClient:
         *,
         client: Any,
         params: dict[str, Any],
-        has_native_video: bool,
-        has_native_image: bool,
-        preserve_native_multimodal_errors: bool,
     ) -> tuple[None, None, AsyncIterator[StreamEvent], None]:
-        """执行流式聊天请求并返回事件迭代器。
-
-        Args:
-            client: AsyncOpenAI 实例。
-            params: 请求参数 dict（不含 ``stream`` 键）。
-
-        Returns:
-            四元组 ``(None, None, AsyncIterator[StreamEvent], None)``。
-        """
-        try:
-            stream_resp = await client.chat.completions.create(**params, stream=True)
-        except Exception as e:
-            if (
-                has_native_video
-                and not preserve_native_multimodal_errors
-                and _is_native_video_unsupported_error(e)
-            ):
-                fallback_params = dict(params)
-                original_messages = fallback_params.get("messages")
-                if isinstance(original_messages, list):
-                    downgraded_messages, removed = _strip_native_video_from_messages(original_messages)
-                    if removed > 0:
-                        logger.warning(
-                            "流式请求检测到上游不支持原生视频输入，自动降级为文本摘要模式重试。"
-                            f"移除视频块数量: {removed}"
-                        )
-                        fallback_params["messages"] = downgraded_messages
-                        stream_resp = await client.chat.completions.create(**fallback_params, stream=True)
-                    else:
-                        raise
-                else:
-                    raise
-            elif (
-                has_native_image
-                and not preserve_native_multimodal_errors
-                and _is_native_image_unsupported_error(e)
-            ):
-                fallback_params = dict(params)
-                original_messages = fallback_params.get("messages")
-                if isinstance(original_messages, list):
-                    downgraded_messages, removed = _strip_native_image_from_messages(original_messages)
-                    if removed > 0:
-                        logger.warning(
-                            "流式请求检测到上游不支持原生图片输入，自动降级为文字描述模式重试。"
-                            f"移除图片块数量: {removed}"
-                        )
-                        fallback_params["messages"] = downgraded_messages
-                        stream_resp = await client.chat.completions.create(**fallback_params, stream=True)
-                    else:
-                        raise
-                else:
-                    raise
-            else:
-                raise
+        """执行流式聊天请求并返回事件迭代器。"""
+        stream_resp = await client.chat.completions.create(**params, stream=True)
 
         async def iter_events() -> AsyncIterator[StreamEvent]:
             """逐块迭代流式响应，产出 StreamEvent。

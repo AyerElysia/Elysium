@@ -336,3 +336,72 @@ def test_request_inspector_rejects_unknown_import_shape() -> None:
         assert "无法识别导入 JSON 结构" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_request_inspector_redacts_provider_media_sources() -> None:
+    """OpenAI 与 Anthropic 的媒体 source 不应进入 inspector 记录。"""
+    inspector = RequestInspector()
+    openai_secret = "data:image/png;base64,openai-secret"
+    anthropic_secret = "anthropic-secret"
+
+    request_id = inspector.capture(
+        "chat.completions.create",
+        {
+            "model": "vision-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "请描述图片"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": openai_secret,
+                                "detail": "high",
+                            },
+                        },
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": anthropic_secret,
+                            },
+                        },
+                    ],
+                }
+            ],
+        },
+    )
+
+    record = inspector._records[-1]
+    content = record.params["messages"][0]["content"]
+    assert content[0]["text"] == "请描述图片"
+    assert content[1]["image_url"] == {
+        "url": "[removed]",
+        "detail": "high",
+    }
+    assert content[2]["source"] == {
+        "type": "base64",
+        "media_type": "image/png",
+        "data": "[removed]",
+    }
+    assert openai_secret not in str(record.to_full())
+    assert anthropic_secret not in str(record.to_full())
+
+    inspector.attach_response(
+        request_id,
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "output_audio",
+                    "audio_base64": "response-secret",
+                    "format": "wav",
+                }
+            ],
+        },
+    )
+    assert record.response is not None
+    assert record.response["content"][0]["audio_base64"] == "[removed]"
+    assert "response-secret" not in str(record.to_full())

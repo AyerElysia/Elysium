@@ -30,6 +30,8 @@ from typing import Any, AsyncIterator
 from fastapi import APIRouter, Body
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+from .payload.media import redact_media_sources
+
 
 _OVERVIEW_FIELDS: list[tuple[str, str]] = [
     ("stream", "流式"),
@@ -560,8 +562,9 @@ class RequestInspector:
         self._counter += 1
         try:
             copied = json.loads(json.dumps(params, default=str))
+            copied = redact_media_sources(copied)
         except Exception:
-            copied = {"_raw": str(params)}
+            copied = {"_raw": "[unserializable request omitted]"}
         effective_metadata = metadata.copy() if isinstance(metadata, dict) else {}
 
         model = str(copied.get("model", "—"))
@@ -590,8 +593,9 @@ class RequestInspector:
             return False
         try:
             copied = json.loads(json.dumps(response, default=str))
+            copied = redact_media_sources(copied)
         except Exception:
-            copied = {"_raw": str(response)}
+            copied = {"_raw": "[unserializable response omitted]"}
 
         target: CapturedRequest | None = None
         for record in reversed(self._records):

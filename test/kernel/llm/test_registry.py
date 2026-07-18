@@ -121,37 +121,32 @@ def test_registry_get_bedrock_client():
     assert isinstance(client, FakeBedrockClient)
 
 
-def test_registry_invalid_client_type_fallback_to_openai():
-    """测试无效的client_type回退到OpenAI。"""
+def test_registry_invalid_client_type_fails_closed():
+    """未知 client_type 不应静默回退到 OpenAI。"""
     registry = ModelClientRegistry()
     model = _model_entry(client_type="unknown_provider", api_provider="Unknown")
 
-    client = registry.get_client_for_model(model)
-
-    # 应该回退到OpenAI
-    assert client is registry.openai
+    with pytest.raises(LLMConfigurationError, match="不支持的 model.client_type"):
+        registry.get_client_for_model(model)
 
 
-def test_registry_non_string_client_type_fallback_to_openai():
-    """测试client_type不是字符串时回退到OpenAI。"""
+def test_registry_non_string_client_type_fails_closed():
+    """非字符串 client_type 应明确报配置错误。"""
     registry = ModelClientRegistry()
     model = _model_entry(client_type=cast(Any, 123), api_provider="Unknown")
 
-    client = registry.get_client_for_model(model)
-
-    # 应该回退到OpenAI
-    assert client is registry.openai
+    with pytest.raises(LLMConfigurationError, match="model.client_type"):
+        registry.get_client_for_model(model)
 
 
 def test_registry_openai_none_raises_error():
-    """测试OpenAI客户端为None时抛出异常。"""
-    # 通过直接设置openai为None来测试
+    """显式选择 openai 但 client 未配置时抛出异常。"""
     registry = ModelClientRegistry()
     registry.openai = None
 
-    model = _model_entry(client_type="unknown", api_provider="Unknown")
+    model = _model_entry(client_type="openai")
 
-    with pytest.raises(LLMConfigurationError, match="OpenAI client 未配置"):
+    with pytest.raises(LLMConfigurationError, match="openai client 未配置"):
         registry.get_client_for_model(model)
 
 

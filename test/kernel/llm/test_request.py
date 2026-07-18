@@ -12,11 +12,12 @@ from src.kernel.llm.exceptions import (
     LLMConfigurationError,
     LLMRateLimitError,
     LLMTimeoutError,
+    UnsupportedModalityError,
 )
 from src.kernel.llm.model_client.base import StreamEvent
 from src.kernel.llm.model_client.registry import ModelClientRegistry
 from src.kernel.llm.monitor import get_global_collector
-from src.kernel.llm.payload import LLMPayload, Text, ToolResult
+from src.kernel.llm.payload import Image, LLMPayload, Text, ToolResult
 from src.kernel.llm.policy import (
     LoadBalancedPolicy,
     RoundRobinPolicy,
@@ -515,6 +516,29 @@ class TestLLMRequestSend:
 
         response = await request.send(stream=False)
         assert response.message == "Success response!"
+
+    @pytest.mark.asyncio
+    async def test_send_rejects_media_before_client_call_when_all_models_are_text_only(
+        self,
+        mock_model_set: list[dict[str, Any]],
+    ) -> None:
+        request = LLMRequest(mock_model_set, "text_only_media")
+        request.add_payload(
+            LLMPayload(
+                ROLE.USER,
+                Image(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+                    "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+                ),
+            )
+        )
+        mock_client = MockChatClient()
+        request.clients.openai = mock_client
+
+        with pytest.raises(UnsupportedModalityError, match="没有模型支持"):
+            await request.send(stream=False)
+
+        assert mock_client.call_count == 0
 
     @pytest.mark.asyncio
     async def test_send_applies_token_budget_trimming(

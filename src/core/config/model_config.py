@@ -33,6 +33,7 @@ from typing import Any, ClassVar, Literal, cast
 
 from pydantic import ConfigDict
 from src.kernel.config import ConfigBase, SectionBase, config_section, Field
+from src.kernel.llm.media_capabilities import normalize_media_capabilities
 from src.kernel.llm.types import ModelSet
 
 # ==============================================================================
@@ -158,6 +159,13 @@ class ModelInfoSection(SectionBase):
             "额外参数（用于 API 调用时的额外配置）。"
             "上下文策略保留键：context_reserve_tokens/context_reserve_ratio、"
             "context_compression_trigger_tokens/context_compression_trigger_ratio。"
+        ),
+    )
+    media_capabilities: dict[str, Any] = Field(
+        default_factory=lambda: normalize_media_capabilities(None),
+        description=(
+            "原生媒体能力合同。未配置时仅支持 text；可配置 modalities、"
+            "accepted_mime_types、大小/数量/时长限制及 wire_profile。"
         ),
     )
     anti_truncation: bool = Field(
@@ -352,6 +360,17 @@ class ModelConfig(ConfigBase):
                 api_provider="SiliconFlow",
                 price_in=4.13,
                 price_out=4.13,
+                media_capabilities={
+                    "modalities": ["text", "image"],
+                    "accepted_mime_types": {
+                        "image": [
+                            "image/png",
+                            "image/jpeg",
+                            "image/gif",
+                            "image/webp",
+                        ],
+                    },
+                },
             ),
             ModelInfoSection(
                 name="sensevoice-small",
@@ -560,6 +579,9 @@ class ModelConfig(ConfigBase):
                 "max_context": model_info.max_context,
                 "tool_call_compat": model_info.tool_call_compat,
                 "extra_params": extra_params,
+                "media_capabilities": normalize_media_capabilities(
+                    model_info.media_capabilities
+                ),
             }
             
             model_set.append(model_entry)
@@ -640,6 +662,9 @@ class ModelConfig(ConfigBase):
             "max_context": model_info.max_context,
             "tool_call_compat": model_info.tool_call_compat,
             "extra_params": extra_params,
+            "media_capabilities": normalize_media_capabilities(
+                model_info.media_capabilities
+            ),
         }
         
         return cast(ModelSet, [model_entry])

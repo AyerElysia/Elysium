@@ -35,6 +35,7 @@ class ModelEntry(TypedDict, total=True):
     max_context: int
     tool_call_compat: bool
     extra_params: dict[str, Any]
+    media_capabilities: dict[str, Any]
 
 
 # 模型集合类型：一组可用的模型配置

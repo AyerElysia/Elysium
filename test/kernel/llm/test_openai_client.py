@@ -7,7 +7,7 @@ import asyncio
 import base64
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock
 from typing import cast, Any
 
 import pytest
@@ -16,6 +16,8 @@ from src.kernel.llm import (
     Audio,
     Image,
     LLMPayload,
+    MediaValidationError,
+    UnsupportedModalityError,
     ReasoningText,
     ROLE,
     Text,
@@ -25,85 +27,40 @@ from src.kernel.llm import (
 )
 
 
-class TestIsDataUrl:
-    """测试_is_data_url函数。"""
+_PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
+_WEBP_BYTES = b"RIFF\x10\x00\x00\x00WEBPVP8 "
+_MP3_BYTES = b"ID3\x04\x00\x00"
+_WAV_BYTES = b"RIFF$\x00\x00\x00WAVEfmt "
+_MP4_BYTES = b"\x00\x00\x00\x18ftypmp42"
 
-    def test_data_url_with_png(self):
-        """测试PNG data URL。"""
-        from src.kernel.llm.model_client.openai_client import _is_data_url
 
-        assert _is_data_url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUA")
-
-    def test_data_url_with_jpeg(self):
-        """测试JPEG data URL。"""
-        from src.kernel.llm.model_client.openai_client import _is_data_url
-
-        assert _is_data_url("data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD")
-
-    def test_not_data_url(self):
-        """测试非data URL。"""
-        from src.kernel.llm.model_client.openai_client import _is_data_url
-
-        assert not _is_data_url("https://example.com/image.png")
-        assert not _is_data_url("/path/to/image.png")
-        assert not _is_data_url("image.png")
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
 
 
 class TestImageToDataUrl:
-    """测试_image_to_data_url函数。"""
+    """测试 OpenAI 只消费已校验的 Image IR。"""
 
-    def test_base64_format(self):
-        """测试base64|格式转换。"""
+    def test_uses_validated_image_mime_and_bytes(self):
         from src.kernel.llm.model_client.openai_client import _image_to_data_url
 
-        b64_data = "iVBORw0KGgoAAAANSUhEUgAAAAUA"
-        result = _image_to_data_url(f"base64|{b64_data}")
+        image = Image.from_bytes(_PNG_BYTES)
+        assert _image_to_data_url(image) == image.data_url
 
-        assert result.startswith("data:image/png;base64,")
-        assert b64_data in result
-
-    def test_already_data_url(self):
-        """测试已经是data URL格式。"""
+    def test_uses_detected_webp_mime(self):
         from src.kernel.llm.model_client.openai_client import _image_to_data_url
 
-        url = "data:image/png;base64,iVBORw0KGgo"
-        result = _image_to_data_url(url)
+        image = Image.from_bytes(_WEBP_BYTES)
+        assert _image_to_data_url(image) == image.data_url
+        assert _image_to_data_url(image).startswith("data:image/webp;base64,")
 
-        assert result == url
-
-    def test_detects_webp_base64(self):
-        """测试纯 base64 图片会按文件头推断 MIME。"""
+    def test_does_not_accept_unvalidated_strings(self):
         from src.kernel.llm.model_client.openai_client import _image_to_data_url
 
-        webp_b64 = base64.b64encode(b"RIFF\x10\x00\x00\x00WEBPVP8 ").decode()
-        result = _image_to_data_url(webp_b64)
-
-        assert result.startswith("data:image/webp;base64,")
-
-    def test_file_not_found(self):
-        """测试文件不存在。"""
-        from src.kernel.llm.model_client.openai_client import _image_to_data_url
-
-        with pytest.raises(FileNotFoundError, match="Image file not found"):
-            _image_to_data_url("/nonexistent/file.png")
-
-    @patch("src.kernel.llm.model_client.openai_client.Path")
-    def test_valid_file_path(self, mock_path):
-        """测试有效的文件路径。"""
-        from src.kernel.llm.model_client.openai_client import _image_to_data_url
-
-        # 创建mock文件
-        mock_file = Mock()
-        mock_file.exists.return_value = True
-        mock_file.is_file.return_value = True
-        mock_file.read_bytes.return_value = b"fake_image_data"
-        mock_path.return_value = mock_file
-
-        result = _image_to_data_url("/fake/path/image.png")
-
-        assert result.startswith("data:image/png;base64,")
-        # 验证base64编码
-        assert "fake_image_data" not in result  # 应该被编码
+        with pytest.raises(AttributeError):
+            _image_to_data_url("data:image/png;base64,anything")  # type: ignore[arg-type]
 
 
 class TestPayloadsToOpenAIMessages:
@@ -259,7 +216,7 @@ class TestPayloadsToOpenAIMessages:
         payloads = [
             LLMPayload(
                 ROLE.USER,
-                [Text("What's in this image?"), Image("base64|aGVsbG8=")],
+                [Text("What's in this image?"), Image.from_bytes(_PNG_BYTES)],
             )
         ]
         messages, tools = _payloads_to_openai_messages(payloads)
@@ -272,34 +229,27 @@ class TestPayloadsToOpenAIMessages:
         assert content[0]["type"] == "text"
         assert content[1]["type"] == "image_url"
 
-    def test_multimodal_content_with_video(self):
-        """测试多模态内容（文本+视频）。"""
+    def test_multimodal_content_with_video_is_rejected(self):
+        """OpenAI Chat Completions 不把视频伪装成 image_url。"""
         from src.kernel.llm.model_client.openai_client import _payloads_to_openai_messages
 
         payloads = [
             LLMPayload(
                 ROLE.USER,
-                [Text("看看这个视频"), Video("base64|AAAAGGZ0eXBtcDQy")],
+                [Text("看看这个视频"), Video.from_bytes(_MP4_BYTES)],
             )
         ]
-        messages, tools = _payloads_to_openai_messages(payloads)
-
-        assert len(messages) == 1
-        assert tools == []
-        content = messages[0]["content"]
-        assert isinstance(content, list)
-        assert len(content) == 2
-        assert content[1]["type"] == "image_url"
-        assert content[1]["image_url"]["url"].startswith("data:video/")
+        with pytest.raises(UnsupportedModalityError, match="视频"):
+            _payloads_to_openai_messages(payloads)
 
     def test_multimodal_content_with_audio(self):
-        """测试多模态内容（文本+音频）。"""
+        """测试多模态内容（文本+已验证音频）。"""
         from src.kernel.llm.model_client.openai_client import _payloads_to_openai_messages
 
         payloads = [
             LLMPayload(
                 ROLE.USER,
-                [Text("转写这段音频"), Audio("base64|aGVsbG8=")],
+                [Text("转写这段音频"), Audio.from_bytes(_MP3_BYTES)],
             )
         ]
         messages, tools = _payloads_to_openai_messages(payloads)
@@ -310,58 +260,45 @@ class TestPayloadsToOpenAIMessages:
         assert isinstance(content, list)
         assert len(content) == 2
         assert content[1]["type"] == "input_audio"
-        assert content[1]["input_audio"]["format"] == "mp3"
+        assert content[1]["input_audio"] == {
+            "data": _b64(_MP3_BYTES),
+            "format": "mp3",
+        }
 
     def test_audio_format_propagates_wav(self):
-        """Audio mime_type=audio/wav 应输出 format='wav'。"""
+        """已验证 audio/wav 应输出 format='wav'。"""
         from src.kernel.llm.model_client.openai_client import _payloads_to_openai_messages
 
-        payloads = [
-            LLMPayload(
-                ROLE.USER,
-                [Audio("base64|aGVsbG8=", mime_type="audio/wav")],
-            )
-        ]
+        payloads = [LLMPayload(ROLE.USER, [Audio.from_bytes(_WAV_BYTES)])]
         messages, _ = _payloads_to_openai_messages(payloads)
+        assert messages[0]["content"][0]["input_audio"] == {
+            "data": _b64(_WAV_BYTES),
+            "format": "wav",
+        }
+
+    def test_audio_format_alias_is_canonicalized(self):
+        """audio/x-wav 在 IR 层规范化为 audio/wav。"""
+        from src.kernel.llm.model_client.openai_client import _payloads_to_openai_messages
+
+        audio = Audio.from_bytes(_WAV_BYTES, mime_type="audio/x-wav")
+        messages, _ = _payloads_to_openai_messages([LLMPayload(ROLE.USER, [audio])])
         assert messages[0]["content"][0]["input_audio"]["format"] == "wav"
 
-    def test_audio_format_propagates_x_wav(self):
-        """audio/x-wav 也应映射为 wav。"""
-        from src.kernel.llm.model_client.openai_client import _payloads_to_openai_messages
+    def test_audio_unknown_wire_mime_is_rejected(self):
+        """Provider 不为未知音频 MIME 猜测 mp3。"""
+        from src.kernel.llm.model_client.openai_client import _audio_mime_to_format
 
-        payloads = [
-            LLMPayload(
-                ROLE.USER,
-                [Audio("base64|aGVsbG8=", mime_type="audio/x-wav")],
-            )
-        ]
-        messages, _ = _payloads_to_openai_messages(payloads)
-        assert messages[0]["content"][0]["input_audio"]["format"] == "wav"
-
-    def test_audio_format_unknown_falls_back_to_mp3(self):
-        """未知 mime_type 保守降级为 mp3。"""
-        from src.kernel.llm.model_client.openai_client import _payloads_to_openai_messages
-
-        payloads = [
-            LLMPayload(
-                ROLE.USER,
-                [Audio("base64|aGVsbG8=", mime_type="audio/silk")],
-            )
-        ]
-        messages, _ = _payloads_to_openai_messages(payloads)
-        assert messages[0]["content"][0]["input_audio"]["format"] == "mp3"
+        with pytest.raises(UnsupportedModalityError, match="audio/silk"):
+            _audio_mime_to_format("audio/silk")
 
     def test_audio_data_url_extracts_mime_type(self):
-        """data URL 应自动提取 mime_type，并体现在 OpenAI format 字段。"""
+        """data URL 的真实 MIME 应体现在 OpenAI format 字段。"""
         from src.kernel.llm.model_client.openai_client import _payloads_to_openai_messages
 
-        payloads = [
-            LLMPayload(
-                ROLE.USER,
-                [Audio("data:audio/wav;base64,aGVsbG8=")],
-            )
-        ]
-        messages, _ = _payloads_to_openai_messages(payloads)
+        payload = f"data:audio/wav;base64,{_b64(_WAV_BYTES)}"
+        messages, _ = _payloads_to_openai_messages(
+            [LLMPayload(ROLE.USER, [Audio(payload)])]
+        )
         assert messages[0]["content"][0]["input_audio"]["format"] == "wav"
 
     def test_tool_payload(self):
@@ -1003,183 +940,83 @@ class TestOpenAIChatClient:
         assert call_kwargs["presence_penalty"] == 0.1
 
     @pytest.mark.asyncio
-    async def test_create_retries_without_native_video_when_unsupported(self):
-        """测试上游不支持原生视频输入时会自动降级并重试。"""
+    async def test_create_rejects_video_before_provider_call(self):
+        """视频在 OpenAI provider 序列化前明确失败，不能伪装成图片或重试。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
 
-        mock_completion = MagicMock()
-        mock_completion.choices = [MagicMock()]
-        mock_completion.choices[0].message.content = "fallback-ok"
-        mock_completion.choices[0].message.tool_calls = None
-
         mock_chat = AsyncMock()
-        mock_chat.completions.create = AsyncMock(
-            side_effect=[
-                Exception("invalid_request_error: unsupported content type video_url"),
-                mock_completion,
-            ]
-        )
-
         mock_openai_client = MagicMock()
-        mock_openai_client.chat.completions.create = mock_chat.completions.create
+        mock_openai_client.chat.completions.create = mock_chat
 
         client = OpenAIChatClient()
-        client._clients = {}
         client._get_client = MagicMock(return_value=mock_openai_client)
+        payloads = [
+            LLMPayload(ROLE.USER, [Text("描述一下"), Video.from_bytes(_MP4_BYTES)])
+        ]
 
-        payloads = [LLMPayload(ROLE.USER, [Text("描述一下"), Video("base64|AAAAGGZ0eXBtcDQy")])]
-        model_set = {
-            "api_key": "test-key",
-            "base_url": None,
-            "timeout": None,
-            "max_tokens": None,
-            "temperature": None,
-            "extra_params": {},
-        }
-
-        message, tool_calls, stream_iter, reasoning_content, request_record_id = await client.create(
-            model_name="gpt-4o",
-            payloads=payloads,
-            tools=[],
-            request_name="test",
-            model_set=model_set,
-            stream=False,
-        )
-
-        assert message == "fallback-ok"
-        assert tool_calls == []
-        assert stream_iter is None
-        assert reasoning_content is None
-        assert isinstance(request_record_id, int)
-        assert mock_chat.completions.create.await_count == 2
-
-        first_call_kwargs = mock_chat.completions.create.await_args_list[0].kwargs
-        second_call_kwargs = mock_chat.completions.create.await_args_list[1].kwargs
-        first_content = first_call_kwargs["messages"][0]["content"]
-        second_content = second_call_kwargs["messages"][0]["content"]
-        assert any(
-            item.get("type") == "image_url"
-            and (item.get("image_url") or {}).get("url", "").startswith("data:video/")
-            for item in first_content
-            if isinstance(item, dict)
-        )
-        assert all(
-            not (
-                item.get("type") == "image_url"
-                and (item.get("image_url") or {}).get("url", "").startswith("data:video/")
+        with pytest.raises(UnsupportedModalityError, match="视频"):
+            await client.create(
+                model_name="gpt-4o",
+                payloads=payloads,
+                tools=[],
+                request_name="test",
+                model_set={"api_key": "test-key", "extra_params": {}},
+                stream=False,
             )
-            for item in second_content
-            if isinstance(item, dict)
-        )
+
+        mock_chat.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_create_retries_without_native_video_when_provider_reports_invalid_image_format(self):
-        """视频被 image_url 通道拒收时，也应自动去掉视频块并重试。"""
+    async def test_create_rejects_video_without_provider_retry(self):
+        """Provider 侧不根据错误文本做视频删除/重试。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
 
-        mock_completion = MagicMock()
-        mock_completion.choices = [MagicMock()]
-        mock_completion.choices[0].message.content = "fallback-ok"
-        mock_completion.choices[0].message.tool_calls = None
-
         mock_chat = AsyncMock()
-        mock_chat.completions.create = AsyncMock(
-            side_effect=[
-                Exception("param incorrect: invalid image format, only bmp/gif/png/jpeg/webp are supported"),
-                mock_completion,
-            ]
-        )
-
         mock_openai_client = MagicMock()
-        mock_openai_client.chat.completions.create = mock_chat.completions.create
-
+        mock_openai_client.chat.completions.create = mock_chat
         client = OpenAIChatClient()
-        client._clients = {}
         client._get_client = MagicMock(return_value=mock_openai_client)
 
-        payloads = [LLMPayload(ROLE.USER, [Text("描述一下"), Video("base64|AAAAGGZ0eXBtcDQy")])]
-        model_set = {
-            "api_key": "test-key",
-            "base_url": None,
-            "timeout": None,
-            "max_tokens": None,
-            "temperature": None,
-            "extra_params": {},
-        }
-
-        message, tool_calls, stream_iter, reasoning_content, request_record_id = await client.create(
-            model_name="mimo-v2.5",
-            payloads=payloads,
-            tools=[],
-            request_name="test",
-            model_set=model_set,
-            stream=False,
-        )
-
-        assert message == "fallback-ok"
-        assert tool_calls == []
-        assert stream_iter is None
-        assert reasoning_content is None
-        assert isinstance(request_record_id, int)
-        assert mock_chat.completions.create.await_count == 2
+        with pytest.raises(UnsupportedModalityError):
+            await client.create(
+                model_name="mimo-v2.5",
+                payloads=[LLMPayload(ROLE.USER, [Video.from_bytes(_MP4_BYTES)])],
+                tools=[],
+                request_name="test",
+                model_set={"api_key": "test-key", "extra_params": {}},
+                stream=False,
+            )
+        mock_chat.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_create_retries_without_native_image_when_endpoint_lacks_image_support(self):
-        """图片输入不被当前端点支持时，应自动去掉图片块并重试。"""
+    async def test_create_preserves_provider_image_error_without_text_fallback(self):
+        """图片被端点拒绝时保留上游错误，不删图也不改成文字请求。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
 
-        mock_completion = MagicMock()
-        mock_completion.choices = [MagicMock()]
-        mock_completion.choices[0].message.content = "fallback-ok"
-        mock_completion.choices[0].message.tool_calls = None
-
-        mock_chat = AsyncMock()
-        mock_chat.completions.create = AsyncMock(
-            side_effect=[
-                Exception("Error code: 404 - {'error': {'message': 'No endpoints found that support image input'}}"),
-                mock_completion,
-            ]
+        upstream_error = Exception(
+            "Error code: 404 - {'error': {'message': 'No endpoints found that support image input'}}"
         )
-
+        mock_chat = AsyncMock(side_effect=upstream_error)
         mock_openai_client = MagicMock()
-        mock_openai_client.chat.completions.create = mock_chat.completions.create
-
+        mock_openai_client.chat.completions.create = mock_chat
         client = OpenAIChatClient()
-        client._clients = {}
         client._get_client = MagicMock(return_value=mock_openai_client)
 
-        payloads = [LLMPayload(ROLE.USER, [Text("描述一下"), Image("base64|aGVsbG8=")])]
-        model_set = {
-            "api_key": "test-key",
-            "base_url": None,
-            "timeout": None,
-            "max_tokens": None,
-            "temperature": None,
-            "extra_params": {},
-        }
-
-        message, tool_calls, stream_iter, reasoning_content, request_record_id = await client.create(
-            model_name="mimo-v2.5-pro",
-            payloads=payloads,
-            tools=[],
-            request_name="test",
-            model_set=model_set,
-            stream=False,
-        )
-
-        assert message == "fallback-ok"
-        assert tool_calls == []
-        assert stream_iter is None
-        assert reasoning_content is None
-        assert isinstance(request_record_id, int)
-        assert mock_chat.completions.create.await_count == 2
-
-        first_call_kwargs = mock_chat.completions.create.await_args_list[0].kwargs
-        second_call_kwargs = mock_chat.completions.create.await_args_list[1].kwargs
-        first_content = first_call_kwargs["messages"][0]["content"]
-        second_content = second_call_kwargs["messages"][0]["content"]
-        assert any(item.get("type") == "image_url" for item in first_content if isinstance(item, dict))
-        assert all(item.get("type") != "image_url" for item in second_content if isinstance(item, dict))
+        with pytest.raises(Exception, match="No endpoints found that support image input"):
+            await client.create(
+                model_name="mimo-v2.5-pro",
+                payloads=[
+                    LLMPayload(
+                        ROLE.USER,
+                        [Text("描述一下"), Image.from_bytes(_PNG_BYTES)],
+                    )
+                ],
+                tools=[],
+                request_name="test",
+                model_set={"api_key": "test-key", "extra_params": {}},
+                stream=False,
+            )
+        mock_chat.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_life_inspect_media_native_image_error_is_preserved_for_chatter_fallback(self):
@@ -1205,7 +1042,7 @@ class TestOpenAIChatClient:
                 ROLE.USER,
                 [
                     Text("你刚刚调用了 tool-inspect_media。以下媒体已被提升为原生多模态输入。"),
-                    Image("base64|aGVsbG8="),
+                    Image.from_bytes(_PNG_BYTES),
                 ],
             )
         ]
@@ -1231,60 +1068,31 @@ class TestOpenAIChatClient:
         assert mock_chat.completions.create.await_count == 1
 
     @pytest.mark.asyncio
-    async def test_create_stream_retries_without_native_image_when_endpoint_lacks_image_support(self):
-        """流式图片输入不被支持时，也应自动去掉图片块并重试。"""
+    async def test_create_stream_preserves_provider_image_error(self):
+        """流式图片请求失败时同样不删除图片块或自动重试。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
 
-        fake_stream = AsyncMock()
-        fake_stream.__aiter__.return_value = iter([])
-
-        mock_chat = AsyncMock()
-        mock_chat.completions.create = AsyncMock(
-            side_effect=[
-                Exception("Error code: 404 - {'error': {'message': 'No endpoints found that support image input'}}"),
-                fake_stream,
-            ]
+        upstream_error = Exception(
+            "Error code: 404 - {'error': {'message': 'No endpoints found that support image input'}}"
         )
-
+        mock_chat = AsyncMock(side_effect=upstream_error)
         mock_openai_client = MagicMock()
-        mock_openai_client.chat.completions.create = mock_chat.completions.create
-
+        mock_openai_client.chat.completions.create = mock_chat
         client = OpenAIChatClient()
-        client._clients = {}
         client._get_client = MagicMock(return_value=mock_openai_client)
 
-        payloads = [LLMPayload(ROLE.USER, [Text("描述一下"), Image("base64|aGVsbG8=")])]
-        model_set = {
-            "api_key": "test-key",
-            "base_url": None,
-            "timeout": None,
-            "max_tokens": None,
-            "temperature": None,
-            "extra_params": {},
-        }
-
-        message, tool_calls, stream_iter, reasoning_content, request_record_id = await client.create(
-            model_name="mimo-v2.5-pro",
-            payloads=payloads,
-            tools=[],
-            request_name="test",
-            model_set=model_set,
-            stream=True,
-        )
-
-        assert message is None
-        assert tool_calls is None
-        assert stream_iter is not None
-        assert reasoning_content is None
-        assert isinstance(request_record_id, int)
-        assert mock_chat.completions.create.await_count == 2
-
-        first_call_kwargs = mock_chat.completions.create.await_args_list[0].kwargs
-        second_call_kwargs = mock_chat.completions.create.await_args_list[1].kwargs
-        first_content = first_call_kwargs["messages"][0]["content"]
-        second_content = second_call_kwargs["messages"][0]["content"]
-        assert any(item.get("type") == "image_url" for item in first_content if isinstance(item, dict))
-        assert all(item.get("type") != "image_url" for item in second_content if isinstance(item, dict))
+        with pytest.raises(Exception, match="No endpoints found that support image input"):
+            await client.create(
+                model_name="mimo-v2.5-pro",
+                payloads=[
+                    LLMPayload(ROLE.USER, [Text("描述一下"), Image.from_bytes(_PNG_BYTES)])
+                ],
+                tools=[],
+                request_name="test",
+                model_set={"api_key": "test-key", "extra_params": {}},
+                stream=True,
+            )
+        mock_chat.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_create_inject_reasoning_content_for_thinking_tool_calls(self):

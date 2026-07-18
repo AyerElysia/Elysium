@@ -2,17 +2,35 @@
 
 from __future__ import annotations
 
+import base64
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from src.kernel.llm import Image, LLMPayload, ReasoningText, ROLE, Text, ToolCall, ToolResult
+from src.kernel.llm import (
+    Audio,
+    File,
+    Image,
+    LLMPayload,
+    ReasoningText,
+    ROLE,
+    Text,
+    ToolCall,
+    ToolResult,
+    UnsupportedModalityError,
+    Video,
+)
 from src.kernel.llm.model_client.anthropic_client import (
     AnthropicChatClient,
     _parse_anthropic_message,
     _payloads_to_anthropic_messages,
     _to_anthropic_tool,
+)
+
+
+_PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 )
 
 
@@ -87,7 +105,7 @@ class TestPayloadsToAnthropicMessages:
         payloads = [
             LLMPayload(ROLE.SYSTEM, Text("You are helpful.")),
             LLMPayload(ROLE.TOOL, MockTool),
-            LLMPayload(ROLE.USER, [Text("Hello"), Image("base64|aGVsbG8=")]),
+            LLMPayload(ROLE.USER, [Text("Hello"), Image.from_bytes(_PNG_BYTES)]),
             LLMPayload(
                 ROLE.ASSISTANT,
                 [ReasoningText("think", signature="sig_1"), Text("Need tool"), ToolCall(id="toolu_1", name="get_weather", args={"city": "Paris"})],

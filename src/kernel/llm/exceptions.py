@@ -18,6 +18,18 @@ class LLMConfigurationError(LLMError):
     """配置错误。"""
 
 
+class MediaValidationError(LLMError):
+    """媒体输入无法通过结构、编码或文件签名校验。"""
+
+
+class MediaLimitError(MediaValidationError):
+    """媒体输入超过单项或请求限制。"""
+
+
+class UnsupportedModalityError(LLMError):
+    """当前模型或 provider 不支持请求中的媒体模态。"""
+
+
 class LLMResponseConsumedError(LLMError):
     """响应已被消费。"""
 
@@ -91,6 +103,8 @@ def should_retry_same_model(error: BaseException) -> bool:
         error,
         (
             LLMConfigurationError,
+            MediaValidationError,
+            UnsupportedModalityError,
             LLMAuthenticationError,
             LLMContentFilterError,
             LLMTokenLimitError,
