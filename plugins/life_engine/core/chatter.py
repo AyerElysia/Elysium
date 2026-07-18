@@ -39,6 +39,7 @@ from src.kernel.llm import (
     UnsupportedModalityError,
     Video,
 )
+from src.kernel.llm.media_capabilities import normalize_media_capabilities
 from .context_compaction import (
     DEFAULT_MAX_GROUPS as _CONTEXT_COMPRESSION_MAX_GROUPS,
     DEFAULT_MAX_PART_CHARS as _CONTEXT_COMPRESSION_MAX_PART_CHARS,
@@ -1146,6 +1147,92 @@ class LifeChatter(BaseChatter):
         cls._GLOBAL_RUNTIME = None
         cls._GLOBAL_USABLE_MAP = None
 
+    def _configured_primary_task_name(self) -> str:
+        """返回 life_chatter 主任务名；旧配置缺失或留空时沿用 actor。"""
+
+        cfg = self._get_config()
+        model_cfg = getattr(cfg, "model", None) if cfg is not None else None
+        return str(getattr(model_cfg, "task_name", "") or "").strip() or "actor"
+
+    def _required_primary_modalities(self) -> set[str]:
+        """返回长生命周期主 request 必须预先覆盖的输入模态。"""
+
+        required = {"text"}
+        cfg = self._get_multimodal_cfg()
+        if cfg is None or not bool(getattr(cfg, "enabled", False)):
+            return required
+
+        def positive_budget(name: str, default: int) -> bool:
+            try:
+                return int(getattr(cfg, name, default)) > 0
+            except (TypeError, ValueError):
+                return default > 0
+
+        if positive_budget("max_images_per_payload", 4) and (
+            bool(getattr(cfg, "native_image", True))
+            or bool(getattr(cfg, "native_emoji", True))
+        ):
+            required.add("image")
+        if positive_budget("max_videos_per_payload", 1) and bool(
+            getattr(cfg, "native_video", False)
+        ):
+            required.add("video")
+        if positive_budget("max_audios_per_payload", 2) and bool(
+            getattr(cfg, "native_audio", False)
+        ):
+            required.add("audio")
+        return required
+
+    @staticmethod
+    def _model_set_supports_modalities(
+        model_set: Any,
+        required_modalities: set[str],
+    ) -> bool:
+        """判断一个 task 是否至少有一个模型可承接完整主请求。"""
+
+        if not isinstance(model_set, (list, tuple)) or not model_set:
+            return False
+        for model in model_set:
+            if not isinstance(model, dict):
+                continue
+            try:
+                capabilities = normalize_media_capabilities(
+                    model.get("media_capabilities")
+                )
+            except Exception:
+                continue
+            if required_modalities.issubset(set(capabilities["modalities"])):
+                return True
+        return False
+
+    def _create_global_request(self) -> Any:
+        """按配置创建主 request，并为旧配置和原生媒体能力安全回退。"""
+
+        task_name = self._configured_primary_task_name()
+        if task_name == "actor":
+            return self.create_request("actor", request_name="life_chatter")
+
+        try:
+            request = self.create_request(task_name, request_name="life_chatter")
+        except Exception as exc:
+            logger.warning(
+                f"life_chatter 主任务 {task_name!r} 不可用，回退 actor: {exc}"
+            )
+            return self.create_request("actor", request_name="life_chatter")
+
+        required_modalities = self._required_primary_modalities()
+        if not self._model_set_supports_modalities(
+            getattr(request, "model_set", None),
+            required_modalities,
+        ):
+            logger.warning(
+                "life_chatter 主任务 "
+                f"{task_name!r} 无可用模型覆盖 {sorted(required_modalities)!r}，"
+                "回退 actor"
+            )
+            return self.create_request("actor", request_name="life_chatter")
+        return request
+
     async def _get_or_create_global_runtime(
         self,
         service: LifeEngineService | None,
@@ -1155,7 +1242,7 @@ class LifeChatter(BaseChatter):
         if self.__class__._GLOBAL_RUNTIME is not None and self.__class__._GLOBAL_USABLE_MAP is not None:
             return self.__class__._GLOBAL_RUNTIME, self.__class__._GLOBAL_USABLE_MAP
 
-        request = self.create_request("actor", request_name="life_chatter")
+        request = self._create_global_request()
         self._install_context_compression_hook(
             request,
             chatter_config=getattr(self._get_config(), "chatter", None),
@@ -2734,12 +2821,60 @@ class LifeChatter(BaseChatter):
         await response
         return response
 
+    @staticmethod
+    def _new_media_budget(cfg: Any) -> MediaBudget:
+        return MediaBudget(
+            max_images=int(getattr(cfg, "max_images_per_payload", 4) or 0),
+            max_videos=int(getattr(cfg, "max_videos_per_payload", 1) or 0),
+            max_audios=int(getattr(cfg, "max_audios_per_payload", 2) or 0),
+        )
+
+    def _extract_unread_media(
+        self,
+        unread_msgs: list[Message],
+    ) -> tuple[list[MediaItem], MediaBudget | None]:
+        """按 compose 的同一配置和预算规划当前 unread 媒体。"""
+
+        cfg = self._get_multimodal_cfg()
+        if cfg is None or not bool(getattr(cfg, "enabled", False)):
+            return [], None
+
+        budget = self._new_media_budget(cfg)
+        candidates = extract_media_from_messages(
+            unread_msgs,
+            budget,
+            enable_image=bool(getattr(cfg, "native_image", True)),
+            enable_emoji=bool(getattr(cfg, "native_emoji", True)),
+            enable_video=bool(getattr(cfg, "native_video", False)),
+            enable_audio=bool(getattr(cfg, "native_audio", False)),
+            audio_max_seconds=int(getattr(cfg, "audio_max_seconds", 60) or 60),
+        )
+        return candidates, budget
+
+    @staticmethod
+    def _has_observable_media(media_items: list[MediaItem]) -> bool:
+        """只把已 materialized、可进入原生/fallback 链路的媒体视为可观察。"""
+
+        for item in media_items:
+            attachment = item.attachment
+            if attachment is None:
+                continue
+            try:
+                if attachment.media_ref.is_materialized:
+                    return True
+            except Exception:
+                continue
+        return False
+
     def _compose_unread_user_content(
         self,
         rt: "_WorkflowRuntime",
         unread_msgs: list[Message],
         user_prompt_text: str,
         chat_stream: ChatStream | None = None,
+        *,
+        unread_media: list[MediaItem] | None = None,
+        media_budget: MediaBudget | None = None,
     ) -> list[Content]:
         """把 user_prompt_text 与 unread_msgs 中可注入的多模态媒体组合为 Content 列表。
 
@@ -2752,26 +2887,17 @@ class LifeChatter(BaseChatter):
         if cfg is None or not getattr(cfg, "enabled", False):
             return [Text(user_prompt_text)]
 
-        budget = MediaBudget(
-            max_images=int(getattr(cfg, "max_images_per_payload", 4) or 0),
-            max_videos=int(getattr(cfg, "max_videos_per_payload", 1) or 0),
-            max_audios=int(getattr(cfg, "max_audios_per_payload", 2) or 0),
-        )
+        if unread_media is None or media_budget is None:
+            candidates, budget = self._extract_unread_media(unread_msgs)
+            if budget is None:
+                return [Text(user_prompt_text)]
+        else:
+            candidates = list(unread_media)
+            budget = media_budget
+
         enable_image = bool(getattr(cfg, "native_image", True))
         enable_emoji = bool(getattr(cfg, "native_emoji", True))
-        enable_video = bool(getattr(cfg, "native_video", False))
-        enable_audio = bool(getattr(cfg, "native_audio", False))
         audio_max_seconds = int(getattr(cfg, "audio_max_seconds", 60) or 60)
-
-        candidates = extract_media_from_messages(
-            unread_msgs,
-            budget,
-            enable_image=enable_image,
-            enable_emoji=enable_emoji,
-            enable_video=enable_video,
-            enable_audio=enable_audio,
-            audio_max_seconds=audio_max_seconds,
-        )
         if bool(getattr(cfg, "include_history_media", False)) and chat_stream is not None:
             context = getattr(chat_stream, "context", None)
             history_msgs = list(getattr(context, "history_messages", []) or [])
@@ -3472,8 +3598,13 @@ class LifeChatter(BaseChatter):
                 unread_lines = "\n".join(
                     self.format_message_line(msg) for msg in unread_msgs
                 )
+                unread_media, unread_media_budget = self._extract_unread_media(
+                    unread_msgs
+                )
+                has_observable_media = self._has_observable_media(unread_media)
 
-                # 路由：是否把这批消息交给表达层继续处理
+                # 路由：是否把这批消息交给表达层继续处理。router 只读纯文本，
+                # 因此不能用它的 false 丢弃 planner 已确认可观察的真实媒体。
                 decision = await self._should_respond(
                     unread_lines, unread_msgs, chat_stream,
                 )
@@ -3482,10 +3613,12 @@ class LifeChatter(BaseChatter):
                 )
 
                 if not decision.get("should_respond", False):
-                    logger.info("决定不响应，继续等待...")
-                    rt.must_reply = False
-                    await self.flush_unreads(unread_msgs)
-                    return Wait()
+                    if not has_observable_media:
+                        logger.info("决定不响应，继续等待...")
+                        rt.must_reply = False
+                        await self.flush_unreads(unread_msgs)
+                        return Wait()
+                    logger.info("纯文本路由未响应，但 unread 含可观察媒体，交给主模型")
 
                 runtime_context_text = self._format_runtime_context_text(
                     self._consume_runtime_assistant_context(chat_stream)
@@ -3529,7 +3662,12 @@ class LifeChatter(BaseChatter):
                 self._upsert_pending_unread_payload(
                     response=rt.response,
                     formatted_content=self._compose_unread_user_content(
-                        rt, unread_msgs, user_prompt_text, chat_stream
+                        rt,
+                        unread_msgs,
+                        user_prompt_text,
+                        chat_stream,
+                        unread_media=unread_media,
+                        media_budget=unread_media_budget,
                     ),
                 )
                 rt.history_merged = True

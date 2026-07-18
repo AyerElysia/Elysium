@@ -21,9 +21,17 @@ from plugins.life_engine.service.event_builder import EventType, LifeEngineEvent
 from plugins.life_engine.tools.exec_tools import LifeEngineBashTool
 from plugins.life_engine.tools.file_tools import LifeEngineRunAgentTool, LifeEngineWakeDFCTool
 from src.core.components.base.chatter import BaseChatter, Failure, Success, Wait
+from src.core.models.media import MediaAttachment
 from src.core.models.message import Message, MessageType
 from src.kernel.llm import Image, LLMContextManager, LLMPayload, ROLE, Text, ToolResult
 import pytest
+
+
+_TEST_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+    "AAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
+
 
 def test_life_chatter_system_prompt_includes_memory_and_chatter_tools_not_heartbeat_tool(tmp_path) -> None:
     """聊天态应共享 SOUL/USER/MEMORY/TOOLS，并保留核心工具说明。"""
@@ -417,6 +425,304 @@ async def test_life_chatter_global_runtime_is_reused(monkeypatch) -> None:
     assert len(created_requests) == 1
 
     LifeChatter.reset_global_runtime()
+
+
+def _life_chatter_test_image_message(*, descriptor_only: bool = False) -> Message:
+    attachment = MediaAttachment.from_legacy(
+        {"type": "image", "data": _TEST_PNG_B64},
+        source_message_id="image-message",
+    )
+    if descriptor_only:
+        attachment = MediaAttachment.from_descriptor(attachment.to_descriptor())
+    return Message(
+        message_id="image-message",
+        content="[图片]",
+        processed_plain_text="[图片]",
+        message_type=MessageType.IMAGE,
+        sender_role="other",
+        stream_id="stream-a",
+        attachments=[attachment],
+    )
+
+
+def _life_chatter_for_config(config: object | None) -> LifeChatter:
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=config)
+    chatter.stream_id = "stream-a"
+    return chatter
+
+
+def test_life_chatter_observable_unread_media_respects_materialization_and_config() -> None:
+    config = LifeEngineConfig()
+    chatter = _life_chatter_for_config(config)
+
+    materialized, _ = chatter._extract_unread_media(
+        [_life_chatter_test_image_message()]
+    )
+    descriptor_only, _ = chatter._extract_unread_media(
+        [_life_chatter_test_image_message(descriptor_only=True)]
+    )
+    empty_body, _ = chatter._extract_unread_media(
+        [
+            Message(
+                message_id="empty-image",
+                content={"media": [{"type": "image", "data": ""}]},
+                processed_plain_text="[图片]",
+                message_type=MessageType.IMAGE,
+                sender_role="other",
+            )
+        ]
+    )
+
+    assert chatter._has_observable_media(materialized) is True
+    assert chatter._has_observable_media(descriptor_only) is False
+    assert chatter._has_observable_media(empty_body) is False
+
+    config.multimodal.native_image = False
+    disabled, _ = chatter._extract_unread_media(
+        [_life_chatter_test_image_message()]
+    )
+    assert chatter._has_observable_media(disabled) is False
+
+    config.multimodal.native_image = True
+    config.multimodal.max_images_per_payload = 0
+    over_budget, _ = chatter._extract_unread_media(
+        [_life_chatter_test_image_message()]
+    )
+    assert chatter._has_observable_media(over_budget) is False
+
+    config.multimodal.max_images_per_payload = 4
+    compatible, _ = chatter._extract_unread_media(
+        [
+            Message(
+                message_id="legacy-image",
+                content={"media": [{"type": "image", "data": _TEST_PNG_B64}]},
+                processed_plain_text="[图片]",
+                message_type=MessageType.IMAGE,
+                sender_role="other",
+            )
+        ]
+    )
+    assert chatter._has_observable_media(compatible) is True
+
+
+class _RouterBranchRequest:
+    def __init__(self, flushed: list[Message], *, must_not_send: bool = False) -> None:
+        self.payloads: list[LLMPayload] = []
+        self.call_list = [
+            SimpleNamespace(
+                id="pass-1",
+                name="action-life_pass_and_wait",
+                args={},
+            )
+        ]
+        self.message = ""
+        self.flushed = flushed
+        self.must_not_send = must_not_send
+        self.send_calls = 0
+        self.saw_native_image = False
+
+    def add_payload(self, payload: LLMPayload) -> None:
+        self.payloads.append(payload)
+
+    async def send(self, *, stream: bool = False):
+        assert stream is False
+        if self.must_not_send:
+            raise AssertionError("router=false 的非媒体消息不得进入主 request")
+        assert self.flushed == [], "unread 不得在主模型发送前被路由阶段 flush"
+        self.send_calls += 1
+        self.saw_native_image = any(
+            isinstance(part, Image)
+            for payload in self.payloads
+            for part in payload.content
+        )
+        return self
+
+    def __await__(self):
+        async def done():
+            return self
+
+        return done().__await__()
+
+
+async def _drive_router_false_case(
+    monkeypatch,
+    *,
+    unread: Message,
+    config: LifeEngineConfig,
+    must_not_send: bool,
+) -> tuple[Wait | Success | Failure, _RouterBranchRequest, list[Message]]:
+    LifeChatter.reset_global_runtime()
+    flushed: list[Message] = []
+    request = _RouterBranchRequest(flushed, must_not_send=must_not_send)
+    rt = _WorkflowRuntime(
+        response=request,
+        phase=_Phase.WAIT_USER,
+        history_merged=False,
+        unreads=[],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[],
+    )
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+    chatter = _life_chatter_for_config(config)
+    chat_stream = SimpleNamespace(
+        stream_id="stream-a",
+        stream_name="Test",
+        platform="test",
+        chat_type="private",
+        context=SimpleNamespace(history_messages=[]),
+    )
+
+    async def fetch_unreads():
+        return [], [unread]
+
+    async def router_false(*_args, **_kwargs):
+        return {"reason": "test false", "should_respond": False}
+
+    async def no_history(*_args, **_kwargs):
+        return ""
+
+    async def no_dynamic_context(*_args, **_kwargs):
+        return "", 0
+
+    async def flush_unreads(messages):
+        flushed.extend(messages)
+
+    async def immediate_model_turn(awaitable):
+        return await awaitable
+
+    monkeypatch.setattr(chatter, "fetch_unreads", fetch_unreads)
+    monkeypatch.setattr(chatter, "_should_respond", router_false)
+    monkeypatch.setattr(chatter, "_build_history_text_async", no_history)
+    monkeypatch.setattr(chatter, "_build_dynamic_context_text", no_dynamic_context)
+    monkeypatch.setattr(chatter, "flush_unreads", flush_unreads)
+    monkeypatch.setattr(chatter, "_await_model_turn", immediate_model_turn)
+    monkeypatch.setattr(chatter, "_maybe_compact_runtime_context", lambda _response: None)
+    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", lambda _response: None)
+    monkeypatch.setattr(
+        "src.kernel.concurrency.get_watchdog",
+        lambda: SimpleNamespace(feed_dog=lambda _stream_id: None),
+    )
+
+    result = await chatter._drive_global_runtime_until_yield(chat_stream, service=None)
+    LifeChatter.reset_global_runtime()
+    return result, request, flushed
+
+
+@pytest.mark.asyncio
+async def test_life_chatter_router_false_with_materialized_image_reaches_main_request(
+    monkeypatch,
+) -> None:
+    result, request, flushed = await _drive_router_false_case(
+        monkeypatch,
+        unread=_life_chatter_test_image_message(),
+        config=LifeEngineConfig(),
+        must_not_send=False,
+    )
+
+    assert isinstance(result, Wait)
+    assert request.send_calls == 1
+    assert request.saw_native_image is True
+    assert flushed and flushed[0].message_id == "image-message"
+
+
+@pytest.mark.parametrize("case", ["text", "descriptor", "disabled"])
+@pytest.mark.asyncio
+async def test_life_chatter_router_false_without_observable_media_flushes_and_waits(
+    monkeypatch,
+    case: str,
+) -> None:
+    config = LifeEngineConfig()
+    if case == "text":
+        unread = Message(
+            message_id="text-message",
+            content="普通文本",
+            processed_plain_text="普通文本",
+            message_type=MessageType.TEXT,
+            sender_role="other",
+            stream_id="stream-a",
+        )
+    else:
+        unread = _life_chatter_test_image_message(
+            descriptor_only=case == "descriptor"
+        )
+        if case == "disabled":
+            config.multimodal.native_image = False
+
+    result, request, flushed = await _drive_router_false_case(
+        monkeypatch,
+        unread=unread,
+        config=config,
+        must_not_send=True,
+    )
+
+    assert isinstance(result, Wait)
+    assert request.send_calls == 0
+    assert request.payloads == []
+    assert flushed == [unread]
+
+
+def _model_entry(*modalities: str) -> dict[str, object]:
+    return {"media_capabilities": {"modalities": list(modalities)}}
+
+
+@pytest.mark.parametrize(
+    ("configured_task", "configured_models", "multimodal_enabled", "expected_calls"),
+    [
+        ("vision-life", [_model_entry("text", "image")], True, ["vision-life"]),
+        ("life", [_model_entry("text")], True, ["life", "actor"]),
+        ("life", [_model_entry("text")], False, ["life"]),
+        ("missing-models", [], True, ["missing-models", "actor"]),
+        ("", [], True, ["actor"]),
+    ],
+)
+def test_life_chatter_primary_task_selection_and_media_safe_fallback(
+    monkeypatch,
+    configured_task: str,
+    configured_models: list[dict[str, object]],
+    multimodal_enabled: bool,
+    expected_calls: list[str],
+) -> None:
+    config = LifeEngineConfig()
+    config.model.task_name = configured_task
+    config.multimodal.enabled = multimodal_enabled
+    chatter = _life_chatter_for_config(config)
+    calls: list[str] = []
+
+    def fake_create_request(_self, task, *, request_name):
+        assert request_name == "life_chatter"
+        calls.append(task)
+        models = configured_models if task == configured_task else [
+            _model_entry("text", "image")
+        ]
+        return SimpleNamespace(task=task, model_set=models)
+
+    monkeypatch.setattr(LifeChatter, "create_request", fake_create_request)
+
+    request = chatter._create_global_request()
+
+    assert calls == expected_calls
+    assert request.task == expected_calls[-1]
+
+
+def test_life_chatter_primary_task_creation_error_falls_back_to_actor(monkeypatch) -> None:
+    config = LifeEngineConfig()
+    config.model.task_name = "broken-life"
+    chatter = _life_chatter_for_config(config)
+    calls: list[str] = []
+
+    def fake_create_request(_self, task, *, request_name):
+        assert request_name == "life_chatter"
+        calls.append(task)
+        if task == "broken-life":
+            raise ValueError("task missing")
+        return SimpleNamespace(task=task, model_set=[_model_entry("text", "image")])
+
+    monkeypatch.setattr(LifeChatter, "create_request", fake_create_request)
+
+    assert chatter._create_global_request().task == "actor"
+    assert calls == ["broken-life", "actor"]
 
 
 @pytest.mark.asyncio
