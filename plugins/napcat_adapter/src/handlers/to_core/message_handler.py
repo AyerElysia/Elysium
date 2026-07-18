@@ -261,15 +261,43 @@ class MessageHandler:
     async def _handle_image_message(self, segment: dict) -> SegPayload | None:
         """处理图片消息与表情包消息"""
         message_data = segment.get("data", {})
-        image_sub_type = message_data.get("sub_type")
+        if not isinstance(message_data, dict):
+            logger.warning("图片消息 data 无法解析")
+            return {"type": "text", "data": "[无法解析的图片]"}
+
+        raw_image_sub_type = message_data.get("sub_type")
         image_url = message_data.get("url", "")
 
-        if not image_url:
+        if not isinstance(image_url, str) or not image_url:
             logger.warning("图片消息缺少URL")
             return None
 
+        if raw_image_sub_type is None:
+            # 部分 marketFace/旧版 NapCat image 段没有 sub_type；沿用旧兼容行为，
+            # 将其视为表情包，而不是在适配器边界丢弃视觉数据。
+            image_sub_type = 1
+        elif isinstance(raw_image_sub_type, bool):
+            logger.warning(f"无法解析的图片子类型：{raw_image_sub_type!r}")
+            return {"type": "text", "data": "[无法解析的图片]"}
+        elif isinstance(raw_image_sub_type, int):
+            image_sub_type = raw_image_sub_type
+        elif isinstance(raw_image_sub_type, str):
+            try:
+                image_sub_type = int(raw_image_sub_type.strip(), 10)
+            except ValueError:
+                logger.warning(f"无法解析的图片子类型：{raw_image_sub_type!r}")
+                return {"type": "text", "data": "[无法解析的图片]"}
+        else:
+            logger.warning(f"无法解析的图片子类型：{raw_image_sub_type!r}")
+            return {"type": "text", "data": "[无法解析的图片]"}
+
+        # NapCat 的非零图片子类型表示自定义/动画表情；9 兼容上游扩展值。
+        if image_sub_type not in {0, 1, 2, 3, 4, 5, 6, 7, 9}:
+            logger.warning(f"不支持的图片子类型：{image_sub_type}")
+            return {"type": "text", "data": "[无法解析的图片]"}
+
         try:
-            async with asyncio.timeout(10): # 兜底超时处理
+            async with asyncio.timeout(10):  # 兜底超时处理
                 image_base64 = await get_image_base64(image_url)
         except TimeoutError:
             logger.error(f"图片消息处理超时: {image_url}")
@@ -277,13 +305,10 @@ class MessageHandler:
         except Exception as e:
             logger.error(f"图片消息处理失败: {e!s}")
             return None
+
         if image_sub_type == 0:
             return {"type": "image", "data": image_base64}
-        elif image_sub_type not in [4, 9]:
-            return {"type": "emoji", "data": image_base64}
-        else:
-            logger.warning(f"不支持的图片子类型：{image_sub_type}")
-            return None
+        return {"type": "emoji", "data": image_base64}
 
     async def _handle_at_message(self, segment: dict, raw_message: dict) -> SegPayload | None:
         """处理@消息"""
