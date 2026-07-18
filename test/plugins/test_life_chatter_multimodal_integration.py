@@ -15,10 +15,16 @@ from typing import Any
 
 import pytest
 
-from plugins.life_engine.core.chatter import LifeChatter, _Phase, _WorkflowRuntime
+from plugins.life_engine.core.chatter import (
+    LifeChatter,
+    _is_native_multimodal_unsupported_error,
+    _Phase,
+    _WorkflowRuntime,
+)
 from plugins.life_engine.core.config import LifeEngineConfig
 from src.core.models.message import Message, MessageType
 from src.kernel.llm import Audio, Image, LLMPayload, ROLE, Text, Video
+from src.kernel.llm.exceptions import UnsupportedModalityError
 from src.kernel.llm.model_client.openai_client import _payloads_to_openai_messages
 
 import base64
@@ -33,6 +39,14 @@ def _png_b64() -> str:
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8"
         "/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
     )
+
+
+def _wav_b64() -> str:
+    return base64.b64encode(b"RIFF$\x00\x00\x00WAVEfmt ").decode()
+
+
+def _mp4_b64() -> str:
+    return base64.b64encode(b"\x00\x00\x00\x18ftypmp42").decode()
 
 
 def _msg(message_id: str, **kwargs: Any) -> SimpleNamespace:
@@ -83,12 +97,16 @@ def test_compose_disabled_returns_text_only() -> None:
 
 
 def test_compose_can_enable_all_native_modalities() -> None:
-    chatter = _make_chatter(multimodal_enabled=True)
+    chatter = _make_chatter(
+        multimodal_enabled=True,
+        native_audio=True,
+        native_video=True,
+    )
     rt = _new_runtime()
     msgs = [
         _msg("m1", media=[{"type": "image", "data": _png_b64()}]),
-        _msg("m2", media=[{"type": "voice", "data": _b64("vo"), "format": "wav"}]),
-        _msg("m3", media=[{"type": "video", "data": _b64("vid"), "mime_type": "video/mp4"}]),
+        _msg("m2", media=[{"type": "voice", "data": _wav_b64(), "format": "wav"}]),
+        _msg("m3", media=[{"type": "video", "data": _mp4_b64(), "mime_type": "video/mp4"}]),
     ]
     out = chatter._compose_unread_user_content(rt, msgs, "hi")
     assert any(isinstance(p, Image) for p in out)
@@ -101,8 +119,8 @@ def test_compose_can_disable_voice_video_explicitly() -> None:
     rt = _new_runtime()
     msgs = [
         _msg("m1", media=[{"type": "image", "data": _png_b64()}]),
-        _msg("m2", media=[{"type": "voice", "data": _b64("vo"), "format": "wav"}]),
-        _msg("m3", media=[{"type": "video", "data": _b64("vid"), "mime_type": "video/mp4"}]),
+        _msg("m2", media=[{"type": "voice", "data": _wav_b64(), "format": "wav"}]),
+        _msg("m3", media=[{"type": "video", "data": _mp4_b64(), "mime_type": "video/mp4"}]),
     ]
     out = chatter._compose_unread_user_content(rt, msgs, "hi")
     assert any(isinstance(p, Image) for p in out)
@@ -125,59 +143,6 @@ def test_compose_can_disable_emoji_explicitly() -> None:
     out = chatter._compose_unread_user_content(rt, msgs, "hi")
     assert all(not isinstance(p, Image) for p in out)
     assert len(out) == 1 and isinstance(out[0], Text)
-
-
-def test_native_visual_vlm_skip_keeps_emoji_vlm_and_skips_native_images(monkeypatch) -> None:
-    """原生图片直达模型时跳过图片 VLM，但表情包仍保留文字识别。"""
-    chatter = _make_chatter(multimodal_enabled=True, native_image=True, native_emoji=True)
-    skip_calls: list[tuple[str, tuple[str, ...]]] = []
-    unskip_calls: list[tuple[str, tuple[str, ...]]] = []
-
-    fake_manager = SimpleNamespace(
-        skip_vlm_for_stream=lambda stream_id, media_types: skip_calls.append(
-            (stream_id, tuple(media_types))
-        ),
-        unskip_vlm_for_stream=lambda stream_id, media_types: unskip_calls.append(
-            (stream_id, tuple(media_types))
-        ),
-    )
-    monkeypatch.setattr(
-        "src.core.managers.media_manager.get_media_manager",
-        lambda: fake_manager,
-    )
-
-    chatter._sync_native_visual_vlm_skip(SimpleNamespace(stream_id="stream-emoji"))
-
-    assert unskip_calls == [("stream-emoji", ("emoji",))]
-    assert skip_calls == [("stream-emoji", ("image",))]
-
-
-def test_native_visual_vlm_skip_clears_stale_image_rule_when_disabled(monkeypatch) -> None:
-    """关闭原生图片后应清除旧图片规则，且表情包始终保留 VLM。"""
-    chatter = _make_chatter(multimodal_enabled=True, native_image=False, native_emoji=True)
-    skip_calls: list[tuple[str, tuple[str, ...]]] = []
-    unskip_calls: list[tuple[str, tuple[str, ...]]] = []
-
-    fake_manager = SimpleNamespace(
-        skip_vlm_for_stream=lambda stream_id, media_types: skip_calls.append(
-            (stream_id, tuple(media_types))
-        ),
-        unskip_vlm_for_stream=lambda stream_id, media_types: unskip_calls.append(
-            (stream_id, tuple(media_types))
-        ),
-    )
-    monkeypatch.setattr(
-        "src.core.managers.media_manager.get_media_manager",
-        lambda: fake_manager,
-    )
-
-    chatter._sync_native_visual_vlm_skip(SimpleNamespace(stream_id="stream-image"))
-
-    assert unskip_calls == [
-        ("stream-image", ("emoji",)),
-        ("stream-image", ("image",)),
-    ]
-    assert skip_calls == []
 
 
 def test_compose_dedup_across_retries() -> None:
@@ -254,7 +219,6 @@ async def test_delta_unread_native_image_is_restored_after_model_failure(
 
     monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
     monkeypatch.setattr(chatter, "_await_model_turn", immediate_model_turn)
-    monkeypatch.setattr(chatter, "_sync_native_visual_vlm_skip", lambda _stream: None)
 
     result = await chatter._drive_global_runtime_until_yield(
         SimpleNamespace(stream_id="stream-a"),
@@ -362,7 +326,7 @@ def test_strip_transient_context_removes_only_trailing_wrapper() -> None:
 def test_user_payload_serializes_audio_with_correct_format() -> None:
     chatter = _make_chatter(multimodal_enabled=True, native_audio=True)
     rt = _new_runtime()
-    msgs = [_msg("m1", media=[{"type": "voice", "data": _b64("au"), "format": "wav"}])]
+    msgs = [_msg("m1", media=[{"type": "voice", "data": _wav_b64(), "format": "wav"}])]
     content = chatter._compose_unread_user_content(rt, msgs, "请听这条语音")
     payload = LLMPayload(ROLE.USER, content)
     messages, _ = _payloads_to_openai_messages([payload])
@@ -372,18 +336,111 @@ def test_user_payload_serializes_audio_with_correct_format() -> None:
     assert audio_parts[0]["input_audio"]["format"] == "wav"
 
 
-def test_user_payload_serializes_image_and_video() -> None:
+def test_user_payload_keeps_video_for_provider_rejection() -> None:
     chatter = _make_chatter(multimodal_enabled=True, native_video=True)
     rt = _new_runtime()
     msgs = [
         _msg("m1", media=[{"type": "image", "data": _png_b64()}]),
-        _msg("m2", media=[{"type": "video", "data": _b64("vi"), "mime_type": "video/webm"}]),
+        _msg("m2", media=[{"type": "video", "data": _mp4_b64(), "mime_type": "video/mp4"}]),
     ]
-    payload = LLMPayload(ROLE.USER, chatter._compose_unread_user_content(rt, msgs, "看看"))
-    messages, _ = _payloads_to_openai_messages([payload])
-    parts = [p for p in messages[0]["content"] if isinstance(p, dict)]
-    image_url_parts = [p for p in parts if p.get("type") == "image_url"]
-    urls = [p["image_url"]["url"] for p in image_url_parts]
-    # OpenAI 兼容协议下 Video 也通过 image_url 通道携带 data:video/... URL
-    assert any(u.startswith("data:image/") for u in urls)
-    assert any(u.startswith("data:video/") for u in urls)
+    content = chatter._compose_unread_user_content(rt, msgs, "看看")
+    assert any(isinstance(part, Image) for part in content)
+    assert any(isinstance(part, Video) for part in content)
+    with pytest.raises(UnsupportedModalityError):
+        _payloads_to_openai_messages([LLMPayload(ROLE.USER, content)])
+
+
+def test_native_multimodal_error_detection_includes_wrapped_kernel_error() -> None:
+    direct_error = UnsupportedModalityError("没有模型支持 image 模态")
+    assert _is_native_multimodal_unsupported_error(direct_error) is True
+
+    try:
+        try:
+            raise direct_error
+        except UnsupportedModalityError as cause:
+            raise RuntimeError("provider wrapper") from cause
+    except RuntimeError as wrapped_error:
+        assert _is_native_multimodal_unsupported_error(wrapped_error) is True
+
+
+class _AwaitableFallbackResponse:
+    """Minimal response double for the one-shot media fallback retry."""
+
+    def __init__(
+        self,
+        payloads: list[LLMPayload],
+        sent_snapshots: list[list[LLMPayload]] | None = None,
+    ) -> None:
+        self.payloads = payloads
+        self.sent_snapshots = sent_snapshots if sent_snapshots is not None else []
+        self.send_count = 0
+
+    def __await__(self):
+        async def resolve() -> "_AwaitableFallbackResponse":
+            return self
+
+        return resolve().__await__()
+
+    async def send(self, *, stream: bool = False) -> "_AwaitableFallbackResponse":
+        assert stream is False
+        self.send_count += 1
+        snapshot = [
+            LLMPayload(payload.role, list(payload.content))
+            for payload in self.payloads
+        ]
+        self.sent_snapshots.append(snapshot)
+        return _AwaitableFallbackResponse(snapshot, self.sent_snapshots)
+
+
+@pytest.mark.asyncio
+async def test_media_text_fallback_replaces_all_native_media_once(monkeypatch) -> None:
+    image = Image(_png_b64())
+    audio = Audio(_wav_b64())
+    video = Video(_mp4_b64(), mime_type="video/mp4")
+    response = _AwaitableFallbackResponse(
+        [
+            LLMPayload(
+                ROLE.USER,
+                [Text("请处理"), image, audio, image, video],
+            )
+        ]
+    )
+    runtime = _new_runtime()
+    runtime.response = response
+    observed_kinds: list[str] = []
+
+    async def describe(part: Image | Audio | Video) -> str:
+        observed_kinds.append(part.kind.value)
+        return f"{part.kind.value}-description"
+
+    monkeypatch.setattr(
+        LifeChatter,
+        "_describe_native_media_for_fallback",
+        staticmethod(describe),
+    )
+
+    fallback_response = await LifeChatter._retry_model_turn_with_media_text_fallback(
+        runtime,
+        "请基于观察结果回答",
+    )
+    runtime.response = fallback_response
+
+    assert response.send_count == 1
+    assert observed_kinds == ["image", "audio", "video"]
+    sent_payloads = response.sent_snapshots[0]
+    assert all(
+        not isinstance(part, (Image, Audio, Video))
+        for payload in sent_payloads
+        for part in payload.content
+    )
+    sent_text = "\n".join(
+        part.text
+        for payload in sent_payloads
+        for part in payload.content
+        if isinstance(part, Text)
+    )
+    assert "image-description" in sent_text
+    assert "audio-description" in sent_text
+    assert "video-description" in sent_text
+    assert LifeChatter._has_native_media(runtime.response) is False
+    assert runtime.response.payloads[0].content[0].text == "请处理"

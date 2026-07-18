@@ -873,15 +873,15 @@ class LifeEngineConfig(BaseConfig):
 
     @config_section("multimodal")
     class MultimodalSection(SectionBase):
-        """life_chatter 原生多模态输入配置（MiMo-V2-Omni 等模型）。
+        """life_chatter 原生多模态输入配置。
 
-        启用后会把 unread_msgs 中允许的媒体转为 LLM 原生 Content。
-        默认关闭，避免普通聊天持续携带图片/音频/视频导致 token 与上下文体积膨胀。
-        需要原生多模态测试时再显式打开。
+        图片和表情包默认走原生视觉输入；音频、视频需要模型显式声明对应能力后再开启。
+        原始媒体只在当前对话轮保留，轮次结束后转换为安全描述，避免后续请求反复携带
+        base64 数据。
         """
 
         enabled: bool = Field(
-            default=False,
+            default=True,
             description="启用 life_chatter 原生多模态输入。",
         )
         native_image: bool = Field(
@@ -893,11 +893,11 @@ class LifeEngineConfig(BaseConfig):
             description="是否把 emoji / 表情包媒体作为原生 Image Content 注入。",
         )
         native_video: bool = Field(
-            default=True,
+            default=False,
             description="是否把 video 媒体作为原生 Video Content 注入。",
         )
         native_audio: bool = Field(
-            default=True,
+            default=False,
             description="是否把 voice / record / audio 媒体作为原生 Audio Content 注入。",
         )
         max_images_per_payload: int = Field(
@@ -935,8 +935,8 @@ class LifeEngineConfig(BaseConfig):
         prune_old_media_after_send: bool = Field(
             default=False,
             description=(
-                "兼容旧配置项。life_chatter 现在默认保留 payload 中的原生 Image/Audio/Video，"
-                "不再把已发送媒体剪成文本占位。"
+                "兼容旧配置项，不再控制媒体生命周期。原生 Image/Audio/Video 只在当前对话轮保留，"
+                "进入 WAIT_USER 后统一转换为安全描述并释放原始数据。"
             ),
         )
         unsupported_audio_placeholder: str = Field(

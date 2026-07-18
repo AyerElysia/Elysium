@@ -1,3 +1,5 @@
+import base64
+
 from src.kernel.llm import Image, LLMPayload, ROLE, Text, ToolCall, ToolResult
 
 from plugins.life_engine.core.context_compaction import (
@@ -10,6 +12,15 @@ from plugins.life_engine.core.context_compaction import (
     is_summary_payload,
     split_pinned_and_tail,
 )
+
+
+_PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
+
+
+def _large_png_base64(padding_bytes: int) -> str:
+    return base64.b64encode(_PNG_BYTES + b"\x00" * padding_bytes).decode("ascii")
 
 
 def estimate(payloads):
@@ -111,7 +122,7 @@ def test_open_recent_tool_chain_is_kept_as_one_group():
 
 
 def test_summary_contains_media_descriptor_not_base64():
-    blob = "A" * 20_000
+    blob = _large_png_base64(20_000)
     payloads = [
         LLMPayload(ROLE.USER, [Text("old media"), Image("data:image/png;base64," + blob)]),
         LLMPayload(ROLE.ASSISTANT, Text("seen")),
@@ -214,7 +225,7 @@ def test_continuous_summary_prefers_newest_and_trims_old_from_head():
 
 
 def test_latest_group_media_replaced_with_descriptor_when_over_target():
-    huge = "B" * 50_000
+    huge = _large_png_base64(50_000)
     payloads = [
         LLMPayload(ROLE.USER, Text("keep-me")),
         LLMPayload(ROLE.ASSISTANT, Text("ack")),

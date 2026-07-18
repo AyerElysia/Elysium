@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,17 @@ from plugins.life_engine.core.chatter import LifeChatter, LifeInspectMediaTool
 from plugins.life_engine.core.config import LifeEngineConfig
 from src.core.models.message import Message, MessageType
 from src.kernel.llm import Audio, Image, LLMPayload, ROLE, Text, ToolResult
+
+
+_PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
+_WAV_BYTES = b"RIFF$\x00\x00\x00WAVEfmt "
+_MP4_BYTES = b"\x00\x00\x00\x18ftypmp42"
+
+
+def _base64(data: bytes) -> str:
+    return "base64|" + base64.b64encode(data).decode("ascii")
 
 
 def _make_tool(messages: list[Message]) -> LifeInspectMediaTool:
@@ -46,8 +58,8 @@ def _message(
 
 def test_selects_latest_unread_media() -> None:
     tool = _make_tool([
-        _message("m1", media=[{"type": "image", "data": "base64|QUJD"}]),
-        _message("m2", media=[{"type": "video", "data": {"base64": "base64|REVG"}}]),
+        _message("m1", media=[{"type": "image", "data": _base64(_PNG_BYTES)}]),
+        _message("m2", media=[{"type": "video", "data": {"base64": _base64(_MP4_BYTES)}}]),
     ])
 
     selected = tool._select_media("latest", "auto")
@@ -55,13 +67,13 @@ def test_selects_latest_unread_media() -> None:
     assert selected is not None
     assert selected.message.message_id == "m2"
     assert selected.kind == "video"
-    assert selected.data_for_native == "base64|REVG"
+    assert selected.data_for_native == _base64(_MP4_BYTES)
 
 
 def test_filters_by_media_type() -> None:
     tool = _make_tool([
-        _message("m1", media=[{"type": "image", "data": "base64|QUJD"}]),
-        _message("m2", media=[{"type": "video", "data": {"base64": "base64|REVG"}}]),
+        _message("m1", media=[{"type": "image", "data": _base64(_PNG_BYTES)}]),
+        _message("m2", media=[{"type": "video", "data": {"base64": _base64(_MP4_BYTES)}}]),
     ])
 
     selected = tool._select_media("latest", "image")
@@ -73,16 +85,16 @@ def test_filters_by_media_type() -> None:
 
 def test_filters_audio_media_type() -> None:
     tool = _make_tool([
-        _message("m1", media=[{"type": "image", "data": "base64|QUJD"}]),
+        _message("m1", media=[{"type": "image", "data": _base64(_PNG_BYTES)}]),
         _message(
             "m2",
             media=[
                 {
                     "type": "voice",
                     "data": {
-                        "base64": "base64|UklGRg==",
-                        "filename": "sound.mp3",
-                        "mime_type": "audio/mpeg",
+                        "base64": _base64(_WAV_BYTES),
+                        "filename": "sound.wav",
+                        "mime_type": "audio/wav",
                     },
                 }
             ],
@@ -94,8 +106,8 @@ def test_filters_audio_media_type() -> None:
     assert selected is not None
     assert selected.message.message_id == "m2"
     assert selected.kind == "audio"
-    assert selected.data_for_native == "base64|UklGRg=="
-    assert selected.mime_type == "audio/mpeg"
+    assert selected.data_for_native == _base64(_WAV_BYTES)
+    assert selected.mime_type == "audio/wav"
 
 
 def test_audio_media_type_uses_nested_mime() -> None:
@@ -106,7 +118,7 @@ def test_audio_media_type_uses_nested_mime() -> None:
                 {
                     "type": "voice",
                     "data": {
-                        "base64": "base64|UklGRg==",
+                        "base64": _base64(_WAV_BYTES),
                         "filename": "sound.wav",
                         "mime_type": "audio/wav",
                     },
@@ -148,7 +160,7 @@ async def test_execute_returns_plaintext_when_media_data_missing() -> None:
 async def test_execute_promotes_media_for_next_native_turn() -> None:
     LifeInspectMediaTool._consume_promoted_media("stream-1")
     tool = _make_tool(
-        [_message("m1", media=[{"type": "image", "data": "base64|QUJD"}])]
+        [_message("m1", media=[{"type": "image", "data": _base64(_PNG_BYTES)}])]
     )
 
     success, result = await tool.execute(focus="看图中文字", detail_level="detailed")
@@ -173,9 +185,9 @@ async def test_execute_promotes_audio_for_next_native_turn() -> None:
                     {
                         "type": "voice",
                         "data": {
-                            "base64": "base64|UklGRg==",
-                            "filename": "sound.mp3",
-                            "mime_type": "audio/mpeg",
+                            "base64": _base64(_WAV_BYTES),
+                            "filename": "sound.wav",
+                            "mime_type": "audio/wav",
                         },
                     }
                 ],
@@ -197,7 +209,7 @@ async def test_execute_promotes_audio_for_next_native_turn() -> None:
 async def test_promoted_media_after_tool_result_gets_assistant_bridge() -> None:
     LifeInspectMediaTool._consume_promoted_media("stream-1")
     tool = _make_tool(
-        [_message("m1", media=[{"type": "image", "data": "base64|QUJD"}])]
+        [_message("m1", media=[{"type": "image", "data": _base64(_PNG_BYTES)}])]
     )
     await tool.execute(focus="确认是否能直接看图")
 
@@ -225,7 +237,7 @@ async def test_promoted_media_after_tool_result_gets_assistant_bridge() -> None:
 async def test_promoted_media_after_tool_result_with_system_reminder_gets_assistant_bridge() -> None:
     LifeInspectMediaTool._consume_promoted_media("stream-1")
     tool = _make_tool(
-        [_message("m1", media=[{"type": "image", "data": "base64|QUJD"}])]
+        [_message("m1", media=[{"type": "image", "data": _base64(_PNG_BYTES)}])]
     )
     await tool.execute(focus="确认是否能直接看图")
 

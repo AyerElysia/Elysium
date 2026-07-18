@@ -290,16 +290,9 @@ async def run_enhanced(
     """enhanced 模式执行流程。
 
     Args:
-        native_multimodal: 启用后将 image 媒体以 base64 直接打包进 USER payload，
-            同时为当前 stream 注册 "image" 类型的 VLM 跳过（表情包 emoji 仍由框架
-            VLM 生成描述，受益于哈希缓存）。执行结束后会自动取消注册，避免残留副作用。
-            历史消息不传图片，仅未读消息携带图片。
+        native_multimodal: 启用后将未读消息中的已验证图片直接打包进 USER payload；
+            历史消息不传图片。
     """
-    if native_multimodal:
-        from src.core.managers.media_manager import get_media_manager
-        get_media_manager().skip_vlm_for_stream(chat_stream.stream_id, ["image"])
-        logger.debug(f"已为 stream {chat_stream.stream_id[:8]} 注册跳过 image 类型的 VLM 识别")
-
     try:
         request = chatter.create_request("actor", with_reminder="actor")
     except (ValueError, KeyError) as error:

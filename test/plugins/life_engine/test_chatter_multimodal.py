@@ -38,6 +38,22 @@ def _png_b64() -> str:
     )
 
 
+def _wav_b64() -> str:
+    return base64.b64encode(b"RIFF$\x00\x00\x00WAVEfmt ").decode()
+
+
+def _mp3_b64() -> str:
+    return base64.b64encode(b"ID3\x04\x00\x00\x00\x00\x00\x00").decode()
+
+
+def _amr_b64() -> str:
+    return base64.b64encode(b"#!AMR\n").decode()
+
+
+def _mp4_b64() -> str:
+    return base64.b64encode(b"\x00\x00\x00\x18ftypmp42").decode()
+
+
 def _msg(message_id: str, *, content: Any = None, extra: Any = None, media: Any = None,
          message_type: Any = None) -> SimpleNamespace:
     return SimpleNamespace(
@@ -170,8 +186,8 @@ class TestBuild:
         items = [
             MediaItem("image", _png_b64(), "m1"),
             MediaItem("emoji", _png_b64(), "m2"),
-            MediaItem("video", _b64("v"), "m3", mime_type="video/mp4"),
-            MediaItem("audio", _b64("a"), "m4", mime_type="audio/wav"),
+            MediaItem("video", _mp4_b64(), "m3", mime_type="video/mp4"),
+            MediaItem("audio", _wav_b64(), "m4", mime_type="audio/wav"),
         ]
         out = build_multimodal_content("hi", items)
         types = [type(p).__name__ for p in out]
@@ -185,12 +201,12 @@ class TestBuild:
         assert any(isinstance(p, Image) for p in out)
 
     def test_audio_mp3_supported(self) -> None:
-        items = [MediaItem("audio", _b64(), "m1", mime_type="audio/mpeg")]
+        items = [MediaItem("audio", _mp3_b64(), "m1", mime_type="audio/mpeg")]
         out = build_multimodal_content("", items)
         assert any(isinstance(p, Audio) for p in out)
 
     def test_audio_amr_downgraded(self) -> None:
-        items = [MediaItem("audio", _b64(), "m1", mime_type="audio/amr")]
+        items = [MediaItem("audio", _amr_b64(), "m1", mime_type="audio/amr")]
         out = build_multimodal_content("", items, unsupported_audio_placeholder="[未知语音]")
         assert all(not isinstance(p, Audio) for p in out)
         assert any(isinstance(p, Text) and p.text == "[未知语音]" for p in out)

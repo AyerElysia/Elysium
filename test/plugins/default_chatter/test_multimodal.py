@@ -15,8 +15,11 @@ from plugins.default_chatter.multimodal import (
 )
 from src.kernel.llm import Image, Text
 
-# 一个最小可解码的合法 base64 字符串（Image 构造时会做 b64decode 校验）
-_VALID_B64 = "aGVsbG8="  # b"hello"
+# Image construction now requires a real image signature.
+_VALID_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8"
+    "/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+)
 
 
 def _make_msg(
@@ -111,10 +114,17 @@ class TestBuildMultimodalContent:
             {"type": "image", "data": _VALID_B64},
         ]
         content = build_multimodal_content("hi", items)
-        assert [type(c).__name__ for c in content] == ["Text", "Image", "Image"]
+        assert [type(c).__name__ for c in content] == [
+            "Text",
+            "Text",
+            "Image",
+            "Text",
+            "Image",
+        ]
 
     def test_text_followed_by_images_when_no_placeholder(self) -> None:
         items = [{"type": "image", "data": _VALID_B64}]
         content = build_multimodal_content("hi", items)
         assert isinstance(content[0], Text)
-        assert isinstance(content[1], Image)
+        assert isinstance(content[1], Text)
+        assert isinstance(content[2], Image)

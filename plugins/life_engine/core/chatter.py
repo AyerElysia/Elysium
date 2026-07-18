@@ -26,7 +26,19 @@ from src.app.plugin_system.base import BaseAction, BaseChatter, BaseTool, Failur
 from src.app.plugin_system.types import ChatType
 from src.core.config import get_core_config
 from src.core.models.message import Message, MessageType
-from src.kernel.llm import Audio, Content, Image, LLMPayload, ReasoningText, ROLE, Text, ToolCall, ToolResult, Video
+from src.kernel.llm import (
+    Audio,
+    Content,
+    Image,
+    LLMPayload,
+    ReasoningText,
+    ROLE,
+    Text,
+    ToolCall,
+    ToolResult,
+    UnsupportedModalityError,
+    Video,
+)
 from .context_compaction import (
     DEFAULT_MAX_GROUPS as _CONTEXT_COMPRESSION_MAX_GROUPS,
     DEFAULT_MAX_PART_CHARS as _CONTEXT_COMPRESSION_MAX_PART_CHARS,
@@ -109,6 +121,8 @@ def _is_native_multimodal_unsupported_error(error: BaseException) -> bool:
     cursor: BaseException | None = error
     seen: set[int] = set()
     while cursor is not None and id(cursor) not in seen:
+        if isinstance(cursor, UnsupportedModalityError):
+            return True
         seen.add(id(cursor))
         parts.append(type(cursor).__name__.lower())
         parts.append(str(cursor).lower())
@@ -1250,6 +1264,72 @@ class LifeChatter(BaseChatter):
         except Exception:
             return str(value)
 
+    @staticmethod
+    def _media_descriptor_for_part(part: Image | Audio | Video) -> dict[str, Any]:
+        """Return the persistence-safe subset of a native media reference."""
+        ref = part.media_ref
+        return {
+            "kind": ref.kind.value,
+            "mime_type": ref.mime_type,
+            "size_bytes": ref.size_bytes,
+            "sha256": ref.sha256,
+            "source_message_id": ref.source_message_id,
+        }
+
+    @staticmethod
+    def _released_media_placeholder(
+        descriptor: dict[str, Any],
+        *,
+        fallback_kind: str = "media",
+    ) -> str:
+        kind = str(descriptor.get("kind") or fallback_kind).strip().lower()
+        label = {
+            "image": "图片",
+            "audio": "音频",
+            "video": "视频",
+        }.get(kind, "媒体")
+        details: list[str] = []
+        source_message_id = descriptor.get("source_message_id")
+        if isinstance(source_message_id, str) and source_message_id.strip():
+            normalized_id = re.sub(r"\s+", " ", source_message_id).strip()[:80]
+            details.append(f"source_message_id={normalized_id}")
+        sha256 = descriptor.get("sha256")
+        if isinstance(sha256, str) and re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
+            details.append(f"sha256={sha256[:12].lower()}")
+        suffix = f"；{'；'.join(details)}" if details else ""
+        return f"[{label}已观察，原始媒体数据已释放{suffix}]"
+
+    @classmethod
+    def _release_native_media(cls, response: Any) -> int:
+        """Release native media bytes after a completed user interaction turn."""
+        payloads = getattr(response, "payloads", None)
+        if not isinstance(payloads, list):
+            return 0
+
+        released = 0
+        sanitized_payloads: list[Any] = []
+        for payload in payloads:
+            if not isinstance(payload, LLMPayload):
+                sanitized_payloads.append(payload)
+                continue
+            content: list[Any] = []
+            changed = False
+            for part in payload.content:
+                if isinstance(part, (Image, Audio, Video)):
+                    descriptor = cls._media_descriptor_for_part(part)
+                    content.append(Text(cls._released_media_placeholder(descriptor)))
+                    released += 1
+                    changed = True
+                else:
+                    content.append(part)
+            sanitized_payloads.append(
+                LLMPayload(payload.role, content) if changed else payload  # type: ignore[arg-type]
+            )
+
+        if released:
+            response.payloads = sanitized_payloads
+        return released
+
     @classmethod
     def _serialize_content_part(cls, part: object) -> dict[str, Any] | None:
         if isinstance(part, Text):
@@ -1275,24 +1355,15 @@ class LifeChatter(BaseChatter):
                 "call_id": part.call_id,
                 "name": part.name,
             }
-        if isinstance(part, Image):
-            return {"type": "image", "value": part.value}
-        if isinstance(part, Audio):
+        if isinstance(part, (Image, Audio, Video)):
             return {
-                "type": "audio",
-                "value": part.value,
-                "mime_type": getattr(part, "mime_type", "audio/mpeg"),
-            }
-        if isinstance(part, Video):
-            return {
-                "type": "video",
-                "value": part.value,
-                "mime_type": getattr(part, "mime_type", "video/mp4"),
+                "type": "media_descriptor",
+                "descriptor": cls._media_descriptor_for_part(part),
             }
         return None
 
-    @staticmethod
-    def _deserialize_content_part(data: Any) -> object | None:
+    @classmethod
+    def _deserialize_content_part(cls, data: Any) -> object | None:
         if not isinstance(data, dict):
             return None
         part_type = str(data.get("type") or "")
@@ -1317,17 +1388,27 @@ class LifeChatter(BaseChatter):
                     call_id=data.get("call_id") if isinstance(data.get("call_id"), str) else None,
                     name=data.get("name") if isinstance(data.get("name"), str) else None,
                 )
-            if part_type == "image":
-                return Image(str(data.get("value") or ""))
-            if part_type == "audio":
-                return Audio(
-                    str(data.get("value") or ""),
-                    mime_type=str(data.get("mime_type") or "audio/mpeg"),
+            if part_type == "media_descriptor":
+                descriptor = data.get("descriptor")
+                return Text(
+                    cls._released_media_placeholder(
+                        descriptor if isinstance(descriptor, dict) else {},
+                    )
                 )
-            if part_type == "video":
-                return Video(
-                    str(data.get("value") or ""),
-                    mime_type=str(data.get("mime_type") or "video/mp4"),
+            if part_type in {"image", "audio", "video"}:
+                # Legacy snapshots may contain a media body. Never materialize it.
+                descriptor = {
+                    "kind": part_type,
+                    "mime_type": data.get("mime_type"),
+                    "size_bytes": data.get("size_bytes"),
+                    "sha256": data.get("sha256"),
+                    "source_message_id": data.get("source_message_id"),
+                }
+                return Text(
+                    cls._released_media_placeholder(
+                        descriptor,
+                        fallback_kind=part_type,
+                    )
                 )
         except Exception:
             return None
@@ -2428,18 +2509,18 @@ class LifeChatter(BaseChatter):
 
     # ── FSM helpers ──────────────────────────────────────────
 
-    @staticmethod
-    def _transition(rt: _WorkflowRuntime, to_phase: _Phase, reason: str) -> None:
+    @classmethod
+    def _transition(cls, rt: _WorkflowRuntime, to_phase: _Phase, reason: str) -> None:
+        if to_phase == _Phase.WAIT_USER:
+            released = cls._release_native_media(rt.response)
+            if released:
+                logger.debug(f"[FSM] 已释放 {released} 个原生媒体内容块")
+            rt.active_stream_id = ""
+            rt.active_unread_turn_key = ""
         if rt.phase == to_phase:
-            if to_phase == _Phase.WAIT_USER:
-                rt.active_stream_id = ""
-                rt.active_unread_turn_key = ""
             return
         logger.debug(f"[FSM] {rt.phase.value} -> {to_phase.value}: {reason}")
         rt.phase = to_phase
-        if to_phase == _Phase.WAIT_USER:
-            rt.active_stream_id = ""
-            rt.active_unread_turn_key = ""
 
     @classmethod
     def _recover_failed_model_turn(
@@ -2628,44 +2709,49 @@ class LifeChatter(BaseChatter):
             ]
 
     @staticmethod
-    def _format_promoted_media_fallback_header() -> str:
-        return (
-            "你刚刚调用了 tool-inspect_media，但当前对话模型不支持原生多模态输入。"
-            "系统已改用全模态/媒体观察模型生成文字观察结果，并把结果回灌给你。\n"
-            "请基于下面的观察结果继续判断；不要声称你无法查看这条媒体，也不要说是子代理在替你回复。"
+    def _has_native_media(response: Any) -> bool:
+        payloads = getattr(response, "payloads", None)
+        if not isinstance(payloads, list):
+            return False
+        return any(
+            isinstance(part, (Image, Audio, Video))
+            for payload in payloads
+            for part in list(getattr(payload, "content", []) or [])
         )
 
     @staticmethod
-    async def _recognize_promoted_media_for_fallback(
-        promoted: _PromotedNativeMedia,
+    async def _describe_native_media_for_fallback(
+        part: Image | Audio | Video,
+        *,
+        observer_kind: str | None = None,
     ) -> str | None:
-        selected = promoted.selected
+        """Use the cached observer chain to turn validated media into text."""
         try:
             from src.core.managers.media_manager import get_media_manager
 
             manager = get_media_manager()
-            if selected.kind == "audio":
+            source_id = str(part.media_ref.source_message_id or part.kind.value)
+            if isinstance(part, Audio):
                 return await manager.recognize_voice(
                     {
-                        "base64": selected.data_for_native,
-                        "mime_type": selected.mime_type,
-                        "filename": str(getattr(selected.message, "message_id", "") or "audio"),
+                        "base64": part.value,
+                        "mime_type": part.mime_type,
+                        "filename": source_id,
                     },
                     use_cache=True,
                 )
-            if selected.kind == "video":
+            if isinstance(part, Video):
                 return await manager.recognize_video(
                     {
-                        "base64": selected.data_for_native,
-                        "mime_type": selected.mime_type,
-                        "filename": str(getattr(selected.message, "message_id", "") or "video"),
+                        "base64": part.value,
+                        "mime_type": part.mime_type,
+                        "filename": source_id,
                     },
                     use_cache=True,
                 )
-
-            media_type = "emoji" if selected.original_type == "emoji" else "image"
+            media_type = "emoji" if observer_kind == "emoji" else "image"
             return await manager.recognize_media(
-                selected.data_for_native,
+                part.data_url,
                 media_type,
                 use_cache=True,
             )
@@ -2674,59 +2760,83 @@ class LifeChatter(BaseChatter):
             return None
 
     @classmethod
-    async def _build_promoted_media_fallback_text(
-        cls,
-        promoted_items: list[_PromotedNativeMedia],
-    ) -> str:
-        lines: list[str] = [cls._format_promoted_media_fallback_header()]
+    async def _replace_native_media_with_observations(cls, response: Any) -> int:
+        """Replace every native media part in the long-lived context with text."""
+        payloads = cls._snapshot_payloads(response)
+        if not payloads:
+            return 0
 
-        for index, promoted in enumerate(promoted_items, start=1):
-            selected = promoted.selected
-            message_id = str(getattr(selected.message, "message_id", "") or "unknown")
-            sender = str(
-                getattr(selected.message, "sender_name", "")
-                or getattr(selected.message, "sender_id", "")
-                or "unknown"
-            )
-            observed_text = await cls._recognize_promoted_media_for_fallback(promoted)
-            if not observed_text:
-                observed_text = str(
-                    getattr(selected.message, "processed_plain_text", "") or ""
-                ).strip()
-            if not observed_text:
-                observed_text = "媒体观察模型未能生成可靠描述；请只基于已知上下文保守回应。"
+        observed_by_hash: dict[tuple[str, str], str | None] = {}
+        replaced = 0
+        transformed: list[LLMPayload] = []
+        labels = {
+            "image": "图片",
+            "emoji": "表情包",
+            "audio": "语音",
+            "video": "视频",
+        }
 
-            lines.extend(
-                [
-                    "",
-                    f"## 媒体观察结果 {index}",
-                    f"- 类型：{selected.kind} / {selected.original_type or selected.kind}",
-                    f"- 消息ID：{message_id}",
-                    f"- 发送者：{sender}",
-                    f"- 关注点：{promoted.focus}",
-                    f"- 详细程度：{promoted.detail_level}",
-                    f"- 观察结果：{observed_text}",
-                ]
-            )
+        for payload in payloads:
+            content: list[Any] = []
+            for index, part in enumerate(payload.content):
+                if not isinstance(part, (Image, Audio, Video)):
+                    content.append(part)
+                    continue
 
-        return "\n".join(lines)
+                observer_kind = part.kind.value
+                previous_part = payload.content[index - 1] if index > 0 else None
+                if (
+                    isinstance(part, Image)
+                    and isinstance(previous_part, Text)
+                    and previous_part.text == "[表情包]"
+                ):
+                    observer_kind = "emoji"
+
+                replaced += 1
+                key = (observer_kind, part.sha256)
+                if key not in observed_by_hash:
+                    if observer_kind == "emoji":
+                        observed_by_hash[key] = await cls._describe_native_media_for_fallback(
+                            part,
+                            observer_kind="emoji",
+                        )
+                    else:
+                        observed_by_hash[key] = await cls._describe_native_media_for_fallback(
+                            part
+                        )
+                observed_text = observed_by_hash[key]
+                label = labels.get(observer_kind, "媒体")
+                if observed_text:
+                    content.append(
+                        Text(
+                            f"[{label}观察结果] {observed_text}\n"
+                            "（原生媒体已转为文字观察，请直接基于结果回应，"
+                            "不要声称无法查看。）"
+                        )
+                    )
+                else:
+                    content.append(
+                        Text(
+                            f"[{label}观察未完成] 媒体观察链未能生成可靠描述；"
+                            "请只基于其他已知上下文保守回应。"
+                        )
+                    )
+            transformed.append(LLMPayload(payload.role, content))
+
+        cls._restore_payloads(response, transformed)
+        return replaced
 
     @classmethod
-    async def _retry_model_turn_with_promoted_media_fallback(
+    async def _retry_model_turn_with_media_text_fallback(
         cls,
         rt: _WorkflowRuntime,
-        promoted_items: list[_PromotedNativeMedia],
-        payloads_before_media: list[LLMPayload],
         suffix_context_text: str,
     ) -> Any:
-        cls._restore_payloads(rt.response, payloads_before_media)
+        replaced = await cls._replace_native_media_with_observations(rt.response)
+        if replaced <= 0:
+            raise UnsupportedModalityError("媒体文字回退时未找到原生媒体")
 
-        fallback_text = await cls._build_promoted_media_fallback_text(promoted_items)
-        if cls._has_tool_result_tail(rt.response):
-            rt.response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
-        rt.response.add_payload(LLMPayload(ROLE.USER, Text(fallback_text)))
         cls._append_suffix_context(rt.response, suffix_context_text)
-
         response = await rt.response.send(stream=False)
         cls._strip_suffix_context(response)
         await response
@@ -2757,8 +2867,8 @@ class LifeChatter(BaseChatter):
         )
         enable_image = bool(getattr(cfg, "native_image", True))
         enable_emoji = bool(getattr(cfg, "native_emoji", True))
-        enable_video = bool(getattr(cfg, "native_video", True))
-        enable_audio = bool(getattr(cfg, "native_audio", True))
+        enable_video = bool(getattr(cfg, "native_video", False))
+        enable_audio = bool(getattr(cfg, "native_audio", False))
         audio_max_seconds = int(getattr(cfg, "audio_max_seconds", 60) or 60)
 
         candidates = extract_media_from_messages(
@@ -2814,31 +2924,6 @@ class LifeChatter(BaseChatter):
         """获取 life_engine.multimodal 配置 section（不存在时返回 None）。"""
         cfg = self._get_config()
         return getattr(cfg, "multimodal", None) if cfg is not None else None
-
-    def _sync_native_visual_vlm_skip(self, chat_stream: ChatStream) -> None:
-        """按原生视觉配置同步当前 stream 的 VLM 跳过规则。"""
-        stream_id = str(getattr(chat_stream, "stream_id", "") or "").strip()
-        if not stream_id:
-            return
-
-        cfg = self._get_multimodal_cfg()
-        try:
-            from src.core.managers.media_manager import get_media_manager
-
-            manager = get_media_manager()
-            # 表情包仍保留 VLM 文本识别，供反应判断和非视觉回退使用。
-            manager.unskip_vlm_for_stream(stream_id, {"emoji"})
-            if (
-                cfg is not None
-                and bool(getattr(cfg, "enabled", False))
-                and bool(getattr(cfg, "native_image", True))
-            ):
-                manager.skip_vlm_for_stream(stream_id, {"image"})
-            else:
-                # 配置热切换时清除之前注册的普通图片跳过状态。
-                manager.unskip_vlm_for_stream(stream_id, {"image"})
-        except Exception:
-            logger.debug("同步原生视觉 VLM 跳过规则失败", exc_info=True)
 
     @staticmethod
     def _format_runtime_context_text(texts: list[str]) -> str:
@@ -3461,7 +3546,6 @@ class LifeChatter(BaseChatter):
         self._active_chat_stream = chat_stream
         rt, usable_map = await self._get_or_create_global_runtime(service, chat_stream)
         stream_id = str(getattr(chat_stream, "stream_id", "") or self.stream_id or "").strip()
-        self._sync_native_visual_vlm_skip(chat_stream)
         if rt.phase != _Phase.WAIT_USER:
             active_stream_id = str(getattr(rt, "active_stream_id", "") or "").strip()
             if active_stream_id and active_stream_id != stream_id:
@@ -3584,7 +3668,6 @@ class LifeChatter(BaseChatter):
                 # Compact before transient suffix/media injection so rollback snapshots
                 # and the current newest group remain stable.
                 self._maybe_compact_runtime_context(rt.response)
-                payloads_before_media = self._snapshot_payloads(rt.response)
                 if initial_turn:
                     self._append_suffix_context(
                         rt.response,
@@ -3621,17 +3704,18 @@ class LifeChatter(BaseChatter):
                     raise
                 except Exception as error:
                     self._strip_suffix_context(rt.response)
-                    if promoted_media_items and _is_native_multimodal_unsupported_error(error):
+                    if (
+                        _is_native_multimodal_unsupported_error(error)
+                        and self._has_native_media(rt.response)
+                    ):
                         logger.warning(
                             "当前模型不支持原生多模态输入，改用媒体观察文字结果重试: "
                             f"{error}"
                         )
                         try:
                             rt.response = await self._await_model_turn(
-                                self._retry_model_turn_with_promoted_media_fallback(
+                                self._retry_model_turn_with_media_text_fallback(
                                     rt,
-                                    promoted_media_items,
-                                    payloads_before_media,
                                     rt.pending_transient_context_text if initial_turn else "",
                                 )
                             )

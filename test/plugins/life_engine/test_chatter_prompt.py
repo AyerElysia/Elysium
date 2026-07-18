@@ -227,7 +227,16 @@ def test_life_chatter_single_huge_snapshot_payload_has_hard_cap() -> None:
 
 def test_life_chatter_snapshot_compaction_drops_large_binary_and_tool_payloads() -> None:
     payloads = [
-        LLMPayload(ROLE.USER, [Text("请看附件"), Image("a" * 400_000)]),
+        LLMPayload(
+            ROLE.USER,
+            [
+                Text("请看附件"),
+                Image(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+                    "AAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+                ),
+            ],
+        ),
         LLMPayload(
             ROLE.TOOL_RESULT,
             ToolResult(value={"raw": "z" * 400_000}, call_id="call-1", name="dump"),
@@ -249,6 +258,71 @@ def test_life_chatter_snapshot_compaction_drops_large_binary_and_tool_payloads()
     assert "z" * 1_000 not in serialized
     assert "[图片]" in serialized
     assert "[工具结果]" in serialized
+
+
+def test_life_chatter_snapshot_persists_only_media_descriptor() -> None:
+    encoded = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+        "AAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    )
+    image = Image(encoded, source_message_id="message-1")
+
+    snapshot = LifeChatter._snapshot_data_for_payloads(
+        [LLMPayload(ROLE.USER, [Text("请看图片"), image])]
+    )
+
+    media_part = snapshot["payloads"][0]["content"][1]
+    assert media_part == {
+        "type": "media_descriptor",
+        "descriptor": {
+            "kind": "image",
+            "mime_type": "image/png",
+            "size_bytes": image.size_bytes,
+            "sha256": image.sha256,
+            "source_message_id": "message-1",
+        },
+    }
+    assert encoded not in str(snapshot)
+    assert "value" not in media_part
+
+
+def test_life_chatter_snapshot_media_restores_as_text_only() -> None:
+    descriptor_payload = {
+        "role": "user",
+        "content": [
+            {
+                "type": "media_descriptor",
+                "descriptor": {
+                    "kind": "image",
+                    "mime_type": "image/png",
+                    "size_bytes": 68,
+                    "sha256": "a" * 64,
+                    "source_message_id": "message-1",
+                },
+            }
+        ],
+    }
+    legacy_payload = {
+        "role": "user",
+        "content": [
+            {
+                "type": "image",
+                "value": "legacy-image-body",
+                "mime_type": "image/png",
+            }
+        ],
+    }
+
+    restored = LifeChatter._deserialize_payload(descriptor_payload)
+    restored_legacy = LifeChatter._deserialize_payload(legacy_payload)
+
+    assert restored is not None
+    assert restored_legacy is not None
+    assert all(isinstance(part, Text) for part in restored.content)
+    assert all(isinstance(part, Text) for part in restored_legacy.content)
+    assert "原始媒体数据已释放" in restored.content[0].text
+    assert "message-1" in restored.content[0].text
+    assert "legacy-image-body" not in restored_legacy.content[0].text
 
 
 def test_life_chatter_snapshot_compaction_handles_budget_below_summary_envelope() -> None:
@@ -471,7 +545,6 @@ async def test_life_chatter_follow_up_response_is_sent_once_without_initial_comm
     monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
     monkeypatch.setattr(chatter, "flush_unreads", fail_flush_unreads)
     monkeypatch.setattr(chatter, "_await_model_turn", immediate_model_turn)
-    monkeypatch.setattr(chatter, "_sync_native_visual_vlm_skip", lambda _stream: None)
     monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", lambda _response: None)
 
     result = await chatter._drive_global_runtime_until_yield(
@@ -1061,20 +1134,37 @@ async def test_life_chatter_must_reply_fallback_at_max_rounds(monkeypatch) -> No
     LifeChatter.reset_global_runtime()
 
 
-def test_life_chatter_wait_transition_clears_global_runtime_owner() -> None:
+def test_life_chatter_wait_transition_releases_native_media_and_owner() -> None:
+    image = Image(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+        "AAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+        source_message_id="message-1",
+    )
+    response = SimpleNamespace(
+        payloads=[LLMPayload(ROLE.USER, [Text("请看图片"), image])]
+    )
     rt = _WorkflowRuntime(
-        response=SimpleNamespace(payloads=[]),
+        response=response,
         phase=_Phase.TOOL_EXEC,
         history_merged=True,
         unreads=[],
         cross_round_seen_signatures=set(),
         unread_msgs_to_flush=[],
         active_stream_id="stream-a",
+        active_unread_turn_key="turn-1",
     )
 
     LifeChatter._transition(rt, _Phase.WAIT_USER, "done")
 
     assert rt.active_stream_id == ""
+    assert rt.active_unread_turn_key == ""
+    assert not any(
+        isinstance(part, Image)
+        for payload in response.payloads
+        for part in payload.content
+    )
+    assert "原始媒体数据已释放" in response.payloads[0].content[1].text
+    assert "message-1" in response.payloads[0].content[1].text
 
 
 def test_life_chatter_live_system_prompt_adds_broadcast_guidance(tmp_path) -> None:
