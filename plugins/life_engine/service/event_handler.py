@@ -51,16 +51,10 @@ class LifeEngineMessageCollectorHandler(BaseEventHandler):
                 return EventDecision.SUCCESS, params
 
             direction = "received"
-            sent_confirmed = False
             if event_name == EventType.ON_MESSAGE_DELIVERED.value:
                 direction = "sent"
-                sent_confirmed = True
 
-            await service.record_message(
-                message,
-                direction=direction,
-                sent_confirmed=sent_confirmed,
-            )
+            await service.record_message(message, direction=direction)
         except Exception as exc:  # noqa: BLE001
             logger.error(f"life_engine 收集消息失败: {exc}")
             log_error(

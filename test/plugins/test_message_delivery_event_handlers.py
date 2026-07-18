@@ -41,11 +41,7 @@ async def test_life_engine_collects_only_confirmed_outbound_messages() -> None:
 
     assert decision is EventDecision.SUCCESS
     assert returned_params is params
-    service.record_message.assert_awaited_once_with(
-        message,
-        direction="sent",
-        sent_confirmed=True,
-    )
+    service.record_message.assert_awaited_once_with(message, direction="sent")
 
     service.record_message.reset_mock()
     decision, returned_params = await handler.execute(

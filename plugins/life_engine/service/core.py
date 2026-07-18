@@ -46,10 +46,6 @@ from ..core.chat_history import (
 )
 from ..core.config import LifeEngineConfig
 from ..core.context_assembly import LifeChatterContextAssembler
-from ..core.everos import (
-    is_everos_message_sync_enabled,
-    sync_message_to_everos,
-)
 from ..core.send_targets import format_send_targets_for_prompt, list_recent_send_targets
 from ..core.tool_parallel import iter_life_tool_call_batches
 from ..autonomy import (
@@ -191,8 +187,6 @@ class LifeEngineService(BaseService):
         self._last_memory_maintenance_prompt_at: str | None = None
         self._followup_states: dict[str, FollowupState] = {}
         self._scheduler = None
-        # EverOS writes are best-effort, but remain service-owned until completion.
-        self._everos_sync_task_ids: set[str] = set()
 
     @property
     def memory_service(self) -> LifeMemoryService | None:
@@ -858,10 +852,8 @@ class LifeEngineService(BaseService):
         self,
         message: Message,
         direction: str = "received",
-        *,
-        sent_confirmed: bool = False,
     ) -> None:
-        """记录聊天消息；出站 EverOS 同步仅接受已确认送达的事件。"""
+        """记录聊天消息。"""
         if not self._is_enabled():
             return
 
@@ -893,8 +885,6 @@ class LifeEngineService(BaseService):
                     state.active_check_kind = None
         await self._publish_raw_events([event])
         await self._save_runtime_context()
-        if direction == "received" or sent_confirmed:
-            self._schedule_everos_message_sync(message, direction, event)
         if direction == "received":
             self._schedule_curiosity_review(message, event)
         if unlocked_self_pause:
@@ -919,42 +909,6 @@ class LifeEngineService(BaseService):
             direction=direction,
             pending_message_count=self._state.pending_event_count,
         )
-
-    def _schedule_everos_message_sync(
-        self,
-        message: Message,
-        direction: str,
-        event: LifeEngineEvent,
-    ) -> None:
-        cfg = self._cfg()
-        if not is_everos_message_sync_enabled(cfg, direction):
-            return
-
-        timeout = float(getattr(cfg.everos, "write_timeout_seconds", 15.0) or 15.0) + 2.0
-        coroutine = sync_message_to_everos(cfg, message, direction=direction)
-        try:
-            task_info = get_task_manager().create_task(
-                coroutine,
-                name=f"life_everos_sync_{event.sequence}",
-                daemon=True,
-                timeout=timeout,
-            )
-        except Exception:
-            coroutine.close()
-            logger.warning("EverOS 后台同步任务创建失败，已跳过", exc_info=True)
-            return
-
-        task_id = str(getattr(task_info, "task_id", "") or "").strip()
-        if not task_id:
-            return
-        self._everos_sync_task_ids.add(task_id)
-        task = getattr(task_info, "task", None)
-        if task is not None:
-            task.add_done_callback(
-                lambda _task, completed_id=task_id: self._everos_sync_task_ids.discard(
-                    completed_id
-                )
-            )
 
     def _get_curiosity_engine(self) -> CuriosityEngine:
         cfg = self._cfg()
@@ -3534,11 +3488,6 @@ class LifeEngineService(BaseService):
         if self._snn_tick_task_id:
             safe_cancel_task(self._snn_tick_task_id, get_task_manager())
             self._snn_tick_task_id = None
-
-        task_manager = get_task_manager()
-        for task_id in tuple(self._everos_sync_task_ids):
-            safe_cancel_task(task_id, task_manager)
-        self._everos_sync_task_ids.clear()
 
         try:
             await cleanup_autonomy_schedules(self._cfg().settings.workspace_path)

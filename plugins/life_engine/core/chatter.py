@@ -56,7 +56,6 @@ from .chat_history import (
     message_flag,
 )
 from .context_assembly import LifeChatterContextAssembler
-from .everos import recall_everos_for_chatter
 from .multimodal import (
     MediaBudget,
     MediaItem,
@@ -108,9 +107,6 @@ _RECENT_VISIBLE_TEXT_REPLY_TTL_SECONDS = 5 * 60.0
 _RECENT_VISIBLE_TEXT_REPLY_MAX_ENTRIES = 128
 _REACTION_ONLY_TEXT_PATTERN = re.compile(
     r"^(?:\s*\[(?:表情包|图片)(?:[:：][^\]]*)?\]\s*)+$"
-)
-_FORMATTED_MESSAGE_SENDER_ID_PATTERN = re.compile(
-    r"【[^】]*】\s*(?:<[^>]+>\s*)?\[([^\]\r\n]+)\]"
 )
 
 
@@ -1945,86 +1941,6 @@ class LifeChatter(BaseChatter):
         config = getattr(plugin_config, "config", None) if plugin_config is not None else None
         return getattr(config, "chatter", None) if config is not None else None
 
-    @staticmethod
-    def _is_everos_external_sender(message: Message | None) -> bool:
-        if message is None:
-            return False
-        sender_role = str(getattr(message, "sender_role", "") or "").strip().lower()
-        return sender_role not in {"bot", "assistant"}
-
-    @staticmethod
-    def _everos_sender_hint_from_formatted_lines(unread_lines: str) -> str:
-        matches = _FORMATTED_MESSAGE_SENDER_ID_PATTERN.findall(
-            str(unread_lines or "")
-        )
-        return str(matches[-1] if matches else "").strip()
-
-    def _pick_everos_user_identity(
-        self,
-        chat_stream: ChatStream,
-        unread_messages: list[Message] | tuple[Message, ...] | None = None,
-    ) -> tuple[str, str]:
-        """选择本轮 EverOS 用户 owner 的原始 ID 与来源平台。"""
-        context = getattr(chat_stream, "context", None)
-        candidates: list[Message | None] = list(reversed(list(unread_messages or [])))
-        if context is not None:
-            candidates.append(getattr(context, "current_message", None))
-            candidates.extend(reversed(list(getattr(context, "unread_messages", []) or [])))
-            candidates.extend(reversed(list(getattr(context, "history_messages", []) or [])[-20:]))
-
-        for message in candidates:
-            if not self._is_everos_external_sender(message):
-                continue
-            sender_id = str(getattr(message, "sender_id", "") or "").strip()
-            if sender_id:
-                platform = str(
-                    getattr(message, "platform", "")
-                    or getattr(chat_stream, "platform", "")
-                    or ""
-                ).strip()
-                return sender_id, platform
-
-        platform = str(getattr(chat_stream, "platform", "") or "").strip()
-        triggering_user_id = str(
-            getattr(context, "triggering_user_id", "") if context is not None else ""
-        ).strip()
-        if triggering_user_id:
-            return triggering_user_id, platform
-
-        for attr_name in ("user_id", "target_user_id"):
-            user_id = str(getattr(chat_stream, attr_name, "") or "").strip()
-            if user_id:
-                return user_id, platform
-        return str(getattr(chat_stream, "stream_id", "") or "neo_user"), platform
-
-    def _pick_everos_user_id(
-        self,
-        chat_stream: ChatStream,
-        unread_messages: list[Message] | tuple[Message, ...] | None = None,
-    ) -> str:
-        """兼容旧调用方：仅返回本轮 EverOS 用户的原始 ID。"""
-        user_id, _ = self._pick_everos_user_identity(chat_stream, unread_messages)
-        return user_id
-
-    async def _build_everos_recall_context(
-        self,
-        chat_stream: ChatStream,
-        service: LifeEngineService | None,
-        *,
-        query_text: str = "",
-        unread_messages: list[Message] | tuple[Message, ...] | None = None,
-    ) -> str:
-        if not str(query_text or "").strip():
-            return ""
-        cfg = service._cfg() if service is not None else self._get_config()
-        user_id, platform = self._pick_everos_user_identity(chat_stream, unread_messages)
-        return await recall_everos_for_chatter(
-            cfg,
-            query=query_text,
-            user_id=user_id,
-            platform=platform,
-        )
-
     def _is_sub_agent_enabled(self) -> bool:
         """读取 life_chatter 子代理功能开关。"""
         cfg = self._get_chatter_config_section()
@@ -2230,8 +2146,6 @@ class LifeChatter(BaseChatter):
         include_recent_chat_history: bool = True,
         commit_cursors: bool = True,
         event_cursor_override: int | None = None,
-        everos_query_text: str = "",
-        everos_unread_messages: list[Message] | tuple[Message, ...] | None = None,
     ) -> tuple[str, int]:
         """构建仅本次请求可见的 life 运行态快照。"""
         if service is None:
@@ -2249,15 +2163,6 @@ class LifeChatter(BaseChatter):
                 commit_cursors=commit_cursors,
                 event_cursor_override=event_cursor_override,
             )
-
-        everos_text = await self._build_everos_recall_context(
-            chat_stream,
-            service,
-            query_text=everos_query_text,
-            unread_messages=everos_unread_messages,
-        )
-        if everos_text:
-            context_text = "\n\n".join(part for part in (context_text, everos_text) if part)
 
         if not context_text:
             return "", high_water
@@ -2303,17 +2208,6 @@ class LifeChatter(BaseChatter):
             unread_lines=unread_lines,
             history_text=history_text,
         )
-        everos_unread_messages: list[Message] = []
-        sender_hint = self._everos_sender_hint_from_formatted_lines(unread_lines)
-        if sender_hint:
-            everos_unread_messages.append(
-                Message(
-                    sender_id=sender_hint,
-                    sender_role="user",
-                    platform=str(getattr(chat_stream, "platform", "") or ""),
-                    stream_id=str(getattr(chat_stream, "stream_id", "") or ""),
-                )
-            )
         dynamic_context_text, high_water = await self._build_dynamic_context_text(
             chat_stream,
             service,
@@ -2321,8 +2215,6 @@ class LifeChatter(BaseChatter):
             include_recent_chat_history=include_recent_chat_history,
             commit_cursors=commit_cursors,
             event_cursor_override=event_cursor_override,
-            everos_query_text=unread_lines,
-            everos_unread_messages=everos_unread_messages,
         )
         system_prompt_text = self._build_chat_system_prompt(service, None)
         assembled = LifeChatterContextAssembler.assemble(
@@ -3630,8 +3522,6 @@ class LifeChatter(BaseChatter):
                     service,
                     runtime_context_text=runtime_context_text,
                     include_recent_chat_history=not include_history_in_prompt,
-                    everos_query_text=unread_lines,
-                    everos_unread_messages=unread_msgs,
                 )
 
                 rt.unread_payloads_before_turn = self._snapshot_payloads(rt.response)
