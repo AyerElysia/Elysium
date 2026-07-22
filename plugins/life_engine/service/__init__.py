@@ -24,6 +24,13 @@ from .state_manager import (
     get_file_metadata,
 )
 from .attention import AttentionRouter, AttentionWindow
+from .subconscious_context import (
+    EventGroup,
+    PreparedHeartbeatContext,
+    SubconsciousContextManager,
+    SubconsciousSummary,
+    SummaryEntry,
+)
 from .event_bus import (
     LifeEvent,
     LifeEventBus,
@@ -61,6 +68,11 @@ __all__ = [
     "life_event_from_legacy",
     "AttentionRouter",
     "AttentionWindow",
+    "SummaryEntry",
+    "SubconsciousSummary",
+    "EventGroup",
+    "PreparedHeartbeatContext",
+    "SubconsciousContextManager",
     # 状态管理
     "StatePersistence",
     "event_to_dict",

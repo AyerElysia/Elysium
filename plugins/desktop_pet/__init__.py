@@ -1,2 +1,0 @@
-"""Desktop pet bridge plugin."""
-

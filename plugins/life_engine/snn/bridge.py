@@ -16,6 +16,8 @@ from typing import Any, TYPE_CHECKING
 
 import numpy as np
 
+from ..service.event_builder import is_life_heartbeat_event
+
 if TYPE_CHECKING:
     from ..service import LifeEngineService
 
@@ -102,7 +104,7 @@ def extract_features(
             if tool_name == "nucleus_tell_dfc":
                 tell_dfc_count += 1
 
-        elif etype_val == "heartbeat":
+        elif etype_val == "heartbeat" and is_life_heartbeat_event(e):
             content = str(getattr(e, "content", "") or "")
             if "安静" in content or "持续感受" in content or "等待" in content:
                 idle_beats += 1
@@ -168,7 +170,7 @@ def extract_event_stats(
             if "web_search" in tool_name:
                 web_search_count += 1
 
-        elif etype_val == "heartbeat":
+        elif etype_val == "heartbeat" and is_life_heartbeat_event(e):
             content = str(getattr(e, "content", "") or "")
             if "安静" in content or "持续感受" in content or "等待" in content:
                 idle_beats += 1

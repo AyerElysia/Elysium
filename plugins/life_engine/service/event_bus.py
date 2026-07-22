@@ -58,6 +58,8 @@ class LifeEvent:
 
 def _legacy_channel(event: LifeEngineEvent) -> LifeEventChannel:
     content_type = str(event.content_type or "").strip().lower()
+    if event.event_type == EventType.SUMMARY:
+        return LifeEventChannel.SYSTEM
     if event.event_type in {EventType.TOOL_CALL, EventType.TOOL_RESULT}:
         return LifeEventChannel.TOOL
     if event.event_type == EventType.AGENT_RESULT:
@@ -123,12 +125,23 @@ def life_event_from_legacy(event: LifeEngineEvent) -> LifeEvent:
         metadata["chat_type"] = event.chat_type
     if event.heartbeat_index is not None:
         metadata["heartbeat_index"] = event.heartbeat_index
+    for field_name in (
+        "heartbeat_run_id",
+        "call_id",
+        "parent_event_id",
+        "causation_id",
+    ):
+        value = getattr(event, field_name, None)
+        if value is not None:
+            metadata[field_name] = value
     if event.tool_name is not None:
         metadata["tool_name"] = event.tool_name
     if event.tool_args is not None:
         metadata["tool_args"] = event.tool_args
     if event.tool_success is not None:
         metadata["tool_success"] = event.tool_success
+    if event.heartbeat_context_consumed:
+        metadata["heartbeat_context_consumed"] = True
 
     return LifeEvent(
         event_id=event.event_id,

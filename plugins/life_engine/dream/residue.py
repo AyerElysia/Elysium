@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import re
@@ -13,11 +14,14 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .scenes import DreamTrace
     from .seeds import DreamSeed
+
+from ..memory.eligibility import assess_workspace_document
 
 logger = logging.getLogger("life_engine.dream")
 
@@ -446,54 +450,96 @@ async def archive_dream(
     return archive_path.relative_to(workspace).as_posix()
 
 
+async def _index_memory_document(
+    memory_service: Any,
+    path: str,
+    content: str,
+    *,
+    title: str,
+    source_mtime: float,
+) -> Any:
+    """Write a document through the current index API, with legacy fallback."""
+    upsert_document = getattr(memory_service, "upsert_document", None)
+    if callable(upsert_document):
+        result = upsert_document(
+            path,
+            content,
+            title=title,
+            source_mtime=source_mtime,
+        )
+        if inspect.isawaitable(result):
+            result = await result
+        node_id = getattr(result, "node_id", None)
+        if node_id:
+            return result
+        if isinstance(result, dict) and result.get("node_id"):
+            return SimpleNamespace(node_id=str(result["node_id"]))
+        return None
+
+    get_or_create_file_node = getattr(memory_service, "get_or_create_file_node", None)
+    if not callable(get_or_create_file_node):
+        return None
+    result = get_or_create_file_node(path, title=title, content=content)
+    if inspect.isawaitable(result):
+        result = await result
+    return result if getattr(result, "node_id", None) else None
+
+
 async def integrate_archive_into_memory(
     report: DreamReport,
     workspace: Path,
     memory_service: Any,
     seed_report: list["DreamSeed"],
 ) -> dict[str, Any]:
-    """将梦札接入文件系统记忆。
-
-    Args:
-        report: 做梦报告
-        workspace: 工作空间路径
-        memory_service: 记忆服务
-        seed_report: 种子报告列表
-
-    Returns:
-        记忆集成效果字典
-    """
+    """将梦札接入文件系统记忆。"""
     if memory_service is None or workspace is None or not report.archive_path:
         return {}
 
     from ..memory.edges import EdgeType
 
-    abs_archive_path = workspace / report.archive_path
-    if not abs_archive_path.exists():
+    archive_eligibility = assess_workspace_document(workspace, report.archive_path)
+    if not archive_eligibility.eligible:
+        return {"archive_written": False, "linked_refs": 0}
+    archive_path = archive_eligibility.path
+    abs_archive_path = workspace / archive_path
+    try:
+        dream_content = abs_archive_path.read_text(encoding="utf-8", errors="replace")
+        archive_mtime = abs_archive_path.stat().st_mtime
+    except OSError:
         return {"archive_written": False, "linked_refs": 0}
 
-    dream_content = abs_archive_path.read_text(encoding="utf-8")
-    dream_node = await memory_service.get_or_create_file_node(
-        report.archive_path,
-        title=f"梦札 {Path(report.archive_path).stem}",
-        content=dream_content,
+    dream_node = await _index_memory_document(
+        memory_service,
+        archive_path,
+        dream_content,
+        title=f"梦札 {Path(archive_path).stem}",
+        source_mtime=archive_mtime,
     )
+    if dream_node is None:
+        return {"archive_written": False, "linked_refs": 0}
 
     linked_refs = 0
     linked_paths: list[str] = []
     for ref in _iter_seed_file_refs(seed_report, workspace):
-        ref_path = workspace / ref
-        if not ref_path.exists() or not ref_path.is_file():
+        ref_eligibility = assess_workspace_document(workspace, ref)
+        if not ref_eligibility.eligible:
             continue
+        ref = ref_eligibility.path
+        ref_path = workspace / ref
         try:
-            ref_content = ref_path.read_text(encoding="utf-8")
-        except Exception:  # noqa: BLE001
-            ref_content = ""
-        ref_node = await memory_service.get_or_create_file_node(
+            ref_content = ref_path.read_text(encoding="utf-8", errors="replace")
+            ref_mtime = ref_path.stat().st_mtime
+        except OSError:
+            continue
+        ref_node = await _index_memory_document(
+            memory_service,
             ref,
+            ref_content,
             title=ref_path.stem,
-            content=ref_content[:2000],
+            source_mtime=ref_mtime,
         )
+        if ref_node is None:
+            continue
         await memory_service.create_or_update_edge(
             dream_node.node_id,
             ref_node.node_id,
@@ -507,7 +553,7 @@ async def integrate_archive_into_memory(
 
     return {
         "archive_written": True,
-        "archive_path": report.archive_path,
+        "archive_path": archive_path,
         "archive_node_id": dream_node.node_id,
         "linked_refs": linked_refs,
         "linked_paths": linked_paths,

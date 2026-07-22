@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import time
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -214,3 +215,42 @@ async def test_distributor_starts_loop_before_slow_persistence(monkeypatch: pyte
     assert started_streams == ["stream-001"]
     await asyncio.wait_for(persist_started.wait(), timeout=1.0)
     persist_release.set()
+
+
+@pytest.mark.asyncio
+async def test_distributor_logs_slow_dispatch_at_debug_and_keeps_task_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """慢分发只产生 DEBUG，且超时后原任务仍能完成。"""
+
+    completed = asyncio.Event()
+
+    async def _slow_distribution() -> None:
+        await asyncio.sleep(1.05)
+        completed.set()
+
+    class _TaskInfo:
+        task = asyncio.create_task(_slow_distribution())
+
+    def _create_task(coro, **_kwargs):
+        # 只替换外层分发任务；关闭未执行的生产协程，避免测试泄漏警告。
+        coro.close()
+        return _TaskInfo()
+
+    fake_manager = SimpleNamespace(create_task=_create_task)
+    message = SimpleNamespace(stream_id="slow-stream", platform="test")
+    logger = __import__(
+        "src.core.transport.distribution.distributor", fromlist=["logger"]
+    ).logger
+
+    with patch(
+        "src.core.transport.distribution.distributor.get_task_manager",
+        return_value=fake_manager,
+    ), patch.object(logger, "debug") as debug_mock, patch.object(logger, "warning") as warning_mock:
+        await _on_message_received("ON_MESSAGE_RECEIVED", {"message": message})
+
+    warning_mock.assert_not_called()
+    debug_mock.assert_called_once()
+    assert "elapsed=" in str(debug_mock.call_args)
+    assert not completed.is_set()
+    await asyncio.wait_for(completed.wait(), timeout=1.0)

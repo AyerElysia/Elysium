@@ -109,7 +109,6 @@ Neo-MoFox/
 | `default_chatter` | 默认对话执行器，负责群聊/私聊判定、prompt 组装、工具调用、多模态输入和消息发送 |
 | `life_engine` | 后台数字生命中枢，负责事件流、心跳、记忆、主动线索、SNN/调质、做梦和运行态同步 |
 | `proactive_message_plugin` | 主动续话和沉默检查，不再依赖“外界长期静默暂停”机制 |
-| `booku_memory` | 记忆读写和闪回注入 |
 | `emoji_sender` | 表情包入库、检索和发送 |
 | `napcat_adapter` | QQ/NapCat 平台适配 |
 | `live_bridge` | 直播桥接场景支持 |

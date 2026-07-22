@@ -56,6 +56,7 @@ def _make_memory_service():
     })
     svc.prune_weak_edges = AsyncMock(return_value=2)
     svc.list_dream_candidate_nodes = AsyncMock(return_value=[])
+    svc.upsert_document = AsyncMock(return_value=MagicMock(node_id="file:dream"))
     svc.get_or_create_file_node = AsyncMock(return_value=MagicMock(node_id="file:dream"))
     svc.create_or_update_edge = AsyncMock(return_value=MagicMock())
     return svc
@@ -256,7 +257,7 @@ class TestDreamScheduler:
         report = await sched.run_dream_cycle(events)
         assert report.archive_path.startswith("dreams/")
         assert (tmp_path / report.archive_path).exists()
-        sched._memory.get_or_create_file_node.assert_awaited()
+        sched._memory.upsert_document.assert_awaited()
 
     def test_serialize_deserialize_roundtrip(self):
         """序列化/反序列化往返一致。"""

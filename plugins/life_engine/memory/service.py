@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -20,6 +21,7 @@ from src.app.plugin_system.api import log_api
 from .nodes import (
     MemoryNode,
     generate_file_node_id,
+    generate_legacy_file_node_id,
     get_or_create_file_node,
     get_node_by_file_path,
     migrate_node_identity,
@@ -31,6 +33,7 @@ from .nodes import (
 from .edges import (
     MemoryEdge,
     EdgeType,
+    EXPLICIT_RELATION_EDGE_TYPES,
     create_or_update_edge,
     get_edges_from,
     get_edges_to,
@@ -38,9 +41,11 @@ from .edges import (
     reinforce_coactivated,
 )
 from .search import (
+    DetailedSearchResult,
     SearchResult,
     get_chroma_collection,
     search_memory,
+    search_memory_detailed,
     sync_embedding,
     vector_search,
     fts_search,
@@ -70,6 +75,37 @@ from .decay import (
     get_file_relations,
     get_stats,
 )
+from .indexing import (
+    ChunkIndexState,
+    DocumentIndexResult,
+    IndexJob,
+    claim_index_jobs,
+    create_memory_schema,
+    enqueue_index_job,
+    list_index_jobs,
+    move_document_rows,
+    read_active_chunk_index_state,
+    set_index_job_status,
+    upsert_document_rows,
+    delete_document_rows,
+)
+from .eligibility import (
+    MEMORY_CONTENT_DIRECTORIES,
+    assess_document_path,
+    assess_workspace_document,
+    read_workspace_document,
+)
+from .health import health_snapshot as collect_health_snapshot
+from .worker import (
+    CHUNK_COLLECTION_PREFIX,
+    CHUNK_INDEX_VERSION,
+    DEFAULT_RECLAIM_AFTER,
+    IndexWorkerReport,
+    chunk_collection_metadata,
+    get_chunk_collection,
+    get_named_chunk_collection,
+    process_index_jobs as run_chunk_index_jobs,
+)
 
 logger = log_api.get_logger("life_engine.memory")
 
@@ -85,19 +121,30 @@ class LifeMemoryService:
     PRUNE_THRESHOLD = 0.1
     RRF_K = 60
 
-    def __init__(self, plugin: Any) -> None:
+    def __init__(self, plugin: Any, *, clock: Any = None) -> None:
         """初始化记忆服务。
 
         Args:
             plugin: 插件实例（用于获取配置）
+            clock: 可选无参时钟，供相对日期查询测试或注入使用。
         """
         self.plugin = plugin
+        self._clock = clock or datetime.now
         self._workspace_override: Path | None = None
         if isinstance(plugin, (str, Path)):
             self._workspace_override = Path(plugin)
         self._db: sqlite3.Connection | None = None
         self._initialized = False
+        self._closing = False
         self._chroma_collection = None
+        self._chunk_collection = None
+        self._chunk_collection_identity: tuple[str, int] | None = None
+        self._chunk_index_state: ChunkIndexState | None = None
+        self._chunk_collection_candidate = None
+        self._chunk_collection_candidate_identity: tuple[str, int] | None = None
+        self._index_write_lock = asyncio.Lock()
+        self._index_worker_lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
 
     def _emit_visual_event(
         self,
@@ -152,32 +199,125 @@ class LifeMemoryService:
         return Path(config.settings.workspace_path)
 
     async def _get_chroma_collection(self) -> Any:
-        """获取并缓存向量集合。"""
+        """获取并缓存兼容旧节点向量的集合。"""
         if self._chroma_collection is None:
             self._chroma_collection = await get_chroma_collection(self._get_vector_db_path())
         return self._chroma_collection
 
+    async def _resolve_chunk_collection(
+        self,
+        model_name: str,
+        dimension: int,
+        _metadata: Any = None,
+    ) -> Any:
+        """按 embedding 模型和维度获取本轮 worker 的候选集合。"""
+        identity = (str(model_name or "unknown"), int(dimension))
+        if self._chunk_collection is not None and self._chunk_collection_identity == identity:
+            return self._chunk_collection
+        if (
+            self._chunk_collection_candidate is not None
+            and self._chunk_collection_candidate_identity == identity
+        ):
+            return self._chunk_collection_candidate
+
+        state = self._chunk_index_state
+        if state is not None:
+            self._validate_chunk_index_state(state)
+            if (state.model_name, state.dimension) != identity:
+                raise ValueError("ActiveCollectionIdentityMismatch")
+            collection = await get_named_chunk_collection(
+                self._get_vector_db_path(),
+                state.collection_name,
+            )
+            self._validate_restored_chunk_collection(state, collection)
+        else:
+            collection = await get_chunk_collection(
+                self._get_vector_db_path(),
+                identity[0],
+                identity[1],
+            )
+
+        self._chunk_collection_candidate = collection
+        self._chunk_collection_candidate_identity = identity
+        return collection
+
+    @staticmethod
+    def _validate_chunk_index_state(state: ChunkIndexState) -> None:
+        expected_prefix = f"{CHUNK_COLLECTION_PREFIX}_v{CHUNK_INDEX_VERSION}_"
+        if state.version != CHUNK_INDEX_VERSION:
+            raise ValueError("ChunkIndexVersionMismatch")
+        if not state.collection_name.startswith(expected_prefix):
+            raise ValueError("ChunkCollectionNameMismatch")
+        if state.dimension <= 0 or not state.model_name:
+            raise ValueError("ChunkCollectionIdentityInvalid")
+
+    @classmethod
+    def _validate_restored_chunk_collection(
+        cls,
+        state: ChunkIndexState,
+        collection: Any,
+    ) -> None:
+        cls._validate_chunk_index_state(state)
+        actual_name = str(getattr(collection, "name", "") or "").strip()
+        if actual_name != state.collection_name:
+            raise ValueError("ChunkCollectionNameMismatch")
+        metadata = getattr(collection, "metadata", None)
+        if not isinstance(metadata, dict) or not metadata:
+            raise ValueError("ChunkCollectionMetadataMissing")
+        expected = chunk_collection_metadata(state.model_name, state.dimension)
+        for key, value in expected.items():
+            if key not in metadata or metadata[key] != value:
+                raise ValueError(f"ChunkCollectionMetadataMismatch:{key}")
+
+    async def _restore_chunk_collection(self) -> None:
+        db = self._require_db()
+        state = await asyncio.to_thread(read_active_chunk_index_state, db)
+        if state is None:
+            return
+        self._chunk_index_state = state
+        self._validate_chunk_index_state(state)
+        collection = await get_named_chunk_collection(
+            self._get_vector_db_path(),
+            state.collection_name,
+        )
+        self._validate_restored_chunk_collection(state, collection)
+        self._chunk_collection = collection
+        self._chunk_collection_identity = (state.model_name, state.dimension)
+        self._chunk_collection_candidate = collection
+        self._chunk_collection_candidate_identity = self._chunk_collection_identity
+        logger.info(f"已恢复 chunk 向量集合: {state.collection_name}")
+
     async def initialize(self) -> None:
         """初始化记忆服务。"""
-        if self._initialized:
-            return
+        async with self._lifecycle_lock:
+            if self._initialized:
+                return
 
-        db_path = self._get_db_path()
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+            db_path = self._get_db_path()
+            db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self._db = sqlite3.connect(str(db_path), check_same_thread=False)
-        self._db.row_factory = sqlite3.Row
+            db = sqlite3.connect(str(db_path), check_same_thread=False)
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys = ON")
+            db.execute("PRAGMA busy_timeout = 5000")
+            self._db = db
 
-        # 启用外键约束（SQLite 默认关闭）
-        self._db.execute("PRAGMA foreign_keys = ON")
+            try:
+                await self._create_tables()
+                await asyncio.to_thread(create_memory_schema, db)
 
-        await self._create_tables()
+                try:
+                    await self._restore_chunk_collection()
+                except Exception as exc:
+                    logger.warning(f"恢复 chunk 向量集合失败，已降级到 legacy: {exc}")
 
-        # 初始化 ChromaDB collection
-        self._chroma_collection = await self._get_chroma_collection()
-
-        self._initialized = True
-        logger.info(f"记忆服务初始化完成，数据库: {db_path}")
+                self._chroma_collection = await self._get_chroma_collection()
+                self._initialized = True
+            except BaseException:
+                self._db = None
+                await asyncio.to_thread(db.close)
+                raise
+            logger.info(f"记忆服务初始化完成，数据库: {db_path}")
 
     async def _create_tables(self) -> None:
         """创建数据库表。"""
@@ -284,6 +424,163 @@ class LifeMemoryService:
         await asyncio.to_thread(_do_db_work)
         logger.debug("记忆数据库表创建完成")
 
+    def _require_db(self) -> sqlite3.Connection:
+        if self._db is None or self._closing:
+            raise RuntimeError("记忆服务尚未初始化或正在关闭")
+        return self._db
+
+    async def close(self) -> None:
+        """幂等关闭 SQLite；共享向量服务的生命周期由 kernel 管理。"""
+        async with self._lifecycle_lock:
+            if self._db is None:
+                self._initialized = False
+                self._clear_cached_collections()
+                return
+
+            self._closing = True
+            try:
+                async with self._index_worker_lock:
+                    async with self._index_write_lock:
+                        db = self._db
+                        self._db = None
+                        if db is not None:
+                            await asyncio.to_thread(db.close)
+            finally:
+                self._initialized = False
+                self._closing = False
+                self._clear_cached_collections()
+
+    def _clear_cached_collections(self) -> None:
+        self._chroma_collection = None
+        self._chunk_collection = None
+        self._chunk_collection_identity = None
+        self._chunk_index_state = None
+        self._chunk_collection_candidate = None
+        self._chunk_collection_candidate_identity = None
+
+    async def upsert_document(
+        self,
+        path: str,
+        content: str,
+        title: str = "",
+        source_mtime: float | None = None,
+        *,
+        max_chars: int | None = None,
+        overlap_chars: int | None = None,
+    ) -> DocumentIndexResult:
+        """统一写入文档节点、分块 FTS 和待处理 outbox。"""
+        async with self._index_write_lock:
+            db = self._require_db()
+            return await asyncio.to_thread(
+                upsert_document_rows,
+                db,
+                path,
+                content,
+                title,
+                source_mtime,
+                **({} if max_chars is None else {"max_chars": max_chars}),
+                **({} if overlap_chars is None else {"overlap_chars": overlap_chars}),
+            )
+
+    async def delete_document(self, path: str) -> bool:
+        """删除文档及其 SQLite 索引、分块和 outbox 记录。"""
+        async with self._index_write_lock:
+            db = self._require_db()
+            return await asyncio.to_thread(delete_document_rows, db, path)
+
+    async def move_document(self, old_path: str, new_path: str) -> bool:
+        """移动文档索引；目标已有节点时明确拒绝合并。"""
+        async with self._index_write_lock:
+            db = self._require_db()
+            return await asyncio.to_thread(move_document_rows, db, old_path, new_path)
+
+    async def enqueue_index_job(self, node_id: str, content_hash: str) -> str:
+        """加入一个待处理索引任务，不触发 embedding 或网络请求。"""
+        async with self._index_write_lock:
+            db = self._require_db()
+            return await asyncio.to_thread(enqueue_index_job, db, node_id, content_hash)
+
+    async def process_index_jobs(self, limit: int = 10) -> List[IndexJob]:
+        """领取待处理任务，交给外部 worker；本方法不执行 embedding。"""
+        async with self._index_write_lock:
+            db = self._require_db()
+            return await asyncio.to_thread(claim_index_jobs, db, limit=limit)
+
+    async def run_index_worker(
+        self,
+        limit: int = 10,
+        *,
+        collection: Any = None,
+        embed_texts_func: Any = None,
+        collection_upsert_func: Any = None,
+        retry_failed: bool = True,
+        reclaim_after: float | None = DEFAULT_RECLAIM_AFTER,
+    ) -> IndexWorkerReport:
+        """执行一批 chunk embedding 任务，不阻塞并发文档更新。"""
+
+        def _open_worker_db() -> sqlite3.Connection:
+            worker_db = sqlite3.connect(str(self._get_db_path()), check_same_thread=False)
+            worker_db.row_factory = sqlite3.Row
+            worker_db.execute("PRAGMA foreign_keys = ON")
+            worker_db.execute("PRAGMA busy_timeout = 5000")
+            return worker_db
+
+        async with self._index_worker_lock:
+            self._require_db()
+            worker_db = _open_worker_db()
+            worker_task = asyncio.create_task(
+                run_chunk_index_jobs(
+                    worker_db,
+                    collection,
+                    limit=limit,
+                    embed_texts_func=embed_texts_func,
+                    collection_resolver=self._resolve_chunk_collection,
+                    collection_upsert_func=collection_upsert_func,
+                    retry_failed=retry_failed,
+                    reclaim_after=reclaim_after,
+                )
+            )
+            try:
+                report = await asyncio.shield(worker_task)
+            except asyncio.CancelledError:
+                await worker_task
+                raise
+            finally:
+                worker_db.close()
+            if report.completed:
+                active_collection = collection or self._chunk_collection_candidate
+                if active_collection is not None:
+                    self._chunk_collection = active_collection
+                    self._chunk_collection_identity = (report.model_name, report.dimension)
+        return report
+
+    async def list_index_jobs(
+        self,
+        status: str = "pending",
+        limit: int = 100,
+    ) -> List[IndexJob]:
+        """读取 outbox 状态，供 worker 或测试观察。"""
+        async with self._index_write_lock:
+            db = self._require_db()
+            return await asyncio.to_thread(list_index_jobs, db, status=status, limit=limit)
+
+    async def set_index_job_status(
+        self,
+        job_id: str,
+        status: str,
+        error: str = "",
+    ) -> bool:
+        """更新外部索引 worker 的任务状态。"""
+        async with self._index_write_lock:
+            db = self._require_db()
+            return await asyncio.to_thread(
+                set_index_job_status,
+                db,
+                job_id,
+                status,
+                error=error,
+            )
+
     # --------------------------------------------------------
     # 节点操作（封装模块函数）
     # --------------------------------------------------------
@@ -305,22 +602,53 @@ class LifeMemoryService:
             migrate_node_identity_func=self._migrate_node_identity_wrapper,
         )
 
-    async def get_node_by_file_path(self, file_path: str) -> Optional[MemoryNode]:
-        """根据文件路径获取节点。"""
-        return await get_node_by_file_path(
+    async def get_or_create_workspace_document_node(self, file_path: str) -> MemoryNode:
+        """Index an eligible workspace document before using it in a relation."""
+        return await self._get_or_create_file_node_from_workspace(file_path)
+
+    async def get_node_by_file_path(
+        self,
+        file_path: str,
+        migrate_identity: bool = True,
+    ) -> Optional[MemoryNode]:
+        """根据合格记忆文档路径获取节点。"""
+        eligibility = assess_document_path(file_path)
+        if not eligibility.eligible:
+            return None
+        normalized_path = eligibility.path
+        node = await get_node_by_file_path(
             db=self._db,
-            file_path=file_path,
-            migrate_node_identity_func=self._migrate_node_identity_wrapper,
+            file_path=normalized_path,
+            migrate_node_identity_func=(
+                self._migrate_node_identity_wrapper if migrate_identity else None
+            ),
         )
+        if node is not None or migrate_identity:
+            return node
+
+        legacy_node_id = generate_legacy_file_node_id(file_path)
+        if legacy_node_id == generate_file_node_id(normalized_path):
+            return None
+        legacy_node = await self._get_node_by_id_wrapper(legacy_node_id)
+        if legacy_node is None:
+            return None
+        legacy_eligibility = assess_document_path(legacy_node.file_path or "")
+        return legacy_node if legacy_eligibility.eligible else None
 
     async def migrate_file_path(self, old_path: str, new_path: str) -> bool:
-        """迁移文件路径对应的记忆身份。"""
-        return await migrate_file_path(
-            db=self._db,
-            old_path=old_path,
-            new_path=new_path,
-            migrate_node_identity_func=self._migrate_node_identity_wrapper,
-        )
+        """迁移文档路径，优先保留 chunk/FTS/outbox 的一致性。"""
+        async with self._index_write_lock:
+            db = self._require_db()
+            try:
+                return await asyncio.to_thread(move_document_rows, db, old_path, new_path)
+            except FileNotFoundError:
+                # Very old installations may only have the historical node ID.
+                return await migrate_file_path(
+                    db=db,
+                    old_path=old_path,
+                    new_path=new_path,
+                    migrate_node_identity_func=self._migrate_node_identity_wrapper,
+                )
 
     async def increment_access(self, node_id: str) -> None:
         """增加节点访问计数并更新激活强度。"""
@@ -354,7 +682,8 @@ class LifeMemoryService:
     ) -> None:
         """迁移向量库中的节点 ID（尽力而为，不阻塞主流程）。"""
         try:
-            old_data = self._chroma_collection.get(
+            old_data = await asyncio.to_thread(
+                self._chroma_collection.get,
                 ids=[old_node_id],
                 include=["embeddings", "documents", "metadatas"],
             )
@@ -381,8 +710,8 @@ class LifeMemoryService:
             if documents:
                 upsert_kwargs["documents"] = [documents[0]]
 
-            self._chroma_collection.upsert(**upsert_kwargs)
-            self._chroma_collection.delete(ids=[old_node_id])
+            await asyncio.to_thread(self._chroma_collection.upsert, **upsert_kwargs)
+            await asyncio.to_thread(self._chroma_collection.delete, ids=[old_node_id])
         except Exception as e:
             logger.debug(f"向量身份迁移失败 {old_node_id} -> {new_node_id}: {e}")
 
@@ -477,8 +806,11 @@ class LifeMemoryService:
         enable_association: bool = True,
         file_types: Optional[List[str]] = None,
         time_range_days: int = 0,
+        *,
+        now: Any = None,
+        workspace_path: str | Path | None = None,
     ) -> List[SearchResult]:
-        """混合检索 + 联想。"""
+        """混合检索 + 联想，优先使用已就绪的 chunk 向量集合。"""
         return await search_memory(
             db=self._db,
             query=query,
@@ -488,17 +820,46 @@ class LifeMemoryService:
             file_types=file_types,
             time_range_days=time_range_days,
             emit_visual_event=self._emit_visual_event,
-            increment_access_func=self.increment_access,
-            reinforce_coactivated_func=self._reinforce_coactivated_wrapper,
+            now=self._clock if now is None else now,
+            workspace_path=(self._get_workspace_path() if workspace_path is None else workspace_path),
+            chunk_collection=self._chunk_collection,
+        )
+
+    async def search_memory_detailed(
+        self,
+        query: str,
+        top_k: int = 5,
+        enable_association: bool = True,
+        file_types: Optional[List[str]] = None,
+        time_range_days: int = 0,
+        *,
+        now: Any = None,
+        workspace_path: str | Path | None = None,
+    ) -> DetailedSearchResult:
+        """返回检索结果及各阶段只读诊断。"""
+        return await search_memory_detailed(
+            db=self._db,
+            query=query,
+            collection=self._chroma_collection,
+            top_k=top_k,
+            enable_association=enable_association,
+            file_types=file_types,
+            time_range_days=time_range_days,
+            emit_visual_event=self._emit_visual_event,
+            now=self._clock if now is None else now,
+            workspace_path=(self._get_workspace_path() if workspace_path is None else workspace_path),
+            chunk_collection=self._chunk_collection,
         )
 
     async def vector_search(self, query: str, top_k: int = 10) -> List[tuple]:
-        """向量相似度检索。"""
+        """向量相似度检索，优先聚合 chunk 命中到节点。"""
         return await vector_search(
             query=query,
             collection=self._chroma_collection,
             top_k=top_k,
             filter_existing_func=self._filter_existing_scores_wrapper,
+            db=self._db,
+            chunk_collection=self._chunk_collection,
         )
 
     async def fts_search(self, query: str, top_k: int = 10) -> List[tuple]:
@@ -520,8 +881,9 @@ class LifeMemoryService:
         seed_ids: List[str],
         max_depth: int = 2,
         max_results: int = 10,
+        allowed_edge_types: Optional[List[EdgeType | str]] = None,
     ) -> List[tuple]:
-        """激活扩散联想。"""
+        """激活扩散联想，默认只读取显式关系。"""
         return await spread_activation(
             db=self._db,
             seed_ids=seed_ids,
@@ -529,6 +891,11 @@ class LifeMemoryService:
             max_results=max_results,
             spread_decay=self.SPREAD_DECAY,
             spread_threshold=self.SPREAD_THRESHOLD,
+            allowed_edge_types=(
+                EXPLICIT_RELATION_EDGE_TYPES
+                if allowed_edge_types is None
+                else allowed_edge_types
+            ),
         )
 
     # --------------------------------------------------------
@@ -612,21 +979,37 @@ class LifeMemoryService:
         self,
         file_path: str,
         max_depth: int = 4,
+        persist_lineage: bool = False,
+        *,
+        allow_heuristic: bool = False,
     ) -> Dict[str, Any]:
-        """沿演化链解析旧路径当前对应的文件。
-
-        返回值不会说旧文件“失效”，只说明它后来迁移/整理到了哪里。
-        """
-        requested_path = normalize_file_path(file_path)
+        """沿显式演化链解析旧路径当前对应的文件。"""
+        eligibility = assess_document_path(file_path)
+        requested_path = eligibility.path
         workspace = self._get_workspace_path()
-        if not requested_path:
+        if not eligibility.eligible:
             return {
                 "requested_path": requested_path,
                 "resolved_path": requested_path,
                 "resolved": False,
                 "lineage": [],
-                "note": "路径为空",
+                "note": f"不是可用于记忆演化的文档: {eligibility.reason}",
             }
+
+        node = await self.get_node_by_file_path(
+            file_path,
+            migrate_identity=False,
+        )
+        if node is not None:
+            resolved = await self._resolve_canonical_from_node(node, max_depth=max_depth)
+            if resolved is not None:
+                return {
+                    "requested_path": requested_path,
+                    "resolved_path": resolved["path"],
+                    "resolved": True,
+                    "lineage": resolved["lineage"],
+                    "note": "显式记忆演化链指向了当前文件",
+                }
 
         requested_abs = workspace / requested_path
         if requested_abs.exists():
@@ -638,42 +1021,36 @@ class LifeMemoryService:
                 "note": "请求路径当前存在",
             }
 
-        node = await self.get_node_by_file_path(requested_path)
-        if node is not None:
-            resolved = await self._resolve_canonical_from_node(node, max_depth=max_depth)
-            if resolved is not None:
+        if allow_heuristic:
+            candidate_path = await asyncio.to_thread(
+                self._find_missing_file_candidate,
+                requested_path,
+            )
+            if candidate_path:
+                reason = "旧路径当前不存在；工作空间中发现同主题的当前文件候选。"
+                if persist_lineage and allow_heuristic:
+                    reason = "旧路径当前不存在；工作空间中发现同主题的当前文件候选，保留旧记忆并建立迁移链路。"
+                    await self.create_memory_lineage_edge(
+                        source_path=requested_path,
+                        target_path=candidate_path,
+                        relation_type=EdgeType.RENAMES,
+                        reason=reason,
+                        strength=0.75,
+                    )
                 return {
                     "requested_path": requested_path,
-                    "resolved_path": resolved["path"],
+                    "resolved_path": candidate_path,
                     "resolved": True,
-                    "lineage": resolved["lineage"],
-                    "note": "请求路径不在工作空间中，但记忆演化链指向了当前文件",
+                    "lineage": [
+                        {
+                            "relation": EdgeType.RENAMES.value,
+                            "from": requested_path,
+                            "to": candidate_path,
+                            "reason": reason,
+                        }
+                    ],
+                    "note": "请求路径不在工作空间中，已按候选路径解析到当前文件",
                 }
-
-        candidate_path = await self._find_missing_file_candidate(requested_path)
-        if candidate_path:
-            reason = "旧路径当前不存在；工作空间中发现同主题的当前文件候选，保留旧记忆并建立迁移链路。"
-            await self.create_memory_lineage_edge(
-                source_path=requested_path,
-                target_path=candidate_path,
-                relation_type=EdgeType.RENAMES,
-                reason=reason,
-                strength=0.75,
-            )
-            return {
-                "requested_path": requested_path,
-                "resolved_path": candidate_path,
-                "resolved": True,
-                "lineage": [
-                    {
-                        "relation": EdgeType.RENAMES.value,
-                        "from": requested_path,
-                        "to": candidate_path,
-                        "reason": reason,
-                    }
-                ],
-                "note": "请求路径不在工作空间中，已按记忆演化链解析到当前文件",
-            }
 
         return {
             "requested_path": requested_path,
@@ -690,24 +1067,43 @@ class LifeMemoryService:
         top_k: int = 5,
     ) -> List[MemoryBundle]:
         """把普通检索结果聚合成“当前理解 + 历史轨迹”的记忆包。"""
+        workspace = self._get_workspace_path()
+
+        def _bundle_memory_path(file_path: str) -> str | None:
+            eligibility = assess_document_path(file_path)
+            if not eligibility.eligible:
+                return None
+            candidate = workspace / eligibility.path
+            if candidate.is_symlink():
+                return None
+            if candidate.exists() and not assess_workspace_document(workspace, eligibility.path).eligible:
+                return None
+            return eligibility.path
+
         bundles: list[MemoryBundle] = []
         seen_primary_paths: set[str] = set()
 
         for result in results:
             if len(bundles) >= max(1, top_k):
                 break
-            node = await self.get_node_by_file_path(result.file_path)
+            source_path = _bundle_memory_path(result.file_path)
+            if source_path is None:
+                continue
+            node = await self.get_node_by_file_path(
+                source_path,
+                migrate_identity=False,
+            )
             if node is None:
                 continue
 
             evidence = [
                 MemoryEvidence(
-                    file_path=result.file_path,
+                    file_path=source_path,
                     title=result.title,
                     snippet=result.snippet,
                     relevance=result.relevance,
                     source=result.source,
-                    exists=(self._get_workspace_path() / result.file_path).exists(),
+                    exists=(workspace / source_path).is_file(),
                 )
             ]
             trace: list[MemoryTrace] = []
@@ -716,15 +1112,16 @@ class LifeMemoryService:
             outgoing, incoming = await get_lineage_edges(self._db, node.node_id)
             for edge in outgoing:
                 target = await self._get_node_by_id_wrapper(edge.target_id)
-                if target is None or not target.file_path:
+                target_path = _bundle_memory_path(target.file_path) if target and target.file_path else None
+                if target is None or target_path is None:
                     continue
                 related_node_ids.append(target.node_id)
                 snippet = await self._get_snippet_wrapper(target.node_id)
-                exists = (self._get_workspace_path() / target.file_path).exists()
+                exists = (workspace / target_path).is_file()
                 trace.append(
                     MemoryTrace(
                         relation=edge.edge_type.value,
-                        file_path=target.file_path,
+                        file_path=target_path,
                         title=target.title,
                         snippet=snippet,
                         reason=edge.reason,
@@ -734,7 +1131,7 @@ class LifeMemoryService:
                 )
                 evidence.append(
                     MemoryEvidence(
-                        file_path=target.file_path,
+                        file_path=target_path,
                         title=target.title,
                         snippet=snippet,
                         relevance=result.relevance * edge.weight,
@@ -747,15 +1144,16 @@ class LifeMemoryService:
 
             for edge in incoming:
                 source = await self._get_node_by_id_wrapper(edge.source_id)
-                if source is None or not source.file_path:
+                incoming_path = _bundle_memory_path(source.file_path) if source and source.file_path else None
+                if source is None or incoming_path is None:
                     continue
                 related_node_ids.append(source.node_id)
                 snippet = await self._get_snippet_wrapper(source.node_id)
-                exists = (self._get_workspace_path() / source.file_path).exists()
+                exists = (workspace / incoming_path).is_file()
                 trace.append(
                     MemoryTrace(
                         relation=edge.edge_type.value,
-                        file_path=source.file_path,
+                        file_path=incoming_path,
                         title=source.title,
                         snippet=snippet,
                         reason=edge.reason,
@@ -765,7 +1163,7 @@ class LifeMemoryService:
                 )
                 evidence.append(
                     MemoryEvidence(
-                        file_path=source.file_path,
+                        file_path=incoming_path,
                         title=source.title,
                         snippet=snippet,
                         relevance=result.relevance * edge.weight,
@@ -777,23 +1175,35 @@ class LifeMemoryService:
                 )
 
             canonical = await self._resolve_canonical_from_node(node)
-            if canonical is not None:
-                resolution = {
-                    "requested_path": result.file_path,
+            resolution = (
+                {
+                    "requested_path": source_path,
                     "resolved_path": canonical["path"],
                     "resolved": True,
                     "lineage": canonical["lineage"],
                     "note": "记忆演化链指向了后续整理文件",
                 }
-            else:
-                resolution = await self.resolve_canonical_path(result.file_path)
-            primary_path = str(resolution.get("resolved_path") or result.file_path)
+                if canonical is not None
+                else {
+                    "requested_path": source_path,
+                    "resolved_path": source_path,
+                    "resolved": False,
+                    "lineage": [],
+                    "note": "未找到显式记忆演化链",
+                }
+            )
+            primary_path = _bundle_memory_path(str(resolution.get("resolved_path") or ""))
+            if primary_path is None:
+                continue
             if primary_path in seen_primary_paths:
                 continue
             seen_primary_paths.add(primary_path)
 
-            if primary_path != result.file_path and not any(item.file_path == primary_path for item in evidence):
-                primary_node = await self.get_node_by_file_path(primary_path)
+            if primary_path != source_path and not any(item.file_path == primary_path for item in evidence):
+                primary_node = await self.get_node_by_file_path(
+                    primary_path,
+                    migrate_identity=False,
+                )
                 if primary_node is not None:
                     related_node_ids.append(primary_node.node_id)
                     evidence.append(
@@ -805,7 +1215,7 @@ class LifeMemoryService:
                             source="lineage",
                             relation="canonical",
                             relation_reason=str(resolution.get("note") or ""),
-                            exists=(self._get_workspace_path() / primary_path).exists(),
+                            exists=(workspace / primary_path).is_file(),
                         )
                     )
 
@@ -859,20 +1269,45 @@ class LifeMemoryService:
         return await self.build_memory_bundles(query=query, results=results, top_k=top_k)
 
     async def _get_or_create_file_node_from_workspace(self, file_path: str) -> MemoryNode:
-        normalized = normalize_file_path(file_path)
-        workspace_file = self._get_workspace_path() / normalized
-        content = ""
-        title = Path(normalized).stem
-        if workspace_file.is_file():
+        """Load an eligible workspace document, or reuse an indexed historical node.
+
+        This helper is used by explicit lineage and correction writes.  It must
+        never turn a typo or an internal runtime path into a new empty memory
+        node.  A missing file is only valid when the node already exists as
+        historical lineage evidence.
+        """
+        path_eligibility = assess_document_path(file_path)
+        if not path_eligibility.eligible:
+            raise ValueError(f"不支持索引的记忆文档路径: {path_eligibility.reason}")
+
+        workspace = self._get_workspace_path()
+        eligibility = assess_workspace_document(workspace, path_eligibility.path)
+        if eligibility.eligible:
             try:
-                content = workspace_file.read_text(encoding="utf-8", errors="replace")
-            except Exception as exc:
-                logger.debug(f"读取记忆文件用于建链失败 {normalized}: {exc}")
-        return await self.get_or_create_file_node(
-            normalized,
-            title=title,
-            content=content,
-        )
+                content, source_mtime, _ = read_workspace_document(
+                    workspace,
+                    eligibility.path,
+                )
+            except (OSError, UnicodeError, ValueError) as exc:
+                raise ValueError(f"无法读取记忆文档: {eligibility.path}") from exc
+            await self.upsert_document(
+                eligibility.path,
+                content,
+                title=Path(eligibility.path).stem,
+                source_mtime=source_mtime,
+            )
+            node = await self.get_node_by_file_path(eligibility.path)
+            if node is None:
+                raise RuntimeError(f"记忆文档写入后未找到节点: {eligibility.path}")
+            return node
+
+        if eligibility.reason == "stat_error":
+            historical_node = await self.get_node_by_file_path(path_eligibility.path)
+            if historical_node is not None:
+                return historical_node
+            raise ValueError(f"记忆文档不存在或不可访问: {path_eligibility.path}")
+
+        raise ValueError(f"不支持索引的记忆文档路径: {eligibility.reason}")
 
     async def _resolve_canonical_from_node(
         self,
@@ -880,72 +1315,130 @@ class LifeMemoryService:
         max_depth: int = 4,
     ) -> Dict[str, Any] | None:
         workspace = self._get_workspace_path()
-        visited = {node.node_id}
-        current = node
-        lineage: list[dict[str, str]] = []
+        if max_depth <= 0:
+            return None
 
-        for _ in range(max_depth):
-            outgoing, _ = await get_lineage_edges(self._db, current.node_id)
-            candidates = [
-                edge
-                for edge in outgoing
-                if edge.edge_type in CANONICAL_EDGE_TYPES and edge.target_id not in visited
-            ]
-            if not candidates:
+        frontier: list[
+            tuple[MemoryNode, list[dict[str, str]], frozenset[str], float, float, tuple[str, ...]]
+        ] = [(node, [], frozenset({node.node_id}), 0.0, 0.0, ())]
+        resolved: list[tuple[int, float, float, tuple[str, ...], str, list[dict[str, str]]]] = []
+
+        for depth in range(1, max_depth + 1):
+            next_frontier: list[
+                tuple[MemoryNode, list[dict[str, str]], frozenset[str], float, float, tuple[str, ...]]
+            ] = []
+            for current, lineage, visited, weight, created_at, edge_ids in sorted(
+                frontier,
+                key=lambda item: (-item[3], -item[4], item[5], item[0].node_id),
+            ):
+                outgoing, _ = await get_lineage_edges(self._db, current.node_id)
+                candidates = [
+                    edge
+                    for edge in outgoing
+                    if edge.edge_type in CANONICAL_EDGE_TYPES and edge.target_id not in visited
+                ]
+                for edge in sorted(
+                    candidates,
+                    key=lambda item: (-float(item.weight), -float(item.created_at), item.edge_id),
+                ):
+                    target = await self._get_node_by_id_wrapper(edge.target_id)
+                    if target is None or not target.file_path:
+                        continue
+                    target_eligibility = assess_document_path(target.file_path)
+                    if not target_eligibility.eligible:
+                        continue
+                    target_path = target_eligibility.path
+                    current_path = assess_document_path(current.file_path or "").path
+                    target_lineage = [
+                        *lineage,
+                        {
+                            "relation": edge.edge_type.value,
+                            "from": current_path or current.node_id,
+                            "to": target_path,
+                            "reason": edge.reason,
+                        },
+                    ]
+                    target_weight = weight + float(edge.weight)
+                    target_created_at = created_at + float(edge.created_at)
+                    target_edge_ids = (*edge_ids, edge.edge_id)
+                    next_frontier.append(
+                        (
+                            target,
+                            target_lineage,
+                            visited | {target.node_id},
+                            target_weight,
+                            target_created_at,
+                            target_edge_ids,
+                        )
+                    )
+                    if assess_workspace_document(workspace, target_path).eligible:
+                        resolved.append(
+                            (
+                                depth,
+                                target_weight,
+                                target_created_at,
+                                target_edge_ids,
+                                target_path,
+                                target_lineage,
+                            )
+                        )
+
+            if not next_frontier:
                 break
-            edge = sorted(candidates, key=lambda item: (item.weight, item.created_at), reverse=True)[0]
-            target = await self._get_node_by_id_wrapper(edge.target_id)
-            if target is None or not target.file_path:
-                break
-            visited.add(target.node_id)
-            lineage.append(
-                {
-                    "relation": edge.edge_type.value,
-                    "from": current.file_path or current.node_id,
-                    "to": target.file_path,
-                    "reason": edge.reason,
-                }
-            )
-            current = target
-            if (workspace / target.file_path).exists():
-                return {"path": target.file_path, "lineage": lineage}
+            frontier = next_frontier
 
-        return None
+        if not resolved:
+            return None
+        _, _, _, _, path, lineage = sorted(
+            resolved,
+            key=lambda item: (-item[0], -item[1], -item[2], item[3], item[4]),
+        )[0]
+        return {"path": path, "lineage": lineage}
 
-    async def _find_missing_file_candidate(self, requested_path: str) -> str | None:
+    def _find_missing_file_candidate(self, requested_path: str) -> str | None:
+        """Find one eligible same-stem candidate without traversing runtime storage."""
+        requested_eligibility = assess_document_path(requested_path)
+        if not requested_eligibility.eligible:
+            return None
+
         workspace = self._get_workspace_path()
-        requested = Path(requested_path)
+        requested = Path(requested_eligibility.path)
         suffix = requested.suffix
         stem = requested.stem
-        candidate_stems = [stem]
+        candidate_stems = {stem}
         for marker in ("_research", "-research", "_draft", "-draft", "_old", "-old", "_notes", "-notes"):
             if stem.endswith(marker):
-                candidate_stems.append(stem[: -len(marker)])
+                candidate_stems.add(stem[: -len(marker)])
+        candidate_stems.discard("")
 
-        search_roots = []
+        search_roots: list[Path] = []
         parent = workspace / requested.parent
-        if parent.exists() and parent.is_dir():
+        if requested.parent != Path(".") and parent.is_dir():
             search_roots.append(parent)
-        search_roots.append(workspace)
+        search_roots.extend(
+            workspace / directory
+            for directory in sorted(MEMORY_CONTENT_DIRECTORIES)
+            if (workspace / directory).is_dir()
+        )
 
+        candidates: set[str] = set()
         seen_roots: set[Path] = set()
         for root in search_roots:
             if root in seen_roots:
                 continue
             seen_roots.add(root)
-            for candidate_stem in candidate_stems:
-                if not candidate_stem:
-                    continue
-                direct = root / f"{candidate_stem}{suffix}"
-                if direct.exists() and direct.is_file():
-                    return normalize_file_path(str(direct.relative_to(workspace)))
-
             for path in root.rglob(f"*{suffix}"):
-                if not path.is_file():
+                try:
+                    candidate_path = path.relative_to(workspace).as_posix()
+                except ValueError:
                     continue
-                if path.stem in candidate_stems:
-                    return normalize_file_path(str(path.relative_to(workspace)))
-        return None
+                if path.stem not in candidate_stems:
+                    continue
+                eligibility = assess_workspace_document(workspace, candidate_path)
+                if eligibility.eligible:
+                    candidates.add(eligibility.path)
+
+        return next(iter(candidates)) if len(candidates) == 1 else None
 
     def _build_current_understanding(
         self,
@@ -1015,6 +1508,14 @@ class LifeMemoryService:
         """获取记忆系统统计信息。"""
         return await get_stats(self._db)
 
+    async def health_snapshot(self) -> Dict[str, Any]:
+        """获取只读记忆健康快照，不修复或删除任何数据。"""
+        return await collect_health_snapshot(
+            self._db,
+            self._get_workspace_path(),
+            self._chunk_collection or self._chroma_collection,
+        )
+
     # --------------------------------------------------------
     # 做梦系统接口（封装模块函数）
     # --------------------------------------------------------
@@ -1026,8 +1527,9 @@ class LifeMemoryService:
         max_depth: int = 3,
         decay_factor: float = 0.6,
         learning_rate: float = 0.05,
+        persist_learning: bool = False,
     ) -> Dict[str, Any]:
-        """REM 做梦游走。"""
+        """REM 做梦游走，默认只读。"""
         return await dream_walk(
             db=self._db,
             num_seeds=num_seeds,
@@ -1036,6 +1538,7 @@ class LifeMemoryService:
             decay_factor=decay_factor,
             learning_rate=learning_rate,
             emit_visual_event=self._emit_visual_event,
+            persist_learning=persist_learning,
         )
 
     async def list_dream_candidate_nodes(self, limit: int = 12) -> List[Dict[str, Any]]:

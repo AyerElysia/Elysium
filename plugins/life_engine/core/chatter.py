@@ -96,6 +96,21 @@ _LIVE_BRIDGE_BLOCKED_USABLE_SIGNATURES = frozenset(
         "tts_voice_plugin:action:tts_voice_action",
     }
 )
+_SURFACE_BLOCKED_USABLE_SIGNATURES = frozenset(
+    {
+        "tts_voice_plugin:action:tts_voice_action",
+    }
+)
+_SURFACE_REALTIME_HIDDEN_USABLE_SIGNATURES = frozenset(
+    {
+        "life_engine:action:think",
+        "life_engine:action:record_inner_monologue",
+        "tts_voice_plugin:action:tts_voice_action",
+    }
+)
+_SURFACE_LOW_LATENCY_ENV = "NEKO_SURFACE_LOW_LATENCY"
+_SURFACE_FAST_MAX_TOKENS_ENV = "NEKO_SURFACE_FAST_MAX_TOKENS"
+_SURFACE_FAST_MAX_TOKENS_DEFAULT = 900
 
 # 运行时 assistant 注入队列：
 # 用于接收主动续话/内心独白等外部插件产生的上下文。
@@ -1911,6 +1926,99 @@ class LifeChatter(BaseChatter):
                 f"life_chatter 模型请求超时 ({timeout:.2f}s)"
             ) from exc
 
+    @staticmethod
+    def _surface_fast_max_tokens() -> int:
+        raw = os.environ.get(_SURFACE_FAST_MAX_TOKENS_ENV)
+        try:
+            parsed = int(str(raw).strip()) if raw is not None else _SURFACE_FAST_MAX_TOKENS_DEFAULT
+        except (TypeError, ValueError):
+            parsed = _SURFACE_FAST_MAX_TOKENS_DEFAULT
+        return max(128, min(parsed, 3200))
+
+    @classmethod
+    def _surface_realtime_model_set(cls, model_set: Any) -> Any:
+        """克隆当前模型集，并关闭 Surface 单轮中的额外思考延迟。"""
+        if not isinstance(model_set, (list, tuple)):
+            return model_set
+
+        token_limit = cls._surface_fast_max_tokens()
+        tuned_models: list[Any] = []
+        for model in model_set:
+            if not isinstance(model, dict):
+                tuned_models.append(model)
+                continue
+            tuned = dict(model)
+            configured_max = tuned.get("max_tokens")
+            if isinstance(configured_max, int) and configured_max > 0:
+                tuned["max_tokens"] = min(configured_max, token_limit)
+            else:
+                tuned["max_tokens"] = token_limit
+
+            extra_params = dict(tuned.get("extra_params") or {})
+            extra_params.pop("thinking", None)
+            extra_params["enable_thinking"] = False
+            extra_params["tool_choice"] = "required"
+            tuned["extra_params"] = extra_params
+            tuned_models.append(tuned)
+        return tuned_models
+
+    @staticmethod
+    def _usable_signature(usable: Any) -> str:
+        getter = getattr(usable, "get_signature", None)
+        if not callable(getter):
+            return ""
+        try:
+            return str(getter() or "")
+        except Exception:
+            return ""
+
+    @classmethod
+    def _apply_surface_realtime_request_overrides(
+        cls,
+        response: Any,
+        chat_stream: ChatStream,
+        *,
+        must_reply: bool,
+    ) -> tuple[bool, Any, list[tuple[Any, list[Any]]]]:
+        """临时精简本次 Surface 请求；全局 runtime 和其他平台不受污染。"""
+        if not must_reply or not cls._is_surface_low_latency_stream(chat_stream):
+            return False, None, []
+
+        original_model_set = getattr(response, "model_set", None)
+        if original_model_set is not None:
+            response.model_set = cls._surface_realtime_model_set(original_model_set)
+
+        saved_tool_payloads: list[tuple[Any, list[Any]]] = []
+        for payload in getattr(response, "payloads", None) or []:
+            if getattr(payload, "role", None) != ROLE.TOOL:
+                continue
+            original_content = list(getattr(payload, "content", None) or [])
+            filtered_content = [
+                usable
+                for usable in original_content
+                if cls._usable_signature(usable)
+                not in _SURFACE_REALTIME_HIDDEN_USABLE_SIGNATURES
+            ]
+            if len(filtered_content) == len(original_content):
+                continue
+            saved_tool_payloads.append((payload, original_content))
+            payload.content = filtered_content
+
+        return True, original_model_set, saved_tool_payloads
+
+    @staticmethod
+    def _restore_surface_realtime_request_overrides(
+        response: Any,
+        state: tuple[bool, Any, list[tuple[Any, list[Any]]]],
+    ) -> None:
+        applied, original_model_set, saved_tool_payloads = state
+        if not applied:
+            return
+        if original_model_set is not None:
+            response.model_set = original_model_set
+        for payload, original_content in saved_tool_payloads:
+            payload.content = original_content
+
     async def modify_llm_usables(self, llm_usables: list[Any]) -> list[type[Any]]:
         """直播桥接场景下裁掉当前无法走通的组件；并按配置过滤 MCP 工具。"""
         available = await super().modify_llm_usables(llm_usables)
@@ -2138,6 +2246,41 @@ class LifeChatter(BaseChatter):
         """判断当前聊天流是否为直播桥接场景。"""
         return str(getattr(chat_stream, "platform", "") or "").strip().lower() == "live"
 
+    @staticmethod
+    def _is_surface_stream(chat_stream: ChatStream | None) -> bool:
+        """判断当前聊天流是否来自 N.E.K.O 实时表现窗口。"""
+        return (
+            str(getattr(chat_stream, "platform", "") or "").strip().lower()
+            == "neko.surface"
+        )
+
+    @staticmethod
+    def _surface_low_latency_enabled() -> bool:
+        """返回 Surface 是否启用默认开启的低延迟对话路径。"""
+        raw = os.environ.get(_SURFACE_LOW_LATENCY_ENV)
+        if raw is None:
+            return True
+        return raw.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+    @classmethod
+    def _is_surface_low_latency_stream(cls, chat_stream: ChatStream | None) -> bool:
+        return cls._is_surface_stream(chat_stream) and cls._surface_low_latency_enabled()
+
+    @classmethod
+    def _build_surface_realtime_guidance(cls, chat_stream: ChatStream | None) -> str:
+        """构建只在本轮可见的 Surface 低延迟回复约束。"""
+        if not cls._is_surface_low_latency_stream(chat_stream):
+            return ""
+        return (
+            "### N.E.K.O 实时私聊\n"
+            "- 对方正在表现窗口前等待你的即时回应；优先自然接话和低延迟。\n"
+            "- 普通对话应在第一次模型决策里直接调用 `life_send_text`，不要先单独调用 "
+            "`think`、`record_inner_monologue` 或 TTS 工具。\n"
+            "- 只有确实需要查询或操作时才先调用其他工具；拿到结果后立即回复。\n"
+            "- 回复保持口语化、适合直接朗读，尽量一次发成一个完整短段。\n"
+            "- 语音由 Surface 自动用 Neo TTS 合成，不要主动调用 `tts_voice_action`。"
+        )
+
     @classmethod
     def _build_live_scene_guidance(cls, chat_stream: ChatStream | None) -> str:
         """为直播桥接场景补充专用行为约束。"""
@@ -2251,6 +2394,12 @@ class LifeChatter(BaseChatter):
                 event_cursor_override=event_cursor_override,
             )
 
+        surface_guidance = self._build_surface_realtime_guidance(chat_stream)
+        if surface_guidance:
+            context_text = "\n\n".join(
+                part for part in (context_text.strip(), surface_guidance) if part
+            )
+
         if not context_text:
             return "", high_water
         return (
@@ -2344,6 +2493,15 @@ class LifeChatter(BaseChatter):
                 "reason": "内部主动机会或自主意向浮现，交给表达层判断",
                 "should_respond": True,
                 "force_reply": False,
+            }
+
+        # N.E.K.O 是已认证的一对一表现窗口。用户在这里发出的文字天然就是
+        # 对爱莉的直接对话，不需要再花一次模型请求判断“要不要回复”。
+        if self._is_surface_low_latency_stream(chat_stream):
+            return {
+                "reason": "N.E.K.O 实时私聊直接进入表达层",
+                "should_respond": True,
+                "force_reply": True,
             }
 
         service = self._get_life_service()
@@ -3479,7 +3637,8 @@ class LifeChatter(BaseChatter):
         统一主意识的工具 registry 只注入一次；这里补一层执行期过滤，避免
         后续切换到直播等特殊 stream 时沿用第一条流的工具可用性。
         """
-        if str(getattr(trigger_msg, "platform", "") or "").strip().lower() != "live":
+        platform = str(getattr(trigger_msg, "platform", "") or "").strip().lower()
+        if platform not in {"live", "neko.surface"}:
             return False
 
         try:
@@ -3490,7 +3649,12 @@ class LifeChatter(BaseChatter):
             return False
 
         signature = getattr(usable_cls, "get_signature", lambda: None)()
-        return str(signature or "") in _LIVE_BRIDGE_BLOCKED_USABLE_SIGNATURES
+        blocked_signatures = (
+            _SURFACE_BLOCKED_USABLE_SIGNATURES
+            if platform == "neko.surface"
+            else _LIVE_BRIDGE_BLOCKED_USABLE_SIGNATURES
+        )
+        return str(signature or "") in blocked_signatures
 
     async def run_tool_call(
         self,
@@ -3520,11 +3684,17 @@ class LifeChatter(BaseChatter):
                     usable_map,
                     trigger_msg,
                 ):
+                    platform = str(getattr(trigger_msg, "platform", "") or "").strip().lower()
+                    blocked_detail = (
+                        "当前 N.E.K.O 表现窗口由 Surface 自动处理语音，请改用文字回复。"
+                        if platform == "neko.surface"
+                        else "当前直播桥接场景已屏蔽该工具，请改用文字回复。"
+                    )
                     response.add_payload(
                         LLMPayload(
                             ROLE.TOOL_RESULT,
                             ToolResult(
-                                value="当前直播桥接场景已屏蔽该工具，请改用文字回复。",
+                                value=blocked_detail,
                                 call_id=getattr(current_call, "id", ""),
                                 name=call_name,
                             ),
@@ -3712,9 +3882,27 @@ class LifeChatter(BaseChatter):
 
                 try:
                     async def _send_and_collect_response() -> Any:
-                        response = await rt.response.send(stream=False)
-                        self._strip_suffix_context(response)
-                        await response
+                        source_response = rt.response
+                        override_state = self._apply_surface_realtime_request_overrides(
+                            source_response,
+                            chat_stream,
+                            must_reply=rt.must_reply,
+                        )
+                        try:
+                            response = await source_response.send(stream=False)
+                            self._strip_suffix_context(response)
+                            await response
+                        finally:
+                            self._restore_surface_realtime_request_overrides(
+                                source_response,
+                                override_state,
+                            )
+
+                        # LLMResponse 继承了本次临时模型集；恢复默认模型集，确保
+                        # 后续 QQ/飞书等流仍按统一 life 配置运行。
+                        applied, original_model_set, _saved_tools = override_state
+                        if applied and original_model_set is not None:
+                            response.model_set = original_model_set
                         return response
 
                     rt.response = await self._await_model_turn(
@@ -3908,6 +4096,8 @@ class LifeChatter(BaseChatter):
                     self._transition(rt, _Phase.FOLLOW_UP, "empty turn, continue loop")
                     self._maybe_compact_runtime_context(llm_response)
                     self._save_rolling_context_snapshot(llm_response)
+                    if self._is_surface_low_latency_stream(chat_stream) and rt.must_reply:
+                        continue
                     return Success("follow-up scheduled")
 
                 self._ensure_unique_tool_call_ids(call_list)
@@ -4100,6 +4290,8 @@ class LifeChatter(BaseChatter):
                 self._transition(rt, _Phase.FOLLOW_UP, "default loop continue")
                 self._maybe_compact_runtime_context(llm_response)
                 self._save_rolling_context_snapshot(llm_response)
+                if self._is_surface_low_latency_stream(chat_stream) and rt.must_reply:
+                    continue
                 return Success("follow-up scheduled")
 
     async def execute(self) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:

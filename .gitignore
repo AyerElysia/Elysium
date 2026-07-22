@@ -104,17 +104,16 @@ data/
 
 plugins/*
 
-!plugins/desktop_pet/
-!plugins/desktop_pet/**
-plugins/desktop_pet/**/__pycache__/
-plugins/desktop_pet/**/*.py[cod]
+!plugins/neko_surface/
+!plugins/neko_surface/**
+plugins/neko_surface/**/__pycache__/
+plugins/neko_surface/**/*.py[cod]
 !plugins/werewolf_game/
 !plugins/werewolf_game/**
 plugins/werewolf_game/**/__pycache__/
 plugins/werewolf_game/**/*.py[cod]
 !plugins/default_chatter/
 !plugins/napcat_adapter/
-!plugins/booku_memory/
 !plugins/emoji_sender/
 !plugins/life_engine/
 !plugins/live_bridge/

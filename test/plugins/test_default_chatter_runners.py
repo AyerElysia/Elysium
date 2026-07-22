@@ -303,7 +303,7 @@ def test_upsert_pending_unread_payload_keeps_fixed_reminder_on_first_user_only()
 
     reset_system_reminder_store()
     store = get_system_reminder_store()
-    store.set("actor", "booku_memory", "Booku Memory 命令手册")
+    store.set("actor", "test_reminder", "测试提醒")
 
     request = create_llm_request(
         model_set=[
@@ -339,12 +339,12 @@ def test_upsert_pending_unread_payload_keeps_fixed_reminder_on_first_user_only()
     user_payloads = [payload for payload in request.payloads if payload.role == ROLE.USER]
     assert len(user_payloads) == 3
     assert isinstance(user_payloads[0].content[0], Text)
-    assert user_payloads[0].content[0].text == "<system_reminder>\n[booku_memory]\nBooku Memory 命令手册\n</system_reminder>"
+    assert user_payloads[0].content[0].text == "<system_reminder>\n[test_reminder]\n测试提醒\n</system_reminder>"
 
     for payload in user_payloads[1:]:
         assert all(
             not isinstance(part, Text)
-            or part.text != "<system_reminder>\n[booku_memory]\nBooku Memory 命令手册\n</system_reminder>"
+            or part.text != "<system_reminder>\n[test_reminder]\n测试提醒\n</system_reminder>"
             for part in payload.content
         )
 

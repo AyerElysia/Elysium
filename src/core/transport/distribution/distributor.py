@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import cast
 
 from src.core.components.types import EventType
@@ -23,6 +24,8 @@ from src.kernel.logger import get_logger, COLOR
 from src.core.models.message import Message
 
 logger = get_logger("distributor", display="消息分发", color=COLOR.MAGENTA)
+
+_DISTRIBUTION_WAIT_TIMEOUT = 1.0
 
 
 async def _on_message_received(_: str, params: dict) -> tuple[EventDecision, dict]:
@@ -132,8 +135,6 @@ async def _on_message_received(_: str, params: dict) -> tuple[EventDecision, dic
             # 注意：不要在“每次收到新消息”时重置 message_buffer_skip_count。
             # 否则在高压群聊下，skip_count 会被反复清零，导致缓冲逻辑永远达不到
             # max_skip 的强制放行阈值，从而 Tick 可能被无限跳过。
-            import time
-
             context.last_message_time = time.time()
 
             # 4. 尝试启动该流的 Tick 驱动器（如果已在运行则跳过）
@@ -155,15 +156,15 @@ async def _on_message_received(_: str, params: dict) -> tuple[EventDecision, dic
         daemon=True,
     )
 
+    started_at = time.monotonic()
     try:
-        # 在快速路径下（如测试或系统资源充足），我们尽可能同步等待完成（最多等待 1.0 秒）。
-        # 这确保了单元测试等依赖即时状态断言的场景完全不受影响。
-        await asyncio.wait_for(asyncio.shield(task_info.task), timeout=1.0)
+        # 快速路径尽可能同步完成；慢任务由 shield 保持在后台继续执行。
+        await asyncio.wait_for(asyncio.shield(task_info.task), timeout=_DISTRIBUTION_WAIT_TIMEOUT)
     except asyncio.TimeoutError:
-        # 如果 1.0 秒内未完成（例如由于 SQLite 锁导致的 DB 等待），我们允许其在后台继续运行，
-        # 并立即向事件总线返回 SUCCESS，以防事件总线硬超时（5.0秒）抛弃事件。
-        logger.warning(
-            f"消息分发由于底层 I/O 或数据库锁定执行较慢（已超过 1.0 秒），切换至后台继续处理: "
+        elapsed = time.monotonic() - started_at
+        logger.debug(
+            "消息分发超过同步等待阈值，转入后台继续处理: "
+            f"elapsed={elapsed:.3f}s, threshold={_DISTRIBUTION_WAIT_TIMEOUT:.1f}s, "
             f"stream_id={message.stream_id[:8]}, platform={message.platform}"
         )
 

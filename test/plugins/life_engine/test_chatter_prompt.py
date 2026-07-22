@@ -726,6 +726,106 @@ def test_life_chatter_primary_task_creation_error_falls_back_to_actor(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_surface_private_message_skips_router_llm(monkeypatch) -> None:
+    chatter = _life_chatter_for_config(LifeEngineConfig())
+    unread = Message(
+        message_id="surface-direct-1",
+        content="爱莉爱莉",
+        processed_plain_text="爱莉爱莉",
+        sender_role="other",
+        platform="neko.surface",
+        stream_id="surface-stream",
+    )
+    chat_stream = SimpleNamespace(
+        stream_id="surface-stream",
+        platform="neko.surface",
+        chat_type="private",
+    )
+
+    async def must_not_read_history(*_args, **_kwargs):
+        raise AssertionError("Surface 实时私聊不应先读取路由历史")
+
+    monkeypatch.delenv("NEKO_SURFACE_LOW_LATENCY", raising=False)
+    monkeypatch.setattr(chatter, "_build_history_text_async", must_not_read_history)
+
+    decision = await chatter._should_respond("主人: 爱莉爱莉", [unread], chat_stream)
+
+    assert decision == {
+        "reason": "N.E.K.O 实时私聊直接进入表达层",
+        "should_respond": True,
+        "force_reply": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_surface_dynamic_context_includes_realtime_guidance(monkeypatch) -> None:
+    chatter = _life_chatter_for_config(LifeEngineConfig())
+    monkeypatch.delenv("NEKO_SURFACE_LOW_LATENCY", raising=False)
+
+    context_text, high_water = await chatter._build_dynamic_context_text(
+        SimpleNamespace(platform="neko.surface"),
+        service=None,
+    )
+
+    assert high_water == 0
+    assert "N.E.K.O 实时私聊" in context_text
+    assert "第一次模型决策里直接调用 `life_send_text`" in context_text
+    assert "不要主动调用 `tts_voice_action`" in context_text
+
+
+def test_surface_request_overrides_are_temporary(monkeypatch) -> None:
+    class ThinkTool:
+        @classmethod
+        def get_signature(cls):
+            return "life_engine:action:think"
+
+    class SendTextTool:
+        @classmethod
+        def get_signature(cls):
+            return "life_engine:action:life_send_text"
+
+    class TtsTool:
+        @classmethod
+        def get_signature(cls):
+            return "tts_voice_plugin:action:tts_voice_action"
+
+    tool_payload = LLMPayload(ROLE.TOOL, [ThinkTool, SendTextTool, TtsTool])
+    original_model_set = [
+        {
+            "model_identifier": "neo-model",
+            "max_tokens": 3200,
+            "extra_params": {"enable_thinking": True, "thinking": {"type": "enabled"}},
+        }
+    ]
+    response = SimpleNamespace(
+        model_set=original_model_set,
+        payloads=[tool_payload],
+    )
+    monkeypatch.delenv("NEKO_SURFACE_LOW_LATENCY", raising=False)
+    monkeypatch.setenv("NEKO_SURFACE_FAST_MAX_TOKENS", "512")
+
+    state = LifeChatter._apply_surface_realtime_request_overrides(
+        response,
+        SimpleNamespace(platform="neko.surface"),
+        must_reply=True,
+    )
+
+    assert state[0] is True
+    assert response.model_set is not original_model_set
+    assert response.model_set[0]["max_tokens"] == 512
+    assert response.model_set[0]["extra_params"]["enable_thinking"] is False
+    assert response.model_set[0]["extra_params"]["tool_choice"] == "required"
+    assert [tool.get_signature() for tool in tool_payload.content] == [
+        "life_engine:action:life_send_text"
+    ]
+
+    LifeChatter._restore_surface_realtime_request_overrides(response, state)
+
+    assert response.model_set is original_model_set
+    assert tool_payload.content == [ThinkTool, SendTextTool, TtsTool]
+
+
+@pytest.mark.asyncio
 async def test_life_chatter_global_runtime_follow_up_stays_on_owner_stream(monkeypatch) -> None:
     LifeChatter.reset_global_runtime()
     rt = _WorkflowRuntime(
@@ -1051,6 +1151,114 @@ async def test_life_chatter_think_only_continues_loop(monkeypatch) -> None:
     assert isinstance(result, Success)
     assert rt.phase == _Phase.FOLLOW_UP
     assert rt.follow_up_rounds == 1
+
+    LifeChatter.reset_global_runtime()
+
+
+@pytest.mark.asyncio
+async def test_surface_think_only_follow_up_runs_without_driver_tick(monkeypatch) -> None:
+    """Surface 即使偶发 think-only，也应在同一次驱动中立刻续轮发出回复。"""
+
+    LifeChatter.reset_global_runtime()
+    tool_calls: list[str] = []
+
+    class FollowUpResponse:
+        def __init__(self) -> None:
+            self.payloads = []
+            self.model_set = []
+            self.call_list = [
+                SimpleNamespace(
+                    id="send-1",
+                    name="action-life_send_text",
+                    args={"content": "我在呢。"},
+                )
+            ]
+            self.message = ""
+
+        def add_payload(self, payload) -> None:
+            self.payloads.append(payload)
+
+        def __await__(self):
+            async def done():
+                return self
+
+            return done().__await__()
+
+    class ThinkOnlyResponse:
+        def __init__(self) -> None:
+            self.payloads = []
+            self.model_set = []
+            self.call_list = [
+                SimpleNamespace(id="think-1", name="action-think", args={"thought": "先想想"})
+            ]
+            self.message = ""
+            self.send_calls = 0
+
+        def add_payload(self, payload) -> None:
+            self.payloads.append(payload)
+
+        async def send(self, *, stream: bool = False):
+            assert stream is False
+            self.send_calls += 1
+            return FollowUpResponse()
+
+    response = ThinkOnlyResponse()
+    unread = Message(
+        message_id="surface-unread",
+        content="爱莉？",
+        processed_plain_text="爱莉？",
+        sender_role="other",
+        platform="neko.surface",
+        stream_id="surface-stream",
+    )
+    rt = _WorkflowRuntime(
+        response=response,
+        phase=_Phase.TOOL_EXEC,
+        history_merged=True,
+        unreads=[unread],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[],
+        active_stream_id="surface-stream",
+        must_reply=True,
+    )
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=None)
+    chatter.stream_id = "surface-stream"
+
+    async def fake_fetch_unreads():
+        return [], [unread]
+
+    async def fake_run_tool_call(call, *_args, **_kwargs):
+        calls = call if isinstance(call, list) else [call]
+        tool_calls.extend(str(item.name) for item in calls)
+        return [(False, True) for _ in calls]
+
+    async def immediate_model_turn(awaitable):
+        return await awaitable
+
+    monkeypatch.delenv("NEKO_SURFACE_LOW_LATENCY", raising=False)
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+    monkeypatch.setattr(chatter, "run_tool_call", fake_run_tool_call)
+    monkeypatch.setattr(chatter, "_await_model_turn", immediate_model_turn)
+    monkeypatch.setattr(chatter, "_maybe_compact_runtime_context", lambda _response: None)
+    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", lambda _response: None)
+    monkeypatch.setattr(
+        "src.kernel.concurrency.get_watchdog",
+        lambda: SimpleNamespace(feed_dog=lambda _stream_id: None),
+    )
+
+    result = await chatter._drive_global_runtime_until_yield(
+        SimpleNamespace(stream_id="surface-stream", platform="neko.surface"),
+        service=None,
+    )
+
+    assert isinstance(result, Wait)
+    assert response.send_calls == 1
+    assert tool_calls == ["action-think", "action-life_send_text"]
+    assert rt.phase == _Phase.WAIT_USER
 
     LifeChatter.reset_global_runtime()
 

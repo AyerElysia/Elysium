@@ -12,6 +12,7 @@ from plugins.minicpm_live_bridge.router import MiniCPMLiveRouter
 from plugins.webui_backend.backend.event_handler.live_chat_event_handler import (
     LiveChatEventHandler,
 )
+from plugins.webui_backend.backend.router.live_chat_router import LiveChatRouter
 from src.core.components.types import EventType
 from src.kernel.event import EventDecision
 
@@ -74,6 +75,48 @@ async def test_webui_marks_delivered_messages_as_sent() -> None:
     assert returned_params is params
     handler._build_message_data.assert_awaited_once_with(message, True)
     handler._broadcast_message.assert_awaited_once_with(message_data)
+
+
+@pytest.mark.asyncio
+async def test_webui_ignores_neko_surface_messages() -> None:
+    handler = LiveChatEventHandler(SimpleNamespace())
+    message = SimpleNamespace(message_id="surface-1", platform="neko.surface")
+    params = {"message": message}
+    handler._build_message_data = AsyncMock()
+    handler._broadcast_message = AsyncMock()
+
+    decision, returned_params = await handler.execute(
+        EventType.ON_MESSAGE_RECEIVED.value,
+        params,
+    )
+
+    assert decision is EventDecision.PASS
+    assert returned_params is params
+    handler._build_message_data.assert_not_awaited()
+    handler._broadcast_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_webui_broadcast_drops_neko_surface_messages() -> None:
+    class _WebSocketProbe:
+        pass
+
+    websocket = _WebSocketProbe()
+    websocket.send_json = AsyncMock()
+    previous_connections = LiveChatRouter.active_connections
+    LiveChatRouter.active_connections = {"surface-stream": {websocket}}
+    try:
+        await LiveChatRouter.broadcast_message(
+            {
+                "message_id": "surface-2",
+                "stream_id": "surface-stream",
+                "platform": "neko.surface",
+            }
+        )
+    finally:
+        LiveChatRouter.active_connections = previous_connections
+
+    websocket.send_json.assert_not_awaited()
 
 
 @pytest.mark.asyncio

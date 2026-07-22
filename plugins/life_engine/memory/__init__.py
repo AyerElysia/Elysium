@@ -2,11 +2,63 @@
 
 from __future__ import annotations
 
-from .service import LifeMemoryService
-from .nodes import NodeType, MemoryNode
-from .edges import EdgeType, MemoryEdge
-from .search import SearchResult
-from .lineage import MemoryBundle, MemoryCorrection, MemoryEvidence, MemoryTrace
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .service import LifeMemoryService
+
+
+_LAZY_EXPORTS = {
+    "NodeType": ("nodes", "NodeType"),
+    "MemoryNode": ("nodes", "MemoryNode"),
+    "EdgeType": ("edges", "EdgeType"),
+    "MemoryEdge": ("edges", "MemoryEdge"),
+    "ChunkSearchResult": ("search", "ChunkSearchResult"),
+    "DetailedSearchResult": ("search", "DetailedSearchResult"),
+    "EmbeddingResult": ("search", "EmbeddingResult"),
+    "SearchDiagnostics": ("search", "SearchDiagnostics"),
+    "SearchResult": ("search", "SearchResult"),
+    "chunk_fts_search": ("search", "chunk_fts_search"),
+    "embed_texts": ("search", "embed_texts"),
+    "IndexWorkerReport": ("worker", "IndexWorkerReport"),
+    "chunk_collection_name": ("worker", "chunk_collection_name"),
+    "get_chunk_collection": ("worker", "get_chunk_collection"),
+    "get_named_chunk_collection": ("worker", "get_named_chunk_collection"),
+    "process_index_jobs": ("worker", "process_index_jobs"),
+    "MemoryBundle": ("lineage", "MemoryBundle"),
+    "MemoryCorrection": ("lineage", "MemoryCorrection"),
+    "MemoryEvidence": ("lineage", "MemoryEvidence"),
+    "MemoryTrace": ("lineage", "MemoryTrace"),
+    "ChunkIndexState": ("indexing", "ChunkIndexState"),
+    "DocumentChunk": ("indexing", "DocumentChunk"),
+    "DocumentIndexResult": ("indexing", "DocumentIndexResult"),
+    "IndexJob": ("indexing", "IndexJob"),
+    "chunk_document": ("indexing", "chunk_document"),
+    "create_memory_schema": ("indexing", "create_memory_schema"),
+    "delete_document_rows": ("indexing", "delete_document_rows"),
+    "enqueue_index_job": ("indexing", "enqueue_index_job"),
+    "move_document_rows": ("indexing", "move_document_rows"),
+    "read_active_chunk_index_state": ("indexing", "read_active_chunk_index_state"),
+    "upsert_document_rows": ("indexing", "upsert_document_rows"),
+    "write_active_chunk_index_state": ("indexing", "write_active_chunk_index_state"),
+    "extract_document_date": ("temporal", "extract_document_date"),
+    "parse_explicit_date": ("temporal", "parse_explicit_date"),
+    "parse_relative_date": ("temporal", "parse_relative_date"),
+    "parse_temporal_date": ("temporal", "parse_temporal_date"),
+}
+
+
+def __getattr__(name: str) -> Any:
+    if name == "LifeMemoryService":
+        from .service import LifeMemoryService as value
+    elif name in _LAZY_EXPORTS:
+        module_name, attribute = _LAZY_EXPORTS[name]
+        module = __import__(f"{__name__}.{module_name}", fromlist=[attribute])
+        value = getattr(module, attribute)
+    else:
+        raise AttributeError(name)
+    globals()[name] = value
+    return value
 
 __all__ = [
     "LifeMemoryService",
@@ -15,8 +67,35 @@ __all__ = [
     "EdgeType",
     "MemoryEdge",
     "SearchResult",
+    "ChunkSearchResult",
+    "DetailedSearchResult",
+    "EmbeddingResult",
+    "SearchDiagnostics",
+    "chunk_fts_search",
+    "embed_texts",
+    "IndexWorkerReport",
+    "chunk_collection_name",
+    "get_chunk_collection",
+    "get_named_chunk_collection",
+    "process_index_jobs",
     "MemoryBundle",
     "MemoryCorrection",
     "MemoryEvidence",
     "MemoryTrace",
+    "ChunkIndexState",
+    "DocumentChunk",
+    "DocumentIndexResult",
+    "IndexJob",
+    "chunk_document",
+    "create_memory_schema",
+    "delete_document_rows",
+    "enqueue_index_job",
+    "move_document_rows",
+    "read_active_chunk_index_state",
+    "upsert_document_rows",
+    "write_active_chunk_index_state",
+    "extract_document_date",
+    "parse_explicit_date",
+    "parse_relative_date",
+    "parse_temporal_date",
 ]

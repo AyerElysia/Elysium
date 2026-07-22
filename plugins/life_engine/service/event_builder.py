@@ -19,6 +19,7 @@ class EventType(str, Enum):
 
     MESSAGE = "message"          # 外部消息
     HEARTBEAT = "heartbeat"      # 心跳回复（内部思考）
+    SUMMARY = "summary"          # 潜意识/上下文规范摘要
     TOOL_CALL = "tool_call"      # 工具调用
     TOOL_RESULT = "tool_result"  # 工具返回结果
     AGENT_RESULT = "agent_result"  # 后台智能体执行结果
@@ -53,10 +54,19 @@ class LifeEngineEvent:
     # 心跳特有字段
     heartbeat_index: int | None = None
 
+    # 因果关联字段
+    heartbeat_run_id: str | None = None
+    call_id: str | None = None
+    parent_event_id: str | None = None
+    causation_id: str | None = None
+
     # 工具调用特有字段
     tool_name: str | None = None
     tool_args: dict[str, Any] | None = None
     tool_success: bool | None = None
+
+    # heartbeat context acknowledgement; raw events remain append-only
+    heartbeat_context_consumed: bool = False
 
 
 @dataclass(slots=True)
@@ -70,6 +80,7 @@ class LifeEngineState:
     pending_event_count: int = 0
     history_event_count: int = 0
     event_sequence: int = 0
+    heartbeat_context_cursor: int = 0
     last_wake_context_at: str | None = None
     last_wake_context_size: int = 0
     last_model_reply_at: str | None = None
@@ -95,12 +106,42 @@ class LifeEngineState:
     chatter_thought_cursors: dict[str, int] = field(default_factory=dict)
     # 每个聊天流最近一次 action-think 的快照
     last_chatter_think_by_stream: dict[str, dict[str, str]] = field(default_factory=dict)
+    # 可恢复的规范化潜意识摘要（持久化为 JSON 字典）
+    subconscious_summary: dict[str, Any] = field(default_factory=dict)
 
 
 # 中枢内部消息的固定标识
 INTERNAL_PLATFORM = "life_engine"
 INTERNAL_STREAM_ID = "life_engine_internal"
 RUNTIME_CONTEXT_FILE = "life_engine_context.json"
+
+
+def is_life_heartbeat_event(event: LifeEngineEvent) -> bool:
+    """判断事件是否为生命中枢自身产生的真实心跳回复。
+
+    ``HEARTBEAT`` 仍兼容承载 life_chatter 的 inner-monologue 事件；
+    后者属于对话器运行态，不应参与中枢心跳、SNN 奖赏或 DFC 最近思考统计。
+    """
+    event_type = getattr(event, "event_type", None)
+    event_type_value = getattr(event_type, "value", event_type)
+    if str(event_type_value or "").strip().lower() != EventType.HEARTBEAT.value:
+        return False
+
+    content_type = str(getattr(event, "content_type", "") or "").strip().lower()
+    heartbeat_index = getattr(event, "heartbeat_index", None)
+    if heartbeat_index is not None:
+        try:
+            if int(heartbeat_index) < 0:
+                return False
+        except (TypeError, ValueError, OverflowError):
+            pass
+    if content_type == "chatter_inner_monologue":
+        return False
+    if content_type == "heartbeat_reply":
+        return True
+    if str(getattr(event, "source", "") or "").strip() == INTERNAL_PLATFORM:
+        return True
+    return heartbeat_index is not None
 
 
 def _now_iso() -> str:
@@ -202,6 +243,7 @@ class EventBuilder:
 
     def build_message_event(self, message: Message, direction: str = "received") -> LifeEngineEvent:
         """将核心消息对象转换为事件。"""
+        seq = self._next_sequence()
         extra = getattr(message, "extra", {}) or {}
         platform = str(message.platform or "unknown")
         chat_type = str(message.chat_type or "unknown").lower()
@@ -250,10 +292,10 @@ class EventBuilder:
         message_type = getattr(message.message_type, "value", str(message.message_type))
 
         return LifeEngineEvent(
-            event_id=f"msg_{message.message_id or self._next_sequence()}",
+            event_id=f"msg_{message.message_id or seq}",
             event_type=EventType.MESSAGE,
             timestamp=_format_time(getattr(message, "time", None)),
-            sequence=self._next_sequence(),
+            sequence=seq,
             source=platform,
             source_detail=source_detail,
             content=content,
@@ -301,18 +343,33 @@ class EventBuilder:
             stream_id=target_stream_id or None,
         )
 
-    def build_heartbeat_event(self, content: str, heartbeat_count: int, task_name: str) -> LifeEngineEvent:
+    def build_heartbeat_event(
+        self,
+        content: str,
+        heartbeat_count: int,
+        task_name: str,
+        *,
+        heartbeat_run_id: str | None = None,
+        call_id: str | None = None,
+        parent_event_id: str | None = None,
+        causation_id: str | None = None,
+    ) -> LifeEngineEvent:
         """构建心跳事件（中枢内部思考）。"""
+        seq = self._next_sequence()
         return LifeEngineEvent(
-            event_id=f"hb_{heartbeat_count}_{self._next_sequence()}",
+            event_id=f"hb_{heartbeat_count}_{seq}",
             event_type=EventType.HEARTBEAT,
             timestamp=_now_iso(),
-            sequence=self._next_sequence(),
+            sequence=seq,
             source=INTERNAL_PLATFORM,
             source_detail=f"中枢心跳 | 第{heartbeat_count}次 | task={task_name}",
             content=content,
             content_type="heartbeat_reply",
             heartbeat_index=heartbeat_count,
+            heartbeat_run_id=heartbeat_run_id,
+            call_id=call_id,
+            parent_event_id=parent_event_id,
+            causation_id=causation_id,
         )
 
     def build_chatter_inner_monologue_event(
@@ -366,32 +423,71 @@ class EventBuilder:
             stream_id=target_stream_id or None,
         )
 
-    def build_tool_call_event(self, tool_name: str, tool_args: dict[str, Any]) -> LifeEngineEvent:
+    def build_tool_call_event(
+        self,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        *,
+        heartbeat_run_id: str | None = None,
+        call_id: str | None = None,
+        parent_event_id: str | None = None,
+        causation_id: str | None = None,
+    ) -> LifeEngineEvent:
         """构建工具调用事件。"""
+        seq = self._next_sequence()
+        event_id = f"tool_call_{seq}"
         return LifeEngineEvent(
-            event_id=f"tool_call_{self._next_sequence()}",
+            event_id=event_id,
             event_type=EventType.TOOL_CALL,
             timestamp=_now_iso(),
-            sequence=self._next_sequence(),
+            sequence=seq,
             source=INTERNAL_PLATFORM,
             source_detail=f"中枢工具调用 | {tool_name}",
             content=f"调用工具: {tool_name}",
             content_type="tool_call",
+            heartbeat_run_id=heartbeat_run_id,
+            call_id=call_id,
+            parent_event_id=parent_event_id,
+            causation_id=causation_id,
             tool_name=tool_name,
             tool_args=tool_args,
         )
 
-    def build_tool_result_event(self, tool_name: str, result: str, success: bool) -> LifeEngineEvent:
-        """构建工具结果事件。"""
+    def build_tool_result_event(
+        self,
+        tool_name: str,
+        result: str,
+        success: bool,
+        *,
+        heartbeat_run_id: str | None = None,
+        call_id: str | None = None,
+        parent_event_id: str | None = None,
+        causation_id: str | None = None,
+        call_event: LifeEngineEvent | None = None,
+    ) -> LifeEngineEvent:
+        """构建工具结果事件，可直接关联对应的 call event。"""
+        seq = self._next_sequence()
+        linked_call_id = call_id or (call_event.call_id if call_event is not None else None)
+        linked_parent_id = parent_event_id or (
+            call_event.event_id if call_event is not None else None
+        )
         return LifeEngineEvent(
-            event_id=f"tool_result_{self._next_sequence()}",
+            event_id=f"tool_result_{seq}",
             event_type=EventType.TOOL_RESULT,
             timestamp=_now_iso(),
-            sequence=self._next_sequence(),
+            sequence=seq,
             source=INTERNAL_PLATFORM,
             source_detail=f"工具返回 | {tool_name} | {'成功' if success else '失败'}",
             content=_shorten_text(result, max_length=500),
             content_type="tool_result",
+            heartbeat_run_id=heartbeat_run_id or (
+                call_event.heartbeat_run_id if call_event is not None else None
+            ),
+            call_id=linked_call_id,
+            parent_event_id=linked_parent_id,
+            causation_id=causation_id or (
+                call_event.event_id if call_event is not None else None
+            ),
             tool_name=tool_name,
             tool_success=success,
         )
@@ -404,18 +500,27 @@ class EventBuilder:
         success: bool = True,
         rounds: int = 0,
         duration_ms: int = 0,
+        heartbeat_run_id: str | None = None,
+        call_id: str | None = None,
+        parent_event_id: str | None = None,
+        causation_id: str | None = None,
     ) -> LifeEngineEvent:
         """构建后台智能体执行结果事件。"""
         status = "成功" if success else "失败"
+        seq = self._next_sequence()
         return LifeEngineEvent(
-            event_id=f"agent_result_{self._next_sequence()}",
+            event_id=f"agent_result_{seq}",
             event_type=EventType.AGENT_RESULT,
             timestamp=_now_iso(),
-            sequence=self._next_sequence(),
+            sequence=seq,
             source=INTERNAL_PLATFORM,
             source_detail=f"后台智能体 | {agent_type} | {status} | {rounds}轮 | {duration_ms}ms",
             content=_shorten_text(result_text, max_length=500),
             content_type="agent_result",
+            heartbeat_run_id=heartbeat_run_id,
+            call_id=call_id,
+            parent_event_id=parent_event_id,
+            causation_id=causation_id,
             tool_name=f"agent:{agent_type}",
             tool_success=success,
         )

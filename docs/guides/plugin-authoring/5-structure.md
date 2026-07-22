@@ -88,7 +88,7 @@ my_plugin/
 
 ### **示范 3：插件已经比较复杂，按子域分目录**
 
-像 [plugins/booku_memory/plugin.py](plugins/booku_memory/plugin.py) 这类插件，就已经进入更复杂的形态了。它下面会继续分成 `agent/`、`service/` 之类的子目录。
+像一个已经进入更复杂形态的插件，就不适合把所有逻辑都放在一个文件里了。它下面可以继续分成 `agent/`、`service/` 之类的子目录。
 
 这种方向更像：
 

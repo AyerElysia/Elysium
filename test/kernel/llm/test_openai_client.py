@@ -182,6 +182,68 @@ class TestPayloadsToOpenAIMessages:
             "name": "calculator",
         }
 
+    def test_plain_text_tool_result_is_repaired_for_gemini_compat(self):
+        """旧上下文中的纯文本工具结果也应恢复 call id 和工具名。"""
+        from src.kernel.llm.model_client.openai_client import _payloads_to_openai_messages
+
+        payloads = [
+            LLMPayload(
+                ROLE.ASSISTANT,
+                [ToolCall(id="call_1", name="calculator", args={})],
+            ),
+            LLMPayload(ROLE.TOOL_RESULT, [Text("42")]),
+        ]
+
+        messages, tools = _payloads_to_openai_messages(
+            payloads,
+            include_tool_result_name=True,
+        )
+
+        assert tools == []
+        assert messages[1] == {
+            "role": "tool",
+            "content": "42",
+            "tool_call_id": "call_1",
+            "name": "calculator",
+        }
+
+    def test_plain_text_tool_results_follow_pending_call_order_for_gemini(self):
+        """多个旧式工具结果按 assistant 声明的调用顺序配对。"""
+        from src.kernel.llm.model_client.openai_client import _payloads_to_openai_messages
+
+        payloads = [
+            LLMPayload(
+                ROLE.ASSISTANT,
+                [
+                    ToolCall(id="call_1", name="first_tool", args={}),
+                    ToolCall(id="call_2", name="second_tool", args={}),
+                ],
+            ),
+            LLMPayload(ROLE.TOOL_RESULT, [Text("first")]),
+            LLMPayload(ROLE.TOOL_RESULT, [Text("second")]),
+        ]
+
+        messages, _ = _payloads_to_openai_messages(
+            payloads,
+            include_tool_result_name=True,
+        )
+
+        assert messages[1]["tool_call_id"] == "call_1"
+        assert messages[1]["name"] == "first_tool"
+        assert messages[2]["tool_call_id"] == "call_2"
+        assert messages[2]["name"] == "second_tool"
+
+    def test_orphan_plain_text_tool_result_becomes_context_for_gemini(self):
+        """无法配对的旧工具结果不能生成 Gemini 非法 function_response。"""
+        from src.kernel.llm.model_client.openai_client import _payloads_to_openai_messages
+
+        messages, _ = _payloads_to_openai_messages(
+            [LLMPayload(ROLE.TOOL_RESULT, [Text("legacy result")])],
+            include_tool_result_name=True,
+        )
+
+        assert messages == [{"role": "user", "content": "legacy result"}]
+
     def test_parse_completion_message_repairs_non_json_tool_arguments(self):
         """测试响应解析会修复单引号形式的 tool arguments。"""
         from src.kernel.llm.model_client.openai_client import _parse_completion_message

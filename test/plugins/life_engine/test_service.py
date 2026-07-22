@@ -13,6 +13,10 @@ import pytest
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.constants import LIFE_CHATTER_GLOBAL_CURSOR_KEY
 from plugins.life_engine.service import LifeEngineService
+from plugins.life_engine.service.event_builder import (
+    EventType,
+    RUNTIME_CONTEXT_FILE,
+)
 from plugins.life_engine.service.event_bus import RAW_EVENT_LOG_FILE
 from src.kernel.llm import ROLE, ToolRegistry
 
@@ -35,6 +39,19 @@ def _make_service(tmp_path: Path) -> LifeEngineService:
     config.settings.enabled = True
     config.settings.workspace_path = str(tmp_path)
     return LifeEngineService(_DummyPlugin(config=config))
+
+
+class _FakeMemoryIndexService:
+    def __init__(self) -> None:
+        self.run_calls = 0
+        self.close_calls = 0
+
+    async def run_index_worker(self, **_: object) -> object:
+        self.run_calls += 1
+        return SimpleNamespace(claimed=0, completed=(), failed=(), stale=())
+
+    async def close(self) -> None:
+        self.close_calls += 1
 
 
 def test_memory_service_property_aliases_private_field(tmp_path: Path) -> None:
@@ -449,3 +466,334 @@ async def test_web_search_accepts_empty_time_range_as_unset(
     assert result["action"] == "web_search"
     assert captured["endpoint"] == "/search"
     assert "time_range" not in captured["payload"]
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_success_consumes_delta_without_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """成功心跳只消费本轮 delta，下一轮不应重放旧事件。"""
+    service = _make_service(tmp_path)
+    event = service._event_builder.build_dfc_message_event(
+        "只应该被心跳看到一次",
+        stream_id="stream-1",
+        platform="qq",
+        chat_type="private",
+        sender_name="Ayer",
+    )
+    await service._queue_pending_event(event)
+
+    contexts: list[str] = []
+
+    async def _fake_model(
+        wake_context: str,
+        *,
+        heartbeat_run_id: str | None = None,
+    ) -> str:
+        contexts.append(wake_context)
+        assert heartbeat_run_id
+        return "已处理"
+
+    monkeypatch.setattr(service, "_run_heartbeat_model", _fake_model)
+
+    first_reply, first_prepared = await service._run_heartbeat_round(
+        collect_background_agents=False,
+    )
+    second_reply, second_prepared = await service._run_heartbeat_round(
+        collect_background_agents=False,
+    )
+
+    assert first_reply == second_reply == "已处理"
+    assert "只应该被心跳看到一次" in contexts[0]
+    assert contexts[1] == ""
+    assert first_prepared.acknowledged_event_ids == [event.event_id]
+    assert second_prepared.selected_event_ids == []
+    assert event.heartbeat_context_consumed is True
+    assert service._state.heartbeat_context_cursor >= event.sequence
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_failure_keeps_delta_for_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """模型失败时不推进游标，下一次重试仍能看到原始 delta。"""
+    service = _make_service(tmp_path)
+    event = service._event_builder.build_dfc_message_event(
+        "模型失败后必须重试这条",
+        stream_id="stream-1",
+    )
+    await service._queue_pending_event(event)
+
+    attempts = 0
+    retry_contexts: list[str] = []
+
+    async def _fake_model(
+        wake_context: str,
+        *,
+        heartbeat_run_id: str | None = None,
+    ) -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("model unavailable")
+        retry_contexts.append(wake_context)
+        return "重试成功"
+
+    monkeypatch.setattr(service, "_run_heartbeat_model", _fake_model)
+
+    with pytest.raises(RuntimeError, match="model unavailable"):
+        await service._run_heartbeat_round(collect_background_agents=False)
+
+    assert service._state.heartbeat_context_cursor == 0
+    assert event.heartbeat_context_consumed is False
+    assert any(item.event_id == event.event_id for item in service._event_history)
+
+    reply, prepared = await service._run_heartbeat_round(
+        collect_background_agents=False,
+    )
+
+    assert reply == "重试成功"
+    assert "模型失败后必须重试这条" in retry_contexts[0]
+    assert prepared.acknowledged_event_ids == [event.event_id]
+    assert service._state.heartbeat_context_cursor >= event.sequence
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_arrival_during_model_is_deferred_to_next_round(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """模型执行期间到达的新事件应留给下一轮，而不是被当前提交跳过。"""
+    service = _make_service(tmp_path)
+    initial_event = service._event_builder.build_dfc_message_event(
+        "模型开始前的事件",
+        stream_id="stream-1",
+    )
+    arriving_event = service._event_builder.build_dfc_message_event(
+        "模型执行期间到达的事件",
+        stream_id="stream-1",
+    )
+    await service._queue_pending_event(initial_event)
+
+    calls = 0
+    contexts: list[str] = []
+
+    async def _fake_model(
+        wake_context: str,
+        *,
+        heartbeat_run_id: str | None = None,
+    ) -> str:
+        nonlocal calls
+        calls += 1
+        contexts.append(wake_context)
+        if calls == 1:
+            await service._queue_pending_event(arriving_event)
+        return f"reply-{calls}"
+
+    monkeypatch.setattr(service, "_run_heartbeat_model", _fake_model)
+
+    await service._run_heartbeat_round(collect_background_agents=False)
+
+    assert "模型执行期间到达的事件" not in contexts[0]
+    assert any(item.event_id == arriving_event.event_id for item in service._pending_events)
+    assert arriving_event.heartbeat_context_consumed is False
+
+    await service._run_heartbeat_round(collect_background_agents=False)
+
+    assert "模型执行期间到达的事件" in contexts[1]
+    assert service._state.heartbeat_context_cursor >= arriving_event.sequence
+
+
+@pytest.mark.asyncio
+async def test_automatic_and_manual_heartbeats_are_serialized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """自动心跳与手动心跳共享同一事务锁，不应并行运行模型。"""
+    service = _make_service(tmp_path)
+    active_calls = 0
+    max_active_calls = 0
+
+    async def _fake_model(
+        wake_context: str,
+        *,
+        heartbeat_run_id: str | None = None,
+    ) -> str:
+        nonlocal active_calls, max_active_calls
+        active_calls += 1
+        max_active_calls = max(max_active_calls, active_calls)
+        try:
+            await asyncio.sleep(0.02)
+            return "串行完成"
+        finally:
+            active_calls -= 1
+
+    monkeypatch.setattr(service, "_run_heartbeat_model", _fake_model)
+
+    automatic_result, manual_result = await asyncio.gather(
+        service._run_heartbeat_round(collect_background_agents=True),
+        service.trigger_heartbeat_manually(),
+    )
+
+    assert max_active_calls == 1
+    assert service._state.heartbeat_count == 2
+    assert automatic_result[0] == "串行完成"
+    assert manual_result["success"] is True
+    assert manual_result["reply"] == "串行完成"
+
+
+@pytest.mark.asyncio
+async def test_legacy_heartbeat_summary_migrates_to_subconscious_state(
+    tmp_path: Path,
+) -> None:
+    """v1 用 heartbeat 标记的旧摘要应迁移为规范潜意识摘要。"""
+    legacy_summary = {
+        "event_id": "summary-old",
+        "event_type": EventType.HEARTBEAT.value,
+        "timestamp": "2026-07-18T23:00:00+08:00",
+        "sequence": 7,
+        "source": "system",
+        "source_detail": "上下文压缩系统",
+        "content": "前天发生过一次重要对话",
+        "content_type": "history_summary",
+        "heartbeat_index": -1,
+    }
+    (tmp_path / RUNTIME_CONTEXT_FILE).write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "state": {"event_sequence": 7},
+                "pending_events": [],
+                "event_history": [legacy_summary],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    service = _make_service(tmp_path)
+    await service._load_runtime_context()
+
+    summary = service._state.subconscious_summary
+    assert summary["covered_through_sequence"] == 7
+    assert any(
+        entry["text"] == "前天发生过一次重要对话"
+        for entry in summary["entries"]
+    )
+    assert service._event_history == []
+
+
+@pytest.mark.asyncio
+async def test_consumed_heartbeat_events_remain_consumed_after_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """成功提交后的消费标记和游标应可从运行时上下文恢复。"""
+    service = _make_service(tmp_path)
+    event = service._event_builder.build_dfc_message_event(
+        "重启后不能重新注入",
+        stream_id="stream-1",
+    )
+    await service._queue_pending_event(event)
+
+    async def _fake_model(
+        wake_context: str,
+        *,
+        heartbeat_run_id: str | None = None,
+    ) -> str:
+        return "已确认"
+
+    monkeypatch.setattr(service, "_run_heartbeat_model", _fake_model)
+    await service._run_heartbeat_round(collect_background_agents=False)
+    await service._save_runtime_context()
+
+    restored = _make_service(tmp_path)
+    await restored._load_runtime_context()
+    restored_event = next(
+        item for item in restored._event_history if item.event_id == event.event_id
+    )
+    prepared = await restored._prepare_heartbeat_context()
+
+    assert restored._state.heartbeat_context_cursor >= event.sequence
+    assert restored_event.heartbeat_context_consumed is True
+    assert prepared.content == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("memory_index_enabled", [True, False])
+async def test_memory_index_lifecycle_start_toggle_and_stop_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    memory_index_enabled: bool,
+) -> None:
+    service = _make_service(tmp_path)
+    config = service.plugin.config
+    config.memory_index.enabled = memory_index_enabled
+    config.memory_index.run_on_startup = True
+    config.autonomy.enabled = False
+    config.streams.enabled = False
+    config.drives.enabled = False
+    fake_memory = _FakeMemoryIndexService()
+
+    async def fake_init_memory(_integration: object) -> None:
+        service._memory_service = fake_memory  # type: ignore[assignment]
+
+    monkeypatch.setattr(
+        "plugins.life_engine.service.integrations.MemoryIntegration.init_memory_service",
+        fake_init_memory,
+    )
+
+    await service.start()
+    await asyncio.sleep(0.02)
+
+    if memory_index_enabled:
+        assert service._memory_index_task_id is not None
+        assert fake_memory.run_calls >= 1
+    else:
+        assert service._memory_index_task_id is None
+        assert fake_memory.run_calls == 0
+
+    await service.stop()
+
+    assert service._memory_index_task_id is None
+    assert service._memory_service is None
+    assert fake_memory.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_memory_index_loop_survives_provider_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _make_service(tmp_path)
+    service._state.running = True
+    service._stop_event = asyncio.Event()
+
+    class FailingOnceMemory(_FakeMemoryIndexService):
+        async def run_index_worker(self, **_: object) -> object:
+            self.run_calls += 1
+            if self.run_calls == 1:
+                raise RuntimeError("provider unavailable")
+            service._stop_event.set()
+            return SimpleNamespace(claimed=0, completed=(), failed=(), stale=())
+
+    fake_memory = FailingOnceMemory()
+    service._memory_service = fake_memory  # type: ignore[assignment]
+    monkeypatch.setattr(
+        service,
+        "_memory_index_options",
+        lambda: {
+            "enabled": True,
+            "interval_seconds": 0,
+            "batch_size": 2,
+            "run_on_startup": True,
+            "retry_failed": False,
+            "reclaim_after_seconds": 60,
+        },
+    )
+
+    await asyncio.wait_for(service._memory_index_loop(), timeout=1.0)
+
+    assert fake_memory.run_calls == 2

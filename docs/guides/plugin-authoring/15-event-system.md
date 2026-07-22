@@ -356,12 +356,11 @@ class EchoMessageLogger(BaseEventHandler):
 
 但事件系统真正厉害的地方，在于它不只能旁听，还能介入。
 
-比如当前仓库里就有两类很典型的真实例子：
+比如当前仓库里就有一个很典型的真实例子：
 
 - `notice_injector` 监听系统的其他消息事件，把 notice 收集起来
-- `booku_memory` 监听 `on_prompt_build`，在 prompt 构建前往 `values.extra` 里注入记忆闪回
 
-这两类例子都说明了一件事：
+这个例子说明了一件事：
 
 > **事件处理器不只是“知道发生了什么”，还可以沿着参数链对后续行为产生影响。**
 

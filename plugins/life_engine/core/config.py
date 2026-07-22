@@ -44,6 +44,14 @@ class LifeEngineConfig(BaseConfig):
             "max_rounds_per_heartbeat",
         },
         "model": {"task_name"},
+        "memory_index": {
+            "enabled",
+            "interval_seconds",
+            "batch_size",
+            "run_on_startup",
+            "retry_failed",
+            "reclaim_after_seconds",
+        },
         "history_retrieval": {
             "enabled",
             "default_cross_stream",
@@ -191,6 +199,44 @@ class LifeEngineConfig(BaseConfig):
         task_name: str = Field(
             default="life",
             description="中枢任务使用的模型任务名称，对应 config/model.toml 中的 [model_tasks.life]。",
+        )
+
+    @config_section("memory_index")
+    class MemoryIndexSection(SectionBase):
+        """异步 chunk 向量索引配置。"""
+
+        enabled: bool = Field(
+            default=True,
+            description="是否启用独立的记忆 chunk 向量索引 worker。",
+        )
+
+        interval_seconds: int = Field(
+            default=60,
+            ge=30,
+            description="索引 worker 每批之间的等待秒数。",
+        )
+
+        batch_size: int = Field(
+            default=4,
+            ge=1,
+            le=50,
+            description="每轮最多处理的 outbox 文档任务数。",
+        )
+
+        run_on_startup: bool = Field(
+            default=True,
+            description="启动后是否立即处理一批；关闭时先等待一个间隔。",
+        )
+
+        retry_failed: bool = Field(
+            default=False,
+            description="启动后的首批是否允许领取 failed 任务；默认关闭，且不会循环重试。",
+        )
+
+        reclaim_after_seconds: int = Field(
+            default=600,
+            ge=60,
+            description="processing 任务超过该秒数后可由新 worker 回收。",
         )
 
     @config_section("autonomy")
@@ -1163,6 +1209,7 @@ class LifeEngineConfig(BaseConfig):
 
     settings: SettingsSection = Field(default_factory=SettingsSection)
     model: ModelSection = Field(default_factory=ModelSection)
+    memory_index: MemoryIndexSection = Field(default_factory=MemoryIndexSection)
     curiosity: CuriositySection = Field(default_factory=CuriositySection)
     history_retrieval: HistoryRetrievalSection = Field(default_factory=HistoryRetrievalSection)
     web: WebSection = Field(default_factory=WebSection)

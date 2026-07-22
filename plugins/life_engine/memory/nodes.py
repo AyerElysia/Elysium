@@ -18,6 +18,8 @@ from typing import Any, Optional
 
 from src.app.plugin_system.api import log_api
 
+from .eligibility import assess_document_path
+
 logger = log_api.get_logger("life_engine.memory.nodes")
 
 
@@ -78,9 +80,23 @@ def normalize_file_path(file_path: str) -> str:
 
 
 def generate_file_node_id(file_path: str) -> str:
-    """根据文件路径生成节点 ID。"""
+    """Return a deterministic ID for an already-canonical file path.
+
+    This low-level helper intentionally retains compatibility with historical
+    callers. New indexing writes must use ``canonical_file_node_id`` so an
+    absolute or traversal path can never define an identity.
+    """
     normalized = normalize_file_path(file_path)
     return f"file:{hashlib.md5(normalized.encode()).hexdigest()[:12]}"
+
+
+def canonical_file_node_id(file_path: str) -> tuple[str, str]:
+    """Validate one document path and return its canonical path and node ID."""
+    eligibility = assess_document_path(file_path)
+    if not eligibility.eligible:
+        raise ValueError(f"不支持索引的记忆文档路径: {eligibility.reason}")
+    path = eligibility.path
+    return path, generate_file_node_id(path)
 
 
 def generate_legacy_file_node_id(file_path: str) -> str:
@@ -146,9 +162,10 @@ async def get_or_create_file_node(
     Returns:
         MemoryNode 实例
     """
-    normalized_path = normalize_file_path(file_path)
-    if not normalized_path:
-        raise ValueError("file_path 不能为空")
+    eligibility = assess_document_path(file_path)
+    if not eligibility.eligible:
+        raise ValueError(f"不支持索引的记忆文档路径: {eligibility.reason}")
+    normalized_path = eligibility.path
     node_id = generate_file_node_id(normalized_path)
     legacy_node_id = generate_legacy_file_node_id(file_path)
 
@@ -278,9 +295,10 @@ async def get_node_by_file_path(
     Returns:
         MemoryNode 或 None
     """
-    normalized_path = normalize_file_path(file_path)
-    if not normalized_path:
+    eligibility = assess_document_path(file_path)
+    if not eligibility.eligible:
         return None
+    normalized_path = eligibility.path
     node_id = generate_file_node_id(normalized_path)
 
     def _lookup_node(nid: str) -> Optional[MemoryNode]:
@@ -551,9 +569,10 @@ async def migrate_file_path(
         是否迁移成功
     """
     old_norm = normalize_file_path(old_path)
-    new_norm = normalize_file_path(new_path)
-    if not old_norm or not new_norm:
+    target_eligibility = assess_document_path(new_path)
+    if not old_norm or not target_eligibility.eligible:
         return False
+    new_norm = target_eligibility.path
     if old_norm == new_norm:
         return True
 

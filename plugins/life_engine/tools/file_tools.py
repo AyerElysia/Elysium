@@ -22,6 +22,7 @@ from src.app.plugin_system.base import BaseTool
 from src.core.models.message import Message, MessageType
 
 from ..constants import EXTERNAL_MESSAGE_ACTIVE_WINDOW_MINUTES
+from ..memory.eligibility import assess_document_path, assess_workspace_document
 from ..memory.prompting import build_memory_write_warning
 from ..trace.store import LifeTraceStore
 from ._utils import (
@@ -59,15 +60,37 @@ def _get_life_engine_service(plugin: Any):
 
 
 async def _sync_memory_embedding_for_file(plugin: Any, path: str, content: str) -> None:
-    """同步文件内容到记忆系统（公共函数，消除重复）。"""
+    """同步文件内容到统一 SQLite/FTS/outbox 索引。
+
+    函数名保留以兼容已有调用方；统一文档 API 不会在文件工具路径中
+    触发 embedding 或网络请求。
+    """
+    eligibility = assess_document_path(path)
+    if not eligibility.eligible:
+        logger.debug(
+            f"跳过非记忆文档索引: {eligibility.path or path} ({eligibility.reason})"
+        )
+        return
     try:
         from ..service import LifeEngineService
 
         service = LifeEngineService.get_instance()
-        if service and service._memory_service:
-            await service._memory_service.sync_embedding(path, content)
+        memory_service = getattr(service, "_memory_service", None) if service else None
+        if memory_service is None:
+            return
+        source_mtime = None
+        try:
+            source_mtime = (_get_workspace(plugin) / path).stat().st_mtime
+        except (OSError, ValueError):
+            pass
+        await memory_service.upsert_document(
+            path,
+            content,
+            title=Path(path).stem,
+            source_mtime=source_mtime,
+        )
     except Exception as e:
-        logger.warning(f"同步记忆 embedding 失败 {path}: {e}")
+        logger.warning(f"同步记忆文档索引失败 {path}: {e}")
 
 
 def _read_trace_before_content(target: Path, encoding: str) -> str | None:
@@ -650,7 +673,7 @@ class LifeEngineWriteFileTool(BaseTool):
                 **_tool_trace_context(self),
             )
 
-            # 触发记忆系统同步 embedding
+            # 同步 SQLite/FTS/outbox 文档索引
             await _sync_memory_embedding_for_file(self.plugin, path, content)
 
             return True, {
@@ -754,7 +777,7 @@ class LifeEngineEditFileTool(BaseTool):
                 **_tool_trace_context(self),
             )
 
-            # 触发记忆系统同步 embedding
+            # 同步 SQLite/FTS/outbox 文档索引
             await _sync_memory_embedding_for_file(self.plugin, path, new_content)
 
             return True, {
@@ -1099,6 +1122,17 @@ class FetchLifeMemoryTool(BaseTool):
                 failed += 1
                 continue
             requested_path_str = file_path_str
+            requested_eligibility = assess_document_path(file_path_str)
+            if not requested_eligibility.eligible:
+                files_data.append(
+                    {
+                        "path": requested_path_str,
+                        "error": f"不是可读取的记忆文档: {requested_eligibility.reason}",
+                    }
+                )
+                failed += 1
+                continue
+            file_path_str = requested_eligibility.path
             path_resolution: dict[str, Any] | None = None
 
             # 验证路径安全性
@@ -1109,28 +1143,53 @@ class FetchLifeMemoryTool(BaseTool):
                 continue
 
             target_path = resolved
-            if not target_path.exists():
-                if memory_service is not None and hasattr(memory_service, "resolve_canonical_path"):
-                    try:
-                        resolution = await memory_service.resolve_canonical_path(file_path_str)
-                    except Exception as exc:  # noqa: BLE001
-                        logger.debug(f"解析记忆旧路径失败 {file_path_str}: {exc}")
-                        resolution = None
-                    if resolution and resolution.get("resolved"):
-                        resolved_path_str = str(resolution.get("resolved_path") or "").strip()
+            if memory_service is not None and hasattr(memory_service, "resolve_canonical_path"):
+                try:
+                    resolution = await memory_service.resolve_canonical_path(
+                        file_path_str,
+                        persist_lineage=False,
+                        allow_heuristic=False,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(f"解析记忆旧路径失败 {file_path_str}: {exc}")
+                    resolution = None
+                if resolution and resolution.get("resolved"):
+                    resolved_path_str = str(resolution.get("resolved_path") or "").strip()
+                    resolved_eligibility = assess_document_path(resolved_path_str)
+                    if not resolved_eligibility.eligible:
+                        logger.debug(
+                            "忽略指向非记忆文档的谱系解析: "
+                            f"{resolved_path_str} ({resolved_eligibility.reason})"
+                        )
+                    else:
+                        resolved_path_str = resolved_eligibility.path
                         ok, resolved_target = _resolve_path(self.plugin, resolved_path_str)
                         if ok and resolved_target.exists() and resolved_target.is_file():
                             target_path = resolved_target
                             file_path_str = resolved_path_str
                             path_resolution = resolution
 
-                if not target_path.exists():
-                    error_data = {"path": requested_path_str, "error": "文件不存在"}
-                    if path_resolution:
-                        error_data["path_resolution"] = path_resolution
-                    files_data.append(error_data)
-                    failed += 1
-                    continue
+            if not target_path.exists():
+                error_data = {"path": requested_path_str, "error": "文件不存在"}
+                if path_resolution:
+                    error_data["path_resolution"] = path_resolution
+                files_data.append(error_data)
+                failed += 1
+                continue
+
+            workspace_eligibility = assess_workspace_document(
+                _get_workspace(self.plugin),
+                file_path_str,
+            )
+            if not workspace_eligibility.eligible:
+                files_data.append(
+                    {
+                        "path": requested_path_str,
+                        "error": f"不是可读取的记忆文档: {workspace_eligibility.reason}",
+                    }
+                )
+                failed += 1
+                continue
 
             if requested_path_str != file_path_str and path_resolution is None:
                 path_resolution = {

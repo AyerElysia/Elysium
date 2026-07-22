@@ -18,6 +18,11 @@ from src.core.utils.security import VerifiedDep
 
 logger = get_logger(name="LiveChat", color="#F5C2E7")
 
+# N.E.K.O is a presentation surface for Neo, not a chat channel to render in
+# the Neo WebUI.  Keep this value shared by the event handler and HTTP/WS
+# filtering so a Surface event cannot re-enter the WebUI through another path.
+NEKO_SURFACE_PLATFORM = "neko.surface"
+
 
 # ==================== Pydantic 模型 ====================
 
@@ -246,7 +251,10 @@ class LiveChatRouter(BaseRouter):
 
                 result = []
                 for stream in streams:
-                    if str(stream.get("platform", "")) == "astrbot":
+                    if str(stream.get("platform", "")).strip() in {
+                        "astrbot",
+                        NEKO_SURFACE_PLATFORM,
+                    }:
                         continue
                     stream_info = StreamInfo(
                         stream_id=str(stream.get("stream_id", "")),
@@ -312,6 +320,8 @@ class LiveChatRouter(BaseRouter):
                 # 转换为 MessageInfo 模型
                 result = []
                 for msg in messages:
+                    if str(msg.get("platform", "")).strip() == NEKO_SURFACE_PLATFORM:
+                        continue
                     message_info = MessageInfo(
                         message_id=str(msg.get("message_id", "")),
                         stream_id=str(msg.get("stream_id", "")),
@@ -477,6 +487,10 @@ class LiveChatRouter(BaseRouter):
         Args:
             message_data: 消息数据字典，必须包含 stream_id 字段
         """
+        if str(message_data.get("platform", "")).strip() == NEKO_SURFACE_PLATFORM:
+            logger.debug("忽略 N.E.K.O Surface 消息，不推送到 Neo WebUI")
+            return
+
         stream_id = message_data.get("stream_id")
         if not stream_id:
             logger.warning("消息数据缺少 stream_id，无法广播")

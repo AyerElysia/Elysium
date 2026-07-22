@@ -6,12 +6,12 @@ import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Sequence
 
 import pytest
 
 from plugins.life_engine.core.config import LifeEngineConfig
-from plugins.life_engine.memory import EdgeType, LifeMemoryService
+from plugins.life_engine.memory import EdgeType, EmbeddingResult, LifeMemoryService
 
 
 @dataclass
@@ -130,3 +130,344 @@ def test_migrate_file_path_keeps_edges_and_fts(
         assert cursor.fetchone() is None
 
     asyncio.run(_run())
+
+
+def test_unified_document_api_updates_sqlite_without_embedding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """统一文档 API 只写 SQLite/FTS/outbox，不触发向量请求。"""
+
+    async def _run() -> None:
+        service = _make_service(tmp_path)
+        fake_collection = SimpleNamespace()
+
+        async def _fake_get_collection() -> Any:
+            return fake_collection
+
+        monkeypatch.setattr(service, "_get_chroma_collection", _fake_get_collection)
+        await service.initialize()
+
+        first = await service.upsert_document(
+            "notes/indexed.md",
+            "first searchable body",
+            title="Indexed",
+            source_mtime=12.0,
+        )
+        second = await service.upsert_document(
+            "notes/indexed.md",
+            "second searchable body",
+            title="Indexed",
+            source_mtime=13.0,
+        )
+        assert first.node_id == second.node_id
+        assert second.chunks
+        assert (await service.list_index_jobs())
+
+        await service.upsert_document("notes/indexed.md", "", title="Indexed")
+        assert await service.list_index_jobs() == []
+        assert service._db.execute(
+            "SELECT COUNT(*) FROM memory_chunks_fts WHERE node_id = ?",
+            (first.node_id,),
+        ).fetchone()[0] == 0
+
+        await service.upsert_document("notes/source.md", "source body", title="Source")
+        await service.upsert_document("notes/target.md", "target body", title="Target")
+        with pytest.raises(FileExistsError, match="目标文档已存在"):
+            await service.move_document("notes/source.md", "notes/target.md")
+        assert await service.delete_document("notes/target.md") is True
+
+    asyncio.run(_run())
+
+
+@pytest.mark.asyncio
+async def test_service_run_index_worker_uses_chunk_collection_and_updates_nodes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _make_service(tmp_path)
+    legacy_collection = SimpleNamespace()
+
+    async def fake_legacy_collection() -> Any:
+        return legacy_collection
+
+    monkeypatch.setattr(service, "_get_chroma_collection", fake_legacy_collection)
+    await service.initialize()
+    indexed = await service.upsert_document(
+        "notes/service-worker.md",
+        "service worker body",
+        title="Service Worker",
+    )
+
+    class ChunkCollection:
+        metadata = {"collection_kind": "life_memory_chunk"}
+        name = "life_memory_chunks_v1_fake_2"
+
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def upsert(self, **kwargs: Any) -> None:
+            self.calls.append(kwargs)
+
+    chunk_collection = ChunkCollection()
+    resolver_calls: list[tuple[str, int]] = []
+
+    async def fake_chunk_collection(path: str, model_name: str, dimension: int) -> Any:
+        assert path.endswith("/.memory/chroma")
+        resolver_calls.append((model_name, dimension))
+        return chunk_collection
+
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.get_chunk_collection",
+        fake_chunk_collection,
+    )
+
+    async def embed(texts: Sequence[str]) -> EmbeddingResult:
+        return EmbeddingResult(
+            embeddings=[[1.0, 2.0] for _ in texts],
+            model_name="service/fake",
+        )
+
+    report = await service.run_index_worker(embed_texts_func=embed)
+
+    assert report.completed == (indexed.job_id,)
+    assert resolver_calls == [("service/fake", 2)]
+    assert len(chunk_collection.calls) == 1
+    assert service._chunk_collection is chunk_collection
+    assert service._db.execute(
+        "SELECT embedding_synced FROM memory_nodes WHERE node_id = ?",
+        (indexed.node_id,),
+    ).fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_service_restart_restores_persisted_chunk_collection_and_close_is_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _make_service(tmp_path)
+    legacy_collection = SimpleNamespace()
+
+    async def fake_legacy_collection() -> Any:
+        return legacy_collection
+
+    monkeypatch.setattr(service, "_get_chroma_collection", fake_legacy_collection)
+    await service.initialize()
+    indexed = await service.upsert_document("notes/restart.md", "restart body")
+
+    class ChunkCollection:
+        name = "life_memory_chunks_v1_service_fake_2"
+        metadata = {
+            "collection_kind": "life_memory_chunk",
+            "chunk_index_version": 1,
+            "embedding_model": "service/fake",
+            "embedding_dimension": 2,
+        }
+
+        def upsert(self, **_: Any) -> None:
+            return None
+
+    chunk_collection = ChunkCollection()
+
+    async def embed(texts: Sequence[str]) -> EmbeddingResult:
+        return EmbeddingResult(
+            embeddings=[[1.0, 2.0] for _ in texts],
+            model_name="service/fake",
+        )
+
+    report = await service.run_index_worker(
+        collection=chunk_collection,
+        embed_texts_func=embed,
+    )
+    assert report.completed == (indexed.job_id,)
+    await service.close()
+    await service.close()
+    assert service._db is None
+    assert service._initialized is False
+
+    restored = _make_service(tmp_path)
+    monkeypatch.setattr(restored, "_get_chroma_collection", fake_legacy_collection)
+    named_calls: list[str] = []
+
+    async def fake_named_collection(path: str, name: str) -> Any:
+        assert path.endswith("/.memory/chroma")
+        named_calls.append(name)
+        return chunk_collection
+
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.get_named_chunk_collection",
+        fake_named_collection,
+    )
+    await restored.initialize()
+
+    assert named_calls == [chunk_collection.name]
+    assert restored._chunk_collection is chunk_collection
+    assert restored._chunk_collection_identity == ("service/fake", 2)
+    await restored.close()
+
+
+@pytest.mark.asyncio
+async def test_service_rejects_invalid_active_marker_before_backend_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from plugins.life_engine.memory import write_active_chunk_index_state
+
+    legacy_collection = SimpleNamespace()
+
+    async def fake_legacy_collection() -> Any:
+        return legacy_collection
+
+    service = _make_service(tmp_path)
+    monkeypatch.setattr(service, "_get_chroma_collection", fake_legacy_collection)
+    await service.initialize()
+    write_active_chunk_index_state(
+        service._db,
+        "invalid-collection-name",
+        "service/fake",
+        2,
+        1,
+        now=10.0,
+    )
+    await service.close()
+
+    named_calls: list[str] = []
+
+    async def fake_named_collection(_path: str, name: str) -> Any:
+        named_calls.append(name)
+        return SimpleNamespace(name=name)
+
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.get_named_chunk_collection",
+        fake_named_collection,
+    )
+    restored = _make_service(tmp_path)
+    monkeypatch.setattr(restored, "_get_chroma_collection", fake_legacy_collection)
+    await restored.initialize()
+
+    assert named_calls == []
+    assert restored._chunk_collection is None
+    assert restored._chroma_collection is legacy_collection
+    await restored.close()
+
+
+@pytest.mark.asyncio
+async def test_service_rejects_restored_collection_without_identity_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from plugins.life_engine.memory import write_active_chunk_index_state
+
+    legacy_collection = SimpleNamespace()
+
+    async def fake_legacy_collection() -> Any:
+        return legacy_collection
+
+    service = _make_service(tmp_path)
+    monkeypatch.setattr(service, "_get_chroma_collection", fake_legacy_collection)
+    await service.initialize()
+    collection_name = "life_memory_chunks_v1_service_fake_2"
+    write_active_chunk_index_state(
+        service._db,
+        collection_name,
+        "service/fake",
+        2,
+        1,
+        now=10.0,
+    )
+    await service.close()
+
+    named_calls: list[str] = []
+
+    async def fake_named_collection(_path: str, name: str) -> Any:
+        named_calls.append(name)
+        return SimpleNamespace(name=name, metadata={})
+
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.get_named_chunk_collection",
+        fake_named_collection,
+    )
+    restored = _make_service(tmp_path)
+    monkeypatch.setattr(restored, "_get_chroma_collection", fake_legacy_collection)
+    await restored.initialize()
+
+    assert named_calls == [collection_name]
+    assert restored._chunk_collection is None
+    assert restored._chroma_collection is legacy_collection
+
+    create_calls: list[tuple[str, int]] = []
+
+    async def fake_create_collection(
+        _path: str,
+        model_name: str,
+        dimension: int,
+    ) -> Any:
+        create_calls.append((model_name, dimension))
+        return SimpleNamespace()
+
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.get_chunk_collection",
+        fake_create_collection,
+    )
+    indexed = await restored.upsert_document("notes/missing-active.md", "body")
+
+    async def embed(texts: Sequence[str]) -> EmbeddingResult:
+        return EmbeddingResult(
+            embeddings=[[1.0, 2.0] for _ in texts],
+            model_name="service/fake",
+        )
+
+    report = await restored.run_index_worker(embed_texts_func=embed)
+
+    assert report.failed == (indexed.job_id,)
+    assert report.errors[indexed.job_id] == "ValueError"
+    assert named_calls == [collection_name, collection_name]
+    assert create_calls == []
+    await restored.close()
+
+
+@pytest.mark.asyncio
+async def test_service_worker_does_not_block_concurrent_document_update(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _make_service(tmp_path)
+
+    async def fake_legacy_collection() -> Any:
+        return SimpleNamespace()
+
+    monkeypatch.setattr(service, "_get_chroma_collection", fake_legacy_collection)
+    await service.initialize()
+    old = await service.upsert_document("notes/concurrent.md", "old body")
+    started = asyncio.Event()
+    release = asyncio.Event()
+    upserts: list[dict[str, Any]] = []
+
+    async def delayed_embed(texts: Sequence[str]) -> EmbeddingResult:
+        started.set()
+        await release.wait()
+        return EmbeddingResult(
+            embeddings=[[1.0, 2.0] for _ in texts],
+            model_name="service/fake",
+        )
+
+    worker = asyncio.create_task(
+        service.run_index_worker(
+            collection=SimpleNamespace(upsert=lambda **kwargs: upserts.append(kwargs)),
+            embed_texts_func=delayed_embed,
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    new = await asyncio.wait_for(
+        service.upsert_document("notes/concurrent.md", "new body"),
+        timeout=1.0,
+    )
+    release.set()
+    report = await worker
+
+    assert old.job_id in report.stale
+    assert report.upserted_chunks == 0
+    assert upserts == []
+    assert service._db.execute(
+        "SELECT status FROM memory_index_jobs WHERE job_id = ?", (new.job_id,)
+    ).fetchone()[0] == "pending"

@@ -289,6 +289,20 @@ def _payloads_to_openai_messages(
     messages: list[dict[str, Any]] = []
     tools: list[dict[str, Any]] = []
     tool_call_names: dict[str, str] = {}
+    pending_tool_calls: list[tuple[str, str]] = []
+
+    def consume_tool_call(call_id: str | None) -> tuple[str | None, str | None]:
+        """Return and consume the matching pending tool call, if one exists."""
+        if call_id:
+            for index, (pending_id, pending_name) in enumerate(pending_tool_calls):
+                if pending_id == call_id:
+                    pending_tool_calls.pop(index)
+                    return pending_id, pending_name
+            return call_id, tool_call_names.get(call_id)
+
+        if pending_tool_calls:
+            return pending_tool_calls.pop(0)
+        return None, None
 
     for payload in payloads:
         if payload.role == ROLE.TOOL:
@@ -330,25 +344,40 @@ def _payloads_to_openai_messages(
 
             if tool_payloads:
                 for tool_call_id, tool_name, content_text in tool_payloads:
+                    resolved_call_id = tool_call_id
+                    resolved_name = tool_name
+                    if include_tool_result_name:
+                        matched_call_id, matched_name = consume_tool_call(tool_call_id)
+                        resolved_call_id = resolved_call_id or matched_call_id
+                        resolved_name = resolved_name or matched_name
                     message = {
                         "role": "tool",
                         "content": content_text,
-                        **({"tool_call_id": tool_call_id} if tool_call_id else {}),
+                        **({"tool_call_id": resolved_call_id} if resolved_call_id else {}),
                     }
                     if include_tool_result_name:
-                        resolved_name = tool_name or (
-                            tool_call_names.get(tool_call_id) if tool_call_id else None
-                        )
                         if resolved_name:
                             message["name"] = resolved_name
                     messages.append(message)
             else:
-                messages.append(
-                    {
-                        "role": "tool",
-                        "content": fallback_text or "",
-                    }
-                )
+                content_text = fallback_text or ""
+                if include_tool_result_name:
+                    resolved_call_id, resolved_name = consume_tool_call(None)
+                    if resolved_call_id and resolved_name:
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "content": content_text,
+                                "tool_call_id": resolved_call_id,
+                                "name": resolved_name,
+                            }
+                        )
+                    else:
+                        # Gemini rejects orphan function responses without a name.
+                        # Preserve their text as ordinary context instead.
+                        messages.append({"role": "user", "content": content_text})
+                else:
+                    messages.append({"role": "tool", "content": content_text})
             continue
 
         role = payload.role.value
@@ -364,6 +393,7 @@ def _payloads_to_openai_messages(
                     call_id = part.id or f"call_{idx}"
                     if call_id and part.name:
                         tool_call_names[call_id] = part.name
+                        pending_tool_calls.append((call_id, part.name))
                     tool_calls_list.append(
                         {
                             "id": call_id,

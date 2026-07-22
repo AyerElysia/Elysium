@@ -11,6 +11,8 @@ from src.core.components.types import EventType
 from src.kernel.event import EventDecision
 from src.kernel.logger import get_logger
 
+from ..router.live_chat_router import NEKO_SURFACE_PLATFORM
+
 logger = get_logger("live_chat_event_handler", display="实时消息处理器")
 
 
@@ -53,6 +55,15 @@ class LiveChatEventHandler(BaseEventHandler):
         try:
             message = params.get("message")
             if not message:
+                return EventDecision.PASS, params
+
+            # N.E.K.O is Neo's presentation surface.  Its canonical messages
+            # are already visible in N.E.K.O and must not be duplicated in the
+            # Neo WebUI live chat stream.
+            if (
+                str(getattr(message, "platform", "") or "").strip()
+                == NEKO_SURFACE_PLATFORM
+            ):
                 return EventDecision.PASS, params
 
             # 仅确认投递事件代表已发送消息；发送前事件不在本处理器订阅范围内。

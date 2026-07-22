@@ -223,6 +223,14 @@ class MemoryRouter(BaseRouter):
             stats = await memory.get_stats()
             return stats
 
+        @self.app.get("/api/health")
+        async def get_health() -> Any:
+            """返回只读记忆健康快照。"""
+            memory = get_memory_service()
+            if not memory:
+                return JSONResponse(content={"status": "disabled"}, status_code=503)
+            return await memory.health_snapshot()
+
         @self.app.get("/api/graph")
         async def get_graph(
             limit_nodes: int = 80,

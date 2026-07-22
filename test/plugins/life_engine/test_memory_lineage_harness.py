@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from plugins.life_engine.core.config import LifeEngineConfig
-from plugins.life_engine.memory import LifeMemoryService
+from plugins.life_engine.memory import EdgeType, LifeMemoryService
 from plugins.life_engine.tools.file_tools import FetchLifeMemoryTool
 
 
@@ -68,10 +68,18 @@ def test_dream_system_lineage_keeps_old_memory_and_resolves_current_file(
             encoding="utf-8",
         )
 
+        old_file = tmp_path / old_path
+        old_file.write_text("旧笔记内容", encoding="utf-8")
         await service.get_or_create_file_node(
             old_path,
             title="dream_system_research",
             content="做梦系统还在研究阶段，旧笔记只记录了早期方案。",
+        )
+        await service.create_memory_lineage_edge(
+            old_path,
+            current_path,
+            EdgeType.RENAMES,
+            reason="显式整理到当前笔记",
         )
 
         resolution = await service.resolve_canonical_path(old_path)
@@ -108,7 +116,160 @@ def test_dream_system_lineage_keeps_old_memory_and_resolves_current_file(
         file_payload = payload["files"][0]
         assert file_payload["path"] == current_path
         assert file_payload["requested_path"] == old_path
+        assert "旧笔记内容" not in file_payload["content"]
         assert "已经做好了" in file_payload["content"]
         assert file_payload["path_resolution"]["resolved"] is True
 
     asyncio.run(_run())
+
+
+@pytest.mark.asyncio
+async def test_explicit_lineage_prefers_deep_existing_target_over_source_and_dead_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = _make_plugin(tmp_path)
+    service = LifeMemoryService(plugin)
+
+    async def _fake_get_collection() -> Any:
+        return _FakeCollection()
+
+    monkeypatch.setattr(service, "_get_chroma_collection", _fake_get_collection)
+    await service.initialize()
+
+    source_path = "notes/a.md"
+    middle_path = "notes/b.md"
+    current_path = "notes/c.md"
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    for path in (source_path, middle_path, current_path):
+        (tmp_path / path).write_text(path, encoding="utf-8")
+
+    source = await service.get_or_create_file_node(source_path, title="A")
+    middle = await service.get_or_create_file_node(middle_path, title="B")
+    current = await service.get_or_create_file_node(current_path, title="C")
+    dead = await service.get_or_create_file_node("notes/dead.md", title="dead")
+    await service.create_or_update_edge(
+        source.node_id,
+        dead.node_id,
+        EdgeType.RENAMES,
+        reason="dead preferred branch",
+        strength=0.99,
+        bidirectional=False,
+    )
+    await service.create_or_update_edge(
+        source.node_id,
+        middle.node_id,
+        EdgeType.RENAMES,
+        reason="explicit first step",
+        strength=0.5,
+        bidirectional=False,
+    )
+    await service.create_or_update_edge(
+        middle.node_id,
+        current.node_id,
+        EdgeType.REFINES,
+        reason="explicit current step",
+        strength=0.5,
+        bidirectional=False,
+    )
+
+    resolution = await service.resolve_canonical_path(source_path, max_depth=3)
+
+    assert resolution["resolved"] is True
+    assert resolution["resolved_path"] == current_path
+    assert [step["to"] for step in resolution["lineage"]] == [middle_path, current_path]
+
+
+@pytest.mark.asyncio
+async def test_fetch_does_not_persist_guessed_lineage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = _make_plugin(tmp_path)
+    service = LifeMemoryService(plugin)
+
+    async def _fake_get_collection() -> Any:
+        return _FakeCollection()
+
+    monkeypatch.setattr(service, "_get_chroma_collection", _fake_get_collection)
+    await service.initialize()
+
+    guessed_path = "notes/topic.md"
+    guessed_file = tmp_path / guessed_path
+    guessed_file.parent.mkdir(parents=True)
+    guessed_file.write_text("current", encoding="utf-8")
+    before = (
+        service._db.execute("SELECT COUNT(*) FROM memory_nodes").fetchone()[0],
+        service._db.execute("SELECT COUNT(*) FROM memory_edges").fetchone()[0],
+    )
+    calls: list[dict[str, Any]] = []
+    resolve_canonical_path = service.resolve_canonical_path
+
+    async def _capture_resolution(file_path: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return await resolve_canonical_path(file_path, *args, **kwargs)
+
+    monkeypatch.setattr(service, "resolve_canonical_path", _capture_resolution)
+    monkeypatch.setattr(
+        "plugins.life_engine.tools.file_tools._get_life_engine_service",
+        lambda _plugin: type("_Service", (), {"_memory_service": service})(),
+    )
+
+    ok, payload = await FetchLifeMemoryTool(plugin=plugin).execute(
+        ["notes/topic_research.md"],
+    )
+
+    assert ok is True
+    assert payload["successful"] == 0
+    assert payload["failed"] == 1
+    assert calls == [{"persist_lineage": False, "allow_heuristic": False}]
+    assert (
+        service._db.execute("SELECT COUNT(*) FROM memory_nodes").fetchone()[0],
+        service._db.execute("SELECT COUNT(*) FROM memory_edges").fetchone()[0],
+    ) == before
+
+
+@pytest.mark.asyncio
+async def test_lineage_rejects_missing_unindexed_path_but_keeps_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = _make_plugin(tmp_path)
+    service = LifeMemoryService(plugin)
+
+    async def _fake_get_collection() -> Any:
+        return _FakeCollection()
+
+    monkeypatch.setattr(service, "_get_chroma_collection", _fake_get_collection)
+    await service.initialize()
+
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    current_path = "notes/current.md"
+    (tmp_path / current_path).write_text("current", encoding="utf-8")
+    historical_path = "notes/old.md"
+    await service.get_or_create_file_node(
+        historical_path,
+        title="old",
+        content="historical evidence",
+    )
+
+    await service.create_memory_lineage_edge(
+        historical_path,
+        current_path,
+        EdgeType.RENAMES,
+        reason="保留旧文件作为历史证据",
+    )
+
+    before = service._db.execute("SELECT COUNT(*) FROM memory_nodes").fetchone()[0]
+    with pytest.raises(ValueError, match="记忆文档不存在或不可访问"):
+        await service.create_memory_lineage_edge(
+            "notes/typo.md",
+            current_path,
+            EdgeType.RENAMES,
+            reason="此路径不应创建空白节点",
+        )
+
+    assert service._db.execute("SELECT COUNT(*) FROM memory_nodes").fetchone()[0] == before
+    assert await service.get_node_by_file_path(historical_path) is not None

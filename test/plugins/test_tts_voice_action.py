@@ -10,13 +10,14 @@ from plugins.tts_voice_plugin.actions.tts_action import TTSVoiceAction
 from plugins.tts_voice_plugin.config import TTSVoiceConfig
 
 
-def _build_action(*, always_available: bool) -> TTSVoiceAction:
+def _build_action(*, always_available: bool, platform: str = "") -> TTSVoiceAction:
     cfg = TTSVoiceConfig()
     cfg.components.action_always_available = always_available
 
     plugin = SimpleNamespace(config=cfg, tts_service=None)
     chat_stream = SimpleNamespace(
         stream_id="s1",
+        platform=platform,
         context=SimpleNamespace(history_messages=[]),
     )
     return TTSVoiceAction(chat_stream=chat_stream, plugin=plugin)
@@ -107,3 +108,16 @@ async def test_execute_persists_tts_text_as_voice_plain_text(monkeypatch) -> Non
         "stream_id": "s1",
         "processed_plain_text": "[语音:今晚我想认真说一会儿。]",
     }
+
+
+@pytest.mark.asyncio
+async def test_surface_execute_is_suppressed_when_adapter_owns_tts() -> None:
+    action = _build_action(always_available=True, platform="neko.surface")
+    action.tts_service = SimpleNamespace()
+
+    success, message = await action.execute(
+        tts_voice_text="这条不应再生成第二份语音。",
+    )
+
+    assert success is False
+    assert "自动 TTS" in message

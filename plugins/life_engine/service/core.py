@@ -13,6 +13,7 @@ from dataclasses import asdict
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
 from src.app.plugin_system.api.log_api import get_logger
@@ -92,12 +93,15 @@ from .event_builder import (
 from .followup import FollowupState, PendingFollowup
 from .state_manager import (
     StatePersistence,
-    compress_history,
-    clear_wake_context_reminder,
     get_file_metadata,
     minutes_since_time,
 )
 from .attention import AttentionRouter
+from .subconscious_context import (
+    PreparedHeartbeatContext,
+    SubconsciousContextManager,
+    SubconsciousSummary,
+)
 from .event_bus import LifeEventBus, RawEventStore
 from .integrations import (
     DFCIntegration,
@@ -141,10 +145,23 @@ class LifeEngineService(BaseService):
         self._state = LifeEngineState()
         self._state_dirty: bool = False
         self._heartbeat_task_id: str | None = None
+        self._memory_index_task_id: str | None = None
         self._stop_event: asyncio.Event | None = None
         self._pending_events: list[LifeEngineEvent] = []
         self._event_history: list[LifeEngineEvent] = []
         self._lock: asyncio.Lock | None = None
+        self._heartbeat_run_lock = asyncio.Lock()
+        settings = getattr(getattr(plugin, "config", None), "settings", None)
+        configured_budget = getattr(settings, "subconscious_context_max_chars", None)
+        if configured_budget is None:
+            configured_budget = getattr(settings, "heartbeat_context_max_chars", None)
+        try:
+            context_budget = max(0, int(configured_budget or 6000))
+        except (TypeError, ValueError):
+            context_budget = 6000
+        self._subconscious_context: SubconsciousContextManager = SubconsciousContextManager(
+            max_chars=context_budget,
+        )
         self._sleep_state_active: bool = False
         self._memory_service: LifeMemoryService | None = None
         self._last_decay_date: str | None = None
@@ -279,6 +296,25 @@ class LifeEngineService(BaseService):
         """返回滚动事件流保留上限。"""
         cfg = self._cfg()
         return max(1, int(cfg.settings.context_history_max_events))
+
+    def _memory_index_options(self) -> dict[str, Any]:
+        """读取新旧配置兼容的保守索引参数。"""
+        section = getattr(self._cfg(), "memory_index", None)
+
+        def _integer(name: str, default: int, minimum: int) -> int:
+            try:
+                return max(minimum, int(getattr(section, name, default)))
+            except (TypeError, ValueError):
+                return default
+
+        return {
+            "enabled": bool(getattr(section, "enabled", True)),
+            "interval_seconds": _integer("interval_seconds", 60, 30),
+            "batch_size": min(50, _integer("batch_size", 4, 1)),
+            "run_on_startup": bool(getattr(section, "run_on_startup", True)),
+            "retry_failed": bool(getattr(section, "retry_failed", False)),
+            "reclaim_after_seconds": _integer("reclaim_after_seconds", 600, 60),
+        }
 
     def _sleep_window_config(self) -> tuple[dtime | None, dtime | None]:
         """返回配置的睡眠窗口（sleep, wake）。"""
@@ -491,6 +527,7 @@ class LifeEngineService(BaseService):
             "tool_name": event.tool_name,
             "tool_args": event.tool_args or {},
             "tool_success": event.tool_success,
+            "heartbeat_context_consumed": event.heartbeat_context_consumed,
         }
 
     async def _publish_raw_events(self, events: list[LifeEngineEvent]) -> None:
@@ -502,13 +539,19 @@ class LifeEngineService(BaseService):
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"life_engine raw event 写入失败（已跳过）: {exc}", exc_info=True)
 
-    async def _queue_pending_event(self, event: LifeEngineEvent) -> None:
+    async def _queue_pending_event(
+        self,
+        event: LifeEngineEvent,
+        *,
+        persist: bool = True,
+    ) -> None:
         """Append an event to the compatibility pending queue and raw bus."""
         async with self._get_lock():
             self._pending_events.append(event)
             self._state.pending_event_count = len(self._pending_events)
         await self._publish_raw_events([event])
-        await self._save_runtime_context()
+        if persist:
+            await self._save_runtime_context()
 
     def _serialize_stream_message(
         self,
@@ -1840,15 +1883,53 @@ class LifeEngineService(BaseService):
             "channel": "chatter_think_snapshot",
         }
 
-    async def record_tool_call(self, tool_name: str, tool_args: dict[str, Any]) -> None:
-        """记录工具调用事件。"""
-        event = self._event_builder.build_tool_call_event(tool_name, tool_args)
-        await self._queue_pending_event(event)
+    async def record_tool_call(
+        self,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        *,
+        heartbeat_run_id: str | None = None,
+        call_id: str | None = None,
+        parent_event_id: str | None = None,
+        causation_id: str | None = None,
+    ) -> LifeEngineEvent:
+        """记录工具调用事件；旧调用方仍可只传工具名和参数。"""
+        event = self._event_builder.build_tool_call_event(
+            tool_name,
+            tool_args,
+            heartbeat_run_id=heartbeat_run_id,
+            call_id=call_id,
+            parent_event_id=parent_event_id,
+            causation_id=causation_id,
+        )
+        await self._queue_pending_event(event, persist=heartbeat_run_id is None)
+        return event
 
-    async def record_tool_result(self, tool_name: str, result: str, success: bool) -> None:
-        """记录工具返回结果事件。"""
-        event = self._event_builder.build_tool_result_event(tool_name, result, success)
-        await self._queue_pending_event(event)
+    async def record_tool_result(
+        self,
+        tool_name: str,
+        result: str,
+        success: bool,
+        *,
+        heartbeat_run_id: str | None = None,
+        call_id: str | None = None,
+        parent_event_id: str | None = None,
+        causation_id: str | None = None,
+        call_event: LifeEngineEvent | None = None,
+    ) -> LifeEngineEvent:
+        """记录工具返回结果事件；旧调用方仍可使用原签名。"""
+        event = self._event_builder.build_tool_result_event(
+            tool_name,
+            result,
+            success,
+            heartbeat_run_id=heartbeat_run_id,
+            call_id=call_id,
+            parent_event_id=parent_event_id,
+            causation_id=causation_id,
+            call_event=call_event,
+        )
+        await self._queue_pending_event(event, persist=heartbeat_run_id is None)
+        return event
 
     async def _collect_background_agent_results(self) -> None:
         """收集已完成的后台智能体结果，注入为事件。"""
@@ -1886,23 +1967,159 @@ class LifeEngineService(BaseService):
         events: list[LifeEngineEvent],
         *,
         publish_raw: bool = True,
+        persist: bool = True,
     ) -> None:
-        """将事件追加到滚动历史中，支持压缩。"""
+        """将事件追加到原始历史；确认后的压缩由 heartbeat commit 统一执行。"""
         if not events:
             return
 
         async with self._get_lock():
             self._event_history.extend(events)
-            limit = self._history_limit()
-
-            compress_threshold = int(limit * 0.8)
-            if len(self._event_history) > compress_threshold:
-                self._event_history = compress_history(self._event_history, limit)
-
+            self._event_history.sort(
+                key=lambda event: (int(event.sequence or 0), str(event.event_id or ""))
+            )
             self._state.history_event_count = len(self._event_history)
         if publish_raw:
             await self._publish_raw_events(events)
+        if persist:
+            await self._save_runtime_context()
+
+    async def _prepare_heartbeat_context(self) -> PreparedHeartbeatContext:
+        """Drain pending events and prepare one fixed heartbeat snapshot."""
+        pending = await self.drain_pending_events()
+        if pending:
+            await self._append_history(pending, publish_raw=False, persist=False)
+            await self._save_runtime_context()
+
+        async with self._get_lock():
+            snapshot_events = list(self._event_history)
+            cursor = int(self._state.heartbeat_context_cursor or 0)
+            summary = dict(self._state.subconscious_summary or {})
+
+        prepared = self._subconscious_context.prepare(
+            snapshot_events,
+            cursor=cursor,
+            existing_summary=summary,
+        )
+        self._state.last_wake_context_at = _now_iso()
+        self._state.last_wake_context_size = len(prepared.selected_event_ids)
+        log_wake_context_injected(
+            task_name=self._cfg().model.task_name,
+            wake_context_at=self._state.last_wake_context_at,
+            context_message_count=len(prepared.selected_event_ids),
+            drained_message_count=len(pending),
+            history_message_count=len(snapshot_events),
+            source_count=len({event.source for event in snapshot_events}),
+            content=prepared.content,
+        )
+        logger.info(
+            "life_engine 已准备唤醒上下文: "
+            f"count={len(prepared.selected_event_ids)} drained={len(pending)} "
+            f"high_water={prepared.snapshot_high_water} "
+            f"task={self._cfg().model.task_name}"
+        )
+        return prepared
+
+    async def _commit_heartbeat_context(
+        self,
+        prepared: PreparedHeartbeatContext,
+        model_reply: str,
+        heartbeat_run_id: str,
+    ) -> None:
+        """Commit one successful heartbeat snapshot and advance its cursor."""
+        reply_text = str(model_reply or "").strip()
+        heartbeat_event: LifeEngineEvent | None = None
+        if reply_text:
+            heartbeat_event = self._event_builder.build_heartbeat_event(
+                reply_text,
+                self._state.heartbeat_count,
+                self._cfg().model.task_name or "life",
+                heartbeat_run_id=heartbeat_run_id,
+            )
+
+        async with self._get_lock():
+            run_events = [
+                event
+                for event in self._pending_events
+                if event.heartbeat_run_id == heartbeat_run_id
+            ]
+            if run_events:
+                for event in run_events:
+                    # Successful model output is history, not a new wake-up signal.
+                    event.heartbeat_context_consumed = True
+                run_ids = {id(event) for event in run_events}
+                self._pending_events = [
+                    event for event in self._pending_events if id(event) not in run_ids
+                ]
+                self._event_history.extend(run_events)
+            if heartbeat_event is not None:
+                heartbeat_event.heartbeat_context_consumed = True
+                self._event_history.append(heartbeat_event)
+            self._event_history.sort(
+                key=lambda event: (int(event.sequence or 0), str(event.event_id or ""))
+            )
+            acknowledged_ids = set(prepared.acknowledged_event_ids)
+            if acknowledged_ids:
+                for event in self._event_history:
+                    if event.event_id in acknowledged_ids:
+                        event.heartbeat_context_consumed = True
+
+            self._state.pending_event_count = len(self._pending_events)
+            self._state.subconscious_summary = prepared.updated_summary.to_dict()
+            current_cursor = int(self._state.heartbeat_context_cursor or 0)
+            # The commit frontier is the prepare snapshot only. Events created
+            # by this model run, or arriving while it is running, belong to a
+            # later heartbeat and must never be skipped by this commit.
+            candidate_high_water = max(
+                current_cursor,
+                int(prepared.snapshot_high_water or 0),
+            )
+            has_unconsumed_gap = any(
+                current_cursor < int(event.sequence or 0) <= candidate_high_water
+                and event.event_type != EventType.SUMMARY
+                and not event.heartbeat_context_consumed
+                for event in self._event_history
+            )
+            if not has_unconsumed_gap:
+                self._state.heartbeat_context_cursor = candidate_high_water
+
+            self._event_history = self._subconscious_context.compact_history(
+                self._event_history,
+                cursor=self._state.heartbeat_context_cursor,
+                existing_summary=self._state.subconscious_summary,
+            )
+            summary_events = [
+                event
+                for event in self._event_history
+                if event.event_type == EventType.SUMMARY
+                and str(event.content_type or "").strip().lower() == "subconscious_summary"
+            ]
+            if summary_events:
+                try:
+                    latest_summary = max(
+                        summary_events,
+                        key=lambda event: int(event.sequence or 0),
+                    )
+                    self._state.subconscious_summary = SubconsciousSummary.from_json(
+                        latest_summary.content
+                    ).to_dict()
+                except (TypeError, ValueError):
+                    pass
+            self._state.history_event_count = len(self._event_history)
+
+        if heartbeat_event is not None:
+            await self._publish_raw_events([heartbeat_event])
         await self._save_runtime_context()
+
+    async def _prepare_and_commit_heartbeat_context(
+        self,
+        model_reply: str,
+        heartbeat_run_id: str,
+    ) -> PreparedHeartbeatContext:
+        """Compatibility helper used by tests and heartbeat runners."""
+        prepared = await self._prepare_heartbeat_context()
+        await self._commit_heartbeat_context(prepared, model_reply, heartbeat_run_id)
+        return prepared
 
     async def clear_runtime_context(self) -> None:
         """清理当前事件上下文。"""
@@ -1912,8 +2129,9 @@ class LifeEngineService(BaseService):
             self._state.pending_event_count = 0
             self._state.history_event_count = 0
             self._state.event_sequence = 0
+            self._state.heartbeat_context_cursor = 0
+            self._state.subconscious_summary = {}
         await self._save_runtime_context()
-        clear_wake_context_reminder()
 
     def _build_wake_context_text(self, events: list[LifeEngineEvent]) -> str:
         """把事件流拼成可注入的上下文文本。"""
@@ -1931,11 +2149,11 @@ class LifeEngineService(BaseService):
                 source_short = self._simplify_source(source)
                 line = f"[{time_display}] 📨 {source_short}"
                 line += f"\n    └─ {event.sender}: {event.content}"
+            elif event.event_type == EventType.SUMMARY:
+                line = f"[{time_display}] 🧠 潜意识摘要"
+                line += f"\n    └─ {event.content}"
             elif event.event_type == EventType.HEARTBEAT:
-                if str(event.content_type or "").strip().lower() == "attention_summary":
-                    line = f"[{time_display}] 🧠 潜意识摘要"
-                else:
-                    line = f"[{time_display}] 💭 心跳#{event.heartbeat_index}"
+                line = f"[{time_display}] 💭 心跳#{event.heartbeat_index}"
                 line += f"\n    └─ {event.content}"
             elif event.event_type == EventType.TOOL_CALL:
                 line = f"[{time_display}] 🔧 {event.tool_name}"
@@ -2626,53 +2844,19 @@ class LifeEngineService(BaseService):
         return ", ".join(key_params[:2])
 
     async def inject_wake_context(self) -> str:
-        """把当前待处理事件注入到系统提醒。"""
-        events = await self.drain_pending_events()
-        if events:
-            await self._append_history(events, publish_raw=False)
+        """兼容旧调用方，准备一次纯字符串 heartbeat context。"""
+        prepared = await self._prepare_heartbeat_context()
+        return prepared.content
 
-        async with self._get_lock():
-            context_events = list(self._event_history)
-
-        if not context_events:
-            clear_wake_context_reminder()
-            return ""
-
-        window = self._get_attention_router().select(
-            context_events,
-            cursor=0,
-            current_stream_id="",
-            max_events=self._history_limit(),
-        )
-        context_events = window.events
-        content = self._build_wake_context_text(context_events)
-        from src.core.prompt import get_system_reminder_store
-        from .state_manager import _TARGET_REMINDER_BUCKET, _TARGET_REMINDER_NAME
-
-        store = get_system_reminder_store()
-        store.set(_TARGET_REMINDER_BUCKET, name=_TARGET_REMINDER_NAME, content=content)
-
-        self._state.last_wake_context_at = _now_iso()
-        self._state.last_wake_context_size = len(context_events)
-        log_wake_context_injected(
-            task_name=self._cfg().model.task_name,
-            wake_context_at=self._state.last_wake_context_at,
-            context_message_count=len(context_events),
-            drained_message_count=len(events),
-            history_message_count=len(context_events),
-            source_count=len({event.source for event in context_events}),
-            content=content,
-        )
-        logger.info(
-            "life_engine 已注入唤醒上下文: "
-            f"count={len(context_events)} drained={len(events)} "
-            f"task={self._cfg().model.task_name}"
-        )
-        return content
-
-    async def _record_model_reply(self, model_reply: str) -> None:
-        """记录心跳模型回复。"""
-        reply_text = model_reply.strip()
+    async def _record_model_reply(
+        self,
+        model_reply: str,
+        *,
+        heartbeat_run_id: str | None = None,
+        persist: bool = True,
+    ) -> None:
+        """记录心跳模型回复指标；新事务可延迟事件持久化到 commit。"""
+        reply_text = str(model_reply or "").strip()
 
         self._state.last_model_reply_at = _now_iso()
         self._state.last_model_reply = reply_text
@@ -2692,12 +2876,14 @@ class LifeEngineService(BaseService):
                 f"#{self._state.heartbeat_count} "
                 f"{_shorten_text(reply_text, max_length=240)}"
             )
-            heartbeat_event = self._event_builder.build_heartbeat_event(
-                reply_text,
-                self._state.heartbeat_count,
-                self._cfg().model.task_name or "life",
-            )
-            await self._append_history([heartbeat_event])
+            if persist:
+                heartbeat_event = self._event_builder.build_heartbeat_event(
+                    reply_text,
+                    self._state.heartbeat_count,
+                    self._cfg().model.task_name or "life",
+                    heartbeat_run_id=heartbeat_run_id,
+                )
+                await self._append_history([heartbeat_event])
         else:
             logger.info(f"life_engine 心跳模型回复为空: #{self._state.heartbeat_count}")
 
@@ -3116,11 +3302,24 @@ class LifeEngineService(BaseService):
         call: Any,
         response: Any,
         registry: ToolRegistry,
-    ) -> None:
+        *,
+        heartbeat_run_id: str | None = None,
+    ) -> LifeEngineEvent | None:
         """执行一次心跳 tool call。"""
         tool_name, args = self._heartbeat_tool_call_metadata(call)
         log_args = {k: v for k, v in args.items() if k != "reason"}
-        await self.record_tool_call(tool_name or "<unknown>", log_args)
+        call_id = str(getattr(call, "id", "") or "")
+        if heartbeat_run_id:
+            call_id = call_id or f"{heartbeat_run_id}:call:{uuid4().hex[:12]}"
+            call_event = await self.record_tool_call(
+                tool_name or "<unknown>",
+                log_args,
+                heartbeat_run_id=heartbeat_run_id,
+                call_id=call_id,
+                parent_event_id=f"heartbeat_run:{heartbeat_run_id}",
+            )
+        else:
+            call_event = await self.record_tool_call(tool_name or "<unknown>", log_args)
 
         result_text, success = await self._run_heartbeat_tool_call_execution(
             tool_name,
@@ -3128,43 +3327,84 @@ class LifeEngineService(BaseService):
             registry,
         )
         self._append_heartbeat_tool_result_payload(response, call, tool_name, result_text)
-        await self.record_tool_result(tool_name or "<unknown>", result_text, success)
+        if heartbeat_run_id:
+            await self.record_tool_result(
+                tool_name or "<unknown>",
+                result_text,
+                success,
+                heartbeat_run_id=heartbeat_run_id,
+                call_id=call_id,
+                parent_event_id=(call_event.event_id if call_event else None),
+                call_event=call_event,
+            )
+        else:
+            await self.record_tool_result(tool_name or "<unknown>", result_text, success)
+        return call_event
+
 
     async def _execute_heartbeat_tool_call_batch(
         self,
         calls: list[Any],
         response: Any,
         registry: ToolRegistry,
+        *,
+        heartbeat_run_id: str | None = None,
     ) -> int:
         """并行执行一组已判定安全的心跳 tool call，并按原顺序写回结果。"""
-        prepared: list[tuple[Any, str, dict[str, Any]]] = []
+        prepared: list[tuple[Any, str, dict[str, Any], LifeEngineEvent | None, str]] = []
         for call in calls:
             tool_name, args = self._heartbeat_tool_call_metadata(call)
             log_args = {k: v for k, v in args.items() if k != "reason"}
-            await self.record_tool_call(tool_name or "<unknown>", log_args)
-            prepared.append((call, tool_name, args))
+            call_id = str(getattr(call, "id", "") or "")
+            if heartbeat_run_id:
+                call_id = call_id or f"{heartbeat_run_id}:call:{uuid4().hex[:12]}"
+                call_event = await self.record_tool_call(
+                    tool_name or "<unknown>",
+                    log_args,
+                    heartbeat_run_id=heartbeat_run_id,
+                    call_id=call_id,
+                    parent_event_id=f"heartbeat_run:{heartbeat_run_id}",
+                )
+            else:
+                call_event = await self.record_tool_call(tool_name or "<unknown>", log_args)
+            prepared.append((call, tool_name, args, call_event, call_id))
 
         if len(prepared) > 1:
             logger.info(
                 "life_engine 心跳并行执行工具批次: "
-                f"{[tool_name or '<unknown>' for _, tool_name, _ in prepared]}"
+                f"{[tool_name or '<unknown>' for _, tool_name, _, _, _ in prepared]}"
             )
 
         outcomes = await asyncio.gather(
             *(
                 self._run_heartbeat_tool_call_execution(tool_name, args, registry)
-                for _, tool_name, args in prepared
+                for _, tool_name, args, _, _ in prepared
             ),
             return_exceptions=True,
         )
-        for (call, tool_name, _args), outcome in zip(prepared, outcomes, strict=False):
+        for (call, tool_name, _args, call_event, call_id), outcome in zip(
+            prepared,
+            outcomes,
+            strict=False,
+        ):
             if isinstance(outcome, Exception):
                 result_text = f"执行异常: {outcome}"
                 success = False
             else:
                 result_text, success = outcome
             self._append_heartbeat_tool_result_payload(response, call, tool_name, result_text)
-            await self.record_tool_result(tool_name or "<unknown>", result_text, success)
+            if heartbeat_run_id:
+                await self.record_tool_result(
+                    tool_name or "<unknown>",
+                    result_text,
+                    success,
+                    heartbeat_run_id=heartbeat_run_id,
+                    call_id=call_id,
+                    parent_event_id=(call_event.event_id if call_event else None),
+                    call_event=call_event,
+                )
+            else:
+                await self.record_tool_result(tool_name or "<unknown>", result_text, success)
 
         return len(prepared) * 2
 
@@ -3188,8 +3428,13 @@ class LifeEngineService(BaseService):
             self._last_memory_maintenance_prompt_at = _now_iso()
         return prompt
 
-    async def _run_heartbeat_model(self, wake_context: str) -> str:
-        """调用 life 任务模型生成内部报文。"""
+    async def _run_heartbeat_model(
+        self,
+        wake_context: str,
+        *,
+        heartbeat_run_id: str | None = None,
+    ) -> str:
+        """调用 life 任务模型生成内部报文；请求失败必须向上抛出。"""
         cfg = self._cfg()
         task_name = cfg.model.task_name.strip() or "life"
         model_set = get_model_set_by_task(task_name)
@@ -3244,7 +3489,7 @@ class LifeEngineService(BaseService):
             )
         except Exception as e:
             logger.error(f"Heartbeat request failed after all retries: {e}")
-            return
+            raise
 
         max_rounds = max(1, int(cfg.settings.max_rounds_per_heartbeat))
         last_text = ""
@@ -3252,10 +3497,10 @@ class LifeEngineService(BaseService):
 
         for _ in range(max_rounds):
             try:
-                response_text = await response
-            except asyncio.TimeoutError:
+                response_text = await asyncio.wait_for(response, timeout=timeout_seconds)
+            except asyncio.TimeoutError as exc:
                 logger.warning("life_engine heartbeat response read timeout")
-                break
+                raise TimeoutError("heartbeat response read timeout") from exc
 
             last_text = str(response_text or "").strip()
             call_list = list(getattr(response, "call_list", []) or [])
@@ -3287,18 +3532,27 @@ class LifeEngineService(BaseService):
                         batch,
                         response,
                         registry,
+                        heartbeat_run_id=heartbeat_run_id,
                     )
                     continue
 
                 for call in batch:
-                    await self._execute_heartbeat_tool_call(call, response, registry)
+                    await self._execute_heartbeat_tool_call(
+                        call,
+                        response,
+                        registry,
+                        heartbeat_run_id=heartbeat_run_id,
+                    )
                     tool_event_count += 2
 
             try:
-                response = await asyncio.wait_for(response.send(stream=False), timeout=timeout_seconds)
-            except asyncio.TimeoutError:
+                response = await asyncio.wait_for(
+                    response.send(stream=False),
+                    timeout=timeout_seconds,
+                )
+            except asyncio.TimeoutError as exc:
                 logger.warning("life_engine heartbeat follow-up request timeout")
-                break
+                raise TimeoutError("heartbeat follow-up request timeout") from exc
 
         if tool_event_count > 0:
             self._state.idle_heartbeat_count = 0
@@ -3451,6 +3705,15 @@ class LifeEngineService(BaseService):
         )
         self._heartbeat_task_id = task.task_id
 
+        memory_index_options = self._memory_index_options()
+        if self._memory_service is not None and memory_index_options["enabled"]:
+            index_task = get_task_manager().create_task(
+                self._memory_index_loop(),
+                name="life_engine_memory_index",
+                daemon=True,
+            )
+            self._memory_index_task_id = index_task.task_id
+
         logger.info(
             "life_engine 已启动: "
             f"interval={int(cfg.settings.heartbeat_interval_seconds)}s "
@@ -3469,8 +3732,35 @@ class LifeEngineService(BaseService):
             snn_enabled=cfg.snn.enabled,
         )
 
+    async def _await_managed_task(self, task_id: str | None, *, timeout: float) -> None:
+        """等待 daemon 自然退出，超时后取消并等待其清理完成。"""
+        if not task_id:
+            return
+        manager = get_task_manager()
+        try:
+            task = manager.get_task(task_id).task
+        except Exception:
+            return
+        if task is None or task.done():
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(f"后台任务停止超时，正在取消: task_id={task_id}")
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"后台任务取消时退出异常: task_id={task_id} error={exc}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"后台任务已异常退出: task_id={task_id} error={exc}")
+
     async def stop(self) -> None:
-        """停止心跳。"""
+        """停止后台循环并关闭记忆 SQLite。"""
         from .registry import unregister_life_engine_service
 
         pending_before_stop = len(self._pending_events)
@@ -3479,15 +3769,21 @@ class LifeEngineService(BaseService):
         if self._stop_event is not None:
             self._stop_event.set()
 
-        from .error_handling import safe_cancel_task
+        await self._await_managed_task(self._memory_index_task_id, timeout=10.0)
+        self._memory_index_task_id = None
+        await self._await_managed_task(self._heartbeat_task_id, timeout=5.0)
+        self._heartbeat_task_id = None
+        await self._await_managed_task(self._snn_tick_task_id, timeout=5.0)
+        self._snn_tick_task_id = None
 
-        if self._heartbeat_task_id:
-            safe_cancel_task(self._heartbeat_task_id, get_task_manager())
-            self._heartbeat_task_id = None
-
-        if self._snn_tick_task_id:
-            safe_cancel_task(self._snn_tick_task_id, get_task_manager())
-            self._snn_tick_task_id = None
+        memory_service = self._memory_service
+        if memory_service is not None:
+            try:
+                await memory_service.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"关闭记忆服务失败: {exc}", exc_info=True)
+            finally:
+                self._memory_service = None
 
         try:
             await cleanup_autonomy_schedules(self._cfg().settings.workspace_path)
@@ -3505,6 +3801,117 @@ class LifeEngineService(BaseService):
             log_file_path=str(get_life_log_file()),
             snn_tick_count=self._snn_network.tick_count if self._snn_network else 0,
         )
+
+    async def _run_heartbeat_round(
+        self,
+        *,
+        collect_background_agents: bool,
+    ) -> tuple[str, PreparedHeartbeatContext]:
+        """Run one serialized heartbeat transaction."""
+        async with self._heartbeat_run_lock:
+            self._state.heartbeat_count += 1
+            self._state.last_heartbeat_at = _now_iso()
+            heartbeat_run_id = (
+                f"heartbeat-{self._state.heartbeat_count}-{uuid4().hex[:12]}"
+            )
+
+            try:
+                if self._memory_integration is not None:
+                    await self._memory_integration.maybe_run_daily_decay()
+
+                if self._snn_integration is not None:
+                    await self._snn_integration.heartbeat_pre()
+
+                if collect_background_agents:
+                    try:
+                        await self._collect_background_agent_results()
+                    except Exception as agent_exc:  # noqa: BLE001
+                        logger.warning(
+                            f"收集后台智能体结果异常（已跳过）: {agent_exc}",
+                            exc_info=True,
+                        )
+
+                prepared = await self._prepare_heartbeat_context()
+                log_heartbeat_event(
+                    heartbeat_count=self._state.heartbeat_count,
+                    last_heartbeat_at=self._state.last_heartbeat_at,
+                    pending_message_count=self._state.pending_event_count,
+                    last_wake_context_at=self._state.last_wake_context_at,
+                    last_wake_context_size=self._state.last_wake_context_size,
+                )
+                model_reply = await self._run_heartbeat_model(
+                    prepared.content,
+                    heartbeat_run_id=heartbeat_run_id,
+                )
+                await self._record_model_reply(
+                    model_reply,
+                    heartbeat_run_id=heartbeat_run_id,
+                    persist=False,
+                )
+                await self._commit_heartbeat_context(
+                    prepared,
+                    model_reply,
+                    heartbeat_run_id,
+                )
+
+                if self._snn_integration is not None:
+                    await self._snn_integration.heartbeat_post()
+                return str(model_reply or ""), prepared
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                self._state.last_model_error = str(exc)
+                await self._save_runtime_context()
+                raise
+
+    async def _memory_index_loop(self) -> None:
+        """独立运行 chunk 向量索引，每轮最多处理一批。"""
+        options = self._memory_index_options()
+        interval = int(options["interval_seconds"])
+        run_immediately = bool(options["run_on_startup"])
+        retry_failed_once = bool(options["retry_failed"])
+
+        try:
+            while self._state.running:
+                if not run_immediately:
+                    stop_event = self._stop_event
+                    if stop_event is not None:
+                        try:
+                            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                            break
+                        except asyncio.TimeoutError:
+                            pass
+                    else:
+                        await asyncio.sleep(interval)
+                run_immediately = False
+
+                if not self._state.running or self._memory_service is None:
+                    break
+
+                try:
+                    report = await self._memory_service.run_index_worker(
+                        limit=int(options["batch_size"]),
+                        retry_failed=retry_failed_once,
+                        reclaim_after=float(options["reclaim_after_seconds"]),
+                    )
+                    retry_failed_once = False
+                    logger.info(
+                        "life_engine 记忆索引批次完成: "
+                        f"claimed={report.claimed} completed={len(report.completed)} "
+                        f"failed={len(report.failed)} stale={len(report.stale)}"
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    retry_failed_once = False
+                    logger.error(f"life_engine 记忆索引批次失败: {exc}", exc_info=True)
+
+                if self._stop_event is not None and self._stop_event.is_set():
+                    break
+        except asyncio.CancelledError:
+            raise
+        finally:
+            logger.info("life_engine 记忆索引循环已停止")
 
     async def _heartbeat_loop(self) -> None:
         """心跳循环。"""
@@ -3579,39 +3986,12 @@ class LifeEngineService(BaseService):
                 if self._state.self_pause_until:
                     await self.clear_self_pause(source="expired")
 
-                self._state.heartbeat_count += 1
-                self._state.last_heartbeat_at = _now_iso()
-
-                # 每日记忆衰减
-                if self._memory_integration is not None:
-                    await self._memory_integration.maybe_run_daily_decay()
-
-                # SNN 心跳前更新
-                if self._snn_integration is not None:
-                    await self._snn_integration.heartbeat_pre()
-
-                # 收集后台智能体结果
+                injected_content = ""
                 try:
-                    await self._collect_background_agent_results()
-                except Exception as _agent_exc:  # noqa: BLE001
-                    logger.warning(f"收集后台智能体结果异常（已跳过）: {_agent_exc}", exc_info=True)
-
-                injected_content = await self.inject_wake_context()
-                log_heartbeat_event(
-                    heartbeat_count=self._state.heartbeat_count,
-                    last_heartbeat_at=self._state.last_heartbeat_at,
-                    pending_message_count=self._state.pending_event_count,
-                    last_wake_context_at=self._state.last_wake_context_at,
-                    last_wake_context_size=self._state.last_wake_context_size,
-                )
-
-                try:
-                    model_reply = await self._run_heartbeat_model(injected_content)
-                    await self._record_model_reply(model_reply)
-
-                    # SNN 心跳后更新
-                    if self._snn_integration is not None:
-                        await self._snn_integration.heartbeat_post()
+                    model_reply, prepared = await self._run_heartbeat_round(
+                        collect_background_agents=True,
+                    )
+                    injected_content = prepared.content
 
                     # 白天小憩检查
                     if self._dream_scheduler is not None and self._dream_scheduler.should_dream(
@@ -3631,7 +4011,6 @@ class LifeEngineService(BaseService):
                             )
                         except Exception as nap_exc:  # noqa: BLE001
                             logger.error(f"白天小憩执行异常: {nap_exc}", exc_info=True)
-
                 except Exception as exc:  # noqa: BLE001
                     self._state.last_model_error = str(exc)
                     log_error(
@@ -3682,30 +4061,9 @@ class LifeEngineService(BaseService):
         logger.info("life_engine 手动触发心跳")
 
         try:
-            self._state.heartbeat_count += 1
-            self._state.last_heartbeat_at = _now_iso()
-
-            if self._memory_integration is not None:
-                await self._memory_integration.maybe_run_daily_decay()
-
-            if self._snn_integration is not None:
-                await self._snn_integration.heartbeat_pre()
-
-            injected_content = await self.inject_wake_context()
-
-            log_heartbeat_event(
-                heartbeat_count=self._state.heartbeat_count,
-                last_heartbeat_at=self._state.last_heartbeat_at,
-                pending_message_count=self._state.pending_event_count,
-                last_wake_context_at=self._state.last_wake_context_at,
-                last_wake_context_size=self._state.last_wake_context_size,
+            model_reply, prepared = await self._run_heartbeat_round(
+                collect_background_agents=False,
             )
-
-            model_reply = await self._run_heartbeat_model(injected_content)
-            await self._record_model_reply(model_reply)
-
-            if self._snn_integration is not None:
-                await self._snn_integration.heartbeat_post()
 
             logger.info(
                 f"life_engine 手动心跳完成 #{self._state.heartbeat_count}: "

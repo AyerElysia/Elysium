@@ -33,7 +33,7 @@ class AttentionRouter:
         max_summary_events: int = 8,
     ) -> None:
         self.max_events = max(1, int(max_events))
-        self.max_chars = max(500, int(max_chars))
+        self.max_chars = max(0, int(max_chars))
         self.max_summary_events = max(1, int(max_summary_events))
 
     def select(
@@ -49,8 +49,10 @@ class AttentionRouter:
         limit_chars = max_chars if max_chars is not None else self.max_chars
 
         candidates = [
-            event for event in sorted(events, key=lambda item: int(item.sequence or 0))
-            if int(event.sequence or 0) > int(cursor or 0)
+            event
+            for event in sorted(events, key=lambda item: int(item.sequence or 0))
+            if event.event_type != EventType.SUMMARY
+            and int(event.sequence or 0) > int(cursor or 0)
         ]
         high_water = max((int(event.sequence or 0) for event in candidates), default=int(cursor or 0))
         if not candidates:
@@ -69,10 +71,13 @@ class AttentionRouter:
                 + 32
             )
 
-        # Sort candidates by priority (highest score first, then earliest sequence first)
+        # Sort by priority, then prefer the newest event on equal scores.
         scored_candidates = sorted(
             candidates,
-            key=lambda e: (self._score_event(e, current_stream_id=current_stream_id), -int(e.sequence or 0)),
+            key=lambda e: (
+                self._score_event(e, current_stream_id=current_stream_id),
+                int(e.sequence or 0),
+            ),
             reverse=True,
         )
 
@@ -92,16 +97,29 @@ class AttentionRouter:
         selected.sort(key=lambda event: int(event.sequence or 0))
 
         summary_events = self._summarize_omitted(omitted) if omitted else []
+        remaining_chars = max(0, int(limit_chars) - current_chars)
+        if summary_events:
+            summary_event = summary_events[0]
+            fixed_size = self._events_text_size([summary_event]) - len(summary_event.content)
+            content_budget = remaining_chars - fixed_size
+            if content_budget <= 0:
+                summary_events = []
+            elif len(summary_event.content) > content_budget:
+                summary_event.content = _shorten_text(
+                    summary_event.content,
+                    max_length=content_budget,
+                )
 
+        summary_chars = self._events_text_size(summary_events)
+        context_char_count = current_chars + summary_chars
         return AttentionWindow(
             selected_events=selected,
             summary_events=summary_events,
             high_water=high_water,
             dropped_count=len(omitted),
             source_stats=source_stats,
-            context_char_count=current_chars + self._events_text_size(summary_events),
+            context_char_count=context_char_count,
         )
-
 
     @staticmethod
     def _events_text_size(events: list[LifeEngineEvent]) -> int:
@@ -164,21 +182,25 @@ class AttentionRouter:
         lines: list[str] = []
         max_sequence = max(int(event.sequence or 0) for event in events)
         for (source, content_type), grouped in ranked:
-            latest = grouped[-1]
-            sample = _shorten_text(str(latest.content or ""), max_length=80)
-            lines.append(f"- {source}/{content_type}: {len(grouped)} 条，最新：{sample}")
+            ordered = sorted(grouped, key=lambda event: int(event.sequence or 0))
+            first = _shorten_text(str(ordered[0].content or ""), max_length=60)
+            latest = _shorten_text(str(ordered[-1].content or ""), max_length=60)
+            if first == latest:
+                sample = f"样本：{first}"
+            else:
+                sample = f"首条：{first}；最新：{latest}"
+            lines.append(f"- {source}/{content_type}: {len(grouped)} 条，{sample}")
 
         content = "潜意识已压缩低显著事件：\n" + "\n".join(lines)
         return [
             LifeEngineEvent(
                 event_id=f"attention_summary_{max_sequence}",
-                event_type=EventType.HEARTBEAT,
+                event_type=EventType.SUMMARY,
                 timestamp=_now_iso(),
                 sequence=max_sequence,
                 source="system",
                 source_detail="注意力路由 | 潜意识摘要",
                 content=content,
                 content_type="attention_summary",
-                heartbeat_index=-1,
             )
         ]

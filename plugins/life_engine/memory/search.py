@@ -7,18 +7,30 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 from src.app.plugin_system.api import log_api
 
 if TYPE_CHECKING:
     pass
 
+from .edges import EdgeType, EXPLICIT_RELATION_EDGE_TYPES, row_to_edge
+from .eligibility import (
+    assess_document_path,
+    assess_workspace_document,
+    eligible_document_path_sql,
+    is_eligible_indexed_document_path,
+    register_indexed_path_sql_function,
+)
 from .nodes import MemoryNode, row_to_node
-from .edges import get_edges_from
+from .temporal import parse_temporal_date
 
 logger = log_api.get_logger("life_engine.memory.search")
 
@@ -48,6 +60,137 @@ class SearchResult:
     source: str  # 'direct' | 'associated'
     association_path: List[str] = field(default_factory=list)
     association_reason: str = ""
+    score_kind: str = "rank"
+
+
+@dataclass(frozen=True)
+class ChunkSearchResult:
+    """A chunk-level full-text hit."""
+
+    node_id: str
+    chunk_id: str
+    score: float
+    snippet: str
+    chunk_index: int
+
+
+@dataclass(frozen=True)
+class EmbeddingResult:
+    """Validated embedding batch with the provider model retained."""
+
+    embeddings: List[List[float]]
+    model_name: str = ""
+
+    @property
+    def dimension(self) -> int:
+        return len(self.embeddings[0]) if self.embeddings else 0
+
+    def __iter__(self):
+        return iter(self.embeddings)
+
+    def __len__(self) -> int:
+        return len(self.embeddings)
+
+    def __getitem__(self, index: int) -> List[float]:
+        return self.embeddings[index]
+
+
+@dataclass
+class SearchDiagnostics:
+    """Read-only diagnostics for one search execution."""
+
+    degraded: bool = False
+    fts_success: bool = False
+    vector_success: bool = False
+    fts_candidate_count: int = 0
+    vector_candidate_count: int = 0
+    phase_timings: Dict[str, float] = field(default_factory=dict)
+    error_types: Dict[str, str] = field(default_factory=dict)
+    errors: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class DetailedSearchResult:
+    """Search results together with non-sensitive execution diagnostics."""
+
+    results: List[SearchResult]
+    diagnostics: SearchDiagnostics
+
+    @property
+    def degraded(self) -> bool:
+        return self.diagnostics.degraded
+
+    @property
+    def fts_success(self) -> bool:
+        return self.diagnostics.fts_success
+
+    @property
+    def vector_success(self) -> bool:
+        return self.diagnostics.vector_success
+
+    @property
+    def fts_candidate_count(self) -> int:
+        return self.diagnostics.fts_candidate_count
+
+    @property
+    def vector_candidate_count(self) -> int:
+        return self.diagnostics.vector_candidate_count
+
+    @property
+    def phase_timings(self) -> Dict[str, float]:
+        return self.diagnostics.phase_timings
+
+    @property
+    def error_types(self) -> Dict[str, str]:
+        return self.diagnostics.error_types
+
+    @property
+    def errors(self) -> Dict[str, str]:
+        return self.diagnostics.errors
+
+
+def _query_metadata(query: str) -> Dict[str, Any]:
+    """Return safe query metadata for optional visual events."""
+    value = str(query or "")
+    return {
+        "query_length": len(value),
+        "query_hash": hashlib.sha256(value.encode("utf-8")).hexdigest()[:16],
+    }
+
+
+def _short_error(exc: BaseException) -> str:
+    """Return only an error type so query text cannot enter diagnostics."""
+    return type(exc).__name__
+
+
+@dataclass
+class _FtsSearchOutcome:
+    results: List[ChunkSearchResult]
+    success: bool
+    degraded: bool = False
+    error_type: str | None = None
+    error: str = ""
+
+
+@dataclass
+class _VectorSearchOutcome:
+    results: List[Tuple[str, float]]
+    success: bool
+    degraded: bool = False
+    error_type: str | None = None
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class _LoadedNode:
+    node_id: str
+    file_path: str
+    title: str
+    event_date: str | None
+    is_deleted: bool
+    source_mtime: float | None
+    created_at: float
+    preview_content: str
 
 
 # ============================================================
@@ -70,32 +213,60 @@ async def get_chroma_collection(db_path: str) -> Any:
     return await vector_service.get_or_create_collection("life_memory")
 
 
-async def embed_text(text: str) -> List[float]:
-    """生成文本的 embedding 向量。
+async def embed_texts(texts: Iterable[str]) -> EmbeddingResult:
+    """Generate one validated embedding batch and retain the provider model."""
+    values = [str(text) for text in texts]
+    if not values:
+        raise ValueError("Embedding 输入不能为空")
 
-    Args:
-        text: 输入文本
-
-    Returns:
-        embedding 向量
-    """
-    from src.app.plugin_system.api.llm_api import create_embedding_request, get_model_set_by_task
+    from src.app.plugin_system.api.llm_api import (
+        create_embedding_request,
+        get_model_set_by_task,
+    )
 
     try:
         model_set = get_model_set_by_task("embedding")
         request = create_embedding_request(
             model_set=model_set,
             request_name="life_memory_embedding",
-            inputs=[text],
+            inputs=values,
         )
         response = await request.send()
-        embeddings = getattr(response, "embeddings", None) or []
-        if not embeddings:
-            raise RuntimeError("Embedding 请求返回为空")
-        return [float(v) for v in embeddings[0]]
-    except Exception as e:
-        logger.error(f"Embedding 生成失败: {e}")
+        raw_embeddings = getattr(response, "embeddings", None)
+        if raw_embeddings is None:
+            raise RuntimeError("Embedding 响应缺少向量")
+        if len(raw_embeddings) != len(values):
+            raise ValueError(
+                f"Embedding 数量不匹配: expected={len(values)}, actual={len(raw_embeddings)}"
+            )
+
+        normalized: List[List[float]] = []
+        dimension: int | None = None
+        for index, raw_vector in enumerate(raw_embeddings):
+            if raw_vector is None:
+                raise ValueError(f"Embedding 向量为空: index={index}")
+            vector = [float(value) for value in raw_vector]
+            if not vector:
+                raise ValueError(f"Embedding 向量为空: index={index}")
+            if dimension is None:
+                dimension = len(vector)
+            elif len(vector) != dimension:
+                raise ValueError("Embedding 向量维度不一致")
+            normalized.append(vector)
+
+        return EmbeddingResult(
+            embeddings=normalized,
+            model_name=str(getattr(response, "model_name", "") or ""),
+        )
+    except Exception as exc:
+        logger.error(f"Embedding 生成失败: {type(exc).__name__}")
         raise
+
+
+async def embed_text(text: str) -> List[float]:
+    """Generate one embedding while preserving the historical API."""
+    result = await embed_texts([text])
+    return result.embeddings[0]
 
 
 async def sync_embedding(
@@ -116,23 +287,28 @@ async def sync_embedding(
     """
     from .nodes import get_node_by_file_path
 
+    eligibility = assess_document_path(file_path)
+    if not eligibility.eligible:
+        return
+    normalized_path = eligibility.path
     if get_node_by_file_path_func:
-        node = await get_node_by_file_path_func(file_path)
+        node = await get_node_by_file_path_func(normalized_path)
     else:
-        node = await get_node_by_file_path(db, file_path)
+        node = await get_node_by_file_path(db, normalized_path)
     if not node:
         return
 
     try:
         embedding = await embed_text(content[:3000])
 
-        collection.upsert(
+        await asyncio.to_thread(
+            collection.upsert,
             ids=[node.node_id],
             embeddings=[embedding],
             documents=[content[:500]],
             metadatas=[
                 {
-                    "file_path": file_path,
+                    "file_path": normalized_path,
                     "title": node.title,
                     "created_at": node.created_at,
                 }
@@ -153,58 +329,275 @@ async def sync_embedding(
         logger.error(f"同步 embedding 失败 ({file_path}): {e}")
 
 
+def _collection_metadata(collection: Any) -> Dict[str, Any]:
+    metadata = getattr(collection, "metadata", None)
+    if isinstance(metadata, dict):
+        return dict(metadata)
+    return {}
+
+
+def _is_chunk_collection(collection: Any) -> bool:
+    if collection is None:
+        return False
+    metadata = _collection_metadata(collection)
+    kind = str(metadata.get("collection_kind") or metadata.get("kind") or "").lower()
+    if "chunk" in kind or metadata.get("chunk_index_version") is not None:
+        return True
+    name = str(getattr(collection, "name", "") or "").lower()
+    return "life_memory_chunks" in name
+
+
+def _first_query_values(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return []
+        first = value[0]
+        if isinstance(first, (list, tuple)):
+            return list(first)
+        return list(value)
+    return [value]
+
+
+def _current_chunk_map(
+    db: sqlite3.Connection,
+    chunk_ids: Sequence[str],
+) -> Dict[str, Tuple[str, str, int]]:
+    """Map only current SQLite chunks to their owning document revision."""
+    ordered = list(dict.fromkeys(str(value) for value in chunk_ids if value))
+    if not ordered or not _table_exists(db, "memory_chunks"):
+        return {}
+    placeholders = ",".join("?" for _ in ordered)
+    rows = db.execute(
+        "SELECT c.chunk_id, c.node_id, n.content_hash, n.index_revision "
+        "FROM memory_chunks c JOIN memory_nodes n ON n.node_id = c.node_id "
+        f"WHERE c.chunk_id IN ({placeholders}) AND COALESCE(n.is_deleted, 0) = 0",
+        ordered,
+    ).fetchall()
+    return {
+        str(row["chunk_id"]): (
+            str(row["node_id"]),
+            str(row["content_hash"] or ""),
+            int(row["index_revision"] or 0),
+        )
+        for row in rows
+    }
+
+
+async def _query_vector_collection(
+    collection: Any,
+    query_embedding: Sequence[float],
+    top_k: int,
+    *,
+    chunk_mode: bool,
+    db: sqlite3.Connection | None,
+) -> _VectorSearchOutcome:
+    """Query and normalize one vector collection without generating embeddings."""
+    try:
+        include = ["metadatas", "distances"] if chunk_mode else ["distances"]
+        results = await asyncio.to_thread(
+            collection.query,
+            query_embeddings=[list(query_embedding)],
+            n_results=max(0, int(top_k)),
+            include=include,
+        )
+        ids = _first_query_values(results.get("ids") if isinstance(results, dict) else None)
+        distances = _first_query_values(
+            results.get("distances") if isinstance(results, dict) else None
+        )
+        metadatas = _first_query_values(
+            results.get("metadatas") if isinstance(results, dict) else None
+        )
+        if not ids:
+            return _VectorSearchOutcome(results=[], success=True)
+
+        degraded = False
+        error_type: str | None = None
+        raw_pairs: List[Tuple[str, float]] = []
+        result_ids = [str(value) for value in ids]
+        current_chunks = (
+            await _async_db_read(_current_chunk_map, db, result_ids)
+            if chunk_mode and db is not None
+            else {}
+        )
+        best_by_node: Dict[str, float] = {}
+        for index, result_id in enumerate(result_ids):
+            metadata = metadatas[index] if index < len(metadatas) else {}
+            metadata = metadata if isinstance(metadata, dict) else {}
+            resolved_id = result_id
+            if chunk_mode:
+                current = current_chunks.get(result_id)
+                if db is not None and current is None:
+                    degraded = True
+                    error_type = error_type or "StaleChunkVector"
+                    continue
+                if current is not None:
+                    node_id, document_hash, index_revision = current
+                    metadata_node_id = str(metadata.get("node_id") or "")
+                    metadata_hash = str(metadata.get("document_hash") or "")
+                    metadata_revision = metadata.get("index_revision")
+                    try:
+                        revision_mismatch = (
+                            metadata_revision is not None
+                            and int(metadata_revision) != index_revision
+                        )
+                    except (TypeError, ValueError):
+                        revision_mismatch = True
+                    if (
+                        (metadata_node_id and metadata_node_id != node_id)
+                        or (metadata_hash and metadata_hash != document_hash)
+                        or revision_mismatch
+                    ):
+                        degraded = True
+                        error_type = error_type or "StaleChunkVector"
+                        continue
+                    resolved_id = node_id
+                else:
+                    resolved_id = str(metadata.get("node_id") or "")
+                    if not resolved_id:
+                        degraded = True
+                        error_type = error_type or "ChunkMetadataUnavailable"
+                        continue
+
+            distance = distances[index] if index < len(distances) else 0.0
+            similarity = 1.0 / (1.0 + float(distance))
+            if chunk_mode:
+                best_by_node[resolved_id] = max(
+                    best_by_node.get(resolved_id, 0.0), similarity
+                )
+            else:
+                raw_pairs.append((resolved_id, similarity))
+        if chunk_mode:
+            raw_pairs = list(best_by_node.items())
+        return _VectorSearchOutcome(
+            results=raw_pairs,
+            success=True,
+            degraded=degraded,
+            error_type=error_type,
+        )
+    except Exception as exc:
+        logger.warning(f"向量检索降级: {type(exc).__name__}")
+        return _VectorSearchOutcome(
+            results=[],
+            success=False,
+            degraded=True,
+            error_type=type(exc).__name__,
+            error=_short_error(exc),
+        )
+
+
+async def _filter_vector_outcome(
+    outcome: _VectorSearchOutcome,
+    filter_existing_func: Any,
+    db: sqlite3.Connection | None,
+    *,
+    chunk_mode: bool,
+) -> _VectorSearchOutcome:
+    raw_pairs = outcome.results
+    if filter_existing_func:
+        filtered_pairs, stale_ids = await filter_existing_func(raw_pairs)
+        if stale_ids:
+            logger.warning(f"向量检索命中 {len(stale_ids)} 个脏节点ID（节点表不存在），已忽略")
+        raw_pairs = filtered_pairs
+    elif chunk_mode and db is not None:
+        raw_pairs, _ = await filter_existing_scores(db, raw_pairs)
+    outcome.results = raw_pairs
+    return outcome
+
+
+async def _vector_search_outcome(
+    query: str,
+    collection: Any,
+    top_k: int,
+    filter_existing_func: Any = None,
+    *,
+    db: sqlite3.Connection | None = None,
+    chunk_collection: Any = None,
+) -> _VectorSearchOutcome:
+    """Prefer chunk vectors, with an explicit degraded legacy-node fallback."""
+    target = chunk_collection if chunk_collection is not None else collection
+    chunk_mode = chunk_collection is not None or _is_chunk_collection(target)
+    if target is None:
+        return _VectorSearchOutcome(
+            results=[],
+            success=False,
+            degraded=True,
+            error_type="CollectionUnavailable",
+            error="vector collection unavailable",
+        )
+    try:
+        query_embedding = await embed_text(query)
+        primary = await _query_vector_collection(
+            target,
+            query_embedding,
+            top_k,
+            chunk_mode=chunk_mode,
+            db=db,
+        )
+
+        has_legacy_fallback = (
+            chunk_mode
+            and collection is not None
+            and collection is not target
+            and not _is_chunk_collection(collection)
+        )
+        if has_legacy_fallback and (not primary.success or not primary.results):
+            legacy = await _query_vector_collection(
+                collection,
+                query_embedding,
+                top_k,
+                chunk_mode=False,
+                db=db,
+            )
+            if legacy.success:
+                legacy.degraded = True
+                legacy.error_type = "LegacyVectorFallback"
+                legacy.error = primary.error
+                return await _filter_vector_outcome(
+                    legacy,
+                    filter_existing_func,
+                    db,
+                    chunk_mode=False,
+                )
+            return legacy
+
+        return await _filter_vector_outcome(
+            primary,
+            filter_existing_func,
+            db,
+            chunk_mode=chunk_mode,
+        )
+    except Exception as exc:
+        logger.warning(f"向量检索降级: {type(exc).__name__}")
+        return _VectorSearchOutcome(
+            results=[],
+            success=False,
+            degraded=True,
+            error_type=type(exc).__name__,
+            error=_short_error(exc),
+        )
+
+
 async def vector_search(
     query: str,
     collection: Any,
     top_k: int = 10,
     filter_existing_func: Any = None,
+    *,
+    db: sqlite3.Connection | None = None,
+    chunk_collection: Any = None,
 ) -> List[Tuple[str, float]]:
-    """向量相似度检索。
-
-    Args:
-        query: 查询文本
-        collection: ChromaDB collection
-        top_k: 返回数量
-        filter_existing_func: 过滤存在节点的函数
-
-    Returns:
-        (node_id, similarity) 列表
-    """
-    try:
-        query_embedding = await embed_text(query)
-
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=top_k,
-            include=["distances"],
-        )
-
-        if not results["ids"] or not results["ids"][0]:
-            return []
-
-        # ChromaDB 返回的是距离，转换为相似度
-        raw_pairs: List[Tuple[str, float]] = []
-        for node_id, distance in zip(results["ids"][0], results["distances"][0]):
-            similarity = 1.0 / (1.0 + distance)
-            raw_pairs.append((node_id, similarity))
-
-        # 过滤掉向量库存在但节点表不存在的脏 ID
-        if filter_existing_func:
-            filtered_pairs, stale_ids = await filter_existing_func(raw_pairs)
-            if stale_ids:
-                logger.warning(
-                    f"向量检索命中 {len(stale_ids)} 个脏节点ID（节点表不存在），已忽略: {stale_ids[:5]}"
-                )
-                try:
-                    collection.delete(ids=stale_ids)
-                except Exception as cleanup_err:
-                    logger.debug(f"清理向量库脏节点失败: {cleanup_err}")
-            return filtered_pairs
-
-        return raw_pairs
-    except Exception as e:
-        logger.error(f"向量检索失败: {e}")
-        return []
+    """向量相似度检索，保留旧 ``(node_id, score)`` API。"""
+    outcome = await _vector_search_outcome(
+        query,
+        collection,
+        top_k,
+        filter_existing_func,
+        db=db,
+        chunk_collection=chunk_collection,
+    )
+    return outcome.results
 
 
 # ============================================================
@@ -212,54 +605,520 @@ async def vector_search(
 # ============================================================
 
 
+def _fts_terms(query: str) -> List[str]:
+    """Extract safe literal terms without exposing FTS query syntax."""
+    terms = re.findall(r"[\w\u3400-\u9fff]+", str(query or ""), flags=re.UNICODE)
+    if not terms and str(query or "").strip():
+        terms = [str(query).strip()]
+    result: List[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        normalized = term.casefold()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(term)
+        if len(result) >= 16:
+            break
+    return result
+
+
 def _sanitize_fts_query(query: str) -> str:
-    """将查询文本转义为合法的 SQLite FTS5 MATCH 参数。
-
-    FTS5 会把裸数字解释为列号（导致 "no such column: N"），
-    把含特殊运算符的字符串解释为查询语法。
-    通过双引号包裹整个 query 可强制按字面量搜索。
-    内部已有的双引号需先转义（"" 是 FTS5 的引号转义方式）。
-    """
-    escaped = query.replace('"', '""')
-    return f'"{escaped}"'
+    """Build a safe OR query so multiple terms need not form one phrase."""
+    quoted = []
+    for term in _fts_terms(query):
+        quoted.append(f'"{term.replace(chr(34), chr(34) * 2)}"')
+    return " OR ".join(quoted)
 
 
-async def fts_search(db: sqlite3.Connection, query: str, top_k: int = 10) -> List[Tuple[str, float]]:
-    """全文搜索。
+def _normalize_file_types(file_types: Optional[List[str]]) -> tuple[str, ...]:
+    suffixes: List[str] = []
+    for value in file_types or []:
+        suffix = str(value or "").strip().lower()
+        if not suffix:
+            continue
+        suffix = "." + suffix.lstrip(".")
+        if suffix not in suffixes:
+            suffixes.append(suffix)
+    return tuple(suffixes)
 
-    Args:
-        db: SQLite 数据库连接
-        query: 查询文本
-        top_k: 返回数量
 
-    Returns:
-        (node_id, score) 列表
-    """
-    safe_query = _sanitize_fts_query(query)
+def _matches_file_type(file_path: str, file_types: Optional[List[str]]) -> bool:
+    suffixes = _normalize_file_types(file_types)
+    return not suffixes or str(file_path or "").lower().endswith(suffixes)
 
-    def _do_db_work() -> List[Tuple[str, float]]:
-        cursor = db.cursor()
-        # 使用 FTS5 的 BM25 排序
-        cursor.execute(
-            """
-            SELECT node_id, bm25(memory_fts) as score
+
+def _table_exists(db: sqlite3.Connection, table: str) -> bool:
+    return db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'virtual table') AND name = ?",
+        (table,),
+    ).fetchone() is not None
+
+
+def _table_columns(db: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+async def _async_db_read(func: Any, *args: Any) -> Any:
+    """Run a SQLite read off-loop, falling back for thread-bound test connections."""
+    try:
+        return await asyncio.to_thread(func, *args)
+    except sqlite3.ProgrammingError as exc:
+        if "created in a thread" not in str(exc):
+            raise
+        return func(*args)
+
+
+def _node_filter_sql(
+    db: sqlite3.Connection,
+    *,
+    alias: str,
+    event_date: date | str | None,
+    file_types: Optional[List[str]],
+    min_event_date: date | str | None = None,
+) -> tuple[str, List[Any]]:
+    register_indexed_path_sql_function(db)
+    columns = _table_columns(db, "memory_nodes")
+    clauses = [f"{alias}.file_path IS NOT NULL", f"TRIM({alias}.file_path) <> ''"]
+    params: List[Any] = []
+    if "node_type" in columns:
+        clauses.append(f"lower(COALESCE({alias}.node_type, 'file')) = 'file'")
+    if "is_deleted" in columns:
+        clauses.append(f"COALESCE({alias}.is_deleted, 0) = 0")
+    if event_date is not None:
+        if "event_date" not in columns:
+            clauses.append("1 = 0")
+        else:
+            target = event_date.isoformat() if isinstance(event_date, date) else str(event_date)
+            clauses.append(f"{alias}.event_date = ?")
+            params.append(target)
+    elif min_event_date is not None and "event_date" in columns:
+        target = (
+            min_event_date.isoformat()
+            if isinstance(min_event_date, date)
+            else str(min_event_date)
+        )
+        clauses.append(f"({alias}.event_date IS NULL OR {alias}.event_date >= ?)")
+        params.append(target)
+    suffixes = _normalize_file_types(file_types)
+    if suffixes:
+        suffix_clauses: List[str] = []
+        for suffix in suffixes:
+            suffix_clauses.append(
+                f"substr(lower({alias}.file_path), -length(?)) = ?"
+            )
+            params.extend((suffix, suffix))
+        clauses.append("(" + " OR ".join(suffix_clauses) + ")")
+    eligibility_sql, eligibility_params = eligible_document_path_sql(f"{alias}.file_path")
+    clauses.append(eligibility_sql)
+    params.extend(eligibility_params)
+    return " AND ".join(clauses), params
+
+
+def _make_snippet(content: str, query: str, max_chars: int = 300) -> str:
+    """Return a bounded excerpt around the first literal query term."""
+    text = str(content or "")
+    limit = max(1, int(max_chars))
+    if len(text) <= limit:
+        return text
+    lowered = text.casefold()
+    positions = [
+        lowered.find(term.casefold())
+        for term in _fts_terms(query)
+        if term and lowered.find(term.casefold()) >= 0
+    ]
+    hit = min(positions) if positions else 0
+    start = max(0, hit - limit // 3)
+    end = min(len(text), start + limit)
+    start = max(0, end - limit)
+    snippet = text[start:end]
+    if start > 0 and snippet:
+        snippet = "…" + snippet[1:]
+    if end < len(text) and snippet:
+        snippet = snippet[:-1] + "…"
+    return snippet
+
+
+def _chunk_fts_rows(
+    db: sqlite3.Connection,
+    query: str,
+    top_k: int,
+    event_date: date | str | None,
+    file_types: Optional[List[str]],
+) -> List[ChunkSearchResult]:
+    if not _table_exists(db, "memory_chunks_fts") or not _table_exists(db, "memory_chunks"):
+        raise RuntimeError("chunk FTS unavailable")
+    match_query = _sanitize_fts_query(query)
+    if not match_query:
+        return []
+    filter_sql, filter_params = _node_filter_sql(
+        db,
+        alias="n",
+        event_date=event_date,
+        file_types=file_types,
+    )
+    raw_limit = max(max(0, int(top_k)) * 4, max(0, int(top_k)))
+    rows = db.execute(
+        f"""
+        SELECT c.node_id, c.chunk_id, c.chunk_index, c.content,
+               bm25(memory_chunks_fts) AS fts_rank
+        FROM memory_chunks_fts
+        JOIN memory_chunks AS c
+          ON c.chunk_id = memory_chunks_fts.chunk_id
+         AND c.node_id = memory_chunks_fts.node_id
+        JOIN memory_nodes AS n ON n.node_id = c.node_id
+        WHERE memory_chunks_fts MATCH ? AND {filter_sql}
+        ORDER BY fts_rank, c.node_id, c.chunk_index
+        LIMIT ?
+        """,
+        [match_query, *filter_params, raw_limit],
+    ).fetchall()
+    results: List[ChunkSearchResult] = []
+    seen_nodes: set[str] = set()
+    for row in rows:
+        node_id = str(row["node_id"])
+        if node_id in seen_nodes:
+            continue
+        seen_nodes.add(node_id)
+        results.append(
+            ChunkSearchResult(
+                node_id=node_id,
+                chunk_id=str(row["chunk_id"]),
+                score=abs(float(row["fts_rank"] or 0.0)),
+                snippet=_make_snippet(str(row["content"] or ""), query),
+                chunk_index=int(row["chunk_index"] or 0),
+            )
+        )
+        if len(results) >= max(0, int(top_k)):
+            break
+    return results
+
+
+def _like_match_score(content: str, terms: List[str]) -> float:
+    lowered = str(content or "").casefold()
+    score = 0.0
+    for term in terms:
+        normalized = term.casefold()
+        if normalized:
+            score += float(lowered.count(normalized))
+    return score
+
+
+def _chunk_like_rows(
+    db: sqlite3.Connection,
+    query: str,
+    top_k: int,
+    event_date: date | str | None,
+    file_types: Optional[List[str]],
+) -> List[ChunkSearchResult]:
+    """Unicode-safe fallback which does not depend on an FTS tokenizer."""
+    if not _table_exists(db, "memory_chunks"):
+        raise RuntimeError("chunk table unavailable")
+    terms = _fts_terms(query)
+    if not terms:
+        return []
+    filter_sql, filter_params = _node_filter_sql(
+        db,
+        alias="n",
+        event_date=event_date,
+        file_types=file_types,
+    )
+    term_clauses: List[str] = []
+    term_params: List[Any] = []
+    for term in terms:
+        term_clauses.append(
+            "(instr(lower(COALESCE(c.content, '')), lower(?)) > 0 "
+            "OR instr(lower(COALESCE(c.title, '')), lower(?)) > 0)"
+        )
+        term_params.extend((term, term))
+    raw_limit = max(100, max(1, int(top_k)) * 16)
+    rows = db.execute(
+        f"""
+        SELECT c.node_id, c.chunk_id, c.chunk_index, c.content
+        FROM memory_chunks AS c
+        JOIN memory_nodes AS n ON n.node_id = c.node_id
+        WHERE ({' OR '.join(term_clauses)}) AND {filter_sql}
+        LIMIT ?
+        """,
+        [*term_params, *filter_params, raw_limit],
+    ).fetchall()
+    ranked = sorted(
+        rows,
+        key=lambda row: (
+            -_like_match_score(str(row["content"] or ""), terms),
+            int(row["chunk_index"] or 0),
+            str(row["node_id"]),
+        ),
+    )
+    results: List[ChunkSearchResult] = []
+    seen_nodes: set[str] = set()
+    for row in ranked:
+        node_id = str(row["node_id"])
+        if node_id in seen_nodes:
+            continue
+        seen_nodes.add(node_id)
+        results.append(
+            ChunkSearchResult(
+                node_id=node_id,
+                chunk_id=str(row["chunk_id"]),
+                score=_like_match_score(str(row["content"] or ""), terms),
+                snippet=_make_snippet(str(row["content"] or ""), query),
+                chunk_index=int(row["chunk_index"] or 0),
+            )
+        )
+        if len(results) >= max(0, int(top_k)):
+            break
+    return results
+
+
+def _legacy_like_rows(
+    db: sqlite3.Connection,
+    query: str,
+    top_k: int,
+    event_date: date | str | None,
+    file_types: Optional[List[str]],
+) -> List[ChunkSearchResult]:
+    if not _table_exists(db, "memory_fts"):
+        raise RuntimeError("legacy FTS unavailable")
+    terms = _fts_terms(query)
+    if not terms:
+        return []
+    filter_sql, filter_params = _node_filter_sql(
+        db,
+        alias="n",
+        event_date=event_date,
+        file_types=file_types,
+    )
+    term_clauses: List[str] = []
+    term_params: List[Any] = []
+    for term in terms:
+        term_clauses.append(
+            "(instr(lower(COALESCE(memory_fts.content, '')), lower(?)) > 0 "
+            "OR instr(lower(COALESCE(memory_fts.title, '')), lower(?)) > 0)"
+        )
+        term_params.extend((term, term))
+    rows = db.execute(
+        f"""
+        SELECT memory_fts.node_id, memory_fts.content
+        FROM memory_fts
+        JOIN memory_nodes AS n ON n.node_id = memory_fts.node_id
+        WHERE ({' OR '.join(term_clauses)}) AND {filter_sql}
+        LIMIT ?
+        """,
+        [*term_params, *filter_params, max(100, max(1, int(top_k)) * 16)],
+    ).fetchall()
+    ranked = sorted(
+        rows,
+        key=lambda row: (
+            -_like_match_score(str(row["content"] or ""), terms),
+            str(row["node_id"]),
+        ),
+    )
+    return [
+        ChunkSearchResult(
+            node_id=str(row["node_id"]),
+            chunk_id=f"legacy:{row['node_id']}",
+            score=_like_match_score(str(row["content"] or ""), terms),
+            snippet=_make_snippet(str(row["content"] or ""), query),
+            chunk_index=0,
+        )
+        for row in ranked[: max(0, int(top_k))]
+    ]
+
+
+def _legacy_fts_rows(
+    db: sqlite3.Connection,
+    query: str,
+    top_k: int,
+    event_date: date | str | None,
+    file_types: Optional[List[str]],
+) -> List[ChunkSearchResult]:
+    if not _table_exists(db, "memory_fts"):
+        raise RuntimeError("legacy FTS unavailable")
+    filter_sql, filter_params = _node_filter_sql(
+        db,
+        alias="n",
+        event_date=event_date,
+        file_types=file_types,
+    )
+    sql_row = db.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'memory_fts'"
+    ).fetchone()
+    is_virtual_fts = "using fts" in str(sql_row[0] if sql_row else "").lower()
+    limit = max(0, int(top_k))
+    if is_virtual_fts:
+        match_query = _sanitize_fts_query(query)
+        if not match_query:
+            return []
+        rows = db.execute(
+            f"""
+            SELECT memory_fts.node_id, memory_fts.content,
+                   bm25(memory_fts) AS fts_rank
             FROM memory_fts
-            WHERE memory_fts MATCH ?
-            ORDER BY score
+            JOIN memory_nodes AS n ON n.node_id = memory_fts.node_id
+            WHERE memory_fts MATCH ? AND {filter_sql}
+            ORDER BY fts_rank, memory_fts.node_id
             LIMIT ?
             """,
-            (safe_query, top_k),
+            [match_query, *filter_params, limit],
+        ).fetchall()
+    else:
+        terms = _fts_terms(query)
+        if not terms:
+            return []
+        term_clauses: List[str] = []
+        term_params: List[Any] = []
+        for term in terms:
+            term_clauses.append(
+                "(lower(COALESCE(memory_fts.title, '')) LIKE ? "
+                "OR lower(COALESCE(memory_fts.content, '')) LIKE ?)"
+            )
+            pattern = f"%{term.casefold()}%"
+            term_params.extend((pattern, pattern))
+        rows = db.execute(
+            f"""
+            SELECT memory_fts.node_id, memory_fts.content, 0.0 AS fts_rank
+            FROM memory_fts
+            JOIN memory_nodes AS n ON n.node_id = memory_fts.node_id
+            WHERE ({' OR '.join(term_clauses)}) AND {filter_sql}
+            ORDER BY memory_fts.node_id
+            LIMIT ?
+            """,
+            [*term_params, *filter_params, limit],
+        ).fetchall()
+    return [
+        ChunkSearchResult(
+            node_id=str(row["node_id"]),
+            chunk_id=f"legacy:{row['node_id']}",
+            score=abs(float(row["fts_rank"] or 0.0)),
+            snippet=_make_snippet(str(row["content"] or ""), query),
+            chunk_index=0,
         )
+        for row in rows
+    ]
 
-        results: List[Tuple[str, float]] = []
-        for row in cursor.fetchall():
-            # BM25 返回负数，绝对值越大越相关
-            score = abs(row["score"]) / 10.0  # 归一化
-            results.append((row["node_id"], min(score, 1.0)))
 
-        return results
+async def _chunk_fts_search_outcome(
+    db: sqlite3.Connection,
+    query: str,
+    top_k: int = 10,
+    event_date: date | str | None = None,
+    file_types: Optional[List[str]] = None,
+) -> _FtsSearchOutcome:
+    primary_error: BaseException | None = None
+    primary_succeeded = False
+    try:
+        primary = await _async_db_read(
+            _chunk_fts_rows,
+            db,
+            query,
+            top_k,
+            event_date,
+            file_types,
+        )
+        primary_succeeded = True
+        if primary:
+            return _FtsSearchOutcome(results=primary, success=True)
+    except Exception as exc:
+        primary_error = exc
 
-    return await asyncio.to_thread(_do_db_work)
+    # A unicode61 index cannot tokenize arbitrary Chinese text reliably.  The
+    # bounded literal fallback is only used after FTS misses or is unavailable.
+    literal_succeeded = False
+    try:
+        chunk_fallback = await _async_db_read(
+            _chunk_like_rows,
+            db,
+            query,
+            top_k,
+            event_date,
+            file_types,
+        )
+        literal_succeeded = True
+        if chunk_fallback:
+            return _FtsSearchOutcome(
+                results=chunk_fallback,
+                success=True,
+                degraded=True,
+                error_type=type(primary_error).__name__ if primary_error else "TokenizerFallback",
+            )
+    except Exception as exc:
+        if primary_error is None:
+            primary_error = exc
+
+    try:
+        legacy = await _async_db_read(
+            _legacy_fts_rows,
+            db,
+            query,
+            top_k,
+            event_date,
+            file_types,
+        )
+        if not legacy:
+            legacy = await _async_db_read(
+                _legacy_like_rows,
+                db,
+                query,
+                top_k,
+                event_date,
+                file_types,
+            )
+        if legacy:
+            return _FtsSearchOutcome(
+                results=legacy,
+                success=True,
+                degraded=True,
+                error_type=type(primary_error).__name__ if primary_error else "LegacyFtsFallback",
+            )
+    except Exception as fallback_error:
+        if not primary_succeeded and not literal_succeeded:
+            error = primary_error or fallback_error
+            logger.warning(f"全文检索降级失败: {type(error).__name__}")
+            return _FtsSearchOutcome(
+                results=[],
+                success=False,
+                degraded=True,
+                error_type=type(error).__name__,
+            )
+
+    return _FtsSearchOutcome(
+        results=[],
+        success=True,
+        degraded=primary_error is not None,
+        error_type=type(primary_error).__name__ if primary_error else None,
+    )
+
+
+async def chunk_fts_search(
+    db: sqlite3.Connection,
+    query: str,
+    top_k: int = 10,
+    event_date: date | str | None = None,
+    file_types: Optional[List[str]] = None,
+) -> List[ChunkSearchResult]:
+    """Search chunk FTS first and fall back to the legacy node FTS."""
+    outcome = await _chunk_fts_search_outcome(
+        db,
+        query,
+        top_k,
+        event_date,
+        file_types,
+    )
+    return outcome.results
+
+
+async def fts_search(
+    db: sqlite3.Connection,
+    query: str,
+    top_k: int = 10,
+) -> List[Tuple[str, float]]:
+    """全文搜索，保留旧 ``(node_id, score)`` API。"""
+    results = await chunk_fts_search(db, query, top_k)
+    return [
+        (result.node_id, min(abs(float(result.score)) / 10.0, 1.0))
+        for result in results
+    ]
 
 
 # ============================================================
@@ -301,6 +1160,53 @@ def rrf_fusion(
 # ============================================================
 
 
+def _normalize_allowed_edge_types(
+    allowed_edge_types: Optional[Iterable[EdgeType | str]],
+) -> set[EdgeType]:
+    """规范化扩散允许的边类型；默认只允许显式关系。"""
+    if allowed_edge_types is None:
+        return set(EXPLICIT_RELATION_EDGE_TYPES)
+
+    if isinstance(allowed_edge_types, (EdgeType, str)):
+        values: Iterable[EdgeType | str] = [allowed_edge_types]
+    else:
+        values = allowed_edge_types
+
+    normalized: set[EdgeType] = set()
+    for value in values:
+        if isinstance(value, EdgeType):
+            normalized.add(value)
+            continue
+        try:
+            normalized.add(EdgeType(str(value).strip().lower()))
+        except ValueError:
+            logger.debug(f"忽略未知扩散边类型: {value}")
+    return normalized
+
+
+def _read_edges_from(
+    db: sqlite3.Connection,
+    node_id: str,
+    min_weight: float,
+) -> List[Any]:
+    if not _table_exists(db, "memory_edges"):
+        return []
+    rows = db.execute(
+        "SELECT * FROM memory_edges WHERE source_id = ? AND weight >= ? "
+        "ORDER BY weight DESC",
+        (node_id, min_weight),
+    ).fetchall()
+    return [row_to_edge(row) for row in rows]
+
+
+async def _get_edges_from_readonly(
+    db: sqlite3.Connection,
+    node_id: str,
+    min_weight: float,
+) -> List[Any]:
+    return await _async_db_read(_read_edges_from, db, node_id, min_weight)
+
+
 async def spread_activation(
     db: sqlite3.Connection,
     seed_ids: List[str],
@@ -308,6 +1214,7 @@ async def spread_activation(
     max_results: int = 10,
     spread_decay: float = SPREAD_DECAY,
     spread_threshold: float = SPREAD_THRESHOLD,
+    allowed_edge_types: Optional[Iterable[EdgeType | str]] = None,
 ) -> List[Tuple[str, float, List[str], str]]:
     """激活扩散联想。
 
@@ -318,53 +1225,88 @@ async def spread_activation(
         max_results: 最大返回数量
         spread_decay: 扩散衰减系数
         spread_threshold: 扩散阈值
+        allowed_edge_types: 允许参与扩散的边类型；默认仅显式关系。
 
     Returns:
         [(node_id, activation_score, path, reason), ...]
     """
-    activation: Dict[str, float] = {seed: 1.0 for seed in seed_ids}
-    paths: Dict[str, List[str]] = {seed: [seed] for seed in seed_ids}
+    try:
+        normalized_depth = max(0, int(max_depth))
+        normalized_results = max(0, int(max_results))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_depth 和 max_results 必须是整数") from exc
+
+    normalized_seed_ids = list(
+        dict.fromkeys(
+            str(seed_id)
+            for seed_id in (seed_ids or [])
+            if str(seed_id or "").strip()
+        )
+    )
+    allowed_types = _normalize_allowed_edge_types(allowed_edge_types)
+    if (
+        not normalized_seed_ids
+        or not allowed_types
+        or normalized_depth == 0
+        or normalized_results == 0
+    ):
+        return []
+
+    activation: Dict[str, float] = {seed: 1.0 for seed in normalized_seed_ids}
+    paths: Dict[str, List[str]] = {seed: [seed] for seed in normalized_seed_ids}
     reasons: Dict[str, str] = {}
-    visited = set(seed_ids)
-    frontier = list(seed_ids)
+    frontier: List[Tuple[str, float, List[str]]] = [
+        (seed, 1.0, [seed]) for seed in normalized_seed_ids
+    ]
 
-    for depth in range(max_depth):
-        next_frontier: List[str] = []
-        decay = spread_decay ** (depth + 1)
+    for _ in range(normalized_depth):
+        next_candidates: Dict[str, Tuple[float, List[str], str]] = {}
 
-        for node_id in frontier:
-            current_activation = activation[node_id]
-            edges = await get_edges_from(db, node_id, min_weight=spread_threshold)
+        for node_id, current_activation, current_path in frontier:
+            edges = await _get_edges_from_readonly(db, node_id, spread_threshold)
 
             for edge in edges:
-                neighbor = edge.target_id
-                if neighbor in visited:
+                if edge.edge_type not in allowed_types:
                     continue
 
-                propagated = current_activation * edge.weight * decay
-                if propagated >= spread_threshold:
-                    if neighbor not in activation:
-                        activation[neighbor] = 0
-                        paths[neighbor] = paths[node_id] + [neighbor]
-                        reasons[neighbor] = f"{edge.edge_type.value}: {edge.reason}"
+                neighbor = edge.target_id
+                if neighbor in current_path:
+                    continue
 
-                    activation[neighbor] += propagated
-                    next_frontier.append(neighbor)
-                    visited.add(neighbor)
+                propagated = current_activation * edge.weight * spread_decay
+                if propagated < spread_threshold:
+                    continue
 
-        frontier = next_frontier
-        if not frontier:
+                previous_score = activation.get(neighbor, float("-inf"))
+                candidate = next_candidates.get(neighbor)
+                candidate_score = candidate[0] if candidate else float("-inf")
+                if propagated <= max(previous_score, candidate_score):
+                    continue
+
+                next_candidates[neighbor] = (
+                    propagated,
+                    current_path + [neighbor],
+                    f"{edge.edge_type.value}: {edge.reason}",
+                )
+
+        if not next_candidates:
             break
 
+        frontier = []
+        for node_id, (score, path, reason) in next_candidates.items():
+            activation[node_id] = score
+            paths[node_id] = path
+            reasons[node_id] = reason
+            frontier.append((node_id, score, path))
+
     # 移除种子节点，返回联想到的节点
-    for seed in seed_ids:
+    for seed in normalized_seed_ids:
         activation.pop(seed, None)
 
-    sorted_items = sorted(activation.items(), key=lambda x: -x[1])[:max_results]
-
+    sorted_items = sorted(activation.items(), key=lambda item: (-item[1], item[0]))
     return [
         (node_id, score, paths.get(node_id, []), reasons.get(node_id, ""))
-        for node_id, score in sorted_items
+        for node_id, score in sorted_items[:normalized_results]
     ]
 
 
@@ -400,13 +1342,26 @@ async def filter_existing_scores(
 
     def _do_db_work() -> set:
         cursor = db.cursor()
+        register_indexed_path_sql_function(db)
+        columns = _table_columns(db, "memory_nodes")
+        clauses = [f"node_id IN ({placeholders})"]
+        if "node_type" in columns:
+            clauses.append("lower(COALESCE(node_type, 'file')) = 'file'")
+        if "is_deleted" in columns:
+            clauses.append("COALESCE(is_deleted, 0) = 0")
+        if "file_path" in columns:
+            clauses.extend(["file_path IS NOT NULL", "TRIM(file_path) <> ''"])
+            eligibility_sql, eligibility_params = eligible_document_path_sql("file_path")
+            clauses.append(eligibility_sql)
+        else:
+            eligibility_params = []
         cursor.execute(
-            f"SELECT node_id FROM memory_nodes WHERE node_id IN ({placeholders})",
-            ordered_ids,
+            f"SELECT node_id FROM memory_nodes WHERE {' AND '.join(clauses)}",
+            [*ordered_ids, *eligibility_params],
         )
         return {row["node_id"] for row in cursor.fetchall()}
 
-    existing_ids = await asyncio.to_thread(_do_db_work)
+    existing_ids = await _async_db_read(_do_db_work)
     stale_ids = [node_id for node_id in ordered_ids if node_id not in existing_ids]
     filtered_scores = [(node_id, score) for node_id, score in scores if node_id in existing_ids]
     return filtered_scores, stale_ids
@@ -428,29 +1383,143 @@ async def get_node_by_id(db: sqlite3.Connection, node_id: str) -> Optional[Memor
         row = cursor.fetchone()
         return row_to_node(row) if row else None
 
-    return await asyncio.to_thread(_do_db_work)
+    return await _async_db_read(_do_db_work)
 
 
 async def get_snippet(db: sqlite3.Connection, node_id: str) -> str:
-    """获取节点内容摘要。
+    """获取节点内容摘要，优先读取新分块表。"""
 
-    Args:
-        db: SQLite 数据库连接
-        node_id: 节点 ID
-
-    Returns:
-        内容摘要
-    """
     def _do_db_work() -> str:
-        cursor = db.cursor()
-        cursor.execute("SELECT content FROM memory_fts WHERE node_id = ?", (node_id,))
-        row = cursor.fetchone()
-        if row:
-            content = row["content"]
-            return content[:150] + "..." if len(content) > 150 else content
+        if _table_exists(db, "memory_chunks"):
+            row = db.execute(
+                "SELECT content FROM memory_chunks WHERE node_id = ? "
+                "ORDER BY chunk_index LIMIT 1",
+                (node_id,),
+            ).fetchone()
+            if row:
+                return _make_snippet(str(row["content"] or ""), "")
+        if _table_exists(db, "memory_fts"):
+            row = db.execute(
+                "SELECT content FROM memory_fts WHERE node_id = ? LIMIT 1",
+                (node_id,),
+            ).fetchone()
+            if row:
+                return _make_snippet(str(row["content"] or ""), "")
         return ""
 
-    return await asyncio.to_thread(_do_db_work)
+    return await _async_db_read(_do_db_work)
+
+
+def _load_nodes_by_ids(
+    db: sqlite3.Connection,
+    node_ids: Iterable[str],
+) -> Dict[str, _LoadedNode]:
+    ordered_ids = list(dict.fromkeys(str(node_id) for node_id in node_ids if node_id))
+    if not ordered_ids:
+        return {}
+    columns = _table_columns(db, "memory_nodes")
+    placeholders = ",".join("?" for _ in ordered_ids)
+    event_expr = "n.event_date" if "event_date" in columns else "NULL"
+    deleted_expr = "COALESCE(n.is_deleted, 0)" if "is_deleted" in columns else "0"
+    mtime_expr = "n.source_mtime" if "source_mtime" in columns else "NULL"
+    chunk_expr = (
+        "(SELECT c.content FROM memory_chunks AS c "
+        "WHERE c.node_id = n.node_id ORDER BY c.chunk_index LIMIT 1)"
+        if _table_exists(db, "memory_chunks")
+        else "NULL"
+    )
+    fts_expr = (
+        "(SELECT f.content FROM memory_fts AS f WHERE f.node_id = n.node_id LIMIT 1)"
+        if _table_exists(db, "memory_fts")
+        else "NULL"
+    )
+    rows = db.execute(
+        f"""
+        SELECT n.node_id, n.file_path, n.title, {event_expr} AS event_date,
+               {deleted_expr} AS is_deleted, {mtime_expr} AS source_mtime,
+               n.created_at, COALESCE({chunk_expr}, {fts_expr}, '') AS preview_content
+        FROM memory_nodes AS n
+        WHERE n.node_id IN ({placeholders})
+        """,
+        ordered_ids,
+    ).fetchall()
+    return {
+        str(row["node_id"]): _LoadedNode(
+            node_id=str(row["node_id"]),
+            file_path=str(row["file_path"] or ""),
+            title=str(row["title"] or ""),
+            event_date=str(row["event_date"]) if row["event_date"] else None,
+            is_deleted=bool(row["is_deleted"]),
+            source_mtime=float(row["source_mtime"]) if row["source_mtime"] is not None else None,
+            created_at=float(row["created_at"] or 0.0),
+            preview_content=str(row["preview_content"] or ""),
+        )
+        for row in rows
+    }
+
+
+def _coerce_search_date(now: Any) -> date | None:
+    if callable(now):
+        now = now()
+    if isinstance(now, datetime):
+        return now.date()
+    if isinstance(now, date):
+        return now
+    return None
+
+
+def _node_event_date(node: _LoadedNode) -> date | None:
+    if not node.event_date:
+        return None
+    try:
+        return date.fromisoformat(node.event_date[:10])
+    except ValueError:
+        return None
+
+
+def _node_effective_date(node: _LoadedNode) -> date | None:
+    event_date = _node_event_date(node)
+    if event_date is not None:
+        return event_date
+    timestamp = node.source_mtime if node.source_mtime is not None else node.created_at
+    if timestamp <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(timestamp).date()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _workspace_file_exists(workspace_path: str | Path | None, file_path: str) -> bool:
+    if workspace_path is None:
+        return True
+    return assess_workspace_document(workspace_path, file_path).eligible
+
+
+def _node_matches_filters(
+    node: _LoadedNode,
+    *,
+    file_types: Optional[List[str]],
+    explicit_date: date | None,
+    cutoff_date: date | None,
+    workspace_path: str | Path | None,
+) -> bool:
+    if node.is_deleted or not node.file_path:
+        return False
+    if not is_eligible_indexed_document_path(node.file_path):
+        return False
+    if not _matches_file_type(node.file_path, file_types):
+        return False
+    if not _workspace_file_exists(workspace_path, node.file_path):
+        return False
+    if explicit_date is not None:
+        if _node_event_date(node) != explicit_date:
+            return False
+    elif cutoff_date is not None:
+        effective_date = _node_effective_date(node)
+        if effective_date is None or effective_date < cutoff_date:
+            return False
+    return True
 
 
 async def filter_results(
@@ -458,50 +1527,252 @@ async def filter_results(
     results: List[Tuple[str, float]],
     file_types: Optional[List[str]] = None,
     time_range_days: int = 0,
+    *,
+    now: date | datetime | None = None,
+    workspace_path: str | Path | None = None,
+    event_date: date | None = None,
 ) -> List[Tuple[str, float]]:
-    """过滤检索结果。
-
-    Args:
-        db: SQLite 数据库连接
-        results: 检索结果
-        file_types: 文件类型过滤
-        time_range_days: 时间范围过滤
-
-    Returns:
-        过滤后的结果
-    """
-    filtered: List[Tuple[str, float]] = []
-    now = time.time()
-    cutoff = now - time_range_days * 86400 if time_range_days > 0 else 0
-
-    for node_id, score in results:
-        node = await get_node_by_id(db, node_id)
-        if not node:
-            continue
-
-        # 时间过滤
-        if cutoff > 0 and node.created_at < cutoff:
-            continue
-
-        # 类型过滤
-        if file_types and node.file_path:
-            path_lower = node.file_path.lower()
-            match = False
-            for ft in file_types:
-                if ft in path_lower or path_lower.startswith(ft):
-                    match = True
-                    break
-            if not match:
-                continue
-
-        filtered.append((node_id, score))
-
-    return filtered
+    """过滤旧式分数列表；保留兼容 API 并使用严格路径/日期规则。"""
+    current_date = _coerce_search_date(now)
+    if current_date is None and time_range_days > 0:
+        current_date = datetime.now().astimezone().date()
+    cutoff_date = (
+        current_date - timedelta(days=max(0, int(time_range_days)))
+        if current_date is not None and time_range_days > 0 and event_date is None
+        else None
+    )
+    nodes = await _async_db_read(
+        _load_nodes_by_ids,
+        db,
+        (node_id for node_id, _ in results),
+    )
+    return [
+        (node_id, score)
+        for node_id, score in results
+        if node_id in nodes
+        and _node_matches_filters(
+            nodes[node_id],
+            file_types=file_types,
+            explicit_date=event_date,
+            cutoff_date=cutoff_date,
+            workspace_path=workspace_path,
+        )
+    ]
 
 
 # ============================================================
 # 混合检索
 # ============================================================
+
+
+async def search_memory_detailed(
+    db: sqlite3.Connection,
+    query: str,
+    collection: Any,
+    top_k: int = 5,
+    enable_association: bool = True,
+    file_types: Optional[List[str]] = None,
+    time_range_days: int = 0,
+    emit_visual_event: Any = None,
+    increment_access_func: Any = None,
+    reinforce_coactivated_func: Any = None,
+    *,
+    now: date | datetime | Any | None = None,
+    workspace_path: str | Path | None = None,
+    chunk_collection: Any = None,
+) -> DetailedSearchResult:
+    """并行执行 chunk FTS/向量召回，并返回只读诊断信息。"""
+    del increment_access_func, reinforce_coactivated_func
+    total_started = time.perf_counter()
+    diagnostics = SearchDiagnostics()
+    query_meta = _query_metadata(query)
+    resolved_now = now() if callable(now) else now
+    explicit_date = parse_temporal_date(str(query or ""), now=resolved_now)
+    current_date = _coerce_search_date(resolved_now)
+    if current_date is None and time_range_days > 0:
+        current_date = datetime.now().astimezone().date()
+    cutoff_date = (
+        current_date - timedelta(days=max(0, int(time_range_days)))
+        if explicit_date is None and current_date is not None and time_range_days > 0
+        else None
+    )
+    if emit_visual_event:
+        emit_visual_event(
+            "memory.search.started",
+            {**query_meta, "top_k": top_k, "enable_association": enable_association},
+        )
+
+    async def _bound_filter(raw_pairs: List[Tuple[str, float]]):
+        return await filter_existing_scores(db, raw_pairs)
+
+    async def _run_fts() -> tuple[_FtsSearchOutcome, float]:
+        started = time.perf_counter()
+        outcome = await _chunk_fts_search_outcome(
+            db, query, max(0, int(top_k)) * 4, explicit_date, file_types
+        )
+        return outcome, time.perf_counter() - started
+
+    async def _run_vector() -> tuple[_VectorSearchOutcome, float]:
+        started = time.perf_counter()
+        outcome = await _vector_search_outcome(
+            query,
+            collection,
+            max(0, int(top_k)) * 4,
+            _bound_filter,
+            db=db,
+            chunk_collection=chunk_collection,
+        )
+        return outcome, time.perf_counter() - started
+
+    gathered = await asyncio.gather(_run_fts(), _run_vector(), return_exceptions=True)
+    fts_outcome = _FtsSearchOutcome([], False, True, "UnknownError")
+    vector_outcome = _VectorSearchOutcome([], False, True, "UnknownError")
+    for phase, value in zip(("fts", "vector"), gathered):
+        if isinstance(value, BaseException):
+            diagnostics.degraded = True
+            diagnostics.error_types[phase] = type(value).__name__
+            diagnostics.errors[phase] = _short_error(value)
+            continue
+        outcome, elapsed = value
+        diagnostics.phase_timings[phase] = elapsed
+        if phase == "fts":
+            fts_outcome = outcome
+        else:
+            vector_outcome = outcome
+
+    diagnostics.fts_success = fts_outcome.success
+    diagnostics.vector_success = vector_outcome.success
+    diagnostics.fts_candidate_count = len(fts_outcome.results)
+    diagnostics.vector_candidate_count = len(vector_outcome.results)
+    diagnostics.degraded = (
+        diagnostics.degraded or fts_outcome.degraded or vector_outcome.degraded
+        or not fts_outcome.success or not vector_outcome.success
+    )
+    for phase, outcome in (("fts", fts_outcome), ("vector", vector_outcome)):
+        if outcome.error_type:
+            diagnostics.error_types[phase] = outcome.error_type
+        if outcome.error:
+            diagnostics.errors[phase] = outcome.error
+
+    fts_scores = [(item.node_id, item.score) for item in fts_outcome.results]
+    fused_scores = rrf_fusion(fts_scores, vector_outcome.results)
+    best_chunks = {item.node_id: item for item in fts_outcome.results}
+    load_started = time.perf_counter()
+    candidate_nodes = await _async_db_read(
+        _load_nodes_by_ids, db, (node_id for node_id, _ in fused_scores)
+    )
+    diagnostics.phase_timings["load"] = time.perf_counter() - load_started
+    filtered_scores = [
+        (node_id, score)
+        for node_id, score in fused_scores
+        if node_id in candidate_nodes
+        and _node_matches_filters(
+            candidate_nodes[node_id],
+            file_types=file_types,
+            explicit_date=explicit_date,
+            cutoff_date=cutoff_date,
+            workspace_path=workspace_path,
+        )
+    ]
+    seeds = filtered_scores[: max(0, int(top_k))]
+    seed_ids = [node_id for node_id, _ in seeds]
+
+    association_started = time.perf_counter()
+    associated: List[Tuple[str, float, List[str], str]] = []
+    if enable_association and seed_ids:
+        associated = await spread_activation(
+            db,
+            seed_ids,
+            max_depth=2,
+            max_results=max(0, int(top_k)) * 2,
+            allowed_edge_types=EXPLICIT_RELATION_EDGE_TYPES,
+        )
+    diagnostics.phase_timings["association"] = time.perf_counter() - association_started
+    associated_nodes = await _async_db_read(
+        _load_nodes_by_ids, db, (node_id for node_id, *_ in associated)
+    )
+
+    results: List[SearchResult] = []
+    seen_paths: set[str] = set()
+    seed_payload: List[Dict[str, Any]] = []
+    associated_payload: List[Dict[str, Any]] = []
+    for node_id, score in seeds:
+        node = candidate_nodes[node_id]
+        chunk = best_chunks.get(node_id)
+        results.append(
+            SearchResult(
+                file_path=node.file_path,
+                title=node.title,
+                snippet=chunk.snippet if chunk else _make_snippet(node.preview_content, query),
+                relevance=score,
+                source="direct",
+                score_kind="rank",
+            )
+        )
+        seen_paths.add(node.file_path)
+        seed_payload.append(
+            {"id": node_id, "title": node.title, "path": node.file_path, "score": score}
+        )
+
+    for node_id, score, path, reason in associated:
+        node = associated_nodes.get(node_id)
+        if node is None or node.file_path in seen_paths:
+            continue
+        if not _node_matches_filters(
+            node,
+            file_types=file_types,
+            explicit_date=explicit_date,
+            cutoff_date=cutoff_date,
+            workspace_path=workspace_path,
+        ):
+            continue
+        results.append(
+            SearchResult(
+                file_path=node.file_path,
+                title=node.title,
+                snippet=_make_snippet(node.preview_content, query),
+                relevance=score * 0.8,
+                source="associated",
+                association_path=path,
+                association_reason=reason,
+                score_kind="rank",
+            )
+        )
+        seen_paths.add(node.file_path)
+        associated_payload.append(
+            {
+                "id": node_id,
+                "title": node.title,
+                "path": node.file_path,
+                "score": score,
+                "association_path": path,
+                "association_reason": reason,
+            }
+        )
+
+    diagnostics.phase_timings["total"] = time.perf_counter() - total_started
+    if emit_visual_event:
+        emit_visual_event(
+            "memory.search.seeds",
+            {**query_meta, "seed_ids": seed_ids, "results": seed_payload},
+        )
+        if associated_payload:
+            emit_visual_event(
+                "memory.activation.spread",
+                {**query_meta, "seed_ids": seed_ids, "results": associated_payload},
+            )
+        emit_visual_event(
+            "memory.search.finished",
+            {
+                **query_meta,
+                "total_found": len(results),
+                "degraded": diagnostics.degraded,
+                "error_types": diagnostics.error_types,
+            },
+        )
+    return DetailedSearchResult(
+        results=results[: max(0, int(top_k)) * 2], diagnostics=diagnostics
+    )
 
 
 async def search_memory(
@@ -515,143 +1786,25 @@ async def search_memory(
     emit_visual_event: Any = None,
     increment_access_func: Any = None,
     reinforce_coactivated_func: Any = None,
+    *,
+    now: date | datetime | Any | None = None,
+    workspace_path: str | Path | None = None,
+    chunk_collection: Any = None,
 ) -> List[SearchResult]:
-    """混合检索 + 联想。
-
-    Args:
-        db: SQLite 数据库连接
-        query: 查询文本
-        collection: ChromaDB collection
-        top_k: 返回数量
-        enable_association: 是否启用联想
-        file_types: 文件类型过滤
-        time_range_days: 时间范围过滤
-        emit_visual_event: 可视化事件发射函数
-        increment_access_func: 增加访问计数的函数
-        reinforce_coactivated_func: Hebbian 强化函数
-
-    Returns:
-        SearchResult 列表
-    """
-    if emit_visual_event:
-        emit_visual_event(
-            "memory.search.started",
-            {
-                "query": query,
-                "top_k": top_k,
-                "enable_association": enable_association,
-            },
-        )
-
-    # 并行执行关键词和语义检索
-    fts_results = await fts_search(db, query, top_k * 2)
-
-    async def _bound_filter(raw_pairs):
-        return await filter_existing_scores(db, raw_pairs)
-
-    vector_results = await vector_search(query, collection, top_k * 2, _bound_filter)
-
-    # RRF 融合
-    seed_scores = rrf_fusion(fts_results, vector_results)
-
-    # 过滤文件类型和时间范围
-    if file_types or time_range_days > 0:
-        seed_scores = await filter_results(db, seed_scores, file_types, time_range_days)
-
-    # 取 top-k 作为种子
-    seeds = seed_scores[:top_k]
-    seed_ids = [node_id for node_id, _ in seeds]
-
-    # 激活扩散联想
-    associated: List[Tuple[str, float, List[str], str]] = []
-    if enable_association and seeds:
-        associated = await spread_activation(db, seed_ids, max_depth=2)
-
-    # 更新访问计数并强化边
-    if increment_access_func:
-        for node_id, _ in seeds:
-            await increment_access_func(node_id)
-
-    if reinforce_coactivated_func and len(seed_ids) > 1:
-        await reinforce_coactivated_func(seed_ids)
-
-    # 构建结果
-    results: List[SearchResult] = []
-    seed_payload: List[Dict[str, Any]] = []
-    associated_payload: List[Dict[str, Any]] = []
-
-    # 直接命中
-    for node_id, score in seeds:
-        node = await get_node_by_id(db, node_id)
-        if node and node.file_path:
-            snippet = await get_snippet(db, node_id)
-            results.append(
-                SearchResult(
-                    file_path=node.file_path,
-                    title=node.title,
-                    snippet=snippet,
-                    relevance=score,
-                    source="direct",
-                )
-            )
-            seed_payload.append({
-                "id": node_id,
-                "title": node.title,
-                "path": node.file_path,
-                "score": score,
-            })
-
-    # 联想结果
-    for node_id, score, path, reason in associated:
-        node = await get_node_by_id(db, node_id)
-        if node and node.file_path:
-            if any(r.file_path == node.file_path for r in results):
-                continue
-            snippet = await get_snippet(db, node_id)
-            results.append(
-                SearchResult(
-                    file_path=node.file_path,
-                    title=node.title,
-                    snippet=snippet,
-                    relevance=score * 0.8,
-                    source="associated",
-                    association_path=path,
-                    association_reason=reason,
-                )
-            )
-            associated_payload.append({
-                "id": node_id,
-                "title": node.title,
-                "path": node.file_path,
-                "score": score,
-                "association_path": path,
-                "association_reason": reason,
-            })
-
-    if emit_visual_event:
-        emit_visual_event(
-            "memory.search.seeds",
-            {
-                "query": query,
-                "seed_ids": seed_ids,
-                "results": seed_payload,
-            },
-        )
-        if associated_payload:
-            emit_visual_event(
-                "memory.activation.spread",
-                {
-                    "query": query,
-                    "seed_ids": seed_ids,
-                    "results": associated_payload,
-                },
-            )
-        emit_visual_event(
-            "memory.search.finished",
-            {
-                "query": query,
-                "total_found": len(results),
-            },
-        )
-
-    return results[:top_k * 2]
+    """混合检索 + 联想（只读），保留旧列表返回 API。"""
+    detailed = await search_memory_detailed(
+        db=db,
+        query=query,
+        collection=collection,
+        top_k=top_k,
+        enable_association=enable_association,
+        file_types=file_types,
+        time_range_days=time_range_days,
+        emit_visual_event=emit_visual_event,
+        increment_access_func=increment_access_func,
+        reinforce_coactivated_func=reinforce_coactivated_func,
+        now=now,
+        workspace_path=workspace_path,
+        chunk_collection=chunk_collection,
+    )
+    return detailed.results

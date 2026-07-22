@@ -7,18 +7,26 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import math
 import sqlite3
 import time
-import uuid
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 
 from src.app.plugin_system.api import log_api
 
+from .eligibility import assess_document_path, eligible_document_path_sql
 from .nodes import MemoryNode, NodeType, row_to_node
-from .edges import EdgeType, row_to_edge, get_edges_from
+from .edges import (
+    EdgeType,
+    _EDGE_WRITE_LOCK,
+    _finish_savepoint,
+    _reinforce_associations_sync,
+    _start_savepoint,
+    get_edges_from,
+)
 
 logger = log_api.get_logger("life_engine.memory.decay")
 
@@ -30,6 +38,25 @@ logger = log_api.get_logger("life_engine.memory.decay")
 DECAY_LAMBDA = 0.05  # 遗忘衰减系数（约14天半衰期）
 PRUNE_THRESHOLD = 0.1  # 边剪枝阈值
 DREAM_LEARNING_RATE = 0.05  # REM 做梦学习率
+
+
+def _run_edge_maintenance(
+    db: sqlite3.Connection,
+    prefix: str,
+    operation: Any,
+) -> Any:
+    """在边写锁和 savepoint 内运行维护操作，保留调用方外层事务。"""
+    with _EDGE_WRITE_LOCK:
+        cursor = db.cursor()
+        savepoint = _start_savepoint(cursor, prefix)
+        error: BaseException | None = None
+        try:
+            return operation()
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            _finish_savepoint(cursor, savepoint, error)
 
 
 # ============================================================
@@ -99,30 +126,113 @@ async def apply_decay(db: sqlite3.Connection) -> int:
                 )
                 updated += 1
 
-        # 边衰减
-        cursor.execute(
+        # 双向 ASSOCIATES 以逻辑关系对为单位衰减，避免镜像行逐渐分叉。
+        association_rows = cursor.execute(
             "SELECT * FROM memory_edges WHERE edge_type = ?",
             (EdgeType.ASSOCIATES.value,),
-        )
-        for row in cursor.fetchall():
-            edge = row_to_edge(row)
-            if edge.last_activated_at:
-                days_since = (time.time() - edge.last_activated_at) / 86400
+        ).fetchall()
+        association_pairs: Dict[tuple[str, str], list[sqlite3.Row]] = {}
+        for row in association_rows:
+            pair_key = tuple(sorted((str(row["source_id"]), str(row["target_id"]))))
+            association_pairs.setdefault(pair_key, []).append(row)
+
+        decay_now = time.time()
+        for (node_a, node_b), rows in association_pairs.items():
+            is_bidirectional_pair = any(bool(row["bidirectional"]) for row in rows)
+            timestamps = [
+                float(row["last_activated_at"])
+                for row in rows
+                if row["last_activated_at"] is not None
+            ]
+            is_complete_bidirectional_pair = is_bidirectional_pair and len(rows) == 2
+            if is_complete_bidirectional_pair:
+                if not timestamps:
+                    continue
+                base_strength = max(float(row["base_strength"] or 0.0) for row in rows)
+                reinforcement = max(float(row["reinforcement"] or 0.0) for row in rows)
+                activation_count = max(int(row["activation_count"] or 0) for row in rows)
+                last_activated_at = max(timestamps)
+                reason = next(
+                    (str(row["reason"] or "") for row in rows if row["reason"]),
+                    "",
+                )
+                days_since = (decay_now - last_activated_at) / 86400
                 decay_factor = math.exp(-DECAY_LAMBDA * days_since)
-                new_weight = edge.base_strength + edge.reinforcement * decay_factor
+                new_weight = base_strength + reinforcement * decay_factor
 
                 if new_weight < PRUNE_THRESHOLD:
-                    cursor.execute("DELETE FROM memory_edges WHERE edge_id = ?", (edge.edge_id,))
-                elif abs(new_weight - edge.weight) > 0.01:
                     cursor.execute(
-                        "UPDATE memory_edges SET weight = ? WHERE edge_id = ?",
-                        (new_weight, edge.edge_id),
+                        """
+                        DELETE FROM memory_edges
+                        WHERE edge_type = ?
+                          AND ((source_id = ? AND target_id = ?)
+                               OR (source_id = ? AND target_id = ?))
+                        """,
+                        (EdgeType.ASSOCIATES.value, node_a, node_b, node_b, node_a),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        UPDATE memory_edges
+                        SET weight = ?, base_strength = ?, reinforcement = ?,
+                            activation_count = ?, last_activated_at = ?, reason = ?,
+                            bidirectional = 1
+                        WHERE edge_type = ?
+                          AND ((source_id = ? AND target_id = ?)
+                               OR (source_id = ? AND target_id = ?))
+                        """,
+                        (
+                            new_weight,
+                            base_strength,
+                            reinforcement,
+                            activation_count,
+                            last_activated_at,
+                            reason,
+                            EdgeType.ASSOCIATES.value,
+                            node_a,
+                            node_b,
+                            node_b,
+                            node_a,
+                        ),
+                    )
+                continue
+
+            for row in rows:
+                if row["last_activated_at"] is None:
+                    if is_bidirectional_pair:
+                        cursor.execute(
+                            "UPDATE memory_edges SET bidirectional = 0 WHERE edge_id = ?",
+                            (row["edge_id"],),
+                        )
+                    continue
+                days_since = (decay_now - float(row["last_activated_at"])) / 86400
+                decay_factor = math.exp(-DECAY_LAMBDA * days_since)
+                new_weight = (
+                    float(row["base_strength"] or 0.0)
+                    + float(row["reinforcement"] or 0.0) * decay_factor
+                )
+                if new_weight < PRUNE_THRESHOLD:
+                    cursor.execute(
+                        "DELETE FROM memory_edges WHERE edge_id = ?",
+                        (row["edge_id"],),
+                    )
+                elif (
+                    abs(new_weight - float(row["weight"] or 0.0)) > 0.01
+                    or is_bidirectional_pair
+                ):
+                    cursor.execute(
+                        "UPDATE memory_edges SET weight = ?, bidirectional = ? WHERE edge_id = ?",
+                        (new_weight, 0 if is_bidirectional_pair else row["bidirectional"], row["edge_id"]),
                     )
 
-        db.commit()
         return updated
 
-    updated = await asyncio.to_thread(_do_db_work)
+    updated = await asyncio.to_thread(
+        _run_edge_maintenance,
+        db,
+        "apply_decay",
+        _do_db_work,
+    )
 
     elapsed = time.time() - start_time
     logger.info(
@@ -144,8 +254,9 @@ async def dream_walk(
     decay_factor: float = 0.6,
     learning_rate: float = DREAM_LEARNING_RATE,
     emit_visual_event: Any = None,
+    persist_learning: bool = False,
 ) -> Dict[str, Any]:
-    """REM 做梦游走：从随机种子出发进行激活扩散，Hebbian 强化共激活节点。
+    """REM 做梦游走：从随机种子出发进行激活扩散。
 
     与搜索时的 spread_activation 的区别：
     - 种子是随机选取的（不是查询驱动的）
@@ -161,6 +272,7 @@ async def dream_walk(
         decay_factor: 扩散衰减系数
         learning_rate: 学习率
         emit_visual_event: 可视化事件发射函数
+        persist_learning: 是否持久化 ASSOCIATES 学习边，默认关闭
 
     Returns:
         {"nodes_activated": int, "new_edges_created": int, "seed_ids": list}
@@ -168,14 +280,25 @@ async def dream_walk(
     if not db:
         return {"nodes_activated": 0, "new_edges_created": 0, "seed_ids": []}
 
-    # Step 1: Load all nodes (sync DB)
+    # Step 1: Load only active, eligible file nodes (sync DB).
     def _load_nodes() -> List[tuple]:
         cursor = db.cursor()
+        columns = {str(row[1]) for row in cursor.execute("PRAGMA table_info(memory_nodes)")}
+        eligibility_sql, eligibility_params = eligible_document_path_sql("file_path")
+        clauses = [
+            "node_type = ?",
+            "activation_strength > 0.05",
+            "file_path IS NOT NULL",
+            "TRIM(file_path) <> ''",
+            eligibility_sql,
+        ]
+        if "is_deleted" in columns:
+            clauses.append("COALESCE(is_deleted, 0) = 0")
         cursor.execute(
-            """
-            SELECT node_id, activation_strength FROM memory_nodes
-            WHERE activation_strength > 0.05 ORDER BY activation_strength DESC
-            """
+            "SELECT node_id, activation_strength FROM memory_nodes WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY activation_strength DESC",
+            [NodeType.FILE.value, *eligibility_params],
         )
         return [(r["node_id"], r["activation_strength"]) for r in cursor.fetchall()]
 
@@ -184,6 +307,7 @@ async def dream_walk(
         return {"nodes_activated": 0, "new_edges_created": 0, "seed_ids": []}
 
     node_ids = [r[0] for r in node_rows]
+    eligible_node_ids = set(node_ids)
     strengths = np.array([r[1] for r in node_rows], dtype=np.float64)
     total_strength = float(strengths.sum())
     if total_strength <= 0:
@@ -234,7 +358,7 @@ async def dream_walk(
 
             for edge in edges:
                 neighbor = edge.target_id
-                if neighbor in visited:
+                if neighbor not in eligible_node_ids or neighbor in visited:
                     continue
 
                 propagated = current_act * edge.weight * decay
@@ -263,95 +387,38 @@ async def dream_walk(
 
     all_activated = list(activation.keys())
 
-    # Step 2: Hebbian 强化共激活节点 (mixed sync/async DB)
-    now = time.time()
+    if not persist_learning:
+        logger.info(
+            f"REM dream_walk 只读完成: seeds={len(actual_seed_ids)} "
+            f"activated={len(all_activated)}"
+        )
+        return {
+            "nodes_activated": len(all_activated),
+            "new_edges_created": 0,
+            "seed_ids": actual_seed_ids,
+        }
 
-    top_activated = sorted(activation.items(), key=lambda x: -x[1])[:15]
-    top_ids = [nid for nid, _ in top_activated]
-
-    # Check which nodes exist (sync DB)
-    def _check_existing(ids: List[str]) -> List[str]:
-        cursor = db.cursor()
-        existing: List[str] = []
-        for nid in ids:
-            cursor.execute("SELECT node_id FROM memory_nodes WHERE node_id = ?", (nid,))
-            if cursor.fetchone():
-                existing.append(nid)
-        return existing
-
-    existing_ids = await asyncio.to_thread(_check_existing, top_ids)
-
-    # Build edge operations data in Python (sync DB, run in thread)
-    def _build_edge_ops(ids: List[str], lr: float, now_ts: float) -> tuple:
-        ops: List[tuple] = []
-        new_count = 0
-        cursor = db.cursor()
-        for i, node_a in enumerate(ids):
-            for node_b in ids[i + 1:]:
-                cursor.execute(
-                    """
-                    SELECT edge_id, weight FROM memory_edges
-                    WHERE source_id = ? AND target_id = ? AND edge_type = ?
-                    """,
-                    (node_a, node_b, EdgeType.ASSOCIATES.value),
-                )
-                row = cursor.fetchone()
-
-                if row:
-                    old_weight = row["weight"]
-                    delta = lr * (1 - old_weight)
-                    new_weight = min(old_weight + delta, 1.0)
-                    ops.append(("update", new_weight, delta, now_ts, row["edge_id"]))
-                else:
-                    edge_id = str(uuid.uuid4())[:8]
-                    ops.append(("insert",
-                        edge_id, node_a, node_b, EdgeType.ASSOCIATES.value,
-                        0.15, 0.15, 0.0, 1, now_ts, "REM 做梦联想", now_ts, 1,
-                    ))
-                    new_count += 1
-        return ops, new_count
-
-    edge_ops, new_edges_count = await asyncio.to_thread(_build_edge_ops, existing_ids, learning_rate, now)
-
-    # Execute all edge operations (sync DB, single transaction)
-    def _apply_edge_ops(ops: List[tuple]) -> None:
-        cursor = db.cursor()
-        for op in ops:
-            if op[0] == "update":
-                _, new_weight, delta, now_ts, edge_id = op
-                cursor.execute(
-                    """
-                    UPDATE memory_edges SET weight = ?, reinforcement = reinforcement + ?,
-                    activation_count = activation_count + 1, last_activated_at = ?
-                    WHERE edge_id = ?
-                    """,
-                    (new_weight, delta, now_ts, edge_id),
-                )
-            elif op[0] == "insert":
-                (_, edge_id, source, target, etype, weight, base,
-                 reinforcement, act_count, last_activated, reason, created, bidirectional) = op
-                cursor.execute(
-                    """
-                    INSERT INTO memory_edges
-                    (edge_id, source_id, target_id, edge_type, weight, base_strength,
-                     reinforcement, activation_count, last_activated_at, reason, created_at, bidirectional)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (edge_id, source, target, etype, weight, base,
-                     reinforcement, act_count, last_activated, reason, created, bidirectional),
-                )
-        db.commit()
-
-    await asyncio.to_thread(_apply_edge_ops, edge_ops)
+    top_activated = sorted(activation.items(), key=lambda item: -item[1])[:15]
+    top_ids = [node_id for node_id, _ in top_activated]
+    _, created_pairs, stale_ids = await asyncio.to_thread(
+        _reinforce_associations_sync,
+        db,
+        top_ids,
+        learning_rate,
+        initial_strength=0.15,
+        reason="REM 做梦联想",
+    )
+    if stale_ids:
+        logger.warning(f"REM 学习跳过不存在节点: {stale_ids[:5]}")
 
     logger.info(
         f"REM dream_walk 完成: seeds={len(actual_seed_ids)} "
-        f"activated={len(all_activated)} new_edges={new_edges_count}"
+        f"activated={len(all_activated)} new_edges={created_pairs}"
     )
 
     return {
         "nodes_activated": len(all_activated),
-        "new_edges_created": new_edges_count,
+        "new_edges_created": created_pairs,
         "seed_ids": actual_seed_ids,
     }
 
@@ -374,26 +441,33 @@ async def list_dream_candidate_nodes(
 
     def _do_db_work() -> List[Dict[str, Any]]:
         cursor = db.cursor()
+        columns = {str(row[1]) for row in cursor.execute("PRAGMA table_info(memory_nodes)")}
+        eligibility_sql, eligibility_params = eligible_document_path_sql("file_path")
+        clauses = [
+            "node_type = ?",
+            "file_path IS NOT NULL",
+            "TRIM(file_path) <> ''",
+            eligibility_sql,
+        ]
+        if "is_deleted" in columns:
+            clauses.append("COALESCE(is_deleted, 0) = 0")
         cursor.execute(
-            """
-            SELECT node_id, file_path, title, activation_strength, access_count,
-                   emotional_valence, emotional_arousal, importance, updated_at
-            FROM memory_nodes
-            WHERE node_type = ?
-            ORDER BY importance DESC,
-                     emotional_arousal DESC,
-                     access_count DESC,
-                     activation_strength DESC,
-                     updated_at DESC
-            LIMIT ?
-            """,
-            (NodeType.FILE.value, max(1, int(limit))),
+            "SELECT node_id, file_path, title, activation_strength, access_count, "
+            "emotional_valence, emotional_arousal, importance, updated_at "
+            "FROM memory_nodes WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY importance DESC, emotional_arousal DESC, access_count DESC, "
+            "activation_strength DESC, updated_at DESC LIMIT ?",
+            [NodeType.FILE.value, *eligibility_params, max(1, int(limit))],
         )
         results: List[Dict[str, Any]] = []
         for row in cursor.fetchall():
+            eligibility = assess_document_path(str(row["file_path"] or ""))
+            if not eligibility.eligible:
+                continue
             results.append({
                 "node_id": row["node_id"],
-                "file_path": row["file_path"],
+                "file_path": eligibility.path,
                 "title": row["title"] or "",
                 "activation_strength": float(row["activation_strength"] or 0.0),
                 "access_count": int(row["access_count"] or 0),
@@ -428,22 +502,32 @@ async def list_random_file_nodes(
 
     def _do_db_work() -> List[Dict[str, Any]]:
         cursor = db.cursor()
+        columns = {str(row[1]) for row in cursor.execute("PRAGMA table_info(memory_nodes)")}
+        eligibility_sql, eligibility_params = eligible_document_path_sql("file_path")
+        clauses = [
+            "node_type = ?",
+            "file_path IS NOT NULL",
+            "TRIM(file_path) <> ''",
+            eligibility_sql,
+        ]
+        if "is_deleted" in columns:
+            clauses.append("COALESCE(is_deleted, 0) = 0")
         cursor.execute(
-            """
-            SELECT node_id, file_path, title, activation_strength, access_count,
-                   emotional_valence, emotional_arousal, importance, updated_at
-            FROM memory_nodes
-            WHERE node_type = ?
-            ORDER BY RANDOM()
-            LIMIT ?
-            """,
-            (NodeType.FILE.value, max(1, int(limit))),
+            "SELECT node_id, file_path, title, activation_strength, access_count, "
+            "emotional_valence, emotional_arousal, importance, updated_at "
+            "FROM memory_nodes WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY RANDOM() LIMIT ?",
+            [NodeType.FILE.value, *eligibility_params, max(1, int(limit))],
         )
         results: List[Dict[str, Any]] = []
         for row in cursor.fetchall():
+            eligibility = assess_document_path(str(row["file_path"] or ""))
+            if not eligibility.eligible:
+                continue
             results.append({
                 "node_id": row["node_id"],
-                "file_path": row["file_path"],
+                "file_path": eligibility.path,
                 "title": row["title"] or "",
                 "activation_strength": float(row["activation_strength"] or 0.0),
                 "access_count": int(row["access_count"] or 0),
@@ -475,28 +559,47 @@ async def prune_weak_edges(
 
     def _do_db_work() -> int:
         cursor = db.cursor()
-        cursor.execute(
-            """
-            SELECT edge_id, weight FROM memory_edges
-            WHERE edge_type = ? AND weight < ?
-            """,
-            (EdgeType.ASSOCIATES.value, threshold),
-        )
-        rows = cursor.fetchall()
-
+        rows = cursor.execute(
+            "SELECT * FROM memory_edges WHERE edge_type = ?",
+            (EdgeType.ASSOCIATES.value,),
+        ).fetchall()
         if not rows:
             return 0
 
-        edge_ids = [r["edge_id"] for r in rows]
+        pairs: Dict[tuple[str, str], list[sqlite3.Row]] = {}
+        for row in rows:
+            pair_key = tuple(sorted((str(row["source_id"]), str(row["target_id"]))))
+            pairs.setdefault(pair_key, []).append(row)
+
+        edge_ids: set[str] = set()
+        for pair_rows in pairs.values():
+            is_bidirectional_pair = any(bool(row["bidirectional"]) for row in pair_rows)
+            if is_bidirectional_pair:
+                if any(float(row["weight"] or 0.0) < threshold for row in pair_rows):
+                    edge_ids.update(str(row["edge_id"]) for row in pair_rows)
+                continue
+            edge_ids.update(
+                str(row["edge_id"])
+                for row in pair_rows
+                if float(row["weight"] or 0.0) < threshold
+            )
+
+        if not edge_ids:
+            return 0
+
         placeholders = ",".join("?" for _ in edge_ids)
         cursor.execute(
             f"DELETE FROM memory_edges WHERE edge_id IN ({placeholders})",
-            edge_ids,
+            list(edge_ids),
         )
-        db.commit()
         return len(edge_ids)
 
-    count = await asyncio.to_thread(_do_db_work)
+    count = await asyncio.to_thread(
+        _run_edge_maintenance,
+        db,
+        "prune_weak_edges",
+        _do_db_work,
+    )
     if count > 0:
         logger.info(f"REM 弱边修剪完成: pruned={count} threshold={threshold}")
     return count
@@ -505,6 +608,51 @@ async def prune_weak_edges(
 # ============================================================
 # 关联图谱
 # ============================================================
+
+
+async def _call_relation_callback(callback: Any, db: sqlite3.Connection, *args: Any) -> Any:
+    """兼容模块函数（需要 db）和 service bound callback（不需要 db）。"""
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        signature = None
+
+    if signature is None:
+        call_args = args if getattr(callback, "__self__", None) is not None else (db, *args)
+    else:
+        def accepts(*candidate_args: Any) -> bool:
+            try:
+                signature.bind(*candidate_args)
+            except TypeError:
+                return False
+            return True
+
+        positional = [
+            parameter
+            for parameter in signature.parameters.values()
+            if parameter.kind
+            in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        first_name = positional[0].name.lower() if positional else ""
+        accepts_without_db = accepts(*args)
+        accepts_with_db = accepts(db, *args)
+        is_bound_method = getattr(callback, "__self__", None) is not None
+
+        if first_name in {"db", "conn", "connection", "database"} and accepts_with_db:
+            call_args = (db, *args)
+        elif is_bound_method and accepts_without_db:
+            call_args = args
+        elif accepts_without_db and not accepts_with_db:
+            call_args = args
+        elif accepts_with_db and not accepts_without_db:
+            call_args = (db, *args)
+        elif accepts_without_db:
+            call_args = args
+        else:
+            raise TypeError("关系回调参数不兼容")
+
+    result = callback(*call_args)
+    return await result if inspect.isawaitable(result) else result
 
 
 async def get_file_relations(
@@ -517,37 +665,31 @@ async def get_file_relations(
     get_edges_to_func: Any = None,
     get_node_by_id_func: Any = None,
 ) -> Dict[str, Any]:
-    """获取文件的关联图谱。
-
-    Args:
-        db: SQLite 数据库连接
-        file_path: 文件路径
-        depth: 关联深度
-        min_strength: 最小关联强度
-        get_node_by_file_path_func: 获取节点的函数
-        get_edges_from_func: 获取出边的函数
-        get_edges_to_func: 获取入边的函数
-        get_node_by_id_func: 根据 ID 获取节点的函数
-
-    Returns:
-        关联图谱信息
-    """
+    """按层遍历文件关联图，同时返回出/入方向和实际深度。"""
     from .nodes import get_node_by_file_path
     from .edges import get_edges_from, get_edges_to
     from .search import get_node_by_id
 
+    max_depth = max(0, int(depth))
     get_node_func = get_node_by_file_path_func or get_node_by_file_path
     get_from_func = get_edges_from_func or get_edges_from
     get_to_func = get_edges_to_func or get_edges_to
     get_id_func = get_node_by_id_func or get_node_by_id
 
-    node = await get_node_func(db, file_path)
+    root_eligibility = assess_document_path(file_path)
+    if not root_eligibility.eligible:
+        return {"error": f"不是可操作的记忆文档: {root_eligibility.reason}"}
+    file_path = root_eligibility.path
+    node = await _call_relation_callback(get_node_func, db, file_path)
     if not node:
         return {"error": f"未找到文件: {file_path}"}
+    node_eligibility = assess_document_path(node.file_path or "")
+    if not node_eligibility.eligible:
+        return {"error": f"不是可操作的记忆文档: {node_eligibility.reason}"}
 
-    relations = {
+    relations: Dict[str, Any] = {
         "center": {
-            "file_path": file_path,
+            "file_path": node.file_path or file_path,
             "title": node.title,
             "activation_strength": node.activation_strength,
             "access_count": node.access_count,
@@ -555,32 +697,52 @@ async def get_file_relations(
         "outgoing": [],
         "incoming": [],
     }
+    frontier: list[tuple[Any, int]] = [(node, 0)]
+    node_depths: Dict[str, int] = {node.node_id: 0}
+    seen_relations: set[tuple[str, str, str, str]] = set()
 
-    # 出边
-    out_edges = await get_from_func(db, node.node_id, min_strength)
-    for edge in out_edges:
-        target = await get_id_func(db, edge.target_id)
-        if target and target.file_path:
-            relations["outgoing"].append({
-                "file_path": target.file_path,
-                "title": target.title,
-                "relation_type": edge.edge_type.value,
-                "strength": edge.weight,
-                "reason": edge.reason,
-            })
+    while frontier:
+        current, current_depth = frontier.pop(0)
+        next_depth = current_depth + 1
+        if next_depth > max_depth:
+            continue
+        out_edges = await _call_relation_callback(
+            get_from_func, db, current.node_id, min_strength
+        )
+        in_edges = await _call_relation_callback(
+            get_to_func, db, current.node_id, min_strength
+        )
 
-    # 入边
-    in_edges = await get_to_func(db, node.node_id, min_strength)
-    for edge in in_edges:
-        source = await get_id_func(db, edge.source_id)
-        if source and source.file_path:
-            relations["incoming"].append({
-                "file_path": source.file_path,
-                "title": source.title,
-                "relation_type": edge.edge_type.value,
-                "strength": edge.weight,
-                "reason": edge.reason,
-            })
+        for direction, edges in (("outgoing", out_edges), ("incoming", in_edges)):
+            for edge in edges:
+                neighbor_id = edge.target_id if direction == "outgoing" else edge.source_id
+                relation_key = (edge.edge_id, direction, current.node_id, neighbor_id)
+                if relation_key in seen_relations:
+                    continue
+                seen_relations.add(relation_key)
+                neighbor = await _call_relation_callback(get_id_func, db, neighbor_id)
+                if neighbor is None or not neighbor.file_path:
+                    continue
+                neighbor_eligibility = assess_document_path(neighbor.file_path)
+                if not neighbor_eligibility.eligible:
+                    continue
+                known_depth = node_depths.get(neighbor.node_id)
+                if known_depth is not None and known_depth < next_depth:
+                    continue
+                relations[direction].append(
+                    {
+                        "file_path": neighbor.file_path,
+                        "title": neighbor.title,
+                        "relation_type": edge.edge_type.value,
+                        "strength": edge.weight,
+                        "reason": edge.reason,
+                        "depth": next_depth,
+                        "edge_id": edge.edge_id,
+                    }
+                )
+                if known_depth is None:
+                    node_depths[neighbor.node_id] = next_depth
+                    frontier.append((neighbor, next_depth))
 
     return relations
 

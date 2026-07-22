@@ -30,6 +30,342 @@ logger = get_logger("life_engine", display="life_engine")
 # DFC 注入目标标识
 _TARGET_REMINDER_BUCKET = "actor"
 _TARGET_REMINDER_NAME = "生命中枢唤醒上下文"
+_SUMMARY_CONTENT_TYPES = {
+    "attention_summary",
+    "history_summary",
+    "subconscious_summary",
+}
+_CONTEXT_COMPRESSION_MARKERS = (
+    "context compression system",
+    "context_compression_system",
+    "上下文压缩系统",
+    "上下文压缩",
+)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return default
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _safe_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if not normalized:
+            return default
+        return normalized in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _is_legacy_summary_data(data: dict[str, Any]) -> bool:
+    """识别 v1 用 HEARTBEAT 表示的摘要事件。"""
+    if str(data.get("event_type") or "").strip().lower() != EventType.HEARTBEAT.value:
+        return False
+    if _safe_int(data.get("heartbeat_index"), 0) == -1:
+        return True
+    content_type = str(data.get("content_type") or "").strip().lower()
+    if content_type in _SUMMARY_CONTENT_TYPES:
+        return True
+    source_detail = str(data.get("source_detail") or "").strip().lower()
+    return any(marker in source_detail for marker in _CONTEXT_COMPRESSION_MARKERS)
+
+
+def _sort_events(events: list[LifeEngineEvent]) -> list[LifeEngineEvent]:
+    return sorted(
+        events,
+        key=lambda event: (_safe_int(event.sequence), str(event.event_id or "")),
+    )
+
+
+def _coerce_summary(value: Any) -> Any:
+    from .subconscious_context import SubconsciousSummary, SummaryEntry
+
+    if isinstance(value, SubconsciousSummary):
+        return SubconsciousSummary.from_dict(value.to_dict())
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return SubconsciousSummary()
+        try:
+            value = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return SubconsciousSummary(entries=[SummaryEntry(kind="fact", text=text)])
+    if not isinstance(value, dict):
+        return SubconsciousSummary()
+
+    canonical_keys = {
+        "schema_version",
+        "covered_from_sequence",
+        "covered_through_sequence",
+        "entries",
+        "stats",
+    }
+    if not canonical_keys.intersection(value):
+        entry = _summary_entry_from_dict(value)
+        if entry is None:
+            text = _summary_body_text(value)
+            entry = SummaryEntry(kind="fact", text=text) if text else None
+        return SubconsciousSummary(entries=[entry] if entry is not None else [])
+
+    raw_entries = value.get("entries")
+    entry_values = raw_entries if isinstance(raw_entries, list) else [raw_entries]
+    entries = [
+        entry
+        for raw_entry in entry_values
+        if raw_entry is not None
+        for entry in [_summary_entry_from_dict(raw_entry)]
+        if entry is not None
+    ]
+    if raw_entries and not entries:
+        entries.append(SummaryEntry(kind="fact", text=_summary_body_text(raw_entries)))
+    for key in ("summary", "text", "content", "body", "description", "fact"):
+        if value.get(key) is None:
+            continue
+        text = _summary_body_text(value.get(key))
+        if text:
+            entries.append(SummaryEntry(kind="fact", text=text))
+        break
+
+    stats: dict[str, int] = {}
+    raw_stats = value.get("stats")
+    if isinstance(raw_stats, dict):
+        for key, raw_value in raw_stats.items():
+            try:
+                stats[str(key)] = int(raw_value or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+    return SubconsciousSummary(
+        schema_version=max(1, _safe_int(value.get("schema_version"), 1)),
+        covered_from_sequence=max(
+            0,
+            _safe_int(value.get("covered_from_sequence")),
+        ),
+        covered_through_sequence=max(
+            0,
+            _safe_int(value.get("covered_through_sequence")),
+        ),
+        entries=entries,
+        stats=stats,
+    )
+
+
+def _summary_to_dict(value: Any) -> dict[str, Any]:
+    return _coerce_summary(value).to_dict()
+
+
+def _summary_body_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if value is None:
+        return ""
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return str(value).strip()
+
+
+def _summary_entry_from_dict(data: Any) -> Any:
+    from .subconscious_context import SummaryEntry
+
+    if isinstance(data, SummaryEntry):
+        data = data.to_dict()
+    if isinstance(data, str):
+        text = data.strip()
+        return SummaryEntry(kind="fact", text=text) if text else None
+    if not isinstance(data, dict):
+        text = str(data or "").strip()
+        return SummaryEntry(kind="fact", text=text) if text else None
+
+    raw_text = next(
+        (
+            data.get(key)
+            for key in ("text", "content", "summary", "body", "description", "fact")
+            if data.get(key) is not None
+        ),
+        "",
+    )
+    text = _summary_body_text(raw_text)
+    if not text:
+        text = _summary_body_text(data)
+    if not text:
+        return None
+
+    raw_event_ids = data.get("event_ids")
+    if raw_event_ids is None:
+        raw_event_ids = data.get("event_id")
+    if isinstance(raw_event_ids, (list, tuple, set)):
+        event_ids = [str(value) for value in raw_event_ids if value]
+    elif raw_event_ids:
+        event_ids = [str(raw_event_ids)]
+    else:
+        event_ids = []
+
+    raw_sequences = data.get("sequences")
+    if raw_sequences is None:
+        raw_sequences = data.get("sequence")
+    if isinstance(raw_sequences, (list, tuple, set)):
+        sequence_values = raw_sequences
+    elif raw_sequences is None:
+        sequence_values = []
+    else:
+        sequence_values = [raw_sequences]
+    sequences: list[int] = []
+    for value in sequence_values:
+        try:
+            sequences.append(int(value))
+        except (TypeError, ValueError, OverflowError):
+            continue
+
+    return SummaryEntry(
+        kind=str(data.get("kind") or data.get("event_type") or data.get("type") or "fact"),
+        text=text,
+        event_ids=list(dict.fromkeys(event_ids)),
+        sequences=sorted(set(sequences)),
+        source=str(data.get("source") or ""),
+        tool_name=(
+            str(data["tool_name"])
+            if data.get("tool_name") is not None
+            else None
+        ),
+    )
+
+
+def _summary_from_event(event: LifeEngineEvent, body: Any = None) -> Any:
+    """把结构化或旧文本摘要转换为可合并的摘要种子。"""
+    from .subconscious_context import SubconsciousSummary, SummaryEntry
+
+    raw_body = event.content if body is None else body
+    decoded = raw_body
+    if isinstance(raw_body, str) and raw_body.strip():
+        try:
+            decoded = json.loads(raw_body)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decoded = None
+
+    if isinstance(decoded, dict):
+        summary = _coerce_summary(decoded)
+    elif isinstance(decoded, list):
+        entries = [
+            entry
+            for raw_entry in decoded
+            for entry in [_summary_entry_from_dict(raw_entry)]
+            if entry is not None
+        ]
+        summary = SubconsciousSummary(entries=entries)
+    else:
+        decoded_text = decoded.strip() if isinstance(decoded, str) else ""
+        text = decoded_text or _summary_body_text(raw_body)
+        summary = SubconsciousSummary(
+            entries=[SummaryEntry(kind="fact", text=text)] if text else []
+        )
+
+    sequence = _safe_int(event.sequence)
+    for entry in summary.entries:
+        if not entry.event_ids and event.event_id:
+            entry.event_ids = [str(event.event_id)]
+        if not entry.sequences and event.sequence is not None:
+            entry.sequences = [sequence]
+        if not entry.source:
+            entry.source = str(event.source or "")
+
+    entry_sequences = [
+        value
+        for entry in summary.entries
+        for value in entry.sequences
+        if value > 0
+    ]
+    if summary.covered_from_sequence <= 0:
+        summary.covered_from_sequence = (
+            min(entry_sequences) if entry_sequences else max(0, sequence)
+        )
+    summary.covered_through_sequence = max(
+        summary.covered_through_sequence,
+        max(entry_sequences, default=0),
+        max(0, sequence),
+    )
+    return summary
+
+
+def _deduplicate_summary(summary: Any) -> Any:
+    from .subconscious_context import SubconsciousSummary, SummaryEntry
+
+    entries_by_content: dict[str, SummaryEntry] = {}
+    for raw_entry in summary.entries:
+        entry = _summary_entry_from_dict(raw_entry.to_dict())
+        if entry is None:
+            continue
+        normalized = " ".join(str(entry.text or "").split()).casefold()
+        if not normalized:
+            continue
+        existing = entries_by_content.get(normalized)
+        if existing is None:
+            entries_by_content[normalized] = entry
+            continue
+        existing.event_ids = list(
+            dict.fromkeys([*existing.event_ids, *entry.event_ids])
+        )
+        existing.sequences = sorted(set([*existing.sequences, *entry.sequences]))
+        if not existing.source:
+            existing.source = entry.source
+        if not existing.tool_name:
+            existing.tool_name = entry.tool_name
+
+    entries = sorted(
+        entries_by_content.values(),
+        key=lambda entry: (
+            entry.sequences[0] if entry.sequences else 0,
+            entry.kind,
+            entry.text,
+        ),
+    )
+    stats: dict[str, int] = {}
+    for key, value in (summary.stats or {}).items():
+        stats[str(key)] = max(0, _safe_int(value))
+    return SubconsciousSummary(
+        schema_version=1,
+        covered_from_sequence=max(0, _safe_int(summary.covered_from_sequence)),
+        covered_through_sequence=max(0, _safe_int(summary.covered_through_sequence)),
+        entries=entries,
+        stats=stats,
+    )
+
+
+def _merge_summaries(left: Any, right: Any) -> Any:
+    from .subconscious_context import SubconsciousSummary
+
+    left = _coerce_summary(left)
+    right = _coerce_summary(right)
+    covered_from = [
+        value
+        for value in (
+            _safe_int(left.covered_from_sequence),
+            _safe_int(right.covered_from_sequence),
+        )
+        if value > 0
+    ]
+    stats = dict(left.stats or {})
+    for key, value in (right.stats or {}).items():
+        stats[str(key)] = max(stats.get(str(key), 0), _safe_int(value))
+    return _deduplicate_summary(
+        SubconsciousSummary(
+            schema_version=1,
+            covered_from_sequence=min(covered_from) if covered_from else 0,
+            covered_through_sequence=max(
+                _safe_int(left.covered_through_sequence),
+                _safe_int(right.covered_through_sequence),
+            ),
+            entries=[*left.entries, *right.entries],
+            stats=stats,
+        )
+    )
 
 
 def event_to_dict(event: LifeEngineEvent) -> dict[str, Any]:
@@ -54,9 +390,14 @@ def event_to_dict(event: LifeEngineEvent) -> dict[str, Any]:
         "chat_type": event.chat_type,
         "stream_id": event.stream_id,
         "heartbeat_index": event.heartbeat_index,
+        "heartbeat_run_id": event.heartbeat_run_id,
+        "call_id": event.call_id,
+        "parent_event_id": event.parent_event_id,
+        "causation_id": event.causation_id,
         "tool_name": event.tool_name,
         "tool_args": event.tool_args,
         "tool_success": event.tool_success,
+        "heartbeat_context_consumed": event.heartbeat_context_consumed,
     }
 
 
@@ -73,13 +414,15 @@ def event_from_dict(
     Returns:
         反序列化的事件对象
     """
-    event_type_raw = str(data.get("event_type") or EventType.MESSAGE.value)
+    event_type_raw = str(data.get("event_type") or EventType.MESSAGE.value).strip().lower()
     try:
         event_type = EventType(event_type_raw)
     except ValueError:
         event_type = EventType.MESSAGE
+    if _is_legacy_summary_data(data):
+        event_type = EventType.SUMMARY
 
-    sequence = int(data.get("sequence") or 0)
+    sequence = _safe_int(data.get("sequence"))
     event_id = data.get("event_id")
     if not event_id and next_sequence_func is not None:
         # 仅在 event_id 缺失时使用生成器作为后备
@@ -88,6 +431,12 @@ def event_from_dict(
     elif not event_id:
         event_id = f"evt_{sequence}"
 
+    raw_content = data.get("content")
+    if isinstance(raw_content, (dict, list)):
+        content = json.dumps(raw_content, ensure_ascii=False, sort_keys=True)
+    else:
+        content = str(raw_content or "")
+
     return LifeEngineEvent(
         event_id=str(event_id),
         event_type=event_type,
@@ -95,15 +444,22 @@ def event_from_dict(
         sequence=sequence,
         source=str(data.get("source") or "unknown"),
         source_detail=str(data.get("source_detail") or "unknown"),
-        content=str(data.get("content") or ""),
+        content=content,
         content_type=str(data.get("content_type") or "text"),
         sender=data.get("sender"),
         chat_type=data.get("chat_type"),
         stream_id=data.get("stream_id"),
         heartbeat_index=data.get("heartbeat_index"),
+        heartbeat_run_id=data.get("heartbeat_run_id"),
+        call_id=data.get("call_id"),
+        parent_event_id=data.get("parent_event_id"),
+        causation_id=data.get("causation_id"),
         tool_name=data.get("tool_name"),
         tool_args=data.get("tool_args"),
         tool_success=data.get("tool_success"),
+        heartbeat_context_consumed=_safe_bool(
+            data.get("heartbeat_context_consumed"),
+        ),
     )
 
 
@@ -207,11 +563,11 @@ def compress_history(
         event_id=f"summary_{uuid4().hex[:12]}",
         sequence=old_events[-1].sequence if old_events else 0,
         timestamp=old_events[-1].timestamp if old_events else _now_iso(),
-        event_type=EventType.HEARTBEAT,  # 用心跳类型表示摘要
+        event_type=EventType.SUMMARY,
         source="system",
         source_detail="上下文压缩系统",
         content=summary,
-        heartbeat_index=-1,  # 特殊标记表示这是摘要
+        content_type="history_summary",
     )
 
     # 返回：摘要 + 最近事件
@@ -285,10 +641,16 @@ class StatePersistence:
         """
         async with self._get_lock():
             payload = {
-                "version": 1,
+                "version": 2,
                 "state": {
                     "heartbeat_count": state.heartbeat_count,
                     "event_sequence": state.event_sequence,
+                    "heartbeat_context_cursor": _safe_int(
+                        getattr(state, "heartbeat_context_cursor", 0)
+                    ),
+                    "subconscious_summary": _summary_to_dict(
+                        getattr(state, "subconscious_summary", None)
+                    ),
                     "last_model_reply_at": state.last_model_reply_at,
                     "last_model_reply": state.last_model_reply,
                     "last_model_error": state.last_model_error,
@@ -363,44 +725,108 @@ class StatePersistence:
             logger.error(f"life_engine 读取上下文失败: {exc}")
             return [], [], {}
 
-        pending_raw = raw.get("pending_events")
-        history_raw = raw.get("event_history")
-        state_raw = raw.get("state") or {}
+        if not isinstance(raw, dict):
+            logger.warning("life_engine 上下文文件格式无效，跳过恢复")
+            return [], [], {}
+
+        pending_raw = raw.get("pending_events", [])
+        history_raw = raw.get("event_history", [])
+        raw_state_value = raw.get("state")
+        state_raw = raw_state_value if isinstance(raw_state_value, dict) else {}
 
         if not isinstance(pending_raw, list) or not isinstance(history_raw, list):
             logger.warning("life_engine 上下文文件格式无效，跳过恢复")
             return [], [], {}
 
+        persisted_summary = _coerce_summary(
+            state_raw.get("subconscious_summary", raw.get("subconscious_summary"))
+        )
         pending_events: list[LifeEngineEvent] = []
+        pending_summary_inputs: list[tuple[LifeEngineEvent, dict[str, Any]]] = []
+        parsed_history: list[tuple[LifeEngineEvent, dict[str, Any], bool]] = []
         history_events: list[LifeEngineEvent] = []
         for item in pending_raw:
             if isinstance(item, dict):
-                pending_events.append(event_from_dict(item, next_sequence_func))
+                event = event_from_dict(item, next_sequence_func)
+                if event.event_type == EventType.SUMMARY:
+                    pending_summary_inputs.append((event, item))
+                else:
+                    pending_events.append(event)
         for item in history_raw:
-            if isinstance(item, dict):
-                history_events.append(event_from_dict(item, next_sequence_func))
+            if not isinstance(item, dict):
+                continue
+            legacy_summary = _is_legacy_summary_data(item)
+            parsed_history.append(
+                (event_from_dict(item, next_sequence_func), item, legacy_summary)
+            )
 
-        history_limit = self._history_limit_func()
-        history_events = history_events[-history_limit:]
+        pending_events = _sort_events(pending_events)
+        pending_summary_inputs.sort(
+            key=lambda item: (
+                _safe_int(item[0].sequence),
+                str(item[0].event_id or ""),
+            )
+        )
+        for event, item in pending_summary_inputs:
+            persisted_summary = _merge_summaries(
+                persisted_summary,
+                _summary_from_event(event, item.get("content")),
+            )
+        parsed_history.sort(
+            key=lambda item: (
+                _safe_int(item[0].sequence),
+                str(item[0].event_id or ""),
+            )
+        )
+        parsed_history_events = [event for event, _, _ in parsed_history]
+        for event, item, legacy_summary in parsed_history:
+            if legacy_summary or event.event_type == EventType.SUMMARY:
+                persisted_summary = _merge_summaries(
+                    persisted_summary,
+                    _summary_from_event(event, item.get("content")),
+                )
+            if not legacy_summary and event.event_type != EventType.SUMMARY:
+                history_events.append(event)
+        loaded_events = [*pending_events, *parsed_history_events, *[event for event, _ in pending_summary_inputs]]
+        loaded_max_sequence = max(
+            (_safe_int(event.sequence) for event in loaded_events),
+            default=0,
+        )
+        history_limit = max(0, _safe_int(self._history_limit_func()))
+        history_events = history_events[-history_limit:] if history_limit else []
+        summary_dict = _deduplicate_summary(persisted_summary).to_dict()
 
         async with self._get_lock():
             state.pending_event_count = len(pending_events)
             state.history_event_count = len(history_events)
-            state.heartbeat_count = int(state_raw.get("heartbeat_count") or state.heartbeat_count)
-            state.event_sequence = int(state_raw.get("event_sequence") or state.event_sequence)
+            state.heartbeat_count = _safe_int(
+                state_raw.get("heartbeat_count"),
+                state.heartbeat_count,
+            )
+            state.event_sequence = max(
+                _safe_int(state.event_sequence),
+                _safe_int(state_raw.get("event_sequence")),
+                loaded_max_sequence,
+            )
+            if hasattr(state, "heartbeat_context_cursor"):
+                state.heartbeat_context_cursor = _safe_int(
+                    state_raw.get("heartbeat_context_cursor")
+                )
+            if hasattr(state, "subconscious_summary"):
+                state.subconscious_summary = summary_dict
             state.last_model_reply_at = state_raw.get("last_model_reply_at")
             state.last_model_reply = state_raw.get("last_model_reply")
             state.last_model_error = state_raw.get("last_model_error")
             state.last_wake_context_at = state_raw.get("last_wake_context_at")
-            state.last_wake_context_size = int(state_raw.get("last_wake_context_size") or 0)
+            state.last_wake_context_size = _safe_int(state_raw.get("last_wake_context_size"))
             state.last_external_message_at = state_raw.get("last_external_message_at")
             state.last_tell_dfc_at = state_raw.get("last_tell_dfc_at")
-            state.tell_dfc_count = int(state_raw.get("tell_dfc_count") or 0)
+            state.tell_dfc_count = _safe_int(state_raw.get("tell_dfc_count"))
             state.self_pause_until = state_raw.get("self_pause_until")
             state.self_pause_started_at = state_raw.get("self_pause_started_at")
             state.self_pause_reason = state_raw.get("self_pause_reason")
-            state.self_pause_duration_minutes = int(
-                state_raw.get("self_pause_duration_minutes") or 0
+            state.self_pause_duration_minutes = _safe_int(
+                state_raw.get("self_pause_duration_minutes")
             )
             raw_cursors = state_raw.get("chatter_context_cursors")
             if isinstance(raw_cursors, dict):
@@ -451,17 +877,12 @@ class StatePersistence:
                         snapshots[sid] = snapshot
                 state.last_chatter_think_by_stream = snapshots
 
-            if history_events:
-                max_seq = max(event.sequence for event in history_events)
-                if pending_events:
-                    max_seq = max(max_seq, max(event.sequence for event in pending_events))
-                state.event_sequence = max(state.event_sequence, max_seq)
-
         # 子系统持久化状态
         persisted_state = {
             "snn_state": raw.get("snn_state"),
             "neuromod_state": raw.get("neuromod_state"),
             "dream_state": raw.get("dream_state"),
+            "subconscious_summary": summary_dict,
         }
 
         logger.info(

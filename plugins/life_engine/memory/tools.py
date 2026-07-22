@@ -14,11 +14,20 @@ from typing import Annotated, Any, List, Optional
 from src.app.plugin_system.api import log_api
 from src.app.plugin_system.base import BaseTool
 
-from .service import LifeMemoryService
 from .edges import EdgeType
+from .eligibility import assess_document_path
 from .lineage import MemoryBundle
+from .service import LifeMemoryService
 
 logger = log_api.get_logger("life_engine.memory_tools")
+
+
+def _eligible_path_or_error(file_path: str) -> tuple[str | None, str | None]:
+    """Normalize a tool path without allowing runtime/internal memory domains."""
+    decision = assess_document_path(file_path)
+    if decision.eligible:
+        return decision.path, None
+    return None, f"不是可操作的记忆文档: {decision.reason}"
 
 
 def _bundle_to_payload(bundle: MemoryBundle) -> dict[str, Any]:
@@ -89,7 +98,7 @@ class LifeEngineSearchMemoryTool(BaseTool):
         "- source='associated'：通过关联路径联想到的，association_path 显示联想路线\n"
         "- memory_bundles：当前理解 + 历史轨迹 + 修正记录；旧记忆不会被删除，会作为演化证据保留\n"
         "\n"
-        "**注意：** 搜索会自动增强命中记忆的激活强度，长期不访问的记忆会自然衰减。"
+        "**注意：** 搜索和联想是只读操作，不会自动增强激活强度或创建/强化关联边。"
     )
     chatter_allow: list[str] = ["life_engine_internal"]
 
@@ -254,15 +263,20 @@ class LifeEngineRelateFileTool(BaseTool):
         if relation_type not in valid_types:
             return False, {"error": f"relation_type 必须是 {valid_types} 之一"}
 
+        source_path, source_error = _eligible_path_or_error(source_path)
+        target_path, target_error = _eligible_path_or_error(target_path)
+        if source_error or target_error:
+            return False, {"error": source_error or target_error}
+
         # 验证强度
         strength = max(0.1, min(1.0, strength))
 
         try:
             service = await self._get_service()
 
-            # 获取或创建节点
-            source_node = await service.get_or_create_file_node(source_path)
-            target_node = await service.get_or_create_file_node(target_path)
+            # 只允许真实的、合格的工作区记忆文档进入关联图。
+            source_node = await service.get_or_create_workspace_document_node(source_path)
+            target_node = await service.get_or_create_workspace_document_node(target_path)
 
             # 创建边
             edge_type = EdgeType(relation_type)
@@ -330,6 +344,9 @@ class LifeEngineViewRelationsTool(BaseTool):
         """查看关联图谱。"""
         if not file_path:
             return False, {"error": "file_path 不能为空"}
+        file_path, path_error = _eligible_path_or_error(file_path)
+        if path_error:
+            return False, {"error": path_error}
 
         depth = max(1, min(3, depth))
         min_strength = max(0.0, min(1.0, min_strength))
@@ -396,6 +413,11 @@ class LifeEngineForgetRelationTool(BaseTool):
 
         if mode not in ("delete", "weaken"):
             return False, {"error": "mode 必须是 'delete' 或 'weaken'"}
+
+        source_path, source_error = _eligible_path_or_error(source_path)
+        target_path, target_error = _eligible_path_or_error(target_path)
+        if source_error or target_error:
+            return False, {"error": source_error or target_error}
 
         try:
             service = await self._get_service()

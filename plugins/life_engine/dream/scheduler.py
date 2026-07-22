@@ -98,6 +98,7 @@ class DreamScheduler:
         rem_decay_factor: float = 0.6,
         rem_learning_rate: float = 0.05,
         rem_edge_prune_threshold: float = 0.08,
+        rem_persist_learning: bool = False,
         # 调度参数
         dream_interval_minutes: int = 90,
         idle_trigger_heartbeats: int = 10,
@@ -121,6 +122,7 @@ class DreamScheduler:
         self._rem_decay_factor = rem_decay_factor
         self._rem_learning_rate = rem_learning_rate
         self._rem_edge_prune_threshold = rem_edge_prune_threshold
+        self._rem_persist_learning = rem_persist_learning
 
         self._dream_interval_seconds = dream_interval_minutes * 60
         self._idle_trigger_heartbeats = idle_trigger_heartbeats
@@ -457,6 +459,7 @@ class DreamScheduler:
                 max_depth=effective_depth,
                 decay_factor=effective_decay,
                 learning_rate=self._rem_learning_rate,
+                persist_learning=self._rem_persist_learning,
             )
             report.nodes_activated += int(result.get("nodes_activated", 0) or 0)
             report.new_edges_created += int(result.get("new_edges_created", 0) or 0)
@@ -464,13 +467,14 @@ class DreamScheduler:
             if not report.seed_node_ids:
                 report.seed_node_ids = list(result.get("seed_ids") or [])
 
-        pruned = await self._memory.prune_weak_edges(
-            threshold=self._rem_edge_prune_threshold,
-        )
-        if isinstance(pruned, dict):
-            report.edges_pruned = int(pruned.get("pruned", 0) or 0)
-        else:
-            report.edges_pruned = int(pruned or 0)
+        if self._rem_persist_learning:
+            pruned = await self._memory.prune_weak_edges(
+                threshold=self._rem_edge_prune_threshold,
+            )
+            if isinstance(pruned, dict):
+                report.edges_pruned = int(pruned.get("pruned", 0) or 0)
+            else:
+                report.edges_pruned = int(pruned or 0)
 
         return report
 

@@ -21,6 +21,7 @@ from .event_builder import (
     _now_iso,
     _shorten_text,
     INTERNAL_PLATFORM,
+    is_life_heartbeat_event,
 )
 
 if TYPE_CHECKING:
@@ -143,7 +144,7 @@ class DFCIntegration:
         # 2. 最近思考（最近1-2条心跳独白）
         heartbeat_events = [
             e for e in self._service._event_history
-            if e.event_type == EventType.HEARTBEAT
+            if is_life_heartbeat_event(e)
         ][-2:]
 
         if heartbeat_events:
@@ -531,13 +532,8 @@ class SNNIntegration:
 
     @staticmethod
     def _is_real_heartbeat_event(event: LifeEngineEvent) -> bool:
-        """判断是否为真实心跳（排除压缩摘要事件）。"""
-        if event.event_type != EventType.HEARTBEAT:
-            return False
-        heartbeat_index = getattr(event, "heartbeat_index", None)
-        if heartbeat_index is None:
-            return True
-        return heartbeat_index >= 0
+        """判断是否为生命中枢自身产生的真实心跳。"""
+        return is_life_heartbeat_event(event)
 
     @staticmethod
     def _collect_tool_metrics(events: list[LifeEngineEvent]) -> tuple[int, int, int]:
