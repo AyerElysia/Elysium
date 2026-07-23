@@ -10,6 +10,7 @@ from typing import Any, Sequence
 
 import pytest
 
+from plugins.life_engine.memory import worker as worker_module
 from plugins.life_engine.memory.indexing import (
     claim_index_jobs,
     create_memory_schema,
@@ -430,3 +431,335 @@ async def test_worker_drops_payload_updated_while_embedding(tmp_path: Path) -> N
     assert node["embedding_content_hash"] is None
     assert node["embedding_model"] is None
     assert node["embedding_updated_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_worker_exports_only_valid_document_bodies(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    valid_body = "ordinary valid body reaches the worker outputs"
+    noncanonical_body = "noncanonical body must never leave sqlite"
+    deleted_body = "deleted body must never leave sqlite"
+    concept_body = "concept body must never leave sqlite"
+    wrong_identity_body = "wrong identity body must never leave sqlite"
+    valid = upsert_document_rows(db, "notes/valid.md", valid_body, now=1.0)
+    noncanonical = upsert_document_rows(
+        db,
+        "notes/noncanonical.md",
+        noncanonical_body,
+        now=2.0,
+    )
+    deleted = upsert_document_rows(db, "notes/deleted.md", deleted_body, now=3.0)
+    concept = upsert_document_rows(db, "notes/concept.md", concept_body, now=4.0)
+    wrong_identity = upsert_document_rows(
+        db,
+        "notes/wrong-identity.md",
+        wrong_identity_body,
+        now=5.0,
+    )
+    db.execute(
+        "UPDATE memory_nodes SET file_path = ? WHERE node_id = ?",
+        ("./notes/noncanonical.md", noncanonical.node_id),
+    )
+    db.execute(
+        "UPDATE memory_nodes SET is_deleted = 1 WHERE node_id = ?",
+        (deleted.node_id,),
+    )
+    db.execute(
+        "UPDATE memory_nodes SET node_type = 'concept' WHERE node_id = ?",
+        (concept.node_id,),
+    )
+    # Keep every related row structurally consistent under a file ID that does
+    # not belong to this canonical path, so the node predicate is the boundary
+    # being exercised rather than a foreign-key or chunk-ID failure.
+    assert wrong_identity.content_hash is not None
+    wrong_node_id = "file:000000000000"
+    wrong_job_id = f"{wrong_node_id}:{wrong_identity.content_hash}"
+    chunk_rows = db.execute(
+        "SELECT chunk_id, chunk_index, content_hash FROM memory_chunks WHERE node_id = ?",
+        (wrong_identity.node_id,),
+    ).fetchall()
+    db.commit()
+    db.execute("PRAGMA foreign_keys = OFF")
+    db.execute(
+        "UPDATE memory_nodes SET node_id = ? WHERE node_id = ?",
+        (wrong_node_id, wrong_identity.node_id),
+    )
+    for chunk in chunk_rows:
+        chunk_index = int(chunk["chunk_index"])
+        chunk_hash = str(chunk["content_hash"])
+        db.execute(
+            "UPDATE memory_chunks SET node_id = ?, chunk_id = ? WHERE chunk_id = ?",
+            (
+                wrong_node_id,
+                f"{wrong_node_id}:{chunk_index}:{chunk_hash}",
+                chunk["chunk_id"],
+            ),
+        )
+    db.execute(
+        "UPDATE memory_index_jobs SET job_id = ?, node_id = ? WHERE job_id = ?",
+        (wrong_job_id, wrong_node_id, wrong_identity.job_id),
+    )
+    db.commit()
+    db.execute("PRAGMA foreign_keys = ON")
+
+    embed_calls: list[list[str]] = []
+
+    async def embed(texts: Sequence[str]) -> EmbeddingResult:
+        embed_calls.append(list(texts))
+        return await _embed_ok(texts)
+
+    recorder = _RecordingUpsert()
+    report = await process_index_jobs(
+        db,
+        object(),
+        limit=10,
+        embed_texts_func=embed,
+        collection_upsert_func=recorder.upsert,
+        now=10.0,
+    )
+
+    embedded_texts = [text for call in embed_calls for text in call]
+    upserted_documents = [
+        document for call in recorder.calls for document in call["documents"]
+    ]
+    invalid_bodies = (
+        noncanonical_body,
+        deleted_body,
+        concept_body,
+        wrong_identity_body,
+    )
+    assert valid_body in embedded_texts
+    assert valid_body in upserted_documents
+    assert all(body not in embedded_texts for body in invalid_bodies)
+    assert all(body not in upserted_documents for body in invalid_bodies)
+    assert report.completed == (valid.job_id,)
+    assert report.failed == ()
+    invalid_job_ids = {
+        noncanonical.job_id,
+        deleted.job_id,
+        concept.job_id,
+        wrong_job_id,
+    }
+    assert set(report.stale) == invalid_job_ids
+
+    for job_id in invalid_job_ids:
+        row = db.execute(
+            "SELECT status, error FROM memory_index_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        assert report.errors[job_id] == "InvalidDocumentIdentity"
+        assert row is not None
+        assert (row["status"], row["error"]) == (
+            "stale",
+            "InvalidDocumentIdentity",
+        )
+
+
+@pytest.mark.asyncio
+async def test_worker_never_exports_malformed_chunk_identity(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    indexed = upsert_document_rows(
+        db,
+        "notes/chunk-boundary.md",
+        "must never leave sqlite",
+        now=2.0,
+    )
+    db.execute(
+        "UPDATE memory_chunks SET chunk_id = 'malformed-chunk' WHERE node_id = ?",
+        (indexed.node_id,),
+    )
+    db.commit()
+    recorder = _RecordingUpsert()
+
+    async def reject_embed(_: Sequence[str]) -> EmbeddingResult:
+        pytest.fail("malformed chunk content reached the embedder")
+
+    report = await process_index_jobs(
+        db,
+        object(),
+        embed_texts_func=reject_embed,
+        collection_upsert_func=recorder.upsert,
+        now=10.0,
+    )
+
+    assert report.stale == (indexed.job_id,)
+    assert report.errors[indexed.job_id] == "InvalidChunkIdentity"
+    assert recorder.calls == []
+
+
+@pytest.mark.asyncio
+async def test_worker_revalidates_invalid_identity_after_delayed_embedding(
+    tmp_path: Path,
+) -> None:
+    db = _db(tmp_path)
+    body = "legal body must not reach chroma after identity mutation"
+    indexed = upsert_document_rows(
+        db,
+        "notes/delayed-identity.md",
+        body,
+        now=2.0,
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    embed_calls: list[list[str]] = []
+
+    async def delayed_embed(texts: Sequence[str]) -> EmbeddingResult:
+        embed_calls.append(list(texts))
+        started.set()
+        await release.wait()
+        return await _embed_ok(texts)
+
+    recorder = _RecordingUpsert()
+    task = asyncio.create_task(
+        process_index_jobs(
+            db,
+            object(),
+            embed_texts_func=delayed_embed,
+            collection_upsert_func=recorder.upsert,
+            now=10.0,
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    db.execute(
+        "UPDATE memory_nodes SET node_type = 'concept' WHERE node_id = ?",
+        (indexed.node_id,),
+    )
+    db.commit()
+    release.set()
+    report = await task
+
+    row = db.execute(
+        "SELECT status, error FROM memory_index_jobs WHERE job_id = ?",
+        (indexed.job_id,),
+    ).fetchone()
+    assert embed_calls == [[body]]
+    assert report.stale == (indexed.job_id,)
+    assert report.errors[indexed.job_id] == "InvalidDocumentIdentity"
+    assert report.upserted_chunks == 0
+    assert recorder.calls == []
+    assert row is not None
+    assert (row["status"], row["error"]) == ("stale", "InvalidDocumentIdentity")
+
+
+@pytest.mark.asyncio
+async def test_worker_revalidates_deleted_identity_before_embedding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = _db(tmp_path)
+    indexed = upsert_document_rows(
+        db,
+        "notes/pre-embed-identity.md",
+        "body must not reach the embedder after preflight mutation",
+        now=2.0,
+    )
+    original_load = worker_module._load_job_payloads
+
+    def load_then_delete(
+        connection: sqlite3.Connection,
+        jobs: Sequence[Any],
+    ) -> tuple[list[Any], list[str], dict[str, str]]:
+        result = original_load(connection, jobs)
+        connection.execute(
+            "UPDATE memory_nodes SET is_deleted = 1 WHERE node_id = ?",
+            (indexed.node_id,),
+        )
+        connection.commit()
+        return result
+
+    monkeypatch.setattr(worker_module, "_load_job_payloads", load_then_delete)
+    recorder = _RecordingUpsert()
+
+    async def reject_embed(_: Sequence[str]) -> EmbeddingResult:
+        pytest.fail("deleted document content reached the embedder")
+
+    report = await process_index_jobs(
+        db,
+        object(),
+        embed_texts_func=reject_embed,
+        collection_upsert_func=recorder.upsert,
+        now=10.0,
+    )
+
+    row = db.execute(
+        "SELECT status, error FROM memory_index_jobs WHERE job_id = ?",
+        (indexed.job_id,),
+    ).fetchone()
+    assert report.stale == (indexed.job_id,)
+    assert report.errors[indexed.job_id] == "InvalidDocumentIdentity"
+    assert report.embedded_chunks == 0
+    assert report.upserted_chunks == 0
+    assert recorder.calls == []
+    assert row is not None
+    assert (row["status"], row["error"]) == ("stale", "InvalidDocumentIdentity")
+
+
+@pytest.mark.asyncio
+async def test_tombstones_are_created_on_document_update(tmp_path: Path) -> None:
+    """Updating a document writes old chunk IDs to memory_vector_tombstones."""
+    db = _db(tmp_path)
+    upsert_document_rows(db, "notes/doc.md", "first version content here", "Doc")
+    rows = db.execute("SELECT chunk_id FROM memory_vector_tombstones").fetchall()
+    assert rows == []
+    upsert_document_rows(db, "notes/doc.md", "completely different content now", "Doc")
+    rows = db.execute("SELECT chunk_id FROM memory_vector_tombstones").fetchall()
+    assert len(rows) > 0
+
+
+@pytest.mark.asyncio
+async def test_tombstones_are_created_on_document_delete(tmp_path: Path) -> None:
+    """Deleting a document writes chunk IDs to memory_vector_tombstones."""
+    from plugins.life_engine.memory.indexing import delete_document_rows
+    db = _db(tmp_path)
+    upsert_document_rows(db, "notes/del.md", "content to delete later", "Del")
+    delete_document_rows(db, "notes/del.md")
+    rows = db.execute("SELECT chunk_id FROM memory_vector_tombstones").fetchall()
+    assert len(rows) > 0
+
+
+@pytest.mark.asyncio
+async def test_consume_tombstones_calls_collection_delete(tmp_path: Path) -> None:
+    """consume_vector_tombstones forwards tombstoned IDs to collection.delete."""
+    from plugins.life_engine.memory.indexing import delete_document_rows
+    from plugins.life_engine.memory.worker import consume_vector_tombstones
+
+    db = _db(tmp_path)
+    upsert_document_rows(db, "notes/tomb.md", "old content to be superseded here", "Tomb")
+    old_ids = [
+        row["chunk_id"]
+        for row in db.execute("SELECT chunk_id FROM memory_chunks WHERE 1=1").fetchall()
+    ]
+    assert old_ids
+    delete_document_rows(db, "notes/tomb.md")
+
+    deleted_ids: list[str] = []
+
+    class FakeCollection:
+        def delete(self, *, ids: list[str]) -> None:
+            deleted_ids.extend(ids)
+
+    cleared = await consume_vector_tombstones(db, FakeCollection())
+    assert cleared == len(old_ids)
+    assert set(deleted_ids) == set(old_ids)
+    rows = db.execute("SELECT chunk_id FROM memory_vector_tombstones").fetchall()
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_consume_tombstones_handles_collection_delete_error(tmp_path: Path) -> None:
+    """consume_vector_tombstones swallows collection.delete errors gracefully."""
+    from plugins.life_engine.memory.indexing import delete_document_rows
+    from plugins.life_engine.memory.worker import consume_vector_tombstones
+
+    db = _db(tmp_path)
+    upsert_document_rows(db, "notes/errortomb.md", "content that will be deleted", "ErrTomb")
+    delete_document_rows(db, "notes/errortomb.md")
+
+    class FailingCollection:
+        def delete(self, *, ids: list[str]) -> None:
+            raise RuntimeError("Chroma is down")
+
+    cleared = await consume_vector_tombstones(db, FailingCollection())
+    assert cleared == 0
+    rows = db.execute("SELECT chunk_id FROM memory_vector_tombstones").fetchall()
+    assert len(rows) > 0

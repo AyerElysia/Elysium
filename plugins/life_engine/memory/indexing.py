@@ -8,13 +8,18 @@ No vector database or network operation belongs here.
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Sequence
 
-from .eligibility import assess_document_path
+from .eligibility import (
+    assess_document_path,
+    assess_indexed_document_path,
+    register_indexed_path_sql_function,
+)
 from .nodes import (
     NodeType,
     canonical_file_node_id,
@@ -28,6 +33,11 @@ INDEX_SCHEMA_VERSION = 4
 ACTIVE_CHUNK_STATE_KEY = "active_chunk_collection"
 DEFAULT_CHUNK_SIZE = 900
 DEFAULT_CHUNK_OVERLAP = 120
+
+# ``check_same_thread=False`` lets service tasks use one connection from the
+# executor. SQLite savepoints are connection-scoped, so concurrent root scopes
+# must not mistake each other for nested transactions.
+_TRANSACTION_LOCK = threading.RLock()
 
 
 class DocumentIdentityConflict(ValueError):
@@ -117,9 +127,70 @@ def _ensure_index_tables(db: sqlite3.Connection) -> None:
         "memory_chunks_fts",
         "memory_index_jobs",
         "memory_index_state",
+        "memory_vector_tombstones",
     )
     if any(not _table_exists(db, table) for table in required):
         create_memory_schema(db)
+
+
+def _stored_row_identity(
+    row: sqlite3.Row,
+    *,
+    require_node_id: bool = True,
+) -> tuple[str, str]:
+    """Return a strict stored file path and its canonical node identity."""
+    if str(row["node_type"] or "file").lower() != NodeType.FILE.value:
+        raise DocumentIdentityConflict("node is not a file node")
+    decision = assess_indexed_document_path(row["file_path"])
+    if not decision.eligible:
+        raise DocumentIdentityConflict("stored path is not a canonical eligible document")
+    path = decision.path
+    canonical_node_id = generate_file_node_id(path)
+    if require_node_id and str(row["node_id"] or "") != canonical_node_id:
+        raise DocumentIdentityConflict("stored path does not match node ID")
+    return path, canonical_node_id
+
+
+def _assert_stored_file_identity(
+    row: sqlite3.Row,
+    *,
+    expected_path: str | None = None,
+    expected_node_id: str | None = None,
+) -> str:
+    """Validate a persisted file row without normalizing historical storage."""
+    path, canonical_node_id = _stored_row_identity(row)
+    if expected_path is not None and path != expected_path:
+        raise DocumentIdentityConflict("stored path does not match expected identity")
+    if expected_node_id is not None and canonical_node_id != expected_node_id:
+        raise DocumentIdentityConflict("stored node ID does not match expected identity")
+    return path
+
+
+def _path_is_claimed_by_another_node(
+    db: sqlite3.Connection,
+    *,
+    path: str,
+    node_id: str,
+    ignored_node_id: str | None = None,
+) -> bool:
+    """Detect canonical or legacy spelling collisions without repairing them."""
+    rows = db.execute(
+        "SELECT node_id, node_type, file_path FROM memory_nodes "
+        "WHERE lower(COALESCE(node_type, 'file')) = ?",
+        (NodeType.FILE.value,),
+    ).fetchall()
+    for row in rows:
+        stored_path = "" if row["file_path"] is None else str(row["file_path"])
+        decision = assess_document_path(stored_path)
+        if not decision.eligible or decision.path != path:
+            continue
+        row_node_id = str(row["node_id"] or "")
+        if row_node_id == ignored_node_id:
+            continue
+        if row_node_id != node_id:
+            return True
+    return False
+
 
 @contextmanager
 def transaction(
@@ -127,32 +198,36 @@ def transaction(
     *,
     immediate: bool = False,
 ) -> Iterator[sqlite3.Cursor]:
-    """Run work in a transaction, supporting callers already in a transaction.
+    """Run one non-interleaving transaction on a potentially shared handle.
 
-    ``immediate=True`` acquires SQLite's reserved write lock at the root so a
-    maintenance batch cannot interleave its planning and mutation phases with a
-    second writer. Nested callers always use savepoints.
+    ``check_same_thread=False`` does not make transaction ownership safe: a
+    second executor task can otherwise observe the first task's root
+    transaction, create a savepoint, and have its work undone by the first
+    task's rollback. The reentrant lock spans the complete scope so nested
+    helper calls retain savepoint semantics while independent scopes cannot
+    share a root transaction accidentally.
     """
-    savepoint: str | None = None
-    if db.in_transaction:
-        savepoint = f"life_index_{id(db):x}_{time.monotonic_ns()}"
-        db.execute(f"SAVEPOINT {savepoint}")
-    else:
-        db.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
-    cursor = db.cursor()
-    try:
-        yield cursor
-        if savepoint is not None:
-            db.execute(f"RELEASE SAVEPOINT {savepoint}")
+    with _TRANSACTION_LOCK:
+        savepoint: str | None = None
+        if db.in_transaction:
+            savepoint = f"life_index_{id(db):x}_{time.monotonic_ns()}"
+            db.execute(f"SAVEPOINT {savepoint}")
         else:
-            db.commit()
-    except Exception:
-        if savepoint is not None:
-            db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-            db.execute(f"RELEASE SAVEPOINT {savepoint}")
-        else:
-            db.rollback()
-        raise
+            db.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+        cursor = db.cursor()
+        try:
+            yield cursor
+            if savepoint is not None:
+                db.execute(f"RELEASE SAVEPOINT {savepoint}")
+            else:
+                db.commit()
+        except Exception:
+            if savepoint is not None:
+                db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                db.execute(f"RELEASE SAVEPOINT {savepoint}")
+            else:
+                db.rollback()
+            raise
 
 
 def _ensure_memory_nodes(db: sqlite3.Connection) -> None:
@@ -259,6 +334,7 @@ def create_memory_schema(db: sqlite3.Connection, *, now: float | None = None) ->
     timestamp = float(time.time() if now is None else now)
     if db.row_factory is None:
         db.row_factory = sqlite3.Row
+    register_indexed_path_sql_function(db)
     with transaction(db):
         _ensure_memory_nodes(db)
         db.execute(
@@ -346,6 +422,20 @@ def create_memory_schema(db: sqlite3.Connection, *, now: float | None = None) ->
         _ensure_column(db, "memory_index_state", "dimension", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(db, "memory_index_state", "version", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(db, "memory_index_state", "updated_at", "REAL NOT NULL DEFAULT 0")
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_vector_tombstones (
+                chunk_id TEXT PRIMARY KEY,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        _ensure_column(db, "memory_vector_tombstones", "chunk_id", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(db, "memory_vector_tombstones", "created_at", "REAL NOT NULL DEFAULT 0")
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_vector_tombstones_created "
+            "ON memory_vector_tombstones(created_at)"
+        )
         tokenizer = _try_create_chunks_fts(db)
         if not tokenizer:
             tokenizer = _existing_fts_tokenizer(db)
@@ -374,8 +464,10 @@ create_index_schema = create_memory_schema
 
 
 def read_active_chunk_index_state(db: sqlite3.Connection) -> ChunkIndexState | None:
-    """Read the single active chunk collection marker, if one exists."""
-    _ensure_index_tables(db)
+    """Read the active chunk marker without creating or upgrading schema."""
+    _configure_connection(db)
+    if not _table_exists(db, "memory_index_state"):
+        return None
     row = db.execute(
         "SELECT collection_name, model_name, dimension, version, updated_at "
         "FROM memory_index_state WHERE state_key = ?",
@@ -577,6 +669,83 @@ def _replace_chunk_fts(
     )
 
 
+def _insert_chunk_tombstones(
+    db: sqlite3.Connection,
+    chunk_ids: Sequence[str],
+    now: float,
+) -> None:
+    """Record superseded chunk vector IDs for deferred Chroma deletion."""
+    ids = [str(cid) for cid in chunk_ids if cid]
+    if not ids or not _table_exists(db, "memory_vector_tombstones"):
+        return
+    db.executemany(
+        "INSERT OR IGNORE INTO memory_vector_tombstones(chunk_id, created_at) VALUES (?, ?)",
+        [(cid, now) for cid in ids],
+    )
+
+
+def ensure_document_reference_rows(
+    db: sqlite3.Connection,
+    file_path: str,
+    title: str = "",
+    *,
+    now: float | None = None,
+) -> DocumentIndexResult:
+    """Create one canonical file reference without replacing indexed content.
+
+    Relation-only callers sometimes need a node before a workspace document is
+    available. This helper intentionally creates no chunks and no vector job;
+    it must never overwrite an existing document body or its outbox state.
+    """
+    normalized_path, node_id = canonical_file_node_id(file_path)
+    _ensure_index_tables(db)
+    timestamp = float(time.time() if now is None else now)
+    document_title = str(title or Path(normalized_path).stem)
+    with transaction(db):
+        existing = db.execute(
+            "SELECT * FROM memory_nodes WHERE node_id = ?",
+            (node_id,),
+        ).fetchone()
+        if existing is not None:
+            _assert_stored_file_identity(
+                existing,
+                expected_path=normalized_path,
+                expected_node_id=node_id,
+            )
+            return DocumentIndexResult(
+                node_id=node_id,
+                file_path=normalized_path,
+                content_hash=existing["content_hash"],
+                chunks=(),
+                job_id=None,
+                source_mtime=existing["source_mtime"],
+            )
+        if _path_is_claimed_by_another_node(
+            db,
+            path=normalized_path,
+            node_id=node_id,
+        ):
+            raise DocumentIdentityConflict("document path is already claimed by another node")
+        db.execute(
+            """
+            INSERT INTO memory_nodes
+                (node_id, node_type, file_path, content_hash, title,
+                 activation_strength, access_count, last_accessed_at,
+                 emotional_valence, emotional_arousal, importance,
+                 created_at, updated_at, embedding_synced, is_deleted, index_revision)
+            VALUES (?, ?, ?, NULL, ?, 1.0, 0, NULL, 0.0, 0.0, 0.5, ?, ?, 0, 0, 0)
+            """,
+            (node_id, NodeType.FILE.value, normalized_path, document_title, timestamp, timestamp),
+        )
+    return DocumentIndexResult(
+        node_id=node_id,
+        file_path=normalized_path,
+        content_hash=None,
+        chunks=(),
+        job_id=None,
+    )
+
+
 def upsert_document_rows(
     db: sqlite3.Connection,
     file_path: str,
@@ -611,14 +780,21 @@ def upsert_document_rows(
     with transaction(db):
         _ensure_memory_nodes(db)
         existing = db.execute(
-            "SELECT node_type, file_path, created_at FROM memory_nodes WHERE node_id = ?",
+            "SELECT * FROM memory_nodes WHERE node_id = ?",
             (node_id,),
         ).fetchone()
         if existing is not None:
-            existing_path = str(existing["file_path"] or "")
-            existing_type = str(existing["node_type"] or "file").lower()
-            if existing_type != NodeType.FILE.value or existing_path != normalized_path:
-                raise DocumentIdentityConflict("node ID belongs to another document")
+            _assert_stored_file_identity(
+                existing,
+                expected_path=normalized_path,
+                expected_node_id=node_id,
+            )
+        if _path_is_claimed_by_another_node(
+            db,
+            path=normalized_path,
+            node_id=node_id,
+        ):
+            raise DocumentIdentityConflict("document path is already claimed by another node")
         created_at = (
             float(existing["created_at"])
             if existing is not None and existing["created_at"] is not None
@@ -664,7 +840,15 @@ def upsert_document_rows(
             ),
         )
         _replace_old_fts(db, node_id, document_title, text)
+        old_chunk_ids_for_tombstone: list[str] = [
+            str(row["chunk_id"])
+            for row in db.execute(
+                "SELECT chunk_id FROM memory_chunks WHERE node_id = ?", (node_id,)
+            ).fetchall()
+        ]
         db.execute("DELETE FROM memory_chunks WHERE node_id = ?", (node_id,))
+        if old_chunk_ids_for_tombstone:
+            _insert_chunk_tombstones(db, old_chunk_ids_for_tombstone, timestamp)
         if chunks:
             db.executemany(
                 """
@@ -721,9 +905,10 @@ def delete_document_rows_by_id(
     if not identifier:
         return False
     _ensure_index_tables(db)
+    timestamp = float(time.time())
     with transaction(db):
         row = db.execute(
-            "SELECT 1 FROM memory_nodes WHERE node_id = ?",
+            "SELECT * FROM memory_nodes WHERE node_id = ?",
             (identifier,),
         ).fetchone()
         if row is None:
@@ -733,7 +918,15 @@ def delete_document_rows_by_id(
         if _table_exists(db, "memory_fts"):
             db.execute("DELETE FROM memory_fts WHERE node_id = ?", (identifier,))
         if _table_exists(db, "memory_chunks"):
+            old_chunk_ids_for_tombstone: list[str] = [
+                str(chunk_row["chunk_id"])
+                for chunk_row in db.execute(
+                    "SELECT chunk_id FROM memory_chunks WHERE node_id = ?", (identifier,)
+                ).fetchall()
+            ]
             db.execute("DELETE FROM memory_chunks WHERE node_id = ?", (identifier,))
+            if old_chunk_ids_for_tombstone:
+                _insert_chunk_tombstones(db, old_chunk_ids_for_tombstone, timestamp)
         if _table_exists(db, "memory_index_jobs"):
             db.execute("DELETE FROM memory_index_jobs WHERE node_id = ?", (identifier,))
         if _table_exists(db, "memory_edges"):
@@ -800,13 +993,19 @@ def rekey_document_rows_by_id(
         ).fetchone()
         if old_row is None:
             return False
-        if str(old_row["node_type"] or "file").lower() != NodeType.FILE.value:
-            raise DocumentIdentityConflict("source node is not a file node")
-        old_decision = assess_document_path(str(old_row["file_path"] or ""))
-        if not old_decision.eligible:
-            raise DocumentIdentityConflict("source path is not an eligible document")
-        if expected_path is not None and old_decision.path != expected_path:
+        old_stored_path, _ = _stored_row_identity(
+            old_row,
+            require_node_id=False,
+        )
+        if expected_path is not None and old_stored_path != expected_path:
             raise DocumentIdentityConflict("source path does not match expected identity")
+        if _path_is_claimed_by_another_node(
+            db,
+            path=target_path,
+            node_id=target_node_id,
+            ignored_node_id=source_id,
+        ):
+            raise DocumentIdentityConflict("target document path is already occupied")
 
         if source_id == target_node_id:
             if str(old_row["file_path"] or "") != target_path:
@@ -877,12 +1076,14 @@ def rekey_document_rows_by_id(
             )
 
         chunk_rows = []
+        old_chunk_ids_for_tombstone: list[str] = []
         if _table_exists(db, "memory_chunks"):
             chunk_rows = db.execute(
-                "SELECT chunk_index, content_hash, content, title, created_at "
+                "SELECT chunk_id, chunk_index, content_hash, content, title, created_at "
                 "FROM memory_chunks WHERE node_id = ? ORDER BY chunk_index",
                 (source_id,),
             ).fetchall()
+            old_chunk_ids_for_tombstone = [str(row["chunk_id"]) for row in chunk_rows]
         if _table_exists(db, "memory_chunks_fts"):
             db.execute("DELETE FROM memory_chunks_fts WHERE node_id = ?", (source_id,))
         if _table_exists(db, "memory_chunks"):
@@ -921,6 +1122,9 @@ def rekey_document_rows_by_id(
             )
             _replace_chunk_fts(db, target_node_id, chunks)
 
+        if old_chunk_ids_for_tombstone:
+            _insert_chunk_tombstones(db, old_chunk_ids_for_tombstone, timestamp)
+
         if _table_exists(db, "memory_fts"):
             fts_rows = db.execute(
                 "SELECT title, content FROM memory_fts WHERE node_id = ?",
@@ -955,22 +1159,35 @@ def delete_document_rows(
     *,
     now: float | None = None,
 ) -> bool:
-    """Atomically remove a document node, chunks, FTS rows, and outbox jobs."""
+    """Atomically remove one canonical document and every SQLite reference."""
+    normalized_path, node_id = canonical_file_node_id(file_path)
     _ensure_index_tables(db)
-    normalized_path = normalize_file_path(file_path)
-    if not normalized_path:
-        return False
-    node_id = generate_file_node_id(normalized_path)
+    timestamp = float(time.time() if now is None else now)
     with transaction(db):
-        existed = db.execute(
-            "SELECT 1 FROM memory_nodes WHERE node_id = ?", (node_id,)
+        row = db.execute(
+            "SELECT * FROM memory_nodes WHERE node_id = ?", (node_id,)
         ).fetchone()
+        if row is None:
+            return False
+        _assert_stored_file_identity(
+            row,
+            expected_path=normalized_path,
+            expected_node_id=node_id,
+        )
         if _table_exists(db, "memory_chunks_fts"):
             db.execute("DELETE FROM memory_chunks_fts WHERE node_id = ?", (node_id,))
         if _table_exists(db, "memory_fts"):
             db.execute("DELETE FROM memory_fts WHERE node_id = ?", (node_id,))
         if _table_exists(db, "memory_chunks"):
+            old_chunk_ids_for_tombstone: list[str] = [
+                str(chunk_row["chunk_id"])
+                for chunk_row in db.execute(
+                    "SELECT chunk_id FROM memory_chunks WHERE node_id = ?", (node_id,)
+                ).fetchall()
+            ]
             db.execute("DELETE FROM memory_chunks WHERE node_id = ?", (node_id,))
+            if old_chunk_ids_for_tombstone:
+                _insert_chunk_tombstones(db, old_chunk_ids_for_tombstone, timestamp)
         if _table_exists(db, "memory_index_jobs"):
             db.execute("DELETE FROM memory_index_jobs WHERE node_id = ?", (node_id,))
         if _table_exists(db, "memory_edges"):
@@ -983,9 +1200,8 @@ def delete_document_rows(
                 "UPDATE memory_corrections SET related_node_id = NULL WHERE related_node_id = ?",
                 (node_id,),
             )
-        if existed:
-            db.execute("DELETE FROM memory_nodes WHERE node_id = ?", (node_id,))
-    return existed is not None
+        db.execute("DELETE FROM memory_nodes WHERE node_id = ?", (node_id,))
+    return True
 
 
 def move_document_rows(
@@ -996,18 +1212,11 @@ def move_document_rows(
     now: float | None = None,
 ) -> bool:
     """Move one document's identity without merging with an existing target."""
-    old_norm = normalize_file_path(old_path)
-    target_eligibility = assess_document_path(new_path)
-    if not old_norm:
-        raise ValueError("old_path 不能为空")
-    if not target_eligibility.eligible:
-        raise ValueError(f"不支持索引的记忆文档路径: {target_eligibility.reason}")
-    new_norm = target_eligibility.path
+    old_norm, old_id = canonical_file_node_id(old_path)
+    new_norm, new_id = canonical_file_node_id(new_path)
     _ensure_index_tables(db)
     if old_norm == new_norm:
         return True
-    old_id = generate_file_node_id(old_norm)
-    new_id = generate_file_node_id(new_norm)
     timestamp = float(time.time() if now is None else now)
 
     with transaction(db):
@@ -1016,10 +1225,21 @@ def move_document_rows(
         ).fetchone()
         if old_row is None:
             raise FileNotFoundError(f"源文档不存在于记忆索引: {old_norm}")
+        _assert_stored_file_identity(
+            old_row,
+            expected_path=old_norm,
+            expected_node_id=old_id,
+        )
+        if _path_is_claimed_by_another_node(
+            db,
+            path=new_norm,
+            node_id=new_id,
+        ):
+            raise FileExistsError(f"目标文档已存在于记忆索引: {new_norm}")
         target_row = db.execute(
             "SELECT 1 FROM memory_nodes WHERE node_id = ?", (new_id,)
         ).fetchone()
-        if target_row is not None:
+        if target_row is not None or _has_node_references(db, new_id):
             raise FileExistsError(f"目标文档已存在于记忆索引: {new_norm}")
 
         columns = _columns(db, "memory_nodes")
@@ -1082,13 +1302,17 @@ def move_document_rows(
             )
 
         old_chunks = []
+        old_chunk_ids_for_tombstone: list[str] = []
         if _table_exists(db, "memory_chunks"):
             old_chunks = db.execute(
-                "SELECT chunk_index, content_hash, content, title, created_at, updated_at "
+                "SELECT chunk_id, chunk_index, content_hash, content, title, created_at, updated_at "
                 "FROM memory_chunks WHERE node_id = ? ORDER BY chunk_index",
                 (old_id,),
             ).fetchall()
+            old_chunk_ids_for_tombstone = [str(row["chunk_id"]) for row in old_chunks]
             db.execute("DELETE FROM memory_chunks WHERE node_id = ?", (old_id,))
+            if old_chunk_ids_for_tombstone:
+                _insert_chunk_tombstones(db, old_chunk_ids_for_tombstone, timestamp)
         if _table_exists(db, "memory_chunks_fts"):
             db.execute("DELETE FROM memory_chunks_fts WHERE node_id = ?", (old_id,))
         chunks = [
@@ -1173,8 +1397,10 @@ def list_index_jobs(
     status: str = "pending",
     limit: int = 100,
 ) -> list[IndexJob]:
-    """Read outbox jobs without embedding or network work."""
-    _ensure_index_tables(db)
+    """Read outbox jobs without embedding, network work, or schema writes."""
+    _configure_connection(db)
+    if not _table_exists(db, "memory_index_jobs"):
+        return []
     rows = db.execute(
         """
         SELECT job_id, node_id, content_hash, status, created_at, updated_at, attempts, error,
@@ -1295,11 +1521,14 @@ __all__ = [
     "create_index_schema",
     "create_memory_schema",
     "delete_document_rows",
+    "delete_document_rows_by_id",
+    "ensure_document_reference_rows",
     "enqueue_index_job",
     "ensure_memory_schema",
     "list_index_jobs",
     "move_document_rows",
     "read_active_chunk_index_state",
+    "rekey_document_rows_by_id",
     "set_index_job_status",
     "transaction",
     "upsert_document_rows",

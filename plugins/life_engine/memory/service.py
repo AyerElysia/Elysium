@@ -21,14 +21,9 @@ from src.app.plugin_system.api import log_api
 from .nodes import (
     MemoryNode,
     generate_file_node_id,
-    generate_legacy_file_node_id,
     get_or_create_file_node,
     get_node_by_file_path,
-    migrate_node_identity,
-    migrate_file_path,
-    update_fts,
     increment_access,
-    normalize_file_path,
 )
 from .edges import (
     MemoryEdge,
@@ -46,7 +41,6 @@ from .search import (
     get_chroma_collection,
     search_memory,
     search_memory_detailed,
-    sync_embedding,
     vector_search,
     fts_search,
     spread_activation,
@@ -81,27 +75,30 @@ from .indexing import (
     IndexJob,
     claim_index_jobs,
     create_memory_schema,
+    delete_document_rows,
     enqueue_index_job,
     list_index_jobs,
     move_document_rows,
     read_active_chunk_index_state,
     set_index_job_status,
     upsert_document_rows,
-    delete_document_rows,
 )
 from .eligibility import (
     MEMORY_CONTENT_DIRECTORIES,
     assess_document_path,
+    assess_indexed_document_path,
     assess_workspace_document,
     read_workspace_document,
+    register_indexed_path_sql_function,
 )
-from .health import health_snapshot as collect_health_snapshot
+from .health import health_snapshot_from_path as collect_health_snapshot
 from .worker import (
     CHUNK_COLLECTION_PREFIX,
     CHUNK_INDEX_VERSION,
     DEFAULT_RECLAIM_AFTER,
     IndexWorkerReport,
     chunk_collection_metadata,
+    consume_vector_tombstones,
     get_chunk_collection,
     get_named_chunk_collection,
     process_index_jobs as run_chunk_index_jobs,
@@ -300,6 +297,7 @@ class LifeMemoryService:
             db.row_factory = sqlite3.Row
             db.execute("PRAGMA foreign_keys = ON")
             db.execute("PRAGMA busy_timeout = 5000")
+            register_indexed_path_sql_function(db)
             self._db = db
 
             try:
@@ -523,6 +521,7 @@ class LifeMemoryService:
             worker_db.row_factory = sqlite3.Row
             worker_db.execute("PRAGMA foreign_keys = ON")
             worker_db.execute("PRAGMA busy_timeout = 5000")
+            register_indexed_path_sql_function(worker_db)
             return worker_db
 
         async with self._index_worker_lock:
@@ -542,6 +541,12 @@ class LifeMemoryService:
             )
             try:
                 report = await asyncio.shield(worker_task)
+                tombstone_collection = collection or self._chunk_collection
+                if tombstone_collection is not None:
+                    try:
+                        await consume_vector_tombstones(worker_db, tombstone_collection)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug(f"向量 tombstone 清理失败: {exc}")
             except asyncio.CancelledError:
                 await worker_task
                 raise
@@ -591,16 +596,15 @@ class LifeMemoryService:
         title: str = "",
         content: str = "",
     ) -> MemoryNode:
-        """获取或创建文件节点。"""
-        return await get_or_create_file_node(
-            db=self._db,
-            file_path=file_path,
-            title=title,
-            content=content,
-            emit_visual_event=self._emit_visual_event,
-            update_fts_func=self._update_fts_wrapper,
-            migrate_node_identity_func=self._migrate_node_identity_wrapper,
-        )
+        """Create a reference node or atomically index one document body."""
+        async with self._index_write_lock:
+            db = self._require_db()
+            return await get_or_create_file_node(
+                db=db,
+                file_path=file_path,
+                title=title,
+                content=content,
+            )
 
     async def get_or_create_workspace_document_node(self, file_path: str) -> MemoryNode:
         """Index an eligible workspace document before using it in a relation."""
@@ -609,46 +613,18 @@ class LifeMemoryService:
     async def get_node_by_file_path(
         self,
         file_path: str,
-        migrate_identity: bool = True,
+        migrate_identity: bool = False,
     ) -> Optional[MemoryNode]:
-        """根据合格记忆文档路径获取节点。"""
-        eligibility = assess_document_path(file_path)
-        if not eligibility.eligible:
-            return None
-        normalized_path = eligibility.path
-        node = await get_node_by_file_path(
-            db=self._db,
-            file_path=normalized_path,
-            migrate_node_identity_func=(
-                self._migrate_node_identity_wrapper if migrate_identity else None
-            ),
-        )
-        if node is not None or migrate_identity:
-            return node
-
-        legacy_node_id = generate_legacy_file_node_id(file_path)
-        if legacy_node_id == generate_file_node_id(normalized_path):
-            return None
-        legacy_node = await self._get_node_by_id_wrapper(legacy_node_id)
-        if legacy_node is None:
-            return None
-        legacy_eligibility = assess_document_path(legacy_node.file_path or "")
-        return legacy_node if legacy_eligibility.eligible else None
+        """Read one canonical node without automatic identity migration."""
+        del migrate_identity
+        db = self._require_db()
+        return await get_node_by_file_path(db=db, file_path=file_path)
 
     async def migrate_file_path(self, old_path: str, new_path: str) -> bool:
-        """迁移文档路径，优先保留 chunk/FTS/outbox 的一致性。"""
+        """Explicitly move a canonical document identity inside SQLite."""
         async with self._index_write_lock:
             db = self._require_db()
-            try:
-                return await asyncio.to_thread(move_document_rows, db, old_path, new_path)
-            except FileNotFoundError:
-                # Very old installations may only have the historical node ID.
-                return await migrate_file_path(
-                    db=db,
-                    old_path=old_path,
-                    new_path=new_path,
-                    migrate_node_identity_func=self._migrate_node_identity_wrapper,
-                )
+            return await asyncio.to_thread(move_document_rows, db, old_path, new_path)
 
     async def increment_access(self, node_id: str) -> None:
         """增加节点访问计数并更新激活强度。"""
@@ -657,67 +633,6 @@ class LifeMemoryService:
             node_id=node_id,
             emit_visual_event=self._emit_visual_event,
         )
-
-    async def _migrate_node_identity_wrapper(
-        self,
-        old_node_id: str,
-        new_node_id: str,
-        new_file_path: str,
-    ) -> bool:
-        """节点身份迁移的包装函数。"""
-        return await migrate_node_identity(
-            db=self._db,
-            old_node_id=old_node_id,
-            new_node_id=new_node_id,
-            new_file_path=new_file_path,
-            emit_visual_event=self._emit_visual_event,
-            migrate_vector_identity_func=self._migrate_vector_identity,
-        )
-
-    async def _migrate_vector_identity(
-        self,
-        old_node_id: str,
-        new_node_id: str,
-        new_file_path: str,
-    ) -> None:
-        """迁移向量库中的节点 ID（尽力而为，不阻塞主流程）。"""
-        try:
-            old_data = await asyncio.to_thread(
-                self._chroma_collection.get,
-                ids=[old_node_id],
-                include=["embeddings", "documents", "metadatas"],
-            )
-            ids = old_data.get("ids") or []
-            if not ids:
-                return
-
-            embeddings = old_data.get("embeddings") or []
-            documents = old_data.get("documents") or []
-            metadatas = old_data.get("metadatas") or []
-            if not embeddings:
-                return
-
-            metadata = metadatas[0] if metadatas else {}
-            if not isinstance(metadata, dict):
-                metadata = {}
-            metadata["file_path"] = new_file_path
-
-            upsert_kwargs: Dict[str, Any] = {
-                "ids": [new_node_id],
-                "embeddings": [embeddings[0]],
-                "metadatas": [metadata],
-            }
-            if documents:
-                upsert_kwargs["documents"] = [documents[0]]
-
-            await asyncio.to_thread(self._chroma_collection.upsert, **upsert_kwargs)
-            await asyncio.to_thread(self._chroma_collection.delete, ids=[old_node_id])
-        except Exception as e:
-            logger.debug(f"向量身份迁移失败 {old_node_id} -> {new_node_id}: {e}")
-
-    async def _update_fts_wrapper(self, node_id: str, title: str, content: str) -> None:
-        """FTS 更新的包装函数。"""
-        await update_fts(self._db, node_id, title, content)
 
     async def _get_node_by_id_wrapper(self, node_id: str) -> Optional[MemoryNode]:
         """根据 ID 获取节点的包装函数。"""
@@ -867,14 +782,8 @@ class LifeMemoryService:
         return await fts_search(self._db, query, top_k)
 
     async def sync_embedding(self, file_path: str, content: str) -> None:
-        """同步文件的 embedding 到向量数据库。"""
-        await sync_embedding(
-            db=self._db,
-            collection=self._chroma_collection,
-            file_path=file_path,
-            content=content,
-            get_node_by_file_path_func=self.get_node_by_file_path,
-        )
+        """Queue document indexing; only the outbox worker may touch Chroma."""
+        await self.upsert_document(file_path, content)
 
     async def spread_activation(
         self,
@@ -945,8 +854,15 @@ class LifeMemoryService:
             raise ValueError("topic 和 message 不能为空")
 
         corrections: list[MemoryCorrection] = []
-        normalized_paths = [normalize_file_path(path) for path in (related_paths or []) if path]
-        if not normalized_paths:
+        canonical_paths: list[str] = []
+        for raw_path in related_paths or []:
+            if not raw_path:
+                continue
+            eligibility = assess_document_path(raw_path)
+            if not eligibility.eligible:
+                raise ValueError(f"不支持索引的记忆文档路径: {eligibility.reason}")
+            canonical_paths.append(eligibility.path)
+        if not canonical_paths:
             corrections.append(
                 await insert_memory_correction(
                     db=self._db,
@@ -960,7 +876,7 @@ class LifeMemoryService:
             )
             return corrections
 
-        for path in normalized_paths:
+        for path in canonical_paths:
             node = await self._get_or_create_file_node_from_workspace(path)
             corrections.append(
                 await insert_memory_correction(
@@ -1070,7 +986,7 @@ class LifeMemoryService:
         workspace = self._get_workspace_path()
 
         def _bundle_memory_path(file_path: str) -> str | None:
-            eligibility = assess_document_path(file_path)
+            eligibility = assess_indexed_document_path(file_path)
             if not eligibility.eligible:
                 return None
             candidate = workspace / eligibility.path
@@ -1344,11 +1260,12 @@ class LifeMemoryService:
                     target = await self._get_node_by_id_wrapper(edge.target_id)
                     if target is None or not target.file_path:
                         continue
-                    target_eligibility = assess_document_path(target.file_path)
+                    target_eligibility = assess_indexed_document_path(target.file_path)
                     if not target_eligibility.eligible:
                         continue
                     target_path = target_eligibility.path
-                    current_path = assess_document_path(current.file_path or "").path
+                    current_eligibility = assess_indexed_document_path(current.file_path)
+                    current_path = current_eligibility.path if current_eligibility.eligible else ""
                     target_lineage = [
                         *lineage,
                         {
@@ -1509,11 +1426,15 @@ class LifeMemoryService:
         return await get_stats(self._db)
 
     async def health_snapshot(self) -> Dict[str, Any]:
-        """获取只读记忆健康快照，不修复或删除任何数据。"""
+        """获取隔离的只读记忆健康快照，不修复或删除任何数据。"""
+        async with self._lifecycle_lock:
+            self._require_db()
+            db_path = self._get_db_path()
+            collection = self._chunk_collection or self._chroma_collection
         return await collect_health_snapshot(
-            self._db,
+            db_path,
             self._get_workspace_path(),
-            self._chunk_collection or self._chroma_collection,
+            collection,
         )
 
     # --------------------------------------------------------

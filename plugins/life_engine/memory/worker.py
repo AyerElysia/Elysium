@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from .eligibility import assess_indexed_document_path
 from .indexing import (
     IndexJob,
     claim_index_jobs,
@@ -22,6 +23,7 @@ from .indexing import (
     transaction,
     write_active_chunk_index_state,
 )
+from .nodes import NodeType, compute_content_hash, generate_file_node_id
 from .search import EmbeddingResult, embed_texts
 
 CHUNK_INDEX_VERSION = 1
@@ -179,6 +181,38 @@ async def _db_call(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         return func(*args, **kwargs)
 
 
+def _tombstone_table_exists(db: sqlite3.Connection) -> bool:
+    row = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_vector_tombstones'",
+    ).fetchone()
+    return row is not None
+
+
+def _read_pending_tombstones(db: sqlite3.Connection, *, limit: int) -> list[str]:
+    """Return up to *limit* chunk_ids awaiting Chroma deletion."""
+    if not _tombstone_table_exists(db):
+        return []
+    rows = db.execute(
+        "SELECT chunk_id FROM memory_vector_tombstones ORDER BY created_at LIMIT ?",
+        (max(0, int(limit)),),
+    ).fetchall()
+    return [str(row[0]) for row in rows if row[0]]
+
+
+def _remove_processed_tombstones(
+    db: sqlite3.Connection,
+    chunk_ids: Sequence[str],
+) -> None:
+    """Delete consumed tombstone rows inside an already-open transaction."""
+    if not chunk_ids or not _tombstone_table_exists(db):
+        return
+    placeholders = ",".join("?" for _ in chunk_ids)
+    db.execute(
+        f"DELETE FROM memory_vector_tombstones WHERE chunk_id IN ({placeholders})",
+        list(chunk_ids),
+    )
+
+
 def _normalize_embedding_result(value: Any, expected_count: int) -> EmbeddingResult:
     """Normalize injected fakes and provider responses to the validated shape."""
     model_name = str(getattr(value, "model_name", "") or "")
@@ -212,57 +246,153 @@ def _normalize_embedding_result(value: Any, expected_count: int) -> EmbeddingRes
     return EmbeddingResult(embeddings=vectors, model_name=model_name)
 
 
+def _is_deleted(value: Any) -> bool:
+    """Interpret legacy SQLite deletion values without treating ``'0'`` as true."""
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        return bool(int(value or 0))
+    except (TypeError, ValueError):
+        return bool(value)
+
+
+def _job_identity_error(job: IndexJob) -> str | None:
+    """Reject a persisted outbox row whose deterministic identity is damaged."""
+    node_id = str(job.node_id or "").strip()
+    content_hash = str(job.content_hash or "").strip()
+    if not node_id or not content_hash:
+        return "InvalidJobIdentity"
+    if str(job.job_id or "") != f"{node_id}:{content_hash}":
+        return "InvalidJobIdentity"
+    return None
+
+
+def _is_active_embeddable_file_node(node: sqlite3.Row | None) -> bool:
+    """Return whether a stored node is safe to export as a file document."""
+    if node is None or _is_deleted(node["is_deleted"]):
+        return False
+    if str(node["node_type"] or "").lower() != NodeType.FILE.value:
+        return False
+    decision = assess_indexed_document_path(node["file_path"])
+    return bool(
+        decision.eligible
+        and str(node["node_id"] or "") == generate_file_node_id(decision.path)
+    )
+
+
+def _current_revision(node: sqlite3.Row, job: IndexJob) -> tuple[int | None, str | None]:
+    """Return the compatible outbox revision or a non-exportable identity error."""
+    try:
+        revision = int(node["index_revision"] or 0)
+        expected = int(job.index_revision or revision)
+    except (TypeError, ValueError):
+        return None, "InvalidJobIdentity"
+    if revision < 0 or expected < 0:
+        return None, "InvalidJobIdentity"
+    return expected, None
+
+
+def _payloads_for_job(
+    db: sqlite3.Connection,
+    job: IndexJob,
+    node: sqlite3.Row,
+    *,
+    index_revision: int,
+) -> tuple[list[_ChunkPayload], str | None]:
+    """Build a complete deterministic chunk set only after node identity passed."""
+    rows = db.execute(
+        "SELECT chunk_id, node_id, chunk_index, content_hash, content, title "
+        "FROM memory_chunks WHERE node_id = ? ORDER BY chunk_index, chunk_id",
+        (job.node_id,),
+    ).fetchall()
+    if not rows:
+        return [], "EmptyDocument"
+
+    payloads: list[_ChunkPayload] = []
+    for expected_index, row in enumerate(rows):
+        try:
+            chunk_index = int(row["chunk_index"])
+        except (TypeError, ValueError):
+            return [], "InvalidChunkIdentity"
+        content = row["content"]
+        chunk_hash = str(row["content_hash"] or "")
+        if (
+            str(row["node_id"] or "") != str(job.node_id)
+            or chunk_index != expected_index
+            or not isinstance(content, str)
+            or not content
+            or chunk_hash != compute_content_hash(content)
+            or str(row["chunk_id"] or "")
+            != f"{job.node_id}:{chunk_index}:{chunk_hash}"
+        ):
+            return [], "InvalidChunkIdentity"
+        payloads.append(
+            _ChunkPayload(
+                job_id=job.job_id,
+                node_id=str(node["node_id"]),
+                file_path=str(node["file_path"]),
+                title=str(node["title"] or ""),
+                document_hash=job.content_hash,
+                index_revision=index_revision,
+                chunk_id=str(row["chunk_id"]),
+                chunk_index=chunk_index,
+                chunk_hash=chunk_hash,
+                content=content,
+            )
+        )
+    return payloads, None
+
+
 def _load_job_payloads(
     db: sqlite3.Connection,
     jobs: Sequence[IndexJob],
 ) -> tuple[list[_ChunkPayload], list[str], dict[str, str]]:
-    """Read current rows and exclude jobs whose revision has already changed."""
+    """Read only complete, strictly identified document payloads for claimed jobs."""
     payloads: list[_ChunkPayload] = []
     stale: list[str] = []
     errors: dict[str, str] = {}
     for job in jobs:
         node = db.execute(
-            "SELECT node_id, file_path, title, content_hash, index_revision, is_deleted "
+            "SELECT node_id, node_type, file_path, title, content_hash, index_revision, is_deleted "
             "FROM memory_nodes WHERE node_id = ?",
             (job.node_id,),
         ).fetchone()
-        if node is None or bool(node["is_deleted"] or 0):
+        if not _is_active_embeddable_file_node(node):
             stale.append(job.job_id)
-            errors[job.job_id] = "MissingNode"
+            errors[job.job_id] = "InvalidDocumentIdentity"
             continue
-        current_hash = str(node["content_hash"] or "")
-        current_revision = int(node["index_revision"] or 0)
-        job_revision = int(job.index_revision or current_revision)
-        if current_hash != job.content_hash or current_revision != job_revision:
+        if _job_identity_error(job) is not None:
+            stale.append(job.job_id)
+            errors[job.job_id] = "InvalidJobIdentity"
+            continue
+        assert node is not None
+        job_revision, revision_error = _current_revision(node, job)
+        if revision_error:
+            stale.append(job.job_id)
+            errors[job.job_id] = revision_error
+            continue
+        assert job_revision is not None
+        if (
+            str(node["content_hash"] or "") != job.content_hash
+            or int(node["index_revision"] or 0) != job_revision
+        ):
             stale.append(job.job_id)
             errors[job.job_id] = "StaleRevision"
             continue
-        rows = db.execute(
-            "SELECT chunk_id, chunk_index, content_hash, content, title "
-            "FROM memory_chunks WHERE node_id = ? ORDER BY chunk_index, chunk_id",
-            (job.node_id,),
-        ).fetchall()
-        if not rows:
-            errors[job.job_id] = "EmptyDocument"
+        job_payloads, payload_error = _payloads_for_job(
+            db,
+            job,
+            node,
+            index_revision=job_revision,
+        )
+        if payload_error == "EmptyDocument":
+            errors[job.job_id] = payload_error
             continue
-        for row in rows:
-            content = str(row["content"] or "")
-            if not content:
-                continue
-            payloads.append(
-                _ChunkPayload(
-                    job_id=job.job_id,
-                    node_id=str(node["node_id"]),
-                    file_path=str(node["file_path"] or ""),
-                    title=str(node["title"] or ""),
-                    document_hash=job.content_hash,
-                    index_revision=job_revision,
-                    chunk_id=str(row["chunk_id"]),
-                    chunk_index=int(row["chunk_index"] or 0),
-                    chunk_hash=str(row["content_hash"] or ""),
-                    content=content,
-                )
-            )
+        if payload_error:
+            stale.append(job.job_id)
+            errors[job.job_id] = payload_error
+            continue
+        payloads.extend(job_payloads)
     return payloads, stale, errors
 
 
@@ -297,39 +427,62 @@ def _revalidate_payloads(
     *,
     now: float,
 ) -> tuple[list[_ChunkPayload], list[int], list[IndexJob], list[str], dict[str, str]]:
-    """Drop payloads superseded while the embedding request was in flight."""
+    """Keep only payloads that still match strict current SQLite identity."""
+    payloads_by_job: dict[str, list[_ChunkPayload]] = {}
+    for payload in payloads:
+        payloads_by_job.setdefault(payload.job_id, []).append(payload)
+
     valid_job_ids: set[str] = set()
     stale: list[str] = []
     errors: dict[str, str] = {}
     with transaction(db):
         for job in jobs:
             node = db.execute(
-                "SELECT content_hash, index_revision, is_deleted FROM memory_nodes "
-                "WHERE node_id = ?",
+                "SELECT node_id, node_type, file_path, title, content_hash, index_revision, is_deleted "
+                "FROM memory_nodes WHERE node_id = ?",
                 (job.node_id,),
             ).fetchone()
             job_row = db.execute(
-                "SELECT status, content_hash, index_revision FROM memory_index_jobs "
-                "WHERE job_id = ?",
+                "SELECT job_id, node_id, status, content_hash, index_revision "
+                "FROM memory_index_jobs WHERE job_id = ?",
                 (job.job_id,),
             ).fetchone()
-            current_revision = int(node["index_revision"] or 0) if node else 0
-            expected_revision = int(job.index_revision or current_revision)
-            error_type = ""
-            if node is None or bool(node["is_deleted"] or 0):
-                error_type = "MissingNode"
-            elif (
-                str(node["content_hash"] or "") != job.content_hash
-                or current_revision != expected_revision
-            ):
-                error_type = "StaleRevision"
-            elif job_row is None or str(job_row["status"] or "") != "processing":
-                error_type = "JobStateChanged"
-            elif (
-                str(job_row["content_hash"] or "") != job.content_hash
-                or int(job_row["index_revision"] or expected_revision) != expected_revision
-            ):
-                error_type = "StaleRevision"
+            error_type: str | None = None
+            if not _is_active_embeddable_file_node(node):
+                error_type = "InvalidDocumentIdentity"
+            elif _job_identity_error(job) is not None:
+                error_type = "InvalidJobIdentity"
+            job_revision: int | None = None
+            if error_type is None:
+                assert node is not None
+                job_revision, error_type = _current_revision(node, job)
+            if error_type is None:
+                assert node is not None and job_revision is not None
+                if (
+                    str(node["content_hash"] or "") != job.content_hash
+                    or int(node["index_revision"] or 0) != job_revision
+                ):
+                    error_type = "StaleRevision"
+                elif job_row is None or str(job_row["status"] or "") != "processing":
+                    error_type = "JobStateChanged"
+                elif (
+                    str(job_row["job_id"] or "") != job.job_id
+                    or str(job_row["node_id"] or "") != job.node_id
+                    or str(job_row["content_hash"] or "") != job.content_hash
+                    or int(job_row["index_revision"] or job_revision) != job_revision
+                ):
+                    error_type = "StaleRevision"
+                else:
+                    current_payloads, payload_error = _payloads_for_job(
+                        db,
+                        job,
+                        node,
+                        index_revision=job_revision,
+                    )
+                    if payload_error:
+                        error_type = payload_error
+                    elif current_payloads != payloads_by_job.get(job.job_id, []):
+                        error_type = "StalePayload"
 
             if error_type:
                 if job_row is not None and str(job_row["status"] or "") == "processing":
@@ -342,11 +495,12 @@ def _revalidate_payloads(
                 errors[job.job_id] = error_type
                 continue
 
-            if int(job_row["index_revision"] or 0) == 0 and expected_revision:
+            assert job_row is not None and job_revision is not None
+            if int(job_row["index_revision"] or 0) == 0 and job_revision:
                 db.execute(
                     "UPDATE memory_index_jobs SET index_revision = ? "
                     "WHERE job_id = ? AND status = 'processing' AND index_revision = 0",
-                    (expected_revision, job.job_id),
+                    (job_revision, job.job_id),
                 )
             valid_job_ids.add(job.job_id)
 
@@ -376,45 +530,53 @@ def _complete_jobs(
     with transaction(db):
         for job in jobs:
             node_row = db.execute(
-                "SELECT content_hash, index_revision FROM memory_nodes WHERE node_id = ?",
+                "SELECT node_id, node_type, file_path, title, content_hash, index_revision, is_deleted "
+                "FROM memory_nodes WHERE node_id = ?",
                 (job.node_id,),
             ).fetchone()
-            current_revision = int(node_row["index_revision"] or 0) if node_row else 0
-            expected_revision = int(job.index_revision or current_revision)
-            if node_row is None:
+            error_type: str | None = None
+            if not _is_active_embeddable_file_node(node_row):
+                error_type = "InvalidDocumentIdentity"
+            elif _job_identity_error(job) is not None:
+                error_type = "InvalidJobIdentity"
+            expected_revision: int | None = None
+            if error_type is None:
+                assert node_row is not None
+                expected_revision, error_type = _current_revision(node_row, job)
+            if error_type is None:
+                assert node_row is not None and expected_revision is not None
+                if (
+                    str(node_row["content_hash"] or "") != job.content_hash
+                    or int(node_row["index_revision"] or 0) != expected_revision
+                ):
+                    error_type = "StaleRevision"
+            if error_type:
                 db.execute(
-                    "UPDATE memory_index_jobs SET status = 'stale', updated_at = ?, "
-                    "error = 'MissingNode' WHERE job_id = ? AND status = 'processing'",
-                    (now, job.job_id),
+                    "UPDATE memory_index_jobs SET status = 'stale', updated_at = ?, error = ? "
+                    "WHERE job_id = ? AND status = 'processing'",
+                    (now, error_type, job.job_id),
                 )
                 stale.append(job.job_id)
-                errors[job.job_id] = "MissingNode"
-                continue
-            if (
-                str(node_row["content_hash"] or "") != job.content_hash
-                or current_revision != expected_revision
-            ):
-                db.execute(
-                    "UPDATE memory_index_jobs SET status = 'stale', updated_at = ?, "
-                    "error = 'StaleRevision' WHERE job_id = ? AND status = 'processing'",
-                    (now, job.job_id),
-                )
-                stale.append(job.job_id)
-                errors[job.job_id] = "StaleRevision"
+                errors[job.job_id] = error_type
                 continue
 
+            assert expected_revision is not None
             job_cursor = db.execute(
                 "UPDATE memory_index_jobs SET status = 'completed', updated_at = ?, error = '' "
-                "WHERE job_id = ? AND status = 'processing' AND content_hash = ? "
+                "WHERE job_id = ? AND node_id = ? AND status = 'processing' AND content_hash = ? "
                 "AND index_revision = ? AND EXISTS ("
-                "SELECT 1 FROM memory_nodes WHERE node_id = ? AND content_hash = ? "
+                "SELECT 1 FROM memory_nodes WHERE node_id = ? AND node_type = ? "
+                "AND is_deleted = 0 AND file_path = ? AND content_hash = ? "
                 "AND index_revision = ?)",
                 (
                     now,
                     job.job_id,
+                    job.node_id,
                     job.content_hash,
                     expected_revision,
                     job.node_id,
+                    NodeType.FILE.value,
+                    str(node_row["file_path"]),
                     job.content_hash,
                     expected_revision,
                 ),
@@ -456,6 +618,42 @@ def _complete_jobs(
                 now=now,
             )
     return completed, stale, errors
+
+
+async def consume_vector_tombstones(
+    db: sqlite3.Connection,
+    collection: Any,
+    *,
+    limit: int = 200,
+    now: float | None = None,
+) -> int:
+    """Delete superseded chunk vectors from Chroma and clear tombstone records."""
+    if collection is None:
+        return 0
+    chunk_ids = await _db_call(_read_pending_tombstones, db, limit=limit)
+    if not chunk_ids:
+        return 0
+
+    delete_func = getattr(collection, "delete", None)
+    if not callable(delete_func):
+        return 0
+
+    try:
+        await _call_external(delete_func, ids=chunk_ids)
+    except Exception as exc:  # noqa: BLE001
+        import logging
+
+        logging.getLogger("life_engine.memory.worker").warning(
+            f"向量 tombstone 清理失败 ({len(chunk_ids)} ids): {type(exc).__name__}: {exc}"
+        )
+        return 0
+
+    def _clear(db_: sqlite3.Connection) -> None:
+        with transaction(db_):
+            _remove_processed_tombstones(db_, chunk_ids)
+
+    await _db_call(_clear, db)
+    return len(chunk_ids)
 
 
 async def process_index_jobs(
@@ -544,6 +742,26 @@ async def process_index_jobs(
             claimed=len(jobs),
             failed=tuple(job.job_id for job in failed_without_payload),
             stale=tuple(stale_ids),
+            errors=error_map,
+        )
+
+    # The first load is intentionally not an outbound boundary: ensure the
+    # current stored identity and every chunk are still identical immediately
+    # before exposing text to the embedding provider.
+    payloads, _, live_jobs, new_stale, new_errors = await _db_call(
+        _revalidate_payloads,
+        db,
+        live_jobs,
+        payloads,
+        now=timestamp,
+    )
+    stale_ids.extend(new_stale)
+    error_map.update(new_errors)
+    if not live_jobs:
+        return IndexWorkerReport(
+            claimed=len(jobs),
+            failed=tuple(job.job_id for job in failed_without_payload),
+            stale=tuple(dict.fromkeys(stale_ids)),
             errors=error_map,
         )
 
@@ -773,6 +991,13 @@ async def process_index_jobs(
     )
     stale_ids.extend(post_stale)
     error_map.update(completion_errors)
+
+    if collection is not None:
+        try:
+            await consume_vector_tombstones(db, collection, now=timestamp)
+        except Exception:  # noqa: BLE001
+            pass
+
     return IndexWorkerReport(
         claimed=len(jobs),
         embedded_chunks=embedded_chunk_count,
@@ -793,6 +1018,7 @@ __all__ = [
     "IndexWorkerReport",
     "chunk_collection_metadata",
     "chunk_collection_name",
+    "consume_vector_tombstones",
     "get_chunk_collection",
     "get_named_chunk_collection",
     "process_index_jobs",

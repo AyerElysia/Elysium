@@ -12,6 +12,10 @@ import pytest
 
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.memory import EdgeType, EmbeddingResult, LifeMemoryService
+from plugins.life_engine.memory.nodes import (
+    generate_file_node_id,
+    generate_legacy_file_node_id,
+)
 
 
 @dataclass
@@ -471,3 +475,128 @@ async def test_service_worker_does_not_block_concurrent_document_update(
     assert service._db.execute(
         "SELECT status FROM memory_index_jobs WHERE job_id = ?", (new.job_id,)
     ).fetchone()[0] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_service_health_snapshot_uses_isolated_committed_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _make_service(tmp_path)
+
+    async def fake_legacy_collection() -> Any:
+        return SimpleNamespace(count=lambda: 0, get=lambda **_: {"ids": []})
+
+    monkeypatch.setattr(service, "_get_chroma_collection", fake_legacy_collection)
+    await service.initialize()
+    committed = await service.upsert_document("notes/committed.md", "committed")
+    db = service._db
+    assert db is not None
+
+    db.execute(
+        "INSERT INTO memory_nodes "
+        "(node_id, node_type, file_path, content_hash, title, created_at, updated_at) "
+        "VALUES (?, 'file', ?, 'transient', 'Transient', 2, 2)",
+        (generate_file_node_id("notes/transient.md"), "notes/transient.md"),
+    )
+    assert db.in_transaction is True
+
+    snapshot = await service.health_snapshot()
+
+    assert snapshot["counts"]["nodes"] == 1
+    assert snapshot["workspace"]["file_count"] == 0
+    assert db.in_transaction is True
+    assert db.execute("SELECT COUNT(*) FROM memory_nodes").fetchone()[0] == 2
+    db.rollback()
+    assert db.execute("SELECT COUNT(*) FROM memory_nodes").fetchone()[0] == 1
+    assert committed.node_id == generate_file_node_id("notes/committed.md")
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_document_uses_sqlite_outbox_without_chroma_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _make_service(tmp_path)
+    collection = SimpleNamespace(upsert=lambda **_: pytest.fail("unexpected Chroma write"))
+
+    async def fake_collection() -> Any:
+        return collection
+
+    monkeypatch.setattr(service, "_get_chroma_collection", fake_collection)
+    await service.initialize()
+
+    node = await service.get_or_create_file_node(
+        "notes/compat.md",
+        title="Compat",
+        content="transaction backed content",
+    )
+
+    assert service._db.execute(
+        "SELECT COUNT(*) FROM memory_chunks WHERE node_id = ?", (node.node_id,)
+    ).fetchone()[0] > 0
+    assert service._db.execute(
+        "SELECT COUNT(*) FROM memory_chunks_fts WHERE node_id = ?", (node.node_id,)
+    ).fetchone()[0] > 0
+    assert service._db.execute(
+        "SELECT status FROM memory_index_jobs WHERE node_id = ?", (node.node_id,)
+    ).fetchone()[0] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_legacy_node_lookup_is_read_only(tmp_path: Path) -> None:
+    service = _make_service(tmp_path)
+    await service.initialize()
+    path = "notes/legacy.md"
+    legacy_id = generate_legacy_file_node_id(f"./{path}")
+    service._db.execute(
+        """
+        INSERT INTO memory_nodes (
+            node_id, node_type, file_path, content_hash, title,
+            created_at, updated_at, embedding_synced
+        ) VALUES (?, 'file', ?, '', 'legacy', 1, 1, 0)
+        """,
+        (legacy_id, path),
+    )
+    service._db.commit()
+    before = [tuple(row) for row in service._db.execute("SELECT * FROM memory_nodes")]
+
+    node = await service.get_node_by_file_path(path)
+
+    assert node is not None
+    assert node.node_id == legacy_id
+    assert [tuple(row) for row in service._db.execute("SELECT * FROM memory_nodes")] == before
+
+
+@pytest.mark.asyncio
+async def test_read_rejects_noncanonical_stored_path(tmp_path: Path) -> None:
+    service = _make_service(tmp_path)
+    await service.initialize()
+    path = "notes/noncanonical.md"
+    node_id = generate_file_node_id(path)
+    service._db.execute(
+        """
+        INSERT INTO memory_nodes (
+            node_id, node_type, file_path, content_hash, title,
+            created_at, updated_at, embedding_synced
+        ) VALUES (?, 'file', './notes/noncanonical.md', '', 'bad', 1, 1, 0)
+        """,
+        (node_id,),
+    )
+    service._db.commit()
+
+    assert await service.get_node_by_file_path(path) is None
+
+
+@pytest.mark.asyncio
+async def test_record_memory_correction_rejects_absolute_related_path(tmp_path: Path) -> None:
+    service = _make_service(tmp_path)
+    await service.initialize()
+
+    with pytest.raises(ValueError, match="absolute_path"):
+        await service.record_memory_correction(
+            "topic",
+            "correction",
+            related_paths=["/notes/a.md"],
+        )
