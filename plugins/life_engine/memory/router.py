@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar
@@ -14,6 +15,11 @@ from pydantic import BaseModel
 from src.app.plugin_system.base import BaseRouter
 
 from ..service.static_page import render_dashboard
+from .eligibility import (
+    assess_indexed_document_path,
+    eligible_document_path_sql,
+    register_indexed_path_sql_function,
+)
 
 if TYPE_CHECKING:
     from ..core.plugin import LifeEnginePlugin
@@ -22,6 +28,285 @@ class ActivateRequest(BaseModel):
     seed_ids: list[str]
     max_depth: int = 2
     max_results: int = 20
+
+
+def _table_exists(db: sqlite3.Connection, table: str) -> bool:
+    try:
+        return db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'virtual table') AND name = ?",
+            (table,),
+        ).fetchone() is not None
+    except sqlite3.ProgrammingError:
+        raise
+    except sqlite3.Error:
+        return False
+
+
+def _table_columns(db: sqlite3.Connection, table: str) -> set[str]:
+    if not _table_exists(db, table):
+        return set()
+    try:
+        return {str(row[1]) for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
+    except sqlite3.ProgrammingError:
+        raise
+    except sqlite3.Error:
+        return set()
+
+
+def _row_value(row: sqlite3.Row, name: str, default: Any = None) -> Any:
+    return row[name] if name in row.keys() else default
+
+
+def _is_deleted(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        return bool(int(value or 0))
+    except (TypeError, ValueError):
+        return bool(value)
+
+
+def _node_type(value: Any) -> str:
+    raw = getattr(value, "value", value)
+    return str("file" if raw is None else raw).lower()
+
+
+def _graph_node_type(row: sqlite3.Row) -> str | None:
+    if not _row_value(row, "node_id") or _is_deleted(_row_value(row, "is_deleted")):
+        return None
+    node_type = _node_type(_row_value(row, "node_type"))
+    if node_type == "concept":
+        return node_type
+    if node_type != "file":
+        return None
+    if not assess_indexed_document_path(_row_value(row, "file_path")).eligible:
+        return None
+    return node_type
+
+
+def _activation_value(row: sqlite3.Row) -> float:
+    try:
+        return float(_row_value(row, "activation_strength", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _graph_visibility_sql(columns: set[str], alias: str) -> tuple[str, list[Any]]:
+    node_type_expr = (
+        f"lower(COALESCE({alias}.node_type, 'file'))"
+        if "node_type" in columns
+        else "'file'"
+    )
+    if "file_path" in columns:
+        eligibility_sql, eligibility_params = eligible_document_path_sql(f"{alias}.file_path")
+        file_clause = (
+            f"{alias}.file_path IS NOT NULL AND TRIM({alias}.file_path) <> '' "
+            f"AND {eligibility_sql}"
+        )
+    else:
+        file_clause = "0 = 1"
+        eligibility_params = []
+    clauses = [
+        f"({node_type_expr} = 'concept' OR ({node_type_expr} = 'file' AND ({file_clause})))"
+    ]
+    if "is_deleted" in columns:
+        clauses.append(f"COALESCE({alias}.is_deleted, 0) = 0")
+    return " AND ".join(clauses), eligibility_params
+
+
+def _empty_graph() -> dict[str, list[dict[str, Any]]]:
+    return {"nodes": [], "links": []}
+
+
+def _serialize_graph_node(row: sqlite3.Row, node_type: str, degree: int) -> dict[str, Any]:
+    file_path = _row_value(row, "file_path") if node_type == "file" else None
+    return {
+        "id": _row_value(row, "node_id"),
+        "type": node_type.upper(),
+        "title": _row_value(row, "title") or file_path or "Untitled",
+        "path": file_path,
+        "activation": _activation_value(row),
+        "importance": float(_row_value(row, "importance", 0.0) or 0.0),
+        "valence": float(_row_value(row, "emotional_valence", 0.0) or 0.0),
+        "arousal": float(_row_value(row, "emotional_arousal", 0.0) or 0.0),
+        "access_count": int(_row_value(row, "access_count", 0) or 0),
+        "updated_at": _row_value(row, "updated_at"),
+        "last_accessed_at": _row_value(row, "last_accessed_at"),
+        "degree": degree,
+    }
+
+
+def _serialize_graph_link(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": _row_value(row, "edge_id"),
+        "source": _row_value(row, "source_id"),
+        "target": _row_value(row, "target_id"),
+        "type": _row_value(row, "edge_type"),
+        "weight": float(_row_value(row, "weight", 0.0) or 0.0),
+        "base_strength": float(_row_value(row, "base_strength", 0.0) or 0.0),
+        "reinforcement": float(_row_value(row, "reinforcement", 0.0) or 0.0),
+        "activation_count": int(_row_value(row, "activation_count", 0) or 0),
+        "last_activated_at": _row_value(row, "last_activated_at"),
+        "reason": _row_value(row, "reason") or "",
+    }
+
+
+async def _read_graph_payload(
+    db: sqlite3.Connection,
+    *,
+    limit_nodes: int,
+    min_weight: float,
+    focus_id: str | None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Read and filter a graph snapshot without writing SQLite state."""
+
+    def _read() -> dict[str, list[dict[str, Any]]]:
+        if not _table_exists(db, "memory_nodes"):
+            return _empty_graph()
+
+        node_columns = _table_columns(db, "memory_nodes")
+        if "node_id" not in node_columns:
+            return _empty_graph()
+        register_indexed_path_sql_function(db)
+        visibility_sql, visibility_params = _graph_visibility_sql(node_columns, "n")
+        cursor = db.cursor()
+
+        if focus_id is not None:
+            focus_row = cursor.execute(
+                f"SELECT n.* FROM memory_nodes AS n WHERE n.node_id = ? AND {visibility_sql}",
+                [focus_id, *visibility_params],
+            ).fetchone()
+            if focus_row is None or _graph_node_type(focus_row) is None:
+                return _empty_graph()
+
+            candidate_ids = [focus_id]
+            if _table_exists(db, "memory_edges"):
+                edge_columns = _table_columns(db, "memory_edges")
+                if {"source_id", "target_id", "weight"} <= edge_columns:
+                    source_visibility_sql, source_visibility_params = _graph_visibility_sql(
+                        node_columns, "source_node"
+                    )
+                    target_visibility_sql, target_visibility_params = _graph_visibility_sql(
+                        node_columns, "target_node"
+                    )
+                    edge_rows = cursor.execute(
+                        f"SELECT e.source_id, e.target_id FROM memory_edges AS e "
+                        f"JOIN memory_nodes AS source_node ON source_node.node_id = e.source_id "
+                        f"JOIN memory_nodes AS target_node ON target_node.node_id = e.target_id "
+                        f"WHERE e.weight >= ? AND (e.source_id = ? OR e.target_id = ?) "
+                        f"AND {source_visibility_sql} AND {target_visibility_sql} "
+                        "ORDER BY e.weight DESC",
+                        [
+                            min_weight,
+                            focus_id,
+                            focus_id,
+                            *source_visibility_params,
+                            *target_visibility_params,
+                        ],
+                    ).fetchall()
+                    seen_ids = {focus_id}
+                    for edge in edge_rows:
+                        source_id = str(_row_value(edge, "source_id") or "")
+                        target_id = str(_row_value(edge, "target_id") or "")
+                        neighbor_id = target_id if source_id == focus_id else source_id
+                        if neighbor_id and neighbor_id not in seen_ids:
+                            candidate_ids.append(neighbor_id)
+                            seen_ids.add(neighbor_id)
+                        if len(candidate_ids) >= limit_nodes:
+                            break
+
+            placeholders = ",".join("?" for _ in candidate_ids)
+            rows = cursor.execute(
+                f"SELECT n.* FROM memory_nodes AS n "
+                f"WHERE n.node_id IN ({placeholders}) AND {visibility_sql}",
+                [*candidate_ids, *visibility_params],
+            ).fetchall()
+            rows_by_id = {
+                str(_row_value(row, "node_id")): row
+                for row in rows
+                if _graph_node_type(row) is not None
+            }
+            if focus_id not in rows_by_id:
+                return _empty_graph()
+            selected_rows = [rows_by_id[focus_id]]
+            selected_rows.extend(
+                sorted(
+                    (
+                        row
+                        for node_id, row in rows_by_id.items()
+                        if node_id != focus_id
+                    ),
+                    key=lambda row: (-_activation_value(row), str(_row_value(row, "node_id"))),
+                )
+            )
+        else:
+            order_sql = (
+                "COALESCE(n.activation_strength, 0.0) DESC, n.node_id"
+                if "activation_strength" in node_columns
+                else "n.node_id"
+            )
+            rows = cursor.execute(
+                f"SELECT n.* FROM memory_nodes AS n WHERE {visibility_sql} "
+                f"ORDER BY {order_sql} LIMIT ?",
+                [*visibility_params, limit_nodes],
+            ).fetchall()
+            selected_rows = [row for row in rows if _graph_node_type(row) is not None]
+
+        selected_ids = [str(_row_value(row, "node_id")) for row in selected_rows]
+        if not selected_ids:
+            return _empty_graph()
+
+        degree_by_id = {node_id: 0 for node_id in selected_ids}
+        links: list[dict[str, Any]] = []
+        if _table_exists(db, "memory_edges"):
+            edge_columns = _table_columns(db, "memory_edges")
+            if {"source_id", "target_id", "weight"} <= edge_columns:
+                placeholders = ",".join("?" for _ in selected_ids)
+                edge_order = "weight DESC"
+                if "activation_count" in edge_columns:
+                    edge_order += ", activation_count DESC"
+                edge_rows = cursor.execute(
+                    f"SELECT * FROM memory_edges WHERE weight >= ? "
+                    f"AND source_id IN ({placeholders}) AND target_id IN ({placeholders}) "
+                    f"ORDER BY {edge_order}",
+                    [min_weight, *selected_ids, *selected_ids],
+                ).fetchall()
+                selected_id_set = set(selected_ids)
+                for edge in edge_rows:
+                    source_id = str(_row_value(edge, "source_id") or "")
+                    target_id = str(_row_value(edge, "target_id") or "")
+                    if source_id not in selected_id_set or target_id not in selected_id_set:
+                        continue
+                    links.append(_serialize_graph_link(edge))
+                    degree_by_id[source_id] += 1
+                    if target_id != source_id:
+                        degree_by_id[target_id] += 1
+
+        nodes = []
+        for row in selected_rows:
+            node_id = str(_row_value(row, "node_id"))
+            node_type = _graph_node_type(row)
+            if node_type is not None:
+                nodes.append(_serialize_graph_node(row, node_type, degree_by_id[node_id]))
+        return {"nodes": nodes, "links": links}
+
+    try:
+        return await asyncio.to_thread(_read)
+    except sqlite3.ProgrammingError as exc:
+        if "created in a thread" not in str(exc):
+            raise
+        return _read()
+
+
+def _is_visible_activation_node(node: Any) -> bool:
+    if _is_deleted(getattr(node, "is_deleted", 0)):
+        return False
+    node_type = _node_type(getattr(node, "node_type", None))
+    if node_type == "concept":
+        return True
+    return node_type == "file" and assess_indexed_document_path(
+        getattr(node, "file_path", None)
+    ).eligible
 
 
 class MemoryRouter(BaseRouter):
@@ -68,113 +353,20 @@ class MemoryRouter(BaseRouter):
             if not memory or not memory._db:
                 return {"status": "disabled", "nodes": [], "links": []}
 
-            cursor = memory._db.cursor()
             safe_limit = max(10, min(int(limit_nodes), 200))
             safe_weight = max(0.0, min(float(min_weight), 1.0))
-
-            if focus_id:
-                node_ids: set[str] = {focus_id}
-                cursor.execute(
-                    "SELECT source_id, target_id FROM memory_edges WHERE weight >= ? AND (source_id = ? OR target_id = ?)",
-                    (safe_weight, focus_id, focus_id),
-                )
-                for row in cursor.fetchall():
-                    node_ids.add(row["source_id"])
-                    node_ids.add(row["target_id"])
-                ordered_ids = [focus_id] + [node_id for node_id in node_ids if node_id != focus_id]
-                node_id_list = ordered_ids[:safe_limit]
-                if not node_id_list:
-                    return {"nodes": [], "links": []}
-                placeholders = ",".join("?" for _ in node_id_list)
-                cursor.execute(
-                    f"""
-                    SELECT n.*, (
-                        SELECT COUNT(*) FROM memory_edges e
-                        WHERE e.weight >= ? AND (e.source_id = n.node_id OR e.target_id = n.node_id)
-                    ) AS degree
-                    FROM memory_nodes n
-                    WHERE n.node_id IN ({placeholders})
-                    ORDER BY n.activation_strength DESC
-                    """,
-                    [safe_weight, *node_id_list],
-                )
-            else:
-                cursor.execute(
-                    """
-                    SELECT n.*, (
-                        SELECT COUNT(*) FROM memory_edges e
-                        WHERE e.weight >= ? AND (e.source_id = n.node_id OR e.target_id = n.node_id)
-                    ) AS degree
-                    FROM memory_nodes n
-                    ORDER BY n.activation_strength DESC
-                    LIMIT ?
-                    """,
-                    (safe_weight, safe_limit),
-                )
-
-            node_rows = cursor.fetchall()
-            nodes = []
-            node_ids = []
-            for row in node_rows:
-                nodes.append(
-                    {
-                        "id": row["node_id"],
-                        "type": str(row["node_type"] or "").upper(),
-                        "title": row["title"] or row["file_path"] or "Untitled",
-                        "path": row["file_path"],
-                        "activation": float(row["activation_strength"] or 0.0),
-                        "importance": float(row["importance"] or 0.0),
-                        "valence": float(row["emotional_valence"] or 0.0),
-                        "arousal": float(row["emotional_arousal"] or 0.0),
-                        "access_count": int(row["access_count"] or 0),
-                        "updated_at": row["updated_at"],
-                        "last_accessed_at": row["last_accessed_at"],
-                        "degree": int(row["degree"] or 0),
-                    }
-                )
-                node_ids.append(row["node_id"])
-
-            if not node_ids:
-                return {"nodes": [], "links": []}
-
-            placeholders = ",".join("?" for _ in node_ids)
-            cursor.execute(
-                f"""
-                SELECT * FROM memory_edges
-                WHERE weight >= ?
-                  AND source_id IN ({placeholders})
-                  AND target_id IN ({placeholders})
-                ORDER BY weight DESC, activation_count DESC
-                """,
-                [safe_weight, *node_ids, *node_ids],
+            payload = await _read_graph_payload(
+                memory._db,
+                limit_nodes=safe_limit,
+                min_weight=safe_weight,
+                focus_id=focus_id,
             )
-            edge_rows = cursor.fetchall()
-            links = []
-            for row in edge_rows:
-                links.append(
-                    {
-                        "id": row["edge_id"],
-                        "source": row["source_id"],
-                        "target": row["target_id"],
-                        "type": row["edge_type"],
-                        "weight": float(row["weight"] or 0.0),
-                        "base_strength": float(row["base_strength"] or 0.0),
-                        "reinforcement": float(row["reinforcement"] or 0.0),
-                        "activation_count": int(row["activation_count"] or 0),
-                        "last_activated_at": row["last_activated_at"],
-                        "reason": row["reason"] or "",
-                    }
-                )
-
-            return {
-                "nodes": nodes,
-                "links": links,
-                "meta": {
-                    "focus_id": focus_id,
-                    "limit_nodes": safe_limit,
-                    "min_weight": safe_weight,
-                },
+            payload["meta"] = {
+                "focus_id": focus_id,
+                "limit_nodes": safe_limit,
+                "min_weight": safe_weight,
             }
+            return payload
 
         @self.app.get("/", response_class=HTMLResponse)
         async def get_dashboard() -> Any:
@@ -259,10 +451,12 @@ class MemoryRouter(BaseRouter):
             association_data = []
             for node_id, score, path, reason in results:
                 node = await memory._get_node_by_id(node_id)
+                if node is None or not _is_visible_activation_node(node):
+                    continue
                 association_data.append(
                     {
                         "id": node_id,
-                        "title": node.title if node else "Unknown",
+                        "title": node.title,
                         "score": score,
                         "path": path,
                         "reason": reason,
@@ -298,5 +492,6 @@ class MemoryRouter(BaseRouter):
                     "association_reason": item.association_reason,
                 }
                 for item in results
+                if assess_indexed_document_path(item.file_path).eligible
             ]
             return response
