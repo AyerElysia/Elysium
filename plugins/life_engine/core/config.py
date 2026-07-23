@@ -144,6 +144,13 @@ class LifeEngineConfig(BaseConfig):
             "send_targets_window_hours",
             "salient_tail_enabled",
         },
+        "learning": {
+            "enabled",
+            "inject_to_heartbeat",
+            "reflection_cooldown_minutes",
+            "audit_interval_hours",
+            "compress_trigger_count",
+        },
     }
 
     @config_section("settings")
@@ -302,6 +309,58 @@ class LifeEngineConfig(BaseConfig):
             ge=1,
             le=50,
             description="回望段落最多摆出多少条未沉淀留痕。",
+        )
+
+    @config_section("learning")
+    class LearningSection(SectionBase):
+        """三环自学习/自反思系统配置。"""
+
+        enabled: bool = Field(
+            default=True,
+            description="是否启用三环自学习系统（快环反思/审计环/慢环压缩）。",
+        )
+
+        inject_to_heartbeat: bool = Field(
+            default=True,
+            description="是否在心跳 prompt 中注入自我认知文档和学习进展。",
+        )
+
+        reflection_cooldown_minutes: float = Field(
+            default=30.0,
+            ge=5.0,
+            description="快环反思冷却时间（分钟）。两次反思之间的最小间隔。",
+        )
+
+        audit_interval_hours: float = Field(
+            default=6.0,
+            ge=1.0,
+            description="审计环执行间隔（小时）。有待审洞察时，至少间隔这么久才再次审计。",
+        )
+
+        audit_batch_size: int = Field(
+            default=3,
+            ge=1,
+            le=10,
+            description="每次审计最多处理几条洞察。",
+        )
+
+        compress_trigger_count: int = Field(
+            default=5,
+            ge=2,
+            description="积累多少条 validated 洞察后触发慢环压缩。",
+        )
+
+        compress_interval_hours: float = Field(
+            default=48.0,
+            ge=6.0,
+            description="两次慢环压缩之间的最小间隔（小时）。",
+        )
+
+        knowledge_max_chars: int = Field(
+            default=2000,
+            ge=500,
+            le=6000,
+            description="注入 prompt 的自我认知文档最大字符数。",
         )
 
     @config_section("curiosity")
@@ -1227,6 +1286,7 @@ class LifeEngineConfig(BaseConfig):
     drives: DrivesSection = Field(default_factory=DrivesSection)
     autonomy: AutonomySection = Field(default_factory=AutonomySection)
     narrative: NarrativeSection = Field(default_factory=NarrativeSection)
+    learning: LearningSection = Field(default_factory=LearningSection)
 
     @field_validator("chatter")
     @classmethod

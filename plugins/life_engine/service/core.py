@@ -196,6 +196,9 @@ class LifeEngineService(BaseService):
         self._curiosity_engine: CuriosityEngine | None = None
         self._curiosity_inflight: bool = False
 
+        # 三环自学习系统
+        self._learning_scheduler = None  # LearningScheduler | None
+
         # 状态持久化
         self._state_persistence: StatePersistence | None = None
         self._event_bus: LifeEventBus | None = None
@@ -2001,6 +2004,10 @@ class LifeEngineService(BaseService):
             cursor=cursor,
             existing_summary=summary,
         )
+        # 标记本轮是否包含外部入站消息（供学习系统判断交互）
+        prepared.has_inbound_messages = any(
+            event.event_type == EventType.MESSAGE for event in pending
+        ) if pending else False
         self._state.last_wake_context_at = _now_iso()
         self._state.last_wake_context_size = len(prepared.selected_event_ids)
         log_wake_context_injected(
@@ -3565,6 +3572,13 @@ class LifeEngineService(BaseService):
                 self._state.idle_heartbeat_count += 1
                 logger.debug(f"life_engine 心跳无工具调用，空闲计数: {self._state.idle_heartbeat_count}")
 
+        # 三环自学习系统心跳（低频后台任务：审计/压缩/指标）
+        if self._learning_scheduler is not None:
+            try:
+                await self._learning_scheduler.on_heartbeat()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"学习系统心跳异常: {exc}")
+
         if not last_text:
             if tool_event_count > 0:
                 last_text = f"我刚刚完成了 {tool_event_count // 2} 次工具操作，先记下这些变化。"
@@ -3572,6 +3586,26 @@ class LifeEngineService(BaseService):
                 last_text = "此刻很安静，但我仍在持续感受与观察。"
 
         return last_text
+
+    def _fire_dream_reflection(self, report: Any) -> None:
+        """梦境结束后触发学习系统内省反思（后台非阻塞）。"""
+        if self._learning_scheduler is None:
+            return
+        dream_text = getattr(report, "dream_text", "") or getattr(report, "narrative", "") or ""
+        if not dream_text:
+            return
+        dream_id = getattr(report, "dream_id", "unknown")
+        try:
+            get_task_manager().create_task(
+                self._learning_scheduler.on_dream_end(
+                    dream_text=dream_text[:2000],
+                    context=f"dream_id={dream_id}",
+                ),
+                name=f"life_learning_dream_{dream_id}",
+                daemon=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"梦境反思任务创建失败: {exc}")
 
     async def _save_runtime_context(self) -> None:
         """持久化当前上下文。"""
@@ -3681,6 +3715,26 @@ class LifeEngineService(BaseService):
         if drives_cfg is None or getattr(drives_cfg, "enabled", True):
             self._impulse_engine = ImpulseEngine(list(DEFAULT_RULES))
             logger.info("冲动引擎已初始化")
+
+        # 初始化三环自学习系统
+        learning_cfg = getattr(cfg, "learning", None)
+        if learning_cfg is None or getattr(learning_cfg, "enabled", True):
+            try:
+                from ..learning.scheduler import LearningScheduler
+
+                self._learning_scheduler = LearningScheduler(
+                    workspace_path=cfg.settings.workspace_path,
+                    model_task_name=getattr(cfg.model, "task_name", "life"),
+                    audit_interval_hours=float(getattr(learning_cfg, "audit_interval_hours", 6.0) if learning_cfg else 6.0),
+                    audit_batch_size=int(getattr(learning_cfg, "audit_batch_size", 3) if learning_cfg else 3),
+                    compress_trigger_count=int(getattr(learning_cfg, "compress_trigger_count", 5) if learning_cfg else 5),
+                    compress_interval_hours=float(getattr(learning_cfg, "compress_interval_hours", 48.0) if learning_cfg else 48.0),
+                    reflection_cooldown_minutes=float(getattr(learning_cfg, "reflection_cooldown_minutes", 30.0) if learning_cfg else 30.0),
+                )
+                logger.info("三环自学习系统已初始化")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"三环自学习系统初始化失败: {exc}")
+                self._learning_scheduler = None
 
         self._state.running = True
         self._state.started_at = _now_iso()
@@ -3854,6 +3908,25 @@ class LifeEngineService(BaseService):
                     heartbeat_run_id,
                 )
 
+                # 交互结束 → 触发学习系统快环反思（后台非阻塞）
+                if (
+                    self._learning_scheduler is not None
+                    and prepared.has_inbound_messages
+                    and model_reply
+                ):
+                    interaction_text = str(model_reply or "")[:2000]
+                    context_text = prepared.content[:3000] if prepared.content else ""
+                    event_ids = list(prepared.selected_event_ids[:20])
+                    get_task_manager().create_task(
+                        self._learning_scheduler.on_interaction_end(
+                            interaction_text=interaction_text,
+                            context=context_text,
+                            source_event_ids=event_ids,
+                        ),
+                        name=f"life_learning_reflect_{self._state.heartbeat_count}",
+                        daemon=True,
+                    )
+
                 if self._snn_integration is not None:
                     await self._snn_integration.heartbeat_post()
                 return str(model_reply or ""), prepared
@@ -3959,6 +4032,7 @@ class LifeEngineService(BaseService):
                                 f"🌙 做梦完成: dream_id={report.dream_id} "
                                 f"duration={report.duration_seconds:.1f}s"
                             )
+                            self._fire_dream_reflection(report)
                         except Exception as exc:
                             logger.error(f"做梦执行异常: {exc}", exc_info=True)
 
@@ -4009,6 +4083,7 @@ class LifeEngineService(BaseService):
                                 f"💤 白天小憩完成: dream_id={report.dream_id} "
                                 f"duration={report.duration_seconds:.1f}s"
                             )
+                            self._fire_dream_reflection(report)
                         except Exception as nap_exc:  # noqa: BLE001
                             logger.error(f"白天小憩执行异常: {nap_exc}", exc_info=True)
                 except Exception as exc:  # noqa: BLE001
@@ -4120,6 +4195,7 @@ class LifeEngineService(BaseService):
                 "life_engine 手动做梦完成: "
                 f"dream_id={report.dream_id} duration={report.duration_seconds:.1f}s"
             )
+            self._fire_dream_reflection(report)
 
             return {
                 "success": True,

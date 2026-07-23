@@ -24,6 +24,7 @@ from ..tools.schedule_tools import SCHEDULE_TOOLS
 from ..tools.autonomy_tools import AUTONOMY_TOOLS
 from ..tools.skill_tools import SKILL_TOOLS
 from ..tools.event_grep_tools import EVENT_GREP_TOOLS
+from ..learning.tools import LEARNING_TOOLS
 from .compat_tools import (
     LifeThinkAction,
     LifeRecordInnerMonologueAction,
@@ -97,6 +98,7 @@ class LifeEnginePlugin(BasePlugin):
             *AUTONOMY_TOOLS,
             *SKILL_TOOLS,
             *EVENT_GREP_TOOLS,
+            *LEARNING_TOOLS,
         ]
 
         # 启用 LifeChatter 时注册对话器及其专用 Action / Tool

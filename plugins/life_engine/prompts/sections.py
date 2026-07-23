@@ -307,6 +307,54 @@ class RiverReflectionSection(HeartbeatSectionProvider):
         return "\n".join(lines)
 
 
+class SelfKnowledgeSection(HeartbeatSectionProvider):
+    """压缩后的自我认知文档，作为持续的身份背景。"""
+
+    section_id = "self_knowledge"
+
+    def enabled(self, ctx: SectionContext) -> bool:
+        learning_cfg = getattr(ctx.config, "learning", None)
+        if learning_cfg is None:
+            return True
+        return bool(getattr(learning_cfg, "enabled", True)) and bool(
+            getattr(learning_cfg, "inject_to_heartbeat", True)
+        )
+
+    async def render(self, ctx: SectionContext) -> str | None:
+        service = ctx.service
+        scheduler = getattr(service, "_learning_scheduler", None)
+        if scheduler is None:
+            return None
+        knowledge = scheduler.get_knowledge_for_prompt(
+            max_chars=int(getattr(ctx.config.learning, "knowledge_max_chars", 2000) or 2000)
+        )
+        if not knowledge:
+            return None
+        return f"### 自我认知\n{knowledge}"
+
+
+class LearningProgressSection(HeartbeatSectionProvider):
+    """近期学习进展（有新 validated/rejected 时简短提示）。"""
+
+    section_id = "learning_progress"
+
+    def enabled(self, ctx: SectionContext) -> bool:
+        learning_cfg = getattr(ctx.config, "learning", None)
+        if learning_cfg is None:
+            return True
+        return bool(getattr(learning_cfg, "enabled", True)) and bool(
+            getattr(learning_cfg, "inject_to_heartbeat", True)
+        )
+
+    async def render(self, ctx: SectionContext) -> str | None:
+        service = ctx.service
+        scheduler = getattr(service, "_learning_scheduler", None)
+        if scheduler is None:
+            return None
+        progress = scheduler.get_progress_for_prompt()
+        return progress or None
+
+
 DEFAULT_HEARTBEAT_SECTIONS: list[HeartbeatSectionProvider] = [
     InnerStateSection(),
     ThoughtStreamsSection(),
@@ -314,4 +362,6 @@ DEFAULT_HEARTBEAT_SECTIONS: list[HeartbeatSectionProvider] = [
     ImpulseSection(),
     SendTargetsSection(),
     RiverReflectionSection(),
+    SelfKnowledgeSection(),
+    LearningProgressSection(),
 ]
