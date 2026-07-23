@@ -22,7 +22,13 @@ from src.app.plugin_system.base import BaseTool
 from src.core.models.message import Message, MessageType
 
 from ..constants import EXTERNAL_MESSAGE_ACTIVE_WINDOW_MINUTES
-from ..memory.eligibility import assess_document_path, assess_workspace_document
+from ..core.config import LifeEngineConfig
+from ..memory.eligibility import (
+    DEFAULT_MAX_DOCUMENT_BYTES,
+    assess_document_path,
+    assess_indexed_document_path,
+    read_workspace_document,
+)
 from ..memory.prompting import build_memory_write_warning
 from ..trace.store import LifeTraceStore
 from ._utils import (
@@ -35,6 +41,19 @@ if TYPE_CHECKING:
     from ..agents.coordinator import AgentCoordinator
 
 logger = log_api.get_logger("life_engine.tools")
+
+_MEMORY_READ_MAX_BYTES = DEFAULT_MAX_DOCUMENT_BYTES
+
+
+def _get_workspace_read_only(plugin: Any) -> Path:
+    """Return the configured workspace without creating it for a read query."""
+    config = getattr(plugin, "config", None)
+    if isinstance(config, LifeEngineConfig):
+        workspace = config.settings.workspace_path
+    else:
+        workspace = str(Path(__file__).parent.parent.parent.parent / "data" / "life_engine_workspace")
+    return Path(workspace).resolve()
+
 
 def _format_size(size: int) -> str:
     """格式化文件大小。"""
@@ -60,17 +79,34 @@ def _get_life_engine_service(plugin: Any):
 
 
 async def _sync_memory_embedding_for_file(plugin: Any, path: str, content: str) -> None:
-    """同步文件内容到统一 SQLite/FTS/outbox 索引。
-
-    函数名保留以兼容已有调用方；统一文档 API 不会在文件工具路径中
-    触发 embedding 或网络请求。
-    """
+    """将已落盘的 canonical 记忆文档写入 SQLite/FTS/outbox。"""
     eligibility = assess_document_path(path)
     if not eligibility.eligible:
         logger.debug(
             f"跳过非记忆文档索引: {eligibility.path or path} ({eligibility.reason})"
         )
         return
+
+    workspace = _get_workspace(plugin)
+    valid, source_target = _resolve_path(plugin, path)
+    canonical_valid, canonical_target = _resolve_path(plugin, eligibility.path)
+    if not valid or not canonical_valid or source_target != canonical_target:
+        logger.debug(
+            "跳过与 canonical 文档不一致的文件索引: "
+            f"{path} -> {eligibility.path}"
+        )
+        return
+
+    try:
+        document_content, source_mtime, _ = read_workspace_document(
+            workspace,
+            eligibility.path,
+            max_bytes=_MEMORY_READ_MAX_BYTES,
+        )
+    except (OSError, ValueError) as exc:
+        logger.debug(f"跳过不可安全读取的记忆文档 {path}: {exc}")
+        return
+
     try:
         from ..service import LifeEngineService
 
@@ -78,19 +114,14 @@ async def _sync_memory_embedding_for_file(plugin: Any, path: str, content: str) 
         memory_service = getattr(service, "_memory_service", None) if service else None
         if memory_service is None:
             return
-        source_mtime = None
-        try:
-            source_mtime = (_get_workspace(plugin) / path).stat().st_mtime
-        except (OSError, ValueError):
-            pass
         await memory_service.upsert_document(
-            path,
-            content,
-            title=Path(path).stem,
+            eligibility.path,
+            document_content,
+            title=Path(eligibility.path).stem,
             source_mtime=source_mtime,
         )
-    except Exception as e:
-        logger.warning(f"同步记忆文档索引失败 {path}: {e}")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"同步记忆文档索引失败 {eligibility.path}: {exc}")
 
 
 def _read_trace_before_content(target: Path, encoding: str) -> str | None:
@@ -1112,17 +1143,18 @@ class FetchLifeMemoryTool(BaseTool):
         files_data: list[dict] = []
         successful = 0
         failed = 0
+        workspace = _get_workspace_read_only(self.plugin)
         life_service = _get_life_engine_service(self.plugin)
         memory_service = getattr(life_service, "_memory_service", None) if life_service else None
 
-        for file_path_str in file_paths:
-            file_path_str = str(file_path_str or "").strip()
-            if not file_path_str:
+        for requested_path_str in file_paths:
+            requested_path_str = str(requested_path_str or "")
+            if not requested_path_str:
                 files_data.append({"path": "", "error": "路径为空"})
                 failed += 1
                 continue
-            requested_path_str = file_path_str
-            requested_eligibility = assess_document_path(file_path_str)
+
+            requested_eligibility = assess_indexed_document_path(requested_path_str)
             if not requested_eligibility.eligible:
                 files_data.append(
                     {
@@ -1132,17 +1164,9 @@ class FetchLifeMemoryTool(BaseTool):
                 )
                 failed += 1
                 continue
+
             file_path_str = requested_eligibility.path
             path_resolution: dict[str, Any] | None = None
-
-            # 验证路径安全性
-            ok, resolved = _resolve_path(self.plugin, file_path_str)
-            if not ok:
-                files_data.append({"path": file_path_str, "error": str(resolved)})
-                failed += 1
-                continue
-
-            target_path = resolved
             if memory_service is not None and hasattr(memory_service, "resolve_canonical_path"):
                 try:
                     resolution = await memory_service.resolve_canonical_path(
@@ -1154,133 +1178,90 @@ class FetchLifeMemoryTool(BaseTool):
                     logger.debug(f"解析记忆旧路径失败 {file_path_str}: {exc}")
                     resolution = None
                 if resolution and resolution.get("resolved"):
-                    resolved_path_str = str(resolution.get("resolved_path") or "").strip()
-                    resolved_eligibility = assess_document_path(resolved_path_str)
+                    resolved_path_str = str(resolution.get("resolved_path") or "")
+                    resolved_eligibility = assess_indexed_document_path(resolved_path_str)
                     if not resolved_eligibility.eligible:
-                        logger.debug(
-                            "忽略指向非记忆文档的谱系解析: "
-                            f"{resolved_path_str} ({resolved_eligibility.reason})"
+                        files_data.append(
+                            {
+                                "path": requested_path_str,
+                                "error": (
+                                    "不是可读取的记忆文档: "
+                                    f"{resolved_eligibility.reason}"
+                                ),
+                            }
                         )
-                    else:
-                        resolved_path_str = resolved_eligibility.path
-                        ok, resolved_target = _resolve_path(self.plugin, resolved_path_str)
-                        if ok and resolved_target.exists() and resolved_target.is_file():
-                            target_path = resolved_target
-                            file_path_str = resolved_path_str
-                            path_resolution = resolution
+                        failed += 1
+                        continue
+                    file_path_str = resolved_eligibility.path
+                    path_resolution = dict(resolution)
+                    path_resolution["requested_path"] = requested_path_str
+                    path_resolution["resolved_path"] = file_path_str
+                    path_resolution["resolved"] = True
 
-            if not target_path.exists():
-                error_data = {"path": requested_path_str, "error": "文件不存在"}
+            try:
+                content, source_mtime, size_bytes = read_workspace_document(
+                    workspace,
+                    file_path_str,
+                    max_bytes=_MEMORY_READ_MAX_BYTES,
+                )
+            except FileNotFoundError:
+                error_data: dict[str, Any] = {
+                    "path": requested_path_str,
+                    "error": "文件不存在",
+                }
+                if path_resolution:
+                    error_data["path_resolution"] = path_resolution
+                files_data.append(error_data)
+                failed += 1
+                continue
+            except (OSError, ValueError) as exc:
+                error_data = {
+                    "path": requested_path_str,
+                    "error": f"读取失败: {exc}",
+                }
                 if path_resolution:
                     error_data["path_resolution"] = path_resolution
                 files_data.append(error_data)
                 failed += 1
                 continue
 
-            workspace_eligibility = assess_workspace_document(
-                _get_workspace(self.plugin),
-                file_path_str,
-            )
-            if not workspace_eligibility.eligible:
-                files_data.append(
-                    {
-                        "path": requested_path_str,
-                        "error": f"不是可读取的记忆文档: {workspace_eligibility.reason}",
-                    }
-                )
-                failed += 1
-                continue
+            truncated = max_length_per_file > 0 and len(content) > max_length_per_file
+            if truncated:
+                content = content[:max_length_per_file] + "\n\n... (内容过长，已截断)"
 
-            if requested_path_str != file_path_str and path_resolution is None:
-                path_resolution = {
-                    "requested_path": requested_path_str,
-                    "resolved_path": file_path_str,
-                    "resolved": True,
-                    "note": "请求路径已解析到当前文件",
-                }
+            file_data: dict[str, Any] = {
+                "path": file_path_str,
+                "title": Path(file_path_str).stem,
+                "content": content,
+                "truncated": truncated,
+            }
+            if requested_path_str != file_path_str:
+                file_data["requested_path"] = requested_path_str
+            if path_resolution:
+                file_data["path_resolution"] = path_resolution
 
-            if not target_path.exists():
-                files_data.append({"path": file_path_str, "error": "文件不存在"})
-                failed += 1
-                continue
-
-            if not target_path.is_file():
-                files_data.append({"path": file_path_str, "error": "不是文件"})
-                failed += 1
-                continue
-
-            # 读取文件内容
-            try:
-                # 检查文件大小，防止内存溢出
-                stat = target_path.stat()
-                MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
-                if stat.st_size > MAX_FILE_SIZE:
-                    files_data.append({
-                        "path": file_path_str,
-                        "error": f"文件过大 ({stat.st_size / 1024 / 1024:.1f}MB)，超过限制 ({MAX_FILE_SIZE / 1024 / 1024:.1f}MB)"
-                    })
-                    failed += 1
-                    continue
-
-                # 如果设置了长度限制，只读取需要的部分
-                truncated = False
-                if max_length_per_file > 0:
-                    with target_path.open('r', encoding='utf-8', errors='replace') as f:
-                        content = f.read(max_length_per_file + 1)
-                        truncated = len(content) > max_length_per_file
-                        if truncated:
-                            content = content[:max_length_per_file] + "\n\n... (内容过长，已截断)"
+            if include_metadata:
+                now = time.time()
+                days_ago = int((now - source_mtime) / 86400)
+                if days_ago == 0:
+                    time_ago = "今天"
+                elif days_ago == 1:
+                    time_ago = "昨天"
+                elif days_ago < 7:
+                    time_ago = f"{days_ago}天前"
+                elif days_ago < 30:
+                    time_ago = f"{days_ago // 7}周前"
                 else:
-                    content = target_path.read_text(encoding="utf-8", errors='replace')
+                    time_ago = f"{days_ago // 30}月前"
 
-                file_data = {
-                    "path": file_path_str,
-                    "title": target_path.stem,
-                    "content": content,
-                    "truncated": truncated,
+                file_data["metadata"] = {
+                    "size": _format_size(size_bytes),
+                    "modified": time_ago,
+                    "ext": Path(file_path_str).suffix or "(无扩展名)",
                 }
-                if requested_path_str != file_path_str:
-                    file_data["requested_path"] = requested_path_str
-                if path_resolution:
-                    file_data["path_resolution"] = path_resolution
 
-                # 添加元数据
-                if include_metadata:
-                    size = stat.st_size
-                    for unit in ["B", "KB", "MB", "GB"]:
-                        if size < 1024:
-                            size_str = f"{size:.1f}{unit}" if unit != "B" else f"{size}{unit}"
-                            break
-                        size /= 1024
-                    else:
-                        # 防御性编程：处理超大文件（>1TB）
-                        size_str = f"{size:.1f}TB"
-
-                    now = time.time()
-                    days_ago = int((now - stat.st_mtime) / 86400)
-                    if days_ago == 0:
-                        time_ago = "今天"
-                    elif days_ago == 1:
-                        time_ago = "昨天"
-                    elif days_ago < 7:
-                        time_ago = f"{days_ago}天前"
-                    elif days_ago < 30:
-                        time_ago = f"{days_ago // 7}周前"
-                    else:
-                        time_ago = f"{days_ago // 30}月前"
-
-                    file_data["metadata"] = {
-                        "size": size_str,
-                        "modified": time_ago,
-                        "ext": target_path.suffix or "(无扩展名)",
-                    }
-
-                files_data.append(file_data)
-                successful += 1
-
-            except Exception as e:
-                files_data.append({"path": file_path_str, "error": f"读取失败: {e}"})
-                failed += 1
+            files_data.append(file_data)
+            successful += 1
 
         # 记录工具调用，方便调试
         logger.info(

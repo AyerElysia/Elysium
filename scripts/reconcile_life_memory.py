@@ -26,7 +26,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from plugins.life_engine.memory.eligibility import (  # noqa: E402
     SUPPORTED_DOCUMENT_SUFFIXES,
-    assess_document_path,
+    assess_indexed_document_path,
     assess_workspace_document,
     normalize_document_path,
     read_workspace_document,
@@ -89,12 +89,7 @@ def compute_content_hash(content: str) -> str:
     return hashlib.sha256(content.encode()).hexdigest()[:16]
 
 
-def _file_node_id(path: str) -> str:
-    """Match the current deterministic file-node identity for one path."""
-    return f"file:{hashlib.md5(path.encode()).hexdigest()[:12]}"
-
-
-def _load_indexing_helpers() -> tuple[Any, Any, Any | None]:
+def _load_indexing_helpers() -> tuple[Any, Any, Any]:
     """Load SQLite indexing helpers only for apply mode."""
     with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
         from plugins.life_engine.memory import indexing
@@ -102,7 +97,7 @@ def _load_indexing_helpers() -> tuple[Any, Any, Any | None]:
     return (
         indexing.create_memory_schema,
         indexing.upsert_document_rows,
-        getattr(indexing, "delete_document_rows", None),
+        indexing.delete_document_rows_by_id,
     )
 
 
@@ -201,10 +196,11 @@ def _indexed_nodes(
             continue
         if str(values.get("node_type") or "file").lower() != "file":
             continue
-        raw_path = str(values.get("file_path") or "").strip().replace("\\", "/")
-        decision = assess_document_path(raw_path)
+        stored_path = values.get("file_path")
+        raw_path = "" if stored_path is None else str(stored_path)
+        decision = assess_indexed_document_path(stored_path)
         if not decision.eligible:
-            values["path"] = decision.path or raw_path
+            values["path"] = raw_path
             values["eligibility_reason"] = decision.reason
             ineligible.append(values)
             continue
@@ -248,44 +244,6 @@ def _table_columns(db: sqlite3.Connection, table: str) -> set[str]:
     if not _table_exists(db, table):
         return set()
     return {str(row[1]) for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
-
-
-def _node_exists(db: sqlite3.Connection, node_id: str) -> bool:
-    return bool(
-        _table_exists(db, "memory_nodes")
-        and db.execute("SELECT 1 FROM memory_nodes WHERE node_id = ? LIMIT 1", (node_id,)).fetchone()
-    )
-
-
-def _delete_node_rows_by_id(db: sqlite3.Connection, node_id: str) -> bool:
-    """Delete one legacy file node by its stored ID without touching vectors."""
-    if not node_id or not _node_exists(db, node_id):
-        return False
-    try:
-        if _table_exists(db, "memory_chunks_fts"):
-            db.execute("DELETE FROM memory_chunks_fts WHERE node_id = ?", (node_id,))
-        if _table_exists(db, "memory_fts"):
-            db.execute("DELETE FROM memory_fts WHERE node_id = ?", (node_id,))
-        if _table_exists(db, "memory_chunks"):
-            db.execute("DELETE FROM memory_chunks WHERE node_id = ?", (node_id,))
-        if _table_exists(db, "memory_index_jobs"):
-            db.execute("DELETE FROM memory_index_jobs WHERE node_id = ?", (node_id,))
-        if {"source_id", "target_id"}.issubset(_table_columns(db, "memory_edges")):
-            db.execute(
-                "DELETE FROM memory_edges WHERE source_id = ? OR target_id = ?",
-                (node_id, node_id),
-            )
-        if "related_node_id" in _table_columns(db, "memory_corrections"):
-            db.execute(
-                "UPDATE memory_corrections SET related_node_id = NULL WHERE related_node_id = ?",
-                (node_id,),
-            )
-        db.execute("DELETE FROM memory_nodes WHERE node_id = ?", (node_id,))
-        db.commit()
-    except sqlite3.Error:
-        db.rollback()
-        raise
-    return True
 
 
 def _orphan_repair_counts(db: sqlite3.Connection) -> dict[str, int]:
@@ -523,22 +481,31 @@ def reconcile(
 
     create_memory_schema: Any = None
     upsert_document_rows: Any = None
-    delete_document_rows: Any = None
+    delete_document_rows_by_id: Any = None
+    db: sqlite3.Connection | None = None
     if apply:
+        (
+            create_memory_schema,
+            upsert_document_rows,
+            delete_document_rows_by_id,
+        ) = _load_indexing_helpers()
         # This occurs before schema upgrades, upserts, and ineligible-node
         # pruning so every SQLite mutation has a recoverable predecessor.
         backup_path = _backup_database(db_path)
         db = _open_apply(db_path)
-        create_memory_schema, upsert_document_rows, delete_document_rows = _load_indexing_helpers()
-        create_memory_schema(db)
     elif db_path.exists():
         backup_path = None
         db = _open_readonly(db_path)
     else:
         backup_path = None
-        db = None
 
     try:
+        if apply and db is not None:
+            # Keep schema migration, planning, SQLite mutations, and outbox
+            # enqueueing in one reserved-lock transaction. Nested indexing
+            # helpers use savepoints while this root transaction is active.
+            db.execute("BEGIN IMMEDIATE")
+            create_memory_schema(db)
         indexed, ineligible_indexed_nodes = (
             _indexed_nodes(db, workspace) if db is not None else ({}, [])
         )
@@ -603,23 +570,9 @@ def reconcile(
             for node in ineligible_indexed_nodes:
                 path = str(node.get("path") or "")
                 node_id = str(node.get("node_id") or "")
-                decision = assess_document_path(path)
-                deleted = False
-                if (
-                    delete_document_rows is not None
-                    and decision.path
-                    and node_id == _file_node_id(decision.path)
-                ):
-                    try:
-                        deleted = bool(delete_document_rows(db, decision.path))
-                    except ValueError:
-                        # Newer helpers may reject the legacy path before row
-                        # deletion; the stored-ID fallback remains authoritative.
-                        deleted = False
-                # Legacy rows can have an ID that does not match the modern
-                # path-derived identity. Clean that stored row as a fallback.
-                if _node_exists(db, node_id):
-                    deleted = _delete_node_rows_by_id(db, node_id) or deleted
+                # Persisted paths are never normalized for deletion. The stored
+                # ID identifies the exact legacy or malformed row to remove.
+                deleted = bool(delete_document_rows_by_id(db, node_id))
                 if deleted:
                     pruned_node_count += 1
                     if path:
@@ -660,7 +613,7 @@ def reconcile(
         if apply and repair_orphans and db is not None:
             orphan_repair_applied = _repair_orphan_rows(db)
 
-        return {
+        summary = {
             "mode": "apply" if apply else "dry-run",
             "workspace": str(workspace),
             "database": str(db_path),
@@ -708,6 +661,13 @@ def reconcile(
             "repair_orphan_count": orphan_repair_applied["total_count"],
             "deletions": pruned_node_count + orphan_repair_applied["total_count"],
         }
+        if apply and db is not None:
+            db.commit()
+        return summary
+    except BaseException:
+        if apply and db is not None and db.in_transaction:
+            db.rollback()
+        raise
     finally:
         if db is not None:
             db.close()

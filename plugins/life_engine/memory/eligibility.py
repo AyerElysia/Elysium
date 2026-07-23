@@ -10,6 +10,7 @@ import os
 import posixpath
 import sqlite3
 import stat
+import threading
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -395,16 +396,48 @@ def scan_workspace_documents(
 
 
 SQLITE_INDEXED_PATH_FUNCTION = "life_memory_indexed_path_ok"
+_SQL_FUNCTION_LOCK = threading.RLock()
+
+
+def _indexed_path_sql_value(value: object) -> int:
+    """Return SQLite's integer representation of the strict stored-path rule."""
+    return int(is_eligible_indexed_document_path(value))
+
+
+def _has_indexed_path_sql_function(db: sqlite3.Connection) -> bool:
+    """Return whether this handle already owns the strict-path UDF."""
+    try:
+        return (
+            db.execute(
+                "SELECT 1 FROM pragma_function_list WHERE name = ? AND narg = ? LIMIT 1",
+                (SQLITE_INDEXED_PATH_FUNCTION, 1),
+            ).fetchone()
+            is not None
+        )
+    except sqlite3.DatabaseError:
+        # ``pragma_function_list`` is unavailable on older SQLite builds. A
+        # direct invocation remains connection-local and, under the caller's
+        # lock, avoids falling back to repeated ``create_function`` calls.
+        try:
+            db.execute(f"SELECT {SQLITE_INDEXED_PATH_FUNCTION}(NULL)").fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such function" in str(exc).lower():
+                return False
+            raise
+        return True
 
 
 def register_indexed_path_sql_function(db: sqlite3.Connection) -> None:
-    """Register the authoritative stored-path predicate on one SQLite handle."""
-    db.create_function(
-        SQLITE_INDEXED_PATH_FUNCTION,
-        1,
-        lambda value: int(is_eligible_indexed_document_path(value)),
-        deterministic=True,
-    )
+    """Install the authoritative stored-path predicate at most once per handle."""
+    with _SQL_FUNCTION_LOCK:
+        if _has_indexed_path_sql_function(db):
+            return
+        db.create_function(
+            SQLITE_INDEXED_PATH_FUNCTION,
+            1,
+            _indexed_path_sql_value,
+            deterministic=True,
+        )
 
 
 def eligible_document_path_sql(column: str) -> tuple[str, list[str]]:

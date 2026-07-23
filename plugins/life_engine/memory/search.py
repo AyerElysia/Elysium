@@ -29,8 +29,20 @@ from .eligibility import (
     is_eligible_indexed_document_path,
     register_indexed_path_sql_function,
 )
-from .nodes import MemoryNode, row_to_node
+from .nodes import MemoryNode, NodeType, canonical_file_node_id, row_to_node
 from .temporal import parse_temporal_date
+
+# NOTE: Every ``register_indexed_path_sql_function(db)`` call below is
+# deliberately unconditional and repeated per query. This is safe and cheap
+# because ``eligibility.register_indexed_path_sql_function`` already
+# serializes installation with its own ``_SQL_FUNCTION_LOCK`` and probes the
+# connection (via ``pragma_function_list``, or a direct call on older
+# SQLite) before ever calling ``sqlite3.Connection.create_function`` again.
+# None of these call sites hold ``indexing._TRANSACTION_LOCK`` or
+# ``edges._EDGE_WRITE_LOCK`` while registering, so there is no lock-ordering
+# cycle with those transaction/edge-write locks either. Do not remove these
+# calls as a "de-duplication" cleanup: read paths here can run against a
+# freshly opened connection that never went through ``create_memory_schema``.
 
 logger = log_api.get_logger("life_engine.memory.search")
 
@@ -172,6 +184,17 @@ class _FtsSearchOutcome:
     error: str = ""
 
 
+@dataclass(frozen=True)
+class _DeferredChunkVectorHit:
+    """A chunk-vector hit awaiting SQLite revision validation."""
+
+    chunk_id: str
+    node_id: str
+    document_hash: str
+    index_revision: Any
+    similarity: float
+
+
 @dataclass
 class _VectorSearchOutcome:
     results: List[Tuple[str, float]]
@@ -179,11 +202,13 @@ class _VectorSearchOutcome:
     degraded: bool = False
     error_type: str | None = None
     error: str = ""
+    deferred_chunk_hits: List[_DeferredChunkVectorHit] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
 class _LoadedNode:
     node_id: str
+    node_type: str
     file_path: str
     title: str
     event_date: str | None
@@ -276,57 +301,60 @@ async def sync_embedding(
     content: str,
     get_node_by_file_path_func: Any = None,
 ) -> None:
-    """同步文件的 embedding 到向量数据库。
+    """兼容旧调用：仅更新 SQLite 文档/ outbox，不直接写入 Chroma。
 
-    Args:
-        db: SQLite 数据库连接
-        collection: ChromaDB collection
-        file_path: 文件路径
-        content: 文件内容
-        get_node_by_file_path_func: 获取节点的函数
+    Chroma 只能由 index worker 写入。已有 SQLite 修订会保留其标题和
+    内容；空内容不会清空已索引的文档，只会重新排入其现有 outbox 工作。
     """
-    from .nodes import get_node_by_file_path
-
+    del collection, get_node_by_file_path_func
     eligibility = assess_document_path(file_path)
     if not eligibility.eligible:
         return
-    normalized_path = eligibility.path
-    if get_node_by_file_path_func:
-        node = await get_node_by_file_path_func(normalized_path)
-    else:
-        node = await get_node_by_file_path(db, normalized_path)
-    if not node:
-        return
+
+    from .indexing import enqueue_index_job, upsert_document_rows
+
+    text = str(content or "")
+    canonical_path, node_id = canonical_file_node_id(eligibility.path)
+
+    def _enqueue() -> str | None:
+        existing = None
+        if _table_exists(db, "memory_nodes"):
+            existing = db.execute(
+                "SELECT node_type, file_path, content_hash, title "
+                "FROM memory_nodes WHERE node_id = ?",
+                (node_id,),
+            ).fetchone()
+        if existing is not None:
+            node_type, stored_path, content_hash, title = existing
+            if (
+                str(node_type or NodeType.FILE.value).lower() != NodeType.FILE.value
+                or not is_eligible_indexed_document_path(stored_path)
+                or str(stored_path) != canonical_path
+            ):
+                return None
+            if text:
+                result = upsert_document_rows(
+                    db,
+                    canonical_path,
+                    text,
+                    title=str(title or ""),
+                )
+                return result.file_path
+            if content_hash:
+                enqueue_index_job(db, node_id, str(content_hash))
+                return canonical_path
+            return None
+        if not text:
+            return None
+        result = upsert_document_rows(db, canonical_path, text)
+        return result.file_path
 
     try:
-        embedding = await embed_text(content[:3000])
-
-        await asyncio.to_thread(
-            collection.upsert,
-            ids=[node.node_id],
-            embeddings=[embedding],
-            documents=[content[:500]],
-            metadatas=[
-                {
-                    "file_path": normalized_path,
-                    "title": node.title,
-                    "created_at": node.created_at,
-                }
-            ],
-        )
-
-        def _do_db_work() -> None:
-            cursor = db.cursor()
-            cursor.execute(
-                "UPDATE memory_nodes SET embedding_synced = 1 WHERE node_id = ?",
-                (node.node_id,),
-            )
-            db.commit()
-
-        await asyncio.to_thread(_do_db_work)
-        logger.debug(f"已同步 embedding: {file_path}")
-    except Exception as e:
-        logger.error(f"同步 embedding 失败 ({file_path}): {e}")
+        queued_path = await asyncio.to_thread(_enqueue)
+        if queued_path:
+            logger.debug(f"已排入 embedding outbox: {queued_path}")
+    except Exception as exc:
+        logger.error(f"排入 embedding outbox 失败 ({canonical_path}): {type(exc).__name__}")
 
 
 def _collection_metadata(collection: Any) -> Dict[str, Any]:
@@ -366,14 +394,26 @@ def _current_chunk_map(
 ) -> Dict[str, Tuple[str, str, int]]:
     """Map only current SQLite chunks to their owning document revision."""
     ordered = list(dict.fromkeys(str(value) for value in chunk_ids if value))
-    if not ordered or not _table_exists(db, "memory_chunks"):
+    if (
+        not ordered
+        or not _table_exists(db, "memory_chunks")
+        or not _table_exists(db, "memory_nodes")
+    ):
         return {}
-    placeholders = ",".join("?" for _ in ordered)
+    register_indexed_path_sql_function(db)
+    node_columns = _table_columns(db, "memory_nodes")
+    clauses = [f"c.chunk_id IN ({','.join('?' for _ in ordered)})"]
+    if "is_deleted" in node_columns:
+        clauses.append("COALESCE(n.is_deleted, 0) = 0")
+    if "node_type" in node_columns:
+        clauses.append("lower(COALESCE(n.node_type, 'file')) = 'file'")
+    eligibility_sql, eligibility_params = eligible_document_path_sql("n.file_path")
+    clauses.append(eligibility_sql)
     rows = db.execute(
         "SELECT c.chunk_id, c.node_id, n.content_hash, n.index_revision "
         "FROM memory_chunks c JOIN memory_nodes n ON n.node_id = c.node_id "
-        f"WHERE c.chunk_id IN ({placeholders}) AND COALESCE(n.is_deleted, 0) = 0",
-        ordered,
+        f"WHERE {' AND '.join(clauses)}",
+        [*ordered, *eligibility_params],
     ).fetchall()
     return {
         str(row["chunk_id"]): (
@@ -392,6 +432,7 @@ async def _query_vector_collection(
     *,
     chunk_mode: bool,
     db: sqlite3.Connection | None,
+    defer_chunk_validation: bool = False,
 ) -> _VectorSearchOutcome:
     """Query and normalize one vector collection without generating embeddings."""
     try:
@@ -412,13 +453,15 @@ async def _query_vector_collection(
         if not ids:
             return _VectorSearchOutcome(results=[], success=True)
 
+        deferred_validation = chunk_mode and db is not None and defer_chunk_validation
         degraded = False
         error_type: str | None = None
         raw_pairs: List[Tuple[str, float]] = []
+        deferred_hits: List[_DeferredChunkVectorHit] = []
         result_ids = [str(value) for value in ids]
         current_chunks = (
             await _async_db_read(_current_chunk_map, db, result_ids)
-            if chunk_mode and db is not None
+            if chunk_mode and db is not None and not deferred_validation
             else {}
         )
         best_by_node: Dict[str, float] = {}
@@ -426,42 +469,56 @@ async def _query_vector_collection(
             metadata = metadatas[index] if index < len(metadatas) else {}
             metadata = metadata if isinstance(metadata, dict) else {}
             resolved_id = result_id
+            distance = distances[index] if index < len(distances) else 0.0
+            similarity = 1.0 / (1.0 + float(distance))
             if chunk_mode:
-                current = current_chunks.get(result_id)
-                if db is not None and current is None:
-                    degraded = True
-                    error_type = error_type or "StaleChunkVector"
-                    continue
-                if current is not None:
-                    node_id, document_hash, index_revision = current
-                    metadata_node_id = str(metadata.get("node_id") or "")
-                    metadata_hash = str(metadata.get("document_hash") or "")
-                    metadata_revision = metadata.get("index_revision")
-                    try:
-                        revision_mismatch = (
-                            metadata_revision is not None
-                            and int(metadata_revision) != index_revision
+                metadata_node_id = str(metadata.get("node_id") or "")
+                metadata_hash = str(metadata.get("document_hash") or "")
+                metadata_revision = metadata.get("index_revision")
+                if deferred_validation:
+                    deferred_hits.append(
+                        _DeferredChunkVectorHit(
+                            chunk_id=result_id,
+                            node_id=metadata_node_id,
+                            document_hash=metadata_hash,
+                            index_revision=metadata_revision,
+                            similarity=similarity,
                         )
-                    except (TypeError, ValueError):
-                        revision_mismatch = True
-                    if (
-                        (metadata_node_id and metadata_node_id != node_id)
-                        or (metadata_hash and metadata_hash != document_hash)
-                        or revision_mismatch
-                    ):
+                    )
+                    if not metadata_node_id:
+                        continue
+                    resolved_id = metadata_node_id
+                else:
+                    current = current_chunks.get(result_id)
+                    if db is not None and current is None:
                         degraded = True
                         error_type = error_type or "StaleChunkVector"
                         continue
-                    resolved_id = node_id
-                else:
-                    resolved_id = str(metadata.get("node_id") or "")
-                    if not resolved_id:
-                        degraded = True
-                        error_type = error_type or "ChunkMetadataUnavailable"
-                        continue
+                    if current is not None:
+                        node_id, document_hash, index_revision = current
+                        try:
+                            revision_mismatch = (
+                                metadata_revision is not None
+                                and int(metadata_revision) != index_revision
+                            )
+                        except (TypeError, ValueError):
+                            revision_mismatch = True
+                        if (
+                            (metadata_node_id and metadata_node_id != node_id)
+                            or (metadata_hash and metadata_hash != document_hash)
+                            or revision_mismatch
+                        ):
+                            degraded = True
+                            error_type = error_type or "StaleChunkVector"
+                            continue
+                        resolved_id = node_id
+                    else:
+                        resolved_id = metadata_node_id
+                        if not resolved_id:
+                            degraded = True
+                            error_type = error_type or "ChunkMetadataUnavailable"
+                            continue
 
-            distance = distances[index] if index < len(distances) else 0.0
-            similarity = 1.0 / (1.0 + float(distance))
             if chunk_mode:
                 best_by_node[resolved_id] = max(
                     best_by_node.get(resolved_id, 0.0), similarity
@@ -475,6 +532,7 @@ async def _query_vector_collection(
             success=True,
             degraded=degraded,
             error_type=error_type,
+            deferred_chunk_hits=deferred_hits,
         )
     except Exception as exc:
         logger.warning(f"向量检索降级: {type(exc).__name__}")
@@ -487,12 +545,47 @@ async def _query_vector_collection(
         )
 
 
+def _resolve_deferred_chunk_hits(
+    db: sqlite3.Connection,
+    hits: Sequence[_DeferredChunkVectorHit],
+) -> tuple[List[Tuple[str, float]], bool, str | None]:
+    """Validate deferred chunk-vector hits against the current SQLite revision."""
+    current_chunks = _current_chunk_map(db, [hit.chunk_id for hit in hits])
+    best_by_node: Dict[str, float] = {}
+    degraded = False
+    error_type: str | None = None
+    for hit in hits:
+        current = current_chunks.get(hit.chunk_id)
+        if current is None:
+            degraded = True
+            error_type = error_type or "StaleChunkVector"
+            continue
+        node_id, document_hash, index_revision = current
+        try:
+            revision_mismatch = (
+                hit.index_revision is not None and int(hit.index_revision) != index_revision
+            )
+        except (TypeError, ValueError):
+            revision_mismatch = True
+        if (
+            (hit.node_id and hit.node_id != node_id)
+            or (hit.document_hash and hit.document_hash != document_hash)
+            or revision_mismatch
+        ):
+            degraded = True
+            error_type = error_type or "StaleChunkVector"
+            continue
+        best_by_node[node_id] = max(best_by_node.get(node_id, 0.0), hit.similarity)
+    return list(best_by_node.items()), degraded, error_type
+
+
 async def _filter_vector_outcome(
     outcome: _VectorSearchOutcome,
     filter_existing_func: Any,
     db: sqlite3.Connection | None,
     *,
     chunk_mode: bool,
+    validate_db: bool = True,
 ) -> _VectorSearchOutcome:
     raw_pairs = outcome.results
     if filter_existing_func:
@@ -500,9 +593,38 @@ async def _filter_vector_outcome(
         if stale_ids:
             logger.warning(f"向量检索命中 {len(stale_ids)} 个脏节点ID（节点表不存在），已忽略")
         raw_pairs = filtered_pairs
-    elif chunk_mode and db is not None:
+    if validate_db and db is not None:
         raw_pairs, _ = await filter_existing_scores(db, raw_pairs)
     outcome.results = raw_pairs
+    return outcome
+
+
+async def _resolve_deferred_vector_outcome(
+    db: sqlite3.Connection,
+    outcome: _VectorSearchOutcome,
+) -> _VectorSearchOutcome:
+    """Replace provisional chunk results after concurrent readers have finished."""
+    if not outcome.deferred_chunk_hits:
+        return outcome
+    try:
+        results, degraded, error_type = await _async_db_read(
+            _resolve_deferred_chunk_hits,
+            db,
+            outcome.deferred_chunk_hits,
+        )
+    except Exception as exc:
+        logger.warning(f"向量检索降级: {type(exc).__name__}")
+        outcome.results = []
+        outcome.success = False
+        outcome.degraded = True
+        outcome.error_type = type(exc).__name__
+        outcome.error = _short_error(exc)
+        outcome.deferred_chunk_hits = []
+        return outcome
+    outcome.results = results
+    outcome.degraded = outcome.degraded or degraded
+    outcome.error_type = outcome.error_type or error_type
+    outcome.deferred_chunk_hits = []
     return outcome
 
 
@@ -514,6 +636,8 @@ async def _vector_search_outcome(
     *,
     db: sqlite3.Connection | None = None,
     chunk_collection: Any = None,
+    validate_db: bool = True,
+    defer_chunk_validation: bool = False,
 ) -> _VectorSearchOutcome:
     """Prefer chunk vectors, with an explicit degraded legacy-node fallback."""
     target = chunk_collection if chunk_collection is not None else collection
@@ -534,6 +658,7 @@ async def _vector_search_outcome(
             top_k,
             chunk_mode=chunk_mode,
             db=db,
+            defer_chunk_validation=defer_chunk_validation,
         )
 
         has_legacy_fallback = (
@@ -559,6 +684,7 @@ async def _vector_search_outcome(
                     filter_existing_func,
                     db,
                     chunk_mode=False,
+                    validate_db=validate_db,
                 )
             return legacy
 
@@ -567,6 +693,7 @@ async def _vector_search_outcome(
             filter_existing_func,
             db,
             chunk_mode=chunk_mode,
+            validate_db=validate_db,
         )
     except Exception as exc:
         logger.warning(f"向量检索降级: {type(exc).__name__}")
@@ -1207,6 +1334,36 @@ async def _get_edges_from_readonly(
     return await _async_db_read(_read_edges_from, db, node_id, min_weight)
 
 
+def _read_traversable_node_ids(db: sqlite3.Connection) -> set[str]:
+    """Load graph nodes that are safe for a read-only retrieval traversal."""
+    if not _table_exists(db, "memory_nodes"):
+        return set()
+    register_indexed_path_sql_function(db)
+    columns = _table_columns(db, "memory_nodes")
+    node_type_expr = "COALESCE(node_type, 'file')" if "node_type" in columns else "'file'"
+    deleted_expr = "COALESCE(is_deleted, 0)" if "is_deleted" in columns else "0"
+    eligibility_sql, eligibility_params = eligible_document_path_sql("file_path")
+    rows = db.execute(
+        "SELECT node_id, "
+        f"{node_type_expr} AS node_type, file_path, {deleted_expr} AS is_deleted "
+        "FROM memory_nodes "
+        f"WHERE {deleted_expr} = 0 "
+        f"AND (lower({node_type_expr}) <> ? OR {eligibility_sql})",
+        [NodeType.FILE.value, *eligibility_params],
+    ).fetchall()
+    visible_ids: set[str] = set()
+    for row in rows:
+        node_type = str(row["node_type"] or NodeType.FILE.value).lower()
+        if node_type == NodeType.CONCEPT.value:
+            visible_ids.add(str(row["node_id"]))
+        elif (
+            node_type == NodeType.FILE.value
+            and is_eligible_indexed_document_path(row["file_path"])
+        ):
+            visible_ids.add(str(row["node_id"]))
+    return visible_ids
+
+
 async def spread_activation(
     db: sqlite3.Connection,
     seed_ids: List[str],
@@ -1251,6 +1408,12 @@ async def spread_activation(
         or normalized_results == 0
     ):
         return []
+    traversable_node_ids = await _async_db_read(_read_traversable_node_ids, db)
+    normalized_seed_ids = [
+        node_id for node_id in normalized_seed_ids if node_id in traversable_node_ids
+    ]
+    if not normalized_seed_ids:
+        return []
 
     activation: Dict[str, float] = {seed: 1.0 for seed in normalized_seed_ids}
     paths: Dict[str, List[str]] = {seed: [seed] for seed in normalized_seed_ids}
@@ -1270,7 +1433,7 @@ async def spread_activation(
                     continue
 
                 neighbor = edge.target_id
-                if neighbor in current_path:
+                if neighbor not in traversable_node_ids or neighbor in current_path:
                     continue
 
                 propagated = current_activation * edge.weight * spread_decay
@@ -1381,7 +1544,17 @@ async def get_node_by_id(db: sqlite3.Connection, node_id: str) -> Optional[Memor
         cursor = db.cursor()
         cursor.execute("SELECT * FROM memory_nodes WHERE node_id = ?", (node_id,))
         row = cursor.fetchone()
-        return row_to_node(row) if row else None
+        if row is None:
+            return None
+        if "is_deleted" in row.keys() and bool(row["is_deleted"]):
+            return None
+        node = row_to_node(row)
+        if (
+            node.node_type == NodeType.FILE
+            and not is_eligible_indexed_document_path(node.file_path)
+        ):
+            return None
+        return node
 
     return await _async_db_read(_do_db_work)
 
@@ -1433,11 +1606,13 @@ def _load_nodes_by_ids(
         if _table_exists(db, "memory_fts")
         else "NULL"
     )
+    node_type_expr = "n.node_type" if "node_type" in columns else "'file'"
     rows = db.execute(
         f"""
-        SELECT n.node_id, n.file_path, n.title, {event_expr} AS event_date,
-               {deleted_expr} AS is_deleted, {mtime_expr} AS source_mtime,
-               n.created_at, COALESCE({chunk_expr}, {fts_expr}, '') AS preview_content
+        SELECT n.node_id, {node_type_expr} AS node_type, n.file_path, n.title,
+               {event_expr} AS event_date, {deleted_expr} AS is_deleted,
+               {mtime_expr} AS source_mtime, n.created_at,
+               COALESCE({chunk_expr}, {fts_expr}, '') AS preview_content
         FROM memory_nodes AS n
         WHERE n.node_id IN ({placeholders})
         """,
@@ -1446,6 +1621,7 @@ def _load_nodes_by_ids(
     return {
         str(row["node_id"]): _LoadedNode(
             node_id=str(row["node_id"]),
+            node_type=str(row["node_type"] or NodeType.FILE.value).lower(),
             file_path=str(row["file_path"] or ""),
             title=str(row["title"] or ""),
             event_date=str(row["event_date"]) if row["event_date"] else None,
@@ -1504,7 +1680,7 @@ def _node_matches_filters(
     cutoff_date: date | None,
     workspace_path: str | Path | None,
 ) -> bool:
-    if node.is_deleted or not node.file_path:
+    if node.node_type != NodeType.FILE.value or node.is_deleted or not node.file_path:
         return False
     if not is_eligible_indexed_document_path(node.file_path):
         return False
@@ -1602,9 +1778,6 @@ async def search_memory_detailed(
             {**query_meta, "top_k": top_k, "enable_association": enable_association},
         )
 
-    async def _bound_filter(raw_pairs: List[Tuple[str, float]]):
-        return await filter_existing_scores(db, raw_pairs)
-
     async def _run_fts() -> tuple[_FtsSearchOutcome, float]:
         started = time.perf_counter()
         outcome = await _chunk_fts_search_outcome(
@@ -1618,9 +1791,10 @@ async def search_memory_detailed(
             query,
             collection,
             max(0, int(top_k)) * 4,
-            _bound_filter,
             db=db,
             chunk_collection=chunk_collection,
+            validate_db=False,
+            defer_chunk_validation=True,
         )
         return outcome, time.perf_counter() - started
 
@@ -1639,6 +1813,10 @@ async def search_memory_detailed(
             fts_outcome = outcome
         else:
             vector_outcome = outcome
+
+    validation_started = time.perf_counter()
+    vector_outcome = await _resolve_deferred_vector_outcome(db, vector_outcome)
+    diagnostics.phase_timings["vector_validation"] = time.perf_counter() - validation_started
 
     diagnostics.fts_success = fts_outcome.success
     diagnostics.vector_success = vector_outcome.success

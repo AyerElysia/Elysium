@@ -11,12 +11,16 @@ from typing import Any
 
 import pytest
 
+from plugins.life_engine.memory import search as search_module
+from plugins.life_engine.memory.edges import EdgeType, create_or_update_edge
 from plugins.life_engine.memory.indexing import create_memory_schema, upsert_document_rows
 from plugins.life_engine.memory.search import (
+    _chunk_fts_rows,
     chunk_fts_search,
     embed_texts,
     search_memory,
     search_memory_detailed,
+    sync_embedding,
     vector_search,
 )
 
@@ -403,6 +407,83 @@ async def test_chunk_vector_search_deduplicates_nodes_and_ignores_stale_ids(
 
 
 @pytest.mark.asyncio
+async def test_chunk_vector_validation_waits_for_parallel_fts_reader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = _db(tmp_path)
+    indexed = upsert_document_rows(
+        db,
+        "notes/chunk-parallel.md",
+        "chunk parallel marker",
+        "Chunk parallel",
+        now=2.0,
+    )
+    node = db.execute(
+        "SELECT content_hash, index_revision FROM memory_nodes WHERE node_id = ?",
+        (indexed.node_id,),
+    ).fetchone()
+    assert node is not None
+    fts_started = threading.Event()
+    release_fts = threading.Event()
+    fts_finished = threading.Event()
+    vector_started = threading.Event()
+    original_fts_rows = search_module._chunk_fts_rows
+    original_chunk_map = search_module._current_chunk_map
+
+    def gated_fts_rows(*args: Any, **kwargs: Any) -> Any:
+        fts_started.set()
+        assert release_fts.wait(timeout=2.0)
+        try:
+            return original_fts_rows(*args, **kwargs)
+        finally:
+            fts_finished.set()
+
+    def guarded_chunk_map(*args: Any, **kwargs: Any) -> Any:
+        assert fts_finished.is_set(), "chunk validation raced the FTS reader"
+        return original_chunk_map(*args, **kwargs)
+
+    monkeypatch.setattr("plugins.life_engine.memory.search.embed_text", _no_embed)
+    monkeypatch.setattr(search_module, "_chunk_fts_rows", gated_fts_rows)
+    monkeypatch.setattr(search_module, "_current_chunk_map", guarded_chunk_map)
+    chunks = _FakeCollection(
+        [indexed.chunks[0].chunk_id],
+        metadatas=[
+            {
+                "node_id": indexed.node_id,
+                "document_hash": str(node["content_hash"] or ""),
+                "index_revision": int(node["index_revision"] or 0),
+            }
+        ],
+        chunk=True,
+        started=vector_started,
+    )
+
+    task = asyncio.create_task(
+        search_memory_detailed(
+            db,
+            "chunk parallel marker",
+            None,
+            top_k=2,
+            enable_association=False,
+            chunk_collection=chunks,
+        )
+    )
+    assert await asyncio.to_thread(fts_started.wait, 1.0)
+    assert await asyncio.to_thread(vector_started.wait, 1.0)
+    assert not task.done()
+    release_fts.set()
+    detailed = await asyncio.wait_for(task, timeout=5.0)
+
+    assert fts_finished.is_set()
+    assert detailed.fts_success is True
+    assert detailed.vector_success is True
+    assert detailed.vector_candidate_count == 1
+    assert "OperationalError" not in detailed.error_types.values()
+    assert [item.file_path for item in detailed.results] == ["notes/chunk-parallel.md"]
+
+
+@pytest.mark.asyncio
 async def test_chunk_vector_failure_uses_degraded_legacy_node_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -434,3 +515,179 @@ async def test_chunk_vector_failure_uses_degraded_legacy_node_fallback(
     assert detailed.error_types["vector"] == "LegacyVectorFallback"
     assert chunks.query_thread_id is not None
     assert legacy.query_thread_id is not None
+
+
+@pytest.mark.asyncio
+async def test_vector_filter_callback_cannot_bypass_strict_sqlite_visibility(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = _db(tmp_path)
+    visible = upsert_document_rows(db, "notes/visible.md", "visible", now=2.0)
+    hidden = upsert_document_rows(db, "notes/hidden.md", "hidden", now=3.0)
+    db.execute(
+        "UPDATE memory_nodes SET file_path = ? WHERE node_id = ?",
+        ("./notes/hidden.md", hidden.node_id),
+    )
+    db.commit()
+    monkeypatch.setattr("plugins.life_engine.memory.search.embed_text", _no_embed)
+
+    async def permissive_filter(
+        scores: list[tuple[str, float]],
+    ) -> tuple[list[tuple[str, float]], list[str]]:
+        return scores, []
+
+    results = await vector_search(
+        "query",
+        _FakeCollection([visible.node_id, hidden.node_id]),
+        db=db,
+        filter_existing_func=permissive_filter,
+    )
+
+    assert [node_id for node_id, _ in results] == [visible.node_id]
+
+
+@pytest.mark.asyncio
+async def test_sync_embedding_enqueues_outbox_without_chroma_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = _db(tmp_path)
+    existing = upsert_document_rows(
+        db,
+        "notes/sync.md",
+        "old indexed body",
+        "Sync",
+        now=2.0,
+    )
+    db.execute(
+        "UPDATE memory_nodes SET embedding_synced = 1 WHERE node_id = ?",
+        (existing.node_id,),
+    )
+    db.execute("DELETE FROM memory_index_jobs WHERE node_id = ?", (existing.node_id,))
+    db.commit()
+
+    class _FailingChroma:
+        def __init__(self) -> None:
+            self.upsert_calls: list[dict[str, Any]] = []
+
+        def upsert(self, **kwargs: Any) -> None:
+            self.upsert_calls.append(kwargs)
+            raise AssertionError("sync_embedding must not write Chroma directly")
+
+    collection = _FailingChroma()
+    monkeypatch.setattr("plugins.life_engine.memory.search.embed_text", _no_embed)
+
+    await sync_embedding(db, collection, "./notes/sync.md", "new queued body")
+
+    node = db.execute(
+        "SELECT node_id, file_path, content_hash, title, embedding_synced "
+        "FROM memory_nodes WHERE node_id = ?",
+        (existing.node_id,),
+    ).fetchone()
+    jobs = db.execute(
+        "SELECT node_id, content_hash, status, attempts, error "
+        "FROM memory_index_jobs WHERE node_id = ?",
+        (existing.node_id,),
+    ).fetchall()
+
+    assert node is not None
+    assert node["node_id"] == existing.node_id
+    assert node["file_path"] == "notes/sync.md"
+    assert node["title"] == "Sync"
+    assert node["content_hash"] != existing.content_hash
+    assert node["embedding_synced"] == 0
+    assert [tuple(job) for job in jobs] == [
+        (existing.node_id, node["content_hash"], "pending", 0, "")
+    ]
+
+    await sync_embedding(db, collection, "notes/sync.md", "")
+    preserved = db.execute(
+        "SELECT content_hash, title, embedding_synced FROM memory_nodes WHERE node_id = ?",
+        (existing.node_id,),
+    ).fetchone()
+    assert preserved is not None
+    assert tuple(preserved) == (node["content_hash"], "Sync", 0)
+    assert collection.upsert_calls == []
+
+
+@pytest.mark.parametrize(
+    "stored_path",
+    [
+        "./notes/hidden.md",
+        "notes//hidden.md",
+        r"notes\hidden.md",
+        " notes/hidden.md ",
+        "runtime/hidden.json",
+    ],
+    ids=["dot-slash", "duplicate-slash", "backslash", "padding", "runtime"],
+)
+@pytest.mark.asyncio
+async def test_search_memory_excludes_malformed_stored_paths_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stored_path: str,
+) -> None:
+    db = _db(tmp_path)
+    root = upsert_document_rows(
+        db,
+        "notes/root.md",
+        "strict stored path marker",
+        "Root",
+        now=2.0,
+    )
+    hidden = upsert_document_rows(
+        db,
+        "notes/hidden.md",
+        "strict stored path marker",
+        "Hidden",
+        now=3.0,
+    )
+    await create_or_update_edge(
+        db,
+        root.node_id,
+        hidden.node_id,
+        EdgeType.RELATES,
+        strength=0.9,
+        bidirectional=False,
+    )
+    db.execute(
+        "UPDATE memory_nodes SET file_path = ? WHERE node_id = ?",
+        (stored_path, hidden.node_id),
+    )
+    db.commit()
+    assert db.execute(
+        "SELECT COUNT(*) FROM memory_chunks_fts WHERE node_id = ?",
+        (hidden.node_id,),
+    ).fetchone()[0] > 0
+    before = _snapshot(db)
+    fts_finished = threading.Event()
+    original_chunk_fts_rows = _chunk_fts_rows
+
+    def record_fts_completion(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return original_chunk_fts_rows(*args, **kwargs)
+        finally:
+            fts_finished.set()
+
+    collection = _FakeCollection(
+        [root.node_id, hidden.node_id],
+        gate=fts_finished,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.search._chunk_fts_rows",
+        record_fts_completion,
+    )
+    monkeypatch.setattr("plugins.life_engine.memory.search.embed_text", _no_embed)
+
+    results = await search_memory(
+        db,
+        "strict stored path marker",
+        collection,
+        top_k=10,
+        enable_association=True,
+    )
+
+    assert [item.file_path for item in results] == ["notes/root.md"]
+    assert collection.query_thread_id is not None
+    assert _snapshot(db) == before

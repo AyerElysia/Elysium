@@ -17,18 +17,33 @@ import numpy as np
 
 from src.app.plugin_system.api import log_api
 
-from .eligibility import assess_document_path, eligible_document_path_sql
+from .eligibility import (
+    assess_document_path,
+    assess_indexed_document_path,
+    eligible_document_path_sql,
+    is_eligible_indexed_document_path,
+    register_indexed_path_sql_function,
+)
+from .indexing import transaction as _index_transaction
 from .nodes import MemoryNode, NodeType, row_to_node
 from .edges import (
     EdgeType,
     _EDGE_WRITE_LOCK,
-    _finish_savepoint,
     _reinforce_associations_sync,
-    _start_savepoint,
     get_edges_from,
 )
 
 logger = log_api.get_logger("life_engine.memory.decay")
+
+# NOTE: Every ``register_indexed_path_sql_function(db)`` call below is
+# deliberately unconditional and repeated per query, mirroring the call sites
+# in ``search.py``. This is safe because
+# ``eligibility.register_indexed_path_sql_function`` serializes installation
+# with its own ``_SQL_FUNCTION_LOCK`` and probes the connection before calling
+# ``sqlite3.Connection.create_function`` again, so concurrent callers never
+# race on ``create_function`` and never deadlock against
+# ``indexing._TRANSACTION_LOCK`` or ``edges._EDGE_WRITE_LOCK`` (neither is held
+# while registering here).
 
 
 # ============================================================
@@ -45,18 +60,19 @@ def _run_edge_maintenance(
     prefix: str,
     operation: Any,
 ) -> Any:
-    """在边写锁和 savepoint 内运行维护操作，保留调用方外层事务。"""
-    with _EDGE_WRITE_LOCK:
-        cursor = db.cursor()
-        savepoint = _start_savepoint(cursor, prefix)
-        error: BaseException | None = None
-        try:
-            return operation()
-        except BaseException as exc:
-            error = exc
-            raise
-        finally:
-            _finish_savepoint(cursor, savepoint, error)
+    """在边写锁和统一事务边界内运行维护操作，保留调用方外层事务。
+
+    ``prefix`` 不再直接命名一个裸 ``SAVEPOINT``：维护操作改为进入
+    ``indexing.transaction()``，与 ``upsert_document_rows`` 等写路径共享同一把
+    ``indexing._TRANSACTION_LOCK``。这避免了旧实现的竞态——``apply_decay`` 曾经
+    只靠 ``_EDGE_WRITE_LOCK`` 保护自己的裸 SAVEPOINT，与仅受
+    ``_TRANSACTION_LOCK`` 保护的 ``transaction()`` 根事务互不知晓；当两者在同一
+    共享连接上并发运行时，后进入的一方会被 SQLite 视为前者根事务下的嵌套
+    SAVEPOINT，前者失败回滚就会连带抹掉后者已提交的写入。现在两条路径共享同一
+    把事务锁，根事务与嵌套 SAVEPOINT 的身份始终由锁的持有顺序决定，不会被误判。
+    """
+    with _EDGE_WRITE_LOCK, _index_transaction(db):
+        return operation()
 
 
 # ============================================================
@@ -116,7 +132,14 @@ async def apply_decay(db: sqlite3.Connection) -> int:
 
         updated = 0
         for row in rows:
+            if "is_deleted" in row.keys() and bool(row["is_deleted"]):
+                continue
             node = row_to_node(row)
+            if (
+                node.node_type == NodeType.FILE
+                and not is_eligible_indexed_document_path(node.file_path)
+            ):
+                continue
             new_strength = compute_memory_strength(node)
 
             if abs(new_strength - node.activation_strength) > 0.01:
@@ -283,6 +306,7 @@ async def dream_walk(
     # Step 1: Load only active, eligible file nodes (sync DB).
     def _load_nodes() -> List[tuple]:
         cursor = db.cursor()
+        register_indexed_path_sql_function(db)
         columns = {str(row[1]) for row in cursor.execute("PRAGMA table_info(memory_nodes)")}
         eligibility_sql, eligibility_params = eligible_document_path_sql("file_path")
         clauses = [
@@ -441,6 +465,7 @@ async def list_dream_candidate_nodes(
 
     def _do_db_work() -> List[Dict[str, Any]]:
         cursor = db.cursor()
+        register_indexed_path_sql_function(db)
         columns = {str(row[1]) for row in cursor.execute("PRAGMA table_info(memory_nodes)")}
         eligibility_sql, eligibility_params = eligible_document_path_sql("file_path")
         clauses = [
@@ -462,7 +487,7 @@ async def list_dream_candidate_nodes(
         )
         results: List[Dict[str, Any]] = []
         for row in cursor.fetchall():
-            eligibility = assess_document_path(str(row["file_path"] or ""))
+            eligibility = assess_indexed_document_path(row["file_path"])
             if not eligibility.eligible:
                 continue
             results.append({
@@ -502,6 +527,7 @@ async def list_random_file_nodes(
 
     def _do_db_work() -> List[Dict[str, Any]]:
         cursor = db.cursor()
+        register_indexed_path_sql_function(db)
         columns = {str(row[1]) for row in cursor.execute("PRAGMA table_info(memory_nodes)")}
         eligibility_sql, eligibility_params = eligible_document_path_sql("file_path")
         clauses = [
@@ -522,7 +548,7 @@ async def list_random_file_nodes(
         )
         results: List[Dict[str, Any]] = []
         for row in cursor.fetchall():
-            eligibility = assess_document_path(str(row["file_path"] or ""))
+            eligibility = assess_indexed_document_path(row["file_path"])
             if not eligibility.eligible:
                 continue
             results.append({
@@ -610,7 +636,12 @@ async def prune_weak_edges(
 # ============================================================
 
 
-async def _call_relation_callback(callback: Any, db: sqlite3.Connection, *args: Any) -> Any:
+async def _call_relation_callback(
+    callback: Any,
+    db: sqlite3.Connection,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
     """兼容模块函数（需要 db）和 service bound callback（不需要 db）。"""
     try:
         signature = inspect.signature(callback)
@@ -622,7 +653,7 @@ async def _call_relation_callback(callback: Any, db: sqlite3.Connection, *args: 
     else:
         def accepts(*candidate_args: Any) -> bool:
             try:
-                signature.bind(*candidate_args)
+                signature.bind(*candidate_args, **kwargs)
             except TypeError:
                 return False
             return True
@@ -651,8 +682,26 @@ async def _call_relation_callback(callback: Any, db: sqlite3.Connection, *args: 
         else:
             raise TypeError("关系回调参数不兼容")
 
-    result = callback(*call_args)
+    result = callback(*call_args, **kwargs)
     return await result if inspect.isawaitable(result) else result
+
+
+def _relation_lookup_kwargs(callback: Any) -> Dict[str, Any]:
+    """Disable service lookup migration for a read-only relation request."""
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return {}
+    accepts_migration_flag = "migrate_identity" in signature.parameters or any(
+        parameter.kind == parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+    return {"migrate_identity": False} if accepts_migration_flag else {}
+
+
+def _relation_node_is_file(node: Any) -> bool:
+    value = getattr(getattr(node, "node_type", None), "value", getattr(node, "node_type", None))
+    return str(value or "").lower() == NodeType.FILE.value
 
 
 async def get_file_relations(
@@ -680,11 +729,16 @@ async def get_file_relations(
     if not root_eligibility.eligible:
         return {"error": f"不是可操作的记忆文档: {root_eligibility.reason}"}
     file_path = root_eligibility.path
-    node = await _call_relation_callback(get_node_func, db, file_path)
+    node = await _call_relation_callback(
+        get_node_func,
+        db,
+        file_path,
+        **_relation_lookup_kwargs(get_node_func),
+    )
     if not node:
         return {"error": f"未找到文件: {file_path}"}
-    node_eligibility = assess_document_path(node.file_path or "")
-    if not node_eligibility.eligible:
+    node_eligibility = assess_indexed_document_path(node.file_path)
+    if not _relation_node_is_file(node) or not node_eligibility.eligible:
         return {"error": f"不是可操作的记忆文档: {node_eligibility.reason}"}
 
     relations: Dict[str, Any] = {
@@ -721,9 +775,9 @@ async def get_file_relations(
                     continue
                 seen_relations.add(relation_key)
                 neighbor = await _call_relation_callback(get_id_func, db, neighbor_id)
-                if neighbor is None or not neighbor.file_path:
+                if neighbor is None or not _relation_node_is_file(neighbor):
                     continue
-                neighbor_eligibility = assess_document_path(neighbor.file_path)
+                neighbor_eligibility = assess_indexed_document_path(neighbor.file_path)
                 if not neighbor_eligibility.eligible:
                     continue
                 known_depth = node_depths.get(neighbor.node_id)

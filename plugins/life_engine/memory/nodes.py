@@ -8,17 +8,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import posixpath
 import sqlite3
 import time
-import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
 from src.app.plugin_system.api import log_api
 
-from .eligibility import assess_document_path
+from .eligibility import assess_document_path, assess_indexed_document_path
 
 logger = log_api.get_logger("life_engine.memory.nodes")
 
@@ -67,27 +65,25 @@ class MemoryNode:
 
 
 def normalize_file_path(file_path: str) -> str:
-    """规范化文件路径字符串，避免同一路径多种写法导致的节点分裂。"""
-    raw = str(file_path or "").strip().replace("\\", "/")
-    if not raw:
-        return ""
-    normalized = posixpath.normpath(raw)
-    if normalized == ".":
-        return ""
-    if normalized.startswith("./"):
-        normalized = normalized[2:]
-    return normalized.lstrip("/")
+    """Return an eligible canonical path or an empty string.
+
+    Kept only for callers that need a non-raising compatibility helper. It
+    never strips a leading slash or collapses traversal into a valid identity.
+    """
+    eligibility = assess_document_path(file_path)
+    return eligibility.path if eligibility.eligible else ""
 
 
 def generate_file_node_id(file_path: str) -> str:
     """Return a deterministic ID for an already-canonical file path.
 
-    This low-level helper intentionally retains compatibility with historical
-    callers. New indexing writes must use ``canonical_file_node_id`` so an
-    absolute or traversal path can never define an identity.
+    Deliberately do not normalize here: callers that accept external input must
+    first use ``canonical_file_node_id``. Hashing a noncanonical spelling as-is
+    prevents an absolute or traversal alias from silently claiming the stored
+    identity of a valid document.
     """
-    normalized = normalize_file_path(file_path)
-    return f"file:{hashlib.md5(normalized.encode()).hexdigest()[:12]}"
+    path = str(file_path or "")
+    return f"file:{hashlib.md5(path.encode()).hexdigest()[:12]}"
 
 
 def canonical_file_node_id(file_path: str) -> tuple[str, str]:
@@ -148,135 +144,41 @@ async def get_or_create_file_node(
     update_fts_func: Any = None,
     migrate_node_identity_func: Any = None,
 ) -> MemoryNode:
-    """获取或创建文件节点。
+    """Return a canonical file node through the SQLite document authority.
 
-    Args:
-        db: SQLite 数据库连接
-        file_path: 文件路径
-        title: 标题
-        content: 内容（用于生成 hash 和 FTS）
-        emit_visual_event: 可视化事件发射函数
-        update_fts_func: FTS 更新函数
-        migrate_node_identity_func: 节点身份迁移函数
-
-    Returns:
-        MemoryNode 实例
+    A supplied document body is always committed through the chunk/FTS/outbox
+    transaction. Empty-content calls only ensure a reference node exists and
+    never clear an already indexed document. Legacy migration callbacks are
+    intentionally ignored here: node lookup and ordinary writes must not turn
+    into implicit identity repair or vector-store work.
     """
-    eligibility = assess_document_path(file_path)
-    if not eligibility.eligible:
-        raise ValueError(f"不支持索引的记忆文档路径: {eligibility.reason}")
-    normalized_path = eligibility.path
-    node_id = generate_file_node_id(normalized_path)
-    legacy_node_id = generate_legacy_file_node_id(file_path)
+    del emit_visual_event, update_fts_func, migrate_node_identity_func
+    normalized_path, _ = canonical_file_node_id(file_path)
+    text = str(content or "")
 
-    def _lookup_node(nid: str) -> Optional[MemoryNode]:
-        cursor = db.cursor()
-        cursor.execute("SELECT * FROM memory_nodes WHERE node_id = ?", (nid,))
-        row = cursor.fetchone()
-        return row_to_node(row) if row else None
+    if text:
+        from .indexing import upsert_document_rows
 
-    row_result = await asyncio.to_thread(_lookup_node, node_id)
-    if row_result is None and legacy_node_id != node_id:
-        legacy_row_result = await asyncio.to_thread(_lookup_node, legacy_node_id)
-        if legacy_row_result is not None and migrate_node_identity_func:
-            await migrate_node_identity_func(
-                old_node_id=legacy_node_id,
-                new_node_id=node_id,
-                new_file_path=normalized_path,
-            )
-            row_result = await asyncio.to_thread(_lookup_node, node_id)
-
-    now = time.time()
-    content_hash = compute_content_hash(content) if content else None
-
-    if row_result:
-        node = row_result
-
-        if content_hash and node.content_hash != content_hash:
-            def _update_node_hash() -> None:
-                cursor = db.cursor()
-                cursor.execute(
-                    """
-                    UPDATE memory_nodes
-                    SET content_hash = ?, title = ?, updated_at = ?, embedding_synced = 0
-                    WHERE node_id = ?
-                    """,
-                    (content_hash, title or node.title, now, node_id),
-                )
-                db.commit()
-
-            await asyncio.to_thread(_update_node_hash)
-            node.content_hash = content_hash
-            node.title = title or node.title
-            node.updated_at = now
-            node.embedding_synced = False
-
-            if update_fts_func:
-                await update_fts_func(node_id, title, content[:2000])
-
-        return node
-
-    node = MemoryNode(
-        node_id=node_id,
-        node_type=NodeType.FILE,
-        file_path=normalized_path,
-        content_hash=content_hash,
-        title=title,
-        created_at=now,
-        updated_at=now,
-    )
-
-    def _insert_node() -> None:
-        cursor = db.cursor()
-        cursor.execute(
-            """
-            INSERT INTO memory_nodes
-            (node_id, node_type, file_path, content_hash, title,
-             activation_strength, access_count, last_accessed_at,
-             emotional_valence, emotional_arousal, importance,
-             created_at, updated_at, embedding_synced)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                node.node_id,
-                node.node_type.value,
-                node.file_path,
-                node.content_hash,
-                node.title,
-                node.activation_strength,
-                node.access_count,
-                node.last_accessed_at,
-                node.emotional_valence,
-                node.emotional_arousal,
-                node.importance,
-                node.created_at,
-                node.updated_at,
-                0,
-            ),
+        await asyncio.to_thread(
+            upsert_document_rows,
+            db,
+            normalized_path,
+            text,
+            title,
         )
-        db.commit()
+    else:
+        from .indexing import ensure_document_reference_rows
 
-    await asyncio.to_thread(_insert_node)
-
-    if content and update_fts_func:
-        await update_fts_func(node_id, title, content[:2000])
-
-    if emit_visual_event:
-        emit_visual_event(
-            "memory.nodes.created",
-            {
-                "node": {
-                    "id": node.node_id,
-                    "type": node.node_type.value.upper(),
-                    "title": node.title,
-                    "path": node.file_path,
-                    "activation": node.activation_strength,
-                    "importance": node.importance,
-                }
-            },
+        await asyncio.to_thread(
+            ensure_document_reference_rows,
+            db,
+            normalized_path,
+            title,
         )
 
-    logger.debug(f"创建文件节点: {file_path}")
+    node = await get_node_by_file_path(db, normalized_path)
+    if node is None:
+        raise RuntimeError(f"文档节点写入后未找到: {normalized_path}")
     return node
 
 
@@ -285,41 +187,44 @@ async def get_node_by_file_path(
     file_path: str,
     migrate_node_identity_func: Any = None,
 ) -> Optional[MemoryNode]:
-    """根据文件路径获取节点。
+    """Read one canonical file node without repairing legacy identities.
 
-    Args:
-        db: SQLite 数据库连接
-        file_path: 文件路径
-        migrate_node_identity_func: 节点身份迁移函数
-
-    Returns:
-        MemoryNode 或 None
+    The optional migration callback is retained for source compatibility but is
+    deliberately ignored. A legacy ID may be returned only when its persisted
+    path is already the exact canonical spelling for the requested document.
     """
+    del migrate_node_identity_func
     eligibility = assess_document_path(file_path)
     if not eligibility.eligible:
         return None
     normalized_path = eligibility.path
-    node_id = generate_file_node_id(normalized_path)
 
-    def _lookup_node(nid: str) -> Optional[MemoryNode]:
-        cursor = db.cursor()
-        cursor.execute("SELECT * FROM memory_nodes WHERE node_id = ?", (nid,))
-        row = cursor.fetchone()
-        return row_to_node(row) if row else None
+    def _valid_file_row(row: sqlite3.Row) -> Optional[MemoryNode]:
+        if str(row["node_type"] or "file").lower() != NodeType.FILE.value:
+            return None
+        stored = assess_indexed_document_path(row["file_path"])
+        if not stored.eligible or stored.path != normalized_path:
+            return None
+        return row_to_node(row)
 
-    row_result = await asyncio.to_thread(_lookup_node, node_id)
-    if row_result is None:
-        legacy_node_id = generate_legacy_file_node_id(file_path)
-        if legacy_node_id != node_id:
-            legacy_row_result = await asyncio.to_thread(_lookup_node, legacy_node_id)
-            if legacy_row_result is not None and migrate_node_identity_func:
-                await migrate_node_identity_func(
-                    old_node_id=legacy_node_id,
-                    new_node_id=node_id,
-                    new_file_path=normalized_path,
-                )
-                row_result = await asyncio.to_thread(_lookup_node, node_id)
-    return row_result
+    def _lookup_node() -> Optional[MemoryNode]:
+        # Do not select a canonical-ID row until the path has also been proven
+        # unique. A historical duplicate must remain quarantined from reads.
+        rows = db.execute(
+            "SELECT * FROM memory_nodes WHERE lower(COALESCE(node_type, 'file')) = ? "
+            "AND file_path = ? ORDER BY node_id",
+            (NodeType.FILE.value, normalized_path),
+        ).fetchall()
+        valid_rows = [
+            node
+            for row in rows
+            if (node := _valid_file_row(row)) is not None
+        ]
+        if len(valid_rows) != 1:
+            return None
+        return valid_rows[0]
+
+    return await asyncio.to_thread(_lookup_node)
 
 
 async def migrate_node_identity(
@@ -330,225 +235,25 @@ async def migrate_node_identity(
     emit_visual_event: Any = None,
     migrate_vector_identity_func: Any = None,
 ) -> bool:
-    """将节点身份从 old_node_id 迁移到 new_node_id，并保留关联与检索数据。
+    """Explicitly rekey one legacy file node through the SQLite authority.
 
-    Args:
-        db: SQLite 数据库连接
-        old_node_id: 旧节点 ID
-        new_node_id: 新节点 ID
-        new_file_path: 新文件路径
-        emit_visual_event: 可视化事件发射函数
-        migrate_vector_identity_func: 向量身份迁移函数
-
-    Returns:
-        是否迁移成功
+    This maintenance operation refuses implicit merges and never writes Chroma.
+    Vector convergence is represented by the SQLite outbox created by the
+    transactional rekey helper.
     """
+    del emit_visual_event, migrate_vector_identity_func
+    canonical_path, canonical_node_id = canonical_file_node_id(new_file_path)
+    if str(new_node_id or "") != canonical_node_id:
+        raise ValueError("new_node_id 与 canonical 文件路径不一致")
 
-    if old_node_id == new_node_id:
-        def _update_path() -> bool:
-            cursor = db.cursor()
-            cursor.execute(
-                "UPDATE memory_nodes SET file_path = ?, updated_at = ? WHERE node_id = ?",
-                (new_file_path, time.time(), old_node_id),
-            )
-            db.commit()
-            return cursor.rowcount > 0
+    from .indexing import rekey_document_rows_by_id
 
-        return await asyncio.to_thread(_update_path)
-
-    def _load_node(nid: str) -> Optional[sqlite3.Row]:
-        cursor = db.cursor()
-        cursor.execute("SELECT * FROM memory_nodes WHERE node_id = ?", (nid,))
-        return cursor.fetchone()
-
-    old_row = await asyncio.to_thread(_load_node, old_node_id)
-    if not old_row:
-        return False
-
-    new_row = await asyncio.to_thread(_load_node, new_node_id)
-    now = time.time()
-
-    if new_row:
-        merged_title = (new_row["title"] or "").strip() or (old_row["title"] or "")
-        merged_content_hash = new_row["content_hash"] or old_row["content_hash"]
-        merged_activation = max(
-            float(new_row["activation_strength"] or 0.0),
-            float(old_row["activation_strength"] or 0.0),
-        )
-        merged_access_count = int(new_row["access_count"] or 0) + int(old_row["access_count"] or 0)
-        new_last = new_row["last_accessed_at"]
-        old_last = old_row["last_accessed_at"]
-        merged_last_accessed = (
-            max(v for v in (new_last, old_last) if v is not None)
-            if (new_last is not None or old_last is not None)
-            else None
-        )
-        merged_emotional_valence = (
-            float(new_row["emotional_valence"] or 0.0) + float(old_row["emotional_valence"] or 0.0)
-        ) / 2.0
-        merged_emotional_arousal = max(
-            float(new_row["emotional_arousal"] or 0.0),
-            float(old_row["emotional_arousal"] or 0.0),
-        )
-        merged_importance = max(
-            float(new_row["importance"] or 0.0),
-            float(old_row["importance"] or 0.0),
-        )
-        merged_created_at = min(
-            float(new_row["created_at"] or now),
-            float(old_row["created_at"] or now),
-        )
-
-        def _update_merged() -> None:
-            cursor = db.cursor()
-            cursor.execute(
-                """
-                UPDATE memory_nodes
-                SET file_path = ?,
-                    content_hash = ?,
-                    title = ?,
-                    activation_strength = ?,
-                    access_count = ?,
-                    last_accessed_at = ?,
-                    emotional_valence = ?,
-                    emotional_arousal = ?,
-                    importance = ?,
-                    created_at = ?,
-                    updated_at = ?,
-                    embedding_synced = 0
-                WHERE node_id = ?
-                """,
-                (
-                    new_file_path,
-                    merged_content_hash,
-                    merged_title,
-                    merged_activation,
-                    merged_access_count,
-                    merged_last_accessed,
-                    merged_emotional_valence,
-                    merged_emotional_arousal,
-                    merged_importance,
-                    merged_created_at,
-                    now,
-                    new_node_id,
-                ),
-            )
-
-        await asyncio.to_thread(_update_merged)
-    else:
-        def _insert_merged() -> None:
-            cursor = db.cursor()
-            cursor.execute(
-                """
-                INSERT INTO memory_nodes
-                (node_id, node_type, file_path, content_hash, title,
-                 activation_strength, access_count, last_accessed_at,
-                 emotional_valence, emotional_arousal, importance,
-                 created_at, updated_at, embedding_synced)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    new_node_id,
-                    old_row["node_type"],
-                    new_file_path,
-                    old_row["content_hash"],
-                    old_row["title"],
-                    old_row["activation_strength"],
-                    old_row["access_count"],
-                    old_row["last_accessed_at"],
-                    old_row["emotional_valence"],
-                    old_row["emotional_arousal"],
-                    old_row["importance"],
-                    old_row["created_at"],
-                    now,
-                    0,
-                ),
-            )
-
-        await asyncio.to_thread(_insert_merged)
-
-    # Migrate edges and FTS data (sync DB, single transaction)
-    def _migrate_edges_and_fts() -> None:
-        cursor = db.cursor()
-        cursor.execute(
-            "SELECT * FROM memory_edges WHERE source_id = ? OR target_id = ?",
-            (old_node_id, old_node_id),
-        )
-        old_edges = cursor.fetchall()
-        for edge in old_edges:
-            mapped_source = new_node_id if edge["source_id"] == old_node_id else edge["source_id"]
-            mapped_target = new_node_id if edge["target_id"] == old_node_id else edge["target_id"]
-            if mapped_source == mapped_target:
-                continue
-
-            cursor.execute(
-                """
-                INSERT INTO memory_edges
-                (edge_id, source_id, target_id, edge_type, weight, base_strength,
-                 reinforcement, activation_count, last_activated_at, reason, created_at, bidirectional)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(source_id, target_id, edge_type) DO UPDATE SET
-                    weight = MAX(weight, excluded.weight),
-                    base_strength = MAX(base_strength, excluded.base_strength),
-                    reinforcement = reinforcement + excluded.reinforcement,
-                    activation_count = activation_count + excluded.activation_count,
-                    last_activated_at = CASE
-                        WHEN last_activated_at IS NULL THEN excluded.last_activated_at
-                        WHEN excluded.last_activated_at IS NULL THEN last_activated_at
-                        ELSE MAX(last_activated_at, excluded.last_activated_at)
-                    END,
-                    reason = CASE
-                        WHEN reason IS NULL OR reason = '' THEN excluded.reason
-                        ELSE reason
-                    END,
-                    bidirectional = MAX(bidirectional, excluded.bidirectional)
-                """,
-                (
-                    str(uuid.uuid4())[:8],
-                    mapped_source,
-                    mapped_target,
-                    edge["edge_type"],
-                    edge["weight"],
-                    edge["base_strength"],
-                    edge["reinforcement"],
-                    edge["activation_count"],
-                    edge["last_activated_at"],
-                    edge["reason"],
-                    edge["created_at"],
-                    edge["bidirectional"],
-                ),
-            )
-
-        cursor.execute(
-            "SELECT title, content FROM memory_fts WHERE node_id = ? LIMIT 1",
-            (old_node_id,),
-        )
-        old_fts_row = cursor.fetchone()
-        if old_fts_row:
-            cursor.execute("DELETE FROM memory_fts WHERE node_id = ?", (new_node_id,))
-            cursor.execute(
-                "INSERT INTO memory_fts (node_id, title, content) VALUES (?, ?, ?)",
-                (new_node_id, old_fts_row["title"], old_fts_row["content"]),
-            )
-
-        cursor.execute(
-            "DELETE FROM memory_edges WHERE source_id = ? OR target_id = ?",
-            (old_node_id, old_node_id),
-        )
-        cursor.execute("DELETE FROM memory_fts WHERE node_id = ?", (old_node_id,))
-        cursor.execute("DELETE FROM memory_nodes WHERE node_id = ?", (old_node_id,))
-        db.commit()
-
-    await asyncio.to_thread(_migrate_edges_and_fts)
-
-    if migrate_vector_identity_func:
-        await migrate_vector_identity_func(
-            old_node_id=old_node_id,
-            new_node_id=new_node_id,
-            new_file_path=new_file_path,
-        )
-
-    return True
+    return await asyncio.to_thread(
+        rekey_document_rows_by_id,
+        db,
+        str(old_node_id or "").strip(),
+        canonical_path,
+    )
 
 
 async def migrate_file_path(
@@ -557,58 +262,49 @@ async def migrate_file_path(
     new_path: str,
     migrate_node_identity_func: Any = None,
 ) -> bool:
-    """迁移文件路径对应的记忆身份，避免移动文件后节点断裂。
-
-    Args:
-        db: SQLite 数据库连接
-        old_path: 旧路径
-        new_path: 新路径
-        migrate_node_identity_func: 节点身份迁移函数
-
-    Returns:
-        是否迁移成功
-    """
-    old_norm = normalize_file_path(old_path)
-    target_eligibility = assess_document_path(new_path)
-    if not old_norm or not target_eligibility.eligible:
-        return False
-    new_norm = target_eligibility.path
+    """Explicitly move a canonical file identity without widening paths."""
+    old_norm, old_node_id = canonical_file_node_id(old_path)
+    new_norm, new_node_id = canonical_file_node_id(new_path)
     if old_norm == new_norm:
         return True
-
-    old_node_id = generate_file_node_id(old_norm)
-    new_node_id = generate_file_node_id(new_norm)
-    if migrate_node_identity_func:
-        migrated = await migrate_node_identity_func(
-            old_node_id=old_node_id,
-            new_node_id=new_node_id,
-            new_file_path=new_norm,
-        )
-        if migrated:
-            logger.info(f"已迁移记忆路径: {old_norm} -> {new_norm}")
-        return migrated
-    return False
+    if migrate_node_identity_func is None:
+        return False
+    migrated = await migrate_node_identity_func(
+        old_node_id=old_node_id,
+        new_node_id=new_node_id,
+        new_file_path=new_norm,
+    )
+    if migrated:
+        logger.info(f"已迁移记忆路径: {old_norm} -> {new_norm}")
+    return migrated
 
 
 async def update_fts(db: sqlite3.Connection, node_id: str, title: str, content: str) -> None:
-    """更新全文搜索索引。
+    """Compatibility wrapper that performs a complete transactional reindex.
 
-    Args:
-        db: SQLite 数据库连接
-        node_id: 节点 ID
-        title: 标题
-        content: 内容
+    Updating only legacy FTS would diverge from chunks and the embedding outbox,
+    so callers are resolved back to a strict canonical document identity first.
     """
-    def _do_db_work() -> None:
-        cursor = db.cursor()
-        cursor.execute("DELETE FROM memory_fts WHERE node_id = ?", (node_id,))
-        cursor.execute(
-            "INSERT INTO memory_fts (node_id, title, content) VALUES (?, ?, ?)",
-            (node_id, title, content),
-        )
-        db.commit()
+    identifier = str(node_id or "").strip()
 
-    await asyncio.to_thread(_do_db_work)
+    def _path_for_node() -> str | None:
+        row = db.execute(
+            "SELECT node_id, node_type, file_path FROM memory_nodes WHERE node_id = ?",
+            (identifier,),
+        ).fetchone()
+        if row is None or str(row["node_type"] or "file").lower() != NodeType.FILE.value:
+            return None
+        stored = assess_indexed_document_path(row["file_path"])
+        if not stored.eligible or str(row["node_id"] or "") != generate_file_node_id(stored.path):
+            return None
+        return stored.path
+
+    file_path = await asyncio.to_thread(_path_for_node)
+    if file_path is None:
+        return
+    from .indexing import upsert_document_rows
+
+    await asyncio.to_thread(upsert_document_rows, db, file_path, str(content or ""), title)
 
 
 async def increment_access(

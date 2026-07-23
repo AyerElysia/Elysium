@@ -21,7 +21,11 @@ if TYPE_CHECKING:
     from .scenes import DreamTrace
     from .seeds import DreamSeed
 
-from ..memory.eligibility import assess_workspace_document
+from ..memory.eligibility import (
+    assess_indexed_document_path,
+    assess_workspace_document,
+    read_workspace_document,
+)
 
 logger = logging.getLogger("life_engine.dream")
 
@@ -351,17 +355,17 @@ async def archive_dream(
     _DREAM_ARCHIVE_DIR = "dreams"
 
     started = datetime.fromtimestamp(report.started_at or time.time(), tz=timezone.utc).astimezone()
-    archive_dir = workspace / _DREAM_ARCHIVE_DIR / started.strftime("%Y-%m-%d")
-    archive_dir.mkdir(parents=True, exist_ok=True)
-    file_name = f"{started.strftime('%H%M')}_{report.dream_id}.md"
-    archive_path = archive_dir / file_name
-
-    all_refs = _unique_preserve(
-        ref
-        for seed in report.seed_report
-        for ref in (list(seed.core_refs) + list(seed.supporting_refs))
-        if str(ref or "").strip()
+    archive_relative_path = (
+        f"{_DREAM_ARCHIVE_DIR}/{started.strftime('%Y-%m-%d')}/"
+        f"{started.strftime('%H%M')}_{report.dream_id}.md"
     )
+    archive_eligibility = assess_indexed_document_path(archive_relative_path)
+    if not archive_eligibility.eligible:
+        raise ValueError(f"梦札路径不合法: {archive_eligibility.reason}")
+    archive_path = workspace / archive_eligibility.path
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+
+    all_refs = _iter_seed_file_refs(report.seed_report, workspace)
     motifs = dream_trace.motifs[:8]
     tags = report.dream_residue.tags[:8] if report.dream_residue else []
 
@@ -447,7 +451,7 @@ async def archive_dream(
         "\n".join(frontmatter_lines + [""] + body_lines).strip() + "\n",
         encoding="utf-8",
     )
-    return archive_path.relative_to(workspace).as_posix()
+    return archive_eligibility.path
 
 
 async def _index_memory_document(
@@ -458,31 +462,28 @@ async def _index_memory_document(
     title: str,
     source_mtime: float,
 ) -> Any:
-    """Write a document through the current index API, with legacy fallback."""
+    """Write one canonical document through the SQLite/FTS/outbox API."""
+    eligibility = assess_indexed_document_path(path)
+    if not eligibility.eligible:
+        return None
     upsert_document = getattr(memory_service, "upsert_document", None)
-    if callable(upsert_document):
-        result = upsert_document(
-            path,
-            content,
-            title=title,
-            source_mtime=source_mtime,
-        )
-        if inspect.isawaitable(result):
-            result = await result
-        node_id = getattr(result, "node_id", None)
-        if node_id:
-            return result
-        if isinstance(result, dict) and result.get("node_id"):
-            return SimpleNamespace(node_id=str(result["node_id"]))
+    if not callable(upsert_document):
         return None
 
-    get_or_create_file_node = getattr(memory_service, "get_or_create_file_node", None)
-    if not callable(get_or_create_file_node):
-        return None
-    result = get_or_create_file_node(path, title=title, content=content)
+    result = upsert_document(
+        eligibility.path,
+        content,
+        title=title,
+        source_mtime=source_mtime,
+    )
     if inspect.isawaitable(result):
         result = await result
-    return result if getattr(result, "node_id", None) else None
+    node_id = getattr(result, "node_id", None)
+    if node_id:
+        return result
+    if isinstance(result, dict) and result.get("node_id"):
+        return SimpleNamespace(node_id=str(result["node_id"]))
+    return None
 
 
 async def integrate_archive_into_memory(
@@ -497,15 +498,13 @@ async def integrate_archive_into_memory(
 
     from ..memory.edges import EdgeType
 
-    archive_eligibility = assess_workspace_document(workspace, report.archive_path)
+    archive_eligibility = assess_indexed_document_path(report.archive_path)
     if not archive_eligibility.eligible:
         return {"archive_written": False, "linked_refs": 0}
     archive_path = archive_eligibility.path
-    abs_archive_path = workspace / archive_path
     try:
-        dream_content = abs_archive_path.read_text(encoding="utf-8", errors="replace")
-        archive_mtime = abs_archive_path.stat().st_mtime
-    except OSError:
+        dream_content, archive_mtime, _ = read_workspace_document(workspace, archive_path)
+    except (OSError, ValueError):
         return {"archive_written": False, "linked_refs": 0}
 
     dream_node = await _index_memory_document(
@@ -521,21 +520,15 @@ async def integrate_archive_into_memory(
     linked_refs = 0
     linked_paths: list[str] = []
     for ref in _iter_seed_file_refs(seed_report, workspace):
-        ref_eligibility = assess_workspace_document(workspace, ref)
-        if not ref_eligibility.eligible:
-            continue
-        ref = ref_eligibility.path
-        ref_path = workspace / ref
         try:
-            ref_content = ref_path.read_text(encoding="utf-8", errors="replace")
-            ref_mtime = ref_path.stat().st_mtime
-        except OSError:
+            ref_content, ref_mtime, _ = read_workspace_document(workspace, ref)
+        except (OSError, ValueError):
             continue
         ref_node = await _index_memory_document(
             memory_service,
             ref,
             ref_content,
-            title=ref_path.stem,
+            title=Path(ref).stem,
             source_mtime=ref_mtime,
         )
         if ref_node is None:
@@ -561,31 +554,22 @@ async def integrate_archive_into_memory(
 
 
 def _iter_seed_file_refs(seeds: list["DreamSeed"], workspace: Path) -> list[str]:
-    """返回可映射到文件系统的 refs。"""
+    """返回存在且可安全读取的 canonical seed 文件引用。"""
     refs: list[str] = []
     for seed in seeds:
         for ref in list(seed.core_refs) + list(seed.supporting_refs):
-            raw = str(ref or "").strip()
-            if not raw:
+            path_part = str(ref or "").split("#", 1)[0]
+            eligibility = assess_indexed_document_path(path_part)
+            if not eligibility.eligible:
                 continue
-            path_part = raw.split("#", 1)[0].strip()
-            normalized = _normalize_ref(path_part, workspace)
-            if normalized:
-                refs.append(normalized)
+            if not assess_workspace_document(workspace, eligibility.path).eligible:
+                continue
+            refs.append(eligibility.path)
     return _unique_preserve(refs)
 
 
 def _normalize_ref(value: str, workspace: Path | None = None) -> str:
-    """把 ref 规整为 workspace 相对路径。"""
-    raw = str(value or "").strip().replace("\\", "/")
-    if not raw:
-        return ""
-    if workspace is None:
-        return raw.lstrip("/")
-    path = Path(raw)
-    try:
-        if path.is_absolute():
-            return path.resolve().relative_to(workspace).as_posix()
-    except Exception:  # noqa: BLE001
-        pass
-    return raw.lstrip("/")
+    """返回 canonical 文档引用，不宽松转换路径拼写。"""
+    del workspace
+    eligibility = assess_indexed_document_path(value)
+    return eligibility.path if eligibility.eligible else ""

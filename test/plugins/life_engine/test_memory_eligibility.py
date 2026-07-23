@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -11,10 +13,13 @@ import pytest
 
 from plugins.life_engine.memory.eligibility import (
     assess_document_path,
+    assess_indexed_document_path,
     assess_workspace_document,
+    register_indexed_path_sql_function,
     scan_workspace_documents,
 )
 from plugins.life_engine.memory.indexing import create_memory_schema, upsert_document_rows
+from plugins.life_engine.memory.search import _node_filter_sql
 
 
 @pytest.mark.parametrize(
@@ -184,3 +189,479 @@ async def test_dream_archive_skips_ineligible_runtime_path(tmp_path: Path) -> No
 
     assert result == {"archive_written": False, "linked_refs": 0}
     upsert_document.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("path", "reason"),
+    [
+        ("./notes/entry.md", "noncanonical_path"),
+        ("notes//entry.md", "noncanonical_path"),
+        ("notes\\entry.md", "noncanonical_path"),
+    ],
+)
+def test_stored_document_paths_must_already_be_canonical(path: str, reason: str) -> None:
+    decision = assess_indexed_document_path(path)
+
+    assert decision.eligible is False
+    assert decision.reason == reason
+
+
+@pytest.mark.asyncio
+async def test_file_tool_syncs_only_canonical_safe_workspace_document(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from plugins.life_engine.core.config import LifeEngineConfig
+    from plugins.life_engine.tools.file_tools import _sync_memory_embedding_for_file
+
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    (notes / "entry.md").write_text("authoritative content", encoding="utf-8")
+    # On POSIX this is a distinct literal filename; it must not index notes/entry.md.
+    (tmp_path / "notes\\entry.md").write_text("wrong physical file", encoding="utf-8")
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(tmp_path)
+    upsert_document = AsyncMock()
+    fake_service = SimpleNamespace(
+        _memory_service=SimpleNamespace(upsert_document=upsert_document),
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.service.LifeEngineService.get_instance",
+        lambda: fake_service,
+    )
+
+    await _sync_memory_embedding_for_file(
+        SimpleNamespace(config=config),
+        "notes\\entry.md",
+        "wrong physical file",
+    )
+    upsert_document.assert_not_awaited()
+
+    await _sync_memory_embedding_for_file(
+        SimpleNamespace(config=config),
+        "notes/entry.md",
+        "ignored caller content",
+    )
+
+    upsert_document.assert_awaited_once()
+    args = upsert_document.await_args
+    assert args.args[:2] == ("notes/entry.md", "authoritative content")
+    assert args.kwargs["title"] == "entry"
+    assert isinstance(args.kwargs["source_mtime"], float)
+
+
+@pytest.mark.asyncio
+async def test_fetch_memory_rejects_noncanonical_paths_without_creating_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from plugins.life_engine.core.config import LifeEngineConfig
+    from plugins.life_engine.tools.file_tools import FetchLifeMemoryTool
+
+    workspace = tmp_path / "missing-workspace"
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(workspace)
+    monkeypatch.setattr(
+        "plugins.life_engine.tools.file_tools._get_life_engine_service",
+        lambda _plugin: None,
+    )
+
+    ok, payload = await FetchLifeMemoryTool(
+        plugin=SimpleNamespace(config=config),
+    ).execute(["./notes/entry.md"])
+
+    assert ok is True
+    assert payload["successful"] == 0
+    assert payload["files"] == [
+        {
+            "path": "./notes/entry.md",
+            "error": "不是可读取的记忆文档: noncanonical_path",
+        }
+    ]
+    assert workspace.exists() is False
+
+
+@pytest.mark.asyncio
+async def test_fetch_memory_rejects_noncanonical_lineage_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from plugins.life_engine.core.config import LifeEngineConfig
+    from plugins.life_engine.tools.file_tools import FetchLifeMemoryTool
+
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    (notes / "current.md").write_text("current", encoding="utf-8")
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(tmp_path)
+
+    async def _resolve(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {"resolved": True, "resolved_path": "./notes/current.md"}
+
+    memory_service = SimpleNamespace(resolve_canonical_path=_resolve)
+    monkeypatch.setattr(
+        "plugins.life_engine.tools.file_tools._get_life_engine_service",
+        lambda _plugin: SimpleNamespace(_memory_service=memory_service),
+    )
+
+    ok, payload = await FetchLifeMemoryTool(
+        plugin=SimpleNamespace(config=config),
+    ).execute(["notes/entry.md"])
+
+    assert ok is True
+    assert payload["successful"] == 0
+    assert payload["files"] == [
+        {
+            "path": "notes/entry.md",
+            "error": "不是可读取的记忆文档: noncanonical_path",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dream_archive_indexes_only_canonical_safe_seed_refs(tmp_path: Path) -> None:
+    from plugins.life_engine.dream.residue import DreamReport, integrate_archive_into_memory
+    from plugins.life_engine.dream.seeds import DreamSeed
+
+    dreams = tmp_path / "dreams" / "2026-07-20"
+    dreams.mkdir(parents=True)
+    archive_path = dreams / "0100_dream.md"
+    archive_path.write_text("dream", encoding="utf-8")
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    (notes / "kept.md").write_text("kept", encoding="utf-8")
+    outside = tmp_path / "outside.md"
+    outside.write_text("private", encoding="utf-8")
+
+    upsert_document = AsyncMock(
+        side_effect=[
+            SimpleNamespace(node_id="file:dream"),
+            SimpleNamespace(node_id="file:kept"),
+        ]
+    )
+    create_or_update_edge = AsyncMock()
+    memory_service = SimpleNamespace(
+        upsert_document=upsert_document,
+        create_or_update_edge=create_or_update_edge,
+    )
+    seed = DreamSeed(
+        seed_id="seed",
+        seed_type="day_residue",
+        title="seed",
+        summary="seed",
+        core_refs=[
+            "notes/kept.md#section",
+            "./notes/kept.md",
+            "notes\\kept.md",
+            "../outside.md",
+            str(outside),
+        ],
+        supporting_refs=["notes/kept.md"],
+    )
+
+    result = await integrate_archive_into_memory(
+        DreamReport(archive_path="dreams/2026-07-20/0100_dream.md"),
+        tmp_path,
+        memory_service,
+        [seed],
+    )
+
+    assert result["archive_written"] is True
+    assert result["linked_refs"] == 1
+    assert result["linked_paths"] == ["notes/kept.md"]
+    assert [call.args[0] for call in upsert_document.await_args_list] == [
+        "dreams/2026-07-20/0100_dream.md",
+        "notes/kept.md",
+    ]
+    create_or_update_edge.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dream_archive_writes_sqlite_fts_and_outbox_without_collection_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from plugins.life_engine.dream.residue import DreamReport, integrate_archive_into_memory
+    from plugins.life_engine.memory.service import LifeMemoryService
+
+    archive = tmp_path / "dreams" / "2026-07-20"
+    archive.mkdir(parents=True)
+    (archive / "0100_dream.md").write_text("dream content", encoding="utf-8")
+    service = LifeMemoryService(tmp_path)
+    get_collection = AsyncMock(return_value=SimpleNamespace())
+    monkeypatch.setattr(service, "_get_chroma_collection", get_collection)
+    await service.initialize()
+    legacy_collection = service._chroma_collection
+    chunk_collection = service._chunk_collection
+    try:
+        result = await integrate_archive_into_memory(
+            DreamReport(archive_path="dreams/2026-07-20/0100_dream.md"),
+            tmp_path,
+            service,
+            [],
+        )
+
+        assert result["archive_written"] is True
+        assert result["linked_refs"] == 0
+        jobs = await service.list_index_jobs()
+        assert len(jobs) == 1
+        assert jobs[0].node_id == result["archive_node_id"]
+        assert jobs[0].status == "pending"
+        assert service._chroma_collection is legacy_collection
+        assert service._chunk_collection is chunk_collection
+        get_collection.assert_awaited_once()
+    finally:
+        await service.close()
+
+
+class _CountingConnection(sqlite3.Connection):
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.create_function_calls = 0
+
+    def create_function(self, *args: object, **kwargs: object) -> None:
+        self.create_function_calls += 1
+        super().create_function(*args, **kwargs)
+
+
+def test_indexed_path_udf_is_installed_once_under_concurrent_reads(tmp_path: Path) -> None:
+    db = sqlite3.connect(
+        str(tmp_path / "udf.db"),
+        factory=_CountingConnection,
+        check_same_thread=False,
+    )
+    db.row_factory = sqlite3.Row
+    create_memory_schema(db)
+    assert db.create_function_calls == 1
+
+    errors: list[BaseException] = []
+
+    def read_filter() -> None:
+        try:
+            register_indexed_path_sql_function(db)
+            _node_filter_sql(db, alias="n", event_date=None, file_types=None)
+        except BaseException as exc:  # pragma: no cover - assertion aid for threads
+            errors.append(exc)
+
+    threads = [threading.Thread(target=read_filter) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2.0)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert db.create_function_calls == 1
+
+
+class _LegacyCountingConnection(_CountingConnection):
+    """Connection double that emulates SQLite without pragma_function_list."""
+
+    def execute(self, sql: str, parameters: object = ()) -> sqlite3.Cursor:
+        if "pragma_function_list" in sql.lower():
+            raise sqlite3.OperationalError("no such table: pragma_function_list")
+        return super().execute(sql, parameters)
+
+
+def test_indexed_path_udf_old_sqlite_fallback_installs_once_concurrently(
+    tmp_path: Path,
+) -> None:
+    db = sqlite3.connect(
+        str(tmp_path / "legacy-udf.db"),
+        factory=_LegacyCountingConnection,
+        check_same_thread=False,
+    )
+    errors: list[BaseException] = []
+
+    def register() -> None:
+        try:
+            register_indexed_path_sql_function(db)
+        except BaseException as exc:  # pragma: no cover - assertion aid for threads
+            errors.append(exc)
+
+    threads = [threading.Thread(target=register) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2.0)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert db.create_function_calls == 1
+    assert db.execute("SELECT life_memory_indexed_path_ok(?)", ("notes/valid.md",)).fetchone() == (
+        1,
+    )
+
+
+def test_search_and_decay_udf_callsites_do_not_deadlock_under_concurrency(
+    tmp_path: Path,
+) -> None:
+    """Regression for real search.py/decay.py call sites, not the UDF in isolation.
+
+    Before ``eligibility.register_indexed_path_sql_function`` gained its own
+    ``_SQL_FUNCTION_LOCK`` and per-connection probe, two threads racing to
+    (re)install the UDF on the same ``check_same_thread=False`` connection
+    could hit ``sqlite3.OperationalError: Error creating function`` or contend
+    indefinitely. This drives every synchronous call site in ``search.py`` and
+    ``decay.py`` that calls ``register_indexed_path_sql_function`` unconditionally
+    on each invocation through a bounded ``ThreadPoolExecutor``.
+    ``as_completed(..., timeout=...)`` makes a real deadlock regression fail the
+    test instead of hanging the suite forever.
+
+    Only the synchronous DB worker paths are driven here: the async wrappers in
+    ``decay.py`` (``list_dream_candidate_nodes``, etc.) ultimately delegate to
+    these same sync closures via ``asyncio.to_thread``, so covering the sync
+    path is sufficient and avoids nested thread-pool contention.
+
+    Each worker receives its own dedicated ``sqlite3.Connection`` to the same
+    on-disk file so that CPython's per-connection sqlite3 internal lock cannot
+    serialize or deadlock concurrent operations.
+    """
+    from plugins.life_engine.memory.search import (
+        _current_chunk_map,
+        _node_filter_sql,
+        _read_traversable_node_ids,
+    )
+    from plugins.life_engine.memory.eligibility import (
+        eligible_document_path_sql,
+        register_indexed_path_sql_function,
+    )
+    from plugins.life_engine.memory.nodes import NodeType
+
+    db_path = str(tmp_path / "udf-callsites.db")
+    # Create schema once on a setup connection to a named file.
+    setup_db = sqlite3.connect(db_path, check_same_thread=False)
+    setup_db.row_factory = sqlite3.Row
+    setup_db.execute(
+        """
+        CREATE TABLE memory_edges (
+            edge_id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            edge_type TEXT NOT NULL,
+            weight REAL DEFAULT 0.5,
+            base_strength REAL DEFAULT 0.5,
+            reinforcement REAL DEFAULT 0.0,
+            activation_count INTEGER DEFAULT 0,
+            last_activated_at REAL,
+            reason TEXT,
+            created_at REAL NOT NULL,
+            bidirectional INTEGER DEFAULT 1,
+            UNIQUE(source_id, target_id, edge_type)
+        )
+        """
+    )
+    create_memory_schema(setup_db, now=1.0)
+    upsert_document_rows(setup_db, "notes/one.md", "alpha beta gamma " * 5, now=2.0)
+    upsert_document_rows(setup_db, "notes/two.md", "delta epsilon zeta " * 5, now=3.0)
+
+    chunk_row = setup_db.execute("SELECT chunk_id FROM memory_chunks LIMIT 1").fetchone()
+    assert chunk_row is not None
+    chunk_id = str(chunk_row["chunk_id"])
+    node_row = setup_db.execute("SELECT node_id FROM memory_nodes LIMIT 1").fetchone()
+    assert node_row is not None
+    node_id = str(node_row["node_id"])
+    setup_db.close()
+
+    # --- Sync worker functions matching real call sites in search.py/decay.py ---
+    # Each accepts its own dedicated connection; the caller closes it when done.
+
+    def _search_node_filter(conn: sqlite3.Connection) -> None:
+        # Mirrors search.py:_node_filter_sql (line ~795)
+        for _ in range(20):
+            register_indexed_path_sql_function(conn)
+            _node_filter_sql(conn, alias="n", event_date=None, file_types=None)
+
+    def _search_traversable_ids(conn: sqlite3.Connection) -> None:
+        # Mirrors search.py:_read_traversable_node_ids (line ~1329)
+        for _ in range(20):
+            _read_traversable_node_ids(conn)
+
+    def _search_chunk_map(conn: sqlite3.Connection) -> None:
+        # Mirrors search.py:_current_chunk_map (line ~391)
+        for _ in range(20):
+            _current_chunk_map(conn, [chunk_id])
+
+    def _search_filter_scores(conn: sqlite3.Connection) -> None:
+        # Mirrors the _do_db_work closure in search.py:filter_existing_scores (~1496)
+        for _ in range(20):
+            register_indexed_path_sql_function(conn)
+            eligibility_sql, eligibility_params = eligible_document_path_sql("file_path")
+            conn.execute(
+                f"SELECT node_id FROM memory_nodes WHERE node_id = ? AND {eligibility_sql}",
+                [node_id, *eligibility_params],
+            ).fetchall()
+
+    def _decay_dream_candidates(conn: sqlite3.Connection) -> None:
+        # Mirrors the _do_db_work closure in decay.py:list_dream_candidate_nodes (~458)
+        for _ in range(20):
+            register_indexed_path_sql_function(conn)
+            eligibility_sql, eligibility_params = eligible_document_path_sql("file_path")
+            conn.execute(
+                "SELECT node_id FROM memory_nodes WHERE node_type = ? "
+                f"AND file_path IS NOT NULL AND {eligibility_sql} LIMIT 5",
+                [NodeType.FILE.value, *eligibility_params],
+            ).fetchall()
+
+    def _decay_random_nodes(conn: sqlite3.Connection) -> None:
+        # Mirrors the _do_db_work closure in decay.py:list_random_file_nodes (~520)
+        for _ in range(20):
+            register_indexed_path_sql_function(conn)
+            eligibility_sql, eligibility_params = eligible_document_path_sql("file_path")
+            conn.execute(
+                "SELECT node_id FROM memory_nodes WHERE node_type = ? "
+                f"AND file_path IS NOT NULL AND {eligibility_sql} ORDER BY RANDOM() LIMIT 5",
+                [NodeType.FILE.value, *eligibility_params],
+            ).fetchall()
+
+    def _decay_dream_walk_load(conn: sqlite3.Connection) -> None:
+        # Mirrors the _load_nodes closure in decay.py:dream_walk (~299)
+        for _ in range(20):
+            register_indexed_path_sql_function(conn)
+            eligibility_sql, eligibility_params = eligible_document_path_sql("file_path")
+            conn.execute(
+                "SELECT node_id, activation_strength FROM memory_nodes "
+                "WHERE node_type = ? AND file_path IS NOT NULL "
+                f"AND {eligibility_sql} ORDER BY activation_strength DESC",
+                [NodeType.FILE.value, *eligibility_params],
+            ).fetchall()
+
+    worker_fns = [
+        _search_node_filter,
+        _search_traversable_ids,
+        _search_chunk_map,
+        _search_filter_scores,
+        _decay_dream_candidates,
+        _decay_random_nodes,
+        _decay_dream_walk_load,
+    ] * 3  # 7 worker functions × 3 = 21
+
+    # Pre-create one dedicated connection per worker BEFORE the pool starts.
+    worker_connections = [
+        sqlite3.connect(db_path, check_same_thread=False)
+        for _ in range(len(worker_fns))
+    ]
+    for conn in worker_connections:
+        conn.row_factory = sqlite3.Row
+
+    def _run_worker(fn, conn: sqlite3.Connection) -> None:
+        try:
+            fn(conn)
+        finally:
+            conn.close()
+
+    worker_pairs = list(zip(worker_fns, worker_connections))
+
+    with ThreadPoolExecutor(max_workers=len(worker_pairs)) as pool:
+        futures = {pool.submit(_run_worker, fn, conn): fn for fn, conn in worker_pairs}
+        pending = set(futures)
+        try:
+            for future in as_completed(futures, timeout=10.0):
+                pending.discard(future)
+                future.result()
+        except TimeoutError:  # pragma: no cover - indicates a real deadlock regression
+            names = sorted({futures[f].__name__ for f in pending})
+            pytest.fail(
+                f"register_indexed_path_sql_function call sites deadlocked: "
+                f"{len(pending)} worker(s) still pending after 10s ({names})"
+            )

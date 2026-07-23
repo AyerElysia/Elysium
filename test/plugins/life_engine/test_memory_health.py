@@ -14,7 +14,11 @@ from plugins.life_engine.memory.health import (
     collect_health_snapshot,
     health_snapshot,
 )
-from plugins.life_engine.memory.indexing import create_memory_schema, upsert_document_rows
+from plugins.life_engine.memory.indexing import (
+    create_memory_schema,
+    delete_document_rows_by_id,
+    upsert_document_rows,
+)
 from plugins.life_engine.memory.nodes import compute_content_hash, generate_file_node_id
 from scripts.reconcile_life_memory import MemoryDatabaseInUseError
 from scripts.reconcile_life_memory import main as reconcile_main
@@ -305,6 +309,101 @@ async def test_health_compares_chunk_collection_with_chunk_ids(tmp_path: Path) -
     json.dumps(snapshot)
 
 
+@pytest.mark.asyncio
+async def test_health_requires_exact_stored_identity_for_coverage_and_vectors(
+    tmp_path: Path,
+) -> None:
+    db = _db(tmp_path)
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    (notes / "valid.md").write_text("valid", encoding="utf-8")
+    (notes / "noncanonical.md").write_text("noncanonical", encoding="utf-8")
+    (notes / "wrong-id.md").write_text("wrong id", encoding="utf-8")
+    (notes / "deleted.md").write_text("deleted", encoding="utf-8")
+    (notes / "concept.md").write_text("concept", encoding="utf-8")
+
+    valid = upsert_document_rows(db, "notes/valid.md", "valid", now=1.0)
+    noncanonical = upsert_document_rows(db, "notes/noncanonical.md", "noncanonical", now=2.0)
+    wrong_id = upsert_document_rows(db, "notes/wrong-id.md", "wrong id", now=3.0)
+    deleted = upsert_document_rows(db, "notes/deleted.md", "deleted", now=4.0)
+    concept = upsert_document_rows(db, "notes/concept.md", "concept", now=5.0)
+    db.execute(
+        "UPDATE memory_nodes SET embedding_synced = 1 WHERE node_id IN (?, ?, ?, ?, ?)",
+        (valid.node_id, noncanonical.node_id, wrong_id.node_id, deleted.node_id, concept.node_id),
+    )
+    db.execute(
+        "UPDATE memory_nodes SET file_path = ? WHERE node_id = ?",
+        ("./notes/noncanonical.md", noncanonical.node_id),
+    )
+    db.execute(
+        "UPDATE memory_nodes SET is_deleted = 1 WHERE node_id = ?",
+        (deleted.node_id,),
+    )
+    db.execute(
+        "UPDATE memory_nodes SET node_type = 'concept' WHERE node_id = ?",
+        (concept.node_id,),
+    )
+    db.commit()
+    db.execute("PRAGMA foreign_keys = OFF")
+    db.execute(
+        "UPDATE memory_nodes SET node_id = ? WHERE node_id = ?",
+        ("file:wrong-id", wrong_id.node_id),
+    )
+    db.execute(
+        "UPDATE memory_chunks SET node_id = ? WHERE node_id = ?",
+        ("file:wrong-id", wrong_id.node_id),
+    )
+    db.execute(
+        "UPDATE memory_chunks_fts SET node_id = ? WHERE node_id = ?",
+        ("file:wrong-id", wrong_id.node_id),
+    )
+    db.execute(
+        "UPDATE memory_index_jobs SET node_id = ? WHERE node_id = ?",
+        ("file:wrong-id", wrong_id.node_id),
+    )
+    db.commit()
+    db.execute("PRAGMA foreign_keys = ON")
+
+    collection = _FakeCollection(
+        [
+            valid.chunks[0].chunk_id,
+            noncanonical.chunks[0].chunk_id,
+            wrong_id.chunks[0].chunk_id,
+            deleted.chunks[0].chunk_id,
+            concept.chunks[0].chunk_id,
+        ],
+        chunk=True,
+    )
+    snapshot = await health_snapshot(db, tmp_path, collection)
+
+    assert snapshot["index"]["coverage"] == pytest.approx(0.2)
+    assert snapshot["index"]["unindexed_path_count"] == 4
+    assert snapshot["index"]["unindexed_paths"] == [
+        "notes/concept.md",
+        "notes/deleted.md",
+        "notes/noncanonical.md",
+        "notes/wrong-id.md",
+    ]
+    assert snapshot["index"]["ineligible_indexed_node_count"] == 2
+    assert snapshot["index"]["ineligible_indexed_node_paths"] == [
+        "./notes/noncanonical.md",
+        "notes/wrong-id.md",
+    ]
+    assert snapshot["index"]["ineligible_indexed_reason_counts"] == {
+        "node_id_mismatch": 1,
+        "noncanonical_path": 1,
+    }
+    assert snapshot["vector"]["orphan_chunk_count"] == 4
+    assert snapshot["vector"]["orphan_chunk_ids"] == sorted(
+        [
+            noncanonical.chunks[0].chunk_id,
+            wrong_id.chunks[0].chunk_id,
+            deleted.chunks[0].chunk_id,
+            concept.chunks[0].chunk_id,
+        ]
+    )
+
+
 def test_health_and_reconcile_exclude_runtime_and_hidden_trace_files(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     notes = workspace / "notes"
@@ -377,6 +476,7 @@ def test_reconcile_dry_run_and_apply_are_sqlite_only(tmp_path: Path) -> None:
         db.execute("SELECT content_hash FROM memory_nodes WHERE file_path = 'notes/note.md'").fetchone()[0]
         == compute_content_hash("first")
     )
+    assert db.execute("SELECT status FROM memory_index_jobs").fetchone()[0] == "pending"
     db.close()
 
     (notes / "note.md").write_text("second", encoding="utf-8")
@@ -530,6 +630,94 @@ def test_reconcile_prunes_only_ineligible_indexed_nodes_and_dry_run_writes_nothi
     assert "notes/missing.md" in remaining_paths
     assert "runtime/state.json" not in remaining_paths
     assert ".life_trace/trace.txt" not in remaining_paths
+    db.close()
+
+
+def test_reconcile_rejects_and_prunes_noncanonical_stored_paths(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    notes = workspace / "notes"
+    notes.mkdir(parents=True)
+    (notes / "note.md").write_text("canonical body", encoding="utf-8")
+
+    memory_dir = workspace / ".memory"
+    memory_dir.mkdir()
+    db_path = memory_dir / "memory.db"
+    db = sqlite3.connect(str(db_path))
+    db.row_factory = sqlite3.Row
+    create_memory_schema(db)
+    _insert_active_file_node(db, "./notes/note.md")
+    db.commit()
+    db.close()
+
+    dry_run = reconcile(workspace)
+    assert dry_run["new_paths"] == ["notes/note.md"]
+    assert dry_run["unchanged_count"] == 0
+    assert dry_run["ineligible_indexed_node_paths"] == ["./notes/note.md"]
+    assert dry_run["ineligible_indexed_reason_counts"] == {"noncanonical_path": 1}
+
+    db = sqlite3.connect(str(db_path))
+    assert db.execute("SELECT file_path FROM memory_nodes").fetchone()[0] == "./notes/note.md"
+    db.close()
+
+    applied = reconcile(workspace, apply=True, prune_ineligible=True)
+    assert applied["prune_ineligible_paths"] == ["./notes/note.md"]
+    assert applied["applied_paths"] == ["notes/note.md"]
+
+    db = sqlite3.connect(str(db_path))
+    assert db.execute("SELECT file_path FROM memory_nodes").fetchone()[0] == "notes/note.md"
+    assert db.execute("SELECT status FROM memory_index_jobs").fetchone()[0] == "pending"
+    db.close()
+
+
+def test_reconcile_apply_rolls_back_pruning_and_prior_upserts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    notes = workspace / "notes"
+    notes.mkdir(parents=True)
+    (notes / "first.md").write_text("first", encoding="utf-8")
+    (notes / "second.md").write_text("second", encoding="utf-8")
+
+    memory_dir = workspace / ".memory"
+    memory_dir.mkdir()
+    db_path = memory_dir / "memory.db"
+    db = sqlite3.connect(str(db_path))
+    db.row_factory = sqlite3.Row
+    create_memory_schema(db)
+    _insert_active_file_node(db, "runtime/state.json")
+    db.commit()
+    db.close()
+
+    calls: list[str] = []
+
+    def fail_after_first_upsert(
+        db: sqlite3.Connection,
+        file_path: str,
+        content: str,
+        title: str = "",
+        source_mtime: float | None = None,
+    ) -> Any:
+        calls.append(file_path)
+        if file_path == "notes/second.md":
+            raise RuntimeError("injected reconciliation failure")
+        return upsert_document_rows(db, file_path, content, title, source_mtime)
+
+    monkeypatch.setattr(
+        "scripts.reconcile_life_memory._load_indexing_helpers",
+        lambda: (create_memory_schema, fail_after_first_upsert, delete_document_rows_by_id),
+    )
+
+    with pytest.raises(RuntimeError, match="injected reconciliation failure"):
+        reconcile(workspace, apply=True, prune_ineligible=True)
+
+    assert calls == ["notes/first.md", "notes/second.md"]
+    db = sqlite3.connect(str(db_path))
+    assert db.execute("SELECT file_path FROM memory_nodes ORDER BY file_path").fetchall() == [
+        ("runtime/state.json",)
+    ]
+    assert db.execute("SELECT COUNT(*) FROM memory_chunks").fetchone()[0] == 0
+    assert db.execute("SELECT COUNT(*) FROM memory_index_jobs").fetchone()[0] == 0
     db.close()
 
 

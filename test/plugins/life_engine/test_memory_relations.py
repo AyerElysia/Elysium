@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import threading
+import plugins.life_engine.memory.decay as _decay_mod
+from plugins.life_engine.memory.indexing import upsert_document_rows
 from collections.abc import Iterator
 from typing import Any
 
@@ -13,6 +16,8 @@ from plugins.life_engine.memory.decay import (
     apply_decay,
     dream_walk,
     get_file_relations,
+    list_dream_candidate_nodes,
+    list_random_file_nodes,
     prune_weak_edges,
 )
 from plugins.life_engine.memory.edges import (
@@ -26,6 +31,7 @@ from plugins.life_engine.memory.edges import (
 from plugins.life_engine.memory.nodes import (
     generate_file_node_id,
     get_node_by_file_path,
+    row_to_node,
 )
 from plugins.life_engine.memory.search import get_node_by_id, spread_activation
 
@@ -135,6 +141,46 @@ def _database_snapshot(db: sqlite3.Connection) -> tuple[list[tuple[Any, ...]], l
         ).fetchall()
     ]
     return nodes, edges
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [list_dream_candidate_nodes, list_random_file_nodes],
+    ids=["candidates", "random"],
+)
+@pytest.mark.asyncio
+async def test_dream_selectors_register_path_udf_and_exclude_noncanonical_rows(
+    db: sqlite3.Connection,
+    selector: Any,
+) -> None:
+    valid_id = _add_file_node(db, "notes/valid.md")
+    _add_file_node(db, "./notes/noncanonical.md")
+
+    rows = await selector(db, limit=10)
+
+    assert [row["node_id"] for row in rows] == [valid_id]
+    assert [row["file_path"] for row in rows] == ["notes/valid.md"]
+
+
+@pytest.mark.asyncio
+async def test_dream_walk_registers_path_udf_and_ignores_noncanonical_seed(
+    db: sqlite3.Connection,
+) -> None:
+    valid_id = _add_file_node(db, "notes/valid.md")
+    malformed_id = _add_file_node(db, "./notes/noncanonical.md")
+
+    result = await dream_walk(
+        db,
+        num_seeds=1,
+        seed_ids=[malformed_id, valid_id],
+        max_depth=0,
+    )
+
+    assert result == {
+        "nodes_activated": 1,
+        "new_edges_created": 0,
+        "seed_ids": [valid_id],
+    }
 
 
 @pytest.mark.asyncio
@@ -416,6 +462,7 @@ class _BoundRelationCallbacks:
     def __init__(self, db: sqlite3.Connection) -> None:
         self.db = db
         self.file_paths: list[str] = []
+        self.migrate_identity_values: list[bool] = []
 
     async def get_node_by_file_path(
         self,
@@ -423,6 +470,7 @@ class _BoundRelationCallbacks:
         migrate_identity: bool = True,
     ) -> Any:
         self.file_paths.append(file_path)
+        self.migrate_identity_values.append(migrate_identity)
         return await get_node_by_file_path(self.db, file_path)
 
     async def get_edges_from(self, node_id: str, min_weight: float = 0.0) -> Any:
@@ -467,6 +515,7 @@ async def test_file_relations_uses_bound_or_module_callbacks_with_bfs_depths(
     )
 
     assert callbacks.file_paths == ["notes/a.md"]
+    assert callbacks.migrate_identity_values == [False]
     assert bound_result == module_result
     outgoing = bound_result["outgoing"]
     assert {(item["file_path"], item["depth"]) for item in outgoing} == {
@@ -486,6 +535,50 @@ async def test_file_relations_uses_bound_or_module_callbacks_with_bfs_depths(
     )
     assert zero_depth["outgoing"] == []
     assert zero_depth["incoming"] == []
+
+
+@pytest.mark.asyncio
+async def test_file_relations_skips_noncanonical_neighbor_without_migration(
+    db: sqlite3.Connection,
+) -> None:
+    root_id = _add_file_node(db, "notes/root.md")
+    malformed_id = _add_file_node(db, "./notes/noncanonical.md")
+    await create_or_update_edge(
+        db,
+        root_id,
+        malformed_id,
+        EdgeType.CAUSES,
+        strength=0.9,
+    )
+    callbacks = _BoundRelationCallbacks(db)
+    raw_lookup_ids: list[str] = []
+
+    async def raw_node_lookup(
+        connection: sqlite3.Connection,
+        node_id: str,
+    ) -> Any:
+        raw_lookup_ids.append(node_id)
+        row = connection.execute(
+            "SELECT * FROM memory_nodes WHERE node_id = ?",
+            (node_id,),
+        ).fetchone()
+        return row_to_node(row) if row else None
+
+    result = await get_file_relations(
+        db,
+        "notes/root.md",
+        depth=1,
+        get_node_by_file_path_func=callbacks.get_node_by_file_path,
+        get_edges_from_func=get_edges_from,
+        get_edges_to_func=get_edges_to,
+        get_node_by_id_func=raw_node_lookup,
+    )
+
+    assert callbacks.file_paths == ["notes/root.md"]
+    assert callbacks.migrate_identity_values == [False]
+    assert raw_lookup_ids == [malformed_id]
+    assert result["outgoing"] == []
+    assert result["incoming"] == []
 
 
 @pytest.mark.asyncio
@@ -529,3 +622,59 @@ async def test_spread_activation_uses_single_hop_decay_and_strongest_acyclic_pat
     assert result_by_id[node_d][1] == [node_a, node_c, node_b, node_d]
     assert node_a not in result_by_id
     assert all(len(path) == len(set(path)) for _, path, _ in result_by_id.values())
+
+
+@pytest.mark.asyncio
+async def test_apply_decay_rollback_does_not_clobber_concurrent_upsert(
+    db: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a rolled-back decay transaction must not erase a concurrent upsert.
+
+    Before ``_run_edge_maintenance`` adopted ``indexing.transaction()`` (and its
+    ``_TRANSACTION_LOCK``), ``apply_decay`` used a bare ``SAVEPOINT`` guarded only
+    by ``_EDGE_WRITE_LOCK``. When an independent ``upsert_document_rows`` began its
+    own root ``BEGIN`` on the same connection while decay's bare savepoint was live,
+    SQLite promoted the upsert into a nested savepoint under decay's root. Decay's
+    subsequent ``ROLLBACK`` then erased the upsert's committed rows.
+
+    This test injects a failure into ``apply_decay`` so its transaction rolls back,
+    verifying that the concurrent ``upsert_document_rows`` survives.
+    """
+    _add_file_node(db, "notes/existing.md")
+
+    upsert_started = threading.Event()
+    upsert_errors: list[BaseException] = []
+
+    def _failing_compute(node, decay_lambda=_decay_mod.DECAY_LAMBDA):
+        # 1. Signal that the upsert thread may proceed.
+        upsert_started.set()
+        # 2. Wait briefly so the upsert thread can reach the lock boundary.
+        time.sleep(0.05)
+        # 3. Raise to force decay's transaction to roll back.
+        raise RuntimeError("injected decay failure")
+
+    monkeypatch.setattr(_decay_mod, "compute_memory_strength", _failing_compute)
+
+    def do_upsert() -> None:
+        try:
+            assert upsert_started.wait(timeout=5.0), "upsert signal never received"
+            upsert_document_rows(db, "notes/new-doc.md", "content alpha beta", now=10.0)
+        except BaseException as exc:
+            upsert_errors.append(exc)
+
+    upsert_thread = threading.Thread(target=do_upsert, daemon=True)
+    upsert_thread.start()
+
+    with pytest.raises(RuntimeError, match="injected decay failure"):
+        await apply_decay(db)
+
+    upsert_thread.join(timeout=5.0)
+    assert not upsert_thread.is_alive(), "upsert thread did not finish"
+    assert upsert_errors == [], f"upsert thread raised: {upsert_errors}"
+
+    row = db.execute(
+        "SELECT node_id FROM memory_nodes WHERE file_path = ?",
+        ("notes/new-doc.md",),
+    ).fetchone()
+    assert row is not None, "upsert row was clobbered by decay rollback"

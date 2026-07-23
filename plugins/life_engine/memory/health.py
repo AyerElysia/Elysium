@@ -14,14 +14,14 @@ from typing import Any
 
 from .eligibility import (
     SUPPORTED_DOCUMENT_SUFFIXES,
-    assess_document_path,
+    assess_indexed_document_path,
     assess_workspace_document,
     read_workspace_document,
     scan_workspace_documents,
     summarize_rejections,
 )
 from .indexing import INDEX_SCHEMA_NAME
-from .nodes import compute_content_hash
+from .nodes import compute_content_hash, generate_file_node_id
 
 # Kept as a compatibility alias for callers that imported the former constant.
 SUPPORTED_WORKSPACE_SUFFIXES = SUPPORTED_DOCUMENT_SUFFIXES
@@ -68,6 +68,29 @@ def _is_deleted(value: Any) -> bool:
         return bool(int(value or 0))
     except (TypeError, ValueError):
         return bool(value)
+
+
+def _stored_path_text(row: dict[str, Any]) -> str:
+    """Render a persisted path for reporting without changing its identity."""
+    value = row.get("file_path")
+    return "" if value is None else str(value)
+
+
+def _active_file_identity(row: dict[str, Any]) -> tuple[str | None, str]:
+    """Return a strict active file identity or its diagnostic reason."""
+    if _is_deleted(row.get("is_deleted")):
+        return None, "deleted_node"
+    if str(row.get("node_type") or "file").lower() != "file":
+        return None, "not_file_node"
+
+    decision = assess_indexed_document_path(row.get("file_path"))
+    if not decision.eligible:
+        return None, decision.reason or "invalid_path"
+
+    node_id = row.get("node_id")
+    if not isinstance(node_id, str) or node_id != generate_file_node_id(decision.path):
+        return None, "node_id_mismatch"
+    return decision.path, ""
 
 
 def _bounded_paths(values: set[str] | list[str]) -> list[str]:
@@ -471,7 +494,7 @@ def collect_health_snapshot(
             counts["file_nodes"] = sum(
                 1
                 for row in node_rows
-                if (row.get("node_type") or "file").lower() == "file"
+                if str(row.get("node_type") or "file").lower() == "file"
             )
             counts["concept_nodes"] = sum(
                 1 for row in node_rows if str(row.get("node_type") or "").lower() == "concept"
@@ -496,24 +519,24 @@ def collect_health_snapshot(
     ineligible_indexed_node_paths: list[str] = []
     ineligible_indexed_reason_counts: dict[str, int] = {}
     for row in node_rows:
+        # Deleted and concept rows are not active document-index candidates, but
+        # remain visible through the aggregate node counters.  Every active file
+        # row must retain its exact stored path and deterministic node identity.
         if _is_deleted(row.get("is_deleted")):
             continue
         if str(row.get("node_type") or "file").lower() != "file":
             continue
-        raw_path = str(row.get("file_path") or "").strip().replace("\\", "/")
-        decision = assess_document_path(raw_path)
-        if not decision.eligible:
+        path, identity_error = _active_file_identity(row)
+        if path is None:
             ineligible_indexed_node_count += 1
-            report_path = decision.path or raw_path
+            report_path = _stored_path_text(row)
             if report_path:
                 ineligible_indexed_node_paths.append(report_path)
-            if decision.reason:
-                ineligible_indexed_reason_counts[decision.reason] = (
-                    ineligible_indexed_reason_counts.get(decision.reason, 0) + 1
-                )
+            ineligible_indexed_reason_counts[identity_error] = (
+                ineligible_indexed_reason_counts.get(identity_error, 0) + 1
+            )
             continue
 
-        path = decision.path
         workspace_decision = assess_workspace_document(workspace, path)
         # A path that no longer exists remains valid historical evidence. A
         # present symlink, oversized file, special file, or escaped path must
@@ -629,44 +652,90 @@ def collect_health_snapshot(
     return snapshot
 
 
+def _is_enabled(value: Any) -> bool:
+    """Interpret SQLite flag values without treating textual ``'0'`` as true."""
+    return _is_deleted(value)
+
+
+def _valid_chunk_ids(
+    db: sqlite3.Connection,
+    valid_node_ids: set[str],
+) -> dict[str, str]:
+    """Return chunk IDs mapped to strict file-node owners."""
+    if not valid_node_ids or not _table_exists(db, "memory_chunks"):
+        return {}
+    placeholders = ",".join("?" for _ in valid_node_ids)
+    try:
+        rows = db.execute(
+            "SELECT chunk_id, node_id, chunk_index, content_hash, content "
+            "FROM memory_chunks WHERE node_id IN ("
+            + placeholders
+            + ") ORDER BY node_id, chunk_index, chunk_id",
+            sorted(valid_node_ids),
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+
+    chunks_by_node: dict[str, list[tuple[Any, ...]]] = {}
+    for row in rows:
+        node_id = row[1]
+        if isinstance(node_id, str):
+            chunks_by_node.setdefault(node_id, []).append(tuple(row))
+
+    valid_chunk_ids: dict[str, str] = {}
+    for node_id, node_chunks in chunks_by_node.items():
+        node_chunk_ids: list[str] = []
+        for expected_index, row in enumerate(node_chunks):
+            try:
+                chunk_index = int(row[2])
+            except (TypeError, ValueError):
+                node_chunk_ids = []
+                break
+            content = row[4]
+            chunk_hash = str(row[3] or "")
+            chunk_id = row[0]
+            if (
+                chunk_index != expected_index
+                or not isinstance(content, str)
+                or not content
+                or chunk_hash != compute_content_hash(content)
+                or not isinstance(chunk_id, str)
+                or chunk_id != f"{node_id}:{chunk_index}:{chunk_hash}"
+            ):
+                node_chunk_ids = []
+                break
+            node_chunk_ids.append(chunk_id)
+        valid_chunk_ids.update({chunk_id: node_id for chunk_id in node_chunk_ids})
+    return valid_chunk_ids
+
+
 def _vector_id_sets(
     db: sqlite3.Connection | None,
 ) -> tuple[set[str], set[str], set[str], set[str]]:
-    """Return current node/chunk IDs and IDs expected in each vector layout."""
+    """Return vector owners that still have strict active SQLite identities."""
     if db is None:
         return set(), set(), set(), set()
     rows = _load_node_rows(db)
-    node_ids = {
-        str(row["node_id"])
-        for row in rows
-        if row.get("node_id") is not None
-    }
+    valid_rows: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        path, _ = _active_file_identity(row)
+        node_id = row.get("node_id")
+        if path is not None and isinstance(node_id, str):
+            valid_rows[node_id] = row
+
+    node_ids = set(valid_rows)
     embedded_node_ids = {
-        str(row["node_id"])
-        for row in rows
-        if row.get("node_id") is not None
-        and not _is_deleted(row.get("is_deleted"))
-        and bool(row.get("embedding_synced") or 0)
+        node_id
+        for node_id, row in valid_rows.items()
+        if _is_enabled(row.get("embedding_synced"))
     }
-    chunk_ids: set[str] = set()
-    expected_embedded_chunk_ids: set[str] = set()
-    if _table_exists(db, "memory_chunks") and _table_exists(db, "memory_nodes"):
-        try:
-            chunk_rows = db.execute(
-                "SELECT c.chunk_id, c.node_id FROM memory_chunks c "
-                "JOIN memory_nodes n ON n.node_id = c.node_id "
-                "WHERE COALESCE(n.is_deleted, 0) = 0"
-            ).fetchall()
-            chunk_ids = {
-                str(row[0]) for row in chunk_rows if row[0] is not None
-            }
-            expected_embedded_chunk_ids = {
-                str(row[0])
-                for row in chunk_rows
-                if row[0] is not None and str(row[1]) in embedded_node_ids
-            }
-        except sqlite3.Error:
-            pass
+    chunk_owner_by_id = _valid_chunk_ids(db, node_ids)
+    chunk_ids = set(chunk_owner_by_id)
+    expected_embedded_chunk_ids = {
+        chunk_id
+        for chunk_id, node_id in chunk_owner_by_id.items()
+        if node_id in embedded_node_ids
+    }
     return node_ids, embedded_node_ids, chunk_ids, expected_embedded_chunk_ids
 
 
@@ -770,6 +839,28 @@ def _collect_empty_db_snapshot(
     return collect_health_snapshot(None, workspace_path), (set(), set(), set(), set())
 
 
+def _collect_read_only_db_snapshot(
+    db_path: str | Path,
+    workspace_path: str | Path,
+) -> tuple[dict[str, Any], _VectorIdSets]:
+    """Collect one consistent committed snapshot on an isolated read-only handle."""
+    path = Path(db_path).expanduser().resolve()
+    uri = f"{path.as_uri()}?mode=ro"
+    db = sqlite3.connect(uri, uri=True)
+    db.row_factory = sqlite3.Row
+    try:
+        db.execute("PRAGMA busy_timeout = 5000")
+        db.execute("PRAGMA foreign_keys = ON")
+        db.execute("PRAGMA query_only = ON")
+        db.execute("BEGIN")
+        try:
+            return collect_health_snapshot(db, workspace_path), _vector_id_sets(db)
+        finally:
+            db.rollback()
+    finally:
+        db.close()
+
+
 async def _async_db_snapshot(
     db: sqlite3.Connection | None,
     workspace_path: str | Path,
@@ -787,13 +878,12 @@ async def _async_db_snapshot(
         return collect_health_snapshot(db, workspace_path), _vector_id_sets(db)
 
 
-async def health_snapshot(
-    db: sqlite3.Connection | None,
-    workspace_path: str | Path,
-    collection: Any = None,
+async def _finish_health_snapshot(
+    snapshot: dict[str, Any],
+    id_sets: _VectorIdSets,
+    collection: Any,
 ) -> dict[str, Any]:
-    """Return a JSON-serializable, read-only memory health snapshot."""
-    snapshot, id_sets = await _async_db_snapshot(db, workspace_path)
+    """Attach vector diagnostics and compute one final snapshot status."""
     node_ids, embedded_node_ids, chunk_ids, expected_chunk_ids = id_sets
     vector = await asyncio.to_thread(_read_vector_collection, collection)
 
@@ -877,11 +967,38 @@ async def health_snapshot(
         )
     ):
         issue_count += 1
-    if db is None:
+    if sqlite_section.get("available") is not True:
         snapshot["status"] = "unavailable"
     else:
         snapshot["status"] = "ok" if sqlite_ok and fk_ok and issue_count == 0 else "degraded"
     return snapshot
+
+
+async def health_snapshot(
+    db: sqlite3.Connection | None,
+    workspace_path: str | Path,
+    collection: Any = None,
+) -> dict[str, Any]:
+    """Return a JSON-serializable, read-only caller-owned health snapshot."""
+    snapshot, id_sets = await _async_db_snapshot(db, workspace_path)
+    return await _finish_health_snapshot(snapshot, id_sets, collection)
+
+
+async def health_snapshot_from_path(
+    db_path: str | Path,
+    workspace_path: str | Path,
+    collection: Any = None,
+) -> dict[str, Any]:
+    """Collect health through an isolated read-only SQLite connection."""
+    try:
+        snapshot, id_sets = await asyncio.to_thread(
+            _collect_read_only_db_snapshot,
+            db_path,
+            workspace_path,
+        )
+    except (OSError, ValueError, sqlite3.Error):
+        snapshot, id_sets = await asyncio.to_thread(_collect_empty_db_snapshot, workspace_path)
+    return await _finish_health_snapshot(snapshot, id_sets, collection)
 
 
 # Explicit aliases make the sync/async boundary discoverable to callers.
@@ -894,5 +1011,6 @@ __all__ = [
     "collect_health_snapshot",
     "health_snapshot",
     "health_snapshot_async",
+    "health_snapshot_from_path",
     "health_snapshot_sync",
 ]
