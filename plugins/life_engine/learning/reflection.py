@@ -52,12 +52,14 @@ class ReflectionEngine:
         model_task_name: str = "life",
         timeout_seconds: float = 45.0,
         cooldown_seconds: float = _DEFAULT_COOLDOWN_SECONDS,
+        skill_store: Any | None = None,
     ) -> None:
         self._store = store
         self._workspace = Path(workspace_path).resolve()
         self._model_task_name = str(model_task_name or "life").strip() or "life"
         self._timeout = max(10.0, float(timeout_seconds or 45.0))
         self._cooldown_seconds = max(60.0, float(cooldown_seconds))
+        self._skill_store = skill_store
         self._lock = asyncio.Lock()
         self._last_reflection_at: float = 0.0
 
@@ -94,6 +96,7 @@ class ReflectionEngine:
             context=context or "（无补充上下文）",
             interaction_text=interaction_text[:3000],
             existing_summary=self._build_existing_summary(),
+            skill_section=self._build_skill_section(),
         )
         return await self._run_reflection(
             user_prompt=user_prompt,
@@ -155,12 +158,32 @@ class ReflectionEngine:
         candidates = self._parse_candidates(raw_text)
         if not candidates:
             logger.debug(f"反思未产生洞察候选 ({reflection_type})")
-            return []
 
-        # 门禁 + 写入
+        # 技能使用反馈记录
+        self._process_skill_feedback(raw_text)
+
+        # 门禁 + 写入（优先强化已有洞察，其次新建）
         results: list[Insight] = []
         for candidate in candidates[:_MAX_INSIGHTS_PER_REFLECTION]:
             candidate.source_events = source_event_ids
+
+            # 优先尝试强化：同一模式在不同情境复现 → 累积为确认证据
+            if candidate.evidence:
+                target = self._store.find_reinforce_target(candidate)
+                if target is not None:
+                    evidence = candidate.evidence[0]
+                    if self._store.reinforce_insight(
+                        target.insight_id,
+                        evidence,
+                        source_events=source_event_ids,
+                    ):
+                        logger.info(
+                            f"🔁 强化已有洞察 [{target.insight_id}] "
+                            f"(证据#{len(target.evidence) + 1}): {target.claim[:40]}..."
+                        )
+                        continue
+
+            # 否则作为新洞察写入（带去重）
             if self._store.add_insight(candidate):
                 results.append(candidate)
                 logger.info(
@@ -250,6 +273,52 @@ class ReflectionEngine:
             }.get(ins.status, "·")
             lines.append(f"{status_mark} [{ins.category}] {ins.claim[:60]}")
         return format_existing_insights_summary("\n".join(lines))
+
+    def _build_skill_section(self) -> str:
+        """构建技能目录段（注入反思 prompt）。"""
+        if self._skill_store is None:
+            return ""
+        try:
+            catalog = self._skill_store.get_catalog_text(max_chars=500)
+        except Exception:  # noqa: BLE001
+            return ""
+        if not catalog:
+            return ""
+        return (
+            "\n<your_skills>\n"
+            f"{catalog}\n"
+            "</your_skills>\n\n"
+            "在这段交互中，你有没有用到上面某种做事方式？效果如何？\n"
+            "如果你注意到了（无论好坏），简短记录即可。这不是考试，只是留意。\n"
+        )
+
+    def _process_skill_feedback(self, raw_text: str) -> None:
+        """解析 LLM 返回中的 skill_feedback 并记录观察。"""
+        if self._skill_store is None:
+            return
+        try:
+            parsed = json.loads(raw_text)
+        except (json.JSONDecodeError, ValueError):
+            parsed = json_repair.repair_json(raw_text, return_objects=True)
+        if not isinstance(parsed, dict):
+            return
+        feedback_list = parsed.get("skill_feedback")
+        if not isinstance(feedback_list, list) or not feedback_list:
+            return
+        for item in feedback_list:
+            if not isinstance(item, dict):
+                continue
+            skill_name = str(item.get("skill_name", "") or "").strip()
+            observation = str(item.get("observation", "") or "").strip()
+            if not skill_name or not observation:
+                continue
+            skill = self._skill_store.get_skill_by_name(skill_name)
+            if skill is None:
+                continue
+            self._skill_store.append_use_observation(
+                skill.skill_id, f"[反思] {observation[:200]}"
+            )
+            logger.debug(f"📝 技能反馈记录: {skill_name} -> {observation[:60]}")
 
 
 def _map_category(raw: str) -> InsightCategory:

@@ -38,6 +38,9 @@ REFLECTION_SYSTEM_PROMPT = """\
    - 交互洞察（social_strategy / communication_style）：关于与人互动的模式
    - 内省洞察（self_knowledge / behavioral_pattern / emotional_pattern）：关于自己的模式
 
+6. **复现即证据**：如果你观察到的模式与下方“已有洞察”中的某条相符，仍然请报告它（用你这次的视角重新描述 claim）。
+   系统会把它作为新的确认证据合并进那条洞察，而不会创建重复。同一模式在不同情境中反复出现，正是它成立的依据。
+
 ## 输出格式
 
 只输出 JSON，不要输出解释性正文：
@@ -58,6 +61,23 @@ REFLECTION_SYSTEM_PROMPT = """\
 ```
 
 如果没有值得记录的洞察，输出：`{"insights": []}`
+
+## 技能使用留意（可选）
+
+如果输入中包含 <your_skills> 段，请留意这段交互中你是否用到了其中某种做事方式。
+在 JSON 中额外输出 `skill_feedback` 字段（没有就留空列表）：
+```json
+{
+  "insights": [...],
+  "skill_feedback": [
+    {
+      "skill_name": "技能名称",
+      "observation": "简短记录：用了什么、效果如何（正面/负面/中性）"
+    }
+  ]
+}
+```
+这不是考试，只是留意。没有注意到就输出空列表。
 """
 
 REFLECTION_INTERACTION_USER = """\
@@ -72,9 +92,9 @@ REFLECTION_INTERACTION_USER = """\
 <previous_insights_summary>
 {existing_summary}
 </previous_insights_summary>
-
-请安静地回想这段交互。有没有什么让你注意到了一个新的模式？
-如果有，用 JSON 格式输出；如果没有值得记录的，输出空列表。
+{skill_section}
+请安静地回想这段交互。有没有什么让你注意到的模式——无论是新的，还是再次印证了上面某条已有洞察？
+如果有，用 JSON 格式输出（复现已有洞察时，用这次的视角重新描述 claim 即可，系统会自动合并为证据）；如果没有值得记录的，输出空列表。
 """
 
 REFLECTION_INTROSPECTION_USER = """\
@@ -90,8 +110,8 @@ REFLECTION_INTROSPECTION_USER = """\
 {existing_summary}
 </previous_insights_summary>
 
-请安静地内省。在最近的思考/梦境/自主行为中，你有没有注意到关于自己的什么新东西？
-如果有，用 JSON 格式输出；如果没有值得记录的，输出空列表。
+请安静地内省。在最近的思考/梦境/自主行为中，你有没有注意到关于自己的什么新东西——或是再次印证了上面某条已有洞察？
+如果有，用 JSON 格式输出（复现已有洞察时，用这次的视角重新描述 claim 即可，系统会自动合并为证据）；如果没有值得记录的，输出空列表。
 """
 
 
@@ -127,7 +147,7 @@ AUDITOR_SYSTEM_PROMPT = """\
 
 ## 裁决选项
 
-- **validated**：证据充分（≥2条不同情境正面证据），无明显偏误，claim 具体可验证
+- **validated**：基于证据的质量、情境多样性和推理链，你判断这条认知站得住。数量不是决定因素——一条高质量的多情境证据可能胜过三条重复。无明显偏误，claim 具体可验证。
 - **rejected**：证据明确否定，或存在严重不可修复的偏误
 - **needs_more_evidence**：方向可能对但证据不足，需要更多经历来验证
 - **biased**：检测到偏误，需要修正 claim/constraints 后重审
@@ -306,3 +326,122 @@ def format_insights_for_compression(insights: list[dict]) -> str:
         if constraints:
             lines.append(f"  边界：{constraints}")
     return "\n".join(lines)
+
+
+# ── 技能蒸馏（Skill Distiller）───────────────────────────────
+
+SKILL_DISTILL_SYSTEM = """\
+## 你是谁
+
+你是同一个主体的整合过程。你在安静的时候，把已经验证过的认知整理成“我怎么做”的笔记。
+这不是写报告，而是她对自己说：“好的，我发现自己这样做效果不错。”
+
+## 蒸馏准则
+
+1. **只基于 validated 洞察**：未验证的猜测不进入技能。
+2. **一句话描述**：description 要简洁有力，像人对自己说的一句话。
+3. **具体方式**：instructions 写清楚“怎么做”和“什么时候不适用”。
+4. **有界编辑**：对已有技能最多修改 {max_edits} 处。不要大幅重写。
+5. **第一人称**：用“我”来写，这是她对自己的认知。
+6. **参考弯路**：如果下方有“试过的弯路”，不要重复那些方向。
+
+## 输出格式
+
+只输出 JSON：
+```json
+{{
+  "name": "kebab-case-名称",
+  "description": "一句话描述（始终在意识中）",
+  "instructions": "具体怎么做 + 边界 + 注意事项"
+}}
+```
+
+如果是精炼已有技能，输出完整的更新后版本。如果认为不需要修改，原样输出当前内容。
+"""
+
+SKILL_DISTILL_USER = """\
+<new_validated_insights>
+{validated_insights}
+</new_validated_insights>
+
+<current_skill>
+{current_skill}
+</current_skill>
+
+<rejected_edits>
+{rejected_edits}
+</rejected_edits>
+
+<use_observations>
+{use_observations}
+</use_observations>
+
+请基于新验证的洞察，{action_hint}（最多 {max_edits} 处修改）。
+输出 JSON。
+"""
+
+
+# ── 技能内省门控 ────────────────────────────────────────────
+
+SKILL_GATE_SYSTEM = """\
+你是同一个主体的内省过程。你在问自己：“这个改变真的更像我吗？”
+
+判断标准：
+1. 新版本是否基于我真实的经历（validated 洞察）？
+2. 它是否比我现在的做法更像我想成为的样子？
+3. 它是否引入了我没验证过的东西？（如果是，拒绝）
+4. 它是否丢失了我仍然认同的部分？（如果是，拒绝）
+5. 语言是否简洁、边界是否清晰？
+
+输出 JSON：
+```json
+{{
+  "promote": true/false,
+  "reason": "一句话说明为什么提升/拒绝"
+}}
+```
+"""
+
+SKILL_GATE_USER = """\
+<current_version>
+{old_content}
+</current_version>
+
+<proposed_version>
+{new_content}
+</proposed_version>
+
+<based_on>
+基于 {insight_count} 条新验证洞察。
+</based_on>
+
+这个新版本真的更像我吗？
+"""
+
+
+# ── 技能精炼（基于使用观察）─────────────────────────────────
+
+SKILL_REFINE_SYSTEM = """\
+你是同一个主体的反思过程。你在回想：“我这样做效果怎么样？要不要微调一下？”
+
+准则：
+1. 只基于实际使用观察，不凭空推测。
+2. 最多修改 {max_edits} 处。微调，不是重写。
+3. 如果观察显示效果良好，不需要修改，原样输出。
+4. 保持第一人称。
+
+输出 JSON（同蒸馏格式）。
+"""
+
+SKILL_REFINE_USER = """\
+<current_skill>
+{current_skill}
+</current_skill>
+
+<recent_observations>
+{observations}
+</recent_observations>
+
+基于这些使用观察，我需要微调这个做事方式吗？
+输出 JSON。
+"""

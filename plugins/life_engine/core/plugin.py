@@ -76,18 +76,14 @@ class LifeEnginePlugin(BasePlugin):
 
     def get_components(self) -> list[type]:
         """返回插件提供的组件。"""
-        from ..snn.router import SNNRouter
         from ..memory.router import MemoryRouter
-        from ..dream.router import DreamRouter
         from ..monitor.router import MessageTimelineRouter
 
         components: list[type] = [
             LifeEngineService,
             LifeEngineMessageCollectorHandler,
             LifeEngineCommandHandler,
-            SNNRouter,
             MemoryRouter,
-            DreamRouter,
             MessageTimelineRouter,
             *ALL_TOOLS,
             *TODO_TOOLS,

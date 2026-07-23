@@ -32,20 +32,6 @@ def _get_manager() -> ThoughtStreamManager | None:
     return service._thought_manager
 
 
-def _apply_neuromod_pulse(pulses: dict[str, float], reason: str) -> None:
-    """求知/探索的满足反馈：向调质层施加即时脉冲。
-
-    让"探索是值得的"成为可被身体记住的经验——好奇心回路的奖赏端。
-    失败时静默：满足感缺席不应阻断思考流操作本身。
-    """
-    try:
-        service = _get_service()
-        inner_state = getattr(service, "_inner_state", None) if service else None
-        if inner_state is not None:
-            inner_state.apply_pulse(pulses, reason=reason)
-    except Exception as e:  # noqa: BLE001
-        logger.debug(f"调质脉冲施加失败: {e}")
-
 
 def _record_river_moment(*, kind: str, summary: str, operation: str, reason: str = "") -> None:
     """转折点入长河；长河故障绝不影响思考流操作。"""
@@ -171,11 +157,8 @@ class LifeEngineManageThoughtStreamTool(BaseTool):
                     curiosity_delta=curiosity_delta,
                 )
                 if success:
-                    # 探索本身有回报：小幅满足 + 维持求知欲
-                    _apply_neuromod_pulse(
-                        {"contentment": 0.04, "curiosity": 0.02},
-                        reason="thought_stream_advance",
-                    )
+                    # 探索本身有回报
+                    pass
                 return success, msg
 
             if action == "retire":
@@ -193,12 +176,7 @@ class LifeEngineManageThoughtStreamTool(BaseTool):
                     conclusion=conclusion.strip() if conclusion else "",
                 )
                 if success and new_status == "completed":
-                    # 求知得到满足：带结论的闭合给更强的满足反馈
-                    pulse = 0.10 if conclusion and conclusion.strip() else 0.05
-                    _apply_neuromod_pulse(
-                        {"contentment": pulse},
-                        reason="thought_stream_completed",
-                    )
+                    pass
                 if success:
                     verb = "闭合" if new_status == "completed" else "搁置"
                     detail = conclusion.strip() if conclusion and conclusion.strip() else "（无结论）"

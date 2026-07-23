@@ -5,9 +5,11 @@
 - 快环（ReflectionEngine）：交互/内省后提取洞察候选
 - 审计环（InsightAuditor）：独立 LLM 验证、偏误检测
 - 慢环（SelfKnowledgeCompressor）：压缩为版本化自我认知文档
+- 技能蒸馏（SkillDistiller）：将 validated 洞察蒸馏为技能模式
 
 核心组件：
 - InsightStore: 洞察实验账本（append-only 审计日志 + 快照）
+- SkillStore: 技能持久化（skills.json + 审计流）
 - LearningScheduler: 三环调度协调器
 - LearningMetrics: 学习曲线追踪
 """
@@ -31,6 +33,8 @@ from .auditor import InsightAuditor
 from .knowledge import SelfKnowledgeCompressor
 from .metrics import LearningMetrics
 from .scheduler import LearningScheduler
+from .skill_store import SkillMaturity, SkillPattern, SkillStore
+from .skill_distiller import SkillDistiller
 from .tools import LEARNING_TOOLS
 
 __all__ = [
@@ -53,6 +57,11 @@ __all__ = [
     "SelfKnowledgeCompressor",
     "LearningMetrics",
     "LearningScheduler",
+    # Skill
+    "SkillMaturity",
+    "SkillPattern",
+    "SkillStore",
+    "SkillDistiller",
     # Tools
     "LEARNING_TOOLS",
 ]

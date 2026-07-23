@@ -41,7 +41,6 @@ from .event_bus import (
 )
 from .integrations import (
     DFCIntegration,
-    SNNIntegration,
     MemoryIntegration,
     to_jsonable,
 )
@@ -82,7 +81,6 @@ __all__ = [
     "get_file_metadata",
     # 集成管理器
     "DFCIntegration",
-    "SNNIntegration",
     "MemoryIntegration",
     "to_jsonable",
 ]

@@ -21,6 +21,8 @@ from .auditor import InsightAuditor
 from .knowledge import SelfKnowledgeCompressor
 from .metrics import LearningMetrics
 from .reflection import ReflectionEngine
+from .skill_distiller import SkillDistiller
+from .skill_store import SkillStore
 from .store import InsightStore
 
 logger = logging.getLogger("life_engine.learning.scheduler")
@@ -32,6 +34,8 @@ _DEFAULT_COMPRESS_TRIGGER_COUNT = 5
 _DEFAULT_COMPRESS_INTERVAL_HOURS = 48.0
 _DEFAULT_REFLECTION_COOLDOWN_MINUTES = 30.0
 _DEFAULT_METRICS_INTERVAL_HOURS = 12.0
+_DEFAULT_SKILL_DISTILL_TRIGGER_COUNT = 3
+_DEFAULT_SKILL_DISTILL_INTERVAL_HOURS = 24.0
 
 
 class LearningScheduler:
@@ -55,17 +59,22 @@ class LearningScheduler:
         reflection_cooldown_minutes: float = _DEFAULT_REFLECTION_COOLDOWN_MINUTES,
         # 指标参数
         metrics_interval_hours: float = _DEFAULT_METRICS_INTERVAL_HOURS,
+        # 技能蒸馏参数
+        skill_distill_trigger_count: int = _DEFAULT_SKILL_DISTILL_TRIGGER_COUNT,
+        skill_distill_interval_hours: float = _DEFAULT_SKILL_DISTILL_INTERVAL_HOURS,
     ) -> None:
         self._workspace = Path(workspace_path).resolve()
         self._model_task_name = model_task_name
 
         # 初始化核心组件
         self.store = InsightStore(self._workspace)
+        self.skill_store = SkillStore(self._workspace)
         self.reflection = ReflectionEngine(
             store=self.store,
             workspace_path=self._workspace,
             model_task_name=model_task_name,
             cooldown_seconds=reflection_cooldown_minutes * 60,
+            skill_store=self.skill_store,
         )
         self.auditor = InsightAuditor(
             store=self.store,
@@ -79,6 +88,14 @@ class LearningScheduler:
             model_task_name=model_task_name,
             trigger_count=compress_trigger_count,
             interval_hours=compress_interval_hours,
+        )
+        self.distiller = SkillDistiller(
+            store=self.store,
+            skill_store=self.skill_store,
+            workspace_path=self._workspace,
+            model_task_name=model_task_name,
+            trigger_count=skill_distill_trigger_count,
+            interval_hours=skill_distill_interval_hours,
         )
         self.metrics = LearningMetrics(store=self.store)
 
@@ -113,26 +130,6 @@ class LearningScheduler:
         except Exception as exc:
             logger.warning(f"交互反思异常: {exc}")
 
-    async def on_dream_end(
-        self,
-        *,
-        dream_text: str,
-        context: str = "",
-        source_event_ids: list[str] | None = None,
-    ) -> None:
-        """梦境结束事件：触发内省反思。"""
-        try:
-            insights = await self.reflection.reflect_on_internal(
-                internal_text=dream_text,
-                context=context,
-                source_event_ids=source_event_ids,
-            )
-            if insights:
-                logger.info(f"梦境反思产生 {len(insights)} 条洞察")
-                await self._maybe_run_audit()
-        except Exception as exc:
-            logger.warning(f"梦境反思异常: {exc}")
-
     async def on_thought_closed(
         self,
         *,
@@ -155,13 +152,14 @@ class LearningScheduler:
     # ── 心跳驱动入口 ─────────────────────────────────────────
 
     async def on_heartbeat(self) -> None:
-        """心跳触发：检查是否需要执行审计/压缩/指标快照。
+        """心跳触发：检查是否需要执行审计/压缩/蒸馏/指标快照。
 
         由 life_engine 心跳周期调用（低频，不必每次心跳都调用）。
         """
         try:
             await self._maybe_run_audit()
             await self._maybe_run_compression()
+            await self._maybe_run_distillation()
             await self._maybe_snapshot_metrics()
         except Exception as exc:
             logger.warning(f"学习调度心跳异常: {exc}")
@@ -186,6 +184,13 @@ class LearningScheduler:
             return
         logger.info("📝 触发慢环压缩")
         await self.compressor.run_compression()
+
+    async def _maybe_run_distillation(self) -> None:
+        """检查是否需要技能蒸馏。"""
+        if not self.distiller.should_distill():
+            return
+        logger.info("🧪 触发技能蒸馏")
+        await self.distiller.run_distillation()
 
     async def _maybe_snapshot_metrics(self) -> None:
         """定期生成学习指标快照。"""
@@ -251,6 +256,10 @@ class LearningScheduler:
     def get_knowledge_for_prompt(self, max_chars: int = 2000) -> str:
         """获取自我认知文档（供 prompt 注入）。"""
         return self.compressor.get_knowledge_for_prompt(max_chars=max_chars)
+
+    def get_skill_catalog_for_prompt(self, max_chars: int = 600) -> str:
+        """获取技能目录文本（L1，供 prompt 注入）。"""
+        return self.skill_store.get_catalog_text(max_chars=max_chars)
 
     def get_progress_for_prompt(self) -> str:
         """获取学习进展（供 prompt 注入）。"""

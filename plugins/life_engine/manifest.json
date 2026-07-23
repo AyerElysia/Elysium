@@ -136,7 +136,7 @@
     },
     {
       "component_type": "tool",
-      "component_name": "nucleus_manage_skill",
+      "component_name": "nucleus_skill",
       "dependencies": [],
       "enabled": true
     },

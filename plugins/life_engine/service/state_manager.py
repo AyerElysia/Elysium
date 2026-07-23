@@ -588,7 +588,7 @@ class PersistenceError(RuntimeError):
 class StatePersistence:
     """状态持久化管理器。
 
-    负责运行时上下文的保存与恢复，包括事件历史、SNN 状态等。
+    负责运行时上下文的保存与恢复，包括事件历史。
     """
 
     def __init__(
@@ -625,19 +625,13 @@ class StatePersistence:
         state: LifeEngineState,
         pending_events: list[LifeEngineEvent],
         event_history: list[LifeEngineEvent],
-        snn_network: Any = None,
-        inner_state: Any = None,
-        dream_scheduler: Any = None,
     ) -> None:
-        """持久化当前上下文（待处理事件 + 历史事件 + 各子系统状态）。
+        """持久化当前上下文（待处理事件 + 历史事件）。
 
         Args:
             state: 当前中枢状态
             pending_events: 待处理事件列表
             event_history: 事件历史列表
-            snn_network: SNN 网络（可选）
-            inner_state: 调质层引擎（可选）
-            dream_scheduler: 做梦调度器（可选）
         """
         async with self._get_lock():
             payload = {
@@ -670,24 +664,6 @@ class StatePersistence:
                 "pending_events": [event_to_dict(e) for e in pending_events],
                 "event_history": [event_to_dict(e) for e in event_history],
             }
-            # SNN 状态持久化
-            if snn_network is not None:
-                try:
-                    payload["snn_state"] = snn_network.serialize()
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(f"SNN 状态序列化失败: {exc}")
-            # 调质层状态持久化
-            if inner_state is not None:
-                try:
-                    payload["neuromod_state"] = inner_state.serialize()
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(f"调质层状态序列化失败: {exc}")
-            # 做梦系统状态持久化
-            if dream_scheduler is not None:
-                try:
-                    payload["dream_state"] = dream_scheduler.serialize()
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(f"做梦系统状态序列化失败: {exc}")
 
         path = self._runtime_context_path()
         temp_path = path.with_suffix(path.suffix + ".tmp")
@@ -877,11 +853,8 @@ class StatePersistence:
                         snapshots[sid] = snapshot
                 state.last_chatter_think_by_stream = snapshots
 
-        # 子系统持久化状态
+        # 持久化状态
         persisted_state = {
-            "snn_state": raw.get("snn_state"),
-            "neuromod_state": raw.get("neuromod_state"),
-            "dream_state": raw.get("dream_state"),
             "subconscious_summary": summary_dict,
         }
 

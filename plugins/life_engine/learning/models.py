@@ -291,11 +291,15 @@ class Insight:
 
     @property
     def can_review(self) -> bool:
-        """是否还能被审计。"""
+        """是否还能被审计。
+
+        信念永远可重新审视——不用硬上限机械禁止。
+        review_count 仅作信息记录，审计频次预算由调度器控制（脚手架），
+        但不作为“你只能想 N 次”的认知禁令。
+        """
         return (
             self.status == InsightStatus.CANDIDATE.value
             and self.next_action == InsightNextAction.AWAIT_REVIEW.value
-            and self.review_count < self.max_reviews
         )
 
     @property

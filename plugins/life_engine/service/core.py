@@ -25,11 +25,7 @@ from src.kernel.llm import LLMPayload, ROLE, Text, ToolRegistry, ToolResult
 from src.kernel.scheduler import get_unified_scheduler, TriggerType
 
 if TYPE_CHECKING:
-    from ..dream.scheduler import DreamScheduler
     from ..memory.service import LifeMemoryService
-    from ..neuromod.engine import InnerStateEngine
-    from ..snn.bridge import SNNBridge
-    from ..snn.core import DriveCoreNetwork
 
 from .audit import (
     get_life_log_file,
@@ -105,7 +101,6 @@ from .subconscious_context import (
 from .event_bus import LifeEventBus, RawEventStore
 from .integrations import (
     DFCIntegration,
-    SNNIntegration,
     MemoryIntegration,
 )
 from .self_pause import (
@@ -166,21 +161,8 @@ class LifeEngineService(BaseService):
         self._memory_service: LifeMemoryService | None = None
         self._last_decay_date: str | None = None
 
-        # SNN 皮层下系统
-        self._snn_network: DriveCoreNetwork | None = None
-        self._snn_bridge: SNNBridge | None = None
-        self._snn_tick_task_id: str | None = None
-
-        # 神经调质层
-        self._inner_state: InnerStateEngine | None = None
-
-        # 做梦系统
-        self._dream_scheduler: DreamScheduler | None = None
-        self._injected_dream_ids: set[str] = set()
-
         # 集成管理器
         self._dfc_integration: DFCIntegration | None = None
-        self._snn_integration: SNNIntegration | None = None
         self._memory_integration: MemoryIntegration | None = None
 
         # 事件构建器
@@ -469,13 +451,6 @@ class LifeEngineService(BaseService):
         data["in_sleep_window"] = in_sleep_window
         data["sleep_window"] = sleep_window_desc
         data["log_file_path"] = str(get_life_log_file())
-        data["snn_enabled"] = self._cfg().snn.enabled
-        if self._snn_network is not None:
-            data["snn_health"] = self._snn_network.get_health()
-        neuromod_cfg = getattr(self._cfg(), "neuromod", None)
-        data["neuromod_enabled"] = neuromod_cfg.enabled if neuromod_cfg else False
-        if self._inner_state is not None:
-            data["neuromod_state"] = self._inner_state.get_full_state()
         return data
 
     @staticmethod
@@ -609,7 +584,7 @@ class LifeEngineService(BaseService):
             pending_events = list(self._pending_events)
             event_history = list(self._event_history)
             state_snapshot = asdict(self._state)
-            inner_state = self._inner_state
+            inner_state = None
 
         life_events = [
             self._serialize_life_event(event)
@@ -698,21 +673,10 @@ class LifeEngineService(BaseService):
         stream_snapshots.sort(key=lambda item: item["sort_ts"], reverse=True)
         stream_snapshots = stream_snapshots[: max(1, stream_limit)]
 
-        inner_state_snapshot: dict[str, Any] | None = None
-        if inner_state is not None:
-            try:
-                inner_state_snapshot = inner_state.get_full_state()
-            except Exception:
-                try:
-                    inner_state_snapshot = asdict(inner_state)  # type: ignore[arg-type]
-                except Exception:
-                    inner_state_snapshot = {"status": "unavailable"}
-
         return {
             "generated_at": _now_iso(),
             "life": {
                 "state": state_snapshot,
-                "inner_state": inner_state_snapshot,
                 "pending_events": pending_life_events,
                 "recent_events": life_events,
                 "latest_event": life_latest_event,
@@ -2308,22 +2272,6 @@ class LifeEngineService(BaseService):
             cursors = self._state.chatter_thought_cursors
             cursors[sid] = max(int(cursors.get(sid, 0) or 0), int(revision))
 
-    def _format_chatter_inner_state(self) -> str:
-        if self._inner_state is None:
-            return ""
-        try:
-            today_str = datetime.now().strftime("%Y-%m-%d")
-            return self._inner_state.format_full_state_for_prompt(today_str)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(f"构建 chatter inner_state 快照失败: {exc}")
-            try:
-                state_dict = self._inner_state.get_full_state()
-            except Exception:  # noqa: BLE001
-                return ""
-            if not isinstance(state_dict, dict):
-                return ""
-            return "\n".join(f"{key}: {value}" for key, value in state_dict.items())
-
     def _format_chatter_trace_recent_changes(self, *, limit: int = 3) -> str:
         """渲染长河最近留痕块（用于 chatter suffix）。"""
         if limit <= 0:
@@ -2612,8 +2560,7 @@ class LifeEngineService(BaseService):
         transient 注入；high_water_sequence 在 LLM 请求成功后持久化，避免重复注入。
 
         结构：
-          1. ### 当前内在状态  （neuromod）
-          2. ### 当前思考流    （注意力脑区，分焦点/背景，带 🔄 delta 标记）
+          1. ### 当前思考流    （注意力脑区，分焦点/背景，带 🔄 delta 标记）
           3. ### 最近一次独白/思考快照
           4. ### 运行时内心独白（push_runtime_assistant_injection 队列）
           5. ### 最近聊天记录
@@ -2711,10 +2658,6 @@ class LifeEngineService(BaseService):
 
         sections: list[str] = []
 
-        inner_state_text = self._format_chatter_inner_state()
-        if inner_state_text:
-            sections.append(f"### 当前内在状态\n{inner_state_text}")
-
         new_thought_revision = thought_cursor
         if sync_streams:
             thought_body, current_revision = self._format_chatter_thought_streams(
@@ -2806,6 +2749,24 @@ class LifeEngineService(BaseService):
         if salient_body and not selected_events:
             sections.append(f"### 最近关键活动\n{salient_body}")
             new_event_high_water = max(new_event_high_water, salient_high_water)
+
+        # 学习系统注入：技能目录 + 自我认知（边界提醒，修复 chatter 反馈缺口）
+        learning_cfg = getattr(cfg, "learning", None)
+        if (
+            self._learning_scheduler is not None
+            and learning_cfg is not None
+            and getattr(learning_cfg, "enabled", True)
+        ):
+            skill_catalog = self._learning_scheduler.get_skill_catalog_for_prompt(
+                max_chars=int(getattr(learning_cfg, "skill_catalog_max_chars", 600) or 600)
+            )
+            if skill_catalog:
+                sections.append(f"### 我的做事方式\n{skill_catalog}")
+            knowledge_text = self._learning_scheduler.get_knowledge_for_prompt(
+                max_chars=int(getattr(learning_cfg, "knowledge_max_chars", 2000) or 2000)
+            )
+            if knowledge_text:
+                sections.append(f"### 自我认知\n{knowledge_text}")
 
         # thought delta cursor 在渲染阶段直接提交（不等待 LLM 调用成功）
         if commit_cursors and new_thought_revision > thought_cursor:
@@ -2948,28 +2909,11 @@ class LifeEngineService(BaseService):
         lines: list[str] = self._build_prompt_header()
         lines.extend(self._build_prompt_context_section(wake_context))
 
-        if self._dream_scheduler is not None:
-            try:
-                dream_payload = str(
-                    self._dream_scheduler.get_active_residue_payload("life") or ""
-                ).strip()
-                if dream_payload:
-                    lines.extend([
-                        "### 梦后余韵", "",
-                        dream_payload, "",
-                    ])
-            except Exception:  # noqa: BLE001
-                logger.debug("读取梦后余韵失败")
-
         lines.extend(self._build_prompt_status_section(
             period_label, heartbeat_interval, external_activity, idle_heartbeats
         ))
 
-        # SNN 驱动注入已降级：shadow_only 模式下不注入 prompt
-        # 神经调质层（neuromod）已提供更清晰的驱动状态摘要
-        # SNN 仍作为底层信号处理器运行，提供特征提取和奖赏计算
-
-        # 子系统注入段落（调质/思考流/好奇牵引/冲动/可触达目标等）
+        # 子系统注入段落（思考流/好奇牵引/冲动/可触达目标等）
         # 统一由 SectionProvider 协议渲染，见 prompts/sections.py
         for section_text in section_texts or []:
             lines.extend([section_text, ""])
@@ -3028,12 +2972,12 @@ class LifeEngineService(BaseService):
             "`speak` 的目标可以填「你可以触达的人和地方」里列出的 `target_key`，或精确 `target_stream_id`。",
             "都留空时，意向到点只会以事件浮现给心跳、不会唤醒表达层；不要猜测列表之外的目标。",
             "保持沉默也是主体选择：如果你想确认自己不会打扰，可以登记 `kind=silence`。", "",
-            "### `nucleus_manage_skill` — 沉淀自己的工作方式", "",
-            "skill 是你对自己稳定工作方式的沉淀，不是替用户执行任务的后台脚本。",
-            "只有当你反复发现某种做事习惯、判断边界或内部流程值得保留下来，才考虑起草 skill。",
-            "先 draft，再观察，再 publish；发布不是命令表达层必须使用，只是让未来的你更容易想起这套方法。",
-            "当前只允许 instruction-only skill；包含脚本、shell、外部 API 或自动执行能力的内容不要静默发布。",
-            "不要为了单次用户请求创建 skill；那属于表达层当场处理，不应变成长期能力。", "",
+            "### `nucleus_skill` — 管理自己的做事方式", "",
+            "技能是你从经验中发展出的做事方式（程序性记忆），不是后台脚本，不是自动化规则。",
+            "你可以 list 查看目录、detail 细看某个技能、reflect 记录使用观察、refine 精炼、",
+            "mark_embodied 标记已成为直觉、challenge 质疑、draft 写下新领悟、archive 归档。",
+            "成熟度推进是你的判断——系统只记录观察，不自动改变。",
+            "有界编辑：每次 refine 只调一点，渐进式成长。", "",
             "### 工具边界", "",
             "- `nucleus_search_memory` 是历史检索，不要反复重搜同一主题",
             "- 本地文件工具只用于你的私有工作区、日记、笔记、MEMORY 维护和 USER.md 长期画像维护，不用于替用户查项目或改项目",
@@ -3587,26 +3531,6 @@ class LifeEngineService(BaseService):
 
         return last_text
 
-    def _fire_dream_reflection(self, report: Any) -> None:
-        """梦境结束后触发学习系统内省反思（后台非阻塞）。"""
-        if self._learning_scheduler is None:
-            return
-        dream_text = getattr(report, "dream_text", "") or getattr(report, "narrative", "") or ""
-        if not dream_text:
-            return
-        dream_id = getattr(report, "dream_id", "unknown")
-        try:
-            get_task_manager().create_task(
-                self._learning_scheduler.on_dream_end(
-                    dream_text=dream_text[:2000],
-                    context=f"dream_id={dream_id}",
-                ),
-                name=f"life_learning_dream_{dream_id}",
-                daemon=True,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(f"梦境反思任务创建失败: {exc}")
-
     async def _save_runtime_context(self) -> None:
         """持久化当前上下文。"""
         from .state_manager import PersistenceError
@@ -3622,9 +3546,6 @@ class LifeEngineService(BaseService):
                 self._state,
                 self._pending_events,
                 self._event_history,
-                self._snn_network,
-                self._inner_state,
-                self._dream_scheduler,
             )
             self._state_dirty = False
         except PersistenceError as exc:
@@ -3652,14 +3573,6 @@ class LifeEngineService(BaseService):
         self._pending_events = pending
         self._event_history = history
 
-        # 存储持久化状态供子系统恢复
-        if persisted.get("snn_state"):
-            self._snn_persisted_state = persisted["snn_state"]
-        if persisted.get("neuromod_state"):
-            self._neuromod_persisted_state = persisted["neuromod_state"]
-        if persisted.get("dream_state"):
-            self._dream_persisted_state = persisted["dream_state"]
-
     async def start(self) -> None:
         """启动心跳。"""
         from .registry import register_life_engine_service
@@ -3685,9 +3598,6 @@ class LifeEngineService(BaseService):
         # 初始化集成管理器
         self._memory_integration = MemoryIntegration(self)
         await self._memory_integration.init_memory_service()
-
-        self._snn_integration = SNNIntegration(self)
-        await self._snn_integration.init_snn()
 
         self._dfc_integration = DFCIntegration(self)
 
@@ -3730,6 +3640,8 @@ class LifeEngineService(BaseService):
                     compress_trigger_count=int(getattr(learning_cfg, "compress_trigger_count", 5) if learning_cfg else 5),
                     compress_interval_hours=float(getattr(learning_cfg, "compress_interval_hours", 48.0) if learning_cfg else 48.0),
                     reflection_cooldown_minutes=float(getattr(learning_cfg, "reflection_cooldown_minutes", 30.0) if learning_cfg else 30.0),
+                    skill_distill_trigger_count=int(getattr(learning_cfg, "skill_distill_trigger_count", 3) if learning_cfg else 3),
+                    skill_distill_interval_hours=float(getattr(learning_cfg, "skill_distill_interval_hours", 24.0) if learning_cfg else 24.0),
                 )
                 logger.info("三环自学习系统已初始化")
             except Exception as exc:  # noqa: BLE001
@@ -3774,8 +3686,7 @@ class LifeEngineService(BaseService):
             f"task={cfg.model.task_name} "
             f"workspace={cfg.settings.workspace_path} "
             f"sleep={cfg.settings.sleep_time or '-'} "
-            f"wake={cfg.settings.wake_time or '-'} "
-            f"snn={cfg.snn.enabled}"
+            f"wake={cfg.settings.wake_time or '-'}"
         )
         log_lifecycle(
             "started",
@@ -3783,7 +3694,6 @@ class LifeEngineService(BaseService):
             heartbeat_interval_seconds=int(cfg.settings.heartbeat_interval_seconds),
             model_task_name=cfg.model.task_name,
             log_file_path=str(get_life_log_file()),
-            snn_enabled=cfg.snn.enabled,
         )
 
     async def _await_managed_task(self, task_id: str | None, *, timeout: float) -> None:
@@ -3827,8 +3737,6 @@ class LifeEngineService(BaseService):
         self._memory_index_task_id = None
         await self._await_managed_task(self._heartbeat_task_id, timeout=5.0)
         self._heartbeat_task_id = None
-        await self._await_managed_task(self._snn_tick_task_id, timeout=5.0)
-        self._snn_tick_task_id = None
 
         memory_service = self._memory_service
         if memory_service is not None:
@@ -3853,7 +3761,6 @@ class LifeEngineService(BaseService):
             pending_message_count=pending_before_stop,
             heartbeat_count=self._state.heartbeat_count,
             log_file_path=str(get_life_log_file()),
-            snn_tick_count=self._snn_network.tick_count if self._snn_network else 0,
         )
 
     async def _run_heartbeat_round(
@@ -3872,9 +3779,6 @@ class LifeEngineService(BaseService):
             try:
                 if self._memory_integration is not None:
                     await self._memory_integration.maybe_run_daily_decay()
-
-                if self._snn_integration is not None:
-                    await self._snn_integration.heartbeat_pre()
 
                 if collect_background_agents:
                     try:
@@ -3927,8 +3831,6 @@ class LifeEngineService(BaseService):
                         daemon=True,
                     )
 
-                if self._snn_integration is not None:
-                    await self._snn_integration.heartbeat_post()
                 return str(model_reply or ""), prepared
             except asyncio.CancelledError:
                 raise
@@ -4013,28 +3915,6 @@ class LifeEngineService(BaseService):
                             f"window={sleep_window_desc}"
                         )
                         self._sleep_state_active = True
-                        if self._dream_scheduler is not None:
-                            self._dream_scheduler.enter_sleep()
-
-                    # 做梦检查
-                    if self._dream_scheduler is not None and self._dream_scheduler.should_dream(
-                        idle_heartbeat_count=self._state.idle_heartbeat_count,
-                        in_sleep_window=True,
-                    ):
-                        try:
-                            async with self._get_lock():
-                                event_history = list(self._event_history)
-                            report = await self._dream_scheduler.run_dream_cycle(event_history)
-                            await self._save_runtime_context()
-                            if self._dfc_integration is not None:
-                                await self._dfc_integration.inject_dream_report(report, "sleep_window")
-                            logger.info(
-                                f"🌙 做梦完成: dream_id={report.dream_id} "
-                                f"duration={report.duration_seconds:.1f}s"
-                            )
-                            self._fire_dream_reflection(report)
-                        except Exception as exc:
-                            logger.error(f"做梦执行异常: {exc}", exc_info=True)
 
                     if should_log_heartbeat:
                         logger.info(f"life_engine heartbeat tick: 睡眠中（{sleep_window_desc}），跳过")
@@ -4067,25 +3947,6 @@ class LifeEngineService(BaseService):
                     )
                     injected_content = prepared.content
 
-                    # 白天小憩检查
-                    if self._dream_scheduler is not None and self._dream_scheduler.should_dream(
-                        idle_heartbeat_count=self._state.idle_heartbeat_count,
-                        in_sleep_window=False,
-                    ):
-                        try:
-                            async with self._get_lock():
-                                event_history = list(self._event_history)
-                            report = await self._dream_scheduler.run_dream_cycle(event_history)
-                            await self._save_runtime_context()
-                            if self._dfc_integration is not None:
-                                await self._dfc_integration.inject_dream_report(report, "daytime_nap")
-                            logger.info(
-                                f"💤 白天小憩完成: dream_id={report.dream_id} "
-                                f"duration={report.duration_seconds:.1f}s"
-                            )
-                            self._fire_dream_reflection(report)
-                        except Exception as nap_exc:  # noqa: BLE001
-                            logger.error(f"白天小憩执行异常: {nap_exc}", exc_info=True)
                 except Exception as exc:  # noqa: BLE001
                     self._state.last_model_error = str(exc)
                     log_error(
@@ -4167,69 +4028,4 @@ class LifeEngineService(BaseService):
                 "heartbeat_count": self._state.heartbeat_count,
             }
 
-    async def trigger_dream_manually(self) -> dict[str, Any]:
-        """手动触发一次做梦周期。"""
-        if not self._is_enabled():
-            return {"success": False, "error": "life_engine 未启用"}
 
-        dream = self._dream_scheduler
-        if dream is None:
-            return {"success": False, "error": "做梦系统未启用"}
-
-        if dream.is_dreaming:
-            return {"success": False, "error": "做梦系统正在运行中"}
-
-        logger.info("life_engine 手动触发做梦")
-
-        try:
-            dream.enter_sleep()
-            async with self._get_lock():
-                event_history = list(self._event_history)
-            report = await dream.run_dream_cycle(event_history)
-            await self._save_runtime_context()
-
-            if self._dfc_integration is not None:
-                await self._dfc_integration.inject_dream_report(report, "manual")
-
-            logger.info(
-                "life_engine 手动做梦完成: "
-                f"dream_id={report.dream_id} duration={report.duration_seconds:.1f}s"
-            )
-            self._fire_dream_reflection(report)
-
-            return {
-                "success": True,
-                "dream_id": report.dream_id,
-                "duration_seconds": round(report.duration_seconds, 1),
-                "nrem_episodes": report.nrem.episodes_replayed,
-                "nrem_steps": report.nrem.total_steps,
-                "rem_nodes": report.rem.nodes_activated,
-                "rem_new_edges": report.rem.new_edges_created,
-                "rem_pruned_edges": report.rem.edges_pruned,
-                "seed_titles": [seed.title for seed in report.seed_report],
-                "seed_types": [seed.seed_type for seed in report.seed_report],
-                "dream_text": report.dream_text or report.narrative,
-                "dream_residue": (
-                    {
-                        "summary": report.dream_residue.summary,
-                        "life_payload": report.dream_residue.life_payload,
-                        "dfc_payload": report.dream_residue.dfc_payload,
-                        "dominant_affect": report.dream_residue.dominant_affect,
-                        "strength": report.dream_residue.strength,
-                        "tags": list(report.dream_residue.tags),
-                    }
-                    if report.dream_residue is not None
-                    else None
-                ),
-                "archive_path": report.archive_path,
-                "memory_effects": dict(report.memory_effects),
-            }
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"life_engine 手动做梦失败: {exc}\n{traceback.format_exc()}")
-            log_error(
-                "manual_dream_failed",
-                str(exc),
-                heartbeat_count=self._state.heartbeat_count,
-                heartbeat_at=self._state.last_heartbeat_at,
-            )
-            return {"success": False, "error": str(exc)}

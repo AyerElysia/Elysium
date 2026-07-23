@@ -23,7 +23,7 @@ _WRITE_TOOL_NAMES: frozenset[str] = frozenset({
     "nucleus_bash",
     "nucleus_manage_todo",
     "nucleus_manage_schedule",
-    "nucleus_manage_skill",
+    "nucleus_skill",
 })
 
 # 全局禁用——子智能体不应递归调用自身或直接对外沟通

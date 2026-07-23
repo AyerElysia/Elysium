@@ -34,8 +34,16 @@ STORE_VERSION = 1
 
 # 去重相似度阈值（简单文本匹配）
 _DEDUP_OVERLAP_THRESHOLD = 0.7
-# Topic 冷却：连续失败次数
-_TOPIC_COOLDOWN_FAILURES = 3
+
+# 强化匹配阈值：同 topic 时用较低阈值捕捉改述，无 topic 时需更高重叠
+_REINFORCE_OVERLAP_WITH_TOPIC = 0.5
+_REINFORCE_OVERLAP_NO_TOPIC = 0.7
+# 可被强化的状态（活跃且尚未验证/否定/归档）
+_REINFORCEABLE_STATUSES = (
+    InsightStatus.CANDIDATE.value,
+    InsightStatus.UNDER_REVIEW.value,
+    InsightStatus.NEEDS_MORE_EVIDENCE.value,
+)
 
 
 class InsightStore:
@@ -111,9 +119,6 @@ class InsightStore:
         if self._is_duplicate(insight):
             logger.info(f"洞察去重: '{insight.claim[:40]}...' 与已有洞察重复")
             return False
-        if self._is_topic_cooled_down(insight.topic_key):
-            logger.info(f"Topic '{insight.topic_key}' 冷却中，暂不接收")
-            return False
         self._insights.append(insight)
         self._append_audit({
             "action": "insight_created",
@@ -153,6 +158,92 @@ class InsightStore:
             "evidence_id": evidence.evidence_id,
             "supports": evidence.supports,
             "kind": evidence.kind,
+        })
+        self._save()
+        return True
+
+    # ── 强化（证据累积）──────────────────────────────────
+
+    def find_reinforce_target(self, new_insight: Insight) -> Insight | None:
+        """为一条新观察寻找可强化的已有洞察。
+
+        匹配逻辑：
+        - 目标必须处于活跃状态（candidate/under_review/needs_more_evidence）
+        - 两者都有 topic 且不同 → 不合并（明确不同主题）
+        - 同 topic → claim 重叠 ≥ 0.5 即可（捕捉改述）
+        - 无共同 topic → 需 claim 重叠 ≥ 0.7（更保守）
+        返回重叠度最高的匹配，或 None。
+        """
+        self.load()
+        if not new_insight.claim:
+            return None
+        new_tokens = set(_tokenize(new_insight.claim))
+        if not new_tokens:
+            return None
+
+        best: Insight | None = None
+        best_overlap = 0.0
+        for existing in self._insights:
+            if existing.status not in _REINFORCEABLE_STATUSES:
+                continue
+            both_have_topic = bool(existing.topic_key) and bool(new_insight.topic_key)
+            if both_have_topic and existing.topic_key != new_insight.topic_key:
+                continue  # 明确不同主题，不合并
+            same_topic = both_have_topic and existing.topic_key == new_insight.topic_key
+            threshold = _REINFORCE_OVERLAP_WITH_TOPIC if same_topic else _REINFORCE_OVERLAP_NO_TOPIC
+            existing_tokens = set(_tokenize(existing.claim))
+            if not existing_tokens:
+                continue
+            overlap = len(new_tokens & existing_tokens) / max(len(new_tokens), 1)
+            if overlap >= threshold and overlap > best_overlap:
+                best = existing
+                best_overlap = overlap
+        return best
+
+    def reinforce_insight(
+        self,
+        insight_id: str,
+        evidence: Evidence,
+        *,
+        source_events: list[str] | None = None,
+    ) -> bool:
+        """用一条新观察强化已有洞察。
+
+        效果：
+        - 补充证据（add_evidence 同时记录触碰）
+        - 合并来源事件
+        - 关键：若此前被打回收集证据（gather_evidence），重置为 await_review 重新排队待审
+        - 写 append-only 审计日志
+
+        注意：不自动修改置信度。确信度由她的主动质疑和独立他者的评估决定，
+        不由重复次数机械累加。
+        """
+        insight = self.get_insight(insight_id)
+        if insight is None:
+            return False
+
+        insight.add_evidence(evidence)  # 内部已 touch_count++ / last_touched_at
+        if source_events:
+            for sid in source_events:
+                if sid and sid not in insight.source_events:
+                    insight.source_events.append(sid)
+
+        # 关键闭环：被打回收集证据的洞察，有了新证据后重新排队等待审计
+        if (
+            insight.status == InsightStatus.CANDIDATE.value
+            and insight.next_action == InsightNextAction.GATHER_EVIDENCE.value
+        ):
+            insight.next_action = InsightNextAction.AWAIT_REVIEW.value
+
+        insight.updated_at = _now_iso()
+        self._append_audit({
+            "action": "insight_reinforced",
+            "insight_id": insight_id,
+            "evidence_id": evidence.evidence_id,
+            "supports": evidence.supports,
+            "evidence_count": len(insight.evidence),
+            "positive_count": insight.positive_evidence_count,
+            "next_action": insight.next_action,
         })
         self._save()
         return True
@@ -272,26 +363,6 @@ class InsightStore:
             if overlap >= _DEDUP_OVERLAP_THRESHOLD:
                 return True
         return False
-
-    def _is_topic_cooled_down(self, topic_key: str) -> bool:
-        """检查 topic 是否因连续失败而冷却。"""
-        if not topic_key:
-            return False
-        self.load()
-        topic_insights = [
-            ins for ins in self._insights
-            if ins.topic_key == topic_key
-        ]
-        if len(topic_insights) < _TOPIC_COOLDOWN_FAILURES:
-            return False
-        # 最近 N 条是否全是 rejected/archived
-        recent = sorted(topic_insights, key=lambda i: i.born_at, reverse=True)[
-            :_TOPIC_COOLDOWN_FAILURES
-        ]
-        return all(
-            ins.status in (InsightStatus.REJECTED.value, InsightStatus.ARCHIVED.value)
-            for ins in recent
-        )
 
     def _topic_distribution(self) -> dict[str, int]:
         topics: dict[str, int] = {}

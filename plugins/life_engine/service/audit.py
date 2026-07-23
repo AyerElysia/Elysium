@@ -183,25 +183,3 @@ def log_error(event: str, error: str, **fields: Any) -> None:
         **fields,
     }
     _emit(payload, level="error")
-
-
-def log_snn_tick(**fields: Any) -> None:
-    """记录一次 SNN tick 更新。"""
-    payload = {
-        "component": "life_engine",
-        "event": "snn_tick",
-        "kind": "snn",
-        **fields,
-    }
-    _emit(payload)
-
-
-def log_snn_snapshot(**fields: Any) -> None:
-    """记录 SNN 状态快照（定期或关键时刻）。"""
-    payload = {
-        "component": "life_engine",
-        "event": "snn_snapshot",
-        "kind": "snn",
-        **fields,
-    }
-    _emit(payload)

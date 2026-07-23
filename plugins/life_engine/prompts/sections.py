@@ -65,21 +65,6 @@ async def render_heartbeat_sections(
 # ============================================================
 
 
-class InnerStateSection(HeartbeatSectionProvider):
-    """神经调质 + 习惯的内在状态摘要。"""
-
-    section_id = "inner_state"
-
-    def enabled(self, ctx: SectionContext) -> bool:
-        neuromod_cfg = getattr(ctx.config, "neuromod", None)
-        if getattr(ctx.service, "_inner_state", None) is None or neuromod_cfg is None:
-            return False
-        return bool(neuromod_cfg.enabled) and bool(neuromod_cfg.inject_to_heartbeat)
-
-    async def render(self, ctx: SectionContext) -> str | None:
-        return ctx.service._inner_state.format_full_state_for_prompt(ctx.today_str)
-
-
 class ThoughtStreamsSection(HeartbeatSectionProvider):
     """当前活跃思考流（heartbeat 内不分组、不做 delta）。"""
 
@@ -149,12 +134,6 @@ class ImpulseSection(HeartbeatSectionProvider):
 
     async def render(self, ctx: SectionContext) -> str | None:
         service = ctx.service
-        neuromod_state: dict[str, Any] = {}
-        if getattr(service, "_inner_state", None) is not None:
-            try:
-                neuromod_state = service._inner_state.get_full_state()
-            except Exception:  # noqa: BLE001
-                pass
         has_urgent_todos = False
         try:
             from ..tools.todo_tools import TodoStorage
@@ -179,9 +158,9 @@ class ImpulseSection(HeartbeatSectionProvider):
             ),
             "has_urgent_todos": has_urgent_todos,
         }
-        suggestions = service._impulse_engine.evaluate(neuromod_state, context)
+        suggestions = service._impulse_engine.evaluate({}, context)
         return service._impulse_engine.format_for_prompt(
-            suggestions, neuromod_state, max_items=3
+            suggestions, {}, max_items=3
         )
 
 
@@ -355,13 +334,44 @@ class LearningProgressSection(HeartbeatSectionProvider):
         return progress or None
 
 
+class SkillCatalogSection(HeartbeatSectionProvider):
+    """技能目录——她知道自己发展出了哪些做事方式。
+
+    只呈现目录（description + 成熟度），不呈现完整 instructions。
+    她决定什么时候细看。用不用、什么时候用，完全由她在推理中自主判断。
+    """
+
+    section_id = "skill_catalog"
+
+    def enabled(self, ctx: SectionContext) -> bool:
+        learning_cfg = getattr(ctx.config, "learning", None)
+        if learning_cfg is None:
+            return True
+        return bool(getattr(learning_cfg, "enabled", True)) and bool(
+            getattr(learning_cfg, "inject_to_heartbeat", True)
+        )
+
+    async def render(self, ctx: SectionContext) -> str | None:
+        service = ctx.service
+        scheduler = getattr(service, "_learning_scheduler", None)
+        if scheduler is None:
+            return None
+        max_chars = int(
+            getattr(getattr(ctx.config, "learning", None), "skill_catalog_max_chars", 600) or 600
+        )
+        catalog = scheduler.get_skill_catalog_for_prompt(max_chars=max_chars)
+        if not catalog:
+            return None
+        return f"### 我的做事方式\n{catalog}"
+
+
 DEFAULT_HEARTBEAT_SECTIONS: list[HeartbeatSectionProvider] = [
-    InnerStateSection(),
     ThoughtStreamsSection(),
     CuriositySection(),
     ImpulseSection(),
     SendTargetsSection(),
     RiverReflectionSection(),
     SelfKnowledgeSection(),
+    SkillCatalogSection(),
     LearningProgressSection(),
 ]
