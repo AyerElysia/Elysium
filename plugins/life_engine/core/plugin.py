@@ -29,6 +29,7 @@ from .compat_tools import (
     LifeThinkAction,
     LifeRecordInnerMonologueAction,
     LifeScheduleFollowupMessageAction,
+    LifeInnerDialogueTool,
     LifeMessageNucleusTool,
     LifeConsultNucleusTool,
 )
@@ -104,6 +105,7 @@ class LifeEnginePlugin(BasePlugin):
             from .chatter import (
                 LifeChatter,
                 LifeInspectMediaTool,
+                LifeSaveMediaTool,
                 LifePassAndWaitAction,
                 LifeSendFileAction,
                 LifeSendTextAction,
@@ -115,10 +117,13 @@ class LifeEnginePlugin(BasePlugin):
                 LifeSendTextAction,
                 LifeSendFileAction,
                 LifeInspectMediaTool,
+                LifeSaveMediaTool,
                 LifePassAndWaitAction,
                 LifeThinkAction,
                 LifeRecordInnerMonologueAction,
                 LifeScheduleFollowupMessageAction,
+                LifeInnerDialogueTool,
+                # 兼容旧名（内部转 inner_dialogue）
                 LifeMessageNucleusTool,
                 LifeConsultNucleusTool,
             ])

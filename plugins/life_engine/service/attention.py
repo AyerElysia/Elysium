@@ -137,7 +137,7 @@ class AttentionRouter:
         stream_id = str(event.stream_id or "").strip()
         if event.event_type == EventType.TOOL_RESULT and event.tool_success is False:
             return 100
-        if content_type in {"direct_message", "dfc_message"}:
+        if content_type in {"direct_message", "dfc_message", "inner_dialogue"}:
             return 95
         if content_type == "autonomy_intent_due":
             return 93

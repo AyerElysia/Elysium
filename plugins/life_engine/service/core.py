@@ -1256,6 +1256,77 @@ class LifeEngineService(BaseService):
                 return sender_id, str(getattr(msg, "sender_name", "") or "")
         return "", ""
 
+    async def enqueue_inner_dialogue(
+        self,
+        thought: str,
+        *,
+        mode: str = "reflect",
+        expect_surface: bool = True,
+        stream_id: str = "",
+        platform: str = "",
+        chat_type: str = "",
+        sender_name: str = "",
+    ) -> dict[str, Any]:
+        """接收主意识沉下来的内心对话（异步，进入中枢心跳处理）。"""
+        if not self._is_enabled():
+            raise RuntimeError("life_engine 未启用")
+
+        text = str(thought or "").strip()
+        if not text:
+            raise ValueError("thought 不能为空")
+
+        mode_name = str(mode or "reflect").strip().lower() or "reflect"
+        if mode_name not in {"notice", "reflect", "gap", "decide"}:
+            mode_name = "reflect"
+
+        receipt_id = f"idlg_{uuid4().hex[:12]}"
+        event = self._event_builder.build_inner_dialogue_event(
+            text,
+            mode=mode_name,
+            expect_surface=bool(expect_surface),
+            receipt_id=receipt_id,
+            stream_id=stream_id,
+            platform=platform or "life_chatter",
+            chat_type=chat_type,
+            sender_name=sender_name or "主意识",
+        )
+
+        await self._queue_pending_event(event)
+
+        log_message_received(
+            received_at=event.timestamp,
+            platform=event.source,
+            chat_type=event.chat_type or "unknown",
+            source_label=event.source_detail,
+            source_detail=event.source_detail,
+            stream_id=event.stream_id or "",
+            sender_display=event.sender or "主意识",
+            sender_id="life_chatter",
+            message_id=event.event_id,
+            reply_to=None,
+            message_type=event.content_type,
+            content=event.content,
+            direction="received",
+            pending_message_count=self._state.pending_event_count,
+        )
+        logger.info(
+            "life_engine 已接收内心对话: "
+            f"receipt={receipt_id} mode={mode_name} "
+            f"stream_id={event.stream_id or 'unknown'} "
+            f"expect_surface={bool(expect_surface)} "
+            f"pending={self._state.pending_event_count}"
+        )
+        return {
+            "event_id": event.event_id,
+            "receipt_id": receipt_id,
+            "mode": mode_name,
+            "expect_surface": bool(expect_surface),
+            "stream_id": event.stream_id or "",
+            "pending_event_count": self._state.pending_event_count,
+            "queued": True,
+            "channel": "inner_dialogue",
+        }
+
     async def enqueue_dfc_message(
         self,
         message: str,
@@ -2188,6 +2259,7 @@ class LifeEngineService(BaseService):
             "proactive_opportunity",
             "dfc_message",
             "direct_message",
+            "inner_dialogue",
             "autonomy_intent_due",
             "autonomy_intent_scheduled",
             "autonomy_intent_silence",
@@ -2428,6 +2500,7 @@ class LifeEngineService(BaseService):
             if content_type in {
                 "dfc_message",
                 "direct_message",
+                "inner_dialogue",
                 "proactive_opportunity",
                 "autonomy_intent_due",
                 "autonomy_intent_scheduled",
@@ -2463,6 +2536,7 @@ class LifeEngineService(BaseService):
             label = {
                 "dfc_message": "📮 DFC",
                 "direct_message": "📨 私信",
+                "inner_dialogue": "💭 内心对话",
                 "proactive_opportunity": "✨ 主动机会",
                 "autonomy_intent_due": "🌱 自主意向",
                 "autonomy_intent_scheduled": "🌱 意向登记",
@@ -2949,6 +3023,12 @@ class LifeEngineService(BaseService):
             "TODO 是承诺记录和提醒信号，不是潜意识替用户办事的队列。",
             "心跳态可以观察、整理或释放 TODO；不要因为看到 TODO 就替表达层推进用户任务。",
             "如果 TODO 涉及你对 Ayer 的承诺或共同目标，表达层会在自然对话中自行决定是否提及。", "",
+            "### 内心对话（`inner_dialogue` 事件）", "",
+            "当事件流里出现 `inner_dialogue` 时，那是主意识（表达层）刚刚沉下来的话——",
+            "不是外部用户，也不是另一个人在问你。那是你自己心里的嘀咕。",
+            "认真对待它：可以联想、沉淀、补信息差；想通了若值得被场面感知，再用 `nucleus_tell_dfc` 浮回去。",
+            "想完也可以什么都不说——人类也常想完不说话。",
+            "浮回时用第一人称、同一主体的口吻，补事实/倾向/风险，不要命令表达层怎么说。", "",
             "### `nucleus_tell_dfc` — 给表达层补充信息差", "",
             "这个工具用于补充背景，不用于指导表达层怎么说、怎么做。", "",
             "你应该用它：",

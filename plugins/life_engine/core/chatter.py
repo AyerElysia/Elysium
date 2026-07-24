@@ -1124,6 +1124,102 @@ class LifeInspectMediaTool(BaseTool):
         )
 
 
+class LifeSaveMediaTool(BaseTool):
+    """把收到的图片/媒体存到 workspace，供后续处理或分析使用。"""
+
+    tool_name = "nucleus_save_media"
+    tool_description = (
+        "把用户发来的图片、语音或视频保存到 workspace 目录，持久化到磁盘。\n\n"
+        "**与 inspect_media 的区别：**\n"
+        "- inspect_media：让你「看」媒体，只进 LLM 上下文，不落盘\n"
+        "- nucleus_save_media：把媒体存到 workspace 文件里，可持久保留、二次使用\n\n"
+        "**save_path 说明：**\n"
+        "- 留空 → 自动存到 workspace/received/<时间戳>.<扩展名>\n"
+        "- 相对路径（如 'vibes/ref.png'）→ workspace/<路径>\n"
+        "- 必须在 workspace 内\n\n"
+        "**返回：** 保存路径、文件大小、媒体类型"
+    )
+    chatter_allow: list[str] = ["life_chatter"]
+
+    async def execute(
+        self,
+        target: Annotated[
+            str,
+            "要保存的媒体：latest 表示最近一条；也可以传具体 message_id",
+        ] = "latest",
+        media_type: Annotated[
+            str,
+            "媒体类型过滤：auto/image/video/audio",
+        ] = "auto",
+        save_path: Annotated[
+            str,
+            "workspace 内的保存路径（相对路径），留空则自动命名存到 received/ 下",
+        ] = "",
+    ) -> tuple[bool, str | dict]:
+        import base64
+        import mimetypes
+        import time as _time
+        from ..tools._utils import _get_workspace
+
+        selected = LifeInspectMediaTool._select_media(self, target, media_type)  # type: ignore[arg-type]
+        if selected is None:
+            return False, "当前会话没有找到可保存的媒体，或指定 message_id 不存在"
+
+        raw = selected.data_for_native
+        if not raw:
+            return False, "找到了媒体记录，但原始数据不在当前运行态，无法保存"
+
+        # 解码 base64
+        try:
+            if raw.startswith("data:") and ";base64," in raw:
+                raw = raw.split(";base64,", 1)[1]
+            elif raw.startswith("base64|"):
+                raw = raw.split("|", 1)[1]
+            image_bytes = base64.b64decode(raw)
+        except Exception as exc:
+            return False, f"媒体数据解码失败: {exc}"
+
+        # 推断扩展名
+        mime = selected.mime_type or ""
+        ext = mimetypes.guess_extension(mime.split(";")[0].strip()) or ""
+        if ext in (".ksh", ".bat", ""):
+            ext = {"image": ".png", "video": ".mp4", "audio": ".mp3"}.get(selected.kind, ".bin")
+
+        workspace = _get_workspace(self.plugin)
+
+        # 解析保存路径
+        raw_path = str(save_path or "").strip()
+        if not raw_path:
+            ts = int(_time.time())
+            filename = f"{ts}{ext}"
+            dest = workspace / "received" / filename
+        else:
+            candidate = Path(raw_path)
+            dest = candidate if candidate.is_absolute() else workspace / candidate
+            try:
+                dest.resolve().relative_to(workspace)
+            except ValueError:
+                return False, f"保存路径超出 workspace 范围: {dest}"
+            if dest.is_dir():
+                dest = dest / f"{int(_time.time())}{ext}"
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(image_bytes)
+
+        size = len(image_bytes)
+        size_str = f"{size / 1024:.1f} KB" if size < 1024 * 1024 else f"{size / 1024 / 1024:.1f} MB"
+        rel = str(dest.relative_to(workspace))
+
+        return True, {
+            "saved_to": str(dest),
+            "workspace_relative": rel,
+            "size": size_str,
+            "size_bytes": size,
+            "kind": selected.kind,
+            "mime_type": mime or "unknown",
+        }
+
+
 # ── LifeChatter ───────────────────────────────────────────────
 
 class LifeChatter(BaseChatter):
@@ -2322,6 +2418,7 @@ class LifeChatter(BaseChatter):
             "- `nucleus_bash`：查看或操作电脑终端。\n"
             "- `nucleus_view_screen`：查看 Ayer 当前屏幕。\n"
             "- `nucleus_manage_todo`：创建 TODO。\n"
+            "- `inner_dialogue`：把念头沉进心里慢慢想（异步；想通了会自己浮回）。\n"
             "- `tool-inspect_media`：把图片/视频/语音提升为原生多模态输入。\n"
             "- 不要把 `reason`、`thought` 等元信息写进 `content`。"
         )

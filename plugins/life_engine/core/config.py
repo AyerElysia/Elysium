@@ -1132,7 +1132,7 @@ class LifeEngineConfig(BaseConfig):
 
         salient_tail_include_direct_messages: bool = Field(
             default=True,
-            description="是否包含 dfc_message / direct_message / proactive_opportunity 类消息。",
+            description="是否包含 dfc_message / direct_message / inner_dialogue / proactive_opportunity 类消息。",
         )
 
         salient_tail_include_inner_monologue: bool = Field(

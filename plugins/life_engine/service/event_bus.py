@@ -79,7 +79,7 @@ def _legacy_priority_and_salience(event: LifeEngineEvent) -> tuple[int, float]:
     content_type = str(event.content_type or "").strip().lower()
     if event.event_type == EventType.TOOL_RESULT and event.tool_success is False:
         return int(LifeEventPriority.URGENT), 1.0
-    if content_type in {"direct_message", "dfc_message"}:
+    if content_type in {"direct_message", "dfc_message", "inner_dialogue"}:
         return int(LifeEventPriority.HIGH), 0.9
     if content_type == "proactive_opportunity":
         return int(LifeEventPriority.HIGH), 0.82

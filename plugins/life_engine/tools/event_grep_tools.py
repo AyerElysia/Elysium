@@ -85,7 +85,7 @@ def _is_life_internal_payload(payload: dict[str, Any]) -> bool:
     stream_id = str(payload.get("stream_id") or "").strip()
     if source == "life_engine":
         return True
-    return not stream_id and content_type in {"proactive_opportunity", "dfc_message", "direct_message"}
+    return not stream_id and content_type in {"proactive_opportunity", "dfc_message", "direct_message", "inner_dialogue"}
 
 
 async def grep_life_events(

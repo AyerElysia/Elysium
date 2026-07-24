@@ -8,7 +8,6 @@ from typing import Any
 
 _PARALLEL_SAFE_TOOL_NAMES: frozenset[str] = frozenset(
     {
-        "consult_nucleus",
         "fetch_chat_history",
         "fetch_life_memory",
         "grep_life_events",

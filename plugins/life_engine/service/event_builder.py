@@ -305,6 +305,61 @@ class EventBuilder:
             stream_id=stream_id,
         )
 
+    def build_inner_dialogue_event(
+        self,
+        thought: str,
+        *,
+        mode: str = "reflect",
+        expect_surface: bool = True,
+        receipt_id: str = "",
+        stream_id: str = "",
+        platform: str = "",
+        chat_type: str = "",
+        sender_name: str = "",
+    ) -> LifeEngineEvent:
+        """构建主意识 → 潜意识 的异步内心对话事件。
+
+        这不是外部用户留言，也不是第二人格咨询，而是同一主体把念头沉进中枢慢循环。
+        """
+        seq = self._next_sequence()
+        platform_name = str(platform or "life_chatter").strip() or "life_chatter"
+        chat_type_name = str(chat_type or "unknown").strip().lower() or "unknown"
+        sender_display = str(sender_name or "主意识").strip() or "主意识"
+        target_stream_id = str(stream_id or "").strip()
+        mode_name = str(mode or "reflect").strip().lower() or "reflect"
+        rid = str(receipt_id or "").strip() or f"idlg_{seq}"
+        detail_parts = [
+            platform_name,
+            "内部",
+            "内心对话",
+            f"mode={mode_name}",
+            f"receipt={rid}",
+            f"expect_surface={'yes' if expect_surface else 'no'}",
+        ]
+        if target_stream_id:
+            detail_parts.append(f"stream_id={target_stream_id}")
+
+        header = (
+            f"[内心对话 | mode={mode_name} | receipt={rid} | "
+            f"expect_surface={'yes' if expect_surface else 'no'}]"
+        )
+        body = str(thought or "").strip()
+        content = f"{header}\n{body}" if body else header
+
+        return LifeEngineEvent(
+            event_id=f"idlg_{seq}",
+            event_type=EventType.MESSAGE,
+            timestamp=_now_iso(),
+            sequence=seq,
+            source=platform_name,
+            source_detail=" | ".join(detail_parts),
+            content=content,
+            content_type="inner_dialogue",
+            sender=sender_display,
+            chat_type=chat_type_name,
+            stream_id=target_stream_id or None,
+        )
+
     def build_dfc_message_event(
         self,
         message: str,

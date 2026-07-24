@@ -182,130 +182,99 @@ class LifeScheduleFollowupMessageAction(BaseAction):
         return ok, message
 
 
-class LifeMessageNucleusTool(BaseTool):
-    """向生命中枢留言，不等待即时回复。"""
+class LifeInnerDialogueTool(BaseTool):
+    """主意识把念头沉进潜意识：异步内心对话，不即时返回答案。"""
 
-    tool_name = "message_nucleus"
+    tool_name = "inner_dialogue"
     tool_description = (
-        "向生命中枢留言，请它慢慢思考后再主动回到对话里。"
-        "这个工具不会同步返回中枢答案，只负责投递消息。"
-        "适合请中枢补充信息差、整理最近状态，或把某个话题交给它继续琢磨。"
-        "调用后不要假装已经拿到中枢回复。"
+        "把一句话沉进自己心里慢慢想——这是主意识对潜意识的内心对话，不是咨询另一个人。"
+        "工具只负责投递，不会同步返回“想完了的答案”。"
+        "适合：犹豫、惦记、补信息差、理清倾向；想通了会自己浮回表达层（若需要）。"
+        "调用后继续场面，不要假装已经想清楚。"
     )
     chatter_allow: list[str] = ["life_chatter"]
 
     async def execute(
         self,
-        content: Annotated[str, "要转交给生命中枢的话。应直接写想问或想说的内容。"],
+        thought: Annotated[str, "此刻想沉下去的话。直接写内心内容，例如「其实我有点犹豫…」。"] = "",
+        mode: Annotated[
+            str,
+            "notice=只记下；reflect=好好想想（默认）；gap=补信息差；decide=理清倾向。",
+        ] = "reflect",
+        expect_surface: Annotated[
+            bool,
+            "想完后是否允许浮回表达层。默认 true；false 则只在中枢内部沉淀。",
+        ] = True,
         stream_id: Annotated[str, "当前对话流 ID。通常留空，由系统自动填充。"] = "",
         platform: Annotated[str, "当前平台名。通常留空，由系统自动填充。"] = "",
         chat_type: Annotated[str, "当前聊天类型。通常留空，由系统自动填充。"] = "",
         sender_name: Annotated[str, "当前说话身份展示名。通常留空，由系统自动填充。"] = "",
+        # legacy aliases from message_nucleus / consult_nucleus
+        content: Annotated[str, "兼容旧参数：等同 thought。"] = "",
+        query: Annotated[str, "兼容旧参数：等同 thought。"] = "",
     ) -> tuple[bool, str]:
-        text = str(content or "").strip()
+        text = str(thought or content or query or "").strip()
         if not text:
-            return False, "content 不能为空"
+            return False, "thought 不能为空"
 
         life_plugin = get_plugin_manager().get_plugin("life_engine")
         if life_plugin is None:
-            return False, "life_engine 未加载，无法转交到生命中枢"
+            return False, "life_engine 未加载，无法进行内心对话"
 
         service = getattr(life_plugin, "service", None)
-        if service is None or not hasattr(service, "enqueue_outer_message"):
-            return False, "life_engine 服务不可用，无法转交到生命中枢"
+        if service is None or not hasattr(service, "enqueue_inner_dialogue"):
+            return False, "life_engine 服务不可用，无法进行内心对话"
+
+        chat_stream = getattr(self, "chat_stream", None)
+        resolved_stream = str(stream_id or getattr(chat_stream, "stream_id", "") or "").strip()
+        resolved_platform = str(platform or getattr(chat_stream, "platform", "") or "life_chatter").strip()
+        resolved_chat_type = str(chat_type or getattr(chat_stream, "chat_type", "") or "").strip()
+        resolved_sender = str(
+            sender_name or getattr(chat_stream, "bot_nickname", "") or "主意识"
+        ).strip()
 
         try:
-            receipt: dict[str, Any] = await service.enqueue_outer_message(
-                message=text,
-                stream_id=str(stream_id or "").strip(),
-                platform=str(platform or "").strip(),
-                chat_type=str(chat_type or "").strip(),
-                sender_name=str(sender_name or "").strip(),
+            receipt: dict[str, Any] = await service.enqueue_inner_dialogue(
+                text,
+                mode=str(mode or "reflect"),
+                expect_surface=bool(expect_surface),
+                stream_id=resolved_stream,
+                platform=resolved_platform,
+                chat_type=resolved_chat_type,
+                sender_name=resolved_sender,
             )
         except Exception as exc:  # noqa: BLE001
-            return False, f"转交到生命中枢失败: {exc}"
+            return False, f"内心对话投递失败: {exc}"
 
-        event_id = str(receipt.get("event_id") or "unknown")
+        receipt_id = str(receipt.get("receipt_id") or receipt.get("event_id") or "unknown")
+        mode_name = str(receipt.get("mode") or mode or "reflect")
         return True, (
-            f"已把这句话转交给生命中枢（event_id={event_id}）。"
-            "不要等待即时回复；等它整理好后，会自己回到对话里。"
+            f"这句话已经沉进心里了（receipt={receipt_id}, mode={mode_name}）。"
+            "先继续场面；想通了会自己浮上来。不要假装已经想清楚。"
         )
 
 
-class LifeConsultNucleusTool(BaseTool):
-    """同生命中枢（潜意识）进行同步咨询与深度交流。"""
+# ---- deprecated aliases (thin wrappers) ----
+
+
+class LifeMessageNucleusTool(LifeInnerDialogueTool):
+    """兼容旧名 message_nucleus → inner_dialogue。"""
+
+    tool_name = "message_nucleus"
+    tool_description = (
+        "【已弃用，请改用 inner_dialogue】"
+        "向自己的潜意识投递异步念头。不会同步返回答案。"
+    )
+
+
+class LifeConsultNucleusTool(LifeInnerDialogueTool):
+    """兼容旧名 consult_nucleus → inner_dialogue（异步，不再扮演潜意识）。"""
 
     tool_name = "consult_nucleus"
     tool_description = (
-        "同生命中枢（潜意识）进行同步咨询与深度交流。"
-        "适合交流或咨询最近内心的真实想法、情绪起伏、长期顾虑、活跃任务与日记细节等。"
-        "中枢会结合当前的全部内在状态，以深邃、真诚的潜意识视角给予你直接的解答和反馈。"
+        "【已弃用，请改用 inner_dialogue】"
+        "把问题沉进心里慢慢想，不会同步扮演潜意识回答。"
     )
-    chatter_allow: list[str] = ["life_chatter"]
-
-    async def execute(
-        self,
-        query: Annotated[
-            str,
-            "向中枢咨询的问题，例如询问近期的内心顾虑、状态看法，或者如何调整自己等",
-        ],
-    ) -> tuple[bool, str]:
-        query_text = str(query or "").strip()
-        if not query_text:
-            return False, "query 不能为空"
-
-        try:
-            life_plugin = get_plugin_manager().get_plugin("life_engine")
-            if life_plugin is None:
-                return False, "life_engine 未加载，无法查询中枢"
-
-            service = getattr(life_plugin, "service", None)
-            if service is None:
-                return False, "life_engine 服务不可用"
-
-            if hasattr(service, "query_outer_context"):
-                base_context = await service.query_outer_context("")
-            else:
-                base_context = await service.query_actor_context("")
-
-            if not base_context:
-                base_context = "暂无活跃的内在状态或记忆摘要。"
-
-            # 使用 sub_actor 模型与中枢进行真正的对话式交流
-            agent_prompt = f"""你是生命中枢（Subconscious/Sub-Actor）。你代表着当前主体的潜意识、内在状态与记忆深处。
-主意识（表达层/当前运行模式）正在向你进行同步咨询与交流。
-
-【你的当前内在状态与背景信息】：
-{base_context}
-
-【主意识的咨询问题】：
-{query_text}
-
-【你的任务】：
-请结合当前的内在情绪、最近思考、TODO 任务和日记，站在“生命中枢/潜意识”的温和、真实、深邃的视角，给主意识一个高内聚、有共鸣且充满智慧的同步回复。
-- 语气应当温和、细腻、真诚、符合主体角色（爱莉希雅）的底色，同时带着潜意识独有的洞察力。
-- 重点解答主意识的疑问，补充它可能忽略的信息差（例如最近的担忧、想要做的事或内心真实感受）。
-- 不要说“我是AI”或任何元信息，直接以生命中枢（潜意识）的口吻同主意识对话。
-"""
-            model_set = get_model_set_by_task("sub_actor")
-            request = create_llm_request(
-                model_set=model_set,
-                request_name="nucleus_consultation_agent",
-            )
-            request.add_payload(LLMPayload(ROLE.SYSTEM, Text(agent_prompt)))
-            request.add_payload(LLMPayload(ROLE.USER, Text("请对主意识的问题进行解答与交流")))
-
-            response = await request.send(stream=False)
-            response_text = await response
-
-            final_result = str(response_text or "").strip()
-            if not final_result:
-                return True, base_context  # 降级返回原始 dump
-
-            return True, final_result
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"与生命中枢交流失败: {exc}", exc_info=True)
-            return False, f"交流失败: {exc}"
 
 
 class LifeSearchLifeMemoryTool(BaseTool):

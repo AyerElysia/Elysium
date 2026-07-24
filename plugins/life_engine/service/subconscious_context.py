@@ -19,6 +19,7 @@ SUMMARY_SCHEMA_VERSION = 1
 _HIGH_VALUE_MESSAGE_TYPES = {
     "direct_message",
     "dfc_message",
+    "inner_dialogue",
     "proactive_opportunity",
     "autonomy_intent_due",
     "autonomy_intent_scheduled",
@@ -1075,7 +1076,7 @@ class SubconsciousContextManager:
             return 100
         if event.event_type == EventType.AGENT_RESULT:
             return 98 if event.tool_success is False else 88
-        if content_type in {"direct_message", "dfc_message"}:
+        if content_type in {"direct_message", "dfc_message", "inner_dialogue"}:
             return 95
         if content_type.startswith("autonomy_intent_"):
             return 93
