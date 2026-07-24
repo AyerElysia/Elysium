@@ -158,6 +158,7 @@ class LifeEngineService(BaseService):
             max_chars=context_budget,
         )
         self._sleep_state_active: bool = False
+        self._self_pause_skip_logged: bool = False
         self._memory_service: LifeMemoryService | None = None
         self._last_decay_date: str | None = None
 
@@ -373,6 +374,7 @@ class LifeEngineService(BaseService):
         async with self._get_lock():
             changed = self._clear_self_pause_state()
         if changed:
+            self._self_pause_skip_logged = False
             await self._save_runtime_context()
             logger.info(f"life_engine 主动休息锁已解除: source={source}")
         return changed
@@ -392,6 +394,8 @@ class LifeEngineService(BaseService):
             )
 
         await self._save_runtime_context()
+        # 进入休息只报一次；心跳循环里用此标记静默跳过，不再每 tick 刷 remaining。
+        self._self_pause_skip_logged = True
         logger.info(
             "life_engine 进入主动休息: "
             f"duration={payload['duration_minutes']}min requested={payload['requested_minutes']}min "
@@ -3930,13 +3934,18 @@ class LifeEngineService(BaseService):
                     self._self_pause_status()
                 )
                 if paused_by_self:
-                    if should_log_heartbeat:
+                    # 进入休息时 request_self_pause 已打过 INFO；心跳循环只在首次跳过时补一条，
+                    # 避免每 tick 刷 remaining=… 的重复日志。
+                    if not self._self_pause_skip_logged:
                         logger.info(
                             "life_engine heartbeat LLM 已因主动休息暂停: "
                             f"remaining={remaining_minutes}min until={paused_until} "
                             f"reason={pause_reason or '-'}"
                         )
+                        self._self_pause_skip_logged = True
                     continue
+                if self._self_pause_skip_logged:
+                    self._self_pause_skip_logged = False
                 if self._state.self_pause_until:
                     await self.clear_self_pause(source="expired")
 
