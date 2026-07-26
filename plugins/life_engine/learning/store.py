@@ -25,12 +25,16 @@ from .models import (
     InsightNextAction,
     InsightStatus,
     KnowledgeVersion,
+    ValidationExperiment,
+    EvidenceKind,
 )
+from .semantic_matcher import match_insight_pattern, semantic_overlap
 
 logger = logging.getLogger("life_engine.learning.store")
 
 LEARNING_DIR_NAME = ".life_learning"
 STORE_VERSION = 1
+EXPERIMENTS_FILE = "validation_experiments.json"
 
 # 去重相似度阈值（简单文本匹配）
 _DEDUP_OVERLAP_THRESHOLD = 0.7
@@ -56,8 +60,14 @@ class InsightStore:
         self.audit_log_path = self.root / "insights_audit.jsonl"
         self.knowledge_dir = self.root / "knowledge"
         self.state_path = self.root / "state.json"
+        self.experiments_path = self.root / EXPERIMENTS_FILE
         self._insights: list[Insight] = []
+        self._experiments: dict[str, list[ValidationExperiment]] = {
+            "pending": [],
+            "completed": [],
+        }
         self._loaded = False
+        self._experiments_loaded = False
 
     # ── 加载 / 保存 ──────────────────────────────────────────
 
@@ -167,37 +177,38 @@ class InsightStore:
     def find_reinforce_target(self, new_insight: Insight) -> Insight | None:
         """为一条新观察寻找可强化的已有洞察。
 
-        匹配逻辑：
+        匹配逻辑（使用语义匹配）：
         - 目标必须处于活跃状态（candidate/under_review/needs_more_evidence）
         - 两者都有 topic 且不同 → 不合并（明确不同主题）
-        - 同 topic → claim 重叠 ≥ 0.5 即可（捕捉改述）
-        - 无共同 topic → 需 claim 重叠 ≥ 0.7（更保守）
-        返回重叠度最高的匹配，或 None。
+        - 同 topic → claim 语义重叠 ≥ 0.5 即可（捕捉改述）
+        - 无共同 topic → 需 claim 语义重叠 ≥ 0.7（更保守）
+        返回匹配度最高的匹配，或 None。
         """
         self.load()
         if not new_insight.claim:
             return None
-        new_tokens = set(_tokenize(new_insight.claim))
-        if not new_tokens:
-            return None
 
         best: Insight | None = None
-        best_overlap = 0.0
+        best_score = 0.0
+
         for existing in self._insights:
             if existing.status not in _REINFORCEABLE_STATUSES:
                 continue
-            both_have_topic = bool(existing.topic_key) and bool(new_insight.topic_key)
-            if both_have_topic and existing.topic_key != new_insight.topic_key:
-                continue  # 明确不同主题，不合并
-            same_topic = both_have_topic and existing.topic_key == new_insight.topic_key
-            threshold = _REINFORCE_OVERLAP_WITH_TOPIC if same_topic else _REINFORCE_OVERLAP_NO_TOPIC
-            existing_tokens = set(_tokenize(existing.claim))
-            if not existing_tokens:
-                continue
-            overlap = len(new_tokens & existing_tokens) / max(len(new_tokens), 1)
-            if overlap >= threshold and overlap > best_overlap:
+
+            # 使用语义匹配算法
+            score = match_insight_pattern(
+                existing.claim,
+                new_insight.claim,
+                topic1=existing.topic_key,
+                topic2=new_insight.topic_key,
+                same_topic_threshold=0.5,
+                diff_topic_threshold=0.7,
+            )
+
+            if score > best_score:
                 best = existing
-                best_overlap = overlap
+                best_score = score
+
         return best
 
     def reinforce_insight(
@@ -343,25 +354,56 @@ class InsightStore:
             "topics": self._topic_distribution(),
         }
 
+    def get_stale_insights(self, staleness_threshold_days: int = 90) -> list[tuple[Insight, int]]:
+        """获取长期未被验证的洞察（供主体观察，不强制改变）。
+
+        **尊重主体性原则**：系统不强制遗忘，只提供观察。
+        主体可以选择：
+        - 重新验证这些洞察
+        - 发现它们仍然有效
+        - 意识到它们已过时
+        - 或者保持原样
+
+        Args:
+            staleness_threshold_days: 陈旧阈值（天），默认90天
+
+        Returns:
+            (洞察, 陈旧天数) 列表，按陈旧程度排序
+        """
+        self.load()
+        stale_insights: list[tuple[Insight, int]] = []
+
+        for ins in self._insights:
+            if ins.status != InsightStatus.VALIDATED.value:
+                continue
+
+            staleness = ins.get_staleness_days()
+            if staleness >= staleness_threshold_days:
+                stale_insights.append((ins, staleness))
+
+        # 按陈旧程度排序
+        stale_insights.sort(key=lambda x: x[1], reverse=True)
+        return stale_insights
+
     # ── 去重与冷却 ───────────────────────────────────────────
 
     def _is_duplicate(self, new_insight: Insight) -> bool:
-        """简单文本重叠度去重。"""
+        """使用语义重叠度去重。"""
         if not new_insight.claim:
             return False
-        new_tokens = set(_tokenize(new_insight.claim))
+
         for existing in self._insights:
             if existing.status in (InsightStatus.ARCHIVED.value,):
                 continue
             if existing.topic_key and new_insight.topic_key:
                 if existing.topic_key != new_insight.topic_key:
                     continue
-            existing_tokens = set(_tokenize(existing.claim))
-            if not existing_tokens:
-                continue
-            overlap = len(new_tokens & existing_tokens) / max(len(new_tokens), 1)
+
+            # 使用语义匹配，阈值 0.7（去重比强化更严格）
+            overlap = semantic_overlap(existing.claim, new_insight.claim)
             if overlap >= _DEDUP_OVERLAP_THRESHOLD:
                 return True
+
         return False
 
     def _topic_distribution(self) -> dict[str, int]:
@@ -460,6 +502,195 @@ class InsightStore:
             json.dumps(state, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+
+    # ── 验证实验管理 ────────────────────────────────────────────
+
+    def _load_experiments(self) -> None:
+        """加载验证实验数据。"""
+        if self._experiments_loaded:
+            return
+        self._ensure_dirs()
+        if not self.experiments_path.exists():
+            self._experiments = {"pending": [], "completed": []}
+            self._experiments_loaded = True
+            return
+        try:
+            raw = json.loads(self.experiments_path.read_text(encoding="utf-8"))
+            pending = raw.get("pending", [])
+            completed = raw.get("completed", [])
+            self._experiments = {
+                "pending": [
+                    ValidationExperiment.from_dict(e) for e in pending if isinstance(e, dict)
+                ],
+                "completed": [
+                    ValidationExperiment.from_dict(e) for e in completed if isinstance(e, dict)
+                ],
+            }
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning(f"加载验证实验失败: {exc}")
+            self._experiments = {"pending": [], "completed": []}
+        self._experiments_loaded = True
+
+    def _save_experiments(self) -> None:
+        """保存验证实验数据。"""
+        self._ensure_dirs()
+        payload = {
+            "version": STORE_VERSION,
+            "updated_at": _now_iso(),
+            "pending": [e.to_dict() for e in self._experiments["pending"]],
+            "completed": [e.to_dict() for e in self._experiments["completed"]],
+        }
+        temp = self.experiments_path.with_suffix(".json.tmp")
+        temp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temp.replace(self.experiments_path)
+
+    def add_validation_experiment(self, exp: ValidationExperiment) -> bool:
+        """添加验证实验到待验证队列。
+
+        Args:
+            exp: 验证实验
+
+        Returns:
+            是否成功添加
+        """
+        self._load_experiments()
+        # 检查是否已存在
+        for existing in self._experiments["pending"]:
+            if existing.experiment_id == exp.experiment_id:
+                logger.info(f"验证实验 {exp.experiment_id} 已存在")
+                return False
+        self._experiments["pending"].append(exp)
+        self._save_experiments()
+        logger.info(f"✅ 添加验证实验: {exp.hypothesis[:50]}...")
+        return True
+
+    def list_pending_experiments(self, insight_id: str | None = None) -> list[ValidationExperiment]:
+        """列出待验证的实验。
+
+        Args:
+            insight_id: 可选，只列出与特定洞察相关的实验
+
+        Returns:
+            待验证实验列表
+        """
+        self._load_experiments()
+        if insight_id:
+            return [e for e in self._experiments["pending"] if e.insight_id == insight_id]
+        return list(self._experiments["pending"])
+
+    def list_completed_experiments(self, insight_id: str | None = None) -> list[ValidationExperiment]:
+        """列出已完成的实验。
+
+        Args:
+            insight_id: 可选，只列出与特定洞察相关的实验
+
+        Returns:
+            已完成实验列表
+        """
+        self._load_experiments()
+        if insight_id:
+            return [e for e in self._experiments["completed"] if e.insight_id == insight_id]
+        return list(self._experiments["completed"])
+
+    def get_experiment(self, experiment_id: str) -> ValidationExperiment | None:
+        """获取实验（pending 或 completed）。"""
+        self._load_experiments()
+        for exp in self._experiments["pending"]:
+            if exp.experiment_id == experiment_id:
+                return exp
+        for exp in self._experiments["completed"]:
+            if exp.experiment_id == experiment_id:
+                return exp
+        return None
+
+    def complete_experiment(
+        self,
+        experiment_id: str,
+        actual_outcome: str,
+        result_type: str,
+        notes: str = "",
+    ) -> bool:
+        """完成验证实验，生成证据并反馈到洞察。
+
+        **尊重主体性**：由主体或用户主动调用，不自动触发。
+
+        Args:
+            experiment_id: 实验ID
+            actual_outcome: 实际结果描述
+            result_type: "confirmed" | "contradicted" | "inconclusive"
+            notes: 补充说明
+
+        Returns:
+            是否成功完成
+        """
+        self._load_experiments()
+        self.load()
+
+        # 找到实验
+        exp = None
+        for i, e in enumerate(self._experiments["pending"]):
+            if e.experiment_id == experiment_id:
+                exp = e
+                self._experiments["pending"].pop(i)
+                break
+
+        if exp is None:
+            logger.warning(f"验证实验 {experiment_id} 不存在或已完成")
+            return False
+
+        # 更新实验状态
+        exp.actual_outcome = actual_outcome
+        exp.result_type = result_type
+        exp.completed_at = _now_iso()
+        exp.notes = notes
+        self._experiments["completed"].append(exp)
+
+        # 生成证据
+        supports = result_type == "confirmed"
+        weight = 2.0  # 验证实验的证据权重更高
+
+        evidence = Evidence.create(
+            kind=EvidenceKind.VALIDATION_EXPERIMENT,
+            description=f"预测: {exp.hypothesis}\n实际: {actual_outcome}\n结果: {result_type}",
+            source_ref=experiment_id,
+            supports=supports,
+            weight=weight,
+            context=notes,
+        )
+
+        # 添加证据到洞察
+        insight = self.get_insight(exp.insight_id)
+        if insight:
+            insight.add_evidence(evidence)
+
+            # 如果被否定，记录反例挑战
+            if result_type == "contradicted":
+                insight.record_contradiction()
+                logger.info(
+                    f"❌ 洞察被现实否定 [{insight.insight_id}]: {insight.claim[:40]}... "
+                    f"(contradiction_count={insight.contradiction_count})"
+                )
+            elif result_type == "confirmed":
+                logger.info(
+                    f"✅ 洞察被现实确认 [{insight.insight_id}]: {insight.claim[:40]}..."
+                )
+
+            self._save()
+
+        self._save_experiments()
+
+        self._append_audit({
+            "action": "validation_experiment_completed",
+            "experiment_id": experiment_id,
+            "insight_id": exp.insight_id,
+            "result_type": result_type,
+            "supports": supports,
+        })
+
+        return True
 
 
 # ── 工具函数 ──────────────────────────────────────────────────

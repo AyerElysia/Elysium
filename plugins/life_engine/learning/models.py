@@ -19,16 +19,6 @@ from uuid import uuid4
 # ── 枚举 ──────────────────────────────────────────────────────
 
 
-class InsightCategory(str, Enum):
-    """洞察类别。"""
-
-    SOCIAL_STRATEGY = "social_strategy"          # 社交互动策略
-    SELF_KNOWLEDGE = "self_knowledge"            # 自我认知
-    BEHAVIORAL_PATTERN = "behavioral_pattern"    # 行为模式
-    EMOTIONAL_PATTERN = "emotional_pattern"      # 情感模式
-    COMMUNICATION_STYLE = "communication_style"  # 沟通风格
-
-
 class InsightStatus(str, Enum):
     """洞察生命周期状态。
 
@@ -65,6 +55,8 @@ class EvidenceKind(str, Enum):
     COUNTER_EXAMPLE = "counter_example"            # 反例
     EXTERNAL_FEEDBACK = "external_feedback"        # 外部反馈
     DREAM_INSIGHT = "dream_insight"                # 梦境启发
+    VALIDATION_EXPERIMENT = "validation_experiment" # 验证实验：将预测转化为可测试的结果
+    EMBODIED_VALIDATION = "embodied_validation"    # 具身验证：Minecraft等环境中的实测
 
 
 class AuditVerdict(str, Enum):
@@ -191,7 +183,7 @@ class Insight:
     """
 
     insight_id: str
-    category: str              # InsightCategory value
+    category: str              # 自由命名，无枚举约束
     claim: str                 # 洞察陈述
     rationale: str             # 为什么这么认为
     constraints: str           # 适用边界
@@ -203,10 +195,12 @@ class Insight:
     confidence: float = 0.3
     born_at: str = field(default_factory=_now_iso)
     updated_at: str = field(default_factory=_now_iso)
+    last_validated_at: str = ""  # 最后一次被验证通过的时间
     review_count: int = 0
     max_reviews: int = 3
     touch_count: int = 0       # 被触碰次数
     last_touched_at: str = ""
+    contradiction_count: int = 0  # 被反例挑战的次数
     anti_bias_flags: list[str] = field(default_factory=list)
     audit_history: list[AuditRecord] = field(default_factory=list)
     revision_note: str = ""    # 修正说明
@@ -234,7 +228,7 @@ class Insight:
 
         return cls(
             insight_id=str(data.get("insight_id", "") or _gen_id("ins")),
-            category=str(data.get("category", "") or InsightCategory.SELF_KNOWLEDGE.value),
+            category=str(data.get("category", "") or ""),
             claim=str(data.get("claim", "") or ""),
             rationale=str(data.get("rationale", "") or ""),
             constraints=str(data.get("constraints", "") or ""),
@@ -246,10 +240,12 @@ class Insight:
             confidence=max(0.0, min(1.0, float(data.get("confidence", 0.3) or 0.3))),
             born_at=str(data.get("born_at", "") or _now_iso()),
             updated_at=str(data.get("updated_at", "") or _now_iso()),
+            last_validated_at=str(data.get("last_validated_at", "") or ""),
             review_count=int(data.get("review_count", 0) or 0),
             max_reviews=int(data.get("max_reviews", 3) or 3),
             touch_count=int(data.get("touch_count", 0) or 0),
             last_touched_at=str(data.get("last_touched_at", "") or ""),
+            contradiction_count=int(data.get("contradiction_count", 0) or 0),
             anti_bias_flags=anti_bias,
             audit_history=audit_history,
             revision_note=str(data.get("revision_note", "") or ""),
@@ -259,7 +255,7 @@ class Insight:
     def create(
         cls,
         *,
-        category: InsightCategory | str,
+        category: str,
         claim: str,
         rationale: str,
         constraints: str = "",
@@ -269,7 +265,7 @@ class Insight:
     ) -> "Insight":
         return cls(
             insight_id=_gen_id("ins"),
-            category=category.value if isinstance(category, InsightCategory) else str(category),
+            category=str(category).strip(),
             claim=str(claim or "").strip(),
             rationale=str(rationale or "").strip(),
             constraints=str(constraints or "").strip(),
@@ -319,6 +315,85 @@ class Insight:
     def record_touch(self) -> None:
         self.touch_count += 1
         self.last_touched_at = _now_iso()
+
+    def record_contradiction(self) -> None:
+        """记录一次反例挑战"""
+        self.contradiction_count += 1
+        self.updated_at = _now_iso()
+
+    def get_staleness_days(self) -> int:
+        """计算距上次验证的天数"""
+        if not self.last_validated_at:
+            # 未验证过的，用创建时间
+            ref_time = self.born_at
+        else:
+            ref_time = self.last_validated_at
+
+        try:
+            ref_dt = datetime.fromisoformat(ref_time)
+            now = datetime.now(timezone.utc).astimezone()
+            return (now - ref_dt).days
+        except (ValueError, TypeError):
+            return 0
+
+
+@dataclass(slots=True)
+class ValidationExperiment:
+    """验证实验：将洞察转化为可测试的预测。
+
+    借鉴 VibeGamer 的 runExperiment，为洞察提供真实世界反馈闭环。
+    """
+
+    experiment_id: str
+    insight_id: str
+    hypothesis: str           # 可测试的预测："如果...那么..."
+    test_scenario: str        # 测试场景描述
+    expected_outcome: str     # 预期结果
+    created_at: str
+    actual_outcome: str = ""  # 实际结果（填写后）
+    result_type: str = ""     # "confirmed" / "contradicted" / "inconclusive"
+    completed_at: str = ""
+    notes: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ValidationExperiment":
+        return cls(
+            experiment_id=str(data.get("experiment_id", "") or _gen_id("exp")),
+            insight_id=str(data.get("insight_id", "") or ""),
+            hypothesis=str(data.get("hypothesis", "") or ""),
+            test_scenario=str(data.get("test_scenario", "") or ""),
+            expected_outcome=str(data.get("expected_outcome", "") or ""),
+            created_at=str(data.get("created_at", "") or _now_iso()),
+            actual_outcome=str(data.get("actual_outcome", "") or ""),
+            result_type=str(data.get("result_type", "") or ""),
+            completed_at=str(data.get("completed_at", "") or ""),
+            notes=str(data.get("notes", "") or ""),
+        )
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        insight_id: str,
+        hypothesis: str,
+        test_scenario: str,
+        expected_outcome: str,
+    ) -> "ValidationExperiment":
+        return cls(
+            experiment_id=_gen_id("exp"),
+            insight_id=insight_id,
+            hypothesis=hypothesis,
+            test_scenario=test_scenario,
+            expected_outcome=expected_outcome,
+            created_at=_now_iso(),
+        )
+
+    @property
+    def is_completed(self) -> bool:
+        return bool(self.result_type and self.completed_at)
 
 
 @dataclass(slots=True)

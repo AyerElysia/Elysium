@@ -34,9 +34,7 @@ REFLECTION_SYSTEM_PROMPT = """\
 
 4. **质量优先**：每次最多提出 2 条洞察。没有值得记录的，就输出空列表。
 
-5. **两类洞察**：
-   - 交互洞察（social_strategy / communication_style）：关于与人互动的模式
-   - 内省洞察（self_knowledge / behavioral_pattern / emotional_pattern）：关于自己的模式
+5. **洞察可以是任何维度**：关于与人互动的、关于自己的、关于情绪节奏的、关于任何你注意到的。你自己命名类别。
 
 6. **复现即证据**：如果你观察到的模式与下方“已有洞察”中的某条相符，仍然请报告它（用你这次的视角重新描述 claim）。
    系统会把它作为新的确认证据合并进那条洞察，而不会创建重复。同一模式在不同情境中反复出现，正是它成立的依据。
@@ -48,7 +46,7 @@ REFLECTION_SYSTEM_PROMPT = """\
 {
   "insights": [
     {
-      "category": "social_strategy | self_knowledge | behavioral_pattern | emotional_pattern | communication_style",
+      "category": "你自己命名的类别标签，2-6个字，描述这条洞察属于什么维度",
       "claim": "洞察陈述，一句话，可验证",
       "rationale": "为什么这么认为（基于刚才的经历）",
       "constraints": "适用边界：什么情况下成立，什么情况下不成立",

@@ -143,10 +143,11 @@ class InsightAuditor:
                 reason=f"审计通过: {record.reasoning[:100]}",
                 audit_record=record,
             )
-            # 更新置信度
+            # 更新置信度和验证时间
             ins = self._store.get_insight(insight.insight_id)
             if ins:
                 ins.confidence = max(ins.confidence, record.evidence_sufficiency)
+                ins.last_validated_at = _now_iso()
                 self._store.update_insight(ins)
 
         elif verdict == AuditVerdict.REJECTED.value:

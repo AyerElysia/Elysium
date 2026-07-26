@@ -24,7 +24,7 @@ import json_repair
 from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
 from src.kernel.llm import LLMPayload, ROLE, Text
 
-from .models import Evidence, EvidenceKind, Insight, InsightCategory
+from .models import Evidence, EvidenceKind, Insight
 from .prompts import (
     REFLECTION_INTERACTION_USER,
     REFLECTION_INTROSPECTION_USER,
@@ -37,8 +37,6 @@ logger = logging.getLogger("life_engine.learning.reflection")
 
 # 反思冷却（秒）
 _DEFAULT_COOLDOWN_SECONDS = 30 * 60  # 30 分钟
-# 单次最多提取洞察数
-_MAX_INSIGHTS_PER_REFLECTION = 2
 
 
 class ReflectionEngine:
@@ -164,7 +162,7 @@ class ReflectionEngine:
 
         # 门禁 + 写入（优先强化已有洞察，其次新建）
         results: list[Insight] = []
-        for candidate in candidates[:_MAX_INSIGHTS_PER_REFLECTION]:
+        for candidate in candidates:
             candidate.source_events = source_event_ids
 
             # 优先尝试强化：同一模式在不同情境复现 → 累积为确认证据
@@ -243,9 +241,8 @@ class ReflectionEngine:
                     weight=1.0,
                 ))
 
-            # 映射 category
-            category_str = str(item.get("category", "") or "").strip()
-            category = _map_category(category_str)
+            # category: 她写什么就是什么，不做映射
+            category = str(item.get("category", "") or "").strip()
 
             insight = Insight.create(
                 category=category,
@@ -275,22 +272,14 @@ class ReflectionEngine:
         return format_existing_insights_summary("\n".join(lines))
 
     def _build_skill_section(self) -> str:
-        """构建技能目录段（注入反思 prompt）。"""
+        """构建技能反馈段落。"""
         if self._skill_store is None:
             return ""
-        try:
-            catalog = self._skill_store.get_catalog_text(max_chars=500)
-        except Exception:  # noqa: BLE001
+        skills = getattr(self._skill_store, "list_skills", lambda: [])()
+        if not skills:
             return ""
-        if not catalog:
-            return ""
-        return (
-            "\n<your_skills>\n"
-            f"{catalog}\n"
-            "</your_skills>\n\n"
-            "在这段交互中，你有没有用到上面某种做事方式？效果如何？\n"
-            "如果你注意到了（无论好坏），简短记录即可。这不是考试，只是留意。\n"
-        )
+        skill_names = [s.get("name", "") for s in skills if isinstance(s, dict)]
+        return f"\n<your_skills>\n{', '.join(skill_names)}\n</your_skills>\n"
 
     def _process_skill_feedback(self, raw_text: str) -> None:
         """解析 LLM 返回中的 skill_feedback 并记录观察。"""
@@ -321,13 +310,3 @@ class ReflectionEngine:
             logger.debug(f"📝 技能反馈记录: {skill_name} -> {observation[:60]}")
 
 
-def _map_category(raw: str) -> InsightCategory:
-    """将 LLM 输出的 category 字符串映射为枚举。"""
-    mapping = {
-        "social_strategy": InsightCategory.SOCIAL_STRATEGY,
-        "self_knowledge": InsightCategory.SELF_KNOWLEDGE,
-        "behavioral_pattern": InsightCategory.BEHAVIORAL_PATTERN,
-        "emotional_pattern": InsightCategory.EMOTIONAL_PATTERN,
-        "communication_style": InsightCategory.COMMUNICATION_STYLE,
-    }
-    return mapping.get(raw.strip().lower(), InsightCategory.SELF_KNOWLEDGE)

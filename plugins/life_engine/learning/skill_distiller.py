@@ -25,7 +25,7 @@ import json_repair
 from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
 from src.kernel.llm import LLMPayload, ROLE, Text
 
-from .models import Insight, InsightCategory, InsightNextAction, InsightStatus
+from .models import Insight, InsightNextAction, InsightStatus
 from .prompts import (
     SKILL_DISTILL_SYSTEM,
     SKILL_DISTILL_USER,
@@ -37,13 +37,6 @@ from .skill_store import SkillMaturity, SkillPattern, SkillStore
 from .store import InsightStore
 
 logger = logging.getLogger("life_engine.learning.skill_distiller")
-
-# 属于"技能"类别的洞察（会进入蒸馏）
-_SKILL_CATEGORIES = {
-    InsightCategory.SOCIAL_STRATEGY.value,
-    InsightCategory.COMMUNICATION_STYLE.value,
-    InsightCategory.BEHAVIORAL_PATTERN.value,
-}
 
 # 默认参数
 _DEFAULT_TRIGGER_COUNT = 3       # 触发蒸馏的 validated 技能类洞察数
@@ -103,7 +96,7 @@ class SkillDistiller:
         async with self._lock:
             distillable = self._collect_distillable_insights()
             if not distillable:
-                logger.debug("无可蒸馏的技能类 validated 洞察")
+                logger.debug("无可蒸馏的程序性记忆类 validated 洞察")
                 return False
 
             logger.info(f"🔧 开始技能蒸馏: {len(distillable)} 条 validated 洞察")
@@ -183,12 +176,11 @@ class SkillDistiller:
     # ── 内部方法 ─────────────────────────────────────────────
 
     def _collect_distillable_insights(self) -> list[Insight]:
-        """收集属于技能类别的 validated 且待蒸馏的洞察。"""
+        """收集所有 validated 且待蒸馏的洞察。"""
         validated = self._store.list_by_status(InsightStatus.VALIDATED)
         return [
             ins for ins in validated
-            if ins.category in _SKILL_CATEGORIES
-            and ins.next_action != InsightNextAction.ARCHIVE.value
+            if ins.next_action != InsightNextAction.ARCHIVE.value
         ]
 
     def _find_matching_skill(

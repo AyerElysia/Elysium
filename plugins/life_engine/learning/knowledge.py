@@ -96,7 +96,6 @@ class SelfKnowledgeCompressor:
 
     def should_compress(self) -> bool:
         """判断是否应该触发压缩。"""
-        # 检查 validated 且待 promote 的数量
         promotable = self._store.list_for_compression()
         if len(promotable) >= self._trigger_count:
             return True
@@ -133,7 +132,8 @@ class SelfKnowledgeCompressor:
                 current_knowledge = _INITIAL_KNOWLEDGE
 
             # 2. 收集 rejected 反例（最近 5 条）
-            rejected = self._store.list_by_status(InsightStatus.REJECTED)[-5:]
+            all_rejected = self._store.list_by_status(InsightStatus.REJECTED)
+            rejected = all_rejected[-5:]
 
             # 3. 调用 LLM 压缩
             new_content = await self._compress(

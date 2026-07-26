@@ -21,11 +21,11 @@ from .models import (
     Evidence,
     EvidenceKind,
     Insight,
-    InsightCategory,
     InsightNextAction,
     InsightStatus,
     KnowledgeVersion,
     LearningMetricsPoint,
+    ValidationExperiment,
 )
 from .store import InsightStore
 from .reflection import ReflectionEngine
@@ -45,11 +45,11 @@ __all__ = [
     "Evidence",
     "EvidenceKind",
     "Insight",
-    "InsightCategory",
     "InsightNextAction",
     "InsightStatus",
     "KnowledgeVersion",
     "LearningMetricsPoint",
+    "ValidationExperiment",
     # Core
     "InsightStore",
     "ReflectionEngine",

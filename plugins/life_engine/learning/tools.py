@@ -16,7 +16,7 @@ from src.app.plugin_system.api import log_api
 from src.app.plugin_system.base import BaseTool
 
 from ..core.config import LifeEngineConfig
-from .models import Evidence, EvidenceKind, InsightStatus
+from .models import Evidence, EvidenceKind, InsightStatus, ValidationExperiment
 from .store import InsightStore
 
 logger = log_api.get_logger("life_engine.learning")
@@ -261,9 +261,227 @@ class LifeViewKnowledgeTool(BaseTool):
         return True, result
 
 
+class LifeObserveStaleInsightsTool(BaseTool):
+    """观察久未验证的洞察（不强制改变）。
+
+    **尊重主体性**：系统只提供观察，你自己决定如何处理：
+    - 可以重新验证它们
+    - 可以发现它们仍然有效
+    - 可以意识到它们已过时
+    - 或者保持原样
+    """
+
+    tool_name: str = "nucleus_observe_stale_insights"
+    tool_description: str = (
+        "观察那些很久没有被验证的洞察（默认90天）。"
+        "系统不会强制改变它们，只是提醒你关注。"
+        "你可以选择重新审视、保持原样、或让它们自然淡化。"
+    )
+    chatter_allow: list[str] = ["life_engine_internal"]
+
+    async def execute(
+        self,
+        threshold_days: Annotated[int, "陈旧阈值（天），默认90"] = 90,
+        max_results: Annotated[int, "最多返回几条，默认10"] = 10,
+    ) -> tuple[bool, str | dict]:
+        workspace = _get_workspace(self.plugin)
+        store = InsightStore(workspace)
+        store.load()
+
+        stale_insights = store.get_stale_insights(staleness_threshold_days=threshold_days)
+
+        if not stale_insights:
+            return True, {
+                "action": "observe_stale_insights",
+                "count": 0,
+                "message": f"没有超过 {threshold_days} 天未验证的洞察。",
+            }
+
+        # 限制返回数量
+        stale_insights = stale_insights[:max_results]
+
+        insights_data = []
+        for insight, staleness_days in stale_insights:
+            insights_data.append({
+                "insight_id": insight.insight_id,
+                "category": insight.category,
+                "claim": insight.claim,
+                "staleness_days": staleness_days,
+                "confidence": insight.confidence,
+                "evidence_count": len(insight.evidence),
+                "last_validated_at": insight.last_validated_at or insight.born_at,
+            })
+
+        return True, {
+            "action": "observe_stale_insights",
+            "count": len(insights_data),
+            "total_stale": len(store.get_stale_insights(threshold_days)),
+            "threshold_days": threshold_days,
+            "insights": insights_data,
+            "note": (
+                "这些洞察已经很久没有被新的经历验证了。"
+                "你可以选择：重新验证、保持原样、或用 nucleus_challenge_insight 质疑它们。"
+            ),
+        }
+
+
+class LifeListValidationExperimentsTool(BaseTool):
+    """查看验证实验（预测与现实的对比）。
+
+    这些实验让你能验证自己的洞察是否与现实一致。
+    """
+
+    tool_name: str = "nucleus_list_validation_experiments"
+    tool_description: str = (
+        "查看待验证或已完成的验证实验。"
+        "验证实验是将你的洞察转化为可测试的预测，"
+        "让你能通过实际交互结果来检验认知是否准确。"
+    )
+    chatter_allow: list[str] = ["life_engine_internal"]
+
+    async def execute(
+        self,
+        status: Annotated[str, "pending|completed|all，默认pending"] = "pending",
+        max_results: Annotated[int, "最多返回几条，默认10"] = 10,
+    ) -> tuple[bool, str | dict]:
+        workspace = _get_workspace(self.plugin)
+        store = InsightStore(workspace)
+        store.load()
+
+        if status == "pending":
+            experiments = store.list_pending_experiments()
+        elif status == "completed":
+            experiments = store.list_completed_experiments()
+        else:  # all
+            experiments = store.list_pending_experiments() + store.list_completed_experiments()
+
+        if not experiments:
+            return True, {
+                "action": "list_validation_experiments",
+                "status": status,
+                "count": 0,
+                "message": f"没有{status}状态的验证实验。",
+            }
+
+        experiments = experiments[:max_results]
+        experiments_data = []
+
+        for exp in experiments:
+            # 找到关联的洞察
+            insight = store.get_insight(exp.insight_id)
+            insight_claim = insight.claim if insight else "（洞察已删除）"
+
+            exp_data = {
+                "experiment_id": exp.experiment_id,
+                "insight_id": exp.insight_id,
+                "insight_claim": insight_claim,
+                "hypothesis": exp.hypothesis,
+                "test_scenario": exp.test_scenario,
+                "expected_outcome": exp.expected_outcome,
+                "created_at": exp.created_at,
+            }
+
+            if exp.is_completed:
+                exp_data.update({
+                    "actual_outcome": exp.actual_outcome,
+                    "result_type": exp.result_type,
+                    "completed_at": exp.completed_at,
+                    "notes": exp.notes,
+                })
+
+            experiments_data.append(exp_data)
+
+        return True, {
+            "action": "list_validation_experiments",
+            "status": status,
+            "count": len(experiments_data),
+            "total": len(experiments),
+            "experiments": experiments_data,
+            "note": (
+                "这些实验让你能验证洞察是否与现实一致。"
+                "对于 pending 的实验，当相关交互发生后，"
+                "用 nucleus_complete_validation_experiment 来记录结果。"
+            ),
+        }
+
+
+class LifeCompleteValidationExperimentTool(BaseTool):
+    """完成一个验证实验的评估。
+
+    **尊重主体性**：由你自己决定何时评估、如何评估。
+    """
+
+    tool_name: str = "nucleus_complete_validation_experiment"
+    tool_description: str = (
+        "完成一个验证实验的评估。"
+        "在相关交互发生后，你可以回顾实际结果，"
+        "判断预测是否准确（confirmed/contradicted/inconclusive）。"
+        "系统会将结果作为高权重证据反馈到原洞察。"
+    )
+    chatter_allow: list[str] = ["life_engine_internal"]
+
+    async def execute(
+        self,
+        experiment_id: Annotated[str, "实验ID"],
+        actual_outcome: Annotated[str, "实际发生了什么"],
+        result_type: Annotated[
+            str,
+            "confirmed（预测准确）| contradicted（预测错误）| inconclusive（无法判断）",
+        ],
+        notes: Annotated[str, "补充说明（可选）"] = "",
+    ) -> tuple[bool, str | dict]:
+        workspace = _get_workspace(self.plugin)
+        store = InsightStore(workspace)
+
+        # 验证 result_type
+        valid_types = {"confirmed", "contradicted", "inconclusive"}
+        if result_type not in valid_types:
+            return False, {
+                "error": f"result_type 必须是 {valid_types} 之一",
+            }
+
+        success = store.complete_experiment(
+            experiment_id=experiment_id,
+            actual_outcome=actual_outcome,
+            result_type=result_type,
+            notes=notes,
+        )
+
+        if not success:
+            return False, {
+                "action": "complete_validation_experiment",
+                "error": "实验不存在或已完成",
+                "experiment_id": experiment_id,
+            }
+
+        # 获取完成后的实验
+        exp = store.get_experiment(experiment_id)
+        insight = store.get_insight(exp.insight_id) if exp else None
+
+        return True, {
+            "action": "complete_validation_experiment",
+            "experiment_id": experiment_id,
+            "result_type": result_type,
+            "insight_id": exp.insight_id if exp else None,
+            "insight_claim": insight.claim if insight else None,
+            "message": (
+                f"实验已完成。结果: {result_type}。"
+                f"证据已添加到洞察 [{exp.insight_id if exp else ''}]。"
+                + (
+                    "\n⚠️ 洞察被现实否定，你可以用 nucleus_challenge_insight 重新审视它。"
+                    if result_type == "contradicted"
+                    else ""
+                )
+            ),
+        }
+
+
 LEARNING_TOOLS = [
     LifeReflectNowTool,
     LifeListInsightsTool,
     LifeChallengeInsightTool,
     LifeViewKnowledgeTool,
+    LifeObserveStaleInsightsTool,
+    LifeListValidationExperimentsTool,
+    LifeCompleteValidationExperimentTool,
 ]

@@ -24,6 +24,8 @@ from .reflection import ReflectionEngine
 from .skill_distiller import SkillDistiller
 from .skill_store import SkillStore
 from .store import InsightStore
+from ..minecraft.consciousness import MinecraftSession
+from ..minecraft.launcher import MCConfig
 
 logger = logging.getLogger("life_engine.learning.scheduler")
 
@@ -36,6 +38,8 @@ _DEFAULT_REFLECTION_COOLDOWN_MINUTES = 30.0
 _DEFAULT_METRICS_INTERVAL_HOURS = 12.0
 _DEFAULT_SKILL_DISTILL_TRIGGER_COUNT = 3
 _DEFAULT_SKILL_DISTILL_INTERVAL_HOURS = 24.0
+_DEFAULT_STALENESS_CHECK_INTERVAL_HOURS = 168.0  # 每周检查一次
+_DEFAULT_STALENESS_THRESHOLD_DAYS = 90
 
 
 class LearningScheduler:
@@ -62,6 +66,12 @@ class LearningScheduler:
         # 技能蒸馏参数
         skill_distill_trigger_count: int = _DEFAULT_SKILL_DISTILL_TRIGGER_COUNT,
         skill_distill_interval_hours: float = _DEFAULT_SKILL_DISTILL_INTERVAL_HOURS,
+        # 陈旧检查参数
+        staleness_check_interval_hours: float = _DEFAULT_STALENESS_CHECK_INTERVAL_HOURS,
+        staleness_threshold_days: int = _DEFAULT_STALENESS_THRESHOLD_DAYS,
+        # Minecraft 参数
+        minecraft_enabled: bool = False,
+        minecraft_config: dict[str, Any] | None = None,
     ) -> None:
         self._workspace = Path(workspace_path).resolve()
         self._model_task_name = model_task_name
@@ -99,13 +109,32 @@ class LearningScheduler:
         )
         self.metrics = LearningMetrics(store=self.store)
 
+        # Minecraft 具身体验
+        self.minecraft_session: MinecraftSession | None = None
+        if minecraft_enabled:
+            # 过滤掉非 MCConfig 字段（如 vla_model）
+            _mc_fields = {f.name for f in MCConfig.__dataclass_fields__.values()} if hasattr(MCConfig, "__dataclass_fields__") else set()
+            _mc_raw = minecraft_config or {}
+            _mc_kwargs = {k: v for k, v in _mc_raw.items() if not _mc_fields or k in _mc_fields}
+            mc_cfg = MCConfig(**_mc_kwargs)
+
+            self.minecraft_session = MinecraftSession(
+                workspace=self._workspace,
+                mc_config=mc_cfg,
+                llm_helper=None,  # TODO: 可选注入 LLM 辅助意图解析
+            )
+            logger.info("Minecraft 具身体验已初始化（对话式控制）")
+
         # 调度参数
         self._audit_interval_hours = max(1.0, audit_interval_hours)
         self._metrics_interval_hours = max(1.0, metrics_interval_hours)
+        self._staleness_check_interval_hours = max(24.0, staleness_check_interval_hours)
+        self._staleness_threshold_days = max(30, staleness_threshold_days)
 
         self._running = False
         self._last_audit_at: str = ""
         self._last_metrics_at: str = ""
+        self._last_staleness_check_at: str = ""
 
     # ── 事件驱动入口 ─────────────────────────────────────────
 
@@ -152,7 +181,7 @@ class LearningScheduler:
     # ── 心跳驱动入口 ─────────────────────────────────────────
 
     async def on_heartbeat(self) -> None:
-        """心跳触发：检查是否需要执行审计/压缩/蒸馏/指标快照。
+        """心跳触发：检查是否需要执行审计/压缩/蒸馏/指标快照/陈旧检查。
 
         由 life_engine 心跳周期调用（低频，不必每次心跳都调用）。
         """
@@ -161,6 +190,7 @@ class LearningScheduler:
             await self._maybe_run_compression()
             await self._maybe_run_distillation()
             await self._maybe_snapshot_metrics()
+            await self._maybe_check_staleness()
         except Exception as exc:
             logger.warning(f"学习调度心跳异常: {exc}")
 
@@ -202,6 +232,32 @@ class LearningScheduler:
         state["last_metrics_at"] = self._last_metrics_at
         self.store.save_state(state)
 
+    async def _maybe_check_staleness(self) -> None:
+        """定期观察陈旧洞察（不强制改变）。
+
+        **尊重主体性**：系统只提供观察，不强制遗忘。
+        主体在心跳时会看到这些信息，自己决定如何处理。
+        """
+        if not self._should_check_staleness():
+            return
+
+        stale_insights = self.store.get_stale_insights(
+            staleness_threshold_days=self._staleness_threshold_days
+        )
+
+        if stale_insights:
+            # 只记录观察，不改变状态
+            logger.info(
+                f"📊 观察到 {len(stale_insights)} 条洞察已久未验证 "
+                f"(≥{self._staleness_threshold_days}天)"
+            )
+            # 这些信息会在心跳 prompt 中可见，供主体观察
+
+        self._last_staleness_check_at = _now_iso()
+        state = self.store.load_state()
+        state["last_staleness_check_at"] = self._last_staleness_check_at
+        self.store.save_state(state)
+
     # ── 调度判断 ─────────────────────────────────────────────
 
     def _should_audit(self) -> bool:
@@ -234,6 +290,20 @@ class LearningScheduler:
             now = datetime.now(timezone.utc).astimezone()
             hours_elapsed = (now - last_dt).total_seconds() / 3600.0
             return hours_elapsed >= self._metrics_interval_hours
+        except (ValueError, TypeError):
+            return True
+
+    def _should_check_staleness(self) -> bool:
+        """是否应该检查陈旧洞察。"""
+        state = self.store.load_state()
+        last_check = state.get("last_staleness_check_at", "")
+        if not last_check:
+            return True
+        try:
+            last_dt = datetime.fromisoformat(last_check)
+            now = datetime.now(timezone.utc).astimezone()
+            hours_elapsed = (now - last_dt).total_seconds() / 3600.0
+            return hours_elapsed >= self._staleness_check_interval_hours
         except (ValueError, TypeError):
             return True
 
