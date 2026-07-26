@@ -131,7 +131,6 @@ class TestRouterManager:
             router_cls = manager.get_router_class("nonexistent:router:test")
             assert router_cls is None
 
-    @pytest.mark.asyncio
     async def test_mount_router(self, manager, http_server, plugin, registry):
         """测试挂载 Router。"""
         # 使用 patch 模拟 get_http_server 返回测试服务器
@@ -152,7 +151,6 @@ class TestRouterManager:
             mounted_router = manager.get_mounted_router(signature)
             assert mounted_router is router
 
-    @pytest.mark.asyncio
     async def test_mount_router_already_mounted(self, manager, http_server, plugin, registry):
         """测试挂载已挂载的 Router。"""
         with patch("src.core.managers.router_manager.get_global_registry") as mock_registry, \
@@ -167,7 +165,6 @@ class TestRouterManager:
             with pytest.raises(RuntimeError, match="Router 已挂载"):
                 await manager.mount_router(signature, plugin)
 
-    @pytest.mark.asyncio
     async def test_mount_router_not_found(self, manager, http_server, plugin, registry):
         """测试挂载不存在的 Router。"""
         with patch("src.core.managers.router_manager.get_global_registry") as mock_registry, \
@@ -179,7 +176,6 @@ class TestRouterManager:
             with pytest.raises(ValueError, match="Router 类未找到"):
                 await manager.mount_router("nonexistent:router:test", plugin)
 
-    @pytest.mark.asyncio
     async def test_unmount_router(self, manager, http_server, plugin, registry):
         """测试卸载 Router。"""
         with patch("src.core.managers.router_manager.get_global_registry") as mock_registry, \
@@ -201,13 +197,11 @@ class TestRouterManager:
             assert signature not in manager.get_all_mounted_routers()
             router.shutdown.assert_called_once()
 
-    @pytest.mark.asyncio
     async def test_unmount_router_not_mounted(self, manager):
         """测试卸载未挂载的 Router。"""
         # 不应该报错
         await manager.unmount_router("nonexistent:router:test")
 
-    @pytest.mark.asyncio
     async def test_mount_plugin_routers(self, manager, http_server, plugin, registry):
         """测试挂载插件的所有 Router。"""
         with patch("src.core.managers.router_manager.get_global_registry") as mock_registry, \
@@ -221,7 +215,6 @@ class TestRouterManager:
             assert len(routers) == 2
             assert len(manager.get_all_mounted_routers()) == 2
 
-    @pytest.mark.asyncio
     async def test_unmount_plugin_routers(self, manager, http_server, plugin, registry):
         """测试卸载插件的所有 Router。"""
         with patch("src.core.managers.router_manager.get_global_registry") as mock_registry, \
@@ -237,7 +230,6 @@ class TestRouterManager:
             await manager.unmount_plugin_routers("test_plugin")
             assert len(manager.get_all_mounted_routers()) == 0
 
-    @pytest.mark.asyncio
     async def test_unmount_all_routers(self, manager, http_server, plugin, registry):
         """测试卸载所有 Router。"""
         with patch("src.core.managers.router_manager.get_global_registry") as mock_registry, \
@@ -253,7 +245,6 @@ class TestRouterManager:
             await manager.unmount_all_routers()
             assert len(manager.get_all_mounted_routers()) == 0
 
-    @pytest.mark.asyncio
     async def test_mount_all_routers(self, manager, http_server, plugin, registry):
         """测试挂载所有已加载插件的 Router。"""
         mock_plugin_manager = Mock()
@@ -293,7 +284,6 @@ class TestRouterManager:
             info_list = manager.get_all_router_info()
             assert len(info_list) == 2
 
-    @pytest.mark.asyncio
     async def test_reload_router(self, manager, http_server, plugin, registry):
         """测试重新加载 Router。"""
         with patch("src.core.managers.router_manager.get_global_registry") as mock_registry, \

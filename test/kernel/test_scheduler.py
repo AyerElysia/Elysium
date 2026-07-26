@@ -31,7 +31,6 @@ class TestScheduler:
         yield
         await get_unified_scheduler().stop()
 
-    @pytest.mark.asyncio
     async def test_delayed_task(self):
         """测试延迟任务"""
         executed = []
@@ -59,7 +58,6 @@ class TestScheduler:
         task_info = await get_unified_scheduler().get_task_info(schedule_id)
         assert task_info is None  # 一次性任务完成后会自动移除
 
-    @pytest.mark.asyncio
     async def test_recurring_task(self):
         """测试循环任务"""
         executed = []
@@ -85,7 +83,6 @@ class TestScheduler:
         # 清理
         await get_unified_scheduler().remove_schedule(schedule_id)
 
-    @pytest.mark.asyncio
     async def test_custom_trigger(self):
         """测试自定义条件触发"""
         executed = []
@@ -117,7 +114,6 @@ class TestScheduler:
         # 清理
         await get_unified_scheduler().remove_schedule(schedule_id)
 
-    @pytest.mark.asyncio
     async def test_task_with_params(self):
         """测试带参数的任务"""
         executed = []
@@ -141,7 +137,6 @@ class TestScheduler:
         assert len(executed) == 1
         assert executed[0] == (1, 2, 3)
 
-    @pytest.mark.asyncio
     async def test_remove_task(self):
         """测试移除任务"""
         executed = []
@@ -165,7 +160,6 @@ class TestScheduler:
         await asyncio.sleep(1)
         assert len(executed) == 0
 
-    @pytest.mark.asyncio
     async def test_pause_resume_task(self):
         """测试暂停和恢复任务"""
         executed = []
@@ -203,7 +197,6 @@ class TestScheduler:
         # 清理
         await get_unified_scheduler().remove_schedule(schedule_id)
 
-    @pytest.mark.asyncio
     async def test_manual_trigger(self):
         """测试手动触发任务"""
         executed = []
@@ -226,7 +219,6 @@ class TestScheduler:
         # 验证任务已执行
         assert len(executed) == 1
 
-    @pytest.mark.asyncio
     async def test_list_tasks(self):
         """测试列出任务"""
         # 创建多个任务
@@ -260,7 +252,6 @@ class TestScheduler:
         await get_unified_scheduler().remove_schedule(task1_id)
         await get_unified_scheduler().remove_schedule(task2_id)
 
-    @pytest.mark.asyncio
     async def test_statistics(self):
         """测试统计信息"""
         # 创建循环任务（这样不会自动移除）
@@ -314,7 +305,6 @@ class TestSchedulerTimeUtils:
         scheduled = datetime(2026, 2, 2, 12, 0, 0)
         assert next_after(now, scheduled, 0.0) == now
 
-    @pytest.mark.asyncio
     async def test_find_by_name(self):
         """测试按名称查找任务"""
         # 创建任务
@@ -336,7 +326,6 @@ class TestSchedulerTimeUtils:
         # 清理
         await get_unified_scheduler().remove_schedule(schedule_id)
 
-    @pytest.mark.asyncio
     async def test_task_timeout(self):
         """测试任务超时"""
         async def timeout_task():
@@ -362,7 +351,6 @@ class TestSchedulerTimeUtils:
         stats = get_unified_scheduler().get_statistics()
         assert stats["total_timeouts"] >= 1
 
-    @pytest.mark.asyncio
     async def test_task_failure(self):
         """测试任务失败"""
         async def failing_task():
@@ -387,7 +375,6 @@ class TestSchedulerTimeUtils:
         stats = get_unified_scheduler().get_statistics()
         assert stats["total_failures"] >= 1
 
-    @pytest.mark.asyncio
     async def test_task_retry(self):
         """测试任务重试"""
         attempt_count = 0
@@ -418,7 +405,6 @@ class TestSchedulerTimeUtils:
         task_info = await get_unified_scheduler().get_task_info(schedule_id)
         assert task_info is None
 
-    @pytest.mark.asyncio
     async def test_force_overwrite(self):
         """测试强制覆盖同名任务"""
         executed1 = []
@@ -466,7 +452,6 @@ class TestSchedulerTimeUtils:
         # 清理
         await get_unified_scheduler().remove_schedule(schedule_id)
 
-    @pytest.mark.asyncio
     async def test_task_execution_methods(self):
         """测试TaskExecution的各种方法"""
         execution = TaskExecution(execution_id="test_id", started_at=datetime.now())
@@ -492,7 +477,6 @@ class TestSchedulerTimeUtils:
         assert execution3.status == TaskStatus.CANCELLED
         assert execution3.ended_at is not None
 
-    @pytest.mark.asyncio
     async def test_schedule_task_methods(self):
         """测试ScheduleTask的各种方法"""
         async def dummy_callback():
@@ -540,7 +524,6 @@ class TestSchedulerTimeUtils:
         assert len(task.execution_history) == 1
         assert task.trigger_count == 1
 
-    @pytest.mark.asyncio
     async def test_recurring_task_finish_execution(self):
         """测试循环任务完成执行后状态变为PENDING"""
         async def dummy_callback():
@@ -562,7 +545,6 @@ class TestSchedulerTimeUtils:
         assert task.status == TaskStatus.PENDING
         assert task.current_execution is None
 
-    @pytest.mark.asyncio
     async def test_trigger_at_specified_time(self):
         """测试在指定时间触发任务"""
         executed = []
@@ -588,7 +570,6 @@ class TestSchedulerTimeUtils:
         task_info = await get_unified_scheduler().get_task_info(schedule_id)
         assert task_info is None
 
-    @pytest.mark.asyncio
     async def test_recurring_task_with_interval_seconds(self):
         """测试使用interval_seconds的循环任务"""
         executed = []
@@ -610,7 +591,6 @@ class TestSchedulerTimeUtils:
 
         await get_unified_scheduler().remove_schedule(schedule_id)
 
-    @pytest.mark.asyncio
     async def test_remove_schedule_by_name(self):
         """测试按名称移除任务"""
         executed = []
@@ -637,7 +617,6 @@ class TestSchedulerTimeUtils:
         result2 = await get_unified_scheduler().remove_schedule_by_name("non_existent_task")
         assert result2 is False
 
-    @pytest.mark.asyncio
     async def test_event_trigger(self):
         """测试事件触发"""
         executed = []
@@ -669,7 +648,6 @@ class TestSchedulerTimeUtils:
         # 清理
         await get_unified_scheduler().remove_schedule(schedule_id)
 
-    @pytest.mark.asyncio
     async def test_synchronous_callback(self):
         """测试同步函数作为callback"""
         executed = []
@@ -688,7 +666,6 @@ class TestSchedulerTimeUtils:
 
         assert len(executed) == 1
 
-    @pytest.mark.asyncio
     async def test_scheduler_config(self):
         """测试SchedulerConfig配置"""
         config = SchedulerConfig(
@@ -710,7 +687,6 @@ class TestSchedulerTimeUtils:
         assert default_config.check_interval == 1.0
         assert default_config.task_default_timeout == 300.0
 
-    @pytest.mark.asyncio
     async def test_scheduler_start_when_already_running(self):
         """测试调度器已运行时再次调用start"""
         # 调度器已在setup中启动，再次启动不应报错
@@ -719,14 +695,12 @@ class TestSchedulerTimeUtils:
         stats = get_unified_scheduler().get_statistics()
         assert stats["is_running"] is True
 
-    @pytest.mark.asyncio
     async def test_scheduler_stop_when_not_running(self):
         """测试调度器未运行时调用stop"""
         scheduler = UnifiedScheduler()
         # 不应该抛出异常
         await scheduler.stop()
 
-    @pytest.mark.asyncio
     async def test_create_schedule_without_start(self):
         """测试未启动调度器时创建任务"""
         scheduler = UnifiedScheduler()
@@ -743,7 +717,6 @@ class TestSchedulerTimeUtils:
                 task_name="test_error",
             )
 
-    @pytest.mark.asyncio
     async def test_event_trigger_without_event_name(self):
         """测试事件触发缺少event_name"""
         async def dummy_task():
@@ -757,7 +730,6 @@ class TestSchedulerTimeUtils:
                 task_name="test_no_event_name",
             )
 
-    @pytest.mark.asyncio
     async def test_task_info_with_zero_success_count(self):
         """测试任务信息中成功次数为0时的平均执行时间"""
         async def failing_task():
@@ -776,25 +748,21 @@ class TestSchedulerTimeUtils:
         # 失败的任务会被移除，所以应该返回None
         assert task_info is None
 
-    @pytest.mark.asyncio
     async def test_trigger_nonexistent_task(self):
         """测试触发不存在的任务"""
         result = await get_unified_scheduler().trigger_schedule("nonexistent_id")
         assert result is False
 
-    @pytest.mark.asyncio
     async def test_pause_nonexistent_task(self):
         """测试暂停不存在的任务"""
         result = await get_unified_scheduler().pause_schedule("nonexistent_id")
         assert result is False
 
-    @pytest.mark.asyncio
     async def test_resume_nonexistent_task(self):
         """测试恢复不存在的任务"""
         result = await get_unified_scheduler().resume_schedule("nonexistent_id")
         assert result is False
 
-    @pytest.mark.asyncio
     async def test_pause_running_task(self):
         """测试暂停正在运行的任务"""
         async def long_running_task():
@@ -825,7 +793,6 @@ class TestSchedulerTimeUtils:
         # 清理
         await get_unified_scheduler().remove_schedule(schedule_id)
 
-    @pytest.mark.asyncio
     async def test_resume_non_paused_task(self):
         """测试恢复未暂停的任务"""
         async def dummy_task():
@@ -844,13 +811,11 @@ class TestSchedulerTimeUtils:
 
         await get_unified_scheduler().remove_schedule(schedule_id)
 
-    @pytest.mark.asyncio
     async def test_trigger_event_with_no_subscribers(self):
         """测试触发没有订阅者的事件"""
         # 不应该抛出异常
         await get_unified_scheduler().trigger_event("nonexistent_event")
 
-    @pytest.mark.asyncio
     async def test_list_tasks_with_filters(self):
         """测试带过滤器列出任务"""
         # 创建不同状态和类型的任务
@@ -891,7 +856,6 @@ class TestSchedulerTimeUtils:
         await get_unified_scheduler().remove_schedule(task1_id)
         await get_unified_scheduler().remove_schedule(task2_id)
 
-    @pytest.mark.asyncio
     async def test_custom_trigger_with_invalid_condition(self):
         """测试自定义触发器条件函数无效"""
         executed = []
@@ -914,7 +878,6 @@ class TestSchedulerTimeUtils:
 
         await get_unified_scheduler().remove_schedule(schedule_id)
 
-    @pytest.mark.asyncio
     async def test_custom_trigger_with_exception(self):
         """测试自定义条件函数抛出异常"""
         executed = []
@@ -939,7 +902,6 @@ class TestSchedulerTimeUtils:
 
         await get_unified_scheduler().remove_schedule(schedule_id)
 
-    @pytest.mark.asyncio
     async def test_task_execution_history_limit(self):
         """测试执行历史记录限制"""
         async def quick_task():
@@ -964,7 +926,6 @@ class TestSchedulerTimeUtils:
 
         await get_unified_scheduler().remove_schedule(schedule_id)
 
-    @pytest.mark.asyncio
     async def test_remove_running_task(self):
         """测试移除正在运行的任务"""
         executed = []
@@ -991,7 +952,6 @@ class TestSchedulerTimeUtils:
         task_info = await get_unified_scheduler().get_task_info(schedule_id)
         assert task_info is None
 
-    @pytest.mark.asyncio
     async def test_task_info_details(self):
         """测试任务信息的详细内容"""
         async def detailed_task(a, b):
@@ -1026,7 +986,6 @@ class TestSchedulerTimeUtils:
 
         await get_unified_scheduler().remove_schedule(schedule_id)
 
-    @pytest.mark.asyncio
     async def test_statistics_with_running_tasks(self):
         """测试统计信息中包含运行中的任务"""
         async def long_task():
@@ -1051,7 +1010,6 @@ class TestSchedulerTimeUtils:
         # 清理
         await get_unified_scheduler().remove_schedule(schedule_id)
 
-    @pytest.mark.asyncio
     async def test_force_overwrite_non_active_task(self):
         """测试覆盖非活跃任务"""
         async def dummy_task():
@@ -1080,7 +1038,6 @@ class TestSchedulerTimeUtils:
 
         await get_unified_scheduler().remove_schedule(schedule_id2)
 
-    @pytest.mark.asyncio
     async def test_schedule_task_without_task_name(self):
         """测试创建任务时不指定task_name"""
         async def dummy_task():
@@ -1100,7 +1057,6 @@ class TestSchedulerTimeUtils:
 
         await get_unified_scheduler().remove_schedule(schedule_id)
 
-    @pytest.mark.asyncio
     async def test_finish_execution_without_current(self):
         """测试finish_execution在没有current_execution时的行为"""
         async def dummy_callback():
@@ -1122,7 +1078,6 @@ class TestSchedulerTimeUtils:
         assert task.status == TaskStatus.PENDING
         assert task.current_execution is None
 
-    @pytest.mark.asyncio
     async def test_recurring_task_with_trigger_at_and_interval(self):
         """测试循环任务使用trigger_at和interval_seconds"""
         executed = []
@@ -1149,7 +1104,6 @@ class TestSchedulerTimeUtils:
 
         await get_unified_scheduler().remove_schedule(schedule_id)
 
-    @pytest.mark.asyncio
     async def test_manual_trigger_with_exception(self):
         """测试手动触发任务时发生异常"""
         async def failing_task():
@@ -1166,7 +1120,6 @@ class TestSchedulerTimeUtils:
         result = await get_unified_scheduler().trigger_schedule(schedule_id)
         assert result is False  # 失败的任务返回False
 
-    @pytest.mark.asyncio
     async def test_recurring_task_failure_with_max_retries(self):
         """测试循环任务失败但达到最大重试次数"""
         attempt_count = 0
@@ -1192,7 +1145,6 @@ class TestSchedulerTimeUtils:
 
         await get_unified_scheduler().remove_schedule(schedule_id)
 
-    @pytest.mark.asyncio
     async def test_event_task_timeout(self):
         """测试事件任务超时"""
         async def timeout_handler(**kwargs):
@@ -1218,7 +1170,6 @@ class TestSchedulerTimeUtils:
         stats = get_unified_scheduler().get_statistics()
         assert stats["total_timeouts"] >= 1
 
-    @pytest.mark.asyncio
     async def test_event_task_failure(self):
         """测试事件任务失败"""
         async def failing_handler(**kwargs):
@@ -1245,7 +1196,6 @@ class TestSchedulerTimeUtils:
 
         await get_unified_scheduler().remove_schedule(schedule_id)
 
-    @pytest.mark.asyncio
     async def test_is_active_method(self):
         """测试is_active方法的各种状态"""
         async def dummy_callback():
@@ -1279,7 +1229,6 @@ class TestSchedulerTimeUtils:
         task.status = TaskStatus.PAUSED
         assert task.is_active() is False
 
-    @pytest.mark.asyncio
     async def test_can_trigger_method(self):
         """测试can_trigger方法"""
         async def dummy_callback():
@@ -1306,7 +1255,6 @@ class TestSchedulerTimeUtils:
         task.status = TaskStatus.COMPLETED
         assert task.can_trigger() is False
 
-    @pytest.mark.asyncio
     async def test_scheduler_with_custom_config(self):
         """测试自定义配置的调度器"""
         config = SchedulerConfig(
@@ -1343,7 +1291,6 @@ class TestSchedulerTimeUtils:
         await scheduler.remove_schedule(schedule_id)
         await scheduler.stop()
 
-    @pytest.mark.asyncio
     async def test_event_trigger_sync_callback(self):
         """测试事件触发使用同步回调"""
         executed = []

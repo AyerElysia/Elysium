@@ -63,7 +63,6 @@ def test_chunk_collection_identity_is_versioned_by_model_and_dimension() -> None
     }
 
 
-@pytest.mark.asyncio
 async def test_named_collection_lookup_is_exact_and_does_not_create(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -92,7 +91,6 @@ async def test_named_collection_lookup_is_exact_and_does_not_create(
     assert vector_service._collections == {"exact-name": collection}
 
 
-@pytest.mark.asyncio
 async def test_worker_batches_embeddings_and_one_off_loop_upsert(tmp_path: Path) -> None:
     db = _db(tmp_path)
     second = upsert_document_rows(
@@ -194,7 +192,6 @@ async def test_worker_batches_embeddings_and_one_off_loop_upsert(tmp_path: Path)
     assert active_state.version == 1
 
 
-@pytest.mark.asyncio
 async def test_worker_retries_failed_embedding_job(tmp_path: Path) -> None:
     db = _db(tmp_path)
     indexed = upsert_document_rows(db, "notes/retry.md", "retry body", "Retry", now=2.0)
@@ -244,7 +241,6 @@ async def test_worker_retries_failed_embedding_job(tmp_path: Path) -> None:
     assert len(recorder.calls) == 1
 
 
-@pytest.mark.asyncio
 async def test_worker_rejects_embedding_identity_drift_after_activation(
     tmp_path: Path,
 ) -> None:
@@ -284,7 +280,6 @@ async def test_worker_rejects_embedding_identity_drift_after_activation(
     assert len(recorder.calls) == 1
 
 
-@pytest.mark.asyncio
 async def test_worker_rejects_collection_name_drift_before_upsert(tmp_path: Path) -> None:
     db = _db(tmp_path)
     first = upsert_document_rows(db, "notes/first.md", "first body", now=2.0)
@@ -319,7 +314,6 @@ async def test_worker_rejects_collection_name_drift_before_upsert(tmp_path: Path
     assert len(recorder.calls) == 1
 
 
-@pytest.mark.asyncio
 async def test_worker_reclaims_abandoned_processing_job(tmp_path: Path) -> None:
     db = _db(tmp_path)
     indexed = upsert_document_rows(db, "notes/reclaim.md", "reclaim body", now=1.0)
@@ -344,7 +338,6 @@ async def test_worker_reclaims_abandoned_processing_job(tmp_path: Path) -> None:
     assert (row["status"], row["attempts"]) == ("completed", 2)
 
 
-@pytest.mark.asyncio
 async def test_worker_marks_collection_resolver_errors_failed(tmp_path: Path) -> None:
     db = _db(tmp_path)
     indexed = upsert_document_rows(db, "notes/resolver.md", "resolver body", now=2.0)
@@ -368,7 +361,6 @@ async def test_worker_marks_collection_resolver_errors_failed(tmp_path: Path) ->
     assert (row["status"], row["error"]) == ("failed", "LookupError")
 
 
-@pytest.mark.asyncio
 async def test_worker_drops_payload_updated_while_embedding(tmp_path: Path) -> None:
     db = _db(tmp_path)
     old = upsert_document_rows(
@@ -433,7 +425,6 @@ async def test_worker_drops_payload_updated_while_embedding(tmp_path: Path) -> N
     assert node["embedding_updated_at"] is None
 
 
-@pytest.mark.asyncio
 async def test_worker_exports_only_valid_document_bodies(tmp_path: Path) -> None:
     db = _db(tmp_path)
     valid_body = "ordinary valid body reaches the worker outputs"
@@ -555,7 +546,6 @@ async def test_worker_exports_only_valid_document_bodies(tmp_path: Path) -> None
         )
 
 
-@pytest.mark.asyncio
 async def test_worker_never_exports_malformed_chunk_identity(tmp_path: Path) -> None:
     db = _db(tmp_path)
     indexed = upsert_document_rows(
@@ -587,7 +577,6 @@ async def test_worker_never_exports_malformed_chunk_identity(tmp_path: Path) -> 
     assert recorder.calls == []
 
 
-@pytest.mark.asyncio
 async def test_worker_revalidates_invalid_identity_after_delayed_embedding(
     tmp_path: Path,
 ) -> None:
@@ -641,7 +630,6 @@ async def test_worker_revalidates_invalid_identity_after_delayed_embedding(
     assert (row["status"], row["error"]) == ("stale", "InvalidDocumentIdentity")
 
 
-@pytest.mark.asyncio
 async def test_worker_revalidates_deleted_identity_before_embedding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -694,7 +682,6 @@ async def test_worker_revalidates_deleted_identity_before_embedding(
     assert (row["status"], row["error"]) == ("stale", "InvalidDocumentIdentity")
 
 
-@pytest.mark.asyncio
 async def test_tombstones_are_created_on_document_update(tmp_path: Path) -> None:
     """Updating a document writes old chunk IDs to memory_vector_tombstones."""
     db = _db(tmp_path)
@@ -706,7 +693,6 @@ async def test_tombstones_are_created_on_document_update(tmp_path: Path) -> None
     assert len(rows) > 0
 
 
-@pytest.mark.asyncio
 async def test_tombstones_are_created_on_document_delete(tmp_path: Path) -> None:
     """Deleting a document writes chunk IDs to memory_vector_tombstones."""
     from plugins.life_engine.memory.indexing import delete_document_rows
@@ -717,7 +703,6 @@ async def test_tombstones_are_created_on_document_delete(tmp_path: Path) -> None
     assert len(rows) > 0
 
 
-@pytest.mark.asyncio
 async def test_consume_tombstones_calls_collection_delete(tmp_path: Path) -> None:
     """consume_vector_tombstones forwards tombstoned IDs to collection.delete."""
     from plugins.life_engine.memory.indexing import delete_document_rows
@@ -745,7 +730,6 @@ async def test_consume_tombstones_calls_collection_delete(tmp_path: Path) -> Non
     assert rows == []
 
 
-@pytest.mark.asyncio
 async def test_consume_tombstones_handles_collection_delete_error(tmp_path: Path) -> None:
     """consume_vector_tombstones swallows collection.delete errors gracefully."""
     from plugins.life_engine.memory.indexing import delete_document_rows

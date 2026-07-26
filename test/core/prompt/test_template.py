@@ -22,7 +22,6 @@ class TestPromptTemplate:
         assert tmpl.template == "Hello {name}"
         assert tmpl.values == {}
 
-    @pytest.mark.asyncio
     async def test_template_set_and_build(self) -> None:
         """Test setting values and building."""
         tmpl = PromptTemplate(
@@ -32,14 +31,12 @@ class TestPromptTemplate:
         result = await tmpl.set("name", "Alice").set("age", 25).build()
         assert result == "Hello Alice, you are 25 years old"
 
-    @pytest.mark.asyncio
     async def test_template_set_chaining(self) -> None:
         """Test that set returns self for chaining."""
         tmpl = PromptTemplate(name="test", template="{a} {b} {c}")
         result = await tmpl.set("a", 1).set("b", 2).set("c", 3).build()
         assert result == "1 2 3"
 
-    @pytest.mark.asyncio
     async def test_template_with_policy(self) -> None:
         """Test template with render policy."""
         tmpl = PromptTemplate(
@@ -50,7 +47,6 @@ class TestPromptTemplate:
         result = await tmpl.set("name", "Alice").set("bio", "A developer").build()
         assert result == "Name: Alice\nAbout:\nA developer"
 
-    @pytest.mark.asyncio
     async def test_template_policy_with_empty_value(self) -> None:
         """Test that policy handles empty values."""
         tmpl = PromptTemplate(
@@ -96,7 +92,6 @@ class TestPromptTemplate:
         tmpl.clear()
         assert len(tmpl.values) == 0
 
-    @pytest.mark.asyncio
     async def test_template_build_strict_mode_missing_key(self) -> None:
         """Test build in strict mode with missing key."""
         tmpl = PromptTemplate(name="test", template="{a} {b}")
@@ -105,7 +100,6 @@ class TestPromptTemplate:
         with pytest.raises(KeyError):
             await tmpl.build(strict=True)
 
-    @pytest.mark.asyncio
     async def test_template_build_non_strict_mode(self) -> None:
         """Test build in non-strict mode (default)."""
         tmpl = PromptTemplate(name="test", template="{a} {b}")
@@ -114,7 +108,6 @@ class TestPromptTemplate:
         result = await tmpl.build(strict=False)
         assert result == "1 "
 
-    @pytest.mark.asyncio
     async def test_template_build_default_non_strict(self) -> None:
         """Test that default build is non-strict."""
         tmpl = PromptTemplate(name="test", template="{a} {b}")
@@ -154,7 +147,6 @@ class TestPromptTemplate:
         assert tmpl.values["name"] == "  Alice  "
         assert clone.values["name"] == "Bob"
 
-    @pytest.mark.asyncio
     async def test_template_with_values(self) -> None:
         """Test creating new template with values."""
         tmpl = PromptTemplate(name="test", template="{name} {age}")
@@ -178,7 +170,6 @@ class TestPromptTemplate:
         assert "name='test'" in repr_str
         assert "values" in repr_str
 
-    @pytest.mark.asyncio
     async def test_template_complex_policies(self) -> None:
         """Test template with complex policy chains."""
         tmpl = PromptTemplate(
@@ -200,7 +191,6 @@ class TestPromptTemplate:
         assert "This is a long enough context" in result2
         assert "# 相关内容" in result2
 
-    @pytest.mark.asyncio
     async def test_template_with_list_value(self) -> None:
         """Test template with list value."""
         from src.core.prompt.policies import join_blocks
@@ -214,7 +204,6 @@ class TestPromptTemplate:
         result = await tmpl.set("items", ["apple", "banana", "cherry"]).build()
         assert result == "Items:\napple\nbanana\ncherry"
 
-    @pytest.mark.asyncio
     async def test_template_with_nested_placeholder(self) -> None:
         """Test template with dot notation placeholder.
 
@@ -229,7 +218,6 @@ class TestPromptTemplate:
         result = await tmpl.set("user_name", "Alice").set("user_age", 25).build()
         assert result == "Alice is 25 years old"
 
-    @pytest.mark.asyncio
     async def test_template_special_characters(self) -> None:
         """Test template with special characters."""
         tmpl = PromptTemplate(
@@ -251,7 +239,6 @@ class TestOnPromptBuildEvent:
         for handler in bus.get_subscribers(PROMPT_BUILD_EVENT):
             bus.unsubscribe(PROMPT_BUILD_EVENT, handler)
 
-    @pytest.mark.asyncio
     async def test_build_fires_event(self) -> None:
         """build 应触发 on_prompt_build 事件并将元数据广播给订阅者。"""
         received: list[dict] = []
@@ -271,7 +258,6 @@ class TestOnPromptBuildEvent:
         assert received[0]["template"] == "Hello {name}"
         assert received[0]["values"]["name"] == "World"
 
-    @pytest.mark.asyncio
     async def test_build_subscriber_can_modify_values(self) -> None:
         """订阅者修改 values 后，build 应使用修改后的值渲染。"""
 
@@ -287,7 +273,6 @@ class TestOnPromptBuildEvent:
 
         assert result == "Hi Alice！"
 
-    @pytest.mark.asyncio
     async def test_build_subscriber_can_modify_template(self) -> None:
         """订阅者修改 template 后，build 应使用修改后的模板渲染。"""
 
@@ -303,7 +288,6 @@ class TestOnPromptBuildEvent:
 
         assert result == "Goodbye Bob"
 
-    @pytest.mark.asyncio
     async def test_build_subscriber_exception_is_silenced(self) -> None:
         """订阅者抛出异常时，build 应静默降级并使用原始数据渲染。"""
 
@@ -317,14 +301,12 @@ class TestOnPromptBuildEvent:
         result = await tmpl.set("name", "Charlie").build()
         assert result == "Hello Charlie"
 
-    @pytest.mark.asyncio
     async def test_build_no_subscriber_skips_event(self) -> None:
         """无订阅者时，build 应直接渲染，不触发事件调度。"""
         tmpl = PromptTemplate(name="no_sub_test", template="{greeting} {who}")
         result = await tmpl.set("greeting", "Hey").set("who", "there").build()
         assert result == "Hey there"
 
-    @pytest.mark.asyncio
     async def test_build_event_params_contain_correct_keys(self) -> None:
         """on_prompt_build 事件 params 必须包含所有规定的字段。"""
         received_keys: list[set] = []

@@ -16,7 +16,6 @@ def _make_tool() -> LifeEngineFetchChatHistoryTool:
     return LifeEngineFetchChatHistoryTool(plugin=plugin)  # type: ignore[arg-type]
 
 
-@pytest.mark.asyncio
 async def test_fetch_chat_history_auto_merge_dedup(monkeypatch: pytest.MonkeyPatch) -> None:
     """auto 模式下应合并本地与回补，并做去重。"""
     tool = _make_tool()
@@ -123,7 +122,6 @@ async def test_fetch_chat_history_auto_merge_dedup(monkeypatch: pytest.MonkeyPat
     assert len(payload["tool_events"]) == 1
 
 
-@pytest.mark.asyncio
 async def test_fetch_chat_history_auto_does_not_backfill_without_force(monkeypatch: pytest.MonkeyPatch) -> None:
     """auto 模式默认不应偷偷触发 NapCat 回补，保持当前流检索轻量。"""
     tool = _make_tool()
@@ -150,7 +148,6 @@ async def test_fetch_chat_history_auto_does_not_backfill_without_force(monkeypat
     assert payload["stats"]["backfill_attempted"] is False
 
 
-@pytest.mark.asyncio
 async def test_fetch_chat_history_without_chat_stream_uses_latest_external_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -199,7 +196,6 @@ async def test_fetch_chat_history_without_chat_stream_uses_latest_external_strea
     ]
 
 
-@pytest.mark.asyncio
 async def test_fetch_chat_history_local_db_no_backfill(monkeypatch: pytest.MonkeyPatch) -> None:
     """local_db 模式下不应触发回补。"""
     tool = _make_tool()
@@ -223,7 +219,6 @@ async def test_fetch_chat_history_local_db_no_backfill(monkeypatch: pytest.Monke
     assert payload["stats"]["backfill_attempted"] is False
 
 
-@pytest.mark.asyncio
 async def test_fetch_chat_history_invalid_regex_returns_error() -> None:
     """非法正则应返回错误。"""
     tool = _make_tool()

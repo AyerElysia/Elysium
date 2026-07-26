@@ -87,7 +87,6 @@ def test_surface_tts_text_caps_long_punctuation_free_runs() -> None:
     assert "".join(segments) == text
 
 
-@pytest.mark.asyncio
 async def test_user_text_enters_core_sink_as_canonical_message() -> None:
     sink = _DummySink()
     gateway = _FakeGateway()
@@ -118,7 +117,6 @@ async def test_user_text_enters_core_sink_as_canonical_message() -> None:
     assert envelope["message_info"]["extra"]["bypass_message_buffer"] is True
 
 
-@pytest.mark.asyncio
 async def test_user_audio_enters_core_as_validated_voice_attachment() -> None:
     sink = _DummySink()
     gateway = _FakeGateway()
@@ -162,7 +160,6 @@ async def test_user_audio_enters_core_as_validated_voice_attachment() -> None:
     assert message.attachments[0].media_ref.data == wav_audio
 
 
-@pytest.mark.asyncio
 async def test_user_screen_enters_core_as_proactive_image_attachment() -> None:
     sink = _DummySink()
     gateway = _FakeGateway()
@@ -217,7 +214,6 @@ async def test_user_screen_enters_core_as_proactive_image_attachment() -> None:
     assert message.extra["is_proactive_vision"] is True
 
 
-@pytest.mark.asyncio
 async def test_outgoing_message_without_tts_service_stays_text_only(monkeypatch) -> None:
     gateway = _FakeGateway()
     adapter = NekoSurfaceAdapter(
@@ -249,7 +245,6 @@ async def test_outgoing_message_without_tts_service_stays_text_only(monkeypatch)
     assert gateway.events[0][1]["turn_id"] == "reply-1"
 
 
-@pytest.mark.asyncio
 async def test_outgoing_surface_text_gets_one_automatic_higgs_voice(monkeypatch) -> None:
     gateway = _FakeGateway()
     adapter = NekoSurfaceAdapter(
@@ -289,7 +284,6 @@ async def test_outgoing_surface_text_gets_one_automatic_higgs_voice(monkeypatch)
     assert voice_payload["speech_id"] == "reply-tts-1"
 
 
-@pytest.mark.asyncio
 async def test_outgoing_surface_text_streams_sentence_voices_in_order(monkeypatch) -> None:
     gateway = _FakeGateway()
     adapter = NekoSurfaceAdapter(
@@ -329,7 +323,6 @@ async def test_outgoing_surface_text_streams_sentence_voices_in_order(monkeypatc
     ]
 
 
-@pytest.mark.asyncio
 async def test_slow_surface_tts_does_not_block_text_delivery(monkeypatch) -> None:
     gateway = _FakeGateway()
     adapter = NekoSurfaceAdapter(
@@ -384,7 +377,6 @@ async def test_slow_surface_tts_does_not_block_text_delivery(monkeypatch) -> Non
     ]
 
 
-@pytest.mark.asyncio
 async def test_split_reply_synthesizes_in_parallel_but_publishes_voice_in_order(
     monkeypatch,
 ) -> None:
@@ -458,7 +450,6 @@ async def test_split_reply_synthesizes_in_parallel_but_publishes_voice_in_order(
     assert gateway.events[5][1]["payload"]["speech_id"] == "reply-part-2"
 
 
-@pytest.mark.asyncio
 async def test_new_user_turn_cancels_old_surface_tts(monkeypatch) -> None:
     sink = _DummySink()
     gateway = _FakeGateway()
@@ -522,7 +513,6 @@ async def test_new_user_turn_cancels_old_surface_tts(monkeypatch) -> None:
     ]
 
 
-@pytest.mark.asyncio
 async def test_explicit_voice_segment_is_not_auto_synthesized(monkeypatch) -> None:
     gateway = _FakeGateway()
     adapter = NekoSurfaceAdapter(

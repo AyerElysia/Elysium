@@ -140,7 +140,6 @@ def test_create_rerank_request(model_set: ModelSet) -> None:
     assert request.top_n == 1
 
 
-@pytest.mark.asyncio
 async def test_embedding_request_send(model_set: ModelSet) -> None:
     request = EmbeddingRequest(
         model_set=model_set,
@@ -155,7 +154,6 @@ async def test_embedding_request_send(model_set: ModelSet) -> None:
     assert response.model_name == "test-model"
 
 
-@pytest.mark.asyncio
 async def test_rerank_request_send(model_set: ModelSet) -> None:
     request = RerankRequest(
         model_set=model_set,

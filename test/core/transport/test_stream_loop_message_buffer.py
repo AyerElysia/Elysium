@@ -86,7 +86,6 @@ def test_message_buffer_check_bypasses_for_internal_sync_message(
     assert context.message_buffer_skip_count == 0
 
 
-@pytest.mark.asyncio
 async def test_distributor_does_not_reset_message_buffer_skip_count(monkeypatch: pytest.MonkeyPatch) -> None:
     """收到新消息时不应清零 skip_count，否则高压群聊会无限缓冲。"""
 
@@ -154,7 +153,6 @@ async def test_distributor_does_not_reset_message_buffer_skip_count(monkeypatch:
     assert unread_messages == [message]
 
 
-@pytest.mark.asyncio
 async def test_distributor_starts_loop_before_slow_persistence(monkeypatch: pytest.MonkeyPatch) -> None:
     """入站消息应先进入未读队列并启动驱动器，慢持久化不能阻塞回复链路。"""
 
@@ -217,7 +215,6 @@ async def test_distributor_starts_loop_before_slow_persistence(monkeypatch: pyte
     persist_release.set()
 
 
-@pytest.mark.asyncio
 async def test_distributor_logs_slow_dispatch_at_debug_and_keeps_task_alive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

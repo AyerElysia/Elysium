@@ -628,7 +628,6 @@ class TestOpenAIChatClient:
         loop_key = client._get_loop_key()
         assert loop_key == 0
 
-    @pytest.mark.asyncio
     async def test_create_non_streaming_response(self):
         """测试非流式响应。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
@@ -674,7 +673,6 @@ class TestOpenAIChatClient:
         assert reasoning_content is None
         assert isinstance(request_record_id, int)
 
-    @pytest.mark.asyncio
     async def test_create_stores_usage_with_cache_fields(self):
         """测试非流式请求会记录 usage，并包含缓存相关字段。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
@@ -731,7 +729,6 @@ class TestOpenAIChatClient:
         assert usage["cache_creation_input_tokens"] == 20
         assert client.pop_last_usage() is None
 
-    @pytest.mark.asyncio
     async def test_create_with_tool_calls(self):
         """测试包含工具调用的响应。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
@@ -785,7 +782,6 @@ class TestOpenAIChatClient:
         assert reasoning_content is None
         assert isinstance(request_record_id, int)
 
-    @pytest.mark.asyncio
     async def test_create_omits_tool_choice_without_tool_payloads(self):
         """测试未传工具 payload 时不会透传 tool_choice。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
@@ -828,7 +824,6 @@ class TestOpenAIChatClient:
         assert "tools" not in create_kwargs
         assert "tool_choice" not in create_kwargs
 
-    @pytest.mark.asyncio
     async def test_create_keeps_configured_tool_choice_with_tool_payloads(self):
         """测试传入工具 payload 时保留配置的 tool_choice。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
@@ -883,7 +878,6 @@ class TestOpenAIChatClient:
         assert create_kwargs["tool_choice"] == "auto"
         assert create_kwargs["tools"][0]["function"]["name"] == "test_tool"
 
-    @pytest.mark.asyncio
     async def test_create_invalid_model_set_type(self):
         """测试无效的model_set类型。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
@@ -900,7 +894,6 @@ class TestOpenAIChatClient:
                 stream=False,
             )
 
-    @pytest.mark.asyncio
     async def test_create_missing_api_key(self):
         """测试缺少api_key。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
@@ -918,7 +911,6 @@ class TestOpenAIChatClient:
                 stream=False,
             )
 
-    @pytest.mark.asyncio
     async def test_create_invalid_extra_params(self):
         """测试无效的extra_params。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
@@ -957,7 +949,6 @@ class TestOpenAIChatClient:
                 stream=False,
             )
 
-    @pytest.mark.asyncio
     async def test_create_with_extra_params(self):
         """测试包含额外参数。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
@@ -1001,7 +992,6 @@ class TestOpenAIChatClient:
         assert call_kwargs["top_p"] == 0.9
         assert call_kwargs["presence_penalty"] == 0.1
 
-    @pytest.mark.asyncio
     async def test_create_rejects_video_before_provider_call(self):
         """视频在 OpenAI provider 序列化前明确失败，不能伪装成图片或重试。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
@@ -1028,7 +1018,6 @@ class TestOpenAIChatClient:
 
         mock_chat.assert_not_awaited()
 
-    @pytest.mark.asyncio
     async def test_create_rejects_video_without_provider_retry(self):
         """Provider 侧不根据错误文本做视频删除/重试。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
@@ -1050,7 +1039,6 @@ class TestOpenAIChatClient:
             )
         mock_chat.assert_not_awaited()
 
-    @pytest.mark.asyncio
     async def test_create_preserves_provider_image_error_without_text_fallback(self):
         """图片被端点拒绝时保留上游错误，不删图也不改成文字请求。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
@@ -1080,7 +1068,6 @@ class TestOpenAIChatClient:
             )
         mock_chat.assert_awaited_once()
 
-    @pytest.mark.asyncio
     async def test_life_inspect_media_native_image_error_is_preserved_for_chatter_fallback(self):
         """tool-inspect_media 提升媒体时，不在底层静默删图，让 life_chatter 生成文字观察回退。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
@@ -1129,7 +1116,6 @@ class TestOpenAIChatClient:
 
         assert mock_chat.completions.create.await_count == 1
 
-    @pytest.mark.asyncio
     async def test_create_stream_preserves_provider_image_error(self):
         """流式图片请求失败时同样不删除图片块或自动重试。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
@@ -1156,7 +1142,6 @@ class TestOpenAIChatClient:
             )
         mock_chat.assert_awaited_once()
 
-    @pytest.mark.asyncio
     async def test_create_inject_reasoning_content_for_thinking_tool_calls(self):
         """测试开启 thinking 时为 tool_calls 消息补齐 reasoning_content。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
@@ -1212,7 +1197,6 @@ class TestOpenAIChatClient:
         assert "reasoning_content" in tool_call_message
         assert tool_call_message["reasoning_content"] == tool_call_message["content"]
 
-    @pytest.mark.asyncio
     async def test_create_inject_reasoning_content_for_thinking_param(self):
         """测试 Anthropic 风格 thinking 参数也会启用 reasoning_content 回填。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
@@ -1265,7 +1249,6 @@ class TestOpenAIChatClient:
         assert "reasoning_content" in tool_call_message
         assert tool_call_message["reasoning_content"] == tool_call_message["content"]
 
-    @pytest.mark.asyncio
     async def test_create_backfills_reasoning_content_when_history_already_contains_it(self):
         """测试当上下文中已有 reasoning_content 时，会为其他 assistant 历史回填。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
@@ -1322,7 +1305,6 @@ class TestOpenAIChatClient:
         assert tool_call_message["role"] == "assistant"
         assert tool_call_message["reasoning_content"] == tool_call_message["content"]
 
-    @pytest.mark.asyncio
     async def test_create_does_not_backfill_reasoning_content_without_reasoning_history(self):
         """测试当历史中没有 reasoning_content 时，不会额外回填。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
@@ -1376,7 +1358,6 @@ class TestOpenAIChatClient:
         assert tool_call_message["role"] == "assistant"
         assert "reasoning_content" not in tool_call_message
 
-    @pytest.mark.asyncio
     async def test_create_preserves_reasoning_content_from_completion_message(self):
         """测试非流式响应中的 reasoning_content 会被返回。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
@@ -1416,7 +1397,6 @@ class TestOpenAIChatClient:
         assert result[0] == "最终回答"
         assert result[3] == "中间思考"
 
-    @pytest.mark.asyncio
     async def test_default_tool_choice_is_auto_for_deepseek(self):
         """测试 DeepSeek 场景下默认 tool_choice 为 auto（避免 required 触发 grammar 编译失败）。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
@@ -1474,7 +1454,6 @@ class TestOpenAIChatClient:
         call_kwargs = mock_chat.completions.create.call_args.kwargs
         assert call_kwargs["tool_choice"] == "auto"
 
-    @pytest.mark.asyncio
     async def test_default_tool_choice_is_required_for_non_deepseek(self):
         """测试非 DeepSeek 提供商默认 tool_choice 也为 auto。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
@@ -1528,7 +1507,6 @@ class TestOpenAIChatClient:
         call_kwargs = mock_chat.completions.create.call_args.kwargs
         assert call_kwargs["tool_choice"] == "auto"
 
-    @pytest.mark.asyncio
     async def test_create_with_tool_call_compat_prompt_and_parsing(self):
         """测试 tool_call_compat 模式注入提示词并解析 JSON 返回。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient
@@ -1594,7 +1572,6 @@ class TestOpenAIChatClient:
         assert reasoning_content is None
         assert isinstance(request_record_id, int)
 
-    @pytest.mark.asyncio
     async def test_stream_iterator_closes_underlying_stream_on_early_stop(self):
         """测试流式响应提前停止消费时会关闭底层流对象。"""
         from src.kernel.llm.model_client.openai_client import OpenAIChatClient

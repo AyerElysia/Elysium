@@ -44,7 +44,6 @@ async def _anthropic_reasoning_stream_events():
     yield StreamEvent(text_delta="done")
 
 
-@pytest.mark.asyncio
 async def test_response_await_collects_full_message():
     req = LLMRequest(dummy_model_set(), request_name="t")
     resp = LLMResponse(
@@ -61,7 +60,6 @@ async def test_response_await_collects_full_message():
     assert resp.payloads[-1].role == ROLE.ASSISTANT
 
 
-@pytest.mark.asyncio
 async def test_response_async_for_yields_chunks_and_sets_message():
     req = LLMRequest(dummy_model_set(), request_name="t")
     resp = LLMResponse(
@@ -80,7 +78,6 @@ async def test_response_async_for_yields_chunks_and_sets_message():
     assert resp.message == "hello"
 
 
-@pytest.mark.asyncio
 async def test_response_cannot_be_consumed_twice():
     req = LLMRequest(dummy_model_set(), request_name="t")
     resp = LLMResponse(
@@ -96,7 +93,6 @@ async def test_response_cannot_be_consumed_twice():
         _ = await resp
 
 
-@pytest.mark.asyncio
 async def test_response_preserves_structured_reasoning_blocks_in_payload() -> None:
     req = LLMRequest(dummy_model_set(), request_name="t")
     resp = LLMResponse(

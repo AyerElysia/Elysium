@@ -7,7 +7,6 @@ import pytest
 from plugins.napcat_adapter.src.handlers.to_core.message_handler import MessageHandler
 
 
-@pytest.mark.asyncio
 async def test_mp3_file_message_is_promoted_to_voice_segment(tmp_path) -> None:
     audio_path = tmp_path / "pink-light.mp3"
     audio_path.write_bytes(b"fake mp3 bytes")

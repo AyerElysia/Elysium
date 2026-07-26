@@ -86,7 +86,6 @@ def test_public_status_includes_next_step_guidance() -> None:
     assert "私聊里行动或跳过" in result.public_messages[0]
 
 
-@pytest.mark.asyncio
 async def test_private_werewolf_command_is_intercepted(monkeypatch) -> None:
     class DummyPlugin:
         pass

@@ -117,7 +117,6 @@ def _insert_active_file_node(db: sqlite3.Connection, path: str) -> str:
     return node_id
 
 
-@pytest.mark.asyncio
 async def test_health_reports_integrity_schema_counts_orphans_jobs_and_edges(
     tmp_path: Path,
 ) -> None:
@@ -240,7 +239,6 @@ def test_sync_health_reports_workspace_hash_and_ignores_memory_files(tmp_path: P
     json.dumps(snapshot)
 
 
-@pytest.mark.asyncio
 async def test_health_handles_unavailable_vector_and_minimal_legacy_schema(tmp_path: Path) -> None:
     db_path = tmp_path / "legacy.db"
     db = sqlite3.connect(str(db_path), check_same_thread=False)
@@ -269,7 +267,6 @@ async def test_health_handles_unavailable_vector_and_minimal_legacy_schema(tmp_p
     json.dumps(empty)
 
 
-@pytest.mark.asyncio
 async def test_health_compares_chunk_collection_with_chunk_ids(tmp_path: Path) -> None:
     db = _db(tmp_path)
     notes = tmp_path / "notes"
@@ -309,7 +306,6 @@ async def test_health_compares_chunk_collection_with_chunk_ids(tmp_path: Path) -
     json.dumps(snapshot)
 
 
-@pytest.mark.asyncio
 async def test_health_requires_exact_stored_identity_for_coverage_and_vectors(
     tmp_path: Path,
 ) -> None:

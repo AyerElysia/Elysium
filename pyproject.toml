@@ -33,21 +33,35 @@ dev = [
     "pytest-cov>=7.0.0",
     "pytest-mock>=3.15.1",
     "pytest-randomly>=4.0.1",
+    "pytest-timeout>=2.3.1",
     "pytest-xdist>=3.8.0",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["test"]
+timeout = 30
 addopts = [
+    "-n", "auto",
+    "--dist", "loadfile",
     "--cov=src",
+    "--cov=plugins",
     "--cov-config=pyproject.toml",
     "--cov-report=term-missing",
+    "--cov-fail-under=40",
     "--import-mode=importlib",
+    "--strict-markers",
+]
+markers = [
+    "slow: 标记慢测试（>1s），CI 中可排除",
+    "integration: 需要外部依赖（DB/网络）的集成测试",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:audioop",
 ]
 
 [tool.coverage.run]
-source = ["src"]
+source = ["src", "plugins"]
 
 [tool.coverage.report]
 omit = [

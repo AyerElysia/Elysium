@@ -31,7 +31,6 @@ def test_life_engine_exposes_compat_tools_when_chatter_enabled() -> None:
     assert "LifeScheduleFollowupMessageAction" in component_names
 
 
-@pytest.mark.asyncio
 async def test_record_inner_monologue_action_delegates_to_life_service(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = []
 
@@ -79,7 +78,6 @@ async def test_record_inner_monologue_action_delegates_to_life_service(monkeypat
     ]
 
 
-@pytest.mark.asyncio
 async def test_think_action_delegates_snapshot_to_life_service(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = []
 
@@ -118,7 +116,6 @@ async def test_think_action_delegates_snapshot_to_life_service(monkeypatch: pyte
     ]
 
 
-@pytest.mark.asyncio
 async def test_schedule_followup_message_action_delegates_to_life_service(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = []
 

@@ -24,7 +24,6 @@ class _FakeConfigInstance:
     value: str = "ok"
 
 
-@pytest.mark.asyncio
 async def test_load_plugin_uses_class_configs_before_instantiation(monkeypatch) -> None:
     """插件应在实例化前通过 class configs 加载配置。"""
 
@@ -78,7 +77,6 @@ async def test_load_plugin_uses_class_configs_before_instantiation(monkeypatch) 
     assert loaded.config is not None
 
 
-@pytest.mark.asyncio
 async def test_register_components_includes_configs_class_property() -> None:
     """即使 get_components 未返回 Config，configs 里的配置类也应被注册。"""
 
@@ -104,7 +102,6 @@ async def test_register_components_includes_configs_class_property() -> None:
     assert config_components["register_config_plugin:config:test_config"] is _TestConfig
 
 
-@pytest.mark.asyncio
 async def test_load_plugin_does_not_fallback_to_get_components_config(
     monkeypatch,
 ) -> None:
@@ -159,7 +156,6 @@ async def test_load_plugin_does_not_fallback_to_get_components_config(
     assert loaded.config is None
 
 
-@pytest.mark.asyncio
 async def test_register_components_ignores_config_from_get_components() -> None:
     """get_components 返回的 Config 组件应被忽略，不应注册。"""
 
@@ -183,7 +179,6 @@ async def test_register_components_ignores_config_from_get_components() -> None:
     assert "ignore_legacy_config_plugin:config:test_config" not in config_components
 
 
-@pytest.mark.asyncio
 async def test_register_components_supports_agent_type() -> None:
     """插件组件注册应支持 Agent 组件类型。"""
 
@@ -241,7 +236,6 @@ def _prepare_loaded_plugin_for_unload(
     monkeypatch.setattr(manager, "_cleanup_sys_modules", MagicMock())
 
 
-@pytest.mark.asyncio
 async def test_reload_plugin_orders_unload_cache_removal_and_load(monkeypatch) -> None:
     """重载顺序应为卸载、清除配置缓存、重新加载，且缓存只清一次。"""
     operations: list[str] = []
@@ -277,7 +271,6 @@ async def test_reload_plugin_orders_unload_cache_removal_and_load(monkeypatch) -
     manager.load_plugin.assert_awaited_once_with("plugins/reload_plugin")
 
 
-@pytest.mark.asyncio
 async def test_unload_plugin_removes_config_cache_on_success(monkeypatch) -> None:
     """直接成功卸载插件时应清除该插件的配置缓存。"""
     config_manager = MagicMock()
@@ -294,7 +287,6 @@ async def test_unload_plugin_removes_config_cache_on_success(monkeypatch) -> Non
     config_manager.remove_config.assert_called_once_with("cached_plugin")
 
 
-@pytest.mark.asyncio
 async def test_unload_plugin_keeps_config_cache_on_failure(monkeypatch) -> None:
     """卸载流程失败时不应清除插件配置缓存。"""
     config_manager = MagicMock()

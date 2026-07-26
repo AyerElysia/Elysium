@@ -20,7 +20,6 @@ def _attach_config(router: MiniCPMLiveRouter, config: MiniCPMLiveBridgeConfig) -
     router.plugin = SimpleNamespace(config=config)
 
 
-@pytest.mark.asyncio
 async def test_resolve_live_turn_user_text_uses_asr_transcript(monkeypatch: pytest.MonkeyPatch) -> None:
     router = _make_router(monkeypatch)
     transcribe_mock = AsyncMock(return_value="你好，我来了")
@@ -46,7 +45,6 @@ async def test_resolve_live_turn_user_text_uses_asr_transcript(monkeypatch: pyte
     )
 
 
-@pytest.mark.asyncio
 async def test_resolve_live_turn_user_text_falls_back_to_placeholder(monkeypatch: pytest.MonkeyPatch) -> None:
     router = _make_router(monkeypatch)
     monkeypatch.setattr(router, "_transcribe_live_audio", AsyncMock(return_value=""))
@@ -67,7 +65,6 @@ async def test_resolve_live_turn_user_text_falls_back_to_placeholder(monkeypatch
     }
 
 
-@pytest.mark.asyncio
 async def test_ingest_current_turn_input_preserves_voice_transcript_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

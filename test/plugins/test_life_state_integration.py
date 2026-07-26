@@ -9,7 +9,6 @@ from plugins.life_engine.service import LifeEngineService, LifeEngineEvent, Even
 class TestLifeStateIntegration:
     """测试 Life State 集成功能。"""
 
-    @pytest.mark.asyncio
     async def test_get_state_digest_for_dfc_empty(self):
         """测试空状态时返回空字符串。"""
         # 创建 mock plugin
@@ -26,7 +25,6 @@ class TestLifeStateIntegration:
         result = await service.get_state_digest_for_dfc()
         assert result == ""
 
-    @pytest.mark.asyncio
     async def test_get_state_digest_for_dfc_with_heartbeats(self):
         """测试包含心跳独白的状态摘要。"""
         mock_plugin = MagicMock()
@@ -70,7 +68,6 @@ class TestLifeStateIntegration:
         assert "【最近思考】" in result
         assert "缓存优化" in result or "Prompt Caching" in result
 
-    @pytest.mark.asyncio
     async def test_get_state_digest_for_dfc_with_tool_calls(self):
         """测试包含工具调用的状态摘要。"""
         mock_plugin = MagicMock()
@@ -124,7 +121,6 @@ class TestLifeStateIntegration:
         assert "【工具偏好】" in result
         assert "read_file" in result
 
-    @pytest.mark.asyncio
     async def test_get_state_digest_length_control(self):
         """测试状态摘要长度控制在合理范围内。"""
         mock_plugin = MagicMock()

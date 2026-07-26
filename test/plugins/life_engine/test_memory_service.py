@@ -184,7 +184,6 @@ def test_unified_document_api_updates_sqlite_without_embedding(
     asyncio.run(_run())
 
 
-@pytest.mark.asyncio
 async def test_service_run_index_worker_uses_chunk_collection_and_updates_nodes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -244,7 +243,6 @@ async def test_service_run_index_worker_uses_chunk_collection_and_updates_nodes(
     ).fetchone()[0] == 1
 
 
-@pytest.mark.asyncio
 async def test_service_restart_restores_persisted_chunk_collection_and_close_is_idempotent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -310,7 +308,6 @@ async def test_service_restart_restores_persisted_chunk_collection_and_close_is_
     await restored.close()
 
 
-@pytest.mark.asyncio
 async def test_service_rejects_invalid_active_marker_before_backend_lookup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -355,7 +352,6 @@ async def test_service_rejects_invalid_active_marker_before_backend_lookup(
     await restored.close()
 
 
-@pytest.mark.asyncio
 async def test_service_rejects_restored_collection_without_identity_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -430,7 +426,6 @@ async def test_service_rejects_restored_collection_without_identity_metadata(
     await restored.close()
 
 
-@pytest.mark.asyncio
 async def test_service_worker_does_not_block_concurrent_document_update(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -477,7 +472,6 @@ async def test_service_worker_does_not_block_concurrent_document_update(
     ).fetchone()[0] == "pending"
 
 
-@pytest.mark.asyncio
 async def test_service_health_snapshot_uses_isolated_committed_connection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -513,7 +507,6 @@ async def test_service_health_snapshot_uses_isolated_committed_connection(
     await service.close()
 
 
-@pytest.mark.asyncio
 async def test_get_or_create_document_uses_sqlite_outbox_without_chroma_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -544,7 +537,6 @@ async def test_get_or_create_document_uses_sqlite_outbox_without_chroma_write(
     ).fetchone()[0] == "pending"
 
 
-@pytest.mark.asyncio
 async def test_legacy_node_lookup_is_read_only(tmp_path: Path) -> None:
     service = _make_service(tmp_path)
     await service.initialize()
@@ -569,7 +561,6 @@ async def test_legacy_node_lookup_is_read_only(tmp_path: Path) -> None:
     assert [tuple(row) for row in service._db.execute("SELECT * FROM memory_nodes")] == before
 
 
-@pytest.mark.asyncio
 async def test_read_rejects_noncanonical_stored_path(tmp_path: Path) -> None:
     service = _make_service(tmp_path)
     await service.initialize()
@@ -589,7 +580,6 @@ async def test_read_rejects_noncanonical_stored_path(tmp_path: Path) -> None:
     assert await service.get_node_by_file_path(path) is None
 
 
-@pytest.mark.asyncio
 async def test_record_memory_correction_rejects_absolute_related_path(tmp_path: Path) -> None:
     service = _make_service(tmp_path)
     await service.initialize()

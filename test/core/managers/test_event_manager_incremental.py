@@ -26,7 +26,6 @@ def reset_runtime_state() -> None:
     reset_event_manager()
 
 
-@pytest.mark.asyncio
 async def test_plugin_event_handler_receives_on_all_plugin_loaded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -78,7 +77,6 @@ async def test_plugin_event_handler_receives_on_all_plugin_loaded(
     ]
 
 
-@pytest.mark.asyncio
 async def test_unload_plugin_removes_event_handler_subscriptions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -134,7 +132,6 @@ async def test_unload_plugin_removes_event_handler_subscriptions(
     assert call_count == 0
 
 
-@pytest.mark.asyncio
 async def test_temporary_handler_keeps_subscription_on_pass() -> None:
     """临时监听器返回 PASS 时应保留订阅。"""
 
@@ -172,7 +169,6 @@ async def test_temporary_handler_keeps_subscription_on_pass() -> None:
     assert get_event_stats["temporary_handler_count"] == 1
 
 
-@pytest.mark.asyncio
 async def test_temporary_handler_auto_unregisters_on_success() -> None:
     """临时监听器返回 SUCCESS 后应自动移除。"""
 

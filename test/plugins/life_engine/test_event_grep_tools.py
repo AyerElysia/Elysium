@@ -45,7 +45,6 @@ def _reset_registry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(registry, "_life_engine_registry", registry.ServiceRegistry())
 
 
-@pytest.mark.asyncio
 async def test_grep_life_events_searches_history_and_pending() -> None:
     service = LifeEngineService(SimpleNamespace(config=None))
     service._event_history = [
@@ -65,7 +64,6 @@ async def test_grep_life_events_searches_history_and_pending() -> None:
     assert result["matches"][0]["event"]["event_id"] == "evt-3"
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_grep_defaults_to_current_stream() -> None:
     service = LifeEngineService(SimpleNamespace(config=None))
     service._event_history = [
@@ -89,7 +87,6 @@ async def test_life_chatter_grep_defaults_to_current_stream() -> None:
     assert payload["matches"][0]["event"]["stream_id"] == "s1"
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_grep_includes_life_internal_events_by_default() -> None:
     service = LifeEngineService(SimpleNamespace(config=None))
     service._event_history = [
@@ -118,7 +115,6 @@ async def test_life_chatter_grep_includes_life_internal_events_by_default() -> N
     assert stream_ids == ["", "s1"]
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_grep_context_stays_in_current_stream() -> None:
     service = LifeEngineService(SimpleNamespace(config=None))
     service._event_history = [
@@ -145,7 +141,6 @@ async def test_life_chatter_grep_context_stays_in_current_stream() -> None:
     assert [item["stream_id"] for item in match["context_after"]] == ["s1"]
 
 
-@pytest.mark.asyncio
 async def test_life_engine_grep_can_search_tool_name() -> None:
     service = LifeEngineService(SimpleNamespace(config=None))
     service._event_history = [
@@ -165,7 +160,6 @@ async def test_life_engine_grep_can_search_tool_name() -> None:
     assert payload["matches"][0]["event"]["tool_name"] == "nucleus_web_search"
 
 
-@pytest.mark.asyncio
 async def test_proactive_opportunity_is_searchable_from_event_stream() -> None:
     service = LifeEngineService(SimpleNamespace(config=None))
     await service.enqueue_proactive_opportunity(
@@ -191,7 +185,6 @@ async def test_proactive_opportunity_is_searchable_from_event_stream() -> None:
     assert event["content_type"] == "proactive_opportunity"
 
 
-@pytest.mark.asyncio
 async def test_chatter_inner_monologue_is_searchable_from_event_stream() -> None:
     service = LifeEngineService(SimpleNamespace(config=None))
     await service.record_chatter_inner_monologue(

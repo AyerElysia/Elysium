@@ -202,7 +202,6 @@ def test_memory_maintenance_prompt_emits_once_per_interval(tmp_path: Path) -> No
     assert second == ""
 
 
-@pytest.mark.asyncio
 async def test_enqueue_dfc_message_appends_pending_event(tmp_path: Path) -> None:
     """DFC 留言应进入 pending 队列并持久化。"""
     service = _make_service(tmp_path)
@@ -244,7 +243,6 @@ async def test_enqueue_dfc_message_appends_pending_event(tmp_path: Path) -> None
     assert raw_events[0]["reply_target"]["stream_id"] == "stream-1"
 
 
-@pytest.mark.asyncio
 async def test_enqueue_dfc_message_rejects_empty_message(tmp_path: Path) -> None:
     """空留言必须被拒绝。"""
     service = _make_service(tmp_path)
@@ -253,7 +251,6 @@ async def test_enqueue_dfc_message_rejects_empty_message(tmp_path: Path) -> None
         await service.enqueue_dfc_message("   ")
 
 
-@pytest.mark.asyncio
 async def test_heartbeat_tool_batch_executes_parallel_and_preserves_payload_order(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -321,7 +318,6 @@ async def test_heartbeat_tool_batch_executes_parallel_and_preserves_payload_orde
     ]
 
 
-@pytest.mark.asyncio
 async def test_heartbeat_tool_execution_strips_auto_reason_when_signature_rejects_it(
     tmp_path: Path,
 ) -> None:
@@ -351,7 +347,6 @@ async def test_heartbeat_tool_execution_strips_auto_reason_when_signature_reject
     assert seen_args == ["diaries/2026-04-29.md"]
 
 
-@pytest.mark.asyncio
 async def test_heartbeat_tool_execution_keeps_declared_reason_parameter(
     tmp_path: Path,
 ) -> None:
@@ -381,7 +376,6 @@ async def test_heartbeat_tool_execution_keeps_declared_reason_parameter(
     assert seen_reason == ["主动表达"]
 
 
-@pytest.mark.asyncio
 async def test_chatter_context_cursor_persists_across_restart(tmp_path: Path) -> None:
     """life_chatter 事件流游标应持久化，避免重启后重复注入旧事件。"""
     service = _make_service(tmp_path)
@@ -395,7 +389,6 @@ async def test_chatter_context_cursor_persists_across_restart(tmp_path: Path) ->
     assert restored._state.chatter_context_cursors["stream-1"] == 42
 
 
-@pytest.mark.asyncio
 async def test_chatter_think_snapshot_persists_across_restart(tmp_path: Path) -> None:
     service = _make_service(tmp_path)
 
@@ -423,7 +416,6 @@ async def test_chatter_think_snapshot_persists_across_restart(tmp_path: Path) ->
     assert snapshot["recorded_at"]
 
 
-@pytest.mark.asyncio
 async def test_enqueue_dfc_message_rejects_when_disabled(tmp_path: Path) -> None:
     """life_engine 禁用时不应接受 DFC 留言。"""
     config = LifeEngineConfig()
@@ -435,7 +427,6 @@ async def test_enqueue_dfc_message_rejects_when_disabled(tmp_path: Path) -> None
         await service.enqueue_dfc_message("帮我记一下")
 
 
-@pytest.mark.asyncio
 async def test_web_search_accepts_empty_time_range_as_unset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -468,7 +459,6 @@ async def test_web_search_accepts_empty_time_range_as_unset(
     assert "time_range" not in captured["payload"]
 
 
-@pytest.mark.asyncio
 async def test_heartbeat_success_consumes_delta_without_replay(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -513,7 +503,6 @@ async def test_heartbeat_success_consumes_delta_without_replay(
     assert service._state.heartbeat_context_cursor >= event.sequence
 
 
-@pytest.mark.asyncio
 async def test_heartbeat_failure_keeps_delta_for_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -560,7 +549,6 @@ async def test_heartbeat_failure_keeps_delta_for_retry(
     assert service._state.heartbeat_context_cursor >= event.sequence
 
 
-@pytest.mark.asyncio
 async def test_heartbeat_arrival_during_model_is_deferred_to_next_round(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -606,7 +594,6 @@ async def test_heartbeat_arrival_during_model_is_deferred_to_next_round(
     assert service._state.heartbeat_context_cursor >= arriving_event.sequence
 
 
-@pytest.mark.asyncio
 async def test_automatic_and_manual_heartbeats_are_serialized(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -644,7 +631,6 @@ async def test_automatic_and_manual_heartbeats_are_serialized(
     assert manual_result["reply"] == "串行完成"
 
 
-@pytest.mark.asyncio
 async def test_legacy_heartbeat_summary_migrates_to_subconscious_state(
     tmp_path: Path,
 ) -> None:
@@ -685,7 +671,6 @@ async def test_legacy_heartbeat_summary_migrates_to_subconscious_state(
     assert service._event_history == []
 
 
-@pytest.mark.asyncio
 async def test_consumed_heartbeat_events_remain_consumed_after_restart(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -721,7 +706,6 @@ async def test_consumed_heartbeat_events_remain_consumed_after_restart(
     assert prepared.content == ""
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("memory_index_enabled", [True, False])
 async def test_memory_index_lifecycle_start_toggle_and_stop_close(
     tmp_path: Path,
@@ -762,7 +746,6 @@ async def test_memory_index_lifecycle_start_toggle_and_stop_close(
     assert fake_memory.close_calls == 1
 
 
-@pytest.mark.asyncio
 async def test_memory_index_loop_survives_provider_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

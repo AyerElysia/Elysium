@@ -68,7 +68,6 @@ def _insert_edge(
     )
 
 
-@pytest.mark.asyncio
 async def test_graph_filters_invalid_deleted_nodes_links_degrees_and_invalid_focus() -> None:
     db = _graph_db()
     _insert_node(db, "file:good", "file", "notes/good.md", activation=1.0)
@@ -110,7 +109,6 @@ async def test_graph_filters_invalid_deleted_nodes_links_degrees_and_invalid_foc
     assert invalid_focus == {"nodes": [], "links": []}
 
 
-@pytest.mark.asyncio
 async def test_graph_supports_legacy_schema_without_is_deleted() -> None:
     db = _graph_db(include_deleted=False)
     db.execute(

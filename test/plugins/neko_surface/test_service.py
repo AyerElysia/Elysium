@@ -21,7 +21,6 @@ def _state_event(event_id: str, *, sequence: int, priority: int) -> SurfaceEvent
     )
 
 
-@pytest.mark.asyncio
 async def test_bounded_queue_sheds_old_low_priority_event() -> None:
     queue = BoundedEventQueue(maxsize=2)
     await queue.put(_state_event("low-old", sequence=1, priority=1))
@@ -35,7 +34,6 @@ async def test_bounded_queue_sheds_old_low_priority_event() -> None:
     assert (await queue.get()).event_id == "critical"
 
 
-@pytest.mark.asyncio
 async def test_bounded_queue_rejects_new_low_priority_event() -> None:
     queue = BoundedEventQueue(maxsize=1)
     await queue.put(_state_event("critical", sequence=1, priority=9))

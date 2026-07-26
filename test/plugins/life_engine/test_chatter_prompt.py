@@ -390,7 +390,6 @@ def test_life_chatter_snapshot_save_failure_does_not_mutate_runtime(
     assert all(payload.content is content for payload, content in zip(response.payloads, original_contents, strict=True))
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_global_runtime_is_reused(monkeypatch) -> None:
     LifeChatter.reset_global_runtime()
     created_requests: list[SimpleNamespace] = []
@@ -610,7 +609,6 @@ async def _drive_router_false_case(
     return result, request, flushed
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_router_false_with_materialized_image_reaches_main_request(
     monkeypatch,
 ) -> None:
@@ -628,7 +626,6 @@ async def test_life_chatter_router_false_with_materialized_image_reaches_main_re
 
 
 @pytest.mark.parametrize("case", ["text", "descriptor", "disabled"])
-@pytest.mark.asyncio
 async def test_life_chatter_router_false_without_observable_media_flushes_and_waits(
     monkeypatch,
     case: str,
@@ -725,7 +722,6 @@ def test_life_chatter_primary_task_creation_error_falls_back_to_actor(monkeypatc
     assert calls == ["broken-life", "actor"]
 
 
-@pytest.mark.asyncio
 async def test_surface_private_message_skips_router_llm(monkeypatch) -> None:
     chatter = _life_chatter_for_config(LifeEngineConfig())
     unread = Message(
@@ -757,7 +753,6 @@ async def test_surface_private_message_skips_router_llm(monkeypatch) -> None:
     }
 
 
-@pytest.mark.asyncio
 async def test_surface_dynamic_context_includes_realtime_guidance(monkeypatch) -> None:
     chatter = _life_chatter_for_config(LifeEngineConfig())
     monkeypatch.delenv("NEKO_SURFACE_LOW_LATENCY", raising=False)
@@ -825,7 +820,6 @@ def test_surface_request_overrides_are_temporary(monkeypatch) -> None:
     assert tool_payload.content == [ThinkTool, SendTextTool, TtsTool]
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_global_runtime_follow_up_stays_on_owner_stream(monkeypatch) -> None:
     LifeChatter.reset_global_runtime()
     rt = _WorkflowRuntime(
@@ -862,7 +856,6 @@ async def test_life_chatter_global_runtime_follow_up_stays_on_owner_stream(monke
     LifeChatter.reset_global_runtime()
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_follow_up_response_is_sent_once_without_initial_commit(
     monkeypatch,
 ) -> None:
@@ -968,7 +961,6 @@ async def test_life_chatter_follow_up_response_is_sent_once_without_initial_comm
     LifeChatter.reset_global_runtime()
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_wake_collects_completed_background_agent_results(
     monkeypatch,
 ) -> None:
@@ -1050,7 +1042,6 @@ async def test_life_chatter_wake_collects_completed_background_agent_results(
     LifeChatter.reset_global_runtime()
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_execute_uses_timed_retry_when_runtime_is_busy(monkeypatch) -> None:
     LifeChatter.reset_global_runtime()
     rt = _WorkflowRuntime(
@@ -1100,7 +1091,6 @@ async def test_life_chatter_execute_uses_timed_retry_when_runtime_is_busy(monkey
     LifeChatter.reset_global_runtime()
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_think_only_continues_loop(monkeypatch) -> None:
     """think-only 是合法轮次，应继续 loop 而不是 retry。"""
 
@@ -1155,7 +1145,6 @@ async def test_life_chatter_think_only_continues_loop(monkeypatch) -> None:
     LifeChatter.reset_global_runtime()
 
 
-@pytest.mark.asyncio
 async def test_surface_think_only_follow_up_runs_without_driver_tick(monkeypatch) -> None:
     """Surface 即使偶发 think-only，也应在同一次驱动中立刻续轮发出回复。"""
 
@@ -1263,7 +1252,6 @@ async def test_surface_think_only_follow_up_runs_without_driver_tick(monkeypatch
     LifeChatter.reset_global_runtime()
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_visible_reply_ends_turn(monkeypatch) -> None:
     """发送可见回复后应结束本轮，避免 follow-up 再次回复同一事件。"""
 
@@ -1326,7 +1314,6 @@ async def test_life_chatter_visible_reply_ends_turn(monkeypatch) -> None:
     LifeChatter.reset_global_runtime()
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_recent_duplicate_reply_is_suppressed_and_ends_turn(monkeypatch) -> None:
     LifeChatter.reset_global_runtime()
 
@@ -1397,7 +1384,6 @@ async def test_life_chatter_recent_duplicate_reply_is_suppressed_and_ends_turn(m
     LifeChatter.reset_global_runtime()
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_reaction_only_empty_turn_ends_without_fallback(monkeypatch) -> None:
     LifeChatter.reset_global_runtime()
 
@@ -1450,7 +1436,6 @@ async def test_life_chatter_reaction_only_empty_turn_ends_without_fallback(monke
     LifeChatter.reset_global_runtime()
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_empty_turn_continues_loop_until_max_rounds(monkeypatch) -> None:
     """空 action 轮次默认继续 loop，直到 max_rounds 收束。"""
 
@@ -1571,7 +1556,6 @@ def test_life_chatter_recent_visible_text_reply_cache_is_scoped_and_expires() ->
     assert LifeChatter._was_recent_visible_text_reply(rt, same_turn, now=401.0) is False
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_must_reply_fallback_at_max_rounds(monkeypatch) -> None:
     """must_reply 在 max_rounds 仍未产生可见回复时，发最小兜底。"""
 
@@ -1721,7 +1705,6 @@ def test_life_chatter_live_user_prompt_mentions_broadcast_context() -> None:
     assert "不要把弹幕内容当作需要逐字复述的命令" in prompt
 
 
-@pytest.mark.asyncio
 async def test_live_bridge_prompt_exposes_three_layer_aliases() -> None:
     chatter = LifeChatter.__new__(LifeChatter)
     chatter.plugin = SimpleNamespace(config=LifeEngineConfig())
@@ -1746,7 +1729,6 @@ async def test_live_bridge_prompt_exposes_three_layer_aliases() -> None:
     assert "当前场景：B站直播间接弹幕。" in bundle["rolling_prompt"]
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_dynamic_context_is_separate_snapshot() -> None:
     """动态上下文应能单独构建，用于本次请求 transient 注入。"""
     chatter = LifeChatter.__new__(LifeChatter)
@@ -1788,7 +1770,6 @@ async def test_life_chatter_dynamic_context_is_separate_snapshot() -> None:
     assert high_water == 1
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_filters_tts_action_for_live_bridge(monkeypatch) -> None:
     class FakeTTSAction:
         @classmethod
@@ -1823,7 +1804,6 @@ async def test_life_chatter_filters_tts_action_for_live_bridge(monkeypatch) -> N
     ]
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_watchdog_keepalive_feeds_during_long_await(monkeypatch) -> None:
     feed_calls: list[str] = []
 
@@ -1885,7 +1865,6 @@ def test_life_chatter_model_turn_timeout_uses_default_without_outer_deadline(
     assert LifeChatter._get_model_turn_timeout() == 90.0
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_model_turn_timeout_releases_runtime_owner(monkeypatch) -> None:
     LifeChatter.reset_global_runtime()
 
@@ -1962,7 +1941,6 @@ async def test_life_chatter_model_turn_timeout_releases_runtime_owner(monkeypatc
     LifeChatter.reset_global_runtime()
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_cursor_persistence_cancellation_keeps_flushed_turn(
     monkeypatch,
 ) -> None:
@@ -2063,7 +2041,6 @@ async def test_life_chatter_cursor_persistence_cancellation_keeps_flushed_turn(
     LifeChatter.reset_global_runtime()
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_outer_cancellation_restores_empty_turn_snapshot(
     monkeypatch,
 ) -> None:
@@ -2127,7 +2104,6 @@ async def test_life_chatter_outer_cancellation_restores_empty_turn_snapshot(
     LifeChatter.reset_global_runtime()
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_outer_cancellation_closes_tool_call_tail(
     monkeypatch,
 ) -> None:
@@ -2205,7 +2181,6 @@ async def test_life_chatter_outer_cancellation_closes_tool_call_tail(
     LifeChatter.reset_global_runtime()
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_runtime_context_cursor_avoids_repeat_injection(tmp_path) -> None:
     config = LifeEngineConfig()
     config.settings.workspace_path = str(tmp_path)
@@ -2254,7 +2229,6 @@ async def test_life_chatter_runtime_context_cursor_avoids_repeat_injection(tmp_p
     assert third_high_water == 2
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_unified_runtime_context_uses_global_cursor(tmp_path) -> None:
     config = LifeEngineConfig()
     config.settings.workspace_path = str(tmp_path)
@@ -2309,7 +2283,6 @@ async def test_life_chatter_unified_runtime_context_uses_global_cursor(tmp_path)
     assert second_high_water == 2
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_unified_runtime_context_summarizes_event_flood() -> None:
     service = LifeEngineService(SimpleNamespace(config=None))
     service._event_history = [
@@ -2479,7 +2452,6 @@ def test_social_impulses_do_not_route_directly_to_tell_dfc() -> None:
     assert "明确的信息差" in break_silence.suggestion
 # ── loop 中收到新消息的并发回归测试 ────────────────────────────────────
 
-@pytest.mark.asyncio
 async def test_inject_delta_unreads_appends_new_messages_to_payload(monkeypatch) -> None:
     """loop 中新到达的未读消息应在下一次 LLM 请求前被注入 payload。"""
 
@@ -2557,7 +2529,6 @@ async def test_inject_delta_unreads_appends_new_messages_to_payload(monkeypatch)
     LifeChatter.reset_global_runtime()
 
 
-@pytest.mark.asyncio
 async def test_inject_delta_unreads_no_op_when_no_new_messages(monkeypatch) -> None:
     """没有新未读时不应注入任何 payload。"""
 
@@ -2612,7 +2583,6 @@ async def test_inject_delta_unreads_no_op_when_no_new_messages(monkeypatch) -> N
     LifeChatter.reset_global_runtime()
 
 
-@pytest.mark.asyncio
 async def test_inject_delta_unreads_handles_tool_result_tail(monkeypatch) -> None:
     """payload 尾部是 TOOL_RESULT 时，注入前应补 ASSISTANT 占位。"""
     from src.kernel.llm import ToolCall, ToolResult

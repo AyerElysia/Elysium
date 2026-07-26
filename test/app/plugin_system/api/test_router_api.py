@@ -82,7 +82,6 @@ class TestRouterAPI:
             
             assert len(result) == 2
     
-    @pytest.mark.asyncio
     async def test_mount_router(self) -> None:
         """测试挂载路由。"""
         with patch('src.app.plugin_system.api.router_api._get_router_manager') as mock_get_mgr:
@@ -96,7 +95,6 @@ class TestRouterAPI:
             
             assert result == mock_router
     
-    @pytest.mark.asyncio
     async def test_unmount_router(self) -> None:
         """测试卸载路由。"""
         with patch('src.app.plugin_system.api.router_api._get_router_manager') as mock_get_mgr:
@@ -108,7 +106,6 @@ class TestRouterAPI:
             
             mock_manager.unmount_router.assert_called_once()
     
-    @pytest.mark.asyncio
     async def test_mount_plugin_routers(self) -> None:
         """测试挂载插件的所有路由。"""
         with patch('src.app.plugin_system.api.router_api._get_router_manager') as mock_get_mgr:
@@ -122,7 +119,6 @@ class TestRouterAPI:
             
             assert len(result) == 2
     
-    @pytest.mark.asyncio
     async def test_unmount_plugin_routers(self) -> None:
         """测试卸载插件的所有路由。"""
         with patch('src.app.plugin_system.api.router_api._get_router_manager') as mock_get_mgr:
@@ -159,7 +155,6 @@ class TestRouterAPI:
             
             assert len(result) == 2
     
-    @pytest.mark.asyncio
     async def test_reload_router(self) -> None:
         """测试重载路由。"""
         with patch('src.app.plugin_system.api.router_api._get_router_manager') as mock_get_mgr:

@@ -12,7 +12,6 @@ from src.core.managers.tool_manager.mcp_adapter import MCPToolAdapter
 from src.core.managers.tool_manager.mcp_manager import MCPManager, MCPServerMetadata
 
 
-@pytest.mark.asyncio
 async def test_mcp_manager_initialize_dispatches_all_server_types(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -95,7 +94,6 @@ def test_mcp_manager_get_deferred_tool_classes_filters_by_metadata() -> None:
     assert manager.get_deferred_tool_classes() == [DeferredTool]
 
 
-@pytest.mark.asyncio
 async def test_mcp_tool_adapter_uses_bound_manager_and_normalizes_name() -> None:
     """适配器应复用绑定 manager，并将工具名规范化。"""
     fake_tool = SimpleNamespace(

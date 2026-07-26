@@ -29,7 +29,6 @@ def _make_wav_base64(samples: list[float], sample_rate: int = 16000) -> str:
     return "data:audio/wav;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-@pytest.mark.asyncio
 async def test_build_realtime_adapter_returns_minicpm_adapter() -> None:
     adapter = build_realtime_adapter(
         adapter_name="minicpm_realtime_v0",
@@ -49,7 +48,6 @@ async def test_build_realtime_adapter_returns_minicpm_adapter() -> None:
     assert adapter.upstream_connect_headers() == {"Authorization": "Bearer test"}
 
 
-@pytest.mark.asyncio
 async def test_minicpm_adapter_builds_session_update_from_context_snapshot() -> None:
     adapter = MiniCPMRealtimeAdapter(
         session_id="live-session",
@@ -82,7 +80,6 @@ async def test_minicpm_adapter_builds_session_update_from_context_snapshot() -> 
     assert adapter.context_snapshot["life_runtime_context"] == "ctx"
 
 
-@pytest.mark.asyncio
 async def test_minicpm_adapter_turns_pcm_audio_into_append_and_attaches_video_frame() -> None:
     adapter = MiniCPMRealtimeAdapter(
         session_id="live-session",
@@ -127,7 +124,6 @@ async def test_minicpm_adapter_turns_pcm_audio_into_append_and_attaches_video_fr
     assert content[1] == {"type": "image_data", "image_data": {"data": "AAAA"}}
 
 
-@pytest.mark.asyncio
 async def test_minicpm_adapter_converts_wav_turn_and_emits_client_audio_and_final() -> None:
     adapter = MiniCPMRealtimeAdapter(
         session_id="live-session",
@@ -172,7 +168,6 @@ async def test_minicpm_adapter_converts_wav_turn_and_emits_client_audio_and_fina
     assert any(msg["type"] == "final" for msg in upstream_final.client_messages)
 
 
-@pytest.mark.asyncio
 async def test_passthrough_adapter_returns_raw_upstream_payload_to_client() -> None:
     adapter = PassthroughRealtimeAdapter(
         session_id="live-session",

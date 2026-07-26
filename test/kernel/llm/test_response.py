@@ -168,7 +168,6 @@ class TestLLMResponse:
 class TestLLMResponseAwait:
     """Test cases for awaiting LLMResponse."""
 
-    @pytest.mark.asyncio
     async def test_await_with_stream(
         self, mock_model_set: list[dict[str, Any]], sample_payloads: list[LLMPayload]
     ) -> None:
@@ -188,7 +187,6 @@ class TestLLMResponseAwait:
         assert response.message == result
         assert response._consumed is True
 
-    @pytest.mark.asyncio
     async def test_await_without_stream(
         self, mock_model_set: list[dict[str, Any]], sample_payloads: list[LLMPayload]
     ) -> None:
@@ -207,7 +205,6 @@ class TestLLMResponseAwait:
         assert result == "Static response"
         assert response._consumed is True
 
-    @pytest.mark.asyncio
     async def test_await_attaches_reasoning_to_inspector(
         self, mock_model_set: list[dict[str, Any]], sample_payloads: list[LLMPayload]
     ) -> None:
@@ -234,7 +231,6 @@ class TestLLMResponseAwait:
         assert payload["content"] == "2"
         assert payload["reasoning_content"] == "先算一下。"
 
-    @pytest.mark.asyncio
     async def test_await_already_consumed(
         self, mock_model_set: list[dict[str, Any]], sample_payloads: list[LLMPayload]
     ) -> None:
@@ -259,7 +255,6 @@ class TestLLMResponseAwait:
 class TestLLMResponseAsyncIteration:
     """Test cases for async iterating LLMResponse."""
 
-    @pytest.mark.asyncio
     async def test_async_iter_with_stream(
         self, mock_model_set: list[dict[str, Any]], sample_payloads: list[LLMPayload]
     ) -> None:
@@ -282,7 +277,6 @@ class TestLLMResponseAsyncIteration:
         assert response._consumed is True
         assert response.message == "Hello there! How can I help?"
 
-    @pytest.mark.asyncio
     async def test_async_iter_without_stream(
         self, mock_model_set: list[dict[str, Any]], sample_payloads: list[LLMPayload]
     ) -> None:
@@ -304,7 +298,6 @@ class TestLLMResponseAsyncIteration:
         assert chunks == ["Static response"]
         assert response._consumed is True
 
-    @pytest.mark.asyncio
     async def test_async_iter_already_consumed(
         self, mock_model_set: list[dict[str, Any]], sample_payloads: list[LLMPayload]
     ) -> None:
@@ -330,7 +323,6 @@ class TestLLMResponseAsyncIteration:
 class TestLLMResponseAutoAppend:
     """Test cases for auto_append_response functionality."""
 
-    @pytest.mark.asyncio
     async def test_auto_append_disabled(
         self, mock_model_set: list[dict[str, Any]], sample_payloads: list[LLMPayload]
     ) -> None:
@@ -351,7 +343,6 @@ class TestLLMResponseAutoAppend:
         assert len(response.payloads) == 2
         assert response.payloads[-1].role == ROLE.USER
 
-    @pytest.mark.asyncio
     async def test_auto_append_enabled(
         self, mock_model_set: list[dict[str, Any]], sample_payloads: list[LLMPayload]
     ) -> None:
@@ -375,7 +366,6 @@ class TestLLMResponseAutoAppend:
         assert response.payloads[-1].role == ROLE.ASSISTANT
         assert response.payloads[-1].content[0].text == "Assistant response"
 
-    @pytest.mark.asyncio
     async def test_auto_append_with_empty_message(
         self, mock_model_set: list[dict[str, Any]], sample_payloads: list[LLMPayload]
     ) -> None:
@@ -545,7 +535,6 @@ class TestLLMResponseAddCallReflex:
 class TestLLMResponseSend:
     """Test cases for send method (chaining)."""
 
-    @pytest.mark.asyncio
     async def test_send_creates_new_request(
         self, mock_model_set: list[dict[str, Any]], sample_payloads: list[LLMPayload]
     ) -> None:
@@ -585,7 +574,6 @@ class TestLLMResponseSend:
             call_kwargs = mock_send.call_args.kwargs
             assert call_kwargs["stream"] is False
 
-    @pytest.mark.asyncio
     async def test_send_appends_current_response_before_follow_up(
         self, mock_model_set: list[dict[str, Any]], sample_payloads: list[LLMPayload]
     ) -> None:
@@ -644,7 +632,6 @@ class TestLLMResponseSend:
 class TestLLMResponseStreamWithCallback:
     """Test cases for stream_with_callback method."""
 
-    @pytest.mark.asyncio
     async def test_stream_with_callback_on_stream(
         self, mock_model_set: list[dict[str, Any]], sample_payloads: list[LLMPayload]
     ) -> None:
@@ -670,7 +657,6 @@ class TestLLMResponseStreamWithCallback:
         assert received_chunks == ["Hello", " there", "!", " How", " can", " I", " help", "?"]
         assert response._consumed is True
 
-    @pytest.mark.asyncio
     async def test_stream_with_callback_no_stream(
         self, mock_model_set: list[dict[str, Any]], sample_payloads: list[LLMPayload]
     ) -> None:
@@ -695,7 +681,6 @@ class TestLLMResponseStreamWithCallback:
         assert result == "Static"
         assert received_chunks == ["Static"]
 
-    @pytest.mark.asyncio
     async def test_stream_with_callback_already_consumed(
         self, mock_model_set: list[dict[str, Any]], sample_payloads: list[LLMPayload]
     ) -> None:
@@ -723,7 +708,6 @@ class TestLLMResponseStreamWithCallback:
 class TestLLMResponseStreamWithBuffer:
     """Test cases for stream_with_buffer method."""
 
-    @pytest.mark.asyncio
     async def test_stream_with_buffer(
         self, mock_model_set: list[dict[str, Any]], sample_payloads: list[LLMPayload]
     ) -> None:
@@ -747,7 +731,6 @@ class TestLLMResponseStreamWithBuffer:
         assert response._consumed is True
         assert response.message == "Hello there! How can I help?"
 
-    @pytest.mark.asyncio
     async def test_stream_with_buffer_flushes_tail_on_stream_error(
         self, mock_model_set: list[dict[str, Any]], sample_payloads: list[LLMPayload]
     ) -> None:
@@ -770,7 +753,6 @@ class TestLLMResponseStreamWithBuffer:
         assert buffers == ["Hello world"]
         assert response.message == "Hello world"
 
-    @pytest.mark.asyncio
     async def test_stream_with_buffer_no_stream(
         self, mock_model_set: list[dict[str, Any]], sample_payloads: list[LLMPayload]
     ) -> None:
@@ -791,7 +773,6 @@ class TestLLMResponseStreamWithBuffer:
 
         assert buffers == ["Static response"]
 
-    @pytest.mark.asyncio
     async def test_stream_with_buffer_already_consumed(
         self, mock_model_set: list[dict[str, Any]], sample_payloads: list[LLMPayload]
     ) -> None:
@@ -931,7 +912,6 @@ class TestToolCallAccumulator:
 class TestResponseIntegration:
     """Integration tests for LLMResponse with tool calls."""
 
-    @pytest.mark.asyncio
     async def test_response_with_tool_calls_streaming(
         self, mock_model_set: list[dict[str, Any]], sample_payloads: list[LLMPayload]
     ) -> None:
@@ -955,7 +935,6 @@ class TestResponseIntegration:
         assert response.call_list[1].name == "get_time"
         assert response.call_list[1].args == {"timezone": "UTC"}
 
-    @pytest.mark.asyncio
     async def test_response_with_mixed_content(
         self, mock_model_set: list[dict[str, Any]], sample_payloads: list[LLMPayload]
     ) -> None:

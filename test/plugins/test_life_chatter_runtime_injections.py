@@ -306,7 +306,6 @@ def _make_event(seq: int, **kwargs) -> LifeEngineEvent:
     return LifeEngineEvent(**base)
 
 
-@pytest.mark.asyncio
 async def test_build_chatter_runtime_includes_full_new_event_stream() -> None:
     """新增 life 事件流应完整进入 runtime context，而不是只剩 salient tail。"""
     service = LifeEngineService(SimpleNamespace(config=None))
@@ -337,7 +336,6 @@ async def test_build_chatter_runtime_includes_full_new_event_stream() -> None:
     assert hw == 3
 
 
-@pytest.mark.asyncio
 async def test_build_chatter_runtime_thought_delta_cursor_dedup() -> None:
     """同一 stream 第二次 build 不应再在 thought 块带 🔄 delta 标记。"""
     service = LifeEngineService(SimpleNamespace(config=None))
@@ -357,7 +355,6 @@ async def test_build_chatter_runtime_thought_delta_cursor_dedup() -> None:
     assert "🔄" not in second
 
 
-@pytest.mark.asyncio
 async def test_build_chatter_runtime_includes_latest_think_and_recent_chat() -> None:
     service = LifeEngineService(SimpleNamespace(config=LifeEngineConfig()))
     chat = SimpleNamespace(
@@ -388,7 +385,6 @@ async def test_build_chatter_runtime_includes_latest_think_and_recent_chat() -> 
     assert "旧消息 3" in text
 
 
-@pytest.mark.asyncio
 async def test_build_chatter_runtime_includes_recent_file_trace(tmp_path) -> None:
     config = LifeEngineConfig()
     config.settings.workspace_path = str(tmp_path)
@@ -421,7 +417,6 @@ async def test_build_chatter_runtime_includes_recent_file_trace(tmp_path) -> Non
     assert "notes/0.md" not in text
 
 
-@pytest.mark.asyncio
 async def test_build_chatter_runtime_unified_recent_chat_merges_streams(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

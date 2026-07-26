@@ -249,7 +249,6 @@ def test_get_agent_schemas_returns_list(monkeypatch: pytest.MonkeyPatch) -> None
     assert result[0]["function"]["name"] == "agent-mock_agent"
 
 
-@pytest.mark.asyncio
 async def test_execute_agent_requires_signature() -> None:
     """signature 为空时应抛出 ValueError。"""
     mock_plugin = MagicMock()
@@ -257,14 +256,12 @@ async def test_execute_agent_requires_signature() -> None:
         await agent_api.execute_agent("", mock_plugin, "stream_123")
 
 
-@pytest.mark.asyncio
 async def test_execute_agent_requires_plugin() -> None:
     """plugin 为 None 时应抛出 ValueError。"""
     with pytest.raises(ValueError, match="plugin 不能为空"):
         await agent_api.execute_agent("demo:agent:demo", None, "stream_123")  # type: ignore
 
 
-@pytest.mark.asyncio
 async def test_execute_agent_requires_stream_id() -> None:
     """stream_id 为空时应抛出 ValueError。"""
     mock_plugin = MagicMock()
@@ -272,7 +269,6 @@ async def test_execute_agent_requires_stream_id() -> None:
         await agent_api.execute_agent("demo:agent:demo", mock_plugin, "")
 
 
-@pytest.mark.asyncio
 async def test_execute_agent_raises_if_not_found() -> None:
     """Agent 未找到时应抛出 ValueError。"""
     mock_plugin = MagicMock()
@@ -295,7 +291,6 @@ async def test_execute_agent_raises_if_not_found() -> None:
         module.get_global_registry = original_func
 
 
-@pytest.mark.asyncio
 async def test_execute_agent_calls_execute(monkeypatch: pytest.MonkeyPatch) -> None:
     """execute_agent 应调用 Agent 的 execute 方法。"""
     mock_plugin = MagicMock()
@@ -328,7 +323,6 @@ async def test_execute_agent_calls_execute(monkeypatch: pytest.MonkeyPatch) -> N
     assert executed_kwargs["task"] == "test_task"
 
 
-@pytest.mark.asyncio
 async def test_execute_agent_keeps_declared_reason(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -405,7 +399,6 @@ def test_get_agent_usable_schemas_returns_list(
     assert result[0]["function"]["name"] == "tool-mock_tool"
 
 
-@pytest.mark.asyncio
 async def test_execute_agent_usable_requires_signature() -> None:
     """signature 为空时应抛出 ValueError。"""
     mock_plugin = MagicMock()
@@ -413,7 +406,6 @@ async def test_execute_agent_usable_requires_signature() -> None:
         await agent_api.execute_agent_usable("", mock_plugin, "stream_123", "tool")
 
 
-@pytest.mark.asyncio
 async def test_execute_agent_usable_requires_plugin() -> None:
     """plugin 为 None 时应抛出 ValueError。"""
     with pytest.raises(ValueError, match="plugin 不能为空"):
@@ -422,7 +414,6 @@ async def test_execute_agent_usable_requires_plugin() -> None:
         )
 
 
-@pytest.mark.asyncio
 async def test_execute_agent_usable_requires_stream_id() -> None:
     """stream_id 为空时应抛出 ValueError。"""
     mock_plugin = MagicMock()
@@ -432,7 +423,6 @@ async def test_execute_agent_usable_requires_stream_id() -> None:
         )
 
 
-@pytest.mark.asyncio
 async def test_execute_agent_usable_requires_usable_name() -> None:
     """usable_name 为空时应抛出 ValueError。"""
     mock_plugin = MagicMock()
@@ -442,7 +432,6 @@ async def test_execute_agent_usable_requires_usable_name() -> None:
         )
 
 
-@pytest.mark.asyncio
 async def test_execute_agent_usable_calls_execute_local_usable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

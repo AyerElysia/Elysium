@@ -89,14 +89,13 @@ class TestPermissionManagerPersonId:
 class TestPermissionManagerUserPermissionLevel:
     """测试用户权限等级管理。"""
     
-    @pytest.mark.asyncio
     async def test_get_user_permission_level_exists(self) -> None:
         """测试获取已存在用户的权限等级。"""
         manager = PermissionManager()
         
         mock_group = PermissionGroups(
             person_id="test_person_id",
-            level="operator",
+            permission_level="operator",
         )
         
         with patch.object(manager._group_crud, 'get_by', new_callable=AsyncMock) as mock_get:
@@ -107,7 +106,6 @@ class TestPermissionManagerUserPermissionLevel:
             assert level == PermissionLevel.OPERATOR
             mock_get.assert_called_once_with(person_id="test_person_id")
     
-    @pytest.mark.asyncio
     async def test_get_user_permission_level_not_exists(self) -> None:
         """测试获取不存在用户的权限等级返回 USER。"""
         manager = PermissionManager()
@@ -119,7 +117,6 @@ class TestPermissionManagerUserPermissionLevel:
             
             assert level == PermissionLevel.USER
     
-    @pytest.mark.asyncio
     async def test_get_user_permission_level_master_user(self) -> None:
         """测试 Master 用户返回 OWNER 权限。"""
         manager = PermissionManager()
@@ -137,7 +134,6 @@ class TestPermissionManagerUserPermissionLevel:
 class TestPermissionManagerSetUserPermissionGroup:
     """测试设置用户权限组功能。"""
     
-    @pytest.mark.asyncio
     async def test_set_user_permission_group_new_user(self) -> None:
         """测试为新用户设置权限组。"""
         manager = PermissionManager()
@@ -148,12 +144,12 @@ class TestPermissionManagerSetUserPermissionGroup:
             mock_get.return_value = None
             mock_create.return_value = PermissionGroups(
                 person_id="new_user",
-                level="operator",
+                permission_level="operator",
             )
             
             await manager.set_user_permission_group(
                 person_id="new_user",
-                level=PermissionLevel.OPERATOR
+                permission_level=PermissionLevel.OPERATOR
             )
             
             mock_create.assert_called_once()
@@ -161,7 +157,6 @@ class TestPermissionManagerSetUserPermissionGroup:
             assert call_kwargs['person_id'] == "new_user"
             assert call_kwargs['level'] == "operator"
     
-    @pytest.mark.asyncio
     async def test_set_user_permission_group_existing_user(self) -> None:
         """测试为已存在用户更新权限组。"""
         manager = PermissionManager()
@@ -169,7 +164,7 @@ class TestPermissionManagerSetUserPermissionGroup:
         existing_group = PermissionGroups(
             id=1,
             person_id="existing_user",
-            level="user",
+            permission_level="user",
         )
         
         with patch.object(manager._group_crud, 'get_by', new_callable=AsyncMock) as mock_get, \
@@ -179,16 +174,15 @@ class TestPermissionManagerSetUserPermissionGroup:
             
             await manager.set_user_permission_group(
                 person_id="existing_user",
-                level=PermissionLevel.OPERATOR
+                permission_level=PermissionLevel.OPERATOR
             )
             
-            mock_update.assert_called_once_with(1, level="operator")
+            mock_update.assert_called_once_with(1, permission_level="operator")
 
 
 class TestPermissionManagerRemoveUserPermissionGroup:
     """测试移除用户权限组功能。"""
     
-    @pytest.mark.asyncio
     async def test_remove_user_permission_group_exists(self) -> None:
         """测试移除已存在的权限组。"""
         manager = PermissionManager()
@@ -196,7 +190,7 @@ class TestPermissionManagerRemoveUserPermissionGroup:
         existing_group = PermissionGroups(
             id=1,
             person_id="test_user",
-            level="operator",
+            permission_level="operator",
         )
         
         with patch.object(manager._group_crud, 'get_by', new_callable=AsyncMock) as mock_get, \
@@ -210,7 +204,6 @@ class TestPermissionManagerRemoveUserPermissionGroup:
             assert result is True
             mock_delete.assert_called_once_with(1)
     
-    @pytest.mark.asyncio
     async def test_remove_user_permission_group_not_exists(self) -> None:
         """测试移除不存在的权限组返回 False。"""
         manager = PermissionManager()
@@ -226,7 +219,6 @@ class TestPermissionManagerRemoveUserPermissionGroup:
 class TestPermissionManagerCheckCommandPermission:
     """测试命令权限检查功能。"""
     
-    @pytest.mark.asyncio
     async def test_check_command_permission_allowed_by_group(self) -> None:
         """测试通过权限组允许的命令。"""
         manager = PermissionManager()
@@ -248,7 +240,6 @@ class TestPermissionManagerCheckCommandPermission:
             assert has_perm is True
             assert reason == PermissionCheckResult.ALLOWED
     
-    @pytest.mark.asyncio
     async def test_check_command_permission_denied_by_group(self) -> None:
         """测试通过权限组拒绝的命令。"""
         manager = PermissionManager()
@@ -270,7 +261,6 @@ class TestPermissionManagerCheckCommandPermission:
             assert has_perm is False
             assert reason == PermissionCheckResult.DENIED_BY_GROUP
     
-    @pytest.mark.asyncio
     async def test_check_command_permission_override_allow(self) -> None:
         """测试命令覆盖权限允许。"""
         manager = PermissionManager()
@@ -302,7 +292,6 @@ class TestPermissionManagerCheckCommandPermission:
 class TestPermissionManagerGrantCommandPermission:
     """测试授予命令权限功能。"""
     
-    @pytest.mark.asyncio
     async def test_grant_command_permission_new(self) -> None:
         """测试授予新的命令权限。"""
         manager = PermissionManager()
@@ -325,7 +314,6 @@ class TestPermissionManagerGrantCommandPermission:
             
             mock_create.assert_called_once()
     
-    @pytest.mark.asyncio
     async def test_grant_command_permission_update_existing(self) -> None:
         """测试更新已存在的命令权限。"""
         manager = PermissionManager()
@@ -354,7 +342,6 @@ class TestPermissionManagerGrantCommandPermission:
 class TestPermissionManagerEdgeCases:
     """测试边界条件。"""
     
-    @pytest.mark.asyncio
     async def test_empty_person_id(self) -> None:
         """测试空 person_id。"""
         manager = PermissionManager()
@@ -366,14 +353,13 @@ class TestPermissionManagerEdgeCases:
             
             assert level == PermissionLevel.USER
     
-    @pytest.mark.asyncio
     async def test_invalid_permission_level_string(self) -> None:
         """测试无效的权限等级字符串。"""
         manager = PermissionManager()
         
         mock_group = PermissionGroups(
             person_id="test_user",
-            level="invalid_level",
+            permission_level="invalid_level",
         )
         
         with patch.object(manager._group_crud, 'get_by', new_callable=AsyncMock) as mock_get:

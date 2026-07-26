@@ -19,7 +19,6 @@ from src.core.models.sql_alchemy import Messages
 class TestDatabaseAPI:
     """测试数据库 API。"""
     
-    @pytest.mark.asyncio
     async def test_get_by_id(self) -> None:
         """测试通过 ID 查询。"""
         with patch('src.app.plugin_system.api.database_api.CRUDBase') as mock_crud:
@@ -34,7 +33,6 @@ class TestDatabaseAPI:
             assert result is not None
             assert result.id == 1
     
-    @pytest.mark.asyncio
     async def test_get_by(self) -> None:
         """测试条件查询。"""
         with patch('src.app.plugin_system.api.database_api.CRUDBase') as mock_crud:
@@ -49,7 +47,6 @@ class TestDatabaseAPI:
             assert result is not None
             assert result.id == 1
     
-    @pytest.mark.asyncio
     async def test_create(self) -> None:
         """测试创建记录。"""
         with patch('src.app.plugin_system.api.database_api.CRUDBase') as mock_crud:
@@ -64,7 +61,6 @@ class TestDatabaseAPI:
             assert result is not None
             assert result.id == 1
     
-    @pytest.mark.asyncio
     async def test_update(self) -> None:
         """测试更新记录。"""
         with patch('src.app.plugin_system.api.database_api.CRUDBase') as mock_crud:
@@ -79,7 +75,6 @@ class TestDatabaseAPI:
             assert result is not None
             assert result.id == 1
     
-    @pytest.mark.asyncio
     async def test_delete(self) -> None:
         """测试删除记录。"""
         with patch('src.app.plugin_system.api.database_api.CRUDBase') as mock_crud:
@@ -91,7 +86,6 @@ class TestDatabaseAPI:
             
             assert result is True
     
-    @pytest.mark.asyncio
     async def test_bulk_create(self) -> None:
         """测试批量创建。"""
         with patch('src.app.plugin_system.api.database_api.CRUDBase') as mock_crud:

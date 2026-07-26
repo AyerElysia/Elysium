@@ -110,7 +110,6 @@ def test_document_upsert_rejects_runtime_path_before_creating_rows(tmp_path: Pat
     assert db.execute("SELECT COUNT(*) FROM memory_nodes").fetchone()[0] == 0
 
 
-@pytest.mark.asyncio
 async def test_file_tool_does_not_sync_ineligible_runtime_file(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -130,7 +129,6 @@ async def test_file_tool_does_not_sync_ineligible_runtime_file(
     upsert_document.assert_not_awaited()
 
 
-@pytest.mark.asyncio
 async def test_fetch_memory_tool_rejects_runtime_file(tmp_path: Path) -> None:
     from plugins.life_engine.core.config import LifeEngineConfig
     from plugins.life_engine.tools.file_tools import FetchLifeMemoryTool
@@ -156,7 +154,6 @@ async def test_fetch_memory_tool_rejects_runtime_file(tmp_path: Path) -> None:
     ]
 
 
-@pytest.mark.asyncio
 async def test_sync_embedding_skips_ineligible_runtime_file() -> None:
     from plugins.life_engine.memory.search import sync_embedding
 
@@ -175,7 +172,6 @@ async def test_sync_embedding_skips_ineligible_runtime_file() -> None:
     collection.upsert.assert_not_called()
 
 
-@pytest.mark.asyncio
 async def test_dream_archive_skips_ineligible_runtime_path(tmp_path: Path) -> None:
     from plugins.life_engine.dream.residue import DreamReport, integrate_archive_into_memory
 
@@ -206,7 +202,6 @@ def test_stored_document_paths_must_already_be_canonical(path: str, reason: str)
     assert decision.reason == reason
 
 
-@pytest.mark.asyncio
 async def test_file_tool_syncs_only_canonical_safe_workspace_document(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -250,7 +245,6 @@ async def test_file_tool_syncs_only_canonical_safe_workspace_document(
     assert isinstance(args.kwargs["source_mtime"], float)
 
 
-@pytest.mark.asyncio
 async def test_fetch_memory_rejects_noncanonical_paths_without_creating_workspace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -281,7 +275,6 @@ async def test_fetch_memory_rejects_noncanonical_paths_without_creating_workspac
     assert workspace.exists() is False
 
 
-@pytest.mark.asyncio
 async def test_fetch_memory_rejects_noncanonical_lineage_resolution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -318,7 +311,6 @@ async def test_fetch_memory_rejects_noncanonical_lineage_resolution(
     ]
 
 
-@pytest.mark.asyncio
 async def test_dream_archive_indexes_only_canonical_safe_seed_refs(tmp_path: Path) -> None:
     from plugins.life_engine.dream.residue import DreamReport, integrate_archive_into_memory
     from plugins.life_engine.dream.seeds import DreamSeed
@@ -376,7 +368,6 @@ async def test_dream_archive_indexes_only_canonical_safe_seed_refs(tmp_path: Pat
     create_or_update_edge.assert_awaited_once()
 
 
-@pytest.mark.asyncio
 async def test_dream_archive_writes_sqlite_fts_and_outbox_without_collection_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

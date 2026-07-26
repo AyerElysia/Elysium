@@ -102,7 +102,6 @@ def test_timeout_detection_follows_httpx_exception_chain() -> None:
     assert MessageSender._is_timeout_exception(RuntimeError("send failed")) is False
 
 
-@pytest.mark.asyncio
 async def test_send_message_overrides_sender_with_bot_info(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -145,7 +144,6 @@ async def test_send_message_overrides_sender_with_bot_info(
     ]
 
 
-@pytest.mark.asyncio
 async def test_normal_duplicate_messages_are_both_sent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -184,7 +182,6 @@ async def test_normal_duplicate_messages_are_both_sent(
     ]
 
 
-@pytest.mark.asyncio
 async def test_send_timeout_suppresses_only_matching_immediate_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -232,7 +229,6 @@ async def test_send_timeout_suppresses_only_matching_immediate_retry(
     ]
 
 
-@pytest.mark.asyncio
 async def test_timeout_fingerprint_keeps_media_and_target_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -316,7 +312,6 @@ async def test_timeout_fingerprint_keeps_media_and_target_identity(
     ]
 
 
-@pytest.mark.asyncio
 async def test_non_timeout_failure_does_not_suppress_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -352,7 +347,6 @@ async def test_non_timeout_failure_does_not_suppress_retry(
     stream_manager.add_sent_message_to_history.assert_awaited_once_with(retry)
 
 
-@pytest.mark.asyncio
 async def test_send_and_delivery_events_wrap_adapter_and_history_persistence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -409,7 +403,6 @@ async def test_send_and_delivery_events_wrap_adapter_and_history_persistence(
     assert "continue_send" not in delivered_params
 
 
-@pytest.mark.asyncio
 async def test_failed_adapter_send_emits_only_pre_send_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -443,7 +436,6 @@ async def test_failed_adapter_send_emits_only_pre_send_event(
     assert event_manager.publish_event.await_args.args[0] is EventType.ON_MESSAGE_SENT
 
 
-@pytest.mark.asyncio
 async def test_continue_send_false_intercepts_before_adapter_and_history(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -484,7 +476,6 @@ async def test_continue_send_false_intercepts_before_adapter_and_history(
     event_manager.publish_event.assert_awaited_once()
 
 
-@pytest.mark.asyncio
 async def test_virtual_send_events_wrap_history_persistence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -527,7 +518,6 @@ async def test_virtual_send_events_wrap_history_persistence(
     assert params["adapter_signature"] == "live_bridge:adapter:virtual_live"
 
 
-@pytest.mark.asyncio
 async def test_virtual_send_can_be_intercepted_before_history(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -562,7 +552,6 @@ async def test_virtual_send_can_be_intercepted_before_history(
     assert event_manager.publish_event.await_args.args[0] is EventType.ON_MESSAGE_SENT
 
 
-@pytest.mark.asyncio
 async def test_missing_stream_id_does_not_emit_delivery_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

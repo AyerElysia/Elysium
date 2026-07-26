@@ -19,7 +19,6 @@ class _Captured:
     called: bool = False
 
 
-@pytest.mark.asyncio
 async def test_send_text_infers_platform_from_stream_info(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -77,7 +76,6 @@ async def test_send_text_infers_platform_from_stream_info(
     assert getattr(captured.message, "platform") == "wx"
 
 
-@pytest.mark.asyncio
 async def test_send_text_returns_false_when_platform_cannot_be_resolved(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -113,7 +111,6 @@ async def test_send_text_returns_false_when_platform_cannot_be_resolved(
     assert ok is False
 
 
-@pytest.mark.asyncio
 async def test_broadcast_text_resolves_platform_per_stream_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

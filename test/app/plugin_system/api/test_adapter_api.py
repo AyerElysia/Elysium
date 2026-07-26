@@ -21,7 +21,6 @@ from src.core.components.base.adapter import BaseAdapter
 class TestAdapterAPI:
     """测试适配器 API。"""
     
-    @pytest.mark.asyncio
     async def test_start_adapter(self) -> None:
         """测试启动适配器。"""
         with patch('src.app.plugin_system.api.adapter_api._get_adapter_manager') as mock_get_mgr:
@@ -33,7 +32,6 @@ class TestAdapterAPI:
             
             assert result is True
     
-    @pytest.mark.asyncio
     async def test_stop_adapter(self) -> None:
         """测试停止适配器。"""
         with patch('src.app.plugin_system.api.adapter_api._get_adapter_manager') as mock_get_mgr:
@@ -45,7 +43,6 @@ class TestAdapterAPI:
             
             assert result is True
     
-    @pytest.mark.asyncio
     async def test_restart_adapter(self) -> None:
         """测试重启适配器。"""
         with patch('src.app.plugin_system.api.adapter_api._get_adapter_manager') as mock_get_mgr:
@@ -103,7 +100,6 @@ class TestAdapterAPI:
             
             assert result is True
     
-    @pytest.mark.asyncio
     async def test_stop_all_adapters(self) -> None:
         """测试停止所有适配器。"""
         with patch('src.app.plugin_system.api.adapter_api._get_adapter_manager') as mock_get_mgr:
@@ -115,7 +111,6 @@ class TestAdapterAPI:
             
             assert len(result) == 2
     
-    @pytest.mark.asyncio
     async def test_get_bot_info_by_platform(self) -> None:
         """测试获取平台 Bot 信息。"""
         with patch('src.app.plugin_system.api.adapter_api._get_adapter_manager') as mock_get_mgr:
@@ -129,7 +124,6 @@ class TestAdapterAPI:
             assert result is not None
             assert result["name"] == "test_bot"
     
-    @pytest.mark.asyncio
     async def test_send_adapter_command(self) -> None:
         """测试发送适配器命令。"""
         with patch('src.app.plugin_system.api.adapter_api._get_adapter_manager') as mock_get_mgr:

@@ -23,7 +23,6 @@ def test_utility_commands_plugin_exposes_clear_command() -> None:
     assert ClearContextCommand in plugin.get_components()
 
 
-@pytest.mark.asyncio
 async def test_clear_context_command_clears_current_stream() -> None:
     """根命令应清空当前流上下文。"""
     plugin = _build_plugin()
@@ -44,7 +43,6 @@ async def test_clear_context_command_clears_current_stream() -> None:
     send_text_mock.assert_awaited_once_with("✓ 当前聊天上下文已清空。", stream_id="stream-current")
 
 
-@pytest.mark.asyncio
 async def test_clear_context_command_clears_specific_group_stream() -> None:
     """指定群号时应根据当前平台生成目标 stream_id。"""
     plugin = _build_plugin()
@@ -70,7 +68,6 @@ async def test_clear_context_command_clears_specific_group_stream() -> None:
     send_text_mock.assert_awaited_once_with("✓ 群 12345 的上下文已清空。", stream_id="stream-current")
 
 
-@pytest.mark.asyncio
 async def test_clear_context_command_bulk_clear_all() -> None:
     """全部子命令应调用批量清空接口。"""
     plugin = _build_plugin()

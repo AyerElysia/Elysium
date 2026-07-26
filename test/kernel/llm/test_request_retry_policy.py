@@ -49,7 +49,6 @@ def _model(identifier: str, *, max_retry: int):
     }
 
 
-@pytest.mark.asyncio
 async def test_retry_is_driven_by_policy_switch_or_retry():
     # a 会失败一次；max_retry=0 => policy 应立刻切换到 b
     model_set = [_model("a", max_retry=0), _model("b", max_retry=0)]
@@ -62,7 +61,6 @@ async def test_retry_is_driven_by_policy_switch_or_retry():
     assert dummy.calls == ["a", "b"]
 
 
-@pytest.mark.asyncio
 async def test_forced_stream_collection_error_is_retried_inside_request():
     model_set = [
         {**_model("a", max_retry=0), "force_stream_mode": True},
@@ -101,7 +99,6 @@ async def test_forced_stream_collection_error_is_retried_inside_request():
     assert dummy.calls == [("a", True), ("b", False)]
 
 
-@pytest.mark.asyncio
 async def test_forced_stream_precollection_keeps_response_awaitable():
     model_set = [{**_model("a", max_retry=0), "force_stream_mode": True}]
 
@@ -131,7 +128,6 @@ async def test_forced_stream_precollection_keeps_response_awaitable():
     assert await resp == "hello world"
 
 
-@pytest.mark.asyncio
 async def test_retry_skips_permanent_404_and_switches_model():
     model_set = [_model("a", max_retry=3), _model("b", max_retry=0)]
 

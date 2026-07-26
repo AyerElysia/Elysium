@@ -60,7 +60,6 @@ class TestTaskInfo:
         assert isinstance(task_info.created_at, datetime)
         assert task_info.group_name is None
 
-    @pytest.mark.asyncio
     async def test_task_info_status_methods(self) -> None:
         """测试 TaskInfo 状态方法"""
         async def sample_task():
@@ -96,7 +95,6 @@ class TestTaskManager:
         assert tm1 is tm2
         assert isinstance(tm1, TaskManager)
 
-    @pytest.mark.asyncio
     async def test_create_task(self) -> None:
         """测试创建任务"""
         tm = get_task_manager()
@@ -116,7 +114,6 @@ class TestTaskManager:
         result = await task_info.task
         assert result == "result"
 
-    @pytest.mark.asyncio
     async def test_create_daemon_task(self) -> None:
         """测试创建守护任务"""
         tm = get_task_manager()
@@ -128,7 +125,6 @@ class TestTaskManager:
         assert task_info.daemon is True
         await task_info.task
 
-    @pytest.mark.asyncio
     async def test_wait_all_tasks(self) -> None:
         """测试等待所有任务完成"""
         tm = get_task_manager()
@@ -167,7 +163,6 @@ class TestTaskManager:
         active_non_daemon = [t for t in active_tasks if not t.daemon]
         assert len(active_non_daemon) == 0
 
-    @pytest.mark.asyncio
     async def test_cancel_task(self) -> None:
         """测试取消任务"""
         tm = get_task_manager()
@@ -190,7 +185,6 @@ class TestTaskManager:
 
         assert task_info.is_cancelled()
 
-    @pytest.mark.asyncio
     async def test_get_task_stats(self) -> None:
         """测试获取任务统计"""
         tm = get_task_manager()
@@ -207,7 +201,6 @@ class TestTaskManager:
         assert stats["total_tasks"] >= 2
         assert stats["daemon_tasks"] >= 1
 
-    @pytest.mark.asyncio
     async def test_to_process(self) -> None:
         """测试提交函数到进程池执行"""
         tm = TaskManager(process_workers=1)
@@ -219,7 +212,6 @@ class TestTaskManager:
 
         assert result == 3
 
-    @pytest.mark.asyncio
     async def test_to_process_timeout(self) -> None:
         """测试进程池任务超时"""
         tm = TaskManager(process_workers=1)
@@ -234,7 +226,6 @@ class TestTaskManager:
 class TestTaskGroup:
     """测试 TaskGroup 类"""
 
-    @pytest.mark.asyncio
     async def test_task_group_context_manager(self) -> None:
         """测试 TaskGroup 上下文管理器"""
         tm = get_task_manager()
@@ -260,7 +251,6 @@ class TestTaskGroup:
         assert t1.is_done()
         assert t2.is_done()
 
-    @pytest.mark.asyncio
     async def test_task_group_shared(self) -> None:
         """测试 TaskGroup 共享"""
         tm = get_task_manager()
@@ -285,7 +275,6 @@ class TestTaskGroup:
         async with group2 as tg:
             tg.create_task(task2())
 
-    @pytest.mark.asyncio
     async def test_task_group_cancel_on_error(self) -> None:
         """测试 TaskGroup 错误时取消其他任务"""
         tm = get_task_manager()
@@ -397,7 +386,6 @@ class TestWatchDog:
 class TestIntegration:
     """集成测试"""
 
-    @pytest.mark.asyncio
     async def test_task_manager_with_watchdog(self) -> None:
         """测试 TaskManager 与 WatchDog 集成"""
         tm = get_task_manager()
@@ -464,7 +452,6 @@ class TestTaskInfoEdgeCases:
         assert task_info.get_result() is None
         assert task_info.cancel() is False
 
-    @pytest.mark.asyncio
     async def test_task_info_repr_statuses(self) -> None:
         """测试 __repr__ 方法的各种状态"""
         # 测试 running 状态
@@ -507,7 +494,6 @@ class TestTaskInfoEdgeCases:
         repr_cancelled = repr(task_info_cancelled)
         assert "cancelled" in repr_cancelled
 
-    @pytest.mark.asyncio
     async def test_task_info_repr_with_options(self) -> None:
         """测试 __repr__ 的 daemon 和 group 选项"""
         async def sample_task():
@@ -527,7 +513,6 @@ class TestTaskInfoEdgeCases:
         assert "@my_group" in repr_str
         await task
 
-    @pytest.mark.asyncio
     async def test_task_info_failed_status(self) -> None:
         """测试失败状态"""
         async def failing_task():
@@ -545,7 +530,6 @@ class TestTaskInfoEdgeCases:
         assert task_info.is_failed()
         assert isinstance(task_info.get_exception(), ValueError)
 
-    @pytest.mark.asyncio
     async def test_task_info_get_result_raises(self) -> None:
         """测试 get_result 在任务失败时抛出异常"""
         async def failing_task():
@@ -586,7 +570,6 @@ class TestTaskManagerEdgeCases:
             with pytest.raises(RuntimeError, match="must be called within an async context"):
                 tm.create_task(dummy_task())
 
-    @pytest.mark.asyncio
     async def test_get_task_not_found(self) -> None:
         """测试获取不存在的任务"""
         tm = get_task_manager()
@@ -594,20 +577,17 @@ class TestTaskManagerEdgeCases:
         with pytest.raises(TaskNotFoundError):
             tm.get_task("nonexistent_task_id")
 
-    @pytest.mark.asyncio
     async def test_cancel_task_not_found(self) -> None:
         """测试取消不存在的任务返回 False"""
         tm = get_task_manager()
         result = tm.cancel_task("nonexistent_task_id")
         assert result is False
 
-    @pytest.mark.asyncio
     async def test_wait_all_tasks_empty(self) -> None:
         """测试等待空任务列表"""
         tm = get_task_manager()
         await tm.wait_all_tasks()  # 应该正常返回
 
-    @pytest.mark.asyncio
     async def test_wait_all_tasks_with_daemon(self) -> None:
         """测试 wait_all_tasks 不等待守护任务"""
         tm = get_task_manager()
@@ -620,7 +600,6 @@ class TestTaskManagerEdgeCases:
         # wait_all_tasks 应该立即返回（不等待守护任务）
         await asyncio.wait_for(tm.wait_all_tasks(), timeout=0.1)
 
-    @pytest.mark.asyncio
     async def test_cleanup_tasks_empty(self) -> None:
         """测试清理空任务列表"""
         tm = get_task_manager()
@@ -632,7 +611,6 @@ class TestTaskManagerEdgeCases:
         cleaned = tm.cleanup_tasks()
         assert cleaned == 0
 
-    @pytest.mark.asyncio
     async def test_get_all_tasks(self) -> None:
         """测试获取所有任务"""
         tm = get_task_manager()
@@ -648,7 +626,6 @@ class TestTaskManagerEdgeCases:
 
         await task_info.task
 
-    @pytest.mark.asyncio
     async def test_get_task_count(self) -> None:
         """测试获取任务数量"""
         tm = get_task_manager()
@@ -662,7 +639,6 @@ class TestTaskManagerEdgeCases:
 
         assert new_count >= initial_count + 1
 
-    @pytest.mark.asyncio
     async def test_get_active_task_count(self) -> None:
         """测试获取活跃任务数量"""
         tm = get_task_manager()
@@ -675,7 +651,6 @@ class TestTaskManagerEdgeCases:
 
         assert active_count >= 1
 
-    @pytest.mark.asyncio
     async def test_task_manager_repr(self) -> None:
         """测试 TaskManager __repr__"""
         tm = get_task_manager()
@@ -684,7 +659,6 @@ class TestTaskManagerEdgeCases:
         assert "total=" in repr_str
         assert "active=" in repr_str
 
-    @pytest.mark.asyncio
     async def test_task_done_callback_with_exception(self) -> None:
         """测试任务完成回调处理异常"""
         tm = get_task_manager()
@@ -702,7 +676,6 @@ class TestTaskManagerEdgeCases:
 class TestTaskGroupEdgeCases:
     """测试 TaskGroup 边界情况"""
 
-    @pytest.mark.asyncio
     async def test_task_group_empty_tasks(self) -> None:
         """测试空任务组"""
         tm = get_task_manager()
@@ -711,7 +684,6 @@ class TestTaskGroupEdgeCases:
             assert tg.get_task_count() == 0
             assert tg.get_active_task_count() == 0
 
-    @pytest.mark.asyncio
     async def test_task_group_timeout(self) -> None:
         """测试任务组超时"""
         tm = get_task_manager()
@@ -724,7 +696,6 @@ class TestTaskGroupEdgeCases:
 
         # 任务应该被取消
 
-    @pytest.mark.asyncio
     async def test_task_group_cancel_on_error_false(self) -> None:
         """测试 cancel_on_error=False"""
         tm = get_task_manager()
@@ -743,7 +714,6 @@ class TestTaskGroupEdgeCases:
         except ValueError:
             pass
 
-    @pytest.mark.asyncio
     async def test_task_group_repr(self) -> None:
         """测试 TaskGroup __repr__"""
         tg = TaskGroup(name="test_group")
@@ -757,7 +727,6 @@ class TestTaskGroupEdgeCases:
             repr_str_active = repr(tg)
             assert "active" in repr_str_active
 
-    @pytest.mark.asyncio
     async def test_task_group_is_active(self) -> None:
         """测试 is_active 方法"""
         tm = get_task_manager()
@@ -770,7 +739,6 @@ class TestTaskGroupEdgeCases:
 
         assert not tg.is_active()
 
-    @pytest.mark.asyncio
     async def test_task_group_get_task_count(self) -> None:
         """测试 get_task_count 方法"""
         tm = get_task_manager()
@@ -783,7 +751,6 @@ class TestTaskGroupEdgeCases:
             tg.create_task(dummy_task())
             assert tg.get_task_count() == 2
 
-    @pytest.mark.asyncio
     async def test_task_group_get_active_task_count(self) -> None:
         """测试 get_active_task_count 方法"""
         tm = get_task_manager()
@@ -802,21 +769,18 @@ class TestTaskGroupEdgeCases:
             await asyncio.sleep(0.02)
             assert tg.get_active_task_count() == 1
 
-    @pytest.mark.asyncio
     async def test_task_group_wait_all_with_none_tasks(self) -> None:
         """测试 _wait_all_tasks 没有任务"""
         tg = TaskGroup(name="test_group")
         # 直接调用私有方法测试
         await tg._wait_all_tasks()
 
-    @pytest.mark.asyncio
     async def test_task_group_cancel_all_empty(self) -> None:
         """测试 _cancel_all_tasks 没有任务"""
         tg = TaskGroup(name="test_group")
         # 直接调用私有方法测试
         await tg._cancel_all_tasks()
 
-    @pytest.mark.asyncio
     async def test_task_group_with_exception_in_context(self) -> None:
         """测试上下文管理器传入异常"""
         tm = get_task_manager()
@@ -831,7 +795,6 @@ class TestTaskGroupEdgeCases:
         except RuntimeError:
             pass
 
-    @pytest.mark.asyncio
     async def test_task_group_cancelled_error_propagation(self) -> None:
         """测试 CancelledError 传播"""
         tm = get_task_manager()
@@ -1008,7 +971,6 @@ class TestWatchDogEdgeCases:
         assert stats_running["thread_alive"] is True
         wd.stop()
 
-    @pytest.mark.asyncio
     @pytest.mark.slow
     async def test_watchdog_with_task_manager_integration(self) -> None:
         """测试 WatchDog 与 TaskManager 深度集成"""
@@ -1184,7 +1146,6 @@ class TestWatchDogStreamMonitoring:
 class TestConcurrencyModuleRepr:
     """测试各类的 __repr__ 方法"""
 
-    @pytest.mark.asyncio
     async def test_task_manager_repr_comprehensive(self) -> None:
         """测试 TaskManager __repr__ 的全面情况"""
         tm = get_task_manager()
@@ -1215,7 +1176,6 @@ class TestConcurrencyModuleRepr:
 
         await tm.wait_all_tasks()
 
-    @pytest.mark.asyncio
     async def test_task_info_repr_comprehensive(self) -> None:
         """测试 TaskInfo __repr__ 的全面情况"""
         async def sample_task():
@@ -1272,7 +1232,6 @@ class TestConcurrencyModuleRepr:
 class TestTaskManagerGroupManagement:
     """测试 TaskManager 的组管理功能"""
 
-    @pytest.mark.asyncio
     async def test_task_manager_get_existing_group(self) -> None:
         """测试获取已存在的组"""
         tm = get_task_manager()
@@ -1284,7 +1243,6 @@ class TestTaskManagerGroupManagement:
         # 应该返回同一个对象
         assert group1 is group2
 
-    @pytest.mark.asyncio
     async def test_task_manager_group_with_different_params(self) -> None:
         """测试同名组使用不同参数（第一个有效）"""
         tm = get_task_manager()
@@ -1297,7 +1255,6 @@ class TestTaskManagerGroupManagement:
         assert group1 is group2
         assert group1.timeout == 10.0
 
-    @pytest.mark.asyncio
     async def test_task_manager_cleanup_tasks_in_group(self) -> None:
         """测试清理组内已完成的任务"""
         tm = get_task_manager()
@@ -1319,13 +1276,11 @@ class TestTaskManagerGroupManagement:
 class TestAdditionalCoverage:
     """额外测试用例以覆盖剩余代码"""
 
-    @pytest.mark.asyncio
     async def test_task_info_is_failed_with_none_task(self) -> None:
         """测试 task 为 None 时 is_failed 返回 False"""
         task_info = TaskInfo(task_id="test_id", task=None)
         assert not task_info.is_failed()
 
-    @pytest.mark.asyncio
     async def test_task_info_repr_completed_status(self) -> None:
         """测试 __repr__ 中 completed 状态"""
         async def sample_task():
@@ -1338,7 +1293,6 @@ class TestAdditionalCoverage:
         repr_str = repr(task_info)
         assert "completed" in repr_str
 
-    @pytest.mark.asyncio
     async def test_task_group_wait_all_with_pending(self) -> None:
         """测试 _wait_all_tasks 有 pending 任务"""
         tm = get_task_manager()
@@ -1350,7 +1304,6 @@ class TestAdditionalCoverage:
             tg.create_task(long_task())
             # 任务会因超时被取消
 
-    @pytest.mark.asyncio
     async def test_task_group_cancel_all_with_done_tasks(self) -> None:
         """测试 _cancel_all_tasks 包含已完成任务"""
         tg = TaskGroup(name="cancel_done_test")
@@ -1367,7 +1320,6 @@ class TestAdditionalCoverage:
             # 调用 cancel_all，已完成任务应被跳过
             await tg._cancel_all_tasks()
 
-    @pytest.mark.asyncio
     async def test_task_group_cancel_all_with_timeout(self) -> None:
         """测试 _cancel_all_tasks 等待超时"""
         tg = TaskGroup(name="cancel_timeout_test")
@@ -1393,7 +1345,6 @@ class TestAdditionalCoverage:
         # 不应该抛出异常
         wd._log("info", "Test")
 
-    @pytest.mark.asyncio
     async def test_watchdog_task_timeout_cancel_fails(self) -> None:
         """测试任务取消失败的情况"""
         tm = get_task_manager()
@@ -1417,7 +1368,6 @@ class TestAdditionalCoverage:
 
         wd.stop()
 
-    @pytest.mark.asyncio
     async def test_task_manager_on_task_done_without_group(self) -> None:
         """测试任务完成回调中无组的情况"""
         tm = get_task_manager()
@@ -1432,7 +1382,6 @@ class TestAdditionalCoverage:
 
         # _on_task_done 应该正常处理（无组的情况）
 
-    @pytest.mark.asyncio
     async def test_watchdog_task_timeout_without_task_manager(self) -> None:
         """测试 WatchDog 没有 TaskManager 时"""
         wd = WatchDog(tick_interval=0.1)
@@ -1443,7 +1392,6 @@ class TestAdditionalCoverage:
 
         wd.stop()
 
-    @pytest.mark.asyncio
     async def test_task_group_exit_with_exception_no_cancel(self) -> None:
         """测试退出时有异常但 cancel_on_error=False"""
         tm = get_task_manager()
@@ -1462,7 +1410,6 @@ class TestAdditionalCoverage:
             pass
         # normal_task 应该完成（没有被取消）
 
-    @pytest.mark.asyncio
     async def test_task_info_repr_with_no_name(self) -> None:
         """测试 TaskInfo 没有名称时的 __repr__"""
         async def sample_task():
@@ -1475,7 +1422,6 @@ class TestAdditionalCoverage:
         assert "test_id"[:8] in repr_str
         await task
 
-    @pytest.mark.asyncio
     async def test_task_group_wait_all_returns_immediately(self) -> None:
         """测试所有任务已完成时立即返回"""
         tg = TaskGroup(name="immediate_return")
@@ -1489,7 +1435,6 @@ class TestAdditionalCoverage:
             # 所有任务已完成，_wait_all_tasks 应该立即返回
             await tg._wait_all_tasks()
 
-    @pytest.mark.asyncio
     async def test_watchdog_with_no_active_tasks(self) -> None:
         """测试 WatchDog 检查任务时没有活跃任务"""
         tm = get_task_manager()
@@ -1503,7 +1448,6 @@ class TestAdditionalCoverage:
 
         wd.stop()
 
-    @pytest.mark.asyncio
     async def test_task_group_cancel_when_exception_set(self) -> None:
         """测试 _exception 已设置时取消任务"""
         tm = get_task_manager()
@@ -1520,26 +1464,22 @@ class TestAdditionalCoverage:
         except ValueError:
             pass  # 预期的异常
 
-    @pytest.mark.asyncio
     async def test_watchdog_log_with_invalid_level(self) -> None:
         """测试使用无效日志级别"""
         wd = WatchDog()
         # 使用无效的级别，应该不会崩溃
         wd._log("invalid", "Test message")
 
-    @pytest.mark.asyncio
     async def test_task_info_is_done_without_task(self) -> None:
         """测试 task 为 None 时 is_done"""
         task_info = TaskInfo(task_id="test_id", task=None)
         assert not task_info.is_done()
 
-    @pytest.mark.asyncio
     async def test_task_info_is_cancelled_without_task(self) -> None:
         """测试 task 为 None 时 is_cancelled"""
         task_info = TaskInfo(task_id="test_id", task=None)
         assert not task_info.is_cancelled()
 
-    @pytest.mark.asyncio
     async def test_task_group_cancelled_error_from_wait(self) -> None:
         """测试 _wait_all_tasks 中 asyncio.wait 抛出 CancelledError"""
         tm = get_task_manager()
@@ -1562,7 +1502,6 @@ class TestAdditionalCoverage:
             with pytest.raises(asyncio.CancelledError):
                 await cancel_during_wait()
 
-    @pytest.mark.asyncio
     async def test_task_group_record_exception_first_time(self) -> None:
         """测试 _record_exception 第一次记录异常"""
         tg = TaskGroup(name="record_test")
@@ -1577,7 +1516,6 @@ class TestAdditionalCoverage:
         tg._record_exception(exc2)
         assert tg._exception is exc1
 
-    @pytest.mark.asyncio
     async def test_watchdog_cancel_task_fails(self) -> None:
         """测试 WatchDog 任务取消失败的情况"""
         tm = get_task_manager()
@@ -1599,7 +1537,6 @@ class TestAdditionalCoverage:
 
         wd.stop()
 
-    @pytest.mark.asyncio
     async def test_task_manager_done_callback_exception_handling(self) -> None:
         """测试任务完成回调中的异常处理逻辑"""
         tm = get_task_manager()
@@ -1612,7 +1549,6 @@ class TestAdditionalCoverage:
             tg.create_task(failing_task())
             # 等待任务完成，_on_task_done 会处理异常
 
-    @pytest.mark.asyncio
     async def test_task_manager_done_callback_with_group_exception(self) -> None:
         """测试任务完成回调记录异常到组"""
         tm = get_task_manager()
@@ -1632,7 +1568,6 @@ class TestAdditionalCoverage:
             # _on_task_done 应该将异常记录到组中
             # 由于任务失败且属于组，异常应该被记录
 
-    @pytest.mark.asyncio
     async def test_watchdog_tick_anomaly_log(self) -> None:
         """测试 WatchDog tick 异常检测和日志"""
         wd = WatchDog(tick_interval=0.01)
@@ -1655,7 +1590,6 @@ class TestAdditionalCoverage:
 
         wd.stop()
 
-    @pytest.mark.asyncio
     async def test_task_group_wait_all_cancelled_from_wait(self) -> None:
         """测试 asyncio.wait 抛出 CancelledError"""
         tg = TaskGroup(name="cancel_from_wait")
@@ -1685,7 +1619,6 @@ class TestAdditionalCoverage:
                     cancel_task.cancel()
                 raise
 
-    @pytest.mark.asyncio
     async def test_task_info_is_failed_not_done(self) -> None:
         """测试 is_failed 在任务未完成时返回 False"""
         async def running_task():
@@ -1704,7 +1637,6 @@ class TestAdditionalCoverage:
         except asyncio.CancelledError:
             pass
 
-    @pytest.mark.asyncio
     async def test_task_info_repr_completed_branch(self) -> None:
         """测试 __repr__ 中 completed 分支"""
         async def normal_task():
@@ -1720,7 +1652,6 @@ class TestAdditionalCoverage:
         # 应该显示 completed 状态
         assert "completed" in repr_str
 
-    @pytest.mark.asyncio
     async def test_task_manager_on_task_done_with_exception_in_group(self) -> None:
         """测试 _on_task_done 中任务异常且属于组的逻辑"""
         tm = get_task_manager()
@@ -1741,7 +1672,6 @@ class TestAdditionalCoverage:
 
             # _on_task_done 应该已经处理了这个异常
 
-    @pytest.mark.asyncio
     async def test_task_manager_on_task_done_cancelled_task(self) -> None:
         """测试 _on_task_done 中任务被取消的情况"""
         tm = get_task_manager()
@@ -1764,7 +1694,6 @@ class TestAdditionalCoverage:
 
             # _on_task_done 应该处理被取消的任务（不记录异常）
 
-    @pytest.mark.asyncio
     async def test_watchdog_task_cancel_returns_false(self) -> None:
         """测试任务取消失败的情况（cancel 返回 False）"""
         tm = get_task_manager()
@@ -1784,7 +1713,6 @@ class TestAdditionalCoverage:
 
         wd.stop()
 
-    @pytest.mark.asyncio
     async def test_task_manager_done_callback_full_exception_path(self) -> None:
         """测试 _on_task_done 中完整异常处理路径"""
         tm = get_task_manager()
@@ -1809,7 +1737,6 @@ class TestAdditionalCoverage:
             # _on_task_done 回调应该已经被触发
             # 它应该检测到任务未取消、有异常、属于组、组存在
 
-    @pytest.mark.asyncio
     async def test_task_group_wait_all_handles_wait_cancelled(self) -> None:
         """测试 _wait_all_tasks 中 asyncio.wait 抛出 CancelledError"""
         tg = TaskGroup(name="wait_cancelled")
@@ -1840,7 +1767,6 @@ class TestAdditionalCoverage:
                 # 预期的取消
                 pass
 
-    @pytest.mark.asyncio
     async def test_task_info_repr_all_statuses(self) -> None:
         """测试 __repr__ 所有状态分支"""
         # 测试 completed 状态（非 cancelled 且非 failed）
@@ -1854,7 +1780,6 @@ class TestAdditionalCoverage:
         repr_str = repr(task_info)
         assert "completed" in repr_str
 
-    @pytest.mark.asyncio
     async def test_task_info_is_failed_edge_case(self) -> None:
         """测试 is_failed 在 task 为 None 时返回 False"""
         task_info = TaskInfo(task_id="test_id", task=None)
@@ -1874,7 +1799,6 @@ class TestAdditionalCoverage:
         except asyncio.CancelledError:
             pass
 
-    @pytest.mark.asyncio
     async def test_watchdog_timeout_cancel_failure(self) -> None:
         """测试任务超时但取消失败"""
         tm = get_task_manager()
@@ -1895,7 +1819,6 @@ class TestAdditionalCoverage:
 
         wd.stop()
 
-    @pytest.mark.asyncio
     async def test_task_manager_done_callback_exception_path(self) -> None:
         """测试任务完成回调异常处理的完整路径"""
         tm = get_task_manager()
@@ -1930,7 +1853,6 @@ class TestAdditionalCoverage:
         # 手动触发回调
         tm._on_task_done(task)
 
-    @pytest.mark.asyncio
     async def test_task_group_wait_cancelled_during_wait(self) -> None:
         """测试在 asyncio.wait 期间被取消"""
         tg = TaskGroup(name="cancel_during_wait")
@@ -1958,7 +1880,6 @@ class TestAdditionalCoverage:
             except asyncio.CancelledError:
                 pass
 
-    @pytest.mark.asyncio
     async def test_task_info_is_failed_done_but_none_task(self) -> None:
         """测试 is_failed 当任务已完成但 task 为 None（边界情况）"""
         # 这是一个极端的边界情况，理论上不应该发生
@@ -1969,7 +1890,6 @@ class TestAdditionalCoverage:
         # 所以 is_failed 也应该返回 False
         assert not task_info.is_failed()
 
-    @pytest.mark.asyncio
     async def test_task_info_repr_failed_status(self) -> None:
         """测试 __repr__ 中的 failed 状态"""
         async def failing_task():
@@ -1988,7 +1908,6 @@ class TestAdditionalCoverage:
         repr_str = repr(task_info)
         assert "failed" in repr_str
 
-    @pytest.mark.asyncio
     async def test_watchdog_cancel_fails_logging(self) -> None:
         """测试任务取消失败时的日志记录"""
         tm = get_task_manager()
@@ -2021,7 +1940,6 @@ class TestAdditionalCoverage:
         task_info.task = replacement_task
         tm.cleanup_tasks()
 
-    @pytest.mark.asyncio
     async def test_task_info_is_failed_edge_case_with_mock(self) -> None:
         """测试 is_failed 当 is_done() 返回 True 但 task 为 None"""
         # 创建一个 TaskInfo 并手动设置状态来覆盖第 57 行
@@ -2049,7 +1967,6 @@ class TestAdditionalCoverage:
 
         assert result is False
 
-    @pytest.mark.asyncio
     async def test_task_group_cancelled_error_in_wait_all(self) -> None:
         """测试 _wait_all_tasks 中的 CancelledError"""
         tm = get_task_manager()
@@ -2067,7 +1984,6 @@ class TestAdditionalCoverage:
         with pytest.raises(asyncio.CancelledError):
             await cancellable_context()
 
-    @pytest.mark.asyncio
     async def test_task_group_cancel_all_pending(self) -> None:
         """测试 _cancel_all_tasks 等待取消完成"""
         tg = TaskGroup(name="cancel_pending_test")
@@ -2085,7 +2001,6 @@ class TestAdditionalCoverage:
             # 取消所有任务并等待
             await tg._cancel_all_tasks()
 
-    @pytest.mark.asyncio
     async def test_watchdog_tick_warning(self) -> None:
         """测试 WatchDog tick 间隔异常警告"""
         wd = WatchDog(tick_interval=0.01)
@@ -2103,7 +2018,6 @@ class TestAdditionalCoverage:
         time.sleep(0.01)
         wd.stop()
 
-    @pytest.mark.asyncio
     async def test_watchdog_task_timeout_checks(self) -> None:
         """测试 WatchDog 任务超时检查的所有分支"""
         tm = get_task_manager()
@@ -2133,7 +2047,6 @@ class TestAdditionalCoverage:
 
         wd.stop()
 
-    @pytest.mark.asyncio
     async def test_task_group_wait_all_timeout_pending(self) -> None:
         """测试 _wait_all_tasks 超时后取消 pending"""
         tm = get_task_manager()

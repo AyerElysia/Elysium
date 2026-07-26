@@ -25,7 +25,6 @@ def _plugin(tmp_path: Path) -> SimpleNamespace:
     return SimpleNamespace(config=config)
 
 
-@pytest.mark.asyncio
 async def test_write_and_edit_file_records_trace(tmp_path: Path) -> None:
     plugin = _plugin(tmp_path)
     writer = LifeEngineWriteFileTool(plugin=plugin)
@@ -58,7 +57,6 @@ async def test_write_and_edit_file_records_trace(tmp_path: Path) -> None:
     assert records[1].reason == "initial soul draft"
 
 
-@pytest.mark.asyncio
 async def test_trace_query_tools(tmp_path: Path) -> None:
     plugin = _plugin(tmp_path)
     writer = LifeEngineWriteFileTool(plugin=plugin)

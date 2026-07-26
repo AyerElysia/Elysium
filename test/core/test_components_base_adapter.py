@@ -97,7 +97,6 @@ class TestBaseAdapter:
         assert adapter._health_check_task_info is None
         assert adapter._running is False
 
-    @pytest.mark.asyncio
     async def test_adapter_start(self):
         """测试适配器启动。"""
         mock_sink = MagicMock()
@@ -118,7 +117,6 @@ class TestBaseAdapter:
                 assert adapter._running is True
                 assert adapter._health_check_task_info is not None
 
-    @pytest.mark.asyncio
     async def test_adapter_stop(self):
         """测试适配器停止。"""
         mock_sink = MagicMock()
@@ -138,7 +136,6 @@ class TestBaseAdapter:
                 assert adapter._running is False
                 assert adapter._health_check_task_info is None
 
-    @pytest.mark.asyncio
     async def test_on_adapter_loaded_hook(self):
         """测试适配器加载钩子。"""
         mock_sink = MagicMock()
@@ -147,7 +144,6 @@ class TestBaseAdapter:
         # 默认实现应该不抛出异常
         await adapter.on_adapter_loaded()
 
-    @pytest.mark.asyncio
     async def test_on_adapter_unloaded_hook(self):
         """测试适配器卸载钩子。"""
         mock_sink = MagicMock()
@@ -156,7 +152,6 @@ class TestBaseAdapter:
         # 默认实现应该不抛出异常
         await adapter.on_adapter_unloaded()
 
-    @pytest.mark.asyncio
     async def test_health_check_default(self):
         """测试默认健康检查。"""
         mock_sink = MagicMock()
@@ -168,7 +163,6 @@ class TestBaseAdapter:
         result = await adapter.health_check()
         assert result is True
 
-    @pytest.mark.asyncio
     async def test_health_check_loop(self):
         """测试健康检查循环。"""
         mock_sink = MagicMock()
@@ -189,7 +183,6 @@ class TestBaseAdapter:
 
         # 测试通过，没有异常
 
-    @pytest.mark.asyncio
     async def test_health_check_loop_triggers_reconnect(self):
         """测试健康检查失败时触发重连。"""
         mock_sink = MagicMock()
@@ -212,7 +205,6 @@ class TestBaseAdapter:
                     # 确保重连被调用至少一次
                     assert mock_reconnect.call_count >= 1
 
-    @pytest.mark.asyncio
     async def test_reconnect_default(self):
         """测试默认重连逻辑。"""
         mock_sink = MagicMock()
@@ -227,7 +219,6 @@ class TestBaseAdapter:
         adapter.stop.assert_called_once()
         adapter.start.assert_called_once()
 
-    @pytest.mark.asyncio
     async def test_send_platform_message_not_implemented(self):
         """测试未实现发送消息方法时抛出异常。"""
         mock_sink = MagicMock()
@@ -246,7 +237,6 @@ class TestBaseAdapter:
         with pytest.raises(NotImplementedError):
             await adapter._send_platform_message(mock_envelope)
 
-    @pytest.mark.asyncio
     async def test_send_platform_message_with_transport_config(self):
         """测试有传输配置时发送消息。"""
         mock_sink = MagicMock()
@@ -281,7 +271,6 @@ class CustomAdapterWithHooks(TestAdapter):
 class TestAdapterHooks:
     """测试适配器生命周期钩子。"""
 
-    @pytest.mark.asyncio
     async def test_custom_on_adapter_loaded(self):
         """测试自定义加载钩子被调用。"""
         mock_sink = MagicMock()
@@ -293,7 +282,6 @@ class TestAdapterHooks:
 
         assert CustomAdapterWithHooks.loaded_called is True
 
-    @pytest.mark.asyncio
     async def test_custom_on_adapter_unloaded(self):
         """测试自定义卸载钩子被调用。"""
         mock_sink = MagicMock()
@@ -318,7 +306,6 @@ class CustomAdapterWithHealthCheck(TestAdapter):
 class TestAdapterHealthCheck:
     """测试适配器健康检查功能。"""
 
-    @pytest.mark.asyncio
     async def test_custom_health_check(self):
         """测试自定义健康检查方法。"""
         mock_sink = MagicMock()
@@ -342,7 +329,6 @@ class CustomAdapterWithReconnect(TestAdapter):
 class TestAdapterReconnect:
     """测试适配器重连功能。"""
 
-    @pytest.mark.asyncio
     async def test_custom_reconnect(self):
         """测试自定义重连方法。"""
         mock_sink = MagicMock()
@@ -369,7 +355,6 @@ class TestAdapterReconnect:
 class TestAdapterCommand:
     """测试适配器命令功能（get_bot_info）。"""
 
-    @pytest.mark.asyncio
     async def test_get_bot_info_returns_dict(self):
         """测试 get_bot_info 返回包含必要字段的字典。"""
         mock_sink = MagicMock()
@@ -382,7 +367,6 @@ class TestAdapterCommand:
         assert "bot_name" in result
         assert "platform" in result
 
-    @pytest.mark.asyncio
     async def test_get_bot_info_platform_matches(self):
         """测试 get_bot_info 返回的平台与适配器平台一致。"""
         mock_sink = MagicMock()
@@ -477,7 +461,6 @@ class AdapterWithCommandResponse(TestAdapter):
 class TestAdapterCommandResponseMechanism:
     """测试适配器命令请求-响应机制。"""
 
-    @pytest.mark.asyncio
     async def test_adapter_command_request_response_flow(self):
         """测试完整的命令请求-响应流程。"""
         from mofox_wire import MessageEnvelope
@@ -535,7 +518,6 @@ class TestAdapterCommandResponseMechanism:
         assert response_data["request_id"] == request_id
         assert response_data["response"]["status"] == "ok"
 
-    @pytest.mark.asyncio
     async def test_adapter_command_with_custom_response(self):
         """测试带有自定义响应的命令处理。"""
         mock_sink = MagicMock()
@@ -585,7 +567,6 @@ class TestAdapterCommandResponseMechanism:
         assert response_data["response"] == custom_response
         assert response_data["response"]["data"]["groups"][0]["name"] == "Test Group"
 
-    @pytest.mark.asyncio
     async def test_adapter_command_with_params(self):
         """测试带参数的命令处理。"""
         mock_sink = MagicMock()
@@ -625,7 +606,6 @@ class TestAdapterCommandResponseMechanism:
         assert len(adapter.received_commands) == 1
         assert adapter.received_commands[0]["params"] == params
 
-    @pytest.mark.asyncio
     async def test_adapter_command_error_response(self):
         """测试命令错误响应。"""
         mock_sink = MagicMock()
@@ -675,7 +655,6 @@ class TestAdapterCommandResponseMechanism:
         assert response_data["response"]["status"] == "failed"
         assert response_data["response"]["message"] == "权限不足"
 
-    @pytest.mark.asyncio
     async def test_multiple_commands_sequential(self):
         """测试顺序发送多个命令。"""
         mock_sink = MagicMock()
@@ -724,7 +703,6 @@ class TestAdapterCommandResponseMechanism:
             assert response_data["request_id"] == request_id
             assert response_data["response"]["data"]["action"] == action
 
-    @pytest.mark.asyncio
     async def test_adapter_command_without_core_sink(self):
         """测试没有core_sink时的命令处理。"""
         # 创建没有core_sink的适配器

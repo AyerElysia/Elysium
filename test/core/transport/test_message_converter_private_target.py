@@ -9,7 +9,6 @@ from src.core.models.message import Message, MessageType
 from src.core.transport.message_receive.converter import MessageConverter
 
 
-@pytest.mark.asyncio
 async def test_message_to_envelope_private_target_prefers_stream_person(monkeypatch: pytest.MonkeyPatch) -> None:
     """私聊发送时，当未显式提供 target_user_id，应优先使用 stream 的 person_id，而不是 sender(bot)。"""
     converter = MessageConverter()
@@ -67,7 +66,6 @@ async def test_message_to_envelope_private_target_prefers_stream_person(monkeypa
     helper.person_crud.get_by.assert_awaited_once_with(person_id="hash_person_888")
 
 
-@pytest.mark.asyncio
 async def test_message_to_envelope_private_target_drops_internal_route_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

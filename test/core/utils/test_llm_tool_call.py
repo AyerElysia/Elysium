@@ -21,7 +21,6 @@ class _FakeResponse:
         self.payloads.append(payload)
 
 
-@pytest.mark.asyncio
 async def test_ready_executions_resume_in_call_order() -> None:
     events: list[str] = []
 
@@ -49,7 +48,6 @@ async def test_ready_executions_resume_in_call_order() -> None:
     ]
 
 
-@pytest.mark.asyncio
 async def test_run_tool_call_runs_concurrently_and_appends_in_call_order() -> None:
     events: list[str] = []
 
@@ -97,7 +95,6 @@ async def test_run_tool_call_runs_concurrently_and_appends_in_call_order() -> No
     ]
 
 
-@pytest.mark.asyncio
 async def test_run_tool_call_binds_tool_runtime_stream_context() -> None:
     class StreamAwareTool(BaseTool):
         tool_name = "stream_aware"

@@ -174,7 +174,6 @@ class TestBaseChatter:
 
         reset_system_reminder_store()
 
-    @pytest.mark.asyncio
     async def test_execute_with_messages(self, mock_plugin):
         """测试执行聊天器（有消息）。"""
         chatter = ConcreteChatter("stream_123", mock_plugin)
@@ -193,7 +192,6 @@ class TestBaseChatter:
         assert isinstance(results[1], Success)
         assert results[1].message == "处理完成"
 
-    @pytest.mark.asyncio
     async def test_execute_without_messages(self, mock_plugin):
         """测试执行聊天器（无消息）。"""
         chatter = ConcreteChatter("stream_123", mock_plugin)
@@ -206,7 +204,6 @@ class TestBaseChatter:
         assert isinstance(results[0], Failure)
         assert results[0].error == "没有新消息"
 
-    @pytest.mark.asyncio
     async def test_execute_with_multiple_messages(self, mock_plugin):
         """测试执行聊天器（多条消息）。"""
         chatter = ConcreteChatter("stream_123", mock_plugin)
@@ -222,7 +219,6 @@ class TestBaseChatter:
         assert isinstance(results[1], Success)
         assert results[1].data == {"count": 5}
 
-    @pytest.mark.asyncio
     async def test_modify_llm_usables_uses_owner_plugin_instance(self):
         """测试跨插件组件实例化时使用组件所属插件实例。"""
 
@@ -269,7 +265,6 @@ class TestBaseChatter:
 
         assert CrossPluginTool in result
 
-    @pytest.mark.asyncio
     async def test_modify_llm_usables_filters_by_chatter_allow(self):
         """测试 modify_llm_usables 会按 chatter_allow 过滤组件。"""
 
@@ -312,7 +307,6 @@ class TestBaseChatter:
         assert OpenTool in result
         assert RejectedTool not in result
 
-    @pytest.mark.asyncio
     async def test_exec_llm_usable_uses_owner_plugin_instance(self):
         """测试执行跨插件 Tool 时向管理器传入所属插件实例。"""
 
@@ -353,7 +347,6 @@ class TestBaseChatter:
         assert ok is True
         assert payload == "ok"
 
-    @pytest.mark.asyncio
     async def test_exec_llm_usable_agent_without_global_managers(self):
         """测试执行 Agent 时不通过 Tool/Action 管理器。"""
 
@@ -462,7 +455,6 @@ class TestChatterAttributes:
 class TestChatterExecutePatterns:
     """测试 Chatter 执行模式。"""
 
-    @pytest.mark.asyncio
     async def test_multiple_waits(self, mock_plugin):
         """测试多个 Wait。"""
         class MultiWaitChatter(BaseChatter):
@@ -487,7 +479,6 @@ class TestChatterExecutePatterns:
         assert results[2].time == 3.0
         assert isinstance(results[3], Success)
 
-    @pytest.mark.asyncio
     async def test_immediate_success(self, mock_plugin):
         """测试立即成功。"""
         class ImmediateSuccessChatter(BaseChatter):
@@ -506,7 +497,6 @@ class TestChatterExecutePatterns:
         assert isinstance(results[0], Success)
         assert results[0].message == "立即完成"
 
-    @pytest.mark.asyncio
     async def test_immediate_failure(self, mock_plugin):
         """测试立即失败。"""
         class ImmediateFailureChatter(BaseChatter):
@@ -529,7 +519,6 @@ class TestChatterExecutePatterns:
 class TestUnreadsFlow:
     """测试 fetch_unreads 与 flush_unreads 方法。"""
 
-    @pytest.mark.asyncio
     async def test_fetch_unreads_only_does_not_mutate_context(self, mock_plugin):
         """测试 fetch_unreads 仅读取，不会清空未读或写入历史。"""
         chatter = ConcreteChatter("stream_123", mock_plugin)
@@ -557,7 +546,6 @@ class TestUnreadsFlow:
             assert len(mock_stream.context.unread_messages) == 1
             mock_stream.context.add_history_message.assert_not_called()
 
-    @pytest.mark.asyncio
     async def test_flush_unreads_only_moves_specified_messages(self, mock_plugin):
         """测试 flush_unreads 仅搬运指定未读消息，不影响新增未读。"""
         chatter = ConcreteChatter("stream_123", mock_plugin)
@@ -578,7 +566,6 @@ class TestUnreadsFlow:
             assert mock_stream.context.unread_messages[0].message_id == "msg_2"
             mock_stream.context.add_history_message.assert_called_once_with(msg1)
 
-    @pytest.mark.asyncio
     async def test_fetch_empty_unreads(self, mock_plugin):
         """测试获取空的未读消息。"""
         chatter = ConcreteChatter("stream_123", mock_plugin)
@@ -595,7 +582,6 @@ class TestUnreadsFlow:
             assert text == ""
             assert messages == []
 
-    @pytest.mark.asyncio
     async def test_fetch_single_message(self, mock_plugin):
         """测试获取单条消息。"""
         chatter = ConcreteChatter("stream_123", mock_plugin)
@@ -628,7 +614,6 @@ class TestUnreadsFlow:
             mock_stream.context.add_history_message.assert_called_once_with(msg)
             assert len(mock_stream.context.unread_messages) == 0
 
-    @pytest.mark.asyncio
     async def test_fetch_multiple_messages_grouped(self, mock_plugin):
         """测试获取多条消息（分组模式）。"""
         chatter = ConcreteChatter("stream_123", mock_plugin)
@@ -665,7 +650,6 @@ class TestUnreadsFlow:
             assert mock_stream.context.add_history_message.call_count == 3
             assert len(mock_stream.context.unread_messages) == 0
 
-    @pytest.mark.asyncio
     async def test_fetch_unreads_returns_readable_lines(self, mock_plugin):
         """测试未读消息返回 LLM 可读的消息行。"""
         chatter = ConcreteChatter("stream_123", mock_plugin)
@@ -692,7 +676,6 @@ class TestUnreadsFlow:
             assert len(messages) == 1
             assert flushed == 1
 
-    @pytest.mark.asyncio
     async def test_fetch_with_missing_stream(self, mock_plugin):
         """测试流不存在的情况。"""
         chatter = ConcreteChatter("stream_123", mock_plugin)
@@ -705,7 +688,6 @@ class TestUnreadsFlow:
             assert text == ""
             assert messages == []
 
-    @pytest.mark.asyncio
     async def test_custom_time_format(self, mock_plugin):
         """测试自定义时间格式。"""
         chatter = ConcreteChatter("stream_123", mock_plugin)

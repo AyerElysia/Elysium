@@ -52,7 +52,6 @@ def test_parse_signal_repairs_json():
     assert signal.tags == ["图片", "审美"]
 
 
-@pytest.mark.asyncio
 async def test_signal_persistence_roundtrip(tmp_path):
     engine = CuriosityEngine(workspace_path=str(tmp_path), model_task_name="life")
     signal = CuriositySignal(

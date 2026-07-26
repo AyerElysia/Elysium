@@ -131,7 +131,6 @@ def _configure_napcat_fetch(
     monkeypatch.setattr(napcat_utils, "get_task_manager", lambda: _InlineTaskManager())
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error_type",
     [httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout],
@@ -157,7 +156,6 @@ async def test_napcat_fetch_retries_direct_only_after_proxy_or_connection_failur
     assert _FakeAsyncClient.calls[1]["trust_env"] is False
 
 
-@pytest.mark.asyncio
 async def test_napcat_fetch_does_not_bypass_proxy_after_http_status_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

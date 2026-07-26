@@ -238,7 +238,6 @@ class TestGlobalManager:
         assert manager2 is not manager1
         assert manager2.count() == 0
 
-    @pytest.mark.asyncio
     async def test_global_manager_integration(self) -> None:
         """Test using global manager with templates."""
         manager = get_prompt_manager()
@@ -267,7 +266,6 @@ class TestManagerIntegration:
         """Reset manager before each test."""
         reset_prompt_manager()
 
-    @pytest.mark.asyncio
     async def test_workflow_full_cycle(self) -> None:
         """Test full workflow: create, register, retrieve, use."""
         manager = get_prompt_manager()
@@ -285,7 +283,6 @@ class TestManagerIntegration:
         result = await retrieved.set("query", "如何学习Python？").set("context", "").build()
         assert "如何学习Python？" in result
 
-    @pytest.mark.asyncio
     async def test_multiple_templates_management(self) -> None:
         """Test managing multiple templates."""
         manager = get_prompt_manager()
@@ -315,7 +312,6 @@ class TestManagerIntegration:
         assert await farewell.set("name", "Bob").build() == "Goodbye Bob"
         assert await question.set("question", "How are you").build() == "How are you?"
 
-    @pytest.mark.asyncio
     async def test_template_isolation(self) -> None:
         """Test that templates are isolated from each other."""
         manager = get_prompt_manager()

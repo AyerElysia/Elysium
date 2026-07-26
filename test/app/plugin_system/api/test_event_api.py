@@ -19,7 +19,6 @@ from src.core.components.types import EventType
 class TestEventAPI:
     """测试事件 API。"""
     
-    @pytest.mark.asyncio
     async def test_publish_event(self) -> None:
         """测试发布事件。"""
         with patch('src.app.plugin_system.api.event_api.get_event_manager') as mock_get_mgr:
@@ -35,7 +34,6 @@ class TestEventAPI:
                 {"data": "test"}
             )
     
-    @pytest.mark.asyncio
     async def test_register_handler(self) -> None:
         """测试注册处理器。"""
         with patch('src.app.plugin_system.api.event_api.get_event_manager') as mock_get_mgr:
@@ -58,7 +56,6 @@ class TestEventAPI:
             
             mock_manager.unregister_handler.assert_called_once()
     
-    @pytest.mark.asyncio
     async def test_create_temporary_handler(self) -> None:
         """测试创建临时处理器。"""
         with patch('src.app.plugin_system.api.event_api.get_event_manager') as mock_get_mgr:
@@ -73,7 +70,6 @@ class TestEventAPI:
             
             assert result == "temp_123"
     
-    @pytest.mark.asyncio
     async def test_unregister_temporary_handler(self) -> None:
         """测试注销临时处理器。"""
         with patch('src.app.plugin_system.api.event_api.get_event_manager') as mock_get_mgr:

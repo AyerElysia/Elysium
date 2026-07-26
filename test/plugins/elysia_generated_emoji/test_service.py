@@ -63,7 +63,6 @@ def _make_service(*, proxy: str = "") -> ElysiaGeneratedEmojiService:
     return ElysiaGeneratedEmojiService(plugin=cast(Any, plugin))
 
 
-@pytest.mark.asyncio
 async def test_call_novelai_empty_proxy_ignores_proxy_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7890")
     monkeypatch.setattr(aiohttp, "ClientSession", _FakeSession)
@@ -77,7 +76,6 @@ async def test_call_novelai_empty_proxy_ignores_proxy_environment(monkeypatch: p
     assert "proxy" not in _FakeSession.last.calls[0]
 
 
-@pytest.mark.asyncio
 async def test_call_novelai_retries_direct_after_proxy_client_error(monkeypatch: pytest.MonkeyPatch) -> None:
     class FailingFirstSession(_FakeSession):
         def __init__(self, **kwargs: object) -> None:

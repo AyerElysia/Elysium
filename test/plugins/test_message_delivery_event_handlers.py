@@ -24,7 +24,6 @@ def _assert_delivery_subscription(handler: object) -> None:
     assert EventType.ON_MESSAGE_SENT not in subscribed
 
 
-@pytest.mark.asyncio
 async def test_life_engine_collects_only_confirmed_outbound_messages() -> None:
     service = SimpleNamespace(record_message=AsyncMock())
     handler = LifeEngineMessageCollectorHandler(
@@ -55,7 +54,6 @@ async def test_life_engine_collects_only_confirmed_outbound_messages() -> None:
     service.record_message.assert_not_awaited()
 
 
-@pytest.mark.asyncio
 async def test_webui_marks_delivered_messages_as_sent() -> None:
     handler = LiveChatEventHandler(SimpleNamespace())
     message = SimpleNamespace(message_id="delivered-2")
@@ -77,7 +75,6 @@ async def test_webui_marks_delivered_messages_as_sent() -> None:
     handler._broadcast_message.assert_awaited_once_with(message_data)
 
 
-@pytest.mark.asyncio
 async def test_webui_ignores_neko_surface_messages() -> None:
     handler = LiveChatEventHandler(SimpleNamespace())
     message = SimpleNamespace(message_id="surface-1", platform="neko.surface")
@@ -96,7 +93,6 @@ async def test_webui_ignores_neko_surface_messages() -> None:
     handler._broadcast_message.assert_not_awaited()
 
 
-@pytest.mark.asyncio
 async def test_webui_broadcast_drops_neko_surface_messages() -> None:
     class _WebSocketProbe:
         pass
@@ -119,7 +115,6 @@ async def test_webui_broadcast_drops_neko_surface_messages() -> None:
     websocket.send_json.assert_not_awaited()
 
 
-@pytest.mark.asyncio
 async def test_minicpm_maps_delivered_messages_to_sent_direction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

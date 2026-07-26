@@ -50,7 +50,6 @@ class TestUser(TestBase):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
-@pytest.mark.asyncio
 async def test_crud_create():
     """测试创建记录"""
     # 创建表
@@ -72,7 +71,6 @@ async def test_crud_create():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_query_filter():
     """测试查询过滤"""
     # 创建表并插入数据
@@ -95,7 +93,6 @@ async def test_query_filter():
         async with engine.begin() as conn:
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
-@pytest.mark.asyncio
 async def test_crud_get():
     """测试根据 ID 获取记录"""
     engine = await get_engine()
@@ -114,7 +111,6 @@ async def test_crud_get():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_crud_get_by():
     """测试根据条件获取记录"""
     engine = await get_engine()
@@ -133,7 +129,6 @@ async def test_crud_get_by():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_crud_get_multi():
     """测试获取多条记录"""
     engine = await get_engine()
@@ -155,7 +150,6 @@ async def test_crud_get_multi():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_crud_update():
     """测试更新记录"""
     engine = await get_engine()
@@ -175,7 +169,6 @@ async def test_crud_update():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_crud_delete():
     """测试删除记录"""
     engine = await get_engine()
@@ -196,7 +189,6 @@ async def test_crud_delete():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_crud_count():
     """测试统计记录数"""
     engine = await get_engine()
@@ -219,7 +211,6 @@ async def test_crud_count():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_crud_exists():
     """测试检查记录是否存在"""
     engine = await get_engine()
@@ -237,7 +228,6 @@ async def test_crud_exists():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_crud_get_or_create():
     """测试获取或创建记录"""
     engine = await get_engine()
@@ -264,7 +254,6 @@ async def test_crud_get_or_create():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_query_filter_operators():
     """测试查询过滤操作符"""
     engine = await get_engine()
@@ -303,7 +292,6 @@ async def test_query_filter_operators():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_query_order_and_pagination():
     """测试排序和分页"""
     engine = await get_engine()
@@ -338,7 +326,6 @@ async def test_query_order_and_pagination():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_query_more_operators():
     """测试更多查询操作符"""
     engine = await get_engine()
@@ -384,7 +371,6 @@ async def test_query_more_operators():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_query_first_count_exists():
     """测试 first, count, exists 方法"""
     engine = await get_engine()
@@ -427,7 +413,6 @@ async def test_query_first_count_exists():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_bulk_operations():
     """测试批量操作"""
     engine = await get_engine()
@@ -458,7 +443,6 @@ async def test_bulk_operations():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_query_filter_or():
     """测试 OR 过滤"""
     engine = await get_engine()
@@ -483,7 +467,6 @@ async def test_query_filter_or():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_edge_cases():
     """测试边界情况"""
     engine = await get_engine()
@@ -518,7 +501,6 @@ async def test_edge_cases():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_aggregate_query():
     """测试聚合查询"""
     engine = await get_engine()
@@ -563,7 +545,6 @@ async def test_aggregate_query():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_query_iterators():
     """测试迭代器方法"""
     engine = await get_engine()
@@ -604,7 +585,6 @@ async def test_query_iterators():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_query_empty_result():
     """测试空结果情况"""
     engine = await get_engine()
@@ -635,7 +615,6 @@ async def test_query_empty_result():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_model_to_dict_edge_cases():
     """测试模型转换的边界情况"""
     engine = await get_engine()
@@ -664,7 +643,6 @@ async def test_model_to_dict_edge_cases():
 # Engine 模块测试
 # =============================================================================
 
-@pytest.mark.asyncio
 async def test_engine_singleton():
     """测试引擎单例模式"""
     from src.kernel.db.core.engine import get_engine, close_engine
@@ -683,7 +661,6 @@ async def test_engine_singleton():
     assert engine3 is not engine1
 
 
-@pytest.mark.asyncio
 async def test_engine_info():
     """测试获取引擎信息"""
     from src.kernel.db.core.engine import get_engine_info
@@ -700,7 +677,6 @@ async def test_engine_info():
         assert "aiosqlite" in info["driver"]
 
 
-@pytest.mark.asyncio
 async def test_close_engine():
     """测试关闭引擎"""
     from src.kernel.db.core.engine import get_engine, close_engine
@@ -717,7 +693,6 @@ async def test_close_engine():
     assert new_engine is not None
 
 
-@pytest.mark.asyncio
 async def test_sqlite_config_builder():
     """测试SQLite配置构建"""
     from src.kernel.db.core.engine import _build_sqlite_config
@@ -740,7 +715,6 @@ async def test_sqlite_config_builder():
         assert "timeout" in kwargs["connect_args"]
 
 
-@pytest.mark.asyncio
 async def test_postgresql_config_builder():
     """测试PostgreSQL配置构建"""
     from src.kernel.db.core.engine import _build_postgresql_config
@@ -767,7 +741,6 @@ async def test_postgresql_config_builder():
     assert kwargs["pool_pre_ping"] is True
 
 
-@pytest.mark.asyncio
 async def test_sqlite_optimizations():
     """测试SQLite优化应用"""
     from src.kernel.db.core.engine import _enable_sqlite_optimizations
@@ -788,7 +761,6 @@ async def test_sqlite_optimizations():
             await engine.dispose()
 
 
-@pytest.mark.asyncio
 async def test_postgresql_optimizations():
     """测试PostgreSQL优化应用（仅验证不抛出异常）"""
     from src.kernel.db.core.engine import _enable_postgresql_optimizations
@@ -805,7 +777,6 @@ async def test_postgresql_optimizations():
         await engine.dispose()
 
 
-@pytest.mark.asyncio
 async def test_engine_initialization_error():
     """测试引擎初始化失败时的错误处理"""
     from src.kernel.db.core.engine import get_engine, close_engine
@@ -833,7 +804,6 @@ async def test_engine_initialization_error():
 # Session 模块测试
 # =============================================================================
 
-@pytest.mark.asyncio
 async def test_session_factory_singleton():
     """测试会话工厂单例模式"""
     from src.kernel.db.core.session import get_session_factory, reset_session_factory
@@ -852,7 +822,6 @@ async def test_session_factory_singleton():
     assert factory3 is not None
 
 
-@pytest.mark.asyncio
 async def test_session_context_manager():
     """测试会话上下文管理器"""
     from src.kernel.db.core.session import get_db_session
@@ -864,7 +833,6 @@ async def test_session_context_manager():
         assert session.is_active
 
 
-@pytest.mark.asyncio
 async def test_session_transaction_commit():
     """测试会话事务提交"""
     from src.kernel.db.core.session import get_db_session
@@ -879,7 +847,6 @@ async def test_session_transaction_commit():
         # 正常退出应该自动提交
 
 
-@pytest.mark.asyncio
 async def test_session_transaction_rollback():
     """测试会话事务回滚"""
     from src.kernel.db.core.session import get_db_session
@@ -893,7 +860,6 @@ async def test_session_transaction_rollback():
     # 异常后应该正确回滚
 
 
-@pytest.mark.asyncio
 async def test_apply_session_settings_sqlite():
     """测试SQLite会话设置应用"""
     from src.kernel.db.core.session import _apply_session_settings
@@ -911,7 +877,6 @@ async def test_apply_session_settings_sqlite():
             await async_session.close()
 
 
-@pytest.mark.asyncio
 async def test_apply_session_settings_postgresql():
     """测试PostgreSQL会话设置应用"""
     from src.kernel.db.core.session import _apply_session_settings
@@ -928,7 +893,6 @@ async def test_apply_session_settings_postgresql():
             await async_session.close()
 
 
-@pytest.mark.asyncio
 async def test_apply_session_settings_error_handling():
     """测试会话设置应用时的错误处理"""
     from src.kernel.db.core.session import _apply_session_settings
@@ -946,7 +910,6 @@ async def test_apply_session_settings_error_handling():
 # CRUD 模块额外测试
 # =============================================================================
 
-@pytest.mark.asyncio
 async def test_crud_get_multi_with_list_filter():
     """测试get_multi中使用列表过滤"""
     engine = await get_engine()
@@ -978,7 +941,6 @@ async def test_crud_get_multi_with_list_filter():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_crud_count_with_list_filter():
     """测试count中使用列表过滤"""
     engine = await get_engine()
@@ -1006,7 +968,6 @@ async def test_crud_count_with_list_filter():
 # Query 模块额外测试
 # =============================================================================
 
-@pytest.mark.asyncio
 async def test_query_filter_unknown_field():
     """测试过滤时使用未知字段"""
     engine = await get_engine()
@@ -1029,7 +990,6 @@ async def test_query_filter_unknown_field():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_query_filter_unknown_operator():
     """测试过滤时使用未知操作符"""
     engine = await get_engine()
@@ -1052,7 +1012,6 @@ async def test_query_filter_unknown_operator():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_query_filter_or_no_conditions():
     """测试filter_or没有有效条件"""
     engine = await get_engine()
@@ -1075,7 +1034,6 @@ async def test_query_filter_or_no_conditions():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_query_order_by_unknown_field():
     """测试排序时使用未知字段"""
     engine = await get_engine()
@@ -1098,7 +1056,6 @@ async def test_query_order_by_unknown_field():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_query_limit_and_offset():
     """测试limit和offset"""
     engine = await get_engine()
@@ -1132,7 +1089,6 @@ async def test_query_limit_and_offset():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_query_as_dict_true():
     """测试as_dict=True返回字典"""
     engine = await get_engine()
@@ -1157,7 +1113,6 @@ async def test_query_as_dict_true():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_query_first_as_dict():
     """测试first的as_dict参数"""
     engine = await get_engine()
@@ -1180,7 +1135,6 @@ async def test_query_first_as_dict():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_aggregate_query_invalid_field():
     """测试聚合查询使用无效字段"""
     engine = await get_engine()
@@ -1210,7 +1164,6 @@ async def test_aggregate_query_invalid_field():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_aggregate_query_group_by():
     """测试分组统计"""
     engine = await get_engine()
@@ -1253,7 +1206,6 @@ async def test_aggregate_query_group_by():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_aggregate_query_group_by_no_fields():
     """测试分组统计不指定字段"""
     engine = await get_engine()
@@ -1274,7 +1226,6 @@ async def test_aggregate_query_group_by_no_fields():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_aggregate_query_group_by_invalid_fields():
     """测试分组统计使用无效字段"""
     engine = await get_engine()
@@ -1295,7 +1246,6 @@ async def test_aggregate_query_group_by_invalid_fields():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_aggregate_query_sum_avg_zero_result():
     """测试聚合查询在没有结果时返回0"""
     engine = await get_engine()
@@ -1352,7 +1302,6 @@ def test_exceptions_hierarchy():
 # 更多边界情况测试（提升覆盖率）
 # =============================================================================
 
-@pytest.mark.asyncio
 async def test_crud_get_multi_filter_without_field():
     """测试get_multi过滤时字段不存在"""
     engine = await get_engine()
@@ -1373,7 +1322,6 @@ async def test_crud_get_multi_filter_without_field():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_crud_count_filter_without_field():
     """测试count过滤时字段不存在"""
     engine = await get_engine()
@@ -1394,7 +1342,6 @@ async def test_crud_count_filter_without_field():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_aggregate_filter_without_field():
     """测试AggregateQuery过滤时字段不存在"""
     engine = await get_engine()
@@ -1418,7 +1365,6 @@ async def test_aggregate_filter_without_field():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_query_filter_isnull_false():
     """测试filter的isnull操作符为False"""
     engine = await get_engine()
@@ -1466,7 +1412,6 @@ def test_model_helper_with_empty_model():
     assert callable(fetcher)
 
 
-@pytest.mark.asyncio
 async def test_engine_info_error_handling():
     """测试get_engine_info的错误处理"""
     from src.kernel.db.core.engine import get_engine_info, close_engine
@@ -1490,7 +1435,6 @@ async def test_engine_info_error_handling():
     engine_module._engine_lock = None
 
 
-@pytest.mark.asyncio
 async def test_session_double_check_locking():
     """测试会话工厂的双重检查锁定"""
     from src.kernel.db.core.session import get_session_factory
@@ -1504,7 +1448,6 @@ async def test_session_double_check_locking():
     assert all(f is factories[0] for f in factories)
 
 
-@pytest.mark.asyncio
 async def test_query_iter_batches_empty_result():
     """测试iter_batches在空结果时正常工作"""
     engine = await get_engine()
@@ -1526,7 +1469,6 @@ async def test_query_iter_batches_empty_result():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_query_iter_all_empty_result():
     """测试iter_all在空结果时正常工作"""
     engine = await get_engine()
@@ -1548,7 +1490,6 @@ async def test_query_iter_all_empty_result():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_aggregate_query_with_filter():
     """测试AggregateQuery的filter方法"""
     engine = await get_engine()
@@ -1580,7 +1521,6 @@ async def test_aggregate_query_with_filter():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_query_builder_chain_calls():
     """测试QueryBuilder的链式调用"""
     engine = await get_engine()
@@ -1620,7 +1560,6 @@ async def test_query_builder_chain_calls():
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
 
 
-@pytest.mark.asyncio
 async def test_model_to_dict_fallback_path():
     """测试_model_to_dict的fallback路径"""
     from src.kernel.db.api.crud import _model_to_dict
@@ -1678,7 +1617,6 @@ def test_model_helper_single_column():
     assert values == (42,)
 
 
-@pytest.mark.asyncio
 async def test_concurrent_engine_initialization():
     """测试并发引擎初始化（触发双重检查锁定）"""
     import asyncio
@@ -1695,7 +1633,6 @@ async def test_concurrent_engine_initialization():
     assert all(e is engines[0] for e in engines)
 
 
-@pytest.mark.asyncio
 async def test_aggregate_query_max_min():
     """测试AggregateQuery的max和min方法"""
     engine = await get_engine()

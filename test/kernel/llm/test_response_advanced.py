@@ -65,7 +65,6 @@ async def _stream_mixed_events():
     yield StreamEvent(tool_call_id="call_456", tool_args_delta=' "test"}')
 
 
-@pytest.mark.asyncio
 async def test_stream_with_callback():
     """测试流式响应 + 实时回调。"""
     chunks = []
@@ -89,7 +88,6 @@ async def test_stream_with_callback():
     assert resp.message == "hello world"
 
 
-@pytest.mark.asyncio
 async def test_stream_with_callback_no_stream():
     """测试stream_with_callback处理非流式响应。"""
     chunks = []
@@ -113,7 +111,6 @@ async def test_stream_with_callback_no_stream():
     assert chunks == ["static message"]
 
 
-@pytest.mark.asyncio
 async def test_stream_with_callback_consumed_error():
     """测试stream_with_callback在已消费响应时抛出异常。"""
     async def callback(chunk: str):
@@ -134,7 +131,6 @@ async def test_stream_with_callback_consumed_error():
         await resp.stream_with_callback(callback)
 
 
-@pytest.mark.asyncio
 async def test_stream_with_buffer():
     """测试带缓冲的流式响应。"""
     req = LLMRequest(dummy_model_set(), request_name="test")
@@ -158,7 +154,6 @@ async def test_stream_with_buffer():
     assert resp.message == "hello world"
 
 
-@pytest.mark.asyncio
 async def test_stream_with_buffer_no_stream():
     """测试stream_with_buffer处理非流式响应。"""
     req = LLMRequest(dummy_model_set(), request_name="test")
@@ -179,7 +174,6 @@ async def test_stream_with_buffer_no_stream():
     assert buffers[0] == "static message"
 
 
-@pytest.mark.asyncio
 async def test_stream_with_buffer_consumed_error():
     """测试stream_with_buffer在已消费响应时抛出异常。"""
     req = LLMRequest(dummy_model_set(), request_name="test")
@@ -199,7 +193,6 @@ async def test_stream_with_buffer_consumed_error():
             pass
 
 
-@pytest.mark.asyncio
 async def test_tool_call_accumulator_single_call():
     """测试工具调用累加器（单个工具调用）。"""
     acc = _ToolCallAccumulator()
@@ -218,7 +211,6 @@ async def test_tool_call_accumulator_single_call():
     assert calls[0].args == {"a": 1}
 
 
-@pytest.mark.asyncio
 async def test_tool_call_accumulator_multiple_calls():
     """测试工具调用累加器（多个工具调用）。"""
     acc = _ToolCallAccumulator()
@@ -238,7 +230,6 @@ async def test_tool_call_accumulator_multiple_calls():
     assert calls[1].name == "tool2"
 
 
-@pytest.mark.asyncio
 async def test_tool_call_accumulator_invalid_json():
     """测试工具调用累加器处理无效JSON。"""
     acc = _ToolCallAccumulator()
@@ -255,7 +246,6 @@ async def test_tool_call_accumulator_invalid_json():
     assert calls[0].args == "not json"  # 应该保持原始字符串
 
 
-@pytest.mark.asyncio
 async def test_tool_call_accumulator_empty_args():
     """测试工具调用累加器处理空参数。"""
     acc = _ToolCallAccumulator()
@@ -271,7 +261,6 @@ async def test_tool_call_accumulator_empty_args():
     assert calls[0].args == {}
 
 
-@pytest.mark.asyncio
 async def test_response_collects_tool_calls_from_stream():
     """测试响应从流中收集工具调用。"""
     req = LLMRequest(dummy_model_set(), request_name="test")
@@ -291,7 +280,6 @@ async def test_response_collects_tool_calls_from_stream():
     assert resp.call_list[0].args == {"a": 1, "b": 2}
 
 
-@pytest.mark.asyncio
 async def test_response_collects_mixed_stream():
     """测试响应收集混合流（文本+工具调用）。"""
     req = LLMRequest(dummy_model_set(), request_name="test")
@@ -313,7 +301,6 @@ async def test_response_collects_mixed_stream():
     assert resp.call_list[0].name == "search"
 
 
-@pytest.mark.asyncio
 async def test_response_tool_call_compat_stream_repair_success():
     """测试 tool_call_compat 在流式文本 JSON 下可修复并转为 tool call。"""
 
@@ -339,7 +326,6 @@ async def test_response_tool_call_compat_stream_repair_success():
     assert resp.call_list[0].args == {"query": "neo"}
 
 
-@pytest.mark.asyncio
 async def test_response_tool_call_compat_stream_repair_fail_raises():
     """测试 tool_call_compat JSON repair 失败时抛错。"""
 
@@ -360,7 +346,6 @@ async def test_response_tool_call_compat_stream_repair_fail_raises():
         await resp
 
 
-@pytest.mark.asyncio
 async def test_response_to_payload():
     """测试to_payload方法。"""
     req = LLMRequest(dummy_model_set(), request_name="test")
@@ -378,7 +363,6 @@ async def test_response_to_payload():
     assert payload.content == [Text("test message")]
 
 
-@pytest.mark.asyncio
 async def test_response_add_payload():
     """测试add_payload方法。"""
     req = LLMRequest(dummy_model_set(), request_name="test")
@@ -398,7 +382,6 @@ async def test_response_add_payload():
     assert resp.payloads[0].content == [Text("first"), Text("second")]
 
 
-@pytest.mark.asyncio
 async def test_response_add_payload_with_position():
     """测试add_payload方法指定位置。"""
     req = LLMRequest(dummy_model_set(), request_name="test")
@@ -420,7 +403,6 @@ async def test_response_add_payload_with_position():
     assert resp.payloads[1] == new_payload
 
 
-@pytest.mark.asyncio
 async def test_response_add_call_reflex():
     """测试add_call_reflex方法。"""
     req = LLMRequest(dummy_model_set(), request_name="test")
@@ -443,7 +425,6 @@ async def test_response_add_call_reflex():
     assert all(payload.role != ROLE.TOOL_RESULT for payload in resp.payloads)
 
 
-@pytest.mark.asyncio
 async def test_response_add_payload_uses_context_manager_add_payload() -> None:
     """测试 response.add_payload 委托给 context_manager.add_payload。"""
 
@@ -472,7 +453,6 @@ async def test_response_add_payload_uses_context_manager_add_payload() -> None:
     assert manager.called is True
 
 
-@pytest.mark.asyncio
 async def test_response_add_call_reflex_uses_context_manager_add_payload() -> None:
     """测试 response.add_call_reflex 逐条委托给 context_manager.add_payload。"""
 
@@ -512,7 +492,6 @@ async def test_response_add_call_reflex_uses_context_manager_add_payload() -> No
 
 # --- Bug 1/2：_ToolCallAccumulator 后续 chunk tool_call_id 为 None ---
 
-@pytest.mark.asyncio
 async def test_accumulator_subsequent_chunks_no_id():
     """Bug 1/2 回归：后续 chunk tool_call_id 为 None 时，args 应正确归属到上一个工具调用。
 
@@ -537,7 +516,6 @@ async def test_accumulator_subsequent_chunks_no_id():
     assert calls[0].args == {"location": "Tokyo"}
 
 
-@pytest.mark.asyncio
 async def test_accumulator_multiple_calls_subsequent_no_id():
     """Bug 1/2 回归：多工具调用时后续 chunk 无 id，应正确切换归属。
 
@@ -564,7 +542,6 @@ async def test_accumulator_multiple_calls_subsequent_no_id():
     assert calls[1].args == {"y": 2}
 
 
-@pytest.mark.asyncio
 async def test_accumulator_no_id_no_history_discarded():
     """Bug 1/2 回归：既无新 id 又无历史 id 时，事件应被安全丢弃，不抛异常。"""
     acc = _ToolCallAccumulator()
@@ -576,7 +553,6 @@ async def test_accumulator_no_id_no_history_discarded():
 
 # --- Bug 3：__aiter__ 流异常时已收集内容不丢失 ---
 
-@pytest.mark.asyncio
 async def test_aiter_stream_error_content_preserved():
     """Bug 3 回归：async for 消费流时流中途抛异常，已收集的文本应保存到 message。
 
@@ -606,7 +582,6 @@ async def test_aiter_stream_error_content_preserved():
     assert resp.message == "Hello world"
 
 
-@pytest.mark.asyncio
 async def test_aiter_stream_error_tool_calls_preserved():
     """Bug 3 回归：async for 消费流时异常，已收集的工具调用应保存到 call_list。"""
     async def flaky_stream():
@@ -634,7 +609,6 @@ async def test_aiter_stream_error_tool_calls_preserved():
 
 # --- Bug 4：_collect_full_response（await 模式）流异常时已收集内容不丢失 ---
 
-@pytest.mark.asyncio
 async def test_await_stream_error_content_preserved():
     """Bug 4 回归：await 消费流时流中途抛异常，已收集的文本应保存到 message。
 
@@ -661,7 +635,6 @@ async def test_await_stream_error_content_preserved():
     assert resp.message == "Partial response"
 
 
-@pytest.mark.asyncio
 async def test_await_stream_error_tool_calls_preserved():
     """Bug 4 回归：await 消费流时异常，已收集的工具调用应保存到 call_list。"""
     async def flaky_stream():
@@ -686,7 +659,6 @@ async def test_await_stream_error_tool_calls_preserved():
     assert resp.call_list[0].args == {"a": 42}
 
 
-@pytest.mark.asyncio
 async def test_await_normal_stream_unaffected():
     """Bug 3/4 回归（无错误路径）：正常流在修复后仍能完整收集内容。"""
     async def good_stream():

@@ -46,7 +46,6 @@ def _install_fake_streams(monkeypatch, streams: list[object], info_by_stream: di
     monkeypatch.setattr("src.core.utils.user_query_helper.get_user_query_helper", lambda: _FakeUserQueryHelper())
 
 
-@pytest.mark.asyncio
 async def test_send_target_prompt_lists_recent_current_group_and_private(monkeypatch) -> None:
     now = time.time()
     group_stream = SimpleNamespace(
@@ -114,7 +113,6 @@ async def test_send_target_prompt_lists_recent_current_group_and_private(monkeyp
     assert "旧群" not in prompt
 
 
-@pytest.mark.asyncio
 async def test_life_send_text_can_send_to_target_key(monkeypatch) -> None:
     now = time.time()
     current_stream = ChatStream(stream_id="1" * 64, platform="qq", chat_type="private")
@@ -170,7 +168,6 @@ async def test_life_send_text_can_send_to_target_key(monkeypatch) -> None:
     assert all(message.extra["target_group_id"] == "100" for message in sent_messages)
 
 
-@pytest.mark.asyncio
 async def test_life_send_text_without_target_key_uses_legacy_stream_send(monkeypatch) -> None:
     current_stream = ChatStream(stream_id="1" * 64, platform="qq", chat_type="private")
     action = LifeSendTextAction(
@@ -193,7 +190,6 @@ async def test_life_send_text_without_target_key_uses_legacy_stream_send(monkeyp
     assert sent_contents == ["第一段", "第二段"]
 
 
-@pytest.mark.asyncio
 async def test_life_send_text_rejects_invalid_target_key_and_cross_reply(monkeypatch) -> None:
     current_stream = ChatStream(stream_id="1" * 64, platform="qq", chat_type="private")
     _install_fake_streams(monkeypatch, [], {})

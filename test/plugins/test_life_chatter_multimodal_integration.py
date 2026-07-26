@@ -160,7 +160,6 @@ def test_compose_dedup_across_retries() -> None:
     assert all(isinstance(p, Text) for p in second)
 
 
-@pytest.mark.asyncio
 async def test_delta_unread_native_image_is_restored_after_model_failure(
     monkeypatch,
 ) -> None:
@@ -392,7 +391,6 @@ class _AwaitableFallbackResponse:
         return _AwaitableFallbackResponse(snapshot, self.sent_snapshots)
 
 
-@pytest.mark.asyncio
 async def test_media_text_fallback_replaces_all_native_media_once(monkeypatch) -> None:
     image = Image(_png_b64())
     audio = Audio(_wav_b64())

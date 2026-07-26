@@ -139,7 +139,6 @@ def test_inspect_media_is_registered_as_tool_schema() -> None:
     assert schema["function"]["name"] == "tool-inspect_media"
 
 
-@pytest.mark.asyncio
 async def test_execute_returns_plaintext_when_media_data_missing() -> None:
     tool = _make_tool([
         _message(
@@ -156,7 +155,6 @@ async def test_execute_returns_plaintext_when_media_data_missing() -> None:
     assert "[图片:一张粉色角色图]" in result
 
 
-@pytest.mark.asyncio
 async def test_execute_promotes_media_for_next_native_turn() -> None:
     LifeInspectMediaTool._consume_promoted_media("stream-1")
     tool = _make_tool(
@@ -174,7 +172,6 @@ async def test_execute_promotes_media_for_next_native_turn() -> None:
     assert LifeChatter._consume_promoted_media_content("stream-1") == []
 
 
-@pytest.mark.asyncio
 async def test_execute_promotes_audio_for_next_native_turn() -> None:
     LifeInspectMediaTool._consume_promoted_media("stream-1")
     tool = _make_tool(
@@ -205,7 +202,6 @@ async def test_execute_promotes_audio_for_next_native_turn() -> None:
     assert any(isinstance(part, Audio) for part in content)
 
 
-@pytest.mark.asyncio
 async def test_promoted_media_after_tool_result_gets_assistant_bridge() -> None:
     LifeInspectMediaTool._consume_promoted_media("stream-1")
     tool = _make_tool(
@@ -233,7 +229,6 @@ async def test_promoted_media_after_tool_result_gets_assistant_bridge() -> None:
     assert any(isinstance(part, Image) for part in response.payloads[-1].content)
 
 
-@pytest.mark.asyncio
 async def test_promoted_media_after_tool_result_with_system_reminder_gets_assistant_bridge() -> None:
     LifeInspectMediaTool._consume_promoted_media("stream-1")
     tool = _make_tool(

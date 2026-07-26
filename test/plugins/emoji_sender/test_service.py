@@ -54,7 +54,6 @@ def test_select_candidate_uses_temperature_weights() -> None:
     assert weights[0] > weights[1] > weights[2]
 
 
-@pytest.mark.asyncio
 async def test_search_best_samples_within_threshold() -> None:
     """阈值内存在多个候选时，应交给温度采样函数决定。"""
     service = _make_service(temperature=0.12)
@@ -92,7 +91,6 @@ async def test_search_best_samples_within_threshold() -> None:
     assert [candidate.meme_id for candidate in sampled_candidates] == ["m1", "m2"]
 
 
-@pytest.mark.asyncio
 async def test_search_best_uses_temperature_sampling_for_tagged_fallback() -> None:
     """阈值外但带有效标签时，fallback 也应走温度采样而不是固定第一名。"""
     service = _make_service(temperature=0.2)
@@ -128,7 +126,6 @@ async def test_search_best_uses_temperature_sampling_for_tagged_fallback() -> No
     assert [candidate.meme_id for candidate in sampled_candidates] == ["m1", "m2"]
 
 
-@pytest.mark.asyncio
 async def test_search_best_without_tags_still_requires_threshold_match() -> None:
     """未指定有效标签时，阈值外结果不应触发 fallback。"""
     service = _make_service(temperature=0.2)

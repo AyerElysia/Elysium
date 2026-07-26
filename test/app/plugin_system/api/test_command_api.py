@@ -90,7 +90,6 @@ class TestCommandAPI:
             assert cmd_class == BaseCommand
             assert args == ["arg1"]
     
-    @pytest.mark.asyncio
     async def test_execute_command(self) -> None:
         """测试执行命令。"""
         with patch('src.app.plugin_system.api.command_api._get_command_manager') as mock_get_mgr:

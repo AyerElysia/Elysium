@@ -42,7 +42,6 @@ def _register_skill(plugin: SkillManagerPlugin, root_dir: Path, name: str = "dem
     return entry
 
 
-@pytest.mark.asyncio
 async def test_refresh_discovers_life_engine_workspace_without_skill_md(tmp_path: Path) -> None:
     """life_engine_workspace 没有 SKILL.md 时，也应作为可读取 skill 暴露。"""
 
@@ -61,7 +60,6 @@ async def test_refresh_discovers_life_engine_workspace_without_skill_md(tmp_path
     assert "MEMORY.md" in entry.files
 
 
-@pytest.mark.asyncio
 async def test_get_script_executes_python_script(tmp_path: Path) -> None:
     """应继续支持原有 Python 脚本执行路径。"""
 
@@ -85,7 +83,6 @@ async def test_get_script_executes_python_script(tmp_path: Path) -> None:
     assert "[stdout]\nNeo-MoFox" in cast(str, result)
 
 
-@pytest.mark.asyncio
 async def test_get_script_executes_powershell_script_via_subprocess(tmp_path: Path) -> None:
     """应支持 PowerShell 脚本并通过外部进程执行。"""
 
@@ -127,7 +124,6 @@ async def test_get_script_executes_powershell_script_via_subprocess(tmp_path: Pa
     )
 
 
-@pytest.mark.asyncio
 async def test_get_script_reports_missing_powershell_runner(tmp_path: Path) -> None:
     """PowerShell 解释器缺失时应给出明确错误。"""
 
@@ -148,7 +144,6 @@ async def test_get_script_reports_missing_powershell_runner(tmp_path: Path) -> N
     assert result == "未找到可用的 PowerShell 解释器"
 
 
-@pytest.mark.asyncio
 async def test_get_script_can_be_disabled_by_config(tmp_path: Path) -> None:
     """关闭脚本执行后，get_script 应明确拒绝执行。"""
 
@@ -169,7 +164,6 @@ async def test_get_script_can_be_disabled_by_config(tmp_path: Path) -> None:
     assert "已被配置关闭" in cast(str, result)
 
 
-@pytest.mark.asyncio
 async def test_get_skill_truncates_large_body(tmp_path: Path) -> None:
     """get_skill 应遵守主文档长度预算。"""
 
@@ -192,7 +186,6 @@ async def test_get_skill_truncates_large_body(tmp_path: Path) -> None:
     assert "已截断" in cast(str, result)
 
 
-@pytest.mark.asyncio
 async def test_get_script_returns_timeout_for_slow_external_script(tmp_path: Path) -> None:
     """外部脚本卡住时应主动超时并终止进程。"""
 

@@ -37,7 +37,6 @@ class TestJSONStoreInit:
 class TestJSONStoreSave:
     """测试 save 方法"""
 
-    @pytest.mark.asyncio
     async def test_save_simple_data(self) -> None:
         """测试保存简单数据"""
         temp_dir = tempfile.mkdtemp()
@@ -58,7 +57,6 @@ class TestJSONStoreSave:
         finally:
             shutil.rmtree(temp_dir)
 
-    @pytest.mark.asyncio
     async def test_save_complex_data(self) -> None:
         """测试保存复杂数据结构"""
         temp_dir = tempfile.mkdtemp()
@@ -82,7 +80,6 @@ class TestJSONStoreSave:
         finally:
             shutil.rmtree(temp_dir)
 
-    @pytest.mark.asyncio
     async def test_save_overwrite_existing(self) -> None:
         """测试覆盖已存在的数据"""
         temp_dir = tempfile.mkdtemp()
@@ -101,7 +98,6 @@ class TestJSONStoreSave:
         finally:
             shutil.rmtree(temp_dir)
 
-    @pytest.mark.asyncio
     async def test_save_creates_directory_if_not_exists(self) -> None:
         """测试目录不存在时自动创建"""
         temp_dir = tempfile.mkdtemp()
@@ -117,7 +113,6 @@ class TestJSONStoreSave:
         finally:
             shutil.rmtree(temp_dir)
 
-    @pytest.mark.asyncio
     async def test_save_with_invalid_name_slash(self) -> None:
         """测试保存时使用包含斜杠的名称抛出错误"""
         temp_dir = tempfile.mkdtemp()
@@ -129,7 +124,6 @@ class TestJSONStoreSave:
         finally:
             shutil.rmtree(temp_dir)
 
-    @pytest.mark.asyncio
     async def test_save_with_invalid_name_backslash(self) -> None:
         """测试保存时使用包含反斜杠的名称抛出错误"""
         temp_dir = tempfile.mkdtemp()
@@ -141,7 +135,6 @@ class TestJSONStoreSave:
         finally:
             shutil.rmtree(temp_dir)
 
-    @pytest.mark.asyncio
     async def test_save_with_invalid_name_dot_dot(self) -> None:
         """测试保存时使用包含 .. 的名称抛出错误（路径遍历攻击）"""
         temp_dir = tempfile.mkdtemp()
@@ -157,7 +150,6 @@ class TestJSONStoreSave:
 class TestJSONStoreLoad:
     """测试 load 方法"""
 
-    @pytest.mark.asyncio
     async def test_load_existing_data(self) -> None:
         """测试加载已存在的数据"""
         temp_dir = tempfile.mkdtemp()
@@ -174,7 +166,6 @@ class TestJSONStoreLoad:
         finally:
             shutil.rmtree(temp_dir)
 
-    @pytest.mark.asyncio
     async def test_load_nonexistent_data(self) -> None:
         """测试加载不存在的数据返回 None"""
         temp_dir = tempfile.mkdtemp()
@@ -186,7 +177,6 @@ class TestJSONStoreLoad:
         finally:
             shutil.rmtree(temp_dir)
 
-    @pytest.mark.asyncio
     async def test_load_with_invalid_name(self) -> None:
         """测试加载时使用非法名称抛出错误"""
         temp_dir = tempfile.mkdtemp()
@@ -202,7 +192,6 @@ class TestJSONStoreLoad:
 class TestJSONStoreDelete:
     """测试 delete 方法"""
 
-    @pytest.mark.asyncio
     async def test_delete_existing_data(self) -> None:
         """测试删除已存在的数据"""
         temp_dir = tempfile.mkdtemp()
@@ -221,7 +210,6 @@ class TestJSONStoreDelete:
         finally:
             shutil.rmtree(temp_dir)
 
-    @pytest.mark.asyncio
     async def test_delete_nonexistent_data(self) -> None:
         """测试删除不存在的数据返回 False"""
         temp_dir = tempfile.mkdtemp()
@@ -233,7 +221,6 @@ class TestJSONStoreDelete:
         finally:
             shutil.rmtree(temp_dir)
 
-    @pytest.mark.asyncio
     async def test_delete_with_invalid_name(self) -> None:
         """测试删除时使用非法名称抛出错误"""
         temp_dir = tempfile.mkdtemp()
@@ -249,7 +236,6 @@ class TestJSONStoreDelete:
 class TestJSONStoreExists:
     """测试 exists 方法"""
 
-    @pytest.mark.asyncio
     async def test_exists_existing_data(self) -> None:
         """测试检查已存在的数据"""
         temp_dir = tempfile.mkdtemp()
@@ -264,7 +250,6 @@ class TestJSONStoreExists:
         finally:
             shutil.rmtree(temp_dir)
 
-    @pytest.mark.asyncio
     async def test_exists_nonexistent_data(self) -> None:
         """测试检查不存在的数据"""
         temp_dir = tempfile.mkdtemp()
@@ -275,7 +260,6 @@ class TestJSONStoreExists:
         finally:
             shutil.rmtree(temp_dir)
 
-    @pytest.mark.asyncio
     async def test_exists_with_invalid_name(self) -> None:
         """测试检查时使用非法名称抛出错误"""
         temp_dir = tempfile.mkdtemp()
@@ -291,7 +275,6 @@ class TestJSONStoreExists:
 class TestJSONStoreListAll:
     """测试 list_all 方法"""
 
-    @pytest.mark.asyncio
     async def test_list_all_empty_storage(self) -> None:
         """测试列出空存储"""
         temp_dir = tempfile.mkdtemp()
@@ -303,7 +286,6 @@ class TestJSONStoreListAll:
         finally:
             shutil.rmtree(temp_dir)
 
-    @pytest.mark.asyncio
     async def test_list_all_with_data(self) -> None:
         """测试列出存储中的所有数据"""
         temp_dir = tempfile.mkdtemp()
@@ -327,7 +309,6 @@ class TestJSONStoreListAll:
         finally:
             shutil.rmtree(temp_dir)
 
-    @pytest.mark.asyncio
     async def test_list_all_ignores_non_json_files(self) -> None:
         """测试列出时忽略非 JSON 文件"""
         temp_dir = tempfile.mkdtemp()
@@ -352,7 +333,6 @@ class TestJSONStoreListAll:
 class TestJSONStoreConcurrency:
     """测试并发访问"""
 
-    @pytest.mark.asyncio
     async def test_concurrent_save_different_keys(self) -> None:
         """测试并发保存不同的键"""
         temp_dir = tempfile.mkdtemp()
@@ -377,7 +357,6 @@ class TestJSONStoreConcurrency:
         finally:
             shutil.rmtree(temp_dir)
 
-    @pytest.mark.asyncio
     async def test_concurrent_save_same_key(self) -> None:
         """测试并发保存相同的键"""
         temp_dir = tempfile.mkdtemp()
@@ -399,7 +378,6 @@ class TestJSONStoreConcurrency:
         finally:
             shutil.rmtree(temp_dir)
 
-    @pytest.mark.asyncio
     async def test_concurrent_read_write(self) -> None:
         """测试并发读写"""
         temp_dir = tempfile.mkdtemp()
@@ -427,7 +405,6 @@ class TestJSONStoreConcurrency:
 class TestGlobalJSONStore:
     """测试全局 json_store 单例"""
 
-    @pytest.mark.asyncio
     async def test_global_singleton(self) -> None:
         """测试全局 json_store 是单例"""
         from src.kernel.storage.core import _get_json_store
@@ -437,7 +414,6 @@ class TestGlobalJSONStore:
 
         assert store1 is store2
 
-    @pytest.mark.asyncio
     async def test_global_json_store_save_and_load(self) -> None:
         """测试全局 json_store 的基本功能"""
         # 使用临时目录避免污染默认目录
@@ -459,7 +435,6 @@ class TestGlobalJSONStore:
 class TestJSONStoreEdgeCases:
     """测试边界情况"""
 
-    @pytest.mark.asyncio
     async def test_save_empty_dict(self) -> None:
         """测试保存空字典"""
         temp_dir = tempfile.mkdtemp()
@@ -473,7 +448,6 @@ class TestJSONStoreEdgeCases:
         finally:
             shutil.rmtree(temp_dir)
 
-    @pytest.mark.asyncio
     async def test_save_dict_with_unicode(self) -> None:
         """测试保存包含 Unicode 字符的数据"""
         temp_dir = tempfile.mkdtemp()
@@ -493,7 +467,6 @@ class TestJSONStoreEdgeCases:
         finally:
             shutil.rmtree(temp_dir)
 
-    @pytest.mark.asyncio
     async def test_save_dict_with_special_characters(self) -> None:
         """测试保存包含特殊字符的数据"""
         temp_dir = tempfile.mkdtemp()
@@ -512,7 +485,6 @@ class TestJSONStoreEdgeCases:
         finally:
             shutil.rmtree(temp_dir)
 
-    @pytest.mark.asyncio
     async def test_name_with_underscores_and_numbers(self) -> None:
         """测试使用带下划线和数字的名称"""
         temp_dir = tempfile.mkdtemp()
@@ -534,7 +506,6 @@ class TestJSONStoreEdgeCases:
 class TestIntegration:
     """集成测试"""
 
-    @pytest.mark.asyncio
     async def test_full_crud_workflow(self) -> None:
         """测试完整的增删改查工作流程"""
         temp_dir = tempfile.mkdtemp()
@@ -565,7 +536,6 @@ class TestIntegration:
         finally:
             shutil.rmtree(temp_dir)
 
-    @pytest.mark.asyncio
     async def test_multiple_data_sets(self) -> None:
         """测试管理多个数据集"""
         temp_dir = tempfile.mkdtemp()

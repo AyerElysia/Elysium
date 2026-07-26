@@ -56,7 +56,6 @@ def _seed_todos(tmp_path: Path, count: int, *, completed: int = 0) -> None:
     TodoStorage(tmp_path).save(todos)
 
 
-@pytest.mark.asyncio
 async def test_list_todos_defaults_to_compact_limited_summary(tmp_path: Path) -> None:
     _seed_todos(tmp_path, 12, completed=1)
     tool = _make_list_tool(tmp_path)
@@ -100,7 +99,6 @@ async def test_list_todos_defaults_to_compact_limited_summary(tmp_path: Path) ->
     assert "created_at" not in first
 
 
-@pytest.mark.asyncio
 async def test_list_todos_full_detail_is_explicit_and_still_limited(tmp_path: Path) -> None:
     _seed_todos(tmp_path, 3)
     tool = _make_list_tool(tmp_path)
@@ -118,7 +116,6 @@ async def test_list_todos_full_detail_is_explicit_and_still_limited(tmp_path: Pa
     assert "created_at" in payload["todos"][0]
 
 
-@pytest.mark.asyncio
 async def test_list_todos_limit_has_hard_cap(tmp_path: Path) -> None:
     _seed_todos(tmp_path, 30)
     tool = _make_list_tool(tmp_path)
@@ -132,7 +129,6 @@ async def test_list_todos_limit_has_hard_cap(tmp_path: Path) -> None:
     assert payload["truncated"] is True
 
 
-@pytest.mark.asyncio
 async def test_create_requires_next_action_and_review_anchor(tmp_path: Path) -> None:
     tool = _make_manage_tool(tmp_path)
 
@@ -149,7 +145,6 @@ async def test_create_requires_next_action_and_review_anchor(tmp_path: Path) -> 
     assert "至少一项" in str(message)
 
 
-@pytest.mark.asyncio
 async def test_create_shared_recurring_todo_returns_disclosure_flag(tmp_path: Path) -> None:
     tool = _make_manage_tool(tmp_path)
 
@@ -172,7 +167,6 @@ async def test_create_shared_recurring_todo_returns_disclosure_flag(tmp_path: Pa
     assert todo["remind_at"]
 
 
-@pytest.mark.asyncio
 async def test_complete_recurring_todo_records_once_and_schedules_next(tmp_path: Path) -> None:
     storage = TodoStorage(tmp_path)
     storage.save([
@@ -202,7 +196,6 @@ async def test_complete_recurring_todo_records_once_and_schedules_next(tmp_path:
     assert todo["remind_at"]
 
 
-@pytest.mark.asyncio
 async def test_reminder_schedule_is_created_and_replaced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[dict[str, object]] = []
 

@@ -43,7 +43,6 @@ class TestPermissionAPI:
             
             assert result == "qq:123456"
     
-    @pytest.mark.asyncio
     async def test_get_user_permission_level(self) -> None:
         """测试获取用户权限级别。"""
         with patch('src.app.plugin_system.api.permission_api._get_permission_manager') as mock_get_mgr:
@@ -55,7 +54,6 @@ class TestPermissionAPI:
             
             assert result == PermissionLevel.OPERATOR
     
-    @pytest.mark.asyncio
     async def test_set_user_permission_group(self) -> None:
         """测试设置用户权限组。"""
         with patch('src.app.plugin_system.api.permission_api._get_permission_manager') as mock_get_mgr:
@@ -70,7 +68,6 @@ class TestPermissionAPI:
             
             assert result is True
     
-    @pytest.mark.asyncio
     async def test_remove_user_permission_group(self) -> None:
         """测试移除用户权限组。"""
         with patch('src.app.plugin_system.api.permission_api._get_permission_manager') as mock_get_mgr:
@@ -82,7 +79,6 @@ class TestPermissionAPI:
             
             assert result is True
     
-    @pytest.mark.asyncio
     async def test_check_command_permission(self) -> None:
         """测试检查命令权限。"""
         with patch('src.app.plugin_system.api.permission_api._get_permission_manager') as mock_get_mgr:
@@ -101,7 +97,6 @@ class TestPermissionAPI:
             assert has_perm is True
             assert reason == "allowed"
     
-    @pytest.mark.asyncio
     async def test_grant_command_permission(self) -> None:
         """测试授予命令权限。"""
         with patch('src.app.plugin_system.api.permission_api._get_permission_manager') as mock_get_mgr:

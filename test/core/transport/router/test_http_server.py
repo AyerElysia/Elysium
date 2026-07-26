@@ -27,7 +27,6 @@ class TestHTTPServer:
         if server.is_running():
             asyncio.create_task(server.stop())
 
-    @pytest.mark.asyncio
     async def test_server_init(self, server):
         """测试服务器初始化。"""
         assert server.host == "127.0.0.1"
@@ -35,7 +34,6 @@ class TestHTTPServer:
         assert not server.is_running()
         assert isinstance(server.app, FastAPI)
 
-    @pytest.mark.asyncio
     async def test_server_start_stop(self, server):
         """测试服务器启动和停止。"""
         # 启动服务器
@@ -55,7 +53,6 @@ class TestHTTPServer:
         await server.stop()
         assert not server.is_running()
 
-    @pytest.mark.asyncio
     async def test_mount_sub_app(self, server):
         """测试挂载子应用。"""
         # 创建子应用
@@ -80,7 +77,6 @@ class TestHTTPServer:
 
         await server.stop()
 
-    @pytest.mark.asyncio
     async def test_get_app(self, server):
         """测试获取应用实例。"""
         app = server.app
@@ -107,7 +103,6 @@ class TestHTTPServer:
         url = server.get_base_url()
         assert url == "http://127.0.0.1:8888"
 
-    @pytest.mark.asyncio
     async def test_multiple_start_error(self, server):
         """测试重复启动服务器会抛出错误。"""
         await server.start()
@@ -118,7 +113,6 @@ class TestHTTPServer:
 
         await server.stop()
 
-    @pytest.mark.asyncio
     async def test_stop_not_running(self, server):
         """测试停止未运行的服务器不会报错。"""
         # 不应该抛出异常
@@ -153,7 +147,6 @@ class TestGlobalServer:
         assert server2 is server
 
 
-@pytest.mark.asyncio
 async def test_concurrent_requests():
     """测试并发请求处理。"""
     server = HTTPServer(host="127.0.0.1", port=8889)

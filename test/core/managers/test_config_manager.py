@@ -48,7 +48,6 @@ class TestConfigManagerInit:
 class TestConfigManagerLoadConfig:
     """测试配置加载功能。"""
     
-    @pytest.mark.asyncio
     async def test_load_config_first_time(self) -> None:
         """测试首次加载配置。"""
         manager = ConfigManager()
@@ -70,7 +69,6 @@ class TestConfigManagerLoadConfig:
             assert result == mock_config
             assert manager._configs["test_plugin"] == mock_config
     
-    @pytest.mark.asyncio
     async def test_load_config_returns_cached(self) -> None:
         """测试加载已缓存的配置直接返回。"""
         manager = ConfigManager()
@@ -86,7 +84,6 @@ class TestConfigManagerLoadConfig:
             # 应返回缓存的配置
             assert result == cached_config
     
-    @pytest.mark.asyncio
     async def test_load_config_with_custom_params(self) -> None:
         """测试使用自定义参数加载配置。"""
         manager = ConfigManager()
@@ -115,7 +112,6 @@ class TestConfigManagerLoadConfig:
 class TestConfigManagerReloadConfig:
     """测试配置重载功能。"""
     
-    @pytest.mark.asyncio
     async def test_reload_config_clears_cache(self) -> None:
         """测试重载配置清除旧缓存。"""
         manager = ConfigManager()
@@ -135,7 +131,6 @@ class TestConfigManagerReloadConfig:
             assert manager._configs["test_plugin"] == new_config
             assert manager._configs["test_plugin"] is not old_config
     
-    @pytest.mark.asyncio
     async def test_reload_config_without_previous_cache(self) -> None:
         """测试重载未缓存的配置。"""
         manager = ConfigManager()

@@ -33,7 +33,6 @@ def _image_segment(sub_type: object) -> dict:
         (None, "emoji"),  # marketFace/旧版 image 段可能省略 sub_type
     ],
 )
-@pytest.mark.asyncio
 async def test_image_subtypes_are_converted_to_base64_segments(
     sub_type: object,
     expected_type: str,
@@ -50,7 +49,6 @@ async def test_image_subtypes_are_converted_to_base64_segments(
 
 
 @pytest.mark.parametrize("sub_type", [99, "not-a-subtype", True])
-@pytest.mark.asyncio
 async def test_invalid_image_subtypes_use_placeholder_without_download(sub_type: object) -> None:
     handler = MessageHandler(SimpleNamespace(plugin=None))
     get_image_base64 = AsyncMock()
@@ -62,7 +60,6 @@ async def test_invalid_image_subtypes_use_placeholder_without_download(sub_type:
     get_image_base64.assert_not_awaited()
 
 
-@pytest.mark.asyncio
 async def test_image_download_failure_keeps_existing_drop_semantics() -> None:
     handler = MessageHandler(SimpleNamespace(plugin=None))
     get_image_base64 = AsyncMock(side_effect=RuntimeError("download failed"))
@@ -74,7 +71,6 @@ async def test_image_download_failure_keeps_existing_drop_semantics() -> None:
     get_image_base64.assert_awaited_once_with(_IMAGE_URL)
 
 
-@pytest.mark.asyncio
 async def test_image_download_timeout_returns_placeholder() -> None:
     handler = MessageHandler(SimpleNamespace(plugin=None))
     get_image_base64 = AsyncMock(side_effect=TimeoutError)

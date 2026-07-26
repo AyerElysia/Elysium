@@ -5,7 +5,6 @@ from unittest.mock import AsyncMock
 import pytest
 
 
-@pytest.mark.asyncio
 async def test_adapter_manager_subprocess_mode_is_rejected(monkeypatch):
     """子进程适配器支持已移除：声明 run_in_subprocess=True 的适配器应被拒绝启动。"""
 
@@ -30,7 +29,6 @@ async def test_adapter_manager_subprocess_mode_is_rejected(monkeypatch):
     assert adapter is None
 
 
-@pytest.mark.asyncio
 async def test_on_all_plugins_loaded_schedules_background_start(monkeypatch):
     """所有适配器都应立即调度到后台启动并返回。"""
 

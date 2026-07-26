@@ -70,7 +70,6 @@ def _make_bot_with_deps_config(enabled: bool = True, skip_if_satisfied: bool = T
 class TestInstallPluginDepsDisabled:
     """测试 plugin_deps.enabled=False 时的行为"""
 
-    @pytest.mark.asyncio
     async def test_skips_all_when_disabled(self) -> None:
         """enabled=False 时不应调用 DependencyInstaller 并更新状态为已跳过"""
         bot = _make_bot_with_deps_config(enabled=False)
@@ -83,7 +82,6 @@ class TestInstallPluginDepsDisabled:
         mock_installer_cls.assert_not_called()
         bot.ui.update_phase_status.assert_called_once_with("依赖安装", "已跳过（已禁用）")
 
-    @pytest.mark.asyncio
     async def test_load_order_unchanged_when_disabled(self) -> None:
         """enabled=False 时 load_order 不应被修改"""
         bot = _make_bot_with_deps_config(enabled=False)
@@ -104,7 +102,6 @@ class TestInstallPluginDepsDisabled:
 class TestInstallPluginDepsNoDeps:
     """测试所有插件均无依赖时的行为"""
 
-    @pytest.mark.asyncio
     async def test_no_deps_updates_status_without_installing(self) -> None:
         """所有插件无依赖时应更新状态为无需安装"""
         bot = _make_bot_with_deps_config(enabled=True)
@@ -126,7 +123,6 @@ class TestInstallPluginDepsNoDeps:
 class TestInstallPluginDepsSuccess:
     """测试依赖安装成功时的行为"""
 
-    @pytest.mark.asyncio
     async def test_load_order_unchanged_when_install_succeeds(self) -> None:
         """安装成功时 load_order 不应被修改"""
         bot = _make_bot_with_deps_config(enabled=True)
@@ -145,7 +141,6 @@ class TestInstallPluginDepsSuccess:
         assert "plugin_a" in bot.load_order
         assert "plugin_b" in bot.load_order
 
-    @pytest.mark.asyncio
     async def test_load_results_not_set_on_success(self) -> None:
         """安装成功时 load_results 不应预先设置为 False"""
         bot = _make_bot_with_deps_config(enabled=True)
@@ -171,7 +166,6 @@ class TestInstallPluginDepsSuccess:
 class TestInstallPluginDepsFailRequired:
     """测试依赖安装失败且 dependencies_required=True 时的行为"""
 
-    @pytest.mark.asyncio
     async def test_plugin_removed_from_load_order(self) -> None:
         """dependencies_required=True 时安装失败应将插件从 load_order 中移除"""
         bot = _make_bot_with_deps_config(enabled=True)
@@ -190,7 +184,6 @@ class TestInstallPluginDepsFailRequired:
         assert "plugin_a" not in bot.load_order
         assert "plugin_b" in bot.load_order
 
-    @pytest.mark.asyncio
     async def test_load_results_set_false_for_failed_required(self) -> None:
         """dependencies_required=True 安装失败时应在 load_results 中标记 False"""
         bot = _make_bot_with_deps_config(enabled=True)
@@ -207,7 +200,6 @@ class TestInstallPluginDepsFailRequired:
 
         assert bot.load_results.get("plugin_a") is False
 
-    @pytest.mark.asyncio
     async def test_warning_logged_for_failed_required(self) -> None:
         """dependencies_required=True 安装失败时应记录 warning 日志"""
         bot = _make_bot_with_deps_config(enabled=True)
@@ -233,7 +225,6 @@ class TestInstallPluginDepsFailRequired:
 class TestInstallPluginDepsFailOptional:
     """测试依赖安装失败且 dependencies_required=False 时的行为"""
 
-    @pytest.mark.asyncio
     async def test_plugin_kept_in_load_order(self) -> None:
         """dependencies_required=False 时安装失败不应将插件从 load_order 中移除"""
         bot = _make_bot_with_deps_config(enabled=True)
@@ -250,7 +241,6 @@ class TestInstallPluginDepsFailOptional:
 
         assert "plugin_a" in bot.load_order
 
-    @pytest.mark.asyncio
     async def test_load_results_not_set_for_optional_failure(self) -> None:
         """dependencies_required=False 安装失败时不应在 load_results 中预设为 False"""
         bot = _make_bot_with_deps_config(enabled=True)
@@ -268,7 +258,6 @@ class TestInstallPluginDepsFailOptional:
         # dependencies_required=False 的插件不应被提前打入 load_results
         assert "plugin_a" not in bot.load_results
 
-    @pytest.mark.asyncio
     async def test_warning_logged_for_optional_failure(self) -> None:
         """dependencies_required=False 安装失败时应记录 warning 日志"""
         bot = _make_bot_with_deps_config(enabled=True)

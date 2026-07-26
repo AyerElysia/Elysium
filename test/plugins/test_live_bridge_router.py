@@ -296,7 +296,6 @@ def test_live_fast_reply_sanitizer_strips_wrappers() -> None:
     assert OpenAIRouter._sanitize_live_fast_reply("```text\n爱莉：看到啦。\n```") == "看到啦。"
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("blocked_stage", ["send", "response"])
 async def test_bridge_total_timeout_covers_send_and_response(blocked_stage: str) -> None:
     class _BlockingResponse:
@@ -320,7 +319,6 @@ async def test_bridge_total_timeout_covers_send_and_response(blocked_stage: str)
         )
 
 
-@pytest.mark.asyncio
 async def test_chat_completions_rejects_unsupported_streaming() -> None:
     router = OpenAIRouter.__new__(OpenAIRouter)
     handlers: dict[str, object] = {}
@@ -349,7 +347,6 @@ async def test_chat_completions_rejects_unsupported_streaming() -> None:
     assert "stream=true" in exc_info.value.detail
 
 
-@pytest.mark.asyncio
 async def test_router_subscribes_reply_queue_to_delivered_event(monkeypatch) -> None:
     router = OpenAIRouter.__new__(OpenAIRouter)
     event_bus = SimpleNamespace(subscribe=Mock())
@@ -368,7 +365,6 @@ async def test_router_subscribes_reply_queue_to_delivered_event(monkeypatch) -> 
     assert callback == router._on_message_sent
 
 
-@pytest.mark.asyncio
 async def test_chat_completions_routes_sister_marker_to_isolated_handler(monkeypatch) -> None:
     router = OpenAIRouter.__new__(OpenAIRouter)
 
@@ -399,7 +395,6 @@ async def test_chat_completions_routes_sister_marker_to_isolated_handler(monkeyp
     assert getattr(result, "routed", None) == "sister"
 
 
-@pytest.mark.asyncio
 async def test_record_sister_reply_persists_directly_to_stream_history(monkeypatch) -> None:
     router = OpenAIRouter.__new__(OpenAIRouter)
     stream_manager = SimpleNamespace(
@@ -428,7 +423,6 @@ async def test_record_sister_reply_persists_directly_to_stream_history(monkeypat
     assert reply.extra["sister_bridge"] is True
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("generation_result", "expected_status"),
     [
@@ -470,7 +464,6 @@ async def test_sister_generation_failures_remain_retryable_http_errors(
     record_sister.assert_not_awaited()
 
 
-@pytest.mark.asyncio
 async def test_sister_prompt_reads_only_isolated_stream_history(monkeypatch) -> None:
     from src.core.models.message import Message
 

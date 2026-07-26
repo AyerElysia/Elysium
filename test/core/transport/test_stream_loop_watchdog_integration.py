@@ -12,7 +12,6 @@ from src.core.transport.distribution.loop import run_chat_stream
 from src.core.transport.distribution.stream_loop_manager import StreamLoopManager
 
 
-@pytest.mark.asyncio
 async def test_start_stream_loop_registers_watchdog_with_exact_thresholds(monkeypatch: pytest.MonkeyPatch) -> None:
     """启动流循环时应使用精确秒级阈值，并注入可调用的重启回调。"""
     manager = StreamLoopManager()
@@ -75,7 +74,6 @@ async def test_start_stream_loop_registers_watchdog_with_exact_thresholds(monkey
             await task
 
 
-@pytest.mark.asyncio
 async def test_run_chat_stream_unregisters_watchdog_on_exit(monkeypatch: pytest.MonkeyPatch) -> None:
     """流驱动器退出时应注销 WatchDog 心跳注册。"""
     stream_id = "stream_unregister_on_exit"
@@ -113,7 +111,6 @@ async def test_run_chat_stream_unregisters_watchdog_on_exit(monkeypatch: pytest.
     unregister_mock.assert_called_once_with(stream_id=stream_id)
 
 
-@pytest.mark.asyncio
 async def test_watchdog_restart_callback_is_throttled(monkeypatch: pytest.MonkeyPatch) -> None:
     """WatchDog 高频触发重启回调时，应被管理器冷却窗口抑制。"""
     manager = StreamLoopManager()
@@ -180,7 +177,6 @@ async def test_watchdog_restart_callback_is_throttled(monkeypatch: pytest.Monkey
             await task
 
 
-@pytest.mark.asyncio
 async def test_force_restart_does_not_wait_for_stuck_old_task(monkeypatch: pytest.MonkeyPatch) -> None:
     """强制重启应立即切换到新任务，而不是卡在已取消但不退出的旧任务上。"""
     manager = StreamLoopManager()
@@ -262,7 +258,6 @@ async def test_force_restart_does_not_wait_for_stuck_old_task(monkeypatch: pytes
     await new_task
 
 
-@pytest.mark.asyncio
 async def test_run_chat_stream_does_not_cleanup_new_task_state(monkeypatch: pytest.MonkeyPatch) -> None:
     """旧任务退出时，不应清理已被新任务接管的 context.stream_loop_task/WatchDog 注册。"""
     stream_id = "stream_cleanup_race"

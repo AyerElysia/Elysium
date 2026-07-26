@@ -38,7 +38,6 @@ def _fake_capture() -> CapturedScreen:
     )
 
 
-@pytest.mark.asyncio
 async def test_view_screen_uses_native_when_screen_native_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     from plugins.life_engine.tools import screen_tools
 
@@ -65,7 +64,6 @@ async def test_view_screen_uses_native_when_screen_native_enabled(monkeypatch: p
     assert calls == ["vlm"]
 
 
-@pytest.mark.asyncio
 async def test_view_screen_falls_back_when_native_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     from plugins.life_engine.tools import screen_tools
 
@@ -92,7 +90,6 @@ async def test_view_screen_falls_back_when_native_disabled(monkeypatch: pytest.M
     assert calls == ["vlm"]
 
 
-@pytest.mark.asyncio
 async def test_view_screen_rejects_when_disabled() -> None:
     plugin = _make_plugin()
     plugin.config.screen.enabled = False
@@ -144,7 +141,6 @@ def test_is_blank_image_returns_true_for_missing_file(tmp_path: Path) -> None:
     assert _is_blank_image(tmp_path / "nonexistent.png") is True
 
 
-@pytest.mark.asyncio
 async def test_auto_mode_skips_blank_capture_and_tries_next(monkeypatch: pytest.MonkeyPatch) -> None:
     """auto 模式下，黑图捕获应被跳过，继续尝试下一个方法。"""
     from plugins.life_engine.tools import screen_tools
@@ -186,7 +182,6 @@ async def test_auto_mode_skips_blank_capture_and_tries_next(monkeypatch: pytest.
     assert "pil" not in call_order
 
 
-@pytest.mark.asyncio
 async def test_wsl_auto_mode_tries_powershell_first(monkeypatch: pytest.MonkeyPatch) -> None:
     """WSL auto 模式下应最先尝试 powershell 截图方法。"""
     from plugins.life_engine.tools import screen_tools

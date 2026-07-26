@@ -326,7 +326,6 @@ class TestActionManagerGetActionSchemas:
 class TestActionManagerExecuteAction:
     """测试 Action 执行功能。"""
     
-    @pytest.mark.asyncio
     async def test_execute_action_success(self) -> None:
         """测试成功执行 Action。"""
         manager = ActionManager()
@@ -359,7 +358,6 @@ class TestActionManagerExecuteAction:
             assert result == (True, "Success")
             mock_action_instance.execute.assert_called_once()
     
-    @pytest.mark.asyncio
     async def test_execute_action_not_found(self) -> None:
         """测试执行不存在的 Action。"""
         manager = ActionManager()
@@ -419,7 +417,6 @@ class TestActionManagerEdgeCases:
             
             assert result is None
     
-    @pytest.mark.asyncio
     async def test_execute_action_with_exception(self) -> None:
         """测试 Action 执行异常处理。"""
         manager = ActionManager()

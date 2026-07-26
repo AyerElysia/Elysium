@@ -265,7 +265,6 @@ class TestCommandManagerMatchCommand:
 class TestCommandManagerExecuteCommand:
     """测试命令执行功能。"""
     
-    @pytest.mark.asyncio
     async def test_execute_command_success(self) -> None:
         """测试成功执行命令。"""
         manager = CommandManager()
@@ -297,7 +296,6 @@ class TestCommandManagerExecuteCommand:
             
             assert result == "Success"
     
-    @pytest.mark.asyncio
     async def test_execute_command_permission_denied(self) -> None:
         """测试权限拒绝的命令执行。"""
         manager = CommandManager()

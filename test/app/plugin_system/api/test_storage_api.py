@@ -41,7 +41,6 @@ class _Note(TestBase):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_plugin_database_initialize_creates_table(tmp_path: pytest.TempdirFactory) -> None:
     """initialize() 应建表，crud().create() 应成功写入。"""
     db = PluginDatabase(str(tmp_path / "test.db"), [_Note])
@@ -55,7 +54,6 @@ async def test_plugin_database_initialize_creates_table(tmp_path: pytest.Tempdir
         await db.close()
 
 
-@pytest.mark.asyncio
 async def test_plugin_database_initialize_idempotent(tmp_path: pytest.TempdirFactory) -> None:
     """多次调用 initialize() 不应抛出异常。"""
     db = PluginDatabase(str(tmp_path / "idempotent.db"), [_Note])
@@ -64,7 +62,6 @@ async def test_plugin_database_initialize_idempotent(tmp_path: pytest.TempdirFac
     await db.close()
 
 
-@pytest.mark.asyncio
 async def test_plugin_database_crud_read_write(tmp_path: pytest.TempdirFactory) -> None:
     """crud() 接口的 get / get_by / get_multi / count / exists / delete 方法。"""
     db = PluginDatabase(str(tmp_path / "crud.db"), [_Note])
@@ -91,7 +88,6 @@ async def test_plugin_database_crud_read_write(tmp_path: pytest.TempdirFactory) 
         await db.close()
 
 
-@pytest.mark.asyncio
 async def test_plugin_database_query_filter(tmp_path: pytest.TempdirFactory) -> None:
     """query() 接口的链式 filter / order_by / limit。"""
     db = PluginDatabase(str(tmp_path / "query.db"), [_Note])
@@ -111,7 +107,6 @@ async def test_plugin_database_query_filter(tmp_path: pytest.TempdirFactory) -> 
         await db.close()
 
 
-@pytest.mark.asyncio
 async def test_plugin_database_aggregate(tmp_path: pytest.TempdirFactory) -> None:
     """aggregate() 接口的 group_by_count。"""
     db = PluginDatabase(str(tmp_path / "agg.db"), [_Note])
@@ -132,7 +127,6 @@ async def test_plugin_database_aggregate(tmp_path: pytest.TempdirFactory) -> Non
         await db.close()
 
 
-@pytest.mark.asyncio
 async def test_plugin_database_session_raw(tmp_path: pytest.TempdirFactory) -> None:
     """session() 上下文管理器应暴露 AsyncSession，支持直接 execute。"""
     from sqlalchemy import select
@@ -151,7 +145,6 @@ async def test_plugin_database_session_raw(tmp_path: pytest.TempdirFactory) -> N
         await db.close()
 
 
-@pytest.mark.asyncio
 async def test_plugin_database_requires_initialize(tmp_path: pytest.TempdirFactory) -> None:
     """未调用 initialize() 时调用 crud() 应抛出 RuntimeError。"""
     db = PluginDatabase(str(tmp_path / "uninit.db"), [_Note])
@@ -159,7 +152,6 @@ async def test_plugin_database_requires_initialize(tmp_path: pytest.TempdirFacto
         db.crud(_Note)
 
 
-@pytest.mark.asyncio
 async def test_plugin_database_independent_from_main_db(
     tmp_path: pytest.TempdirFactory,
 ) -> None:
@@ -182,7 +174,6 @@ async def test_plugin_database_independent_from_main_db(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_save_and_load_json(tmp_path: pytest.TempdirFactory, monkeypatch: pytest.MonkeyPatch) -> None:
     """save_json / load_json 基本读写。"""
     import src.app.plugin_system.api.storage_api as sa
@@ -197,7 +188,6 @@ async def test_save_and_load_json(tmp_path: pytest.TempdirFactory, monkeypatch: 
     assert data is not None and data["v"] == 42
 
 
-@pytest.mark.asyncio
 async def test_exists_and_delete_json(tmp_path: pytest.TempdirFactory, monkeypatch: pytest.MonkeyPatch) -> None:
     """exists_json / delete_json 行为。"""
     import src.app.plugin_system.api.storage_api as sa
@@ -214,7 +204,6 @@ async def test_exists_and_delete_json(tmp_path: pytest.TempdirFactory, monkeypat
     assert not await exists_json("ns", "key1")
 
 
-@pytest.mark.asyncio
 async def test_list_json(tmp_path: pytest.TempdirFactory, monkeypatch: pytest.MonkeyPatch) -> None:
     """list_json 应返回所有已保存的键名。"""
     import src.app.plugin_system.api.storage_api as sa

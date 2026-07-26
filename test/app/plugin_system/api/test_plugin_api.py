@@ -19,7 +19,6 @@ from src.app.plugin_system.api import plugin_api
 class TestPluginAPI:
     """测试插件 API。"""
     
-    @pytest.mark.asyncio
     async def test_load_plugin(self) -> None:
         """测试加载插件。"""
         with patch('src.app.plugin_system.api.plugin_api._get_plugin_manager') as mock_get:
@@ -31,7 +30,6 @@ class TestPluginAPI:
             
             assert result is True
     
-    @pytest.mark.asyncio
     async def test_unload_plugin(self) -> None:
         """测试卸载插件。"""
         with patch('src.app.plugin_system.api.plugin_api._get_plugin_manager') as mock_get:
@@ -43,7 +41,6 @@ class TestPluginAPI:
             
             assert result is True
     
-    @pytest.mark.asyncio
     async def test_reload_plugin(self) -> None:
         """测试重载插件。"""
         with patch('src.app.plugin_system.api.plugin_api._get_plugin_manager') as mock_get:
@@ -124,7 +121,6 @@ class TestPluginAPI:
 
             assert result == "plugins/test_plugin"
 
-    @pytest.mark.asyncio
     async def test_list_unloaded_plugins(self) -> None:
         """测试列出未加载插件。"""
         with patch('src.app.plugin_system.api.plugin_api._get_plugin_manager') as mock_get_mgr:

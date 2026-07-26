@@ -24,7 +24,6 @@ from src.core.models.stream import ChatStream
 class TestStreamAPI:
     """测试流 API。"""
     
-    @pytest.mark.asyncio
     async def test_get_or_create_stream(self) -> None:
         """测试获取或创建流。"""
         with patch('src.app.plugin_system.api.stream_api._get_stream_manager') as mock_get_mgr:
@@ -42,7 +41,6 @@ class TestStreamAPI:
             
             assert result == mock_stream
     
-    @pytest.mark.asyncio
     async def test_get_stream(self) -> None:
         """测试获取流。"""
         with patch('src.app.plugin_system.api.stream_api._get_stream_manager') as mock_get_mgr:
@@ -55,7 +53,6 @@ class TestStreamAPI:
             
             assert result == mock_stream
     
-    @pytest.mark.asyncio
     async def test_build_stream_from_database(self) -> None:
         """测试从数据库构建流。"""
         with patch('src.app.plugin_system.api.stream_api._get_stream_manager') as mock_get_mgr:
@@ -68,7 +65,6 @@ class TestStreamAPI:
             
             assert result == mock_stream
     
-    @pytest.mark.asyncio
     async def test_load_stream_context(self) -> None:
         """测试加载流上下文。"""
         with patch('src.app.plugin_system.api.stream_api._get_stream_manager') as mock_get_mgr:
@@ -81,7 +77,6 @@ class TestStreamAPI:
             
             assert result == mock_context
     
-    @pytest.mark.asyncio
     async def test_add_message_to_stream(self) -> None:
         """测试添加消息到流。"""
         with patch('src.app.plugin_system.api.stream_api._get_stream_manager') as mock_get_mgr:
@@ -95,7 +90,6 @@ class TestStreamAPI:
             
             assert result == mock_db_message
     
-    @pytest.mark.asyncio
     async def test_delete_stream(self) -> None:
         """测试删除流。"""
         with patch('src.app.plugin_system.api.stream_api._get_stream_manager') as mock_get_mgr:
@@ -107,7 +101,6 @@ class TestStreamAPI:
             
             assert result is True
     
-    @pytest.mark.asyncio
     async def test_get_stream_info(self) -> None:
         """测试获取流信息。"""
         with patch('src.app.plugin_system.api.stream_api._get_stream_manager') as mock_get_mgr:
@@ -121,7 +114,6 @@ class TestStreamAPI:
             assert result is not None
             assert result["stream_id"] == "stream_123"
     
-    @pytest.mark.asyncio
     async def test_get_stream_messages(self) -> None:
         """测试获取流消息。"""
         with patch('src.app.plugin_system.api.stream_api._get_stream_manager') as mock_get_mgr:
@@ -134,7 +126,6 @@ class TestStreamAPI:
             
             assert len(result) == 2
 
-    @pytest.mark.asyncio
     async def test_clear_stream_context(self) -> None:
         """测试清空指定流上下文。"""
         with patch('src.app.plugin_system.api.stream_api._get_stream_manager') as mock_get_mgr:
@@ -150,7 +141,6 @@ class TestStreamAPI:
                 cleared_at=12.3,
             )
 
-    @pytest.mark.asyncio
     async def test_load_and_clear_context(self) -> None:
         """测试清空指定流上下文包装器。"""
         with patch('src.app.plugin_system.api.stream_api._get_stream_manager') as mock_get_mgr:
@@ -164,7 +154,6 @@ class TestStreamAPI:
             assert result == mock_stream
             mock_manager.load_and_clear_context.assert_awaited_once_with("stream_123")
 
-    @pytest.mark.asyncio
     async def test_bulk_clear_streams(self) -> None:
         """测试批量清空流上下文包装器。"""
         with patch('src.app.plugin_system.api.stream_api._get_stream_manager') as mock_get_mgr:
@@ -187,7 +176,6 @@ class TestStreamAPI:
             
             mock_manager.clear_cache.assert_called_once_with("stream_123")
     
-    @pytest.mark.asyncio
     async def test_refresh_stream(self) -> None:
         """测试刷新流。"""
         with patch('src.app.plugin_system.api.stream_api._get_stream_manager') as mock_get_mgr:
@@ -200,7 +188,6 @@ class TestStreamAPI:
             
             assert result == mock_stream
     
-    @pytest.mark.asyncio
     async def test_activate_stream(self) -> None:
         """测试激活流。"""
         with patch('src.app.plugin_system.api.stream_api._get_stream_manager') as mock_get_mgr:

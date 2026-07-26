@@ -23,7 +23,6 @@ MAX_MEDIA_DATA_BYTES = _MEDIA_MANAGER_MODULE._MAX_MEDIA_DATA_BYTES
 MAX_VIDEO_DATA_BYTES = _MEDIA_MANAGER_MODULE._MAX_VIDEO_DATA_BYTES
 
 
-@pytest.mark.asyncio
 async def test_recognize_voice_uses_cache() -> None:
     """语音命中缓存时应直接返回，不再触发 ASR。"""
     manager = MediaManager.__new__(MediaManager)
@@ -57,7 +56,6 @@ async def test_recognize_voice_uses_cache() -> None:
     assert stats["cache_misses"] == 0
 
 
-@pytest.mark.asyncio
 async def test_recognize_voice_runs_asr_and_persists() -> None:
     """语音未命中缓存时优先调用原生音频理解，并保存结果。"""
     manager = MediaManager.__new__(MediaManager)
@@ -94,7 +92,6 @@ async def test_recognize_voice_runs_asr_and_persists() -> None:
     assert stats["success"] == 1
 
 
-@pytest.mark.asyncio
 async def test_recognize_media_rejects_oversized_payload() -> None:
     """超大媒体应在进入识别前被拒绝。"""
     manager = MediaManager.__new__(MediaManager)
@@ -119,7 +116,6 @@ async def test_recognize_media_rejects_oversized_payload() -> None:
     assert stats["rejected_too_large"] == 1
 
 
-@pytest.mark.asyncio
 async def test_recognize_video_allows_payload_above_generic_media_limit() -> None:
     """视频摘要应使用视频专用上限，而不是图片/语音的 8MB 通用上限。"""
     manager = MediaManager.__new__(MediaManager)
@@ -152,7 +148,6 @@ async def test_recognize_video_allows_payload_above_generic_media_limit() -> Non
     assert stats["failure_types"]["extract_frames_failed"] == 1
 
 
-@pytest.mark.asyncio
 async def test_recognize_video_rejects_payload_above_video_limit() -> None:
     """超过 200MB 的视频仍应在抽帧前被拒绝。"""
     manager = MediaManager.__new__(MediaManager)
@@ -180,7 +175,6 @@ async def test_recognize_video_rejects_payload_above_video_limit() -> None:
     assert stats["bytes_rejected"] == MAX_VIDEO_DATA_BYTES + 1
 
 
-@pytest.mark.asyncio
 async def test_voice_failure_alert_triggers() -> None:
     """连续语音失败应触发失败告警。"""
     manager = MediaManager.__new__(MediaManager)
@@ -213,7 +207,6 @@ async def test_voice_failure_alert_triggers() -> None:
     assert stats["failure_types"]["audio_understanding_failed"] >= 5
 
 
-@pytest.mark.asyncio
 async def test_recognize_voice_rejects_path_only_without_file_access(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

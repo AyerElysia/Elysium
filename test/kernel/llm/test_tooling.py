@@ -104,7 +104,6 @@ class TestLLMUsable:
         assert schema.get("name") == "get_weather"
         assert schema.get("description") == "Get weather information"
 
-    @pytest.mark.asyncio
     async def test_execution_wraps_coroutine_result(self) -> None:
         async def execute() -> tuple[bool, str]:
             return True, "ok"
@@ -115,7 +114,6 @@ class TestLLMUsable:
         assert wrapped._status == "_DONE"
         assert result == (True, "ok")
 
-    @pytest.mark.asyncio
     async def test_execution_uses_last_non_empty_asyncgen_yield(self) -> None:
         async def execute():
             yield None

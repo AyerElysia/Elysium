@@ -250,7 +250,6 @@ def test_convert_assistant_after_tool_result_synthesizes_missing_thinking() -> N
     }
 
 
-@pytest.mark.asyncio
 async def test_create_non_stream_returns_text_tool_calls_and_reasoning(monkeypatch: pytest.MonkeyPatch) -> None:
     """测试非流式 create 路径。"""
     response = SimpleNamespace(
@@ -289,7 +288,6 @@ async def test_create_non_stream_returns_text_tool_calls_and_reasoning(monkeypat
     assert create_params["tools"][0]["input_schema"]["required"] == ["city", "reason"]
 
 
-@pytest.mark.asyncio
 async def test_create_non_stream_supports_openai_tool_format(monkeypatch: pytest.MonkeyPatch) -> None:
     """测试 Anthropic client 可按配置发送 OpenAI 风格 tools。"""
     response = SimpleNamespace(content=[SimpleNamespace(type="text", text="done")])
@@ -384,7 +382,6 @@ def test_to_anthropic_tool_does_not_inject_reason_when_execute_accepts_it() -> N
     assert "reason" not in required
 
 
-@pytest.mark.asyncio
 async def test_create_stream_emits_text_reasoning_and_tool_deltas(monkeypatch: pytest.MonkeyPatch) -> None:
     """测试流式 create 路径。"""
     events = [

@@ -43,7 +43,6 @@ def _register_skill(plugin: SkillManagerPlugin, root_dir: Path, name: str) -> Sk
     return entry
 
 
-@pytest.mark.asyncio
 async def test_skill_command_list_reports_registered_skills(tmp_path: Path) -> None:
     """list 子命令应按名称列出已注册 skill。"""
 
@@ -68,7 +67,6 @@ async def test_skill_command_list_reports_registered_skills(tmp_path: Path) -> N
     assert "beta: beta skill" in sent_message
 
 
-@pytest.mark.asyncio
 async def test_skill_command_refresh_reloads_catalog(tmp_path: Path) -> None:
     """refresh 子命令应触发插件重新扫描 skill 目录。"""
 
@@ -107,7 +105,6 @@ def test_skill_manager_plugin_exposes_command_component() -> None:
     assert SkillManagerCommand in plugin.get_components()
 
 
-@pytest.mark.asyncio
 async def test_skill_command_direct_invocation_injects_skill(
     tmp_path: Path,
 ) -> None:

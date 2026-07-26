@@ -117,7 +117,6 @@ class TestIsSatisfied:
 class TestInstall:
     """测试 install 方法"""
 
-    @pytest.mark.asyncio
     async def test_empty_packages_returns_true_without_subprocess(self) -> None:
         """空包列表直接返回 True，不调用 subprocess"""
         installer = DependencyInstaller()
@@ -126,7 +125,6 @@ class TestInstall:
         assert result is True
         mock_exec.assert_not_called()
 
-    @pytest.mark.asyncio
     async def test_successful_install_returns_true(self) -> None:
         """subprocess 返回退出码 0 时，install 应返回 True"""
         installer = DependencyInstaller()
@@ -140,7 +138,6 @@ class TestInstall:
 
         assert result is True
 
-    @pytest.mark.asyncio
     async def test_failed_install_returns_false(self) -> None:
         """subprocess 返回非 0 退出码时，install 应返回 False"""
         installer = DependencyInstaller()
@@ -154,7 +151,6 @@ class TestInstall:
 
         assert result is False
 
-    @pytest.mark.asyncio
     async def test_command_not_found_returns_false(self) -> None:
         """安装命令不存在时，install 应返回 False（不抛出）"""
         installer = DependencyInstaller()
@@ -164,7 +160,6 @@ class TestInstall:
 
         assert result is False
 
-    @pytest.mark.asyncio
     async def test_invalid_command_format_returns_false(self) -> None:
         """命令格式解析失败时，install 应返回 False"""
         installer = DependencyInstaller()
@@ -172,7 +167,6 @@ class TestInstall:
         result = await installer.install(["requests"], command="pip 'unclosed")
         assert result is False
 
-    @pytest.mark.asyncio
     async def test_subprocess_called_with_correct_args(self) -> None:
         """验证 subprocess 调用时正确传入了命令和包名"""
         installer = DependencyInstaller()
@@ -197,13 +191,11 @@ class TestInstall:
 class TestInstallForPlugins:
     """测试 install_for_plugins 方法"""
 
-    @pytest.mark.asyncio
     async def test_empty_specs_returns_empty_dict(self) -> None:
         installer = DependencyInstaller()
         result = await installer.install_for_plugins([])
         assert result == {}
 
-    @pytest.mark.asyncio
     async def test_spec_with_no_packages_marked_true(self) -> None:
         """无依赖的插件应直接标记为 True"""
         installer = DependencyInstaller()
@@ -211,7 +203,6 @@ class TestInstallForPlugins:
         result = await installer.install_for_plugins(specs)
         assert result == {"plugin_a": True}
 
-    @pytest.mark.asyncio
     async def test_deduplication_of_packages(self) -> None:
         """多个插件声明相同包时，只应安装一次"""
         installer = DependencyInstaller()
@@ -235,7 +226,6 @@ class TestInstallForPlugins:
         assert len(captured_packages) == 1
         assert len(captured_packages[0]) == 3  # 去重后 3 个不同包
 
-    @pytest.mark.asyncio
     async def test_all_plugins_true_when_install_succeeds(self) -> None:
         """安装成功时，所有带依赖的插件均标记为 True"""
         installer = DependencyInstaller()
@@ -251,7 +241,6 @@ class TestInstallForPlugins:
 
         assert results == {"plugin_a": True, "plugin_b": True}
 
-    @pytest.mark.asyncio
     async def test_all_plugins_false_when_install_fails(self) -> None:
         """安装失败时，所有带依赖的插件均标记为 False"""
         installer = DependencyInstaller()
@@ -268,7 +257,6 @@ class TestInstallForPlugins:
         assert results["plugin_a"] is False
         assert results["plugin_b"] is False
 
-    @pytest.mark.asyncio
     async def test_skip_if_satisfied_true_calls_check_missing(self) -> None:
         """skip_if_satisfied=True 时应调用 check_missing 过滤已满足的包"""
         installer = DependencyInstaller()
@@ -281,7 +269,6 @@ class TestInstallForPlugins:
         # check_missing 返回空列表（全部满足），installer.install 不应被调用
         assert results["plugin_a"] is True
 
-    @pytest.mark.asyncio
     async def test_skip_if_satisfied_false_skips_check_missing(self) -> None:
         """skip_if_satisfied=False 时不应调用 check_missing，直接安装全部"""
         installer = DependencyInstaller()

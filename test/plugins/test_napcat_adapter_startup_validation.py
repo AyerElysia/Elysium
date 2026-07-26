@@ -286,7 +286,6 @@ def test_send_platform_message_propagates_send_handler_error() -> None:
         asyncio.run(adapter._send_platform_message({"message_info": {}, "message_segment": {}}))
 
 
-@pytest.mark.asyncio
 async def test_send_platform_message_preserves_napcat_timeout_cause() -> None:
     """Napcat API 超时应保留原始 TimeoutError 异常链。"""
     plugin = _build_napcat_plugin()
@@ -475,7 +474,6 @@ def test_handle_raw_message_keeps_normal_private_message() -> None:
     assert envelope is not None
 
 
-@pytest.mark.asyncio
 async def test_meta_event_handler_reconnects_when_heartbeat_times_out(monkeypatch) -> None:
     """心跳超时时应触发适配器自动重连。"""
 

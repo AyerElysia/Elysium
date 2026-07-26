@@ -20,7 +20,6 @@ StreamManager = _STREAM_MANAGER_MODULE.StreamManager
 _serialize_content_for_db = _STREAM_MANAGER_MODULE._serialize_content_for_db
 
 
-@pytest.mark.asyncio
 async def test_add_message_strips_all_media_base64_payloads() -> None:
     """入库时不应保留任何媒体 base64，只保留元信息。"""
     manager = StreamManager.__new__(StreamManager)
@@ -68,7 +67,6 @@ async def test_add_message_strips_all_media_base64_payloads() -> None:
     assert "huge.png" in created["content"]
 
 
-@pytest.mark.asyncio
 async def test_add_message_strips_raw_binary_string_content() -> None:
     """纯字符串媒体内容也不应以 base64 形式落库。"""
     manager = StreamManager.__new__(StreamManager)

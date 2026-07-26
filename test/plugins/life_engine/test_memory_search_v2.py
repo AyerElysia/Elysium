@@ -113,7 +113,6 @@ def _snapshot(db: sqlite3.Connection) -> tuple[list[tuple[Any, ...]], ...]:
     return tuple([tuple(row) for row in db.execute(query).fetchall()] for query in queries)
 
 
-@pytest.mark.asyncio
 async def test_chinese_chunk_fts_hits_late_content_and_multiterm_is_or(tmp_path: Path) -> None:
     db = _db(tmp_path)
     content = "前文无关。" * 180 + "后半段出现神经可塑性关键结论，另有星海协议。"
@@ -139,7 +138,6 @@ async def test_chinese_chunk_fts_hits_late_content_and_multiterm_is_or(tmp_path:
     assert [item.node_id for item in multi] == [indexed.node_id]
 
 
-@pytest.mark.asyncio
 async def test_fts_and_vector_run_in_parallel_and_vector_query_is_off_loop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -177,7 +175,6 @@ async def test_fts_and_vector_run_in_parallel_and_vector_query_is_off_loop(
     assert collection.query_thread_id != main_thread
 
 
-@pytest.mark.asyncio
 async def test_vector_failure_returns_fts_and_marks_degraded(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -203,7 +200,6 @@ async def test_vector_failure_returns_fts_and_marks_degraded(
     assert collection.delete_calls == []
 
 
-@pytest.mark.asyncio
 async def test_strict_file_type_and_workspace_missing_filter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -236,7 +232,6 @@ async def test_strict_file_type_and_workspace_missing_filter(
     assert [item.file_path for item in results] == ["notes/live.md"]
 
 
-@pytest.mark.asyncio
 async def test_explicit_relative_date_and_time_range_filters(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -278,7 +273,6 @@ async def test_explicit_relative_date_and_time_range_filters(
     }
 
 
-@pytest.mark.asyncio
 async def test_same_node_multi_chunk_dedup_and_search_is_fully_read_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -317,7 +311,6 @@ async def test_same_node_multi_chunk_dedup_and_search_is_fully_read_only(
     assert _snapshot(db) == before
 
 
-@pytest.mark.asyncio
 async def test_embed_texts_sends_one_batch_and_retains_provider_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -361,7 +354,6 @@ async def test_embed_texts_sends_one_batch_and_retains_provider_model(
     assert result.dimension == 2
 
 
-@pytest.mark.asyncio
 async def test_chunk_vector_search_deduplicates_nodes_and_ignores_stale_ids(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -406,7 +398,6 @@ async def test_chunk_vector_search_deduplicates_nodes_and_ignores_stale_ids(
     assert chunks.delete_calls == []
 
 
-@pytest.mark.asyncio
 async def test_chunk_vector_validation_waits_for_parallel_fts_reader(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -483,7 +474,6 @@ async def test_chunk_vector_validation_waits_for_parallel_fts_reader(
     assert [item.file_path for item in detailed.results] == ["notes/chunk-parallel.md"]
 
 
-@pytest.mark.asyncio
 async def test_chunk_vector_failure_uses_degraded_legacy_node_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -517,7 +507,6 @@ async def test_chunk_vector_failure_uses_degraded_legacy_node_fallback(
     assert legacy.query_thread_id is not None
 
 
-@pytest.mark.asyncio
 async def test_vector_filter_callback_cannot_bypass_strict_sqlite_visibility(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -547,7 +536,6 @@ async def test_vector_filter_callback_cannot_bypass_strict_sqlite_visibility(
     assert [node_id for node_id, _ in results] == [visible.node_id]
 
 
-@pytest.mark.asyncio
 async def test_sync_embedding_enqueues_outbox_without_chroma_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -622,7 +610,6 @@ async def test_sync_embedding_enqueues_outbox_without_chroma_write(
     ],
     ids=["dot-slash", "duplicate-slash", "backslash", "padding", "runtime"],
 )
-@pytest.mark.asyncio
 async def test_search_memory_excludes_malformed_stored_paths_without_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

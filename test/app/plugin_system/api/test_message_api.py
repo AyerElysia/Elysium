@@ -7,7 +7,6 @@ import pytest
 from src.app.plugin_system.api import message_api
 
 
-@pytest.mark.asyncio
 async def test_get_messages_by_time_in_chat_invalid_stream_id() -> None:
     """stream_id 为空时应抛出 ValueError。"""
     with pytest.raises(ValueError, match="stream_id 不能为空"):
@@ -18,7 +17,6 @@ async def test_get_messages_by_time_in_chat_invalid_stream_id() -> None:
         )
 
 
-@pytest.mark.asyncio
 async def test_get_messages_by_time_in_chat_applies_filter_bot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -48,7 +46,6 @@ async def test_get_messages_by_time_in_chat_applies_filter_bot(
     assert result == [{"sender_id": "user1", "time": 2.0}]
 
 
-@pytest.mark.asyncio
 async def test_is_command_message_uses_command_manager(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -64,7 +61,6 @@ async def test_is_command_message_uses_command_manager(
     assert message_api._is_command_message({"content": "hello"}) is False
 
 
-@pytest.mark.asyncio
 async def test_rows_to_message_dicts_uses_new_structure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -106,7 +102,6 @@ async def test_rows_to_message_dicts_uses_new_structure(
     assert "user_id" not in result[0]
 
 
-@pytest.mark.asyncio
 async def test_build_readable_messages_with_details_merge_and_absolute() -> None:
     """格式化函数应支持 absolute 时间与 merge。"""
     messages = [
@@ -124,7 +119,6 @@ async def test_build_readable_messages_with_details_merge_and_absolute() -> None
     assert len(details) == 1
 
 
-@pytest.mark.asyncio
 async def test_get_person_ids_from_messages_returns_sorted_unique() -> None:
     """person_id 提取应去重并排序。"""
     messages = [

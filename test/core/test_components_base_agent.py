@@ -93,7 +93,6 @@ class TestBaseAgent:
         agent = ConcreteAgent(stream_id="stream_123", plugin=mock_plugin)
         assert agent.get_signature() == "my_plugin:agent:task_agent"
 
-    @pytest.mark.asyncio
     async def test_execute(self, mock_plugin):
         """测试 execute。"""
         agent = ConcreteAgent(stream_id="stream_123", plugin=mock_plugin)
@@ -197,7 +196,6 @@ class TestBaseAgent:
 
         reset_system_reminder_store()
 
-    @pytest.mark.asyncio
     async def test_execute_local_usable_success(self, mock_plugin):
         """测试执行私有 usable 成功。"""
         agent = ConcreteAgent(stream_id="stream_123", plugin=mock_plugin)
@@ -208,7 +206,6 @@ class TestBaseAgent:
         assert success is True
         assert result == "private:weather"
 
-    @pytest.mark.asyncio
     async def test_execute_local_usable_success_with_prefixed_name(self, mock_plugin):
         """测试执行私有 usable（带 schema 前缀名）成功。"""
         agent = ConcreteAgent(stream_id="stream_123", plugin=mock_plugin)
@@ -219,7 +216,6 @@ class TestBaseAgent:
         assert success is True
         assert result == "private:weather"
 
-    @pytest.mark.asyncio
     async def test_execute_local_usable_keeps_declared_reason(self, mock_plugin):
         """测试私有 usable 显式声明 reason 时不被剥离。"""
 
@@ -236,14 +232,12 @@ class TestBaseAgent:
         assert success is True
         assert result == "weather:need details"
 
-    @pytest.mark.asyncio
     async def test_execute_local_usable_not_found(self, mock_plugin):
         """测试执行不存在的私有 usable。"""
         agent = ConcreteAgent(stream_id="stream_123", plugin=mock_plugin)
         with pytest.raises(ValueError, match="私有 usable 不存在"):
             await agent.execute_local_usable("non_existing_tool")
 
-    @pytest.mark.asyncio
     async def test_execute_local_usable_ignores_global_registry(self, mock_plugin):
         """测试 Agent 不读取全局注册表。"""
         agent = ConcreteAgent(stream_id="stream_123", plugin=mock_plugin)
@@ -253,7 +247,6 @@ class TestBaseAgent:
 
         mock_registry.assert_not_called()
 
-    @pytest.mark.asyncio
     async def test_execute_local_usable_action_path(self, mock_plugin):
         """测试私有 Action usable 路径。"""
         from src.core.components.base.action import BaseAction

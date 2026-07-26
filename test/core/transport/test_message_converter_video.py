@@ -36,7 +36,6 @@ def _build_private_envelope(segments: list[dict]) -> dict:
     }
 
 
-@pytest.mark.asyncio
 async def test_converter_attaches_video_without_running_summary() -> None:
     """视频只保留占位符和验证后的附件，不在 converter 内生成摘要。"""
     converter = MessageConverter()
@@ -68,7 +67,6 @@ async def test_converter_attaches_video_without_running_summary() -> None:
     assert not hasattr(MessageConverter, "_skip_vlm_media_types_for_stream")
 
 
-@pytest.mark.asyncio
 async def test_converter_keeps_image_and_video_placeholders_and_attachments() -> None:
     """混合媒体按原顺序附加，文本只含稳定占位符。"""
     converter = MessageConverter()

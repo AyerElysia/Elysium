@@ -118,7 +118,6 @@ class TestMediaManagerMimeType:
         )
         assert MediaManager._compute_hash(f"{encoded[:8]}\n{encoded[8:]}") == expected
 
-    @pytest.mark.asyncio
     async def test_recognition_lock_lru_keeps_active_lock(self) -> None:
         """容量清理不得让同一媒体在识别中获得第二把锁。"""
         manager = MediaManager.__new__(MediaManager)
@@ -143,7 +142,6 @@ class TestMediaManagerMimeType:
 class TestMediaManagerRecognizeMedia:
     """测试媒体识别功能。"""
     
-    @pytest.mark.asyncio
     async def test_recognize_media_with_cache(self) -> None:
         """测试使用缓存的媒体识别。"""
         with patch('src.core.managers.media_manager.get_model_set_by_task'):
@@ -161,7 +159,6 @@ class TestMediaManagerRecognizeMedia:
                 
                 assert result == "Cached description"
     
-    @pytest.mark.asyncio
     async def test_recognize_media_without_cache(self) -> None:
         """测试无缓存时进行 VLM 识别。"""
         with patch('src.core.managers.media_manager.get_model_set_by_task') as mock_get_model:
@@ -185,7 +182,6 @@ class TestMediaManagerRecognizeMedia:
                 
                 assert result == "VLM description"
     
-    @pytest.mark.asyncio
     async def test_recognize_media_vlm_not_available(self) -> None:
         """测试 VLM 不可用时的降级处理。"""
         with patch('src.core.managers.media_manager.get_model_set_by_task') as mock_get_model:
@@ -205,7 +201,6 @@ class TestMediaManagerRecognizeMedia:
                 # VLM 不可用时应返回默认描述或 None
                 assert result is None or isinstance(result, str)
 
-    @pytest.mark.asyncio
     async def test_recognize_with_vlm_uses_default_prompt_when_template_missing(self) -> None:
         class AwaitableResponse:
             message = "一张测试图片"
@@ -248,7 +243,6 @@ class TestMediaManagerRecognizeMedia:
 class TestMediaManagerRecognizeBatch:
     """测试批量识别功能。"""
     
-    @pytest.mark.asyncio
     async def test_recognize_batch_empty_list(self) -> None:
         """测试空列表批量识别。"""
         with patch('src.core.managers.media_manager.get_model_set_by_task'):
@@ -258,7 +252,6 @@ class TestMediaManagerRecognizeBatch:
             
             assert results == []
     
-    @pytest.mark.asyncio
     async def test_recognize_batch_multiple_items(self) -> None:
         """测试多个项目批量识别。"""
         with patch('src.core.managers.media_manager.get_model_set_by_task'):
@@ -302,7 +295,6 @@ class TestMediaManagerSaveAndGetMediaInfo:
 
         assert path == "/tmp/image.jpg"
     
-    @pytest.mark.asyncio
     async def test_save_media_info(self) -> None:
         """测试保存媒体信息。"""
         with patch('src.core.managers.media_manager.get_model_set_by_task'):
@@ -322,7 +314,6 @@ class TestMediaManagerSaveAndGetMediaInfo:
                     vlm_processed=True
                 )
     
-    @pytest.mark.asyncio
     async def test_get_media_info_exists(self) -> None:
         """测试获取已存在的媒体信息。"""
         with patch('src.core.managers.media_manager.get_model_set_by_task'):
@@ -356,7 +347,6 @@ class TestMediaManagerSaveAndGetMediaInfo:
                 assert result["image_id"] == "abc123"
                 assert result["type"] == "image"
     
-    @pytest.mark.asyncio
     async def test_get_media_info_not_exists(self) -> None:
         """测试获取不存在的媒体信息。"""
         with patch('src.core.managers.media_manager.get_model_set_by_task'):
@@ -382,7 +372,6 @@ class TestMediaManagerSaveAndGetMediaInfo:
 class TestMediaManagerEdgeCases:
     """测试边界条件。"""
     
-    @pytest.mark.asyncio
     async def test_recognize_empty_base64_data(self) -> None:
         """测试空 base64 数据。"""
         with patch('src.core.managers.media_manager.get_model_set_by_task'):
@@ -396,7 +385,6 @@ class TestMediaManagerEdgeCases:
             # 空数据应该返回 None 或错误
             assert result is None or result == ""
     
-    @pytest.mark.asyncio
     async def test_recognize_invalid_media_type(self) -> None:
         """测试无效的媒体类型。"""
         with patch('src.core.managers.media_manager.get_model_set_by_task'):
@@ -419,7 +407,6 @@ class TestMediaManagerEdgeCases:
 class TestMediaManagerRecognizeVoice:
     """测试语音识别（ASR）功能。"""
 
-    @pytest.mark.asyncio
     async def test_recognize_voice_asr_not_available(self) -> None:
         """测试 ASR 不可用时返回 None。"""
         with patch('src.core.managers.media_manager.get_model_set_by_task') as mock_get_model:
@@ -432,7 +419,6 @@ class TestMediaManagerRecognizeVoice:
 
             assert result is None
 
-    @pytest.mark.asyncio
     async def test_recognize_voice_success(self) -> None:
         """测试 ASR 识别成功返回文字。"""
         # model_set 是 list[dict]，与 get_model_set_by_task 返回格式一致
@@ -455,7 +441,6 @@ class TestMediaManagerRecognizeVoice:
                 assert result == "语音转写：你好，世界"
                 mock_asr.assert_called_once_with(audio_b64)
 
-    @pytest.mark.asyncio
     async def test_recognize_voice_asr_returns_none(self) -> None:
         """测试 ASR 识别返回 None 时行为。"""
         mock_model_set = [{"model_identifier": "sensevoice-small", "api_key": "sk-test"}]
@@ -476,7 +461,6 @@ class TestMediaManagerRecognizeVoice:
 
                 assert result is None
 
-    @pytest.mark.asyncio
     async def test_recognize_voice_exception_returns_none(self) -> None:
         """测试 ASR 识别抛出异常时返回 None。"""
         mock_model_set = [{"model_identifier": "sensevoice-small", "api_key": "sk-test"}]
@@ -497,7 +481,6 @@ class TestMediaManagerRecognizeVoice:
 
                 assert result is None
 
-    @pytest.mark.asyncio
     async def test_recognize_with_asr_calls_client(self) -> None:
         """测试 _recognize_with_asr 正确调用 ASR client。"""
         mock_model_entry = {"model_identifier": "sensevoice-small", "api_key": "sk-test", "base_url": "http://localhost"}
@@ -526,7 +509,6 @@ class TestMediaManagerRecognizeVoice:
                 mock_registry.get_asr_client_for_model.assert_called_once_with(mock_model_entry)
                 mock_client.create_transcription.assert_called_once()
 
-    @pytest.mark.asyncio
     async def test_recognize_with_asr_no_models(self) -> None:
         """测试 model_set 中无模型时返回 None。"""
         mock_model_set = []  # 空列表

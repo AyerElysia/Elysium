@@ -54,7 +54,6 @@ def _event(
     )
 
 
-@pytest.mark.asyncio
 async def test_raw_event_store_appends_and_reads_since(tmp_path: Path) -> None:
     store = RawEventStore(tmp_path)
     first = life_event_from_legacy(_event(1, content="first"))

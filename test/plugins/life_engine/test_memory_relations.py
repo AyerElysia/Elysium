@@ -148,7 +148,6 @@ def _database_snapshot(db: sqlite3.Connection) -> tuple[list[tuple[Any, ...]], l
     [list_dream_candidate_nodes, list_random_file_nodes],
     ids=["candidates", "random"],
 )
-@pytest.mark.asyncio
 async def test_dream_selectors_register_path_udf_and_exclude_noncanonical_rows(
     db: sqlite3.Connection,
     selector: Any,
@@ -162,7 +161,6 @@ async def test_dream_selectors_register_path_udf_and_exclude_noncanonical_rows(
     assert [row["file_path"] for row in rows] == ["notes/valid.md"]
 
 
-@pytest.mark.asyncio
 async def test_dream_walk_registers_path_udf_and_ignores_noncanonical_seed(
     db: sqlite3.Connection,
 ) -> None:
@@ -183,7 +181,6 @@ async def test_dream_walk_registers_path_udf_and_ignores_noncanonical_seed(
     }
 
 
-@pytest.mark.asyncio
 async def test_create_or_update_edge_validates_and_syncs_bidirectional_rows(
     db: sqlite3.Connection,
 ) -> None:
@@ -266,7 +263,6 @@ async def test_create_or_update_edge_validates_and_syncs_bidirectional_rows(
             for row in directional_rows] == [(node_a, node_b, 0)]
 
 
-@pytest.mark.asyncio
 async def test_delete_edge_uses_total_deleted_rows_and_preserves_directional_reverse(
     db: sqlite3.Connection,
 ) -> None:
@@ -303,7 +299,6 @@ async def test_delete_edge_uses_total_deleted_rows_and_preserves_directional_rev
             for row in directional_rows] == [(node_b, node_a)]
 
 
-@pytest.mark.asyncio
 async def test_reinforcement_and_dream_persist_real_bidirectional_associations(
     db: sqlite3.Connection,
 ) -> None:
@@ -366,7 +361,6 @@ async def test_reinforcement_and_dream_persist_real_bidirectional_associations(
     }
 
 
-@pytest.mark.asyncio
 async def test_association_decay_and_pruning_preserve_pair_invariants(
     db: sqlite3.Connection,
 ) -> None:
@@ -418,7 +412,6 @@ async def test_association_decay_and_pruning_preserve_pair_invariants(
     assert _edge_rows(db, EdgeType.ASSOCIATES) == []
 
 
-@pytest.mark.asyncio
 async def test_association_maintenance_keeps_null_timestamp_pairs_and_outer_transactions(
     db: sqlite3.Connection,
 ) -> None:
@@ -483,7 +476,6 @@ class _BoundRelationCallbacks:
         return await get_node_by_id(self.db, node_id)
 
 
-@pytest.mark.asyncio
 async def test_file_relations_uses_bound_or_module_callbacks_with_bfs_depths(
     db: sqlite3.Connection,
 ) -> None:
@@ -537,7 +529,6 @@ async def test_file_relations_uses_bound_or_module_callbacks_with_bfs_depths(
     assert zero_depth["incoming"] == []
 
 
-@pytest.mark.asyncio
 async def test_file_relations_skips_noncanonical_neighbor_without_migration(
     db: sqlite3.Connection,
 ) -> None:
@@ -581,7 +572,6 @@ async def test_file_relations_skips_noncanonical_neighbor_without_migration(
     assert result["incoming"] == []
 
 
-@pytest.mark.asyncio
 async def test_spread_activation_uses_single_hop_decay_and_strongest_acyclic_path(
     db: sqlite3.Connection,
 ) -> None:
@@ -624,7 +614,6 @@ async def test_spread_activation_uses_single_hop_decay_and_strongest_acyclic_pat
     assert all(len(path) == len(set(path)) for _, path, _ in result_by_id.values())
 
 
-@pytest.mark.asyncio
 async def test_apply_decay_rollback_does_not_clobber_concurrent_upsert(
     db: sqlite3.Connection,
     monkeypatch: pytest.MonkeyPatch,

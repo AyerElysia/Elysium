@@ -147,7 +147,6 @@ class TestVectorDBBase:
         }
         assert abstract_methods == expected_methods
 
-    @pytest.mark.asyncio
     async def test_mock_implementation(self) -> None:
         """测试 Mock 实现是否可以正常工作"""
         mock_db = MockVectorDB()
@@ -208,7 +207,6 @@ class TestChromaDBImpl:
             db2 = ChromaDBImpl(path=tmpdir)
             assert db1 is not db2
 
-    @pytest.mark.asyncio
     async def test_initialize(self, temp_db_path: str) -> None:
         """测试初始化"""
         db = ChromaDBImpl(path=temp_db_path)
@@ -220,7 +218,6 @@ class TestChromaDBImpl:
 
         await db.close()
 
-    @pytest.mark.asyncio
     async def test_get_or_create_collection(
         self, chroma_db: ChromaDBImpl
     ) -> None:
@@ -232,7 +229,6 @@ class TestChromaDBImpl:
         collection2 = await chroma_db.get_or_create_collection("test_collection")
         assert collection1 is collection2
 
-    @pytest.mark.asyncio
     async def test_add_and_query(
         self, chroma_db: ChromaDBImpl
     ) -> None:
@@ -260,7 +256,6 @@ class TestChromaDBImpl:
         assert "metadatas" in results
         assert "documents" in results
 
-    @pytest.mark.asyncio
     async def test_query_with_where(
         self, chroma_db: ChromaDBImpl
     ) -> None:
@@ -286,7 +281,6 @@ class TestChromaDBImpl:
 
         assert "ids" in results
 
-    @pytest.mark.asyncio
     async def test_count(self, chroma_db: ChromaDBImpl) -> None:
         """测试计数功能"""
         collection_name = "test_collection"
@@ -305,7 +299,6 @@ class TestChromaDBImpl:
         count = await chroma_db.count(collection_name)
         assert count == 2
 
-    @pytest.mark.asyncio
     async def test_get(self, chroma_db: ChromaDBImpl) -> None:
         """测试获取数据"""
         collection_name = "test_collection"
@@ -328,7 +321,6 @@ class TestChromaDBImpl:
         assert "ids" in result
         assert "documents" in result
 
-    @pytest.mark.asyncio
     async def test_delete(self, chroma_db: ChromaDBImpl) -> None:
         """测试删除数据"""
         collection_name = "test_collection"
@@ -349,7 +341,6 @@ class TestChromaDBImpl:
         count_after = await chroma_db.count(collection_name)
         assert count_after == 1
 
-    @pytest.mark.asyncio
     async def test_delete_collection(self, chroma_db: ChromaDBImpl) -> None:
         """测试删除集合"""
         collection_name = "test_collection"
@@ -368,7 +359,6 @@ class TestChromaDBImpl:
         count = await chroma_db.count(collection_name)
         assert count == 0
 
-    @pytest.mark.asyncio
     async def test_close(self, chroma_db: ChromaDBImpl) -> None:
         """测试关闭连接"""
         assert chroma_db._initialized
@@ -447,7 +437,6 @@ class TestChromaDBImplEdgeCases:
         yield db
         await db.close()
 
-    @pytest.mark.asyncio
     async def test_query_with_invalid_where_fallback(
         self, chroma_db: ChromaDBImpl
     ) -> None:
@@ -473,7 +462,6 @@ class TestChromaDBImplEdgeCases:
         # 即使回退，也应该返回结果（可能为空或包含所有结果）
         assert isinstance(results, dict)
 
-    @pytest.mark.asyncio
     async def test_get_with_invalid_where_fallback(
         self, chroma_db: ChromaDBImpl
     ) -> None:
@@ -497,7 +485,6 @@ class TestChromaDBImplEdgeCases:
 
         assert isinstance(result, dict)
 
-    @pytest.mark.asyncio
     async def test_process_where_condition_exception(
         self, chroma_db: ChromaDBImpl
     ) -> None:
@@ -515,7 +502,6 @@ class TestChromaDBImplEdgeCases:
         result = chroma_db._process_where_condition({"key": ["val1", "val2", "val3"]})
         assert result == {"key": {"$in": ["val1", "val2", "val3"]}}
 
-    @pytest.mark.asyncio
     async def test_add_to_nonexistent_collection(
         self, chroma_db: ChromaDBImpl
     ) -> None:
@@ -531,7 +517,6 @@ class TestChromaDBImplEdgeCases:
         count = await chroma_db.count("new_collection")
         assert count == 1
 
-    @pytest.mark.asyncio
     async def test_query_nonexistent_collection(
         self, chroma_db: ChromaDBImpl
     ) -> None:
@@ -546,7 +531,6 @@ class TestChromaDBImplEdgeCases:
         assert "ids" in results
         assert "distances" in results
 
-    @pytest.mark.asyncio
     async def test_get_nonexistent_collection(
         self, chroma_db: ChromaDBImpl
     ) -> None:
@@ -560,7 +544,6 @@ class TestChromaDBImplEdgeCases:
         assert isinstance(result, dict)
         assert "ids" in result
 
-    @pytest.mark.asyncio
     async def test_delete_from_nonexistent_collection(
         self, chroma_db: ChromaDBImpl
     ) -> None:
@@ -571,7 +554,6 @@ class TestChromaDBImplEdgeCases:
             ids=["id1"],
         )
 
-    @pytest.mark.asyncio
     async def test_count_nonexistent_collection(
         self, chroma_db: ChromaDBImpl
     ) -> None:
@@ -579,7 +561,6 @@ class TestChromaDBImplEdgeCases:
         count = await chroma_db.count("nonexistent_collection")
         assert count == 0
 
-    @pytest.mark.asyncio
     async def test_delete_nonexistent_collection(
         self, chroma_db: ChromaDBImpl
     ) -> None:
@@ -587,7 +568,6 @@ class TestChromaDBImplEdgeCases:
         # 应该不抛出异常
         await chroma_db.delete_collection("nonexistent_collection")
 
-    @pytest.mark.asyncio
     async def test_multiple_initializations(
         self, chroma_db: ChromaDBImpl
     ) -> None:
@@ -600,7 +580,6 @@ class TestChromaDBImplEdgeCases:
 
         assert chroma_db._initialized
 
-    @pytest.mark.asyncio
     async def test_collection_caching(self, chroma_db: ChromaDBImpl) -> None:
         """测试集合缓存机制"""
         # 创建集合
@@ -612,7 +591,6 @@ class TestChromaDBImplEdgeCases:
         assert collection1 is collection2
         assert "cached_collection" in chroma_db._collections
 
-    @pytest.mark.asyncio
     async def test_close_clears_collections(
         self, chroma_db: ChromaDBImpl
     ) -> None:
@@ -644,7 +622,6 @@ class TestChromaDBImplEdgeCases:
         result = chroma_db._process_where_condition({"key": ["single"]})
         assert result == {"key": "single"}
 
-    @pytest.mark.asyncio
     async def test_process_where_condition_multiple_fields_with_lists(
         self, chroma_db: ChromaDBImpl
     ) -> None:

@@ -32,7 +32,6 @@ class PlainTool(BaseTool):
         return True, query
 
 
-@pytest.mark.asyncio
 async def test_execute_tool_keeps_declared_reason(monkeypatch: pytest.MonkeyPatch) -> None:
     """当工具 execute 声明 reason 时，ToolUse 不应剥离该参数。"""
 
@@ -60,7 +59,6 @@ async def test_execute_tool_keeps_declared_reason(monkeypatch: pytest.MonkeyPatc
     assert result == "weather:context needed"
 
 
-@pytest.mark.asyncio
 async def test_execute_tool_strips_auto_reason_for_plain_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

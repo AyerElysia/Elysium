@@ -123,7 +123,6 @@ def test_dream_system_lineage_keeps_old_memory_and_resolves_current_file(
     asyncio.run(_run())
 
 
-@pytest.mark.asyncio
 async def test_explicit_lineage_prefers_deep_existing_target_over_source_and_dead_branch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -181,7 +180,6 @@ async def test_explicit_lineage_prefers_deep_existing_target_over_source_and_dea
     assert [step["to"] for step in resolution["lineage"]] == [middle_path, current_path]
 
 
-@pytest.mark.asyncio
 async def test_fetch_does_not_persist_guessed_lineage(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -230,7 +228,6 @@ async def test_fetch_does_not_persist_guessed_lineage(
     ) == before
 
 
-@pytest.mark.asyncio
 async def test_lineage_rejects_missing_unindexed_path_but_keeps_history(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

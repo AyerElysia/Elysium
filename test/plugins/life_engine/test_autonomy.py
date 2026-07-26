@@ -50,7 +50,6 @@ def test_build_intent_uses_delay_minutes_and_rejects_out_of_range() -> None:
         )
 
 
-@pytest.mark.asyncio
 async def test_repeating_intent_uses_recurring_scheduler(monkeypatch) -> None:
     intent = build_intent(
         kind="reflect",
@@ -80,7 +79,6 @@ async def test_repeating_intent_uses_recurring_scheduler(monkeypatch) -> None:
     assert captured["trigger_config"]["interval_seconds"] == 3600.0
 
 
-@pytest.mark.asyncio
 async def test_schedule_autonomy_intent_persists_and_records_event(tmp_path: Path, monkeypatch) -> None:
     service = _make_service(tmp_path)
 
@@ -113,7 +111,6 @@ async def test_schedule_autonomy_intent_persists_and_records_event(tmp_path: Pat
     assert service._pending_events[0].content_type == "autonomy_intent_scheduled"
 
 
-@pytest.mark.asyncio
 async def test_repeating_autonomy_intent_stays_scheduled_after_trigger(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -151,7 +148,6 @@ async def test_repeating_autonomy_intent_stays_scheduled_after_trigger(
     assert "周期性自主意向浮现" in service._pending_events[0].content
 
 
-@pytest.mark.asyncio
 async def test_autonomy_tool_calls_service(tmp_path: Path, monkeypatch) -> None:
     service = _make_service(tmp_path)
 
@@ -174,7 +170,6 @@ async def test_autonomy_tool_calls_service(tmp_path: Path, monkeypatch) -> None:
     assert result["delay_minutes"] == 2
 
 
-@pytest.mark.asyncio
 async def test_trigger_speak_without_target_downgrades_to_life_event(tmp_path: Path, monkeypatch) -> None:
     service = _make_service(tmp_path)
 

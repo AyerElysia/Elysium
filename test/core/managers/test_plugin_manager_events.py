@@ -55,7 +55,6 @@ def mock_event_bus():
     return mock_bus
 
 
-@pytest.mark.asyncio
 async def test_on_component_loaded_event_triggered(plugin_manager, mock_event_bus):
     """测试组件加载时触发 ON_COMPONENT_LOADED 事件。"""
     # 清理注册表和状态管理器
@@ -80,7 +79,6 @@ async def test_on_component_loaded_event_triggered(plugin_manager, mock_event_bu
     )
 
 
-@pytest.mark.asyncio
 async def test_on_component_unloaded_event_triggered(plugin_manager, mock_event_bus):
     """测试组件卸载时触发 ON_COMPONENT_UNLOADED 事件。"""
     # 清理并注册组件
@@ -104,7 +102,6 @@ async def test_on_component_unloaded_event_triggered(plugin_manager, mock_event_
     )
 
 
-@pytest.mark.asyncio
 async def test_on_plugin_unloaded_event_triggered(plugin_manager, mock_event_bus, monkeypatch):
     """测试插件卸载时触发 ON_PLUGIN_UNLOADED 事件。"""
     # 清理注册表和状态管理器
@@ -160,7 +157,6 @@ async def test_on_plugin_unloaded_event_triggered(plugin_manager, mock_event_bus
     )
 
 
-@pytest.mark.asyncio
 async def test_component_loaded_event_failure_does_not_block_registration(
     plugin_manager, mock_event_bus
 ):
@@ -184,7 +180,6 @@ async def test_component_loaded_event_failure_does_not_block_registration(
     assert component is not None
 
 
-@pytest.mark.asyncio
 async def test_plugin_unloaded_event_failure_does_not_block_unloading(
     plugin_manager, mock_event_bus
 ):
@@ -238,7 +233,6 @@ async def test_plugin_unloaded_event_failure_does_not_block_unloading(
     assert "test_event_plugin" not in plugin_manager._loaded_plugins
 
 
-@pytest.mark.asyncio
 async def test_events_triggered_in_correct_order(plugin_manager, monkeypatch):
     """测试事件按正确的顺序触发。"""
     # 清理注册表和状态管理器

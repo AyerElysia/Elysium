@@ -61,7 +61,6 @@ def _get_media_segments(envelope: dict) -> list[dict]:
     ]
 
 
-@pytest.mark.asyncio
 async def test_message_to_envelope_preserves_text_and_media_from_dict() -> None:
     """纯 legacy 出站仍保留文本、content.media 与 extra.media。"""
     converter = MessageConverter()
@@ -100,7 +99,6 @@ async def test_message_to_envelope_preserves_text_and_media_from_dict() -> None:
     assert segments[3]["data"] == "R0hJ"
 
 
-@pytest.mark.asyncio
 async def test_message_to_envelope_strips_base64_prefix_for_media() -> None:
     """既有非 file 媒体前缀剥离行为保持不变。"""
     converter = MessageConverter()
@@ -122,7 +120,6 @@ async def test_message_to_envelope_strips_base64_prefix_for_media() -> None:
     assert _get_segments(envelope)[0]["data"] == "iVBORw0KGgoAAA"
 
 
-@pytest.mark.asyncio
 async def test_envelope_to_message_builds_nested_canonical_attachments() -> None:
     """嵌套媒体只保留占位文本，并统一构造带 source message ID 的附件。"""
     converter = MessageConverter()
@@ -169,7 +166,6 @@ async def test_envelope_to_message_builds_nested_canonical_attachments() -> None
     assert "media_errors" not in message.extra
 
 
-@pytest.mark.asyncio
 async def test_envelope_to_message_prefixes_extra_keys_that_collide_with_message_fields() -> None:
     """适配器 extra 不能覆盖显式 Message 字段或 converter 兼容字段。"""
     converter = MessageConverter()
@@ -205,7 +201,6 @@ async def test_envelope_to_message_prefixes_extra_keys_that_collide_with_message
     assert message.extra["custom_field"] == "custom-value"
 
 
-@pytest.mark.asyncio
 async def test_invalid_media_is_retained_with_body_safe_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -242,7 +237,6 @@ async def test_invalid_media_is_retained_with_body_safe_error(
 
 
 @pytest.mark.parametrize("encode_as_json", [False, True])
-@pytest.mark.asyncio
 async def test_file_handler_preserves_source_fields_without_mutating_input(
     encode_as_json: bool,
 ) -> None:
@@ -287,7 +281,6 @@ async def test_file_handler_preserves_source_fields_without_mutating_input(
     assert message.attachments[0].media_ref.data == _FILE_BYTES
 
 
-@pytest.mark.asyncio
 async def test_canonical_only_attachments_are_sent_including_file_base64() -> None:
     """没有 legacy 字段时，物化 canonical 附件也能直接发送。"""
     converter = MessageConverter()
@@ -320,7 +313,6 @@ async def test_canonical_only_attachments_are_sent_including_file_base64() -> No
     assert media_segments[1]["data"] == _legacy_base64(_FILE_BYTES)
 
 
-@pytest.mark.asyncio
 async def test_descriptor_only_attachment_does_not_leak_and_legacy_falls_back() -> None:
     """descriptor-only 附件不发送数据，但相同 legacy fallback 仍可发送。"""
     converter = MessageConverter()
@@ -351,7 +343,6 @@ async def test_descriptor_only_attachment_does_not_leak_and_legacy_falls_back() 
     assert detached.media_ref.sha256 not in json.dumps(envelope)
 
 
-@pytest.mark.asyncio
 async def test_inbound_legacy_dual_write_is_deduplicated_on_outbound() -> None:
     """canonical、content.media 与 extra.media 的同一入站媒体只发送一次。"""
     converter = MessageConverter()
@@ -374,7 +365,6 @@ async def test_inbound_legacy_dual_write_is_deduplicated_on_outbound() -> None:
 
 
 @pytest.mark.parametrize("segment_type", ["image", "file"])
-@pytest.mark.asyncio
 async def test_path_only_adapter_media_is_rejected_without_file_access(
     segment_type: str,
     monkeypatch: pytest.MonkeyPatch,

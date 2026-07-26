@@ -12,7 +12,6 @@ from src.core.models.message import Message
 from src.core.models.stream import ChatStream
 
 
-@pytest.mark.asyncio
 async def test_get_or_create_stream_concurrent_calls_create_once(monkeypatch) -> None:
     """同一 stream_id 并发获取时应只创建一次流实例。"""
     from src.core.managers.stream_manager import StreamManager
@@ -36,7 +35,6 @@ async def test_get_or_create_stream_concurrent_calls_create_once(monkeypatch) ->
     assert manager._create_new_stream.await_args.kwargs["stream_id"] == stream_id
 
 
-@pytest.mark.asyncio
 async def test_get_or_create_stream_returns_cached_instance_without_db(monkeypatch) -> None:
     """缓存中已有流时应直接返回，不触发查库/建流。"""
     from src.core.managers.stream_manager import StreamManager
@@ -56,7 +54,6 @@ async def test_get_or_create_stream_returns_cached_instance_without_db(monkeypat
     assert manager._create_new_stream.await_count == 0
 
 
-@pytest.mark.asyncio
 async def test_create_new_stream_includes_bot_info(monkeypatch) -> None:
     """创建新流时应从适配器获取 bot 信息并保存到 ChatStream。"""
     from src.core.managers.stream_manager import StreamManager
@@ -94,7 +91,6 @@ async def test_create_new_stream_includes_bot_info(monkeypatch) -> None:
     adapter_manager.get_bot_info_by_platform.assert_awaited_once_with("qq")
 
 
-@pytest.mark.asyncio
 async def test_add_message_persists_sender_person_id() -> None:
     """写入消息时应从 sender 信息推导 person_id，避免历史消息丢失用户身份。"""
     from src.core.managers.stream_manager import StreamManager
@@ -136,7 +132,6 @@ async def test_add_message_persists_sender_person_id() -> None:
     assert created_data["person_id"] == "hash_qq_user_123"
 
 
-@pytest.mark.asyncio
 async def test_db_message_to_runtime_fallback_to_content_when_plain_text_missing(monkeypatch) -> None:
     """数据库消息未保存 processed_plain_text 时，应回退 content，避免显示 None。"""
     from src.core.managers.stream_manager import StreamManager
@@ -181,7 +176,6 @@ async def test_db_message_to_runtime_fallback_to_content_when_plain_text_missing
     assert runtime_msg.processed_plain_text == "bot reply"
 
 
-@pytest.mark.asyncio
 async def test_db_message_to_runtime_uses_bot_name_for_bot_message(monkeypatch) -> None:
     """数据库重建历史时，Bot 自身消息应优先显示 bot_name。"""
     from src.core.managers.stream_manager import StreamManager
@@ -231,7 +225,6 @@ async def test_db_message_to_runtime_uses_bot_name_for_bot_message(monkeypatch) 
     assert runtime_msg.sender_cardname == "MoFox"
 
 
-@pytest.mark.asyncio
 async def test_get_stream_info_normalizes_raw_person_id(monkeypatch) -> None:
     """读取流信息时，原始 person_id 应自动规范化为哈希格式。"""
     from src.core.managers.stream_manager import StreamManager
@@ -278,7 +271,6 @@ async def test_get_stream_info_normalizes_raw_person_id(monkeypatch) -> None:
     manager._streams_crud.update.assert_awaited_once_with(1, {"person_id": "hash_qq_12345"})
 
 
-@pytest.mark.asyncio
 async def test_add_message_normalizes_direct_raw_person_id(monkeypatch) -> None:
     """消息携带原始 person_id 时，入库应写入哈希格式。"""
     from src.core.managers.stream_manager import StreamManager
@@ -319,7 +311,6 @@ async def test_add_message_normalizes_direct_raw_person_id(monkeypatch) -> None:
     assert created_data["person_id"] == "hash_qq_user_123"
 
 
-@pytest.mark.asyncio
 async def test_clear_stream_context_resets_cached_runtime_context() -> None:
     """清空上下文应同步重置内存中的运行态。"""
     from src.core.managers.stream_manager import StreamManager
@@ -356,7 +347,6 @@ async def test_clear_stream_context_resets_cached_runtime_context() -> None:
     manager._streams_crud.update.assert_awaited_once_with(9, {"context_cleared_at": 123.0})
 
 
-@pytest.mark.asyncio
 async def test_load_stream_context_respects_context_cleared_at(monkeypatch) -> None:
     """加载上下文时应过滤清空时间点之前的消息。"""
     from src.core.managers.stream_manager import StreamManager
@@ -406,7 +396,6 @@ async def test_load_stream_context_respects_context_cleared_at(monkeypatch) -> N
     assert fake_query.limit_value == 20
 
 
-@pytest.mark.asyncio
 async def test_bulk_clear_streams_clears_matching_cached_streams(monkeypatch) -> None:
     """批量清空应只影响匹配类型的内存流，并持久化到数据库。"""
     from src.core.managers.stream_manager import StreamManager

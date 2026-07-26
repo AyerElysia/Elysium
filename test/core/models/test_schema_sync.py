@@ -51,7 +51,6 @@ class TypeMismatchTarget(TestBase):
     score: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
-@pytest.mark.asyncio
 async def test_schema_sync_adds_missing_and_removes_undefined_columns() -> None:
     """应删除未定义字段并补齐缺失字段。"""
     engine = await get_engine()
@@ -89,7 +88,6 @@ async def test_schema_sync_adds_missing_and_removes_undefined_columns() -> None:
             await conn.execute(text("DROP TABLE IF EXISTS schema_sync_target"))
 
 
-@pytest.mark.asyncio
 async def test_schema_sync_raises_on_sqlite_type_mismatch() -> None:
     """SQLite 遇到类型漂移时应硬失败，避免带病启动。"""
     engine = await get_engine()

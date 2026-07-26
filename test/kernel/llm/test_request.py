@@ -232,7 +232,6 @@ class TestLLMRequest:
         )
         assert len(request.payloads) == 3
 
-    @pytest.mark.asyncio
     async def test_send_records_provider_cache_usage_metrics(
         self,
         mock_model_set: list[dict[str, Any]],
@@ -503,7 +502,6 @@ class TestExtractTools:
 class TestLLMRequestSend:
     """Test cases for LLMRequest.send method."""
 
-    @pytest.mark.asyncio
     async def test_send_success_non_streaming(
         self, mock_model_set: list[dict[str, Any]]
     ) -> None:
@@ -518,7 +516,6 @@ class TestLLMRequestSend:
         response = await request.send(stream=False)
         assert response.message == "Success response!"
 
-    @pytest.mark.asyncio
     async def test_send_rejects_media_before_client_call_when_all_models_are_text_only(
         self,
         mock_model_set: list[dict[str, Any]],
@@ -541,7 +538,6 @@ class TestLLMRequestSend:
 
         assert mock_client.call_count == 0
 
-    @pytest.mark.asyncio
     async def test_send_applies_token_budget_trimming(
         self, mock_model_set: list[dict[str, Any]], monkeypatch
     ) -> None:
@@ -579,7 +575,6 @@ class TestLLMRequestSend:
         assert len(capture_client.last_payloads) < 12
         assert len(response.payloads) == 12
 
-    @pytest.mark.asyncio
     async def test_send_applies_context_compression_trigger_tokens(
         self, mock_model_set: list[dict[str, Any]], monkeypatch
     ) -> None:
@@ -614,7 +609,6 @@ class TestLLMRequestSend:
 
         assert len(capture_client.last_payloads) <= 4
 
-    @pytest.mark.asyncio
     async def test_send_success_streaming(
         self, mock_model_set: list[dict[str, Any]]
     ) -> None:
@@ -634,7 +628,6 @@ class TestLLMRequestSend:
 
         assert " ".join(chunks) == "Hello  world !"
 
-    @pytest.mark.asyncio
     async def test_send_with_tool_calls(
         self, mock_model_set: list[dict[str, Any]]
     ) -> None:
@@ -664,7 +657,6 @@ class TestLLMRequestSend:
         assert response.call_list[0].name == "get_weather"
         assert response.call_list[1].name == "get_time"
 
-    @pytest.mark.asyncio
     async def test_send_with_retry_on_error(
         self, mock_model_set: list[dict[str, Any]]
     ) -> None:
@@ -711,7 +703,6 @@ class TestLLMRequestSend:
 
         asyncio.run(_run())
 
-    @pytest.mark.asyncio
     async def test_send_model_switch_after_retries(
         self, mock_model_set: list[dict[str, Any]]
     ) -> None:
@@ -735,7 +726,6 @@ class TestLLMRequestSend:
         assert response.message == "Fallback success!"
         assert mock_client.call_count == 4
 
-    @pytest.mark.asyncio
     async def test_send_all_models_exhausted(
         self, mock_model_set: list[dict[str, Any]]
     ) -> None:
@@ -769,7 +759,6 @@ class TestLLMRequestSend:
         with pytest.raises(LLMTimeoutError):
             await request.send(stream=False)
 
-    @pytest.mark.asyncio
     async def test_send_with_delay_between_retries(
         self, mock_model_set: list[dict[str, Any]]
     ) -> None:
@@ -791,7 +780,6 @@ class TestLLMRequestSend:
         # Should have at least retry_interval delay (1.0 second)
         assert elapsed >= 0.9  # Allow small tolerance
 
-    @pytest.mark.asyncio
     async def test_send_metrics_collection(
         self, mock_model_set: list[dict[str, Any]]
     ) -> None:
@@ -817,7 +805,6 @@ class TestLLMRequestSend:
         assert history[0].request_name == "test_request"
         assert history[0].success is True
 
-    @pytest.mark.asyncio
     async def test_send_with_metrics_disabled(
         self, mock_model_set: list[dict[str, Any]]
     ) -> None:
@@ -839,7 +826,6 @@ class TestLLMRequestSend:
         history = collector.get_recent_history(limit=10)
         assert len(history) == 0
 
-    @pytest.mark.asyncio
     async def test_send_invalid_model_identifier(
         self, mock_model_set: list[dict[str, Any]]
     ) -> None:
@@ -869,7 +855,6 @@ class TestLLMRequestSend:
         with pytest.raises(LLMConfigurationError, match="model.model_identifier 必须是非空字符串"):
             await request.send(stream=False)
 
-    @pytest.mark.asyncio
     async def test_send_exception_classification(
         self, mock_model_set: list[dict[str, Any]]
     ) -> None:
@@ -902,7 +887,6 @@ class TestLLMRequestErrorLogging:
         """Return a single-model set with max_retry=0 for immediate failure."""
         return [{**mock_model_set[0], "max_retry": 0}]
 
-    @pytest.mark.asyncio
     async def test_5xx_api_error_logs_warning_not_error(
         self, mock_model_set: list[dict[str, Any]]
     ) -> None:
@@ -930,7 +914,6 @@ class TestLLMRequestErrorLogging:
         error_msgs = " ".join(str(c) for c in mock_logger.error.call_args_list)
         assert "请求失败" not in error_msgs or "重试已耗尽" in error_msgs
 
-    @pytest.mark.asyncio
     async def test_503_api_error_logs_warning_not_error(
         self, mock_model_set: list[dict[str, Any]]
     ) -> None:
@@ -956,7 +939,6 @@ class TestLLMRequestErrorLogging:
         error_msgs = " ".join(str(c) for c in mock_logger.error.call_args_list)
         assert "请求失败" not in error_msgs or "重试已耗尽" in error_msgs
 
-    @pytest.mark.asyncio
     async def test_4xx_api_error_logs_error(
         self, mock_model_set: list[dict[str, Any]]
     ) -> None:
@@ -978,7 +960,6 @@ class TestLLMRequestErrorLogging:
 
         mock_logger.error.assert_called()
 
-    @pytest.mark.asyncio
     async def test_api_error_without_status_code_logs_error(
         self, mock_model_set: list[dict[str, Any]]
     ) -> None:

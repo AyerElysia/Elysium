@@ -32,7 +32,6 @@ def _make_bot_for_runtime_mcp() -> Bot:
     return bot
 
 
-@pytest.mark.asyncio
 async def test_initialize_core_initializes_mcp_manager() -> None:
     """_initialize_core() 应初始化 MCP manager。"""
     bot = _make_bot_for_runtime_mcp()
@@ -56,7 +55,6 @@ async def test_initialize_core_initializes_mcp_manager() -> None:
     fake_mcp_manager.initialize.assert_awaited_once()
 
 
-@pytest.mark.asyncio
 async def test_shutdown_cleans_up_mcp_manager() -> None:
     """shutdown() 应关闭 MCP 客户端连接。"""
     bot = _make_bot_for_runtime_mcp()

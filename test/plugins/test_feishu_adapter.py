@@ -37,7 +37,6 @@ def test_feishu_config_defaults_to_long_connection() -> None:
     assert config.connection.auto_start_long_connection is True
 
 
-@pytest.mark.asyncio
 async def test_feishu_text_event_to_envelope() -> None:
     adapter = make_adapter()
     payload = {
@@ -72,7 +71,6 @@ async def test_feishu_text_event_to_envelope() -> None:
     assert envelope["message_segment"][-1] == {"type": "text", "data": "爱莉爱莉"}
 
 
-@pytest.mark.asyncio
 async def test_feishu_handle_event_sends_to_core_sink() -> None:
     adapter = make_adapter()
     payload = {
@@ -96,7 +94,6 @@ async def test_feishu_handle_event_sends_to_core_sink() -> None:
     assert adapter.core_sink.messages[0]["message_info"]["user_info"]["user_id"] == "ou_2"
 
 
-@pytest.mark.asyncio
 async def test_feishu_envelope_converts_to_core_message() -> None:
     adapter = make_adapter()
     payload = {
@@ -131,7 +128,6 @@ async def test_feishu_envelope_converts_to_core_message() -> None:
     assert "message_type" not in message.extra
 
 
-@pytest.mark.asyncio
 async def test_feishu_image_event_downloads_to_image_segment(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter = make_adapter()
     downloaded: dict[str, str] = {}
@@ -179,7 +175,6 @@ async def test_feishu_image_event_downloads_to_image_segment(monkeypatch: pytest
     }
 
 
-@pytest.mark.asyncio
 async def test_feishu_image_event_falls_back_to_text_when_download_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -211,7 +206,6 @@ async def test_feishu_image_event_falls_back_to_text_when_download_fails(
     assert envelope["message_segment"] == [{"type": "text", "data": "[图片]"}]
 
 
-@pytest.mark.asyncio
 async def test_feishu_user_name_alias_maps_sender_display_name() -> None:
     config = FeishuAdapterConfig()
     config.identity.user_name_aliases = [
@@ -252,7 +246,6 @@ async def test_feishu_user_name_alias_maps_sender_display_name() -> None:
     assert extra["feishu_union_id"] == "on_ayer"
 
 
-@pytest.mark.asyncio
 async def test_feishu_deduplicates_by_message_id() -> None:
     adapter = make_adapter()
 
@@ -280,7 +273,6 @@ async def test_feishu_deduplicates_by_message_id() -> None:
     assert len(adapter.core_sink.messages) == 1
 
 
-@pytest.mark.asyncio
 async def test_feishu_outgoing_group_text(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter = make_adapter()
     calls = []
@@ -307,7 +299,6 @@ async def test_feishu_outgoing_group_text(monkeypatch: pytest.MonkeyPatch) -> No
     assert calls[0][1]["receive_id"] == "oc_1"
 
 
-@pytest.mark.asyncio
 async def test_feishu_outgoing_reply_text(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter = make_adapter()
     calls = []
@@ -335,7 +326,6 @@ async def test_feishu_outgoing_reply_text(monkeypatch: pytest.MonkeyPatch) -> No
     assert calls[0][0] == "/open-apis/im/v1/messages/om_1/reply"
 
 
-@pytest.mark.asyncio
 async def test_feishu_outgoing_voice_sends_audio_message(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter = make_adapter()
     calls = []

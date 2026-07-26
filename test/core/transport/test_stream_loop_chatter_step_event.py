@@ -18,7 +18,6 @@ async def _two_ticks(*_args, **_kwargs):
     yield SimpleNamespace(stream_id="stream-001", tick_count=2)
 
 
-@pytest.mark.asyncio
 async def test_on_chatter_step_continue_false_skips_current_tick_then_recovers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -122,7 +121,6 @@ async def test_on_chatter_step_continue_false_skips_current_tick_then_recovers(
     assert manager._stats["total_failures"] == 0
 
 
-@pytest.mark.asyncio
 async def test_run_chat_stream_times_out_stuck_chatter_step(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -212,7 +210,6 @@ async def test_run_chat_stream_times_out_stuck_chatter_step(
     assert context.is_chatter_processing is False
 
 
-@pytest.mark.asyncio
 async def test_run_chat_stream_sends_timer_resume_event_to_waiting_generator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -297,7 +294,6 @@ async def test_run_chat_stream_sends_timer_resume_event_to_waiting_generator(
     assert manager._stats["total_process_cycles"] == 1
 
 
-@pytest.mark.asyncio
 async def test_run_chat_stream_keeps_timer_resume_event_across_message_buffer_skip(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -385,7 +381,6 @@ async def test_run_chat_stream_keeps_timer_resume_event_across_message_buffer_sk
     assert manager._stats["total_process_cycles"] == 1
 
 
-@pytest.mark.asyncio
 async def test_run_chat_stream_primes_new_generator_before_resume_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

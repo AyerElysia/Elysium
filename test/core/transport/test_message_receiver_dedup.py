@@ -8,7 +8,6 @@ from src.core.models.message import Message
 from src.core.transport.message_receive.receiver import MessageReceiver
 
 
-@pytest.mark.asyncio
 async def test_receive_envelope_dedups_same_message_in_window() -> None:
     """同一条入站消息在去重窗口内只应分发一次。"""
     message = Message(
@@ -50,7 +49,6 @@ async def test_receive_envelope_dedups_same_message_in_window() -> None:
     assert event_manager.publish_event.await_count == 1
 
 
-@pytest.mark.asyncio
 async def test_receive_envelope_different_message_ids_not_deduped() -> None:
     """不同 message_id 的入站消息应正常分别分发。"""
     message1 = Message(

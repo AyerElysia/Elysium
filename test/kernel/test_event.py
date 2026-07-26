@@ -81,7 +81,6 @@ class TestEventBusBasics:
 
 
 class TestEventBusPublish:
-    @pytest.mark.asyncio
     async def test_publish_no_subscribers_returns_success_and_copies_params(self) -> None:
         bus = EventBus()
         params = {"x": 1}
@@ -90,7 +89,6 @@ class TestEventBusPublish:
         assert out == {"x": 1}
         assert out is not params
 
-    @pytest.mark.asyncio
     async def test_publish_valid_chain_success_pass_stop(self) -> None:
         bus = EventBus()
         calls: list[str] = []
@@ -128,7 +126,6 @@ class TestEventBusPublish:
         assert out["ignored"] is False  # PASS 不更新链式 params
         assert out["stop"] is True
 
-    @pytest.mark.asyncio
     async def test_publish_invalid_return_is_discarded_and_does_not_mutate_chain(self) -> None:
         bus = EventBus()
 
@@ -147,7 +144,6 @@ class TestEventBusPublish:
         assert decision == EventDecision.SUCCESS
         assert out == {"v": 1}
 
-    @pytest.mark.asyncio
     async def test_publish_invalid_next_params_keys_discarded(self) -> None:
         bus = EventBus()
 
@@ -165,7 +161,6 @@ class TestEventBusPublish:
         assert decision == EventDecision.SUCCESS
         assert out == {"x": 2}
 
-    @pytest.mark.asyncio
     async def test_publish_handler_exception_is_ignored(self) -> None:
         bus = EventBus()
 
@@ -183,7 +178,6 @@ class TestEventBusPublish:
         assert decision == EventDecision.SUCCESS
         assert out == {"x": 2}
 
-    @pytest.mark.asyncio
     async def test_publish_handler_timeout_is_ignored(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -207,7 +201,6 @@ class TestEventBusPublish:
         assert decision == EventDecision.SUCCESS
         assert out == {"x": 2}
 
-    @pytest.mark.asyncio
     async def test_publish_input_validation(self) -> None:
         bus = EventBus()
 
@@ -220,7 +213,6 @@ class TestEventBusPublish:
         with pytest.raises(ValueError, match="key 必须全部为 str"):
             await bus.publish("e", {1: "x"})  # type: ignore[dict-item]
 
-    @pytest.mark.asyncio
     async def test_publish_accepts_event_type_str_enum(self) -> None:
         bus = EventBus()
 
@@ -237,7 +229,6 @@ class TestEventBusPublish:
         assert decision == EventDecision.SUCCESS
         assert out == {"handled": EventType.ON_ALL_PLUGIN_LOADED.value}
 
-    @pytest.mark.asyncio
     async def test_publish_sync_returns_task(self) -> None:
         bus = EventBus()
 
@@ -252,7 +243,6 @@ class TestEventBusPublish:
         assert decision == EventDecision.SUCCESS
         assert out == {"x": 2}
 
-    @pytest.mark.asyncio
     async def test_concurrent_publish_isolated_params(self) -> None:
         bus = EventBus()
         seen: list[int] = []

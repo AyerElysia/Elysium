@@ -56,7 +56,6 @@ async def _make_service(tmp_path: Path) -> LifeMemoryService:
     return service
 
 
-@pytest.mark.asyncio
 async def test_search_is_read_only_and_does_not_delete_stale_vectors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -115,7 +114,6 @@ async def test_search_is_read_only_and_does_not_delete_stale_vectors(
     assert _snapshot(service._db) == before
 
 
-@pytest.mark.asyncio
 async def test_spread_activation_defaults_to_explicit_relations(tmp_path: Path) -> None:
     service = await _make_service(tmp_path)
     node_a = await service.get_or_create_file_node("notes/a.md", title="A")
@@ -151,7 +149,6 @@ async def test_spread_activation_defaults_to_explicit_relations(tmp_path: Path) 
     assert node_b.node_id in {node_id for node_id, *_ in associates_results}
 
 
-@pytest.mark.asyncio
 async def test_vector_search_filters_stale_ids_without_collection_mutation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -170,7 +167,6 @@ async def test_vector_search_filters_stale_ids_without_collection_mutation(
     assert collection.delete_calls == []
 
 
-@pytest.mark.asyncio
 async def test_dream_walk_default_does_not_create_or_update_edges(tmp_path: Path) -> None:
     service = await _make_service(tmp_path)
     node_a = await service.get_or_create_file_node("notes/a.md", title="A")
@@ -196,7 +192,6 @@ async def test_dream_walk_default_does_not_create_or_update_edges(tmp_path: Path
     assert _snapshot(service._db) == before
 
 
-@pytest.mark.asyncio
 async def test_dream_walk_can_explicitly_persist_learning(tmp_path: Path) -> None:
     service = await _make_service(tmp_path)
     node_a = await service.get_or_create_file_node("notes/a.md", title="A")
@@ -227,7 +222,6 @@ async def test_dream_walk_can_explicitly_persist_learning(tmp_path: Path) -> Non
     assert cursor.fetchone()["count"] >= 1
 
 
-@pytest.mark.asyncio
 async def test_default_canonical_resolver_is_read_only_and_does_not_scan_workspace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -254,7 +248,6 @@ async def test_default_canonical_resolver_is_read_only_and_does_not_scan_workspa
     assert _snapshot(service._db) == before
 
 
-@pytest.mark.asyncio
 async def test_default_canonical_resolver_reads_legacy_lineage_without_migration(
     tmp_path: Path,
 ) -> None:
@@ -298,7 +291,6 @@ async def test_default_canonical_resolver_reads_legacy_lineage_without_migration
     assert _snapshot(service._db) == before
 
 
-@pytest.mark.asyncio
 async def test_heuristic_resolution_is_opt_in_and_read_only_without_persistence(
     tmp_path: Path,
 ) -> None:
@@ -318,7 +310,6 @@ async def test_heuristic_resolution_is_opt_in_and_read_only_without_persistence(
     assert _snapshot(service._db) == before
 
 
-@pytest.mark.asyncio
 async def test_heuristic_resolution_requires_a_unique_candidate(tmp_path: Path) -> None:
     service = await _make_service(tmp_path)
     notes = tmp_path / "notes"
@@ -336,7 +327,6 @@ async def test_heuristic_resolution_requires_a_unique_candidate(tmp_path: Path) 
     assert result["resolved"] is False
 
 
-@pytest.mark.asyncio
 async def test_canonical_resolver_rejects_runtime_path_without_reading_graph(
     tmp_path: Path,
 ) -> None:
@@ -350,7 +340,6 @@ async def test_canonical_resolver_rejects_runtime_path_without_reading_graph(
     assert _snapshot(service._db) == before
 
 
-@pytest.mark.asyncio
 async def test_memory_bundles_exclude_legacy_runtime_lineage_nodes(tmp_path: Path) -> None:
     service = await _make_service(tmp_path)
     memory_path = "notes/kept.md"
@@ -416,7 +405,6 @@ async def test_memory_bundles_exclude_legacy_runtime_lineage_nodes(tmp_path: Pat
     assert bundle.history_trace == []
 
 
-@pytest.mark.asyncio
 async def test_build_memory_bundles_does_not_use_filename_heuristic(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -453,7 +441,6 @@ async def test_build_memory_bundles_does_not_use_filename_heuristic(
     assert bundles[0].primary_path == old_path
 
 
-@pytest.mark.asyncio
 async def test_scheduler_dream_walk_is_read_only_by_default() -> None:
     from plugins.life_engine.dream.scheduler import DreamScheduler
 

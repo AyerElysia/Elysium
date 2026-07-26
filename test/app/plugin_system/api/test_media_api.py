@@ -18,7 +18,6 @@ from src.app.plugin_system.api import media_api
 class TestMediaAPI:
     """测试媒体 API。"""
     
-    @pytest.mark.asyncio
     async def test_recognize_media(self) -> None:
         """测试识别媒体。"""
         with patch('src.app.plugin_system.api.media_api._get_media_manager') as mock_get_mgr:
@@ -30,7 +29,6 @@ class TestMediaAPI:
             
             assert result == "A picture of a cat"
     
-    @pytest.mark.asyncio
     async def test_recognize_batch(self) -> None:
         """测试批量识别媒体。"""
         with patch('src.app.plugin_system.api.media_api._get_media_manager') as mock_get_mgr:
@@ -46,7 +44,6 @@ class TestMediaAPI:
             assert len(result) == 2
             assert result[0] == (0, "Cat")
     
-    @pytest.mark.asyncio
     async def test_save_media_info(self) -> None:
         """测试保存媒体信息。"""
         with patch('src.app.plugin_system.api.media_api._get_media_manager') as mock_get_mgr:
@@ -64,7 +61,6 @@ class TestMediaAPI:
             
             mock_manager.save_media_info.assert_called_once()
     
-    @pytest.mark.asyncio
     async def test_get_media_info(self) -> None:
         """测试获取媒体信息。"""
         with patch('src.app.plugin_system.api.media_api._get_media_manager') as mock_get_mgr:

@@ -23,7 +23,6 @@ def _build_action(*, always_available: bool, platform: str = "") -> TTSVoiceActi
     return TTSVoiceAction(chat_stream=chat_stream, plugin=plugin)
 
 
-@pytest.mark.asyncio
 async def test_go_activate_returns_true_when_always_available_enabled(monkeypatch) -> None:
     """常驻可用开关开启时应直接激活，不走随机/关键词/LLM 判定。"""
     action = _build_action(always_available=True)
@@ -38,7 +37,6 @@ async def test_go_activate_returns_true_when_always_available_enabled(monkeypatc
     assert await action.go_activate() is True
 
 
-@pytest.mark.asyncio
 async def test_go_activate_uses_keyword_when_always_available_disabled(monkeypatch) -> None:
     """关闭常驻可用后，命中关键词应激活。"""
     action = _build_action(always_available=False)
@@ -56,7 +54,6 @@ async def test_go_activate_uses_keyword_when_always_available_disabled(monkeypat
     assert await action.go_activate() is True
 
 
-@pytest.mark.asyncio
 async def test_go_activate_returns_false_when_all_conditions_miss(monkeypatch) -> None:
     """关闭常驻可用且无随机/关键词/LLM命中时应不激活。"""
     action = _build_action(always_available=False)
@@ -74,7 +71,6 @@ async def test_go_activate_returns_false_when_all_conditions_miss(monkeypatch) -
     assert await action.go_activate() is False
 
 
-@pytest.mark.asyncio
 async def test_execute_persists_tts_text_as_voice_plain_text(monkeypatch) -> None:
     """TTS 语音消息应把合成文本写入 processed_plain_text。"""
     action = _build_action(always_available=True)
@@ -110,7 +106,6 @@ async def test_execute_persists_tts_text_as_voice_plain_text(monkeypatch) -> Non
     }
 
 
-@pytest.mark.asyncio
 async def test_surface_execute_is_suppressed_when_adapter_owns_tts() -> None:
     action = _build_action(always_available=True, platform="neko.surface")
     action.tts_service = SimpleNamespace()

@@ -436,7 +436,6 @@ def test_life_chatter_blocks_live_bridge_tool_at_execution_time() -> None:
     assert not LifeChatter._is_tool_call_blocked_for_trigger(call, usable_map, qq_msg)
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_run_tool_call_accepts_single_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -478,7 +477,6 @@ async def test_life_chatter_run_tool_call_accepts_single_call(
     assert payload.content[0].value == "已发送"
 
 
-@pytest.mark.asyncio
 async def test_life_chatter_run_tool_call_preserves_batch_shape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
