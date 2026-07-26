@@ -9,7 +9,7 @@ on:
 
 env:
   REGISTRY_USER: ikun11451
-  IMAGE_BASE: neo-mofox
+  IMAGE_BASE: elysium
 
 # Workflow's jobs
 jobs:

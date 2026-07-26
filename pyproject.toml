@@ -1,7 +1,7 @@
 [project]
-name = "neo-mofox"
-version = "1.1.0-alpha"
-description = "一个全新重构的 AI 聊天机器人框架，它的目标不仅仅是回答问题，而是创造一个真正的数字生命体。"
+name = "elysium"
+version = "2.0.0-alpha"
+description = "Elysium — 爱莉的家。数字生命系统：意识、学习、记忆、技能、具身体验。"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
