@@ -38,6 +38,7 @@ class LifeEngineConfig(BaseConfig):
         "settings": {
             "enabled",
             "heartbeat_interval_seconds",
+            "heartbeat_timeout_seconds",
             "sleep_time",
             "wake_time",
             "workspace_path",
@@ -151,6 +152,11 @@ class LifeEngineConfig(BaseConfig):
         heartbeat_interval_seconds: int = Field(
             default=30,
             description="心跳间隔（秒）。",
+        )
+
+        heartbeat_timeout_seconds: int = Field(
+            default=120,
+            description="单次心跳模型请求的超时（秒）。与心跳间隔解耦，慢模型可放宽。",
         )
 
         sleep_time: str = Field(
@@ -1140,6 +1146,87 @@ class LifeEngineConfig(BaseConfig):
             description="是否包含最近的 chatter_inner_monologue（最多 2 条）。",
         )
 
+    @config_section("minecraft")
+    class MinecraftSection(SectionBase):
+        """Minecraft 具身体验配置。"""
+
+        enabled: bool = Field(
+            default=False,
+            description="是否启用 Minecraft 具身体验。",
+        )
+
+        java_path: str = Field(
+            default="java",
+            description="Java 可执行文件路径。",
+        )
+
+        mc_version: str = Field(
+            default="1.21.4",
+            description="Minecraft 版本。",
+        )
+
+        world_name: str = Field(
+            default="elysia_world",
+            description="专用存档名称。",
+        )
+
+        window_width: int = Field(
+            default=1280,
+            ge=640,
+            le=3840,
+            description="游戏窗口宽度。",
+        )
+
+        window_height: int = Field(
+            default=720,
+            ge=360,
+            le=2160,
+            description="游戏窗口高度。",
+        )
+
+        consciousness_interval_seconds: float = Field(
+            default=6.0,
+            ge=2.0,
+            le=30.0,
+            description="意识层决策间隔（秒）。",
+        )
+
+        vla_model: str = Field(
+            default="bytedance-research/UI-TARS-7B-SFT",
+            description="VLA 模型名称或路径。",
+        )
+
+        vla_fps: int = Field(
+            default=6,
+            ge=1,
+            le=30,
+            description="VLA 闭环帧率。",
+        )
+
+        vla_timeout_seconds: float = Field(
+            default=30.0,
+            ge=5.0,
+            le=120.0,
+            description="单个意图最大执行时间（秒）。",
+        )
+
+        max_session_minutes: int = Field(
+            default=60,
+            ge=5,
+            le=240,
+            description="最大会话时长（分钟）。",
+        )
+
+        reflex_enabled: bool = Field(
+            default=True,
+            description="是否启用 Reflex 保护层。",
+        )
+
+        offline_username: str = Field(
+            default="Elysia",
+            description="离线模式用户名。",
+        )
+
     settings: SettingsSection = Field(default_factory=SettingsSection)
     model: ModelSection = Field(default_factory=ModelSection)
     memory_index: MemoryIndexSection = Field(default_factory=MemoryIndexSection)
@@ -1155,6 +1242,7 @@ class LifeEngineConfig(BaseConfig):
     streams: StreamsSection = Field(default_factory=StreamsSection)
     runtime_sync: RuntimeSyncSection = Field(default_factory=RuntimeSyncSection)
     drives: DrivesSection = Field(default_factory=DrivesSection)
+    minecraft: MinecraftSection = Field(default_factory=MinecraftSection)
     autonomy: AutonomySection = Field(default_factory=AutonomySection)
     narrative: NarrativeSection = Field(default_factory=NarrativeSection)
     learning: LearningSection = Field(default_factory=LearningSection)

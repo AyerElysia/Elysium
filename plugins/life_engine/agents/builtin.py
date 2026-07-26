@@ -62,6 +62,7 @@ _READ_ONLY_TOOLS: list[str] = [
     "nucleus_web_search",
     "nucleus_browser_fetch",
     "nucleus_view_screen",
+    "nucleus_minecraft",
     "nucleus_manage_thought_stream",
     "nucleus_list_todos",
     "nucleus_list_schedules",

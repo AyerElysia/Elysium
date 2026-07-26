@@ -3498,7 +3498,13 @@ class LifeEngineService(BaseService):
 
         request.add_payload(LLMPayload(ROLE.USER, Text(user_prompt)))
 
-        timeout_seconds = max(10.0, min(60.0, float(cfg.settings.heartbeat_interval_seconds)))
+        # 心跳请求超时与心跳间隔解耦：慢模型（长 prompt 的推理模型）单次可达上百秒，
+        # 沿用间隔值会把正常的慢响应当成超时反复重试。
+        configured_timeout = float(
+            getattr(cfg.settings, "heartbeat_timeout_seconds", 0)
+            or cfg.settings.heartbeat_interval_seconds
+        )
+        timeout_seconds = max(10.0, min(600.0, configured_timeout))
 
         logger.debug(
             f"life_engine heartbeat request: "
@@ -3726,6 +3732,16 @@ class LifeEngineService(BaseService):
                     reflection_cooldown_minutes=float(getattr(learning_cfg, "reflection_cooldown_minutes", 30.0) if learning_cfg else 30.0),
                     skill_distill_trigger_count=int(getattr(learning_cfg, "skill_distill_trigger_count", 3) if learning_cfg else 3),
                     skill_distill_interval_hours=float(getattr(learning_cfg, "skill_distill_interval_hours", 24.0) if learning_cfg else 24.0),
+                    minecraft_enabled=bool(getattr(cfg, "minecraft", None) and cfg.minecraft.enabled),
+                    minecraft_config={
+                        "java_path": cfg.minecraft.java_path,
+                        "mc_version": cfg.minecraft.mc_version,
+                        "world_name": cfg.minecraft.world_name,
+                        "window_width": cfg.minecraft.window_width,
+                        "window_height": cfg.minecraft.window_height,
+                        "vla_model": cfg.minecraft.vla_model,
+                        "offline_username": cfg.minecraft.offline_username,
+                    } if getattr(cfg, "minecraft", None) and cfg.minecraft.enabled else None,
                 )
                 logger.info("三环自学习系统已初始化")
             except Exception as exc:  # noqa: BLE001

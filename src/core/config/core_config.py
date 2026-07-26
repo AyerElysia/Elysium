@@ -157,9 +157,30 @@ class CoreConfig(ConfigBase):
         定义 LLM 运行时的全局行为，例如默认模型调度策略。
         """
 
-        default_policy: Literal["load_balanced", "round_robin"] = Field(
-            default="load_balanced",
-            description="默认模型调度策略，可选 load_balanced 或 round_robin",
+        default_policy: Literal["load_balanced", "round_robin", "failover"] = Field(
+            default="failover",
+            description=(
+                "默认模型调度策略："
+                "failover=按 model_list 顺序主备切换（推荐，高可控）；"
+                "load_balanced=按负载/失败动态选模；"
+                "round_robin=跨请求轮询"
+            ),
+        )
+        enable_trajectory_logging: bool = Field(
+            default=True,
+            description="是否启用 LLM text-only trajectory 记录",
+        )
+        trajectory_base_path: str = Field(
+            default="data/training_data_lake",
+            description="trajectory JSONL 数据湖路径（相对项目根解析）",
+        )
+        trajectory_flush_interval: float = Field(
+            default=5.0,
+            description="trajectory JSONL 后台刷写间隔（秒）",
+        )
+        trajectory_queue_limit: int = Field(
+            default=10000,
+            description="trajectory 内存队列告警阈值",
         )
 
     llm: LLMSection = Field(default_factory=LLMSection)
