@@ -1,0 +1,1232 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Neo-MoFox Life Engine 记忆检索健康度工程审查报告：数据完整性、索引一致性、效率、命中准确性、过滤和可观测性审查。">
+  <title>Neo-MoFox · 记忆检索健康度审计</title>
+  <style>
+    :root {
+      --bg: #101820;
+      --bg-raised: #17232d;
+      --bg-soft: #1d2b35;
+      --bg-code: #0b1218;
+      --line: #30414e;
+      --line-strong: #4b6271;
+      --text: #e9f0f2;
+      --muted: #a9bac3;
+      --faint: #70848f;
+      --teal: #2dd4bf;
+      --teal-soft: #164d4b;
+      --amber: #f5b942;
+      --amber-soft: #55451e;
+      --coral: #f47b68;
+      --coral-soft: #512b2b;
+      --blue: #6ab0f3;
+      --blue-soft: #203e5d;
+      --green: #76d49b;
+      --red: #ff8575;
+      --shadow: 0 10px 28px rgba(0, 0, 0, .18);
+      --radius: 8px;
+      --content: 1240px;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; background: var(--bg); }
+    body {
+      margin: 0;
+      color: var(--text);
+      background: var(--bg);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      line-height: 1.65;
+      font-size: 15px;
+    }
+    a { color: var(--teal); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    button, input { font: inherit; }
+    button { cursor: pointer; }
+    code, kbd, .mono {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: .9em;
+    }
+    code { color: #bfe9e3; }
+    p { margin: .35rem 0 1rem; }
+    h1, h2, h3, h4 { line-height: 1.25; margin: 0; letter-spacing: 0; }
+    h1 { font-size: clamp(2rem, 4vw, 3.5rem); max-width: 850px; }
+    h2 { font-size: clamp(1.45rem, 2.2vw, 2rem); }
+    h3 { font-size: 1.1rem; }
+    h4 { font-size: .98rem; }
+    ul, ol { padding-left: 1.35rem; }
+    li + li { margin-top: .3rem; }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      border-bottom: 1px solid var(--line);
+      background: rgba(16, 24, 32, .96);
+      backdrop-filter: blur(10px);
+    }
+    .topbar-inner {
+      max-width: var(--content);
+      min-height: 58px;
+      margin: 0 auto;
+      padding: 10px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+      font-weight: 750;
+      letter-spacing: .02em;
+    }
+    .brand-mark {
+      width: 28px;
+      height: 28px;
+      display: grid;
+      place-items: center;
+      border: 1px solid var(--teal);
+      border-radius: 6px;
+      color: var(--teal);
+      background: var(--teal-soft);
+      font-size: .82rem;
+      font-weight: 800;
+    }
+    .brand small { color: var(--muted); font-weight: 500; }
+    .topbar-actions { display: flex; align-items: center; gap: 8px; }
+    .topbar-actions button, .filter-box input {
+      min-height: 34px;
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      color: var(--text);
+      background: var(--bg-raised);
+      padding: 5px 10px;
+    }
+    .topbar-actions button:hover { border-color: var(--teal); background: var(--bg-soft); }
+
+    .shell {
+      max-width: var(--content);
+      margin: 0 auto;
+      padding: 26px 24px 70px;
+      display: grid;
+      grid-template-columns: 220px minmax(0, 1fr);
+      gap: 28px;
+    }
+    .toc {
+      position: sticky;
+      top: 82px;
+      align-self: start;
+      max-height: calc(100vh - 106px);
+      overflow: auto;
+      padding: 13px 0;
+    }
+    .toc-title {
+      color: var(--faint);
+      font-size: .72rem;
+      font-weight: 800;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+    .toc a {
+      display: block;
+      border-left: 2px solid transparent;
+      padding: 5px 10px;
+      color: var(--muted);
+      font-size: .86rem;
+      line-height: 1.4;
+    }
+    .toc a:hover, .toc a.active {
+      border-left-color: var(--teal);
+      color: var(--text);
+      background: rgba(45, 212, 191, .08);
+      text-decoration: none;
+    }
+    .toc .sub { padding-left: 22px; font-size: .8rem; }
+
+    main { min-width: 0; }
+    .hero {
+      padding: 22px 0 30px;
+      border-bottom: 1px solid var(--line);
+    }
+    .eyebrow {
+      color: var(--teal);
+      font-size: .78rem;
+      font-weight: 800;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      margin-bottom: 12px;
+    }
+    .hero-lead {
+      max-width: 880px;
+      margin-top: 17px;
+      color: var(--muted);
+      font-size: 1.04rem;
+    }
+    .verdict {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 17px;
+      border: 1px solid var(--coral);
+      border-radius: 6px;
+      padding: 8px 12px;
+      color: #ffd2cb;
+      background: var(--coral-soft);
+      font-weight: 800;
+    }
+    .verdict .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--coral); }
+    .meta-line { margin-top: 12px; color: var(--faint); font-size: .82rem; }
+
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 25px;
+    }
+    .metric-card, .panel, .callout, .finding, .source-card {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--bg-raised);
+      box-shadow: var(--shadow);
+    }
+    .metric-card { padding: 15px; min-height: 126px; }
+    .metric-label { color: var(--muted); font-size: .78rem; }
+    .metric-value {
+      display: block;
+      margin: 6px 0 2px;
+      color: var(--text);
+      font-size: 1.75rem;
+      font-weight: 800;
+      font-variant-numeric: tabular-nums;
+      line-height: 1.1;
+    }
+    .metric-note { color: var(--faint); font-size: .78rem; }
+    .accent-teal .metric-value { color: var(--teal); }
+    .accent-amber .metric-value { color: var(--amber); }
+    .accent-coral .metric-value { color: var(--coral); }
+    .accent-blue .metric-value { color: var(--blue); }
+
+    section.report-section { padding-top: 40px; scroll-margin-top: 76px; }
+    .section-head {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 15px;
+    }
+    .section-head p { margin: 0; max-width: 760px; color: var(--muted); }
+    .section-index { color: var(--faint); font-size: .8rem; font-variant-numeric: tabular-nums; }
+    .panel { padding: 18px; }
+    .panel + .panel { margin-top: 14px; }
+    .panel h3 { margin-bottom: 9px; }
+    .panel h4 { margin-top: 15px; margin-bottom: 6px; color: var(--teal); }
+    .panel p:last-child { margin-bottom: 0; }
+    .two-col { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .three-col { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    .four-col { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .callout { padding: 16px 18px; border-left: 4px solid var(--amber); background: #262718; }
+    .callout.danger { border-left-color: var(--coral); background: #271b1d; }
+    .callout.info { border-left-color: var(--blue); background: #18242d; }
+    .callout strong { color: var(--amber); }
+    .callout.danger strong { color: var(--coral); }
+    .callout.info strong { color: var(--blue); }
+
+    .score-table, .data-table, .issue-table { width: 100%; border-collapse: collapse; }
+    .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); }
+    .score-table th, .score-table td, .data-table th, .data-table td, .issue-table th, .issue-table td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 11px;
+      text-align: left;
+      vertical-align: top;
+    }
+    .score-table tr:last-child td, .data-table tr:last-child td, .issue-table tr:last-child td { border-bottom: 0; }
+    th { color: var(--muted); background: var(--bg-soft); font-size: .78rem; font-weight: 750; white-space: nowrap; }
+    td { color: #dce6e9; font-size: .88rem; }
+    .score-name { min-width: 135px; font-weight: 700; }
+    .score-number { width: 78px; font-weight: 800; font-variant-numeric: tabular-nums; }
+    .score-track, .progress-track {
+      height: 8px;
+      min-width: 105px;
+      overflow: hidden;
+      border-radius: 3px;
+      background: #0d151b;
+      border: 1px solid #293b46;
+    }
+    .score-fill, .progress-fill { height: 100%; background: var(--teal); }
+    .score-fill.mid { background: var(--amber); }
+    .score-fill.low { background: var(--coral); }
+    .confidence { display: inline-block; border: 1px solid var(--line-strong); border-radius: 4px; padding: 1px 6px; color: var(--muted); font-size: .72rem; white-space: nowrap; }
+    .confidence.high { border-color: #3d806f; color: #a6eed0; }
+    .confidence.medium { border-color: #806d3e; color: #f6d890; }
+    .confidence.low { border-color: #80473e; color: #ffb6a9; }
+
+    .bar-chart { display: grid; gap: 11px; margin-top: 12px; }
+    .bar-row { display: grid; grid-template-columns: 180px minmax(0, 1fr) 78px; align-items: center; gap: 10px; font-size: .84rem; }
+    .bar-label { color: var(--muted); }
+    .bar-track { height: 19px; background: #0c151b; border: 1px solid var(--line); border-radius: 3px; overflow: hidden; }
+    .bar-fill { height: 100%; min-width: 2px; background: var(--teal); }
+    .bar-fill.amber { background: var(--amber); }
+    .bar-fill.blue { background: var(--blue); }
+    .bar-fill.coral { background: var(--coral); }
+    .bar-value { color: var(--text); text-align: right; font-variant-numeric: tabular-nums; }
+    .legend-row { display: flex; flex-wrap: wrap; gap: 10px 16px; margin-top: 12px; color: var(--muted); font-size: .78rem; }
+    .legend-item { display: inline-flex; align-items: center; gap: 6px; }
+    .legend-swatch { width: 10px; height: 10px; border-radius: 2px; background: var(--teal); }
+    .legend-swatch.amber { background: var(--amber); }
+    .legend-swatch.blue { background: var(--blue); }
+    .legend-swatch.coral { background: var(--coral); }
+
+    .snapshot-label { color: var(--teal); font-size: .76rem; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+    .snapshot-note { color: var(--faint); font-size: .8rem; }
+    .stat-strip { display: flex; flex-wrap: wrap; gap: 8px; margin: 11px 0 15px; }
+    .stat-pill { border: 1px solid var(--line-strong); border-radius: 5px; padding: 5px 8px; background: var(--bg-soft); color: var(--muted); font-size: .8rem; }
+    .stat-pill b { color: var(--text); font-variant-numeric: tabular-nums; }
+
+    .flow {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: stretch;
+      gap: 7px;
+      margin: 14px 0 7px;
+    }
+    .flow-step {
+      flex: 1 1 145px;
+      min-width: 126px;
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      padding: 10px;
+      background: var(--bg-soft);
+    }
+    .flow-step strong { display: block; color: var(--text); font-size: .86rem; }
+    .flow-step span { display: block; margin-top: 4px; color: var(--faint); font-size: .76rem; line-height: 1.45; }
+    .flow-arrow { align-self: center; color: var(--teal); font-size: 1.15rem; }
+    .flow-caption { color: var(--faint); font-size: .78rem; }
+    .flow-life .flow-step { border-top: 3px solid var(--teal); }
+
+    .finding-list { display: grid; gap: 12px; }
+    .finding { padding: 16px 17px; box-shadow: none; }
+    .finding-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+    .finding-title { display: flex; align-items: flex-start; gap: 8px; font-weight: 800; }
+    .severity { flex: 0 0 auto; border-radius: 4px; padding: 2px 7px; font-size: .7rem; font-weight: 850; letter-spacing: .04em; }
+    .severity.p0 { color: #ffd7d0; background: #75352e; }
+    .severity.p1 { color: #ffe2aa; background: #685020; }
+    .severity.p2 { color: #c5ddf4; background: #254667; }
+    .finding p { color: var(--muted); }
+    .finding-meta { display: grid; grid-template-columns: 128px minmax(0, 1fr); gap: 5px 12px; margin-top: 10px; font-size: .82rem; }
+    .finding-meta dt { color: var(--faint); font-weight: 700; }
+    .finding-meta dd { margin: 0; color: #dce6e9; }
+    .finding-meta code { overflow-wrap: anywhere; }
+    details { border: 1px solid var(--line); border-radius: 6px; background: rgba(0,0,0,.08); }
+    details + details { margin-top: 8px; }
+    details summary { cursor: pointer; list-style: none; padding: 10px 12px; color: var(--text); font-weight: 700; }
+    details summary::-webkit-details-marker { display: none; }
+    details summary::before { content: "+"; display: inline-block; width: 18px; color: var(--teal); font-weight: 900; }
+    details[open] summary::before { content: "−"; }
+    details .detail-body { padding: 0 12px 12px; color: var(--muted); }
+    .finding details { margin-top: 12px; }
+
+    .tag-list { display: flex; flex-wrap: wrap; gap: 6px; }
+    .tag { border: 1px solid var(--line-strong); border-radius: 4px; padding: 3px 7px; color: var(--muted); background: var(--bg-soft); font-size: .78rem; }
+    .tag.p1 { border-color: #806d3e; color: #f6d890; }
+    .tag.p2 { border-color: #3d617d; color: #b7d5ed; }
+    .tag.ok { border-color: #3d806f; color: #a6eed0; }
+
+    .roadmap { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .roadmap-step { min-height: 220px; border: 1px solid var(--line); border-top: 3px solid var(--teal); border-radius: 6px; padding: 14px; background: var(--bg-raised); }
+    .roadmap-step:nth-child(2) { border-top-color: var(--amber); }
+    .roadmap-step:nth-child(3) { border-top-color: var(--blue); }
+    .roadmap-step:nth-child(4) { border-top-color: var(--green); }
+    .roadmap-step .phase { color: var(--faint); font-size: .76rem; font-weight: 800; letter-spacing: .08em; }
+    .roadmap-step h3 { margin: 7px 0 9px; }
+    .roadmap-step p, .roadmap-step li { color: var(--muted); font-size: .84rem; }
+
+    .filter-box { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+    .filter-box label { color: var(--muted); font-size: .82rem; }
+    .filter-box input { width: min(100%, 330px); }
+    .issue-table .issue-id { width: 70px; color: var(--teal); font-weight: 800; }
+    .issue-table .issue-severity { width: 68px; }
+    .issue-table tr.hidden { display: none; }
+
+    pre {
+      margin: 10px 0 0;
+      padding: 12px;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      color: #c6d9de;
+      background: var(--bg-code);
+      font-size: .79rem;
+      line-height: 1.55;
+    }
+    .source-card { padding: 13px 14px; box-shadow: none; }
+    .source-card strong { display: block; margin-bottom: 5px; color: var(--text); }
+    .source-card p { margin: 0; color: var(--muted); font-size: .82rem; }
+    .source-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .footnote { color: var(--faint); font-size: .78rem; }
+    .nowrap { white-space: nowrap; }
+    .danger-text { color: var(--coral); font-weight: 700; }
+    .good-text { color: var(--green); font-weight: 700; }
+    .amber-text { color: var(--amber); font-weight: 700; }
+
+    footer {
+      max-width: var(--content);
+      margin: 0 auto;
+      padding: 22px 24px 42px;
+      border-top: 1px solid var(--line);
+      color: var(--faint);
+      font-size: .8rem;
+    }
+
+    @media (max-width: 1020px) {
+      .shell { grid-template-columns: 1fr; }
+      .toc {
+        position: static;
+        max-height: none;
+        display: flex;
+        gap: 3px;
+        overflow-x: auto;
+        padding: 0 0 6px;
+        border-bottom: 1px solid var(--line);
+      }
+      .toc-title { display: none; }
+      .toc a { flex: 0 0 auto; border-left: 0; border-bottom: 2px solid transparent; padding: 5px 8px; white-space: nowrap; }
+      .toc a:hover, .toc a.active { border-left: 0; border-bottom-color: var(--teal); }
+      .toc .sub { display: none; }
+      .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .roadmap { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 700px) {
+      body { font-size: 14px; }
+      .topbar-inner, .shell, footer { padding-left: 15px; padding-right: 15px; }
+      .topbar-inner { align-items: flex-start; }
+      .brand small { display: none; }
+      .topbar-actions button { font-size: .78rem; padding: 5px 7px; }
+      .metric-grid, .two-col, .three-col, .four-col, .source-grid, .roadmap { grid-template-columns: 1fr; }
+      .metric-card { min-height: 0; }
+      .section-head { display: block; }
+      .section-index { display: block; margin-bottom: 5px; }
+      .bar-row { grid-template-columns: 118px minmax(0, 1fr) 62px; gap: 7px; }
+      .finding-head { display: block; }
+      .finding-head .severity { display: inline-block; margin-bottom: 6px; }
+      .finding-meta { grid-template-columns: 1fr; gap: 1px; }
+      .finding-meta dd { margin-bottom: 6px; }
+      .flow { display: grid; grid-template-columns: 1fr; }
+      .flow-arrow { transform: rotate(90deg); justify-self: center; }
+      .flow-step { min-width: 0; }
+      h1 { font-size: 2.1rem; }
+    }
+    @media print {
+      .topbar, .toc, .topbar-actions, .filter-box { display: none !important; }
+      .shell { display: block; padding: 0; }
+      .hero { padding-top: 0; }
+      .metric-card, .panel, .finding, .source-card { box-shadow: none; break-inside: avoid; }
+      section.report-section { padding-top: 20px; }
+      a { color: inherit; text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">MQ</span>
+        <span>Neo-MoFox <small>/ 记忆检索健康度审计</small></span>
+      </div>
+      <div class="topbar-actions">
+        <button type="button" id="expand-all" title="展开全部详情">展开详情</button>
+        <button type="button" id="collapse-all" title="折叠全部详情">折叠详情</button>
+        <button type="button" id="print-report" title="打印或导出 PDF">打印</button>
+      </div>
+    </div>
+  </header>
+
+  <div class="shell">
+    <nav class="toc" aria-label="报告导航">
+      <div class="toc-title">Contents</div>
+      <a href="#summary">执行摘要</a>
+      <a href="#scorecard">评分卡</a>
+      <a href="#snapshot">运行快照</a>
+      <a href="#architecture">架构流程</a>
+      <a href="#efficiency">效率分析</a>
+      <a href="#metrics-gap">指标缺口</a>
+      <a href="#issues">问题清单</a>
+      <a class="sub" href="#issues-p1">P1 关键问题</a>
+      <a class="sub" href="#issues-p2">P2 改进问题</a>
+      <a href="#failures">失败场景</a>
+      <a href="#testing">测试与 telemetry</a>
+      <a href="#roadmap">修复路线</a>
+      <a href="#method">方法与限制</a>
+      <a href="#appendix">附录</a>
+    </nav>
+
+    <main>
+      <section class="hero" id="summary">
+        <div class="eyebrow">Engineering Review · Offline Snapshot</div>
+        <h1>记忆检索健康度审计</h1>
+        <p class="hero-lead">
+          对 Neo-MoFox 当前 Life Engine 记忆检索链路进行只读代码审查与本地数据快照核对。
+          重点检查数据完整性、索引一致性、效率、命中准确性、相关性、过滤正确性、可观测性和测试保障。
+        </p>
+        <div class="verdict"><span class="dot"></span>总体判定：当前不能评为生产级，也不能评为“足够好”</div>
+        <div class="meta-line">审计时间：2026-07-20 11:15:26 +08:00 · 报告性质：工程审查，不是性能基准或质量认证 · 数据读取：只读 SQLite/Chroma 元数据</div>
+
+        <div class="metric-grid" aria-label="审计关键指标">
+          <div class="metric-card accent-teal">
+            <span class="metric-label">Life Engine 图谱</span>
+            <span class="metric-value">302 / 7,314</span>
+            <span class="metric-note">nodes / edges</span>
+          </div>
+          <div class="metric-card accent-amber">
+            <span class="metric-label">Life Engine 索引</span>
+            <span class="metric-value">62 / 100</span>
+            <span class="metric-note">FTS rows / Chroma embeddings</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="report-section" id="summary-detail">
+        <div class="section-head">
+          <div>
+            <span class="section-index">01</span>
+            <h2>执行摘要与总体判定</h2>
+          </div>
+        </div>
+        <div class="two-col">
+          <article class="panel">
+            <h3>可确认的能力</h3>
+            <ul>
+              <li>Life Engine 已形成 SQLite 节点/边/FTS、Chroma 语义向量、RRF 融合、激活扩散、访问强化和 lineage 记忆包的完整概念链。</li>
+              <li>Life Engine 存在针对性的单元/回归测试，能证明路径迁移保留 FTS/边等局部契约。</li>
+            </ul>
+          </article>
+          <article class="panel">
+            <h3>阻断生产级结论的事实</h3>
+            <ul>
+              <li>Life Engine 302 个节点中只有 62 个 FTS 行；240 个节点没有 FTS。93 个节点标记为 <code>embedding_synced=1</code>，但 Chroma 只有约 100 个向量，状态语义没有单一可信来源。</li>
+              <li>Life Engine 观察到源端和目标端各 17 条边引用不存在节点；去重后各有 3 个缺失端点 ID，且有 2 条边两端均缺失。</li>
+              <li>Life Engine 检索代码注释写“并行”，实现却按 FTS 后向量顺序等待。</li>
+              <li>precision、recall、nDCG/MRR、p50/p95/p99 latency 均没有真实运行观测；现有 <code>relevance</code> 是算法分数，不是正确性指标。</li>
+              <li>Chroma 适配层多处吞掉异常并返回空结果，写入没有事务或 outbox 保证。</li>
+            </ul>
+          </article>
+        </div>
+        <div class="callout danger" style="margin-top:14px">
+          <strong>结论边界：</strong>系统可以被描述为“功能面完整、正在演进的本地记忆原型”，但不能被描述为数据一致性已证明、检索质量已证明、延迟已达标的生产级服务。当前不应使用“足够好”“已达到生产级”作为验收结论。
+        </div>
+      </section>
+
+      <section class="report-section" id="scorecard">
+        <div class="section-head">
+          <div>
+            <span class="section-index">02</span>
+            <h2>评分卡</h2>
+          </div>
+          <p>分数是基于快照、源码和现有测试证据的工程判断；不是经过标注数据和压测得出的统计置信区间。</p>
+        </div>
+        <div class="table-wrap">
+          <table class="score-table">
+            <thead>
+              <tr><th>维度</th><th>评分</th><th>可视化</th><th>证据与判定</th><th>置信度</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="score-name">数据完整性</td><td class="score-number">4.0 / 10</td>
+                <td><div class="score-track"><div class="score-fill low" style="width:40%"></div></div></td>
+                <td>Life Engine 有 240 个无 FTS 节点、17/17 悬空端点引用，且空标题/内容 hash 大量缺失。</td>
+                <td><span class="confidence high">高</span></td>
+              </tr>
+              <tr>
+                <td class="score-name">索引一致性</td><td class="score-number">4.5 / 10</td>
+                <td><div class="score-track"><div class="score-fill low" style="width:45%"></div></div></td>
+                <td>Life 的 <code>embedding_synced</code>、FTS 和 Chroma 数量互相无法形成闭环。</td>
+                <td><span class="confidence high">高</span></td>
+              </tr>
+              <tr>
+                <td class="score-name">效率</td><td class="score-number">5.0 / 10</td>
+                <td><div class="score-track"><div class="score-fill mid" style="width:50%"></div></div></td>
+                <td>规模尚小、存在本地索引，但 Life 仍有串行查询、N+1 数据访问和逐条状态更新。</td>
+                <td><span class="confidence medium">中</span></td>
+              </tr>
+              <tr>
+                <td class="score-name">命中准确性</td><td class="score-number">3.0 / 10</td>
+                <td><div class="score-track"><div class="score-fill low" style="width:30%"></div></div></td>
+                <td>没有 qrels/人工相关性标签、precision@k 或 recall@k；只能确认排序算法存在，不能确认结果正确。</td>
+                <td><span class="confidence low">低</span></td>
+              </tr>
+              <tr>
+                <td class="score-name">相关性</td><td class="score-number">5.0 / 10</td>
+                <td><div class="score-track"><div class="score-fill mid" style="width:50%"></div></div></td>
+                <td>RRF、余弦相似度和激活扩散具备解释路径，但 BM25 归一化和启发式分数没有校准。</td>
+                <td><span class="confidence low">低</span></td>
+              </tr>
+              <tr>
+                <td class="score-name">过滤正确性</td><td class="score-number">5.0 / 10</td>
+                <td><div class="score-track"><div class="score-fill mid" style="width:50%"></div></div></td>
+                <td>Life 时间/类型过滤有局部测试或实现，但没有覆盖向量召回和组合过滤矩阵。</td>
+                <td><span class="confidence medium">中</span></td>
+              </tr>
+              <tr>
+                <td class="score-name">可观测性</td><td class="score-number">3.5 / 10</td>
+                <td><div class="score-track"><div class="score-fill low" style="width:35%"></div></div></td>
+                <td>有错误日志和 Life SSE 事件，但缺少按阶段计时、请求 ID、候选数/过滤数、索引健康指标和异常计数。</td>
+                <td><span class="confidence high">高</span></td>
+              </tr>
+              <tr>
+                <td class="score-name">测试保障</td><td class="score-number">5.0 / 10</td>
+                <td><div class="score-track"><div class="score-fill mid" style="width:50%"></div></div></td>
+                <td>有局部回归测试，但没有真实数据健康检查、端到端检索质量测试、延迟基准、部分失败和跨存储一致性测试。</td>
+                <td><span class="confidence medium">中</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="stat-strip">
+          <span class="stat-pill"><b>4.4 / 10</b> 粗略综合信号</span>
+          <span class="stat-pill">权重：不设“准确性”伪精确权重</span>
+          <span class="stat-pill">门槛：数据一致性与质量观测未达标即不能生产化</span>
+        </div>
+        <p class="footnote">综合信号仅用于排序修复优先级，不应把 4.4 当作可比较的产品 KPI。尤其 accuracy、relevance 和 latency 的置信度不足，必须先补观测再重新评分。</p>
+      </section>
+
+      <section class="report-section" id="snapshot">
+        <div class="section-head">
+          <div>
+            <span class="section-index">03</span>
+            <h2>真实运行快照</h2>
+          </div>
+          <p>以下数字来自仓库本地数据目录的只读 SQLite 查询；Chroma 的总数读取其 SQLite 元数据表，并与 ID 集合做差集核对。</p>
+        </div>
+
+        <article class="panel">
+          <div class="snapshot-label">Life Engine · exact snapshot</div>
+          <div class="stat-strip">
+            <span class="stat-pill"><b>302</b> nodes</span>
+            <span class="stat-pill"><b>62</b> FTS rows</span>
+            <span class="stat-pill"><b>93</b> synced</span>
+            <span class="stat-pill"><b>240</b> no FTS</span>
+            <span class="stat-pill"><b>7,314</b> edges</span>
+            <span class="stat-pill"><b>约 100</b> Chroma vectors（精确计数 100）</span>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr><th>对象</th><th>计数</th><th>交叉核对</th><th>工程含义</th></tr></thead>
+              <tbody>
+                <tr><td>节点总数</td><td>302</td><td>全部为 <code>file</code> 节点；当前 <code>concept</code> 节点为 0</td><td>图谱规模不大，但节点类型设计与实际数据分布不一致。</td></tr>
+                <tr><td>FTS5 行</td><td>62</td><td>62 个 distinct <code>node_id</code>，无重复 FTS 行</td><td>只有约 20.5% 节点具备全文索引；240 个节点没有 FTS。</td></tr>
+                <tr><td>embedding_synced=1</td><td>93</td><td><code>embedding_synced=0</code> 为 209</td><td>字段更像历史写入状态，而不是当前向量库事实。</td></tr>
+                <tr><td>Chroma embeddings</td><td>100</td><td>collection=<code>life_memory</code>，dimension=1024；向量 ID 均能在节点表找到</td><td>向量没有悬空 ID，但只有 100/302 节点进入向量检索。</td></tr>
+                <tr><td>边</td><td>7,314</td><td>associates 6,198；relates 858；continues 184；causes 62；其余 12</td><td>网络连接密度高于 FTS/向量覆盖，扩散可能放大脏关系。</td></tr>
+                <tr><td>悬空边端点</td><td>源端 17；目标端 17</td><td>去重后各 3 个缺失端点 ID；2 条边两端均缺失</td><td>激活扩散会遍历到不存在节点，再由后续查询静默丢弃，形成隐性召回损失。</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="bar-chart" aria-label="Life Engine 覆盖率柱状图">
+            <div class="bar-row"><span class="bar-label">FTS 覆盖 / 302 nodes</span><div class="bar-track"><div class="bar-fill coral" style="width:20.53%"></div></div><span class="bar-value">20.5%</span></div>
+            <div class="bar-row"><span class="bar-label">Chroma 覆盖 / 302 nodes</span><div class="bar-track"><div class="bar-fill amber" style="width:33.11%"></div></div><span class="bar-value">33.1%</span></div>
+            <div class="bar-row"><span class="bar-label">synced 标记 / 302 nodes</span><div class="bar-track"><div class="bar-fill blue" style="width:30.79%"></div></div><span class="bar-value">30.8%</span></div>
+            <div class="bar-row"><span class="bar-label">FTS ∩ synced / 302 nodes</span><div class="bar-track"><div class="bar-fill" style="width:3.97%"></div></div><span class="bar-value">12 nodes</span></div>
+          </div>
+          <p class="footnote">交叉事实：93 个 synced 节点中 81 个没有对应 FTS；62 个 FTS 节点中 50 个仍标记为未 synced；7 个节点有 Chroma 向量但未标记 synced。状态字段、FTS 和向量集合之间没有形成单一闭环。</p>
+        </article>
+
+        <article class="panel">
+          <h3>快照解释：Life Engine 的可检索覆盖率不足</h3>
+          <div class="two-col">
+            <div>
+              <p><span class="danger-text">Life 的“可检索覆盖率”明显不足。</span> 62 FTS + 100 vector 并不等价于 302 节点均可被混合检索；且边网络 7,314 条比索引覆盖增长更快。</p>
+              <p>节点只要没有同步任务或同步失败，代码路径会继续返回成功/空结果，当前没有健康门禁阻止继续使用。</p>
+            </div>
+            <div>
+              <p>本报告的历史记忆数据已从运行时审查范围移除；原始数据目录仍作为冷备份保留，不作为当前服务契约或运行时依赖。</p>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section class="report-section" id="architecture">
+        <div class="section-head">
+          <div>
+            <span class="section-index">04</span>
+            <h2>架构流程对照</h2>
+          </div>
+          <p>流程按当前源码实际调用顺序绘制；“并行”仅在实现确实并发时标记为并行。</p>
+        </div>
+        <article class="panel">
+          <h3>Life Engine：SQLite FTS + Chroma + 图扩散</h3>
+          <div class="flow flow-life" aria-label="Life Engine 检索流程">
+            <div class="flow-step"><strong>输入 query</strong><span><code>LifeMemoryService.search_memory</code></span></div>
+            <span class="flow-arrow">→</span>
+            <div class="flow-step"><strong>FTS5</strong><span><code>fts_search</code>，BM25 后做 abs/10 截断</span></div>
+            <span class="flow-arrow">→</span>
+            <div class="flow-step"><strong>Embedding + Chroma</strong><span><code>embed_text</code> 后向量 query；结果过滤脏 ID</span></div>
+            <span class="flow-arrow">→</span>
+            <div class="flow-step"><strong>RRF fusion</strong><span>rank-only 融合，<code>RRF_K=60</code></span></div>
+            <span class="flow-arrow">→</span>
+            <div class="flow-step"><strong>过滤</strong><span>file type/time range；逐个查节点</span></div>
+            <span class="flow-arrow">→</span>
+            <div class="flow-step"><strong>Seeds + spread</strong><span>top-k 种子，深度 2、衰减 .7、阈值 .3</span></div>
+            <span class="flow-arrow">→</span>
+            <div class="flow-step"><strong>副作用</strong><span>access++、边强化、SSE 事件、SearchResult</span></div>
+          </div>
+          <p class="flow-caption">源码：<code>plugins/life_engine/memory/search.py:507-657</code>、<code>plugins/life_engine/memory/service.py:473-532</code>。代码注释称 FTS 与向量并行，但实际在 547 和 552 行顺序 await。</p>
+          <details>
+            <summary>Life Engine 的数据写入和迁移路径</summary>
+            <div class="detail-body">
+              <ol>
+                <li><code>get_or_create_file_node</code> 先按规范化路径查找/创建节点；有 content hash 变化时把 <code>embedding_synced</code> 重置为 0，并在有回调时更新 FTS。</li>
+                <li><code>sync_embedding</code> 另行生成 embedding，写 Chroma，再把节点标成 synced；两步之间没有统一 outbox/状态机。</li>
+                <li>路径迁移会在 SQLite 中迁移 edge 和 FTS，再 best-effort 迁移 Chroma 身份；Chroma 异常只 debug。</li>
+                <li>搜索结束后会增加 access count，并对共激活 seed 强化边，因此一次“读”会改变图状态。</li>
+              </ol>
+            </div>
+          </details>
+        </article>
+
+      </section>
+
+      <section class="report-section" id="efficiency">
+        <div class="section-head">
+          <div>
+            <span class="section-index">05</span>
+            <h2>效率分析</h2>
+          </div>
+          <p>本节分为静态复杂度和运行观测两部分；所有“次数”都是从代码路径推导，不能替代实际 latency。</p>
+        </div>
+        <article class="panel">
+          <h3>主要瓶颈与复杂度来源</h3>
+          <div class="three-col">
+            <div class="source-card">
+              <strong>Life：串行双路检索</strong>
+              <p>在 <code>search.py:546-552</code>，FTS 完成后才开始向量 embedding/query。没有 <code>asyncio.gather</code>，总耗时近似为两路耗时之和。</p>
+            </div>
+            <div class="source-card">
+              <strong>Life：结果级 N+1</strong>
+              <p><code>filter_results</code> 每个候选调用 <code>get_node_by_id</code>；最终直接结果又逐个查 node 和 snippet，seed access 更新也逐条执行。</p>
+            </div>
+            <div class="source-card">
+              <strong>Life：扩散放大</strong>
+              <p><code>spread_activation</code> 按 frontier 节点逐次获取 edges。边多于索引覆盖时，图扩散会把节点一致性问题转成额外查询和静默缺失。</p>
+            </div>
+          </div>
+          <h4>静态推导的查询触点</h4>
+          <div class="bar-chart" aria-label="静态查询触点柱状图">
+            <div class="bar-row"><span class="bar-label">Life 基础双路</span><div class="bar-track"><div class="bar-fill teal" style="width:20%"></div></div><span class="bar-value">2 路</span></div>
+          </div>
+        </article>
+        <article class="panel">
+          <h3>效率方面的正面事实</h3>
+          <ul>
+            <li>Life 节点/边/FTS 有基础索引；向量检索通过 Chroma HNSW 持久化集合，规模在本快照中尚小。</li>
+            <li>Life 的 SQLite 重活和 Chroma 同步调用会进入线程/异步适配层，避免直接阻塞事件循环；这不等于端到端低 latency，但为后续并行化保留了空间。</li>
+          </ul>
+          <div class="callout info"><strong>效率判定：</strong>当前规模下“能运行”不代表“可扩展”。应先以真实分位数测量确认瓶颈，再做受控 gather、批量查询和批量状态更新；不要仅凭快照数量猜 SLA。</div>
+        </article>
+      </section>
+
+      <section class="report-section" id="metrics-gap">
+        <div class="section-head">
+          <div>
+            <span class="section-index">06</span>
+            <h2>precision / recall / latency 为什么未观测</h2>
+          </div>
+          <p>缺口不是“没把指标画出来”，而是当前代码没有定义可计算它们的实验契约。</p>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead><tr><th>指标</th><th>当前可见信息</th><th>为什么不等价于该指标</th><th>最低补齐方案</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><b>Precision@k</b></td>
+                <td>Life 返回 <code>SearchResult.relevance</code>。</td>
+                <td>该字段是 RRF/向量/扩散分数，不包含“结果是否相关”的人工或业务真值。</td>
+                <td>建立查询集和 qrels，按 query/top-k 标记相关性，计算 precision@1/3/5/10。</td>
+              </tr>
+              <tr>
+                <td><b>Recall@k</b></td>
+                <td>可以数返回多少条，也可以数 FTS/vector 候选交集。</td>
+                <td>没有已知的完整相关结果集合；“没有命中”可能是没有 FTS、没有 vector、过滤掉、向量失败或确实不相关。</td>
+                <td>为每个查询维护完整相关集合，至少覆盖 exact phrase、语义改写、历史路径、已归档和跨 folder 场景。</td>
+              </tr>
+              <tr>
+                <td><b>Latency</b></td>
+                <td>源码有错误日志、Chroma 调用和 LLM metrics 的其他基础设施。</td>
+                <td>记忆检索没有 query-level start/end、阶段耗时、候选数量、p50/p95/p99，也不能把 LLM 总延迟外推为 memory latency。</td>
+                <td>用 monotonic clock 在 embedding、FTS、vector、filter、spread、dedup、metadata、total 各阶段打点；保存 request_id、success/degraded、top_k、collection 数。</td>
+              </tr>
+              <tr>
+                <td><b>错误率 / 降级率</b></td>
+                <td>多个地方 catch exception 后返回空列表/空 dict。</td>
+                <td>调用方可能把“向量服务失败”与“没有命中”混为一谈，日志无法聚合成率。</td>
+                <td>返回结构化状态：<code>ok</code> / <code>degraded</code> / <code>failed</code>，并统计 embedding、Chroma、SQLite、reconcile 各类错误。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="two-col" style="margin-top:14px">
+          <div class="panel">
+            <h3>当前不能声称的结论</h3>
+            <div class="tag-list">
+              <span class="tag p1">不能声称高 precision</span>
+              <span class="tag p1">不能声称高 recall</span>
+              <span class="tag p1">不能声称低 latency</span>
+              <span class="tag p2">不能声称过滤无漏</span>
+              <span class="tag p2">不能声称降级透明</span>
+            </div>
+          </div>
+          <div class="panel">
+            <h3>可暂时声称的结论</h3>
+            <div class="tag-list">
+              <span class="tag ok">源码存在两路检索算法</span>
+              <span class="tag ok">局部测试覆盖若干契约</span>
+              <span class="tag ok">本地数据可被只读核对</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="report-section" id="issues">
+        <div class="section-head">
+          <div>
+            <span class="section-index">07</span>
+            <h2>按严重度的问题清单</h2>
+          </div>
+          <p>P0 表示当前生产门禁/数据可信度阻断；P1 表示应在生产化前修复；P2 表示重要的质量、性能或可维护性改进。</p>
+        </div>
+        <div class="filter-box">
+          <label for="issue-filter">筛选问题：</label>
+          <input id="issue-filter" type="search" placeholder="输入关键词、路径或严重度">
+        </div>
+        <div class="finding-list" id="issues-list">
+          <article class="finding" id="issue-p0" data-search="P0 生产级 质量门禁 precision recall latency">
+            <div class="finding-head">
+              <div class="finding-title"><span class="severity p0">P0</span><span>没有通过生产级门禁所需的质量与延迟证据</span></div>
+            </div>
+            <p>当前最大问题不是某一个排序公式，而是系统没有证据证明检索质量和服务水平。既没有 qrels，也没有 precision/recall/latency 分布；同时 Life 快照存在明显索引覆盖断层。</p>
+            <dl class="finding-meta">
+              <dt>影响</dt><dd>任何“准确、快、不会漏”的产品承诺都不可验证；故障时无法区分无命中与降级失败。</dd>
+              <dt>源码路径</dt><dd><code>plugins/life_engine/memory/search.py:507-657</code></dd>
+              <dt>修复建议</dt><dd>先设生产门禁：索引健康检查通过、qrels 达到最低 precision/recall、p95 latency 达标、降级率有预算，再讨论上线。</dd>
+              <dt>证据置信度</dt><dd><span class="confidence high">高：源码和快照均支持</span></dd>
+            </dl>
+          </article>
+
+          <article class="finding" id="issues-p1" data-search="P1 Life FTS embedding_synced Chroma 索引一致性 240 no FTS 93 100 7 81 50">
+            <div class="finding-head">
+              <div class="finding-title"><span class="severity p1">P1</span><span>Life Engine 的节点、FTS、synced 标记和 Chroma 没有统一一致性状态</span></div>
+            </div>
+            <p>快照显示 302 节点、62 FTS、93 synced、100 Chroma；240 节点无 FTS。更细的交叉是：81 个 synced 节点没有 FTS，50 个 FTS 节点没有 synced 标记，7 个节点有向量但 synced=0。节点更新时会把 synced 置 0，但不会自动把 embedding 同步任务放入可靠队列。</p>
+            <dl class="finding-meta">
+              <dt>源码路径/行号</dt><dd><code>plugins/life_engine/memory/nodes.py:175-200</code>、<code>plugins/life_engine/memory/nodes.py:244-245</code>；<code>plugins/life_engine/memory/search.py:101-154</code>；<code>plugins/life_engine/memory/service.py:508-516</code></dd>
+              <dt>影响</dt><dd>关键词检索、语义检索和状态面板看到的是三个不同子集；更新后的内容可能只在旧 FTS 或旧向量中出现。</dd>
+              <dt>修复建议</dt><dd>引入索引版本/内容 hash 对账；以节点内容 hash 对 FTS 和 vector 建立可重试 outbox；提供全量 reconcile、增量 reconcile 和健康门禁；不要用单个布尔字段表示多索引一致性。</dd>
+              <dt>当前快照证据</dt><dd>Life Chroma vector ID 全部属于现有节点，未发现向量悬空 ID；问题是覆盖与状态语义不完整，而非本次读取发现的 vector-only 脏 ID。</dd>
+            </dl>
+            <details><summary>为什么“93 synced”不能直接当作“93 个可检索节点”</summary><div class="detail-body">字段在节点更新时被重置，在同步成功后被置 1，但没有在本次健康查询中反向读取 Chroma，也没有记录 embedding 模型版本、内容 hash 和同步时间。因此它只能说明某次写路径设置过标志，不能证明当前向量存在且对应当前内容。</div></details>
+          </article>
+
+          <article class="finding" data-search="P1 orphan edge 悬空边 foreign key memory_edges 7314">
+            <div class="finding-head">
+              <div class="finding-title"><span class="severity p1">P1</span><span>Life 图谱存在悬空边端点，扩散路径会静默丢失</span></div>
+            </div>
+            <p>读取 <code>memory_edges</code> 后发现源端引用缺失 17 条、目标端引用缺失 17 条；去重后各 3 个缺失 ID，2 条边两端都缺失。服务初始化确实打开了 SQLite foreign keys，但现有库仍保留悬空引用，说明历史数据、迁移或旁路写入没有被健康门禁覆盖。</p>
+            <dl class="finding-meta">
+              <dt>源码路径/行号</dt><dd><code>plugins/life_engine/memory/service.py:171-228</code>；<code>plugins/life_engine/memory/search.py:331-368</code>；<code>plugins/life_engine/memory/router.py:140-165</code></dd>
+              <dt>影响</dt><dd>图扩散把缺失节点加入 visited/activation 后，结果构建阶段因 node 不存在被过滤；用户只看到较少的 associated 结果，且没有一致性告警。</dd>
+              <dt>修复建议</dt><dd>上线前执行一次只读 <code>PRAGMA foreign_key_check</code> 和 edge orphan 扫描；修复/隔离脏边；所有 migration 用事务；新增后台健康指标和“可解释降级”计数。</dd>
+              <dt>证据置信度</dt><dd><span class="confidence high">高：直接 SQL 计数</span></dd>
+            </dl>
+          </article>
+
+          <article class="finding" data-search="P1 Life search 并行 sequential latency fts vector asyncio gather">
+            <div class="finding-head">
+              <div class="finding-title"><span class="severity p1">P1</span><span>Life 的 FTS 与向量检索实际串行，注释与实现不一致</span></div>
+            </div>
+            <p><code>search_memory</code> 的注释写“并行执行关键词和语义检索”，但 <code>fts_search</code> 在 547 行 await 完成后，才在 552 行调用向量检索。embedding 请求、Chroma query 和 FTS 查询的等待时间被直接相加。</p>
+            <dl class="finding-meta">
+              <dt>源码路径/行号</dt><dd><code>plugins/life_engine/memory/search.py:546-555</code></dd>
+              <dt>影响</dt><dd>端到端 latency 上限明显高于必要值；任一路慢都会拖住另一路；当前没有 telemetry 证明实际影响大小。</dd>
+              <dt>修复建议</dt><dd>在资源隔离、超时和错误状态设计完成后使用 <code>asyncio.gather</code> 并发；分别记录 fts/vector/embedding 的耗时和 degraded 状态，避免一个异常掩盖另一个结果。</dd>
+              <dt>置信度</dt><dd><span class="confidence high">高：静态路径确定</span></dd>
+            </dl>
+          </article>
+
+          <article class="finding" data-search="P1 Chroma exception swallowed vector add query metadata consistency partial write">
+            <div class="finding-head">
+              <div class="finding-title"><span class="severity p1">P1</span><span>Chroma 适配层吞异常，跨向量/元数据写入没有可靠一致性边界</span></div>
+            </div>
+            <p><code>ChromaDBImpl.add/query/get/delete/count</code> 多处 catch broad exception 后记录日志并返回 None、空字典或 0。Life 的 vector_search 失败则直接返回空列表。这样的降级若没有结构化状态，会把索引失败伪装成合法的“无结果”。</p>
+            <dl class="finding-meta">
+              <dt>源码路径/行号</dt><dd><code>src/kernel/vector_db/chromadb_impl.py:111-184</code>、<code>src/kernel/vector_db/chromadb_impl.py:240-323</code>；<code>plugins/life_engine/memory/search.py:173-207</code></dd>
+              <dt>影响</dt><dd>元数据可能显示写入成功但向量不存在；检索调用方无法区分空库、服务失败和真实零命中。</dd>
+              <dt>修复建议</dt><dd>适配层返回显式 Result/异常分类；写入采用 pending→vector committed→metadata committed 的 outbox 或补偿状态；query 结果带 degraded/error 字段；失败注入必须验证不会报告成功。</dd>
+              <dt>置信度</dt><dd><span class="confidence high">高：源码确定</span></dd>
+            </dl>
+          </article>
+
+          <article class="finding" id="issues-p2" data-search="P2 FTS BM25 normalize phrase query relevance scoring file_types time filter">
+            <div class="finding-head">
+              <div class="finding-title"><span class="severity p2">P2</span><span>FTS 分数和查询语义未校准，过滤匹配过于宽松</span></div>
+            </div>
+            <p>FTS5 BM25 的负值被取绝对值后除以 10 并截断到 1，再与 vector 结果只按 rank 做 RRF；这不是跨检索器校准后的相关性分数。查询整体被双引号包裹，特殊字符安全性较好，但多词查询会倾向精确短语，可能牺牲词项召回。Life 的 file type 过滤用路径 substring/startswith，不是严格 suffix 匹配。</p>
+            <dl class="finding-meta">
+              <dt>源码路径/行号</dt><dd><code>plugins/life_engine/memory/search.py:215-224</code>、<code>plugins/life_engine/memory/search.py:240-258</code>、<code>plugins/life_engine/memory/search.py:456-499</code></dd>
+              <dt>影响</dt><dd>relevance 数值无法解释为概率或跨源可比度；文件类型可能误匹配目录名/任意子串；时间过滤使用 created_at，不一定符合用户理解的更新时间。</dd>
+              <dt>修复建议</dt><dd>用独立评估集校准 BM25/向量融合；分离 exact phrase 与 token query 模式；用 <code>Path.suffix</code> 做类型匹配并明确 created/updated 语义；补组合过滤测试。</dd>
+              <dt>置信度</dt><dd><span class="confidence high">高：实现确定，质量影响需 qrels 量化</span></dd>
+            </dl>
+          </article>
+
+          <article class="finding" data-search="P2 observability telemetry SSE dropped events request id metrics">
+            <div class="finding-head">
+              <div class="finding-title"><span class="severity p2">P2</span><span>可观测性只覆盖“事件/错误”，没有检索健康指标</span></div>
+            </div>
+            <p>Life 有 <code>memory.search.started/seeds/finished</code> 事件，但没有阶段 latency、候选输入/输出、过滤丢弃原因、索引版本、降级次数、结果来源分布或 request_id。Life SSE queue 满时会删除订阅队列，事件丢失没有聚合指标。</p>
+            <dl class="finding-meta">
+              <dt>源码路径/行号</dt><dd><code>plugins/life_engine/memory/search.py:536-655</code>；<code>plugins/life_engine/memory/router.py:37-54</code>；<code>src/kernel/vector_db/chromadb_impl.py:127-184</code></dd>
+              <dt>影响</dt><dd>无法建立 SLO、无法定位慢阶段、无法区分检索质量下降与数据覆盖下降，也无法统计 SSE 观测本身的丢失率。</dd>
+              <dt>修复建议</dt><dd>统一结构化 telemetry schema；记录 query hash（不直接记录敏感正文）、stage durations、counts、status、error class、collection；为 dropped event 计数并采样。</dd>
+              <dt>置信度</dt><dd><span class="confidence high">高：源码缺口清晰</span></dd>
+            </dl>
+          </article>
+        </div>
+      </section>
+
+      <section class="report-section" id="failures">
+        <div class="section-head">
+          <div>
+            <span class="section-index">08</span>
+            <h2>典型失败场景</h2>
+          </div>
+          <p>这些场景把静态问题翻译成调用方可以观察到的行为；其中部分需要故障注入测试确认具体恢复路径。</p>
+        </div>
+        <div class="table-wrap">
+          <table class="issue-table">
+            <thead><tr><th>场景</th><th>触发链路</th><th>用户/系统表现</th><th>应有信号</th><th>当前状态</th></tr></thead>
+            <tbody>
+              <tr>
+                <td class="issue-id">F-01</td>
+                <td>创建节点时传入空 content，未调用 FTS 更新与 embedding 同步。</td>
+                <td>节点存在，但关键词和语义检索都可能找不到；图谱统计仍把它算作完整节点。</td>
+                <td>node_index_state=pending；健康页显示 FTS/vector 缺失原因。</td>
+                <td><span class="danger-text">当前可发生</span></td>
+              </tr>
+              <tr>
+                <td class="issue-id">F-02</td>
+                <td>文件内容更新，FTS 更新后 embedding_synced 被重置为 0；后续同步任务失败或未触发。</td>
+                <td>FTS 可能返回新文本，向量返回旧文本或无结果；状态页只显示一个布尔值。</td>
+                <td>content_hash、index_version、last_sync_error 和可重试队列。</td>
+                <td><span class="danger-text">快照已显示状态分裂</span></td>
+              </tr>
+              <tr>
+                <td class="issue-id">F-03</td>
+                <td>Chroma query/add 抛异常，被适配层 catch 后返回空/None。</td>
+                <td>调用方把 vector failure 当作零命中或继续写 metadata，质量下降但请求可能报告成功。</td>
+                <td>degraded=true、error_class=vector_backend、计数和告警。</td>
+                <td><span class="danger-text">当前可发生</span></td>
+              </tr>
+              <tr>
+                <td class="issue-id">F-04</td>
+                <td>Life spread 遍历悬空边，随后 get_node_by_id 得不到节点。</td>
+                <td>associated 结果比预期少，没有错误；用户以为没有关联。</td>
+                <td>orphan_edge_count、dropped_association_count、repair job。</td>
+                <td><span class="danger-text">快照已证实脏边</span></td>
+              </tr>
+              <tr>
+                <td class="issue-id">F-05</td>
+                <td>查询包含多词短语、文件类型和时间范围，FTS 采用整句 quoted MATCH、类型采用 substring。</td>
+                <td>词项召回不足或文件类型误匹配；没有 qrels 无法知道漏了多少。</td>
+                <td>query_mode、filter_reason、每个过滤阶段的 dropped count。</td>
+                <td><span class="amber-text">质量风险未量化</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="report-section" id="testing">
+        <div class="section-head">
+          <div>
+            <span class="section-index">09</span>
+            <h2>测试与 telemetry 缺口</h2>
+          </div>
+          <p>现有测试证明局部代码契约，但还没有形成“数据健康→检索质量→延迟→故障恢复”的完整保障链。</p>
+        </div>
+        <div class="two-col">
+          <article class="panel">
+            <h3>现有测试能证明什么</h3>
+            <ul>
+              <li><code>test/plugins/life_engine/test_memory_service.py</code>：Chroma collection 缓存、workspace override、文件迁移保留 edge/FTS。</li>
+              <li><code>test/plugins/life_engine/test_memory_lineage_harness.py</code>：旧路径到当前文件的 lineage resolution、correction 和 memory bundle。</li>
+            </ul>
+            <p class="footnote">这些文件在本次审查中被读取用于判断覆盖面；本次任务只执行 HTML 基本校验，没有把 pytest 结果冒充为本报告的运行证据。</p>
+          </article>
+          <article class="panel">
+            <h3>缺失的关键测试</h3>
+            <ul>
+              <li>对真实快照执行 node↔FTS↔vector、edge orphan、metadata↔vector、tag orphan/duplicate 的健康检查。</li>
+              <li>端到端检索测试：真实/仿真 embedding、FTS、Chroma、filter、spread、dedup 全链路。</li>
+              <li>带 qrels 的 precision@k、recall@k、MRR/nDCG 评估；覆盖 direct/associated、历史路径和组合过滤。</li>
+              <li>latency 基准和并发测试：冷启动、缓存命中、embedding 慢、Chroma 慢。</li>
+              <li>失败注入：vector add/query/get 失败、embedding 为空、metadata 写失败、进程在双写中断和迁移中断。</li>
+              <li>过滤矩阵：file type 严格后缀、created/updated 时间、空 query、FTS 特殊字符。</li>
+            </ul>
+          </article>
+        </div>
+        <article class="panel" style="margin-top:14px">
+          <h3>telemetry 最小字段建议</h3>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr><th>字段</th><th>用途</th><th>示例</th></tr></thead>
+              <tbody>
+                <tr><td><code>request_id</code></td><td>串起 embedding、检索、过滤、结果和错误</td><td><code>memq-20260720-...</code></td></tr>
+                <tr><td><code>query_hash</code></td><td>不记录敏感原文而能做聚合</td><td>稳定 hash，不把正文打入日志</td></tr>
+                <tr><td><code>stage_ms</code></td><td>分阶段 latency 和 p95 定位</td><td><code>embed=..., fts=..., vector=..., total=...</code></td></tr>
+                <tr><td><code>candidate_counts</code></td><td>识别覆盖、过滤和去重损失</td><td><code>fts=20, vector=20, fused=31, final=5</code></td></tr>
+                <tr><td><code>index_state</code></td><td>说明结果是否来自完整或降级索引</td><td><code>ok / fts_only / vector_only / degraded</code></td></tr>
+                <tr><td><code>filter_drops</code></td><td>解释为什么候选没有进入结果</td><td><code>deleted=2, type=1, time=4, missing_node=1</code></td></tr>
+                <tr><td><code>backend_error</code></td><td>把空结果与 backend failure 分开</td><td><code>embedding_timeout / chroma_query_error</code></td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section class="report-section" id="roadmap">
+        <div class="section-head">
+          <div>
+            <span class="section-index">10</span>
+            <h2>分阶段修复路线</h2>
+          </div>
+          <p>先恢复数据可信度，再优化效率和质量；每阶段都有可验收的退出条件。</p>
+        </div>
+        <div class="roadmap">
+          <article class="roadmap-step">
+            <div class="phase">PHASE 0 · 立即</div>
+            <h3>健康门禁与止损</h3>
+            <ul>
+              <li>新增只读 health audit：节点/FTS/vector、edge orphan、metadata/vector、tag orphan。</li>
+              <li>把 vector backend 的空返回标为 degraded，不再静默等价于零命中。</li>
+              <li>冻结“生产级/足够好”结论；记录当前快照作为 baseline。</li>
+            </ul>
+            <p><b>退出条件：</b>每次启动或定时任务都能产生健康状态和告警。</p>
+          </article>
+          <article class="roadmap-step">
+            <div class="phase">PHASE 1 · 正确性</div>
+            <h3>索引和存储一致性</h3>
+            <ul>
+              <li>按 content hash/index version 重建 FTS 和 embedding 同步状态。</li>
+              <li>修复/隔离 Life 17/17 悬空端点；为迁移和新增边加事务与 FK 检查。</li>
+              <li>明确向量软删除策略，排除 deleted vector，禁止错误恢复。</li>
+              <li>双写引入 outbox、补偿重试或明确 pending 状态。</li>
+            </ul>
+            <p><b>退出条件：</b>全量 reconcile 后差集为零；故障注入不会报告假成功。</p>
+          </article>
+          <article class="roadmap-step">
+            <div class="phase">PHASE 2 · 效率</div>
+            <h3>并行化与批量化</h3>
+            <ul>
+              <li>Life FTS/vector 受控 gather，过滤和结果构建使用批量 SQL。</li>
+              <li>降低重复 count/query 触点，直接处理空结果。</li>
+              <li>批量状态更新，移除不必要的 N+1。</li>
+            </ul>
+            <p><b>退出条件：</b>在固定数据集和并发条件下 p95 有可重复改善。</p>
+          </article>
+          <article class="roadmap-step">
+            <div class="phase">PHASE 3 · 质量与上线</div>
+            <h3>评测闭环与生产门</h3>
+            <ul>
+              <li>建立至少 30 个代表性 query、qrels 和 filter 期望集合。</li>
+              <li>固定 precision/recall/MRR/nDCG、p50/p95/p99、降级率和索引覆盖率。</li>
+              <li>对 direct/associated、Life 检索路径和历史迁移分层报告。</li>
+              <li>设置回归阈值、报警阈值、重建 runbook 和回滚开关。</li>
+            </ul>
+            <p><b>退出条件：</b>质量和延迟达到预先约定门槛，且失败可见、可恢复、可复盘。</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="report-section" id="method">
+        <div class="section-head">
+          <div>
+            <span class="section-index">11</span>
+            <h2>方法与限制</h2>
+          </div>
+          <p>审计结论严格区分“直接读取”“源码推导”和“尚未观测”。</p>
+        </div>
+        <div class="two-col">
+          <article class="panel">
+            <h3>方法</h3>
+            <ol>
+              <li>读取现有报告约定与 <code>plugins/life_engine/static/memory_dashboard.html</code>，只借鉴信息组织，不复制其 CDN 依赖。</li>
+              <li>审查 Life Engine 的 <code>service.py</code>、<code>search.py</code>、<code>nodes.py</code>、<code>edges.py</code>、<code>decay.py</code>、<code>router.py</code> 和工具入口。</li>
+              <li>对 <code>data/life_engine_workspace/.memory/memory.db</code> 和 Life Chroma 进行 read-only SQLite 查询。</li>
+              <li>对节点/向量 ID 差集、FTS 重复和边端点进行交叉核对。</li>
+              <li>以源码当前行号引用问题；分数和严重度由工程风险、影响面和证据强度综合判断。</li>
+            </ol>
+          </article>
+          <article class="panel">
+            <h3>限制</h3>
+            <ul>
+              <li>没有发起网络请求、embedding 请求或线上检索请求；因此没有 runtime latency，也没有真实服务错误率。</li>
+              <li>没有 qrels、人工相关性标注、完整相关集合，不能计算 precision/recall；源码中的 score/relevance 不能充当真值。</li>
+              <li>SQLite/Chroma 是某一时间点快照；即使使用 read-only URI，也不能代表所有并发写入时序和历史故障。</li>
+              <li>本次没有执行 pytest；读取测试文件用于覆盖面审查，不把已有测试内容表述为本轮通过结果。</li>
+              <li>部分风险是从控制流推导，需要专门故障注入来确认具体复现。</li>
+              <li>工作区在审查开始时已有其他未提交改动；本任务只新增本 HTML，不回滚或修改其他文件。</li>
+            </ul>
+          </article>
+        </div>
+        <div class="callout" style="margin-top:14px"><strong>阅读规则：</strong>“已观测”表示本地数据直接计数；“源码确定”表示控制流无需运行即可确认；“质量风险未量化”表示可能影响 precision/recall，但必须用 qrels 才能给出数值。</div>
+      </section>
+
+      <section class="report-section" id="appendix">
+        <div class="section-head">
+          <div>
+            <span class="section-index">12</span>
+            <h2>附录</h2>
+          </div>
+          <p>保留数据字典、查询证据、配置基线和源码索引，便于后续复审。</p>
+        </div>
+
+        <details open>
+          <summary>A. 数据路径与只读核对对象</summary>
+          <div class="detail-body">
+            <div class="source-grid">
+              <div class="source-card"><strong>Life metadata</strong><p><code>data/life_engine_workspace/.memory/memory.db</code><br>对象：<code>memory_nodes</code>、<code>memory_edges</code>、<code>memory_fts</code>、<code>memory_corrections</code></p></div>
+              <div class="source-card"><strong>Life vector</strong><p><code>data/life_engine_workspace/.memory/chroma/chroma.sqlite3</code><br>collection：<code>life_memory</code>，dimension 1024，embedding rows 100</p></div>
+              <div class="source-card"><strong>冷备份 metadata</strong><p><code>data/booku_memory/metadata.db</code><br>仅作离线冷备份保留，不属于当前运行时依赖</p></div>
+              <div class="source-card"><strong>冷备份 vector</strong><p><code>data/chroma_db/booku_memory/chroma.sqlite3</code><br>仅作离线冷备份保留，不属于当前运行时依赖</p></div>
+            </div>
+            <pre>.venv/bin/python3 只读查询摘要
+Life: nodes=302, fts=62, embedding_synced(1)=93, edges=7314, chroma_embeddings=100
+Life: node_no_fts=240, source_orphan_refs=17, target_orphan_refs=17
+冷备份目录：data/booku_memory、data/chroma_db/booku_memory
+说明：冷备份仅保留，不参与当前运行时查询。</pre>
+          </div>
+        </details>
+
+        <details>
+          <summary>B. 评分使用的关键比例</summary>
+          <div class="detail-body">
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead><tr><th>比例</th><th>计算</th><th>解释</th></tr></thead>
+                <tbody>
+                  <tr><td>Life FTS coverage</td><td>62 / 302 = 20.53%</td><td>只有有 FTS 行的节点可以走关键词检索。</td></tr>
+                  <tr><td>Life vector coverage</td><td>100 / 302 = 33.11%</td><td>Chroma 中有 embedding ID 的节点数量占比。</td></tr>
+                  <tr><td>Life synced flag</td><td>93 / 302 = 30.79%</td><td>数据库布尔字段，不等于 vector 事实。</td></tr>
+                  <tr><td>Life FTS∩synced</td><td>12 / 302 = 3.97%</td><td>当前同时具备 FTS 行且标记 synced 的节点。</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </details>
+
+        <details>
+          <summary>C. 算法和配置基线</summary>
+          <div class="detail-body">
+            <div class="two-col">
+              <div>
+                <h4>Life Engine</h4>
+                <ul>
+                  <li><code>RRF_K=60</code></li>
+                  <li><code>SPREAD_DECAY=0.7</code></li>
+                  <li><code>SPREAD_THRESHOLD=0.3</code></li>
+                  <li>默认 search top_k=5；FTS/vector 查询上限为 <code>top_k*2</code></li>
+                  <li>activation spread 默认 max_depth=2、max_results=10</li>
+                </ul>
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <details>
+          <summary>D. 源码索引：复审优先阅读位置</summary>
+          <div class="detail-body">
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead><tr><th>主题</th><th>路径与行号</th><th>本报告用途</th></tr></thead>
+                <tbody>
+                  <tr><td>Life 表结构/索引</td><td><code>plugins/life_engine/memory/service.py:182-285</code></td><td>nodes、edges、FTS5、索引和 FK 定义。</td></tr>
+                  <tr><td>Life 节点/FTS 更新</td><td><code>plugins/life_engine/memory/nodes.py:126-263</code>、<code>:574-645</code></td><td>节点创建、content hash、FTS 写入、access 和 synced 交界。</td></tr>
+                  <tr><td>Life 检索主链</td><td><code>plugins/life_engine/memory/search.py:156-296</code>、<code>:304-368</code>、<code>:456-657</code></td><td>vector、FTS、RRF、spread、filter 和 side effects。</td></tr>
+                  <tr><td>Life API/观测</td><td><code>plugins/life_engine/memory/router.py:37-54</code>、<code>:184-294</code></td><td>SSE、stats、graph、search 路由。</td></tr>
+                  <tr><td>Chroma backend</td><td><code>src/kernel/vector_db/chromadb_impl.py:111-354</code></td><td>异常吞掉、空返回、count/query/get/delete 行为。</td></tr>
+                  <tr><td>局部测试</td><td><code>test/plugins/life_engine/test_memory_service.py</code></td><td>现有局部保障和缺口边界。</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </details>
+
+        <details>
+          <summary>E. 最终复审清单</summary>
+          <div class="detail-body">
+            <ul>
+              <li>健康脚本：Life 302 节点与三类索引是否可对账。</li>
+              <li>一致性：所有写入、更新、移动、删除、路径迁移是否具备可重试状态和补偿记录。</li>
+              <li>质量：每个代表性 query 是否有完整相关集合和过滤后的期望结果。</li>
+              <li>性能：冷/热缓存、embedding、SQLite、Chroma、扩散和多 collection 的 p50/p95/p99。</li>
+              <li>降级：backend error 是否被调用方看见，是否与零命中严格区分。</li>
+              <li>上线：失败注入、数据恢复、重建索引和回滚 runbook 是否被自动化测试。</li>
+            </ul>
+          </div>
+        </details>
+      </section>
+    </main>
+  </div>
+
+  <footer>
+    <div><b>Neo-MoFox 记忆检索健康度审计</b> · 单文件离线报告 · 无外部 CDN、字体、图片或网络请求。</div>
+    <div style="margin-top:5px">本报告只新增于 <code>reports/memory_query_health_audit.html</code>；结论应随 reconcile、qrels 和 telemetry 补齐后重新审查。</div>
+  </footer>
+
+  <script>
+    (function () {
+      const details = Array.from(document.querySelectorAll('details'));
+      const expand = document.getElementById('expand-all');
+      const collapse = document.getElementById('collapse-all');
+      const print = document.getElementById('print-report');
+      const filter = document.getElementById('issue-filter');
+      const issues = Array.from(document.querySelectorAll('#issues-list .finding'));
+      const navLinks = Array.from(document.querySelectorAll('.toc a'));
+      const sections = navLinks
+        .map(function (link) { return document.querySelector(link.getAttribute('href')); })
+        .filter(Boolean);
+
+      expand.addEventListener('click', function () {
+        details.forEach(function (item) { item.open = true; });
+      });
+      collapse.addEventListener('click', function () {
+        details.forEach(function (item) { item.open = false; });
+      });
+      print.addEventListener('click', function () { window.print(); });
+      filter.addEventListener('input', function (event) {
+        const query = String(event.target.value || '').trim().toLowerCase();
+        issues.forEach(function (issue) {
+          const matches = !query || issue.textContent.toLowerCase().indexOf(query) >= 0 || String(issue.dataset.search || '').toLowerCase().indexOf(query) >= 0;
+          issue.classList.toggle('hidden', !matches);
+        });
+      });
+
+      if ('IntersectionObserver' in window) {
+        const observer = new IntersectionObserver(function (entries) {
+          entries.forEach(function (entry) {
+            if (!entry.isIntersecting) return;
+            navLinks.forEach(function (link) {
+              link.classList.toggle('active', link.getAttribute('href') === '#' + entry.target.id);
+            });
+          });
+        }, { rootMargin: '-18% 0px -72% 0px', threshold: 0 });
+        sections.forEach(function (section) { observer.observe(section); });
+      }
+    }());
+  </script>
+</body>
+</html>

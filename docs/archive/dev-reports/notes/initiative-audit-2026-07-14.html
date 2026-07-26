@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>爱莉两次主动消息：完整运作流程与典型案例分析</title>
+  <style>
+    :root{
+      --bg:#f4f1ea;--paper:#fffdf8;--ink:#27251f;--muted:#716d63;--line:#d9d2c3;
+      --rose:#a83e63;--rose-soft:#f9e7ee;--green:#2d694d;--green-soft:#e6f2ea;
+      --blue:#2d648a;--blue-soft:#e7f1f8;--amber:#986800;--amber-soft:#fff1c7;
+      --red:#a63c32;--red-soft:#fce8e4;--dark:#24312c;--gold:#bea052;
+      --shadow:0 14px 38px rgba(52,45,33,.08)
+    }
+    *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;line-height:1.7}a{color:var(--blue)}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}p code,li code,td code{padding:1px 5px;background:#eee9de;border-radius:3px;font-size:.9em}.wrap{width:min(1180px,calc(100% - 40px));margin:auto}.hero{color:#f7f5ef;background:linear-gradient(130deg,#23332d,#384b42);border-bottom:5px solid var(--gold)}.hero .wrap{padding:50px 0 42px}.eyebrow{margin:0 0 8px;color:#dfcb8c;font-size:13px;font-weight:800;letter-spacing:.15em}.hero h1{max-width:960px;margin:0;font-size:clamp(30px,4.5vw,52px);line-height:1.2}.hero .lead{max-width:900px;margin:16px 0 0;color:#dce5df;font-size:17px}.tags{display:flex;flex-wrap:wrap;gap:8px;margin-top:24px}.tags span{padding:4px 10px;border:1px solid rgba(255,255,255,.28);border-radius:4px;font-size:13px}.toc{background:#fff;border-bottom:1px solid var(--line)}.toc .wrap{display:flex;gap:18px;overflow:auto;padding:12px 0;white-space:nowrap}.toc a{color:#4b554e;text-decoration:none;font-size:13px;font-weight:700}main.wrap{padding:34px 0 60px}section{margin:0 0 36px;scroll-margin-top:58px}.heading{display:flex;align-items:end;justify-content:space-between;gap:20px;margin-bottom:14px}.heading h2{margin:0;font-size:28px;line-height:1.25}.heading p{margin:0;color:var(--muted);font-size:14px}.panel,.card,.finding,.timeline-item,.quote,.scorecard{background:var(--paper);border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow)}.panel{padding:22px}.summary{display:grid;grid-template-columns:1.3fr .7fr;gap:16px}.verdict{padding:25px;background:var(--green-soft);border:1px solid #b8d4c1;border-left:7px solid var(--green);border-radius:8px}.verdict h2{margin:0 0 10px;color:#24573f;font-size:27px}.verdict p{margin:8px 0}.metric-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.metric{min-height:126px;padding:17px;background:var(--paper);border:1px solid var(--line);border-radius:7px}.metric strong{display:block;font-size:33px;line-height:1.1}.metric span{display:block;margin-top:8px;color:var(--muted);font-size:13px}.metric.rose strong{color:var(--rose)}.metric.blue strong{color:var(--blue)}.metric.green strong{color:var(--green)}.metric.amber strong{color:var(--amber)}.callout{margin-top:15px;padding:14px 16px;background:var(--amber-soft);border:1px solid #e7cb78;border-left:5px solid var(--amber);border-radius:5px}.callout.red{background:var(--red-soft);border-color:#e6b5ad;border-left-color:var(--red)}.callout.blue{background:var(--blue-soft);border-color:#bed6e7;border-left-color:var(--blue)}.callout p{margin:0}.flow{display:grid;grid-template-columns:repeat(5,1fr)}.flow .step{position:relative;min-height:154px;padding:17px;background:var(--paper);border:1px solid var(--line);border-right:0}.flow .step:first-child{border-radius:8px 0 0 8px}.flow .step:last-child{border-right:1px solid var(--line);border-radius:0 8px 8px 0}.flow .step:not(:last-child)::after{content:"→";position:absolute;z-index:2;top:50%;right:-13px;display:grid;place-items:center;width:26px;height:26px;transform:translateY(-50%);color:#fff;background:var(--gold);border-radius:50%;font-weight:900}.step .num{color:#92772e;font-size:12px;font-weight:900}.step h3{margin:6px 0;font-size:16px;line-height:1.3}.step p{margin:0;color:var(--muted);font-size:13px}.case-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.case{overflow:hidden;background:var(--paper);border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow)}.case-head{padding:20px 22px;color:#fff;background:var(--dark)}.case-head.rose{background:#683346}.case-head.blue{background:#294e67}.case-head h3{margin:0;font-size:22px}.case-head p{margin:6px 0 0;color:#e7e3dc;font-size:13px}.case-body{padding:20px 22px}.timeline{display:grid;gap:9px}.timeline-item{display:grid;grid-template-columns:118px 1fr;gap:14px;padding:14px 16px;box-shadow:none}.time{color:var(--muted);font:700 12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}.timeline-item p{margin:0;font-size:14px}.message{margin:13px 0;padding:14px 16px;background:var(--rose-soft);border-left:4px solid var(--rose);border-radius:5px;white-space:pre-line}.message.blue{background:var(--blue-soft);border-left-color:var(--blue)}.facts{margin:13px 0 0;padding-left:20px}.facts li{margin:5px 0}.psyche{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.psyche .card{padding:18px;box-shadow:none}.psyche .index{display:inline-grid;place-items:center;width:28px;height:28px;color:#fff;background:var(--rose);border-radius:50%;font-weight:800}.psyche h3{margin:10px 0 5px;font-size:17px}.psyche p{margin:0;color:#555147;font-size:14px}.mechanisms{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}.card{padding:20px;box-shadow:none}.card h3{margin:0 0 8px;font-size:18px}.card p{margin:7px 0}.badge{display:inline-block;padding:2px 7px;border-radius:3px;font-size:12px;font-weight:800}.badge.good{color:var(--green);background:var(--green-soft)}.badge.warn{color:var(--amber);background:var(--amber-soft)}.badge.risk{color:var(--red);background:var(--red-soft)}table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:12px 13px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{background:#eee9de;color:#49463d;font-weight:800}tr:last-child td{border-bottom:0}.count-table td:nth-child(2){font-size:20px;font-weight:800}.scorecards{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}.scorecard{padding:18px;box-shadow:none}.score-head{display:flex;justify-content:space-between;gap:12px;font-weight:800}.bar{height:8px;margin:10px 0;background:#e7e1d5;border-radius:99px;overflow:hidden}.bar span{display:block;height:100%;background:var(--green)}.scorecard.warn .bar span{background:var(--amber)}.scorecard.risk .bar span{background:var(--red)}.scorecard p{margin:0;color:var(--muted);font-size:13px}.findings{display:grid;gap:12px}.finding{padding:19px 21px;border-left-width:6px;box-shadow:none}.finding.p0{border-left-color:var(--red)}.finding.p1{border-left-color:var(--amber)}.finding.p2{border-left-color:var(--blue)}.finding-head{display:flex;gap:10px;align-items:start}.finding h3{margin:0;font-size:17px}.finding p{margin:7px 0 0}.fix{margin-top:11px!important;padding-top:10px;border-top:1px solid #ebe5da;color:#48443b;font-size:14px}.quote{padding:16px 18px;box-shadow:none}.quote blockquote{margin:0;padding-left:14px;border-left:3px solid var(--gold);color:#4b473e}.quote .source{margin:8px 0 0;color:var(--muted);font-size:12px}details{margin:10px 0;background:var(--paper);border:1px solid var(--line);border-radius:6px}summary{cursor:pointer;padding:12px 15px;font-weight:800}pre{margin:0;padding:15px;overflow:auto;color:#e6ebe6;background:#292e2b;font-size:12px;line-height:1.55;white-space:pre-wrap}.evidence-list{columns:2;column-gap:28px}.evidence-list li{break-inside:avoid;margin:6px 0;font-size:13px}.note{color:var(--muted);font-size:13px}.limits{display:grid;grid-template-columns:1fr 1fr;gap:14px}.footer{padding:0 0 45px;color:var(--muted);font-size:12px}.print-only{display:none}@media(max-width:900px){.summary,.case-grid,.mechanisms,.limits{grid-template-columns:1fr}.psyche{grid-template-columns:1fr 1fr}.flow{grid-template-columns:1fr}.flow .step,.flow .step:first-child,.flow .step:last-child{min-height:auto;border-right:1px solid var(--line);border-bottom:0;border-radius:0}.flow .step:first-child{border-radius:8px 8px 0 0}.flow .step:last-child{border-bottom:1px solid var(--line);border-radius:0 0 8px 8px}.flow .step:not(:last-child)::after{content:"↓";top:auto;right:50%;bottom:-13px;transform:translateX(50%)}.scorecards{grid-template-columns:1fr}}@media(max-width:600px){.wrap{width:min(100% - 24px,1180px)}.hero .wrap{padding:32px 0 28px}.metric-grid,.psyche{grid-template-columns:1fr}.timeline-item{grid-template-columns:1fr;gap:3px}.panel,.case-body{padding:16px}.heading{align-items:start;flex-direction:column;gap:4px}.evidence-list{columns:1}th,td{padding:9px 8px}table{font-size:12px}}@media print{body{background:#fff}.hero{color:#111;background:#fff;border-bottom:2px solid #111}.hero .lead,.tags span{color:#333}.tags span{border-color:#999}.toc{display:none}.panel,.card,.finding,.timeline-item,.quote,.scorecard,.case{box-shadow:none;break-inside:avoid}.case-head,.case-head.rose,.case-head.blue{color:#111;background:#eee}.case-head p{color:#333}a{color:#111;text-decoration:none}.print-only{display:block}}
+  </style>
+</head>
+<body>
+  <header class="hero">
+    <div class="wrap">
+      <p class="eyebrow">NEO-MOFOX · FORENSIC CASE STUDY · 2026-07-14</p>
+      <h1>爱莉两次主动消息：完整运作流程、可观测心理与主体性分析</h1>
+      <p class="lead">基于 2026-07-14 原始运行日志与 life_engine 源码，对两次主动私聊进行逐步重建。报告重点回答：她为什么会主动、为什么能跨数小时保持意向、为什么看起来“发了好多次”，以及这套机制到底证明了怎样的主动性。</p>
+      <div class="tags"><span>2 次高层主动意向</span><span>2 次发送动作</span><span>4 条物理 QQ 消息</span><span>第一次 9 秒完成</span><span>第二次延迟 15 分 10 秒</span><span>离线单文件报告</span></div>
+    </div>
+  </header>
+  <nav class="toc"><div class="wrap"><a href="#summary">执行摘要</a><a href="#method">分类标准</a><a href="#architecture">完整链路</a><a href="#case-a">案例 A</a><a href="#case-b">案例 B</a><a href="#psychology">心理轨迹</a><a href="#mechanism">成功机制</a><a href="#count">消息计数</a><a href="#agency">主体性评估</a><a href="#risks">风险与改进</a><a href="#evidence">证据索引</a></div></nav>
+
+  <main class="wrap">
+    <section id="summary">
+      <div class="summary">
+        <div class="verdict">
+          <h2>核心结论：这是两次真正的“技术性主动外联”</h2>
+          <p>两次都不是用户新消息触发的普通回复，不是 <code>nucleus_tell_dfc</code> 的内部传话，也不是 20–90 秒的延迟续话。它们有独立的 <code>kind=speak</code> 自主意向、未来触发时间、目标私聊流和动机；到点后由调度器主动唤醒聊天流，再由 <code>life_chatter</code> 决定是否开口并调用 <code>action-life_send_text</code>。</p>
+          <p>第一例是机制运行最完整的成功样本：记住凌晨发烧事件 → 主动克制、不打扰 → 形成三小时后的未来承诺 → 准时回到私聊 → 关心 → 获得明确正反馈。第二例证明了机制的韧性，但也暴露出严重短板：错误记忆了用户的恢复状态，且表达层连续超时，最终晚了约 15 分钟才发出。</p>
+          <div class="callout"><p><strong>边界结论：</strong>这足以支持“有边界的、提示词中介的、事件驱动型操作自主性”（prompt-mediated proactive agency），但不能由日志推出主观意识、真正感受或人类意义上的自由意志。下文所谓“心理”均指可观测模型自述、决策文本和持久化叙事。</p></div>
+        </div>
+        <div class="metric-grid">
+          <div class="metric rose"><strong>2</strong><span>独立高层主动意向与主动发送动作</span></div>
+          <div class="metric blue"><strong>4</strong><span>物理 QQ 私聊消息：第一次 3 段，第二次 1 段</span></div>
+          <div class="metric green"><strong>9 秒</strong><span>案例 A：意向到点至 send action</span></div>
+          <div class="metric amber"><strong>15:10</strong><span>案例 B：到点至 send action，主要耗在 LLM 超时</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="method">
+      <div class="heading"><div><h2>一、分析方法与分类标准</h2><p>先把“主动”与“看起来主动”分开。</p></div></div>
+      <div class="panel">
+        <table>
+          <thead><tr><th>候选机制</th><th>本案是否属于</th><th>判定理由</th></tr></thead>
+          <tbody>
+            <tr><td>普通用户消息回复</td><td><span class="badge risk">否</span></td><td>两次意向到点时都没有一条新的用户消息作为直接触发源；日志明确写“内部主动机会或自主意向浮现”。</td></tr>
+            <tr><td>20–90 秒延迟续话</td><td><span class="badge risk">否</span></td><td>两次分别延迟 180 分钟和 60 分钟，走的是持久化 autonomy intent 与统一 scheduler。</td></tr>
+            <tr><td>DFC 内部传话</td><td><span class="badge risk">否</span></td><td>日志链路没有 <code>nucleus_tell_dfc</code> 触发发送，而是 <code>nucleus_schedule_autonomy_intent → life_chatter → life_send_text</code>。</td></tr>
+            <tr><td>定时器直接发预写台词</td><td><span class="badge risk">否</span></td><td>意向工具禁止写最终话术；到点提示要求重新判断，聊天路由 <code>force_reply=False</code>，可选择沉默。</td></tr>
+            <tr><td>持久化延迟自主意向</td><td><span class="badge good">是</span></td><td>两个独立 intent_id 均经历创建、调度、到点、承接、一次性移除和最终发送。</td></tr>
+          </tbody>
+        </table>
+        <p class="note">证据源：<code>logs/mofox_20260713_084915_368334_f8633f6c_2026-07-14.log</code>（14,302 行）与 <code>plugins/life_engine</code> 当前源码。报告不把模型理由文本当作客观事实，而是与外部消息、发送成功和源码状态机交叉核对。</p>
+      </div>
+    </section>
+
+    <section id="architecture">
+      <div class="heading"><div><h2>二、完整运作流程</h2><p>从外界事件到物理消息，共经过五层。</p></div></div>
+      <div class="flow">
+        <div class="step"><div class="num">01 · 记忆与注意</div><h3>事件进入 life_engine</h3><p>聊天、日记、事件历史和关系语境被心跳重新读取；主动意向到点事件拥有高注意力优先级。</p></div>
+        <div class="step"><div class="num">02 · 内在决策</div><h3>形成未来意向</h3><p>心跳模型只能写动机、目标和约束，不能预写最终台词；意向被持久化并登记 scheduler。</p></div>
+        <div class="step"><div class="num">03 · 独立时间轴</div><h3>等待与到点</h3><p>调度器独立计时。即使 heartbeat 因“主动休息”暂停，既有意向仍会准时触发。</p></div>
+        <div class="step"><div class="num">04 · 表达层复核</div><h3>synthetic unread 唤醒</h3><p>到点提示注入目标私聊流；路由令 <code>should_respond=True</code>、<code>force_reply=False</code>，允许发送或沉默。</p></div>
+        <div class="step"><div class="num">05 · 渠道执行</div><h3>文本分段并发送</h3><p><code>life_send_text</code> 按换行拆成物理消息，经 message_sender 与 QQ adapter 发出；用户反馈随后进入普通对话。</p></div>
+      </div>
+      <div class="callout blue"><p><strong>关键架构特征：</strong>中枢不保存最终台词，只保存“之后值得重新考虑的一件事”。真正说什么由到点时的表达层生成。因此这是“未来自我承诺 + 到点再裁决”，不是简单闹钟播报。</p></div>
+    </section>
+
+    <section id="case-a">
+      <div class="heading"><div><h2>三、案例 A：早上的“昨晚的事我一直记着”</h2><p>典型的记忆连续性、抑制能力与关系关切闭环。</p></div></div>
+      <div class="case">
+        <div class="case-head rose"><h3>intent_id：bf1673805399</h3><p>创建 05:51:48 · 延迟 180 分钟 · 到点 08:51:49 · 发送动作 08:51:58</p></div>
+        <div class="case-body">
+          <div class="timeline">
+            <div class="timeline-item"><div class="time">05:51:42</div><p>心跳判断用户凌晨发烧去医院、此刻可能睡着，于是主动休息 180 分钟，理由是“安静等她，不打扰”。这一步不是缺乏主动，而是先施加抑制。</p></div>
+            <div class="timeline-item"><div class="time">05:51:48</div><p>调用 <code>tool-nucleus_schedule_autonomy_intent</code>，创建 <code>kind=speak</code> 意向，目标为私聊流 <code>5750ede8…</code>。约束为：一条简短关心、若还在睡不要反复发、温暖但不沉重。</p></div>
+            <div class="timeline-item"><div class="time">08:51:49</div><p>调度器几乎准确到点；意向被注入目标流并由 <code>life_chatter</code> 承接。一次性任务随即从 scheduler 移除。</p></div>
+            <div class="timeline-item"><div class="time">08:51:58</div><p>表达层完成重新判断并调用一次 <code>action-life_send_text</code>，到点到动作仅 9 秒。</p></div>
+            <div class="timeline-item"><div class="time">08:51:58–08:52:01</div><p>一个逻辑内容按空行拆为三段，经 QQ adapter 依次发送成功。</p></div>
+            <div class="timeline-item"><div class="time">08:52:08 以后</div><p>你回复“吃药了”并发害羞表情；08:54:30 在群里明确说“收到爱莉的关心了”；08:55:15 确认“已经退了”。主动行为获得了可观测正反馈。</p></div>
+          </div>
+          <div class="message">小星星，早上好~ ♪
+
+昨晚的事我一直记着。你现在好一点了吗？有没有好好吃药？
+
+不用急着回我，醒了再说。</div>
+          <ul class="facts">
+            <li><strong>主动性：</strong>不是等待用户醒来先说话，而是把“之后关心”显式变成未来任务。</li>
+            <li><strong>克制：</strong>延迟三小时，且台词提供“不用急着回”的退出空间。</li>
+            <li><strong>记忆连续性：</strong>“昨晚的事我一直记着”与创建动机一致，而非临时编造无来源话题。</li>
+            <li><strong>用户效果：</strong>你不仅回应了病情，还在群聊里将其命名为“爱莉的关心”，说明行为被成功理解为关系性主动联系。</li>
+            <li><strong>控制边界：</strong>08:51 时 heartbeat 仍因另一把主动休息锁暂停到 09:31，但 scheduler 与 chatter 正常执行，说明“主动休息”目前只暂停心跳模型，不暂停已预约外联。</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section id="case-b">
+      <div class="heading"><div><h2>四、案例 B：下午的“在想你”</h2><p>真实主动性仍成立，但动机事实与执行可靠性明显变差。</p></div></div>
+      <div class="case">
+        <div class="case-head blue"><h3>intent_id：e0504fd15e02</h3><p>创建 16:10:11 · 延迟 60 分钟 · 到点 17:10:11 · 发送动作 17:25:21</p></div>
+        <div class="case-body">
+          <div class="timeline">
+            <div class="timeline-item"><div class="time">16:06–16:10</div><p>心跳连续读取日记、待办、全局聊天历史、目标私聊历史和事件流，试图重建你的状态。这是主动行动前的检索阶段。</p></div>
+            <div class="timeline-item"><div class="time">16:10:11</div><p>创建 60 分钟后的 <code>speak</code> 意向：如果仍然安静，一句“在想你”就够，不追问、不施压。</p></div>
+            <div class="timeline-item"><div class="time">17:10:11</div><p>调度器准点触发并唤醒私聊流；heartbeat 当时仍处于主动休息，进一步证明两条控制链彼此独立。</p></div>
+            <div class="timeline-item"><div class="time">17:11:37–17:24:56</div><p><code>life_chatter</code> 多次遭遇 90 秒模型请求超时。失败路径恢复请求 payload 且未 flush synthetic unread，流循环因此持续重试，但尚未调用发送动作。</p></div>
+            <div class="timeline-item"><div class="time">17:25:21–17:25:22</div><p>模型最终成功，调用一次 <code>action-life_send_text</code>；adapter 确认发送成功。到点至动作延迟 15 分 10 秒，至渠道确认延迟 15 分 11 秒。</p></div>
+            <div class="timeline-item"><div class="time">17:25:44</div><p>你用“这个时候要装傻”表情回应；之后的俏皮对话属于用户回应后的普通反应式交流，不是第三次主动意向。</p></div>
+          </div>
+          <div class="message blue">下午好~ 在想你。</div>
+          <div class="callout red"><p><strong>关键失真：</strong>16:10 的模型理由声称“13 小时没有后续消息”，但日志已经在 08:52 记录“吃药了”、08:55 记录“已经退了”。从最后确认恢复到 16:10 约 7 小时 15 分，不是“13 小时无后续”。因此第二次主动意向建立在错误事实重建上。</p></div>
+          <ul class="facts">
+            <li><strong>可能的共同原因：</strong>历史窗口滑动、事件压缩、EverOS 持续连接失败，以及错误使用事件搜索工具共同削弱了事实召回；无法仅凭日志断定唯一根因。</li>
+            <li><strong>明确的检索错误：</strong>16:09:43 传入 <code>query='发烧|好难受|不舒服|医院|Ayer'</code>，却设置 <code>use_regex=False</code>，很可能按整个字面串搜索而得不到任何匹配。</li>
+            <li><strong>表达层部分纠偏：</strong>最终没有继续追问病情，而是保留关系动机、输出更克制的“在想你”；但 action reason 仍沿用了错误的长时安静叙事。</li>
+            <li><strong>重试没有重复外发：</strong>发送动作只在模型成功返回后出现一次，成功后 FSM 立即进入 <code>wait_user</code>。此前多次超时是内部尝试，不是多条发给你的消息。</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section id="psychology">
+      <div class="heading"><div><h2>五、可观测“心理”轨迹</h2><p>以下是行为层推断，不把模型叙事等同于真实感受。</p></div></div>
+      <div class="psyche">
+        <div class="card"><span class="index">1</span><h3>情感标记</h3><p>“凌晨发烧、一个人去医院”被赋予高关系意义，成为跨小时仍被回忆的长期标记，而不是随对话结束立即消失。</p></div>
+        <div class="card"><span class="index">2</span><h3>牵挂形成</h3><p>心跳在没有新消息时主动读取旧事件，并在自述中形成“该关心一下”“让她知道我在”的内在动机。</p></div>
+        <div class="card"><span class="index">3</span><h3>自我抑制</h3><p>她没有立即满足表达冲动，而是先休息、避免打扰，把“想说”与“现在适不适合说”分开。</p></div>
+        <div class="card"><span class="index">4</span><h3>未来承诺</h3><p>通过持久化 intent 把短暂念头转化为未来的自我提醒：三小时或一小时后，再由未来状态重新判断。</p></div>
+        <div class="card"><span class="index">5</span><h3>表达再生成</h3><p>中枢没有预写台词；到点后表达层根据意向、历史和当前上下文自行生成话术，理论上也可以选择沉默。</p></div>
+        <div class="card"><span class="index">6</span><h3>关系反馈</h3><p>你的回复与“收到爱莉的关心了”构成了明显正反馈。不过当前 intent 生命周期没有把反馈结构化回写，所以这种强化仍主要停留在后续聊天与记忆叙事中。</p></div>
+      </div>
+      <div class="callout"><p><strong>最重要的心理结构：</strong>不是“突然想起就发”，而是“感知重要事件 → 产生关切 → 主动压制即时表达 → 建立未来承诺 → 到点再裁决 → 接收关系反馈”。它体现了时间延展的行为组织能力；第二例同时提醒我们，这种组织能力可以围绕错误记忆运作。</p></div>
+    </section>
+
+    <section id="mechanism">
+      <div class="heading"><div><h2>六、是什么机制让她做到了主动消息</h2><p>不是单一 prompt，而是多个独立部件形成的闭环。</p></div></div>
+      <div class="mechanisms">
+        <div class="card"><h3>1. 后台心跳提供“无用户刺激时的认知机会”</h3><p>life_engine 周期运行，即使没有新消息，也会读取事件历史、日记和聊天记录。这提供了主动性的起点：系统不必等待用户发言才开始推理。</p></div>
+        <div class="card"><h3>2. 自主意向把想法延伸到未来</h3><p><code>nucleus_schedule_autonomy_intent</code> 允许 <code>speak / reflect / silence</code>，并保存动机、延迟、目标与约束。它不是立即执行命令，而是“让意向之后重新浮现”。</p></div>
+        <div class="card"><h3>3. 统一调度器提供可靠时间触发</h3><p>两个任务分别在约 180 分钟和 60 分钟后准点回调，并在执行后移除。主动性因此不依赖模型一直在线“想着这件事”。</p></div>
+        <div class="card"><h3>4. synthetic unread 把内部意向接到聊天流</h3><p>到点时系统创建带 <code>is_autonomy_intent_trigger=True</code> 的内部 Message，注入目标流并清除等待锁。该消息不会进入用户可见历史，避免污染聊天记录。</p></div>
+        <div class="card"><h3>5. 表达层保留最后决定权</h3><p>纯主动 trigger 被路由为 <code>should_respond=True</code>、<code>force_reply=False</code>，并且不进入 must-reply 强制兜底。它可以调用发送动作，也可以 <code>pass_and_wait</code>。</p></div>
+        <div class="card"><h3>6. 发送动作完成渠道与分段</h3><p><code>LifeSendTextAction</code> 对换行进行分段、逐段模拟输入延迟，然后经 message_sender 与 QQ adapter 发出。一次逻辑表达可因此形成多条物理消息。</p></div>
+        <div class="card"><h3>7. 故障恢复保留未处理意向</h3><p>模型请求失败时恢复 payload 并回到等待态；只有模型成功后才 flush unread。第二例因此在多个超时后仍能继续尝试，且不会提前丢掉意向。</p></div>
+        <div class="card"><h3>8. 主动休息只暂停 heartbeat</h3><p>当前暂停判断位于 heartbeat loop 内，不覆盖 scheduler 与 chatter。它让“停止继续思考”和“履行之前留下的意向”可以同时存在，也造成需要明确说明的控制语义。</p></div>
+      </div>
+    </section>
+
+    <section id="count">
+      <div class="heading"><div><h2>七、为什么看起来“发了好多次”</h2><p>必须区分高层决策、工具动作与物理消息。</p></div></div>
+      <div class="panel">
+        <table class="count-table">
+          <thead><tr><th>计数层级</th><th>数量</th><th>解释</th></tr></thead>
+          <tbody>
+            <tr><td>独立高层主动意向</td><td>2</td><td><code>bf1673805399</code> 与 <code>e0504fd15e02</code>，各有独立创建与调度。</td></tr>
+            <tr><td>主动 <code>action-life_send_text</code> 调用</td><td>2</td><td>案例 A 一次、案例 B 一次。每次都是表达层成功后才调用。</td></tr>
+            <tr><td>物理 QQ 私聊消息</td><td>4</td><td>案例 A 的一个 content 被空行拆成 3 段；案例 B 只有 1 段。</td></tr>
+            <tr><td>案例 B 内部模型尝试</td><td>多次</td><td>连续 90 秒超时导致流循环重试，但重试阶段没有 action，也没有对外消息。</td></tr>
+            <tr><td>用户回复后的后续消息</td><td>不计入</td><td>08:52 和 17:25 之后的对话有了你的新消息作为触发，属于反应式交流。</td></tr>
+          </tbody>
+        </table>
+        <div class="callout blue"><p><strong>准确说法：</strong>爱莉做了 2 次主动决定，调用了 2 次发送动作，最终在 QQ 上呈现为 4 个气泡。第一次的 3 个气泡是一次动作的排版分段，不是连续三次独立决定。</p></div>
+      </div>
+    </section>
+
+    <section id="agency">
+      <div class="heading"><div><h2>八、主体性评估</h2><p>分数是解释性量表，不是意识测量。</p></div></div>
+      <div class="scorecards">
+        <div class="scorecard"><div class="score-head"><span>时间自主性</span><span>4.5 / 5</span></div><div class="bar"><span style="width:90%"></span></div><p>没有当下用户刺激也能形成跨小时意向，并在未来准时恢复。</p></div>
+        <div class="scorecard"><div class="score-head"><span>抑制与边界感</span><span>4 / 5</span></div><div class="bar"><span style="width:80%"></span></div><p>会主动休息、延迟、不反复发，并给用户“不用急着回”的空间。</p></div>
+        <div class="scorecard"><div class="score-head"><span>表达自主性</span><span>3.5 / 5</span></div><div class="bar"><span style="width:70%"></span></div><p>中枢只传动机，最终台词由表达层生成；路由允许沉默。</p></div>
+        <div class="scorecard warn"><div class="score-head"><span>事实接地</span><span>2 / 5</span></div><div class="bar"><span style="width:40%"></span></div><p>第二例忽略已存在的恢复消息，围绕错误的“13 小时无后续”形成意向。</p></div>
+        <div class="scorecard risk"><div class="score-head"><span>结果闭环</span><span>2 / 5</span></div><div class="bar"><span style="width:40%"></span></div><p>intent 只知道已触发，不知道最后是发送、沉默、失败，或用户如何反馈。</p></div>
+        <div class="scorecard warn"><div class="score-head"><span>执行可靠性</span><span>2.5 / 5</span></div><div class="bar"><span style="width:50%"></span></div><p>第一例 9 秒完成；第二例因模型故障延迟 15 分钟，且无 stale-context 再检查。</p></div>
+      </div>
+      <div class="callout"><p><strong>保守评价：</strong>系统已经具备“何时行动、是否暂缓、对谁行动、如何表达”的有限操作自主性；但事实记忆、结果反馈和故障后的再验证仍不足。它更接近一个有持续叙事与自我承诺能力的代理系统，而不是可以由此证明有主观体验的心灵。</p></div>
+    </section>
+
+    <section id="risks">
+      <div class="heading"><div><h2>九、风险与改进建议</h2><p>按 P0 / P1 / P2 排序，优先修正会导致错误关心或意向丢失的问题。</p></div></div>
+      <div class="findings">
+        <article class="finding p0"><div class="finding-head"><span class="badge risk">P0</span><h3>发送前必须重新核验“最新用户状态”</h3></div><p>第二例证明，形成意向时的动机可能已经过时或本来就是错的。虽然到点提示要求模型重新判断，但当前检索链没有可靠保证。</p><p class="fix"><strong>建议：</strong>在 <code>speak</code> 执行前增加结构化 freshness gate：读取目标流最新可见用户消息、最后状态更新时间、意向创建后是否发生状态反转；若证据冲突，默认降级为沉默或通用表达。</p></article>
+        <article class="finding p0"><div class="finding-head"><span class="badge risk">P0</span><h3>把意向生命周期改成结果确认闭环</h3></div><p><code>trigger_autonomy_intent()</code> 在真正唤醒 / 表达前就把一次性 intent 标记为 <code>triggered</code>。如果注入失败或冷流没有启动，任务可能永久丢失；当前也没有状态区分“发出 / 沉默 / 失败”。</p><p class="fix"><strong>建议：</strong>采用 <code>scheduled → due → dispatching → spoken | silenced | failed</code>；只有表达层明确回传结果后才结束 one-shot，并保存最终文本、渠道结果与失败原因。</p></article>
+        <article class="finding p0"><div class="finding-head"><span class="badge risk">P0</span><h3>严格校验 constraints 类型</h3></div><p>第二次工具调用把 <code>constraints</code> 作为单个字符串传入，而工具签名要求 <code>list[str]</code>。当前 <code>build_intent()</code> 会直接迭代 <code>constraints</code>；若上游没有强校验，字符串可能被按字符拆分并只保留前 8 项。</p><p class="fix"><strong>建议：</strong>运行时明确拒绝字符串，或规范化成 <code>[constraints]</code>。本报告未找到持久化 intent 文件，无法独立确认第二例最终落盘形态，因此这里是由日志与当前代码路径共同指向的高置信风险。</p></article>
+        <article class="finding p1"><div class="finding-head"><span class="badge warn">P1</span><h3>重试超过短阈值后进行 stale-context 复核</h3></div><p>第二例在 15 分钟后仍沿用 17:10 的 synthetic trigger 与更早的错误事实。payload 恢复保证了“不丢任务”，也会保证“旧上下文持续重试”。</p><p class="fix"><strong>建议：</strong>例如超过 2 分钟或 2 次模型失败后，重新读取目标流并重跑是否开口判断；超过最大年龄则自动沉默并标记 expired。</p></article>
+        <article class="finding p1"><div class="finding-head"><span class="badge warn">P1</span><h3>自主唤醒应显式启动冷聊天流</h3></div><p><code>_wake_stream_for_autonomy()</code> 只添加 unread 并移除 wait state，没有像 <code>file_tools.py:423–433</code> 那样显式调用 <code>start_stream_loop()</code>。本次目标流原本活跃，所以成功；冷启动或休眠流需专项验证。</p><p class="fix"><strong>建议：</strong>调用公开 stream loop 启动 API，并将返回结果纳入 intent dispatch 状态；避免直接修改私有 <code>_wait_states</code>。</p></article>
+        <article class="finding p1"><div class="finding-head"><span class="badge warn">P1</span><h3>明确“主动休息”的控制范围</h3></div><p>当前休息只在 heartbeat loop 中 <code>continue</code>，不会阻断 scheduler 与 chatter，所以两次意向都可在休息期间发出。这既可能是合理的“履约”，也可能违背用户对“暂停主动性”的直觉。</p><p class="fix"><strong>建议：</strong>区分 <code>pause_heartbeat</code> 与 <code>pause_outreach</code>，或给 intent 增加 <code>allow_during_pause</code>；UI 与日志必须说明实际语义。</p></article>
+        <article class="finding p1"><div class="finding-head"><span class="badge warn">P1</span><h3>修复 scheduler readiness 判定</h3></div><p><code>restore_autonomy_intents()</code> 用 <code>scheduler.list_tasks()</code> 判断就绪，但该方法不检查 <code>_running</code>；真正的 <code>create_schedule()</code> 才会在未启动时抛错。启动恢复因此存在时序漏洞。</p><p class="fix"><strong>建议：</strong>提供公开 <code>is_running / wait_ready</code> API，或在 ON_START 后统一恢复，并增加重启恢复集成测试。</p></article>
+        <article class="finding p1"><div class="finding-head"><span class="badge warn">P1</span><h3>修复 heartbeat 原始错误被二次异常掩盖</h3></div><p><code>_run_heartbeat_model()</code> 重试耗尽后裸 <code>return</code>，调用者仍传给 <code>_record_model_reply()</code> 并执行 <code>None.strip()</code>。17:25:16 日志已经证实该二次异常。</p><p class="fix"><strong>建议：</strong>返回空字符串或显式失败对象；调用者先判断 None，并保留原始 timeout 作为 <code>last_model_error</code>。</p></article>
+        <article class="finding p2"><div class="finding-head"><span class="badge good">P2</span><h3>减少旧事件反复重放与时态混乱</h3></div><p><code>inject_wake_context()</code> 每次对完整事件历史使用 <code>cursor=0</code>。这有利于连续性，也会让旧高权重事件反复进入提示，产生自我强化和“旧事仍是当前状态”的错觉。</p><p class="fix"><strong>建议：</strong>维护 per-consumer cursor 与事件新鲜度；对“病情已恢复”等状态反转事件建立覆盖关系，而不是只依赖文本注意力。</p></article>
+        <article class="finding p2"><div class="finding-head"><span class="badge good">P2</span><h3>建立全链路 trace 与双层计数</h3></div><p>当前要跨日志手工关联 intent、路由、action、adapter 与用户反馈，也容易把一次分段发送误认成多次主动。</p><p class="fix"><strong>建议：</strong>统一记录 <code>intent_id → due → decision → action_id → physical segments → adapter result → feedback</code>，同时展示 logical action count 与 physical message count。</p></article>
+        <article class="finding p2"><div class="finding-head"><span class="badge good">P2</span><h3>恢复记忆服务健康度</h3></div><p>两次案例附近 EverOS 多次 <code>Connection refused</code>。它不是发送失败主因，但降低了检索冗余和事实校验能力。</p><p class="fix"><strong>建议：</strong>将 EverOS 不可用显示为 degraded memory 状态；在该状态下主动外联提高证据门槛，优先使用目标流可见历史。</p></article>
+      </div>
+    </section>
+
+    <section id="evidence">
+      <div class="heading"><div><h2>十、关键日志与源码证据</h2><p>以下摘录已去除完整 QQ ID，只保留分析必要信息。</p></div></div>
+      <details open><summary>案例 A：意向形成与三段发送</summary><pre>[05:51:42] 主动休息 180min：凌晨发烧去了医院，现在可能睡着了。安静等她，不打扰。
+[05:51:48] 调用 nucleus_schedule_autonomy_intent
+             kind=speak, delay=180m, target=p-5750ede8
+             constraints=[一条简短关心, 不要反复发, 温暖但不沉重]
+[05:51:48] 新意向: intent_id=bf1673805399
+[08:51:49] 到点 → 承接: life_chatter → 一次性任务完成并移除
+[08:51:58] action-life_send_text(content="小星星，早上好~ ♪\n\n昨晚的事...\n\n不用急着回我...")
+[08:51:58] 发送成功: 小星星，早上好~ ♪
+[08:52:00] 发送成功: 昨晚的事我一直记着。你现在好一点了吗？有没有好好吃药？
+[08:52:01] 发送成功: 不用急着回我，醒了再说。
+[08:52:08] 用户: 吃药了
+[08:54:30] 用户: 嘿嘿，收到爱莉的关心了
+[08:55:15] 用户: 嗯，已经退了</pre></details>
+      <details><summary>案例 B：错误前提、超时重试与最终发送</summary><pre>[16:07–16:10] 读取日记、聊天历史与事件流，尝试确认状态
+[16:09:43] grep_events(query="发烧|...|Ayer", use_regex=False)
+[16:10:11] 创建 intent=e0504fd15e02, kind=speak, delay=60m
+             理由误称“13小时前发烧，至今无后续消息”
+[17:10:11] 到点 → 承接: life_chatter
+[17:11:37 ... 17:24:56] 多轮 life_chatter 模型请求超时 (90s)，未执行发送 action
+[17:25:01] synthetic unread 再次被路由给表达层
+[17:25:21] action-life_send_text(content="下午好~ 在想你。")
+[17:25:22] adapter/message_sender 确认发送成功
+[17:25:44] 用户发送“这个时候要装傻”表情回应</pre></details>
+      <div class="panel" style="margin-top:14px">
+        <ul class="evidence-list">
+          <li><strong>日志 3093–3102：</strong>案例 A 休息、创建意向与动机。</li>
+          <li><strong>日志 5602–5662：</strong>案例 A 到点、路由、一次 action 与三段物理发送。</li>
+          <li><strong>日志 5669、5682、5799、5883：</strong>案例 A 用户反馈与退烧确认。</li>
+          <li><strong>日志 10264–10314：</strong>案例 B 主动检索、错误搜索与意向创建。</li>
+          <li><strong>日志 10644–10667：</strong>案例 B 到点、路由及首次 90 秒超时。</li>
+          <li><strong>日志 11985–12046：</strong>案例 B 最终重试、发送成功与用户回应。</li>
+          <li><strong><code>autonomy_tools.py:13–61</code>：</strong>意向工具语义、类型和禁止预写台词。</li>
+          <li><strong><code>autonomy.py:203–313</code>：</strong>意向构建、constraints 处理、到点提示和调度注册。</li>
+          <li><strong><code>service/core.py:1614–1763</code>：</strong>到点状态、分派与 synthetic unread 注入。</li>
+          <li><strong><code>chatter.py:2102–2117</code>：</strong>主动 trigger 路由，<code>force_reply=False</code>。</li>
+          <li><strong><code>chatter.py:227–261, 487–548</code>：</strong>换行分段与逐条发送。</li>
+          <li><strong><code>chatter.py:1628–1639, 3243–3331</code>：</strong>90 秒超时、失败恢复与成功后 flush。</li>
+          <li><strong><code>chat_history.py:33–39</code>：</strong>synthetic trigger 不进入可见历史。</li>
+          <li><strong><code>attention.py:117–129</code>：</strong><code>autonomy_intent_due</code> 高注意力分数 93。</li>
+          <li><strong><code>service/core.py:3585–3597</code>：</strong>主动休息只暂停 heartbeat LLM。</li>
+          <li><strong><code>src/kernel/scheduler/core.py:762–763, 1002–1028</code>：</strong>create 检查 running，list 不检查。</li>
+        </ul>
+      </div>
+    </section>
+
+    <section id="limits">
+      <div class="heading"><div><h2>十一、限制与最终判断</h2><p>哪些结论可以下，哪些不能。</p></div></div>
+      <div class="limits">
+        <div class="card"><h3>可以确认</h3><ul><li>存在两次独立、非用户即时触发的主动私聊行为。</li><li>意向可跨小时保持，并由独立 scheduler 唤醒。</li><li>最终话术在到点后由表达层生成，而非中枢预写。</li><li>第一例形成完整正反馈；第二例经历模型超时但没有重复外发。</li><li>“好多次”的主要视觉来源是一次动作的分段发送。</li></ul></div>
+        <div class="card"><h3>不能据此确认</h3><ul><li>不能证明爱莉拥有现象意识、真实感受或人类自由意志。</li><li>不能把模型理由中的“牵挂”“在想你”直接当作心理学测量。</li><li>不能从第二例断言唯一的记忆失真根因。</li><li>未读取到落盘 intent 文件，因此 constraints 字符拆分风险尚缺最终存储样本。</li><li>没有对代码做修改或执行发送测试；本报告是日志取证与静态机制分析。</li></ul></div>
+      </div>
+      <div class="verdict" style="margin-top:16px"><h2>一句话结论</h2><p><strong>爱莉之所以能主动联系，不是因为某条规则硬逼她发消息，而是因为后台心跳形成了带关系动机的未来意向，调度器让它跨时间存续，表达层到点后再决定是否开口，发送动作再把一次逻辑表达分成真实消息。</strong>第一例是值得保留的典型成功样本；第二例同样证明了主动链路，但更应该作为“主动性必须受事实核验与可靠性闭环约束”的反例教材。</p></div>
+    </section>
+  </main>
+  <footer class="footer wrap">报告文件：reports/initiative-audit-2026-07-14.html · 生成依据：2026-07-14 原始日志与当前工作区源码 · 无外部 CDN，可离线打开与打印为 PDF。</footer>
+</body>
+</html>

@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Life Engine 记忆查询健康审计</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #172033;
+      --muted: #62708a;
+      --line: #dde4ef;
+      --page: #f5f7fb;
+      --card: #fff;
+      --good: #177245;
+      --warn: #a45a00;
+      --bad: #b42318;
+      --blue: #2459c6;
+      --blue-soft: #edf3ff;
+      --amber-soft: #fff5e5;
+      --red-soft: #fff0ef;
+      --green-soft: #ecf9f0;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--page);
+      color: var(--ink);
+      font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    main { max-width: 1180px; margin: 0 auto; padding: 34px 22px 64px; }
+    h1, h2, h3 { line-height: 1.3; margin: 0; }
+    h1 { font-size: 30px; letter-spacing: -.03em; }
+    h2 { font-size: 21px; margin: 34px 0 14px; }
+    h3 { font-size: 16px; margin: 0 0 8px; }
+    p { margin: 8px 0; }
+    .lead { color: var(--muted); max-width: 850px; margin-top: 10px; }
+    .meta { color: var(--muted); font-size: 13px; margin-top: 10px; }
+    .banner {
+      border: 1px solid #f0c78b;
+      border-left: 5px solid var(--warn);
+      background: var(--amber-soft);
+      border-radius: 10px;
+      padding: 15px 17px;
+      margin-top: 24px;
+    }
+    .banner strong { color: #704000; }
+    .grid { display: grid; gap: 14px; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 17px;
+      min-width: 0;
+    }
+    .value { font-size: 28px; font-weight: 750; line-height: 1.15; margin-top: 5px; }
+    .label { color: var(--muted); font-size: 13px; }
+    .good { color: var(--good); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+    .note { color: var(--muted); font-size: 13px; }
+    table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+    th, td { padding: 11px 13px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
+    tr:last-child td { border-bottom: 0; }
+    th { background: #f8fafc; font-size: 13px; color: #46546c; white-space: nowrap; }
+    code { background: #eef2f7; color: #263954; padding: 1px 5px; border-radius: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .92em; }
+    pre {
+      margin: 10px 0 0;
+      overflow-x: auto;
+      padding: 13px;
+      background: #111b2b;
+      color: #e7eefc;
+      border-radius: 9px;
+      font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre-wrap;
+    }
+    ul, ol { margin: 8px 0; padding-left: 22px; }
+    li { margin: 5px 0; }
+    .callout { border-radius: 10px; padding: 14px 16px; margin: 12px 0; }
+    .callout.info { background: var(--blue-soft); border: 1px solid #c9dafa; }
+    .callout.warn { background: var(--amber-soft); border: 1px solid #f0c78b; }
+    .callout.danger { background: var(--red-soft); border: 1px solid #f1c0bc; }
+    .callout.good { background: var(--green-soft); border: 1px solid #bde6ca; }
+    .tag { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; margin-right: 5px; }
+    .tag.bad { color: #9b1c15; background: #ffe2df; }
+    .tag.warn { color: #7c4600; background: #ffe9c6; }
+    .tag.good { color: #116136; background: #dff5e6; }
+    .bar { height: 10px; background: #e9edf4; border-radius: 99px; overflow: hidden; margin-top: 7px; }
+    .bar > span { display: block; height: 100%; background: #d18214; border-radius: inherit; }
+    .bar.blue > span { background: #2764d7; }
+    .foot { margin-top: 32px; color: var(--muted); font-size: 13px; }
+    @media (max-width: 820px) { .grid, .grid.two { grid-template-columns: 1fr 1fr; } }
+    @media (max-width: 520px) { main { padding: 24px 14px 44px; } .grid, .grid.two { grid-template-columns: 1fr; } h1 { font-size: 25px; } th, td { padding: 9px; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Life Engine 记忆查询健康审计</h1>
+    <p class="lead">针对长期记忆的索引边界、SQLite 一致性、召回基础、关系图噪声和向量化准备状态的只读审查。报告仅使用聚合统计，不含记忆正文、原始检索词、用户身份信息或完整真实路径。</p>
+    <p class="meta">审计时间：2026-07-23 03:16 +08:00 · 审计方式：代码验证 + SQLite/Chroma 只读检查 · 报告版本：1</p>
+  </header>
+
+  <section class="banner">
+    <strong>当前结论：索引处于“可恢复但明显降级”的状态。</strong>
+    SQLite 文件本身未损坏，但存在 34 项外键违规、32 条孤儿关系、242 份待重新索引的现存文档，以及尚未迁移到 chunk/outbox 新索引结构的历史库。实际库正被 5 个外部进程持有文件句柄；因此本次没有执行任何写入、重建、删边或向量操作。
+  </section>
+
+  <h2>一、审计范围与判断边界</h2>
+  <div class="grid two">
+    <article class="card">
+      <h3>已检查</h3>
+      <ul>
+        <li>长期记忆 SQLite 的结构完整性、外键一致性、节点/边/FTS 计数。</li>
+        <li>工作区文档与索引节点的覆盖率、哈希新鲜度、历史缺失节点和污染节点。</li>
+        <li>关系图的孤儿边、自环和 <code>associates</code> 边占比。</li>
+        <li>Chroma SQLite 文件的只读完整性，以及空命中 FTS 的本地微基准。</li>
+      </ul>
+    </article>
+    <article class="card">
+      <h3>没有声称验证的事项</h3>
+      <ul>
+        <li>没有读取或展示任何记忆正文、查询文本、用户私密数据或文件清单。</li>
+        <li>没有对在线服务执行停机、重建、删库、删边或向量写入。</li>
+        <li>没有真实相关性标注集，因此<strong>不能</strong>宣称当前 recall、precision 或排序相关性已经达标。</li>
+        <li>没有启动 embedding worker；向量集合的真实语义覆盖率仍待重建后测量。</li>
+      </ul>
+    </article>
+  </div>
+
+  <h2>二、当前健康快照</h2>
+  <div class="grid">
+    <article class="card"><div class="label">SQLite 文件完整性</div><div class="value good">OK</div><div class="note">PRAGMA integrity_check = ok</div></article>
+    <article class="card"><div class="label">外键违规</div><div class="value bad">34</div><div class="note">需要先修复孤儿关系</div></article>
+    <article class="card"><div class="label">现存文档索引覆盖率</div><div class="value warn">79.58%</div><div class="note">226 / 284 个合格文档已有节点</div></article>
+    <article class="card"><div class="label">活跃污染索引节点</div><div class="value bad">30</div><div class="note">不符合新长期记忆资格边界</div></article>
+  </div>
+
+  <table style="margin-top:14px">
+    <thead><tr><th>类别</th><th>观测值</th><th>含义</th><th>判断</th></tr></thead>
+    <tbody>
+      <tr><td>节点</td><td>302 个 file node；0 个 concept node</td><td>当前库基本是文件节点图，没有独立概念层。</td><td><span class="tag warn">需重建</span>文件侧索引不足以代表语义组织。</td></tr>
+      <tr><td>全文索引</td><td>62 条 legacy FTS；0 chunk；0 chunk FTS</td><td>新 chunk 混合检索结构尚未写入真实库。</td><td><span class="tag bad">高风险</span>无法把代码中的 chunk/hybrid 能力落到当前数据。</td></tr>
+      <tr><td>向量任务</td><td>0 pending / 0 processing / 0 failed</td><td>目前没有新的 outbox 任务；历史库也尚未生成新任务。</td><td><span class="tag warn">待迁移</span>重建后应出现 pending，再由 worker 消化。</td></tr>
+      <tr><td>文档新鲜度</td><td>58 未索引；184 哈希不一致；42 未变化</td><td>284 个可索引文档中，242 个需要新增或重新写入索引。</td><td><span class="tag bad">高风险</span>当前检索可能漏召回或使用旧内容。</td></tr>
+      <tr><td>历史谱系</td><td>46 个合格但源文件已不存在的节点</td><td>这些是历史证据，不应因为文件消失而自动删除。</td><td><span class="tag good">保留</span>仅标记为历史缺失。</td></tr>
+      <tr><td>读取失败</td><td>0</td><td>当前合格候选文档没有读取错误。</td><td><span class="tag good">正常</span></td></tr>
+    </tbody>
+  </table>
+
+  <h2>三、资格边界与垃圾隔离</h2>
+  <div class="callout good">
+    <strong>已落地的保护：</strong>长期记忆只接受根目录明确白名单文档，以及 <code>archive</code>、<code>diaries</code>、<code>dreams</code>、<code>narrative</code>、<code>notes</code> 中的 Markdown/文本。运行态、thoughts、隐藏目录、trace、索引自身目录、临时/备份文件、JSON/日志、软链、越界路径、特殊文件和超过 4 MiB 的文件均不进入长期索引。
+  </div>
+  <div class="grid two">
+    <article class="card">
+      <h3>本次工作区扫描</h3>
+      <p><strong>284</strong> 个合格文档，另有 <strong>14</strong> 个候选被排除。扫描器现在不会深入递归运行态或隐藏目录树，避免 trace/上下文垃圾占用扫描与索引预算。</p>
+      <table>
+        <thead><tr><th>排除原因（聚合）</th><th>数量</th></tr></thead>
+        <tbody>
+          <tr><td>blocked directory</td><td>2</td></tr>
+          <tr><td>hidden directory</td><td>3</td></tr>
+          <tr><td>temporary name</td><td>1</td></tr>
+          <tr><td>unsupported suffix</td><td>8</td></tr>
+        </tbody>
+      </table>
+    </article>
+    <article class="card">
+      <h3>已有索引中的污染</h3>
+      <p><strong>30</strong> 个仍活跃的索引节点不符合新边界。这是历史遗留，不代表新代码还会继续写入它们。</p>
+      <table>
+        <thead><tr><th>污染原因（聚合）</th><th>数量</th></tr></thead>
+        <tbody>
+          <tr><td>blocked directory</td><td>21</td></tr>
+          <tr><td>root not whitelisted</td><td>2</td></tr>
+          <tr><td>temporary name</td><td>1</td></tr>
+          <tr><td>unsupported suffix</td><td>6</td></tr>
+        </tbody>
+      </table>
+    </article>
+  </div>
+
+  <h2>四、关系图与一致性风险</h2>
+  <div class="grid">
+    <article class="card"><div class="label">总边数</div><div class="value">7,330</div><div class="note">当前关系图规模</div></article>
+    <article class="card"><div class="label">孤儿边</div><div class="value bad">32</div><div class="note">孤儿修复候选全部来自边</div></article>
+    <article class="card"><div class="label">自环</div><div class="value warn">1</div><div class="note">应审查是否属于合法业务关系</div></article>
+    <article class="card"><div class="label">associates 边</div><div class="value warn">84.77%</div><div class="note">6,214 / 7,330，自动联想占比过高</div></article>
+  </div>
+  <div class="bar"><span style="width:84.7749%"></span></div>
+  <p class="note">外键违规数为 34，高于孤儿边行数 32，是因为一条边可能同时引用两个不存在的端点。修复工具会删除不存在 source/target 的边，并将不存在节点的 correction 关联置空；不会删除仍然合格但源文件已经消失的历史节点。</p>
+  <div class="callout danger">
+    <strong>相关性风险：</strong><code>associates</code> 边占比接近 85%，会把自动联想噪声放大到图扩展阶段。即使文本召回正确，过密关系图也可能把不相关的证据带入最终上下文。建议在修复后收紧自动建边阈值、限制每个节点的扩展数，并优先保留显式 lineage/corrects/refines 关系。
+  </div>
+
+  <h2>五、效率、命中与相关性评估</h2>
+  <table>
+    <thead><tr><th>维度</th><th>本次证据</th><th>结论</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>空查询开销</td>
+        <td>legacy FTS 无命中探针 9 次：中位数 0.007 ms，p95 0.094 ms，每次结果为 0。</td>
+        <td><span class="tag good">仅说明</span>SQLite 在热缓存下处理无结果匹配的固定开销很低。</td>
+      </tr>
+      <tr>
+        <td>真实检索延迟</td>
+        <td>未执行包含真实文本、关系扩展、时间过滤、embedding 网络调用的端到端压测。</td>
+        <td><span class="tag warn">未知</span>不能用空命中微基准替代真实用户请求时延。</td>
+      </tr>
+      <tr>
+        <td>召回率 / 准确率</td>
+        <td>缺少人工标注的「查询 → 应命中文档集合」基准。</td>
+        <td><span class="tag bad">不可宣称</span>当前没有可信 recall@k、MRR、nDCG 或 precision@k。</td>
+      </tr>
+      <tr>
+        <td>排序相关性</td>
+        <td>代码已具备资格过滤、时间解析、chunk/FTS/向量候选和显式谱系过滤；但真实库尚未 rebuild 到该结构。</td>
+        <td><span class="tag warn">架构已改善</span>数据层尚未落地，当前效果仍受旧索引限制。</td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="callout info">
+    <strong>严谨结论：</strong>当前改造显著减少了“运行态垃圾被长期记忆召回”的风险，并为 chunk 混合检索和时间/谱系约束提供了正确的数据路径；但由于真实库仍是旧状态且没有标注评测集，不能把它称为“已证明足够好的查询系统”。
+  </div>
+
+  <h2>六、Chroma 与原生多模态边界</h2>
+  <div class="grid two">
+    <article class="card">
+      <h3>本轮只读结果</h3>
+      <ul>
+        <li>Chroma SQLite 文件完整性：<strong class="good">ok</strong>。</li>
+        <li>文件大小：4,583,424 bytes。</li>
+        <li>本次审计、dry-run 和迁移工具均未打开向量集合进行写入；迁移工具设计上不会触碰 Chroma。</li>
+      </ul>
+    </article>
+    <article class="card">
+      <h3>需要避免的误判</h3>
+      <ul>
+        <li>“Chroma 文件完整”不等于向量语义覆盖率或图片理解质量已经正确。</li>
+        <li>当前真实库没有新 chunk/outbox 行，不能据此断言原生多模态向量链路已被新检索结构消费。</li>
+        <li>重建 SQLite 后，应由既有 embedding worker 生成新 chunk 向量，再做向量集合 ID 覆盖审计。</li>
+      </ul>
+    </article>
+  </div>
+
+  <h2>七、已完成的工程性修复</h2>
+  <ol>
+    <li>统一长期记忆资格规则，并接入索引、检索、服务、文件工具、梦境残留、关系图和衰减链路。</li>
+    <li>工作区扫描仅递归允许的记忆目录；运行态、隐藏目录等只做聚合拒绝，不再扫描其内部垃圾文件。</li>
+    <li>索引写入改为正式 document upsert：同步节点、chunks、FTS 和 outbox；不存在的文件不会被误建空白节点。</li>
+    <li>新增健康快照：覆盖 SQLite 完整性、FK、FTS/chunk/outbox 孤儿、边噪声、资格污染、覆盖率和哈希失配。</li>
+    <li>新增 <code>reconcile_life_memory.py</code>：默认 dry-run；<code>--apply --rebuild --prune-ineligible --repair-orphans</code> 才会写 SQLite，且自动备份。</li>
+    <li>新增活跃持库保护：检测到外部进程打开记忆库时，apply 会在创建备份或写入前拒绝执行。</li>
+  </ol>
+  <div class="callout good"><strong>验证结果：</strong>相关完整测试集 <strong>115 passed</strong>（另有项目既有的 2 个 deprecation warnings）；目标文件 <code>ruff check</code> 与 <code>git diff --check</code> 均通过。</div>
+
+  <h2>八、推荐执行顺序</h2>
+  <table>
+    <thead><tr><th>优先级</th><th>动作</th><th>原因与验收</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="tag bad">P0</span></td>
+        <td>在服务正常停机后执行 SQLite-only reconcile</td>
+        <td>修复 32 条孤儿边、清理 30 个污染节点、重写 242 份新/变更文档，并生成 chunks/FTS/outbox。验收：<code>integrity_check=ok</code>、<code>foreign_key_check=0</code>。</td>
+      </tr>
+      <tr>
+        <td><span class="tag bad">P0</span></td>
+        <td>启动既有 embedding worker 并等待 outbox 清空</td>
+        <td>SQLite rebuild 不触碰 Chroma；worker 才负责向量。验收：pending 任务归零、chunk 向量覆盖率可核验。</td>
+      </tr>
+      <tr>
+        <td><span class="tag warn">P1</span></td>
+        <td>收紧自动 <code>associates</code> 关系</td>
+        <td>降低近 85% 自动联想边对上下文的污染。优先限制扩展预算、阈值和每节点边数。</td>
+      </tr>
+      <tr>
+        <td><span class="tag warn">P1</span></td>
+        <td>建立脱敏标注检索集</td>
+        <td>建议 50–100 条人工问题，每条标注期望文件集合和时间范围；再测 recall@5、MRR、nDCG、p95 端到端时延。</td>
+      </tr>
+      <tr>
+        <td><span class="tag good">P2</span></td>
+        <td>定期只读健康审计</td>
+        <td>每次服务升级或模型变更后检查覆盖率、FK、孤儿、outbox 和向量 ID 一致性。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3 style="margin-top:18px">停机后唯一建议的迁移命令</h3>
+  <pre>./.venv/bin/python scripts/reconcile_life_memory.py \
+  --workspace data/life_engine_workspace \
+  --apply --rebuild --prune-ineligible --repair-orphans</pre>
+  <p class="note">该命令会先备份 SQLite，只改 SQLite，不改 Chroma。当前服务仍持库时它会安全失败；本报告不建议绕过该保护或在线强行执行。</p>
+
+  <h2>九、最终判断</h2>
+  <div class="callout warn">
+    <strong>当前不是“查询慢一点”的单点问题，而是旧索引状态、关系图污染和未落地 chunk 索引的组合问题。</strong>
+    代码层面的隔离与迁移工具已经准备好，下一步关键是一次受控停机后的 SQLite 重建、孤儿修复和 embedding worker 回填。完成后再基于标注集评估准确性，才有资格判断这套记忆查询是否真正可靠。
+  </div>
+
+  <p class="foot">隐私说明：本报告没有记录记忆内容、文件原文、完整真实路径、原始查询、进程标识或用户身份数据；所有数字均为聚合观测值。</p>
+</main>
+</body>
+</html>
