@@ -396,6 +396,12 @@ def _resolve_json_path(json_path: str | Path) -> Path:
 def get_global_collector(json_path: str | Path | None = None) -> MetricsCollector:
     """获取全局指标收集器。
 
+    默认只在内存中保留最近的请求指标，供 WebUI 的模型统计面板读取。
+    完整的请求内容由训练数据湖（``data/training_data_lake``）以 append-only
+    JSONL 落盘，因此这里不再整文件重写 ``llm_metrics.json``，避免同一份数据
+    存两遍。需要恢复旧行为时显式传入 ``json_path``，或设置环境变量
+    ``MOFOX_LLM_METRICS_PATH``。
+
     Args:
         json_path: JSON 持久化文件路径。仅在首次创建时生效。
     """
@@ -405,6 +411,6 @@ def get_global_collector(json_path: str | Path | None = None) -> MetricsCollecto
     with _global_collector_lock:
         if _global_collector is not None:
             return _global_collector
-        path = json_path if json_path is not None else os.environ.get("MOFOX_LLM_METRICS_PATH", _DEFAULT_JSON_PATH)
+        path = json_path if json_path is not None else os.environ.get("MOFOX_LLM_METRICS_PATH")
         _global_collector = MetricsCollector(json_path=path)
         return _global_collector

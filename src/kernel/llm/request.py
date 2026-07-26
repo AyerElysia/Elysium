@@ -12,7 +12,9 @@ LLMRequest 支持：
 from __future__ import annotations
 
 import asyncio
+import json
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Any, Self
 
@@ -35,16 +37,199 @@ from .media_capabilities import (
 )
 from .model_client import ModelClientRegistry
 from .monitor import RequestMetrics, RequestTimer, get_global_collector
-from .payload import Content, LLMPayload, ReasoningText, Text, ToolResult
+from .payload import (
+    Content,
+    LLMPayload,
+    MediaPart,
+    ReasoningText,
+    Text,
+    ToolCall,
+    ToolResult,
+)
 from .policy import create_default_policy
 from .policy.base import Policy
 from .response import LLMResponse
 from .roles import ROLE
+from .trajectory_collector import record_trajectory
+from .trajectory_types import (
+    derive_task_tags,
+    new_trajectory_id,
+    sanitize_text_only,
+    utc_timestamp,
+)
 from .types import ModelEntry, ModelSet, RequestType
 from .token_counter import count_payload_tokens
 
 
 logger = get_logger("kernel.llm.request", display="LLM 请求")
+
+
+def _trajectory_settings() -> tuple[bool, str, float, int]:
+    """Read trajectory settings without importing core config at module load time."""
+    try:
+        from src.core.config import get_core_config
+
+        section = get_core_config().llm
+        return (
+            bool(section.enable_trajectory_logging),
+            str(section.trajectory_base_path),
+            float(section.trajectory_flush_interval),
+            int(section.trajectory_queue_limit),
+        )
+    except Exception:
+        # Kernel LLM tests and low-level callers may intentionally run before
+        # core initialization; the documented defaults remain usable there.
+        return True, "data/training_data_lake", 5.0, 10000
+
+
+def _safe_related_id(request: Any, name: str) -> str | None:
+    """Read an optional association ID from the request or its context manager."""
+    for source in (request, getattr(request, "context_manager", None)):
+        if source is None:
+            continue
+        try:
+            value = getattr(source, name, None)
+        except Exception:
+            value = None
+        if value is not None and str(value).strip():
+            return str(value)
+    return None
+
+
+def _media_placeholder(part: MediaPart) -> str:
+    kind = getattr(part, "kind", None)
+    kind_value = getattr(kind, "value", kind)
+    normalized = str(kind_value or "file").lower()
+    if normalized not in {"image", "audio", "video", "file"}:
+        normalized = "file"
+    return f"[{normalized}]"
+
+
+def _safe_tool_arguments(arguments: Any) -> str:
+    sanitized = sanitize_text_only(arguments)
+    if isinstance(sanitized, str):
+        return sanitized
+    try:
+        return json.dumps(sanitized, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        return str(sanitized)
+
+
+def _safe_tool_result_value(value: Any) -> str:
+    sanitized = sanitize_text_only(value)
+    if isinstance(sanitized, str):
+        return sanitized
+    try:
+        return json.dumps(sanitized, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        return str(sanitized)
+
+
+def _serialize_tool_call(call: ToolCall) -> dict[str, Any]:
+    return {
+        "id": sanitize_text_only(call.id),
+        "type": "function",
+        "function": {
+            "name": sanitize_text_only(call.name),
+            "arguments": _safe_tool_arguments(call.args),
+        },
+    }
+
+
+def _serialize_payloads(payloads: list[LLMPayload]) -> list[dict[str, Any]]:
+    """Serialize payloads to text-only OpenAI-like messages."""
+    messages: list[dict[str, Any]] = []
+    for payload in payloads:
+        role = getattr(payload.role, "value", str(payload.role))
+        role_text = str(role)
+        text_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        tool_results: list[dict[str, Any]] = []
+
+        for part in payload.content:
+            if isinstance(part, Text):
+                text_parts.append(str(sanitize_text_only(part.text)))
+            elif isinstance(part, ReasoningText):
+                if part.text:
+                    text_parts.append(str(sanitize_text_only(part.text)))
+                elif part.redacted_data:
+                    text_parts.append("[reasoning]")
+            elif isinstance(part, MediaPart):
+                text_parts.append(_media_placeholder(part))
+            elif isinstance(part, ToolCall):
+                tool_calls.append(_serialize_tool_call(part))
+            elif isinstance(part, ToolResult):
+                tool_results.append(
+                    {
+                        "tool_call_id": sanitize_text_only(part.call_id),
+                        "name": sanitize_text_only(part.name),
+                        "content": _safe_tool_result_value(part.value),
+                    }
+                )
+            else:
+                # Tool declarations are sent separately to providers. Keep a
+                # text-only marker in the trajectory without serializing object
+                # internals or credentials from a tool implementation.
+                if role_text == ROLE.TOOL.value:
+                    text_parts.append("[tool]")
+                else:
+                    text_parts.append(str(sanitize_text_only(part)))
+
+        if tool_results or role_text == ROLE.TOOL_RESULT.value:
+            if tool_results:
+                for result in tool_results:
+                    message: dict[str, Any] = {
+                        "role": "tool",
+                        "content": result["content"],
+                    }
+                    if result["tool_call_id"] is not None:
+                        message["tool_call_id"] = result["tool_call_id"]
+                    if result["name"] is not None:
+                        message["name"] = result["name"]
+                    messages.append(message)
+            else:
+                messages.append({"role": "tool", "content": " ".join(text_parts)})
+            continue
+
+        message = {
+            "role": role_text,
+            "content": " ".join(text_parts),
+        }
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        messages.append(message)
+    return messages
+
+
+def _serialize_tool_results(payloads: list[LLMPayload]) -> list[dict[str, Any]]:
+    """Extract text-only tool results for the trajectory top-level field."""
+    results: list[dict[str, Any]] = []
+    for payload in payloads:
+        for part in payload.content:
+            if not isinstance(part, ToolResult):
+                continue
+            results.append(
+                {
+                    "call_id": sanitize_text_only(part.call_id),
+                    "name": sanitize_text_only(part.name),
+                    "content": _safe_tool_result_value(part.value),
+                }
+            )
+    return results
+
+
+def _serialize_response(response: LLMResponse) -> dict[str, Any]:
+    """Serialize the response fields that were actually produced."""
+    output: dict[str, Any] = {
+        "content": sanitize_text_only(response.message),
+    }
+    if response.reasoning_content:
+        output["reasoning_content"] = sanitize_text_only(response.reasoning_content)
+    if response.call_list:
+        output["tool_calls"] = [
+            _serialize_tool_call(call) for call in response.call_list
+        ]
+    return output
 
 
 def _normalize_tool_result_payload(payload: LLMPayload) -> LLMPayload:
@@ -135,6 +320,7 @@ class LLMRequest:
 
     model_set: ModelSet
     request_name: str = ""
+    trajectory_metadata: dict[str, Any] = field(default_factory=dict)
 
     payloads: list[LLMPayload] = field(default_factory=list)
     policy: Policy | None = None
@@ -313,6 +499,93 @@ class LLMRequest:
             LLMResponse: 包含响应消息和工具调用信息的对象。
         """
         model_set = _validate_model_set(self.model_set)
+        request_id = new_trajectory_id("req")
+        trace_id = _safe_related_id(self, "trace_id") or request_id
+        stream_id = _safe_related_id(self, "stream_id")
+        heartbeat_run_id = _safe_related_id(self, "heartbeat_run_id")
+        call_id = _safe_related_id(self, "call_id")
+        task_name = self.request_name or "llm"
+        task_tags = derive_task_tags(task_name)
+        trajectory_enabled, trajectory_base_path, trajectory_flush_interval, trajectory_queue_limit = _trajectory_settings()
+        previous_attempt_id: str | None = None
+        attempt_index = 0
+
+        # Caller-supplied metadata is sanitized by the collector before persistence.
+        request_metadata = dict(self.trajectory_metadata or {})
+        request_metadata.setdefault("request_type", self.request_type.value if hasattr(self.request_type, "value") else str(self.request_type))
+
+        def record_attempt(
+            *,
+            attempt_id: str,
+            parent_attempt_id: str | None,
+            attempt_number: int,
+            model: dict[str, Any],
+            step_meta: dict[str, Any] | None,
+            trimmed: list[LLMPayload],
+            latency_s: float,
+            success: bool,
+            response: Any = None,
+            usage: dict[str, Any] | None = None,
+            error: BaseException | None = None,
+            response_obj: LLMResponse | None = None,
+        ) -> None:
+            """Persist one durable attempt event without affecting the request."""
+            event: dict[str, Any] = {
+                "trace_id": trace_id,
+                "attempt_id": attempt_id,
+                "request_id": request_id,
+                "parent_attempt_id": parent_attempt_id,
+                "timestamp": utc_timestamp(),
+                "request_name": self.request_name,
+                "task_name": task_name,
+                "task_tags": task_tags,
+                "stream_id": stream_id,
+                "heartbeat_run_id": heartbeat_run_id,
+                "call_id": call_id,
+                "model": model.get("model_identifier"),
+                "model_identifier": model.get("model_identifier"),
+                "api_provider": model.get("api_provider"),
+                "policy_meta": step_meta or {},
+                "messages": _serialize_payloads(trimmed),
+                "response": (
+                    _serialize_response(response_obj)
+                    if response_obj is not None
+                    else sanitize_text_only(response)
+                ),
+                "tool_results": _serialize_tool_results(trimmed),
+                "usage": usage or {},
+                "latency_s": latency_s,
+                "success": success,
+                "error": str(error) if error is not None else None,
+                "error_type": type(error).__name__ if error is not None else None,
+                "metadata": {
+                    **request_metadata,
+                    "request_id": request_id,
+                    "attempt_id": attempt_id,
+                    "attempt_index": attempt_number,
+                    "policy_meta": step_meta or {},
+                    "request_name": self.request_name,
+                    "task_name": task_name,
+                    "task_tags": task_tags,
+                    "stream_id": stream_id,
+                    "heartbeat_run_id": heartbeat_run_id,
+                    "retry_count": attempt_number - 1,
+                    "model_index": (step_meta or {}).get("model_index", 0),
+                    "stream": stream,
+                },
+                "extensions": {},
+            }
+            if response_obj is not None and response_obj.call_list:
+                event["metadata"]["call_ids"] = [
+                    sanitize_text_only(item.id) for item in response_obj.call_list
+                ]
+            record_trajectory(
+                event,
+                base_path=trajectory_base_path,
+                enabled=trajectory_enabled,
+                flush_interval=trajectory_flush_interval,
+                queue_limit=trajectory_queue_limit,
+            )
 
         # TOOL_RESULT payload 规范化（确保 provider 端可读）
         payloads = [_normalize_tool_result_payload(p) for p in self.payloads]
@@ -345,6 +618,11 @@ class LLMRequest:
         # 循环直到找到可用模型或耗尽重试机会
         while step.model is not None:
             model = _validate_model_entry(step.model)
+            attempt_index += 1
+            attempt_id = new_trajectory_id("attempt")
+            parent_attempt_id = previous_attempt_id
+            attempt_state = {"recorded": False}
+            attempt_started = time.perf_counter()
 
             model_identifier = model.get("model_identifier")
             if not isinstance(model_identifier, str) or not model_identifier:
@@ -482,6 +760,44 @@ class LLMRequest:
                     )
                     get_global_collector().record_request(metrics)
 
+                def _record_success(
+                    response_obj: LLMResponse,
+                    stream_error: BaseException | None = None,
+                    *,
+                    _attempt_id: str = attempt_id,
+                    _parent_attempt_id: str | None = parent_attempt_id,
+                    _attempt_number: int = attempt_index,
+                    _model: dict[str, Any] = model,
+                    _step_meta: dict[str, Any] | None = step.meta,
+                    _trimmed: list[LLMPayload] = list(trimmed_payloads),
+                    _usage: dict[str, Any] = dict(provider_usage),
+                    _state: dict[str, Any] = attempt_state,
+                    _started: float = attempt_started,
+                ) -> None:
+                    """Persist the attempt once its response content is final."""
+                    if _state.get("recorded"):
+                        return
+                    _state["recorded"] = True
+                    record_attempt(
+                        attempt_id=_attempt_id,
+                        parent_attempt_id=_parent_attempt_id,
+                        attempt_number=_attempt_number,
+                        model=_model,
+                        step_meta=_step_meta,
+                        trimmed=_trimmed,
+                        latency_s=time.perf_counter() - _started,
+                        success=stream_error is None,
+                        usage=_usage,
+                        error=stream_error,
+                        response_obj=response_obj,
+                    )
+
+                if resp._stream is None:
+                    # Non-stream (or pre-collected) responses are already complete here.
+                    _record_success(resp)
+                else:
+                    resp._on_complete = _record_success
+
                 session.record_success(latency=timer.elapsed)
                 return resp
 
@@ -545,6 +861,21 @@ class LLMRequest:
                         model_index=step.meta.get("model_index", 0) if step.meta else 0,
                     )
                     get_global_collector().record_request(metrics)
+
+                if not attempt_state["recorded"]:
+                    attempt_state["recorded"] = True
+                    record_attempt(
+                        attempt_id=attempt_id,
+                        parent_attempt_id=parent_attempt_id,
+                        attempt_number=attempt_index,
+                        model=model,
+                        step_meta=step.meta,
+                        trimmed=list(trimmed_payloads),
+                        latency_s=time.perf_counter() - attempt_started,
+                        success=False,
+                        error=classified_error,
+                    )
+                previous_attempt_id = attempt_id
 
                 retry_count += 1
                 next_step = session.next_after_error(classified_error)

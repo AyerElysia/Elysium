@@ -31,6 +31,29 @@ def isolated_global_metrics_collector(tmp_path, monkeypatch):
     monkeypatch.setattr(monitor, "_global_collector", None)
 
 
+@pytest.fixture(autouse=True)
+def isolated_global_trajectory_collector(tmp_path, monkeypatch):
+    """LLM 测试不应向真实数据湖写入任何记录。"""
+    from src.kernel.llm import trajectory_collector as tc_mod
+    from src.kernel.llm import request as req_mod
+
+    existing = tc_mod._global_collector
+    if existing is not None and hasattr(existing, "shutdown"):
+        existing.shutdown()
+    monkeypatch.setattr(tc_mod, "_global_collector", None)
+
+    # Redirect _trajectory_settings so LLMRequest writes to a throw-away lake.
+    fake_lake = str(tmp_path / "test_lake")
+    monkeypatch.setattr(req_mod, "_trajectory_settings", lambda: (True, fake_lake, 0.05, 500))
+
+    yield
+
+    created = tc_mod._global_collector
+    if created is not None and hasattr(created, "shutdown"):
+        created.shutdown()
+    monkeypatch.setattr(tc_mod, "_global_collector", None)
+
+
 # ============================================================================
 # Model Set Fixtures
 # ============================================================================

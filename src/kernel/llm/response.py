@@ -48,10 +48,12 @@ class LLMResponse:
     call_list: list[ToolCall] | None = None
     tool_call_compat: bool = False
     request_record_id: int | None = None
+    _on_complete: Callable[["LLMResponse", BaseException | None], None] | None = None
 
     _consumed: bool = False
     _appended_to_context: bool = False
     _inspector_response_attached: bool = False
+    _completion_notified: bool = False
 
     def __post_init__(self) -> None:
         """确保 message 和 call_list 不为 None，方便后续处理；如果 context_manager 为空且上层存在，则继承上层的 context_manager。"""
@@ -67,6 +69,17 @@ class LLMResponse:
             ctx = getattr(self._upper, "context_manager", None)
             if ctx:
                 self.context_manager = ctx
+
+    def _notify_complete(self, error: BaseException | None = None) -> None:
+        """Notify the request owner once after a stream has been finalized."""
+        if self._completion_notified or self._on_complete is None:
+            return
+        self._completion_notified = True
+        try:
+            self._on_complete(self, error)
+        except Exception:
+            # Observability callbacks must never alter response consumption.
+            return
 
     def _maybe_apply_tool_call_compat(self) -> None:
         """如果启用了 tool_call_compat 模式且尚未解析过工具调用，则尝试从 message 中解析工具调用信息。"""
@@ -134,6 +147,7 @@ class LLMResponse:
             content = self.message or ""
             if content:
                 yield content
+            self._notify_complete(None)
             return
 
         full_content: list[str] = []
@@ -162,6 +176,7 @@ class LLMResponse:
         self._maybe_apply_tool_call_compat()
         self.attach_to_inspector()
         self._maybe_append_response_to_context()
+        self._notify_complete(stream_error)
 
         if stream_error is not None:
             raise stream_error
@@ -205,6 +220,7 @@ class LLMResponse:
         self._maybe_apply_tool_call_compat()
         self.attach_to_inspector()
         self._maybe_append_response_to_context()
+        self._notify_complete(stream_error)
 
         if stream_error is not None:
             raise stream_error
@@ -245,6 +261,7 @@ class LLMResponse:
         self.call_list = tool_acc.finalize()
         self._maybe_apply_tool_call_compat()
         self._stream = None
+        self._notify_complete(stream_error)
 
         if stream_error is not None:
             raise stream_error
@@ -422,14 +439,18 @@ class LLMResponse:
         full_content: list[str] = []
         tool_acc = _ToolCallAccumulator()
         reasoning_acc = _ReasoningBlockAccumulator()
-        async for event in self._stream:
-            if event.text_delta:
-                full_content.append(event.text_delta)
-                await on_chunk(event.text_delta)
-            if event.reasoning_block_type or event.reasoning_delta or event.reasoning_signature_delta:
-                reasoning_acc.apply(event)
-            if event.tool_name or event.tool_args_delta or event.tool_call_id:
-                tool_acc.apply(event)
+        stream_error: Exception | None = None
+        try:
+            async for event in self._stream:
+                if event.text_delta:
+                    full_content.append(event.text_delta)
+                    await on_chunk(event.text_delta)
+                if event.reasoning_block_type or event.reasoning_delta or event.reasoning_signature_delta:
+                    reasoning_acc.apply(event)
+                if event.tool_name or event.tool_args_delta or event.tool_call_id:
+                    tool_acc.apply(event)
+        except Exception as exc:
+            stream_error = exc
 
         self.message = "".join(full_content)
         self.reasoning_parts = reasoning_acc.finalize() or self.reasoning_parts
@@ -439,6 +460,9 @@ class LLMResponse:
         self._maybe_apply_tool_call_compat()
         self.attach_to_inspector()
         self._maybe_append_response_to_context()
+        self._notify_complete(stream_error)
+        if stream_error is not None:
+            raise stream_error
         return self.message
 
     async def stream_with_buffer(self, buffer_size: int = 10) -> AsyncIterator[str]:
@@ -510,6 +534,7 @@ class LLMResponse:
         self._maybe_apply_tool_call_compat()
         self.attach_to_inspector()
         self._maybe_append_response_to_context()
+        self._notify_complete(stream_error)
 
         if stream_error is not None:
             raise stream_error
