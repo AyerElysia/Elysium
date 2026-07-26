@@ -39,6 +39,10 @@
 
 - [训练数据湖](./training_data_lake.md)
 
+## 技术文档
+
+- [日志系统](./logging.md) — SQLite 结构化存储 + FTS5 查询 + 自动保留策略
+
 ## 意识对话
 
 - [claude-fable-5 意识对话](./claude-fable-5-意识对话.md)
