@@ -116,10 +116,18 @@ def _legacy_model_set(task_name: str) -> list[dict[str, Any]]:
         from src.core.config.model_config import get_model_config
 
         mc = get_model_config()
-        return mc.get_task(task_name)
-    except Exception:
+        # 尝试直接匹配任务名
+        try:
+            return mc.get_task(task_name)
+        except (ValueError, KeyError):
+            pass
+        # 回退到 "actor" 作为默认任务
+        if task_name in ("default", "main"):
+            return mc.get_task("actor")
+        raise ValueError(f"任务 '{task_name}' 未找到")
+    except Exception as e:
         raise ValueError(
-            f"无法解析模型路由 '{task_name}'：统一配置中未定义，老配置也不可用"
+            f"无法解析模型路由 '{task_name}'：统一配置中未定义，老配置也不可用 ({e})"
         )
 
 

@@ -1,6 +1,6 @@
 """Bot 主类
 
-Neo-MoFox 框架的核心协调器，负责系统初始化、插件加载和生命周期管理。
+Elysium 框架的核心协调器，负责系统初始化、插件加载和生命周期管理。
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from src.kernel.vector_db import VectorDBBase
 
 class Bot:
-    """Neo-MoFox Bot 主类
+    """Elysium Bot 主类
 
     管理完整的 Bot 生命周期，包括：
     - Kernel 层初始化
@@ -52,7 +52,7 @@ class Bot:
         ui_level: UI 详细程度
     """
 
-    bot_name: str = "Neo-MoFox"
+    bot_name: str = "Elysium"
     bot_version: str = CORE_VERSION
 
     def __init__(
@@ -263,22 +263,34 @@ class Bot:
         7. Database
         8. VectorDB
         9. Storage
+
+        同时将所有服务注册到 DI 容器（架构 v2）。
         """
         self.ui.update_phase_status("初始化内核", "启动中...")
 
         # Step 1: Config
         from src.core.config import init_core_config, init_mcp_config, init_model_config
+        from src.kernel.config.unified import init_config as init_unified_config
+        from src.kernel.container import container
+        from src.kernel.protocols import EventBusProtocol, SchedulerProtocol, VectorStoreProtocol
 
         self.config = init_core_config(self.config_path)
         init_model_config("config/model.toml")
         init_mcp_config("config/mcp.toml")
+        # 架构 v2：统一配置（兼容模式，从老文件构建）
+        init_unified_config("config/elysium.toml")
         self.ui.update_phase_status("配置", "已加载")
 
         # Step 2: Logger
         from src.kernel.logger import get_logger, initialize_logger_system, COLOR
+        from src.kernel.protocols import LogStoreProtocol
 
         initialize_logger_system(log_level=self.config.bot.log_level)
         self.logger = get_logger(name="console", display="控制台", color=COLOR.BLUE)
+        # v2: 注册 LogStore
+        from src.kernel.logger.logger import _global_log_store
+        if _global_log_store is not None:
+            container.register(LogStoreProtocol, _global_log_store)
         self.ui.update_phase_status("日志", "已初始化")
 
         await self._preflight_llm_providers()
@@ -287,6 +299,7 @@ class Bot:
         from src.kernel.event import get_event_bus
 
         self.event_bus = get_event_bus()
+        container.register(EventBusProtocol, self.event_bus)  # v2
         self.ui.update_phase_status("事件总线", "已初始化")
 
         # Step 4: Task Manager
@@ -295,6 +308,7 @@ class Bot:
         self.task_manager = get_task_manager(
             process_workers=self.config.advanced.process_workers
         )
+        container.register(type(self.task_manager), self.task_manager)  # v2
         
         # 仅在启用时启动 WatchDog
         if self.config.bot.enable_watchdog:
@@ -308,6 +322,7 @@ class Bot:
         from src.kernel.scheduler import get_unified_scheduler
 
         self.scheduler = get_unified_scheduler()
+        container.register(SchedulerProtocol, self.scheduler)  # v2
         self.ui.update_phase_status("调度器", "已初始化")
 
         # Step 6: WatchDog（复用 Step 4 已启动的全局单例）
@@ -358,6 +373,7 @@ class Bot:
         # 确保 data 目录存在
         Path("data/chroma_db").mkdir(parents=True, exist_ok=True)
         self.vector_db = get_vector_db_service("data/chroma_db")
+        container.register(VectorStoreProtocol, self.vector_db)  # v2
         self.ui.update_phase_status("向量数据库", "已初始化")
 
         # Step 9: Storage
