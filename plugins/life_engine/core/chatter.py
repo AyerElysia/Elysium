@@ -2615,7 +2615,7 @@ class LifeChatter(BaseChatter):
         prefix_prompt = self._build_chat_router_prefix_prompt(service, chat_stream)
 
         try:
-            from plugins.default_chatter.router_agent import route_should_respond
+            from plugins.life_engine.core.router import route_should_respond
 
             result = await self._await_with_watchdog_keepalive(
                 route_should_respond(

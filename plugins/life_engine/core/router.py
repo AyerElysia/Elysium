@@ -1,6 +1,11 @@
-"""Default Chatter 路由器模块。"""
+"""对话路由器：判断此刻是否应该开口。
+
+从 default_chatter 迁移而来，作为 life_engine 自有能力。
+"""
 
 from __future__ import annotations
+
+from typing import Protocol, TypedDict
 
 import json_repair
 
@@ -12,14 +17,31 @@ from src.kernel.llm import LLMPayload, ROLE, Text
 from src.kernel.llm import LLMRequest
 from src.kernel.llm.token_counter import count_text_tokens
 
-from .type_defs import SubAgentDecision, SupportsRequestCreation
+
+class SubAgentDecision(TypedDict):
+    """路由判定结果。"""
+
+    reason: str
+    should_respond: bool
+
+
+class SupportsRequestCreation(Protocol):
+    """支持创建 LLM 请求的最小能力集合。"""
+
+    def create_request(
+        self,
+        task: str = "actor",
+        sub_task: str = "",
+        *,
+        with_reminder: str = "",
+    ) -> LLMRequest: ...
 
 
 _DEFAULT_ROUTER_FALLBACK_PROMPT = """你是当前主体的对话路由器。
 你的任务不是按硬规则拦截消息，而是站在主体自己的视角，结合近期聊天记录和新消息，判断此刻要不要开口。
 
 # 路由原则
-- 不要使用“艾特 ID 是否匹配”“是否私聊”“是否关键词命中”这类机械硬规则替主体做决定。
+- 不要使用"艾特 ID 是否匹配""是否私聊""是否关键词命中"这类机械硬规则替主体做决定。
 - @、昵称、平台 ID、群名片、表情、图片摘要都只是上下文线索，不是绝对规则。
 - 你只需要判断：如果我是这个主体，看到近期聊天和这批新消息，此刻开口是否自然、必要、有生命力。
 - 可以选择不说话：例如话还没说完、别人正在对话、接话会打断氛围、或此刻沉默更合适。
@@ -47,7 +69,7 @@ class _SafeFormatDict(dict[str, str]):
 def _safe_count_tokens(text: str, model_identifier: str) -> int:
     """安全计算文本 token 数量，失败时返回 0。"""
     try:
-        return count_text_tokens(text, model_identifier=model_identifier)
+        return count_text_tokens(text, model_identifier)
     except Exception:
         return 0
 
@@ -57,30 +79,14 @@ def _trim_text_suffix_by_budget(
     model_identifier: str,
     token_budget: int,
 ) -> str:
-    """保留文本尾部内容并控制在 token 预算内。"""
-    if token_budget <= 0 or not text:
-        return ""
-
-    total_tokens = _safe_count_tokens(text, model_identifier)
-    if total_tokens <= token_budget:
+    """保留文本末尾，使其不超过 token 预算。"""
+    if not text:
+        return text
+    total = _safe_count_tokens(text, model_identifier)
+    if total == 0 or total <= token_budget:
         return text
 
-    lines = text.splitlines()
-    kept_reversed: list[str] = []
-    used_tokens = 0
-    for line in reversed(lines):
-        line_tokens = _safe_count_tokens(line, model_identifier)
-        if kept_reversed and used_tokens + line_tokens > token_budget:
-            break
-        kept_reversed.append(line)
-        used_tokens += line_tokens
-
-    candidate = "\n".join(reversed(kept_reversed)).strip()
-    if candidate and _safe_count_tokens(candidate, model_identifier) <= token_budget:
-        return candidate
-
-    left = 0
-    right = len(text)
+    left, right = 0, len(text) - 1
     best = text[-512:]
     while left <= right:
         middle = (left + right) // 2
@@ -212,21 +218,3 @@ async def route_should_respond(
     except Exception as error:
         logger.error(f"Router 路由过程异常: {error}", exc_info=True)
         return {"should_respond": True, "reason": f"执行异常: {error}"}
-
-
-async def decide_should_respond(
-    chatter: SupportsRequestCreation,
-    logger: Logger,
-    unreads_text: str,
-    chat_stream: ChatStream,
-    fallback_prompt: str | None = None,
-) -> SubAgentDecision:
-    """兼容旧入口。新代码请使用 route_should_respond。"""
-
-    return await route_should_respond(
-        chatter=chatter,
-        logger=logger,
-        unreads_text=unreads_text,
-        chat_stream=chat_stream,
-        fallback_prompt=fallback_prompt,
-    )
