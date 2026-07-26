@@ -142,6 +142,118 @@ def render_memory_prompt(
 
 
 def build_memory_write_warning(path: str, content: str) -> str | None:
+    """检查写入内容是否可能意外覆盖大量记忆。"""
+    size = len(content.encode("utf-8"))
+    if size >= MEMORY_WRITE_WARNING_THRESHOLD_BYTES:
+        return (
+            f"⚠️ 此文件内容较大（{size // 1024}KB），"
+            "请确认不是意外覆盖整个记忆文档"
+        )
+    return None
+
+
+def format_memory_bundles_for_prompt(
+    bundles: list,
+    *,
+    max_bundles: int = 3,
+    include_history: bool = True,
+    include_corrections: bool = True,
+) -> str:
+    """完美架构：将 MemoryBundle 列表格式化为结构化的 prompt 文本。
+
+    Args:
+        bundles: MemoryBundle 列表
+        max_bundles: 最多包含多少个记忆包
+        include_history: 是否包含历史演化轨迹
+        include_corrections: 是否包含修正记录
+
+    Returns:
+        格式化的 prompt 文本，包含：
+        - 当前理解（主要依据）
+        - 历史演化（如果有）
+        - 已知修正（如果有）
+        - 不确定性说明（如果有）
+    """
+    if not bundles:
+        return ""
+
+    lines = ["<memory_context>"]
+
+    for idx, bundle in enumerate(bundles[:max_bundles], 1):
+        if idx > 1:
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+
+        # 当前理解
+        lines.append(f"## 记忆 {idx}: {bundle.query}")
+        lines.append("")
+        lines.append("### 当前理解")
+        lines.append(f"- 主要文件: {bundle.primary_path}")
+
+        if bundle.evidence:
+            lines.append("- 相关证据:")
+            for evidence in bundle.evidence[:5]:  # 最多5个证据
+                relevance_str = f"相关度 {evidence.relevance:.2f}"
+                source_str = ""
+                if evidence.source == "lineage":
+                    source_str = f" (演化关系: {evidence.relation})"
+                elif evidence.source == "associated":
+                    source_str = " (联想)"
+
+                lines.append(f"  - {evidence.file_path} ({relevance_str}{source_str})")
+
+        # 历史演化
+        if include_history and bundle.history_trace:
+            lines.append("")
+            lines.append("### 历史演化")
+
+            # 分组：earlier 和 later
+            earlier = [t for t in bundle.history_trace if t.direction == "earlier"]
+            later = [t for t in bundle.history_trace if t.direction == "later"]
+
+            if earlier:
+                lines.append("- 早期版本:")
+                for trace in earlier:
+                    reason_str = f" - {trace.reason}" if trace.reason else ""
+                    lines.append(f"  - {trace.file_path} [{trace.relation}]{reason_str}")
+
+            if later:
+                lines.append("- 后续演化:")
+                for trace in later:
+                    reason_str = f" - {trace.reason}" if trace.reason else ""
+                    lines.append(f"  - {trace.file_path} [{trace.relation}]{reason_str}")
+
+        # 已知修正
+        if include_corrections and bundle.corrections:
+            lines.append("")
+            lines.append("### 已知修正")
+            for correction in bundle.corrections[:3]:  # 最多3条修正
+                source_label = {
+                    "user": "用户纠正",
+                    "reflection": "反思修正",
+                    "system": "系统修正",
+                }.get(correction.source, correction.source)
+
+                # 格式化时间
+                from datetime import datetime
+                dt = datetime.fromtimestamp(correction.created_at)
+                time_str = dt.strftime("%Y-%m-%d")
+
+                lines.append(f"- [{source_label}, {time_str}] {correction.message}")
+
+        # 不确定性
+        if bundle.uncertainty and bundle.uncertainty.strip():
+            lines.append("")
+            lines.append("### 不确定性")
+            lines.append(f"- {bundle.uncertainty}")
+
+    lines.append("")
+    lines.append("</memory_context>")
+
+    return "\n".join(lines)
+
+
     """当写入 MEMORY.md 时，根据写入结果给出告警。"""
     if Path(path).name.upper() != "MEMORY.MD":
         return None

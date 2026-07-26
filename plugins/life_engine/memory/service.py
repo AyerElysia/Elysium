@@ -724,9 +724,25 @@ class LifeMemoryService:
         *,
         now: Any = None,
         workspace_path: str | Path | None = None,
-    ) -> List[SearchResult]:
-        """混合检索 + 联想，优先使用已就绪的 chunk 向量集合。"""
-        return await search_memory(
+        return_bundles: bool = True,
+    ) -> List[MemoryBundle] | List[SearchResult]:
+        """混合检索 + 联想，默认返回完整的可追溯记忆包。
+
+        Args:
+            query: 检索查询
+            top_k: 返回结果数量
+            enable_association: 是否启用联想扩散
+            file_types: 文件类型过滤
+            time_range_days: 时间范围过滤（天数）
+            now: 时间基准（测试用）
+            workspace_path: 工作空间路径（测试用）
+            return_bundles: 是否返回完整记忆包（默认 True，完美架构）
+
+        Returns:
+            List[MemoryBundle]: 完整认知包（默认，包含演化历史）
+            List[SearchResult]: 简单搜索结果（仅当 return_bundles=False）
+        """
+        simple_results = await search_memory(
             db=self._db,
             query=query,
             collection=self._chroma_collection,
@@ -738,6 +754,17 @@ class LifeMemoryService:
             now=self._clock if now is None else now,
             workspace_path=(self._get_workspace_path() if workspace_path is None else workspace_path),
             chunk_collection=self._chunk_collection,
+        )
+
+        if not return_bundles:
+            # 降级模式：返回简单结果列表
+            return simple_results
+
+        # 完美架构：默认返回完整记忆包
+        return await self.build_memory_bundles(
+            query=query,
+            results=simple_results,
+            top_k=top_k,
         )
 
     async def search_memory_detailed(
@@ -1174,15 +1201,46 @@ class LifeMemoryService:
         file_types: Optional[List[str]] = None,
         time_range_days: int = 0,
     ) -> List[MemoryBundle]:
-        """检索并返回可追溯记忆包。"""
-        results = await self.search_memory(
+        """检索并返回可追溯记忆包。
+
+        注意：这个方法现在是 search_memory() 的别名（向后兼容）。
+        推荐直接使用 search_memory()，它默认返回 MemoryBundle。
+        """
+        return await self.search_memory(
             query=query,
             top_k=top_k,
             enable_association=enable_association,
             file_types=file_types,
             time_range_days=time_range_days,
+            return_bundles=True,
         )
-        return await self.build_memory_bundles(query=query, results=results, top_k=top_k)
+
+    async def search_memory_simple(
+        self,
+        query: str,
+        top_k: int = 5,
+        enable_association: bool = True,
+        file_types: Optional[List[str]] = None,
+        time_range_days: int = 0,
+        *,
+        now: Any = None,
+        workspace_path: str | Path | None = None,
+    ) -> List[SearchResult]:
+        """简单检索模式，返回无演化历史的搜索结果列表。
+
+        警告：这是降级版本，仅用于特殊场景（如性能敏感的内部操作）。
+        正常情况下应该使用 search_memory()，它默认返回完整记忆包。
+        """
+        return await self.search_memory(
+            query=query,
+            top_k=top_k,
+            enable_association=enable_association,
+            file_types=file_types,
+            time_range_days=time_range_days,
+            now=now,
+            workspace_path=workspace_path,
+            return_bundles=False,
+        )
 
     async def _get_or_create_file_node_from_workspace(self, file_path: str) -> MemoryNode:
         """Load an eligible workspace document, or reuse an indexed historical node.
