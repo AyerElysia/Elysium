@@ -631,15 +631,16 @@ class FeishuAdapter(BaseAdapter):
         url = self._api_url(
             f"/open-apis/im/v1/messages/{message_id}/resources/{resource_key}"
         )
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.get(
-                url,
-                params={"type": resource_type},
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json; charset=utf-8",
-                },
-            )
+        resp = await self._request_with_retry(
+            "GET",
+            url,
+            timeout=30.0,
+            params={"type": resource_type},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+        )
 
         content_type = str(resp.headers.get("content-type") or "").lower()
         if resp.status_code >= 400:
@@ -838,13 +839,14 @@ class FeishuAdapter(BaseAdapter):
             "file_name": filename,
             "duration": str(duration_ms),
         }
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                url,
-                headers={"Authorization": f"Bearer {token}"},
-                data=data,
-                files=files,
-            )
+        resp = await self._request_with_retry(
+            "POST",
+            url,
+            timeout=30.0,
+            headers={"Authorization": f"Bearer {token}"},
+            data=data,
+            files=files,
+        )
         payload = self._decode_response(resp)
         file_key = str((payload.get("data") or {}).get("file_key") or "")
         if not file_key:
@@ -988,18 +990,55 @@ class FeishuAdapter(BaseAdapter):
             },
         )
 
+    async def _request_with_retry(
+        self,
+        method: str,
+        url: str,
+        *,
+        timeout: float = 20.0,
+        max_retries: int = 2,
+        initial_delay: float = 0.5,
+        backoff_factor: float = 2.0,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """发起 HTTP 请求，仅对传输层抖动重试。
+
+        飞书开放平台偶发 "Server disconnected without sending a response"，
+        不重试会让消息永久丢失。业务错误（4xx / code != 0）由调用方处理，不在此重试。
+        """
+        delay = initial_delay
+        last_error: Exception | None = None
+        for attempt in range(max_retries + 1):
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    return await client.request(method, url, **kwargs)
+            except httpx.TransportError as exc:
+                last_error = exc
+                if attempt >= max_retries:
+                    break
+                logger.warning(
+                    f"飞书请求传输失败，重试中: url={url} "
+                    f"attempt={attempt + 1}/{max_retries + 1} "
+                    f"error={type(exc).__name__}: {exc}"
+                )
+                await asyncio.sleep(delay)
+                delay *= backoff_factor
+        assert last_error is not None
+        raise last_error
+
     async def _post_json(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
         token = await self._get_tenant_access_token()
         url = self._api_url(path)
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json; charset=utf-8",
-                },
-                json=body,
-            )
+        resp = await self._request_with_retry(
+            "POST",
+            url,
+            timeout=20.0,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            json=body,
+        )
         data = self._decode_response(resp)
         if int(data.get("code", 0)) != 0:
             raise RuntimeError(f"Feishu API failed: path={path}, response={data}")
@@ -1014,14 +1053,15 @@ class FeishuAdapter(BaseAdapter):
         if not config.app.app_id or not config.app.app_secret:
             raise RuntimeError("Feishu app_id/app_secret 未配置")
 
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.post(
-                self._api_url("/open-apis/auth/v3/tenant_access_token/internal"),
-                json={
-                    "app_id": config.app.app_id,
-                    "app_secret": config.app.app_secret,
-                },
-            )
+        resp = await self._request_with_retry(
+            "POST",
+            self._api_url("/open-apis/auth/v3/tenant_access_token/internal"),
+            timeout=20.0,
+            json={
+                "app_id": config.app.app_id,
+                "app_secret": config.app.app_secret,
+            },
+        )
         data = self._decode_response(resp)
         if int(data.get("code", 0)) != 0:
             raise RuntimeError(f"Feishu tenant_access_token failed: {data}")

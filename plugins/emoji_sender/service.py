@@ -226,8 +226,17 @@ class EmojiSenderService(BaseService):
         return hashlib.sha256(data).hexdigest()
 
     @staticmethod
-    def _guess_mime(suffix: str) -> str:
-        """根据后缀猜测 MIME。"""
+    def _detect_mime(data: bytes, suffix: str = "") -> str:
+        """从文件内容（magic bytes）检测真实 MIME，后缀仅作 fallback。"""
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            return "image/png"
+        if data[:2] == b"\xff\xd8":
+            return "image/jpeg"
+        if data[:6] in (b"GIF87a", b"GIF89a"):
+            return "image/gif"
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return "image/webp"
+        # fallback: 按后缀猜
         suffix = suffix.lower()
         return {
             ".png": "image/png",
@@ -645,7 +654,7 @@ class EmojiSenderService(BaseService):
 
             # 压缩图片用于 VLM
             try:
-                mime = self._guess_mime(source.suffix)
+                mime = self._detect_mime(payload, source.suffix)
                 vlm_bytes, vlm_mime, is_gif_collage = self._compress_image_for_vlm(payload, mime)
             except Exception as e:
                 logger.warning(f"压缩图片失败: {source} - {e}")
