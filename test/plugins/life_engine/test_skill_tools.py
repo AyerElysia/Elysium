@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from plugins.life_engine.core.config import LifeEngineConfig
-from plugins.life_engine.tools.skill_tools import LifeEngineManageSkillTool
+from plugins.life_engine.tools.skill_tools import LifeEngineSkillTool
 from plugins.skill_manager.config import SkillManagerConfig
 
 
@@ -20,8 +20,8 @@ def _make_plugin(tmp_path: Path) -> SimpleNamespace:
     return SimpleNamespace(config=config)
 
 
-def _make_tool(tmp_path: Path) -> LifeEngineManageSkillTool:
-    return LifeEngineManageSkillTool(plugin=cast(Any, _make_plugin(tmp_path)))
+def _make_tool(tmp_path: Path) -> LifeEngineSkillTool:
+    return LifeEngineSkillTool(plugin=cast(Any, _make_plugin(tmp_path)))
 
 
 class _FakePluginManager:
@@ -42,7 +42,6 @@ class _FakeSkillManager:
         self.skills["fresh"] = object()
 
 
-@pytest.mark.asyncio
 async def test_manage_skill_draft_publish_and_archive(tmp_path: Path) -> None:
     tool = _make_tool(tmp_path)
     skill_manager = _FakeSkillManager()
@@ -103,7 +102,6 @@ async def test_manage_skill_draft_publish_and_archive(tmp_path: Path) -> None:
     assert "skill_archive" in payload["archived_path"]
 
 
-@pytest.mark.asyncio
 async def test_manage_skill_rejects_script_like_skill(tmp_path: Path) -> None:
     tool = _make_tool(tmp_path)
 
@@ -121,7 +119,6 @@ async def test_manage_skill_rejects_script_like_skill(tmp_path: Path) -> None:
     assert not (tmp_path / "skill_drafts" / "dangerous-runner" / "SKILL.md").exists()
 
 
-@pytest.mark.asyncio
 async def test_manage_skill_validate_reports_frontmatter_errors(tmp_path: Path) -> None:
     tool = _make_tool(tmp_path)
     bad = tmp_path / "skill_drafts" / "bad-skill" / "SKILL.md"
