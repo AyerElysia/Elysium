@@ -1,46 +1,22 @@
 """
 Logger 模块
 
-基于 rich 库的统一日志系统，支持彩色渲染、元数据跟踪、文件输出和异常格式化。
+基于 rich 库的统一日志系统，支持彩色渲染、元数据跟踪、SQLite 结构化存储和异常格式化。
 
 用法示例:
     from src.kernel.logger import (
-        initialize_logger_system, get_logger, COLOR, RotationMode, LOG_OUTPUT_EVENT
+        initialize_logger_system, get_logger, COLOR, LOG_OUTPUT_EVENT, query_logs
     )
-    from src.kernel.event import event_bus
 
     # 初始化全局日志配置（在核心启动时调用）
-    initialize_logger_system(
-        log_dir="logs/app",
-        log_level="INFO",
-        enable_file=True,
-        file_rotation=RotationMode.DATE,
-    )
+    initialize_logger_system(log_level="INFO", db_path="data/logs.db")
 
     # 创建日志记录器（将使用全局配置）
     logger = get_logger("my_logger", display="我的日志", color=COLOR.BLUE)
     logger.info("Hello World!")
 
-    # 覆盖全局配置
-    logger2 = get_logger("debug_logger", log_level="DEBUG")
-    logger2.debug("这条debug日志会显示")
-
-    # 使用元数据
-    logger.set_metadata("user_id", "12345")
-    logger.info("用户登录", ip="192.168.1.1")
-
-    # 使用面板输出
-    logger.print_panel("重要消息", title="通知")
-
-    # 启用事件广播
-    async def on_log(event_name, params):
-        print(f"[{params['level']}] {params['message']}")
-        from src.kernel.event import EventDecision
-        return (EventDecision.SUCCESS, params)
-
-    logger = get_logger("my_logger", enable_event_broadcast=True)
-    event_bus.subscribe(LOG_OUTPUT_EVENT, on_log)
-    logger.info("这条日志会被广播到事件系统")
+    # 查询日志
+    results = query_logs(level="ERROR", search="崩溃", limit=20)
 """
 
 from .logger import (
@@ -57,7 +33,41 @@ from .logger import (
     LOG_OUTPUT_EVENT,
 )
 from .color import COLOR, get_rich_color, DEFAULT_LEVEL_COLORS
-from .file_handler import FileHandler, RotationMode
+from .db_store import LogStore, SESSION_ID
+from .stdlib_bridge import install_stdlib_bridge, uninstall_stdlib_bridge
+
+
+def query_logs(
+    level: str | None = None,
+    module: str | None = None,
+    search: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> list[dict]:
+    """查询日志（供 webui/CLI 使用）。
+
+    Args:
+        level: 过滤级别（如 "ERROR"）
+        module: 过滤模块（支持前缀匹配）
+        search: 全文搜索关键词（FTS5）
+        since: 起始时间（ISO 格式）
+        until: 截止时间（ISO 格式）
+        limit: 返回条数上限
+        offset: 偏移量
+
+    Returns:
+        日志记录列表
+    """
+    from .logger import _global_log_store
+    if _global_log_store is None:
+        return []
+    return _global_log_store.query(
+        level=level, module=module, search=search,
+        since=since, until=until, limit=limit, offset=offset,
+    )
+
 
 __all__ = [
     # 全局初始化
@@ -69,9 +79,14 @@ __all__ = [
     "get_logger",
     "Logger",
     "COLOR",
-    # 文件输出相关
-    "FileHandler",
-    "RotationMode",
+    # 查询接口
+    "query_logs",
+    # 存储引擎
+    "LogStore",
+    "SESSION_ID",
+    # stdlib 桥接
+    "install_stdlib_bridge",
+    "uninstall_stdlib_bridge",
     # 辅助函数
     "remove_logger",
     "get_all_loggers",
@@ -84,4 +99,4 @@ __all__ = [
 ]
 
 # 版本信息
-__version__ = "1.1.0-alpha"
+__version__ = "2.0.0"

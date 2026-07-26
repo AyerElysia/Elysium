@@ -277,7 +277,7 @@ class Bot:
         # Step 2: Logger
         from src.kernel.logger import get_logger, initialize_logger_system, COLOR
 
-        initialize_logger_system(log_dir=self.log_dir, log_level=self.config.bot.log_level)
+        initialize_logger_system(log_level=self.config.bot.log_level)
         self.logger = get_logger(name="console", display="控制台", color=COLOR.BLUE)
         self.ui.update_phase_status("日志", "已初始化")
 

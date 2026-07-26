@@ -1,7 +1,7 @@
 """
 统一日志系统
 
-基于 rich 库的日志输出，支持彩色渲染、元数据跟踪和文件输出。
+基于 rich 库的日志输出，支持彩色渲染、元数据跟踪和 SQLite 结构化存储。
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from rich.text import Text
 from rich.traceback import install as install_rich_traceback
 
 from .color import COLOR, get_rich_color
-from .file_handler import FileHandler, RotationMode
+from .db_store import LogStore
 
 if TYPE_CHECKING:
     from src.kernel.event import EventBus
@@ -154,16 +154,17 @@ def _strip_rich_markup(message: str) -> str:
 _global_config: dict[str, Any] = {
     "log_dir": "logs",
     "log_level": "DEBUG",  # DEBUG, INFO, WARNING, ERROR, CRITICAL
-    "enable_file": False,
-    "file_rotation": RotationMode.DATE,
-    "max_file_size": 10 * 1024 * 1024,  # 10MB
+    "enable_db": False,
+    "db_path": "data/logs.db",
+    "retention_debug_days": 3,
+    "retention_info_days": 30,
     "enable_event_broadcast": True,
 }
 _config_lock = threading.Lock()
 
-# 全局共享的文件处理器（所有logger共享同一个）
-_global_file_handler: FileHandler | None = None
-_file_handler_lock = threading.Lock()
+# 全局共享的日志存储（所有logger共享同一个）
+_global_log_store: LogStore | None = None
+_log_store_lock = threading.Lock()
 
 # 日志等级优先级映射
 _LOG_LEVEL_PRIORITY = {
@@ -178,17 +179,16 @@ _LOG_LEVEL_PRIORITY = {
 class Logger:
     """日志记录器
 
-    提供彩色日志输出、元数据跟踪、rich 渲染支持和文件输出。
+    提供彩色日志输出、元数据跟踪、rich 渲染支持和 SQLite 结构化存储。
 
     Attributes:
         name: 日志记录器名称
         display: 显示名称（用于输出前缀）
         color: 日志颜色
         console: rich.Console 实例
-        file_handler: 文件处理器（可选）
         metadata: 元数据字典
         _lock: 线程锁
-        _enable_file: 是否启用文件输出
+        _enable_db: 是否启用数据库存储
         _log_level: 日志等级
     """
 
@@ -198,7 +198,7 @@ class Logger:
         display: str | None = None,
         color: COLOR | str = COLOR.WHITE,
         console: Console | None = None,
-        enable_file: bool = False,
+        enable_db: bool = False,
         enable_event_broadcast: bool = True,
         log_level: str | None = None,
     ) -> None:
@@ -209,7 +209,7 @@ class Logger:
             display: 显示名称，如果为 None 则使用 name
             color: 日志颜色
             console: rich.Console 实例，如果为 None 则创建默认实例
-            enable_file: 是否启用文件输出（使用全局共享的文件处理器）
+            enable_db: 是否启用数据库存储（使用全局共享的 LogStore）
             enable_event_broadcast: 是否启用事件广播（发布到 on_log_output 事件）
             log_level: 日志等级，如果为 None 则使用全局配置
         """
@@ -218,7 +218,7 @@ class Logger:
         self.color = get_rich_color(color)
         self.metadata: dict[str, Any] = {}
         self._lock = threading.Lock()
-        self._enable_file = enable_file
+        self._enable_db = enable_db
         self._enable_event_broadcast = enable_event_broadcast
 
         # 设置日志等级
@@ -355,21 +355,19 @@ class Logger:
                     exc_text = Text("".join(exc_lines), style="dim")
                     self.console.print(exc_text)
 
-            # 输出到文件（如果启用，不受日志级别过滤）
-            if self._enable_file:
-                global _global_file_handler
-                if _global_file_handler is not None:
-                    # 构建纯文本日志（不带颜色代码）
+            # 输出到数据库（如果启用，不受日志级别过滤）
+            if self._enable_db:
+                if _global_log_store is not None:
                     plain_message = _strip_rich_markup(message)
-                    log_line = f"[{timestamp_short}] {self.display} | {level} | {plain_message}"
-                    if all_metadata:
-                        metadata_str = " | ".join([f"{k}={v}" for k, v in all_metadata.items()])
-                        log_line += f"\n  {metadata_str}"
+                    meta = dict(all_metadata)
                     if exc_lines:
-                        log_line += "\n" + "".join(exc_lines)
-                    log_line += "\n"
-
-                    _global_file_handler.write(log_line)
+                        meta["exception"] = "".join(exc_lines)
+                    _global_log_store.write(
+                        level=level,
+                        module=self.name,
+                        message=plain_message,
+                        metadata=meta or None,
+                    )
 
             # 发布事件广播（如果启用）
             if self._enable_event_broadcast:
@@ -531,10 +529,10 @@ class Logger:
 
     def __repr__(self) -> str:
         """日志记录器字符串表示"""
-        file_status = "enabled" if self._enable_file else "disabled"
+        db_status = "enabled" if self._enable_db else "disabled"
         return (
             f"Logger(name='{self.name}', display='{self.display}', "
-            f"color='{self.color}', file={file_status})"
+            f"color='{self.color}', db={db_status})"
         )
 
 
@@ -544,67 +542,58 @@ _lock = threading.Lock()
 
 
 def initialize_logger_system(
-    log_dir: str | Path = "logs",
     log_level: str = "DEBUG",
-    enable_file: bool = True,
-    file_rotation: RotationMode = RotationMode.DATE,
-    max_file_size: int = 10 * 1024 * 1024,
+    enable_db: bool = True,
+    db_path: str | Path = "data/logs.db",
+    retention_debug_days: int = 3,
+    retention_info_days: int = 30,
     enable_event_broadcast: bool = True,
-    log_filename: str = "mofox",
+    **_legacy: Any,
 ) -> None:
     """初始化日志系统全局配置
 
     此方法应在核心启动时调用，用于设置全局的日志配置。
-    之后创建的所有logger将默认使用这些配置（除非在创建时显式指定）。
-    
-    所有logger将共享同一个日志文件，不会为每个logger创建单独的文件。
+    之后创建的所有 logger 将默认使用这些配置（除非在创建时显式指定）。
+
+    所有 logger 共享同一个 SQLite 日志存储（data/logs.db）。
 
     Args:
-        log_dir: 日志文件目录路径
         log_level: 全局日志等级（DEBUG, INFO, WARNING, ERROR, CRITICAL）
-        enable_file: 是否默认启用文件输出
-        file_rotation: 文件轮转模式
-        max_file_size: 单个日志文件最大大小（字节）
+        enable_db: 是否启用 SQLite 结构化存储
+        db_path: SQLite 数据库文件路径
+        retention_debug_days: DEBUG 级别日志保留天数
+        retention_info_days: INFO+ 级别日志保留天数
         enable_event_broadcast: 是否默认启用事件广播
-        log_filename: 日志文件基础名称（所有logger共享）
 
     Example:
         >>> from src.kernel.logger import initialize_logger_system
-        >>> # 在核心启动时调用
-        >>> initialize_logger_system(
-        ...     log_dir="logs/app",
-        ...     log_level="INFO",
-        ...     enable_file=True,
-        ...     log_filename="mofox",
-        ... )
+        >>> initialize_logger_system(log_level="INFO", db_path="data/logs.db")
     """
-    global _global_file_handler
+    global _global_log_store
     _set_event_broadcast_stopped(False)
-    
+
     with _config_lock:
-        _global_config["log_dir"] = log_dir
         _global_config["log_level"] = log_level.upper()
-        _global_config["enable_file"] = enable_file
-        _global_config["file_rotation"] = file_rotation
-        _global_config["max_file_size"] = max_file_size
+        _global_config["enable_db"] = enable_db
+        _global_config["db_path"] = str(db_path)
+        _global_config["retention_debug_days"] = retention_debug_days
+        _global_config["retention_info_days"] = retention_info_days
         _global_config["enable_event_broadcast"] = enable_event_broadcast
-    
-    # 创建或重新创建全局文件处理器
-    with _file_handler_lock:
-        # 关闭旧的文件处理器（如果存在）
-        if _global_file_handler is not None:
-            _global_file_handler.close()
-        
-        # 创建新的文件处理器
-        if enable_file:
-            _global_file_handler = FileHandler(
-                log_dir=log_dir,
-                base_filename=log_filename,
-                rotation_mode=file_rotation,
-                max_size=max_file_size,
+
+    # 创建或重新创建全局 LogStore
+    if enable_db:
+        with _log_store_lock:
+            if _global_log_store is not None:
+                _global_log_store.close()
+            _global_log_store = LogStore(
+                db_path=db_path,
+                retention_debug_days=retention_debug_days,
+                retention_info_days=retention_info_days,
             )
-        else:
-            _global_file_handler = None
+        # 安装 stdlib 桥接
+        from .stdlib_bridge import install_stdlib_bridge
+        install_stdlib_bridge(_global_log_store)
+
     # 安装 rich traceback
     install_rich_traceback_formatter()
 
@@ -623,20 +612,21 @@ def get_logger(
     display: str | None = None,
     color: COLOR | str | None = None,
     console: Console | None = None,
-    enable_file: bool | None = None,
+    enable_db: bool | None = None,
     enable_event_broadcast: bool | None = None,
     log_level: str | None = None,
+    **_legacy: Any,
 ) -> Logger:
     """获取或创建日志记录器
-    
-    所有logger共享同一个日志文件，文件配置通过 initialize_logger_system() 设置。
+
+    所有 logger 共享同一个 SQLite 日志存储，配置通过 initialize_logger_system() 设置。
 
     Args:
         name: 日志记录器名称（唯一标识）
         display: 显示名称，如果为 None 则使用 name
         color: 日志颜色；为 None 时根据 name 自动映射默认颜色
         console: rich.Console 实例
-        enable_file: 是否启用文件输出（None 则使用全局配置）
+        enable_db: 是否启用 SQLite 存储（None 则使用全局配置）
         enable_event_broadcast: 是否启用事件广播（None 则使用全局配置）
         log_level: 日志等级（None 则使用全局配置）
 
@@ -645,35 +635,30 @@ def get_logger(
 
     Example:
         >>> from src.kernel.logger import get_logger, COLOR, initialize_logger_system
-        >>> # 先初始化全局配置
-        >>> initialize_logger_system(log_dir="logs", log_level="INFO", enable_file=True)
-        >>> # 使用全局配置创建logger
+        >>> initialize_logger_system(log_level="INFO")
         >>> logger = get_logger("my_logger", display="我的日志", color=COLOR.BLUE)
         >>> logger.info("Hello World!")
-        >>> # 覆盖全局配置
-        >>> logger2 = get_logger("my_logger2", log_level="DEBUG")
-        >>> logger2.debug("这条debug日志会显示")
     """
     with _lock:
         if name not in _loggers:
             _maybe_resume_event_broadcast()
             # 使用全局配置作为默认值
             with _config_lock:
-                actual_enable_file = enable_file if enable_file is not None else _global_config["enable_file"]
+                actual_enable_db = enable_db if enable_db is not None else _global_config["enable_db"]
                 actual_enable_event_broadcast = (
-                    enable_event_broadcast if enable_event_broadcast is not None 
+                    enable_event_broadcast if enable_event_broadcast is not None
                     else _global_config["enable_event_broadcast"]
                 )
             actual_color = color if color is not None else _get_default_logger_color_by_name(name)
-            
+
             _loggers[name] = Logger(
                 name=name,
                 display=display,
                 color=actual_color,
                 console=console,
-                enable_file=actual_enable_file,
+                enable_db=actual_enable_db,
                 enable_event_broadcast=actual_enable_event_broadcast,
-                log_level=log_level,  # None 时 Logger 自动跟随全局配置
+                log_level=log_level,
             )
         return _loggers[name]
 
@@ -703,20 +688,20 @@ def get_all_loggers() -> dict[str, Logger]:
     with _lock:
         return dict(_loggers)
 
-def _close_global_file_handler() -> None:
-    global _global_file_handler
-
-    with _file_handler_lock:
-        if _global_file_handler is not None:
-            _global_file_handler.close()
-            _global_file_handler = None
+def _close_global_log_store() -> None:
+    """关闭全局 LogStore。"""
+    global _global_log_store
+    with _log_store_lock:
+        if _global_log_store is not None:
+            _global_log_store.close()
+            _global_log_store = None
 
 
 async def shutdown_logger_system_async(timeout: float = 1.0) -> None:
     """异步关闭日志系统，先收尾日志事件广播任务。"""
     _set_event_broadcast_stopped(True)
     await _drain_event_broadcast_tasks(timeout=timeout)
-    _close_global_file_handler()
+    _close_global_log_store()
 
 
 def shutdown_logger_system() -> None:
@@ -729,14 +714,13 @@ def shutdown_logger_system() -> None:
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        # 没有运行中的事件循环时，不能再有活跃 asyncio task。
         pass
     else:
         with _event_broadcast_lock:
             tasks = [task for task in _event_broadcast_tasks if not task.done()]
         for task in tasks:
             task.cancel()
-    _close_global_file_handler()
+    _close_global_log_store()
 
 
 def install_rich_traceback_formatter():
