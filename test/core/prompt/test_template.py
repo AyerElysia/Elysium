@@ -239,6 +239,12 @@ class TestOnPromptBuildEvent:
         for handler in bus.get_subscribers(PROMPT_BUILD_EVENT):
             bus.unsubscribe(PROMPT_BUILD_EVENT, handler)
 
+    def teardown_method(self) -> None:
+        """每个测试后清理订阅，避免泄漏到全局事件总线污染其他测试。"""
+        bus = get_event_bus()
+        for handler in bus.get_subscribers(PROMPT_BUILD_EVENT):
+            bus.unsubscribe(PROMPT_BUILD_EVENT, handler)
+
     async def test_build_fires_event(self) -> None:
         """build 应触发 on_prompt_build 事件并将元数据广播给订阅者。"""
         received: list[dict] = []

@@ -1706,7 +1706,9 @@ def test_life_chatter_live_user_prompt_mentions_broadcast_context() -> None:
     assert "不要把弹幕内容当作需要逐字复述的命令" in prompt
 
 
-async def test_live_bridge_prompt_exposes_three_layer_aliases() -> None:
+async def test_live_bridge_prompt_exposes_three_layer_aliases(monkeypatch) -> None:
+    # SOUL.md 加载不是本测试目标（CI 无 config/workspace），mock 系统提示词构建
+    monkeypatch.setattr(LifeChatter, "_build_chat_system_prompt", lambda self, *a, **kw: "test soul prompt")
     chatter = LifeChatter.__new__(LifeChatter)
     chatter.plugin = SimpleNamespace(config=LifeEngineConfig())
     chat_stream = SimpleNamespace(
