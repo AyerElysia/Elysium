@@ -1,0 +1,53 @@
+{
+  "name": "diary_plugin",
+  "version": "2.0.0",
+  "description": "日记插件 - 保留按天日记能力，并新增按聊天隔离的连续记忆空间",
+  "author": "MoFox Team",
+  "dependencies": {
+    "plugins": [],
+    "components": []
+  },
+  "include": [
+    {
+      "component_type": "service",
+      "component_name": "diary_service",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "tool",
+      "component_name": "read_diary",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "action",
+      "component_name": "write_diary",
+      "dependencies": [
+        "diary_plugin:tool:read_diary",
+        "diary_plugin:service:diary_service"
+      ],
+      "enabled": true
+    },
+    {
+      "component_type": "event_handler",
+      "component_name": "auto_diary_handler",
+      "dependencies": [
+        "diary_plugin:service:diary_service"
+      ],
+      "enabled": true
+    },
+    {
+      "component_type": "event_handler",
+      "component_name": "continuous_memory_prompt_injector",
+      "dependencies": [
+        "diary_plugin:service:diary_service"
+      ],
+      "enabled": true
+    }
+  ],
+  "entry_point": "plugin.py",
+  "min_core_version": "1.0.0",
+  "python_dependencies": [],
+  "dependencies_required": true
+}

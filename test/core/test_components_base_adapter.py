@@ -75,16 +75,21 @@ class TestBaseAdapter:
 
     def test_get_signature_without_plugin_name(self):
         """测试未设置插件名称时获取签名。"""
+        # 防御性清理：确保 _plugin_ 处于未设置状态（避免被其他测试污染）
+        if hasattr(TestAdapter, "_plugin_"):
+            del TestAdapter._plugin_
         signature = TestAdapter.get_signature()
         assert signature is None
 
     def test_get_signature_with_plugin_name(self):
         """测试设置插件名称后获取签名。"""
         TestAdapter._plugin_ = "test_plugin"
-        signature = TestAdapter.get_signature()
-        assert signature == "test_plugin:adapter:test_adapter"
-        # 重置
-        TestAdapter._plugin_ = "unknown_plugin"
+        try:
+            signature = TestAdapter.get_signature()
+            assert signature == "test_plugin:adapter:test_adapter"
+        finally:
+            # 恢复未设置状态（_plugin_ 只是注解，无默认值，须删除而非赋假值）
+            del TestAdapter._plugin_
 
     def test_adapter_initialization(self):
         """测试适配器初始化。"""

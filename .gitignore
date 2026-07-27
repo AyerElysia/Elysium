@@ -104,6 +104,11 @@ data/
 
 plugins/*
 
+!plugins/diary_plugin/
+!plugins/elysia_generated_emoji/
+!plugins/thinking_plugin/
+!plugins/tts_voice_plugin/
+
 !plugins/neko_surface/
 !plugins/neko_surface/**
 plugins/neko_surface/**/__pycache__/

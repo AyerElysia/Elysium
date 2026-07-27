@@ -598,6 +598,25 @@ class EmojiSenderService(BaseService):
 
         raw = (response.message or response.reasoning_content or "").strip()
         obj = self._extract_json_object(raw)
+
+        # 推理模型（如 MiMo）的 reasoning 长度不可控，偶发把输出预算吃光导致
+        # content 是半截 JSON。此时换用任务列表里的后备模型重试一次。
+        if obj is None and len(model_set) > 1:
+            logger.debug(f"VLM 首选模型输出无法解析，降级重试 | raw={raw[:200]!r}")
+            retry_request = create_llm_request(
+                model_set=model_set[1:],
+                request_name="emoji_sender_label",
+                context_manager=LLMContextManager(),
+            )
+            retry_request.add_payload(LLMPayload(ROLE.USER, [Text(prompt), Image(image_value)]))
+            try:
+                retry_response = await retry_request.send(stream=False)
+                await retry_response
+                raw = (retry_response.message or retry_response.reasoning_content or "").strip()
+                obj = self._extract_json_object(raw)
+            except Exception as e:
+                logger.warning(f"VLM 降级重试失败: {e}")
+
         if obj is None:
             logger.warning(f"VLM 输出无法解析为 JSON，跳过 | raw={raw[:300]!r}")
             return None

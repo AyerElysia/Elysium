@@ -1,0 +1,1 @@
+"""Elysia generated emoji plugin."""

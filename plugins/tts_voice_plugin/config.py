@@ -1,0 +1,191 @@
+"""TTS Voice 插件配置。
+
+定义 GPT-SoVITS 语音合成插件的配置项，包括基础设置、风格列表、高级参数和空间音效。
+"""
+
+from typing import ClassVar
+
+from src.core.components.base.config import BaseConfig, Field, SectionBase, config_section
+
+
+@config_section("plugin")
+class PluginSection(SectionBase):
+    """插件基本配置。"""
+
+    enable: bool = Field(default=False, description="是否启用插件")
+    keywords: list[str] = Field(
+        default_factory=lambda: [
+            "发语音", "语音", "说句话", "用语音说", "听你", "听声音",
+            "想听你", "想听声音", "讲个话", "说段话", "念一下", "读一下",
+            "用嘴说", "说", "能发语音吗", "亲口",
+        ],
+        description="触发语音合成的关键词列表",
+    )
+
+
+@config_section("components")
+class ComponentsSection(SectionBase):
+    """组件启用控制。"""
+
+    action_enabled: bool = Field(default=True, description="是否启用 Action 组件")
+    action_always_available: bool = Field(
+        default=True,
+        description=(
+            "是否让 tts_voice_action 始终可用。"
+            "开启后不会依赖随机/关键词/LLM 判定，适合 default_chatter 稳定调用 TTS。"
+        ),
+    )
+    command_enabled: bool = Field(default=True, description="是否启用 Command 组件")
+
+
+@config_section("prompt")
+class PromptSection(SectionBase):
+    """自定义提示词配置。"""
+
+    custom_instructions: str = Field(
+        default="",
+        description=(
+            "追加到 tts_voice_action action 描述末尾的自定义指令。\n"
+            "可描述希望 AI 主动使用语音功能的具体场景，"
+            "例如：在表达亲密感、讲故事或用户明确要求听声音时主动使用。\n"
+            "不会覆盖已有的触发条件，只是扩充场景说明。"
+        ),
+    )
+
+
+@config_section("tts")
+class TTSSection(SectionBase):
+    """TTS 语音合成基础配置。"""
+
+    engine: str = Field(
+        default="gpt_sovits",
+        description=(
+            "使用的 TTS 引擎：'gpt_sovits' (本地)、"
+            "'mimo_cloud' (MiMo 云端 VoiceClone) 或 'higgs_cloud' (Boson Higgs Audio)"
+        ),
+    )
+    server: str = Field(default="http://127.0.0.1:9880", description="GPT-SoVITS 服务地址")
+    timeout: int = Field(default=180, description="TTS 请求超时秒数")
+    max_text_length: int = Field(default=1000, description="最大合成文本长度")
+    supported_text_languages: list[str] = Field(
+        default_factory=lambda: ["zh", "en", "ja", "yue", "auto", "auto_yue"],
+        description=(
+            "允许发送给 TTS API 的 text_lang 语言代码列表。"
+            "支持带说明格式（如 zh(中英混合)），服务端会自动提取括号前代码。"
+        ),
+    )
+    fallback_text_language: str = Field(
+        default="zh",
+        description="当输入语言非法或不受支持时的兜底语言代码",
+    )
+
+
+@config_section("tts_styles")
+class TTSStyle(SectionBase):
+    """TTS 风格参数配置，每个实例代表一种独立的语音风格。"""
+
+    style_name: str = Field(default="default", description="风格唯一标识符，必须有一个名为 default")
+    name: str = Field(default="默认", description="显示名称")
+    refer_wav_path: str = Field(default="C:/path/to/your/reference.wav", description="参考音频路径")
+    prompt_text: str = Field(
+        default="这是一个示例文本，请替换为您自己的参考音频文本。",
+        description="参考音频文本",
+    )
+    prompt_language: str = Field(default="zh", description="参考音频语言")
+    gpt_weights: str = Field(default="C:/path/to/your/gpt_weights.ckpt", description="GPT 模型路径")
+    sovits_weights: str = Field(default="C:/path/to/your/sovits_weights.pth", description="SoVITS 模型路径")
+    speed_factor: float = Field(default=1.0, description="语速因子")
+    text_language: str = Field(default="auto", description="文本语言模式 (zh/ja/en/auto 等)")
+
+
+@config_section("tts_advanced")
+class TTSAdvancedSection(SectionBase):
+    """TTS 高级参数配置（语速、采样、批处理等）。"""
+
+    media_type: str = Field(default="wav", description="输出音频格式")
+    top_k: int = Field(default=9, description="Top-K 采样参数")
+    top_p: float = Field(default=0.8, description="Top-P 核采样参数")
+    temperature: float = Field(default=0.8, description="温度参数")
+    batch_size: int = Field(default=6, description="批处理大小")
+    batch_threshold: float = Field(default=0.75, description="批处理阈值")
+    text_split_method: str = Field(default="cut5", description="文本分割方法")
+    repetition_penalty: float = Field(default=1.4, description="重复惩罚因子")
+    sample_steps: int = Field(default=150, description="采样步数")
+    super_sampling: bool = Field(default=True, description="是否启用超采样")
+
+
+@config_section("spatial_effects")
+class SpatialEffectsSection(SectionBase):
+    """空间音效配置。"""
+
+    enabled: bool = Field(default=False, description="是否启用空间音效处理")
+    reverb_enabled: bool = Field(default=False, description="是否启用标准混响效果")
+    room_size: float = Field(default=0.2, description="混响的房间大小 (0.0-1.0)")
+    damping: float = Field(default=0.6, description="混响的阻尼/高频衰减 (0.0-1.0)")
+    wet_level: float = Field(default=0.3, description="混响的湿声比例 (0.0-1.0)")
+    dry_level: float = Field(default=0.8, description="混响的干声比例 (0.0-1.0)")
+    width: float = Field(default=1.0, description="混响的立体声宽度 (0.0-1.0)")
+    convolution_enabled: bool = Field(default=False, description="是否启用卷积混响（需要 assets/small_room_ir.wav）")
+    convolution_mix: float = Field(default=0.7, description="卷积混响的干湿比 (0.0-1.0)")
+
+
+@config_section("mimo_cloud")
+class MimoCloudSection(SectionBase):
+    """MiMo 云端 VoiceClone 配置。"""
+
+    base_url: str = Field(
+        default="https://token-plan-cn.xiaomimimo.com/v1/chat/completions",
+        description="MiMoCN Chat Completions 接口地址"
+    )
+    api_key: str = Field(
+        default="",
+        description="MiMoCN API Key"
+    )
+    model: str = Field(
+        default="mimo-v2.5-tts-voiceclone",
+        description="云端克隆模型名称"
+    )
+
+
+@config_section("higgs_cloud")
+class HiggsCloudSection(SectionBase):
+    """Boson Higgs Audio 云端 TTS 配置。"""
+
+    base_url: str = Field(
+        default="https://api.boson.ai/v1/audio/speech",
+        description="Boson Higgs Audio Create Speech 接口地址",
+    )
+    api_key: str = Field(default="", description="Boson API Key")
+    model: str = Field(
+        default="higgs-audio-v3-tts",
+        description="Boson TTS 模型名称",
+    )
+    voice: str = Field(
+        default="",
+        description="已注册的 Boson custom voice ID；为空时回退到 ref_audio 一次性克隆",
+    )
+    response_format: str = Field(
+        default="mp3",
+        description="输出音频格式：mp3/opus/pcm/wav/aac/flac",
+    )
+    num_timesteps: int = Field(default=10, description="Higgs 生成步数")
+
+
+class TTSVoiceConfig(BaseConfig):
+    """TTS Voice 插件主配置类。"""
+
+    config_name: ClassVar[str] = "config"
+    config_description: ClassVar[str] = "GPT-SoVITS 语音合成插件配置"
+
+    plugin: PluginSection = Field(default_factory=PluginSection)
+    components: ComponentsSection = Field(default_factory=ComponentsSection)
+    prompt: PromptSection = Field(default_factory=PromptSection)
+    tts: TTSSection = Field(default_factory=TTSSection)
+    tts_styles: list[TTSStyle] = Field(
+        default_factory=lambda: [TTSStyle()],
+        description="TTS 风格列表，每项为一种独立的语音风格配置",
+    )
+    tts_advanced: TTSAdvancedSection = Field(default_factory=TTSAdvancedSection)
+    mimo_cloud: MimoCloudSection = Field(default_factory=MimoCloudSection)
+    higgs_cloud: HiggsCloudSection = Field(default_factory=HiggsCloudSection)
+    spatial_effects: SpatialEffectsSection = Field(default_factory=SpatialEffectsSection)

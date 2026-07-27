@@ -1,0 +1,40 @@
+{
+    "name": "tts_voice_plugin",
+    "version": "3.1.2",
+    "description": "基于GPT-SoVITS的文本转语音插件，支持多种语言和多风格语音合成",
+    "author": "言柒",
+    "license": "AGPL-v3.0",
+    "dependencies": {
+        "plugins": [],
+        "components": []
+    },
+    "include": [
+        {
+            "component_type": "action",
+            "component_name": "tts_voice_action",
+            "dependencies": []
+        },
+        {
+            "component_type": "service",
+            "component_name": "tts",
+            "dependencies": []
+        },
+        {
+            "component_type": "command",
+            "component_name": "tts",
+            "dependencies": []
+        },
+        {
+            "component_type": "config",
+            "component_name": "config",
+            "dependencies": []
+        }
+    ],
+    "entry_point": "plugin.py",
+    "min_core_version": "1.0.0",
+    "python_dependencies": [
+        "aiohttp",
+        "soundfile",
+        "pedalboard"
+    ]
+}
