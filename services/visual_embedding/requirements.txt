@@ -1,0 +1,11 @@
+# Qwen3-VL-Embedding-2B 视觉嵌入服务依赖
+# torch CUDA 版由 start.sh 通过专用 index 安装（适配 RTX 5090 / CUDA 12.x）
+transformers>=4.57.0
+qwen-vl-utils>=0.0.14
+accelerate>=1.2.0
+fastapi>=0.115.0
+uvicorn>=0.32.0
+pillow>=10.0.0
+numpy>=1.26.0
+pydantic>=2.0.0
+modelscope>=1.20.0

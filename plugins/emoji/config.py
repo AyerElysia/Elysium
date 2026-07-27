@@ -108,12 +108,72 @@ class EmojiConfig(BaseConfig):
                 description="最大可用表情包数量上限（<=0 表示不限制）；达到上限后不再继续入库",
             )
 
+        @config_section("visual")
+        class VisualSection(SectionBase):
+            """纯视觉检索相关配置（Qwen3-VL-Embedding 本地服务）。"""
+
+            embed_enabled: bool = Field(
+                default=True,
+                description="是否启用纯视觉检索（关闭则回退，用于应急）",
+            )
+            embed_endpoint: str = Field(
+                default="http://127.0.0.1:8848/v1/embeddings",
+                description="视觉嵌入服务地址（OpenAI 兼容 /v1/embeddings）",
+            )
+            embed_dim: int = Field(
+                default=2048,
+                description="视觉嵌入向量维度（Qwen3-VL-Embedding-2B 默认 2048）",
+            )
+            collection_name: str = Field(
+                default="emoji_sender_visual",
+                description="视觉向量集合名（与旧文本库隔离，便于回退）",
+            )
+            query_instruction: str = Field(
+                default="Retrieve a meme image that best expresses the given intent or emotion.",
+                description="检索 query 的指令前缀（指令感知，提升文本意图→图像匹配效果）",
+            )
+            request_timeout: float = Field(
+                default=30.0,
+                description="调用视觉嵌入服务的超时时间（秒）",
+            )
+            match_min_cosine: float = Field(
+                default=0.15,
+                description="视觉检索的最低 cosine 相似度阈值（低于此值视为匹配不佳，但仍返回最接近的候选）",
+            )
+
+        @config_section("collection")
+        class CollectionSection(SectionBase):
+            """仿生收藏（候选池 + 图片库）相关配置。"""
+
+            meme_db_path: str = Field(
+                default="data/emoji/meme_candidates.db",
+                description="候选池 SQLite 数据库路径（收到的表情包候选 + 浏览/收藏状态 + 溯源）",
+            )
+            meme_image_dir: str = Field(
+                default="data/emoji/memes",
+                description="收藏的表情包图片存储目录",
+            )
+            media_cache_dir: str = Field(
+                default="data/media_cache/emojis",
+                description="聊天收到表情包的来源目录（感知筛选扫描此处）",
+            )
+            browse_page_size: int = Field(
+                default=8,
+                description="browse_memes 一次返回的候选数量",
+            )
+            visual_dedup_threshold: float = Field(
+                default=0.95,
+                description="视觉去重阈值（cosine >= 此值视为近似重复，不重复收藏）",
+            )
+
         scheduler: SchedulerSection = Field(default_factory=SchedulerSection)
         plugin: PluginSection = Field(default_factory=PluginSection)
         prompt: PromptSection = Field(default_factory=PromptSection)
         ingest: IngestSection = Field(default_factory=IngestSection)
         vector: VectorSection = Field(default_factory=VectorSection)
         storage: StorageSection = Field(default_factory=StorageSection)
+        visual: VisualSection = Field(default_factory=VisualSection)
+        collection: CollectionSection = Field(default_factory=CollectionSection)
 
     # ── generated：现场生成表情包（原 elysia_generated_emoji）────
 

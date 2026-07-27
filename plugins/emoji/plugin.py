@@ -146,7 +146,11 @@ class EmojiPlugin(BasePlugin):
         self.emoji_service = None
 
     async def _register_schedule_when_ready(self) -> None:
-        """等待 scheduler 运行后注册 sender 周期入库任务。"""
+        """等待 scheduler 运行后注册 sender 周期感知任务。
+
+        注意：这里是“感知”不是“收藏”。感知是前注意的后台行为（认出最近收到了哪些表情包），
+        不替她做任何收藏决定——收藏与否完全由她通过 nucleus_browse/collect_meme 自主决定。
+        """
         from src.kernel.scheduler import get_unified_scheduler, TriggerType
 
         if not isinstance(self.config, EmojiConfig):
@@ -155,14 +159,14 @@ class EmojiPlugin(BasePlugin):
 
         scheduler = get_unified_scheduler()
         interval = int(self.config.sender.scheduler.interval_seconds)
-        task_name_once = "emoji_sender_ingest_once"
-        task_name_recurring = "emoji_sender_ingest_recurring"
+        task_name_once = "emoji_sender_perceive_once"
+        task_name_recurring = "emoji_sender_perceive_recurring"
 
         # scheduler.start() 发生在 Bot.run()；这里等待其就绪。
         for attempt in range(600):
             try:
                 once_id = await scheduler.create_schedule(
-                    callback=self._ingest_job,
+                    callback=self._perceive_job,
                     trigger_type=TriggerType.TIME,
                     trigger_config={"delay_seconds": 0},
                     is_recurring=False,
@@ -171,7 +175,7 @@ class EmojiPlugin(BasePlugin):
                 )
 
                 recurring_id = await scheduler.create_schedule(
-                    callback=self._ingest_job,
+                    callback=self._perceive_job,
                     trigger_type=TriggerType.TIME,
                     trigger_config={"interval_seconds": interval},
                     is_recurring=True,
@@ -181,23 +185,29 @@ class EmojiPlugin(BasePlugin):
 
                 self._schedule_ids = [once_id, recurring_id]
                 logger.info(
-                    f"emoji sender 入库任务已注册: once={once_id} recurring={recurring_id}"
+                    f"emoji sender 感知任务已注册: once={once_id} recurring={recurring_id}"
                 )
                 return
             except RuntimeError:
                 await asyncio.sleep(0.5)
                 continue
             except Exception as e:
-                logger.warning(f"注册 emoji sender 入库任务失败: {e}")
+                logger.warning(f"注册 emoji sender 感知任务失败: {e}")
                 await asyncio.sleep(2.0)
 
-        logger.warning("等待 scheduler 就绪超时，emoji sender 入库任务未注册")
+        logger.warning("等待 scheduler 就绪超时，emoji sender 感知任务未注册")
 
-    async def _ingest_job(self) -> None:
-        """scheduler 回调：创建一个 sender service 实例并执行入库。"""
+    async def _perceive_job(self) -> None:
+        """scheduler 回调：前注意感知——扫描最近收到的表情包并登记到候选池。
+
+        只“认出有哪些表情包”，不替她决定收藏。收藏是她自己的事。
+        """
         from src.app.plugin_system.api.service_api import get_service
 
         service = get_service("emoji:service:emoji_sender")
         if service is None:
             return
-        await cast(EmojiSenderService, service).ingest_once()
+        try:
+            await cast(EmojiSenderService, service).perception_scan(max_scan=20)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"表情包感知筛选异常: {exc}")

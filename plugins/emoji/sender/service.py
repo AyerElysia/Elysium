@@ -39,6 +39,8 @@ from src.kernel.logger import get_logger
 from src.kernel.vector_db import get_vector_db_service
 
 from ..config import EmojiConfig
+from .meme_store import MemeStore
+from .visual_embedder import VisualEmbedder, VisualEmbedError
 
 try:
     from PIL import Image as PILImage
@@ -195,6 +197,34 @@ class EmojiSenderService(BaseService):
     def _vector_db(self):
         """获取（缓存的）向量数据库服务实例。"""
         return get_vector_db_service(self._vector_db_path())
+
+    # ── 视觉检索 + 仿生收藏 基础设施 ────────────────────────
+
+    _visual_embedder_cache: VisualEmbedder | None = None
+    _meme_store_cache: MemeStore | None = None
+
+    def _visual_embedder(self) -> VisualEmbedder:
+        """获取（缓存的）视觉嵌入客户端。"""
+        v = self._cfg().visual
+        if EmojiSenderService._visual_embedder_cache is None:
+            EmojiSenderService._visual_embedder_cache = VisualEmbedder(
+                endpoint=str(v.embed_endpoint),
+                timeout=float(v.request_timeout),
+                query_instruction=str(v.query_instruction or ""),
+            )
+        return EmojiSenderService._visual_embedder_cache
+
+    def _meme_store(self) -> MemeStore:
+        """获取（缓存的）表情包存储（候选池 + 图片库 + 视觉向量库）。"""
+        if EmojiSenderService._meme_store_cache is None:
+            c = self._cfg().collection
+            EmojiSenderService._meme_store_cache = MemeStore(
+                db_path=str(c.meme_db_path),
+                image_dir=str(c.meme_image_dir),
+                vector_db=get_vector_db_service(str(self._cfg().vector.db_path)),
+                collection_name=str(self._cfg().visual.collection_name),
+            )
+        return EmojiSenderService._meme_store_cache
 
     @staticmethod
     def _build_candidate(*, distance: float, metadata: dict[str, Any]) -> MemeCandidate | None:
@@ -793,7 +823,113 @@ class EmojiSenderService(BaseService):
         description_query: str,
         emotion_tags: list[str] | None = None,
     ) -> dict[str, Any] | None:
-        """按 tag 过滤后执行向量检索，返回温度采样后的候选。"""
+        """检索最贴合“想表达的意图”的表情包。
+
+        纯视觉优先：把文本意图 embed 到多模态空间，直接检索表情包图像向量。
+        视觉不可用/未启用/视觉库为空时，回退到旧的文本描述检索（应急）。
+        """
+        query = str(description_query or "").strip()
+        if not query:
+            raise ValueError("description_query 不能为空")
+
+        if self._cfg().visual.embed_enabled:
+            try:
+                visual_result = await self._search_best_visual(query)
+                if visual_result is not None:
+                    return visual_result
+            except VisualEmbedError as exc:
+                logger.warning(f"视觉检索失败，回退文本检索: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"视觉检索异常，回退文本检索: {exc}")
+
+        # 回退：旧的文本描述检索
+        return await self._search_best_text(query, emotion_tags)
+
+    async def _search_best_visual(self, query: str) -> dict[str, Any] | None:
+        """纯视觉检索：文本意图 → 表情包图像向量。"""
+        store = self._meme_store()
+        await store.initialize()
+        # 视觉库为空时返回 None，让上层回退文本检索
+        if await store.count_collected() <= 0:
+            return None
+
+        embedder = self._visual_embedder()
+        query_embedding = await embedder.embed_text(query, with_instruction=True)
+
+        top_n = int(self._cfg().vector.top_n)
+        results = await store.search_visual(query_embedding, top_n=top_n)
+
+        ids_list: list[list[str]] = list(results.get("ids") or [])
+        distances_list: list[list[float]] = list(results.get("distances") or [])
+        metadatas_list: list[list[dict[str, Any]]] = list(results.get("metadatas") or [])
+        if not ids_list or not ids_list[0]:
+            return None
+
+        # ChromaDB 返回 L2 距离；对归一化向量 cosine = 1 - dist^2/2。
+        # 统一用 cosine 作为“distance”（越大越相似），与阈值比较更直观。
+        min_cosine = float(self._cfg().visual.match_min_cosine)
+        candidates: list[MemeCandidate] = []
+        for i, meme_id in enumerate(ids_list[0]):
+            l2 = float(distances_list[0][i]) if distances_list and distances_list[0] and i < len(distances_list[0]) else 2.0
+            cosine = 1.0 - (l2 * l2) / 2.0
+            meta = metadatas_list[0][i] if metadatas_list and metadatas_list[0] and i < len(metadatas_list[0]) else {}
+            path_value = str(meta.get("path") or "")
+            if not path_value:
+                continue
+            candidates.append(
+                MemeCandidate(
+                    meme_id=str(meme_id),
+                    tag="",
+                    path=path_value,
+                    description=str(meta.get("note") or ""),
+                    distance=cosine,  # 此处 distance 存的是 cosine（越大越相似）
+                )
+            )
+
+        if not candidates:
+            return None
+
+        # cosine 越高越相似：阈值内温度采样；阈值外仍返回最接近的（她想表达时总给一张）
+        # 注意：_select_candidate 按 distance 升序，而 cosine 是越大越好，故按 -cosine 排序
+        candidates.sort(key=lambda c: c.distance, reverse=True)
+        under_threshold = [c for c in candidates if c.distance >= min_cosine]
+        pool = under_threshold if under_threshold else candidates
+        best = self._select_candidate_visual(pool)
+        if best is None:
+            return None
+
+        return {
+            "meme_id": best.meme_id,
+            "tag": best.tag,
+            "path": best.path,
+            "description": best.description,
+            "distance": best.distance,
+            "fallback_used": not under_threshold,
+        }
+
+    def _select_candidate_visual(self, candidates: list[MemeCandidate]) -> MemeCandidate | None:
+        """视觉候选采样：cosine 越大越相似，按相似度温度采样。"""
+        if not candidates:
+            return None
+        ordered = sorted(candidates, key=lambda c: c.distance, reverse=True)
+        temperature = self._selection_temperature()
+        if temperature <= 0.0 or len(ordered) == 1:
+            return ordered[0]
+        best_sim = ordered[0].distance
+        weights = [
+            math.exp(-max(0.0, best_sim - c.distance) / temperature)
+            for c in ordered
+        ]
+        if not any(w > 0.0 for w in weights):
+            return ordered[0]
+        return random.choices(ordered, weights=weights, k=1)[0]
+
+    async def _search_best_text(
+        self,
+        description_query: str,
+        emotion_tags: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """（回退）按 tag 过滤后执行文本描述向量检索，返回温度采样后的候选。"""
         query = str(description_query or "").strip()
         if not query:
             raise ValueError("description_query 不能为空")
@@ -952,6 +1088,216 @@ class EmojiSenderService(BaseService):
             emotion_tags=emotion_tags,
         )
         return ok
+
+    # ── 仿生收藏：感知筛选 + 浏览 + 收藏（她的自主行为）──────────
+
+    async def _vlm_perceive_meme(
+        self,
+        *,
+        image_base64: str,
+        mime: str,
+        is_gif_collage: bool = False,
+    ) -> dict[str, Any] | None:
+        """感知层：轻量识别“这是不是表情包/贴纸”并给一句简短描述。
+
+        这是前注意感知，只做“认出”，不做“是否收藏”的决定——那是她的选择。
+        """
+        try:
+            model_set = get_model_set_by_task("vlm")
+        except Exception:
+            logger.debug("未配置 VLM 任务模型，跳过感知筛选")
+            return None
+
+        gif_hint = (
+            "注意：这是一个 GIF 动图的关键帧截图（网格排列），请综合所有帧判断。\n"
+            if is_gif_collage else ""
+        )
+        prompt = (
+            "判断这张图片是不是表情包/贴纸/meme（用于聊天表达情绪的图片），还是普通照片/截图/其他。\n"
+            + gif_hint
+            + "输出严格 JSON（不要额外文字）：\n"
+            '{"is_meme": true/false, "brief": "一句话描述这张表情包在表达什么（20字内）"}\n'
+            "判断依据：表情包通常有夸张表情、情绪表达、棗/二次元角色、叠字文案；"
+            "普通照片/截图/文档不算。is_meme=false 时 brief 可为空。"
+        )
+
+        from src.kernel.llm import Image, LLMContextManager, LLMPayload, ROLE, Text
+
+        request = create_llm_request(
+            model_set=model_set,
+            request_name="emoji_perceive",
+            context_manager=LLMContextManager(),
+        )
+        image_value = f"data:{mime};base64,{image_base64}"
+        request.add_payload(LLMPayload(ROLE.USER, [Text(prompt), Image(image_value)]))
+
+        try:
+            response = await request.send(stream=False)
+            await response
+        except Exception as e:
+            logger.warning(f"感知筛选 VLM 调用失败: {e}")
+            return None
+
+        raw = (response.message or response.reasoning_content or "").strip()
+        obj = self._extract_json_object(raw)
+        if obj is None:
+            return None
+        return {
+            "is_meme": bool(obj.get("is_meme")),
+            "brief": str(obj.get("brief") or "").strip()[:60],
+        }
+
+    async def perception_scan(self, max_scan: int = 20) -> int:
+        """感知筛选：扫描 media cache 新图片，识别表情包并登记到候选池。
+
+        前注意、低频、只登记不决策。返回本次新增候选数。
+        """
+        store = self._meme_store()
+        await store.initialize()
+        root = self._media_cache_dir()
+        if not root.exists():
+            return 0
+
+        files = [
+            p for p in root.iterdir()
+            if p.is_file() and p.suffix.lower() in _ALLOWED_SUFFIXES
+        ]
+        if not files:
+            return 0
+
+        added = 0
+        scanned = 0
+        for path in files:
+            if scanned >= max_scan:
+                break
+            try:
+                payload = path.read_bytes()
+            except Exception:
+                continue
+            source_hash = self._sha256_bytes(payload)
+            if await store.has_hash(source_hash):
+                continue  # 已登记过（任意状态）
+            scanned += 1
+
+            try:
+                mime = self._detect_mime(payload, path.suffix)
+                vlm_bytes, vlm_mime, is_gif_collage = self._compress_image_for_vlm(payload, mime)
+                image_b64 = await get_task_manager().to_process(base64_encode_bytes, vlm_bytes)
+            except Exception as e:
+                logger.debug(f"感知筛选预处理失败 {path.name}: {e}")
+                continue
+
+            perceived = await self._vlm_perceive_meme(
+                image_base64=image_b64, mime=vlm_mime, is_gif_collage=is_gif_collage
+            )
+            if not perceived or not perceived.get("is_meme"):
+                # 不是表情包：也登记为 dismissed，避免反复感知同一张
+                await store.add_candidate(
+                    source_hash=source_hash, source_path=str(path), mime=mime,
+                )
+                await store.mark_dismissed(source_hash)
+                continue
+
+            ok = await store.add_candidate(
+                source_hash=source_hash,
+                source_path=str(path),
+                mime=mime,
+                brief=str(perceived.get("brief") or ""),
+            )
+            if ok:
+                added += 1
+
+        if added:
+            logger.info(f"感知筛选：新增 {added} 张表情包候选（扫描 {scanned} 张新图）")
+        return added
+
+    async def browse_candidates(self, limit: int | None = None) -> list[dict[str, Any]]:
+        """浏览未收藏的表情包候选（供她判断要不要收藏）。"""
+        store = self._meme_store()
+        await store.initialize()
+        if limit is None:
+            limit = int(self._cfg().collection.browse_page_size)
+        candidates = await store.list_unreviewed(limit=limit)
+        return [
+            {
+                "candidate_id": c.candidate_id,
+                "brief": c.brief,
+                "source_path": c.source_path,
+                "mime": c.mime,
+            }
+            for c in candidates
+        ]
+
+    async def get_unreviewed_count(self) -> int:
+        """未浏览的表情包候选数量（供好奇心上下文感知）。"""
+        try:
+            store = self._meme_store()
+            await store.initialize()
+            return await store.count_unreviewed()
+        except Exception:  # noqa: BLE001
+            return 0
+
+    async def collect_meme(self, candidate_id: str, note: str = "") -> tuple[bool, str]:
+        """收藏一张表情包（她的决定）：视觉 embed → 入库 → 去重 → 标记收藏。"""
+        store = self._meme_store()
+        await store.initialize()
+
+        candidate = await store.get_candidate(candidate_id)
+        if candidate is None:
+            return False, "找不到这张候选表情包"
+        if candidate.status == "collected":
+            return False, "这张已经收藏过了"
+
+        source_path = Path(candidate.source_path)
+        if not source_path.exists():
+            return False, "原图已不存在，无法收藏"
+
+        try:
+            image_bytes = source_path.read_bytes()
+        except Exception as e:
+            return False, f"读取原图失败: {e}"
+
+        # 视觉去重：已有近似图则不重复收藏
+        embedder = self._visual_embedder()
+        try:
+            embedding = await embedder.embed_image_bytes(image_bytes)
+        except VisualEmbedError as e:
+            return False, f"视觉嵌入失败，无法收藏: {e}"
+
+        threshold = float(self._cfg().collection.visual_dedup_threshold)
+        if await store.is_visual_duplicate(embedding, threshold=threshold):
+            await store.mark_dismissed(candidate_id)
+            return False, "已经有一张几乎一样的表情包了，不重复收藏"
+
+        # 复制图片到图片库 + 写入视觉向量库
+        meme_id = candidate.source_hash
+        try:
+            stored_path = store.save_image(meme_id, str(source_path), candidate.mime)
+            await store.store_visual(
+                meme_id=meme_id,
+                embedding=embedding,
+                source_hash=candidate.source_hash,
+                image_path=stored_path,
+                source_stream=candidate.source_stream,
+                source_message_id=candidate.source_message_id,
+                note=str(note or ""),
+            )
+        except Exception as e:
+            return False, f"入库失败: {e}"
+
+        await store.mark_collected(candidate_id, meme_id, note=str(note or ""))
+        brief = candidate.brief or "一张表情包"
+        logger.info(f"收藏表情包: {meme_id[:8]}... | {brief} | note={note!r}")
+        return True, f"已收藏这张表情包（{brief}）"
+
+    async def dismiss_meme(self, candidate_id: str) -> tuple[bool, str]:
+        """跳过一张候选（不想收藏）。"""
+        store = self._meme_store()
+        await store.initialize()
+        if await store.get_candidate(candidate_id) is None:
+            return False, "找不到这张候选表情包"
+        await store.mark_dismissed(candidate_id)
+        return True, "好的，不收藏这张"
 
     async def update_meme_description(self, meme_id: str, new_description: str) -> bool:
         """更新向量库中某个表情包的描述并重新生成 embedding。

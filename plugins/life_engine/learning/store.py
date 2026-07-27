@@ -321,6 +321,90 @@ class InsightStore:
 
         return merged_any
 
+    # ── 重新审视（螺旋上升）─────────────────────────────────
+
+    def reconsider_insight(
+        self,
+        insight_id: str,
+        *,
+        reason: str = "",
+    ) -> bool:
+        """把一条已经下过判断的洞察重新放回审计队列。
+
+        学习是螺旋上升的：validated 不等于永远为真。当她发现一条曾经
+        验证过的认知不再符合现在的自己（或者反例累积到让她怀疑），
+        这条认知应该能重新进入审视，而不是被永久钉死。
+
+        做什么：
+        - status → candidate，next_action → await_review（重新排队）
+        - 记录 revision_note（为什么要重新想）
+        - 保留全部证据、审计历史、knowledge_versions：
+          这是重新审视，不是删除。旧的知识文档版本仍是不可变的历史。
+        - 写 append-only 审计日志
+
+        不做什么：
+        - 不清除 confidence，也不自动降低它。重新想一遍不等于已经错了，
+          结论由后面的审计和她自己给出。
+        - 不删除任何已发布的 knowledge/vN.md。历史保持原样，
+          修正体现在下一个版本里。
+
+        只由她主动发起（或她授权的路径）。系统自己不会替她推翻任何结论。
+        """
+        insight = self.get_insight(insight_id)
+        if insight is None:
+            return False
+
+        old_status = insight.status
+        old_action = insight.next_action
+
+        insight.status = InsightStatus.CANDIDATE.value
+        insight.next_action = InsightNextAction.AWAIT_REVIEW.value
+        if reason:
+            insight.revision_note = reason
+        insight.updated_at = _now_iso()
+
+        self._append_audit({
+            "action": "insight_reconsidered",
+            "insight_id": insight_id,
+            "from_status": old_status,
+            "from_next_action": old_action,
+            "to_status": insight.status,
+            "next_action": insight.next_action,
+            "reason": reason,
+            "evidence_count": len(insight.evidence),
+            "negative_count": insight.negative_evidence_count,
+            "knowledge_versions": list(insight.knowledge_versions),
+        })
+        self._save()
+        return True
+
+    def record_knowledge_version(self, insight_id: str, version: int) -> bool:
+        """记录一条洞察被写进了哪个版本的知识文档。
+
+        用途：重新审视 → 再次验证之后，压缩器知道这条认知在旧版本里
+        已经有对应表述，应该更新它，而不是当成全新认知重复写一遍。
+        """
+        insight = self.get_insight(insight_id)
+        if insight is None:
+            return False
+        if version not in insight.knowledge_versions:
+            insight.knowledge_versions.append(version)
+            insight.updated_at = _now_iso()
+            self._save()
+        return True
+
+    def list_reconsidered(self) -> list[Insight]:
+        """列出被重新审视过的洞察（带修正说明、且曾进过知识文档）。
+
+        这是"反例备忘"的真实来源之一：不只是被否定的洞察，
+        还有曾经写进自我认知、后来她自己觉得需要改的那些。
+        """
+        self.load()
+        return [
+            ins for ins in self._insights
+            if ins.revision_note and ins.knowledge_versions
+        ]
+
     # ── 状态流转 ─────────────────────────────────────────────
 
     def transition_status(
@@ -839,8 +923,9 @@ class InsightStore:
             insight.add_evidence(evidence)
 
             # 如果被否定，记录反例挑战
+            # 注意：contradiction_count 已由 add_evidence 统一累加
+            #（supports=False 的证据一律计数），这里不再重复 +1。
             if result_type == "contradicted":
-                insight.record_contradiction()
                 logger.info(
                     f"❌ 洞察被现实否定 [{insight.insight_id}]: {insight.claim[:40]}... "
                     f"(contradiction_count={insight.contradiction_count})"

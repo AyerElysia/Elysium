@@ -35,6 +35,7 @@ from .prompts import (
     SELECTION_GATE_SYSTEM,
     SELECTION_GATE_USER,
     format_insights_for_compression,
+    format_reconsidered_for_compression,
 )
 from .store import InsightStore
 
@@ -131,15 +132,21 @@ class SelfKnowledgeCompressor:
             if not current_knowledge:
                 current_knowledge = _INITIAL_KNOWLEDGE
 
-            # 2. 收集 rejected 反例（最近 5 条）
+            # 2. 收集反例来源（两条渠道）
+            #    a) rejected：被审计明确否定的
+            #    b) reconsidered：曾写进知识文档、后来她自己拿回来重想的
+            #    只有 (a) 的话这个渠道基本是空的——审计几乎不出 rejected，
+            #    而"我以前这么以为，现在不这么想了"恰恰是螺旋上升的主要形态。
             all_rejected = self._store.list_by_status(InsightStatus.REJECTED)
             rejected = all_rejected[-5:]
+            reconsidered = self._store.list_reconsidered()[-5:]
 
             # 3. 调用 LLM 压缩
             new_content = await self._compress(
                 current_knowledge=current_knowledge,
                 validated_insights=promotable,
                 rejected_insights=rejected,
+                reconsidered_insights=reconsidered,
             )
             if not new_content or new_content.strip() == current_knowledge.strip():
                 logger.info("压缩未产生变化")
@@ -172,6 +179,11 @@ class SelfKnowledgeCompressor:
                 # 标记已压缩的洞察为 promoted（从 promote 队列移除）
                 for ins in promotable:
                     ins.next_action = InsightNextAction.ARCHIVE.value
+                    # 记下它进过哪个版本：万一以后她把这条拿回来重想、
+                    # 又重新验证了，压缩器能认出"这条在旧版里已有表述，
+                    # 该更新而不是再写一遍"。
+                    if next_version not in ins.knowledge_versions:
+                        ins.knowledge_versions.append(next_version)
                     self._store.update_insight(ins)
 
                 # 更新状态
@@ -192,6 +204,7 @@ class SelfKnowledgeCompressor:
         current_knowledge: str,
         validated_insights: list[Insight],
         rejected_insights: list[Insight],
+        reconsidered_insights: list[Insight] | None = None,
     ) -> str:
         """调用 LLM 执行有界压缩。"""
         system_prompt = KNOWLEDGE_COMPRESS_SYSTEM.format(max_edits=self._max_edits)
@@ -202,6 +215,9 @@ class SelfKnowledgeCompressor:
             ),
             rejected_insights=format_insights_for_compression(
                 [ins.to_dict() for ins in rejected_insights]
+            ),
+            reconsidered_insights=format_reconsidered_for_compression(
+                [ins.to_dict() for ins in (reconsidered_insights or [])]
             ),
             max_edits=self._max_edits,
         )

@@ -132,7 +132,10 @@ plugins/commands_plugin/**/__pycache__/
 plugins/commands_plugin/**/*.py[cod]
 !plugins/proactive_message_plugin/
 !plugins/skill_manager/
-!plugins/webui_backend/
 
 # Runtime/local skills are discovered by plugins/skill_manager.
 skill/*
+
+# 视觉嵌入服务的独立 venv 与运行日志（模型在 /root/models，不在仓库内）
+services/visual_embedding/.venv/
+services/visual_embedding/*.log

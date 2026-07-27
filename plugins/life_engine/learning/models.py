@@ -203,7 +203,8 @@ class Insight:
     contradiction_count: int = 0  # 被反例挑战的次数
     anti_bias_flags: list[str] = field(default_factory=list)
     audit_history: list[AuditRecord] = field(default_factory=list)
-    revision_note: str = ""    # 修正说明
+    revision_note: str = ""       # 修正说明（重新验证时填写的理由）
+    knowledge_versions: list[int] = field(default_factory=list)  # 被写入过哪些知识文档版本号
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -225,6 +226,14 @@ class Insight:
         source_events = [str(s) for s in source_raw if s] if isinstance(source_raw, list) else []
         bias_raw = data.get("anti_bias_flags")
         anti_bias = [str(b) for b in bias_raw if b] if isinstance(bias_raw, list) else []
+        kv_raw = data.get("knowledge_versions")
+        kv_list: list[int] = []
+        if isinstance(kv_raw, list):
+            for v in kv_raw:
+                try:
+                    kv_list.append(int(v))
+                except (TypeError, ValueError):
+                    continue
 
         return cls(
             insight_id=str(data.get("insight_id", "") or _gen_id("ins")),
@@ -249,6 +258,7 @@ class Insight:
             anti_bias_flags=anti_bias,
             audit_history=audit_history,
             revision_note=str(data.get("revision_note", "") or ""),
+            knowledge_versions=kv_list,
         )
 
     @classmethod
@@ -355,6 +365,10 @@ class Insight:
         self.touch_count += 1
         self.last_touched_at = _now_iso()
         self.updated_at = _now_iso()
+        # 反例计数：所有证据挂载都经过这里，所以这里数才数得准。
+        # 仅记录，不触发任何自动状态变更——要不要因此改主意是她的事。
+        if not ev.supports:
+            self.contradiction_count += 1
 
     def record_touch(self) -> None:
         self.touch_count += 1

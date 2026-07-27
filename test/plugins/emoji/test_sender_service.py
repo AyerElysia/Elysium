@@ -12,10 +12,14 @@ from plugins.emoji.config import EmojiConfig
 from plugins.emoji.sender.service import EmojiSenderService, MemeCandidate
 
 
-def _make_service(*, temperature: float = 0.12) -> EmojiSenderService:
-    """创建一个带最小配置的 EmojiSenderService。"""
+def _make_service(*, temperature: float = 0.12, visual_enabled: bool = False) -> EmojiSenderService:
+    """创建一个带最小配置的 EmojiSenderService。
+
+    默认关闭视觉检索（visual_enabled=False），以便确定性地测试文本检索路径。
+    """
     config = EmojiConfig()
     config.sender.vector.temperature = temperature
+    config.sender.visual.embed_enabled = visual_enabled
     plugin = SimpleNamespace(config=config)
     return EmojiSenderService(plugin=cast(Any, plugin))
 

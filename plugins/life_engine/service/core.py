@@ -980,10 +980,14 @@ class LifeEngineService(BaseService):
             )
             prefix_prompt = self._build_curiosity_prefix_prompt()
             history_text = await self._build_curiosity_history_text(message, max_messages=max_history)
+            new_event_text = self._format_curiosity_event(event)
+            meme_awareness = await self._build_meme_awareness_text()
+            if meme_awareness:
+                new_event_text = new_event_text + "\n\n" + meme_awareness
             signal = await self._get_curiosity_engine().review(
                 prefix_prompt=prefix_prompt,
                 history_text=history_text,
-                new_event_text=self._format_curiosity_event(event),
+                new_event_text=new_event_text,
                 source_event_id=event.event_id,
                 source_stream_id=event.stream_id or "",
             )
@@ -995,6 +999,25 @@ class LifeEngineService(BaseService):
             logger.warning(f"好奇异步判断失败: {exc}")
         finally:
             self._curiosity_inflight = False
+
+    async def _build_meme_awareness_text(self) -> str:
+        """构建“未浏览表情包”的轻意识文本（供好奇心参考，是提醒不是任务）。"""
+        try:
+            from src.app.plugin_system.api.service_api import get_service
+
+            svc = get_service("emoji:service:emoji_sender")
+            if svc is None:
+                return ""
+            count = await svc.get_unreviewed_count()
+            if count <= 0:
+                return ""
+            return (
+                f"（顺带一提：最近收到了 {count} 张还没看过的表情包。"
+                f"如果你有兴趣，可以用 nucleus_browse_memes 翻翻看，喜欢的就收藏——"
+                f"不过这完全随你，不是任务。）"
+            )
+        except Exception:  # noqa: BLE001
+            return ""
 
     def _build_curiosity_prefix_prompt(self) -> str:
         workspace = self._workspace_dir()
@@ -3304,8 +3327,10 @@ class LifeEngineService(BaseService):
         # 之前这组在 plugin.get_components() 里注册了，却没进中枢工具池，
         # 于是她只能用 nucleus_bash 去读 .life_learning/ —— 日志里有 5 次这样的尝试。
         from ..learning.tools import LEARNING_TOOLS
+        # 表情包仿生收藏工具：让她自主浏览/收藏/跳过最近收到的表情包。
+        from plugins.emoji.sender.collection_tools import EMOJI_COLLECTION_TOOLS
 
-        return ALL_TOOLS + TODO_TOOLS + MEMORY_TOOLS + GREP_TOOLS + WEB_TOOLS + STREAM_TOOLS + SCHEDULE_TOOLS + AUTONOMY_TOOLS + SKILL_TOOLS + EVENT_GREP_TOOLS + LEARNING_TOOLS
+        return ALL_TOOLS + TODO_TOOLS + MEMORY_TOOLS + GREP_TOOLS + WEB_TOOLS + STREAM_TOOLS + SCHEDULE_TOOLS + AUTONOMY_TOOLS + SKILL_TOOLS + EVENT_GREP_TOOLS + LEARNING_TOOLS + EMOJI_COLLECTION_TOOLS
 
     @staticmethod
     def _heartbeat_tool_call_metadata(call: Any) -> tuple[str, dict[str, Any]]:

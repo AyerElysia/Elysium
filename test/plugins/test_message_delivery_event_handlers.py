@@ -9,10 +9,6 @@ from plugins.life_engine.service.event_handler import LifeEngineMessageCollector
 from plugins.minicpm_live_bridge.config import MiniCPMLiveBridgeConfig
 from plugins.minicpm_live_bridge.event_handler import MiniCPMLiveUnifiedEventHandler
 from plugins.minicpm_live_bridge.router import MiniCPMLiveRouter
-from plugins.webui_backend.backend.event_handler.live_chat_event_handler import (
-    LiveChatEventHandler,
-)
-from plugins.webui_backend.backend.router.live_chat_router import LiveChatRouter
 from src.core.components.types import EventType
 from src.kernel.event import EventDecision
 
@@ -52,67 +48,6 @@ async def test_life_engine_collects_only_confirmed_outbound_messages() -> None:
     assert decision is EventDecision.PASS
     assert returned_params is params
     service.record_message.assert_not_awaited()
-
-
-async def test_webui_marks_delivered_messages_as_sent() -> None:
-    handler = LiveChatEventHandler(SimpleNamespace())
-    message = SimpleNamespace(message_id="delivered-2")
-    params = {"message": message}
-    message_data = {"message_id": message.message_id, "is_sent": True}
-    handler._build_message_data = AsyncMock(return_value=message_data)
-    handler._broadcast_message = AsyncMock()
-
-    _assert_delivery_subscription(handler)
-
-    decision, returned_params = await handler.execute(
-        EventType.ON_MESSAGE_DELIVERED.value,
-        params,
-    )
-
-    assert decision is EventDecision.SUCCESS
-    assert returned_params is params
-    handler._build_message_data.assert_awaited_once_with(message, True)
-    handler._broadcast_message.assert_awaited_once_with(message_data)
-
-
-async def test_webui_ignores_neko_surface_messages() -> None:
-    handler = LiveChatEventHandler(SimpleNamespace())
-    message = SimpleNamespace(message_id="surface-1", platform="neko.surface")
-    params = {"message": message}
-    handler._build_message_data = AsyncMock()
-    handler._broadcast_message = AsyncMock()
-
-    decision, returned_params = await handler.execute(
-        EventType.ON_MESSAGE_RECEIVED.value,
-        params,
-    )
-
-    assert decision is EventDecision.PASS
-    assert returned_params is params
-    handler._build_message_data.assert_not_awaited()
-    handler._broadcast_message.assert_not_awaited()
-
-
-async def test_webui_broadcast_drops_neko_surface_messages() -> None:
-    class _WebSocketProbe:
-        pass
-
-    websocket = _WebSocketProbe()
-    websocket.send_json = AsyncMock()
-    previous_connections = LiveChatRouter.active_connections
-    LiveChatRouter.active_connections = {"surface-stream": {websocket}}
-    try:
-        await LiveChatRouter.broadcast_message(
-            {
-                "message_id": "surface-2",
-                "stream_id": "surface-stream",
-                "platform": "neko.surface",
-            }
-        )
-    finally:
-        LiveChatRouter.active_connections = previous_connections
-
-    websocket.send_json.assert_not_awaited()
 
 
 async def test_minicpm_maps_delivered_messages_to_sent_direction(

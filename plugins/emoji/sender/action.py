@@ -1,8 +1,8 @@
 """emoji_sender Action：发送表情包。
 
 该 Action 面向 LLM Tool Calling：
-- 输入：目标表情包描述文本 + 情感 tag（可多个）
-- 行为：按 tag 过滤候选后向量检索 topN，选择距离满足阈值的最佳表情包发送
+- 输入：你想表达的情绪/意图描述
+- 行为：纯视觉语义检索——把意图 embed 到多模态空间，匹配最贴合的表情包图像并发送
 """
 
 from __future__ import annotations
@@ -13,29 +13,28 @@ from typing import cast
 from src.app.plugin_system.api.service_api import get_service
 from src.core.components.base.action import BaseAction
 
-from .service import EMOTION_TAG_PRESET, EmojiSenderService
-
-_EMOTION_TAG_VALUES = "、".join(EMOTION_TAG_PRESET)
-_EMOTION_TAG_DESC = (
-    f"情感标签（可多个，可为空）。可选值：{_EMOTION_TAG_VALUES}。"
-    "若为空则不按 tag 过滤，直接全库向量检索。"
-)
+from .service import EmojiSenderService
 
 
 class SendEmojiMemeAction(BaseAction):
     """发送表情包动作。"""
 
     action_name: str = "send_emoji_meme"
-    action_description: str = "根据目标描述与情感标签，检索并发送一张符合当前情景的表情包来生动地表达情绪。不要忘记在聊天时使用这个动作，比起简单的文字它往往更受欢迎。此动作可以单独使用也可以和发送文字一起使用，更符合日常聊天习惯。"
+    action_description: str = (
+        "根据你想表达的情绪或意图，检索并发送一张最贴合的表情包来生动地表达。"
+        "只需要描述你此刻想表达什么（例如：'俏皮地吐舌头卖萌'、'无语地翻白眼'、'开心地大笑'），"
+        "系统会按视觉语义匹配最合适的表情包。"
+        "不要忘记在聊天时使用这个动作，比起简单的文字它往往更受欢迎。"
+        "此动作可以单独使用也可以和发送文字一起使用，更符合日常聊天习惯。"
+    )
     primary_action: bool = False
 
     async def execute(
         self,
-        description: Annotated[str, "目标表情包的描述文本，用于向量匹配（例如：‘生气地翻白眼’）"],
-        emotion_tags: Annotated[
-            list[str] | None,
-            _EMOTION_TAG_DESC,
-        ] = None,
+        description: Annotated[
+            str,
+            "你想表达的情绪或意图（例如：'俏皮地吐舌头卖萌'、'无语地翻白眼'），用于视觉语义匹配",
+        ],
     ) -> tuple[bool, str]:
         """执行发送表情包动作。"""
         service = get_service("emoji:service:emoji_sender")
@@ -48,22 +47,20 @@ class SendEmojiMemeAction(BaseAction):
             stream_id=self.chat_stream.stream_id,
             platform=self.chat_stream.platform,
             description_query=description,
-            emotion_tags=emotion_tags,
         )
 
         if ok:
             if not result:
                 return True, "已发送表情包"
 
-            tag = str(result.get("tag") or "").strip()
             desc = str(result.get("description") or "").strip()
             distance = result.get("distance")
             fallback_used = bool(result.get("fallback_used"))
 
             dist_text = f"{float(distance):.4f}" if isinstance(distance, (int, float)) else "unknown"
-            fallback_text = "（已触发fallback：未满足阈值但仍在指定标签内选最相似）" if fallback_used else ""
+            fallback_text = "（视觉库为空，已回退文本检索）" if fallback_used else ""
 
-            detail = f"已发送表情包{fallback_text}\n- 标签: {tag}\n- 描述: {desc}\n- 距离: {dist_text}"
+            detail = f"已发送表情包{fallback_text}\n- 描述: {desc or '（无）'}\n- 匹配距离: {dist_text}"
             return True, detail
 
         # 失败：尽量带上原因

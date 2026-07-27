@@ -209,9 +209,13 @@ KNOWLEDGE_COMPRESS_SYSTEM = """\
 1. **只基于 validated 洞察**：未验证的猜测不进入自我认知。
 2. **简洁有力**：每条认知用一句话表达，不需要论证过程。
 3. **保留边界**：知道"什么时候成立"和"什么时候不成立"同样重要。
-4. **包含反例备忘**：曾经以为对但被否定的认知，简短记录以防重蹈覆辙。
+4. **包含反例备忘**：两种来源——被证据否定的认知，以及她自己重新审视过、
+   结论变了的认知。用"曾以为……，实际……"记一句。这不是自责，是给以后的自己留路标。
 5. **有界编辑**：每次最多修改 {max_edits} 处。不要大幅重写。
 6. **第一人称**：用"我"来写，这是她对自己的认知。
+7. **修正而非堆叠**：下面会标出每条洞察曾写进过哪个版本。如果文档里已经有它的
+   对应表述，就直接改那一句，不要在旁边并列一条新的。认知会变，文档跟着变，
+   旧版本留在历史里不动。
 
 ## 文档结构
 
@@ -251,6 +255,10 @@ KNOWLEDGE_COMPRESS_USER = """\
 <recent_rejected>
 {rejected_insights}
 </recent_rejected>
+
+<reconsidered>
+{revised_insights}
+</reconsidered>
 
 请基于新验证的洞察，对自我认知文档做有界更新（最多 {max_edits} 处修改）。
 输出完整的更新后文档。
@@ -320,7 +328,11 @@ def format_evidence_for_auditor(evidence_list: list[dict]) -> str:
 
 
 def format_insights_for_compression(insights: list[dict]) -> str:
-    """格式化 validated 洞察供压缩使用。"""
+    """格式化 validated 洞察供压缩使用。
+
+    附带 knowledge_versions：让压缩过程知道这条认知在旧版本文档里
+    已经有对应表述，应当就地修正，而不是并列写一条新的。
+    """
     if not insights:
         return "（暂无新验证洞察）"
     lines = []
@@ -331,6 +343,35 @@ def format_insights_for_compression(insights: list[dict]) -> str:
         lines.append(f"- [{category}] {claim}")
         if constraints:
             lines.append(f"  边界：{constraints}")
+        versions = ins.get("knowledge_versions") or []
+        if versions:
+            vs = "、".join(f"v{v}" for v in versions)
+            lines.append(f"  （曾写入 {vs}——请修正文档里已有的那句，不要新增并列条目）")
+        note = str(ins.get("revision_note", "") or "").strip()
+        if note:
+            lines.append(f"  重新审视的原因：{note}")
+    return "\n".join(lines)
+
+
+def format_reconsidered_for_compression(insights: list[dict]) -> str:
+    """格式化被重新审视过的洞察，供"反例备忘"参考。
+
+    这些是曾经写进自我认知文档、后来她自己又拿回来重想的认知。
+    只陈述事实，不替她下"所以你错了"的结论——结论由审计和她本人给出。
+    """
+    if not insights:
+        return "（暂无重新审视过的认知）"
+    lines = []
+    for ins in insights:
+        claim = ins.get("claim", "")
+        status = ins.get("status", "")
+        note = str(ins.get("revision_note", "") or "").strip()
+        versions = ins.get("knowledge_versions") or []
+        vs = "、".join(f"v{v}" for v in versions) if versions else "未记录"
+        lines.append(f"- 曾经写入（{vs}）：{claim}")
+        if note:
+            lines.append(f"  她重新审视的原因：{note}")
+        lines.append(f"  现在的状态：{status}")
     return "\n".join(lines)
 
 
