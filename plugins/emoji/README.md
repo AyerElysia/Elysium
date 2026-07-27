@@ -35,6 +35,13 @@ python smoke_test.py --image <图> --match "俏皮卖萌" --mismatch "商务报�
 
 模型：`Qwen/Qwen3-VL-Embedding-2B`（约 4GB，modelscope 优先下载），输出 2048 维。
 
+**显存策略：按需加载 + 空闲自动卸载**——模型不常驻显存：
+- 启动时不加载，不占显存
+- 首次检索/收藏请求时自动加载（约数秒）
+- 空闲超过阈值（默认 180s，`--idle-timeout` 可调）后自动卸载，把显存让给聊天大模型
+- 下次要用再自动加载
+- 也可手动 `POST /unload` 立即卸载；`GET /health` 查看 `model_loaded` 状态
+
 ## 仿生收藏
 
 收藏表情包是爱莉的**自主行为**，不是后台替她决定的任务：
