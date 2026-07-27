@@ -146,7 +146,7 @@ class _FakeMemory:
             ),
         }
 
-    async def search_memory(self, query: str, *, top_k: int) -> list[Any]:
+    async def search_memory(self, query: str, *, top_k: int, return_bundles: bool = True) -> list[Any]:
         self.search_calls.append((query, top_k))
         return [
             SimpleNamespace(

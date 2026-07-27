@@ -51,6 +51,7 @@ class ReflectionEngine:
         timeout_seconds: float = 45.0,
         cooldown_seconds: float = _DEFAULT_COOLDOWN_SECONDS,
         skill_store: Any | None = None,
+        memory_service: Any | None = None,
     ) -> None:
         self._store = store
         self._workspace = Path(workspace_path).resolve()
@@ -58,8 +59,14 @@ class ReflectionEngine:
         self._timeout = max(10.0, float(timeout_seconds or 45.0))
         self._cooldown_seconds = max(60.0, float(cooldown_seconds))
         self._skill_store = skill_store
+        self._memory_service = memory_service
         self._lock = asyncio.Lock()
         self._last_reflection_at: float = 0.0
+
+    def attach_memory_service(self, memory_service: Any) -> None:
+        """晚绑定记忆服务（构造顺序无法保证时使用）。"""
+        if memory_service is not None:
+            self._memory_service = memory_service
 
     @property
     def can_reflect(self) -> bool:
@@ -162,6 +169,7 @@ class ReflectionEngine:
 
         # 门禁 + 写入（优先强化已有洞察，其次新建）
         results: list[Insight] = []
+        persisted: list[Insight] = []
         for candidate in candidates:
             candidate.source_events = source_event_ids
 
@@ -179,14 +187,20 @@ class ReflectionEngine:
                             f"🔁 强化已有洞察 [{target.insight_id}] "
                             f"(证据#{len(target.evidence) + 1}): {target.claim[:40]}..."
                         )
+                        persisted.append(candidate)
                         continue
 
             # 否则作为新洞察写入（带去重）
             if self._store.add_insight(candidate):
                 results.append(candidate)
+                persisted.append(candidate)
                 logger.info(
                     f"💡 新洞察 [{candidate.category}]: {candidate.claim[:50]}..."
                 )
+
+        # 记忆演化：把"修正型洞察"落成显式修正记录，挂到相关记忆文件上
+        if persisted:
+            await self._auto_record_corrections(persisted, reflection_type=reflection_type)
 
         return results
 

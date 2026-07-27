@@ -1363,6 +1363,10 @@ class LifeChatter(BaseChatter):
         # 直播/私聊/群聊等场景提示放到每轮 USER prompt 中，避免第一条消息的
         # stream 类型污染后续所有流。
         system_text = self._build_chat_system_prompt(service, None)
+        if not system_text:
+            # SOUL.md 不可用——没有灵魂就不说话
+            logger.error("SOUL.md 不可用，life_chatter 拒绝生成回复")
+            return None
         request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_text)))
 
         # 工具 schema 仍需一个现实聊天流用于 go_activate / adapter capability 判断；
@@ -2248,7 +2252,10 @@ class LifeChatter(BaseChatter):
 
         # TOOL.md 是 life_engine/heartbeat 的工具边界；life_chatter 使用独立
         # TOOLS.md，避免把潜意识中枢的工具规则混入表达层。
-        soul_text = self._load_workspace_markdown(service, "SOUL.md")
+        soul_text = self._load_soul_markdown(service)
+        if soul_text is None:
+            # 没有灵魂就不说话
+            return ""
         user_text = self._load_workspace_markdown(service, "USER.md")
         memory_text = self._load_workspace_memory_prompt(service, mode="chat")
         tools_text = self._load_workspace_markdown(service, "TOOLS.md")
@@ -2275,7 +2282,9 @@ class LifeChatter(BaseChatter):
         具体行动。
         """
 
-        soul_text = self._load_workspace_markdown(service, "SOUL.md")
+        soul_text = self._load_soul_markdown(service)
+        if soul_text is None:
+            return ""
         user_text = self._load_workspace_markdown(service, "USER.md")
         memory_text = self._load_workspace_memory_prompt(service, mode="chat")
 
@@ -2315,6 +2324,31 @@ class LifeChatter(BaseChatter):
         except Exception as e:
             logger.warning(f"读取 {filename} 失败: {e}")
         return ""
+
+    def _load_soul_markdown(
+        self,
+        service: LifeEngineService | None,
+    ) -> str | None:
+        """加载 SOUL.md。返回 None 表示不可用（应拒绝回复）。"""
+        workspace = self._resolve_workspace_path(service)
+        if not workspace:
+            logger.error("工作空间路径不可用，无法加载 SOUL.md")
+            return None
+
+        path = Path(workspace) / "SOUL.md"
+        try:
+            if path.exists() and path.is_file():
+                content = path.read_text(encoding="utf-8").strip()
+                if content:
+                    return content
+                logger.error(f"SOUL.md 为空: {path}")
+                return None
+        except Exception as e:
+            logger.error(f"SOUL.md 读取失败: {e}")
+            return None
+
+        logger.error(f"SOUL.md 不存在: {path}。没有灵魂就不说话。")
+        return None
 
     def _load_workspace_memory_prompt(
         self,
@@ -2550,6 +2584,10 @@ class LifeChatter(BaseChatter):
             event_cursor_override=event_cursor_override,
         )
         system_prompt_text = self._build_chat_system_prompt(service, None)
+        if not system_prompt_text:
+            # SOUL.md 不可用——没有灵魂就不说话
+            logger.error("SOUL.md 不可用，拒绝构建上下文")
+            return None
         assembled = LifeChatterContextAssembler.assemble(
             prefix_text=system_prompt_text,
             rolling_text=user_prompt_text,
@@ -2613,6 +2651,9 @@ class LifeChatter(BaseChatter):
             },
         )
         prefix_prompt = self._build_chat_router_prefix_prompt(service, chat_stream)
+        if not prefix_prompt:
+            # SOUL.md 不可用——没有灵魂就不说话
+            return {"reason": "SOUL.md 不可用，拒绝响应", "should_respond": False}
 
         try:
             from plugins.life_engine.core.router import route_should_respond

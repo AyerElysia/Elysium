@@ -480,7 +480,7 @@ class MemoryRouter(BaseRouter):
             if not memory:
                 return JSONResponse(content={"status": "disabled"}, status_code=503)
 
-            results = await memory.search_memory(query, top_k=top_k)
+            results = await memory.search_memory(query, top_k=top_k, return_bundles=False)
             response = [
                 {
                     "file_path": item.file_path,

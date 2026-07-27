@@ -405,6 +405,7 @@ async def test_life_chatter_global_runtime_is_reused(monkeypatch) -> None:
 
     monkeypatch.setattr(LifeChatter, "create_request", fake_create_request)
     monkeypatch.setattr(LifeChatter, "inject_usables", fake_inject_usables)
+    monkeypatch.setattr(LifeChatter, "_build_chat_system_prompt", lambda self, *a, **kw: "test soul")
 
     first = LifeChatter.__new__(LifeChatter)
     first.plugin = SimpleNamespace(config=None)

@@ -128,12 +128,15 @@ class LifeEngineSearchMemoryTool(BaseTool):
 
         try:
             service = await self._get_service()
+            # 这里需要 SearchResult 列表（下面既要读 file_path 逐条格式化，
+            # 又要交给 build_memory_bundles），所以显式走简单模式。
             results = await service.search_memory(
                 query=query.strip(),
                 top_k=top_k,
                 enable_association=enable_association,
                 file_types=file_types,
-                time_range_days=time_range_days
+                time_range_days=time_range_days,
+                return_bundles=False,
             )
 
             # 格式化结果

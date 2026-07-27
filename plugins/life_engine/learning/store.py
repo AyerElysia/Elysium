@@ -36,12 +36,20 @@ LEARNING_DIR_NAME = ".life_learning"
 STORE_VERSION = 1
 EXPERIMENTS_FILE = "validation_experiments.json"
 
-# 去重相似度阈值（简单文本匹配）
-_DEDUP_OVERLAP_THRESHOLD = 0.7
-
-# 强化匹配阈值：同 topic 时用较低阈值捕捉改述，无 topic 时需更高重叠
-_REINFORCE_OVERLAP_WITH_TOPIC = 0.5
-_REINFORCE_OVERLAP_NO_TOPIC = 0.7
+# 强化/去重匹配阈值。
+#
+# 基于真实数据校准（2026-07-27，49 条实际洞察的 1176 个配对）：
+#   同一模式的改述       → 重叠度 0.32 ~ 1.00
+#   相关但确实不同的模式 → 重叠度 0.20 ~ 0.30
+#   无关                 → < 0.20
+# 因此 0.45 作为"同一模式"的判定线；topic 不同不再直接排除——
+# 她每次反思都会自由命名 topic_key（49 条洞察出现 44 个不同 key），
+# topic 相等本就是罕见事件，用它做硬门禁会让改述永远无法合并成证据。
+_REINFORCE_OVERLAP_WITH_TOPIC = 0.45
+_REINFORCE_OVERLAP_NO_TOPIC = 0.45
+# 去重与强化用同一条线：判定为"同一模式"后走强化（累积证据），
+# 而不是丢弃观察。
+_DEDUP_OVERLAP_THRESHOLD = 0.45
 # 可被强化的状态（活跃且尚未验证/否定/归档）
 _REINFORCEABLE_STATUSES = (
     InsightStatus.CANDIDATE.value,

@@ -72,9 +72,12 @@ class LearningScheduler:
         # Minecraft 参数
         minecraft_enabled: bool = False,
         minecraft_config: dict[str, Any] | None = None,
+        # 记忆服务（用于把"修正型洞察"落成显式修正记录，形成记忆演化链）
+        memory_service: Any | None = None,
     ) -> None:
         self._workspace = Path(workspace_path).resolve()
         self._model_task_name = model_task_name
+        self._memory_service = memory_service
 
         # 初始化核心组件
         self.store = InsightStore(self._workspace)
@@ -85,6 +88,7 @@ class LearningScheduler:
             model_task_name=model_task_name,
             cooldown_seconds=reflection_cooldown_minutes * 60,
             skill_store=self.skill_store,
+            memory_service=memory_service,
         )
         self.auditor = InsightAuditor(
             store=self.store,
@@ -135,6 +139,21 @@ class LearningScheduler:
         self._last_audit_at: str = ""
         self._last_metrics_at: str = ""
         self._last_staleness_check_at: str = ""
+
+    # ── 记忆服务晚绑定 ───────────────────────────────────────
+
+    def attach_memory_service(self, memory_service: Any) -> None:
+        """晚绑定记忆服务。
+
+        LearningScheduler 可能在 memory_service 就绪之前构造。
+        提供这个入口，避免反思环因为拿不到记忆服务而静默退化成
+        "只写洞察、不写修正" 的半截状态。
+        """
+        if memory_service is None:
+            return
+        self._memory_service = memory_service
+        self.reflection.attach_memory_service(memory_service)
+        logger.debug("LearningScheduler 已绑定 memory_service")
 
     # ── 事件驱动入口 ─────────────────────────────────────────
 

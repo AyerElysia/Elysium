@@ -730,7 +730,13 @@ class LifeEngineService(BaseService):
         if memory_service is None:
             return "记忆系统暂不可用"
 
-        results = await memory_service.search_memory(query_text, top_k=max(1, int(top_k)))
+        # 需要 SearchResult 列表：下面既要交给 build_memory_bundles，
+        # 也要在降级路径里直接读 file_path/snippet。
+        results = await memory_service.search_memory(
+            query_text,
+            top_k=max(1, int(top_k)),
+            return_bundles=False,
+        )
         if not results:
             logger.info(
                 f"[search_actor_memory] 记忆检索无结果:\n"
@@ -3225,8 +3231,12 @@ class LifeEngineService(BaseService):
             return "\n".join(boundary_lines)
         return "\n".join([*boundary_lines, "", safe_content])
 
-    def _build_heartbeat_system_prompt(self) -> str:
-        """构造心跳模型系统提示词。"""
+    def _build_heartbeat_system_prompt(self) -> str | None:
+        """构造心跳模型系统提示词。
+
+        Returns:
+            提示词字符串，或 None 表示 SOUL.md 不可用（应跳过本次心跳）。
+        """
         workspace = Path(self._cfg().settings.workspace_path)
 
         soul_file = workspace / "SOUL.md"
@@ -3235,11 +3245,15 @@ class LifeEngineService(BaseService):
             try:
                 soul_content = soul_file.read_text(encoding="utf-8").strip()
             except Exception as e:
-                logger.warning(f"无法读取 SOUL.md: {e}")
-                soul_content = "你是爱莉希雅，一个并行存在的生命中枢。"
+                logger.error(f"SOUL.md 读取失败，跳过本次心跳: {e}")
+                return None
         else:
-            logger.warning("SOUL.md 不存在，使用默认人设")
-            soul_content = "你是爱莉希雅，一个并行存在的生命中枢。"
+            logger.error(f"SOUL.md 不存在 ({soul_file})，跳过本次心跳。没有灵魂就不说话。")
+            return None
+
+        if not soul_content:
+            logger.error("SOUL.md 为空，跳过本次心跳。")
+            return None
 
         user_file = workspace / "USER.md"
         user_content = ""
@@ -3479,6 +3493,9 @@ class LifeEngineService(BaseService):
         )
 
         system_prompt = self._build_heartbeat_system_prompt()
+        if system_prompt is None:
+            # SOUL.md 不可用——没有灵魂就不说话
+            return
         memory_maintenance_prompt = self._build_memory_maintenance_prompt_if_due()
         section_texts = await self._render_heartbeat_sections()
         user_prompt = self._build_heartbeat_model_prompt(
