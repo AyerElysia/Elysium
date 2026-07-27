@@ -279,6 +279,9 @@ class Bot:
         init_mcp_config("config/mcp.toml")
         # 架构 v2：统一配置（兼容模式，从老文件构建）
         init_unified_config("config/elysium.toml")
+        # 架构 v2：新格式模型配置（优先于老 model.toml）
+        from src.kernel.config.models_loader import init_models_config
+        init_models_config("config/models.toml")
         self.ui.update_phase_status("配置", "已加载")
 
         # Step 2: Logger

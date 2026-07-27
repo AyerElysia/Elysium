@@ -70,44 +70,53 @@ class StreamChunk:
 
 
 def _resolve_model_set(routing_name: str) -> list[dict[str, Any]]:
-    """将路由名解析为 model_set（list[dict]），兼容老 LLMRequest 格式。"""
+    """将路由名解析为 model_set（list[dict]），兼容老 LLMRequest 格式。
+
+    解析优先级：
+    1. 新格式 config/models.toml（LiteLLM 风格）
+    2. 统一配置 elysium.toml 中的 llm 节
+    3. 老格式 config/model.toml（最终回退）
+    """
+    # 1. 新格式 models.toml
+    try:
+        from ..config.models_loader import get_models_config
+
+        mc = get_models_config()
+        if routing_name in mc.tasks:
+            return mc.get_task(routing_name)
+        # "default"/"main" 回退到 actor
+        if routing_name in ("default", "main") and "actor" in mc.tasks:
+            return mc.get_task("actor")
+    except (ImportError, Exception):
+        pass
+
+    # 2. 统一配置
     cfg = get_config()
-
-    # 1. 从 routing 找到模型名
     model_name = cfg.llm.routing.get(routing_name, routing_name)
-
-    # 2. 从 models 找模型配置
     model_cfg = cfg.llm.models.get(model_name)
-    if model_cfg is None:
-        # 回退：尝试从老 model_config 获取
-        return _legacy_model_set(routing_name)
+    if model_cfg is not None and model_cfg.provider:
+        provider_cfg = cfg.llm.providers.get(model_cfg.provider)
+        if provider_cfg is not None:
+            api_key = provider_cfg.api_key
+            if isinstance(api_key, list):
+                api_key = api_key[0] if api_key else ""
+            entry: dict[str, Any] = {
+                "api_provider": model_cfg.provider,
+                "base_url": provider_cfg.base_url,
+                "model_identifier": model_cfg.model,
+                "api_key": api_key,
+                "client_type": provider_cfg.client_type,
+                "max_tokens": model_cfg.max_tokens,
+                "temperature": model_cfg.temperature,
+                "top_p": model_cfg.top_p,
+                "max_retry": provider_cfg.max_retry,
+                "timeout": provider_cfg.timeout,
+            }
+            entry.update(model_cfg.extra)
+            return [entry]
 
-    # 3. 从 providers 找 provider 配置
-    provider_cfg = cfg.llm.providers.get(model_cfg.provider)
-    if provider_cfg is None:
-        raise ValueError(
-            f"模型 '{model_name}' 引用了未配置的 provider '{model_cfg.provider}'"
-        )
-
-    # 4. 构建 model_set entry（兼容 LLMRequest 格式）
-    api_key = provider_cfg.api_key
-    if isinstance(api_key, list):
-        api_key = api_key[0] if api_key else ""
-
-    entry: dict[str, Any] = {
-        "api_provider": model_cfg.provider,
-        "base_url": provider_cfg.base_url,
-        "model_identifier": model_cfg.model,
-        "api_key": api_key,
-        "client_type": provider_cfg.client_type,
-        "max_tokens": model_cfg.max_tokens,
-        "temperature": model_cfg.temperature,
-        "top_p": model_cfg.top_p,
-        "max_retry": provider_cfg.max_retry,
-        "timeout": provider_cfg.timeout,
-    }
-    entry.update(model_cfg.extra)
-    return [entry]
+    # 3. 老格式回退
+    return _legacy_model_set(routing_name)
 
 
 def _legacy_model_set(task_name: str) -> list[dict[str, Any]]:
