@@ -1,4 +1,4 @@
-"""emoji_sender 服务层测试。"""
+"""emoji sender 服务层测试。"""
 
 from __future__ import annotations
 
@@ -8,14 +8,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from plugins.emoji_sender.config import EmojiSenderConfig
-from plugins.emoji_sender.service import EmojiSenderService, MemeCandidate
+from plugins.emoji.config import EmojiConfig
+from plugins.emoji.sender.service import EmojiSenderService, MemeCandidate
 
 
 def _make_service(*, temperature: float = 0.12) -> EmojiSenderService:
     """创建一个带最小配置的 EmojiSenderService。"""
-    config = EmojiSenderConfig()
-    config.vector.temperature = temperature
+    config = EmojiConfig()
+    config.sender.vector.temperature = temperature
     plugin = SimpleNamespace(config=config)
     return EmojiSenderService(plugin=cast(Any, plugin))
 
@@ -43,7 +43,7 @@ def test_select_candidate_uses_temperature_weights() -> None:
         MemeCandidate("m3", "开心", "/tmp/3.png", "第三张", 0.31),
     ]
 
-    with patch("plugins.emoji_sender.service.random.choices", return_value=[candidates[1]]) as choices_mock:
+    with patch("plugins.emoji.sender.service.random.choices", return_value=[candidates[1]]) as choices_mock:
         selected = service._select_candidate(candidates)
 
     assert selected is candidates[1]
@@ -77,9 +77,9 @@ async def test_search_best_samples_within_threshold() -> None:
     chosen = MemeCandidate("m2", "开心", "/tmp/2.png", "第二张", 0.08)
 
     with (
-        patch("plugins.emoji_sender.service.get_model_set_by_task", return_value=object()),
-        patch("plugins.emoji_sender.service.create_embedding_request", return_value=embedding_request),
-        patch("plugins.emoji_sender.service.get_vector_db_service", return_value=mock_vdb),
+        patch("plugins.emoji.sender.service.get_model_set_by_task", return_value=object()),
+        patch("plugins.emoji.sender.service.create_embedding_request", return_value=embedding_request),
+        patch("plugins.emoji.sender.service.get_vector_db_service", return_value=mock_vdb),
         patch.object(service, "_select_candidate", return_value=chosen) as select_mock,
     ):
         result = await service.search_best("开心地笑", ["开心"])
@@ -112,9 +112,9 @@ async def test_search_best_uses_temperature_sampling_for_tagged_fallback() -> No
     chosen = MemeCandidate("m2", "开心", "/tmp/2.png", "第二张", 0.49)
 
     with (
-        patch("plugins.emoji_sender.service.get_model_set_by_task", return_value=object()),
-        patch("plugins.emoji_sender.service.create_embedding_request", return_value=embedding_request),
-        patch("plugins.emoji_sender.service.get_vector_db_service", return_value=mock_vdb),
+        patch("plugins.emoji.sender.service.get_model_set_by_task", return_value=object()),
+        patch("plugins.emoji.sender.service.create_embedding_request", return_value=embedding_request),
+        patch("plugins.emoji.sender.service.get_vector_db_service", return_value=mock_vdb),
         patch.object(service, "_select_candidate", return_value=chosen) as select_mock,
     ):
         result = await service.search_best("开心地笑", ["开心"])
@@ -145,9 +145,9 @@ async def test_search_best_without_tags_still_requires_threshold_match() -> None
     embedding_request.send = AsyncMock(return_value=SimpleNamespace(embeddings=[[0.1, 0.2, 0.3]]))
 
     with (
-        patch("plugins.emoji_sender.service.get_model_set_by_task", return_value=object()),
-        patch("plugins.emoji_sender.service.create_embedding_request", return_value=embedding_request),
-        patch("plugins.emoji_sender.service.get_vector_db_service", return_value=mock_vdb),
+        patch("plugins.emoji.sender.service.get_model_set_by_task", return_value=object()),
+        patch("plugins.emoji.sender.service.create_embedding_request", return_value=embedding_request),
+        patch("plugins.emoji.sender.service.get_vector_db_service", return_value=mock_vdb),
         patch.object(service, "_select_candidate") as select_mock,
     ):
         result = await service.search_best("开心地笑", None)

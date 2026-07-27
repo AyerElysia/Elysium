@@ -105,7 +105,10 @@ data/
 plugins/*
 
 !plugins/diary_plugin/
-!plugins/elysia_generated_emoji/
+!plugins/emoji/
+!plugins/emoji/**
+plugins/emoji/**/__pycache__/
+plugins/emoji/**/*.py[cod]
 !plugins/tts_voice_plugin/
 
 !plugins/neko_surface/
@@ -116,9 +119,7 @@ plugins/neko_surface/**/*.py[cod]
 !plugins/werewolf_game/**
 plugins/werewolf_game/**/__pycache__/
 plugins/werewolf_game/**/*.py[cod]
-!plugins/default_chatter/
 !plugins/napcat_adapter/
-!plugins/emoji_sender/
 !plugins/life_engine/
 !plugins/live_bridge/
 !plugins/minicpm_live_bridge/

@@ -467,8 +467,8 @@ class EmojiRouter(BaseRouter):
                 if data.description is not None:
                     try:
                         from src.app.plugin_system.api.service_api import get_service
-                        from plugins.emoji_sender.service import EmojiSenderService
-                        svc = get_service("emoji_sender:service:emoji_sender")
+                        from plugins.emoji.sender.service import EmojiSenderService
+                        svc = get_service("emoji:service:emoji_sender")
                         if svc is not None and isinstance(svc, EmojiSenderService):
                             vdb_synced = await svc.update_meme_description(hash, data.description)
                         else:

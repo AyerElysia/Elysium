@@ -25,10 +25,10 @@ from src.core.components.base.service import BaseService
 from src.kernel.concurrency import get_task_manager
 from src.kernel.logger import get_logger
 
-from .config import ElysiaGeneratedEmojiConfig
+from ..config import EmojiConfig
 from .prompt import EmojiStylePreset
 
-logger = get_logger("elysia_generated_emoji")
+logger = get_logger("emoji.generated")
 
 _ENV_KEY_NAMES = ("NOVELAI_API_KEY", "NOVELAI_TOKEN", "NAI_API_KEY")
 
@@ -60,11 +60,11 @@ class ElysiaGeneratedEmojiService(BaseService):
         self._last_request_at = 0.0
         self._key_index = 0
 
-    def _cfg(self) -> ElysiaGeneratedEmojiConfig:
+    def _cfg(self) -> EmojiConfig.GeneratedSection:
         cfg = self.plugin.config
-        if not isinstance(cfg, ElysiaGeneratedEmojiConfig):
-            raise RuntimeError("elysia_generated_emoji config 未正确加载")
-        return cfg
+        if not isinstance(cfg, EmojiConfig):
+            raise RuntimeError("emoji plugin config 未正确加载")
+        return cfg.generated
 
     async def initialize(self) -> None:
         """启动生成表情包队列。"""

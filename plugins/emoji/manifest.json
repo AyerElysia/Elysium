@@ -1,0 +1,43 @@
+{
+  "name": "emoji",
+  "version": "1.0.0",
+  "description": "表情包统一插件：收藏发送（sender，media cache + tag + 向量检索）与现场生成（generated，NovelAI）",
+  "author": "Elysium",
+  "dependencies": {
+    "plugins": [],
+    "components": []
+  },
+  "include": [
+    {
+      "component_type": "service",
+      "component_name": "emoji_sender",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "action",
+      "component_name": "send_emoji_meme",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "service",
+      "component_name": "elysia_generated_emoji",
+      "dependencies": []
+    },
+    {
+      "component_type": "action",
+      "component_name": "generate_emoji_meme",
+      "dependencies": []
+    },
+    {
+      "component_type": "config",
+      "component_name": "config",
+      "dependencies": []
+    }
+  ],
+  "entry_point": "plugin.py",
+  "min_core_version": "1.0.0",
+  "python_dependencies": ["aiohttp", "pillow"],
+  "dependencies_required": true
+}

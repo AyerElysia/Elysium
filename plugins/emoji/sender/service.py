@@ -38,7 +38,7 @@ from src.core.utils.base64_helper import base64_encode_bytes
 from src.kernel.logger import get_logger
 from src.kernel.vector_db import get_vector_db_service
 
-from .config import EmojiSenderConfig
+from ..config import EmojiConfig
 
 try:
     from PIL import Image as PILImage
@@ -46,7 +46,7 @@ except ImportError:
     PILImage = None
 
 
-logger = get_logger("emoji_sender")
+logger = get_logger("emoji.sender")
 
 
 EMOTION_TAG_PRESET: tuple[str, ...] = (
@@ -123,12 +123,12 @@ class EmojiSenderService(BaseService):
 
         return random.choices(ordered_candidates, weights=weights, k=1)[0]
 
-    def _cfg(self) -> EmojiSenderConfig:
-        """获取插件配置实例。"""
+    def _cfg(self) -> EmojiConfig.SenderSection:
+        """获取插件配置实例（sender 命名空间）。"""
         cfg = self.plugin.config
-        if not isinstance(cfg, EmojiSenderConfig):
-            raise RuntimeError("emoji_sender plugin config 未正确加载")
-        return cfg
+        if not isinstance(cfg, EmojiConfig):
+            raise RuntimeError("emoji plugin config 未正确加载")
+        return cfg.sender
 
     @staticmethod
     def _media_cache_dir() -> Path:

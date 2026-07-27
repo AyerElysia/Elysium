@@ -1,7 +1,8 @@
-"""emoji_sender 插件入口。
+"""emoji 插件入口（合并自原 emoji_sender 与 elysia_generated_emoji）。
 
-加载后会注册一个 scheduler 周期任务：定时执行一次入库（对齐→抽取→VLM 决策→收藏入库）。
-注意：scheduler 在 Bot.run() 阶段才 start()，因此这里使用 task_manager 后台协程等待 scheduler 就绪后再注册。
+包含两套能力：
+- sender：从 media cache 收藏表情包并按 tag+向量检索发送（含 scheduler 周期入库任务）
+- generated：现场生成表情包（NovelAI），默认禁用，配置开启后生效
 """
 
 from __future__ import annotations
@@ -13,12 +14,14 @@ from src.core.components import BasePlugin, register_plugin
 from src.kernel.concurrency import get_task_manager
 from src.kernel.logger import get_logger
 
-from .action import SendEmojiMemeAction
-from .config import EmojiSenderConfig
-from .service import EmojiSenderService
+from .config import EmojiConfig
+from .generated.action import GenerateEmojiMemeAction
+from .generated.service import ElysiaGeneratedEmojiService
+from .sender.action import SendEmojiMemeAction
+from .sender.service import EmojiSenderService
 
 
-logger = get_logger("emoji_sender")
+logger = get_logger("emoji")
 
 _TARGET_REMINDER_BUCKET = "actor"
 _TARGET_REMINDER_NAME = "关于表情包的使用"
@@ -34,16 +37,16 @@ _EMOJI_USAGE_REMINDER = (
 
 
 def build_emoji_sender_actor_reminder(plugin: Any) -> str:
-    """构建 emoji_sender 的 actor reminder。"""
+    """构建 sender 的 actor reminder。"""
 
     config = getattr(plugin, "config", None)
-    if isinstance(config, EmojiSenderConfig) and not config.plugin.inject_system_prompt:
+    if isinstance(config, EmojiConfig) and not config.sender.plugin.inject_system_prompt:
         return ""
     return _EMOJI_USAGE_REMINDER
 
 
 def sync_emoji_sender_actor_reminder(plugin: Any) -> str:
-    """同步 emoji_sender 的 actor reminder。"""
+    """同步 sender 的 actor reminder。"""
 
     from src.core.prompt import get_system_reminder_store
 
@@ -51,7 +54,7 @@ def sync_emoji_sender_actor_reminder(plugin: Any) -> str:
     reminder_content = build_emoji_sender_actor_reminder(plugin)
     if not reminder_content:
         store.delete(_TARGET_REMINDER_BUCKET, _TARGET_REMINDER_NAME)
-        logger.debug("emoji_sender actor reminder 已清理")
+        logger.debug("emoji sender actor reminder 已清理")
         return ""
 
     store.set(
@@ -59,37 +62,43 @@ def sync_emoji_sender_actor_reminder(plugin: Any) -> str:
         name=_TARGET_REMINDER_NAME,
         content=reminder_content,
     )
-    logger.debug("emoji_sender actor reminder 已同步")
+    logger.debug("emoji sender actor reminder 已同步")
     return reminder_content
 
 
 @register_plugin
-class EmojiSenderPlugin(BasePlugin):
-    """emoji_sender 插件。"""
+class EmojiPlugin(BasePlugin):
+    """表情包统一插件（收藏发送 + 现场生成）。"""
 
-    plugin_name: str = "emoji_sender"
-    plugin_description: str = "从 media cache 收藏表情包并按 tag+向量检索发送"
+    plugin_name: str = "emoji"
+    plugin_description: str = "表情包能力：收藏发送（sender）与现场生成（generated）"
     plugin_version: str = "1.0.0"
 
-    configs: list[type] = [EmojiSenderConfig]
+    configs: list[type] = [EmojiConfig]
     dependent_components: list[str] = []
 
-    def __init__(self, config: EmojiSenderConfig | None = None) -> None:
+    def __init__(self, config: EmojiConfig | None = None) -> None:
         super().__init__(config)
         self._schedule_ids: list[str] = []
         self._register_task_id: str | None = None
+        # generated 能力在 on_plugin_loaded 时按需初始化，供 GenerateEmojiMemeAction 取用
+        self.emoji_service: ElysiaGeneratedEmojiService | None = None
 
     def get_components(self) -> list[type]:
         """返回本插件提供的组件类。"""
-        return [EmojiSenderService, SendEmojiMemeAction]
+        components: list[type] = [EmojiSenderService, SendEmojiMemeAction]
+        cfg = self.config
+        if isinstance(cfg, EmojiConfig) and cfg.generated.plugin.enabled:
+            components.extend([ElysiaGeneratedEmojiService, GenerateEmojiMemeAction])
+        return components
 
     async def on_plugin_loaded(self) -> None:
-        """插件加载完成后：初始化配置并注册周期任务。"""
+        """插件加载完成后：初始化 sender 调度与 generated 服务。"""
+        # ── sender：reminder + 自定义指令 + 周期入库任务 ──
         sync_emoji_sender_actor_reminder(self)
 
-        # 将自定义场景说明追加到 action 的描述，使 Chatter 侧感知使用时机
-        if isinstance(self.config, EmojiSenderConfig):
-            custom = self.config.prompt.custom_instructions.strip()
+        if isinstance(self.config, EmojiConfig):
+            custom = self.config.sender.prompt.custom_instructions.strip()
             if custom:
                 SendEmojiMemeAction.action_description = (
                     SendEmojiMemeAction.action_description.rstrip() + "\n\n自定义指令：\n" + custom
@@ -104,8 +113,16 @@ class EmojiSenderPlugin(BasePlugin):
         )
         self._register_task_id = task.task_id
 
+        # ── generated：按需初始化生成服务 ──
+        cfg = self.config
+        if isinstance(cfg, EmojiConfig) and cfg.generated.plugin.enabled:
+            self.emoji_service = ElysiaGeneratedEmojiService(self)
+            await self.emoji_service.initialize()
+        else:
+            logger.info("emoji generated 能力已禁用")
+
     async def on_plugin_unloaded(self) -> None:
-        """插件卸载前：移除 schedule，并取消后台注册任务。"""
+        """插件卸载前：移除 schedule、取消后台任务、清理 reminder 与生成服务。"""
         from src.kernel.scheduler import get_unified_scheduler
         from src.core.prompt import get_system_reminder_store
 
@@ -126,24 +143,24 @@ class EmojiSenderPlugin(BasePlugin):
             self._register_task_id = None
 
         get_system_reminder_store().delete(_TARGET_REMINDER_BUCKET, _TARGET_REMINDER_NAME)
+        self.emoji_service = None
 
     async def _register_schedule_when_ready(self) -> None:
-        """等待 scheduler 运行后注册周期任务。"""
+        """等待 scheduler 运行后注册 sender 周期入库任务。"""
         from src.kernel.scheduler import get_unified_scheduler, TriggerType
 
-        if not isinstance(self.config, EmojiSenderConfig):
-            logger.warning("emoji_sender config 未加载，无法注册 schedule")
+        if not isinstance(self.config, EmojiConfig):
+            logger.warning("emoji config 未加载，无法注册 schedule")
             return
 
         scheduler = get_unified_scheduler()
-        interval = int(self.config.scheduler.interval_seconds)
+        interval = int(self.config.sender.scheduler.interval_seconds)
         task_name_once = "emoji_sender_ingest_once"
         task_name_recurring = "emoji_sender_ingest_recurring"
 
         # scheduler.start() 发生在 Bot.run()；这里等待其就绪。
         for attempt in range(600):
             try:
-                # 先注册一次性任务，立即跑一遍（满足“启动后尽快入库”的直觉）
                 once_id = await scheduler.create_schedule(
                     callback=self._ingest_job,
                     trigger_type=TriggerType.TIME,
@@ -164,23 +181,23 @@ class EmojiSenderPlugin(BasePlugin):
 
                 self._schedule_ids = [once_id, recurring_id]
                 logger.info(
-                    f"emoji_sender 入库任务已注册: once={once_id} recurring={recurring_id}"
+                    f"emoji sender 入库任务已注册: once={once_id} recurring={recurring_id}"
                 )
                 return
             except RuntimeError:
                 await asyncio.sleep(0.5)
                 continue
             except Exception as e:
-                logger.warning(f"注册 emoji_sender 入库任务失败: {e}")
+                logger.warning(f"注册 emoji sender 入库任务失败: {e}")
                 await asyncio.sleep(2.0)
 
-        logger.warning("等待 scheduler 就绪超时，emoji_sender 入库任务未注册")
+        logger.warning("等待 scheduler 就绪超时，emoji sender 入库任务未注册")
 
     async def _ingest_job(self) -> None:
-        """scheduler 回调：创建一个 service 实例并执行入库。"""
+        """scheduler 回调：创建一个 sender service 实例并执行入库。"""
         from src.app.plugin_system.api.service_api import get_service
 
-        service = get_service("emoji_sender:service:emoji_sender")
+        service = get_service("emoji:service:emoji_sender")
         if service is None:
             return
         await cast(EmojiSenderService, service).ingest_once()

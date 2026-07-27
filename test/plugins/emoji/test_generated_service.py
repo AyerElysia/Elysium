@@ -8,8 +8,8 @@ from typing import Any, cast
 import aiohttp
 import pytest
 
-from plugins.elysia_generated_emoji.config import ElysiaGeneratedEmojiConfig
-from plugins.elysia_generated_emoji.service import ElysiaGeneratedEmojiService
+from plugins.emoji.config import EmojiConfig
+from plugins.emoji.generated.service import ElysiaGeneratedEmojiService
 
 
 class _FakeResponse:
@@ -57,8 +57,8 @@ class _FakeSession:
 
 
 def _make_service(*, proxy: str = "") -> ElysiaGeneratedEmojiService:
-    config = ElysiaGeneratedEmojiConfig()
-    config.api.proxy = proxy
+    config = EmojiConfig()
+    config.generated.api.proxy = proxy
     plugin = SimpleNamespace(config=config)
     return ElysiaGeneratedEmojiService(plugin=cast(Any, plugin))
 

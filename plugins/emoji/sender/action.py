@@ -38,7 +38,7 @@ class SendEmojiMemeAction(BaseAction):
         ] = None,
     ) -> tuple[bool, str]:
         """执行发送表情包动作。"""
-        service = get_service("emoji_sender:service:emoji_sender")
+        service = get_service("emoji:service:emoji_sender")
         if service is None:
             return False, "emoji_sender service 未加载"
 

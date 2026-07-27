@@ -10,11 +10,11 @@ from src.core.components.types import ChatType
 from src.kernel.concurrency import get_task_manager
 from src.kernel.logger import get_logger
 
-from .config import ElysiaGeneratedEmojiConfig
+from ..config import EmojiConfig
 from .prompt import list_style_names, resolve_style
 from .service import ElysiaGeneratedEmojiService, EmojiGenerationRequest
 
-logger = get_logger("elysia_generated_emoji.action")
+logger = get_logger("emoji.generated.action")
 
 
 class GenerateEmojiMemeAction(BaseAction):
@@ -66,9 +66,10 @@ class GenerateEmojiMemeAction(BaseAction):
         if not isinstance(service, ElysiaGeneratedEmojiService):
             return False, "Elysia 生成表情包服务未加载"
 
-        cfg = getattr(self.plugin, "config", None)
-        if not isinstance(cfg, ElysiaGeneratedEmojiConfig) or not cfg.plugin.enabled:
+        full_cfg = getattr(self.plugin, "config", None)
+        if not isinstance(full_cfg, EmojiConfig) or not full_cfg.generated.plugin.enabled:
             return False, "Elysia 生成表情包未启用"
+        cfg = full_cfg.generated
 
         preset = resolve_style(style)
         prompt = self._build_scene_prompt(intent=intent, scene=scene)
