@@ -28,7 +28,13 @@ from .models import (
     ValidationExperiment,
     EvidenceKind,
 )
-from .semantic_matcher import match_insight_pattern, semantic_overlap
+from .semantic_matcher import (
+    match_insight_pattern,
+    semantic_overlap,
+    batch_match,
+    REINFORCE_THRESHOLD,
+    MERGE_THRESHOLD,
+)
 
 logger = logging.getLogger("life_engine.learning.store")
 
@@ -36,20 +42,12 @@ LEARNING_DIR_NAME = ".life_learning"
 STORE_VERSION = 1
 EXPERIMENTS_FILE = "validation_experiments.json"
 
-# 强化/去重匹配阈值。
-#
-# 基于真实数据校准（2026-07-27，49 条实际洞察的 1176 个配对）：
-#   同一模式的改述       → 重叠度 0.32 ~ 1.00
-#   相关但确实不同的模式 → 重叠度 0.20 ~ 0.30
-#   无关                 → < 0.20
-# 因此 0.45 作为"同一模式"的判定线；topic 不同不再直接排除——
-# 她每次反思都会自由命名 topic_key（49 条洞察出现 44 个不同 key），
-# topic 相等本就是罕见事件，用它做硬门禁会让改述永远无法合并成证据。
-_REINFORCE_OVERLAP_WITH_TOPIC = 0.45
-_REINFORCE_OVERLAP_NO_TOPIC = 0.45
-# 去重与强化用同一条线：判定为"同一模式"后走强化（累积证据），
-# 而不是丢弃观察。
-_DEDUP_OVERLAP_THRESHOLD = 0.45
+## 阈值由 semantic_matcher 统一管理（基于 BGE-M3 embedding 校准）：
+#   REINFORCE_THRESHOLD = 0.65  (cosine >= 此值 → 同一模式，可强化)
+#   MERGE_THRESHOLD = 0.75      (cosine >= 此值 → 高度重复，应合并)
+_REINFORCE_OVERLAP_WITH_TOPIC = REINFORCE_THRESHOLD
+_REINFORCE_OVERLAP_NO_TOPIC = REINFORCE_THRESHOLD
+_DEDUP_OVERLAP_THRESHOLD = REINFORCE_THRESHOLD
 # 可被强化的状态（活跃且尚未验证/否定/归档）
 _REINFORCEABLE_STATUSES = (
     InsightStatus.CANDIDATE.value,
@@ -132,10 +130,20 @@ class InsightStore:
     # ── CRUD ─────────────────────────────────────────────────
 
     def add_insight(self, insight: Insight) -> bool:
-        """添加新洞察（带去重检查）。返回是否成功添加。"""
+        """添加新洞察。返回是否创建了新洞察。
+
+        若这条观察表达的是已有洞察的同一模式，不再静默丢弃——
+        把它携带的证据并入那条已有洞察。反思提示词承诺过
+        "复现即证据"，这里是那句承诺的落地处。
+        """
         self.load()
-        if self._is_duplicate(insight):
-            logger.info(f"洞察去重: '{insight.claim[:40]}...' 与已有洞察重复")
+        dup = self._find_duplicate(insight)
+        if dup is not None:
+            merged = self._merge_as_evidence(dup, insight)
+            logger.info(
+                f"洞察复现: '{insight.claim[:40]}...' → "
+                f"并入 {dup.insight_id}（证据 {'已' if merged else '未'}累积）"
+            )
             return False
         self._insights.append(insight)
         self._append_audit({
@@ -187,9 +195,9 @@ class InsightStore:
 
         匹配逻辑（使用语义匹配）：
         - 目标必须处于活跃状态（candidate/under_review/needs_more_evidence）
-        - 两者都有 topic 且不同 → 不合并（明确不同主题）
-        - 同 topic → claim 语义重叠 ≥ 0.5 即可（捕捉改述）
-        - 无共同 topic → 需 claim 语义重叠 ≥ 0.7（更保守）
+        - claim 语义重叠 ≥ 0.45 即视为"同一模式的改述"，累积为证据
+        - topic_key 不同不再直接排除：她每次反思都自由命名 topic，
+          topic 相同本就罕见，用它做硬门禁会让改述永远合并不上
         返回匹配度最高的匹配，或 None。
         """
         self.load()
@@ -209,8 +217,8 @@ class InsightStore:
                 new_insight.claim,
                 topic1=existing.topic_key,
                 topic2=new_insight.topic_key,
-                same_topic_threshold=0.5,
-                diff_topic_threshold=0.7,
+                same_topic_threshold=_REINFORCE_OVERLAP_WITH_TOPIC,
+                diff_topic_threshold=_REINFORCE_OVERLAP_NO_TOPIC,
             )
 
             if score > best_score:
@@ -266,6 +274,52 @@ class InsightStore:
         })
         self._save()
         return True
+
+    def _merge_as_evidence(self, target: Insight, observation: Insight) -> bool:
+        """把一条"复现的观察"并入已有洞察，作为新证据。
+
+        - 活跃状态的目标 → 走 reinforce_insight（会重新排队待审）
+        - 已 validated / rejected 的目标 → 只附证据，不改状态：
+          她（或独立审计）已经对那条下过判断，新观察是记录，不是推翻指令
+        """
+        items = list(observation.evidence)
+        if not items:
+            items = [Evidence(
+                evidence_id=f"ev_{uuid4().hex[:12]}",
+                timestamp=_now_iso(),
+                kind=EvidenceKind.PATTERN_MATCH.value,
+                description=observation.rationale or observation.claim,
+                source_ref=observation.source_events[0] if observation.source_events else "",
+            )]
+
+        reinforceable = target.status in _REINFORCEABLE_STATUSES
+        merged_any = False
+        for ev in items:
+            # 保留这次的表述，便于她看到同一模式的不同说法
+            if not ev.context:
+                ev.context = f"复现表述: {observation.claim}"
+            if reinforceable:
+                merged_any = self.reinforce_insight(
+                    target.insight_id,
+                    ev,
+                    source_events=observation.source_events,
+                ) or merged_any
+            else:
+                target.add_evidence(ev)
+                merged_any = True
+
+        if merged_any and not reinforceable:
+            target.updated_at = _now_iso()
+            self._append_audit({
+                "action": "evidence_merged",
+                "insight_id": target.insight_id,
+                "status": target.status,
+                "evidence_count": len(target.evidence),
+                "reappeared_claim": observation.claim,
+            })
+            self._save()
+
+        return merged_any
 
     # ── 状态流转 ─────────────────────────────────────────────
 
@@ -393,26 +447,136 @@ class InsightStore:
         stale_insights.sort(key=lambda x: x[1], reverse=True)
         return stale_insights
 
+    # ── 存量去重合并 ─────────────────────────────────────────
+
+    def merge_duplicates(self, *, threshold: float | None = None) -> int:
+        """扫描所有 candidate 洞察，合并高度重复的条目。
+
+        使用 Embedding cosine similarity 进行全配对比较：
+        - cosine >= threshold (默认 MERGE_THRESHOLD=0.75) → 合并
+        - 保留证据最多的作为主体，其余的 evidence 并入主体
+        - 被合并的洞察标记为 archived
+
+        Returns:
+            合并的洞察数量（被归档的条目数）
+        """
+        self.load()
+        merge_threshold = threshold if threshold is not None else MERGE_THRESHOLD
+
+        # 只合并活跃状态的洞察
+        active = [
+            ins for ins in self._insights
+            if ins.status in _REINFORCEABLE_STATUSES
+        ]
+        if len(active) < 2:
+            return 0
+
+        claims = [ins.claim for ins in active]
+        matrix = batch_match(claims)
+        if matrix is None:
+            logger.warning("merge_duplicates: Embedding 不可用，跳过")
+            return 0
+
+        # 用 Union-Find 聚类：cosine >= threshold 的归为一组
+        n = len(active)
+        parent = list(range(n))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: int, b: int) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                if matrix[i][j] >= merge_threshold:
+                    union(i, j)
+
+        # 按组聚合
+        groups: dict[int, list[int]] = {}
+        for i in range(n):
+            root = find(i)
+            groups.setdefault(root, []).append(i)
+
+        merged_count = 0
+        for indices in groups.values():
+            if len(indices) < 2:
+                continue
+            # 选证据最多的作为主体
+            insights_in_group = [active[i] for i in indices]
+            insights_in_group.sort(key=lambda ins: len(ins.evidence), reverse=True)
+            primary = insights_in_group[0]
+
+            for secondary in insights_in_group[1:]:
+                # 把 secondary 的证据并入 primary
+                for ev in secondary.evidence:
+                    if ev.evidence_id not in {e.evidence_id for e in primary.evidence}:
+                        primary.add_evidence(ev)
+                # 合并来源事件
+                for sid in secondary.source_events:
+                    if sid not in primary.source_events:
+                        primary.source_events.append(sid)
+                # 归档 secondary
+                secondary.status = InsightStatus.ARCHIVED.value
+                secondary.next_action = InsightNextAction.ARCHIVE.value
+                secondary.revision_note = f"已合并入 {primary.insight_id}"
+                merged_count += 1
+
+                self._append_audit({
+                    "action": "insight_merged",
+                    "merged_id": secondary.insight_id,
+                    "into_id": primary.insight_id,
+                    "similarity": float(matrix[
+                        indices[insights_in_group.index(secondary)]
+                    ][indices[0]]),
+                })
+
+            primary.updated_at = _now_iso()
+            logger.info(
+                f"合并 {len(indices)-1} 条重复洞察入 [{primary.insight_id}]: "
+                f"{primary.claim[:50]}... (证据: {len(primary.evidence)})"
+            )
+
+        if merged_count > 0:
+            self._save()
+            logger.info(f"存量去重完成: {merged_count} 条被合并归档")
+        return merged_count
+
     # ── 去重与冷却 ───────────────────────────────────────────
 
-    def _is_duplicate(self, new_insight: Insight) -> bool:
-        """使用语义重叠度去重。"""
-        if not new_insight.claim:
-            return False
+    def _find_duplicate(self, new_insight: Insight) -> Insight | None:
+        """找出与新洞察表达同一模式的已有洞察（语义重叠度）。
 
+        与 find_reinforce_target 用同一条判定线，区别只在于这里也会命中
+        已 validated / rejected 的洞察——那类不再强化，但也不该被当成
+        全新洞察重复记一遍。
+
+        topic_key 不参与门禁：她每次反思自由命名 topic，用它做硬排除
+        会让同一模式的改述被当成新洞察反复创建。
+        """
+        if not new_insight.claim:
+            return None
+
+        best: Insight | None = None
+        best_overlap = 0.0
         for existing in self._insights:
             if existing.status in (InsightStatus.ARCHIVED.value,):
                 continue
-            if existing.topic_key and new_insight.topic_key:
-                if existing.topic_key != new_insight.topic_key:
-                    continue
-
-            # 使用语义匹配，阈值 0.7（去重比强化更严格）
             overlap = semantic_overlap(existing.claim, new_insight.claim)
-            if overlap >= _DEDUP_OVERLAP_THRESHOLD:
-                return True
+            if overlap >= _DEDUP_OVERLAP_THRESHOLD and overlap > best_overlap:
+                best = existing
+                best_overlap = overlap
 
-        return False
+        return best
+
+    def _is_duplicate(self, new_insight: Insight) -> bool:
+        """兼容保留：是否与已有洞察表达同一模式。"""
+        return self._find_duplicate(new_insight) is not None
 
     def _topic_distribution(self) -> dict[str, int]:
         topics: dict[str, int] = {}

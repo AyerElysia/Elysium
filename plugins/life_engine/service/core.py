@@ -3300,8 +3300,12 @@ class LifeEngineService(BaseService):
         from ..tools.autonomy_tools import AUTONOMY_TOOLS
         from ..tools.skill_tools import SKILL_TOOLS
         from ..tools.event_grep_tools import EVENT_GREP_TOOLS
+        # 自学习工具：让她能自己查看/质疑/反思洞察账本。
+        # 之前这组在 plugin.get_components() 里注册了，却没进中枢工具池，
+        # 于是她只能用 nucleus_bash 去读 .life_learning/ —— 日志里有 5 次这样的尝试。
+        from ..learning.tools import LEARNING_TOOLS
 
-        return ALL_TOOLS + TODO_TOOLS + MEMORY_TOOLS + GREP_TOOLS + WEB_TOOLS + STREAM_TOOLS + SCHEDULE_TOOLS + AUTONOMY_TOOLS + SKILL_TOOLS + EVENT_GREP_TOOLS
+        return ALL_TOOLS + TODO_TOOLS + MEMORY_TOOLS + GREP_TOOLS + WEB_TOOLS + STREAM_TOOLS + SCHEDULE_TOOLS + AUTONOMY_TOOLS + SKILL_TOOLS + EVENT_GREP_TOOLS + LEARNING_TOOLS
 
     @staticmethod
     def _heartbeat_tool_call_metadata(call: Any) -> tuple[str, dict[str, Any]]:
@@ -3546,8 +3550,31 @@ class LifeEngineService(BaseService):
                 exceptions=(asyncio.TimeoutError,),
             )
         except Exception as e:
-            logger.error(f"Heartbeat request failed after all retries: {e}")
-            raise
+            # 主模型失败，尝试轻量模型降级（utils task 通常路由到更快的 provider）
+            if task_name != "utils":
+                try:
+                    logger.warning(
+                        f"life_engine 心跳主模型({task_name})失败，尝试 utils 降级: {e}"
+                    )
+                    fallback_model_set = get_model_set_by_task("utils")
+                    fallback_request = create_llm_request(
+                        model_set=fallback_model_set,
+                        request_name="life_engine_heartbeat_fallback",
+                    )
+                    # 复制 payloads 到 fallback request
+                    for payload in request.payloads:
+                        fallback_request.add_payload(payload)
+                    response = await asyncio.wait_for(
+                        fallback_request.send(stream=False),
+                        timeout=timeout_seconds,
+                    )
+                    logger.info("life_engine 心跳降级成功(utils)")
+                except Exception as fallback_exc:
+                    logger.error(f"Heartbeat fallback also failed: {fallback_exc}")
+                    raise e from fallback_exc
+            else:
+                logger.error(f"Heartbeat request failed after all retries: {e}")
+                raise
 
         max_rounds = max(1, int(cfg.settings.max_rounds_per_heartbeat))
         last_text = ""
@@ -3742,6 +3769,8 @@ class LifeEngineService(BaseService):
                 self._learning_scheduler = LearningScheduler(
                     workspace_path=cfg.settings.workspace_path,
                     model_task_name=getattr(cfg.model, "task_name", "life"),
+                    # 反思环需要记忆服务：把"我之前理解错了"落成显式修正记录
+                    memory_service=self._memory_service,
                     audit_interval_hours=float(getattr(learning_cfg, "audit_interval_hours", 6.0) if learning_cfg else 6.0),
                     audit_batch_size=int(getattr(learning_cfg, "audit_batch_size", 3) if learning_cfg else 3),
                     compress_trigger_count=int(getattr(learning_cfg, "compress_trigger_count", 5) if learning_cfg else 5),
@@ -3987,7 +4016,9 @@ class LifeEngineService(BaseService):
                         reclaim_after=float(options["reclaim_after_seconds"]),
                     )
                     retry_failed_once = False
-                    logger.info(
+                    _has_work = report.claimed or report.completed or report.failed or report.stale
+                    _log = logger.info if _has_work else logger.debug
+                    _log(
                         "life_engine 记忆索引批次完成: "
                         f"claimed={report.claimed} completed={len(report.completed)} "
                         f"failed={len(report.failed)} stale={len(report.stale)}"

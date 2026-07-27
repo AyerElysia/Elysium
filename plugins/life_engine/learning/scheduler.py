@@ -217,6 +217,10 @@ class LearningScheduler:
         """检查是否到了审计时间。"""
         if not self._should_audit():
             return
+        # 审计前先执行存量去重（合并高度重复的洞察）
+        merged = self.store.merge_duplicates()
+        if merged:
+            logger.info(f"审计前去重: {merged} 条洞察被合并")
         logger.info("🔍 触发审计环")
         records = await self.auditor.run_audit_cycle()
         if records:

@@ -292,11 +292,55 @@ class Insight:
         信念永远可重新审视——不用硬上限机械禁止。
         review_count 仅作信息记录，审计频次预算由调度器控制（脚手架），
         但不作为“你只能想 N 次”的认知禁令。
+
+        两条进入审计队列的路径：
+        1. 明确在等待审计（await_review）
+        2. 上次审计之后又有新证据到达——上次判"证据不足"或"需修正"
+           所依据的前提已经变了，值得再看一次。
+
+        第 2 条是必要的：审计环把绝大多数洞察打回 gather_evidence / revise，
+        若只认第 1 条，这些洞察就永久离开队列，再也不会被重新审视——
+        那与本方法文档承诺的"信念永远可重新审视"直接矛盾。
+        反过来，没有新证据时不进队列，避免重复消耗审计调用去看同一份材料。
         """
-        return (
-            self.status == InsightStatus.CANDIDATE.value
-            and self.next_action == InsightNextAction.AWAIT_REVIEW.value
-        )
+        if self.status not in (
+            InsightStatus.CANDIDATE.value,
+            InsightStatus.NEEDS_MORE_EVIDENCE.value,
+        ):
+            return False
+        if self.next_action == InsightNextAction.AWAIT_REVIEW.value:
+            return True
+        if self.next_action in (
+            InsightNextAction.GATHER_EVIDENCE.value,
+            InsightNextAction.REVISE.value,
+        ):
+            return self.has_new_evidence_since_last_review
+        return False
+
+    @property
+    def has_new_evidence_since_last_review(self) -> bool:
+        """上次审计之后是否有新证据到达。"""
+        if not self.evidence:
+            return False
+        if not self.audit_history:
+            return True
+
+        last_audit_ts = self.audit_history[-1].timestamp
+
+        def _parse(ts: str) -> datetime | None:
+            try:
+                return datetime.fromisoformat(ts)
+            except (ValueError, TypeError):
+                return None
+
+        audit_dt = _parse(last_audit_ts)
+        if audit_dt is None:
+            return True
+        for ev in self.evidence:
+            ev_dt = _parse(ev.timestamp)
+            if ev_dt is not None and ev_dt > audit_dt:
+                return True
+        return False
 
     @property
     def positive_evidence_count(self) -> int:

@@ -30,6 +30,12 @@ def _get_workspace(plugin: Any) -> Path:
         workspace = str(
             Path(__file__).parent.parent.parent.parent / "data" / "life_engine_workspace"
         )
+        # 这条回落会指向真实工作区。曾经因此把一条外部构造的证据写进了活账本，
+        # 且当时静默无声。保留回落（避免在配置异常时整组工具不可用），但必须留痕。
+        logger.warning(
+            f"学习工具拿不到 LifeEngineConfig（plugin={type(plugin).__name__}），"
+            f"回落到默认工作区 {workspace}。若此刻并非真实运行环境，写入将污染真实账本。"
+        )
     path = Path(workspace).resolve()
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -45,6 +51,27 @@ def _get_scheduler(plugin: Any) -> Any:
     except Exception:
         pass
     return None
+
+
+def _get_store(plugin: Any) -> InsightStore:
+    """获取洞察账本。
+
+    优先复用调度器那一个长生命周期实例。原因是 InsightStore.load() 在
+    _loaded 为真时直接 return，而 _save() 整文件覆盖：如果工具各建一个
+    store，工具写入的证据会被调度器下一次落盘用它的陈旧内存静默抹掉，
+    而且没有任何日志会告诉她东西丢了。共享同一实例，写入即对双方可见。
+
+    拿不到调度器时（未初始化、或单元测试）退回按工作区自建。
+    """
+    scheduler = _get_scheduler(plugin)
+    store = getattr(scheduler, "store", None)
+    if isinstance(store, InsightStore):
+        store.load()
+        return store
+
+    store = InsightStore(_get_workspace(plugin))
+    store.load()
+    return store
 
 
 class LifeReflectNowTool(BaseTool):
@@ -126,9 +153,7 @@ class LifeListInsightsTool(BaseTool):
         ] = "all",
         limit: Annotated[int, "最多显示条数（默认 10）"] = 10,
     ) -> tuple[bool, str | dict]:
-        workspace = _get_workspace(self.plugin)
-        store = InsightStore(workspace)
-        store.load()
+        store = _get_store(self.plugin)
 
         status = str(status_filter or "all").strip().lower()
         max_items = max(1, min(50, int(limit or 10)))
@@ -191,9 +216,7 @@ class LifeChallengeInsightTool(BaseTool):
         if not text:
             return False, "请说明你的质疑理由。"
 
-        workspace = _get_workspace(self.plugin)
-        store = InsightStore(workspace)
-        store.load()
+        store = _get_store(self.plugin)
 
         insight = store.get_insight(iid)
         if insight is None:
@@ -239,9 +262,7 @@ class LifeViewKnowledgeTool(BaseTool):
         self,
         show_stats: Annotated[bool, "是否同时显示学习统计（默认 true）"] = True,
     ) -> tuple[bool, str | dict]:
-        workspace = _get_workspace(self.plugin)
-        store = InsightStore(workspace)
-        store.load()
+        store = _get_store(self.plugin)
 
         knowledge = store.read_current_knowledge()
         manifest = store.load_knowledge_manifest()
@@ -284,9 +305,7 @@ class LifeObserveStaleInsightsTool(BaseTool):
         threshold_days: Annotated[int, "陈旧阈值（天），默认90"] = 90,
         max_results: Annotated[int, "最多返回几条，默认10"] = 10,
     ) -> tuple[bool, str | dict]:
-        workspace = _get_workspace(self.plugin)
-        store = InsightStore(workspace)
-        store.load()
+        store = _get_store(self.plugin)
 
         stale_insights = store.get_stale_insights(staleness_threshold_days=threshold_days)
 
@@ -344,9 +363,7 @@ class LifeListValidationExperimentsTool(BaseTool):
         status: Annotated[str, "pending|completed|all，默认pending"] = "pending",
         max_results: Annotated[int, "最多返回几条，默认10"] = 10,
     ) -> tuple[bool, str | dict]:
-        workspace = _get_workspace(self.plugin)
-        store = InsightStore(workspace)
-        store.load()
+        store = _get_store(self.plugin)
 
         if status == "pending":
             experiments = store.list_pending_experiments()
@@ -430,8 +447,7 @@ class LifeCompleteValidationExperimentTool(BaseTool):
         ],
         notes: Annotated[str, "补充说明（可选）"] = "",
     ) -> tuple[bool, str | dict]:
-        workspace = _get_workspace(self.plugin)
-        store = InsightStore(workspace)
+        store = _get_store(self.plugin)
 
         # 验证 result_type
         valid_types = {"confirmed", "contradicted", "inconclusive"}

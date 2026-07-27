@@ -64,7 +64,7 @@ class InsightAuditor:
         self._lock = asyncio.Lock()
 
     async def run_audit_cycle(self) -> list[AuditRecord]:
-        """执行一轮审计：取出候选 → 逐条审计 → 更新状态。
+        """执行一轮审计：取出候选 → 自动晋升检查 → 逐条审计 → 更新状态。
 
         Returns:
             本轮产生的审计记录列表
@@ -75,9 +75,29 @@ class InsightAuditor:
                 logger.debug("无待审洞察")
                 return []
 
-            batch = candidates[: self._batch_size]
             records: list[AuditRecord] = []
 
+            # 自动晋升：证据充分的洞察直接 validated，不消耗 LLM 调用
+            auto_promoted = []
+            remaining = []
+            for ins in candidates:
+                if self._should_auto_promote(ins):
+                    auto_promoted.append(ins)
+                else:
+                    remaining.append(ins)
+
+            for ins in auto_promoted:
+                record = self._auto_promote(ins)
+                if record:
+                    records.append(record)
+
+            if auto_promoted:
+                logger.info(
+                    f"⬆️ 自动晋升: {len(auto_promoted)} 条洞察证据充分，直接 validated"
+                )
+
+            # LLM 审计：只对证据不足的洞察调用
+            batch = remaining[: self._batch_size]
             for insight in batch:
                 record = await self._audit_single(insight)
                 if record is not None:
@@ -91,6 +111,61 @@ class InsightAuditor:
                     f"biased={sum(1 for r in records if r.verdict == AuditVerdict.BIASED.value)}"
                 )
             return records
+
+    def _should_auto_promote(self, insight: Insight) -> bool:
+        """检查洞察是否满足自动晋升条件。
+
+        条件：
+        - >= 3 条正面证据
+        - 来自 >= 2 个不同日期
+        - 无矛盾证据（没有 supports=False 的）
+        """
+        positive = [ev for ev in insight.evidence if ev.supports]
+        if len(positive) < 3:
+            return False
+        # 检查是否有矛盾证据
+        has_contradiction = any(not ev.supports for ev in insight.evidence)
+        if has_contradiction:
+            return False
+        # 检查日期多样性
+        dates: set[str] = set()
+        for ev in positive:
+            try:
+                dt = datetime.fromisoformat(ev.timestamp)
+                dates.add(dt.strftime("%Y-%m-%d"))
+            except (ValueError, TypeError):
+                pass
+        return len(dates) >= 2
+
+    def _auto_promote(self, insight: Insight) -> AuditRecord | None:
+        """自动晋升：证据充分，跳过 LLM 审计直接 validated。"""
+        record = AuditRecord(
+            audit_id=f"audit_auto_{uuid4().hex[:12]}",
+            insight_id=insight.insight_id,
+            timestamp=_now_iso(),
+            verdict=AuditVerdict.VALIDATED.value,
+            reasoning=(
+                f"自动晋升: {len(insight.evidence)} 条证据"
+                f"（正面 {insight.positive_evidence_count}），"
+                f"来自多个不同情境，无矛盾证据。"
+            ),
+            bias_detected=[],
+            evidence_sufficiency=0.85,
+            suggestions="",
+        )
+        self._store.transition_status(
+            insight.insight_id,
+            InsightStatus.VALIDATED,
+            next_action=InsightNextAction.PROMOTE,
+            reason=f"自动晋升: {len(insight.evidence)} 条证据充分",
+            audit_record=record,
+        )
+        ins = self._store.get_insight(insight.insight_id)
+        if ins:
+            ins.confidence = max(ins.confidence, 0.85)
+            ins.last_validated_at = _now_iso()
+            self._store.update_insight(ins)
+        return record
 
     async def _audit_single(self, insight: Insight) -> AuditRecord | None:
         """审计单条洞察。"""

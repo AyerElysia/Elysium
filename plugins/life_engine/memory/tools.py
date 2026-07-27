@@ -128,41 +128,42 @@ class LifeEngineSearchMemoryTool(BaseTool):
 
         try:
             service = await self._get_service()
-            # 这里需要 SearchResult 列表（下面既要读 file_path 逐条格式化，
-            # 又要交给 build_memory_bundles），所以显式走简单模式。
-            results = await service.search_memory(
-                query=query.strip(),
+            # search_memory 默认返回 MemoryBundle（return_bundles=True）。
+            # 不再走"先拿 SearchResult、再 build_memory_bundles"的两步走——
+            # 那条路要求 service 的返回类型在两次调用之间保持一致，
+            # 实际上会因运行时版本差异触发 'MemoryBundle has no attribute file_path'。
+            # 直接消费 bundle，从 evidence 里重建 direct/associated 摘要列表。
+            bundles = await service.search_memory(
+                query.strip(),
                 top_k=top_k,
                 enable_association=enable_association,
                 file_types=file_types,
                 time_range_days=time_range_days,
-                return_bundles=False,
             )
 
-            # 格式化结果
-            direct_results = []
-            associated_results = []
-
-            for r in results:
-                item = {
-                    "file_path": r.file_path,
-                    "title": r.title,
-                    "snippet": r.snippet,
-                    "relevance": round(r.relevance, 3)
-                }
-
-                if r.source == "direct":
-                    direct_results.append(item)
-                else:
-                    item["association_path"] = r.association_path
-                    item["association_reason"] = r.association_reason
-                    associated_results.append(item)
-
-            bundles = await service.build_memory_bundles(
-                query=query.strip(),
-                results=results,
-                top_k=top_k,
-            )
+            # 从 bundle.evidence 提取检索摘要，保持和原有 JSON 结构兼容
+            seen_paths: set[str] = set()
+            direct_results: list[dict] = []
+            associated_results: list[dict] = []
+            for bundle in bundles:
+                for ev in bundle.evidence:
+                    fp = str(getattr(ev, "file_path", "") or "").strip()
+                    if not fp or fp in seen_paths:
+                        continue
+                    seen_paths.add(fp)
+                    item: dict = {
+                        "file_path": fp,
+                        "title": getattr(ev, "title", "") or "",
+                        "snippet": getattr(ev, "snippet", "") or "",
+                        "relevance": round(float(getattr(ev, "relevance", 0) or 0), 3),
+                    }
+                    src = str(getattr(ev, "source", "") or "")
+                    if src == "associated":
+                        item["association_path"] = getattr(ev, "relation", "") or ""
+                        item["association_reason"] = getattr(ev, "relation_reason", "") or ""
+                        associated_results.append(item)
+                    else:
+                        direct_results.append(item)
 
             return True, {
                 "action": "search_memory",
@@ -170,7 +171,7 @@ class LifeEngineSearchMemoryTool(BaseTool):
                 "direct_results": direct_results,
                 "associated_results": associated_results,
                 "memory_bundles": [_bundle_to_payload(bundle) for bundle in bundles],
-                "total_found": len(results)
+                "total_found": len(direct_results) + len(associated_results),
             }
 
         except Exception as e:

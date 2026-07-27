@@ -44,6 +44,15 @@ logger = log_api.get_logger("life_engine.tools")
 
 _MEMORY_READ_MAX_BYTES = DEFAULT_MAX_DOCUMENT_BYTES
 
+# 自动演化链推断：检索源文件时取多少候选
+_LINEAGE_SOURCE_TOP_K = 3
+# 候选分数至少要达到最高分的多少比例才算"足够突出"
+_LINEAGE_SOURCE_SCORE_RATIO = 0.85
+# 用于检索源文件的查询文本最长多少字符
+_LINEAGE_QUERY_MAX_CHARS = 300
+# 用于检索源文件的查询最多取多少行有信息量的内容
+_LINEAGE_QUERY_MAX_LINES = 4
+
 
 def _get_workspace_read_only(plugin: Any) -> Path:
     """Return the configured workspace without creating it for a read query."""
@@ -120,14 +129,18 @@ async def _auto_create_lineage_edge(
 
         # 完善实现：从 reason 中提取源文件路径
         source_path = _extract_source_path_from_reason(reason, path)
+        explicit_source = source_path is not None
 
         if source_path is None:
-            # 如果没有明确的源文件，尝试基于内容相似度查找
-            if before_content and after_content and operation == "write":
+            # 没有明确源文件时，用"本次新增的内容"去检索它延续/精炼的是谁。
+            # 注意：write 与 edit 都要走这条路——新建文件时 before_content 为空，
+            # 恰恰是"整理旧笔记为新笔记"最常见的形态。
+            query_material = _extract_new_material(before_content, after_content)
+            if query_material:
                 source_path = await _find_similar_source_file(
                     memory_service,
                     target_path=path,
-                    target_content=before_content or after_content,
+                    target_content=query_material,
                     edge_type=edge_type,
                 )
 
@@ -139,7 +152,8 @@ async def _auto_create_lineage_edge(
                     target_path=path,
                     relation_type=edge_type,
                     reason=auto_reason,
-                    strength=0.8,
+                    # 推断出来的源文件不如她自己写明的可靠，强度给低一档
+                    strength=0.8 if explicit_source else 0.55,
                 )
                 logger.info(
                     f"✅ 自动建立演化链: {source_path} → {path} [{edge_type.value}]"
@@ -186,6 +200,48 @@ def _extract_source_path_from_reason(reason: str, target_path: str) -> str | Non
     return None
 
 
+def _extract_new_material(before_content: str | None, after_content: str | None) -> str:
+    """取出这次操作真正"新增"的内容，作为检索源文件的查询material。
+
+    为什么不用整份文件：编辑一份已存在的笔记时，用全文去检索必然把自己捞回来，
+    真正表达"我在延续什么"的只有新增的那几行。新建文件时没有 before，
+    全文本身就是新增内容。
+    """
+    after = (after_content or "").strip()
+    if not after:
+        return ""
+
+    before = (before_content or "").strip()
+    if not before:
+        return after
+
+    old_lines = {line.strip() for line in before.splitlines() if line.strip()}
+    added = [
+        line.strip()
+        for line in after.splitlines()
+        if line.strip() and line.strip() not in old_lines
+    ]
+    if added:
+        return "\n".join(added)
+    # 内容没有新增行（例如只调整了顺序/措辞），退回全文
+    return after
+
+
+def _build_lineage_query(material: str) -> str:
+    """把内容压成一条检索查询：取有信息量的前几行，并限长。"""
+    lines = [
+        line.strip().lstrip("#-*> ").strip()
+        for line in (material or "").splitlines()
+    ]
+    meaningful = [line for line in lines if len(line) >= 8]
+    if not meaningful:
+        # 全是短行时退让一步，避免直接放弃
+        meaningful = [line for line in lines if line]
+    if not meaningful:
+        return ""
+    return " ".join(meaningful[:_LINEAGE_QUERY_MAX_LINES])[:_LINEAGE_QUERY_MAX_CHARS]
+
+
 async def _find_similar_source_file(
     memory_service: Any,
     target_path: str,
@@ -201,31 +257,38 @@ async def _find_similar_source_file(
         if edge_type.value not in ["refines", "corrects", "continues"]:
             return None
 
-        # 使用记忆检索查找相似文件
-        # 提取目标内容的关键句作为查询
-        query_lines = [
-            line.strip()
-            for line in target_content.split('\n')[:5]  # 前5行
-            if line.strip() and len(line.strip()) > 10
-        ]
-
-        if not query_lines:
+        query = _build_lineage_query(target_content)
+        if not query:
             return None
-
-        query = " ".join(query_lines[:2])  # 使用前2个有意义的句子
 
         # 检索相似文件（降级模式，不返回 bundle）
         results = await memory_service.search_memory(
             query=query,
-            top_k=3,
+            top_k=_LINEAGE_SOURCE_TOP_K,
             enable_association=False,
             return_bundles=False,  # 使用简单模式避免递归
         )
 
-        # 找到最相似且不是目标文件本身的文件
+        if not results:
+            return None
+
+        # relevance 是 RRF 融合分（量级约 1/(60+rank)，最大 ~0.033），
+        # 不能用绝对阈值判断。这里用"相对最高分"来判断候选是否足够突出。
+        top_score = max(float(getattr(r, "relevance", 0.0) or 0.0) for r in results)
+        if top_score <= 0.0:
+            return None
+
         for result in results:
-            if result.file_path != target_path and result.relevance > 0.6:
-                return result.file_path
+            candidate = str(getattr(result, "file_path", "") or "").strip()
+            if not candidate or candidate == target_path:
+                continue
+            # 只接受直接命中，联想扩散来的文件不足以作为演化源
+            if str(getattr(result, "source", "") or "") != "direct":
+                continue
+            score = float(getattr(result, "relevance", 0.0) or 0.0)
+            if score < top_score * _LINEAGE_SOURCE_SCORE_RATIO:
+                continue
+            return candidate
 
         return None
 

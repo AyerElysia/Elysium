@@ -261,6 +261,13 @@ class EmojiSenderService(BaseService):
 
         max_bytes = int(max_size_mb * 1024 * 1024)
 
+        # 完整性校验：截断/损坏的图片直接拒绝，避免原样透传给 VLM 触发 400
+        try:
+            probe = PILImage.open(io.BytesIO(image_bytes))
+            probe.load()
+        except Exception as e:
+            raise RuntimeError(f"图片损坏或不完整，无法解码: {e}") from e
+
         # GIF：提取多个关键帧拼成网格图
         if mime == "image/gif":
             try:
@@ -393,23 +400,38 @@ class EmojiSenderService(BaseService):
 
     @staticmethod
     def _extract_json_object(text: str) -> dict[str, Any] | None:
-        """从模型输出中提取 JSON object。"""
+        """从模型输出中提取 JSON object。
+
+        先尝试最后一个 { 到最后一个 }（推理模型在末尾输出答案时有效），
+        再 fallback 到第一个 { 到最后一个 }（普通模型前后加文字时有效）。
+        """
         if not text:
             return None
 
-        start = text.find("{")
         end = text.rfind("}")
-        if start == -1 or end == -1 or end <= start:
+        if end == -1:
             return None
 
-        candidate = text[start : end + 1]
-        try:
-            obj = json.loads(candidate)
-        except Exception:
-            return None
+        # 尝试1：最后一个 JSON 对象（推理模型将答案放在末尾）
+        start = text.rfind("{", 0, end + 1)
+        if start != -1:
+            try:
+                obj = json.loads(text[start : end + 1])
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                pass
 
-        if isinstance(obj, dict):
-            return obj
+        # 尝试2：第一个 { 到最后一个 }（普通模型在前后添加了额外文字）
+        start = text.find("{")
+        if start != -1:
+            try:
+                obj = json.loads(text[start : end + 1])
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                pass
+
         return None
 
     async def _align_data_dir_with_db(self) -> None:
@@ -574,10 +596,10 @@ class EmojiSenderService(BaseService):
             logger.warning(f"VLM 标注失败: {e}")
             return None
 
-        raw = (response.message or "").strip()
+        raw = (response.message or response.reasoning_content or "").strip()
         obj = self._extract_json_object(raw)
         if obj is None:
-            logger.warning("VLM 输出无法解析为 JSON，跳过")
+            logger.warning(f"VLM 输出无法解析为 JSON，跳过 | raw={raw[:300]!r}")
             return None
 
         keep = bool(obj.get("keep"))
