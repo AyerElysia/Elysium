@@ -125,13 +125,12 @@ plugins/werewolf_game/**/*.py[cod]
 !plugins/minicpm_live_bridge/**
 plugins/minicpm_live_bridge/**/__pycache__/
 plugins/minicpm_live_bridge/**/*.py[cod]
-!plugins/perm_plugin/
+!plugins/commands_plugin/
+!plugins/commands_plugin/**
+plugins/commands_plugin/**/__pycache__/
+plugins/commands_plugin/**/*.py[cod]
 !plugins/proactive_message_plugin/
 !plugins/skill_manager/
-!plugins/utility_commands/
-!plugins/utility_commands/**
-plugins/utility_commands/**/__pycache__/
-plugins/utility_commands/**/*.py[cod]
 !plugins/webui_backend/
 
 # Runtime/local skills are discovered by plugins/skill_manager.

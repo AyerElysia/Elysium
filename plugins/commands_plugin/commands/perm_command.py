@@ -32,7 +32,7 @@ from src.app.plugin_system.api.stream_api import get_stream_info
 from src.app.plugin_system.base import BaseCommand, cmd_route
 from src.app.plugin_system.types import PermissionLevel
 
-logger = get_logger("perm_plugin.command")
+logger = get_logger("commands_plugin.perm")
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  常量

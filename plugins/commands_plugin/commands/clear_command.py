@@ -9,7 +9,7 @@ from src.app.plugin_system.base import BaseCommand, cmd_route
 from src.app.plugin_system.types import PermissionLevel
 from src.core.models.stream import ChatStream
 
-logger = get_logger("utility_commands.clear_command")
+logger = get_logger("commands_plugin.clear_command")
 
 
 class ClearContextCommand(BaseCommand):

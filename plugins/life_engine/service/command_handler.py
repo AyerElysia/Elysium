@@ -19,7 +19,7 @@ class LifeEngineCommandHandler(BaseEventHandler):
     plugin_name = "life_engine"
     handler_name = "command_handler"
     handler_description = "处理 life_engine 命令（心跳/直连留言）"
-    # 需要高于 command_dispatch_plugin(2000)，避免被“未知命令”先拦截。
+    # 需要高于 commands_plugin 的命令分流(2000)，避免被“未知命令”先拦截。
     weight = 2100
     intercept_message = False
     init_subscribe: list[EventType | str] = [
