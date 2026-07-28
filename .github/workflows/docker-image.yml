@@ -1,10 +1,8 @@
 name: Docker Build and Push
 
 on:
-  push:
-    branches:
-      - main
-      - dev
+  # 暂时禁用自动触发（Docker Hub secrets 未配置）
+  # 需要 Docker 部署时手动触发或恢复 push 触发
   workflow_dispatch:
 
 env:
