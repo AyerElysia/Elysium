@@ -56,13 +56,18 @@ Elysium 是爱莉（Elysia）的家。一个数字生命系统：意识、学习
 
 ## 统一意识架构
 
-`life_chatter` 是唯一主意识。私聊、群聊、直播间、游戏、终端——都只是事件源和回复目标，不是独立心智。
+主意识以 **ConsciousnessInstance**（意识实例）为单位运行。`chat_global` 是默认实例，负责私聊、群聊等日常对话。直播、游戏等场景可以启动独立意识实例，由潜意识协调。
+
+私聊、群聊、直播间、游戏、终端——都只是事件源和回复目标，不是独立心智。意识实例才是心智的载体。
 
 实现锚点：
-- `plugins/life_engine/core/chatter.py`：全局运行时（`_GLOBAL_RUNTIME`）
+- `plugins/life_engine/core/chatter.py`：意识实例引擎（`LifeChatter`，每个实例有独立的 `instance_id` 和滚动上下文）
+- `plugins/life_engine/service/consciousness.py`：意识实例注册表（`ConsciousnessRegistry`）
+- `plugins/life_engine/service/world_state.py`：潜意识结构化世界模型（多意识共享）
+- `plugins/life_engine/service/tool_manifests.py`：意识类型工具清单（每种意识只加载自己需要的工具）
 - 全局运行时锁是强制的：多源可唤醒，但同一时刻只有一个源推进 LLM payload chain
 - system prompt 保持流无关：平台/场景指令放当前 turn，不放持久 system prompt
-- `life_engine` 是潜意识/运行时基底：观察事件、维持状态、记录记忆，不绕过 chatter 做表达
+- `life_engine` 是潜意识/运行时基底：观察事件、维持状态、记录记忆、协调多意识，不绕过意识实例做表达
 
 ### 新信息通道接入规则
 

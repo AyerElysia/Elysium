@@ -1223,14 +1223,18 @@ class LifeSaveMediaTool(BaseTool):
 # ── LifeChatter ───────────────────────────────────────────────
 
 class LifeChatter(BaseChatter):
-    """生命中枢统一对话器 - 同一主体的对外运行模式。"""
+    """生命中枢统一意识实例 - 同一主体的对外运行模式。"""
 
     chatter_name: str = "life_chatter"
-    chatter_description: str = "生命中枢统一对话器 - 同一主体的对外运行模式"
+    chatter_description: str = "生命中枢统一意识实例 - 同一主体的对外运行模式"
     associated_platforms: list[str] = []
     chat_type: ChatType = ChatType.ALL
     dependencies: list[str] = []
     global_runtime_key: str = LIFE_CHATTER_GLOBAL_CURSOR_KEY
+
+    # 意识实例标识（多意识协调）
+    instance_id: str = "chat_global"
+    instance_kind: str = "chat"
 
     _GLOBAL_RUNTIME_LOCK: asyncio.Lock | None = None
     _GLOBAL_RUNTIME_LOCK_LOOP: asyncio.AbstractEventLoop | None = None
@@ -1373,6 +1377,8 @@ class LifeChatter(BaseChatter):
         # 后续真正执行 Action 时会用 trigger_msg 恢复当前来源 stream。
         self._active_chat_stream = chat_stream
         usable_map = await self.inject_usables(request)
+        # Phase E: 按意识实例类型工具清单过滤
+        usable_map = self._filter_usables_by_manifest(usable_map, request)
         restored_payloads = self._load_rolling_context_snapshot()
         if restored_payloads:
             request.payloads.extend(restored_payloads)
@@ -1446,13 +1452,64 @@ class LifeChatter(BaseChatter):
         context_manager.compression_hook = compression_hook
 
     def _rolling_context_snapshot_path(self) -> Path:
-        """返回 life_chatter 滚动上下文快照文件路径。"""
+        """返回意识实例的滚动上下文快照文件路径。
+
+        新路径：runtime/consciousness/{instance_id}/rolling_context.json
+        兼容旧路径：runtime/life_chatter_rolling_context.json（自动迁移）
+        """
+        cfg = self._get_config()
+        settings = getattr(cfg, "settings", None)
+        workspace = str(getattr(settings, "workspace_path", "") or "").strip()
+        if not workspace:
+            workspace = str(Path(__file__).parent.parent.parent.parent / "data" / "life_engine_workspace")
+        base = Path(workspace).expanduser()
+        return base / "runtime" / "consciousness" / self.instance_id / "rolling_context.json"
+
+    def _legacy_rolling_context_path(self) -> Path:
+        """旧版全局滚动上下文路径（用于迁移）。"""
         cfg = self._get_config()
         settings = getattr(cfg, "settings", None)
         workspace = str(getattr(settings, "workspace_path", "") or "").strip()
         if not workspace:
             workspace = str(Path(__file__).parent.parent.parent.parent / "data" / "life_engine_workspace")
         return Path(workspace).expanduser() / "runtime" / "life_chatter_rolling_context.json"
+
+    def _filter_usables_by_manifest(self, usable_map: Any, request: Any) -> Any:
+        """按意识实例类型的工具清单过滤可用工具。
+
+        只保留清单内的工具，减少每轮 LLM 请求中的 tool schema 开销。
+        清单是建议性的：她仍可通过 skill 系统使用清单外的能力。
+        """
+        from ..service.tool_manifests import get_tool_manifest
+
+        manifest = get_tool_manifest(self.instance_kind)
+        if not manifest or not isinstance(usable_map, dict):
+            return usable_map
+
+        # 过滤 usable_map：只保留清单内的工具
+        filtered = {
+            name: cls
+            for name, cls in usable_map.items()
+            if name in manifest
+        }
+
+        # 同时从 request 的 tool payload 中移除非清单工具的 schema
+        try:
+            for payload in getattr(request, "payloads", None) or []:
+                role = getattr(payload, "role", None)
+                if role == ROLE.TOOL:
+                    content = getattr(payload, "content", None)
+                    if isinstance(content, list):
+                        payload.content = [
+                            tool_def for tool_def in content
+                            if getattr(tool_def, "name", "") in manifest
+                            or f"action-{getattr(tool_def, 'name', '')}" in manifest
+                            or f"tool-{getattr(tool_def, 'name', '')}" in manifest
+                        ]
+        except Exception:  # noqa: BLE001
+            pass  # 过滤失败不影响主流程
+
+        return filtered
 
     @staticmethod
     def _json_safe_value(value: Any) -> Any:
@@ -1779,6 +1836,19 @@ class LifeChatter(BaseChatter):
 
     def _load_rolling_context_snapshot(self) -> list[LLMPayload]:
         path = self._rolling_context_snapshot_path()
+        # Phase C: 自动迁移旧版全局滚动上下文到实例路径
+        if not path.exists() and self.instance_id == "chat_global":
+            legacy = self._legacy_rolling_context_path()
+            if legacy.exists():
+                try:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    import shutil
+                    shutil.move(str(legacy), str(path))
+                    logger.info(
+                        f"意识实例迁移: {legacy.name} -> {path}"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"滚动上下文迁移失败: {exc}")
         if not path.exists():
             return []
         try:
