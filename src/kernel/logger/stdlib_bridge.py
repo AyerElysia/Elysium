@@ -12,6 +12,19 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .db_store import LogStore
 
+# 第三方库噪音过滤：这些模块的 DEBUG/INFO 日志不写入数据库
+# 只有 WARNING+ 才会记录
+_NOISY_LOGGERS: dict[str, int] = {
+    "aiosqlite": logging.WARNING,
+    "websockets": logging.WARNING,
+    "httpcore": logging.WARNING,
+    "httpx": logging.WARNING,
+    "openai": logging.WARNING,
+    "urllib3": logging.WARNING,
+    "asyncio": logging.WARNING,
+    "charset_normalizer": logging.WARNING,
+}
+
 
 class SQLiteLogHandler(logging.Handler):
     """将 stdlib logging 记录桥接到 LogStore。"""
@@ -23,6 +36,17 @@ class SQLiteLogHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         """将日志记录写入 LogStore。"""
         try:
+            # 第三方库噪音过滤：只记录 WARNING+
+            min_level = _NOISY_LOGGERS.get(record.name)
+            if min_level is None:
+                # 检查父级 logger 是否在噪音列表中
+                for prefix, level in _NOISY_LOGGERS.items():
+                    if record.name.startswith(prefix + "."):
+                        min_level = level
+                        break
+            if min_level is not None and record.levelno < min_level:
+                return
+
             message = record.getMessage()
             metadata: dict[str, object] = {}
 
