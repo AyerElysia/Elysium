@@ -749,12 +749,36 @@ class TTSService(BaseService):
                 server_config=server_config,
                 text=clean_text,
             )
+            if audio_data is None:
+                logger.warning("云端 TTS 失败，回退到本地 GPT-SoVITS")
+                audio_data = await self._call_tts_api(
+                    server_config=server_config,
+                    text=clean_text,
+                    text_language=final_language,
+                    refer_wav_path=server_config.get("refer_wav_path"),
+                    prompt_text=server_config.get("prompt_text"),
+                    prompt_language=server_config.get("prompt_language"),
+                    gpt_weights=server_config.get("gpt_weights"),
+                    sovits_weights=server_config.get("sovits_weights"),
+                )
         elif self._config.tts.engine == "higgs_cloud":
             logger.info("引擎配置为 higgs_cloud，使用 Boson Higgs Audio")
             audio_data = await self._call_higgs_cloud_tts(
                 server_config=server_config,
                 text=clean_text,
             )
+            if audio_data is None:
+                logger.warning("Higgs 云端 TTS 失败，回退到本地 GPT-SoVITS")
+                audio_data = await self._call_tts_api(
+                    server_config=server_config,
+                    text=clean_text,
+                    text_language=final_language,
+                    refer_wav_path=server_config.get("refer_wav_path"),
+                    prompt_text=server_config.get("prompt_text"),
+                    prompt_language=server_config.get("prompt_language"),
+                    gpt_weights=server_config.get("gpt_weights"),
+                    sovits_weights=server_config.get("sovits_weights"),
+                )
         else:
             audio_data = await self._call_tts_api(
                 server_config=server_config,
