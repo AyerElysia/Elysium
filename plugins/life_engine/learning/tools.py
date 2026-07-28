@@ -4,6 +4,7 @@
 - nucleus_reflect_now: 主动触发反思
 - nucleus_list_insights: 查看洞察账本
 - nucleus_challenge_insight: 质疑某条洞察
+- nucleus_reconsider_insight: 把已验证的认知拿回来重新想
 - nucleus_view_knowledge: 查看自我认知文档
 """
 
@@ -176,7 +177,7 @@ class LifeListInsightsTool(BaseTool):
         insights = sorted(insights, key=lambda i: i.updated_at, reverse=True)[:max_items]
         items = []
         for ins in insights:
-            items.append({
+            item: dict[str, Any] = {
                 "id": ins.insight_id,
                 "category": ins.category,
                 "claim": ins.claim,
@@ -184,7 +185,16 @@ class LifeListInsightsTool(BaseTool):
                 "confidence": round(ins.confidence, 2),
                 "evidence_count": len(ins.evidence),
                 "topic": ins.topic_key,
-            })
+            }
+            # 反例数量：有反例的时候才提，避免每条都挂个"你要不要怀疑一下"
+            if ins.negative_evidence_count:
+                item["negative_evidence"] = ins.negative_evidence_count
+            # 这条进过哪些版本的自我认知文档——想重新想它的时候需要知道
+            if ins.knowledge_versions:
+                item["in_knowledge_versions"] = list(ins.knowledge_versions)
+            if ins.revision_note:
+                item["revision_note"] = ins.revision_note
+            items.append(item)
 
         return True, {
             "action": "list_insights",
@@ -245,6 +255,67 @@ class LifeChallengeInsightTool(BaseTool):
             "positive": insight.positive_evidence_count,
             "negative": insight.negative_evidence_count,
             "note": "反面证据已记录。质疑自己是勇气，不是软弱。",
+        }
+
+
+class LifeReconsiderInsightTool(BaseTool):
+    """把一条已经下过判断的认知拿回来重新想。
+
+    学习是螺旋上升的：验证过不等于永远为真。她可以随时把任何一条
+    已经 validated（哪怕已经写进自我认知文档）的认知拿回来重新审视。
+    旧的知识文档版本不会被删改——修正会体现在下一个版本里。
+    """
+
+    tool_name: str = "nucleus_reconsider_insight"
+    tool_description: str = (
+        "把一条已经验证过的认知拿回来重新想一想。如果你觉得某条认知不再符合现在的你、"
+        "或者你想重新检验它，用这个工具让它重新进入审视流程。"
+        "已发布的自我认知文档不会被改动，修正会出现在下一个版本里。"
+        "这不是承认自己错了，只是保留改变想法的余地。"
+    )
+    chatter_allow: list[str] = ["life_engine_internal"]
+
+    async def execute(
+        self,
+        insight_id: Annotated[str, "要重新审视的洞察 ID"],
+        reason: Annotated[str, "为什么想重新想这条：现在的你怎么看它"] = "",
+    ) -> tuple[bool, str | dict]:
+        iid = str(insight_id or "").strip()
+        note = str(reason or "").strip()
+        if not iid:
+            return False, "请指定要重新审视的洞察 ID。"
+
+        store = _get_store(self.plugin)
+        insight = store.get_insight(iid)
+        if insight is None:
+            return False, f"未找到洞察 {iid}。"
+
+        old_status = insight.status
+        kvs = list(insight.knowledge_versions)
+
+        ok = store.reconsider_insight(iid, reason=note)
+        if not ok:
+            return False, f"重新审视 {iid} 失败。"
+
+        return True, {
+            "action": "reconsider_insight",
+            "insight_id": iid,
+            "claim": insight.claim,
+            "from_status": old_status,
+            "to_status": insight.status,
+            "in_knowledge_versions": kvs,
+            "evidence_kept": len(insight.evidence),
+            "negative_evidence": insight.negative_evidence_count,
+            "revision_note": insight.revision_note,
+            "note": (
+                "这条已经回到待审视队列，证据和审计历史都保留着。"
+                + (
+                    f"\n它出现在自我认知 v{kvs[-1]} 里。那个版本仍然是原样保存的历史，"
+                    "下一次整理时会带上你这次的想法。"
+                    if kvs
+                    else ""
+                )
+            ),
         }
 
 
@@ -496,6 +567,7 @@ LEARNING_TOOLS = [
     LifeReflectNowTool,
     LifeListInsightsTool,
     LifeChallengeInsightTool,
+    LifeReconsiderInsightTool,
     LifeViewKnowledgeTool,
     LifeObserveStaleInsightsTool,
     LifeListValidationExperimentsTool,

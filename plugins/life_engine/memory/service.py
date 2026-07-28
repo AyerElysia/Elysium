@@ -90,6 +90,7 @@ from .eligibility import (
     assess_workspace_document,
     read_workspace_document,
     register_indexed_path_sql_function,
+    scan_workspace_documents,
 )
 from .health import health_snapshot_from_path as collect_health_snapshot
 from .worker import (
@@ -311,6 +312,7 @@ class LifeMemoryService:
 
                 self._chroma_collection = await self._get_chroma_collection()
                 self._initialized = True
+                await self._startup_recovery()
             except BaseException:
                 self._db = None
                 await asyncio.to_thread(db.close)
@@ -421,6 +423,83 @@ class LifeMemoryService:
 
         await asyncio.to_thread(_do_db_work)
         logger.debug("记忆数据库表创建完成")
+
+    async def _startup_recovery(self) -> None:
+        """启动时修复：补索引缺口、清理 ghost 节点和孤立边。"""
+        workspace = self._get_workspace_path()
+        db = self._db
+        if db is None:
+            return
+
+        # 1. 扫描工作区，收集已索引路径
+        scan = scan_workspace_documents(workspace)
+        workspace_paths: set[str] = {doc.path for doc in scan.documents}
+
+        indexed_rows = db.execute(
+            "SELECT node_id, file_path, is_deleted FROM memory_nodes WHERE node_type = 'file'"
+        ).fetchall()
+        indexed_paths: dict[str, tuple[str, int]] = {}
+        for row in indexed_rows:
+            fp = str(row["file_path"] or "")
+            if fp:
+                indexed_paths[fp] = (str(row["node_id"]), int(row["is_deleted"] or 0))
+
+        # 2. 补索引缺口：工作区有但未索引的文件
+        unindexed = workspace_paths - set(indexed_paths.keys())
+        if unindexed:
+            logger.info(f"启动扫描：发现 {len(unindexed)} 个未索引文件，开始补索引")
+            enqueued = 0
+            for path in sorted(unindexed):
+                decision = assess_workspace_document(workspace, path)
+                if not decision.eligible:
+                    continue
+                try:
+                    content, _, _ = read_workspace_document(workspace, path)
+                    title = Path(path).stem
+                    await get_or_create_file_node(
+                        db=db,
+                        file_path=path,
+                        title=title,
+                        content=content,
+                    )
+                    enqueued += 1
+                except Exception as exc:
+                    logger.warning(f"补索引失败 {path}: {exc}")
+            logger.info(f"启动扫描完成：已入队 {enqueued}/{len(unindexed)} 个文件待 embedding")
+
+        # 3. 标记 ghost 节点：索引中有但工作区已删除的文件
+        ghost_paths = set(indexed_paths.keys()) - workspace_paths
+        ghost_node_ids = []
+        for fp in ghost_paths:
+            nid, deleted = indexed_paths[fp]
+            if deleted == 0:  # 还没标记删除
+                ghost_node_ids.append(nid)
+        if ghost_node_ids:
+            placeholders = ",".join("?" * len(ghost_node_ids))
+            db.execute(
+                f"UPDATE memory_nodes SET is_deleted = 1 WHERE node_id IN ({placeholders})",
+                ghost_node_ids,
+            )
+            db.commit()
+            logger.info(f"启动清理：标记 {len(ghost_node_ids)} 个 ghost 节点为已删除")
+
+        # 4. 清理孤立边：FK 约束违反（指向已删除节点的边）
+        orphan_edges = db.execute(
+            """
+            SELECT e.edge_id FROM memory_edges e
+            LEFT JOIN memory_nodes s ON s.node_id = e.source_id
+            LEFT JOIN memory_nodes t ON t.node_id = e.target_id
+            WHERE s.node_id IS NULL OR t.node_id IS NULL
+            """
+        ).fetchall()
+        if orphan_edges:
+            placeholders = ",".join("?" * len(orphan_edges))
+            db.execute(
+                f"DELETE FROM memory_edges WHERE edge_id IN ({placeholders})",
+                [r["edge_id"] for r in orphan_edges],
+            )
+            db.commit()
+            logger.info(f"启动清理：删除 {len(orphan_edges)} 条孤立边")
 
     def _require_db(self) -> sqlite3.Connection:
         if self._db is None or self._closing:

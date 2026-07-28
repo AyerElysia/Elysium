@@ -205,6 +205,8 @@ class Insight:
     audit_history: list[AuditRecord] = field(default_factory=list)
     revision_note: str = ""       # 修正说明（重新验证时填写的理由）
     knowledge_versions: list[int] = field(default_factory=list)  # 被写入过哪些知识文档版本号
+    reconsidered_at: str = ""     # 她主动拿回来重新想的时间（空 = 没重新想过）
+    reconsider_count: int = 0     # 重新想过几次。只是事实，不含"想太多次就是错"的意思
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -259,6 +261,8 @@ class Insight:
             audit_history=audit_history,
             revision_note=str(data.get("revision_note", "") or ""),
             knowledge_versions=kv_list,
+            reconsidered_at=str(data.get("reconsidered_at", "") or ""),
+            reconsider_count=int(data.get("reconsider_count", 0) or 0),
         )
 
     @classmethod

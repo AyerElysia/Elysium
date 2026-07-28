@@ -113,6 +113,15 @@ class LearningScheduler:
         )
         self.metrics = LearningMetrics(store=self.store)
 
+        # 回填 knowledge_versions：v1 写在 record_knowledge_version 之前，
+        # 那两条洞察不知道自己已经在知识文档里。她要是现在重新审视其中一条，
+        # 修正会找不到对应表述。只搬 manifest 里的既有事实，不做判断。
+        # 包起来：补账失败也不能让她起不来。
+        try:
+            self.store.reconcile_knowledge_versions()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"回填 knowledge_versions 失败（不影响启动）: {e}")
+
         # Minecraft 具身体验
         self.minecraft_session: MinecraftSession | None = None
         if minecraft_enabled:
@@ -228,6 +237,8 @@ class LearningScheduler:
             state = self.store.load_state()
             state["last_audit_at"] = self._last_audit_at
             self.store.save_state(state)
+            # 审计刚改过状态，趁现在留一个点，别等下一个 12 小时窗口
+            self._snapshot_metrics_now()
             # 审计后检查是否需要压缩
             await self._maybe_run_compression()
 
@@ -236,7 +247,10 @@ class LearningScheduler:
         if not self.compressor.should_compress():
             return
         logger.info("📝 触发慢环压缩")
-        await self.compressor.run_compression()
+        promoted = await self.compressor.run_compression()
+        if promoted:
+            # 新版本刚落盘，指标曲线上应该有这个点
+            self._snapshot_metrics_now()
 
     async def _maybe_run_distillation(self) -> None:
         """检查是否需要技能蒸馏。"""
@@ -249,7 +263,21 @@ class LearningScheduler:
         """定期生成学习指标快照。"""
         if not self._should_snapshot_metrics():
             return
-        self.metrics.snapshot()
+        self._snapshot_metrics_now()
+
+    def _snapshot_metrics_now(self) -> None:
+        """立刻写一个指标点。
+
+        除了 12 小时的定期快照，晋升 / 压缩这类"状态刚变过"的时刻也要留点。
+        否则 metrics.jsonl 会长期显示 validated_count=0、knowledge_version=0，
+        而磁盘上其实已经有 validated 洞察和知识文档了——曲线看起来像没在学。
+        （她通过工具看到的统计一直是实时读账本的，不受此影响。）
+        """
+        try:
+            self.metrics.snapshot()
+        except Exception as exc:
+            logger.warning(f"指标快照失败: {exc}")
+            return
         self._last_metrics_at = _now_iso()
         state = self.store.load_state()
         state["last_metrics_at"] = self._last_metrics_at

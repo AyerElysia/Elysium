@@ -590,3 +590,158 @@ async def test_record_memory_correction_rejects_absolute_related_path(tmp_path: 
             "correction",
             related_paths=["/notes/a.md"],
         )
+
+
+# ── 启动恢复 ────────────────────────────────────────────────
+
+
+async def test_startup_recovery_indexes_unindexed_files(tmp_path: Path) -> None:
+    """工作区中已存在但尚未入索引的文件，启动时应该被发现并入队。"""
+    service = _make_service(tmp_path)
+    await service.initialize()
+
+    # 模拟"外部写入"的文件——不在索引里，但工作区存在
+    workspace_file = tmp_path / "notes" / "external_note.md"
+    workspace_file.parent.mkdir(parents=True, exist_ok=True)
+    workspace_file.write_text("# 外部写入的笔记\n这是一段内容", encoding="utf-8")
+
+    # 确认此时工作区有文件，但索引里没有
+    rows = service._db.execute(
+        "SELECT node_id FROM memory_nodes WHERE file_path = 'notes/external_note.md'"
+    ).fetchall()
+    assert len(rows) == 0, "文件不应在启动前就被索引"
+
+    # 触发启动恢复
+    await service._startup_recovery()
+
+    # 验证文件已被入队索引
+    rows = service._db.execute(
+        "SELECT node_id, file_path FROM memory_nodes WHERE file_path = 'notes/external_note.md'"
+    ).fetchall()
+    assert len(rows) == 1, "文件应该被启动恢复扫描到"
+    assert rows[0]["file_path"] == "notes/external_note.md"
+
+    # 验证索引任务已入队
+    job_rows = service._db.execute(
+        "SELECT node_id, status FROM memory_index_jobs WHERE status = 'pending'"
+    ).fetchall()
+    assert any(r["node_id"] == rows[0]["node_id"] for r in job_rows), "文件应产生待处理索引任务"
+
+
+async def test_startup_recovery_marks_ghost_nodes_as_deleted(tmp_path: Path) -> None:
+    """索引里有但工作区已删除的文件，应被标记为 is_deleted=1。"""
+    service = _make_service(tmp_path)
+    await service.initialize()
+
+    # 创建一个节点，不创建对应文件（ghost 节点）
+    ghost_node_id = "file:0000000000001"
+    service._db.execute(
+        """
+        INSERT INTO memory_nodes
+        (node_id, node_type, file_path, content_hash, title, created_at, updated_at, is_deleted)
+        VALUES (?, 'file', 'notes/deleted_note.md', '', 'deleted', 1, 1, 0)
+        """,
+        (ghost_node_id,),
+    )
+    service._db.commit()
+
+    assert service._db.execute(
+        "SELECT is_deleted FROM memory_nodes WHERE node_id = ?", (ghost_node_id,)
+    ).fetchone()["is_deleted"] == 0, "启动前不应标记删除"
+
+    # 触发启动恢复
+    await service._startup_recovery()
+
+    # 验证 ghost 节点已被标记删除
+    row = service._db.execute(
+        "SELECT is_deleted FROM memory_nodes WHERE node_id = ?", (ghost_node_id,)
+    ).fetchone()
+    assert row is not None, "ghost 节点应保留在表中"
+    assert row["is_deleted"] == 1, "ghost 节点应被标记为已删除"
+
+
+async def test_startup_recovery_deletes_orphan_edges(tmp_path: Path) -> None:
+    """指向已删除节点的孤立边，应该被启动恢复清理掉。"""
+    service = _make_service(tmp_path)
+    await service.initialize()
+
+    # 创建两个节点，然后只删除一个——制造孤立边
+    node_a = "file:000000000000a"
+    node_b = "file:000000000000b"
+    service._db.execute(
+        "INSERT INTO memory_nodes (node_id, node_type, file_path, created_at, updated_at) VALUES (?, 'file', 'notes/a.md', 1, 1)",
+        (node_a,),
+    )
+    service._db.execute(
+        "INSERT INTO memory_nodes (node_id, node_type, file_path, created_at, updated_at) VALUES (?, 'file', 'notes/b.md', 1, 1)",
+        (node_b,),
+    )
+    service._db.commit()
+
+    # 创建边：A→B
+    service._db.execute(
+        "INSERT INTO memory_edges (edge_id, source_id, target_id, edge_type, weight, created_at) VALUES (?, ?, ?, 'relates', 0.5, 1)",
+        ("edge_a_to_b", node_a, node_b),
+    )
+    service._db.commit()
+    # 确保 service 连接完全释放锁
+    _ = service._db.execute("SELECT 1").fetchone()
+    # 创建孤立边：X→B，其中 X 不存在
+    # 用独立的 sqlite3 连接绕过 service 的 FK enforcement
+    import sqlite3
+
+    db_path = service._get_db_path()
+    with sqlite3.connect(db_path, timeout=10.0) as raw_conn:
+        raw_conn.execute("PRAGMA foreign_keys = OFF")
+        raw_conn.execute(
+            "INSERT INTO memory_edges (edge_id, source_id, target_id, edge_type, weight, created_at) VALUES (?, ?, ?, 'relates', 0.5, 1)",
+            ("edge_orphan", "file:000000000000x", node_b),
+        )
+        raw_conn.commit()
+
+    # 确认孤立边存在
+    orphan_count = service._db.execute(
+        "SELECT COUNT(*) FROM memory_edges WHERE edge_id = 'edge_orphan'"
+    ).fetchone()[0]
+    assert orphan_count == 1
+
+    # 触发启动恢复
+    await service._startup_recovery()
+
+    # 验证孤立边已删除
+    orphan_count = service._db.execute(
+        "SELECT COUNT(*) FROM memory_edges WHERE edge_id = 'edge_orphan'"
+    ).fetchone()[0]
+    assert orphan_count == 0, "孤立边应该被启动恢复删除"
+
+    # 正常边仍然保留
+    normal_count = service._db.execute(
+        "SELECT COUNT(*) FROM memory_edges WHERE edge_id = 'edge_a_to_b'"
+    ).fetchone()[0]
+    assert normal_count == 1, "正常边应该保留"
+
+
+async def test_startup_recovery_noop_when_everything_clean(tmp_path: Path) -> None:
+    """索引和工作区完全一致时，不应有任何副作用。"""
+    service = _make_service(tmp_path)
+    await service.initialize()
+
+    # 创建一个与工作区文件对应的节点
+    workspace_file = tmp_path / "notes" / "clean.md"
+    workspace_file.parent.mkdir(parents=True, exist_ok=True)
+    workspace_file.write_text("# 干净的文件\n内容", encoding="utf-8")
+
+    node_id = "file:000000000000c"
+    service._db.execute(
+        "INSERT INTO memory_nodes (node_id, node_type, file_path, created_at, updated_at, is_deleted) VALUES (?, 'file', 'notes/clean.md', 1, 1, 0)",
+        (node_id,),
+    )
+    service._db.commit()
+    initial_node_count = service._db.execute("SELECT COUNT(*) FROM memory_nodes").fetchone()[0]
+
+    await service._startup_recovery()
+
+    # 不应新增节点，不应标记任何删除，不应删除任何边
+    final_node_count = service._db.execute("SELECT COUNT(*) FROM memory_nodes").fetchone()[0]
+    assert final_node_count == initial_node_count
+

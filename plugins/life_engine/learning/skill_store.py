@@ -122,6 +122,10 @@ class SkillStore:
         self.audit_log_path = self.root / "skills_audit.jsonl"
         self._skills: list[SkillPattern] = []
         self._loaded = False
+        # 读不出来时置位：_save 会拒绝写，避免把"读失败"写成"她没有任何技能"
+        self._load_failed = False
+        # 这一版代码看不懂的行，原样留着，保存时一并写回去
+        self._unreadable_rows: list[dict[str, Any]] = []
 
     # ── 加载/保存 ─────────────────────────────────────────────
 
@@ -129,29 +133,86 @@ class SkillStore:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def load(self) -> None:
+        """从磁盘加载技能。
+
+        和洞察账本同样的道理：_save 是整份覆写。原来的实现在解析失败时
+        直接"重置"成空表并标记已加载，于是一次读失败会在下一次写入时
+        变成"她从来没练出过任何做事方式"。技能是她的程序性记忆，
+        丢了就是把练过的手感抹掉，所以这里分两种失败处理：
+
+        - 整份读不出来：备份原文件，置 _load_failed，_save 拒绝写。
+        - 单行读不出来：跳过那一行，但原始 dict 收着，保存时写回去。
+        """
         if self._loaded:
             return
         self._ensure_dirs()
-        if self.skills_path.exists():
-            try:
-                raw = json.loads(self.skills_path.read_text(encoding="utf-8"))
-                self._skills = [
-                    SkillPattern.from_dict(d)
-                    for d in raw.get("skills", [])
-                ]
-            except (json.JSONDecodeError, KeyError, TypeError) as exc:
-                logger.warning(f"skills.json 解析失败，重置: {exc}")
-                self._skills = []
-        else:
+        self._unreadable_rows = []
+        if not self.skills_path.exists():
             self._skills = []
+            self._loaded = True
+            self._load_failed = False
+            return
+        try:
+            raw = json.loads(self.skills_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, ValueError) as exc:
+            self._load_failed = True
+            self._skills = []
+            self._loaded = True
+            backup = self._backup_unreadable_skills()
+            logger.error(
+                f"❌ 技能档读不出来，本轮不会写入以免覆盖: {exc}"
+                + (f"（原文件已备份到 {backup.name}）" if backup else "")
+            )
+            return
+
+        items = raw.get("skills", []) if isinstance(raw, dict) else []
+        parsed: list[SkillPattern] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                parsed.append(SkillPattern.from_dict(item))
+            except Exception as exc:  # noqa: BLE001
+                # 一行读不动不该让这一行凭空消失
+                self._unreadable_rows.append(item)
+                logger.warning(
+                    f"跳过一条读不出来的技能（原样保留）: "
+                    f"{item.get('skill_id', '?')} - {exc}"
+                )
+        self._skills = parsed
         self._loaded = True
+        self._load_failed = False
+        if self._unreadable_rows:
+            logger.warning(
+                f"技能档里有 {len(self._unreadable_rows)} 条这一版代码读不动，已原样保留"
+            )
+
+    def _backup_unreadable_skills(self) -> Path | None:
+        """把读不出来的技能档留一份，便于事后人工救回。"""
+        try:
+            stamp = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d_%H%M%S")
+            backup = self.skills_path.with_name(f"skills.broken_{stamp}.json")
+            backup.write_bytes(self.skills_path.read_bytes())
+            return backup
+        except OSError as exc:  # noqa: BLE001
+            logger.warning(f"备份损坏技能档失败: {exc}")
+            return None
 
     def _save(self) -> None:
+        """原子写入技能档。
+
+        load 失败时拒绝写：整份覆写 + 空的 _skills = 抹掉她练过的一切。
+        """
+        if self._load_failed:
+            logger.error("❌ 技能档处于读失败状态，拒绝写入（保护已有记录）")
+            return
         self._ensure_dirs()
+        rows: list[dict[str, Any]] = [s.to_dict() for s in self._skills]
+        rows.extend(self._unreadable_rows)
         payload = {
             "version": 1,
             "updated_at": _now_iso(),
-            "skills": [s.to_dict() for s in self._skills],
+            "skills": rows,
         }
         temp = self.skills_path.with_suffix(".tmp")
         temp.write_text(

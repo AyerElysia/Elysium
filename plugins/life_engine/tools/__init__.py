@@ -28,7 +28,6 @@ from ..trace.tools import LIFE_TRACE_TOOLS
 from ..streams.tools import STREAM_TOOLS
 from ..narrative.tools import NARRATIVE_TOOLS, LifeEngineWriteNarrativeTool
 from .exec_tools import EXEC_TOOLS
-from .download_tools import DOWNLOAD_TOOLS, LifeEngineDownloadTool
 from ..minecraft.tools import MINECRAFT_TOOLS, LifeEngineMinecraftTool
 
 ALL_TOOLS = [
@@ -39,7 +38,6 @@ ALL_TOOLS = [
     *REST_TOOLS,
     *SCREEN_TOOLS,
     *EXEC_TOOLS,
-    *DOWNLOAD_TOOLS,
     *MINECRAFT_TOOLS,
 ]
 
@@ -68,7 +66,6 @@ __all__ = [
     "LifeEngineMakeDirectoryTool",
     "LifeEngineWakeDFCTool",
     "LifeEngineRunAgentTool",
-    "LifeEngineDownloadTool",
     "FetchLifeMemoryTool",
     "MINECRAFT_TOOLS",
     "LifeEngineMinecraftTool",

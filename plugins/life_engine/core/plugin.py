@@ -28,10 +28,7 @@ from ..learning.tools import LEARNING_TOOLS
 from .compat_tools import (
     LifeThinkAction,
     LifeRecordInnerMonologueAction,
-    LifeScheduleFollowupMessageAction,
     LifeInnerDialogueTool,
-    LifeMessageNucleusTool,
-    LifeConsultNucleusTool,
 )
 from ..agents import register_builtin_agents
 
@@ -104,33 +101,18 @@ class LifeEnginePlugin(BasePlugin):
         ):
             from .chatter import (
                 LifeChatter,
-                LifeInspectMediaTool,
-                LifeSaveMediaTool,
                 LifePassAndWaitAction,
-                LifeSendFileAction,
                 LifeSendTextAction,
             )
-            from .sub_agent_tool import LifeRunAgentTool
 
             components.extend([
                 LifeChatter,
                 LifeSendTextAction,
-                LifeSendFileAction,
-                LifeInspectMediaTool,
-                LifeSaveMediaTool,
                 LifePassAndWaitAction,
                 LifeThinkAction,
                 LifeRecordInnerMonologueAction,
-                LifeScheduleFollowupMessageAction,
                 LifeInnerDialogueTool,
-                # 兼容旧名（内部转 inner_dialogue）
-                LifeMessageNucleusTool,
-                LifeConsultNucleusTool,
             ])
-
-            # life_chatter 子代理委托工具：仅在 enable_sub_agent=true 时注册
-            if bool(getattr(self.config.chatter, "enable_sub_agent", False)):
-                components.append(LifeRunAgentTool)
 
         return components
 

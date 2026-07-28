@@ -74,6 +74,10 @@ class InsightStore:
         }
         self._loaded = False
         self._experiments_loaded = False
+        # 账本读不出来时置位：_save 会拒绝写，避免把"读失败"写成"她什么都没学过"
+        self._load_failed = False
+        # 这一版代码看不懂的行，原样留着，保存时一并写回去
+        self._unreadable_rows: list[dict[str, Any]] = []
 
     # ── 加载 / 保存 ──────────────────────────────────────────
 
@@ -82,35 +86,89 @@ class InsightStore:
         self.knowledge_dir.mkdir(parents=True, exist_ok=True)
 
     def load(self) -> None:
-        """从磁盘加载洞察快照。"""
+        """从磁盘加载洞察快照。
+
+        这里的谨慎是有代价换来的：_save 是整份覆写。原来的实现在读失败时
+        把 _insights 设成空表并标记已加载，于是"文件读不出来"会在下一次
+        写入时变成"她从来没学过任何东西"——账本被自己的恢复逻辑抹掉。
+
+        所以现在分两种失败：
+        - 整份读不出来（JSON 坏了 / IO 错）：备份原文件，置 _load_failed，
+          _save 拒绝写。宁可这一轮不记录，也不能覆盖掉。
+        - 单行读不出来（字段是新版本加的、或那一行确实坏了）：跳过这一行，
+          但把原始 dict 原样收着，保存时写回去。她的记录不因为代码换版本而消失。
+        """
         if self._loaded:
             return
         self._ensure_dirs()
+        self._unreadable_rows = []
         if not self.insights_path.exists():
             self._insights = []
             self._loaded = True
+            self._load_failed = False
             return
         try:
             raw = json.loads(self.insights_path.read_text(encoding="utf-8"))
-            version = raw.get("version", STORE_VERSION)
-            items = raw.get("insights", [])
-            self._insights = [
-                Insight.from_dict(item)
-                for item in items
-                if isinstance(item, dict)
-            ]
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning(f"加载洞察账本失败: {exc}")
+        except (json.JSONDecodeError, OSError, ValueError) as exc:
+            self._load_failed = True
             self._insights = []
+            self._loaded = True
+            backup = self._backup_unreadable_ledger()
+            logger.error(
+                f"❌ 洞察账本读不出来，本轮不会写入以免覆盖: {exc}"
+                + (f"（原文件已备份到 {backup.name}）" if backup else "")
+            )
+            return
+
+        items = raw.get("insights", []) if isinstance(raw, dict) else []
+        parsed: list[Insight] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                parsed.append(Insight.from_dict(item))
+            except Exception as exc:  # noqa: BLE001
+                # 一行读不动不该拖垮整个账本，更不该让这一行凭空消失
+                self._unreadable_rows.append(item)
+                logger.warning(
+                    f"跳过一条读不出来的洞察（原样保留）: "
+                    f"{item.get('insight_id', '?')} - {exc}"
+                )
+        self._insights = parsed
         self._loaded = True
+        self._load_failed = False
+        if self._unreadable_rows:
+            logger.warning(
+                f"账本里有 {len(self._unreadable_rows)} 条这一版代码读不动，已原样保留"
+            )
+
+    def _backup_unreadable_ledger(self) -> Path | None:
+        """把读不出来的账本原文件留一份，便于事后人工救回。"""
+        try:
+            stamp = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d_%H%M%S")
+            backup = self.insights_path.with_name(f"insights.broken_{stamp}.json")
+            backup.write_bytes(self.insights_path.read_bytes())
+            return backup
+        except OSError as exc:  # noqa: BLE001
+            logger.warning(f"备份损坏账本失败: {exc}")
+            return None
 
     def _save(self) -> None:
-        """原子写入洞察快照。"""
+        """原子写入洞察快照。
+
+        load 失败时拒绝写：整份覆写 + 空的 _insights = 抹掉她学过的一切。
+        读不动的单行原样写回，不因为代码版本变化而丢。
+        """
+        if self._load_failed:
+            logger.error("❌ 账本处于读失败状态，拒绝写入（保护已有记录）")
+            return
         self._ensure_dirs()
+        rows: list[dict[str, Any]] = [ins.to_dict() for ins in self._insights]
+        rows.extend(self._unreadable_rows)
         payload = {
             "version": STORE_VERSION,
             "updated_at": _now_iso(),
-            "insights": [ins.to_dict() for ins in self._insights],
+            "insights": rows,
         }
         temp = self.insights_path.with_suffix(".json.tmp")
         temp.write_text(
@@ -361,6 +419,10 @@ class InsightStore:
         insight.next_action = InsightNextAction.AWAIT_REVIEW.value
         if reason:
             insight.revision_note = reason
+        # 单独记时间：revision_note 也被去重合并写（"已合并入 …"），
+        # 用它判断"是否重新想过"会把 47 条归档合并误当成重新审视。
+        insight.reconsidered_at = _now_iso()
+        insight.reconsider_count += 1
         insight.updated_at = _now_iso()
 
         self._append_audit({
@@ -374,6 +436,7 @@ class InsightStore:
             "evidence_count": len(insight.evidence),
             "negative_count": insight.negative_evidence_count,
             "knowledge_versions": list(insight.knowledge_versions),
+            "reconsider_count": insight.reconsider_count,
         })
         self._save()
         return True
@@ -394,16 +457,60 @@ class InsightStore:
         return True
 
     def list_reconsidered(self) -> list[Insight]:
-        """列出被重新审视过的洞察（带修正说明、且曾进过知识文档）。
+        """列出她主动拿回来重新想过的洞察。
 
-        这是"反例备忘"的真实来源之一：不只是被否定的洞察，
+        这是"反例备忘"的真实来源之一：不只是被审计否定的洞察，
         还有曾经写进自我认知、后来她自己觉得需要改的那些。
+
+        判据是 reconsidered_at，而不是 revision_note——后者同时被
+        去重合并复用，会把归档的合并记录一起算进来。
         """
         self.load()
-        return [
-            ins for ins in self._insights
-            if ins.revision_note and ins.knowledge_versions
-        ]
+        return [ins for ins in self._insights if ins.reconsidered_at]
+
+    def reconcile_knowledge_versions(self) -> int:
+        """按 manifest 回填 knowledge_versions。
+
+        为什么需要：v1 是在 record_knowledge_version 存在之前写的，
+        里面那两条洞察的 knowledge_versions 是空的。如果她现在重新
+        审视其中一条，压缩器就不知道这条认知已经在知识文档里有表述，
+        修正会丢。
+
+        只补不删，幂等；只搬 manifest 里已有的事实，不做任何判断。
+        返回补了多少条。
+        """
+        self.load()
+        manifest = self.load_knowledge_manifest()
+        versions = manifest.get("versions")
+        if not isinstance(versions, list):
+            return 0
+
+        fixed = 0
+        for entry in versions:
+            if not isinstance(entry, dict) or not entry.get("promoted"):
+                continue
+            try:
+                version = int(entry.get("version", 0))
+            except (TypeError, ValueError):
+                continue
+            if version <= 0:
+                continue
+            ids = entry.get("insight_ids")
+            if not isinstance(ids, list):
+                continue
+            for raw_id in ids:
+                insight = self.get_insight(str(raw_id))
+                if insight is None:
+                    continue
+                if version not in insight.knowledge_versions:
+                    insight.knowledge_versions.append(version)
+                    insight.knowledge_versions.sort()
+                    fixed += 1
+
+        if fixed:
+            self._save()
+            logger.info(f"📚 回填 knowledge_versions: {fixed} 条")
+        return fixed
 
     # ── 状态流转 ─────────────────────────────────────────────
 

@@ -198,7 +198,7 @@ class Logger:
         display: str | None = None,
         color: COLOR | str = COLOR.WHITE,
         console: Console | None = None,
-        enable_db: bool = False,
+        enable_db: bool | None = None,
         enable_event_broadcast: bool = True,
         log_level: str | None = None,
     ) -> None:
@@ -209,7 +209,8 @@ class Logger:
             display: 显示名称，如果为 None 则使用 name
             color: 日志颜色
             console: rich.Console 实例，如果为 None 则创建默认实例
-            enable_db: 是否启用数据库存储（使用全局共享的 LogStore）
+            enable_db: 是否启用数据库存储（使用全局共享的 LogStore）；
+                None 表示跟随全局配置，且在 initialize_logger_system 之后生效
             enable_event_broadcast: 是否启用事件广播（发布到 on_log_output 事件）
             log_level: 日志等级，如果为 None 则使用全局配置
         """
@@ -218,7 +219,12 @@ class Logger:
         self.color = get_rich_color(color)
         self.metadata: dict[str, Any] = {}
         self._lock = threading.Lock()
-        self._enable_db = enable_db
+        # enable_db 与 log_level 同理：为 None 时动态跟随全局配置。
+        # 否则在 import 期（initialize_logger_system 之前）创建的 logger
+        # 会把 enable_db=False 永久冻结下来，导致整棵 kernel.llm.* 日志
+        # 从不落库——失败与重试链路在 logs.db 里完全不可见。
+        self._use_global_enable_db: bool = enable_db is None
+        self._enable_db = bool(enable_db)
         self._enable_event_broadcast = enable_event_broadcast
 
         # 设置日志等级
@@ -356,7 +362,7 @@ class Logger:
                     self.console.print(exc_text)
 
             # 输出到数据库（如果启用，不受日志级别过滤）
-            if self._enable_db:
+            if self._db_enabled():
                 if _global_log_store is not None:
                     plain_message = _strip_rich_markup(message)
                     meta = dict(all_metadata)
@@ -437,6 +443,21 @@ class Logger:
         level_priority = _LOG_LEVEL_PRIORITY.get(level.upper(), 0)
         current_priority = _LOG_LEVEL_PRIORITY.get(current_level, 0)
         return level_priority >= current_priority
+
+    def _db_enabled(self) -> bool:
+        """检查是否应该写入数据库。
+
+        与 ``_should_log`` 同构：未显式指定 enable_db 时动态读取全局配置，
+        这样在 ``initialize_logger_system`` 之前创建的 logger 也能在初始化
+        之后正常落库。
+
+        Returns:
+            bool: 是否写入 SQLite 存储
+        """
+        if self._use_global_enable_db:
+            with _config_lock:
+                return bool(_global_config["enable_db"])
+        return self._enable_db
 
     def set_log_level(self, level: str) -> None:
         """设置日志等级
@@ -529,7 +550,7 @@ class Logger:
 
     def __repr__(self) -> str:
         """日志记录器字符串表示"""
-        db_status = "enabled" if self._enable_db else "disabled"
+        db_status = "enabled" if self._db_enabled() else "disabled"
         return (
             f"Logger(name='{self.name}', display='{self.display}', "
             f"color='{self.color}', db={db_status})"
@@ -642,9 +663,11 @@ def get_logger(
     with _lock:
         if name not in _loggers:
             _maybe_resume_event_broadcast()
-            # 使用全局配置作为默认值
+            # 使用全局配置作为默认值。
+            # 注意 enable_db 不在此处解析：import 期创建的 logger 会把当时的
+            # False 永久冻结，导致 initialize_logger_system 之后仍不落库。
+            # 保持 None 传入，由 Logger._db_enabled() 动态读取全局配置。
             with _config_lock:
-                actual_enable_db = enable_db if enable_db is not None else _global_config["enable_db"]
                 actual_enable_event_broadcast = (
                     enable_event_broadcast if enable_event_broadcast is not None
                     else _global_config["enable_event_broadcast"]
@@ -656,7 +679,7 @@ def get_logger(
                 display=display,
                 color=actual_color,
                 console=console,
-                enable_db=actual_enable_db,
+                enable_db=enable_db,
                 enable_event_broadcast=actual_enable_event_broadcast,
                 log_level=log_level,
             )

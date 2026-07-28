@@ -66,7 +66,6 @@ _READ_ONLY_TOOLS: list[str] = [
     "nucleus_manage_thought_stream",
     "nucleus_list_todos",
     "nucleus_list_schedules",
-    "retrieve_memory",
 ]
 
 

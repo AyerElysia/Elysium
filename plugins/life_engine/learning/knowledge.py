@@ -139,7 +139,7 @@ class SelfKnowledgeCompressor:
             #    而"我以前这么以为，现在不这么想了"恰恰是螺旋上升的主要形态。
             all_rejected = self._store.list_by_status(InsightStatus.REJECTED)
             rejected = all_rejected[-5:]
-            reconsidered = self._store.list_reconsidered()[-5:]
+            reconsidered = self.collect_reconsidered_memo()
 
             # 3. 调用 LLM 压缩
             new_content = await self._compress(
@@ -281,6 +281,20 @@ class SelfKnowledgeCompressor:
         if not isinstance(parsed, dict):
             return False
         return bool(parsed.get("promote", False))
+
+    def collect_reconsidered_memo(self, limit: int = 5) -> list[Insight]:
+        """挑出"曾经写进认知文档、后来她自己不这么想了"的洞察。
+
+        为什么要 knowledge_versions 这层过滤：
+        list_reconsidered() 返回她重新想过的全部洞察，包含还在候选期就
+        改了主意的——那只是想法在流动，不是"我曾经以为"。反例备忘要的是
+        后者：确实写进过自我认知、后来被她自己拿回来的那些。
+
+        只做筛选和排序，不下结论。
+        """
+        published = [ins for ins in self._store.list_reconsidered() if ins.knowledge_versions]
+        published.sort(key=lambda ins: ins.reconsidered_at)
+        return published[-limit:] if limit > 0 else published
 
     def get_knowledge_for_prompt(self, max_chars: int = 2000) -> str:
         """获取当前自我认知文档（用于 prompt 注入）。"""
