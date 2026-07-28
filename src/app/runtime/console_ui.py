@@ -191,7 +191,7 @@ class ConsoleUIManager:
         """获取当前级别的样式配置"""
         return self._STYLES.get(self.level, self._STYLES[UILevel.STANDARD])
 
-    def show_banner(self, version: str, bot_name: str = "Neo-MoFox") -> None:
+    def show_banner(self, version: str, bot_name: str = "Elysium") -> None:
         """显示启动横幅
 
         根据 UI 级别显示不同风格的横幅：
@@ -246,7 +246,7 @@ class ConsoleUIManager:
                     padding=(0, 2),
                     title=f"[bold white]v{version}[/bold white]",
                     title_align="right",
-                    subtitle="[dim]Neo-MoFox Bot Framework[/dim]",
+                    subtitle="[dim]Elysium[/dim]",
                     subtitle_align="center",
                 )
             )
@@ -563,7 +563,7 @@ class ConsoleUIManager:
 
         return f"[{color}]{filled}{partial_char}[/{color}][dim]{empty}[/dim]"
 
-    def update_plugin_progress(self, plugin_name: str, success: bool) -> None:
+    def update_plugin_progress(self, plugin_name: str, success: bool, version: str = "") -> None:
         """更新插件加载进度
 
         当处于 ``startup_progress`` 上下文且已调用 ``begin_plugin_loading`` 时，
@@ -573,6 +573,7 @@ class ConsoleUIManager:
         Args:
             plugin_name: 插件名称
             success: 是否加载成功
+            version: 插件版本号
         """
         # 统计更新
         if success:
@@ -584,10 +585,9 @@ class ConsoleUIManager:
         if self._startup_progress is not None and self._plugin_task_id is not None:
             if success:
                 if self.level != UILevel.MINIMAL:
-                    loaded = self._stats["plugins_loaded"]
+                    ver_tag = f" [dim]v{version}[/dim]" if version else ""
                     self.console.print(
-                        f"  [green]✓[/green] [cyan]{plugin_name}[/cyan]"
-                        + (f" [dim](#{loaded})[/dim]" if self.level == UILevel.VERBOSE else "")
+                        f"  [green]✓[/green] [cyan]{plugin_name}[/cyan]{ver_tag}"
                     )
             else:
                 self.console.print(
@@ -966,7 +966,7 @@ class ConsoleUIManager:
 
         Spinner("dots", style="green") if self._dashboard_running else "●"
         header.add_row(
-            Text("Neo-MoFox Bot", style="cyan bold"),
+            Text("Elysium", style="cyan bold"),
             Text("实时仪表盘", style="dim"),
             Text("运行中", style="green bold") if self._dashboard_running else Text("已停止", style="red"),
         )

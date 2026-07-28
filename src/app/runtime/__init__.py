@@ -1,4 +1,4 @@
-"""Neo-MoFox Runtime 模块
+"""Elysium Runtime 模块
 
 提供 Bot 生命周期管理、控制台 UI 和交互式命令系统。
 """

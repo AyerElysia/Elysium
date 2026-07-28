@@ -58,7 +58,7 @@ class ModelsConfig:
         self._providers = data.get("providers", {})
         self._models = data.get("models", {})
         self._tasks = data.get("tasks", {})
-        logger.info(
+        logger.debug(
             f"模型配置已加载: {len(self._providers)} providers, "
             f"{len(self._models)} models, {len(self._tasks)} tasks"
         )

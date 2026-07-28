@@ -156,11 +156,11 @@ class Bot:
 
             if failed > 0:
                 self.ui.display_warning(
-                    f"Bot 已初始化，加载了 {loaded}/{total} 个插件（{failed} 个失败）"
+                    f"Elysium 已苏醒，加载了 {loaded}/{total} 个插件（{failed} 个失败）"
                 )
             else:
                 self.ui.display_success(
-                    f"Bot 初始化成功，加载了 {total} 个插件"
+                    f"Elysium 已苏醒 ({total} 个插件)"
                 )
 
         except Exception as e:
@@ -266,7 +266,7 @@ class Bot:
 
         同时将所有服务注册到 DI 容器（架构 v2）。
         """
-        self.ui.update_phase_status("初始化内核", "启动中...")
+        self.ui.update_phase_status("内核", "初始化中...")
 
         # Step 1: Config
         from src.core.config import init_core_config, init_mcp_config, init_model_config
@@ -282,7 +282,6 @@ class Bot:
         # 架构 v2：新格式模型配置（优先于老 model.toml）
         from src.kernel.config.models_loader import init_models_config
         init_models_config("config/models.toml")
-        self.ui.update_phase_status("配置", "已加载")
 
         # Step 2: Logger
         from src.kernel.logger import get_logger, initialize_logger_system, COLOR
@@ -294,7 +293,6 @@ class Bot:
         from src.kernel.logger.logger import _global_log_store
         if _global_log_store is not None:
             container.register(LogStoreProtocol, _global_log_store)
-        self.ui.update_phase_status("日志", "已初始化")
 
         await self._preflight_llm_providers()
 
@@ -303,7 +301,6 @@ class Bot:
 
         self.event_bus = get_event_bus()
         container.register(EventBusProtocol, self.event_bus)  # v2
-        self.ui.update_phase_status("事件总线", "已初始化")
 
         # Step 4: Task Manager
         from src.kernel.concurrency import get_task_manager, get_watchdog
@@ -318,19 +315,15 @@ class Bot:
             get_watchdog().start()
         else:
             self.logger.warning("WatchDog 已禁用 (调试模式)")
-            
-        self.ui.update_phase_status("任务管理器", "已初始化")
 
         # Step 5: Scheduler
         from src.kernel.scheduler import get_unified_scheduler
 
         self.scheduler = get_unified_scheduler()
         container.register(SchedulerProtocol, self.scheduler)  # v2
-        self.ui.update_phase_status("调度器", "已初始化")
 
         # Step 6: WatchDog（复用 Step 4 已启动的全局单例）
         self.watchdog = get_watchdog()
-        self.ui.update_phase_status("看门狗", "已初始化")
 
         # Step 7: Database
         from src.kernel.db import init_database_from_config
@@ -358,7 +351,7 @@ class Bot:
 
         sync_stats = await enforce_database_schema_consistency()
         if self.logger:
-            self.logger.info(
+            self.logger.debug(
                 "数据库结构已对齐: "
                 f"tables={sync_stats.tables_checked}, "
                 f"add={sync_stats.columns_added}, "
@@ -368,7 +361,6 @@ class Bot:
             )
 
         self._stats["db_connected"] = True
-        self.ui.update_phase_status("数据库", "已连接")
 
         # Step 8: VectorDB
         from src.kernel.vector_db import get_vector_db_service
@@ -377,7 +369,6 @@ class Bot:
         Path("data/chroma_db").mkdir(parents=True, exist_ok=True)
         self.vector_db = get_vector_db_service("data/chroma_db")
         container.register(VectorStoreProtocol, self.vector_db)  # v2
-        self.ui.update_phase_status("向量数据库", "已初始化")
 
         # Step 9: Storage
         from src.kernel.storage import JSONStore
@@ -385,7 +376,7 @@ class Bot:
         # 确保 data 目录存在
         Path("data/json_storage").mkdir(parents=True, exist_ok=True)
         self.storage = JSONStore("data/json_storage")
-        self.ui.update_phase_status("存储", "已初始化")
+        self.ui.update_phase_status("内核", "就绪")
 
     async def _preflight_llm_providers(self) -> None:
         assert self.config is not None
@@ -401,12 +392,14 @@ class Bot:
 
         providers = get_model_config().api_providers
         if not providers:
-            self.logger.warning("LLM 预检: 未配置任何 API 提供商")
             self.ui.update_phase_status("LLM 预检", "无配置")
             return
 
         timeout = float(self.config.bot.llm_preflight_timeout or 5.0)
         self.ui.update_phase_status("LLM 预检", "进行中...")
+
+        results: list[tuple[str, bool, float]] = []
+        start_all = time.perf_counter()
 
         async with httpx.AsyncClient(timeout=timeout) as client:
             async def _check_provider(provider) -> None:
@@ -424,19 +417,28 @@ class Bot:
                 try:
                     resp = await client.get(url, headers=headers)
                     elapsed = time.perf_counter() - start
-                    self.logger.info(
-                        f"LLM 预检: {provider.name} {resp.status_code} {elapsed:.2f}s ({url})"
-                    )
-                except Exception as e:
+                    results.append((provider.name, resp.status_code == 200, elapsed))
+                except Exception:
                     elapsed = time.perf_counter() - start
-                    self.logger.warning(
-                        f"LLM 预检失败: {provider.name} {elapsed:.2f}s ({url}) -> {e}"
-                    )
+                    results.append((provider.name, False, elapsed))
 
             await asyncio.gather(
                 *(_check_provider(provider) for provider in providers),
                 return_exceptions=True,
             )
+
+        total_elapsed = time.perf_counter() - start_all
+        ok_providers = [name for name, ok, _ in results if ok]
+        failed_providers = [name for name, ok, _ in results if not ok]
+
+        # 只打一行摘要
+        if ok_providers:
+            summary = "  ".join(f"{name} OK" for name in ok_providers)
+            self.logger.info(f"LLM: {summary}  ({total_elapsed:.1f}s)")
+        if failed_providers and not ok_providers:
+            self.logger.warning(f"LLM 预检: 所有提供商不可用 ({', '.join(failed_providers)})")
+        elif failed_providers:
+            self.logger.debug(f"LLM 预检: {', '.join(failed_providers)} 不可用")
 
         self.ui.update_phase_status("LLM 预检", "已完成")
 
@@ -477,34 +479,8 @@ class Bot:
         )
 
         if is_public and has_insecure_keys:
-            # 使用 logger 发出警告
-            self.logger.warning("")
-            self.logger.warning("=" * 80)
-            self.logger.warning("⚠️  HTTP 服务器安全警告 ⚠️")
-            self.logger.warning("=" * 80)
-            self.logger.warning("")
-            self.logger.warning(f"检测到 HTTP 服务器配置为对外开放（{host}），但未设置安全的 API 密钥！")
-            self.logger.warning("")
-            self.logger.warning("这将导致以下安全风险：")
-            self.logger.warning("  • 任何人都可以访问您的 Bot API 端点")
-            self.logger.warning("  • 可能被恶意利用进行未授权操作")
-            self.logger.warning("  • 可能导致数据泄露或系统被攻击")
-            self.logger.warning("")
-            self.logger.warning("建议的解决方案：")
-            self.logger.warning("  1. 在 config/core.toml 中设置强密钥：")
-            self.logger.warning('     api_keys = ["your-strong-random-key-here"]')
-            self.logger.warning("  2. 或将监听地址改为本地：")
-            self.logger.warning('     http_router_host = "127.0.0.1"')
-            self.logger.warning("")
-            self.logger.warning("⚠️  我们不会承担因不安全配置导致系统被黑入的任何风险和责任！⚠️")
-            self.logger.warning("")
-            self.logger.warning("=" * 80)
-            self.logger.warning("")
-            await asyncio.get_running_loop().run_in_executor(
-                None, input, "输入回车来继续:"
-            )
-
-            # 同时在 UI 中显示警告状态
+            self.logger.warning(f"HTTP 对外开放但无安全密钥 ({host})")
+            self.logger.warning("建议设置 api_keys 或改为 127.0.0.1")
             self.ui.update_phase_status("HTTP服务器", "⚠️ 不安全配置")
             
     async def _initialize_core(self) -> None:
@@ -672,11 +648,12 @@ class Bot:
                     manifest._source_path, manifest
                 )
                 self.load_results[plugin_name] = success
-                self.ui.update_plugin_progress(plugin_name, success)
+                version = str(getattr(manifest, "version", "") or "")
+                self.ui.update_plugin_progress(plugin_name, success, version=version)
 
             except Exception as e:
                 self.load_results[plugin_name] = False
-                self.ui.update_plugin_progress(plugin_name, False)
+                self.ui.update_plugin_progress(plugin_name, False, version="")
                 if self.logger:
                     self.logger.error(f"插件 '{plugin_name}' 加载失败: {e}")
                 # 继续加载其他插件（容错策略）
@@ -741,8 +718,7 @@ class Bot:
 
         command_parser = CommandParser(self)
 
-        self.logger.info("Neo-MoFox Bot 启动成功")
-        self.logger.info("输入 /help 查看可用命令")
+        self.logger.info("Elysium 已苏醒。输入 /help 查看命令。")
 
         # 主循环
         try:
@@ -869,9 +845,9 @@ class Bot:
         self._running = False
 
         if self.logger:
-            self.logger.info("正在关闭 Neo-MoFox Bot...")
+            self.logger.info("正在关闭 Elysium...")
         else:
-            print("正在关闭 Neo-MoFox Bot...")
+            print("正在关闭 Elysium...")
 
         try:
             # 1. 停止接受新工作

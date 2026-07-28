@@ -28,7 +28,7 @@ _README_FILE_NAME = "README.md"
 
 _SCHEMA_DOCUMENT = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "title": "Neo-MoFox text-only trajectory",
+    "title": "Elysium text-only trajectory",
     "type": "object",
     "schema_version": TRAJECTORY_SCHEMA_VERSION,
     "format": "jsonl",
