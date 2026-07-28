@@ -191,6 +191,30 @@ class LifeEngineConfig(BaseConfig):
             description="单次心跳内允许模型连续进行工具调用的最大轮数（防止死循环）。",
         )
 
+        subconscious_context_max_chars: int = Field(
+            default=16000,
+            ge=1000,
+            description="潜意识上下文管理器的字符预算上限。",
+        )
+
+        subconscious_summary_max_chars: int = Field(
+            default=4000,
+            ge=200,
+            description="潜意识规范摘要的最大字符数。",
+        )
+
+        subconscious_entry_max_chars: int = Field(
+            default=480,
+            ge=40,
+            description="潜意识摘要单条目的最大字符数。",
+        )
+
+        subconscious_recent_groups: int = Field(
+            default=5,
+            ge=0,
+            description="潜意识上下文保留的最近完整因果组数量。",
+        )
+
     @config_section("model")
     class ModelSection(SectionBase):
         """中枢模型任务设置。"""

@@ -98,6 +98,8 @@ from .subconscious_context import (
     SubconsciousContextManager,
     SubconsciousSummary,
 )
+from .world_state import PerceptionFilter, WorldState
+from .consciousness import ConsciousnessRegistry, ConsciousnessInstance, CHAT_GLOBAL_INSTANCE_ID
 from .event_bus import LifeEventBus, RawEventStore
 from .integrations import (
     DFCIntegration,
@@ -116,6 +118,41 @@ if TYPE_CHECKING:
 
 logger = get_logger("life_engine", display="life_engine")
 _USER_TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "templates" / "USER.md"
+
+
+def _resolve_heartbeat_timeout(configured: float, model_set: Any) -> float:
+    """把心跳的外层超时抬到至少两个「单模型尝试」之上。
+
+    request 层对每个模型各自套了一层 ``asyncio.wait_for(timeout=model["timeout"])``，
+    超时后由 failover policy 轮换到下一个模型。但外层这一层 ``wait_for`` 一旦先到点，
+    抛出的是 ``CancelledError``——request.py 对它是裸 ``raise``，不进 failover。
+    于是当外层超时 == provider 超时（本仓库两边都是 120s）时，两个定时器同时到点，
+    外层取消先赢：模型列表里剩下的 5 个候补一个都轮不到，整个 failover 形同虚设。
+
+    这里保证外层预算 > 单次尝试预算，让内层至少有机会换一次模型。
+
+    Args:
+        configured: 配置里声明的心跳超时（秒）
+        model_set: 本次心跳使用的模型集，用于读取单模型超时
+
+    Returns:
+        float: 实际使用的外层超时秒数
+    """
+    per_attempt = 0.0
+    try:
+        for entry in model_set or []:
+            value = entry.get("timeout") if isinstance(entry, dict) else None
+            if isinstance(value, (int, float)) and value > 0:
+                per_attempt = max(per_attempt, float(value))
+    except Exception:  # noqa: BLE001 - 配置异常不应阻断心跳
+        per_attempt = 0.0
+
+    budget = configured
+    if per_attempt > 0:
+        budget = max(budget, per_attempt * 2 + 15.0)
+
+    return max(10.0, min(900.0, budget))
+
 
 class LifeEngineService(BaseService):
     """life_engine 心跳服务。
@@ -151,16 +188,41 @@ class LifeEngineService(BaseService):
         if configured_budget is None:
             configured_budget = getattr(settings, "heartbeat_context_max_chars", None)
         try:
-            context_budget = max(0, int(configured_budget or 6000))
+            context_budget = max(1000, int(configured_budget or 16000))
         except (TypeError, ValueError):
-            context_budget = 6000
+            context_budget = 16000
+        try:
+            summary_max = max(200, int(getattr(settings, "subconscious_summary_max_chars", None) or 4000))
+        except (TypeError, ValueError):
+            summary_max = 4000
+        try:
+            entry_max = max(40, int(getattr(settings, "subconscious_entry_max_chars", None) or 480))
+        except (TypeError, ValueError):
+            entry_max = 480
+        try:
+            recent_groups = max(0, int(getattr(settings, "subconscious_recent_groups", None) or 5))
+        except (TypeError, ValueError):
+            recent_groups = 5
         self._subconscious_context: SubconsciousContextManager = SubconsciousContextManager(
             max_chars=context_budget,
+            recent_group_count=recent_groups,
+            summary_max_chars=summary_max,
+            entry_max_chars=entry_max,
         )
         self._sleep_state_active: bool = False
         self._self_pause_skip_logged: bool = False
         self._memory_service: LifeMemoryService | None = None
         self._last_decay_date: str | None = None
+
+        # 结构化世界模型（潜意识共享内在世界）
+        self._world_state: WorldState = WorldState.load(
+            self._workspace_dir() / "runtime" / "world_state.json"
+        )
+
+        # 意识实例注册表（多意识协调）
+        self._consciousness_registry: ConsciousnessRegistry = ConsciousnessRegistry.load(
+            self._workspace_dir() / "runtime" / "consciousness_registry.json"
+        )
 
         # 集成管理器
         self._dfc_integration: DFCIntegration | None = None
@@ -195,6 +257,28 @@ class LifeEngineService(BaseService):
     def memory_service(self) -> LifeMemoryService | None:
         """兼容旧调用方的公开记忆服务访问入口。"""
         return self._memory_service
+
+    @property
+    def world_state(self) -> WorldState:
+        """潜意识结构化世界模型（共享内在世界）。"""
+        return self._world_state
+
+    def save_world_state(self) -> None:
+        """将世界状态持久化到磁盘。"""
+        self._world_state.save(
+            self._workspace_dir() / "runtime" / "world_state.json"
+        )
+
+    @property
+    def consciousness_registry(self) -> ConsciousnessRegistry:
+        """意识实例注册表（多意识协调）。"""
+        return self._consciousness_registry
+
+    def save_consciousness_registry(self) -> None:
+        """将意识注册表持久化到磁盘。"""
+        self._consciousness_registry.save(
+            self._workspace_dir() / "runtime" / "consciousness_registry.json"
+        )
 
     def _get_lock(self) -> asyncio.Lock:
         """获取懒加载锁。"""
@@ -2765,6 +2849,14 @@ class LifeEngineService(BaseService):
 
         sections: list[str] = []
 
+        # 内在世界（从潜意识结构化世界模型渲染）
+        world_perception = self._world_state.render_for_perception(
+            PerceptionFilter.full(),
+            max_chars=3000,
+        )
+        if world_perception:
+            sections.append(f"### 内在世界（来自潜意识）\n{world_perception}")
+
         new_thought_revision = thought_cursor
         if sync_streams:
             thought_body, current_revision = self._format_chatter_thought_streams(
@@ -3550,7 +3642,7 @@ class LifeEngineService(BaseService):
             getattr(cfg.settings, "heartbeat_timeout_seconds", 0)
             or cfg.settings.heartbeat_interval_seconds
         )
-        timeout_seconds = max(10.0, min(600.0, configured_timeout))
+        timeout_seconds = _resolve_heartbeat_timeout(configured_timeout, model_set)
 
         logger.debug(
             f"life_engine heartbeat request: "
@@ -3559,7 +3651,7 @@ class LifeEngineService(BaseService):
             f"tools_count={len(tools)}"
         )
 
-        from .error_handling import retry_with_backoff
+        from .error_handling import RetryExhaustedError, retry_with_backoff
 
         async def _send_heartbeat_request() -> Any:
             return await asyncio.wait_for(
@@ -3655,13 +3747,29 @@ class LifeEngineService(BaseService):
                     )
                     tool_event_count += 2
 
-            try:
-                response = await asyncio.wait_for(
-                    response.send(stream=False),
+            # 工具轮之后的续问必须和首次请求同等强度地重试：这里原本是裸的
+            # wait_for，首个模型一挂就直接把整个心跳判死，而首次请求那边有
+            # retry_with_backoff。心跳的绝大多数超时都发生在这一步（工具执行
+            # 之后上下文最长、最慢），少了重试等于把最脆弱的一环裸奔。
+            # 重发是幂等的：response.send() 每次都带同一份累积 payload 重投。
+            current_response = response
+
+            async def _send_followup_request() -> Any:
+                return await asyncio.wait_for(
+                    current_response.send(stream=False),
                     timeout=timeout_seconds,
                 )
-            except asyncio.TimeoutError as exc:
-                logger.warning("life_engine heartbeat follow-up request timeout")
+
+            try:
+                response = await retry_with_backoff(
+                    _send_followup_request,
+                    max_retries=1,
+                    initial_delay=2.0,
+                    backoff_factor=1.5,
+                    exceptions=(asyncio.TimeoutError,),
+                )
+            except (asyncio.TimeoutError, RetryExhaustedError) as exc:
+                logger.warning(f"life_engine heartbeat follow-up request timeout: {exc}")
                 raise TimeoutError("heartbeat follow-up request timeout") from exc
 
         if tool_event_count > 0:

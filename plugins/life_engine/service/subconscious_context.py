@@ -8,11 +8,14 @@ without invoking an LLM or token counter.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from .event_builder import EventType, LifeEngineEvent
+
+logger = logging.getLogger(__name__)
 
 
 SUMMARY_SCHEMA_VERSION = 1
@@ -241,10 +244,10 @@ class SubconsciousContextManager:
     def __init__(
         self,
         *,
-        max_chars: int = 6000,
-        recent_group_count: int = 3,
-        summary_max_chars: int = 1800,
-        entry_max_chars: int = 240,
+        max_chars: int = 16000,
+        recent_group_count: int = 5,
+        summary_max_chars: int = 4000,
+        entry_max_chars: int = 480,
     ) -> None:
         self.max_chars = max(0, int(max_chars))
         self.recent_group_count = max(0, int(recent_group_count))
@@ -402,6 +405,20 @@ class SubconsciousContextManager:
             [summary_event.event_id]
             if summary_event is not None and summary_text
             else []
+        )
+
+        # 结构化诊断日志：追踪潜意识上下文健康度
+        logger.debug(
+            "潜意识上下文 prepare: "
+            f"input_events={len(sorted_events)} "
+            f"delta_events={len(delta)} "
+            f"selected={len(selected_ids)} "
+            f"dropped={dropped_count} "
+            f"summary_entries={len(summary.entries)} "
+            f"summary_chars={len(self._render_summary(summary))} "
+            f"content_chars={len(content)}/{budget} "
+            f"target_reached={delta_complete} "
+            f"high_water={snapshot_high_water}"
         )
 
         return PreparedHeartbeatContext(
@@ -889,6 +906,22 @@ class SubconsciousContextManager:
             content_type="subconscious_summary",
         )
 
+    # 摘要条目的语义分组顺序（未匹配的 kind 归入“其他”）
+    _SUMMARY_KIND_ORDER: list[tuple[str, str]] = [
+        ("relationship", "关系"),
+        ("emotional_state", "情绪"),
+        ("body_state", "身体"),
+        ("ongoing_thread", "未闭合"),
+        ("commitment", "承诺"),
+        ("direct_message", "直接消息"),
+        ("dfc_message", "信息差"),
+        ("inner_dialogue", "内心对话"),
+        ("proactive_opportunity", "主动机会"),
+        ("autonomy_intent_due", "自主意向"),
+        ("tool_failure", "工具失败"),
+        ("agent_result", "智能体结果"),
+    ]
+
     def _render_summary(
         self,
         summary: SubconsciousSummary,
@@ -904,12 +937,34 @@ class SubconsciousContextManager:
                 f"{summary.covered_through_sequence}"
             ),
         ]
+
+        # 按 kind 分组渲染，让潜意识 LLM 更容易抓住结构
+        grouped: dict[str, list[SummaryEntry]] = {}
         for entry in summary.entries:
-            ids = ",".join(entry.event_ids)
-            sequences = ",".join(str(value) for value in entry.sequences)
-            lines.append(
-                f"- {entry.kind}: {entry.text} [event_id={ids}; sequence={sequences}]"
-            )
+            grouped.setdefault(entry.kind, []).append(entry)
+
+        rendered_kinds: set[str] = set()
+        for kind_key, kind_label in self._SUMMARY_KIND_ORDER:
+            entries = grouped.get(kind_key)
+            if not entries:
+                continue
+            rendered_kinds.add(kind_key)
+            lines.append(f"  [{kind_label}]")
+            for entry in entries:
+                sequences = ",".join(str(v) for v in entry.sequences)
+                seq_tag = f" @{sequences}" if sequences else ""
+                lines.append(f"  - {entry.text}{seq_tag}")
+
+        # 未匹配的 kind 归入“其他”
+        other_kinds = set(grouped.keys()) - rendered_kinds
+        if other_kinds:
+            lines.append("  [其他]")
+            for kind in sorted(other_kinds):
+                for entry in grouped[kind]:
+                    sequences = ",".join(str(v) for v in entry.sequences)
+                    seq_tag = f" @{sequences}" if sequences else ""
+                    lines.append(f"  - ({kind}) {entry.text}{seq_tag}")
+
         if summary.stats:
             stats = ", ".join(
                 f"{key}={summary.stats[key]}" for key in sorted(summary.stats)
