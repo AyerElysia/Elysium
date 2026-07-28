@@ -44,8 +44,10 @@ from .visual_embedder import VisualEmbedder, VisualEmbedError
 
 try:
     from PIL import Image as PILImage
+    from PIL import ImageOps as PILImageOps
 except ImportError:
     PILImage = None
+    PILImageOps = None
 
 
 logger = get_logger("emoji.sender")
@@ -73,6 +75,13 @@ EMOTION_TAG_PRESET: tuple[str, ...] = (
 )
 
 _ALLOWED_SUFFIXES: frozenset[str] = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp"})
+
+# VLM 侧解码器比 PIL 严格得多：越界的 EXIF orientation、异常 ICC profile、
+# CMYK/16bit 采样、渐进式扫描等都可能让上游 prefill 直接报
+# "Multimodal data is corrupted or cannot be processed."。
+# 因此发给 VLM 的静态图一律重编码为干净的 baseline RGB JPEG，不做原样透传。
+_VLM_MAX_LONG_SIDE = 1568
+_VLM_JPEG_QUALITY = 85
 
 _INGEST_LOCK = asyncio.Lock()
 
@@ -277,11 +286,96 @@ class EmojiSenderService(BaseService):
         }.get(suffix, "image/png")
 
     @staticmethod
-    def _compress_image_for_vlm(image_bytes: bytes, mime: str, max_size_mb: float = 5.0) -> tuple[bytes, str, bool]:
-        """将图片压缩至指定大小用于 VLM 识别。
+    def _normalize_static_for_vlm(
+        image_bytes: bytes,
+        max_bytes: int,
+    ) -> tuple[bytes, str]:
+        """把静态图重编码为干净的 baseline RGB JPEG。
 
-        - 静态图（JPG/PNG/WebP）：逐步降低质量和分辨率
+        PIL 的解码容忍度远高于上游 VLM 的 prefill 解码器，因此"PIL 能打开"
+        并不代表"上游能解析"。这里统一做一次彻底的重建：
+
+        - 按 EXIF orientation 摆正，并容忍越界的 orientation 值（如 0）
+        - 丢弃全部 EXIF / ICC profile / 其他附带 metadata
+        - alpha / 调色板 / 灰度 / CMYK / 16bit 一律拍平为 8bit RGB（透明填白）
+        - 长边限制在 _VLM_MAX_LONG_SIDE 以内
+        - 输出 baseline（非渐进式）JPEG
+
+        Returns:
+            (重编码后的 bytes, "image/jpeg")
+        """
+        img = PILImage.open(io.BytesIO(image_bytes))
+        img.load()
+
+        # EXIF orientation：越界值（例如 orientation=0）会让部分严格解码器直接拒绝，
+        # 这里吞掉异常，摆不正就按原样继续。
+        if PILImageOps is not None:
+            try:
+                img = PILImageOps.exif_transpose(img) or img
+            except Exception as e:
+                logger.debug(f"EXIF orientation 处理失败，忽略: {e}")
+
+        # 透明通道拍平到白底，其余色彩模式统一转 RGB
+        if img.mode in ("RGBA", "LA", "PA") or (
+            img.mode == "P" and "transparency" in img.info
+        ):
+            rgba = img.convert("RGBA")
+            canvas = PILImage.new("RGB", rgba.size, (255, 255, 255))
+            canvas.paste(rgba, mask=rgba.split()[-1])
+            img = canvas
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+
+        # 长边限制
+        long_side = max(img.size)
+        if long_side > _VLM_MAX_LONG_SIDE:
+            ratio = _VLM_MAX_LONG_SIDE / long_side
+            img = img.resize(
+                (max(1, int(img.width * ratio)), max(1, int(img.height * ratio))),
+                PILImage.Resampling.LANCZOS,
+            )
+
+        def _encode(image: Any, quality: int) -> bytes:
+            buf = io.BytesIO()
+            # exif=b"" / icc_profile=None：显式清空，避免旧 metadata 被带出去
+            image.save(
+                buf,
+                format="JPEG",
+                quality=quality,
+                optimize=True,
+                progressive=False,
+                subsampling="4:2:0",
+                exif=b"",
+                icc_profile=None,
+            )
+            return buf.getvalue()
+
+        out = _encode(img, _VLM_JPEG_QUALITY)
+
+        # 仍超限则降质量，再不行降分辨率
+        quality = _VLM_JPEG_QUALITY
+        while len(out) > max_bytes and quality > 30:
+            quality = max(30, quality - 10)
+            out = _encode(img, quality)
+
+        while len(out) > max_bytes and max(img.size) > 320:
+            img = img.resize(
+                (max(1, int(img.width * 0.8)), max(1, int(img.height * 0.8))),
+                PILImage.Resampling.LANCZOS,
+            )
+            out = _encode(img, quality)
+
+        return out, "image/jpeg"
+
+    @staticmethod
+    def _compress_image_for_vlm(image_bytes: bytes, mime: str, max_size_mb: float = 5.0) -> tuple[bytes, str, bool]:
+        """把图片处理成可安全发给 VLM 的形式。
+
+        - 静态图（JPG/PNG/WebP）：一律重编码为干净的 baseline RGB JPEG
+          （详见 _normalize_static_for_vlm），不做原样透传
         - GIF：均匀采样最多 6 帧拼成网格图，以 JPEG 发给 VLM（仅用于识别，不影响入库的原文件）
+
+        入库保存的始终是源文件，这里的输出只用于 VLM 识别。
 
         Returns:
             (用于 VLM 的 bytes, mime 类型, is_gif_frames_collage)
@@ -357,54 +451,24 @@ class EmojiSenderService(BaseService):
             except Exception as e:
                 raise RuntimeError(f"GIF 处理失败: {e}") from e
 
-        # 静态图：不超限则直接返回
-        if len(image_bytes) <= max_bytes:
-            return image_bytes, mime, False
-
-        # 静态图：超限则逐步压缩
+        # 静态图：一律重编码，不做原样透传。
+        # 原样透传会把越界 EXIF orientation、异常 ICC profile、CMYK/16bit 采样、
+        # 渐进式扫描等直接送到上游，触发 400 "Multimodal data is corrupted"。
         try:
-            img = PILImage.open(io.BytesIO(image_bytes))
+            normalized, output_mime = EmojiSenderService._normalize_static_for_vlm(
+                image_bytes, max_bytes
+            )
         except Exception as e:
-            raise RuntimeError(f"无法打开图片: {e}") from e
+            raise RuntimeError(f"图片规范化失败: {e}") from e
 
-        output_format = {
-            "image/png": "JPEG",   # PNG 超大时转 JPEG 压缩效果更好
-            "image/jpeg": "JPEG",
-            "image/jpg": "JPEG",
-            "image/webp": "WEBP",
-        }.get(mime, "JPEG")
-        output_mime = "image/jpeg" if output_format == "JPEG" else mime
-
-        quality = 85
-        scale = 1.0
-        compressed = b""
-
-        while quality >= 30 or scale > 0.4:
-            output = io.BytesIO()
-            try:
-                target = img.convert("RGB") if output_format == "JPEG" else img
-                if scale < 1.0:
-                    new_w = max(1, int(target.width * scale))
-                    new_h = max(1, int(target.height * scale))
-                    target = target.resize((new_w, new_h), PILImage.Resampling.LANCZOS)
-                target.save(output, format=output_format, quality=quality)
-                compressed = output.getvalue()
-                if len(compressed) <= max_bytes:
-                    logger.info(
-                        f"图片已压缩: {len(image_bytes)} → {len(compressed)} 字节 "
-                        f"(质量 {quality}, 缩放 {scale:.2f})"
-                    )
-                    return compressed, output_mime, False
-            except Exception as e:
-                raise RuntimeError(f"压缩图片失败: {e}") from e
-
-            if quality > 30:
-                quality = max(30, quality - 10)
-            else:
-                scale = round(scale - 0.1, 1)
-
-        logger.warning(f"图片压缩后仍超限，使用最后结果: {len(compressed)} 字节")
-        return compressed, output_mime, False
+        if len(normalized) > max_bytes:
+            logger.warning(f"图片重编码后仍超限，使用最后结果: {len(normalized)} 字节")
+        else:
+            logger.debug(
+                f"图片已规范化用于 VLM: {len(image_bytes)} → {len(normalized)} 字节 "
+                f"({mime} → {output_mime})"
+            )
+        return normalized, output_mime, False
     
     @staticmethod
     def _build_persona_prompt():
@@ -1089,6 +1153,99 @@ class EmojiSenderService(BaseService):
         )
         return ok
 
+    # ── 使用表情包：知情权 + 选择权 ─────────────────────
+
+    async def recall_collected_memes(
+        self,
+        *,
+        mode: str = "intent",
+        description: str = "",
+        count: int = 6,
+    ) -> list[dict[str, Any]]:
+        """召回她收藏的表情包候选（带着她当初的备注），由她自己挑。
+
+        两种模式：
+        - mode="visual"：按描述做视觉检索，返回最贴合的 count 张（算法按外观找候选）
+        - mode="intent"：纯随机采 count 张（算法不猜意图，随机递一捼，她自己想起来、自己挑）
+
+        两种都返回带备注的候选，选择权始终在她手里。
+        """
+        store = self._meme_store()
+        await store.initialize()
+        n = max(1, int(count or 6))
+
+        mode = str(mode or "intent").strip().lower()
+        if mode == "visual" and str(description or "").strip():
+            # 视觉模式：按描述检索 top-n（带着备注）
+            try:
+                embedder = self._visual_embedder()
+                query_embedding = await embedder.embed_text(
+                    str(description).strip(), with_instruction=True
+                )
+                results = await store.search_visual(query_embedding, top_n=n)
+                ids = list(results.get("ids") or [])
+                metadatas = list(results.get("metadatas") or [])
+                candidates: list[dict[str, Any]] = []
+                if ids and ids[0]:
+                    for i, mid in enumerate(ids[0]):
+                        meta = metadatas[0][i] if metadatas and metadatas[0] and i < len(metadatas[0]) else {}
+                        meta = meta or {}
+                        path = str(meta.get("path") or "")
+                        if not path:
+                            continue
+                        candidates.append(
+                            {"meme_id": str(mid), "path": path, "note": str(meta.get("note") or "")}
+                        )
+                if candidates:
+                    return candidates[:n]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"视觉召回失败，转为随机采样: {exc}")
+
+        # 意图模式（默认）：纯随机采样。算法不猜意图，随机递一捼，她自己挑。
+        all_memes = await store.get_all_collected()
+        if not all_memes:
+            return []
+        sampled = random.sample(all_memes, k=min(n, len(all_memes)))
+        return sampled
+
+    async def send_meme_by_id(
+        self,
+        *,
+        meme_id: str,
+        stream_id: str,
+        platform: str | None,
+    ) -> tuple[bool, str]:
+        """发送她选中的那张表情包（按 meme_id）。"""
+        store = self._meme_store()
+        await store.initialize()
+        meme = await store.get_meme_by_id(str(meme_id or "").strip())
+        if not meme:
+            return False, "找不到这张表情包（可能 id 不对）"
+
+        path = Path(str(meme.get("path") or ""))
+        if not path.exists():
+            return False, "表情包文件已不存在"
+
+        try:
+            payload = path.read_bytes()
+        except Exception as e:
+            logger.warning(f"读取表情包失败: {path} - {e}")
+            return False, "读取表情包文件失败"
+
+        image_base64 = await get_task_manager().to_process(base64_encode_bytes, payload)
+        note = str(meme.get("note") or "").strip()
+        processed_plain_text = f"[表情包:{note}]" if note else "[表情包]"
+
+        ok = await send_emoji(
+            emoji_data=image_base64,
+            stream_id=stream_id,
+            platform=platform,
+            processed_plain_text=processed_plain_text,
+        )
+        if ok:
+            return True, f"已发送表情包{('：' + note) if note else ''}"
+        return False, "发送失败"
+
     # ── 仿生收藏：感知筛选 + 浏览 + 收藏（她的自主行为）──────────
 
     async def _vlm_perceive_meme(
@@ -1140,7 +1297,29 @@ class EmojiSenderService(BaseService):
 
         raw = (response.message or response.reasoning_content or "").strip()
         obj = self._extract_json_object(raw)
+
+        # 与 _vlm_decide_and_label 同理：输出无法解析不是异常，request 层的
+        # failover 不会因此换模型，于是每轮重扫都会撞在同一个首选模型上。
+        # 推理模型（MiMo）的 reasoning 长度不可控，偶发吃光输出预算只留半截
+        # JSON——这里主动降级到后备模型重试一次。
+        if obj is None and len(model_set) > 1:
+            logger.debug(f"感知筛选首选模型输出无法解析，降级重试 | raw={raw[:200]!r}")
+            retry_request = create_llm_request(
+                model_set=model_set[1:],
+                request_name="emoji_perceive",
+                context_manager=LLMContextManager(),
+            )
+            retry_request.add_payload(LLMPayload(ROLE.USER, [Text(prompt), Image(image_value)]))
+            try:
+                retry_response = await retry_request.send(stream=False)
+                await retry_response
+                raw = (retry_response.message or retry_response.reasoning_content or "").strip()
+                obj = self._extract_json_object(raw)
+            except Exception as e:
+                logger.warning(f"感知筛选降级重试失败: {e}")
+
         if obj is None:
+            logger.debug(f"感知筛选输出无法解析为 JSON | raw={raw[:200]!r}")
             return None
         return {
             "is_meme": bool(obj.get("is_meme")),
@@ -1190,8 +1369,18 @@ class EmojiSenderService(BaseService):
             perceived = await self._vlm_perceive_meme(
                 image_base64=image_b64, mime=vlm_mime, is_gif_collage=is_gif_collage
             )
-            if not perceived or not perceived.get("is_meme"):
-                # 不是表情包：也登记为 dismissed，避免反复感知同一张
+
+            # 关键：区分「VLM 说不是表情包」和「VLM 没能给出结论」。
+            # 上游 prefill 偶发 400（Multimodal data is corrupted）、超时、限流、
+            # 输出截断等都会让 perceived 为 None，这是暂时性失败而非判定结果。
+            # 若在此登记 dismissed，has_hash 会让这张图永久不再被感知——
+            # 一次抖动就永久丢掉一张表情包。因此失败时不落库，留给下一轮重扫。
+            if perceived is None:
+                logger.debug(f"感知筛选未得出结论，留待下轮重试: {path.name}")
+                continue
+
+            if not perceived.get("is_meme"):
+                # 明确判定不是表情包：登记为 dismissed，避免反复感知同一张
                 await store.add_candidate(
                     source_hash=source_hash, source_path=str(path), mime=mime,
                 )

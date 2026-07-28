@@ -294,3 +294,61 @@ class MemeStore:
             return int(await self._vdb.count(self._collection))
         except Exception:  # noqa: BLE001
             return 0
+
+    async def get_all_collected(self) -> list[dict[str, Any]]:
+        """取回所有已收藏的表情包（供随机采样/浏览）。
+
+        Returns:
+            [{meme_id, path, note}] 列表
+        """
+        await self._vdb.get_or_create_collection(self._collection)
+        try:
+            data = await self._vdb.get(
+                collection_name=self._collection,
+                include=["metadatas"],
+                limit=100000,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"读取收藏表情包失败: {exc}")
+            return []
+
+        ids = list(data.get("ids") or [])
+        metadatas = list(data.get("metadatas") or [])
+        result: list[dict[str, Any]] = []
+        for mid, meta in zip(ids, metadatas):
+            meta = meta or {}
+            path = str(meta.get("path") or "")
+            if not path:
+                continue
+            result.append(
+                {
+                    "meme_id": str(mid),
+                    "path": path,
+                    "note": str(meta.get("note") or ""),
+                }
+            )
+        return result
+
+    async def get_meme_by_id(self, meme_id: str) -> dict[str, Any] | None:
+        """按 id 取回单张已收藏表情包。"""
+        await self._vdb.get_or_create_collection(self._collection)
+        try:
+            data = await self._vdb.get(
+                collection_name=self._collection,
+                ids=[meme_id],
+                include=["metadatas"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"按 id 读取表情包失败: {exc}")
+            return None
+        ids = list(data.get("ids") or [])
+        metadatas = list(data.get("metadatas") or [])
+        if not ids:
+            return None
+        meta = metadatas[0] if metadatas else {}
+        meta = meta or {}
+        return {
+            "meme_id": str(ids[0]),
+            "path": str(meta.get("path") or ""),
+            "note": str(meta.get("note") or ""),
+        }

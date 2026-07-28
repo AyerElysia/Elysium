@@ -17,7 +17,7 @@ from src.kernel.logger import get_logger
 from .config import EmojiConfig
 from .generated.action import GenerateEmojiMemeAction
 from .generated.service import ElysiaGeneratedEmojiService
-from .sender.action import SendEmojiMemeAction
+from .sender.action import RecallEmojiAction, SendEmojiByIdAction, SendEmojiMemeAction
 from .sender.service import EmojiSenderService
 
 
@@ -86,7 +86,12 @@ class EmojiPlugin(BasePlugin):
 
     def get_components(self) -> list[type]:
         """返回本插件提供的组件类。"""
-        components: list[type] = [EmojiSenderService, SendEmojiMemeAction]
+        components: list[type] = [
+            EmojiSenderService,
+            SendEmojiMemeAction,
+            RecallEmojiAction,
+            SendEmojiByIdAction,
+        ]
         cfg = self.config
         if isinstance(cfg, EmojiConfig) and cfg.generated.plugin.enabled:
             components.extend([ElysiaGeneratedEmojiService, GenerateEmojiMemeAction])

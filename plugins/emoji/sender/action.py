@@ -65,3 +65,75 @@ class SendEmojiMemeAction(BaseAction):
 
         # 失败：尽量带上原因
         return False, reason
+
+
+class RecallEmojiAction(BaseAction):
+    """召回收藏的表情包候选（带备注），由她自己挑。"""
+
+    action_name: str = "recall_emoji"
+    action_description: str = (
+        "从你自己收藏的表情包里召回一批候选，每张都带着你当初收藏时写的备注，由你自己挑一张。"
+        "两种用法："
+        "(1) 意图模式（mode='intent'，默认）：随机递给你几张，你自己想起来哪张合适、自己挑；"
+        "(2) 视觉模式（mode='visual'）：描述你想表达什么（description），按外观相似度找候选。"
+        "看到候选后，用 send_emoji_by_id 发送你选中的那张。"
+        "如果这批没有合适的，可以再调一次换一批。"
+    )
+    primary_action: bool = False
+
+    async def execute(
+        self,
+        mode: Annotated[
+            str,
+            "召回模式：'intent'（默认，随机递几张你自己挑）或 'visual'（按描述的外观相似度找）",
+        ] = "intent",
+        description: Annotated[
+            str,
+            "visual 模式下你想表达的情绪/意图（例如'俏皮地吐舌头'）；intent 模式可不填",
+        ] = "",
+        count: Annotated[int, "想看几张候选，默认 6"] = 6,
+    ) -> tuple[bool, str]:
+        service = get_service("emoji:service:emoji_sender")
+        if service is None:
+            return False, "emoji_sender service 未加载"
+        service = cast(EmojiSenderService, service)
+
+        candidates = await service.recall_collected_memes(
+            mode=mode,
+            description=description,
+            count=count,
+        )
+        if not candidates:
+            return True, "你还没有收藏表情包，或者这次没有召回到。可以先用 nucleus_browse_memes 看看最近收到的，收藏几张。"
+
+        lines = [f"这里是 {len(candidates)} 张你收藏的表情包，挑一张用 send_emoji_by_id 发送："]
+        for i, c in enumerate(candidates, 1):
+            note = str(c.get("note") or "").strip() or "（当时没写备注）"
+            lines.append(f"{i}. [{c.get('meme_id', '')}] 备注：{note}")
+        return True, "\n".join(lines)
+
+
+class SendEmojiByIdAction(BaseAction):
+    """发送她选中的那张表情包（按 meme_id）。"""
+
+    action_name: str = "send_emoji_by_id"
+    action_description: str = (
+        "发送你选中的那张表情包。先用 recall_emoji 看到候选及其 meme_id，然后用这个动作发送你挑中的那张。"
+    )
+    primary_action: bool = False
+
+    async def execute(
+        self,
+        meme_id: Annotated[str, "要发送的表情包 meme_id（recall_emoji 返回的）"],
+    ) -> tuple[bool, str]:
+        service = get_service("emoji:service:emoji_sender")
+        if service is None:
+            return False, "emoji_sender service 未加载"
+        service = cast(EmojiSenderService, service)
+
+        ok, msg = await service.send_meme_by_id(
+            meme_id=meme_id,
+            stream_id=self.chat_stream.stream_id,
+            platform=self.chat_stream.platform,
+        )
+        return ok, msg
