@@ -795,9 +795,32 @@ class LifeEngineListSchedulesTool(BaseTool):
         return True, {"count": len(items), "tasks": items}
 
 
+class NucleusScheduleTool(BaseTool):
+    """统一的日程管理工具（合并原 nucleus_manage_schedule + nucleus_list_schedules）。"""
+
+    tool_name = "nucleus_schedule"
+    tool_description = (
+        "管理日程/定时任务。\n\n"
+        "action=list：查看当前日程列表\n"
+        "action=add/create：添加新日程\n"
+        "action=remove/delete：删除日程\n"
+        "action=pause：暂停日程\n"
+        "action=resume：恢复日程"
+    )
+    chatter_allow: list[str] = ["life_engine_internal", "life_chatter"]
+
+    async def execute(self, action: Annotated[str, "操作：list/add/create/remove/delete/pause/resume"] = "list", **kwargs: object) -> tuple[bool, str | dict]:
+        action_value = str(action or "list").strip().lower()
+        if action_value in ("list", "show", "query"):
+            tool = LifeEngineListSchedulesTool(plugin=self.plugin)
+            return await tool.execute(**kwargs)  # type: ignore[arg-type]
+        else:
+            tool = LifeEngineManageScheduleTool(plugin=self.plugin)
+            return await tool.execute(action=action_value, **kwargs)  # type: ignore[arg-type]
+
+
 SCHEDULE_TOOLS = [
-    LifeEngineManageScheduleTool,
-    LifeEngineListSchedulesTool,
+    NucleusScheduleTool,
 ]
 
 __all__ = [
@@ -805,7 +828,6 @@ __all__ = [
     "ScheduleStore",
     "restore_life_schedules_when_ready",
     "cleanup_life_schedules",
-    "LifeEngineManageScheduleTool",
-    "LifeEngineListSchedulesTool",
+    "NucleusScheduleTool",
     "SCHEDULE_TOOLS",
 ]

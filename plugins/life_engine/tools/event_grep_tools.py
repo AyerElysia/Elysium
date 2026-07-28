@@ -197,7 +197,7 @@ class LifeEngineGrepEventsTool(BaseTool):
         "这里是事件流检索，不是聊天数据库全文检索。\n"
         "支持正则、按 stream_id 或事件类型过滤，可携带前后相邻事件作为上下文。"
     )
-    chatter_allow: list[str] = ["life_engine_internal"]
+    chatter_allow: list[str] = ["life_engine_internal", "life_chatter"]
 
     async def execute(
         self,

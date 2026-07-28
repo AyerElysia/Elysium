@@ -881,7 +881,37 @@ class LifeEngineListTodosTool(BaseTool):
             return False, f"列出失败: {exc}"
 
 
+class NucleusTodoTool(BaseTool):
+    """统一的 TODO 管理工具（合并原 nucleus_manage_todo + nucleus_list_todos）。"""
+
+    tool_name: str = "nucleus_todo"
+    tool_description: str = (
+        "管理承诺行动 TODO。\n\n"
+        "action=list：查看 TODO 列表（默认只返回未完成项，可按状态/优先级/逾期筛选）\n"
+        "action=create：创建新 TODO（必须提供 title 和 next_action，并且 due_at/remind_at/next_review_at/recurrence 至少一项）\n"
+        "action=update/edit：修改 TODO 字段\n"
+        "action=start：开始执行\n"
+        "action=log_progress：记录进展\n"
+        "action=complete：完成（周期任务会自动排下一次）\n"
+        "action=cancel/archive/delete：取消/归档/删除\n"
+        "action=review：复盘\n\n"
+        "TODO 是需要被行动和复盘的承诺，不是随手记愿望。"
+    )
+    chatter_allow: list[str] = ["life_engine_internal", "life_chatter"]
+
+    async def execute(self, action: Annotated[str, "操作：list/create/update/edit/start/log_progress/complete/cancel/archive/delete/review"] = "list", **kwargs: object) -> tuple[bool, str | dict]:
+        action_value = str(action or "list").strip().lower()
+
+        if action_value in ("list", "get", "query", "show"):
+            # 委托给 list 逻辑
+            tool = LifeEngineListTodosTool(plugin=self.plugin)
+            return await tool.execute(**kwargs)  # type: ignore[arg-type]
+        else:
+            # 委托给 manage 逻辑
+            tool = LifeEngineManageTodoTool(plugin=self.plugin)
+            return await tool.execute(action=action_value, **kwargs)  # type: ignore[arg-type]
+
+
 TODO_TOOLS = [
-    LifeEngineManageTodoTool,
-    LifeEngineListTodosTool,
+    NucleusTodoTool,
 ]

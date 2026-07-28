@@ -53,9 +53,8 @@ _READ_ONLY_TOOLS: list[str] = [
     "nucleus_list_files",
     "nucleus_grep_file",
     "nucleus_grep_events",
-    "grep_life_events",
     "nucleus_search_memory",
-    "nucleus_view_relations",
+    "nucleus_relations",
     "nucleus_memory_stats",
     "fetch_life_memory",
     "fetch_chat_history",
@@ -64,8 +63,8 @@ _READ_ONLY_TOOLS: list[str] = [
     "nucleus_view_screen",
     "nucleus_minecraft",
     "nucleus_manage_thought_stream",
-    "nucleus_list_todos",
-    "nucleus_list_schedules",
+    "nucleus_todo",
+    "nucleus_schedule",
 ]
 
 

@@ -1692,7 +1692,6 @@ ALL_TOOLS = [
     LifeEngineWriteFileTool,
     LifeEngineEditFileTool,
     LifeEngineListFilesTool,
-    LifeEngineMakeDirectoryTool,
     LifeEngineWakeDFCTool,
     LifeEngineRunAgentTool,
     FetchLifeMemoryTool,

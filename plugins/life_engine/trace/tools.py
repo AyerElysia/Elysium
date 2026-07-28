@@ -209,10 +209,34 @@ class LifeTracePreviewVersionTool(BaseTool):
         }
 
 
+class NucleusTraceTool(BaseTool):
+    """统一的文件追溯工具（合并原 5 个 trace 工具）。"""
+
+    tool_name: str = "nucleus_trace"
+    tool_description: str = (
+        "文件修改追溯。\n\n"
+        "action=recent：查看最近的文件修改记录\n"
+        "action=history：查看某个文件的修改历史\n"
+        "action=diff：查看某次修改的差异\n"
+        "action=preview：查看某次修改前/后的文件内容\n"
+        "action=origin：查看文件的创建来源"
+    )
+    chatter_allow: list[str] = ["life_engine_internal"]
+
+    async def execute(self, action: Annotated[str, "操作：recent/history/diff/preview/origin"] = "recent", **kwargs: object) -> tuple[bool, str | dict]:
+        action_value = str(action or "recent").strip().lower()
+        tool_map = {
+            "recent": LifeTraceRecentChangesTool,
+            "history": LifeTraceFileHistoryTool,
+            "diff": LifeTraceShowDiffTool,
+            "preview": LifeTracePreviewVersionTool,
+            "origin": LifeTraceOriginTool,
+        }
+        cls = tool_map.get(action_value, LifeTraceRecentChangesTool)
+        tool = cls(plugin=self.plugin)
+        return await tool.execute(**kwargs)  # type: ignore[arg-type]
+
+
 LIFE_TRACE_TOOLS = [
-    LifeTraceRecentChangesTool,
-    LifeTraceOriginTool,
-    LifeTraceFileHistoryTool,
-    LifeTraceShowDiffTool,
-    LifeTracePreviewVersionTool,
+    NucleusTraceTool,
 ]

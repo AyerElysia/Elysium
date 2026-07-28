@@ -521,10 +521,36 @@ class LifeEngineMemoryStatsTool(BaseTool):
 # 工具注册列表
 # ============================================================
 
+class NucleusRelationsTool(BaseTool):
+    """统一的记忆关系工具（合并原 relate_file + view_relations + forget_relation）。"""
+
+    tool_name: str = "nucleus_relations"
+    tool_description: str = (
+        "管理记忆文件之间的关系。\n\n"
+        "action=add：为文件添加关系/联想\n"
+        "action=view：查看某个文件的关系\n"
+        "action=forget：删除某个关系"
+    )
+    chatter_allow: list[str] = ["life_engine_internal"]
+
+    async def execute(self, action: Annotated[str, "操作：add/view/forget"] = "view", **kwargs: object) -> tuple[bool, str | dict]:
+        action_value = str(action or "view").strip().lower()
+        tool_map = {
+            "add": LifeEngineRelateFileTool,
+            "relate": LifeEngineRelateFileTool,
+            "view": LifeEngineViewRelationsTool,
+            "list": LifeEngineViewRelationsTool,
+            "forget": LifeEngineForgetRelationTool,
+            "remove": LifeEngineForgetRelationTool,
+            "delete": LifeEngineForgetRelationTool,
+        }
+        cls = tool_map.get(action_value, LifeEngineViewRelationsTool)
+        tool = cls(plugin=self.plugin)
+        return await tool.execute(**kwargs)  # type: ignore[arg-type]
+
+
 MEMORY_TOOLS = [
     LifeEngineSearchMemoryTool,
-    LifeEngineRelateFileTool,
-    LifeEngineViewRelationsTool,
-    LifeEngineForgetRelationTool,
+    NucleusRelationsTool,
     LifeEngineMemoryStatsTool,
 ]
