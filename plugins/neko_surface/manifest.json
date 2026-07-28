@@ -2,7 +2,7 @@
   "name": "neko_surface",
   "version": "1.0.0",
   "description": "Connect N.E.K.O as an authenticated presentation surface for Neo-MoFox",
-  "author": "Neo-MoFox Team",
+  "author": "Elysium",
   "license": "GPL-3.0",
   "dependencies": {
     "plugins": [],

@@ -2,7 +2,7 @@
   "name": "life_engine",
   "version": "3.4.0",
   "description": "生命中枢 - 独立于 DFC 的并行存在系统，具有统一事件流模型、文件搜索、TODO 系统、仿生记忆系统与 Tavily 网络能力",
-  "author": "Neo-MoFox Team",
+  "author": "Elysium",
   "dependencies": {
     "plugins": [],
     "components": []

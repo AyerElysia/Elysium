@@ -2,7 +2,7 @@
   "name": "feishu_adapter",
   "version": "0.1.0",
   "description": "飞书自建应用通道桥接：将飞书消息接入统一 life_chatter 主意识",
-  "author": "MoFox Team",
+  "author": "Elysium",
   "license": "GPL-3.0",
   "dependencies": {
     "plugins": [],

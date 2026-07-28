@@ -2,12 +2,22 @@
   "name": "MiniCPM-Live-Bridge",
   "version": "0.1.0",
   "description": "MiniCPM-o live 外部服务器桥接毛坯房：浏览器采集麦克风和桌面屏幕，Neo 负责会话入口、配置、健康检查和事件记录",
-  "author": "Neo-MoFox Team",
+  "author": "Elysium",
   "license": "GPL-3.0",
   "min_core_version": "0.1.0",
   "entry_point": "plugin.py",
-  "keywords": ["minicpm", "live", "webrtc", "screen", "voice", "multimodal"],
-  "categories": ["utility", "multimodal"],
+  "keywords": [
+    "minicpm",
+    "live",
+    "webrtc",
+    "screen",
+    "voice",
+    "multimodal"
+  ],
+  "categories": [
+    "utility",
+    "multimodal"
+  ],
   "dependencies": {
     "plugins": [],
     "components": []

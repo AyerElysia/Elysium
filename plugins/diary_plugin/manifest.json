@@ -2,7 +2,7 @@
   "name": "diary_plugin",
   "version": "2.0.0",
   "description": "日记插件 - 保留按天日记能力，并新增按聊天隔离的连续记忆空间",
-  "author": "MoFox Team",
+  "author": "Elysium",
   "dependencies": {
     "plugins": [],
     "components": []

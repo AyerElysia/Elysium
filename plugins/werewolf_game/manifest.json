@@ -1,31 +1,30 @@
 {
-    "name": "werewolf_game",
-    "version": "0.1.0",
-    "description": "QQ 群狼人杀裁判，支持爱莉以玩家视角参与",
-    "author": "Neo-MoFox",
-    "license": "GPL-3.0",
-    "dependencies": {
-        "plugins": [],
-        "components": []
+  "name": "werewolf_game",
+  "version": "0.1.0",
+  "description": "QQ 群狼人杀裁判，支持爱莉以玩家视角参与",
+  "author": "Elysium",
+  "license": "GPL-3.0",
+  "dependencies": {
+    "plugins": [],
+    "components": []
+  },
+  "include": [
+    {
+      "component_type": "service",
+      "component_name": "werewolf_game",
+      "dependencies": []
     },
-    "include": [
-        {
-            "component_type": "service",
-            "component_name": "werewolf_game",
-            "dependencies": []
-        },
-        {
-            "component_type": "event_handler",
-            "component_name": "werewolf_command_dispatch",
-            "dependencies": []
-        },
-        {
-            "component_type": "action",
-            "component_name": "werewolf_player",
-            "dependencies": []
-        }
-    ],
-    "entry_point": "plugin.py",
-    "min_core_version": "1.0.0"
+    {
+      "component_type": "event_handler",
+      "component_name": "werewolf_command_dispatch",
+      "dependencies": []
+    },
+    {
+      "component_type": "action",
+      "component_name": "werewolf_player",
+      "dependencies": []
+    }
+  ],
+  "entry_point": "plugin.py",
+  "min_core_version": "1.0.0"
 }
-
