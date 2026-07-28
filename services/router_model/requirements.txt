@@ -1,0 +1,13 @@
+# 路由决策模型服务依赖
+# 关键：系统 NVIDIA 驱动为 CUDA 12.8，必须用 cu128 的 torch。
+# vllm 0.26 默认拉 cu13（需 CUDA 13 驱动，不兼容），故锁定 vllm 0.10.2（配 torch 2.8 cu128）。
+# transformers 必须 4.x（vllm 0.10.2 与 transformers 5.x 的 tokenizer API 不兼容）。
+# bitsandbytes 用于 NF4 量化，把 4B 权重压到约 2.7GB，常驻显存友好。
+vllm==0.10.2
+transformers==4.55.0
+bitsandbytes>=0.50.0
+modelscope>=1.20.0
+# 路由决策模型服务依赖
+# vLLM 自带 torch CUDA。RTX 5090 (Blackwell) 需较新 vLLM。
+vllm>=0.6.0
+modelscope>=1.20.0

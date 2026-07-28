@@ -136,16 +136,12 @@ async def route_should_respond(
     prefix_prompt: str = "",
     fallback_prompt: str | None = None,
 ) -> SubAgentDecision:
-    """执行路由判断并返回 should_respond 结果。"""
-    try:
-        request = chatter.create_request(
-            "sub_actor",
-            "router",
-            with_reminder="sub_actor",
-        )
-    except (ValueError, KeyError):
-        return {"should_respond": True, "reason": "未找到 sub_actor 配置，默认响应"}
+    """执行路由判断并返回 should_respond 结果。
 
+    模型优先级：本地小模型 router 任务（低延迟）→ sub_actor（回退）。
+    主体性提示词与人设前缀保持不变：路由始终站在主体自己的视角判断“此刻要不要开口”，
+    而非机械硬规则。换成本地小模型只是去掉“远程前沿大模型”的延迟，不牺牲主体性。
+    """
     nickname = get_core_config().personality.nickname
     bot_id = chat_stream.bot_id or ""
     bot_id_section = f"它的 QQ 号是 {bot_id}。\n" if bot_id else ""
@@ -178,29 +174,56 @@ async def route_should_respond(
     if prefix_text:
         sub_prompt = f"{prefix_text}\n\n{sub_prompt}"
 
-    request.add_payload(LLMPayload(ROLE.SYSTEM, Text(sub_prompt)))
+    # 上下文优化：路由只需近期语境，history 只保留末尾一段（次要延迟优化）
+    _HISTORY_CHAR_BUDGET = 3000
+    fitted_history = (
+        history_text.strip()[-_HISTORY_CHAR_BUDGET:] if history_text.strip() else ""
+    )
+    fitted_unreads = unreads_text
 
-    fitted_unreads = _fit_unreads_to_sub_agent_budget(request, unreads_text)
-    if len(fitted_unreads) < len(unreads_text):
-        logger.info(
-            "Router 输入已截断以控制上下文长度: "
-            f"{len(unreads_text)} -> {len(fitted_unreads)} 字符"
-        )
+    # 依次尝试：本地 router 小模型（低延迟）→ sub_actor（回退）
+    last_error: str = ""
+    for task in ("router", "sub_actor"):
+        try:
+            request = chatter.create_request(
+                task,
+                "router",
+                with_reminder="sub_actor",
+            )
+        except (ValueError, KeyError):
+            last_error = f"{task} 未配置"
+            continue
 
-    user_parts: list[str] = []
-    if history_text.strip():
-        user_parts.append(f"<chat_history>\n{history_text.strip()}\n</chat_history>")
-    user_parts.append(f"<new_messages>\n{fitted_unreads}\n</new_messages>")
-    user_parts.append("请只判断这批新消息是否应路由给表达层继续处理。")
-    request.add_payload(LLMPayload(ROLE.USER, Text("\n\n".join(user_parts))))
+        if not getattr(request, "model_set", None):
+            last_error = f"{task} 无可用模型"
+            continue
 
-    try:
-        response = await request.send(stream=False)
-        await response
+        # 按该任务模型的上下文预算收紧未读消息
+        fitted_unreads_task = _fit_unreads_to_sub_agent_budget(request, unreads_text)
+        if len(fitted_unreads_task) < len(fitted_unreads):
+            logger.info(
+                f"Router[{task}] 输入已截断: {len(fitted_unreads)} -> {len(fitted_unreads_task)} 字符"
+            )
+        parts: list[str] = []
+        if fitted_history:
+            parts.append(f"<chat_history>\n{fitted_history.strip()}\n</chat_history>")
+        parts.append(f"<new_messages>\n{fitted_unreads_task}\n</new_messages>")
+        parts.append("请只判断这批新消息是否应路由给表达层继续处理。")
+
+        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(sub_prompt)))
+        request.add_payload(LLMPayload(ROLE.USER, Text("\n\n".join(parts))))
+
+        try:
+            response = await request.send(stream=False)
+            await response
+        except Exception as error:  # noqa: BLE001
+            last_error = f"{task} 调用失败: {error}"
+            logger.warning(f"Router {last_error}，尝试下一个任务")
+            continue
 
         content = response.message
         if not content or not content.strip():
-            logger.warning("Router 返回了空内容，默认进行响应")
+            logger.warning(f"Router[{task}] 返回了空内容，默认进行响应")
             return {"should_respond": True, "reason": "模型未返回判断内容"}
 
         try:
@@ -210,11 +233,11 @@ async def route_should_respond(
                     "should_respond": bool(result.get("should_respond", True)),
                     "reason": result.get("reason", "未提供理由"),
                 }
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001
             logger.debug(f"Router JSON 解析失败: {error} | 内容: {content[:500]}")
 
-        logger.warning(f"Router 无法找到有效的 JSON 结构: {content[:200]}...")
+        logger.warning(f"Router[{task}] 无法找到有效的 JSON 结构: {content[:200]}...")
         return {"should_respond": True, "reason": "解析 JSON 失败，默认响应"}
-    except Exception as error:
-        logger.error(f"Router 路由过程异常: {error}", exc_info=True)
-        return {"should_respond": True, "reason": f"执行异常: {error}"}
+
+    logger.error(f"Router 所有任务均不可用: {last_error}，默认响应")
+    return {"should_respond": True, "reason": f"路由模型不可用: {last_error}"}
