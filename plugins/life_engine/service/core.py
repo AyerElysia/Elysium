@@ -2141,6 +2141,9 @@ class LifeEngineService(BaseService):
 
     async def _prepare_heartbeat_context(self) -> PreparedHeartbeatContext:
         """Drain pending events and prepare one fixed heartbeat snapshot."""
+        # 多意识协调：同步活跃场景到 WorldState
+        self._sync_world_state_scenes()
+
         pending = await self.drain_pending_events()
         if pending:
             await self._append_history(pending, publish_raw=False, persist=False)
@@ -2178,6 +2181,49 @@ class LifeEngineService(BaseService):
             f"task={self._cfg().model.task_name}"
         )
         return prepared
+
+    def _sync_world_state_scenes(self) -> None:
+        """从意识注册表同步活跃场景到 WorldState（心跳协调协议）。
+
+        每次心跳准备时调用，确保 WorldState 的 active_scenes 层
+        反映当前所有活跃意识实例的状态。
+        """
+        from .world_state import SceneState
+
+        registry = self._consciousness_registry
+        active_instances = registry.get_active()
+
+        # 更新每个活跃意识的场景
+        active_scene_ids: set[str] = set()
+        for instance in active_instances:
+            for stream_id in instance.stream_ids:
+                active_scene_ids.add(stream_id)
+                existing = self._world_state.active_scenes.get(stream_id)
+                if existing is None:
+                    self._world_state.upsert_scene(SceneState(
+                        scene_id=stream_id,
+                        kind=instance.kind,
+                        display_name=instance.display_name or stream_id,
+                        status_summary="活跃",
+                        consciousness_instance_id=instance.instance_id,
+                    ))
+                elif existing.consciousness_instance_id != instance.instance_id:
+                    existing.consciousness_instance_id = instance.instance_id
+                    existing.kind = instance.kind
+
+        # 清理已无活跃意识负责的场景（标记为静默）
+        for scene_id, scene in list(self._world_state.active_scenes.items()):
+            if scene_id not in active_scene_ids and scene.status_summary != "静默":
+                scene.status_summary = "静默"
+                scene.consciousness_instance_id = ""
+
+        # 多意识存在时，在 WorldState 中记录协调信息
+        if len(active_instances) > 1:
+            instance_summary = "; ".join(
+                f"{inst.display_name or inst.instance_id}({inst.kind})"
+                for inst in active_instances
+            )
+            logger.debug(f"多意识协调: {len(active_instances)} 个活跃意识 [{instance_summary}]")
 
     async def _commit_heartbeat_context(
         self,

@@ -454,3 +454,146 @@ class LifeRetrieveMemoryTool(BaseTool):
         except Exception as exc:  # noqa: BLE001
             logger.error(f"执行智能记忆检索失败: {exc}", exc_info=True)
             return False, f"执行失败: {exc}"
+
+
+class LifeReportStateAction(BaseAction):
+    """主意识向潜意识报告场景状态变化。"""
+
+    action_name = "report_state"
+    action_description = (
+        "向潜意识报告当前场景的状态变化。"
+        "当你完成一轮重要互动、观察到关系变化、或场景状态发生转变时使用。"
+        "例如：'小星星的胃线已闭合'、'表情包收藏完成'、'直播刚开始，观众 200 人'。"
+        "这不是给用户发消息，是向自己的内在更新世界认知。"
+    )
+
+    chatter_allow: list[str] = ["life_chatter"]
+    primary_action: bool = False
+
+    async def execute(
+        self,
+        report: Annotated[str, "状态变化的描述（必填）。例如：'小星星的胃线已闭合，不再追问'。"],
+        kind: Annotated[
+            str,
+            "变化类型：relationship=关系变化，thread=话题闭合/开启，"
+            "body=身体状态，scene=场景变化，mood=情绪变化。",
+        ] = "scene",
+        entity_id: Annotated[str, "关联的实体 ID（如人物），可留空。"] = "",
+        thread_id: Annotated[str, "关联的话题 ID（如要闭合某个话题），可留空。"] = "",
+    ) -> tuple[bool, str]:
+        report_text = str(report or "").strip()
+        if not report_text:
+            return False, "report 不能为空"
+
+        life_plugin = get_plugin_manager().get_plugin("life_engine")
+        if life_plugin is None:
+            return False, "life_engine 未加载"
+
+        service = getattr(life_plugin, "service", None)
+        if service is None or not hasattr(service, "world_state"):
+            return False, "life_engine 服务不可用"
+
+        try:
+            from plugins.life_engine.service.world_state import OpenThread
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc).isoformat()
+            ws = service.world_state
+
+            if kind == "thread" and thread_id:
+                # 闭合或更新话题
+                ws.resolve_thread(thread_id)
+            elif kind == "relationship" and entity_id:
+                # 更新关系状态
+                rel = ws.relationships.get(entity_id)
+                if rel:
+                    rel.status_summary = report_text
+                    rel.last_interaction_at = now
+            elif kind == "body":
+                ws.embodied_state.body_summary = report_text
+                ws.embodied_state.updated_at = now
+            elif kind == "mood":
+                ws.embodied_state.mood = report_text
+                ws.embodied_state.updated_at = now
+
+            # 无论哪种类型，都记录为一个未闭合话题（如果是开启）或纯记录
+            if kind == "thread" and not thread_id:
+                ws.add_thread(OpenThread(
+                    thread_id=f"report_{int(datetime.now(timezone.utc).timestamp())}",
+                    kind="topic",
+                    title=report_text,
+                    status="open",
+                    created_at=now,
+                    updated_at=now,
+                ))
+
+            ws.bump_revision(ws.last_updated_sequence + 1, now)
+            service.save_world_state()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"报告状态失败: {exc}")
+            return False, f"报告状态失败: {exc}"
+
+        return True, f"状态已更新到内在世界（{kind}: {report_text[:60]}）"
+
+
+class LifeInnerQueryTool(BaseTool):
+    """主意识向潜意识查询已知事实。"""
+
+    tool_name = "inner_query"
+    tool_description = (
+        "向自己的内在世界查询已知事实。"
+        "当你不确定某个人、某个话题、某个承诺的当前状态时使用。"
+        "它会从潜意识的结构化世界模型中检索，比翻聊天记录更快。"
+        "返回的是你自己已经知道的东西，不是新信息。"
+    )
+    chatter_allow: list[str] = ["life_chatter"]
+
+    async def execute(
+        self,
+        query: Annotated[str, "想查询的内容（必填）。例如：'小星星的身体状况'、'我和妹妹的关系'、'当前未闭合的话题'。"],
+    ) -> tuple[bool, str]:
+        query_text = str(query or "").strip()
+        if not query_text:
+            return False, "query 不能为空"
+
+        life_plugin = get_plugin_manager().get_plugin("life_engine")
+        if life_plugin is None:
+            return False, "life_engine 未加载"
+
+        service = getattr(life_plugin, "service", None)
+        if service is None or not hasattr(service, "world_state"):
+            return False, "life_engine 服务不可用"
+
+        try:
+            ws = service.world_state
+            results: list[str] = []
+            query_lower = query_text.lower()
+
+            # 搜索关系
+            for entity_id, rel in ws.relationships.items():
+                searchable = f"{rel.display_name} {rel.status_summary} {rel.emotional_tone} {' '.join(rel.key_facts)}".lower()
+                if any(word in searchable for word in query_lower.split()):
+                    results.append(rel.render_line())
+
+            # 搜索话题
+            for thread in ws.open_threads:
+                searchable = f"{thread.title} {thread.summary} {thread.kind}".lower()
+                if any(word in searchable for word in query_lower.split()):
+                    results.append(thread.render_line())
+
+            # 搜索身体/情绪
+            body_searchable = f"{ws.embodied_state.body_summary} {ws.embodied_state.mood}".lower()
+            if any(word in body_searchable for word in query_lower.split()):
+                results.extend(ws.embodied_state.render_lines())
+
+            # 搜索场景
+            for scene_id, scene in ws.active_scenes.items():
+                searchable = f"{scene.display_name} {scene.status_summary}".lower()
+                if any(word in searchable for word in query_lower.split()):
+                    results.append(scene.render_line())
+
+            if not results:
+                return True, f"内在世界中没有找到与「{query_text}」相关的已知事实。可能需要翻聊天记录。"
+
+            return True, "内在世界已知：\n" + "\n".join(results[:10])
+        except Exception as exc:  # noqa: BLE001
+            return False, f"查询内在世界失败: {exc}"
