@@ -18,6 +18,7 @@ from src.kernel.llm import (
     Image,
     LLMContextManager,
     LLMPayload,
+    ReasoningText,
     ROLE,
     Text,
     ToolCall,
@@ -93,6 +94,9 @@ def is_summary_payload(payload: LLMPayload) -> bool:
 
 
 def summarize_content_part(item: object, *, max_chars: int = DEFAULT_MAX_PART_CHARS) -> str:
+    # 思考痕迹不应进入压缩摘要——它只服务于当前轮次的模型连续性。
+    if isinstance(item, ReasoningText):
+        return ""
     if isinstance(item, Text):
         text = item.text
     elif isinstance(item, ToolCall):
