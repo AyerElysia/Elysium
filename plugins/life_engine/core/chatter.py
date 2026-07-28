@@ -1622,6 +1622,10 @@ class LifeChatter(BaseChatter):
             for item in (
                 cls._serialize_content_part(part)
                 for part in (getattr(payload, "content", None) or [])
+                # 思考痕迹（reasoning_text）只服务于当前轮次的模型连续性，
+                # 不应持久化到滚动上下文快照——跨轮次堆积会浪费上下文预算
+                # 并以过时的推理痕迹干扰后续生成。
+                if not isinstance(part, ReasoningText)
             )
             if item is not None
         ]
