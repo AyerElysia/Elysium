@@ -241,39 +241,74 @@ class RawEventStore:
         except OSError:
             pass  # 轮转失败不阻塞写入
 
-    async def append(self, event: LifeEvent) -> None:
+    def _append_sync(self, event: LifeEvent) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._maybe_rotate()
         line = json.dumps(life_event_to_dict(event), ensure_ascii=False)
         with self._path.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
 
+    async def append(self, event: LifeEvent) -> None:
+        await asyncio.to_thread(self._append_sync, event)
+
+    def _append_many_sync(self, events: list[LifeEvent]) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._maybe_rotate()
+        lines = [
+            json.dumps(life_event_to_dict(event), ensure_ascii=False)
+            for event in events
+        ]
+        with self._path.open("a", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+
     async def append_many(self, events: list[LifeEvent]) -> None:
         if not events:
             return
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._maybe_rotate()
-        with self._path.open("a", encoding="utf-8") as handle:
-            for event in events:
-                handle.write(json.dumps(life_event_to_dict(event), ensure_ascii=False) + "\n")
+        await asyncio.to_thread(self._append_many_sync, events)
 
-    async def read_tail(self, limit: int = 100) -> list[LifeEvent]:
+    def _read_tail_sync(self, limit: int) -> list[LifeEvent]:
         if limit <= 0 or not self._path.exists():
             return []
-        lines = self._path.read_text(encoding="utf-8").splitlines()
-        return self._decode_lines(lines[-limit:])
+        block_size = 64 * 1024
+        chunks: list[bytes] = []
+        newline_count = 0
+        with self._path.open("rb") as handle:
+            handle.seek(0, 2)
+            position = handle.tell()
+            while position > 0 and newline_count <= limit:
+                read_size = min(block_size, position)
+                position -= read_size
+                handle.seek(position)
+                chunk = handle.read(read_size)
+                chunks.append(chunk)
+                newline_count += chunk.count(b"\n")
+        text = b"".join(reversed(chunks)).decode("utf-8", errors="replace")
+        return self._decode_lines(text.splitlines()[-limit:])
 
-    async def read_since(self, sequence: int, *, limit: int | None = None) -> list[LifeEvent]:
+    async def read_tail(self, limit: int = 100) -> list[LifeEvent]:
+        return await asyncio.to_thread(self._read_tail_sync, limit)
+
+    def _read_since_sync(self, sequence: int, limit: int | None) -> list[LifeEvent]:
         if not self._path.exists():
             return []
         result: list[LifeEvent] = []
-        for line in self._path.read_text(encoding="utf-8").splitlines():
-            for event in self._decode_lines([line]):
-                if event.sequence > sequence:
-                    result.append(event)
-                    if limit is not None and len(result) >= limit:
-                        return result
+        with self._path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                events = self._decode_lines([line])
+                if not events or events[0].sequence <= sequence:
+                    continue
+                result.append(events[0])
+                if limit is not None and len(result) >= limit:
+                    break
         return result
+
+    async def read_since(
+        self,
+        sequence: int,
+        *,
+        limit: int | None = None,
+    ) -> list[LifeEvent]:
+        return await asyncio.to_thread(self._read_since_sync, sequence, limit)
 
     @staticmethod
     def _decode_lines(lines: list[str]) -> list[LifeEvent]:

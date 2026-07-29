@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -65,6 +66,48 @@ async def test_raw_event_store_appends_and_reads_since(tmp_path: Path) -> None:
     assert (tmp_path / RAW_EVENT_LOG_FILE).exists()
     assert [event.content for event in await store.read_since(1)] == ["second"]
     assert [event.sequence for event in await store.read_tail(2)] == [1, 2]
+
+
+async def test_raw_event_store_read_tail_uses_thread_offload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RawEventStore(tmp_path)
+    await store.append(life_event_from_legacy(_event(1)))
+    original = asyncio.to_thread
+    calls: list[str] = []
+
+    async def tracked_to_thread(func, /, *args, **kwargs):
+        calls.append(func.__name__)
+        return await original(func, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", tracked_to_thread)
+
+    assert [event.sequence for event in await store.read_tail(1)] == [1]
+    assert calls == ["_read_tail_sync"]
+
+
+async def test_raw_event_store_publish_returns_after_persistence(tmp_path: Path) -> None:
+    store = RawEventStore(tmp_path)
+    event = life_event_from_legacy(_event(1, content="durable"))
+
+    await store.append(event)
+
+    assert "durable" in store.path.read_text(encoding="utf-8")
+
+
+async def test_raw_event_store_tail_handles_utf8_across_blocks(tmp_path: Path) -> None:
+    store = RawEventStore(tmp_path)
+    events = [
+        life_event_from_legacy(_event(i, content=f"中文事件-{i}-" + "夏" * 400))
+        for i in range(1, 301)
+    ]
+    await store.append_many(events)
+
+    tail = await store.read_tail(3)
+
+    assert [event.sequence for event in tail] == [298, 299, 300]
+    assert tail[-1].content.startswith("中文事件-300")
 
 
 def test_attention_router_summarizes_low_salience_flood() -> None:
