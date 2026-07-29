@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TTS 参考音频工作台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>参考音频工作台</h1>
+  <span id="server-status" class="badge badge-wait" role="status" aria-live="polite">检测服务中…</span>
+  <span class="spacer"></span>
+  <span id="config-path" class="hint"></span>
+</header>
+
+<main class="layout">
+  <!-- ============ 左：风格 ============ -->
+  <section class="panel" aria-labelledby="styles-title">
+    <h2 id="styles-title">插件风格</h2>
+    <div class="field">
+      <label for="style-select">当前编辑</label>
+      <select id="style-select"></select>
+    </div>
+
+    <div class="field">
+      <label for="main-ref">主参考音频<span class="hint"> 必须 3~10 秒</span></label>
+      <input id="main-ref" type="text" spellcheck="false">
+      <div id="main-ref-info" class="ref-info"></div>
+      <div class="row">
+        <button id="main-ref-play" type="button" class="ghost">试听</button>
+        <button id="main-ref-sidecar" type="button" class="ghost">读取旁边文本</button>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="prompt-text">参考文本<span class="hint"> 要和主参考音频内容一致</span></label>
+      <textarea id="prompt-text" rows="3" spellcheck="false"></textarea>
+    </div>
+
+    <div class="field">
+      <label for="prompt-language">参考音频语言</label>
+      <select id="prompt-language">
+        <option value="zh">中文 zh</option>
+        <option value="ja">日语 ja</option>
+        <option value="en">英语 en</option>
+        <option value="all_zh">全中文 all_zh</option>
+        <option value="auto">自动 auto</option>
+      </select>
+    </div>
+
+    <div class="field">
+      <label>辅助参考音频<span class="hint"> 音色融合用，不限时长，可为空</span></label>
+      <ul id="aux-list" class="aux-list"></ul>
+    </div>
+
+    <div class="row">
+      <button id="save-style" type="button" class="primary">写回插件配置</button>
+      <button id="reload-style" type="button" class="ghost">放弃修改</button>
+    </div>
+    <p id="save-hint" class="hint" role="status" aria-live="polite"></p>
+  </section>
+  <!-- ============ 中：素材库 ============ -->
+  <section class="panel panel-wide" aria-labelledby="library-title">
+    <h2 id="library-title">素材库</h2>
+    <div class="row">
+      <select id="root-select" aria-label="素材库"></select>
+      <input id="search-input" type="search" placeholder="按文件名搜索" spellcheck="false">
+      <label class="check"><input id="recursive-check" type="checkbox">含子目录</label>
+    </div>
+    <div class="row">
+      <label class="check"><input id="only-valid-check" type="checkbox">只看 3~10 秒</label>
+      <span id="root-note" class="hint"></span>
+    </div>
+
+    <nav id="breadcrumb" class="breadcrumb" aria-label="目录路径"></nav>
+
+    <div class="table-wrap">
+      <table class="filelist">
+        <thead>
+          <tr><th scope="col">文件</th><th scope="col">时长</th><th scope="col">大小</th><th scope="col">操作</th></tr>
+        </thead>
+        <tbody id="file-body"></tbody>
+      </table>
+      <p id="browse-status" class="hint" role="status" aria-live="polite">载入中…</p>
+    </div>
+
+    <div class="row">
+      <button id="page-prev" type="button" class="ghost">上一页</button>
+      <span id="page-info" class="hint"></span>
+      <button id="page-next" type="button" class="ghost">下一页</button>
+    </div>
+  </section>
+
+  <!-- ============ 右：试听 / 裁剪 ============ -->
+  <section class="panel" aria-labelledby="preview-title">
+    <h2 id="preview-title">试听与裁剪</h2>
+
+    <div class="field">
+      <label for="player">播放</label>
+      <audio id="player" controls preload="none"></audio>
+      <p id="player-name" class="hint"></p>
+    </div>
+
+    <fieldset class="field">
+      <legend>裁剪导入到 ref 目录</legend>
+      <p id="clip-source" class="hint">先在素材库里点「裁剪」</p>
+      <div class="row">
+        <label for="clip-start">起点秒</label>
+        <input id="clip-start" type="number" min="0" step="0.1" value="0">
+        <label for="clip-end">终点秒</label>
+        <input id="clip-end" type="number" min="0" step="0.1">
+      </div>
+      <div class="row">
+        <label for="clip-name">文件名</label>
+        <input id="clip-name" type="text" spellcheck="false">
+      </div>
+      <div class="row">
+        <label for="clip-text">参考文本</label>
+        <input id="clip-text" type="text" spellcheck="false">
+      </div>
+      <div class="row">
+        <button id="clip-preview" type="button" class="ghost">试听这一段</button>
+        <button id="clip-import" type="button" class="primary">裁剪并导入</button>
+      </div>
+      <p id="clip-hint" class="hint" role="status" aria-live="polite"></p>
+    </fieldset>
+
+    <fieldset class="field">
+      <legend>合成试听</legend>
+      <textarea id="tts-text" rows="3" spellcheck="false">今天的风也很温柔呢，要一起走走吗？</textarea>
+      <div class="row">
+        <label class="check"><input id="switch-weights" type="checkbox" checked>顺带切换该风格的模型权重</label>
+      </div>
+      <div class="row">
+        <button id="synthesize" type="button" class="primary">用当前参考合成</button>
+      </div>
+      <p id="tts-hint" class="hint" role="status" aria-live="polite"></p>
+    </fieldset>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

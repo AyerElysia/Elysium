@@ -745,3 +745,39 @@ async def test_startup_recovery_noop_when_everything_clean(tmp_path: Path) -> No
     final_node_count = service._db.execute("SELECT COUNT(*) FROM memory_nodes").fetchone()[0]
     assert final_node_count == initial_node_count
 
+
+async def test_startup_recovery_requeues_unembedded_nodes_without_jobs(tmp_path: Path) -> None:
+    """有节点但从无入队任务（历史遗留）的未同步节点，启动时应被补入队。"""
+    service = _make_service(tmp_path)
+    await service.initialize()
+
+    # 创建工作区文件
+    workspace_file = tmp_path / "notes" / "legacy_note.md"
+    workspace_file.parent.mkdir(parents=True, exist_ok=True)
+    workspace_file.write_text("# 历史遗留笔记\n内容", encoding="utf-8")
+
+    # 直接插入节点（模拟旧版本写入，未入队）
+    node_id = "file:legacy000001"
+    service._db.execute(
+        """INSERT INTO memory_nodes
+           (node_id, node_type, file_path, content_hash, created_at, updated_at, embedding_synced)
+           VALUES (?, 'file', 'notes/legacy_note.md', 'abc123hash', 1, 1, 0)""",
+        (node_id,),
+    )
+    service._db.commit()
+
+    # 确认没有对应任务
+    job_count = service._db.execute(
+        "SELECT COUNT(*) FROM memory_index_jobs WHERE node_id = ?", (node_id,)
+    ).fetchone()[0]
+    assert job_count == 0, "遗留节点不应有任何任务"
+
+    # 触发启动恢复
+    await service._startup_recovery()
+
+    # 应该补入队了一个 pending 任务
+    pending_count = service._db.execute(
+        "SELECT COUNT(*) FROM memory_index_jobs WHERE node_id = ? AND status = 'pending'",
+        (node_id,),
+    ).fetchone()[0]
+    assert pending_count == 1, "遗留节点应被补入队一个 pending 任务"

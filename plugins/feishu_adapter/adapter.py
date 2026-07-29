@@ -26,6 +26,10 @@ logger = get_logger("FeishuAdapter", color="#00D6B9")
 PLATFORM = "feishu"
 _ADAPTER_INSTANCE: "FeishuAdapter | None" = None
 
+# 飞书原始身份标识的前缀。这些串出现在「人名」位置时说明没解析出真名，
+# 对上游（记忆、关系、人物画像）来说等于没有身份信息——她只能认错人。
+_RAW_ID_PREFIXES = ("ou_", "on_", "od_", "oc_", "cli_")
+
 
 def get_feishu_adapter() -> "FeishuAdapter | None":
     return _ADAPTER_INSTANCE
@@ -57,6 +61,10 @@ class FeishuAdapter(BaseAdapter):
         self._main_loop: asyncio.AbstractEventLoop | None = None
         self._long_connection_thread: threading.Thread | None = None
         self._long_connection_client: Any | None = None
+        # open_id/union_id -> 真实显示名。值为 "" 表示查过但查不到，
+        # 用负缓存避免每条消息都去撞一次没权限的接口。
+        self._display_name_cache: dict[str, str] = {}
+        self._display_name_cached_at: dict[str, float] = {}
         set_feishu_adapter(self)
         logger.info("FeishuAdapter 初始化完成")
 
@@ -287,6 +295,23 @@ class FeishuAdapter(BaseAdapter):
             user_id = normalized.get("user_id", "")
             union_id = normalized.get("union_id", "")
             sender_name = normalized["sender_name"]
+
+            # @ 段里飞书会直接带 name，白捡的映射先收进缓存
+            self._harvest_mention_names(normalized.get("mentions") or [])
+
+            # 没配 alias 的用户，_sender_name 只能退回 union_id/open_id 这种原始 ID。
+            # 她看到的"人名"就成了 on_41a2efd3...，同一个群里几个人全是这种串，
+            # 自然认不出谁是谁。这里补一次真名解析。
+            if self._looks_like_raw_id(sender_name):
+                resolved = await self._resolve_display_name(
+                    open_id=open_id,
+                    union_id=union_id,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                )
+                if resolved:
+                    sender_name = resolved
+
             content = normalized["content"]
             timestamp = normalized["timestamp"]
             media_refs = normalized.get("media_refs") or []
@@ -710,6 +735,172 @@ class FeishuAdapter(BaseAdapter):
             if key and name:
                 aliases[key] = name
         return aliases
+
+    @staticmethod
+    def _looks_like_raw_id(name: str) -> bool:
+        """判断这个"名字"其实是一串飞书原始 ID。
+
+        飞书的消息事件里 sender 只带 ID，不带 display name。原本 ``_sender_name``
+        的兜底链最后会退到 union_id / open_id，于是她在上下文里看到的"人名"是
+        ``on_41a2efd323503ed77bd4ce206f309db7`` 这种东西——两个人的 ID 长得一样乱，
+        她自然就认错人。这里识别出这种伪名字，交给 API 去换真名。
+        """
+        value = name.strip()
+        if not value:
+            return True
+        return value.startswith(_RAW_ID_PREFIXES)
+
+    def _cache_display_name(self, key: str, name: str) -> None:
+        """写入显示名缓存；``name`` 为空表示负缓存。"""
+        if not key:
+            return
+        self._display_name_cache[key] = name
+        self._display_name_cached_at[key] = time.time()
+
+    def _cached_display_name(self, key: str) -> str | None:
+        """读显示名缓存，超过 TTL 视为未命中。返回 None 表示未命中。"""
+        if not key or key not in self._display_name_cache:
+            return None
+        ttl = float(self._config().identity.display_name_cache_ttl)
+        cached_at = self._display_name_cached_at.get(key, 0.0)
+        if ttl > 0 and time.time() - cached_at > ttl:
+            self._display_name_cache.pop(key, None)
+            self._display_name_cached_at.pop(key, None)
+            return None
+        return self._display_name_cache[key]
+
+    def _harvest_mention_names(self, mentions: list[Any]) -> None:
+        """从 @ 段里白捡显示名。
+
+        飞书在 mentions 里是会给 name 的，而 sender 里不给。群里只要有人被 @ 过，
+        就能零成本地把他的 ID→真名 记下来，之后他自己发言时就有名字可用了。
+        """
+        for mention in mentions or []:
+            if not isinstance(mention, dict):
+                continue
+            name = str(mention.get("name") or "").strip()
+            if not name or self._looks_like_raw_id(name):
+                continue
+            mention_id = mention.get("id")
+            if isinstance(mention_id, dict):
+                for key in ("open_id", "union_id", "user_id"):
+                    value = str(mention_id.get(key) or "").strip()
+                    if value:
+                        self._cache_display_name(value, name)
+            elif mention_id:
+                self._cache_display_name(str(mention_id).strip(), name)
+
+    async def _resolve_display_name(
+        self,
+        *,
+        open_id: str,
+        union_id: str,
+        user_id: str,
+        chat_id: str,
+    ) -> str:
+        """把发送者 ID 换成人类可读的名字。
+
+        顺序：本地缓存（含 @ 段白捡的）→ 通讯录接口 → 群成员列表。
+        全部失败时返回 ""，由调用方保留原有兜底，绝不因为取名失败而丢消息。
+
+        Args:
+            open_id: 发送者 open_id
+            union_id: 发送者 union_id
+            user_id: 发送者 user_id
+            chat_id: 消息所在会话 ID，用于群成员列表兜底
+
+        Returns:
+            str: 解析到的显示名；未解析到返回空串
+        """
+        keys = [k for k in (open_id, union_id, user_id) if k]
+
+        # 先扫一遍正命中：任一 ID 上挂着真名就直接用，
+        # 不能因为 open_id 上有负缓存就放弃 union_id 上已经捡到的名字。
+        negative_hit = False
+        for key in keys:
+            cached = self._cached_display_name(key)
+            if cached:
+                return cached
+            if cached == "":
+                negative_hit = True
+        if negative_hit:
+            # 上次查过且查不到，TTL 内不再打接口
+            return ""
+
+        config = self._config()
+        if not config.identity.resolve_display_names:
+            return ""
+        if not config.app.app_id or not config.app.app_secret:
+            # 没凭据就拿不到 tenant_access_token，打接口只是白白抛异常。
+            # 这里不写负缓存：等凭据配上以后立刻就能正常解析，不用等 TTL 过期。
+            return ""
+
+        name = ""
+        if open_id:
+            name = await self._fetch_contact_name(open_id)
+        if not name and chat_id:
+            name = await self._fetch_name_from_chat_members(chat_id, keys)
+
+        # 无论成功与否都写缓存：成功避免重复查询，失败写负缓存避免每条消息都打接口
+        for key in keys:
+            self._cache_display_name(key, name)
+        return name
+
+    async def _fetch_contact_name(self, open_id: str) -> str:
+        """查通讯录接口拿显示名。需要 contact:user.base:readonly 权限。"""
+        try:
+            data = await self._get_json(
+                f"/open-apis/contact/v3/users/{open_id}?user_id_type=open_id"
+            )
+        except Exception as exc:
+            logger.debug(f"飞书通讯录查名失败: open_id={open_id} error={exc}")
+            return ""
+        user = (data.get("data") or {}).get("user") or {}
+        for key in ("nickname", "name", "en_name"):
+            value = str(user.get(key) or "").strip()
+            if value and not self._looks_like_raw_id(value):
+                return value
+        return ""
+
+    async def _fetch_name_from_chat_members(self, chat_id: str, keys: list[str]) -> str:
+        """从群成员列表里找名字。
+
+        通讯录接口常因权限未开而 403，群成员列表只要 bot 在群里通常就能读，
+        所以留作兜底。
+        """
+        try:
+            data = await self._get_json(
+                f"/open-apis/im/v1/chats/{chat_id}/members"
+                "?member_id_type=open_id&page_size=100"
+            )
+        except Exception as exc:
+            logger.debug(f"飞书群成员查名失败: chat_id={chat_id} error={exc}")
+            return ""
+
+        wanted = {k for k in keys if k}
+        for item in (data.get("data") or {}).get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            member_id = str(item.get("member_id") or "").strip()
+            if member_id and member_id in wanted:
+                name = str(item.get("name") or "").strip()
+                if name and not self._looks_like_raw_id(name):
+                    return name
+        return ""
+
+    async def _get_json(self, path: str) -> dict[str, Any]:
+        """GET 飞书开放平台接口并校验业务 code。"""
+        token = await self._get_tenant_access_token()
+        resp = await self._request_with_retry(
+            "GET",
+            self._api_url(path),
+            timeout=10.0,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        data = self._decode_response(resp)
+        if int(data.get("code", 0)) != 0:
+            raise RuntimeError(f"Feishu API failed: path={path}, response={data}")
+        return data
 
     @staticmethod
     def _parse_time(raw_time: Any) -> float:

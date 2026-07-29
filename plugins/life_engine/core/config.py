@@ -209,6 +209,12 @@ class LifeEngineConfig(BaseConfig):
             description="潜意识摘要单条目的最大字符数。",
         )
 
+        subconscious_summary_max_entries: int = Field(
+            default=60,
+            ge=10,
+            description="潜意识规范摘要保留的最大条目数，超出时裁剪保留最新。",
+        )
+
         subconscious_recent_groups: int = Field(
             default=5,
             ge=0,

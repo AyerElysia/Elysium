@@ -7,7 +7,6 @@ from types import SimpleNamespace
 from typing import Any
 import wave
 
-import pytest
 
 from plugins.neko_surface.adapter import NekoSurfaceAdapter, PLATFORM, set_neko_surface_adapter
 from plugins.neko_surface.protocol import SurfaceEvent
@@ -41,7 +40,7 @@ class _FakeTTSService:
         self.audio = audio
         self.calls: list[tuple[str, str]] = []
         self._config = SimpleNamespace(
-            higgs_cloud=SimpleNamespace(response_format="mp3"),
+            tts_advanced=SimpleNamespace(media_type="wav"),
         )
 
     async def generate_voice(self, text: str, style: str) -> str:
@@ -63,10 +62,9 @@ def _jpeg_image() -> bytes:
     return b"\xff\xd8\xff\xe0surface-jpeg"
 
 
-def test_tts_mime_type_uses_media_type_for_non_higgs_engine() -> None:
+def test_tts_mime_type_uses_media_type_from_tts_advanced() -> None:
     service = SimpleNamespace(
         _config=SimpleNamespace(
-            tts=SimpleNamespace(engine="gpt_sovits"),
             tts_advanced=SimpleNamespace(media_type="wav"),
         )
     )
@@ -245,7 +243,7 @@ async def test_outgoing_message_without_tts_service_stays_text_only(monkeypatch)
     assert gateway.events[0][1]["turn_id"] == "reply-1"
 
 
-async def test_outgoing_surface_text_gets_one_automatic_higgs_voice(monkeypatch) -> None:
+async def test_outgoing_surface_text_gets_one_automatic_voice(monkeypatch) -> None:
     gateway = _FakeGateway()
     adapter = NekoSurfaceAdapter(
         _DummySink(),
@@ -280,7 +278,7 @@ async def test_outgoing_surface_text_gets_one_automatic_higgs_voice(monkeypatch)
     ]
     voice_payload = gateway.events[2][1]["payload"]
     assert voice_payload["data"] == "YQ=="
-    assert voice_payload["mime_type"] == "audio/mpeg"
+    assert voice_payload["mime_type"] == "audio/wav"
     assert voice_payload["speech_id"] == "reply-tts-1"
 
 

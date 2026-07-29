@@ -194,6 +194,24 @@ class FeishuAdapterConfig(BaseConfig):
             tag="user",
             order=0,
         )
+        resolve_display_names: bool = Field(
+            default=True,
+            description=(
+                "没有配昵称映射时，调飞书通讯录/群成员接口把 open_id 换成真实昵称。"
+                "关掉则回落为原始 ID"
+            ),
+            label="自动解析真实昵称",
+            tag="user",
+            order=1,
+        )
+        display_name_cache_ttl: float = Field(
+            default=21600.0,
+            description="昵称解析结果的缓存秒数，避免每条消息都打接口",
+            label="昵称缓存时长(秒)",
+            input_type="number",
+            tag="user",
+            order=2,
+        )
 
     plugin: PluginSection = Field(default_factory=PluginSection)
     app: AppSection = Field(default_factory=AppSection)

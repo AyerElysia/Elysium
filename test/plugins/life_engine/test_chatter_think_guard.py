@@ -268,7 +268,8 @@ def test_life_send_file_sends_group_file(
     assert sent.extra["target_group_name"] == "群聊"
 
 
-def test_life_send_file_action_only_registered_with_life_chatter() -> None:
+def test_life_send_file_action_is_not_registered() -> None:
+    """零使用的旧文件 action 保留实现兼容，但不再暴露给意识实例。"""
     enabled_config = LifeEngineConfig()
     enabled_config.chatter.enabled = True
     enabled_components = LifeEnginePlugin(enabled_config).get_components()
@@ -278,7 +279,7 @@ def test_life_send_file_action_only_registered_with_life_chatter() -> None:
     disabled_components = LifeEnginePlugin(disabled_config).get_components()
 
     assert LifeSendFileAction.chatter_allow == ["life_chatter"]
-    assert LifeSendFileAction in enabled_components
+    assert LifeSendFileAction not in enabled_components
     assert LifeSendFileAction not in disabled_components
 
 

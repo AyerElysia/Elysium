@@ -126,15 +126,9 @@ class NekoSurfaceAdapter(BaseAdapter):
     def _tts_mime_type(service: Any) -> str:
         """Map the configured TTS response format to a browser/decoder MIME."""
         config = getattr(service, "_config", None)
-        engine = str(getattr(getattr(config, "tts", None), "engine", "") or "").strip().lower()
-        format_config = (
-            getattr(config, "higgs_cloud", None)
-            if engine == "higgs_cloud"
-            else getattr(config, "tts_advanced", None)
-        )
-        format_field = "response_format" if engine == "higgs_cloud" else "media_type"
+        format_config = getattr(config, "tts_advanced", None)
         response_format = str(
-            getattr(format_config, format_field, "mp3") or "mp3"
+            getattr(format_config, "media_type", "wav") or "wav"
         ).strip().lower()
         return {
             "mp3": "audio/mpeg",
@@ -145,7 +139,7 @@ class NekoSurfaceAdapter(BaseAdapter):
             "aac": "audio/aac",
             "flac": "audio/flac",
             "pcm": "audio/pcm",
-        }.get(response_format, "audio/mpeg")
+        }.get(response_format, "audio/wav")
 
     def _invalidate_surface_tts(self, reason: str) -> list[asyncio.Task[Any]]:
         """Cancel all queued voices when the active user turn is superseded."""

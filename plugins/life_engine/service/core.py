@@ -99,7 +99,7 @@ from .subconscious_context import (
     SubconsciousSummary,
 )
 from .world_state import PerceptionFilter, WorldState
-from .consciousness import ConsciousnessRegistry, ConsciousnessInstance, CHAT_GLOBAL_INSTANCE_ID
+from .consciousness import ConsciousnessRegistry
 from .event_bus import LifeEventBus, RawEventStore
 from .integrations import (
     DFCIntegration,
@@ -203,11 +203,16 @@ class LifeEngineService(BaseService):
             recent_groups = max(0, int(getattr(settings, "subconscious_recent_groups", None) or 5))
         except (TypeError, ValueError):
             recent_groups = 5
+        try:
+            summary_max_entries = max(10, int(getattr(settings, "subconscious_summary_max_entries", None) or 60))
+        except (TypeError, ValueError):
+            summary_max_entries = 60
         self._subconscious_context: SubconsciousContextManager = SubconsciousContextManager(
             max_chars=context_budget,
             recent_group_count=recent_groups,
             summary_max_chars=summary_max,
             entry_max_chars=entry_max,
+            summary_max_entries=summary_max_entries,
         )
         self._sleep_state_active: bool = False
         self._self_pause_skip_logged: bool = False
@@ -672,7 +677,6 @@ class LifeEngineService(BaseService):
             pending_events = list(self._pending_events)
             event_history = list(self._event_history)
             state_snapshot = asdict(self._state)
-            inner_state = None
 
         life_events = [
             self._serialize_life_event(event)
@@ -2143,6 +2147,7 @@ class LifeEngineService(BaseService):
         """Drain pending events and prepare one fixed heartbeat snapshot."""
         # 多意识协调：同步活跃场景到 WorldState
         self._sync_world_state_scenes()
+        self.save_world_state()
 
         pending = await self.drain_pending_events()
         if pending:
@@ -2172,7 +2177,10 @@ class LifeEngineService(BaseService):
             drained_message_count=len(pending),
             history_message_count=len(snapshot_events),
             source_count=len({event.source for event in snapshot_events}),
-            content=prepared.content,
+            content_chars=len(prepared.content),
+        )
+        logger.debug(
+            f"潜意识上下文全文:\n{prepared.content}"
         )
         logger.info(
             "life_engine 已准备唤醒上下文: "
@@ -3084,8 +3092,8 @@ class LifeEngineService(BaseService):
         )
 
         if reply_text:
-            logger.info(
-                "life_engine 心跳模型回复: "
+            logger.debug(
+                f"life_engine 心跳模型回复: "
                 f"#{self._state.heartbeat_count} "
                 f"{_shorten_text(reply_text, max_length=240)}"
             )

@@ -200,17 +200,50 @@ def life_event_from_dict(data: dict[str, Any]) -> LifeEvent:
 
 
 class RawEventStore:
-    """Append-only JSONL store for raw life events."""
+    """Append-only JSONL store for raw life events.
 
-    def __init__(self, workspace_path: str | Path, filename: str = RAW_EVENT_LOG_FILE) -> None:
+    当文件超过 max_bytes 时自动轮转：当前文件重命名为 .1，
+    旧的 .1 重命名为 .2，超出 max_archives 的最旧归档被删除。
+    """
+
+    def __init__(
+        self,
+        workspace_path: str | Path,
+        filename: str = RAW_EVENT_LOG_FILE,
+        max_bytes: int = 50 * 1024 * 1024,
+        max_archives: int = 2,
+    ) -> None:
         self._path = Path(workspace_path).resolve() / filename
+        self._max_bytes = max_bytes
+        self._max_archives = max_archives
 
     @property
     def path(self) -> Path:
         return self._path
 
+    def _maybe_rotate(self) -> None:
+        """尺寸轮转：超过阈值时将当前文件归档。"""
+        try:
+            if not self._path.exists() or self._path.stat().st_size < self._max_bytes:
+                return
+            # 删除最旧的归档
+            oldest = self._path.with_suffix(f".jsonl.{self._max_archives}")
+            if oldest.exists():
+                oldest.unlink()
+            # 依次后移已有归档
+            for i in range(self._max_archives - 1, 0, -1):
+                src = self._path.with_suffix(f".jsonl.{i}")
+                dst = self._path.with_suffix(f".jsonl.{i + 1}")
+                if src.exists():
+                    src.rename(dst)
+            # 当前文件 -> .1
+            self._path.rename(self._path.with_suffix(".jsonl.1"))
+        except OSError:
+            pass  # 轮转失败不阻塞写入
+
     async def append(self, event: LifeEvent) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._maybe_rotate()
         line = json.dumps(life_event_to_dict(event), ensure_ascii=False)
         with self._path.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
@@ -219,6 +252,7 @@ class RawEventStore:
         if not events:
             return
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._maybe_rotate()
         with self._path.open("a", encoding="utf-8") as handle:
             for event in events:
                 handle.write(json.dumps(life_event_to_dict(event), ensure_ascii=False) + "\n")

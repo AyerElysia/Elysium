@@ -14,8 +14,8 @@ from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.core.plugin import LifeEnginePlugin
 
 
-def test_life_engine_exposes_compat_tools_when_chatter_enabled() -> None:
-    """启用 life_chatter 时应暴露兼容工具层。"""
+def test_life_engine_exposes_only_active_compat_tools_when_chatter_enabled() -> None:
+    """意识实例只暴露活跃工具，不重新注册已收束的别名和零使用 action。"""
     config = LifeEngineConfig()
     config.chatter.enabled = True
     plugin = LifeEnginePlugin(config=config)
@@ -23,12 +23,13 @@ def test_life_engine_exposes_compat_tools_when_chatter_enabled() -> None:
     component_names = {getattr(comp, "__name__", "") for comp in plugin.get_components()}
 
     assert "LifeThinkAction" in component_names
-    assert "LifeMessageNucleusTool" in component_names
-    assert "LifeConsultNucleusTool" in component_names
+    assert "LifeInnerDialogueTool" in component_names
+    assert "LifeRecordInnerMonologueAction" in component_names
+    assert "LifeMessageNucleusTool" not in component_names
+    assert "LifeConsultNucleusTool" not in component_names
     assert "LifeSearchLifeMemoryTool" not in component_names
     assert "LifeRetrieveMemoryTool" not in component_names
-    assert "LifeRecordInnerMonologueAction" in component_names
-    assert "LifeScheduleFollowupMessageAction" in component_names
+    assert "LifeScheduleFollowupMessageAction" not in component_names
 
 
 async def test_record_inner_monologue_action_delegates_to_life_service(monkeypatch: pytest.MonkeyPatch) -> None:

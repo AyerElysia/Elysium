@@ -425,11 +425,56 @@ class LifeMemoryService:
         logger.debug("记忆数据库表创建完成")
 
     async def _startup_recovery(self) -> None:
-        """启动时修复：补索引缺口、清理 ghost 节点和孤立边。"""
+        """启动时修复：补 embedding 入队缺口、补索引缺口、清理 ghost 节点和孤立边。"""
         workspace = self._get_workspace_path()
         db = self._db
         if db is None:
             return
+
+        # 0. 补 embedding 入队缺口：节点已存在但从未入队（历史遗留 / 任务丢失）
+        unembedded_no_job = db.execute(
+            """
+            SELECT node_id, file_path, content_hash
+            FROM memory_nodes
+            WHERE embedding_synced = 0
+              AND is_deleted = 0
+              AND node_type = 'file'
+              AND NOT EXISTS (
+                  SELECT 1 FROM memory_index_jobs j
+                  WHERE j.node_id = memory_nodes.node_id
+                    AND j.status = 'pending'
+              )
+            """
+        ).fetchall()
+        if unembedded_no_job:
+            logger.info(f"启动扫描：发现 {len(unembedded_no_job)} 个有节点但无任务的未同步文件，补入队")
+            requeued = 0
+            for row in unembedded_no_job:
+                node_id = str(row["node_id"])
+                file_path = str(row["file_path"] or "")
+                content_hash = str(row["content_hash"] or "")
+                try:
+                    if content_hash:
+                        # 有 hash，直接入队无需重读文件
+                        enqueue_index_job(db, node_id, content_hash)
+                        requeued += 1
+                    elif file_path:
+                        # 无 hash，重读文件以更新 hash 并入队
+                        decision = assess_workspace_document(workspace, file_path)
+                        if not decision.eligible:
+                            continue
+                        content, _, _ = read_workspace_document(workspace, file_path)
+                        title = Path(file_path).stem
+                        await get_or_create_file_node(
+                            db=db,
+                            file_path=file_path,
+                            title=title,
+                            content=content,
+                        )
+                        requeued += 1
+                except Exception as exc:
+                    logger.warning(f"补 embedding 入队失败 {file_path}: {exc}")
+            logger.info(f"补 embedding 入队完成：已入队 {requeued}/{len(unembedded_no_job)} 个节点")
 
         # 1. 扫描工作区，收集已索引路径
         scan = scan_workspace_documents(workspace)

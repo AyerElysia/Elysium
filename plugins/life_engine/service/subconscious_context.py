@@ -248,11 +248,13 @@ class SubconsciousContextManager:
         recent_group_count: int = 5,
         summary_max_chars: int = 4000,
         entry_max_chars: int = 480,
+        summary_max_entries: int = 60,
     ) -> None:
         self.max_chars = max(0, int(max_chars))
         self.recent_group_count = max(0, int(recent_group_count))
         self.summary_max_chars = max(0, int(summary_max_chars))
         self.entry_max_chars = max(40, int(entry_max_chars))
+        self.summary_max_entries = max(10, int(summary_max_entries))
 
     def prepare(
         self,
@@ -829,16 +831,19 @@ class SubconsciousContextManager:
         content_type = str(event.content_type or "").strip().lower()
         if event.event_type == EventType.MESSAGE and content_type in _HIGH_VALUE_MESSAGE_TYPES:
             kind = content_type
-        elif event.event_type == EventType.TOOL_RESULT and event.tool_success is False:
-            kind = "tool_failure"
         elif event.event_type == EventType.AGENT_RESULT:
             kind = "agent_result"
         else:
+            # tool_failure 等操作噪音不进入潜意识——
+            # 它们仍被 stats 计数器记录，但不会作为独立条目占据提示词空间。
             return None
 
         text = self._normalize_display_text(event.content)
         if not text:
             text = str(event.tool_name or event.source_detail or kind)
+        # 只过滤没有实际内容的结构壳；短文本也可能承载完整事实，不能按长度机械丢弃。
+        if not text.strip(" \t\n{}[]()\u3000"):
+            return None
         return SummaryEntry(
             kind=kind,
             text=self._shorten(text, self.entry_max_chars),
@@ -848,12 +853,22 @@ class SubconsciousContextManager:
             tool_name=str(event.tool_name) if event.tool_name else None,
         )
 
+    # 允许存在于摘要中的 kind 白名单（不在此集合中的旧条目会在去重时被清洗）
+    _VALID_SUMMARY_KINDS: frozenset[str] = frozenset({
+        *_HIGH_VALUE_MESSAGE_TYPES,
+        "relationship", "emotional_state", "body_state",
+        "ongoing_thread", "commitment", "agent_result",
+    })
+
     def _deduplicate_summary(
         self,
         summary: SubconsciousSummary,
     ) -> SubconsciousSummary:
         entries_by_content: dict[str, SummaryEntry] = {}
         for entry in summary.entries:
+            # 清洗已废弃的 kind（如 tool_failure）和退化内容
+            if entry.kind not in self._VALID_SUMMARY_KINDS:
+                continue
             normalized = self._normalize_key(entry.text)
             if not normalized:
                 continue
@@ -880,6 +895,9 @@ class SubconsciousContextManager:
                 entry.text,
             ),
         )
+        # 容量裁剪：只保留最新的 N 条，避免摘要无限膨胀
+        if len(entries) > self.summary_max_entries:
+            entries = entries[-self.summary_max_entries:]
         return SubconsciousSummary(
             schema_version=SUMMARY_SCHEMA_VERSION,
             covered_from_sequence=max(0, int(summary.covered_from_sequence or 0)),
@@ -918,7 +936,6 @@ class SubconsciousContextManager:
         ("inner_dialogue", "内心对话"),
         ("proactive_opportunity", "主动机会"),
         ("autonomy_intent_due", "自主意向"),
-        ("tool_failure", "工具失败"),
         ("agent_result", "智能体结果"),
     ]
 

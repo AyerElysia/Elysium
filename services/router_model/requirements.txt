@@ -1,13 +1,55 @@
 # 路由决策模型服务依赖
-# 关键：系统 NVIDIA 驱动为 CUDA 12.8，必须用 cu128 的 torch。
-# vllm 0.26 默认拉 cu13（需 CUDA 13 驱动，不兼容），故锁定 vllm 0.10.2（配 torch 2.8 cu128）。
-# transformers 必须 4.x（vllm 0.10.2 与 transformers 5.x 的 tokenizer API 不兼容）。
-# bitsandbytes 用于 NF4 量化，把 4B 权重压到约 2.7GB，常驻显存友好。
-vllm==0.10.2
-transformers==4.55.0
-bitsandbytes>=0.50.0
+#
+# 【重要】这一套不能用 `pip install -r requirements.txt` 一把装出来。
+# torch 必须是 cu128 轮子、vllm 必须是 cu129 轮子，两者都不在 PyPI 默认索引里。
+# 完整重装步骤见 install_env.sh（照着跑就行，别手动 pip install vllm）。
+#
+# 版本锁定链（2026-07-28 打通）：
+#   1. Qwen3.5-2B 的 Qwen3_5ForConditionalGeneration 最早在 vllm 0.20.2 注册。
+#   2. vllm 0.20.2 硬性要求 torch==2.11.0 / torchvision==0.26.0 / torchaudio==2.11.0。
+#   3. 系统 NVIDIA 驱动是 CUDA 12.8，所以 torch 三件套只能用 +cu128 本地版本号的轮子。
+#   4. vllm 用 +cu129 那个轮子（见下方「为什么是 cu129」）。
+#
+# 为什么是 vllm 0.20.2+cu129 而不是 PyPI 上的 vllm 0.20.2：
+#   PyPI 默认轮子是 CUDA 13 编的，它的 8 个扩展 .so 里 DT_NEEDED 写着 libcudart.so.13。
+#   本机只有 CUDA 12.8，于是 `import vllm._C` 直接炸：
+#     ImportError: libcudart.so.13: version `libcudart.so.13' not found
+#   注意：软链 libcudart.so.13 -> libcudart.so.12 是【没用】的。动态链接器校验的是
+#   ELF 里记的 SONAME，不是文件名，照样报 version not found。改 DT_NEEDED 也不该干——
+#   即使宿主端符号补齐了，CUDA 13 编出来的 device cubin 在 12.8 驱动上仍然加载不了
+#   （跨大版本没有兼容性保证）。
+#   正确解法是换轮子：GitHub release 里有官方的 vllm-0.20.2+cu129，
+#   它的扩展链的是 libcudart.so.12，而 CUDA 12.9 和 12.8 同属 12.x，
+#   受 minor version compatibility 保护，直接能跑。实测 import 通过、架构已注册。
+#
+# flashinfer 0.6.8.post1 是 vllm 0.20.2 的硬依赖，会打一行
+#   Failed to get device capability: SM 12.x requires CUDA >= 12.9.
+# 这条在 cu128 torch 下只是警告（它比对的是 torch.version.cuda，不是驱动），
+# 之后仍能正确识别 (12, 0)，不影响启动。
+# 【回滚陷阱】如果要退回 vllm 0.10.2，必须先 pip uninstall flashinfer-python
+# flashinfer-cubin —— 在旧版 vllm 下这两个包会让同一条检测变成致命错误
+#   RuntimeError: FlashInfer requires GPUs with sm75 or higher
+# 从而起不来服务。
+#
+# 【另一个陷阱】别用 rm -rf 清 site-packages 里的包。删了 payload 但留下 .dist-info，
+# pip 会认为「Requirement already satisfied」而拒绝重装（--force-reinstall 也静默失效），
+# 表现为运行时 ImportError: libxxx.so: cannot open shared object file。
+# 一律用 pip uninstall。
+#
+# 量化说明：默认走 vLLM 原生 FP8（RTX 5090 / sm_120 硬件直接支持）。
+# FP8 由 vLLM 在加载时对 bf16 权重现场量化，不需要额外下载 FP8 版模型。
+# KV cache 必须保持 bf16，sm_120 上 fp8 KV cache 会崩（详见 start.sh 注释）。
+
+# --- 这三个装的时候必须带 --index-url，见 install_env.sh ---
+# https://mirrors.aliyun.com/pytorch-wheels/cu128
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+torchaudio==2.11.0+cu128
+
+# --- vllm 装的时候必须指向 GitHub release 的 cu129 轮子，见 install_env.sh ---
+vllm==0.20.2+cu129
+
+transformers>=4.56.0,!=5.0.*,!=5.1.*,!=5.2.*,!=5.3.*,!=5.4.*,!=5.5.0
+huggingface_hub>=0.34.0
 modelscope>=1.20.0
-# 路由决策模型服务依赖
-# vLLM 自带 torch CUDA。RTX 5090 (Blackwell) 需较新 vLLM。
-vllm>=0.6.0
-modelscope>=1.20.0
+hf-transfer

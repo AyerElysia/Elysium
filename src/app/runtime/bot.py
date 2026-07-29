@@ -529,6 +529,18 @@ class Bot:
             port = self.config.http_router.http_router_port
             api_keys = self.config.http_router.api_keys
             
+            # 端口预检：避免绑定失败触发 C 扩展层 segfault
+            import socket
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                if probe.connect_ex((host if host != "0.0.0.0" else "127.0.0.1", port)) == 0:
+                    self.logger.error(
+                        f"HTTP 端口 {port} 已被占用，跳过 HTTP 服务器启动。"
+                        "请检查是否有残留进程（ss -tlnp | grep {port}）。"
+                    )
+                    self.ui.update_phase_status("HTTP服务器", f"⚠️ 端口 {port} 被占用")
+                    self.http_server = None
+                    return
+
             # 安全检查：检测对外开放且无有效密钥的情况
             await self._check_http_security(host, api_keys)
             

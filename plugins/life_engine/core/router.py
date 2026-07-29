@@ -69,7 +69,7 @@ class _SafeFormatDict(dict[str, str]):
 def _safe_count_tokens(text: str, model_identifier: str) -> int:
     """安全计算文本 token 数量，失败时返回 0。"""
     try:
-        return count_text_tokens(text, model_identifier)
+        return count_text_tokens(text, model_identifier=model_identifier)
     except Exception:
         return 0
 
@@ -125,6 +125,42 @@ def _fit_unreads_to_sub_agent_budget(
         token_budget = 6000
 
     return _trim_text_suffix_by_budget(unreads_text, model_identifier, token_budget)
+
+
+def _fit_system_prompt_to_task(
+    sub_prompt: str,
+    request: LLMRequest,
+    logger: Logger,
+    task: str,
+) -> str:
+    """按模型上下文预算裁剪系统提示词（保留末尾路由指令部分）。
+
+    SOUL.md + USER.md + memory 加在一起可能超过万字，远超小模型上下文。
+    以下预算计算预留了历史（≈1500 token）、未读（max_context/4 最多 2048）、
+    输出（80）、结构开销（200）后，剩余全部分给系统提示词。
+    对前沿大模型（sub_actor，max_context 通常 ≥128k）预算极大，不会裁剪。
+    """
+    model_set = getattr(request, "model_set", None)
+    if not isinstance(model_set, list) or not model_set:
+        return sub_prompt
+    first_model = model_set[0]
+    if not isinstance(first_model, dict):
+        return sub_prompt
+    model_identifier = first_model.get("model_identifier", "")
+    max_context = first_model.get("max_context")
+    max_context = max_context if isinstance(max_context, int) and max_context > 0 else 8192
+
+    # 为 history(≈1500) + unreads(max/4, ≤2048) + output(80) + scaffold(200) 留空间
+    reserved = 80 + 1500 + min(max_context // 4, 2048) + 200
+    sys_budget = max(1000, max_context - reserved)
+
+    trimmed = _trim_text_suffix_by_budget(sub_prompt, model_identifier, sys_budget)
+    if len(trimmed) < len(sub_prompt):
+        logger.info(
+            f"Router[{task}] 系统提示词已截断: {len(sub_prompt)} -> {len(trimmed)} 字符"
+            f"（上下文 {max_context} token，系统提示词预算 {sys_budget} token）"
+        )
+    return trimmed
 
 
 async def route_should_respond(
@@ -210,7 +246,8 @@ async def route_should_respond(
         parts.append(f"<new_messages>\n{fitted_unreads_task}\n</new_messages>")
         parts.append("请只判断这批新消息是否应路由给表达层继续处理。")
 
-        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(sub_prompt)))
+        task_sub_prompt = _fit_system_prompt_to_task(sub_prompt, request, logger, task)
+        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(task_sub_prompt)))
         request.add_payload(LLMPayload(ROLE.USER, Text("\n\n".join(parts))))
 
         try:

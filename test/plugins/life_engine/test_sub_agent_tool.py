@@ -28,21 +28,15 @@ def test_life_run_agent_tool_metadata() -> None:
     assert LifeRunAgentTool.chatter_allow == ["life_chatter"]
 
 
-def test_plugin_registers_life_run_agent_only_when_enabled() -> None:
-    """enable_sub_agent=false 时不注册；true 时注册。"""
-    config = LifeEngineConfig()
-    config.chatter.enabled = True
-    config.chatter.enable_sub_agent = False
-    plugin = LifeEnginePlugin(config=config)
-    names = {getattr(c, "__name__", "") for c in plugin.get_components()}
-    assert "LifeRunAgentTool" not in names
-
-    config2 = LifeEngineConfig()
-    config2.chatter.enabled = True
-    config2.chatter.enable_sub_agent = True
-    plugin2 = LifeEnginePlugin(config=config2)
-    names2 = {getattr(c, "__name__", "") for c in plugin2.get_components()}
-    assert "LifeRunAgentTool" in names2
+def test_plugin_does_not_register_legacy_life_run_agent() -> None:
+    """旧 life_run_agent 已由 nucleus_run_agent 取代，不再注入意识实例。"""
+    for enabled in (False, True):
+        config = LifeEngineConfig()
+        config.chatter.enabled = True
+        config.chatter.enable_sub_agent = enabled
+        plugin = LifeEnginePlugin(config=config)
+        names = {getattr(c, "__name__", "") for c in plugin.get_components()}
+        assert "LifeRunAgentTool" not in names
 
 
 def test_tool_rejects_when_sub_agent_disabled() -> None:

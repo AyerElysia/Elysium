@@ -1,6 +1,7 @@
 """TTS Voice 插件配置。
 
-定义 GPT-SoVITS 语音合成插件的配置项，包括基础设置、风格列表、高级参数和空间音效。
+定义本地语音合成插件的配置项，包括基础设置、风格列表、高级参数和空间音效。
+引擎后端可替换（当前默认对接 GPT-SoVITS API 协议）。
 """
 
 from typing import ClassVar
@@ -57,16 +58,25 @@ class PromptSection(SectionBase):
 class TTSSection(SectionBase):
     """TTS 语音合成基础配置。"""
 
-    engine: str = Field(
-        default="gpt_sovits",
-        description=(
-            "使用的 TTS 引擎：'gpt_sovits' (本地)、"
-            "'mimo_cloud' (MiMo 云端 VoiceClone) 或 'higgs_cloud' (Boson Higgs Audio)"
-        ),
-    )
-    server: str = Field(default="http://127.0.0.1:9880", description="GPT-SoVITS 服务地址")
+    server: str = Field(default="http://127.0.0.1:9880", description="本地 TTS 服务地址")
     timeout: int = Field(default=180, description="TTS 请求超时秒数")
     max_text_length: int = Field(default=1000, description="最大合成文本长度")
+    auto_start: bool = Field(
+        default=True,
+        description="调用前若服务未运行，是否自动拉起 TTS 服务进程",
+    )
+    server_dir: str = Field(
+        default="/root/Elysia/GPT-SoVITS",
+        description="TTS 服务的工作目录（启动命令的 cwd）",
+    )
+    start_command: str = Field(
+        default="python3 api_v2.py -a 127.0.0.1 -p 9880 -c GPT_SoVITS/configs/tts_infer.yaml",
+        description="用于拉起 TTS 服务的 shell 命令（在 server_dir 下执行）",
+    )
+    startup_timeout: int = Field(
+        default=120,
+        description="自动拉起后等待服务就绪的最大秒数",
+    )
     supported_text_languages: list[str] = Field(
         default_factory=lambda: ["zh", "en", "ja", "yue", "auto", "auto_yue"],
         description=(
@@ -86,10 +96,20 @@ class TTSStyle(SectionBase):
 
     style_name: str = Field(default="default", description="风格唯一标识符，必须有一个名为 default")
     name: str = Field(default="默认", description="显示名称")
-    refer_wav_path: str = Field(default="C:/path/to/your/reference.wav", description="参考音频路径")
+    refer_wav_path: str = Field(
+        default="C:/path/to/your/reference.wav",
+        description="主参考音频路径（时长必须在 3~10 秒之间，超出会被引擎拒绝）",
+    )
+    aux_refer_wav_paths: list[str] = Field(
+        default_factory=list,
+        description=(
+            "辅助参考音频路径列表（可选）。用于音色融合，不受 3~10 秒限制，"
+            "适合把多段音频的音色特征叠加到主参考之上。"
+        ),
+    )
     prompt_text: str = Field(
         default="这是一个示例文本，请替换为您自己的参考音频文本。",
-        description="参考音频文本",
+        description="参考音频文本（必须与主参考音频内容一致）",
     )
     prompt_language: str = Field(default="zh", description="参考音频语言")
     gpt_weights: str = Field(default="C:/path/to/your/gpt_weights.ckpt", description="GPT 模型路径")
@@ -129,53 +149,11 @@ class SpatialEffectsSection(SectionBase):
     convolution_mix: float = Field(default=0.7, description="卷积混响的干湿比 (0.0-1.0)")
 
 
-@config_section("mimo_cloud")
-class MimoCloudSection(SectionBase):
-    """MiMo 云端 VoiceClone 配置。"""
-
-    base_url: str = Field(
-        default="https://token-plan-cn.xiaomimimo.com/v1/chat/completions",
-        description="MiMoCN Chat Completions 接口地址"
-    )
-    api_key: str = Field(
-        default="",
-        description="MiMoCN API Key"
-    )
-    model: str = Field(
-        default="mimo-v2.5-tts-voiceclone",
-        description="云端克隆模型名称"
-    )
-
-
-@config_section("higgs_cloud")
-class HiggsCloudSection(SectionBase):
-    """Boson Higgs Audio 云端 TTS 配置。"""
-
-    base_url: str = Field(
-        default="https://api.boson.ai/v1/audio/speech",
-        description="Boson Higgs Audio Create Speech 接口地址",
-    )
-    api_key: str = Field(default="", description="Boson API Key")
-    model: str = Field(
-        default="higgs-audio-v3-tts",
-        description="Boson TTS 模型名称",
-    )
-    voice: str = Field(
-        default="",
-        description="已注册的 Boson custom voice ID；为空时回退到 ref_audio 一次性克隆",
-    )
-    response_format: str = Field(
-        default="mp3",
-        description="输出音频格式：mp3/opus/pcm/wav/aac/flac",
-    )
-    num_timesteps: int = Field(default=10, description="Higgs 生成步数")
-
-
 class TTSVoiceConfig(BaseConfig):
     """TTS Voice 插件主配置类。"""
 
     config_name: ClassVar[str] = "config"
-    config_description: ClassVar[str] = "GPT-SoVITS 语音合成插件配置"
+    config_description: ClassVar[str] = "本地语音合成插件配置"
 
     plugin: PluginSection = Field(default_factory=PluginSection)
     components: ComponentsSection = Field(default_factory=ComponentsSection)
@@ -186,6 +164,4 @@ class TTSVoiceConfig(BaseConfig):
         description="TTS 风格列表，每项为一种独立的语音风格配置",
     )
     tts_advanced: TTSAdvancedSection = Field(default_factory=TTSAdvancedSection)
-    mimo_cloud: MimoCloudSection = Field(default_factory=MimoCloudSection)
-    higgs_cloud: HiggsCloudSection = Field(default_factory=HiggsCloudSection)
     spatial_effects: SpatialEffectsSection = Field(default_factory=SpatialEffectsSection)

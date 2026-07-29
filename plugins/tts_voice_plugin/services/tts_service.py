@@ -1,6 +1,7 @@
 """TTS 核心服务。
 
-封装 GPT-SoVITS 语音合成的核心逻辑，包括风格管理、文本清洗、API 调用和空间音效处理。
+封装本地语音合成的核心逻辑，包括风格管理、文本清洗、API 调用和空间音效处理。
+引擎后端可替换（当前默认对接 GPT-SoVITS API 协议）。
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ import base64
 import io
 import os
 import re
+import shlex
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
@@ -28,14 +30,11 @@ if TYPE_CHECKING:
 logger = get_logger("tts_voice_plugin.service")
 
 
-HIGGS_CONTROL_TAG_RE = re.compile(r"<\|(emotion|style|sfx|prosody):[a-z_]+?\|>")
-
-
 class TTSService(BaseService):
-    """GPT-SoVITS TTS 核心服务。"""
+    """本地 TTS 核心服务。"""
 
     service_name: str = "tts"
-    service_description: str = "GPT-SoVITS 语音合成服务"
+    service_description: str = "本地语音合成服务"
     version: str = "3.1.2"
 
     def __init__(self, plugin: "BasePlugin") -> None:
@@ -48,6 +47,7 @@ class TTSService(BaseService):
         self.tts_styles: dict[str, dict[str, Any]] = {}
         self.timeout: int = 60
         self.max_text_length: int = 500
+        self._server_process: asyncio.subprocess.Process | None = None
         self._load_config()
 
     # ------------------------------------------------------------------
@@ -108,6 +108,7 @@ class TTSService(BaseService):
                 "url": global_server,
                 "name": style_cfg.name or style_name,
                 "refer_wav_path": style_cfg.refer_wav_path or default_refer_wav,
+                "aux_refer_wav_paths": list(getattr(style_cfg, "aux_refer_wav_paths", None) or []),
                 "prompt_text": style_cfg.prompt_text or default_prompt_text,
                 "prompt_language": style_cfg.prompt_language or "zh",
                 "gpt_weights": style_cfg.gpt_weights or default_gpt_weights,
@@ -124,6 +125,83 @@ class TTSService(BaseService):
             可用风格名称列表
         """
         return list(self.tts_styles.keys())
+
+    # ------------------------------------------------------------------
+    # 参考音频校验
+    # ------------------------------------------------------------------
+
+    # GPT-SoVITS 在 _set_prompt_semantic 中按 16kHz 采样点数硬校验主参考音频：
+    # 48000 点（3s）~ 160000 点（10s），超界直接抛 OSError 并返回 400。
+    MAIN_REF_MIN_SECONDS: float = 3.0
+    MAIN_REF_MAX_SECONDS: float = 10.0
+
+    @staticmethod
+    def _probe_audio_duration(path: str) -> float | None:
+        """读取音频时长（秒）。无法解析时返回 None。"""
+        try:
+            info = sf.info(path)
+            if not info.samplerate:
+                return None
+            return info.frames / float(info.samplerate)
+        except Exception as e:
+            logger.warning(f"无法解析参考音频时长 ({path}): {e}")
+            return None
+
+    def _validate_main_ref_duration(self, ref_wav_path: str) -> bool:
+        """校验主参考音频是否落在 GPT-SoVITS 允许的时长区间内。
+
+        Args:
+            ref_wav_path: 主参考音频路径
+
+        Returns:
+            校验是否通过。无法解析时长时放行，交由服务端判定。
+        """
+        if not os.path.isfile(ref_wav_path):
+            logger.error(f"主参考音频不存在: {ref_wav_path}")
+            return False
+
+        duration = self._probe_audio_duration(ref_wav_path)
+        if duration is None:
+            return True
+
+        if not (self.MAIN_REF_MIN_SECONDS <= duration <= self.MAIN_REF_MAX_SECONDS):
+            logger.error(
+                f"主参考音频时长 {duration:.2f}s 超出 GPT-SoVITS 允许的 "
+                f"{self.MAIN_REF_MIN_SECONDS:.0f}~{self.MAIN_REF_MAX_SECONDS:.0f}s 区间: {ref_wav_path}。"
+                "请改用符合区间的音频作为 refer_wav_path，"
+                "长音频可放入 aux_refer_wav_paths 参与音色融合。"
+            )
+            return False
+
+        return True
+
+    def _resolve_aux_ref_paths(self, aux_paths: list[str] | None) -> list[str]:
+        """筛选出真实存在的辅助参考音频路径。
+
+        辅助参考音频只参与音色融合，不受主参考音频的时长限制。
+
+        Args:
+            aux_paths: 配置中的辅助参考音频路径列表
+
+        Returns:
+            去重后确实存在的路径列表
+        """
+        if not aux_paths:
+            return []
+
+        resolved: list[str] = []
+        for path in aux_paths:
+            candidate = (path or "").strip()
+            if not candidate or candidate in resolved:
+                continue
+            if not os.path.isfile(candidate):
+                logger.warning(f"辅助参考音频不存在，已跳过: {candidate}")
+                continue
+            resolved.append(candidate)
+
+        if resolved:
+            logger.info(f"启用辅助参考音频 {len(resolved)} 条用于音色融合。")
+        return resolved
 
     # ------------------------------------------------------------------
     # 语言检测与规范化
@@ -316,15 +394,14 @@ class TTSService(BaseService):
         Returns:
             清洗后的文本
         """
-        protected_tags: dict[str, str] = {}
-
-        def protect_higgs_tag(match: re.Match[str]) -> str:
-            placeholder = f"HIGGSTAG{len(protected_tags)}"
-            protected_tags[placeholder] = match.group(0)
-            return placeholder
-
-        if self._config.tts.engine == "higgs_cloud":
-            text = HIGGS_CONTROL_TAG_RE.sub(protect_higgs_tag, text)
+        # 0. 移除 Higgs 风格控制标记（<|emotion:...|> / <|style:...|> / <|sfx:...|> 等）。
+        #    GPT-SoVITS 不理解这类标记，若不先剥离，后续字符过滤会把尖括号和竖线删掉，
+        #    只留下 "emotion:affection" 这类裸文本被当成正文念出来。
+        text = re.sub(r"<\s*\|[^|>]*\|\s*>", "", text)
+        #    兜底：容忍缺失闭合符号的半个标记（如 "<|emotion:affection"）。
+        #    只吃 ASCII 标记体（字母/数字/下划线/冒号/连字符/点/空格），
+        #    避免贪婪匹配把标记后面的正文一起删掉。
+        text = re.sub(r"<\s*\|[\w:\-.\s]*(?:\|\s*>|>|(?=\s)|$)", "", text)
 
         # 1. 基本清理
         text = re.sub(r"[\(（\[【].*?[\)）\]】]", "", text)
@@ -363,10 +440,88 @@ class TTSService(BaseService):
                 else:
                     text = cut_text
 
-        for placeholder, tag in protected_tags.items():
-            text = text.replace(placeholder, tag)
-
         return text.strip()
+
+    # ------------------------------------------------------------------
+    # 服务生命周期（健康检查 + 自动拉起）
+    # ------------------------------------------------------------------
+
+    async def _is_server_alive(self, base_url: str) -> bool:
+        """快速探测 TTS 服务是否存活。"""
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as session:
+                async with session.get(base_url) as resp:
+                    # 任何 HTTP 响应都说明服务在监听
+                    return resp.status < 500
+        except Exception:
+            return False
+
+    async def _ensure_server_alive(self, base_url: str) -> bool:
+        """确保 TTS 服务可用。若未运行且配置了 auto_start，则自动拉起。
+
+        Returns:
+            服务是否可用
+        """
+        if await self._is_server_alive(base_url):
+            return True
+
+        cfg = self._config.tts
+        if not cfg.auto_start:
+            logger.error(f"TTS 服务 {base_url} 未运行，且 auto_start 已禁用。")
+            return False
+
+        server_dir = cfg.server_dir
+        start_command = cfg.start_command
+        if not server_dir or not start_command:
+            logger.error("自动拉起失败：server_dir 或 start_command 未配置。")
+            return False
+
+        if not os.path.isdir(server_dir):
+            logger.error(f"自动拉起失败：工作目录不存在: {server_dir}")
+            return False
+
+        logger.info(f"TTS 服务未运行，正在自动拉起: {start_command} (cwd={server_dir})")
+        try:
+            self._server_process = await asyncio.create_subprocess_exec(
+                *shlex.split(start_command),
+                cwd=server_dir,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+        except Exception as e:
+            logger.error(f"拉起 TTS 服务进程失败: {e}")
+            return False
+
+        # 轮询等待服务就绪
+        startup_timeout = cfg.startup_timeout
+        poll_interval = 2.0
+        elapsed = 0.0
+        while elapsed < startup_timeout:
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+            # 进程已崩溃
+            if self._server_process.returncode is not None:
+                stderr_tail = ""
+                if self._server_process.stderr:
+                    stderr_bytes = await self._server_process.stderr.read(2048)
+                    stderr_tail = stderr_bytes.decode(errors="replace").strip()
+                logger.error(
+                    f"TTS 服务进程已退出 (code={self._server_process.returncode})"
+                    f"{f': {stderr_tail}' if stderr_tail else ''}"
+                )
+                self._server_process = None
+                return False
+
+            if await self._is_server_alive(base_url):
+                logger.info(f"TTS 服务已就绪（耗时 ~{elapsed:.0f}s）")
+                return True
+
+        logger.error(f"TTS 服务在 {startup_timeout}s 内未就绪，放弃等待。")
+        return False
 
     # ------------------------------------------------------------------
     # TTS API 调用
@@ -379,7 +534,7 @@ class TTSService(BaseService):
         text_language: str,
         **kwargs: Any,
     ) -> bytes | None:
-        """调用 GPT-SoVITS API 进行语音合成。
+        """调用本地 TTS API 进行语音合成。
 
         先切换模型权重，再发送合成请求。
 
@@ -397,8 +552,19 @@ class TTSService(BaseService):
             logger.error(f"API 调用失败：缺少 refer_wav_path。当前风格配置: {server_config}")
             return None
 
+        # GPT-SoVITS 只允许主参考音频落在 3~10 秒区间，超界会直接返回 400。
+        # 提前自检，把问题定位在配置上，而不是等服务端抛异常。
+        if not self._validate_main_ref_duration(ref_wav_path):
+            return None
+
+        aux_ref_paths = self._resolve_aux_ref_paths(kwargs.get("aux_refer_wav_paths"))
+
         try:
             base_url = server_config["url"].rstrip("/")
+
+            # 确保 TTS 服务存活（必要时自动拉起）
+            if not await self._ensure_server_alive(base_url):
+                return None
 
             # 步骤一：切换模型权重
             async def switch_model_weights(weights_path: str | None, weight_type: str) -> None:
@@ -430,6 +596,10 @@ class TTSService(BaseService):
                 "prompt_text": kwargs.get("prompt_text", ""),
                 "prompt_lang": kwargs.get("prompt_language", "zh"),
             }
+
+            # 辅助参考音频只参与音色融合，不受 3~10 秒限制。
+            if aux_ref_paths:
+                data["aux_ref_audio_paths"] = aux_ref_paths
 
             # 合并高级配置
             cfg = self._config
@@ -464,159 +634,6 @@ class TTSService(BaseService):
             return None
         except Exception as e:
             logger.error(f"TTS API调用异常: {e}")
-            return None
-
-    async def _call_mimo_cloud_tts(
-        self,
-        server_config: dict[str, Any],
-        text: str,
-    ) -> bytes | None:
-        """调用 MiMo 云端 VoiceClone API。"""
-        mimo_cfg = self._config.mimo_cloud
-        base_url = mimo_cfg.base_url
-        api_key = mimo_cfg.api_key
-        model = mimo_cfg.model
-        
-        if not api_key:
-            logger.error("MiMoCN API Key 未配置！")
-            return None
-
-        ref_wav_path = server_config.get("refer_wav_path")
-        prompt_text = server_config.get("prompt_text", "")
-        
-        if not ref_wav_path or not os.path.exists(ref_wav_path):
-            logger.error(f"云端克隆失败：参考音频 {ref_wav_path} 不存在。")
-            return None
-
-        try:
-            with open(ref_wav_path, "rb") as f:
-                ref_audio_b64 = base64.b64encode(f.read()).decode("utf-8")
-                voice_data_url = f"data:audio/wav;base64,{ref_audio_b64}"
-        except Exception as e:
-            logger.error(f"读取参考音频失败: {e}")
-            return None
-
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "model": model,
-            "modalities": ["text", "audio"],
-            "audio": { 
-                "voice": voice_data_url,
-                "prompt_text": prompt_text,
-                "format": "wav" 
-            },
-            "messages": [
-                { "role": "user", "content": "请用我的声音读出下面的话：" },
-                { "role": "assistant", "content": text }
-            ]
-        }
-        
-        logger.info(f"发送 MiMo 云端克隆请求，使用模型: {model}")
-        try:
-            connector = aiohttp.TCPConnector(limit=10)
-            timeout = aiohttp.ClientTimeout(total=self.timeout)
-            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                async with session.post(base_url, json=payload, headers=headers) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        message = data.get("choices", [{}])[0].get("message", {})
-                        audio_info = message.get("audio")
-                        if audio_info and "data" in audio_info:
-                            logger.info("MiMo 云端克隆成功收到音频数据")
-                            return base64.b64decode(audio_info["data"])
-                        else:
-                            logger.error(f"云端响应中没有音频数据: {data}")
-                            return None
-                    else:
-                        error_text = await resp.text()
-                        logger.error(f"MiMo 云端 API 调用失败: {resp.status} - {error_text}")
-                        return None
-        except asyncio.TimeoutError:
-            logger.error("MiMo 云端 TTS 请求超时")
-            return None
-        except Exception as e:
-            logger.error(f"MiMo 云端 TTS 异常: {e}")
-            return None
-
-    async def _call_higgs_cloud_tts(
-        self,
-        server_config: dict[str, Any],
-        text: str,
-    ) -> bytes | None:
-        """调用 Boson Higgs Audio 云端 TTS。"""
-        higgs_cfg = self._config.higgs_cloud
-        base_url = higgs_cfg.base_url
-        api_key = higgs_cfg.api_key
-
-        if not api_key:
-            logger.error("Boson API Key 未配置！")
-            return None
-
-        payload: dict[str, Any] = {
-            "model": higgs_cfg.model,
-            "input": text,
-            "response_format": higgs_cfg.response_format,
-            "num_timesteps": higgs_cfg.num_timesteps,
-        }
-
-        speed_factor = server_config.get("speed_factor")
-        if speed_factor:
-            payload["speed"] = speed_factor
-
-        if higgs_cfg.voice:
-            payload["voice"] = higgs_cfg.voice
-        else:
-            ref_wav_path = server_config.get("refer_wav_path")
-            prompt_text = server_config.get("prompt_text", "")
-            if not ref_wav_path or not os.path.exists(ref_wav_path):
-                logger.error(f"Higgs 云端克隆失败：参考音频 {ref_wav_path} 不存在。")
-                return None
-
-            try:
-                with open(ref_wav_path, "rb") as f:
-                    ref_audio_bytes = f.read()
-                    payload["ref_audio"] = base64.b64encode(ref_audio_bytes).decode("utf-8")
-                payload["ref_text"] = prompt_text
-                logger.info(
-                    "Higgs 云端 TTS 使用参考原始音频: "
-                    f"path={ref_wav_path}, size={len(ref_audio_bytes)} 字节"
-                )
-            except Exception as e:
-                logger.error(f"读取 Higgs 参考音频失败: {e}")
-                return None
-
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-
-        logger.info(
-            "发送 Higgs 云端 TTS 请求，"
-            f"模型: {higgs_cfg.model}, voice: {higgs_cfg.voice or 'ref_audio'}, "
-            f"format: {higgs_cfg.response_format}"
-        )
-        try:
-            connector = aiohttp.TCPConnector(limit=10)
-            timeout = aiohttp.ClientTimeout(total=self.timeout)
-            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                async with session.post(base_url, json=payload, headers=headers) as resp:
-                    if resp.status == 200:
-                        audio_data = await resp.read()
-                        logger.info(f"Higgs 云端 TTS 成功收到音频数据，大小: {len(audio_data)} 字节")
-                        return audio_data
-
-                    error_text = await resp.text()
-                    logger.error(f"Higgs 云端 API 调用失败: {resp.status} - {error_text}")
-                    return None
-        except asyncio.TimeoutError:
-            logger.error("Higgs 云端 TTS 请求超时")
-            return None
-        except Exception as e:
-            logger.error(f"Higgs 云端 TTS 异常: {e}")
             return None
 
     # ------------------------------------------------------------------
@@ -743,53 +760,17 @@ class TTSService(BaseService):
             f"开始TTS语音合成，文本：{clean_text[:50]}..., 风格：{style}, 最终语言: {final_language}"
         )
 
-        if self._config.tts.engine == "mimo_cloud":
-            logger.info("引擎配置为 mimo_cloud，使用云端 VoiceClone")
-            audio_data = await self._call_mimo_cloud_tts(
-                server_config=server_config,
-                text=clean_text,
-            )
-            if audio_data is None:
-                logger.warning("云端 TTS 失败，回退到本地 GPT-SoVITS")
-                audio_data = await self._call_tts_api(
-                    server_config=server_config,
-                    text=clean_text,
-                    text_language=final_language,
-                    refer_wav_path=server_config.get("refer_wav_path"),
-                    prompt_text=server_config.get("prompt_text"),
-                    prompt_language=server_config.get("prompt_language"),
-                    gpt_weights=server_config.get("gpt_weights"),
-                    sovits_weights=server_config.get("sovits_weights"),
-                )
-        elif self._config.tts.engine == "higgs_cloud":
-            logger.info("引擎配置为 higgs_cloud，使用 Boson Higgs Audio")
-            audio_data = await self._call_higgs_cloud_tts(
-                server_config=server_config,
-                text=clean_text,
-            )
-            if audio_data is None:
-                logger.warning("Higgs 云端 TTS 失败，回退到本地 GPT-SoVITS")
-                audio_data = await self._call_tts_api(
-                    server_config=server_config,
-                    text=clean_text,
-                    text_language=final_language,
-                    refer_wav_path=server_config.get("refer_wav_path"),
-                    prompt_text=server_config.get("prompt_text"),
-                    prompt_language=server_config.get("prompt_language"),
-                    gpt_weights=server_config.get("gpt_weights"),
-                    sovits_weights=server_config.get("sovits_weights"),
-                )
-        else:
-            audio_data = await self._call_tts_api(
-                server_config=server_config,
-                text=clean_text,
-                text_language=final_language,
-                refer_wav_path=server_config.get("refer_wav_path"),
-                prompt_text=server_config.get("prompt_text"),
-                prompt_language=server_config.get("prompt_language"),
-                gpt_weights=server_config.get("gpt_weights"),
-                sovits_weights=server_config.get("sovits_weights"),
-            )
+        audio_data = await self._call_tts_api(
+            server_config=server_config,
+            text=clean_text,
+            text_language=final_language,
+            refer_wav_path=server_config.get("refer_wav_path"),
+            prompt_text=server_config.get("prompt_text"),
+            prompt_language=server_config.get("prompt_language"),
+            aux_refer_wav_paths=server_config.get("aux_refer_wav_paths"),
+            gpt_weights=server_config.get("gpt_weights"),
+            sovits_weights=server_config.get("sovits_weights"),
+        )
 
         if audio_data:
             # 空间音效处理

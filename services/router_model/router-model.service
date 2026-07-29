@@ -1,0 +1,51 @@
+[Unit]
+# 路由决策模型（vLLM，常驻本地推理）
+# 之前没有 unit，start.sh 是前台 exec，终端一关服务就没了——这就是 8849
+# 老是连不上、路由 LLM 报 Connection error 的直接原因。
+Description=Elysium router decision model (vLLM, Qwen3.5-2B)
+After=network-online.target
+Wants=network-online.target
+# 显存被别的进程占满时会启动失败，别无限快速重启刷日志。
+# 注意这两个键只在 [Unit] 段生效，写进 [Service] 会被 systemd 忽略。
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/Elysia/Elysium/services/router_model
+ExecStart=/root/Elysia/Elysium/services/router_model/start.sh
+Restart=always
+RestartSec=10
+# 加载 4.5GB 权重 + 现场 fp8 量化 + torch.compile + 抓 CUDA graph，冷启动几分钟很正常。
+# Qwen3.5-2B 是混合注意力模型，第一次起来要编译 linear_attention 的 triton kernel，
+# 实测 init engine 约 110s（其中编译 47s）；有编译缓存后会快很多。
+# 给 0 是因为 systemd 默认 90s 会在模型还没载完时就把它杀了。
+TimeoutStartSec=0
+TimeoutStopSec=60
+# vLLM 收到 SIGINT 才会干净地放掉显存，SIGTERM 有时会留下僵尸占用
+KillSignal=SIGINT
+
+Environment=TZ=Asia/Shanghai
+Environment="ROUTER_MODEL_PATH=/root/models/Qwen3.5-2B"
+Environment="ROUTER_PORT=8849"
+Environment="ROUTER_SERVED_NAME=qwen3.5-2b-router"
+Environment="ROUTER_QUANT=fp8"
+Environment="ROUTER_MAX_LEN=32768"
+Environment="ROUTER_MAX_SEQS=4"
+# 必须显式给 TRITON_ATTN。自动挡会选 FLASH_ATTN，而 vllm 预编译的 fa2 扩展里
+# 只有 sm_80 的 cubin，sm_120 要靠 JIT 它带的 PTX，那份 PTX 是 CUDA 12.9 工具链编的，
+# 本机 12.8 驱动拒绝加载：CUDA error: the provided PTX was compiled with an
+# unsupported toolchain (cudaErrorUnsupportedPtxVersion)。详见 start.sh 注释。
+Environment="ROUTER_ATTENTION_BACKEND=TRITON_ATTN"
+# 给训练/其他进程留的显存（MiB）
+Environment="ROUTER_VRAM_RESERVE_MIB=512"
+# vLLM 自己的日志级别；HF 缓存指到本地避免每次探网
+Environment="VLLM_LOGGING_LEVEL=INFO"
+Environment="HF_HUB_OFFLINE=1"
+
+StandardOutput=append:/root/Elysia/Elysium/logs/router_model.log
+StandardError=append:/root/Elysia/Elysium/logs/router_model.log
+
+[Install]
+WantedBy=multi-user.target
