@@ -30,6 +30,24 @@ logger = get_logger("life_engine.memory_witness")
 MEMORY_WITNESS_INSTANCE_ID = "memory_witness"
 _NO_WITNESS = "<no_witness>"
 
+# 经历显著性过滤：只有心理意义的事件才编码为经历。
+# tool_call / tool_result 是运动皮层信号——它们被 stats 和原始事件流记录，
+# 但不进入情景记忆，正如人不会记住自己按过的每一个键。
+_EXPERIENTIAL_EVENT_TYPES: frozenset[str] = frozenset({
+    "text",
+    "voice",
+    "image",
+    "video",
+    "emoji",
+    "direct_message",
+    "heartbeat_reply",
+    "chatter_inner_monologue",
+    "proactive_opportunity",
+    "autonomy_intent_due",
+    "autonomy_intent_scheduled",
+    "autonomy_intent_silence",
+})
+
 
 @dataclass(frozen=True, slots=True)
 class WitnessRunReport:
@@ -124,56 +142,68 @@ class MemoryWitnessCoordinator:
                 cursor,
                 limit=limit,
             )
-            experiences = [self._to_experience(event) for event in raw_events]
-            synced = await memory.append_experiences(experiences)
-            if not experiences:
+            if not raw_events:
                 await memory.update_witness_state(
                     instance.instance_id,
                     last_run_at=_now_iso(),
                     last_error="",
                 )
-                return WitnessRunReport(synced_experiences=synced, last_sequence=cursor)
+                return WitnessRunReport(last_sequence=cursor)
+
+            # 游标推进：无论事件是否有心理意义，游标都必须前进，
+            # 否则见证意识会被操作噪音永远困在原地。
+            max_sequence = max(event.sequence for event in raw_events)
+
+            # 编码层筛选：只有心理显著的事件才成为经历。
+            experiences = [
+                self._to_experience(event)
+                for event in raw_events
+                if event.event_type in _EXPERIENTIAL_EVENT_TYPES
+            ]
+            synced = await memory.append_experiences(experiences)
 
             written: list[str] = []
             skipped: list[str] = []
-            for scope, items in self._group_by_stream(experiences):
-                projection_path = self._projection_path(items)
-                existing = await memory.get_witness_by_projection_path(projection_path)
-                if existing is not None:
-                    await self._project_witness(existing)
-                    written.append(existing.witness_id)
-                    continue
-                text = await self._author_witness(instance, items)
-                if not text:
-                    skipped.append(scope)
-                    continue
-                witness = await memory.record_witness_memory(
-                    content=text,
-                    consciousness_instance_id=instance.instance_id,
-                    perspective_subject_id="elysia",
-                    epistemic_kind=EpistemicKind.SUBJECTIVE_WITNESS.value,
-                    source_kind="experience_window",
-                    stream_scope=scope,
-                    visibility="private",
-                    valid_from=items[0].occurred_at,
-                    valid_to=items[-1].occurred_at,
-                    source_event_ids=[item.event_id for item in items],
-                    source_sequence_start=items[0].sequence,
-                    source_sequence_end=items[-1].sequence,
-                    model_task_name=str(
-                        getattr(cfg, "model_task_name", "diary") or "diary"
-                    ),
-                    projection_path=projection_path,
-                    metadata={
-                        "author_kind": "consciousness_instance",
-                        "factual_anchor": "memory_experiences",
-                        "subjective": True,
-                    },
-                )
-                await self._project_witness(witness)
-                written.append(witness.witness_id)
+            if experiences:
+                for scope, items in self._group_by_stream(experiences):
+                    projection_path = self._projection_path(items)
+                    existing = await memory.get_witness_by_projection_path(
+                        projection_path
+                    )
+                    if existing is not None:
+                        await self._project_witness(existing)
+                        written.append(existing.witness_id)
+                        continue
+                    text = await self._author_witness(instance, items)
+                    if not text:
+                        skipped.append(scope)
+                        continue
+                    witness = await memory.record_witness_memory(
+                        content=text,
+                        consciousness_instance_id=instance.instance_id,
+                        perspective_subject_id="elysia",
+                        epistemic_kind=EpistemicKind.SUBJECTIVE_WITNESS.value,
+                        source_kind="experience_window",
+                        stream_scope=scope,
+                        visibility="private",
+                        valid_from=items[0].occurred_at,
+                        valid_to=items[-1].occurred_at,
+                        source_event_ids=[item.event_id for item in items],
+                        source_sequence_start=items[0].sequence,
+                        source_sequence_end=items[-1].sequence,
+                        model_task_name=str(
+                            getattr(cfg, "model_task_name", "diary") or "diary"
+                        ),
+                        projection_path=projection_path,
+                        metadata={
+                            "author_kind": "consciousness_instance",
+                            "factual_anchor": "memory_experiences",
+                            "subjective": True,
+                        },
+                    )
+                    await self._project_witness(witness)
+                    written.append(witness.witness_id)
 
-            max_sequence = max(item.sequence for item in experiences)
             now = _now_iso()
             await memory.update_witness_state(
                 instance.instance_id,
@@ -189,7 +219,7 @@ class MemoryWitnessCoordinator:
             self._service.save_consciousness_registry()
             return WitnessRunReport(
                 synced_experiences=synced,
-                considered_events=len(experiences),
+                considered_events=len(raw_events),
                 written_witnesses=tuple(written),
                 skipped_scopes=tuple(skipped),
                 last_sequence=max_sequence,

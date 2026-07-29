@@ -2115,6 +2115,46 @@ class LifeEngineService(BaseService):
 
         await self._append_history(events)
 
+    async def _collect_background_mission_results(self) -> None:
+        """收集已完成的后台使命结果，注入为事件。"""
+        try:
+            from ..agents.mission_tool import get_all_missions
+            from ..agents.contracts import MissionStatus
+        except ImportError:
+            return
+
+        missions = get_all_missions()
+        if not missions:
+            return
+
+        events: list[LifeEngineEvent] = []
+        for mission_id, mission in missions.items():
+            # 只收集已完成的后台使命
+            if mission.sync:
+                continue
+            if mission.status not in (
+                MissionStatus.SUCCEEDED, MissionStatus.PARTIAL,
+                MissionStatus.FAILED, MissionStatus.CANCELLED,
+                MissionStatus.TIMEOUT,
+            ):
+                continue
+            # 检查是否已经被收集过
+            if getattr(mission, "_collected", False):
+                continue
+            mission._collected = True  # type: ignore[attr-defined]
+
+            event = self._event_builder.build_agent_result_event(
+                agent_type="mission",
+                result_text=mission.summary_text(),
+                success=mission.status == MissionStatus.SUCCEEDED,
+                rounds=mission.progress[0],
+                duration_ms=int(mission.elapsed_seconds * 1000),
+            )
+            events.append(event)
+
+        if events:
+            await self._append_history(events)
+
     async def drain_pending_events(self) -> list[LifeEngineEvent]:
         """清空并返回当前待处理事件。"""
         async with self._get_lock():
@@ -4139,6 +4179,13 @@ class LifeEngineService(BaseService):
                     except Exception as agent_exc:  # noqa: BLE001
                         logger.warning(
                             f"收集后台智能体结果异常（已跳过）: {agent_exc}",
+                            exc_info=True,
+                        )
+                    try:
+                        await self._collect_background_mission_results()
+                    except Exception as mission_exc:  # noqa: BLE001
+                        logger.warning(
+                            f"收集后台使命结果异常（已跳过）: {mission_exc}",
                             exc_info=True,
                         )
 

@@ -149,6 +149,16 @@ class LifeEngineConfig(BaseConfig):
             "audit_interval_hours",
             "compress_trigger_count",
         },
+        "orchestration": {
+            "enabled",
+            "max_concurrency",
+            "max_mission_duration_seconds",
+            "max_tokens_per_mission",
+            "planner_task_name",
+            "worker_task_name",
+            "failure_policy",
+            "trace_enabled",
+        },
     }
 
     @config_section("settings")
@@ -288,7 +298,7 @@ class LifeEngineConfig(BaseConfig):
             description="是否启用异步第一人称记忆见证意识。",
         )
         interval_seconds: int = Field(
-            default=1800,
+            default=300,
             ge=60,
             description="见证意识定时苏醒的间隔秒数。",
         )
@@ -301,10 +311,10 @@ class LifeEngineConfig(BaseConfig):
             description="启动后是否立即回望一次尚未见证的经历。",
         )
         max_events_per_run: int = Field(
-            default=80,
+            default=500,
             ge=1,
-            le=500,
-            description="每次苏醒最多读取的原始经历事件数。",
+            le=2000,
+            description="每次苏醒最多读取的原始事件数（含操作噪音，游标推进用）。",
         )
         timeout_seconds: float = Field(
             default=120.0,
@@ -1235,6 +1245,91 @@ class LifeEngineConfig(BaseConfig):
             description="是否包含最近的 chatter_inner_monologue（最多 2 条）。",
         )
 
+    @config_section("orchestration")
+    class OrchestrationSection(SectionBase):
+        """子代理编排系统配置。"""
+
+        enabled: bool = Field(
+            default=True,
+            description="是否启用子代理编排系统（life_dispatch_mission）。",
+        )
+
+        max_concurrency: int = Field(
+            default=4,
+            ge=1,
+            le=8,
+            description="最大并行 worker 数。",
+        )
+
+        default_max_rounds: int = Field(
+            default=12,
+            ge=1,
+            le=30,
+            description="每个 worker 默认最大工具调用轮数。",
+        )
+
+        default_timeout_seconds: int = Field(
+            default=300,
+            ge=30,
+            le=1800,
+            description="每个 worker 默认超时秒数。",
+        )
+
+        max_mission_duration_seconds: int = Field(
+            default=1800,
+            ge=60,
+            le=7200,
+            description="整个使命的全局超时秒数。",
+        )
+
+        max_tokens_per_mission: int = Field(
+            default=200_000,
+            ge=10_000,
+            le=2_000_000,
+            description="每个使命的全局 token 预算上限。",
+        )
+
+        max_tasks_per_mission: int = Field(
+            default=12,
+            ge=1,
+            le=30,
+            description="每个使命最多包含的子任务数。",
+        )
+
+        planner_task_name: str = Field(
+            default="sub_actor",
+            description="规划器使用的模型任务名。",
+        )
+
+        worker_task_name: str = Field(
+            default="sub_actor",
+            description="Worker 使用的模型任务名。",
+        )
+
+        retry_max_attempts: int = Field(
+            default=2,
+            ge=0,
+            le=5,
+            description="任务失败后最大重试次数。",
+        )
+
+        retry_backoff_base: float = Field(
+            default=2.0,
+            ge=1.0,
+            le=10.0,
+            description="重试指数退避底数。",
+        )
+
+        failure_policy: str = Field(
+            default="continue_others",
+            description="部分失败策略: fail_fast / continue_others / retry_then_skip。",
+        )
+
+        trace_enabled: bool = Field(
+            default=True,
+            description="是否写入编排追踪文件。",
+        )
+
     @config_section("minecraft")
     class MinecraftSection(SectionBase):
         """Minecraft 具身体验配置。"""
@@ -1333,6 +1428,7 @@ class LifeEngineConfig(BaseConfig):
     runtime_sync: RuntimeSyncSection = Field(default_factory=RuntimeSyncSection)
     drives: DrivesSection = Field(default_factory=DrivesSection)
     minecraft: MinecraftSection = Field(default_factory=MinecraftSection)
+    orchestration: OrchestrationSection = Field(default_factory=OrchestrationSection)
     autonomy: AutonomySection = Field(default_factory=AutonomySection)
     narrative: NarrativeSection = Field(default_factory=NarrativeSection)
     learning: LearningSection = Field(default_factory=LearningSection)

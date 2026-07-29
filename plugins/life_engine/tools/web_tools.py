@@ -677,3 +677,252 @@ WEB_TOOLS = [
     LifeEngineWebSearchTool,
     LifeEngineBrowserFetchTool,
 ]
+
+
+class LifeEngineBatchFetchTool(BaseTool):
+    """批量网页提取工具——一次提取多个 URL 的正文。"""
+
+    tool_name: str = "nucleus_batch_fetch"
+    tool_description: str = (
+        "批量提取多个网页的可读正文（基于 Tavily Extract API，单次最多 10 个 URL）。\n\n"
+        "**适用场景：**\n"
+        "- 搜索后需要读取多个结果的详细内容\n"
+        "- 对比多个来源的信息\n"
+        "- 研究型任务需要广泛阅读\n\n"
+        "**注意：** 每个 URL 的正文会被截断到 max_chars_per_url。"
+    )
+    chatter_allow: list[str] = ["life_engine_internal", "default_chatter", "life_chatter"]
+
+    async def execute(
+        self,
+        urls: Annotated[list[str], "要提取的网页 URL 列表（最多 10 个）"],
+        extract_depth: Annotated[Literal["basic", "advanced"], "提取深度"] = "basic",
+        query: Annotated[str, "可选：按该问题重排提取内容"] = "",
+        max_chars_per_url: Annotated[int, "每个 URL 正文最大字符数（500-20000）"] = 0,
+    ) -> tuple[bool, dict[str, Any]]:
+        url_list = [str(u or "").strip() for u in (urls or []) if str(u or "").strip()]
+        if not url_list:
+            return False, {"error": "urls 不能为空"}
+        if len(url_list) > 10:
+            return False, {"error": f"单次最多 10 个 URL，收到 {len(url_list)} 个"}
+
+        # 验证所有 URL
+        valid_urls: list[str] = []
+        errors: list[str] = []
+        for u in url_list:
+            ok, err = _validate_public_url(u)
+            if ok:
+                valid_urls.append(u)
+            else:
+                errors.append(f"{u}: {err}")
+
+        if not valid_urls:
+            return False, {"error": "无有效 URL", "details": errors}
+
+        resolved_max_chars = (
+            min(20000, max(500, int(max_chars_per_url)))
+            if max_chars_per_url > 0
+            else 8000
+        )
+
+        payload: dict[str, Any] = {
+            "urls": valid_urls,
+            "extract_depth": extract_depth,
+            "include_images": False,
+        }
+        q = str(query or "").strip()
+        if q:
+            payload["query"] = q
+
+        try:
+            response = await _tavily_post_json(
+                self.plugin,
+                "/extract",
+                payload,
+                _resolve_extract_timeout(self.plugin),
+            )
+        except (RuntimeError, asyncio.TimeoutError, OSError) as exc:
+            return False, {"error": f"批量提取失败: {exc}"}
+
+        raw_results = response.get("results")
+        if not isinstance(raw_results, list):
+            raw_results = []
+
+        pages: list[dict[str, Any]] = []
+        for item in raw_results:
+            if not isinstance(item, dict):
+                continue
+            content = str(item.get("content") or item.get("raw_content") or "")
+            truncated, was_truncated = _truncate_text(content, resolved_max_chars)
+            pages.append({
+                "url": str(item.get("url") or ""),
+                "title": str(item.get("title") or ""),
+                "content": truncated,
+                "content_length": len(truncated),
+                "truncated": was_truncated,
+            })
+
+        failed = response.get("failed_results")
+        return True, {
+            "action": "batch_fetch",
+            "provider": "tavily",
+            "requested": len(valid_urls),
+            "succeeded": len(pages),
+            "pages": pages,
+            "failed_results": failed if isinstance(failed, list) else [],
+            "url_errors": errors,
+        }
+
+
+class LifeEngineDeepResearchTool(BaseTool):
+    """深度研究工具——多查询搜索 + 批量提取 + 结构化汇总。"""
+
+    tool_name: str = "nucleus_deep_research"
+    tool_description: str = (
+        "深度研究工具：对一个主题执行多角度搜索，提取关键页面正文，"
+        "返回结构化的研究材料包。\n\n"
+        "**工作流程：**\n"
+        "1. 用你提供的多个子查询并行搜索\n"
+        "2. 从搜索结果中选取最相关的页面\n"
+        "3. 批量提取这些页面的正文\n"
+        "4. 返回：搜索结果汇总 + 页面正文 + 来源列表\n\n"
+        "**适用场景：**\n"
+        "- 调研一个复杂主题（技术选型、市场分析、学术综述）\n"
+        "- 需要多源交叉验证的事实核查\n"
+        "- 需要广泛阅读后综合的研究报告\n\n"
+        "**注意：** 本工具只收集和结构化原始材料，不做 LLM 综合。"
+        "综合结论由你（调用者）基于返回的材料自行判断。"
+    )
+    chatter_allow: list[str] = ["life_engine_internal", "default_chatter", "life_chatter"]
+
+    async def execute(
+        self,
+        queries: Annotated[
+            list[str],
+            "搜索子查询列表（2-6 个）。每个查询覆盖主题的一个角度。",
+        ],
+        search_depth: Annotated[Literal["basic", "advanced"], "搜索深度"] = "advanced",
+        max_results_per_query: Annotated[int, "每个查询返回的搜索结果数（1-10）"] = 5,
+        extract_top_n: Annotated[int, "从所有结果中选取 top N 个页面提取正文（0=不提取）"] = 3,
+        max_chars_per_page: Annotated[int, "每个提取页面的最大字符数"] = 6000,
+        time_range: Annotated[Literal["day", "week", "month", "year"] | None, "时间范围"] = None,
+    ) -> tuple[bool, dict[str, Any]]:
+        query_list = [str(q or "").strip() for q in (queries or []) if str(q or "").strip()]
+        if not query_list:
+            return False, {"error": "queries 不能为空"}
+        if len(query_list) > 6:
+            return False, {"error": f"最多 6 个子查询，收到 {len(query_list)} 个"}
+
+        resolved_max_results = max(1, min(10, int(max_results_per_query)))
+        resolved_extract_top = max(0, min(10, int(extract_top_n)))
+        resolved_max_chars = max(1000, min(20000, int(max_chars_per_page))) if max_chars_per_page > 0 else 6000
+
+        # Phase 1: 并行搜索所有子查询
+        search_tasks = []
+        for q in query_list:
+            payload: dict[str, Any] = {
+                "query": q,
+                "max_results": resolved_max_results,
+                "search_depth": search_depth,
+                "topic": "general",
+                "include_answer": False,
+            }
+            if time_range and str(time_range).strip() in ("day", "week", "month", "year"):
+                payload["time_range"] = str(time_range).strip()
+            search_tasks.append(
+                _tavily_post_json(self.plugin, "/search", payload, _resolve_search_timeout(self.plugin))
+            )
+
+        try:
+            search_responses = await asyncio.gather(*search_tasks, return_exceptions=True)
+        except Exception as exc:
+            return False, {"error": f"搜索阶段异常: {exc}"}
+
+        # 汇总搜索结果
+        all_results: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        search_summaries: list[dict[str, Any]] = []
+
+        for i, resp in enumerate(search_responses):
+            if isinstance(resp, Exception):
+                search_summaries.append({"query": query_list[i], "error": str(resp)})
+                continue
+
+            raw_results = resp.get("results") if isinstance(resp, dict) else []
+            if not isinstance(raw_results, list):
+                raw_results = []
+
+            query_results: list[dict[str, Any]] = []
+            for item in raw_results:
+                if not isinstance(item, dict):
+                    continue
+                url = str(item.get("url") or "")
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                entry = {
+                    "title": str(item.get("title") or ""),
+                    "url": url,
+                    "snippet": str(item.get("content") or "")[:500],
+                    "score": float(item.get("score", 0) or 0),
+                    "source_query": query_list[i],
+                }
+                all_results.append(entry)
+                query_results.append(entry)
+
+            search_summaries.append({
+                "query": query_list[i],
+                "result_count": len(query_results),
+            })
+
+        # 按相关性排序
+        all_results.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+        # Phase 2: 提取 top N 页面正文
+        pages: list[dict[str, Any]] = []
+        if resolved_extract_top > 0 and all_results:
+            top_urls = [r["url"] for r in all_results[:resolved_extract_top]]
+            extract_payload: dict[str, Any] = {
+                "urls": top_urls,
+                "extract_depth": "basic",
+                "include_images": False,
+            }
+            try:
+                extract_resp = await _tavily_post_json(
+                    self.plugin, "/extract", extract_payload,
+                    _resolve_extract_timeout(self.plugin),
+                )
+                raw_pages = extract_resp.get("results") if isinstance(extract_resp, dict) else []
+                if isinstance(raw_pages, list):
+                    for item in raw_pages:
+                        if not isinstance(item, dict):
+                            continue
+                        content = str(item.get("content") or item.get("raw_content") or "")
+                        truncated, _ = _truncate_text(content, resolved_max_chars)
+                        pages.append({
+                            "url": str(item.get("url") or ""),
+                            "title": str(item.get("title") or ""),
+                            "content": truncated,
+                            "content_length": len(truncated),
+                        })
+            except Exception as exc:
+                logger.warning(f"deep_research 提取阶段失败: {exc}")
+
+        return True, {
+            "action": "deep_research",
+            "provider": "tavily",
+            "queries": query_list,
+            "search_summaries": search_summaries,
+            "total_unique_results": len(all_results),
+            "search_results": all_results[:20],  # 最多返回 20 条
+            "extracted_pages": pages,
+            "extracted_count": len(pages),
+        }
+
+
+WEB_TOOLS = [
+    LifeEngineWebSearchTool,
+    LifeEngineBrowserFetchTool,
+    LifeEngineBatchFetchTool,
+    LifeEngineDeepResearchTool,
+]

@@ -31,6 +31,7 @@ from .compat_tools import (
     LifeInnerDialogueTool,
 )
 from ..agents import register_builtin_agents
+from ..agents.mission_tool import MISSION_TOOLS
 
 
 logger = get_logger("life_engine", display="life_engine")
@@ -93,6 +94,7 @@ class LifeEnginePlugin(BasePlugin):
             *SKILL_TOOLS,
             *EVENT_GREP_TOOLS,
             *LEARNING_TOOLS,
+            *MISSION_TOOLS,
         ]
 
         # 启用 LifeChatter 时注册对话器及其专用 Action / Tool
