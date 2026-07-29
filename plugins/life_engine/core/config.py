@@ -53,6 +53,17 @@ class LifeEngineConfig(BaseConfig):
             "retry_failed",
             "reclaim_after_seconds",
         },
+        "memory_witness": {
+            "enabled",
+            "interval_seconds",
+            "model_task_name",
+            "run_on_startup",
+            "max_events_per_run",
+            "timeout_seconds",
+            "max_witness_chars",
+            "migrate_legacy_diaries",
+            "legacy_diary_path",
+        },
         "history_retrieval": {
             "enabled",
             "default_cross_stream",
@@ -266,6 +277,54 @@ class LifeEngineConfig(BaseConfig):
             default=600,
             ge=60,
             description="processing 任务超过该秒数后可由新 worker 回收。",
+        )
+
+    @config_section("memory_witness")
+    class MemoryWitnessSection(SectionBase):
+        """第一人称记忆见证意识配置。"""
+
+        enabled: bool = Field(
+            default=True,
+            description="是否启用异步第一人称记忆见证意识。",
+        )
+        interval_seconds: int = Field(
+            default=1800,
+            ge=60,
+            description="见证意识定时苏醒的间隔秒数。",
+        )
+        model_task_name: str = Field(
+            default="diary",
+            description="见证意识使用的小模型任务名。",
+        )
+        run_on_startup: bool = Field(
+            default=True,
+            description="启动后是否立即回望一次尚未见证的经历。",
+        )
+        max_events_per_run: int = Field(
+            default=80,
+            ge=1,
+            le=500,
+            description="每次苏醒最多读取的原始经历事件数。",
+        )
+        timeout_seconds: float = Field(
+            default=120.0,
+            ge=10.0,
+            le=900.0,
+            description="单次见证模型调用的外层超时秒数。",
+        )
+        max_witness_chars: int = Field(
+            default=800,
+            ge=80,
+            le=4000,
+            description="单篇第一人称见证正文的最大字符数。",
+        )
+        migrate_legacy_diaries: bool = Field(
+            default=True,
+            description="是否将旧 Diary Plugin 日记幂等登记为 legacy witness。",
+        )
+        legacy_diary_path: str = Field(
+            default="data/diaries",
+            description="旧日记只读迁移来源；原文件不会被删除或改写。",
         )
 
     @config_section("autonomy")
@@ -1260,6 +1319,7 @@ class LifeEngineConfig(BaseConfig):
     settings: SettingsSection = Field(default_factory=SettingsSection)
     model: ModelSection = Field(default_factory=ModelSection)
     memory_index: MemoryIndexSection = Field(default_factory=MemoryIndexSection)
+    memory_witness: MemoryWitnessSection = Field(default_factory=MemoryWitnessSection)
     curiosity: CuriositySection = Field(default_factory=CuriositySection)
     history_retrieval: HistoryRetrievalSection = Field(default_factory=HistoryRetrievalSection)
     web: WebSection = Field(default_factory=WebSection)

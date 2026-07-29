@@ -254,28 +254,6 @@ def format_memory_bundles_for_prompt(
     return "\n".join(lines)
 
 
-    """当写入 MEMORY.md 时，根据写入结果给出告警。"""
-    if Path(path).name.upper() != "MEMORY.MD":
-        return None
-
-    data = analyze_memory_text(content)
-    if not data.needs_maintenance and data.size_bytes <= MEMORY_WRITE_WARNING_THRESHOLD_BYTES:
-        return None
-
-    reasons = data.maintenance_reasons or [
-        (
-            f"文件大小已达 {_format_kb(data.size_bytes)}，"
-            f"超过建议告警阈值 {_format_kb(MEMORY_WRITE_WARNING_THRESHOLD_BYTES)}。"
-        )
-    ]
-    reason_text = "；".join(reasons[:3])
-    return (
-        "⚠️ MEMORY.md 写入完成，但已进入建议整理区间："
-        f"{reason_text} 后续可考虑把长叙事迁移到 notes/ 或 diaries/，"
-        "让 MEMORY.md 继续保持便于快速注入的决策级摘要。"
-    )
-
-
 def build_memory_maintenance_prompt(data: MemoryPromptData) -> str:
     """生成心跳期的 MEMORY 维护提示。"""
     if not data.needs_maintenance:

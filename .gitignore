@@ -104,7 +104,6 @@ data/
 
 plugins/*
 
-!plugins/diary_plugin/
 !plugins/emoji/
 !plugins/emoji/**
 plugins/emoji/**/__pycache__/

@@ -20,6 +20,8 @@ from __future__ import annotations
 # These match the names as they appear in the LLM tool list.
 
 CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
+    # 记忆见证意识只读取经历账本，不注入聊天或行动工具。
+    "memory_witness": [],
     # 全局聊天意识：私聊、群聊、所有日常对话
     "chat": [
         "action-life_send_text",

@@ -178,6 +178,8 @@ class LifeEngineService(BaseService):
         self._state_dirty: bool = False
         self._heartbeat_task_id: str | None = None
         self._memory_index_task_id: str | None = None
+        self._memory_witness_task_id: str | None = None
+        self._memory_witness_coordinator = None
         self._stop_event: asyncio.Event | None = None
         self._pending_events: list[LifeEngineEvent] = []
         self._event_history: list[LifeEngineEvent] = []
@@ -4013,6 +4015,21 @@ class LifeEngineService(BaseService):
             )
             self._memory_index_task_id = index_task.task_id
 
+        witness_cfg = getattr(cfg, "memory_witness", None)
+        if self._memory_service is not None and bool(
+            getattr(witness_cfg, "enabled", True)
+        ):
+            from .memory_witness import MemoryWitnessCoordinator
+
+            self._memory_witness_coordinator = MemoryWitnessCoordinator(self)
+            self._memory_witness_coordinator.ensure_instance()
+            witness_task = get_task_manager().create_task(
+                self._memory_witness_coordinator.loop(),
+                name="life_engine_memory_witness",
+                daemon=True,
+            )
+            self._memory_witness_task_id = witness_task.task_id
+
         logger.info(
             "life_engine 已启动: "
             f"interval={int(cfg.settings.heartbeat_interval_seconds)}s "
@@ -4066,6 +4083,9 @@ class LifeEngineService(BaseService):
         if self._stop_event is not None:
             self._stop_event.set()
 
+        await self._await_managed_task(self._memory_witness_task_id, timeout=10.0)
+        self._memory_witness_task_id = None
+        self._memory_witness_coordinator = None
         await self._await_managed_task(self._memory_index_task_id, timeout=10.0)
         self._memory_index_task_id = None
         await self._await_managed_task(self._heartbeat_task_id, timeout=5.0)

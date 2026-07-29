@@ -16,6 +16,7 @@ from src.app.plugin_system.base import BaseTool
 
 from .edges import EdgeType
 from .eligibility import assess_document_path
+from .experience import MemorySearchMode
 from .lineage import MemoryBundle
 from .service import LifeMemoryService
 
@@ -98,6 +99,8 @@ class LifeEngineSearchMemoryTool(BaseTool):
         "- source='associated'：通过关联路径联想到的，association_path 显示联想路线\n"
         "- memory_bundles：当前理解 + 历史轨迹 + 修正记录；旧记忆不会被删除，会作为演化证据保留\n"
         "\n"
+        "**认识论边界：** search_mode 必须显式选择；相关性排名不等于事实置信度。"
+        "第一人称见证表达爱莉如何经历，不自动证明其中的外部事实。\n\n"
         "**注意：** 搜索和联想是只读操作，不会自动增强激活强度或创建/强化关联边。"
     )
     chatter_allow: list[str] = ["life_engine_internal"]
@@ -121,10 +124,36 @@ class LifeEngineSearchMemoryTool(BaseTool):
         enable_association: Annotated[bool, "是否启用联想"] = True,
         file_types: Annotated[Optional[List[str]], "限定文件类型"] = None,
         time_range_days: Annotated[int, "时间范围（天），0=不限"] = 0,
+        search_mode: Annotated[
+            str,
+            "检索模式: current_fact/autobiographical/historical/exploratory",
+        ] = "exploratory",
+        stream_scope: Annotated[
+            Optional[str],
+            "可见的聊天流范围；不提供时不跨流读取私有见证",
+        ] = None,
+        valid_at: Annotated[
+            str,
+            "查询现实世界中哪个时点有效的主张；ISO 8601，留空表示不限",
+        ] = "",
+        recorded_as_of: Annotated[
+            str,
+            "查询系统在何时已经知道的记录；ISO 8601，留空表示当前",
+        ] = "",
     ) -> tuple[bool, dict[str, Any]]:
         """执行记忆搜索。"""
         if not query or not query.strip():
             return False, {"error": "query 不能为空"}
+
+        try:
+            mode = MemorySearchMode(str(search_mode or "exploratory"))
+        except ValueError:
+            return False, {
+                "error": (
+                    "search_mode 必须是 current_fact/autobiographical/"
+                    "historical/exploratory 之一"
+                )
+            }
 
         try:
             service = await self._get_service()
@@ -139,6 +168,15 @@ class LifeEngineSearchMemoryTool(BaseTool):
                 enable_association=enable_association,
                 file_types=file_types,
                 time_range_days=time_range_days,
+            )
+            evidence_results = await service.search_evidence_aware(
+                query.strip(),
+                mode=mode,
+                top_k=top_k,
+                stream_scope=stream_scope,
+                enable_association=enable_association,
+                valid_at=valid_at,
+                recorded_as_of=recorded_as_of,
             )
 
             # 从 bundle.evidence 提取检索摘要，保持和原有 JSON 结构兼容
@@ -171,7 +209,30 @@ class LifeEngineSearchMemoryTool(BaseTool):
                 "direct_results": direct_results,
                 "associated_results": associated_results,
                 "memory_bundles": [_bundle_to_payload(bundle) for bundle in bundles],
-                "total_found": len(direct_results) + len(associated_results),
+                "search_mode": mode.value,
+                "stream_scope": stream_scope,
+                "valid_at": valid_at,
+                "recorded_as_of": recorded_as_of,
+                "evidence_results": [
+                    {
+                        "record_id": item.record_id,
+                        "kind": item.kind,
+                        "content": item.content,
+                        "rank_score": round(item.rank_score, 6),
+                        "confidence": item.confidence,
+                        "source": item.source,
+                        "valid_from": item.valid_from,
+                        "valid_to": item.valid_to,
+                        "recorded_at": item.recorded_at,
+                        "stream_scope": item.stream_scope,
+                        "visibility": item.visibility,
+                        "status": item.status,
+                        "provenance": list(item.provenance),
+                        "metadata": item.metadata,
+                    }
+                    for item in evidence_results
+                ],
+                "total_found": len(evidence_results),
             }
 
         except Exception as e:

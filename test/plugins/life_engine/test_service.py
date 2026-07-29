@@ -716,13 +716,35 @@ async def test_memory_index_lifecycle_start_toggle_and_stop_close(
     config = service.plugin.config
     config.memory_index.enabled = memory_index_enabled
     config.memory_index.run_on_startup = True
+    config.memory_witness.enabled = True
+    config.memory_witness.run_on_startup = False
+    config.memory_witness.migrate_legacy_diaries = False
     config.autonomy.enabled = False
     config.streams.enabled = False
     config.drives.enabled = False
     fake_memory = _FakeMemoryIndexService()
+    lifecycle_events: list[str] = []
 
     async def fake_init_memory(_integration: object) -> None:
         service._memory_service = fake_memory  # type: ignore[assignment]
+
+    async def tracked_close() -> None:
+        lifecycle_events.append("memory_close")
+        fake_memory.close_calls += 1
+
+    original_await_managed_task = service._await_managed_task
+
+    async def tracked_await_managed_task(
+        task_id: str | None,
+        *,
+        timeout: float,
+    ) -> None:
+        if task_id is not None and task_id == service._memory_witness_task_id:
+            lifecycle_events.append("witness_wait")
+        await original_await_managed_task(task_id, timeout=timeout)
+
+    monkeypatch.setattr(fake_memory, "close", tracked_close)
+    monkeypatch.setattr(service, "_await_managed_task", tracked_await_managed_task)
 
     monkeypatch.setattr(
         "plugins.life_engine.service.integrations.MemoryIntegration.init_memory_service",
@@ -738,12 +760,17 @@ async def test_memory_index_lifecycle_start_toggle_and_stop_close(
     else:
         assert service._memory_index_task_id is None
         assert fake_memory.run_calls == 0
+    assert service._memory_witness_task_id is not None
+    assert service._memory_witness_coordinator is not None
 
     await service.stop()
 
     assert service._memory_index_task_id is None
+    assert service._memory_witness_task_id is None
+    assert service._memory_witness_coordinator is None
     assert service._memory_service is None
     assert fake_memory.close_calls == 1
+    assert lifecycle_events.index("witness_wait") < lifecycle_events.index("memory_close")
 
 
 async def test_memory_index_loop_survives_provider_failure(

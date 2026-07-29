@@ -105,6 +105,63 @@ from .worker import (
     process_index_jobs as run_chunk_index_jobs,
 )
 
+from .epistemic import (
+    ClaimEvidence,
+    ClaimSearchResult,
+    ClaimState,
+    MemoryAuditEntry,
+    CurrentFactProjection,
+    EpistemicConflict,
+    MemoryBelief,
+    MemoryClaim,
+    MemoryDisposition,
+    MemoryStateEvent,
+    AuthorityClass,
+    RetrievalEpisode,
+    RetrievalExposure,
+    RetrievalFeedback,
+    RetrievalPlasticity,
+    append_belief,
+    append_claim,
+    append_claim_evidence,
+    append_conflict,
+    append_state_event,
+    append_retrieval_episode,
+    append_retrieval_exposure,
+    append_retrieval_feedback,
+    build_memory_audit_trail,
+    create_epistemic_schema,
+    get_claim_state,
+    get_memory_disposition,
+    get_retrieval_plasticity,
+    list_claim_evidence,
+    list_claim_states,
+    list_state_events,
+    new_claim,
+    project_current_facts,
+    search_epistemic_claims,
+)
+from .experience import (
+    EvidenceAwareMemoryResult,
+    ExperienceRecord,
+    MemorySearchMode,
+    WitnessMemory,
+    WitnessSearchResult,
+    create_life_memory_schema,
+    get_witness_by_projection_path,
+    get_witness_state,
+    insert_experiences,
+    insert_witness_memory,
+    list_experiences_after,
+    list_pending_witness_projections,
+    mark_witness_projection,
+    migrate_legacy_witness,
+    migration_exists,
+    record_witness_migration,
+    search_witness_memories,
+    update_witness_state,
+)
+
 logger = log_api.get_logger("life_engine.memory")
 
 
@@ -304,6 +361,8 @@ class LifeMemoryService:
             try:
                 await self._create_tables()
                 await asyncio.to_thread(create_memory_schema, db)
+                await asyncio.to_thread(create_life_memory_schema, db)
+                await asyncio.to_thread(create_epistemic_schema, db)
 
                 try:
                     await self._restore_chunk_collection()
@@ -380,6 +439,28 @@ class LifeMemoryService:
             )
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_edges_target ON memory_edges(target_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_edges_type ON memory_edges(edge_type)")
+
+            # 数据库级自环防线：任何路径（含手工 SQL）都不得写入自指边。
+            cursor.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS memory_edges_no_self_loop_insert
+                BEFORE INSERT ON memory_edges
+                WHEN NEW.source_id = NEW.target_id
+                BEGIN
+                    SELECT RAISE(ABORT, 'MemoryEdgeSelfLoop');
+                END
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS memory_edges_no_self_loop_update
+                BEFORE UPDATE ON memory_edges
+                WHEN NEW.source_id = NEW.target_id
+                BEGIN
+                    SELECT RAISE(ABORT, 'MemoryEdgeSelfLoop');
+                END
+                """
+            )
 
             # 显式修正记录表：不删除旧记忆，只记录“后来如何理解”
             cursor.execute(
@@ -711,6 +792,648 @@ class LifeMemoryService:
             )
 
     # --------------------------------------------------------
+    # 生命记忆本体：不可变经历与第一人称见证
+    # --------------------------------------------------------
+
+    # --------------------------------------------------------
+    # 认识论本体：主张、证据、信念与状态事件
+    # --------------------------------------------------------
+
+    async def append_memory_claim(self, claim: MemoryClaim) -> MemoryClaim:
+        """追加主张；主张正文不可覆盖，后续认识只通过状态事件表达。"""
+        async with self._index_write_lock:
+            return await asyncio.to_thread(append_claim, self._require_db(), claim)
+
+    async def record_retrieval_episode(
+        self,
+        episode: RetrievalEpisode,
+    ) -> RetrievalEpisode:
+        """记录一次检索上下文；候选曝光不是事实证据。"""
+        async with self._index_write_lock:
+            return await asyncio.to_thread(
+                append_retrieval_episode,
+                self._require_db(),
+                episode,
+            )
+
+    async def record_retrieval_exposure(
+        self,
+        exposure: RetrievalExposure,
+    ) -> RetrievalExposure:
+        """记录候选被展示；不自动建立语义边或提高事实状态。"""
+        async with self._index_write_lock:
+            return await asyncio.to_thread(
+                append_retrieval_exposure,
+                self._require_db(),
+                exposure,
+            )
+
+    async def record_retrieval_feedback(
+        self,
+        feedback: RetrievalFeedback,
+    ) -> RetrievalFeedback:
+        """追加主体对候选的采用、拒绝或修正反馈。"""
+        async with self._index_write_lock:
+            return await asyncio.to_thread(
+                append_retrieval_feedback,
+                self._require_db(),
+                feedback,
+            )
+
+    async def get_retrieval_plasticity(
+        self,
+        entity_type: str,
+        entity_id: str,
+    ) -> RetrievalPlasticity:
+        """读取仅用于候选排序的可塑性提示，不替代认识论判断。"""
+        async with self._index_write_lock:
+            return await asyncio.to_thread(
+                get_retrieval_plasticity,
+                self._require_db(),
+                entity_type,
+                entity_id,
+            )
+
+    async def record_epistemic_claim(
+        self,
+        *,
+        subject_key: str,
+        content: str,
+        claim_kind: str,
+        source: str,
+        valid_from: str = "",
+        valid_to: str = "",
+        stream_scope: str = "",
+        visibility: str = "private",
+        consciousness_instance_id: str = "",
+        metadata: Dict[str, Any] | None = None,
+        claim_id: str = "",
+        recorded_at: str = "",
+    ) -> MemoryClaim:
+        """兼容式构造并追加一个新主张；不会由文本相似度合并旧主张。"""
+        claim = new_claim(
+            subject_key=subject_key,
+            content=content,
+            claim_kind=claim_kind,
+            source=source,
+            valid_from=valid_from,
+            valid_to=valid_to,
+            stream_scope=stream_scope,
+            visibility=visibility,
+            consciousness_instance_id=consciousness_instance_id,
+            metadata=metadata,
+            claim_id=claim_id,
+            recorded_at=recorded_at,
+        )
+        return await self.append_memory_claim(claim)
+
+    async def append_claim_evidence(self, evidence: ClaimEvidence) -> ClaimEvidence:
+        """追加一条支持、挑战或语境证据，不将其折算为真值分数。"""
+        async with self._index_write_lock:
+            return await asyncio.to_thread(
+                append_claim_evidence,
+                self._require_db(),
+                evidence,
+            )
+
+    async def append_memory_belief(self, belief: MemoryBelief) -> MemoryBelief:
+        """登记一个意识视角与主张的关系；认可状态由事件另行记录。"""
+        async with self._index_write_lock:
+            return await asyncio.to_thread(append_belief, self._require_db(), belief)
+
+    async def append_epistemic_conflict(
+        self,
+        conflict: EpistemicConflict,
+    ) -> EpistemicConflict:
+        """登记冲突而不擅自裁决两个主张中的任何一个。"""
+        async with self._index_write_lock:
+            return await asyncio.to_thread(append_conflict, self._require_db(), conflict)
+
+    async def append_memory_state_event(
+        self,
+        event: MemoryStateEvent,
+    ) -> MemoryStateEvent:
+        """追加可审计状态变化；权限校验和撤销关系由本体层强制。"""
+        async with self._index_write_lock:
+            return await asyncio.to_thread(
+                append_state_event,
+                self._require_db(),
+                event,
+            )
+
+    async def get_memory_disposition(
+        self,
+        entity_type: str,
+        entity_id: str,
+        *,
+        recorded_as_of: str = "",
+    ) -> MemoryDisposition:
+        """读取主体性遗忘状态；它不影响原始记录的保留与审计。"""
+        async with self._index_write_lock:
+            return await asyncio.to_thread(
+                get_memory_disposition,
+                self._require_db(),
+                entity_type,
+                entity_id,
+                recorded_as_of=recorded_as_of,
+            )
+
+    async def get_memory_claim_state(
+        self,
+        claim_id: str,
+        *,
+        recorded_as_of: str = "",
+    ) -> ClaimState | None:
+        """从完整事件历史还原一个主张在指定记录时点的状态。"""
+        async with self._index_write_lock:
+            return await asyncio.to_thread(
+                get_claim_state,
+                self._require_db(),
+                claim_id,
+                recorded_as_of=recorded_as_of,
+            )
+
+    async def list_memory_claim_states(
+        self,
+        subject_key: str,
+        *,
+        recorded_as_of: str = "",
+        valid_at: str = "",
+        stream_scope: str | None = None,
+        visibility: tuple[str, ...] = ("private",),
+    ) -> List[ClaimState]:
+        """双时间查询主张状态，默认不跨私有流。"""
+        async with self._index_write_lock:
+            return await asyncio.to_thread(
+                list_claim_states,
+                self._require_db(),
+                subject_key,
+                recorded_as_of=recorded_as_of,
+                valid_at=valid_at,
+                stream_scope=stream_scope,
+                visibility=visibility,
+            )
+
+    async def project_current_memory_facts(
+        self,
+        subject_key: str,
+        *,
+        valid_at: str,
+        recorded_as_of: str = "",
+        stream_scope: str | None = None,
+        visibility: tuple[str, ...] = ("private",),
+    ) -> CurrentFactProjection:
+        """重建一个双时间当前事实投影，冲突和不确定性始终保留。"""
+        async with self._index_write_lock:
+            return await asyncio.to_thread(
+                project_current_facts,
+                self._require_db(),
+                subject_key,
+                valid_at=valid_at,
+                recorded_as_of=recorded_as_of,
+                stream_scope=stream_scope,
+                visibility=visibility,
+            )
+
+    async def get_memory_audit_trail(
+        self,
+        entity_type: str,
+        entity_id: str,
+        *,
+        recorded_as_of: str = "",
+    ) -> List[MemoryAuditEntry]:
+        """返回事件、操作者、理由、因果来源与补偿关系的完整审计轨迹。"""
+        async with self._index_write_lock:
+            return await asyncio.to_thread(
+                build_memory_audit_trail,
+                self._require_db(),
+                entity_type,
+                entity_id,
+                recorded_as_of=recorded_as_of,
+            )
+
+    async def list_memory_state_events(
+        self,
+        entity_type: str,
+        entity_id: str,
+        *,
+        recorded_as_of: str = "",
+    ) -> List[MemoryStateEvent]:
+        """读取完整事件轨迹，供审计、回放和解释使用。"""
+        async with self._index_write_lock:
+            return await asyncio.to_thread(
+                list_state_events,
+                self._require_db(),
+                entity_type,
+                entity_id,
+                recorded_as_of=recorded_as_of,
+            )
+
+    async def list_memory_claim_evidence(
+        self,
+        claim_id: str,
+    ) -> List[ClaimEvidence]:
+        """读取一个主张的完整证据链。"""
+        async with self._index_write_lock:
+            return await asyncio.to_thread(
+                list_claim_evidence,
+                self._require_db(),
+                claim_id,
+            )
+
+    # --------------------------------------------------------
+    # 生命记忆本体：不可变经历与第一人称见证
+    # --------------------------------------------------------
+
+    async def append_experiences(
+        self,
+        records: List[ExperienceRecord],
+    ) -> int:
+        """幂等追加不可变经历证据，绝不覆盖已有事件。"""
+        async with self._index_write_lock:
+            db = self._require_db()
+            return await asyncio.to_thread(insert_experiences, db, records)
+
+    async def list_experiences_after(
+        self,
+        sequence: int,
+        *,
+        limit: int = 100,
+        stream_scope: str | None = None,
+    ) -> List[ExperienceRecord]:
+        """按序列读取经历账本，可显式限制聊天流范围。"""
+        async with self._index_write_lock:
+            db = self._require_db()
+            return await asyncio.to_thread(
+                list_experiences_after,
+                db,
+                sequence,
+                limit=limit,
+                stream_scope=stream_scope,
+            )
+
+    async def record_witness_memory(self, **kwargs: Any) -> WitnessMemory:
+        """保存带完整来源链的主体见证，不把它提升为客观事实。"""
+        async with self._index_write_lock:
+            db = self._require_db()
+            return await asyncio.to_thread(insert_witness_memory, db, **kwargs)
+
+    async def mark_witness_projection(
+        self,
+        witness_id: str,
+        *,
+        projection_path: str,
+        status: str,
+        error: str = "",
+    ) -> bool:
+        """更新可重建 Markdown 投影状态，不修改见证正文。"""
+        async with self._index_write_lock:
+            db = self._require_db()
+            return await asyncio.to_thread(
+                mark_witness_projection,
+                db,
+                witness_id,
+                projection_path=projection_path,
+                status=status,
+                error=error,
+            )
+
+    async def list_pending_witness_projections(
+        self,
+        *,
+        limit: int = 100,
+    ) -> List[WitnessMemory]:
+        """读取待恢复的见证投影。"""
+        async with self._index_write_lock:
+            db = self._require_db()
+            return await asyncio.to_thread(
+                list_pending_witness_projections,
+                db,
+                limit=limit,
+            )
+
+    async def get_witness_by_projection_path(
+        self,
+        projection_path: str,
+    ) -> WitnessMemory | None:
+        """用确定性投影路径检查事件窗口是否已见证。"""
+        async with self._index_write_lock:
+            db = self._require_db()
+            return await asyncio.to_thread(
+                get_witness_by_projection_path,
+                db,
+                projection_path,
+            )
+
+    async def get_witness_state(
+        self,
+        consciousness_instance_id: str,
+    ) -> Dict[str, Any]:
+        """读取见证意识的持久化游标与错误状态。"""
+        async with self._index_write_lock:
+            db = self._require_db()
+            return await asyncio.to_thread(
+                get_witness_state,
+                db,
+                consciousness_instance_id,
+            )
+
+    async def update_witness_state(
+        self,
+        consciousness_instance_id: str,
+        **kwargs: Any,
+    ) -> None:
+        """原子更新见证意识游标；调用方决定何时确认整批成功。"""
+        async with self._index_write_lock:
+            db = self._require_db()
+            await asyncio.to_thread(
+                update_witness_state,
+                db,
+                consciousness_instance_id,
+                **kwargs,
+            )
+
+    async def search_epistemic_claims(
+        self,
+        query: str,
+        *,
+        mode: MemorySearchMode = MemorySearchMode.EXPLORATORY,
+        top_k: int = 5,
+        stream_scope: str | None = None,
+        visibility: tuple[str, ...] = ("private",),
+        valid_at: str = "",
+        recorded_as_of: str = "",
+    ) -> List[ClaimSearchResult]:
+        """检索主张本体并保留状态、证据、冲突和可塑性解释。"""
+        if not isinstance(mode, MemorySearchMode):
+            mode = MemorySearchMode(str(mode))
+        async with self._index_write_lock:
+            return await asyncio.to_thread(
+                search_epistemic_claims,
+                self._require_db(),
+                query,
+                mode=mode.value,
+                top_k=top_k,
+                stream_scope=stream_scope,
+                visibility=visibility,
+                valid_at=valid_at,
+                recorded_as_of=recorded_as_of,
+            )
+
+    async def search_evidence_aware(
+        self,
+        query: str,
+        *,
+        mode: MemorySearchMode = MemorySearchMode.EXPLORATORY,
+        top_k: int = 5,
+        stream_scope: str | None = None,
+        visibility: tuple[str, ...] = ("private",),
+        enable_association: bool = True,
+        valid_at: str = "",
+        recorded_as_of: str = "",
+    ) -> List[EvidenceAwareMemoryResult]:
+        """并行召回文档与见证，并保留来源、视角和认识论边界。"""
+        if not isinstance(mode, MemorySearchMode):
+            mode = MemorySearchMode(str(mode))
+        if self._db is None or self._closing:
+            claim_task = asyncio.sleep(0, result=[])
+        else:
+            claim_task = self.search_epistemic_claims(
+                query,
+                mode=mode,
+                top_k=max(1, int(top_k)),
+                stream_scope=stream_scope,
+                visibility=visibility,
+                valid_at=valid_at,
+                recorded_as_of=recorded_as_of,
+            )
+        document_task = self.search_memory(
+            query,
+            top_k=max(1, int(top_k)),
+            enable_association=enable_association,
+            return_bundles=False,
+        )
+        witness_task = self.search_witness_memories(
+            query,
+            mode=mode,
+            top_k=max(1, int(top_k)),
+            stream_scope=stream_scope,
+            visibility=visibility,
+        )
+        claim_results, document_results, witness_results = await asyncio.gather(
+            claim_task,
+            document_task,
+            witness_task,
+        )
+        candidates: list[EvidenceAwareMemoryResult] = []
+        for result in claim_results:
+            claim = result.state.claim
+            candidates.append(
+                EvidenceAwareMemoryResult(
+                    record_id=claim.claim_id,
+                    kind="epistemic_claim",
+                    content=claim.content,
+                    rank_score=float(result.rank_score),
+                    confidence=None,
+                    source=f"claim_{claim.source}",
+                    valid_from=claim.valid_from,
+                    valid_to=claim.valid_to,
+                    recorded_at=claim.recorded_at,
+                    stream_scope=claim.stream_scope,
+                    visibility=claim.visibility,
+                    status=result.state.status,
+                    provenance=tuple(
+                        item.evidence_ref for item in result.evidence
+                    ),
+                    metadata={
+                        "subject_key": claim.subject_key,
+                        "claim_kind": claim.claim_kind,
+                        "authority": claim.authority,
+                        "conflict_ids": [
+                            item.conflict_id for item in result.conflicts
+                        ],
+                        "superseded_by": list(result.state.superseded_by),
+                        "retrieval_affinity": (
+                            result.plasticity.retrieval_affinity
+                            if result.plasticity is not None
+                            else 0.0
+                        ),
+                        "epistemic_note": (
+                            "rank and retrieval feedback are not truth confidence"
+                        ),
+                    },
+                )
+            )
+        for result in document_results:
+            if result.file_path.startswith("diaries/witness/"):
+                projected = await self.get_witness_by_projection_path(
+                    result.file_path
+                )
+                if projected is None:
+                    continue
+                if projected.visibility not in visibility:
+                    continue
+                if projected.status in {"privacy_sealed", "suppressed"}:
+                    continue
+                if stream_scope is None and projected.stream_scope:
+                    continue
+                if stream_scope is not None and projected.stream_scope not in {
+                    "",
+                    stream_scope,
+                }:
+                    continue
+                candidates.append(
+                    EvidenceAwareMemoryResult(
+                        record_id=projected.witness_id,
+                        kind=projected.epistemic_kind,
+                        content=projected.content,
+                        rank_score=float(result.relevance),
+                        confidence=None,
+                        source=f"witness_document_{result.source}",
+                        valid_from=projected.valid_from,
+                        valid_to=projected.valid_to,
+                        recorded_at=projected.recorded_at,
+                        stream_scope=projected.stream_scope,
+                        visibility=projected.visibility,
+                        status=projected.status,
+                        provenance=projected.source_event_ids,
+                        metadata={
+                            "epistemic_note": (
+                                "subjective witness, not objective truth"
+                            ),
+                            "projection_path": projected.projection_path,
+                            "score_kind": getattr(
+                                result,
+                                "score_kind",
+                                "rank",
+                            ),
+                        },
+                    )
+                )
+                continue
+            candidates.append(
+                EvidenceAwareMemoryResult(
+                    record_id=result.file_path,
+                    kind="document_evidence",
+                    content=result.snippet,
+                    rank_score=float(result.relevance),
+                    confidence=None,
+                    source=f"document_{result.source}",
+                    provenance=(result.file_path,),
+                    metadata={
+                        "title": result.title,
+                        "score_kind": getattr(result, "score_kind", "rank"),
+                        "association_path": list(result.association_path),
+                        "association_reason": result.association_reason,
+                    },
+                )
+            )
+        for result in witness_results:
+            witness = result.witness
+            candidates.append(
+                EvidenceAwareMemoryResult(
+                    record_id=witness.witness_id,
+                    kind=witness.epistemic_kind,
+                    content=witness.content,
+                    rank_score=float(result.rank_score),
+                    confidence=None,
+                    source=result.retrieval_source,
+                    valid_from=witness.valid_from,
+                    valid_to=witness.valid_to,
+                    recorded_at=witness.recorded_at,
+                    stream_scope=witness.stream_scope,
+                    visibility=witness.visibility,
+                    status=witness.status,
+                    provenance=witness.source_event_ids,
+                    metadata={
+                        "epistemic_note": result.epistemic_note,
+                        "consciousness_instance_id": (
+                            witness.consciousness_instance_id
+                        ),
+                        "source_kind": witness.source_kind,
+                        "projection_path": witness.projection_path,
+                    },
+                )
+            )
+        priority = {
+            MemorySearchMode.AUTOBIOGRAPHICAL: {
+                "subjective_witness": 0,
+                "legacy_witness": 1,
+                "self_narrative": 2,
+                "document_evidence": 3,
+            },
+            MemorySearchMode.CURRENT_FACT: {
+                "epistemic_claim": 0,
+                "document_evidence": 1,
+                "observed_event": 2,
+                "subjective_witness": 3,
+                "legacy_witness": 4,
+            },
+            MemorySearchMode.HISTORICAL: {
+                "epistemic_claim": 0,
+                "document_evidence": 1,
+                "subjective_witness": 2,
+                "legacy_witness": 3,
+            },
+        }.get(mode, {})
+        candidates.sort(
+            key=lambda item: (
+                priority.get(item.kind, 1),
+                -item.rank_score,
+                item.recorded_at,
+                item.record_id,
+            )
+        )
+        deduplicated: list[EvidenceAwareMemoryResult] = []
+        seen_ids: set[str] = set()
+        for item in candidates:
+            if item.record_id in seen_ids:
+                continue
+            seen_ids.add(item.record_id)
+            deduplicated.append(item)
+        return deduplicated[: max(1, int(top_k)) * 2]
+
+    async def search_witness_memories(
+        self,
+        query: str,
+        *,
+        mode: MemorySearchMode = MemorySearchMode.AUTOBIOGRAPHICAL,
+        top_k: int = 5,
+        stream_scope: str | None = None,
+        visibility: tuple[str, ...] = ("private",),
+    ) -> List[WitnessSearchResult]:
+        """按明确认识论模式检索见证，rank 不等同 truth/confidence。"""
+        async with self._index_write_lock:
+            db = self._require_db()
+            return await asyncio.to_thread(
+                search_witness_memories,
+                db,
+                query,
+                mode=mode,
+                top_k=top_k,
+                stream_scope=stream_scope,
+                visibility=visibility,
+            )
+
+    async def migrate_legacy_witness(self, **kwargs: Any) -> WitnessMemory | None:
+        """原子迁移一条旧日记；旧文件保持只读且不删除。"""
+        async with self._index_write_lock:
+            db = self._require_db()
+            return await asyncio.to_thread(migrate_legacy_witness, db, **kwargs)
+
+    async def witness_migration_exists(self, migration_key: str) -> bool:
+        """检查旧日记迁移键，保证迁移幂等。"""
+        async with self._index_write_lock:
+            db = self._require_db()
+            return await asyncio.to_thread(migration_exists, db, migration_key)
+
+    async def record_witness_migration(self, **kwargs: Any) -> None:
+        """记录旧日记来源哈希与新见证 ID，不删除旧文件。"""
+        async with self._index_write_lock:
+            db = self._require_db()
+            await asyncio.to_thread(record_witness_migration, db, **kwargs)
+
+    # --------------------------------------------------------
     # 节点操作（封装模块函数）
     # --------------------------------------------------------
 
@@ -1025,6 +1748,7 @@ class LifeMemoryService:
                     stream_id=stream_id,
                 )
             )
+            await self._record_correction_claims(corrections)
             return corrections
 
         for path in canonical_paths:
@@ -1040,7 +1764,54 @@ class LifeMemoryService:
                     stream_id=stream_id,
                 )
             )
+        await self._record_correction_claims(corrections)
         return corrections
+
+    async def _record_correction_claims(
+        self,
+        corrections: List[MemoryCorrection],
+    ) -> None:
+        """把旧 correction 兼容记录投影到新本体；候选来源不获确认权。"""
+        for correction in corrections:
+            source = str(correction.source or "unknown").strip().lower()
+            claim = new_claim(
+                claim_id=f"correction_{correction.correction_id}",
+                subject_key=f"correction:{correction.topic}",
+                content=correction.message,
+                claim_kind="correction_candidate",
+                source=source,
+                stream_scope=correction.stream_id or "",
+                metadata={
+                    "legacy_correction_id": correction.correction_id,
+                    "related_node_id": correction.related_node_id or "",
+                    "query": correction.query,
+                },
+                recorded_at=datetime.fromtimestamp(
+                    correction.created_at
+                ).astimezone().isoformat(),
+            )
+            await self.append_memory_claim(claim)
+            authority = claim.authority
+            if authority in {
+                AuthorityClass.SUBJECT.value,
+                AuthorityClass.EXPLICIT_USER.value,
+                AuthorityClass.VERIFIED.value,
+                AuthorityClass.AUTHORITATIVE.value,
+            }:
+                await self.append_memory_state_event(
+                    MemoryStateEvent(
+                        event_id=f"confirm_{claim.claim_id}",
+                        entity_type="claim",
+                        entity_id=claim.claim_id,
+                        event_type="claim_confirmed",
+                        actor=source,
+                        authority=authority,
+                        reason="兼容修正记录具有明确来源权限",
+                        recorded_at=claim.recorded_at,
+                        valid_at=claim.valid_from or claim.recorded_at,
+                        caused_by_event_id=correction.correction_id,
+                    )
+                )
 
     async def resolve_canonical_path(
         self,
@@ -1545,9 +2316,18 @@ class LifeMemoryService:
         evidence: List[MemoryEvidence],
         corrections: List[MemoryCorrection],
     ) -> str:
-        if corrections:
-            latest = sorted(corrections, key=lambda item: item.created_at, reverse=True)[0]
-            return f"最新修正：{latest.message}"
+        authoritative_sources = {"user", "explicit_user", "verified", "authoritative"}
+        authoritative = [
+            item for item in corrections
+            if str(item.source or "").strip().lower() in authoritative_sources
+        ]
+        if authoritative:
+            latest = sorted(
+                authoritative,
+                key=lambda item: item.created_at,
+                reverse=True,
+            )[0]
+            return f"已确认修正：{latest.message}"
 
         primary = next((item for item in evidence if item.file_path == primary_path), None)
         if primary is None and evidence:
@@ -1569,8 +2349,18 @@ class LifeMemoryService:
             notes.append("命中的早期路径已经有后续整理/迁移，回答时应同时承认早期记录和当前文件。")
         if any(not item.exists for item in evidence):
             notes.append("部分证据文件当前不在工作空间中，只能作为历史轨迹参考。")
-        if corrections:
-            notes.append("存在显式修正，最新修正优先于早期笔记的字面结论。")
+        authoritative_sources = {"user", "explicit_user", "verified", "authoritative"}
+        authoritative = [
+            item for item in corrections
+            if str(item.source or "").strip().lower() in authoritative_sources
+        ]
+        candidates = [item for item in corrections if item not in authoritative]
+        if authoritative:
+            notes.append("存在有来源权限的明确修正，应与原始证据一起呈现。")
+        if candidates:
+            notes.append(
+                "存在自动反思或其他候选解释；它们尚未被确认，不能覆盖原始经历。"
+            )
         return " ".join(notes)
 
     # --------------------------------------------------------
