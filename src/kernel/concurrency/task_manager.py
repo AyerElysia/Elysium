@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import multiprocessing
 import weakref
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
@@ -49,9 +50,7 @@ class TaskManager:
         )
         self._watchdog: WatchDog | None = None  # WatchDog 实例，稍后注入
         self._process_workers = max(1, process_workers)
-        self._process_pool: ProcessPoolExecutor | None = ProcessPoolExecutor(
-            max_workers=self._process_workers
-        )
+        self._process_pool: ProcessPoolExecutor | None = None
         self._initialized = True
 
     def configure_process_pool(self, process_workers: int) -> None:
@@ -61,17 +60,19 @@ class TaskManager:
             process_workers: 进程池进程数量，最小为 1
         """
         process_workers = max(1, process_workers)
-        if process_workers == self._process_workers and self._process_pool is not None:
+        if process_workers == self._process_workers:
             return
 
         self.shutdown_process_pool(wait=False, cancel_futures=True)
         self._process_workers = process_workers
-        self._process_pool = ProcessPoolExecutor(max_workers=self._process_workers)
 
     def _ensure_process_pool(self) -> ProcessPoolExecutor:
         """确保进程池存在。"""
         if self._process_pool is None:
-            self._process_pool = ProcessPoolExecutor(max_workers=self._process_workers)
+            self._process_pool = ProcessPoolExecutor(
+                max_workers=self._process_workers,
+                mp_context=multiprocessing.get_context("spawn"),
+            )
         return self._process_pool
 
     def set_watchdog(self, watchdog: WatchDog) -> None:
@@ -81,6 +82,20 @@ class TaskManager:
             watchdog: WatchDog 实例
         """
         self._watchdog = watchdog
+
+    async def to_thread(
+        self,
+        func: Callable[P, R],
+        *args: P.args,
+        timeout: float | None = 15.0,
+        **kwargs: P.kwargs,
+    ) -> R:
+        """在线程中执行阻塞或释放 GIL 的同步函数。"""
+        call = partial(func, *args, **kwargs)
+        future = asyncio.to_thread(call)
+        if timeout is None:
+            return await future
+        return await asyncio.wait_for(future, timeout=timeout)
 
     async def to_process(
         self,

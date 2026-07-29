@@ -117,6 +117,9 @@ class _FakeAsyncClient:
 
 
 class _InlineTaskManager:
+    async def to_thread(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        return func(*args, **kwargs)
+
     async def to_process(self, func: Any, *args: Any, **kwargs: Any) -> Any:
         return func(*args, **kwargs)
 

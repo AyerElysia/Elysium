@@ -434,7 +434,7 @@ class MessageHandler:
             if file_path and Path(file_path).exists():
                 # 本地文件处理
                 video_data = await asyncio.to_thread(Path(file_path).read_bytes)
-                video_base64 = await get_task_manager().to_process(
+                video_base64 = await get_task_manager().to_thread(
                     base64_encode_bytes,
                     video_data,
                 )
@@ -461,7 +461,7 @@ class MessageHandler:
                     logger.warning(f"视频下载失败: {download_result.get('error', '未知错误')}")
                     return {"type": "text", "data": f"[视频消息] ({download_result.get('error', '下载失败')})"}
 
-                video_base64 = await get_task_manager().to_process(
+                video_base64 = await get_task_manager().to_thread(
                     base64_encode_bytes,
                     download_result["data"],
                 )
@@ -840,7 +840,7 @@ class MessageHandler:
         if not file_path or not Path(file_path).exists():
             return None, None
         audio_data = await asyncio.to_thread(Path(file_path).read_bytes)
-        audio_base64 = await get_task_manager().to_process(
+        audio_base64 = await get_task_manager().to_thread(
             base64_encode_bytes,
             audio_data,
         )
@@ -882,7 +882,7 @@ class MessageHandler:
         if size_mb > max_size_mb:
             logger.warning(f"音频文件过大，跳过处理: {size_mb:.2f}MB > {max_size_mb:.2f}MB")
             return None, None
-        audio_base64 = await get_task_manager().to_process(
+        audio_base64 = await get_task_manager().to_thread(
             base64_encode_bytes,
             audio_data,
         )

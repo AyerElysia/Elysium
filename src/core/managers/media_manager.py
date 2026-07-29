@@ -936,7 +936,7 @@ class MediaManager:
             model_name = model_entry.get("model_identifier") if isinstance(model_entry, dict) else str(model_entry)
 
             clean_b64 = self._extract_clean_base64(audio_base64)
-            audio_bytes = await get_task_manager().to_process(
+            audio_bytes = await get_task_manager().to_thread(
                 base64_decode_to_bytes,
                 clean_b64,
             )

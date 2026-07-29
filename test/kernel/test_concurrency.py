@@ -201,6 +201,26 @@ class TestTaskManager:
         assert stats["total_tasks"] >= 2
         assert stats["daemon_tasks"] >= 1
 
+    def test_process_pool_is_lazy(self) -> None:
+        tm = TaskManager(process_workers=2)
+
+        assert tm._process_pool is None
+        assert tm.get_stats()["process_pool_running"] is False
+
+    async def test_to_thread(self) -> None:
+        tm = TaskManager(process_workers=1)
+
+        result = await tm.to_thread(process_add, 1, 2)
+
+        assert result == 3
+        assert tm._process_pool is None
+
+    async def test_to_thread_timeout(self) -> None:
+        tm = TaskManager(process_workers=1)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await tm.to_thread(process_sleep, 0.3, timeout=0.05)
+
     async def test_to_process(self) -> None:
         """测试提交函数到进程池执行"""
         tm = TaskManager(process_workers=1)
@@ -1747,9 +1767,6 @@ class TestAdditionalCoverage:
         async with tg:
             tg.create_task(slow_task())
 
-            # 创建外部取消源
-            cancel_event = asyncio.Event()
-
             async def wait_and_cancel():
                 await asyncio.sleep(0.05)
                 # 取消当前正在运行的任务
@@ -1827,7 +1844,7 @@ class TestAdditionalCoverage:
             raise RuntimeError("Callback test error")
 
         # 创建组
-        group = tm.group(name="callback_path_test")
+        tm.group(name="callback_path_test")
 
         # 直接在组外创建任务但设置 group_name
         # 这样可以手动控制回调的触发
