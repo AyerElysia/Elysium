@@ -22,6 +22,7 @@
   ├── chat_global：日常对话（私聊、群聊）
   ├── minecraft：具身交互（纯视觉→键鼠）
   ├── livestream：直播互动（弹幕）
+  ├── memory_witness：第一人称见证意识（安静记录自己，把经历落成不可变账本；无对外工具，专注见证与记录）
   └── 每个实例有：
       ├── 独立滚动上下文 (runtime/consciousness/{id}/)
       ├── 独立工具清单 (tool_manifests.py)

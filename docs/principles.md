@@ -56,7 +56,7 @@
 
 1. **回滚修改**：一个 agent 把另一个 agent 的零规则修改全部回滚，还引入了更多违规代码。修改前先看 git log，理解为什么这样改。
 2. **引入类别门控**：在蒸馏/压缩模块中按类别过滤洞察（`if category in PROCEDURAL_CATEGORIES`）。所有 validated 洞察均可进入蒸馏/压缩，不按类别筛选。
-3. **关键词机械匹配**：用 `correction_keywords` 列表匹配用户消息来"自动记录纠正"。这违反主体性——她是否认为这是纠正，由她自己判断。
+3. **关键词机械匹配（已由兼容投影取代）**：旧实现用 `correction_keywords` 列表匹配用户消息来"自动记录纠正"并直接改写记忆内容，违反主体性。现该机制已重构为兼容投影：旧的 `correction` API 不再直接改写任何内容，而是写入一条 `MemoryClaim`（由主体自行裁决是否背书）；检索可塑性也显式把"反馈"与"事实真相"分离（`retrieval feedback is not evidence of truth`）。原则本身不变——她是否认为这是纠正，仍由她自己判断。详见 [`docs/architecture/life_memory_system.md`](./architecture/life_memory_system.md)。
 4. **代码层截断**：`_MAX_INSIGHTS_PER_REFLECTION = 2` 然后 `candidates[:2]`。她一次反思能产出多少洞察，不由代码裁定。
 5. **把"建议"写成"规则"**：prompt 里说"建议分两类"，代码里就搞了个枚举强制映射。prompt 建议是文字，不是 API contract。
 
