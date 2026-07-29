@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import sys
 import threading
 from datetime import datetime
@@ -164,6 +165,7 @@ _config_lock = threading.Lock()
 
 # 全局共享的日志存储（所有logger共享同一个）
 _global_log_store: LogStore | None = None
+_stdlib_bridge_handler: logging.Handler | None = None
 _log_store_lock = threading.Lock()
 
 # 日志等级优先级映射
@@ -306,6 +308,8 @@ class Logger:
             **metadata: 额外的元数据
         """
         should_output = self._should_log(level)
+        if not should_output:
+            return
 
         with self._lock:
             # 合并元数据
@@ -590,7 +594,7 @@ def initialize_logger_system(
         >>> from src.kernel.logger import initialize_logger_system
         >>> initialize_logger_system(log_level="INFO", db_path="data/logs.db")
     """
-    global _global_log_store
+    global _global_log_store, _stdlib_bridge_handler
     _set_event_broadcast_stopped(False)
 
     with _config_lock:
@@ -601,19 +605,30 @@ def initialize_logger_system(
         _global_config["retention_info_days"] = retention_info_days
         _global_config["enable_event_broadcast"] = enable_event_broadcast
 
-    # 创建或重新创建全局 LogStore
-    if enable_db:
-        with _log_store_lock:
-            if _global_log_store is not None:
-                _global_log_store.close()
+    # 创建或重新创建全局 LogStore，并确保 stdlib bridge 只有一个。
+    from .stdlib_bridge import install_stdlib_bridge, uninstall_stdlib_bridge
+
+    if _stdlib_bridge_handler is not None:
+        uninstall_stdlib_bridge(_stdlib_bridge_handler)
+        _stdlib_bridge_handler = None
+
+    with _log_store_lock:
+        if _global_log_store is not None:
+            _global_log_store.close()
+            _global_log_store = None
+        if enable_db:
             _global_log_store = LogStore(
                 db_path=db_path,
                 retention_debug_days=retention_debug_days,
                 retention_info_days=retention_info_days,
             )
-        # 安装 stdlib 桥接
-        from .stdlib_bridge import install_stdlib_bridge
-        install_stdlib_bridge(_global_log_store)
+
+    if _global_log_store is not None:
+        bridge_level = getattr(logging, log_level.upper(), logging.INFO)
+        _stdlib_bridge_handler = install_stdlib_bridge(
+            _global_log_store,
+            level=bridge_level,
+        )
 
     # 安装 rich traceback
     install_rich_traceback_formatter()
@@ -712,8 +727,13 @@ def get_all_loggers() -> dict[str, Logger]:
         return dict(_loggers)
 
 def _close_global_log_store() -> None:
-    """关闭全局 LogStore。"""
-    global _global_log_store
+    """关闭全局 LogStore 并卸载 stdlib bridge。"""
+    global _global_log_store, _stdlib_bridge_handler
+    if _stdlib_bridge_handler is not None:
+        from .stdlib_bridge import uninstall_stdlib_bridge
+
+        uninstall_stdlib_bridge(_stdlib_bridge_handler)
+        _stdlib_bridge_handler = None
     with _log_store_lock:
         if _global_log_store is not None:
             _global_log_store.close()

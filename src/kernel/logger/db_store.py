@@ -49,7 +49,11 @@ class LogStore:
         self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=10000)
         self._stopped = threading.Event()
         self._conn: sqlite3.Connection | None = None
-        self._lock = threading.Lock()
+        self._metrics_lock = threading.Lock()
+        self._queued_count = 0
+        self._written_count = 0
+        self._dropped_count = 0
+        self._write_failure_count = 0
 
         # 初始化数据库
         self._init_db()
@@ -176,9 +180,12 @@ class LogStore:
                 batch,
             )
             conn.commit()
+            with self._metrics_lock:
+                self._written_count += len(batch)
         except Exception:
-            # 写入失败不影响主程序
-            pass
+            # 写入失败不影响主程序，但必须可观测。
+            with self._metrics_lock:
+                self._write_failure_count += len(batch)
 
     def write(
         self,
@@ -211,9 +218,12 @@ class LogStore:
 
         try:
             self._queue.put_nowait(entry)
+            with self._metrics_lock:
+                self._queued_count += 1
         except queue.Full:
-            # 队列满时丢弃（日志不应阻塞主程序）
-            pass
+            # 队列满时丢弃（日志不应阻塞主程序），并记录指标。
+            with self._metrics_lock:
+                self._dropped_count += 1
 
     def query(
         self,
@@ -326,15 +336,37 @@ class LogStore:
             )
             size_bytes = self._db_path.stat().st_size if self._db_path.exists() else 0
             conn.close()
+            with self._metrics_lock:
+                metrics = {
+                    "queued_count": self._queued_count,
+                    "written_count": self._written_count,
+                    "dropped_count": self._dropped_count,
+                    "write_failure_count": self._write_failure_count,
+                }
             return {
                 "total_entries": total,
                 "by_level": by_level,
                 "db_size_bytes": size_bytes,
                 "db_path": str(self._db_path),
                 "session_id": SESSION_ID,
+                "queue_size": self._queue.qsize(),
+                **metrics,
             }
         except Exception:
-            return {"total_entries": 0, "by_level": {}, "db_size_bytes": 0}
+            with self._metrics_lock:
+                metrics = {
+                    "queued_count": self._queued_count,
+                    "written_count": self._written_count,
+                    "dropped_count": self._dropped_count,
+                    "write_failure_count": self._write_failure_count,
+                }
+            return {
+                "total_entries": 0,
+                "by_level": {},
+                "db_size_bytes": 0,
+                "queue_size": self._queue.qsize(),
+                **metrics,
+            }
 
     def close(self) -> None:
         """关闭存储（发送停止信号，等待 worker 退出）。"""

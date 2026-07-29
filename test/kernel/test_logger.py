@@ -16,13 +16,14 @@ from rich.console import Console
 from src.kernel.logger import (
     COLOR,
     DEFAULT_LEVEL_COLORS,
-    LOG_OUTPUT_EVENT,
     Logger,
     clear_all_loggers,
     get_all_loggers,
     get_logger,
     get_rich_color,
+    initialize_logger_system,
     remove_logger,
+    shutdown_logger_system,
 )
 from src.kernel.logger.db_store import LogStore
 from src.kernel.logger.stdlib_bridge import (
@@ -349,3 +350,72 @@ class TestLoggerWithDB:
         console = Console(file=buf, force_terminal=False, width=200)
         log = Logger(name="no_db", console=console)
         assert log._enable_db is False
+
+
+    def test_filtered_debug_skips_database_and_broadcast(self, tmp_path: Path) -> None:
+        from unittest.mock import Mock
+
+        from src.kernel.logger import logger as logger_module
+
+        store = LogStore(db_path=tmp_path / "filtered.db")
+        old_store = logger_module._global_log_store
+        logger_module._global_log_store = store
+        try:
+            log = Logger(
+                name="filtered_debug",
+                console=Console(file=StringIO()),
+                enable_db=True,
+                enable_event_broadcast=True,
+                log_level="INFO",
+            )
+            emit_event = Mock()
+            log._emit_log_event = emit_event  # type: ignore[method-assign]
+
+            log.debug("must stay out of every sink")
+
+            assert store.stats()["queued_count"] == 0
+            emit_event.assert_not_called()
+        finally:
+            logger_module._global_log_store = old_store
+            store.close()
+
+    def test_reinitialize_keeps_one_stdlib_bridge(self, tmp_path: Path) -> None:
+        from src.kernel.logger import logger as logger_module
+
+        root = logging.getLogger()
+        old_config = dict(logger_module._global_config)
+        old_root_level = root.level
+        try:
+            initialize_logger_system(
+                log_level="INFO",
+                db_path=tmp_path / "first.db",
+            )
+            initialize_logger_system(
+                log_level="WARNING",
+                db_path=tmp_path / "second.db",
+            )
+
+            handlers = [handler for handler in root.handlers if isinstance(handler, SQLiteLogHandler)]
+            assert len(handlers) == 1
+            assert handlers[0].level == logging.WARNING
+        finally:
+            shutdown_logger_system()
+            logger_module._global_config.clear()
+            logger_module._global_config.update(old_config)
+            root.setLevel(old_root_level)
+
+    def test_log_store_stats_expose_pipeline_metrics(self, tmp_path: Path) -> None:
+        store = LogStore(db_path=tmp_path / "metrics.db")
+        try:
+            store.write("INFO", "metrics", "queued")
+            time.sleep(1.5)
+
+            stats = store.stats()
+
+            assert stats["queued_count"] == 1
+            assert stats["written_count"] == 1
+            assert stats["dropped_count"] == 0
+            assert stats["write_failure_count"] == 0
+            assert stats["queue_size"] == 0
+        finally:
+            store.close()
