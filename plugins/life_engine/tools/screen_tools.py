@@ -497,7 +497,7 @@ async def _observe_screen(
             fallback_error = str(exc)
             logger.warning(f"原生屏幕视觉请求失败，准备走降级路径: {exc}")
 
-    fallback_task = str(getattr(screen_cfg, "fallback_task_name", "vlm") or "vlm").strip() or "vlm"
+    fallback_task = str(getattr(screen_cfg, "fallback_task_name", "vision") or "vision").strip() or "vision"
     try:
         observation = await _analyze_screenshot_with_model(
             model_task_name=fallback_task,

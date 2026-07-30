@@ -119,7 +119,7 @@ class Worker:
         self,
         plugin: BasePlugin,
         task: TaskContract,
-        model_task_name: str = "sub_actor",
+        model_task_name: str = "agent",
         stream_id: str = "",
         trigger_message: Message | None = None,
         trace_hook: TraceHook | None = None,

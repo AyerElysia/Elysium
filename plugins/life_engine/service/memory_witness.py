@@ -192,7 +192,7 @@ class MemoryWitnessCoordinator:
                         source_sequence_start=items[0].sequence,
                         source_sequence_end=items[-1].sequence,
                         model_task_name=str(
-                            getattr(cfg, "model_task_name", "diary") or "diary"
+                            getattr(cfg, "model_task_name", "witness") or "witness"
                         ),
                         projection_path=projection_path,
                         metadata={
@@ -301,7 +301,7 @@ class MemoryWitnessCoordinator:
         records: Sequence[ExperienceRecord],
     ) -> str:
         cfg = self.config
-        task_name = str(getattr(cfg, "model_task_name", "diary") or "diary")
+        task_name = str(getattr(cfg, "model_task_name", "witness") or "witness")
         model_set = get_model_set_by_task(task_name)
         if not model_set:
             raise RuntimeError(f"MemoryWitnessModelUnavailable:{task_name}")

@@ -50,6 +50,14 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
         "tool-inner_query",
         "tool-fetch_chat_history",
     ],
+    # 语音通话意识：实时语音交互，跨场景感知
+    "voice_live": [
+        "action-life_send_text",   # 通话中也可发文字
+        "action-think",
+        "action-report_state",     # 报告通话状态到 WorldState
+        "tool-inner_query",        # 向潜意识查询
+        "tool-fetch_chat_history", # 查阅历史
+    ],
 }
 
 # 默认清单：未定义的意识类型使用 chat 清单

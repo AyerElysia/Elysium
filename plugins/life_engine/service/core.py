@@ -1026,7 +1026,7 @@ class LifeEngineService(BaseService):
         task_name = (
             str(getattr(curiosity_cfg, "task_name", "") or "").strip()
             or str(getattr(cfg.model, "task_name", "") or "").strip()
-            or "life"
+            or "core"
         )
         timeout = float(getattr(curiosity_cfg, "timeout_seconds", 30.0) or 30.0)
         workspace = str(getattr(cfg.settings, "workspace_path", "") or self._workspace_dir())
@@ -2288,7 +2288,7 @@ class LifeEngineService(BaseService):
             heartbeat_event = self._event_builder.build_heartbeat_event(
                 reply_text,
                 self._state.heartbeat_count,
-                self._cfg().model.task_name or "life",
+                self._cfg().model.task_name or "core",
                 heartbeat_run_id=heartbeat_run_id,
             )
 
@@ -2389,14 +2389,63 @@ class LifeEngineService(BaseService):
         await self._save_runtime_context()
 
     def _build_wake_context_text(self, events: list[LifeEngineEvent]) -> str:
-        """把事件流拼成可注入的上下文文本。"""
+        """把事件流拼成可注入的上下文文本。
+
+        连续的工具操作（TOOL_CALL / 成功的 TOOL_RESULT）会被折叠为一行摘要，
+        避免操作噪音占据意识窗口。失败的工具结果和 AGENT_RESULT 保留完整渲染。
+        """
         if not events:
             return ""
 
         sorted_events = sorted(events, key=lambda e: e.sequence)
         lines: list[str] = []
 
+        # 折叠连续工具操作的缓冲区
+        tool_run_count = 0
+        tool_run_failures: list[LifeEngineEvent] = []
+        tool_run_start_time = ""
+
+        def _flush_tool_run() -> None:
+            """将累积的工具操作折叠为一行摘要。"""
+            nonlocal tool_run_count, tool_run_failures, tool_run_start_time
+            if tool_run_count <= 0:
+                return
+            time_display = _format_time_display(tool_run_start_time)
+            fail_count = len(tool_run_failures)
+            if fail_count == 0:
+                lines.append(
+                    f"[{time_display}] 🔧 执行了 {tool_run_count} 次工具操作（全部成功）"
+                )
+            else:
+                lines.append(
+                    f"[{time_display}] 🔧 执行了 {tool_run_count} 次工具操作"
+                    f"（{fail_count} 次失败）"
+                )
+                # 失败的工具结果有体验价值，逐条展示
+                for fail_event in tool_run_failures:
+                    fail_time = _format_time_display(fail_event.timestamp)
+                    result_short = _shorten_text(fail_event.content or "", max_length=160)
+                    lines.append(f"[{fail_time}] ❌ {fail_event.tool_name}: {result_short}")
+            tool_run_count = 0
+            tool_run_failures = []
+            tool_run_start_time = ""
+
         for event in sorted_events:
+            # 工具操作折叠逻辑
+            if event.event_type == EventType.TOOL_CALL:
+                if tool_run_count == 0:
+                    tool_run_start_time = event.timestamp
+                tool_run_count += 1
+                continue
+            if event.event_type == EventType.TOOL_RESULT:
+                if event.tool_success is False:
+                    tool_run_failures.append(event)
+                # 成功的 tool_result 不单独渲染，已被 tool_call 计数覆盖
+                continue
+
+            # 遇到非工具事件，先刷新之前的工具操作摘要
+            _flush_tool_run()
+
             time_display = _format_time_display(event.timestamp)
 
             if event.event_type == EventType.MESSAGE:
@@ -2410,19 +2459,6 @@ class LifeEngineService(BaseService):
             elif event.event_type == EventType.HEARTBEAT:
                 line = f"[{time_display}] 💭 心跳#{event.heartbeat_index}"
                 line += f"\n    └─ {event.content}"
-            elif event.event_type == EventType.TOOL_CALL:
-                line = f"[{time_display}] 🔧 {event.tool_name}"
-                if event.tool_args:
-                    args_short = self._simplify_tool_args(event.tool_args)
-                    if args_short:
-                        line += f"({args_short})"
-                content_short = _shorten_text(event.content or "", max_length=160)
-                if content_short:
-                    line += f"\n    └─ {content_short}"
-            elif event.event_type == EventType.TOOL_RESULT:
-                status = "✅" if event.tool_success else "❌"
-                result_short = _shorten_text(event.content or "", max_length=100)
-                line = f"[{time_display}] {status} {event.tool_name}: {result_short}"
             elif event.event_type == EventType.AGENT_RESULT:
                 status = "✅" if event.tool_success else "❌"
                 agent_name = event.tool_name or "agent"
@@ -2432,6 +2468,9 @@ class LifeEngineService(BaseService):
                 line = f"[{time_display}] ❓ {event.content}"
 
             lines.append(line)
+
+        # 尾部可能残留的工具操作
+        _flush_tool_run()
 
         return "\n".join(lines)
 
@@ -2449,7 +2488,15 @@ class LifeEngineService(BaseService):
             if unified_chatter_context:
                 return True
             return bool(not stream_id or stream_id == current_stream_id)
-        if event_type in {EventType.TOOL_CALL, EventType.TOOL_RESULT, EventType.AGENT_RESULT}:
+        # 工具操作噪音过滤：
+        # - TOOL_CALL 对表达层无体验价值，不注入 chatter
+        # - TOOL_RESULT 仅在失败时可见（失败是有意义的障碍信号）
+        # - AGENT_RESULT 保留（子代理完成工作是有意义的结果）
+        if event_type == EventType.TOOL_CALL:
+            return False
+        if event_type == EventType.TOOL_RESULT:
+            return event.tool_success is False
+        if event_type == EventType.AGENT_RESULT:
             return True
 
         stream_id = str(event.stream_id or "").strip()
@@ -2462,7 +2509,7 @@ class LifeEngineService(BaseService):
         if current_stream_id and stream_id == current_stream_id:
             return content_type != "text"
 
-        if content_type in {"heartbeat_reply", "chatter_inner_monologue", "tool_call", "tool_result"}:
+        if content_type in {"heartbeat_reply", "chatter_inner_monologue"}:
             return True
         if content_type in {
             "proactive_opportunity",
@@ -3143,7 +3190,7 @@ class LifeEngineService(BaseService):
                 heartbeat_event = self._event_builder.build_heartbeat_event(
                     reply_text,
                     self._state.heartbeat_count,
-                    self._cfg().model.task_name or "life",
+                    self._cfg().model.task_name or "core",
                     heartbeat_run_id=heartbeat_run_id,
                 )
                 await self._append_history([heartbeat_event])
@@ -3702,7 +3749,7 @@ class LifeEngineService(BaseService):
     ) -> str:
         """调用 life 任务模型生成内部报文；请求失败必须向上抛出。"""
         cfg = self._cfg()
-        task_name = cfg.model.task_name.strip() or "life"
+        task_name = cfg.model.task_name.strip() or "core"
         model_set = get_model_set_by_task(task_name)
         request = create_llm_request(
             model_set=model_set,
@@ -3764,12 +3811,12 @@ class LifeEngineService(BaseService):
             )
         except Exception as e:
             # 主模型失败，尝试轻量模型降级（utils task 通常路由到更快的 provider）
-            if task_name != "utils":
+            if task_name != "utility":
                 try:
                     logger.warning(
-                        f"life_engine 心跳主模型({task_name})失败，尝试 utils 降级: {e}"
+                        f"life_engine 心跳主模型({task_name})失败，尝试 utility 降级: {e}"
                     )
-                    fallback_model_set = get_model_set_by_task("utils")
+                    fallback_model_set = get_model_set_by_task("utility")
                     fallback_request = create_llm_request(
                         model_set=fallback_model_set,
                         request_name="life_engine_heartbeat_fallback",
@@ -3997,7 +4044,7 @@ class LifeEngineService(BaseService):
 
                 self._learning_scheduler = LearningScheduler(
                     workspace_path=cfg.settings.workspace_path,
-                    model_task_name=getattr(cfg.model, "task_name", "life"),
+                    model_task_name=getattr(cfg.model, "task_name", "core"),
                     # 反思环需要记忆服务：把"我之前理解错了"落成显式修正记录
                     memory_service=self._memory_service,
                     audit_interval_hours=float(getattr(learning_cfg, "audit_interval_hours", 6.0) if learning_cfg else 6.0),

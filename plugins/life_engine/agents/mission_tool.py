@@ -190,7 +190,7 @@ class LifeDispatchMissionTool(BaseTool):
 
         # 规划
         planner = Planner(
-            model_task_name=getattr(cfg, "planner_task_name", "sub_actor"),
+            model_task_name=getattr(cfg, "planner_task_name", "agent"),
             max_tasks=budget.max_tasks,
         )
 
@@ -237,7 +237,7 @@ class LifeDispatchMissionTool(BaseTool):
             mission=mission,
             graph=graph,
             max_concurrency=effective_concurrency,
-            worker_task_name=getattr(cfg, "worker_task_name", "sub_actor"),
+            worker_task_name=getattr(cfg, "worker_task_name", "agent"),
             retry_max_attempts=getattr(cfg, "retry_max_attempts", 2),
             retry_backoff_base=getattr(cfg, "retry_backoff_base", 2.0),
             failure_policy=mission.failure_policy,

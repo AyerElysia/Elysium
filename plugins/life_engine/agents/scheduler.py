@@ -45,7 +45,7 @@ class Scheduler:
         graph: TaskGraph,
         *,
         max_concurrency: int = 4,
-        worker_task_name: str = "sub_actor",
+        worker_task_name: str = "agent",
         retry_max_attempts: int = 2,
         retry_backoff_base: float = 2.0,
         failure_policy: FailurePolicy = FailurePolicy.CONTINUE_OTHERS,

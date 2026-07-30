@@ -1263,11 +1263,11 @@ class LifeChatter(BaseChatter):
         cls._GLOBAL_USABLE_MAP = None
 
     def _configured_primary_task_name(self) -> str:
-        """返回 life_chatter 主任务名；旧配置缺失或留空时沿用 actor。"""
+        """返回 life_chatter 主任务名；旧配置缺失或留空时沿用 expression。"""
 
         cfg = self._get_config()
         model_cfg = getattr(cfg, "model", None) if cfg is not None else None
-        return str(getattr(model_cfg, "task_name", "") or "").strip() or "actor"
+        return str(getattr(model_cfg, "task_name", "") or "").strip() or "expression"
 
     def _required_primary_modalities(self) -> set[str]:
         """返回长生命周期主 request 必须预先覆盖的输入模态。"""
@@ -1324,16 +1324,16 @@ class LifeChatter(BaseChatter):
         """按配置创建主 request，并为旧配置和原生媒体能力安全回退。"""
 
         task_name = self._configured_primary_task_name()
-        if task_name == "actor":
-            return self.create_request("actor", request_name="life_chatter")
+        if task_name == "expression":
+            return self.create_request("expression", request_name="life_chatter")
 
         try:
             request = self.create_request(task_name, request_name="life_chatter")
         except Exception as exc:
             logger.warning(
-                f"life_chatter 主任务 {task_name!r} 不可用，回退 actor: {exc}"
+                f"life_chatter 主任务 {task_name!r} 不可用，回退 expression: {exc}"
             )
-            return self.create_request("actor", request_name="life_chatter")
+            return self.create_request("expression", request_name="life_chatter")
 
         required_modalities = self._required_primary_modalities()
         if not self._model_set_supports_modalities(
@@ -1343,9 +1343,9 @@ class LifeChatter(BaseChatter):
             logger.warning(
                 "life_chatter 主任务 "
                 f"{task_name!r} 无可用模型覆盖 {sorted(required_modalities)!r}，"
-                "回退 actor"
+                "回退 expression"
             )
-            return self.create_request("actor", request_name="life_chatter")
+            return self.create_request("expression", request_name="life_chatter")
         return request
 
     async def _get_or_create_global_runtime(

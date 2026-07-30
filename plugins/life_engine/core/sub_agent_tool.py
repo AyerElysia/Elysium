@@ -87,7 +87,7 @@ class LifeRunAgentTool(BaseTool):
         if cfg is not None:
             configured = str(getattr(cfg, "sub_agent_task_name", "") or "").strip()
         type_specific = getattr(agent_type_def, "model_task_name", None)
-        return str(type_specific or configured or "sub_actor").strip() or "sub_actor"
+        return str(type_specific or configured or "agent").strip() or "agent"
 
     def _resolve_default_max_rounds(self) -> int:
         """读取 sub_agent_default_max_rounds。"""

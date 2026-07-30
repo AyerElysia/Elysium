@@ -247,8 +247,8 @@ class LifeEngineConfig(BaseConfig):
         """中枢模型任务设置。"""
 
         task_name: str = Field(
-            default="life",
-            description="中枢任务使用的模型任务名称，对应 config/model.toml 中的 [model_tasks.life]。",
+            default="core",
+            description="中枢任务使用的模型任务名称，对应 config/model.toml 中的 [model_tasks.core]。",
         )
 
     @config_section("memory_index")
@@ -303,7 +303,7 @@ class LifeEngineConfig(BaseConfig):
             description="见证意识定时苏醒的间隔秒数。",
         )
         model_task_name: str = Field(
-            default="diary",
+            default="witness",
             description="见证意识使用的小模型任务名。",
         )
         run_on_startup: bool = Field(
@@ -818,10 +818,10 @@ class LifeEngineConfig(BaseConfig):
         )
 
         sub_agent_task_name: str = Field(
-            default="sub_actor",
+            default="agent",
             description=(
                 "子代理创建 LLM request 时使用的模型任务名，对应 config/model.toml 中的 task key。"
-                "留空时回退为 sub_actor。"
+                "留空时回退为 agent。"
             ),
         )
 
@@ -931,11 +931,11 @@ class LifeEngineConfig(BaseConfig):
             description="是否启用 life_chatter 的按需媒体观察工具。",
         )
         task_name: str = Field(
-            default="media_observer",
+            default="vision",
             description="兼容旧配置保留；当前 inspect_media 不再调用媒体观察子代理模型。",
         )
         fallback_task_name: str = Field(
-            default="sub_actor",
+            default="agent",
             description="兼容旧配置保留；当前 inspect_media 不再调用降级整合模型。",
         )
         max_image_bytes: int = Field(
@@ -1040,7 +1040,7 @@ class LifeEngineConfig(BaseConfig):
         )
 
         fallback_task_name: str = Field(
-            default="vlm",
+            default="vision",
             description="原生不可用或失败时使用的 VLM 降级模型任务名。",
         )
 
@@ -1297,12 +1297,12 @@ class LifeEngineConfig(BaseConfig):
         )
 
         planner_task_name: str = Field(
-            default="sub_actor",
+            default="agent",
             description="规划器使用的模型任务名。",
         )
 
         worker_task_name: str = Field(
-            default="sub_actor",
+            default="agent",
             description="Worker 使用的模型任务名。",
         )
 

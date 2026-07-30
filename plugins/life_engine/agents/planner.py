@@ -86,7 +86,7 @@ class Planner:
 
     def __init__(
         self,
-        model_task_name: str = "sub_actor",
+        model_task_name: str = "agent",
         max_tasks: int = 12,
     ) -> None:
         self.model_task_name = model_task_name

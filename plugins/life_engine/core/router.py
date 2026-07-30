@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Protocol, TypedDict
 
 import json_repair
@@ -16,6 +17,41 @@ from src.kernel.logger import Logger
 from src.kernel.llm import LLMPayload, ROLE, Text
 from src.kernel.llm import LLMRequest
 from src.kernel.llm.token_counter import count_text_tokens
+
+
+# ---------------------------------------------------------------------------
+# 熔断器：本地 router 模型连续失败后自动跳过，避免每条消息都等连接超时。
+# ---------------------------------------------------------------------------
+_CIRCUIT_FAILURE_THRESHOLD = 3       # 连续失败 N 次后熔断
+_CIRCUIT_COOLDOWN_SECONDS = 120.0    # 熔断后冷却时间（秒）
+
+_circuit_consecutive_failures = 0
+_circuit_open_until: float = 0.0     # timestamp，在此之前跳过本地 router
+
+
+def _circuit_is_open() -> bool:
+    """熔断器是否处于打开状态（应跳过本地 router）。"""
+    if _circuit_open_until <= 0:
+        return False
+    if time.monotonic() >= _circuit_open_until:
+        # 冷却到期，进入半开状态：允许一次探测
+        return False
+    return True
+
+
+def _circuit_record_success() -> None:
+    """记录成功，重置熔断器。"""
+    global _circuit_consecutive_failures, _circuit_open_until
+    _circuit_consecutive_failures = 0
+    _circuit_open_until = 0.0
+
+
+def _circuit_record_failure() -> None:
+    """记录失败，必要时打开熔断器。"""
+    global _circuit_consecutive_failures, _circuit_open_until
+    _circuit_consecutive_failures += 1
+    if _circuit_consecutive_failures >= _CIRCUIT_FAILURE_THRESHOLD:
+        _circuit_open_until = time.monotonic() + _CIRCUIT_COOLDOWN_SECONDS
 
 
 class SubAgentDecision(TypedDict):
@@ -30,7 +66,7 @@ class SupportsRequestCreation(Protocol):
 
     def create_request(
         self,
-        task: str = "actor",
+        task: str = "expression",
         sub_task: str = "",
         *,
         with_reminder: str = "",
@@ -105,7 +141,7 @@ def _fit_unreads_to_sub_agent_budget(
     request: LLMRequest,
     unreads_text: str,
 ) -> str:
-    """将未读消息压缩到 sub-agent 可控 token 预算内。"""
+    """将未读消息压缩到模型上下文可控的 token 预算内。"""
     model_set = getattr(request, "model_set", None)
     if not isinstance(model_set, list) or not model_set:
         return unreads_text
@@ -120,7 +156,8 @@ def _fit_unreads_to_sub_agent_budget(
 
     max_context = first_model.get("max_context")
     if isinstance(max_context, int) and max_context > 0:
-        token_budget = min(max(1024, max_context // 4), 8000)
+        # 未读消息占 max_context 的 ~35%（2048 → 716 token；大模型 → 上限 8000）
+        token_budget = min(max(256, max_context * 35 // 100), 8000)
     else:
         token_budget = 6000
 
@@ -136,9 +173,9 @@ def _fit_system_prompt_to_task(
     """按模型上下文预算裁剪系统提示词（保留末尾路由指令部分）。
 
     SOUL.md + USER.md + memory 加在一起可能超过万字，远超小模型上下文。
-    以下预算计算预留了历史（≈1500 token）、未读（max_context/4 最多 2048）、
-    输出（80）、结构开销（200）后，剩余全部分给系统提示词。
-    对前沿大模型（sub_actor，max_context 通常 ≥128k）预算极大，不会裁剪。
+    预算按比例分配：系统提示词占 max_context 的 ~30%，其余留给
+    历史、未读、输出和安全余量。
+    对前沿大模型（agent，max_context 通常 ≥128k）预算极大，不会裁剪。
     """
     model_set = getattr(request, "model_set", None)
     if not isinstance(model_set, list) or not model_set:
@@ -148,11 +185,11 @@ def _fit_system_prompt_to_task(
         return sub_prompt
     model_identifier = first_model.get("model_identifier", "")
     max_context = first_model.get("max_context")
-    max_context = max_context if isinstance(max_context, int) and max_context > 0 else 8192
+    max_context = max_context if isinstance(max_context, int) and max_context > 0 else 2048
 
-    # 为 history(≈1500) + unreads(max/4, ≤2048) + output(80) + scaffold(200) 留空间
-    reserved = 80 + 1500 + min(max_context // 4, 2048) + 200
-    sys_budget = max(1000, max_context - reserved)
+    # 系统提示词预算 = max_context 的 30%（小模型下约 600 token，大模型下极大不会裁剪）
+    # 剩余 70% 留给：history(~20%) + unreads(~35%) + output(80) + scaffold(~100) + safety(~5%)
+    sys_budget = max(400, max_context * 3 // 10)
 
     trimmed = _trim_text_suffix_by_budget(sub_prompt, model_identifier, sys_budget)
     if len(trimmed) < len(sub_prompt):
@@ -210,21 +247,28 @@ async def route_should_respond(
     if prefix_text:
         sub_prompt = f"{prefix_text}\n\n{sub_prompt}"
 
-    # 上下文优化：路由只需近期语境，history 只保留末尾一段（次要延迟优化）
-    _HISTORY_CHAR_BUDGET = 3000
+    # 上下文优化：路由只需近期语境。history 字符预算按 max_context 的 ~15% 估算
+    # （中文 1 字符 ≈ 1-1.5 token）。2048 上下文 → 300 字符；大模型 → 上限 1500。
+    _HISTORY_CHAR_BUDGET = max(200, min(1500, 2048 * 15 // 100))  # 固定用 router 的 2048 算
     fitted_history = (
         history_text.strip()[-_HISTORY_CHAR_BUDGET:] if history_text.strip() else ""
     )
     fitted_unreads = unreads_text
 
-    # 依次尝试：本地 router 小模型（低延迟）→ sub_actor（回退）
+    # 依次尝试：本地 router 小模型（低延迟）→ agent（回退）
+    # 熔断器：本地模型连续失败后自动跳过，避免每条消息都等连接超时
     last_error: str = ""
-    for task in ("router", "sub_actor"):
+    tasks_to_try = ["router", "agent"]
+    if _circuit_is_open():
+        tasks_to_try = ["agent"]
+        logger.debug("Router 熔断器打开，跳过本地 router 模型")
+
+    for task in tasks_to_try:
         try:
             request = chatter.create_request(
                 task,
                 "router",
-                with_reminder="sub_actor",
+                with_reminder="agent",
             )
         except (ValueError, KeyError):
             last_error = f"{task} 未配置"
@@ -247,8 +291,34 @@ async def route_should_respond(
         parts.append("请只判断这批新消息是否应路由给表达层继续处理。")
 
         task_sub_prompt = _fit_system_prompt_to_task(sub_prompt, request, logger, task)
+        user_text = "\n\n".join(parts)
+
+        # 最终硬守卫：token 估算器对中文有系统性低估，逐部件裁剪后仍可能溢出。
+        # 用保守比率（1 字符 ≈ 1.5 token）做总量检查，超了直接砍 system prompt。
+        _model_set_guard = getattr(request, "model_set", None)
+        _max_ctx = 2048
+        if isinstance(_model_set_guard, list) and _model_set_guard and isinstance(_model_set_guard[0], dict):
+            _mc_val = _model_set_guard[0].get("max_context")
+            if isinstance(_mc_val, int) and _mc_val > 0:
+                _max_ctx = _mc_val
+        # 保守 token 估计：中文 1 字符 ≈ 1.5 token
+        _user_tokens_est = int(len(user_text) * 1.5)
+        _output_reserve = 80
+        _sys_budget_hard = _max_ctx - _user_tokens_est - _output_reserve - 100  # 100 最终安全余量
+        if _sys_budget_hard < 100:
+            _sys_budget_hard = 100
+        _sys_tokens_est = int(len(task_sub_prompt) * 1.5)
+        if _sys_tokens_est > _sys_budget_hard:
+            # 按字符比率反算允许的字符数
+            _allowed_chars = int(_sys_budget_hard / 1.5)
+            task_sub_prompt = task_sub_prompt[-_allowed_chars:].strip()
+            logger.info(
+                f"Router[{task}] 硬守卫截断系统提示词 -> {len(task_sub_prompt)} 字符"
+                f"（max_ctx={_max_ctx}, user_est={_user_tokens_est}, sys_hard={_sys_budget_hard}）"
+            )
+
         request.add_payload(LLMPayload(ROLE.SYSTEM, Text(task_sub_prompt)))
-        request.add_payload(LLMPayload(ROLE.USER, Text("\n\n".join(parts))))
+        request.add_payload(LLMPayload(ROLE.USER, Text(user_text)))
 
         try:
             response = await request.send(stream=False)
@@ -256,9 +326,13 @@ async def route_should_respond(
         except Exception as error:  # noqa: BLE001
             last_error = f"{task} 调用失败: {error}"
             logger.warning(f"Router {last_error}，尝试下一个任务")
+            if task == "router":
+                _circuit_record_failure()
             continue
 
         content = response.message
+        if task == "router":
+            _circuit_record_success()
         if not content or not content.strip():
             logger.warning(f"Router[{task}] 返回了空内容，默认进行响应")
             return {"should_respond": True, "reason": "模型未返回判断内容"}

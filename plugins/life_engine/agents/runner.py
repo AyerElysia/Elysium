@@ -85,7 +85,7 @@ class AgentRunner:
             raise RuntimeError("无法获取 life_engine 配置")
 
         # 模型
-        task_name = self.agent_type_def.model_task_name or "sub_actor"
+        task_name = self.agent_type_def.model_task_name or "agent"
         model_set = get_model_set_by_task(task_name)
         if not model_set:
             raise RuntimeError(f"找不到模型配置: {task_name}")
