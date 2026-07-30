@@ -13,7 +13,7 @@ from plugins.life_engine.core.multimodal import (
     _is_gif_image,
     build_multimodal_content,
 )
-from plugins.napcat_adapter.src.handlers import utils as napcat_utils
+from plugins.napcat_adapter.utils import media as napcat_utils
 from src.core.managers.media_manager import MediaManager
 from src.kernel.llm import Image
 
@@ -151,7 +151,7 @@ async def test_napcat_fetch_retries_direct_only_after_proxy_or_connection_failur
         ],
     )
 
-    encoded = await napcat_utils.get_image_base64(str(request.url))
+    encoded = await napcat_utils.download_image_base64(str(request.url))
 
     assert encoded == base64.b64encode(b"image-bytes").decode("utf-8")
     assert len(_FakeAsyncClient.calls) == 2
@@ -179,6 +179,6 @@ async def test_napcat_fetch_does_not_bypass_proxy_after_http_status_error(
     )
 
     with pytest.raises(httpx.HTTPStatusError):
-        await napcat_utils.get_image_base64(str(request.url))
+        await napcat_utils.download_image_base64(str(request.url))
 
     assert len(_FakeAsyncClient.calls) == 1

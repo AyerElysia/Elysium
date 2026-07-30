@@ -13,12 +13,9 @@
 
 from __future__ import annotations
 
-import asyncio
 import base64
 from collections import OrderedDict
 from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
 
 from src.core.managers.media_manager import MediaManager, get_media_manager
 
@@ -41,7 +38,7 @@ class TestMediaManagerInit:
     def test_init_with_vlm(self) -> None:
         """测试有 VLM 配置时的初始化（ASR 未配置）。"""
         def side_effect(task: str):
-            if task == "vlm":
+            if task == "vision":
                 return MagicMock()
             return None
 

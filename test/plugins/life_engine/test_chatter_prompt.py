@@ -669,10 +669,10 @@ def _model_entry(*modalities: str) -> dict[str, object]:
     ("configured_task", "configured_models", "multimodal_enabled", "expected_calls"),
     [
         ("vision-life", [_model_entry("text", "image")], True, ["vision-life"]),
-        ("life", [_model_entry("text")], True, ["life", "actor"]),
+        ("life", [_model_entry("text")], True, ["life", "expression"]),
         ("life", [_model_entry("text")], False, ["life"]),
-        ("missing-models", [], True, ["missing-models", "actor"]),
-        ("", [], True, ["actor"]),
+        ("missing-models", [], True, ["missing-models", "expression"]),
+        ("", [], True, ["expression"]),
     ],
 )
 def test_life_chatter_primary_task_selection_and_media_safe_fallback(
@@ -704,7 +704,7 @@ def test_life_chatter_primary_task_selection_and_media_safe_fallback(
     assert request.task == expected_calls[-1]
 
 
-def test_life_chatter_primary_task_creation_error_falls_back_to_actor(monkeypatch) -> None:
+def test_life_chatter_primary_task_creation_error_falls_back_to_expression(monkeypatch) -> None:
     config = LifeEngineConfig()
     config.model.task_name = "broken-life"
     chatter = _life_chatter_for_config(config)
@@ -719,8 +719,8 @@ def test_life_chatter_primary_task_creation_error_falls_back_to_actor(monkeypatc
 
     monkeypatch.setattr(LifeChatter, "create_request", fake_create_request)
 
-    assert chatter._create_global_request().task == "actor"
-    assert calls == ["broken-life", "actor"]
+    assert chatter._create_global_request().task == "expression"
+    assert calls == ["broken-life", "expression"]
 
 
 async def test_surface_private_message_skips_router_llm(monkeypatch) -> None:

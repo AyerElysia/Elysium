@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import io
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,7 +16,7 @@ from plugins.life_engine.tools.screen_tools import CapturedScreen
 def _make_plugin() -> SimpleNamespace:
     cfg = LifeEngineConfig()
     cfg.screen.enabled = True
-    cfg.screen.native_task_name = "vlm"
+    cfg.screen.native_task_name = "vision"
     cfg.multimodal.enabled = True
     cfg.multimodal.native_image = False
     cfg.model.task_name = "life"
@@ -61,7 +60,7 @@ async def test_view_screen_uses_native_when_screen_native_enabled(monkeypatch: p
     assert isinstance(result, dict)
     assert result["mode"] == "native_image"
     assert result["observation"] == "屏幕上有一个测试窗口。"
-    assert calls == ["vlm"]
+    assert calls == ["vision"]
 
 
 async def test_view_screen_falls_back_when_native_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -87,7 +86,7 @@ async def test_view_screen_falls_back_when_native_disabled(monkeypatch: pytest.M
     assert success is True
     assert isinstance(result, dict)
     assert result["mode"] == "vlm_fallback"
-    assert calls == ["vlm"]
+    assert calls == ["vision"]
 
 
 async def test_view_screen_rejects_when_disabled() -> None:
@@ -150,11 +149,8 @@ async def test_auto_mode_skips_blank_capture_and_tries_next(monkeypatch: pytest.
     monkeypatch.setattr(screen_tools, "_is_wsl", lambda: False)
 
     call_order: list[str] = []
-    normal_capture_done = False
 
     async def fake_ffmpeg(path: object, cfg: object) -> tuple[bool, str]:
-        import tempfile, os
-        from pathlib import Path as _Path
         call_order.append("ffmpeg")
         # ffmpeg 写入一个全黑图
         black = PILImage.new("RGB", (4, 4), color=(0, 0, 0))

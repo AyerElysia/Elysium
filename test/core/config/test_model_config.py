@@ -183,20 +183,24 @@ class TestModelTasksSection:
         """测试默认任务配置。"""
         tasks = ModelTasksSection()
 
-        assert hasattr(tasks, "utils")
-        assert hasattr(tasks, "utils_small")
-        assert hasattr(tasks, "actor")
-        assert hasattr(tasks, "sub_actor")
-        assert hasattr(tasks, "vlm")
+        assert hasattr(tasks, "core")
+        assert hasattr(tasks, "expression")
+        assert hasattr(tasks, "witness")
+        assert hasattr(tasks, "agent")
+        assert hasattr(tasks, "utility")
+        assert hasattr(tasks, "vision")
         assert hasattr(tasks, "voice")
-        assert hasattr(tasks, "tool_use")
+        assert hasattr(tasks, "embedding")
+        assert hasattr(tasks, "router")
+        assert hasattr(tasks, "live")
 
-    def test_get_existing_task(self):
-        """测试获取存在的任务。"""
+    def test_get_legacy_alias_resolves_canonical_task(self):
+        """旧任务名应解析到对应的 canonical 配置。"""
         tasks = ModelTasksSection()
-        tasks.utils = TaskConfigSection(model_list=["gpt-4"])
+        tasks.utility = TaskConfigSection(model_list=["gpt-4"])
 
         task = tasks.get_task("utils")
+        assert task is tasks.utility
         assert task.model_list == ["gpt-4"]
 
     def test_get_nonexistent_task_raises(self):
@@ -209,7 +213,7 @@ class TestModelTasksSection:
     def test_get_none_task_raises(self):
         """测试获取 None 任务抛出异常。"""
         tasks = ModelTasksSection()
-        object.__setattr__(tasks, "utils", None)
+        object.__setattr__(tasks, "utility", None)
 
         with pytest.raises(ValueError, match="任务 'utils' 未配置"):
             tasks.get_task("utils")
@@ -413,8 +417,8 @@ class TestModelConfig:
                 ),
             ],
         )
-        # 设置 model_tasks 的 utils 配置
-        config.model_tasks.utils = TaskConfigSection(
+        # 设置 model_tasks 的 canonical utility 配置
+        config.model_tasks.utility = TaskConfigSection(
             model_list=["gpt4"],
             max_tokens=1000,
             temperature=0.5,
@@ -462,13 +466,13 @@ class TestModelConfig:
                 ),
             ],
         )
-        config.model_tasks.utils = TaskConfigSection(
+        config.model_tasks.utility = TaskConfigSection(
             model_list=["gpt4"],
             max_tokens=1000,
             temperature=0.5,
         )
 
-        model_set = config.get_task("utils")
+        model_set = config.get_task("utility")
         entry = model_set[0]
         assert entry["max_context"] == 16384
         assert entry["tool_call_compat"] is True
@@ -503,11 +507,11 @@ class TestModelConfig:
                 ),
             ],
         )
-        config.model_tasks.actor = TaskConfigSection(
+        config.model_tasks.expression = TaskConfigSection(
             model_list=["gpt4", "claude_opus"],
         )
 
-        model_set = config.get_task("actor")
+        model_set = config.get_task("expression")
 
         assert len(model_set) == 2
         assert model_set[0]["model_identifier"] == "gpt-4"
