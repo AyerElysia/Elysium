@@ -1,0 +1,32 @@
+{
+  "name": "Livestream",
+  "version": "1.0.0",
+  "description": "商业级 AI 直播框架（弹幕互动 + Live2D + TTS）",
+  "author": "Elysium",
+  "license": "GPL-3.0",
+  "min_core_version": "0.1.0",
+  "entry_point": "plugin.py",
+  "keywords": [
+    "livestream",
+    "bilibili",
+    "danmaku",
+    "vtuber",
+    "live2d",
+    "tts"
+  ],
+  "categories": [
+    "entertainment"
+  ],
+  "dependencies": {
+    "plugins": [],
+    "components": []
+  },
+  "python_dependencies": [
+    "fastapi",
+    "pydantic",
+    "blivedm"
+  ],
+  "include": [
+    "static"
+  ]
+}

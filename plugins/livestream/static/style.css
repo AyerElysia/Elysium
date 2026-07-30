@@ -1,0 +1,219 @@
+/* AI Livestream 样式 */
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+    background: #1a1a2e;
+    font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+    color: #eee;
+}
+
+/* Live2D 渲染区 */
+#live2d-container {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 1;
+}
+
+#live2d-canvas {
+    width: 100%;
+    height: 100%;
+}
+
+/* 弹幕飘屏 */
+#danmaku-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 60%;
+    z-index: 10;
+    pointer-events: none;
+    overflow: hidden;
+}
+
+.danmaku-item {
+    position: absolute;
+    white-space: nowrap;
+    font-size: 18px;
+    font-weight: bold;
+    color: #fff;
+    text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.8);
+    animation: danmaku-scroll linear forwards;
+    will-change: transform;
+}
+
+@keyframes danmaku-scroll {
+    from {
+        transform: translateX(100vw);
+    }
+    to {
+        transform: translateX(-100%);
+    }
+}
+
+/* 状态指示 */
+#status-indicator {
+    position: absolute;
+    top: 16px;
+    left: 16px;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    background: rgba(0, 0, 0, 0.6);
+    border-radius: 20px;
+    backdrop-filter: blur(4px);
+}
+
+.status-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: #666;
+    transition: background 0.3s;
+}
+
+.status-dot.idle {
+    background: #4caf50;
+}
+
+.status-dot.thinking {
+    background: #ff9800;
+    animation: pulse 1s infinite;
+}
+
+.status-dot.speaking {
+    background: #2196f3;
+    animation: pulse 0.5s infinite;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+
+#status-text {
+    font-size: 14px;
+}
+
+/* 控制面板 */
+#control-panel {
+    position: absolute;
+    bottom: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 20px;
+    background: rgba(0, 0, 0, 0.7);
+    border-radius: 12px;
+    backdrop-filter: blur(8px);
+}
+
+.ctrl-btn {
+    padding: 8px 16px;
+    border: none;
+    border-radius: 6px;
+    background: #4a4a6a;
+    color: #fff;
+    font-size: 14px;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+.ctrl-btn:hover:not(:disabled) {
+    background: #6a6a9a;
+}
+
+.ctrl-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+#btn-start {
+    background: #2e7d32;
+}
+
+#btn-start:hover:not(:disabled) {
+    background: #388e3c;
+}
+
+#btn-stop {
+    background: #c62828;
+}
+
+#btn-stop:hover:not(:disabled) {
+    background: #d32f2f;
+}
+
+.volume-control {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+}
+
+.volume-control input[type="range"] {
+    width: 80px;
+}
+
+.checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 13px;
+    cursor: pointer;
+}
+
+/* 调试输入 */
+#debug-input {
+    position: absolute;
+    bottom: 70px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 20;
+    display: flex;
+    gap: 8px;
+}
+
+#say-input {
+    width: 300px;
+    padding: 8px 12px;
+    border: 1px solid #555;
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.7);
+    color: #fff;
+    font-size: 14px;
+}
+
+#say-input:focus {
+    outline: none;
+    border-color: #888;
+}
+
+#btn-say {
+    padding: 8px 16px;
+    border: none;
+    border-radius: 6px;
+    background: #5c6bc0;
+    color: #fff;
+    cursor: pointer;
+}
+
+#btn-say:hover {
+    background: #7986cb;
+}
