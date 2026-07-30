@@ -67,6 +67,7 @@ class Scheduler:
 
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._cancelled = False
+        self._fail_fast_triggered = False
         self._running_tasks: dict[str, asyncio.Task] = {}
 
     # ------------------------------------------------------------------
@@ -88,13 +89,26 @@ class Scheduler:
             )
         except asyncio.TimeoutError:
             logger.warning(f"[{self.mission.mission_id}] 使命全局超时")
-            self.graph.cascade_cancel()
+            await self._cancel_running_tasks()
+            self._record_graph_terminal_results(
+                self.graph.cascade_cancel(),
+                TaskStatus.CANCELLED,
+                error="使命全局超时",
+            )
             self.mission.status = MissionStatus.TIMEOUT
         except asyncio.CancelledError:
-            self.graph.cascade_cancel()
+            await self._cancel_running_tasks()
+            self._record_graph_terminal_results(
+                self.graph.cascade_cancel(),
+                TaskStatus.CANCELLED,
+                error="使命执行协程已取消",
+            )
             self.mission.status = MissionStatus.CANCELLED
             raise
 
+        if self._running_tasks:
+            await self._cancel_running_tasks()
+        self._record_missing_terminal_results()
         if self.mission.status == MissionStatus.RUNNING:
             self.mission.status = self._compute_final_status()
 
@@ -107,12 +121,7 @@ class Scheduler:
 
     def cancel(self) -> None:
         """请求取消使命。"""
-        self._cancelled = True
-        # 取消所有正在运行的 asyncio.Task
-        for task_obj in self._running_tasks.values():
-            if not task_obj.done():
-                task_obj.cancel()
-        self.graph.cascade_cancel()
+        self._request_cancel(error="使命已取消")
 
     @property
     def is_cancelled(self) -> bool:
@@ -128,7 +137,7 @@ class Scheduler:
             # 全局预算检查
             if self._budget_exceeded():
                 logger.warning(f"[{self.mission.mission_id}] 全局 token 预算耗尽")
-                self.graph.cascade_cancel()
+                self._request_cancel(error="使命 token 预算耗尽")
                 break
 
             ready = self.graph.get_ready_tasks()
@@ -145,7 +154,12 @@ class Scheduler:
                 else:
                     # 死锁：无就绪、无运行中、但有 pending（不应发生）
                     logger.error(f"[{self.mission.mission_id}] 调度死锁，强制终止")
-                    self.graph.cascade_cancel()
+                    cancelled = self.graph.cascade_cancel()
+                    self._record_graph_terminal_results(
+                        cancelled,
+                        TaskStatus.CANCELLED,
+                        error="调度死锁",
+                    )
                     break
 
             # 启动就绪任务
@@ -172,7 +186,26 @@ class Scheduler:
             tid for tid, t in self._running_tasks.items() if t in done
         ]
         for tid in finished_ids:
-            del self._running_tasks[tid]
+            task_obj = self._running_tasks.pop(tid)
+            if task_obj.cancelled():
+                self._record_terminal_result(
+                    tid,
+                    TaskStatus.CANCELLED,
+                    error="任务执行已取消",
+                )
+                continue
+            exception = task_obj.exception()
+            if exception is not None:
+                logger.error(f"[{tid}] worker 协程异常: {exception}")
+                self.graph.set_status(tid, TaskStatus.FAILED)
+                self._record_terminal_result(
+                    tid,
+                    TaskStatus.FAILED,
+                    error=str(exception),
+                )
+                failed_task = self.graph.get_task(tid)
+                if failed_task is not None:
+                    self._handle_failure(failed_task)
 
     # ------------------------------------------------------------------
     # 单任务执行（含重试）
@@ -236,9 +269,15 @@ class Scheduler:
                 )
                 await asyncio.sleep(backoff)
             else:
-                # 最终失败
-                self.graph.set_status(task_contract.task_id, TaskStatus.FAILED)
-                self._handle_failure(task_contract)
+                # 最终失败；保留 Worker 给出的精确终态（如 TIMEOUT）。
+                terminal_status = (
+                    result.status
+                    if result.status in {TaskStatus.FAILED, TaskStatus.TIMEOUT}
+                    else TaskStatus.FAILED
+                )
+                self.graph.set_status(task_contract.task_id, terminal_status)
+                if terminal_status in {TaskStatus.FAILED, TaskStatus.TIMEOUT}:
+                    self._handle_failure(task_contract)
                 return result
 
         # 不应到达这里
@@ -255,11 +294,20 @@ class Scheduler:
             logger.warning(
                 f"[{self.mission.mission_id}] fail_fast: 取消所有任务"
             )
-            self.cancel()
+            self._fail_fast_triggered = True
+            self._request_cancel(
+                error=f"上游任务失败: {failed_task.task_id}",
+                exclude_task_id=failed_task.task_id,
+            )
 
         elif self.failure_policy == FailurePolicy.CONTINUE_OTHERS:
             # 跳过直接依赖此任务的下游，但其它分支继续
             skipped = self.graph.cascade_skip(failed_task.task_id)
+            self._record_graph_terminal_results(
+                skipped,
+                TaskStatus.SKIPPED,
+                error=f"上游任务失败: {failed_task.task_id}",
+            )
             if skipped:
                 logger.info(
                     f"[{self.mission.mission_id}] 跳过 {len(skipped)} 个下游任务"
@@ -268,6 +316,11 @@ class Scheduler:
         elif self.failure_policy == FailurePolicy.RETRY_THEN_SKIP:
             # 重试已在 _execute_with_retry 中处理，到这里说明重试也失败了
             skipped = self.graph.cascade_skip(failed_task.task_id)
+            self._record_graph_terminal_results(
+                skipped,
+                TaskStatus.SKIPPED,
+                error=f"上游任务重试失败: {failed_task.task_id}",
+            )
             if skipped:
                 logger.info(
                     f"[{self.mission.mission_id}] 重试失败后跳过 {len(skipped)} 个下游"
@@ -276,6 +329,74 @@ class Scheduler:
     # ------------------------------------------------------------------
     # 辅助
     # ------------------------------------------------------------------
+
+    def _request_cancel(
+        self,
+        *,
+        error: str,
+        exclude_task_id: str = "",
+    ) -> None:
+        """同步请求取消，并立即为所有图终态补写可审计结果。"""
+        self._cancelled = True
+        for task_id, task_obj in self._running_tasks.items():
+            if task_id != exclude_task_id and not task_obj.done():
+                task_obj.cancel()
+        cancelled = self.graph.cascade_cancel()
+        self._record_graph_terminal_results(
+            cancelled,
+            TaskStatus.CANCELLED,
+            error=error,
+        )
+
+    async def _cancel_running_tasks(self) -> None:
+        """取消并回收所有运行中协程，避免超时后留下后台 Worker。"""
+        pending = [task for task in self._running_tasks.values() if not task.done()]
+        for task_obj in pending:
+            task_obj.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._collect_done(set(self._running_tasks.values()))
+
+    def _record_terminal_result(
+        self,
+        task_id: str,
+        status: TaskStatus,
+        *,
+        error: str | None = None,
+    ) -> None:
+        """在结果账本中补写未执行或被传播到终态的任务。"""
+        existing = self.mission.results.get(task_id)
+        if existing is not None:
+            return
+        self.mission.results[task_id] = TaskResult(
+            task_id=task_id,
+            status=status,
+            error=error,
+            attempts=0,
+        )
+
+    def _record_graph_terminal_results(
+        self,
+        task_ids: list[str],
+        status: TaskStatus,
+        *,
+        error: str | None = None,
+    ) -> None:
+        for task_id in task_ids:
+            self._record_terminal_result(task_id, status, error=error)
+
+    def _record_missing_terminal_results(self) -> None:
+        """保证 Mission.results 与图中的全部终态任务一一对应。"""
+        for task_id in self.graph.task_ids:
+            status = self.graph.get_status(task_id)
+            if status in {
+                TaskStatus.SUCCEEDED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+                TaskStatus.TIMEOUT,
+                TaskStatus.SKIPPED,
+            }:
+                self._record_terminal_result(task_id, status)
 
     def _gather_upstream_outputs(self, task: TaskContract) -> dict[str, Any]:
         """收集任务依赖的上游输出。"""
@@ -299,6 +420,8 @@ class Scheduler:
             return MissionStatus.SUCCEEDED
         if any(s == TaskStatus.SUCCEEDED for s in statuses):
             return MissionStatus.PARTIAL
+        if self._fail_fast_triggered:
+            return MissionStatus.FAILED
         if self._cancelled:
             return MissionStatus.CANCELLED
         return MissionStatus.FAILED

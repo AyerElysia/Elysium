@@ -275,7 +275,7 @@ def _witness_service_stub(tmp_path: Path, memory: object) -> SimpleNamespace:
         timestamp="2026-07-29T08:00:00+08:00",
         source="chat",
         channel="chat",
-        event_type="message",
+        event_type="text",
         content="真实经历",
         stream_id="stream-1",
     )
