@@ -1,7 +1,7 @@
 """统一平台操作工具。
 
 一个工具覆盖所有平台（QQ / 飞书）的操作能力。
-爱莉通过对应的 skill（qq_actions / feishu_actions）查阅可用操作清单，
+爱莉通过 action='help' 查阅对应平台的能力清单（渐进式披露），
 然后调用本工具执行。
 
 飞书路径通过 lark-cli 命令行执行，覆盖 200+ 命令 / 2500+ API 端点。
@@ -17,6 +17,8 @@ from typing import Annotated, Any
 from src.app.plugin_system.api.adapter_api import send_adapter_command
 from src.app.plugin_system.api import log_api
 from src.app.plugin_system.base import BaseTool
+
+from ._utils import _get_workspace
 
 
 logger = log_api.get_logger("life_engine.platform_tools")
@@ -55,14 +57,15 @@ class PlatformActionTool(BaseTool):
     tool_name: str = "platform_action"
     tool_description: str = (
         "跨平台统一操作接口。通过 platform + action + params 调用任意已支持的平台 API。\n\n"
-        "使用前请先查阅对应平台的 skill：\n"
-        "- QQ: get_skill('qq_actions')\n"
-        "- 飞书: get_skill('feishu_actions')\n\n"
+        "★ 第一次用某个平台前，先查能力清单：\n"
+        "  action='help', platform='qq'     → 查看 QQ 可用操作\n"
+        "  action='help', platform='feishu' → 查看飞书可用操作\n\n"
         "参数：\n"
         "- `platform`: 目标平台（'qq' 或 'feishu'，默认 'qq'）\n"
-        "- `action`: API 动作名（必填，参见对应 skill）\n"
+        "- `action`: API 动作名（必填，参见 help 返回的清单）\n"
         "- `params`: 参数字典（JSON 对象，按操作要求填写）\n\n"
         "举例：\n"
+        "- 查看QQ能力: action='help', platform='qq'\n"
         "- QQ 群签到: platform='qq', action='set_group_sign', params={'group_id': 123}\n"
         "- 飞书发消息: platform='feishu', action='im +messages-send --chat-id oc_xxx --text 你好'\n"
         "- 飞书查群列表: platform='feishu', action='im +chat-list'"
@@ -97,6 +100,10 @@ class PlatformActionTool(BaseTool):
         platform_name = platform.strip().lower()
         if platform_name not in ("qq", "feishu"):
             return False, f"不支持的平台: {platform}（支持: qq, feishu）"
+
+        # 能力清单查询（渐进式披露）
+        if action_name.lower() in ("help", "docs", "list"):
+            return self._read_skill_doc(platform_name)
 
         if platform_name == "qq":
             return await self._execute_qq(action_name, parsed_params)
@@ -204,6 +211,25 @@ class PlatformActionTool(BaseTool):
             return True, stdout_text[:2000]
 
         return True, {"status": "ok"}
+
+    # ------------------------------------------------------------------
+    # 能力清单（渐进式披露）
+    # ------------------------------------------------------------------
+
+    def _read_skill_doc(self, platform: str) -> tuple[bool, str | dict]:
+        """读取平台对应的能力清单文档（SKILL.md）。"""
+        workspace = _get_workspace(self.plugin)
+        doc_path = workspace / "skills" / f"{platform}_actions" / "SKILL.md"
+        if not doc_path.exists():
+            return False, (
+                f"没有找到 {platform} 的能力清单文档。\n"
+                f"期望路径: skills/{platform}_actions/SKILL.md"
+            )
+        try:
+            content = doc_path.read_text(encoding="utf-8")
+            return True, content
+        except Exception as exc:
+            return False, f"读取能力清单失败: {exc}"
 
     # ------------------------------------------------------------------
     # 辅助
