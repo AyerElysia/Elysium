@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, cast
 
 from mofox_wire import CoreSink, MessageEnvelope, WebSocketAdapterOptions
@@ -147,8 +148,6 @@ class NapcatAdapter(BaseAdapter):
 
     async def _ws_health_check(self) -> None:
         """WebSocket 健康检查，检测到断开时记录并尝试触发重连。"""
-        import asyncio
-
         consecutive_failures = 0
         last_log_time = 0.0
 
@@ -184,6 +183,42 @@ class NapcatAdapter(BaseAdapter):
     # ------------------------------------------------------------------
     # WebSocket 连接钩子（由 BaseAdapter 调用）
     # ------------------------------------------------------------------
+
+    async def _start_ws_server(self, options: WebSocketAdapterOptions) -> None:
+        """Override mofox_wire default: call on_ws_connected/on_ws_disconnected hooks."""
+        from urllib.parse import urlparse
+
+        from websockets.legacy import server as ws_server_lib
+
+        parsed = urlparse(options.url)
+        host = parsed.hostname or "0.0.0.0"
+        port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+        path = parsed.path or "/"
+
+        async def handler(ws: Any) -> None:
+            # path guard（与 mofox_wire 保持一致）
+            if options.allowed_paths and ws.path not in options.allowed_paths:
+                await ws.close(code=4000, reason="Path not allowed")
+                return
+            if ws.path != path:
+                await ws.close(code=4000, reason="Path mismatch")
+                return
+
+            self._ws = ws
+            await self.on_ws_connected(ws)   # ← 绑定 NapCatClient._ws
+            try:
+                await self._ws_listen_loop(options)   # _ws_listen_loop 的 finally 会置 self._ws = None
+            finally:
+                await self.on_ws_disconnected()   # ← 解绑 NapCatClient._ws
+
+        self._ws_server = await ws_server_lib.serve(
+            handler,
+            host,
+            port,
+            extra_headers=options.headers,
+            max_size=options.max_message_size,
+        )
+        logger.info(f"NapCat WebSocket 服务器已在 {host}:{port} 启动，等待连接...")
 
     async def on_ws_connected(self, ws: Any) -> None:
         """WebSocket 连接建立时调用。"""

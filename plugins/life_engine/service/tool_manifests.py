@@ -34,6 +34,7 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
         "tool-fetch_chat_history",
         "tool-nucleus_grep_events",
         "action-send_emoji_meme",
+        "tool-qq_action",
     ],
     # 我的世界意识：具身交互，纯视觉→键鼠
     "minecraft": [

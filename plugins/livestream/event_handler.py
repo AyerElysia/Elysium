@@ -46,18 +46,17 @@ class LivestreamEventHandler(BaseEventHandler):
             command = params.get("command", "")
             return await self._handle_command(command, params)
 
-        return EventDecision.CONTINUE, params
+        return EventDecision.SUCCESS, params
 
     async def _on_system_start(self) -> tuple[EventDecision, dict]:
         """系统启动时检查是否需要自动开播。"""
-        # auto_start 逻辑由 router 处理
         logger.info("直播事件处理器已就绪")
-        return EventDecision.CONTINUE, {}
+        return EventDecision.SUCCESS, {}
 
     async def _on_system_stop(self) -> tuple[EventDecision, dict]:
         """系统停止时清理。"""
         logger.info("直播事件处理器已停止")
-        return EventDecision.CONTINUE, {}
+        return EventDecision.SUCCESS, {}
 
     async def _handle_command(
         self, command: str, params: dict
@@ -66,12 +65,12 @@ class LivestreamEventHandler(BaseEventHandler):
         match command:
             case "livestream_start":
                 logger.info("收到直播开始命令")
-                return EventDecision.CONTINUE, {"action": "start"}
+                return EventDecision.SUCCESS, {"action": "start"}
             case "livestream_stop":
                 logger.info("收到直播停止命令")
-                return EventDecision.CONTINUE, {"action": "stop"}
+                return EventDecision.SUCCESS, {"action": "stop"}
             case "livestream_status":
                 logger.info("收到直播状态查询")
-                return EventDecision.CONTINUE, {"action": "status"}
+                return EventDecision.SUCCESS, {"action": "status"}
             case _:
-                return EventDecision.CONTINUE, {}
+                return EventDecision.SUCCESS, params
