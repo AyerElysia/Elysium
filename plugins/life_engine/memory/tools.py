@@ -103,7 +103,7 @@ class LifeEngineSearchMemoryTool(BaseTool):
         "第一人称见证表达爱莉如何经历，不自动证明其中的外部事实。\n\n"
         "**注意：** 搜索和联想是只读操作，不会自动增强激活强度或创建/强化关联边。"
     )
-    chatter_allow: list[str] = ["life_engine_internal"]
+    chatter_allow: list[str] = ["life_engine_internal", "life_chatter"]
 
     def __init__(self, plugin):
         super().__init__(plugin)
@@ -386,7 +386,7 @@ class LifeEngineViewRelationsTool(BaseTool):
         "- ✓ 探索一个主题在你记忆网络中的位置\n"
         "- ✓ depth=2 可以看到“朋友的朋友”层级的关联"
     )
-    chatter_allow: list[str] = ["life_engine_internal"]
+    chatter_allow: list[str] = ["life_engine_internal", "life_chatter"]
 
     def __init__(self, plugin):
         super().__init__(plugin)
@@ -548,7 +548,7 @@ class LifeEngineMemoryStatsTool(BaseTool):
 
     tool_name: str = "nucleus_memory_stats"
     tool_description: str = "获取记忆系统的统计信息：节点数量、关联数量、平均激活强度等。用于了解记忆网络的整体状态。"
-    chatter_allow: list[str] = ["life_engine_internal"]
+    chatter_allow: list[str] = ["life_engine_internal", "life_chatter"]
 
     def __init__(self, plugin):
         super().__init__(plugin)
