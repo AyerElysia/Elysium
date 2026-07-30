@@ -1771,8 +1771,17 @@ class LifeMemoryService:
         self,
         corrections: List[MemoryCorrection],
     ) -> None:
-        """把旧 correction 兼容记录投影到新本体；候选来源不获确认权。"""
+        """把旧 correction 兼容记录投影到新本体；候选来源不获确认权。
+
+        同一逻辑修正可能绑定多个文件节点（多行 correction），但认识论层
+        只需一条 claim。按 (topic, message) 去重。
+        """
+        seen_claims: set[tuple[str, str]] = set()
         for correction in corrections:
+            dedup_key = (correction.topic, correction.message)
+            if dedup_key in seen_claims:
+                continue
+            seen_claims.add(dedup_key)
             source = str(correction.source or "unknown").strip().lower()
             claim = new_claim(
                 claim_id=f"correction_{correction.correction_id}",

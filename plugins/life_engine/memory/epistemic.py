@@ -280,6 +280,7 @@ def authority_for_source(source: str) -> AuthorityClass:
         "reflection": AuthorityClass.REFLECTION,
         "inference": AuthorityClass.INFERRED,
         "inferred": AuthorityClass.INFERRED,
+        "learning_system": AuthorityClass.VERIFIED,
     }
     return aliases.get(normalized, AuthorityClass.UNKNOWN)
 

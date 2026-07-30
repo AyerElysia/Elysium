@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .auditor import InsightAuditor
+from .models import AuditVerdict
 from .knowledge import SelfKnowledgeCompressor
 from .metrics import LearningMetrics
 from .reflection import ReflectionEngine
@@ -148,6 +149,7 @@ class LearningScheduler:
         self._last_audit_at: str = ""
         self._last_metrics_at: str = ""
         self._last_staleness_check_at: str = ""
+        self._epistemic_backfilled = False
 
     # ── 记忆服务晚绑定 ───────────────────────────────────────
 
@@ -214,6 +216,10 @@ class LearningScheduler:
         由 life_engine 心跳周期调用（低频，不必每次心跳都调用）。
         """
         try:
+            # 首次心跳时回填历史验证洞察到认识论层
+            if not self._epistemic_backfilled:
+                await self._backfill_epistemic_claims()
+                self._epistemic_backfilled = True
             await self._maybe_run_audit()
             await self._maybe_run_compression()
             await self._maybe_run_distillation()
@@ -241,6 +247,8 @@ class LearningScheduler:
             self._snapshot_metrics_now()
             # 审计后检查是否需要压缩
             await self._maybe_run_compression()
+            # 将新验证的洞察投影到认识论层
+            await self._project_validated_to_epistemic(records)
 
     async def _maybe_run_compression(self) -> None:
         """检查是否需要压缩。"""
@@ -251,6 +259,103 @@ class LearningScheduler:
         if promoted:
             # 新版本刚落盘，指标曲线上应该有这个点
             self._snapshot_metrics_now()
+
+    async def _backfill_epistemic_claims(self) -> None:
+        """一次性回填：将所有历史 validated 洞察投影到认识论层。
+
+        幂等——已存在的 claim_id 会被跳过。只在首次心跳时执行。
+        """
+        if self._memory_service is None:
+            return
+        validated_insights = self.store.list_validated()
+        if not validated_insights:
+            return
+
+        from ..memory.epistemic import new_claim
+
+        projected = 0
+        for insight in validated_insights:
+            claim_id = f"insight_{insight.insight_id}"
+            try:
+                existing = await self._memory_service.get_memory_claim_state(claim_id)
+                if existing is not None:
+                    continue
+            except Exception:
+                pass
+            try:
+                claim = new_claim(
+                    claim_id=claim_id,
+                    subject_key=f"insight:{insight.category or '自我认知'}",
+                    content=insight.claim,
+                    claim_kind="validated_insight",
+                    source="learning_system",
+                    metadata={
+                        "insight_id": insight.insight_id,
+                        "evidence_count": len(insight.evidence),
+                        "confidence": insight.confidence,
+                        "category": insight.category,
+                    },
+                )
+                await self._memory_service.append_memory_claim(claim)
+                projected += 1
+            except Exception as exc:
+                logger.debug(f"回填洞察投影失败: {exc}")
+
+        if projected:
+            logger.info(f"🧠 认识论回填: {projected} 条历史验证洞察 → claims")
+
+    async def _project_validated_to_epistemic(self, records: list) -> None:
+        """将审计通过的洞察投影到记忆系统认识论层。
+
+        学习系统验证一条洞察（≥ 3 证据 + 多日期）意味着它已经不再是猜测，
+        而是一项经过经验确认的自我认知。将它写入认识论层为 claim，
+        让记忆检索时能触及这些稳定认知。
+        """
+        if self._memory_service is None:
+            return
+        validated = [
+            r for r in records
+            if getattr(r, "verdict", "") == AuditVerdict.VALIDATED.value
+        ]
+        if not validated:
+            return
+
+        from ..memory.epistemic import new_claim
+
+        projected = 0
+        for record in validated:
+            insight = self.store.get_insight(record.insight_id)
+            if insight is None:
+                continue
+            claim_id = f"insight_{insight.insight_id}"
+            # 幂等：已存在则跳过
+            try:
+                existing = await self._memory_service.get_memory_claim_state(claim_id)
+                if existing is not None:
+                    continue
+            except Exception:
+                pass
+            try:
+                claim = new_claim(
+                    claim_id=claim_id,
+                    subject_key=f"insight:{insight.category or '自我认知'}",
+                    content=insight.claim,
+                    claim_kind="validated_insight",
+                    source="learning_system",
+                    metadata={
+                        "insight_id": insight.insight_id,
+                        "evidence_count": len(insight.evidence),
+                        "confidence": insight.confidence,
+                        "category": insight.category,
+                    },
+                )
+                await self._memory_service.append_memory_claim(claim)
+                projected += 1
+            except Exception as exc:
+                logger.debug(f"洞察投影到认识论层失败: {exc}")
+
+        if projected:
+            logger.info(f"🧠 认识论投影: {projected} 条验证洞察 → claims")
 
     async def _maybe_run_distillation(self) -> None:
         """检查是否需要技能蒸馏。"""
