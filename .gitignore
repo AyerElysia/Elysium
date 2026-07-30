@@ -120,6 +120,10 @@ plugins/werewolf_game/**/__pycache__/
 plugins/werewolf_game/**/*.py[cod]
 !plugins/napcat_adapter/
 !plugins/life_engine/
+!plugins/feishu_adapter/
+!plugins/feishu_adapter/**
+plugins/feishu_adapter/**/__pycache__/
+plugins/feishu_adapter/**/*.py[cod]
 !plugins/livestream/
 !plugins/livestream/**
 plugins/livestream/**/__pycache__/

@@ -109,6 +109,16 @@ class FeishuAdapter(BaseAdapter):
             "bot_name": config.bot.bot_name or "爱莉",
         }
 
+    async def execute_action(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Execute a named action via the Feishu action executor.
+
+        Used by the unified platform_action tool.
+        """
+        if not hasattr(self, "_action_executor"):
+            from .actions import FeishuActionExecutor
+            self._action_executor = FeishuActionExecutor(self)
+        return await self._action_executor.execute(action, params)
+
     async def handle_event(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Handle a Feishu event callback payload."""
         if not self._config().plugin.enabled:
