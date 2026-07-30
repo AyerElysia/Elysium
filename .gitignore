@@ -98,7 +98,10 @@ logs/*
 htmlcov/
 .ruff_cache/
 old/
-data/
+data/*
+!data/life_engine_workspace/
+data/life_engine_workspace/*
+!data/life_engine_workspace/skills/
 .claude/
 /config/
 

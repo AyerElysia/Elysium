@@ -3,11 +3,15 @@
 一个工具覆盖所有平台（QQ / 飞书）的操作能力。
 爱莉通过对应的 skill（qq_actions / feishu_actions）查阅可用操作清单，
 然后调用本工具执行。
+
+飞书路径通过 lark-cli 命令行执行，覆盖 200+ 命令 / 2500+ API 端点。
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import shlex
 from typing import Annotated, Any
 
 from src.app.plugin_system.api.adapter_api import send_adapter_command
@@ -16,6 +20,12 @@ from src.app.plugin_system.base import BaseTool
 
 
 logger = log_api.get_logger("life_engine.platform_tools")
+
+# lark-cli 二进制路径
+_LARK_CLI_BIN = "lark-cli"
+
+# 飞书命令超时（秒）
+_FEISHU_TIMEOUT = 30.0
 
 # 默认 QQ 适配器签名
 _DEFAULT_QQ_ADAPTER_SIGN = "napcat_adapter:adapter:napcat_adapter"
@@ -30,11 +40,13 @@ _QQ_BLOCKED_ACTIONS: frozenset[str] = frozenset({
     "get_credentials",
 })
 
-# 飞书危险操作黑名单
-_FEISHU_BLOCKED_ACTIONS: frozenset[str] = frozenset({
-    "delete_chat",
-    "remove_all_members",
-})
+# 飞书禁止的命令关键词（安全策略）
+_FEISHU_BLOCKED_PATTERNS: tuple[str, ...] = (
+    "--yes",           # 禁止自动确认高危操作
+    "auth login",      # 禁止重新认证
+    "config set",      # 禁止修改配置
+    "config init",     # 禁止重置配置
+)
 
 
 class PlatformActionTool(BaseTool):
@@ -52,7 +64,8 @@ class PlatformActionTool(BaseTool):
         "- `params`: 参数字典（JSON 对象，按操作要求填写）\n\n"
         "举例：\n"
         "- QQ 群签到: platform='qq', action='set_group_sign', params={'group_id': 123}\n"
-        "- 飞书发消息: platform='feishu', action='send_text', params={'chat_id': 'oc_xxx', 'text': '你好'}"
+        "- 飞书发消息: platform='feishu', action='im +messages-send --chat-id oc_xxx --text 你好'\n"
+        "- 飞书查群列表: platform='feishu', action='im +chat-list'"
     )
     chatter_allow: list[str] = ["chat", "life_engine_internal"]
 
@@ -125,39 +138,72 @@ class PlatformActionTool(BaseTool):
         return True, str(response)
 
     # ------------------------------------------------------------------
-    # 飞书路径：直接调用适配器 execute_action
+    # 飞书路径：lark-cli subprocess
     # ------------------------------------------------------------------
 
     async def _execute_feishu(self, action: str, params: dict[str, Any]) -> tuple[bool, str | dict]:
-        if action in _FEISHU_BLOCKED_ACTIONS:
-            return False, f"操作 '{action}' 已被安全策略禁止"
+        """通过 lark-cli 执行飞书操作。
+
+        action 为 lark-cli 命令字符串（不含 'lark-cli' 前缀），例如：
+          'im +messages-send --chat-id oc_xxx --text 你好'
+          'calendar +agenda'
+          'docs +fetch --url https://xxx'
+        params 通常为空，保留兼容。
+        """
+        # 安全检查
+        action_lower = action.lower()
+        for pattern in _FEISHU_BLOCKED_PATTERNS:
+            if pattern in action_lower:
+                return False, f"命令包含被禁止的内容 '{pattern}'（安全策略）"
+
+        # 构建命令
+        try:
+            cmd_parts = [_LARK_CLI_BIN] + shlex.split(action)
+        except ValueError as exc:
+            return False, f"命令解析失败: {exc}"
+
+        # lark-cli 默认输出 JSON，无需额外指定
+
+        logger.info(f"[platform_action:feishu] 执行: {' '.join(cmd_parts)}")
 
         try:
-            from plugins.feishu_adapter.adapter import get_feishu_adapter
-            adapter = get_feishu_adapter()
+            proc = await asyncio.create_subprocess_exec(
+                *cmd_parts,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=_FEISHU_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            proc.kill()  # type: ignore[union-attr]
+            return False, f"命令超时（{_FEISHU_TIMEOUT}s）"
+        except FileNotFoundError:
+            return False, "lark-cli 未安装或不在 PATH 中"
         except Exception as exc:
-            return False, f"飞书适配器加载失败: {exc}"
-
-        if adapter is None:
-            return False, "飞书适配器未启动"
-
-        try:
-            result = await adapter.execute_action(action, params)
-        except Exception as exc:
-            logger.error(f"[platform_action:feishu] 执行失败: {action}, error={exc}")
+            logger.error(f"[platform_action:feishu] 执行异常: {exc}")
             return False, f"执行失败: {exc}"
 
-        if isinstance(result, dict):
-            status = result.get("status", "")
-            if status == "ok":
-                data = result.get("data", result)
-                logger.info(f"[platform_action:feishu] 成功: {action}")
-                return True, data if data else {"status": "ok"}
-            msg = result.get("message") or str(result)
-            logger.warning(f"[platform_action:feishu] 失败: {action} -> {msg}")
-            return False, f"操作失败: {msg}"
+        stdout_text = stdout.decode("utf-8", errors="replace").strip()
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
 
-        return True, str(result)
+        if proc.returncode != 0:  # type: ignore[union-attr]
+            err_msg = stderr_text or stdout_text or f"exit code {proc.returncode}"
+            logger.warning(f"[platform_action:feishu] 失败: {err_msg[:300]}")
+            return False, f"命令失败: {err_msg[:500]}"
+
+        # 尝试解析 JSON 输出
+        if stdout_text:
+            try:
+                data = json.loads(stdout_text)
+                logger.info(f"[platform_action:feishu] 成功")
+                return True, data
+            except (json.JSONDecodeError, TypeError):
+                pass
+            # 非 JSON 输出直接返回文本
+            return True, stdout_text[:2000]
+
+        return True, {"status": "ok"}
 
     # ------------------------------------------------------------------
     # 辅助
