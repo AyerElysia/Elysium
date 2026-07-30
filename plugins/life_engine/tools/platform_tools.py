@@ -70,7 +70,7 @@ class PlatformActionTool(BaseTool):
         "- 飞书发消息: platform='feishu', action='im +messages-send --chat-id oc_xxx --text 你好'\n"
         "- 飞书查群列表: platform='feishu', action='im +chat-list'"
     )
-    chatter_allow: list[str] = ["chat", "life_engine_internal"]
+    chatter_allow: list[str] = ["life_chatter", "life_engine_internal"]
 
     async def execute(
         self,
