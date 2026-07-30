@@ -56,6 +56,37 @@ def _message(
     )
 
 
+def test_life_chatter_uses_dedicated_chatter_task_when_configured() -> None:
+    """独立 chatter_task_name 应优先于潜意识 task_name。"""
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter._get_config = lambda: SimpleNamespace(
+        model=SimpleNamespace(
+            task_name="core",
+            chatter_task_name="expression_large",
+        )
+    )
+
+    assert chatter._configured_primary_task_name() == "expression_large"
+
+
+def test_life_chatter_follows_core_task_when_dedicated_task_is_empty() -> None:
+    """独立任务留空时，主意识应跟随共享 task_name。"""
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter._get_config = lambda: SimpleNamespace(
+        model=SimpleNamespace(task_name="core", chatter_task_name="")
+    )
+
+    assert chatter._configured_primary_task_name() == "core"
+
+
+def test_life_chatter_falls_back_to_expression_without_model_config() -> None:
+    """旧配置没有 model section 时应安全回退 expression。"""
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter._get_config = lambda: None
+
+    assert chatter._configured_primary_task_name() == "expression"
+
+
 def test_life_chatter_runtime_queue_is_per_stream() -> None:
     push_runtime_assistant_injection("stream_a", "[内心独白] A")
     push_runtime_assistant_injection("stream_b", "[内心独白] B")
@@ -306,8 +337,8 @@ def _make_event(seq: int, **kwargs) -> LifeEngineEvent:
     return LifeEngineEvent(**base)
 
 
-async def test_build_chatter_runtime_includes_full_new_event_stream() -> None:
-    """新增 life 事件流应完整进入 runtime context，而不是只剩 salient tail。"""
+async def test_build_chatter_runtime_filters_tool_call_noise() -> None:
+    """运行上下文保留有意义结果，但不把原始工具调用参数注入表达层。"""
     service = LifeEngineService(SimpleNamespace(config=None))
     chat = SimpleNamespace(stream_id="stream-x")
     service._event_history = [
@@ -331,7 +362,7 @@ async def test_build_chatter_runtime_includes_full_new_event_stream() -> None:
     text, hw = await service.build_chatter_runtime_context(chat)
     assert "### 新增 life 事件流" in text
     assert "HB_NOISE" in text
-    assert "tool_args_blob" in text
+    assert "tool_args_blob" not in text
     assert "AGENT_DONE" in text
     assert hw == 3
 

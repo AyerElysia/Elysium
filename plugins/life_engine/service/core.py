@@ -2962,16 +2962,26 @@ class LifeEngineService(BaseService):
         events.sort(key=lambda event: int(event.sequence or 0))
 
         limit = max(1, min(int(event_limit or 80), 160))
-        relevant_events = [
+        unread_events = [
             event
             for event in events
             if int(event.sequence or 0) > event_cursor
-            and self._event_belongs_to_life_runtime(
+        ]
+        relevant_events = [
+            event
+            for event in unread_events
+            if self._event_belongs_to_life_runtime(
                 event,
                 current_stream_id=stream_id,
                 unified_chatter_context=unified_chatter_context,
             )
         ]
+        # 被表达层策略过滤的工具调用仍属于已经观察过的事件。
+        # 游标必须越过它们，否则同一批不可见噪声会在每轮上下文构建时反复扫描。
+        unread_high_water = max(
+            (int(event.sequence or 0) for event in unread_events),
+            default=event_cursor,
+        )
         if unified_chatter_context:
             attention_window = self._get_attention_router().select(
                 relevant_events,
@@ -2981,14 +2991,15 @@ class LifeEngineService(BaseService):
             )
             selected_events = attention_window.events
             omitted_event_count = attention_window.dropped_count
-            new_event_high_water = max(attention_window.high_water, event_cursor)
+            new_event_high_water = max(
+                attention_window.high_water,
+                unread_high_water,
+                event_cursor,
+            )
         else:
             omitted_event_count = max(0, len(relevant_events) - limit)
             selected_events = relevant_events[-limit:]
-            new_event_high_water = max(
-                (int(event.sequence or 0) for event in relevant_events),
-                default=event_cursor,
-            )
+            new_event_high_water = unread_high_water
 
         sections: list[str] = []
 

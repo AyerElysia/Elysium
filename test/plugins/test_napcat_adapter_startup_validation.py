@@ -248,49 +248,27 @@ def test_get_bot_info_returns_standard_bot_name_field() -> None:
     }
 
 
-def test_send_platform_message_propagates_send_handler_error() -> None:
-    """Napcat 发送失败时不应被适配器吞掉异常。"""
-    config = NapcatAdapterConfig.from_dict(
-        {
-            "plugin": {"enabled": True, "config_version": "2.0.0"},
-            "bot": {"qq_id": "123456789", "qq_nickname": "MoFoxBot"},
-            "napcat_server": {
-                "mode": "reverse",
-                "host": "localhost",
-                "port": 8095,
-                "access_token": "",
-            },
-            "features": {
-                "group_list_type": "blacklist",
-                "group_list": [],
-                "private_list_type": "blacklist",
-                "private_list": [],
-                "ban_user_id": [],
-                "enable_poke": True,
-                "ignore_non_self_poke": False,
-                "poke_debounce_seconds": 2.0,
-                "enable_emoji_like": True,
-                "enable_reply_at": True,
-                "reply_at_rate": 0.5,
-                "enable_video_processing": True,
-                "video_max_size_mb": 100,
-                "video_download_timeout": 60,
-            },
-        }
+def test_send_platform_message_propagates_sender_error() -> None:
+    """NapCat v3 出站发送失败时不应被适配器吞掉异常。"""
+    adapter = NapcatAdapter(
+        core_sink=cast(Any, _FakeCoreSink()),
+        plugin=_build_napcat_plugin(),
     )
-    plugin = NapcatAdapterPlugin(config=config)
-    adapter = NapcatAdapter(core_sink=cast(Any, _FakeCoreSink()), plugin=plugin)
-    adapter.send_handler.handle_message = AsyncMock(side_effect=ValueError("bad target"))
+    adapter._sender.send = AsyncMock(side_effect=ValueError("bad target"))
 
+    envelope = {
+        "message_info": {},
+        "message_segment": {"type": "text", "data": "hello"},
+    }
     with pytest.raises(ValueError, match="bad target"):
-        asyncio.run(adapter._send_platform_message({"message_info": {}, "message_segment": {}}))
+        asyncio.run(adapter._send_platform_message(envelope))
 
 
 async def test_send_platform_message_preserves_napcat_timeout_cause() -> None:
     """Napcat API 超时应保留原始 TimeoutError 异常链。"""
     plugin = _build_napcat_plugin()
     adapter = NapcatAdapter(core_sink=cast(Any, _FakeCoreSink()), plugin=plugin)
-    adapter.send_napcat_api = AsyncMock(side_effect=TimeoutError("napcat timeout"))
+    adapter._client.call = AsyncMock(side_effect=TimeoutError("napcat timeout"))
     envelope = {
         "message_info": {
             "user_info": {"user_id": "987654"},
@@ -300,20 +278,17 @@ async def test_send_platform_message_preserves_napcat_timeout_cause() -> None:
         ],
     }
 
-    with pytest.raises(RuntimeError, match="Napcat 消息发送超时") as exc_info:
+    with pytest.raises(TimeoutError, match="napcat timeout"):
         await adapter._send_platform_message(envelope)
 
-    assert isinstance(exc_info.value.__cause__, TimeoutError)
-    assert str(exc_info.value.__cause__) == "napcat timeout"
+    adapter._client.call.assert_awaited_once()
 
 
 def test_send_normal_message_splits_multiline_text_into_multiple_napcat_messages() -> None:
     """NapCat 出站文本包含换行时，应拆成多条消息发送。"""
     plugin = _build_napcat_plugin()
     adapter = NapcatAdapter(core_sink=cast(Any, _FakeCoreSink()), plugin=plugin)
-    adapter.send_handler.send_message_to_napcat = AsyncMock(
-        return_value={"status": "ok"}
-    )
+    adapter._client.call = AsyncMock(return_value={"status": "ok"})
 
     envelope = {
         "message_info": {
@@ -325,11 +300,11 @@ def test_send_normal_message_splits_multiline_text_into_multiple_napcat_messages
         ],
     }
 
-    asyncio.run(adapter.send_handler.send_normal_message(envelope))
+    asyncio.run(adapter._sender.send(envelope))
 
-    assert adapter.send_handler.send_message_to_napcat.await_count == 2
-    first_call = adapter.send_handler.send_message_to_napcat.await_args_list[0]
-    second_call = adapter.send_handler.send_message_to_napcat.await_args_list[1]
+    assert adapter._client.call.await_count == 2
+    first_call = adapter._client.call.await_args_list[0]
+    second_call = adapter._client.call.await_args_list[1]
 
     assert first_call.args[0] == "send_group_msg"
     assert first_call.args[1]["group_id"] == 123456
@@ -348,9 +323,7 @@ def test_send_normal_message_keeps_single_line_text_as_one_napcat_message() -> N
     """普通单行文本应保持单条发送。"""
     plugin = _build_napcat_plugin()
     adapter = NapcatAdapter(core_sink=cast(Any, _FakeCoreSink()), plugin=plugin)
-    adapter.send_handler.send_message_to_napcat = AsyncMock(
-        return_value={"status": "ok"}
-    )
+    adapter._client.call = AsyncMock(return_value={"status": "ok"})
 
     envelope = {
         "message_info": {
@@ -361,10 +334,10 @@ def test_send_normal_message_keeps_single_line_text_as_one_napcat_message() -> N
         ],
     }
 
-    asyncio.run(adapter.send_handler.send_normal_message(envelope))
+    asyncio.run(adapter._sender.send(envelope))
 
-    assert adapter.send_handler.send_message_to_napcat.await_count == 1
-    only_call = adapter.send_handler.send_message_to_napcat.await_args_list[0]
+    assert adapter._client.call.await_count == 1
+    only_call = adapter._client.call.await_args_list[0]
     assert only_call.args[0] == "send_private_msg"
     assert only_call.args[1]["user_id"] == 987654
     assert only_call.args[1]["message"] == [
@@ -406,8 +379,9 @@ def test_handle_raw_message_ignores_bot_self_echo() -> None:
     adapter = NapcatAdapter(core_sink=cast(Any, _FakeCoreSink()), plugin=plugin)
 
     envelope = asyncio.run(
-        adapter.message_handler.handle_raw_message(
+        adapter.from_platform_message(
             {
+                "post_type": "message",
                 "self_id": "123456789",
                 "message_id": 1001,
                 "message_type": "private",
@@ -457,8 +431,9 @@ def test_handle_raw_message_keeps_normal_private_message() -> None:
     adapter = NapcatAdapter(core_sink=cast(Any, _FakeCoreSink()), plugin=plugin)
 
     envelope = asyncio.run(
-        adapter.message_handler.handle_raw_message(
+        adapter.from_platform_message(
             {
+                "post_type": "message",
                 "self_id": "123456789",
                 "message_id": 1002,
                 "message_type": "private",
@@ -474,23 +449,33 @@ def test_handle_raw_message_keeps_normal_private_message() -> None:
     assert envelope is not None
 
 
-async def test_meta_event_handler_reconnects_when_heartbeat_times_out(monkeypatch) -> None:
-    """心跳超时时应触发适配器自动重连。"""
-
+async def test_meta_event_handler_reconnects_on_unhealthy_heartbeat() -> None:
+    """OneBot 明确报告异常心跳时应触发适配器重连。"""
     plugin = _build_napcat_plugin()
     adapter = NapcatAdapter(core_sink=cast(Any, _FakeCoreSink()), plugin=plugin)
     adapter.reconnect = AsyncMock()
+    adapter._router.meta_handler.set_reconnect_callback(adapter.reconnect)
 
-    handler = adapter.meta_event_handler
-    handler.last_heart_beat = 0.0
-    handler.interval = 0.01
-
-    monkeypatch.setattr(
-        "plugins.napcat_adapter.src.handlers.to_core.meta_event_handler.time.time",
-        lambda: 0.03,
+    await adapter._router.meta_handler.handle(
+        {
+            "post_type": "meta_event",
+            "meta_event_type": "heartbeat",
+            "self_id": 123456789,
+            "status": {"online": False, "good": False},
+            "interval": 30000,
+        }
     )
 
-    await handler.check_heartbeat(123456789)
-
     adapter.reconnect.assert_awaited_once()
-    assert handler._interval_checking is False
+
+
+def test_napcat_health_does_not_use_business_message_inactivity() -> None:
+    """安静连接是正常状态，不能按多久没业务消息触发重连。"""
+    adapter = NapcatAdapter(
+        core_sink=cast(Any, _FakeCoreSink()),
+        plugin=_build_napcat_plugin(),
+    )
+
+    assert not hasattr(adapter, "_activity_timeout")
+    assert not hasattr(adapter, "_last_message_time")
+    assert not hasattr(adapter, "_watchdog_thread")

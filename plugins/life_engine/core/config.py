@@ -44,7 +44,7 @@ class LifeEngineConfig(BaseConfig):
             "workspace_path",
             "max_rounds_per_heartbeat",
         },
-        "model": {"task_name"},
+        "model": {"task_name", "chatter_task_name"},
         "memory_index": {
             "enabled",
             "interval_seconds",
@@ -248,7 +248,11 @@ class LifeEngineConfig(BaseConfig):
 
         task_name: str = Field(
             default="core",
-            description="中枢任务使用的模型任务名称，对应 config/model.toml 中的 [model_tasks.core]。",
+            description="潜意识（心跳）使用的模型任务名称，对应 config/model.toml 中的 [model_tasks.core]。",
+        )
+        chatter_task_name: str = Field(
+            default="",
+            description="主意识（chatter 表达层）使用的模型任务名。留空时跟随 task_name。",
         )
 
     @config_section("memory_index")

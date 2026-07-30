@@ -116,3 +116,22 @@ def test_cross_day_sleep_window() -> None:
     )
     assert config.settings.sleep_time == "23:00"
     assert config.settings.wake_time == "07:00"
+
+
+def test_model_section_allows_dedicated_chatter_task() -> None:
+    """主意识可以使用不同于潜意识心跳的模型任务。"""
+    model = LifeEngineConfig.ModelSection(
+        task_name="core",
+        chatter_task_name="expression_large",
+    )
+
+    assert model.task_name == "core"
+    assert model.chatter_task_name == "expression_large"
+
+
+def test_model_section_keeps_chatter_task_optional() -> None:
+    """未配置独立主意识任务时保留空值，由运行时跟随 task_name。"""
+    model = LifeEngineConfig.ModelSection(task_name="core")
+
+    assert model.task_name == "core"
+    assert model.chatter_task_name == ""

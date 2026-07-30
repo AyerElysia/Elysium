@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any, cast
 
 from mofox_wire import CoreSink, MessageEnvelope, WebSocketAdapterOptions
@@ -95,9 +94,6 @@ class NapcatAdapter(BaseAdapter):
         # 注入重连回调
         self._router.meta_handler.set_reconnect_callback(self.reconnect)
 
-        # WebSocket 健康检查任务
-        self._health_check_task: asyncio.Task | None = None
-        self._health_check_running = False
 
     def _get_config(self) -> NapcatAdapterConfig | None:
         """获取当前插件配置。"""
@@ -119,66 +115,41 @@ class NapcatAdapter(BaseAdapter):
         config = cast(NapcatAdapterConfig, self.plugin.config)
         _validate_bot_identity(config)
 
-        # 启动 WebSocket 健康检查
-        self._health_check_running = True
-        self._health_check_task = asyncio.create_task(self._ws_health_check())
-
         logger.info("NapCat 适配器已加载")
 
     async def on_adapter_unloaded(self) -> None:
         """适配器卸载。"""
         logger.info("NapCat 适配器正在关闭...")
 
-        # 停止健康检查
-        self._health_check_running = False
-        if self._health_check_task:
-            self._health_check_task.cancel()
-            try:
-                await self._health_check_task
-            except asyncio.CancelledError:
-                pass
-
-        # 停止心跳检查
+        # 停止 OneBot 元事件心跳检查
+        # BaseAdapter 仍负责 WebSocket 连接状态健康检查。
+        # 不能用“多久没有业务消息”判断连接僵死：安静连接是正常状态。
+        # 传输层 ping/pong 与 OneBot heartbeat 才是连接健康的依据。
         self._router.meta_handler.stop()
+
+        # 关闭 WebSocket 连接
+        if self._ws:
+            try:
+                await self._ws.close()
+                logger.info("WebSocket 连接已关闭")
+            except Exception as e:
+                logger.warning(f"关闭 WebSocket 连接时出错: {e}")
+            self._ws = None
+
+        # 关闭 WebSocket 服务器（释放端口）
+        if self._ws_server:
+            try:
+                self._ws_server.close()
+                await self._ws_server.wait_closed()
+                logger.info("WebSocket 服务器已关闭，端口已释放")
+            except Exception as e:
+                logger.warning(f"关闭 WebSocket 服务器时出错: {e}")
+            self._ws_server = None
 
         # 解绑 WebSocket
         self._client.unbind_ws()
 
         logger.info("NapCat 适配器已关闭")
-
-    async def _ws_health_check(self) -> None:
-        """WebSocket 健康检查，检测到断开时记录并尝试触发重连。"""
-        consecutive_failures = 0
-        last_log_time = 0.0
-
-        while self._health_check_running:
-            try:
-                await asyncio.sleep(5)  # 每 5 秒检查一次
-
-                # 检查 _ws 状态
-                if self._client._ws is None:
-                    consecutive_failures += 1
-                    current_time = asyncio.get_event_loop().time()
-
-                    # 避免日志刷屏，每 30 秒记录一次
-                    if current_time - last_log_time > 30:
-                        logger.warning(
-                            f"检测到 WebSocket 连接丢失（_ws=None），已持续 {consecutive_failures * 5} 秒。"
-                            "这通常是 mofox_wire 的 _ws_listen_loop 异常退出导致。"
-                            "NapCat 会自动重连，重连后连接将恢复。"
-                        )
-                        last_log_time = current_time
-                else:
-                    # 连接正常，重置计数
-                    if consecutive_failures > 0:
-                        logger.info("WebSocket 连接已恢复")
-                        consecutive_failures = 0
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"健康检查异常: {e}")
-                await asyncio.sleep(10)
 
     # ------------------------------------------------------------------
     # WebSocket 连接钩子（由 BaseAdapter 调用）
@@ -217,6 +188,8 @@ class NapcatAdapter(BaseAdapter):
             port,
             extra_headers=options.headers,
             max_size=options.max_message_size,
+            ping_interval=20,
+            ping_timeout=20,
         )
         logger.info(f"NapCat WebSocket 服务器已在 {host}:{port} 启动，等待连接...")
 

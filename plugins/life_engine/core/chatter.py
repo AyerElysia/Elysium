@@ -1263,11 +1263,17 @@ class LifeChatter(BaseChatter):
         cls._GLOBAL_USABLE_MAP = None
 
     def _configured_primary_task_name(self) -> str:
-        """返回 life_chatter 主任务名；旧配置缺失或留空时沿用 expression。"""
+        """返回 life_chatter 主任务名；优先读 chatter_task_name，留空时跟随 task_name，再留空用 expression。"""
 
         cfg = self._get_config()
         model_cfg = getattr(cfg, "model", None) if cfg is not None else None
-        return str(getattr(model_cfg, "task_name", "") or "").strip() or "expression"
+        # 优先使用独立的 chatter 任务名
+        chatter_task = str(getattr(model_cfg, "chatter_task_name", "") or "").strip()
+        if chatter_task:
+            return chatter_task
+        # 回退到共享 task_name
+        shared_task = str(getattr(model_cfg, "task_name", "") or "").strip()
+        return shared_task or "expression"
 
     def _required_primary_modalities(self) -> set[str]:
         """返回长生命周期主 request 必须预先覆盖的输入模态。"""

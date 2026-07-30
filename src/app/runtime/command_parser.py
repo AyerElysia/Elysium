@@ -6,11 +6,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import queue
+import sys
 import threading
 from typing import TYPE_CHECKING, Any, Callable
 
 from .exceptions import CommandExecutionError
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .bot import Bot
@@ -130,7 +134,7 @@ class CommandParser:
 
             if isinstance(input_item, BaseException):
                 if isinstance(input_item, EOFError):
-                    return False
+                    return self._handle_stdin_eof()
                 if isinstance(input_item, KeyboardInterrupt):
                     return False
                 raise input_item
@@ -175,8 +179,7 @@ class CommandParser:
             return True
 
         except EOFError:
-            # 输入结束（如 Ctrl+D）
-            return False
+            return self._handle_stdin_eof()
         except KeyboardInterrupt:
             # 用户中断（如 Ctrl+C）
             return False
@@ -184,6 +187,19 @@ class CommandParser:
             raise
         except Exception as e:
             raise CommandExecutionError(command_name, str(e)) from e
+
+    def _handle_stdin_eof(self) -> bool:
+        """处理标准输入结束。
+
+        无 TTY 的服务环境（如 systemd 的 ``StandardInput=null``）没有交互式
+        输入，EOF 只意味着应关闭输入线程，Bot 仍需继续运行。真实终端中的
+        Ctrl+D 则保留传统语义：结束交互主循环。
+        """
+        self._input_stop_event.set()
+        if sys.stdin.isatty():
+            return False
+        logger.info("stdin 已关闭，Elysium 切换为无交互模式，持续运行中...")
+        return True
 
     async def cmd_help(self, args: list[str]) -> None:
         """显示帮助信息
