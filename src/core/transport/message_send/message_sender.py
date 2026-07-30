@@ -372,7 +372,7 @@ class MessageSender:
         虚拟发送同样先发布 ON_MESSAGE_SENT 供处理器拦截；历史写入完成后
         再发布 ON_MESSAGE_DELIVERED，表示虚拟投递已确认。
         """
-        adapter_signature = "live_bridge:adapter:virtual_live"
+        adapter_signature = "core:adapter:virtual_send"
 
         try:
             envelope = await self._converter.message_to_envelope(message)

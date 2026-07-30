@@ -515,7 +515,7 @@ async def test_virtual_send_events_wrap_history_persistence(
         EventType.ON_MESSAGE_DELIVERED,
     ]
     _, params = event_manager.publish_event.await_args_list[1].args
-    assert params["adapter_signature"] == "live_bridge:adapter:virtual_live"
+    assert params["adapter_signature"] == "core:adapter:virtual_send"
 
 
 async def test_virtual_send_can_be_intercepted_before_history(
