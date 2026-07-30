@@ -129,11 +129,29 @@ fi
 # 钉死。这个参数一给，vLLM 就跳过 profiling 那套差值计算（源码 determine_available_memory
 # 开头就 return 了），共用显卡上的抖动再也影响不到它。
 # 尺寸我们自己按模型几何算，比差值靠谱得多。
-read -r VRAM_TOTAL VRAM_FREE VRAM_USED < <(
-    nvidia-smi --query-gpu=memory.total,memory.free,memory.used --format=csv,noheader,nounits \
-        | head -n1 | tr -d ','
-)
-echo "==> 显存: 总 ${VRAM_TOTAL}MiB / 空闲 ${VRAM_FREE}MiB / 他人占用 ${VRAM_USED}MiB"
+
+# nvidia-smi 在 WSL/systemd 环境下可能不在 PATH 里，自动探测
+if ! command -v nvidia-smi &>/dev/null; then
+    for _candidate in /usr/lib/wsl/lib/nvidia-smi /usr/bin/nvidia-smi /usr/local/bin/nvidia-smi; do
+        if [ -x "$_candidate" ]; then
+            export PATH="$(dirname "$_candidate"):$PATH"
+            break
+        fi
+    done
+fi
+
+if command -v nvidia-smi &>/dev/null; then
+    read -r VRAM_TOTAL VRAM_FREE VRAM_USED < <(
+        nvidia-smi --query-gpu=memory.total,memory.free,memory.used --format=csv,noheader,nounits \
+            | head -n1 | tr -d ','
+    )
+    echo "==> 显存: 总 ${VRAM_TOTAL}MiB / 空闲 ${VRAM_FREE}MiB / 他人占用 ${VRAM_USED}MiB"
+else
+    echo "==> nvidia-smi 不可用，使用默认显存预算"
+    VRAM_TOTAL=24576
+    VRAM_FREE=10240
+    VRAM_USED=14336
+fi
 
 # 每 token 的 KV cache 字节数，从模型 config.json 现算（换模型自动跟着变）：
 #   层数 × KV head 数 × head_dim × 2(K+V) × 2(bf16)

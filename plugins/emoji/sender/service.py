@@ -633,7 +633,7 @@ class EmojiSenderService(BaseService):
     ) -> dict[str, Any] | None:
         """调用 VLM 对表情包做收藏决策与标注。"""
         try:
-            model_set = get_model_set_by_task("vlm")
+            model_set = get_model_set_by_task("vision")
         except Exception:
             logger.debug("未配置 VLM 任务模型，跳过入库")
             return None
@@ -1260,7 +1260,7 @@ class EmojiSenderService(BaseService):
         这是前注意感知，只做“认出”，不做“是否收藏”的决定——那是她的选择。
         """
         try:
-            model_set = get_model_set_by_task("vlm")
+            model_set = get_model_set_by_task("vision")
         except Exception:
             logger.debug("未配置 VLM 任务模型，跳过感知筛选")
             return None

@@ -33,20 +33,20 @@ class LivestreamEventHandler(BaseEventHandler):
     def init_subscribe(self) -> list:
         return [EventType.ON_START, EventType.ON_STOP, LIVESTREAM_COMMAND_EVENT]
 
-    async def execute(self, event_type: Any, **kwargs: Any) -> tuple[EventDecision, dict]:
+    async def execute(self, event_name: str, params: dict[str, Any]) -> tuple[EventDecision, dict[str, Any]]:
         """处理事件。"""
         # 系统启动/停止
-        if event_type == EventType.ON_START:
+        if event_name == EventType.ON_START:
             return await self._on_system_start()
-        if event_type == EventType.ON_STOP:
+        if event_name == EventType.ON_STOP:
             return await self._on_system_stop()
 
         # 自定义命令
-        if event_type == LIVESTREAM_COMMAND_EVENT:
-            command = kwargs.get("command", "")
-            return await self._handle_command(command, kwargs)
+        if event_name == LIVESTREAM_COMMAND_EVENT:
+            command = params.get("command", "")
+            return await self._handle_command(command, params)
 
-        return EventDecision.CONTINUE, {}
+        return EventDecision.CONTINUE, params
 
     async def _on_system_start(self) -> tuple[EventDecision, dict]:
         """系统启动时检查是否需要自动开播。"""

@@ -218,88 +218,96 @@ class TaskConfigSection(SectionBase):
 # Model Tasks Configuration
 # ==============================================================================
 
+# 旧任务名 → 新任务名的别名映射。
+# 代码中仍有大量旧名硬编码，此表保证向后兼容。
+_TASK_ALIASES: dict[str, str] = {
+    "life": "core",
+    "actor": "expression",
+    "sub_actor": "agent",
+    "diary": "witness",
+    "vlm": "vision",
+    "video": "vision",
+    "utils": "utility",
+    "utils_small": "utility",
+    "media_observer": "vision",
+    "tool_use": "agent",
+}
+
 
 class ModelTasksSection(SectionBase):
     """模型任务配置集合
-    
+
     包含所有预定义任务的配置，同时允许用户添加自定义任务。
+    任务命名按功能语义划分，对应生命引擎的各子系统。
     """
 
     model_config = ConfigDict(extra="allow")
     __config_extra_section_model__: ClassVar[type[SectionBase]] = TaskConfigSection
 
-    # ========== 核心对话任务 ==========
-    utils: TaskConfigSection = Field(
+    # ========== 意识与认知 ==========
+    core: TaskConfigSection = Field(
         default_factory=lambda: TaskConfigSection(model_list=["siliconflow-deepseek-ai/DeepSeek-V3.2"]),
-        description="在 MoFox 的一些组件中使用的模型，例如表情包模块，取名模块，关系模块，是 MoFox 必须的模型",
+        description="生命中枢：心跳循环、意识推理、核心决策",
     )
-    utils_small: TaskConfigSection = Field(
-        default_factory=lambda: TaskConfigSection(model_list=["qwen3-8b"]),
-        description="在 MoFox 的一些组件中使用的小模型，消耗量较大，建议使用速度较快的小模型",
-    )
-    actor: TaskConfigSection = Field(
+    expression: TaskConfigSection = Field(
         default_factory=lambda: TaskConfigSection(model_list=["siliconflow-deepseek-ai/DeepSeek-V3.2"]),
-        description="动作器模型配置",
+        description="表达层：chatter 对话生成、情感表达",
     )
-    diary: TaskConfigSection = Field(
+    witness: TaskConfigSection = Field(
         default_factory=lambda: TaskConfigSection(model_list=["siliconflow-deepseek-ai/DeepSeek-V3.2"]),
-        description="日记相关模型配置",
+        description="见证意识：经历沉淀、记忆凝缩",
     )
-    life: TaskConfigSection = Field(
-        default_factory=lambda: TaskConfigSection(
-            model_list=["siliconflow-deepseek-ai/DeepSeek-V3.2"]
-        ),
-        description="生命中枢任务配置",
-    )
-    sub_actor: TaskConfigSection = Field(
+    agent: TaskConfigSection = Field(
         default_factory=lambda: TaskConfigSection(model_list=["siliconflow-deepseek-ai/DeepSeek-V3.2"]),
-        description="副动作器模型配置",
+        description="子代理：编排 worker/planner、工具执行",
+    )
+    utility: TaskConfigSection = Field(
+        default_factory=lambda: TaskConfigSection(model_list=["siliconflow-deepseek-ai/DeepSeek-V3.2"]),
+        description="轻量杂务：降级 fallback、小组件调用",
     )
 
-    # ========== 多模态任务 ==========
-    vlm: TaskConfigSection = Field(
+    # ========== 多模态感知 ==========
+    vision: TaskConfigSection = Field(
         default_factory=lambda: TaskConfigSection(model_list=["qwen2.5-vl-72b"]),
-        description="图像识别模型",
+        description="视觉理解：图片/视频/屏幕识别",
     )
     voice: TaskConfigSection = Field(
         default_factory=lambda: TaskConfigSection(model_list=["sensevoice-small"]),
-        description="语音识别模型",
+        description="语音识别 (ASR)",
     )
-    video: TaskConfigSection = Field(
-        default_factory=lambda: TaskConfigSection(model_list=["qwen2.5-vl-72b"]),
-        description="视频分析模型配置",
+
+    # ========== 基础设施 ==========
+    embedding: TaskConfigSection = Field(
+        default_factory=lambda: TaskConfigSection(model_list=["bge-m3"], embedding_dimension=1024),
+        description="向量嵌入",
     )
-    media_observer: TaskConfigSection = Field(
-        default_factory=lambda: TaskConfigSection(model_list=["qwen2.5-vl-72b"], max_tokens=800, temperature=0.2),
-        description="life_chatter 按需观察图片/视频/语音的专用子代理模型配置",
+    router: TaskConfigSection = Field(
+        default_factory=lambda: TaskConfigSection(model_list=["qwen3.5-2b-router"], max_tokens=80, temperature=0.3),
+        description="本地路由决策模型",
     )
     live: TaskConfigSection = Field(
         default_factory=lambda: TaskConfigSection(model_list=["siliconflow-deepseek-ai/DeepSeek-V3.2"]),
-        description="实时 live 通话任务配置，用于外部 live server 或后续 Neo 侧 realtime adapter",
-    )
-    tool_use: TaskConfigSection = Field(
-        default_factory=lambda: TaskConfigSection(model_list=["qwen3-8b"]),
-        description="工具调用模型，需要使用支持工具调用的模型",
-    )
-    embedding: TaskConfigSection = Field(
-        default_factory=lambda: TaskConfigSection(model_list=["bge-m3"], embedding_dimension=1024),
-        description="嵌入模型配置",
+        description="实时通话桥接（外部 live server）",
     )
 
     def get_task(self, task_name: str) -> TaskConfigSection:
         """获取指定任务的配置
-        
+
+        支持旧任务名自动映射到新名称（向后兼容）。
+
         Args:
-            task_name: 任务名称
-            
+            task_name: 任务名称（新名或旧名均可）
+
         Returns:
             TaskConfigSection: 任务配置
-            
+
         Raises:
             ValueError: 如果任务未找到或未配置
         """
-        if hasattr(self, task_name):
-            config = getattr(self, task_name)
+        # 别名解析：旧名 → 新名
+        resolved = _TASK_ALIASES.get(task_name, task_name)
+        if hasattr(self, resolved):
+            config = getattr(self, resolved)
             if config is None:
                 raise ValueError(f"任务 '{task_name}' 未配置")
             if isinstance(config, TaskConfigSection):

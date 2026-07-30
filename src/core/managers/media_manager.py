@@ -133,13 +133,13 @@ class MediaManager:
     def _initialize_vlm(self) -> None:
         """初始化 VLM/视频/ASR 模型配置。"""
         try:
-            self._vlm_model_set = get_model_set_by_task("vlm")
+            self._vlm_model_set = get_model_set_by_task("vision")
             self._vlm_available = self._vlm_model_set is not None
             self._voice_model_set = get_model_set_by_task("voice")
             self._voice_available = self._voice_model_set is not None
-            self._video_model_set = get_model_set_by_task("video")
+            self._video_model_set = get_model_set_by_task("vision")
             self._audio_understanding_model_set = None
-            for task_name in ("audio_observer", "media_observer"):
+            for task_name in ("audio_observer", "vision"):
                 try:
                     self._audio_understanding_model_set = get_model_set_by_task(task_name)
                     if self._audio_understanding_model_set:

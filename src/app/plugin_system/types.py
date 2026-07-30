@@ -40,14 +40,25 @@ from src.kernel.llm import (
 class TaskType(Enum):
     """插件系统面向任务语义的模型分类。"""
 
-    UTILS = "utils"
-    UTILS_SMALL = "utils_small"
-    ACTOR = "actor"
-    SUB_ACTOR = "sub_actor"
-    VLM = "vlm"
+    CORE = "core"
+    EXPRESSION = "expression"
+    WITNESS = "witness"
+    AGENT = "agent"
+    UTILITY = "utility"
+    VISION = "vision"
     VOICE = "voice"
-    VIDEO = "video"
-    TOOL_USE = "tool_use"
+    EMBEDDING = "embedding"
+    ROUTER = "router"
+    LIVE = "live"
+
+    # 旧名别名（向后兼容）
+    UTILS = "utility"
+    UTILS_SMALL = "utility"
+    ACTOR = "expression"
+    SUB_ACTOR = "agent"
+    VLM = "vision"
+    VIDEO = "vision"
+    TOOL_USE = "agent"
 
 
 __all__ = [

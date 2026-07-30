@@ -2,7 +2,7 @@
 # 路由决策模型（vLLM，常驻本地推理）
 # 之前没有 unit，start.sh 是前台 exec，终端一关服务就没了——这就是 8849
 # 老是连不上、路由 LLM 报 Connection error 的直接原因。
-Description=Elysium router decision model (vLLM, Qwen3.5-2B)
+Description=Elysium router decision model (vLLM, Qwen3-0.6B)
 After=network-online.target
 Wants=network-online.target
 # 显存被别的进程占满时会启动失败，别无限快速重启刷日志。
@@ -27,12 +27,13 @@ TimeoutStopSec=60
 KillSignal=SIGINT
 
 Environment=TZ=Asia/Shanghai
-Environment="ROUTER_MODEL_PATH=/root/models/Qwen3.5-2B"
+Environment="PATH=/usr/lib/wsl/lib:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="ROUTER_MODEL_PATH=/root/models/Qwen3-0.6B"
 Environment="ROUTER_PORT=8849"
-Environment="ROUTER_SERVED_NAME=qwen3.5-2b-router"
+Environment="ROUTER_SERVED_NAME=qwen3-0.6b-router"
 Environment="ROUTER_QUANT=fp8"
-Environment="ROUTER_MAX_LEN=32768"
-Environment="ROUTER_MAX_SEQS=4"
+Environment="ROUTER_MAX_LEN=2048"
+Environment="ROUTER_MAX_SEQS=2"
 # 必须显式给 TRITON_ATTN。自动挡会选 FLASH_ATTN，而 vllm 预编译的 fa2 扩展里
 # 只有 sm_80 的 cubin，sm_120 要靠 JIT 它带的 PTX，那份 PTX 是 CUDA 12.9 工具链编的，
 # 本机 12.8 驱动拒绝加载：CUDA error: the provided PTX was compiled with an
