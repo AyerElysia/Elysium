@@ -232,7 +232,82 @@ class NapcatAdapterConfig(BaseConfig):
             order=13
         )
 
+    @config_section("events", title="事件感知", tag="general", order=40)
+    class EventsSection(SectionBase):
+        """事件感知配置"""
+
+        enable_recall_notice: bool = Field(
+            default=True,
+            description="是否感知消息撤回事件",
+            label="消息撤回感知",
+            tag="notice",
+            order=0
+        )
+        enable_member_change_notice: bool = Field(
+            default=True,
+            description="是否感知群成员变动（加入/退出/被踢）",
+            label="成员变动感知",
+            tag="notice",
+            order=1
+        )
+        enable_admin_change_notice: bool = Field(
+            default=True,
+            description="是否感知管理员变动事件",
+            label="管理员变动感知",
+            tag="notice",
+            order=2
+        )
+        enable_essence_notice: bool = Field(
+            default=True,
+            description="是否感知精华消息事件",
+            label="精华消息感知",
+            tag="notice",
+            order=3
+        )
+        enable_request_notice: bool = Field(
+            default=True,
+            description="是否感知好友/群请求事件",
+            label="请求事件感知",
+            tag="request",
+            order=4
+        )
+
+    @config_section("request_handling", title="请求处理", tag="general", order=50)
+    class RequestHandlingSection(SectionBase):
+        """请求事件处理策略"""
+
+        friend_request_strategy: str = Field(
+            default="notify",
+            description="好友申请处理策略: auto_accept/ignore/notify",
+            label="好友申请策略",
+            input_type="select",
+            choices=["auto_accept", "ignore", "notify"],
+            tag="request",
+            hint="auto_accept: 自动同意; ignore: 忽略; notify: 通知核心决策",
+            order=0
+        )
+        group_add_strategy: str = Field(
+            default="notify",
+            description="加群申请处理策略: auto_accept/ignore/notify",
+            label="加群申请策略",
+            input_type="select",
+            choices=["auto_accept", "ignore", "notify"],
+            tag="request",
+            order=1
+        )
+        group_invite_strategy: str = Field(
+            default="notify",
+            description="入群邀请处理策略: auto_accept/ignore/notify",
+            label="入群邀请策略",
+            input_type="select",
+            choices=["auto_accept", "ignore", "notify"],
+            tag="request",
+            order=2
+        )
+
     plugin: PluginSection = Field(default_factory=PluginSection)
     bot: BotSection = Field(default_factory=BotSection)
     napcat_server: NapcatServerSection = Field(default_factory=NapcatServerSection)
     features: FeaturesSection = Field(default_factory=FeaturesSection)
+    events: EventsSection = Field(default_factory=EventsSection)
+    request_handling: RequestHandlingSection = Field(default_factory=RequestHandlingSection)

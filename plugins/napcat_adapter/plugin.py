@@ -1,40 +1,39 @@
-"""
-Napcat 适配器（基于 MoFox-Bus 完全重写版）
+"""NapCat 适配器（全面重写版 v3.0）
 
-核心流程：
-1. Napcat WebSocket 连接 → 接收 OneBot 格式消息
-2. from_platform_message: OneBot dict → MessageEnvelope
-3. CoreSink → 推送到 MoFox-Bot 核心
-4. 核心回复 → _send_platform_message: MessageEnvelope → OneBot API 调用
+核心架构：
+- NapCatClient: API 调用层（100+ OneBot API）
+- EventRouter: 事件路由层（message/notice/request/meta_event）
+- OutgoingSender: 出站消息发送
+- CommandHandler: 命令系统（旧式兼容 + 新式透传）
+
+接口兼容：
+- 继承 BaseAdapter（from src.core.components.base）
+- 实现 from_platform_message(raw) -> MessageEnvelope | None
+- 实现 _send_platform_message(envelope) -> None
+- 实现 get_bot_info() -> dict
+- send_napcat_api(action, params) 向后兼容
 """
 
 from __future__ import annotations
 
-import asyncio
-import uuid
 from typing import Any, cast
 
-import orjson
 from mofox_wire import CoreSink, MessageEnvelope, WebSocketAdapterOptions
-
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.core.components.base import BaseAdapter, BasePlugin
 from src.core.components.loader import register_plugin
 
+from .client import NapCatClient
 from .config import NapcatAdapterConfig
-from .src.handlers import utils as handler_utils
-from .src.handlers.to_core.message_handler import MessageHandler
-from .src.handlers.to_core.meta_event_handler import MetaEventHandler
-from .src.handlers.to_core.notice_handler import NoticeHandler
-from .src.handlers.to_napcat.send_handler import SendHandler
+from .events import EventRouter
+from .outgoing import CommandHandler, OutgoingSender
 
 logger = get_logger("napcat_adapter")
 
 
 def _validate_bot_identity(config: NapcatAdapterConfig) -> None:
     """校验 Bot 身份配置。"""
-
     qq_id = str(config.bot.qq_id).strip()
     qq_nickname = str(config.bot.qq_nickname).strip()
 
@@ -48,19 +47,19 @@ def _validate_bot_identity(config: NapcatAdapterConfig) -> None:
 
 
 class NapcatAdapter(BaseAdapter):
-    """Napcat 适配器 - 完全基于 mofox-wire 架构"""
+    """NapCat 适配器 v3.0 — 全功能 OneBot 11 适配器。"""
 
     adapter_name = "napcat_adapter"
-    adapter_version = "2.0.0"
-    adapter_author = "MoFox Team"
-    adapter_description = "基于 MoFox-Bus 的 Napcat/OneBot 11 适配器"
+    adapter_version = "3.0.0"
+    adapter_author = "Elysium Team"
+    adapter_description = "全功能 NapCat/OneBot 11 适配器（100+ API，全量事件感知）"
     platform = "qq"
 
     run_in_subprocess = False
 
-    def __init__(self, core_sink: CoreSink, plugin: NapcatAdapterPlugin | None = None, **kwargs):
-        """初始化 Napcat 适配器"""
-        # 从插件配置读取 WebSocket URL
+    def __init__(self, core_sink: CoreSink, plugin: "NapcatAdapterPlugin | None" = None, **kwargs):
+        """初始化 NapCat 适配器。"""
+        # 从配置读取 WebSocket 参数
         if plugin and plugin.config:
             config = cast(NapcatAdapterConfig, plugin.config)
             host = config.napcat_server.host
@@ -78,7 +77,6 @@ class NapcatAdapter(BaseAdapter):
             headers = {}
             ws_mode = "server"
 
-        # 配置 WebSocket 传输
         transport = WebSocketAdapterOptions(
             mode=ws_mode,
             url=ws_url,
@@ -87,272 +85,194 @@ class NapcatAdapter(BaseAdapter):
 
         super().__init__(core_sink, plugin=plugin, transport=transport, **kwargs)
 
-        # 初始化处理器
-        self.message_handler = MessageHandler(self)
-        self.notice_handler = NoticeHandler(self)
-        self.meta_event_handler = MetaEventHandler(self)
-        self.send_handler = SendHandler(self)
+        # 核心组件
+        self._client = NapCatClient()
+        self._router = EventRouter(self._client, self._get_config)
+        self._sender = OutgoingSender(self._client, self._get_config)
+        self._command_handler = CommandHandler(self._client, self._get_config, core_sink)
 
-        # 响应池：用于存储等待的 API 响应
-        self._response_pool: dict[str, asyncio.Future] = {}
-        self._response_timeout = 30.0
+        # 注入重连回调
+        self._router.meta_handler.set_reconnect_callback(self.reconnect)
 
-        # WebSocket 连接（用于发送 API 请求）
-        # 注意：_ws 继承自 BaseAdapter，是 WebSocketLike 协议类型
-        self._napcat_ws = None  # 可选的额外连接引用
+        # WebSocket 健康检查任务
+        self._health_check_task: asyncio.Task | None = None
+        self._health_check_running = False
 
-        # 注册 utils 内部使用的适配器实例，便于工具方法自动获取 WS
-        handler_utils.register_adapter(self)
+    def _get_config(self) -> NapcatAdapterConfig | None:
+        """获取当前插件配置。"""
+        if self.plugin and self.plugin.config:
+            return cast(NapcatAdapterConfig, self.plugin.config)
+        return None
 
-    def _should_process_event(self, raw: dict[str, Any]) -> bool:
-        """
-        检查事件是否应该被处理（黑白名单过滤）
-
-        此方法在 from_platform_message 顶层调用，对所有类型的事件（消息、通知、元事件）进行过滤。
-
-        Args:
-            raw: OneBot 原始事件数据
-
-        Returns:
-            bool: True表示应该处理，False表示应该过滤
-        """
-        if not self.plugin or not self.plugin.config:
-            return True
-
-        config = cast(NapcatAdapterConfig, self.plugin.config)
-        features_config = config.features
-        post_type = raw.get("post_type")
-
-        # 获取用户信息（根据事件类型从不同字段获取）
-        user_id: str = ""
-        if post_type == "message":
-            sender_info = raw.get("sender", {})
-            user_id = str(sender_info.get("user_id", ""))
-        elif post_type == "notice":
-            user_id = str(raw.get("user_id", ""))
-        else:
-            # 元事件或其他类型不需要过滤
-            return True
-
-        # 检查全局封禁用户列表
-        ban_user_ids = [str(item) for item in features_config.ban_user_id]
-        if user_id and user_id in ban_user_ids:
-            logger.debug(f"用户 {user_id} 在全局封禁列表中，事件被过滤")
-            return False
-
-        # 获取消息类型（消息事件使用 message_type，通知事件根据 group_id 判断）
-        message_type = raw.get("message_type")
-        group_id = raw.get("group_id")
-
-        # 如果是通知事件，根据是否有 group_id 判断是群通知还是私聊通知
-        if post_type == "notice":
-            message_type = "group" if group_id else "private"
-
-        # 群聊/群通知过滤
-        if message_type == "group" and group_id:
-            group_id_str = str(group_id)
-            group_list_type = features_config.group_list_type
-            group_list = [str(item) for item in features_config.group_list]
-
-            if group_list_type == "blacklist":
-                if group_id_str in group_list:
-                    logger.debug(f"群聊 {group_id_str} 在黑名单中，事件被过滤")
-                    return False
-            else:  # whitelist
-                if group_id_str not in group_list:
-                    logger.debug(f"群聊 {group_id_str} 不在白名单中，事件被过滤")
-                    return False
-
-        # 私聊/私聊通知过滤
-        elif message_type == "private":
-            private_list_type = features_config.private_list_type
-            private_list = [str(item) for item in features_config.private_list]
-
-            if private_list_type == "blacklist":
-                if user_id in private_list:
-                    logger.debug(f"私聊用户 {user_id} 在黑名单中，事件被过滤")
-                    return False
-            else:  # whitelist
-                if user_id not in private_list:
-                    logger.debug(f"私聊用户 {user_id} 不在白名单中，事件被过滤")
-                    return False
-
-        # 通过所有过滤条件
-        return True
+    # ------------------------------------------------------------------
+    # 生命周期
+    # ------------------------------------------------------------------
 
     async def on_adapter_loaded(self) -> None:
-        """适配器加载时的初始化"""
-        logger.info("Napcat 适配器正在启动...")
+        """适配器加载。"""
+        logger.info("NapCat 适配器 v3.0 正在启动...")
 
         if not self.plugin or not self.plugin.config:
-            raise RuntimeError("Napcat 适配器启动失败：缺少插件配置")
+            raise RuntimeError("NapCat 适配器启动失败：缺少插件配置")
 
         config = cast(NapcatAdapterConfig, self.plugin.config)
         _validate_bot_identity(config)
 
-        # 设置处理器配置（将整个 plugin 对象传递给处理器）
-        # 注意：handlers 现在会直接访问 plugin.config 而不是接收 dict
-        # 这里不再需要调用 set_plugin_config，因为处理器会通过 adapter.plugin 访问
-        logger.info("Napcat 适配器已加载")
+        # 启动 WebSocket 健康检查
+        self._health_check_running = True
+        self._health_check_task = asyncio.create_task(self._ws_health_check())
+
+        logger.info("NapCat 适配器已加载")
 
     async def on_adapter_unloaded(self) -> None:
-        """适配器卸载时的清理"""
-        logger.info("Napcat 适配器正在关闭...")
+        """适配器卸载。"""
+        logger.info("NapCat 适配器正在关闭...")
 
-        # 清理响应池
-        for future in self._response_pool.values():
-            if not future.done():
-                future.cancel()
-        self._response_pool.clear()
+        # 停止健康检查
+        self._health_check_running = False
+        if self._health_check_task:
+            self._health_check_task.cancel()
+            try:
+                await self._health_check_task
+            except asyncio.CancelledError:
+                pass
 
-        logger.info("Napcat 适配器已关闭")
+        # 停止心跳检查
+        self._router.meta_handler.stop()
+
+        # 解绑 WebSocket
+        self._client.unbind_ws()
+
+        logger.info("NapCat 适配器已关闭")
+
+    async def _ws_health_check(self) -> None:
+        """WebSocket 健康检查，检测到断开时记录并尝试触发重连。"""
+        import asyncio
+
+        consecutive_failures = 0
+        last_log_time = 0.0
+
+        while self._health_check_running:
+            try:
+                await asyncio.sleep(5)  # 每 5 秒检查一次
+
+                # 检查 _ws 状态
+                if self._client._ws is None:
+                    consecutive_failures += 1
+                    current_time = asyncio.get_event_loop().time()
+
+                    # 避免日志刷屏，每 30 秒记录一次
+                    if current_time - last_log_time > 30:
+                        logger.warning(
+                            f"检测到 WebSocket 连接丢失（_ws=None），已持续 {consecutive_failures * 5} 秒。"
+                            "这通常是 mofox_wire 的 _ws_listen_loop 异常退出导致。"
+                            "NapCat 会自动重连，重连后连接将恢复。"
+                        )
+                        last_log_time = current_time
+                else:
+                    # 连接正常，重置计数
+                    if consecutive_failures > 0:
+                        logger.info("WebSocket 连接已恢复")
+                        consecutive_failures = 0
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"健康检查异常: {e}")
+                await asyncio.sleep(10)
+
+    # ------------------------------------------------------------------
+    # WebSocket 连接钩子（由 BaseAdapter 调用）
+    # ------------------------------------------------------------------
+
+    async def on_ws_connected(self, ws: Any) -> None:
+        """WebSocket 连接建立时调用。"""
+        self._client.bind_ws(ws)
+        # 检查这是初次连接还是重连
+        bot_qq = self.plugin.config.bot.qq_id if self.plugin and self.plugin.config else "未知"
+        logger.info(f"NapCat WebSocket 已连接 (Bot {bot_qq})")
+
+    async def on_ws_disconnected(self) -> None:
+        """WebSocket 连接断开时调用。"""
+        self._client.unbind_ws()
+        logger.warning("NapCat WebSocket 已断开")
+
+    # ------------------------------------------------------------------
+    # BaseAdapter 接口实现
+    # ------------------------------------------------------------------
 
     async def from_platform_message(self, raw: dict[str, Any]) -> MessageEnvelope | None:  # type: ignore[override]
+        """将 OneBot 原始消息转换为 MessageEnvelope。
+
+        这是核心入站方法，由 mofox-wire 的传输层调用。
+        所有事件（message/notice/request/meta_event/API响应）都经过这里。
         """
-        将 Napcat/OneBot 原始消息转换为 MessageEnvelope
-
-        这是核心转换方法，处理：
-        - message 事件 → 消息
-        - notice 事件 → 通知（戳一戳、表情回复等）
-        - meta_event 事件 → 元事件（心跳、生命周期）
-        - API 响应 → 存入响应池
-
-        注意：黑白名单等过滤机制在此方法最开始执行，确保所有类型的事件都能被过滤。
-        """
-        post_type = raw.get("post_type")
-
-        # API 响应（没有 post_type，有 echo）
-        if post_type is None and "echo" in raw:
-            echo = raw.get("echo")
-            if echo and echo in self._response_pool:
-                future = self._response_pool[echo]
-                if not future.done():
-                    future.set_result(raw)
-            return None
-
-        # 顶层过滤：黑白名单等过滤机制
-        if not self._should_process_event(raw):
-            return None
-
-        try:
-            # 消息事件
-            if post_type == "message":
-                return await self.message_handler.handle_raw_message(raw)  # type: ignore[return-value]
-
-            # 通知事件
-            elif post_type == "notice":
-                return await self.notice_handler.handle_notice(raw)  # type: ignore[return-value]
-
-            # 元事件
-            elif post_type == "meta_event":
-                return await self.meta_event_handler.handle_meta_event(raw)  # type: ignore[return-value]
-
-            # 未知事件类型
-            else:
-                return None
-        except ValueError as ve:
-            logger.warning(f"处理 Napcat 事件时数据无效: {ve}")
-            return None
-        except Exception as e:
-            logger.error(f"处理 Napcat 事件失败: {e}, 原始数据: {raw}")
-            return None
+        return await self._router.dispatch(raw)
 
     async def _send_platform_message(self, envelope: MessageEnvelope) -> None:  # type: ignore[override]
+        """将 MessageEnvelope 发送到 NapCat。
+
+        这是核心出站方法，由 mofox-wire 的核心推送调用。
+        根据消息段类型分发到 sender 或 command_handler。
         """
-        将 MessageEnvelope 转换并发送到 Napcat
+        # 检查是否是命令类消息
+        segment = envelope.get("message_segment", {})
+        if isinstance(segment, list):
+            first_seg = segment[0] if segment else {}
+        else:
+            first_seg = segment
 
-        这里不直接通过 WebSocket 发送 envelope，
-        而是调用 Napcat API（send_group_msg, send_private_msg 等）
-        """
-        try:
-            await self.send_handler.handle_message(envelope)
-        except Exception as e:
-            logger.error(f"发送 Napcat 消息失败: {e}")
-            raise
-
-    async def send_napcat_api(self, action: str, params: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
-        """
-        发送 Napcat API 请求并等待响应
-
-        Args:
-            action: API 动作名称（如 send_group_msg）
-            params: API 参数
-            timeout: 超时时间（秒）
-
-        Returns:
-            API 响应数据
-        """
-        if not self._ws:
-            raise RuntimeError("WebSocket 连接未建立")
-
-        # 生成唯一的 echo ID
-        echo = str(uuid.uuid4())
-
-        # 创建 Future 用于等待响应
-        future = asyncio.Future()
-        self._response_pool[echo] = future
-
-        # 构造请求
-        # Napcat expects JSON text frames; orjson.dumps returns bytes so decode to str
-        request = orjson.dumps(
-            {
-                "action": action,
-                "params": params,
-                "echo": echo,
-            }
-        ).decode()
+        seg_type = first_seg.get("type") if isinstance(first_seg, dict) else None
 
         try:
-            # 发送请求
-            await self._ws.send(request)
-
-            # 等待响应
-            response = await asyncio.wait_for(future, timeout=timeout)
-            return response
-
-        except asyncio.TimeoutError:
-            logger.error(f"API 请求超时: {action}")
-            raise
+            if seg_type in ("command", "adapter_command", "adapter_response"):
+                await self._command_handler.handle(envelope)
+            else:
+                await self._sender.send(envelope)
         except Exception as e:
-            logger.error(f"API 请求失败: {action}, 错误: {e}")
+            logger.error(f"发送消息失败: {e}")
             raise
-        finally:
-            # 清理响应池
-            self._response_pool.pop(echo, None)
-
-    def get_ws_connection(self):
-        """获取 WebSocket 连接（用于发送 API 请求）"""
-        if not self._ws:
-            raise RuntimeError("WebSocket 连接未建立")
-        return self._ws
 
     async def get_bot_info(self) -> dict[str, Any]:  # type: ignore[override]
-        """获取 Bot 信息（QQ ID 和昵称）"""
-        if not self.plugin or not self.plugin.config:
+        """获取 Bot 信息。"""
+        config = self._get_config()
+        if not config:
             return {}
-
-        config = cast(NapcatAdapterConfig, self.plugin.config)
         return {
             "bot_id": config.bot.qq_id,
             "bot_name": config.bot.qq_nickname,
             "platform": self.platform,
         }
-    
+
+    # ------------------------------------------------------------------
+    # 向后兼容 API
+    # ------------------------------------------------------------------
+
+    async def send_napcat_api(
+        self, action: str, params: dict[str, Any], timeout: float = 30.0
+    ) -> dict[str, Any]:
+        """向后兼容的 API 调用方法。
+
+        旧代码（如 life_engine 的 chat_history_tools）可能直接调用此方法。
+        """
+        return await self._client.call(action, params, timeout=timeout)
+
+    @property
+    def client(self) -> NapCatClient:
+        """获取 NapCatClient 实例（供高级用途）。"""
+        return self._client
+
+
 @register_plugin
 class NapcatAdapterPlugin(BasePlugin):
-    """Napcat 适配器插件"""
+    """NapCat 适配器插件。"""
 
     plugin_name = "napcat_adapter"
-    plugin_version = "2.0.0"
-    plugin_author = "MoFox Team"
-    plugin_description = "Napcat/OneBot 11 适配器（基于 Neo-MoFox 重写）"
+    plugin_version = "3.0.0"
+    plugin_author = "Elysium Team"
+    plugin_description = "全功能 NapCat/OneBot 11 适配器（100+ API，全量事件感知）"
     configs = [NapcatAdapterConfig]
 
-
     def get_components(self) -> list[type]:
-        """获取插件内所有组件类
-
-        Returns:
-            list[type]: 插件内所有组件类的列表
-        """
+        """获取插件内所有组件类。"""
         return [NapcatAdapter]
