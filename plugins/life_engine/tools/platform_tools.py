@@ -32,6 +32,10 @@ _FEISHU_TIMEOUT = 30.0
 # 默认 QQ 适配器签名
 _DEFAULT_QQ_ADAPTER_SIGN = "napcat_adapter:adapter:napcat_adapter"
 
+# QQ 操作超时（秒）—— 必须大于适配器内部 API 调用超时，
+# 否则外层先超时会导致实际成功的操作被报告为失败。
+_QQ_TIMEOUT = 30.0
+
 # QQ 危险操作黑名单
 _QQ_BLOCKED_ACTIONS: frozenset[str] = frozenset({
     "set_group_leave",
@@ -126,7 +130,7 @@ class PlatformActionTool(BaseTool):
                 adapter_sign=adapter_sign,
                 command_name=action,
                 command_data=params,
-                timeout=15.0,
+                timeout=_QQ_TIMEOUT,
             )
         except Exception as exc:
             logger.error(f"[platform_action:qq] 执行失败: {action}, error={exc}")

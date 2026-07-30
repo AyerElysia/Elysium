@@ -370,6 +370,10 @@ class AdapterManager:
             # 构建adapter_command消息信封
             from mofox_wire import MessageEnvelope
             
+            # 内层超时比外层短，给响应回传留出余量。
+            # 否则内外同时超时时，外层先清理 Future，实际成功的操作被报告为失败。
+            inner_timeout = max(5.0, timeout - 5.0)
+            
             envelope: MessageEnvelope = {
                 "direction": "outgoing",  # type: ignore[typeddict-item]
                 "message_info": {
@@ -383,7 +387,7 @@ class AdapterManager:
                         "request_id": request_id,
                         "action": command_name,
                         "params": command_data,
-                        "timeout": timeout,
+                        "timeout": inner_timeout,
                     }
                 },
             }
