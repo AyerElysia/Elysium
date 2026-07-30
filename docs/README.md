@@ -1,12 +1,22 @@
 # Elysium 文档
 
-## 设计原则
+## 从这里开始
 
-- [principles.md](./principles.md) — 主体性、零规则、仿生、边界提醒、意识实例、渐进式披露（必读）
+- [当前架构](./architecture/current_architecture.md) — **当前代码与运行边界的权威总图**
+- [principles.md](./principles.md) — 主体性、零规则、仿生、意识实例与渐进式披露（设计底线）
+- [生命记忆系统](./architecture/life_memory_system.md) — 追加式经历、认识论本体、双时间与主体性遗忘
+- [意识实例架构](./architecture/consciousness_instances.md) — 多意识实例、潜意识协调与工具边界
+- [Life Engine 模块说明](../plugins/life_engine/README.md) — 生命域的代码入口与运行链路
 
-## 架构文档
+## 当前架构与迁移
 
-- [意识实例架构](./architecture/consciousness_instances.md) — 多意识实例 + 潜意识协调 + 工具编排（2026-07 最新）
+- [基座 v2 兼容迁移说明](./architecture_v2.md) — Kernel/Core/App 与旧 Manager 并存的迁移背景；不是最终架构总图
+- [日志系统](./logging.md) — SQLite 结构化存储、FTS5、保留策略与噪音过滤
+
+## 历史架构研究
+
+以下 Phase 文档记录项目早期分析与设计推演，其中部分机制已经删除或被重建，**不代表当前状态**：
+
 - [Phase1: 核心哲学](./architecture/Phase1_CorePhilosophy/)
 - [Phase2: 架构分层](./architecture/Phase2_ArchitectureLayer/)
 - [Phase3: 创新点](./architecture/Phase3_InnovationPoints/)
@@ -22,10 +32,6 @@
 - [自主性原则](./minecraft/minecraft_autonomy_principles.md)
 - [具身设计](./minecraft/minecraft_embodiment_design.md)
 - [快速上手](./minecraft/minecraft_quick_start.md)
-
-## 技术文档
-
-- [日志系统](./logging.md) — SQLite 结构化存储 + FTS5 + 自动保留 + 第三方噪音过滤
 
 ## 她的日记
 

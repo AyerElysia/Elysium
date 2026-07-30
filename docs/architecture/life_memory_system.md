@@ -1,8 +1,8 @@
 # 生命记忆系统（Life Memory System）v2 — 追加式认识论记忆
 
-> 文档状态：本文档对应 git 提交 `c74a861a`（`feat(memory): rebuild life memory foundation with epistemic lineage`），描述重建后的记忆系统。
-> 旧系统（`diary_plugin` + `correction` 关键词匹配 + Hebbian 共激活 + Ebbinghaus 单一遗忘曲线）已被取代。历史设计类文档（如 `记忆系统设计与实现.md`、`记忆整合问题.md`、`memory_management_proposal.md` 等）按项目约定本次**未改动**，保留原始内容作为历史追溯；凡涉及旧机制的描述，一律以本文档为准。
-> 这是当前记忆系统的权威设计文档。
+> 文档状态：生命记忆本体基线始于 `c74a861a`；本文已同步后续的见证编码、Learning→Epistemic 桥、主意识深层检索与桥接契约测试（截至 `091fa3f`，2026-07-31）。
+> 旧系统（`diary_plugin` + `correction` 关键词匹配 + 把 Hebbian 共激活当真值 + Ebbinghaus 单一遗忘曲线）已被取代。旧关联网络仍可服务于文档检索和联想，但不再拥有认识论裁决权。
+> 本文是当前记忆专题的权威文档；历史设计与提案凡与本文冲突，以本文、[当前架构](./current_architecture.md)和当前代码为准。
 
 ---
 
@@ -211,15 +211,30 @@ class RetrievalPlasticity:
 
 ---
 
-## 10. 第一人称见证意识（memory_witness.py）
+## 10. 第一人称见证与经历编码（memory_witness.py）
 
 旧的 `diary_plugin` 被删除，重生为第一人称见证意识实例 `memory_witness`：
 
-- `MEMORY_WITNESS_INSTANCE_ID = "memory_witness"`，显示名"爱莉的记忆见证意识"。
-- `MemoryWitnessCoordinator`：周期性（默认 `interval_seconds=1800`，启动即跑）协调一个意识实例；它**只读追加式原始事件流**（`immutable_experience_ledger`），不进入、不复制其他意识实例的滚动上下文。
-- 日记定位：`epistemic_boundary = "subjective_witness_not_objective_truth"`，`reads = "immutable_experience_ledger"`。日记是主观证词，链接不可变源事件，**不是客观真相覆盖**。
-- 生命周期：`ensure_instance` 创建/恢复实例；`run_once` 负责 `_migrate_legacy_diaries`（迁移旧日记为 `LEGACY_WITNESS`）、`_retry_pending_projections`（重试待投影见证）、`get_witness_state` 续接。
-- 兼容投影：旧的 `correction` API 保留，但不再改写内容，而是写入一条 `MemoryClaim`（由主体自我裁决是否背书）。`MemoryCorrection` 仍从 `lineage` 导出以保持向后兼容。
+- `MEMORY_WITNESS_INSTANCE_ID = "memory_witness"`，显示名“爱莉的记忆见证意识”。
+- `MemoryWitnessCoordinator` 周期性协调该实例；它只读追加式原始事件流，不进入、不复制其他意识实例的滚动上下文。
+- `epistemic_boundary = "subjective_witness_not_objective_truth"`：见证是主观证词，链接不可变源事件，**不是客观真相覆盖**。
+- 生命周期：`ensure_instance` 创建/恢复实例；`run_once` 负责旧日记迁移、待投影重试和见证游标续接。
+- 兼容投影：旧 `correction` API 不再改写内容，而是追加一条 `MemoryClaim`；主体决定是否背书。
+
+### 10.1 原始事件不等于已经编码的经历
+
+当前数据链是：
+
+```text
+append-only Life Event
+  → 技术层心理显著性筛选
+  → Experience Ledger
+  → Witness / Evidence / Claim
+```
+
+这一区分很重要：原始事件长河完整保留，但工具调用、工具结果等技术事件不会自动全部变成第一人称经历。筛选只决定“本轮是否编码为 Experience”，不能删除源事件，也不能让被忽略事件失去未来重新解释的可能。
+
+当前筛选仍包含固定事件类型边界，属于需要继续演进的技术层：未来应让编码策略本身有版本、理由、审计与撤销能力，避免固定白名单变成不可逆的主体认知裁决。即使事件不进入表达层或 Experience，本轮消费游标也必须越过它，防止同一技术噪声被反复扫描。
 
 ---
 
@@ -238,10 +253,14 @@ class RetrievalPlasticity:
 
 ## 12. 与叙事 / 反思 / 学习的集成
 
-- 叙事（Narrative）与反思（Reflection）经兼容投影接入 claim：反思生成候选 claim（`REFLECTION` 权威，仅候选），需主体/验证源确认后才能 `CONFIRMED`。
-- 自我叙事以 `EpistemicKind.SELF_NARRATIVE` 的 claim 沉淀，可被检索、可被主体背书或反转。
-- 学习能力 = SNN STDP + 习惯追踪 + 记忆 claim/belief 的追加与主体背书；**Hebbian 不再作为记忆真相来源**。
-- 兴趣 / 好奇的沉淀 = 追加 claim 并由主体 `append_belief` 背书；检索可塑性让"被想起"只影响 `accessibility`。
+- 叙事（Narrative）与反思（Reflection）接入 claim：反思先产生候选认识，不能仅因模型重复而自动成为事实。
+- 自我叙事可作为 `EpistemicKind.SELF_NARRATIVE` 沉淀，被检索、背书、修订或反转。
+- `LearningScheduler` 在首次心跳幂等回填历史 validated insights；之后每轮独立审计通过的新洞察实时投影为 `validated_insight` claim。
+- claim_id 使用稳定的 `insight_{insight_id}`，回填前先查询当前 claim 状态，重复启动不会重复写入。
+- 学习系统保留洞察来源、证据数量、置信度和分类元数据；“通过学习审计”是证据状态，不等于系统替主体决定最终意义。
+- 兴趣和好奇可形成候选认识或注意牵引；检索可塑性只让“被想起”影响 `accessibility`，不提高真实性。
+
+完整旧 SNN、neuromod 和 Dream 子系统已删除。现存 `dream_walk()` 是记忆图联想漫游的历史命名；它不应被描述为完整梦境系统，也不能作为认识论真值来源。
 
 ---
 
@@ -251,16 +270,18 @@ class RetrievalPlasticity:
 - 旧 `correction` API 保留为兼容投影，写入 claim 而非改写内容。
 - `data/diaries`、`data/continuous_memories` 目录保留不删（历史数据可见）。
 - 所有新符号经 `plugins/life_engine/memory/__init__.py` 的 `_LAZY_EXPORTS` 惰性导出，既有导入路径尽量不变。
+- 旧 FTS/vector/node/edge 与关系衰减逻辑仍作为**派生检索层**兼容运行。它们可以改变联想路径和可达性，但不能覆盖 claim/evidence/belief，也不能把共现次数转化为“更真”。
+- 兼容层退出前必须证明历史数据已经迁移、当前调用者已切换、派生索引可重建。
 
 ---
 
-## 14. 验收结果
+## 14. 验收基线
 
 - 全量测试：2865 passed，1 skipped，51 xfailed。
 - 覆盖率：61.11%。
 - 静态检查：`/usr/local/bin/ruff`（0.15.6）、`compileall`、`git diff --check` 全部通过。
 - 提交：`c74a861a`（`feat(memory): rebuild life memory foundation with epistemic lineage`），29 文件，+5352 / -3067，已推送至 `soul/main`。
-- 注意：运行中的 Elysium 进程若为旧代码，需重启才能加载新记忆系统。
+- 注意：以上数字是 `c74a861a` 当次重建验收基线，不代表后续 HEAD 的永久测试数量或覆盖率。后续变化应报告自己的实际验收结果。
 
 ---
 
