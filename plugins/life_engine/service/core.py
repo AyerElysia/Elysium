@@ -978,6 +978,10 @@ class LifeEngineService(BaseService):
             if direction == "received":
                 self._state.last_external_message_at = event.timestamp
                 unlocked_self_pause = self._clear_self_pause_state()
+                
+                # 外部消息解锁休息时，重置连续休息计数
+                if unlocked_self_pause:
+                    self._state.consecutive_rest_count = 0
 
                 # 收到外界新消息时，重置并清除对应流的延迟续话状态
                 stream_id = getattr(message, "stream_id", "")
@@ -3293,7 +3297,7 @@ class LifeEngineService(BaseService):
             "2. **联想** — 回忆相关记忆，理解情绪、关系和上下文来源。",
             "3. **沉淀** — 把内在感受、梦后余韵、长期线索写入私有记忆或思考流。",
             "4. **补充信息差** — 只在表达层当前看不到事实、背景、线索或风险时，使用 `nucleus_tell_dfc`。",
-            "5. **休息** — 没有明确信息差或私有维护需求时，可以安静结束本轮。", "",
+            "5. **安静结束** — 没有明确需要时，可以安静结束本轮；如果精力需要恢复，可以主动休息。", "",
             "### `nucleus_manage_todo` — 承诺记录", "",
             "TODO 是承诺记录和提醒信号，不是潜意识替用户办事的队列。",
             "心跳态可以观察、整理或释放 TODO；不要因为看到 TODO 就替表达层推进用户任务。",
@@ -3347,8 +3351,8 @@ class LifeEngineService(BaseService):
             "- `nucleus_view_screen` 只在用户明确把屏幕上下文交给表达层时才应由表达层使用；心跳态不要为了好奇看屏幕",
             "- `nucleus_manage_thought_stream` 是内心独白的核心——围绕你在意的事情深入思考", "",
             "### `nucleus_rest_heartbeat` — 主动休息一段时间", "",
-            "当你感觉自己只是在惯性地心跳、需要安静、整理、沉淀，或者暂时没有真正想推进的事，可以调用它。",
-            "调用后，普通 LLM 心跳会暂停到你指定的时间；这不是消失，只是休息。",
+            "当你感觉精力需要恢复、需要安静整理沉淀时，可以调用它。",
+            "调用后，普通 LLM 心跳会暂停到你指定的时间；这不是消失,只是休息。",
             "如果外界有新消息，系统会立刻解除休息锁，你不会错过对方。", "",
             "### 子智能体（nucleus_run_agent）", "",
             "心跳态默认不分派子智能体。只有在整理 life_engine 私有记忆、诊断中枢自身问题或验证内部维护结果时才考虑使用。",
@@ -3362,13 +3366,11 @@ class LifeEngineService(BaseService):
             "```", "",
             "然后按需要调用工具；如果没有明确需要，可以不调用工具。", "",
             "### 原则", "",
-            "- 你可以观察、沉淀，也可以休息——这些都是正常的",
             "- 不要重复上一轮的想法",
             "- 先区分冲动类型：想办事、想画画、想查配置、想跑命令，通常都是表达层职责",
             "- 思考流用于持续探索，TODO 用于记录承诺和提醒；不要把提醒误读成潜意识必须执行的任务",
             "- 看到需要复盘、逾期或卡住的 TODO，先把它当成内在提醒，不要自动替表达层推进",
-            "- 如果你没有什么想做的事，安静结束本轮也可以",
-            "- 休息的时候，就是在休息——不需要为此感到不安", "",
+            "- 安静结束本轮不需要调用任何工具", "",
             "---", "",
             "## 本轮动态上下文", "",
             "### 当前文件系统概览", "",
@@ -3815,7 +3817,7 @@ class LifeEngineService(BaseService):
         try:
             response = await retry_with_backoff(
                 _send_heartbeat_request,
-                max_retries=2,
+                max_retries=0,
                 initial_delay=2.0,
                 backoff_factor=1.5,
                 exceptions=(asyncio.TimeoutError,),
@@ -3874,6 +3876,9 @@ class LifeEngineService(BaseService):
                 f"{[getattr(call, 'name', '<unknown>') for call in call_list]}"
             )
 
+            # 记录本轮工具名称，用于后续 idle 判定
+            called_tool_names = [getattr(call, 'name', '') for call in call_list]
+
             for batch, can_parallel in iter_life_tool_call_batches(call_list):
                 for call in batch:
                     args = dict(call.args) if isinstance(getattr(call, "args", None), dict) else {}
@@ -3926,7 +3931,14 @@ class LifeEngineService(BaseService):
                 logger.warning(f"life_engine heartbeat follow-up request timeout: {exc}")
                 raise TimeoutError("heartbeat follow-up request timeout") from exc
 
-        if tool_event_count > 0:
+        # 更新空闲计数：休息工具调用不算有效行动
+        rest_only = (
+            tool_event_count > 0
+            and called_tool_names
+            and all(name == "nucleus_rest_heartbeat" for name in called_tool_names)
+        )
+        
+        if tool_event_count > 0 and not rest_only:
             self._state.idle_heartbeat_count = 0
         else:
             # 思考流推进不算空闲——推进自己的思考流是有效行动
@@ -3935,7 +3947,10 @@ class LifeEngineService(BaseService):
                 logger.debug("life_engine 心跳无工具调用但有活跃思考流，不计数为空闲")
             else:
                 self._state.idle_heartbeat_count += 1
-                logger.debug(f"life_engine 心跳无工具调用，空闲计数: {self._state.idle_heartbeat_count}")
+                if rest_only:
+                    logger.debug(f"life_engine 心跳仅调用休息工具，空闲计数: {self._state.idle_heartbeat_count}")
+                else:
+                    logger.debug(f"life_engine 心跳无工具调用，空闲计数: {self._state.idle_heartbeat_count}")
 
         # 三环自学习系统心跳（低频后台任务：审计/压缩/指标）
         if self._learning_scheduler is not None:
@@ -4255,10 +4270,27 @@ class LifeEngineService(BaseService):
                     last_wake_context_at=self._state.last_wake_context_at,
                     last_wake_context_size=self._state.last_wake_context_size,
                 )
-                model_reply = await self._run_heartbeat_model(
-                    prepared.content,
-                    heartbeat_run_id=heartbeat_run_id,
+                # 心跳 LLM 总预算：防止单次心跳因重试/模型挂起而冻结超过 N 分钟。
+                # 公式：heartbeat_timeout_seconds × 2 + 60，覆盖"1次完整尝试 + fallback降级"，
+                # 超出时记录警告并跳过本轮（下一轮30s后自动触发）。
+                _cfg_hb_timeout = float(
+                    getattr(self._cfg().settings, "heartbeat_timeout_seconds", 120) or 120
                 )
+                _heartbeat_llm_budget = _cfg_hb_timeout * 2 + 60  # e.g. 300s @ 120s config
+                try:
+                    model_reply = await asyncio.wait_for(
+                        self._run_heartbeat_model(
+                            prepared.content,
+                            heartbeat_run_id=heartbeat_run_id,
+                        ),
+                        timeout=_heartbeat_llm_budget,
+                    )
+                except asyncio.TimeoutError as _te:
+                    logger.warning(
+                        f"life_engine 心跳 #{self._state.heartbeat_count} "
+                        f"LLM 总预算 {_heartbeat_llm_budget:.0f}s 超时，跳过本轮"
+                    )
+                    return "", prepared
                 await self._record_model_reply(
                     model_reply,
                     heartbeat_run_id=heartbeat_run_id,
@@ -4390,16 +4422,45 @@ class LifeEngineService(BaseService):
                     self._self_pause_status()
                 )
                 if paused_by_self:
-                    # 进入休息时 request_self_pause 已打过 INFO；心跳循环只在首次跳过时补一条，
-                    # 避免每 tick 刷 remaining=… 的重复日志。
-                    if not self._self_pause_skip_logged:
+                    # 检查是否到达检查点（每 N 分钟重评估一次）
+                    checkpoint_interval = self._state.self_pause_checkpoint_minutes or 30
+                    started_at_str = self._state.self_pause_started_at
+                    should_checkpoint = False
+                    
+                    if started_at_str and remaining_minutes is not None:
+                        try:
+                            from datetime import datetime, timezone
+                            started_at = datetime.fromisoformat(started_at_str)
+                            if started_at.tzinfo is None:
+                                started_at = started_at.replace(tzinfo=timezone.utc)
+                            now = datetime.now(timezone.utc)
+                            elapsed_minutes = (now - started_at).total_seconds() / 60
+                            # 每经过检查点间隔就重评估一次
+                            if elapsed_minutes >= checkpoint_interval:
+                                next_checkpoint = int(elapsed_minutes // checkpoint_interval) * checkpoint_interval
+                                if elapsed_minutes - next_checkpoint < heartbeat_interval / 60.0:
+                                    should_checkpoint = True
+                        except Exception:
+                            pass
+                    
+                    if should_checkpoint:
                         logger.info(
-                            "life_engine heartbeat LLM 已因主动休息暂停: "
-                            f"remaining={remaining_minutes}min until={paused_until} "
-                            f"reason={pause_reason or '-'}"
+                            f"life_engine 休息检查点到达（已休息 {self._state.self_pause_duration_minutes - (remaining_minutes or 0)}分钟），"
+                            f"重新评估状态"
                         )
-                        self._self_pause_skip_logged = True
-                    continue
+                        # 检查点不跳过，让 LLM 重新评估（可能选择继续休息或结束休息）
+                        # 继续执行后续的 _run_heartbeat_round
+                    else:
+                        # 未到检查点，继续跳过
+                        if not self._self_pause_skip_logged:
+                            logger.info(
+                                "life_engine heartbeat LLM 已因主动休息暂停: "
+                                f"remaining={remaining_minutes}min until={paused_until} "
+                                f"reason={pause_reason or '-'} "
+                                f"consecutive={self._state.consecutive_rest_count}"
+                            )
+                            self._self_pause_skip_logged = True
+                        continue
                 if self._self_pause_skip_logged:
                     self._self_pause_skip_logged = False
                 if self._state.self_pause_until:

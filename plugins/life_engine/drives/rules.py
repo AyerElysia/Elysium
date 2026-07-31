@@ -1,111 +1,106 @@
-"""默认冲动规则集。"""
+"""默认冲动规则集 — 基于现存可审计状态的行为建议。
+
+重构说明（2026-07-31）：
+- 移除依赖已删除 neuromod 子系统的规则
+  (curiosity/sociability/energy/diligence/contentment)
+- 改为基于当前可审计状态：思考流、好奇刺点、学习进展、
+  河流回望、自主意向、紧急 todo
+- 修正 thought_pursue 逻辑互斥（有思考流时 idle 恒为 0）
+- 保持"建议而非命令"的设计哲学
+"""
 from __future__ import annotations
-from typing import Any
 from .impulse import ImpulseRule
 
 
-def _get_modulator_value(neuromod_state: dict[str, Any], name: str) -> float:
-    """从神经调质状态中提取指定调质的浓度值。"""
-    mod = neuromod_state.get(name, {})
-    if isinstance(mod, dict):
-        return mod.get("value", 0.5)
-    if isinstance(mod, (int, float)):
-        return float(mod)
-    return 0.5
+# ---- thought_deepen ----
+def _thought_deepen_condition(neuromod_state: dict, context: dict) -> bool:
+    """有活跃思考流时建议继续深入。修复原 thought_pursue 的 idle 互斥问题。"""
+    return context.get("has_active_thoughts", False)
 
-
-# ---- curiosity_explore ----
-def _curiosity_explore_condition(neuromod_state: dict, context: dict) -> bool:
-    curiosity = _get_modulator_value(neuromod_state, "curiosity")
-    idle = context.get("idle_heartbeats", 0)
-    return curiosity > 0.65 and idle >= 2
-
-curiosity_explore = ImpulseRule(
-    name="curiosity_explore",
-    condition=_curiosity_explore_condition,
-    suggestion="你的好奇心正盛，有没有感兴趣的话题想深入了解？",
-    tools=["nucleus_web_search", "nucleus_manage_thought_stream"],
-    cooldown_minutes=45,
-)
-
-# ---- social_reach_out ----
-def _social_reach_out_condition(neuromod_state: dict, context: dict) -> bool:
-    sociability = _get_modulator_value(neuromod_state, "sociability")
-    silence = context.get("silence_minutes", 0)
-    return sociability > 0.6 and silence > 30
-
-social_reach_out = ImpulseRule(
-    name="social_reach_out",
-    condition=_social_reach_out_condition,
-    suggestion="你很想和大家说说话；先看看是否真的有表达层缺失的关键背景，没有就把这股社交欲写进思考流",
-    tools=["nucleus_manage_thought_stream"],
-    cooldown_minutes=45,
-)
-
-# ---- diligence_todo ----
-def _diligence_todo_condition(neuromod_state: dict, context: dict) -> bool:
-    diligence = _get_modulator_value(neuromod_state, "diligence")
-    has_todos = context.get("has_urgent_todos", False)
-    return diligence > 0.65 and has_todos
-
-diligence_todo = ImpulseRule(
-    name="diligence_todo",
-    condition=_diligence_todo_condition,
-    suggestion="你的专注力很好，正好可以推进待办事项",
-    tools=["nucleus_list_todos"],
-    cooldown_minutes=30,
-)
-
-# ---- break_silence ----
-def _break_silence_condition(neuromod_state: dict, context: dict) -> bool:
-    silence = context.get("silence_minutes", 0)
-    energy = _get_modulator_value(neuromod_state, "energy")
-    return silence > 60 and energy > 0.5
-
-break_silence = ImpulseRule(
-    name="break_silence",
-    condition=_break_silence_condition,
-    suggestion="安静很久了；可以推进思考流，只有发现明确的信息差时才补充给表达层",
-    tools=["nucleus_manage_thought_stream"],
-    cooldown_minutes=60,
-)
-
-# ---- thought_pursue ----
-def _thought_pursue_condition(neuromod_state: dict, context: dict) -> bool:
-    has_thoughts = context.get("has_active_thoughts", False)
-    idle = context.get("idle_heartbeats", 0)
-    return has_thoughts and idle >= 1
-
-thought_pursue = ImpulseRule(
-    name="thought_pursue",
-    condition=_thought_pursue_condition,
-    suggestion="你有未完成的思考，也许可以继续深入",
+thought_deepen = ImpulseRule(
+    name="thought_deepen",
+    condition=_thought_deepen_condition,
+    suggestion="你有未完成的思考流，也许可以继续深入、联想或沉淀",
     tools=["nucleus_manage_thought_stream"],
     cooldown_minutes=20,
 )
 
-# ---- rest_well ----
-def _rest_well_condition(neuromod_state: dict, context: dict) -> bool:
-    energy = _get_modulator_value(neuromod_state, "energy")
-    contentment = _get_modulator_value(neuromod_state, "contentment")
-    idle = context.get("idle_heartbeats", 0)
-    # 精力低且满足感合理时，休息是自然的选择
-    return energy < 0.4 and contentment > 0.3 and idle >= 3
 
-rest_well = ImpulseRule(
-    name="rest_well",
-    condition=_rest_well_condition,
-    suggestion="你的精力需要恢复，安静休息是现在最好的选择",
-    tools=[],
+# ---- curiosity_engage ----
+def _curiosity_engage_condition(neuromod_state: dict, context: dict) -> bool:
+    """有好奇刺点时建议承接。"""
+    return context.get("has_curiosity_signal", False)
+
+curiosity_engage = ImpulseRule(
+    name="curiosity_engage",
+    condition=_curiosity_engage_condition,
+    suggestion="好奇层留下了刺点；如果你在意，可以靠近它、开思考流承接，或者放下它",
+    tools=["nucleus_manage_thought_stream", "nucleus_web_search"],
+    cooldown_minutes=45,
+)
+
+
+# ---- learning_reflect ----
+def _learning_reflect_condition(neuromod_state: dict, context: dict) -> bool:
+    """有学习进展时建议反思。"""
+    return context.get("has_learning_progress", False)
+
+learning_reflect = ImpulseRule(
+    name="learning_reflect",
+    condition=_learning_reflect_condition,
+    suggestion="学习系统有新进展；可以看看新验证的领悟或技能目录",
+    tools=["nucleus_skill"],
+    cooldown_minutes=60,
+)
+
+
+# ---- river_consolidate ----
+def _river_consolidate_condition(neuromod_state: dict, context: dict) -> bool:
+    """有待沉淀的河流记忆时建议回望。"""
+    return context.get("has_pending_river_moments", False)
+
+river_consolidate = ImpulseRule(
+    name="river_consolidate",
+    condition=_river_consolidate_condition,
+    suggestion="长河里积累了一些留痕；如果愿意，可以回望并写下它对你意味着什么",
+    tools=["nucleus_write_narrative"],
     cooldown_minutes=120,
 )
 
 
+# ---- intent_review ----
+def _intent_review_condition(neuromod_state: dict, context: dict) -> bool:
+    """有自主意向时建议审视。"""
+    return context.get("has_autonomy_intents", False)
+
+intent_review = ImpulseRule(
+    name="intent_review",
+    condition=_intent_review_condition,
+    suggestion="你登记了一些延迟意向；可以看看它们，决定是否调整或取消",
+    tools=["nucleus_list_autonomy_intents"],
+    cooldown_minutes=90,
+)
+
+
+# ---- todo_attend ----
+def _todo_attend_condition(neuromod_state: dict, context: dict) -> bool:
+    """有紧急/逾期 todo 时建议关注（但不是命令执行）。"""
+    return context.get("has_urgent_todos", False)
+
+todo_attend = ImpulseRule(
+    name="todo_attend",
+    condition=_todo_attend_condition,
+    suggestion="有紧急或逾期的 TODO；这是承诺提醒，不是命令——可以观察、整理或释放",
+    tools=["nucleus_list_todos"],
+    cooldown_minutes=45,
+)
+
+
 DEFAULT_RULES: list[ImpulseRule] = [
-    curiosity_explore,
-    social_reach_out,
-    diligence_todo,
-    break_silence,
-    thought_pursue,
-    rest_well,
+    thought_deepen,
+    curiosity_engage,
+    learning_reflect,
+    river_consolidate,
+    intent_review,
+    todo_attend,
 ]

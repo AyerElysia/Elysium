@@ -65,7 +65,7 @@ def build_self_pause_status(
 
 
 def clear_self_pause_state(state: LifeEngineState) -> bool:
-    """清除主动休息锁。"""
+    """清除主动休息锁。返回是否有变化。"""
     changed = any(
         (
             state.self_pause_until,
@@ -79,6 +79,7 @@ def clear_self_pause_state(state: LifeEngineState) -> bool:
         state.self_pause_started_at = None
         state.self_pause_reason = None
         state.self_pause_duration_minutes = 0
+        # 连续休息计数在此不清零，由外部决定何时重置
     return changed
 
 
@@ -102,6 +103,9 @@ def apply_self_pause(
     state.self_pause_until = paused_until.isoformat()
     state.self_pause_reason = cleaned_reason
     state.self_pause_duration_minutes = clamped_minutes
+    
+    # 递增连续休息计数
+    state.consecutive_rest_count += 1
 
     return {
         "paused": True,
@@ -109,6 +113,7 @@ def apply_self_pause(
         "requested_minutes": requested_minutes,
         "paused_until": paused_until.isoformat(),
         "reason": cleaned_reason,
+        "consecutive_count": state.consecutive_rest_count,
         "min_minutes": SELF_PAUSE_MINUTES_MIN,
         "max_minutes": SELF_PAUSE_MINUTES_MAX,
         "will_wake_on_external_message": True,

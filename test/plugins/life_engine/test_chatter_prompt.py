@@ -2441,18 +2441,29 @@ def test_heartbeat_prompt_bounds_tell_dfc_to_context_gap(tmp_path) -> None:
     assert "你去安慰/追问 Y" in prompt
     assert "工具会默认唤醒表达层" in prompt
     assert "唤醒只是让新上下文被看见，不代表表达层必须开口" in prompt
-    assert "没有明确信息差或私有维护需求时，可以安静结束本轮" in prompt
+    assert "没有明确需要时，可以安静结束本轮" in prompt
     assert "有冲动就行动" not in prompt
 
 
-def test_social_impulses_do_not_route_directly_to_tell_dfc() -> None:
-    """社交类冲动不应默认把 nucleus_tell_dfc 当作主动表达出口。"""
-    from plugins.life_engine.drives.rules import break_silence, social_reach_out
+def test_impulse_rules_based_on_auditable_state() -> None:
+    """冲动规则应基于现存可审计状态，不依赖已删除的 neuromod。"""
+    from plugins.life_engine.drives.rules import DEFAULT_RULES
 
-    assert "nucleus_tell_dfc" not in social_reach_out.tools
-    assert "nucleus_tell_dfc" not in break_silence.tools
-    assert "表达层缺失的关键背景" in social_reach_out.suggestion
-    assert "明确的信息差" in break_silence.suggestion
+    # 确认所有规则都不依赖 neuromod（规则 condition 函数只接受 context 参数）
+    for rule in DEFAULT_RULES:
+        assert rule.name in {
+            "thought_deepen",
+            "curiosity_engage",
+            "learning_reflect",
+            "river_consolidate",
+            "intent_review",
+            "todo_attend",
+        }, f"发现未预期的规则: {rule.name}"
+    
+    # 确认社交类规则已被移除（它们依赖已删除的 sociability 调质）
+    rule_names = {rule.name for rule in DEFAULT_RULES}
+    assert "social_reach_out" not in rule_names
+    assert "break_silence" not in rule_names
 # ── loop 中收到新消息的并发回归测试 ────────────────────────────────────
 
 async def test_inject_delta_unreads_appends_new_messages_to_payload(monkeypatch) -> None:

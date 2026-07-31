@@ -74,12 +74,17 @@ class ThoughtStreamsSection(HeartbeatSectionProvider):
         if getattr(ctx.service, "_thought_manager", None) is None:
             return False
         streams_cfg = getattr(ctx.config, "streams", None)
-        return streams_cfg is None or bool(getattr(streams_cfg, "inject_to_heartbeat", True))
+        return (
+            streams_cfg is None
+            or bool(getattr(streams_cfg, "inject_to_heartbeat", True))
+        )
 
     async def render(self, ctx: SectionContext) -> str | None:
         streams_cfg = getattr(ctx.config, "streams", None)
         focus_window = (
-            int(getattr(streams_cfg, "focus_window_minutes", 30) or 30) if streams_cfg else 30
+            int(getattr(streams_cfg, "focus_window_minutes", 30) or 30)
+            if streams_cfg
+            else 30
         )
         body = ctx.service._thought_manager.format_for_prompt(
             max_items=3,
@@ -114,7 +119,8 @@ class CuriositySection(HeartbeatSectionProvider):
             return None
         guidance = (
             "如果这个刺点你确实在意，可以靠近它（联想、检索、轻轻观察），"
-            "或者用 `nucleus_manage_thought_stream`（action=create，absorb_curiosity=true）"
+            "或者用 `nucleus_manage_thought_stream`"
+            "（action=create，absorb_curiosity=true）"
             "开一条思考流把它留住——承接之后这股牵引会自然放下。\n"
             "如果你觉得它已经闭合、或并不重要，放下它也很好。"
         )
@@ -130,10 +136,15 @@ class ImpulseSection(HeartbeatSectionProvider):
         if getattr(ctx.service, "_impulse_engine", None) is None:
             return False
         drives_cfg = getattr(ctx.config, "drives", None)
-        return drives_cfg is None or bool(getattr(drives_cfg, "inject_to_heartbeat", True))
+        return (
+            drives_cfg is None
+            or bool(getattr(drives_cfg, "inject_to_heartbeat", True))
+        )
 
     async def render(self, ctx: SectionContext) -> str | None:
         service = ctx.service
+        
+        # 判定紧急 todo
         has_urgent_todos = False
         try:
             from ..tools.todo_tools import TodoStorage
@@ -149,6 +160,43 @@ class ImpulseSection(HeartbeatSectionProvider):
             )
         except Exception:  # noqa: BLE001
             has_urgent_todos = False
+        
+        # 判定好奇刺点
+        has_curiosity_signal = False
+        try:
+            signal = await service._get_curiosity_engine().load_signal()
+            has_curiosity_signal = bool(signal and signal.text)
+        except Exception:  # noqa: BLE001
+            has_curiosity_signal = False
+        
+        # 判定学习进展
+        has_learning_progress = False
+        try:
+            scheduler = getattr(service, "_learning_scheduler", None)
+            if scheduler:
+                progress = scheduler.get_progress_for_prompt()
+                has_learning_progress = bool(progress)
+        except Exception:  # noqa: BLE001
+            has_learning_progress = False
+        
+        # 判定待沉淀河流记忆
+        has_pending_river_moments = False
+        try:
+            from ..narrative.store import NarrativeStore
+            from ..trace.store import LifeTraceStore
+            narrative_cfg = getattr(ctx.config, "narrative", None)
+            if narrative_cfg and getattr(narrative_cfg, "enabled", True):
+                store = NarrativeStore(service._workspace_dir())
+                trace_store = LifeTraceStore(service._workspace_dir())
+                pending = store.pending_moments(trace_store.recent(limit=500))
+                min_moments = int(getattr(narrative_cfg, "min_moments", 5))
+                has_pending_river_moments = len(pending) >= min_moments
+        except Exception:  # noqa: BLE001
+            has_pending_river_moments = False
+        
+        # 判定自主意向（需要新增工具支持，暂时置 False）
+        has_autonomy_intents = False
+        
         context = {
             "silence_minutes": ctx.silence_minutes or 0,
             "idle_heartbeats": ctx.idle_heartbeats,
@@ -157,6 +205,10 @@ class ImpulseSection(HeartbeatSectionProvider):
                 and service._thought_manager.list_active()
             ),
             "has_urgent_todos": has_urgent_todos,
+            "has_curiosity_signal": has_curiosity_signal,
+            "has_learning_progress": has_learning_progress,
+            "has_pending_river_moments": has_pending_river_moments,
+            "has_autonomy_intents": has_autonomy_intents,
         }
         suggestions = service._impulse_engine.evaluate({}, context)
         return service._impulse_engine.format_for_prompt(
@@ -215,14 +267,18 @@ class RiverReflectionSection(HeartbeatSectionProvider):
     """回望长河：到期时把未沉淀的转折点摆给她，由她决定是否讲述。
 
     沉淀必须经过她的语言——本段落只呈现素材与邀请，绝不替她总结；
-    低频（min_interval_hours）+ 邀请冷却（invite_cooldown_hours），回望是想起，不是作业。
+    低频（min_interval_hours）+ 邀请冷却（invite_cooldown_hours），
+    回望是想起，不是作业。
     """
 
     section_id = "river_reflection"
 
     def enabled(self, ctx: SectionContext) -> bool:
         narrative_cfg = getattr(ctx.config, "narrative", None)
-        if narrative_cfg is None or getattr(ctx.service, "_workspace_dir", None) is None:
+        if (
+            narrative_cfg is None
+            or getattr(ctx.service, "_workspace_dir", None) is None
+        ):
             return False
         return bool(getattr(narrative_cfg, "enabled", True)) and bool(
             getattr(narrative_cfg, "inject_to_heartbeat", True)
@@ -278,9 +334,11 @@ class RiverReflectionSection(HeartbeatSectionProvider):
             lines.extend(["", f"上次你写道：「{snippet}」"])
         lines.extend([
             "",
-            "如果你愿意回望这段日子，可以用 `nucleus_write_narrative` 写下它对你意味着什么——"
+            "如果你愿意回望这段日子，可以用 `nucleus_write_narrative` "
+            "写下它对你意味着什么——"
             "用你自己的话，长短不限。"
-            "如果你觉得没什么值得说的，传 nothing_to_say=true 也同样是一次完整的回望。"
+            "如果你觉得没什么值得说的，传 nothing_to_say=true "
+            "也同样是一次完整的回望。"
             "现在不想回望，跳过也很好。",
         ])
         return "\n".join(lines)
@@ -305,7 +363,10 @@ class SelfKnowledgeSection(HeartbeatSectionProvider):
         if scheduler is None:
             return None
         knowledge = scheduler.get_knowledge_for_prompt(
-            max_chars=int(getattr(ctx.config.learning, "knowledge_max_chars", 2000) or 2000)
+            max_chars=int(
+                getattr(ctx.config.learning, "knowledge_max_chars", 2000)
+                or 2000
+            )
         )
         if not knowledge:
             return None
@@ -357,7 +418,12 @@ class SkillCatalogSection(HeartbeatSectionProvider):
         if scheduler is None:
             return None
         max_chars = int(
-            getattr(getattr(ctx.config, "learning", None), "skill_catalog_max_chars", 600) or 600
+            getattr(
+                getattr(ctx.config, "learning", None),
+                "skill_catalog_max_chars",
+                600,
+            )
+            or 600
         )
         catalog = scheduler.get_skill_catalog_for_prompt(max_chars=max_chars)
         if not catalog:
@@ -365,10 +431,109 @@ class SkillCatalogSection(HeartbeatSectionProvider):
         return f"### 我的做事方式\n{catalog}"
 
 
+class LeisureOpportunitySection(HeartbeatSectionProvider):
+    """休闲机会快照：将现存可审计状态组织为非强制候选集合。
+    
+    设计原则：
+    - 以邀请而非任务形式呈现机会
+    - 保持主体性：有候选时仍允许选择休息或安静结束
+    - 基于现存可审计状态，不依赖已删除的 neuromod
+    """
+
+    section_id = "leisure_opportunities"
+
+    def enabled(self, ctx: SectionContext) -> bool:
+        # 复用原 drives 配置键以保持兼容性
+        drives_cfg = getattr(ctx.config, "drives", None)
+        return (
+            drives_cfg is None
+            or bool(getattr(drives_cfg, "inject_to_heartbeat", True))
+        )
+
+    async def render(self, ctx: SectionContext) -> str | None:
+        service = ctx.service
+        opportunities: list[str] = []
+        
+        # 1. 活跃思考流
+        if (
+            getattr(service, "_thought_manager", None)
+            and service._thought_manager.list_active()
+        ):
+            opportunities.append(
+                "你有未完成的思考流，也许可以继续深入、联想或沉淀"
+            )
+        
+        # 2. 好奇刺点
+        try:
+            signal = await service._get_curiosity_engine().load_signal()
+            if signal and signal.text:
+                opportunities.append("好奇层留下了刺点；如果你在意，可以靠近它、开思考流承接")
+        except Exception:  # noqa: BLE001
+            pass
+        
+        # 3. 学习进展
+        try:
+            scheduler = getattr(service, "_learning_scheduler", None)
+            if scheduler and scheduler.get_progress_for_prompt():
+                opportunities.append("学习系统有新进展；可以看看新验证的领悟或技能目录")
+        except Exception:  # noqa: BLE001
+            pass
+        
+        # 4. 待沉淀河流记忆
+        try:
+            from ..narrative.store import NarrativeStore
+            from ..trace.store import LifeTraceStore
+            narrative_cfg = getattr(ctx.config, "narrative", None)
+            if narrative_cfg and getattr(narrative_cfg, "enabled", True):
+                store = NarrativeStore(service._workspace_dir())
+                trace_store = LifeTraceStore(service._workspace_dir())
+                pending = store.pending_moments(trace_store.recent(limit=500))
+                min_moments = int(getattr(narrative_cfg, "min_moments", 5))
+                if len(pending) >= min_moments:
+                    opportunities.append("长河里积累了一些留痕；如果愿意，可以回望并写下它对你意味着什么")
+        except Exception:  # noqa: BLE001
+            pass
+        
+        # 5. 紧急 todo（作为提醒而非命令）
+        try:
+            from ..tools.todo_tools import TodoStorage
+            active_todos = [
+                todo
+                for todo in TodoStorage(service._workspace_dir()).load()
+                if todo.status not in {"completed", "cancelled", "archived"}
+            ]
+            if any(
+                todo.priority == "urgent"
+                or todo.is_overdue()
+                or todo.needs_review()
+                for todo in active_todos
+            ):
+                opportunities.append(
+                    "有紧急或逾期的 TODO；这是承诺提醒，可以观察、整理或释放"
+                )
+        except Exception:  # noqa: BLE001
+            pass
+        
+        if not opportunities:
+            return None
+        
+        lines = ["### 当前机会", ""]
+        lines.append("此刻你可能想：")
+        lines.append("")
+        for opp in opportunities[:4]:  # 最多展示 4 条
+            lines.append(f"- {opp}")
+        lines.append("")
+        lines.append("这些只是机会；你也可以观察、沉淀，或者安静结束本轮。")
+        lines.append("如果精力需要恢复，主动休息也很好。")
+        lines.append("")
+        
+        return "\n".join(lines)
+
+
 DEFAULT_HEARTBEAT_SECTIONS: list[HeartbeatSectionProvider] = [
     ThoughtStreamsSection(),
     CuriositySection(),
-    ImpulseSection(),
+    LeisureOpportunitySection(),  # 替换原 ImpulseSection
     SendTargetsSection(),
     RiverReflectionSection(),
     SelfKnowledgeSection(),

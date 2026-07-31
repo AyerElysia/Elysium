@@ -98,6 +98,9 @@ class LifeEngineState:
     self_pause_started_at: str | None = None
     self_pause_reason: str | None = None
     self_pause_duration_minutes: int = 0
+    self_pause_checkpoint_minutes: int = 30  # 休息期间检查点间隔
+    consecutive_rest_count: int = 0  # 连续休息次数（用于觉察）
+    last_leisure_seen_at: str | None = None  # 上次看到休闲机会快照的时间
     # 每个聊天流已经给 life_chatter 注入过的事件序列高水位
     # NOTE: 老字段，新代码实际上把它当作 chatter_event_cursors 使用。
     # 加载老 state 时直接复用；写出时仍写入此字段以保持兼容。

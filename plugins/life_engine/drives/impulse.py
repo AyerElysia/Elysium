@@ -15,7 +15,8 @@ logger = logging.getLogger("life_engine.drives")
 class ImpulseRule:
     """一条冲动规则。"""
     name: str                                      # 规则名
-    condition: Callable[[dict, dict], bool]        # (neuromod_state, context) -> should_trigger
+    # (neuromod_state, context) -> should_trigger
+    condition: Callable[[dict, dict], bool]
     suggestion: str                                 # 自然语言建议
     tools: list[str]                                # 推荐工具
     cooldown_minutes: int = 30                      # 同一规则最小触发间隔
@@ -76,20 +77,18 @@ class ImpulseEngine:
                 logger.debug(f"冲动规则 {rule.name} 评估失败: {e}")
         return suggestions
 
-    def format_for_prompt(self, suggestions: list[ImpulseSuggestion], neuromod_state: dict[str, Any], max_items: int = 3) -> str:
+    def format_for_prompt(
+        self,
+        suggestions: list[ImpulseSuggestion],
+        neuromod_state: dict[str, Any],
+        max_items: int = 3,
+    ) -> str:
         """格式化为心跳 prompt 片段。"""
         if not suggestions:
             return ""
 
-        # 提取关键驱动值用于上下文
-        curiosity = neuromod_state.get("curiosity", {})
-        sociability = neuromod_state.get("sociability", {})
-
-        curiosity_val = curiosity.get("value", 0.5) if isinstance(curiosity, dict) else 0.5
-        sociability_val = sociability.get("value", 0.5) if isinstance(sociability, dict) else 0.5
-
         lines = ["### 内在冲动", ""]
-        lines.append(f"基于你当前的好奇心({curiosity_val:.0%})和社交欲({sociability_val:.0%})：")
+        lines.append("基于当前状态，你可能想：")
         lines.append("")
 
         for s in suggestions[:max_items]:

@@ -657,6 +657,9 @@ class StatePersistence:
                     "self_pause_started_at": state.self_pause_started_at,
                     "self_pause_reason": state.self_pause_reason,
                     "self_pause_duration_minutes": state.self_pause_duration_minutes,
+                    "self_pause_checkpoint_minutes": state.self_pause_checkpoint_minutes,
+                    "consecutive_rest_count": state.consecutive_rest_count,
+                    "last_leisure_seen_at": state.last_leisure_seen_at,
                     "chatter_context_cursors": state.chatter_context_cursors or {},
                     "chatter_thought_cursors": state.chatter_thought_cursors or {},
                     "last_chatter_think_by_stream": state.last_chatter_think_by_stream or {},
@@ -804,6 +807,13 @@ class StatePersistence:
             state.self_pause_duration_minutes = _safe_int(
                 state_raw.get("self_pause_duration_minutes")
             )
+            state.self_pause_checkpoint_minutes = _safe_int(
+                state_raw.get("self_pause_checkpoint_minutes", 30)
+            )
+            state.consecutive_rest_count = _safe_int(
+                state_raw.get("consecutive_rest_count", 0)
+            )
+            state.last_leisure_seen_at = state_raw.get("last_leisure_seen_at")
             raw_cursors = state_raw.get("chatter_context_cursors")
             if isinstance(raw_cursors, dict):
                 cursors: dict[str, int] = {}
