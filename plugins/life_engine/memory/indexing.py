@@ -1442,7 +1442,8 @@ def claim_index_jobs(
     clauses = ["status = 'pending'"]
     params: list[object] = []
     if retry_failed:
-        clauses.append("status = 'failed'")
+        # 排除永久性失败（EmptyDocument）——空文档不会因重试而变非空
+        clauses.append("(status = 'failed' AND error != 'EmptyDocument')")
     if reclaim_after is not None:
         clauses.append("(status = 'processing' AND updated_at <= ?)")
         params.append(timestamp - max(0.0, float(reclaim_after)))

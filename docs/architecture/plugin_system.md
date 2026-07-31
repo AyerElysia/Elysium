@@ -1,0 +1,367 @@
+# 插件系统（Plugin System）
+
+> 文档状态：权威文档，与代码同步截至 2026-07-31。
+> 代码位置：`src/app/plugin_system/`（API 层）+ `src/core/components/`（基类+加载器）。
+> 本文是插件架构的权威文档；凡与本文冲突，以本文和当前代码为准。
+
+---
+
+## 0. 一句话定位
+
+插件系统是 Elysium 的**组件化扩展架构**：所有功能（生命引擎、适配器、表情包、画室、直播等）都以插件形式注册，每个插件通过声明式 `get_components()` 暴露工具（Tool）、动作（Action）、服务（Service）、对话器（Chatter）、路由（Router）、事件处理器（EventHandler）等组件，由统一的加载器发现、依赖排序、实例化并注册到运行时。
+
+---
+
+## 1. 总体架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      运行时（Runtime）                             │
+│  PluginManager / EventManager /AdapterManager / ChatterManager    │
+├─────────────────────────────────────────────────────────────────┤
+│                      API 层  (plugin_system/api/)                 │
+│  llm_api / event_api / send_api / message_api / config_api /     │
+│  adapter_api / chat_api / storage_api / prompt_api / ...          │
+├─────────────────────────────────────────────────────────────────┤
+│                      基类层  (core/components/base/)              │
+│  BasePlugin / BaseTool / BaseAction / BaseService /               │
+│  BaseChatter / BaseAdapter / BaseRouter / BaseEventHandler /      │
+│  BaseConfig / BaseAgent / BaseCommand                             │
+├─────────────────────────────────────────────────────────────────┤
+│                      加载器  (core/components/loader.py)          │
+│  @register_plugin / PluginLoader / PluginDependencyResolver       │
+├─────────────────────────────────────────────────────────────────┤
+│                      插件实例  (plugins/)                          │
+│  life_engine / napcat_adapter / feishu_adapter / emoji /          │
+│  elysia_art_studio / livestream / tts_voice_plugin / ...          │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 2. 组件基类
+
+### 2.1 BasePlugin（插件入口）
+
+```python
+class BasePlugin(ABC):
+    plugin_name: str              # 唯一标识
+    plugin_description: str       # 描述
+    plugin_version: str           # 版本号
+    configs: list[type]           # 配置类列表
+    dependent_components: list[str]  # 依赖的组件
+
+    def get_components(self) -> list[type]:
+        """返回插件提供的所有组件类。"""
+        ...
+
+    async def on_plugin_loaded(self) -> None:
+        """插件加载后回调。"""
+        ...
+
+    async def on_plugin_unloaded(self) -> None:
+        """插件卸载前回调。"""
+        ...
+```
+
+### 2.2 BaseTool（LLM 可调用工具）
+
+```python
+class BaseTool(ABC, LLMUsable):
+    tool_name: str                # 工具名（如 "nucleus_trace"）
+    tool_description: str         # 描述（LLM 可见）
+    chatter_allow: list[str]      # 允许哪些 chatter 调用
+
+    async def execute(self, **kwargs) -> tuple[bool, str | dict]:
+        """执行工具，返回 (成功?, 结果)。"""
+        ...
+
+    @classmethod
+    def to_schema(cls) -> dict:
+        """生成 OpenAI function calling schema。"""
+        ...
+```
+
+工具通过 `Annotated` 类型注解自动生成参数 schema：
+```python
+async def execute(
+    self,
+    path: Annotated[str, "文件路径"],
+    limit: Annotated[int, "最多返回条数"] = 20,
+) -> tuple[bool, str | dict]:
+```
+
+### 2.3 BaseAction（聊天流动作）
+
+```python
+class BaseAction(ABC, LLMUsable):
+    action_name: str
+    action_description: str
+
+    def __init__(self, chat_stream: ChatStream, plugin: BasePlugin):
+        ...
+
+    async def execute(self, **kwargs) -> tuple[bool, str]:
+        ...
+
+    async def go_activate(self) -> bool:
+        """是否激活（概率/关键词/LLM 判断）。"""
+        ...
+```
+
+Action 与 Tool 的区别：Action 绑定到特定 ChatStream（有消息上下文），Tool 无状态。
+
+### 2.4 BaseService（后台服务）
+
+```python
+class BaseService:
+    def __init__(self, plugin: BasePlugin):
+        ...
+```
+
+Service 是长生命周期的后台服务（如 LifeEngineService），由插件实例化并管理。
+
+### 2.5 BaseChatter（对话器）
+
+```python
+class BaseChatter(ABC):
+    chatter_name: str
+    associated_platforms: list[str]
+    chat_type: ChatType
+
+    async def execute(self) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:
+        """对话器主循环（生成器模式）。"""
+        ...
+```
+
+Chatter 是对话的主循环，yield 状态机（Wait/Success/Failure/Stop）驱动交互。
+
+### 2.6 其他基类
+
+| 基类 | 职责 |
+| --- | --- |
+| `BaseAdapter` | 平台适配器（QQ/飞书/WebSocket） |
+| `BaseRouter` | 消息路由判断 |
+| `BaseEventHandler` | 事件订阅处理 |
+| `BaseConfig` | 插件配置（Pydantic） |
+| `BaseAgent` | 子代理 |
+| `BaseCommand` | 命令处理（`/cmd`） |
+
+---
+
+## 3. 插件注册与加载
+
+### 3.1 @register_plugin 装饰器
+
+```python
+@register_plugin
+class LifeEnginePlugin(BasePlugin):
+    plugin_name = "life_engine"
+    ...
+```
+
+装饰器将插件类注册到全局注册表，供加载器发现。
+
+### 3.2 PluginManifest
+
+每个插件目录下有 `manifest.json`：
+
+```json
+{
+  "name": "life_engine",
+  "version": "3.4.0",
+  "description": "生命中枢",
+  "entry": "core.plugin",
+  "dependencies": [],
+  "core_version": ">=2.0.0"
+}
+```
+
+### 3.3 加载流程
+
+```
+PluginLoader.load_all_plugins(plugins_dir)
+    │
+    ├── 1. discover_plugins()：扫描目录/ZIP
+    ├── 2. load_manifest()：读取 manifest.json
+    ├── 3. _check_version_compatibility()：核心版本检查
+    ├── 4. PluginDependencyResolver：拓扑排序
+    ├── 5. 按序加载每个插件：
+    │       ├── import 入口模块
+    │       ├── 实例化 BasePlugin
+    │       ├── 调用 get_components()
+    │       ├── 注册所有组件到对应 Manager
+    │       └── 调用 on_plugin_loaded()
+    └── 6. 返回加载结果
+```
+
+### 3.4 依赖解析
+
+`PluginDependencyResolver` 使用拓扑排序确保依赖先加载：
+- 循环依赖检测
+- 缺失依赖报告
+- 加载失败隔离（不影响其他插件）
+
+---
+
+## 4. API 层
+
+**目录**：`src/app/plugin_system/api/`
+
+为插件提供扁平化的便捷接口，屏蔽底层 Manager 细节：
+
+| API 模块 | 职责 |
+| --- | --- |
+| `llm_api` | LLM 请求构造、模型查询、工具执行 |
+| `event_api` | 事件发布/订阅 |
+| `send_api` | 消息发送 |
+| `message_api` | 消息查询/格式化 |
+| `config_api` | 配置读取 |
+| `adapter_api` | 适配器操作 |
+| `chat_api` | 聊天流管理 |
+| `storage_api` | 持久化存储 |
+| `prompt_api` | Prompt 模板管理 |
+| `plugin_api` | 插件加载/卸载/查询 |
+| `service_api` | 服务注册/查询 |
+| `stream_api` | 流管理 |
+| `media_api` | 媒体处理 |
+| `permission_api` | 权限控制 |
+| `database_api` | 数据库操作 |
+| `command_api` | 命令注册 |
+| `router_api` | 路由注册 |
+| `agent_api` | 子代理管理 |
+| `action_api` | Action 注册 |
+| `log_api` | 日志获取 |
+
+### 4.1 LLM API 示例
+
+```python
+from src.app.plugin_system.api.llm_api import (
+    create_llm_request,
+    get_model_set_by_task,
+    run_tool_call,
+)
+
+# 创建请求
+request = create_llm_request(
+    get_model_set_by_task("expression"),
+    request_name="my_feature",
+)
+request.add_payload(LLMPayload(ROLE.SYSTEM, Text("...")))
+request.add_payload(LLMPayload(ROLE.USER, Text("...")))
+
+# 发送
+response = await request.send(stream=False)
+text = await response
+```
+
+### 4.2 事件 API 示例
+
+```python
+from src.app.plugin_system.api.event_api import publish_event, subscribe_event
+
+# 发布
+await publish_event(EventType.ON_MESSAGE_RECEIVED, {"message": msg})
+
+# 订阅
+subscribe_event(EventType.ON_MESSAGE_RECEIVED, handler)
+```
+
+---
+
+## 5. 配置体系
+
+### 5.1 BaseConfig
+
+```python
+class LifeEngineConfig(BaseConfig):
+    config_name = "config"
+
+    @config_section
+    class SettingsSection(SectionBase):
+        enabled: bool = Field(default=True)
+        heartbeat_interval_seconds: int = Field(default=30)
+        ...
+
+    @config_section
+    class ModelSection(SectionBase):
+        task_name: str = Field(default="core")
+        chatter_task_name: str = Field(default="")
+        ...
+```
+
+### 5.2 配置加载
+
+- 文件：`config/plugins/{plugin_name}/config.toml`
+- 格式：TOML，按 section 映射到 Pydantic 模型
+- 验证：Pydantic Field 类型检查 + 自定义 validator
+- WebUI 暴露：`__config_schema_visible_fields__` 控制哪些字段可在线修改
+
+---
+
+## 6. 当前插件清单
+
+| 插件 | 职责 | 核心组件 |
+| --- | --- | --- |
+| `life_engine` | 生命中枢 | Service + Chatter + 50+ Tools + Router |
+| `napcat_adapter` | QQ 适配器 | Adapter + EventHandler |
+| `feishu_adapter` | 飞书适配器 | Adapter + EventHandler |
+| `emoji` | 表情包 | Action + Tools |
+| `elysia_art_studio` | 画室 | Tools + Service |
+| `livestream` | 直播 | Service + Tools |
+| `tts_voice_plugin` | TTS 语音 | Tools + Service |
+| `voice_live` | 语音直播 | Service |
+| `skill_manager` | 技能管理 | Tools |
+| `commands_plugin` | 命令集 | Commands |
+| `diary_plugin` | 日记（兼容） | Tools |
+| `webui_backend` | Web 管理面板 | Router + Service |
+| `neko_surface` | 猫娘表面 | Action |
+| `werewolf_game` | 狼人杀 | Tools + Service |
+| `astrbot_sister_bridge` | AstrBot 桥接 | Adapter |
+
+---
+
+## 7. 组件生命周期
+
+```
+插件发现 → manifest 解析 → 依赖排序 → import 入口
+    │
+    ▼
+实例化 BasePlugin(config)
+    │
+    ▼
+get_components() → 组件类列表
+    │
+    ├── BaseTool → ToolRegistry（LLM 可调用）
+    ├── BaseAction → ChatStream 注册
+    ├── BaseService → 实例化 + start()
+    ├── BaseChatter → ChatterManager 注册
+    ├── BaseAdapter → AdapterManager 注册
+    ├── BaseRouter → 路由链注册
+    └── BaseEventHandler → EventManager 订阅
+    │
+    ▼
+on_plugin_loaded()（插件级初始化）
+    │
+    ▼ 运行中...
+    │
+    ▼
+on_plugin_unloaded()（清理）
+```
+
+---
+
+## 8. 文件索引
+
+| 路径 | 职责 |
+| --- | --- |
+| `src/core/components/base/plugin.py` | BasePlugin 基类 |
+| `src/core/components/base/tool.py` | BaseTool 基类 |
+| `src/core/components/base/action.py` | BaseAction 基类 |
+| `src/core/components/base/service.py` | BaseService 基类 |
+| `src/core/components/base/chatter.py` | BaseChatter 基类 |
+| `src/core/components/base/config.py` | BaseConfig + Field + SectionBase |
+| `src/core/components/loader.py` | 插件加载器 + 依赖解析 |
+| `src/app/plugin_system/base/__init__.py` | 统一导出（re-export） |
+| `src/app/plugin_system/api/` | 20 个 API 模块 |
+| `src/app/plugin_system/types.py` | 共享类型定义 |

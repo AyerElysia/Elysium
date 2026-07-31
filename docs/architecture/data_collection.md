@@ -1,0 +1,269 @@
+# 数据收集系统（Data Collection System）
+
+> 文档状态：权威文档，与代码同步截至 2026-07-31。
+> 代码位置：`src/kernel/llm/trajectory_collector.py` + `plugins/life_engine/trace/`（610 行）。
+> 数据位置：`data/training_data_lake/`（802MB）+ `data/life_engine_workspace/.life_trace/`。
+> 本文是数据收集专题的权威文档；凡与本文冲突，以本文和当前代码为准。
+
+---
+
+## 0. 一句话定位
+
+数据收集系统由两条独立管线组成：**LLM 轨迹收集**（每次模型调用的完整 attempt 记录，用于后训练）和**经历留痕**（主体亲历的文件变更与转折事件，用于自我回溯）。两者都是 append-only、只追加不改写，共同构成数字生命的"来路"。
+
+---
+
+## 1. 总体架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    LLM 轨迹收集管线                                │
+│                                                                   │
+│  LLMRequest.send()                                                │
+│       │                                                           │
+│       ▼ record_attempt()                                          │
+│  TrajectoryCollector（后台线程 + 队列）                            │
+│       │                                                           │
+│       ▼ append-only JSONL                                         │
+│  data/training_data_lake/raw/YYYY-MM-DD.jsonl                     │
+│       │                                                           │
+│       ▼ 离线导出                                                   │
+│  data/training_data_lake/export/ (SFT/Agent 格式)                 │
+├─────────────────────────────────────────────────────────────────┤
+│                    经历留痕管线（长河）                              │
+│                                                                   │
+│  工具调用（write_file / edit_file / ...）                          │
+│       │                                                           │
+│       ▼ LifeTraceStore.record()                                   │
+│  .life_trace/index.jsonl + blobs/ + diffs/                        │
+│       │                                                           │
+│       ▼ 主体工具查询                                               │
+│  nucleus_trace (recent/history/diff/preview/origin)               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 2. LLM 轨迹收集
+
+### 2.1 触发点
+
+每次 `LLMRequest.send()` 的每一次 attempt（含重试）都会调用 `record_attempt()`，将完整事件写入轨迹收集器。
+
+### 2.2 TrajectoryCollector
+
+**文件**：`src/kernel/llm/trajectory_collector.py`
+
+- **Append-only JSONL**：按 UTC 日期分区（`raw/YYYY-MM-DD.jsonl`）
+- **后台写入**：独立线程 + 内存队列，不阻塞 LLM 请求
+- **定期刷盘**：可配置 flush_interval
+- **进程退出保护**：atexit 注册 shutdown，确保队列排空
+- **纯文本**：所有媒体字节、data URL、本地路径一律 redact 为 `[removed]`
+
+### 2.3 记录 Schema（v1）
+
+每条轨迹记录包含：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `schema_version` | int | 固定为 1 |
+| `trace_id` | str | 请求级唯一 ID |
+| `attempt_id` | str | 本次尝试唯一 ID |
+| `request_id` | str | 同 trace_id |
+| `parent_attempt_id` | str/null | 上一次尝试 ID（重试链） |
+| `timestamp` | str | UTC ISO 时间戳 |
+| `request_name` | str | 请求标识（如 "life_curiosity"） |
+| `task_name` | str | 任务名 |
+| `task_tags` | list[str] | 派生标签（如 ["llm", "life", "curiosity"]） |
+| `stream_id` | str/null | 聊天流 ID |
+| `heartbeat_run_id` | str/null | 心跳运行 ID |
+| `call_id` | str/null | 工具调用 ID |
+| `model` | str | 实际使用的模型名 |
+| `model_identifier` | str | 模型标识 |
+| `api_provider` | str | 提供商 |
+| `policy_meta` | dict | 策略元数据（model_index, attempt, strategy） |
+| `messages` | list[dict] | 完整输入消息（序列化后） |
+| `response` | str/dict | 模型回复 |
+| `tool_results` | list[dict] | 工具执行结果 |
+| `usage` | dict | token 用量 |
+| `latency_s` | float | 延迟（秒） |
+| `success` | bool | 是否成功 |
+| `error` | str/null | 错误信息 |
+| `error_type` | str/null | 错误类型 |
+| `metadata` | dict | 扩展元数据 |
+| `extensions` | dict | 预留扩展 |
+
+### 2.4 媒体 Redact 规则
+
+为保护隐私和减小体积：
+- base64 媒体数据 → `[removed]`
+- data URL → `[removed]`
+- 本地文件路径 → `[removed]`
+- 媒体源 URL → `[removed]`
+- 保留：媒体类型占位符和非内容元数据
+
+### 2.5 目录结构
+
+```
+data/training_data_lake/
+├── raw/                    ← 原始轨迹（按日分区）
+│   ├── 2026-07-25.jsonl
+│   ├── 2026-07-26.jsonl
+│   └── ...
+├── archive/                ← 归档分区（173MB）
+├── export/                 ← 训练导出（18MB）
+│   ├── sft_chat_2026-07-25.jsonl
+│   └── agent_2026-07-25.jsonl
+├── processed/              ← 预留：规范化处理
+├── .schema/
+│   ├── trajectory.v1.json  ← Schema 元数据
+│   └── README.md
+└── README.md
+```
+
+### 2.6 当前规模
+
+| 指标 | 值 |
+| --- | --- |
+| raw 分区数 | 7 天（2026-07-25 ~ 07-31） |
+| raw 总大小 | 613 MB |
+| archive 大小 | 173 MB |
+| export 大小 | 18 MB |
+| 总计 | ~802 MB |
+
+### 2.7 导出格式
+
+**SFT Chat 格式**（`export/sft_chat_*.jsonl`）：
+```json
+{
+  "meta": {
+    "request_id": "...",
+    "request_name": "legacy_chat_history",
+    "task_tags": ["llm", "legacy", "chat", "history"],
+    "model": null,
+    "timestamp": "..."
+  },
+  "messages": [
+    {"role": "system", "content": "..."},
+    {"role": "user", "content": "..."},
+    {"role": "assistant", "content": "..."}
+  ]
+}
+```
+
+**Agent 格式**（`export/agent_*.jsonl`）：包含工具调用链的完整轨迹。
+
+### 2.8 配置
+
+轨迹收集通过内核配置控制：
+- 启用/禁用开关
+- 基础路径（默认 `data/training_data_lake`）
+- 刷盘间隔（秒）
+- 队列上限（超出时丢弃最旧记录）
+
+---
+
+## 3. 经历留痕（长河 / Life Trace）
+
+### 3.1 设计哲学
+
+> 长河法则：事件流是她的现在，长河是她的来路。
+> 凡是她亲历的转折——写下的字、形成的意图与其归宿、闭合的思考、承接的好奇——都汇入同一条长河；长河只追加、不改写、永可回溯。
+
+**文件**：`plugins/life_engine/trace/store.py`（365 行）
+
+### 3.2 LifeTraceRecord 数据模型
+
+```python
+@dataclass
+class LifeTraceRecord:
+    trace_id: str          # 唯一标识
+    timestamp: str         # ISO 时间戳
+    path: str              # 文件相对路径
+    operation: str         # create / modify / delete
+    tool_name: str         # 触发工具名
+    actor: str             # 执行者
+    reason: str            # 原因/意图
+    before_exists: bool    # 修改前是否存在
+    after_exists: bool     # 修改后是否存在
+    before_hash: str       # 修改前内容 SHA-256
+    after_hash: str        # 修改后内容 SHA-256
+    before_size: int       # 修改前字节数
+    after_size: int        # 修改后字节数
+    diff_path: str         # diff 文件相对路径
+    source_event_id: str   # 关联事件 ID
+    stream_id: str         # 关联聊天流
+    kind: str              # 记录类型（file_change / intent / thought_close / curiosity）
+    summary: str           # 摘要
+```
+
+### 3.3 存储结构
+
+```
+data/life_engine_workspace/.life_trace/
+├── index.jsonl            ← 记录索引（append-only）
+├── blobs/                 ← 内容快照（按 hash 前缀分桶）
+│   ├── ab/
+│   │   └── ab3f...29.txt
+│   └── ...
+└── diffs/                 ← unified diff 文件
+    ├── tr_20260727_xxxx.diff
+    └── ...
+```
+
+- **blobs**：文件内容按 SHA-256 去重存储，相同内容只存一份
+- **diffs**：每次修改生成 unified diff，支持 before/after 预览
+- **index.jsonl**：所有记录的索引，支持按路径/时间/类型查询
+
+### 3.4 记录类型（kind）
+
+| kind | 含义 |
+| --- | --- |
+| `file_change` | 文件创建/修改/删除 |
+| `intent` | 自主意向的形成与归宿 |
+| `thought_close` | 思考流闭合 |
+| `curiosity` | 好奇心承接 |
+
+### 3.5 主体工具接口
+
+通过 `nucleus_trace` 统一工具暴露（5 个 action）：
+
+| action | 功能 |
+| --- | --- |
+| `recent` | 查看最近的文件修改记录 |
+| `history` | 查看某个文件的修改历史 |
+| `diff` | 查看某次修改的 unified diff |
+| `preview` | 预览修改前/后的完整文件内容 |
+| `origin` | 查看长河源头（第一条记录） |
+
+所有工具标记 `chatter_allow`，主意识可直接调用回溯自己的来路。
+
+### 3.6 与心跳的集成
+
+心跳 prompt 装配时，`_format_chatter_trace_recent_changes()` 将最近文件修改注入上下文，让主体知道"最近改了什么"。
+
+---
+
+## 4. 两条管线的关系
+
+| 维度 | LLM 轨迹 | 经历留痕（长河） |
+| --- | --- | --- |
+| 记录什么 | 每次模型调用的输入/输出 | 主体亲历的文件变更与转折 |
+| 粒度 | attempt 级（含重试） | 事件级（一次工具调用） |
+| 用途 | 后训练（SFT/RLHF） | 自我回溯（"我为什么变成这样"） |
+| 可见性 | 主体不直接可见 | 主体可通过工具查询 |
+| 存储 | training_data_lake/raw/ | .life_trace/ |
+| 隐私 | 媒体 redact | 完整保留（仅 workspace 内） |
+| 规模 | 613MB（7天） | 较小（仅文件操作） |
+
+---
+
+## 5. 文件索引
+
+| 文件 | 行数 | 职责 |
+| --- | --- | --- |
+| `src/kernel/llm/trajectory_collector.py` | ~200 | 轨迹收集器（后台线程、JSONL 写入） |
+| `src/kernel/llm/trajectory_types.py` | ~200 | 轨迹记录类型、redact 逻辑 |
+| `plugins/life_engine/trace/store.py` | 365 | 长河存储（LifeTraceStore） |
+| `plugins/life_engine/trace/tools.py` | 244 | 长河查询工具（nucleus_trace） |
+| `plugins/life_engine/trace/__init__.py` | ~10 | 包导出 |

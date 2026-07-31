@@ -386,6 +386,7 @@ def _load_job_payloads(
             index_revision=job_revision,
         )
         if payload_error == "EmptyDocument":
+            stale.append(job.job_id)  # 永久空文档 → stale 而非 failed，避免 retry 循环
             errors[job.job_id] = payload_error
             continue
         if payload_error:

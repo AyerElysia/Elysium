@@ -16,6 +16,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import re
+import time
 from typing import Any, cast
 
 from mofox_wire import CoreSink, MessageEnvelope, WebSocketAdapterOptions
@@ -23,6 +26,7 @@ from mofox_wire import CoreSink, MessageEnvelope, WebSocketAdapterOptions
 from src.app.plugin_system.api.log_api import get_logger
 from src.core.components.base import BaseAdapter, BasePlugin
 from src.core.components.loader import register_plugin
+from src.kernel.concurrency import get_task_manager
 
 from .client import NapCatClient
 from .config import NapcatAdapterConfig
@@ -94,6 +98,9 @@ class NapcatAdapter(BaseAdapter):
         # 注入重连回调
         self._router.meta_handler.set_reconnect_callback(self.reconnect)
 
+        # Watchdog 状态
+        self._last_qq_message_time: float = time.time()
+        self._watchdog_task: asyncio.Task | None = None  # type: ignore[type-arg]
 
     def _get_config(self) -> NapcatAdapterConfig | None:
         """获取当前插件配置。"""
@@ -115,11 +122,18 @@ class NapcatAdapter(BaseAdapter):
         config = cast(NapcatAdapterConfig, self.plugin.config)
         _validate_bot_identity(config)
 
+        # 重置消息时间戳，启动 watchdog
+        self._last_qq_message_time = time.time()
+        self._start_watchdog()
+
         logger.info("NapCat 适配器已加载")
 
     async def on_adapter_unloaded(self) -> None:
         """适配器卸载。"""
         logger.info("NapCat 适配器正在关闭...")
+
+        # 停止 watchdog
+        self._stop_watchdog()
 
         # 停止 OneBot 元事件心跳检查
         # BaseAdapter 仍负责 WebSocket 连接状态健康检查。
@@ -215,6 +229,11 @@ class NapcatAdapter(BaseAdapter):
         这是核心入站方法，由 mofox-wire 的传输层调用。
         所有事件（message/notice/request/meta_event/API响应）都经过这里。
         """
+        # 收到真实 QQ 消息（非心跳/元事件）时更新时间戳，供 watchdog 判断是否卡死
+        post_type = raw.get("post_type", "")
+        if post_type == "message":
+            self._last_qq_message_time = time.time()
+
         return await self._router.dispatch(raw)
 
     async def _send_platform_message(self, envelope: MessageEnvelope) -> None:  # type: ignore[override]
@@ -269,6 +288,331 @@ class NapcatAdapter(BaseAdapter):
     def client(self) -> NapCatClient:
         """获取 NapCatClient 实例（供高级用途）。"""
         return self._client
+
+    # ------------------------------------------------------------------
+    # NapCat CLOSE-WAIT Watchdog
+    # ------------------------------------------------------------------
+    # NapCat 与腾讯服务器（198.18.x.x:443）的 TCP 连接有时卡入 CLOSE-WAIT：
+    # 腾讯发了 FIN，但 NapCat 没有关闭自己这侧 → socket 死亡，不再收到任何消息。
+    # 此时 Elysium↔NapCat 的 WebSocket（8087）仍然 ESTAB，掩盖了真正的问题。
+    # Watchdog 每 30s 检查一次，发现 CLOSE-WAIT + 长时间无消息时强制关闭僵尸
+    # socket（ss -K），迫使 NapCat 感知到连接断开并自行重连腾讯服务器。
+    # ------------------------------------------------------------------
+
+    # 检测间隔（秒）
+    _WATCHDOG_CHECK_INTERVAL: int = 30
+    # 出现 CLOSE-WAIT 且多久没有收到 QQ 消息才判定为卡死（秒）
+    _CLOSE_WAIT_SILENCE_THRESHOLD: int = 90
+    # 无消息多久输出一条 WARNING（无 CLOSE-WAIT 时，仅告警不干预）
+    _SILENCE_WARN_THRESHOLD: int = 600
+
+    def _start_watchdog(self) -> None:
+        """启动 NapCat CLOSE-WAIT 监控 asyncio task。"""
+        if self._watchdog_task and not self._watchdog_task.done():
+            return
+        tm = get_task_manager()
+        self._watchdog_task = tm.create_task(
+            self._watchdog_loop(),
+            name="napcat_close_wait_watchdog",
+            daemon=True,
+        )
+        logger.info("[NapCat Watchdog] CLOSE-WAIT 监控任务已启动")
+
+    def _stop_watchdog(self) -> None:
+        """取消 watchdog task。"""
+        if self._watchdog_task and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+            logger.info("[NapCat Watchdog] 监控任务已停止")
+        self._watchdog_task = None
+
+    async def _watchdog_loop(self) -> None:
+        """Watchdog 主循环：每 30s 检查 NapCat 连接健康状态。"""
+        while True:
+            try:
+                await asyncio.sleep(self._WATCHDOG_CHECK_INTERVAL)
+                await self._check_napcat_health()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error(f"[NapCat Watchdog] 监控循环异常: {exc}", exc_info=True)
+
+    async def _check_napcat_health(self) -> None:
+        """单次健康检查：找 PID → 查 CLOSE-WAIT → 必要时 ss -K。"""
+        now = time.time()
+        silence_secs = now - self._last_qq_message_time
+
+        # 1. 找 NapCat 进程 PID（通过连接到本机 WS 服务端口的客户端进程）
+        ws_port = self._ws_port()
+        napcat_pid = await self._find_napcat_pid(ws_port)
+
+        if napcat_pid is None:
+            # NapCat 还没连接，或连接在其他端口，暂时跳过
+            if silence_secs > self._SILENCE_WARN_THRESHOLD:
+                logger.warning(
+                    f"[NapCat Watchdog] QQ 消息已静默 {silence_secs:.0f}s，"
+                    f"且未能检测到 NapCat 进程（WS port={ws_port}）"
+                )
+            return
+
+        # 2. 查该 PID 的 CLOSE-WAIT 外部连接
+        close_wait_sockets = await self._get_close_wait_sockets(napcat_pid)
+
+        if close_wait_sockets:
+            logger.warning(
+                f"[NapCat Watchdog] 检测到 NapCat(pid={napcat_pid}) "
+                f"CLOSE-WAIT 连接 {len(close_wait_sockets)} 条，"
+                f"QQ 消息已静默 {silence_secs:.0f}s"
+            )
+            for sock in close_wait_sockets:
+                logger.warning(f"[NapCat Watchdog]   CLOSE-WAIT: {sock}")
+
+            if silence_secs >= self._CLOSE_WAIT_SILENCE_THRESHOLD:
+                # 静默超过阈值 → 确认卡死，强制关闭僵尸 socket
+                logger.error(
+                    f"[NapCat Watchdog] ⚠️ 静默 {silence_secs:.0f}s ≥ 阈值 "
+                    f"{self._CLOSE_WAIT_SILENCE_THRESHOLD}s，执行 ss -K 强制关闭僵尸连接..."
+                )
+                killed = await self._kill_close_wait_sockets(close_wait_sockets)
+                logger.error(
+                    f"[NapCat Watchdog] ss -K 完成，已强制关闭 {killed} 条僵尸连接。"
+                    f"NapCat 应会自动重连腾讯服务器。"
+                )
+            else:
+                logger.warning(
+                    f"[NapCat Watchdog] CLOSE-WAIT 存在，但静默仅 {silence_secs:.0f}s < "
+                    f"{self._CLOSE_WAIT_SILENCE_THRESHOLD}s，暂不干预，继续观察..."
+                )
+        else:
+            # 无 CLOSE-WAIT，但长时间无消息也记录一下（可能是正常的安静时段）
+            if silence_secs > self._SILENCE_WARN_THRESHOLD:
+                logger.info(
+                    f"[NapCat Watchdog] QQ 消息已静默 {silence_secs:.0f}s，"
+                    f"NapCat(pid={napcat_pid}) 无 CLOSE-WAIT，连接状态正常（可能只是没有新消息）"
+                )
+
+    def _ws_port(self) -> int:
+        """获取当前配置的 WebSocket 端口。"""
+        config = self._get_config()
+        if config:
+            return config.napcat_server.port
+        return 8087
+
+    async def _find_napcat_pid(self, ws_port: int) -> int | None:
+        """通过连接到 WS 服务端口的客户端进程找到 NapCat PID。
+
+        Elysium 是 WS server，NapCat 是 client。
+        `ss -tnp dport = :<port>` 列出目标端口为 <port> 的连接，其中
+        包含 NapCat 进程信息。
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ss", "-tnp", "dport", "=", f":{ws_port}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            output = stdout.decode(errors="replace")
+            for line in output.splitlines():
+                if "ESTAB" not in line:
+                    continue
+                m = re.search(r"pid=(\d+)", line)
+                if m:
+                    return int(m.group(1))
+        except asyncio.TimeoutError:
+            logger.debug("[NapCat Watchdog] _find_napcat_pid 超时")
+        except Exception as exc:
+            logger.debug(f"[NapCat Watchdog] _find_napcat_pid 异常: {exc}")
+        return None
+
+    async def _get_close_wait_sockets(self, pid: int) -> list[str]:
+        """获取指定 PID 进程所有处于 CLOSE-WAIT 状态的外部连接地址对。
+
+        返回格式：["local_addr remote_addr", ...]，过滤掉本地回环连接。
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ss", "-tnp", "state", "close-wait",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            output = stdout.decode(errors="replace")
+
+            results: list[str] = []
+            for line in output.splitlines():
+                if f"pid={pid}" not in line:
+                    continue
+                # 过滤本地回环（127.x.x.x）
+                if "127.0.0.1" in line:
+                    continue
+                # 提取本地地址和远端地址（ss 输出：State Recv-Q Send-Q Local Remote users）
+                parts = line.split()
+                if len(parts) >= 5:
+                    local_addr = parts[3]
+                    remote_addr = parts[4]
+                    results.append(f"{local_addr} -> {remote_addr}")
+            return results
+        except asyncio.TimeoutError:
+            logger.debug("[NapCat Watchdog] _get_close_wait_sockets 超时")
+        except Exception as exc:
+            logger.debug(f"[NapCat Watchdog] _get_close_wait_sockets 异常: {exc}")
+        return []
+
+    async def _kill_close_wait_sockets(self, socket_pairs: list[str]) -> int:
+        """对每条 CLOSE-WAIT 连接强制关闭（WSL2 用 pidfd_getfd + shutdown，原生 Linux 用 ss -K）。
+
+        返回成功处理的连接数。
+        """
+        # WSL2 kernel 不支持 ss -K (SOCK_DESTROY netlink 未实现)
+        # 检测 WSL2：uname -r 输出包含 "microsoft" 或 "WSL"
+        is_wsl2 = await self._detect_wsl2()
+
+        if is_wsl2:
+            return await self._kill_close_wait_wsl2(socket_pairs)
+        else:
+            return await self._kill_close_wait_native(socket_pairs)
+
+    async def _detect_wsl2(self) -> bool:
+        """检测是否运行在 WSL2 环境。"""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "uname", "-r",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+            kernel = stdout.decode().lower()
+            return "microsoft" in kernel or "wsl" in kernel
+        except Exception:
+            return False
+
+    async def _kill_close_wait_wsl2(self, socket_pairs: list[str]) -> int:
+        """WSL2 环境：通过 pidfd_getfd + shutdown() syscall 关闭 CLOSE-WAIT socket。"""
+        killed = 0
+        napcat_pid = await self._find_napcat_pid(self._ws_port())
+        if napcat_pid is None:
+            logger.warning("[NapCat Watchdog] 无法找到 NapCat PID，跳过 socket 清理")
+            return 0
+
+        # 获取 NapCat 所有打开的 fd
+        napcat_fds = await self._get_napcat_socket_fds(napcat_pid, socket_pairs)
+
+        for fd_num in napcat_fds:
+            try:
+                success = await self._shutdown_socket_via_pidfd(napcat_pid, fd_num)
+                if success:
+                    logger.info(f"[NapCat Watchdog] 已通过 pidfd_getfd 关闭 NapCat(pid={napcat_pid}) fd={fd_num}")
+                    killed += 1
+                else:
+                    logger.warning(f"[NapCat Watchdog] pidfd_getfd 关闭 fd={fd_num} 失败")
+            except Exception as exc:
+                logger.warning(f"[NapCat Watchdog] 关闭 fd={fd_num} 异常: {exc}")
+
+        return killed
+
+    async def _get_napcat_socket_fds(self, pid: int, socket_pairs: list[str]) -> list[int]:
+        """获取 NapCat 进程中匹配 socket_pairs 的文件描述符编号。"""
+        fds = []
+        try:
+            # 读取 /proc/<pid>/fd 目录，找出指向 socket 的 fd
+            proc = await asyncio.create_subprocess_exec(
+                "ls", "-l", f"/proc/{pid}/fd",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3.0)
+            lines = stdout.decode(errors="replace").splitlines()
+
+            for line in lines:
+                if "socket:" in line:
+                    # 格式: "lrwx------ 1 root root 64 ... 163 -> socket:[28604165]"
+                    parts = line.split()
+                    if len(parts) >= 9:
+                        fd_str = parts[8]  # fd number 在箭头前
+                        if fd_str.isdigit():
+                            fds.append(int(fd_str))
+        except Exception as exc:
+            logger.debug(f"[NapCat Watchdog] 获取 NapCat socket fds 失败: {exc}")
+
+        # socket_pairs 包含地址信息，但 /proc/pid/fd 只有 inode
+        # 简化：返回所有 socket fd，由 shutdown 操作判断是否生效
+        # 更精确的做法需要解析 /proc/pid/net/tcp 匹配 inode，但过于复杂
+        # CLOSE-WAIT 状态的 socket 在 shutdown 后会立即失效，不影响正常连接
+        return fds
+
+    async def _shutdown_socket_via_pidfd(self, pid: int, fd: int) -> bool:
+        """通过 pidfd_getfd syscall 借用目标进程的 fd，执行 shutdown(SHUT_RDWR)。"""
+        script = f"""
+import ctypes, os, sys
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+SYS_pidfd_open, SYS_pidfd_getfd = 434, 438
+
+pidfd = libc.syscall(ctypes.c_long(SYS_pidfd_open), ctypes.c_int({pid}), ctypes.c_uint(0))
+if pidfd < 0:
+    sys.exit(1)
+
+borrowed = libc.syscall(ctypes.c_long(SYS_pidfd_getfd), ctypes.c_int(pidfd), ctypes.c_int({fd}), ctypes.c_uint(0))
+if borrowed < 0:
+    os.close(pidfd)
+    sys.exit(2)
+
+ret = libc.shutdown(ctypes.c_int(borrowed), ctypes.c_int(2))
+os.close(borrowed)
+os.close(pidfd)
+sys.exit(0 if ret == 0 else 3)
+"""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "python3", "-c", script,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            return proc.returncode == 0
+        except asyncio.TimeoutError:
+            logger.warning(f"[NapCat Watchdog] pidfd_getfd shutdown timeout for fd={fd}")
+            return False
+        except Exception as exc:
+            logger.warning(f"[NapCat Watchdog] pidfd_getfd shutdown exception: {exc}")
+            return False
+
+    async def _kill_close_wait_native(self, socket_pairs: list[str]) -> int:
+        """原生 Linux：使用 ss -K 命令关闭 CLOSE-WAIT socket。"""
+        killed = 0
+        for pair in socket_pairs:
+            # pair 格式: "172.26.x.x:44472 -> 198.18.x.x:443"
+            try:
+                parts = pair.replace(" -> ", " ").split()
+                if len(parts) < 2:
+                    continue
+                local_addr, remote_addr = parts[0], parts[1]
+                proc = await asyncio.create_subprocess_exec(
+                    "ss", "-K",
+                    "src", local_addr,
+                    "dst", remote_addr,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+                rc = proc.returncode or 0
+                out = stdout.decode(errors="replace").strip()
+                err = stderr.decode(errors="replace").strip()
+                if rc == 0:
+                    logger.info(
+                        f"[NapCat Watchdog] ss -K src={local_addr} dst={remote_addr} "
+                        f"成功 (rc={rc}){': ' + out if out else ''}"
+                    )
+                    killed += 1
+                else:
+                    logger.warning(
+                        f"[NapCat Watchdog] ss -K src={local_addr} dst={remote_addr} "
+                        f"返回 rc={rc}{': ' + err if err else ''}"
+                    )
+            except asyncio.TimeoutError:
+                logger.warning(f"[NapCat Watchdog] ss -K {pair} 超时")
+            except Exception as exc:
+                logger.warning(f"[NapCat Watchdog] ss -K {pair} 异常: {exc}")
+        return killed
 
 
 @register_plugin

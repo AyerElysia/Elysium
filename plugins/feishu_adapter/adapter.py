@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import asyncio
 import json
+import os
 import subprocess
 import tempfile
 import threading
@@ -65,6 +66,10 @@ class FeishuAdapter(BaseAdapter):
         # 用负缓存避免每条消息都去撞一次没权限的接口。
         self._display_name_cache: dict[str, str] = {}
         self._display_name_cached_at: dict[str, float] = {}
+        # Feishu 连接监控
+        self._feishu_stop_event = threading.Event()
+        self._last_feishu_ws_time: float = 0.0      # 最后一次收到 WS 事件的时间
+        self._feishu_watchdog_thread: threading.Thread | None = None
         set_feishu_adapter(self)
         logger.info("FeishuAdapter 初始化完成")
 
@@ -75,14 +80,21 @@ class FeishuAdapter(BaseAdapter):
             return
         if not config.app.app_id or not config.app.app_secret:
             logger.warning("FeishuAdapter 缺少 app_id/app_secret；入站可接收，出站发送会失败")
+        self._feishu_stop_event.clear()
+        self._last_feishu_ws_time = time.time()
         if (
             config.connection.subscription_mode == "long_connection"
             and config.connection.auto_start_long_connection
         ):
+            self._start_feishu_watchdog()
             self._start_long_connection()
         logger.info("FeishuAdapter 已加载，等待飞书事件回调")
 
     async def on_adapter_unloaded(self) -> None:
+        self._feishu_stop_event.set()
+        if self._feishu_watchdog_thread and self._feishu_watchdog_thread.is_alive():
+            self._feishu_watchdog_thread.join(timeout=5)
+            self._feishu_watchdog_thread = None
         await self._stop_long_connection()
         set_feishu_adapter(None)
         self._tenant_access_token = ""
@@ -140,6 +152,85 @@ class FeishuAdapter(BaseAdapter):
             raise ValueError("无法转换飞书消息")
         await self.core_sink.send(envelope)
         return raw_message
+
+    def _start_feishu_watchdog(self) -> None:
+        """启动 Feishu 连接监控线程，专门检测 CLOSE-WAIT 僵尸连接并强制重连。"""
+        if self._feishu_watchdog_thread and self._feishu_watchdog_thread.is_alive():
+            return
+        thread = threading.Thread(
+            target=self._feishu_watchdog_loop,
+            name="feishu_watchdog",
+            daemon=True,
+        )
+        self._feishu_watchdog_thread = thread
+        thread.start()
+        logger.info("[Feishu Watchdog] 飞书连接监控线程已启动")
+
+    def _feishu_watchdog_loop(self) -> None:
+        """监控飞书 WebSocket 连接健康状态。
+
+        每 60 秒检查一次：
+        1. 连接线程死了 → 重启
+        2. 线程活着但 TCP 连接卡在 CLOSE-WAIT → 强制重连
+        """
+        CHECK_INTERVAL = 60       # 每 60 秒检查一次
+        STALE_THRESHOLD = 300     # 5 分钟无任何 WS 活动才触发 CLOSE-WAIT 检测
+
+        while not self._feishu_stop_event.wait(timeout=CHECK_INTERVAL):
+            try:
+                thread = self._long_connection_thread
+                if thread is None:
+                    continue
+
+                # 1. 线程已死 → 重启
+                if not thread.is_alive():
+                    logger.warning("[Feishu Watchdog] 长连接线程已停止，重启中...")
+                    self._start_long_connection()
+                    continue
+
+                # 2. 线程活着但可能是 CLOSE-WAIT 僵尸
+                idle_secs = time.time() - self._last_feishu_ws_time
+                if idle_secs > STALE_THRESHOLD:
+                    if self._detect_feishu_close_wait():
+                        logger.warning(
+                            f"[Feishu Watchdog] 检测到 CLOSE-WAIT 僵尸连接"
+                            f"（已 {idle_secs:.0f}s 无 WS 活动），强制重连..."
+                        )
+                        self._force_restart_long_connection()
+                    else:
+                        logger.debug(
+                            f"[Feishu Watchdog] 已 {idle_secs:.0f}s 无 WS 活动，"
+                            f"未检测到 CLOSE-WAIT，连接状态正常"
+                        )
+
+            except Exception as exc:
+                logger.error(f"[Feishu Watchdog] 监控循环异常: {exc}", exc_info=True)
+
+    def _detect_feishu_close_wait(self) -> bool:
+        """检测本进程是否存在到 Feishu 服务器 443 端口的 CLOSE-WAIT 连接。"""
+        try:
+            pid = str(os.getpid())
+            result = subprocess.run(
+                ["ss", "-tnp", "state", "close-wait"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in result.stdout.splitlines():
+                if f"pid={pid}" in line and ":443" in line:
+                    return True
+        except Exception as exc:
+            logger.debug(f"[Feishu Watchdog] CLOSE-WAIT 检测失败: {exc}")
+        return False
+
+    def _force_restart_long_connection(self) -> None:
+        """强制停止旧连接线程并启动新连接。
+
+        旧线程无法被 join（可能永久阻塞在 client.start()），
+        但它是 daemon 线程，新线程启动后旧线程会被孤立并最终由 OS 回收。
+        """
+        self._long_connection_thread = None
+        self._long_connection_client = None
+        self._last_feishu_ws_time = time.time()  # 重置时间，避免立即再次触发
+        self._start_long_connection()
 
     def _start_long_connection(self) -> None:
         config = self._config()
@@ -199,28 +290,42 @@ class FeishuAdapter(BaseAdapter):
             return
 
         config = self._config()
-        event_handler = self._build_lark_event_handler(lark)
         log_level = getattr(lark.LogLevel, config.connection.long_connection_log_level, lark.LogLevel.INFO)
-        client = lark_ws.Client(
-            app_id=config.app.app_id,
-            app_secret=config.app.app_secret,
-            log_level=log_level,
-            event_handler=event_handler,
-            domain=config.app.api_base_url,
-            auto_reconnect=True,
-            source="neo-mofox-feishu-adapter",
-        )
-        self._long_connection_client = client
-        logger.info("飞书长连接正在连接开放平台")
-        try:
-            client.start()
-        except Exception as exc:
-            logger.error(f"飞书长连接已退出: {exc}", exc_info=True)
+        retry_delay = 5.0
+
+        while not self._feishu_stop_event.is_set():
+            event_handler = self._build_lark_event_handler(lark)
+            client = lark_ws.Client(
+                app_id=config.app.app_id,
+                app_secret=config.app.app_secret,
+                log_level=log_level,
+                event_handler=event_handler,
+                domain=config.app.api_base_url,
+                auto_reconnect=True,
+                source="neo-mofox-feishu-adapter",
+            )
+            self._long_connection_client = client
+            self._last_feishu_ws_time = time.time()
+            logger.info("飞书长连接正在连接开放平台")
+            try:
+                client.start()
+                # client.start() 正常返回说明连接已关闭
+                logger.info("飞书长连接 client.start() 已返回")
+            except Exception as exc:
+                logger.error(f"飞书长连接已退出: {exc}", exc_info=True)
+
+            if self._feishu_stop_event.is_set():
+                break
+
+            logger.info(f"飞书长连接断开，{retry_delay:.0f}s 后重连...")
+            self._feishu_stop_event.wait(timeout=retry_delay)
+            retry_delay = min(retry_delay * 2, 60.0)  # 指数退避，最大 60s
 
     def _build_lark_event_handler(self, lark_module: Any) -> Any:
         config = self._config()
 
         def on_message(event: Any) -> None:
+            self._last_feishu_ws_time = time.time()  # 更新 WS 活动时间戳
             payload = self._lark_event_to_payload(event)
             loop = self._main_loop
             if loop and loop.is_running():

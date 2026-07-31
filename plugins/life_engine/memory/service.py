@@ -523,7 +523,8 @@ class LifeMemoryService:
               AND NOT EXISTS (
                   SELECT 1 FROM memory_index_jobs j
                   WHERE j.node_id = memory_nodes.node_id
-                    AND j.status = 'pending'
+                    AND (j.status = 'pending'
+                         OR j.error = 'EmptyDocument')
               )
             """
         ).fetchall()
