@@ -1,4 +1,4 @@
-"""Message event interception for Werewolf commands."""
+"""Message event interception for Werewolf commands v2.0."""
 
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ class WerewolfCommandEventHandler(BaseEventHandler):
             await self._send_public_reply(message, reply)
         else:
             reply = await service.handle_private_command(message, args)
-            await service._send_private_referee_message(
+            await service._send_private(
                 str(getattr(message, "platform", "") or "qq"),
                 str(getattr(message, "sender_id", "")),
                 reply,
