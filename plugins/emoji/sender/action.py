@@ -28,6 +28,7 @@ class SendEmojiMemeAction(BaseAction):
         "此动作可以单独使用也可以和发送文字一起使用，更符合日常聊天习惯。"
     )
     primary_action: bool = False
+    chatter_allow: list[str] = ["life_chatter"]
 
     async def execute(
         self,
@@ -80,6 +81,7 @@ class RecallEmojiAction(BaseAction):
         "如果这批没有合适的，可以再调一次换一批。"
     )
     primary_action: bool = False
+    chatter_allow: list[str] = ["life_chatter"]
 
     async def execute(
         self,
@@ -121,6 +123,7 @@ class SendEmojiByIdAction(BaseAction):
         "发送你选中的那张表情包。先用 recall_emoji 看到候选及其 meme_id，然后用这个动作发送你挑中的那张。"
     )
     primary_action: bool = False
+    chatter_allow: list[str] = ["life_chatter"]
 
     async def execute(
         self,

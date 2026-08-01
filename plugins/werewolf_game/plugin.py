@@ -5,7 +5,6 @@ from __future__ import annotations
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import BasePlugin, register_plugin
 
-from .actions import WerewolfPlayerAction
 from .config import WerewolfConfig
 from .event_handler import WerewolfCommandEventHandler
 from .service import WerewolfGameService
@@ -39,6 +38,5 @@ class WerewolfGamePlugin(BasePlugin):
         return [
             WerewolfGameService,
             WerewolfCommandEventHandler,
-            WerewolfPlayerAction,
         ]
 

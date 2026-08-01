@@ -31,6 +31,7 @@ class GenerateEmojiMemeAction(BaseAction):
         "caption 会由本地后处理叠到图上，不要要求模型在画面内生成文字。"
     )
     primary_action = False
+    chatter_allow: list[str] = ["life_chatter"]
     chat_type = ChatType.ALL
 
     async def execute(

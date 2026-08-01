@@ -236,64 +236,6 @@ class LifeEngineGrepEventsTool(BaseTool):
             return False, f"搜索事件流失败: {exc}"
 
 
-class LifeChatterGrepEventsTool(BaseTool):
-    """Search life_engine's event ledger from life_chatter."""
-
-    tool_name: str = "grep_life_events"
-    tool_description: str = (
-        "搜索同一主体的事件流，默认只查当前聊天流相关事件。"
-        "适合回忆刚刚 life 心跳想了什么、当前窗口之前发生过什么、或者你刚才是否已经回复过。"
-        "如果确实需要全局事件流，显式设置 cross_stream=true。"
-    )
-    chatter_allow: list[str] = ["life_chatter"]
-
-    async def execute(
-        self,
-        query: Annotated[str, "要搜索的关键词或正则表达式"],
-        use_regex: Annotated[bool, "是否按正则表达式匹配 query"] = False,
-        case_insensitive: Annotated[bool, "匹配时是否忽略大小写"] = True,
-        cross_stream: Annotated[bool, "是否跨所有聊天流搜索；默认 false"] = False,
-        stream_ids: Annotated[list[str] | None, "限定 stream_id；为空时默认当前聊天流"] = None,
-        event_types: Annotated[list[str] | None, "限定事件类型：message/heartbeat/tool_call/tool_result"] = None,
-        fields: Annotated[list[str] | None, "限定搜索字段；为空搜索常用文本字段"] = None,
-        include_pending: Annotated[bool, "是否包含尚未进入历史的 pending 事件"] = True,
-        include_life_internal: Annotated[bool, "是否包含 life 内部事件；默认 true"] = True,
-        limit: Annotated[int, "最大返回命中数"] = 8,
-        context_before: Annotated[int, "每条命中前带几条相邻事件"] = 1,
-        context_after: Annotated[int, "每条命中后带几条相邻事件"] = 1,
-        order: Annotated[Literal["asc", "desc"], "返回顺序：asc/desc"] = "desc",
-    ) -> tuple[bool, dict[str, Any] | str]:
-        resolved_stream_ids = [str(sid or "").strip() for sid in (stream_ids or []) if str(sid or "").strip()]
-        if not cross_stream and not resolved_stream_ids:
-            chat_stream = getattr(self, "chat_stream", None)
-            current_stream_id = str(getattr(chat_stream, "stream_id", "") or "").strip()
-            if current_stream_id:
-                resolved_stream_ids = [current_stream_id]
-
-        try:
-            return True, await grep_life_events(
-                query=query,
-                use_regex=use_regex,
-                case_insensitive=case_insensitive,
-                stream_ids=[] if cross_stream else resolved_stream_ids,
-                event_types=event_types,
-                fields=fields,
-                include_pending=include_pending,
-                include_life_internal=bool(include_life_internal and not cross_stream),
-                limit=limit,
-                context_before=context_before,
-                context_after=context_after,
-                order=order,
-            )
-        except re.error as exc:
-            return False, f"正则表达式错误: {exc}"
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"聊天态搜索 life 事件流失败: {exc}")
-            return False, f"搜索事件流失败: {exc}"
-
-
 EVENT_GREP_TOOLS = [
     LifeEngineGrepEventsTool,
-    # LifeChatterGrepEventsTool 仅在 LifeChatter 启用时由 plugin.py 条件注册，
-    # 不放在此处，避免与 plugin.py get_components() 中的显式注册产生重复。
 ]

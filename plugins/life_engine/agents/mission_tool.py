@@ -443,8 +443,47 @@ class LifeMissionCancelTool(BaseTool):
 # 导出
 # ---------------------------------------------------------------------------
 
+
+class NucleusMissionTool(BaseTool):
+    """统一的使命编排工具（合并原 dispatch/status/cancel 三个工具）。"""
+
+    tool_name: str = "nucleus_mission"
+    tool_description: str = (
+        "使命编排系统：下达重型任务给子代理集团军。\n\n"
+        "action=dispatch：下达新使命（编排系统自动分解为子任务图，并行调度 worker）\n"
+        "action=status：查询使命执行进度\n"
+        "action=cancel：取消正在执行的使命\n\n"
+        "**适用场景：**\n"
+        "- 复杂调研（多源搜索 + 综合分析）\n"
+        "- 代码实现（设计 + 实现 + 验证）\n"
+        "- 任何需要多步骤、多工具协作的重型任务\n\n"
+        "**模式（dispatch）：**\n"
+        "- auto（默认）：LLM 自动分解目标\n"
+        "- manual：直接指定 tasks 列表\n\n"
+        "**同步 vs 后台：**\n"
+        "- sync=true（默认）：阻塞等待结果\n"
+        "- sync=false：后台执行，立即返回 mission_id"
+    )
+    chatter_allow: list[str] = ["life_chatter"]
+
+    async def execute(
+        self,
+        action: Annotated[str, "操作：dispatch/status/cancel"] = "dispatch",
+        **kwargs: object,
+    ) -> tuple[bool, str | dict[str, Any]]:
+        action_value = str(action or "dispatch").strip().lower()
+        if action_value in ("dispatch", "new", "create", "start"):
+            tool = LifeDispatchMissionTool(plugin=self.plugin)
+            return await tool.execute(**kwargs)  # type: ignore[arg-type]
+        elif action_value in ("status", "query", "progress", "check"):
+            tool = LifeMissionStatusTool(plugin=self.plugin)
+            return await tool.execute(**kwargs)  # type: ignore[arg-type]
+        elif action_value in ("cancel", "stop", "abort"):
+            tool = LifeMissionCancelTool(plugin=self.plugin)
+            return await tool.execute(**kwargs)  # type: ignore[arg-type]
+        return False, f"未知操作: {action_value}，可用: dispatch/status/cancel"
+
+
 MISSION_TOOLS: list[type[BaseTool]] = [
-    LifeDispatchMissionTool,
-    LifeMissionStatusTool,
-    LifeMissionCancelTool,
+    NucleusMissionTool,
 ]
