@@ -114,6 +114,8 @@ docs/                  设计文档与思考
 .venv/bin/python -m pytest test/ -q --import-mode=importlib
 ```
 
+首次部署、模型与 Life Engine 配置、飞书接入、验收清单和故障排查见 [部署、配置、测试与使用说明](./docs/operations/deployment_and_usage.md)。
+
 <h2 align="center">📖 想多了解一点</h2>
 
 <div align="center">

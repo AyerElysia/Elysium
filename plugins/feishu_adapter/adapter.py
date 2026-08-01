@@ -6,6 +6,7 @@ import base64
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -66,6 +67,9 @@ class FeishuAdapter(BaseAdapter):
         # 用负缓存避免每条消息都去撞一次没权限的接口。
         self._display_name_cache: dict[str, str] = {}
         self._display_name_cached_at: dict[str, float] = {}
+        # 已收到私聊消息的用户 -> p2p chat_id。对当前会话的回复优先按 chat_id
+        # 发送，避免被飞书按“向用户主动推送”路径限制。
+        self._private_chat_ids: dict[str, str] = {}
         # Feishu 连接监控
         self._feishu_stop_event = threading.Event()
         self._last_feishu_ws_time: float = 0.0      # 最后一次收到 WS 事件的时间
@@ -100,6 +104,7 @@ class FeishuAdapter(BaseAdapter):
         self._tenant_access_token = ""
         self._tenant_access_token_expires_at = 0.0
         self._seen_event_ids.clear()
+        self._private_chat_ids.clear()
         logger.info("FeishuAdapter 已关闭")
 
     async def health_check(self) -> bool:
@@ -452,6 +457,9 @@ class FeishuAdapter(BaseAdapter):
             else:
                 extra["target_user_id"] = open_id
 
+            if chat_type == "private" and open_id and chat_id:
+                self._private_chat_ids[open_id] = chat_id
+
             message_info: dict[str, Any] = {
                 "platform": PLATFORM,
                 "message_id": message_id,
@@ -535,8 +543,16 @@ class FeishuAdapter(BaseAdapter):
             return
 
         if open_id:
-            await self._send_text(receive_id_type="open_id", receive_id=open_id, text=text)
-            logger.info(f"飞书私聊消息发送成功: open_id={open_id} text={text[:80]}")
+            receive_id_type, receive_id = self._private_receive_target(open_id)
+            await self._send_text(
+                receive_id_type=receive_id_type,
+                receive_id=receive_id,
+                text=text,
+            )
+            logger.info(
+                "飞书私聊消息发送成功: "
+                f"{receive_id_type}={receive_id} text={text[:80]}"
+            )
             return
 
         raise ValueError("飞书出站消息缺少 chat_id/open_id，无法确定发送目标")
@@ -1076,6 +1092,13 @@ class FeishuAdapter(BaseAdapter):
             "voice_data": voice_data,
         }
 
+    def _private_receive_target(self, open_id: str) -> tuple[str, str]:
+        """优先返回已建立的私聊会话，缺失时回退到用户 open_id。"""
+        private_chat_id = self._private_chat_ids.get(open_id, "")
+        if private_chat_id:
+            return "chat_id", private_chat_id
+        return "open_id", open_id
+
     async def _send_audio_message(
         self,
         *,
@@ -1096,7 +1119,8 @@ class FeishuAdapter(BaseAdapter):
                 await self._send_text("chat_id", chat_id, fallback_text)
                 return
             if open_id:
-                await self._send_text("open_id", open_id, fallback_text)
+                receive_id_type, receive_id = self._private_receive_target(open_id)
+                await self._send_text(receive_id_type, receive_id, fallback_text)
                 return
             raise ValueError("飞书出站语音缺少 chat_id/open_id，无法确定发送目标") from exc
 
@@ -1116,13 +1140,17 @@ class FeishuAdapter(BaseAdapter):
             return
 
         if open_id:
+            receive_id_type, receive_id = self._private_receive_target(open_id)
             await self._send_audio(
-                receive_id_type="open_id",
-                receive_id=open_id,
+                receive_id_type=receive_id_type,
+                receive_id=receive_id,
                 file_key=file_key,
                 duration_ms=duration_ms,
             )
-            logger.info(f"飞书私聊语音发送成功: open_id={open_id} file_key={file_key}")
+            logger.info(
+                "飞书私聊语音发送成功: "
+                f"{receive_id_type}={receive_id} file_key={file_key}"
+            )
             return
 
         raise ValueError("飞书出站语音缺少 chat_id/open_id，无法确定发送目标")
@@ -1160,8 +1188,9 @@ class FeishuAdapter(BaseAdapter):
         return file_key, duration_ms
 
     async def _reply_audio(self, message_id: str, file_key: str, duration_ms: int) -> dict[str, Any]:
+        normalized_message_id = self._normalize_message_id(message_id)
         return await self._post_json(
-            f"/open-apis/im/v1/messages/{message_id}/reply",
+            f"/open-apis/im/v1/messages/{normalized_message_id}/reply",
             {
                 "msg_type": "audio",
                 "content": json.dumps(
@@ -1195,6 +1224,20 @@ class FeishuAdapter(BaseAdapter):
         if not audio_bytes:
             raise ValueError("音频数据为空")
 
+        ffmpeg = shutil.which("ffmpeg")
+        ffprobe = shutil.which("ffprobe")
+        missing = [
+            name
+            for name, path in (("ffmpeg", ffmpeg), ("ffprobe", ffprobe))
+            if path is None
+        ]
+        if missing:
+            raise RuntimeError(
+                "飞书语音发送需要安装并加入 PATH 的 "
+                + "、".join(missing)
+                + "；当前进程无法找到这些命令。"
+            )
+
         with tempfile.TemporaryDirectory(prefix="feishu_audio_") as tmp_dir:
             tmp_path = Path(tmp_dir)
             input_path = tmp_path / "input_audio"
@@ -1203,7 +1246,7 @@ class FeishuAdapter(BaseAdapter):
 
             subprocess.run(
                 [
-                    "ffmpeg",
+                    ffmpeg,
                     "-y",
                     "-i",
                     str(input_path),
@@ -1220,15 +1263,25 @@ class FeishuAdapter(BaseAdapter):
                 stderr=subprocess.PIPE,
             )
 
-            duration_ms = FeishuAdapter._probe_audio_duration_ms(output_path)
+            duration_ms = FeishuAdapter._probe_audio_duration_ms(
+                output_path,
+                ffprobe=ffprobe,
+            )
             return output_path.read_bytes(), duration_ms
 
     @staticmethod
-    def _probe_audio_duration_ms(path: Path) -> int:
+    def _probe_audio_duration_ms(
+        path: Path,
+        *,
+        ffprobe: str | None = None,
+    ) -> int:
         try:
+            ffprobe_command = ffprobe or shutil.which("ffprobe")
+            if not ffprobe_command:
+                return 1
             result = subprocess.run(
                 [
-                    "ffprobe",
+                    ffprobe_command,
                     "-v",
                     "error",
                     "-show_entries",
@@ -1277,9 +1330,18 @@ class FeishuAdapter(BaseAdapter):
                 pass
         return base64.b64decode(raw, validate=False)
 
+    @staticmethod
+    def _normalize_message_id(message_id: str) -> str:
+        """还原飞书 OpenAPI 接受的原始消息 ID。"""
+        normalized = str(message_id or "").strip()
+        if normalized.startswith("msg_om_"):
+            return normalized.removeprefix("msg_")
+        return normalized
+
     async def _reply_text(self, message_id: str, text: str) -> dict[str, Any]:
+        normalized_message_id = self._normalize_message_id(message_id)
         return await self._post_json(
-            f"/open-apis/im/v1/messages/{message_id}/reply",
+            f"/open-apis/im/v1/messages/{normalized_message_id}/reply",
             {
                 "msg_type": "text",
                 "content": json.dumps({"text": text}, ensure_ascii=False),

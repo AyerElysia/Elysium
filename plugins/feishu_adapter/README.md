@@ -42,16 +42,23 @@ bot_open_id = ""
 
 1. 飞书开放平台创建“企业自建应用”。
 2. 启用机器人能力。
-3. 添加消息相关权限：接收消息事件、发送消息、回复消息。
-4. 在“事件与回调”里把订阅方式设置为“长连接”。
-5. 添加事件：
+3. 在“权限管理”中按当前功能开通应用身份权限：
+   - 私聊收消息：`im:message.p2p_msg:readonly`
+   - 机器人发送/回复消息：`im:message:send_as_bot`
+   - 读取消息及下载收到的图片资源：优先使用 `im:message:readonly`
+   - 如需群聊 @ 消息：另开 `im:message.group_at_msg:readonly`（当前群聊未验收）
+   - 如需从通讯录解析真实昵称：可选 `contact:user.base:readonly`
+4. 图片资源接口若返回 `99991672 Access denied`，飞书错误信息允许 `im:message:readonly`、`im:message.history:readonly`、`im:message` 三者之一；本项目建议最小只读权限 `im:message:readonly`，不要为排障直接授予更宽的 `im:message`。
+5. 在“事件与回调”里把订阅方式设置为“长连接”。
+6. 添加事件：
 
 ```text
 im.message.receive_v1
 ```
 
-6. 发布应用，并把机器人添加到飞书群或私聊。
-7. 启动 Neo-MoFox。看到 `飞书长连接后台线程已启动` / SDK 连接日志后，就可以收消息。
+7. 权限或事件变更后创建新版本，提交管理员审批并发布；只保存权限配置但不发布，运行中的应用不会获得新权限。
+8. 确认应用可用范围包含测试用户，并把机器人添加到飞书私聊或目标群。
+9. 启动 Elysium。看到 `飞书长连接后台线程已启动` / SDK 连接日志后，再验收文本与图片。
 
 长连接模式不需要公网域名，不需要回调地址，也不需要 frp/cloudflared/ngrok。
 

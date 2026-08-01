@@ -326,6 +326,15 @@ async def test_feishu_outgoing_reply_text(monkeypatch: pytest.MonkeyPatch) -> No
     assert calls[0][0] == "/open-apis/im/v1/messages/om_1/reply"
 
 
+def test_feishu_audio_conversion_reports_missing_ffmpeg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("plugins.feishu_adapter.adapter.shutil.which", lambda _name: None)
+
+    with pytest.raises(RuntimeError, match="ffmpeg.*ffprobe"):
+        FeishuAdapter._convert_audio_to_opus(b"RIFF-demo")
+
+
 async def test_feishu_outgoing_voice_sends_audio_message(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter = make_adapter()
     calls = []
