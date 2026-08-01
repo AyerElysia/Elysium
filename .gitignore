@@ -125,6 +125,10 @@ plugins/neko_surface/**/*.py[cod]
 plugins/werewolf_game/**/__pycache__/
 plugins/werewolf_game/**/*.py[cod]
 !plugins/napcat_adapter/
+!plugins/kook_adapter/
+!plugins/kook_adapter/**
+plugins/kook_adapter/**/__pycache__/
+plugins/kook_adapter/**/*.py[cod]
 !plugins/life_engine/
 !plugins/feishu_adapter/
 !plugins/feishu_adapter/**
