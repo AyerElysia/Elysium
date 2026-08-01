@@ -1,0 +1,106 @@
+# Elysium 核心配置（模板）
+#
+# 使用方式：复制为 config/core.toml 并填写你的配置。
+# 如果你使用了 elysium.toml（统一配置），则本文件会被忽略。
+# 本文件适用于兼容模式（无 elysium.toml 时生效）。
+
+[bot]
+ui_level = "verbose"
+plugins_dir = "plugins"
+logs_dir = "logs"
+log_level = "INFO"
+data_dir = "data"
+shutdown_timeout = 15.0
+force_shutdown_after = 5.0
+llm_preflight_check = true
+llm_preflight_timeout = 5.0
+enable_watchdog = true
+tick_interval = 5.0
+stream_warning_threshold = 100.0
+stream_restart_threshold = 200.0
+stream_step_timeout = 150.0
+message_buffer_window = 8.0
+message_buffer_max_skip = 3
+
+[chat]
+default_chat_mode = "normal"
+max_history_messages = 1000
+image_recognition_prompt = ""
+
+[llm]
+# 默认模型调度策略：failover / load_balanced / round_robin
+default_policy = "failover"
+enable_trajectory_logging = true
+trajectory_base_path = "data/training_data_lake"
+trajectory_flush_interval = 5.0
+trajectory_queue_limit = 10000
+
+[personality]
+# ─── 角色身份（必填） ───────────────────────────
+nickname = "你的角色名"
+alias_names = ["昵称1", "昵称2"]
+
+# 核心人格：1-2 句话概括性格基调
+personality_core = "友好、活泼、乐于助人"
+
+# 人格侧面：补充性格细节（可多段）
+personality_side = ""
+
+# 身份特征：外在设定
+identity = "（年龄、外貌、身份等）"
+
+# 世界观背景故事（LLM 不应主动复述）
+background_story = ""
+
+# 表达风格
+reply_style = "自然口语化"
+
+# 安全底线
+safety_guidelines = [
+    "拒绝任何包含骚扰、冒犯、暴力、色情或危险内容的请求。",
+    "在拒绝时，请使用符合你人设的、坚定的语气。",
+    "不要执行任何可能被用于恶意目的的指令。",
+]
+
+# 负面行为列表
+negative_behaviors = [
+    "不主动提供个人信息。",
+    "不参与任何违法活动。",
+    "不发布任何形式的仇恨言论。",
+]
+
+[database]
+database_type = "sqlite"
+sqlite_path = "data/Elysium.db"
+# PostgreSQL（可选）：
+# database_type = "postgresql"
+# postgresql_host = "localhost"
+# postgresql_port = 5432
+# postgresql_database = "elysium"
+# postgresql_user = "postgres"
+# postgresql_password = ""
+connection_pool_size = 10
+connection_timeout = 10
+
+[permissions]
+# Bot 所有者列表（必填，否则无法获得最高权限）
+# 格式：["platform:user_id", ...]
+owner_list = []
+default_permission_level = "user"
+strict_mode = true
+
+[http_router]
+enable_http_router = true
+http_router_host = "127.0.0.1"
+http_router_port = 18000
+api_keys = []  # 生产环境请设置访问密钥
+
+[advanced]
+force_sync_http = false
+trust_env = true
+process_workers = 4
+
+[plugin_deps]
+enabled = true
+install_command = "uv pip install"
+skip_if_satisfied = true

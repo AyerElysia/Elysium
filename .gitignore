@@ -65,6 +65,8 @@ notion/
 plan/
 report/
 Report/
+!docs/report/
+!docs/report/**
 
 # Jupyter
 .ipynb_checkpoints
@@ -103,7 +105,8 @@ data/*
 data/life_engine_workspace/*
 !data/life_engine_workspace/skills/
 .claude/
-/config/
+/config/*
+!/config/*.example
 
 plugins/*
 
