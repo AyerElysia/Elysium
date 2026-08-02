@@ -1473,6 +1473,16 @@ class LifeEngineConfig(BaseConfig):
             description="Optional caller-owned lifetime for one game intention.",
         )
 
+        @field_validator("intent_timeout_seconds", mode="before")
+        @classmethod
+        def normalize_disabled_intent_timeout(cls, value: object) -> object:
+            """Treat TOML's generated zero sentinel as an unset timeout."""
+
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if float(value) == 0.0:
+                    return None
+            return value
+
     settings: SettingsSection = Field(default_factory=SettingsSection)
     model: ModelSection = Field(default_factory=ModelSection)
     memory_index: MemoryIndexSection = Field(default_factory=MemoryIndexSection)
