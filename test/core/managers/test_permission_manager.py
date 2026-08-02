@@ -11,12 +11,12 @@
 
 from __future__ import annotations
 
-import pytest
+from types import SimpleNamespace
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.core.managers.permission_manager import (
     PermissionManager,
-    PermissionCheckResult,
     get_permission_manager,
 )
 from src.core.components.types import PermissionLevel
@@ -27,12 +27,22 @@ from src.core.components.base.command import BaseCommand
 # 测试用 Command 类
 class TestCommand(BaseCommand):
     """测试命令类。"""
-    
+
+    __test__ = False
     signature = "test_plugin:command:test"
     name = "test"
     description = "Test command"
     help_text = "Test command help"
     required_permission = PermissionLevel.USER
+
+
+def _install_test_config(manager: PermissionManager, *, owners: list[str] | None = None) -> None:
+    manager._config = SimpleNamespace(
+        permissions=SimpleNamespace(
+            owner_list=list(owners or []),
+            default_permission_level="user",
+        )
+    )
 
 
 class TestPermissionManagerInit:
@@ -92,6 +102,7 @@ class TestPermissionManagerUserPermissionLevel:
     async def test_get_user_permission_level_exists(self) -> None:
         """测试获取已存在用户的权限等级。"""
         manager = PermissionManager()
+        _install_test_config(manager)
         
         mock_group = PermissionGroups(
             person_id="test_person_id",
@@ -109,6 +120,7 @@ class TestPermissionManagerUserPermissionLevel:
     async def test_get_user_permission_level_not_exists(self) -> None:
         """测试获取不存在用户的权限等级返回 USER。"""
         manager = PermissionManager()
+        _install_test_config(manager)
         
         with patch.object(manager._group_crud, 'get_by', new_callable=AsyncMock) as mock_get:
             mock_get.return_value = None
@@ -120,12 +132,9 @@ class TestPermissionManagerUserPermissionLevel:
     async def test_get_user_permission_level_master_user(self) -> None:
         """测试 Master 用户返回 OWNER 权限。"""
         manager = PermissionManager()
-        
-        with patch.object(manager, '_load_config') as mock_config:
-            mock_config_obj = MagicMock()
-            mock_config_obj.permission.master_users = ["master_id_123"]
-            mock_config.return_value = mock_config_obj
-            
+        _install_test_config(manager, owners=["qq:master_id_123"])
+
+        with patch.object(manager, 'generate_person_id', return_value="master_id_123"):
             level = await manager.get_user_permission_level("master_id_123")
             
             assert level == PermissionLevel.OWNER
@@ -149,13 +158,13 @@ class TestPermissionManagerSetUserPermissionGroup:
             
             await manager.set_user_permission_group(
                 person_id="new_user",
-                permission_level=PermissionLevel.OPERATOR
+                level=PermissionLevel.OPERATOR
             )
             
             mock_create.assert_called_once()
-            call_kwargs = mock_create.call_args[1]
-            assert call_kwargs['person_id'] == "new_user"
-            assert call_kwargs['level'] == "operator"
+            payload = mock_create.call_args.args[0]
+            assert payload['person_id'] == "new_user"
+            assert payload['permission_level'] == "operator"
     
     async def test_set_user_permission_group_existing_user(self) -> None:
         """测试为已存在用户更新权限组。"""
@@ -174,10 +183,11 @@ class TestPermissionManagerSetUserPermissionGroup:
             
             await manager.set_user_permission_group(
                 person_id="existing_user",
-                permission_level=PermissionLevel.OPERATOR
+                level=PermissionLevel.OPERATOR
             )
-            
-            mock_update.assert_called_once_with(1, permission_level="operator")
+
+            assert mock_update.call_args.args[0] == 1
+            assert mock_update.call_args.args[1]["permission_level"] == "operator"
 
 
 class TestPermissionManagerRemoveUserPermissionGroup:
@@ -223,7 +233,7 @@ class TestPermissionManagerCheckCommandPermission:
         """测试通过权限组允许的命令。"""
         manager = PermissionManager()
         
-        TestCommand.required_permission = PermissionLevel.USER
+        TestCommand.permission_level = PermissionLevel.USER
         
         with patch.object(manager, 'get_user_permission_level', new_callable=AsyncMock) as mock_get_level, \
              patch.object(manager._command_crud, 'get_by', new_callable=AsyncMock) as mock_get_perm:
@@ -238,13 +248,13 @@ class TestPermissionManagerCheckCommandPermission:
             )
             
             assert has_perm is True
-            assert reason == PermissionCheckResult.ALLOWED
+            assert reason == "权限充足"
     
     async def test_check_command_permission_denied_by_group(self) -> None:
         """测试通过权限组拒绝的命令。"""
         manager = PermissionManager()
         
-        TestCommand.required_permission = PermissionLevel.OPERATOR
+        TestCommand.permission_level = PermissionLevel.OPERATOR
         
         with patch.object(manager, 'get_user_permission_level', new_callable=AsyncMock) as mock_get_level, \
              patch.object(manager._command_crud, 'get_by', new_callable=AsyncMock) as mock_get_perm:
@@ -259,13 +269,13 @@ class TestPermissionManagerCheckCommandPermission:
             )
             
             assert has_perm is False
-            assert reason == PermissionCheckResult.DENIED_BY_GROUP
+            assert "需要 operator 权限" in reason
     
     async def test_check_command_permission_override_allow(self) -> None:
         """测试命令覆盖权限允许。"""
         manager = PermissionManager()
         
-        TestCommand.required_permission = PermissionLevel.OPERATOR
+        TestCommand.permission_level = PermissionLevel.OPERATOR
         
         override_perm = CommandPermissions(
             person_id="test_user",
@@ -286,7 +296,7 @@ class TestPermissionManagerCheckCommandPermission:
             )
             
             assert has_perm is True
-            assert reason == PermissionCheckResult.ALLOWED
+            assert reason == "权限覆盖授权"
 
 
 class TestPermissionManagerGrantCommandPermission:
@@ -336,7 +346,8 @@ class TestPermissionManagerGrantCommandPermission:
                 granted=True
             )
             
-            mock_update.assert_called_once_with(1, granted=True)
+            assert mock_update.call_args.args[0] == 1
+            assert mock_update.call_args.args[1]["granted"] is True
 
 
 class TestPermissionManagerEdgeCases:
@@ -345,6 +356,7 @@ class TestPermissionManagerEdgeCases:
     async def test_empty_person_id(self) -> None:
         """测试空 person_id。"""
         manager = PermissionManager()
+        _install_test_config(manager)
         
         with patch.object(manager._group_crud, 'get_by', new_callable=AsyncMock) as mock_get:
             mock_get.return_value = None
@@ -356,6 +368,7 @@ class TestPermissionManagerEdgeCases:
     async def test_invalid_permission_level_string(self) -> None:
         """测试无效的权限等级字符串。"""
         manager = PermissionManager()
+        _install_test_config(manager)
         
         mock_group = PermissionGroups(
             person_id="test_user",

@@ -9,7 +9,7 @@ from typing import Self
 from src.kernel.logger import get_logger
 
 from .exceptions import LLMAPIError, LLMConfigurationError, LLMRateLimitError, LLMTimeoutError, classify_exception
-from .model_client import ModelClientRegistry
+from .model_client import ModelClientRegistry, get_default_model_client_registry
 from .monitor import RequestMetrics, RequestTimer, get_global_collector
 from .policy import create_default_policy
 from .policy.base import Policy
@@ -36,7 +36,7 @@ class EmbeddingRequest:
         if self.policy is None:
             self.policy = create_default_policy()
         if self.clients is None:
-            self.clients = ModelClientRegistry()
+            self.clients = get_default_model_client_registry()
 
     def add_input(self, value: str) -> Self:
         """追加 embedding 输入文本。"""

@@ -3,6 +3,7 @@
 定义 core 层所需的配置项，使用 kernel/config 的配置系统。
 """
 
+from pathlib import Path
 from typing import Literal
 
 from pydantic import model_validator
@@ -180,7 +181,17 @@ class CoreConfig(ConfigBase):
         )
         trajectory_queue_limit: int = Field(
             default=10000,
-            description="trajectory 内存队列告警阈值",
+            description="trajectory 内存队列硬上限，磁盘故障时保护主进程内存",
+        )
+        trajectory_raw_retention_days: int = Field(
+            default=3,
+            ge=1,
+            description="trajectory 原始 JSONL 保留天数，之后压缩归档",
+        )
+        trajectory_archive_retention_days: int = Field(
+            default=0,
+            ge=0,
+            description="trajectory 压缩归档保留天数；0 表示永久保留",
         )
 
     llm: LLMSection = Field(default_factory=LLMSection)

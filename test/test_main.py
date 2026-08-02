@@ -6,6 +6,7 @@ import pytest
 
 from main import load_ui_level_from_config
 from src.app.runtime import UILevel
+from src.app.runtime.single_instance import AlreadyRunningError, SingleInstanceLock
 
 
 def test_load_ui_level_defaults_when_config_missing(tmp_path) -> None:
@@ -39,3 +40,20 @@ def test_load_ui_level_rejects_invalid_toml(tmp_path) -> None:
 
     with pytest.raises(tomllib.TOMLDecodeError):
         load_ui_level_from_config(str(config_path))
+
+
+def test_single_instance_lock_rejects_second_owner_and_recovers(tmp_path) -> None:
+    """Only one process may hold the runtime lock at a time."""
+    lock_path = tmp_path / "runtime" / "elysium.lock"
+    first = SingleInstanceLock(lock_path)
+    second = SingleInstanceLock(lock_path)
+
+    first.acquire()
+    try:
+        with pytest.raises(AlreadyRunningError, match="Elysium 已在运行"):
+            second.acquire()
+    finally:
+        first.release()
+
+    second.acquire()
+    second.release()

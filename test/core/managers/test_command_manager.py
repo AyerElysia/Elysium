@@ -13,7 +13,6 @@
 
 from __future__ import annotations
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.core.managers.command_manager import CommandManager
@@ -25,7 +24,8 @@ from src.core.models.message import Message
 # 测试用 Command 类
 class TestCommand(BaseCommand):
     """测试命令类。"""
-    
+
+    __test__ = False
     signature = "test_plugin:command:test"
     name = "test"
     description = "Test command"
@@ -237,7 +237,7 @@ class TestCommandManagerMatchCommand:
             
             command_path, command_cls, args = manager.match_command("/unknown")
             
-            assert command_path == ""
+            assert command_path == "unknown"
             assert command_cls is None
             assert args == []
     
@@ -269,62 +269,60 @@ class TestCommandManagerExecuteCommand:
         """测试成功执行命令。"""
         manager = CommandManager()
         
-        mock_message = MagicMock(spec=Message)
+        mock_message = MagicMock()
         mock_message.processed_plain_text = "/test hello"
+        mock_message.content = "/test hello"
+        mock_message.platform = "qq"
+        mock_message.sender_id = "user-1"
+        mock_message.stream_id = "stream-1"
+        mock_message.message_id = "message-1"
         
         with patch.object(manager, 'match_command') as mock_match, \
-             patch.object(manager, 'get_command_class') as mock_get_class, \
-             patch('src.core.managers.command_manager.get_permission_manager') as mock_get_perm:
-            
-            mock_match.return_value = {
-                "signature": "test_plugin:command:test",
-                "args": "hello"
-            }
+             patch('src.core.managers.command_manager.get_permission_manager') as mock_get_perm, \
+             patch('src.core.managers.command_manager.get_plugin_manager') as mock_get_plugin:
             
             mock_cmd_class = MagicMock()
+            mock_cmd_class._signature_ = "test_plugin:command:test"
             mock_cmd_instance = MagicMock()
-            mock_cmd_instance.execute = AsyncMock(return_value="Success")
+            mock_cmd_instance.execute = AsyncMock(return_value=(True, "Success"))
             mock_cmd_class.return_value = mock_cmd_instance
-            mock_cmd_class.required_permission = PermissionLevel.USER
-            mock_get_class.return_value = mock_cmd_class
+            mock_match.return_value = ("test", mock_cmd_class, ["hello"])
             
             mock_perm_manager = MagicMock()
+            mock_perm_manager.generate_person_id.return_value = "person-id"
             mock_perm_manager.check_command_permission = AsyncMock(return_value=(True, None))
             mock_get_perm.return_value = mock_perm_manager
+            mock_get_plugin.return_value.get_plugin.return_value = MagicMock()
             
             result = await manager.execute_command(mock_message, "/test hello")
             
-            assert result == "Success"
+            assert result == (True, "Success")
     
     async def test_execute_command_permission_denied(self) -> None:
         """测试权限拒绝的命令执行。"""
         manager = CommandManager()
         
-        mock_message = MagicMock(spec=Message)
+        mock_message = MagicMock()
         mock_message.processed_plain_text = "/admin"
+        mock_message.content = "/admin"
+        mock_message.platform = "qq"
+        mock_message.sender_id = "user-1"
         
         with patch.object(manager, 'match_command') as mock_match, \
-             patch.object(manager, 'get_command_class') as mock_get_class, \
              patch('src.core.managers.command_manager.get_permission_manager') as mock_get_perm:
             
-            mock_match.return_value = {
-                "signature": "test_plugin:command:admin",
-                "args": ""
-            }
-            
             mock_cmd_class = MagicMock()
-            mock_cmd_class.required_permission = PermissionLevel.OWNER
-            mock_get_class.return_value = mock_cmd_class
+            mock_cmd_class._signature_ = "test_plugin:command:admin"
+            mock_match.return_value = ("admin", mock_cmd_class, [])
             
             mock_perm_manager = MagicMock()
+            mock_perm_manager.generate_person_id.return_value = "person-id"
             mock_perm_manager.check_command_permission = AsyncMock(return_value=(False, "denied"))
             mock_get_perm.return_value = mock_perm_manager
             
             result = await manager.execute_command(mock_message, "/admin")
             
-            # 应该返回权限拒绝消息或 None
-            # 应该返回权限拒绝消息或 None
-            assert result is None or (isinstance(result, str) and ("权限" in result or "permission" in result.lower()))
+            assert result == (False, "权限不足：denied")
 
 
 class TestCommandManagerGetCommandHelp:
@@ -334,14 +332,18 @@ class TestCommandManagerGetCommandHelp:
         """测试获取已存在命令的帮助信息。"""
         manager = CommandManager()
         
-        with patch.object(manager, 'get_command_class') as mock_get_class:
+        with patch.object(manager, 'get_command_class') as mock_get_class, \
+             patch('src.core.managers.command_manager.get_plugin_manager') as mock_get_plugin:
             mock_cmd_class = MagicMock()
-            mock_cmd_class.help_text = "Test command help text"
+            mock_cmd_class.command_name = "test"
+            mock_cmd_class.command_description = "Test command help text"
+            mock_cmd_class.return_value._root.children = {}
             mock_get_class.return_value = mock_cmd_class
+            mock_get_plugin.return_value.get_plugin.return_value = MagicMock()
             
             result = manager.get_command_help("test_plugin:command:test")
             
-            assert result == "Test command help text"
+            assert result == "命令: /test\n描述: Test command help text"
     
     def test_get_command_help_not_exists(self) -> None:
         """测试获取不存在命令的帮助信息。"""
@@ -352,7 +354,7 @@ class TestCommandManagerGetCommandHelp:
             
             result = manager.get_command_help("non_existent_command")
             
-            assert result == "" or "not found" in result.lower()
+            assert result == "命令未找到: non_existent_command"
 
 
 class TestCommandManagerEdgeCases:

@@ -6,6 +6,7 @@ Media API 模块。
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.api._utils import _validate_non_empty
@@ -89,17 +90,30 @@ async def recognize_batch(
         _validate_non_empty(item[0], "base64_data")
         _validate_media_type(item[1])
 
-    # 兼容 video：MediaManager.recognize_batch 仅面向 image/emoji，
-    # 因此这里统一逐条走 recognize_media 路由。
-    results: list[tuple[int, str | None]] = []
-    for idx, (base64_data, media_type) in enumerate(media_list):
-        description = await recognize_media(
-            base64_data=base64_data,
-            media_type=media_type,
-            use_cache=use_cache,
+    # recognize_media 负责按类型路由；信号量避免大批量输入耗尽连接池或线程池。
+    concurrency = asyncio.Semaphore(min(8, len(media_list)))
+
+    async def _recognize_one(
+        idx: int,
+        base64_data: str,
+        media_type: str,
+    ) -> tuple[int, str | None]:
+        async with concurrency:
+            description = await recognize_media(
+                base64_data=base64_data,
+                media_type=media_type,
+                use_cache=use_cache,
+            )
+            return idx, description
+
+    return list(
+        await asyncio.gather(
+            *(
+                _recognize_one(idx, base64_data, media_type)
+                for idx, (base64_data, media_type) in enumerate(media_list)
+            )
         )
-        results.append((idx, description))
-    return results
+    )
 
 
 async def save_media_info(

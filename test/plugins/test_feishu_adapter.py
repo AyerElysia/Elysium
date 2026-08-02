@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -76,6 +78,58 @@ async def test_feishu_long_connection_uses_dedicated_sdk_event_loop(monkeypatch)
     assert observed_loops
     assert observed_loops[0] is not main_loop
     assert observed_loops[0].is_closed()
+
+
+async def test_feishu_http_client_is_reused_and_closed() -> None:
+    """飞书 API 请求应复用连接池，并在适配器卸载时关闭。"""
+    adapter = make_adapter()
+
+    first = await adapter._get_http_client()
+    second = await adapter._get_http_client()
+
+    assert first is second
+    await adapter.on_adapter_unloaded()
+    assert first.is_closed
+    assert adapter._http_client is None
+
+
+async def test_feishu_token_refresh_is_single_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """并发发送时只允许一次 tenant token 刷新请求。"""
+    adapter = make_adapter(_credentialed_config())
+    request = AsyncMock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "tenant_access_token": "token",
+                "expire": 7200,
+            },
+        )
+    )
+    monkeypatch.setattr(adapter, "_request_with_retry", request)
+
+    tokens = await asyncio.gather(
+        *(adapter._get_tenant_access_token() for _ in range(10))
+    )
+
+    assert tokens == ["token"] * 10
+    request.assert_awaited_once()
+
+
+def test_feishu_watchdog_refuses_duplicate_client_for_stuck_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """旧 SDK 线程未退出时不能再启动第二个共享事件循环客户端。"""
+    adapter = make_adapter()
+    adapter._long_connection_thread = MagicMock(is_alive=lambda: True)
+    start = MagicMock()
+    monkeypatch.setattr(adapter, "_start_long_connection", start)
+
+    adapter._force_restart_long_connection()
+
+    start.assert_not_called()
 
 
 async def test_feishu_text_event_to_envelope() -> None:

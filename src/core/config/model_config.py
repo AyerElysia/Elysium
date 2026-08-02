@@ -34,7 +34,7 @@ from typing import Any, ClassVar, Literal, cast
 from pydantic import ConfigDict
 from src.kernel.config import ConfigBase, SectionBase, config_section, Field
 from src.kernel.llm.media_capabilities import normalize_media_capabilities
-from src.kernel.llm.types import ModelSet
+from src.kernel.llm.types import ModelSet, redact_secret
 
 # ==============================================================================
 # API Provider Configuration
@@ -527,15 +527,17 @@ class ModelConfig(ConfigBase):
             request = LLMRequest(model_set=model_set, request_name="chat")
             ```
         """
-        # ─── 优先走新格式 models.toml ───
-        try:
-            from src.kernel.config.models_loader import get_models_config
+        # 只有全局配置实例才允许由统一 models.toml 覆盖。独立实例（测试、
+        # 临时配置、插件沙箱）必须保持自包含，不能读取进程全局配置。
+        if self is _global_model_config:
+            try:
+                from src.kernel.config.models_loader import get_models_config
 
-            mc = get_models_config()
-            if mc.tasks:
-                return mc.get_task(task_name)  # type: ignore[return-value]
-        except Exception:
-            pass
+                mc = get_models_config()
+                if mc.tasks:
+                    return mc.get_task(task_name)  # type: ignore[return-value]
+            except Exception:
+                pass
 
         # ─── 回退：旧格式 model.toml ───
         # 获取任务配置
@@ -585,7 +587,7 @@ class ModelConfig(ConfigBase):
                 "api_provider": provider.name,
                 "base_url": provider.base_url,
                 "model_identifier": model_info.model_identifier,
-                "api_key": provider.get_api_key(),  # 支持密钥轮询
+                "api_key": redact_secret(provider.get_api_key()),  # 支持密钥轮询
                 "client_type": provider.client_type,
                 "max_retry": provider.max_retry,
                 "timeout": float(provider.timeout),
@@ -668,7 +670,7 @@ class ModelConfig(ConfigBase):
             "api_provider": provider.name,
             "base_url": provider.base_url,
             "model_identifier": model_info.model_identifier,
-            "api_key": provider.get_api_key(),
+            "api_key": redact_secret(provider.get_api_key()),
             "client_type": provider.client_type,
             "max_retry": provider.max_retry,
             "timeout": float(provider.timeout),

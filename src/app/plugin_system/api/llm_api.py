@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from src.app.plugin_system.types import TaskType
 from src.kernel.llm import (
     EmbeddingRequest,
     LLMContextManager,
@@ -33,6 +34,7 @@ __all__ = [
     "create_tool_registry",
     "exec_llm_usable",
     "run_tool_call",
+    "TaskType",
 ]
 
 if TYPE_CHECKING:

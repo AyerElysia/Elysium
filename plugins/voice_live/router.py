@@ -1,199 +1,272 @@
-"""Voice Live 路由。
-
-提供 FastAPI WebSocket 端点和静态页面服务，
-实现浏览器端全双工语音通话的通信协议。
-"""
+"""Secure same-origin browser and OBS gateway for Voice Live."""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
+import secrets
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
-from fastapi import WebSocket, WebSocketDisconnect
+from fastapi import HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from src.core.components.base.router import BaseRouter
 from src.kernel.logger import get_logger
 
-from .session import CallSession, SessionState
+from .auth import TicketAuthority
+from .protocol import SessionState
+from .session import CallSession
 
-logger = get_logger("voice_live.router", display="Voice Live Router")
-
-# 静态文件目录
+logger = get_logger("voice_live.router", display="Voice Live")
 STATIC_DIR = Path(__file__).parent / "static"
 
 
 class VoiceLiveRouter(BaseRouter):
-    """Voice Live 路由组件。
-
-    端点：
-    - GET /          -> 语音通话 Web 页面
-    - WS /ws         -> 主 WebSocket 端点
-    - GET /health    -> 健康检查
-    """
+    """Issue single-use tickets and own calls plus read-only OBS observers."""
 
     router_name = "voice_live"
-    router_description = "全双工实时语音通话"
+    router_description = "商业级全双工实时语音通话"
     custom_route_path = "/voice-live"
-    cors_origins = ["*"]
+    cors_origins: list[str] | None = None
 
     def __init__(self, plugin: Any) -> None:
-        # 活跃会话映射
         self._sessions: dict[str, CallSession] = {}
+        self._sessions_lock = asyncio.Lock()
+        self._observers: set[WebSocket] = set()
+        config = plugin.config
+        self.custom_route_path = config.server.route_path
+        environment_name = str(config.server.ticket_secret_env or "").strip()
+        configured_secret = os.environ.get(environment_name, "") if environment_name else ""
+        ticket_secret = (
+            configured_secret.encode("utf-8") if configured_secret else secrets.token_bytes(32)
+        )
+        self._ticket_authority = TicketAuthority(
+            ticket_secret, config.server.ticket_ttl_seconds
+        )
         super().__init__(plugin)
 
-    def register_endpoints(self) -> None:
-        """注册路由端点。"""
+    @property
+    def active_session_count(self) -> int:
+        return sum(1 for session in self._sessions.values() if session.is_active)
 
+    def session_snapshots(self) -> list[dict[str, Any]]:
+        return [session.snapshot() for session in self._sessions.values()]
+
+    def register_endpoints(self) -> None:
         @self.app.get("/", response_class=HTMLResponse)
-        async def index():
-            """提供语音通话 Web 页面。"""
-            html_file = STATIC_DIR / "voice_live.html"
-            if html_file.exists():
-                return HTMLResponse(content=html_file.read_text(encoding="utf-8"))
-            return HTMLResponse(content="<h1>Voice Live</h1><p>页面未找到</p>", status_code=404)
+        async def index() -> HTMLResponse:
+            return self._static_html("voice_live.html")
+
+        @self.app.get("/overlay", response_class=HTMLResponse)
+        async def overlay() -> HTMLResponse:
+            return self._static_html("overlay.html")
+
+        @self.app.post("/ticket")
+        async def ticket(request: Request) -> JSONResponse:
+            origin = request.headers.get("origin", "")
+            if not self._origin_allowed(origin, request.headers.get("host", "")):
+                raise HTTPException(status_code=403, detail="Origin 不在 Voice Live 白名单")
+            return JSONResponse(
+                {
+                    "ticket": self._issue_ticket(),
+                    "expires_in": self.plugin.config.server.ticket_ttl_seconds,
+                },
+                headers={"Cache-Control": "no-store"},
+            )
 
         @self.app.get("/health")
-        async def health():
-            """健康检查。"""
-            config = self.plugin.config
-            fd_config = config.full_duplex
-            deg_config = config.degraded
-
-            return JSONResponse(content={
-                "status": "ok",
-                "full_duplex_provider": fd_config.provider_type,
-                "full_duplex_configured": bool(fd_config.upstream_url),
-                "degraded_enabled": deg_config.enabled,
-                "active_sessions": len(self._sessions),
-            })
+        async def health() -> JSONResponse:
+            provider = self.plugin.config.full_duplex
+            return JSONResponse(
+                {
+                    "status": "ok",
+                    "protocol": 1,
+                    "provider": provider.provider_type,
+                    "model": provider.model_name,
+                    "configured": provider.provider_type != "disabled" and bool(provider.upstream_url),
+                    "active_sessions": self.active_session_count,
+                    "sessions": self.session_snapshots(),
+                    "observers": len(self._observers),
+                }
+            )
 
         @self.app.websocket("/ws")
-        async def websocket_endpoint(ws: WebSocket):
-            """主 WebSocket 端点。"""
-            await self._handle_websocket(ws)
+        async def websocket_endpoint(websocket: WebSocket) -> None:
+            await self._handle_websocket(websocket)
 
-    # ------------------------------------------------------------------
-    # WebSocket 处理
-    # ------------------------------------------------------------------
+        @self.app.websocket("/observe")
+        async def observer_endpoint(websocket: WebSocket) -> None:
+            await self._handle_observer(websocket)
 
-    async def _handle_websocket(self, ws: WebSocket) -> None:
-        """处理 WebSocket 连接。"""
-        # 认证检查
-        config = self.plugin.config
-        server_config = config.server
-        auth_token = server_config.auth_token
+    def _static_html(self, name: str) -> HTMLResponse:
+        path = STATIC_DIR / name
+        if not path.is_file():
+            return HTMLResponse(f"Voice Live asset missing: {name}", status_code=404)
+        return HTMLResponse(path.read_text(encoding="utf-8"))
 
-        await ws.accept()
-
-        # 可选认证
-        if auth_token:
-            # 等待第一条消息作为认证
+    def _origin_allowed(self, origin: str, host: str = "") -> bool:
+        try:
+            candidate = urlsplit(origin)
+        except ValueError:
+            return False
+        if candidate.scheme not in {"http", "https"} or not candidate.hostname:
+            return False
+        if host and candidate.netloc == host:
+            return True
+        for raw in self.plugin.config.server.allowed_origins:
             try:
-                first_msg = await asyncio.wait_for(ws.receive_text(), timeout=5.0)
-                data = json.loads(first_msg)
-                if data.get("type") != "auth" or data.get("token") != auth_token:
-                    await ws.send_json({"type": "error", "message": "认证失败"})
-                    await ws.close()
-                    return
-                await ws.send_json({"type": "auth_ok"})
-            except (asyncio.TimeoutError, json.JSONDecodeError):
-                await ws.send_json({"type": "error", "message": "认证超时"})
-                await ws.close()
-                return
+                allowed = urlsplit(str(raw).rstrip("/"))
+            except ValueError:
+                continue
+            if candidate.scheme != allowed.scheme or candidate.hostname != allowed.hostname:
+                continue
+            if allowed.port is None or candidate.port == allowed.port:
+                return True
+        return False
 
-        # 并发限制
-        max_sessions = server_config.max_concurrent_sessions
-        if len(self._sessions) >= max_sessions:
-            await ws.send_json({"type": "error", "message": "达到最大并发数"})
-            await ws.close()
+    def _issue_ticket(self) -> str:
+        return self._ticket_authority.issue()
+
+    def _consume_ticket(self, ticket: str) -> bool:
+        return self._ticket_authority.consume(ticket)
+
+    async def _accept_ticket_socket(self, websocket: WebSocket) -> bool:
+        origin = websocket.headers.get("origin", "")
+        host = websocket.headers.get("host", "")
+        ticket = websocket.query_params.get("ticket", "")
+        if not self._origin_allowed(origin, host) or not self._consume_ticket(ticket):
+            await websocket.close(code=1008, reason="invalid or expired Voice Live ticket")
+            return False
+        await websocket.accept()
+        return True
+
+    async def _handle_websocket(self, websocket: WebSocket) -> None:
+        if not await self._accept_ticket_socket(websocket):
             return
-
-        # 创建会话
+        config = self.plugin.config
         session = CallSession(config)
-        self._sessions[session.session_id] = session
+        async with self._sessions_lock:
+            if len(self._sessions) >= config.server.max_concurrent_sessions:
+                await websocket.close(code=1013, reason="Voice Live session capacity reached")
+                return
+            self._sessions[session.session_id] = session
 
-        # 设置发送回调
         async def send_json(data: dict[str, Any]) -> None:
-            try:
-                await ws.send_json(data)
-            except Exception:  # noqa: BLE001
-                pass
+            await websocket.send_json(data)
+            await self._broadcast_json(data)
 
         async def send_bytes(data: bytes) -> None:
-            try:
-                await ws.send_bytes(data)
-            except Exception:  # noqa: BLE001
-                pass
+            await websocket.send_bytes(data)
+            await self._broadcast_bytes(data)
 
         session.set_send_callbacks(send_json, send_bytes)
-
-        # 注入上下文（如果可用）
-        await self._inject_context(session)
-
-        logger.info(f"WebSocket 连接建立: {session.session_id}")
-
+        reason = "disconnect"
+        logger.info(f"Voice Live WebSocket 已连接: {session.session_id}")
         try:
-            await self._message_loop(ws, session)
+            async with asyncio.timeout(config.server.max_session_minutes * 60):
+                while session.state not in {SessionState.ENDED, SessionState.FAILED}:
+                    try:
+                        message = await asyncio.wait_for(
+                            websocket.receive(), timeout=config.server.idle_timeout_seconds
+                        )
+                    except TimeoutError:
+                        reason = "idle_timeout"
+                        break
+                    if message.get("type") == "websocket.disconnect":
+                        break
+                    if message.get("bytes") is not None:
+                        await session.handle_audio(message["bytes"])
+                    elif message.get("text") is not None:
+                        payload = json.loads(message["text"])
+                        if not isinstance(payload, dict):
+                            raise ValueError("Voice Live control event must be an object")
+                        await session.handle_message(payload)
         except WebSocketDisconnect:
-            logger.info(f"WebSocket 断开: {session.session_id}")
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"WebSocket 异常: {exc}")
+            pass
+        except TimeoutError:
+            reason = "session_limit"
+        except Exception as exc:
+            reason = "transport_error"
+            logger.error(f"Voice Live WebSocket 异常: {exc}", exc_info=True)
+            try:
+                await websocket.send_json(
+                    {"type": "error", "message": str(exc), "fatal": True}
+                )
+            except Exception:
+                pass
         finally:
-            # 清理会话
-            await session.stop()
-            self._sessions.pop(session.session_id, None)
+            await session.stop(reason=reason)
+            async with self._sessions_lock:
+                self._sessions.pop(session.session_id, None)
 
-    async def _message_loop(self, ws: WebSocket, session: CallSession) -> None:
-        """WebSocket 消息循环。"""
-        while True:
-            message = await ws.receive()
-
-            if message.get("type") == "websocket.disconnect":
-                break
-
-            # 二进制帧 = 音频数据
-            if "bytes" in message and message["bytes"]:
-                await session.handle_audio(message["bytes"])
-                continue
-
-            # 文本帧 = JSON 控制消息
-            if "text" in message and message["text"]:
-                try:
-                    data = json.loads(message["text"])
-                    await session.handle_message(data)
-                except json.JSONDecodeError:
-                    logger.debug(f"无效 JSON: {message['text'][:100]}")
-
-    # ------------------------------------------------------------------
-    # 上下文注入
-    # ------------------------------------------------------------------
-
-    async def _inject_context(self, session: CallSession) -> None:
-        """为会话注入意识上下文。"""
+    async def _handle_observer(self, websocket: WebSocket) -> None:
+        if not await self._accept_ticket_socket(websocket):
+            return
+        self._observers.add(websocket)
+        await websocket.send_json(
+            {"type": "observer.ready", "protocol": 1, "sessions": self.session_snapshots()}
+        )
         try:
-            from .context_bridge import ContextBridge
+            while True:
+                message = await websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    return
+                if message.get("text"):
+                    event = json.loads(message["text"])
+                    if event.get("type") == "ping":
+                        await websocket.send_json({"type": "pong"})
+        except WebSocketDisconnect:
+            pass
+        finally:
+            self._observers.discard(websocket)
 
-            bridge = ContextBridge(self.plugin.config)
-            prompt = await bridge.build_system_prompt()
-            if prompt:
-                session.set_system_prompt(prompt)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(f"上下文注入跳过: {exc}")
+    async def _broadcast_json(self, data: dict[str, Any]) -> None:
+        stale: list[WebSocket] = []
+        for observer in tuple(self._observers):
+            try:
+                await observer.send_json(data)
+            except Exception:
+                stale.append(observer)
+        for observer in stale:
+            self._observers.discard(observer)
 
-    # ------------------------------------------------------------------
-    # 生命周期
-    # ------------------------------------------------------------------
+    async def _broadcast_bytes(self, data: bytes) -> None:
+        stale: list[WebSocket] = []
+        for observer in tuple(self._observers):
+            try:
+                await observer.send_bytes(data)
+            except Exception:
+                stale.append(observer)
+        for observer in stale:
+            self._observers.discard(observer)
+
+    async def stop_all(self, *, reason: str = "router_shutdown") -> None:
+        async with self._sessions_lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+        await asyncio.gather(
+            *(session.stop(reason=reason) for session in sessions),
+            return_exceptions=True,
+        )
 
     async def startup(self) -> None:
-        """路由启动。"""
-        logger.info("Voice Live 路由已启动")
+        logger.info(
+            f"Voice Live 路由已启动: provider={self.plugin.config.full_duplex.provider_type}"
+        )
 
     async def shutdown(self) -> None:
-        """路由关闭，清理所有会话。"""
-        for session in list(self._sessions.values()):
-            await session.stop()
-        self._sessions.clear()
+        await self.stop_all()
+        observers = tuple(self._observers)
+        self._observers.clear()
+        for observer in observers:
+            try:
+                await observer.close(code=1001)
+            except Exception:
+                pass
         logger.info("Voice Live 路由已关闭")
+
+
+__all__ = ["VoiceLiveRouter"]

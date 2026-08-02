@@ -7,8 +7,7 @@ from __future__ import annotations
 
 import pytest
 from sqlalchemy import Integer, Text
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, declarative_base, mapped_column
 
 from src.app.plugin_system.api.storage_api import (
     PluginDatabase,
@@ -24,6 +23,7 @@ from src.app.plugin_system.api.storage_api import (
 # ---------------------------------------------------------------------------
 
 TestBase = declarative_base()
+TestBase.__test__ = False
 
 
 class _Note(TestBase):
@@ -73,6 +73,7 @@ async def test_plugin_database_crud_read_write(tmp_path: pytest.TempdirFactory) 
         c = await crud.create({"title": "C"})
 
         assert await crud.count() == 3
+        assert c.id is not None
         assert await crud.exists(title="A")
         assert not await crud.exists(title="Z")
 

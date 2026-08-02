@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter
 from pydantic import Field as PydanticField
 from pydantic_core import PydanticUndefined
 
+from .env import interpolate_env
 from .types import ConfigData, TOMLData
 
 
@@ -404,8 +405,10 @@ class ConfigBase(BaseModel):
         """
 
         path = Path(path)
-        # 确保文件存在，若父目录不存在则递归创建
         if not path.exists():
+            if not auto_update:
+                raise FileNotFoundError(path)
+            # auto_update 是显式的生成/迁移模式，允许创建缺失的配置文件。
             path.parent.mkdir(parents=True, exist_ok=True)
             path.touch()
         original_text = path.read_text(
@@ -416,7 +419,7 @@ class ConfigBase(BaseModel):
 
         if not auto_update:
             # 不需要签名同步，直接解析原始数据
-            return cls.from_dict(raw)
+            return cls.from_dict(interpolate_env(raw))
 
         # 合并用户值与模型默认值
         merged = _merge_with_model_defaults(cls, raw)
@@ -428,7 +431,8 @@ class ConfigBase(BaseModel):
         if _normalize_newlines(original_text) != _normalize_newlines(new_text):
             path.write_text(new_text, encoding="utf-8")
 
-        return cls.from_dict(merged)
+        # 环境变量只参与内存中的校验与运行，绝不能把真实密钥回写到文件。
+        return cls.from_dict(interpolate_env(merged))
 
     @classmethod
     def default(cls) -> ConfigData:

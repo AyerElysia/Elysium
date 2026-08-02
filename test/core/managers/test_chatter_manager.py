@@ -13,7 +13,6 @@
 
 from __future__ import annotations
 
-import pytest
 from unittest.mock import MagicMock, patch
 
 from src.core.managers.chatter_manager import ChatterManager
@@ -269,12 +268,15 @@ class TestChatterManagerGetOrCreateChatterForStream:
         manager = ChatterManager()
         
         with patch.object(manager, '_select_chatter_class') as mock_select, \
-             patch.object(manager, 'register_active_chatter') as mock_register:
+             patch.object(manager, 'register_active_chatter') as mock_register, \
+             patch('src.core.managers.get_plugin_manager') as mock_get_plugin_manager:
             
             mock_chatter_class = MagicMock()
             mock_chatter_instance = MagicMock(spec=TestChatter)
             mock_chatter_class.return_value = mock_chatter_instance
+            mock_chatter_class.get_signature.return_value = "test_plugin:chatter:test"
             mock_select.return_value = mock_chatter_class
+            mock_get_plugin_manager.return_value.get_plugin.return_value = MagicMock()
             
             result = manager.get_or_create_chatter_for_stream(
                 stream_id="stream_new",

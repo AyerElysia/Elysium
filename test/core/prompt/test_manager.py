@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 
 from src.core.prompt.manager import PromptManager, get_prompt_manager, reset_prompt_manager
 from src.core.prompt.template import PromptTemplate
@@ -117,9 +116,11 @@ class TestPromptManager:
             template="Template 2: {value}",
         )
 
-        # Should return the same instance
-        assert tmpl1 is tmpl2
+        # Callers receive independent snapshots so one render cannot leak values
+        # into another request.
+        assert tmpl1 is not tmpl2
         assert tmpl1.template == "Template 1: {value}"
+        assert tmpl2.template == "Template 1: {value}"
 
     def test_get_or_create_with_policies(self) -> None:
         """Test get_or_create with policies."""
@@ -278,7 +279,9 @@ class TestManagerIntegration:
 
         # Retrieve and use
         retrieved = manager.get_template("kb_query")
-        assert retrieved is tmpl
+        assert retrieved is not None
+        assert retrieved is not tmpl
+        assert retrieved.template == tmpl.template
 
         result = await retrieved.set("query", "如何学习Python？").set("context", "").build()
         assert "如何学习Python？" in result

@@ -469,6 +469,45 @@ async def test_meta_event_handler_reconnects_on_unhealthy_heartbeat() -> None:
     adapter.reconnect.assert_awaited_once()
 
 
+async def test_get_close_wait_sockets_keeps_only_matching_pid_and_fd(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CLOSE-WAIT 解析必须保留精确 fd，不能退化为 NapCat 的全部 socket。"""
+    adapter = NapcatAdapter(
+        core_sink=cast(Any, _FakeCoreSink()),
+        plugin=_build_napcat_plugin(),
+    )
+    process = AsyncMock()
+    process.communicate.return_value = (
+        b"State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n"
+        b'CLOSE-WAIT 0 0 172.26.1.2:49832 198.18.0.29:443 users:(("qq",pid=1901,fd=175))\n'
+        b'CLOSE-WAIT 0 0 172.26.1.2:49833 198.18.0.30:443 users:(("qq",pid=19010,fd=176))\n',
+        b"",
+    )
+    create_process = AsyncMock(return_value=process)
+    monkeypatch.setattr(
+        "plugins.napcat_adapter.plugin.asyncio.create_subprocess_exec",
+        create_process,
+    )
+
+    result = await adapter._get_close_wait_sockets(1901)
+
+    assert result == [("172.26.1.2:49832 -> 198.18.0.29:443", 175)]
+
+
+async def test_napcat_socket_cleanup_does_not_expand_to_all_fds() -> None:
+    """WSL2 清理只允许操作 ss 指定的 fd。"""
+    adapter = NapcatAdapter(
+        core_sink=cast(Any, _FakeCoreSink()),
+        plugin=_build_napcat_plugin(),
+    )
+
+    result = await adapter._get_napcat_socket_fds(
+        1901,
+        [("172.26.1.2:49832 -> 198.18.0.29:443", 175)],
+    )
+
+    assert result == [175]
+
+
 def test_napcat_health_does_not_use_business_message_inactivity() -> None:
     """安静连接是正常状态，不能按多久没业务消息触发重连。"""
     adapter = NapcatAdapter(

@@ -3,6 +3,8 @@
 """
 from __future__ import annotations
 
+import inspect
+import threading
 from dataclasses import dataclass
 
 from ..exceptions import LLMConfigurationError
@@ -82,3 +84,48 @@ class ModelClientRegistry:
         if not hasattr(client, "create_transcription"):
             raise LLMConfigurationError("当前 client 不支持 ASR 请求")
         return client  # type: ignore[return-value]
+
+
+_default_clients_lock = threading.Lock()
+_default_openai_client: ChatModelClient | None = None
+_default_anthropic_client: ChatModelClient | None = None
+
+
+def get_default_model_client_registry() -> ModelClientRegistry:
+    """返回独立注册表外壳，共享进程级 provider 连接池。"""
+    global _default_openai_client, _default_anthropic_client
+    with _default_clients_lock:
+        if _default_openai_client is None:
+            _default_openai_client = OpenAIChatClient()
+        if _default_anthropic_client is None:
+            _default_anthropic_client = AnthropicChatClient()
+        openai_client = _default_openai_client
+        anthropic_client = _default_anthropic_client
+
+    return ModelClientRegistry(
+        openai=openai_client,
+        anthropic=anthropic_client,
+    )
+
+
+async def close_default_model_clients() -> None:
+    """关闭默认 provider 连接池，并允许下次初始化创建干净实例。"""
+    global _default_openai_client, _default_anthropic_client
+    with _default_clients_lock:
+        clients = {
+            client
+            for client in (_default_openai_client, _default_anthropic_client)
+            if client is not None
+        }
+        _default_openai_client = None
+        _default_anthropic_client = None
+
+    for client in clients:
+        close = getattr(client, "aclose", None)
+        if close is None:
+            close = getattr(client, "close", None)
+        if close is None:
+            continue
+        result = close()
+        if inspect.isawaitable(result):
+            await result

@@ -6,7 +6,11 @@ import asyncio
 from pathlib import Path
 import tomllib
 
-from src.app.runtime import UILevel
+from src.app.runtime.console_ui import UILevel
+from src.app.runtime.single_instance import AlreadyRunningError, SingleInstanceLock
+
+
+_INSTANCE_LOCK_PATH = Path("data/runtime/elysium.lock")
 
 
 def load_ui_level_from_config(config_path: str = "config/core.toml") -> UILevel:
@@ -67,7 +71,11 @@ async def main() -> None:
 if __name__ == "__main__":
     try:
         # 运行异步主函数
-        asyncio.run(main())
+        with SingleInstanceLock(_INSTANCE_LOCK_PATH):
+            asyncio.run(main())
+    except AlreadyRunningError as exc:
+        print(f"\n[Startup refused: {exc}]")
+        raise SystemExit(2) from exc
     except KeyboardInterrupt:
         # 用户中断（Ctrl+C）
         print("\n[Interrupted by user]")

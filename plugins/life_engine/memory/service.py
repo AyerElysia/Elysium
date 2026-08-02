@@ -387,7 +387,13 @@ class LifeMemoryService:
     PRUNE_THRESHOLD = 0.1
     RRF_K = 60
 
-    def __init__(self, plugin: Any, *, clock: Any = None) -> None:
+    def __init__(
+        self,
+        plugin: Any,
+        *,
+        clock: Any = None,
+        vector_backend_enabled: bool = True,
+    ) -> None:
         """初始化记忆服务。
 
         Args:
@@ -396,6 +402,7 @@ class LifeMemoryService:
         """
         self.plugin = plugin
         self._clock = clock or datetime.now
+        self._vector_backend_enabled = bool(vector_backend_enabled)
         self._workspace_override: Path | None = None
         if isinstance(plugin, (str, Path)):
             self._workspace_override = Path(plugin)
@@ -573,12 +580,15 @@ class LifeMemoryService:
                 await run_db(create_life_memory_schema, db)
                 await run_db(create_epistemic_schema, db)
 
-                try:
-                    await self._restore_chunk_collection()
-                except Exception as exc:
-                    logger.warning(f"恢复 chunk 向量集合失败，已降级到 legacy: {exc}")
+                if self._vector_backend_enabled:
+                    try:
+                        await self._restore_chunk_collection()
+                    except Exception as exc:
+                        logger.warning(f"恢复 chunk 向量集合失败，已降级到 legacy: {exc}")
 
-                self._chroma_collection = await self._get_chroma_collection()
+                    self._chroma_collection = await self._get_chroma_collection()
+                else:
+                    logger.warning("Life Memory 向量后端已关闭，使用 SQLite 检索")
                 self._initialized = True
                 await self._startup_recovery()
             except BaseException:

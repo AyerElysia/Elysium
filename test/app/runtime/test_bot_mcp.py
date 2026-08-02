@@ -6,7 +6,6 @@ import sys
 from types import ModuleType
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
 
 from src.app.runtime.bot import Bot
 
@@ -68,7 +67,7 @@ async def test_shutdown_cleans_up_mcp_manager() -> None:
     vector_db_module.close_all_vector_db_services = AsyncMock(return_value=None)  # type: ignore[attr-defined]
 
     logger_module = ModuleType("src.kernel.logger")
-    logger_module.shutdown_logger_system = MagicMock()  # type: ignore[attr-defined]
+    logger_module.shutdown_logger_system_async = AsyncMock(return_value=None)  # type: ignore[attr-defined]
 
     with patch.dict(
         sys.modules,

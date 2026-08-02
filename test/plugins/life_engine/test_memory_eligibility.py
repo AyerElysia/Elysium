@@ -172,21 +172,6 @@ async def test_sync_embedding_skips_ineligible_runtime_file() -> None:
     collection.upsert.assert_not_called()
 
 
-async def test_dream_archive_skips_ineligible_runtime_path(tmp_path: Path) -> None:
-    from plugins.life_engine.dream.residue import DreamReport, integrate_archive_into_memory
-
-    upsert_document = AsyncMock()
-    result = await integrate_archive_into_memory(
-        DreamReport(archive_path="runtime/state.json"),
-        tmp_path,
-        SimpleNamespace(upsert_document=upsert_document),
-        [],
-    )
-
-    assert result == {"archive_written": False, "linked_refs": 0}
-    upsert_document.assert_not_awaited()
-
-
 @pytest.mark.parametrize(
     ("path", "reason"),
     [
@@ -309,100 +294,6 @@ async def test_fetch_memory_rejects_noncanonical_lineage_resolution(
             "error": "不是可读取的记忆文档: noncanonical_path",
         }
     ]
-
-
-async def test_dream_archive_indexes_only_canonical_safe_seed_refs(tmp_path: Path) -> None:
-    from plugins.life_engine.dream.residue import DreamReport, integrate_archive_into_memory
-    from plugins.life_engine.dream.seeds import DreamSeed
-
-    dreams = tmp_path / "dreams" / "2026-07-20"
-    dreams.mkdir(parents=True)
-    archive_path = dreams / "0100_dream.md"
-    archive_path.write_text("dream", encoding="utf-8")
-    notes = tmp_path / "notes"
-    notes.mkdir()
-    (notes / "kept.md").write_text("kept", encoding="utf-8")
-    outside = tmp_path / "outside.md"
-    outside.write_text("private", encoding="utf-8")
-
-    upsert_document = AsyncMock(
-        side_effect=[
-            SimpleNamespace(node_id="file:dream"),
-            SimpleNamespace(node_id="file:kept"),
-        ]
-    )
-    create_or_update_edge = AsyncMock()
-    memory_service = SimpleNamespace(
-        upsert_document=upsert_document,
-        create_or_update_edge=create_or_update_edge,
-    )
-    seed = DreamSeed(
-        seed_id="seed",
-        seed_type="day_residue",
-        title="seed",
-        summary="seed",
-        core_refs=[
-            "notes/kept.md#section",
-            "./notes/kept.md",
-            "notes\\kept.md",
-            "../outside.md",
-            str(outside),
-        ],
-        supporting_refs=["notes/kept.md"],
-    )
-
-    result = await integrate_archive_into_memory(
-        DreamReport(archive_path="dreams/2026-07-20/0100_dream.md"),
-        tmp_path,
-        memory_service,
-        [seed],
-    )
-
-    assert result["archive_written"] is True
-    assert result["linked_refs"] == 1
-    assert result["linked_paths"] == ["notes/kept.md"]
-    assert [call.args[0] for call in upsert_document.await_args_list] == [
-        "dreams/2026-07-20/0100_dream.md",
-        "notes/kept.md",
-    ]
-    create_or_update_edge.assert_awaited_once()
-
-
-async def test_dream_archive_writes_sqlite_fts_and_outbox_without_collection_mutation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from plugins.life_engine.dream.residue import DreamReport, integrate_archive_into_memory
-    from plugins.life_engine.memory.service import LifeMemoryService
-
-    archive = tmp_path / "dreams" / "2026-07-20"
-    archive.mkdir(parents=True)
-    (archive / "0100_dream.md").write_text("dream content", encoding="utf-8")
-    service = LifeMemoryService(tmp_path)
-    get_collection = AsyncMock(return_value=SimpleNamespace())
-    monkeypatch.setattr(service, "_get_chroma_collection", get_collection)
-    await service.initialize()
-    legacy_collection = service._chroma_collection
-    chunk_collection = service._chunk_collection
-    try:
-        result = await integrate_archive_into_memory(
-            DreamReport(archive_path="dreams/2026-07-20/0100_dream.md"),
-            tmp_path,
-            service,
-            [],
-        )
-
-        assert result["archive_written"] is True
-        assert result["linked_refs"] == 0
-        jobs = await service.list_index_jobs()
-        assert len(jobs) == 1
-        assert jobs[0].node_id == result["archive_node_id"]
-        assert jobs[0].status == "pending"
-        assert service._chroma_collection is legacy_collection
-        assert service._chunk_collection is chunk_collection
-        get_collection.assert_awaited_once()
-    finally:
-        await service.close()
 
 
 class _CountingConnection(sqlite3.Connection):

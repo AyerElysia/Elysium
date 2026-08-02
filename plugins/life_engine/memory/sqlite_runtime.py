@@ -35,7 +35,7 @@ import atexit
 import os
 import sqlite3
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Literal, TypeVar
@@ -84,9 +84,14 @@ _READER_PRAGMAS: tuple[tuple[str, str], ...] = (
 # CPU or file descriptors.
 _DEFAULT_MAX_WORKERS = 4
 _EXECUTOR_ENV_VAR = "ELYSIUM_MEMORY_DB_WORKERS"
+_DEFAULT_QUEUE_LIMIT = 64
+_QUEUE_ENV_VAR = "ELYSIUM_MEMORY_DB_QUEUE"
 
 _executor: ThreadPoolExecutor | None = None
 _executor_lock = threading.Lock()
+_submission_lock = threading.Lock()
+_inflight_submissions = 0
+_rejected_submissions = 0
 
 _reader_local = threading.local()
 _reader_registry: set[sqlite3.Connection] = set()
@@ -129,6 +134,70 @@ def _resolve_max_workers() -> int:
             f"{_EXECUTOR_ENV_VAR} must be a positive integer, got {workers}"
         )
     return workers
+
+
+def _resolve_queue_limit() -> int:
+    """Return the maximum number of submitted calls waiting for a worker."""
+    raw = os.environ.get(_QUEUE_ENV_VAR)
+    if raw is None or not raw.strip():
+        return _DEFAULT_QUEUE_LIMIT
+
+    try:
+        limit = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{_QUEUE_ENV_VAR} must be a non-negative integer, got {raw!r}"
+        ) from exc
+    if limit < 0:
+        raise ValueError(
+            f"{_QUEUE_ENV_VAR} must be a non-negative integer, got {limit}"
+        )
+    return limit
+
+
+class MemoryDatabaseOverloaded(RuntimeError):
+    """Raised when memory DB work exceeds the bounded executor admission limit."""
+
+
+def _release_submission(_future: Future[Any]) -> None:
+    """Release one executor admission slot after the real call settles."""
+    global _inflight_submissions
+    with _submission_lock:
+        _inflight_submissions = max(0, _inflight_submissions - 1)
+
+
+def _submit_db_call(fn: Callable[[], T]) -> Future[T]:
+    """Submit one call with a hard workers-plus-queue capacity bound."""
+    global _inflight_submissions, _rejected_submissions
+
+    capacity = _resolve_max_workers() + _resolve_queue_limit()
+    with _submission_lock:
+        if _inflight_submissions >= capacity:
+            _rejected_submissions += 1
+            raise MemoryDatabaseOverloaded(
+                f"memory DB executor overloaded: capacity={capacity}"
+            )
+        _inflight_submissions += 1
+
+    try:
+        future = get_db_executor().submit(fn)
+    except BaseException:
+        with _submission_lock:
+            _inflight_submissions = max(0, _inflight_submissions - 1)
+        raise
+    future.add_done_callback(_release_submission)
+    return future
+
+
+def get_db_runtime_stats() -> dict[str, int]:
+    """Return admission counters for health checks and tests."""
+    with _submission_lock:
+        return {
+            "max_workers": _resolve_max_workers(),
+            "queue_limit": _resolve_queue_limit(),
+            "inflight": _inflight_submissions,
+            "rejected_total": _rejected_submissions,
+        }
 
 
 def get_db_executor() -> ThreadPoolExecutor:
@@ -313,10 +382,8 @@ async def run_db(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     Returns:
         T: Whatever ``fn`` returns.
     """
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        get_db_executor(), partial(fn, *args, **kwargs)
-    )
+    future = _submit_db_call(partial(fn, *args, **kwargs))
+    return await asyncio.wrap_future(future)
 
 
 async def run_read(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
@@ -343,8 +410,8 @@ async def run_read(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     def _call() -> T:
         return fn(_thread_reader(path, generation), *args, **kwargs)
 
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(get_db_executor(), _call)
+    future = _submit_db_call(_call)
+    return await asyncio.wrap_future(future)
 
 
 def shutdown_db_runtime(*, wait: bool = True) -> None:

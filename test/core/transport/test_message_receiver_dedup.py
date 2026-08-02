@@ -1,11 +1,50 @@
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
-
-import pytest
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.core.models.message import Message
 from src.core.transport.message_receive.receiver import MessageReceiver
+
+
+async def test_message_claim_is_atomic_under_concurrency() -> None:
+    receiver = MessageReceiver()
+
+    results = await asyncio.gather(
+        *(
+            receiver._claim_message(
+                adapter_signature="plugin:adapter:qq",
+                platform="qq",
+                message_id="msg-concurrent",
+            )
+            for _ in range(20)
+        )
+    )
+
+    assert results.count(True) == 1
+    assert results.count(False) == 19
+
+
+async def test_message_claim_expires_after_dedup_window() -> None:
+    receiver = MessageReceiver()
+
+    with patch(
+        "src.core.transport.message_receive.receiver.time.monotonic",
+        side_effect=[100.0, 221.0],
+    ):
+        first = await receiver._claim_message(
+            adapter_signature="plugin:adapter:qq",
+            platform="qq",
+            message_id="msg-expiring",
+        )
+        after_window = await receiver._claim_message(
+            adapter_signature="plugin:adapter:qq",
+            platform="qq",
+            message_id="msg-expiring",
+        )
+
+    assert first is True
+    assert after_window is True
 
 
 async def test_receive_envelope_dedups_same_message_in_window() -> None:

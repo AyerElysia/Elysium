@@ -35,6 +35,7 @@ class TaskInfo:
     name: str | None = None
     coro: Coroutine[Any, Any, Any] | None = None
     task: asyncio.Task[Any] | None = None
+    loop: asyncio.AbstractEventLoop | None = None
     daemon: bool = False
     timeout: float | None = None
     created_at: datetime = field(default_factory=datetime.now)
@@ -76,6 +77,13 @@ class TaskInfo:
         if self.task is None:
             return False
         return self.task.cancel()
+
+    def cancel_threadsafe(self) -> bool:
+        """Schedule cancellation on the task's owning event loop."""
+        if self.task is None or self.task.done() or self.loop is None:
+            return False
+        self.loop.call_soon_threadsafe(self.task.cancel)
+        return True
 
     def __repr__(self) -> str:
         """任务信息字符串表示"""

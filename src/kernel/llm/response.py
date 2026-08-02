@@ -177,8 +177,9 @@ class LLMResponse:
                 stream_error = e
 
         try:
-            async for chunk in asyncio.wait_for(_consume_stream(), timeout=STREAM_TOTAL_TIMEOUT):
-                yield chunk
+            async with asyncio.timeout(STREAM_TOTAL_TIMEOUT):
+                async for chunk in _consume_stream():
+                    yield chunk
         except asyncio.TimeoutError:
             from .exceptions import LLMTimeoutError
             stream_error = LLMTimeoutError(f"Stream 消费超时 ({STREAM_TOTAL_TIMEOUT:.0f}s)")

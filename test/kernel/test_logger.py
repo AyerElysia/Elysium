@@ -258,6 +258,44 @@ class TestLogStore:
         assert isinstance(deleted, int)
         store.close()
 
+    def test_new_database_uses_incremental_vacuum(self, tmp_path: Path) -> None:
+        """New stores must be able to return deleted pages to the filesystem."""
+        import sqlite3
+
+        db_path = tmp_path / "vacuum.db"
+        store = LogStore(db_path=db_path)
+        store.close()
+
+        with sqlite3.connect(db_path) as conn:
+            assert conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+
+    def test_bloated_legacy_database_is_compacted_once(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A legacy NONE-vacuum store is migrated before its writer starts."""
+        import sqlite3
+
+        from src.kernel.logger import db_store as db_store_module
+
+        db_path = tmp_path / "legacy.db"
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("CREATE TABLE legacy_payload (value BLOB)")
+            conn.execute("INSERT INTO legacy_payload VALUES (zeroblob(1048576))")
+            conn.commit()
+            conn.execute("DELETE FROM legacy_payload")
+            conn.commit()
+            assert conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 0
+            assert conn.execute("PRAGMA freelist_count").fetchone()[0] > 0
+
+        monkeypatch.setattr(db_store_module, "_LEGACY_COMPACT_MIN_BYTES", 1)
+        monkeypatch.setattr(db_store_module, "_LEGACY_COMPACT_FREE_RATIO", 0.0)
+        store = LogStore(db_path=db_path)
+        store.close()
+
+        with sqlite3.connect(db_path) as conn:
+            assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+            assert conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+
     def test_stats(self, store: LogStore) -> None:
         store.write("INFO", "mod", "a")
         store.write("ERROR", "mod", "b")

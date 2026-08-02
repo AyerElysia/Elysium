@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import time
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -213,6 +213,86 @@ async def test_distributor_starts_loop_before_slow_persistence(monkeypatch: pyte
     assert started_streams == ["stream-001"]
     await asyncio.wait_for(persist_started.wait(), timeout=1.0)
     persist_release.set()
+
+
+async def test_distributor_serializes_messages_from_same_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一聊天流的内存注入和数据库落盘必须保持接收顺序。"""
+    unread_messages = []
+    persisted_messages = []
+    first_persist_started = asyncio.Event()
+    release_first_persist = asyncio.Event()
+    context = SimpleNamespace(
+        last_message_time=None,
+        message_buffer_skip_count=0,
+        stream_loop_task=None,
+        add_unread_message=lambda msg: unread_messages.append(msg),
+    )
+    chat_stream = SimpleNamespace(
+        stream_id="stream-serial",
+        context=context,
+        update_active_time=lambda: None,
+    )
+
+    async def _get_stream(**_kwargs):
+        return chat_stream
+
+    async def _persist(message, **_kwargs):
+        if message.content == "first":
+            first_persist_started.set()
+            await release_first_persist.wait()
+        persisted_messages.append(message)
+
+    fake_sm = SimpleNamespace(
+        get_or_create_stream=_get_stream,
+        add_message=_persist,
+    )
+    fake_slm = SimpleNamespace(
+        is_running=True,
+        start_stream_loop=AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "src.core.managers.stream_manager.get_stream_manager",
+        lambda: fake_sm,
+    )
+    monkeypatch.setattr(
+        "src.core.transport.distribution.stream_loop_manager."
+        "get_stream_loop_manager",
+        lambda: fake_slm,
+    )
+
+    def _message(content: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            content=content,
+            platform="test",
+            stream_id="stream-serial",
+            chat_type="group",
+            sender_id="u1",
+            sender_name="U",
+            sender_cardname="",
+            extra={"group_id": "g1", "group_name": "G"},
+        )
+
+    first = _message("first")
+    second = _message("second")
+    first_call = asyncio.create_task(
+        _on_message_received("ON_MESSAGE_RECEIVED", {"message": first})
+    )
+    await asyncio.wait_for(first_persist_started.wait(), timeout=1.0)
+    second_call = asyncio.create_task(
+        _on_message_received("ON_MESSAGE_RECEIVED", {"message": second})
+    )
+    await asyncio.sleep(0.05)
+
+    assert unread_messages == [first]
+    assert persisted_messages == []
+
+    release_first_persist.set()
+    await asyncio.gather(first_call, second_call)
+
+    assert unread_messages == [first, second]
+    assert persisted_messages == [first, second]
 
 
 async def test_distributor_logs_slow_dispatch_at_debug_and_keeps_task_alive(

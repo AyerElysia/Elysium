@@ -225,3 +225,35 @@ class TestDedicatedExecutor:
             sqlite_runtime._resolve_max_workers()
             == sqlite_runtime._DEFAULT_MAX_WORKERS
         )
+
+    async def test_submission_queue_is_actually_bounded(self, monkeypatch) -> None:
+        """A stalled disk must not create an unbounded executor backlog."""
+        sqlite_runtime.shutdown_db_runtime()
+        monkeypatch.setenv(sqlite_runtime._EXECUTOR_ENV_VAR, "1")
+        monkeypatch.setenv(sqlite_runtime._QUEUE_ENV_VAR, "1")
+        started = threading.Event()
+        release = threading.Event()
+
+        def _block() -> None:
+            started.set()
+            release.wait(timeout=5.0)
+
+        first = asyncio.create_task(sqlite_runtime.run_db(_block))
+        try:
+            assert await asyncio.to_thread(started.wait, 2.0)
+            second = asyncio.create_task(sqlite_runtime.run_db(lambda: None))
+            for _ in range(100):
+                if sqlite_runtime.get_db_runtime_stats()["inflight"] == 2:
+                    break
+                await asyncio.sleep(0.01)
+
+            with pytest.raises(sqlite_runtime.MemoryDatabaseOverloaded):
+                await sqlite_runtime.run_db(lambda: None)
+
+            assert sqlite_runtime.get_db_runtime_stats()["rejected_total"] >= 1
+            release.set()
+            await asyncio.gather(first, second)
+        finally:
+            release.set()
+            await asyncio.gather(first, return_exceptions=True)
+            sqlite_runtime.shutdown_db_runtime()

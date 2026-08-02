@@ -36,4 +36,4 @@ def test_types_module_reexports_message_and_stream_models() -> None:
 def test_llm_api_task_type_uses_public_types_module() -> None:
     """llm_api 中的 TaskType 应与公共类型层保持同一对象。"""
     assert llm_api.TaskType is types.TaskType
-    assert types.TaskType.ACTOR.value == "actor"
+    assert types.TaskType.ACTOR is types.TaskType.EXPRESSION

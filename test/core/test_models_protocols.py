@@ -6,7 +6,7 @@ from typing import Protocol, runtime_checkable
 
 # 定义测试协议
 @runtime_checkable
-class TestService(Protocol):
+class ServiceProtocol(Protocol):
     """测试服务协议。"""
 
     async def process(self, data: str) -> str: ...
@@ -70,14 +70,14 @@ class TestProtocols:
     def test_protocol_check_with_implementation(self):
         """测试协议检查（完整实现）。"""
         impl = TestServiceImpl()
-        assert isinstance(impl, TestService)
+        assert isinstance(impl, ServiceProtocol)
 
     def test_protocol_check_with_partial_implementation(self):
         """测试协议检查（部分实现）。"""
         impl = PartialServiceImpl()
         # 由于 Protocol 是结构化子类型，只检查是否存在必需方法
         # 缺少 get_status 方法的实现不应该通过检查
-        assert not isinstance(impl, TestService)
+        assert not isinstance(impl, ServiceProtocol)
 
     def test_protocol_check_with_non_compatible(self):
         """测试协议检查（不兼容的对象）。"""
@@ -86,7 +86,7 @@ class TestProtocols:
                 return "not a service"
 
         impl = NotAService()
-        assert not isinstance(impl, TestService)
+        assert not isinstance(impl, ServiceProtocol)
 
     def test_data_service_protocol(self):
         """测试数据服务协议。"""

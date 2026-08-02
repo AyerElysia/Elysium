@@ -181,6 +181,36 @@ class TestBlockingPoolLeakAccounting:
         finally:
             pool.shutdown()
 
+    async def test_submission_queue_is_bounded(self) -> None:
+        """Calls beyond worker plus queue capacity are rejected immediately."""
+        pool = BlockingPool(
+            "test-bounded",
+            max_workers=1,
+            max_queue_size=1,
+        )
+        release = threading.Event()
+        started = threading.Event()
+
+        def _hog() -> None:
+            started.set()
+            release.wait(5.0)
+
+        try:
+            first = asyncio.create_task(pool.run(_hog, timeout=None, label="first"))
+            assert await asyncio.to_thread(started.wait, 1.0)
+            second = asyncio.create_task(pool.run(_hog, timeout=None, label="second"))
+            await asyncio.sleep(0)
+
+            with pytest.raises(BlockingCallNotStarted, match="capacity|容量"):
+                await pool.run(_hog, timeout=None, label="third")
+            assert pool.stats()["rejected_total"] == 1
+
+            release.set()
+            await asyncio.gather(first, second)
+        finally:
+            release.set()
+            pool.shutdown()
+
 
 class TestBlockingPoolConfiguration:
     """配置解析：写错的调优参数必须在启动时炸掉，而不是被吞成另一种行为。"""

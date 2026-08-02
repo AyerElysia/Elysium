@@ -6,11 +6,11 @@ from sqlalchemy.orm import Mapped, declarative_base, mapped_column
 
 from src.core.utils.schema_sync import enforce_database_schema_consistency
 from src.kernel.db import configure_engine, get_engine
-from src.kernel.db.core.exceptions import DatabaseInitializationError
 from src.kernel.db.core.engine import _build_sqlite_config
 
 
 TestBase = declarative_base()
+TestBase.__test__ = False
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -51,8 +51,8 @@ class TypeMismatchTarget(TestBase):
     score: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
-async def test_schema_sync_adds_missing_and_removes_undefined_columns() -> None:
-    """应删除未定义字段并补齐缺失字段。"""
+async def test_schema_sync_adds_missing_and_preserves_undefined_columns() -> None:
+    """启动同步应补齐缺失字段，但不得删除历史字段。"""
     engine = await get_engine()
 
     async with engine.begin() as conn:
@@ -72,7 +72,9 @@ async def test_schema_sync_adds_missing_and_removes_undefined_columns() -> None:
         stats = await enforce_database_schema_consistency(TestBase.metadata)
         assert stats.tables_checked >= 1
         assert stats.columns_added >= 1
-        assert stats.columns_removed >= 1
+        assert stats.columns_removed == 0
+        assert stats.columns_preserved >= 1
+        assert stats.requires_migration
 
         async with engine.begin() as conn:
             columns = await conn.run_sync(
@@ -82,14 +84,49 @@ async def test_schema_sync_adds_missing_and_removes_undefined_columns() -> None:
         names = {column["name"] for column in columns}
         assert "id" in names
         assert "name" in names
-        assert "legacy_col" not in names
+        assert "legacy_col" in names
     finally:
         async with engine.begin() as conn:
             await conn.execute(text("DROP TABLE IF EXISTS schema_sync_target"))
 
 
-async def test_schema_sync_raises_on_sqlite_type_mismatch() -> None:
-    """SQLite 遇到类型漂移时应硬失败，避免带病启动。"""
+async def test_explicit_schema_migration_can_remove_undefined_columns() -> None:
+    """只有显式迁移模式才允许删除历史字段。"""
+    engine = await get_engine()
+
+    async with engine.begin() as conn:
+        await conn.execute(text("DROP TABLE IF EXISTS schema_sync_target"))
+        await conn.execute(
+            text(
+                """
+                CREATE TABLE schema_sync_target (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    legacy_col TEXT
+                )
+                """
+            )
+        )
+
+    try:
+        stats = await enforce_database_schema_consistency(
+            TestBase.metadata,
+            allow_destructive=True,
+        )
+        assert stats.columns_removed >= 1
+
+        async with engine.begin() as conn:
+            columns = await conn.run_sync(
+                lambda sync_conn: inspect(sync_conn).get_columns("schema_sync_target")
+            )
+        assert "legacy_col" not in {column["name"] for column in columns}
+    finally:
+        async with engine.begin() as conn:
+            await conn.execute(text("DROP TABLE IF EXISTS schema_sync_target"))
+
+
+async def test_schema_sync_reports_sqlite_type_mismatch_without_mutating() -> None:
+    """SQLite 类型漂移应被报告，并留给显式迁移处理。"""
     engine = await get_engine()
 
     async with engine.begin() as conn:
@@ -106,8 +143,18 @@ async def test_schema_sync_raises_on_sqlite_type_mismatch() -> None:
         )
 
     try:
-        with pytest.raises(DatabaseInitializationError):
-            await enforce_database_schema_consistency(TestBase.metadata)
+        stats = await enforce_database_schema_consistency(TestBase.metadata)
+        assert stats.type_mismatches >= 1
+        assert stats.requires_migration
+
+        async with engine.begin() as conn:
+            columns = await conn.run_sync(
+                lambda sync_conn: inspect(sync_conn).get_columns(
+                    "schema_sync_type_mismatch"
+                )
+            )
+        score = next(column for column in columns if column["name"] == "score")
+        assert isinstance(score["type"], Text)
     finally:
         async with engine.begin() as conn:
             await conn.execute(text("DROP TABLE IF EXISTS schema_sync_type_mismatch"))

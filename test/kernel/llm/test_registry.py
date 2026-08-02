@@ -10,7 +10,11 @@ from typing import Any, cast
 import pytest
 
 from src.kernel.llm import LLMConfigurationError
-from src.kernel.llm.model_client import ModelClientRegistry
+from src.kernel.llm.model_client import (
+    ModelClientRegistry,
+    close_default_model_clients,
+    get_default_model_client_registry,
+)
 from src.kernel.llm.model_client.anthropic_client import AnthropicChatClient
 from src.kernel.llm.model_client.openai_client import OpenAIChatClient
 from src.kernel.llm.types import ModelEntry
@@ -37,6 +41,23 @@ def _model_entry(**overrides: Any) -> ModelEntry:
     }
     base.update(overrides)
     return cast(ModelEntry, base)
+
+
+async def test_default_registries_share_pools_but_not_mutable_slots() -> None:
+    """默认请求应复用连接池，同时允许单个请求替换自己的客户端。"""
+    first = get_default_model_client_registry()
+    second = get_default_model_client_registry()
+    shared_openai = first.openai
+
+    assert first is not second
+    assert first.openai is second.openai
+    first.openai = cast(Any, object())
+    assert second.openai is shared_openai
+
+    await close_default_model_clients()
+    third = get_default_model_client_registry()
+    assert third.openai is not shared_openai
+    await close_default_model_clients()
 
 
 def test_registry_default_openai_client():

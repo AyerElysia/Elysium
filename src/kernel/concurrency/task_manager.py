@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import multiprocessing
 import weakref
 from collections.abc import Callable
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
 
 P = ParamSpec("P")
 R = TypeVar("R")
+logger = logging.getLogger(__name__)
 
 
 class TaskManager:
@@ -158,8 +160,9 @@ class TaskManager:
             RuntimeError: 如果不在异步上下文中调用
         """
         try:
-            asyncio.get_running_loop()
+            loop = asyncio.get_running_loop()
         except RuntimeError:
+            coro.close()
             raise RuntimeError(
                 "TaskManager.create_task must be called within an async context"
             )
@@ -171,6 +174,7 @@ class TaskManager:
             task_id=task_id,
             name=name or f"task_{task_id[:8]}",
             coro=coro,
+            loop=loop,
             daemon=daemon,
             timeout=timeout,
             group_name=group_name,
@@ -202,10 +206,19 @@ class TaskManager:
             task_info = self._tasks.get(task_id) if task_id else None
             group = self._groups.get(task_info.group_name) if task_info and task_info.group_name else None
 
-        if group is not None and not task.cancelled():
-            exc = task.exception()
-            if exc is not None:
-                group._record_exception(exc)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        if group is not None:
+            group._record_exception(exc)
+        logger.error(
+            "Managed task failed: name=%s id=%s",
+            task_info.name if task_info else task.get_name(),
+            task_id or "unknown",
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
 
     def get_task(self, task_id: str) -> TaskInfo:
         """获取任务信息
@@ -287,9 +300,19 @@ class TaskManager:
                 name=name,
                 timeout=timeout,
                 cancel_on_error=cancel_on_error,
+                _task_factory=self._create_group_task,
             )
             self._groups[name] = group
             return group
+
+    def _create_group_task(
+        self,
+        coro: Coroutine[Any, Any, Any],
+        name: str | None,
+        group_name: str,
+    ) -> TaskInfo:
+        """Create a manager-tracked child for :class:`TaskGroup`."""
+        return self.create_task(coro, name=name, group_name=group_name)
 
     def cleanup_tasks(self) -> int:
         """清理已完成的任务
@@ -380,31 +403,28 @@ class TaskManager:
         if not coros:
             return []
 
-        # 创建任务组（如果指定了 group_name）
-        group_context: TaskGroup | None = None
         if group_name:
             group_context = self.group(name=group_name)
-
-        # 创建所有任务
-        tasks = []
-        for coro in coros:
-            task_info = self.create_task(
-                coro=coro,
-                name=f"gather_task_{len(tasks)}",
-                group_name=group_name,
-            )
-            tasks.append(task_info.task)
-
-        # 使用 TaskGroup 上下文（如果有）
-        if group_context:
             async with group_context:
-                # 等待所有任务完成
-                results = await asyncio.gather(*tasks, return_exceptions=return_exceptions)
-        else:
-            # 直接等待所有任务完成
-            results = await asyncio.gather(*tasks, return_exceptions=return_exceptions)
+                task_infos = [
+                    group_context.create_task(coro, name=f"gather_task_{index}")
+                    for index, coro in enumerate(coros)
+                ]
+                tasks = [info.task for info in task_infos if info.task is not None]
+                results = await asyncio.gather(
+                    *tasks,
+                    return_exceptions=return_exceptions,
+                )
+                if return_exceptions:
+                    group_context._exception = None
+                return results
 
-        return results
+        task_infos = [
+            self.create_task(coro=coro, name=f"gather_task_{index}")
+            for index, coro in enumerate(coros)
+        ]
+        tasks = [info.task for info in task_infos if info.task is not None]
+        return await asyncio.gather(*tasks, return_exceptions=return_exceptions)
 
     def get_stats(self) -> dict[str, Any]:
         """获取任务统计信息

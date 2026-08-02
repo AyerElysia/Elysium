@@ -321,14 +321,8 @@ async def restore_autonomy_intents(plugin: Any, workspace_path: str | Path) -> i
         return 0
 
     scheduler = get_unified_scheduler()
-    for _ in range(120):
-        try:
-            await scheduler.list_tasks()
-            break
-        except RuntimeError:
-            await asyncio.sleep(0.5)
-    else:
-        logger.warning("等待调度器就绪超时，未恢复自主意向")
+    if not scheduler.is_running:
+        logger.warning("调度器尚未运行，未恢复自主意向")
         return 0
 
     restored = 0

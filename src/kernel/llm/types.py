@@ -7,6 +7,20 @@ from enum import Enum
 from typing import Any, TypeAlias, TypedDict
 
 
+class RedactedSecret(str):
+    """A string that remains usable by clients but is masked in containers/logs."""
+
+    def __repr__(self) -> str:
+        return "'<redacted>'"
+
+
+def redact_secret(value: object) -> RedactedSecret:
+    """Wrap a secret without changing its string value or equality semantics."""
+    if isinstance(value, RedactedSecret):
+        return value
+    return RedactedSecret(str(value or ""))
+
+
 class RequestType(str, Enum):
     """LLM 请求类型。"""
 
@@ -43,7 +57,9 @@ ModelSet: TypeAlias = list[ModelEntry]
 
 
 __all__ = [
-    "RequestType",
     "ModelEntry",
     "ModelSet",
+    "RedactedSecret",
+    "RequestType",
+    "redact_secret",
 ]

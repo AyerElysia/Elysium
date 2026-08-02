@@ -16,11 +16,10 @@ from mofox_wire import MessageEnvelope
 
 from src.app.plugin_system.api.log_api import get_logger
 
-from ..utils.constants import NoticeType
-
 if TYPE_CHECKING:
     from ..client import NapCatClient
     from ..config import NapcatAdapterConfig
+    from .meta import MetaEventHandler
 
 logger = get_logger("napcat_adapter")
 

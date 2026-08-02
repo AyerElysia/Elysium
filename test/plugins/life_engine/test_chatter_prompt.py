@@ -1749,9 +1749,6 @@ async def test_life_chatter_dynamic_context_is_separate_snapshot() -> None:
     chatter = LifeChatter.__new__(LifeChatter)
     chat_stream = SimpleNamespace(stream_id="stream-1")
     service = LifeEngineService(SimpleNamespace(config=None))
-    service._inner_state = SimpleNamespace(
-        format_full_state_for_prompt=lambda _today: "STATE_NOW"
-    )
     service._thought_manager = SimpleNamespace(
         format_for_prompt=lambda **kwargs: "THOUGHT_STREAM_NOW",
         current_revision=1,
@@ -1778,7 +1775,6 @@ async def test_life_chatter_dynamic_context_is_separate_snapshot() -> None:
     )
 
     assert "<life_runtime_context>" in dynamic
-    assert "STATE_NOW" in dynamic
     assert "THOUGHT_STREAM_NOW" in dynamic
     assert "RECENT_EVENT" in dynamic
     assert "RUNTIME_NOW" in dynamic

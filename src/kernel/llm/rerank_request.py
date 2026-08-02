@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Self
 
 from .exceptions import LLMConfigurationError, classify_exception
-from .model_client import ModelClientRegistry
+from .model_client import ModelClientRegistry, get_default_model_client_registry
 from .monitor import RequestMetrics, RequestTimer, get_global_collector
 from .policy import create_default_policy
 from .policy.base import Policy
@@ -34,7 +34,7 @@ class RerankRequest:
         if self.policy is None:
             self.policy = create_default_policy()
         if self.clients is None:
-            self.clients = ModelClientRegistry()
+            self.clients = get_default_model_client_registry()
 
     def set_query(self, value: str) -> Self:
         """设置 rerank 查询文本。"""

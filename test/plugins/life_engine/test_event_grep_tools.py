@@ -9,7 +9,6 @@ import pytest
 from plugins.life_engine.service.core import LifeEngineService
 from plugins.life_engine.service.event_builder import EventType, LifeEngineEvent
 from plugins.life_engine.tools.event_grep_tools import (
-    LifeChatterGrepEventsTool,
     LifeEngineGrepEventsTool,
     grep_life_events,
 )
@@ -75,7 +74,7 @@ async def test_life_chatter_grep_defaults_to_current_stream() -> None:
 
     registry.register_life_engine_service(service)
 
-    tool = LifeChatterGrepEventsTool(plugin=SimpleNamespace())
+    tool = LifeEngineGrepEventsTool(plugin=SimpleNamespace())
     tool.chat_stream = SimpleNamespace(stream_id="s1")
 
     ok, payload = await tool.execute(query="关键词")
@@ -104,7 +103,7 @@ async def test_life_chatter_grep_includes_life_internal_events_by_default() -> N
 
     registry.register_life_engine_service(service)
 
-    tool = LifeChatterGrepEventsTool(plugin=SimpleNamespace())
+    tool = LifeEngineGrepEventsTool(plugin=SimpleNamespace())
     tool.chat_stream = SimpleNamespace(stream_id="s1")
 
     ok, payload = await tool.execute(query="关键词")
@@ -129,7 +128,7 @@ async def test_life_chatter_grep_context_stays_in_current_stream() -> None:
 
     registry.register_life_engine_service(service)
 
-    tool = LifeChatterGrepEventsTool(plugin=SimpleNamespace())
+    tool = LifeEngineGrepEventsTool(plugin=SimpleNamespace())
     tool.chat_stream = SimpleNamespace(stream_id="s1")
 
     ok, payload = await tool.execute(query="目标", context_before=2, context_after=2)

@@ -34,7 +34,7 @@ from sqlalchemy import or_, select
 
 from src.kernel.logger import get_logger
 from src.app.plugin_system.api.llm_api import get_model_set_by_task
-from src.kernel.llm.model_client.registry import ModelClientRegistry
+from src.kernel.llm.model_client.registry import get_default_model_client_registry
 from src.core.prompt import PromptTemplate, get_prompt_manager
 from src.core.config import get_core_config
 from src.core.utils.base64_helper import base64_decode_to_bytes
@@ -924,7 +924,7 @@ class MediaManager:
             识别出的文字，失败返回 None。
         """
         try:
-            registry = ModelClientRegistry()
+            registry = get_default_model_client_registry()
             model_set = self._asr_model_set
             # model_set 是 list[dict]，每个元素即一个 ModelEntry
             if not isinstance(model_set, list) or not model_set:

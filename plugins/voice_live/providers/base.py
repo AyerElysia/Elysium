@@ -1,79 +1,76 @@
-"""全双工 Provider 基类。
-
-定义所有实时语音 Provider 的统一接口，包括：
-- 连接/断开生命周期
-- 音频流收发
-- 打断（barge-in）支持
-- 状态与转写回调
-"""
+"""Strict provider contract for realtime speech-to-speech backends."""
 
 from __future__ import annotations
 
-import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from enum import Enum, auto
 from typing import Any
 
-
-class ProviderState(Enum):
-    """Provider 运行状态。"""
-
-    IDLE = auto()
-    CONNECTING = auto()
-    LISTENING = auto()
-    SPEAKING = auto()
-    ERROR = auto()
-    CLOSED = auto()
+from ..protocol import ProviderState
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, frozen=True)
 class TranscriptEvent:
-    """转写事件。"""
-
-    role: str  # "user" | "assistant"
+    role: str
     text: str
     is_final: bool = True
-    timestamp_ms: int = 0
+    event_id: str = ""
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, frozen=True)
 class AudioDelta:
-    """音频增量数据。"""
-
-    data: bytes  # PCM16 raw bytes
-    sample_rate: int = 24000
+    data: bytes
+    sample_rate: int
     format: str = "pcm16"
+    response_id: str = ""
 
 
-# 回调类型定义
-AudioDeltaCallback = Callable[[AudioDelta], Awaitable[None]]
-StateChangeCallback = Callable[[ProviderState], Awaitable[None]]
+@dataclass(slots=True, frozen=True)
+class InterruptionEvent:
+    source: str
+    response_id: str = ""
+    item_id: str = ""
+
+
+@dataclass(slots=True, frozen=True)
+class ToolCallEvent:
+    call_id: str
+    name: str
+    arguments_json: str
+
+
+@dataclass(slots=True, frozen=True)
+class ProviderMetrics:
+    values: dict[str, Any] = field(default_factory=dict)
+
+
+AudioCallback = Callable[[AudioDelta], Awaitable[None]]
+StateCallback = Callable[[ProviderState], Awaitable[None]]
 TranscriptCallback = Callable[[TranscriptEvent], Awaitable[None]]
 ErrorCallback = Callable[[str], Awaitable[None]]
+InterruptionCallback = Callable[[InterruptionEvent], Awaitable[None]]
+MetricsCallback = Callable[[ProviderMetrics], Awaitable[None]]
+ToolCallCallback = Callable[[ToolCallEvent], Awaitable[None]]
 
 
 class BaseRealtimeProvider(ABC):
-    """全双工实时语音 Provider 抽象基类。
+    """A provider must expose one deterministic model path and lifecycle."""
 
-    所有 Provider（OpenAI Realtime、Moshi 等）都继承此类，
-    实现统一的连接、音频流、打断和回调接口。
-    """
-
-    provider_name: str = "base"
+    provider_name = "base"
+    input_sample_rate = 16000
+    output_sample_rate = 24000
 
     def __init__(self) -> None:
         self._state = ProviderState.IDLE
-        self._audio_delta_callbacks: list[AudioDeltaCallback] = []
-        self._state_change_callbacks: list[StateChangeCallback] = []
+        self._session_config: dict[str, Any] = {}
+        self._audio_callbacks: list[AudioCallback] = []
+        self._state_callbacks: list[StateCallback] = []
         self._transcript_callbacks: list[TranscriptCallback] = []
         self._error_callbacks: list[ErrorCallback] = []
-        self._session_config: dict[str, Any] = {}
-
-    # ------------------------------------------------------------------
-    # 状态属性
-    # ------------------------------------------------------------------
+        self._interruption_callbacks: list[InterruptionCallback] = []
+        self._metrics_callbacks: list[MetricsCallback] = []
+        self._tool_callbacks: list[ToolCallCallback] = []
 
     @property
     def state(self) -> ProviderState:
@@ -81,108 +78,75 @@ class BaseRealtimeProvider(ABC):
 
     @property
     def is_active(self) -> bool:
-        return self._state in (ProviderState.LISTENING, ProviderState.SPEAKING)
+        return self._state not in {ProviderState.IDLE, ProviderState.ERROR, ProviderState.CLOSED}
 
-    # ------------------------------------------------------------------
-    # 回调注册
-    # ------------------------------------------------------------------
+    def on_audio_delta(self, callback: AudioCallback) -> None:
+        self._audio_callbacks.append(callback)
 
-    def on_audio_delta(self, callback: AudioDeltaCallback) -> None:
-        """注册音频输出回调。"""
-        self._audio_delta_callbacks.append(callback)
-
-    def on_state_change(self, callback: StateChangeCallback) -> None:
-        """注册状态变更回调。"""
-        self._state_change_callbacks.append(callback)
+    def on_state_change(self, callback: StateCallback) -> None:
+        self._state_callbacks.append(callback)
 
     def on_transcript(self, callback: TranscriptCallback) -> None:
-        """注册转写事件回调。"""
         self._transcript_callbacks.append(callback)
 
     def on_error(self, callback: ErrorCallback) -> None:
-        """注册错误回调。"""
         self._error_callbacks.append(callback)
 
-    # ------------------------------------------------------------------
-    # 内部回调触发
-    # ------------------------------------------------------------------
+    def on_interruption(self, callback: InterruptionCallback) -> None:
+        self._interruption_callbacks.append(callback)
 
-    async def _emit_audio_delta(self, delta: AudioDelta) -> None:
-        for cb in self._audio_delta_callbacks:
-            try:
-                await cb(delta)
-            except Exception:  # noqa: BLE001
-                pass
+    def on_metrics(self, callback: MetricsCallback) -> None:
+        self._metrics_callbacks.append(callback)
 
-    async def _emit_state_change(self, new_state: ProviderState) -> None:
-        old_state = self._state
-        self._state = new_state
-        if old_state != new_state:
-            for cb in self._state_change_callbacks:
-                try:
-                    await cb(new_state)
-                except Exception:  # noqa: BLE001
-                    pass
+    def on_tool_call(self, callback: ToolCallCallback) -> None:
+        self._tool_callbacks.append(callback)
+
+    async def _emit_audio(self, event: AudioDelta) -> None:
+        for callback in self._audio_callbacks:
+            await callback(event)
+
+    async def _emit_state(self, state: ProviderState) -> None:
+        if state == self._state:
+            return
+        self._state = state
+        for callback in self._state_callbacks:
+            await callback(state)
 
     async def _emit_transcript(self, event: TranscriptEvent) -> None:
-        for cb in self._transcript_callbacks:
-            try:
-                await cb(event)
-            except Exception:  # noqa: BLE001
-                pass
+        for callback in self._transcript_callbacks:
+            await callback(event)
 
     async def _emit_error(self, message: str) -> None:
-        for cb in self._error_callbacks:
-            try:
-                await cb(message)
-            except Exception:  # noqa: BLE001
-                pass
+        for callback in self._error_callbacks:
+            await callback(message)
 
-    # ------------------------------------------------------------------
-    # 抽象接口
-    # ------------------------------------------------------------------
+    async def _emit_interruption(self, event: InterruptionEvent) -> None:
+        for callback in self._interruption_callbacks:
+            await callback(event)
 
-    @abstractmethod
-    async def connect(self, session_config: dict[str, Any]) -> None:
-        """连接到上游全双工模型。
+    async def _emit_metrics(self, values: dict[str, Any]) -> None:
+        event = ProviderMetrics(dict(values))
+        for callback in self._metrics_callbacks:
+            await callback(event)
 
-        Args:
-            session_config: 会话配置，包含 instructions、voice 等参数
-        """
-        ...
+    async def _emit_tool_call(self, event: ToolCallEvent) -> None:
+        for callback in self._tool_callbacks:
+            await callback(event)
 
     @abstractmethod
-    async def disconnect(self) -> None:
-        """断开连接并清理资源。"""
-        ...
+    async def connect(self, session_config: dict[str, Any]) -> None: ...
 
     @abstractmethod
-    async def send_audio(self, pcm_chunk: bytes) -> None:
-        """发送音频数据到上游模型。
-
-        Args:
-            pcm_chunk: PCM16 原始音频字节
-        """
-        ...
+    async def disconnect(self) -> None: ...
 
     @abstractmethod
-    async def interrupt(self) -> None:
-        """打断当前生成（barge-in）。
+    async def send_audio(self, pcm16: bytes) -> None: ...
 
-        当用户开始说话时调用，停止当前的音频输出。
-        """
-        ...
+    @abstractmethod
+    async def interrupt(self, *, played_audio_ms: int | None = None) -> None: ...
 
     async def send_text(self, text: str) -> None:
-        """发送文本消息到上游模型（可选）。
+        raise NotImplementedError(f"{self.provider_name} does not support text injection")
 
-        某些 Provider 支持文本注入，默认不实现。
-        """
-        del text  # 默认不支持
-
-    async def update_instructions(self, instructions: str) -> None:
-        """动态更新系统指令（可选）。
-
-        某些 Provider 支持运行时更新 instructions。
-        """
-        del instructions  # 默认不支持
+    async def submit_tool_result(self, call_id: str, result: Any) -> None:
+        raise NotImplementedError(f"{self.provider_name} does not support tool results")

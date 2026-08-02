@@ -73,7 +73,8 @@ EventHandlerCallable = Callable[
 class _Subscriber:
     handler: EventHandlerCallable
     priority: int
-    order: int           
+    order: int
+    timeout_seconds: float | None
 
 class EventBus:
     """事件总线，用于发布/订阅模式。
@@ -109,6 +110,7 @@ class EventBus:
         event_name: str,
         handler: EventHandlerCallable,
         priority: int = 0,
+        timeout_seconds: float | None = EVENT_HANDLER_TIMEOUT_SECONDS,
     ) -> Callable[[], None]:
         """订阅事件。
 
@@ -136,6 +138,7 @@ class EventBus:
                 handler=handler,
                 priority=int(priority),
                 order=self._subscribe_order,
+                timeout_seconds=timeout_seconds,
             )
         else:
             # 重复
@@ -143,6 +146,7 @@ class EventBus:
                 handler=handler,
                 priority=int(priority),
                 order=existing.order,
+                timeout_seconds=timeout_seconds,
             )
 
         self._subscribers[event_name][handler] = sub
@@ -363,7 +367,9 @@ class EventBus:
         Raises:
             asyncio.TimeoutError: 处理器超过 ``EVENT_HANDLER_TIMEOUT_SECONDS``。
         """
-        timeout = EVENT_HANDLER_TIMEOUT_SECONDS if EVENT_HANDLER_TIMEOUT_SECONDS > 0 else None
+        timeout = sub.timeout_seconds
+        if timeout is not None and timeout <= 0:
+            timeout = None
 
         if asyncio.iscoroutinefunction(sub.handler):
             result: Any = sub.handler(event_name, params)

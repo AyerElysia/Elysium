@@ -100,6 +100,9 @@ class NapcatAdapter(BaseAdapter):
 
         # Watchdog 状态
         self._last_qq_message_time: float = time.time()
+        # 记录每条 CLOSE-WAIT 连接首次被观察到的时间。不能用“多久没收到
+        # QQ 消息”代替连接本身的存活时间，否则正常的安静时段也会触发清理。
+        self._close_wait_seen_at: dict[tuple[str, int], float] = {}
         self._watchdog_task: asyncio.Task | None = None  # type: ignore[type-arg]
 
     def _get_config(self) -> NapcatAdapterConfig | None:
@@ -301,8 +304,8 @@ class NapcatAdapter(BaseAdapter):
 
     # 检测间隔（秒）
     _WATCHDOG_CHECK_INTERVAL: int = 30
-    # 出现 CLOSE-WAIT 且多久没有收到 QQ 消息才判定为卡死（秒）
-    _CLOSE_WAIT_SILENCE_THRESHOLD: int = 90
+    # 同一条 CLOSE-WAIT 连接持续多久才允许清理（秒）
+    _CLOSE_WAIT_PERSISTENCE_THRESHOLD: int = 90
     # 无消息多久输出一条 WARNING（无 CLOSE-WAIT 时，仅告警不干预）
     _SILENCE_WARN_THRESHOLD: int = 600
 
@@ -357,35 +360,52 @@ class NapcatAdapter(BaseAdapter):
         # 2. 查该 PID 的 CLOSE-WAIT 外部连接
         close_wait_sockets = await self._get_close_wait_sockets(napcat_pid)
 
+        # 只有同一条 CLOSE-WAIT 连接持续存在足够长时间才处理。QQ 长时间
+        # 没有新消息是正常情况，不能作为强制断连接的依据。
+        current_sockets = set(close_wait_sockets)
+        self._close_wait_seen_at = {
+            socket: self._close_wait_seen_at.get(socket, now)
+            for socket in current_sockets
+        }
+        stale_sockets = [
+            socket
+            for socket in close_wait_sockets
+            if now - self._close_wait_seen_at[socket] >= self._CLOSE_WAIT_PERSISTENCE_THRESHOLD
+        ]
+
         if close_wait_sockets:
-            logger.warning(
+            # CLOSE-WAIT 本身是常见的 TCP 收尾状态，普通观察不应污染 INFO 日志。
+            logger.debug(
                 f"[NapCat Watchdog] 检测到 NapCat(pid={napcat_pid}) "
                 f"CLOSE-WAIT 连接 {len(close_wait_sockets)} 条，"
                 f"QQ 消息已静默 {silence_secs:.0f}s"
             )
-            for sock in close_wait_sockets:
-                logger.warning(f"[NapCat Watchdog]   CLOSE-WAIT: {sock}")
+            for sock, fd_num in close_wait_sockets:
+                age = now - self._close_wait_seen_at[(sock, fd_num)]
+                logger.debug(f"[NapCat Watchdog]   CLOSE-WAIT: {sock} fd={fd_num} 持续 {age:.0f}s")
 
-            if silence_secs >= self._CLOSE_WAIT_SILENCE_THRESHOLD:
-                # 静默超过阈值 → 确认卡死，强制关闭僵尸 socket
-                logger.error(
-                    f"[NapCat Watchdog] ⚠️ 静默 {silence_secs:.0f}s ≥ 阈值 "
-                    f"{self._CLOSE_WAIT_SILENCE_THRESHOLD}s，执行 ss -K 强制关闭僵尸连接..."
-                )
-                killed = await self._kill_close_wait_sockets(close_wait_sockets)
-                logger.error(
-                    f"[NapCat Watchdog] ss -K 完成，已强制关闭 {killed} 条僵尸连接。"
-                    f"NapCat 应会自动重连腾讯服务器。"
-                )
-            else:
-                logger.warning(
-                    f"[NapCat Watchdog] CLOSE-WAIT 存在，但静默仅 {silence_secs:.0f}s < "
-                    f"{self._CLOSE_WAIT_SILENCE_THRESHOLD}s，暂不干预，继续观察..."
-                )
+            if stale_sockets:
+                # 只关闭已确认持续存在的 CLOSE-WAIT fd，不能把 NapCat 的其余
+                # WebSocket、登录态和 API 连接一并关掉。
+                killed = await self._kill_close_wait_sockets(stale_sockets)
+                for socket in stale_sockets:
+                    self._close_wait_seen_at.pop(socket, None)
+                if killed:
+                    logger.info(
+                        f"[NapCat Watchdog] 已清理 {killed}/{len(stale_sockets)} 条持续 "
+                        f"{self._CLOSE_WAIT_PERSISTENCE_THRESHOLD}s 的目标连接，"
+                        f"未影响 NapCat WebSocket"
+                    )
+                else:
+                    logger.warning(
+                        f"[NapCat Watchdog] CLOSE-WAIT 目标连接清理失败 "
+                        f"(目标 {len(stale_sockets)} 条)"
+                    )
         else:
+            self._close_wait_seen_at.clear()
             # 无 CLOSE-WAIT，但长时间无消息也记录一下（可能是正常的安静时段）
             if silence_secs > self._SILENCE_WARN_THRESHOLD:
-                logger.info(
+                logger.debug(
                     f"[NapCat Watchdog] QQ 消息已静默 {silence_secs:.0f}s，"
                     f"NapCat(pid={napcat_pid}) 无 CLOSE-WAIT，连接状态正常（可能只是没有新消息）"
                 )
@@ -424,10 +444,11 @@ class NapcatAdapter(BaseAdapter):
             logger.debug(f"[NapCat Watchdog] _find_napcat_pid 异常: {exc}")
         return None
 
-    async def _get_close_wait_sockets(self, pid: int) -> list[str]:
+    async def _get_close_wait_sockets(self, pid: int) -> list[tuple[str, int]]:
         """获取指定 PID 进程所有处于 CLOSE-WAIT 状态的外部连接地址对。
 
-        返回格式：["local_addr remote_addr", ...]，过滤掉本地回环连接。
+        返回格式：[("local_addr -> remote_addr", fd), ...]，过滤掉本地回环连接。
+        fd 必须从 ss 输出中直接提取，后续 WSL2 清理时只能操作这个 fd。
         """
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -438,19 +459,26 @@ class NapcatAdapter(BaseAdapter):
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
             output = stdout.decode(errors="replace")
 
-            results: list[str] = []
+            results: list[tuple[str, int]] = []
             for line in output.splitlines():
-                if f"pid={pid}" not in line:
+                pid_match = re.search(r"(?:^|[,=(])pid=(\d+)(?:[,)]|$)", line)
+                fd_match = re.search(r"(?:^|[,=(])fd=(\d+)(?:[,)]|$)", line)
+                if not pid_match or int(pid_match.group(1)) != pid or not fd_match:
                     continue
-                # 过滤本地回环（127.x.x.x）
-                if "127.0.0.1" in line:
-                    continue
-                # 提取本地地址和远端地址（ss 输出：State Recv-Q Send-Q Local Remote users）
+                # ss 在带 state 过滤时可能省略 State 列，因此不要依赖固定下标；
+                # users: 总在地址列之后，按它反向定位 local/remote。
                 parts = line.split()
-                if len(parts) >= 5:
-                    local_addr = parts[3]
-                    remote_addr = parts[4]
-                    results.append(f"{local_addr} -> {remote_addr}")
+                process_index = next(
+                    (index for index, part in enumerate(parts) if part.startswith("users:")),
+                    None,
+                )
+                if process_index is not None and process_index >= 2:
+                    local_addr = parts[process_index - 2]
+                    remote_addr = parts[process_index - 1]
+                    # 过滤本地回环连接。
+                    if local_addr.startswith(("127.", "::1", "[::1]")):
+                        continue
+                    results.append((f"{local_addr} -> {remote_addr}", int(fd_match.group(1))))
             return results
         except asyncio.TimeoutError:
             logger.debug("[NapCat Watchdog] _get_close_wait_sockets 超时")
@@ -458,7 +486,7 @@ class NapcatAdapter(BaseAdapter):
             logger.debug(f"[NapCat Watchdog] _get_close_wait_sockets 异常: {exc}")
         return []
 
-    async def _kill_close_wait_sockets(self, socket_pairs: list[str]) -> int:
+    async def _kill_close_wait_sockets(self, socket_pairs: list[tuple[str, int]]) -> int:
         """对每条 CLOSE-WAIT 连接强制关闭（WSL2 用 pidfd_getfd + shutdown，原生 Linux 用 ss -K）。
 
         返回成功处理的连接数。
@@ -486,7 +514,7 @@ class NapcatAdapter(BaseAdapter):
         except Exception:
             return False
 
-    async def _kill_close_wait_wsl2(self, socket_pairs: list[str]) -> int:
+    async def _kill_close_wait_wsl2(self, socket_pairs: list[tuple[str, int]]) -> int:
         """WSL2 环境：通过 pidfd_getfd + shutdown() syscall 关闭 CLOSE-WAIT socket。"""
         killed = 0
         napcat_pid = await self._find_napcat_pid(self._ws_port())
@@ -494,7 +522,7 @@ class NapcatAdapter(BaseAdapter):
             logger.warning("[NapCat Watchdog] 无法找到 NapCat PID，跳过 socket 清理")
             return 0
 
-        # 获取 NapCat 所有打开的 fd
+        # 只取 ss 明确标记为 CLOSE-WAIT 的 fd，绝不能返回 NapCat 的全部 socket。
         napcat_fds = await self._get_napcat_socket_fds(napcat_pid, socket_pairs)
 
         for fd_num in napcat_fds:
@@ -510,35 +538,16 @@ class NapcatAdapter(BaseAdapter):
 
         return killed
 
-    async def _get_napcat_socket_fds(self, pid: int, socket_pairs: list[str]) -> list[int]:
-        """获取 NapCat 进程中匹配 socket_pairs 的文件描述符编号。"""
-        fds = []
-        try:
-            # 读取 /proc/<pid>/fd 目录，找出指向 socket 的 fd
-            proc = await asyncio.create_subprocess_exec(
-                "ls", "-l", f"/proc/{pid}/fd",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3.0)
-            lines = stdout.decode(errors="replace").splitlines()
+    async def _get_napcat_socket_fds(self, pid: int, socket_pairs: list[tuple[str, int]]) -> list[int]:
+        """获取 ss 明确标记的 CLOSE-WAIT fd。
 
-            for line in lines:
-                if "socket:" in line:
-                    # 格式: "lrwx------ 1 root root 64 ... 163 -> socket:[28604165]"
-                    parts = line.split()
-                    if len(parts) >= 9:
-                        fd_str = parts[8]  # fd number 在箭头前
-                        if fd_str.isdigit():
-                            fds.append(int(fd_str))
-        except Exception as exc:
-            logger.debug(f"[NapCat Watchdog] 获取 NapCat socket fds 失败: {exc}")
-
-        # socket_pairs 包含地址信息，但 /proc/pid/fd 只有 inode
-        # 简化：返回所有 socket fd，由 shutdown 操作判断是否生效
-        # 更精确的做法需要解析 /proc/pid/net/tcp 匹配 inode，但过于复杂
-        # CLOSE-WAIT 状态的 socket 在 shutdown 后会立即失效，不影响正常连接
-        return fds
+        ``pid`` 保留在签名中用于调用方语义和日志关联；fd 已由
+        ``_get_close_wait_sockets`` 按同一个 PID 从 ``ss -tnp`` 提取。
+        这里禁止回退到扫描 NapCat 的全部 socket，否则一次清理会误伤
+        WebSocket 和其他正常连接。
+        """
+        del pid
+        return sorted({fd_num for _pair, fd_num in socket_pairs})
 
     async def _shutdown_socket_via_pidfd(self, pid: int, fd: int) -> bool:
         """通过 pidfd_getfd syscall 借用目标进程的 fd，执行 shutdown(SHUT_RDWR)。"""
@@ -576,10 +585,10 @@ sys.exit(0 if ret == 0 else 3)
             logger.warning(f"[NapCat Watchdog] pidfd_getfd shutdown exception: {exc}")
             return False
 
-    async def _kill_close_wait_native(self, socket_pairs: list[str]) -> int:
+    async def _kill_close_wait_native(self, socket_pairs: list[tuple[str, int]]) -> int:
         """原生 Linux：使用 ss -K 命令关闭 CLOSE-WAIT socket。"""
         killed = 0
-        for pair in socket_pairs:
+        for pair, _fd_num in socket_pairs:
             # pair 格式: "172.26.x.x:44472 -> 198.18.x.x:443"
             try:
                 parts = pair.replace(" -> ", " ").split()

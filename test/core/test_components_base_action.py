@@ -244,21 +244,15 @@ class TestBaseAction:
         mock_model_config.get_task.return_value = mock_task
         mock_get_config.return_value = mock_model_config
 
-        async def timeout_send(*args, **kwargs):
-            await asyncio.sleep(0.1)
-            return "yes"
-
         mock_request_instance = MagicMock()
-        mock_request_instance.send = timeout_send
+        mock_request_instance.send = AsyncMock(side_effect=asyncio.TimeoutError())
         mock_llm_request.return_value = mock_request_instance
 
         action = ConcreteAction(mock_chat_stream, mock_plugin)
 
-        # 设置很小的超时以触发超时
-        with patch("asyncio.wait_for", side_effect=asyncio.TimeoutError()):
-            result = asyncio.run(action._llm_judge_activation("测试提示"))
-            # 超时时应该默认激活
-            assert result is True
+        result = asyncio.run(action._llm_judge_activation("测试提示"))
+        # 超时时应该默认激活
+        assert result is True
 
     @patch("src.core.transport.message_send.get_message_sender")
     def test_send_to_stream_with_string(self, mock_get_sender, mock_chat_stream, mock_plugin):

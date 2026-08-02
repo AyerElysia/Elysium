@@ -322,26 +322,31 @@ async def increment_access(
     now = time.time()
 
     def _do_db_work() -> Optional[tuple]:
-        cursor = db.cursor()
-        cursor.execute(
-            """
-            UPDATE memory_nodes
-            SET access_count = access_count + 1,
-                last_accessed_at = ?,
-                activation_strength = MIN(1.0, activation_strength + 0.1)
-            WHERE node_id = ?
-            """,
-            (now, node_id),
-        )
-        db.commit()
-        cursor.execute(
-            "SELECT activation_strength, access_count, last_accessed_at FROM memory_nodes WHERE node_id = ?",
-            (node_id,),
-        )
-        row = cursor.fetchone()
-        if row:
-            return (float(row["activation_strength"] or 0.0), int(row["access_count"] or 0), row["last_accessed_at"])
-        return None
+        from .indexing import transaction
+
+        with transaction(db, immediate=True) as cursor:
+            cursor.execute(
+                """
+                UPDATE memory_nodes
+                SET access_count = access_count + 1,
+                    last_accessed_at = ?,
+                    activation_strength = MIN(1.0, activation_strength + 0.1)
+                WHERE node_id = ?
+                """,
+                (now, node_id),
+            )
+            cursor.execute(
+                "SELECT activation_strength, access_count, last_accessed_at FROM memory_nodes WHERE node_id = ?",
+                (node_id,),
+            )
+            row = cursor.fetchone()
+            if row:
+                return (
+                    float(row["activation_strength"] or 0.0),
+                    int(row["access_count"] or 0),
+                    row["last_accessed_at"],
+                )
+            return None
 
     row_data = await run_db(_do_db_work)
     if row_data and emit_visual_event:

@@ -74,6 +74,67 @@ async def test_start_stream_loop_registers_watchdog_with_exact_thresholds(monkey
             await task
 
 
+async def test_finished_stream_task_releases_all_runtime_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """自然退出的流任务不能遗留锁、WatchDog 注册或活跃统计。"""
+    manager = StreamLoopManager()
+    stream_id = "stream_natural_exit"
+    finished = asyncio.Event()
+    context = SimpleNamespace(stream_loop_task=None)
+    manager._get_stream_context = AsyncMock(return_value=context)
+
+    async def dummy_runner(_stream_id: str, _manager: StreamLoopManager) -> None:
+        finished.set()
+
+    monkeypatch.setattr(
+        "src.core.transport.distribution.loop.run_chat_stream",
+        dummy_runner,
+    )
+    monkeypatch.setattr(
+        "src.core.config.get_core_config",
+        lambda: SimpleNamespace(
+            bot=SimpleNamespace(
+                tick_interval=1.0,
+                stream_warning_threshold=5.0,
+                stream_restart_threshold=10.0,
+            )
+        ),
+    )
+    unregister_stream = MagicMock()
+    fake_watchdog = SimpleNamespace(
+        register_stream=MagicMock(),
+        unregister_stream=unregister_stream,
+    )
+
+    class FakeTaskInfo:
+        def __init__(self, task: asyncio.Task[None]) -> None:
+            self.task = task
+
+    class FakeTaskManager:
+        def create_task(self, coro, **_kwargs):
+            return FakeTaskInfo(asyncio.create_task(coro))
+
+    monkeypatch.setattr(
+        "src.kernel.concurrency.get_watchdog",
+        lambda: fake_watchdog,
+    )
+    monkeypatch.setattr(
+        "src.kernel.concurrency.get_task_manager",
+        lambda: FakeTaskManager(),
+    )
+
+    assert await manager.start_stream_loop(stream_id) is True
+    await asyncio.wait_for(finished.wait(), timeout=1.0)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert manager.get_stats()["active_streams"] == 0
+    assert stream_id not in manager._active_stream_tasks
+    assert stream_id not in manager._stream_start_locks
+    unregister_stream.assert_called_with(stream_id)
+
+
 async def test_run_chat_stream_unregisters_watchdog_on_exit(monkeypatch: pytest.MonkeyPatch) -> None:
     """流驱动器退出时应注销 WatchDog 心跳注册。"""
     stream_id = "stream_unregister_on_exit"

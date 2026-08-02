@@ -400,7 +400,7 @@ class LifeEngineWebSearchTool(BaseTool):
         "- ✗ 想回忆自己写过的内容 → 用 nucleus_search_memory / nucleus_grep_file\n\n"
         "**注意：** 这是外部网络信息，可能有偏差，关键事实请交叉核验。"
     )
-    chatter_allow: list[str] = ["life_engine_internal", "life_chatter"]
+    chatter_allow: list[str] = ["life_engine_internal", "default_chatter", "life_chatter"]
 
     async def execute(
         self,
@@ -526,7 +526,7 @@ class LifeEngineBrowserFetchTool(BaseTool):
         "- ✗ 本地文件不是网页，但本工具也兼容 workspace 内的本地路径读取\n\n"
         "**安全约束：** 公开网页仅允许 http/https；本地路径仅允许 workspace 内文件。"
     )
-    chatter_allow: list[str] = ["life_engine_internal", "life_chatter"]
+    chatter_allow: list[str] = ["life_engine_internal", "default_chatter", "life_chatter"]
 
     async def execute(
         self,
@@ -685,7 +685,7 @@ class LifeEngineBatchFetchTool(BaseTool):
         "- 研究型任务需要广泛阅读\n\n"
         "**注意：** 每个 URL 的正文会被截断到 max_chars_per_url。"
     )
-    chatter_allow: list[str] = ["life_engine_internal", "life_chatter"]
+    chatter_allow: list[str] = ["life_engine_internal", "default_chatter", "life_chatter"]
 
     async def execute(
         self,
@@ -787,7 +787,7 @@ class LifeEngineDeepResearchTool(BaseTool):
         "**注意：** 本工具只收集和结构化原始材料，不做 LLM 综合。"
         "综合结论由你（调用者）基于返回的材料自行判断。"
     )
-    chatter_allow: list[str] = ["life_engine_internal", "life_chatter"]
+    chatter_allow: list[str] = ["life_engine_internal", "default_chatter", "life_chatter"]
 
     async def execute(
         self,
@@ -927,7 +927,7 @@ class NucleusWebTool(BaseTool):
         "典型流程：search → 看到感兴趣的结果 → fetch/batch 读取正文。\n"
         "复杂调研直接用 research（自动搜索 + 提取 + 去重）。"
     )
-    chatter_allow: list[str] = ["life_engine_internal", "life_chatter"]
+    chatter_allow: list[str] = ["life_engine_internal", "default_chatter", "life_chatter"]
 
     async def execute(
         self,

@@ -26,7 +26,8 @@ from src.core.components.types import ComponentType, ChatType
 # 测试用 Action 类
 class TestAction(BaseAction):
     """测试 Action 类。"""
-    
+
+    __test__ = False
     signature = "test_plugin:action:test_action"
     description = "Test action"
     supported_chat_types = [ChatType.ALL]
@@ -147,7 +148,7 @@ class TestActionManagerGetActionsForChat:
         """测试获取 ALL 类型的 Action。"""
         manager = ActionManager()
         
-        TestAction.supported_chat_types = [ChatType.ALL]
+        TestAction.chat_type = ChatType.ALL
         actions = {
             "test_plugin:action:test": TestAction,
         }
@@ -170,7 +171,7 @@ class TestActionManagerGetActionsForChat:
         """测试获取特定聊天类型的 Action。"""
         manager = ActionManager()
         
-        TestAction.supported_chat_types = [ChatType.GROUP]
+        TestAction.chat_type = ChatType.GROUP
         actions = {
             "test_plugin:action:test": TestAction,
         }
@@ -292,8 +293,9 @@ class TestActionManagerGetActionSchemas:
         manager = ActionManager()
         
         actions = [TestAction, TestAction]
-        
-        with patch.object(manager, 'get_action_schema') as mock_get_schema:
+
+        with patch.object(manager, 'get_actions_for_chat', return_value=actions), \
+             patch.object(manager, 'get_action_schema') as mock_get_schema:
             mock_get_schema.side_effect = [
                 {"name": "schema1"},
                 {"name": "schema2"},

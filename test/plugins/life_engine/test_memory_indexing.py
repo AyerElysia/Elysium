@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import threading
 from pathlib import Path
@@ -19,7 +20,7 @@ from plugins.life_engine.memory.indexing import (
     upsert_document_rows,
     write_active_chunk_index_state,
 )
-from plugins.life_engine.memory.nodes import generate_file_node_id
+from plugins.life_engine.memory.nodes import generate_file_node_id, increment_access
 
 
 def _db(tmp_path: Path) -> sqlite3.Connection:
@@ -332,3 +333,64 @@ def test_apply_decay_rollback_does_not_erase_concurrent_upsert_document(
         ("notes/new.md",),
     ).fetchone()
     assert row is not None
+
+
+async def test_increment_access_cannot_commit_another_threads_transaction(
+    tmp_path: Path,
+) -> None:
+    """Access accounting must wait for ownership of the shared writer."""
+    db = sqlite3.connect(
+        str(tmp_path / "access-vs-rollback.db"),
+        check_same_thread=False,
+    )
+    db.row_factory = sqlite3.Row
+    db.execute(
+        "CREATE TABLE memory_fts (node_id TEXT, title TEXT, content TEXT)"
+    )
+    create_memory_schema(db, now=100.0)
+    indexed = upsert_document_rows(
+        db,
+        "notes/access.md",
+        "baseline",
+        title="original",
+        now=100.0,
+    )
+
+    transaction_entered = threading.Event()
+    allow_rollback = threading.Event()
+    errors: list[BaseException] = []
+
+    def rollback_title_change() -> None:
+        try:
+            with transaction(db):
+                db.execute(
+                    "UPDATE memory_nodes SET title = 'must rollback' WHERE node_id = ?",
+                    (indexed.node_id,),
+                )
+                transaction_entered.set()
+                assert allow_rollback.wait(timeout=5.0)
+                raise _ExpectedRollback("expected rollback")
+        except _ExpectedRollback:
+            return
+        except BaseException as exc:  # pragma: no cover - thread assertion aid
+            errors.append(exc)
+
+    owner = threading.Thread(target=rollback_title_change)
+    owner.start()
+    assert transaction_entered.wait(timeout=5.0)
+
+    access_task = asyncio.create_task(increment_access(db, indexed.node_id))
+    await asyncio.sleep(0.05)
+    assert not access_task.done()
+    allow_rollback.set()
+    await access_task
+    owner.join(timeout=5.0)
+
+    assert not owner.is_alive()
+    assert errors == []
+    row = db.execute(
+        "SELECT title, access_count FROM memory_nodes WHERE node_id = ?",
+        (indexed.node_id,),
+    ).fetchone()
+    assert row["title"] == "original"
+    assert row["access_count"] == 1

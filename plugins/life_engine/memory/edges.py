@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import math
 import sqlite3
-import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -18,6 +17,7 @@ from typing import Any, Dict, List, Optional
 from src.app.plugin_system.api import log_api
 
 from .eligibility import assess_document_path
+from .indexing import _TRANSACTION_LOCK
 from .sqlite_runtime import run_db
 
 logger = log_api.get_logger("life_engine.memory.edges")
@@ -126,7 +126,10 @@ def row_to_edge(row: sqlite3.Row) -> MemoryEdge:
 # ============================================================
 
 
-_EDGE_WRITE_LOCK = threading.RLock()
+# Every write through the shared ``check_same_thread=False`` connection must
+# use one transaction-ownership lock.  A separate edge lock allows an edge
+# savepoint to become nested under another thread's root transaction.
+_EDGE_WRITE_LOCK = _TRANSACTION_LOCK
 
 
 def _validate_strength(value: float, *, name: str = "strength") -> float:

@@ -229,7 +229,6 @@ def _make_tool_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[LifeEngineManageThoughtStreamTool, list[dict], SimpleNamespace]:
     from plugins.life_engine.curiosity.engine import CuriosityEngine, CuriositySignal
-    from plugins.life_engine.neuromod.engine import InnerStateEngine
 
     captured: list[dict] = []
     curiosity_engine = CuriosityEngine(workspace_path=str(tmp_path))
@@ -240,7 +239,6 @@ def _make_tool_env(
     )
     fake_service = SimpleNamespace(
         _thought_manager=ThoughtStreamManager(workspace_path=str(tmp_path)),
-        _inner_state=InnerStateEngine(),
         _get_curiosity_engine=lambda: curiosity_engine,
         _record_life_moment=lambda **kwargs: captured.append(kwargs),
     )

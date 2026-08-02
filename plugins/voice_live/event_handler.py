@@ -97,9 +97,7 @@ class VoiceLiveEventHandler(BaseEventHandler):
         # 通知所有活跃会话停止
         router = self._get_router()
         if router:
-            for session_id, session in list(router._sessions.items()):
-                await session.stop()
-                router._sessions.pop(session_id, None)
+            await router.stop_all(reason="event_command")
 
         # 发布事件
         try:
@@ -114,7 +112,7 @@ class VoiceLiveEventHandler(BaseEventHandler):
     async def _report_status(self, params: dict[str, Any]) -> None:
         """报告通话状态。"""
         router = self._get_router()
-        active_count = len(router._sessions) if router else 0
+        active_count = router.active_session_count if router else 0
         logger.info(f"语音通话状态: {active_count} 个活跃会话")
 
     def _get_router(self) -> Any:

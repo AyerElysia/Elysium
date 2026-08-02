@@ -69,6 +69,30 @@ def test_workspace_path_override_works_with_path_input(tmp_path: Path) -> None:
     assert db_path == tmp_path / ".memory" / "memory.db"
 
 
+async def test_initialize_skips_chroma_when_vector_backend_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A disabled vector backend must not enter native Chroma code."""
+    service = LifeMemoryService(tmp_path, vector_backend_enabled=False)
+
+    async def fail_if_called() -> Any:
+        raise AssertionError("Chroma must not initialize while disabled")
+
+    monkeypatch.setattr(service, "_get_chroma_collection", fail_if_called)
+
+    await service.initialize()
+    try:
+        assert service._initialized is True
+        assert service._chroma_collection is None
+        results = await service.search_memory(
+            "anything",
+            return_bundles=False,
+        )
+        assert results == []
+    finally:
+        await service.close()
+
+
 def test_migrate_file_path_keeps_edges_and_fts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -8,6 +8,7 @@ src.core.components.loader.PluginLoader 负责。
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import inspect
 import shutil
@@ -52,6 +53,7 @@ class PluginManager:
         self._plugin_paths: dict[str, str] = {}
         self._failed_plugins: dict[str, str] = {}
         self._archive_tmpdirs: dict[str, str] = {}  # 压缩包插件解压临时目录
+        self._lifecycle_lock = asyncio.Lock()
 
         logger.info("插件管理器初始化完成")
 
@@ -59,6 +61,18 @@ class PluginManager:
         self, plugin_path: str, manifest: PluginManifest
     ) -> bool:
         """加载单个插件（manifest 已由 loader 宏观层校验并提供）。"""
+        async with self._lifecycle_lock:
+            return await self._load_plugin_from_manifest_unlocked(
+                plugin_path,
+                manifest,
+            )
+
+    async def _load_plugin_from_manifest_unlocked(
+        self,
+        plugin_path: str,
+        manifest: PluginManifest,
+    ) -> bool:
+        """在生命周期锁内执行插件加载事务。"""
         plugin_name = manifest.name
 
         # 1. 检查是否已加载
@@ -75,6 +89,7 @@ class PluginManager:
         if not plugin_module:
             error_msg = "插件模块加载失败"
             self._failed_plugins[plugin_name] = error_msg
+            await self._rollback_failed_load(plugin_name, plugin_path)
             return False
 
         # 3. 查找 @register_plugin 注册的插件类
@@ -85,75 +100,78 @@ class PluginManager:
             error_msg = "插件类未注册（未使用 @register_plugin 装饰器）"
             self._failed_plugins[plugin_name] = error_msg
             logger.error(f"插件 '{plugin_name}' 加载失败: {error_msg}")
+            await self._rollback_failed_load(plugin_name, plugin_path)
             return False
 
-        # 4. 通过插件类属性 configs 加载配置
-        from src.core.components.base.config import BaseConfig
-        from src.core.managers.config_manager import get_config_manager
-
-        config_instance = None
-        has_config = False
-        config_classes = plugin_class.configs  # type: ignore[attr-defined]
-
-        if not isinstance(config_classes, list):
-            logger.warning(
-                f"插件 '{plugin_name}' 的 configs 不是 list 类型，将忽略并继续兼容旧逻辑"
-            )
-            config_classes = []
-
-        for config_cls in config_classes:
-            if isinstance(config_cls, type) and issubclass(config_cls, BaseConfig):
-                config_instance = get_config_manager().load_config(plugin_name, config_cls)
-                has_config = True
-                break
-
-        # 5. 实例化插件（注入已加载配置）
+        plugin_instance: BasePlugin | None = None
         try:
+            # 4. 通过插件类属性 configs 加载配置
+            from src.core.components.base.config import BaseConfig
+            from src.core.managers.config_manager import get_config_manager
+
+            config_instance = None
+            has_config = False
+            config_classes = plugin_class.configs  # type: ignore[attr-defined]
+
+            if not isinstance(config_classes, list):
+                logger.warning(
+                    f"插件 '{plugin_name}' 的 configs 不是 list 类型，将忽略并继续兼容旧逻辑"
+                )
+                config_classes = []
+
+            for config_cls in config_classes:
+                if isinstance(config_cls, type) and issubclass(config_cls, BaseConfig):
+                    config_instance = get_config_manager().load_config(
+                        plugin_name,
+                        config_cls,
+                    )
+                    has_config = True
+                    break
+
+            # 5. 实例化插件（注入已加载配置）
             plugin_instance = plugin_class(config=config_instance)  # type: ignore
-        except Exception as e:
-            error_msg = f"插件实例化失败: {e}"
+
+            if not has_config:
+                logger.debug(
+                    f"插件 '{plugin_name}' 未通过类属性 configs 声明配置，使用空配置"
+                )
+
+            # 6. 注册组件到全局注册表
+            await self._register_components(plugin_instance)
+
+            # 7. 生命周期钩子失败意味着插件没有成功启动，必须回滚。
+            await plugin_instance.on_plugin_loaded()
+
+            from src.core.managers.event_manager import get_event_manager
+
+            await get_event_manager().register_plugin_handlers(
+                plugin_name,
+                plugin_instance=plugin_instance,
+            )
+
+            from src.core.components.state_manager import get_global_state_manager
+            from src.core.components.types import build_signature
+
+            await get_global_state_manager().set_state_async(
+                build_signature(plugin_name, ComponentType.PLUGIN, plugin_name),
+                ComponentState.ACTIVE,
+            )
+        except Exception as exc:
+            error_msg = f"插件启动事务失败: {exc}"
             self._failed_plugins[plugin_name] = error_msg
             logger.error(f"插件 '{plugin_name}' 加载失败: {error_msg}")
+            await self._rollback_failed_load(
+                plugin_name,
+                plugin_path,
+                plugin_instance,
+            )
             return False
 
-        if not has_config:
-            logger.debug(f"插件 '{plugin_name}' 未通过类属性 configs 声明配置，使用空配置")
-
-        # 6. 注册组件到全局注册表
-        await self._register_components(plugin_instance)
-
-        # 7. 调用生命周期钩子
-        try:
-            await plugin_instance.on_plugin_loaded()
-        except Exception as e:
-            logger.error(
-                f"调用插件 '{plugin_name}' 的 on_plugin_loaded 钩子时出错: {e}"
-            )
-
-        # 8. 记录并更新状态
+        # 8. 仅在所有启动步骤成功后发布可见状态。
         self._loaded_plugins[plugin_name] = plugin_instance
         self._manifests[plugin_name] = manifest
         self._plugin_paths[plugin_name] = plugin_path
-
-        from src.core.components.state_manager import get_global_state_manager
-        from src.core.components.types import (
-            ComponentState,
-            ComponentType,
-            build_signature,
-        )
-
-        state_manager = get_global_state_manager()
-        await state_manager.set_state_async(
-            build_signature(plugin_name, ComponentType.PLUGIN, plugin_name),
-            ComponentState.ACTIVE,
-        )
-
-        from src.core.managers.event_manager import get_event_manager
-
-        await get_event_manager().register_plugin_handlers(
-            plugin_name,
-            plugin_instance=plugin_instance,
-        )
+        self._failed_plugins.pop(plugin_name, None)
 
         logger.info(f"✅ 插件加载成功: {plugin_name} v{manifest.version}")
         return True
@@ -186,94 +204,163 @@ class PluginManager:
             >>> success = await manager.unload_plugin("my_plugin")
             >>> True
         """
+        async with self._lifecycle_lock:
+            return await self._unload_plugin_unlocked(plugin_name)
+
+    async def _unload_plugin_unlocked(self, plugin_name: str) -> bool:
+        """在生命周期锁内执行尽力而为的完整卸载。"""
         if plugin_name not in self._loaded_plugins:
             logger.warning(f"插件 '{plugin_name}' 未加载")
             return False
 
-        try:
-            plugin = self._loaded_plugins[plugin_name]
+        plugin = self._loaded_plugins[plugin_name]
+        manifest = self._manifests.get(plugin_name)
+        plugin_path = self._plugin_paths.get(plugin_name)
+        cleanup_errors: list[tuple[str, Exception]] = []
 
-            # 调用卸载钩子
+        async def _cleanup_step(name: str, operation) -> None:
             try:
-                await plugin.on_plugin_unloaded()
-            except Exception as e:
+                await operation()
+            except Exception as exc:
+                cleanup_errors.append((name, exc))
                 logger.error(
-                    f"调用插件 '{plugin_name}' 的 on_plugin_unloaded 钩子时出错: {e}"
+                    f"卸载插件 '{plugin_name}' 的 {name} 失败: {exc}"
                 )
 
-            # 触发插件卸载事件
-            from src.core.components.types import EventType
-            from src.kernel.event import get_event_bus
+        await _cleanup_step("卸载钩子", plugin.on_plugin_unloaded)
 
-            manifest = self._manifests.get(plugin_name)
-            try:
-                await get_event_bus().publish(
-                    EventType.ON_PLUGIN_UNLOADED,
-                    {
-                        "plugin_name": plugin_name,
-                        "manifest": manifest,
-                    },
-                )
-            except Exception as event_error:
-                logger.warning(
-                    f"触发 ON_PLUGIN_UNLOADED 事件失败 '{plugin_name}': {event_error}"
-                )
+        from src.core.components.types import EventType, build_signature
+        from src.kernel.event import get_event_bus
 
-            from src.core.components.state_manager import get_global_state_manager
-            from src.core.components.types import (
-                ComponentState,
-                ComponentType,
-                build_signature,
+        try:
+            await get_event_bus().publish(
+                EventType.ON_PLUGIN_UNLOADED,
+                {"plugin_name": plugin_name, "manifest": manifest},
+            )
+        except Exception as event_error:
+            logger.warning(
+                f"触发 ON_PLUGIN_UNLOADED 事件失败 '{plugin_name}': {event_error}"
             )
 
-            # 更新状态
-            state_manager = get_global_state_manager()
-            await state_manager.set_state_async(
+        from src.core.components.state_manager import get_global_state_manager
+
+        state_manager = get_global_state_manager()
+        await _cleanup_step(
+            "插件状态",
+            lambda: state_manager.set_state_async(
                 build_signature(plugin_name, ComponentType.PLUGIN, plugin_name),
                 ComponentState.UNLOADED,
+            ),
+        )
+
+        from src.core.managers.event_manager import get_event_manager
+
+        await _cleanup_step(
+            "事件处理器",
+            lambda: get_event_manager().unregister_plugin_handlers(plugin_name),
+        )
+        await _cleanup_step(
+            "组件注册",
+            lambda: self._unregister_plugin_components(plugin_name),
+        )
+
+        from src.core.components.loader import unregister_plugin
+        from src.core.managers.config_manager import get_config_manager
+
+        unregister_plugin(plugin_name)
+        if plugin_path:
+            self._cleanup_sys_modules(plugin_name, plugin_path)
+            self._cleanup_plugin_import_paths(plugin_name, plugin_path)
+
+        self._loaded_plugins.pop(plugin_name, None)
+        self._manifests.pop(plugin_name, None)
+        self._plugin_paths.pop(plugin_name, None)
+        get_config_manager().remove_config(plugin_name)
+
+        if cleanup_errors:
+            logger.error(
+                f"❌ 插件卸载完成但有 {len(cleanup_errors)} 个清理步骤失败: "
+                f"{plugin_name}"
             )
-
-            from src.core.managers.event_manager import get_event_manager
-
-            await get_event_manager().unregister_plugin_handlers(plugin_name)
-
-            # 从全局注册表中移除该插件的组件
-            await self._unregister_plugin_components(plugin_name)
-
-            # 从插件类注册表中移除插件类
-            from src.core.components.loader import unregister_plugin
-            unregister_plugin(plugin_name)
-
-            # 清理 sys.modules 中的插件模块
-            plugin_path = self._plugin_paths.get(plugin_name)
-            if plugin_path:
-                self._cleanup_sys_modules(plugin_name, plugin_path)
-
-            # 清理压缩包插件的临时目录
-            if plugin_name in self._archive_tmpdirs:
-                tmpdir = self._archive_tmpdirs.pop(plugin_name)
-                try:
-                    shutil.rmtree(tmpdir, ignore_errors=True)
-                except Exception as e:
-                    logger.warning(f"清理临时目录失败 ({tmpdir}): {e}")
-
-            # 移除引用
-            del self._loaded_plugins[plugin_name]
-            if plugin_name in self._manifests:
-                del self._manifests[plugin_name]
-            if plugin_name in self._plugin_paths:
-                del self._plugin_paths[plugin_name]
-
-            from src.core.managers.config_manager import get_config_manager
-
-            get_config_manager().remove_config(plugin_name)
-
-            logger.info(f"✅ 插件卸载成功: {plugin_name}")
-            return True
-
-        except Exception as e:
-            logger.error(f"❌ 插件卸载失败: {plugin_name} - {e}")
             return False
+
+        logger.info(f"✅ 插件卸载成功: {plugin_name}")
+        return True
+
+    async def _rollback_failed_load(
+        self,
+        plugin_name: str,
+        plugin_path: str,
+        plugin_instance: "BasePlugin | None" = None,
+    ) -> None:
+        """回滚插件启动事务留下的全部可见状态和资源。"""
+        from src.core.components.loader import unregister_plugin
+        from src.core.components.state_manager import get_global_state_manager
+        from src.core.components.types import build_signature
+        from src.core.managers.config_manager import get_config_manager
+        from src.core.managers.event_manager import get_event_manager
+
+        async def _cleanup_async(name: str, operation) -> None:
+            try:
+                await operation()
+            except Exception as exc:
+                logger.warning(
+                    f"回滚插件 '{plugin_name}' 的 {name} 失败: {exc}"
+                )
+
+        if plugin_instance is not None:
+            await _cleanup_async("卸载钩子", plugin_instance.on_plugin_unloaded)
+
+        await _cleanup_async(
+            "事件处理器",
+            lambda: get_event_manager().unregister_plugin_handlers(plugin_name),
+        )
+        await _cleanup_async(
+            "组件注册",
+            lambda: self._unregister_plugin_components(plugin_name),
+        )
+
+        plugin_signature = build_signature(
+            plugin_name,
+            ComponentType.PLUGIN,
+            plugin_name,
+        )
+        state_manager = get_global_state_manager()
+        state_manager.remove_state(plugin_signature)
+        state_manager.remove_runtime_data(plugin_signature)
+
+        get_config_manager().remove_config(plugin_name)
+        unregister_plugin(plugin_name)
+        self._cleanup_sys_modules(plugin_name, plugin_path)
+        self._cleanup_plugin_import_paths(plugin_name, plugin_path)
+
+        self._loaded_plugins.pop(plugin_name, None)
+        self._manifests.pop(plugin_name, None)
+        self._plugin_paths.pop(plugin_name, None)
+
+    def _cleanup_plugin_import_paths(
+        self,
+        plugin_name: str,
+        plugin_path: str,
+    ) -> None:
+        """移除插件追加的导入路径并清理压缩包临时目录。"""
+        paths_to_remove: set[str] = set()
+        if plugin_path.endswith((".zip", ".mfp")):
+            tmpdir = self._archive_tmpdirs.pop(plugin_name, None)
+            if tmpdir:
+                tmp_path = Path(tmpdir).resolve()
+                for raw_path in sys.path:
+                    try:
+                        Path(raw_path).resolve().relative_to(tmp_path)
+                    except (OSError, ValueError):
+                        continue
+                    paths_to_remove.add(raw_path)
+                shutil.rmtree(tmpdir, ignore_errors=True)
+        else:
+            paths_to_remove.add(str(Path(plugin_path).parent))
+
+        if paths_to_remove:
+            sys.path[:] = [path for path in sys.path if path not in paths_to_remove]
 
     def _cleanup_sys_modules(self, plugin_name: str, plugin_path: str) -> None:
         """从 sys.modules 中清理插件相关的所有模块。
@@ -363,21 +450,29 @@ class PluginManager:
             >>> success = await manager.reload_plugin("my_plugin")
             >>> True
         """
-        if plugin_name not in self._loaded_plugins:
-            logger.warning(f"插件 '{plugin_name}' 未加载，无法重载")
-            return False
+        async with self._lifecycle_lock:
+            if plugin_name not in self._loaded_plugins:
+                logger.warning(f"插件 '{plugin_name}' 未加载，无法重载")
+                return False
 
-        plugin_path = self._plugin_paths.get(plugin_name)
-        if not plugin_path:
-            logger.error(f"未找到插件 '{plugin_name}' 的路径")
-            return False
+            plugin_path = self._plugin_paths.get(plugin_name)
+            if not plugin_path:
+                logger.error(f"未找到插件 '{plugin_name}' 的路径")
+                return False
 
-        # 卸载
-        if not await self.unload_plugin(plugin_name):
-            return False
+            from src.core.components.loader import load_manifest
 
-        # 重新加载
-        return await self.load_plugin(plugin_path)
+            manifest = await load_manifest(plugin_path)
+            if manifest is None:
+                logger.error(f"插件 '{plugin_name}' 的 manifest 校验失败，取消重载")
+                return False
+
+            unload_success = await self._unload_plugin_unlocked(plugin_name)
+            load_success = await self._load_plugin_from_manifest_unlocked(
+                plugin_path,
+                manifest,
+            )
+            return unload_success and load_success
 
     def get_plugin(self, plugin_name: str) -> "BasePlugin | None":
         """获取插件实例。
@@ -515,6 +610,7 @@ class PluginManager:
         try:
             # 创建持久化临时目录（不使用 with 块，避免提前删除）
             tmpdir = tempfile.mkdtemp(prefix=f"mofox_plugin_{manifest.name}_")
+            self._archive_tmpdirs[manifest.name] = tmpdir
 
             with zipfile.ZipFile(archive_path, "r") as zf:
                 zf.extractall(tmpdir)
@@ -569,9 +665,6 @@ class PluginManager:
 
                 sys.modules[module_name] = module
                 spec.loader.exec_module(module)
-
-                # 记录临时目录路径，供后续卸载时清理
-                self._archive_tmpdirs[manifest.name] = tmpdir
 
                 return module
             except Exception:
@@ -695,6 +788,7 @@ class PluginManager:
                     normalized_components.append(config_cls)
 
         plugin_name = plugin_instance.plugin_name
+        registration_errors: list[tuple[str, Exception]] = []
 
         logger.debug(f"开始注册插件 '{plugin_name}' 的 {len(normalized_components)} 个组件")
 
@@ -753,7 +847,16 @@ class PluginManager:
 
             except Exception as e:
                 logger.error(f"注册组件 '{signature}' 失败: {e}")
+                if signature in registry:
+                    registry.unregister(signature)
+                state_manager.remove_state(signature)
+                state_manager.remove_runtime_data(signature)
+                registration_errors.append((signature, e))
                 continue
+
+        if registration_errors:
+            failed = ", ".join(signature for signature, _ in registration_errors)
+            raise RuntimeError(f"组件注册事务失败: {failed}")
 
         logger.info(f"✅ 插件 '{plugin_name}' 的组件注册完成")
 

@@ -17,9 +17,8 @@ from src.kernel.llm.exceptions import (
 from src.kernel.llm.model_client.base import StreamEvent
 from src.kernel.llm.model_client.registry import ModelClientRegistry
 from src.kernel.llm.monitor import get_global_collector
-from src.kernel.llm.payload import Image, LLMPayload, Text, ToolResult
+from src.kernel.llm.payload import Image, LLMPayload, LLMUsable, Text, ToolResult
 from src.kernel.llm.policy import (
-    LoadBalancedPolicy,
     RoundRobinPolicy,
     create_default_policy,
     create_policy,
@@ -54,7 +53,7 @@ class MockChatClient:
         *,
         model_name: str,
         payloads: list[LLMPayload],
-        tools: list[Tool],
+        tools: list[LLMUsable],
         request_name: str,
         model_set: Any,
         stream: bool,
@@ -325,6 +324,8 @@ class TestValidateModelEntry:
         }
         result = _validate_model_entry(model)
         assert result == model
+        assert "sk-test" not in repr(result)
+        assert "<redacted>" in repr(result)
 
     def test_missing_required_fields(self) -> None:
         """Test validation with missing required fields."""

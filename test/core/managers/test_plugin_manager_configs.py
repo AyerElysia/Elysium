@@ -156,6 +156,69 @@ async def test_load_plugin_does_not_fallback_to_get_components_config(
     assert loaded.config is None
 
 
+async def test_load_hook_failure_rolls_back_all_plugin_state(monkeypatch) -> None:
+    """启动钩子失败的插件不能以成功或半加载状态留在框架中。"""
+
+    class FailingStartupPlugin(BasePlugin):
+        plugin_name = "failing_startup_plugin"
+        unloaded_calls = 0
+
+        def get_components(self) -> list[type]:
+            return []
+
+        async def on_plugin_loaded(self) -> None:
+            raise RuntimeError("startup failed")
+
+        async def on_plugin_unloaded(self) -> None:
+            type(self).unloaded_calls += 1
+
+    manager = PluginManager()
+    manifest = PluginManifest(
+        name="failing_startup_plugin",
+        version="1.0.0",
+        description="test",
+        author="test",
+    )
+    monkeypatch.setattr(manager, "_load_from_folder", AsyncMock(return_value=object()))
+    monkeypatch.setattr(manager, "_register_components", AsyncMock())
+    monkeypatch.setattr(manager, "_unregister_plugin_components", AsyncMock())
+    monkeypatch.setattr(manager, "_cleanup_sys_modules", MagicMock())
+    monkeypatch.setattr(manager, "_cleanup_plugin_import_paths", MagicMock())
+    monkeypatch.setattr(
+        "src.core.components.loader.get_plugin_class",
+        lambda _name: FailingStartupPlugin,
+    )
+    unregister_plugin = MagicMock()
+    monkeypatch.setattr(
+        "src.core.components.loader.unregister_plugin",
+        unregister_plugin,
+    )
+    config_manager = MagicMock()
+    monkeypatch.setattr(
+        "src.core.managers.config_manager.get_config_manager",
+        lambda: config_manager,
+    )
+    event_manager = MagicMock(unregister_plugin_handlers=AsyncMock())
+    monkeypatch.setattr(
+        "src.core.managers.event_manager.get_event_manager",
+        lambda: event_manager,
+    )
+
+    success = await manager.load_plugin_from_manifest("fake/path", manifest)
+
+    assert success is False
+    assert manager.get_plugin("failing_startup_plugin") is None
+    assert FailingStartupPlugin.unloaded_calls == 1
+    manager._unregister_plugin_components.assert_awaited_once_with(
+        "failing_startup_plugin"
+    )
+    event_manager.unregister_plugin_handlers.assert_awaited_once_with(
+        "failing_startup_plugin"
+    )
+    config_manager.remove_config.assert_called_once_with("failing_startup_plugin")
+    unregister_plugin.assert_called_once_with("failing_startup_plugin")
+
+
 async def test_register_components_ignores_config_from_get_components() -> None:
     """get_components 返回的 Config 组件应被忽略，不应注册。"""
 
@@ -245,18 +308,37 @@ async def test_reload_plugin_orders_unload_cache_removal_and_load(monkeypatch) -
     config_manager = MagicMock(remove_config=remove_config)
     manager = PluginManager()
     _prepare_loaded_plugin_for_unload(manager, monkeypatch, "reload_plugin")
-    original_unload = manager.unload_plugin
+    original_unload = manager._unload_plugin_unlocked
+    manifest = PluginManifest(
+        name="reload_plugin",
+        version="1.0.0",
+        description="test",
+        author="test",
+    )
 
     async def tracked_unload(plugin_name: str) -> bool:
         operations.append("unload")
         return await original_unload(plugin_name)
 
-    async def tracked_load(plugin_path: str) -> bool:
+    async def tracked_load(plugin_path: str, loaded_manifest: PluginManifest) -> bool:
+        assert loaded_manifest is manifest
         operations.append("load")
         return True
 
-    monkeypatch.setattr(manager, "unload_plugin", AsyncMock(side_effect=tracked_unload))
-    monkeypatch.setattr(manager, "load_plugin", AsyncMock(side_effect=tracked_load))
+    monkeypatch.setattr(
+        manager,
+        "_unload_plugin_unlocked",
+        AsyncMock(side_effect=tracked_unload),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_load_plugin_from_manifest_unlocked",
+        AsyncMock(side_effect=tracked_load),
+    )
+    monkeypatch.setattr(
+        "src.core.components.loader.load_manifest",
+        AsyncMock(return_value=manifest),
+    )
     monkeypatch.setattr(
         "src.core.managers.config_manager.get_config_manager",
         lambda: config_manager,
@@ -267,8 +349,11 @@ async def test_reload_plugin_orders_unload_cache_removal_and_load(monkeypatch) -
     assert result is True
     assert operations == ["unload", "remove_config", "load"]
     remove_config.assert_called_once_with("reload_plugin")
-    manager.unload_plugin.assert_awaited_once_with("reload_plugin")
-    manager.load_plugin.assert_awaited_once_with("plugins/reload_plugin")
+    manager._unload_plugin_unlocked.assert_awaited_once_with("reload_plugin")
+    manager._load_plugin_from_manifest_unlocked.assert_awaited_once_with(
+        "plugins/reload_plugin",
+        manifest,
+    )
 
 
 async def test_unload_plugin_removes_config_cache_on_success(monkeypatch) -> None:
@@ -287,8 +372,10 @@ async def test_unload_plugin_removes_config_cache_on_success(monkeypatch) -> Non
     config_manager.remove_config.assert_called_once_with("cached_plugin")
 
 
-async def test_unload_plugin_keeps_config_cache_on_failure(monkeypatch) -> None:
-    """卸载流程失败时不应清除插件配置缓存。"""
+async def test_unload_plugin_still_clears_cache_after_partial_failure(
+    monkeypatch,
+) -> None:
+    """卸载局部失败时仍应释放其余资源，避免留下半卸载状态。"""
     config_manager = MagicMock()
     manager = PluginManager()
     _prepare_loaded_plugin_for_unload(manager, monkeypatch, "failing_plugin")
@@ -305,4 +392,5 @@ async def test_unload_plugin_keeps_config_cache_on_failure(monkeypatch) -> None:
     result = await manager.unload_plugin("failing_plugin")
 
     assert result is False
-    config_manager.remove_config.assert_not_called()
+    config_manager.remove_config.assert_called_once_with("failing_plugin")
+    assert "failing_plugin" not in manager._loaded_plugins

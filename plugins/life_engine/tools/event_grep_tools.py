@@ -204,26 +204,42 @@ class LifeEngineGrepEventsTool(BaseTool):
         query: Annotated[str, "要搜索的关键词或正则表达式"],
         use_regex: Annotated[bool, "是否按正则表达式匹配 query"] = False,
         case_insensitive: Annotated[bool, "匹配时是否忽略大小写"] = True,
+        cross_stream: Annotated[bool, "是否跨所有聊天流搜索；默认 false"] = False,
         stream_ids: Annotated[list[str] | None, "限定 stream_id；为空表示全局事件流"] = None,
         event_types: Annotated[list[str] | None, "限定事件类型：message/heartbeat/tool_call/tool_result"] = None,
         fields: Annotated[list[str] | None, "限定搜索字段；为空搜索常用文本字段"] = None,
         include_pending: Annotated[bool, "是否包含尚未进入历史的 pending 事件"] = True,
-        include_life_internal: Annotated[bool, "是否在限定 stream 时仍包含 life 内部事件"] = False,
+        include_life_internal: Annotated[bool | None, "是否在限定 stream 时仍包含 life 内部事件"] = None,
         limit: Annotated[int, "最大返回命中数"] = _DEFAULT_LIMIT,
         context_before: Annotated[int, "每条命中前带几条相邻事件"] = 1,
         context_after: Annotated[int, "每条命中后带几条相邻事件"] = 1,
         order: Annotated[Literal["asc", "desc"], "返回顺序：asc/desc"] = "desc",
     ) -> tuple[bool, dict[str, Any] | str]:
+        resolved_stream_ids = [
+            str(stream_id or "").strip()
+            for stream_id in (stream_ids or [])
+            if str(stream_id or "").strip()
+        ]
+        chat_stream = getattr(self, "chat_stream", None)
+        current_stream_id = str(
+            getattr(chat_stream, "stream_id", "") or ""
+        ).strip()
+        if not cross_stream and not resolved_stream_ids and current_stream_id:
+            resolved_stream_ids = [current_stream_id]
+
+        include_internal = (
+            bool(current_stream_id) if include_life_internal is None else include_life_internal
+        )
         try:
             return True, await grep_life_events(
                 query=query,
                 use_regex=use_regex,
                 case_insensitive=case_insensitive,
-                stream_ids=stream_ids,
+                stream_ids=[] if cross_stream else resolved_stream_ids,
                 event_types=event_types,
                 fields=fields,
                 include_pending=include_pending,
-                include_life_internal=include_life_internal,
+                include_life_internal=bool(include_internal and not cross_stream),
                 limit=limit,
                 context_before=context_before,
                 context_after=context_after,

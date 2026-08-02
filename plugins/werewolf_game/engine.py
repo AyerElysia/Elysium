@@ -13,11 +13,10 @@ import random
 from collections import Counter
 from dataclasses import dataclass
 
-from .boards import BoardConfig, get_board
+from .boards import get_board
 from .models import (
     DIVINE_ROLES,
     DeathCause,
-    Faction,
     GameState,
     NightState,
     Phase,
@@ -124,7 +123,10 @@ class WerewolfEngine:
         return ActionResult(
             True,
             "身份已分配，游戏开始。",
-            public_messages=[f"狼人杀开始（{board.name}）。请所有玩家查看私聊身份。"],
+            public_messages=[
+                f"狼人杀开始（{board.name}）。请所有玩家查看私聊身份。\n"
+                "下一步：有夜间技能的玩家请在私聊里行动或跳过。"
+            ],
         )
 
     def start_test_game(self, game: GameState, *, rng: random.Random | None = None) -> ActionResult:
@@ -148,7 +150,14 @@ class WerewolfEngine:
         game.night = NightState()
         game.votes.clear()
         game.log_event("game_start", detail="测试局")
-        return ActionResult(True, "测试局开始。", public_messages=["测试狼人杀开始。请查看私聊身份。"])
+        return ActionResult(
+            True,
+            "测试局开始。",
+            public_messages=[
+                "测试狼人杀开始。请查看私聊身份。\n"
+                "下一步：有夜间技能的玩家请在私聊里行动或跳过。"
+            ],
+        )
 
     # ------------------------------------------------------------------
     # Night actions
@@ -265,10 +274,9 @@ class WerewolfEngine:
         killed: list[tuple[str, DeathCause]] = []
 
         # 狼刀（守卫优先挡住）
-        wolf_blocked = False
         if game.night.wolf_target:
             if game.night.guard_target == game.night.wolf_target:
-                wolf_blocked = True  # 守卫挡住
+                pass  # 守卫挡住
             elif game.night.healed_target == game.night.wolf_target:
                 pass  # 女巫救了
             else:
@@ -594,7 +602,7 @@ class WerewolfEngine:
         if not player or not player.alive:
             return ActionResult(False, "只有存活玩家可以发言。")
         game.log_event("speech", actor_id=user_id, detail=text[:200])
-        return ActionResult(True, f"发言已记录。")
+        return ActionResult(True, "发言已记录。")
 
     # ------------------------------------------------------------------
     # Day: vote
@@ -848,6 +856,14 @@ class WerewolfEngine:
         if game.phase == Phase.WAITING:
             board = get_board(game.board_name)
             lines.append(f"人数：{len(game.players)}/{board.player_count}")
+            if len(game.players) >= board.player_count:
+                lines.append("下一步：房主发送 /狼人杀 开始。")
+            elif len(game.players) >= MIN_TEST_PLAYERS:
+                lines.append(
+                    "下一步：继续邀请玩家，或由房主发送 /狼人杀 测试开始。"
+                )
+            else:
+                lines.append("下一步：发送 /狼人杀 加入，等待更多玩家。")
         if game.phase == Phase.ENDED and game.ended_reason:
             lines.append(f"结局：{game.ended_reason}")
         return "\n".join(lines)

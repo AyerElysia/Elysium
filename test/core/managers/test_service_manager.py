@@ -12,19 +12,18 @@
 
 from __future__ import annotations
 
-import pytest
-from unittest.mock import MagicMock, patch, AsyncMock
+from unittest.mock import MagicMock, patch
 
 from src.core.managers.service_manager import ServiceManager
 from src.core.components.base.service import BaseService
-from src.core.components.registry import ComponentRegistry
 from src.core.components.types import ComponentType
 
 
 # 测试用 Service 类
 class TestService(BaseService):
     """测试服务类。"""
-    
+
+    __test__ = False
     signature = "test_plugin:service:test_service"
     description = "Test service"
     
@@ -160,10 +159,12 @@ class TestServiceManagerGetService:
         """测试获取服务实例（非单例）。"""
         manager = ServiceManager()
         
-        with patch('src.core.managers.service_manager.get_global_registry') as mock_get_registry:
+        with patch('src.core.managers.service_manager.get_global_registry') as mock_get_registry, \
+             patch('src.core.managers.get_plugin_manager') as mock_get_plugin_manager:
             mock_registry = MagicMock()
             mock_registry.get.return_value = TestService
             mock_get_registry.return_value = mock_registry
+            mock_get_plugin_manager.return_value.get_plugin.return_value = MagicMock()
             
             result = manager.get_service("test_plugin:service:test_service")
             
@@ -173,10 +174,12 @@ class TestServiceManagerGetService:
         """测试每次获取都创建新实例。"""
         manager = ServiceManager()
         
-        with patch('src.core.managers.service_manager.get_global_registry') as mock_get_registry:
+        with patch('src.core.managers.service_manager.get_global_registry') as mock_get_registry, \
+             patch('src.core.managers.get_plugin_manager') as mock_get_plugin_manager:
             mock_registry = MagicMock()
             mock_registry.get.return_value = TestService
             mock_get_registry.return_value = mock_registry
+            mock_get_plugin_manager.return_value.get_plugin.return_value = MagicMock()
             
             instance1 = manager.get_service("test_plugin:service:test_service")
             instance2 = manager.get_service("test_plugin:service:test_service")

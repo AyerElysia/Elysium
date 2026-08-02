@@ -8,7 +8,12 @@ from typing import Any
 
 import pytest
 
-from plugins.life_engine.autonomy import AutonomyIntentStore, build_intent, schedule_autonomy_intent
+from plugins.life_engine.autonomy import (
+    AutonomyIntentStore,
+    build_intent,
+    restore_autonomy_intents,
+    schedule_autonomy_intent,
+)
 from plugins.life_engine.core.chatter import LifeChatter
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.service.core import LifeEngineService
@@ -77,6 +82,33 @@ async def test_repeating_intent_uses_recurring_scheduler(monkeypatch) -> None:
     assert intent.schedule_id == "recurring-schedule"
     assert captured["is_recurring"] is True
     assert captured["trigger_config"]["interval_seconds"] == 3600.0
+
+
+async def test_restore_autonomy_requires_running_scheduler(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Listing tasks must not be mistaken for scheduler readiness."""
+    intent = build_intent(
+        kind="reflect",
+        motivation="稍后继续想",
+        delay_minutes=5,
+        min_delay_minutes=1,
+        max_delay_minutes=60,
+    )
+    AutonomyIntentStore(tmp_path).upsert(intent)
+
+    class StoppedScheduler:
+        is_running = False
+
+        async def create_schedule(self, **_kwargs):
+            raise AssertionError("stopped scheduler must not receive schedules")
+
+    monkeypatch.setattr(
+        "plugins.life_engine.autonomy.get_unified_scheduler",
+        lambda: StoppedScheduler(),
+    )
+
+    assert await restore_autonomy_intents(SimpleNamespace(service=None), tmp_path) == 0
 
 
 async def test_schedule_autonomy_intent_persists_and_records_event(tmp_path: Path, monkeypatch) -> None:

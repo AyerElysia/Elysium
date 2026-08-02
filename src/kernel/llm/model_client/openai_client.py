@@ -708,6 +708,22 @@ class OpenAIChatClient:
             self._last_usage = None
             return dict(usage) if isinstance(usage, dict) else None
 
+    async def aclose(self) -> None:
+        """关闭并清空所有按事件循环缓存的 SDK 客户端。"""
+        with self._lock:
+            clients = list(self._clients.values())
+            self._clients.clear()
+
+        for client in clients:
+            close = getattr(client, "close", None)
+            if close is None:
+                close = getattr(client, "aclose", None)
+            if close is None:
+                continue
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+
     # ------------------------------------------------------------------
     # 内部工具方法
     # ------------------------------------------------------------------

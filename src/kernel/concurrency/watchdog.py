@@ -72,6 +72,7 @@ class WatchDog:
         self._running = False
         self._monitor_thread: threading.Thread | None = None
         self._stream_registry: dict[str, StreamHeartbeat] = {}
+        self._stream_registry_lock = threading.RLock()
         self._last_tick_time: datetime | None = None
         self._task_manager: TaskManager | None = None
 
@@ -135,14 +136,16 @@ class WatchDog:
 
     def _check_streams(self) -> None:
         """检查聊天流健康状态"""
-        if not self._stream_registry:
+        with self._stream_registry_lock:
+            streams = list(self._stream_registry.items())
+        if not streams:
             return
 
         now = datetime.now()
         now_monotonic = time.monotonic()
 
         # 遍历所有注册的流
-        for stream_id, heartbeat in list(self._stream_registry.items()):
+        for stream_id, heartbeat in streams:
             # 计算距离上次心跳的时间
             delta = (now - heartbeat.last_tick).total_seconds()
 
@@ -208,7 +211,7 @@ class WatchDog:
                 )
 
                 # 取消任务
-                if task_info.cancel():
+                if task_info.cancel_threadsafe():
                     logger.info(f"任务 '{task_info.name}' 已取消")
                 else:
                     logger.warning(f"任务 '{task_info.name}' 取消失败")
@@ -244,7 +247,8 @@ class WatchDog:
             restart_cooldown=max(0.0, restart_cooldown if restart_cooldown is not None else tick_interval),
         )
 
-        self._stream_registry[stream_id] = heartbeat
+        with self._stream_registry_lock:
+            self._stream_registry[stream_id] = heartbeat
         logger.info(f"聊天流 '{stream_id}' 已注册到 WatchDog")
 
         return heartbeat
@@ -255,8 +259,9 @@ class WatchDog:
         Args:
             stream_id: 聊天流 ID
         """
-        if stream_id in self._stream_registry:
-            del self._stream_registry[stream_id]
+        with self._stream_registry_lock:
+            removed = self._stream_registry.pop(stream_id, None)
+        if removed is not None:
             logger.info(f"聊天流 '{stream_id}' 已从 WatchDog 注销")
 
     def feed_dog(self, stream_id: str) -> None:
@@ -267,8 +272,10 @@ class WatchDog:
         Args:
             stream_id: 聊天流 ID
         """
-        if stream_id in self._stream_registry:
-            self._stream_registry[stream_id].last_tick = datetime.now()
+        with self._stream_registry_lock:
+            heartbeat = self._stream_registry.get(stream_id)
+            if heartbeat is not None:
+                heartbeat.last_tick = datetime.now()
 
     def get_stream_heartbeat(self, stream_id: str) -> StreamHeartbeat | None:
         """获取聊天流心跳信息
@@ -279,7 +286,8 @@ class WatchDog:
         Returns:
             StreamHeartbeat | None: 心跳信息，如果未注册则返回 None
         """
-        return self._stream_registry.get(stream_id)
+        with self._stream_registry_lock:
+            return self._stream_registry.get(stream_id)
 
     def get_stats(self) -> dict[str, Any]:
         """获取 WatchDog 统计信息
@@ -287,10 +295,12 @@ class WatchDog:
         Returns:
             dict: 统计信息字典
         """
+        with self._stream_registry_lock:
+            registered_streams = len(self._stream_registry)
         return {
             "running": self._running,
             "tick_interval": self._tick_interval,
-            "registered_streams": len(self._stream_registry),
+            "registered_streams": registered_streams,
             "thread_alive": self._monitor_thread.is_alive() if self._monitor_thread else False,
         }
 

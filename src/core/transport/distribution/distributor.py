@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
+import weakref
 from typing import cast
 
 from src.core.components.types import EventType
@@ -26,6 +28,31 @@ from src.core.models.message import Message
 logger = get_logger("distributor", display="消息分发", color=COLOR.MAGENTA)
 
 _DISTRIBUTION_WAIT_TIMEOUT = 1.0
+_MAX_PENDING_DISTRIBUTIONS_PER_STREAM = 256
+_distribution_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+_distribution_slots: weakref.WeakValueDictionary[str, asyncio.Semaphore] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _get_distribution_lock(stream_id: str) -> asyncio.Lock:
+    """返回同一事件循环中按流复用、空闲后可回收的分发锁。"""
+    lock = _distribution_locks.get(stream_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _distribution_locks[stream_id] = lock
+    return lock
+
+
+def _get_distribution_slots(stream_id: str) -> asyncio.Semaphore:
+    """返回同一流的有界待处理名额。"""
+    slots = _distribution_slots.get(stream_id)
+    if slots is None:
+        slots = asyncio.Semaphore(_MAX_PENDING_DISTRIBUTIONS_PER_STREAM)
+        _distribution_slots[stream_id] = slots
+    return slots
 
 
 async def _on_message_received(_: str, params: dict) -> tuple[EventDecision, dict]:
@@ -41,7 +68,6 @@ async def _on_message_received(_: str, params: dict) -> tuple[EventDecision, dic
     Returns:
         tuple[EventDecision, dict]: (事件决策, 事件参数)
     """
-    import asyncio
     from src.core.managers.stream_manager import get_stream_manager
     from src.core.transport.distribution.stream_loop_manager import get_stream_loop_manager
 
@@ -50,7 +76,7 @@ async def _on_message_received(_: str, params: dict) -> tuple[EventDecision, dic
         logger.warning("ON_MESSAGE_RECEIVED 事件缺少 message 参数")
         return EventDecision.PASS, params
 
-    async def _do_distribution() -> None:
+    async def _do_distribution_locked() -> None:
         # ── 命令优先检查：若消息是已注册命令，直接分发执行，不进入 Chatter ──
         text: str = message.content if isinstance(message.content, str) else ""
         if text:
@@ -113,23 +139,11 @@ async def _on_message_received(_: str, params: dict) -> tuple[EventDecision, dic
                 )
                 return
 
-            # 2. 先写入内存未读队列并启动驱动器，再后台持久化。
+            # 2. 先写入内存未读队列并启动驱动器，再持久化。
             # 事件总线单个处理器默认只有 5 秒超时；若把数据库写入放在前面，
             # DB/冷启动稍慢就会导致消息只被旁路收集器看到，life_chatter 不会被唤醒。
             context.add_unread_message(message)
             chat_stream.update_active_time()
-
-            async def _persist_message() -> None:
-                try:
-                    await sm.add_message(message, add_to_unread=False)
-                except Exception as exc:  # noqa: BLE001
-                    logger.error(f"后台持久化入站消息失败: {exc}", exc_info=True)
-
-            get_task_manager().create_task(
-                _persist_message(),
-                name=f"persist_inbound_message_{message.stream_id[:8]}",
-                daemon=True,
-            )
 
             # 3. 更新消息缓冲时间戳。
             # 注意：不要在“每次收到新消息”时重置 message_buffer_skip_count。
@@ -146,15 +160,45 @@ async def _on_message_received(_: str, params: dict) -> tuple[EventDecision, dic
             else:
                 logger.warning("StreamLoopManager 未启动，跳过驱动器启动")
 
+            # 5. 在同一流的分发锁内完成落盘，保证数据库顺序与接收顺序一致。
+            # 驱动器已经先启动，慢磁盘不会延迟本条消息进入 Chatter；后续同流消息
+            # 会自然等待形成背压，不再创建无界的二级持久化任务。
+            try:
+                await sm.add_message(message, add_to_unread=False)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"持久化入站消息失败: {exc}", exc_info=True)
+
         except Exception as e:
             logger.error(f"消息分发失败: {e}", exc_info=True)
 
-    # 提交分发任务给全局任务管理器进行管理
-    task_info = get_task_manager().create_task(
-        _do_distribution(),
-        name=f"distribute_inbound_message_{message.stream_id[:8]}",
-        daemon=True,
-    )
+    async def _do_distribution() -> None:
+        async with _get_distribution_lock(message.stream_id):
+            await _do_distribution_locked()
+
+    # 提交分发任务给全局任务管理器进行管理。每个流只允许有限数量的
+    # 等待任务；达到上限时在接收链路施加背压，而不是继续无界占用内存。
+    slots = _get_distribution_slots(message.stream_id)
+    admission_started_at = time.monotonic()
+    await slots.acquire()
+    admission_elapsed = time.monotonic() - admission_started_at
+    if admission_elapsed >= 0.1:
+        logger.warning(
+            "入站分发已施加背压: "
+            f"waited={admission_elapsed:.3f}s, stream_id={message.stream_id[:8]}"
+        )
+
+    distribution_coro = _do_distribution()
+    try:
+        task_info = get_task_manager().create_task(
+            distribution_coro,
+            name=f"distribute_inbound_message_{message.stream_id[:8]}",
+            daemon=True,
+        )
+    except BaseException:
+        distribution_coro.close()
+        slots.release()
+        raise
+    task_info.task.add_done_callback(lambda _task: slots.release())
 
     started_at = time.monotonic()
     try:
@@ -211,6 +255,7 @@ def initialize_distribution() -> None:
         EventType.ON_MESSAGE_RECEIVED,
         _on_message_received,
         priority=0,  # 默认优先级，在插件事件处理器之后执行
+        timeout_seconds=None,  # 有界队列负责背压，不能因通用 5 秒超时丢入站消息
     )
 
     # 订阅插件加载完成事件，自动启动 StreamLoopManager

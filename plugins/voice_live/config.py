@@ -1,12 +1,7 @@
-"""Voice Live 配置。
+"""Commercial realtime voice configuration.
 
-定义全双工语音通话插件的所有配置节，包括：
-- 插件基础设置
-- 全双工 Provider 配置（OpenAI Realtime / Moshi）
-- 降级管线配置（MiMo-V2.5 + IndexTTS2）
-- VAD 语音活动检测参数
-- 会话与意识实例配置
-- 音频格式配置
+The provider is always explicit.  A failed provider never changes the model or
+conversation architecture behind the user's back.
 """
 
 from __future__ import annotations
@@ -17,307 +12,119 @@ from src.core.components.base.config import BaseConfig, Field, SectionBase, conf
 
 
 class VoiceLiveConfig(BaseConfig):
-    """全双工语音通话插件配置。"""
+    """Configuration for the independent ``voice_live`` consciousness."""
 
     config_name: ClassVar[str] = "config"
-    config_description: ClassVar[str] = "全双工实时语音通话配置"
-
-    # ------------------------------------------------------------------
-    # 插件基础设置
-    # ------------------------------------------------------------------
+    config_description: ClassVar[str] = "商业级全双工实时语音通话配置"
 
     @config_section("plugin", title="插件设置", tag="plugin", order=0)
     class PluginSection(SectionBase):
-        enabled: bool = Field(
-            default=True,
-            description="是否启用 Voice Live 插件",
-            label="启用插件",
-            tag="plugin",
-            order=0,
-        )
+        enabled: bool = Field(default=True, description="是否启用 Voice Live", label="启用插件")
 
-    # ------------------------------------------------------------------
-    # 服务器设置
-    # ------------------------------------------------------------------
-
-    @config_section("server", title="服务器设置", tag="network", order=10)
+    @config_section("server", title="接入与会话安全", tag="network", order=10)
     class ServerSection(SectionBase):
-        route_path: str = Field(
-            default="/voice-live",
-            description="FastAPI 路由前缀路径",
-            label="路由路径",
-            tag="network",
-            order=0,
+        route_path: str = Field(default="/voice-live", description="HTTP 路由前缀")
+        allowed_origins: list[str] = Field(
+            default_factory=lambda: [
+                "http://127.0.0.1",
+                "http://localhost",
+                "https://127.0.0.1",
+                "https://localhost",
+            ],
+            description="允许申请短期 WebSocket ticket 的浏览器 Origin 前缀",
         )
-        auth_token: str = Field(
-            default="",
-            description="WebSocket 连接认证 token；留空则不验证",
-            label="认证 Token",
-            tag="network",
-            order=1,
+        ticket_secret_env: str = Field(
+            default="VOICE_LIVE_TICKET_SECRET",
+            description="保存 ticket 签名密钥的环境变量名；本机未设置时使用进程级随机密钥",
         )
-        max_concurrent_sessions: int = Field(
-            default=4,
-            description="最大并发通话会话数",
-            label="最大并发数",
-            tag="network",
-            order=2,
-        )
+        ticket_ttl_seconds: int = Field(default=30, ge=5, description="一次性连接 ticket 有效期")
+        max_concurrent_sessions: int = Field(default=1, ge=1, description="最大并发通话数")
+        max_session_minutes: int = Field(default=120, ge=1, description="单次通话硬上限")
+        idle_timeout_seconds: int = Field(default=300, ge=30, description="无音频与控制消息的空闲超时")
 
-    # ------------------------------------------------------------------
-    # 全双工 Provider 配置
-    # ------------------------------------------------------------------
-
-    @config_section("full_duplex", title="全双工 Provider", tag="ai", order=20)
+    @config_section("full_duplex", title="实时 Omni Provider", tag="ai", order=20)
     class FullDuplexSection(SectionBase):
-        provider_type: Literal["openai_realtime", "moshi", "disabled"] = Field(
-            default="disabled",
-            description="全双工 Provider 类型；disabled 时自动使用降级管线",
-            label="Provider 类型",
-            tag="ai",
-            order=0,
+        provider_type: Literal[
+            "minicpm_omni",
+            "qwen_realtime",
+            "openai_realtime",
+            "disabled",
+        ] = Field(
+            default="minicpm_omni",
+            description="显式选择实时供应商；连接失败时不会隐式更换模型",
         )
         upstream_url: str = Field(
+            default="ws://127.0.0.1:9060/backend",
+            description="实时模型 WebSocket 地址",
+        )
+        api_key_env: str = Field(
+            default="VOICE_LIVE_API_KEY",
+            description="云端 API Key 所在环境变量名；密钥本身不得写入配置",
+        )
+        model_name: str = Field(default="MiniCPM-o-4_5", description="实时模型标识")
+        voice: str = Field(default="", description="云端 voice 标识；空值使用供应商默认语音")
+        mode: Literal["full_duplex", "turn_based"] = Field(
+            default="full_duplex",
+            description="MiniCPM-o 运行模式",
+        )
+        reference_audio_path: str = Field(
             default="",
-            description="上游全双工模型 WebSocket 地址，例如 wss://api.openai.com/v1/realtime 或 ws://127.0.0.1:8998/api/chat",
-            label="上游地址",
-            placeholder="wss://api.openai.com/v1/realtime",
-            tag="network",
-            order=1,
+            description="本地 Omni 输入参考音频（16k mono float32/WAV）；空值不注入",
         )
-        api_key: str = Field(
+        tts_reference_audio_path: str = Field(
             default="",
-            description="上游模型 API Key（OpenAI Realtime 需要；Moshi 本地可留空）",
-            label="API Key",
-            tag="network",
-            order=2,
+            description="本地 Omni 音色参考音频；空值使用运行时默认",
         )
-        model_name: str = Field(
-            default="gpt-4o-realtime-preview",
-            description="全双工模型标识符",
-            label="模型名称",
-            tag="ai",
-            order=3,
+        upstream_input_chunk_ms: int = Field(
+            default=1000,
+            ge=20,
+            description="聚合后发往上游的音频时长；MiniCPM-o 官方全双工路径建议 1000ms",
         )
-        voice: str = Field(
-            default="alloy",
-            description="OpenAI Realtime 语音名称（alloy/echo/shimmer 等）",
-            label="语音",
-            tag="ai",
-            order=4,
-        )
+        connect_timeout_seconds: float = Field(default=20.0, gt=0, description="上游连接超时")
+        event_timeout_seconds: float = Field(default=45.0, gt=0, description="会话初始化事件超时")
         instructions: str = Field(
             default="",
-            description="注入全双工模型的额外系统指令；留空则从意识上下文自动生成",
-            label="系统指令",
-            tag="ai",
-            order=5,
-        )
-        connect_timeout: float = Field(
-            default=10.0,
-            description="连接上游模型的超时时间（秒）",
-            label="连接超时",
-            tag="network",
-            order=6,
+            description="附加指令；会与人格、WorldState、实例历史共同组成上下文",
         )
 
-    # ------------------------------------------------------------------
-    # 降级管线配置
-    # ------------------------------------------------------------------
-
-    @config_section("degraded", title="降级管线", tag="ai", order=30)
-    class DegradedSection(SectionBase):
-        enabled: bool = Field(
-            default=True,
-            description="是否启用降级管线（全双工不可用时的回退方案）",
-            label="启用降级",
-            tag="ai",
-            order=0,
-        )
-        model_task_name: str = Field(
-            default="live",
-            description="降级管线使用的模型任务名（对应 model.toml 中的 [model_tasks.live]）",
-            label="模型任务",
-            tag="ai",
-            order=1,
-        )
-        tts_style: str = Field(
-            default="default",
-            description="TTS 语音风格（对应 tts_voice_plugin 中的 style_name）",
-            label="TTS 风格",
-            tag="ai",
-            order=2,
-        )
-        sentence_min_chars: int = Field(
-            default=8,
-            description="凑够多少字符强制切句（防止长句缺标点不发声）",
-            label="最小切句字符",
-            tag="ai",
-            order=3,
-        )
-        max_context_turns: int = Field(
-            default=20,
-            description="降级管线保留的最近对话轮数",
-            label="上下文轮数",
-            tag="ai",
-            order=4,
-        )
-        llm_timeout: float = Field(
-            default=60.0,
-            description="LLM 请求超时时间（秒）",
-            label="LLM 超时",
-            tag="network",
-            order=5,
-        )
-
-    # ------------------------------------------------------------------
-    # VAD 语音活动检测
-    # ------------------------------------------------------------------
-
-    @config_section("vad", title="语音活动检测", tag="audio", order=40)
-    class VadSection(SectionBase):
-        threshold: float = Field(
-            default=0.012,
-            description="判断为语音的 RMS 能量阈值（0.001–0.5）",
-            label="能量阈值",
-            tag="audio",
-            order=0,
-        )
-        silence_ms: int = Field(
-            default=800,
-            description="停止说话后静音持续多少毫秒触发发送",
-            label="静音触发(ms)",
-            tag="audio",
-            order=1,
-        )
-        min_speech_ms: int = Field(
-            default=300,
-            description="触发发送所需的最短语音时长（毫秒）",
-            label="最短语音(ms)",
-            tag="audio",
-            order=2,
-        )
-        max_ms: int = Field(
-            default=15000,
-            description="单次语音录制的最大时长（毫秒）",
-            label="最大时长(ms)",
-            tag="audio",
-            order=3,
-        )
-        pre_speech_ms: int = Field(
-            default=200,
-            description="语音起始前额外保留的预录缓冲（毫秒）",
-            label="预录缓冲(ms)",
-            tag="audio",
-            order=4,
-        )
-
-    # ------------------------------------------------------------------
-    # 会话与意识实例
-    # ------------------------------------------------------------------
-
-    @config_section("session", title="会话设置", tag="session", order=50)
+    @config_section("session", title="意识实例", tag="session", order=30)
     class SessionSection(SectionBase):
-        instance_id: str = Field(
-            default="voice_live_001",
-            description="意识实例 ID",
-            label="实例 ID",
-            tag="session",
-            order=0,
-        )
-        stream_id: str = Field(
-            default="voice_live_main",
-            description="语音通话写入统一事件流时使用的 stream_id",
-            label="Stream ID",
-            tag="session",
-            order=1,
-        )
-        stream_name: str = Field(
-            default="语音通话",
-            description="统一事件流中显示的流名称",
-            label="流名称",
-            tag="session",
-            order=2,
-        )
-        user_id: str = Field(
-            default="voice_user",
-            description="语音用户在消息模型中的 sender_id",
-            label="用户 ID",
-            tag="session",
-            order=3,
-        )
-        user_name: str = Field(
-            default="语音用户",
-            description="语音用户显示名",
-            label="用户名",
-            tag="session",
-            order=4,
-        )
-        include_life_runtime_context: bool = Field(
+        instance_id_prefix: str = Field(default="voice_live", description="独立意识实例 ID 前缀")
+        stream_id_prefix: str = Field(default="voice_live", description="统一事件流 ID 前缀")
+        display_name: str = Field(default="实时通话意识", description="意识实例显示名")
+        stream_name: str = Field(default="实时语音通话", description="统一事件流显示名")
+        user_id: str = Field(default="voice_user", description="通话对方 sender_id")
+        user_name: str = Field(default="用户", description="通话对方显示名")
+        require_life_engine: bool = Field(
             default=True,
-            description="是否读取 life_engine 的运行态上下文（人格、记忆、WorldState）",
-            label="包含运行态上下文",
-            tag="session",
-            order=5,
+            description="要求真实注册到 LifeEngine；关闭仅用于隔离测试",
         )
-        include_unified_events: bool = Field(
-            default=True,
-            description="是否携带最近统一事件流",
-            label="包含统一事件",
-            tag="session",
-            order=6,
-        )
-        record_to_life: bool = Field(
-            default=True,
-            description="是否将通话事件写入 life_engine 统一事件流",
-            label="记录到生命引擎",
-            tag="session",
-            order=7,
-        )
+        record_to_life: bool = Field(default=True, description="把最终转写写入统一生命事件流")
+        cross_scene_awareness: bool = Field(default=True, description="感知完整 WorldState")
 
-    # ------------------------------------------------------------------
-    # 音频格式
-    # ------------------------------------------------------------------
-
-    @config_section("audio", title="音频设置", tag="audio", order=60)
+    @config_section("audio", title="音频传输", tag="audio", order=40)
     class AudioSection(SectionBase):
-        input_sample_rate: int = Field(
-            default=16000,
-            description="客户端输入音频采样率（Hz）",
-            label="输入采样率",
-            tag="audio",
-            order=0,
-        )
-        output_sample_rate: int = Field(
-            default=24000,
-            description="服务端输出音频采样率（Hz）",
-            label="输出采样率",
-            tag="audio",
-            order=1,
-        )
-        chunk_ms: int = Field(
-            default=100,
-            description="音频分片间隔（毫秒）",
-            label="分片间隔(ms)",
-            tag="audio",
-            order=2,
-        )
-        format: Literal["pcm16", "opus"] = Field(
-            default="pcm16",
-            description="WebSocket 传输的音频格式",
-            label="音频格式",
-            tag="audio",
-            order=3,
-        )
+        input_sample_rate: int = Field(default=16000, ge=8000, description="上行 PCM16 采样率")
+        output_sample_rate: int = Field(default=24000, ge=8000, description="下行 PCM16 采样率")
+        browser_frame_ms: int = Field(default=20, ge=10, description="浏览器上行帧时长")
+        channels: Literal[1] = Field(default=1, description="传输声道数")
+        format: Literal["pcm16"] = Field(default="pcm16", description="浏览器传输格式")
 
-    # ------------------------------------------------------------------
-    # 配置节实例声明（Pydantic 字段）
-    # ------------------------------------------------------------------
+    @config_section("observability", title="可观测性与隐私", tag="debug", order=50)
+    class ObservabilitySection(SectionBase):
+        trace_root: str = Field(
+            default="runtime/consciousness",
+            description="意识实例 episode、checkpoint 与 JSONL 轨迹目录",
+        )
+        persist_audio: bool = Field(
+            default=False,
+            description="是否保存原始通话音频；默认关闭以保护隐私",
+        )
+        metrics_interval_seconds: int = Field(default=5, ge=1, description="向浏览器推送指标的周期")
 
     plugin: PluginSection = Field(default_factory=PluginSection)
     server: ServerSection = Field(default_factory=ServerSection)
     full_duplex: FullDuplexSection = Field(default_factory=FullDuplexSection)
-    degraded: DegradedSection = Field(default_factory=DegradedSection)
-    vad: VadSection = Field(default_factory=VadSection)
     session: SessionSection = Field(default_factory=SessionSection)
     audio: AudioSection = Field(default_factory=AudioSection)
+    observability: ObservabilitySection = Field(default_factory=ObservabilitySection)

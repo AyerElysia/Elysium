@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import gzip
 import json
+import threading
+import time
 
 import pytest
 
@@ -119,6 +122,71 @@ class TestPersistence:
         assert collector.queue_size == 1
         assert collector.flush() is True
         assert collector.queue_size == 0
+
+    def test_queue_limit_is_a_real_memory_bound(self, tmp_path) -> None:
+        bounded = TrajectoryCollector(
+            base_path=tmp_path / "bounded_lake",
+            flush_interval=60.0,
+            queue_limit=2,
+        )
+        try:
+            bounded.record({"request_name": "one", "messages": []})
+            bounded.record({"request_name": "two", "messages": []})
+            bounded.record({"request_name": "dropped", "messages": []})
+
+            assert bounded.queue_size == 2
+            assert bounded.stats()["dropped_count"] == 1
+            assert [item["request_name"] for item in bounded._queue] == ["one", "two"]
+        finally:
+            bounded.shutdown()
+
+    def test_old_raw_partition_is_atomically_archived(self, tmp_path) -> None:
+        collector = TrajectoryCollector(
+            base_path=tmp_path / "archive_lake",
+            flush_interval=60.0,
+            raw_retention_days=3,
+            archive_retention_days=0,
+        )
+        try:
+            raw_file = collector.raw_path / "2000-01-01.jsonl"
+            raw_file.write_text('{"request_name":"old"}\n', encoding="utf-8")
+
+            collector._run_partition_maintenance()
+
+            archive_file = collector.archive_path / "2000-01-01.jsonl.gz"
+            assert not raw_file.exists()
+            assert archive_file.exists()
+            with gzip.open(archive_file, "rt", encoding="utf-8") as file:
+                assert json.loads(file.readline())["request_name"] == "old"
+            assert collector.stats()["archived_partition_count"] == 1
+        finally:
+            collector.shutdown()
+
+    def test_slow_fsync_does_not_block_producers(
+        self, collector: TrajectoryCollector, monkeypatch
+    ) -> None:
+        collector.record({"request_name": "before_flush", "messages": []})
+        fsync_started = threading.Event()
+        allow_fsync = threading.Event()
+
+        def _slow_fsync(_fd: int) -> None:
+            fsync_started.set()
+            allow_fsync.wait(timeout=3.0)
+
+        monkeypatch.setattr(collector_mod.os, "fsync", _slow_fsync)
+        flush_thread = threading.Thread(target=collector.flush)
+        flush_thread.start()
+        try:
+            assert fsync_started.wait(timeout=2.0)
+            started_at = time.monotonic()
+            collector.record({"request_name": "during_flush", "messages": []})
+            elapsed = time.monotonic() - started_at
+
+            assert elapsed < 0.1
+            assert collector.queue_size == 2
+        finally:
+            allow_fsync.set()
+            flush_thread.join(timeout=3.0)
 
     def test_attempt_chain_is_preserved(self, collector: TrajectoryCollector) -> None:
         first = new_trajectory_id("attempt")

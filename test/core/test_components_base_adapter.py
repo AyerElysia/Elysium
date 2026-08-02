@@ -15,6 +15,7 @@ from src.core.components import BasePlugin
 class TestAdapter(BaseAdapter):
     """测试用的适配器实现。"""
 
+    __test__ = False
     adapter_name = "test_adapter"
     adapter_version = "1.0.0"
     adapter_description = "Test adapter"

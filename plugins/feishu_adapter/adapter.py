@@ -83,6 +83,9 @@ class FeishuAdapter(BaseAdapter):
         super().__init__(core_sink, plugin=plugin, transport=None, **kwargs)
         self._tenant_access_token: str = ""
         self._tenant_access_token_expires_at: float = 0.0
+        self._tenant_token_lock = asyncio.Lock()
+        self._http_client_lock = asyncio.Lock()
+        self._http_client: httpx.AsyncClient | None = None
         self._seen_event_ids: list[str] = []
         self._main_loop: asyncio.AbstractEventLoop | None = None
         self._long_connection_loop: asyncio.AbstractEventLoop | None = None
@@ -122,14 +125,20 @@ class FeishuAdapter(BaseAdapter):
     async def on_adapter_unloaded(self) -> None:
         self._feishu_stop_event.set()
         if self._feishu_watchdog_thread and self._feishu_watchdog_thread.is_alive():
-            self._feishu_watchdog_thread.join(timeout=5)
+            await asyncio.to_thread(self._feishu_watchdog_thread.join, 5)
             self._feishu_watchdog_thread = None
         await self._stop_long_connection()
+        if self._http_client is not None:
+            await self._http_client.aclose()
+            self._http_client = None
         set_feishu_adapter(None)
+        self._main_loop = None
         self._tenant_access_token = ""
         self._tenant_access_token_expires_at = 0.0
         self._seen_event_ids.clear()
         self._private_chat_ids.clear()
+        self._display_name_cache.clear()
+        self._display_name_cached_at.clear()
         logger.info("FeishuAdapter 已关闭")
 
     async def health_check(self) -> bool:
@@ -254,9 +263,34 @@ class FeishuAdapter(BaseAdapter):
     def _force_restart_long_connection(self) -> None:
         """强制停止旧连接线程并启动新连接。
 
-        旧线程无法被 join（可能永久阻塞在 client.start()），
-        但它是 daemon 线程，新线程启动后旧线程会被孤立并最终由 OS 回收。
+        必须先确认旧 SDK 线程已经退出。lark-oapi 使用模块级事件循环，
+        直接遗弃旧线程再启动新线程会让两个客户端争用同一个全局 loop。
         """
+        old_thread = self._long_connection_thread
+        try:
+            main_loop = self._main_loop
+            if main_loop is not None and main_loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(
+                    self._stop_long_connection(),
+                    main_loop,
+                )
+                future.result(timeout=12)
+            elif self._long_connection_client is not None:
+                self._run_sdk_disconnect(
+                    self._long_connection_client,
+                    self._long_connection_loop,
+                )
+                if old_thread is not None:
+                    old_thread.join(timeout=5)
+        except Exception as exc:
+            logger.error(f"[Feishu Watchdog] 旧长连接关闭失败: {exc}")
+
+        if old_thread is not None and old_thread.is_alive():
+            logger.error(
+                "[Feishu Watchdog] 旧长连接线程仍未退出，本轮不启动重复客户端"
+            )
+            return
+
         self._long_connection_thread = None
         self._long_connection_client = None
         self._last_feishu_ws_time = time.time()  # 重置时间，避免立即再次触发
@@ -288,20 +322,27 @@ class FeishuAdapter(BaseAdapter):
     async def _stop_long_connection(self) -> None:
         client = self._long_connection_client
         self._long_connection_client = None
-        if client is None:
-            return
+        thread = self._long_connection_thread
         # lark-oapi 的 ws.Client 当前没有公开 stop()。这里尽力断开底层连接；
         # daemon 线程会在进程退出时自动释放，插件重载时由运行状态检查避免重复启动。
-        try:
-            disconnect = getattr(client, "_disconnect", None)
-            if disconnect is not None:
-                await asyncio.to_thread(
-                    self._run_sdk_disconnect,
-                    client,
-                    self._long_connection_loop,
-                )
-        except Exception as exc:
-            logger.warning(f"飞书长连接关闭失败: {exc}")
+        if client is not None:
+            try:
+                disconnect = getattr(client, "_disconnect", None)
+                if disconnect is not None:
+                    await asyncio.to_thread(
+                        self._run_sdk_disconnect,
+                        client,
+                        self._long_connection_loop,
+                    )
+            except Exception as exc:
+                logger.warning(f"飞书长连接关闭失败: {exc}")
+
+        if thread is not None and thread.is_alive():
+            await asyncio.to_thread(thread.join, 5)
+        if thread is not None and thread.is_alive():
+            logger.warning("飞书长连接线程在 5 秒内未退出")
+        elif self._long_connection_thread is thread:
+            self._long_connection_thread = None
 
     @staticmethod
     def _run_sdk_disconnect(
@@ -1458,8 +1499,13 @@ class FeishuAdapter(BaseAdapter):
         last_error: Exception | None = None
         for attempt in range(max_retries + 1):
             try:
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    return await client.request(method, url, **kwargs)
+                client = await self._get_http_client()
+                return await client.request(
+                    method,
+                    url,
+                    timeout=timeout,
+                    **kwargs,
+                )
             except httpx.TransportError as exc:
                 last_error = exc
                 if attempt >= max_retries:
@@ -1473,6 +1519,25 @@ class FeishuAdapter(BaseAdapter):
                 delay *= backoff_factor
         assert last_error is not None
         raise last_error
+
+    async def _get_http_client(self) -> httpx.AsyncClient:
+        """获取适配器生命周期内复用的 HTTP 连接池。"""
+        client = self._http_client
+        if client is not None and not client.is_closed:
+            return client
+
+        async with self._http_client_lock:
+            client = self._http_client
+            if client is None or client.is_closed:
+                client = httpx.AsyncClient(
+                    timeout=20.0,
+                    limits=httpx.Limits(
+                        max_connections=20,
+                        max_keepalive_connections=10,
+                    ),
+                )
+                self._http_client = client
+            return client
 
     async def _post_json(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
         token = await self._get_tenant_access_token()
@@ -1497,29 +1562,40 @@ class FeishuAdapter(BaseAdapter):
         if self._tenant_access_token and self._tenant_access_token_expires_at > now:
             return self._tenant_access_token
 
-        config = self._config()
-        if not config.app.app_id or not config.app.app_secret:
-            raise RuntimeError("Feishu app_id/app_secret 未配置")
+        async with self._tenant_token_lock:
+            now = time.time()
+            if (
+                self._tenant_access_token
+                and self._tenant_access_token_expires_at > now
+            ):
+                return self._tenant_access_token
 
-        resp = await self._request_with_retry(
-            "POST",
-            self._api_url("/open-apis/auth/v3/tenant_access_token/internal"),
-            timeout=20.0,
-            json={
-                "app_id": config.app.app_id,
-                "app_secret": config.app.app_secret,
-            },
-        )
-        data = self._decode_response(resp)
-        if int(data.get("code", 0)) != 0:
-            raise RuntimeError(f"Feishu tenant_access_token failed: {data}")
-        token = str(data.get("tenant_access_token") or "")
-        if not token:
-            raise RuntimeError(f"Feishu tenant_access_token missing: {data}")
-        expire = float(data.get("expire") or 7200)
-        self._tenant_access_token = token
-        self._tenant_access_token_expires_at = now + max(60.0, expire - 300.0)
-        return token
+            config = self._config()
+            if not config.app.app_id or not config.app.app_secret:
+                raise RuntimeError("Feishu app_id/app_secret 未配置")
+
+            resp = await self._request_with_retry(
+                "POST",
+                self._api_url("/open-apis/auth/v3/tenant_access_token/internal"),
+                timeout=20.0,
+                json={
+                    "app_id": config.app.app_id,
+                    "app_secret": config.app.app_secret,
+                },
+            )
+            data = self._decode_response(resp)
+            if int(data.get("code", 0)) != 0:
+                raise RuntimeError(f"Feishu tenant_access_token failed: {data}")
+            token = str(data.get("tenant_access_token") or "")
+            if not token:
+                raise RuntimeError(f"Feishu tenant_access_token missing: {data}")
+            expire = float(data.get("expire") or 7200)
+            self._tenant_access_token = token
+            self._tenant_access_token_expires_at = now + max(
+                60.0,
+                expire - 300.0,
+            )
+            return token
 
     def _api_url(self, path: str) -> str:
         base = self._config().app.api_base_url.rstrip("/")

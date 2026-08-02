@@ -10,10 +10,7 @@
 
 from __future__ import annotations
 
-import pytest
-from pathlib import Path
-from unittest.mock import MagicMock, patch, mock_open
-from typing import Type
+from unittest.mock import MagicMock, patch
 
 from src.core.managers.config_manager import ConfigManager
 from src.core.components.base.config import BaseConfig, SectionBase, config_section
@@ -23,7 +20,8 @@ from pydantic import Field
 # 测试用配置类
 class TestPluginConfig(BaseConfig):
     """测试插件配置类。"""
-    
+
+    __test__ = False
     @config_section("general")
     class GeneralSection(SectionBase):
         """通用配置section。"""
@@ -75,7 +73,7 @@ class TestConfigManagerLoadConfig:
         cached_config = MagicMock(spec=TestPluginConfig)
         manager._configs["test_plugin"] = cached_config
         
-        with patch.object(TestPluginConfig, 'load_for_plugin') as mock_load:
+        with patch.object(TestPluginConfig, 'reload') as mock_load:
             result = manager.load_config("test_plugin", TestPluginConfig)
             
             # 不应调用 load_for_plugin
@@ -120,7 +118,7 @@ class TestConfigManagerReloadConfig:
         old_config = MagicMock(spec=TestPluginConfig)
         manager._configs["test_plugin"] = old_config
         
-        with patch.object(TestPluginConfig, 'load_for_plugin') as mock_load:
+        with patch.object(TestPluginConfig, 'reload') as mock_load:
             new_config = MagicMock(spec=TestPluginConfig)
             mock_load.return_value = new_config
             
@@ -135,7 +133,7 @@ class TestConfigManagerReloadConfig:
         """测试重载未缓存的配置。"""
         manager = ConfigManager()
         
-        with patch.object(TestPluginConfig, 'load_for_plugin') as mock_load:
+        with patch.object(TestPluginConfig, 'reload') as mock_load:
             mock_config = MagicMock(spec=TestPluginConfig)
             mock_load.return_value = mock_config
             

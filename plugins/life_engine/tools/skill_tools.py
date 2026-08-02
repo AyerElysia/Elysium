@@ -18,7 +18,6 @@ from typing import Annotated, Any, Literal
 from src.app.plugin_system.base import BaseTool
 from src.kernel.logger import get_logger
 
-from ._utils import _get_workspace
 
 logger = get_logger("life_engine.skill_tools")
 
@@ -33,6 +32,20 @@ def _normalize_name(name: str) -> str:
     text = re.sub(r"[^a-z0-9\u4e00-\u9fff-]+", "-", text)
     text = re.sub(r"-{2,}", "-", text).strip("-")
     return text[:64].strip("-")
+
+
+def _looks_like_automation_script(text: str) -> bool:
+    """Reject executable automation masquerading as a procedural memory."""
+    lowered = str(text or "").lower()
+    markers = (
+        "```bash",
+        "```sh",
+        "```powershell",
+        "rm -rf",
+        "subprocess.",
+        "os.system(",
+    )
+    return any(marker in lowered for marker in markers)
 
 
 def _get_skill_store(plugin: Any):
@@ -226,6 +239,8 @@ class LifeEngineSkillTool(BaseTool):
             return False, "请提供技能名称"
         if not description.strip():
             return False, "draft 需要 description（一句话描述这个做事方式）"
+        if _looks_like_automation_script(instructions):
+            return False, "技能只能描述做事方式，不能包含可执行脚本或破坏性命令"
 
         from ..learning.skill_store import SkillMaturity, SkillPattern
 

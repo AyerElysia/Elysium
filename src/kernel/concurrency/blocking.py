@@ -75,6 +75,7 @@ class BlockingPool:
         *,
         max_workers: int,
         env_var: str | None = None,
+        max_queue_size: int | None = None,
     ) -> None:
         """初始化线程池描述，线程在首次使用时才真正创建。
 
@@ -82,10 +83,15 @@ class BlockingPool:
             name: 池名，用作线程名前缀与日志标识。
             max_workers: 默认 worker 数。
             env_var: 可选的环境变量名，允许运维按实际负载覆盖 worker 数。
+            max_queue_size: 最多允许多少个调用在线程池队列中等待。默认与
+                ``max_workers`` 相同；超过容量会立即显式拒绝。
         """
         self._name = name
         self._default_max_workers = max_workers
         self._env_var = env_var
+        self._max_queue_size = max_workers if max_queue_size is None else max(
+            0, int(max_queue_size)
+        )
 
         self._executor: ThreadPoolExecutor | None = None
         self._executor_lock = threading.Lock()
@@ -94,6 +100,27 @@ class BlockingPool:
         self._abandoned: dict[int, AbandonedCall] = {}
         self._abandoned_lock = threading.Lock()
         self._total_abandoned = 0
+        self._admission_lock = threading.Lock()
+        self._inflight = 0
+        self._rejected = 0
+
+    def _admit(self, label: str) -> None:
+        """Reserve bounded worker/queue capacity for one submission."""
+        workers = self._max_workers or self._default_max_workers
+        capacity = workers + self._max_queue_size
+        with self._admission_lock:
+            if self._inflight >= capacity:
+                self._rejected += 1
+                raise BlockingCallNotStarted(
+                    f"[{self._name}] {label} 未启动：线程池容量已满 "
+                    f"({self._inflight}/{capacity})"
+                )
+            self._inflight += 1
+
+    def _release_admission(self, _future: Future[Any]) -> None:
+        """Return one worker/queue slot after a future settles."""
+        with self._admission_lock:
+            self._inflight = max(0, self._inflight - 1)
 
     @property
     def name(self) -> str:
@@ -222,7 +249,16 @@ class BlockingPool:
             Exception: ``fn`` 自身抛出的任何异常，原样向上传递。
         """
         started_at = time.monotonic()
-        future = self.executor().submit(fn, *args, **(kwargs or {}))
+        executor = self.executor()
+        effective_label = label or repr(fn)
+        self._admit(effective_label)
+        try:
+            future = executor.submit(fn, *args, **(kwargs or {}))
+        except BaseException:
+            with self._admission_lock:
+                self._inflight = max(0, self._inflight - 1)
+            raise
+        future.add_done_callback(self._release_admission)
         awaitable = asyncio.wrap_future(future)
 
         try:
@@ -240,7 +276,7 @@ class BlockingPool:
             self._register_abandoned(
                 future,
                 AbandonedCall(
-                    label=label or repr(fn),
+                    label=effective_label,
                     timeout=float(timeout or 0.0),
                     started_at=started_at,
                 ),
@@ -258,6 +294,9 @@ class BlockingPool:
         with self._abandoned_lock:
             live = list(self._abandoned.values())
             total = self._total_abandoned
+        with self._admission_lock:
+            inflight = self._inflight
+            rejected = self._rejected
 
         return {
             "name": self._name,
@@ -265,6 +304,9 @@ class BlockingPool:
             "abandoned_live": len(live),
             "abandoned_total": total,
             "abandoned_labels": sorted(record.label for record in live),
+            "max_queue_size": self._max_queue_size,
+            "inflight": inflight,
+            "rejected_total": rejected,
         }
 
     def shutdown(self, *, wait: bool = False) -> None:

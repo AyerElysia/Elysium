@@ -20,12 +20,12 @@
 from __future__ import annotations
 
 import os
-import re
 import tomllib
 from pathlib import Path
 from typing import Any
 
 from .schema import ElysiumSchema
+from .env import interpolate_env
 
 # ─────────────────────────────────────────────
 # 全局状态
@@ -34,27 +34,12 @@ from .schema import ElysiumSchema
 _config: ElysiumSchema | None = None
 _config_path: Path | None = None
 
-_ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _ENV_PREFIX = "ELYSIUM_"
 
 
 # ─────────────────────────────────────────────
 # 环境变量插值
 # ─────────────────────────────────────────────
-
-
-def _interpolate_env(value: Any) -> Any:
-    """递归替换字符串中的 ${VAR} 为环境变量值。"""
-    if isinstance(value, str):
-        def _replace(m: re.Match) -> str:
-            var_name = m.group(1)
-            return os.environ.get(var_name, m.group(0))  # 未设置则保留原文
-        return _ENV_PATTERN.sub(_replace, value)
-    if isinstance(value, dict):
-        return {k: _interpolate_env(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_interpolate_env(item) for item in value]
-    return value
 
 
 def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
@@ -200,7 +185,7 @@ def init_config(
         raw = _load_legacy_configs(path.parent)
 
     # 环境变量插值
-    raw = _interpolate_env(raw)
+    raw = interpolate_env(raw)
 
     # ELYSIUM_* 覆盖
     if env_override:

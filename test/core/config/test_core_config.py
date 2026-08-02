@@ -51,7 +51,7 @@ class TestLLMSection:
         """测试默认 LLM 配置。"""
         config = CoreConfig.LLMSection()
 
-        assert config.default_policy == "load_balanced"
+        assert config.default_policy == "failover"
 
     def test_custom_llm_config(self):
         """测试自定义 LLM 配置。"""
@@ -342,6 +342,7 @@ allow_operator_promotion = true
             config2 = init_core_config(str(config_path))
 
             # 第二次应该返回新创建的实例（因为重新初始化了）
+            assert config1 is not config2
             assert config2 is not None
             assert isinstance(config2, CoreConfig)
             # get_core_config 应该返回第二次初始化的实例

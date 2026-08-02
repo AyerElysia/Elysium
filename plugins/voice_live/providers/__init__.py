@@ -1,4 +1,4 @@
-"""全双工 Provider 抽象层。"""
+"""Realtime speech-to-speech provider layer."""
 
 from .base import BaseRealtimeProvider, ProviderState
 from .factory import create_provider

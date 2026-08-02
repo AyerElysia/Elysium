@@ -438,6 +438,12 @@ async def close_engine() -> None:
     """
     global _engine
 
+    # The session factory is bound to the engine that created it. Invalidate it
+    # before disposing the engine so a later restart cannot reuse a stale pool.
+    from .session import reset_session_factory
+
+    await reset_session_factory()
+
     if _engine is not None:
         logger.info("正在关闭数据库引擎...")
         await _engine.dispose()

@@ -491,6 +491,22 @@ class AnthropicChatClient:
         self._lock = threading.Lock()
         self._clients: dict[_ClientCacheKey, object] = {}
 
+    async def aclose(self) -> None:
+        """关闭并清空所有按事件循环缓存的 SDK 客户端。"""
+        with self._lock:
+            clients = list(self._clients.values())
+            self._clients.clear()
+
+        for client in clients:
+            close = getattr(client, "close", None)
+            if close is None:
+                close = getattr(client, "aclose", None)
+            if close is None:
+                continue
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+
     def _get_loop_key(self) -> int:
         """获取当前事件循环的唯一标识。"""
         import asyncio

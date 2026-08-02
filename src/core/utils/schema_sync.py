@@ -1,11 +1,10 @@
-"""数据库结构强一致同步。
+"""数据库结构安全同步。
 
 在应用启动阶段执行：
-- 删除代码模型中未定义的列
-- 添加数据库中缺失的列
-- 校验并修正列类型与可空性
+- 添加数据库中缺失且能够安全创建的列
+- 检查多余列、类型与可空性差异
 
-目标是让数据库结构与 `src.core.models.sql_alchemy` 中的 ORM 定义保持一致。
+启动阶段默认绝不删除数据。破坏性变更只能由显式迁移流程启用。
 """
 
 from __future__ import annotations
@@ -31,17 +30,32 @@ class SchemaSyncStats:
     tables_checked: int = 0
     columns_added: int = 0
     columns_removed: int = 0
+    columns_preserved: int = 0
     columns_type_altered: int = 0
     columns_nullability_altered: int = 0
+    type_mismatches: int = 0
+    nullability_mismatches: int = 0
+
+    @property
+    def requires_migration(self) -> bool:
+        """Whether non-additive schema drift still requires an explicit migration."""
+        return bool(
+            self.columns_preserved
+            or self.type_mismatches
+            or self.nullability_mismatches
+        )
 
 
 async def enforce_database_schema_consistency(
     metadata: MetaData | None = None,
+    *,
+    allow_destructive: bool = False,
 ) -> SchemaSyncStats:
-    """强制数据库结构与 ORM 定义保持一致。
+    """安全地对齐数据库结构与 ORM 定义。
 
     Args:
         metadata: 要对齐的模型元数据；为空时使用 core 默认模型元数据。
+        allow_destructive: 显式迁移时允许删除多余列或修改现有列。
 
     Returns:
         SchemaSyncStats: 同步结果统计。
@@ -65,15 +79,24 @@ async def enforce_database_schema_consistency(
         await conn.run_sync(lambda sync_conn: active_metadata.create_all(sync_conn))
 
         for table in active_metadata.sorted_tables:
-            await _sync_table(conn, table, db_type, stats)
+            await _sync_table(
+                conn,
+                table,
+                db_type,
+                stats,
+                allow_destructive=allow_destructive,
+            )
 
     logger.info(
         "Schema 对齐完成: "
         f"tables={stats.tables_checked}, "
         f"add={stats.columns_added}, "
         f"drop={stats.columns_removed}, "
+        f"preserve={stats.columns_preserved}, "
         f"type={stats.columns_type_altered}, "
-        f"nullable={stats.columns_nullability_altered}"
+        f"nullable={stats.columns_nullability_altered}, "
+        f"type_drift={stats.type_mismatches}, "
+        f"nullable_drift={stats.nullability_mismatches}"
     )
     return stats
 
@@ -83,6 +106,8 @@ async def _sync_table(
     model_table: Table,
     db_type: str,
     stats: SchemaSyncStats,
+    *,
+    allow_destructive: bool,
 ) -> None:
     """同步单个表结构。"""
     db_columns = await _get_db_columns(conn, model_table.name, model_table.schema)
@@ -98,8 +123,16 @@ async def _sync_table(
 
     table_ref = _qualified_table_name(model_table.name, model_table.schema, dialect)
 
-    # 1. 删除多余列（数据库有，模型无）
+    # 1. 多余列可能仍承载历史数据，启动时必须保留。
     for col_name in sorted(set(db_column_map) - set(model_column_map)):
+        if not allow_destructive:
+            stats.columns_preserved += 1
+            logger.warning(
+                f"检测到未定义列并已保留: {model_table.name}.{col_name}；"
+                "如需删除，请通过显式数据库迁移执行"
+            )
+            continue
+
         quoted_col = _quote_identifier(dialect, col_name)
         if "postgresql" in db_type:
             await conn.execute(
@@ -174,22 +207,40 @@ async def _sync_table(
         db_col_type = _normalize_type(str(db_col["type"]))
 
         if model_type != db_col_type:
-            await _alter_column_type(conn, model_table, col_name, model_col, db_type)
-            stats.columns_type_altered += 1
-            logger.warning(
-                f"已修正列类型: {model_table.name}.{col_name} "
-                f"({db_col_type} -> {model_type})"
-            )
+            stats.type_mismatches += 1
+            if allow_destructive and await _alter_column_type(
+                conn, model_table, col_name, model_col, db_type
+            ):
+                stats.columns_type_altered += 1
+                stats.type_mismatches -= 1
+                logger.warning(
+                    f"已修正列类型: {model_table.name}.{col_name} "
+                    f"({db_col_type} -> {model_type})"
+                )
+            else:
+                logger.warning(
+                    f"检测到列类型差异并未自动修改: {model_table.name}.{col_name} "
+                    f"({db_col_type} -> {model_type})"
+                )
 
         db_nullable = bool(db_col.get("nullable", True))
         model_nullable = bool(model_col.nullable)
         if db_nullable != model_nullable:
-            await _alter_column_nullability(conn, model_table, col_name, model_nullable, db_type)
-            stats.columns_nullability_altered += 1
-            logger.warning(
-                f"已修正可空性: {model_table.name}.{col_name} "
-                f"({db_nullable} -> {model_nullable})"
-            )
+            stats.nullability_mismatches += 1
+            if allow_destructive and await _alter_column_nullability(
+                conn, model_table, col_name, model_nullable, db_type
+            ):
+                stats.columns_nullability_altered += 1
+                stats.nullability_mismatches -= 1
+                logger.warning(
+                    f"已修正可空性: {model_table.name}.{col_name} "
+                    f"({db_nullable} -> {model_nullable})"
+                )
+            else:
+                logger.warning(
+                    f"检测到列可空性差异并未自动修改: {model_table.name}.{col_name} "
+                    f"({db_nullable} -> {model_nullable})"
+                )
 
 
 async def _get_db_columns(
@@ -246,7 +297,7 @@ async def _alter_column_type(
     col_name: str,
     model_col,
     db_type: str,
-) -> None:
+) -> bool:
     """修正列类型。"""
     table_ref = _qualified_table_name(table.name, table.schema, conn.dialect)
     quoted_col = _quote_identifier(conn.dialect, col_name)
@@ -259,7 +310,7 @@ async def _alter_column_type(
                 f"TYPE {target_type_sql} USING {quoted_col}::{target_type_sql}"
             )
         )
-        return
+        return True
 
     if "sqlite" in db_type:
         # SQLite 的类型亲和性意味着大多数类型差异在运行时不会造成问题，
@@ -267,7 +318,7 @@ async def _alter_column_type(
         logger.warning(
             f"SQLite 不支持 ALTER TYPE，跳过类型修正: {table.name}.{col_name}"
         )
-        return
+        return False
 
     raise DatabaseInitializationError(
         f"暂不支持的数据库类型: {db_type}，无法修正列类型 {table.name}.{col_name}"
@@ -280,7 +331,7 @@ async def _alter_column_nullability(
     col_name: str,
     target_nullable: bool,
     db_type: str,
-) -> None:
+) -> bool:
     """修正列可空性。"""
     table_ref = _qualified_table_name(table.name, table.schema, conn.dialect)
     quoted_col = _quote_identifier(conn.dialect, col_name)
@@ -292,14 +343,14 @@ async def _alter_column_nullability(
             else f"ALTER TABLE {table_ref} ALTER COLUMN {quoted_col} SET NOT NULL"
         )
         await conn.execute(text(sql))
-        return
+        return True
 
     if "sqlite" in db_type:
         # SQLite 不支持修改可空性，但这通常不影响运行时行为，跳过即可
         logger.warning(
             f"SQLite 不支持 ALTER NULLABILITY，跳过可空性修正: {table.name}.{col_name}"
         )
-        return
+        return False
 
     raise DatabaseInitializationError(
         f"暂不支持的数据库类型: {db_type}，无法修正可空性 {table.name}.{col_name}"

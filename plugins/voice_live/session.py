@@ -1,83 +1,78 @@
-"""通话会话管理。
-
-每个 WebSocket 连接对应一个 CallSession，
-管理全双工/降级路径的选择、生命周期和消息协议。
-"""
+"""One deterministic realtime voice session and its owned resources."""
 
 from __future__ import annotations
 
-import asyncio
-import json
 import time
 import uuid
-from enum import Enum, auto
+from collections.abc import Callable
 from typing import Any
 
 from src.kernel.logger import get_logger
 
+from .audio import resample_pcm16_mono
 from .config import VoiceLiveConfig
-from .degraded.llm_client import DegradedLLMClient
-from .degraded.pipeline import DegradedPipeline, PipelineState
-from .degraded.server_vad import VadConfig
-from .degraded.tts_streamer import TTSStreamer
+from .consciousness import VoiceLiveConsciousnessManager
+from .context_bridge import ContextBridge
+from .protocol import AUDIO_MAGIC, ProviderState, SessionState, pack_audio_frame, unpack_audio_frame
 from .providers.base import (
     AudioDelta,
     BaseRealtimeProvider,
-    ProviderState,
+    InterruptionEvent,
+    ProviderMetrics,
+    ToolCallEvent,
     TranscriptEvent,
 )
 from .providers.factory import create_provider
+from .runtime_store import VoiceEpisodeStore
+from .tool_broker import VoiceToolBroker
 
-logger = get_logger("voice_live.session", display="Call Session")
-
-
-class SessionState(Enum):
-    """会话状态。"""
-
-    IDLE = auto()
-    CONNECTING = auto()
-    ACTIVE_FULL_DUPLEX = auto()
-    ACTIVE_DEGRADED = auto()
-    ENDED = auto()
+logger = get_logger("voice_live.session", display="Voice Call")
+ProviderFactory = Callable[[VoiceLiveConfig], BaseRealtimeProvider]
 
 
 class CallSession:
-    """单次语音通话会话。
-
-    状态机：idle -> connecting -> active (full_duplex | degraded) -> ended
-
-    根据配置选择路径：
-    - 全双工 Provider 已配置且可用 -> 全双工路径
-    - 否则 -> 降级管线
-    """
+    """Own one provider, consciousness instance and durable voice episode."""
 
     def __init__(
         self,
         config: VoiceLiveConfig,
         session_id: str | None = None,
+        *,
+        provider_factory: ProviderFactory = create_provider,
+        store: VoiceEpisodeStore | None = None,
+        consciousness: VoiceLiveConsciousnessManager | None = None,
+        bridge: ContextBridge | None = None,
+        tool_broker: VoiceToolBroker | None = None,
     ) -> None:
         self._config = config
-        self.session_id = session_id or str(uuid.uuid4())[:8]
-        self._state = SessionState.IDLE
-        self._mode: str = ""  # "full_duplex" | "degraded"
-        self._created_at = time.time()
-
-        # 全双工路径
+        self.session_id = session_id or uuid.uuid4().hex[:12]
+        self.episode_id = self.session_id
+        self._provider_factory = provider_factory
+        self._runtime_injected = any(
+            value is not None for value in (store, consciousness, bridge, tool_broker)
+        )
+        instance_id = f"{config.session.instance_id_prefix}_{self.episode_id}"
+        self._store = store or VoiceEpisodeStore(
+            config.observability.trace_root, instance_id, self.episode_id
+        )
+        self._consciousness = consciousness or VoiceLiveConsciousnessManager(
+            config, self.episode_id, self._store
+        )
+        self._bridge = bridge or ContextBridge(config, self._consciousness, self._store)
+        self._tool_broker = tool_broker or VoiceToolBroker(
+            self._consciousness, config, self._store
+        )
         self._provider: BaseRealtimeProvider | None = None
-
-        # 降级路径
-        self._pipeline: DegradedPipeline | None = None
-
-        # 消息发送回调（由 Router 设置）
-        self._send_json: Any = None  # async (dict) -> None
-        self._send_bytes: Any = None  # async (bytes) -> None
-
-        # 上下文桥接（由外部注入）
-        self._system_prompt: str = ""
-
-    # ------------------------------------------------------------------
-    # 属性
-    # ------------------------------------------------------------------
+        self._state = SessionState.CREATED
+        self._send_json: Any = None
+        self._send_bytes: Any = None
+        self._last_input_sequence = -1
+        self._output_sequence = 0
+        self._input_audio_bytes = 0
+        self._output_audio_bytes = 0
+        self._interruptions = 0
+        self._created_monotonic = time.monotonic()
+        self._failure_reason = ""
 
     @property
     def state(self) -> SessionState:
@@ -85,313 +80,327 @@ class CallSession:
 
     @property
     def mode(self) -> str:
-        return self._mode
+        return "full_duplex" if self._state is SessionState.ACTIVE else ""
 
     @property
     def is_active(self) -> bool:
-        return self._state in (SessionState.ACTIVE_FULL_DUPLEX, SessionState.ACTIVE_DEGRADED)
+        return self._state is SessionState.ACTIVE
 
-    # ------------------------------------------------------------------
-    # 回调设置
-    # ------------------------------------------------------------------
+    @property
+    def provider_name(self) -> str:
+        return self._provider.provider_name if self._provider is not None else ""
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "episode_id": self.episode_id,
+            "state": self._state.value,
+            "provider": self.provider_name,
+            "input_audio_bytes": self._input_audio_bytes,
+            "output_audio_bytes": self._output_audio_bytes,
+            "interruptions": self._interruptions,
+            "age_seconds": round(time.monotonic() - self._created_monotonic, 3),
+            "failure_reason": self._failure_reason,
+        }
 
     def set_send_callbacks(self, send_json: Any, send_bytes: Any) -> None:
-        """设置消息发送回调。"""
         self._send_json = send_json
         self._send_bytes = send_bytes
 
-    def set_system_prompt(self, prompt: str) -> None:
-        """设置系统提示词（来自 ContextBridge）。"""
-        self._system_prompt = prompt
-
-    # ------------------------------------------------------------------
-    # 会话生命周期
-    # ------------------------------------------------------------------
-
-    async def start(self, mode: str = "auto") -> None:
-        """启动会话。
-
-        Args:
-            mode: "auto" | "full_duplex" | "degraded"
-        """
-        if self._state != SessionState.IDLE:
-            await self._send_error("会话已在运行中")
+    def _resume_runtime(self, episode_id: str) -> None:
+        if not episode_id or episode_id == self.episode_id:
             return
+        if self._runtime_injected:
+            raise RuntimeError("cannot replace an injected test runtime")
+        self.episode_id = episode_id
+        instance_id = f"{self._config.session.instance_id_prefix}_{episode_id}"
+        self._store = VoiceEpisodeStore(
+            self._config.observability.trace_root, instance_id, episode_id
+        )
+        self._consciousness = VoiceLiveConsciousnessManager(
+            self._config, episode_id, self._store
+        )
+        self._bridge = ContextBridge(self._config, self._consciousness, self._store)
+        self._tool_broker = VoiceToolBroker(
+            self._consciousness, self._config, self._store
+        )
 
-        await self._set_state(SessionState.CONNECTING)
+    async def start(self, mode: str = "auto", *, resume_episode_id: str = "") -> bool:
+        """Start the explicit provider; never switch models implicitly."""
+        if self._state is not SessionState.CREATED:
+            await self._send_error("会话已经启动或结束")
+            return False
+        if mode not in {"auto", "full_duplex"}:
+            await self._fail(f"不支持的模式: {mode}；Voice Live 不会隐式切换模型")
+            return False
 
         try:
-            # 路径选择
-            if mode == "full_duplex" or (
-                mode == "auto" and self._should_use_full_duplex()
-            ):
-                await self._start_full_duplex()
-            elif mode == "degraded" or mode == "auto":
-                await self._start_degraded()
-            else:
-                await self._send_error(f"不支持的模式: {mode}")
-                await self._set_state(SessionState.ENDED)
-                return
-
-            # 发送就绪消息
-            await self._send_json_safe({
-                "type": "ready",
-                "mode": self._mode,
-                "provider": self._get_provider_name(),
-                "session_id": self.session_id,
-            })
-
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"会话启动失败: {exc}")
-            await self._send_error(f"启动失败: {exc}")
-            await self._set_state(SessionState.ENDED)
-
-    async def stop(self) -> None:
-        """停止会话。"""
-        if self._state == SessionState.ENDED:
-            return
-
-        # 清理全双工路径
-        if self._provider:
-            try:
-                await self._provider.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
+            self._resume_runtime(resume_episode_id)
+        except Exception as exc:
+            await self._fail(f"恢复会话失败: {exc}")
+            return False
+        self._state = SessionState.CONNECTING
+        await self._store.append_async(
+            "session.connecting",
+            {"session_id": self.session_id, "resume": bool(resume_episode_id)},
+        )
+        await self._store.checkpoint_async("connecting", session_id=self.session_id)
+        try:
+            provider = self._provider_factory(self._config)
+            self._provider = provider
+            self._register_provider_callbacks(provider)
+            await self._consciousness.activate(provider.provider_name)
+            schemas = self._tool_broker.schemas()
+            await provider.connect(
+                {
+                    "instructions": self._bridge.build_system_prompt(),
+                    "model": self._config.full_duplex.model_name,
+                    "voice": self._config.full_duplex.voice,
+                    "tools": schemas,
+                    "provider_config": {
+                        "tools_available": [schema["name"] for schema in schemas]
+                    },
+                }
+            )
+        except Exception as exc:
+            logger.error(f"实时语音会话启动失败: {exc}", exc_info=True)
+            provider = self._provider
             self._provider = None
+            if provider is not None:
+                try:
+                    await provider.disconnect()
+                except Exception:
+                    pass
+            if self._consciousness.is_active:
+                await self._consciousness.suspend(reason="startup_failed")
+            await self._fail(f"启动失败: {exc}")
+            return False
 
-        # 清理降级路径
-        if self._pipeline:
-            await self._pipeline.stop()
-            self._pipeline = None
+        self._state = SessionState.ACTIVE
+        await self._consciousness.report_state("实时通话已连接，正在倾听")
+        await self._store.append_async(
+            "session.ready",
+            {"session_id": self.session_id, "provider": provider.provider_name},
+        )
+        await self._store.checkpoint_async(
+            "active", session_id=self.session_id, provider=provider.provider_name
+        )
+        await self._send_json_safe(
+            {
+                "type": "ready",
+                "mode": "full_duplex",
+                "provider": provider.provider_name,
+                "session_id": self.session_id,
+                "episode_id": self.episode_id,
+                "protocol": 1,
+                "input_sample_rate": self._config.audio.input_sample_rate,
+                "output_sample_rate": self._config.audio.output_sample_rate,
+            }
+        )
+        return True
 
-        await self._set_state(SessionState.ENDED)
-        await self._send_json_safe({"type": "ended"})
-        logger.info(f"会话结束: {self.session_id}")
-
-    # ------------------------------------------------------------------
-    # 客户端消息处理
-    # ------------------------------------------------------------------
+    async def stop(self, *, reason: str = "normal") -> None:
+        if self._state in {SessionState.STOPPING, SessionState.ENDED}:
+            return
+        was_failed = self._state is SessionState.FAILED
+        self._state = SessionState.STOPPING
+        errors: list[Exception] = []
+        provider = self._provider
+        self._provider = None
+        if provider is not None:
+            try:
+                await provider.disconnect()
+            except Exception as exc:
+                errors.append(exc)
+        if self._consciousness.is_active:
+            try:
+                await self._consciousness.suspend(reason=reason)
+            except Exception as exc:
+                errors.append(exc)
+        final_state = SessionState.FAILED if was_failed else SessionState.ENDED
+        try:
+            await self._store.append_async(
+                "session.ended",
+                {"reason": reason, "failed": was_failed, "cleanup_errors": [str(exc) for exc in errors]},
+            )
+            await self._store.checkpoint_async(
+                final_state.value,
+                reason=reason,
+                cleanup_errors=[str(exc) for exc in errors],
+                metrics=self.snapshot(),
+            )
+        except Exception as exc:
+            errors.append(exc)
+        self._state = final_state
+        await self._send_json_safe(
+            {"type": "ended", "reason": reason, "state": final_state.value}
+        )
+        if errors:
+            logger.warning(
+                "Voice Live 会话结束时有 %d 个清理错误: %s",
+                len(errors),
+                "; ".join(str(exc) for exc in errors),
+            )
 
     async def handle_message(self, data: dict[str, Any]) -> None:
-        """处理客户端 JSON 控制消息。"""
-        msg_type = data.get("type", "")
+        message_type = str(data.get("type") or "")
+        if message_type == "start":
+            await self.start(
+                str(data.get("mode") or "auto"),
+                resume_episode_id=str(data.get("resume_episode_id") or ""),
+            )
+        elif message_type == "interrupt":
+            if self._provider is not None and self.is_active:
+                self._interruptions += 1
+                await self._send_json_safe(
+                    {"type": "playback.clear", "reason": "client_barge_in"}
+                )
+                played_ms = data.get("played_audio_ms")
+                await self._provider.interrupt(
+                    played_audio_ms=int(played_ms) if played_ms is not None else None
+                )
+        elif message_type == "text":
+            text = str(data.get("text") or "").strip()
+            if text and self._provider is not None and self.is_active:
+                await self._provider.send_text(text)
+        elif message_type == "stop":
+            await self.stop(reason="client_stop")
+        elif message_type == "ping":
+            await self._send_json_safe(
+                {"type": "pong", "server_monotonic_ms": time.monotonic_ns() // 1_000_000}
+            )
+        else:
+            await self._send_error(f"未知消息类型: {message_type}")
 
-        match msg_type:
-            case "start":
-                mode = data.get("mode", "auto")
-                await self.start(mode)
-            case "interrupt":
-                await self._handle_interrupt()
-            case "stop":
-                await self.stop()
-            case "ping":
-                await self._send_json_safe({"type": "pong"})
-            case _:
-                logger.debug(f"未知消息类型: {msg_type}")
-
-    async def handle_audio(self, audio_bytes: bytes) -> None:
-        """处理客户端二进制音频帧。"""
-        if not self.is_active:
+    async def handle_audio(self, data: bytes) -> None:
+        if not self.is_active or self._provider is None or not data:
             return
-
-        if self._state == SessionState.ACTIVE_FULL_DUPLEX and self._provider:
-            await self._provider.send_audio(audio_bytes)
-        elif self._state == SessionState.ACTIVE_DEGRADED and self._pipeline:
-            await self._pipeline.feed_audio(audio_bytes)
-
-    # ------------------------------------------------------------------
-    # 全双工路径
-    # ------------------------------------------------------------------
-
-    async def _start_full_duplex(self) -> None:
-        """启动全双工路径。"""
-        fd_config = self._config.full_duplex
-        self._provider = create_provider(self._config)
-
-        if self._provider is None:
-            raise RuntimeError("无法创建全双工 Provider")
-
-        # 注册回调
-        self._provider.on_audio_delta(self._on_provider_audio)
-        self._provider.on_state_change(self._on_provider_state)
-        self._provider.on_transcript(self._on_provider_transcript)
-        self._provider.on_error(self._on_provider_error)
-
-        # 构建会话配置
-        session_config = {
-            "instructions": self._system_prompt or fd_config.instructions,
-            "voice": fd_config.voice,
-            "model": fd_config.model_name,
-        }
-
-        await self._provider.connect(session_config)
-        self._mode = "full_duplex"
-        await self._set_state(SessionState.ACTIVE_FULL_DUPLEX)
-        logger.info(f"全双工会话已启动: {self.session_id}")
-
-    # ------------------------------------------------------------------
-    # 降级路径
-    # ------------------------------------------------------------------
-
-    async def _start_degraded(self) -> None:
-        """启动降级管线。"""
-        deg_config = self._config.degraded
-        vad_section = self._config.vad
-
-        # 构建 VAD 配置
-        vad_config = VadConfig(
-            threshold=vad_section.threshold,
-            silence_ms=vad_section.silence_ms,
-            min_speech_ms=vad_section.min_speech_ms,
-            max_ms=vad_section.max_ms,
-            pre_speech_ms=vad_section.pre_speech_ms,
-            sample_rate=self._config.audio.input_sample_rate,
+        if not data.startswith(AUDIO_MAGIC):
+            raise ValueError("audio frame must use Voice Live protocol v1")
+        frame = unpack_audio_frame(data)
+        if frame.sequence <= self._last_input_sequence:
+            raise ValueError(
+                f"audio sequence must increase: {frame.sequence} <= {self._last_input_sequence}"
+            )
+        self._last_input_sequence = frame.sequence
+        pcm16 = resample_pcm16_mono(
+            frame.pcm16, frame.sample_rate, self._provider.input_sample_rate
         )
+        self._input_audio_bytes += len(pcm16)
+        await self._provider.send_audio(pcm16)
 
-        # 构建 LLM 客户端
-        llm_client = self._build_llm_client(deg_config)
+    def _register_provider_callbacks(self, provider: BaseRealtimeProvider) -> None:
+        provider.on_audio_delta(self._on_audio)
+        provider.on_state_change(self._on_provider_state)
+        provider.on_transcript(self._on_transcript)
+        provider.on_error(self._on_error)
+        provider.on_interruption(self._on_interruption)
+        provider.on_metrics(self._on_metrics)
+        provider.on_tool_call(self._on_tool_call)
 
-        # 构建 TTS 流式合成器
-        tts_streamer = TTSStreamer(
-            tts_style=deg_config.tts_style,
-            sentence_min_chars=deg_config.sentence_min_chars,
+    async def _on_audio(self, event: AudioDelta) -> None:
+        if self._send_bytes is None:
+            return
+        self._output_sequence += 1
+        self._output_audio_bytes += len(event.data)
+        await self._send_bytes(
+            pack_audio_frame(self._output_sequence, event.sample_rate, event.data)
         )
-
-        # 组装管线
-        self._pipeline = DegradedPipeline(vad_config, llm_client, tts_streamer)
-        self._pipeline.on_audio_output(self._on_pipeline_audio)
-        self._pipeline.on_state_change(self._on_pipeline_state)
-        self._pipeline.on_transcript(self._on_pipeline_transcript)
-
-        await self._pipeline.start(self._system_prompt)
-        self._mode = "degraded"
-        await self._set_state(SessionState.ACTIVE_DEGRADED)
-        logger.info(f"降级会话已启动: {self.session_id}")
-
-    def _build_llm_client(self, deg_config: Any) -> DegradedLLMClient:
-        """构建降级 LLM 客户端。"""
-        # 从 model.toml 的 [model_tasks.live] 获取模型信息
-        # 默认使用 NexusAI 中转站 + MiMo-V2.5
-        return DegradedLLMClient(
-            base_url="http://localhost:3000/v1",
-            api_key="sk-V2o9Ut2rBHFgkH4hCy53snYbQA5uAlkc25jlRzmtT9P3wapo",
-            model="mimo-v2.5",
-            timeout=deg_config.llm_timeout,
-            max_context_turns=deg_config.max_context_turns,
-        )
-
-    # ------------------------------------------------------------------
-    # 打断处理
-    # ------------------------------------------------------------------
-
-    async def _handle_interrupt(self) -> None:
-        """处理打断请求。"""
-        if self._state == SessionState.ACTIVE_FULL_DUPLEX and self._provider:
-            await self._provider.interrupt()
-        elif self._state == SessionState.ACTIVE_DEGRADED and self._pipeline:
-            await self._pipeline.interrupt()
-
-    # ------------------------------------------------------------------
-    # Provider 回调
-    # ------------------------------------------------------------------
-
-    async def _on_provider_audio(self, delta: AudioDelta) -> None:
-        """全双工 Provider 音频输出。"""
-        if self._send_bytes:
-            # 先发 JSON 头（可选），再发二进制帧
-            await self._send_json_safe({
-                "type": "audio_delta",
-                "format": delta.format,
-                "sample_rate": delta.sample_rate,
-            })
-            await self._send_bytes(delta.data)
-
 
     async def _on_provider_state(self, state: ProviderState) -> None:
-        """全双工 Provider 状态变更。"""
-        state_map = {
-            ProviderState.LISTENING: "listening",
-            ProviderState.SPEAKING: "speaking",
-            ProviderState.CONNECTING: "connecting",
-            ProviderState.ERROR: "error",
-        }
-        mapped = state_map.get(state, "idle")
-        await self._send_json_safe({"type": "state", "state": mapped})
+        await self._send_json_safe({"type": "state", "state": state.value})
+        await self._store.append_async("provider.state", {"state": state.value})
+        if self._consciousness.is_active:
+            await self._consciousness.report_state(f"实时通话状态：{state.value}")
 
-    async def _on_provider_transcript(self, event: TranscriptEvent) -> None:
-        """全双工 Provider 转写事件。"""
-        await self._send_json_safe({
-            "type": "transcript",
-            "role": event.role,
-            "text": event.text,
-            "is_final": event.is_final,
-        })
+    async def _on_transcript(self, event: TranscriptEvent) -> None:
+        await self._send_json_safe(
+            {
+                "type": "transcript",
+                "role": event.role,
+                "text": event.text,
+                "is_final": event.is_final,
+                "event_id": event.event_id,
+            }
+        )
+        if event.is_final:
+            await self._bridge.record_transcript(
+                event.role, event.text, provider_event_id=event.event_id
+            )
 
-    async def _on_provider_error(self, message: str) -> None:
-        """全双工 Provider 错误。"""
-        await self._send_error(message)
+    async def _on_error(self, message: str) -> None:
+        await self._store.append_async("provider.error", {"message": message})
+        if self._state not in {
+            SessionState.STOPPING,
+            SessionState.ENDED,
+            SessionState.FAILED,
+        }:
+            await self._fail(f"上游实时模型异常: {message}")
 
-    # ------------------------------------------------------------------
-    # Pipeline 回调
-    # ------------------------------------------------------------------
+    async def _on_interruption(self, event: InterruptionEvent) -> None:
+        self._interruptions += 1
+        await self._store.append_async(
+            "provider.interruption",
+            {
+                "source": event.source,
+                "response_id": event.response_id,
+                "item_id": event.item_id,
+            },
+        )
+        await self._send_json_safe(
+            {"type": "playback.clear", "reason": event.source}
+        )
 
-    async def _on_pipeline_audio(self, audio_bytes: bytes, fmt: str) -> None:
-        """降级管线音频输出。"""
-        if self._send_bytes:
-            await self._send_json_safe({
-                "type": "audio_delta",
-                "format": fmt,
-                "sample_rate": self._config.audio.output_sample_rate,
-            })
-            await self._send_bytes(audio_bytes)
+    async def _on_metrics(self, event: ProviderMetrics) -> None:
+        await self._store.append_async("provider.metrics", event.values)
+        await self._send_json_safe(
+            {"type": "metrics", "values": event.values, "session": self.snapshot()}
+        )
 
-    async def _on_pipeline_state(self, state: PipelineState) -> None:
-        """降级管线状态变更。"""
-        state_map = {
-            PipelineState.LISTENING: "listening",
-            PipelineState.THINKING: "thinking",
-            PipelineState.SPEAKING: "speaking",
-            PipelineState.ERROR: "error",
-        }
-        mapped = state_map.get(state, "idle")
-        await self._send_json_safe({"type": "state", "state": mapped})
+    async def _on_tool_call(self, event: ToolCallEvent) -> None:
+        try:
+            result = await self._tool_broker.execute(event.name, event.arguments_json)
+        except Exception as exc:
+            result = {"success": False, "error": str(exc)}
+            await self._store.append_async(
+                "tool.failed", {"name": event.name, "error": str(exc)}
+            )
+        if self._provider is not None:
+            await self._provider.submit_tool_result(event.call_id, result)
 
-    async def _on_pipeline_transcript(self, role: str, text: str) -> None:
-        """降级管线转写。"""
-        await self._send_json_safe({
-            "type": "transcript",
-            "role": role,
-            "text": text,
-            "is_final": True,
-        })
-
-    # ------------------------------------------------------------------
-    # 内部方法
-    # ------------------------------------------------------------------
-
-    def _should_use_full_duplex(self) -> bool:
-        """判断是否应使用全双工路径。"""
-        fd_config = self._config.full_duplex
-        return fd_config.provider_type != "disabled" and bool(fd_config.upstream_url)
-
-    def _get_provider_name(self) -> str:
-        """获取当前 Provider 名称。"""
-        if self._mode == "full_duplex" and self._provider:
-            return self._provider.provider_name
-        return "degraded_pipeline"
-
-    async def _set_state(self, new_state: SessionState) -> None:
-        """设置会话状态。"""
-        self._state = new_state
+    async def _fail(self, message: str) -> None:
+        if self._state is SessionState.FAILED:
+            return
+        self._failure_reason = message
+        self._state = SessionState.FAILED
+        await self._store.append_async("session.failed", {"error": message})
+        await self._store.checkpoint_async("failed", error=message)
+        await self._send_error(message, fatal=True)
+        provider = self._provider
+        self._provider = None
+        if provider is not None:
+            try:
+                await provider.disconnect()
+            except Exception:
+                pass
+        if self._consciousness.is_active:
+            await self._consciousness.suspend(reason="abnormal_exit")
+        await self._store.checkpoint_async(
+            "suspended", reason="abnormal_exit", error=message
+        )
 
     async def _send_json_safe(self, data: dict[str, Any]) -> None:
-        """安全发送 JSON 消息。"""
-        if self._send_json:
-            try:
-                await self._send_json(data)
-            except Exception:  # noqa: BLE001
-                pass
+        if self._send_json is None:
+            return
+        try:
+            await self._send_json(data)
+        except Exception as exc:
+            logger.debug(f"Voice Live transport send failed: {exc}")
 
-    async def _send_error(self, message: str) -> None:
-        """发送错误消息。"""
-        await self._send_json_safe({"type": "error", "message": message})
+    async def _send_error(self, message: str, *, fatal: bool = False) -> None:
+        await self._send_json_safe(
+            {"type": "error", "message": message, "fatal": fatal}
+        )
+
+
+__all__ = ["CallSession", "SessionState"]

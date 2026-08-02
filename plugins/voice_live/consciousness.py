@@ -1,187 +1,185 @@
-"""Voice Live 意识实例管理。
-
-语音通话定义为独立意识实例（kind="voice_live"），
-通过潜意识（WorldState + ConsciousnessRegistry）与其他意识协同。
-
-参照 life_engine/livestream/__init__.py 的 LivestreamConsciousnessManager 模式。
-"""
+"""Lifecycle binding for the independent realtime voice consciousness."""
 
 from __future__ import annotations
 
-import logging
-from dataclasses import dataclass
+import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from plugins.life_engine.service.consciousness import ConsciousnessInstance
+from plugins.life_engine.service.tool_manifests import get_tool_manifest
+from plugins.life_engine.service.world_state import PerceptionFilter, SceneState
+
+from .runtime_store import VoiceEpisodeStore
 
 
-@dataclass(slots=True)
-class VoiceLiveConsciousnessConfig:
-    """语音通话意识实例配置。"""
-
-    instance_id: str = "voice_live_001"
-    display_name: str = "语音通话意识"
-    stream_id: str = "voice_live_main"
-    cross_scene_awareness: bool = True
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def build_voice_live_perception_filter() -> Any:
-    """构建语音通话意识的感知过滤器。
-
-    语音通话意识：
-    - 看到所有关系（需要知道在和谁说话）
-    - 看到身体状态（保持人格一致性）
-    - 不需要承诺细节（通话中不处理任务）
-    - 看到跨场景摘要
-    """
-    from plugins.life_engine.service.world_state import PerceptionFilter
-
-    return PerceptionFilter(
-        relationship_ids=[],  # 空 = 所有关系
-        scene_ids=[],  # 空 = 所有场景
-        thread_kinds=["topic"],  # 只要活跃话题
-        include_body_state=True,
-        include_commitments=False,  # 通话不需要承诺细节
-    )
+def build_voice_live_perception_filter() -> PerceptionFilter:
+    """Voice calls receive an unabridged semantic slice of the shared world."""
+    return PerceptionFilter.full()
 
 
 class VoiceLiveConsciousnessManager:
-    """管理语音通话意识实例的生命周期。
+    """Own a real registry instance, scene binding and durable episode."""
 
-    用法：
-        manager = VoiceLiveConsciousnessManager(config)
-        await manager.activate()   # 通话开始时注册并激活
-        ...通话进行中...
-        await manager.suspend()    # 通话结束时挂起
-    """
+    def __init__(
+        self,
+        config: Any,
+        episode_id: str,
+        store: VoiceEpisodeStore,
+        *,
+        service: Any | None = None,
+    ) -> None:
+        session = config.session
+        self.episode_id = episode_id
+        self.instance_id = f"{session.instance_id_prefix}_{episode_id}"
+        self.stream_id = f"{session.stream_id_prefix}_{episode_id}"
+        self._config = config
+        self._store = store
+        self._service = service
+        self._instance: ConsciousnessInstance | None = None
 
-    def __init__(self, config: VoiceLiveConsciousnessConfig | None = None) -> None:
-        self._config = config or VoiceLiveConsciousnessConfig()
-        self._instance: Any = None
-        self._active = False
-        self._registry: Any = None
+    @property
+    def instance(self) -> ConsciousnessInstance | None:
+        return self._instance
 
     @property
     def is_active(self) -> bool:
-        return self._active
+        return bool(self._instance and self._instance.is_active)
 
-    @property
-    def instance_id(self) -> str:
-        return self._config.instance_id
+    def _life_service(self) -> Any | None:
+        if self._service is not None:
+            return self._service
+        from plugins.life_engine.service.registry import get_life_engine_service
 
-    def _get_registry(self) -> Any:
-        """获取 ConsciousnessRegistry 实例。"""
-        if self._registry is not None:
-            return self._registry
-        try:
-            from plugins.life_engine.service.consciousness import ConsciousnessRegistry
-            # 尝试从 life_engine 插件获取 registry
-            from src.core.managers import get_plugin_manager
-            plugin = get_plugin_manager().get_plugin("life_engine")
-            if plugin:
-                registry = getattr(plugin, "consciousness_registry", None)
-                if registry:
-                    self._registry = registry
-                    return registry
-        except Exception:  # noqa: BLE001
-            pass
-        return None
+        return get_life_engine_service()
 
-    async def activate(self) -> bool:
-        """注册并激活语音通话意识实例。"""
-        if self._active:
-            return True
-
-        registry = self._get_registry()
-        if registry is None:
-            logger.debug("ConsciousnessRegistry 不可用，跳过意识注册")
-            return False
-
-        try:
-            from plugins.life_engine.service.consciousness import ConsciousnessInstance
-
-            now = datetime.now(timezone.utc).isoformat()
-            perception_filter = build_voice_live_perception_filter()
-
-            self._instance = ConsciousnessInstance(
-                instance_id=self._config.instance_id,
+    async def activate(self, provider_name: str) -> ConsciousnessInstance:
+        service = self._life_service()
+        if service is None:
+            if self._config.session.require_life_engine:
+                raise RuntimeError("LifeEngine 未运行，不能创建真实 voice_live 意识实例")
+            instance = ConsciousnessInstance(
+                instance_id=self.instance_id,
                 kind="voice_live",
-                display_name=self._config.display_name,
-                stream_ids=[self._config.stream_id],
+                display_name=self._config.session.display_name,
+                stream_ids=[self.stream_id],
+                status="active",
+                created_at=_now(),
+                last_active_at=_now(),
+                perception_filter=build_voice_live_perception_filter(),
+                metadata={"episode_id": self.episode_id, "provider": provider_name},
+            )
+            self._instance = instance
+            await self._store.append_async("consciousness.activated", instance.to_dict())
+            return instance
+
+        registry = service.consciousness_registry
+        existing = registry.get(self.instance_id)
+        now = _now()
+        metadata = {
+            "episode_id": self.episode_id,
+            "provider": provider_name,
+            "cross_scene_awareness": self._config.session.cross_scene_awareness,
+            "tool_manifest": get_tool_manifest("voice_live"),
+        }
+
+        if existing is not None and existing.kind != "voice_live":
+            raise RuntimeError(f"意识实例 ID 冲突: {self.instance_id}")
+        if existing is None or existing.status == "terminated":
+            instance = ConsciousnessInstance(
+                instance_id=self.instance_id,
+                kind="voice_live",
+                display_name=self._config.session.display_name,
+                stream_ids=[self.stream_id],
                 status="active",
                 created_at=now,
                 last_active_at=now,
-                perception_filter=perception_filter,
-                metadata={
-                    "cross_scene_awareness": self._config.cross_scene_awareness,
-                    "type": "voice_call",
-                },
+                perception_filter=build_voice_live_perception_filter(),
+                metadata=metadata,
             )
+            registry.register(instance)
+        else:
+            instance = existing
+            instance.stream_ids = [self.stream_id]
+            instance.perception_filter = build_voice_live_perception_filter()
+            instance.metadata.update(metadata)
+            if instance.is_suspended:
+                registry.resume(self.instance_id, timestamp=now)
+            else:
+                registry.touch(self.instance_id, timestamp=now)
 
-            # 如果存在同 ID 的旧实例，先终止
-            existing = registry.get(self._config.instance_id)
-            if existing and existing.status == "suspended":
-                registry.terminate(self._config.instance_id)
+        service.world_state.upsert_scene(
+            SceneState(
+                scene_id=self.stream_id,
+                kind="voice_live",
+                display_name=self._config.session.stream_name,
+                status_summary="实时通话已连接",
+                last_active_at=now,
+                consciousness_instance_id=self.instance_id,
+                context_tags=[provider_name, self.episode_id],
+            )
+        )
+        await asyncio.to_thread(service.save_consciousness_registry)
+        await asyncio.to_thread(service.save_world_state)
+        self._instance = instance
+        await self._store.append_async("consciousness.activated", instance.to_dict())
+        await self._store.checkpoint_async("consciousness_active", provider=provider_name)
+        return instance
 
-            registry.register(self._instance)
-            self._active = True
-            logger.info(f"语音通话意识已激活: {self._config.instance_id}")
-            return True
-
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"意识实例注册失败: {exc}")
-            return False
-
-    async def suspend(self) -> None:
-        """挂起语音通话意识实例。"""
-        if not self._active:
+    async def report_state(self, summary: str) -> None:
+        if not summary:
             return
+        service = self._life_service()
+        now = _now()
+        if service is not None:
+            existing = service.world_state.active_scenes.get(self.stream_id)
+            service.world_state.upsert_scene(
+                SceneState(
+                    scene_id=self.stream_id,
+                    kind="voice_live",
+                    display_name=self._config.session.stream_name,
+                    status_summary=summary,
+                    last_active_at=now,
+                    consciousness_instance_id=self.instance_id,
+                    context_tags=list(existing.context_tags) if existing else [self.episode_id],
+                )
+            )
+            service.consciousness_registry.touch(self.instance_id, timestamp=now)
+            await asyncio.to_thread(service.save_consciousness_registry)
+            await asyncio.to_thread(service.save_world_state)
+        await self._store.append_async("consciousness.state", {"summary": summary})
 
-        registry = self._get_registry()
-        if registry:
-            try:
-                now = datetime.now(timezone.utc).isoformat()
-                registry.suspend(self._config.instance_id, timestamp=now)
-            except Exception:  # noqa: BLE001
-                pass
-
-        self._active = False
+    async def suspend(self, *, reason: str = "normal") -> None:
+        service = self._life_service()
+        now = _now()
+        if service is not None:
+            service.consciousness_registry.suspend(self.instance_id, timestamp=now)
+            existing = service.world_state.active_scenes.get(self.stream_id)
+            service.world_state.upsert_scene(
+                SceneState(
+                    scene_id=self.stream_id,
+                    kind="voice_live",
+                    display_name=self._config.session.stream_name,
+                    status_summary=f"通话已结束：{reason}",
+                    last_active_at=now,
+                    consciousness_instance_id=self.instance_id,
+                    context_tags=list(existing.context_tags) if existing else [self.episode_id],
+                )
+            )
+            await asyncio.to_thread(service.save_consciousness_registry)
+            await asyncio.to_thread(service.save_world_state)
+        await self._store.append_async("consciousness.suspended", {"reason": reason})
+        await self._store.checkpoint_async("suspended", reason=reason)
         self._instance = None
-        logger.info(f"语音通话意识已挂起: {self._config.instance_id}")
 
-    async def report_state(self, state_text: str) -> None:
-        """向 WorldState 报告通话状态。
-
-        例如："正在和用户语音通话中"
-        """
-        registry = self._get_registry()
-        if not registry or not self._instance:
-            return
-
-        try:
-            from plugins.life_engine.service.world_state import WorldState
-            # 通过 life_engine 获取 world_state
-            from src.core.managers import get_plugin_manager
-            plugin = get_plugin_manager().get_plugin("life_engine")
-            if plugin:
-                world_state = getattr(plugin, "world_state", None)
-                if world_state and hasattr(world_state, "update_scene_status"):
-                    world_state.update_scene_status(
-                        self._config.instance_id,
-                        state_text,
-                    )
-        except Exception:  # noqa: BLE001
-            pass
-
-    def render_perception(self, world_state: Any) -> str:
-        """渲染 WorldState 切片供语音通话上下文使用。"""
-        if self._instance is None:
+    def render_world_state(self) -> str:
+        service = self._life_service()
+        if service is None:
             return ""
-        try:
-            return world_state.render_for_perception(
-                self._instance.perception_filter,
-                max_chars=1500,
-            )
-        except Exception:  # noqa: BLE001
-            return ""
+        # Use the complete JSON representation.  Do not impose a local character
+        # budget or a hand-picked category filter on cognition.
+        return service.world_state.to_json()

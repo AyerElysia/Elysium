@@ -1,9 +1,4 @@
-"""Voice Live 插件主类。
-
-提供全双工实时语音通话能力，支持：
-- 真全双工路径：OpenAI Realtime API / Moshi 协议
-- 降级路径：MiMo-V2.5 多模态理解 + IndexTTS2 本地合成
-"""
+"""Independent commercial realtime voice consciousness plugin."""
 
 from __future__ import annotations
 
@@ -27,8 +22,8 @@ class VoiceLivePlugin(BasePlugin):
     """
 
     plugin_name = "Voice-Live"
-    plugin_description = "全双工实时语音通话"
-    plugin_version = "1.0.0"
+    plugin_description = "独立意识、可恢复、可打断的实时语音通话"
+    plugin_version = "2.0.0"
     configs = [VoiceLiveConfig]
 
     def __init__(self, config: VoiceLiveConfig | None = None) -> None:

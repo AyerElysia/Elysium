@@ -495,7 +495,9 @@ class TestMediaManagerRecognizeVoice:
             mock_client = AsyncMock()
             mock_client.create_transcription = AsyncMock(return_value="识别文字")
 
-            with patch('src.core.managers.media_manager.ModelClientRegistry') as mock_registry_cls:
+            with patch(
+                'src.core.managers.media_manager.get_default_model_client_registry'
+            ) as mock_registry_cls:
                 mock_registry = MagicMock()
                 mock_registry_cls.return_value = mock_registry
                 mock_registry.get_asr_client_for_model.return_value = mock_client

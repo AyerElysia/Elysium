@@ -47,6 +47,7 @@ class LifeEngineConfig(BaseConfig):
         "model": {"task_name", "chatter_task_name"},
         "memory_index": {
             "enabled",
+            "backend_enabled",
             "interval_seconds",
             "batch_size",
             "run_on_startup",
@@ -262,6 +263,11 @@ class LifeEngineConfig(BaseConfig):
         enabled: bool = Field(
             default=True,
             description="是否启用独立的记忆 chunk 向量索引 worker。",
+        )
+
+        backend_enabled: bool = Field(
+            default=True,
+            description="是否初始化 Life Memory 的 Chroma 向量后端；关闭时保留 SQLite 全文检索。",
         )
 
         interval_seconds: int = Field(

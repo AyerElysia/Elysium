@@ -60,6 +60,7 @@ class StreamLoopManager:
 
         # 流启动锁：防止并发启动同一个流的多个任务
         self._stream_start_locks: dict[str, asyncio.Lock] = {}
+        self._active_stream_tasks: dict[str, asyncio.Task[Any]] = {}
 
         # WatchDog 重启防抖状态
         # - _restart_inflight: 当前正在执行重启的流
@@ -103,9 +104,6 @@ class StreamLoopManager:
 
     async def stop(self) -> None:
         """停止流循环管理器，取消所有驱动器任务。"""
-        if not self.is_running:
-            return
-
         self.is_running = False
 
         from src.core.managers import get_stream_manager
@@ -125,6 +123,25 @@ class StreamLoopManager:
                 *[self._wait_for_task_cancel(sid, t) for sid, t in cancel_tasks],
                 return_exceptions=True,
             )
+
+        from src.kernel.concurrency import get_watchdog
+
+        stream_ids = set(self._active_stream_tasks)
+        stream_ids.update(self._stream_start_locks)
+        for stream_id in stream_ids:
+            get_watchdog().unregister_stream(stream_id)
+
+        for chat_stream in sm._streams.values():
+            chat_stream.context.stream_loop_task = None
+
+        self._active_stream_tasks.clear()
+        self._stream_start_locks.clear()
+        self._restart_inflight.clear()
+        self._restart_next_allowed_at.clear()
+        self._chatter_genes.clear()
+        self._wait_states.clear()
+        self._pending_wait_resume_events.clear()
+        self._stats["active_streams"] = 0
 
         logger.info("StreamLoopManager 已停止")
 
@@ -188,6 +205,14 @@ class StreamLoopManager:
                     daemon=True,
                 )
                 context.stream_loop_task = loop_task.task
+                was_active = stream_id in self._active_stream_tasks
+                self._active_stream_tasks[stream_id] = loop_task.task
+                loop_task.task.add_done_callback(
+                    lambda task, sid=stream_id: self._on_stream_task_done(
+                        sid,
+                        task,
+                    )
+                )
 
                 event_loop = asyncio.get_running_loop()
 
@@ -225,7 +250,8 @@ class StreamLoopManager:
                     restart_cooldown=restart_cooldown,
                 )
                 
-                self._stats["active_streams"] += 1
+                if not was_active:
+                    self._stats["active_streams"] += 1
                 self._stats["total_loops"] += 1
 
                 logger.debug(f"[管理器] stream={stream_id[:8]}, 启动驱动器任务")
@@ -246,9 +272,12 @@ class StreamLoopManager:
         """
         context = await self._get_stream_context(stream_id)
         if not context:
+            self._cleanup_stream_runtime_state(stream_id)
             return False
 
         if not context.stream_loop_task or context.stream_loop_task.done():
+            context.stream_loop_task = None
+            self._cleanup_stream_runtime_state(stream_id)
             return False
 
         task = context.stream_loop_task
@@ -261,10 +290,54 @@ class StreamLoopManager:
             logger.error(f"停止任务时出错: {e}")
 
         context.stream_loop_task = None
-        self._pending_wait_resume_events.pop(stream_id, None)
-        self._stats["active_streams"] = max(0, self._stats["active_streams"] - 1)
+        self._cleanup_stream_runtime_state(stream_id)
         logger.debug(f"停止流循环: {stream_id[:8]}")
         return True
+
+    def _on_stream_task_done(
+        self,
+        stream_id: str,
+        task: asyncio.Task[Any],
+    ) -> None:
+        """在流任务自然结束或异常退出后回收管理器状态。"""
+        if self._active_stream_tasks.get(stream_id) is not task:
+            return
+        self._cleanup_stream_runtime_state(stream_id)
+        if not task.get_loop().is_closed():
+            task.get_loop().call_soon(
+                self._cleanup_stream_start_lock,
+                stream_id,
+            )
+
+    def _cleanup_stream_start_lock(self, stream_id: str) -> None:
+        """在启动临界区释放后回收不再使用的按流锁。"""
+        lock = self._stream_start_locks.get(stream_id)
+        if lock is not None and not lock.locked():
+            self._stream_start_locks.pop(stream_id, None)
+
+    def _cleanup_stream_runtime_state(self, stream_id: str) -> None:
+        """清理一个流的短期执行状态，并保证统计值不重复递减。"""
+        if self._active_stream_tasks.pop(stream_id, None) is not None:
+            self._stats["active_streams"] = max(
+                0,
+                self._stats["active_streams"] - 1,
+            )
+        self._restart_inflight.discard(stream_id)
+        self._restart_next_allowed_at.pop(stream_id, None)
+        self._chatter_genes.pop(stream_id, None)
+        self._wait_states.pop(stream_id, None)
+        self._pending_wait_resume_events.pop(stream_id, None)
+
+        lock = self._stream_start_locks.get(stream_id)
+        if lock is not None and not lock.locked():
+            self._stream_start_locks.pop(stream_id, None)
+
+        try:
+            from src.kernel.concurrency import get_watchdog
+
+            get_watchdog().unregister_stream(stream_id)
+        except Exception:
+            pass
 
     async def restart_stream_loop(self, stream_id: str) -> bool:
         """强制重启指定流的驱动器任务。

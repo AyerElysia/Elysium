@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.app.plugin_system.api import media_api
@@ -33,9 +32,7 @@ class TestMediaAPI:
         """测试批量识别媒体。"""
         with patch('src.app.plugin_system.api.media_api._get_media_manager') as mock_get_mgr:
             mock_manager = MagicMock()
-            mock_manager.recognize_batch = AsyncMock(
-                return_value=[(0, "Cat"), (1, "Dog")]
-            )
+            mock_manager.recognize_media = AsyncMock(side_effect=["Cat", "Dog"])
             mock_get_mgr.return_value = mock_manager
             
             media_list = [("base64_1", "image"), ("base64_2", "image")]
@@ -43,6 +40,8 @@ class TestMediaAPI:
             
             assert len(result) == 2
             assert result[0] == (0, "Cat")
+            assert result[1] == (1, "Dog")
+            assert mock_manager.recognize_media.await_count == 2
     
     async def test_save_media_info(self) -> None:
         """测试保存媒体信息。"""

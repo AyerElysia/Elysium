@@ -20,6 +20,7 @@ def _game_with_players(count: int = 6):
         group_name="group",
         group_stream_id="stream",
         owner_id="u1",
+        board_name="6人新手局",
     )
     for index in range(1, count + 1):
         engine.add_player(game, user_id=f"u{index}", display_name=f"P{index}")
@@ -28,26 +29,22 @@ def _game_with_players(count: int = 6):
 
 def test_player_view_does_not_expose_full_role_table() -> None:
     engine, game = _game_with_players()
-    engine.start_game(game, rng=random.Random(4))
+    result = engine.start_game(game, rng=random.Random(4))
+    assert result.ok is True
 
     viewer = next(player for player in game.players.values() if player.role != Role.WEREWOLF)
-    hidden_roles = [
-        player.role_label
-        for player in game.players.values()
-        if player.user_id != viewer.user_id and player.role != Role.WEREWOLF
-    ]
-
     view = engine.player_view(game, viewer.user_id)
 
     assert f"你的身份：{viewer.role_label}" in view
-    for label in hidden_roles:
-        assert f"：{label}" not in view
-    assert "公开玩家列表" in view
+    public_players = view.split("玩家列表：", 1)[1]
+    for role_label in ("狼人", "预言家", "女巫", "猎人", "守卫"):
+        assert role_label not in public_players
 
 
 def test_wolf_view_only_exposes_wolf_teammates() -> None:
     engine, game = _game_with_players()
-    engine.start_game(game, rng=random.Random(1))
+    result = engine.start_game(game, rng=random.Random(1))
+    assert result.ok is True
 
     wolf = next(player for player in game.players.values() if player.role == Role.WEREWOLF)
     view = engine.player_view(game, wolf.user_id)
@@ -63,7 +60,7 @@ def test_three_player_test_game_can_start_but_normal_game_still_requires_six() -
 
     normal = engine.start_game(game, rng=random.Random(1))
     assert normal.ok is False
-    assert "至少需要 6 名玩家" in normal.message
+    assert "需要 6 名玩家" in normal.message
 
     test_result = engine.start_test_game(game, rng=random.Random(1))
     assert test_result.ok is True
@@ -86,7 +83,9 @@ def test_public_status_includes_next_step_guidance() -> None:
     assert "私聊里行动或跳过" in result.public_messages[0]
 
 
-async def test_private_werewolf_command_is_intercepted(monkeypatch) -> None:
+async def test_private_werewolf_command_is_intercepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class DummyPlugin:
         pass
 
@@ -109,7 +108,7 @@ async def test_private_werewolf_command_is_intercepted(monkeypatch) -> None:
         sent.append((platform, user_id, text))
         return True
 
-    monkeypatch.setattr(WerewolfGameService, "_send_private_referee_message", fake_private)
+    monkeypatch.setattr(WerewolfGameService, "_send_private", fake_private)
 
     message = Message(
         content="/狼人杀 身份",
@@ -125,18 +124,13 @@ async def test_private_werewolf_command_is_intercepted(monkeypatch) -> None:
     decision, _ = await handler.execute("on_message_received", {"message": message})
 
     assert decision == EventDecision.STOP
-    assert sent == [
-        (
-            "qq",
-            "u1",
-            "当前阶段：等待加入\n你的身份：未分配\n你的状态：存活\n公开玩家列表：\n1. P1（存活）",
-        )
-    ]
+    assert sent == [("qq", "u1", service.engine.player_view(game, "u1"))]
 
 
 def test_night_resolution_keeps_public_message_role_free() -> None:
     engine, game = _game_with_players()
-    engine.start_game(game, rng=random.Random(2))
+    result = engine.start_game(game, rng=random.Random(2))
+    assert result.ok is True
     game.phase = Phase.NIGHT
 
     wolf = next(player for player in game.players.values() if player.role == Role.WEREWOLF)
@@ -148,12 +142,22 @@ def test_night_resolution_keeps_public_message_role_free() -> None:
         if player.role not in {Role.WEREWOLF, Role.SEER, Role.WITCH}
     )
 
-    engine.night_action(game, actor_id=wolf.user_id, action="kill", target_id=target.user_id)
-    engine.night_action(game, actor_id=seer.user_id, action="check", target_id=wolf.user_id)
-    result = engine.night_action(game, actor_id=witch.user_id, action="pass")
+    engine.night_action(
+        game,
+        actor_id=wolf.user_id,
+        action="kill",
+        target_id=target.user_id,
+    )
+    engine.night_action(
+        game,
+        actor_id=seer.user_id,
+        action="check",
+        target_id=wolf.user_id,
+    )
+    resolution = engine.night_action(game, actor_id=witch.user_id, action="pass")
 
-    assert result.public_messages
-    joined = "\n".join(result.public_messages)
+    assert resolution.public_messages
+    joined = "\n".join(resolution.public_messages)
     assert target.display_name in joined
     assert "身份：狼人" not in joined
     assert "身份：预言家" not in joined

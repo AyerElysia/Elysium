@@ -208,7 +208,7 @@ def _is_blank_image(path: Path) -> bool:
             img.load()
             # 转灰度后取平均值，速度快且跨格式
             gray = img.convert("L")
-            pixels = list(gray.getdata())
+            pixels = list(gray.get_flattened_data())
             if not pixels:
                 return True
             mean = sum(pixels) / len(pixels)

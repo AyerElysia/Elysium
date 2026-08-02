@@ -7,6 +7,7 @@ Concurrency 模块单元测试
 from __future__ import annotations
 
 import asyncio
+import threading
 import pytest
 from datetime import datetime
 from unittest.mock import patch
@@ -298,21 +299,58 @@ class TestTaskGroup:
     async def test_task_group_cancel_on_error(self) -> None:
         """测试 TaskGroup 错误时取消其他任务"""
         tm = get_task_manager()
+        sibling_cancelled = asyncio.Event()
 
         async def failing_task():
             await asyncio.sleep(0.05)
             raise ValueError("Task failed")
 
         async def long_task():
-            await asyncio.sleep(0.05)
-            return "should not complete"
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                sibling_cancelled.set()
+                raise
 
-        try:
+        with pytest.raises(ValueError, match="Task failed"):
             async with tm.group(name="error_group", cancel_on_error=True) as tg:
                 tg.create_task(failing_task())
                 tg.create_task(long_task())
-        except ValueError:
-            pass  # 预期的异常
+        assert sibling_cancelled.is_set()
+
+    async def test_task_group_timeout_is_explicit(self) -> None:
+        """A group timeout cancels children and raises TimeoutError."""
+        tm = get_task_manager()
+        cancelled = asyncio.Event()
+
+        async def blocked_task() -> None:
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        with pytest.raises(asyncio.TimeoutError, match="timed out"):
+            async with tm.group(name="explicit_timeout", timeout=0.01) as tg:
+                tg.create_task(blocked_task())
+        assert cancelled.is_set()
+
+    async def test_task_info_threadsafe_cancel_uses_owner_loop(self) -> None:
+        """WatchDog-style cancellation is marshalled to the task loop."""
+        tm = get_task_manager()
+        task_info = tm.create_task(asyncio.sleep(5), name="threadsafe-cancel")
+        result: list[bool] = []
+
+        worker = threading.Thread(
+            target=lambda: result.append(task_info.cancel_threadsafe())
+        )
+        worker.start()
+        worker.join(timeout=1.0)
+
+        assert result == [True]
+        assert task_info.task is not None
+        with pytest.raises(asyncio.CancelledError):
+            await task_info.task
 
     def test_task_group_inactive_error(self) -> None:
         """测试非激活状态创建任务抛出异常"""
@@ -571,10 +609,11 @@ class TestTaskManagerEdgeCases:
     """测试 TaskManager 边界情况"""
 
     def test_task_manager_double_init(self) -> None:
-        """测试 TaskManager 重复初始化（单例保护）"""
+        """直接构造应隔离状态，全局访问器才提供单例。"""
         tm = TaskManager()
         tm2 = TaskManager()
-        assert tm is tm2
+        assert tm is not tm2
+        assert get_task_manager() is get_task_manager()
 
     def test_create_task_not_in_async_context(self) -> None:
         """测试非异步上下文中创建任务抛出 RuntimeError"""
@@ -686,11 +725,9 @@ class TestTaskManagerEdgeCases:
         async def failing_task():
             raise ValueError("Test error")
 
-        # 创建一个属于组的任务
-        async with tm.group(name="callback_test_group") as tg:
-            tg.create_task(failing_task())
-
-        # 等待任务完成，异常应该被记录到组中
+        with pytest.raises(ValueError, match="Test error"):
+            async with tm.group(name="callback_test_group") as tg:
+                tg.create_task(failing_task())
 
 
 class TestTaskGroupEdgeCases:
@@ -843,28 +880,17 @@ class TestWatchDogEdgeCases:
         wd = WatchDog(tick_interval=0.2)
         assert wd._tick_interval == 0.2
         assert not wd._running
-        assert wd._thread is None
+        assert wd._monitor_thread is None
 
     def test_watchdog_get_logger_fallback(self) -> None:
         """测试 logger 不可用时的回退"""
-        # Mock import error by making the import fail
-        with patch("builtins.__import__", side_effect=ImportError("Logger module not available")):
-            # 需要重新导入 WatchDog 类来触发 _get_logger 的调用
-            # 这里我们直接测试 _log 方法在 logger 为 None 时的行为
-            wd = WatchDog()
-            wd._logger = None
-            # 不应该抛出异常
-            wd._log("info", "Test message")
+        wd = WatchDog()
+        assert not hasattr(wd, "_logger")
 
     def test_watchdog_log_with_none_logger(self) -> None:
         """测试 logger 为 None 时的日志记录"""
         wd = WatchDog()
-        wd._logger = None
-
-        # 不应该抛出异常
-        wd._log("info", "Test message")
-        wd._log("warning", "Test warning")
-        wd._log("error", "Test error")
+        assert not hasattr(wd, "_logger")
 
     def test_watchdog_start_already_running(self) -> None:
         """测试重复启动 WatchDog"""
@@ -891,7 +917,7 @@ class TestWatchDogEdgeCases:
         # 启动 WatchDog
         wd.start()
         assert wd._running
-        assert wd._thread is not None
+        assert wd._monitor_thread is not None
 
         # 停止 WatchDog
         wd.stop()
@@ -1358,12 +1384,9 @@ class TestAdditionalCoverage:
             await tg._cancel_all_tasks()
 
     def test_watchdog_get_logger_exception_handling(self) -> None:
-        """测试 _get_logger 异常处理"""
-        # 直接测试 _log 方法在 logger 为 None 时的行为
+        """WatchDog 使用模块级 logger，不维护易失的实例 logger。"""
         wd = WatchDog()
-        wd._logger = None
-        # 不应该抛出异常
-        wd._log("info", "Test")
+        assert not hasattr(wd, "_logger")
 
     async def test_watchdog_task_timeout_cancel_fails(self) -> None:
         """测试任务取消失败的情况"""
@@ -1485,10 +1508,9 @@ class TestAdditionalCoverage:
             pass  # 预期的异常
 
     async def test_watchdog_log_with_invalid_level(self) -> None:
-        """测试使用无效日志级别"""
+        """WatchDog 不暴露动态日志级别入口。"""
         wd = WatchDog()
-        # 使用无效的级别，应该不会崩溃
-        wd._log("invalid", "Test message")
+        assert not hasattr(wd, "_log")
 
     async def test_task_info_is_done_without_task(self) -> None:
         """测试 task 为 None 时 is_done"""
@@ -1564,10 +1586,9 @@ class TestAdditionalCoverage:
         async def failing_task():
             raise ValueError("Task failed")
 
-        # 创建一个属于组的任务
-        async with tm.group(name="callback_exception_test") as tg:
-            tg.create_task(failing_task())
-            # 等待任务完成，_on_task_done 会处理异常
+        with pytest.raises(ValueError, match="Task failed"):
+            async with tm.group(name="callback_exception_test") as tg:
+                tg.create_task(failing_task())
 
     async def test_task_manager_done_callback_with_group_exception(self) -> None:
         """测试任务完成回调记录异常到组"""
@@ -1576,17 +1597,9 @@ class TestAdditionalCoverage:
         async def failing_task():
             raise ValueError("Error in task")
 
-        async with tm.group(name="group_exception_test") as tg:
-            task_info = tg.create_task(failing_task())
-            # 等待任务失败
-            if task_info.task:
-                try:
-                    await task_info.task
-                except ValueError:
-                    pass
-
-            # _on_task_done 应该将异常记录到组中
-            # 由于任务失败且属于组，异常应该被记录
+        with pytest.raises(ValueError, match="Error in task"):
+            async with tm.group(name="group_exception_test") as tg:
+                tg.create_task(failing_task())
 
     async def test_watchdog_tick_anomaly_log(self) -> None:
         """测试 WatchDog tick 异常检测和日志"""
@@ -1679,18 +1692,9 @@ class TestAdditionalCoverage:
         async def failing_task():
             raise ValueError("Test error")
 
-        # 创建一个属于组的失败任务
-        async with tm.group(name="exception_callback_test") as tg:
-            task_info = tg.create_task(failing_task())
-
-            # 等待任务完成并失败
-            if task_info.task:
-                try:
-                    await task_info.task
-                except ValueError:
-                    pass
-
-            # _on_task_done 应该已经处理了这个异常
+        with pytest.raises(ValueError, match="Test error"):
+            async with tm.group(name="exception_callback_test") as tg:
+                tg.create_task(failing_task())
 
     async def test_task_manager_on_task_done_cancelled_task(self) -> None:
         """测试 _on_task_done 中任务被取消的情况"""
@@ -1743,19 +1747,9 @@ class TestAdditionalCoverage:
         # 创建一个组并添加失败的任务
         _ = tm.group(name="full_exception_test")
 
-        # 在组内创建任务（但不使用 async with，保持组激活）
-        async with tm.group(name="full_exception_test") as tg:
-            task_info = tg.create_task(failing_task())
-
-            # 等待任务完成（会失败）
-            if task_info.task:
-                try:
-                    await task_info.task
-                except ValueError:
-                    pass
-
-            # _on_task_done 回调应该已经被触发
-            # 它应该检测到任务未取消、有异常、属于组、组存在
+        with pytest.raises(ValueError, match="Test exception"):
+            async with tm.group(name="full_exception_test") as tg:
+                tg.create_task(failing_task())
 
     async def test_task_group_wait_all_handles_wait_cancelled(self) -> None:
         """测试 _wait_all_tasks 中 asyncio.wait 抛出 CancelledError"""
@@ -1853,7 +1847,7 @@ class TestAdditionalCoverage:
         task_info = TaskInfo(
             task_id="callback_test",
             name="callback_test",
-            coro=failing_task(),
+            coro=None,
             task=task,
             group_name="callback_path_test",
         )

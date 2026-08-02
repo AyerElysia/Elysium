@@ -50,6 +50,7 @@ class SchedulerConfig:
     task_default_timeout: float = 300.0  # 默认任务超时(5分钟)
     task_cancel_timeout: float = 10.0  # 任务取消超时(10秒)
     shutdown_timeout: float = 30.0  # 关闭超时(30秒)
+    custom_condition_timeout: float = 5.0  # 同步自定义条件最长执行时间
 
     # 并发控制
     max_concurrent_tasks: int = 100  # 最大并发任务数
@@ -217,6 +218,11 @@ class UnifiedScheduler:
         # 已完成任务缓存（用于统计）
         self._completed_tasks: list[ScheduleTask] = []
 
+    @property
+    def is_running(self) -> bool:
+        """Return whether the scheduler currently accepts new schedules."""
+        return self._running and not self._stopping
+
     # ==================== 生命周期管理 ====================
 
     async def start(self) -> None:
@@ -300,18 +306,26 @@ class UnifiedScheduler:
 
         logger.info(f"正在取消 {len(running_task_ids)} 个运行中的任务...")
 
-        # 通过 task_manager 取消任务
+        pending: list[asyncio.Task[Any]] = []
         for task_id in running_task_ids:
             try:
-                self._task_manager.cancel_task(task_id)
+                task_info = self._task_manager.get_task(task_id)
+                if task_info.task is not None and not task_info.task.done():
+                    self._task_manager.cancel_task(task_id)
+                    pending.append(task_info.task)
             except Exception:
                 pass  # 任务可能已经完成
 
-        # 等待取消完成（带超时）
+        if not pending:
+            return
+
         try:
-            await asyncio.sleep(self.config.shutdown_timeout)
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True),
+                timeout=self.config.shutdown_timeout,
+            )
             logger.info("所有任务已取消")
-        except Exception:
+        except asyncio.TimeoutError:
             logger.warning(f"部分任务取消超时（{self.config.shutdown_timeout}秒），强制停止")
 
     # ==================== 后台循环 ====================
@@ -467,7 +481,11 @@ class UnifiedScheduler:
             if inspect.iscoroutinefunction(condition_func):
                 result = await condition_func()
             else:
-                result = condition_func()
+                result = await _CALLBACK_POOL.run(
+                    condition_func,
+                    timeout=self.config.custom_condition_timeout,
+                    label=f"condition:{task.task_name}",
+                )
             return bool(result)
         except Exception as e:
             logger.error(f"执行任务 {task.task_name} 的自定义条件函数时出错: {e}")

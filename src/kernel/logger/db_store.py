@@ -22,6 +22,9 @@ SESSION_ID: str = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}
 # 批量写入阈值
 _BATCH_SIZE = 100
 _FLUSH_INTERVAL = 1.0  # 秒
+_LEGACY_COMPACT_MIN_BYTES = 64 * 1024 * 1024
+_LEGACY_COMPACT_FREE_RATIO = 0.25
+_INCREMENTAL_VACUUM_PAGES = 8192
 
 
 class LogStore:
@@ -55,8 +58,10 @@ class LogStore:
         self._dropped_count = 0
         self._write_failure_count = 0
 
-        # 初始化数据库
+        # 初始化数据库。清理必须发生在 writer 启动前，避免启动阶段两个
+        # SQLite 连接互相争用写锁。
         self._init_db()
+        self.cleanup()
 
         # 启动后台写入线程
         self._worker = threading.Thread(
@@ -64,12 +69,14 @@ class LogStore:
         )
         self._worker.start()
 
-        # 启动时执行保留策略清理
-        self.cleanup()
-
     def _init_db(self) -> None:
         """初始化数据库 schema。"""
+        is_new_database = not self._db_path.exists() or self._db_path.stat().st_size == 0
         conn = sqlite3.connect(str(self._db_path), timeout=5.0)
+        original_auto_vacuum = int(conn.execute("PRAGMA auto_vacuum").fetchone()[0])
+        if is_new_database:
+            # Must be selected before the first table is created.
+            conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=3000")
@@ -111,6 +118,22 @@ class LogStore:
             pass
 
         conn.commit()
+
+        # Older databases were created with auto_vacuum=NONE. Only migrate a
+        # materially bloated file: VACUUM runs before the writer thread starts
+        # and therefore happens at most once.
+        if not is_new_database and original_auto_vacuum == 0:
+            page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+            page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+            free_pages = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+            size_bytes = page_size * page_count
+            free_ratio = free_pages / page_count if page_count else 0.0
+            if (
+                size_bytes >= _LEGACY_COMPACT_MIN_BYTES
+                and free_ratio >= _LEGACY_COMPACT_FREE_RATIO
+            ):
+                conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+                conn.execute("VACUUM")
         conn.close()
 
     def _get_conn(self) -> sqlite3.Connection:
@@ -306,8 +329,10 @@ class LogStore:
 
     def cleanup(self) -> int:
         """执行保留策略清理，返回删除条数。"""
+        conn: sqlite3.Connection | None = None
         try:
             conn = sqlite3.connect(str(self._db_path), timeout=5.0)
+            conn.execute("PRAGMA busy_timeout=3000")
             cursor = conn.execute(
                 "DELETE FROM logs WHERE level = 'DEBUG' AND timestamp < datetime('now', ?)",
                 (f"-{self._retention_debug_days} days",),
@@ -321,10 +346,20 @@ class LogStore:
             deleted_all = cursor.rowcount
 
             conn.commit()
-            conn.close()
+
+            # DELETE only adds free pages. Incremental vacuum returns a bounded
+            # number of them without a long full-file lock.
+            auto_vacuum = int(conn.execute("PRAGMA auto_vacuum").fetchone()[0])
+            free_pages = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+            if auto_vacuum == 2 and free_pages > 0:
+                pages = min(free_pages, _INCREMENTAL_VACUUM_PAGES)
+                conn.execute(f"PRAGMA incremental_vacuum({pages})")
             return deleted_debug + deleted_all
         except Exception:
             return 0
+        finally:
+            if conn is not None:
+                conn.close()
 
     def stats(self) -> dict[str, Any]:
         """获取日志存储统计信息。"""

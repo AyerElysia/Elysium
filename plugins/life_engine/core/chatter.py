@@ -564,6 +564,16 @@ class LifeSendTextAction(BaseAction):
         if not cleaned_segments:
             return False, "发送内容不能只是省略号或占位符"
 
+        # 参数和目标必须先校验；失败的发送不能污染重复消息缓存。
+        resolved_target: SendTarget | None = None
+        normalized_target_key = str(target_key or "").strip()
+        if normalized_target_key:
+            if reply_to:
+                return False, "跨聊天发送不能同时使用 reply_to；请去掉 reply_to 或不填 target_key"
+            resolved_target = await self._resolve_send_target(normalized_target_key)
+            if resolved_target is None:
+                return False, f"未知或不可用的发送目标 target_key: {normalized_target_key}"
+
         # ── 跨 wake 重复发送检测 ──────────────────────────────
         combined_text = "\n".join(cleaned_segments)
         content_hash = hashlib.sha256(combined_text.encode("utf-8")).hexdigest()[:16]
@@ -587,15 +597,6 @@ class LifeSendTextAction(BaseAction):
 
             # 记录此次发送
             _RECENT_SENT_CACHE[content_hash] = now
-
-        resolved_target: SendTarget | None = None
-        normalized_target_key = str(target_key or "").strip()
-        if normalized_target_key:
-            if reply_to:
-                return False, "跨聊天发送不能同时使用 reply_to；请去掉 reply_to 或不填 target_key"
-            resolved_target = await self._resolve_send_target(normalized_target_key)
-            if resolved_target is None:
-                return False, f"未知或不可用的发送目标 target_key: {normalized_target_key}"
 
         sent_count = 0
         for index, segment in enumerate(cleaned_segments):

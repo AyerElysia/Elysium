@@ -20,6 +20,7 @@ from src.core.transport.router.http_server import HTTPServer
 class TestRouter(BaseRouter):
     """测试用的 Router。"""
 
+    __test__ = False
     router_name = "test_router"
     router_description = "Test Router"
     custom_route_path = "/api/test"
@@ -46,6 +47,7 @@ class AnotherTestRouter(BaseRouter):
 class TestPlugin(BasePlugin):
     """测试用的插件。"""
 
+    __test__ = False
     plugin_name = "test_plugin"
 
     def __init__(self):

@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
+from collections import OrderedDict
 from typing import Any, Dict
 
 from mofox_wire import MessageEnvelope
@@ -36,6 +38,8 @@ logger = get_logger("message_receiver", display="消息接收器", color=COLOR.C
 # 其余已知类型（notice、request、meta_event 等）以及未知类型均路由至 _handle_other。
 # 对于未显式设置 message_type 的老式 envelope，回退到 has_segments 判断以保持兼容。
 _STANDARD_MESSAGE_TYPES: frozenset[str] = frozenset({"message", "group", "private"})
+_DEDUP_WINDOW_SECONDS = 120.0
+_DEDUP_CACHE_MAX_SIZE = 10_000
 
 
 class MessageReceiver:
@@ -60,7 +64,40 @@ class MessageReceiver:
         """
         self._converter = converter or MessageConverter()
         self._event_manager: Any = None
+        self._dedup_lock = asyncio.Lock()
+        self._recent_messages: OrderedDict[tuple[str, str, str], float] = OrderedDict()
         logger.info("MessageReceiver 初始化完成")
+
+    async def _claim_message(
+        self,
+        *,
+        adapter_signature: str,
+        platform: str,
+        message_id: Any,
+    ) -> bool:
+        """原子占用消息 ID，并拒绝去重窗口内的重复消息。"""
+        normalized_id = str(message_id or "").strip()
+        if not normalized_id or normalized_id == "?":
+            return True
+
+        key = (adapter_signature, platform, normalized_id)
+        now = time.monotonic()
+        expires_before = now - _DEDUP_WINDOW_SECONDS
+
+        async with self._dedup_lock:
+            while self._recent_messages:
+                oldest_key, oldest_seen = next(iter(self._recent_messages.items()))
+                if oldest_seen > expires_before:
+                    break
+                self._recent_messages.pop(oldest_key, None)
+
+            if key in self._recent_messages:
+                return False
+
+            self._recent_messages[key] = now
+            if len(self._recent_messages) > _DEDUP_CACHE_MAX_SIZE:
+                self._recent_messages.popitem(last=False)
+            return True
 
     def _get_event_manager(self) -> Any:
         """延迟获取事件管理器（避免模块导入时的循环依赖）。"""
@@ -128,6 +165,17 @@ class MessageReceiver:
         message_segment = envelope.get("message_segment")
         if isinstance(message_segment, dict) and message_segment.get("type") == "adapter_response":
             await self._handle_adapter_response(envelope)
+            return
+
+        if not await self._claim_message(
+            adapter_signature=adapter_signature,
+            platform=str(platform),
+            message_id=message_id,
+        ):
+            logger.debug(
+                f"忽略去重窗口内的重复消息: id={message_id}, "
+                f"platform={platform}, adapter={adapter_signature}"
+            )
             return
 
         # 优先根据 message_type 路由：

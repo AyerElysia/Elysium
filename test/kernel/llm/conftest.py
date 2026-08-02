@@ -44,7 +44,11 @@ def isolated_global_trajectory_collector(tmp_path, monkeypatch):
 
     # Redirect _trajectory_settings so LLMRequest writes to a throw-away lake.
     fake_lake = str(tmp_path / "test_lake")
-    monkeypatch.setattr(req_mod, "_trajectory_settings", lambda: (True, fake_lake, 0.05, 500))
+    monkeypatch.setattr(
+        req_mod,
+        "_trajectory_settings",
+        lambda: (True, fake_lake, 0.05, 500, 3, 0),
+    )
 
     yield
 

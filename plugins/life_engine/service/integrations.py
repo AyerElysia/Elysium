@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -14,7 +13,6 @@ from src.app.plugin_system.api.log_api import get_logger
 
 from .event_builder import (
     EventType,
-    LifeEngineEvent,
     _format_time_display,
     _now_iso,
     _shorten_text,
@@ -266,7 +264,13 @@ class MemoryIntegration:
 
             cfg = self._service._cfg()
             workspace = Path(cfg.settings.workspace_path)
-            self._service._memory_service = LifeMemoryService(workspace)
+            index_config = getattr(cfg, "memory_index", None)
+            self._service._memory_service = LifeMemoryService(
+                workspace,
+                vector_backend_enabled=bool(
+                    getattr(index_config, "backend_enabled", True)
+                ),
+            )
             await self._service._memory_service.initialize()
             logger.info("life_engine 仿生记忆服务已初始化")
         except Exception as e:

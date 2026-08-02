@@ -95,7 +95,8 @@ def test_build_memory_write_warning_for_oversized_memory() -> None:
     warning = build_memory_write_warning("MEMORY.md", content)
 
     assert warning is not None
-    assert "MEMORY.md 写入完成" in warning
+    assert "此文件内容较大" in warning
+    assert "意外覆盖整个记忆文档" in warning
 
 
 def test_build_memory_write_warning_allows_moderate_memory() -> None:

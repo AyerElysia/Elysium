@@ -217,7 +217,34 @@ option2 = 100
         finally:
             shutil.rmtree(temp_dir)
 
-    def test_configbase_load_nonexistent_file(self) -> None:
+    def test_load_interpolates_env_without_writing_secret(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """环境变量应只在内存展开，配置文件必须继续保存占位符。"""
+        class TestConfig(ConfigBase):
+            @config_section("service")
+            class ServiceSection(SectionBase):
+                api_key: str = Field(default="")
+
+            service: ServiceSection = Field(default_factory=ServiceSection)
+
+        config_file = tmp_path / "secret.toml"
+        config_file.write_text(
+            '[service]\napi_key = "${ELYSIUM_TEST_API_KEY}"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("ELYSIUM_TEST_API_KEY", "runtime-secret")
+
+        config = TestConfig.load(config_file, auto_update=True)
+
+        assert config.service.api_key == "runtime-secret"
+        persisted = config_file.read_text(encoding="utf-8")
+        assert "${ELYSIUM_TEST_API_KEY}" in persisted
+        assert "runtime-secret" not in persisted
+
+    def test_configbase_load_nonexistent_file(self, tmp_path: Path) -> None:
         """测试加载不存在的文件抛出错误"""
         class TestConfig(ConfigBase):
             @config_section("general")
@@ -227,7 +254,7 @@ option2 = 100
             general: GeneralSection = Field(default_factory=GeneralSection)
 
         with pytest.raises(FileNotFoundError):
-            TestConfig.load("/nonexistent/path/config.toml")
+            TestConfig.load(tmp_path / "missing" / "config.toml")
 
     def test_configbase_load_malformed_toml(self) -> None:
         """测试加载格式错误的 TOML 文件"""

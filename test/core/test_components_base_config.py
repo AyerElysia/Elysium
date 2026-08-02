@@ -13,6 +13,7 @@ from src.kernel.config import Field, SectionBase, config_section
 class TestSection(SectionBase):
     """测试用的配置节。"""
 
+    __test__ = False
     enabled: bool = Field(default=True, description="启用状态")
     value: int = Field(default=42, description="数值")
     name: str = Field(default="test", description="名称")
@@ -21,6 +22,7 @@ class TestSection(SectionBase):
 class TestConfig(BaseConfig):
     """测试用的配置类。"""
 
+    __test__ = False
     # 使用 ClassVar 标注类变量
     config_name: ClassVar[str] = "test_config"
     config_description: ClassVar[str] = "Test configuration"
@@ -157,6 +159,7 @@ class TestBaseConfig:
         mock_generate.assert_called_once()
         # 然后加载
         mock_load.assert_called_once()
+        assert result is mock_load.return_value
 
     @patch("src.core.components.base.config.Path.exists")
     def test_load_for_plugin_no_auto_generate(self, mock_exists):
@@ -177,6 +180,7 @@ class TestBaseConfig:
 
         # 不应该生成，应该直接加载
         mock_load.assert_called_once()
+        assert result is mock_load.return_value
 
     @patch("src.core.components.base.config.Path.exists")
     @patch("src.core.components.base.config.BaseConfig.load")
@@ -189,6 +193,7 @@ class TestBaseConfig:
         result = TestConfig.reload()
 
         mock_load.assert_called_once()
+        assert result is mock_load.return_value
         # 检查是否传递了 auto_update=True
         call_kwargs = mock_load.call_args[1]
         assert call_kwargs.get("auto_update") is True

@@ -37,10 +37,12 @@ def _configure_kernel_db_for_tests(tmp_path_factory: pytest.TempPathFactory) -> 
 
 # 创建测试用的 Base 和模型
 TestBase = declarative_base()
+TestBase.__test__ = False
 
 
 class TestUser(TestBase):
     """测试用户模型"""
+    __test__ = False
     __tablename__ = "test_users"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -691,6 +693,18 @@ async def test_close_engine():
     # 重新获取应该创建新引擎
     new_engine = await get_engine()
     assert new_engine is not None
+
+
+async def test_close_engine_resets_session_factory():
+    """Closing the engine must invalidate its bound session factory."""
+    from src.kernel.db.core.engine import close_engine
+    from src.kernel.db.core.session import get_session_factory
+
+    old_factory = await get_session_factory()
+    await close_engine()
+    new_factory = await get_session_factory()
+
+    assert new_factory is not old_factory
 
 
 async def test_sqlite_config_builder():

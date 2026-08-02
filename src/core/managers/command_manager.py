@@ -119,7 +119,10 @@ class CommandManager:
             return False
 
         stripped = text.strip()
-        return any(stripped.startswith(prefix) for prefix in self._command_prefixes)
+        return any(
+            stripped.startswith(prefix) and len(stripped) > len(prefix)
+            for prefix in self._command_prefixes
+        )
 
     def match_command(
         self, text: str

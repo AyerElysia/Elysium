@@ -14,13 +14,11 @@
 """
 
 import datetime
-
 from datetime import timezone
 from typing import Any
 
 from sqlalchemy import Boolean, DateTime, Float, Index, Integer, Text, UniqueConstraint
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, declarative_base, mapped_column
 
 # 创建基类
 Base = declarative_base()
@@ -114,9 +112,7 @@ class ChatStreams(Base):
     )
 
     __table_args__ = (
-        Index("idx_chatstreams_person_id", "person_id"),
         Index("idx_chatstreams_platform_group", "platform", "group_id"),
-        Index("idx_chatstreams_last_active", "last_active_time"),
     )
 
 
@@ -178,7 +174,6 @@ class LLMUsage(Base):
     )
 
     __table_args__ = (
-        Index("idx_llmusage_timestamp", "timestamp"),
         Index("idx_llmusage_model_name", "model_name"),
         Index("idx_llmusage_user_timestamp", "user_id", "timestamp"),
         Index("idx_llmusage_status_timestamp", "status", "timestamp"),
@@ -257,7 +252,6 @@ class Messages(Base):
 
     __table_args__ = (
         Index("idx_messages_stream_time", "stream_id", "time"),
-        Index("idx_messages_person_id", "person_id"),
     )
 
 
@@ -329,9 +323,6 @@ class ActionRecords(Base):
     )
 
     __table_args__ = (
-        Index("idx_actionrecords_action_id", "action_id"),
-        Index("idx_actionrecords_stream_id", "stream_id"),
-        Index("idx_actionrecords_time", "time"),
         Index("idx_actionrecords_stream_time", "stream_id", "time"),
     )
 
@@ -353,7 +344,6 @@ class Images(Base):
     query_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
 
     __table_args__ = (
-        Index("idx_images_path", "path"),
         Index("idx_images_type_banned", "type", "is_banned"),
     )
 
@@ -370,7 +360,6 @@ class ImageDescriptions(Base):
     timestamp: Mapped[float] = mapped_column(Float, nullable=False)
 
     __table_args__ = (
-        Index("idx_imagedesc_hash", "image_description_hash"),
         UniqueConstraint("image_description_hash", "type", name="uq_imagedesc_hash_type"),
     )
 
@@ -385,9 +374,6 @@ class OnlineTime(Base):
     duration: Mapped[int] = mapped_column(Integer, nullable=False)
     start_timestamp: Mapped[datetime.datetime] = mapped_column(DateTime, nullable=False, default=datetime.datetime.now)
     end_timestamp: Mapped[datetime.datetime] = mapped_column(DateTime, nullable=False, index=True)
-
-    __table_args__ = (Index("idx_onlinetime_end_timestamp", "end_timestamp"),)
-
 
 class PersonInfo(Base):
     """统一用户信息模型 - 跨平台用户身份中心"""
@@ -493,7 +479,6 @@ class PersonInfo(Base):
 
     __table_args__ = (
         Index("idx_personinfo_platform_user", "platform", "user_id"),
-        Index("idx_personinfo_last_interaction", "last_interaction"),
         Index("idx_personinfo_attitude", "attitude"),
     )
 
@@ -681,7 +666,6 @@ class PermissionGroups(Base):
     )
 
     __table_args__ = (
-        Index("idx_permission_groups_person_id", "person_id"),
         Index("idx_permission_groups_level", "permission_level"),
     )
 
@@ -745,8 +729,6 @@ class CommandPermissions(Base):
     )
 
     __table_args__ = (
-        Index("idx_command_permissions_person", "person_id"),
-        Index("idx_command_permissions_command", "command_signature"),
         Index(
             "idx_command_permissions_unique",
             "person_id",

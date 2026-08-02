@@ -136,5 +136,6 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
 
 async def reset_session_factory() -> None:
     """重置会话工厂（用于测试）"""
-    global _session_factory
+    global _session_factory, _factory_lock
     _session_factory = None
+    _factory_lock = None

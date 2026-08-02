@@ -34,6 +34,8 @@ enable_trajectory_logging = true
 trajectory_base_path = "data/training_data_lake"
 trajectory_flush_interval = 5.0
 trajectory_queue_limit = 10000
+trajectory_raw_retention_days = 3
+trajectory_archive_retention_days = 0
 
 [personality]
 # ─── 角色身份（必填） ───────────────────────────

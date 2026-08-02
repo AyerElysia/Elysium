@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import socket
 import pytest
 from fastapi import FastAPI
 from httpx import AsyncClient
@@ -117,6 +118,24 @@ class TestHTTPServer:
         """测试停止未运行的服务器不会报错。"""
         # 不应该抛出异常
         await server.stop()
+
+    async def test_bind_failure_is_reported_during_start(self):
+        """端口被占用时 start() 必须失败，不能留下伪运行状态。"""
+        occupied = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen(1)
+        port = occupied.getsockname()[1]
+        server = HTTPServer(host="127.0.0.1", port=port)
+
+        try:
+            with pytest.raises(RuntimeError, match="HTTP 服务器启动失败"):
+                await server.start()
+        finally:
+            occupied.close()
+
+        assert not server.is_running()
+        assert server.server is None
+        assert server._server_task is None
 
     def test_get_openapi_schema(self, server):
         """测试获取 OpenAPI schema。"""

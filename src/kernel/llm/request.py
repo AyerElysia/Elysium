@@ -35,7 +35,7 @@ from .media_capabilities import (
     filter_model_set_for_media,
     normalize_media_capabilities,
 )
-from .model_client import ModelClientRegistry
+from .model_client import ModelClientRegistry, get_default_model_client_registry
 from .monitor import RequestMetrics, RequestTimer, get_global_collector
 from .payload import (
     Content,
@@ -57,14 +57,14 @@ from .trajectory_types import (
     sanitize_text_only,
     utc_timestamp,
 )
-from .types import ModelEntry, ModelSet, RequestType
+from .types import ModelEntry, ModelSet, RequestType, redact_secret
 from .token_counter import count_payload_tokens
 
 
 logger = get_logger("kernel.llm.request", display="LLM 请求")
 
 
-def _trajectory_settings() -> tuple[bool, str, float, int]:
+def _trajectory_settings() -> tuple[bool, str, float, int, int, int]:
     """Read trajectory settings without importing core config at module load time."""
     try:
         from src.core.config import get_core_config
@@ -75,11 +75,13 @@ def _trajectory_settings() -> tuple[bool, str, float, int]:
             str(section.trajectory_base_path),
             float(section.trajectory_flush_interval),
             int(section.trajectory_queue_limit),
+            int(section.trajectory_raw_retention_days),
+            int(section.trajectory_archive_retention_days),
         )
     except Exception:
         # Kernel LLM tests and low-level callers may intentionally run before
         # core initialization; the documented defaults remain usable there.
-        return True, "data/training_data_lake", 5.0, 10000
+        return True, "data/training_data_lake", 5.0, 10000, 3, 0
 
 
 def _safe_related_id(request: Any, name: str) -> str | None:
@@ -335,7 +337,7 @@ class LLMRequest:
         if self.policy is None:
             self.policy = create_default_policy()
         if self.clients is None:
-            self.clients = ModelClientRegistry()
+            self.clients = get_default_model_client_registry()
         if self.context_manager is None:
             self.context_manager = LLMContextManager()
 
@@ -506,7 +508,14 @@ class LLMRequest:
         call_id = _safe_related_id(self, "call_id")
         task_name = self.request_name or "llm"
         task_tags = derive_task_tags(task_name)
-        trajectory_enabled, trajectory_base_path, trajectory_flush_interval, trajectory_queue_limit = _trajectory_settings()
+        (
+            trajectory_enabled,
+            trajectory_base_path,
+            trajectory_flush_interval,
+            trajectory_queue_limit,
+            trajectory_raw_retention_days,
+            trajectory_archive_retention_days,
+        ) = _trajectory_settings()
         previous_attempt_id: str | None = None
         attempt_index = 0
 
@@ -585,6 +594,8 @@ class LLMRequest:
                 enabled=trajectory_enabled,
                 flush_interval=trajectory_flush_interval,
                 queue_limit=trajectory_queue_limit,
+                raw_retention_days=trajectory_raw_retention_days,
+                archive_retention_days=trajectory_archive_retention_days,
             )
 
         # TOOL_RESULT payload 规范化（确保 provider 端可读）
@@ -967,6 +978,7 @@ def _validate_model_entry(model: dict[str, Any]) -> ModelEntry:
                 "model.extra_params.context_compression_trigger_ratio 必须是 number"
             )
 
+    model["api_key"] = redact_secret(model.get("api_key"))
     model["media_capabilities"] = normalize_media_capabilities(
         model.get("media_capabilities")
     )

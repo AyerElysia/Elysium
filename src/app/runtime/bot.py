@@ -6,13 +6,12 @@ Elysium 框架的核心协调器，负责系统初始化、插件加载和生命
 from __future__ import annotations
 
 import asyncio
-import os
 import socket
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from src.core.config import CORE_VERSION
@@ -81,6 +80,12 @@ class Bot:
         self._initialized = False
         self._running = False
         self._shutdown_requested = False
+        self._network_loop: asyncio.AbstractEventLoop | None = None
+        self._dns_executor: ThreadPoolExecutor | None = None
+        self._original_getaddrinfo: Any | None = None
+        self._original_getnameinfo: Any | None = None
+        self._patched_getaddrinfo: Any | None = None
+        self._patched_getnameinfo: Any | None = None
 
         # Kernel 层组件（延迟初始化）
         self.config: CoreConfig | None = None
@@ -134,6 +139,13 @@ class Bot:
                 # Phase 1: Kernel 初始化
                 await self._initialize_kernel()
 
+                # Plugin startup hooks restore persisted schedules. Scheduler
+                # readiness is therefore a kernel-initialization invariant,
+                # not something deferred until the interactive run loop.
+                assert self.scheduler is not None
+                await self.scheduler.start()
+                self._stats["scheduler_running"] = True
+
                 # Phase 2: Core 组件初始化
                 await self._initialize_core()
 
@@ -165,18 +177,23 @@ class Bot:
 
         except Exception as e:
             self.ui.display_error(f"Initialization failed: {e}", e)
+            await self.shutdown(raise_on_error=False)
             raise BotInitializationError(str(e), "unknown") from e
 
     async def _optimize_async_network_runtime(self) -> None:
         """优化异步网络运行时：线程池与 DNS 预解析。"""
+        if self._dns_executor is not None:
+            return
+
         loop = asyncio.get_running_loop()
 
-        # 默认线程池：承载 to_thread / run_in_executor(None, ...)
-        max_workers = min(32, (os.cpu_count() or 1) + 4)
-        loop.set_default_executor(ThreadPoolExecutor(max_workers=max_workers))
-
         # DNS 专用线程池：避免 getaddrinfo 被通用任务挤占
-        dns_executor = ThreadPoolExecutor(max_workers=16)
+        dns_executor = ThreadPoolExecutor(
+            max_workers=16,
+            thread_name_prefix="elysium-dns",
+        )
+        original_getaddrinfo = loop.getaddrinfo
+        original_getnameinfo = loop.getnameinfo
 
         async def _patched_getaddrinfo(host, port, *args, **kwargs):
             func = partial(socket.getaddrinfo, host, port, *args, **kwargs)
@@ -188,6 +205,12 @@ class Bot:
 
         loop.getaddrinfo = _patched_getaddrinfo  # type: ignore[method-assign]
         loop.getnameinfo = _patched_getnameinfo  # type: ignore[method-assign]
+        self._network_loop = loop
+        self._dns_executor = dns_executor
+        self._original_getaddrinfo = original_getaddrinfo
+        self._original_getnameinfo = original_getnameinfo
+        self._patched_getaddrinfo = _patched_getaddrinfo
+        self._patched_getnameinfo = _patched_getnameinfo
 
         # 预解析 provider 域名，减少首包抖动
         targets = self._extract_provider_hosts_from_model_config("config/model.toml")
@@ -207,6 +230,28 @@ class Bot:
             *(_resolve(host, port) for host, port in targets),
             return_exceptions=True,
         )
+
+    def _shutdown_async_network_runtime(self) -> None:
+        """恢复事件循环 DNS 方法并关闭专用解析线程池。"""
+        loop = getattr(self, "_network_loop", None)
+        if loop is not None:
+            patched_getaddrinfo = getattr(self, "_patched_getaddrinfo", None)
+            patched_getnameinfo = getattr(self, "_patched_getnameinfo", None)
+            if loop.getaddrinfo is patched_getaddrinfo:
+                loop.getaddrinfo = getattr(self, "_original_getaddrinfo", None)  # type: ignore[method-assign]
+            if loop.getnameinfo is patched_getnameinfo:
+                loop.getnameinfo = getattr(self, "_original_getnameinfo", None)  # type: ignore[method-assign]
+
+        executor = getattr(self, "_dns_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        self._network_loop = None
+        self._dns_executor = None
+        self._original_getaddrinfo = None
+        self._original_getnameinfo = None
+        self._patched_getaddrinfo = None
+        self._patched_getnameinfo = None
 
     @staticmethod
     def _extract_provider_hosts_from_model_config(
@@ -356,9 +401,16 @@ class Bot:
                 f"tables={sync_stats.tables_checked}, "
                 f"add={sync_stats.columns_added}, "
                 f"drop={sync_stats.columns_removed}, "
+                f"preserve={sync_stats.columns_preserved}, "
                 f"type={sync_stats.columns_type_altered}, "
-                f"nullable={sync_stats.columns_nullability_altered}"
+                f"nullable={sync_stats.columns_nullability_altered}, "
+                f"type_drift={sync_stats.type_mismatches}, "
+                f"nullable_drift={sync_stats.nullability_mismatches}"
             )
+            if sync_stats.requires_migration:
+                self.logger.warning(
+                    "检测到需要显式迁移的数据库结构差异；启动阶段已保留现有数据"
+                )
 
         self._stats["db_connected"] = True
 
@@ -703,8 +755,8 @@ class Bot:
         self._running = True
 
         # 启动调度器
-        await self.scheduler.start()
-        self._stats["scheduler_running"] = True
+        if not self.scheduler.is_running:
+            raise BotRuntimeError("Scheduler stopped before runtime startup completed")
         
         # 触发 ON_START 事件（所有初始化完成，系统即将进入运行状态）
         try:
@@ -841,7 +893,12 @@ class Bot:
         self._stats["plugins_loaded"] = 0
         self._stats["plugins_failed"] = 0
 
-    async def shutdown(self, timeout: float = 30.0) -> None:
+    async def shutdown(
+        self,
+        timeout: float = 30.0,
+        *,
+        raise_on_error: bool = True,
+    ) -> None:
         """优雅关闭 Bot
 
         Args:
@@ -861,89 +918,133 @@ class Bot:
         else:
             print("正在关闭 Elysium...")
 
-        try:
-            # 1. 停止接受新工作
-            if self.logger:
-                self.logger.info("停止接受新任务...")
+        if self.logger:
+            self.logger.info("停止接受新任务...")
 
-            # 2. 触发 ON_STOP 事件（让事件处理器在插件卸载前执行清理）
+        errors: list[tuple[str, Exception]] = []
+
+        async def _run_step(name: str, operation) -> None:
             try:
-                from src.core.components.types import EventType
-                assert self.event_bus is not None
-                await self.event_bus.publish(EventType.ON_STOP, {})
+                await operation()
+            except Exception as exc:
+                errors.append((name, exc))
                 if self.logger:
-                    self.logger.info("已触发 ON_STOP 事件")
-            except Exception as e:
-                if self.logger:
-                    self.logger.warning(f"触发 ON_STOP 事件失败: {e}")
+                    self.logger.error(
+                        f"关闭步骤失败 [{name}]: {exc}",
+                        exc_info=exc,
+                    )
+                else:
+                    print(f"关闭步骤失败 [{name}]: {exc}")
 
-            # 3. 卸载插件
-            await self._unload_all_plugins()
+        async def _publish_stop() -> None:
+            if self.event_bus is None:
+                return
+            from src.core.components.types import EventType
 
-            # 4. 停止调度器
-            if self.scheduler:
+            await self.event_bus.publish(EventType.ON_STOP, {})
+            if self.logger:
+                self.logger.info("已触发 ON_STOP 事件")
+
+        async def _stop_stream_loops() -> None:
+            from src.core.transport.distribution.stream_loop_manager import (
+                get_stream_loop_manager,
+            )
+
+            await get_stream_loop_manager().stop()
+
+        async def _stop_scheduler() -> None:
+            if self.scheduler is not None:
                 await self.scheduler.stop()
                 self._stats["scheduler_running"] = False
 
-            # 5. 停止 HTTP 服务器
+        async def _stop_http_server() -> None:
             if self.http_server and self.http_server.is_running():
                 if self.logger:
                     self.logger.info("停止 HTTP 服务器...")
                 await self.http_server.stop()
 
-            # 6. 关闭 MCP 客户端连接
-            if self.mcp_manager:
+        async def _cleanup_mcp() -> None:
+            if self.mcp_manager is not None:
                 if self.logger:
                     self.logger.info("关闭 MCP 客户端连接...")
                 await self.mcp_manager.cleanup()
 
-            # 7. 停止 WatchDog
-            if self.watchdog:
+        async def _stop_watchdog() -> None:
+            if self.watchdog is not None:
                 self.watchdog.stop()
 
-            # 8. 停止任务管理器（取消所有活动任务）
-            if self.task_manager:
-                active_tasks = self.task_manager.get_active_tasks()
-                for task_info in active_tasks:
+        async def _stop_tasks() -> None:
+            if self.task_manager is None:
+                return
+            try:
+                for task_info in self.task_manager.get_active_tasks():
                     self.task_manager.cancel_task(task_info.task_id)
-
-                # 等待所有非守护任务完成
-                await self.task_manager.wait_all_tasks()
-
-                # 清理已完成的任务
+                await asyncio.wait_for(
+                    self.task_manager.wait_all_tasks(),
+                    timeout=timeout,
+                )
+            finally:
                 self.task_manager.cleanup_tasks()
                 self.task_manager.shutdown_process_pool(wait=False)
 
-            # 9. 关闭数据库
+        async def _close_database() -> None:
             from src.kernel.db import close_engine
 
             await close_engine()
             self._stats["db_connected"] = False
 
-            # 10. 关闭向量数据库
+        async def _close_model_clients() -> None:
+            from src.kernel.llm.model_client import close_default_model_clients
+
+            await close_default_model_clients()
+
+        async def _close_vector_databases() -> None:
             from src.kernel.vector_db import close_all_vector_db_services
 
             await close_all_vector_db_services()
 
-            # 11. 关闭日志系统（停止事件广播）
+        async def _close_network_runtime() -> None:
+            self._shutdown_async_network_runtime()
+
+        async def _close_logger() -> None:
             from src.kernel.logger import shutdown_logger_system_async
 
             await shutdown_logger_system_async()
 
-            self.ui.display_success("关闭完成")
+        steps = (
+            ("on_stop", _publish_stop),
+            ("stream_loops", _stop_stream_loops),
+            ("plugins", self._unload_all_plugins),
+            ("scheduler", _stop_scheduler),
+            ("http_server", _stop_http_server),
+            ("mcp", _cleanup_mcp),
+            ("watchdog", _stop_watchdog),
+            ("tasks", _stop_tasks),
+            ("llm_clients", _close_model_clients),
+            ("database", _close_database),
+            ("vector_database", _close_vector_databases),
+            ("network_runtime", _close_network_runtime),
+            ("logger", _close_logger),
+        )
+        for name, operation in steps:
+            await _run_step(name, operation)
 
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f"关闭过程中出错: {e}", exc_info=e)
-            else:
-                print(f"关闭过程中出错: {e}")
-            raise BotShutdownError(f"关闭失败: {e}") from e
+        self._initialized = False
+        if not errors:
+            self.ui.display_success("关闭完成")
+            return
+
+        summary = "; ".join(f"{name}: {exc}" for name, exc in errors)
+        if raise_on_error:
+            raise BotShutdownError(f"关闭失败: {summary}") from errors[0][1]
+        self.ui.display_warning(f"关闭完成，但有 {len(errors)} 个步骤失败")
 
     async def start(self) -> None:
         """完整的启动流程（初始化 + 运行 + 关闭）
 
         这是推荐的启动方式。
         """
+        primary_error: Exception | None = None
         try:
             await self.initialize()
             await self.run()
@@ -955,13 +1056,23 @@ class Bot:
             else:
                 print("\n[用户中断]")
         except Exception as e:
+            primary_error = e
             if self.logger:
                 self.logger.error(f"Bot 错误: {e}", exc_info=e)
             else:
                 print(f"\n[致命错误: {e}]")
             raise
         finally:
-            await self.shutdown()
+            try:
+                await self.shutdown()
+            except BotShutdownError as shutdown_error:
+                if primary_error is None:
+                    raise
+                if self.logger:
+                    self.logger.error(
+                        f"主错误后的关闭过程仍有失败: {shutdown_error}",
+                        exc_info=shutdown_error,
+                    )
 
 
 __all__ = ["Bot"]

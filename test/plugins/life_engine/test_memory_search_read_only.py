@@ -6,7 +6,7 @@ import sqlite3
 import time
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -439,32 +439,6 @@ async def test_build_memory_bundles_does_not_use_filename_heuristic(
 
     assert bundles
     assert bundles[0].primary_path == old_path
-
-
-async def test_scheduler_dream_walk_is_read_only_by_default() -> None:
-    from plugins.life_engine.dream.scheduler import DreamScheduler
-
-    memory = MagicMock()
-    memory.dream_walk = AsyncMock(
-        return_value={
-            "nodes_activated": 1,
-            "new_edges_created": 0,
-            "seed_ids": ["seed"],
-        }
-    )
-    memory.prune_weak_edges = AsyncMock(return_value=1)
-    scheduler = DreamScheduler(
-        memory_service=memory,
-        rem_walk_rounds=1,
-        rem_seeds_per_round=1,
-    )
-
-    report = await scheduler._run_rem(["seed"])
-
-    assert report.new_edges_created == 0
-    memory.dream_walk.assert_awaited_once()
-    assert memory.dream_walk.await_args.kwargs["persist_learning"] is False
-    memory.prune_weak_edges.assert_not_awaited()
 
 
 async def test_memory_bundles_batch_lineage_reads_and_path_checks(

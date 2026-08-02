@@ -26,10 +26,26 @@ from plugins.life_engine.learning.models import (
     InsightStatus,
 )
 from plugins.life_engine.learning.knowledge import SelfKnowledgeCompressor
-from plugins.life_engine.learning.prompts import format_reconsidered_for_compression
+from plugins.life_engine.learning.prompts import (
+    KNOWLEDGE_COMPRESS_USER,
+    format_reconsidered_for_compression,
+)
 from plugins.life_engine.learning.store import InsightStore
 
 _CLAIM = "我在深夜会主动把话收短，避免把对方留在一个需要回应的句子里"
+
+
+def test_knowledge_compression_prompt_accepts_reconsidered_insights() -> None:
+    """The compression template and compressor must share one field contract."""
+    prompt = KNOWLEDGE_COMPRESS_USER.format(
+        current_knowledge="old",
+        validated_insights="validated",
+        rejected_insights="rejected",
+        reconsidered_insights="reconsidered",
+        max_edits=4,
+    )
+
+    assert "<reconsidered>\nreconsidered\n</reconsidered>" in prompt
 
 
 def _ev(description: str = "一次实际互动", *, supports: bool = True) -> Evidence:
@@ -309,6 +325,5 @@ class TestNothingIsImposedOnHer:
         store.add_evidence(ins.insight_id, _ev("又一次印证", supports=True))
 
         assert store.get_insight(ins.insight_id).contradiction_count == 0
-
 
 

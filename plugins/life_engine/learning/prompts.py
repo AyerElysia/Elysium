@@ -257,7 +257,7 @@ KNOWLEDGE_COMPRESS_USER = """\
 </recent_rejected>
 
 <reconsidered>
-{revised_insights}
+{reconsidered_insights}
 </reconsidered>
 
 请基于新验证的洞察，对自我认知文档做有界更新（最多 {max_edits} 处修改）。

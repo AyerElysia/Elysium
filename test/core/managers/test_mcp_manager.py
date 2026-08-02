@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -115,3 +116,52 @@ async def test_mcp_tool_adapter_uses_bound_manager_and_normalizes_name() -> None
         arguments={"path": "/tmp/demo.txt"},
     )
     assert result["tool_name"] == "mcp-file-system-read-file"
+
+
+async def test_failed_mcp_connection_closes_partial_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """连接初始化失败时必须立即关闭该服务已打开的传输。"""
+    manager = MCPManager()
+    transport_closed = asyncio.Event()
+
+    class FakeTransportContext:
+        async def __aenter__(self):
+            return object(), object()
+
+        async def __aexit__(self, *_args):
+            transport_closed.set()
+
+    monkeypatch.setattr(
+        "src.core.managers.tool_manager.mcp_manager.stdio_client",
+        lambda _params: FakeTransportContext(),
+    )
+    manager._connect_session = AsyncMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("initialize failed")
+    )
+
+    success = await manager.connect_stdio_server(
+        "broken",
+        "fake-command",
+        [],
+    )
+
+    assert success is False
+    assert transport_closed.is_set()
+    assert "broken" not in manager._sessions
+
+
+async def test_mcp_tool_call_has_hard_timeout() -> None:
+    """失联 MCP 工具不能无限占住调用链。"""
+    manager = MCPManager()
+    never_returns = asyncio.Event()
+
+    async def _hang(*_args):
+        await never_returns.wait()
+
+    manager._sessions["slow"] = SimpleNamespace(
+        call_tool=AsyncMock(side_effect=_hang)
+    )
+
+    with pytest.raises(asyncio.TimeoutError):
+        await manager.call_tool("slow", "hang", {}, timeout=0.01)

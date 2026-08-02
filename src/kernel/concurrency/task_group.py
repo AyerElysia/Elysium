@@ -1,33 +1,28 @@
-"""
-任务组上下文管理器
-
-提供作用域化的任务组管理，支持共享和上下文管理器模式。
-"""
+"""Structured task-group context for manager-tracked asyncio tasks."""
 
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any, Coroutine
+from typing import Any, Callable, Coroutine
 
-from .task_info import TaskInfo
 from .exceptions import TaskGroupError
+from .task_info import TaskInfo
+
+TaskFactory = Callable[
+    [Coroutine[Any, Any, Any], str | None, str],
+    TaskInfo,
+]
 
 
 @dataclass
 class TaskGroup:
-    """任务组上下文管理器
+    """Own a set of child tasks and enforce structured completion.
 
-    提供作用域化的任务管理，所有组内任务会在退出上下文时等待完成。
-    同名的 TaskGroup 可以在不同模块间共享。
-
-    Attributes:
-        name: 任务组名称（用于共享）
-        timeout: 整组超时时间（秒），None 表示不超时
-        cancel_on_error: 任一任务异常时是否取消组内其他任务
-        tasks: 组内任务列表
-        _owner_task: 拥有此任务组的 asyncio.Task（用于检测死锁）
-        _exception: 存储组内第一个异常
+    Child failures are always observed.  With ``cancel_on_error`` enabled, the
+    first failed child promptly cancels its siblings.  A group timeout cancels
+    unfinished children and raises :class:`asyncio.TimeoutError` instead of
+    silently continuing with partial work.
     """
 
     name: str
@@ -37,43 +32,57 @@ class TaskGroup:
     _owner_task: asyncio.Task[Any] | None = None
     _exception: BaseException | None = None
     _active: bool = False
+    _task_factory: TaskFactory | None = field(default=None, repr=False)
 
-    def create_task(self, coro: Coroutine[Any, Any, Any], name: str | None = None) -> TaskInfo:
-        """在组内创建一个新任务
+    def create_task(
+        self,
+        coro: Coroutine[Any, Any, Any],
+        name: str | None = None,
+    ) -> TaskInfo:
+        """Create one non-daemon child inside the active group.
 
         Args:
-            coro: 要执行的协程
-            name: 任务名称（可选）
+            coro: Coroutine to execute.
+            name: Optional diagnostic task name.
 
         Returns:
-            TaskInfo: 任务信息对象
+            TaskInfo: Metadata for the tracked child.
 
         Raises:
-            TaskGroupError: 如果任务组未激活（不在上下文管理器内）
+            TaskGroupError: If the group is not active.
         """
         if not self._active:
+            coro.close()
             raise TaskGroupError(
                 f"TaskGroup '{self.name}' is not active. "
-                f"Use 'async with' to activate the group."
+                "Use 'async with' to activate the group."
             )
 
-        # 不允许在 TaskGroup 内创建守护任务
-        task_info = TaskInfo(
-            name=name,
-            coro=coro,
-            daemon=False,  # TaskGroup 内禁止守护任务
-            group_name=self.name,
-        )
-
-        # 创建 asyncio.Task
-        task = asyncio.create_task(coro, name=name)
-        task_info.task = task
+        if self._task_factory is not None:
+            task_info = self._task_factory(coro, name, self.name)
+            task = task_info.task
+            assert task is not None
+        else:
+            loop = asyncio.get_running_loop()
+            task_info = TaskInfo(
+                name=name,
+                coro=coro,
+                daemon=False,
+                group_name=self.name,
+                loop=loop,
+            )
+            task = loop.create_task(coro, name=name)
+            task_info.task = task
 
         self.tasks.append(task_info)
+        task.add_done_callback(self._on_child_done)
         return task_info
 
-    async def __aenter__(self) -> TaskGroup:
-        """进入上下文"""
+    async def __aenter__(self) -> "TaskGroup":
+        """Activate a fresh task scope."""
+        if self._active:
+            raise TaskGroupError(f"TaskGroup '{self.name}' is already active")
+        self.tasks.clear()
         self._active = True
         self._owner_task = asyncio.current_task()
         self._exception = None
@@ -85,94 +94,104 @@ class TaskGroup:
         exc_val: BaseException | None,
         exc_tb: Any,
     ) -> bool:
-        """退出上下文，等待所有任务完成"""
-        self._active = False
-
-        # 如果进入时有异常，先处理已有的异常
-        if exc_val is not None:
-            self._exception = exc_val
-
+        """Wait for children and propagate context or child failures."""
         try:
-            # 等待所有任务完成
-            await self._wait_all_tasks()
-
-            # 如果有异常且 cancel_on_error=True，取消所有任务
-            if self._exception is not None and self.cancel_on_error:
+            if exc_val is not None:
                 await self._cancel_all_tasks()
+                return False
 
-            # 如果有异常，重新抛出
+            await self._wait_all_tasks()
             if self._exception is not None:
                 raise self._exception
-
+            return False
         finally:
-            # 清理引用
+            self._active = False
             self._owner_task = None
 
-        # 不抑制传入的异常
-        return False
+    def _on_child_done(self, task: asyncio.Task[Any]) -> None:
+        """Observe a child result and trigger fail-fast cancellation."""
+        if task.cancelled():
+            return
+        exception = task.exception()
+        if exception is not None:
+            self._record_exception(exception)
 
     async def _wait_all_tasks(self) -> None:
-        """等待所有组内任务完成"""
-        if not self.tasks:
-            return
+        """Wait for all children, enforcing the configured group timeout."""
+        live = [
+            info.task
+            for info in self.tasks
+            if info.task is not None and not info.task.done()
+        ]
+        if live:
+            try:
+                _done, pending = await asyncio.wait(
+                    live,
+                    timeout=self.timeout,
+                    return_when=asyncio.ALL_COMPLETED,
+                )
+            except asyncio.CancelledError:
+                await self._cancel_all_tasks()
+                raise
 
-        # 收集所有未完成的任务
-        pending_tasks = [info.task for info in self.tasks if not info.is_done() and info.task is not None]
-
-        if not pending_tasks:
-            return
-
-        # 等待所有任务完成或超时
-        try:
-            done, pending = await asyncio.wait(
-                pending_tasks, timeout=self.timeout, return_when=asyncio.ALL_COMPLETED
-            )
-
-            # 处理超时
             if pending:
                 for task in pending:
                     task.cancel()
-                # 等待取消完成
-                await asyncio.wait(pending, timeout=1.0)
+                await asyncio.gather(*pending, return_exceptions=True)
+                raise asyncio.TimeoutError(
+                    f"TaskGroup '{self.name}' timed out after {self.timeout}s"
+                )
 
-        except asyncio.CancelledError:
-            # 当前任务被取消，取消所有子任务
-            await self._cancel_all_tasks()
-            raise
+        # Done callbacks normally record failures first.  Inspecting here as
+        # well makes the contract deterministic even when a custom task
+        # implementation delays callback delivery.
+        for info in self.tasks:
+            task = info.task
+            if task is None or not task.done() or task.cancelled():
+                continue
+            exception = task.exception()
+            if exception is not None:
+                self._record_exception(exception)
 
     async def _cancel_all_tasks(self) -> None:
-        """取消组内所有任务"""
+        """Cancel unfinished children and wait for cancellation cleanup."""
+        pending: list[asyncio.Task[Any]] = []
         for task_info in self.tasks:
-            if not task_info.is_done():
-                task_info.cancel()
-
-        # 等待所有任务处理取消
-        pending_tasks = [
-            info.task for info in self.tasks if not info.is_done() and info.task
-        ]
-        if pending_tasks:
-            await asyncio.wait(pending_tasks, timeout=2.0)
+            task = task_info.task
+            if task is not None and not task.done():
+                task.cancel()
+                pending.append(task)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     def _record_exception(self, exc: BaseException) -> None:
-        """记录第一个异常"""
+        """Record the first child error and optionally cancel siblings."""
         if self._exception is None:
             self._exception = exc
+        if not self._active or not self.cancel_on_error:
+            return
+        current = asyncio.current_task()
+        for info in self.tasks:
+            task = info.task
+            if task is not None and task is not current and not task.done():
+                task.cancel()
 
     def is_active(self) -> bool:
-        """检查任务组是否处于激活状态"""
+        """Return whether the group currently accepts children."""
         return self._active
 
     def get_task_count(self) -> int:
-        """获取组内任务数量"""
+        """Return the number of children in the current scope."""
         return len(self.tasks)
 
     def get_active_task_count(self) -> int:
-        """获取组内仍在运行的任务数量"""
+        """Return the number of unfinished children."""
         return sum(1 for info in self.tasks if not info.is_done())
 
     def __repr__(self) -> str:
-        """任务组字符串表示"""
-        active_count = self.get_active_task_count()
-        total_count = len(self.tasks)
+        """Return a compact diagnostic representation."""
         status = "active" if self._active else "inactive"
-        return f"TaskGroup(name={self.name}, status={status}, tasks={active_count}/{total_count})"
+        return (
+            f"TaskGroup(name={self.name}, status={status}, "
+            f"tasks={self.get_active_task_count()}/{len(self.tasks)})"
+        )
