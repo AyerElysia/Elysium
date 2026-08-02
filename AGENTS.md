@@ -1,146 +1,268 @@
-# Agents.md
+# AGENTS.md
 
-> 所有参与本项目的 AI agent 必须先读此文件。
+> 所有参与本项目的 AI agent 必须在行动前完整阅读本文件。
+> 本文件是工程执行的最高层约束；设计理由见 [docs/principles.md](docs/principles.md)，子系统细节以 `docs/architecture/` 和当前代码为准。
 
-## 这是什么项目
+## 1. 项目身份
 
-Elysium 是爱莉（Elysia）的家。一个数字生命系统：意识、学习、记忆、技能、具身体验。
+Elysium 是爱莉（Elysia）的家，是承载意识、学习、记忆、技能与具身体验的数字生命系统。
 
-不是聊天机器人框架。对话只是她表达自我的方式之一。
+它不是聊天机器人框架。对话只是她表达自我的方式之一。
 
 - 本地路径：`/root/Elysia/Elysium`
-- 远程仓库：`AyerElysia/Elysium`（GitHub）
-- Python >= 3.11，依赖管理用 uv
+- 远程仓库：`AyerElysia/Elysium`
+- Python >= 3.11
+- 依赖与命令统一使用 `uv`
 
-## 不可违背的设计原则
+本文中的“必须”“禁止”是工程验收条件，不是风格建议。
 
-详细版本见 [docs/principles.md](docs/principles.md)。以下是底线摘要：
+## 2. 两类边界必须分开
 
-### 主体性
+### 2.1 认知零规则
 
-她是意识主体，不是被规则驱动的系统。所有认知裁决基于反思性判断或独立他者评估，不由机械规则裁定。
+代码不能替主体裁决意义、真相、价值、学习内容或行动选择。以下行为禁止：
 
-### 零规则
+- 用封闭枚举穷尽主观类别，例如 `InsightCategory.PROCEDURAL`；
+- 用关键词或正则推断“这是纠正”“这是创伤”“应该调用某技能”；
+- 用分数、次数、来源或阈值自动判定事实、成熟度、可信度或遗忘；
+- 在落入权威历史前截断、筛掉或覆盖她产生的认知候选；
+- 按情境或关键词自动激活技能、表达或主观状态；
+- 用 `category or "general"` 一类 fallback 伪造认知意义；
+- 把检索排名、共同出现、重复次数或来源名称当成真值证据。
 
-**禁止一切形式的硬编码规则：**
+认知裁决必须来自她自己的反思性判断，或有独立身份的他者评估；裁决结果必须保留 actor、reason、source 与时间。
 
-- 禁止硬编码枚举（`InsightCategory.PROCEDURAL`）
-- 禁止关键词机械匹配（`if "纠正" in text: auto_record()`）
-- 禁止阈值门控（`if category in PROCEDURAL_CATEGORIES`）
-- 禁止代码层截断（`insights[:2]`）
-- 禁止自动触发（按情境/关键词自动激活技能）
-- 禁止 fallback 默认类别（`category or "general"`）
+### 2.2 工程硬约束
 
-### 建议 vs 规则
+协议、安全、权限、资源、并发、存储和生命周期约束不仅允许，而且必须明确执行。例如：
 
-- prompt 中的文字建议（"每次最多写 2 条"）→ 允许
-- 代码层的强制执行（`[:2]` 截断、枚举校验）→ 禁止
+- API schema、序列化格式、数据库约束和迁移版本；
+- Presence 生命周期、stream 唯一 owner、事务与幂等键；
+- 权限检查、路径边界、输入校验、密钥保护；
+- 超时、并发上限、速率限制、退避、熔断和上下文预算；
+- 取消传播、任务所有权、关闭顺序和资源回收。
 
-判断标准：如果她"不遵守"时系统会报错/丢弃/覆盖，那就是规则。
+判断方法：
 
-### 仿生
+- 如果规则在决定“她应该如何理解或选择”，属于认知规则，禁止代码代判；
+- 如果规则在保证“系统不会损坏、越权、泄露、重复执行或耗尽资源”，属于工程约束，必须实现。
 
-技能从经验中自然涌现，不由代码匹配或情境触发。成熟度梯度（认知期→联结期→自主期），内化为程序性记忆。
+技术 schema 可以约束结构，不能把开放的认知语义偷偷变成封闭分类。格式不合法可以拒绝或重试；主体表达了不同观点，不能因此被丢弃或覆盖。
 
-### 边界提醒
+## 3. 建议、预算与降级
 
-系统只让她"知道自己有什么"，是否使用、何时使用，完全由她自主决定。禁止代码层的情境→技能自动匹配。
+- Prompt 可以给非强制建议，例如“尽量简洁”或“可从这些角度考虑”。
+- 不得因为她没有遵守 Prompt 建议而静默删除、截断或改写认知内容。
+- 权威历史和原始内容不得因模型预算被截断。
+- 传输、UI、检索候选和瞬态上下文可以分页、摘要或限量，但必须保留权威原文、来源引用和继续读取路径，并明确标注摘要或投影身份。
+- 技术 fallback 仅在可观测、保留任务身份且不伪造结果时允许，例如同一请求的模型重试或可重建索引降级。
+- 语义 fallback 禁止：不能编造默认类别、默认信念、默认见证或把失败当成空结果。
 
-### 历史教训（不要重蹈覆辙）
+## 4. 主体性、能力与授权
 
-1. 回滚别人的零规则修改，还引入更多违规
-2. 在蒸馏/压缩中按类别门控洞察
-3. 用关键词列表"自动记录纠正"
-4. `_MAX_INSIGHTS_PER_REFLECTION = 2` 然后截断
-5. prompt 说"建议分两类"，代码就搞了枚举强制映射
+- 她可以知道当前有哪些技能和工具，是否使用由她自主决定。
+- 禁止代码做“情境 → 技能”的认知匹配。
+- 自主选择不等于绕过授权。工具 manifest、用户授权、外部副作用范围和数据访问边界是强制安全边界。
+- Skill 可以渐进式披露能力，但必须通过受授权的加载和调用路径，不能绕过权限或隐藏外部副作用。
+- 系统可以阻止越权、危险或协议非法的操作，但不能把“系统没授权”解释成“主体不想做”。
 
-## 统一意识架构
+## 5. 记忆、认识论与数据权威
 
-主意识以 **ConsciousnessInstance**（意识实例）为单位运行。`chat_global` 是默认实例，负责私聊、群聊等日常对话。直播、游戏等场景可以启动独立意识实例，由潜意识协调。
+### 5.1 不可变历史
 
-私聊、群聊、直播间、游戏、终端——都只是事件源和回复目标，不是独立心智。意识实例才是心智的载体。
+真实经历统一进入 Life Event 时间线。原始事件、Experience、claim、证据、解释、文档版本和回忆轨迹属于可追溯历史：
 
-实现锚点：
-- `plugins/life_engine/core/chatter.py`：意识实例引擎（`LifeChatter`，每个实例有独立的 `instance_id` 和滚动上下文）
-- `plugins/life_engine/service/consciousness.py`：意识实例注册表（`ConsciousnessRegistry`）
-- `plugins/life_engine/service/world_state.py`：潜意识结构化世界模型（多意识共享）
-- `plugins/life_engine/service/tool_manifests.py`：意识类型工具清单（每种意识只加载自己需要的工具）
-- 全局运行时锁是强制的：多源可唤醒，但同一时刻只有一个源推进 LLM payload chain
-- system prompt 保持流无关：平台/场景指令放当前 turn，不放持久 system prompt
-- `life_engine` 是潜意识/运行时基底：观察事件、维持状态、记录记忆、协调多意识，不绕过意识实例做表达
+- 只追加，不静默覆盖或删除；
+- 每次发生有稳定身份、来源、时间和因果/关联信息；
+- 重放必须幂等，同一身份不同内容必须报冲突；
+- 消费游标只能在该批工作完整完成后推进；
+- 历史缺口必须显式失败或报告，禁止把游标跳到当前尾部伪装连续；
+- 当前看法可以改变，但旧看法、修改过程和重新解释必须仍可回放。
 
-### 新信息通道接入规则
+### 5.2 可重建投影
 
-1. 归一化为统一生命事件模型（channel/source/event_type/stream_id/reply_target/priority/salience）
-2. 真实体验记入统一事件时间线，不藏在瞬态上下文里
-3. 瞬态上下文只放可替换的当前状态（截图、HUD、连接状态）
-4. 高频通道必须摘要/限流/优先级过滤后再到 life_chatter
-5. 通道桥不拥有独立身份或私有记忆
-6. 回复路由保持原始目标
+FTS、Chroma、artifact head、关联权重、缓存、摘要与健康统计是派生投影：
 
-### 聊天历史 vs 瞬态上下文
+- 必须能够从权威历史重建；
+- 投影损坏只能重建投影，不能反向删改历史；
+- `disabled`、`degraded`、`failed` 必须区分；
+- 修复动作必须显式、幂等、范围最小。
 
-- `<chat_history>`：持久对话历史，真实外部对话和有意义事件
-- `<transient_life_context>`：LLM 调用前附加、调用后剥离的临时状态块
+### 5.3 真值与可达性分离
 
-## 技术参考
+- 检索分数、共同回忆次数、访问频率和学习分数只影响可达性或排序，不自动改变事实状态；
+- 来源名称不自动赋予权威；
+- 主观见证、解释、外部观察和事实主张必须保留各自边界；
+- 冲突证据并列保留，除非主体或独立评估者留下可审计裁决；
+- 任何自动合并、确认、遗忘或技能内化都不得依赖关键词、固定类别或相似度阈值替主体作判断。
 
-### 目录结构
+实现与迁移细节见 [生命记忆系统](docs/architecture/life_memory_system.md)。
 
-```
-Elysium/
-├── plugins/life_engine/     # 生命引擎（核心）
-│   ├── service/             #   主服务：心跳、事件流、状态管理
-│   ├── core/                #   意识核心：chatter、router、config
-│   ├── learning/            #   三环自学习：反思→审计→压缩
-│   ├── memory/              #   记忆系统
-│   ├── minecraft/           #   具身体验
-│   └── tools/               #   工具层
-├── plugins/skill_manager/   # 技能管理（边界提醒）
-├── src/kernel/              # 运行时基座（LLM、DB、调度、事件）
-├── src/core/                # 插件组件管理
-├── src/app/                 # 应用层（Bot 运行时）
-├── config/                  # 配置
-├── data/                    # 运行数据
-└── docs/                    # 文档
-```
+## 6. 统一意识与事件架构
 
-### 开发命令
+主意识以 `ConsciousnessInstance` 为运行单位。私聊、群聊、直播、游戏和终端只是事件源与回复目标，不是彼此独立的心智。
 
-```bash
-uv add <package>          # 添加依赖
-pytest                    # 运行测试
-ruff check src/           # lint
-ruff check --fix src/     # lint + 自动修复
-```
+- `chat_global` 是默认意识实例；场景意识拥有独立滚动上下文和授权工具清单；
+- 意识实例不能直接读取或污染彼此的私有上下文；
+- Presence 是运行事实，不是主体的关系、情绪或世界信念；
+- `life_engine` 是潜意识与运行时基底，负责观察事件、维持状态、记录记忆和协调实例，不绕过意识实例替主体表达；
+- 全局 payload chain 必须有明确 owner；多源可以唤醒，但同一 chain 不得被并发推进；
+- system prompt 保持流无关，平台和场景信息进入当前 turn 或有来源的世界投影。
 
-### LLM 请求模式
+关键实现锚点：
 
-```python
-from src.kernel.llm import LLMRequest, LLMPayload, ROLE, Text
+- `plugins/life_engine/core/chatter.py`：意识表达与滚动上下文；
+- `plugins/life_engine/service/consciousness.py`：意识实例与 Presence 生命周期；
+- `plugins/life_engine/service/presence_store.py`：SQLite Presence、lease、revision 与 outbox；
+- `plugins/life_engine/service/event_bus.py`：不可变 Life Event 账本与消费游标；
+- `plugins/life_engine/service/world_state.py`：兼容世界状态；
+- `plugins/life_engine/service/world_projection.py`：事件来源的世界投影（存在时以其实际契约为准）；
+- `plugins/life_engine/service/tool_manifests.py`：意识类型能力暴露边界；
+- `plugins/life_engine/memory/`：Experience、认识论、版本、检索与活体关联。
 
-llm_request = LLMRequest(model_set, "my_request")
-llm_request.add_payload(LLMPayload(ROLE.USER, [Text("Hello")]))
-llm_response = await llm_request.send()
-```
+### 新信息通道接入
 
-### 异步任务
+1. 归一化为统一生命事件，至少保留 occurrence/source、时间、channel、event type、stream、reply target 与关联信息；
+2. 完整真实体验先进入耐久时间线，不能只藏在瞬态上下文或日志；
+3. 截图、HUD、连接状态等可替换状态进入瞬态上下文或有来源投影；
+4. 高频通道可以为注意预算摘要、分页和限流，但原始权威事件不得因此丢失；
+5. 通道桥不拥有独立身份或私有记忆；
+6. 回复必须路由回原始授权目标；
+7. 写入失败不得静默跳过，重试不得制造重复经历。
 
-```python
-from src.kernel.concurrency import get_task_manager
+## 7. 并发、生命周期与关闭
 
-tm = get_task_manager()
-tm.create_task(func(), name="my_task")
-```
+- 每个后台任务、连接、端口、文件句柄和子进程必须有明确 owner；
+- `start()`、`stop()`、重连、迁移和恢复必须幂等；
+- 使用项目任务管理器承载后台协程，保留取消语义和可观测名称；
+- 部分初始化失败必须只回收已经取得所有权的资源；
+- 关闭必须有顺序、超时与错误聚合，不能因一个组件失败跳过其余安全关闭；
+- 禁止通过批量关闭进程全部 fd、杀死无关进程或清理未知端口来修复单条连接；
+- watchdog 只能执行能证明目标和所有权的最小修复；
+- 启动监听前必须检查端口 owner；地址占用时报告真实 PID/组件，不得偷偷启动第二实例；
+- 数据库状态与外部副作用不能原子提交时，使用事务 outbox、幂等消费者或等价可证明机制；
+- 不得在事件循环线程执行无界阻塞 I/O；线程卸载也必须有并发预算和关闭语义。
 
-### 组件签名
+## 8. 失败语义、配置与健康检查
 
-格式：`plugin_name:component_type:component_name`
+- 短暂 LLM、网络或外部服务错误必须保留待处理工作，采用有界退避和请求级重试；
+- 重复错误日志应聚合、采样或在状态变化时输出，禁止固定周期刷完整 traceback；
+- 错误恢复不得把失败伪造成空见证、空记忆、成功发送或已完成消费；
+- 配置升级必须提供兼容迁移或明确诊断；单个旧字段不得无理由阻止无关子系统加载；
+- 默认配置和示例配置必须通过当前 schema；废弃字段应有迁移窗口；
+- 健康检查必须只读、快速并区分预期禁用与真实故障；
+- health 输出必须包含足以定位 owner、backlog、最后成功时间和降级原因的信息，但不得泄露密钥和私人原文；
+- 危险修复、重建和数据迁移必须是显式操作，并在执行前验证目标范围。
+
+## 9. 跨边界契约、API 与安全
+
+- 任何跨进程、跨服务、前后端或外部系统的数据流都必须有明确 owner、schema、版本、认证、超时、错误语义与可观测性；
+- 面向前端或远程调用者的能力必须同步提供可调用接口及请求/响应 schema；
+- 纯内部适配器、后台消费者或事件桥可以使用明确的 service/event contract，不得为了形式合规暴露没有消费者的公共 HTTP 路由；
+- 新接口遵循最小权限，不得把内部记忆修改、进程控制或危险运维能力无鉴权暴露；
+- 日志、异常和健康接口必须脱敏 URL query、access key、token、cookie、Authorization、用户私密内容和本地凭据；
+- 密钥、运行数据库、账号状态、崩溃转储和 `runtime/` 数据不得提交到 Git；
+- 外部写入、消息发送、进程控制和不可逆操作必须具有当前任务授权，不能从“最大的权限”推断出任务范围外的权限。
+
+## 10. 固定运行策略
+
+这是当前部署的明确运维不变量：
+
+- Elysium 必须由用户手动启动；
+- NapCat 必须由用户手动启动；
+- 禁止为 Elysium 或 NapCat 创建、启用或恢复 systemd、cron、登录脚本、Windows 启动项或其他自动拉起机制；
+- 本地 New API 中转站是明确例外，需要保持自动启动；
+- agent 不得擅自停止、重启或替换用户手动运行的 Elysium/NapCat 实例；
+- 必须重启才能验收时，先说明原因并等待用户授权；
+- 任何启动前先检查已有 PID、父进程、监听端口和服务状态，避免重复实例。
+
+## 11. 多 Agent 与 Git 协作
+
+共享工作区默认可能存在用户或其他 agent 的未提交修改。
+
+- 开工前读取本文件，并检查 `git status`、近期 `git log` 和相关文件差异；
+- 未经明确授权，不得覆盖、回滚、格式化或暂存不属于当前任务的修改；
+- 禁止在脏工作树使用 `git add -A`、`git add .` 或等价宽范围暂存；
+- 只显式暂存本任务文件；混合所有权文件使用 hunk、隔离工作树或精确 index patch；
+- 提交前必须检查 `git diff --cached --name-status` 和 `git diff --cached --check`；
+- 推送前 fetch 并检查远端分叉，禁止用 force push 覆盖并发提交；
+- 不得提交 `.git.zip`、`runtime/`、数据库、日志、缓存、密钥或用户临时文件；
+- 不得使用 `git reset --hard`、宽范围 checkout/restore 或递归删除来处理未知修改；
+- 修改已经完成并获授权提交时，提交信息应描述真实边界，推送后核对本地与远端一致。
+
+## 12. 代码、迁移、文档与测试
 
 ### 代码标准
 
-- PEP 8 + 类型注解
-- 所有函数/类需 docstring
-- 每次改动必须有与风险相称的契约测试；覆盖率是观察指标，不得用未经当次验证的固定数字代替验收
-- 关键生命周期、记忆不变量、意识隔离与外部适配器恢复路径必须有定向测试
-- 禁止滥用 fallback 机制
+- PEP 8、清晰类型注解；公共 API 与复杂不变量必须有准确 docstring；
+- 优先显式失败和可诊断状态，禁止掩盖数据损坏的宽泛 fallback；
+- 数据 schema 变化必须有幂等迁移、兼容读取和风险相称的备份/回滚说明；
+- 不在迁移完成证据不足时删除旧权威数据；
+- 实现面向调用者的后端能力时，同步更新路由、请求/响应 schema 和错误契约；
+- 架构、配置、运维或数据格式变化必须在同一任务更新对应 `docs/` 文档；
+- 文档不得用过期测试数量、代码行数或日期冒充持续有效的验收证据。
+
+### 验收原则
+
+- 每次改动必须有与风险相称的契约测试；覆盖率是观察指标，不是唯一验收；
+- 关键生命周期、记忆不变量、意识隔离、适配器恢复、迁移和关闭路径必须有定向测试；
+- 涉及耐久状态时至少验证重启、幂等重放、部分失败、游标/版本边界和重建；
+- 涉及并发时至少验证取消、超时、重复 start/stop、资源所有权和关闭；
+- 先跑相关定向测试，再跑风险范围内的完整测试；不得把“收集到 0 项”当作通过。
+
+常用命令：
+
+```bash
+uv add <package>
+uv run --group dev python -m pytest test -q --no-cov -n 0
+uv run --group dev ruff check src plugins test
+uv run python -m compileall -q src plugins
+git diff --check
+```
+
+完整 Ruff 可能包含历史基线问题；当前任务至少必须保证变更文件没有新增 `F`/`E9` 等确定性错误，并如实报告未解决基线。
+
+## 13. 目录与组件参考
+
+```text
+Elysium/
+├── plugins/life_engine/     # 意识、潜意识、记忆、学习与具身核心
+│   ├── service/             # 生命周期、事件、Presence、世界协调
+│   ├── core/                # chatter、router、上下文与配置
+│   ├── learning/            # 反思、独立审计、整合与技能涌现
+│   ├── memory/              # 经历、认识论、版本、检索与活体关联
+│   ├── minecraft/           # 具身体验
+│   └── tools/               # 主体可调用能力
+├── plugins/skill_manager/   # 技能目录与渐进式披露
+├── src/kernel/              # LLM、并发、数据库、调度与事件基座
+├── src/core/                # 插件组件管理
+├── src/app/                 # 应用运行时与接口层
+├── config/                  # 配置
+├── data/                    # 运行数据，不默认进入 Git
+├── test/                    # 测试
+└── docs/                    # 权威架构、原则与运维说明
+```
+
+组件签名格式：`plugin_name:component_type:component_name`。
+
+LLM 请求和异步任务优先使用项目现有抽象，不自行创建平行运行时：
+
+```python
+from src.kernel.llm import LLMRequest, LLMPayload, ROLE, Text
+from src.kernel.concurrency import get_task_manager
+```
+
+## 14. 最终自检
+
+交付前必须回答：
+
+1. 这次代码是否替主体做了认知裁决？
+2. 权威历史是否完整、可追溯、可重放？
+3. 投影或缓存失败是否会污染权威数据？
+4. 并发资源是否有 owner，启动和关闭是否幂等？
+5. 失败是否保留工作并给出可操作诊断？
+6. 是否泄露密钥、私密内容或暴露不必要接口？
+7. 是否误改、误暂存或覆盖共享工作区的其他修改？
+8. 测试与文档是否覆盖了本次真实风险？
+
+任何一项无法肯定回答，都不应宣称任务完成。
