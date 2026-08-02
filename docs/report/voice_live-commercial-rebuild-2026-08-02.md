@@ -3,6 +3,8 @@
 > 日期：2026-08-02
 > 范围：`plugins/voice_live/`、必要的 Life Engine 工具注册/清单、浏览器通话页、OBS 叠加层、本地与云端 Provider、测试与文档。
 > 结论：核心架构和主要真实链路已经跑通，当前建议以 Qwen-Audio Realtime 作为可上线默认路径，以 MiniCPM-o 4.5 作为本地可控路径；Qwen3.5-Omni Realtime 等待当前百炼工作空间开通模型权限。最后一次空闲打断修复已通过协议测试，但由于 Elysium 必须由用户手工启动，修复后的浏览器点击复验需要用户下次手工启动实例后完成。
+>
+> 后续补充：Qwen 下行接入爱莉 Seed-VC 实时音色的实现、真实音频指标与质量边界见 `docs/report/voice-live-elysia-seedvc-integration-2026-08-02.md`。
 
 ## 1. 执行摘要
 

@@ -27,6 +27,8 @@
     <div class="transcript" id="transcript"><div class="empty">最终转写和运行状态会显示在这里。</div></div>
     <div class="stats">
       <div>Provider <b id="provider">—</b></div>
+      <div>音色 <b id="voiceProfile">原生</b></div>
+      <div>SVC 块延迟 <b id="svcLatency">—</b></div>
       <div>Episode <b id="episode">—</b></div>
       <div>RTT <b id="latency">—</b></div>
       <div>上行 <b id="uplink">0 KB</b></div>
@@ -84,11 +86,11 @@ async function connect(resume=''){
   ws.onmessage=event=>{try{if(typeof event.data==='string')handle(JSON.parse(event.data));else playFrame(event.data)}catch(error){add('system','数据处理错误：'+error.message)}};
   ws.onerror=()=>status('连接错误');ws.onclose=()=>{status('已断开');if(running&&!explicitStop&&reconnects<3){reconnects++;setTimeout(()=>connect(episodeId),400*reconnects)}else if(!explicitStop)finish(false)};
   function handle(msg){
-    if(msg.type==='ready'){running=true;reconnects=0;episodeId=msg.episode_id;sessionStorage.setItem('voiceLiveEpisode',episodeId);el('provider').textContent=msg.provider;el('episode').textContent=episodeId.slice(0,8);status('通话中');state('listening')}
+    if(msg.type==='ready'){running=true;reconnects=0;episodeId=msg.episode_id;sessionStorage.setItem('voiceLiveEpisode',episodeId);el('provider').textContent=msg.provider;el('voiceProfile').textContent=msg.voice_profile||'原生';el('episode').textContent=episodeId.slice(0,8);status('通话中');state('listening')}
     else if(msg.type==='state')state(msg.state)
     else if(msg.type==='transcript')add(msg.role,msg.text,msg.is_final)
     else if(msg.type==='playback.clear')clearPlayback(msg.reason||'上游打断')
-    else if(msg.type==='metrics'){}
+    else if(msg.type==='metrics'){const svc=msg.values?.voice_conversion;if(svc){const perBlock=svc.block_count?svc.inference_ms/svc.block_count:0;el('svcLatency').textContent=svc.block_count?Math.round(perBlock)+' ms':'缓冲中'}}
     else if(msg.type==='pong'){el('latency').textContent=Math.round(performance.now()-pingAt)+' ms'}
     else if(msg.type==='error'){add('system','错误：'+msg.message);state('error');if(msg.fatal)finish(false)}
     else if(msg.type==='ended'){add('system','通话结束：'+msg.reason);finish(false)}

@@ -2,7 +2,7 @@
 
 > 文档状态：权威架构文档，与代码同步至 2026-08-02。
 > 代码位置：`plugins/voice_live/`。
-> 验收证据：`docs/report/voice_live-commercial-rebuild-2026-08-02.md`。
+> 验收证据：`docs/report/voice_live-commercial-rebuild-2026-08-02.md` 与 `docs/report/voice-live-elysia-seedvc-integration-2026-08-02.md`。
 
 ## 1. 定位与不变量
 
@@ -35,6 +35,10 @@ Voice Live 是爱莉在实时语音场景中的独立意识实例，不是“语
             |- Qwen-Omni Realtime（获得模型权限后的升级路径）
             |- OpenAI Realtime（协议适配路径）
             `- MiniCPM-o 4.5（本地可控路径）
+       `- 可选 VoiceConverter（当前为独立 Seed-VC CUDA 服务）
+            |- 24 kHz Provider PCM -> 300 ms 有界块
+            |- 爱莉参考音色 + 10 步扩散 + SOLA
+            `- 22.05 kHz 输出 -> 24 kHz 浏览器 PCM
   <- 24 kHz PCM16 增量音频 + 转写 + 状态 + 指标
   <- 浏览器时钟调度播放、排队、清空与重连
 
@@ -79,6 +83,20 @@ CREATED -> CONNECTING -> ACTIVE -> STOPPING -> ENDED
 - 重复空闲打断是幂等操作。
 
 这避免 Qwen 在“当前没有活动响应”时因 `response.cancel` 返回 `invalid_value` 并关闭会话。
+
+### 3.4 爱莉实时音色转换
+
+`voice_conversion.enabled=true` 时，Provider 下行音频不会直接送到浏览器，而是进入 `CallSession` 独占的有界转换队列。当前实现通过带 bearer token 的本地 HTTP/PCM 协议连接 Seed-VC 辅助进程；Elysium 为 AGPLv3、Seed-VC 为 GPLv3，许可证兼容。独立进程的目的不是规避许可证，而是隔离 CUDA/模型故障，并允许模型继续运行在专用 Windows Python 环境中。
+
+关键生命周期语义：
+
+- 会话只有在音色 profile 校验并成功分配远端转换 session 后才连接 Realtime Provider；
+- 转换服务不可用、profile 不一致、请求超时或队列溢出时显式终止通话，不把 Qwen 原声伪装成爱莉声音；
+- 每个打断都会增加转换 generation、丢弃尚未转换的旧音频并 reset SOLA/上下文；已在推理中的旧 generation 即使稍后返回，也不会播放；
+- Provider 回到 `LISTENING` 时 flush 最后不足 300 ms 的尾块；停止时删除远端 session 并关闭 HTTP 连接；
+- 当前只允许一个活跃 Seed-VC session，与 Voice Live 默认单通话容量一致。
+
+当前实测生产候选为 `seed-uvit-tat-xlsr-tiny`、10 diffusion steps、300 ms block、40 ms crossfade、固定 seed 42。20 步在本机模型实时系数约为 1.04，且 CAM++ 相似度没有提升，因此不得作为实时默认。固定 seed 让相同输入跨会话得到相同 PCM，便于回归和直播一致性。
 
 ## 4. 实时通话意识
 
@@ -180,7 +198,7 @@ Qwen3.5-Omni Realtime 提供语义打断、多语种、语音控制、Function C
 
 地址：`http://127.0.0.1:18000/voice-live/`
 
-页面提供开始/结束、麦克风静音、主动打断、实时状态、上下行字节、RTT、转写和错误提示。浏览器断线时采用有界退避重连；恢复时携带 episode 标识，以延续持久化上下文而不是伪造一个新 episode。
+页面提供开始/结束、麦克风静音、主动打断、实时状态、上下行字节、RTT、转写和错误提示。启用音色转换后还显示 `voice_profile` 与最近一个 SVC 块的推理延迟；OBS overlay 同样标记当前音色 profile。浏览器断线时采用有界退避重连；恢复时携带 episode 标识，以延续持久化上下文而不是伪造一个新 episode。
 
 麦克风必须由用户手势授权。部署到非 localhost 时，应使用 HTTPS，否则浏览器可能拒绝 `getUserMedia`。
 
@@ -216,13 +234,24 @@ require_life_engine = true
 record_to_life = true
 cross_scene_awareness = true
 
+[voice_conversion]
+enabled = true
+service_url = "http://<windows-wsl-host>:17861"
+token_env = "SEEDVC_STREAM_TOKEN"
+profile_id = "elysia"
+connect_timeout_seconds = 10.0
+request_timeout_seconds = 10.0
+queue_max_chunks = 64
+
 [observability]
 persist_audio = false
 ```
 
-运行前在启动 Elysium 的同一手工终端设置 `VOICE_LIVE_API_KEY`。不得把真实值写进 TOML、脚本、命令历史示例、前端代码或 Git。
+运行前在启动 Elysium 的同一手工终端设置 `VOICE_LIVE_API_KEY` 和 `SEEDVC_STREAM_TOKEN`。不得把真实值写进 TOML、脚本、命令历史示例、前端代码或 Git。
 
 本地模型启动脚本为 `plugins/voice_live/scripts/start_minicpm_omni.ps1`；它只启动本地 Omni 推理服务，不启动、不终止也不重启 Elysium。
+
+Seed-VC 辅助服务由 `plugins/voice_live/scripts/start_seedvc_stream.ps1` 启动。需要通过环境变量提供 Windows Python、Seed-VC 根目录、checkpoint、preset config、爱莉参考 WAV 和随机 bearer token。脚本动态发现当前 WSL vEthernet 地址，端口已有兼容服务时只复用，不会停止或启动 Elysium。服务入口为 `plugins/voice_live/scripts/seedvc_stream_service.py`。
 
 ## 9. 验收
 
@@ -238,6 +267,6 @@ persist_audio = false
   -q --no-cov
 ```
 
-独立 Provider 音频验证使用 `scripts/e2e_realtime.py`；完整 Elysium 网关验证使用 `scripts/e2e_gateway.py`。验收不能只检查“连接成功”，还必须检查：输出音频时长、RMS、哈希、转写、首音频延迟、工具事件、可信场景 ID、意识最终挂起和事件账本。
+独立 Provider 音频验证使用 `scripts/e2e_realtime.py`；完整 Elysium 网关验证使用 `scripts/e2e_gateway.py`；音色转换使用 `scripts/e2e_voice_conversion.py --pace-realtime`。验收不能只检查“连接成功”，还必须检查：输出音频时长、RMS、哈希、转写、首音频延迟、工具事件、可信场景 ID、意识最终挂起、转换 session 清理和事件账本。
 
 Elysium 必须由用户手工启动。任何自动化验收需要实例重启时必须停止并请求用户确认，不能以“测试需要”为由自动拉起主进程。

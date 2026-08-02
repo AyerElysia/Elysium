@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import asyncio
+import os
+import wave
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from plugins.voice_live.config import VoiceLiveConfig
-from plugins.voice_live.protocol import ProviderState, SessionState, pack_audio_frame, unpack_audio_frame
+from plugins.voice_live.protocol import (
+    ProviderState,
+    SessionState,
+    pack_audio_frame,
+    unpack_audio_frame,
+)
 from plugins.voice_live.providers.base import (
     AudioDelta,
     BaseRealtimeProvider,
@@ -16,6 +24,7 @@ from plugins.voice_live.providers.base import (
 )
 from plugins.voice_live.runtime_store import VoiceEpisodeStore
 from plugins.voice_live.session import CallSession
+from plugins.voice_live.voice_conversion import ConvertedAudio
 
 
 class FakeProvider(BaseRealtimeProvider):
@@ -73,16 +82,77 @@ class FakeBridge:
     def build_system_prompt(self) -> str:
         return "independent voice context"
 
-    async def record_transcript(self, role: str, text: str, *, provider_event_id: str = "") -> None:
+    async def record_transcript(
+        self, role: str, text: str, *, provider_event_id: str = ""
+    ) -> None:
         self.transcripts.append((role, text, provider_event_id))
 
 
 class FakeBroker:
     def schemas(self) -> list[dict[str, Any]]:
-        return [{"type": "function", "name": "action-think", "parameters": {"type": "object"}}]
+        return [
+            {
+                "type": "function",
+                "name": "action-think",
+                "parameters": {"type": "object"},
+            }
+        ]
 
     async def execute(self, name: str, arguments_json: str) -> dict[str, Any]:
         return {"name": name, "arguments": arguments_json}
+
+
+class FakeVoiceConverter:
+    input_sample_rate = 24000
+    output_sample_rate = 24000
+
+    def __init__(self) -> None:
+        self.processed: list[tuple[bytes, int]] = []
+        self.flushes = 0
+        self.resets = 0
+        self.closed = False
+
+    async def connect(self) -> dict[str, Any]:
+        return {"health": {"status": "ok", "profile_id": "elysia"}}
+
+    async def process(self, pcm16: bytes, sample_rate: int) -> ConvertedAudio:
+        self.processed.append((pcm16, sample_rate))
+        return ConvertedAudio(
+            pcm16,
+            24000,
+            {"block_count": 1, "inference_ms": 5.0, "pending_samples": 0},
+        )
+
+    async def flush(self) -> ConvertedAudio:
+        self.flushes += 1
+        return ConvertedAudio(b"", 24000, {})
+
+    async def reset(self) -> None:
+        self.resets += 1
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class BlockingVoiceConverter(FakeVoiceConverter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def process(self, pcm16: bytes, sample_rate: int) -> ConvertedAudio:
+        self.processed.append((pcm16, sample_rate))
+        self.started.set()
+        await self.release.wait()
+        return ConvertedAudio(
+            pcm16,
+            24000,
+            {"block_count": 1, "inference_ms": 5.0, "pending_samples": 0},
+        )
+
+    async def close(self) -> None:
+        self.release.set()
+        await super().close()
 
 
 def make_config(tmp_path: Path) -> VoiceLiveConfig:
@@ -94,7 +164,9 @@ def make_config(tmp_path: Path) -> VoiceLiveConfig:
 
 
 @pytest.mark.asyncio
-async def test_session_runs_audio_interrupt_transcript_tool_and_cleanup(tmp_path: Path) -> None:
+async def test_session_runs_audio_interrupt_transcript_tool_and_cleanup(
+    tmp_path: Path,
+) -> None:
     config = make_config(tmp_path)
     provider = FakeProvider()
     consciousness = FakeConsciousness()
@@ -122,7 +194,10 @@ async def test_session_runs_audio_interrupt_transcript_tool_and_cleanup(tmp_path
     session.set_send_callbacks(send_json, send_bytes)
     assert await session.start()
     assert session.state is SessionState.ACTIVE
-    assert provider.connected and provider.connected["instructions"] == "independent voice context"
+    assert (
+        provider.connected
+        and provider.connected["instructions"] == "independent voice context"
+    )
     assert json_events[-1]["type"] == "ready"
 
     pcm = b"\x00\x00" * 320
@@ -152,7 +227,9 @@ async def test_session_runs_audio_interrupt_transcript_tool_and_cleanup(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_provider_error_is_fatal_and_suspends_consciousness(tmp_path: Path) -> None:
+async def test_provider_error_is_fatal_and_suspends_consciousness(
+    tmp_path: Path,
+) -> None:
     config = make_config(tmp_path)
     provider = FakeProvider()
     consciousness = FakeConsciousness()
@@ -181,3 +258,194 @@ async def test_provider_error_is_fatal_and_suspends_consciousness(tmp_path: Path
     assert consciousness.reasons == ["abnormal_exit"]
     assert any(event.get("fatal") is True for event in events)
     assert store.load_checkpoint()["state"] == "suspended"
+
+
+@pytest.mark.asyncio
+async def test_session_streams_provider_audio_through_voice_converter(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    config.voice_conversion.enabled = True
+    provider = FakeProvider()
+    converter = FakeVoiceConverter()
+    session = CallSession(
+        config,
+        "converted",
+        provider_factory=lambda _: provider,
+        voice_converter_factory=lambda _: converter,
+        store=VoiceEpisodeStore(tmp_path, "voice_live_converted", "converted"),
+        consciousness=FakeConsciousness(),
+        bridge=FakeBridge(),
+        tool_broker=FakeBroker(),
+    )
+    json_events: list[dict[str, Any]] = []
+    binary_events: list[bytes] = []
+
+    async def send_json(value: dict[str, Any]) -> None:
+        json_events.append(value)
+
+    async def send_bytes(value: bytes) -> None:
+        binary_events.append(value)
+
+    session.set_send_callbacks(send_json, send_bytes)
+    assert await session.start()
+    pcm = b"\x01\x00" * 320
+    await provider._emit_audio(AudioDelta(pcm, 24000, response_id="r-converted"))
+    assert session._conversion_queue is not None
+    await asyncio.wait_for(session._conversion_queue.join(), timeout=1)
+
+    assert converter.processed == [(pcm, 24000)]
+    frame = unpack_audio_frame(binary_events[-1])
+    assert frame.sample_rate == 24000 and frame.pcm16 == pcm
+    assert any(
+        event.get("values", {}).get("voice_conversion", {}).get("block_count") == 1
+        for event in json_events
+    )
+
+    await session.handle_message({"type": "interrupt"})
+    await asyncio.wait_for(session._conversion_queue.join(), timeout=1)
+    assert converter.resets >= 1
+    await session.stop(reason="converted_complete")
+    assert converter.closed is True
+
+
+@pytest.mark.asyncio
+async def test_interruption_discards_in_flight_converted_audio(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    config.voice_conversion.enabled = True
+    provider = FakeProvider()
+    converter = BlockingVoiceConverter()
+    session = CallSession(
+        config,
+        "converted_interrupt",
+        provider_factory=lambda _: provider,
+        voice_converter_factory=lambda _: converter,
+        store=VoiceEpisodeStore(
+            tmp_path, "voice_live_converted_interrupt", "converted_interrupt"
+        ),
+        consciousness=FakeConsciousness(),
+        bridge=FakeBridge(),
+        tool_broker=FakeBroker(),
+    )
+    binary_events: list[bytes] = []
+
+    async def send_json(_: dict[str, Any]) -> None:
+        return
+
+    async def send_bytes(value: bytes) -> None:
+        binary_events.append(value)
+
+    session.set_send_callbacks(send_json, send_bytes)
+    assert await session.start()
+    await provider._emit_audio(AudioDelta(b"\x01\x00" * 320, 24000))
+    await asyncio.wait_for(converter.started.wait(), timeout=1)
+    await provider._emit_interruption(InterruptionEvent("provider"))
+    converter.release.set()
+    assert session._conversion_queue is not None
+    await asyncio.wait_for(session._conversion_queue.join(), timeout=1)
+
+    assert binary_events == []
+    assert converter.resets == 1
+    await session.stop(reason="interruption_verified")
+
+
+@pytest.mark.asyncio
+async def test_conversion_backpressure_fails_closed(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    config.voice_conversion.enabled = True
+    config.voice_conversion.queue_max_chunks = 4
+    provider = FakeProvider()
+    converter = BlockingVoiceConverter()
+    session = CallSession(
+        config,
+        "converted_backpressure",
+        provider_factory=lambda _: provider,
+        voice_converter_factory=lambda _: converter,
+        store=VoiceEpisodeStore(
+            tmp_path, "voice_live_converted_backpressure", "converted_backpressure"
+        ),
+        consciousness=FakeConsciousness(),
+        bridge=FakeBridge(),
+        tool_broker=FakeBroker(),
+    )
+    json_events: list[dict[str, Any]] = []
+
+    async def send_json(value: dict[str, Any]) -> None:
+        json_events.append(value)
+
+    async def send_bytes(_: bytes) -> None:
+        return
+
+    session.set_send_callbacks(send_json, send_bytes)
+    assert await session.start()
+    chunk = AudioDelta(b"\x01\x00" * 320, 24000)
+    await provider._emit_audio(chunk)
+    await asyncio.wait_for(converter.started.wait(), timeout=1)
+    for _ in range(4):
+        await provider._emit_audio(chunk)
+    await provider._emit_audio(chunk)
+
+    assert session.state is SessionState.FAILED
+    assert converter.closed is True
+    assert any(event.get("fatal") is True for event in json_events)
+
+
+@pytest.mark.asyncio
+async def test_session_real_seedvc_stream_when_e2e_environment_is_present(
+    tmp_path: Path,
+) -> None:
+    service_url = os.environ.get("VOICE_CONVERSION_E2E_URL", "")
+    source_path = os.environ.get("VOICE_CONVERSION_E2E_WAV", "")
+    if not service_url or not source_path:
+        pytest.skip("Seed-VC E2E environment is not configured")
+
+    with wave.open(source_path, "rb") as source:
+        assert source.getnchannels() == 1 and source.getsampwidth() == 2
+        sample_rate = source.getframerate()
+        source_pcm = source.readframes(source.getnframes())
+
+    config = make_config(tmp_path)
+    config.voice_conversion.enabled = True
+    config.voice_conversion.service_url = service_url
+    config.voice_conversion.token_env = "SEEDVC_STREAM_TOKEN"
+    config.audio.output_sample_rate = 24000
+    provider = FakeProvider()
+    session = CallSession(
+        config,
+        "real_seedvc",
+        provider_factory=lambda _: provider,
+        store=VoiceEpisodeStore(tmp_path, "voice_live_seedvc", "real_seedvc"),
+        consciousness=FakeConsciousness(),
+        bridge=FakeBridge(),
+        tool_broker=FakeBroker(),
+    )
+    binary_events: list[bytes] = []
+
+    async def send_json(_: dict[str, Any]) -> None:
+        return
+
+    async def send_bytes(value: bytes) -> None:
+        binary_events.append(value)
+
+    session.set_send_callbacks(send_json, send_bytes)
+    assert await session.start()
+    assert session._conversion_queue is not None
+    await asyncio.wait_for(session._conversion_queue.join(), timeout=5)
+    await provider._emit_state(ProviderState.SPEAKING)
+    frame_bytes = sample_rate // 10 * 2
+    for offset in range(0, len(source_pcm), frame_bytes):
+        await provider._emit_audio(
+            AudioDelta(
+                source_pcm[offset : offset + frame_bytes],
+                sample_rate,
+                response_id="qwen-real-seedvc",
+            )
+        )
+    await provider._emit_state(ProviderState.LISTENING)
+    await asyncio.wait_for(session._conversion_queue.join(), timeout=30)
+
+    converted_pcm = b"".join(unpack_audio_frame(frame).pcm16 for frame in binary_events)
+    assert len(converted_pcm) >= 24000 * 2 * 3
+    assert converted_pcm != source_pcm
+    assert session.snapshot()["voice_conversion_blocks"] >= 10
+    await session.stop(reason="real_seedvc_complete")
