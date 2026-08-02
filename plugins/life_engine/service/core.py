@@ -607,10 +607,7 @@ class LifeEngineService(BaseService):
         """Mirror legacy service events into the unified raw event log."""
         if not events:
             return
-        try:
-            await self._get_event_bus().publish_legacy_events(events)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"life_engine raw event 写入失败（已跳过）: {exc}", exc_info=True)
+        await self._get_event_bus().publish_legacy_events(events)
 
     async def _queue_pending_event(
         self,
@@ -787,7 +784,10 @@ class LifeEngineService(BaseService):
 
     def health(self) -> dict[str, Any]:
         """返回一个轻量健康信息。"""
-        return self.snapshot()
+        snapshot = self.snapshot()
+        if self._event_bus is not None:
+            snapshot["raw_event_ledger"] = self._event_bus.store.health_snapshot()
+        return snapshot
 
     async def get_state_digest_for_dfc(self) -> str:
         """生成给 DFC 的状态摘要。"""
