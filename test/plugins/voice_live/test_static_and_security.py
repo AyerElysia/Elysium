@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -58,3 +59,19 @@ def test_voice_live_tree_contains_no_inline_api_key() -> None:
         text = path.read_text(encoding="utf-8", errors="ignore")
         assert "sk-" not in text
         assert "api_key=\"" not in text
+
+
+def test_manifest_makes_voice_live_discoverable_with_life_engine_dependency() -> None:
+    manifest = json.loads(
+        (ROOT / "plugins/voice_live/manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["name"] == "Voice-Live"
+    assert manifest["dependencies"]["plugins"] == ["life_engine"]
+    components = {
+        (item["component_type"], item["component_name"])
+        for item in manifest["include"]
+    }
+    assert components == {
+        ("router", "voice_live"),
+        ("event_handler", "voice_live_handler"),
+    }

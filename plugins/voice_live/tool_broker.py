@@ -7,16 +7,23 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from plugins.life_engine.service.tool_manifests import get_tool_manifest
 from src.core.components.registry import get_global_registry
 from src.core.components.types import ComponentType
 from src.core.models.message import Message, MessageType
+
+from .life_binding import get_tool_manifest
 
 
 @dataclass(slots=True, frozen=True)
 class _ToolBinding:
     signature: str
     component_type: ComponentType
+    context_parameters: frozenset[str]
+
+
+_RUNTIME_CONTEXT_PARAMETERS = frozenset(
+    {"scene_id", "consciousness_instance_id", "episode_id"}
+)
 
 
 class VoiceToolBroker:
@@ -42,14 +49,24 @@ class VoiceToolBroker:
                 name = str(function.get("name") or "")
                 if name not in allowed:
                     continue
+                parameters = dict(
+                    function.get("parameters")
+                    or {"type": "object", "properties": {}}
+                )
                 schema = {
                     "type": "function",
                     "name": name,
                     "description": str(function.get("description") or ""),
-                    "parameters": dict(function.get("parameters") or {"type": "object", "properties": {}}),
+                    "parameters": parameters,
                 }
                 schemas.append(schema)
-                self._bindings[name] = _ToolBinding(signature, component_type)
+                properties = parameters.get("properties")
+                property_names = set(properties) if isinstance(properties, dict) else set()
+                self._bindings[name] = _ToolBinding(
+                    signature,
+                    component_type,
+                    frozenset(property_names) & _RUNTIME_CONTEXT_PARAMETERS,
+                )
         return schemas
 
     async def execute(self, name: str, arguments_json: str) -> dict[str, Any]:
@@ -59,6 +76,13 @@ class VoiceToolBroker:
         arguments = json.loads(arguments_json or "{}")
         if not isinstance(arguments, dict):
             raise ValueError("tool arguments must be a JSON object")
+        runtime_context = {
+            "scene_id": self._consciousness.stream_id,
+            "consciousness_instance_id": self._consciousness.instance_id,
+            "episode_id": self._store.episode_id,
+        }
+        for parameter in binding.context_parameters:
+            arguments[parameter] = runtime_context[parameter]
         from src.core.managers import get_plugin_manager
 
         plugin_name = binding.signature.split(":", 1)[0]

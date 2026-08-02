@@ -1,0 +1,39 @@
+{
+  "name": "Voice-Live",
+  "version": "2.0.0",
+  "description": "独立意识、可恢复、可打断的商业级全双工实时语音通话",
+  "author": "Elysium",
+  "license": "GPL-3.0",
+  "dependencies": {
+    "plugins": [
+      "life_engine"
+    ],
+    "components": []
+  },
+  "include": [
+    {
+      "component_type": "router",
+      "component_name": "voice_live",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "event_handler",
+      "component_name": "voice_live_handler",
+      "dependencies": [],
+      "enabled": true
+    }
+  ],
+  "entry_point": "plugin.py",
+  "min_core_version": "1.0.0",
+  "python_dependencies": [
+    "aiohttp",
+    "fastapi",
+    "pydantic"
+  ],
+  "dependencies_required": true,
+  "config": {
+    "path": "config/plugins/Voice-Live/config.toml",
+    "reloadable": false
+  }
+}

@@ -26,6 +26,8 @@ from ..tools.skill_tools import SKILL_TOOLS
 from ..tools.event_grep_tools import EVENT_GREP_TOOLS
 from ..learning.tools import LEARNING_TOOLS
 from .compat_tools import (
+    LifeInnerQueryTool,
+    LifeReportStateAction,
     LifeThinkAction,
     LifeRecordInnerMonologueAction,
     LifeInnerDialogueTool,
@@ -84,6 +86,8 @@ class LifeEnginePlugin(BasePlugin):
             LifeEngineCommandHandler,
             MemoryRouter,
             MessageTimelineRouter,
+            LifeReportStateAction,
+            LifeInnerQueryTool,
             *ALL_TOOLS,
             *TODO_TOOLS,
             *MEMORY_TOOLS,

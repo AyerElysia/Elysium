@@ -21,9 +21,10 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from plugins.voice_live.protocol import ProviderState
-from plugins.voice_live.providers.base import AudioDelta, TranscriptEvent
-from plugins.voice_live.providers.qwen_realtime import QwenRealtimeProvider
+from plugins.voice_live.protocol import ProviderState  # noqa: E402
+from plugins.voice_live.providers.base import AudioDelta, TranscriptEvent  # noqa: E402
+from plugins.voice_live.providers.minicpm_omni import MiniCPMOmniProvider  # noqa: E402
+from plugins.voice_live.providers.qwen_realtime import QwenRealtimeProvider  # noqa: E402
 
 
 def _read_pcm16_mono_16k(path: Path) -> bytes:
@@ -55,23 +56,37 @@ def _pcm16_rms(pcm: bytes) -> int:
 
 
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
-    api_key = os.environ.get(args.api_key_env, "")
-    if not api_key:
-        raise RuntimeError(f"environment variable {args.api_key_env} is empty")
-    provider = QwenRealtimeProvider(
-        args.url,
-        api_key,
-        model=args.model,
-        voice=args.voice,
-        connect_timeout=args.connect_timeout,
-        event_timeout=args.event_timeout,
-    )
+    if args.provider == "qwen_realtime":
+        api_key = os.environ.get(args.api_key_env, "")
+        if not api_key:
+            raise RuntimeError(f"environment variable {args.api_key_env} is empty")
+        provider = QwenRealtimeProvider(
+            args.url,
+            api_key,
+            model=args.model,
+            voice=args.voice,
+            connect_timeout=args.connect_timeout,
+            event_timeout=args.event_timeout,
+        )
+    else:
+        if args.text:
+            raise RuntimeError("MiniCPM-o acceptance requires --input audio")
+        provider = MiniCPMOmniProvider(
+            args.url,
+            mode=args.mode,
+            reference_audio_path=args.reference_audio,
+            tts_reference_audio_path=args.tts_reference_audio,
+            input_chunk_ms=args.upstream_chunk_ms,
+            connect_timeout=args.connect_timeout,
+            event_timeout=args.event_timeout,
+        )
     output = bytearray()
     transcripts: list[dict[str, Any]] = []
     states: list[str] = []
     errors: list[str] = []
     response_finished = asyncio.Event()
     first_audio_at = 0.0
+    input_complete_at = 0.0
     started_at = time.monotonic()
     saw_speaking = False
 
@@ -116,23 +131,31 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         )
         if args.text:
             await provider.send_text(args.text)
+            input_complete_at = time.monotonic()
         else:
             source = _read_pcm16_mono_16k(args.input)
+            if args.provider == "minicpm_omni" and args.mode == "turn_based":
+                await provider.send_turn_audio(source)
+                input_complete_at = time.monotonic()
+                await asyncio.wait_for(response_finished.wait(), timeout=args.response_timeout)
+                source = b""
             frame_bytes = 16000 * 2 * args.frame_ms // 1000
             silence = b"\x00" * frame_bytes
-            for _ in range(1000 // args.frame_ms):
-                await provider.send_audio(silence)
-                await asyncio.sleep(args.frame_ms / 1000)
-            for offset in range(0, len(source), frame_bytes):
-                frame = source[offset : offset + frame_bytes]
-                if len(frame) < frame_bytes:
-                    frame += b"\x00" * (frame_bytes - len(frame))
-                await provider.send_audio(frame)
-                await asyncio.sleep(args.frame_ms / 1000)
-            for _ in range(args.trailing_silence_ms // args.frame_ms):
-                await provider.send_audio(silence)
-                await asyncio.sleep(args.frame_ms / 1000)
-        await asyncio.wait_for(response_finished.wait(), timeout=args.response_timeout)
+            if source:
+                for _ in range(1000 // args.frame_ms):
+                    await provider.send_audio(silence)
+                    await asyncio.sleep(args.frame_ms / 1000)
+                for offset in range(0, len(source), frame_bytes):
+                    frame = source[offset : offset + frame_bytes]
+                    if len(frame) < frame_bytes:
+                        frame += b"\x00" * (frame_bytes - len(frame))
+                    await provider.send_audio(frame)
+                    await asyncio.sleep(args.frame_ms / 1000)
+                for _ in range(args.trailing_silence_ms // args.frame_ms):
+                    await provider.send_audio(silence)
+                    await asyncio.sleep(args.frame_ms / 1000)
+                input_complete_at = time.monotonic()
+                await asyncio.wait_for(response_finished.wait(), timeout=args.response_timeout)
     finally:
         await provider.disconnect()
 
@@ -157,6 +180,11 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         "first_audio_latency_ms": (
             round((first_audio_at - started_at) * 1000, 1) if first_audio_at else None
         ),
+        "first_audio_after_input_ms": (
+            round((first_audio_at - input_complete_at) * 1000, 1)
+            if first_audio_at and input_complete_at
+            else None
+        ),
     }
     if result["output_rms"] <= 0 or result["output_seconds"] <= 0.1:
         raise RuntimeError(f"provider returned invalid audio: {result}")
@@ -165,6 +193,11 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--provider",
+        choices=("qwen_realtime", "minicpm_omni"),
+        default="qwen_realtime",
+    )
     parser.add_argument("--url", required=True)
     parser.add_argument("--model", default="qwen3.5-omni-plus-realtime")
     parser.add_argument("--voice", default="Tina")
@@ -174,6 +207,10 @@ def main() -> None:
     parser.add_argument("--text", default="")
     parser.add_argument("--instructions", default="请自然、简洁地用中文回答。")
     parser.add_argument("--frame-ms", type=int, default=20)
+    parser.add_argument("--mode", choices=("full_duplex", "turn_based"), default="full_duplex")
+    parser.add_argument("--reference-audio", default="")
+    parser.add_argument("--tts-reference-audio", default="")
+    parser.add_argument("--upstream-chunk-ms", type=int, default=1000)
     parser.add_argument("--trailing-silence-ms", type=int, default=1800)
     parser.add_argument("--connect-timeout", type=float, default=20.0)
     parser.add_argument("--event-timeout", type=float, default=30.0)

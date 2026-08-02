@@ -8,10 +8,8 @@ from __future__ import annotations
 from typing import Annotated, Any
 
 from src.app.plugin_system.api.log_api import get_logger
-from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
 from src.app.plugin_system.base import BaseAction, BaseTool
 from src.core.managers import get_plugin_manager
-from src.kernel.llm import LLMPayload, ROLE, Text, ToolRegistry, ToolResult
 
 
 logger = get_logger("life_engine.compat_tools")
@@ -279,6 +277,10 @@ class LifeReportStateAction(BaseAction):
         ] = "scene",
         entity_id: Annotated[str, "关联的实体 ID（如人物），可留空。"] = "",
         thread_id: Annotated[str, "关联的话题 ID（如要闭合某个话题），可留空。"] = "",
+        scene_id: Annotated[
+            str,
+            "当前场景 ID。通常留空，由可信运行时上下文自动注入。",
+        ] = "",
     ) -> tuple[bool, str]:
         report_text = str(report or "").strip()
         if not report_text:
@@ -293,7 +295,7 @@ class LifeReportStateAction(BaseAction):
             return False, "life_engine 服务不可用"
 
         try:
-            from plugins.life_engine.service.world_state import OpenThread
+            from ..service.world_state import OpenThread
             from datetime import datetime, timezone
             now = datetime.now(timezone.utc).isoformat()
             ws = service.world_state
@@ -313,6 +315,17 @@ class LifeReportStateAction(BaseAction):
             elif kind == "mood":
                 ws.embodied_state.mood = report_text
                 ws.embodied_state.updated_at = now
+            elif kind == "scene":
+                resolved_scene_id = str(
+                    scene_id
+                    or getattr(getattr(self, "chat_stream", None), "stream_id", "")
+                    or ""
+                ).strip()
+                scene = ws.active_scenes.get(resolved_scene_id)
+                if scene is None:
+                    return False, f"当前场景未注册: {resolved_scene_id or 'unknown'}"
+                scene.status_summary = report_text
+                scene.last_active_at = now
 
             # 无论哪种类型，都记录为一个未闭合话题（如果是开启）或纯记录
             if kind == "thread" and not thread_id:

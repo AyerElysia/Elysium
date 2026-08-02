@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from collections.abc import Callable
@@ -151,9 +152,26 @@ class CallSession:
             self._register_provider_callbacks(provider)
             await self._consciousness.activate(provider.provider_name)
             schemas = self._tool_broker.schemas()
+            instructions = self._bridge.build_system_prompt()
+            await self._store.append_async(
+                "provider.configuration",
+                {
+                    "provider": provider.provider_name,
+                    "instruction_chars": len(instructions),
+                    "instruction_bytes": len(instructions.encode("utf-8")),
+                    "tool_count": len(schemas),
+                    "tool_schema_bytes": len(
+                        json.dumps(
+                            schemas,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ),
+                },
+            )
             await provider.connect(
                 {
-                    "instructions": self._bridge.build_system_prompt(),
+                    "instructions": instructions,
                     "model": self._config.full_duplex.model_name,
                     "voice": self._config.full_duplex.voice,
                     "tools": schemas,
@@ -163,7 +181,8 @@ class CallSession:
                 }
             )
         except Exception as exc:
-            logger.error(f"实时语音会话启动失败: {exc}", exc_info=True)
+            failure = str(exc).strip() or type(exc).__name__
+            logger.error(f"实时语音会话启动失败: {failure}", exc_info=True)
             provider = self._provider
             self._provider = None
             if provider is not None:
@@ -173,7 +192,7 @@ class CallSession:
                     pass
             if self._consciousness.is_active:
                 await self._consciousness.suspend(reason="startup_failed")
-            await self._fail(f"启动失败: {exc}")
+            await self._fail(f"启动失败: {failure}")
             return False
 
         self._state = SessionState.ACTIVE

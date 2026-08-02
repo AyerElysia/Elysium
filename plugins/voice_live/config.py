@@ -63,7 +63,7 @@ class VoiceLiveConfig(BaseConfig):
         )
         model_name: str = Field(default="MiniCPM-o-4_5", description="实时模型标识")
         voice: str = Field(default="", description="云端 voice 标识；空值使用供应商默认语音")
-        mode: Literal["full_duplex", "turn_based"] = Field(
+        mode: Literal["full_duplex"] = Field(
             default="full_duplex",
             description="MiniCPM-o 运行模式",
         )

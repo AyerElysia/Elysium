@@ -63,9 +63,9 @@ class ContextBridge:
         await self._store.append_async("transcript.final", payload)
         if not self._config.session.record_to_life:
             return
-        from plugins.life_engine.service.registry import get_life_engine_service
+        from .life_binding import get_running_life_service
 
-        service = get_life_engine_service()
+        service = get_running_life_service()
         if service is None:
             if self._config.session.require_life_engine:
                 raise RuntimeError("最终转写无法写入 LifeEngine")

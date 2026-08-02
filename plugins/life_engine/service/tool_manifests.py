@@ -56,8 +56,6 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
     ],
     # 语音通话意识：实时语音交互，跨场景感知
     "voice_live": [
-        "action-life_send_text",   # 通话中也可发文字
-        "action-think",
         "action-report_state",     # 报告通话状态到 WorldState
         "tool-inner_query",        # 向潜意识查询
         "tool-fetch_chat_history", # 查阅历史

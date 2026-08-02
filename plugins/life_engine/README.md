@@ -83,7 +83,7 @@ Life Engine 维护一个主体下的多个场景意识：
 | `chat_global` | 私聊、群聊与日常表达 | 核心稳定路径 |
 | `memory_witness` | 第一人称见证和经历编码 | 核心稳定路径 |
 | `minecraft` | 视觉输入、Windows 桥接与键鼠具身 | 环境依赖型能力 |
-| `voice_live` | 全双工实时语音 | 实验性集成 |
+| `voice_live` | 独立意识、可打断、可恢复的全双工实时语音 | 生产候选；真实云端与本地链路已验收 |
 | `livestream` | 弹幕、TTS、Live2D/OBS 直播场景 | 实验性集成 |
 
 每个意识实例拥有独立滚动上下文和工具清单。实例之间不直接读取彼此上下文；跨场景信息通过 `WorldState`、Life Event、潜意识协调和主动状态报告流动。
@@ -258,7 +258,7 @@ client/    API 调用与响应关联
 
 ### Voice Live
 
-`plugins/voice_live/` 提供实时语音框架，支持实时 Provider 和本地降级链。其生产可用性取决于模型服务、音频设备和网络配置。
+`plugins/voice_live/` 为每次通话创建真实 `ConsciousnessInstance`，通过显式 Provider 连接 Qwen Realtime、OpenAI Realtime 或本地 MiniCPM-o。它不做静默模型降级；浏览器使用一次性 ticket，模型工具的场景身份由可信运行时覆盖注入，最终转写和工具事件进入追加式 episode。OBS 通过只读观察 WebSocket 使用透明叠加层。完整架构、配置和验收边界见 [`docs/architecture/voice_live.md`](../../docs/architecture/voice_live.md)。
 
 ### Livestream
 
@@ -317,7 +317,7 @@ journalctl -u elysium -f
 - 新 DI/Registry 与旧 Manager 的统一；
 - legacy 配置、索引与工具兼容层的退出条件；
 - 经历显著性编码从固定技术筛选走向可追溯、可重新解释的主体性机制；
-- Mission、Voice Live、Livestream、Minecraft 的契约和端到端验收；
+- Mission、Livestream、Minecraft 的契约和端到端验收，以及 Voice Live 的 WebRTC 与长期并发压测；
 - 自动 CI 与本地/GPU/平台测试分层。
 
 判断新改动是否属于 Life Engine 时，优先问：

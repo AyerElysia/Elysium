@@ -71,7 +71,12 @@ class MiniCPMOmniProvider(BaseRealtimeProvider):
         self._http = aiohttp.ClientSession()
         try:
             self._ws = await asyncio.wait_for(
-                self._http.ws_connect(self._url, heartbeat=20),
+                # Omni initialization and decode are intentionally heavyweight.
+                # aiohttp's heartbeat closes the socket if the native server is
+                # busy for half the heartbeat interval, even though the model is
+                # still making progress.  Business-event and session deadlines
+                # provide the liveness boundary for this provider instead.
+                self._http.ws_connect(self._url, heartbeat=None),
                 timeout=self._connect_timeout,
             )
             self._ready = asyncio.get_running_loop().create_future()
@@ -115,11 +120,44 @@ class MiniCPMOmniProvider(BaseRealtimeProvider):
     async def send_audio(self, pcm16: bytes) -> None:
         if not self._ws or self._ws.closed:
             raise RuntimeError("MiniCPM-o provider is not connected")
+        if self._mode != "full_duplex":
+            raise RuntimeError("turn-based MiniCPM-o audio must use send_turn_audio()")
         self._input.extend(pcm16)
         while len(self._input) >= self._chunk_bytes:
             chunk = bytes(self._input[: self._chunk_bytes])
             del self._input[: self._chunk_bytes]
             await self._send_audio_chunk(chunk)
+
+    async def send_turn_audio(self, pcm16: bytes) -> None:
+        """Submit one complete audio turn for deterministic native acceptance."""
+
+        if not self._ws or self._ws.closed:
+            raise RuntimeError("MiniCPM-o provider is not connected")
+        if self._mode != "turn_based":
+            raise RuntimeError("send_turn_audio() requires turn_based mode")
+        provider_config = dict(self._session_config.get("provider_config") or {})
+        generation = dict(provider_config.get("generation") or {})
+        await self._send(
+            {
+                "type": "input.append",
+                "input": {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "audio",
+                                    "data": pcm16_to_float32_b64(pcm16),
+                                }
+                            ],
+                        }
+                    ],
+                    "streaming": True,
+                    "use_tts_template": True,
+                    "generation": generation,
+                },
+            }
+        )
 
     async def _send_audio_chunk(self, chunk: bytes, *, force_listen: bool = False) -> None:
         await self._send(
@@ -207,11 +245,17 @@ class MiniCPMOmniProvider(BaseRealtimeProvider):
             return
         if event_type == "session.closed":
             reason = str(event.get("reason") or "server_closed")
+            if self._ready is not None and not self._ready.done():
+                self._ready.set_exception(
+                    RuntimeError(f"MiniCPM-o session closed during initialization: {reason}")
+                )
             if not self._closed:
                 await self._emit_error(f"MiniCPM-o session closed: {reason}")
             await self._emit_state(ProviderState.CLOSED)
             return
         if event_type == "error":
             message = str(event.get("message") or event.get("error") or "MiniCPM-o error")
+            if self._ready is not None and not self._ready.done():
+                self._ready.set_exception(RuntimeError(message))
             await self._emit_error(message)
             await self._emit_state(ProviderState.ERROR)

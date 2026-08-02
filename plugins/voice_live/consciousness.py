@@ -6,10 +6,13 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
-from plugins.life_engine.service.consciousness import ConsciousnessInstance
-from plugins.life_engine.service.tool_manifests import get_tool_manifest
-from plugins.life_engine.service.world_state import PerceptionFilter, SceneState
-
+from .life_binding import (
+    ConsciousnessInstance,
+    PerceptionFilter,
+    SceneState,
+    get_running_life_service,
+    get_tool_manifest,
+)
 from .runtime_store import VoiceEpisodeStore
 
 
@@ -53,9 +56,7 @@ class VoiceLiveConsciousnessManager:
     def _life_service(self) -> Any | None:
         if self._service is not None:
             return self._service
-        from plugins.life_engine.service.registry import get_life_engine_service
-
-        return get_life_engine_service()
+        return get_running_life_service()
 
     async def activate(self, provider_name: str) -> ConsciousnessInstance:
         service = self._life_service()

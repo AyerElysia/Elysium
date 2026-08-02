@@ -47,7 +47,7 @@
 | `chat_global` | 私聊、群聊与日常表达 | 表达、内在查询、历史、深层记忆、平台操作 | 核心稳定路径 |
 | `memory_witness` | 读取源事件、编码经历、留下第一人称见证 | 空工具清单；不直接行动 | 核心稳定路径 |
 | `minecraft` | 纯视觉输入到键鼠输出的具身交互 | Minecraft 控制、表达、思考、状态报告 | 环境依赖型能力 |
-| `voice_live` | 全双工实时语音和通话状态 | 表达、思考、状态报告、内在查询、历史 | 实验性集成 |
+| `voice_live` | 全双工实时语音和通话状态 | 状态报告、内在查询、历史 | 生产候选；云端、本地、工具与 OBS 链路已实机验收 |
 | `livestream` | 弹幕、主动闲聊、TTS、Live2D/OBS | 表达、思考、状态报告、内在查询、历史 | 实验性集成，需端到端验收 |
 
 默认 `chat_global` 不可终止；未绑定实例的普通聊天流会归入该实例。未知 kind 当前仍回退 chat 工具清单，这是兼容行为，不应被新实例依赖；新增意识类型应显式声明 manifest。
@@ -89,8 +89,6 @@ action-report_state
 ### voice_live
 
 ```text
-action-life_send_text
-action-think
 action-report_state
 tool-inner_query
 tool-fetch_chat_history
@@ -164,7 +162,7 @@ tool-fetch_chat_history
 6. 验证重连、重启、异常退出和重复注册；
 7. 证明不会直接读取或污染其他实例上下文。
 
-因此 Voice Live 和 Livestream 当前标为实验性集成：框架和目录已经存在，但仍需真实环境下验证完整注册、恢复、关闭与跨意识状态链。
+Voice Live 已完成独立实例注册、追加式 episode、显式 Provider、可信运行时工具上下文、浏览器麦克风、OBS 观察者、云端与本地模型的真实链路验收，当前为生产候选。它仍需遵守 Elysium 手工启动策略；涉及主进程重启的复验必须先由用户确认。Livestream 仍是实验性集成，需真实平台下完成关闭、恢复和跨意识状态链验收。
 
 ---
 
