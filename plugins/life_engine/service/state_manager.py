@@ -15,15 +15,15 @@ from uuid import uuid4
 
 from src.app.plugin_system.api.log_api import get_logger
 
+from ..storage_utils import atomic_write_text
 from .event_builder import (
+    RUNTIME_CONTEXT_FILE,
     EventType,
     LifeEngineEvent,
     LifeEngineState,
-    _now_iso,
     _format_time_display,
-    RUNTIME_CONTEXT_FILE,
+    _now_iso,
 )
-
 
 logger = get_logger("life_engine", display="life_engine")
 
@@ -607,12 +607,20 @@ class StatePersistence:
         self._workspace_path = workspace_path
         self._history_limit_func = history_limit_func
         self._lock = lock
+        self._write_lock: asyncio.Lock | None = None
 
     def _get_lock(self) -> asyncio.Lock:
         """获取锁（懒加载或使用传入的锁）。"""
         if self._lock is None:
             self._lock = asyncio.Lock()
         return self._lock
+
+    def _get_write_lock(self) -> asyncio.Lock:
+        """Return the lock that serializes file replacement order."""
+
+        if self._write_lock is None:
+            self._write_lock = asyncio.Lock()
+        return self._write_lock
 
     def _runtime_context_path(self) -> Path:
         """返回运行时上下文持久化文件路径。"""
@@ -669,15 +677,11 @@ class StatePersistence:
             }
 
         path = self._runtime_context_path()
-        temp_path = path.with_suffix(path.suffix + ".tmp")
+        serialized = json.dumps(payload, ensure_ascii=False, indent=2)
         try:
-            await asyncio.to_thread(
-                temp_path.write_text,
-                json.dumps(payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            await asyncio.to_thread(temp_path.replace, path)
-        except Exception as exc:  # noqa: BLE001
+            async with self._get_write_lock():
+                await asyncio.to_thread(atomic_write_text, path, serialized)
+        except Exception as exc:
             logger.error(f"life_engine 持久化上下文失败: {exc}")
             raise PersistenceError(f"Failed to persist runtime context: {exc}") from exc
 
