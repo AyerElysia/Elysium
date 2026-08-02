@@ -527,6 +527,17 @@ class ModelConfig(ConfigBase):
             request = LLMRequest(model_set=model_set, request_name="chat")
             ```
         """
+        # ─── 优先走新格式 models.toml ───
+        try:
+            from src.kernel.config.models_loader import get_models_config
+
+            mc = get_models_config()
+            if mc.tasks:
+                return mc.get_task(task_name)  # type: ignore[return-value]
+        except Exception:
+            pass
+
+        # ─── 回退：旧格式 model.toml ───
         # 获取任务配置
         task_config = self.model_tasks.get_task(task_name)
 

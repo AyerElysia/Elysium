@@ -73,6 +73,12 @@ if TYPE_CHECKING:
 logger = get_logger("life_chatter", display="生命对话器", color=COLOR.MAGENTA)
 _T = TypeVar("_T")
 
+# ── 全局消息去重缓存 ──────────────────────────────────
+# 防止跨 wake cycle 重复发送相同内容
+_RECENT_SENT_CACHE: dict[str, float] = {}  # {content_hash: timestamp}
+_RECENT_SENT_CACHE_TTL = 60.0  # 秒
+_RECENT_SENT_CACHE_LOCK = threading.Lock()
+
 # ── 控制流常量 ────────────────────────────────────────────────
 _PASS_AND_WAIT = "action-life_pass_and_wait"
 _SEND_TEXT = "action-life_send_text"
@@ -557,6 +563,30 @@ class LifeSendTextAction(BaseAction):
         ]
         if not cleaned_segments:
             return False, "发送内容不能只是省略号或占位符"
+
+        # ── 跨 wake 重复发送检测 ──────────────────────────────
+        combined_text = "\n".join(cleaned_segments)
+        content_hash = hashlib.sha256(combined_text.encode("utf-8")).hexdigest()[:16]
+
+        now = time.time()
+        with _RECENT_SENT_CACHE_LOCK:
+            # 清理过期条目
+            expired = [k for k, ts in _RECENT_SENT_CACHE.items() if now - ts > _RECENT_SENT_CACHE_TTL]
+            for k in expired:
+                _RECENT_SENT_CACHE.pop(k, None)
+
+            # 检测重复
+            if content_hash in _RECENT_SENT_CACHE:
+                last_sent = _RECENT_SENT_CACHE[content_hash]
+                elapsed = now - last_sent
+                if elapsed < _RECENT_SENT_CACHE_TTL:
+                    logger.warning(
+                        f"检测到重复消息（{elapsed:.1f}s前已发送），已拦截: {combined_text[:60]}..."
+                    )
+                    return False, f"该消息内容在 {elapsed:.1f}秒前已发送，已跳过重复发送"
+
+            # 记录此次发送
+            _RECENT_SENT_CACHE[content_hash] = now
 
         resolved_target: SendTarget | None = None
         normalized_target_key = str(target_key or "").strip()

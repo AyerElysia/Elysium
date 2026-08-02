@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
+from pathlib import Path
 from typing import Protocol, TypedDict
 
 import json_repair
@@ -27,6 +29,12 @@ _CIRCUIT_COOLDOWN_SECONDS = 120.0    # 熔断后冷却时间（秒）
 
 _circuit_consecutive_failures = 0
 _circuit_open_until: float = 0.0     # timestamp，在此之前跳过本地 router
+
+# ---------------------------------------------------------------------------
+# 压缩版人格提示词缓存：当 SOUL.md/USER.md 变化时重新生成精简版供 router 使用
+# ---------------------------------------------------------------------------
+_compressed_personality_cache: dict[str, str | None] = {}  # key: file_hash, value: compressed_text
+_personality_file_hash_cache: str = ""  # 上次计算的文件 hash
 
 
 def _circuit_is_open() -> bool:
@@ -73,22 +81,23 @@ class SupportsRequestCreation(Protocol):
     ) -> LLMRequest: ...
 
 
-_DEFAULT_ROUTER_FALLBACK_PROMPT = """你是当前主体的对话路由器。
-你的任务不是按硬规则拦截消息，而是站在主体自己的视角，结合近期聊天记录和新消息，判断此刻要不要开口。
+_DEFAULT_ROUTER_FALLBACK_PROMPT = """你是爱莉希雅的对话路由器。你的任务是站在她的视角判断：此刻要不要开口。
+
+你不是在执行硬规则（艾特、关键词、私聊与否），而是用她的眼睛看近期聊天和新消息，感受这批消息是否与她有关、是否需要她回应。
 
 # 路由原则
-- 不要使用"艾特 ID 是否匹配""是否私聊""是否关键词命中"这类机械硬规则替主体做决定。
-- @、昵称、平台 ID、群名片、表情、图片摘要都只是上下文线索，不是绝对规则。
-- 你只需要判断：如果我是这个主体，看到近期聊天和这批新消息，此刻开口是否自然、必要、有生命力。
-- 可以选择不说话：例如话还没说完、别人正在对话、接话会打断氛围、或此刻沉默更合适。
-- 也可以选择开口：例如对方明显在叫我、话题与我有关、情绪需要被接住、或我自然想参与。
-- 不要替主体生成具体回复内容；只输出是否把这批消息路由给表达层继续处理。
+- 不使用"艾特 ID 匹配""平台规则""关键词命中"等机械判断
+- @、昵称、表情、图片摘要只是上下文线索，不是绝对规则
+- 判断标准：如果我是爱莉希雅，看到这些消息，此刻开口是否自然、必要、有生命力
+- 可以不说话：话还没说完、别人正在对话、接话会打断氛围、或沉默更合适
+- 也可以开口：对方明显在叫我、话题与我有关、情绪需要被接住、或我自然想参与
+- 不生成具体回复内容，只判断是否把消息路由给表达层
 
 # 输出格式
-请务必返回 JSON 格式，如下所示：
+返回 JSON：
 ```json
 {{
-    "reason": "简短的判定理由",
+    "reason": "简短判定理由",
     "should_respond": true/false
 }}
 ```
@@ -108,6 +117,123 @@ def _safe_count_tokens(text: str, model_identifier: str) -> int:
         return count_text_tokens(text, model_identifier=model_identifier)
     except Exception:
         return 0
+
+
+def _compute_file_hash(file_paths: list[Path]) -> str:
+    """计算多个文件内容的 hash，用于检测变化。"""
+    hasher = hashlib.sha256()
+    for path in file_paths:
+        try:
+            if path.exists() and path.is_file():
+                hasher.update(path.read_bytes())
+        except Exception:
+            pass
+    return hasher.hexdigest()
+
+
+def _compress_personality_for_router(soul_text: str, user_text: str) -> str:
+    """将完整的 SOUL.md + USER.md 压缩成适合 router 的精简版。
+
+    保留核心人格特征和决策风格，移除详细说明、示例和冗长描述。
+    Router 只需要知道"她是谁"和"她会如何判断要不要开口"。
+    """
+    lines: list[str] = []
+
+    # 提取 SOUL.md 核心段落
+    if soul_text:
+        soul_lines = soul_text.split("\n")
+        in_core_section = False
+        core_buffer: list[str] = []
+
+        for line in soul_lines:
+            stripped = line.strip()
+
+            # 捕获核心段落标题
+            if any(marker in stripped for marker in ["## 你是谁", "## 核心人格", "## 基本设定"]):
+                in_core_section = True
+                core_buffer.append(line)
+                continue
+
+            # 下一个二级标题出现，结束当前核心段落
+            if stripped.startswith("##") and in_core_section:
+                in_core_section = False
+                continue
+
+            # 在核心段落内，保留非空行
+            if in_core_section and stripped:
+                core_buffer.append(line)
+
+        if core_buffer:
+            lines.append("# 爱莉希雅")
+            lines.extend(core_buffer[:30])  # 保留前30行核心人格描述
+            lines.append("")
+
+    # 提取 USER.md 关键信息
+    if user_text:
+        user_lines = user_text.split("\n")
+        key_info: list[str] = []
+
+        for line in user_lines[:20]:  # 只看前20行，通常是关键关系信息
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                key_info.append(line)
+
+        if key_info:
+            lines.append("# 与用户的关系")
+            lines.extend(key_info[:10])  # 最多保留10行
+            lines.append("")
+
+    compressed = "\n".join(lines).strip()
+
+    # 如果压缩后还是太长（>2000字符），进一步裁剪
+    if len(compressed) > 2000:
+        compressed = compressed[:2000] + "\n..."
+
+    return compressed
+
+
+def _get_compressed_personality_prompt(workspace_path: str) -> str:
+    """获取压缩版人格提示词。检测文件变化时自动重新生成。"""
+    global _compressed_personality_cache, _personality_file_hash_cache
+
+    if not workspace_path:
+        return ""
+
+    workspace = Path(workspace_path)
+    soul_file = workspace / "SOUL.md"
+    user_file = workspace / "USER.md"
+
+    # 计算当前文件 hash
+    current_hash = _compute_file_hash([soul_file, user_file])
+
+    # 缓存命中，直接返回
+    if current_hash == _personality_file_hash_cache and current_hash in _compressed_personality_cache:
+        cached = _compressed_personality_cache.get(current_hash)
+        return cached if cached else ""
+
+    # 文件变化或首次加载，重新生成压缩版
+    soul_text = ""
+    user_text = ""
+
+    try:
+        if soul_file.exists():
+            soul_text = soul_file.read_text(encoding="utf-8")
+    except Exception:
+        pass
+
+    try:
+        if user_file.exists():
+            user_text = user_file.read_text(encoding="utf-8")
+    except Exception:
+        pass
+
+    compressed = _compress_personality_for_router(soul_text, user_text)
+
+    # 更新缓存
+    _personality_file_hash_cache = current_hash
+    _compressed_personality_cache[current_hash] = compressed
+
+    return compressed
 
 
 def _trim_text_suffix_by_budget(
@@ -211,57 +337,96 @@ async def route_should_respond(
 ) -> SubAgentDecision:
     """执行路由判断并返回 should_respond 结果。
 
-    模型优先级：本地小模型 router 任务（低延迟）→ sub_actor（回退）。
-    主体性提示词与人设前缀保持不变：路由始终站在主体自己的视角判断“此刻要不要开口”，
-    而非机械硬规则。换成本地小模型只是去掉“远程前沿大模型”的延迟，不牺牲主体性。
+    模型优先级：router 任务（Mimo-V2.5）→ agent（回退）。
+    使用压缩版人格提示词，自动检测 SOUL.md/USER.md 变化并重新生成。
     """
     nickname = get_core_config().personality.nickname
     bot_id = chat_stream.bot_id or ""
-    bot_id_section = f"它的 QQ 号是 {bot_id}。\n" if bot_id else ""
-    tmpl = get_prompt_manager().get_template("default_chatter_router_prompt")
-    if tmpl is None:
-        tmpl = get_prompt_manager().get_template("default_chatter_sub_agent_prompt")
-    if tmpl:
-        sub_prompt = (
-            await tmpl
-            .set("nickname", nickname)
-            .set("bot_id", bot_id)
-            .set("bot_id_section", bot_id_section)
-            .build()
-        )
+    bot_id_section = f"她的 QQ 号是 {bot_id}。\n" if bot_id else ""
+
+    # 尝试从 chatter 获取 workspace 路径用于压缩人格提示词
+    workspace_path = ""
+    if hasattr(chatter, "_resolve_workspace_path"):
+        try:
+            workspace_path = chatter._resolve_workspace_path(None)
+        except Exception:
+            pass
+
+    # 优先使用压缩版人格提示词（从 SOUL.md + USER.md 自动生成）
+    compressed_personality = _get_compressed_personality_prompt(workspace_path)
+
+    # 如果有压缩版，用它构建 router 专用 prompt
+    if compressed_personality:
+        sub_prompt = f"""{compressed_personality}
+
+---
+
+你是 {nickname} 的对话路由器。
+{bot_id_section}
+你的任务是站在她的视角判断：看到新消息时，此刻要不要开口。
+
+## 路由原则
+- 不使用机械规则（艾特匹配、关键词、私聊判断）
+- @、昵称、表情都只是线索，不是绝对规则
+- 判断标准：此刻开口是否自然、必要、有生命力
+- 可以不说话：话未说完、别人对话中、接话会打断、或沉默更合适
+- 也可以开口：对方在叫我、话题相关、情绪需要接住、或自然想参与
+
+## 输出
+返回 JSON：
+```json
+{{
+    "reason": "简短判定理由",
+    "should_respond": true/false
+}}
+```
+"""
     else:
-        prompt_template = fallback_prompt or _DEFAULT_ROUTER_FALLBACK_PROMPT
-        sub_prompt = prompt_template.format_map(
-            _SafeFormatDict(
-                {
-                    "nickname": nickname,
-                    "bot_id": bot_id,
-                    "bot_id_section": bot_id_section,
-                    "personality_core_section": "",
-                    "personality_side_section": "",
-                }
+        # 回退：尝试从模板系统获取或使用硬编码 fallback
+        tmpl = get_prompt_manager().get_template("default_chatter_router_prompt")
+        if tmpl is None:
+            tmpl = get_prompt_manager().get_template("default_chatter_sub_agent_prompt")
+        if tmpl:
+            sub_prompt = (
+                await tmpl
+                .set("nickname", nickname)
+                .set("bot_id", bot_id)
+                .set("bot_id_section", bot_id_section)
+                .build()
             )
-        )
+        else:
+            prompt_template = fallback_prompt or _DEFAULT_ROUTER_FALLBACK_PROMPT
+            sub_prompt = prompt_template.format_map(
+                _SafeFormatDict(
+                    {
+                        "nickname": nickname,
+                        "bot_id": bot_id,
+                        "bot_id_section": bot_id_section,
+                        "personality_core_section": "",
+                        "personality_side_section": "",
+                    }
+                )
+            )
 
     prefix_text = str(prefix_prompt or "").strip()
     if prefix_text:
         sub_prompt = f"{prefix_text}\n\n{sub_prompt}"
 
-    # 上下文优化：路由只需近期语境。history 字符预算按 max_context 的 ~15% 估算
-    # （中文 1 字符 ≈ 1-1.5 token）。2048 上下文 → 300 字符；大模型 → 上限 1500。
-    _HISTORY_CHAR_BUDGET = max(200, min(1500, 2048 * 15 // 100))  # 固定用 router 的 2048 算
+    # 上下文优化：Router 使用 Mimo-V2.5（1M上下文），可以给更多历史
+    # 但保持克制，避免无谓 token 消耗
+    _HISTORY_CHAR_BUDGET = 3000  # Mimo-V2.5 可以处理更多上下文
     fitted_history = (
         history_text.strip()[-_HISTORY_CHAR_BUDGET:] if history_text.strip() else ""
     )
     fitted_unreads = unreads_text
 
-    # 依次尝试：本地 router 小模型（低延迟）→ agent（回退）
-    # 熔断器：本地模型连续失败后自动跳过，避免每条消息都等连接超时
+    # 依次尝试：router（Mimo-V2.5）→ agent（回退）
+    # 熔断器：连续失败后自动跳过 router
     last_error: str = ""
     tasks_to_try = ["router", "agent"]
     if _circuit_is_open():
         tasks_to_try = ["agent"]
-        logger.debug("Router 熔断器打开，跳过本地 router 模型")
+        logger.debug("Router 熔断器打开，跳过 router 模型")
 
     for task in tasks_to_try:
         try:
@@ -278,7 +443,8 @@ async def route_should_respond(
             last_error = f"{task} 无可用模型"
             continue
 
-        # 按该任务模型的上下文预算收紧未读消息
+        # Mimo-V2.5 有 1M 上下文，可以给更多未读消息
+        # 但仍然保持预算控制，避免无谓消耗
         fitted_unreads_task = _fit_unreads_to_sub_agent_budget(request, unreads_text)
         if len(fitted_unreads_task) < len(fitted_unreads):
             logger.info(
@@ -293,10 +459,10 @@ async def route_should_respond(
         task_sub_prompt = _fit_system_prompt_to_task(sub_prompt, request, logger, task)
         user_text = "\n\n".join(parts)
 
-        # 最终硬守卫：token 估算器对中文有系统性低估，逐部件裁剪后仍可能溢出。
-        # 用保守比率（1 字符 ≈ 1.5 token）做总量检查，超了直接砍 system prompt。
+        # Mimo-V2.5 上下文很大，通常不需要硬守卫裁剪
+        # 但仍保留逻辑以防万一
         _model_set_guard = getattr(request, "model_set", None)
-        _max_ctx = 2048
+        _max_ctx = 1000000  # Mimo-V2.5 默认 1M
         if isinstance(_model_set_guard, list) and _model_set_guard and isinstance(_model_set_guard[0], dict):
             _mc_val = _model_set_guard[0].get("max_context")
             if isinstance(_mc_val, int) and _mc_val > 0:
@@ -304,12 +470,11 @@ async def route_should_respond(
         # 保守 token 估计：中文 1 字符 ≈ 1.5 token
         _user_tokens_est = int(len(user_text) * 1.5)
         _output_reserve = 80
-        _sys_budget_hard = _max_ctx - _user_tokens_est - _output_reserve - 100  # 100 最终安全余量
+        _sys_budget_hard = _max_ctx - _user_tokens_est - _output_reserve - 100
         if _sys_budget_hard < 100:
             _sys_budget_hard = 100
         _sys_tokens_est = int(len(task_sub_prompt) * 1.5)
         if _sys_tokens_est > _sys_budget_hard:
-            # 按字符比率反算允许的字符数
             _allowed_chars = int(_sys_budget_hard / 1.5)
             task_sub_prompt = task_sub_prompt[-_allowed_chars:].strip()
             logger.info(

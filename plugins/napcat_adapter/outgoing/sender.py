@@ -70,7 +70,11 @@ class OutgoingSender:
         if group_info and group_info.get("group_id"):
             action = "send_group_msg"
             target_key = "group_id"
-            target_id = int(group_info["group_id"])
+            try:
+                target_id = int(group_info["group_id"])
+            except (ValueError, TypeError):
+                logger.error(f"group_id 非整数: {group_info['group_id']!r}，放弃发送群消息")
+                return
         elif user_info and user_info.get("user_id"):
             action = "send_private_msg"
             target_key = "user_id"

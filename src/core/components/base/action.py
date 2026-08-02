@@ -496,7 +496,7 @@ class BaseAction(ABC, LLMUsable):
 
                 if chat_type == "group":
                     if last_msg:
-                        target_group_id = last_msg.extra.get("group_id")
+                        target_group_id = last_msg.extra.get("group_id") or last_msg.extra.get("target_group_id")
                         target_group_name = last_msg.extra.get("group_name")
                 else:
                     target_user_id, target_user_name = await self._resolve_private_target_from_context(

@@ -82,11 +82,15 @@ def _resolve_model_set(routing_name: str) -> list[dict[str, Any]]:
         from ..config.models_loader import get_models_config
 
         mc = get_models_config()
-        if routing_name in mc.tasks:
-            return mc.get_task(routing_name)
-        # "default"/"main" 回退到 actor
-        if routing_name in ("default", "main") and "actor" in mc.tasks:
-            return mc.get_task("actor")
+        if mc.tasks:
+            # get_task 内部处理别名解析
+            try:
+                return mc.get_task(routing_name)
+            except ValueError:
+                pass
+            # "default"/"main" 回退到 expression
+            if routing_name in ("default", "main") and "expression" in mc.tasks:
+                return mc.get_task("expression")
     except (ImportError, Exception):
         pass
 

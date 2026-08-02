@@ -38,6 +38,20 @@ _DEFAULTS = {
     "temp": 0.7,
 }
 
+# 旧任务名 → 新任务名别名（向后兼容）
+_TASK_ALIASES: dict[str, str] = {
+    "life": "core",
+    "actor": "expression",
+    "sub_actor": "agent",
+    "diary": "witness",
+    "vlm": "vision",
+    "video": "vision",
+    "utils": "utility",
+    "utils_small": "utility",
+    "media_observer": "vision",
+    "tool_use": "agent",
+}
+
 
 class ModelsConfig:
     """新格式模型配置。"""
@@ -87,7 +101,9 @@ class ModelsConfig:
         Raises:
             ValueError: 任务不存在
         """
-        task = self._tasks.get(task_name)
+        # 别名解析（旧任务名 → 新任务名）
+        resolved = _TASK_ALIASES.get(task_name, task_name)
+        task = self._tasks.get(resolved)
         if task is None:
             raise ValueError(f"任务 '{task_name}' 未找到。可用: {list(self._tasks.keys())}")
 
@@ -138,6 +154,8 @@ class ModelsConfig:
             modalities.append("image")
         if model.get("audio", False):
             modalities.append("audio")
+        if model.get("video", False):
+            modalities.append("video")
 
         entry: dict[str, Any] = {
             "api_provider": provider_name,
@@ -148,6 +166,8 @@ class ModelsConfig:
             "max_retry": provider.get("max_retry", _DEFAULTS["max_retry"]),
             "timeout": provider.get("timeout", _DEFAULTS["timeout"]),
             "retry_interval": provider.get("retry_interval", _DEFAULTS["retry_interval"]),
+            "price_in": model.get("price_in", 0.0),
+            "price_out": model.get("price_out", 0.0),
             "max_tokens": max_tokens,
             "temperature": temperature,
             "max_context": model.get("ctx", _DEFAULTS["ctx"]),

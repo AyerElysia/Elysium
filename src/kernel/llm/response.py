@@ -11,6 +11,7 @@ LLMResponse 支持：
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable, Awaitable
 from dataclasses import dataclass
@@ -154,19 +155,33 @@ class LLMResponse:
         tool_acc = _ToolCallAccumulator()
         reasoning_acc = _ReasoningBlockAccumulator()
         stream_error: Exception | None = None
+
+        # 防止 streaming 响应卡死：stream 可能因网络/服务端问题进入 CLOSE-WAIT，
+        # 导致 async for 永久阻塞。300s 总预算覆盖整个 stream 消费过程。
+        STREAM_TOTAL_TIMEOUT = 300.0
+
+        async def _consume_stream():
+            nonlocal stream_error
+            try:
+                async for event in self._stream:
+                    if event.text_delta:
+                        full_content.append(event.text_delta)
+                        yield event.text_delta
+                    if event.reasoning_block_type or event.reasoning_delta or event.reasoning_signature_delta:
+                        reasoning_acc.apply(event)
+                    if event.tool_name or event.tool_args_delta or event.tool_call_id:
+                        tool_acc.apply(event)
+            except Exception as e:
+                # 部分 provider/SDK 会在流尾抛出"连接关闭"等异常。
+                # 先记录异常，确保已收集的内容能正确落库，再重新抛出。
+                stream_error = e
+
         try:
-            async for event in self._stream:
-                if event.text_delta:
-                    full_content.append(event.text_delta)
-                    yield event.text_delta
-                if event.reasoning_block_type or event.reasoning_delta or event.reasoning_signature_delta:
-                    reasoning_acc.apply(event)
-                if event.tool_name or event.tool_args_delta or event.tool_call_id:
-                    tool_acc.apply(event)
-        except Exception as e:
-            # 部分 provider/SDK 会在流尾抛出"连接关闭"等异常。
-            # 先记录异常，确保已收集的内容能正确落库，再重新抛出。
-            stream_error = e
+            async for chunk in asyncio.wait_for(_consume_stream(), timeout=STREAM_TOTAL_TIMEOUT):
+                yield chunk
+        except asyncio.TimeoutError:
+            from .exceptions import LLMTimeoutError
+            stream_error = LLMTimeoutError(f"Stream 消费超时 ({STREAM_TOTAL_TIMEOUT:.0f}s)")
 
         self.message = "".join(full_content)
         self.reasoning_parts = reasoning_acc.finalize() or self.reasoning_parts
@@ -199,14 +214,24 @@ class LLMResponse:
         tool_acc = _ToolCallAccumulator()
         reasoning_acc = _ReasoningBlockAccumulator()
         stream_error: Exception | None = None
+
+        # 防止 streaming 响应卡死：300s 总预算覆盖整个 stream 消费过程
+        STREAM_TOTAL_TIMEOUT = 300.0
+
         try:
-            async for event in self._stream:
-                if event.text_delta:
-                    full_content.append(event.text_delta)
-                if event.reasoning_block_type or event.reasoning_delta or event.reasoning_signature_delta:
-                    reasoning_acc.apply(event)
-                if event.tool_name or event.tool_args_delta or event.tool_call_id:
-                    tool_acc.apply(event)
+            async def _consume():
+                async for event in self._stream:
+                    if event.text_delta:
+                        full_content.append(event.text_delta)
+                    if event.reasoning_block_type or event.reasoning_delta or event.reasoning_signature_delta:
+                        reasoning_acc.apply(event)
+                    if event.tool_name or event.tool_args_delta or event.tool_call_id:
+                        tool_acc.apply(event)
+
+            await asyncio.wait_for(_consume(), timeout=STREAM_TOTAL_TIMEOUT)
+        except asyncio.TimeoutError:
+            from .exceptions import LLMTimeoutError
+            stream_error = LLMTimeoutError(f"Stream 消费超时 ({STREAM_TOTAL_TIMEOUT:.0f}s)")
         except Exception as e:
             # 部分 provider/SDK 会在流尾抛出"连接关闭"等异常。
             # 先记录异常，确保已收集的内容能正确落库，再重新抛出。
@@ -243,14 +268,24 @@ class LLMResponse:
         tool_acc = _ToolCallAccumulator()
         reasoning_acc = _ReasoningBlockAccumulator()
         stream_error: Exception | None = None
+
+        # 防止 streaming 响应卡死：300s 总预算
+        STREAM_TOTAL_TIMEOUT = 300.0
+
         try:
-            async for event in self._stream:
-                if event.text_delta:
-                    full_content.append(event.text_delta)
-                if event.reasoning_block_type or event.reasoning_delta or event.reasoning_signature_delta:
-                    reasoning_acc.apply(event)
-                if event.tool_name or event.tool_args_delta or event.tool_call_id:
-                    tool_acc.apply(event)
+            async def _consume():
+                async for event in self._stream:
+                    if event.text_delta:
+                        full_content.append(event.text_delta)
+                    if event.reasoning_block_type or event.reasoning_delta or event.reasoning_signature_delta:
+                        reasoning_acc.apply(event)
+                    if event.tool_name or event.tool_args_delta or event.tool_call_id:
+                        tool_acc.apply(event)
+
+            await asyncio.wait_for(_consume(), timeout=STREAM_TOTAL_TIMEOUT)
+        except asyncio.TimeoutError:
+            from .exceptions import LLMTimeoutError
+            stream_error = LLMTimeoutError(f"Stream 消费超时 ({STREAM_TOTAL_TIMEOUT:.0f}s)")
         except Exception as e:
             stream_error = e
 
