@@ -892,10 +892,16 @@ class LLMRequest:
                 next_step = session.next_after_error(classified_error)
 
                 if next_step.model is None:
-                    logger.error(
-                        f"LLM 请求重试已耗尽: request={self.request_name or '__default__'}, "
-                        f"retry_count={retry_count}, last_error={type(classified_error).__name__}: {classified_error}"
-                    )
+                    if next_step.error is None:
+                        logger.error(
+                            f"LLM 请求重试已耗尽: request={self.request_name or '__default__'}, "
+                            f"retry_count={retry_count}, last_error={type(classified_error).__name__}: {classified_error}"
+                        )
+                    else:
+                        logger.debug(
+                            f"LLM 备用模型仍在冷却: request={self.request_name or '__default__'}, "
+                            f"retry_after={getattr(next_step.error, 'retry_after', 0.0):.1f}s"
+                        )
                 else:
                     next_model_identifier = next_step.model.get("model_identifier")
                     next_model_name = (
@@ -911,6 +917,8 @@ class LLMRequest:
 
                 step = next_step
 
+        if step.error is not None:
+            raise step.error
         assert last_error is not None
         raise last_error
 

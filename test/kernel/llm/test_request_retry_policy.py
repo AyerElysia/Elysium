@@ -1,5 +1,7 @@
 
-from src.kernel.llm.exceptions import LLMAPIError
+import pytest
+
+from src.kernel.llm.exceptions import LLMAPIError, LLMModelsCoolingDownError
 from src.kernel.llm.model_client import ModelClientRegistry, StreamEvent
 from src.kernel.llm.payload import LLMPayload, Text
 from src.kernel.llm.policy.failover import FailoverPolicy
@@ -154,6 +156,53 @@ async def test_permanent_failure_does_not_enter_transient_cooldown():
         assert (await request.send(stream=False)).message == "ok"
 
     assert client.calls == ["a", "b", "a", "b"]
+
+
+async def test_all_cooling_models_are_not_probed_before_expiry():
+    """A fully failed chain must not be hammered by each new request."""
+
+    model_set = [_model("a", max_retry=0), _model("b", max_retry=0)]
+
+    class FailingClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def create(
+            self,
+            *,
+            model_name: str,
+            payloads,
+            tools,
+            request_name: str,
+            model_set,
+            stream: bool,
+        ):
+            self.calls.append(model_name)
+            raise LLMAPIError("upstream unavailable", status_code=500)
+
+    client = FailingClient()
+    clients = ModelClientRegistry(openai=client)
+    first = LLMRequest(
+        model_set,
+        request_name="life_memory_witness",
+        clients=clients,
+        policy=FailoverPolicy(),
+    )
+    with pytest.raises(LLMAPIError):
+        await first.send(stream=False)
+    assert client.calls == ["a", "b"]
+
+    second = LLMRequest(
+        model_set,
+        request_name="life_memory_witness",
+        clients=clients,
+        policy=FailoverPolicy(),
+    )
+    with pytest.raises(LLMModelsCoolingDownError) as exc_info:
+        await second.send(stream=False)
+
+    assert exc_info.value.retry_after > 290
+    assert client.calls == ["a", "b"]
 
 
 def test_transient_cooldown_expiry_restores_primary(monkeypatch):

@@ -15,13 +15,15 @@ from typing import Any, Protocol
 class ModelStep:
     """下一步执行计划。
 
-    - model=None 表示策略耗尽，应停止重试并把最后一次异常抛给上层。
+    - model=None 表示当前没有可执行模型，应由上层抛出 error 或最后一次异常。
     - delay_seconds 由 policy 决定（例如 retry_interval）。
+    - error 用于 policy 在没有可执行模型时传递可操作的终止原因。
     """
 
     model: dict[str, Any] | None
     delay_seconds: float = 0.0
     meta: dict[str, Any] | None = None
+    error: BaseException | None = None
 
 
 class PolicySession(Protocol):

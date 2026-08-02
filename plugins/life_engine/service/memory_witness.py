@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -155,12 +156,16 @@ class MemoryWitnessCoordinator:
                     continue
 
                 transient_failures += 1
-                next_delay = retry_delay
+                retry_after = getattr(exc, "retry_after", 0.0)
+                if isinstance(retry_after, (int, float)) and retry_after > 0:
+                    next_delay = max(retry_delay, math.ceil(retry_after))
+                else:
+                    next_delay = retry_delay
                 summary = _transient_error_summary(exc)
                 message = (
                     "记忆见证上游暂时不可用，待处理经历已保留: "
                     f"failure_count={transient_failures}, "
-                    f"retry_in={retry_delay}s, error={summary}"
+                    f"retry_in={next_delay}s, error={summary}"
                 )
                 if transient_failures == _TRANSIENT_ERROR_ESCALATION_COUNT:
                     logger.error(message)

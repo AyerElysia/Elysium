@@ -88,10 +88,37 @@ class LLMAPIError(LLMError):
         self.model = model
 
 
+class LLMModelsCoolingDownError(LLMError):
+    """所有候选模型均处于临时故障冷却期。"""
+
+    def __init__(
+        self,
+        *,
+        request_name: str,
+        retry_after: float,
+        models: tuple[str, ...] = (),
+    ) -> None:
+        self.request_name = request_name or "__default__"
+        self.retry_after = max(1.0, float(retry_after))
+        self.models = models
+        super().__init__(
+            "all candidate models are cooling down: "
+            f"request={self.request_name}, retry_after={self.retry_after:.1f}s"
+        )
+
+
 def is_transient_llm_error(error: BaseException) -> bool:
     """Return whether an LLM failure is likely to recover without reconfiguration."""
 
-    if isinstance(error, (LLMTimeoutError, LLMRateLimitError, TimeoutError)):
+    if isinstance(
+        error,
+        (
+            LLMTimeoutError,
+            LLMRateLimitError,
+            LLMModelsCoolingDownError,
+            TimeoutError,
+        ),
+    ):
         return True
     if isinstance(error, LLMAPIError):
         status_code = error.status_code
@@ -106,6 +133,9 @@ def should_retry_same_model(error: BaseException) -> bool:
     - 返回 ``True`` 表示当前模型还可以重试一次；
     - 返回 ``False`` 表示应直接切到下一个模型，不要在当前模型上空转。
     """
+    if isinstance(error, LLMModelsCoolingDownError):
+        return False
+
     if isinstance(error, (LLMTimeoutError, LLMRateLimitError)):
         return True
 

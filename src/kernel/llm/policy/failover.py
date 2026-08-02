@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from ..exceptions import is_transient_llm_error
+from ..exceptions import LLMModelsCoolingDownError, is_transient_llm_error
 from .base import ModelStep, Policy, PolicySession
 
 _DEFAULT_COOLDOWN_SECONDS = 300.0
@@ -93,12 +93,12 @@ class _ModelCooldownRegistry:
         models: list[dict[str, Any]],
         *,
         start: int,
-    ) -> tuple[int | None, tuple[str, ...]]:
-        """选择首个可用模型；全部冷却时选择最早到期者探测。"""
+    ) -> tuple[int | None, tuple[str, ...], float]:
+        """选择首个已就绪模型，并返回全部冷却时的最短剩余时间。"""
 
         candidates = list(range(start, len(models)))
         if not candidates:
-            return None, ()
+            return None, (), 0.0
 
         now = time.monotonic()
         cooling: list[tuple[int, _CooldownState]] = []
@@ -107,17 +107,14 @@ class _ModelCooldownRegistry:
             for index in candidates:
                 state = self._entries.get(self._key(request_name, models[index]))
                 if state is None or state.until <= now:
-                    return index, tuple(skipped)
+                    return index, tuple(skipped), 0.0
                 cooling.append((index, state))
                 skipped.append(
                     str(models[index].get("model_identifier") or "unknown")
                 )
 
-        probe_index = min(cooling, key=lambda item: item[1].until)[0]
-        probe_name = str(
-            models[probe_index].get("model_identifier") or "unknown"
-        )
-        return probe_index, tuple(name for name in skipped if name != probe_name)
+        retry_after = max(1.0, min(state.until for _, state in cooling) - now)
+        return None, tuple(skipped), retry_after
 
     def reset(self) -> None:
         """清空健康状态，供确定性测试使用。"""
@@ -179,12 +176,26 @@ class _FailoverSession(PolicySession):
 
     def first(self) -> ModelStep:
         self._started = True
-        selected, skipped = _MODEL_COOLDOWNS.choose_index(
+        selected, skipped, retry_after = _MODEL_COOLDOWNS.choose_index(
             self._request_name,
             self._models,
             start=0,
         )
-        assert selected is not None
+        if selected is None:
+            return ModelStep(
+                model=None,
+                meta={
+                    "reason": "all_models_cooling",
+                    "strategy": "failover",
+                    "cooldown_skipped": skipped,
+                    "retry_after": retry_after,
+                },
+                error=LLMModelsCoolingDownError(
+                    request_name=self._request_name,
+                    retry_after=retry_after,
+                    models=skipped,
+                ),
+            )
         self._idx = selected
         self._attempts_used = 1
         model = self._models[self._idx]
@@ -209,19 +220,35 @@ class _FailoverSession(PolicySession):
             error,
             base_cooldown_seconds=self._cooldown_seconds,
         )
-        next_idx, skipped = _MODEL_COOLDOWNS.choose_index(
+        next_idx, skipped, retry_after = _MODEL_COOLDOWNS.choose_index(
             self._request_name,
             self._models,
             start=self._idx + 1,
         )
         if next_idx is None:
+            cooling_error = (
+                LLMModelsCoolingDownError(
+                    request_name=self._request_name,
+                    retry_after=retry_after,
+                    models=skipped,
+                )
+                if retry_after > 0
+                else None
+            )
             return ModelStep(
                 model=None,
                 meta={
-                    "reason": "exhausted",
+                    "reason": (
+                        "remaining_models_cooling"
+                        if cooling_error is not None
+                        else "exhausted"
+                    ),
                     "strategy": "failover",
                     "attempt": self._attempts_used,
+                    "cooldown_skipped": skipped,
+                    "retry_after": retry_after,
                 },
+                error=cooling_error,
             )
 
         self._idx = next_idx

@@ -29,7 +29,7 @@ from plugins.life_engine.service.memory_witness import (
     MemoryWitnessCoordinator,
 )
 from plugins.life_engine.service.tool_manifests import get_tool_manifest
-from src.kernel.llm.exceptions import LLMAPIError
+from src.kernel.llm.exceptions import LLMAPIError, LLMModelsCoolingDownError
 
 
 def _db() -> sqlite3.Connection:
@@ -296,8 +296,34 @@ def _witness_service_stub(tmp_path: Path, memory: object) -> SimpleNamespace:
     )
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected_delay", "expected_summary"),
+    [
+        (
+            LLMAPIError(
+                "upstream unavailable",
+                status_code=500,
+                error_code="do_request_failed",
+            ),
+            60,
+            "LLMAPIError(status=500, code=do_request_failed)",
+        ),
+        (
+            LLMModelsCoolingDownError(
+                request_name="life_memory_witness",
+                retry_after=240,
+                models=("mimo-v2.5", "gpt-5.6-luna"),
+            ),
+            240,
+            "LLMModelsCoolingDownError",
+        ),
+    ],
+)
 async def test_witness_loop_retries_transient_upstream_failure_quietly(
     monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+    expected_delay: int,
+    expected_summary: str,
 ) -> None:
     """A temporary model outage keeps evidence pending and retries soon."""
 
@@ -324,11 +350,7 @@ async def test_witness_loop_retries_transient_upstream_failure_quietly(
         nonlocal run_count
         run_count += 1
         if run_count == 1:
-            raise LLMAPIError(
-                "upstream unavailable",
-                status_code=500,
-                error_code="do_request_failed",
-            )
+            raise failure
         service._state.running = False
 
     async def _record_error(exc: Exception) -> None:
@@ -359,12 +381,12 @@ async def test_witness_loop_retries_transient_upstream_failure_quietly(
     await coordinator.loop()
 
     assert run_count == 2
-    assert delays == [60]
+    assert delays == [expected_delay]
     assert len(recorded_errors) == 1
     assert errors == []
     assert len(warnings) == 1
     assert "待处理经历已保留" in warnings[0]
-    assert "LLMAPIError(status=500, code=do_request_failed)" in warnings[0]
+    assert expected_summary in warnings[0]
     assert infos == ["记忆见证上游已恢复: previous_failures=1"]
 
 

@@ -151,5 +151,7 @@ class EmbeddingRequest:
                 retry_count += 1
                 step = session.next_after_error(classified_error)
 
+        if step.error is not None:
+            raise step.error
         assert last_error is not None
         raise last_error
