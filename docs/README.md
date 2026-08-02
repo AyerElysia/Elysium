@@ -6,6 +6,7 @@
 - [principles.md](./principles.md) — 主体性、零规则、仿生、意识实例与渐进式披露（设计底线）
 - [生命记忆系统](./architecture/life_memory_system.md) — 追加式经历、认识论本体、双时间与主体性遗忘
 - [意识实例架构](./architecture/consciousness_instances.md) — 多意识实例、潜意识协调与工具边界
+- [离线优先共享后端重构计划](./architecture/offline_first_shared_backend_plan.md) — 本地独立运行、远程近实时共享、不可变事件同步与无损迁移验收门
 - [Elysium Console 前端提案](./architecture/elysium_console_frontend_proposal.md) — 已批准的插件驱动统一控制台与分阶段验收计划
 - [Elysium Console Stage 0 设计基线](./architecture/elysium_console_stage0_design.md) — 此刻、Live Ready、Live Call 与安全降级页的交互规范
 - [Elysium Console 安全模型](./architecture/elysium_console_security_model.md) — 插件页面、密钥、OBS、会话与主进程生命周期边界
