@@ -25,6 +25,7 @@ from src.core.components.base.router import BaseRouter
 from src.kernel.logger import get_logger
 
 from .config import LivestreamConfig
+from .consciousness import LivestreamConsciousnessManager
 from .output.avatar_controller import AvatarController
 from .output.tts_queue import TTSQueue
 from .pipeline.event_filter import EventFilter
@@ -69,6 +70,7 @@ class LivestreamRouter(BaseRouter):
         self._tts: TTSQueue | None = None
         self._avatar: AvatarController | None = None
         self._proactive: ProactiveEngine | None = None
+        self._consciousness = LivestreamConsciousnessManager(self._config)
 
         super().__init__(plugin)
 
@@ -109,6 +111,7 @@ class LivestreamRouter(BaseRouter):
                 await self._start_pipeline()
                 return JSONResponse({"message": "直播已开始"})
             except Exception as exc:
+                await self._stop_pipeline()
                 logger.error(f"启动直播失败: {exc}", exc_info=True)
                 return JSONResponse(
                     {"message": f"启动失败: {exc}"}, status_code=500
@@ -198,7 +201,11 @@ class LivestreamRouter(BaseRouter):
         # 初始化组件
         self._event_filter = EventFilter(config)
         self._queue = PriorityEventQueue(config)
-        self._llm = LLMOrchestrator(config)
+        await self._consciousness.activate()
+        self._llm = LLMOrchestrator(
+            config,
+            consciousness=self._consciousness,
+        )
         self._tts = TTSQueue(config)
         self._avatar = AvatarController(config)
         self._proactive = ProactiveEngine(config)
@@ -249,6 +256,7 @@ class LivestreamRouter(BaseRouter):
             await self._avatar.stop()
         if self._llm:
             await self._llm.stop()
+        await self._consciousness.suspend()
 
         logger.info("直播管线已全部停止")
 

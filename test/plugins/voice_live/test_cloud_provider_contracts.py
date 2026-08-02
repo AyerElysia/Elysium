@@ -16,6 +16,46 @@ from plugins.voice_live.providers.qwen_realtime import (
 )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_kind", ["openai", "qwen"])
+async def test_transient_context_is_deleted_and_completion_is_reported(
+    provider_kind: str,
+) -> None:
+    """Realtime turn context leaves provider history after response.done."""
+
+    if provider_kind == "openai":
+        provider = OpenAIRealtimeProvider("ws://example/realtime", "secret")
+    else:
+        provider = QwenRealtimeProvider(
+            "ws://example/realtime",
+            "secret",
+            model="qwen-realtime",
+        )
+    sent: list[dict[str, Any]] = []
+    completions: list[bool] = []
+
+    async def send(event: dict[str, Any]) -> None:
+        sent.append(event)
+
+    async def completed(success: bool) -> None:
+        completions.append(success)
+
+    provider._send = send  # type: ignore[method-assign]
+    provider.on_response_done(completed)
+    await provider.inject_context("transient-world")
+    created_item = sent[0]["item"]["id"]
+
+    await provider._handle_event(  # type: ignore[attr-defined]
+        {"type": "response.done", "response": {"status": "completed"}}
+    )
+
+    assert sent[-1] == {
+        "type": "conversation.item.delete",
+        "item_id": created_item,
+    }
+    assert completions == [True]
+
+
 async def _start_server(handler: Any) -> tuple[web.AppRunner, int]:
     app = web.Application()
     app.router.add_get("/realtime", handler)

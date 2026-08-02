@@ -238,9 +238,10 @@ async def test_enqueue_dfc_message_appends_pending_event(tmp_path: Path) -> None
         json.loads(line)
         for line in (tmp_path / RAW_EVENT_LOG_FILE).read_text(encoding="utf-8").splitlines()
     ]
-    assert raw_events[0]["event_id"] == event.event_id
-    assert raw_events[0]["channel"] == "chat"
-    assert raw_events[0]["reply_target"]["stream_id"] == "stream-1"
+    raw_event = next(item for item in raw_events if item["event_id"] == event.event_id)
+    assert raw_event["channel"] == "chat"
+    assert raw_event["reply_target"]["stream_id"] == "stream-1"
+    assert raw_event["source_instance_id"] == "chat_global"
 
 
 async def test_enqueue_dfc_message_rejects_empty_message(tmp_path: Path) -> None:
@@ -496,7 +497,8 @@ async def test_heartbeat_success_consumes_delta_without_replay(
 
     assert first_reply == second_reply == "已处理"
     assert "只应该被心跳看到一次" in contexts[0]
-    assert contexts[1] == ""
+    assert "只应该被心跳看到一次" not in contexts[1]
+    assert "chat_global" in contexts[1]
     assert first_prepared.acknowledged_event_ids == [event.event_id]
     assert second_prepared.selected_event_ids == []
     assert event.heartbeat_context_consumed is True
@@ -703,7 +705,8 @@ async def test_consumed_heartbeat_events_remain_consumed_after_restart(
 
     assert restored._state.heartbeat_context_cursor >= event.sequence
     assert restored_event.heartbeat_context_consumed is True
-    assert prepared.content == ""
+    assert "重启后不能重新注入" not in prepared.content
+    assert "chat_global" in prepared.content
 
 
 @pytest.mark.parametrize("memory_index_enabled", [True, False])

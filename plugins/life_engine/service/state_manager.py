@@ -398,6 +398,10 @@ def event_to_dict(event: LifeEngineEvent) -> dict[str, Any]:
         "tool_args": event.tool_args,
         "tool_success": event.tool_success,
         "heartbeat_context_consumed": event.heartbeat_context_consumed,
+        "source_instance_id": event.source_instance_id,
+        "correlation_id": event.correlation_id,
+        "content_ref": event.content_ref,
+        "raw_content": event.raw_content,
     }
 
 
@@ -460,6 +464,10 @@ def event_from_dict(
         heartbeat_context_consumed=_safe_bool(
             data.get("heartbeat_context_consumed"),
         ),
+        source_instance_id=data.get("source_instance_id"),
+        correlation_id=data.get("correlation_id"),
+        content_ref=data.get("content_ref"),
+        raw_content=data.get("raw_content"),
     )
 
 

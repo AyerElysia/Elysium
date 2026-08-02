@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import traceback
 from dataclasses import asdict
 from datetime import datetime, time as dtime, timedelta, timezone
@@ -98,9 +100,23 @@ from .subconscious_context import (
     SubconsciousContextManager,
     SubconsciousSummary,
 )
-from .world_state import PerceptionFilter, WorldState
+from .world_state import WorldState
 from .consciousness import ConsciousnessRegistry
-from .event_bus import LifeEventBus, RawEventStore
+from .event_bus import (
+    LifeEvent,
+    LifeEventBus,
+    LifeEventChannel,
+    LifeEventPriority,
+    RawEventStore,
+)
+from .perception_gateway import PerceptionGateway, PreparedPerception
+from .world_projection import (
+    WORLD_LEGACY_IMPORT_EVENT,
+    WORLD_OBSERVATION_EVENT,
+    WORLD_PROJECTION_DB_FILE,
+    WorldProjectionStore,
+    legacy_snapshot_assertions,
+)
 from .integrations import (
     DFCIntegration,
     MemoryIntegration,
@@ -254,6 +270,9 @@ class LifeEngineService(BaseService):
         # 状态持久化
         self._state_persistence: StatePersistence | None = None
         self._event_bus: LifeEventBus | None = None
+        self._world_projection: WorldProjectionStore | None = None
+        self._perception_gateway: PerceptionGateway | None = None
+        self._pending_chatter_perceptions: dict[str, PreparedPerception] = {}
         self._attention_router: AttentionRouter | None = None
         self._legacy_config_warning_emitted: bool = False
         self._last_memory_maintenance_prompt_at: str | None = None
@@ -267,14 +286,26 @@ class LifeEngineService(BaseService):
 
     @property
     def world_state(self) -> WorldState:
-        """潜意识结构化世界模型（共享内在世界）。"""
+        """Return the non-authoritative legacy migration snapshot."""
         return self._world_state
 
     def save_world_state(self) -> None:
-        """将世界状态持久化到磁盘。"""
-        self._world_state.save(
-            self._workspace_dir() / "runtime" / "world_state.json"
+        """Export the derived world projection for read-only diagnostics."""
+
+        self._get_perception_gateway()
+        projection = self._get_world_projection()
+        target = self._workspace_dir() / "runtime" / "world_projection.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(
+                projection.canonical_snapshot(),
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
         )
+        temporary.replace(target)
 
     @property
     def consciousness_registry(self) -> ConsciousnessRegistry:
@@ -286,6 +317,11 @@ class LifeEngineService(BaseService):
         self._consciousness_registry.save(
             self._workspace_dir() / "runtime" / "consciousness_registry.json"
         )
+        self._consciousness_registry.flush_lifecycle_events(
+            self._get_event_bus().store.append_sync
+        )
+        if self._world_projection is not None:
+            self._world_projection.catch_up(self._get_event_bus().store)
 
     def _get_lock(self) -> asyncio.Lock:
         """获取懒加载锁。"""
@@ -296,7 +332,211 @@ class LifeEngineService(BaseService):
     def _get_event_bus(self) -> LifeEventBus:
         if self._event_bus is None:
             self._event_bus = LifeEventBus(RawEventStore(self._workspace_dir()))
+            self._consciousness_registry.flush_lifecycle_events(
+                self._event_bus.store.append_sync
+            )
         return self._event_bus
+
+    def _get_world_projection(self) -> WorldProjectionStore:
+        """Return the rebuildable subjective world read model."""
+
+        if self._world_projection is None:
+            self._world_projection = WorldProjectionStore(
+                self._workspace_dir() / "runtime" / WORLD_PROJECTION_DB_FILE
+            )
+        return self._world_projection
+
+    def _migrate_legacy_world_state(self) -> None:
+        """Append the legacy JSON snapshot once as migration evidence."""
+
+        projection = self._get_world_projection()
+        if projection.legacy_imported():
+            projection.catch_up(self._get_event_bus().store)
+            return
+        snapshot = self._world_state.to_dict()
+        encoded = json.dumps(
+            snapshot,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        snapshot_hash = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        assertions = legacy_snapshot_assertions(snapshot)
+        if assertions:
+            occurred_at = self._world_state.last_updated_at or _now_iso()
+            event = LifeEvent(
+                event_id=f"world_legacy_{snapshot_hash}",
+                sequence=0,
+                timestamp=occurred_at,
+                source="life_engine.world_state_migration",
+                channel=LifeEventChannel.SYSTEM.value,
+                event_type=WORLD_LEGACY_IMPORT_EVENT,
+                content=json.dumps(
+                    {
+                        "assertions": assertions,
+                        "legacy_schema_version": self._world_state.schema_version,
+                        "legacy_revision": self._world_state.revision,
+                        "snapshot_hash": snapshot_hash,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                priority=int(LifeEventPriority.NORMAL),
+                salience=0.8,
+                occurrence_id=f"world_legacy_{snapshot_hash}",
+            )
+            self._get_event_bus().store.append_sync(event)
+        projection.catch_up(self._get_event_bus().store)
+        projection.mark_legacy_imported(snapshot_hash)
+
+    def _get_perception_gateway(self) -> PerceptionGateway:
+        """Return the reliable per-instance perception delivery gateway."""
+
+        if self._perception_gateway is None:
+            self._migrate_legacy_world_state()
+            self._perception_gateway = PerceptionGateway(
+                self._consciousness_registry,
+                self._get_event_bus().store,
+                self._get_world_projection(),
+            )
+        return self._perception_gateway
+
+    @property
+    def perception_gateway(self) -> PerceptionGateway:
+        """Expose the supported cross-instance perception integration point."""
+
+        return self._get_perception_gateway()
+
+    @property
+    def world_projection(self) -> WorldProjectionStore:
+        """Expose the rebuildable world projection for diagnostics and queries."""
+
+        self._get_perception_gateway()
+        return self._get_world_projection()
+
+    def resolve_consciousness_instance(self, stream_id: str = "") -> str:
+        """Resolve a trusted runtime instance from current stream ownership."""
+
+        owner = self._consciousness_registry.get_for_stream(
+            str(stream_id or "").strip()
+        )
+        return owner.instance_id if owner is not None else "chat_global"
+
+    def report_world_observation_sync(
+        self,
+        report: str,
+        *,
+        source_instance_id: str,
+        subject: str,
+        predicate: str = "state_report",
+        domain: str = "",
+        status: str = "",
+        stream_id: str = "",
+        observed_at: str = "",
+        valid_from: str = "",
+        valid_to: str = "",
+        supersedes_assertion_id: str = "",
+        retracts_assertion_id: str = "",
+        value: Any | None = None,
+    ) -> dict[str, Any]:
+        """Append one attributed observation and project it synchronously."""
+
+        report_text = str(report or "").strip()
+        instance_id = str(source_instance_id or "").strip()
+        assertion_subject = str(subject or "").strip()
+        assertion_predicate = str(predicate or "").strip()
+        if not report_text:
+            raise ValueError("world observation report must not be empty")
+        if not instance_id:
+            raise ValueError("world observation source_instance_id must not be empty")
+        if self._consciousness_registry.get(instance_id) is None:
+            raise ValueError(
+                f"world observation source instance is not registered: {instance_id}"
+            )
+        if not assertion_subject or not assertion_predicate:
+            raise ValueError("world observation subject and predicate must not be empty")
+        now = observed_at or _now_iso()
+        assertion_id = "assertion_" + uuid4().hex
+        event_id = "world_observation_" + uuid4().hex
+        assertion: dict[str, Any] = {
+            "assertion_id": assertion_id,
+            "subject": assertion_subject,
+            "predicate": assertion_predicate,
+            "value": report_text if value is None else value,
+            "domain": str(domain or ""),
+            "status": str(status or ""),
+            "source_instance_id": instance_id,
+            "observed_at": now,
+            "valid_from": valid_from or now,
+            "valid_to": str(valid_to or ""),
+            "supersedes_assertion_id": str(supersedes_assertion_id or ""),
+            "retracts_assertion_id": str(retracts_assertion_id or ""),
+            "report": report_text,
+        }
+        event = LifeEvent(
+            event_id=event_id,
+            sequence=0,
+            timestamp=now,
+            source="consciousness.report_state",
+            channel=LifeEventChannel.LIFE.value,
+            event_type=WORLD_OBSERVATION_EVENT,
+            content=json.dumps(
+                {"assertion": assertion},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            stream_id=str(stream_id or ""),
+            priority=int(LifeEventPriority.NORMAL),
+            salience=0.8,
+            occurrence_id=event_id,
+            source_instance_id=instance_id,
+            metadata={"assertion_id": assertion_id},
+        )
+        persisted = self._get_event_bus().store.append_sync(event)
+        frontier = self._get_world_projection().catch_up(
+            self._get_event_bus().store
+        )
+        return {
+            "event_id": persisted.event_id,
+            "occurrence_id": persisted.occurrence_id,
+            "assertion_id": assertion_id,
+            "ingest_position": persisted.sequence,
+            "projection_as_of": frontier,
+            "source_instance_id": instance_id,
+        }
+
+    async def report_world_observation(
+        self,
+        report: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Append one attributed observation without blocking the event loop."""
+
+        return await asyncio.to_thread(
+            self.report_world_observation_sync,
+            report,
+            **kwargs,
+        )
+
+    def prepare_perception(self, instance_id: str) -> PreparedPerception:
+        """Prepare a retryable transient world delivery for one instance."""
+
+        return self._get_perception_gateway().prepare(instance_id)
+
+    def commit_perception(
+        self,
+        prepared: PreparedPerception,
+    ) -> tuple[int, int]:
+        """Commit a world delivery after its runtime accepted the context."""
+
+        return self._get_perception_gateway().commit(prepared)
+
+    def query_world(self, instance_id: str, query: str) -> str:
+        """Return the full provenance-aware projection for reflective judgment."""
+
+        return self._get_perception_gateway().query(instance_id, query)
 
     def _get_attention_router(self) -> AttentionRouter:
         if self._attention_router is None:
@@ -601,13 +841,31 @@ class LifeEngineService(BaseService):
             "tool_args": event.tool_args or {},
             "tool_success": event.tool_success,
             "heartbeat_context_consumed": event.heartbeat_context_consumed,
+            "source_instance_id": event.source_instance_id,
+            "correlation_id": event.correlation_id,
+            "content_ref": event.content_ref,
         }
 
     async def _publish_raw_events(self, events: list[LifeEngineEvent]) -> None:
         """Mirror legacy service events into the unified raw event log."""
         if not events:
             return
+        for event in events:
+            if event.source_instance_id or event.event_type != EventType.MESSAGE:
+                continue
+            stream_id = str(event.stream_id or "").strip()
+            if not stream_id:
+                continue
+            owner = self._consciousness_registry.get_for_stream(stream_id)
+            if owner is not None:
+                event.source_instance_id = owner.instance_id
+                event.correlation_id = event.correlation_id or owner.session_id or None
         await self._get_event_bus().publish_legacy_events(events)
+        if self._world_projection is not None:
+            await asyncio.to_thread(
+                self._world_projection.catch_up,
+                self._get_event_bus().store,
+            )
 
     async def _queue_pending_event(
         self,
@@ -787,6 +1045,13 @@ class LifeEngineService(BaseService):
         snapshot = self.snapshot()
         if self._event_bus is not None:
             snapshot["raw_event_ledger"] = self._event_bus.store.health_snapshot()
+        snapshot["consciousness_presence"] = (
+            self._consciousness_registry.health_snapshot()
+        )
+        if self._world_projection is not None:
+            snapshot["world_projection"] = (
+                self._world_projection.health_snapshot()
+            )
         return snapshot
 
     async def get_state_digest_for_dfc(self) -> str:
@@ -2191,9 +2456,8 @@ class LifeEngineService(BaseService):
 
     async def _prepare_heartbeat_context(self) -> PreparedHeartbeatContext:
         """Drain pending events and prepare one fixed heartbeat snapshot."""
-        # 多意识协调：同步活跃场景到 WorldState
-        self._sync_world_state_scenes()
-        self.save_world_state()
+        self._consciousness_registry.reconcile_expired(timestamp=_now_iso())
+        self.save_consciousness_registry()
 
         pending = await self.drain_pending_events()
         if pending:
@@ -2209,6 +2473,16 @@ class LifeEngineService(BaseService):
             snapshot_events,
             cursor=cursor,
             existing_summary=summary,
+        )
+        prepared.world_perception = await asyncio.to_thread(
+            self.prepare_perception,
+            "life_engine_subconscious",
+        )
+        prepared.content = (
+            "<transient_world_perception>\n"
+            f"{prepared.world_perception.content}\n"
+            "</transient_world_perception>\n\n"
+            f"{prepared.content}"
         )
         # 标记本轮是否包含外部入站消息（供学习系统判断交互）
         prepared.has_inbound_messages = any(
@@ -2235,49 +2509,6 @@ class LifeEngineService(BaseService):
             f"task={self._cfg().model.task_name}"
         )
         return prepared
-
-    def _sync_world_state_scenes(self) -> None:
-        """从意识注册表同步活跃场景到 WorldState（心跳协调协议）。
-
-        每次心跳准备时调用，确保 WorldState 的 active_scenes 层
-        反映当前所有活跃意识实例的状态。
-        """
-        from .world_state import SceneState
-
-        registry = self._consciousness_registry
-        active_instances = registry.get_active()
-
-        # 更新每个活跃意识的场景
-        active_scene_ids: set[str] = set()
-        for instance in active_instances:
-            for stream_id in instance.stream_ids:
-                active_scene_ids.add(stream_id)
-                existing = self._world_state.active_scenes.get(stream_id)
-                if existing is None:
-                    self._world_state.upsert_scene(SceneState(
-                        scene_id=stream_id,
-                        kind=instance.kind,
-                        display_name=instance.display_name or stream_id,
-                        status_summary="活跃",
-                        consciousness_instance_id=instance.instance_id,
-                    ))
-                elif existing.consciousness_instance_id != instance.instance_id:
-                    existing.consciousness_instance_id = instance.instance_id
-                    existing.kind = instance.kind
-
-        # 清理已无活跃意识负责的场景（标记为静默）
-        for scene_id, scene in list(self._world_state.active_scenes.items()):
-            if scene_id not in active_scene_ids and scene.status_summary != "静默":
-                scene.status_summary = "静默"
-                scene.consciousness_instance_id = ""
-
-        # 多意识存在时，在 WorldState 中记录协调信息
-        if len(active_instances) > 1:
-            instance_summary = "; ".join(
-                f"{inst.display_name or inst.instance_id}({inst.kind})"
-                for inst in active_instances
-            )
-            logger.debug(f"多意识协调: {len(active_instances)} 个活跃意识 [{instance_summary}]")
 
     async def _commit_heartbeat_context(
         self,
@@ -2368,6 +2599,11 @@ class LifeEngineService(BaseService):
 
         if heartbeat_event is not None:
             await self._publish_raw_events([heartbeat_event])
+        if isinstance(prepared.world_perception, PreparedPerception):
+            await asyncio.to_thread(
+                self.commit_perception,
+                prepared.world_perception,
+            )
         await self._save_runtime_context()
 
     async def _prepare_and_commit_heartbeat_context(
@@ -2585,11 +2821,34 @@ class LifeEngineService(BaseService):
             stream_id,
             unified_chatter_context=unified_chatter_context,
         )
-        if not sid or sequence <= 0:
+        if not sid:
             return
-        async with self._get_lock():
-            cursors = self._state.chatter_context_cursors
-            cursors[sid] = max(int(cursors.get(sid, 0) or 0), int(sequence))
+        if sequence > 0:
+            async with self._get_lock():
+                cursors = self._state.chatter_context_cursors
+                cursors[sid] = max(
+                    int(cursors.get(sid, 0) or 0),
+                    int(sequence),
+                )
+        prepared = self._pending_chatter_perceptions.get(sid)
+        if prepared is not None:
+            await asyncio.to_thread(self.commit_perception, prepared)
+            if self._pending_chatter_perceptions.get(sid) is prepared:
+                self._pending_chatter_perceptions.pop(sid, None)
+
+    def has_pending_chatter_perception(
+        self,
+        stream_id: str,
+        *,
+        unified_chatter_context: bool = False,
+    ) -> bool:
+        """Return whether a successful model turn still must ack world context."""
+
+        sid = self._chatter_cursor_key(
+            stream_id,
+            unified_chatter_context=unified_chatter_context,
+        )
+        return bool(sid and sid in self._pending_chatter_perceptions)
 
     async def _commit_chatter_thought_cursor(
         self,
@@ -3007,13 +3266,21 @@ class LifeEngineService(BaseService):
 
         sections: list[str] = []
 
-        # 内在世界（从潜意识结构化世界模型渲染）
-        world_perception = self._world_state.render_for_perception(
-            PerceptionFilter.full(),
-            max_chars=3000,
+        instance_id = self.resolve_consciousness_instance(stream_id)
+        world_perception = await asyncio.to_thread(
+            self.prepare_perception,
+            instance_id,
         )
-        if world_perception:
-            sections.append(f"### 内在世界（来自潜意识）\n{world_perception}")
+        sections.append(
+            "### 潜意识协调的瞬时世界感知\n"
+            f"{world_perception.content}"
+        )
+        if commit_cursors:
+            perception_key = self._chatter_cursor_key(
+                stream_id,
+                unified_chatter_context=unified_chatter_context,
+            ) or instance_id
+            self._pending_chatter_perceptions[perception_key] = world_perception
 
         new_thought_revision = thought_cursor
         if sync_streams:
@@ -4083,8 +4350,9 @@ class LifeEngineService(BaseService):
                     minecraft_enabled=bool(getattr(cfg, "minecraft", None) and cfg.minecraft.enabled),
                     consciousness_registry=self._consciousness_registry,
                     save_consciousness_registry=self.save_consciousness_registry,
-                    world_state=self._world_state,
-                    save_world_state=self.save_world_state,
+                    prepare_perception=self.prepare_perception,
+                    commit_perception=self.commit_perception,
+                    report_world_observation=self.report_world_observation,
                     minecraft_config={
                         "java_path": cfg.minecraft.java_path,
                         "mc_version": cfg.minecraft.mc_version,

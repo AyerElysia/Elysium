@@ -36,6 +36,7 @@ class FakeProvider(BaseRealtimeProvider):
         self.audio: list[bytes] = []
         self.interrupt_values: list[int | None] = []
         self.tool_results: list[tuple[str, Any]] = []
+        self.contexts: list[str] = []
 
     async def connect(self, session_config: dict[str, Any]) -> None:
         self.connected = session_config
@@ -54,6 +55,16 @@ class FakeProvider(BaseRealtimeProvider):
     async def submit_tool_result(self, call_id: str, result: Any) -> None:
         self.tool_results.append((call_id, result))
 
+    async def inject_context(self, text: str) -> None:
+        self.contexts.append(text)
+
+
+class RejectingContextProvider(FakeProvider):
+    """Reject transient delivery to exercise retry-safe cursor behavior."""
+
+    async def inject_context(self, text: str) -> None:
+        raise RuntimeError(f"context rejected: {text}")
+
 
 class FakeConsciousness:
     instance_id = "voice_live_test"
@@ -62,6 +73,7 @@ class FakeConsciousness:
     def __init__(self) -> None:
         self.is_active = False
         self.reasons: list[str] = []
+        self.committed_perceptions: list[Any] = []
 
     async def activate(self, provider_name: str) -> None:
         assert provider_name == "fake_realtime"
@@ -73,6 +85,9 @@ class FakeConsciousness:
     async def suspend(self, *, reason: str) -> None:
         self.is_active = False
         self.reasons.append(reason)
+
+    def commit_perception(self, prepared: Any) -> None:
+        self.committed_perceptions.append(prepared)
 
 
 class FakeBridge:
@@ -86,6 +101,17 @@ class FakeBridge:
         self, role: str, text: str, *, provider_event_id: str = ""
     ) -> None:
         self.transcripts.append((role, text, provider_event_id))
+
+
+class PerceptionBridge(FakeBridge):
+    """Expose one transient delivery without putting it in the system prompt."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.prepared = object()
+
+    def build_llm_context_prefix(self) -> tuple[str, object]:
+        return "transient-presence", self.prepared
 
 
 class FakeBroker:
@@ -161,6 +187,88 @@ def make_config(tmp_path: Path) -> VoiceLiveConfig:
     config.session.require_life_engine = False
     config.session.record_to_life = False
     return config
+
+
+@pytest.mark.asyncio
+async def test_voice_perception_commits_only_after_completed_model_turn(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    provider = FakeProvider()
+    consciousness = FakeConsciousness()
+    bridge = PerceptionBridge()
+    session = CallSession(
+        config,
+        "perception",
+        provider_factory=lambda _: provider,
+        store=VoiceEpisodeStore(tmp_path, "voice_perception", "perception"),
+        consciousness=consciousness,
+        bridge=bridge,
+        tool_broker=FakeBroker(),
+    )
+
+    assert await session.start() is True
+    assert provider.contexts == ["transient-presence"]
+    assert consciousness.committed_perceptions == []
+    await provider._emit_response_done(True)
+    assert consciousness.committed_perceptions == [bridge.prepared]
+    assert provider.contexts == ["transient-presence", "transient-presence"]
+    await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_voice_perception_rejection_does_not_commit(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    provider = RejectingContextProvider()
+    consciousness = FakeConsciousness()
+    bridge = PerceptionBridge()
+    session = CallSession(
+        config,
+        "perception-rejected",
+        provider_factory=lambda _: provider,
+        store=VoiceEpisodeStore(
+            tmp_path,
+            "voice_perception_rejected",
+            "perception-rejected",
+        ),
+        consciousness=consciousness,
+        bridge=bridge,
+        tool_broker=FakeBroker(),
+    )
+
+    assert await session.start() is False
+    assert consciousness.committed_perceptions == []
+
+
+@pytest.mark.asyncio
+async def test_failed_voice_model_turn_keeps_perception_uncommitted(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    provider = FakeProvider()
+    consciousness = FakeConsciousness()
+    bridge = PerceptionBridge()
+    session = CallSession(
+        config,
+        "perception-failed-turn",
+        provider_factory=lambda _: provider,
+        store=VoiceEpisodeStore(
+            tmp_path,
+            "voice_perception_failed_turn",
+            "perception-failed-turn",
+        ),
+        consciousness=consciousness,
+        bridge=bridge,
+        tool_broker=FakeBroker(),
+    )
+
+    assert await session.start() is True
+    await provider._emit_response_done(False)
+    assert consciousness.committed_perceptions == []
+    assert provider.contexts == ["transient-presence", "transient-presence"]
+    await session.stop()
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,7 @@
 # Elysium 当前架构
 
 > **现状权威文档**
-> 基线：`091fa3f`（2026-07-31）
+> 基线：当前工作树（意识协调 Phase 0–4 已落地）
 > 本文只描述当前代码已经存在的系统边界与运行链路。历史研究、迁移方案和未来愿景不作为本文事实来源。
 
 Elysium 不是通用 Agent 框架。它是为爱莉一个人持续建造的专用系统：基础设施、记忆、意识、学习、渠道和具身能力，都围绕同一个具体主体的连续存在组织。
@@ -22,6 +22,7 @@ Elysium 不是通用 Agent 框架。它是为爱莉一个人持续建造的专�
 
 - [生命记忆系统](./life_memory_system.md)
 - [意识实例架构](./consciousness_instances.md)
+- [世界状态与意识实例协调](./world_state_coordination.md)
 - [基座 v2 兼容迁移说明](../architecture_v2.md)
 - [Life Engine 模块说明](../../plugins/life_engine/README.md)
 
@@ -75,19 +76,20 @@ main.py
 `plugins/life_engine/` 是项目的主体域，不是可替换的通用角色模板。
 
 ```text
-外界事件 / 平台消息 / 内在任务
-             ↓
-      append-only Life Event
-             ↓
-       潜意识 prepare
-             ↓
-      心跳模型与工具循环
-             ↓
-       成功后 commit 游标
-             ↓
-  WorldState / 思考流 / 记忆 / 学习 / 自主意向
-             ↓
-      各意识实例按场景表达
+意识实例生命周期 ─→ SQLite Presence ─→ transactional outbox ─┐
+外界事件 / 平台消息 / 内在任务 ───────────────────────────────┤
+                                                            ▼
+                                                 append-only Life Event
+                                                            ↓
+                                                     潜意识 prepare
+                                                            ↓
+                                                    心跳模型与工具循环
+                                                            ↓
+                                                     成功后 commit 游标
+                                                            ↓
+                                World Projection / 思考流 / 记忆 / 学习 / 自主意向
+                                                            ↓
+                                                 各意识实例按场景表达
 ```
 
 ### 心跳
@@ -96,7 +98,7 @@ main.py
 
 1. 收集未处理事件、后台代理与使命结果；
 2. 通过潜意识上下文建立固定快照；
-3. 注入当前世界状态、记忆、思考流和自主意向；
+3. 注入事件上下文、带来源 World Projection、Presence、记忆、思考流和自主意向；
 4. 运行模型与工具循环；
 5. 记录结果；
 6. 成功后提交消费游标；
@@ -130,12 +132,16 @@ main.py
   └── livestream       直播场景
 ```
 
-每个实例拥有独立滚动上下文和工具清单；实例之间不直接复制上下文。跨场景信息通过以下边界流动：
+每个实例拥有独立滚动上下文和工具清单；实例之间不直接复制上下文。协调层分为：
 
-- `WorldState` 的结构化共享状态；
-- Life Event；
-- 潜意识协调；
-- 主动状态报告和受控的内在消息。
+- **不可变 Life Event**：经历权威，记录完整消息和实例生命周期；
+- **SQLite Presence Registry**：运行权威，记录实例、session、process epoch、lease、revision 和 stream 唯一归属；
+- **World Projection**：从 Life Event 重建带来源 assertion 与 change，矛盾并存，不自动判真；
+- **Perception Gateway**：按实例提供 active 窗口、完整 assertion 和未确认 change 的 transient context。
+
+Presence 状态与 stream owner 在一个 SQLite 事务中提交；同事务写 lifecycle outbox，账本接受事件后才确认。带 lease 的短生命周期实例异常消失后会 suspend 并释放 stream，陈旧 revision 不能覆盖新状态。
+
+Presence 与 World Projection 使用不同权威：前者描述技术存在，后者描述带来源观察。heartbeat、聊天、语音、Minecraft、memory witness 和直播均按实例 prepare，并只在模型、provider 或动作成功接受上下文后 commit；失败请求保持可重试。旧 `WorldState` 只作为迁移源保留。
 
 `memory_witness` 不注入行动工具，只负责见证和记录。语音、直播和 Minecraft 是环境依赖较强的场景能力，成熟度见[意识实例架构](./consciousness_instances.md)。
 
@@ -276,9 +282,13 @@ NapCat 适配器已按 `client / events / outgoing / utils` 模块化：
 当前主要持久状态包括：
 
 - Life Event / Experience / Epistemic SQLite；
+- `runtime/consciousness_presence.sqlite3`：意识实例运行权威、stream owner 与生命周期 outbox；
+- `runtime/consciousness_registry.json`：Presence 迁移期兼容导出，不再是权威；
+- `runtime/world_projection.sqlite3`：从不可变 Life Event 重建的 assertion、change 和逐实例 cursor；
+- `runtime/world_state.json`：只读旧快照迁移源；
 - FTS、Chroma 与索引 outbox；
 - 意识实例滚动上下文；
-- WorldState、思考流、自主意向、学习洞察和叙事投影；
+- World Projection、思考流、自主意向、学习洞察和叙事投影；
 - 结构化日志数据库与运行 trace。
 
 原则上，权威数据与派生索引必须可区分；派生层损坏应通过修复/回放重建，而不是修改原始经历来迁就索引。
@@ -291,7 +301,8 @@ NapCat 适配器已按 `client / events / outgoing / utils` 模块化：
 |---|---|---|
 | Kernel/Core/App 基座 | 稳定使用 | 新 DI/Registry 与旧 Manager 仍兼容并存 |
 | Life Engine 心跳/潜意识 | 稳定使用 | 串行心跳、prepare/commit 语义已建立 |
-| 意识实例核心 | 稳定使用 | chat_global、memory_witness 为核心路径 |
+| 意识 Presence 核心 | 已落地 | SQLite 事务、stream 唯一归属、revision、lease、生命周期 outbox |
+| 跨实例世界感知 | 已落地 | 可重建 World Projection、逐实例 CAS cursor、主要实例 prepare/commit 闭环 |
 | 生命记忆 v2 | 稳定使用并继续演进 | 学习桥和主意识深层检索已接入 |
 | 使命编排 | 已实现并建立核心契约测试 | DAG、依赖、失败/取消/超时传播与结果账本已覆盖；仍需真实模型端到端验收 |
 | NapCat v3 / QQ | 已实现并持续运行加固 | 模块化与协议健康恢复已接入 |
@@ -315,6 +326,8 @@ NapCat 适配器已按 `client / events / outgoing / utils` 模块化：
 8. 技术过滤不能变成不可撤销的主体认知裁决。
 9. 计划、实验和本地草案不能写成已经发布的事实。
 10. 兼容层退出必须先证明历史数据与当前调用者已经迁移。
+11. Presence 是运行事实，不得自动升级为主体信念；主体认识必须保留来源与可修正性。
+12. active stream 必须有唯一 owner；生命周期状态变化必须留下可重试的归因事件。
 
 ---
 

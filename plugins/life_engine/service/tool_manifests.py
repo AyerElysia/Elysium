@@ -66,19 +66,19 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
     ],
 }
 
-# 默认清单：未定义的意识类型使用 chat 清单
-DEFAULT_MANIFEST_KIND = "chat"
-
-
 def get_tool_manifest(kind: str) -> list[str]:
     """Get the tool manifest for a consciousness instance kind.
 
-    Returns the chat manifest as fallback for unknown kinds.
+    Unknown kinds must declare their capabilities explicitly.  Silently
+    inheriting chat powers would blur an instance boundary.
     """
-    return CONSCIOUSNESS_TOOL_MANIFESTS.get(
-        kind,
-        CONSCIOUSNESS_TOOL_MANIFESTS[DEFAULT_MANIFEST_KIND],
-    )
+
+    normalized = str(kind or "").strip()
+    if normalized not in CONSCIOUSNESS_TOOL_MANIFESTS:
+        raise KeyError(
+            f"consciousness tool manifest is not declared: {normalized!r}"
+        )
+    return list(CONSCIOUSNESS_TOOL_MANIFESTS[normalized])
 
 
 def is_tool_in_manifest(tool_name: str, kind: str) -> bool:

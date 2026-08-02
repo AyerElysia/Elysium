@@ -25,6 +25,10 @@ logger = logging.getLogger(__name__)
 WORLD_STATE_SCHEMA_VERSION = 1
 
 
+class WorldStateMigrationError(RuntimeError):
+    """Raised when the preserved legacy snapshot cannot be imported safely."""
+
+
 # ---------------------------------------------------------------------------
 # Sub-structures
 # ---------------------------------------------------------------------------
@@ -82,7 +86,7 @@ class RelationshipState:
         if self.emotional_tone:
             parts.append(f"情感:{self.emotional_tone}")
         if self.key_facts:
-            parts.append("；".join(self.key_facts[:3]))
+            parts.append("；".join(self.key_facts))
         return "[关系] " + "，".join(parts)
 
 
@@ -376,13 +380,16 @@ class WorldState:
 
     @classmethod
     def load(cls, path: Path) -> "WorldState":
-        """Load from disk; returns empty state if file missing or corrupt."""
+        """Load the legacy snapshot, refusing a lossy reset when it is corrupt."""
+
+        if not path.exists():
+            return cls()
         try:
-            if path.exists():
-                return cls.from_json(path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            logger.warning(f"加载 world_state 失败，使用空状态: {exc}")
-        return cls()
+            return cls.from_json(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise WorldStateMigrationError(
+                "legacy world_state could not be imported; source was preserved"
+            ) from exc
 
     def save(self, path: Path) -> None:
         """Atomically persist to disk (write tmp + rename)."""
@@ -410,42 +417,31 @@ class WorldState:
         The output is structured as labeled lines that the consciousness can
         clearly identify as its own inner knowledge (not external messages).
         """
-        pf = perception_filter or PerceptionFilter.full()
+        # Legacy filters are retained only for transfer compatibility.  They
+        # must not enforce cognitive inclusion/exclusion in code.
+        del perception_filter
         lines: list[str] = []
 
         # 关系层
-        for entity_id, rel in self.relationships.items():
-            if pf.relationship_ids and entity_id not in pf.relationship_ids:
-                continue
+        for rel in self.relationships.values():
             lines.append(rel.render_line())
 
         # 身体/情绪层
-        if pf.include_body_state:
-            lines.extend(self.embodied_state.render_lines())
+        lines.extend(self.embodied_state.render_lines())
 
         # 话题层
         for thread in self.open_threads:
-            if thread.status != "open":
-                continue
-            if pf.thread_kinds and thread.kind not in pf.thread_kinds:
-                continue
-            if not pf.include_commitments and thread.kind in ("commitment", "promise"):
-                continue
             lines.append(thread.render_line())
 
         # 场景层
-        for scene_id, scene in self.active_scenes.items():
-            if pf.scene_ids and scene_id not in pf.scene_ids:
-                continue
+        for scene in self.active_scenes.values():
             lines.append(scene.render_line())
 
         if not lines:
             return ""
 
-        text = "\n".join(lines)
-        if len(text) > max_chars:
-            text = text[: max_chars - 1].rstrip() + "…"
-        return text
+        del max_chars
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Mutation helpers (used by heartbeat update logic)

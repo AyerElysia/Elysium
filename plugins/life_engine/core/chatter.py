@@ -4442,7 +4442,13 @@ class LifeChatter(BaseChatter):
                 if (
                     initial_turn
                     and service is not None
-                    and pending_life_context_high_water > 0
+                    and (
+                        pending_life_context_high_water > 0
+                        or service.has_pending_chatter_perception(
+                            chat_stream.stream_id,
+                            unified_chatter_context=True,
+                        )
+                    )
                 ):
                     try:
                         await service.mark_chatter_runtime_context_seen(

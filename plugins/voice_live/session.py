@@ -98,6 +98,8 @@ class CallSession:
         self._interruptions = 0
         self._created_monotonic = time.monotonic()
         self._failure_reason = ""
+        self._perception_refresh_lock = asyncio.Lock()
+        self._pending_voice_perception: Any | None = None
 
     @property
     def state(self) -> SessionState:
@@ -236,7 +238,10 @@ class CallSession:
             )
         except Exception as exc:
             failure = str(exc).strip() or type(exc).__name__
-            logger.exception(f"实时语音会话启动失败: {failure}")
+            logger.error(
+                f"实时语音会话启动失败: {failure}",
+                exc_info=True,
+            )
             provider = self._provider
             self._provider = None
             if provider is not None:
@@ -388,6 +393,7 @@ class CallSession:
         provider.on_interruption(self._on_interruption)
         provider.on_metrics(self._on_metrics)
         provider.on_tool_call(self._on_tool_call)
+        provider.on_response_done(self._on_response_done)
 
     async def _on_audio(self, event: AudioDelta) -> None:
         if self._voice_converter is not None:
@@ -416,10 +422,44 @@ class CallSession:
     async def _on_provider_state(self, state: ProviderState) -> None:
         if state is ProviderState.LISTENING:
             await self._queue_conversion_control("flush")
+            await self._refresh_voice_perception()
         await self._send_json_safe({"type": "state", "state": state.value})
         await self._store.append_async("provider.state", {"state": state.value})
         if self._consciousness.is_active:
             await self._consciousness.report_state(f"实时通话状态：{state.value}")
+
+    async def _refresh_voice_perception(self) -> None:
+        """Deliver current world context once per provider listening frontier."""
+
+        if not self._config.session.cross_scene_awareness:
+            return
+        provider = self._provider
+        builder = getattr(self._bridge, "build_llm_context_prefix", None)
+        if provider is None or not callable(builder):
+            return
+        async with self._perception_refresh_lock:
+            if self._pending_voice_perception is not None:
+                return
+            prefix, prepared = await asyncio.to_thread(builder)
+            if not prefix or prepared is None:
+                return
+            await provider.inject_context(prefix)
+            self._pending_voice_perception = prepared
+
+    async def _on_response_done(self, success: bool) -> None:
+        """Commit world delivery only after one completed realtime turn."""
+
+        async with self._perception_refresh_lock:
+            prepared = self._pending_voice_perception
+            self._pending_voice_perception = None
+            if success and prepared is not None:
+                commit = getattr(self._consciousness, "commit_perception", None)
+                if not callable(commit):
+                    raise RuntimeError(
+                        "voice consciousness cannot acknowledge world perception"
+                    )
+                await asyncio.to_thread(commit, prepared)
+        await self._refresh_voice_perception()
 
     async def _on_transcript(self, event: TranscriptEvent) -> None:
         await self._send_json_safe(

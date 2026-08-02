@@ -215,6 +215,7 @@ class PreparedHeartbeatContext:
     recent_history: list[LifeEngineEvent] = field(default_factory=list)
     summary_event: LifeEngineEvent | None = None
     has_inbound_messages: bool = False
+    world_perception: Any | None = None
 
     @property
     def summary(self) -> SubconsciousSummary:

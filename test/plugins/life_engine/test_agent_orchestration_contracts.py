@@ -525,6 +525,7 @@ class TestConsciousnessManifestContracts:
         assert "action-report_state" in manifest
         assert "tool-inner_query" in manifest
 
-    def test_unknown_kind_falls_back_to_chat_only_for_compatibility(self) -> None:
+    def test_unknown_kind_must_declare_manifest(self) -> None:
         assert "future_scene" not in CONSCIOUSNESS_TOOL_MANIFESTS
-        assert get_tool_manifest("future_scene") == get_tool_manifest("chat")
+        with pytest.raises(KeyError, match="not declared"):
+            get_tool_manifest("future_scene")

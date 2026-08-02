@@ -9,11 +9,13 @@ from typing import Any
 from .life_binding import (
     ConsciousnessInstance,
     PerceptionFilter,
-    SceneState,
     get_running_life_service,
     get_tool_manifest,
 )
 from .runtime_store import VoiceEpisodeStore
+
+
+_PRESENCE_LEASE_SECONDS = 180
 
 
 def _now() -> str:
@@ -73,6 +75,8 @@ class VoiceLiveConsciousnessManager:
                 last_active_at=_now(),
                 perception_filter=build_voice_live_perception_filter(),
                 metadata={"episode_id": self.episode_id, "provider": provider_name},
+                session_id=self.episode_id,
+                lease_duration_seconds=_PRESENCE_LEASE_SECONDS,
             )
             self._instance = instance
             await self._store.append_async("consciousness.activated", instance.to_dict())
@@ -101,6 +105,8 @@ class VoiceLiveConsciousnessManager:
                 last_active_at=now,
                 perception_filter=build_voice_live_perception_filter(),
                 metadata=metadata,
+                session_id=self.episode_id,
+                lease_duration_seconds=_PRESENCE_LEASE_SECONDS,
             )
             registry.register(instance)
         else:
@@ -108,24 +114,32 @@ class VoiceLiveConsciousnessManager:
             instance.stream_ids = [self.stream_id]
             instance.perception_filter = build_voice_live_perception_filter()
             instance.metadata.update(metadata)
+            instance.session_id = self.episode_id
+            instance.lease_duration_seconds = _PRESENCE_LEASE_SECONDS
             if instance.is_suspended:
                 registry.resume(self.instance_id, timestamp=now)
             else:
-                registry.touch(self.instance_id, timestamp=now)
+                registry.touch(
+                    self.instance_id,
+                    timestamp=now,
+                    reason="voice_session_activated",
+                )
 
-        service.world_state.upsert_scene(
-            SceneState(
-                scene_id=self.stream_id,
-                kind="voice_live",
-                display_name=self._config.session.stream_name,
-                status_summary="实时通话已连接",
-                last_active_at=now,
-                consciousness_instance_id=self.instance_id,
-                context_tags=[provider_name, self.episode_id],
-            )
-        )
         await asyncio.to_thread(service.save_consciousness_registry)
-        await asyncio.to_thread(service.save_world_state)
+        await service.report_world_observation(
+            "实时通话已连接",
+            source_instance_id=self.instance_id,
+            subject=self.stream_id,
+            predicate="session_state",
+            domain="voice_live",
+            stream_id=self.stream_id,
+            observed_at=now,
+            value={
+                "summary": "实时通话已连接",
+                "provider": provider_name,
+                "episode_id": self.episode_id,
+            },
+        )
         self._instance = instance
         await self._store.append_async("consciousness.activated", instance.to_dict())
         await self._store.checkpoint_async("consciousness_active", provider=provider_name)
@@ -137,50 +151,58 @@ class VoiceLiveConsciousnessManager:
         service = self._life_service()
         now = _now()
         if service is not None:
-            existing = service.world_state.active_scenes.get(self.stream_id)
-            service.world_state.upsert_scene(
-                SceneState(
-                    scene_id=self.stream_id,
-                    kind="voice_live",
-                    display_name=self._config.session.stream_name,
-                    status_summary=summary,
-                    last_active_at=now,
-                    consciousness_instance_id=self.instance_id,
-                    context_tags=list(existing.context_tags) if existing else [self.episode_id],
-                )
+            service.consciousness_registry.touch(
+                self.instance_id,
+                timestamp=now,
+                reason="voice_state_reported",
             )
-            service.consciousness_registry.touch(self.instance_id, timestamp=now)
             await asyncio.to_thread(service.save_consciousness_registry)
-            await asyncio.to_thread(service.save_world_state)
+            await service.report_world_observation(
+                summary,
+                source_instance_id=self.instance_id,
+                subject=self.stream_id,
+                predicate="session_state",
+                domain="voice_live",
+                stream_id=self.stream_id,
+                observed_at=now,
+            )
         await self._store.append_async("consciousness.state", {"summary": summary})
 
     async def suspend(self, *, reason: str = "normal") -> None:
         service = self._life_service()
         now = _now()
         if service is not None:
-            service.consciousness_registry.suspend(self.instance_id, timestamp=now)
-            existing = service.world_state.active_scenes.get(self.stream_id)
-            service.world_state.upsert_scene(
-                SceneState(
-                    scene_id=self.stream_id,
-                    kind="voice_live",
-                    display_name=self._config.session.stream_name,
-                    status_summary=f"通话已结束：{reason}",
-                    last_active_at=now,
-                    consciousness_instance_id=self.instance_id,
-                    context_tags=list(existing.context_tags) if existing else [self.episode_id],
-                )
+            await service.report_world_observation(
+                f"通话已结束：{reason}",
+                source_instance_id=self.instance_id,
+                subject=self.stream_id,
+                predicate="session_state",
+                domain="voice_live",
+                stream_id=self.stream_id,
+                observed_at=now,
+            )
+            service.consciousness_registry.suspend(
+                self.instance_id,
+                timestamp=now,
+                reason=reason,
             )
             await asyncio.to_thread(service.save_consciousness_registry)
-            await asyncio.to_thread(service.save_world_state)
         await self._store.append_async("consciousness.suspended", {"reason": reason})
         await self._store.checkpoint_async("suspended", reason=reason)
         self._instance = None
 
-    def render_world_state(self) -> str:
+    def prepare_perception(self) -> Any | None:
+        """Prepare this voice instance's transient cross-scene perception."""
+
         service = self._life_service()
         if service is None:
-            return ""
-        # Use the complete JSON representation.  Do not impose a local character
-        # budget or a hand-picked category filter on cognition.
-        return service.world_state.to_json()
+            return None
+        return service.prepare_perception(self.instance_id)
+
+    def commit_perception(self, prepared: Any) -> None:
+        """Acknowledge perception only after the provider accepted it."""
+
+        service = self._life_service()
+        if service is None:
+            return
+        service.commit_perception(prepared)

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from plugins.life_engine.service.consciousness import ConsciousnessRegistry
-from plugins.life_engine.service.world_state import WorldState
 from plugins.voice_live.config import VoiceLiveConfig
 from plugins.voice_live.consciousness import VoiceLiveConsciousnessManager
 from plugins.voice_live.runtime_store import VoiceEpisodeStore
@@ -14,15 +14,19 @@ from plugins.voice_live.runtime_store import VoiceEpisodeStore
 class FakeLifeService:
     def __init__(self) -> None:
         self.consciousness_registry = ConsciousnessRegistry()
-        self.world_state = WorldState()
         self.registry_saves = 0
-        self.world_saves = 0
+        self.observations: list[dict[str, Any]] = []
 
     def save_consciousness_registry(self) -> None:
         self.registry_saves += 1
 
-    def save_world_state(self) -> None:
-        self.world_saves += 1
+    async def report_world_observation(
+        self,
+        report: str,
+        **kwargs: Any,
+    ) -> dict[str, str]:
+        self.observations.append({"report": report, **kwargs})
+        return {"assertion_id": f"assertion-{len(self.observations)}"}
 
 
 def make_config(tmp_path: Path) -> VoiceLiveConfig:
@@ -45,13 +49,13 @@ async def test_lifecycle_is_idempotent_resumable_and_persisted(tmp_path: Path) -
     second = await manager.activate("minicpm_omni")
     assert first is second
     assert service.consciousness_registry.get("voice_live_episode") is first
-    scene = service.world_state.active_scenes["voice_live_episode"]
-    assert scene.consciousness_instance_id == first.instance_id
+    assert service.observations[-1]["subject"] == "voice_live_episode"
+    assert service.observations[-1]["source_instance_id"] == first.instance_id
     assert first.metadata["tool_manifest"]
 
     await manager.suspend(reason="abnormal_exit")
     assert first.status == "suspended"
-    assert "abnormal_exit" in service.world_state.active_scenes[manager.stream_id].status_summary
+    assert "abnormal_exit" in service.observations[-1]["report"]
 
     recovered = VoiceLiveConsciousnessManager(
         config, "episode", store, service=service
@@ -60,7 +64,7 @@ async def test_lifecycle_is_idempotent_resumable_and_persisted(tmp_path: Path) -
     assert resumed is first
     assert resumed.status == "active"
     assert service.registry_saves >= 4
-    assert service.world_saves >= 4
+    assert len(service.observations) >= 4
 
 
 @pytest.mark.asyncio

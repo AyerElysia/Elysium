@@ -128,19 +128,40 @@ class LivestreamConfig(BaseConfig):
             tag="ai",
             order=4,
         )
+        llm_base_url: str = Field(
+            default="http://127.0.0.1:3000/v1",
+            description="OpenAI 兼容 LLM 服务地址；不得在 URL 中携带凭据",
+            label="LLM 服务地址",
+            tag="ai",
+            order=5,
+        )
+        llm_model: str = Field(
+            default="mimo-v2.5",
+            description="直播表达使用的模型标识",
+            label="LLM 模型",
+            tag="ai",
+            order=6,
+        )
+        llm_api_key_env: str = Field(
+            default="LIVESTREAM_LLM_API_KEY",
+            description="LLM API key 所在环境变量名；不得写入 key 本身",
+            label="LLM 密钥环境变量",
+            tag="ai",
+            order=7,
+        )
         min_danmaku_length: int = Field(
             default=2,
             description="弹幕最小有效长度（短于此值忽略）",
             label="最小弹幕长度",
             tag="ai",
-            order=5,
+            order=8,
         )
         dedup_window_seconds: float = Field(
             default=10.0,
             description="重复弹幕去重窗口（秒）",
             label="去重窗口",
             tag="ai",
-            order=6,
+            order=9,
         )
 
     # ------------------------------------------------------------------

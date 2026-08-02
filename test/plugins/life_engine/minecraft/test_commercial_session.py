@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from plugins.life_engine.minecraft.embodiment_contracts import (
@@ -17,7 +18,6 @@ from plugins.life_engine.minecraft.embodiment_contracts import (
 from plugins.life_engine.minecraft.launcher import LaunchResult, MCConfig
 from plugins.life_engine.minecraft.session import MinecraftSession
 from plugins.life_engine.service.consciousness import ConsciousnessRegistry
-from plugins.life_engine.service.world_state import WorldState
 
 
 class _Launcher:
@@ -92,6 +92,9 @@ class _Bridge:
 class _Planner:
     """Issue one operation and then make an evidence-backed conclusion."""
 
+    def __init__(self) -> None:
+        self.contexts: list[dict[str, Any]] = []
+
     async def decide(
         self,
         intent: EmbodiedIntent,
@@ -99,6 +102,8 @@ class _Planner:
         receipts: tuple[ActionReceipt, ...],
     ) -> PlannerTurn:
         """Act once, then cite both receipt and post-action observation."""
+
+        self.contexts.append(dict(intent.context))
 
         if not receipts:
             return PlannerTurn(
@@ -123,18 +128,37 @@ class _Planner:
 
 async def _started_session(
     tmp_path: Path,
-) -> tuple[MinecraftSession, _Bridge, ConsciousnessRegistry, WorldState]:
+) -> tuple[MinecraftSession, _Bridge, ConsciousnessRegistry, list[dict[str, Any]]]:
     """Create and start a fully integrated in-memory session."""
 
     registry = ConsciousnessRegistry()
-    world = WorldState()
+    observations: list[dict[str, Any]] = []
+
+    async def report_world_observation(
+        report: str,
+        **kwargs: Any,
+    ) -> dict[str, str]:
+        observations.append({"report": report, **kwargs})
+        return {"assertion_id": f"assertion-{len(observations)}"}
+
+    def prepare_perception(instance_id: str) -> Any:
+        return SimpleNamespace(
+            instance_id=instance_id,
+            content="shared-presence",
+        )
+
+    def commit_perception(prepared: Any) -> None:
+        observations.append({"perception_commit": prepared})
+
     bridge = _Bridge()
     config = MCConfig(mc_home=tmp_path, bridge_ready_timeout_seconds=1)
     session = MinecraftSession(
         workspace=tmp_path,
         mc_config=config,
         consciousness_registry=registry,
-        world_state=world,
+        prepare_perception=prepare_perception,
+        commit_perception=commit_perception,
+        report_world_observation=report_world_observation,
     )
     session._launcher = _Launcher()
 
@@ -146,7 +170,7 @@ async def _started_session(
     session._wait_for_bridge = wait_for_bridge
     result = await session.start(goal="walk together", body_name="agent")
     assert result["success"] is True
-    return session, bridge, registry, world
+    return session, bridge, registry, observations
 
 
 async def test_session_registers_and_terminates_independent_consciousness(
@@ -154,20 +178,21 @@ async def test_session_registers_and_terminates_independent_consciousness(
 ) -> None:
     """Game start and stop own a distinct registry and WorldState lifecycle."""
 
-    session, bridge, registry, world = await _started_session(tmp_path)
+    session, bridge, registry, observations = await _started_session(tmp_path)
     instance_id = session.state.consciousness_instance_id
     stream_id = session.state.stream_id
 
     instance = registry.get(instance_id)
     assert instance is not None and instance.is_active
     assert instance.stream_ids == [stream_id]
-    assert world.active_scenes[stream_id].consciousness_instance_id == instance_id
+    assert observations[-1]["subject"] == stream_id
+    assert observations[-1]["source_instance_id"] == instance_id
 
     result = await session.stop()
 
     assert result["success"] is True
     assert registry.get(instance_id).status == "terminated"
-    assert world.active_scenes[stream_id].status_summary == "session ended"
+    assert observations[-1]["report"] == "session ended"
     assert bridge.closed is True
 
 
@@ -175,7 +200,8 @@ async def test_session_returns_full_intention_evidence(tmp_path: Path) -> None:
     """The public session API returns receipts and observations, not guessed success."""
 
     session, _, _, _ = await _started_session(tmp_path)
-    session._planner = _Planner()
+    planner = _Planner()
+    session._planner = planner
 
     result = await session.do_intent("walk to x=3")
 
@@ -184,3 +210,4 @@ async def test_session_returns_full_intention_evidence(tmp_path: Path) -> None:
     assert len(result["receipts"]) == 1
     assert len(result["observations"]) == 2
     assert session.state.conclusions == [result["conclusion"]]
+    assert planner.contexts[0]["transient_world_perception"] == "shared-presence"

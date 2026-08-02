@@ -1,118 +1,164 @@
-"""直播意识实例管理器。
-
-将直播注册为 ConsciousnessInstance（kind="livestream"），
-通过 WorldState 报告直播状态，实现跨场景感知。
-
-生命周期：start → active → suspend
-"""
+"""Lifecycle and shared-perception binding for livestream consciousness."""
 
 from __future__ import annotations
 
-import logging
-from datetime import datetime, timezone
+import asyncio
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from ..config import LivestreamConfig
+    from .config import LivestreamConfig
 
-logger = logging.getLogger(__name__)
+
+def _now_iso() -> str:
+    """Return one timezone-aware lifecycle timestamp."""
+
+    return datetime.now(UTC).astimezone().isoformat()
 
 
 class LivestreamConsciousnessManager:
-    """直播意识实例管理器。
+    """Bind a running livestream to one real consciousness instance."""
 
-    参照 voice_live 的 VoiceLiveConsciousnessManager 模式。
-    """
+    def __init__(
+        self,
+        config: LivestreamConfig,
+        *,
+        service: Any | None = None,
+    ) -> None:
+        """Create an inactive manager without inventing a separate identity."""
 
-    def __init__(self, config: "LivestreamConfig") -> None:
         self._config = config
-        self._instance: Any = None
-        self._active = False
-        self._registry: Any = None
-        self._world_state: Any = None
+        self._service = service
+        self._instance: Any | None = None
 
     @property
-    def is_active(self) -> bool:
-        return self._active
+    def stream_id(self) -> str:
+        """Return the unified stream identity for this configured room."""
+
+        return f"livestream_{self._config.platform.room_id}"
 
     @property
     def instance_id(self) -> str:
-        return "livestream_001"
+        """Return the stable consciousness identity for this room runtime."""
 
-    async def activate(self) -> bool:
-        """注册并激活直播意识实例。"""
-        try:
-            from plugins.life_engine.service.consciousness import (
-                ConsciousnessInstance,
-                ConsciousnessRegistry,
+        return self.stream_id
+
+    @property
+    def is_active(self) -> bool:
+        """Return whether the bound registry instance is active."""
+
+        return bool(self._instance and self._instance.is_active)
+
+    def _life_service(self) -> Any:
+        """Resolve the supported LifeEngine service integration point."""
+
+        if self._service is not None:
+            return self._service
+        from plugins.life_engine.service.core import LifeEngineService
+
+        service = LifeEngineService.get_instance()
+        if service is None:
+            raise RuntimeError(
+                "LifeEngine is not running; livestream consciousness cannot start"
             )
-            from plugins.life_engine.service.world_state import PerceptionFilter
+        return service
 
-            # 获取全局 registry
-            self._registry = ConsciousnessRegistry.get_instance()
+    async def activate(self) -> Any:
+        """Register or resume this room and append its opening observation."""
 
-            now = datetime.now(timezone.utc).isoformat()
-            room_id = self._config.platform.room_id
+        from plugins.life_engine.service.consciousness import ConsciousnessInstance
+        from plugins.life_engine.service.world_state import PerceptionFilter
 
-            self._instance = ConsciousnessInstance(
+        service = self._life_service()
+        registry = service.consciousness_registry
+        existing = registry.get(self.instance_id)
+        now = _now_iso()
+        if existing is not None and existing.kind != "livestream":
+            raise RuntimeError(
+                f"consciousness instance ID conflict: {self.instance_id}"
+            )
+        if existing is None or existing.status == "terminated":
+            instance = ConsciousnessInstance(
                 instance_id=self.instance_id,
                 kind="livestream",
                 display_name="直播意识",
-                stream_ids=[f"livestream_{room_id}"],
+                stream_ids=[self.stream_id],
                 status="active",
                 created_at=now,
                 last_active_at=now,
-                perception_filter=PerceptionFilter(
-                    relationship_ids=[],
-                    scene_ids=[],
-                    thread_kinds=["topic"],
-                    include_body_state=True,
-                    include_commitments=False,
-                ),
+                perception_filter=PerceptionFilter.full(),
                 metadata={
                     "platform": self._config.platform.platform_type,
-                    "room_id": room_id,
+                    "room_id": self._config.platform.room_id,
                 },
+                session_id=f"livestream:{self._config.platform.room_id}",
+                lease_duration_seconds=300,
             )
-
-            # 如果旧实例存在且已挂起，先终止
-            existing = self._registry.get(self.instance_id)
-            if existing and existing.status == "suspended":
-                self._registry.terminate(self.instance_id)
-
-            self._registry.register(self._instance)
-            self._active = True
-            logger.info(f"直播意识已激活: {self.instance_id} (room={room_id})")
-            return True
-
-        except Exception as exc:
-            logger.error(f"直播意识激活失败: {exc}", exc_info=True)
-            return False
-
-    async def suspend(self) -> None:
-        """挂起直播意识实例。"""
-        if not self._active or not self._registry:
-            return
-        now = datetime.now(timezone.utc).isoformat()
-        self._registry.suspend(self.instance_id, timestamp=now)
-        self._active = False
-        logger.info(f"直播意识已挂起: {self.instance_id}")
-
-    async def report_state(self, state_text: str) -> None:
-        """向 WorldState 报告直播状态。
-
-        Args:
-            state_text: 状态描述，如 "直播中，观众200人，话题：游戏"
-        """
-        try:
-            from plugins.life_engine.service.world_state import WorldState
-
-            ws = WorldState.get_instance()
-            if ws:
-                ws.update_scene_status(
-                    scene_id=f"livestream_{self._config.platform.room_id}",
-                    kind="livestream",
-                    status_text=state_text,
+            registry.register(instance)
+        else:
+            instance = existing
+            if instance.is_suspended:
+                registry.resume(
+                    self.instance_id,
+                    timestamp=now,
+                    reason="livestream_started",
                 )
-        except Exception as exc:
-            logger.debug(f"WorldState 报告失败: {exc}")
+            else:
+                registry.touch(
+                    self.instance_id,
+                    timestamp=now,
+                    reason="livestream_started",
+                )
+        await asyncio.to_thread(service.save_consciousness_registry)
+        self._instance = instance
+        await self.report_state("直播已开始")
+        return instance
+
+    async def suspend(self, *, reason: str = "livestream_stopped") -> None:
+        """Append the closing observation and release stream ownership."""
+
+        if not self.is_active:
+            return
+        service = self._life_service()
+        await self.report_state(f"直播已结束：{reason}")
+        service.consciousness_registry.suspend(
+            self.instance_id,
+            timestamp=_now_iso(),
+            reason=reason,
+        )
+        await asyncio.to_thread(service.save_consciousness_registry)
+        self._instance = None
+
+    async def report_state(self, state_text: str) -> dict[str, Any]:
+        """Append one livestream observation with trusted instance attribution."""
+
+        text = str(state_text or "").strip()
+        if not text:
+            raise ValueError("livestream state observation must not be empty")
+        service = self._life_service()
+        now = _now_iso()
+        service.consciousness_registry.touch(
+            self.instance_id,
+            timestamp=now,
+            reason="livestream_state_reported",
+        )
+        await asyncio.to_thread(service.save_consciousness_registry)
+        return await service.report_world_observation(
+            text,
+            source_instance_id=self.instance_id,
+            subject=self.stream_id,
+            predicate="session_state",
+            domain="livestream",
+            stream_id=self.stream_id,
+            observed_at=now,
+        )
+
+    def prepare_perception(self) -> Any:
+        """Prepare this room's retryable transient world delivery."""
+
+        return self._life_service().prepare_perception(self.instance_id)
+
+    def commit_perception(self, prepared: Any) -> None:
+        """Acknowledge world delivery after a successful model response."""
+
+        self._life_service().commit_perception(prepared)

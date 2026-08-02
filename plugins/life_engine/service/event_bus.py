@@ -441,6 +441,16 @@ class _LegacyJSONLEventStore:
     ) -> list[LifeEvent]:
         return await asyncio.to_thread(self._read_since_sync, sequence, limit)
 
+    def read_since_sync(
+        self,
+        sequence: int,
+        *,
+        limit: int | None = None,
+    ) -> list[LifeEvent]:
+        """Synchronously read events after one durable ingest position."""
+
+        return self._read_since_sync(sequence, limit)
+
     @staticmethod
     def _decode_lines(lines: list[str]) -> list[LifeEvent]:
         events: list[LifeEvent] = []
@@ -862,6 +872,16 @@ class RawEventStore(_LegacyJSONLEventStore):
         limit: int | None = None,
     ) -> list[LifeEvent]:
         return await asyncio.to_thread(self._read_since_sync, sequence, limit)
+
+    def read_since_sync(
+        self,
+        sequence: int,
+        *,
+        limit: int | None = None,
+    ) -> list[LifeEvent]:
+        """Synchronously read events after one durable ingest position."""
+
+        return self._read_since_sync(sequence, limit)
 
     def _get_consumer_offset_sync(self, consumer_id: str) -> int:
         self._ensure_ready_sync()

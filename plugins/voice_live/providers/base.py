@@ -52,6 +52,7 @@ ErrorCallback = Callable[[str], Awaitable[None]]
 InterruptionCallback = Callable[[InterruptionEvent], Awaitable[None]]
 MetricsCallback = Callable[[ProviderMetrics], Awaitable[None]]
 ToolCallCallback = Callable[[ToolCallEvent], Awaitable[None]]
+ResponseDoneCallback = Callable[[bool], Awaitable[None]]
 
 
 class BaseRealtimeProvider(ABC):
@@ -71,6 +72,7 @@ class BaseRealtimeProvider(ABC):
         self._interruption_callbacks: list[InterruptionCallback] = []
         self._metrics_callbacks: list[MetricsCallback] = []
         self._tool_callbacks: list[ToolCallCallback] = []
+        self._response_done_callbacks: list[ResponseDoneCallback] = []
 
     @property
     def state(self) -> ProviderState:
@@ -100,6 +102,11 @@ class BaseRealtimeProvider(ABC):
 
     def on_tool_call(self, callback: ToolCallCallback) -> None:
         self._tool_callbacks.append(callback)
+
+    def on_response_done(self, callback: ResponseDoneCallback) -> None:
+        """Register a model-turn completion callback."""
+
+        self._response_done_callbacks.append(callback)
 
     async def _emit_audio(self, event: AudioDelta) -> None:
         for callback in self._audio_callbacks:
@@ -133,6 +140,12 @@ class BaseRealtimeProvider(ABC):
         for callback in self._tool_callbacks:
             await callback(event)
 
+    async def _emit_response_done(self, success: bool) -> None:
+        """Report whether one model turn completed successfully."""
+
+        for callback in self._response_done_callbacks:
+            await callback(bool(success))
+
     @abstractmethod
     async def connect(self, session_config: dict[str, Any]) -> None: ...
 
@@ -147,6 +160,13 @@ class BaseRealtimeProvider(ABC):
 
     async def send_text(self, text: str) -> None:
         raise NotImplementedError(f"{self.provider_name} does not support text injection")
+
+    async def inject_context(self, text: str) -> None:
+        """Inject transient turn context without requesting an extra response."""
+
+        raise NotImplementedError(
+            f"{self.provider_name} does not support transient context injection"
+        )
 
     async def submit_tool_result(self, call_id: str, result: Any) -> None:
         raise NotImplementedError(f"{self.provider_name} does not support tool results")

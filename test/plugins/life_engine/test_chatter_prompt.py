@@ -2236,7 +2236,9 @@ async def test_life_chatter_runtime_context_cursor_avoids_repeat_injection(tmp_p
     assert "OLD_LIFE_EVENT" not in second_text
     assert "NEW_LIFE_EVENT" in second_text
     assert second_high_water == 2
-    assert third_text == ""
+    assert "OLD_LIFE_EVENT" not in third_text
+    assert "NEW_LIFE_EVENT" not in third_text
+    assert "chat_global" in third_text
     assert third_high_water == 2
 
 
@@ -2290,7 +2292,9 @@ async def test_life_chatter_unified_runtime_context_uses_global_cursor(tmp_path)
     assert "B_CURRENT_STREAM_TEXT" in first_text
     assert first_high_water == 2
     assert service._state.chatter_context_cursors[LIFE_CHATTER_GLOBAL_CURSOR_KEY] == 2
-    assert second_text == ""
+    assert "A_STREAM_EVENT" not in second_text
+    assert "B_CURRENT_STREAM_TEXT" not in second_text
+    assert "chat_global" in second_text
     assert second_high_water == 2
 
 

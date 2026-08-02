@@ -79,6 +79,7 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
         self._response_active = False
         self._active_response_id = ""
         self._active_item_id = ""
+        self._transient_context_item_ids: list[str] = []
         self._tool_name_map: dict[str, str] = {}
 
     async def connect(self, session_config: dict[str, Any]) -> None:
@@ -221,17 +222,35 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
         )
 
     async def send_text(self, text: str) -> None:
+        await self.inject_context(text)
+        await self._send({"type": "response.create"})
+
+    async def inject_context(self, text: str) -> None:
+        """Append one turn context item without independently triggering speech."""
+
+        item_id = f"voice_context_{uuid.uuid4().hex}"
         await self._send(
             {
                 "type": "conversation.item.create",
                 "item": {
+                    "id": item_id,
                     "type": "message",
                     "role": "user",
                     "content": [{"type": "input_text", "text": text}],
                 },
             }
         )
-        await self._send({"type": "response.create"})
+        self._transient_context_item_ids.append(item_id)
+
+    async def _delete_transient_context_items(self) -> None:
+        """Remove delivered world context after the current Qwen turn."""
+
+        item_ids = self._transient_context_item_ids
+        self._transient_context_item_ids = []
+        for item_id in item_ids:
+            await self._send(
+                {"type": "conversation.item.delete", "item_id": item_id}
+            )
 
     async def submit_tool_result(self, call_id: str, result: Any) -> None:
         await self._send(
@@ -362,6 +381,10 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
             response = event.get("response") or {}
             if response.get("usage"):
                 await self._emit_metrics(dict(response["usage"]))
+            status = str(response.get("status") or "completed").lower()
+            success = status not in {"cancelled", "failed", "incomplete", "error"}
+            await self._delete_transient_context_items()
+            await self._emit_response_done(success)
             self._response_active = False
             self._active_response_id = ""
             self._active_item_id = ""

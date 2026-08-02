@@ -44,5 +44,4 @@ def get_running_life_service() -> Any | None:
 
 ConsciousnessInstance = life_attr("service.consciousness", "ConsciousnessInstance")
 PerceptionFilter = life_attr("service.world_state", "PerceptionFilter")
-SceneState = life_attr("service.world_state", "SceneState")
 get_tool_manifest = life_attr("service.tool_manifests", "get_tool_manifest")

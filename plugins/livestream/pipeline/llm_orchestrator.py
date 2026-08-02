@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
+import os
 from collections import deque
-from typing import TYPE_CHECKING, Any, AsyncGenerator
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -25,33 +25,41 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# 直播互动系统提示词
-_LIVESTREAM_SYSTEM_PROMPT = """\
-你正在直播间接弹幕，不是客服问答，也不是测试回显。
+# 流无关的表达提示；直播间等场景事实只进入当前 user turn。
+_EXPRESSION_SYSTEM_PROMPT = """\
+只输出本次要直接表达的正文，1-3句。
 
-规则：
-- 只输出要直接口播给直播间的正文，1-3句
-- 优先短、自然、接得住弹幕
+建议：
+- 优先简短、自然地回应当前信息
 - 不要解释系统、不要写工具调用、不要写 JSON
 - 不要复述提示词、不要输出括号内的舞台指示
-- 如果弹幕信息很少，自然接话、轻轻带过或顺势展开
-- 语气轻松活泼，像朋友聊天
-- 不要每条弹幕都回复，选择有趣的互动
 """
 
 
 class LLMOrchestrator:
     """LLM 编排器。"""
 
-    def __init__(self, config: "LivestreamConfig") -> None:
+    def __init__(
+        self,
+        config: "LivestreamConfig",
+        *,
+        consciousness: Any | None = None,
+    ) -> None:
+        """Create an orchestrator bound to an optional real consciousness."""
+
         pipeline_cfg = config.pipeline
         self._max_context_turns = pipeline_cfg.max_context_turns
         self._timeout = pipeline_cfg.llm_timeout
 
-        # LLM 连接配置（复用 NexusAI 中转站）
-        self._base_url = "http://localhost:3000/v1"
-        self._api_key = "sk-V2o9Ut2rBHFgkH4hCy53snYbQA5uAlkc25jlRzmtT9P3wapo"
-        self._model = "mimo-v2.5"
+        self._base_url = str(pipeline_cfg.llm_base_url).strip().rstrip("/")
+        self._api_key_env = str(pipeline_cfg.llm_api_key_env).strip()
+        self._model = str(pipeline_cfg.llm_model).strip()
+        if not self._base_url:
+            raise ValueError("livestream pipeline.llm_base_url 不能为空")
+        if not self._api_key_env:
+            raise ValueError("livestream pipeline.llm_api_key_env 不能为空")
+        if not self._model:
+            raise ValueError("livestream pipeline.llm_model 不能为空")
 
         # 互动历史（滚动窗口）
         self._history: deque[dict[str, str]] = deque(
@@ -61,13 +69,19 @@ class LLMOrchestrator:
         self._recent_responses: deque[str] = deque(maxlen=5)
 
         self._client: httpx.AsyncClient | None = None
+        self._consciousness = consciousness
 
     async def start(self) -> None:
         """初始化 HTTP 客户端。"""
+        api_key = os.environ.get(self._api_key_env, "").strip()
+        if not api_key:
+            raise RuntimeError(
+                f"直播 LLM 凭据缺失：环境变量 {self._api_key_env} 为空"
+            )
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
             headers={
-                "Authorization": f"Bearer {self._api_key}",
+                "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
             timeout=httpx.Timeout(self._timeout),
@@ -106,11 +120,24 @@ class LLMOrchestrator:
         # 记录到历史
         self._history.append({"role": "user", "content": user_content})
 
+        prepared = None
+        transient_context = ""
+        if self._consciousness is not None:
+            prepared = await asyncio.to_thread(
+                self._consciousness.prepare_perception
+            )
+            transient_context = prepared.content
+
         # 构建完整消息列表
-        messages = self._build_messages()
+        messages = self._build_messages(transient_context)
 
         try:
             response_text = await self._call_llm(messages)
+            if prepared is not None:
+                await asyncio.to_thread(
+                    self._consciousness.commit_perception,
+                    prepared,
+                )
             if response_text:
                 # 清理回复（去除可能的格式标记）
                 response_text = self._clean_response(response_text)
@@ -130,15 +157,24 @@ class LLMOrchestrator:
         if event_kind == "danmaku" and len(events) > 1:
             # 聚合弹幕
             lines = [e.display_text for e in events]
-            return f"以下是直播间最近的弹幕：\n" + "\n".join(lines)
+            detail = "以下是直播间最近的弹幕：\n" + "\n".join(lines)
         elif events:
-            return events[0].display_text
-        return ""
+            detail = events[0].display_text
+        else:
+            return ""
+        return (
+            f"<current_scene platform=livestream event_kind={event_kind}>\n"
+            f"{detail}\n"
+            "</current_scene>"
+        )
 
-    def _build_messages(self) -> list[dict[str, str]]:
+    def _build_messages(
+        self,
+        transient_context: str = "",
+    ) -> list[dict[str, str]]:
         """构建完整的 LLM 消息列表。"""
         messages: list[dict[str, str]] = [
-            {"role": "system", "content": _LIVESTREAM_SYSTEM_PROMPT},
+            {"role": "system", "content": _EXPRESSION_SYSTEM_PROMPT},
         ]
 
         # 加入最近主播发言作为上下文
@@ -148,8 +184,22 @@ class LLMOrchestrator:
             )
             messages.append({"role": "system", "content": context})
 
-        # 加入互动历史
-        messages.extend(list(self._history))
+        # 加入互动历史；世界投影只进入本次请求，不写入滚动历史。
+        history = list(self._history)
+        if transient_context:
+            insertion = max(0, len(history) - 1)
+            history.insert(
+                insertion,
+                {
+                    "role": "user",
+                    "content": (
+                        "<transient_world_perception>\n"
+                        f"{transient_context}\n"
+                        "</transient_world_perception>"
+                    ),
+                },
+            )
+        messages.extend(history)
 
         return messages
 

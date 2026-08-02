@@ -342,7 +342,9 @@ class MemoryWitnessCoordinator:
             content=event.content,
             stream_id=event.stream_id,
             consciousness_instance_id=str(
-                metadata.get("consciousness_instance_id") or ""
+                event.source_instance_id
+                or metadata.get("consciousness_instance_id")
+                or ""
             ),
             actor=str(metadata.get("sender") or event.source or ""),
             visibility="private",
@@ -372,6 +374,10 @@ class MemoryWitnessCoordinator:
         model_set = get_model_set_by_task(task_name)
         if not model_set:
             raise RuntimeError(f"MemoryWitnessModelUnavailable:{task_name}")
+        perception = await asyncio.to_thread(
+            self._service.prepare_perception,
+            instance.instance_id,
+        )
         request = LLMRequest(model_set, "life_memory_witness")
         request.add_payload(
             LLMPayload(ROLE.SYSTEM, Text(self._build_system_prompt(instance)))
@@ -382,13 +388,21 @@ class MemoryWitnessCoordinator:
                 Text(
                     "请回望下面这段已经发生并被保存的经历，写下你此刻愿意留下的"
                     "第一人称见证。如果没有值得留下的主观感受，只输出 "
-                    f"{_NO_WITNESS}。\n\n{self._format_experience_window(records)}"
+                    f"{_NO_WITNESS}。\n\n"
+                    "<transient_world_perception>\n"
+                    f"{perception.content}\n"
+                    "</transient_world_perception>\n\n"
+                    f"{self._format_experience_window(records)}"
                 ),
             )
         )
         timeout = max(10.0, float(getattr(cfg, "timeout_seconds", 120.0)))
         response = await asyncio.wait_for(request.send(), timeout=timeout)
         result = await response if not response.message else response.message
+        await asyncio.to_thread(
+            self._service.commit_perception,
+            perception,
+        )
         text = str(result or "").strip().replace("**", "").replace("```", "")
         if not text or _NO_WITNESS in text.lower():
             return ""

@@ -159,6 +159,27 @@ class MiniCPMOmniProvider(BaseRealtimeProvider):
             }
         )
 
+    async def inject_context(self, text: str) -> None:
+        """Append text context to the native conversation without a response."""
+
+        if not self._ws or self._ws.closed:
+            raise RuntimeError("MiniCPM-o provider is not connected")
+        await self._send(
+            {
+                "type": "input.append",
+                "input": {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [{"type": "text", "text": text}],
+                        }
+                    ],
+                    "streaming": False,
+                    "context_only": True,
+                },
+            }
+        )
+
     async def _send_audio_chunk(self, chunk: bytes, *, force_listen: bool = False) -> None:
         await self._send(
             {
@@ -241,6 +262,10 @@ class MiniCPMOmniProvider(BaseRealtimeProvider):
                 )
             if text:
                 await self._emit_transcript(TranscriptEvent("assistant", text, True, response_id))
+            status = str(event.get("status") or "completed").lower()
+            await self._emit_response_done(
+                status not in {"cancelled", "failed", "incomplete", "error"}
+            )
             await self._emit_state(ProviderState.LISTENING)
             return
         if event_type == "session.closed":

@@ -68,6 +68,14 @@ class LifeEngineEvent:
     # heartbeat context acknowledgement; raw events remain append-only
     heartbeat_context_consumed: bool = False
 
+    # Durable attribution fields used by the raw experience ledger.  The
+    # legacy ``content`` may stay presentation-bounded while ``raw_content``
+    # preserves the complete experience at the persistence boundary.
+    source_instance_id: str | None = None
+    correlation_id: str | None = None
+    content_ref: str | None = None
+    raw_content: str | None = None
+
 
 @dataclass(slots=True)
 class LifeEngineState:
@@ -290,7 +298,8 @@ class EventBuilder:
         raw_content = message.processed_plain_text
         if raw_content is None:
             raw_content = message.content if isinstance(message.content, str) else str(message.content)
-        content = _shorten_text(str(raw_content).strip() or f"[{message.message_type.value}]")
+        full_content = str(raw_content).strip() or f"[{message.message_type.value}]"
+        content = _shorten_text(full_content)
 
         message_type = getattr(message.message_type, "value", str(message.message_type))
 
@@ -306,6 +315,14 @@ class EventBuilder:
             sender=sender_display,
             chat_type=chat_type,
             stream_id=stream_id,
+            source_instance_id=str(extra.get("consciousness_instance_id") or "") or None,
+            correlation_id=str(
+                extra.get("correlation_id")
+                or extra.get("episode_id")
+                or ""
+            ) or None,
+            content_ref=str(extra.get("content_ref") or "") or None,
+            raw_content=full_content,
         )
 
     def build_inner_dialogue_event(

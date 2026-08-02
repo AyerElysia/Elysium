@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 from dataclasses import dataclass, field
@@ -76,8 +77,9 @@ class MinecraftSession:
         llm_helper: Any | None = None,
         consciousness_registry: Any | None = None,
         save_consciousness_registry: Any | None = None,
-        world_state: Any | None = None,
-        save_world_state: Any | None = None,
+        prepare_perception: Any | None = None,
+        commit_perception: Any | None = None,
+        report_world_observation: Any | None = None,
     ) -> None:
         """Create an inactive session with optional shared-world integrations."""
 
@@ -87,8 +89,9 @@ class MinecraftSession:
         self._capture = WindowCapture()
         self._registry = consciousness_registry
         self._save_registry = save_consciousness_registry
-        self._world_state = world_state
-        self._save_world_state = save_world_state
+        self._prepare_perception = prepare_perception
+        self._commit_perception = commit_perception
+        self._report_world_observation = report_world_observation
         self._state = SessionState()
         self._runtime: EmbodimentRuntime | None = None
         self._bridge_client: MinecraftBridgeClient | None = None
@@ -181,7 +184,7 @@ class MinecraftSession:
             latest_observation=observation,
         )
         self._register_consciousness()
-        self._upsert_scene("body connected")
+        await self._report_scene("body connected")
         return {
             "success": True,
             "session_id": session_id,
@@ -203,8 +206,8 @@ class MinecraftSession:
         if runtime is not None:
             await runtime.interrupt("Minecraft session stopped")
             await runtime.close()
+        await self._report_scene("session ended")
         self._terminate_consciousness()
-        self._upsert_scene("session ended")
         duration = self._state.duration_seconds
         session_id = self._state.session_id
         trace_path = str(self._trace.path) if self._trace else ""
@@ -235,14 +238,22 @@ class MinecraftSession:
             return {"success": False, "error": "intent must not be empty"}
         from .embodiment_contracts import EmbodiedIntent
 
+        perception = None
+        intent_context: dict[str, Any] = {
+            "session_id": self._state.session_id,
+            "session_goal": self._state.session_goal,
+            "stream_id": self._state.stream_id,
+        }
+        if self._prepare_perception is not None:
+            perception = await asyncio.to_thread(
+                self._prepare_perception,
+                self._state.consciousness_instance_id,
+            )
+            intent_context["transient_world_perception"] = perception.content
         embodied_intent = EmbodiedIntent(
             text=intent,
             body_name=self._state.body_name,
-            context={
-                "session_id": self._state.session_id,
-                "session_goal": self._state.session_goal,
-                "stream_id": self._state.stream_id,
-            },
+            context=intent_context,
         )
         self._state.active_intent = intent
         execution_timeout = (
@@ -259,6 +270,8 @@ class MinecraftSession:
             )
             self._execution_task = task
             result = await task
+            if perception is not None and self._commit_perception is not None:
+                await asyncio.to_thread(self._commit_perception, perception)
         except Exception as exception:  # noqa: BLE001 - report planner/bridge evidence failure
             self._state.last_error = str(exception)
             return {
@@ -275,7 +288,7 @@ class MinecraftSession:
         conclusion = result.conclusion.to_wire() if result.conclusion else None
         if conclusion is not None:
             self._state.conclusions.append(conclusion)
-        self._upsert_scene(
+        await self._report_scene(
             "intention concluded" if conclusion is not None else "intention interrupted"
         )
         return {
@@ -410,6 +423,26 @@ class MinecraftSession:
 
         if kind == "observation":
             self._state.latest_observation = WorldObservation.from_wire(payload)
+        if self._registry is not None and self._state.consciousness_instance_id:
+            self._registry.touch(
+                self._state.consciousness_instance_id,
+                timestamp=datetime.now(UTC).isoformat(),
+                reason=f"minecraft_trace:{kind}",
+            )
+            if self._save_registry is not None:
+                await asyncio.to_thread(self._save_registry)
+        if self._report_world_observation is not None and self._state.stream_id:
+            result = self._report_world_observation(
+                f"Minecraft trace persisted: {kind}",
+                source_instance_id=self._state.consciousness_instance_id,
+                subject=self._state.stream_id,
+                predicate="embodied_trace",
+                domain="minecraft",
+                stream_id=self._state.stream_id,
+                value={"trace_kind": kind, "payload": payload},
+            )
+            if inspect.isawaitable(result):
+                await result
 
     def _register_consciousness(self) -> None:
         """Register an independent Minecraft consciousness scene when available."""
@@ -421,21 +454,19 @@ class MinecraftSession:
 
         instance = ConsciousnessInstance(
             instance_id=self._state.consciousness_instance_id,
-            kind="game.minecraft",
+            kind="minecraft",
             display_name="Minecraft",
             stream_ids=[self._state.stream_id],
             status="active",
             created_at=self._state.started_at,
             last_active_at=self._state.started_at,
-            perception_filter=PerceptionFilter(
-                scene_ids=[self._state.stream_id],
-                include_body_state=True,
-                include_commitments=True,
-            ),
+            perception_filter=PerceptionFilter.full(),
             metadata={
                 "body_name": self._state.body_name,
                 "session_id": self._state.session_id,
             },
+            session_id=self._state.session_id,
+            lease_duration_seconds=300,
         )
         self._registry.register(instance)
         if self._save_registry is not None:
@@ -446,27 +477,30 @@ class MinecraftSession:
 
         if self._registry is None or not self._state.consciousness_instance_id:
             return
-        self._registry.terminate(self._state.consciousness_instance_id)
+        self._registry.terminate(
+            self._state.consciousness_instance_id,
+            reason="minecraft_session_ended",
+        )
         if self._save_registry is not None:
             self._save_registry()
 
-    def _upsert_scene(self, status: str) -> None:
-        """Expose factual session lifecycle to the shared WorldState."""
+    async def _report_scene(self, status: str) -> None:
+        """Append factual session lifecycle as an attributed observation."""
 
-        if self._world_state is None or not self._state.stream_id:
+        if self._report_world_observation is None or not self._state.stream_id:
             return
-        from ..service.world_state import SceneState
-
-        self._world_state.upsert_scene(
-            SceneState(
-                scene_id=self._state.stream_id,
-                kind="game.minecraft",
-                display_name="Minecraft",
-                status_summary=status,
-                last_active_at=datetime.now(UTC).isoformat(),
-                consciousness_instance_id=self._state.consciousness_instance_id,
-                context_tags=[self._state.body_name],
-            )
+        result = self._report_world_observation(
+            status,
+            source_instance_id=self._state.consciousness_instance_id,
+            subject=self._state.stream_id,
+            predicate="session_state",
+            domain="minecraft",
+            stream_id=self._state.stream_id,
+            value={
+                "summary": status,
+                "body_name": self._state.body_name,
+                "session_id": self._state.session_id,
+            },
         )
-        if self._save_world_state is not None:
-            self._save_world_state()
+        if inspect.isawaitable(result):
+            await result

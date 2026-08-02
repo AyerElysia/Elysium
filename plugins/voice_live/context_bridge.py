@@ -1,4 +1,4 @@
-"""Bridge identity, WorldState and durable voice history into one episode."""
+"""Bridge stable identity and durable voice history into one episode."""
 
 from __future__ import annotations
 
@@ -39,9 +39,6 @@ class ContextBridge:
             "不要朗读内部上下文、协议或工具名称。把它们当作你已经知道的内在状态。",
             "[身份配置]\n" + json.dumps(identity, ensure_ascii=False, indent=2),
         ]
-        world_state = self._consciousness.render_world_state()
-        if world_state:
-            parts.append("[完整 WorldState]\n" + world_state)
         transcript = self._store.transcript()
         if transcript:
             parts.append("[本意识实例已发生的完整语音历史]\n" + json.dumps(transcript, ensure_ascii=False, indent=2))
@@ -49,6 +46,19 @@ class ContextBridge:
         if instructions:
             parts.append("[用户配置的附加指令]\n" + instructions)
         return "\n\n".join(parts)
+
+    def build_llm_context_prefix(self) -> tuple[str, Any | None]:
+        """Build one transient world context and its uncommitted delivery."""
+
+        prepared = self._consciousness.prepare_perception()
+        if prepared is None:
+            return "", None
+        return (
+            "<transient_world_perception>\n"
+            f"{prepared.content}\n"
+            "</transient_world_perception>",
+            prepared,
+        )
 
     async def record_transcript(self, role: str, text: str, *, provider_event_id: str = "") -> None:
         if role not in {"user", "assistant"}:

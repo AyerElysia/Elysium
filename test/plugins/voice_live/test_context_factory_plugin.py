@@ -39,8 +39,8 @@ class FakeConsciousness:
     instance_id = "voice_live_episode"
     stream_id = "voice_live_episode"
 
-    def render_world_state(self) -> str:
-        return '{"scene":"voice"}'
+    def prepare_perception(self) -> Any:
+        return SimpleNamespace(content='{"scene":"voice"}')
 
 
 class FakeLifeService:
@@ -52,7 +52,7 @@ class FakeLifeService:
 
 
 @pytest.mark.asyncio
-async def test_context_bridge_preserves_identity_world_history_and_life_events(
+async def test_context_bridge_separates_stable_identity_and_transient_world(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = VoiceLiveConfig()
@@ -73,8 +73,12 @@ async def test_context_bridge_preserves_identity_world_history_and_life_events(
     prompt = bridge.build_system_prompt()
     assert all(
         value in prompt
-        for value in ("爱莉", "完整背景", "scene", "此前的完整历史", "自己的判断")
+        for value in ("爱莉", "完整背景", "此前的完整历史", "自己的判断")
     )
+    assert "scene" not in prompt
+    transient, prepared = bridge.build_llm_context_prefix()
+    assert "scene" in transient
+    assert prepared is not None
 
     await bridge.record_transcript("user", "你好", provider_event_id="u1")
     await bridge.record_transcript("assistant", "你好呀", provider_event_id="a1")

@@ -5,24 +5,25 @@ from types import SimpleNamespace
 import pytest
 
 from plugins.life_engine.core.compat_tools import LifeReportStateAction
-from plugins.life_engine.service.world_state import SceneState, WorldState
 
 
 @pytest.mark.asyncio
 async def test_report_state_updates_the_active_voice_scene(monkeypatch: pytest.MonkeyPatch) -> None:
-    world_state = WorldState(
-        active_scenes={
-            "voice_live_case": SceneState(
-                scene_id="voice_live_case",
-                kind="voice_live",
-                display_name="实时通话意识",
-            )
+    reports: list[dict[str, object]] = []
+
+    async def report_world_observation(
+        report: str,
+        **kwargs: object,
+    ) -> dict[str, str]:
+        reports.append({"report": report, **kwargs})
+        return {
+            "assertion_id": "assertion-test",
+            "source_instance_id": "voice-live-test",
         }
-    )
-    saved: list[bool] = []
+
     service = SimpleNamespace(
-        world_state=world_state,
-        save_world_state=lambda: saved.append(True),
+        resolve_consciousness_instance=lambda stream_id: "voice-live-test",
+        report_world_observation=report_world_observation,
     )
     manager = SimpleNamespace(
         get_plugin=lambda name: SimpleNamespace(service=service)
@@ -45,7 +46,14 @@ async def test_report_state_updates_the_active_voice_scene(monkeypatch: pytest.M
     )
 
     assert success is True
-    assert "工具链真实验证成功" in result
-    assert world_state.active_scenes["voice_live_case"].status_summary == "工具链真实验证成功"
-    assert world_state.active_scenes["voice_live_case"].last_active_at
-    assert saved == [True]
+    assert "assertion-test" in result
+    assert reports == [
+        {
+            "report": "工具链真实验证成功",
+            "source_instance_id": "voice-live-test",
+            "subject": "voice_live_case",
+            "predicate": "state_report",
+            "domain": "scene",
+            "stream_id": "external_stream_hash",
+        }
+    ]

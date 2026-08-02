@@ -80,17 +80,17 @@ Life Engine 维护一个主体下的多个场景意识：
 
 | 实例 | 作用 | 当前状态 |
 |---|---|---|
-| `chat_global` | 私聊、群聊与日常表达 | 核心稳定路径 |
-| `memory_witness` | 第一人称见证和经历编码 | 核心稳定路径 |
-| `minecraft` | 视觉输入、Windows 桥接与键鼠具身 | 环境依赖型能力 |
-| `voice_live` | 独立意识、可打断、可恢复的全双工实时语音 | 生产候选；真实云端与本地链路已验收 |
-| `livestream` | 弹幕、TTS、Live2D/OBS 直播场景 | 实验性集成 |
+| `chat_global` | 私聊、群聊与日常表达 | Presence、heartbeat/chatter 感知闭环 |
+| `memory_witness` | 第一人称见证和经历编码 | 独立消费与请求级世界感知 |
+| `minecraft` | 视觉输入、Windows 桥接与键鼠具身 | session/lease、trace observation、意图级感知 |
+| `voice_live` | 独立意识、可打断、可恢复的全双工实时语音 | session/lease、listening frontier 动态感知 |
+| `livestream` | 弹幕、TTS、Live2D/OBS 直播场景 | room Presence、请求级感知、状态 observation |
 
-每个意识实例拥有独立滚动上下文和工具清单。实例之间不直接读取彼此上下文；跨场景信息通过 `WorldState`、Life Event、潜意识协调和主动状态报告流动。
+每个意识实例拥有独立滚动上下文和工具清单。实例之间不直接读取彼此上下文。SQLite Presence 记录实例存在、lease、revision 和 stream 唯一归属；生命周期通过 outbox 进入不可变 Life Event。World Projection 从账本重建带来源观察，Perception Gateway 为各实例提供 active 窗口、完整 assertion 和未确认 change，并在成功后提交独立 cursor。旧 `WorldState` 仅保留迁移兼容。
 
 工具清单是上下文预算边界，不是人格规则。`memory_witness` 的清单为空：它只见证，不直接行动。
 
-详见 [`docs/architecture/consciousness_instances.md`](../../docs/architecture/consciousness_instances.md)。
+详见 [`docs/architecture/consciousness_instances.md`](../../docs/architecture/consciousness_instances.md) 与 [`docs/architecture/world_state_coordination.md`](../../docs/architecture/world_state_coordination.md)。
 
 ---
 

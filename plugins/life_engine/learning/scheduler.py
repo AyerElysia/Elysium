@@ -74,8 +74,9 @@ class LearningScheduler:
         minecraft_config: dict[str, Any] | None = None,
         consciousness_registry: Any | None = None,
         save_consciousness_registry: Any | None = None,
-        world_state: Any | None = None,
-        save_world_state: Any | None = None,
+        prepare_perception: Any | None = None,
+        commit_perception: Any | None = None,
+        report_world_observation: Any | None = None,
         # 记忆服务（用于把"修正型洞察"落成显式修正记录，形成记忆演化链）
         memory_service: Any | None = None,
     ) -> None:
@@ -140,8 +141,9 @@ class LearningScheduler:
                 mc_config=mc_cfg,
                 consciousness_registry=consciousness_registry,
                 save_consciousness_registry=save_consciousness_registry,
-                world_state=world_state,
-                save_world_state=save_world_state,
+                prepare_perception=prepare_perception,
+                commit_perception=commit_perception,
+                report_world_observation=report_world_observation,
             )
             logger.info("Minecraft evidence-driven embodiment initialized")
 

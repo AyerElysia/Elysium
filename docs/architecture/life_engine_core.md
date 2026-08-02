@@ -1,6 +1,6 @@
 # 生命引擎核心（Life Engine Core）
 
-> 文档状态：权威文档，与代码同步截至 2026-07-31。
+> 文档状态：权威文档；意识 Presence、World Projection 与 Perception Gateway 已落地。
 > 代码位置：`plugins/life_engine/core/`（9387 行）+ `plugins/life_engine/service/core.py`（4500+ 行）。
 > 本文是生命引擎运行态的权威文档；凡与本文冲突，以本文和当前代码为准。
 
@@ -30,8 +30,8 @@
 │  自主意向     │  工具+Action     │  - 冲动引擎 (ImpulseEngine)        │
 │  休息/睡眠    │  多模态          │  - 好奇心 (CuriosityEngine)        │
 ├──────────────┴──────────────────┴───────────────────────────────────┤
-│                    统一事件流 (LifeEventBus)                           │
-│  所有交互都是事件，按时间顺序展示，保持连续性                           │
+│           统一事件流 (LifeEventBus) + SQLite Presence                  │
+│  经历追加写入；实例生命周期以事务 outbox 进入同一不可变账本              │
 ├─────────────────────────────────────────────────────────────────────┤
 │                    基础设施                                           │
 │  LLM 内核 / 记忆系统 / 适配器(NapCat/Feishu) / 调度器 / 日志         │
@@ -82,7 +82,7 @@ start() → 初始化子系统 → 启动 _heartbeat_loop() + _memory_index_loop
 | 段落 | 来源 | 说明 |
 | --- | --- | --- |
 | 系统人设 | soul.md 模板 | 身份、性格、边界 |
-| 世界状态 | WorldState | 时间、环境、运行态 |
+| 世界状态 | World Projection | 带来源 assertion、Presence 存在感和逐实例未确认 change；只进入当前 heartbeat turn |
 | 待处理事件 | pending_events | 新消息、系统事件 |
 | 好奇心牵引 | CuriosityEngine | 当前探索兴趣 |
 | 最近聊天记录 | ChatStream | 近期对话上下文 |
@@ -344,11 +344,16 @@ route_should_respond()
 
 ### 9.1 统一事件流
 
-所有交互（消息、心跳、工具调用、系统事件）统一为 `LifeEngineEvent`，通过 `LifeEventBus` 发布：
+兼容运行层仍使用 `LifeEngineEvent`，持久经历边界统一转换为 `LifeEvent` 并通过 `LifeEventBus` 写入 SQLite 追加式账本：
 
-- 心跳通过 `event_cursor` 追踪已处理事件
-- 新事件在下次心跳时注入 prompt
-- 显著事件（salient）优先展示，低显著事件压缩
+- 账本 ingest position 是耐久顺序，producer sequence 只作为来源字段保留；
+- `occurrence_id` 提供幂等写入；
+- 消息保留完整原文，兼容心跳展示文本可以单独缩短；
+- `source_instance_id`、`causation_id`、`correlation_id` 和 `recorded_at` 保留实例归因与因果边界；
+- 心跳通过 cursor 追踪已处理事件，新事件在下次 prepare 中形成固定快照；
+- 显著性只负责技术注意预算，不能删除或改写原始经历。
+
+意识实例生命周期先在 `consciousness_presence.sqlite3` 中原子提交 Presence、stream owner 和 outbox，再幂等写入 Life Event。账本写入失败时 outbox 不确认，后续可重试。
 
 ### 9.2 状态持久化
 
@@ -357,6 +362,15 @@ route_should_respond()
 - 事件游标、待处理事件
 - 对话历史
 - 自主意向状态
+
+意识实例运行状态不再由 `StatePersistence` 或 JSON 负责。`SQLitePresenceStore` 单独保存：
+
+- instance/session/process epoch；
+- active/suspended/terminated 与 lease；
+- active stream 唯一 owner；
+- revision/CAS 与生命周期 outbox。
+
+`runtime/consciousness_registry.json` 仅是迁移期兼容导出；`runtime/consciousness_presence.sqlite3` 才是权威 Presence。`runtime/world_projection.sqlite3` 是从不可变 Life Event 重建的带来源派生投影；旧 `world_state.json` 只作为迁移源保留。
 
 ---
 
@@ -377,3 +391,8 @@ route_should_respond()
 | `core/sub_agent_tool.py` | ~300 | 子代理工具 |
 | `core/compat_tools.py` | ~200 | 兼容旧接口工具 |
 | `service/core.py` | 4500+ | 服务层（心跳循环、事件、状态） |
+| `service/event_bus.py` | — | 不可变 Life Event SQLite 账本、消费游标与兼容镜像 |
+| `service/consciousness.py` | — | 意识实例模型、Presence 生命周期、lease 与 outbox 发布 |
+| `service/presence_store.py` | — | SQLite Presence、stream 唯一约束与 revision/CAS |
+| `service/world_projection.py` | — | 带来源 assertion、投影 change、重建与逐实例 cursor |
+| `service/perception_gateway.py` | — | active 窗口与世界变化的 transient prepare/commit/query |
