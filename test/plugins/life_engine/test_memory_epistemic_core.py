@@ -109,25 +109,24 @@ def test_evidence_requires_existing_claim_and_remains_append_only() -> None:
         db.execute("DELETE FROM memory_claim_evidence WHERE evidence_link_id = 'evidence-1'")
 
 
-def test_reflection_cannot_confirm_claim_but_explicit_user_can() -> None:
+def test_state_events_preserve_open_authority_declarations() -> None:
     db = _db()
     claim = append_claim(db, _claim())
 
-    with pytest.raises(PermissionError, match="AuthorityCannotConfirmClaim:reflection"):
-        append_state_event(
-            db,
-            MemoryStateEvent(
-                event_id="reflection-confirm",
-                entity_type="claim",
-                entity_id=claim.claim_id,
-                event_type="claim_confirmed",
-                actor="reflection",
-                authority=AuthorityClass.REFLECTION.value,
-                reason="模型自行相信它是真的",
-                recorded_at="2026-07-01T01:10:00+08:00",
-                valid_at="2026-07-01T01:10:00+08:00",
-            ),
-        )
+    reflection_event = append_state_event(
+        db,
+        MemoryStateEvent(
+            event_id="reflection-confirm",
+            entity_type="claim",
+            entity_id=claim.claim_id,
+            event_type="claim_confirmed",
+            actor="reflection",
+            authority="independent_reflection_assessment",
+            reason="独立反思过程显式作出判断",
+            recorded_at="2026-07-01T01:10:00+08:00",
+            valid_at="2026-07-01T01:10:00+08:00",
+        ),
+    )
 
     event = append_state_event(
         db,
@@ -147,7 +146,7 @@ def test_reflection_cannot_confirm_claim_but_explicit_user_can() -> None:
     state = get_claim_state(db, claim.claim_id)
     assert state is not None
     assert state.status == ClaimStatus.CONFIRMED.value
-    assert state.active_event_ids == (event.event_id,)
+    assert state.active_event_ids == (reflection_event.event_id, event.event_id)
 
 
 def test_supersession_preserves_history_and_bitemporal_query() -> None:

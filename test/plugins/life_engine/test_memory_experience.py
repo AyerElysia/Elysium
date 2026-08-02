@@ -12,6 +12,7 @@ import pytest
 from plugins.life_engine.memory.experience import (
     EpistemicKind,
     EvidenceAwareMemoryResult,
+    ExperienceAppendReport,
     ExperienceRecord,
     MemorySearchMode,
     create_life_memory_schema,
@@ -390,20 +391,34 @@ async def test_witness_loop_retries_transient_upstream_failure_quietly(
     assert infos == ["记忆见证上游已恢复: previous_failures=1"]
 
 
-async def test_search_tool_rejects_unknown_mode_before_service_lookup(
+async def test_search_tool_accepts_open_retrieval_intent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tool = LifeEngineSearchMemoryTool(plugin=SimpleNamespace())
+    observed: dict[str, object] = {}
 
-    async def _must_not_lookup() -> object:
-        raise AssertionError("invalid mode must not touch the memory service")
+    class _OpenModeService:
+        async def search_memory(self, *_args: object, **_kwargs: object) -> list[object]:
+            return []
 
-    monkeypatch.setattr(tool, "_get_service", _must_not_lookup)
+        async def search_evidence_aware(
+            self,
+            _query: str,
+            **kwargs: object,
+        ) -> list[object]:
+            observed.update(kwargs)
+            return []
+
+    async def _service() -> object:
+        return _OpenModeService()
+
+    monkeypatch.setattr(tool, "_get_service", _service)
 
     ok, payload = await tool.execute("经历", search_mode="objective_truth")
 
-    assert ok is False
-    assert "search_mode 必须是" in payload["error"]
+    assert ok is True
+    assert payload["search_mode"] == "objective_truth"
+    assert observed["mode"] == "objective_truth"
 
 
 async def test_search_tool_returns_evidence_payload_without_fake_confidence(
@@ -434,14 +449,14 @@ async def test_search_tool_returns_evidence_payload_without_fake_confidence(
             self,
             _query: str,
             *,
-            mode: MemorySearchMode,
+            mode: str,
             top_k: int,
             stream_scope: str | None,
             enable_association: bool,
             valid_at: str,
             recorded_as_of: str,
         ) -> list[EvidenceAwareMemoryResult]:
-            assert mode is MemorySearchMode.AUTOBIOGRAPHICAL
+            assert mode == "autobiographical"
             assert top_k == 3
             assert stream_scope == "stream-1"
             assert enable_association is False
@@ -509,6 +524,60 @@ async def test_projection_failure_does_not_advance_witness_cursor(
     assert not any("last_sequence" in state for state in memory.states)
 
 
+async def test_witness_retry_authors_existing_experiences_before_advancing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A model failure after append must not turn the retry into a silent skip."""
+
+    class _RetryMemory(_WitnessMemoryStub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.append_calls = 0
+
+        async def append_experiences_detailed(
+            self,
+            records: list[ExperienceRecord],
+        ) -> ExperienceAppendReport:
+            self.append_calls += 1
+            canonical = tuple(records)
+            if self.append_calls == 1:
+                return ExperienceAppendReport(inserted=canonical)
+            return ExperienceAppendReport(existing=canonical)
+
+    memory = _RetryMemory()
+    coordinator = MemoryWitnessCoordinator(_witness_service_stub(tmp_path, memory))
+    author_calls = 0
+
+    async def _author(*_args: object) -> str:
+        nonlocal author_calls
+        author_calls += 1
+        if author_calls == 1:
+            raise LLMAPIError("temporary", status_code=500)
+        return "retry witness"
+
+    async def _project(_witness: object) -> None:
+        return None
+
+    monkeypatch.setattr(coordinator, "_author_witness", _author)
+    monkeypatch.setattr(coordinator, "_project_witness", _project)
+
+    with pytest.raises(LLMAPIError):
+        await coordinator.run_once()
+
+    assert memory.recorded == 0
+    assert not any("last_sequence" in state for state in memory.states)
+
+    report = await coordinator.run_once()
+
+    assert author_calls == 2
+    assert memory.append_calls == 2
+    assert memory.recorded == 1
+    assert report.synced_experiences == 0
+    assert report.last_sequence == 1
+    assert memory.states[-1]["last_sequence"] == 1
+
+
 async def test_existing_window_is_reused_without_calling_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -535,11 +604,11 @@ async def test_existing_window_is_reused_without_calling_model(
     assert memory.states[-1]["last_sequence"] == 1
 
 
-async def test_witness_recovers_from_retained_event_gap(
+async def test_witness_refuses_to_skip_retained_event_gap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A retention gap is reported once, then processing resumes safely."""
+    """A retention gap is fatal to the consumer cursor and is never skipped."""
 
     memory = _WitnessMemoryStub(
         existing=SimpleNamespace(
@@ -595,10 +664,9 @@ async def test_witness_recovers_from_retained_event_gap(
         warnings.append,
     )
 
-    report = await coordinator.run_once()
+    with pytest.raises(RuntimeError, match="MemoryWitnessRawLedgerGap"):
+        await coordinator.run_once()
 
-    assert store.calls == [1, 3]
-    assert report.last_sequence == 4
-    assert memory.states[-1]["last_sequence"] == 4
-    assert len(warnings) == 1
-    assert "记忆见证游标落后" in warnings[0]
+    assert store.calls == [1]
+    assert memory.states == []
+    assert warnings == []

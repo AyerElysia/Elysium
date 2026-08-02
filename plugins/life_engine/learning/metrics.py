@@ -9,9 +9,6 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any
-
 from .models import InsightStatus, LearningMetricsPoint
 from .store import InsightStore
 
@@ -96,8 +93,8 @@ class LearningMetrics:
 
         topics = stats.get("topics", {})
         if topics:
-            top_topics = sorted(topics.items(), key=lambda x: -x[1])[:5]
-            topic_str = ", ".join(f"{k}({v})" for k, v in top_topics)
+            ordered_topics = sorted(topics.items(), key=lambda x: -x[1])
+            topic_str = ", ".join(f"{k}({v})" for k, v in ordered_topics)
             lines.append(f"主题覆盖: {topic_str}")
 
         return "\n".join(lines)

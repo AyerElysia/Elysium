@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -15,7 +16,6 @@ from plugins.life_engine.service.event_builder import (
 )
 from plugins.life_engine.service.event_bus import (
     RAW_EVENT_LOG_FILE,
-    RawEventGapError,
     RawEventStore,
     life_event_from_legacy,
 )
@@ -147,15 +147,58 @@ async def test_raw_event_store_serializes_independent_writers(tmp_path: Path) ->
     assert {event.sequence for event in events} == set(range(1, 201))
 
 
-async def test_raw_event_store_reports_retention_gap(tmp_path: Path) -> None:
-    """A consumer cursor older than retained archives must fail visibly."""
+async def test_raw_event_store_rotation_never_discards_authoritative_history(
+    tmp_path: Path,
+) -> None:
+    """JSONL mirror rotation must not create a gap in the SQLite ledger."""
 
     store = RawEventStore(tmp_path, max_bytes=200, max_archives=1)
     for sequence in range(1, 7):
         await store.append(life_event_from_legacy(_event(sequence)))
 
-    with pytest.raises(RawEventGapError):
-        await store.read_since(1)
+    retained = await store.read_since(1)
+
+    assert [event.source_sequence for event in retained] == [2, 3, 4, 5, 6]
+    health = await store.health()
+    assert health["total"] == 6
+    assert health["earliest_position"] == 1
+
+
+async def test_raw_event_store_assigns_stable_ingest_positions_across_restart(
+    tmp_path: Path,
+) -> None:
+    first = RawEventStore(tmp_path)
+    original = await first.append(life_event_from_legacy(_event(1, content="first")))
+
+    restarted = RawEventStore(tmp_path)
+    later = life_event_from_legacy(_event(1, content="after restart"))
+    later = replace(later, timestamp="2026-04-26T08:00:00+08:00")
+    persisted = await restarted.append(later)
+
+    assert original.sequence == 1
+    assert persisted.sequence == 2
+    assert persisted.source_sequence == 1
+    assert [item.content for item in await restarted.read_since(0)] == [
+        "first",
+        "after restart",
+    ]
+
+
+async def test_raw_event_store_replay_is_idempotent_and_cursor_monotonic(
+    tmp_path: Path,
+) -> None:
+    store = RawEventStore(tmp_path)
+    event = life_event_from_legacy(_event(7, content="once"))
+
+    first = await store.append(event)
+    replay = await store.append(event)
+    assert first.sequence == replay.sequence == 1
+    assert len(await store.read_since(0)) == 1
+
+    assert await store.commit_consumer_offset("witness", 1) == 1
+    assert await store.commit_consumer_offset("witness", 0) == 1
+    health = await store.health()
+    assert health["consumers"][0]["lag"] == 0
 
 
 def test_attention_router_summarizes_low_salience_flood() -> None:

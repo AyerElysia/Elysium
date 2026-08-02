@@ -1,317 +1,246 @@
-# 生命记忆系统（Life Memory System）v2 — 追加式认识论记忆
+# 生命记忆系统 v3：长河·活忆闭环
 
-> 文档状态：生命记忆本体基线始于 `c74a861a`；本文已同步后续的见证编码、Learning→Epistemic 桥、主意识深层检索与桥接契约测试（截至 `091fa3f`，2026-07-31）。
-> 旧系统（`diary_plugin` + `correction` 关键词匹配 + 把 Hebbian 共激活当真值 + Ebbinghaus 单一遗忘曲线）已被取代。旧关联网络仍可服务于文档检索和联想，但不再拥有认识论裁决权。
-> 本文是当前记忆专题的权威文档；历史设计与提案凡与本文冲突，以本文、[当前架构](./current_architecture.md)和当前代码为准。
+> 文档状态：权威架构，与 2026-08-02 的实现同步。
+> 代码入口：`plugins/life_engine/service/event_bus.py`、`plugins/life_engine/memory/experience.py`、`epistemic.py`、`living.py`、`service.py`、`service/memory_witness.py`。
+> 运维与迁移见 [活体记忆迁移与健康检查](../operations/living_memory_migration.md)。
 
----
+## 0. 定位
 
-## 0. 一句话定位
+记忆不是一份会被覆盖的文本，也不是“重复越多就越真”的权重网络。它由两类结构共同组成：
 
-记忆不再是"一份可被覆盖的 `MEMORY.md` 文本文件"，也不是"靠共激活自动强化的连接网络"。记忆是**有状态、连续、可塑且可被主体裁决的追加式认识论账本**：原始经历只追加不删改，事实由声明（claim）与其证据链投影得出，遗忘是多维、各自可逆的处置，检索频率与真实程度显式分离。
+- 不可变历史：发生过什么、何时记录、谁如何解释、一次回忆看见了什么；
+- 可重建投影：当前文件头、全文索引、向量索引、共同回忆形成的可达性。
 
----
+主体可以改变理解，但系统不能替主体删掉旧理解。回忆会改变以后更容易想起什么，却不能自动改变事实状态。
 
-## 1. 为什么重建：旧系统的结构性故障
+## 1. 不可妥协的约束
 
-旧记忆层建立在几个脆弱假设上，重建正是为了消除它们：
+1. 真实经历进入统一事件长河；事件位置在进程重启后仍单调递增。
+2. 原始事件、Experience、claim、证据、解释、版本和回忆轨迹只追加，不原地改写。
+3. 文件当前内容、FTS、Chroma、artifact head 和 association projection 都是派生状态，必须能从账本重建。
+4. 来源、权限、关系、检索意图和回忆动作使用开放文本；代码不按关键词、枚举或相似度阈值替意识作认知判断。
+5. 检索排名、重复次数、共同出现次数和学习系统分数都不是事实置信度。
+6. 冲突、旧看法和后来重新解释必须同时可见，不能用“最新一条”静默覆盖历史。
+7. 任何迁移缺口必须显式失败或报告，禁止把游标直接跳到当前尾部。
 
-| 旧假设（已废弃） | 导致的故障 | 新系统的对应 |
-| --- | --- | --- |
-| 长期记忆 = DFC 可直接 `nucleus_write_file` 读写/覆盖的 `MEMORY.md` | 全文 35KB 注入 system prompt，无增长上限；"整理心跳"靠文件搬移与大小阈值拦截 | 记忆即不可变 `MemoryClaim`/`ClaimEvidence`/`MemoryBelief`，状态由 `reduce_claim_state`/`reduce_belief_state` 投影；按需按 `MemorySearchMode` 取 claim |
-| 经验/记忆可就地 UPDATE 或覆盖 | 原始经历静默丢失，"变化对她意味着什么"被系统单方面决定 | 经历账本（`ExperienceRecord`）不可变，触发器拒绝 UPDATE/DELETE；状态变更一律追加 `MemoryStateEvent` |
-| `correction` 用 `correction_keywords` 列表机械匹配并改写内容 | 违反主体性——"这是否算纠正"由系统而非她判断 | `correction` 保留为兼容投影，仅写入一条 `MemoryClaim`，由主体自行裁决是否背书 |
-| Hebbian 共激活 = 真实关系 = 长期记忆固化 | 共同检索被当作事实关联，连接强度掩盖矛盾 | `retrieval_affinity` 与 epistemic truth 显式分离；关系以 `MemoryBelief`/`ClaimEvidence` 显式记录，`EpistemicConflict` 记录矛盾 |
-| 单一 Ebbinghaus 衰减曲线驱动"遗忘" | "遗忘"与"删除"混为一谈，无撤销与可见性控制 | 多维可逆遗忘（`MemoryDisposition` 五维度），原始证据不删，各维度独立反转 |
-| 世界事实变化后依赖她主动改 `MEMORY.md` | "知道变了又引用旧信息"——旧事实仍被注入 | 双时间模型（valid_time / recorded_time）+ `project_current_facts` 重算当前事实，旧版本保留为历史 |
-
----
-
-## 2. 三条不可妥协的设计原则
-
-### 2.1 神经可塑性与连续性
-记忆的目标是有状态、连续且可塑的。Hebbian 共激活、检索频率、模型置信度都只是**候选手段**，不能把"共同检索"直接当作事实关系或真实性增强。连续性来自不可变经历账本 + 统一生命事件流的串联，而非连接权重的持续衰减。
-
-### 2.2 完整可追溯
-每条记忆从形成、修改到再解释都必须完整可追溯。原始经历与证据只追加、不静默覆盖；当前状态由事件历史重建。任何"修正"是补偿事件（supersede / retract），不是原地擦写。
-
-### 2.3 主体性遗忘与再认知
-遗忘不等于删除。系统应分别管理可达性、当前认可度、情境抑制、叙事显著性与隐私可见性，并支持撤销和恢复。"变化对她意味着什么"必须保留给主体决定，系统只负责记录与投影。
-
----
-
-## 3. 总体架构与数据分层
-
-记忆系统自下而上分为三层，全部以 SQLite 存储，复用既有文档索引基础设施（`indexing`/`nodes`/`edges`），不替换它。
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│ 集成层  service.py / tools.py / memory_witness.py              │
-│  - search_evidence_aware(valid_at, recorded_as_of)             │
-│  - nucleus_search_memory 注解参数                             │
-│  - MemoryWitnessCoordinator（第一人称见证意识实例）            │
-├──────────────────────────────────────────────────────────────┤
-│ 认识论本体层  epistemic.py                                     │
-│  claim / evidence / belief / conflict / state-event /          │
-│  disposition / retrieval-plasticity / audit                   │
-├──────────────────────────────────────────────────────────────┤
-│ 不可变账本层  experience.py                                    │
-│  ExperienceRecord（不可变经历） + WitnessMemory（主观见证）    │
-└──────────────────────────────────────────────────────────────┘
-         ↕ 共享  memory_nodes / memory_edges / memory_index_jobs
-```
-
-新增的核心表（均为附加表，不破坏既有索引）：
-- `memory_experiences` — 不可变经历账本（带 `ExperienceLedgerImmutable` 触发器）
-- `memory_claims` / `memory_claim_evidence` / `memory_beliefs` / `memory_conflicts`
-- `memory_state_events` — 因果可追溯的状态变更事件
-- `memory_dispositions` — 多维遗忘处置
-- `memory_retrieval_episodes` / `memory_retrieval_exposures` / `memory_retrieval_feedback` / `memory_retrieval_plasticity` — 检索可塑性闭环
-- `memory_edges` 增加 `memory_edges_no_self_loop` 触发器防线
-
----
-
-## 4. 不可变经历账本（experience.py）
-
-原始经历是**不可变的事实证据**，是后续一切认识论结构的地基。
-
-### 4.1 ExperienceRecord
-- 字段：`event_id`（主键）、`sequence`（单调递增序号）、`occurred_at`（发生时间）、`recorded_at`（记录时间）、`source`、`channel`、`event_type`、`content`、`stream_id`、`consciousness_instance_id`、`actor`、`visibility`、`valid_from`/`valid_to`（双时间）、`metadata_json`。
-- 表上挂两个触发器：`memory_experiences_immutable_update` 与 `memory_experiences_immutable_delete`，任何对原始经历的 UPDATE/DELETE 都会被 `RAISE(ABORT, 'ExperienceLedgerImmutable')` 拒绝。
-- 含义：原始经历一旦写入，只能追加、不能被改写或抹除。
-
-### 4.2 WitnessMemory（主观见证）
-- 链接一段不可变源事件窗口（`source_sequence_start`/`end`、`source_event_ids`），表达"某个意识实例如何经历这一段证据"。
-- 关键边界：主观见证**不会因为写得更晚就被提升为客观真相**。`WitnessSearchResult.epistemic_note = "subjective witness, not objective truth"`。
-
-### 4.3 两个枚举
-- `EpistemicKind`：`OBSERVED_EVENT`（客观事件）、`SUBJECTIVE_WITNESS`（主观见证）、`LEGACY_WITNESS`（迁移自旧 diary）、`DOCUMENT_EVIDENCE`（文档证据）、`SELF_NARRATIVE`（自我叙事）。
-- `MemorySearchMode`（检索的认识论意图）：`CURRENT_FACT`（当前事实）、`AUTOBIOGRAPHICAL`（自传性）、`HISTORICAL`（历史回溯）、`EXPLORATORY`（探索性）。
-
----
-
-## 5. 认识论本体（epistemic.py）— 系统核心
-
-所有记忆内容以"声明（claim）"为单位，配合证据、背书、矛盾与状态事件构成完整、可投影的知识结构。
-
-### 5.1 来源权限 AuthorityClass
-每一笔记录或显式状态事件都带 `authority`，描述其来源许可。系统**绝不会**把检索排名、重复次数或模型置信度变成真相。
-
-```
-SUBJECT(主体) | EXPLICIT_USER(显式用户) | VERIFIED(已验证) | AUTHORITATIVE(权威)
-OBSERVED(观察) | WITNESS(见证) | REFLECTION(反思) | INFERRED(推断) | UNKNOWN(未知)
-```
-
-`_CONFIRMING_AUTHORITIES = {SUBJECT, EXPLICIT_USER, VERIFIED, AUTHORITATIVE}` —— 只有这些来源才能把 claim 推进到 `CONFIRMED`；`REFLECTION`/`INFERRED` 只能生成候选，需主体或验证源确认。
-
-### 5.2 MemoryClaim（不可变声明 + 双时间）
-- 冻结数据类（`frozen=True, slots=True`），写入后不改。
-- 双时间字段：`valid_from`/`valid_to`（现实有效时间窗口）+ `recorded_at`（系统记录时间）。
-- 其他：`subject_key`、`content`、`claim_kind`、`source`、`authority`、`stream_scope`、`visibility`、`consciousness_instance_id`、`metadata`。
-
-### 5.3 证据链、背书与矛盾
-- `ClaimEvidence`：把一条证据关联到 claim，`stance ∈ {SUPPORTS, CHALLENGES, CONTEXT}`，附带 `source_excerpt`。关系被显式记录，而非靠连接强度隐式表达。
-- `MemoryBelief`：某个视角（`perspective_subject_id`/某个意识实例）对某 claim 的背书关系。
-- `EpistemicConflict`：显式记录两 claim 之间的矛盾（`left_claim_id`/`right_claim_id`/`relation`/`reason`），让冲突可见、可审计，而非被网络强化掩盖。
-
-### 5.4 ClaimStatus 状态机（由事件投影，源 claim 不变）
-```
-PROPOSED → CONFIRMED → SUPERSEDED / RETRACTED
-                  ↘ DISPUTED → (resolved) → CONFIRMED / RETRACTED
-```
-`reduce_claim_state` 依据 `memory_state_events` 重算当前状态；源 claim 行本身永远不变。
-
-### 5.5 MemoryStateEvent（因果 + 可逆）
-每次状态变更都是一个事件：
-- `entity_type`/`entity_id` 指向被变更对象；
-- `event_type`、`actor`、`authority`、`reason` 记录"谁、凭什么、为什么"；
-- `valid_at`（该变更在现实中的生效时间）、`recorded_at`；
-- `caused_by_event_id`（因果链）、`reverses_event_id`（指向被它反转的事件）。
-- 含义：任何处置都可被另一条事件反转，原始历史永不丢失。
-
-### 5.6 MemoryAuditEntry（可审计转移）
-`build_memory_audit_trail` 重建某实体的完整状态转移链，包含 `active`（当前是否生效）、`reversed_by`（被哪些事件反转）、`cause`（因果前驱）。当前状态可由全量历史重建。
-
----
-
-## 6. 双时间模型（Bitemporal）
-
-旧系统最大的故障之一是"知道事实变了，却仍引用旧信息"。双时间模型从结构上消除它：
-
-- **valid_time**（`valid_from`/`valid_to`）：该事实在现实世界中有效的时段。
-- **recorded_time**（`recorded_at`）：系统记录这条信息的时刻。
-
-检索时同时声明 `valid_at`（"我想知道这个时间点的真相"）与 `recorded_as_of`（"基于这个记录时点之前的知识"）。`project_current_facts` 据此投影出 `CurrentFactProjection`：
-
-```python
-@dataclass(frozen=True, slots=True)
-class CurrentFactProjection:
-    subject_key: str
-    valid_at: str
-    recorded_as_of: str
-    active_claims: tuple[ClaimState, ...]
-    conflicts: tuple[EpistemicConflict, ...]
-    uncertainty: tuple[str, ...] = ()   # 保留未决冲突与不确定性，不强行合并
-```
-
-世界事实变化后，只需追加一条新的 `MemoryClaim`（新的 `valid_from`）将旧 claim `SUPERSEDED`，**无需她手动改任何文件**；投影会自动给出该时间点正确的当前事实，旧版本作为历史版本完整保留。
-
----
-
-## 7. 主体性遗忘：多维可逆处置（MemoryDisposition）
-
-遗忘不再是单一衰减曲线，而是对单个记忆实体的五种独立、可逆的访问维度：
-
-| 维度 | 含义 | 旧系统对应 |
-| --- | --- | --- |
-| `accessibility` | 当前是否可被检索到（available / suppressed） | 无（要么在库要么被删） |
-| `endorsement` | 主体当前的认可度（unreviewed / endorsed / rejected） | Hebbian 共激活强度 |
-| `contextual_inhibition` | 在哪些情境下被抑制（可列多个情境标签） | 无 |
-| `narrative_salience` | 在自我叙事中的显著性（0.0–1.0） | 无 |
-| `visibility` | 隐私可见性（private / shared / public） | 无 |
-
-- 五个维度各自独立可逆，由一个 `MemoryStateEvent` 表达，原始证据永不删除。
-- `reduce_memory_disposition` 投影出当前处置；`get_memory_disposition` 读取。
-- 对比旧 Ebbinghaus：旧系统用一个 λ 衰减系数把"记忆强度"压到 50%，等于静默遗忘；新系统把"想不起来""不认可""暂不想提""不重要""不想公开"拆成可分别观察、分别撤销的维度。
-
----
-
-## 8. 检索可塑性闭环（RetrievalPlasticity）
-
-检索不该污染事实，但经历应当影响"被想起的容易程度"。两者被显式拆开：
-
-1. `RetrievalEpisode`：一次检索上下文（query / mode / 意识实例 / stream_scope）。
-2. `RetrievalExposure`：这次检索中向主体展示的某个候选（`rank_position` / `retrieval_source`）。**暴露本身不是真相证据**（`episode` 的 docstring 明确）。
-3. `RetrievalFeedback`：主体对暴露的追加式反馈（accepted / rejected / corrected…），**是关于可达性的反馈，不是关于事实真假的反馈**。
-4. `RetrievalPlasticity`：检索派生的排序提示，与 epistemic 状态显式分离：
-
-```python
-@dataclass(frozen=True, slots=True)
-class RetrievalPlasticity:
-    entity_type: str
-    entity_id: str
-    accepted_count: int = 0
-    rejected_count: int = 0
-    corrected_count: int = 0
-    retrieval_affinity: float = 0.0
-    epistemic_note: str = "retrieval feedback is not evidence of truth"
-```
-
-- 反馈只改变 `accessibility`（可达性），绝不写回任何 truth / 权重 / 共激活强度。
-- `EvidenceAwareMemoryResult`：检索候选的 `rank_score`（排序分）与 `confidence`（认识论置信度）保持分离，下游不会把"排得靠前"误读为"是真的"。
-
----
-
-## 9. 审计回放（build_memory_audit_trail）
-
-每条记忆的当前状态都可以从其全部 `MemoryStateEvent` 历史重建：
-- 因果链：`caused_by_event_id` 串联"为什么发生"；
-- 可逆链：`reverses_event_id` + `MemoryAuditEntry.reversed_by` 串联"被谁撤销"；
-- 完整历史保留：没有静默覆盖，任何时刻都可回放"她当时相信什么、凭什么、后来怎么改的"。
-
----
-
-## 10. 第一人称见证与经历编码（memory_witness.py）
-
-旧的 `diary_plugin` 被删除，重生为第一人称见证意识实例 `memory_witness`：
-
-- `MEMORY_WITNESS_INSTANCE_ID = "memory_witness"`，显示名“爱莉的记忆见证意识”。
-- `MemoryWitnessCoordinator` 周期性协调该实例；它只读追加式原始事件流，不进入、不复制其他意识实例的滚动上下文。
-- `epistemic_boundary = "subjective_witness_not_objective_truth"`：见证是主观证词，链接不可变源事件，**不是客观真相覆盖**。
-- 生命周期：`ensure_instance` 创建/恢复实例；`run_once` 负责旧日记迁移、待投影重试和见证游标续接。
-- 兼容投影：旧 `correction` API 不再改写内容，而是追加一条 `MemoryClaim`；主体决定是否背书。
-
-### 10.1 原始事件不等于已经编码的经历
-
-当前数据链是：
+## 2. 分层架构
 
 ```text
-append-only Life Event
-  → 技术层心理显著性筛选
-  → Experience Ledger
-  → Witness / Evidence / Claim
+外部消息 / 工具 / 心跳 / 场景事件
+              │
+              ▼
+RawEventStore: life_events.sqlite3
+  durable ingest_position + occurrence_id + consumer offset
+              │
+              ▼
+Experience ledger ── Memory Witness
+              │              │
+              ├──────────────┤
+              ▼              ▼
+ Epistemic ledger       Living-memory ledger
+ claim/evidence/state   artifact/interpretation/recall/corecall
+              │              │
+              └──────┬───────┘
+                     ▼
+       Unified evidence-aware retrieval
+          FTS + vector + provenance
+          + contextual stochastic recall
 ```
 
-这一区分很重要：原始事件长河完整保留，但工具调用、工具结果等技术事件不会自动全部变成第一人称经历。筛选只决定“本轮是否编码为 Experience”，不能删除源事件，也不能让被忽略事件失去未来重新解释的可能。
+SQLite 是权威账本。JSONL、文档、FTS、Chroma 和旧 `memory_edges` 都不拥有最终历史权威。
 
-当前筛选仍包含固定事件类型边界，属于需要继续演进的技术层：未来应让编码策略本身有版本、理由、审计与撤销能力，避免固定白名单变成不可逆的主体认知裁决。即使事件不进入表达层或 Experience，本轮消费游标也必须越过它，防止同一技术噪声被反复扫描。
+## 3. 耐久事件主干
 
----
+`RawEventStore` 的权威文件是工作区中的 `life_events.sqlite3`。核心表：
 
-## 11. 真实库修复与自环防线（repair.py）
+- `raw_life_events`：`AUTOINCREMENT ingest_position` 是全局消费位置；
+- `raw_event_consumer_offsets`：每个消费者独立、单调提交游标；
+- `raw_event_store_meta`：迁移元数据；
+- `raw_event_import_issues`：旧 JSONL 解析或镜像写入问题。
 
-重建后为既有数据库提供了幂等、可审计的修复能力：
+每条事件同时保留：
 
-- `repair_document_index(db, workspace_path)`：重建内容哈希已漂移的文档索引行（节点 / FTS / chunk / 向量化 outbox 任务），清理历史遗留的自环边，确保自环触发器存在。
-  - **幂等**：重复执行只处理仍然漂移的文档；空文档只更新节点与 FTS，不制造新向量任务。
-  - **可审计**：返回 `MemoryIndexRepairReport`（扫描数、重建数、清理自环数、完整性检查、外键错误、pending/stale/failed 任务数）。
-  - **不静默擦除**：旧内容版本的索引任务保留为 `stale`/`failed` 历史。
-- `SELF_LOOP_TRIGGERS`：在 `memory_edges` 上挂 `memory_edges_no_self_loop_insert` / `memory_edges_no_self_loop_update` 两个触发器，任何 `source_id = target_id` 的插入/更新都会被 `RAISE(ABORT, 'MemoryEdgeSelfLoop')` 拒绝——自环边在任何边类型下都无有效语义，只会污染演化链与检索扩散。
-- 实测修复结果：88 条哈希漂移文档 → 0，1 条自环边 → 0，`PRAGMA integrity_check` 通过（ok），88 条向量化任务重新入队。
+- `occurrence_id`：一次真实发生的稳定身份，用于幂等重放；
+- `source_event_id` 与 `source_sequence`：生产者原始身份和进程序号；
+- `ingest_position`：跨重启、跨生产者的权威消费位置；
+- 完整 payload 与 hash。
 
----
+旧 `life_events.jsonl` 及轮转归档会在首次打开时按从旧到新顺序幂等导入。JSONL 此后只是兼容镜像；镜像轮转可以删除旧归档，但不能删除 SQLite 中的事件。重复 occurrence 返回原位置；同一 occurrence 携带不同内容会以身份冲突失败。
 
-## 12. 与叙事 / 反思 / 学习的集成
+## 4. 经历与见证
 
-- 叙事（Narrative）与反思（Reflection）接入 claim：反思先产生候选认识，不能仅因模型重复而自动成为事实。
-- 自我叙事可作为 `EpistemicKind.SELF_NARRATIVE` 沉淀，被检索、背书、修订或反转。
-- `LearningScheduler` 在首次心跳幂等回填历史 validated insights；之后每轮独立审计通过的新洞察实时投影为 `validated_insight` claim。
-- claim_id 使用稳定的 `insight_{insight_id}`，回填前先查询当前 claim 状态，重复启动不会重复写入。
-- 学习系统保留洞察来源、证据数量、置信度和分类元数据；“通过学习审计”是证据状态，不等于系统替主体决定最终意义。
-- 兴趣和好奇可形成候选认识或注意牵引；检索可塑性只让“被想起”影响 `accessibility`，不提高真实性。
+`memory_experiences` 保存全部被消费的原始事件证据，不再用固定事件类型白名单判断“什么算经历”。`source_event_id` 保留生产者事件身份，Experience 自身使用 occurrence 身份，允许同一来源下不同真实发生共存。
 
-完整旧 SNN、neuromod 和 Dream 子系统已删除。现存 `dream_walk()` 是记忆图联想漫游的历史命名；它不应被描述为完整梦境系统，也不能作为认识论真值来源。
+`memory_experience_occurrence_aliases` 用来把历史 Experience 与新 occurrence 身份连接起来，避免升级后重放制造副本。
 
----
+`memory_witness` 是第一人称见证意识：
 
-## 13. 向后兼容与迁移
+- 从耐久 consumer offset 继续读取；
+- 所有源事件先进入 Experience，见证意识再判断哪些值得形成日记；
+- 见证输出不被代码按字符切断；
+- 主观见证有 `subjective_witness_not_objective_truth` 边界；
+- 若原始历史真的出现缺口，见证拒绝推进游标并报告 `MemoryWitnessRawLedgerGap`。
 
-- `diary_plugin` 已删除，其功能整合进 `memory_witness` 第一人称见证意识；旧日记数据通过 `_migrate_legacy_diaries` 幂等迁移为 `LEGACY_WITNESS`。
-- 旧 `correction` API 保留为兼容投影，写入 claim 而非改写内容。
-- `data/diaries`、`data/continuous_memories` 目录保留不删（历史数据可见）。
-- 所有新符号经 `plugins/life_engine/memory/__init__.py` 的 `_LAZY_EXPORTS` 惰性导出，既有导入路径尽量不变。
-- 旧 FTS/vector/node/edge 与关系衰减逻辑仍作为**派生检索层**兼容运行。它们可以改变联想路径和可达性，但不能覆盖 claim/evidence/belief，也不能把共现次数转化为“更真”。
-- 兼容层退出前必须证明历史数据已经迁移、当前调用者已切换、派生索引可重建。
+上游 LLM 暂时失败时保留待处理经历并退避重试，不打印每分钟一整段重复 traceback；恢复后继续同一游标。Experience 写入成功但见证生成或文件投影失败时，重试必须从账本重新取得同一批 canonical Experience（包括已经存在的行），只有见证窗口处理完成后才提交 consumer offset，禁止把“已入经历账本”误当成“已完成见证”。
 
----
+## 5. 可追溯文件版本
 
-## 14. 验收基线
+记忆文档的每次已知状态进入：
 
-- 全量测试：2865 passed，1 skipped，51 xfailed。
-- 覆盖率：61.11%。
-- 静态检查：`/usr/local/bin/ruff`（0.15.6）、`compileall`、`git diff --check` 全部通过。
-- 提交：`c74a861a`（`feat(memory): rebuild life memory foundation with epistemic lineage`），29 文件，+5352 / -3067，已推送至 `soul/main`。
-- 注意：以上数字是 `c74a861a` 当次重建验收基线，不代表后续 HEAD 的永久测试数量或覆盖率。后续变化应报告自己的实际验收结果。
+- `memory_artifact_versions`：完整不可变内容、hash、有效时间、作者、父版本；
+- `memory_artifact_derivations`：开放 predicate 的版本来路；
+- `memory_artifact_heads`：当前版本投影，可重建。
 
----
+内置写文件和改文件工具在写入成功后保存 before/after 版本与完整 unified diff。代码不再读取 `reason` 关键词，也不再用文本相似度猜“这次是修正、延续还是重命名”。这些意义只能由主体显式写成 `MemoryDerivation` 或 `SemanticRelation`。
 
-## 15. 关键文件索引
+启动恢复还会扫描工作区：
 
-| 文件 | 职责 |
-| --- | --- |
-| `plugins/life_engine/memory/epistemic.py` | 认识论本体：claim/evidence/belief/conflict/state-event/disposition/retrieval/audit，双时间投影，审计回放 |
-| `plugins/life_engine/memory/experience.py` | 不可变经历账本 + 主观见证层，不可变触发器 |
-| `plugins/life_engine/memory/repair.py` | 幂等索引修复 + 自环触发器防线 |
-| `plugins/life_engine/memory/service.py` | 接入 epistemic facade；`search_evidence_aware(valid_at, recorded_as_of)` 并行召回 claim；边表自环触发器 |
-| `plugins/life_engine/memory/tools.py` | `nucleus_search_memory` 新增 `valid_at`/`recorded_as_of` 注解参数 |
-| `plugins/life_engine/service/memory_witness.py` | 第一人称见证意识实例（由 diary_plugin 重生） |
-| `plugins/life_engine/memory/__init__.py` | 惰性导出新符号 |
+- 首次看到的文件形成 `startup_baseline`；
+- 绕过工具发生的人工修改形成 `startup_observed_change`；
+- 已知文件消失时追加 tombstone 版本；
+- 文件重新出现时以 tombstone 为父版本继续历史。
 
----
+因此“旧看法 → 新看法”的内容、时间和来路均可回放。
 
-## 16. 未来演进方向
+## 6. 解释是独立实体
 
-- Narrative / Learning 目前经兼容投影接 claim，未来可更深消费（如直接驱动 `SELF_NARRATIVE` 的生成与再解释闭环）。
-- 检索可塑性可引入更细的情境化 `accessibility` 规则（结合 `contextual_inhibition` 标签）。
-- 运行实例重启后，可基于双时间投影做一次全量"当前事实"健康自检，量化历史冲突与未决 claim。
+`memory_interpretations` 保存“主体如何解释一段经历或一个主题”，`memory_interpretation_sources` 指向事件、Experience、claim、文档版本或另一条解释。相同 `subject_id` 可以有多个互相矛盾或不断演进的解释；系统按记录时间查询，但不自动裁决谁覆盖谁。
 
----
+反思环的每个落盘洞察都会成为一条 source-linked interpretation。只有反思者显式填写 `reinforces` 时，证据才挂到旧洞察；相似文本、相同 topic、重复出现和坏引用都不会触发代码自动合并。
 
-> 关联文档：
-> - 意识实例架构：`docs/architecture/consciousness_instances.md`
-> - 设计原则：`docs/principles.md`
-> - 经历成为她计划：`docs/plans/2026-06-11_下一阶段建议_经历成为她.md`
-> - 长河计划：`docs/plans/2026-06-11_长河计划_追溯成为经历的脊柱.md`
->
-> 以下旧文档描述已被本文档取代的机制，仅供追溯历史设计，请勿作为当前实现依据：
-> `docs/architecture/Phase3_InnovationPoints/记忆系统设计与实现.md`、`docs/architecture/Phase4_ProblemSolution/记忆整合问题.md`、`docs/plans/memory_management_proposal.md`。
+`memory_interpretation_fts` 让解释参与统一检索。结果始终携带来源引用，并明确标注“解释不是源事实”。
+
+## 7. 认识论账本
+
+主要对象：
+
+- `MemoryClaim`：不可变主张与双时间；
+- `ClaimEvidence`：支持、挑战或语境来源；
+- `MemoryBelief`：某个视角与主张的关系；
+- `EpistemicConflict`：并列保存未裁决冲突；
+- `MemoryStateEvent`：追加式状态变化、因果与反转；
+- `MemoryDisposition`：可达性、认可、情境抑制、叙事显著性和可见性。
+
+`authority`、`claim_kind`、evidence stance 和 state-event 类型在存储层接受开放字符串。`AuthorityClass` 等旧枚举只保留为兼容标签，不是权限层级。系统不再执行 `source -> authority` 映射，也不再凭固定 authority 集合拒绝意识或独立审计者的显式状态事件。判断的 actor、authority 与 reason 会完整留痕。
+
+Learning→Epistemic 桥写入 `learning_insight` 候选和逐条 `ClaimEvidence`。学习审计的 verdict、分数与证据计数作为来源元数据保留，不会因 `source=learning_system` 自动获得“verified”权限。
+
+## 8. 活体回忆与共同回忆
+
+一次检索写入：
+
+- `memory_recall_sessions`：query、自由检索意图、stream、context、策略版本和随机种子；
+- `memory_recall_events`：开放 action 的候选暴露、采用、忽略等轨迹；
+- `memory_corecall_events`：一次回忆中共同出现的实体集合，是带 context 与 signal 的不可变超边；
+- `memory_association_projection`：由超边重建的 pair/context/signal 维度。
+
+共同回忆只改变 accessibility。不同 signal 分列保存，不折算成一个“真值强度”。检索邻居采用记录了随机种子的加权随机优先策略：
+
+- 每条保留的关联都有再次进入回忆的路径；
+- 共同回忆次数提高可达概率；
+- context 让同一记忆在不同场景中形成不同路径；
+- 给定同一账本、策略版本和 seed 可以重放选择；
+- 选择结果永远不写回 claim 的事实状态。
+
+关联可把文档带到解释或 claim，再把这些实体共同进入意识的事实写回新的 corecall。这个闭环就是当前“活体”实现；它不是唯一可能形式，未来可增加新的 signal 和策略版本，而无需改写旧事件。
+
+## 9. 统一检索
+
+`search_evidence_aware` 并行召回：
+
+1. 文档 FTS / chunk FTS / vector；
+2. epistemic claim FTS；
+3. subjective witness；
+4. interpretation FTS；
+5. 已记录 context 中的共同回忆邻居。
+
+搜索工具只执行一次昂贵文档检索，并把同一结果传给 bundle 和 evidence 层。`search_mode` 是自由描述的检索意图，不做 enum 拒绝。所有候选以 `rank_score` 排序，`confidence` 单独保留；不按 claim、文档或见证类型写死优先级。
+
+每次工具检索返回 `recall_episode`，包含 episode id、policy version、seed、context 和是否成功持久化轨迹。历史版本、来源关系和修正通过 bundle、artifact history、interpretation provenance 与 semantic relation 查询回放。
+
+## 10. 索引与自愈
+
+SQLite FTS 与 Chroma 都是可重建投影。活动 chunk collection marker 保存模型、维度、集合名和版本。启动时若 marker 无效、集合缺失或 metadata 不匹配：
+
+1. 仅删除活动投影 marker；
+2. 把活动文档标记为待向量同步；
+3. 幂等重新入队全部文档；
+4. worker 创建符合当前模型与维度的新集合；
+5. 旧事件、Experience、版本、claim 和解释均不受影响。
+
+这避免了“Chroma 已空但 SQLite 还声称同步完成”的永久降级状态。
+
+## 11. 健康检查
+
+`/api/health` 的 memory snapshot 包含：
+
+- SQLite integrity、foreign key、schema 与 tokenizer；
+- workspace/index 覆盖、hash 漂移、orphan、outbox；
+- vector collection 与 chunk ID 对比；
+- artifact versions/heads、interpretations/FTS、semantic relations；
+- recall sessions/events/corecall 与 association projection；
+- projection pair observation 是否与不可变超边计数一致；
+- claims without evidence。
+
+Life Engine 轻量 health 在事件总线已经初始化时还返回 raw ledger bounds、导入问题和每个 consumer 的 lag。健康检查只读；修复和 projection rebuild 是显式操作。
+
+当 `[memory_index].backend_enabled=false` 时，vector absence 是明确配置而不是故障，health 会返回 `vector.expected=false`、`vector.disabled=true`，不会仅因此标记 degraded。若以后重新开启后端，启动恢复会验证活动 collection 的名称与 metadata；缺失或不匹配时只废弃可重建的 vector marker 并重新入队，不改历史账本。
+
+启动恢复还会比较工作区正文与现有 node hash：外部编辑会同时追加 artifact version，并刷新 SQLite FTS/chunk 权威投影；曾删除后重新出现的文档会恢复活动状态。单个旧版非法 node identity 只留下诊断，不能阻断整个插件启动。
+
+## 12. 迁移与兼容
+
+- 旧 raw JSONL 自动幂等导入 SQLite，不删除源文件；
+- 旧 Experience 通过 occurrence alias 连接，不复制历史；
+- 旧 diary 继续幂等迁移为 legacy witness；
+- 旧 `memory_edges` 与 `memory_corrections` 保留为兼容证据；
+- 历史 `associates` 边不会伪装成新的共同回忆事件，也不会被提升为真值；
+- 新的共忆投影从真实 recall trace 生长；
+- 首次新版本启动为现有记忆文件建立 baseline；
+- projection rebuild 只重建派生表，不触碰账本。
+
+## 13. 失败语义
+
+- occurrence 身份冲突：拒绝写入；
+- consumer 历史缺口：拒绝推进游标；
+- artifact parent 缺失或内容 hash 不符：拒绝写入；
+- append-only 表 UPDATE/DELETE：SQLite trigger 拒绝；
+- LLM 500：保留工作并按请求级重试/退避，不把错误变成空见证；
+- vector projection 缺失：重建投影，不回退成永久失效状态；
+- 无法识别的 relation、authority、recall action：按开放文本记录，不用 fallback 类别替换。
+
+## 14. 验收命令
+
+定向回归：
+
+```bash
+uv run --group dev python -m pytest -q --no-cov -n 0 \
+  test/plugins/life_engine/test_memory_living.py \
+  test/plugins/life_engine/test_event_bus_attention.py \
+  test/plugins/life_engine/test_memory_experience.py \
+  test/plugins/life_engine/test_memory_epistemic_core.py \
+  test/plugins/life_engine/test_memory_epistemic_search.py \
+  test/plugins/life_engine/test_memory_service.py \
+  test/plugins/life_engine/test_memory_health.py
+```
+
+验收不能只看测试数量。至少要验证：跨重启事件位置、重复重放幂等、缺口拒绝跳过、文件旧/新/删除版本、解释 as-of 查询、共同回忆投影可重建、相同 seed 可重放、rank 不改变 truth、活动向量集合缺失时自动重建。
+
+## 15. 研究校准与工程翻译
+
+这套实现借鉴认知科学，但不宣称 SQLite 表或权重就是人脑机制的复刻：
+
+- Nader、Schafe 与 LeDoux 的[再巩固实验](https://doi.org/10.1038/35021052)表明，被重新唤起的已巩固恐惧记忆会重新进入可塑状态。它支持“回忆是事件、回忆后可以出现新解释”，但研究对象是动物恐惧记忆，不能被外推成“每次检索都应覆写旧内容”；工程上因此采用追加 interpretation/relation，保留旧版本。
+- Howard 与 Kahana 的[时间情境模型](https://doi.org/10.1006/jmps.2001.1388)，以及 Polyn、Norman 与 Kahana 的[情境维护与检索模型](https://doi.org/10.1037/a0014420)，把内部情境视为检索线索，并解释时间、语义和来源聚类。工程上因此记录 recall context、seed 和同次暴露集合，用情境化随机可达性替代全局固定“记忆强度”。
+- Speer 等人的[人类自传体记忆更新实验](https://doi.org/10.1038/s41467-021-26906-4)显示，回忆后的重新解释可能改变后续回忆内容和情绪。工程上把“当时发生什么”“当时如何理解”“后来如何解释”拆成不同、可按 recorded time 回放的实体。
+- Chan 等人的[跨事件检索研究](https://pubmed.ncbi.nlm.nih.gov/37582610/)发现，插入式检索可促进既有记忆与新学习的共同激活和整合。工程上共同回忆只增强后续可达性，并把 pair/context/signal 分开记录；它不增加 claim 的真实性或权威。
+
+这些研究提供设计约束，不提供认知裁决规则。系统仍禁止把论文中的实验效应翻译成硬编码人格分类、真值阈值或不可审计的自动改写。
+
+## 16. 仍保留的边界
+
+- SQLite 是当前单机权威存储；尚未实现跨机器共识。
+- 旧 retrieval-plasticity 与 legacy edge 仍用于兼容读取，但不参与事实裁决。
+- 当前共同回忆主要记录工具结果进入意识上下文；未来可由表达层追加“实际采用、主动拒绝、重新解释”等更细 signal。
+- tombstone 表示“启动时观察到文件不存在”，不声称知道删除者的主观意义。
+- Elysium 与 NapCat 保持用户手工启动；记忆自愈不授权 systemd、计划任务或守护进程拉起它们。本地 New API 中转站按机器约定独立自动启动。

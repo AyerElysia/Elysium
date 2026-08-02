@@ -306,6 +306,25 @@ async def test_health_compares_chunk_collection_with_chunk_ids(tmp_path: Path) -
     json.dumps(snapshot)
 
 
+async def test_disabled_vector_backend_is_reported_as_expected_absence(
+    tmp_path: Path,
+) -> None:
+    db = _db(tmp_path)
+
+    snapshot = await health_snapshot(
+        db,
+        tmp_path,
+        None,
+        vector_expected=False,
+    )
+
+    assert snapshot["status"] == "ok"
+    assert snapshot["vector"]["available"] is False
+    assert snapshot["vector"]["expected"] is False
+    assert snapshot["vector"]["disabled"] is True
+    assert snapshot["vector_degraded"] is False
+
+
 async def test_health_requires_exact_stored_identity_for_coverage_and_vectors(
     tmp_path: Path,
 ) -> None:

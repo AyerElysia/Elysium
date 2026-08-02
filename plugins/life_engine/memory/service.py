@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -22,6 +23,7 @@ from src.app.plugin_system.api import log_api
 
 from .nodes import (
     MemoryNode,
+    compute_content_hash,
     generate_file_node_id,
     get_or_create_file_node,
     get_node_by_file_path,
@@ -73,6 +75,7 @@ from .decay import (
     get_stats,
 )
 from .indexing import (
+    ACTIVE_CHUNK_STATE_KEY,
     ChunkIndexState,
     DocumentIndexResult,
     IndexJob,
@@ -126,7 +129,6 @@ from .epistemic import (
     MemoryClaim,
     MemoryDisposition,
     MemoryStateEvent,
-    AuthorityClass,
     RetrievalEpisode,
     RetrievalExposure,
     RetrievalFeedback,
@@ -153,10 +155,12 @@ from .epistemic import (
 )
 from .experience import (
     EvidenceAwareMemoryResult,
+    ExperienceAppendReport,
     ExperienceRecord,
     MemorySearchMode,
     WitnessMemory,
     WitnessSearchResult,
+    append_experiences_detailed,
     create_life_memory_schema,
     get_witness_by_projection_path,
     get_witness_state,
@@ -170,6 +174,37 @@ from .experience import (
     record_witness_migration,
     search_witness_memories,
     update_witness_state,
+)
+from .living import (
+    AssociationEvidence,
+    AssociationSelection,
+    CoRecallEvent,
+    InterpretationSource,
+    InterpretationSearchResult,
+    MemoryArtifactVersion,
+    MemoryDerivation,
+    MemoryInterpretation,
+    RecallEpisode,
+    RecallEvent,
+    SemanticRelation,
+    append_artifact_version,
+    append_corecall_event,
+    append_interpretation,
+    append_recall_events,
+    append_semantic_relation,
+    begin_recall_episode,
+    choose_association_neighbours,
+    create_living_memory_schema,
+    get_artifact_head,
+    get_interpretation,
+    list_artifact_heads,
+    list_artifact_history,
+    list_association_evidence,
+    list_interpretations,
+    list_semantic_relations,
+    new_artifact_version,
+    rebuild_association_projection,
+    search_interpretations,
 )
 
 logger = log_api.get_logger("life_engine.memory")
@@ -212,10 +247,12 @@ def _select_indexed_file_nodes(db: sqlite3.Connection) -> list[sqlite3.Row]:
         db: 只读连接。
 
     Returns:
-        list[sqlite3.Row]: 含 ``node_id`` / ``file_path`` / ``is_deleted``。
+        list[sqlite3.Row]: 含 ``node_id`` / ``file_path`` / ``content_hash`` /
+        ``is_deleted``。
     """
     return db.execute(
-        "SELECT node_id, file_path, is_deleted FROM memory_nodes WHERE node_type = 'file'"
+        "SELECT node_id, file_path, content_hash, is_deleted "
+        "FROM memory_nodes WHERE node_type = 'file'"
     ).fetchall()
 
 
@@ -293,6 +330,28 @@ def _enqueue_jobs(
         except Exception as exc:
             logger.warning(f"补 embedding 入队失败 {node_id}: {exc}")
     return enqueued
+
+
+def _invalidate_missing_vector_projection(db: sqlite3.Connection) -> int:
+    """Discard only stale vector projection state and enqueue a full rebuild."""
+
+    rows = db.execute(
+        """SELECT node_id, content_hash FROM memory_nodes
+        WHERE node_type = 'file' AND is_deleted = 0"""
+    ).fetchall()
+    with transaction(db):
+        db.execute(
+            "DELETE FROM memory_index_state WHERE state_key = ?",
+            (ACTIVE_CHUNK_STATE_KEY,),
+        )
+        db.execute(
+            """UPDATE memory_nodes SET embedding_synced = 0
+            WHERE node_type = 'file' AND is_deleted = 0"""
+        )
+    return _enqueue_jobs(
+        db,
+        [(str(row["node_id"]), str(row["content_hash"] or "")) for row in rows],
+    )
 
 
 @dataclass(frozen=True)
@@ -579,12 +638,25 @@ class LifeMemoryService:
                 await run_db(create_memory_schema, db)
                 await run_db(create_life_memory_schema, db)
                 await run_db(create_epistemic_schema, db)
+                await run_db(create_living_memory_schema, db)
 
                 if self._vector_backend_enabled:
                     try:
                         await self._restore_chunk_collection()
                     except Exception as exc:
-                        logger.warning(f"恢复 chunk 向量集合失败，已降级到 legacy: {exc}")
+                        requeued = await run_db(
+                            _invalidate_missing_vector_projection,
+                            db,
+                        )
+                        self._chunk_index_state = None
+                        self._chunk_collection = None
+                        self._chunk_collection_identity = None
+                        self._chunk_collection_candidate = None
+                        self._chunk_collection_candidate_identity = None
+                        logger.warning(
+                            "恢复 chunk 向量集合失败；已废弃可重建投影并将 "
+                            f"{requeued} 个文档重新入队: {exc}"
+                        )
 
                     self._chroma_collection = await self._get_chroma_collection()
                 else:
@@ -750,24 +822,49 @@ class LifeMemoryService:
         workspace_paths: set[str] = {doc.path for doc in scan.documents}
 
         indexed_rows = await run_read(_select_indexed_file_nodes)
-        indexed_paths: dict[str, tuple[str, int]] = {}
+        indexed_paths: dict[str, tuple[str, int, str]] = {}
         for row in indexed_rows:
             fp = str(row["file_path"] or "")
             if fp:
-                indexed_paths[fp] = (str(row["node_id"]), int(row["is_deleted"] or 0))
+                indexed_paths[fp] = (
+                    str(row["node_id"]),
+                    int(row["is_deleted"] or 0),
+                    str(row["content_hash"] or ""),
+                )
+
+        # 1a. 文件系统也是记忆输入端。捕获绕过内置工具发生的人工修改与删除，
+        # 追加到版本账本；同时刷新已有文档的 FTS/chunk 权威投影，避免“版本看见了变化，
+        # 检索正文却仍停在旧内容”的双重现实。
+        active_index_hashes = {
+            path: content_hash
+            for path, (_node_id, deleted, content_hash) in indexed_paths.items()
+            if deleted == 0 and content_hash
+        }
+        versioned = await self._reconcile_workspace_artifact_versions(
+            scan.documents,
+            workspace_paths,
+            indexed_hashes=active_index_hashes,
+        )
+        if versioned:
+            logger.info(f"启动扫描：记忆版本账本追加 {versioned} 个观察版本")
 
         # 2. 补索引缺口：工作区有但未索引的文件
-        unindexed = workspace_paths - set(indexed_paths.keys())
+        active_indexed_paths = {
+            path
+            for path, (_node_id, deleted, _content_hash) in indexed_paths.items()
+            if deleted == 0
+        }
+        unindexed = workspace_paths - active_indexed_paths
         if unindexed:
             logger.info(f"启动扫描：发现 {len(unindexed)} 个未索引文件，开始补索引")
             enqueued = await self._index_missing_documents(workspace, db, sorted(unindexed))
             logger.info(f"启动扫描完成：已入队 {enqueued}/{len(unindexed)} 个文件待 embedding")
 
         # 3. 标记 ghost 节点：索引中有但工作区已删除的文件
-        ghost_paths = set(indexed_paths.keys()) - workspace_paths
+        ghost_paths = active_indexed_paths - workspace_paths
         ghost_node_ids = []
         for fp in ghost_paths:
-            nid, deleted = indexed_paths[fp]
+            nid, deleted, _content_hash = indexed_paths[fp]
             if deleted == 0:  # 还没标记删除
                 ghost_node_ids.append(nid)
         if ghost_node_ids:
@@ -779,6 +876,126 @@ class LifeMemoryService:
         if orphan_edge_ids:
             await run_db(_delete_edges, db, orphan_edge_ids)
             logger.info(f"启动清理：删除 {len(orphan_edge_ids)} 条孤立边")
+
+    async def _reconcile_workspace_artifact_versions(
+        self,
+        documents: Sequence[Any],
+        workspace_paths: set[str],
+        *,
+        indexed_hashes: dict[str, str] | None = None,
+    ) -> int:
+        """Append artifact history and refresh externally changed search rows."""
+
+        db = self._require_db()
+        workspace = self._get_workspace_path()
+        heads = await run_db(list_artifact_heads, db)
+        appended = 0
+        refreshed = 0
+        known_hashes = indexed_hashes or {}
+        for document in documents:
+            try:
+                content, source_mtime, _size = await asyncio.to_thread(
+                    read_workspace_document,
+                    workspace,
+                    document.path,
+                )
+            except (FileNotFoundError, OSError, ValueError) as exc:
+                logger.warning(f"记忆版本扫描读取失败 {document.path}: {exc}")
+                continue
+
+            current_hash = compute_content_hash(content) if content else ""
+            indexed_hash = known_hashes.get(document.path)
+            if indexed_hash is not None and current_hash and indexed_hash != current_hash:
+                try:
+                    await get_or_create_file_node(
+                        db=db,
+                        file_path=document.path,
+                        title=Path(document.path).stem,
+                        content=content,
+                    )
+                    refreshed += 1
+                except Exception as exc:
+                    # 旧版非规范 node identity 不能在普通启动中偷偷迁移；留下诊断，
+                    # 但不能让一个坏节点阻止其余记忆与插件启动。
+                    logger.warning(
+                        f"刷新外部变更文档的检索投影失败 {document.path}: {exc}"
+                    )
+
+            head = heads.get(document.path)
+            if head is not None and head.content == content:
+                continue
+            parents = (head.artifact_id,) if head is not None else ()
+            version = new_artifact_version(
+                logical_key=document.path,
+                artifact_kind="workspace_memory_document",
+                content=content,
+                parent_artifact_ids=parents,
+                authored_by="workspace_reconciler",
+                consciousness_instance_id="life_engine",
+                valid_from=datetime.fromtimestamp(source_mtime).astimezone().isoformat(),
+                metadata={
+                    "observation": (
+                        "startup_baseline" if head is None else "startup_observed_change"
+                    ),
+                    "source_mtime": source_mtime,
+                },
+            )
+            derivations: tuple[MemoryDerivation, ...] = ()
+            if head is not None:
+                derivations = (
+                    MemoryDerivation(
+                        derivation_id=f"derivation_{uuid.uuid4().hex}",
+                        generated_artifact_id=version.artifact_id,
+                        used_artifact_id=head.artifact_id,
+                        predicate="workspace_change_observed",
+                        reason="启动时观察到工作区内容与已知版本不同",
+                        actor="workspace_reconciler",
+                        recorded_at=version.recorded_at,
+                    ),
+                )
+            await run_db(
+                append_artifact_version,
+                db,
+                version,
+                derivations=derivations,
+            )
+            heads[document.path] = version
+            appended += 1
+
+        for logical_key, head in heads.items():
+            if logical_key in workspace_paths:
+                continue
+            if head.artifact_kind == "workspace_memory_document_tombstone":
+                continue
+            tombstone = new_artifact_version(
+                logical_key=logical_key,
+                artifact_kind="workspace_memory_document_tombstone",
+                content="",
+                parent_artifact_ids=(head.artifact_id,),
+                authored_by="workspace_reconciler",
+                consciousness_instance_id="life_engine",
+                metadata={"observation": "startup_observed_deletion"},
+            )
+            await run_db(
+                append_artifact_version,
+                db,
+                tombstone,
+                derivations=(
+                    MemoryDerivation(
+                        derivation_id=f"derivation_{uuid.uuid4().hex}",
+                        generated_artifact_id=tombstone.artifact_id,
+                        used_artifact_id=head.artifact_id,
+                        predicate="workspace_deletion_observed",
+                        reason="启动时观察到记忆文件已不存在",
+                        actor="workspace_reconciler",
+                        recorded_at=tombstone.recorded_at,
+                    ),
+                ),
+            )
+            appended += 1
+        if refreshed:
+            logger.info(f"启动扫描：刷新 {refreshed} 个外部变更文档的检索投影")
+        return appended
 
     async def _requeue_unembedded(
         self,
@@ -1089,6 +1306,7 @@ class LifeMemoryService:
         content: str,
         claim_kind: str,
         source: str,
+        authority: str = "",
         valid_from: str = "",
         valid_to: str = "",
         stream_scope: str = "",
@@ -1104,6 +1322,7 @@ class LifeMemoryService:
             content=content,
             claim_kind=claim_kind,
             source=source,
+            authority=authority,
             valid_from=valid_from,
             valid_to=valid_to,
             stream_scope=stream_scope,
@@ -1282,6 +1501,325 @@ class LifeMemoryService:
             db = self._require_db()
             return await run_db(insert_experiences, db, records)
 
+    async def append_experiences_detailed(
+        self,
+        records: List[ExperienceRecord],
+    ) -> ExperienceAppendReport:
+        """Append occurrences and expose only canonical new evidence."""
+
+        async with self._index_write_lock:
+            db = self._require_db()
+            return await run_db(append_experiences_detailed, db, records)
+
+    async def record_memory_artifact_version(
+        self,
+        version: MemoryArtifactVersion,
+        *,
+        derivations: Sequence[MemoryDerivation] = (),
+    ) -> MemoryArtifactVersion:
+        """Append one immutable memory artifact version and provenance."""
+
+        async with self._index_write_lock:
+            return await run_db(
+                append_artifact_version,
+                self._require_db(),
+                version,
+                derivations=derivations,
+            )
+
+    async def version_memory_artifact(
+        self,
+        *,
+        logical_key: str,
+        artifact_kind: str,
+        content: str,
+        authored_by: str = "",
+        consciousness_instance_id: str = "",
+        stream_scope: str = "",
+        visibility: str = "private",
+        valid_from: str = "",
+        predicate: str = "revises",
+        reason: str = "",
+        metadata: Dict[str, Any] | None = None,
+    ) -> MemoryArtifactVersion:
+        """Create a new head while preserving the previous artifact version."""
+
+        async with self._index_write_lock:
+            db = self._require_db()
+            head = await run_db(get_artifact_head, db, logical_key)
+            parents = (head.artifact_id,) if head is not None else ()
+            version = new_artifact_version(
+                logical_key=logical_key,
+                artifact_kind=artifact_kind,
+                content=content,
+                parent_artifact_ids=parents,
+                authored_by=authored_by,
+                consciousness_instance_id=consciousness_instance_id,
+                stream_scope=stream_scope,
+                visibility=visibility,
+                valid_from=valid_from,
+                metadata=metadata or {},
+            )
+            derivations: tuple[MemoryDerivation, ...] = ()
+            if head is not None:
+                derivations = (
+                    MemoryDerivation(
+                        derivation_id=f"derivation_{uuid.uuid4().hex}",
+                        generated_artifact_id=version.artifact_id,
+                        used_artifact_id=head.artifact_id,
+                        predicate=predicate,
+                        reason=reason,
+                        actor=authored_by,
+                        recorded_at=version.recorded_at,
+                    ),
+                )
+            return await run_db(
+                append_artifact_version,
+                db,
+                version,
+                derivations=derivations,
+            )
+
+    async def get_memory_artifact_history(
+        self,
+        logical_key: str,
+    ) -> List[MemoryArtifactVersion]:
+        """Return every immutable version of one logical memory artifact."""
+
+        async with self._index_write_lock:
+            return await run_db(
+                list_artifact_history,
+                self._require_db(),
+                logical_key,
+            )
+
+    async def record_memory_interpretation(
+        self,
+        interpretation: MemoryInterpretation,
+        *,
+        sources: Sequence[InterpretationSource] = (),
+    ) -> MemoryInterpretation:
+        """Append one subject-authored interpretation and its sources."""
+
+        async with self._index_write_lock:
+            return await run_db(
+                append_interpretation,
+                self._require_db(),
+                interpretation,
+                sources=sources,
+            )
+
+    async def record_memory_semantic_relation(
+        self,
+        relation: SemanticRelation,
+    ) -> SemanticRelation:
+        """Append an explicit relation without a closed predicate taxonomy."""
+
+        async with self._index_write_lock:
+            return await run_db(
+                append_semantic_relation,
+                self._require_db(),
+                relation,
+            )
+
+    async def list_memory_semantic_relations(
+        self,
+        entity_ref: str,
+    ) -> List[SemanticRelation]:
+        """Return every explicit relation touching one memory entity."""
+
+        async with self._index_write_lock:
+            return await run_db(
+                list_semantic_relations,
+                self._require_db(),
+                entity_ref,
+            )
+
+    async def list_memory_interpretations(
+        self,
+        subject_id: str,
+        *,
+        recorded_as_of: str = "",
+    ) -> List[MemoryInterpretation]:
+        """Read the interpretation history available at a recorded time."""
+
+        async with self._index_write_lock:
+            return await run_db(
+                list_interpretations,
+                self._require_db(),
+                subject_id,
+                recorded_as_of=recorded_as_of,
+            )
+
+    async def search_memory_interpretations(
+        self,
+        query: str,
+        *,
+        top_k: int = 5,
+        stream_scope: str | None = None,
+        visibility: tuple[str, ...] = ("private",),
+        recorded_as_of: str = "",
+    ) -> List[InterpretationSearchResult]:
+        """Search subject-authored interpretations with their source trace."""
+
+        async with self._index_write_lock:
+            return await run_db(
+                search_interpretations,
+                self._require_db(),
+                query,
+                top_k=top_k,
+                stream_scope=stream_scope,
+                visibility=visibility,
+                recorded_as_of=recorded_as_of,
+            )
+
+    async def get_memory_interpretation(
+        self,
+        interpretation_id: str,
+    ) -> tuple[MemoryInterpretation, tuple[InterpretationSource, ...]] | None:
+        """Read one interpretation and its provenance by stable identity."""
+
+        async with self._index_write_lock:
+            return await run_db(
+                get_interpretation,
+                self._require_db(),
+                interpretation_id,
+            )
+
+    async def select_memory_association_neighbours(
+        self,
+        seed_refs: Sequence[str],
+        *,
+        context_key: str,
+        random_seed: int,
+        limit: int,
+    ) -> List[AssociationSelection]:
+        """Select replayable contextual neighbours across memory entity kinds."""
+
+        async with self._index_write_lock:
+            return await run_db(
+                choose_association_neighbours,
+                self._require_db(),
+                seed_refs,
+                context_key=context_key,
+                random_seed=random_seed,
+                limit=limit,
+            )
+
+    async def begin_memory_recall(
+        self,
+        **kwargs: Any,
+    ) -> RecallEpisode:
+        """Start a replayable recall episode with an open retrieval intent."""
+
+        async with self._index_write_lock:
+            return await run_db(begin_recall_episode, self._require_db(), **kwargs)
+
+    async def append_memory_recall_events(
+        self,
+        events: Sequence[RecallEvent],
+    ) -> tuple[RecallEvent, ...]:
+        """Append objective and subject-authored traces for one recall."""
+
+        async with self._index_write_lock:
+            return await run_db(
+                append_recall_events,
+                self._require_db(),
+                events,
+            )
+
+    async def append_memory_corecall(
+        self,
+        event: CoRecallEvent,
+    ) -> CoRecallEvent:
+        """Append a contextual co-recall hyperedge and update its projection."""
+
+        async with self._index_write_lock:
+            return await run_db(
+                append_corecall_event,
+                self._require_db(),
+                event,
+            )
+
+    async def list_memory_association_evidence(
+        self,
+        entity_ref: str,
+        *,
+        context_key: str | None = None,
+    ) -> List[AssociationEvidence]:
+        """Return separate contextual association dimensions."""
+
+        async with self._index_write_lock:
+            return await run_db(
+                list_association_evidence,
+                self._require_db(),
+                entity_ref,
+                context_key=context_key,
+            )
+
+    async def rebuild_memory_association_projection(self) -> int:
+        """Rebuild derived pairwise accessibility from immutable hyperedges."""
+
+        async with self._index_write_lock:
+            return await run_db(
+                rebuild_association_projection,
+                self._require_db(),
+            )
+
+    async def expand_living_document_associations(
+        self,
+        results: Sequence[SearchResult],
+        *,
+        context_key: str,
+        random_seed: int,
+        limit: int,
+    ) -> List[SearchResult]:
+        """Add replayable contextual document neighbours to direct recall."""
+
+        seed_refs = [
+            f"document:{item.file_path}"
+            for item in results
+            if item.file_path
+        ]
+        async with self._index_write_lock:
+            selections: list[AssociationSelection] = await run_db(
+                choose_association_neighbours,
+                self._require_db(),
+                seed_refs,
+                context_key=context_key,
+                random_seed=random_seed,
+                limit=max(0, int(limit)),
+            )
+        expanded = list(results)
+        seen_paths = {item.file_path for item in expanded}
+        for index, selection in enumerate(selections):
+            if not selection.entity_ref.startswith("document:"):
+                continue
+            path = selection.entity_ref.removeprefix("document:")
+            if not path or path in seen_paths:
+                continue
+            node = await self.get_node_by_file_path(path, migrate_identity=False)
+            if node is None:
+                continue
+            expanded.append(
+                SearchResult(
+                    file_path=path,
+                    title=node.title,
+                    snippet=node.preview_content,
+                    relevance=1.0 / float(self.RRF_K + index + 1),
+                    source="associated",
+                    association_path=list(seed_refs),
+                    association_reason=(
+                        "living recall evidence: "
+                        + ", ".join(selection.signals)
+                        + f"; events={selection.event_count}"
+                    ),
+                    score_kind="accessibility_rank_not_truth",
+                )
+            )
+            seen_paths.add(path)
+        return expanded
+
     async def list_experiences_after(
         self,
         sequence: int,
@@ -1385,7 +1923,7 @@ class LifeMemoryService:
         self,
         query: str,
         *,
-        mode: MemorySearchMode = MemorySearchMode.EXPLORATORY,
+        mode: MemorySearchMode | str = "",
         top_k: int = 5,
         stream_scope: str | None = None,
         visibility: tuple[str, ...] = ("private",),
@@ -1393,14 +1931,13 @@ class LifeMemoryService:
         recorded_as_of: str = "",
     ) -> List[ClaimSearchResult]:
         """检索主张本体并保留状态、证据、冲突和可塑性解释。"""
-        if not isinstance(mode, MemorySearchMode):
-            mode = MemorySearchMode(str(mode))
+        mode_text = mode.value if isinstance(mode, MemorySearchMode) else str(mode or "")
         async with self._index_write_lock:
             return await run_db(
                 search_epistemic_claims,
                 self._require_db(),
                 query,
-                mode=mode.value,
+                mode=mode_text,
                 top_k=top_k,
                 stream_scope=stream_scope,
                 visibility=visibility,
@@ -1412,17 +1949,18 @@ class LifeMemoryService:
         self,
         query: str,
         *,
-        mode: MemorySearchMode = MemorySearchMode.EXPLORATORY,
+        mode: MemorySearchMode | str = "",
         top_k: int = 5,
         stream_scope: str | None = None,
         visibility: tuple[str, ...] = ("private",),
         enable_association: bool = True,
         valid_at: str = "",
         recorded_as_of: str = "",
+        document_results: Sequence[SearchResult] | None = None,
+        association_context_key: str = "",
+        association_random_seed: int | None = None,
     ) -> List[EvidenceAwareMemoryResult]:
         """并行召回文档与见证，并保留来源、视角和认识论边界。"""
-        if not isinstance(mode, MemorySearchMode):
-            mode = MemorySearchMode(str(mode))
         if self._db is None or self._closing:
             claim_task = asyncio.sleep(0, result=[])
         else:
@@ -1435,12 +1973,15 @@ class LifeMemoryService:
                 valid_at=valid_at,
                 recorded_as_of=recorded_as_of,
             )
-        document_task = self.search_memory(
-            query,
-            top_k=max(1, int(top_k)),
-            enable_association=enable_association,
-            return_bundles=False,
-        )
+        if document_results is None:
+            document_task = self.search_memory(
+                query,
+                top_k=max(1, int(top_k)),
+                enable_association=enable_association,
+                return_bundles=False,
+            )
+        else:
+            document_task = asyncio.sleep(0, result=list(document_results))
         witness_task = self.search_witness_memories(
             query,
             mode=mode,
@@ -1448,10 +1989,26 @@ class LifeMemoryService:
             stream_scope=stream_scope,
             visibility=visibility,
         )
-        claim_results, document_results, witness_results = await asyncio.gather(
+        if self._db is None or self._closing:
+            interpretation_task = asyncio.sleep(0, result=[])
+        else:
+            interpretation_task = self.search_memory_interpretations(
+                query,
+                top_k=max(1, int(top_k)),
+                stream_scope=stream_scope,
+                visibility=visibility,
+                recorded_as_of=recorded_as_of,
+            )
+        (
+            claim_results,
+            document_results,
+            witness_results,
+            interpretation_results,
+        ) = await asyncio.gather(
             claim_task,
             document_task,
             witness_task,
+            interpretation_task,
         )
         candidates: list[EvidenceAwareMemoryResult] = []
         for result in claim_results:
@@ -1583,30 +2140,146 @@ class LifeMemoryService:
                     },
                 )
             )
-        priority = {
-            MemorySearchMode.AUTOBIOGRAPHICAL: {
-                "subjective_witness": 0,
-                "legacy_witness": 1,
-                "self_narrative": 2,
-                "document_evidence": 3,
-            },
-            MemorySearchMode.CURRENT_FACT: {
-                "epistemic_claim": 0,
-                "document_evidence": 1,
-                "observed_event": 2,
-                "subjective_witness": 3,
-                "legacy_witness": 4,
-            },
-            MemorySearchMode.HISTORICAL: {
-                "epistemic_claim": 0,
-                "document_evidence": 1,
-                "subjective_witness": 2,
-                "legacy_witness": 3,
-            },
-        }.get(mode, {})
+        for result in interpretation_results:
+            interpretation = result.interpretation
+            candidates.append(
+                EvidenceAwareMemoryResult(
+                    record_id=interpretation.interpretation_id,
+                    kind="memory_interpretation",
+                    content=interpretation.content,
+                    rank_score=float(result.rank_score),
+                    confidence=None,
+                    source=result.retrieval_source,
+                    valid_from=interpretation.valid_from,
+                    valid_to=interpretation.valid_to,
+                    recorded_at=interpretation.recorded_at,
+                    stream_scope=interpretation.stream_scope,
+                    visibility=interpretation.visibility,
+                    provenance=tuple(item.entity_ref for item in result.sources),
+                    metadata={
+                        "subject_id": interpretation.subject_id,
+                        "authored_by": interpretation.authored_by,
+                        "consciousness_instance_id": (
+                            interpretation.consciousness_instance_id
+                        ),
+                        "source_predicates": [
+                            item.predicate for item in result.sources
+                        ],
+                        "epistemic_note": (
+                            "subject-authored interpretation, not source truth"
+                        ),
+                    },
+                )
+            )
+        if (
+            enable_association
+            and association_context_key
+            and association_random_seed is not None
+            and candidates
+        ):
+            seed_refs = tuple(
+                dict.fromkeys(
+                    (
+                        f"document:{item.record_id}"
+                        if item.kind == "document_evidence"
+                        else f"{item.kind}:{item.record_id}"
+                    )
+                    for item in candidates
+                )
+            )
+            neighbours = await self.select_memory_association_neighbours(
+                seed_refs,
+                context_key=association_context_key,
+                random_seed=association_random_seed,
+                limit=max(1, int(top_k)),
+            )
+            existing_refs = set(seed_refs)
+            for ordinal, neighbour in enumerate(neighbours, start=1):
+                entity_ref = neighbour.entity_ref
+                if entity_ref in existing_refs:
+                    continue
+                if entity_ref.startswith("memory_interpretation:"):
+                    interpretation_id = entity_ref.split(":", 1)[1]
+                    loaded = await self.get_memory_interpretation(interpretation_id)
+                    if loaded is None:
+                        continue
+                    interpretation, sources = loaded
+                    if interpretation.visibility not in visibility:
+                        continue
+                    if stream_scope is None and interpretation.stream_scope:
+                        continue
+                    if stream_scope is not None and interpretation.stream_scope not in {
+                        "",
+                        stream_scope,
+                    }:
+                        continue
+                    candidates.append(
+                        EvidenceAwareMemoryResult(
+                            record_id=interpretation.interpretation_id,
+                            kind="memory_interpretation",
+                            content=interpretation.content,
+                            rank_score=1.0 / float(80 + ordinal),
+                            confidence=None,
+                            source="contextual_corecall",
+                            valid_from=interpretation.valid_from,
+                            valid_to=interpretation.valid_to,
+                            recorded_at=interpretation.recorded_at,
+                            stream_scope=interpretation.stream_scope,
+                            visibility=interpretation.visibility,
+                            provenance=tuple(item.entity_ref for item in sources),
+                            metadata={
+                                "subject_id": interpretation.subject_id,
+                                "association_signals": list(neighbour.signals),
+                                "association_event_count": neighbour.event_count,
+                                "epistemic_note": (
+                                    "co-recall changes accessibility, not truth"
+                                ),
+                            },
+                        )
+                    )
+                    existing_refs.add(entity_ref)
+                elif entity_ref.startswith("epistemic_claim:"):
+                    claim_id = entity_ref.split(":", 1)[1]
+                    state = await self.get_memory_claim_state(claim_id)
+                    if state is None:
+                        continue
+                    claim = state.claim
+                    if claim.visibility not in visibility:
+                        continue
+                    if stream_scope is None and claim.stream_scope:
+                        continue
+                    if stream_scope is not None and claim.stream_scope not in {
+                        "",
+                        stream_scope,
+                    }:
+                        continue
+                    candidates.append(
+                        EvidenceAwareMemoryResult(
+                            record_id=claim.claim_id,
+                            kind="epistemic_claim",
+                            content=claim.content,
+                            rank_score=1.0 / float(80 + ordinal),
+                            confidence=None,
+                            source="contextual_corecall",
+                            valid_from=claim.valid_from,
+                            valid_to=claim.valid_to,
+                            recorded_at=claim.recorded_at,
+                            stream_scope=claim.stream_scope,
+                            visibility=claim.visibility,
+                            status=state.status,
+                            metadata={
+                                "subject_key": claim.subject_key,
+                                "association_signals": list(neighbour.signals),
+                                "association_event_count": neighbour.event_count,
+                                "epistemic_note": (
+                                    "co-recall changes accessibility, not truth"
+                                ),
+                            },
+                        )
+                    )
+                    existing_refs.add(entity_ref)
         candidates.sort(
             key=lambda item: (
-                priority.get(item.kind, 1),
                 -item.rank_score,
                 item.recorded_at,
                 item.record_id,
@@ -1625,7 +2298,7 @@ class LifeMemoryService:
         self,
         query: str,
         *,
-        mode: MemorySearchMode = MemorySearchMode.AUTOBIOGRAPHICAL,
+        mode: MemorySearchMode | str = "",
         top_k: int = 5,
         stream_scope: str | None = None,
         visibility: tuple[str, ...] = ("private",),
@@ -2017,6 +2690,7 @@ class LifeMemoryService:
                 content=correction.message,
                 claim_kind="correction_candidate",
                 source=source,
+                authority="unasserted",
                 stream_scope=correction.stream_id or "",
                 metadata={
                     "legacy_correction_id": correction.correction_id,
@@ -2028,27 +2702,6 @@ class LifeMemoryService:
                 ).astimezone().isoformat(),
             )
             await self.append_memory_claim(claim)
-            authority = claim.authority
-            if authority in {
-                AuthorityClass.SUBJECT.value,
-                AuthorityClass.EXPLICIT_USER.value,
-                AuthorityClass.VERIFIED.value,
-                AuthorityClass.AUTHORITATIVE.value,
-            }:
-                await self.append_memory_state_event(
-                    MemoryStateEvent(
-                        event_id=f"confirm_{claim.claim_id}",
-                        entity_type="claim",
-                        entity_id=claim.claim_id,
-                        event_type="claim_confirmed",
-                        actor=source,
-                        authority=authority,
-                        reason="兼容修正记录具有明确来源权限",
-                        recorded_at=claim.recorded_at,
-                        valid_at=claim.valid_from or claim.recorded_at,
-                        caused_by_event_id=correction.correction_id,
-                    )
-                )
 
     async def resolve_canonical_path(
         self,
@@ -2585,7 +3238,7 @@ class LifeMemoryService:
             primary = evidence[0]
         snippet = " ".join(((primary.snippet if primary else "") or "").split())
         if snippet:
-            return f"当前以 {primary_path} 为主要依据：{snippet[:220]}"
+            return f"当前以 {primary_path} 为主要依据：{snippet}"
         return f"当前以 {primary_path} 为主要依据；需要读取全文确认细节。"
 
     def _build_bundle_uncertainty(
@@ -2658,6 +3311,7 @@ class LifeMemoryService:
             db_path,
             self._get_workspace_path(),
             collection,
+            vector_expected=self._vector_backend_enabled,
         )
 
     # --------------------------------------------------------

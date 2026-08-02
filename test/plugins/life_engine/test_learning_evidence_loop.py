@@ -67,30 +67,30 @@ def _iso(offset_minutes: int) -> str:
     return (datetime.now(timezone.utc) + timedelta(minutes=offset_minutes)).isoformat()
 
 
-class TestParaphraseBecomesEvidence:
-    """同一模式的改述：并入已有洞察，不新建。"""
+class TestParaphraseStaysDistinctWithoutAuthoredRelation:
+    """相似文本只是候选线索，不能由代码擅自合并认识。"""
 
     def test_paraphrase_merges_as_evidence(self, tmp_path):
         store = InsightStore(tmp_path)
         original = _insight(_CLAIM_A, topic_key="线程边界")
         assert store.add_insight(original) is True
 
-        # 换了 topic_key —— 真实账本里 49 条洞察有 44 个不同 key，
-        # 此前这一条就会因为 key 不同而直接跳过比较，存成第二条洞察
         paraphrase = _insight(_CLAIM_A_PARAPHRASE, topic_key="并行收尾")
-        assert store.add_insight(paraphrase) is False
+        assert store.add_insight(paraphrase) is True
 
         all_insights = store.list_all()
-        assert len(all_insights) == 1
-        assert len(all_insights[0].evidence) == 2
+        assert len(all_insights) == 2
+        assert [len(item.evidence) for item in all_insights] == [1, 1]
 
     def test_merged_evidence_records_the_new_wording(self, tmp_path):
         store = InsightStore(tmp_path)
         store.add_insight(_insight(_CLAIM_A, topic_key="线程边界"))
         store.add_insight(_insight(_CLAIM_A_PARAPHRASE, topic_key="并行收尾"))
 
-        newest = store.list_all()[0].evidence[-1]
-        assert _CLAIM_A_PARAPHRASE in newest.context
+        assert [item.claim for item in store.list_all()] == [
+            _CLAIM_A,
+            _CLAIM_A_PARAPHRASE,
+        ]
 
     def test_distinct_claim_still_creates_new_insight(self, tmp_path):
         store = InsightStore(tmp_path)
@@ -99,15 +99,13 @@ class TestParaphraseBecomesEvidence:
         assert store.add_insight(_insight(_CLAIM_DISTINCT, topic_key="偏好强度")) is True
         assert len(store.list_all()) == 2
 
-    def test_reinforce_target_ignores_topic_mismatch(self, tmp_path):
+    def test_explicit_reinforce_target_does_not_need_text_similarity(self, tmp_path):
         store = InsightStore(tmp_path)
-        store.add_insight(_insight(_CLAIM_A, topic_key="线程边界"))
+        target = _insight(_CLAIM_A, topic_key="线程边界")
+        store.add_insight(target)
 
-        target = store.find_reinforce_target(_insight(_CLAIM_A_PARAPHRASE, topic_key="毫不相干"))
-        assert target is not None
-        assert target.claim == _CLAIM_A
-
-        assert store.find_reinforce_target(_insight(_CLAIM_DISTINCT)) is None
+        assert store.reinforce_insight(target.insight_id, _ev("显式关联的证据"))
+        assert len(store.get_insight(target.insight_id).evidence) == 2
 
 
 class TestTerminalTargetKeepsItsVerdict:
@@ -127,15 +125,13 @@ class TestTerminalTargetKeepsItsVerdict:
             reason="测试",
         )
 
-        # validated 不在可强化状态里，所以走不到 find_reinforce_target，
-        # 但去重仍应认出这是同一条 → 证据附上去，状态不动
-        assert store.add_insight(_insight(_CLAIM_A_PARAPHRASE)) is False
+        assert store.add_insight(_insight(_CLAIM_A_PARAPHRASE)) is True
 
         kept = store.get_insight(original.insight_id)
         assert kept.status == InsightStatus.VALIDATED.value
         assert kept.next_action == InsightNextAction.PROMOTE.value
-        assert len(kept.evidence) == 2
-        assert len(store.list_all()) == 1
+        assert len(kept.evidence) == 1
+        assert len(store.list_all()) == 2
 
 
 def _ev_at(offset_minutes: int, description: str = "后到的证据") -> Evidence:
@@ -260,7 +256,7 @@ def _llm_payload(claim: str, *, reinforces: str | None = None, topic_key: str = 
 class TestSheCanNameTheTarget:
     """`reinforces`：她若知道这次是哪条洞察的又一次印证，可以直接指名。
 
-    指名是可选的建议通道，不是必填字段——留空就回落到语义匹配。
+    指名是可选的建议通道；留空或无效时保留为独立解释。
     """
 
     async def test_named_target_wins_over_semantic_match(self, tmp_path):
@@ -282,7 +278,7 @@ class TestSheCanNameTheTarget:
         assert len(store.list_all()) == 1
         assert len(store.get_insight(target.insight_id).evidence) == 2
 
-    async def test_bad_id_falls_back_to_semantic_match(self, tmp_path):
+    async def test_bad_id_does_not_fall_back_to_code_authored_match(self, tmp_path):
         engine = _engine(tmp_path, "")
         store = engine._store
         target = _insight(_CLAIM_A, topic_key="线程边界")
@@ -295,9 +291,9 @@ class TestSheCanNameTheTarget:
             user_prompt="x", source_event_ids=["evt_1"], reflection_type="introspection",
         )
 
-        assert created == []
-        assert len(store.list_all()) == 1
-        assert len(store.get_insight(target.insight_id).evidence) == 2
+        assert len(created) == 1
+        assert len(store.list_all()) == 2
+        assert len(store.get_insight(target.insight_id).evidence) == 1
 
     async def test_no_reinforces_still_creates_when_nothing_matches(self, tmp_path):
         engine = _engine(tmp_path, "")

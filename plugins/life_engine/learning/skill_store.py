@@ -32,7 +32,6 @@ _MATURITY_LABELS = {
 }
 
 # L1 目录中每个 skill 的最大描述长度
-_CATALOG_DESC_MAX = 80
 
 
 class SkillMaturity(Enum):
@@ -299,7 +298,7 @@ class SkillStore:
 
     # ── L1 目录（边界提醒注入）─────────────────────────────────
 
-    def get_catalog_text(self, max_chars: int = 600) -> str:
+    def get_catalog_text(self, max_chars: int = 0) -> str:
         """生成 L1 技能目录文本，用于 prompt 注入。
 
         格式：轻量级自我意识——"你知道自己已经发展出这些做事方式"。
@@ -311,16 +310,12 @@ class SkillStore:
 
         lines: list[str] = []
         for s in self._skills:
-            desc = s.description[:_CATALOG_DESC_MAX]
-            if len(s.description) > _CATALOG_DESC_MAX:
-                desc += "…"
-            lines.append(f"- {desc}（{s.maturity_label}）")
+            lines.append(f"- {s.description}（{s.maturity_label}）")
 
         header = "你知道自己已经发展出这些做事方式："
         text = header + "\n" + "\n".join(lines)
 
-        if max_chars > 0 and len(text) > max_chars:
-            text = text[:max_chars - 1].rstrip() + "…"
+        del max_chars
         return text
 
     # ── L2 正文（按需加载）────────────────────────────────────
@@ -341,12 +336,12 @@ class SkillStore:
         if skill.use_observations:
             parts.append("")
             parts.append("## 使用观察")
-            for obs in skill.use_observations[-5:]:
+            for obs in skill.use_observations:
                 parts.append(f"- {obs}")
         if skill.rejected_edits:
             parts.append("")
             parts.append("## 试过的弯路")
-            for rej in skill.rejected_edits[-3:]:
+            for rej in skill.rejected_edits:
                 summary = rej.get("summary", "")
                 reason = rej.get("reason", "")
                 parts.append(f"- {summary}（{reason}）")
@@ -361,13 +356,10 @@ class SkillStore:
             return False
         stamped = f"[{_now_iso()[:16]}] {observation}"
         skill.use_observations.append(stamped)
-        # 保留最近 20 条
-        if len(skill.use_observations) > 20:
-            skill.use_observations = skill.use_observations[-20:]
         self._append_audit({
             "action": "use_observation_added",
             "skill_id": skill_id,
-            "observation": observation[:200],
+            "observation": observation,
         })
         self._save()
         return True
@@ -389,14 +381,11 @@ class SkillStore:
             "reason": reason,
             "timestamp": _now_iso(),
         })
-        # 保留最近 10 条
-        if len(skill.rejected_edits) > 10:
-            skill.rejected_edits = skill.rejected_edits[-10:]
         self._append_audit({
             "action": "rejected_edit_recorded",
             "skill_id": skill_id,
-            "summary": edit_summary[:200],
-            "reason": reason[:200],
+            "summary": edit_summary,
+            "reason": reason,
         })
         self._save()
         return True

@@ -13,6 +13,7 @@ import pytest
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.memory import EdgeType, EmbeddingResult, LifeMemoryService
 from plugins.life_engine.memory.nodes import (
+    compute_content_hash,
     generate_file_node_id,
     generate_legacy_file_node_id,
 )
@@ -332,6 +333,52 @@ async def test_service_restart_restores_persisted_chunk_collection_and_close_is_
     await restored.close()
 
 
+async def test_startup_reconciliation_versions_external_changes_and_deletion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    note = tmp_path / "notes" / "outside-tool.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("old understanding", encoding="utf-8")
+    legacy_collection = SimpleNamespace()
+
+    async def fake_legacy_collection() -> Any:
+        return legacy_collection
+
+    first = _make_service(tmp_path)
+    monkeypatch.setattr(first, "_get_chroma_collection", fake_legacy_collection)
+    await first.initialize()
+    history = await first.get_memory_artifact_history("notes/outside-tool.md")
+    assert [item.content for item in history] == ["old understanding"]
+    assert history[0].metadata["observation"] == "startup_baseline"
+    await first.close()
+
+    note.write_text("new understanding", encoding="utf-8")
+    second = _make_service(tmp_path)
+    monkeypatch.setattr(second, "_get_chroma_collection", fake_legacy_collection)
+    await second.initialize()
+    history = await second.get_memory_artifact_history("notes/outside-tool.md")
+    assert [item.content for item in history] == [
+        "old understanding",
+        "new understanding",
+    ]
+    await second.close()
+
+    note.unlink()
+    third = _make_service(tmp_path)
+    monkeypatch.setattr(third, "_get_chroma_collection", fake_legacy_collection)
+    await third.initialize()
+    history = await third.get_memory_artifact_history("notes/outside-tool.md")
+    assert [item.content for item in history] == [
+        "old understanding",
+        "new understanding",
+        "",
+    ]
+    assert history[-1].artifact_kind == "workspace_memory_document_tombstone"
+    assert history[-1].metadata["observation"] == "startup_observed_deletion"
+    await third.close()
+
+
 async def test_service_rejects_invalid_active_marker_before_backend_lookup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -427,7 +474,17 @@ async def test_service_rejects_restored_collection_without_identity_metadata(
         dimension: int,
     ) -> Any:
         create_calls.append((model_name, dimension))
-        return SimpleNamespace()
+        return SimpleNamespace(
+            name="life_memory_chunks_v1_service_fake_2",
+            metadata={
+                "collection_kind": "life_memory_chunk",
+                "chunk_index_version": 1,
+                "embedding_model": model_name,
+                "embedding_dimension": dimension,
+            },
+            upsert=lambda **_kwargs: None,
+            delete=lambda **_kwargs: None,
+        )
 
     monkeypatch.setattr(
         "plugins.life_engine.memory.service.get_chunk_collection",
@@ -443,10 +500,10 @@ async def test_service_rejects_restored_collection_without_identity_metadata(
 
     report = await restored.run_index_worker(embed_texts_func=embed)
 
-    assert report.failed == (indexed.job_id,)
-    assert report.errors[indexed.job_id] == "ValueError"
-    assert named_calls == [collection_name, collection_name]
-    assert create_calls == []
+    assert report.completed == (indexed.job_id,)
+    assert report.failed == ()
+    assert named_calls == [collection_name]
+    assert create_calls == [("service/fake", 2)]
     await restored.close()
 
 
@@ -650,6 +707,61 @@ async def test_startup_recovery_indexes_unindexed_files(tmp_path: Path) -> None:
         "SELECT node_id, status FROM memory_index_jobs WHERE status = 'pending'"
     ).fetchall()
     assert any(r["node_id"] == rows[0]["node_id"] for r in job_rows), "文件应产生待处理索引任务"
+
+
+async def test_startup_recovery_refreshes_externally_changed_document(tmp_path: Path) -> None:
+    service = _make_service(tmp_path)
+    await service.initialize()
+    path = tmp_path / "notes" / "changed.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("old remembered body", encoding="utf-8")
+
+    await service._startup_recovery()
+    path.write_text("new externally edited body", encoding="utf-8")
+    await service._startup_recovery()
+
+    row = service._db.execute(
+        "SELECT content_hash, is_deleted FROM memory_nodes WHERE file_path = ?",
+        ("notes/changed.md",),
+    ).fetchone()
+    assert row["content_hash"] == compute_content_hash("new externally edited body")
+    assert row["is_deleted"] == 0
+    chunks = service._db.execute(
+        "SELECT content FROM memory_chunks WHERE node_id = ? ORDER BY chunk_index",
+        (generate_file_node_id("notes/changed.md"),),
+    ).fetchall()
+    assert "".join(chunk["content"] for chunk in chunks) == "new externally edited body"
+    versions = service._db.execute(
+        "SELECT COUNT(*) FROM memory_artifact_versions WHERE logical_key = ?",
+        ("notes/changed.md",),
+    ).fetchone()[0]
+    assert versions == 2
+
+
+async def test_startup_recovery_revives_reappeared_document(tmp_path: Path) -> None:
+    service = _make_service(tmp_path)
+    await service.initialize()
+    path = tmp_path / "notes" / "reappeared.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("first body", encoding="utf-8")
+    await service._startup_recovery()
+
+    path.unlink()
+    await service._startup_recovery()
+    deleted = service._db.execute(
+        "SELECT is_deleted FROM memory_nodes WHERE file_path = ?",
+        ("notes/reappeared.md",),
+    ).fetchone()
+    assert deleted["is_deleted"] == 1
+
+    path.write_text("returned body", encoding="utf-8")
+    await service._startup_recovery()
+    revived = service._db.execute(
+        "SELECT content_hash, is_deleted FROM memory_nodes WHERE file_path = ?",
+        ("notes/reappeared.md",),
+    ).fetchone()
+    assert revived["is_deleted"] == 0
+    assert revived["content_hash"] == compute_content_hash("returned body")
 
 
 async def test_startup_recovery_marks_ghost_nodes_as_deleted(tmp_path: Path) -> None:

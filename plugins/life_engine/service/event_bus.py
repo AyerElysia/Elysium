@@ -9,9 +9,12 @@ channels.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import sqlite3
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from enum import Enum, IntEnum
 from pathlib import Path
 from typing import Any, ClassVar
@@ -19,6 +22,7 @@ from typing import Any, ClassVar
 from .event_builder import EventType, LifeEngineEvent
 
 RAW_EVENT_LOG_FILE = "life_events.jsonl"
+RAW_EVENT_DB_FILE = "life_events.sqlite3"
 
 
 class RawEventGapError(RuntimeError):
@@ -66,6 +70,13 @@ class LifeEvent:
     salience: float = 0.5
     ttl_seconds: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    occurrence_id: str = ""
+    source_sequence: int = 0
+    recorded_at: str = ""
+    source_instance_id: str = ""
+    causation_id: str = ""
+    correlation_id: str = ""
+    content_ref: str = ""
 
 
 def _legacy_channel(event: LifeEngineEvent) -> LifeEventChannel:
@@ -146,6 +157,15 @@ def life_event_from_legacy(event: LifeEngineEvent) -> LifeEvent:
         value = getattr(event, field_name, None)
         if value is not None:
             metadata[field_name] = value
+    source_instance_id = str(getattr(event, "source_instance_id", None) or "")
+    correlation_id = str(getattr(event, "correlation_id", None) or "")
+    content_ref = str(getattr(event, "content_ref", None) or "")
+    if source_instance_id:
+        metadata["source_instance_id"] = source_instance_id
+    if correlation_id:
+        metadata["correlation_id"] = correlation_id
+    if content_ref:
+        metadata["content_ref"] = content_ref
     if event.tool_name is not None:
         metadata["tool_name"] = event.tool_name
     if event.tool_args is not None:
@@ -162,12 +182,17 @@ def life_event_from_legacy(event: LifeEngineEvent) -> LifeEvent:
         source=event.source,
         channel=_legacy_channel(event).value,
         event_type=event.content_type or event.event_type.value,
-        content=event.content or "",
+        content=(getattr(event, "raw_content", None) or event.content or ""),
         stream_id=stream_id,
         reply_target=reply_target,
         priority=priority,
         salience=salience,
         metadata=metadata,
+        source_sequence=int(event.sequence or 0),
+        source_instance_id=source_instance_id,
+        causation_id=str(getattr(event, "causation_id", None) or ""),
+        correlation_id=correlation_id,
+        content_ref=content_ref,
     )
 
 
@@ -186,10 +211,20 @@ def life_event_to_dict(event: LifeEvent) -> dict[str, Any]:
         "salience": float(event.salience),
         "ttl_seconds": event.ttl_seconds,
         "metadata": event.metadata,
+        "occurrence_id": event.occurrence_id,
+        "source_sequence": int(event.source_sequence or 0),
+        "recorded_at": event.recorded_at,
+        "source_instance_id": event.source_instance_id,
+        "causation_id": event.causation_id,
+        "correlation_id": event.correlation_id,
+        "content_ref": event.content_ref,
     }
 
 
 def life_event_from_dict(data: dict[str, Any]) -> LifeEvent:
+    metadata = data.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
     return LifeEvent(
         event_id=str(data.get("event_id") or ""),
         sequence=int(data.get("sequence") or 0),
@@ -207,11 +242,34 @@ def life_event_from_dict(data: dict[str, Any]) -> LifeEvent:
             if data.get("ttl_seconds") is not None
             else None
         ),
-        metadata=data.get("metadata") if isinstance(data.get("metadata"), dict) else {},
+        metadata=metadata,
+        occurrence_id=str(data.get("occurrence_id") or ""),
+        source_sequence=int(data.get("source_sequence") or data.get("sequence") or 0),
+        recorded_at=str(data.get("recorded_at") or ""),
+        source_instance_id=str(
+            data.get("source_instance_id")
+            or metadata.get("source_instance_id")
+            or ""
+        ),
+        causation_id=str(
+            data.get("causation_id")
+            or metadata.get("causation_id")
+            or ""
+        ),
+        correlation_id=str(
+            data.get("correlation_id")
+            or metadata.get("correlation_id")
+            or ""
+        ),
+        content_ref=str(
+            data.get("content_ref")
+            or metadata.get("content_ref")
+            or ""
+        ),
     )
 
 
-class RawEventStore:
+class _LegacyJSONLEventStore:
     """Append-only JSONL store for raw life events.
 
     当文件超过 max_bytes 时自动轮转：当前文件重命名为 .1，
@@ -399,6 +457,528 @@ class RawEventStore:
         return events
 
 
+class RawEventStore(_LegacyJSONLEventStore):
+    """Authoritative append-only ledger with a JSONL compatibility mirror.
+
+    SQLite assigns a durable ingest position in one transaction.  The
+    producer's transient sequence is retained as ``source_sequence`` while
+    callers consume the durable position through ``LifeEvent.sequence``.
+    JSONL rotation can therefore never remove authoritative history.
+    """
+
+    def __init__(
+        self,
+        workspace_path: str | Path,
+        filename: str = RAW_EVENT_LOG_FILE,
+        max_bytes: int = 50 * 1024 * 1024,
+        max_archives: int = 2,
+    ) -> None:
+        super().__init__(
+            workspace_path,
+            filename=filename,
+            max_bytes=max_bytes,
+            max_archives=max_archives,
+        )
+        self._database_path = self._path.with_name(RAW_EVENT_DB_FILE)
+        self._ready = False
+
+    @property
+    def database_path(self) -> Path:
+        """Return the authoritative ledger path."""
+
+        return self._database_path
+
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.now(UTC).astimezone().isoformat()
+
+    def _connect(self) -> sqlite3.Connection:
+        self._database_path.parent.mkdir(parents=True, exist_ok=True)
+        db = sqlite3.connect(
+            self._database_path,
+            timeout=30.0,
+            isolation_level=None,
+        )
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA journal_mode = WAL")
+        db.execute("PRAGMA synchronous = FULL")
+        db.execute("PRAGMA busy_timeout = 30000")
+        db.execute("PRAGMA foreign_keys = ON")
+        return db
+
+    @staticmethod
+    def _create_schema(db: sqlite3.Connection) -> None:
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS raw_life_events (
+                ingest_position INTEGER PRIMARY KEY AUTOINCREMENT,
+                occurrence_id TEXT NOT NULL UNIQUE,
+                source_event_id TEXT NOT NULL,
+                source_sequence INTEGER NOT NULL DEFAULT 0,
+                occurred_at TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                payload_hash TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_raw_life_events_source
+                ON raw_life_events(source_event_id, occurred_at, ingest_position);
+            CREATE TABLE IF NOT EXISTS raw_event_consumer_offsets (
+                consumer_id TEXT PRIMARY KEY,
+                ingest_position INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS raw_event_store_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS raw_event_import_issues (
+                issue_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT NOT NULL,
+                line_number INTEGER NOT NULL DEFAULT 0,
+                error_type TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '',
+                recorded_at TEXT NOT NULL
+            );
+            CREATE TRIGGER IF NOT EXISTS raw_life_events_immutable_update
+            BEFORE UPDATE ON raw_life_events BEGIN
+                SELECT RAISE(ABORT, 'RawLifeEventImmutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS raw_life_events_immutable_delete
+            BEFORE DELETE ON raw_life_events BEGIN
+                SELECT RAISE(ABORT, 'RawLifeEventImmutable');
+            END;
+            """
+        )
+
+    @staticmethod
+    def _canonical_payload(event: LifeEvent) -> dict[str, Any]:
+        source_sequence = int(event.source_sequence or event.sequence or 0)
+        return life_event_to_dict(
+            replace(
+                event,
+                sequence=source_sequence,
+                source_sequence=source_sequence,
+                recorded_at="",
+            )
+        )
+
+    @classmethod
+    def _default_occurrence_id(cls, event: LifeEvent) -> str:
+        payload = cls._canonical_payload(replace(event, occurrence_id=""))
+        payload.pop("occurrence_id", None)
+        material = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return "occ_" + hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _payload_hash(payload_json: str) -> str:
+        return hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+
+    def _record_issue(
+        self,
+        db: sqlite3.Connection,
+        *,
+        source_path: str,
+        line_number: int,
+        error_type: str,
+        detail: str,
+    ) -> None:
+        db.execute(
+            """INSERT INTO raw_event_import_issues
+            (source_path, line_number, error_type, detail, recorded_at)
+            VALUES (?, ?, ?, ?, ?)""",
+            (
+                source_path,
+                int(line_number),
+                error_type,
+                detail[:2000],
+                self._now_iso(),
+            ),
+        )
+
+    def _insert_event(
+        self,
+        db: sqlite3.Connection,
+        event: LifeEvent,
+    ) -> tuple[LifeEvent, bool]:
+        source_sequence = int(event.source_sequence or event.sequence or 0)
+        occurrence_id = str(event.occurrence_id or "").strip()
+        if not occurrence_id:
+            occurrence_id = self._default_occurrence_id(event)
+        recorded_at = event.recorded_at or self._now_iso()
+        normalized = replace(
+            event,
+            occurrence_id=occurrence_id,
+            source_sequence=source_sequence,
+            sequence=source_sequence,
+            recorded_at=recorded_at,
+        )
+        payload = self._canonical_payload(normalized)
+        payload["occurrence_id"] = occurrence_id
+        payload_json = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        payload_hash = self._payload_hash(payload_json)
+        cursor = db.execute(
+            """INSERT OR IGNORE INTO raw_life_events (
+                occurrence_id, source_event_id, source_sequence, occurred_at,
+                recorded_at, payload_json, payload_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                occurrence_id,
+                normalized.event_id,
+                source_sequence,
+                normalized.timestamp,
+                recorded_at,
+                payload_json,
+                payload_hash,
+            ),
+        )
+        inserted = cursor.rowcount > 0
+        row = db.execute(
+            """SELECT ingest_position, payload_hash, recorded_at FROM raw_life_events
+            WHERE occurrence_id = ?""",
+            (occurrence_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(f"RawEventInsertLost:{occurrence_id}")
+        if str(row["payload_hash"]) != payload_hash:
+            raise ValueError(f"RawEventOccurrenceConflict:{occurrence_id}")
+        return replace(
+            normalized,
+            sequence=int(row["ingest_position"]),
+            recorded_at=str(row["recorded_at"]),
+        ), inserted
+
+    def _import_legacy_jsonl(self, db: sqlite3.Connection) -> None:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            migrated = db.execute(
+                """SELECT 1 FROM raw_event_store_meta
+                WHERE key = 'legacy_jsonl_imported'"""
+            ).fetchone()
+            if migrated is not None:
+                db.commit()
+                return
+            for path in self._paths_oldest_first():
+                try:
+                    handle = path.open("r", encoding="utf-8")
+                except OSError as exc:
+                    self._record_issue(
+                        db,
+                        source_path=str(path),
+                        line_number=0,
+                        error_type=type(exc).__name__,
+                        detail=str(exc),
+                    )
+                    continue
+                with handle:
+                    for line_number, line in enumerate(handle, start=1):
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        try:
+                            raw = json.loads(stripped)
+                            if not isinstance(raw, dict):
+                                raise TypeError("raw event row is not an object")
+                            self._insert_event(db, life_event_from_dict(raw))
+                        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                            self._record_issue(
+                                db,
+                                source_path=str(path),
+                                line_number=line_number,
+                                error_type=type(exc).__name__,
+                                detail=str(exc),
+                            )
+            db.execute(
+                """INSERT INTO raw_event_store_meta (key, value, updated_at)
+                VALUES ('legacy_jsonl_imported', '1', ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value, updated_at = excluded.updated_at""",
+                (self._now_iso(),),
+            )
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
+
+    def _ensure_ready_sync(self) -> None:
+        if self._ready:
+            return
+        with self._path_lock:
+            if self._ready:
+                return
+            with self._connect() as db:
+                self._create_schema(db)
+                self._import_legacy_jsonl(db)
+            self._ready = True
+
+    def _maybe_rotate(self) -> None:
+        """Rotate only the mirror and record failures without losing events."""
+
+        try:
+            if not self._path.exists() or self._path.stat().st_size < self._max_bytes:
+                return
+            if self._max_archives <= 0:
+                return
+            oldest = self._archive_path(self._max_archives)
+            if oldest.exists():
+                oldest.unlink()
+            for index in range(self._max_archives - 1, 0, -1):
+                source = self._archive_path(index)
+                target = self._archive_path(index + 1)
+                if source.exists():
+                    source.rename(target)
+            self._path.rename(self._archive_path(1))
+        except OSError as exc:
+            with self._connect() as db:
+                self._record_issue(
+                    db,
+                    source_path=str(self._path),
+                    line_number=0,
+                    error_type=type(exc).__name__,
+                    detail=f"mirror rotation failed: {exc}",
+                )
+
+    def _append_mirror(self, events: list[LifeEvent]) -> None:
+        if not events:
+            return
+        with self._path_lock:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._maybe_rotate()
+            lines = [
+                json.dumps(life_event_to_dict(event), ensure_ascii=False)
+                for event in events
+            ]
+            try:
+                with self._path.open("a", encoding="utf-8") as handle:
+                    handle.write("\n".join(lines) + "\n")
+            except OSError as exc:
+                with self._connect() as db:
+                    self._record_issue(
+                        db,
+                        source_path=str(self._path),
+                        line_number=0,
+                        error_type=type(exc).__name__,
+                        detail=f"mirror append failed: {exc}",
+                    )
+
+    def _append_many_sync(self, events: list[LifeEvent]) -> list[LifeEvent]:
+        if not events:
+            return []
+        self._ensure_ready_sync()
+        persisted: list[LifeEvent] = []
+        mirrored: list[LifeEvent] = []
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                for event in events:
+                    stored, inserted = self._insert_event(db, event)
+                    persisted.append(stored)
+                    if inserted:
+                        mirrored.append(stored)
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+        self._append_mirror(mirrored)
+        return persisted
+
+    def _append_sync(self, event: LifeEvent) -> LifeEvent:
+        return self._append_many_sync([event])[0]
+
+    async def append(self, event: LifeEvent) -> LifeEvent:
+        return await asyncio.to_thread(self._append_sync, event)
+
+    async def append_many(self, events: list[LifeEvent]) -> list[LifeEvent]:
+        if not events:
+            return []
+        return await asyncio.to_thread(self._append_many_sync, events)
+
+    @staticmethod
+    def _event_from_row(row: sqlite3.Row) -> LifeEvent:
+        raw = json.loads(str(row["payload_json"]))
+        event = life_event_from_dict(raw)
+        return replace(
+            event,
+            sequence=int(row["ingest_position"]),
+            source_sequence=int(row["source_sequence"]),
+            occurrence_id=str(row["occurrence_id"]),
+            recorded_at=str(row["recorded_at"]),
+        )
+
+    def append_sync(self, event: LifeEvent) -> LifeEvent:
+        """Synchronously append one event for transactional outbox bridges."""
+
+        return self._append_sync(event)
+
+    def _read_tail_sync(self, limit: int) -> list[LifeEvent]:
+        if limit <= 0:
+            return []
+        self._ensure_ready_sync()
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT * FROM raw_life_events
+                ORDER BY ingest_position DESC LIMIT ?""",
+                (int(limit),),
+            ).fetchall()
+        return [self._event_from_row(row) for row in reversed(rows)]
+
+    async def read_tail(self, limit: int = 100) -> list[LifeEvent]:
+        return await asyncio.to_thread(self._read_tail_sync, limit)
+
+    def _read_since_sync(self, sequence: int, limit: int | None) -> list[LifeEvent]:
+        self._ensure_ready_sync()
+        sql = """SELECT * FROM raw_life_events
+        WHERE ingest_position > ? ORDER BY ingest_position"""
+        params: list[Any] = [int(sequence)]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(0, int(limit)))
+        with self._connect() as db:
+            bounds = db.execute(
+                """SELECT MIN(ingest_position) AS earliest,
+                MAX(ingest_position) AS latest FROM raw_life_events"""
+            ).fetchone()
+            earliest = int(bounds["earliest"] or 0) if bounds is not None else 0
+            if sequence > 0 and earliest > sequence + 1:
+                raise RawEventGapError(sequence, earliest)
+            rows = db.execute(sql, params).fetchall()
+        return [self._event_from_row(row) for row in rows]
+
+    async def read_since(
+        self,
+        sequence: int,
+        *,
+        limit: int | None = None,
+    ) -> list[LifeEvent]:
+        return await asyncio.to_thread(self._read_since_sync, sequence, limit)
+
+    def _get_consumer_offset_sync(self, consumer_id: str) -> int:
+        self._ensure_ready_sync()
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT ingest_position FROM raw_event_consumer_offsets
+                WHERE consumer_id = ?""",
+                (str(consumer_id),),
+            ).fetchone()
+        return int(row["ingest_position"]) if row is not None else 0
+
+    async def get_consumer_offset(self, consumer_id: str) -> int:
+        """Return one consumer's durable ingest cursor."""
+
+        return await asyncio.to_thread(self._get_consumer_offset_sync, consumer_id)
+
+    def _commit_consumer_offset_sync(
+        self,
+        consumer_id: str,
+        ingest_position: int,
+        metadata: dict[str, Any] | None,
+    ) -> int:
+        self._ensure_ready_sync()
+        requested = max(0, int(ingest_position))
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                current_row = db.execute(
+                    """SELECT ingest_position FROM raw_event_consumer_offsets
+                    WHERE consumer_id = ?""",
+                    (str(consumer_id),),
+                ).fetchone()
+                current = int(current_row["ingest_position"]) if current_row else 0
+                committed = max(current, requested)
+                db.execute(
+                    """INSERT INTO raw_event_consumer_offsets (
+                        consumer_id, ingest_position, updated_at, metadata_json
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(consumer_id) DO UPDATE SET
+                        ingest_position = excluded.ingest_position,
+                        updated_at = excluded.updated_at,
+                        metadata_json = excluded.metadata_json""",
+                    (
+                        str(consumer_id),
+                        committed,
+                        self._now_iso(),
+                        json.dumps(metadata or {}, ensure_ascii=False),
+                    ),
+                )
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+        return committed
+
+    async def commit_consumer_offset(
+        self,
+        consumer_id: str,
+        ingest_position: int,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
+        """Atomically advance a consumer cursor without allowing regression."""
+
+        return await asyncio.to_thread(
+            self._commit_consumer_offset_sync,
+            consumer_id,
+            ingest_position,
+            metadata,
+        )
+
+    def _health_sync(self) -> dict[str, Any]:
+        self._ensure_ready_sync()
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT COUNT(*) AS total,
+                MIN(ingest_position) AS earliest,
+                MAX(ingest_position) AS latest FROM raw_life_events"""
+            ).fetchone()
+            issue_row = db.execute(
+                "SELECT COUNT(*) AS total FROM raw_event_import_issues"
+            ).fetchone()
+            consumers = db.execute(
+                """SELECT consumer_id, ingest_position, updated_at
+                FROM raw_event_consumer_offsets ORDER BY consumer_id"""
+            ).fetchall()
+        latest = int(row["latest"] or 0) if row is not None else 0
+        return {
+            "database_path": str(self._database_path),
+            "total": int(row["total"] or 0) if row is not None else 0,
+            "earliest_position": int(row["earliest"] or 0) if row is not None else 0,
+            "latest_position": latest,
+            "import_issue_count": (
+                int(issue_row["total"] or 0) if issue_row is not None else 0
+            ),
+            "consumers": [
+                {
+                    "consumer_id": str(item["consumer_id"]),
+                    "position": int(item["ingest_position"]),
+                    "lag": max(0, latest - int(item["ingest_position"])),
+                    "updated_at": str(item["updated_at"]),
+                }
+                for item in consumers
+            ],
+        }
+
+    async def health(self) -> dict[str, Any]:
+        """Return ledger bounds, migration issues, and consumer lag."""
+
+        return await asyncio.to_thread(self._health_sync)
+
+    def health_snapshot(self) -> dict[str, Any]:
+        """Synchronous lightweight snapshot for existing service health APIs."""
+
+        return self._health_sync()
+
+
 class LifeEventBus:
     """Compatibility event bus that mirrors legacy events to raw storage."""
 
@@ -412,15 +992,13 @@ class LifeEventBus:
 
     async def publish(self, event: LifeEvent) -> LifeEvent:
         async with self._lock:
-            await self._store.append(event)
-        return event
+            return await self._store.append(event)
 
     async def publish_many(self, events: list[LifeEvent]) -> list[LifeEvent]:
         if not events:
             return []
         async with self._lock:
-            await self._store.append_many(events)
-        return events
+            return await self._store.append_many(events)
 
     async def publish_legacy_event(self, event: LifeEngineEvent) -> LifeEvent:
         return await self.publish(life_event_from_legacy(event))

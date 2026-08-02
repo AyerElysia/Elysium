@@ -1,15 +1,15 @@
 # 数据收集系统（Data Collection System）
 
-> 文档状态：权威文档，与代码同步截至 2026-07-31。
-> 代码位置：`src/kernel/llm/trajectory_collector.py` + `plugins/life_engine/trace/`（610 行）。
-> 数据位置：`data/training_data_lake/`（802MB）+ `data/life_engine_workspace/.life_trace/`。
+> 文档状态：权威文档，与代码同步截至 2026-08-02。
+> 代码位置：`src/kernel/llm/trajectory_collector.py`、`plugins/life_engine/service/event_bus.py`、`plugins/life_engine/trace/`。
+> 数据位置：`data/training_data_lake/` + `data/life_engine_workspace/life_events.sqlite3` + `data/life_engine_workspace/.life_trace/`。
 > 本文是数据收集专题的权威文档；凡与本文冲突，以本文和当前代码为准。
 
 ---
 
 ## 0. 一句话定位
 
-数据收集系统由两条独立管线组成：**LLM 轨迹收集**（每次模型调用的完整 attempt 记录，用于后训练）和**经历留痕**（主体亲历的文件变更与转折事件，用于自我回溯）。两者都是 append-only、只追加不改写，共同构成数字生命的"来路"。
+数据收集系统由三条相互引用但权威边界不同的管线组成：**LLM 轨迹收集**、**耐久生命事件长河**和**文件经历留痕**。三者都保留追加式历史；事件 SQLite 与 Life Trace 是运行时自我回溯依据，训练湖不是运行时记忆真相来源。
 
 ---
 
@@ -29,6 +29,14 @@
 │       │                                                           │
 │       ▼ 离线导出                                                   │
 │  data/training_data_lake/export/ (SFT/Agent 格式)                 │
+├─────────────────────────────────────────────────────────────────┤
+│                    耐久生命事件长河                                  │
+│                                                                   │
+│  LifeEventBus.publish()                                           │
+│       ▼ durable occurrence + ingest position                     │
+│  life_events.sqlite3                                              │
+│       ▼ consumer offsets                                          │
+│  Experience Ledger / memory_witness                              │
 ├─────────────────────────────────────────────────────────────────┤
 │                    经历留痕管线（长河）                              │
 │                                                                   │
@@ -163,16 +171,26 @@ data/training_data_lake/
 
 ---
 
-## 3. 经历留痕（长河 / Life Trace）
+## 3. 耐久生命事件长河
 
-### 3.1 设计哲学
+`RawEventStore` 以 `life_events.sqlite3` 为权威存储。`ingest_position` 跨进程重启单调增长；`source_sequence` 只保留生产者原序号；`occurrence_id` 用于重放幂等。消费者使用 `raw_event_consumer_offsets` 单调提交自己的位置。
+
+旧 `life_events.jsonl` 和轮转归档会幂等导入 SQLite，之后继续作为兼容镜像。镜像轮转不再构成历史保留边界。无法解析的行进入 `raw_event_import_issues`，不得静默跳过；consumer 若检测到真实历史缺口，必须停止推进。
+
+事件长河记录“发生过什么”，Experience 记录“哪些原始证据已进入记忆账本”，Witness 记录“主体如何经历”。三者不能互相覆盖。详见 [生命记忆系统](./life_memory_system.md)。
+
+---
+
+## 4. 经历留痕（长河 / Life Trace）
+
+### 4.1 设计哲学
 
 > 长河法则：事件流是她的现在，长河是她的来路。
 > 凡是她亲历的转折——写下的字、形成的意图与其归宿、闭合的思考、承接的好奇——都汇入同一条长河；长河只追加、不改写、永可回溯。
 
 **文件**：`plugins/life_engine/trace/store.py`（365 行）
 
-### 3.2 LifeTraceRecord 数据模型
+### 4.2 LifeTraceRecord 数据模型
 
 ```python
 @dataclass
@@ -197,7 +215,7 @@ class LifeTraceRecord:
     summary: str           # 摘要
 ```
 
-### 3.3 存储结构
+### 4.3 存储结构
 
 ```
 data/life_engine_workspace/.life_trace/
@@ -215,7 +233,7 @@ data/life_engine_workspace/.life_trace/
 - **diffs**：每次修改生成 unified diff，支持 before/after 预览
 - **index.jsonl**：所有记录的索引，支持按路径/时间/类型查询
 
-### 3.4 记录类型（kind）
+### 4.4 记录类型（kind）
 
 | kind | 含义 |
 | --- | --- |
@@ -224,7 +242,7 @@ data/life_engine_workspace/.life_trace/
 | `thought_close` | 思考流闭合 |
 | `curiosity` | 好奇心承接 |
 
-### 3.5 主体工具接口
+### 4.5 主体工具接口
 
 通过 `nucleus_trace` 统一工具暴露（5 个 action）：
 
@@ -238,27 +256,26 @@ data/life_engine_workspace/.life_trace/
 
 所有工具标记 `chatter_allow`，主意识可直接调用回溯自己的来路。
 
-### 3.6 与心跳的集成
+### 4.6 与心跳的集成
 
 心跳 prompt 装配时，`_format_chatter_trace_recent_changes()` 将最近文件修改注入上下文，让主体知道"最近改了什么"。
 
 ---
 
-## 4. 两条管线的关系
+## 5. 三条管线的关系
 
-| 维度 | LLM 轨迹 | 经历留痕（长河） |
-| --- | --- | --- |
-| 记录什么 | 每次模型调用的输入/输出 | 主体亲历的文件变更与转折 |
-| 粒度 | attempt 级（含重试） | 事件级（一次工具调用） |
-| 用途 | 后训练（SFT/RLHF） | 自我回溯（"我为什么变成这样"） |
-| 可见性 | 主体不直接可见 | 主体可通过工具查询 |
-| 存储 | training_data_lake/raw/ | .life_trace/ |
-| 隐私 | 媒体 redact | 完整保留（仅 workspace 内） |
-| 规模 | 613MB（7天） | 较小（仅文件操作） |
+| 维度 | LLM 轨迹 | 生命事件长河 | 文件经历留痕 |
+| --- | --- | --- | --- |
+| 记录什么 | 模型 attempt 输入/输出 | 统一运行事件 | 文件变更与转折 |
+| 身份 | request/attempt | occurrence + ingest position | trace id + blob hash |
+| 用途 | 后训练与模型诊断 | Experience、见证、回放 | “我为何这样修改” |
+| 权威性 | 训练证据，不是运行时真相 | 原始发生账本 | 文件变更证据 |
+| 存储 | `training_data_lake/raw/` | `life_events.sqlite3` | `.life_trace/` |
+| 保留 | 队列与训练湖策略 | SQLite 权威历史；JSONL 为镜像 | index + blobs + diffs |
 
 ---
 
-## 5. 文件索引
+## 6. 文件索引
 
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
@@ -267,3 +284,4 @@ data/life_engine_workspace/.life_trace/
 | `plugins/life_engine/trace/store.py` | 365 | 长河存储（LifeTraceStore） |
 | `plugins/life_engine/trace/tools.py` | 244 | 长河查询工具（nucleus_trace） |
 | `plugins/life_engine/trace/__init__.py` | ~10 | 包导出 |
+| `plugins/life_engine/service/event_bus.py` | — | 耐久事件账本、旧 JSONL 导入、consumer offset 与 health |

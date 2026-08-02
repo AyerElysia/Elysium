@@ -25,6 +25,7 @@ class _EpistemicMemoryStub:
     def __init__(self, *, existing: set[str] | None = None) -> None:
         self.existing = set(existing or ())
         self.claims: list[Any] = []
+        self.evidence: list[Any] = []
         self.lookups: list[str] = []
 
     async def get_memory_claim_state(self, claim_id: str) -> object | None:
@@ -34,6 +35,9 @@ class _EpistemicMemoryStub:
     async def append_memory_claim(self, claim: Any) -> None:
         self.claims.append(claim)
         self.existing.add(claim.claim_id)
+
+    async def append_claim_evidence(self, evidence: Any) -> None:
+        self.evidence.append(evidence)
 
 
 def _validated_insight(scheduler: LearningScheduler, *, claim: str) -> Insight:
@@ -96,14 +100,19 @@ async def test_first_heartbeat_backfills_validated_insight_once(tmp_path) -> Non
     assert claim.claim_id == f"insight_{insight.insight_id}"
     assert claim.subject_key == "insight:行为模式"
     assert claim.content == insight.claim
-    assert claim.claim_kind == "validated_insight"
+    assert claim.claim_kind == "learning_insight"
     assert claim.source == "learning_system"
+    assert claim.authority == "learning_audit_observation"
     assert claim.metadata == {
         "insight_id": insight.insight_id,
         "evidence_count": 1,
-        "confidence": insight.confidence,
+        "confidence_as_reported_by_learning_system": insight.confidence,
         "category": "行为模式",
+        "epistemic_note": "audit output and retrieval frequency are not truth",
     }
+    assert len(memory.evidence) == 1
+    assert memory.evidence[0].claim_id == claim.claim_id
+    assert memory.evidence[0].evidence_ref == "event-1"
 
 
 async def test_backfill_skips_claim_already_present_in_epistemic_store(tmp_path) -> None:
@@ -117,6 +126,7 @@ async def test_backfill_skips_claim_already_present_in_epistemic_store(tmp_path)
 
     assert memory.lookups == [claim_id]
     assert memory.claims == []
+    assert len(memory.evidence) == 1
 
 
 async def test_audit_projection_only_accepts_validated_records(tmp_path) -> None:

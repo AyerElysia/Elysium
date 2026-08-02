@@ -1,22 +1,15 @@
-"""SelfKnowledge：慢环——自我认知压缩。
+"""Versioned self-knowledge integration.
 
-类比 VibeGamer 的 SkillOpt + best_skill.md。
-核心思想：把 validated 洞察压缩成一份活着的"自我认知文档"，注入日常 prompt。
-
-触发条件：
-- validated 洞察积累到 N 条（默认 5）
-- 或距上次压缩超过 M 小时（默认 48h）
-
-压缩流程（借鉴 SkillOpt 的 minibatch 反思）：
-1. Harvest：收集 validated 洞察 + 近期 rejected 反例
-2. 有界编辑：对当前 self_knowledge.md 做最多 K 处修改
-3. Selection Gate：新版本必须严格优于旧版本才 promote
-4. 版本化：保存 vN.md，更新 manifest
+Validated insights, rejected counterexamples, and reconsidered beliefs are
+presented without recency truncation.  The integration process decides the
+coherent scope of each revision, an independent gate reviews it, and every
+proposal is versioned so later interpretations never erase earlier ones.
 """
 
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import logging
 from datetime import datetime, timezone
@@ -44,7 +37,6 @@ logger = logging.getLogger("life_engine.learning.knowledge")
 # 默认参数
 _DEFAULT_TRIGGER_COUNT = 5       # 触发压缩的 validated 数量
 _DEFAULT_INTERVAL_HOURS = 48.0   # 压缩最小间隔
-_DEFAULT_MAX_EDITS = 4           # 每次最多编辑数
 _INITIAL_KNOWLEDGE = """\
 # 自我认知
 
@@ -84,7 +76,7 @@ class SelfKnowledgeCompressor:
         timeout_seconds: float = 90.0,
         trigger_count: int = _DEFAULT_TRIGGER_COUNT,
         interval_hours: float = _DEFAULT_INTERVAL_HOURS,
-        max_edits: int = _DEFAULT_MAX_EDITS,
+        max_edits: int | None = None,
     ) -> None:
         self._store = store
         self._workspace = Path(workspace_path).resolve()
@@ -92,7 +84,8 @@ class SelfKnowledgeCompressor:
         self._timeout = max(30.0, float(timeout_seconds or 90.0))
         self._trigger_count = max(2, int(trigger_count or _DEFAULT_TRIGGER_COUNT))
         self._interval_hours = max(6.0, float(interval_hours or _DEFAULT_INTERVAL_HOURS))
-        self._max_edits = max(1, int(max_edits or _DEFAULT_MAX_EDITS))
+        # 兼容旧配置入口；认知内容的修改范围由整合过程自行判断。
+        del max_edits
         self._lock = asyncio.Lock()
 
     def should_compress(self) -> bool:
@@ -137,8 +130,7 @@ class SelfKnowledgeCompressor:
             #    b) reconsidered：曾写进知识文档、后来她自己拿回来重想的
             #    只有 (a) 的话这个渠道基本是空的——审计几乎不出 rejected，
             #    而"我以前这么以为，现在不这么想了"恰恰是螺旋上升的主要形态。
-            all_rejected = self._store.list_by_status(InsightStatus.REJECTED)
-            rejected = all_rejected[-5:]
+            rejected = self._store.list_by_status(InsightStatus.REJECTED)
             reconsidered = self.collect_reconsidered_memo()
 
             # 3. 调用 LLM 压缩
@@ -156,7 +148,6 @@ class SelfKnowledgeCompressor:
             promote = await self._selection_gate(
                 old_content=current_knowledge,
                 new_content=new_content,
-                edit_count=self._max_edits,
                 insight_count=len(promotable),
             )
 
@@ -170,7 +161,7 @@ class SelfKnowledgeCompressor:
                 content=new_content,
                 version=next_version,
                 insight_ids=insight_ids,
-                edit_count=self._max_edits,
+                edit_count=self._count_change_regions(current_knowledge, new_content),
                 promoted=promote,
                 reason="selection_gate_passed" if promote else "selection_gate_rejected",
             )
@@ -207,7 +198,7 @@ class SelfKnowledgeCompressor:
         reconsidered_insights: list[Insight] | None = None,
     ) -> str:
         """调用 LLM 执行有界压缩。"""
-        system_prompt = KNOWLEDGE_COMPRESS_SYSTEM.format(max_edits=self._max_edits)
+        system_prompt = KNOWLEDGE_COMPRESS_SYSTEM
         user_prompt = KNOWLEDGE_COMPRESS_USER.format(
             current_knowledge=current_knowledge,
             validated_insights=format_insights_for_compression(
@@ -219,7 +210,6 @@ class SelfKnowledgeCompressor:
             reconsidered_insights=format_reconsidered_for_compression(
                 [ins.to_dict() for ins in (reconsidered_insights or [])]
             ),
-            max_edits=self._max_edits,
         )
 
         request = create_llm_request(
@@ -241,14 +231,12 @@ class SelfKnowledgeCompressor:
         *,
         old_content: str,
         new_content: str,
-        edit_count: int,
         insight_count: int,
     ) -> bool:
         """Selection Gate：判断新版本是否严格优于旧版本。"""
         user_prompt = SELECTION_GATE_USER.format(
-            old_content=old_content[:3000],
-            new_content=new_content[:3000],
-            edit_count=edit_count,
+            old_content=old_content,
+            new_content=new_content,
             insight_count=insight_count,
         )
 
@@ -282,7 +270,17 @@ class SelfKnowledgeCompressor:
             return False
         return bool(parsed.get("promote", False))
 
-    def collect_reconsidered_memo(self, limit: int = 5) -> list[Insight]:
+    @staticmethod
+    def _count_change_regions(old_content: str, new_content: str) -> int:
+        """Count actual contiguous diff regions for audit metadata only."""
+        matcher = difflib.SequenceMatcher(
+            a=old_content.splitlines(),
+            b=new_content.splitlines(),
+            autojunk=False,
+        )
+        return sum(1 for tag, *_ in matcher.get_opcodes() if tag != "equal")
+
+    def collect_reconsidered_memo(self, limit: int = 0) -> list[Insight]:
         """挑出"曾经写进认知文档、后来她自己不这么想了"的洞察。
 
         为什么要 knowledge_versions 这层过滤：
@@ -296,13 +294,12 @@ class SelfKnowledgeCompressor:
         published.sort(key=lambda ins: ins.reconsidered_at)
         return published[-limit:] if limit > 0 else published
 
-    def get_knowledge_for_prompt(self, max_chars: int = 2000) -> str:
-        """获取当前自我认知文档（用于 prompt 注入）。"""
+    def get_knowledge_for_prompt(self, max_chars: int = 0) -> str:
+        """获取完整自我认知文档；兼容参数不再切断内容。"""
         content = self._store.read_current_knowledge()
         if not content:
             return ""
-        if max_chars > 0 and len(content) > max_chars:
-            return content[:max_chars - 1].rstrip() + "…"
+        del max_chars
         return content
 
 

@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+import json
+
 
 # ── 快环：反思者 ──────────────────────────────────────────────
 
@@ -32,13 +34,12 @@ REFLECTION_SYSTEM_PROMPT = """\
 
 3. **引用具体事件**：初始证据必须来自你刚刚经历的事情，不是凭空推测。
 
-4. **质量优先**：每次最多提出 2 条洞察。没有值得记录的，就输出空列表。
+4. **质量优先**：只记录真正值得留下的洞察；没有就输出空列表。代码不会限制你能提出多少条。
 
 5. **洞察可以是任何维度**：关于与人互动的、关于自己的、关于情绪节奏的、关于任何你注意到的。你自己命名类别。
 
-6. **复现即证据**：如果你观察到的模式与下方“已有洞察”中的某条相符，仍然请报告它（用你这次的视角重新描述 claim）。
-   系统会把它作为新的确认证据合并进那条洞察，而不会创建重复。同一模式在不同情境中反复出现，正是它成立的依据。
-   如果你能看出是哪一条，可以在 `reinforces` 里写上它的 insight_id——比让系统猜更准。
+6. **显式关联**：如果你判断这次经历确实是在印证某条已有洞察，请在 `reinforces` 里写它的 insight_id。
+   不确定就留空，系统会保留为一条新的解释，不会靠文本相似度替你合并。
    同一个模式沿用同一个 `topic_key`，也会让它们更容易聚到一起。
 
 7. **审计留言可以看，但不必照做**：下方每条洞察后面可能带一行“↳ 审计留言”，那是独立审计视角留下的
@@ -98,7 +99,7 @@ REFLECTION_INTERACTION_USER = """\
 </previous_insights_summary>
 {skill_section}
 请安静地回想这段交互。有没有什么让你注意到的模式——无论是新的，还是再次印证了上面某条已有洞察？
-如果有，用 JSON 格式输出（复现已有洞察时，用这次的视角重新描述 claim 即可，系统会自动合并为证据）；如果没有值得记录的，输出空列表。
+如果有，用 JSON 格式输出；只有你明确填写 reinforces 时才会把证据挂到旧洞察。如果没有值得记录的，输出空列表。
 """
 
 REFLECTION_INTROSPECTION_USER = """\
@@ -115,7 +116,7 @@ REFLECTION_INTROSPECTION_USER = """\
 </previous_insights_summary>
 
 请安静地内省。在最近的思考/梦境/自主行为中，你有没有注意到关于自己的什么新东西——或是再次印证了上面某条已有洞察？
-如果有，用 JSON 格式输出（复现已有洞察时，用这次的视角重新描述 claim 即可，系统会自动合并为证据）；如果没有值得记录的，输出空列表。
+如果有，用 JSON 格式输出；只有你明确填写 reinforces 时才会把证据挂到旧洞察。如果没有值得记录的，输出空列表。
 """
 
 
@@ -131,9 +132,9 @@ AUDITOR_SYSTEM_PROMPT = """\
 ## 审计标准
 
 ### 证据充分性
-- 3 条来自不同时间点的同向证据即可视为充分。不要求“主动寻找反面证据”作为 validated 的前置条件。
-- 证据可以来自不同情境的复现（同一模式在不同场景下被观察到）。
-- 如果证据数量 >= 3 且来自 >= 2 个不同日期，除非存在明确矛盾，否则应倾向 validated。
+- 结合证据的来源、具体程度、适用边界、反例与彼此独立性作出判断。
+- 证据数量和跨情境复现是线索，但重复、检索频率和计数本身不构成真值。
+- 不使用固定条数或固定分数替代你的判断；请说明为什么这些证据在当前语境下足够或不足。
 
 ### 偏误检测
 你仍然检查以下偏误，但只在证据明显单一或有矛盾时才标记：
@@ -147,15 +148,15 @@ AUDITOR_SYSTEM_PROMPT = """\
 
 ## 裁决选项
 
-- **validated**：证据充分（>= 3 条同向，或 1 条高质量多情境证据），无明显偏误，claim 具体可验证。
+- **validated**：结合证据来源、情境跨度、边界与反例后，足以支持具体且可验证的 claim。
 - **rejected**：证据明确否定，或存在严重不可修复的偏误
-- **needs_more_evidence**：方向可能对但证据不足（< 3 条），需要更多经历来验证
+- **needs_more_evidence**：方向可能对但现有证据不足，需要更多经历来验证
 - **biased**：检测到明显偏误，需要修正 claim/constraints 后重审
 
 ## 重要原则
 
 不要过度严格。这些洞察是主体从真实交互中提取的认知，不是学术论文。
-如果一条洞察说的是一种合理的互动模式，且有多次观察支撑，就应该通过。
+如果一条洞察说的是一种合理的互动模式，仍需结合证据来源、边界和可能反例作判断。
 你的职责是防止明显的偏误和过度泛化，而不是要求完美的实验设计。
 
 ## 输出格式
@@ -180,19 +181,22 @@ AUDITOR_USER_TEMPLATE = """\
 - 依据: {rationale}
 - 边界: {constraints}
 - 主题: {topic_key}
-- 当前置信度: {confidence}
-- 已审计次数: {review_count}/{max_reviews}
 </insight>
 
 <evidence_chain>
 {evidence_text}
 </evidence_chain>
 
+<prior_audits>
+{audit_history}
+</prior_audits>
+
 <related_context>
 {context_text}
 </related_context>
 
-请对这条洞察进行独立审计。严格评估证据充分性和偏误风险。
+请对这条洞察进行独立审计。历史审计只是可追溯痕迹，不是本轮必须沿用的结论；
+请结合当前完整证据重新评估证据充分性和偏误风险。
 """
 
 
@@ -211,7 +215,7 @@ KNOWLEDGE_COMPRESS_SYSTEM = """\
 3. **保留边界**：知道"什么时候成立"和"什么时候不成立"同样重要。
 4. **包含反例备忘**：两种来源——被证据否定的认知，以及她自己重新审视过、
    结论变了的认知。用"曾以为……，实际……"记一句。这不是自责，是给以后的自己留路标。
-5. **有界编辑**：每次最多修改 {max_edits} 处。不要大幅重写。
+5. **忠实编辑**：根据这次理解实际需要修改；不要为了控制数量而漏掉相互依赖的变化。
 6. **第一人称**：用"我"来写，这是她对自己的认知。
 7. **修正而非堆叠**：下面会标出每条洞察曾写进过哪个版本。如果文档里已经有它的
    对应表述，就直接改那一句，不要在旁边并列一条新的。认知会变，文档跟着变，
@@ -260,7 +264,7 @@ KNOWLEDGE_COMPRESS_USER = """\
 {reconsidered_insights}
 </reconsidered>
 
-请基于新验证的洞察，对自我认知文档做有界更新（最多 {max_edits} 处修改）。
+请基于新验证的洞察，对自我认知文档做忠实更新。
 输出完整的更新后文档。
 """
 
@@ -296,7 +300,7 @@ SELECTION_GATE_USER = """\
 </new_version>
 
 <changes_summary>
-本次修改了 {edit_count} 处，基于 {insight_count} 条新验证洞察。
+本次更新基于 {insight_count} 条新验证洞察。
 </changes_summary>
 
 新版本是否严格优于旧版本？
@@ -305,12 +309,11 @@ SELECTION_GATE_USER = """\
 
 # ── 辅助：洞察摘要（用于注入 prompt）─────────────────────────
 
-def format_existing_insights_summary(insights_text: str, max_chars: int = 800) -> str:
-    """格式化已有洞察摘要，避免重复提出。"""
+def format_existing_insights_summary(insights_text: str, max_chars: int = 0) -> str:
+    """格式化已有洞察摘要；兼容参数不再切断记忆内容。"""
     if not insights_text:
         return "（暂无已有洞察）"
-    if len(insights_text) > max_chars:
-        return insights_text[:max_chars - 1].rstrip() + "…"
+    del max_chars
     return insights_text
 
 
@@ -318,13 +321,7 @@ def format_evidence_for_auditor(evidence_list: list[dict]) -> str:
     """格式化证据链供审计员查看。"""
     if not evidence_list:
         return "（暂无证据）"
-    lines = []
-    for i, ev in enumerate(evidence_list, 1):
-        direction = "✓ 正面" if ev.get("supports", True) else "✗ 反面"
-        kind = ev.get("kind", "unknown")
-        desc = ev.get("description", "")
-        lines.append(f"{i}. [{direction}] ({kind}) {desc}")
-    return "\n".join(lines)
+    return json.dumps(evidence_list, ensure_ascii=False, indent=2)
 
 
 def format_insights_for_compression(insights: list[dict]) -> str:
@@ -335,22 +332,11 @@ def format_insights_for_compression(insights: list[dict]) -> str:
     """
     if not insights:
         return "（暂无新验证洞察）"
-    lines = []
-    for ins in insights:
-        claim = ins.get("claim", "")
-        constraints = ins.get("constraints", "")
-        category = ins.get("category", "")
-        lines.append(f"- [{category}] {claim}")
-        if constraints:
-            lines.append(f"  边界：{constraints}")
-        versions = ins.get("knowledge_versions") or []
-        if versions:
-            vs = "、".join(f"v{v}" for v in versions)
-            lines.append(f"  （曾写入 {vs}——请修正文档里已有的那句，不要新增并列条目）")
-        note = str(ins.get("revision_note", "") or "").strip()
-        if note:
-            lines.append(f"  重新审视的原因：{note}")
-    return "\n".join(lines)
+    return json.dumps(
+        [_with_version_labels(insight) for insight in insights],
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 def format_reconsidered_for_compression(insights: list[dict]) -> str:
@@ -361,18 +347,20 @@ def format_reconsidered_for_compression(insights: list[dict]) -> str:
     """
     if not insights:
         return "（暂无重新审视过的认知）"
-    lines = []
-    for ins in insights:
-        claim = ins.get("claim", "")
-        status = ins.get("status", "")
-        note = str(ins.get("revision_note", "") or "").strip()
-        versions = ins.get("knowledge_versions") or []
-        vs = "、".join(f"v{v}" for v in versions) if versions else "未记录"
-        lines.append(f"- 曾经写入（{vs}）：{claim}")
-        if note:
-            lines.append(f"  她重新审视的原因：{note}")
-        lines.append(f"  现在的状态：{status}")
-    return "\n".join(lines)
+    return json.dumps(
+        [_with_version_labels(insight) for insight in insights],
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+def _with_version_labels(insight: dict) -> dict:
+    """Add human-readable labels while preserving the complete source record."""
+    rendered = dict(insight)
+    rendered["knowledge_version_labels"] = [
+        f"v{version}" for version in insight.get("knowledge_versions", [])
+    ]
+    return rendered
 
 
 # ── 技能蒸馏（Skill Distiller）───────────────────────────────
@@ -388,7 +376,7 @@ SKILL_DISTILL_SYSTEM = """\
 1. **只基于 validated 洞察**：未验证的猜测不进入技能。
 2. **一句话描述**：description 要简洁有力，像人对自己说的一句话。
 3. **具体方式**：instructions 写清楚“怎么做”和“什么时候不适用”。
-4. **有界编辑**：对已有技能最多修改 {max_edits} 处。不要大幅重写。
+4. **忠实编辑**：根据新理解实际需要修改，不用固定条数裁剪变化。
 5. **第一人称**：用“我”来写，这是她对自己的认知。
 6. **参考弯路**：如果下方有“试过的弯路”，不要重复那些方向。
 
@@ -396,14 +384,18 @@ SKILL_DISTILL_SYSTEM = """\
 
 只输出 JSON：
 ```json
-{{
+{
+  "target_skill_id": "要精炼的现有 skill_id；如果确实应形成新技能则留空",
   "name": "kebab-case-名称",
   "description": "一句话描述（始终在意识中）",
   "instructions": "具体怎么做 + 边界 + 注意事项"
-}}
+}
 ```
 
-如果是精炼已有技能，输出完整的更新后版本。如果认为不需要修改，原样输出当前内容。
+你会看到全部现有技能。是否与某一项属于同一种做事方式，由你根据经历判断：
+- 精炼现有技能时，必须原样填写它的 `target_skill_id`，并输出完整更新后版本。
+- 只有你判断没有任何现有技能适合承接时，才把 `target_skill_id` 留空并命名新技能。
+- 如果认为不需要修改，原样输出对应技能的当前内容与 ID。
 """
 
 SKILL_DISTILL_USER = """\
@@ -411,19 +403,12 @@ SKILL_DISTILL_USER = """\
 {validated_insights}
 </new_validated_insights>
 
-<current_skill>
-{current_skill}
-</current_skill>
+<existing_skills>
+{existing_skills}
+</existing_skills>
 
-<rejected_edits>
-{rejected_edits}
-</rejected_edits>
-
-<use_observations>
-{use_observations}
-</use_observations>
-
-请基于新验证的洞察，{action_hint}（最多 {max_edits} 处修改）。
+请基于新验证的洞察，决定应精炼哪一条现有技能，或是否确实需要形成新技能。
+现有技能的完整历史（包括使用观察与被拒绝的修改）都在上方；不要靠名称字符串猜测关联。
 输出 JSON。
 """
 
@@ -442,10 +427,10 @@ SKILL_GATE_SYSTEM = """\
 
 输出 JSON：
 ```json
-{{
+{
   "promote": true/false,
   "reason": "一句话说明为什么提升/拒绝"
-}}
+}
 ```
 """
 
@@ -473,7 +458,7 @@ SKILL_REFINE_SYSTEM = """\
 
 准则：
 1. 只基于实际使用观察，不凭空推测。
-2. 最多修改 {max_edits} 处。微调，不是重写。
+2. 根据实际观察决定修改范围；保留仍然成立的部分。
 3. 如果观察显示效果良好，不需要修改，原样输出。
 4. 保持第一人称。
 
