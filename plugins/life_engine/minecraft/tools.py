@@ -7,9 +7,7 @@
 from __future__ import annotations
 
 import json
-import logging
-from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, ClassVar
 
 from src.app.plugin_system.api import log_api
 from src.app.plugin_system.base import BaseTool
@@ -35,12 +33,12 @@ class LifeEngineMinecraftTool(BaseTool):
 
     tool_name: str = "nucleus_minecraft"
     description: str = TOOL_DESCRIPTION
-    parameters: dict[str, Any] = {
+    parameters: ClassVar[dict[str, Any]] = {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["start", "stop", "do", "look", "status"],
+                "enum": ["start", "stop", "do", "interrupt", "look", "status"],
                 "description": "操作类型",
             },
             "intent": {
@@ -51,6 +49,14 @@ class LifeEngineMinecraftTool(BaseTool):
                 "type": "string",
                 "description": "会话目标（action=start 时可选），如 '收集木材做工具'",
             },
+            "body_name": {
+                "type": "string",
+                "description": "action=start 时使用的精确身体名称，如 agent 或 biomimetic",
+            },
+            "reason": {
+                "type": "string",
+                "description": "action=interrupt 时由爱莉给出的中断理由",
+            },
         },
         "required": ["action"],
     }
@@ -60,6 +66,8 @@ class LifeEngineMinecraftTool(BaseTool):
         action: Annotated[str, "操作类型"],
         intent: Annotated[str, "意图描述"] = "",
         goal: Annotated[str, "会话目标"] = "",
+        body_name: Annotated[str, "精确身体名称"] = "",
+        reason: Annotated[str, "中断理由"] = "",
         **kwargs: Any,
     ) -> str:
         """执行 Minecraft 操作。"""
@@ -76,7 +84,7 @@ class LifeEngineMinecraftTool(BaseTool):
 
         match action:
             case "start":
-                result = await session.start(goal=goal)
+                result = await session.start(goal=goal, body_name=body_name)
             case "stop":
                 result = await session.stop()
             case "do":
@@ -84,6 +92,11 @@ class LifeEngineMinecraftTool(BaseTool):
                     result = {"success": False, "error": "请提供 intent 参数"}
                 else:
                     result = await session.do_intent(intent)
+            case "interrupt":
+                if not reason:
+                    result = {"success": False, "error": "请提供 reason 参数"}
+                else:
+                    result = await session.interrupt(reason)
             case "look":
                 result = await session.look()
             case "status":
@@ -96,4 +109,4 @@ class LifeEngineMinecraftTool(BaseTool):
 
 MINECRAFT_TOOLS = [LifeEngineMinecraftTool]
 
-__all__ = ["LifeEngineMinecraftTool", "MINECRAFT_TOOLS"]
+__all__ = ["MINECRAFT_TOOLS", "LifeEngineMinecraftTool"]

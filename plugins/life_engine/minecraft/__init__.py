@@ -32,7 +32,7 @@ def _lazy_import():
     from .launcher import MinecraftLauncher
     from .capture import WindowCapture
     from .input_control import InputController
-    from .consciousness import MinecraftSession
+    from .session import MinecraftSession
     from .win_bridge import WinBridge
 
     return MinecraftLauncher, WindowCapture, InputController, MinecraftSession, WinBridge

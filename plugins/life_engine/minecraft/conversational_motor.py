@@ -19,9 +19,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from PIL import Image as PILImage
 
-from .input_control import Action, ActionType, InputController
+from .input_control import Action, InputController
 
 logger = logging.getLogger("life_engine.minecraft.conversational_motor")
 

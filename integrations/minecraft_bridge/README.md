@@ -1,0 +1,15 @@
+# Elysium Embodiment Bridge
+
+Client-only NeoForge 1.21.1 bridge for Elysia's visible Minecraft body. It
+publishes complete structured observations and accepts correlated operations
+over an authenticated WebSocket connection.
+
+The bridge connects outbound to `ws://127.0.0.1:18765/elysium` by default. The
+Windows-to-WSL localhost forwarding path avoids inbound firewall rules. On
+first start it creates
+`config/elysium_bridge.json` with a random token. The token is never printed to
+the game log. Authentication remains mandatory; keep the generated token
+private.
+
+Build with `./gradlew build`. The distributable jar is written under
+`build/libs/`.

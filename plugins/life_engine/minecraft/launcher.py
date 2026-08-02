@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from .win_bridge import WinBridge, get_bridge
@@ -36,6 +36,24 @@ class MCConfig:
     extra_jvm_args: list[str] = field(default_factory=list)
     # 是否失焦时暂停渲染（False = 后台继续渲染）
     pause_on_lost_focus: bool = False
+    default_body: str = "agent"
+    agent_bridge_uri: str = "ws://host.docker.internal:8765/elysium"
+    agent_bridge_listen_uri: str | None = "ws://127.0.0.1:18765/elysium"
+    agent_token_file: Path = field(
+        default_factory=lambda: Path(
+            "/mnt/g/Game/Minecraft/.minecraft/config/elysium_bridge.json"
+        )
+    )
+    biomimetic_bridge_uri: str = "ws://host.docker.internal:8766/elysium"
+    biomimetic_bridge_listen_uri: str | None = "ws://127.0.0.1:18766/elysium"
+    biomimetic_token_file: Path = field(
+        default_factory=lambda: Path(
+            "/mnt/g/Game/Minecraft/.minecraft/config/elysium_native_bridge.json"
+        )
+    )
+    planner_task_name: str = "agent"
+    bridge_ready_timeout_seconds: float = 240.0
+    intent_timeout_seconds: float | None = None
 
 
 @dataclass(slots=True)
@@ -46,6 +64,7 @@ class LaunchResult:
     pid: int | None = None
     window_title: str = "Minecraft"
     error: str = ""
+    reused_existing: bool = False
 
 
 class MinecraftLauncher:
@@ -74,7 +93,7 @@ class MinecraftLauncher:
         }
 
         # 检查版本
-        version_dir = mc_home / "versions" / f"neoforge-21.1.219"
+        version_dir = mc_home / "versions" / "neoforge-21.1.219"
         result["has_version"] = version_dir.exists()
 
         # 检查启动脚本
@@ -91,21 +110,27 @@ class MinecraftLauncher:
 
     async def launch(self) -> LaunchResult:
         """启动 Minecraft（通过 cmd.exe 调用 Windows 端 bat）。"""
-        if await self._bridge.is_running():
-            self._running = True
-            return LaunchResult(success=True, error="已在运行")
-
         # 确保 pauseOnLostFocus 设置正确
-        self._configure_options()
+        existing = await self._bridge.find_window()
+        if existing is not None:
+            self._running = True
+            raw_pid = existing.get("pid")
+            pid = int(raw_pid) if raw_pid is not None else None
+            return LaunchResult(
+                success=True,
+                pid=pid,
+                window_title=str(existing.get("title") or "Minecraft"),
+                reused_existing=True,
+            )
+
+        await asyncio.to_thread(self._configure_options)
 
         # 通过 cmd.exe 启动 bat
-        bat_name = Path(self._cfg.launch_bat).name
+        bat_name = PureWindowsPath(self._cfg.launch_bat).name
         launch_dir = self._cfg.launch_dir
 
-        cmd = [
-            "cmd.exe", "/c",
-            f"cd /D {launch_dir} && start {bat_name}",
-        ]
+        command_line = f'cd /D "{launch_dir}" && start "" "{bat_name}"'
+        cmd = ["cmd.exe", "/d", "/s", "/c", command_line]
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -114,12 +139,14 @@ class MinecraftLauncher:
                 stderr=asyncio.subprocess.PIPE,
                 cwd="/mnt/c",  # 避免 UNC 路径问题
             )
-            # 不等待完成（游戏启动需要时间）
-            await asyncio.sleep(5)
-            self._running = True
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+            if proc.returncode != 0:
+                error = stderr.decode(errors="replace") or stdout.decode(errors="replace")
+                return LaunchResult(success=False, error=error.strip())
             logger.info(f"Minecraft 启动命令已发送: {bat_name}")
+            self._running = True
             return LaunchResult(success=True, window_title="Minecraft NeoForge* 1.21.1")
-        except Exception as exc:
+        except (OSError, TimeoutError) as exc:
             return LaunchResult(success=False, error=str(exc))
 
     def _configure_options(self) -> None:
@@ -142,7 +169,7 @@ class MinecraftLauncher:
 
             options_file.write_text(content, encoding="utf-8")
             logger.info(f"MC options 已配置: {target}")
-        except Exception as exc:
+        except (OSError, UnicodeError) as exc:
             logger.warning(f"配置 MC options 失败: {exc}")
 
     async def wait_for_window(self, timeout: float = 120.0) -> dict[str, Any] | None:
@@ -165,18 +192,12 @@ class MinecraftLauncher:
         return None
 
     async def stop(self) -> None:
-        """停止 MC 进程。"""
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "taskkill.exe", "/F", "/IM", "java.exe",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await proc.communicate()
-            self._running = False
-            logger.info("Minecraft 已停止")
-        except Exception as exc:
-            logger.warning(f"停止 MC 失败: {exc}")
+        """Refuse to kill unrelated Java processes without an owned process id."""
+
+        raise RuntimeError(
+            "launcher does not own the Minecraft java process; close the exact client "
+            "window or leave it running"
+        )
 
     async def find_window(self) -> dict[str, Any] | None:
         """查找 MC 窗口。"""

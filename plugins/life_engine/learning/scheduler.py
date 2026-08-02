@@ -11,7 +11,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,7 +24,7 @@ from .reflection import ReflectionEngine
 from .skill_distiller import SkillDistiller
 from .skill_store import SkillStore
 from .store import InsightStore
-from ..minecraft.consciousness import MinecraftSession
+from ..minecraft.session import MinecraftSession
 from ..minecraft.launcher import MCConfig
 
 logger = logging.getLogger("life_engine.learning.scheduler")
@@ -73,6 +72,10 @@ class LearningScheduler:
         # Minecraft 参数
         minecraft_enabled: bool = False,
         minecraft_config: dict[str, Any] | None = None,
+        consciousness_registry: Any | None = None,
+        save_consciousness_registry: Any | None = None,
+        world_state: Any | None = None,
+        save_world_state: Any | None = None,
         # 记忆服务（用于把"修正型洞察"落成显式修正记录，形成记忆演化链）
         memory_service: Any | None = None,
     ) -> None:
@@ -135,9 +138,12 @@ class LearningScheduler:
             self.minecraft_session = MinecraftSession(
                 workspace=self._workspace,
                 mc_config=mc_cfg,
-                llm_helper=None,  # TODO: 可选注入 LLM 辅助意图解析
+                consciousness_registry=consciousness_registry,
+                save_consciousness_registry=save_consciousness_registry,
+                world_state=world_state,
+                save_world_state=save_world_state,
             )
-            logger.info("Minecraft 具身体验已初始化（对话式控制）")
+            logger.info("Minecraft evidence-driven embodiment initialized")
 
         # 调度参数
         self._audit_interval_hours = max(1.0, audit_interval_hours)

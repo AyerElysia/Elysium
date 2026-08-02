@@ -9,7 +9,6 @@ WSL2 环境：通过 WinBridge 调用 Windows PrintWindow API。
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import io
 import logging

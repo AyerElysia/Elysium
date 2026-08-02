@@ -32,6 +32,8 @@
 - [自主性原则](./minecraft/minecraft_autonomy_principles.md)
 - [具身设计](./minecraft/minecraft_embodiment_design.md)
 - [快速上手](./minecraft/minecraft_quick_start.md)
+- [商业级具身架构](./architecture/minecraft_embodiment.md) — Agent、完全仿生、OBS 与服务器路线
+- [2026-08-02 商业级审计与验收报告](./report/minecraft-commercial-audit-2026-08-02.md)
 
 ## 她的日记
 

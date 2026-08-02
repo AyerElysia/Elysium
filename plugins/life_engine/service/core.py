@@ -4081,6 +4081,10 @@ class LifeEngineService(BaseService):
                     skill_distill_trigger_count=int(getattr(learning_cfg, "skill_distill_trigger_count", 3) if learning_cfg else 3),
                     skill_distill_interval_hours=float(getattr(learning_cfg, "skill_distill_interval_hours", 24.0) if learning_cfg else 24.0),
                     minecraft_enabled=bool(getattr(cfg, "minecraft", None) and cfg.minecraft.enabled),
+                    consciousness_registry=self._consciousness_registry,
+                    save_consciousness_registry=self.save_consciousness_registry,
+                    world_state=self._world_state,
+                    save_world_state=self.save_world_state,
                     minecraft_config={
                         "java_path": cfg.minecraft.java_path,
                         "mc_version": cfg.minecraft.mc_version,
@@ -4089,6 +4093,16 @@ class LifeEngineService(BaseService):
                         "window_height": cfg.minecraft.window_height,
                         "vla_model": cfg.minecraft.vla_model,
                         "offline_username": cfg.minecraft.offline_username,
+                        "default_body": cfg.minecraft.default_body,
+                        "agent_bridge_uri": cfg.minecraft.agent_bridge_uri,
+                        "agent_bridge_listen_uri": cfg.minecraft.agent_bridge_listen_uri,
+                        "agent_token_file": Path(cfg.minecraft.agent_token_file),
+                        "biomimetic_bridge_uri": cfg.minecraft.biomimetic_bridge_uri,
+                        "biomimetic_bridge_listen_uri": cfg.minecraft.biomimetic_bridge_listen_uri,
+                        "biomimetic_token_file": Path(cfg.minecraft.biomimetic_token_file),
+                        "planner_task_name": cfg.minecraft.planner_task_name,
+                        "bridge_ready_timeout_seconds": cfg.minecraft.bridge_ready_timeout_seconds,
+                        "intent_timeout_seconds": cfg.minecraft.intent_timeout_seconds,
                     } if getattr(cfg, "minecraft", None) and cfg.minecraft.enabled else None,
                 )
                 logger.info("三环自学习系统已初始化")
@@ -4438,7 +4452,7 @@ class LifeEngineService(BaseService):
                             # 每经过检查点间隔就重评估一次
                             if elapsed_minutes >= checkpoint_interval:
                                 next_checkpoint = int(elapsed_minutes // checkpoint_interval) * checkpoint_interval
-                                if elapsed_minutes - next_checkpoint < heartbeat_interval / 60.0:
+                                if elapsed_minutes - next_checkpoint < interval / 60.0:
                                     should_checkpoint = True
                         except Exception:
                             pass
@@ -4553,5 +4567,3 @@ class LifeEngineService(BaseService):
                 "error": str(exc),
                 "heartbeat_count": self._state.heartbeat_count,
             }
-
-

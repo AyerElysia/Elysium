@@ -9,14 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
 from PIL import Image as PILImage
 
-from .input_control import Action, ActionType
+from .input_control import Action
 
 logger = logging.getLogger("life_engine.minecraft.vla")
 

@@ -16,20 +16,17 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .capture import WindowCapture
-from .conversational_motor import ConversationalMotorController, create_conversational_motor
+from .conversational_motor import create_conversational_motor
 from .input_control import InputController
 from .launcher import MCConfig, MinecraftLauncher
 from .log_reader import MinecraftLogReader, create_log_reader
-from .motor_loop import ExecutionReport, MotorLoop
+from .motor_loop import MotorLoop
 from .prompts import (
     CONSCIOUSNESS_OBSERVATION,
-    CONSCIOUSNESS_SYSTEM,
     HEARTBEAT_MINECRAFT_ACTIVE,
     HEARTBEAT_MINECRAFT_IDLE,
-    PERCEPTION_PROMPT,
-    SESSION_SUMMARY_PROMPT,
 )
-from .social import SocialPresence, MinecraftChat, create_social_system
+from .social import create_social_system
 
 logger = logging.getLogger("life_engine.minecraft.consciousness")
 
@@ -390,7 +387,7 @@ class MinecraftSession:
                 if event.type == "join":
                     return f"Ayer ({event.player}) 在你的世界里 💕"
                 elif event.type == "leave":
-                    return f"Ayer 刚才离开了，你还有他的气息"
+                    return "Ayer 刚才离开了，你还有他的气息"
                 elif event.type == "chat":
                     return f"Ayer 刚才说了：「{event.message}」"
         return "你不确定 Ayer 现在是否在玩 Minecraft"
@@ -523,7 +520,6 @@ class MinecraftSession:
 
     async def _handle_log_event(self, event) -> None:
         """处理单条日志事件，更新感知和社交状态。"""
-        from .log_reader import LogEvent
 
         if event.type == "chat" and event.player:
             # 玩家聊天 → 更新社交感知

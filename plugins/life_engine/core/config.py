@@ -1415,6 +1415,58 @@ class LifeEngineConfig(BaseConfig):
             description="离线模式用户名。",
         )
 
+        default_body: str = Field(
+            default="agent",
+            description="Explicit Minecraft body selected when start omits body_name.",
+        )
+
+        agent_bridge_uri: str = Field(
+            default="ws://host.docker.internal:8765/elysium",
+            description="Authenticated NeoForge executor bridge URI.",
+        )
+
+        agent_bridge_listen_uri: str | None = Field(
+            default="ws://127.0.0.1:18765/elysium",
+            description="WSL listener for the outbound Windows agent relay.",
+        )
+
+        agent_token_file: str = Field(
+            default="/mnt/g/Game/Minecraft/.minecraft/config/elysium_bridge.json",
+            description="NeoForge bridge configuration containing its generated token.",
+        )
+
+        biomimetic_bridge_uri: str = Field(
+            default="ws://host.docker.internal:8766/elysium",
+            description="Authenticated first-person native-input sidecar URI.",
+        )
+
+        biomimetic_bridge_listen_uri: str | None = Field(
+            default="ws://127.0.0.1:18766/elysium",
+            description="WSL listener for the outbound Windows native-body relay.",
+        )
+
+        biomimetic_token_file: str = Field(
+            default="/mnt/g/Game/Minecraft/.minecraft/config/elysium_native_bridge.json",
+            description="Native sidecar configuration containing its generated token.",
+        )
+
+        planner_task_name: str = Field(
+            default="agent",
+            description="Configured Elysium model task used for game execution planning.",
+        )
+
+        bridge_ready_timeout_seconds: float = Field(
+            default=240.0,
+            gt=0,
+            description="Technical launch deadline for the selected body endpoint.",
+        )
+
+        intent_timeout_seconds: float | None = Field(
+            default=None,
+            gt=0,
+            description="Optional caller-owned lifetime for one game intention.",
+        )
+
     settings: SettingsSection = Field(default_factory=SettingsSection)
     model: ModelSection = Field(default_factory=ModelSection)
     memory_index: MemoryIndexSection = Field(default_factory=MemoryIndexSection)

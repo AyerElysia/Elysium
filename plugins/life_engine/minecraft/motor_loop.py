@@ -9,14 +9,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable
+from dataclasses import dataclass
+from typing import Any
 
-from PIL import Image as PILImage
 
 from .capture import WindowCapture
 from .conversational_motor import ConversationalMotorController, create_conversational_motor
-from .input_control import Action, ActionType, InputController
+from .input_control import InputController
 
 logger = logging.getLogger("life_engine.minecraft.motor")
 

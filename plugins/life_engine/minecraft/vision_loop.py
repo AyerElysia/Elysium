@@ -14,7 +14,6 @@ from PIL import Image as PILImage
 
 from .capture import WindowCapture
 from .conversational_motor import ConversationalMotorController
-from .input_control import InputController
 
 logger = logging.getLogger("life_engine.minecraft.vision_loop")
 
@@ -121,7 +120,7 @@ class VisionLoopController:
             "success": False,
             "reason": "max_steps_exceeded",
             "steps": steps_taken,
-            "feeling": f"我尝试了很多次，但还没完全做到",
+            "feeling": "我尝试了很多次，但还没完全做到",
             "journey": feelings,
         }
 
