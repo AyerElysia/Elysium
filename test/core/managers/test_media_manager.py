@@ -436,7 +436,7 @@ class TestMediaManagerRecognizeVoice:
                 result = await manager.recognize_voice(audio_b64)
 
                 assert result == "语音转写：你好，世界"
-                mock_asr.assert_called_once_with(audio_b64)
+                mock_asr.assert_called_once_with(audio_b64, {})
 
     async def test_recognize_voice_asr_returns_none(self) -> None:
         """测试 ASR 识别返回 None 时行为。"""

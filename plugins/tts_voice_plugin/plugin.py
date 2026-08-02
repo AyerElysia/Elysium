@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from src.app.plugin_system.api.log_api import get_logger
 from src.core.components.base.plugin import BasePlugin
 from src.core.components.loader import register_plugin
@@ -12,7 +14,9 @@ from src.core.components.loader import register_plugin
 from .actions.tts_action import TTSVoiceAction
 from .commands.tts_command import TTSVoiceCommand
 from .config import TTSVoiceConfig
-from .services.tts_service import TTSService
+
+if TYPE_CHECKING:
+    from .services.tts_service import TTSService
 
 logger = get_logger("tts_voice_plugin")
 
@@ -42,6 +46,8 @@ class TTSVoicePlugin(BasePlugin):
             logger.info("TTSVoicePlugin 已在本机配置中停用，跳过服务初始化")
             return
         logger.info("初始化 TTSVoicePlugin...")
+        from .services.tts_service import TTSService
+
         self.tts_service = TTSService(self)
         logger.info("TTSService 已成功初始化。")
 
@@ -73,6 +79,8 @@ class TTSVoicePlugin(BasePlugin):
         if cfg is not None and not cfg.plugin.enable:
             logger.info("TTSVoicePlugin 已在本机配置中停用，不注册组件")
             return []
+
+        from .services.tts_service import TTSService
 
         components: list[type] = [TTSService]
         action_enabled = True
