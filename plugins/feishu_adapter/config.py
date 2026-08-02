@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-from src.core.components.base.config import BaseConfig, Field, SectionBase, config_section
+from src.core.components.base.config import (
+    BaseConfig,
+    Field,
+    SectionBase,
+    config_section,
+)
 
 
 class FeishuAdapterConfig(BaseConfig):
@@ -98,8 +103,8 @@ class FeishuAdapterConfig(BaseConfig):
             order=1,
         )
         long_connection_log_level: str = Field(
-            default="INFO",
-            description="飞书 SDK 长连接日志等级",
+            default="WARNING",
+            description="飞书 SDK 长连接日志等级；常规自动重连日志始终聚合且连接票据始终脱敏",
             label="长连接日志等级",
             input_type="select",
             choices=["DEBUG", "INFO", "WARNING", "ERROR"],

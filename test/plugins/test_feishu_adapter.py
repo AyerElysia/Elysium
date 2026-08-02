@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -9,8 +10,8 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from plugins.feishu_adapter.adapter import FeishuAdapter, set_feishu_adapter
 from plugins.feishu_adapter import adapter as feishu_adapter_module
+from plugins.feishu_adapter.adapter import FeishuAdapter, set_feishu_adapter
 from plugins.feishu_adapter.config import FeishuAdapterConfig
 from plugins.feishu_adapter.router import FeishuRouter
 from src.core.models.message import MessageType
@@ -39,6 +40,77 @@ def test_feishu_config_defaults_to_long_connection() -> None:
 
     assert config.connection.subscription_mode == "long_connection"
     assert config.connection.auto_start_long_connection is True
+    assert config.connection.long_connection_log_level == "WARNING"
+
+
+def test_lark_sdk_log_filter_redacts_connection_credentials() -> None:
+    sdk_filter = feishu_adapter_module._LarkSdkLogFilter()
+    record = logging.LogRecord(
+        name="Lark",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=1,
+        msg=(
+            "connect failed, url=wss://example.test/ws?device_id=public"
+            "&access_key=secret-access&ticket=secret-ticket&service_id=1"
+        ),
+        args=(),
+        exc_info=None,
+    )
+
+    assert sdk_filter.filter(record) is True
+    rendered = record.getMessage()
+    assert "secret-access" not in rendered
+    assert "secret-ticket" not in rendered
+    assert "access_key=<redacted>" in rendered
+    assert "ticket=<redacted>" in rendered
+
+
+def test_lark_sdk_log_filter_suppresses_routine_reconnect_chatter() -> None:
+    sdk_filter = feishu_adapter_module._LarkSdkLogFilter()
+
+    for message in (
+        "connected to wss://example.test/ws?access_key=secret&ticket=secret",
+        "disconnected to wss://example.test/ws?access_key=secret&ticket=secret",
+        "trying to reconnect for the 2nd time",
+        "receive message loop exit, err: connection closed",
+    ):
+        record = logging.LogRecord(
+            name="Lark",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg=message,
+            args=(),
+            exc_info=None,
+        )
+
+        assert sdk_filter.filter(record) is False
+        assert "secret" not in record.getMessage()
+
+
+def test_lark_sdk_log_filter_rate_limits_repeated_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 100.0
+    monkeypatch.setattr(feishu_adapter_module.time, "monotonic", lambda: now)
+    sdk_filter = feishu_adapter_module._LarkSdkLogFilter()
+
+    def make_record() -> logging.LogRecord:
+        return logging.LogRecord(
+            name="Lark",
+            level=logging.ERROR,
+            pathname=__file__,
+            lineno=1,
+            msg="connect failed, err: temporary network failure",
+            args=(),
+            exc_info=None,
+        )
+
+    assert sdk_filter.filter(make_record()) is True
+    assert sdk_filter.filter(make_record()) is False
+    now += feishu_adapter_module._LARK_REPEAT_LOG_INTERVAL_SECONDS
+    assert sdk_filter.filter(make_record()) is True
 
 
 async def test_feishu_long_connection_uses_dedicated_sdk_event_loop(monkeypatch) -> None:

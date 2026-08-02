@@ -32,6 +32,7 @@ encrypt_key = ""
 [connection]
 subscription_mode = "long_connection"
 auto_start_long_connection = true
+long_connection_log_level = "WARNING"
 
 [bot]
 bot_name = "爱莉"
@@ -58,9 +59,12 @@ im.message.receive_v1
 
 7. 权限或事件变更后创建新版本，提交管理员审批并发布；只保存权限配置但不发布，运行中的应用不会获得新权限。
 8. 确认应用可用范围包含测试用户，并把机器人添加到飞书私聊或目标群。
-9. 启动 Elysium。看到 `飞书长连接后台线程已启动` / SDK 连接日志后，再验收文本与图片。
+9. 启动 Elysium。看到 `飞书长连接后台线程已启动` 后，再验收文本与图片。
 
 长连接模式不需要公网域名，不需要回调地址，也不需要 frp/cloudflared/ngrok。
+飞书 SDK 的瞬时断线由 SDK 自动恢复，正常的连接、断开和逐次重试日志会被聚合，
+不会再打印带 `access_key` / `ticket` 的完整连接地址。持续连接失败仍会保留首条诊断，
+相同错误最多每 5 分钟输出一次。
 
 ## 可选：HTTP 回调接入
 

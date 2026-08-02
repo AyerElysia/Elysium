@@ -504,7 +504,7 @@ api_base_url = "https://open.feishu.cn"
 [connection]
 subscription_mode = "long_connection"
 auto_start_long_connection = true
-long_connection_log_level = "INFO"
+long_connection_log_level = "WARNING"
 
 [bot]
 bot_open_id = ""
@@ -530,6 +530,8 @@ display_name_cache_ttl = 21600.0
 - 如果密钥曾泄露，立即在飞书开放平台轮换，不要只删除文本。
 - 长连接不需要公网域名、frp、ngrok 或 cloudflared。
 - 当前 HTTP 回调模式不支持加密回调，不要启用 Encrypt Key。
+- SDK 的短暂断线、恢复和逐次重试日志会被聚合，不作为故障刷屏。
+- 长连接 URL 中的 `access_key`、`ticket` 等临时票据始终脱敏；相同连接错误最多每 5 分钟输出一次。
 
 ### 9.3 飞书启动成功标志
 

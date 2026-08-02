@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-import base64
 import asyncio
+import base64
 import json
+import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -19,12 +21,80 @@ import httpx
 from mofox_wire import CoreSink, MessageEnvelope
 
 from src.core.components.base.adapter import BaseAdapter
-from src.core.utils.audio_transcode import probe_audio_duration_ms, transcode_audio_to_opus
+from src.core.utils.audio_transcode import (
+    probe_audio_duration_ms,
+    transcode_audio_to_opus,
+)
 from src.kernel.logger import get_logger
 
 from .config import FeishuAdapterConfig
 
 logger = get_logger("FeishuAdapter", color="#00D6B9")
+
+_LARK_SENSITIVE_QUERY_RE = re.compile(
+    r"(?i)([?&](?:access_key|ticket|app_secret|tenant_access_token)=)[^&\s]+"
+)
+_LARK_ROUTINE_RECONNECT_LOGS = (
+    "connected to wss://",
+    "disconnected to wss://",
+    "trying to reconnect for the",
+    "receive message loop exit, err:",
+)
+_LARK_REPEATED_ERROR_LOGS = (
+    "connect failed, err:",
+    "ping failed, err:",
+)
+_LARK_REPEAT_LOG_INTERVAL_SECONDS = 300.0
+
+
+def _redact_lark_sdk_log_message(message: str) -> str:
+    """Remove Feishu's short-lived connection credentials from SDK logs."""
+    return _LARK_SENSITIVE_QUERY_RE.sub(r"\1<redacted>", message)
+
+
+class _LarkSdkLogFilter(logging.Filter):
+    """Keep SDK diagnostics safe and aggregate expected reconnect chatter."""
+
+    _elysium_lark_sdk_filter = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._last_repeated_error_at: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = _redact_lark_sdk_log_message(record.getMessage())
+        # The SDK pre-formats all of its messages. Replacing msg/args here ensures
+        # every handler receives the redacted form, including handlers added later.
+        record.msg = message
+        record.args = ()
+        normalized = message.lower()
+
+        # These lines describe the SDK's normal auto-reconnect state machine. The
+        # adapter watchdog remains responsible for reporting sustained failures.
+        if any(marker in normalized for marker in _LARK_ROUTINE_RECONNECT_LOGS):
+            return False
+
+        category = next(
+            (marker for marker in _LARK_REPEATED_ERROR_LOGS if marker in normalized),
+            None,
+        )
+        if category is None:
+            return True
+
+        now = time.monotonic()
+        with self._lock:
+            last_emitted_at = self._last_repeated_error_at.get(category)
+            if (
+                last_emitted_at is not None
+                and now - last_emitted_at < _LARK_REPEAT_LOG_INTERVAL_SECONDS
+            ):
+                return False
+            self._last_repeated_error_at[category] = now
+        return True
+
+
+_LARK_SDK_LOG_FILTER = _LarkSdkLogFilter()
 
 # lark-oapi 必须在**主线程、模块加载期**完成导入，不能留到后台线程里首次导入。
 #
@@ -42,13 +112,30 @@ try:
     import lark_oapi as _lark_oapi_module
     import lark_oapi.ws as _lark_oapi_ws_module
     import lark_oapi.ws.client as _lark_oapi_ws_client_module
+    from lark_oapi.core.log import logger as _lark_sdk_logger
 
     _LARK_IMPORT_ERROR: Exception | None = None
 except Exception as _exc:  # noqa: BLE001
     _lark_oapi_module = None  # type: ignore[assignment]
     _lark_oapi_ws_module = None  # type: ignore[assignment]
     _lark_oapi_ws_client_module = None  # type: ignore[assignment]
+    _lark_sdk_logger = None  # type: ignore[assignment]
     _LARK_IMPORT_ERROR = _exc
+
+
+def _install_lark_sdk_log_filter() -> None:
+    """Install the process-wide SDK filter once without replacing user handlers."""
+    if _lark_sdk_logger is None:
+        return
+    if any(
+        getattr(item, "_elysium_lark_sdk_filter", False)
+        for item in _lark_sdk_logger.filters
+    ):
+        return
+    _lark_sdk_logger.addFilter(_LARK_SDK_LOG_FILTER)
+
+
+_install_lark_sdk_log_filter()
 
 PLATFORM = "feishu"
 _ADAPTER_INSTANCE: "FeishuAdapter | None" = None
@@ -425,7 +512,8 @@ class FeishuAdapter(BaseAdapter):
                     logger.info("飞书长连接 client.start() 已返回")
                 except Exception as exc:
                     if not self._feishu_stop_event.is_set():
-                        logger.error(f"飞书长连接已退出: {exc}", exc_info=True)
+                        safe_error = _redact_lark_sdk_log_message(str(exc))
+                        logger.error(f"飞书长连接已退出: {safe_error}")
 
                 if self._feishu_stop_event.is_set():
                     break
