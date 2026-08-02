@@ -95,6 +95,8 @@ poetry.lock
 /.pytest_cache/
 /test/__pycache__/
 .codex-backups/
+/.git.zip
+/runtime/
 
 logs/*
 htmlcov/
