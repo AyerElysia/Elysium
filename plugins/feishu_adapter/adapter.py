@@ -25,6 +25,30 @@ from .config import FeishuAdapterConfig
 
 logger = get_logger("FeishuAdapter", color="#00D6B9")
 
+# lark-oapi 必须在**主线程、模块加载期**完成导入，不能留到后台线程里首次导入。
+#
+# 原因：lark_oapi 是一棵 11000+ 个 .py 的巨型模块树（corehr/v2/model 一层就 1754 个）。
+# 在 worker 线程里首次导入会长时间持有 Python import lock，与 ChromaDB 的 Rust 扩展
+# （_upsert 需要回调 Python）形成死锁 —— 实测两次启动都必然卡死：
+#   feishu_long_connection 线程  卡在 import lark_oapi 的 exec_module
+#   ThreadPoolExecutor-0_x 线程  卡在 chromadb _upsert 的 futex（CPU 仅 0.02s）
+#   MainThread                   再也拿不到机会跑 heartbeat，启动序列永久停滞
+# 独立进程实测该 import 仅需 1.77s，所以卡住不是慢而是锁竞争。
+#
+# 提到模块级后，后台线程里的 `import lark_oapi` 只是 sys.modules 字典命中，不再持锁。
+# 依赖缺失时保持优雅降级：置为 None，由 _run_long_connection_client 报错并跳过长连接。
+try:
+    import lark_oapi as _lark_oapi_module
+    import lark_oapi.ws as _lark_oapi_ws_module
+    import lark_oapi.ws.client as _lark_oapi_ws_client_module
+
+    _LARK_IMPORT_ERROR: Exception | None = None
+except Exception as _exc:  # noqa: BLE001
+    _lark_oapi_module = None  # type: ignore[assignment]
+    _lark_oapi_ws_module = None  # type: ignore[assignment]
+    _lark_oapi_ws_client_module = None  # type: ignore[assignment]
+    _LARK_IMPORT_ERROR = _exc
+
 PLATFORM = "feishu"
 _ADAPTER_INSTANCE: "FeishuAdapter | None" = None
 
@@ -61,6 +85,7 @@ class FeishuAdapter(BaseAdapter):
         self._tenant_access_token_expires_at: float = 0.0
         self._seen_event_ids: list[str] = []
         self._main_loop: asyncio.AbstractEventLoop | None = None
+        self._long_connection_loop: asyncio.AbstractEventLoop | None = None
         self._long_connection_thread: threading.Thread | None = None
         self._long_connection_client: Any | None = None
         # open_id/union_id -> 真实显示名。值为 "" 表示查过但查不到，
@@ -270,61 +295,116 @@ class FeishuAdapter(BaseAdapter):
         try:
             disconnect = getattr(client, "_disconnect", None)
             if disconnect is not None:
-                await asyncio.to_thread(self._run_sdk_disconnect, client)
+                await asyncio.to_thread(
+                    self._run_sdk_disconnect,
+                    client,
+                    self._long_connection_loop,
+                )
         except Exception as exc:
             logger.warning(f"飞书长连接关闭失败: {exc}")
 
     @staticmethod
-    def _run_sdk_disconnect(client: Any) -> None:
+    def _run_sdk_disconnect(
+        client: Any,
+        sdk_loop: asyncio.AbstractEventLoop | None,
+    ) -> None:
+        """在飞书 SDK 所属事件循环中关闭长连接。"""
         try:
-            import lark_oapi.ws.client as ws_client_module
+            disconnect = getattr(client, "_disconnect", None)
+            if disconnect is None:
+                return
 
-            ws_client_module.loop.run_until_complete(client._disconnect())
+            ws_client_module = _lark_oapi_ws_client_module
+            if ws_client_module is None:
+                raise RuntimeError("lark-oapi ws client module is unavailable")
+
+            if sdk_loop is not None and sdk_loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(disconnect(), sdk_loop)
+                try:
+                    future.result(timeout=5)
+                finally:
+                    sdk_loop.call_soon_threadsafe(sdk_loop.stop)
+                return
+
+            ws_client_module.loop.run_until_complete(disconnect())
         except Exception:
             raise
 
     def _run_long_connection_client(self) -> None:
-        try:
-            import lark_oapi as lark
-            import lark_oapi.ws as lark_ws
-        except Exception as exc:
+        # 使用模块级已导入的 lark_oapi（见文件头注释）。绝对不要在这里做首次导入：
+        # 本函数运行在后台线程，首次导入会持有 import lock 并与 ChromaDB Rust 扩展死锁。
+        if (
+            _lark_oapi_module is None
+            or _lark_oapi_ws_module is None
+            or _lark_oapi_ws_client_module is None
+        ):
             logger.error(
-                f"飞书长连接启动失败：缺少 lark-oapi。请安装 `pip install lark-oapi`。error={exc}",
-                exc_info=True,
+                "飞书长连接启动失败：缺少 lark-oapi。请安装 `pip install lark-oapi`。"
+                f"error={_LARK_IMPORT_ERROR}",
+                exc_info=_LARK_IMPORT_ERROR,
             )
             return
+        lark = _lark_oapi_module
+        lark_ws = _lark_oapi_ws_module
 
-        config = self._config()
-        log_level = getattr(lark.LogLevel, config.connection.long_connection_log_level, lark.LogLevel.INFO)
-        retry_delay = 5.0
+        sdk_loop = asyncio.new_event_loop()
+        ws_client_module = _lark_oapi_ws_client_module
+        previous_sdk_loop = ws_client_module.loop
+        self._long_connection_loop = sdk_loop
+        ws_client_module.loop = sdk_loop
+        asyncio.set_event_loop(sdk_loop)
 
-        while not self._feishu_stop_event.is_set():
-            event_handler = self._build_lark_event_handler(lark)
-            client = lark_ws.Client(
-                app_id=config.app.app_id,
-                app_secret=config.app.app_secret,
-                log_level=log_level,
-                event_handler=event_handler,
-                domain=config.app.api_base_url,
-                auto_reconnect=True,
-                source="neo-mofox-feishu-adapter",
+        try:
+            config = self._config()
+            log_level = getattr(
+                lark.LogLevel,
+                config.connection.long_connection_log_level,
+                lark.LogLevel.INFO,
             )
-            self._long_connection_client = client
-            self._last_feishu_ws_time = time.time()
-            logger.info("飞书长连接正在连接开放平台")
-            try:
-                client.start()
-                # client.start() 正常返回说明连接已关闭
-                logger.info("飞书长连接 client.start() 已返回")
-            except Exception as exc:
-                logger.error(f"飞书长连接已退出: {exc}", exc_info=True)
+            retry_delay = 5.0
 
-            if self._feishu_stop_event.is_set():
-                break
+            while not self._feishu_stop_event.is_set():
+                event_handler = self._build_lark_event_handler(lark)
+                client = lark_ws.Client(
+                    app_id=config.app.app_id,
+                    app_secret=config.app.app_secret,
+                    log_level=log_level,
+                    event_handler=event_handler,
+                    domain=config.app.api_base_url,
+                    auto_reconnect=True,
+                    source="neo-mofox-feishu-adapter",
+                )
+                self._long_connection_client = client
+                self._last_feishu_ws_time = time.time()
+                logger.info("飞书长连接正在连接开放平台")
+                try:
+                    client.start()
+                    # client.start() 正常返回说明连接已关闭
+                    logger.info("飞书长连接 client.start() 已返回")
+                except Exception as exc:
+                    if not self._feishu_stop_event.is_set():
+                        logger.error(f"飞书长连接已退出: {exc}", exc_info=True)
 
-            logger.info(f"飞书长连接断开，{retry_delay:.0f}s 后重连...")
-            self._feishu_stop_event.wait(timeout=retry_delay)
-            retry_delay = min(retry_delay * 2, 60.0)  # 指数退避，最大 60s
+                if self._feishu_stop_event.is_set():
+                    break
+
+                logger.info(f"飞书长连接断开，{retry_delay:.0f}s 后重连...")
+                self._feishu_stop_event.wait(timeout=retry_delay)
+                retry_delay = min(retry_delay * 2, 60.0)  # 指数退避，最大 60s
+        finally:
+            pending_tasks = asyncio.all_tasks(sdk_loop)
+            for task in pending_tasks:
+                task.cancel()
+            if pending_tasks and not sdk_loop.is_closed():
+                sdk_loop.run_until_complete(
+                    asyncio.gather(*pending_tasks, return_exceptions=True)
+                )
+            sdk_loop.close()
+            asyncio.set_event_loop(None)
+            if ws_client_module.loop is sdk_loop:
+                ws_client_module.loop = previous_sdk_loop
+            if self._long_connection_loop is sdk_loop:
+                self._long_connection_loop = None
 
     def _build_lark_event_handler(self, lark_module: Any) -> Any:
         config = self._config()

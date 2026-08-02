@@ -1233,8 +1233,8 @@ class LifeSaveMediaTool(BaseTool):
             if dest.is_dir():
                 dest = dest / f"{int(_time.time())}{ext}"
 
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(image_bytes)
+        await asyncio.to_thread(dest.parent.mkdir, parents=True, exist_ok=True)
+        await asyncio.to_thread(dest.write_bytes, image_bytes)
 
         size = len(image_bytes)
         size_str = f"{size / 1024:.1f} KB" if size < 1024 * 1024 else f"{size / 1024 / 1024:.1f} MB"
@@ -1924,7 +1924,7 @@ class LifeChatter(BaseChatter):
         # successful save. Do not rewrite the snapshot file from load.
         return payloads
 
-    def _save_rolling_context_snapshot(self, response: Any) -> None:
+    async def _save_rolling_context_snapshot(self, response: Any) -> None:
         """Persist the current runtime payloads without mutating runtime.
 
         Runtime hierarchical compaction is owned by ``_maybe_compact_runtime_context``.
@@ -1948,17 +1948,18 @@ class LifeChatter(BaseChatter):
             data = self._snapshot_data_for_payloads(snapshot_payloads)
             path = self._rolling_context_snapshot_path()
             tmp_path = path.with_suffix(path.suffix + ".tmp")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path.write_text(
+            await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
+            await asyncio.to_thread(
+                tmp_path.write_text,
                 json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=str),
                 encoding="utf-8",
             )
-            os.replace(tmp_path, path)
+            await asyncio.to_thread(os.replace, tmp_path, path)
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"保存 life_chatter 滚动上下文快照失败: {exc}")
             try:
                 if tmp_path is not None:
-                    tmp_path.unlink(missing_ok=True)
+                    await asyncio.to_thread(tmp_path.unlink, missing_ok=True)
             except Exception:
                 pass
 
@@ -4306,7 +4307,7 @@ class LifeChatter(BaseChatter):
                             "reaction-only turn needs no visible reply",
                         )
                         self._maybe_compact_runtime_context(llm_response)
-                        self._save_rolling_context_snapshot(llm_response)
+                        await self._save_rolling_context_snapshot(llm_response)
                         return Wait()
 
                     rt.follow_up_rounds += 1
@@ -4323,7 +4324,7 @@ class LifeChatter(BaseChatter):
                             )
                         self._transition(rt, _Phase.WAIT_USER, "max rounds reached")
                         self._maybe_compact_runtime_context(llm_response)
-                        self._save_rolling_context_snapshot(llm_response)
+                        await self._save_rolling_context_snapshot(llm_response)
                         return Wait()
                     # must_reply 且本轮输出了独白却没发消息 → 立即提醒
                     if rt.must_reply and recorded_monologue and not rt.sent_visible_reply:
@@ -4343,7 +4344,7 @@ class LifeChatter(BaseChatter):
                         )
                     self._transition(rt, _Phase.FOLLOW_UP, "empty turn, continue loop")
                     self._maybe_compact_runtime_context(llm_response)
-                    self._save_rolling_context_snapshot(llm_response)
+                    await self._save_rolling_context_snapshot(llm_response)
                     if self._is_surface_low_latency_stream(chat_stream) and rt.must_reply:
                         continue
                     return Success("follow-up scheduled")
@@ -4497,7 +4498,7 @@ class LifeChatter(BaseChatter):
                         llm_response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
                     self._transition(rt, _Phase.WAIT_USER, "pass_and_wait")
                     self._maybe_compact_runtime_context(llm_response)
-                    self._save_rolling_context_snapshot(llm_response)
+                    await self._save_rolling_context_snapshot(llm_response)
                     return Wait()
 
                 # 用户已经看到回复或本轮命中了最近回复锚点后，对外表达已经闭合。
@@ -4512,7 +4513,7 @@ class LifeChatter(BaseChatter):
                     )
                     self._transition(rt, _Phase.WAIT_USER, reason)
                     self._maybe_compact_runtime_context(llm_response)
-                    self._save_rolling_context_snapshot(llm_response)
+                    await self._save_rolling_context_snapshot(llm_response)
                     return Wait()
 
                 # 默认继续 loop：检查 max_rounds 安全阀
@@ -4528,7 +4529,7 @@ class LifeChatter(BaseChatter):
                         llm_response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
                     self._transition(rt, _Phase.WAIT_USER, "max rounds reached")
                     self._maybe_compact_runtime_context(llm_response)
-                    self._save_rolling_context_snapshot(llm_response)
+                    await self._save_rolling_context_snapshot(llm_response)
                     return Wait()
 
                 # 补 ASSISTANT 占位：TOOL_RESULT 尾部必须接 ASSISTANT 才能接下一轮 USER/请求。
@@ -4537,7 +4538,7 @@ class LifeChatter(BaseChatter):
 
                 self._transition(rt, _Phase.FOLLOW_UP, "default loop continue")
                 self._maybe_compact_runtime_context(llm_response)
-                self._save_rolling_context_snapshot(llm_response)
+                await self._save_rolling_context_snapshot(llm_response)
                 if self._is_surface_low_latency_stream(chat_stream) and rt.must_reply:
                     continue
                 return Success("follow-up scheduled")

@@ -20,6 +20,7 @@ from .eligibility import (
     eligible_document_path_sql,
     register_indexed_path_sql_function,
 )
+from .sqlite_runtime import run_db
 
 if TYPE_CHECKING:
     from ..core.plugin import LifeEnginePlugin
@@ -291,7 +292,7 @@ async def _read_graph_payload(
         return {"nodes": nodes, "links": links}
 
     try:
-        return await asyncio.to_thread(_read)
+        return await run_db(_read)
     except sqlite3.ProgrammingError as exc:
         if "created in a thread" not in str(exc):
             raise

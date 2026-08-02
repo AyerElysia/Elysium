@@ -164,7 +164,8 @@ class AutonomyIntentStore:
         return intents
 
     def save(self, intents: list[AutonomyIntent]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        parent = self.path.parent
+        parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "version": _STORE_VERSION,
             "updated_at": iso_now(),

@@ -33,6 +33,18 @@ _TEST_PNG_B64 = (
 )
 
 
+async def _skip_snapshot_save(_response: object) -> None:
+    """替换 ``_save_rolling_context_snapshot`` 的异步空实现。
+
+    快照落盘会 mkdir/write_text/os.replace，是真实磁盘 I/O，因此生产实现是
+    协程；桩必须同样是协程，否则调用点的 ``await`` 会拿到 ``None``。
+
+    Args:
+        _response: 被忽略的 LLM 响应对象。
+    """
+    return None
+
+
 def test_life_chatter_system_prompt_includes_memory_and_chatter_tools_not_heartbeat_tool(tmp_path) -> None:
     """聊天态应共享 SOUL/USER/MEMORY/TOOLS，并保留核心工具说明。"""
     (tmp_path / "SOUL.md").write_text("SOUL_CONTENT", encoding="utf-8")
@@ -348,7 +360,7 @@ def test_life_chatter_snapshot_compaction_handles_budget_below_summary_envelope(
 
 
 @pytest.mark.parametrize("failure_stage", ["mkdir", "write", "replace"])
-def test_life_chatter_snapshot_save_failure_does_not_mutate_runtime(
+async def test_life_chatter_snapshot_save_failure_does_not_mutate_runtime(
     tmp_path, monkeypatch, failure_stage
 ) -> None:
     config = LifeEngineConfig()
@@ -382,7 +394,7 @@ def test_life_chatter_snapshot_save_failure_does_not_mutate_runtime(
     else:
         monkeypatch.setattr(chatter_module.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("replace")))
 
-    chatter._save_rolling_context_snapshot(response)
+    await chatter._save_rolling_context_snapshot(response)
 
     assert response.payloads is original_list
     assert response.payloads == original_payloads
@@ -599,7 +611,7 @@ async def _drive_router_false_case(
     monkeypatch.setattr(chatter, "flush_unreads", flush_unreads)
     monkeypatch.setattr(chatter, "_await_model_turn", immediate_model_turn)
     monkeypatch.setattr(chatter, "_maybe_compact_runtime_context", lambda _response: None)
-    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", lambda _response: None)
+    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
     monkeypatch.setattr(
         "src.kernel.concurrency.get_watchdog",
         lambda: SimpleNamespace(feed_dog=lambda _stream_id: None),
@@ -945,7 +957,7 @@ async def test_life_chatter_follow_up_response_is_sent_once_without_initial_comm
     monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
     monkeypatch.setattr(chatter, "flush_unreads", fail_flush_unreads)
     monkeypatch.setattr(chatter, "_await_model_turn", immediate_model_turn)
-    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", lambda _response: None)
+    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
 
     result = await chatter._drive_global_runtime_until_yield(
         SimpleNamespace(stream_id="stream-a"),
@@ -1234,7 +1246,7 @@ async def test_surface_think_only_follow_up_runs_without_driver_tick(monkeypatch
     monkeypatch.setattr(chatter, "run_tool_call", fake_run_tool_call)
     monkeypatch.setattr(chatter, "_await_model_turn", immediate_model_turn)
     monkeypatch.setattr(chatter, "_maybe_compact_runtime_context", lambda _response: None)
-    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", lambda _response: None)
+    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
     monkeypatch.setattr(
         "src.kernel.concurrency.get_watchdog",
         lambda: SimpleNamespace(feed_dog=lambda _stream_id: None),
@@ -1299,7 +1311,7 @@ async def test_life_chatter_visible_reply_ends_turn(monkeypatch) -> None:
 
     monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
     monkeypatch.setattr(chatter, "run_tool_call", fake_run_tool_call)
-    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", lambda _response: None)
+    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
 
     result = await chatter._drive_global_runtime_until_yield(
         SimpleNamespace(stream_id="stream-a"),
@@ -1369,7 +1381,7 @@ async def test_life_chatter_recent_duplicate_reply_is_suppressed_and_ends_turn(m
     monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
     monkeypatch.setattr(chatter, "run_tool_call", fail_run_tool_call)
     monkeypatch.setattr(chatter, "_send_must_reply_fallback", fail_fallback)
-    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", lambda _response: None)
+    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
 
     result = await chatter._drive_global_runtime_until_yield(
         SimpleNamespace(stream_id="stream-a"),
@@ -1423,7 +1435,7 @@ async def test_life_chatter_reaction_only_empty_turn_ends_without_fallback(monke
 
     monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
     monkeypatch.setattr(chatter, "_send_must_reply_fallback", fail_fallback)
-    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", lambda _response: None)
+    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
 
     result = await chatter._drive_global_runtime_until_yield(
         SimpleNamespace(stream_id="stream-a"),

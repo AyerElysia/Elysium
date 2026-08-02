@@ -22,6 +22,7 @@ from .eligibility import (
 )
 from .indexing import INDEX_SCHEMA_NAME
 from .nodes import compute_content_hash, generate_file_node_id
+from .sqlite_runtime import run_db
 
 # Kept as a compatibility alias for callers that imported the former constant.
 SUPPORTED_WORKSPACE_SUFFIXES = SUPPORTED_DOCUMENT_SUFFIXES
@@ -866,9 +867,9 @@ async def _async_db_snapshot(
     workspace_path: str | Path,
 ) -> tuple[dict[str, Any], _VectorIdSets]:
     if db is None:
-        return await asyncio.to_thread(_collect_empty_db_snapshot, workspace_path)
+        return await run_db(_collect_empty_db_snapshot, workspace_path)
     try:
-        return await asyncio.to_thread(_collect_async_db_snapshot, db, workspace_path)
+        return await run_db(_collect_async_db_snapshot, db, workspace_path)
     except sqlite3.ProgrammingError as exc:
         # Small unit-test connections may retain SQLite's default thread guard.
         # Production connections are created with check_same_thread=False, so
@@ -991,13 +992,13 @@ async def health_snapshot_from_path(
 ) -> dict[str, Any]:
     """Collect health through an isolated read-only SQLite connection."""
     try:
-        snapshot, id_sets = await asyncio.to_thread(
+        snapshot, id_sets = await run_db(
             _collect_read_only_db_snapshot,
             db_path,
             workspace_path,
         )
     except (OSError, ValueError, sqlite3.Error):
-        snapshot, id_sets = await asyncio.to_thread(_collect_empty_db_snapshot, workspace_path)
+        snapshot, id_sets = await run_db(_collect_empty_db_snapshot, workspace_path)
     return await _finish_health_snapshot(snapshot, id_sets, collection)
 
 

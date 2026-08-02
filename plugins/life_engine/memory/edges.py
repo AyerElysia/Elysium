@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import math
 import sqlite3
 import threading
@@ -19,6 +18,7 @@ from typing import Any, Dict, List, Optional
 from src.app.plugin_system.api import log_api
 
 from .eligibility import assess_document_path
+from .sqlite_runtime import run_db
 
 logger = log_api.get_logger("life_engine.memory.edges")
 
@@ -492,7 +492,7 @@ async def create_or_update_edge(
                 _finish_savepoint(cursor, savepoint, error)
         return forward, is_update
 
-    edge, is_update = await asyncio.to_thread(_do_db_work)
+    edge, is_update = await run_db(_do_db_work)
 
     if emit_visual_event:
         event_type = "memory.edges.updated" if is_update else "memory.edges.created"
@@ -541,7 +541,7 @@ async def get_edges_from(
         )
         return [row_to_edge(row) for row in cursor.fetchall()]
 
-    return await asyncio.to_thread(_do_db_work)
+    return await run_db(_do_db_work)
 
 
 async def get_edges_to(
@@ -571,7 +571,7 @@ async def get_edges_to(
         )
         return [row_to_edge(row) for row in cursor.fetchall()]
 
-    return await asyncio.to_thread(_do_db_work)
+    return await run_db(_do_db_work)
 
 
 async def delete_edge(
@@ -646,7 +646,7 @@ async def delete_edge(
                 _finish_savepoint(cursor, savepoint, error)
             return deleted_count > 0
 
-    return await asyncio.to_thread(_do_db_work)
+    return await run_db(_do_db_work)
 
 
 # ============================================================
@@ -678,7 +678,7 @@ async def reinforce_coactivated(
         stale_set = set(stale_ids)
         deduped_ids = [node_id for node_id in deduped_ids if node_id not in stale_set]
 
-    reinforced_edges, _, stale_ids = await asyncio.to_thread(
+    reinforced_edges, _, stale_ids = await run_db(
         _reinforce_associations_sync,
         db,
         deduped_ids,

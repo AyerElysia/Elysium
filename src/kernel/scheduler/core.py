@@ -25,8 +25,18 @@ from src.kernel.concurrency import get_task_manager
 from src.kernel.logger import get_logger
 from src.kernel.scheduler.types import TaskExecution, TaskStatus, TriggerType
 from src.kernel.scheduler.time_utils import next_after
+from src.kernel.concurrency.blocking import BlockingPool
 
 logger = get_logger("kernel.scheduler", display="调度器")
+
+# 同步回调专属线程池。用调度器自己的池子而不是默认 executor：一个超时后收不
+# 回来的回调只会耗尽调度器的容量，不会连带把适配器读文件、媒体解码、向量检索
+# 一起饿死。8 个 worker 足以覆盖常规调度密度，同时让放弃线程的累积可观测。
+_CALLBACK_POOL = BlockingPool(
+    "scheduler-callback",
+    max_workers=8,
+    env_var="ELYSIUM_SCHEDULER_CALLBACK_WORKERS",
+)
 
 
 @dataclass
@@ -271,6 +281,10 @@ class UnifiedScheduler:
         self._event_subscriptions.clear()
         self._completed_tasks.clear()
 
+        # 不等待在途同步回调：若其中有超时后无法中断的，等待就意味着永久挂起，
+        # 关闭路径不能被一个坏回调劫持。排队中的回调会被取消。
+        _CALLBACK_POOL.shutdown(wait=False)
+
         logger.info("统一调度器已停止")
 
     async def _cancel_all_running_tasks(self) -> None:
@@ -497,7 +511,7 @@ class UnifiedScheduler:
                 # 重试循环
                 while True:
                     try:
-                        await asyncio.wait_for(self._run_callback(task), timeout=timeout)
+                        await self._run_callback(task, timeout)
 
                         # 执行成功
                         task.finish_execution(success=True)
@@ -553,19 +567,42 @@ class UnifiedScheduler:
             if not task.is_recurring and task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.TIMEOUT):
                 await self._move_to_completed(task)
 
-    async def _run_callback(self, task: ScheduleTask) -> Any:
-        """运行任务回调函数"""
+    async def _run_callback(self, task: ScheduleTask, timeout: float) -> Any:
+        """运行任务回调函数，并在此处施加超时。
+
+        超时必须落在这一层而不是调用方：协程回调可以被 ``wait_for`` 真正取消，
+        同步回调则不能——线程杀不掉。两者需要不同的收尾方式，在外面套一层统一
+        的 ``wait_for`` 会把同步回调的线程泄漏掩盖成一次普通超时。
+
+        Args:
+            task: 待执行的调度任务。
+            timeout: 超时秒数。
+
+        Returns:
+            Any: 回调的返回值。
+
+        Raises:
+            asyncio.TimeoutError: 回调超时。同步回调超时时线程仍在运行，已由
+                ``BlockingPool`` 登记进放弃计数。
+            Exception: 回调自身抛出的异常。
+        """
         try:
             if asyncio.iscoroutinefunction(task.callback):
-                result = await task.callback(*task.callback_args, **task.callback_kwargs)
-            else:
-                # 同步函数在线程中运行，避免阻塞事件循环
-                result = await asyncio.to_thread(
-                    task.callback,
-                    *task.callback_args,
-                    **task.callback_kwargs,
+                return await asyncio.wait_for(
+                    task.callback(*task.callback_args, **task.callback_kwargs),
+                    timeout=timeout,
                 )
-            return result
+            return await _CALLBACK_POOL.run(
+                task.callback,
+                task.callback_args,
+                task.callback_kwargs,
+                timeout=timeout,
+                label=task.task_name,
+            )
+        except asyncio.TimeoutError:
+            # 调用方已按超时语义记录并统计，这里再打一条 error 只会让同一次
+            # 超时在日志里出现两遍，且第二遍的措辞是误导性的"执行出错"。
+            raise
         except Exception as e:
             logger.error(f"执行任务 {task.task_name} 的回调函数时出错: {e}")
             raise
@@ -664,9 +701,14 @@ class UnifiedScheduler:
                     if asyncio.iscoroutinefunction(task.callback):
                         await asyncio.wait_for(task.callback(*task.callback_args, **merged_kwargs), timeout=timeout)
                     else:
-                        await asyncio.wait_for(
-                            asyncio.to_thread(task.callback, *task.callback_args, **merged_kwargs),
+                        # 同步回调走调度器专属线程池：超时后线程无法中断，
+                        # BlockingPool 会把它登记为放弃中而不是假装收回。
+                        await _CALLBACK_POOL.run(
+                            task.callback,
+                            task.callback_args,
+                            merged_kwargs,
                             timeout=timeout,
+                            label=task.task_name,
                         )
 
                     task.finish_execution(success=True)
@@ -1074,6 +1116,9 @@ class UnifiedScheduler:
             "recurring_tasks": sum(1 for t in self._tasks.values() if t.is_recurring),
             "one_time_tasks": sum(1 for t in self._tasks.values() if not t.is_recurring),
             "registered_events": list(self._event_subscriptions.keys()),
+            # 同步回调线程池状态。abandoned_live 大于 0 意味着有回调超时后仍
+            # 占着 worker——这是排查"调度看起来卡住了"的第一个观察点。
+            "sync_callback_pool": _CALLBACK_POOL.stats(),
             "total_executions": self._total_executions,
             "total_failures": self._total_failures,
             "total_timeouts": self._total_timeouts,

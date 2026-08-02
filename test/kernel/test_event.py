@@ -258,3 +258,97 @@ class TestEventBusPublish:
 
         assert all(decision == EventDecision.SUCCESS for decision, _ in results)
         assert sorted(seen) == list(range(10))
+
+
+class TestSyncHandlerDispatch:
+    """同步订阅者的执行契约。
+
+    订阅者按优先级串行成链，所以链上任何一个同步 handler 只要在事件循环上
+    做文件读或数据库查询，就会把整条链——连同循环上其他所有任务——一起停住。
+    而 EVENT_HANDLER_TIMEOUT_SECONDS 对它原本完全不生效：wait_for
+    只能作用于 awaitable，一个已经在循环上跑着的同步函数没有可取消点。
+    """
+
+    async def test_sync_handler_runs_off_event_loop(self, monkeypatch) -> None:
+        import threading
+
+        monkeypatch.setattr(event_core, "EVENT_HANDLER_TIMEOUT_SECONDS", 5.0)
+
+        bus = EventBus()
+        release = threading.Event()
+        ticks = 0
+
+        def blocking_handler(event_name: str, params: dict):
+            # 若这里跑在事件循环上，_tick 永远不会推进，release 永不被 set
+            release.wait(5.0)
+            params["thread"] = threading.current_thread().name
+            return (EventDecision.SUCCESS, params)
+
+        async def _tick() -> None:
+            nonlocal ticks
+            for _ in range(5):
+                await asyncio.sleep(0.01)
+                ticks += 1
+            release.set()
+
+        bus.subscribe("e", blocking_handler)
+        ticker = asyncio.ensure_future(_tick())
+        try:
+            decision, out = await bus.publish("e", {"thread": ""})
+            await ticker
+        finally:
+            release.set()
+
+        assert decision == EventDecision.SUCCESS
+        assert ticks == 5
+        assert out["thread"].startswith("event-handler")
+
+    async def test_sync_handler_timeout_is_enforced_and_chain_continues(
+        self, monkeypatch
+    ) -> None:
+        """同步 handler 超时必须被跳过，且不阻断后续订阅者。"""
+        import threading
+
+        monkeypatch.setattr(event_core, "EVENT_HANDLER_TIMEOUT_SECONDS", 0.05)
+
+        bus = EventBus()
+        release = threading.Event()
+
+        def stuck_handler(event_name: str, params: dict):
+            release.wait(10.0)
+            params["seen"] = params["seen"] + "stuck"
+            return (EventDecision.SUCCESS, params)
+
+        async def next_handler(event_name: str, params: dict):
+            params["seen"] = params["seen"] + "next"
+            return (EventDecision.SUCCESS, params)
+
+        bus.subscribe("e", stuck_handler, priority=10)
+        bus.subscribe("e", next_handler, priority=1)
+
+        try:
+            decision, out = await bus.publish("e", {"seen": ""})
+        finally:
+            release.set()
+
+        assert decision == EventDecision.SUCCESS
+        # 超时的 handler 影响被丢弃，后一个仍然执行
+        assert out == {"seen": "next"}
+
+    async def test_sync_handler_returning_awaitable_is_awaited(self) -> None:
+        """返回协程的同步 handler：阻塞部分在线程里，等待部分回到循环。"""
+        bus = EventBus()
+
+        async def _finish(params: dict):
+            await asyncio.sleep(0)
+            params["v"] = params["v"] + 1
+            return (EventDecision.SUCCESS, params)
+
+        def factory_handler(event_name: str, params: dict):
+            return _finish(params)
+
+        bus.subscribe("e", factory_handler)
+        decision, out = await bus.publish("e", {"v": 1})
+
+        assert decision == EventDecision.SUCCESS
+        assert out == {"v": 2}

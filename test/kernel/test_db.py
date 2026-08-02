@@ -741,40 +741,106 @@ async def test_postgresql_config_builder():
     assert kwargs["pool_pre_ping"] is True
 
 
-async def test_sqlite_optimizations():
-    """测试SQLite优化应用"""
-    from src.kernel.db.core.engine import _enable_sqlite_optimizations
-    from sqlalchemy.ext.asyncio import create_async_engine
+async def test_sqlite_optimizations_apply_to_every_pooled_connection():
+    """SQLite 调优必须落在连接池的每一条连接上，而不只是第一条。
+
+    ``foreign_keys`` / ``busy_timeout`` / ``temp_store`` 都是连接作用域的，
+    在引擎初始化后执行一次只能配置到池里的第一条连接。本用例并发占用多条
+    连接强制连接池扩容，逐条断言设置生效。
+    """
+    import asyncio
     import tempfile
     from pathlib import Path
 
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from src.kernel.db.core.engine import _install_sqlite_optimizations
+
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "opt_test.db"
-        url = f"sqlite+aiosqlite:///{db_path.absolute()}"
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///{db_path.absolute().as_posix()}"
+        )
+        _install_sqlite_optimizations(engine)
 
-        engine = create_async_engine(url)
+        async def probe() -> dict[str, object]:
+            """占住一条连接，读回其实际生效的 PRAGMA。"""
+            async with engine.connect() as conn:
+                # 持有连接直到所有探针都拿到各自的连接，逼迫连接池新建连接
+                await asyncio.sleep(0.05)
+                return {
+                    "foreign_keys": (
+                        await conn.execute(text("PRAGMA foreign_keys"))
+                    ).scalar(),
+                    "journal_mode": (
+                        await conn.execute(text("PRAGMA journal_mode"))
+                    ).scalar(),
+                    "busy_timeout": (
+                        await conn.execute(text("PRAGMA busy_timeout"))
+                    ).scalar(),
+                    "temp_store": (
+                        await conn.execute(text("PRAGMA temp_store"))
+                    ).scalar(),
+                }
 
         try:
-            # 应用优化（应该不抛出异常）
-            await _enable_sqlite_optimizations(engine)
+            settings = await asyncio.gather(*[probe() for _ in range(6)])
         finally:
             await engine.dispose()
 
+    assert len(settings) == 6
+    for index, applied in enumerate(settings):
+        assert applied["foreign_keys"] == 1, f"第 {index} 条连接外键约束未启用"
+        assert applied["journal_mode"] == "wal", f"第 {index} 条连接不是 WAL"
+        assert applied["busy_timeout"] == 10000, f"第 {index} 条连接 busy_timeout 未设置"
+        # 2 == SQLITE_TEMP_STORE MEMORY
+        assert applied["temp_store"] == 2, f"第 {index} 条连接 temp_store 未设置"
 
-async def test_postgresql_optimizations():
-    """测试PostgreSQL优化应用（仅验证不抛出异常）"""
-    from src.kernel.db.core.engine import _enable_postgresql_optimizations
+
+async def test_session_optimization_failure_degrades_to_default_once():
+    """单条调优语句失败不应让连接建不起来，且只告警一次。
+
+    旧版 PostgreSQL 缺少某些 GUC；此时该项应退回默认配置，而不是把整个
+    连接池打挂。同时 connect 事件会在每条新连接上触发，告警必须去重，
+    否则连接池扩容会刷爆日志。
+    """
+    import asyncio
+    from unittest.mock import patch
+
+    from sqlalchemy import text
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    # 创建一个内存SQLite引擎来测试函数逻辑
-    # （真实PostgreSQL连接需要数据库服务）
+    from src.kernel.db.core import engine as engine_module
+
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
 
-    try:
-        # 函数应该优雅地处理失败
-        await _enable_postgresql_optimizations(engine)
-    finally:
-        await engine.dispose()
+    warnings_seen: list[str] = []
+
+    with patch.object(engine_module.logger, "warning", warnings_seen.append):
+        engine_module._install_session_optimizations(
+            engine,
+            ("PRAGMA busy_timeout = 10000", "PRAGMA definitely_not_a_pragma(1,2"),
+            "TestDB",
+        )
+
+        async def probe() -> object:
+            """占住一条连接，确认好的语句仍然生效。"""
+            async with engine.connect() as conn:
+                # 持有连接直到所有探针都拿到各自的连接，逼迫连接池新建连接
+                await asyncio.sleep(0.05)
+                return (await conn.execute(text("PRAGMA busy_timeout"))).scalar()
+
+        try:
+            timeouts = await asyncio.gather(*[probe() for _ in range(4)])
+        finally:
+            await engine.dispose()
+
+    # 坏语句被跳过，好语句照常生效
+    assert timeouts == [10000, 10000, 10000, 10000]
+    # 4 条连接，但同一条坏语句只告警一次
+    failures = [msg for msg in warnings_seen if "definitely_not_a_pragma" in msg]
+    assert len(failures) == 1, f"预期只告警一次，实际 {len(failures)} 次"
 
 
 async def test_engine_initialization_error():

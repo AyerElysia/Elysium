@@ -31,6 +31,7 @@ from .eligibility import (
 )
 from .nodes import MemoryNode, NodeType, canonical_file_node_id, row_to_node
 from .temporal import parse_temporal_date
+from .sqlite_runtime import run_db
 
 # NOTE: Every ``register_indexed_path_sql_function(db)`` call below is
 # deliberately unconditional and repeated per query. This is safe and cheap
@@ -350,7 +351,7 @@ async def sync_embedding(
         return result.file_path
 
     try:
-        queued_path = await asyncio.to_thread(_enqueue)
+        queued_path = await run_db(_enqueue)
         if queued_path:
             logger.debug(f"已排入 embedding outbox: {queued_path}")
     except Exception as exc:
@@ -789,7 +790,7 @@ def _table_columns(db: sqlite3.Connection, table: str) -> set[str]:
 async def _async_db_read(func: Any, *args: Any) -> Any:
     """Run a SQLite read off-loop, falling back for thread-bound test connections."""
     try:
-        return await asyncio.to_thread(func, *args)
+        return await run_db(func, *args)
     except sqlite3.ProgrammingError as exc:
         if "created in a thread" not in str(exc):
             raise
@@ -1579,6 +1580,59 @@ async def get_snippet(db: sqlite3.Connection, node_id: str) -> str:
             if row:
                 return _make_snippet(str(row["content"] or ""), "")
         return ""
+
+    return await _async_db_read(_do_db_work)
+
+
+@dataclass(frozen=True)
+class LineageNodeView:
+    """组装记忆包时需要的节点视图。
+
+    只保留调用方真正读取的字段。血缘遍历一次可能牵出上百个节点，把完整的
+    :class:`MemoryNode` 全列取回纯属浪费。
+    """
+
+    node_id: str
+    file_path: str
+    title: str
+    snippet: str
+
+
+async def get_lineage_node_views(
+    db: sqlite3.Connection,
+    node_ids: Iterable[str],
+) -> Dict[str, LineageNodeView]:
+    """批量取回可见节点及其摘要。
+
+    可见性判定与 :func:`get_node_by_id` 完全一致：已删除的节点、以及路径不再
+    合规的文件节点都不会出现在结果里；摘要的生成方式与 :func:`get_snippet`
+    一致。区别只在往返次数——原先每条血缘边要两次查询，现在整批一次。
+
+    Args:
+        db: SQLite 连接。
+        node_ids: 待取回的节点 ID，重复项自动去重。
+
+    Returns:
+        Dict[str, LineageNodeView]: node_id 到视图的映射。不可见的节点不在其中，
+        调用方据此判断该节点应被跳过。
+    """
+
+    def _do_db_work() -> Dict[str, LineageNodeView]:
+        views: Dict[str, LineageNodeView] = {}
+        for node_id, node in _load_nodes_by_ids(db, node_ids).items():
+            if node.is_deleted:
+                continue
+            if node.node_type == NodeType.FILE.value and not is_eligible_indexed_document_path(
+                node.file_path
+            ):
+                continue
+            views[node_id] = LineageNodeView(
+                node_id=node.node_id,
+                file_path=node.file_path,
+                title=node.title,
+                snippet=_make_snippet(node.preview_content, ""),
+            )
+        return views
 
     return await _async_db_read(_do_db_work)
 

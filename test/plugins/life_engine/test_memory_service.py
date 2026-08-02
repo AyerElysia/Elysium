@@ -781,3 +781,81 @@ async def test_startup_recovery_requeues_unembedded_nodes_without_jobs(tmp_path:
         (node_id,),
     ).fetchone()[0]
     assert pending_count == 1, "遗留节点应被补入队一个 pending 任务"
+
+
+# ── 启动恢复的执行位置 ──────────────────────────────────────
+
+
+async def test_startup_recovery_never_runs_on_the_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """启动恢复的工作量与工作区规模成正比，必须完全离开事件循环。
+
+    三次全表扫描、一次目录树遍历、每个待补文件一次读取——原实现全部直接跑在
+    循环上，启动期间适配器收发、心跳和调度一起停摆。这里把目录遍历和文件读取
+    都替换成"记录线程名并真的睡一会儿"的桩：如果它们回到循环上，并发运行的
+    计时协程就推不动。
+    """
+    import threading
+    import time
+
+    from plugins.life_engine.memory import service as service_module
+
+    service = _make_service(tmp_path)
+    await service.initialize()
+
+    for index in range(3):
+        note = tmp_path / "notes" / f"n{index}.md"
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text(f"# 笔记 {index}\n内容", encoding="utf-8")
+
+    loop_thread = threading.current_thread().name
+    scan_threads: list[str] = []
+    read_threads: list[str] = []
+
+    real_scan = service_module.scan_workspace_documents
+    real_read = service_module._read_documents
+
+    def _slow_scan(workspace: Any) -> Any:
+        """记录扫描所在线程，并模拟一次真实规模的目录遍历。"""
+        scan_threads.append(threading.current_thread().name)
+        time.sleep(0.15)
+        return real_scan(workspace)
+
+    def _slow_read(workspace: Any, paths: Any) -> Any:
+        """记录文件读取所在线程，并模拟一次真实规模的批量读。"""
+        read_threads.append(threading.current_thread().name)
+        time.sleep(0.15)
+        return real_read(workspace, paths)
+
+    monkeypatch.setattr(service_module, "scan_workspace_documents", _slow_scan)
+    monkeypatch.setattr(service_module, "_read_documents", _slow_read)
+
+    ticks = 0
+
+    async def _tick() -> None:
+        """恢复期间持续推进，用来证明循环没有被占住。"""
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    ticker = asyncio.ensure_future(_tick())
+    try:
+        await service._startup_recovery()
+    finally:
+        ticker.cancel()
+        try:
+            await ticker
+        except asyncio.CancelledError:
+            pass
+        await service.close()
+
+    # 桩确实被调用了，否则下面的断言是空的
+    assert scan_threads, "启动恢复没有扫描工作区"
+    assert read_threads, "启动恢复没有读取待补索引的文件"
+    assert all(name != loop_thread for name in scan_threads + read_threads)
+
+    # 至少 0.3s 的同步耗时，循环仍然在以 10ms 的节奏推进
+    assert ticks >= 10, f"事件循环在启动恢复期间被阻塞（仅推进 {ticks} 次）"

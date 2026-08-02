@@ -671,11 +671,12 @@ class StatePersistence:
         path = self._runtime_context_path()
         temp_path = path.with_suffix(path.suffix + ".tmp")
         try:
-            temp_path.write_text(
+            await asyncio.to_thread(
+                temp_path.write_text,
                 json.dumps(payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            temp_path.replace(path)
+            await asyncio.to_thread(temp_path.replace, path)
         except Exception as exc:  # noqa: BLE001
             logger.error(f"life_engine 持久化上下文失败: {exc}")
             raise PersistenceError(f"Failed to persist runtime context: {exc}") from exc
@@ -699,7 +700,7 @@ class StatePersistence:
             return [], [], {}
 
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw = json.loads(await asyncio.to_thread(path.read_text, encoding="utf-8"))
         except Exception as exc:  # noqa: BLE001
             logger.error(f"life_engine 读取上下文失败: {exc}")
             return [], [], {}

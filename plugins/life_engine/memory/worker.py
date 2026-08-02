@@ -25,6 +25,7 @@ from .indexing import (
 )
 from .nodes import NodeType, compute_content_hash, generate_file_node_id
 from .search import EmbeddingResult, embed_texts
+from .sqlite_runtime import run_db
 
 CHUNK_INDEX_VERSION = 1
 CHUNK_COLLECTION_PREFIX = "life_memory_chunks"
@@ -174,7 +175,7 @@ async def _resolve_collection(
 async def _db_call(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     """Keep SQLite work off-loop while supporting thread-bound test handles."""
     try:
-        return await asyncio.to_thread(func, *args, **kwargs)
+        return await run_db(func, *args, **kwargs)
     except sqlite3.ProgrammingError as exc:
         if "created in a thread" not in str(exc):
             raise

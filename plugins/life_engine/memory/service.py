@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -45,6 +47,7 @@ from .search import (
     fts_search,
     spread_activation,
     filter_existing_scores,
+    get_lineage_node_views,
     get_node_by_id,
     get_snippet,
 )
@@ -81,6 +84,7 @@ from .indexing import (
     move_document_rows,
     read_active_chunk_index_state,
     set_index_job_status,
+    transaction,
     upsert_document_rows,
 )
 from .eligibility import (
@@ -91,6 +95,12 @@ from .eligibility import (
     read_workspace_document,
     register_indexed_path_sql_function,
     scan_workspace_documents,
+)
+from .sqlite_runtime import (
+    bind_reader_pool,
+    open_memory_connection,
+    run_db,
+    run_read,
 )
 from .health import health_snapshot_from_path as collect_health_snapshot
 from .worker import (
@@ -163,6 +173,207 @@ from .experience import (
 )
 
 logger = log_api.get_logger("life_engine.memory")
+
+# 启动补索引时一次性读入内存的文档数。这不是行为阈值：分批与否不改变最终被
+# 索引的文件集合，只决定峰值内存——整个工作区的正文同时驻留可能是数百 MB。
+_RECOVERY_READ_BATCH = 32
+
+
+def _select_unembedded_without_job(db: sqlite3.Connection) -> list[sqlite3.Row]:
+    """查出已存在但从未进入索引队列的文件节点。
+
+    Args:
+        db: 只读连接。
+
+    Returns:
+        list[sqlite3.Row]: 含 ``node_id`` / ``file_path`` / ``content_hash``。
+    """
+    return db.execute(
+        """
+        SELECT node_id, file_path, content_hash
+        FROM memory_nodes
+        WHERE embedding_synced = 0
+          AND is_deleted = 0
+          AND node_type = 'file'
+          AND NOT EXISTS (
+              SELECT 1 FROM memory_index_jobs j
+              WHERE j.node_id = memory_nodes.node_id
+                AND (j.status = 'pending'
+                     OR j.error = 'EmptyDocument')
+          )
+        """
+    ).fetchall()
+
+
+def _select_indexed_file_nodes(db: sqlite3.Connection) -> list[sqlite3.Row]:
+    """列出全部文件节点的路径与删除标记。
+
+    Args:
+        db: 只读连接。
+
+    Returns:
+        list[sqlite3.Row]: 含 ``node_id`` / ``file_path`` / ``is_deleted``。
+    """
+    return db.execute(
+        "SELECT node_id, file_path, is_deleted FROM memory_nodes WHERE node_type = 'file'"
+    ).fetchall()
+
+
+def _select_orphan_edge_ids(db: sqlite3.Connection) -> list[str]:
+    """查出两端有任一节点不存在的边。
+
+    Args:
+        db: 只读连接。
+
+    Returns:
+        list[str]: 孤立边的 ``edge_id``。
+    """
+    rows = db.execute(
+        """
+        SELECT e.edge_id FROM memory_edges e
+        LEFT JOIN memory_nodes s ON s.node_id = e.source_id
+        LEFT JOIN memory_nodes t ON t.node_id = e.target_id
+        WHERE s.node_id IS NULL OR t.node_id IS NULL
+        """
+    ).fetchall()
+    return [str(row["edge_id"]) for row in rows]
+
+
+def _mark_nodes_deleted(db: sqlite3.Connection, node_ids: Sequence[str]) -> None:
+    """把给定节点标记为已删除。
+
+    用 ``executemany`` 而非一条 ``IN (...)``：后者的参数个数受 SQLite 的
+    ``SQLITE_MAX_VARIABLE_NUMBER`` 限制，工作区一旦大批量删除文件就会直接
+    报错，而这条清理路径恰恰只在那种时候才有活干。
+
+    Args:
+        db: 写连接。
+        node_ids: 待标记的节点 ID。
+    """
+    with transaction(db) as cursor:
+        cursor.executemany(
+            "UPDATE memory_nodes SET is_deleted = 1 WHERE node_id = ?",
+            [(node_id,) for node_id in node_ids],
+        )
+
+
+def _delete_edges(db: sqlite3.Connection, edge_ids: Sequence[str]) -> None:
+    """删除给定的边。
+
+    Args:
+        db: 写连接。
+        edge_ids: 待删除的边 ID。
+    """
+    with transaction(db) as cursor:
+        cursor.executemany(
+            "DELETE FROM memory_edges WHERE edge_id = ?",
+            [(edge_id,) for edge_id in edge_ids],
+        )
+
+
+def _enqueue_jobs(
+    db: sqlite3.Connection,
+    entries: Sequence[tuple[str, str]],
+) -> int:
+    """为一批节点补建索引任务。
+
+    Args:
+        db: 写连接。
+        entries: ``(node_id, content_hash)`` 序列。
+
+    Returns:
+        int: 成功入队的数量。失败的条目只记录日志，不中断整批——启动恢复的
+        价值在于尽可能多地补齐缺口，单个坏节点不应让其余节点继续缺失。
+    """
+    enqueued = 0
+    for node_id, content_hash in entries:
+        try:
+            enqueue_index_job(db, node_id, content_hash)
+            enqueued += 1
+        except Exception as exc:
+            logger.warning(f"补 embedding 入队失败 {node_id}: {exc}")
+    return enqueued
+
+
+@dataclass(frozen=True)
+class _BundlePathView:
+    """一个候选路径的合规性与存在性判定结果。
+
+    Attributes:
+        memory_path: 规范化后的工作区相对路径；不合格时为 ``None``。
+        exists: 该路径当前是否是一个真实存在的普通文件。
+    """
+
+    memory_path: str | None
+    exists: bool
+
+
+def _assess_bundle_path(workspace: Path, raw_path: str) -> _BundlePathView:
+    """判定单个候选路径是否可进入记忆包，并顺带取回存在性。
+
+    合规性判定与存在性判定都要碰文件系统（``is_symlink`` / ``exists`` /
+    ``is_file``），合在一处求值可以让调用方一次拿全，而不是先问路径再问存在。
+
+    Args:
+        workspace: 工作区根目录。
+        raw_path: 检索结果或节点上记录的原始路径。
+
+    Returns:
+        _BundlePathView: 判定结果。
+    """
+    eligibility = assess_indexed_document_path(raw_path)
+    if not eligibility.eligible:
+        return _BundlePathView(memory_path=None, exists=False)
+
+    candidate = workspace / eligibility.path
+    if candidate.is_symlink():
+        return _BundlePathView(memory_path=None, exists=False)
+    if candidate.exists() and not assess_workspace_document(workspace, eligibility.path).eligible:
+        return _BundlePathView(memory_path=None, exists=False)
+    return _BundlePathView(memory_path=eligibility.path, exists=candidate.is_file())
+
+
+def _assess_bundle_paths(
+    workspace: Path,
+    raw_paths: Sequence[str],
+) -> dict[str, _BundlePathView]:
+    """在一次线程调用里判定一批候选路径。
+
+    Args:
+        workspace: 工作区根目录。
+        raw_paths: 原始路径序列，调用方保证已去重。
+
+    Returns:
+        dict[str, _BundlePathView]: 原始路径到判定结果的映射。
+    """
+    return {raw_path: _assess_bundle_path(workspace, raw_path) for raw_path in raw_paths}
+
+
+def _read_documents(
+    workspace: Path,
+    paths: Sequence[str],
+) -> list[tuple[str, str]]:
+    """在线程中读取一批工作区文档。
+
+    Args:
+        workspace: 工作区根目录。
+        paths: 工作区相对路径。
+
+    Returns:
+        list[tuple[str, str]]: ``(path, content)``，不合格或读取失败的文件被跳过。
+    """
+    documents: list[tuple[str, str]] = []
+    for path in paths:
+        try:
+            decision = assess_workspace_document(workspace, path)
+            if not decision.eligible:
+                continue
+            content, _, _ = read_workspace_document(workspace, path)
+        except Exception as exc:
+            logger.warning(f"读取工作区文档失败 {path}: {exc}")
+            continue
+        documents.append((path, content))
+    return documents
 
 
 class LifeMemoryService:
@@ -326,7 +537,7 @@ class LifeMemoryService:
 
     async def _restore_chunk_collection(self) -> None:
         db = self._require_db()
-        state = await asyncio.to_thread(read_active_chunk_index_state, db)
+        state = await run_db(read_active_chunk_index_state, db)
         if state is None:
             return
         self._chunk_index_state = state
@@ -349,20 +560,18 @@ class LifeMemoryService:
                 return
 
             db_path = self._get_db_path()
-            db_path.parent.mkdir(parents=True, exist_ok=True)
 
-            db = sqlite3.connect(str(db_path), check_same_thread=False)
-            db.row_factory = sqlite3.Row
-            db.execute("PRAGMA foreign_keys = ON")
-            db.execute("PRAGMA busy_timeout = 5000")
-            register_indexed_path_sql_function(db)
+            # 连接的 journal/durability/cache 配置全部集中在 sqlite_runtime，
+            # 避免这里和读连接池、备份路径各自设一套 PRAGMA 而悄悄漂移。
+            db = await run_db(open_memory_connection, db_path, role="writer")
             self._db = db
+            bind_reader_pool(db_path)
 
             try:
                 await self._create_tables()
-                await asyncio.to_thread(create_memory_schema, db)
-                await asyncio.to_thread(create_life_memory_schema, db)
-                await asyncio.to_thread(create_epistemic_schema, db)
+                await run_db(create_memory_schema, db)
+                await run_db(create_life_memory_schema, db)
+                await run_db(create_epistemic_schema, db)
 
                 try:
                     await self._restore_chunk_collection()
@@ -374,7 +583,8 @@ class LifeMemoryService:
                 await self._startup_recovery()
             except BaseException:
                 self._db = None
-                await asyncio.to_thread(db.close)
+                bind_reader_pool(None)
+                await run_db(db.close)
                 raise
             logger.info(f"记忆服务初始化完成，数据库: {db_path}")
 
@@ -502,69 +712,34 @@ class LifeMemoryService:
 
             self._db.commit()
 
-        await asyncio.to_thread(_do_db_work)
+        await run_db(_do_db_work)
         logger.debug("记忆数据库表创建完成")
 
     async def _startup_recovery(self) -> None:
-        """启动时修复：补 embedding 入队缺口、补索引缺口、清理 ghost 节点和孤立边。"""
+        """启动时修复：补 embedding 入队缺口、补索引缺口、清理 ghost 节点和孤立边。
+
+        这一步的工作量与工作区规模成正比——三次全表扫描、一次目录树遍历、
+        每个待补文件一次读取。原实现全部直接跑在事件循环上，启动期间整个
+        进程（适配器收发、心跳、调度）都在等它。现在读查询走只读连接、
+        文件 IO 走线程、写入走写连接，事件循环在整个恢复过程中保持可用。
+        """
         workspace = self._get_workspace_path()
         db = self._db
         if db is None:
             return
 
         # 0. 补 embedding 入队缺口：节点已存在但从未入队（历史遗留 / 任务丢失）
-        unembedded_no_job = db.execute(
-            """
-            SELECT node_id, file_path, content_hash
-            FROM memory_nodes
-            WHERE embedding_synced = 0
-              AND is_deleted = 0
-              AND node_type = 'file'
-              AND NOT EXISTS (
-                  SELECT 1 FROM memory_index_jobs j
-                  WHERE j.node_id = memory_nodes.node_id
-                    AND (j.status = 'pending'
-                         OR j.error = 'EmptyDocument')
-              )
-            """
-        ).fetchall()
+        unembedded_no_job = await run_read(_select_unembedded_without_job)
         if unembedded_no_job:
             logger.info(f"启动扫描：发现 {len(unembedded_no_job)} 个有节点但无任务的未同步文件，补入队")
-            requeued = 0
-            for row in unembedded_no_job:
-                node_id = str(row["node_id"])
-                file_path = str(row["file_path"] or "")
-                content_hash = str(row["content_hash"] or "")
-                try:
-                    if content_hash:
-                        # 有 hash，直接入队无需重读文件
-                        enqueue_index_job(db, node_id, content_hash)
-                        requeued += 1
-                    elif file_path:
-                        # 无 hash，重读文件以更新 hash 并入队
-                        decision = assess_workspace_document(workspace, file_path)
-                        if not decision.eligible:
-                            continue
-                        content, _, _ = read_workspace_document(workspace, file_path)
-                        title = Path(file_path).stem
-                        await get_or_create_file_node(
-                            db=db,
-                            file_path=file_path,
-                            title=title,
-                            content=content,
-                        )
-                        requeued += 1
-                except Exception as exc:
-                    logger.warning(f"补 embedding 入队失败 {file_path}: {exc}")
+            requeued = await self._requeue_unembedded(workspace, db, unembedded_no_job)
             logger.info(f"补 embedding 入队完成：已入队 {requeued}/{len(unembedded_no_job)} 个节点")
 
         # 1. 扫描工作区，收集已索引路径
-        scan = scan_workspace_documents(workspace)
+        scan = await asyncio.to_thread(scan_workspace_documents, workspace)
         workspace_paths: set[str] = {doc.path for doc in scan.documents}
 
-        indexed_rows = db.execute(
-            "SELECT node_id, file_path, is_deleted FROM memory_nodes WHERE node_type = 'file'"
-        ).fetchall()
+        indexed_rows = await run_read(_select_indexed_file_nodes)
         indexed_paths: dict[str, tuple[str, int]] = {}
         for row in indexed_rows:
             fp = str(row["file_path"] or "")
@@ -575,23 +750,7 @@ class LifeMemoryService:
         unindexed = workspace_paths - set(indexed_paths.keys())
         if unindexed:
             logger.info(f"启动扫描：发现 {len(unindexed)} 个未索引文件，开始补索引")
-            enqueued = 0
-            for path in sorted(unindexed):
-                decision = assess_workspace_document(workspace, path)
-                if not decision.eligible:
-                    continue
-                try:
-                    content, _, _ = read_workspace_document(workspace, path)
-                    title = Path(path).stem
-                    await get_or_create_file_node(
-                        db=db,
-                        file_path=path,
-                        title=title,
-                        content=content,
-                    )
-                    enqueued += 1
-                except Exception as exc:
-                    logger.warning(f"补索引失败 {path}: {exc}")
+            enqueued = await self._index_missing_documents(workspace, db, sorted(unindexed))
             logger.info(f"启动扫描完成：已入队 {enqueued}/{len(unindexed)} 个文件待 embedding")
 
         # 3. 标记 ghost 节点：索引中有但工作区已删除的文件
@@ -602,31 +761,86 @@ class LifeMemoryService:
             if deleted == 0:  # 还没标记删除
                 ghost_node_ids.append(nid)
         if ghost_node_ids:
-            placeholders = ",".join("?" * len(ghost_node_ids))
-            db.execute(
-                f"UPDATE memory_nodes SET is_deleted = 1 WHERE node_id IN ({placeholders})",
-                ghost_node_ids,
-            )
-            db.commit()
+            await run_db(_mark_nodes_deleted, db, ghost_node_ids)
             logger.info(f"启动清理：标记 {len(ghost_node_ids)} 个 ghost 节点为已删除")
 
         # 4. 清理孤立边：FK 约束违反（指向已删除节点的边）
-        orphan_edges = db.execute(
-            """
-            SELECT e.edge_id FROM memory_edges e
-            LEFT JOIN memory_nodes s ON s.node_id = e.source_id
-            LEFT JOIN memory_nodes t ON t.node_id = e.target_id
-            WHERE s.node_id IS NULL OR t.node_id IS NULL
-            """
-        ).fetchall()
-        if orphan_edges:
-            placeholders = ",".join("?" * len(orphan_edges))
-            db.execute(
-                f"DELETE FROM memory_edges WHERE edge_id IN ({placeholders})",
-                [r["edge_id"] for r in orphan_edges],
-            )
-            db.commit()
-            logger.info(f"启动清理：删除 {len(orphan_edges)} 条孤立边")
+        orphan_edge_ids = await run_read(_select_orphan_edge_ids)
+        if orphan_edge_ids:
+            await run_db(_delete_edges, db, orphan_edge_ids)
+            logger.info(f"启动清理：删除 {len(orphan_edge_ids)} 条孤立边")
+
+    async def _requeue_unembedded(
+        self,
+        workspace: Path,
+        db: sqlite3.Connection,
+        rows: Sequence[sqlite3.Row],
+    ) -> int:
+        """为已存在但从未入队的节点补建 embedding 任务。
+
+        Args:
+            workspace: 工作区根目录。
+            db: 写连接。
+            rows: ``_select_unembedded_without_job`` 的查询结果。
+
+        Returns:
+            int: 成功入队的节点数。
+        """
+        requeued = 0
+        # 有 content_hash 的直接入队，无需重读文件——先整批处理掉，避免和
+        # 昂贵的文件读取交错。
+        with_hash = [
+            (str(row["node_id"]), str(row["content_hash"]))
+            for row in rows
+            if str(row["content_hash"] or "")
+        ]
+        if with_hash:
+            requeued += await run_db(_enqueue_jobs, db, with_hash)
+
+        needs_read = [
+            str(row["file_path"] or "")
+            for row in rows
+            if not str(row["content_hash"] or "") and str(row["file_path"] or "")
+        ]
+        if needs_read:
+            requeued += await self._index_missing_documents(workspace, db, needs_read)
+        return requeued
+
+    async def _index_missing_documents(
+        self,
+        workspace: Path,
+        db: sqlite3.Connection,
+        paths: Sequence[str],
+    ) -> int:
+        """读取工作区文档并建立文件节点，文件 IO 全部在线程中完成。
+
+        文档按批读取而非一次读完：整个工作区的正文同时驻留内存可能是数百 MB，
+        分批只影响峰值内存，不改变最终被索引的文件集合。
+
+        Args:
+            workspace: 工作区根目录。
+            db: 写连接。
+            paths: 待索引的工作区相对路径。
+
+        Returns:
+            int: 成功建立节点的文件数。
+        """
+        indexed = 0
+        for start in range(0, len(paths), _RECOVERY_READ_BATCH):
+            batch = paths[start : start + _RECOVERY_READ_BATCH]
+            documents = await asyncio.to_thread(_read_documents, workspace, batch)
+            for file_path, content in documents:
+                try:
+                    await get_or_create_file_node(
+                        db=db,
+                        file_path=file_path,
+                        title=Path(file_path).stem,
+                        content=content,
+                    )
+                    indexed += 1
+                except Exception as exc:
+                    logger.warning(f"补索引失败 {file_path}: {exc}")
+        return indexed
 
     def _require_db(self) -> sqlite3.Connection:
         if self._db is None or self._closing:
@@ -647,8 +861,11 @@ class LifeMemoryService:
                     async with self._index_write_lock:
                         db = self._db
                         self._db = None
+                        # 读连接必须先于写连接释放：它们指向同一个文件，
+                        # 留着会让 WAL 无法 checkpoint。
+                        bind_reader_pool(None)
                         if db is not None:
-                            await asyncio.to_thread(db.close)
+                            await run_db(db.close)
             finally:
                 self._initialized = False
                 self._closing = False
@@ -675,7 +892,7 @@ class LifeMemoryService:
         """统一写入文档节点、分块 FTS 和待处理 outbox。"""
         async with self._index_write_lock:
             db = self._require_db()
-            return await asyncio.to_thread(
+            return await run_db(
                 upsert_document_rows,
                 db,
                 path,
@@ -690,25 +907,25 @@ class LifeMemoryService:
         """删除文档及其 SQLite 索引、分块和 outbox 记录。"""
         async with self._index_write_lock:
             db = self._require_db()
-            return await asyncio.to_thread(delete_document_rows, db, path)
+            return await run_db(delete_document_rows, db, path)
 
     async def move_document(self, old_path: str, new_path: str) -> bool:
         """移动文档索引；目标已有节点时明确拒绝合并。"""
         async with self._index_write_lock:
             db = self._require_db()
-            return await asyncio.to_thread(move_document_rows, db, old_path, new_path)
+            return await run_db(move_document_rows, db, old_path, new_path)
 
     async def enqueue_index_job(self, node_id: str, content_hash: str) -> str:
         """加入一个待处理索引任务，不触发 embedding 或网络请求。"""
         async with self._index_write_lock:
             db = self._require_db()
-            return await asyncio.to_thread(enqueue_index_job, db, node_id, content_hash)
+            return await run_db(enqueue_index_job, db, node_id, content_hash)
 
     async def process_index_jobs(self, limit: int = 10) -> List[IndexJob]:
         """领取待处理任务，交给外部 worker；本方法不执行 embedding。"""
         async with self._index_write_lock:
             db = self._require_db()
-            return await asyncio.to_thread(claim_index_jobs, db, limit=limit)
+            return await run_db(claim_index_jobs, db, limit=limit)
 
     async def run_index_worker(
         self,
@@ -773,7 +990,7 @@ class LifeMemoryService:
         """读取 outbox 状态，供 worker 或测试观察。"""
         async with self._index_write_lock:
             db = self._require_db()
-            return await asyncio.to_thread(list_index_jobs, db, status=status, limit=limit)
+            return await run_db(list_index_jobs, db, status=status, limit=limit)
 
     async def set_index_job_status(
         self,
@@ -784,7 +1001,7 @@ class LifeMemoryService:
         """更新外部索引 worker 的任务状态。"""
         async with self._index_write_lock:
             db = self._require_db()
-            return await asyncio.to_thread(
+            return await run_db(
                 set_index_job_status,
                 db,
                 job_id,
@@ -803,7 +1020,7 @@ class LifeMemoryService:
     async def append_memory_claim(self, claim: MemoryClaim) -> MemoryClaim:
         """追加主张；主张正文不可覆盖，后续认识只通过状态事件表达。"""
         async with self._index_write_lock:
-            return await asyncio.to_thread(append_claim, self._require_db(), claim)
+            return await run_db(append_claim, self._require_db(), claim)
 
     async def record_retrieval_episode(
         self,
@@ -811,7 +1028,7 @@ class LifeMemoryService:
     ) -> RetrievalEpisode:
         """记录一次检索上下文；候选曝光不是事实证据。"""
         async with self._index_write_lock:
-            return await asyncio.to_thread(
+            return await run_db(
                 append_retrieval_episode,
                 self._require_db(),
                 episode,
@@ -823,7 +1040,7 @@ class LifeMemoryService:
     ) -> RetrievalExposure:
         """记录候选被展示；不自动建立语义边或提高事实状态。"""
         async with self._index_write_lock:
-            return await asyncio.to_thread(
+            return await run_db(
                 append_retrieval_exposure,
                 self._require_db(),
                 exposure,
@@ -835,7 +1052,7 @@ class LifeMemoryService:
     ) -> RetrievalFeedback:
         """追加主体对候选的采用、拒绝或修正反馈。"""
         async with self._index_write_lock:
-            return await asyncio.to_thread(
+            return await run_db(
                 append_retrieval_feedback,
                 self._require_db(),
                 feedback,
@@ -848,7 +1065,7 @@ class LifeMemoryService:
     ) -> RetrievalPlasticity:
         """读取仅用于候选排序的可塑性提示，不替代认识论判断。"""
         async with self._index_write_lock:
-            return await asyncio.to_thread(
+            return await run_db(
                 get_retrieval_plasticity,
                 self._require_db(),
                 entity_type,
@@ -891,7 +1108,7 @@ class LifeMemoryService:
     async def append_claim_evidence(self, evidence: ClaimEvidence) -> ClaimEvidence:
         """追加一条支持、挑战或语境证据，不将其折算为真值分数。"""
         async with self._index_write_lock:
-            return await asyncio.to_thread(
+            return await run_db(
                 append_claim_evidence,
                 self._require_db(),
                 evidence,
@@ -900,7 +1117,7 @@ class LifeMemoryService:
     async def append_memory_belief(self, belief: MemoryBelief) -> MemoryBelief:
         """登记一个意识视角与主张的关系；认可状态由事件另行记录。"""
         async with self._index_write_lock:
-            return await asyncio.to_thread(append_belief, self._require_db(), belief)
+            return await run_db(append_belief, self._require_db(), belief)
 
     async def append_epistemic_conflict(
         self,
@@ -908,7 +1125,7 @@ class LifeMemoryService:
     ) -> EpistemicConflict:
         """登记冲突而不擅自裁决两个主张中的任何一个。"""
         async with self._index_write_lock:
-            return await asyncio.to_thread(append_conflict, self._require_db(), conflict)
+            return await run_db(append_conflict, self._require_db(), conflict)
 
     async def append_memory_state_event(
         self,
@@ -916,7 +1133,7 @@ class LifeMemoryService:
     ) -> MemoryStateEvent:
         """追加可审计状态变化；权限校验和撤销关系由本体层强制。"""
         async with self._index_write_lock:
-            return await asyncio.to_thread(
+            return await run_db(
                 append_state_event,
                 self._require_db(),
                 event,
@@ -931,7 +1148,7 @@ class LifeMemoryService:
     ) -> MemoryDisposition:
         """读取主体性遗忘状态；它不影响原始记录的保留与审计。"""
         async with self._index_write_lock:
-            return await asyncio.to_thread(
+            return await run_db(
                 get_memory_disposition,
                 self._require_db(),
                 entity_type,
@@ -947,7 +1164,7 @@ class LifeMemoryService:
     ) -> ClaimState | None:
         """从完整事件历史还原一个主张在指定记录时点的状态。"""
         async with self._index_write_lock:
-            return await asyncio.to_thread(
+            return await run_db(
                 get_claim_state,
                 self._require_db(),
                 claim_id,
@@ -965,7 +1182,7 @@ class LifeMemoryService:
     ) -> List[ClaimState]:
         """双时间查询主张状态，默认不跨私有流。"""
         async with self._index_write_lock:
-            return await asyncio.to_thread(
+            return await run_db(
                 list_claim_states,
                 self._require_db(),
                 subject_key,
@@ -986,7 +1203,7 @@ class LifeMemoryService:
     ) -> CurrentFactProjection:
         """重建一个双时间当前事实投影，冲突和不确定性始终保留。"""
         async with self._index_write_lock:
-            return await asyncio.to_thread(
+            return await run_db(
                 project_current_facts,
                 self._require_db(),
                 subject_key,
@@ -1005,7 +1222,7 @@ class LifeMemoryService:
     ) -> List[MemoryAuditEntry]:
         """返回事件、操作者、理由、因果来源与补偿关系的完整审计轨迹。"""
         async with self._index_write_lock:
-            return await asyncio.to_thread(
+            return await run_db(
                 build_memory_audit_trail,
                 self._require_db(),
                 entity_type,
@@ -1022,7 +1239,7 @@ class LifeMemoryService:
     ) -> List[MemoryStateEvent]:
         """读取完整事件轨迹，供审计、回放和解释使用。"""
         async with self._index_write_lock:
-            return await asyncio.to_thread(
+            return await run_db(
                 list_state_events,
                 self._require_db(),
                 entity_type,
@@ -1036,7 +1253,7 @@ class LifeMemoryService:
     ) -> List[ClaimEvidence]:
         """读取一个主张的完整证据链。"""
         async with self._index_write_lock:
-            return await asyncio.to_thread(
+            return await run_db(
                 list_claim_evidence,
                 self._require_db(),
                 claim_id,
@@ -1053,7 +1270,7 @@ class LifeMemoryService:
         """幂等追加不可变经历证据，绝不覆盖已有事件。"""
         async with self._index_write_lock:
             db = self._require_db()
-            return await asyncio.to_thread(insert_experiences, db, records)
+            return await run_db(insert_experiences, db, records)
 
     async def list_experiences_after(
         self,
@@ -1065,7 +1282,7 @@ class LifeMemoryService:
         """按序列读取经历账本，可显式限制聊天流范围。"""
         async with self._index_write_lock:
             db = self._require_db()
-            return await asyncio.to_thread(
+            return await run_db(
                 list_experiences_after,
                 db,
                 sequence,
@@ -1077,7 +1294,7 @@ class LifeMemoryService:
         """保存带完整来源链的主体见证，不把它提升为客观事实。"""
         async with self._index_write_lock:
             db = self._require_db()
-            return await asyncio.to_thread(insert_witness_memory, db, **kwargs)
+            return await run_db(insert_witness_memory, db, **kwargs)
 
     async def mark_witness_projection(
         self,
@@ -1090,7 +1307,7 @@ class LifeMemoryService:
         """更新可重建 Markdown 投影状态，不修改见证正文。"""
         async with self._index_write_lock:
             db = self._require_db()
-            return await asyncio.to_thread(
+            return await run_db(
                 mark_witness_projection,
                 db,
                 witness_id,
@@ -1107,7 +1324,7 @@ class LifeMemoryService:
         """读取待恢复的见证投影。"""
         async with self._index_write_lock:
             db = self._require_db()
-            return await asyncio.to_thread(
+            return await run_db(
                 list_pending_witness_projections,
                 db,
                 limit=limit,
@@ -1120,7 +1337,7 @@ class LifeMemoryService:
         """用确定性投影路径检查事件窗口是否已见证。"""
         async with self._index_write_lock:
             db = self._require_db()
-            return await asyncio.to_thread(
+            return await run_db(
                 get_witness_by_projection_path,
                 db,
                 projection_path,
@@ -1133,7 +1350,7 @@ class LifeMemoryService:
         """读取见证意识的持久化游标与错误状态。"""
         async with self._index_write_lock:
             db = self._require_db()
-            return await asyncio.to_thread(
+            return await run_db(
                 get_witness_state,
                 db,
                 consciousness_instance_id,
@@ -1147,7 +1364,7 @@ class LifeMemoryService:
         """原子更新见证意识游标；调用方决定何时确认整批成功。"""
         async with self._index_write_lock:
             db = self._require_db()
-            await asyncio.to_thread(
+            await run_db(
                 update_witness_state,
                 db,
                 consciousness_instance_id,
@@ -1169,7 +1386,7 @@ class LifeMemoryService:
         if not isinstance(mode, MemorySearchMode):
             mode = MemorySearchMode(str(mode))
         async with self._index_write_lock:
-            return await asyncio.to_thread(
+            return await run_db(
                 search_epistemic_claims,
                 self._require_db(),
                 query,
@@ -1406,7 +1623,7 @@ class LifeMemoryService:
         """按明确认识论模式检索见证，rank 不等同 truth/confidence。"""
         async with self._index_write_lock:
             db = self._require_db()
-            return await asyncio.to_thread(
+            return await run_db(
                 search_witness_memories,
                 db,
                 query,
@@ -1420,19 +1637,19 @@ class LifeMemoryService:
         """原子迁移一条旧日记；旧文件保持只读且不删除。"""
         async with self._index_write_lock:
             db = self._require_db()
-            return await asyncio.to_thread(migrate_legacy_witness, db, **kwargs)
+            return await run_db(migrate_legacy_witness, db, **kwargs)
 
     async def witness_migration_exists(self, migration_key: str) -> bool:
         """检查旧日记迁移键，保证迁移幂等。"""
         async with self._index_write_lock:
             db = self._require_db()
-            return await asyncio.to_thread(migration_exists, db, migration_key)
+            return await run_db(migration_exists, db, migration_key)
 
     async def record_witness_migration(self, **kwargs: Any) -> None:
         """记录旧日记来源哈希与新见证 ID，不删除旧文件。"""
         async with self._index_write_lock:
             db = self._require_db()
-            await asyncio.to_thread(record_witness_migration, db, **kwargs)
+            await run_db(record_witness_migration, db, **kwargs)
 
     # --------------------------------------------------------
     # 节点操作（封装模块函数）
@@ -1472,7 +1689,7 @@ class LifeMemoryService:
         """Explicitly move a canonical document identity inside SQLite."""
         async with self._index_write_lock:
             db = self._require_db()
-            return await asyncio.to_thread(move_document_rows, db, old_path, new_path)
+            return await run_db(move_document_rows, db, old_path, new_path)
 
     async def increment_access(self, node_id: str) -> None:
         """增加节点访问计数并更新激活强度。"""
@@ -1870,7 +2087,7 @@ class LifeMemoryService:
             }
 
         if allow_heuristic:
-            candidate_path = await asyncio.to_thread(
+            candidate_path = await run_db(
                 self._find_missing_file_candidate,
                 requested_path,
             )
@@ -1914,19 +2131,50 @@ class LifeMemoryService:
         results: List[SearchResult],
         top_k: int = 5,
     ) -> List[MemoryBundle]:
-        """把普通检索结果聚合成“当前理解 + 历史轨迹”的记忆包。"""
-        workspace = self._get_workspace_path()
+        """把普通检索结果聚合成“当前理解 + 历史轨迹”的记忆包。
 
-        def _bundle_memory_path(file_path: str) -> str | None:
-            eligibility = assess_indexed_document_path(file_path)
-            if not eligibility.eligible:
-                return None
-            candidate = workspace / eligibility.path
-            if candidate.is_symlink():
-                return None
-            if candidate.exists() and not assess_workspace_document(workspace, eligibility.path).eligible:
-                return None
-            return eligibility.path
+        路径判定与节点读取都是成批做的。逐条做的话，每条血缘边要两次数据库
+        往返（取节点、取摘要）外加几次同步 ``stat``——一次召回轻易就是上百次
+        往返，而且 ``stat`` 直接跑在事件循环上。现在每条检索结果最多一次节点
+        批量查询加一次路径批量判定。
+
+        Args:
+            query: 触发这次召回的查询串。
+            results: 底层检索结果。
+            top_k: 最多产出多少个记忆包。
+
+        Returns:
+            List[MemoryBundle]: 记忆包列表，按 ``results`` 的顺序产出。
+        """
+        workspace = self._get_workspace_path()
+        path_views: dict[str, _BundlePathView] = {}
+
+        async def _resolve_paths(raw_paths: Sequence[str]) -> None:
+            """把尚未判定过的路径批量判定并写入缓存。"""
+            pending = [
+                raw_path
+                for raw_path in dict.fromkeys(raw_paths)
+                if raw_path and raw_path not in path_views
+            ]
+            if not pending:
+                return
+            path_views.update(
+                await asyncio.to_thread(_assess_bundle_paths, workspace, pending)
+            )
+
+        def _memory_path(raw_path: str) -> str | None:
+            """返回已判定路径的规范形式；未判定或不合格时为 ``None``。"""
+            view = path_views.get(raw_path)
+            return view.memory_path if view is not None else None
+
+        def _path_exists(raw_path: str) -> bool:
+            """返回已判定路径对应的文件是否存在。"""
+            view = path_views.get(raw_path)
+            return view.exists if view is not None else False
+
+        # 所有检索结果的路径一次判定完：它们是循环的准入条件，逐条判定意味着
+        # 逐条阻塞事件循环做 stat。
+        await _resolve_paths([result.file_path for result in results])
 
         bundles: list[MemoryBundle] = []
         seen_primary_paths: set[str] = set()
@@ -1934,7 +2182,7 @@ class LifeMemoryService:
         for result in results:
             if len(bundles) >= max(1, top_k):
                 break
-            source_path = _bundle_memory_path(result.file_path)
+            source_path = _memory_path(result.file_path)
             if source_path is None:
                 continue
             node = await self.get_node_by_file_path(
@@ -1951,69 +2199,50 @@ class LifeMemoryService:
                     snippet=result.snippet,
                     relevance=result.relevance,
                     source=result.source,
-                    exists=(workspace / source_path).is_file(),
+                    exists=_path_exists(result.file_path),
                 )
             ]
             trace: list[MemoryTrace] = []
             related_node_ids = [node.node_id]
 
             outgoing, incoming = await get_lineage_edges(self._db, node.node_id)
-            for edge in outgoing:
-                target = await self._get_node_by_id_wrapper(edge.target_id)
-                target_path = _bundle_memory_path(target.file_path) if target and target.file_path else None
-                if target is None or target_path is None:
-                    continue
-                related_node_ids.append(target.node_id)
-                snippet = await self._get_snippet_wrapper(target.node_id)
-                exists = (workspace / target_path).is_file()
-                trace.append(
-                    MemoryTrace(
-                        relation=edge.edge_type.value,
-                        file_path=target_path,
-                        title=target.title,
-                        snippet=snippet,
-                        reason=edge.reason,
-                        direction="later",
-                        exists=exists,
-                    )
-                )
-                evidence.append(
-                    MemoryEvidence(
-                        file_path=target_path,
-                        title=target.title,
-                        snippet=snippet,
-                        relevance=result.relevance * edge.weight,
-                        source="lineage",
-                        relation=edge.edge_type.value,
-                        relation_reason=edge.reason,
-                        exists=exists,
-                    )
-                )
+            # 两个方向的邻居一次取全：节点与摘要来自同一批查询，路径判定来自
+            # 同一次线程调用。循环体内因此不再有 await。
+            lineage_views = await get_lineage_node_views(
+                self._db,
+                [edge.target_id for edge in outgoing] + [edge.source_id for edge in incoming],
+            )
+            await _resolve_paths([view.file_path for view in lineage_views.values()])
 
-            for edge in incoming:
-                source = await self._get_node_by_id_wrapper(edge.source_id)
-                incoming_path = _bundle_memory_path(source.file_path) if source and source.file_path else None
-                if source is None or incoming_path is None:
+            for edge, direction in (
+                *((edge, "later") for edge in outgoing),
+                *((edge, "earlier") for edge in incoming),
+            ):
+                neighbour_id = edge.target_id if direction == "later" else edge.source_id
+                neighbour = lineage_views.get(neighbour_id)
+                if neighbour is None or not neighbour.file_path:
                     continue
-                related_node_ids.append(source.node_id)
-                snippet = await self._get_snippet_wrapper(source.node_id)
-                exists = (workspace / incoming_path).is_file()
+                neighbour_path = _memory_path(neighbour.file_path)
+                if neighbour_path is None:
+                    continue
+                related_node_ids.append(neighbour.node_id)
+                exists = _path_exists(neighbour.file_path)
                 trace.append(
                     MemoryTrace(
                         relation=edge.edge_type.value,
-                        file_path=incoming_path,
-                        title=source.title,
-                        snippet=snippet,
+                        file_path=neighbour_path,
+                        title=neighbour.title,
+                        snippet=neighbour.snippet,
                         reason=edge.reason,
-                        direction="earlier",
+                        direction=direction,
                         exists=exists,
                     )
                 )
                 evidence.append(
                     MemoryEvidence(
-                        file_path=incoming_path,
-                        title=source.title,
-                        snippet=snippet,
+                        file_path=neighbour_path,
+                        title=neighbour.title,
+                        snippet=neighbour.snippet,
                         relevance=result.relevance * edge.weight,
                         source="lineage",
                         relation=edge.edge_type.value,
@@ -2040,7 +2269,9 @@ class LifeMemoryService:
                     "note": "未找到显式记忆演化链",
                 }
             )
-            primary_path = _bundle_memory_path(str(resolution.get("resolved_path") or ""))
+            resolved_raw = str(resolution.get("resolved_path") or "")
+            await _resolve_paths([resolved_raw])
+            primary_path = _memory_path(resolved_raw)
             if primary_path is None:
                 continue
             if primary_path in seen_primary_paths:
@@ -2063,7 +2294,7 @@ class LifeMemoryService:
                             source="lineage",
                             relation="canonical",
                             relation_reason=str(resolution.get("note") or ""),
-                            exists=(workspace / primary_path).is_file(),
+                            exists=_path_exists(resolved_raw),
                         )
                     )
 

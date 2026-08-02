@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1061,7 +1062,7 @@ class LifeEngineWriteFileTool(BaseTool):
 
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding=encoding)
+            await asyncio.to_thread(target.write_text, content, encoding=encoding)
             stat = target.stat()
             trace_id = _record_file_trace(
                 self.plugin,
@@ -1176,7 +1177,7 @@ class LifeEngineEditFileTool(BaseTool):
                 new_content = content.replace(old_text, new_text, 1)
                 replacements = 1
 
-            target.write_text(new_content, encoding=encoding)
+            await asyncio.to_thread(target.write_text, new_content, encoding=encoding)
             trace_id = _record_file_trace(
                 self.plugin,
                 path=path,
@@ -1349,7 +1350,7 @@ class LifeEngineMakeDirectoryTool(BaseTool):
                 return False, f"路径已存在且不是目录: {path}"
 
         try:
-            target.mkdir(parents=parents, exist_ok=True)
+            await asyncio.to_thread(target.mkdir, parents=parents, exist_ok=True)
             return True, {
                 "action": "mkdir",
                 "path": path,

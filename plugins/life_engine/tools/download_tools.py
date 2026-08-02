@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import mimetypes
 import os
 import time
@@ -175,7 +176,8 @@ class LifeEngineDownloadTool(BaseTool):
                         return False, {"error": str(resolved), "url": url}
 
                     save_file: Path = resolved  # type: ignore[assignment]
-                    save_file.parent.mkdir(parents=True, exist_ok=True)
+                    parent = save_file.parent
+                    await asyncio.to_thread(parent.mkdir, parents=True, exist_ok=True)
 
                     # 流式写入
                     downloaded = 0

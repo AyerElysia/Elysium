@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import signal
-import threading
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -43,11 +42,16 @@ class SignalHandler:
         self.shutdown_requested = asyncio.Event()
         self.last_signal_time = 0.0
         self.signal_count = 0
-        self._lock = threading.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._original_handlers: dict[int, Any] = {}
 
     def register_signals(self) -> None:
         """注册 SIGINT、SIGTERM，并在支持的平台接管 SIGHUP。"""
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
+
         # 注册 SIGINT (Ctrl+C)
         self._original_handlers[signal.SIGINT] = signal.signal(
             signal.SIGINT, self._handle_signal
@@ -73,8 +77,8 @@ class SignalHandler:
 
     def _handle_sighup(self, signum: int, frame: Any) -> None:
         """忽略终端会话断开信号；进程关闭统一由 SIGTERM 负责。"""
-        assert self.bot.logger is not None
-        self.bot.logger.info(
+        self._schedule_log(
+            "info",
             "收到 SIGHUP（终端关闭），Elysium 继续在后台运行"
         )
 
@@ -85,35 +89,44 @@ class SignalHandler:
             signum: 信号编号
             frame: 当前堆栈帧
         """
-        with self._lock:
-            current_time = time.time()
+        current_time = time.time()
 
-            # 检查是否在 3 秒内多次触发
-            if current_time - self.last_signal_time < 3.0:
-                self.signal_count += 1
-            else:
-                self.signal_count = 1
+        # 检查是否在 3 秒内多次触发
+        if current_time - self.last_signal_time < 3.0:
+            self.signal_count += 1
+        else:
+            self.signal_count = 1
 
-            self.last_signal_time = current_time
+        self.last_signal_time = current_time
 
-            # 第一次信号：请求优雅关闭
-            assert self.bot.logger is not None
-            if self.signal_count == 1:
-                self.bot.logger.info(
-                    "已收到关闭信号。再次按下Ctrl+C强制退出..."
-                )
-                self.shutdown_requested.set()
+        # 第一次信号：请求优雅关闭
+        if self.signal_count == 1:
+            self._schedule_log(
+                "info",
+                "已收到关闭信号。再次按下Ctrl+C强制退出...",
+            )
+            self.shutdown_requested.set()
 
-                # 设置 _running 标志，让主循环自然退出
-                self.bot._running = False
+            # 设置 _running 标志，让主循环自然退出
+            self.bot._running = False
 
-            # 第二次信号（3 秒内）：强制立即关闭
-            elif self.signal_count >= 2:
-                self.bot.logger.warning("正在强制关闭...")
-                # 强制退出（不执行清理）
-                import sys
+        # 第二次信号（3 秒内）：强制立即关闭
+        elif self.signal_count >= 2:
+            self._schedule_log("warning", "正在强制关闭...")
+            # 强制退出（不执行清理）
+            import sys
 
-                sys.exit(1)
+            sys.exit(1)
+
+    def _schedule_log(self, level: str, message: str) -> None:
+        """将信号日志投递回事件循环，避免在信号上下文中争用日志锁。"""
+        logger = getattr(self.bot, "logger", None)
+        log_method = getattr(logger, level, None)
+        if log_method is None:
+            return
+
+        if self._loop is not None and self._loop.is_running():
+            self._loop.call_soon_threadsafe(log_method, message)
 
     def restore_handlers(self) -> None:
         """恢复原始信号处理器"""

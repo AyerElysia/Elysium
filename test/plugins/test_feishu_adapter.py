@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -7,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from plugins.feishu_adapter.adapter import FeishuAdapter, set_feishu_adapter
+from plugins.feishu_adapter import adapter as feishu_adapter_module
 from plugins.feishu_adapter.config import FeishuAdapterConfig
 from plugins.feishu_adapter.router import FeishuRouter
 from src.core.models.message import MessageType
@@ -35,6 +37,45 @@ def test_feishu_config_defaults_to_long_connection() -> None:
 
     assert config.connection.subscription_mode == "long_connection"
     assert config.connection.auto_start_long_connection is True
+
+
+async def test_feishu_long_connection_uses_dedicated_sdk_event_loop(monkeypatch) -> None:
+    """The SDK must not run its blocking loop on the bot's main event loop."""
+    import lark_oapi.ws.client as ws_client_module
+
+    config = FeishuAdapterConfig()
+    config.app.app_id = "cli_test"
+    config.app.app_secret = "secret_test"
+    adapter = make_adapter(config)
+    observed_loops: list[asyncio.AbstractEventLoop] = []
+
+    class FakeClient:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def start(self) -> None:
+            sdk_loop = ws_client_module.loop
+            observed_loops.append(sdk_loop)
+            sdk_loop.run_until_complete(asyncio.sleep(0))
+            adapter._feishu_stop_event.set()
+
+    main_loop = asyncio.get_running_loop()
+    previous_sdk_loop = ws_client_module.loop
+    monkeypatch.setattr(
+        feishu_adapter_module,
+        "_lark_oapi_ws_module",
+        SimpleNamespace(Client=FakeClient),
+    )
+    monkeypatch.setattr(adapter, "_build_lark_event_handler", lambda _: object())
+    ws_client_module.loop = main_loop
+    try:
+        await asyncio.to_thread(adapter._run_long_connection_client)
+    finally:
+        ws_client_module.loop = previous_sdk_loop
+
+    assert observed_loops
+    assert observed_loops[0] is not main_loop
+    assert observed_loops[0].is_closed()
 
 
 async def test_feishu_text_event_to_envelope() -> None:

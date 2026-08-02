@@ -284,7 +284,7 @@ class MinecraftSession:
 
         # 保存截图
         screenshot_path = self._workspace / "minecraft" / "screenshots"
-        screenshot_path.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(screenshot_path.mkdir, parents=True, exist_ok=True)
         path = frame.save(screenshot_path / f"look_{int(time.time())}.png")
 
         return {
@@ -304,7 +304,7 @@ class MinecraftSession:
         # 这里应该调用她的 LLM 进行视觉理解
         # 简化版：返回截图路径，由上层处理
         screenshot_path = self._workspace / "minecraft" / "screenshots"
-        screenshot_path.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(screenshot_path.mkdir, parents=True, exist_ok=True)
         path = frame.save(screenshot_path / f"perceive_{int(time.time())}.png")
 
         self._state.last_perception = f"截图已保存: {path}"
@@ -573,7 +573,7 @@ class MinecraftSession:
     async def _save_session_log(self) -> None:
         """保存会话日志。"""
         log_dir = self._workspace / "minecraft" / "sessions"
-        log_dir.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(log_dir.mkdir, parents=True, exist_ok=True)
 
         log_file = log_dir / f"session_{self._state.session_id}.json"
         data = {

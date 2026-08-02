@@ -21,6 +21,7 @@ from enum import Enum
 from typing import Any
 
 from src.kernel.concurrency import get_task_manager
+from src.kernel.concurrency.blocking import BlockingPool
 from src.kernel.logger import get_logger, COLOR
 
 # 注意：EventBus 自身的日志不应再通过事件总线进行广播，否则在订阅了
@@ -33,6 +34,16 @@ logger = get_logger(
 )
 
 EVENT_HANDLER_TIMEOUT_SECONDS = 5.0
+
+# 同步处理器专属线程池。订阅者按优先级顺序串行执行，一个在事件循环上做文件读
+# 或数据库查询的同步处理器不仅拖慢这条事件链，还会让循环上的所有其他任务一起
+# 停住——而 EVENT_HANDLER_TIMEOUT_SECONDS 原本对它完全不生效，因为超时只作用
+# 于 awaitable。
+_HANDLER_POOL = BlockingPool(
+    "event-handler",
+    max_workers=8,
+    env_var="ELYSIUM_EVENT_HANDLER_WORKERS",
+)
 
 EventParams = dict[str, Any]
 
@@ -334,14 +345,42 @@ class EventBus:
         return (decision, next_params)
 
     async def _execute_handler(self, sub: _Subscriber, event_name: str, params: EventParams) -> Any:
-        """执行处理器并返回结果，支持同步和异步处理器。"""
-        result = sub.handler(event_name, params)
+        """执行处理器并返回结果，支持同步和异步处理器。
+
+        协程处理器直接在事件循环上调用——调用一个协程函数只是构造协程对象，
+        本身不执行任何代码。非协程处理器则派发到线程池：它们可能读文件、发
+        网络请求或查数据库，在循环上执行会阻塞整个进程，而超时对它们也形同
+        虚设（``wait_for`` 只能作用于 awaitable）。
+
+        Args:
+            sub: 订阅者记录。
+            event_name: 事件名。
+            params: 事件参数。
+
+        Returns:
+            Any: 处理器的返回值，交由调用方做协议校验。
+
+        Raises:
+            asyncio.TimeoutError: 处理器超过 ``EVENT_HANDLER_TIMEOUT_SECONDS``。
+        """
+        timeout = EVENT_HANDLER_TIMEOUT_SECONDS if EVENT_HANDLER_TIMEOUT_SECONDS > 0 else None
+
+        if asyncio.iscoroutinefunction(sub.handler):
+            result: Any = sub.handler(event_name, params)
+        else:
+            result = await _HANDLER_POOL.run(
+                sub.handler,
+                (event_name, params),
+                timeout=timeout,
+                label=getattr(sub.handler, "__name__", repr(sub.handler)),
+            )
+
+        # 非协程处理器也可能返回 awaitable（例如返回协程的 partial 或工厂
+        # 函数）。构造那个 awaitable 的阻塞部分已经在线程里跑完了，剩下的
+        # 等待属于事件循环。
         if inspect.isawaitable(result):
-            if EVENT_HANDLER_TIMEOUT_SECONDS > 0:
-                return await asyncio.wait_for(
-                    result,
-                    timeout=EVENT_HANDLER_TIMEOUT_SECONDS,
-                )
+            if timeout is not None:
+                return await asyncio.wait_for(result, timeout=timeout)
             return await result
         return result
 

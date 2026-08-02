@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import sqlite3
 import time
 import uuid
@@ -14,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .edges import EdgeType, MemoryEdge, row_to_edge
+from .sqlite_runtime import run_db
 
 
 LINEAGE_EDGE_TYPES = {
@@ -141,7 +141,7 @@ async def insert_memory_correction(
         )
         db.commit()
 
-    await asyncio.to_thread(_do_db_work)
+    await run_db(_do_db_work)
     return correction
 
 
@@ -196,7 +196,7 @@ async def list_memory_corrections(
 
         return [row_to_correction(row) for row in rows[:limit]]
 
-    return await asyncio.to_thread(_do_db_work)
+    return await run_db(_do_db_work)
 
 
 async def get_lineage_edges(
@@ -231,4 +231,4 @@ async def get_lineage_edges(
         incoming = [row_to_edge(row) for row in cursor.fetchall()]
         return outgoing, incoming
 
-    return await asyncio.to_thread(_do_db_work)
+    return await run_db(_do_db_work)

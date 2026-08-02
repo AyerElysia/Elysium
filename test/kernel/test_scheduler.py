@@ -1317,3 +1317,95 @@ class TestSchedulerTimeUtils:
         assert executed[0] == {"test": "data"}
 
         await get_unified_scheduler().remove_schedule(schedule_id)
+
+
+class TestSyncCallbackDispatch:
+    """同步回调的执行契约。
+
+    旧实现是 wait_for(to_thread(callback), timeout)。它有两个问题：
+    超时只取消协程侧的等待，线程仍然占着**解释器默认 executor** 的一个槽位
+    直到自己返回；而这个池子是全进程共用的，于是一个卡死的定时任务会连带
+    拖垮媒体解码、适配器文件读和向量检索。现在同步回调走调度器自己的有界
+    线程池，超时后的线程被明确登记为"已放弃"并出现在统计里。
+    """
+
+    @pytest.fixture(autouse=True)
+    async def setup_scheduler(self):
+        """每个用例前后启停调度器。"""
+        await get_unified_scheduler().start()
+        yield
+        await get_unified_scheduler().stop()
+
+    async def test_sync_callback_runs_on_dedicated_pool(self):
+        """同步回调必须在调度器专属线程上执行，而不是事件循环或默认池。"""
+        import threading
+
+        seen: list[str] = []
+        done = asyncio.Event()
+
+        def sync_task():
+            seen.append(threading.current_thread().name)
+            done.set()
+
+        await get_unified_scheduler().create_schedule(
+            callback=sync_task,
+            trigger_type=TriggerType.TIME,
+            trigger_config={"delay_seconds": 0.1},
+            task_name="test_sync_pool_thread",
+        )
+
+        await asyncio.wait_for(done.wait(), timeout=5)
+
+        assert len(seen) == 1
+        assert seen[0].startswith("scheduler-callback")
+
+    async def test_sync_callback_timeout_is_accounted_not_silently_leaked(self):
+        """同步回调超时后线程仍在跑，这一点必须出现在统计里。"""
+        import threading
+
+        scheduler = get_unified_scheduler()
+        before = scheduler.get_statistics()["sync_callback_pool"]["abandoned_total"]
+
+        release = threading.Event()
+        started = threading.Event()
+        ticks = 0
+
+        def stuck_task():
+            started.set()
+            release.wait(10.0)
+
+        async def _tick() -> None:
+            nonlocal ticks
+            for _ in range(10):
+                await asyncio.sleep(0.05)
+                ticks += 1
+
+        ticker = asyncio.ensure_future(_tick())
+        try:
+            await scheduler.create_schedule(
+                callback=stuck_task,
+                trigger_type=TriggerType.TIME,
+                trigger_config={"delay_seconds": 0.1},
+                task_name="test_sync_timeout_accounting",
+                timeout=0.2,
+            )
+
+            assert await asyncio.to_thread(started.wait, 5.0)
+            # 等超时判定发生
+            deadline = asyncio.get_running_loop().time() + 5.0
+            while asyncio.get_running_loop().time() < deadline:
+                stats = scheduler.get_statistics()["sync_callback_pool"]
+                if stats["abandoned_total"] > before:
+                    break
+                await asyncio.sleep(0.05)
+
+            stats = scheduler.get_statistics()["sync_callback_pool"]
+            assert stats["abandoned_total"] == before + 1
+            assert "test_sync_timeout_accounting" in stats["abandoned_labels"]
+            assert stats["abandoned_live"] >= 1
+            await ticker
+        finally:
+            release.set()
+
+        # 回调卡了整整一段时间，事件循环却一直在推进
+        assert ticks == 10

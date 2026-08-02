@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus
 
-from sqlalchemy import text
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from src.kernel.logger import get_logger
@@ -167,12 +167,13 @@ async def get_engine() -> AsyncEngine:
                 **(_engine_config.engine_kwargs or {}),
             )
 
-            # 应用数据库特定的优化
+            # 应用数据库特定的优化。注册在 connect 事件上而不是立刻执行一次：
+            # 见 _install_session_optimizations 的说明。
             if _engine_config.apply_optimizations:
                 if db_type == "sqlite":
-                    await _enable_sqlite_optimizations(_engine)
+                    _install_sqlite_optimizations(_engine)
                 elif db_type == "postgresql":
-                    await _enable_postgresql_optimizations(_engine)
+                    _install_postgresql_optimizations(_engine)
 
             logger.info(f"{(db_type or 'UNKNOWN').upper()} 数据库引擎初始化成功")
             return _engine
@@ -444,70 +445,107 @@ async def close_engine() -> None:
         logger.info("数据库引擎已关闭")
 
 
-async def _enable_sqlite_optimizations(engine: AsyncEngine) -> None:
-    """启用 SQLite 性能优化
+def _install_session_optimizations(
+    engine: AsyncEngine,
+    statements: tuple[str, ...],
+    label: str,
+) -> None:
+    """把会话级调优语句注册到连接池的 connect 事件上。
 
-    优化项:
-    - WAL 模式: 提升并发性能
-    - NORMAL 同步: 平衡性能与安全
-    - 外键约束
-    - busy_timeout: 避免锁错误
+    这些语句几乎全是**连接作用域**的：SQLite 的 ``foreign_keys``、
+    ``busy_timeout``、``cache_size``、``temp_store``、``synchronous``，以及
+    PostgreSQL 的每一条 ``SET``，都只对执行它的那一条连接生效。而
+    ``engine.begin()`` 只会从池里取出一条连接，因此"引擎初始化后执行一次"
+    等于只配置了池中的第一条连接——之后池扩容出的每一条连接都跑在默认设置
+    上。对 SQLite 而言这意味着**外键约束实际上是关闭的**（只有
+    ``journal_mode`` 因为写在数据库文件头里才侥幸生效）。
 
-    Args:
-        engine: SQLAlchemy 异步引擎
-    """
-    try:
-        async with engine.begin() as conn:
-            # 启用 WAL 模式
-            await conn.execute(text("PRAGMA journal_mode = WAL"))
-            # 设置适中的同步级别
-            await conn.execute(text("PRAGMA synchronous = NORMAL"))
-            # 启用外键约束
-            await conn.execute(text("PRAGMA foreign_keys = ON"))
-            # 设置 busy_timeout 避免锁错误
-            await conn.execute(text("PRAGMA busy_timeout = 10000"))
-            # 设置缓存大小（10MB）
-            await conn.execute(text("PRAGMA cache_size = -10000"))
-            # 使用内存进行临时存储
-            await conn.execute(text("PRAGMA temp_store = MEMORY"))
-
-    except Exception as e:
-        logger.warning(f"SQLite 优化失败: {e}，使用默认配置")
-
-
-async def _enable_postgresql_optimizations(engine: AsyncEngine) -> None:
-    """启用 PostgreSQL 会话级性能优化
-
-    优化项:
-    - work_mem: 排序/哈希操作的内存
-    - statement_timeout: 语句超时
-    - synchronous_commit: 提交同步级别
-    - jit: 即时编译
-    - idle_in_transaction_session_timeout: 事务空闲超时
-    - lock_timeout: 锁等待超时
+    注册在 ``connect`` 事件上则保证池新建的每一条连接都会被配置，包括
+    ``pool_recycle`` 回收后重建的连接。
 
     Args:
-        engine: SQLAlchemy 异步引擎
+        engine: SQLAlchemy 异步引擎。
+        statements: 按顺序执行的调优语句。
+        label: 日志中使用的数据库标识。
     """
-    try:
-        async with engine.begin() as conn:
-            # 排序/哈希内存（每次操作）
-            await conn.execute(text("SET work_mem = '64MB'"))
-            # 语句超时（1分钟）
-            await conn.execute(text("SET statement_timeout = '60000'"))
-            # 提交同步级别
-            await conn.execute(text("SET synchronous_commit = 'local'"))
-            # 对短查询禁用 JIT
-            await conn.execute(text("SET jit = 'off'"))
-            # 事务空闲超时
-            await conn.execute(
-                text("SET idle_in_transaction_session_timeout = '60000'")
-            )
-            # 锁超时
-            await conn.execute(text("SET lock_timeout = '5000'"))
+    # 每种失败只报告一次：connect 事件会在每条新连接上触发，逐条告警会在
+    # 连接池扩容时把日志刷爆。
+    reported: set[str] = set()
 
-    except Exception as e:
-        logger.warning(f"PostgreSQL 优化失败: {e}，使用默认配置")
+    @event.listens_for(engine.sync_engine, "connect")
+    def _apply_session_optimizations(dbapi_connection: Any, _record: Any) -> None:
+        """在每条新建连接上执行调优语句。
+
+        Args:
+            dbapi_connection: 新建的 DBAPI 连接（异步驱动下为其同步适配对象）。
+            _record: 连接池记录，未使用。
+        """
+        cursor = dbapi_connection.cursor()
+        try:
+            for statement in statements:
+                try:
+                    cursor.execute(statement)
+                except Exception as exc:  # noqa: BLE001 - 单条调优失败不应阻断连接
+                    # 保持既有语义：调优失败降级为默认配置而不是让连接建不起来。
+                    # 例如旧版 PostgreSQL 没有 idle_in_transaction_session_timeout。
+                    if statement not in reported:
+                        reported.add(statement)
+                        logger.warning(
+                            f"{label} 会话优化 {statement!r} 执行失败: {exc}，该项使用默认配置"
+                        )
+        finally:
+            cursor.close()
+
+
+_SQLITE_SESSION_STATEMENTS: tuple[str, ...] = (
+    # WAL：读写不再互斥，写入期间读连接不会被阻塞
+    "PRAGMA journal_mode = WAL",
+    # 平衡性能与安全的同步级别
+    "PRAGMA synchronous = NORMAL",
+    # 外键约束（SQLite 默认关闭，且逐连接生效）
+    "PRAGMA foreign_keys = ON",
+    # 锁等待，避免瞬时争用直接抛 database is locked
+    "PRAGMA busy_timeout = 10000",
+    # 页缓存 10MB（负数表示 KiB）
+    "PRAGMA cache_size = -10000",
+    # 临时表与排序结果放内存
+    "PRAGMA temp_store = MEMORY",
+)
+
+_POSTGRESQL_SESSION_STATEMENTS: tuple[str, ...] = (
+    # 排序/哈希内存（每次操作）
+    "SET work_mem = '64MB'",
+    # 语句超时（1 分钟）
+    "SET statement_timeout = '60000'",
+    # 提交同步级别
+    "SET synchronous_commit = 'local'",
+    # 对短查询禁用 JIT
+    "SET jit = 'off'",
+    # 事务空闲超时
+    "SET idle_in_transaction_session_timeout = '60000'",
+    # 锁超时
+    "SET lock_timeout = '5000'",
+)
+
+
+def _install_sqlite_optimizations(engine: AsyncEngine) -> None:
+    """为 SQLite 引擎注册逐连接的性能优化。
+
+    Args:
+        engine: SQLAlchemy 异步引擎。
+    """
+    _install_session_optimizations(engine, _SQLITE_SESSION_STATEMENTS, "SQLite")
+
+
+def _install_postgresql_optimizations(engine: AsyncEngine) -> None:
+    """为 PostgreSQL 引擎注册逐连接的会话级优化。
+
+    Args:
+        engine: SQLAlchemy 异步引擎。
+    """
+    _install_session_optimizations(
+        engine, _POSTGRESQL_SESSION_STATEMENTS, "PostgreSQL"
+    )
 
 
 async def get_engine_info() -> dict:

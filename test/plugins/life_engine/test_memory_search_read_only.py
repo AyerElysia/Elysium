@@ -465,3 +465,96 @@ async def test_scheduler_dream_walk_is_read_only_by_default() -> None:
     memory.dream_walk.assert_awaited_once()
     assert memory.dream_walk.await_args.kwargs["persist_learning"] is False
     memory.prune_weak_edges.assert_not_awaited()
+
+
+async def test_memory_bundles_batch_lineage_reads_and_path_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """记忆包的往返次数必须与检索结果数成正比，而不是与血缘边数成正比。
+
+    原实现每条血缘边打两次库（取节点、取摘要）再做几次同步 stat。一次
+    召回 10 条结果、每条十几条边，就是上百次串行往返，而 stat 直接跑在
+    事件循环上。本用例给一个节点挂 12 条边，断言节点批量查询只发生一次、
+    路径判定只发生常数次，并且判定不在事件循环线程上执行。
+    """
+    import threading
+
+    from plugins.life_engine.memory import service as service_module
+
+    service = await _make_service(tmp_path)
+    memory_path = "notes/primary.md"
+    (tmp_path / "notes").mkdir(parents=True)
+    (tmp_path / memory_path).write_text("primary", encoding="utf-8")
+    primary = await service.get_or_create_file_node(
+        memory_path,
+        title="Primary",
+        content="primary",
+    )
+
+    edge_count = 12
+    for index in range(edge_count):
+        neighbour_path = f"notes/neighbour_{index}.md"
+        (tmp_path / neighbour_path).write_text(f"n{index}", encoding="utf-8")
+        neighbour = await service.get_or_create_file_node(
+            neighbour_path,
+            title=f"Neighbour {index}",
+            content=f"n{index}",
+        )
+        # 一半出边一半入边，两个方向都要被同一批查询覆盖
+        if index % 2 == 0:
+            source_id, target_id = primary.node_id, neighbour.node_id
+        else:
+            source_id, target_id = neighbour.node_id, primary.node_id
+        await service.create_or_update_edge(
+            source_id,
+            target_id,
+            EdgeType.REFINES,
+            reason=f"lineage {index}",
+            strength=0.9,
+            bidirectional=False,
+        )
+
+    view_calls = 0
+    assess_threads: list[str] = []
+    loop_thread = threading.current_thread().name
+
+    real_views = service_module.get_lineage_node_views
+    real_assess = service_module._assess_bundle_paths
+
+    async def _counting_views(db: Any, node_ids: Any) -> Any:
+        """统计血缘节点批量查询次数。"""
+        nonlocal view_calls
+        view_calls += 1
+        return await real_views(db, node_ids)
+
+    def _recording_assess(workspace: Any, paths: Any) -> Any:
+        """记录路径判定所在线程。"""
+        assess_threads.append(threading.current_thread().name)
+        return real_assess(workspace, paths)
+
+    monkeypatch.setattr(service_module, "get_lineage_node_views", _counting_views)
+    monkeypatch.setattr(service_module, "_assess_bundle_paths", _recording_assess)
+
+    bundles = await service.build_memory_bundles(
+        "primary",
+        [
+            SearchResult(
+                file_path=memory_path,
+                title="Primary",
+                snippet="primary",
+                relevance=1.0,
+                source="direct",
+            )
+        ],
+    )
+
+    # 血缘确实被组装进来了，否则下面的次数断言毫无意义
+    assert len(bundles) == 1
+    assert len(bundles[0].history_trace) == edge_count
+
+    # 12 条边共用一次节点批量查询
+    assert view_calls == 1
+    # 检索结果一批、血缘邻居一批、规范路径一批——与边数无关的常数
+    assert 1 <= len(assess_threads) <= 3
+    assert all(name != loop_thread for name in assess_threads)

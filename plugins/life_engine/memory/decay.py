@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import inspect
 import math
 import sqlite3
@@ -32,6 +31,7 @@ from .edges import (
     _reinforce_associations_sync,
     get_edges_from,
 )
+from .sqlite_runtime import run_db
 
 logger = log_api.get_logger("life_engine.memory.decay")
 
@@ -250,7 +250,7 @@ async def apply_decay(db: sqlite3.Connection) -> int:
 
         return updated
 
-    updated = await asyncio.to_thread(
+    updated = await run_db(
         _run_edge_maintenance,
         db,
         "apply_decay",
@@ -326,7 +326,7 @@ async def dream_walk(
         )
         return [(r["node_id"], r["activation_strength"]) for r in cursor.fetchall()]
 
-    node_rows = await asyncio.to_thread(_load_nodes)
+    node_rows = await run_db(_load_nodes)
     if not node_rows:
         return {"nodes_activated": 0, "new_edges_created": 0, "seed_ids": []}
 
@@ -424,7 +424,7 @@ async def dream_walk(
 
     top_activated = sorted(activation.items(), key=lambda item: -item[1])[:15]
     top_ids = [node_id for node_id, _ in top_activated]
-    _, created_pairs, stale_ids = await asyncio.to_thread(
+    _, created_pairs, stale_ids = await run_db(
         _reinforce_associations_sync,
         db,
         top_ids,
@@ -503,7 +503,7 @@ async def list_dream_candidate_nodes(
             })
         return results
 
-    return await asyncio.to_thread(_do_db_work)
+    return await run_db(_do_db_work)
 
 
 async def list_random_file_nodes(
@@ -564,7 +564,7 @@ async def list_random_file_nodes(
             })
         return results
 
-    return await asyncio.to_thread(_do_db_work)
+    return await run_db(_do_db_work)
 
 
 async def prune_weak_edges(
@@ -620,7 +620,7 @@ async def prune_weak_edges(
         )
         return len(edge_ids)
 
-    count = await asyncio.to_thread(
+    count = await run_db(
         _run_edge_maintenance,
         db,
         "prune_weak_edges",
@@ -843,4 +843,4 @@ async def get_stats(db: sqlite3.Connection) -> Dict[str, Any]:
             "avg_activation": round(avg_activation, 3),
         }
 
-    return await asyncio.to_thread(_do_db_work)
+    return await run_db(_do_db_work)

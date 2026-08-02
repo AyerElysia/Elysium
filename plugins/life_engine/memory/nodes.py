@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import sqlite3
 import time
@@ -17,6 +16,7 @@ from typing import Any, Optional
 from src.app.plugin_system.api import log_api
 
 from .eligibility import assess_document_path, assess_indexed_document_path
+from .sqlite_runtime import run_db
 
 logger = log_api.get_logger("life_engine.memory.nodes")
 
@@ -159,7 +159,7 @@ async def get_or_create_file_node(
     if text:
         from .indexing import upsert_document_rows
 
-        await asyncio.to_thread(
+        await run_db(
             upsert_document_rows,
             db,
             normalized_path,
@@ -169,7 +169,7 @@ async def get_or_create_file_node(
     else:
         from .indexing import ensure_document_reference_rows
 
-        await asyncio.to_thread(
+        await run_db(
             ensure_document_reference_rows,
             db,
             normalized_path,
@@ -224,7 +224,7 @@ async def get_node_by_file_path(
             return None
         return valid_rows[0]
 
-    return await asyncio.to_thread(_lookup_node)
+    return await run_db(_lookup_node)
 
 
 async def migrate_node_identity(
@@ -248,7 +248,7 @@ async def migrate_node_identity(
 
     from .indexing import rekey_document_rows_by_id
 
-    return await asyncio.to_thread(
+    return await run_db(
         rekey_document_rows_by_id,
         db,
         str(old_node_id or "").strip(),
@@ -299,12 +299,12 @@ async def update_fts(db: sqlite3.Connection, node_id: str, title: str, content: 
             return None
         return stored.path
 
-    file_path = await asyncio.to_thread(_path_for_node)
+    file_path = await run_db(_path_for_node)
     if file_path is None:
         return
     from .indexing import upsert_document_rows
 
-    await asyncio.to_thread(upsert_document_rows, db, file_path, str(content or ""), title)
+    await run_db(upsert_document_rows, db, file_path, str(content or ""), title)
 
 
 async def increment_access(
@@ -343,7 +343,7 @@ async def increment_access(
             return (float(row["activation_strength"] or 0.0), int(row["access_count"] or 0), row["last_accessed_at"])
         return None
 
-    row_data = await asyncio.to_thread(_do_db_work)
+    row_data = await run_db(_do_db_work)
     if row_data and emit_visual_event:
         emit_visual_event(
             "memory.nodes.updated",

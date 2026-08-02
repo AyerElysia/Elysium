@@ -556,7 +556,7 @@ class LifeEngineBrowserFetchTool(BaseTool):
                 return False, {"error": str(resolved)}
             target_path = resolved
             try:
-                raw_content = target_path.read_text(encoding="utf-8")
+                raw_content = await asyncio.to_thread(target_path.read_text, encoding="utf-8")
             except UnicodeDecodeError:
                 return False, {"error": "文件编码错误，请尝试其他编码"}
             except Exception as exc:  # noqa: BLE001

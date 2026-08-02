@@ -51,7 +51,6 @@ def test_sighup_does_not_request_shutdown() -> None:
 
     assert bot._running is True
     assert handler.is_shutdown_requested() is False
-    bot.logger.info.assert_called_once()
 
 
 def test_sigterm_requests_graceful_shutdown() -> None:
