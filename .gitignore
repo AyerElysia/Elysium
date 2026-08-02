@@ -105,6 +105,8 @@ data/*
 data/life_engine_workspace/*
 !data/life_engine_workspace/skills/
 .claude/
+.workbuddy/
+.vscode/
 /config/*
 !/config/*.example
 
