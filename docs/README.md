@@ -6,6 +6,7 @@
 - [principles.md](./principles.md) — 主体性、零规则、仿生、意识实例与渐进式披露（设计底线）
 - [生命记忆系统](./architecture/life_memory_system.md) — 追加式经历、认识论本体、双时间与主体性遗忘
 - [意识实例架构](./architecture/consciousness_instances.md) — 多意识实例、潜意识协调与工具边界
+- [Elysium Console 前端提案](./architecture/elysium_console_frontend_proposal.md) — 插件驱动的统一控制台、Voice Live 旗舰路径与分阶段验收计划（待批准）
 - [Life Engine 模块说明](../plugins/life_engine/README.md) — 生命域的代码入口与运行链路
 
 ## 当前架构与迁移
