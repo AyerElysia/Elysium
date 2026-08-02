@@ -9,14 +9,17 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import inspect
+from types import SimpleNamespace
 from typing import Annotated, Any, List, Optional
+from uuid import uuid4
 
 from src.app.plugin_system.api import log_api
 from src.app.plugin_system.base import BaseTool
 
 from .edges import EdgeType
 from .eligibility import assess_document_path
-from .experience import MemorySearchMode
 from .lineage import MemoryBundle
 from .service import LifeMemoryService
 
@@ -99,7 +102,7 @@ class LifeEngineSearchMemoryTool(BaseTool):
         "- source='associated'：通过关联路径联想到的，association_path 显示联想路线\n"
         "- memory_bundles：当前理解 + 历史轨迹 + 修正记录；旧记忆不会被删除，会作为演化证据保留\n"
         "\n"
-        "**认识论边界：** search_mode 必须显式选择；相关性排名不等于事实置信度。"
+        "**认识论边界：** search_mode 可自由描述本次回忆意图；相关性排名不等于事实置信度。"
         "第一人称见证表达爱莉如何经历，不自动证明其中的外部事实。\n\n"
         "**注意：** 搜索和联想是只读操作，不会自动增强激活强度或创建/强化关联边。"
     )
@@ -126,8 +129,8 @@ class LifeEngineSearchMemoryTool(BaseTool):
         time_range_days: Annotated[int, "时间范围（天），0=不限"] = 0,
         search_mode: Annotated[
             str,
-            "检索模式: current_fact/autobiographical/historical/exploratory",
-        ] = "exploratory",
+            "自由描述这次回忆想寻找什么；不会被代码归入固定认知类别",
+        ] = "",
         stream_scope: Annotated[
             Optional[str],
             "可见的聊天流范围；不提供时不跨流读取私有见证",
@@ -145,39 +148,138 @@ class LifeEngineSearchMemoryTool(BaseTool):
         if not query or not query.strip():
             return False, {"error": "query 不能为空"}
 
-        try:
-            mode = MemorySearchMode(str(search_mode or "exploratory"))
-        except ValueError:
-            return False, {
-                "error": (
-                    "search_mode 必须是 current_fact/autobiographical/"
-                    "historical/exploratory 之一"
-                )
-            }
+        mode = str(search_mode or "").strip()
 
         try:
             service = await self._get_service()
-            # search_memory 默认返回 MemoryBundle（return_bundles=True）。
-            # 不再走"先拿 SearchResult、再 build_memory_bundles"的两步走——
-            # 那条路要求 service 的返回类型在两次调用之间保持一致，
-            # 实际上会因运行时版本差异触发 'MemoryBundle has no attribute file_path'。
-            # 直接消费 bundle，从 evidence 里重建 direct/associated 摘要列表。
-            bundles = await service.search_memory(
+            from .living import CoRecallEvent, RecallEvent
+
+            effective_stream = str(
+                stream_scope or self.get_current_stream_id() or ""
+            )
+            context_key = "/".join(
+                item for item in ("life_engine", effective_stream) if item
+            )
+            begin_recall = getattr(service, "begin_memory_recall", None)
+            trace_persisted = callable(begin_recall)
+            if trace_persisted:
+                episode = await begin_recall(
+                    query=query.strip(),
+                    retrieval_intent=mode,
+                    consciousness_instance_id="life_engine",
+                    stream_scope=effective_stream,
+                    context_key=context_key,
+                    policy_version="living-recall-v1",
+                    context={
+                        "valid_at": valid_at,
+                        "recorded_as_of": recorded_as_of,
+                        "file_types": list(file_types or []),
+                        "time_range_days": int(time_range_days),
+                    },
+                )
+            else:
+                episode = SimpleNamespace(
+                    episode_id=f"unpersisted_recall_{uuid4().hex}",
+                    policy_version="living-recall-v1",
+                    random_seed=uuid4().int & ((1 << 63) - 1),
+                    context_key=context_key,
+                )
+            document_results = await service.search_memory(
                 query.strip(),
                 top_k=top_k,
                 enable_association=enable_association,
                 file_types=file_types,
                 time_range_days=time_range_days,
+                return_bundles=False,
             )
-            evidence_results = await service.search_evidence_aware(
-                query.strip(),
-                mode=mode,
-                top_k=top_k,
-                stream_scope=stream_scope,
-                enable_association=enable_association,
-                valid_at=valid_at,
-                recorded_as_of=recorded_as_of,
+            expand_associations = getattr(
+                service,
+                "expand_living_document_associations",
+                None,
             )
+            if callable(expand_associations):
+                document_results = await expand_associations(
+                    document_results,
+                    context_key=context_key,
+                    random_seed=episode.random_seed,
+                    limit=max(0, int(top_k)),
+                )
+            build_bundles = getattr(service, "build_memory_bundles", None)
+            bundles = (
+                await build_bundles(
+                    query=query.strip(),
+                    results=document_results,
+                    top_k=top_k,
+                )
+                if callable(build_bundles)
+                else []
+            )
+            evidence_search = service.search_evidence_aware
+            evidence_kwargs: dict[str, Any] = {
+                "mode": mode,
+                "top_k": top_k,
+                "stream_scope": stream_scope,
+                "enable_association": enable_association,
+                "valid_at": valid_at,
+                "recorded_as_of": recorded_as_of,
+            }
+            parameters = inspect.signature(evidence_search).parameters
+            if "document_results" in parameters or any(
+                item.kind is inspect.Parameter.VAR_KEYWORD
+                for item in parameters.values()
+            ):
+                evidence_kwargs["document_results"] = document_results
+            if "association_context_key" in parameters or any(
+                item.kind is inspect.Parameter.VAR_KEYWORD
+                for item in parameters.values()
+            ):
+                evidence_kwargs["association_context_key"] = context_key
+                evidence_kwargs["association_random_seed"] = episode.random_seed
+            evidence_results = await evidence_search(query.strip(), **evidence_kwargs)
+
+            now_iso = datetime.now(timezone.utc).astimezone().isoformat()
+
+            def _entity_ref(item: Any) -> str:
+                prefix = "document" if item.kind == "document_evidence" else item.kind
+                return f"{prefix}:{item.record_id}"
+
+            recall_events = tuple(
+                RecallEvent(
+                    event_id=f"recall_event_{uuid4().hex}",
+                    episode_id=episode.episode_id,
+                    action="candidate_exposed",
+                    entity_ref=_entity_ref(item),
+                    ordinal=index,
+                    source=item.source,
+                    recorded_at=now_iso,
+                    metadata={
+                        "rank_score": item.rank_score,
+                        "rank_is_not_truth": True,
+                    },
+                )
+                for index, item in enumerate(evidence_results)
+            )
+            append_events = getattr(service, "append_memory_recall_events", None)
+            if callable(append_events):
+                await append_events(recall_events)
+            recalled_refs = tuple(
+                dict.fromkeys(event.entity_ref for event in recall_events)
+            )
+            if len(recalled_refs) >= 2:
+                append_corecall = getattr(service, "append_memory_corecall", None)
+                if callable(append_corecall):
+                    await append_corecall(
+                    CoRecallEvent(
+                        corecall_id=f"corecall_{uuid4().hex}",
+                        episode_id=episode.episode_id,
+                        context_key=context_key,
+                        signal="co_exposed_in_recall",
+                        entity_refs=recalled_refs,
+                        actor="life_engine",
+                        reason="同一次检索中共同进入意识上下文",
+                        recorded_at=now_iso,
+                        )
+                    )
 
             # 从 bundle.evidence 提取检索摘要，保持和原有 JSON 结构兼容
             seen_paths: set[str] = set()
@@ -209,10 +311,17 @@ class LifeEngineSearchMemoryTool(BaseTool):
                 "direct_results": direct_results,
                 "associated_results": associated_results,
                 "memory_bundles": [_bundle_to_payload(bundle) for bundle in bundles],
-                "search_mode": mode.value,
+                "search_mode": mode,
                 "stream_scope": stream_scope,
                 "valid_at": valid_at,
                 "recorded_as_of": recorded_as_of,
+                "recall_episode": {
+                    "episode_id": episode.episode_id,
+                    "policy_version": episode.policy_version,
+                    "random_seed": episode.random_seed,
+                    "context_key": episode.context_key,
+                    "persisted": trace_persisted,
+                },
                 "evidence_results": [
                     {
                         "record_id": item.record_id,
@@ -297,8 +406,8 @@ class LifeEngineRelateFileTool(BaseTool):
         self,
         source_path: Annotated[str, "源文件路径"],
         target_path: Annotated[str, "目标文件路径"],
-        relation_type: Annotated[str, "关联类型: relates/causes/continues/contrasts/refines/corrects/renames/reinterprets"],
-        reason: Annotated[str, "关联原因（必填，请具体描述）"],
+        relation_type: Annotated[str, "用自己的话描述关系；系统不限制固定类型"],
+        reason: Annotated[str, "为什么建立这条关系"],
         strength: Annotated[float, "关联强度 0.1-1.0"] = 0.5,
     ) -> tuple[bool, dict[str, Any]]:
         """建立文件关联。"""
@@ -306,27 +415,9 @@ class LifeEngineRelateFileTool(BaseTool):
         if not source_path or not target_path:
             return False, {"error": "source_path 和 target_path 不能为空"}
 
-        if not reason or len(reason.strip()) < 5:
-            return False, {"error": "reason 必填且至少 5 个字符，请具体描述关联原因"}
-
-        # 检查模糊原因
-        vague_patterns = ["可能", "也许", "大概", "不确定", "或许"]
-        if any(p in reason for p in vague_patterns):
-            return False, {"error": f"reason 不够具体，避免使用模糊词汇：{vague_patterns}"}
-
-        # 验证关联类型
-        valid_types = [
-            "relates",
-            "causes",
-            "continues",
-            "contrasts",
-            "refines",
-            "corrects",
-            "renames",
-            "reinterprets",
-        ]
-        if relation_type not in valid_types:
-            return False, {"error": f"relation_type 必须是 {valid_types} 之一"}
+        relation_text = str(relation_type or "").strip()
+        if not relation_text:
+            return False, {"error": "relation_type 不能为空"}
 
         source_path, source_error = _eligible_path_or_error(source_path)
         target_path, target_error = _eligible_path_or_error(target_path)
@@ -338,32 +429,52 @@ class LifeEngineRelateFileTool(BaseTool):
 
         try:
             service = await self._get_service()
+            from .living import SemanticRelation
 
-            # 只允许真实的、合格的工作区记忆文档进入关联图。
-            source_node = await service.get_or_create_workspace_document_node(source_path)
-            target_node = await service.get_or_create_workspace_document_node(target_path)
-
-            # 创建边
-            edge_type = EdgeType(relation_type)
-            edge = await service.create_or_update_edge(
-                source_id=source_node.node_id,
-                target_id=target_node.node_id,
-                edge_type=edge_type,
-                reason=reason.strip(),
-                strength=strength,
-                bidirectional=(relation_type in {"relates", "contrasts"})
+            stream_scope = str(self.get_current_stream_id() or "")
+            semantic_relation = await service.record_memory_semantic_relation(
+                SemanticRelation(
+                    relation_id=f"relation_{uuid4().hex}",
+                    source_ref=f"document:{source_path}",
+                    target_ref=f"document:{target_path}",
+                    predicate=relation_text,
+                    reason=str(reason or "").strip(),
+                    actor="life_engine",
+                    recorded_at=datetime.now(timezone.utc).astimezone().isoformat(),
+                    consciousness_instance_id="life_engine",
+                    stream_scope=stream_scope,
+                    metadata={"legacy_strength_hint": float(strength)},
+                )
             )
 
-            logger.info(f"建立关联: {source_path} --[{relation_type}]--> {target_path}")
+            legacy_edge_id = ""
+            try:
+                edge_type = EdgeType(relation_text)
+            except ValueError:
+                edge_type = None
+            if edge_type is not None:
+                source_node = await service.get_or_create_workspace_document_node(source_path)
+                target_node = await service.get_or_create_workspace_document_node(target_path)
+                edge = await service.create_or_update_edge(
+                    source_id=source_node.node_id,
+                    target_id=target_node.node_id,
+                    edge_type=edge_type,
+                    reason=str(reason or "").strip(),
+                    strength=max(0.0, min(1.0, float(strength))),
+                    bidirectional=relation_text in {"relates", "contrasts"},
+                )
+                legacy_edge_id = edge.edge_id
+
+            logger.info(f"建立关联: {source_path} --[{relation_text}]--> {target_path}")
 
             return True, {
                 "action": "relate_file",
                 "source_path": source_path,
                 "target_path": target_path,
-                "relation_type": relation_type,
+                "relation_type": relation_text,
                 "reason": reason,
-                "strength": strength,
-                "edge_id": edge.edge_id
+                "relation_id": semantic_relation.relation_id,
+                "legacy_edge_id": legacy_edge_id,
             }
 
         except Exception as e:

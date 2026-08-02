@@ -49,6 +49,7 @@ class ExperienceRecord:
     channel: str
     event_type: str
     content: str
+    source_event_id: str = ""
     stream_id: str = ""
     consciousness_instance_id: str = ""
     actor: str = ""
@@ -56,6 +57,18 @@ class ExperienceRecord:
     valid_from: str = ""
     valid_to: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ExperienceAppendReport:
+    """Canonical records affected by an idempotent ledger append."""
+
+    inserted: tuple[ExperienceRecord, ...] = ()
+    existing: tuple[ExperienceRecord, ...] = ()
+
+    @property
+    def inserted_count(self) -> int:
+        return len(self.inserted)
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,10 +140,25 @@ def create_life_memory_schema(db: sqlite3.Connection) -> None:
 
     db.row_factory = sqlite3.Row
     with transaction(db):
+        existing_table = db.execute(
+            """SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'memory_experiences'"""
+        ).fetchone()
+        if existing_table is not None:
+            columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(memory_experiences)")
+            }
+            if "source_event_id" not in columns:
+                db.execute(
+                    """ALTER TABLE memory_experiences
+                    ADD COLUMN source_event_id TEXT NOT NULL DEFAULT ''"""
+                )
         db.executescript(
             """
             CREATE TABLE IF NOT EXISTS memory_experiences (
                 event_id TEXT PRIMARY KEY,
+                source_event_id TEXT NOT NULL DEFAULT '',
                 sequence INTEGER NOT NULL,
                 occurred_at TEXT NOT NULL,
                 recorded_at TEXT NOT NULL,
@@ -148,6 +176,8 @@ def create_life_memory_schema(db: sqlite3.Connection) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_experiences_sequence
                 ON memory_experiences(sequence, event_id);
+            CREATE INDEX IF NOT EXISTS idx_experiences_source_event
+                ON memory_experiences(source_event_id, occurred_at, event_id);
             CREATE INDEX IF NOT EXISTS idx_experiences_stream
                 ON memory_experiences(stream_id, sequence);
             CREATE INDEX IF NOT EXISTS idx_experiences_time
@@ -159,6 +189,26 @@ def create_life_memory_schema(db: sqlite3.Connection) -> None:
             CREATE TRIGGER IF NOT EXISTS memory_experiences_immutable_delete
             BEFORE DELETE ON memory_experiences BEGIN
                 SELECT RAISE(ABORT, 'ExperienceLedgerImmutable');
+            END;
+
+            CREATE TABLE IF NOT EXISTS memory_experience_occurrence_aliases (
+                occurrence_id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                source_event_id TEXT NOT NULL DEFAULT '',
+                ingest_position INTEGER NOT NULL DEFAULT 0,
+                recorded_at TEXT NOT NULL,
+                FOREIGN KEY (event_id) REFERENCES memory_experiences(event_id)
+                    ON DELETE RESTRICT
+            );
+            CREATE INDEX IF NOT EXISTS idx_experience_alias_event
+                ON memory_experience_occurrence_aliases(event_id, ingest_position);
+            CREATE TRIGGER IF NOT EXISTS experience_aliases_immutable_update
+            BEFORE UPDATE ON memory_experience_occurrence_aliases BEGIN
+                SELECT RAISE(ABORT, 'ExperienceAliasImmutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS experience_aliases_immutable_delete
+            BEFORE DELETE ON memory_experience_occurrence_aliases BEGIN
+                SELECT RAISE(ABORT, 'ExperienceAliasImmutable');
             END;
 
             CREATE TABLE IF NOT EXISTS memory_witnesses (
@@ -226,42 +276,120 @@ def create_life_memory_schema(db: sqlite3.Connection) -> None:
         )
 
 
-def insert_experiences(
+def _same_experience_occurrence(
+    persisted: ExperienceRecord,
+    incoming: ExperienceRecord,
+) -> bool:
+    """Compare source evidence without conflating ingest and producer order."""
+
+    return (
+        persisted.occurred_at == incoming.occurred_at
+        and persisted.source == incoming.source
+        and persisted.channel == incoming.channel
+        and persisted.event_type == incoming.event_type
+        and persisted.content == incoming.content
+        and persisted.stream_id == incoming.stream_id
+        and persisted.consciousness_instance_id
+        == incoming.consciousness_instance_id
+        and persisted.actor == incoming.actor
+        and persisted.visibility == incoming.visibility
+        and persisted.valid_from == (incoming.valid_from or incoming.occurred_at)
+        and persisted.valid_to == incoming.valid_to
+        and persisted.metadata == incoming.metadata
+    )
+
+
+def append_experiences_detailed(
     db: sqlite3.Connection,
     records: Sequence[ExperienceRecord],
-) -> int:
-    """Idempotently append raw evidence; existing events are never rewritten."""
+) -> ExperienceAppendReport:
+    """Append occurrences and return canonical newly inserted evidence.
 
-    inserted = 0
+    Historical rows used ``event_id`` as both source identity and occurrence
+    identity.  During replay, an exact legacy row is linked through an
+    immutable alias instead of being duplicated.  A repeated source event with
+    different occurrence evidence receives its own row.
+    """
+
+    inserted: list[ExperienceRecord] = []
+    existing_records: list[ExperienceRecord] = []
     with transaction(db):
-        for record in records:
+        for raw_record in records:
+            source_event_id = str(
+                raw_record.source_event_id or raw_record.event_id
+            )
+            record = replace(
+                raw_record,
+                source_event_id=source_event_id,
+                recorded_at=raw_record.recorded_at or _now_iso(),
+                valid_from=raw_record.valid_from or raw_record.occurred_at,
+            )
             existing = db.execute(
                 "SELECT * FROM memory_experiences WHERE event_id = ?",
                 (record.event_id,),
             ).fetchone()
             if existing is not None:
                 persisted = _experience_from_row(existing)
-                if persisted != replace(
-                    record,
-                    recorded_at=persisted.recorded_at,
-                    valid_from=record.valid_from or record.occurred_at,
-                ):
+                if not _same_experience_occurrence(persisted, record):
                     raise ValueError(f"ExperienceIdentityConflict:{record.event_id}")
+                existing_records.append(persisted)
                 continue
-            cursor = db.execute(
+
+            alias = db.execute(
+                """SELECT event_id FROM memory_experience_occurrence_aliases
+                WHERE occurrence_id = ?""",
+                (record.event_id,),
+            ).fetchone()
+            if alias is not None:
+                row = db.execute(
+                    "SELECT * FROM memory_experiences WHERE event_id = ?",
+                    (str(alias["event_id"]),),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError(f"ExperienceAliasTargetMissing:{record.event_id}")
+                existing_records.append(_experience_from_row(row))
+                continue
+
+            legacy = None
+            if record.event_id != source_event_id:
+                legacy = db.execute(
+                    "SELECT * FROM memory_experiences WHERE event_id = ?",
+                    (source_event_id,),
+                ).fetchone()
+            if legacy is not None:
+                persisted = _experience_from_row(legacy)
+                if _same_experience_occurrence(persisted, record):
+                    db.execute(
+                        """INSERT INTO memory_experience_occurrence_aliases (
+                            occurrence_id, event_id, source_event_id,
+                            ingest_position, recorded_at
+                        ) VALUES (?, ?, ?, ?, ?)""",
+                        (
+                            record.event_id,
+                            persisted.event_id,
+                            source_event_id,
+                            int(record.sequence),
+                            _now_iso(),
+                        ),
+                    )
+                    existing_records.append(persisted)
+                    continue
+
+            db.execute(
                 """
-                INSERT OR IGNORE INTO memory_experiences (
-                    event_id, sequence, occurred_at, recorded_at, source,
-                    channel, event_type, content, stream_id,
-                    consciousness_instance_id, actor, visibility,
+                INSERT INTO memory_experiences (
+                    event_id, source_event_id, sequence, occurred_at,
+                    recorded_at, source, channel, event_type, content,
+                    stream_id, consciousness_instance_id, actor, visibility,
                     valid_from, valid_to, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.event_id,
+                    source_event_id,
                     int(record.sequence),
                     record.occurred_at,
-                    record.recorded_at or _now_iso(),
+                    record.recorded_at,
                     record.source,
                     record.channel,
                     record.event_type,
@@ -270,13 +398,25 @@ def insert_experiences(
                     record.consciousness_instance_id,
                     record.actor,
                     record.visibility,
-                    record.valid_from or record.occurred_at,
+                    record.valid_from,
                     record.valid_to,
                     json.dumps(record.metadata, ensure_ascii=False),
                 ),
             )
-            inserted += max(0, int(cursor.rowcount))
-    return inserted
+            inserted.append(record)
+    return ExperienceAppendReport(
+        inserted=tuple(inserted),
+        existing=tuple(existing_records),
+    )
+
+
+def insert_experiences(
+    db: sqlite3.Connection,
+    records: Sequence[ExperienceRecord],
+) -> int:
+    """Compatibility wrapper returning the count of new occurrences."""
+
+    return append_experiences_detailed(db, records).inserted_count
 
 
 def list_experiences_after(
@@ -475,14 +615,14 @@ def update_witness_state(
 
 def _fts_query(query: str) -> str:
     tokens = re.findall(r"[\w\u3400-\u9fff]+", query, flags=re.UNICODE)
-    return " OR ".join(f'"{token}"' for token in tokens[:24])
+    return " OR ".join(f'"{token}"' for token in tokens)
 
 
 def search_witness_memories(
     db: sqlite3.Connection,
     query: str,
     *,
-    mode: MemorySearchMode = MemorySearchMode.AUTOBIOGRAPHICAL,
+    mode: MemorySearchMode | str = "",
     top_k: int = 5,
     stream_scope: str | None = None,
     visibility: Sequence[str] = ("private",),
@@ -493,19 +633,8 @@ def search_witness_memories(
     visible = tuple(dict.fromkeys(str(item) for item in visibility if item))
     if not match or not visible:
         return []
-    allowed_kinds = {
-        MemorySearchMode.CURRENT_FACT: (
-            EpistemicKind.SUBJECTIVE_WITNESS.value,
-            EpistemicKind.LEGACY_WITNESS.value,
-        ),
-        MemorySearchMode.AUTOBIOGRAPHICAL: (
-            EpistemicKind.SUBJECTIVE_WITNESS.value,
-            EpistemicKind.LEGACY_WITNESS.value,
-            EpistemicKind.SELF_NARRATIVE.value,
-        ),
-        MemorySearchMode.HISTORICAL: tuple(item.value for item in EpistemicKind),
-        MemorySearchMode.EXPLORATORY: tuple(item.value for item in EpistemicKind),
-    }[mode]
+    mode_text = mode.value if isinstance(mode, MemorySearchMode) else str(mode or "")
+    allowed_kinds = tuple(item.value for item in EpistemicKind)
     params: list[Any] = [match, *allowed_kinds, *visible]
     if stream_scope is None:
         scope_clause = " AND w.stream_scope = ''"
@@ -546,7 +675,7 @@ def search_witness_memories(
         note = "subjective witness, not objective truth"
         if row["epistemic_kind"] == EpistemicKind.LEGACY_WITNESS.value:
             note = "legacy subjective witness with incomplete provenance"
-        if mode is MemorySearchMode.CURRENT_FACT:
+        if mode_text == MemorySearchMode.CURRENT_FACT.value:
             note += "; corroboration required for current facts"
         results.append(
             WitnessSearchResult(
@@ -640,6 +769,7 @@ def _experience_from_row(row: sqlite3.Row) -> ExperienceRecord:
         channel=str(row["channel"]),
         event_type=str(row["event_type"]),
         content=str(row["content"]),
+        source_event_id=str(row["source_event_id"] or row["event_id"]),
         stream_id=str(row["stream_id"]),
         consciousness_instance_id=str(row["consciousness_instance_id"]),
         actor=str(row["actor"]),
@@ -684,10 +814,12 @@ __all__ = [
     "EpistemicKind",
     "EvidenceAwareMemoryResult",
     "ExperienceRecord",
+    "ExperienceAppendReport",
     "MemorySearchMode",
     "WitnessMemory",
     "WitnessSearchResult",
     "create_life_memory_schema",
+    "append_experiences_detailed",
     "get_witness_by_projection_path",
     "get_witness_state",
     "insert_experiences",

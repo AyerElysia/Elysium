@@ -215,11 +215,15 @@ async def test_current_fact_search_returns_active_claim_before_document(
         recorded_as_of="2026-07-02T00:00:00+08:00",
     )
 
-    assert results[0].record_id == claim.claim_id
-    assert results[0].kind == "epistemic_claim"
-    assert results[0].confidence is None
-    assert results[0].metadata["authority"] == "explicit_user"
-    assert "not truth confidence" in results[0].metadata["epistemic_note"]
+    by_id = {item.record_id: item for item in results}
+    assert claim.claim_id in by_id
+    assert "notes/location.md" in by_id
+    claim_result = by_id[claim.claim_id]
+    assert claim_result.kind == "epistemic_claim"
+    assert claim_result.confidence is None
+    assert claim_result.metadata["authority"] == "unasserted"
+    assert "not truth confidence" in claim_result.metadata["epistemic_note"]
+    assert results[0].record_id == "notes/location.md"
 
 
 async def test_sealed_witness_cannot_reenter_through_document_projection(

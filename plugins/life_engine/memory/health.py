@@ -8,6 +8,7 @@ No function in this module creates, deletes, or repairs memory data.
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -426,6 +427,100 @@ def _outbox_snapshot(db: sqlite3.Connection) -> dict[str, Any]:
     return result
 
 
+def _living_memory_snapshot(db: sqlite3.Connection) -> dict[str, Any]:
+    """Read immutable-ledger coverage and rebuildable-projection drift signals."""
+
+    tables = (
+        "memory_artifact_versions",
+        "memory_artifact_derivations",
+        "memory_artifact_heads",
+        "memory_interpretations",
+        "memory_interpretation_fts",
+        "memory_interpretation_sources",
+        "memory_semantic_relations",
+        "memory_recall_sessions",
+        "memory_recall_events",
+        "memory_corecall_events",
+        "memory_association_projection",
+        "memory_claims",
+        "memory_claim_evidence",
+        "memory_beliefs",
+        "memory_epistemic_conflicts",
+        "memory_state_events",
+    )
+    counts = {table: _count(db, table) for table in tables}
+    head_mismatch_count = 0
+    if _table_exists(db, "memory_artifact_heads") and _table_exists(
+        db,
+        "memory_artifact_versions",
+    ):
+        head_mismatch_count = int(
+            db.execute(
+                """SELECT COUNT(*) FROM memory_artifact_heads h
+                LEFT JOIN memory_artifact_versions v ON v.artifact_id = h.artifact_id
+                WHERE v.artifact_id IS NULL OR v.logical_key <> h.logical_key"""
+            ).fetchone()[0]
+            or 0
+        )
+
+    expected_pair_observations = 0
+    invalid_corecall_payload_count = 0
+    if _table_exists(db, "memory_corecall_events"):
+        for row in db.execute(
+            "SELECT entity_refs_json FROM memory_corecall_events"
+        ).fetchall():
+            try:
+                refs = tuple(
+                    dict.fromkeys(
+                        str(item).strip()
+                        for item in json.loads(str(row[0] or "[]"))
+                        if str(item).strip()
+                    )
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                invalid_corecall_payload_count += 1
+                continue
+            expected_pair_observations += len(refs) * (len(refs) - 1) // 2
+
+    projected_pair_observations = 0
+    if _table_exists(db, "memory_association_projection"):
+        projected_pair_observations = int(
+            db.execute(
+                "SELECT COALESCE(SUM(event_count), 0) FROM memory_association_projection"
+            ).fetchone()[0]
+            or 0
+        )
+
+    claims_without_evidence = 0
+    if _table_exists(db, "memory_claims") and _table_exists(
+        db,
+        "memory_claim_evidence",
+    ):
+        claims_without_evidence = int(
+            db.execute(
+                """SELECT COUNT(*) FROM memory_claims c
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM memory_claim_evidence e
+                    WHERE e.claim_id = c.claim_id
+                )"""
+            ).fetchone()[0]
+            or 0
+        )
+
+    return {
+        "counts": counts,
+        "artifact_head_mismatch_count": head_mismatch_count,
+        "invalid_corecall_payload_count": invalid_corecall_payload_count,
+        "expected_pair_observations": expected_pair_observations,
+        "projected_pair_observations": projected_pair_observations,
+        "association_projection_drift": (
+            expected_pair_observations != projected_pair_observations
+        ),
+        "claims_without_evidence": claims_without_evidence,
+        "retrieval_is_not_truth": True,
+    }
+
+
 def collect_health_snapshot(
     db: sqlite3.Connection | None,
     workspace_path: str | Path,
@@ -476,6 +571,16 @@ def collect_health_snapshot(
         "associates_count": 0,
         "associates_ratio": 0.0,
     }
+    living_memory: dict[str, Any] = {
+        "counts": {},
+        "artifact_head_mismatch_count": 0,
+        "invalid_corecall_payload_count": 0,
+        "expected_pair_observations": 0,
+        "projected_pair_observations": 0,
+        "association_projection_drift": False,
+        "claims_without_evidence": 0,
+        "retrieval_is_not_truth": True,
+    }
     if db is not None:
         try:
             integrity = _integrity_snapshot(db)
@@ -509,6 +614,7 @@ def collect_health_snapshot(
             outbox = _outbox_snapshot(db)
             corrections = _correction_snapshot(db)
             edges = _relation_snapshot(db, node_ids)
+            living_memory = _living_memory_snapshot(db)
         except sqlite3.Error as exc:
             empty_sqlite["error_type"] = type(exc).__name__
 
@@ -614,6 +720,7 @@ def collect_health_snapshot(
         "outbox": outbox,
         "corrections": corrections,
         "edges": edges,
+        "living_memory": living_memory,
         "eligibility": eligibility,
         "index": index,
         # A synchronous snapshot has no collection handle.  The async entry
@@ -883,10 +990,14 @@ async def _finish_health_snapshot(
     snapshot: dict[str, Any],
     id_sets: _VectorIdSets,
     collection: Any,
+    *,
+    vector_expected: bool = True,
 ) -> dict[str, Any]:
     """Attach vector diagnostics and compute one final snapshot status."""
     node_ids, embedded_node_ids, chunk_ids, expected_chunk_ids = id_sets
     vector = await asyncio.to_thread(_read_vector_collection, collection)
+    vector["expected"] = bool(vector_expected)
+    vector["disabled"] = not bool(vector_expected)
 
     ids_complete = bool(vector.get("ids_complete"))
     vector_ids = set(str(value) for value in vector.get("ids", []))
@@ -909,6 +1020,8 @@ async def _finish_health_snapshot(
             len(missing_ids) if ids_complete else None
         )
     vector.pop("ids", None)
+    if not vector_expected:
+        vector["degraded"] = False
     vector["vector_degraded"] = bool(vector.get("degraded"))
     snapshot["vector"] = vector
     snapshot["vector_count"] = vector.get("count")
@@ -943,18 +1056,19 @@ async def _finish_health_snapshot(
     issue_count += int(correction_section.get("orphan_related_node_count", 0) or 0)
     issue_count += int(outbox_section.get("processing", 0) or 0)
     issue_count += int(outbox_section.get("failed", 0) or 0)
-    vector_issue_keys = ["orphan_count"]
-    vector_issue_keys.append(
-        "missing_chunk_count"
-        if vector.get("kind") == "chunk"
-        else "missing_embedded_node_count"
-    )
-    for key in vector_issue_keys:
-        value = vector.get(key)
-        if value is not None:
-            issue_count += int(value or 0)
-    if snapshot.get("vector_degraded"):
-        issue_count += 1
+    if vector_expected:
+        vector_issue_keys = ["orphan_count"]
+        vector_issue_keys.append(
+            "missing_chunk_count"
+            if vector.get("kind") == "chunk"
+            else "missing_embedded_node_count"
+        )
+        for key in vector_issue_keys:
+            value = vector.get(key)
+            if value is not None:
+                issue_count += int(value or 0)
+        if snapshot.get("vector_degraded"):
+            issue_count += 1
     if sqlite_section.get("foreign_keys_enabled") is False:
         issue_count += 1
     if any(
@@ -979,16 +1093,25 @@ async def health_snapshot(
     db: sqlite3.Connection | None,
     workspace_path: str | Path,
     collection: Any = None,
+    *,
+    vector_expected: bool = True,
 ) -> dict[str, Any]:
     """Return a JSON-serializable, read-only caller-owned health snapshot."""
     snapshot, id_sets = await _async_db_snapshot(db, workspace_path)
-    return await _finish_health_snapshot(snapshot, id_sets, collection)
+    return await _finish_health_snapshot(
+        snapshot,
+        id_sets,
+        collection,
+        vector_expected=vector_expected,
+    )
 
 
 async def health_snapshot_from_path(
     db_path: str | Path,
     workspace_path: str | Path,
     collection: Any = None,
+    *,
+    vector_expected: bool = True,
 ) -> dict[str, Any]:
     """Collect health through an isolated read-only SQLite connection."""
     try:
@@ -999,7 +1122,12 @@ async def health_snapshot_from_path(
         )
     except (OSError, ValueError, sqlite3.Error):
         snapshot, id_sets = await run_db(_collect_empty_db_snapshot, workspace_path)
-    return await _finish_health_snapshot(snapshot, id_sets, collection)
+    return await _finish_health_snapshot(
+        snapshot,
+        id_sets,
+        collection,
+        vector_expected=vector_expected,
+    )
 
 
 # Explicit aliases make the sync/async boundary discoverable to callers.

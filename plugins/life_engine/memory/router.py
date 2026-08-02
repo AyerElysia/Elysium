@@ -10,7 +10,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar
 
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from src.app.plugin_system.base import BaseRouter
 
@@ -29,6 +29,31 @@ class ActivateRequest(BaseModel):
     seed_ids: list[str]
     max_depth: int = 2
     max_results: int = 20
+
+
+class VectorHealthResponse(BaseModel):
+    """Stable API contract for configured vector-backend health."""
+
+    model_config = ConfigDict(extra="allow")
+
+    available: bool
+    expected: bool = True
+    disabled: bool = False
+    degraded: bool = False
+
+
+class MemoryHealthResponse(BaseModel):
+    """Public read-only memory health response; detailed sections may evolve."""
+
+    model_config = ConfigDict(extra="allow")
+
+    status: str
+    sqlite: dict[str, Any] = Field(default_factory=dict)
+    index: dict[str, Any] = Field(default_factory=dict)
+    outbox: dict[str, Any] = Field(default_factory=dict)
+    edges: dict[str, Any] = Field(default_factory=dict)
+    living_memory: dict[str, Any] = Field(default_factory=dict)
+    vector: VectorHealthResponse
 
 
 def _table_exists(db: sqlite3.Connection, table: str) -> bool:
@@ -416,7 +441,7 @@ class MemoryRouter(BaseRouter):
             stats = await memory.get_stats()
             return stats
 
-        @self.app.get("/api/health")
+        @self.app.get("/api/health", response_model=MemoryHealthResponse)
         async def get_health() -> Any:
             """返回只读记忆健康快照。"""
             memory = get_memory_service()

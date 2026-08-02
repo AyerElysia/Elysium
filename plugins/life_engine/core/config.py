@@ -494,7 +494,7 @@ class LifeEngineConfig(BaseConfig):
             default=2,
             ge=1,
             le=5,
-            description="每次技能精炼最多编辑数（有界编辑）。",
+            description="旧配置兼容字段；认知修改范围现在由独立整合与审视过程决定。",
         )
 
     @config_section("curiosity")

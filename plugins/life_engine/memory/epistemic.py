@@ -8,6 +8,7 @@ retrieval rank, repetition, or model confidence into truth.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -19,7 +20,11 @@ from .indexing import transaction
 
 
 class AuthorityClass(str, Enum):
-    """Provenance permission attached to a record or explicit state event."""
+    """Legacy convenience labels for provenance declarations.
+
+    The storage contract accepts open strings.  These labels are not a
+    hierarchy and code must not infer truth or permission from membership.
+    """
 
     SUBJECT = "subject"
     EXPLICIT_USER = "explicit_user"
@@ -247,14 +252,6 @@ class ClaimSearchResult:
     plasticity: RetrievalPlasticity | None = None
 
 
-_CONFIRMING_AUTHORITIES = {
-    AuthorityClass.SUBJECT.value,
-    AuthorityClass.EXPLICIT_USER.value,
-    AuthorityClass.VERIFIED.value,
-    AuthorityClass.AUTHORITATIVE.value,
-}
-
-
 def now_iso() -> str:
     """Return an offset-aware timestamp suitable for recorded time."""
 
@@ -262,27 +259,10 @@ def now_iso() -> str:
 
 
 def authority_for_source(source: str) -> AuthorityClass:
-    """Map legacy source labels to provenance classes without scoring truth."""
+    """Deprecated compatibility helper that deliberately performs no inference."""
 
-    normalized = str(source or "").strip().lower()
-    aliases = {
-        "subject": AuthorityClass.SUBJECT,
-        "self": AuthorityClass.SUBJECT,
-        "user": AuthorityClass.EXPLICIT_USER,
-        "explicit_user": AuthorityClass.EXPLICIT_USER,
-        "verified": AuthorityClass.VERIFIED,
-        "authoritative": AuthorityClass.AUTHORITATIVE,
-        "observation": AuthorityClass.OBSERVED,
-        "observed": AuthorityClass.OBSERVED,
-        "experience": AuthorityClass.OBSERVED,
-        "witness": AuthorityClass.WITNESS,
-        "memory_witness": AuthorityClass.WITNESS,
-        "reflection": AuthorityClass.REFLECTION,
-        "inference": AuthorityClass.INFERRED,
-        "inferred": AuthorityClass.INFERRED,
-        "learning_system": AuthorityClass.VERIFIED,
-    }
-    return aliases.get(normalized, AuthorityClass.UNKNOWN)
+    del source
+    return AuthorityClass.UNKNOWN
 
 
 def create_epistemic_schema(db: sqlite3.Connection) -> None:
@@ -311,6 +291,14 @@ def create_epistemic_schema(db: sqlite3.Connection) -> None:
                 ON memory_claims(subject_key, recorded_at DESC);
             CREATE INDEX IF NOT EXISTS idx_claims_scope
                 ON memory_claims(stream_scope, visibility);
+            CREATE VIRTUAL TABLE IF NOT EXISTS memory_claim_fts USING fts5(
+                claim_id UNINDEXED, subject_key, content, tokenize='unicode61'
+            );
+            CREATE TRIGGER IF NOT EXISTS memory_claim_fts_after_insert
+            AFTER INSERT ON memory_claims BEGIN
+                INSERT INTO memory_claim_fts (claim_id, subject_key, content)
+                VALUES (new.claim_id, new.subject_key, new.content);
+            END;
 
             CREATE TABLE IF NOT EXISTS memory_claim_evidence (
                 evidence_link_id TEXT PRIMARY KEY,
@@ -427,6 +415,13 @@ def create_epistemic_schema(db: sqlite3.Connection) -> None:
                 ON memory_retrieval_feedback(exposure_id, recorded_at);
             """
         )
+        db.execute(
+            """INSERT INTO memory_claim_fts (claim_id, subject_key, content)
+            SELECT c.claim_id, c.subject_key, c.content FROM memory_claims c
+            WHERE NOT EXISTS (
+                SELECT 1 FROM memory_claim_fts f WHERE f.claim_id = c.claim_id
+            )"""
+        )
         for table in (
             "memory_claims",
             "memory_claim_evidence",
@@ -458,7 +453,7 @@ def append_claim(db: sqlite3.Connection, claim: MemoryClaim) -> MemoryClaim:
         claim,
         content=claim.content.strip(),
         recorded_at=claim.recorded_at or now_iso(),
-        authority=claim.authority or authority_for_source(claim.source).value,
+        authority=str(claim.authority or "unasserted").strip(),
     )
     if not normalized.claim_id or not normalized.subject_key or not normalized.content:
         raise ValueError("ClaimIdentityAndContentRequired")
@@ -606,7 +601,7 @@ def append_state_event(
         event,
         recorded_at=event.recorded_at or now_iso(),
         valid_at=event.valid_at or event.recorded_at or now_iso(),
-        authority=event.authority or AuthorityClass.UNKNOWN.value,
+        authority=str(event.authority or "unasserted").strip(),
     )
     _require_entity(db, normalized.entity_type, normalized.entity_id)
     if normalized.reverses_event_id:
@@ -620,13 +615,6 @@ def append_state_event(
             target["entity_id"]
         ) != normalized.entity_id:
             raise ValueError("ReversalEntityMismatch")
-    if (
-        normalized.event_type in {"claim_confirmed", "claim_authoritatively_revised"}
-        and normalized.authority not in _CONFIRMING_AUTHORITIES
-    ):
-        raise PermissionError(
-            f"AuthorityCannotConfirmClaim:{normalized.authority}"
-        )
     return _append_identity_record(
         db,
         table="memory_state_events",
@@ -741,8 +729,8 @@ def append_retrieval_feedback(
     ).fetchone()
     if exposure is None:
         raise ValueError(f"RetrievalExposureMissing:{normalized.exposure_id}")
-    if normalized.feedback not in {"accepted", "rejected", "corrected"}:
-        raise ValueError(f"UnsupportedRetrievalFeedback:{normalized.feedback}")
+    if not str(normalized.feedback or "").strip():
+        raise ValueError("RetrievalFeedbackActionRequired")
     return _append_identity_record(
         db,
         table="memory_retrieval_feedback",
@@ -1102,25 +1090,41 @@ def search_epistemic_claims(
     if not query_text or not visible:
         return []
     marks = ",".join("?" for _ in visible)
-    clauses = [f"visibility IN ({marks})", "instr(content, ?) > 0"]
-    params: list[Any] = [*visible, query_text]
+    clauses = [f"c.visibility IN ({marks})"]
+    params: list[Any] = [*visible]
     if recorded_as_of:
-        clauses.append("recorded_at <= ?")
+        clauses.append("c.recorded_at <= ?")
         params.append(recorded_as_of)
     if valid_at:
-        clauses.extend(["(valid_from = '' OR valid_from <= ?)", "(valid_to = '' OR valid_to > ?)"])
+        clauses.extend(["(c.valid_from = '' OR c.valid_from <= ?)", "(c.valid_to = '' OR c.valid_to > ?)"])
         params.extend([valid_at, valid_at])
     if stream_scope is None:
-        clauses.append("stream_scope = ''")
+        clauses.append("c.stream_scope = ''")
     else:
-        clauses.append("stream_scope IN (?, '')")
+        clauses.append("c.stream_scope IN (?, '')")
         params.append(stream_scope)
     params.append(max(1, int(top_k)) * 4)
-    rows = db.execute(
-        "SELECT * FROM memory_claims WHERE " + " AND ".join(clauses)
-        + " ORDER BY recorded_at DESC, claim_id LIMIT ?",
-        params,
-    ).fetchall()
+    match = _claim_fts_query(query_text)
+    rows: list[sqlite3.Row] = []
+    if match:
+        rows = db.execute(
+            """SELECT c.*, bm25(memory_claim_fts) AS lexical_rank
+            FROM memory_claim_fts f JOIN memory_claims c
+              ON c.claim_id = f.claim_id
+            WHERE memory_claim_fts MATCH ? AND """
+            + " AND ".join(clauses)
+            + " ORDER BY lexical_rank, c.recorded_at DESC, c.claim_id LIMIT ?",
+            [match, *params],
+        ).fetchall()
+    if not rows:
+        fallback_clauses = [*clauses, "instr(c.content, ?) > 0"]
+        fallback_params = [*params[:-1], query_text, params[-1]]
+        rows = db.execute(
+            "SELECT c.*, 0.0 AS lexical_rank FROM memory_claims c WHERE "
+            + " AND ".join(fallback_clauses)
+            + " ORDER BY c.recorded_at DESC, c.claim_id LIMIT ?",
+            fallback_params,
+        ).fetchall()
     results: list[ClaimSearchResult] = []
     for index, row in enumerate(rows):
         claim = _claim_from_row(row)
@@ -1156,11 +1160,6 @@ def search_epistemic_claims(
     results.sort(
         key=lambda item: (
             -item.rank_score,
-            -(
-                item.plasticity.retrieval_affinity
-                if item.plasticity is not None
-                else 0.0
-            ),
             item.state.claim.recorded_at,
         )
     )
@@ -1246,6 +1245,7 @@ def new_claim(
     content: str,
     claim_kind: str,
     source: str,
+    authority: str = "",
     valid_from: str = "",
     valid_to: str = "",
     stream_scope: str = "",
@@ -1255,7 +1255,7 @@ def new_claim(
     claim_id: str = "",
     recorded_at: str = "",
 ) -> MemoryClaim:
-    """Construct a claim with an explicit provenance authority class."""
+    """Construct a claim without deriving epistemic authority from its source."""
 
     return MemoryClaim(
         claim_id=claim_id or f"clm_{uuid4().hex}",
@@ -1263,7 +1263,7 @@ def new_claim(
         content=content,
         claim_kind=claim_kind,
         source=source,
-        authority=authority_for_source(source).value,
+        authority=str(authority or "unasserted").strip(),
         valid_from=valid_from,
         valid_to=valid_to,
         recorded_at=recorded_at or now_iso(),
@@ -1334,6 +1334,11 @@ def _require_entity(db: sqlite3.Connection, entity_type: str, entity_id: str) ->
 
 def _json_dump(value: dict[str, Any]) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _claim_fts_query(query: str) -> str:
+    tokens = re.findall(r"[\w\u3400-\u9fff]+", query, flags=re.UNICODE)
+    return " OR ".join(f'"{token}"' for token in tokens)
 
 
 def _json_dict(value: str | None) -> dict[str, Any]:

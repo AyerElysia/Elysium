@@ -238,10 +238,6 @@ class LearningScheduler:
         """检查是否到了审计时间。"""
         if not self._should_audit():
             return
-        # 审计前先执行存量去重（合并高度重复的洞察）
-        merged = self.store.merge_duplicates()
-        if merged:
-            logger.info(f"审计前去重: {merged} 条洞察被合并")
         logger.info("🔍 触发审计环")
         records = await self.auditor.run_audit_cycle()
         if records:
@@ -263,6 +259,27 @@ class LearningScheduler:
         logger.info("📝 触发慢环压缩")
         promoted = await self.compressor.run_compression()
         if promoted:
+            version_artifact = getattr(
+                self._memory_service,
+                "version_memory_artifact",
+                None,
+            )
+            if callable(version_artifact):
+                content = self.store.read_current_knowledge()
+                if content:
+                    await version_artifact(
+                        logical_key="learning:self_knowledge",
+                        artifact_kind="self_knowledge_document",
+                        content=content,
+                        authored_by="life_learning_compressor",
+                        consciousness_instance_id="life_engine",
+                        predicate="learning_compression_selected",
+                        reason="整合过程选择了新的自我认知文档版本",
+                        metadata={
+                            "source": "learning_compression",
+                            "selection_gate": "independent_model_assessment",
+                        },
+                    )
             # 新版本刚落盘，指标曲线上应该有这个点
             self._snapshot_metrics_now()
 
@@ -277,33 +294,10 @@ class LearningScheduler:
         if not validated_insights:
             return
 
-        from ..memory.epistemic import new_claim
-
         projected = 0
         for insight in validated_insights:
-            claim_id = f"insight_{insight.insight_id}"
             try:
-                existing = await self._memory_service.get_memory_claim_state(claim_id)
-                if existing is not None:
-                    continue
-            except Exception:
-                pass
-            try:
-                claim = new_claim(
-                    claim_id=claim_id,
-                    subject_key=f"insight:{insight.category or '自我认知'}",
-                    content=insight.claim,
-                    claim_kind="validated_insight",
-                    source="learning_system",
-                    metadata={
-                        "insight_id": insight.insight_id,
-                        "evidence_count": len(insight.evidence),
-                        "confidence": insight.confidence,
-                        "category": insight.category,
-                    },
-                )
-                await self._memory_service.append_memory_claim(claim)
-                projected += 1
+                projected += int(await self._project_insight_to_epistemic(insight))
             except Exception as exc:
                 logger.debug(f"回填洞察投影失败: {exc}")
 
@@ -326,42 +320,103 @@ class LearningScheduler:
         if not validated:
             return
 
-        from ..memory.epistemic import new_claim
-
         projected = 0
         for record in validated:
             insight = self.store.get_insight(record.insight_id)
             if insight is None:
                 continue
-            claim_id = f"insight_{insight.insight_id}"
-            # 幂等：已存在则跳过
             try:
-                existing = await self._memory_service.get_memory_claim_state(claim_id)
-                if existing is not None:
-                    continue
-            except Exception:
-                pass
-            try:
-                claim = new_claim(
-                    claim_id=claim_id,
-                    subject_key=f"insight:{insight.category or '自我认知'}",
-                    content=insight.claim,
-                    claim_kind="validated_insight",
-                    source="learning_system",
-                    metadata={
-                        "insight_id": insight.insight_id,
-                        "evidence_count": len(insight.evidence),
-                        "confidence": insight.confidence,
-                        "category": insight.category,
-                    },
+                projected += int(
+                    await self._project_insight_to_epistemic(
+                        insight,
+                        audit_record=record,
+                    )
                 )
-                await self._memory_service.append_memory_claim(claim)
-                projected += 1
             except Exception as exc:
                 logger.debug(f"洞察投影到认识论层失败: {exc}")
 
         if projected:
             logger.info(f"🧠 认识论投影: {projected} 条验证洞察 → claims")
+
+    async def _project_insight_to_epistemic(
+        self,
+        insight: Any,
+        *,
+        audit_record: Any | None = None,
+    ) -> bool:
+        """投影洞察及其证据，但不把学习系统标签升级成事实权限。"""
+
+        from ..memory.epistemic import ClaimEvidence, new_claim
+
+        claim_id = f"insight_{insight.insight_id}"
+        try:
+            existing = await self._memory_service.get_memory_claim_state(claim_id)
+        except Exception as exc:
+            logger.debug(
+                f"查询洞察投影状态失败，交由追加账本执行幂等判定 {claim_id}: {exc}"
+            )
+            existing = None
+        created = existing is None
+        if created:
+            claim = new_claim(
+                claim_id=claim_id,
+                subject_key=f"insight:{insight.category or '自我认知'}",
+                content=insight.claim,
+                claim_kind="learning_insight",
+                source="learning_system",
+                authority="learning_audit_observation",
+                metadata={
+                    "insight_id": insight.insight_id,
+                    "evidence_count": len(insight.evidence),
+                    "confidence_as_reported_by_learning_system": insight.confidence,
+                    "category": insight.category,
+                    "epistemic_note": "audit output and retrieval frequency are not truth",
+                },
+            )
+            await self._memory_service.append_memory_claim(claim)
+
+        for evidence in insight.evidence:
+            await self._memory_service.append_claim_evidence(
+                ClaimEvidence(
+                    evidence_link_id=f"insight_evidence_{evidence.evidence_id}",
+                    claim_id=claim_id,
+                    evidence_kind=str(evidence.kind or "learning_evidence"),
+                    evidence_ref=str(
+                        evidence.source_ref
+                        or f"learning_evidence:{evidence.evidence_id}"
+                    ),
+                    stance="supports" if evidence.supports else "challenges",
+                    source_excerpt=str(evidence.description or ""),
+                    recorded_at=str(evidence.timestamp or ""),
+                    metadata={
+                        "context": evidence.context,
+                        "reported_weight": evidence.weight,
+                        "weight_is_not_truth": True,
+                    },
+                )
+            )
+
+        if audit_record is not None:
+            await self._memory_service.append_claim_evidence(
+                ClaimEvidence(
+                    evidence_link_id=f"insight_audit_{audit_record.audit_id}",
+                    claim_id=claim_id,
+                    evidence_kind="independent_learning_audit",
+                    evidence_ref=f"learning_audit:{audit_record.audit_id}",
+                    stance="context",
+                    source_excerpt=str(audit_record.reasoning or ""),
+                    recorded_at=str(audit_record.timestamp or ""),
+                    metadata={
+                        "verdict": audit_record.verdict,
+                        "bias_detected": list(audit_record.bias_detected),
+                        "evidence_sufficiency_as_reported": (
+                            audit_record.evidence_sufficiency
+                        ),
+                        "audit_is_not_automatic_truth": True,
+                    },
+                )
+            )
+        return created
 
     async def _maybe_run_distillation(self) -> None:
         """检查是否需要技能蒸馏。"""
@@ -485,11 +540,11 @@ class LearningScheduler:
             "reflection_available": self.reflection.can_reflect,
         }
 
-    def get_knowledge_for_prompt(self, max_chars: int = 2000) -> str:
+    def get_knowledge_for_prompt(self, max_chars: int = 0) -> str:
         """获取自我认知文档（供 prompt 注入）。"""
         return self.compressor.get_knowledge_for_prompt(max_chars=max_chars)
 
-    def get_skill_catalog_for_prompt(self, max_chars: int = 600) -> str:
+    def get_skill_catalog_for_prompt(self, max_chars: int = 0) -> str:
         """获取技能目录文本（L1，供 prompt 注入）。"""
         return self.skill_store.get_catalog_text(max_chars=max_chars)
 

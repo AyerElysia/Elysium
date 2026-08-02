@@ -6,7 +6,6 @@ import sqlite3
 from types import SimpleNamespace
 from typing import Any
 
-import pytest
 from fastapi.testclient import TestClient
 
 from plugins.life_engine.memory.router import MemoryRouter, _read_graph_payload
@@ -215,3 +214,19 @@ def test_search_and_activation_filter_malformed_file_rows_after_backend_calls() 
     assert activation.status_code == 200
     assert [item["id"] for item in activation.json()] == ["file:good", "concept:topic"]
     assert memory.activation_calls == [(["seed"], 3, 4)]
+
+
+def test_health_endpoint_exports_response_schema() -> None:
+    plugin = SimpleNamespace(service=SimpleNamespace(_memory_service=None))
+    router = MemoryRouter(plugin=plugin)
+
+    openapi = router.app.openapi()
+    response_schema = openapi["paths"]["/api/health"]["get"]["responses"]["200"][
+        "content"
+    ]["application/json"]["schema"]
+
+    assert response_schema["$ref"].endswith("/MemoryHealthResponse")
+    health_schema = openapi["components"]["schemas"]["MemoryHealthResponse"]
+    assert {"status", "sqlite", "index", "outbox", "living_memory", "vector"} <= set(
+        health_schema["properties"]
+    )

@@ -38,29 +38,6 @@ logger = logging.getLogger("life_engine.learning.reflection")
 # 反思冷却（秒）
 _DEFAULT_COOLDOWN_SECONDS = 30 * 60  # 30 分钟
 
-# 认知修正的语言标记：命中任一即认为这条洞察是"我之前理解错了"
-_CORRECTION_MARKERS: tuple[str, ...] = (
-    "不是",
-    "其实",
-    "修正",
-    "更正",
-    "之前以为",
-    "原以为",
-    "我错了",
-    "并非",
-    "误解",
-    "重新理解",
-    "推翻",
-)
-
-# 单次反思最多落多少条显式修正（防止一次反思刷满修正表）
-_MAX_AUTO_CORRECTIONS_PER_RUN = 2
-# 为一条修正检索关联记忆文件时的候选数
-_CORRECTION_PATH_TOP_K = 3
-# 一条修正最多绑定多少个记忆文件
-_MAX_CORRECTION_PATHS = 2
-
-
 class ReflectionEngine:
     """快环反思引擎：从经历中提取洞察候选。"""
 
@@ -121,7 +98,7 @@ class ReflectionEngine:
 
         user_prompt = REFLECTION_INTERACTION_USER.format(
             context=context or "（无补充上下文）",
-            interaction_text=interaction_text[:3000],
+            interaction_text=interaction_text,
             existing_summary=self._build_existing_summary(),
             skill_section=self._build_skill_section(),
         )
@@ -156,7 +133,7 @@ class ReflectionEngine:
 
         user_prompt = REFLECTION_INTROSPECTION_USER.format(
             context=context or "（无补充上下文）",
-            internal_text=internal_text[:3000],
+            internal_text=internal_text,
             existing_summary=self._build_existing_summary(),
         )
         return await self._run_reflection(
@@ -195,198 +172,99 @@ class ReflectionEngine:
         for candidate, reinforces_id in candidates:
             candidate.source_events = source_event_ids
 
-            # 优先尝试强化：同一模式在不同情境复现 → 累积为确认证据
-            if candidate.evidence:
-                # 她明确指名要挂到哪条，就听她的；指名无效才回落到语义匹配
-                target = None
-                if reinforces_id:
-                    target = self._store.get_insight(reinforces_id)
-                    if target is None:
-                        logger.debug(f"reinforces 指向的洞察不存在: {reinforces_id}")
+            # 只有反思者显式声明 reinforces 才会强化旧洞察。文本相似、topic
+            # 相同和重复出现都只是检索线索，不能由代码据此宣称是同一认识。
+            if reinforces_id and candidate.evidence:
+                target = self._store.get_insight(reinforces_id)
                 if target is None:
-                    target = self._store.find_reinforce_target(candidate)
-                if target is not None:
-                    evidence = candidate.evidence[0]
-                    if self._store.reinforce_insight(
-                        target.insight_id,
-                        evidence,
-                        source_events=source_event_ids,
-                    ):
-                        logger.info(
-                            f"🔁 强化已有洞察 [{target.insight_id}] "
-                            f"(证据#{len(target.evidence) + 1}): {target.claim[:40]}..."
-                        )
-                        persisted.append(candidate)
-                        continue
-
-            # 否则作为新洞察写入（带去重 + topic 饱和守卫）
-            # topic 饱和守卫：同 topic 已有 >= 3 条活跃洞察时，强制尝试强化而非新建
-            if candidate.topic_key:
-                same_topic_count = sum(
-                    1 for ins in self._store.list_all()
-                    if ins.topic_key == candidate.topic_key and not ins.is_terminal
-                )
-                if same_topic_count >= 3:
-                    # 强制尝试强化最相似的那条
-                    target = self._store.find_reinforce_target(candidate)
-                    if target is not None and candidate.evidence:
-                        self._store.reinforce_insight(
-                            target.insight_id,
-                            candidate.evidence[0],
-                            source_events=source_event_ids,
-                        )
-                        logger.info(
-                            f"🚫 topic '{candidate.topic_key}' 已饱和({same_topic_count}条)，"
-                            f"强制强化 [{target.insight_id}]"
-                        )
-                        persisted.append(candidate)
-                        continue
+                    logger.warning(f"reinforces 指向的洞察不存在: {reinforces_id}")
+                elif self._store.reinforce_insight(
+                    target.insight_id,
+                    candidate.evidence[0],
+                    source_events=source_event_ids,
+                ):
+                    persisted.append(candidate)
+                    continue
 
             if self._store.add_insight(candidate):
                 results.append(candidate)
                 persisted.append(candidate)
                 logger.info(
-                    f"💡 新洞察 [{candidate.category}]: {candidate.claim[:50]}..."
+                    "💡 新洞察 [%s] category=%s",
+                    candidate.insight_id,
+                    candidate.category,
                 )
 
-        # 记忆演化：把"修正型洞察"落成显式修正记录，挂到相关记忆文件上
+        # 每次理解都作为新解释留下；是否修正、延续或推翻旧理解由意识显式
+        # 写关系，代码不再从措辞或相似度猜测。
         if persisted:
-            await self._auto_record_corrections(persisted, reflection_type=reflection_type)
+            await self._record_memory_interpretations(
+                persisted,
+                reflection_type=reflection_type,
+            )
 
         return results
 
-    async def _auto_record_corrections(
+    async def _record_memory_interpretations(
         self,
         insights: list[Insight],
         *,
         reflection_type: str,
     ) -> None:
-        """把"修正型洞察"落成显式记忆修正记录。
+        """Append every reflection as a source-linked, immutable interpretation."""
 
-        反思环里最有价值的一类洞察是"我之前理解错了"。这类认知转折如果只
-        存在于 insight 里，检索记忆时是看不见的——她会重新读到旧理解，却不
-        知道自己已经修正过。所以这里把它们写进 memory_corrections，并尽量
-        绑定到真实记忆节点上，让下次检索该文件时修正会跟着一起浮现。
-        """
         if self._memory_service is None or not insights:
             return
 
-        seen: set[str] = set()
-        recorded = 0
+        from ..memory.living import InterpretationSource, MemoryInterpretation
+
         for insight in insights:
-            if recorded >= _MAX_AUTO_CORRECTIONS_PER_RUN:
-                break
-
-            message = self._extract_correction_message(insight)
-            if not message:
-                continue
-            dedup_key = message[:120]
-            if dedup_key in seen:
-                continue
-            seen.add(dedup_key)
-
-            topic = (insight.topic_key or insight.category or "自我认知").strip()
-            related_paths = await self._resolve_correction_paths(insight)
-
-            if await self._write_correction(
-                topic=topic,
-                message=message,
-                related_paths=related_paths,
-                query=insight.claim,
-            ):
-                recorded += 1
-                logger.info(
-                    f"🔧 记忆修正已记录 [{topic}] -> "
-                    f"{related_paths or '（未绑定文件）'}: {message[:50]}..."
-                )
-
-        if recorded:
-            logger.debug(
-                f"反思({reflection_type}) 产生 {recorded} 条显式记忆修正"
-            )
-
-    def _extract_correction_message(self, insight: Insight) -> str:
-        """判断洞察是否属于"认知修正"，并组装修正说明。"""
-        claim = (insight.claim or "").strip()
-        if len(claim) < 6:
-            return ""
-
-        haystack = " ".join(
-            part for part in (claim, insight.rationale, insight.revision_note) if part
-        )
-        if not any(marker in haystack for marker in _CORRECTION_MARKERS):
-            return ""
-
-        rationale = (insight.rationale or "").strip()
-        if rationale and rationale not in claim:
-            return f"{claim}（依据：{rationale[:120]}）"
-        return claim
-
-    async def _resolve_correction_paths(self, insight: Insight) -> list[str]:
-        """检索这条修正应该挂到哪些记忆文件上。"""
-        query = (insight.claim or "").strip()
-        if not query:
-            return []
-        try:
-            results = await self._memory_service.search_memory(
-                query=query,
-                top_k=_CORRECTION_PATH_TOP_K,
-                enable_association=False,
-                return_bundles=False,
-            )
-        except Exception as exc:  # 检索失败不应阻断修正记录
-            logger.debug(f"修正记录检索关联文件失败: {exc}")
-            return []
-
-        paths: list[str] = []
-        for item in results or []:
-            path = str(getattr(item, "file_path", "") or "").strip()
-            if not path or not path.endswith(".md"):
-                continue
-            if path not in paths:
-                paths.append(path)
-            if len(paths) >= _MAX_CORRECTION_PATHS:
-                break
-        return paths
-
-    async def _write_correction(
-        self,
-        *,
-        topic: str,
-        message: str,
-        related_paths: list[str],
-        query: str,
-    ) -> bool:
-        """写入修正记录；路径不可索引时降级为不绑定文件。"""
-        try:
-            await self._memory_service.record_memory_correction(
-                topic=topic,
-                message=message,
-                related_paths=related_paths or None,
-                source="reflection",
-                query=query,
-            )
-            return True
-        except ValueError as exc:
-            if not related_paths:
-                logger.debug(f"记忆修正写入被拒绝: {exc}")
-                return False
-            logger.debug(f"修正关联路径不可索引，降级为不绑定文件: {exc}")
             try:
-                await self._memory_service.record_memory_correction(
-                    topic=topic,
-                    message=message,
-                    related_paths=None,
-                    source="reflection",
-                    query=query,
+                interpretation_id = f"interpretation_{insight.insight_id}"
+                source_refs = tuple(
+                    dict.fromkeys(
+                        [
+                            *(f"life_event:{item}" for item in insight.source_events),
+                            *(
+                                str(item.source_ref or f"learning_evidence:{item.evidence_id}")
+                                for item in insight.evidence
+                            ),
+                        ]
+                    )
                 )
-                return True
-            except Exception as inner:
-                logger.debug(f"记忆修正写入失败: {inner}")
-                return False
-        except Exception as exc:
-            logger.warning(f"记忆修正写入失败: {exc}")
-            return False
+                interpretation = MemoryInterpretation(
+                    interpretation_id=interpretation_id,
+                    subject_id=(
+                        f"learning_topic:{insight.topic_key or insight.category}"
+                        if insight.topic_key or insight.category
+                        else f"learning_insight:{insight.insight_id}"
+                    ),
+                    content=insight.claim,
+                    authored_by="life_reflection",
+                    consciousness_instance_id="life_engine",
+                    recorded_at=insight.born_at,
+                    metadata={
+                        "insight_id": insight.insight_id,
+                        "rationale": insight.rationale,
+                        "constraints": insight.constraints,
+                        "reflection_type": reflection_type,
+                    },
+                )
+                sources = tuple(
+                    InterpretationSource(
+                        interpretation_id=interpretation_id,
+                        entity_ref=entity_ref,
+                        predicate="draws_from",
+                        ordinal=index,
+                    )
+                    for index, entity_ref in enumerate(source_refs)
+                )
+                await self._memory_service.record_memory_interpretation(
+                    interpretation,
+                    sources=sources,
+                )
+            except Exception as exc:
+                logger.warning(f"反思解释写入记忆账本失败: {exc}")
 
     async def _call_llm(self, user_prompt: str) -> str:
         """调用 LLM 进行反思。"""
@@ -408,7 +286,7 @@ class ReflectionEngine:
         """解析 LLM 输出为洞察候选列表。
 
         返回 (洞察, reinforces_id) 对。reinforces_id 是她可选填写的
-        "这条要挂到哪条已有洞察上"——填了就按她说的挂，没填才走语义匹配。
+        "这条要挂到哪条已有洞察上"；未填写时保留独立解释。
         """
         parsed: Any
         try:
@@ -456,7 +334,7 @@ class ReflectionEngine:
             )
             # reinforces: 可选。她若认为这条观察是已有洞察的又一次印证，
             # 可以直接写那条的 insight_id，证据就挂到那条上，不新建。
-            # 不写也完全正常——系统会自己做语义匹配。
+            # 不写也完全正常——系统不会擅自做认知合并。
             reinforces = str(item.get("reinforces", "") or "").strip()
             candidates.append((insight, reinforces))
 
@@ -491,27 +369,19 @@ class ReflectionEngine:
             "",
         ]
     
-        # 每个 topic 最多展示 2 条（避免过长）
-        shown_count = 0
         for topic, group in sorted(by_topic.items(), key=lambda x: -len(x[1])):
-            if shown_count >= 12:
-                lines.append(f"… 还有 {len(by_topic) - shown_count} 个 topic 未展示")
-                break
             lines.append(f"【{topic}】({len(group)} 条)")
-            for ins in group[:2]:
+            for ins in group:
                 status_mark = {"validated": "✓", "rejected": "✗", "candidate": "?"}.get(ins.status, "·")
                 lines.append(
-                    f"  {status_mark} {ins.insight_id} 证据×{len(ins.evidence)} | {ins.claim[:60]}"
+                    f"  {status_mark} {ins.insight_id} 证据×{len(ins.evidence)} | {ins.claim}"
                 )
                 suggestion = self._latest_suggestion(ins)
                 if suggestion:
-                    lines.append(f"    ↳ 审计: {suggestion[:100]}")
-            if len(group) > 2:
-                lines.append(f"  … 及另外 {len(group)-2} 条")
-            shown_count += 1
+                    lines.append(f"    ↳ 审计: {suggestion}")
             lines.append("")
     
-        return format_existing_insights_summary("\n".join(lines), max_chars=3000)
+        return format_existing_insights_summary("\n".join(lines))
 
     @staticmethod
     def _latest_suggestion(insight: Insight) -> str:
@@ -556,8 +426,6 @@ class ReflectionEngine:
             if skill is None:
                 continue
             self._skill_store.append_use_observation(
-                skill.skill_id, f"[反思] {observation[:200]}"
+                skill.skill_id, f"[反思] {observation}"
             )
-            logger.debug(f"📝 技能反馈记录: {skill_name} -> {observation[:60]}")
-
-
+            logger.debug("📝 技能反馈记录: %s", skill_name)

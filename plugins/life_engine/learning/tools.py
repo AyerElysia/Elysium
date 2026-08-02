@@ -17,7 +17,7 @@ from src.app.plugin_system.api import log_api
 from src.app.plugin_system.base import BaseTool
 
 from ..core.config import LifeEngineConfig
-from .models import Evidence, EvidenceKind, InsightStatus, ValidationExperiment
+from .models import Evidence, EvidenceKind
 from .store import InsightStore
 
 logger = log_api.get_logger("life_engine.learning")
@@ -236,15 +236,9 @@ class LifeChallengeInsightTool(BaseTool):
             kind=EvidenceKind.COUNTER_EXAMPLE,
             description=text,
             supports=False,
-            weight=1.5,  # 反面证据权重稍高
             context="主体主动质疑",
         )
         store.add_evidence(iid, evidence)
-
-        # 如果反面证据足够多，降低置信度
-        if insight.negative_evidence_count >= 2:
-            insight.confidence = max(0.1, insight.confidence - 0.2)
-            store.update_insight(insight)
 
         return True, {
             "action": "challenge_insight",

@@ -37,25 +37,8 @@ MEMORY_WITNESS_INSTANCE_ID = "memory_witness"
 _NO_WITNESS = "<no_witness>"
 _TRANSIENT_ERROR_ESCALATION_COUNT = 3
 
-# 经历显著性过滤：只有心理意义的事件才编码为经历。
-# tool_call / tool_result 是运动皮层信号——它们被 stats 和原始事件流记录，
-# 但不进入情景记忆，正如人不会记住自己按过的每一个键。
-_EXPERIENTIAL_EVENT_TYPES: frozenset[str] = frozenset({
-    "text",
-    "voice",
-    "image",
-    "video",
-    "emoji",
-    "direct_message",
-    "heartbeat_reply",
-    "chatter_inner_monologue",
-    "proactive_opportunity",
-    "autonomy_intent_due",
-    "autonomy_intent_scheduled",
-    "autonomy_intent_silence",
-})
-
-
+# Every retained life event remains available as experience evidence.  The
+# witness consciousness, not a code whitelist, decides what deserves a diary.
 def _transient_error_summary(exc: BaseException) -> str:
     """Describe an upstream failure without dumping response bodies or traces."""
 
@@ -192,20 +175,21 @@ class MemoryWitnessCoordinator:
             await self._migrate_legacy_diaries()
             await self._retry_pending_projections()
             state = await memory.get_witness_state(instance.instance_id)
-            cursor = int(state.get("last_sequence", 0) or 0)
             limit = max(1, int(getattr(cfg, "max_events_per_run", 80)))
             store = self._service._get_event_bus().store
+            get_offset = getattr(store, "get_consumer_offset", None)
+            if callable(get_offset):
+                cursor = int(await get_offset(instance.instance_id))
+            else:
+                cursor = int(state.get("last_sequence", 0) or 0)
             try:
                 raw_events = await store.read_since(cursor, limit=limit)
             except RawEventGapError as gap:
-                logger.warning(
-                    "原始事件历史已轮转，记忆见证游标落后；"
-                    "将从最早保留事件继续处理: "
-                    f"requested={gap.requested_sequence}, "
+                raise RuntimeError(
+                    "MemoryWitnessRawLedgerGap: refusing to skip missing life "
+                    f"history after={gap.requested_sequence} "
                     f"earliest={gap.earliest_available}"
-                )
-                cursor = gap.earliest_available - 1
-                raw_events = await store.read_since(cursor, limit=limit)
+                ) from gap
             if not raw_events:
                 await memory.update_witness_state(
                     instance.instance_id,
@@ -218,13 +202,24 @@ class MemoryWitnessCoordinator:
             # 否则见证意识会被操作噪音永远困在原地。
             max_sequence = max(event.sequence for event in raw_events)
 
-            # 编码层筛选：只有心理显著的事件才成为经历。
-            experiences = [
-                self._to_experience(event)
-                for event in raw_events
-                if event.event_type in _EXPERIENTIAL_EVENT_TYPES
-            ]
-            synced = await memory.append_experiences(experiences)
+            candidates = [self._to_experience(event) for event in raw_events]
+            append_detailed = getattr(memory, "append_experiences_detailed", None)
+            if callable(append_detailed):
+                append_report = await append_detailed(candidates)
+                # Author from the canonical ledger rows, including rows that
+                # were inserted by an earlier failed attempt.  Advancing only
+                # from ``inserted`` would lose the subjective witness when the
+                # experience append succeeded but the model/projection failed:
+                # the retry would see every row as existing and silently move
+                # the durable cursor past an unwitnessed window.
+                experiences = [
+                    *append_report.inserted,
+                    *append_report.existing,
+                ]
+                synced = int(append_report.inserted_count)
+            else:
+                synced = await memory.append_experiences(candidates)
+                experiences = candidates
 
             written: list[str] = []
             skipped: list[str] = []
@@ -276,6 +271,13 @@ class MemoryWitnessCoordinator:
                 last_success_at=now,
                 last_error="",
             )
+            commit_offset = getattr(store, "commit_consumer_offset", None)
+            if callable(commit_offset):
+                await commit_offset(
+                    instance.instance_id,
+                    max_sequence,
+                    metadata={"witness_state_mirror": True},
+                )
             self._service.consciousness_registry.touch(
                 instance.instance_id,
                 timestamp=now,
@@ -329,7 +331,8 @@ class MemoryWitnessCoordinator:
     def _to_experience(event: LifeEvent) -> ExperienceRecord:
         metadata = dict(event.metadata or {})
         return ExperienceRecord(
-            event_id=event.event_id,
+            event_id=event.occurrence_id or f"occ_position_{event.sequence}",
+            source_event_id=event.event_id,
             sequence=event.sequence,
             occurred_at=event.timestamp,
             recorded_at=_now_iso(),
@@ -389,8 +392,7 @@ class MemoryWitnessCoordinator:
         text = str(result or "").strip().replace("**", "").replace("```", "")
         if not text or _NO_WITNESS in text.lower():
             return ""
-        max_chars = max(80, int(getattr(cfg, "max_witness_chars", 800)))
-        return text[:max_chars].strip()
+        return text
 
     def _build_system_prompt(self, instance: ConsciousnessInstance) -> str:
         workspace = self._service._workspace_dir()
@@ -422,10 +424,9 @@ class MemoryWitnessCoordinator:
         lines = []
         for item in records:
             content = " ".join(str(item.content or "").split())
-            if len(content) > 700:
-                content = content[:699] + "…"
             lines.append(
-                f"[{item.occurred_at}] event_id={item.event_id} "
+                f"[{item.occurred_at}] occurrence_id={item.event_id} "
+                f"source_event_id={item.source_event_id or item.event_id} "
                 f"channel={item.channel} type={item.event_type} "
                 f"actor={item.actor or '-'}\n{content}"
             )

@@ -1,14 +1,11 @@
-"""SkillDistiller：将 validated 洞察蒸馏为技能模式。
+"""Distil validated experiences into traceable, subject-chosen skill patterns.
 
-慢环扩展，与 SelfKnowledgeCompressor 并行：
-- Compressor 处理 self_knowledge/emotional_pattern → self_knowledge.md（"我是谁"）
-- Distiller 处理 social_strategy/communication_style/behavioral_pattern → skills（"我怎么做"）
-
-设计原则：
-- 有界编辑（SkillOpt 纪律）：每次最多改 1-2 处
-- 内省门控（替代 benchmark score）："这真的更像我吗？"
-- 拒绝缓存：试过的弯路不重复
-- protected lessons：embodied + protected 的技能不被快更新覆盖
+The orchestration layer schedules work and persists decisions.  It never guesses
+which skill an insight belongs to from names, topics, keywords, or similarity.
+The integration model sees every current skill and explicitly selects an exact
+``skill_id`` or decides that a genuinely new skill is needed.  A separate gate
+reviews both new and edited skills; unavailable or malformed review never means
+approval.
 """
 
 from __future__ import annotations
@@ -38,14 +35,12 @@ from .store import InsightStore
 
 logger = logging.getLogger("life_engine.learning.skill_distiller")
 
-# 默认参数
-_DEFAULT_TRIGGER_COUNT = 3       # 触发蒸馏的 validated 技能类洞察数
-_DEFAULT_INTERVAL_HOURS = 24.0   # 蒸馏最小间隔
-_DEFAULT_MAX_EDITS = 2           # 每次最多编辑数
+_DEFAULT_TRIGGER_COUNT = 3
+_DEFAULT_INTERVAL_HOURS = 24.0
 
 
 class SkillDistiller:
-    """将 validated 洞察蒸馏为技能模式（程序性记忆）。"""
+    """Turn validated insights into procedural memory without code-side judgment."""
 
     def __init__(
         self,
@@ -57,7 +52,7 @@ class SkillDistiller:
         timeout_seconds: float = 90.0,
         trigger_count: int = _DEFAULT_TRIGGER_COUNT,
         interval_hours: float = _DEFAULT_INTERVAL_HOURS,
-        max_edits: int = _DEFAULT_MAX_EDITS,
+        max_edits: int | None = None,
     ) -> None:
         self._store = store
         self._skill_store = skill_store
@@ -66,16 +61,16 @@ class SkillDistiller:
         self._timeout = max(30.0, float(timeout_seconds or 90.0))
         self._trigger_count = max(1, int(trigger_count or _DEFAULT_TRIGGER_COUNT))
         self._interval_hours = max(6.0, float(interval_hours or _DEFAULT_INTERVAL_HOURS))
-        self._max_edits = max(1, int(max_edits or _DEFAULT_MAX_EDITS))
+        # Retained only so old callers/configuration continue to load.  The model
+        # decides the coherent scope of an edit; orchestration does not cap it.
+        del max_edits
         self._lock = asyncio.Lock()
 
     def should_distill(self) -> bool:
-        """判断是否应该触发蒸馏。"""
         distillable = self._collect_distillable_insights()
         if len(distillable) >= self._trigger_count:
             return True
 
-        # 检查时间间隔
         state = self._store.load_state()
         last_distill = state.get("last_skill_distill_at", "")
         if not last_distill and distillable:
@@ -92,158 +87,95 @@ class SkillDistiller:
         return False
 
     async def run_distillation(self) -> bool:
-        """执行一次蒸馏周期。返回是否成功产出/更新技能。"""
         async with self._lock:
             distillable = self._collect_distillable_insights()
             if not distillable:
-                logger.debug("无可蒸馏的程序性记忆类 validated 洞察")
+                logger.debug("No validated insights are waiting for skill distillation")
                 return False
 
-            logger.info(f"🔧 开始技能蒸馏: {len(distillable)} 条 validated 洞察")
-
-            # 按 topic 分组，找是否已有相关 skill
-            topic = distillable[0].topic_key or ""
-            existing_skill = self._find_matching_skill(topic, distillable)
-
-            # 调用 LLM 蒸馏
+            current_skills = self._skill_store.list_skills()
             result = await self._distill(
                 validated_insights=distillable,
-                existing_skill=existing_skill,
+                existing_skills=current_skills,
             )
             if result is None:
-                logger.info("蒸馏未产出结果")
+                logger.info("Skill distillation produced no valid proposal")
                 return False
 
-            # 内省门控
-            if existing_skill:
-                old_content = f"{existing_skill.description}\n{existing_skill.instructions}"
-                new_content = f"{result.get('description', '')}\n{result.get('instructions', '')}"
-                promote = await self._introspective_gate(
-                    old_content=old_content,
-                    new_content=new_content,
-                    insight_count=len(distillable),
+            target_skill_id = result["target_skill_id"]
+            existing_skill = (
+                self._skill_store.get_skill(target_skill_id)
+                if target_skill_id
+                else None
+            )
+            if target_skill_id and existing_skill is None:
+                logger.warning(
+                    "Skill proposal named an unknown target_skill_id; proposal retained "
+                    "only in logs and insights remain pending: %s",
+                    target_skill_id,
                 )
-            else:
-                # 新技能：首次创建默认接受（bootstrap）
-                promote = True
+                return False
 
+            if existing_skill is None and not result["name"]:
+                logger.warning(
+                    "New skill proposal has no subject-chosen name; insights remain pending"
+                )
+                return False
+
+            old_content = self._skill_content(existing_skill)
+            new_content = self._proposal_content(result)
+            promote = await self._introspective_gate(
+                old_content=old_content,
+                new_content=new_content,
+                insight_count=len(distillable),
+            )
             if not promote:
-                # 记录到拒绝缓存
-                if existing_skill:
+                if existing_skill is not None:
                     self._skill_store.append_rejected_edit(
                         existing_skill.skill_id,
-                        edit_summary=result.get("description", "")[:100],
+                        edit_summary=json.dumps(result, ensure_ascii=False),
                         reason="introspective_gate_rejected",
                     )
-                logger.info("⏸️ 技能蒸馏未通过内省门控")
+                logger.info("Skill proposal was not accepted by introspective review")
                 return False
 
-            # 应用结果
-            if existing_skill:
-                existing_skill.description = result.get("description", existing_skill.description)
-                existing_skill.instructions = result.get("instructions", existing_skill.instructions)
-                existing_skill.last_refined_at = _now_iso()
-                # 追加 origin
-                for ins in distillable:
-                    if ins.insight_id not in existing_skill.origin_insight_ids:
-                        existing_skill.origin_insight_ids.append(ins.insight_id)
-                self._skill_store.update_skill(existing_skill)
-                logger.info(f"✅ 技能精炼: {existing_skill.name}")
-            else:
-                name = result.get("name", "") or self._derive_name(topic)
-                new_skill = SkillPattern.create(
-                    name=name,
-                    description=result.get("description", ""),
-                    instructions=result.get("instructions", ""),
-                    maturity=SkillMaturity.EMERGING,
-                    origin_insight_ids=[ins.insight_id for ins in distillable],
-                )
-                self._skill_store.add_skill(new_skill)
-                logger.info(f"✅ 新技能诞生: {new_skill.name}")
+            persisted = self._apply_proposal(
+                result=result,
+                existing_skill=existing_skill,
+                insights=distillable,
+            )
+            if not persisted:
+                logger.warning("Accepted skill proposal could not be persisted")
+                return False
 
-            # 标记已蒸馏的洞察
-            for ins in distillable:
-                ins.next_action = InsightNextAction.ARCHIVE.value
-                self._store.update_insight(ins)
+            for insight in distillable:
+                insight.next_action = InsightNextAction.ARCHIVE.value
+                self._store.update_insight(insight)
 
-            # 更新状态
             state = self._store.load_state()
             state["last_skill_distill_at"] = _now_iso()
             self._store.save_state(state)
-
             return True
 
-    # ── 内部方法 ─────────────────────────────────────────────
-
     def _collect_distillable_insights(self) -> list[Insight]:
-        """收集所有 validated 且待蒸馏的洞察。"""
         validated = self._store.list_by_status(InsightStatus.VALIDATED)
         return [
-            ins for ins in validated
-            if ins.next_action != InsightNextAction.ARCHIVE.value
+            insight
+            for insight in validated
+            if insight.next_action != InsightNextAction.ARCHIVE.value
         ]
-
-    def _find_matching_skill(
-        self, topic: str, insights: list[Insight]
-    ) -> SkillPattern | None:
-        """查找与洞察主题匹配的已有技能。"""
-        if not topic:
-            return None
-        skills = self._skill_store.list_skills()
-        topic_lower = topic.lower().strip()
-        for s in skills:
-            # 匹配 name 或 description 中包含 topic
-            if topic_lower in s.name.lower() or topic_lower in s.description.lower():
-                return s
-        return None
-
-    def _derive_name(self, topic: str) -> str:
-        """从 topic 派生 kebab-case 名称。"""
-        import re
-        name = topic.strip().lower()
-        name = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "-", name)
-        name = re.sub(r"-{2,}", "-", name).strip("-")
-        return name[:40] or "new-skill"
 
     async def _distill(
         self,
         *,
         validated_insights: list[Insight],
-        existing_skill: SkillPattern | None,
+        existing_skills: list[SkillPattern],
     ) -> dict[str, str] | None:
-        """调用 LLM 执行蒸馏/精炼。"""
-        system_prompt = SKILL_DISTILL_SYSTEM.format(max_edits=self._max_edits)
-
-        # 构建 current_skill 文本
-        if existing_skill:
-            current_skill = (
-                f"name: {existing_skill.name}\n"
-                f"description: {existing_skill.description}\n"
-                f"instructions: {existing_skill.instructions}"
-            )
-            action_hint = "对这个已有技能做有界精炼"
-            rejected_text = "\n".join(
-                f"- {r.get('summary', '')} ({r.get('reason', '')})"
-                for r in existing_skill.rejected_edits[-5:]
-            ) or "（暂无）"
-            observations_text = "\n".join(
-                existing_skill.use_observations[-5:]
-            ) or "（暂无）"
-        else:
-            current_skill = "（这是一个新技能，还没有记录。）"
-            action_hint = "蒸馏出一条新技能"
-            rejected_text = "（暂无）"
-            observations_text = "（暂无）"
-
         user_prompt = SKILL_DISTILL_USER.format(
             validated_insights=format_insights_for_compression(
-                [ins.to_dict() for ins in validated_insights]
+                [insight.to_dict() for insight in validated_insights]
             ),
-            current_skill=current_skill,
-            rejected_edits=rejected_text,
-            use_observations=observations_text,
-            action_hint=action_hint,
-            max_edits=self._max_edits,
+            existing_skills=self._format_existing_skills(existing_skills),
         )
 
         try:
@@ -251,7 +183,7 @@ class SkillDistiller:
                 get_model_set_by_task(self._model_task_name),
                 request_name="life_skill_distill",
             )
-            request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
+            request.add_payload(LLMPayload(ROLE.SYSTEM, Text(SKILL_DISTILL_SYSTEM)))
             request.add_payload(LLMPayload(ROLE.USER, Text(user_prompt)))
 
             response = await asyncio.wait_for(
@@ -261,7 +193,7 @@ class SkillDistiller:
             raw_text = await asyncio.wait_for(response, timeout=self._timeout)
             return self._parse_distill_result(str(raw_text or ""))
         except Exception as exc:
-            logger.warning(f"技能蒸馏 LLM 调用失败: {exc}")
+            logger.warning("Skill distillation request failed: %s", exc)
             return None
 
     async def _introspective_gate(
@@ -271,10 +203,9 @@ class SkillDistiller:
         new_content: str,
         insight_count: int,
     ) -> bool:
-        """内省验证门控：这真的更像我吗？"""
         user_prompt = SKILL_GATE_USER.format(
-            old_content=old_content[:2000],
-            new_content=new_content[:2000],
+            old_content=old_content,
+            new_content=new_content,
             insight_count=insight_count,
         )
 
@@ -293,11 +224,58 @@ class SkillDistiller:
             raw_text = await asyncio.wait_for(response, timeout=self._timeout)
             return self._parse_gate_result(str(raw_text or ""))
         except Exception as exc:
-            logger.warning(f"内省门控调用失败，默认接受: {exc}")
-            return True  # 门控失败时不阻塞（与 knowledge.py 的保守策略不同：技能更轻量）
+            logger.warning("Introspective skill gate failed; proposal not accepted: %s", exc)
+            return False
 
-    def _parse_distill_result(self, raw_text: str) -> dict[str, str] | None:
-        """解析蒸馏 LLM 返回的 JSON。"""
+    def _apply_proposal(
+        self,
+        *,
+        result: dict[str, str],
+        existing_skill: SkillPattern | None,
+        insights: list[Insight],
+    ) -> bool:
+        insight_ids = [insight.insight_id for insight in insights]
+        if existing_skill is not None:
+            existing_skill.name = result["name"] or existing_skill.name
+            existing_skill.description = result["description"]
+            existing_skill.instructions = result["instructions"]
+            existing_skill.last_refined_at = _now_iso()
+            for insight_id in insight_ids:
+                if insight_id not in existing_skill.origin_insight_ids:
+                    existing_skill.origin_insight_ids.append(insight_id)
+            return self._skill_store.update_skill(existing_skill)
+
+        new_skill = SkillPattern.create(
+            name=result["name"],
+            description=result["description"],
+            instructions=result["instructions"],
+            maturity=SkillMaturity.EMERGING,
+            origin_insight_ids=insight_ids,
+        )
+        return self._skill_store.add_skill(new_skill)
+
+    @staticmethod
+    def _format_existing_skills(skills: list[SkillPattern]) -> str:
+        if not skills:
+            return "（暂无已有技能）"
+        return json.dumps(
+            [skill.to_dict() for skill in skills],
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    @staticmethod
+    def _skill_content(skill: SkillPattern | None) -> str:
+        if skill is None:
+            return "（尚无对应技能）"
+        return json.dumps(skill.to_dict(), ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def _proposal_content(result: dict[str, str]) -> str:
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def _parse_distill_result(raw_text: str) -> dict[str, str] | None:
         parsed: Any
         try:
             parsed = json.loads(raw_text)
@@ -306,17 +284,19 @@ class SkillDistiller:
 
         if not isinstance(parsed, dict):
             return None
-        # 至少需要 description
-        if not parsed.get("description"):
+        description = str(parsed.get("description", "") or "").strip()
+        instructions = str(parsed.get("instructions", "") or "").strip()
+        if not description or not instructions:
             return None
         return {
-            "name": str(parsed.get("name", "") or ""),
-            "description": str(parsed.get("description", "") or ""),
-            "instructions": str(parsed.get("instructions", "") or ""),
+            "target_skill_id": str(parsed.get("target_skill_id", "") or "").strip(),
+            "name": str(parsed.get("name", "") or "").strip(),
+            "description": description,
+            "instructions": instructions,
         }
 
-    def _parse_gate_result(self, raw_text: str) -> bool:
-        """解析内省门控结果。"""
+    @staticmethod
+    def _parse_gate_result(raw_text: str) -> bool:
         parsed: Any
         try:
             parsed = json.loads(raw_text)
@@ -324,8 +304,8 @@ class SkillDistiller:
             parsed = json_repair.repair_json(raw_text, return_objects=True)
 
         if not isinstance(parsed, dict):
-            return True  # 解析失败默认接受
-        return bool(parsed.get("promote", False))
+            return False
+        return parsed.get("promote") is True
 
 
 def _now_iso() -> str:

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,15 +45,6 @@ if TYPE_CHECKING:
 logger = log_api.get_logger("life_engine.tools")
 
 _MEMORY_READ_MAX_BYTES = DEFAULT_MAX_DOCUMENT_BYTES
-
-# 自动演化链推断：检索源文件时取多少候选
-_LINEAGE_SOURCE_TOP_K = 3
-# 候选分数至少要达到最高分的多少比例才算"足够突出"
-_LINEAGE_SOURCE_SCORE_RATIO = 0.85
-# 用于检索源文件的查询文本最长多少字符
-_LINEAGE_QUERY_MAX_CHARS = 300
-# 用于检索源文件的查询最多取多少行有信息量的内容
-_LINEAGE_QUERY_MAX_LINES = 4
 
 
 def _get_workspace_read_only(plugin: Any) -> Path:
@@ -88,277 +80,71 @@ def _get_life_engine_service(plugin: Any):
     return LifeEngineService.get_instance()
 
 
-async def _auto_create_lineage_edge(
+async def _record_memory_artifact_version(
     plugin: Any,
     *,
     path: str,
     before_content: str | None,
-    after_content: str | None,
-    reason: str,
+    after_content: str,
     operation: str,
-) -> None:
-    """完美架构：自动检测写入/编辑意图并建立演化链。
-
-    这是文件操作与记忆演化的深度集成点。
-    根据操作类型、reason 关键词、内容相似度等，自动判断演化关系。
-    """
-    try:
-        from ..memory.edges import EdgeType
-
-        service = _get_life_engine_service(plugin)
-        if service is None:
-            return
-
-        memory_service = getattr(service, "_memory_service", None)
-        if memory_service is None:
-            return
-
-        # 检测演化意图
-        edge_type, auto_reason = _detect_evolution_intent(
-            reason=reason,
-            operation=operation,
-            before_content=before_content,
-            after_content=after_content,
-        )
-
-        if edge_type is None:
-            return
-
-        logger.info(
-            f"🔗 检测到演化意图: {path} [{edge_type.value}] - {auto_reason}"
-        )
-
-        # 完善实现：从 reason 中提取源文件路径
-        source_path = _extract_source_path_from_reason(reason, path)
-        explicit_source = source_path is not None
-
-        if source_path is None:
-            # 没有明确源文件时，用"本次新增的内容"去检索它延续/精炼的是谁。
-            # 注意：write 与 edit 都要走这条路——新建文件时 before_content 为空，
-            # 恰恰是"整理旧笔记为新笔记"最常见的形态。
-            query_material = _extract_new_material(before_content, after_content)
-            if query_material:
-                source_path = await _find_similar_source_file(
-                    memory_service,
-                    target_path=path,
-                    target_content=query_material,
-                    edge_type=edge_type,
-                )
-
-        if source_path and source_path != path:
-            # 建立真正的跨文件演化链
-            try:
-                await memory_service.create_memory_lineage_edge(
-                    source_path=source_path,
-                    target_path=path,
-                    relation_type=edge_type,
-                    reason=auto_reason,
-                    # 推断出来的源文件不如她自己写明的可靠，强度给低一档
-                    strength=0.8 if explicit_source else 0.55,
-                )
-                logger.info(
-                    f"✅ 自动建立演化链: {source_path} → {path} [{edge_type.value}]"
-                )
-            except Exception as exc:
-                logger.warning(f"建立演化链失败: {exc}")
-        else:
-            # 没有找到源文件，只记录演化意图
-            logger.debug(
-                f"演化意图已检测但未找到源文件: {path} - {edge_type.value}"
-            )
-
-    except Exception as exc:
-        logger.debug(f"自动建立演化链失败（非关键路径）: {exc}")
-
-
-def _extract_source_path_from_reason(reason: str, target_path: str) -> str | None:
-    """从 reason 中提取源文件路径。
-
-    例如：
-    - "整理 drafts/initial.md 为正式笔记" → "drafts/initial.md"
-    - "基于 notes/old.md 的修正版本" → "notes/old.md"
-    """
-    if not reason:
-        return None
-
-    import re
-
-    # 匹配常见的文件路径模式
-    patterns = [
-        r'(?:整理|基于|根据|从|修正|延续|重命名)\s+([a-zA-Z0-9_/.-]+\.(?:md|txt))',
-        r'([a-zA-Z0-9_/.-]+\.(?:md|txt))\s+(?:的|为|到)',
-        r'`([a-zA-Z0-9_/.-]+\.(?:md|txt))`',
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, reason)
-        if match:
-            source = match.group(1)
-            # 确保不是目标文件本身
-            if source != target_path and source.strip():
-                return source.strip()
-
-    return None
-
-
-def _extract_new_material(before_content: str | None, after_content: str | None) -> str:
-    """取出这次操作真正"新增"的内容，作为检索源文件的查询material。
-
-    为什么不用整份文件：编辑一份已存在的笔记时，用全文去检索必然把自己捞回来，
-    真正表达"我在延续什么"的只有新增的那几行。新建文件时没有 before，
-    全文本身就是新增内容。
-    """
-    after = (after_content or "").strip()
-    if not after:
-        return ""
-
-    before = (before_content or "").strip()
-    if not before:
-        return after
-
-    old_lines = {line.strip() for line in before.splitlines() if line.strip()}
-    added = [
-        line.strip()
-        for line in after.splitlines()
-        if line.strip() and line.strip() not in old_lines
-    ]
-    if added:
-        return "\n".join(added)
-    # 内容没有新增行（例如只调整了顺序/措辞），退回全文
-    return after
-
-
-def _build_lineage_query(material: str) -> str:
-    """把内容压成一条检索查询：取有信息量的前几行，并限长。"""
-    lines = [
-        line.strip().lstrip("#-*> ").strip()
-        for line in (material or "").splitlines()
-    ]
-    meaningful = [line for line in lines if len(line) >= 8]
-    if not meaningful:
-        # 全是短行时退让一步，避免直接放弃
-        meaningful = [line for line in lines if line]
-    if not meaningful:
-        return ""
-    return " ".join(meaningful[:_LINEAGE_QUERY_MAX_LINES])[:_LINEAGE_QUERY_MAX_CHARS]
-
-
-async def _find_similar_source_file(
-    memory_service: Any,
-    target_path: str,
-    target_content: str,
-    edge_type: Any,
-) -> str | None:
-    """基于内容相似度查找可能的源文件。
-
-    用于当 reason 中没有明确源文件时的智能推断。
-    """
-    try:
-        # 简化实现：只在特定演化类型下查找
-        if edge_type.value not in ["refines", "corrects", "continues"]:
-            return None
-
-        query = _build_lineage_query(target_content)
-        if not query:
-            return None
-
-        # 检索相似文件（降级模式，不返回 bundle）
-        results = await memory_service.search_memory(
-            query=query,
-            top_k=_LINEAGE_SOURCE_TOP_K,
-            enable_association=False,
-            return_bundles=False,  # 使用简单模式避免递归
-        )
-
-        if not results:
-            return None
-
-        # relevance 是 RRF 融合分（量级约 1/(60+rank)，最大 ~0.033），
-        # 不能用绝对阈值判断。这里用"相对最高分"来判断候选是否足够突出。
-        top_score = max(float(getattr(r, "relevance", 0.0) or 0.0) for r in results)
-        if top_score <= 0.0:
-            return None
-
-        for result in results:
-            candidate = str(getattr(result, "file_path", "") or "").strip()
-            if not candidate or candidate == target_path:
-                continue
-            # 只接受直接命中，联想扩散来的文件不足以作为演化源
-            if str(getattr(result, "source", "") or "") != "direct":
-                continue
-            score = float(getattr(result, "relevance", 0.0) or 0.0)
-            if score < top_score * _LINEAGE_SOURCE_SCORE_RATIO:
-                continue
-            return candidate
-
-        return None
-
-    except Exception as exc:
-        logger.debug(f"查找相似源文件失败: {exc}")
-        return None
-
-
-def _detect_evolution_intent(
-    *,
     reason: str,
-    operation: str,
-    before_content: str | None,
-    after_content: str | None,
-) -> tuple[Any | None, str]:
-    """检测文件演化意图。
+    trace_id: str,
+    source_event_id: str,
+    stream_id: str,
+) -> str:
+    """Persist immutable before/after versions for a memory document."""
 
-    Returns:
-        (EdgeType, reason) 或 (None, "") 如果无法检测
-    """
-    from ..memory.edges import EdgeType
-
-    reason_lower = reason.lower() if reason else ""
-
-    # 检测关键词
-    if any(kw in reason_lower for kw in ["整理", "精炼", "refine", "organize", "总结"]):
-        return EdgeType.REFINES, "整理并精炼之前的内容"
-
-    if any(kw in reason_lower for kw in ["修正", "纠正", "correct", "fix", "错误"]):
-        return EdgeType.CORRECTS, "修正之前的理解错误"
-
-    if any(kw in reason_lower for kw in ["重命名", "rename", "move", "迁移"]):
-        return EdgeType.RENAMES, "重命名或迁移文件"
-
-    if any(kw in reason_lower for kw in ["延续", "继续", "continue", "补充"]):
-        return EdgeType.CONTINUES, "延续之前的思考"
-
-    if any(kw in reason_lower for kw in ["重新理解", "重新解释", "reinterpret"]):
-        return EdgeType.REINTERPRETS, "从新的角度重新理解"
-
-    # 如果没有明确关键词，但是编辑操作且内容相似度高，判断为延续
-    if operation == "edit" and before_content and after_content:
-        # 简化版相似度：检查是否大部分内容保留
-        if len(after_content) > len(before_content) * 0.7:
-            common_ratio = _simple_content_overlap(before_content, after_content)
-            if common_ratio > 0.7:
-                return EdgeType.CONTINUES, "延续并扩展之前的内容"
-
-    return None, ""
-
-
-def _simple_content_overlap(text1: str, text2: str) -> float:
-    """简单的内容重叠度计算。
-
-    Returns:
-        0.0-1.0 的重叠比例
-    """
-    if not text1 or not text2:
-        return 0.0
-
-    # 简化：按行分割，计算公共行比例
-    lines1 = set(line.strip() for line in text1.split("\n") if line.strip())
-    lines2 = set(line.strip() for line in text2.split("\n") if line.strip())
-
-    if not lines1:
-        return 0.0
-
-    common_lines = lines1.intersection(lines2)
-    return len(common_lines) / len(lines1)
+    eligibility = assess_document_path(path)
+    if not eligibility.eligible:
+        return ""
+    service = _get_life_engine_service(plugin)
+    memory_service = getattr(service, "_memory_service", None) if service else None
+    if memory_service is None:
+        return ""
+    logical_key = eligibility.path
+    history = await memory_service.get_memory_artifact_history(logical_key)
+    if before_content is not None and not history:
+        await memory_service.version_memory_artifact(
+            logical_key=logical_key,
+            artifact_kind="workspace_memory_document",
+            content=before_content,
+            authored_by="life_engine",
+            stream_scope=stream_id,
+            predicate="captured_before_change",
+            reason="首次接入版本账本时保存修改前内容",
+            metadata={
+                "captured_before_change": True,
+                "source_event_id": source_event_id,
+                "trace_id": trace_id,
+            },
+        )
+    before_lines = (before_content or "").splitlines(keepends=True)
+    after_lines = after_content.splitlines(keepends=True)
+    diff = "".join(
+        difflib.unified_diff(
+            before_lines,
+            after_lines,
+            fromfile=f"{logical_key}@before",
+            tofile=f"{logical_key}@after",
+        )
+    )
+    version = await memory_service.version_memory_artifact(
+        logical_key=logical_key,
+        artifact_kind="workspace_memory_document",
+        content=after_content,
+        authored_by="life_engine",
+        stream_scope=stream_id,
+        predicate=f"file_{operation}",
+        reason=reason,
+        metadata={
+            "operation": operation,
+            "reason": reason,
+            "source_event_id": source_event_id,
+            "trace_id": trace_id,
+            "diff_from_parent": diff,
+        },
+    )
+    return version.artifact_id
 
 
 async def _get_file_lineage_info(
@@ -1064,6 +850,7 @@ class LifeEngineWriteFileTool(BaseTool):
             target.parent.mkdir(parents=True, exist_ok=True)
             await asyncio.to_thread(target.write_text, content, encoding=encoding)
             stat = target.stat()
+            trace_context = _tool_trace_context(self)
             trace_id = _record_file_trace(
                 self.plugin,
                 path=path,
@@ -1072,21 +859,22 @@ class LifeEngineWriteFileTool(BaseTool):
                 operation="write",
                 tool_name=self.tool_name,
                 reason=reason,
-                **_tool_trace_context(self),
+                **trace_context,
             )
 
-            # 同步 SQLite/FTS/outbox 文档索引
-            await _sync_memory_embedding_for_file(self.plugin, path, content)
-
-            # 完美架构：自动检测并建立演化链
-            await _auto_create_lineage_edge(
+            artifact_id = await _record_memory_artifact_version(
                 self.plugin,
                 path=path,
                 before_content=before_content,
                 after_content=content,
-                reason=reason,
                 operation="write",
+                reason=reason,
+                trace_id=trace_id,
+                **trace_context,
             )
+
+            # 同步 SQLite/FTS/outbox 文档索引
+            await _sync_memory_embedding_for_file(self.plugin, path, content)
 
             return True, {
                 "action": "write_file",
@@ -1094,6 +882,7 @@ class LifeEngineWriteFileTool(BaseTool):
                 "size_human": _format_size(stat.st_size),
                 "created": not existed,
                 "trace_id": trace_id,
+                "artifact_version_id": artifact_id,
                 **(
                     {"warning": warning}
                     if (warning := build_memory_write_warning(path, content)) is not None
@@ -1178,6 +967,7 @@ class LifeEngineEditFileTool(BaseTool):
                 replacements = 1
 
             await asyncio.to_thread(target.write_text, new_content, encoding=encoding)
+            trace_context = _tool_trace_context(self)
             trace_id = _record_file_trace(
                 self.plugin,
                 path=path,
@@ -1186,27 +976,29 @@ class LifeEngineEditFileTool(BaseTool):
                 operation="edit",
                 tool_name=self.tool_name,
                 reason=reason,
-                **_tool_trace_context(self),
+                **trace_context,
             )
 
-            # 同步 SQLite/FTS/outbox 文档索引
-            await _sync_memory_embedding_for_file(self.plugin, path, new_content)
-
-            # 完美架构：自动检测并建立演化链
-            await _auto_create_lineage_edge(
+            artifact_id = await _record_memory_artifact_version(
                 self.plugin,
                 path=path,
                 before_content=content,
                 after_content=new_content,
-                reason=reason,
                 operation="edit",
+                reason=reason,
+                trace_id=trace_id,
+                **trace_context,
             )
+
+            # 同步 SQLite/FTS/outbox 文档索引
+            await _sync_memory_embedding_for_file(self.plugin, path, new_content)
 
             return True, {
                 "action": "edit_file",
                 "path": path,
                 "replacements": replacements,
                 "trace_id": trace_id,
+                "artifact_version_id": artifact_id,
             }
         except UnicodeDecodeError as e:
             return False, f"文件编码错误: {e}"
@@ -1450,7 +1242,7 @@ class LifeEngineRunAgentTool(BaseTool):
                 )
                 return True, {
                     "action": "run_agent_background",
-                    "task": task[:200],
+                    "task": task,
                     "agent_id": agent_id,
                     "agent_type": subagent_type,
                     "status": "running",
@@ -1468,7 +1260,7 @@ class LifeEngineRunAgentTool(BaseTool):
             if result.success:
                 return True, {
                     "action": "run_agent",
-                    "task": task[:200],
+                    "task": task,
                     "result": result.result_text,
                     "rounds": result.rounds_used,
                     "agent_type": subagent_type,
@@ -1512,8 +1304,8 @@ class FetchLifeMemoryTool(BaseTool):
         "\n"
         "**注意事项：**\n"
         "- 此工具会消耗较多上下文 token，请谨慎使用\n"
-        "- 对于大文件（>5000字符），会自动截断并提示\n"
-        "- 建议一次最多读取 3-5 个文件，避免上下文爆炸\n"
+        "- 返回经过安全大小校验的完整文档，不会静默截断记忆\n"
+        "- 如需控制上下文，应先缩小 file_paths，而不是切断文档内容\n"
         "- 文件路径必须是 life_memory_search 返回的路径"
     )
     chatter_allow: list[str] = ["life_engine_internal"]
@@ -1521,15 +1313,12 @@ class FetchLifeMemoryTool(BaseTool):
     async def execute(
         self,
         file_paths: Annotated[list[str], "要读取的文件路径列表（来自 life_memory_search 的结果）"],
-        max_length_per_file: Annotated[int, "每个文件的最大字符数，0=不限制，超过则截断"] = 5000,
+        max_length_per_file: Annotated[int, "兼容参数；记忆文档不再按字符数截断"] = 0,
         include_metadata: Annotated[bool, "是否包含文件元数据（大小、修改时间等）"] = True,
     ) -> tuple[bool, dict]:
         """批量读取记忆文件的完整内容。"""
         if not file_paths:
             return False, {"error": "file_paths 不能为空"}
-
-        if len(file_paths) > 10:
-            return False, {"error": "单次最多读取 10 个文件"}
 
         files_data: list[dict] = []
         successful = 0
@@ -1616,15 +1405,11 @@ class FetchLifeMemoryTool(BaseTool):
                 failed += 1
                 continue
 
-            truncated = max_length_per_file > 0 and len(content) > max_length_per_file
-            if truncated:
-                content = content[:max_length_per_file] + "\n\n... (内容过长，已截断)"
-
             file_data: dict[str, Any] = {
                 "path": file_path_str,
                 "title": Path(file_path_str).stem,
                 "content": content,
-                "truncated": truncated,
+                "truncated": False,
             }
             if requested_path_str != file_path_str:
                 file_data["requested_path"] = requested_path_str
