@@ -38,6 +38,9 @@ class TTSVoicePlugin(BasePlugin):
 
     async def on_plugin_loaded(self) -> None:
         """插件加载后回调，初始化 TTS 服务。"""
+        if isinstance(self.config, TTSVoiceConfig) and not self.config.plugin.enable:
+            logger.info("TTSVoicePlugin 已在本机配置中停用，跳过服务初始化")
+            return
         logger.info("初始化 TTSVoicePlugin...")
         self.tts_service = TTSService(self)
         logger.info("TTSService 已成功初始化。")
@@ -66,10 +69,12 @@ class TTSVoicePlugin(BasePlugin):
         Returns:
             组件类列表
         """
-        components: list[type] = [TTSService]
-
         cfg: TTSVoiceConfig | None = self.config  # type: ignore[assignment]
+        if cfg is not None and not cfg.plugin.enable:
+            logger.info("TTSVoicePlugin 已在本机配置中停用，不注册组件")
+            return []
 
+        components: list[type] = [TTSService]
         action_enabled = True
         command_enabled = True
         if cfg is not None:

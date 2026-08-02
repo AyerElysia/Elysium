@@ -82,6 +82,8 @@ _RECENT_SENT_CACHE_LOCK = threading.Lock()
 # ── 控制流常量 ────────────────────────────────────────────────
 _PASS_AND_WAIT = "action-life_pass_and_wait"
 _SEND_TEXT = "action-life_send_text"
+_SEND_IMAGE = "action-life_send_image"
+_SEND_VOICE = "action-life_send_voice"
 _SEND_FILE = "action-life_send_file"
 _SEND_EMOJI_MEME = "action-send_emoji_meme"
 _SUSPEND_TEXT = "__SUSPEND__"
@@ -620,6 +622,164 @@ class LifeSendTextAction(BaseAction):
         return True, f"已发送{sent_count}条消息{target_desc}: {preview}"
 
 
+class _LifeSendMediaAction(BaseAction):
+    """发送本地媒体文件的公共实现。"""
+
+    media_type: MessageType
+    media_label: str
+    allowed_suffixes: frozenset[str]
+    max_file_bytes: int
+
+    @classmethod
+    def _resolve_media_file(cls, raw_path: str) -> tuple[Path | None, str]:
+        path_text = str(raw_path or "").strip()
+        if not path_text:
+            return None, f"{cls.media_label}路径为空"
+        if any(char in path_text for char in "*?[]"):
+            return None, f"{cls.media_label}路径不能包含通配符"
+        if not (path_text.startswith("~") or Path(path_text).is_absolute()):
+            return None, f"{cls.media_label}路径必须是绝对路径，或以 ~ 开头"
+        try:
+            resolved = Path(path_text).expanduser().resolve()
+        except Exception as exc:  # noqa: BLE001
+            return None, f"{cls.media_label}路径无效: {exc}"
+        if not resolved.exists() or not resolved.is_file():
+            return None, f"{cls.media_label}文件不存在: {resolved}"
+        if not os.access(resolved, os.R_OK):
+            return None, f"{cls.media_label}文件不可读: {resolved}"
+        suffix = resolved.suffix.lower()
+        if suffix not in cls.allowed_suffixes:
+            allowed = ", ".join(sorted(cls.allowed_suffixes))
+            return None, f"不支持的{cls.media_label}格式 {suffix or '<无扩展名>'}；支持: {allowed}"
+        try:
+            size = resolved.stat().st_size
+        except OSError as exc:
+            return None, f"读取{cls.media_label}文件信息失败: {exc}"
+        if size <= 0:
+            return None, f"{cls.media_label}文件为空: {resolved}"
+        if size > cls.max_file_bytes:
+            return None, f"{cls.media_label}文件过大: {size} bytes；上限 {cls.max_file_bytes} bytes"
+        return resolved, ""
+
+    async def _send_path(self, path: str) -> tuple[bool, str]:
+        resolved, error = self._resolve_media_file(path)
+        if resolved is None:
+            return False, error
+        from src.app.plugin_system.api.send_api import send_image, send_voice
+
+        media_data = await asyncio.to_thread(resolved.read_bytes)
+        import base64
+
+        encoded = base64.b64encode(media_data).decode("ascii")
+        sender = send_image if self.media_type == MessageType.IMAGE else send_voice
+        success = await sender(
+            encoded,
+            self.chat_stream.stream_id,
+            platform=self.chat_stream.platform,
+            processed_plain_text=f"[{self.media_label}] {resolved.name}",
+        )
+        if not success:
+            return False, f"{self.media_label}发送失败: {resolved.name}"
+        return True, f"已发送{self.media_label}: {resolved.name}"
+
+
+class LifeSendImageAction(_LifeSendMediaAction):
+    """发送本地图片（life_chatter 专用）。"""
+
+    action_name = "life_send_image"
+    action_description = (
+        "发送一张本地图片给当前聊天。path 必须是绝对路径或以 ~ 开头，"
+        "且指向 png/jpg/jpeg/gif/webp/bmp 图片文件。"
+    )
+    chatter_allow: list[str] = ["life_chatter"]
+    media_type = MessageType.IMAGE
+    media_label = "图片"
+    allowed_suffixes = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"})
+    max_file_bytes = 20 * 1024 * 1024
+
+    async def execute(
+        self,
+        path: Annotated[str, "要发送的本地图片路径。必须是绝对路径，或以 ~ 开头。"],
+    ) -> tuple[bool, str]:
+        return await self._send_path(path)
+
+
+class LifeSendVoiceAction(_LifeSendMediaAction):
+    """发送本地语音（life_chatter 专用）。"""
+
+    action_name = "life_send_voice"
+    action_description = (
+        "向当前聊天发送语音。已有音频文件时填写 path；需要把文字合成为语音时填写 text。"
+        "path 与 text 二选一。合成使用 model_tasks.tts 配置的模型，主体自行决定是否使用。"
+    )
+    chatter_allow: list[str] = ["life_chatter"]
+    media_type = MessageType.VOICE
+    media_label = "语音"
+    allowed_suffixes = frozenset({".wav", ".mp3", ".ogg", ".opus", ".m4a", ".aac", ".flac"})
+    max_file_bytes = 30 * 1024 * 1024
+
+    async def execute(
+        self,
+        path: Annotated[
+            str,
+            "已有本地语音路径；与 text 二选一。必须是绝对路径，或以 ~ 开头。",
+        ] = "",
+        text: Annotated[
+            str,
+            "需要由 TTS 合成并发送的口语文本；与 path 二选一。",
+        ] = "",
+        voice: Annotated[
+            str,
+            "MiMo 预置音色，默认 mimo_default；只有明确想选其他可用音色时再填写。",
+        ] = "mimo_default",
+        instructions: Annotated[
+            str,
+            "可选的自然语言声音表演指令，如温柔、轻声、语速稍慢；不需要时留空。",
+        ] = "",
+    ) -> tuple[bool, str]:
+        normalized_path = str(path or "").strip()
+        normalized_text = str(text or "").strip()
+        if bool(normalized_path) == bool(normalized_text):
+            return False, "path 与 text 必须且只能填写一个"
+        if normalized_path:
+            return await self._send_path(normalized_path)
+
+        try:
+            from src.app.plugin_system.api.llm_api import get_model_set_by_task
+            from src.app.plugin_system.api.send_api import send_voice
+            from src.kernel.llm.model_client.registry import get_default_model_client_registry
+
+            model_set = get_model_set_by_task("tts")
+            if not isinstance(model_set, list) or not model_set:
+                return False, "未配置 model_tasks.tts，无法合成语音"
+            model_entry = model_set[0]
+            client = get_default_model_client_registry().get_speech_client_for_model(model_entry)
+            audio_bytes = await client.create_speech(
+                model_name=str(model_entry.get("model_identifier") or ""),
+                text=normalized_text,
+                request_name="life_send_voice",
+                model_set=model_entry,
+                voice=str(voice or "mimo_default").strip() or "mimo_default",
+                instructions=str(instructions or "").strip(),
+                output_format="wav",
+            )
+            import base64
+
+            encoded = base64.b64encode(audio_bytes).decode("ascii")
+            success = await send_voice(
+                encoded,
+                self.chat_stream.stream_id,
+                platform=self.chat_stream.platform,
+                processed_plain_text=f"[语音:{normalized_text}]",
+            )
+            if not success:
+                return False, "语音已合成，但平台发送失败"
+            return True, f"已合成并发送语音: {normalized_text[:80]}"
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"MiMo TTS 合成或发送失败: {exc}", exc_info=True)
+            return False, f"语音合成或发送失败: {exc}"
+
+
 class LifeSendFileAction(BaseAction):
     """发送本地文件（life_chatter 专用）。"""
 
@@ -1155,7 +1315,46 @@ class LifeInspectMediaTool(BaseTool):
         )
 
 
-class LifeSaveMediaTool(BaseTool):
+class LifeRecognizeVoiceTool(LifeInspectMediaTool):
+    """按需识别当前会话中的语音。"""
+
+    tool_name = "recognize_voice"
+    tool_description = (
+        "识别用户发来的语音并返回文字摘要或转写。"
+        "target 可用 latest 选择最近语音，也可填写具体 message_id。"
+        "只有在你主动需要听懂该语音时调用，不会自动触发。"
+    )
+    chatter_allow: list[str] = ["life_chatter"]
+
+    async def execute(
+        self,
+        target: Annotated[
+            str,
+            "要识别的语音：latest 表示最近一条，也可以传具体 message_id。",
+        ] = "latest",
+    ) -> tuple[bool, str]:
+        selected = self._select_media(target, "audio")
+        if selected is None:
+            return False, "当前会话没有找到可识别的语音，或指定 message_id 不存在"
+        if not selected.data_for_native:
+            return False, "找到了语音记录，但原始音频数据已不在当前运行态"
+
+        from src.core.managers.media_manager import get_media_manager
+
+        summary = await get_media_manager().recognize_voice(
+            {
+                "base64": selected.data_for_native,
+                "mime_type": selected.mime_type,
+                "filename": str(getattr(selected.message, "message_id", "") or "voice"),
+            },
+            use_cache=True,
+        )
+        if not summary:
+            return False, "语音识别失败；请检查 voice 模型配置、协议兼容性和音频格式"
+        return True, summary
+
+
+class LifeSaveMediaTool(LifeInspectMediaTool):
     """把收到的图片/媒体存到 workspace，供后续处理或分析使用。"""
 
     tool_name = "nucleus_save_media"
@@ -1192,7 +1391,7 @@ class LifeSaveMediaTool(BaseTool):
         import time as _time
         from ..tools._utils import _get_workspace
 
-        selected = LifeInspectMediaTool._select_media(self, target, media_type)  # type: ignore[arg-type]
+        selected = self._select_media(target, media_type)
         if selected is None:
             return False, "当前会话没有找到可保存的媒体，或指定 message_id 不存在"
 
@@ -3518,6 +3717,8 @@ class LifeChatter(BaseChatter):
         normalized = str(call_name or "").strip().lower()
         return normalized in {
             _SEND_TEXT,
+            _SEND_IMAGE,
+            _SEND_VOICE,
             _SEND_FILE,
             _SEND_EMOJI_MEME,
             "action-draw_image",

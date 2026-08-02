@@ -154,6 +154,30 @@
     },
     {
       "component_type": "action",
+      "component_name": "life_send_image",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "action",
+      "component_name": "life_send_voice",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "tool",
+      "component_name": "recognize_voice",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "tool",
+      "component_name": "nucleus_save_media",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "action",
       "component_name": "life_pass_and_wait",
       "dependencies": [],
       "enabled": true

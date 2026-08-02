@@ -76,6 +76,22 @@ class RerankModelClient(Protocol):
         ...
 
 
+class SpeechModelClient(Protocol):
+    async def create_speech(
+        self,
+        *,
+        model_name: str,
+        text: str,
+        request_name: str,
+        model_set: Any,
+        voice: str = "mimo_default",
+        instructions: str = "",
+        output_format: str = "wav",
+    ) -> bytes:
+        """发起文本转语音请求并返回音频字节。"""
+        ...
+
+
 class ASRModelClient(Protocol):
     async def create_transcription(
         self,
@@ -84,6 +100,7 @@ class ASRModelClient(Protocol):
         audio_bytes: bytes,
         request_name: str,
         model_set: Any,
+        mime_type: str = "audio/wav",
     ) -> str:
         """发起语音转文字请求并返回识别结果。"""
         ...

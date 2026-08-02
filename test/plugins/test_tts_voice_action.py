@@ -8,6 +8,15 @@ import pytest
 
 from plugins.tts_voice_plugin.actions.tts_action import TTSVoiceAction
 from plugins.tts_voice_plugin.config import TTSVoiceConfig
+from plugins.tts_voice_plugin.plugin import TTSVoicePlugin
+
+
+def test_disabled_tts_voice_plugin_registers_no_components() -> None:
+    """plugin.enable=false 必须阻止旧 GPT-SoVITS 服务与 Action 注册。"""
+    cfg = TTSVoiceConfig()
+    cfg.plugin.enable = False
+
+    assert TTSVoicePlugin(config=cfg).get_components() == []
 
 
 def _build_action(*, always_available: bool, platform: str = "") -> TTSVoiceAction:

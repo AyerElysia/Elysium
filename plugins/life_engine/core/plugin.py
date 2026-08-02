@@ -108,13 +108,21 @@ class LifeEnginePlugin(BasePlugin):
             from .chatter import (
                 LifeChatter,
                 LifePassAndWaitAction,
+                LifeRecognizeVoiceTool,
+                LifeSaveMediaTool,
+                LifeSendImageAction,
                 LifeSendTextAction,
+                LifeSendVoiceAction,
             )
 
             components.extend([
                 LifeChatter,
                 LifeSendTextAction,
+                LifeSendImageAction,
+                LifeSendVoiceAction,
                 LifePassAndWaitAction,
+                LifeRecognizeVoiceTool,
+                LifeSaveMediaTool,
                 LifeThinkAction,
                 LifeRecordInnerMonologueAction,
                 LifeInnerDialogueTool,

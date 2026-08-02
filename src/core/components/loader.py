@@ -234,6 +234,7 @@ class PluginManifest:
 
     Attributes:
         name: 唯一的插件名称/标识符
+        enabled: 是否参与插件加载计划；False 时发现但不加载
         version: 插件版本字符串
         description: 人类可读的描述
         author: 插件作者名称
@@ -251,6 +252,7 @@ class PluginManifest:
     version: str
     description: str
     author: str
+    enabled: bool = True
     dependencies: dict[str, list[str]] = field(
         default_factory=lambda: {"plugins": [], "components": []}
     )
@@ -315,6 +317,7 @@ async def load_manifest(plugin_path: str) -> PluginManifest | None:
             version=manifest_data["version"],
             description=manifest_data.get("description", ""),
             author=manifest_data.get("author", ""),
+            enabled=bool(manifest_data.get("enabled", True)),
             dependencies=manifest_data.get("dependencies", {"plugins": [], "components": []})
             or {"plugins": [], "components": []},
             include=include_list,
@@ -456,6 +459,9 @@ class PluginLoader:
             manifest = await load_manifest(path)
             if not manifest:
                 self._failed_plugins[path] = "无法加载 manifest.json"
+                continue
+            if not manifest.enabled:
+                logger.info(f"插件已在 manifest.json 中停用，跳过加载: {manifest.name}")
                 continue
             manifests[manifest.name] = manifest
 

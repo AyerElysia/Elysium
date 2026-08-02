@@ -25,6 +25,8 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
     # 全局聊天意识：私聊、群聊、所有日常对话
     "chat": [
         "action-life_send_text",
+        "action-life_send_image",
+        "action-life_send_voice",
         "action-life_pass_and_wait",
         "action-think",
         "action-report_state",
@@ -32,6 +34,8 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
         "tool-inner_dialogue",
         "tool-inner_query",
         "tool-fetch_chat_history",
+        "tool-recognize_voice",
+        "tool-nucleus_save_media",
         "tool-nucleus_grep_events",
         "tool-nucleus_search_memory",
         "tool-nucleus_view_relations",

@@ -1646,3 +1646,86 @@ class TestOpenAIChatClient:
 
         await cast(Any, stream_iter).aclose()
         assert fake_stream.closed is True
+
+    async def test_mimo_asr_uses_chat_completions_input_audio(self):
+        """MiMo ASR 必须走 chat/completions，而不是不存在的 transcriptions 端点。"""
+        from src.kernel.llm.model_client.openai_client import OpenAIChatClient
+
+        completion = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="你好，世界"))]
+        )
+        sdk_client = MagicMock()
+        sdk_client.chat.completions.create = AsyncMock(return_value=completion)
+        sdk_client.audio.transcriptions.create = AsyncMock()
+        client = OpenAIChatClient()
+        client._get_client = MagicMock(return_value=sdk_client)
+        model_set = {
+            "api_key": "test-key",
+            "base_url": "https://example.test/v1",
+            "timeout": 30.0,
+            "extra_params": {
+                "asr_wire_profile": "mimo_chat_completions",
+                "asr_language": "auto",
+            },
+        }
+
+        text = await client.create_transcription(
+            model_name="mimo-v2.5-asr",
+            audio_bytes=_WAV_BYTES,
+            request_name="voice_recognition",
+            model_set=model_set,
+            mime_type="audio/wav",
+        )
+
+        assert text == "你好，世界"
+        sdk_client.audio.transcriptions.create.assert_not_awaited()
+        call = sdk_client.chat.completions.create.await_args.kwargs
+        assert call["model"] == "mimo-v2.5-asr"
+        assert call["messages"][0]["content"][0]["type"] == "input_audio"
+        assert call["messages"][0]["content"][0]["input_audio"]["data"].startswith(
+            "data:audio/wav;base64,"
+        )
+        assert call["extra_body"] == {"asr_options": {"language": "auto"}}
+
+    async def test_mimo_tts_returns_decoded_audio(self):
+        """MiMo TTS 应按 chat/completions audio 协议返回解码后的音频字节。"""
+        from src.kernel.llm.model_client.openai_client import OpenAIChatClient
+
+        encoded = base64.b64encode(_WAV_BYTES).decode("ascii")
+        completion = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(audio=SimpleNamespace(data=encoded))
+                )
+            ]
+        )
+        sdk_client = MagicMock()
+        sdk_client.chat.completions.create = AsyncMock(return_value=completion)
+        client = OpenAIChatClient()
+        client._get_client = MagicMock(return_value=sdk_client)
+        model_set = {
+            "api_key": "test-key",
+            "base_url": "https://example.test/v1",
+            "timeout": 30.0,
+            "extra_params": {"tts_wire_profile": "mimo_chat_completions"},
+        }
+
+        result = await client.create_speech(
+            model_name="mimo-v2.5-tts",
+            text="晚上好。",
+            request_name="life_send_voice",
+            model_set=model_set,
+            voice="mimo_default",
+            instructions="温柔、轻声",
+            output_format="wav",
+        )
+
+        assert result == _WAV_BYTES
+        call = sdk_client.chat.completions.create.await_args.kwargs
+        assert call["messages"] == [
+            {"role": "user", "content": "温柔、轻声"},
+            {"role": "assistant", "content": "晚上好。"},
+        ]
+        assert call["extra_body"] == {
+            "audio": {"format": "wav", "voice": "mimo_default"}
+        }
