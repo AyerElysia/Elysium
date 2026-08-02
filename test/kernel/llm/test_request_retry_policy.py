@@ -1,9 +1,8 @@
-import pytest
 
 from src.kernel.llm.exceptions import LLMAPIError
-from src.kernel.llm.model_client import StreamEvent
-from src.kernel.llm.model_client import ModelClientRegistry
+from src.kernel.llm.model_client import ModelClientRegistry, StreamEvent
 from src.kernel.llm.payload import LLMPayload, Text
+from src.kernel.llm.policy.failover import FailoverPolicy
 from src.kernel.llm.request import LLMRequest
 from src.kernel.llm.roles import ROLE
 
@@ -59,6 +58,139 @@ async def test_retry_is_driven_by_policy_switch_or_retry():
     resp = await req.send(stream=False)
     assert resp.message == "ok"
     assert dummy.calls == ["a", "b"]
+
+
+async def test_transient_failure_cools_model_for_matching_future_requests():
+    """Repeated heartbeat rounds should bypass a recently failed primary."""
+
+    model_set = [_model("a", max_retry=0), _model("b", max_retry=0)]
+
+    class CoolingClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        async def create(
+            self,
+            *,
+            model_name: str,
+            payloads,
+            tools,
+            request_name: str,
+            model_set,
+            stream: bool,
+        ):
+            self.calls.append((request_name, model_name))
+            if model_name == "a":
+                raise LLMAPIError("upstream unavailable", status_code=500)
+            return "ok", [], None
+
+    client = CoolingClient()
+    clients = ModelClientRegistry(openai=client)
+    first = LLMRequest(
+        model_set,
+        request_name="life_engine_heartbeat",
+        clients=clients,
+        policy=FailoverPolicy(),
+    )
+    second = LLMRequest(
+        model_set,
+        request_name="life_engine_heartbeat",
+        clients=clients,
+        policy=FailoverPolicy(),
+    )
+    isolated = LLMRequest(
+        model_set,
+        request_name="life_memory_witness",
+        clients=clients,
+        policy=FailoverPolicy(),
+    )
+
+    assert (await first.send(stream=False)).message == "ok"
+    assert (await second.send(stream=False)).message == "ok"
+    assert (await isolated.send(stream=False)).message == "ok"
+
+    assert client.calls == [
+        ("life_engine_heartbeat", "a"),
+        ("life_engine_heartbeat", "b"),
+        ("life_engine_heartbeat", "b"),
+        ("life_memory_witness", "a"),
+        ("life_memory_witness", "b"),
+    ]
+
+
+async def test_permanent_failure_does_not_enter_transient_cooldown():
+    """Configuration and authentication faults must remain visible every time."""
+
+    model_set = [_model("a", max_retry=0), _model("b", max_retry=0)]
+
+    class PermanentFailureClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def create(
+            self,
+            *,
+            model_name: str,
+            payloads,
+            tools,
+            request_name: str,
+            model_set,
+            stream: bool,
+        ):
+            self.calls.append(model_name)
+            if model_name == "a":
+                raise LLMAPIError("invalid request", status_code=400)
+            return "ok", [], None
+
+    client = PermanentFailureClient()
+    clients = ModelClientRegistry(openai=client)
+    for _ in range(2):
+        request = LLMRequest(
+            model_set,
+            request_name="life_engine_heartbeat",
+            clients=clients,
+            policy=FailoverPolicy(),
+        )
+        assert (await request.send(stream=False)).message == "ok"
+
+    assert client.calls == ["a", "b", "a", "b"]
+
+
+def test_transient_cooldown_expiry_restores_primary(monkeypatch):
+    """The preferred model is probed again after its cooldown expires."""
+
+    now = [100.0]
+    monkeypatch.setattr(
+        "src.kernel.llm.policy.failover.time.monotonic",
+        lambda: now[0],
+    )
+    model_set = [_model("a", max_retry=0), _model("b", max_retry=0)]
+    policy = FailoverPolicy(cooldown_seconds=10)
+
+    failed = policy.new_session(
+        model_set=model_set,
+        request_name="life_engine_heartbeat",
+    )
+    assert failed.first().model["model_identifier"] == "a"
+    assert (
+        failed.next_after_error(
+            LLMAPIError("upstream unavailable", status_code=500)
+        ).model["model_identifier"]
+        == "b"
+    )
+
+    cooling = policy.new_session(
+        model_set=model_set,
+        request_name="life_engine_heartbeat",
+    )
+    assert cooling.first().model["model_identifier"] == "b"
+
+    now[0] = 110.0
+    recovered = policy.new_session(
+        model_set=model_set,
+        request_name="life_engine_heartbeat",
+    )
+    assert recovered.first().model["model_identifier"] == "a"
 
 
 async def test_forced_stream_collection_error_is_retried_inside_request():

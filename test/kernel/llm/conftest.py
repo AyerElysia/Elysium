@@ -10,8 +10,18 @@ from unittest.mock import AsyncMock, MagicMock, Mock
 import pytest
 
 from src.kernel.llm.model_client.base import ChatModelClient, StreamEvent
-from src.kernel.llm.payload import LLMUsable, LLMPayload, Text, ToolResult, ToolCall
+from src.kernel.llm.payload import LLMPayload, LLMUsable, Text, ToolCall, ToolResult
+from src.kernel.llm.policy.failover import _reset_model_cooldowns_for_tests
 from src.kernel.llm.roles import ROLE
+
+
+@pytest.fixture(autouse=True)
+def isolated_failover_model_cooldowns():
+    """每个测试独享模型健康状态，避免进程级冷却跨用例泄漏。"""
+
+    _reset_model_cooldowns_for_tests()
+    yield
+    _reset_model_cooldowns_for_tests()
 
 
 @pytest.fixture(autouse=True)
@@ -34,8 +44,8 @@ def isolated_global_metrics_collector(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def isolated_global_trajectory_collector(tmp_path, monkeypatch):
     """LLM 测试不应向真实数据湖写入任何记录。"""
-    from src.kernel.llm import trajectory_collector as tc_mod
     from src.kernel.llm import request as req_mod
+    from src.kernel.llm import trajectory_collector as tc_mod
 
     existing = tc_mod._global_collector
     if existing is not None and hasattr(existing, "shutdown"):

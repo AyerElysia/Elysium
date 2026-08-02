@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 
-
 class LLMError(RuntimeError):
     """LLM 操作基础异常。"""
 
@@ -89,6 +88,17 @@ class LLMAPIError(LLMError):
         self.model = model
 
 
+def is_transient_llm_error(error: BaseException) -> bool:
+    """Return whether an LLM failure is likely to recover without reconfiguration."""
+
+    if isinstance(error, (LLMTimeoutError, LLMRateLimitError, TimeoutError)):
+        return True
+    if isinstance(error, LLMAPIError):
+        status_code = error.status_code
+        return status_code is None or status_code == 429 or status_code >= 500
+    return False
+
+
 def should_retry_same_model(error: BaseException) -> bool:
     """判断同一模型是否值得继续重试。
 
@@ -137,11 +147,11 @@ def classify_exception(error: BaseException, model: str | None = None) -> BaseEx
     # OpenAI SDK 异常处理
     try:
         from openai import (
+            APIError,
             APITimeoutError,
-            RateLimitError,
             AuthenticationError,
             BadRequestError,
-            APIError,
+            RateLimitError,
         )
 
         if isinstance(error, RateLimitError):
@@ -174,11 +184,21 @@ def classify_exception(error: BaseException, model: str | None = None) -> BaseEx
     # Anthropic SDK 异常处理
     try:
         from anthropic import (
-            APITimeoutError as AnthropicAPITimeoutError,
             APIError as AnthropicAPIError,
+        )
+        from anthropic import (
             APIStatusError as AnthropicAPIStatusError,
+        )
+        from anthropic import (
+            APITimeoutError as AnthropicAPITimeoutError,
+        )
+        from anthropic import (
             AuthenticationError as AnthropicAuthenticationError,
+        )
+        from anthropic import (
             BadRequestError as AnthropicBadRequestError,
+        )
+        from anthropic import (
             RateLimitError as AnthropicRateLimitError,
         )
 

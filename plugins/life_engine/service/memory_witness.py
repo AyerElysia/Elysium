@@ -9,18 +9,18 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.api.llm_api import get_model_set_by_task
 from src.app.plugin_system.api.log_api import get_logger
 from src.kernel.llm import ROLE, LLMPayload, LLMRequest, Text
 from src.kernel.llm.exceptions import (
     LLMAPIError,
-    LLMRateLimitError,
-    LLMTimeoutError,
+    is_transient_llm_error,
 )
 
 from ..memory.experience import EpistemicKind, ExperienceRecord, WitnessMemory
@@ -53,20 +53,6 @@ _EXPERIENTIAL_EVENT_TYPES: frozenset[str] = frozenset({
     "autonomy_intent_scheduled",
     "autonomy_intent_silence",
 })
-
-
-def _is_transient_upstream_error(exc: BaseException) -> bool:
-    """Return whether a failed witness run is safe to retry later."""
-
-    if isinstance(exc, (LLMRateLimitError, LLMTimeoutError, TimeoutError)):
-        return True
-    if isinstance(exc, LLMAPIError):
-        return (
-            exc.status_code is None
-            or exc.status_code == 429
-            or exc.status_code >= 500
-        )
-    return False
 
 
 def _transient_error_summary(exc: BaseException) -> str:
@@ -150,7 +136,7 @@ class MemoryWitnessCoordinator:
                     try:
                         await asyncio.wait_for(stop_event.wait(), timeout=next_delay)
                         break
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         pass
                 else:
                     await asyncio.sleep(next_delay)
@@ -161,11 +147,11 @@ class MemoryWitnessCoordinator:
                 await self.run_once()
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 await self._record_error(exc)
-                if not _is_transient_upstream_error(exc):
+                if not is_transient_llm_error(exc):
                     transient_failures = 0
-                    logger.error(f"记忆见证意识运行失败: {exc}", exc_info=True)
+                    logger.exception("记忆见证意识运行失败")
                     continue
 
                 transient_failures += 1
@@ -513,13 +499,13 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 def _parse_time(value: str) -> datetime:
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone()
+        return datetime.fromisoformat(value).astimezone()
     except (TypeError, ValueError):
-        return datetime.now(timezone.utc).astimezone()
+        return datetime.now(UTC).astimezone()
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).astimezone().isoformat()
+    return datetime.now(UTC).astimezone().isoformat()
 
 
 __all__ = [

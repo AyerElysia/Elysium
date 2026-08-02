@@ -1,40 +1,191 @@
-"""
-严格顺序故障转移策略（Failover Policy）。
+"""严格顺序故障转移策略（Failover Policy）。
 
-设计目标：让 model_list 的顺序成为可预期的主备链。
-- 每次请求永远从列表第 1 个模型开始
-- 当前模型失败后立刻切换到下一个
-- 不做同模型反复重试，也不跨请求轮换起点
+设计目标：让 ``model_list`` 的顺序成为可预期的主备链。
+
+- 正常情况下从列表第一个模型开始；
+- 临时故障模型按请求类型进入跨请求冷却，避免连续撞击已知故障端点；
+- 当前模型失败后立即切换到下一个；
+- 不做同模型反复重试，冷却到期后自动恢复主模型探测。
 """
 
 from __future__ import annotations
 
+import threading
+import time
+from dataclasses import dataclass
 from typing import Any
 
+from ..exceptions import is_transient_llm_error
 from .base import ModelStep, Policy, PolicySession
+
+_DEFAULT_COOLDOWN_SECONDS = 300.0
+_MAX_COOLDOWN_SECONDS = 1800.0
+
+
+@dataclass(slots=True)
+class _CooldownState:
+    """单个模型在一种请求类型下的临时故障状态。"""
+
+    until: float
+    failure_count: int
+
+
+class _ModelCooldownRegistry:
+    """进程级模型冷却表，按请求类型和模型端点隔离。"""
+
+    def __init__(self) -> None:
+        self._entries: dict[tuple[str, str, str, str], _CooldownState] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _key(
+        request_name: str,
+        model: dict[str, Any],
+    ) -> tuple[str, str, str, str]:
+        return (
+            request_name or "__default__",
+            str(model.get("api_provider") or ""),
+            str(model.get("base_url") or ""),
+            str(model.get("model_identifier") or ""),
+        )
+
+    def record_failure(
+        self,
+        request_name: str,
+        model: dict[str, Any],
+        error: BaseException,
+        *,
+        base_cooldown_seconds: float,
+    ) -> None:
+        """记录可恢复故障；永久错误继续由每次请求显式暴露。"""
+
+        if not is_transient_llm_error(error):
+            return
+
+        key = self._key(request_name, model)
+        with self._lock:
+            previous = self._entries.get(key)
+            failure_count = 1 if previous is None else previous.failure_count + 1
+            exponent = min(10, failure_count - 1)
+            duration = min(
+                _MAX_COOLDOWN_SECONDS,
+                base_cooldown_seconds * (2**exponent),
+            )
+            self._entries[key] = _CooldownState(
+                until=time.monotonic() + duration,
+                failure_count=failure_count,
+            )
+
+    def record_success(
+        self,
+        request_name: str,
+        model: dict[str, Any],
+    ) -> None:
+        """成功探测后立即恢复该模型的主备优先级。"""
+
+        key = self._key(request_name, model)
+        with self._lock:
+            self._entries.pop(key, None)
+
+    def choose_index(
+        self,
+        request_name: str,
+        models: list[dict[str, Any]],
+        *,
+        start: int,
+    ) -> tuple[int | None, tuple[str, ...]]:
+        """选择首个可用模型；全部冷却时选择最早到期者探测。"""
+
+        candidates = list(range(start, len(models)))
+        if not candidates:
+            return None, ()
+
+        now = time.monotonic()
+        cooling: list[tuple[int, _CooldownState]] = []
+        skipped: list[str] = []
+        with self._lock:
+            for index in candidates:
+                state = self._entries.get(self._key(request_name, models[index]))
+                if state is None or state.until <= now:
+                    return index, tuple(skipped)
+                cooling.append((index, state))
+                skipped.append(
+                    str(models[index].get("model_identifier") or "unknown")
+                )
+
+        probe_index = min(cooling, key=lambda item: item[1].until)[0]
+        probe_name = str(
+            models[probe_index].get("model_identifier") or "unknown"
+        )
+        return probe_index, tuple(name for name in skipped if name != probe_name)
+
+    def reset(self) -> None:
+        """清空健康状态，供确定性测试使用。"""
+
+        with self._lock:
+            self._entries.clear()
+
+
+_MODEL_COOLDOWNS = _ModelCooldownRegistry()
+
+
+def _reset_model_cooldowns_for_tests() -> None:
+    _MODEL_COOLDOWNS.reset()
 
 
 class FailoverPolicy(Policy):
-    """按 model_set 顺序做一次主备切换。"""
+    """按模型集顺序切换，并避开仍在冷却的临时故障模型。"""
+
+    def __init__(
+        self,
+        *,
+        cooldown_seconds: float = _DEFAULT_COOLDOWN_SECONDS,
+    ) -> None:
+        try:
+            parsed = float(cooldown_seconds)
+        except (TypeError, ValueError):
+            parsed = _DEFAULT_COOLDOWN_SECONDS
+        self._cooldown_seconds = min(
+            _MAX_COOLDOWN_SECONDS,
+            max(1.0, parsed),
+        )
 
     def new_session(self, *, model_set: Any, request_name: str) -> PolicySession:
         if not isinstance(model_set, list) or not model_set:
             raise ValueError("model_set 必须是非空 list[dict]")
-        if not all(isinstance(x, dict) for x in model_set):
+        if not all(isinstance(item, dict) for item in model_set):
             raise ValueError("model_set 必须是 list[dict]")
-        return _FailoverSession(model_set=model_set)
+        return _FailoverSession(
+            model_set=model_set,
+            request_name=request_name,
+            cooldown_seconds=self._cooldown_seconds,
+        )
 
 
 class _FailoverSession(PolicySession):
-    def __init__(self, *, model_set: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        *,
+        model_set: list[dict[str, Any]],
+        request_name: str,
+        cooldown_seconds: float,
+    ) -> None:
         self._models = model_set
+        self._request_name = request_name
+        self._cooldown_seconds = cooldown_seconds
         self._idx = 0
         self._attempts_used = 0
         self._started = False
 
     def first(self) -> ModelStep:
         self._started = True
-        self._idx = 0
+        selected, skipped = _MODEL_COOLDOWNS.choose_index(
+            self._request_name,
+            self._models,
+            start=0,
+        )
+        assert selected is not None
+        self._idx = selected
         self._attempts_used = 1
         model = self._models[self._idx]
         return ModelStep(
@@ -44,6 +195,7 @@ class _FailoverSession(PolicySession):
                 "model_name": model.get("model_identifier", "unknown"),
                 "attempt": 1,
                 "strategy": "failover",
+                "cooldown_skipped": skipped,
             },
         )
 
@@ -51,9 +203,18 @@ class _FailoverSession(PolicySession):
         if not self._started:
             return self.first()
 
-        # 不做同模型重试：失败即前进到下一个模型。
-        next_idx = self._idx + 1
-        if next_idx >= len(self._models):
+        _MODEL_COOLDOWNS.record_failure(
+            self._request_name,
+            self._models[self._idx],
+            error,
+            base_cooldown_seconds=self._cooldown_seconds,
+        )
+        next_idx, skipped = _MODEL_COOLDOWNS.choose_index(
+            self._request_name,
+            self._models,
+            start=self._idx + 1,
+        )
+        if next_idx is None:
             return ModelStep(
                 model=None,
                 meta={
@@ -76,8 +237,13 @@ class _FailoverSession(PolicySession):
                 "switch": True,
                 "strategy": "failover",
                 "error_type": type(error).__name__,
+                "cooldown_skipped": skipped,
             },
         )
 
     def record_success(self, *, latency: float = 0.0, tokens: int = 0) -> None:
-        return None
+        if self._started:
+            _MODEL_COOLDOWNS.record_success(
+                self._request_name,
+                self._models[self._idx],
+            )
