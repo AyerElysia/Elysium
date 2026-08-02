@@ -1,6 +1,5 @@
-"""输出层。"""
+"""Legacy namespace retained for import compatibility.
 
-from .avatar_controller import AvatarController
-from .tts_queue import TTSQueue
-
-__all__ = ["AvatarController", "TTSQueue"]
+Output is owned by :mod:`plugins.livestream.performance` and
+:mod:`plugins.livestream.stage`.
+"""

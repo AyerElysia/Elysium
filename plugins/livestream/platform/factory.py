@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 from .base import BasePlatformAdapter
@@ -13,7 +14,7 @@ if TYPE_CHECKING:
     from ..config import LivestreamConfig
 
 
-def create_platform_adapter(config: "LivestreamConfig") -> BasePlatformAdapter:
+def create_platform_adapter(config: LivestreamConfig) -> BasePlatformAdapter:
     """根据配置创建平台适配器。
 
     Args:
@@ -34,9 +35,13 @@ def create_platform_adapter(config: "LivestreamConfig") -> BasePlatformAdapter:
 
             return BilibiliAdapter(
                 room_id=platform_cfg.room_id,
-                sessdata=platform_cfg.sessdata,
-                buvid3=platform_cfg.buvid3,
+                sessdata=os.environ.get(platform_cfg.sessdata_env, ""),
+                buvid3=os.environ.get(platform_cfg.buvid3_env, ""),
                 reconnect_interval=platform_cfg.reconnect_interval,
+                max_reconnect_interval=platform_cfg.max_reconnect_interval,
+                heartbeat_interval=platform_cfg.heartbeat_interval,
+                startup_timeout=platform_cfg.startup_timeout,
+                max_packet_bytes=platform_cfg.max_packet_bytes,
             )
         case _:
             raise ValueError(

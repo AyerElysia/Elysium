@@ -1,32 +1,39 @@
 {
   "name": "Livestream",
-  "version": "1.0.0",
-  "description": "商业级 AI 直播框架（弹幕互动 + Live2D + TTS）",
+  "version": "2.0.0",
+  "description": "可追溯的 B站直播导演、语音舞台与记忆闭环",
   "author": "Elysium",
   "license": "GPL-3.0",
-  "min_core_version": "0.1.0",
+  "min_core_version": "1.0.0",
   "entry_point": "plugin.py",
-  "keywords": [
-    "livestream",
-    "bilibili",
-    "danmaku",
-    "vtuber",
-    "live2d",
-    "tts"
-  ],
-  "categories": [
-    "entertainment"
-  ],
+  "keywords": ["livestream", "bilibili", "director", "tts", "obs"],
+  "categories": ["entertainment"],
   "dependencies": {
-    "plugins": [],
+    "plugins": [
+      "life_engine"
+    ],
     "components": []
   },
   "python_dependencies": [
+    "aiosqlite",
+    "brotli",
     "fastapi",
+    "httpx",
+    "json-repair",
     "pydantic",
-    "blivedm"
+    "websockets"
   ],
   "include": [
-    "static"
-  ]
+    {
+      "component_type": "router",
+      "component_name": "livestream",
+      "dependencies": [],
+      "enabled": true
+    }
+  ],
+  "dependencies_required": true,
+  "config": {
+    "path": "config/plugins/Livestream/config.toml",
+    "reloadable": false
+  }
 }

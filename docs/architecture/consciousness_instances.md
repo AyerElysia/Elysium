@@ -1,113 +1,138 @@
 # 意识实例架构
 
-> 当前实现：一个主体、多个场景意识窗口、潜意识统一协调。Presence、事件来源、World Projection 与逐实例 Perception Gateway 均已接入。
+> 当前实现：一个持续主体、多个场景意识窗口、潜意识统一协调。Presence、不可变事件、World Projection 与逐实例 Perception Gateway 均已接入。
 
 ## 1. 身份模型
 
-`ConsciousnessInstance` 是同一主体在一个场景中的局部运行窗口。不同实例可以拥有不同的即时输入、私有滚动上下文、session、回复目标和工具 manifest，但不能被解释成不同人格，也不能互相读取私有上下文。
+`ConsciousnessInstance` 是同一主体在一个场景中的局部运行窗口，不是独立人格或互不相干的 Agent。不同实例可以拥有不同的即时输入、私有滚动上下文、session、原始授权回复目标和工具 manifest，但不能互相复制私有上下文，也不能把局部判断直接提升为全局事实。
 
-当前声明的实例 kind：
-
-| kind | 作用 | 当前协调闭环 |
+| kind | 场景 | 当前协调闭环 |
 |---|---|---|
 | `chat` / `chat_global` | 私聊、群聊与日常表达 | Presence、事件、heartbeat/chatter 感知 |
 | `memory_witness` | 第一人称经历编码与见证 | 独立 consumer、请求级世界感知 |
 | `minecraft` | 视觉—键鼠具身场景 | session/lease、trace observation、意图级感知 |
 | `voice_live` | 全双工实时语音 | session/lease、listening frontier 动态感知 |
-| `livestream` | 弹幕和直播表达 | room Presence、请求级感知、状态 observation |
+| `livestream` | B站事件、导演、TTS 与 OBS 舞台 | room Presence、决策级感知、状态 observation、播放回执 |
 
-`chat_global` 是默认实例，不可终止；没有独立 stream owner 的普通聊天归入它。kind 是开放技术标识，不是认知类别。未知 kind 必须显式声明 manifest，系统不会回退到 chat 能力。
+`chat_global` 是默认实例且不可终止。kind 是开放技术标识，不是固定认知类别；未知 kind 必须显式声明 manifest，不能回退继承 chat 权限。
 
-## 2. 运行层次
+## 2. 权威数据边界
 
 ```text
-潜意识 / Life Engine
+同一持续主体 / Life Engine
   ├─ immutable Life Event：完整经历与归因
-  ├─ SQLite Presence：实例、lease、revision、stream owner
+  ├─ SQLite Presence：实例、session、lease、revision、stream owner
   ├─ World Projection：带来源、可重建、允许矛盾的 assertion
   ├─ Perception Gateway：逐实例 prepare/commit cursor
   ├─ heartbeat / memory / learning / thought stream
   └─ nucleus tools
 
 场景意识实例
-  ├─ 独立即时输入和滚动上下文
+  ├─ 独立即时输入与私有滚动上下文
   ├─ 显式工具 manifest
   ├─ 原始授权回复目标
   ├─ transient world perception
   └─ 带 source_instance_id 的 observation
 ```
 
-系统传递的是带来源的运行存在和世界观察，不复制其他实例的对话历史。Presence 始终只是技术事实；Projection 中的局部观察也不会被代码自动判真。
+系统严格区分三类事实：
+
+1. 发生过什么：由不可变 Life Event 账本保存；
+2. 哪些窗口正在运行：由 SQLite Presence Registry 保存；
+3. 某个窗口如何观察世界：由带来源的 Life Event 和可重建 World Projection 保存。
+
+Presence 只说明技术存在，不自动成为情绪、关系或信念。相互矛盾的 assertion 并列保留，只有显式、可审计事件能撤回或修订旧观察。
 
 ## 3. Presence 生命周期
 
-权威存储是 `runtime/consciousness_presence.sqlite3`。一次状态事务同时提交实例 revision、active stream owner 和 lifecycle outbox。outbox 在不可变账本接受同一 occurrence 后才确认。
+权威存储是 `runtime/consciousness_presence.sqlite3`。每次状态事务同时提交 instance revision、active stream 唯一占有和 lifecycle outbox；outbox 只有在不可变账本接受同一 occurrence 后才确认。
 
-短生命周期场景声明 session 与 lease，并在真实活动时续租；异常消失后 lease reconciliation 会 suspend 实例并释放 stream。陈旧 revision 不能覆盖新状态，同一 active stream 只能有一个 owner。
+短生命周期场景必须声明 session 与 lease，并在真实运行期间续租。异常消失后，lease reconciliation 会 suspend 实例并释放 stream。陈旧 revision 不能覆盖新状态，同一 active stream 只能有一个 owner。
 
-`runtime/consciousness_registry.json` 是旧数据导入源和兼容导出，不是当前权威。
+`runtime/consciousness_registry.json` 仅作为旧数据导入源和兼容导出，不是当前权威。
+
+直播实例使用稳定 room identity、当前账本 session 与可配置 lease。只有经过鉴权的人工开播才会激活实例；运行时续租不具备开播权。正常停播先追加状态 observation，再 suspend 并释放房间 stream。
 
 ## 4. 跨实例感知
 
-每个实例拥有独立 World Projection cursor。每轮 `prepare` 提供：
+每个实例拥有独立 World Projection cursor。每轮 `prepare(instance_id)` 提供：
 
-- 全部 active 窗口的最小存在感；
-- 全部带来源 assertion，包括矛盾与已撤回记录；
-- 自该实例上次成功确认以来的相关投影 change。
+- 当前全部 active 窗口的最小存在感；
+- 全部带来源 assertion，包括矛盾与撤回关系；
+- 自该实例上次成功确认以来的投影变化。
 
-这些内容只作为当前轮 transient context。模型/provider 成功接受后才 `commit`；失败、超时或执行异常不推进 cursor。Presence 最小存在感不依赖增量 cursor，因此实例持续知道彼此当前存在。
+这些内容只进入当前轮 `<transient_world_perception>`，不写入稳定 system prompt 或私有滚动历史。模型或 provider 成功接受后才能 `commit`；失败、超时和执行异常不能推进 cursor。Presence 最小存在感每轮都会生成，不依赖增量 cursor。
 
-潜意识 heartbeat、`chat_global`、Voice、Minecraft、`memory_witness` 和 Livestream 均使用同一 prepare/commit 契约。具体数据流、迁移和恢复见[世界状态与意识实例协调](./world_state_coordination.md)。
+潜意识 heartbeat、`chat_global`、Voice、Minecraft、`memory_witness` 和 Livestream 均遵守同一 prepare/commit 语义。完整存储、迁移、冲突与恢复契约见[世界状态与意识实例协调](./world_state_coordination.md)。
 
-## 5. 工具边界
+## 5. 直播导演如何接入同一主体
 
-工具 manifest 只控制能力暴露与授权，不决定主体想做什么：
+直播导演不维护第二套 persona、API key、模型地址、工具或私有历史。它调用 `LifeChatter.build_live_bridge_prompt()` 复用同一主体的身份、历史、LifeEngine 运行态和项目级模型策略，再把本轮 B 站原始事件作为不可信外部证据交给模型开放判断。
+
+每一轮导演事务顺序为：
+
+```text
+B站原始事件已落直播账本
+  → prepare(world perception)
+  → LifeChatter 形成当前轮导演上下文
+  → 模型返回受校验的 PerformancePlan
+  → director.decision / performance.planned 落不可变账本
+  → 确认 Life runtime context 与 World Perception cursor
+  → 推进直播 director cursor
+```
+
+因此模型失败不会确认世界感知；进程在决策落账后崩溃时，重放会复用原决定，并幂等补交两个感知 cursor，而不会再次调用模型。观众文本没有工具权限，也不能通过提示注入改变系统契约。
+
+直播的实际表达以 OBS/browser 舞台播放回执为准；计划文本不等于已经说出的事实。完成、失败、中断和超时均进入直播账本，并由记忆桥投影成可追溯 Life Event。
+
+## 6. 工具边界
+
+工具 manifest 只控制能力暴露和授权，不决定主体想做什么：
 
 - chat：表达、思考、状态报告、内在查询、历史和获授权平台能力；
 - minecraft：具身控制、表达、思考、状态报告；
 - voice_live：状态报告、内在查询、历史；
-- livestream：表达、思考、状态报告、内在查询、历史；
-- memory_witness：空 manifest，只见证不直接行动。
+- livestream：导演模型接口为空工具集；控制面仅接受经过鉴权的操作员动作；
+- memory_witness：空 manifest，只见证，不直接行动。
 
-`report_state` 追加 `world.observation_reported`，不修改 JSON；`inner_query` 返回完整、可归因投影，不使用关键词匹配、固定类别或代码截断替当前实例判断意义。
+通道桥只负责协议适配，不拥有身份、记忆或世界真相。不可逆操作必须通过专门安全边界。
 
-## 6. 新场景接入要求
+## 7. 新场景接入要求
 
-新场景至少必须完成：
+一个新场景至少必须完成：
 
 1. 声明显式 instance ID、开放 kind、session 和稳定 stream ID；
-2. 原子注册 Presence，短生命周期场景配置 lease；
+2. 原子注册 Presence，短生命周期场景配置 lease 与续租；
 3. 声明显式工具 manifest，不依赖未知 kind fallback；
 4. 保持私有滚动上下文隔离和原始授权回复目标；
 5. 生命周期与重要观察写入带实例归属的 Life Event；
-6. 在每个真实模型/动作 frontier 使用 Perception Gateway；
-7. 仅在上下文被成功接受后 commit cursor；
-8. 实现幂等 start/stop、恢复、资源关闭和失败重试；
-9. 验证重复注册、stream 冲突、revision 冲突、lease 过期、失败不确认和重启恢复。
+6. 在每个真实模型或动作 frontier 使用 Perception Gateway；
+7. 仅在上下文成功接受且必要结果持久化后 commit cursor；
+8. 实现幂等 start/stop、崩溃恢复、资源关闭和失败重试；
+9. 验证重复注册、stream 冲突、revision 冲突、lease 过期、失败不确认与重启重放。
 
-通道桥只负责协议适配，不拥有身份、记忆或世界真相。
-
-## 7. 关键文件
+## 8. 关键文件
 
 | 文件 | 职责 |
 |---|---|
-| `service/consciousness.py` | 实例模型、Presence 生命周期、lease、outbox 发布 |
-| `service/presence_store.py` | SQLite Presence、stream 唯一约束、revision CAS |
-| `service/event_bus.py` | 不可变 Life Event 账本与 consumer cursor |
-| `service/world_projection.py` | 事件来源 World Projection、重建、感知 cursor |
-| `service/perception_gateway.py` | transient 感知 prepare/commit/query |
-| `service/tool_manifests.py` | 显式实例能力边界 |
-| `service/memory_witness.py` | 独立第一人称见证消费 |
-| `minecraft/session.py` | 具身实例与意图级感知 |
+| `plugins/life_engine/service/consciousness.py` | 实例模型、Presence 生命周期、lease、outbox |
+| `plugins/life_engine/service/presence_store.py` | SQLite Presence、stream 唯一约束、revision CAS |
+| `plugins/life_engine/service/event_bus.py` | 不可变 Life Event 账本与 consumer cursor |
+| `plugins/life_engine/service/world_projection.py` | 带来源 World Projection、重建、感知 cursor |
+| `plugins/life_engine/service/perception_gateway.py` | transient 感知 prepare/commit/query |
+| `plugins/life_engine/service/tool_manifests.py` | 显式实例能力边界 |
+| `plugins/life_engine/service/memory_witness.py` | 独立第一人称见证消费 |
+| `plugins/life_engine/minecraft/session.py` | 具身实例与意图级感知 |
 | `plugins/voice_live/` | 实时语音实例与 provider 感知注入 |
-| `plugins/livestream/` | 直播实例与请求级感知注入 |
+| `plugins/livestream/` | B站直播实例、导演、账本、舞台和记忆投影 |
 
-## 8. 不变量
+## 9. 不变量
 
 1. 所有实例属于同一主体，不是可互换人格。
-2. 私有上下文隔离，跨场景只经过明确、可归因边界。
-3. 完整经历先进入不可变账本；投影可以重建，账本不可被投影反向修改。
+2. 私有上下文隔离；跨场景信息只经过明确、可归因边界。
+3. 完整经历先进入不可变账本；投影可重建，账本不可被投影反向修改。
 4. Presence 不自动成为信念，局部 observation 不自动成为客观事实。
-5. 矛盾观察并存，只有显式、可审计事件能建立撤回或修订关系。
-6. 模型请求失败不得伪装成已感知，cursor 只能在成功后推进。
+5. 矛盾观察并存，修订和撤回必须显式可审计。
+6. 模型请求失败不得伪装成已感知，cursor 只在成功并持久化后推进。
 7. system prompt 保持流无关，场景与世界运行态只进入当前 turn。
+8. Elysium、NapCat 和 Livestream 均只允许人工启动；技术续租与重连不扩大启动授权。

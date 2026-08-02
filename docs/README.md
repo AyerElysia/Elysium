@@ -1,5 +1,7 @@
 # Elysium 文档
 
+- [直播系统](./architecture/livestream.md) — B站接入、同一意识导演、真实播放回执与记忆闭环
+
 ## 从这里开始
 
 - [当前架构](./architecture/current_architecture.md) — **当前代码与运行边界的权威总图**

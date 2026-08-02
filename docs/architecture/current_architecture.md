@@ -251,7 +251,7 @@ NapCat 适配器已按 `client / events / outgoing / utils` 模块化：
 ### 多模态与具身
 
 - `voice_live`：全双工实时语音框架；
-- `livestream`：直播弹幕、队列、TTS、Live2D/OBS 管线；
+- `livestream`：B站原始事件账本、同一意识导演、TTS、OBS 浏览器舞台、真实播放回执与记忆投射；
 - `tts_voice_plugin`：语音表达；
 - `neko_surface`：桌面/表面呈现；
 - `minecraft/`：视觉输入、Windows 桥接、键鼠输出和场景意识。
@@ -308,7 +308,7 @@ NapCat 适配器已按 `client / events / outgoing / utils` 模块化：
 | NapCat v3 / QQ | 已实现并持续运行加固 | 模块化与协议健康恢复已接入 |
 | 飞书 platform_action | 已实现，依赖外部环境 | 需要 lark-cli 与认证 |
 | voice_live | 实验性集成 | 依赖实时模型或本地降级链 |
-| livestream | 实验性集成 | 依赖平台、TTS、Live2D/OBS，仍需端到端验收 |
+| livestream | 生产候选 | 核心闭环与故障注入已自动验收；真实 B站、TTS、OBS 环境仍需上线前验收 |
 | Minecraft | 环境依赖型能力 | 依赖 Windows 桥接、视觉和键鼠环境 |
 | 旧兼容层 | 迁移中 | 不能在未验证调用者前贸然删除 |
 
@@ -336,7 +336,7 @@ NapCat 适配器已按 `client / events / outgoing / utils` 模块化：
 - DI/Registry 与旧 Manager 的职责仍需逐步统一；
 - 兼容工具、旧配置别名、legacy 索引回退需要退出条件；
 - 事件显著性编码仍需从固定技术筛选演进为可追溯、可重新解释的主体性机制；
-- 使命编排仍需真实模型端到端验收；voice_live、livestream 与 Minecraft 需要更完整的契约和真实环境验收；
+- 使命编排仍需真实模型端到端验收；livestream 已具备契约与模拟闭环，但 voice_live、livestream 与 Minecraft 仍需要各自真实环境验收；
 - CI 需要恢复自动化的核心逻辑测试，并把本地/GPU/平台集成测试分层。
 
 这份文档的职责不是描绘终点，而是保证下一次演进从同一个真实起点出发。

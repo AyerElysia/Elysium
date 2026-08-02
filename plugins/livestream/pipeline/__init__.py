@@ -1,7 +1,5 @@
-"""核心互动管线。"""
+"""Legacy namespace retained for import compatibility.
 
-from .event_filter import EventFilter
-from .priority_queue import PriorityEventQueue
-from .scheduler import PipelineScheduler
-
-__all__ = ["EventFilter", "PriorityEventQueue", "PipelineScheduler"]
+The replay-safe pipeline lives in ``director``, ``performance`` and
+``memory_bridge``; the previous cognitive priority queue no longer exists.
+"""

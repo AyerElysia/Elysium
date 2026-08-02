@@ -1,219 +1,24 @@
-/* AI Livestream 样式 */
-
-* {
-    margin: 0;
-    padding: 0;
-    box-sizing: border-box;
-}
-
-body {
-    width: 100vw;
-    height: 100vh;
-    overflow: hidden;
-    background: #1a1a2e;
-    font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
-    color: #eee;
-}
-
-/* Live2D 渲染区 */
-#live2d-container {
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    z-index: 1;
-}
-
-#live2d-canvas {
-    width: 100%;
-    height: 100%;
-}
-
-/* 弹幕飘屏 */
-#danmaku-overlay {
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 60%;
-    z-index: 10;
-    pointer-events: none;
-    overflow: hidden;
-}
-
-.danmaku-item {
-    position: absolute;
-    white-space: nowrap;
-    font-size: 18px;
-    font-weight: bold;
-    color: #fff;
-    text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.8);
-    animation: danmaku-scroll linear forwards;
-    will-change: transform;
-}
-
-@keyframes danmaku-scroll {
-    from {
-        transform: translateX(100vw);
-    }
-    to {
-        transform: translateX(-100%);
-    }
-}
-
-/* 状态指示 */
-#status-indicator {
-    position: absolute;
-    top: 16px;
-    left: 16px;
-    z-index: 20;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px 16px;
-    background: rgba(0, 0, 0, 0.6);
-    border-radius: 20px;
-    backdrop-filter: blur(4px);
-}
-
-.status-dot {
-    width: 12px;
-    height: 12px;
-    border-radius: 50%;
-    background: #666;
-    transition: background 0.3s;
-}
-
-.status-dot.idle {
-    background: #4caf50;
-}
-
-.status-dot.thinking {
-    background: #ff9800;
-    animation: pulse 1s infinite;
-}
-
-.status-dot.speaking {
-    background: #2196f3;
-    animation: pulse 0.5s infinite;
-}
-
-@keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.5; }
-}
-
-#status-text {
-    font-size: 14px;
-}
-
-/* 控制面板 */
-#control-panel {
-    position: absolute;
-    bottom: 16px;
-    left: 50%;
-    transform: translateX(-50%);
-    z-index: 20;
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 12px 20px;
-    background: rgba(0, 0, 0, 0.7);
-    border-radius: 12px;
-    backdrop-filter: blur(8px);
-}
-
-.ctrl-btn {
-    padding: 8px 16px;
-    border: none;
-    border-radius: 6px;
-    background: #4a4a6a;
-    color: #fff;
-    font-size: 14px;
-    cursor: pointer;
-    transition: background 0.2s;
-}
-
-.ctrl-btn:hover:not(:disabled) {
-    background: #6a6a9a;
-}
-
-.ctrl-btn:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-}
-
-#btn-start {
-    background: #2e7d32;
-}
-
-#btn-start:hover:not(:disabled) {
-    background: #388e3c;
-}
-
-#btn-stop {
-    background: #c62828;
-}
-
-#btn-stop:hover:not(:disabled) {
-    background: #d32f2f;
-}
-
-.volume-control {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 13px;
-}
-
-.volume-control input[type="range"] {
-    width: 80px;
-}
-
-.checkbox-label {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    font-size: 13px;
-    cursor: pointer;
-}
-
-/* 调试输入 */
-#debug-input {
-    position: absolute;
-    bottom: 70px;
-    left: 50%;
-    transform: translateX(-50%);
-    z-index: 20;
-    display: flex;
-    gap: 8px;
-}
-
-#say-input {
-    width: 300px;
-    padding: 8px 12px;
-    border: 1px solid #555;
-    border-radius: 6px;
-    background: rgba(0, 0, 0, 0.7);
-    color: #fff;
-    font-size: 14px;
-}
-
-#say-input:focus {
-    outline: none;
-    border-color: #888;
-}
-
-#btn-say {
-    padding: 8px 16px;
-    border: none;
-    border-radius: 6px;
-    background: #5c6bc0;
-    color: #fff;
-    cursor: pointer;
-}
-
-#btn-say:hover {
-    background: #7986cb;
-}
+:root { color-scheme: dark; font-family: Inter, "Microsoft YaHei", sans-serif; }
+* { box-sizing: border-box; }
+body { margin: 0; overflow: hidden; background: transparent; color: #fff; }
+#stage { position: relative; width: 100vw; height: 100vh; background: radial-gradient(circle at 50% 48%, rgba(255,160,210,.18), rgba(20,16,34,.92) 48%, #090711 100%); }
+#visual-slot { position: absolute; inset: 8% 15% 20%; display: grid; place-items: center; }
+.halo { width: min(46vw, 52vh); aspect-ratio: 1; border-radius: 50%; border: 1px solid rgba(255,209,235,.55); box-shadow: 0 0 90px rgba(244,126,191,.22), inset 0 0 65px rgba(255,255,255,.08); transition: transform .18s, box-shadow .18s; }
+#stage[data-speaking="true"] .halo { transform: scale(1.035); box-shadow: 0 0 120px rgba(244,126,191,.48), inset 0 0 75px rgba(255,255,255,.14); }
+.stage-mark { position: absolute; letter-spacing: .7em; color: rgba(255,230,245,.72); font-size: clamp(16px, 2vw, 30px); }
+#expression-label { position: absolute; bottom: 5%; color: rgba(255,255,255,.62); font-size: 14px; }
+#subtitle { position: absolute; left: 12%; right: 12%; bottom: 12%; min-height: 2.8em; padding: .65em 1.1em; text-align: center; font-size: clamp(24px, 3vw, 46px); line-height: 1.45; text-shadow: 0 2px 9px #000; }
+#audience-events { position: absolute; top: 8%; right: 3%; width: min(32vw, 480px); display: grid; gap: 8px; }
+.audience-event { padding: 8px 12px; border-left: 2px solid rgba(255,165,211,.8); background: rgba(10,8,18,.5); border-radius: 0 8px 8px 0; animation: enter .25s ease-out; }
+@keyframes enter { from { opacity: 0; transform: translateX(12px); } }
+#status-panel { position: absolute; top: 18px; left: 18px; display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: 999px; background: rgba(0,0,0,.48); font-size: 13px; }
+#status-dot { width: 9px; height: 9px; border-radius: 50%; background: #e7a94b; }
+#status-dot.ready { background: #78dba9; }
+#status-dot.error { background: #ff6f86; }
+#controls { position: absolute; left: 50%; bottom: 20px; transform: translateX(-50%); display: flex; gap: 8px; padding: 10px; border-radius: 12px; background: rgba(0,0,0,.62); backdrop-filter: blur(10px); }
+button, input { border: 1px solid rgba(255,255,255,.18); border-radius: 7px; background: #2b2338; color: #fff; padding: 8px 12px; }
+button { cursor: pointer; }
+button:disabled { opacity: .38; cursor: not-allowed; }
+#say-text { width: min(34vw, 440px); }
+body[data-view="stage"] #controls,
+body[data-view="stage"] #status-panel { display: none; }

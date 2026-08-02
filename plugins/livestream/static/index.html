@@ -1,221 +1,33 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Livestream</title>
-    <link rel="stylesheet" href="style.css">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Elysium Livestream Stage</title>
+  <link rel="stylesheet" href="style.css">
 </head>
 <body>
-    <!-- Live2D 渲染区 -->
-    <div id="live2d-container">
-        <canvas id="live2d-canvas"></canvas>
-    </div>
-
-    <!-- 弹幕飘屏覆盖层 -->
-    <div id="danmaku-overlay"></div>
-
-    <!-- 状态指示 -->
-    <div id="status-indicator">
-        <div class="status-dot" id="status-dot"></div>
-        <span id="status-text">待机中</span>
-    </div>
-
-    <!-- 控制面板 -->
-    <div id="control-panel">
-        <button id="btn-start" class="ctrl-btn">开始直播</button>
-        <button id="btn-stop" class="ctrl-btn" disabled>停止直播</button>
-        <button id="btn-interrupt" class="ctrl-btn">打断</button>
-        <div class="volume-control">
-            <label>音量</label>
-            <input type="range" id="volume-slider" min="0" max="100" value="80">
-        </div>
-        <label class="checkbox-label">
-            <input type="checkbox" id="danmaku-toggle" checked> 弹幕显示
-        </label>
-    </div>
-
-    <!-- 弹幕输入（调试） -->
-    <div id="debug-input">
-        <input type="text" id="say-input" placeholder="手动发言...">
-        <button id="btn-say">发送</button>
-    </div>
-
-    <!-- 依赖库 -->
-    <script src="https://cdn.jsdelivr.net/npm/pixi.js@7/dist/pixi.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/pixi-live2d-display/dist/cubism4.min.js"></script>
-
-    <script src="danmaku-overlay.js"></script>
-    <script src="live2d-renderer.js"></script>
-    <script>
-    // ==================== 主逻辑 ====================
-    (function() {
-        'use strict';
-
-        const WS_URL = `ws://${location.host}${location.pathname}ws`;
-        let ws = null;
-        let audioCtx = null;
-        let volume = 0.8;
-        let currentState = 'idle';
-
-        // DOM
-        const statusDot = document.getElementById('status-dot');
-        const statusText = document.getElementById('status-text');
-        const btnStart = document.getElementById('btn-start');
-        const btnStop = document.getElementById('btn-stop');
-        const btnInterrupt = document.getElementById('btn-interrupt');
-        const volumeSlider = document.getElementById('volume-slider');
-        const danmakuToggle = document.getElementById('danmaku-toggle');
-        const sayInput = document.getElementById('say-input');
-        const btnSay = document.getElementById('btn-say');
-
-        // 初始化音频上下文
-        function initAudio() {
-            if (!audioCtx) {
-                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-            }
-        }
-
-        // WebSocket 连接
-        function connect() {
-            ws = new WebSocket(WS_URL);
-            ws.binaryType = 'arraybuffer';
-
-            ws.onopen = () => {
-                console.log('[WS] 已连接');
-                ws.send(JSON.stringify({ command: 'ping' }));
-            };
-
-            ws.onmessage = (event) => {
-                if (event.data instanceof ArrayBuffer) {
-                    handleBinaryFrame(event.data);
-                } else {
-                    handleJsonFrame(JSON.parse(event.data));
-                }
-            };
-
-            ws.onclose = () => {
-                console.log('[WS] 断开，3s 后重连');
-                setTimeout(connect, 3000);
-            };
-
-            ws.onerror = (err) => {
-                console.error('[WS] 错误:', err);
-            };
-        }
-
-        // 处理 JSON 控制帧
-        function handleJsonFrame(data) {
-            switch (data.type) {
-                case 'state':
-                    updateState(data.state);
-                    break;
-                case 'danmaku':
-                    if (danmakuToggle.checked) {
-                        DanmakuOverlay.spawn(data.user + '：' + data.content);
-                    }
-                    break;
-                case 'avatar':
-                    Live2DRenderer.handleCommand(data);
-                    break;
-                case 'audio_meta':
-                    // 音频元数据，下一帧是二进制音频
-                    break;
-            }
-        }
-
-        // 处理二进制音频帧
-        let pendingMeta = null;
-        function handleBinaryFrame(buffer) {
-            // 尝试解析为 JSON（元数据帧）
-            try {
-                const text = new TextDecoder().decode(buffer);
-                const data = JSON.parse(text);
-                if (data.type === 'audio_meta') {
-                    pendingMeta = data;
-                    return;
-                }
-            } catch (e) {
-                // 不是 JSON，是纯音频数据
-            }
-
-            // 播放音频
-            playAudio(buffer);
-        }
-
-        // 播放 PCM16 音频
-        function playAudio(buffer) {
-            initAudio();
-            if (!audioCtx) return;
-
-            const bytes = new Uint8Array(buffer);
-            const samples = new Int16Array(bytes.buffer);
-            const audioBuffer = audioCtx.createBuffer(1, samples.length, 16000);
-            const channel = audioBuffer.getChannelData(0);
-
-            for (let i = 0; i < samples.length; i++) {
-                channel[i] = (samples[i] / 32768) * volume;
-            }
-
-            const source = audioCtx.createBufferSource();
-            source.buffer = audioBuffer;
-            source.connect(audioCtx.destination);
-            source.start();
-
-            // 口型同步
-            Live2DRenderer.setMouthOpen(true);
-            source.onended = () => Live2DRenderer.setMouthOpen(false);
-        }
-
-        // 更新状态
-        function updateState(state) {
-            currentState = state;
-            statusDot.className = 'status-dot ' + state;
-            const labels = { idle: '待机中', thinking: '思考中...', speaking: '说话中' };
-            statusText.textContent = labels[state] || state;
-        }
-
-        // 控制按钮
-        btnStart.onclick = () => {
-            initAudio();
-            if (ws) ws.send(JSON.stringify({ command: 'start' }));
-            btnStart.disabled = true;
-            btnStop.disabled = false;
-        };
-
-        btnStop.onclick = () => {
-            if (ws) ws.send(JSON.stringify({ command: 'stop' }));
-            btnStart.disabled = false;
-            btnStop.disabled = true;
-        };
-
-        btnInterrupt.onclick = () => {
-            if (ws) ws.send(JSON.stringify({ command: 'interrupt' }));
-        };
-
-        volumeSlider.oninput = () => {
-            volume = volumeSlider.value / 100;
-        };
-
-        btnSay.onclick = () => {
-            const text = sayInput.value.trim();
-            if (!text) return;
-            fetch(location.pathname + 'api/say', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ text }),
-            });
-            sayInput.value = '';
-        };
-
-        sayInput.onkeydown = (e) => {
-            if (e.key === 'Enter') btnSay.click();
-        };
-
-        // 启动
-        connect();
-        Live2DRenderer.init('live2d-canvas');
-    })();
-    </script>
+  <main id="stage" data-speaking="false">
+    <section id="visual-slot" aria-label="Avatar composition slot">
+      <div class="halo"></div>
+      <div class="stage-mark">ELYSIUM</div>
+      <div id="expression-label">舞台已待命</div>
+    </section>
+    <section id="subtitle" aria-live="polite"></section>
+    <section id="audience-events" aria-label="Recent audience events"></section>
+    <aside id="status-panel">
+      <span id="status-dot"></span>
+      <span id="status-text">正在连接舞台…</span>
+    </aside>
+    <nav id="controls" aria-label="Operator controls">
+      <button id="start" disabled>手动开始</button>
+      <button id="stop" disabled>停止</button>
+      <button id="interrupt" disabled>打断</button>
+      <input id="say-text" maxlength="1000" placeholder="经操作者确认后说一句话">
+      <button id="say" disabled>发送</button>
+    </nav>
+  </main>
+  <script src="app.js"></script>
 </body>
 </html>
