@@ -29,7 +29,7 @@ from src.core.transport.message_receive.utils import (
     extract_stream_id,
     infer_chat_type,
 )
-from src.kernel.logger import get_logger, COLOR
+from src.kernel.logger import COLOR, get_logger
 
 logger = get_logger("message_receiver", display="消息接收器", color=COLOR.CYAN)
 
@@ -66,7 +66,21 @@ class MessageReceiver:
         self._event_manager: Any = None
         self._dedup_lock = asyncio.Lock()
         self._recent_messages: OrderedDict[tuple[str, str, str], float] = OrderedDict()
+        self._inflight_messages: set[tuple[str, str, str]] = set()
         logger.info("MessageReceiver 初始化完成")
+
+    @staticmethod
+    def _message_key(
+        adapter_signature: str,
+        platform: str,
+        message_id: Any,
+    ) -> tuple[str, str, str] | None:
+        """Build a stable deduplication key when the envelope has an ID."""
+
+        normalized_id = str(message_id or "").strip()
+        if not normalized_id or normalized_id == "?":
+            return None
+        return (adapter_signature, platform, normalized_id)
 
     async def _claim_message(
         self,
@@ -76,11 +90,10 @@ class MessageReceiver:
         message_id: Any,
     ) -> bool:
         """原子占用消息 ID，并拒绝去重窗口内的重复消息。"""
-        normalized_id = str(message_id or "").strip()
-        if not normalized_id or normalized_id == "?":
+        key = self._message_key(adapter_signature, platform, message_id)
+        if key is None:
             return True
 
-        key = (adapter_signature, platform, normalized_id)
         now = time.monotonic()
         expires_before = now - _DEDUP_WINDOW_SECONDS
 
@@ -91,13 +104,44 @@ class MessageReceiver:
                     break
                 self._recent_messages.pop(oldest_key, None)
 
-            if key in self._recent_messages:
+            if key in self._recent_messages or key in self._inflight_messages:
                 return False
 
-            self._recent_messages[key] = now
+            self._inflight_messages.add(key)
+            return True
+
+    async def _complete_message(
+        self,
+        *,
+        adapter_signature: str,
+        platform: str,
+        message_id: Any,
+    ) -> None:
+        """Commit a successfully handled message to the deduplication window."""
+
+        key = self._message_key(adapter_signature, platform, message_id)
+        if key is None:
+            return
+        async with self._dedup_lock:
+            self._inflight_messages.discard(key)
+            self._recent_messages[key] = time.monotonic()
             if len(self._recent_messages) > _DEDUP_CACHE_MAX_SIZE:
                 self._recent_messages.popitem(last=False)
-            return True
+
+    async def _release_message(
+        self,
+        *,
+        adapter_signature: str,
+        platform: str,
+        message_id: Any,
+    ) -> None:
+        """Release an unsuccessful claim so a platform redelivery can retry."""
+
+        key = self._message_key(adapter_signature, platform, message_id)
+        if key is None:
+            return
+        async with self._dedup_lock:
+            self._inflight_messages.discard(key)
 
     def _get_event_manager(self) -> Any:
         """延迟获取事件管理器（避免模块导入时的循环依赖）。"""
@@ -182,23 +226,43 @@ class MessageReceiver:
         #   - 在白名单内 → _handle_message（核心可解析的标准消息）
         #   - 已设置但不在白名单 → _handle_other（notice / request / meta_event 等）
         #   - 未设置 → 退化到 has_segments 判断，保持对旧格式适配器的兼容
-        message_type = msg_info.get("message_type")
-        if message_type is not None:
-            if message_type in _STANDARD_MESSAGE_TYPES:
-                await self._handle_message(envelope, adapter_signature)
+        try:
+            message_type = msg_info.get("message_type")
+            if message_type is not None:
+                if message_type in _STANDARD_MESSAGE_TYPES:
+                    handled = await self._handle_message(envelope, adapter_signature)
+                else:
+                    handled = await self._handle_other(envelope, adapter_signature)
             else:
-                await self._handle_other(envelope, adapter_signature)
-            return
+                # message_type 未设置时：有消息段则视为标准消息，否则路由至 _handle_other
+                has_segments = (
+                    envelope.get("message_segment") is not None  # type: ignore[arg-type]
+                    or envelope.get("message_chain") is not None  # type: ignore[arg-type]
+                )
+                if has_segments:
+                    handled = await self._handle_message(envelope, adapter_signature)
+                else:
+                    handled = await self._handle_other(envelope, adapter_signature)
+        except BaseException:
+            await self._release_message(
+                adapter_signature=adapter_signature,
+                platform=str(platform),
+                message_id=message_id,
+            )
+            raise
 
-        # message_type 未设置时：有消息段则视为标准消息，否则路由至 _handle_other
-        has_segments = (
-            envelope.get("message_segment") is not None  # type: ignore[arg-type]
-            or envelope.get("message_chain") is not None  # type: ignore[arg-type]
-        )
-        if has_segments:
-            await self._handle_message(envelope, adapter_signature)
+        if handled:
+            await self._complete_message(
+                adapter_signature=adapter_signature,
+                platform=str(platform),
+                message_id=message_id,
+            )
         else:
-            await self._handle_other(envelope, adapter_signature)
+            await self._release_message(
+                adapter_signature=adapter_signature,
+                platform=str(platform),
+                message_id=message_id,
+            )
 
     # ──────────────────────────────────────────
     # 内部处理
@@ -208,7 +272,7 @@ class MessageReceiver:
         self,
         envelope: MessageEnvelope,
         adapter_signature: str,
-    ) -> None:
+    ) -> bool:
         """处理标准消息：转换并触发 ON_MESSAGE_RECEIVED 事件。"""
         try:
             message = await self._converter.envelope_to_message(envelope)
@@ -219,7 +283,7 @@ class MessageReceiver:
                 f"error={e}",
                 exc_info=True,
             )
-            return
+            return False
 
         # 构建人类可读的日志 (Rich 格式)
         msg_info = envelope.get("message_info", {})
@@ -249,6 +313,7 @@ class MessageReceiver:
                 "adapter_signature": adapter_signature,
             },
         )
+        return True
 
     async def _handle_adapter_response(self, envelope: MessageEnvelope) -> None:
         """处理适配器响应消息。
@@ -279,7 +344,7 @@ class MessageReceiver:
         self,
         envelope: MessageEnvelope,
         adapter_signature: str,
-    ) -> None:
+    ) -> bool:
         """处理非标准消息：触发 ON_RECEIVED_OTHER_MESSAGE 事件。
 
         订阅者可以通过填充 ``params["processed"]`` 字段将消息纳入标准流程。
@@ -302,7 +367,7 @@ class MessageReceiver:
             logger.debug(
                 f"其他类型消息未被处理，已丢弃: adapter={adapter_signature}"
             )
-            return
+            return True
 
         # processed 非空 → 构建简化 Message 并触发 ON_MESSAGE_RECEIVED
         msg_info = envelope.get("message_info", {})
@@ -340,3 +405,4 @@ class MessageReceiver:
                 "adapter_signature": adapter_signature,
             },
         )
+        return True

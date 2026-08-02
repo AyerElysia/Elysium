@@ -25,6 +25,7 @@ from src.app.plugin_system.api import log_api
 from src.app.plugin_system.base import BaseTool
 from src.kernel.scheduler import TriggerType, get_unified_scheduler
 
+from ..storage_utils import atomic_write_text
 from ._utils import _get_workspace
 
 logger = log_api.get_logger("life_engine.schedule_tools")
@@ -174,7 +175,8 @@ class ScheduleStore:
             "updated_at": _now_iso(),
             "records": [record.to_dict() for record in records],
         }
-        self._path.write_text(
+        atomic_write_text(
+            self._path,
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )

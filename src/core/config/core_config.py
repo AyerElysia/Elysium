@@ -8,7 +8,7 @@ from typing import Literal
 
 from pydantic import model_validator
 
-from src.kernel.config import ConfigBase, SectionBase, config_section, Field
+from src.kernel.config import ConfigBase, Field, SectionBase, config_section
 
 CORE_VERSION = "1.1.0-alpha"
 
@@ -120,6 +120,12 @@ class CoreConfig(ConfigBase):
         max_history_messages: int = Field(
             default=20,
             description="每个聊天流在内存中保留的最大历史消息数",
+        )
+        max_unread_messages: int = Field(
+            default=1000,
+            ge=1,
+            le=100_000,
+            description="每个聊天流允许保留的最大未读消息数，达到后施加背压",
         )
         image_recognition_prompt: str = Field(
             default="",

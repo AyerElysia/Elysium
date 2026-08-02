@@ -1,7 +1,6 @@
 """信号处理器。
 
-处理 SIGINT/SIGTERM 以实现优雅关闭；在支持的平台忽略 SIGHUP，
-让终端会话断开不影响无人值守运行。
+处理 SIGINT、SIGTERM 和 SIGHUP，以实现手动进程的优雅关闭。
 """
 
 from __future__ import annotations
@@ -23,7 +22,7 @@ class SignalHandler:
     行为：
     - 第一次 SIGINT/SIGTERM：请求优雅关闭
     - 3 秒内第二次关闭信号：强制立即关闭
-    - SIGHUP：忽略，仅记录终端会话已经断开
+    - SIGHUP：请求优雅关闭，避免终端断开后遗留后台进程
 
     Attributes:
         bot: Bot 实例
@@ -66,7 +65,7 @@ class SignalHandler:
             # SIGTERM 在某些平台可能不可用
             pass
 
-        # 注册 SIGHUP（终端关闭时忽略，防止 Elysium 意外退出）
+        # 注册 SIGHUP（终端关闭时优雅退出，避免残留后台进程）
         try:
             self._original_handlers[signal.SIGHUP] = signal.signal(
                 signal.SIGHUP, self._handle_sighup
@@ -76,11 +75,14 @@ class SignalHandler:
             pass
 
     def _handle_sighup(self, signum: int, frame: Any) -> None:
-        """忽略终端会话断开信号；进程关闭统一由 SIGTERM 负责。"""
+        """Treat terminal detachment as a graceful shutdown request."""
+
         self._schedule_log(
             "info",
-            "收到 SIGHUP（终端关闭），Elysium 继续在后台运行"
+            "收到 SIGHUP（终端关闭），Elysium 将优雅退出",
         )
+        self.shutdown_requested.set()
+        self.bot._running = False
 
     def _handle_signal(self, signum: int, frame: Any) -> None:
         """处理信号

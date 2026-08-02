@@ -11,16 +11,16 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import random
 import time
-import concurrent.futures
 from typing import TYPE_CHECKING, Any, AsyncGenerator, cast
 
-from src.kernel.logger import get_logger, COLOR
+from src.kernel.logger import COLOR, get_logger
 
 if TYPE_CHECKING:
-    from src.core.models.stream import ChatStream, StreamContext
     from src.core.models.message import Message
+    from src.core.models.stream import ChatStream, StreamContext
 
 logger = get_logger("stream_loop_manager", display="流循环", color=COLOR.MAGENTA)
 
@@ -424,7 +424,7 @@ class StreamLoopManager:
             return []
 
         flushed: list[Any] = []
-        while context.message_cache:
+        while context.message_cache and context.has_unread_capacity:
             msg = context.message_cache.popleft()
             context.add_unread_message(msg)
             flushed.append(msg)
@@ -570,7 +570,7 @@ class StreamLoopManager:
         Returns:
             bool: 是否可以继续执行 (True: 满足条件或无等待, False: 仍在等待)
         """
-        from src.core.components.base.chatter import Wait, WaitResumeEvent, Stop
+        from src.core.components.base.chatter import Stop, Wait, WaitResumeEvent
 
         wait_state = self._wait_states.get(stream_id)
         if not wait_state:

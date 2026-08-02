@@ -28,5 +28,14 @@ def atomic_write_text(
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_path, path)
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            # Some platforms/filesystems do not support fsync on directories.
+            pass
     finally:
         temp_path.unlink(missing_ok=True)

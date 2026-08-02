@@ -42,15 +42,15 @@ def test_stdin_eof_stops_interactive_session(monkeypatch) -> None:
     parser._input_stop_event.set.assert_called_once_with()
 
 
-def test_sighup_does_not_request_shutdown() -> None:
-    """SIGHUP 只表示终端断开，不应改变 Bot 运行状态。"""
+def test_sighup_requests_graceful_shutdown() -> None:
+    """SIGHUP must not leave a manually started process running unseen."""
     bot = SimpleNamespace(logger=Mock(), _running=True)
     handler = SignalHandler(bot)
 
     handler._handle_sighup(getattr(signal, "SIGHUP", 1), None)
 
-    assert bot._running is True
-    assert handler.is_shutdown_requested() is False
+    assert bot._running is False
+    assert handler.is_shutdown_requested() is True
 
 
 def test_sigterm_requests_graceful_shutdown() -> None:

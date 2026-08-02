@@ -17,6 +17,7 @@ from uuid import uuid4
 from src.app.plugin_system.api import log_api
 from src.kernel.scheduler import TriggerType, get_unified_scheduler
 
+from .storage_utils import atomic_write_text
 
 logger = log_api.get_logger("life_engine.autonomy", display="Autonomy")
 
@@ -164,14 +165,13 @@ class AutonomyIntentStore:
         return intents
 
     def save(self, intents: list[AutonomyIntent]) -> None:
-        parent = self.path.parent
-        parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "version": _STORE_VERSION,
             "updated_at": iso_now(),
             "intents": [intent.to_dict() for intent in intents],
         }
-        self.path.write_text(
+        atomic_write_text(
+            self.path,
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )

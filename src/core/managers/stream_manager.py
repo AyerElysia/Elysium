@@ -26,8 +26,8 @@ from src.kernel.logger import get_logger
 
 if TYPE_CHECKING:
     from src.core.models.message import Message
-    from src.core.models.stream import ChatStream, StreamContext
     from src.core.models.sql_alchemy import Messages
+    from src.core.models.stream import ChatStream, StreamContext
 
 
 logger = get_logger("stream_manager", display="StreamMgr")
@@ -196,6 +196,15 @@ class StreamManager:
                 )
 
             # 存储到全局单例字典
+            try:
+                max_unread_messages = getattr(
+                    get_core_config().chat,
+                    "max_unread_messages",
+                    1000,
+                )
+            except RuntimeError:
+                max_unread_messages = 1000
+            chat_stream.context.max_unread_messages = max_unread_messages
             self._streams[stream_id] = chat_stream
 
             return chat_stream
@@ -725,8 +734,8 @@ class StreamManager:
         Returns:
             ChatStream: 新创建的流对象
         """
-        from src.core.models.stream import ChatStream
         from src.core.managers.adapter_manager import get_adapter_manager
+        from src.core.models.stream import ChatStream
         from src.core.utils.user_query_helper import get_user_query_helper
 
         # 生成 stream_id
@@ -830,9 +839,9 @@ class StreamManager:
         Returns:
             Message: 运行时消息对象
         """
+        from src.core.managers import get_stream_manager
         from src.core.models.message import Message, MessageType
         from src.core.utils.user_query_helper import get_user_query_helper
-        from src.core.managers import get_stream_manager
 
         stream_info = await get_stream_manager().get_stream_info(db_message.stream_id)
 

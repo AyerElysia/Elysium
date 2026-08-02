@@ -15,6 +15,10 @@ if TYPE_CHECKING:
     from src.core.models.message import Message
 
 
+class StreamBacklogFull(RuntimeError):
+    """Raised when a stream reaches its configured in-memory unread limit."""
+
+
 @dataclass
 class StreamContext:
     """聊天流上下文信息。
@@ -39,6 +43,7 @@ class StreamContext:
     stream_id: str
     chat_type: str = "private"  # private/group/discuss
     max_context_size: int = 100
+    max_unread_messages: int = 1000
     unread_messages: list["Message"] = field(default_factory=list)
     history_messages: list["Message"] = field(default_factory=list)
     is_active: bool = True
@@ -68,7 +73,21 @@ class StreamContext:
         Args:
             message: 消息对象
         """
+        if not self.has_unread_capacity:
+            raise StreamBacklogFull(
+                f"stream {self.stream_id} unread backlog reached "
+                f"{self.max_unread_messages} messages"
+            )
         self.unread_messages.append(message)
+
+    @property
+    def has_unread_capacity(self) -> bool:
+        """Return whether another unread message can be retained safely."""
+
+        return (
+            self.max_unread_messages <= 0
+            or len(self.unread_messages) < self.max_unread_messages
+        )
 
     def add_history_message(self, message: "Message") -> None:
         """添加历史消息。

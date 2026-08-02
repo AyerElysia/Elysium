@@ -15,6 +15,7 @@ from plugins.life_engine.service.event_builder import (
 )
 from plugins.life_engine.service.event_bus import (
     RAW_EVENT_LOG_FILE,
+    RawEventGapError,
     RawEventStore,
     life_event_from_legacy,
 )
@@ -108,6 +109,53 @@ async def test_raw_event_store_tail_handles_utf8_across_blocks(tmp_path: Path) -
 
     assert [event.sequence for event in tail] == [298, 299, 300]
     assert tail[-1].content.startswith("中文事件-300")
+
+
+async def test_raw_event_store_reads_across_rotated_archives(tmp_path: Path) -> None:
+    """Cursor and tail reads must include retained archives in sequence order."""
+
+    store = RawEventStore(tmp_path, max_bytes=200, max_archives=40)
+    for sequence in range(1, 31):
+        await store.append(life_event_from_legacy(_event(sequence)))
+
+    assert [event.sequence for event in await store.read_since(0)] == list(
+        range(1, 31)
+    )
+    assert [event.sequence for event in await store.read_tail(5)] == list(
+        range(26, 31)
+    )
+
+
+async def test_raw_event_store_serializes_independent_writers(tmp_path: Path) -> None:
+    """Two bus instances sharing a path must not overwrite one another's appends."""
+
+    first = RawEventStore(tmp_path)
+    second = RawEventStore(tmp_path)
+    await asyncio.gather(
+        *(
+            store.append(life_event_from_legacy(_event(sequence)))
+            for store, sequences in (
+                (first, range(1, 101)),
+                (second, range(101, 201)),
+            )
+            for sequence in sequences
+        )
+    )
+
+    events = await first.read_since(0)
+    assert len(events) == 200
+    assert {event.sequence for event in events} == set(range(1, 201))
+
+
+async def test_raw_event_store_reports_retention_gap(tmp_path: Path) -> None:
+    """A consumer cursor older than retained archives must fail visibly."""
+
+    store = RawEventStore(tmp_path, max_bytes=200, max_archives=1)
+    for sequence in range(1, 7):
+        await store.append(life_event_from_legacy(_event(sequence)))
+
+    with pytest.raises(RawEventGapError):
+        await store.read_since(1)
 
 
 def test_attention_router_summarizes_low_salience_flood() -> None:

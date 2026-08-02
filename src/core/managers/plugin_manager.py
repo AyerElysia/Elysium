@@ -227,6 +227,17 @@ class PluginManager:
                     f"卸载插件 '{plugin_name}' 的 {name} 失败: {exc}"
                 )
 
+        async def _stop_owned_adapters() -> None:
+            from src.core.managers.adapter_manager import get_adapter_manager
+
+            results = await get_adapter_manager().stop_plugin_adapters(plugin_name)
+            failures = [signature for signature, success in results.items() if not success]
+            if failures:
+                raise RuntimeError(
+                    "adapter shutdown failed: " + ", ".join(sorted(failures))
+                )
+
+        await _cleanup_step("adapters", _stop_owned_adapters)
         await _cleanup_step("卸载钩子", plugin.on_plugin_unloaded)
 
         from src.core.components.types import EventType, build_signature
@@ -876,10 +887,9 @@ class PluginManager:
                 (组件类型, 组件名称, 依赖列表)
         """
         # 动态导入基类以避免循环导入
-        from src.core.components.types import ComponentType
         from src.core.components.base.action import BaseAction
-        from src.core.components.base.agent import BaseAgent
         from src.core.components.base.adapter import BaseAdapter
+        from src.core.components.base.agent import BaseAgent
         from src.core.components.base.chatter import BaseChatter
         from src.core.components.base.command import BaseCommand
         from src.core.components.base.config import BaseConfig
@@ -887,6 +897,7 @@ class PluginManager:
         from src.core.components.base.router import BaseRouter
         from src.core.components.base.service import BaseService
         from src.core.components.base.tool import BaseTool
+        from src.core.components.types import ComponentType
 
         # 组件类型到名称属性和基类的映射
         type_mapping: dict[

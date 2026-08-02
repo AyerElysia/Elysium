@@ -10,16 +10,16 @@ import asyncio
 import uuid
 from typing import TYPE_CHECKING, Any
 
-from src.kernel.concurrency import get_task_manager
-from src.kernel.event import get_event_bus, EventDecision
-from src.kernel.logger import get_logger
 from src.core.components.registry import get_global_registry
 from src.core.components.state_manager import get_global_state_manager
 from src.core.components.types import (
     ComponentState,
-    EventType,
     ComponentType,
+    EventType,
 )
+from src.kernel.concurrency import get_task_manager
+from src.kernel.event import EventDecision, get_event_bus
+from src.kernel.logger import get_logger
 
 if TYPE_CHECKING:
     from src.core.components.base.adapter import BaseAdapter
@@ -62,8 +62,59 @@ class AdapterManager:
     def __init__(self) -> None:
         """初始化适配器管理器。"""
         self._active_adapters: dict[str, BaseAdapter] = {}
+        self._lifecycle_locks: dict[str, asyncio.Lock] = {}
+
+    def _get_lifecycle_lock(self, signature: str) -> asyncio.Lock:
+        """Return the per-adapter lock used to serialize lifecycle changes."""
+
+        lock = self._lifecycle_locks.get(signature)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._lifecycle_locks[signature] = lock
+        return lock
+
+    async def _teardown_adapter_sink(self, signature: str) -> None:
+        """Best-effort removal of a sink owned by an adapter signature."""
+
+        try:
+            from src.core.transport.sink.sink_manager import get_sink_manager
+
+            sink_manager = get_sink_manager()
+        except RuntimeError:
+            return
+        try:
+            await sink_manager.teardown_adapter_sink(signature)
+        except Exception as exc:
+            logger.error(f"Failed to tear down CoreSink '{signature}': {exc}")
+
+    async def _rollback_failed_start(
+        self,
+        signature: str,
+        adapter_instance: "BaseAdapter",
+    ) -> None:
+        """Release resources allocated by a partially completed start."""
+
+        try:
+            await adapter_instance.stop()
+        except Exception as exc:
+            logger.warning(f"Failed to roll back adapter '{signature}': {exc}")
+        await self._teardown_adapter_sink(signature)
+        self._active_adapters.pop(signature, None)
+        try:
+            await get_global_state_manager().set_state_async(
+                signature,
+                ComponentState.ERROR,
+            )
+        except Exception as exc:
+            logger.debug(f"Failed to mark adapter '{signature}' as errored: {exc}")
 
     async def start_adapter(self, signature: str) -> bool:
+        """Start one adapter while serializing concurrent lifecycle requests."""
+
+        async with self._get_lifecycle_lock(signature):
+            return await self._start_adapter_unlocked(signature)
+
+    async def _start_adapter_unlocked(self, signature: str) -> bool:
         """启动适配器。
 
         从全局注册表中获取适配器组件，实例化并启动。
@@ -143,7 +194,9 @@ class AdapterManager:
             except RuntimeError:
                 logger.debug(f"SinkManager 仍未可用，跳过 CoreSink 设置: {signature}")
             except Exception as e:
-                logger.warning(f"设置 CoreSink 失败: {e}")
+                logger.error(f"设置 CoreSink 失败: {e}")
+                await self._rollback_failed_start(signature, adapter_instance)
+                return False
 
         # 启动适配器
         try:
@@ -159,9 +212,16 @@ class AdapterManager:
 
         except Exception as e:
             logger.error(f"启动适配器 '{signature}' 失败: {e}")
+            await self._rollback_failed_start(signature, adapter_instance)
             return False
 
     async def stop_adapter(self, signature: str) -> bool:
+        """Stop one adapter while serializing concurrent lifecycle requests."""
+
+        async with self._get_lifecycle_lock(signature):
+            return await self._stop_adapter_unlocked(signature)
+
+    async def _stop_adapter_unlocked(self, signature: str) -> bool:
         """停止适配器。
 
         停止指定适配器并清理资源。
@@ -186,6 +246,8 @@ class AdapterManager:
         try:
             # 停止适配器
             await adapter_instance.stop()
+
+            await self._teardown_adapter_sink(signature)
 
             # 从活跃列表中移除
             del self._active_adapters[signature]
@@ -217,23 +279,15 @@ class AdapterManager:
             >>> success = await manager.restart_adapter("my_plugin:adapter:qq")
             >>> True
         """
-        # 先停止适配器
-        if signature in self._active_adapters:
-            stop_success = await self.stop_adapter(signature)
-            if not stop_success:
-                logger.error(f"重启适配器 '{signature}' 失败: 停止阶段失败")
-                return False
+        async with self._get_lifecycle_lock(signature):
+            if signature in self._active_adapters:
+                stop_success = await self._stop_adapter_unlocked(signature)
+                if not stop_success:
+                    logger.error(f"重启适配器 '{signature}' 失败: 停止阶段失败")
+                    return False
 
-        # 等待一小段时间确保完全停止
-        await asyncio.sleep(3)
-
-        # 重新启动适配器（即使还在_active_adapters中，也要重新启动）
-        # 先从_active_adapters中移除旧的实例
-        if signature in self._active_adapters:
-            del self._active_adapters[signature]
-
-        # 重新启动适配器
-        return await self.start_adapter(signature)
+            await asyncio.sleep(0)
+            return await self._start_adapter_unlocked(signature)
 
     def get_adapter(self, signature: str) -> "BaseAdapter | None":
         """获取适配器实例。
@@ -296,11 +350,34 @@ class AdapterManager:
         Examples:
             >>> results = await manager.stop_all_adapters()
         """
-        results = {}
+        results: dict[str, bool] = {}
+        signatures = set(self._active_adapters) | set(self._lifecycle_locks)
 
-        for signature in list(self._active_adapters.keys()):
-            results[signature] = await self.stop_adapter(signature)
+        for signature in signatures:
+            async with self._get_lifecycle_lock(signature):
+                if signature not in self._active_adapters:
+                    results[signature] = True
+                    continue
+                results[signature] = await self._stop_adapter_unlocked(signature)
 
+        return results
+
+    async def stop_plugin_adapters(self, plugin_name: str) -> dict[str, bool]:
+        """Stop every active or starting adapter owned by one plugin."""
+
+        prefix = f"{plugin_name}:"
+        signatures = {
+            signature
+            for signature in set(self._active_adapters) | set(self._lifecycle_locks)
+            if signature.startswith(prefix)
+        }
+        results: dict[str, bool] = {}
+        for signature in signatures:
+            async with self._get_lifecycle_lock(signature):
+                if signature not in self._active_adapters:
+                    results[signature] = True
+                    continue
+                results[signature] = await self._stop_adapter_unlocked(signature)
         return results
 
     async def get_bot_info_by_platform(self, platform: str) -> dict[str, str] | None:

@@ -22,6 +22,9 @@ from src.kernel.logger import get_logger
 
 logger = get_logger("mcp_manager")
 _MCP_CONNECT_TIMEOUT_SECONDS = 30.0
+_MCP_INITIALIZE_TIMEOUT_SECONDS = 35.0
+_MCP_CLEANUP_TIMEOUT_SECONDS = 10.0
+_MCP_PARTIAL_CLEANUP_TIMEOUT_SECONDS = 5.0
 _MCP_TOOL_TIMEOUT_SECONDS = 60.0
 
 
@@ -58,12 +61,19 @@ class MCPManager:
         self._tool_signatures: set[str] = set()
         self._server_metadata: dict[str, MCPServerMetadata] = {}
         self._tool_classes_by_server: dict[str, list[type[Any]]] = {}
+        self._lifecycle_lock = asyncio.Lock()
         logger.info("MCP 管理器初始化")
 
     async def initialize(self) -> None:
+        """Initialize all configured servers under one lifecycle lock."""
+
+        async with self._lifecycle_lock:
+            await self._initialize_unlocked()
+
+    async def _initialize_unlocked(self) -> None:
         """初始化 MCP 管理器。"""
         if self._sessions or self._adapters or self._tool_signatures:
-            await self.cleanup()
+            await self._cleanup_unlocked()
 
         try:
             from src.core.config import get_mcp_config
@@ -77,6 +87,7 @@ class MCPManager:
             logger.info("MCP 功能未启用")
             return
 
+        connection_tasks: list[Coroutine[Any, Any, bool]] = []
         if config.mcp.stdio_servers:
             logger.info(f"开始连接 Stdio MCP 服务器: {list(config.mcp.stdio_servers.keys())}")
             for name, params in config.mcp.stdio_servers.items():
@@ -85,9 +96,11 @@ class MCPManager:
                 env = params.get("env")
 
                 if command:
-                    await self._run_connection_task(
-                        name,
-                        self.connect_stdio_server(name, command, args, env),
+                    connection_tasks.append(
+                        self._run_connection_task(
+                            name,
+                            self.connect_stdio_server(name, command, args, env),
+                        )
                     )
                 else:
                     logger.error(f"MCP 服务器 {name} 配置缺少 command")
@@ -95,9 +108,11 @@ class MCPManager:
         if config.mcp.sse_servers:
             logger.info(f"开始连接 SSE MCP 服务器: {list(config.mcp.sse_servers.keys())}")
             for name, params in config.mcp.sse_servers.items():
-                await self._run_connection_task(
-                    name,
-                    self.connect_sse_server_from_config(name, params),
+                connection_tasks.append(
+                    self._run_connection_task(
+                        name,
+                        self.connect_sse_server_from_config(name, params),
+                    )
                 )
 
         if config.mcp.streamable_http_servers:
@@ -106,9 +121,20 @@ class MCPManager:
                 f"{list(config.mcp.streamable_http_servers.keys())}"
             )
             for name, params in config.mcp.streamable_http_servers.items():
-                await self._run_connection_task(
-                    name,
-                    self.connect_streamable_http_server_from_config(name, params),
+                connection_tasks.append(
+                    self._run_connection_task(
+                        name,
+                        self.connect_streamable_http_server_from_config(name, params),
+                    )
+                )
+
+        if connection_tasks:
+            try:
+                async with asyncio.timeout(_MCP_INITIALIZE_TIMEOUT_SECONDS):
+                    await asyncio.gather(*connection_tasks)
+            except TimeoutError:
+                logger.error(
+                    "MCP 初始化超过总时限，未完成的服务器连接已取消"
                 )
 
     async def _run_connection_task(
@@ -140,6 +166,21 @@ class MCPManager:
             logger.error(f"MCP 服务器连接任务失败 {name}: {e}")
             return False
 
+    async def _close_connection_stack(
+        self,
+        connection_stack: AsyncExitStack,
+        name: str,
+    ) -> None:
+        """Bound cleanup of resources from a failed server connection."""
+
+        try:
+            async with asyncio.timeout(_MCP_PARTIAL_CLEANUP_TIMEOUT_SECONDS):
+                await connection_stack.aclose()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"清理 MCP 服务器部分连接失败 {name}: {exc}")
+
     async def connect_stdio_server(
         self,
         name: str,
@@ -168,14 +209,14 @@ class MCPManager:
             return True
 
         except asyncio.CancelledError:
-            await connection_stack.aclose()
+            await self._close_connection_stack(connection_stack, name)
             raise
         except BaseExceptionGroup as e:
-            await connection_stack.aclose()
+            await self._close_connection_stack(connection_stack, name)
             logger.error(f"连接 MCP 服务器失败 {name}: {e}")
             return False
         except Exception as e:
-            await connection_stack.aclose()
+            await self._close_connection_stack(connection_stack, name)
             logger.error(f"连接 MCP 服务器失败 {name}: {e}")
             return False
 
@@ -229,14 +270,14 @@ class MCPManager:
             self._adopt_connection_stack(connection_stack)
             return True
         except asyncio.CancelledError:
-            await connection_stack.aclose()
+            await self._close_connection_stack(connection_stack, name)
             raise
         except BaseExceptionGroup as e:
-            await connection_stack.aclose()
+            await self._close_connection_stack(connection_stack, name)
             logger.error(f"连接 SSE MCP 服务器失败 {name}: {e}")
             return False
         except Exception as e:
-            await connection_stack.aclose()
+            await self._close_connection_stack(connection_stack, name)
             logger.error(f"连接 SSE MCP 服务器失败 {name}: {e}")
             return False
 
@@ -289,14 +330,14 @@ class MCPManager:
             self._adopt_connection_stack(connection_stack)
             return True
         except asyncio.CancelledError:
-            await connection_stack.aclose()
+            await self._close_connection_stack(connection_stack, name)
             raise
         except BaseExceptionGroup as e:
-            await connection_stack.aclose()
+            await self._close_connection_stack(connection_stack, name)
             logger.error(f"连接 Streamable HTTP MCP 服务器失败 {name}: {e}")
             return False
         except Exception as e:
-            await connection_stack.aclose()
+            await self._close_connection_stack(connection_stack, name)
             logger.error(f"连接 Streamable HTTP MCP 服务器失败 {name}: {e}")
             return False
 
@@ -488,6 +529,12 @@ class MCPManager:
         )
 
     async def cleanup(self) -> None:
+        """Clean up all resources under the lifecycle lock."""
+
+        async with self._lifecycle_lock:
+            await self._cleanup_unlocked()
+
+    async def _cleanup_unlocked(self) -> None:
         """清理资源。"""
         from src.core.components.registry import get_global_registry
         from src.core.components.state_manager import get_global_state_manager
@@ -499,9 +546,15 @@ class MCPManager:
             state_manager.remove_state(signature)
 
         try:
-            await self._exit_stack.aclose()
+            async with asyncio.timeout(_MCP_CLEANUP_TIMEOUT_SECONDS):
+                await self._exit_stack.aclose()
         except asyncio.CancelledError as e:
-            logger.warning(f"MCP 管理器关闭连接时被取消，已忽略: {e}")
+            logger.warning(f"MCP 管理器关闭连接时被取消: {e}")
+            raise
+        except TimeoutError:
+            logger.warning(
+                f"MCP 管理器关闭连接超过 {_MCP_CLEANUP_TIMEOUT_SECONDS:.0f}s 时限"
+            )
         except BaseExceptionGroup as e:
             logger.warning(f"MCP 管理器关闭连接时出现异常，已忽略: {e}")
         except Exception as e:

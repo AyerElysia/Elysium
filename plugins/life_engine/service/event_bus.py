@@ -10,15 +10,27 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from .event_builder import EventType, LifeEngineEvent
 
-
 RAW_EVENT_LOG_FILE = "life_events.jsonl"
+
+
+class RawEventGapError(RuntimeError):
+    """Raised when a requested cursor predates every retained raw event."""
+
+    def __init__(self, requested_sequence: int, earliest_available: int) -> None:
+        self.requested_sequence = requested_sequence
+        self.earliest_available = earliest_available
+        super().__init__(
+            "raw event history gap: requested after "
+            f"{requested_sequence}, earliest retained is {earliest_available}"
+        )
 
 
 class LifeEventPriority(IntEnum):
@@ -206,6 +218,9 @@ class RawEventStore:
     旧的 .1 重命名为 .2，超出 max_archives 的最旧归档被删除。
     """
 
+    _path_locks_guard: ClassVar[Any] = threading.Lock()
+    _path_locks: ClassVar[dict[Path, threading.RLock]] = {}
+
     def __init__(
         self,
         workspace_path: str | Path,
@@ -216,63 +231,95 @@ class RawEventStore:
         self._path = Path(workspace_path).resolve() / filename
         self._max_bytes = max_bytes
         self._max_archives = max_archives
+        with self._path_locks_guard:
+            self._path_lock = self._path_locks.setdefault(
+                self._path,
+                threading.RLock(),
+            )
 
     @property
     def path(self) -> Path:
         return self._path
+
+    def _archive_path(self, index: int) -> Path:
+        return self._path.with_name(f"{self._path.name}.{index}")
+
+    def _paths_oldest_first(self) -> list[Path]:
+        archives = [
+            self._archive_path(index)
+            for index in range(self._max_archives, 0, -1)
+            if self._archive_path(index).exists()
+        ]
+        if self._path.exists():
+            archives.append(self._path)
+        return archives
+
+    def _paths_newest_first(self) -> list[Path]:
+        paths = [self._path] if self._path.exists() else []
+        paths.extend(
+            self._archive_path(index)
+            for index in range(1, self._max_archives + 1)
+            if self._archive_path(index).exists()
+        )
+        return paths
 
     def _maybe_rotate(self) -> None:
         """尺寸轮转：超过阈值时将当前文件归档。"""
         try:
             if not self._path.exists() or self._path.stat().st_size < self._max_bytes:
                 return
+            if self._max_archives <= 0:
+                self._path.unlink()
+                return
             # 删除最旧的归档
-            oldest = self._path.with_suffix(f".jsonl.{self._max_archives}")
+            oldest = self._archive_path(self._max_archives)
             if oldest.exists():
                 oldest.unlink()
             # 依次后移已有归档
             for i in range(self._max_archives - 1, 0, -1):
-                src = self._path.with_suffix(f".jsonl.{i}")
-                dst = self._path.with_suffix(f".jsonl.{i + 1}")
+                src = self._archive_path(i)
+                dst = self._archive_path(i + 1)
                 if src.exists():
                     src.rename(dst)
             # 当前文件 -> .1
-            self._path.rename(self._path.with_suffix(".jsonl.1"))
+            self._path.rename(self._archive_path(1))
         except OSError:
             pass  # 轮转失败不阻塞写入
 
     def _append_sync(self, event: LifeEvent) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._maybe_rotate()
-        line = json.dumps(life_event_to_dict(event), ensure_ascii=False)
-        with self._path.open("a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
+        with self._path_lock:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._maybe_rotate()
+            line = json.dumps(life_event_to_dict(event), ensure_ascii=False)
+            with self._path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
 
     async def append(self, event: LifeEvent) -> None:
         await asyncio.to_thread(self._append_sync, event)
 
     def _append_many_sync(self, events: list[LifeEvent]) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._maybe_rotate()
-        lines = [
-            json.dumps(life_event_to_dict(event), ensure_ascii=False)
-            for event in events
-        ]
-        with self._path.open("a", encoding="utf-8") as handle:
-            handle.write("\n".join(lines) + "\n")
+        with self._path_lock:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._maybe_rotate()
+            lines = [
+                json.dumps(life_event_to_dict(event), ensure_ascii=False)
+                for event in events
+            ]
+            with self._path.open("a", encoding="utf-8") as handle:
+                handle.write("\n".join(lines) + "\n")
 
     async def append_many(self, events: list[LifeEvent]) -> None:
         if not events:
             return
         await asyncio.to_thread(self._append_many_sync, events)
 
-    def _read_tail_sync(self, limit: int) -> list[LifeEvent]:
-        if limit <= 0 or not self._path.exists():
+    def _read_tail_from_path(self, path: Path, limit: int) -> list[LifeEvent]:
+        if limit <= 0 or not path.exists():
             return []
         block_size = 64 * 1024
         chunks: list[bytes] = []
         newline_count = 0
-        with self._path.open("rb") as handle:
+        with path.open("rb") as handle:
             handle.seek(0, 2)
             position = handle.tell()
             while position > 0 and newline_count <= limit:
@@ -285,22 +332,48 @@ class RawEventStore:
         text = b"".join(reversed(chunks)).decode("utf-8", errors="replace")
         return self._decode_lines(text.splitlines()[-limit:])
 
+    def _read_tail_sync(self, limit: int) -> list[LifeEvent]:
+        if limit <= 0:
+            return []
+        with self._path_lock:
+            remaining = limit
+            chunks: list[list[LifeEvent]] = []
+            for path in self._paths_newest_first():
+                chunk = self._read_tail_from_path(path, remaining)
+                if chunk:
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                if remaining <= 0:
+                    break
+            return [event for chunk in reversed(chunks) for event in chunk]
+
     async def read_tail(self, limit: int = 100) -> list[LifeEvent]:
         return await asyncio.to_thread(self._read_tail_sync, limit)
 
     def _read_since_sync(self, sequence: int, limit: int | None) -> list[LifeEvent]:
-        if not self._path.exists():
-            return []
-        result: list[LifeEvent] = []
-        with self._path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                events = self._decode_lines([line])
-                if not events or events[0].sequence <= sequence:
-                    continue
-                result.append(events[0])
-                if limit is not None and len(result) >= limit:
-                    break
-        return result
+        with self._path_lock:
+            paths = self._paths_oldest_first()
+            if not paths:
+                return []
+            result: list[LifeEvent] = []
+            earliest_available: int | None = None
+            for path in paths:
+                with path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        events = self._decode_lines([line])
+                        if not events:
+                            continue
+                        event = events[0]
+                        if earliest_available is None:
+                            earliest_available = event.sequence
+                            if sequence > 0 and earliest_available > sequence + 1:
+                                raise RawEventGapError(sequence, earliest_available)
+                        if event.sequence <= sequence:
+                            continue
+                        result.append(event)
+                        if limit is not None and len(result) >= limit:
+                            return result
+            return result
 
     async def read_since(
         self,

@@ -11,8 +11,8 @@
 5. 并发控制 - 使用 concurrency 模块统一管理任务
 """
 
-import inspect
 import asyncio
+import inspect
 import uuid
 import weakref
 from collections import defaultdict
@@ -22,10 +22,10 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from src.kernel.concurrency import get_task_manager
-from src.kernel.logger import get_logger
-from src.kernel.scheduler.types import TaskExecution, TaskStatus, TriggerType
-from src.kernel.scheduler.time_utils import next_after
 from src.kernel.concurrency.blocking import BlockingPool
+from src.kernel.logger import get_logger
+from src.kernel.scheduler.time_utils import next_after
+from src.kernel.scheduler.types import TaskExecution, TaskStatus, TriggerType
 
 logger = get_logger("kernel.scheduler", display="调度器")
 
@@ -135,6 +135,22 @@ class ScheduleTask:
         self.current_execution = execution
         self.status = TaskStatus.RUNNING
         return execution
+
+    def claim_execution(self) -> bool:
+        """Atomically claim a pending task before scheduling its coroutine."""
+
+        if not self.can_trigger():
+            return False
+        self.start_execution()
+        return True
+
+    def release_execution_claim(self) -> None:
+        """Return an unsubmitted execution claim to the pending state."""
+
+        if self.status != TaskStatus.RUNNING or self.current_execution is None:
+            return
+        self.current_execution = None
+        self.status = TaskStatus.PENDING
 
     def finish_execution(self, success: bool, result: Any = None, error: Exception | None = None) -> None:
         """完成当前执行"""
@@ -498,11 +514,19 @@ class UnifiedScheduler:
         # 为每个任务创建独立的执行 Task（使用 task_manager）
         execution_tasks = []
         for task in tasks:
-            task_info = self._task_manager.create_task(
-                self._execute_task(task),
-                name=f"exec_{task.task_name}",
-                daemon=True,  # 调度器执行的任务不受超时检查
-            )
+            if not task.claim_execution():
+                continue
+            execution_coro = self._execute_task(task)
+            try:
+                task_info = self._task_manager.create_task(
+                    execution_coro,
+                    name=f"exec_{task.task_name}",
+                    daemon=True,  # 调度器执行的任务不受超时检查
+                )
+            except BaseException:
+                execution_coro.close()
+                task.release_execution_claim()
+                raise
             task._asyncio_task_id = task_info.task_id
             execution_tasks.append(task_info.task_id)
 
@@ -518,8 +542,6 @@ class UnifiedScheduler:
 
     async def _execute_task(self, task: ScheduleTask) -> None:
         """执行单个任务（完全隔离）"""
-        task.start_execution()
-
         try:
             # 使用信号量控制并发
             async with self._acquire_semaphore():
@@ -686,12 +708,20 @@ class UnifiedScheduler:
         # 并发执行所有事件任务（使用 task_manager）
         execution_task_ids = []
         for task in tasks_to_trigger:
+            if not task.claim_execution():
+                continue
             # 将事件参数注入到回调
-            task_info = self._task_manager.create_task(
-                self._execute_event_task(task, event_params),
-                name=f"event_exec_{task.task_name}",
-                daemon=True,
-            )
+            execution_coro = self._execute_event_task(task, event_params)
+            try:
+                task_info = self._task_manager.create_task(
+                    execution_coro,
+                    name=f"event_exec_{task.task_name}",
+                    daemon=True,
+                )
+            except BaseException:
+                execution_coro.close()
+                task.release_execution_claim()
+                raise
             task._asyncio_task_id = task_info.task_id
             execution_task_ids.append(task_info.task_id)
 
@@ -706,8 +736,6 @@ class UnifiedScheduler:
 
     async def _execute_event_task(self, task: ScheduleTask, event_params: dict[str, Any]) -> None:
         """执行事件触发的任务"""
-        task.start_execution()
-
         try:
             async with self._acquire_semaphore():
                 timeout = task.timeout or self.config.task_default_timeout
@@ -953,18 +981,24 @@ class UnifiedScheduler:
             logger.warning(f"尝试触发不存在的任务: {schedule_id[:8]}...")
             return False
 
-        if not task.can_trigger():
+        if not task.claim_execution():
             logger.warning(f"任务 {task.task_name} 当前状态 {task.status.value} 无法触发")
             return False
 
         logger.info(f"强制触发任务: {task.task_name}")
 
         # 创建执行任务（使用 task_manager）
-        task_info = self._task_manager.create_task(
-            self._execute_task(task),
-            name=f"manual_trigger_{task.task_name}",
-            daemon=True,
-        )
+        execution_coro = self._execute_task(task)
+        try:
+            task_info = self._task_manager.create_task(
+                execution_coro,
+                name=f"manual_trigger_{task.task_name}",
+                daemon=True,
+            )
+        except BaseException:
+            execution_coro.close()
+            task.release_execution_claim()
+            raise
         task._asyncio_task_id = task_info.task_id
 
         # 等待完成

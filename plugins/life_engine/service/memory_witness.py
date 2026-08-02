@@ -16,11 +16,11 @@ from typing import TYPE_CHECKING, Any, Sequence
 
 from src.app.plugin_system.api.llm_api import get_model_set_by_task
 from src.app.plugin_system.api.log_api import get_logger
-from src.kernel.llm import LLMPayload, LLMRequest, ROLE, Text
+from src.kernel.llm import ROLE, LLMPayload, LLMRequest, Text
 
 from ..memory.experience import EpistemicKind, ExperienceRecord, WitnessMemory
 from .consciousness import ConsciousnessInstance
-from .event_bus import LifeEvent
+from .event_bus import LifeEvent, RawEventGapError
 from .world_state import PerceptionFilter
 
 if TYPE_CHECKING:
@@ -138,10 +138,18 @@ class MemoryWitnessCoordinator:
             state = await memory.get_witness_state(instance.instance_id)
             cursor = int(state.get("last_sequence", 0) or 0)
             limit = max(1, int(getattr(cfg, "max_events_per_run", 80)))
-            raw_events = await self._service._get_event_bus().store.read_since(
-                cursor,
-                limit=limit,
-            )
+            store = self._service._get_event_bus().store
+            try:
+                raw_events = await store.read_since(cursor, limit=limit)
+            except RawEventGapError as gap:
+                logger.error(
+                    "Raw event retention overtook the witness cursor; "
+                    "resuming from the earliest retained event: "
+                    f"requested={gap.requested_sequence}, "
+                    f"earliest={gap.earliest_available}"
+                )
+                cursor = gap.earliest_available - 1
+                raw_events = await store.read_since(cursor, limit=limit)
             if not raw_events:
                 await memory.update_witness_state(
                     instance.instance_id,

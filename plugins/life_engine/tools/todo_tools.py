@@ -5,6 +5,7 @@ TODO 不再是愿望清单，而是需要被推进、复盘、完成或放弃的
 
 from __future__ import annotations
 
+import asyncio
 import calendar
 import json
 from dataclasses import asdict, dataclass, field
@@ -17,14 +18,24 @@ from uuid import uuid4
 from src.app.plugin_system.api import log_api
 from src.app.plugin_system.base import BaseTool
 
+from ..storage_utils import atomic_write_text
 from ._utils import _get_workspace
-
 
 logger = log_api.get_logger("life_engine.todos")
 
 _TODO_FILE = "todos.json"
 _TODO_VERSION = 2
 _MAX_LIST_LIMIT = 25
+_TODO_WRITE_LOCK: asyncio.Lock | None = None
+
+
+def _get_todo_write_lock() -> asyncio.Lock:
+    """Return the process-local lock for TODO read-modify-write transactions."""
+
+    global _TODO_WRITE_LOCK
+    if _TODO_WRITE_LOCK is None:
+        _TODO_WRITE_LOCK = asyncio.Lock()
+    return _TODO_WRITE_LOCK
 
 TodoStatusLiteral = Literal[
     "pending",
@@ -300,7 +311,11 @@ class TodoStorage:
         while archive_path.exists():
             archive_path = self.workspace / f"todos_legacy_{_now_stamp()}_{suffix}.json"
             suffix += 1
-        archive_path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_text(
+            archive_path,
+            json.dumps(items, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         self.save([])
         logger.info(f"已归档旧 TODO 数据: {archive_path}")
 
@@ -344,7 +359,8 @@ class TodoStorage:
             "updated_at": _now_iso(),
             "tasks": [todo.to_dict() for todo in todos],
         }
-        self.file_path.write_text(
+        atomic_write_text(
+            self.file_path,
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
@@ -569,6 +585,45 @@ class LifeEngineManageTodoTool(BaseTool):
     chatter_allow: list[str] = ["life_engine_internal", "life_chatter"]
 
     async def execute(
+        self,
+        action: Annotated[TodoAction, "操作：create/update/edit/start/log_progress/complete/cancel/archive/delete/review"],
+        todo_id: Annotated[str, "TODO ID（除 create 外通常必填）"] = "",
+        title: Annotated[str, "标题"] = "",
+        description: Annotated[str, "详细说明"] = "",
+        status: Annotated[TodoStatusLiteral | None, "状态"] = None,
+        priority: Annotated[TodoPriorityLiteral | None, "优先级：low/normal/high/urgent"] = None,
+        next_action: Annotated[str, "下一步具体行动"] = "",
+        due_at: Annotated[str | None, "截止时间，ISO 或 YYYY-MM-DD"] = None,
+        remind_at: Annotated[str | None, "提醒时间，ISO 或 YYYY-MM-DD"] = None,
+        next_review_at: Annotated[str | None, "下次复盘时间，ISO 或 YYYY-MM-DD"] = None,
+        recurrence: Annotated[TodoRecurrenceLiteral | None, "周期：none/daily/weekly/monthly/interval"] = None,
+        recurrence_interval_seconds: Annotated[float | None, "recurrence=interval 时的周期秒数"] = None,
+        visibility: Annotated[TodoVisibilityLiteral | None, "可见性：private/shared"] = None,
+        source: Annotated[str, "来源：life_engine/life_chatter/user 等"] = "",
+        related_stream_id: Annotated[str, "相关聊天流 ID"] = "",
+        note: Annotated[str, "进展、复盘、完成或取消说明"] = "",
+    ) -> tuple[bool, str | dict]:
+        async with _get_todo_write_lock():
+            return await self._execute_locked(
+                action=action,
+                todo_id=todo_id,
+                title=title,
+                description=description,
+                status=status,
+                priority=priority,
+                next_action=next_action,
+                due_at=due_at,
+                remind_at=remind_at,
+                next_review_at=next_review_at,
+                recurrence=recurrence,
+                recurrence_interval_seconds=recurrence_interval_seconds,
+                visibility=visibility,
+                source=source,
+                related_stream_id=related_stream_id,
+                note=note,
+            )
+
+    async def _execute_locked(
         self,
         action: Annotated[TodoAction, "操作：create/update/edit/start/log_progress/complete/cancel/archive/delete/review"],
         todo_id: Annotated[str, "TODO ID（除 create 外通常必填）"] = "",

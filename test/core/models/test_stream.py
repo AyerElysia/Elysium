@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.core.models.stream import ChatStream, StreamContext
+from src.core.models.stream import ChatStream, StreamBacklogFull, StreamContext
 
 
 class TestStreamContext:
@@ -52,6 +52,18 @@ class TestStreamContext:
             context.add_unread_message(mock_message)
 
         assert len(context.unread_messages) == 5
+
+    def test_unread_backlog_has_a_hard_limit(self):
+        """Unread messages must not grow beyond the configured memory bound."""
+
+        context = StreamContext(stream_id="test", max_unread_messages=2)
+        context.add_unread_message(MagicMock())
+        context.add_unread_message(MagicMock())
+
+        with pytest.raises(StreamBacklogFull):
+            context.add_unread_message(MagicMock())
+
+        assert len(context.unread_messages) == 2
 
     def test_add_history_message(self):
         """测试添加历史消息。"""

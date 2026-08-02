@@ -30,9 +30,14 @@ async def test_message_claim_expires_after_dedup_window() -> None:
 
     with patch(
         "src.core.transport.message_receive.receiver.time.monotonic",
-        side_effect=[100.0, 221.0],
+        side_effect=[100.0, 100.0, 221.0],
     ):
         first = await receiver._claim_message(
+            adapter_signature="plugin:adapter:qq",
+            platform="qq",
+            message_id="msg-expiring",
+        )
+        await receiver._complete_message(
             adapter_signature="plugin:adapter:qq",
             platform="qq",
             message_id="msg-expiring",
@@ -145,3 +150,45 @@ async def test_receive_envelope_different_message_ids_not_deduped() -> None:
 
     assert converter.envelope_to_message.await_count == 2
     assert event_manager.publish_event.await_count == 2
+
+
+async def test_conversion_failure_releases_claim_for_redelivery() -> None:
+    """A transient conversion failure must not permanently suppress redelivery."""
+
+    message = Message(
+        message_id="msg-retry",
+        content="hello",
+        processed_plain_text="hello",
+        sender_id="u1",
+        sender_name="Alice",
+        platform="qq",
+        chat_type="private",
+        stream_id="stream-1",
+    )
+    converter = MagicMock()
+    converter.envelope_to_message = AsyncMock(
+        side_effect=[ValueError("temporary decode failure"), message]
+    )
+    receiver = MessageReceiver(converter=converter)
+    receiver._update_person_info = AsyncMock()  # type: ignore[method-assign]
+    event_manager = MagicMock()
+    event_manager.publish_event = AsyncMock(
+        return_value={"decision": "SUCCESS", "params": {}}
+    )
+    receiver._event_manager = event_manager
+    envelope = {
+        "direction": "incoming",
+        "message_info": {
+            "message_id": "msg-retry",
+            "platform": "qq",
+            "message_type": "private",
+            "user_info": {"user_id": "u1", "user_nickname": "Alice"},
+        },
+        "message_segment": [{"type": "text", "data": {"text": "hello"}}],
+    }
+
+    await receiver.receive_envelope(envelope, "plugin:adapter:qq")
+    await receiver.receive_envelope(envelope, "plugin:adapter:qq")
+
+    assert converter.envelope_to_message.await_count == 2
+    assert event_manager.publish_event.await_count == 1

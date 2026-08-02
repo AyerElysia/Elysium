@@ -47,9 +47,22 @@ async def test_shutdown_continues_after_independent_step_failure(
         publish=AsyncMock(side_effect=RuntimeError("event stop failed"))
     )
     bot.scheduler = SimpleNamespace(stop=AsyncMock())
-    bot._unload_all_plugins = AsyncMock()  # type: ignore[method-assign]
+    shutdown_order = []
+    bot._unload_all_plugins = AsyncMock(  # type: ignore[method-assign]
+        side_effect=lambda: shutdown_order.append("plugins")
+    )
     network_cleanup = Mock()
     bot._shutdown_async_network_runtime = network_cleanup  # type: ignore[method-assign]
+
+    adapter_manager = SimpleNamespace(
+        stop_all_adapters=AsyncMock(
+            side_effect=lambda: shutdown_order.append("adapters") or {}
+        )
+    )
+    monkeypatch.setattr(
+        "src.core.managers.adapter_manager.get_adapter_manager",
+        lambda: adapter_manager,
+    )
 
     stream_manager = SimpleNamespace(stop=AsyncMock())
     monkeypatch.setattr(
@@ -74,9 +87,46 @@ async def test_shutdown_continues_after_independent_step_failure(
         await bot.shutdown()
 
     bot.scheduler.stop.assert_awaited_once()
+    adapter_manager.stop_all_adapters.assert_awaited_once()
     bot._unload_all_plugins.assert_awaited_once()
+    assert shutdown_order[:2] == ["adapters", "plugins"]
     stream_manager.stop.assert_awaited_once()
     close_engine.assert_awaited_once()
     close_vectors.assert_awaited_once()
     close_logger.assert_awaited_once()
     network_cleanup.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_deadline_is_hard_even_when_cleanup_delays_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One cancellation-resistant cleanup step must not hang shutdown forever."""
+
+    bot = Bot()
+    stream_manager = SimpleNamespace(stop=AsyncMock())
+    adapter_manager = SimpleNamespace(stop_all_adapters=AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        "src.core.transport.distribution.stream_loop_manager."
+        "get_stream_loop_manager",
+        lambda: stream_manager,
+    )
+    monkeypatch.setattr(
+        "src.core.managers.adapter_manager.get_adapter_manager",
+        lambda: adapter_manager,
+    )
+
+    async def delayed_cancellation() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.2)
+
+    bot._unload_all_plugins = delayed_cancellation  # type: ignore[method-assign]
+    started_at = asyncio.get_running_loop().time()
+
+    await bot.shutdown(timeout=0.03, raise_on_error=False)
+
+    elapsed = asyncio.get_running_loop().time() - started_at
+    assert elapsed < 0.15
+    await asyncio.sleep(0.25)

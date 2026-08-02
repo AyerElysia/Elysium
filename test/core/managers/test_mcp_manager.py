@@ -62,6 +62,46 @@ async def test_mcp_manager_initialize_dispatches_all_server_types(
     )
 
 
+async def test_mcp_manager_connects_configured_servers_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One slow MCP server must not add its full timeout to every later server."""
+
+    manager = MCPManager()
+    config = MCPConfig(
+        mcp=MCPConfig.MCPSection(
+            enabled=True,
+            stdio_servers={
+                "first": {"command": "one"},
+                "second": {"command": "two"},
+            },
+        )
+    )
+    monkeypatch.setattr("src.core.config.get_mcp_config", lambda: config)
+    active = 0
+    maximum_active = 0
+
+    async def connect(*_args, **_kwargs) -> bool:
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        try:
+            await asyncio.sleep(0.02)
+            return True
+        finally:
+            active -= 1
+
+    async def run_connection(_name: str, coro):
+        return await coro
+
+    manager.connect_stdio_server = connect  # type: ignore[method-assign]
+    manager._run_connection_task = run_connection  # type: ignore[method-assign]
+
+    await manager.initialize()
+
+    assert maximum_active == 2
+
+
 def test_mcp_manager_get_deferred_tool_classes_filters_by_metadata() -> None:
     """应仅返回配置为 defer_loading 的服务工具类。"""
     manager = MCPManager()
@@ -165,3 +205,25 @@ async def test_mcp_tool_call_has_hard_timeout() -> None:
 
     with pytest.raises(asyncio.TimeoutError):
         await manager.call_tool("slow", "hang", {}, timeout=0.01)
+
+
+async def test_mcp_cleanup_has_a_hard_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken transport exit must not hold application shutdown forever."""
+
+    manager = MCPManager()
+    never_returns = asyncio.Event()
+
+    async def hang_close() -> None:
+        await never_returns.wait()
+
+    manager._exit_stack = SimpleNamespace(aclose=hang_close)  # type: ignore[assignment]
+    monkeypatch.setattr(
+        "src.core.managers.tool_manager.mcp_manager._MCP_CLEANUP_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    await asyncio.wait_for(manager.cleanup(), timeout=0.1)
+
+    assert manager._sessions == {}

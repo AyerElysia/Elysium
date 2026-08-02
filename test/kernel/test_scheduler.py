@@ -16,7 +16,6 @@ from src.kernel.scheduler import (
     UnifiedScheduler,
     get_unified_scheduler,
 )
-
 from src.kernel.scheduler.time_utils import next_after
 
 
@@ -648,6 +647,40 @@ class TestSchedulerTimeUtils:
         # 清理
         await get_unified_scheduler().remove_schedule(schedule_id)
 
+    async def test_concurrent_event_triggers_execute_once(self):
+        """Concurrent publication must not claim the same recurring task twice."""
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        executions = 0
+
+        async def event_handler(**_kwargs):
+            nonlocal executions
+            executions += 1
+            entered.set()
+            await release.wait()
+
+        schedule_id = await get_unified_scheduler().create_schedule(
+            callback=event_handler,
+            trigger_type=TriggerType.EVENT,
+            trigger_config={"event_name": "concurrent_event"},
+            task_name="concurrent_event_handler",
+            is_recurring=True,
+        )
+
+        first = asyncio.create_task(
+            get_unified_scheduler().trigger_event("concurrent_event")
+        )
+        second = asyncio.create_task(
+            get_unified_scheduler().trigger_event("concurrent_event")
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        release.set()
+        await asyncio.gather(first, second)
+
+        assert executions == 1
+        await get_unified_scheduler().remove_schedule(schedule_id)
+
     async def test_synchronous_callback(self):
         """测试同步函数作为callback"""
         executed = []
@@ -732,8 +765,13 @@ class TestSchedulerTimeUtils:
 
     async def test_task_info_with_zero_success_count(self):
         """测试任务信息中成功次数为0时的平均执行时间"""
+        finished = asyncio.Event()
+
         async def failing_task():
-            raise ValueError("Always fails")
+            try:
+                raise ValueError("Always fails")
+            finally:
+                finished.set()
 
         schedule_id = await get_unified_scheduler().create_schedule(
             callback=failing_task,
@@ -742,7 +780,8 @@ class TestSchedulerTimeUtils:
             task_name="test_failing_for_stats",
         )
 
-        await asyncio.sleep(2)
+        await asyncio.wait_for(finished.wait(), timeout=4)
+        await asyncio.sleep(0)
 
         task_info = await get_unified_scheduler().get_task_info(schedule_id)
         # 失败的任务会被移除，所以应该返回None

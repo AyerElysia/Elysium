@@ -14,8 +14,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from ..storage_utils import atomic_write_text
 from ..trace.store import LifeTraceRecord
-
 
 NARRATIVE_DIR_NAME = ".life_narrative"
 AUTOBIOGRAPHY_REL_PATH = "narrative/autobiography.md"
@@ -75,8 +75,10 @@ class NarrativeStore:
 
     def _save_state(self, state: dict[str, str]) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
-        self.state_path.write_text(
-            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+        atomic_write_text(
+            self.state_path,
+            json.dumps(state, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
 
     def mark_invited(self, *, now: datetime | None = None) -> None:
@@ -170,7 +172,8 @@ class NarrativeStore:
     def _append_autobiography(self, entry: NarrativeEntry) -> None:
         self.autobiography_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.autobiography_path.exists():
-            self.autobiography_path.write_text(
+            atomic_write_text(
+                self.autobiography_path,
                 "# 自我叙事\n\n这里的每一段都是我自己写下的——回望长河时，我对自己说的话。\n",
                 encoding="utf-8",
             )

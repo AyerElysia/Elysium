@@ -21,10 +21,10 @@ from .exceptions import BotInitializationError, BotRuntimeError, BotShutdownErro
 from .signal_handler import SignalHandler
 
 if TYPE_CHECKING:
-    from src.core.config import CoreConfig
     from src.core.components import PluginLoader, PluginManifest
+    from src.core.config import CoreConfig
     from src.core.managers import MCPManager, PluginManager
-    from src.core.transport import MessageReceiver, HTTPServer, SinkManager
+    from src.core.transport import HTTPServer, MessageReceiver, SinkManager
     from src.kernel.concurrency import TaskManager, WatchDog
     from src.kernel.event import EventBus
     from src.kernel.logger import Logger
@@ -317,7 +317,11 @@ class Bot:
         from src.core.config import init_core_config, init_mcp_config, init_model_config
         from src.kernel.config.unified import init_config as init_unified_config
         from src.kernel.container import container
-        from src.kernel.protocols import EventBusProtocol, SchedulerProtocol, VectorStoreProtocol
+        from src.kernel.protocols import (
+            EventBusProtocol,
+            SchedulerProtocol,
+            VectorStoreProtocol,
+        )
 
         self.config = init_core_config(self.config_path)
         init_model_config("config/model.toml")
@@ -329,7 +333,7 @@ class Bot:
         init_models_config("config/models.toml")
 
         # Step 2: Logger
-        from src.kernel.logger import get_logger, initialize_logger_system, COLOR
+        from src.kernel.logger import COLOR, get_logger, initialize_logger_system
         from src.kernel.protocols import LogStoreProtocol
 
         initialize_logger_system(log_level=self.config.bot.log_level)
@@ -438,9 +442,11 @@ class Bot:
 
         assert self.logger is not None
 
-        from src.core.config import get_model_config
-        import httpx
         import time
+
+        import httpx
+
+        from src.core.config import get_model_config
 
         providers = get_model_config().api_providers
         if not providers:
@@ -554,9 +560,9 @@ class Bot:
         # Step 2: 导入其他manager以初始化
         from src.core.managers import (
             initialize_adapter_manager,
-            initialize_router_manager,
-            initialize_event_manager,
             initialize_distribution,
+            initialize_event_manager,
+            initialize_router_manager,
         )
 
         initialize_adapter_manager()
@@ -922,10 +928,45 @@ class Bot:
             self.logger.info("停止接受新任务...")
 
         errors: list[tuple[str, Exception]] = []
+        loop = asyncio.get_running_loop()
+        shutdown_deadline = loop.time() + max(0.0, timeout)
+
+        def _consume_step_result(task: asyncio.Task[None]) -> None:
+            """Consume a detached shutdown step's eventual exception."""
+
+            if task.cancelled():
+                return
+            try:
+                task.exception()
+            except asyncio.CancelledError:
+                return
 
         async def _run_step(name: str, operation) -> None:
+            remaining = shutdown_deadline - loop.time()
+            if remaining <= 0:
+                exc = TimeoutError(
+                    f"shutdown deadline exhausted before step '{name}'"
+                )
+                errors.append((name, exc))
+                return
+
+            step_task = asyncio.create_task(
+                operation(),
+                name=f"shutdown:{name}",
+            )
             try:
-                await operation()
+                done, _ = await asyncio.wait({step_task}, timeout=remaining)
+                if not done:
+                    step_task.cancel()
+                    step_task.add_done_callback(_consume_step_result)
+                    raise TimeoutError(
+                        f"shutdown step '{name}' exceeded the remaining "
+                        f"{remaining:.2f}s deadline"
+                    )
+                await step_task
+            except asyncio.CancelledError:
+                step_task.cancel()
+                raise
             except Exception as exc:
                 errors.append((name, exc))
                 if self.logger:
@@ -951,6 +992,16 @@ class Bot:
             )
 
             await get_stream_loop_manager().stop()
+
+        async def _stop_adapters() -> None:
+            from src.core.managers.adapter_manager import get_adapter_manager
+
+            results = await get_adapter_manager().stop_all_adapters()
+            failures = [signature for signature, success in results.items() if not success]
+            if failures:
+                raise RuntimeError(
+                    "adapter shutdown failed: " + ", ".join(sorted(failures))
+                )
 
         async def _stop_scheduler() -> None:
             if self.scheduler is not None:
@@ -1014,6 +1065,7 @@ class Bot:
         steps = (
             ("on_stop", _publish_stop),
             ("stream_loops", _stop_stream_loops),
+            ("adapters", _stop_adapters),
             ("plugins", self._unload_all_plugins),
             ("scheduler", _stop_scheduler),
             ("http_server", _stop_http_server),

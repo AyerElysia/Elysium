@@ -20,15 +20,16 @@ import weakref
 from typing import cast
 
 from src.core.components.types import EventType
+from src.core.models.message import Message
 from src.kernel.concurrency import get_task_manager
 from src.kernel.event import EventDecision, get_event_bus
-from src.kernel.logger import get_logger, COLOR
-from src.core.models.message import Message
+from src.kernel.logger import COLOR, get_logger
 
 logger = get_logger("distributor", display="消息分发", color=COLOR.MAGENTA)
 
 _DISTRIBUTION_WAIT_TIMEOUT = 1.0
 _MAX_PENDING_DISTRIBUTIONS_PER_STREAM = 256
+_UNREAD_BACKPRESSURE_POLL_SECONDS = 0.05
 _distribution_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
@@ -55,6 +56,33 @@ def _get_distribution_slots(stream_id: str) -> asyncio.Semaphore:
     return slots
 
 
+def _has_unread_capacity(context: object) -> bool:
+    """Return whether a context accepts unread messages.
+
+    Third-party and legacy context implementations predate the bounded backlog
+    contract.  Treat an omitted capability as unbounded while enforcing the
+    limit for the built-in ``StreamContext``.
+    """
+    return bool(getattr(context, "has_unread_capacity", True))
+
+
+async def _wait_for_unread_capacity(context, stream_id: str) -> None:
+    """Apply lossless backpressure until a stream consumes unread messages."""
+
+    started_at = time.monotonic()
+    warning_logged = False
+    while not _has_unread_capacity(context):
+        waited = time.monotonic() - started_at
+        if not warning_logged and waited >= 0.1:
+            logger.warning(
+                "未读消息达到内存上限，入站链路正在背压: "
+                f"stream_id={stream_id[:8]}, "
+                f"limit={getattr(context, 'max_unread_messages', 'unknown')}"
+            )
+            warning_logged = True
+        await asyncio.sleep(_UNREAD_BACKPRESSURE_POLL_SECONDS)
+
+
 async def _on_message_received(_: str, params: dict) -> tuple[EventDecision, dict]:
     """处理 ON_MESSAGE_RECEIVED 事件的回调。
 
@@ -69,7 +97,9 @@ async def _on_message_received(_: str, params: dict) -> tuple[EventDecision, dic
         tuple[EventDecision, dict]: (事件决策, 事件参数)
     """
     from src.core.managers.stream_manager import get_stream_manager
-    from src.core.transport.distribution.stream_loop_manager import get_stream_loop_manager
+    from src.core.transport.distribution.stream_loop_manager import (
+        get_stream_loop_manager,
+    )
 
     message: Message = cast(Message, params.get("message"))
     if message is None:
@@ -142,6 +172,14 @@ async def _on_message_received(_: str, params: dict) -> tuple[EventDecision, dic
             # 2. 先写入内存未读队列并启动驱动器，再持久化。
             # 事件总线单个处理器默认只有 5 秒超时；若把数据库写入放在前面，
             # DB/冷启动稍慢就会导致消息只被旁路收集器看到，life_chatter 不会被唤醒。
+            if not _has_unread_capacity(context):
+                slm = get_stream_loop_manager()
+                if slm.is_running and not (
+                    context.stream_loop_task and not context.stream_loop_task.done()
+                ):
+                    await slm.start_stream_loop(stream_id)
+                await _wait_for_unread_capacity(context, stream_id)
+
             context.add_unread_message(message)
             chat_stream.update_active_time()
 
@@ -225,7 +263,9 @@ async def _on_all_plugins_loaded(_: str, params: dict) -> tuple[EventDecision, d
     Returns:
         tuple[EventDecision, dict]: (事件决策, 事件参数)
     """
-    from src.core.transport.distribution.stream_loop_manager import get_stream_loop_manager
+    from src.core.transport.distribution.stream_loop_manager import (
+        get_stream_loop_manager,
+    )
 
     slm = get_stream_loop_manager()
     await slm.start()
@@ -246,7 +286,9 @@ def initialize_distribution() -> None:
     Examples:
         >>> initialize_distribution()
     """
-    from src.core.transport.distribution.stream_loop_manager import get_stream_loop_manager
+    from src.core.transport.distribution.stream_loop_manager import (
+        get_stream_loop_manager,
+    )
 
     bus = get_event_bus()
 

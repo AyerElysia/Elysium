@@ -22,7 +22,7 @@ from plugins.life_engine.memory.experience import (
 )
 from plugins.life_engine.memory.tools import LifeEngineSearchMemoryTool
 from plugins.life_engine.service.consciousness import ConsciousnessRegistry
-from plugins.life_engine.service.event_bus import LifeEvent
+from plugins.life_engine.service.event_bus import LifeEvent, RawEventGapError
 from plugins.life_engine.service.legacy_diary import parse_legacy_diary_file
 from plugins.life_engine.service.memory_witness import (
     MEMORY_WITNESS_INSTANCE_ID,
@@ -438,3 +438,65 @@ async def test_existing_window_is_reused_without_calling_model(
     assert memory.recorded == 0
     assert report.last_sequence == 1
     assert memory.states[-1]["last_sequence"] == 1
+
+
+async def test_witness_recovers_from_retained_event_gap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retention gap is reported once, then processing resumes safely."""
+
+    memory = _WitnessMemoryStub(
+        existing=SimpleNamespace(
+            witness_id="existing",
+            projection_path="path.md",
+        )
+    )
+
+    async def _get_state(_instance_id: str) -> dict[str, object]:
+        return {"last_sequence": 1}
+
+    memory.get_witness_state = _get_state  # type: ignore[method-assign]
+    service = _witness_service_stub(tmp_path, memory)
+    event = service._get_event_bus().store.event
+    event = LifeEvent(
+        event_id=event.event_id,
+        sequence=4,
+        timestamp=event.timestamp,
+        source=event.source,
+        channel=event.channel,
+        event_type=event.event_type,
+        content=event.content,
+        stream_id=event.stream_id,
+    )
+
+    class _GapStore:
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        async def read_since(
+            self,
+            sequence: int,
+            *,
+            limit: int,
+        ) -> list[LifeEvent]:
+            assert limit == 80
+            self.calls.append(sequence)
+            if len(self.calls) == 1:
+                raise RawEventGapError(sequence, 4)
+            return [event]
+
+    store = _GapStore()
+    service._get_event_bus = lambda: SimpleNamespace(store=store)
+    coordinator = MemoryWitnessCoordinator(service)
+
+    async def _project(_witness: object) -> None:
+        return None
+
+    monkeypatch.setattr(coordinator, "_project_witness", _project)
+
+    report = await coordinator.run_once()
+
+    assert store.calls == [1, 3]
+    assert report.last_sequence == 4
+    assert memory.states[-1]["last_sequence"] == 4

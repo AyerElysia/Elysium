@@ -14,12 +14,14 @@ from __future__ import annotations
 import asyncio
 import json
 import random
-from typing import Any, Callable, Coroutine
+from collections.abc import Callable, Coroutine
+from typing import Any
 
 import websockets
 import websockets.exceptions
 
 from src.app.plugin_system.api.log_api import get_logger
+from src.kernel.concurrency import get_task_manager
 
 logger = get_logger("kook_adapter")
 
@@ -52,8 +54,9 @@ class KookGateway:
         self._session_id: str = ""
         self._sn: int = 0  # 已处理的最新 sn
         self._running = False
-        self._heartbeat_task: asyncio.Task[None] | None = None
-        self._listen_task: asyncio.Task[None] | None = None
+        self._heartbeat_task_info: Any | None = None
+        self._listen_task_info: Any | None = None
+        self._lifecycle_lock = asyncio.Lock()
 
     @property
     def connected(self) -> bool:
@@ -61,21 +64,54 @@ class KookGateway:
 
     async def start(self) -> None:
         """启动 Gateway 连接。"""
-        self._running = True
-        self._listen_task = asyncio.create_task(self._connect_loop(), name="kook-gateway")
-        logger.info("KOOK Gateway 启动中...")
+        async with self._lifecycle_lock:
+            current = self._listen_task_info
+            if current is not None and current.task and not current.task.done():
+                return
+            self._running = True
+            self._listen_task_info = get_task_manager().create_task(
+                self._connect_loop(),
+                name="kook-gateway",
+                daemon=True,
+            )
+            logger.info("KOOK Gateway 启动中...")
 
     async def stop(self) -> None:
         """停止 Gateway 连接。"""
-        self._running = False
-        if self._heartbeat_task and not self._heartbeat_task.done():
-            self._heartbeat_task.cancel()
-        if self._listen_task and not self._listen_task.done():
-            self._listen_task.cancel()
-        if self._ws:
-            await self._ws.close()
-            self._ws = None
-        logger.info("KOOK Gateway 已停止")
+        async with self._lifecycle_lock:
+            self._running = False
+            if self._ws:
+                try:
+                    await asyncio.wait_for(self._ws.close(), timeout=5.0)
+                except Exception as exc:  # noqa: BLE001 - transport close is best effort
+                    logger.warning(f"KOOK WebSocket 关闭失败: {exc}")
+                finally:
+                    self._ws = None
+
+            task_infos = [
+                info
+                for info in (self._heartbeat_task_info, self._listen_task_info)
+                if info is not None
+            ]
+            task_manager = get_task_manager()
+            for task_info in task_infos:
+                task_manager.cancel_task(task_info.task_id)
+            tasks = [
+                task_info.task
+                for task_info in task_infos
+                if task_info.task is not None
+                and task_info.task is not asyncio.current_task()
+            ]
+            if tasks:
+                done, pending = await asyncio.wait(tasks, timeout=5.0)
+                for task in pending:
+                    logger.warning(f"KOOK 后台任务未及时停止: {task.get_name()}")
+                for task in done:
+                    if not task.cancelled():
+                        task.exception()
+            self._heartbeat_task_info = None
+            self._listen_task_info = None
+            logger.info("KOOK Gateway 已停止")
 
     # ─── 连接循环 ───────────────────────────────────────────
 
@@ -115,13 +151,22 @@ class KookGateway:
                 raise RuntimeError("HELLO 握手失败")
 
             # 启动心跳
-            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
+            self._heartbeat_task_info = get_task_manager().create_task(
+                self._heartbeat_loop(ws),
+                name="kook-heartbeat",
+                daemon=True,
+            )
 
             try:
                 await self._listen(ws)
             finally:
-                if self._heartbeat_task and not self._heartbeat_task.done():
-                    self._heartbeat_task.cancel()
+                heartbeat_info = self._heartbeat_task_info
+                if heartbeat_info is not None:
+                    get_task_manager().cancel_task(heartbeat_info.task_id)
+                    heartbeat_task = heartbeat_info.task
+                    if heartbeat_task is not None:
+                        await asyncio.gather(heartbeat_task, return_exceptions=True)
+                    self._heartbeat_task_info = None
                 self._ws = None
 
     async def _wait_hello(self, ws: Any) -> bool:
