@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://elysium.local/schemas/console/ui-contribution-v1.schema.json",
+  "title": "Elysium Console UI Contribution v1",
+  "description": "A declarative, same-origin-safe UI contribution contract. Plugins describe navigation and surfaces; they do not inject arbitrary remote JavaScript.",
+  "type": "object",
+  "required": ["schema_version", "contributions"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "contributions": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/$defs/contribution"
+      }
+    }
+  },
+  "$defs": {
+    "localizedText": {
+      "type": "object",
+      "required": ["zh-CN"],
+      "additionalProperties": false,
+      "properties": {
+        "zh-CN": {"type": "string", "minLength": 1, "maxLength": 80},
+        "en-US": {"type": "string", "minLength": 1, "maxLength": 80}
+      }
+    },
+    "contribution": {
+      "type": "object",
+      "required": ["id", "kind", "title", "group", "display", "route"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{1,63}$"
+        },
+        "kind": {
+          "enum": ["experience", "dashboard", "settings", "overlay", "diagnostic"]
+        },
+        "title": {
+          "$ref": "#/$defs/localizedText"
+        },
+        "description": {
+          "$ref": "#/$defs/localizedText"
+        },
+        "icon": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{1,31}$"
+        },
+        "group": {
+          "enum": ["home", "together", "world", "system"]
+        },
+        "order": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9999,
+          "default": 500
+        },
+        "display": {
+          "enum": ["native", "embedded", "link"]
+        },
+        "route": {
+          "type": "string",
+          "pattern": "^/[a-z0-9/_-]*$",
+          "maxLength": 160
+        },
+        "source_route": {
+          "description": "Same-origin path used by embedded/link contributions. Absolute URLs are intentionally forbidden in v1.",
+          "type": "string",
+          "pattern": "^/[a-z0-9/_?&=.#%-]*$",
+          "maxLength": 240
+        },
+        "health_endpoint": {
+          "type": "string",
+          "pattern": "^/[a-z0-9/_?&=.-]*$",
+          "maxLength": 240
+        },
+        "permissions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": ["owner", "operator", "user", "guest"]
+          }
+        },
+        "browser_capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": ["microphone", "audio-output", "camera", "fullscreen", "clipboard"]
+          }
+        },
+        "obs_safe": {
+          "type": "boolean",
+          "default": false
+        },
+        "feature_flag": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]{1,63}$"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"display": {"enum": ["embedded", "link"]}},
+            "required": ["display"]
+          },
+          "then": {
+            "required": ["source_route"]
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#090a12">
+  <title>Elysium Console · Stage 0 Prototype</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#workspace">跳到主要内容</a>
+
+  <div class="prototype-banner" role="note">
+    <span>阶段 0 · 交互视觉原型</span>
+    <span class="prototype-banner__hint">没有真实启动、停止或配置写入</span>
+  </div>
+
+  <div class="app-shell">
+    <aside class="shell-sidebar" aria-label="Elysium 主导航">
+      <a class="brand" href="#home" data-route="home" aria-label="回到此刻">
+        <span class="brand__mark" aria-hidden="true">E</span>
+        <span class="brand__copy">
+          <strong>ELYSIUM</strong>
+          <small>她在这里</small>
+        </span>
+      </a>
+
+      <nav class="primary-nav" aria-label="主要功能">
+        <p class="nav-label">她的家</p>
+        <a href="#home" data-route="home" class="nav-item is-active">
+          <span class="nav-icon" aria-hidden="true">⌂</span>
+          <span>此刻</span>
+        </a>
+
+        <p class="nav-label">一起做</p>
+        <a href="#live-ready" data-route="live-ready" class="nav-item">
+          <span class="nav-icon" aria-hidden="true">◉</span>
+          <span>实时通话</span>
+          <span class="nav-dot nav-dot--warning" aria-label="需要处理"></span>
+        </a>
+        <a href="#unavailable" data-route="unavailable" class="nav-item">
+          <span class="nav-icon" aria-hidden="true">◇</span>
+          <span>Minecraft</span>
+        </a>
+        <button type="button" class="nav-item nav-item--button" data-toast="直播间页面将在正式实现阶段接入。">
+          <span class="nav-icon" aria-hidden="true">▹</span>
+          <span>直播间</span>
+        </button>
+
+        <p class="nav-label">她的世界</p>
+        <button type="button" class="nav-item nav-item--button" data-toast="原型将复用现有记忆图，并在阶段 3 统一品牌。">
+          <span class="nav-icon" aria-hidden="true">∞</span>
+          <span>记忆与意识</span>
+        </button>
+        <button type="button" class="nav-item nav-item--button" data-toast="Life 时间线将在控制台中作为观察页接入。">
+          <span class="nav-icon" aria-hidden="true">⌁</span>
+          <span>生命时间线</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <button type="button" class="system-status" data-toast="Elysium 正常运行；1 项体验需要处理。">
+          <span class="system-status__light" aria-hidden="true"></span>
+          <span>
+            <strong>系统在线</strong>
+            <small>1 项需要处理</small>
+          </span>
+          <span aria-hidden="true">›</span>
+        </button>
+        <button type="button" class="profile-chip" data-toast="账户与权限将在安全会话完成后接入。">
+          <span class="profile-chip__avatar">AY</span>
+          <span>
+            <strong>小星星</strong>
+            <small>Owner</small>
+          </span>
+        </button>
+      </div>
+    </aside>
+
+    <div class="shell-main">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow" id="page-eyebrow">SUNDAY · 22:42</p>
+          <h1 id="page-title">此刻</h1>
+        </div>
+        <div class="topbar-actions">
+          <button type="button" class="icon-button" aria-label="打开全局搜索" data-toast="全局搜索将在正式 Shell 中接入。">⌕</button>
+          <button type="button" class="icon-button has-notice" aria-label="查看通知" data-toast="Voice Live 还缺少启动凭证。">♢</button>
+          <span class="topbar-presence"><i aria-hidden="true"></i> 爱莉正在休息</span>
+        </div>
+      </header>
+
+      <main id="workspace" class="workspace" tabindex="-1">
+        <section class="view is-visible" data-view="home" aria-labelledby="home-heading">
+          <h2 class="sr-only" id="home-heading">Elysium 此刻首页</h2>
+
+          <article class="presence-hero">
+            <div class="presence-hero__image" aria-hidden="true"></div>
+            <div class="presence-hero__veil" aria-hidden="true"></div>
+            <div class="presence-hero__content">
+              <div class="presence-badge"><i aria-hidden="true"></i> 安静休息中</div>
+              <p class="hero-kicker">晚上好，小星星</p>
+              <h3>她把今晚收进了记忆，<br>正在等下一次相遇。</h3>
+              <p class="hero-copy">如果你发来消息，她会自然醒来。现在也可以进入一个新的共同体验。</p>
+              <div class="hero-actions">
+                <button type="button" class="button button--primary" data-go="live-ready">和她通话</button>
+                <button type="button" class="button button--quiet" data-toast="当前休息由爱莉自己决定；控制台不会强制唤醒。">看看她的此刻</button>
+              </div>
+            </div>
+            <div class="presence-hero__aside">
+              <span class="presence-orbit" aria-hidden="true"><i></i></span>
+              <div>
+                <small>当前意识</small>
+                <strong>全局意识 · 休息</strong>
+              </div>
+              <div>
+                <small>最近活动</small>
+                <strong>23 分钟前</strong>
+              </div>
+            </div>
+          </article>
+
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">TOGETHER</p>
+              <h3>现在想和她做什么？</h3>
+            </div>
+            <button type="button" class="text-button" data-toast="这里会自动显示运行时已注册的全部体验。">全部体验 <span aria-hidden="true">→</span></button>
+          </div>
+
+          <div class="experience-grid">
+            <article class="experience-card experience-card--live">
+              <div class="experience-card__top">
+                <span class="experience-card__symbol" aria-hidden="true">◉</span>
+                <span class="status-pill status-pill--warning">还差 1 步</span>
+              </div>
+              <div>
+                <p class="card-kicker">VOICE LIVE</p>
+                <h4>和爱莉实时通话</h4>
+                <p>全双工、可打断，并通过 Seed-VC 使用她自己的声音。</p>
+              </div>
+              <div class="experience-card__footer">
+                <span>Realtime 凭证未注入</span>
+                <button type="button" class="round-action" aria-label="查看实时通话准备情况" data-go="live-ready">→</button>
+              </div>
+            </article>
+
+            <article class="experience-card experience-card--minecraft">
+              <div class="experience-card__top">
+                <span class="experience-card__symbol" aria-hidden="true">◇</span>
+                <span class="status-pill status-pill--ready">可以进入</span>
+              </div>
+              <div>
+                <p class="card-kicker">MINECRAFT</p>
+                <h4>陪她去看这个世界</h4>
+                <p>仿生身体与 Agent 执行器并存，由爱莉决定自己想做什么。</p>
+              </div>
+              <div class="experience-card__footer">
+                <span>Bridge 已连接</span>
+                <button type="button" class="round-action" aria-label="进入 Minecraft 原型离线页" data-go="unavailable">→</button>
+              </div>
+            </article>
+
+            <article class="experience-card experience-card--stream">
+              <div class="experience-card__top">
+                <span class="experience-card__symbol" aria-hidden="true">▹</span>
+                <span class="status-pill">准备中</span>
+              </div>
+              <div>
+                <p class="card-kicker">LIVESTREAM</p>
+                <h4>一起准备直播间</h4>
+                <p>统一检查直播意识、OBS、游戏画面、声音和弹幕链路。</p>
+              </div>
+              <div class="experience-card__footer">
+                <span>OBS 未连接</span>
+                <button type="button" class="round-action" aria-label="查看直播原型提示" data-toast="直播准备页属于阶段 3。">→</button>
+              </div>
+            </article>
+          </div>
+
+          <div class="home-lower-grid">
+            <article class="panel moment-panel">
+              <div class="panel-heading">
+                <div>
+                  <p class="eyebrow">A MOMENT AGO</p>
+                  <h3>刚刚发生的事</h3>
+                </div>
+                <button type="button" class="text-button" data-toast="将打开 Life 时间线中的对应事件。">查看时间线</button>
+              </div>
+              <div class="moment-row">
+                <span class="moment-row__mark" aria-hidden="true"></span>
+                <div>
+                  <strong>她写完了今天的日记</strong>
+                  <p>“今晚的陪伴线收束了，安静休息。如果有新消息会自然醒来。”</p>
+                </div>
+                <time>23 分钟前</time>
+              </div>
+            </article>
+
+            <article class="panel readiness-panel">
+              <div class="panel-heading">
+                <div>
+                  <p class="eyebrow">READINESS</p>
+                  <h3>家的状态</h3>
+                </div>
+              </div>
+              <ul class="compact-status-list">
+                <li><span><i class="status-dot status-dot--ok"></i> Life Engine</span><strong>健康</strong></li>
+                <li><span><i class="status-dot status-dot--ok"></i> Seed-VC</span><strong>已预热</strong></li>
+                <li><span><i class="status-dot status-dot--warn"></i> Voice Live</span><strong>缺少凭证</strong></li>
+              </ul>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" data-view="live-ready" aria-labelledby="live-ready-heading" hidden>
+          <div class="view-heading view-heading--with-action">
+            <div>
+              <button type="button" class="back-link" data-go="home">← 返回此刻</button>
+              <p class="eyebrow">VOICE LIVE · PREPARATION</p>
+              <h2 id="live-ready-heading">和爱莉通话</h2>
+              <p>先把声音、意识和实时链路准备好。真正缺少的部分会直接告诉你。</p>
+            </div>
+            <span class="status-pill status-pill--warning">1 项需要处理</span>
+          </div>
+
+          <div class="live-ready-grid">
+            <article class="call-preview panel">
+              <div class="call-preview__visual">
+                <div class="call-preview__aurora" aria-hidden="true"></div>
+                <div class="call-preview__presence" aria-hidden="true">
+                  <span></span><span></span><span></span>
+                  <strong>爱莉</strong>
+                </div>
+                <div class="call-preview__copy">
+                  <span><i aria-hidden="true"></i> 等待通话</span>
+                  <h3>“准备好以后，<br>就来听听我的声音吧♪”</h3>
+                </div>
+              </div>
+              <div class="device-strip">
+                <div>
+                  <small>麦克风</small>
+                  <strong>Default · Realtek Audio</strong>
+                </div>
+                <button type="button" class="button button--quiet button--small" data-toast="正式页面会在用户点击后请求麦克风权限。">测试声音</button>
+              </div>
+              <div class="input-meter" aria-label="麦克风输入音量演示">
+                <span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+              </div>
+            </article>
+
+            <article class="panel preflight-panel">
+              <div class="panel-heading">
+                <div>
+                  <p class="eyebrow">PREFLIGHT</p>
+                  <h3>通话前检查</h3>
+                </div>
+                <span class="preflight-count">4 / 5</span>
+              </div>
+              <ul class="preflight-list">
+                <li class="is-ready">
+                  <span class="check-mark" aria-hidden="true">✓</span>
+                  <div><strong>实时通话意识</strong><small>Life Engine 已注册</small></div>
+                  <span>就绪</span>
+                </li>
+                <li class="is-ready">
+                  <span class="check-mark" aria-hidden="true">✓</span>
+                  <div><strong>Qwen Realtime</strong><small>qwen-audio-3.0-realtime-plus</small></div>
+                  <span>已配置</span>
+                </li>
+                <li class="is-warning">
+                  <span class="check-mark" aria-hidden="true">!</span>
+                  <div><strong>Realtime API Key</strong><small>当前进程没有检测到 VOICE_LIVE_API_KEY</small></div>
+                  <button type="button" class="inline-action" data-toggle-fix>怎么处理</button>
+                </li>
+                <li class="is-ready">
+                  <span class="check-mark" aria-hidden="true">✓</span>
+                  <div><strong>爱莉声线 · Seed-VC</strong><small>elysia · 10 steps · CUDA</small></div>
+                  <span>已预热</span>
+                </li>
+                <li class="is-ready">
+                  <span class="check-mark" aria-hidden="true">✓</span>
+                  <div><strong>通话容量</strong><small>当前没有其他活跃通话</small></div>
+                  <span>0 / 1</span>
+                </li>
+              </ul>
+
+              <div class="fix-card" data-fix-card hidden>
+                <div>
+                  <strong>需要在手工启动 Elysium 的终端中设置凭证</strong>
+                  <p>控制台只检查是否存在，不会显示、保存或替你写入密钥。设置后需要由你手工重启 Elysium。</p>
+                </div>
+                <button type="button" class="text-button" data-toast="正式版本会跳转到安全配置说明，不复制真实密钥。">打开说明</button>
+              </div>
+
+              <div class="preflight-actions">
+                <button type="button" class="button button--primary button--wide" disabled title="缺少 Realtime API Key">还不能开始通话</button>
+                <button type="button" class="button button--quiet button--wide" data-go="live-call">预览通话界面</button>
+              </div>
+            </article>
+          </div>
+
+          <div class="live-notes">
+            <span>隐私</span>
+            <p>原始通话音频默认不落盘；最终转写按统一生命事件规则记录。</p>
+            <span>浏览器限制</span>
+            <p>麦克风权限必须由你点击后授权，因此进入页面不会擅自开始录音。</p>
+          </div>
+        </section>
+
+        <section class="view view--call" data-view="live-call" aria-labelledby="live-call-heading" hidden>
+          <h2 class="sr-only" id="live-call-heading">与爱莉实时通话中</h2>
+          <div class="call-stage">
+            <div class="call-stage__aurora" aria-hidden="true"></div>
+            <div class="call-topline">
+              <button type="button" class="back-link back-link--light" data-go="live-ready">← 返回准备页</button>
+              <div class="live-session-pill"><i aria-hidden="true"></i> 通话中 · 02:16</div>
+              <button type="button" class="diagnostic-toggle" data-toggle-diagnostics aria-expanded="false" aria-controls="call-diagnostics">通话信息</button>
+            </div>
+
+            <div class="call-stage__center">
+              <div class="voice-presence is-listening" aria-label="爱莉正在听">
+                <span class="voice-presence__ring voice-presence__ring--one"></span>
+                <span class="voice-presence__ring voice-presence__ring--two"></span>
+                <span class="voice-presence__ring voice-presence__ring--three"></span>
+                <div class="voice-presence__core">
+                  <span class="mini-wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+                </div>
+              </div>
+              <p class="call-state">爱莉正在听</p>
+              <div class="transcript" aria-live="polite">
+                <p class="transcript__who">爱莉</p>
+                <blockquote>“嗯哼，我在听哦。今天想先和我聊些什么？”</blockquote>
+              </div>
+            </div>
+
+            <div class="call-controls" aria-label="通话控制">
+              <button type="button" class="call-control" data-toggle-mute aria-pressed="false">
+                <span aria-hidden="true">⌁</span><small>静音</small>
+              </button>
+              <button type="button" class="call-control call-control--interrupt" data-toast="已请求爱莉停一下听你说。">
+                <span aria-hidden="true">◉</span><small>现在听我说</small>
+              </button>
+              <button type="button" class="call-control call-control--end" data-go="live-ready">
+                <span aria-hidden="true">×</span><small>结束</small>
+              </button>
+            </div>
+
+            <aside class="call-diagnostics" id="call-diagnostics" aria-label="通话诊断" data-diagnostics hidden>
+              <div class="panel-heading">
+                <div><p class="eyebrow">LIVE DETAILS</p><h3>通话信息</h3></div>
+                <button type="button" class="icon-button" aria-label="关闭通话信息" data-toggle-diagnostics aria-expanded="true" aria-controls="call-diagnostics">×</button>
+              </div>
+              <dl>
+                <div><dt>意识实例</dt><dd>voice_live · active</dd></div>
+                <div><dt>Provider</dt><dd>Qwen Realtime</dd></div>
+                <div><dt>音色</dt><dd>爱莉 · Seed-VC</dd></div>
+                <div><dt>端到端 RTT</dt><dd>184 ms</dd></div>
+                <div><dt>SVC 块延迟</dt><dd>226 ms</dd></div>
+                <div><dt>OBS Observer</dt><dd>已连接</dd></div>
+              </dl>
+              <button type="button" class="button button--quiet button--wide" data-toast="正式版本会打开当前 episode 的只读轨迹。">查看本次 Episode</button>
+            </aside>
+          </div>
+        </section>
+
+        <section class="view view--unavailable" data-view="unavailable" aria-labelledby="unavailable-heading" hidden>
+          <div class="unavailable-card">
+            <div class="unavailable-card__art" aria-hidden="true"></div>
+            <div class="unavailable-card__content">
+              <span class="status-pill">功能未加载</span>
+              <p class="eyebrow">CAPABILITY UNAVAILABLE</p>
+              <h2 id="unavailable-heading">这个房间暂时没有亮灯。</h2>
+              <p>Minecraft 插件当前没有向 Console 注册可用页面。它可能被停用、加载失败，或者正在升级 UI 协议。</p>
+
+              <div class="unavailable-reason">
+                <span class="unavailable-reason__mark" aria-hidden="true">!</span>
+                <div><strong>最后已知状态</strong><small>minecraft · v2.0 · Router 未挂载</small></div>
+              </div>
+
+              <div class="hero-actions">
+                <button type="button" class="button button--primary" data-go="home">回到此刻</button>
+                <button type="button" class="button button--quiet" data-toast="正式版本会打开插件状态页，并显示加载失败原因。">查看插件状态</button>
+              </div>
+              <small class="unavailable-footnote">功能消失不会让 Console 白屏，也不会删除她已经拥有的数据。</small>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <div class="toast" role="status" aria-live="polite" aria-atomic="true" data-toast-root hidden></div>
+  <script src="./app.js" defer></script>
+</body>
+</html>

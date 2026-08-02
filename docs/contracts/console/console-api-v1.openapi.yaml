@@ -1,0 +1,328 @@
+openapi: 3.1.0
+info:
+  title: Elysium Console API
+  version: 1.0.0-draft
+  description: >-
+    Stable backend-for-frontend contract for the Elysium Console. The Console reports
+    readiness and invokes allow-listed actions; it never owns Elysium process lifecycle.
+servers:
+  - url: /console/api/v1
+    description: Same-origin Console API
+security:
+  - consoleSession: []
+paths:
+  /bootstrap:
+    get:
+      operationId: getBootstrap
+      summary: Return the shell bootstrap document
+      responses:
+        '200':
+          description: Bootstrap state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Bootstrap'
+  /capabilities:
+    get:
+      operationId: listCapabilities
+      summary: List currently registered UI capabilities
+      responses:
+        '200':
+          description: Runtime-derived capability contributions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schema_version, contributions]
+                properties:
+                  schema_version:
+                    const: 1
+                  contributions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CapabilityContribution'
+  /readiness:
+    get:
+      operationId: getReadiness
+      summary: Return redacted readiness checks
+      responses:
+        '200':
+          description: Readiness state without secret values
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [overall, checks]
+                properties:
+                  overall:
+                    $ref: '#/components/schemas/HealthState'
+                  checks:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ReadinessCheck'
+  /plugins:
+    get:
+      operationId: listPlugins
+      summary: Return plugin status visible to the current role
+      responses:
+        '200':
+          description: Plugin inventory
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [plugins]
+                properties:
+                  plugins:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PluginStatus'
+  /config/schema:
+    get:
+      operationId: getConfigSchema
+      summary: Return safe, UI-renderable configuration metadata
+      responses:
+        '200':
+          description: Redacted configuration schema
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /config/status:
+    get:
+      operationId: getConfigStatus
+      summary: Return configuration presence, never secret values
+      responses:
+        '200':
+          description: Configuration presence state
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ConfigStatus'
+  /events:
+    get:
+      operationId: streamConsoleEvents
+      summary: Stream bounded, role-filtered Console events
+      responses:
+        '200':
+          description: Server-sent event stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+  /session:
+    post:
+      operationId: createConsoleSession
+      summary: Create a short-lived Console session after local authorization
+      security: []
+      responses:
+        '201':
+          description: Session created; the token is delivered through a Secure, HttpOnly cookie
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleSession'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+  /actions/{action_id}:
+    post:
+      operationId: invokeConsoleAction
+      summary: Invoke an allow-listed capability action
+      parameters:
+        - name: action_id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[a-z][a-z0-9_.-]{1,95}$'
+        - name: X-CSRF-Token
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              maxProperties: 32
+              additionalProperties: true
+      responses:
+        '202':
+          description: Action accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActionReceipt'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '409':
+          $ref: '#/components/responses/ErrorResponse'
+components:
+  securitySchemes:
+    consoleSession:
+      type: apiKey
+      in: cookie
+      name: elysium_console_session
+  responses:
+    ErrorResponse:
+      description: Request rejected
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    HealthState:
+      type: string
+      enum: [healthy, degraded, unavailable, unknown]
+    Bootstrap:
+      type: object
+      required: [api_version, console_version, role, capabilities_etag, readiness]
+      properties:
+        api_version:
+          const: 1
+        console_version:
+          type: string
+        role:
+          type: string
+          enum: [owner, operator, user, guest]
+        capabilities_etag:
+          type: string
+        readiness:
+          $ref: '#/components/schemas/HealthState'
+        event_stream_url:
+          type: string
+          const: /console/api/v1/events
+    CapabilityContribution:
+      type: object
+      description: Mirrors ui-contribution-v1.schema.json after server-side validation
+      required: [id, kind, title, group, display, route, availability]
+      properties:
+        id:
+          type: string
+        kind:
+          type: string
+          enum: [experience, dashboard, settings, overlay, diagnostic]
+        title:
+          type: object
+          additionalProperties:
+            type: string
+        group:
+          type: string
+          enum: [home, together, world, system]
+        display:
+          type: string
+          enum: [native, embedded, link]
+        route:
+          type: string
+        source_route:
+          type: string
+        availability:
+          type: string
+          enum: [ready, degraded, unavailable, hidden]
+        reason_code:
+          type: string
+    ReadinessCheck:
+      type: object
+      required: [id, label, state, required]
+      properties:
+        id:
+          type: string
+        label:
+          type: string
+        state:
+          $ref: '#/components/schemas/HealthState'
+        required:
+          type: boolean
+        summary:
+          type: string
+        remediation_code:
+          type: string
+        observed_at:
+          type: string
+          format: date-time
+    PluginStatus:
+      type: object
+      required: [id, version, state]
+      properties:
+        id:
+          type: string
+        version:
+          type: string
+        state:
+          type: string
+          enum: [loaded, degraded, failed, disabled]
+        summary:
+          type: string
+        contribution_ids:
+          type: array
+          items:
+            type: string
+    ConfigStatus:
+      type: object
+      required: [key, configured, secret, restart_required]
+      properties:
+        key:
+          type: string
+        configured:
+          type: boolean
+        secret:
+          type: boolean
+          const: true
+        restart_required:
+          type: boolean
+        help_code:
+          type: string
+    ConsoleSession:
+      type: object
+      required: [role, expires_at, csrf_token]
+      properties:
+        role:
+          type: string
+          enum: [owner, operator, user, guest]
+        expires_at:
+          type: string
+          format: date-time
+        csrf_token:
+          type: string
+    ActionReceipt:
+      type: object
+      required: [request_id, action_id, state]
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        action_id:
+          type: string
+        state:
+          type: string
+          enum: [accepted, completed]
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+        title:
+          type: string
+        status:
+          type: integer
+        code:
+          type: string
+        detail:
+          type: string
+        request_id:
+          type: string

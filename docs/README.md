@@ -6,7 +6,12 @@
 - [principles.md](./principles.md) — 主体性、零规则、仿生、意识实例与渐进式披露（设计底线）
 - [生命记忆系统](./architecture/life_memory_system.md) — 追加式经历、认识论本体、双时间与主体性遗忘
 - [意识实例架构](./architecture/consciousness_instances.md) — 多意识实例、潜意识协调与工具边界
-- [Elysium Console 前端提案](./architecture/elysium_console_frontend_proposal.md) — 插件驱动的统一控制台、Voice Live 旗舰路径与分阶段验收计划（待批准）
+- [Elysium Console 前端提案](./architecture/elysium_console_frontend_proposal.md) — 已批准的插件驱动统一控制台与分阶段验收计划
+- [Elysium Console Stage 0 设计基线](./architecture/elysium_console_stage0_design.md) — 此刻、Live Ready、Live Call 与安全降级页的交互规范
+- [Elysium Console 安全模型](./architecture/elysium_console_security_model.md) — 插件页面、密钥、OBS、会话与主进程生命周期边界
+- [Elysium Console 迁移矩阵](./architecture/elysium_console_migration_matrix.md) — 现有前端接入顺序、目标形态与验收门
+- [Elysium Console Stage 0 原型](./prototypes/elysium_console/) — 可点击的高保真静态原型
+- [Elysium Console Stage 0 验收报告](./report/elysium-console-stage0-prototype-2026-08-02.md) — 浏览器、响应式、交互与契约验证证据
 - [Life Engine 模块说明](../plugins/life_engine/README.md) — 生命域的代码入口与运行链路
 
 ## 当前架构与迁移
