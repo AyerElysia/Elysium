@@ -37,6 +37,7 @@ from src.app.plugin_system.api.llm_api import get_model_set_by_task
 from src.kernel.llm.model_client.registry import get_default_model_client_registry
 from src.core.prompt import PromptTemplate, get_prompt_manager
 from src.core.config import get_core_config
+from src.core.utils.audio_transcode import transcode_audio_to_wav
 from src.core.utils.base64_helper import base64_decode_to_bytes
 from src.kernel.concurrency import get_task_manager
 from src.kernel.db.core.session import get_db_session
@@ -533,7 +534,7 @@ class MediaManager:
 
                 summary = await self._recognize_with_audio_understanding(base64_data, metadata)
                 if not summary:
-                    summary = await self._recognize_with_asr(base64_data)
+                    summary = await self._recognize_with_asr(base64_data, metadata)
                     if summary:
                         summary = f"语音转写：{summary}"
 
@@ -914,11 +915,18 @@ class MediaManager:
             logger.error(f"VLM 识别失败: {e}", exc_info=True)
             return None
 
-    async def _recognize_with_asr(self, audio_base64: str) -> str | None:
+    async def _recognize_with_asr(
+        self,
+        audio_base64: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> str | None:
         """调用 ASR 客户端执行语音转文字。
 
+        不受 ASR 支持的入站格式会先在内存中转为 16 kHz 单声道 WAV。
+
         Args:
-            audio_base64: base64 编码的 WAV 音频数据。
+            audio_base64: base64 编码的音频数据。
+            metadata: 适配器保留的 MIME/文件名信息。
 
         Returns:
             识别出的文字，失败返回 None。
@@ -940,12 +948,21 @@ class MediaManager:
                 base64_decode_to_bytes,
                 clean_b64,
             )
+            resolved_metadata = metadata or {}
+            mime_type = self._guess_audio_mime(resolved_metadata)
+            if mime_type not in {"audio/wav", "audio/mpeg", "audio/mp3"}:
+                audio_bytes = await get_task_manager().to_thread(
+                    transcode_audio_to_wav,
+                    audio_bytes,
+                )
+                mime_type = "audio/wav"
 
             text = await client.create_transcription(
                 model_name=model_name,
                 audio_bytes=audio_bytes,
                 request_name="voice_recognition",
                 model_set=model_entry,
+                mime_type=mime_type,
             )
             return text.strip() if text else None
         except Exception as e:

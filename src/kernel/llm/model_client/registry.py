@@ -8,7 +8,13 @@ import threading
 from dataclasses import dataclass
 
 from ..exceptions import LLMConfigurationError
-from .base import ASRModelClient, ChatModelClient, EmbeddingModelClient, RerankModelClient
+from .base import (
+    ASRModelClient,
+    ChatModelClient,
+    EmbeddingModelClient,
+    RerankModelClient,
+    SpeechModelClient,
+)
 from .anthropic_client import AnthropicChatClient
 from .openai_client import OpenAIChatClient
 from ..types import ModelEntry
@@ -75,6 +81,13 @@ class ModelClientRegistry:
         client = self.get_client_for_model(model)
         if not hasattr(client, "create_rerank"):
             raise LLMConfigurationError("当前 client 不支持 rerank 请求")
+        return client  # type: ignore[return-value]
+
+    def get_speech_client_for_model(self, model: ModelEntry) -> SpeechModelClient:
+        """根据单个模型配置获取 TTS client。"""
+        client = self.get_client_for_model(model)
+        if not hasattr(client, "create_speech"):
+            raise LLMConfigurationError("当前 client 不支持 TTS 请求")
         return client  # type: ignore[return-value]
 
     def get_asr_client_for_model(self, model: ModelEntry) -> ASRModelClient:

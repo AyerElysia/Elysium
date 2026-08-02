@@ -5,13 +5,18 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from plugins.life_engine.core.chatter import (
     LifeChatter,
+    LifeRecognizeVoiceTool,
+    LifeSaveMediaTool,
     LifeSendFileAction,
+    LifeSendImageAction,
     LifeSendTextAction,
+    LifeSendVoiceAction,
 )
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.core.plugin import LifeEnginePlugin
@@ -266,6 +271,200 @@ def test_life_send_file_sends_group_file(
     assert sent.message_type == MessageType.FILE
     assert sent.extra["target_group_id"] == "12345"
     assert sent.extra["target_group_name"] == "群聊"
+
+
+async def test_life_send_image_action_sends_existing_local_image(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_path = tmp_path / "sample.png"
+    image_path.write_bytes(b"fake-png")
+    sent: dict[str, object] = {}
+
+    async def fake_send_image(image_data, stream_id, **kwargs):
+        sent.update({"image_data": image_data, "stream_id": stream_id, **kwargs})
+        return True
+
+    monkeypatch.setattr(
+        "src.app.plugin_system.api.send_api.send_image",
+        fake_send_image,
+    )
+    action = LifeSendImageAction.__new__(LifeSendImageAction)
+    action.chat_stream = SimpleNamespace(stream_id="stream-1", platform="feishu")
+
+    ok, message = await action.execute(str(image_path))
+
+    assert ok is True
+    assert "已发送图片" in message
+    assert sent["stream_id"] == "stream-1"
+    assert sent["platform"] == "feishu"
+    assert sent["image_data"] == "ZmFrZS1wbmc="
+
+
+async def test_life_send_voice_action_sends_existing_local_audio(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    voice_path = tmp_path / "sample.wav"
+    voice_path.write_bytes(b"fake-wav")
+    sent: dict[str, object] = {}
+
+    async def fake_send_voice(voice_data, stream_id, **kwargs):
+        sent.update({"voice_data": voice_data, "stream_id": stream_id, **kwargs})
+        return True
+
+    monkeypatch.setattr(
+        "src.app.plugin_system.api.send_api.send_voice",
+        fake_send_voice,
+    )
+    action = LifeSendVoiceAction.__new__(LifeSendVoiceAction)
+    action.chat_stream = SimpleNamespace(stream_id="stream-1", platform="feishu")
+
+    ok, message = await action.execute(str(voice_path))
+
+    assert ok is True
+    assert "已发送语音" in message
+    assert sent["stream_id"] == "stream-1"
+    assert sent["voice_data"] == "ZmFrZS13YXY="
+
+
+async def test_life_save_media_tool_writes_image_inside_workspace(
+    tmp_path: Path,
+) -> None:
+    image_message = Message(
+        message_id="image-1",
+        content="ZmFrZS1pbWFnZQ==",
+        processed_plain_text="[图片]",
+        message_type=MessageType.IMAGE,
+        sender_id="user-1",
+        sender_name="Ayer",
+        platform="feishu",
+        chat_type="private",
+        stream_id="stream-1",
+    )
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(tmp_path)
+    tool = LifeSaveMediaTool.__new__(LifeSaveMediaTool)
+    tool.plugin = SimpleNamespace(config=config)
+    tool.chat_stream = SimpleNamespace(
+        context=SimpleNamespace(
+            unread_messages=[image_message],
+            current_message=image_message,
+            history_messages=[],
+        )
+    )
+
+    ok, result = await tool.execute("latest", "image", "received/sample.png")
+
+    assert ok is True
+    assert isinstance(result, dict)
+    saved_path = Path(result["saved_to"])
+    assert saved_path == tmp_path / "received" / "sample.png"
+    assert saved_path.read_bytes() == b"fake-image"
+
+
+async def test_life_recognize_voice_tool_uses_current_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    voice_message = Message(
+        message_id="voice-1",
+        content="ZmFrZS1hdWRpbw==",
+        processed_plain_text="[语音]",
+        message_type=MessageType.VOICE,
+        sender_id="user-1",
+        sender_name="Ayer",
+        platform="feishu",
+        chat_type="private",
+        stream_id="stream-1",
+    )
+    tool = LifeRecognizeVoiceTool.__new__(LifeRecognizeVoiceTool)
+    tool.chat_stream = SimpleNamespace(
+        context=SimpleNamespace(
+            unread_messages=[voice_message],
+            current_message=voice_message,
+            history_messages=[],
+        )
+    )
+    manager = SimpleNamespace(
+        recognize_voice=AsyncMock(return_value="语音转写：你好"),
+    )
+    monkeypatch.setattr(
+        "src.core.managers.media_manager.get_media_manager",
+        lambda: manager,
+    )
+
+    ok, result = await tool.execute("latest")
+
+    assert ok is True
+    assert result == "语音转写：你好"
+    manager.recognize_voice.assert_awaited_once()
+
+
+async def test_life_send_voice_action_synthesizes_with_tts_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """text 模式应调用 model_tasks.tts 并把合成音频发送到当前聊天。"""
+    action = LifeSendVoiceAction.__new__(LifeSendVoiceAction)
+    action.chat_stream = SimpleNamespace(stream_id="stream-1", platform="feishu")
+    model_entry = {"model_identifier": "mimo-v2.5-tts"}
+    speech_client = SimpleNamespace(
+        create_speech=AsyncMock(return_value=b"RIFF-demo-audio"),
+    )
+    registry = SimpleNamespace(
+        get_speech_client_for_model=lambda entry: speech_client,
+    )
+    sent: dict[str, object] = {}
+
+    async def fake_send_voice(voice_data, stream_id, **kwargs):
+        sent.update({"voice_data": voice_data, "stream_id": stream_id, **kwargs})
+        return True
+
+    monkeypatch.setattr(
+        "src.app.plugin_system.api.llm_api.get_model_set_by_task",
+        lambda task: [model_entry] if task == "tts" else None,
+    )
+    monkeypatch.setattr(
+        "src.kernel.llm.model_client.registry.get_default_model_client_registry",
+        lambda: registry,
+    )
+    monkeypatch.setattr(
+        "src.app.plugin_system.api.send_api.send_voice",
+        fake_send_voice,
+    )
+
+    ok, result = await action.execute(
+        text="晚上好。",
+        voice="mimo_default",
+        instructions="温柔地说",
+    )
+
+    assert ok is True
+    assert "已合成并发送语音" in result
+    speech_client.create_speech.assert_awaited_once()
+    assert sent["stream_id"] == "stream-1"
+    assert sent["platform"] == "feishu"
+    assert sent["processed_plain_text"] == "[语音:晚上好。]"
+
+
+def test_life_media_capabilities_are_registered_for_enabled_chatter() -> None:
+    """四项媒体能力只在 LifeChatter 启用时注册，并保持主体主动调用。"""
+    enabled_config = LifeEngineConfig()
+    enabled_config.chatter.enabled = True
+    enabled_components = LifeEnginePlugin(enabled_config).get_components()
+
+    disabled_config = LifeEngineConfig()
+    disabled_config.chatter.enabled = False
+    disabled_components = LifeEnginePlugin(disabled_config).get_components()
+
+    media_components = {
+        LifeSendImageAction,
+        LifeSendVoiceAction,
+        LifeRecognizeVoiceTool,
+        LifeSaveMediaTool,
+    }
+    assert media_components <= set(enabled_components)
+    assert media_components.isdisjoint(disabled_components)
+    assert all(component.chatter_allow == ["life_chatter"] for component in media_components)
 
 
 def test_life_send_file_action_is_not_registered() -> None:

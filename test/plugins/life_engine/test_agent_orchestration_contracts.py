@@ -511,6 +511,10 @@ class TestConsciousnessManifestContracts:
             "tool-nucleus_search_memory",
             "tool-nucleus_view_relations",
             "tool-nucleus_memory_stats",
+            "action-life_send_image",
+            "action-life_send_voice",
+            "tool-recognize_voice",
+            "tool-nucleus_save_media",
             "tool-platform_action",
         } <= manifest
 

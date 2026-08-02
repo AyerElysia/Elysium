@@ -13,6 +13,31 @@ from plugins.napcat_adapter.config import NapcatAdapterConfig
 from plugins.napcat_adapter.plugin import NapcatAdapter, NapcatAdapterPlugin, _validate_bot_identity
 
 
+def test_disabled_napcat_plugin_registers_no_adapter_component() -> None:
+    """plugin.enabled=false 必须阻止 Adapter 注册和连接启动。"""
+    config = NapcatAdapterConfig.from_dict(
+        {
+            "plugin": {"enabled": False, "config_version": "2.0.0"},
+            "bot": {"qq_id": "123456789", "qq_nickname": "MoFoxBot"},
+            "napcat_server": {
+                "mode": "reverse",
+                "host": "localhost",
+                "port": 8095,
+                "access_token": "",
+            },
+        }
+    )
+
+    assert NapcatAdapterPlugin(config=config).get_components() == []
+
+
+def test_enabled_napcat_plugin_still_registers_adapter_component() -> None:
+    """修复停用开关不能破坏 enabled=true 的正常注册。"""
+    plugin = _build_napcat_plugin()
+
+    assert plugin.get_components() == [NapcatAdapter]
+
+
 def _build_napcat_plugin() -> NapcatAdapterPlugin:
     """构造测试用 Napcat 插件实例。"""
     config = NapcatAdapterConfig.from_dict(

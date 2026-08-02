@@ -1376,6 +1376,63 @@ class OpenAIChatClient:
             f"当前 SDK 客户端不支持原生 rerank 接口，模型：{model_name}"
         )
 
+    async def create_speech(
+        self,
+        *,
+        model_name: str,
+        text: str,
+        request_name: str,
+        model_set: Any,
+        voice: str = "mimo_default",
+        instructions: str = "",
+        output_format: str = "wav",
+    ) -> bytes:
+        """按 MiMo TTS Chat Completions 协议生成语音。"""
+        del request_name
+        if not isinstance(model_set, dict):
+            raise TypeError("OpenAIChatClient 期望 model_set 为单个模型配置 dict")
+        normalized_text = str(text or "").strip()
+        if not normalized_text:
+            raise ValueError("TTS 文本不能为空")
+        if output_format not in {"wav", "mp3"}:
+            raise ValueError("TTS 输出格式只支持 wav/mp3")
+
+        api_key, base_url, timeout, trust_env, force_ipv4, extra_params = (
+            self._extract_model_params(model_set)
+        )
+        extra_params.pop("tts_wire_profile", None)
+        client = self._get_client(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+            trust_env=trust_env,
+            force_ipv4=force_ipv4,
+        )
+        messages: list[dict[str, str]] = []
+        normalized_instructions = str(instructions or "").strip()
+        if normalized_instructions:
+            messages.append({"role": "user", "content": normalized_instructions})
+        messages.append({"role": "assistant", "content": normalized_text})
+        response = await client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            extra_body={
+                "audio": {"format": output_format, "voice": voice},
+                **extra_params,
+            },
+        )
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            raise LLMContentFilterError("MiMo TTS 返回空 choices")
+        message = getattr(choices[0], "message", None)
+        audio = getattr(message, "audio", None)
+        data = getattr(audio, "data", None)
+        if not isinstance(data, str) or not data.strip():
+            raise LLMConfigurationError("MiMo TTS 响应缺少 message.audio.data")
+        import base64
+
+        return base64.b64decode(data)
+
     async def create_transcription(
         self,
         *,
@@ -1383,8 +1440,13 @@ class OpenAIChatClient:
         audio_bytes: bytes,
         request_name: str,
         model_set: Any,
+        mime_type: str = "audio/wav",
     ) -> str:
-        """发起语音转文字请求（OpenAI audio/transcriptions 接口）。
+        """发起语音转文字请求。
+
+        默认使用 OpenAI ``audio/transcriptions``；当模型配置
+        ``extra_params.asr_wire_profile = \"mimo_chat_completions\"`` 时，
+        按 MiMo-V2.5-ASR 官方协议改走 Chat Completions ``input_audio``。
 
         Args:
             model_name: ASR 模型名称。
@@ -1406,7 +1468,7 @@ class OpenAIChatClient:
         if not isinstance(model_set, dict):
             raise TypeError("OpenAIChatClient 期望 model_set 为单个模型配置 dict")
 
-        api_key, base_url, timeout, trust_env, force_ipv4, _ = (
+        api_key, base_url, timeout, trust_env, force_ipv4, extra_params = (
             self._extract_model_params(model_set)
         )
         client = self._get_client(
@@ -1417,9 +1479,47 @@ class OpenAIChatClient:
             force_ipv4=force_ipv4,
         )
 
+        wire_profile = str(extra_params.pop("asr_wire_profile", "") or "").strip()
+        language = str(extra_params.pop("asr_language", "auto") or "auto").strip()
+        if wire_profile == "mimo_chat_completions":
+            import base64
+
+            if mime_type not in {"audio/wav", "audio/mpeg", "audio/mp3"}:
+                raise UnsupportedModalityError(
+                    f"MiMo-V2.5-ASR 只支持 WAV/MP3，收到: {mime_type!r}"
+                )
+            encoded = base64.b64encode(audio_bytes).decode("ascii")
+            data_url = f"data:{mime_type};base64,{encoded}"
+            response = await client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_audio",
+                                "input_audio": {"data": data_url},
+                            }
+                        ],
+                    }
+                ],
+                extra_body={
+                    "asr_options": {"language": language},
+                    **extra_params,
+                },
+            )
+            choices = getattr(response, "choices", None) or []
+            if not choices:
+                raise LLMContentFilterError("MiMo ASR 返回空 choices")
+            message = getattr(choices[0], "message", None)
+            text = getattr(message, "content", None)
+            return text if isinstance(text, str) else str(text or "")
+
+        suffix = ".mp3" if mime_type in {"audio/mpeg", "audio/mp3"} else ".wav"
         resp = await client.audio.transcriptions.create(
             model=model_name,
-            file=("audio.wav", io.BytesIO(audio_bytes), "audio/wav"),
+            file=(f"audio{suffix}", io.BytesIO(audio_bytes), mime_type),
+            **extra_params,
         )
         text = getattr(resp, "text", None)
         return text if isinstance(text, str) else str(resp)

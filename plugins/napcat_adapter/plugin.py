@@ -636,5 +636,9 @@ class NapcatAdapterPlugin(BasePlugin):
     configs = [NapcatAdapterConfig]
 
     def get_components(self) -> list[type]:
-        """获取插件内所有组件类。"""
+        """获取插件组件；本机配置停用时不注册适配器。"""
+        config = cast(NapcatAdapterConfig | None, self.config)
+        if config is not None and not config.plugin.enabled:
+            logger.info("NapCat 适配器已在配置中停用，不注册 Adapter 组件")
+            return []
         return [NapcatAdapter]

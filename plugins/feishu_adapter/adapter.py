@@ -19,6 +19,7 @@ import httpx
 from mofox_wire import CoreSink, MessageEnvelope
 
 from src.core.components.base.adapter import BaseAdapter
+from src.core.utils.audio_transcode import probe_audio_duration_ms, transcode_audio_to_opus
 from src.kernel.logger import get_logger
 
 from .config import FeishuAdapterConfig
@@ -605,7 +606,7 @@ class FeishuAdapter(BaseAdapter):
             segments.extend(self._mention_segments(normalized.get("mentions") or []))
             media_segments = await self._download_incoming_media_segments(message_id, media_refs)
             if media_segments:
-                if content and content != "[图片]":
+                if content and content not in {"[图片]", "[语音]"}:
                     segments.append({"type": "text", "data": content})
                 segments.extend(media_segments)
             elif content:
@@ -632,9 +633,10 @@ class FeishuAdapter(BaseAdapter):
         outgoing = self._extract_outgoing_message(envelope)
         text = outgoing["text"]
         reply_to = outgoing["reply_to"]
+        image_data = outgoing["image_data"]
         voice_data = outgoing["voice_data"]
 
-        if not text and not voice_data:
+        if not text and not image_data and not voice_data:
             logger.info("飞书出站消息为空，跳过发送")
             return
 
@@ -643,6 +645,15 @@ class FeishuAdapter(BaseAdapter):
         user_info = message_info.get("user_info") or {}
         chat_id = str(group_info.get("group_id") or "")
         open_id = str(user_info.get("user_id") or "")
+
+        if image_data:
+            await self._send_image_message(
+                chat_id=chat_id,
+                open_id=open_id,
+                reply_to=reply_to,
+                image_data=image_data,
+            )
+            return
 
         if voice_data:
             await self._send_audio_message(
@@ -827,6 +838,8 @@ class FeishuAdapter(BaseAdapter):
         if message_type:
             if message_type == "image" and parsed.get("image_key"):
                 return "[图片]"
+            if message_type in {"audio", "file"} and parsed.get("file_key"):
+                return "[语音]" if message_type == "audio" else "[文件]"
             return f"[飞书{message_type}消息: {json.dumps(parsed, ensure_ascii=False)[:300]}]"
         return str(parsed.get("text") or parsed.get("content") or "")
 
@@ -841,6 +854,15 @@ class FeishuAdapter(BaseAdapter):
             image_key = str(parsed.get("image_key") or "").strip()
             if image_key:
                 refs.append({"type": "image", "key": image_key})
+            return refs
+
+        if message_type in {"audio", "file"}:
+            file_key = str(parsed.get("file_key") or "").strip()
+            if file_key:
+                refs.append({
+                    "type": "voice" if message_type == "audio" else "file",
+                    "key": file_key,
+                })
             return refs
 
         if message_type == "post":
@@ -881,20 +903,34 @@ class FeishuAdapter(BaseAdapter):
                 continue
             media_type = str(media_ref.get("type") or "").strip()
             media_key = str(media_ref.get("key") or "").strip()
-            if media_type != "image" or not media_key:
+            resource_type = "image" if media_type == "image" else "file"
+            segment_type = "image" if media_type == "image" else "voice"
+            if media_type not in {"image", "voice"} or not media_key:
                 continue
             try:
-                image_base64 = await self._download_message_resource_as_base64(
+                media_base64 = await self._download_message_resource_as_base64(
                     message_id=message_id,
                     resource_key=media_key,
-                    resource_type="image",
+                    resource_type=resource_type,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    f"飞书图片下载失败，保留文本占位: message_id={message_id}, image_key={media_key}, error={exc}"
+                    "飞书媒体下载失败，保留文本占位: "
+                    f"message_id={message_id}, media_type={media_type}, "
+                    f"media_key={media_key}, error={exc}"
                 )
                 continue
-            segments.append({"type": "image", "data": image_base64})
+            if media_type == "voice":
+                segments.append({
+                    "type": segment_type,
+                    "data": {
+                        "base64": media_base64,
+                        "mime_type": "audio/ogg",
+                        "filename": f"{media_key}.opus",
+                    },
+                })
+            else:
+                segments.append({"type": segment_type, "data": media_base64})
         return segments
 
     async def _download_message_resource_as_base64(
@@ -1195,6 +1231,7 @@ class FeishuAdapter(BaseAdapter):
             segments = [segments]
         text_parts: list[str] = []
         reply_to = ""
+        image_data = ""
         voice_data = ""
         for seg in segments:
             if not isinstance(seg, dict):
@@ -1205,11 +1242,14 @@ class FeishuAdapter(BaseAdapter):
                 reply_to = str(data or "")
             elif seg_type == "text":
                 text_parts.append(str(data or ""))
+            elif seg_type == "image" and not image_data:
+                image_data = FeishuAdapter._stringify_media_data(data)
             elif seg_type == "voice" and not voice_data:
                 voice_data = FeishuAdapter._stringify_media_data(data)
         return {
             "text": "".join(text_parts).strip(),
             "reply_to": reply_to,
+            "image_data": image_data,
             "voice_data": voice_data,
         }
 
@@ -1219,6 +1259,75 @@ class FeishuAdapter(BaseAdapter):
         if private_chat_id:
             return "chat_id", private_chat_id
         return "open_id", open_id
+
+    async def _send_image_message(
+        self,
+        *,
+        chat_id: str,
+        open_id: str,
+        reply_to: str,
+        image_data: str,
+    ) -> None:
+        image_key = await self._upload_image_data(image_data)
+        if self._config().behavior.reply_to_message and reply_to:
+            await self._reply_image(reply_to, image_key)
+            logger.info(f"飞书引用图片发送成功: reply_to={reply_to} image_key={image_key}")
+            return
+        if chat_id:
+            await self._send_image("chat_id", chat_id, image_key)
+            logger.info(f"飞书群图片发送成功: chat_id={chat_id} image_key={image_key}")
+            return
+        if open_id:
+            receive_id_type, receive_id = self._private_receive_target(open_id)
+            await self._send_image(receive_id_type, receive_id, image_key)
+            logger.info(
+                "飞书私聊图片发送成功: "
+                f"{receive_id_type}={receive_id} image_key={image_key}"
+            )
+            return
+        raise ValueError("飞书出站图片缺少 chat_id/open_id，无法确定发送目标")
+
+    async def _upload_image_data(self, image_data: str) -> str:
+        image_bytes = self._decode_media_data(image_data, media_label="图片")
+        token = await self._get_tenant_access_token()
+        resp = await self._request_with_retry(
+            "POST",
+            self._api_url("/open-apis/im/v1/images"),
+            timeout=30.0,
+            headers={"Authorization": f"Bearer {token}"},
+            data={"image_type": "message"},
+            files={"image": ("image.png", image_bytes, "application/octet-stream")},
+        )
+        payload = self._decode_response(resp)
+        image_key = str((payload.get("data") or {}).get("image_key") or "")
+        if not image_key:
+            raise ValueError(f"飞书图片上传响应缺少 image_key: {payload}")
+        return image_key
+
+    async def _reply_image(self, message_id: str, image_key: str) -> dict[str, Any]:
+        normalized_message_id = self._normalize_message_id(message_id)
+        return await self._post_json(
+            f"/open-apis/im/v1/messages/{normalized_message_id}/reply",
+            {
+                "msg_type": "image",
+                "content": json.dumps({"image_key": image_key}, ensure_ascii=False),
+            },
+        )
+
+    async def _send_image(
+        self,
+        receive_id_type: str,
+        receive_id: str,
+        image_key: str,
+    ) -> dict[str, Any]:
+        return await self._post_json(
+            f"/open-apis/im/v1/messages?receive_id_type={receive_id_type}",
+            {
+                "receive_id": receive_id,
+                "msg_type": "image",
+                "content": json.dumps({"image_key": image_key}, ensure_ascii=False),
+            },
+        )
 
     async def _send_audio_message(
         self,
@@ -1342,53 +1451,8 @@ class FeishuAdapter(BaseAdapter):
 
     @staticmethod
     def _convert_audio_to_opus(audio_bytes: bytes) -> tuple[bytes, int]:
-        if not audio_bytes:
-            raise ValueError("音频数据为空")
-
-        ffmpeg = shutil.which("ffmpeg")
-        ffprobe = shutil.which("ffprobe")
-        missing = [
-            name
-            for name, path in (("ffmpeg", ffmpeg), ("ffprobe", ffprobe))
-            if path is None
-        ]
-        if missing:
-            raise RuntimeError(
-                "飞书语音发送需要安装并加入 PATH 的 "
-                + "、".join(missing)
-                + "；当前进程无法找到这些命令。"
-            )
-
-        with tempfile.TemporaryDirectory(prefix="feishu_audio_") as tmp_dir:
-            tmp_path = Path(tmp_dir)
-            input_path = tmp_path / "input_audio"
-            output_path = tmp_path / "voice.opus"
-            input_path.write_bytes(audio_bytes)
-
-            subprocess.run(
-                [
-                    ffmpeg,
-                    "-y",
-                    "-i",
-                    str(input_path),
-                    "-acodec",
-                    "libopus",
-                    "-ac",
-                    "1",
-                    "-ar",
-                    "16000",
-                    str(output_path),
-                ],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-
-            duration_ms = FeishuAdapter._probe_audio_duration_ms(
-                output_path,
-                ffprobe=ffprobe,
-            )
-            return output_path.read_bytes(), duration_ms
+        opus_bytes = transcode_audio_to_opus(audio_bytes)
+        return opus_bytes, probe_audio_duration_ms(opus_bytes)
 
     @staticmethod
     def _probe_audio_duration_ms(
@@ -1432,16 +1496,16 @@ class FeishuAdapter(BaseAdapter):
         return str(data or "")
 
     @staticmethod
-    def _decode_media_data(data: str) -> bytes:
+    def _decode_media_data(data: str, *, media_label: str = "音频") -> bytes:
         raw = str(data or "").strip()
         if not raw:
-            raise ValueError("音频数据为空")
+            raise ValueError(f"{media_label}数据为空")
         if raw.startswith("data:"):
             _, _, raw = raw.partition(",")
         if raw.startswith("base64|"):
             raw = raw.removeprefix("base64|")
         if raw.startswith(("http://", "https://")):
-            raise ValueError("飞书语音暂不支持 URL 直传")
+            raise ValueError(f"飞书{media_label}暂不支持 URL 直传")
         if len(raw) < 4096:
             try:
                 path = Path(raw)

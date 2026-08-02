@@ -1,5 +1,6 @@
 {
   "name": "astrbot_sister_bridge",
+  "enabled": false,
   "version": "1.0.0",
   "description": "让 Neo-MoFox 姐姐通过独立姐妹会话直连 AstrBot 妹妹爱莉希雅并取得即时回复。",
   "author": "Elysium",

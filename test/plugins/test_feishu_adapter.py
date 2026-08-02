@@ -270,6 +270,56 @@ async def test_feishu_image_event_downloads_to_image_segment(monkeypatch: pytest
     }
 
 
+async def test_feishu_audio_event_downloads_to_voice_segment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = make_adapter()
+    downloaded: dict[str, str] = {}
+
+    async def fake_download_resource(*, message_id: str, resource_key: str, resource_type: str) -> str:
+        downloaded.update({
+            "message_id": message_id,
+            "resource_key": resource_key,
+            "resource_type": resource_type,
+        })
+        return "ZmFrZV9hdWRpbw=="
+
+    monkeypatch.setattr(adapter, "_download_message_resource_as_base64", fake_download_resource)
+    payload = {
+        "schema": "2.0",
+        "header": {"event_id": "evt_audio"},
+        "event": {
+            "sender": {"sender_type": "user", "sender_id": {"open_id": "ou_1"}},
+            "message": {
+                "message_id": "om_audio",
+                "chat_id": "oc_private",
+                "chat_type": "p2p",
+                "message_type": "audio",
+                "content": "{\"file_key\":\"file_v3_demo\"}",
+            },
+        },
+    }
+
+    envelope = await adapter.from_platform_message(payload)
+
+    assert envelope is not None
+    assert envelope["message_segment"] == [
+        {
+            "type": "voice",
+            "data": {
+                "base64": "ZmFrZV9hdWRpbw==",
+                "mime_type": "audio/ogg",
+                "filename": "file_v3_demo.opus",
+            },
+        }
+    ]
+    assert downloaded == {
+        "message_id": "om_audio",
+        "resource_key": "file_v3_demo",
+        "resource_type": "file",
+    }
+
+
 async def test_feishu_image_event_falls_back_to_text_when_download_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -394,6 +444,40 @@ async def test_feishu_outgoing_group_text(monkeypatch: pytest.MonkeyPatch) -> No
     assert calls[0][1]["receive_id"] == "oc_1"
 
 
+async def test_feishu_outgoing_image_uploads_and_sends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = make_adapter()
+    calls = []
+
+    async def fake_upload_image(image_data: str) -> str:
+        assert image_data == "ZmFrZV9pbWFnZQ=="
+        return "img-key-1"
+
+    async def fake_post(path, body):
+        calls.append((path, body))
+        return {"code": 0}
+
+    monkeypatch.setattr(adapter, "_upload_image_data", fake_upload_image)
+    monkeypatch.setattr(adapter, "_post_json", fake_post)
+
+    await adapter._send_platform_message({
+        "direction": "outgoing",
+        "message_info": {
+            "platform": "feishu",
+            "message_id": "out_image",
+            "time": 1.0,
+            "user_info": {"platform": "feishu", "user_id": "ou_1", "user_nickname": ""},
+        },
+        "message_segment": [{"type": "image", "data": "ZmFrZV9pbWFnZQ=="}],
+    })
+
+    assert calls[0][0] == "/open-apis/im/v1/messages?receive_id_type=open_id"
+    assert calls[0][1]["receive_id"] == "ou_1"
+    assert calls[0][1]["msg_type"] == "image"
+    assert json.loads(calls[0][1]["content"]) == {"image_key": "img-key-1"}
+
+
 async def test_feishu_outgoing_reply_text(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter = make_adapter()
     calls = []
@@ -424,9 +508,15 @@ async def test_feishu_outgoing_reply_text(monkeypatch: pytest.MonkeyPatch) -> No
 def test_feishu_audio_conversion_reports_missing_ffmpeg(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("plugins.feishu_adapter.adapter.shutil.which", lambda _name: None)
+    def fail_transcode(_audio_bytes: bytes) -> bytes:
+        raise RuntimeError("音频转码需要 FFmpeg")
 
-    with pytest.raises(RuntimeError, match="ffmpeg.*ffprobe"):
+    monkeypatch.setattr(
+        "plugins.feishu_adapter.adapter.transcode_audio_to_opus",
+        fail_transcode,
+    )
+
+    with pytest.raises(RuntimeError, match="FFmpeg"):
         FeishuAdapter._convert_audio_to_opus(b"RIFF-demo")
 
 
