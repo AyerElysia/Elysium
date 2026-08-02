@@ -57,7 +57,8 @@ async def test_shutdown_continues_after_independent_step_failure(
     adapter_manager = SimpleNamespace(
         stop_all_adapters=AsyncMock(
             side_effect=lambda: shutdown_order.append("adapters") or {}
-        )
+        ),
+        list_active_adapters=Mock(return_value=[]),
     )
     monkeypatch.setattr(
         "src.core.managers.adapter_manager.get_adapter_manager",
@@ -95,6 +96,95 @@ async def test_shutdown_continues_after_independent_step_failure(
     close_vectors.assert_awaited_once()
     close_logger.assert_awaited_once()
     network_cleanup.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_recovers_when_plugin_unload_finishes_adapter_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient first-pass adapter failure must not become a fatal error."""
+
+    bot = Bot()
+    signature = "napcat_adapter:adapter:napcat_adapter"
+    active = [signature]
+    adapter_manager = SimpleNamespace(
+        stop_all_adapters=AsyncMock(return_value={signature: False}),
+        list_active_adapters=Mock(side_effect=lambda: list(active)),
+    )
+
+    async def unload_plugins() -> None:
+        active.clear()
+
+    bot._unload_all_plugins = unload_plugins  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "src.core.managers.adapter_manager.get_adapter_manager",
+        lambda: adapter_manager,
+    )
+    monkeypatch.setattr(
+        "src.core.transport.distribution.stream_loop_manager."
+        "get_stream_loop_manager",
+        lambda: SimpleNamespace(stop=AsyncMock()),
+    )
+    monkeypatch.setattr("src.kernel.db.close_engine", AsyncMock())
+    monkeypatch.setattr(
+        "src.kernel.llm.model_client.close_default_model_clients",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "src.kernel.vector_db.close_all_vector_db_services",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "src.kernel.logger.shutdown_logger_system_async",
+        AsyncMock(),
+    )
+
+    await bot.shutdown()
+
+    adapter_manager.stop_all_adapters.assert_awaited_once()
+    assert adapter_manager.list_active_adapters.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_shutdown_reports_adapter_only_after_retry_is_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A truly live adapter after the retry remains a shutdown failure."""
+
+    bot = Bot()
+    signature = "napcat_adapter:adapter:napcat_adapter"
+    adapter_manager = SimpleNamespace(
+        stop_all_adapters=AsyncMock(return_value={signature: False}),
+        list_active_adapters=Mock(return_value=[signature]),
+    )
+    bot._unload_all_plugins = AsyncMock()  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "src.core.managers.adapter_manager.get_adapter_manager",
+        lambda: adapter_manager,
+    )
+    monkeypatch.setattr(
+        "src.core.transport.distribution.stream_loop_manager."
+        "get_stream_loop_manager",
+        lambda: SimpleNamespace(stop=AsyncMock()),
+    )
+    monkeypatch.setattr("src.kernel.db.close_engine", AsyncMock())
+    monkeypatch.setattr(
+        "src.kernel.llm.model_client.close_default_model_clients",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "src.kernel.vector_db.close_all_vector_db_services",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "src.kernel.logger.shutdown_logger_system_async",
+        AsyncMock(),
+    )
+
+    with pytest.raises(BotShutdownError, match="adapters_verify"):
+        await bot.shutdown()
+
+    assert adapter_manager.stop_all_adapters.await_count == 2
 
 
 @pytest.mark.asyncio

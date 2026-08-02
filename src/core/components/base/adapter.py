@@ -135,11 +135,25 @@ class BaseAdapter(AdapterBase):
                 pass
             self._health_check_task_info = None
 
-        # 调用父类停止
-        await super().stop()
+        transport_error: BaseException | None = None
+        try:
+            # 先停止通用传输层；即使它失败，也必须释放插件私有资源。
+            await super().stop()
+        except BaseException as exc:  # noqa: BLE001 - cleanup must survive cancellation
+            transport_error = exc
 
-        # 调用生命周期钩子
-        await self.on_adapter_unloaded()
+        try:
+            await self.on_adapter_unloaded()
+        except BaseException as unload_error:  # noqa: BLE001 - preserve both failures
+            if transport_error is not None:
+                raise BaseExceptionGroup(
+                    "adapter transport and unload cleanup both failed",
+                    [transport_error, unload_error],
+                ) from transport_error
+            raise
+
+        if transport_error is not None:
+            raise transport_error
 
     async def on_adapter_loaded(self) -> None:
         """适配器加载时的钩子。

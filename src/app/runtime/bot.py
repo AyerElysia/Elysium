@@ -999,9 +999,33 @@ class Bot:
             results = await get_adapter_manager().stop_all_adapters()
             failures = [signature for signature, success in results.items() if not success]
             if failures:
-                raise RuntimeError(
-                    "adapter shutdown failed: " + ", ".join(sorted(failures))
+                message = (
+                    "适配器首次关闭未完成，将在插件卸载后重试: "
+                    + ", ".join(sorted(failures))
                 )
+                if self.logger:
+                    self.logger.warning(message)
+                else:
+                    print(message)
+
+        async def _verify_adapters_stopped() -> None:
+            from src.core.managers.adapter_manager import get_adapter_manager
+
+            manager = get_adapter_manager()
+            remaining = manager.list_active_adapters()
+            if not remaining:
+                return
+
+            await manager.stop_all_adapters()
+            remaining = manager.list_active_adapters()
+            if remaining:
+                raise RuntimeError(
+                    "adapter shutdown failed after retry: "
+                    + ", ".join(sorted(remaining))
+                )
+
+            if self.logger:
+                self.logger.info("适配器已在插件卸载后重试关闭完成")
 
         async def _stop_scheduler() -> None:
             if self.scheduler is not None:
@@ -1067,6 +1091,7 @@ class Bot:
             ("stream_loops", _stop_stream_loops),
             ("adapters", _stop_adapters),
             ("plugins", self._unload_all_plugins),
+            ("adapters_verify", _verify_adapters_stopped),
             ("scheduler", _stop_scheduler),
             ("http_server", _stop_http_server),
             ("mcp", _cleanup_mcp),

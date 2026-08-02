@@ -142,9 +142,9 @@ class MemoryWitnessCoordinator:
             try:
                 raw_events = await store.read_since(cursor, limit=limit)
             except RawEventGapError as gap:
-                logger.error(
-                    "Raw event retention overtook the witness cursor; "
-                    "resuming from the earliest retained event: "
+                logger.warning(
+                    "原始事件历史已轮转，记忆见证游标落后；"
+                    "将从最早保留事件继续处理: "
                     f"requested={gap.requested_sequence}, "
                     f"earliest={gap.earliest_available}"
                 )

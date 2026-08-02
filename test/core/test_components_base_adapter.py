@@ -142,6 +142,20 @@ class TestBaseAdapter:
                 assert adapter._running is False
                 assert adapter._health_check_task_info is None
 
+    async def test_adapter_stop_runs_unload_hook_after_transport_failure(self):
+        """Plugin resources must be released even if wire cleanup fails."""
+
+        adapter = TestAdapter(core_sink=MagicMock())
+        adapter.on_adapter_unloaded = AsyncMock()  # type: ignore[method-assign]
+
+        with patch(
+            "mofox_wire.AdapterBase.stop",
+            new=AsyncMock(side_effect=RuntimeError("wire cleanup failed")),
+        ), pytest.raises(RuntimeError, match="wire cleanup failed"):
+            await adapter.stop()
+
+        adapter.on_adapter_unloaded.assert_awaited_once_with()
+
     async def test_on_adapter_loaded_hook(self):
         """测试适配器加载钩子。"""
         mock_sink = MagicMock()

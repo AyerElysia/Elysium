@@ -26,7 +26,7 @@ from mofox_wire import CoreSink, MessageEnvelope, WebSocketAdapterOptions
 from src.app.plugin_system.api.log_api import get_logger
 from src.core.components.base import BaseAdapter, BasePlugin
 from src.core.components.loader import register_plugin
-from src.kernel.concurrency import get_task_manager
+from src.kernel.concurrency import TaskInfo, get_task_manager
 
 from .client import NapCatClient
 from .config import NapcatAdapterConfig
@@ -103,7 +103,7 @@ class NapcatAdapter(BaseAdapter):
         # 记录每条 CLOSE-WAIT 连接首次被观察到的时间。不能用“多久没收到
         # QQ 消息”代替连接本身的存活时间，否则正常的安静时段也会触发清理。
         self._close_wait_seen_at: dict[tuple[str, int], float] = {}
-        self._watchdog_task: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._watchdog_task: TaskInfo | None = None
 
     def _get_config(self) -> NapcatAdapterConfig | None:
         """获取当前插件配置。"""
@@ -311,7 +311,7 @@ class NapcatAdapter(BaseAdapter):
 
     def _start_watchdog(self) -> None:
         """启动 NapCat CLOSE-WAIT 监控 asyncio task。"""
-        if self._watchdog_task and not self._watchdog_task.done():
+        if self._watchdog_task and not self._watchdog_task.is_done():
             return
         tm = get_task_manager()
         self._watchdog_task = tm.create_task(
@@ -323,9 +323,10 @@ class NapcatAdapter(BaseAdapter):
 
     def _stop_watchdog(self) -> None:
         """取消 watchdog task。"""
-        if self._watchdog_task and not self._watchdog_task.done():
-            self._watchdog_task.cancel()
-            logger.info("[NapCat Watchdog] 监控任务已停止")
+        if self._watchdog_task and not self._watchdog_task.is_done():
+            tm = get_task_manager()
+            if tm.cancel_task(self._watchdog_task.task_id):
+                logger.info("[NapCat Watchdog] 监控任务已停止")
         self._watchdog_task = None
 
     async def _watchdog_loop(self) -> None:

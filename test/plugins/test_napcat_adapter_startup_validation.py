@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -262,6 +263,35 @@ def test_send_platform_message_propagates_sender_error() -> None:
     }
     with pytest.raises(ValueError, match="bad target"):
         asyncio.run(adapter._send_platform_message(envelope))
+
+
+def test_watchdog_uses_managed_task_contract_for_shutdown() -> None:
+    """Watchdog cleanup must cancel TaskInfo through TaskManager."""
+
+    adapter = NapcatAdapter(
+        core_sink=cast(Any, _FakeCoreSink()),
+        plugin=_build_napcat_plugin(),
+    )
+    task_info = SimpleNamespace(
+        task_id="napcat-watchdog",
+        is_done=Mock(return_value=False),
+    )
+    manager = SimpleNamespace(
+        create_task=Mock(),
+        cancel_task=Mock(return_value=True),
+    )
+    adapter._watchdog_task = cast(Any, task_info)
+
+    with patch(
+        "plugins.napcat_adapter.plugin.get_task_manager",
+        return_value=manager,
+    ):
+        adapter._start_watchdog()
+        adapter._stop_watchdog()
+
+    manager.create_task.assert_not_called()
+    manager.cancel_task.assert_called_once_with("napcat-watchdog")
+    assert adapter._watchdog_task is None
 
 
 async def test_send_platform_message_preserves_napcat_timeout_cause() -> None:

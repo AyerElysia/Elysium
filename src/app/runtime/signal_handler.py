@@ -1,6 +1,6 @@
 """信号处理器。
 
-处理 SIGINT、SIGTERM 和 SIGHUP，以实现手动进程的优雅关闭。
+SIGINT、SIGTERM 用于手动优雅关闭；SIGHUP 被忽略以保持服务运行。
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ class SignalHandler:
     行为：
     - 第一次 SIGINT/SIGTERM：请求优雅关闭
     - 3 秒内第二次关闭信号：强制立即关闭
-    - SIGHUP：请求优雅关闭，避免终端断开后遗留后台进程
+    - SIGHUP：忽略终端或启动管道断开，保持手动启动的服务运行
 
     Attributes:
         bot: Bot 实例
@@ -65,7 +65,7 @@ class SignalHandler:
             # SIGTERM 在某些平台可能不可用
             pass
 
-        # 注册 SIGHUP（终端关闭时优雅退出，避免残留后台进程）
+        # 注册 SIGHUP（终端或启动管道断开时继续运行）
         try:
             self._original_handlers[signal.SIGHUP] = signal.signal(
                 signal.SIGHUP, self._handle_sighup
@@ -75,14 +75,12 @@ class SignalHandler:
             pass
 
     def _handle_sighup(self, signum: int, frame: Any) -> None:
-        """Treat terminal detachment as a graceful shutdown request."""
+        """Ignore terminal detachment for manually managed processes."""
 
         self._schedule_log(
             "info",
-            "收到 SIGHUP（终端关闭），Elysium 将优雅退出",
+            "收到 SIGHUP（终端或启动管道断开），已忽略；Elysium 继续运行",
         )
-        self.shutdown_requested.set()
-        self.bot._running = False
 
     def _handle_signal(self, signum: int, frame: Any) -> None:
         """处理信号
@@ -91,6 +89,11 @@ class SignalHandler:
             signum: 信号编号
             frame: 当前堆栈帧
         """
+        try:
+            signal_name = signal.Signals(signum).name
+        except ValueError:
+            signal_name = f"signal {signum}"
+
         current_time = time.time()
 
         # 检查是否在 3 秒内多次触发
@@ -105,7 +108,7 @@ class SignalHandler:
         if self.signal_count == 1:
             self._schedule_log(
                 "info",
-                "已收到关闭信号。再次按下Ctrl+C强制退出...",
+                f"已收到关闭信号 {signal_name}。再次按下 Ctrl+C 强制退出...",
             )
             self.shutdown_requested.set()
 

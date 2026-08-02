@@ -494,9 +494,16 @@ async def test_witness_recovers_from_retained_event_gap(
         return None
 
     monkeypatch.setattr(coordinator, "_project_witness", _project)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness.logger.warning",
+        warnings.append,
+    )
 
     report = await coordinator.run_once()
 
     assert store.calls == [1, 3]
     assert report.last_sequence == 4
     assert memory.states[-1]["last_sequence"] == 4
+    assert len(warnings) == 1
+    assert "记忆见证游标落后" in warnings[0]
