@@ -29,17 +29,17 @@ Elysium 是数字生命系统，不是通用聊天机器人框架。修改配置
 | Life Chatter 文本表达 | 已验证 | 必须启用 `[chatter].enabled` 且存在非空 `SOUL.md` |
 | 飞书长连接收消息 | 已验证 | 不需要公网域名 |
 | 飞书私聊文本回复 | 已验证 | 已处理私聊 `chat_id` 路由和引用消息 ID |
-| QQ/NapCat 私聊文本聊天 | 历史已验证，本机可选停用 | 当前这台机器的忽略配置为 `plugin.enabled = false`；仓库默认和文档示例仍保持可启用 |
-| QQ/NapCat 图片查看 | 历史已验证，本机可选停用 | 本机恢复 NapCat 后仍需重新做当前版本冒烟 |
+| QQ/NapCat 私聊文本聊天 | 历史已验证 | 是否启用由各部署环境自行配置；启用后应重新做当前版本冒烟 |
+| QQ/NapCat 图片查看 | 历史已验证 | 是否启用由各部署环境自行配置；启用后应重新做当前版本冒烟 |
 | 飞书图片查看 | 已验证 | 图片资源下载需要消息读取权限；详见 9.1 |
 | 飞书图片保存 | 已验证 | 由主体主动调用 `nucleus_save_media` 保存到 Life Engine workspace |
 | 飞书图片发送 | 已验证 | 由主体主动调用 `life_send_image`，适配器上传并发送图片 |
-| Xiaomi MiMo 文本与图片模型 | 已配置并用于现阶段运行 | `mimo-v2.5` 保留 `text + image` 能力声明 |
-| Life Memory 文本向量生成 | API 冒烟已验证 | SiliconFlow `BAAI/bge-m3`，1024 维；完整记忆检索功能仍需单独验收 |
-| 主体媒体能力 | 图片与语音四项已验收 | 飞书图片保存/发送、语音接收识别、MiMo TTS 语音发送均已通过真实端到端验收；所有能力由主体主动调用 |
+| 文本与图片模型 | 需按部署环境配置 | 所选模型必须声明并实际支持所需的文本、视觉和工具调用能力 |
+| Life Memory 文本向量生成 | 需单独验收 | 向量维度必须与活动索引一致；完整记忆检索功能需单独验收 |
+| 主体媒体能力 | 图片与语音四项已验收 | 飞书图片保存/发送、语音接收识别和语音合成发送均已通过真实端到端验收；所有能力由主体主动调用 |
 | 其他功能 | 暂不验收 | 包括群聊、视频、普通文件、直播、Minecraft、屏幕观察、MCP 等；配置或代码存在不代表已验证 |
 
-当前仍有效的真实端到端验收记录包括：**QQ 聊天、飞书聊天、QQ 查看图片、飞书查看图片、飞书保存图片、飞书发送图片、飞书语音接收识别、飞书语音合成发送**。QQ/NapCat 仅在当前这台机器的忽略配置中停用，不能据此把仓库默认或提交内容写成关闭。
+当前仍有效的真实端到端验收记录包括：**QQ 聊天、飞书聊天、QQ 查看图片、飞书查看图片、飞书保存图片、飞书发送图片、飞书语音接收识别、飞书语音合成发送**。验收记录只说明相关链路曾经通过，不记录或规定任何个人部署环境当前是否启用该能力。
 
 ---
 
@@ -105,13 +105,13 @@ requires-python = ">=3.11"
 PowerShell：
 
 ```powershell
-Set-Location "E:\Elysium-AyerElysia\Elysium"
+Set-Location "<Elysium项目目录>"
 ```
 
 Git Bash：
 
 ```bash
-cd "/e/Elysium-AyerElysia/Elysium"
+cd "<Elysium项目目录>"
 ```
 
 所有启动和测试命令都应从项目根目录执行，因为当前入口使用了 `config/core.toml`、`plugins`、`logs` 等相对路径。
@@ -295,46 +295,25 @@ embedding_dimension = 0
 5. `max_context` 必须与真实模型能力相符。
 6. 视觉、音频和视频不能只改任务名；必须配置并验证媒体能力合同和 Provider 协议。
 
-### 7.5 SiliconFlow Embedding 与记忆索引
+### 7.5 Embedding 与记忆索引
 
-Life Engine 的 chunk 向量索引需要一个真正支持 Embeddings API 的模型。当前验证配置使用 SiliconFlow 的 OpenAI-compatible 接口：
+Life Engine 的 chunk 向量索引需要一个真正支持 Embeddings API 的模型。具体 Provider、模型名称、接口地址和密钥均属于部署环境配置，不写入公共文档；请按所选 Provider 的官方说明填写 `config/model.toml`。
+
+通用关键项：
 
 ```toml
-[[api_providers]]
-name = "SiliconFlow"
-base_url = "https://api.siliconflow.cn/v1"
-api_key = "<SILICONFLOW_API_KEY>"
-client_type = "openai"
-max_retry = 3
-timeout = 30
-retry_interval = 3
-
-[[models]]
-model_identifier = "BAAI/bge-m3"
-name = "siliconflow-bge-m3"
-api_provider = "SiliconFlow"
-max_context = 8192
-force_stream_mode = false
-tool_call_compat = false
-extra_params = {}
-anti_truncation = false
-
 [model_tasks.embedding]
-model_list = ["siliconflow-bge-m3"]
-max_tokens = 800
-temperature = 0.7
-concurrency_count = 1
-secondary_pick_prob = 0.0
-embedding_dimension = 1024
+model_list = ["<内部向量模型名>"]
+embedding_dimension = <模型实际输出维度>
 ```
 
 关键约束：
 
-1. Provider 地址使用 `https://api.siliconflow.cn/v1`，真实密钥只写入被 Git 忽略的本机 `config/model.toml`。
-2. `BAAI/bge-m3` 的输出维度为 1024，必须与 `embedding_dimension` 和活动向量集合一致。
-3. 当前已通过 Elysium 自身调用链完成真实 API 冒烟：单条文本返回 1 条 1024 维向量。
-4. 文本向量 API 成功不等于 Life Memory 全功能验收；记忆写入、索引切换、语义召回和失败恢复仍需分别验证。
-5. 不要用普通聊天模型代替 Embedding 模型。若 `model_tasks.embedding.model_list` 为空，索引器会报 `LLMConfigurationError: model_set 必须是非空 list[dict]`。
+1. `model_tasks.embedding.model_list` 中的名称必须对应已定义、可实际调用的 Embedding 模型。
+2. `embedding_dimension` 必须等于模型实际输出维度，并与活动向量集合一致；更换维度前先制定索引迁移或重建方案。
+3. 真实 API 冒烟必须确认返回非空向量且维度正确，但这不等于 Life Memory 全功能验收；记忆写入、索引切换、语义召回和失败恢复仍需分别验证。
+4. 不要用普通聊天模型代替 Embedding 模型。若 `model_tasks.embedding.model_list` 为空，索引器会报 `LLMConfigurationError: model_set 必须是非空 list[dict]`。
+5. Provider 地址、模型标识和真实密钥仅写入被 Git 忽略的本机配置，不得写入文档、测试、提交或日志示例。
 
 Life Engine 的索引 worker 默认每 60 秒处理一批，每批最多 4 个任务。历史任务因 Embedding 配置缺失而进入 `failed` 后，可在确认 API 和维度无误的前提下临时设置：
 
@@ -347,13 +326,15 @@ retry_failed = true
 
 ### 7.6 ASR/TTS 当前边界
 
-当前代码状态下：
+语音链路的通用实现和协议要求为：
 
-- 在 `model_tasks.voice` 填入 MiMo ASR 模型，不代表语音识别协议已经兼容；ASR 尚未验收。
-- 在 `model_tasks.tts` 填入 MiMo TTS 模型，不会自动让现有 TTS 插件消费该任务。
-- 现有 TTS 插件保持原有 GPT-SoVITS HTTP 协议，当前配置关闭。
-- 曾为飞书验收实现的公共 `openai_chat_audio` 后端和聊天意识工具清单扩展已按最小变更原则回退；后续不能把当时的独立 MiMo WAV 冒烟视为当前运行能力。
-- QQ/NapCat 与飞书共用核心 `voice` 消息段，但出站协议不同：NapCat 直接映射为 OneBot `record`；飞书还需转为 Opus、上传文件并发送 `audio` 消息。优先先验收 NapCat 原有链路，再判断公共 TTS 生成是否真的缺失。
+- `model_tasks.voice` 必须指向兼容当前音频输入合同的音频理解或 ASR 模型。飞书入站 Opus 会先转为 16 kHz 单声道 WAV；`MediaManager` 可先尝试原生音频理解，失败后回退 ASR。
+- `model_tasks.tts` 必须指向兼容当前响应结构的 TTS 模型。聊天意识的 `action-life_send_voice` 消费该任务取得合成音频，再由飞书适配器转为 Opus、上传并发送 `audio` 消息。
+- 这条任务式 TTS 链路不经过 `tts_voice_plugin`。旧插件保持独立的 GPT-SoVITS HTTP 协议；插件停用时不会导入其 `soundfile`、`pedalboard` 等可选音频依赖。
+- 若部署环境启用 GPT-SoVITS 插件，必须另外安装并声明其音频处理依赖，配置服务地址、权重和参考音频，并单独完成离线契约与真实端到端验收；不能复用任务式 TTS 链路的验收结果。
+- QQ/NapCat 与飞书共用核心 `voice` 消息段，但出站协议不同：NapCat 映射为 OneBot `record`，飞书转为 Opus 并发送 `audio`。QQ/NapCat 语音收发尚未完成真实端到端验收。
+
+具体 Provider、模型名称、音色和插件启停状态属于部署环境配置，不写入公共文档。
 
 ---
 
@@ -372,7 +353,7 @@ config/plugins/life_engine/config.toml
 enabled = true
 heartbeat_interval_seconds = 30
 heartbeat_timeout_seconds = 120
-workspace_path = "E:\\Elysium-AyerElysia\\Elysium\\data\\life_engine_workspace"
+workspace_path = "<Elysium项目目录>/data/life_engine_workspace"
 
 [model]
 task_name = "core"
@@ -384,11 +365,7 @@ mode = "enhanced"
 max_rounds_per_chat = 5
 ```
 
-注意 Windows TOML 双引号字符串中的反斜杠需要转义。也可以使用正斜杠：
-
-```toml
-workspace_path = "E:/Elysium-AyerElysia/Elysium/data/life_engine_workspace"
-```
+Windows 下建议在 TOML 路径中使用正斜杠；若使用反斜杠，则需在双引号字符串中转义。`workspace_path` 应替换为当前部署环境的实际绝对路径。
 
 ### 8.1 `SOUL.md` 是表达硬前提
 
@@ -426,7 +403,7 @@ SOUL.md 不可用，life_chatter 拒绝生成回复
 
 这些能力只进入聊天意识工具清单，由主体在理解上下文后主动选择。不得增加关键词匹配、消息类型触发器或“收到图片/语音就自动调用”的机械规则。
 
-当前离线契约覆盖注册边界、飞书图片出站、飞书语音入站资源下载和平台消息段转换。尚需在真实飞书私聊中分别完成保存图片、发送图片、发送语音、识别语音四项端到端验收。
+当前离线契约覆盖注册边界、飞书图片出站、飞书语音入站资源下载、ASR/TTS 协议和平台消息段转换。飞书私聊中的保存图片、发送图片、语音合成发送和语音接收识别四项均已完成真实端到端验收；群聊、视频和普通文件仍未验收。
 
 ### 8.3 可选能力先按需关闭
 
@@ -531,7 +508,7 @@ long_connection_log_level = "INFO"
 
 [bot]
 bot_open_id = ""
-bot_name = "爱莉"
+bot_name = "<机器人名称>"
 
 [behavior]
 reply_to_message = true
@@ -572,7 +549,7 @@ display_name_cache_ttl = 21600.0
 
 ### 9.4 飞书图片查看端到端验收
 
-当前已验收“收到并理解图片”。图片保存、图片发送、语音发送和语音识别已完成代码接入与离线契约测试，但尚未完成真实飞书端到端验收；视频和普通文件消息仍未接入本轮范围。
+当前已验收“收到并理解图片”，图片保存、图片发送、语音合成发送和语音接收识别也已完成真实飞书端到端验收；视频和普通文件消息仍未接入本轮范围。
 
 1. 确认 9.1 中 `im:message:readonly` 已审批并随新版本发布。
 2. 在飞书私聊向机器人发送一张内容明确的新图片。
@@ -580,7 +557,7 @@ display_name_cache_ttl = 21600.0
 4. 让机器人描述图片中的主体、文字或明显细节，不能只回复“收到图片”。
 5. 若 NapCat 能识别同一张图而飞书只能看到 `[图片]`，先检查是否出现 `99991672 Access denied`；不要先修改公共模型合同。
 
-当前已完成真实端到端验收：飞书文本聊天、图片查看、图片保存、图片发送、语音接收识别与 MiMo TTS 语音发送均可用。后续若更换飞书权限、MiMo 模型、TTS 音色或音频转码依赖，仍须按 9.5 重新验收对应链路。
+当前已完成真实端到端验收：飞书文本聊天、图片查看、图片保存、图片发送、语音接收识别与语音合成发送均可用。后续若更换飞书权限、语音模型、TTS 音色或音频转码依赖，仍须按 9.5 重新验收对应链路。
 
 ### 9.5 飞书媒体能力端到端验收
 
@@ -588,7 +565,9 @@ display_name_cache_ttl = 21600.0
 
 - 应用身份权限 `im:message:readonly`、`im:message:send_as_bot` 已审批并随新版本发布。
 - 项目依赖已安装 `imageio-ffmpeg>=0.6.0`，或启动进程 PATH 中存在支持 `libopus` 的 FFmpeg；不再要求独立安装 `ffprobe`。
-- `model_tasks.voice` 指向真实可调用的音频理解或 ASR 模型；仅有模型名不算协议兼容。
+- `model_tasks.voice` 指向真实可调用且兼容 `input_audio` 的音频理解或 ASR 模型；仅有模型名不算协议兼容。
+- `model_tasks.tts` 指向真实可调用且能在 `choices[0].message.audio.data` 返回音频的 TTS 模型。
+- 若部署环境不使用独立的 GPT-SoVITS 链路，应保持旧 `tts_voice_plugin` 停用；若启用，需另行完成服务、可选音频依赖和端到端验收。
 - `data/life_engine_workspace/received/` 所在磁盘有足够空间并纳入隐私保护与备份策略。
 
 逐项验收：
@@ -618,7 +597,7 @@ curl "http://127.0.0.1:8000/feishu/api/status"
 
 ```powershell
 $body = @{
-    content = "爱莉爱莉"
+    content = "测试消息"
     open_id = "local_user"
     sender_name = "本地飞书用户"
 } | ConvertTo-Json
@@ -636,7 +615,7 @@ Invoke-RestMethod `
 
 ## 10. 配置并启动 QQ/NapCat
 
-QQ 接入使用 NapCat + OneBot 11 **反向 WebSocket**：Elysium 启动 WebSocket 服务端并监听本机端口，NapCat 作为客户端主动连接。该链路历史上完成过 QQ 私聊文本和图片查看验收，但当前本机因账号条件不便已停用，不参与日常启动；以下内容保留为可恢复配置。
+QQ 接入使用 NapCat + OneBot 11 **反向 WebSocket**：Elysium 启动 WebSocket 服务端并监听本机端口，NapCat 作为客户端主动连接。该链路历史上完成过 QQ 私聊文本和图片查看验收；是否启用由各部署环境自行决定，启用后应重新完成当前版本冒烟。
 
 ### 10.1 账号与目录要求
 
@@ -645,15 +624,15 @@ QQ 接入使用 NapCat + OneBot 11 **反向 WebSocket**：Elysium 启动 WebSock
 - NapCat 本体和机器人 QQ 客户端可以位于不同目录；启动时从 NapCat 目录调用官方 `launcher.bat`。
 - 文档、代码和提交中不得记录 QQ 密码、登录凭据或其他账号秘密。
 
-当前机器的目录分工为：
+目录应按部署环境自行选择，例如：
 
 ```text
-E:\NapCat\                 # NapCat 目录，包含 launcher.bat
-E:\NavCatQQ\QQ.exe        # 独立机器人 QQ 客户端
-E:\Elysium-AyerElysia\Elysium\  # Elysium 后端
+<NapCat目录>/              # 包含官方 launcher.bat
+<机器人QQ客户端路径>       # 独立机器人 QQ 客户端
+<Elysium项目目录>/         # Elysium 后端
 ```
 
-迁移到其他机器时可以更换盘符和目录，但必须继续保持“机器人 QQ 与个人 QQ 隔离”的原则。
+无论采用何种盘符和目录，都必须继续保持“机器人 QQ 与个人 QQ 隔离”的原则。
 
 ### 10.2 配置 Elysium NapCat 适配器
 
@@ -671,12 +650,12 @@ enabled = true
 
 [bot]
 qq_id = "<机器人QQ号>"
-qq_nickname = "爱莉"
+qq_nickname = "<机器人昵称>"
 
 [napcat_server]
 mode = "reverse"
 host = "localhost"
-port = 8095
+port = 0  # 替换为部署环境选择的未占用端口
 access_token = ""
 ```
 
@@ -684,12 +663,12 @@ access_token = ""
 
 | 字段 | 说明 |
 | --- | --- |
-| `plugin.enabled` | 仓库文档示例保持 `true`；只需在具体机器不使用 NapCat 时，于被 Git 忽略的本机配置改为 `false` |
+| `plugin.enabled` | 是否加载 NapCat 适配器；由各部署环境根据是否使用 QQ 接入自行设置 |
 | `bot.qq_id` | 独立机器人 QQ 号，必须与 NapCat 实际登录账号一致 |
 | `bot.qq_nickname` | Elysium 内部使用的机器人昵称 |
 | `napcat_server.mode` | 当前固定为 `reverse`，表示 Elysium 监听、NapCat 主动连接 |
 | `napcat_server.host` | 本机部署使用 `localhost` |
-| `napcat_server.port` | 当前约定为 `8095` |
+| `napcat_server.port` | 当前约定为 `<OneBot端口>` |
 | `napcat_server.access_token` | 可选；若启用，NapCat 与 Elysium 两端必须填写相同值，且不得提交真实令牌 |
 
 ### 10.3 配置 NapCat OneBot 11 客户端
@@ -700,24 +679,24 @@ access_token = ""
 2. 连接地址填写：
 
    ```text
-   ws://127.0.0.1:8095
+   ws://127.0.0.1:<OneBot端口>
    ```
 
 3. 保持该配置启用，并允许断线后自动重连。
-4. 如果设置 Access Token，必须与 Elysium `access_token` 完全一致；当前本机配置为空。
+4. 如果设置 Access Token，必须与 Elysium `access_token` 完全一致；真实令牌不得写入文档或提交。
 5. 保存配置后确认 NapCat 使用的是独立机器人 QQ，而不是个人 QQ。
 
-这里不需要额外配置正向 WebSocket 服务端，也不需要为本机连接开放公网端口。`8095` 只用于本机 NapCat 与 Elysium 之间的 OneBot 连接。
+这里不需要额外配置正向 WebSocket 服务端，也不需要为本机连接开放公网端口。`<OneBot端口>` 只用于本机 NapCat 与 Elysium 之间的 OneBot 连接。
 
 ### 10.4 恢复启用后的正式启动顺序
 
-当前日常运行不启动 NapCat，只启动 Elysium。需要恢复 QQ 时，先将本机 `config/plugins/napcat_adapter/config.toml` 的 `plugin.enabled` 改回 `true`，再按以下顺序启动：
+部署环境需要启用 QQ 接入时，先将 `config/plugins/napcat_adapter/config.toml` 的 `plugin.enabled` 设为 `true`，再按以下顺序启动：
 
 1. 打开终端并进入 NapCat 目录。
 2. 使用官方启动脚本启动独立机器人 QQ：
 
    ```bat
-   cd /d E:\NapCat
+   cd /d <NapCat目录>
    launcher.bat <机器人QQ号>
    ```
 
@@ -725,11 +704,11 @@ access_token = ""
 4. 进入 Elysium 项目目录，在可观察的终端或 VS Code 终端启动后端：
 
    ```powershell
-   cd E:\Elysium-AyerElysia\Elysium
+   cd <Elysium项目目录>
    .\.venv\Scripts\python.exe main.py
    ```
 
-5. Elysium 加载 NapCat 适配器并开始监听 `127.0.0.1:8095` 后，NapCat 应自动建立反向 WebSocket 连接。
+5. Elysium 加载 NapCat 适配器并开始监听 `127.0.0.1:<OneBot端口>` 后，NapCat 应自动建立反向 WebSocket 连接。
 6. 确认连接完成后再进行 QQ 文本和图片验收。
 
 必须通过 NapCat 官方 `launcher.bat <机器人QQ号>` 启动机器人账号，不自行替换官方启动链。
@@ -740,8 +719,8 @@ access_token = ""
 
 - 独立机器人 QQ 已登录，NapCat 已加载对应账号。
 - Elysium 启动无 Fatal error，NapCat 适配器已启用。
-- Elysium 正在监听 `127.0.0.1:8095`。
-- NapCat 的 WebSocket Client 已连接到 `ws://127.0.0.1:8095`。
+- Elysium 正在监听 `127.0.0.1:<OneBot端口>`。
+- NapCat 的 WebSocket Client 已连接到 `ws://127.0.0.1:<OneBot端口>`。
 - Elysium 能收到来自该 QQ 的 OneBot 私聊消息事件。
 
 ### 10.6 文本与图片验收
@@ -762,7 +741,7 @@ access_token = ""
 - 再按 NapCat/QQ 的正常退出方式关闭机器人账号。
 - 完整重启仍遵循“先 NapCat，后 Elysium”。
 - 仅重启 Elysium 时，可以保持 NapCat 与机器人 QQ 运行；Elysium 恢复监听后，NapCat WebSocket Client 应自动重连。
-- 不同时启动多个使用同一机器人 QQ 的 NapCat 实例，也不同时启动多个监听 `8095` 的 Elysium 实例。
+- 不同时启动多个使用同一机器人 QQ 的 NapCat 实例，也不同时启动多个监听 `<OneBot端口>` 的 Elysium 实例。
 
 ---
 
@@ -845,7 +824,7 @@ Ctrl+C
 - [ ] 日志中没有 `Model does not exist`、401、403、429 或持续超时。
 - [ ] 实际调用的外部 `model_identifier` 与 Provider 文档一致。
 - [ ] 启用记忆索引时，`embedding` 任务使用真正的向量模型且维度与活动索引一致。
-- [ ] Embedding 冒烟请求能返回非空向量，当前 `BAAI/bge-m3` 应为 1024 维。
+- [ ] Embedding 冒烟请求能返回非空向量，且向量维度与 `embedding_dimension` 和活动索引一致。
 - [ ] 日志中没有持续出现 `Embedding 生成失败` 或 `completed=0 failed>0`。
 
 ### 12.4 Life Engine
@@ -866,14 +845,15 @@ Ctrl+C
 - [x] 长连接日志正常。
 - [x] 私聊能收发文本。
 - [x] 私聊图片资源能下载并完成真实视觉识别。
-- [ ] 图片保存、图片发送、语音发送和语音识别已接入并有离线契约测试，待真实飞书端到端验收；群聊、文件、视频仍未验收。
+- [x] 图片保存、图片发送、语音合成发送和语音接收识别已通过真实飞书端到端验收。
+- [ ] 群聊、普通文件和视频仍未验收。
 
-### 12.6 QQ/NapCat 端到端（历史验收，当前停用）
+### 12.6 QQ/NapCat 端到端（历史验收，启用状态由部署环境决定）
 
 - [x] 使用独立机器人 QQ，与个人 QQ 安装和账号隔离。
 - [x] NapCat 通过官方 `launcher.bat <机器人QQ号>` 启动。
-- [x] NapCat OneBot 11 WebSocket Client 指向 `ws://127.0.0.1:8095`。
-- [x] Elysium NapCat 适配器使用 `reverse` 模式并监听 `8095`。
+- [x] NapCat OneBot 11 WebSocket Client 指向 `ws://127.0.0.1:<OneBot端口>`。
+- [x] Elysium NapCat 适配器使用 `reverse` 模式并监听 `<OneBot端口>`。
 - [x] 启动顺序为先 NapCat、后 Elysium，连接能够自动建立。
 - [x] QQ 私聊文本能收发。
 - [x] QQ 私聊图片能进入统一媒体链并完成真实视觉识别。
@@ -909,7 +889,7 @@ Ctrl+C
     -q
 ```
 
-2026-08-01 以单进程、关闭覆盖率运行飞书与 NapCat 定向测试，历史结果为 `52 passed`，NapCat 启动、文本、图片和音频文件子集为 `26 passed`。这些数量只记录当时的离线契约结果；当前端到端结论以真实验收为准：QQ 聊天、飞书聊天、QQ 图片查看、飞书图片查看已通过，其余能力暂不验收。
+2026-08-01 以单进程、关闭覆盖率运行飞书与 NapCat 定向测试，历史结果为 `52 passed`，NapCat 启动、文本、图片和音频文件子集为 `26 passed`。这些数量只记录当时的离线契约结果；端到端结论以真实验收为准：QQ 聊天与图片查看，以及飞书聊天、图片查看、图片保存、图片发送、语音合成发送和语音接收识别已通过；QQ/NapCat 语音及其他未列能力仍未验收。
 
 飞书发送修复至少应有两个小型契约测试长期保护：
 
@@ -927,7 +907,7 @@ Ctrl+C
     -q -n 0 --no-cov
 ```
 
-该组测试用于适配器离线回归，但测试通过不等于对应能力已完成端到端验收。当前只将文本聊天和图片查看列为已验收能力；音频相关用例即使存在，也不应据此宣称语音可用。
+该组测试用于适配器离线回归，但测试通过不等于对应能力已完成端到端验收。飞书语音接收识别与语音合成发送之所以列为可用，是因为已经完成真实飞书端到端验收，而不是因为音频相关用例存在；QQ/NapCat 语音仍不能据此宣称可用。
 
 ### 13.3 格式检查
 
@@ -1111,13 +1091,13 @@ config/
 
 1. 拉取代码并检查变更说明。
 2. 执行 `uv sync --dev`。
-3. 核对本机未提交的 `config/` 和 `data/`，避免误覆盖。
-4. 当前不启动 NapCat；只在明确恢复 QQ 且把适配器配置改回启用后，才按 10.4 启动独立机器人 QQ。
+3. 核对部署环境中未提交的 `config/` 和 `data/`，避免误覆盖。
+4. 按部署环境需要启用或停用可选适配器；启用 QQ 接入时按 10.4 启动独立机器人 QQ。
 5. 启动 Elysium。
-6. 查看 LLM 预检、HTTP、Life Engine 和飞书长连接日志；恢复 QQ 后再检查 NapCat 反向 WebSocket。
-7. 发送一条飞书私聊文本和新图片完成当前日常冒烟；恢复 QQ 后再单独重做 QQ 文本和图片验收。
+6. 查看 LLM 预检、HTTP、Life Engine 和已启用适配器的连接日志。
+7. 对已启用的消息平台执行文本和媒体冒烟；新启用或恢复的适配器应单独重做对应端到端验收。
 8. 如本次改动涉及某功能，运行对应定向测试。
-9. 停止时先对 Elysium 使用 `Ctrl+C` 并等待优雅关闭，再按需退出 NapCat 和机器人 QQ。
+9. 停止时先对 Elysium 使用 `Ctrl+C` 并等待优雅关闭，再按需退出外部适配器和客户端。
 
 ---
 
@@ -1147,11 +1127,11 @@ config/
 - [ ] Linux 原生 `.venv` 手工前台部署（明确不引入 systemd 自启动）
 - [ ] 配置模板与环境变量密钥注入
 - [ ] 模型 Provider 兼容性矩阵
-- [ ] ASR 协议接入、音频格式和端到端测试
-- [ ] GPT-SoVITS 完整部署、权重、参考音频和语音发送验收
-- [ ] MiMo ASR 独立适配评估
+- [x] ASR 协议接入、Opus/WAV 转码和飞书端到端验收
+- [ ] GPT-SoVITS 完整部署、可选音频依赖、权重、参考音频和独立语音发送验收
 - [x] QQ/NapCat 与飞书私聊文本、图片查看真实端到端验收
-- [ ] 飞书群聊、语音、文件、视频和图片保存验收
+- [x] 飞书图片保存、图片发送、语音合成发送和语音接收识别验收
+- [ ] 飞书群聊、普通文件和视频验收
 - [ ] QQ/NapCat 语音、文件、视频和图片保存验收
 - [ ] QQ/NapCat 部署与恢复路径完善
 - [ ] Life Memory、见证、学习、叙事和自主意向的功能测试
@@ -1172,7 +1152,8 @@ config/
 
 | 日期 | 阶段 | 变更 |
 | --- | --- | --- |
-| 2026-08-01 | 阶段一 | 建立 Windows `.venv`、文本模型、Life Engine、飞书长连接的部署运行基线；明确 MiMo ASR/TTS 尚未验收 |
+| 2026-08-01 | 阶段一 | 建立 Windows `.venv`、文本模型、Life Engine、飞书长连接的部署运行基线；明确 ASR/TTS 尚未验收 |
 | 2026-08-02 | 验收基线 | QQ 聊天、飞书聊天、QQ 图片查看、飞书图片查看完成真实验收；回退图片保存注册改动，其他功能统一暂不验收；补全飞书最小权限、审批发布和 `99991672` 排障说明 |
-| 2026-08-02 | Embedding 配置 | 补充 SiliconFlow `BAAI/bge-m3` 1024 维配置、真实 API 冒烟结果、索引维度约束、历史失败任务单批重试和验收检查项 |
-| 2026-08-02 | 媒体能力接入 | 当前停用 NapCat 与 `astrbot_sister_bridge`；为聊天意识注册保存媒体、发送图片、发送已有语音和识别语音能力；补飞书图片出站与语音入站资源链、离线契约和真实端到端验收标准 |
+| 2026-08-02 | Embedding 配置 | 补充 Embedding 通用配置、真实 API 冒烟要求、索引维度约束、历史失败任务单批重试和验收检查项 |
+| 2026-08-02 | 媒体能力接入 | 为聊天意识注册保存媒体、发送图片、发送已有语音和识别语音能力；补飞书图片出站与语音入站资源链、离线契约和真实端到端验收标准 |
+| 2026-08-02 | 飞书媒体验收与 TTS 边界 | 记录飞书图片保存/发送、语音合成发送和语音接收识别均已真实验收；明确任务式 TTS 与独立 GPT-SoVITS 插件链路分离，停用插件时不要求加载其可选音频依赖 |
