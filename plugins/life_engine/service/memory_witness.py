@@ -17,6 +17,11 @@ from typing import TYPE_CHECKING, Any, Sequence
 from src.app.plugin_system.api.llm_api import get_model_set_by_task
 from src.app.plugin_system.api.log_api import get_logger
 from src.kernel.llm import ROLE, LLMPayload, LLMRequest, Text
+from src.kernel.llm.exceptions import (
+    LLMAPIError,
+    LLMRateLimitError,
+    LLMTimeoutError,
+)
 
 from ..memory.experience import EpistemicKind, ExperienceRecord, WitnessMemory
 from .consciousness import ConsciousnessInstance
@@ -29,6 +34,7 @@ if TYPE_CHECKING:
 logger = get_logger("life_engine.memory_witness")
 MEMORY_WITNESS_INSTANCE_ID = "memory_witness"
 _NO_WITNESS = "<no_witness>"
+_TRANSIENT_ERROR_ESCALATION_COUNT = 3
 
 # 经历显著性过滤：只有心理意义的事件才编码为经历。
 # tool_call / tool_result 是运动皮层信号——它们被 stats 和原始事件流记录，
@@ -47,6 +53,34 @@ _EXPERIENTIAL_EVENT_TYPES: frozenset[str] = frozenset({
     "autonomy_intent_scheduled",
     "autonomy_intent_silence",
 })
+
+
+def _is_transient_upstream_error(exc: BaseException) -> bool:
+    """Return whether a failed witness run is safe to retry later."""
+
+    if isinstance(exc, (LLMRateLimitError, LLMTimeoutError, TimeoutError)):
+        return True
+    if isinstance(exc, LLMAPIError):
+        return (
+            exc.status_code is None
+            or exc.status_code == 429
+            or exc.status_code >= 500
+        )
+    return False
+
+
+def _transient_error_summary(exc: BaseException) -> str:
+    """Describe an upstream failure without dumping response bodies or traces."""
+
+    details = [type(exc).__name__]
+    if isinstance(exc, LLMAPIError):
+        if exc.status_code is not None:
+            details.append(f"status={exc.status_code}")
+        if exc.error_code:
+            details.append(f"code={exc.error_code}")
+    if len(details) == 1:
+        return details[0]
+    return f"{details[0]}({', '.join(details[1:])})"
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,27 +137,58 @@ class MemoryWitnessCoordinator:
             return
         run_immediately = bool(getattr(cfg, "run_on_startup", True))
         interval = max(60, int(getattr(cfg, "interval_seconds", 1800)))
+        retry_delay = max(
+            10,
+            min(interval, int(getattr(cfg, "retry_delay_seconds", 60))),
+        )
+        next_delay = 0 if run_immediately else interval
+        transient_failures = 0
         while self._service._state.running:
-            if not run_immediately:
+            if next_delay > 0:
                 stop_event = self._service._stop_event
                 if stop_event is not None:
                     try:
-                        await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                        await asyncio.wait_for(stop_event.wait(), timeout=next_delay)
                         break
                     except asyncio.TimeoutError:
                         pass
                 else:
-                    await asyncio.sleep(interval)
-            run_immediately = False
+                    await asyncio.sleep(next_delay)
             if not self._service._state.running:
                 break
+            next_delay = interval
             try:
                 await self.run_once()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 await self._record_error(exc)
-                logger.error(f"记忆见证意识运行失败: {exc}", exc_info=True)
+                if not _is_transient_upstream_error(exc):
+                    transient_failures = 0
+                    logger.error(f"记忆见证意识运行失败: {exc}", exc_info=True)
+                    continue
+
+                transient_failures += 1
+                next_delay = retry_delay
+                summary = _transient_error_summary(exc)
+                message = (
+                    "记忆见证上游暂时不可用，待处理经历已保留: "
+                    f"failure_count={transient_failures}, "
+                    f"retry_in={retry_delay}s, error={summary}"
+                )
+                if transient_failures == _TRANSIENT_ERROR_ESCALATION_COUNT:
+                    logger.error(message)
+                elif transient_failures == 1:
+                    logger.warning(message)
+                else:
+                    logger.debug(message)
+            else:
+                if transient_failures:
+                    logger.info(
+                        "记忆见证上游已恢复: "
+                        f"previous_failures={transient_failures}"
+                    )
+                transient_failures = 0
 
     async def run_once(self) -> WitnessRunReport:
         async with self._run_lock:

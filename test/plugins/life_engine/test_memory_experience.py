@@ -29,6 +29,7 @@ from plugins.life_engine.service.memory_witness import (
     MemoryWitnessCoordinator,
 )
 from plugins.life_engine.service.tool_manifests import get_tool_manifest
+from src.kernel.llm.exceptions import LLMAPIError
 
 
 def _db() -> sqlite3.Connection:
@@ -293,6 +294,78 @@ def _witness_service_stub(tmp_path: Path, memory: object) -> SimpleNamespace:
         _get_event_bus=lambda: SimpleNamespace(store=_RawStoreStub(event)),
         _workspace_dir=lambda: tmp_path,
     )
+
+
+async def test_witness_loop_retries_transient_upstream_failure_quietly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A temporary model outage keeps evidence pending and retries soon."""
+
+    config = SimpleNamespace(
+        enabled=True,
+        run_on_startup=True,
+        interval_seconds=300,
+        retry_delay_seconds=60,
+    )
+    service = SimpleNamespace(
+        _cfg=lambda: SimpleNamespace(memory_witness=config),
+        _state=SimpleNamespace(running=True),
+        _stop_event=None,
+    )
+    coordinator = MemoryWitnessCoordinator(service)
+    run_count = 0
+    delays: list[float] = []
+    recorded_errors: list[Exception] = []
+    warnings: list[str] = []
+    errors: list[str] = []
+    infos: list[str] = []
+
+    async def _run_once() -> None:
+        nonlocal run_count
+        run_count += 1
+        if run_count == 1:
+            raise LLMAPIError(
+                "upstream unavailable",
+                status_code=500,
+                error_code="do_request_failed",
+            )
+        service._state.running = False
+
+    async def _record_error(exc: Exception) -> None:
+        recorded_errors.append(exc)
+
+    async def _sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(coordinator, "run_once", _run_once)
+    monkeypatch.setattr(coordinator, "_record_error", _record_error)
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness.asyncio.sleep",
+        _sleep,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness.logger.warning",
+        warnings.append,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness.logger.error",
+        errors.append,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness.logger.info",
+        infos.append,
+    )
+
+    await coordinator.loop()
+
+    assert run_count == 2
+    assert delays == [60]
+    assert len(recorded_errors) == 1
+    assert errors == []
+    assert len(warnings) == 1
+    assert "待处理经历已保留" in warnings[0]
+    assert "LLMAPIError(status=500, code=do_request_failed)" in warnings[0]
+    assert infos == ["记忆见证上游已恢复: previous_failures=1"]
 
 
 async def test_search_tool_rejects_unknown_mode_before_service_lookup(

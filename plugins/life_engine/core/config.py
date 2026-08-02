@@ -11,18 +11,17 @@ from pydantic import field_validator
 from src.app.plugin_system.base import BaseConfig, Field, SectionBase, config_section
 
 from ..constants import (
+    DECAY_LAMBDA,
+    DREAM_LEARNING_RATE,
+    EXTERNAL_MESSAGE_ACTIVE_WINDOW_MINUTES,
     HEARTBEAT_IDLE_CRITICAL_THRESHOLD,
     HEARTBEAT_IDLE_WARNING_THRESHOLD,
-    EXTERNAL_MESSAGE_ACTIVE_WINDOW_MINUTES,
-    TODO_URGENT_DAYS_THRESHOLD,
+    PRUNE_THRESHOLD,
     RRF_K,
     SPREAD_DECAY,
     SPREAD_THRESHOLD,
-    DECAY_LAMBDA,
-    PRUNE_THRESHOLD,
-    DREAM_LEARNING_RATE,
+    TODO_URGENT_DAYS_THRESHOLD,
 )
-
 
 # 默认工作空间路径
 _DEFAULT_WORKSPACE = str(Path(__file__).parent.parent.parent.parent / "data" / "life_engine_workspace")
@@ -61,6 +60,7 @@ class LifeEngineConfig(BaseConfig):
             "run_on_startup",
             "max_events_per_run",
             "timeout_seconds",
+            "retry_delay_seconds",
             "max_witness_chars",
             "migrate_legacy_diaries",
             "legacy_diary_path",
@@ -331,6 +331,12 @@ class LifeEngineConfig(BaseConfig):
             ge=10.0,
             le=900.0,
             description="单次见证模型调用的外层超时秒数。",
+        )
+        retry_delay_seconds: int = Field(
+            default=60,
+            ge=10,
+            le=1800,
+            description="上游模型临时失败后再次尝试见证的等待秒数。",
         )
         max_witness_chars: int = Field(
             default=800,
