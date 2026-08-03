@@ -11,6 +11,10 @@ import pytest
 
 from scripts.backup_life_data import SQLITE_SOURCES, LifeBackupError, create_life_backup
 from scripts.backup_mysql import BackupError, _file_sha256, _target_url, verify_snapshot
+from src.kernel.memory_archive.sources import (
+    ArchiveSourceError,
+    verify_backup_manifest,
+)
 
 
 def test_mysql_backup_url_must_come_from_a_mysql_environment(
@@ -53,7 +57,9 @@ def test_life_backup_uses_sqlite_online_backup_and_refuses_overwrite(
         source.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(source)
         try:
-            connection.execute("CREATE TABLE proof (id INTEGER PRIMARY KEY, value TEXT)")
+            connection.execute(
+                "CREATE TABLE proof (id INTEGER PRIMARY KEY, value TEXT)"
+            )
             connection.execute("INSERT INTO proof(value) VALUES ('爱莉')")
             connection.commit()
         finally:
@@ -69,5 +75,13 @@ def test_life_backup_uses_sqlite_online_backup_and_refuses_overwrite(
     assert result["workspace_file_count"] == 1
     assert (output / "manifest.json").is_file()
     assert all(item["integrity_check"] == "ok" for item in result["sqlite"])
+    assert verify_backup_manifest(output) == {
+        "sqlite": len(SQLITE_SOURCES),
+        "workspace": 1,
+    }
+    note_backup = output / "workspace/life_engine_workspace/notes/proof.md"
+    note_backup.write_text("corrupted", encoding="utf-8")
+    with pytest.raises(ArchiveSourceError, match="mismatch"):
+        verify_backup_manifest(output)
     with pytest.raises(LifeBackupError, match="拒绝覆盖"):
         create_life_backup(data_root, output)

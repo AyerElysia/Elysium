@@ -207,6 +207,9 @@ class LifeEngineService(BaseService):
         self._shared_sync_task_id: str | None = None
         self._shared_sync_bridge = None
         self._shared_sync_error: str = ""
+        self._memory_archive_sync_task_id: str | None = None
+        self._memory_archive_sync_bridge = None
+        self._memory_archive_sync_error: str = ""
         self._router_context_projection_task_id: str | None = None
         self._router_context_projection: RouterContextProjection | None = None
         self._stop_event: asyncio.Event | None = None
@@ -1102,6 +1105,38 @@ class LifeEngineService(BaseService):
                 "outbox_backlog": 0,
                 "degraded_reason": self._shared_sync_error,
                 "enabled": sync_enabled,
+            }
+        if self._memory_archive_sync_bridge is not None:
+            try:
+                snapshot["memory_archive_sync"] = (
+                    self._memory_archive_sync_bridge.health_snapshot()
+                )
+            except Exception as exc:  # noqa: BLE001
+                snapshot["memory_archive_sync"] = {
+                    "component": "unified_memory_archive",
+                    "status": "degraded",
+                    "running": False,
+                    "degraded_reason": (
+                        f"health unavailable: {type(exc).__name__}: {exc}"
+                    ),
+                }
+        else:
+            archive_enabled = bool(
+                getattr(
+                    getattr(self._cfg(), "memory_archive_sync", None),
+                    "enabled",
+                    False,
+                )
+            )
+            snapshot["memory_archive_sync"] = {
+                "component": "unified_memory_archive",
+                "status": (
+                    "degraded" if self._memory_archive_sync_error else "disabled"
+                ),
+                "running": False,
+                "known_records": 0,
+                "degraded_reason": self._memory_archive_sync_error,
+                "enabled": archive_enabled,
             }
         return snapshot
 
@@ -4955,6 +4990,31 @@ class LifeEngineService(BaseService):
                 self._shared_sync_error = f"{type(exc).__name__}: {exc}"
                 logger.error(f"life_engine 共享同步初始化失败: {self._shared_sync_error}")
 
+        memory_archive_cfg = getattr(cfg, "memory_archive_sync", None)
+        if bool(getattr(memory_archive_cfg, "enabled", False)):
+            try:
+                from .memory_archive_sync import MemoryArchiveSyncBridge
+
+                self._memory_archive_sync_bridge = MemoryArchiveSyncBridge(
+                    memory_archive_cfg,
+                    cfg.settings.workspace_path,
+                )
+                archive_task = get_task_manager().create_task(
+                    self._memory_archive_sync_bridge.run(self._stop_event),
+                    name="life_engine_memory_archive_sync",
+                    daemon=True,
+                )
+                self._memory_archive_sync_task_id = archive_task.task_id
+                self._memory_archive_sync_error = ""
+            except Exception as exc:  # noqa: BLE001
+                self._memory_archive_sync_bridge = None
+                self._memory_archive_sync_task_id = None
+                self._memory_archive_sync_error = f"{type(exc).__name__}: {exc}"
+                logger.error(
+                    "life_engine unified memory archive initialization failed: "
+                    f"{self._memory_archive_sync_error}"
+                )
+
         chatter_cfg = getattr(cfg, "chatter", None)
         projection_enabled = bool(
             chatter_cfg is not None
@@ -5096,6 +5156,19 @@ class LifeEngineService(BaseService):
                 logger.debug(f"关闭共享同步连接失败: {exc}")
             finally:
                 self._shared_sync_bridge = None
+
+        await self._await_managed_task(
+            self._memory_archive_sync_task_id,
+            timeout=15.0,
+        )
+        self._memory_archive_sync_task_id = None
+        if self._memory_archive_sync_bridge is not None:
+            try:
+                await self._memory_archive_sync_bridge.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"failed to close unified memory archive: {exc}")
+            finally:
+                self._memory_archive_sync_bridge = None
 
         await self._await_managed_task(self._memory_witness_task_id, timeout=10.0)
         self._memory_witness_task_id = None

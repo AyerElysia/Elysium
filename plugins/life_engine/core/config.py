@@ -79,6 +79,26 @@ class LifeEngineConfig(BaseConfig):
             "pull_enabled",
             "allowed_visibilities",
         },
+        "memory_archive_sync": {
+            "enabled",
+            "remote_host",
+            "remote_port",
+            "remote_database",
+            "remote_user",
+            "remote_password_env",
+            "mysql_ssl_mode",
+            "mysql_ssl_ca",
+            "mysql_ssl_cert",
+            "mysql_ssl_key",
+            "connect_timeout_seconds",
+            "interval_seconds",
+            "retry_max_seconds",
+            "publish_batch_size",
+            "publish_concurrency",
+            "scan_batch_size",
+            "max_batch_mib",
+            "local_state_path",
+        },
         "history_retrieval": {
             "enabled",
             "default_cross_stream",
@@ -443,6 +463,90 @@ class LifeEngineConfig(BaseConfig):
         consumer_id: str = Field(
             default="life_engine.shared_sync",
             description="远端事件应用游标的消费者 ID。",
+        )
+
+    @config_section("memory_archive_sync")
+    class MemoryArchiveSyncSection(SectionBase):
+        """Owner-private, local-first archive of all technical memory stores."""
+
+        enabled: bool = Field(
+            default=False,
+            description="Enable the unified memory archive worker. Disabled by default.",
+        )
+        remote_host: str = Field(default="", description="Remote MySQL host.")
+        remote_port: int = Field(
+            default=3306,
+            ge=1,
+            le=65535,
+            description="Remote MySQL port.",
+        )
+        remote_database: str = Field(
+            default="elysium",
+            description="Remote archive database name.",
+        )
+        remote_user: str = Field(default="", description="Remote archive user.")
+        remote_password_env: str = Field(
+            default="ELYSIUM_MEMORY_ARCHIVE_MYSQL_PASSWORD",
+            description="Environment variable containing the password; never plaintext TOML.",
+        )
+        mysql_ssl_mode: str = Field(
+            default="disabled",
+            description="MySQL TLS mode: disabled/required/verify-ca/verify-full.",
+        )
+        mysql_ssl_ca: str = Field(default="", description="Optional CA path.")
+        mysql_ssl_cert: str = Field(
+            default="",
+            description="Optional client certificate path.",
+        )
+        mysql_ssl_key: str = Field(
+            default="",
+            description="Optional client private-key path.",
+        )
+        connect_timeout_seconds: int = Field(
+            default=5,
+            ge=1,
+            le=60,
+            description="Remote connection timeout in seconds.",
+        )
+        interval_seconds: float = Field(
+            default=300.0,
+            ge=10.0,
+            le=86400.0,
+            description="Interval between incremental archive scans.",
+        )
+        retry_max_seconds: float = Field(
+            default=900.0,
+            ge=5.0,
+            le=86400.0,
+            description="Maximum retry backoff while MySQL is unavailable.",
+        )
+        publish_batch_size: int = Field(
+            default=250,
+            ge=1,
+            le=1000,
+            description="Maximum records per remote transaction.",
+        )
+        publish_concurrency: int = Field(
+            default=2,
+            ge=1,
+            le=6,
+            description="Maximum concurrent remote transactions.",
+        )
+        scan_batch_size: int = Field(
+            default=500,
+            ge=1,
+            le=5000,
+            description="Maximum local records inspected per scan step.",
+        )
+        max_batch_mib: int = Field(
+            default=4,
+            ge=1,
+            le=32,
+            description="Maximum estimated payload per remote transaction.",
+        )
+        local_state_path: str = Field(
+            default=".memory/archive_sync_state.sqlite3",
+            description="Rebuildable state path relative to the workspace.",
         )
 
     @config_section("autonomy")
@@ -1620,6 +1724,9 @@ class LifeEngineConfig(BaseConfig):
     memory_index: MemoryIndexSection = Field(default_factory=MemoryIndexSection)
     memory_witness: MemoryWitnessSection = Field(default_factory=MemoryWitnessSection)
     shared_sync: SharedSyncSection = Field(default_factory=SharedSyncSection)
+    memory_archive_sync: MemoryArchiveSyncSection = Field(
+        default_factory=MemoryArchiveSyncSection
+    )
     curiosity: CuriositySection = Field(default_factory=CuriositySection)
     history_retrieval: HistoryRetrievalSection = Field(default_factory=HistoryRetrievalSection)
     web: WebSection = Field(default_factory=WebSection)

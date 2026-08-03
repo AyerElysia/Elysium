@@ -135,3 +135,26 @@ def test_model_section_keeps_chatter_task_optional() -> None:
 
     assert model.task_name == "core"
     assert model.chatter_task_name == ""
+
+
+def test_memory_archive_sync_exposes_every_operational_field() -> None:
+    section = LifeEngineConfig.MemoryArchiveSyncSection(
+        enabled=True,
+        remote_host="mysql.example.test",
+        remote_port=3307,
+        remote_database="elysium",
+        remote_user="archive",
+        mysql_ssl_mode="verify-full",
+        mysql_ssl_ca="/certs/ca.pem",
+        mysql_ssl_cert="/certs/client.pem",
+        mysql_ssl_key="/certs/client.key",
+        connect_timeout_seconds=7,
+        interval_seconds=60,
+        retry_max_seconds=600,
+        local_state_path=".memory/test-archive.sqlite3",
+    )
+
+    visible = LifeEngineConfig.__config_schema_visible_fields__["memory_archive_sync"]
+    assert set(type(section).model_fields) <= visible
+    assert section.mysql_ssl_mode == "verify-full"
+    assert section.connect_timeout_seconds == 7

@@ -22,16 +22,21 @@ SQLITE_SOURCES = (
 
 WORKSPACE_SOURCES = (
     Path("diaries"),
-    Path("life_engine_workspace/.life_learning"),
-    Path("life_engine_workspace/.life_narrative"),
-    Path("life_engine_workspace/.life_trace"),
-    Path("life_engine_workspace/diaries"),
-    Path("life_engine_workspace/dreams"),
-    Path("life_engine_workspace/narrative"),
-    Path("life_engine_workspace/notes"),
-    Path("life_engine_workspace/received"),
-    Path("life_engine_workspace/skills"),
-    Path("life_engine_workspace/thoughts"),
+    Path("life_engine_workspace"),
+)
+
+WORKSPACE_EXCLUDED_PARTS = frozenset({".git", ".memory", "__pycache__"})
+WORKSPACE_EXCLUDED_SUFFIXES = (
+    ".db",
+    ".db-wal",
+    ".db-shm",
+    ".sqlite",
+    ".sqlite-wal",
+    ".sqlite-shm",
+    ".sqlite3",
+    ".sqlite3-wal",
+    ".sqlite3-shm",
+    ".pyc",
 )
 
 
@@ -60,9 +65,7 @@ def _backup_sqlite(source: Path, destination: Path) -> dict[str, Any]:
         target_db.close()
         source_db.close()
 
-    verification = sqlite3.connect(
-        f"file:{destination.resolve()}?mode=ro", uri=True
-    )
+    verification = sqlite3.connect(f"file:{destination.resolve()}?mode=ro", uri=True)
     try:
         integrity = verification.execute("PRAGMA integrity_check").fetchall()
         if integrity != [("ok",)]:
@@ -92,6 +95,13 @@ def _copy_workspace_tree(source: Path, destination: Path) -> list[dict[str, Any]
     records: list[dict[str, Any]] = []
     for source_file in sorted(path for path in source.rglob("*") if path.is_file()):
         relative = source_file.relative_to(source)
+        if any(part in WORKSPACE_EXCLUDED_PARTS for part in relative.parts):
+            continue
+        lowered = source_file.name.lower()
+        if lowered.startswith("life_events.jsonl"):
+            continue
+        if lowered.endswith(WORKSPACE_EXCLUDED_SUFFIXES):
+            continue
         target_file = destination / relative
         target_file.parent.mkdir(parents=True, exist_ok=True)
         before = source_file.stat()
@@ -125,9 +135,7 @@ def create_life_backup(data_root: Path, output: Path) -> dict[str, Any]:
         source = data_root / relative
         if not source.is_file():
             raise LifeBackupError(f"权威 SQLite 不存在: {source}")
-        sqlite_records.append(
-            _backup_sqlite(source, output / "sqlite" / relative)
-        )
+        sqlite_records.append(_backup_sqlite(source, output / "sqlite" / relative))
 
     workspace_records: list[dict[str, Any]] = []
     for relative in WORKSPACE_SOURCES:
@@ -182,9 +190,7 @@ def main() -> int:
             for item in result["sqlite"]
         ],
         "workspace_file_count": result["workspace_file_count"],
-        "excluded_rebuildable_projections": result[
-            "excluded_rebuildable_projections"
-        ],
+        "excluded_rebuildable_projections": result["excluded_rebuildable_projections"],
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0

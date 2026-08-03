@@ -833,6 +833,66 @@ async def test_shared_sync_uses_managed_lifecycle_and_closes(
     assert lifecycle == ["created", "running", "stopped", "closed"]
 
 
+async def test_memory_archive_sync_uses_managed_lifecycle_and_closes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _make_service(tmp_path)
+    config = service.plugin.config
+    config.memory_archive_sync.enabled = True
+    config.memory_index.enabled = False
+    config.memory_witness.enabled = False
+    config.autonomy.enabled = False
+    config.streams.enabled = False
+    config.drives.enabled = False
+    config.learning.enabled = False
+    lifecycle: list[str] = []
+
+    class FakeBridge:
+        def __init__(self, section: object, workspace_path: object) -> None:
+            assert section is config.memory_archive_sync
+            assert workspace_path == config.settings.workspace_path
+            lifecycle.append("created")
+
+        async def run(self, stop_event: asyncio.Event) -> None:
+            lifecycle.append("running")
+            await stop_event.wait()
+            lifecycle.append("stopped")
+
+        async def close(self) -> None:
+            lifecycle.append("closed")
+
+        def health_snapshot(self) -> dict[str, object]:
+            return {
+                "component": "unified_memory_archive",
+                "status": "healthy",
+            }
+
+    async def fake_init_memory(_integration: object) -> None:
+        service._memory_service = None
+
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_archive_sync.MemoryArchiveSyncBridge",
+        FakeBridge,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.service.integrations.MemoryIntegration.init_memory_service",
+        fake_init_memory,
+    )
+
+    await service.start()
+    await asyncio.sleep(0)
+    assert service._memory_archive_sync_task_id is not None
+    assert lifecycle[:2] == ["created", "running"]
+    assert service.health()["memory_archive_sync"]["status"] == "healthy"
+
+    await service.stop()
+
+    assert service._memory_archive_sync_task_id is None
+    assert service._memory_archive_sync_bridge is None
+    assert lifecycle == ["created", "running", "stopped", "closed"]
+
+
 async def test_memory_index_loop_survives_provider_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
