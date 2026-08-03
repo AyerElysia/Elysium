@@ -31,10 +31,15 @@ class DummyClient:
         return "ok", [], None
 
 
-def _model(identifier: str, *, max_retry: int):
+def _model(
+    identifier: str,
+    *,
+    max_retry: int,
+    base_url: str = "https://api.openai.com/v1",
+):
     return {
         "api_provider": "OpenAI",
-        "base_url": "https://api.openai.com/v1",
+        "base_url": base_url,
         "model_identifier": identifier,
         "api_key": "dummy-key",
         "client_type": "openai",
@@ -118,6 +123,108 @@ async def test_transient_failure_cools_model_for_matching_future_requests():
         ("life_memory_witness", "a"),
         ("life_memory_witness", "b"),
     ]
+
+
+async def test_gateway_resource_overload_skips_models_on_same_endpoint():
+    """A gateway-wide guard cannot be repaired by changing model aliases."""
+
+    model_set = [
+        _model("a", max_retry=0, base_url="http://127.0.0.1:3000/v1"),
+        _model("b", max_retry=0, base_url="http://127.0.0.1:3000/v1/"),
+        _model("c", max_retry=0, base_url="https://backup.example/v1"),
+    ]
+
+    class GatewayAwareClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def create(
+            self,
+            *,
+            model_name: str,
+            payloads,
+            tools,
+            request_name: str,
+            model_set,
+            stream: bool,
+        ):
+            self.calls.append(model_name)
+            if model_name == "a":
+                raise LLMAPIError(
+                    "local gateway overloaded",
+                    status_code=503,
+                    error_code="system_cpu_overloaded",
+                )
+            return "ok", [], None
+
+    client = GatewayAwareClient()
+    request = LLMRequest(
+        model_set,
+        request_name="life_memory_witness",
+        clients=ModelClientRegistry(openai=client),
+        policy=FailoverPolicy(),
+    )
+
+    assert (await request.send(stream=False)).message == "ok"
+    assert client.calls == ["a", "c"]
+
+
+async def test_gateway_resource_overload_cools_endpoint_across_request_names():
+    """New requests must not hammer another alias on the same local gateway."""
+
+    model_set = [
+        _model("a", max_retry=0, base_url="http://127.0.0.1:3000/v1"),
+        _model("b", max_retry=0, base_url="http://127.0.0.1:3000/v1"),
+    ]
+
+    class OverloadedClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def create(
+            self,
+            *,
+            model_name: str,
+            payloads,
+            tools,
+            request_name: str,
+            model_set,
+            stream: bool,
+        ):
+            self.calls.append(model_name)
+            raise LLMAPIError(
+                "local gateway overloaded",
+                status_code=503,
+                error_code="system_cpu_overloaded",
+            )
+
+    client = OverloadedClient()
+    clients = ModelClientRegistry(openai=client)
+    first = LLMRequest(
+        model_set,
+        request_name="life_memory_witness",
+        clients=clients,
+        policy=FailoverPolicy(),
+    )
+
+    with pytest.raises(LLMAPIError) as first_error:
+        await first.send(stream=False)
+
+    assert first_error.value.error_code == "system_cpu_overloaded"
+    assert 29 < first_error.value.retry_after <= 30
+    assert client.calls == ["a"]
+
+    second = LLMRequest(
+        model_set,
+        request_name="router",
+        clients=clients,
+        policy=FailoverPolicy(),
+    )
+    with pytest.raises(LLMModelsCoolingDownError) as second_error:
+        await second.send(stream=False)
+
+    assert 29 < second_error.value.retry_after <= 30
+    assert client.calls == ["a"]
 
 
 async def test_permanent_failure_does_not_enter_transient_cooldown():

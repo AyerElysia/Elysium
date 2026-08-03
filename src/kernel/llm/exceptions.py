@@ -81,11 +81,19 @@ class LLMAuthenticationError(LLMError):
 class LLMAPIError(LLMError):
     """API 调用错误（通用）。"""
 
-    def __init__(self, message: str, status_code: int | None = None, error_code: str | None = None, model: str | None = None):
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        error_code: str | None = None,
+        model: str | None = None,
+        retry_after: float | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
         self.error_code = error_code
         self.model = model
+        self.retry_after = retry_after
 
 
 class LLMModelsCoolingDownError(LLMError):
@@ -124,6 +132,24 @@ def is_transient_llm_error(error: BaseException) -> bool:
         status_code = error.status_code
         return status_code is None or status_code == 429 or status_code >= 500
     return False
+
+
+_GATEWAY_RESOURCE_OVERLOAD_CODES = frozenset(
+    {
+        "system_cpu_overloaded",
+        "system_memory_overloaded",
+        "system_disk_overloaded",
+    }
+)
+
+
+def is_gateway_resource_overload(error: BaseException) -> bool:
+    """Return whether a structured API error applies to the whole gateway."""
+
+    if not isinstance(error, LLMAPIError):
+        return False
+    error_code = str(error.error_code or "").strip().lower()
+    return error_code in _GATEWAY_RESOURCE_OVERLOAD_CODES
 
 
 def should_retry_same_model(error: BaseException) -> bool:

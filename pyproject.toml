@@ -48,7 +48,7 @@ asyncio_mode = "auto"
 testpaths = ["test"]
 timeout = 30
 addopts = [
-    "-n", "auto",
+    "-n", "2",
     "--dist", "loadfile",
     "--cov=src",
     "--cov=plugins",

@@ -15,7 +15,11 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from ..exceptions import LLMModelsCoolingDownError, is_transient_llm_error
+from ..exceptions import (
+    LLMModelsCoolingDownError,
+    is_gateway_resource_overload,
+    is_transient_llm_error,
+)
 from .base import ModelStep, Policy, PolicySession
 
 # A local gateway can recover from a brief channel-capacity 503 in seconds.  A
@@ -35,10 +39,11 @@ class _CooldownState:
 
 
 class _ModelCooldownRegistry:
-    """进程级模型冷却表，按请求类型和模型端点隔离。"""
+    """进程级模型冷却表，并单独维护跨请求的网关冷却。"""
 
     def __init__(self) -> None:
         self._entries: dict[tuple[str, str, str, str], _CooldownState] = {}
+        self._gateway_entries: dict[tuple[str, str], _CooldownState] = {}
         self._lock = threading.Lock()
 
     @staticmethod
@@ -51,6 +56,13 @@ class _ModelCooldownRegistry:
             str(model.get("api_provider") or ""),
             str(model.get("base_url") or ""),
             str(model.get("model_identifier") or ""),
+        )
+
+    @staticmethod
+    def _gateway_key(model: dict[str, Any]) -> tuple[str, str]:
+        return (
+            str(model.get("api_provider") or "").strip().lower(),
+            str(model.get("base_url") or "").strip().rstrip("/").lower(),
         )
 
     def record_failure(
@@ -66,16 +78,22 @@ class _ModelCooldownRegistry:
         if not is_transient_llm_error(error):
             return
 
-        key = self._key(request_name, model)
+        gateway_scope = is_gateway_resource_overload(error)
+        key = (
+            self._gateway_key(model)
+            if gateway_scope
+            else self._key(request_name, model)
+        )
         with self._lock:
-            previous = self._entries.get(key)
+            entries = self._gateway_entries if gateway_scope else self._entries
+            previous = entries.get(key)
             failure_count = 1 if previous is None else previous.failure_count + 1
             exponent = min(10, failure_count - 1)
             duration = min(
                 _MAX_COOLDOWN_SECONDS,
                 base_cooldown_seconds * (2**exponent),
             )
-            self._entries[key] = _CooldownState(
+            entries[key] = _CooldownState(
                 until=time.monotonic() + duration,
                 failure_count=failure_count,
             )
@@ -90,6 +108,7 @@ class _ModelCooldownRegistry:
         key = self._key(request_name, model)
         with self._lock:
             self._entries.pop(key, None)
+            self._gateway_entries.pop(self._gateway_key(model), None)
 
     def choose_index(
         self,
@@ -109,12 +128,22 @@ class _ModelCooldownRegistry:
         skipped: list[str] = []
         with self._lock:
             for index in candidates:
-                state = self._entries.get(self._key(request_name, models[index]))
-                if state is None or state.until <= now:
+                model = models[index]
+                states = (
+                    self._entries.get(self._key(request_name, model)),
+                    self._gateway_entries.get(self._gateway_key(model)),
+                )
+                active_states = [
+                    state
+                    for state in states
+                    if state is not None and state.until > now
+                ]
+                if not active_states:
                     return index, tuple(skipped), 0.0
+                state = max(active_states, key=lambda item: item.until)
                 cooling.append((index, state))
                 skipped.append(
-                    str(models[index].get("model_identifier") or "unknown")
+                    str(model.get("model_identifier") or "unknown")
                 )
 
         retry_after = max(1.0, min(state.until for _, state in cooling) - now)
@@ -125,6 +154,7 @@ class _ModelCooldownRegistry:
 
         with self._lock:
             self._entries.clear()
+            self._gateway_entries.clear()
 
 
 _MODEL_COOLDOWNS = _ModelCooldownRegistry()
@@ -230,15 +260,20 @@ class _FailoverSession(PolicySession):
             start=self._idx + 1,
         )
         if next_idx is None:
-            cooling_error = (
-                LLMModelsCoolingDownError(
-                    request_name=self._request_name,
-                    retry_after=retry_after,
-                    models=skipped,
+            if is_gateway_resource_overload(error) and retry_after > 0:
+                if hasattr(error, "retry_after"):
+                    error.retry_after = retry_after
+                cooling_error = error
+            else:
+                cooling_error = (
+                    LLMModelsCoolingDownError(
+                        request_name=self._request_name,
+                        retry_after=retry_after,
+                        models=skipped,
+                    )
+                    if retry_after > 0
+                    else None
                 )
-                if retry_after > 0
-                else None
-            )
             return ModelStep(
                 model=None,
                 meta={
