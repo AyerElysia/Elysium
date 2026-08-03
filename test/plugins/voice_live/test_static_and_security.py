@@ -30,6 +30,23 @@ def test_browser_uses_worklet_clocked_pcm_and_immediate_barge_in() -> None:
     )  # The binary magic is emitted as exact bytes, not text guessing.
 
 
+def test_browser_fully_retires_previous_audio_generation() -> None:
+    html = (ROOT / "plugins/voice_live/static/voice_live.html").read_text(
+        encoding="utf-8"
+    )
+    assert "audioGeneration" in html
+    assert "generation===audioGeneration" in html
+    assert "micSource.disconnect()" in html
+    assert "worklet.port.onmessage=null" in html
+    assert "worklet.port.close()" in html
+    assert "await oldContext.close()" in html
+    assert "audioCtx=null;nextPlayTime=0;playbackStartedAt=0" in html
+    assert "await stopAudio();const generation=++audioGeneration" in html
+    assert "generation!==audioGeneration||explicitStop" in html
+    assert "const current=()=>generation===audioGeneration&&ws===socket" in html
+    assert "await stopAudio();el('start').disabled=false" in html
+
+
 def test_obs_overlay_is_read_only_and_receives_audio() -> None:
     html = (ROOT / "plugins/voice_live/static/overlay.html").read_text(encoding="utf-8")
     assert "/observe?ticket=" in html

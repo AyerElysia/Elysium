@@ -40,7 +40,7 @@
 <script>
 const TARGET_RATE=16000,FRAME_MS=20,HEADER_BYTES=16;
 const el=id=>document.getElementById(id),labels={idle:'待机',connecting:'连接模型',listening:'正在听',thinking:'正在思考',speaking:'正在说话',interrupted:'已打断',error:'发生错误',closed:'已结束'};
-let ws=null,audioCtx=null,stream=null,worklet=null,silentGain=null,running=false,explicitStop=false,muted=false,inputSeq=0,outputSeq=0,uplink=0,downlink=0,nextPlayTime=0,activeSources=new Set(),playbackStartedAt=0,episodeId='',reconnects=0,pingAt=0,bargeLatched=false,noiseFloor=.004,speechFrames=0,partial={};
+let ws=null,audioCtx=null,stream=null,micSource=null,worklet=null,silentGain=null,audioGeneration=0,running=false,explicitStop=false,muted=false,inputSeq=0,outputSeq=0,uplink=0,downlink=0,nextPlayTime=0,activeSources=new Set(),playbackStartedAt=0,episodeId='',reconnects=0,pingAt=0,bargeLatched=false,noiseFloor=.004,speechFrames=0,partial={};
 const pathBase=location.pathname.replace(/\/$/,'');
 
 function state(value){el('orb').className='orb '+value;el('state').textContent=labels[value]||value}
@@ -66,25 +66,35 @@ function handleMicFrame(samples,rms){
   if(!running||muted||!ws||ws.readyState!==WebSocket.OPEN)return;const frame=packPCM(samples);uplink+=frame.byteLength;ws.send(frame);metrics()
 }
 async function startAudio(){
-  stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
-  audioCtx=audioCtx||new AudioContext({latencyHint:'interactive'});await audioCtx.resume();
+  await stopAudio();const generation=++audioGeneration;
+  const nextStream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
+  if(generation!==audioGeneration){nextStream.getTracks().forEach(t=>t.stop());return 0}
+  const nextContext=new AudioContext({latencyHint:'interactive'});await nextContext.resume();
   const code=`class VoicePCM extends AudioWorkletProcessor{constructor(o){super();this.target=o.processorOptions.targetRate;this.frame=o.processorOptions.frameSamples;this.src=[];this.phase=0;this.out=[]}process(inputs){const input=inputs[0]&&inputs[0][0];if(!input)return true;for(const x of input)this.src.push(x);const ratio=sampleRate/this.target;while(this.phase+1<this.src.length){const i=Math.floor(this.phase),f=this.phase-i;this.out.push(this.src[i]*(1-f)+this.src[i+1]*f);this.phase+=ratio;if(this.out.length===this.frame){const data=new Float32Array(this.out),rms=Math.sqrt(data.reduce((s,v)=>s+v*v,0)/data.length);this.port.postMessage({data,rms},[data.buffer]);this.out=[]}}const used=Math.floor(this.phase);if(used){this.src.splice(0,used);this.phase-=used}return true}}registerProcessor('voice-pcm',VoicePCM)`;
-  const url=URL.createObjectURL(new Blob([code],{type:'application/javascript'}));await audioCtx.audioWorklet.addModule(url);URL.revokeObjectURL(url);
-  worklet=new AudioWorkletNode(audioCtx,'voice-pcm',{processorOptions:{targetRate:TARGET_RATE,frameSamples:TARGET_RATE*FRAME_MS/1000}});worklet.port.onmessage=e=>handleMicFrame(e.data.data,e.data.rms);
-  silentGain=audioCtx.createGain();silentGain.gain.value=0;audioCtx.createMediaStreamSource(stream).connect(worklet).connect(silentGain).connect(audioCtx.destination)
+  const url=URL.createObjectURL(new Blob([code],{type:'application/javascript'}));try{await nextContext.audioWorklet.addModule(url)}finally{URL.revokeObjectURL(url)}
+  if(generation!==audioGeneration){nextStream.getTracks().forEach(t=>t.stop());await nextContext.close();return 0}
+  const nextWorklet=new AudioWorkletNode(nextContext,'voice-pcm',{processorOptions:{targetRate:TARGET_RATE,frameSamples:TARGET_RATE*FRAME_MS/1000}}),nextGain=nextContext.createGain(),nextSource=nextContext.createMediaStreamSource(nextStream);nextGain.gain.value=0;
+  stream=nextStream;audioCtx=nextContext;worklet=nextWorklet;silentGain=nextGain;micSource=nextSource;
+  nextWorklet.port.onmessage=e=>{if(generation===audioGeneration&&worklet===nextWorklet)handleMicFrame(e.data.data,e.data.rms)};
+  nextSource.connect(nextWorklet).connect(nextGain).connect(nextContext.destination);return generation
 }
-function stopAudio(){if(worklet){worklet.disconnect();worklet=null}if(silentGain){silentGain.disconnect();silentGain=null}if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}clearPlayback('')}
+async function stopAudio(){
+  audioGeneration++;clearPlayback('');const oldContext=audioCtx;audioCtx=null;nextPlayTime=0;playbackStartedAt=0;
+  if(worklet){worklet.port.onmessage=null;try{worklet.port.close()}catch{}worklet.disconnect();worklet=null}
+  if(micSource){micSource.disconnect();micSource=null}if(silentGain){silentGain.disconnect();silentGain=null}
+  if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}if(oldContext&&oldContext.state!=='closed'){try{await oldContext.close()}catch{}}
+}
 
 function playFrame(buffer){
   const view=new DataView(buffer);if(buffer.byteLength<HEADER_BYTES||view.getUint8(0)!==86||view.getUint8(1)!==76||view.getUint8(2)!==49)throw new Error('不支持的音频帧');const seq=view.getUint32(4,true),rate=view.getUint32(8,true);if(outputSeq&&seq!==outputSeq+1)add('system',`下行音频序列跳跃 ${outputSeq} → ${seq}`);outputSeq=seq;const pcm=new Int16Array(buffer,HEADER_BYTES),floats=new Float32Array(pcm.length);for(let i=0;i<pcm.length;i++)floats[i]=pcm[i]/32768;const audio=audioCtx.createBuffer(1,floats.length,rate);audio.copyToChannel(floats,0);const source=audioCtx.createBufferSource();source.buffer=audio;source.connect(audioCtx.destination);const start=Math.max(audioCtx.currentTime+.012,nextPlayTime||0);if(!playbackStartedAt)playbackStartedAt=start;source.start(start);nextPlayTime=start+audio.duration;activeSources.add(source);source.onended=()=>{activeSources.delete(source);if(!activeSources.size)playbackStartedAt=0};downlink+=buffer.byteLength;metrics()
 }
 
 async function getTicket(){const response=await fetch(pathBase+'/ticket',{method:'POST',cache:'no-store'});if(!response.ok)throw new Error('无法取得安全连接 ticket');return(await response.json()).ticket}
-async function connect(resume=''){
-  const ticket=await getTicket(),proto=location.protocol==='https:'?'wss:':'ws:';ws=new WebSocket(`${proto}//${location.host}${pathBase}/ws?ticket=${encodeURIComponent(ticket)}`);ws.binaryType='arraybuffer';
-  ws.onopen=()=>{status('安全连接已建立');ws.send(JSON.stringify({type:'start',resume_episode_id:resume}))};
-  ws.onmessage=event=>{try{if(typeof event.data==='string')handle(JSON.parse(event.data));else playFrame(event.data)}catch(error){add('system','数据处理错误：'+error.message)}};
-  ws.onerror=()=>status('连接错误');ws.onclose=()=>{status('已断开');if(running&&!explicitStop&&reconnects<3){reconnects++;setTimeout(()=>connect(episodeId),400*reconnects)}else if(!explicitStop)finish(false)};
+async function connect(resume='',generation=audioGeneration){
+  const ticket=await getTicket();if(generation!==audioGeneration||explicitStop)return;const proto=location.protocol==='https:'?'wss:':'ws:',socket=new WebSocket(`${proto}//${location.host}${pathBase}/ws?ticket=${encodeURIComponent(ticket)}`);ws=socket;socket.binaryType='arraybuffer';const current=()=>generation===audioGeneration&&ws===socket;
+  socket.onopen=()=>{if(!current())return;status('安全连接已建立');socket.send(JSON.stringify({type:'start',resume_episode_id:resume}))};
+  socket.onmessage=event=>{if(!current())return;try{if(typeof event.data==='string')handle(JSON.parse(event.data));else playFrame(event.data)}catch(error){add('system','数据处理错误：'+error.message)}};
+  socket.onerror=()=>{if(current())status('连接错误')};socket.onclose=()=>{if(!current())return;ws=null;status('已断开');if(running&&!explicitStop&&reconnects<3){reconnects++;setTimeout(()=>connect(episodeId,generation),400*reconnects)}else if(!explicitStop)void finish(false)};
   function handle(msg){
     if(msg.type==='ready'){running=true;reconnects=0;episodeId=msg.episode_id;sessionStorage.setItem('voiceLiveEpisode',episodeId);el('provider').textContent=msg.provider;el('voiceProfile').textContent=msg.voice_profile||'原生';el('episode').textContent=episodeId.slice(0,8);status('通话中');state('listening')}
     else if(msg.type==='state')state(msg.state)
@@ -92,17 +102,17 @@ async function connect(resume=''){
     else if(msg.type==='playback.clear')clearPlayback(msg.reason||'上游打断')
     else if(msg.type==='metrics'){const svc=msg.values?.voice_conversion;if(svc){const perBlock=svc.block_count?svc.inference_ms/svc.block_count:0;el('svcLatency').textContent=svc.block_count?Math.round(perBlock)+' ms':'缓冲中'}}
     else if(msg.type==='pong'){el('latency').textContent=Math.round(performance.now()-pingAt)+' ms'}
-    else if(msg.type==='error'){add('system','错误：'+msg.message);state('error');if(msg.fatal)finish(false)}
-    else if(msg.type==='ended'){add('system','通话结束：'+msg.reason);finish(false)}
+    else if(msg.type==='error'){add('system','错误：'+msg.message);state('error');if(msg.fatal)void finish(false)}
+    else if(msg.type==='ended'){add('system','通话结束：'+msg.reason);void finish(false)}
   }
 }
 async function begin(){
-  explicitStop=false;episodeId='';reconnects=0;inputSeq=0;outputSeq=0;uplink=0;downlink=0;el('transcript').innerHTML='<div class="empty">正在建立实时音频链路…</div>';el('start').disabled=true;el('stop').disabled=false;el('mute').disabled=false;el('interrupt').disabled=false;state('connecting');status('请求麦克风');try{await startAudio();await connect()}catch(error){add('system','启动失败：'+error.message);finish(false)}
+  explicitStop=false;episodeId='';reconnects=0;inputSeq=0;outputSeq=0;uplink=0;downlink=0;el('transcript').innerHTML='<div class="empty">正在建立实时音频链路…</div>';el('start').disabled=true;el('stop').disabled=false;el('mute').disabled=false;el('interrupt').disabled=false;state('connecting');status('请求麦克风');try{const generation=await startAudio();if(generation&&generation===audioGeneration&&!explicitStop)await connect('',generation)}catch(error){add('system','启动失败：'+error.message);void finish(false)}
 }
-function finish(sendStop=true){if(explicitStop&& !running)return;explicitStop=true;running=false;if(sendStop&&ws?.readyState===WebSocket.OPEN)ws.send(JSON.stringify({type:'stop'}));try{ws?.close()}catch{}ws=null;stopAudio();el('start').disabled=false;el('stop').disabled=true;el('mute').disabled=true;el('interrupt').disabled=true;state('idle');status('未连接')}
-el('start').onclick=begin;el('stop').onclick=()=>finish(true);el('interrupt').onclick=()=>sendInterrupt();el('mute').onclick=()=>{muted=!muted;el('mute').textContent=muted?'恢复麦克风':'静音麦克风'};
+async function finish(sendStop=true){if(explicitStop&&!running&&!ws)return;explicitStop=true;running=false;if(sendStop&&ws?.readyState===WebSocket.OPEN)ws.send(JSON.stringify({type:'stop'}));try{ws?.close()}catch{}ws=null;el('start').disabled=true;el('stop').disabled=true;el('mute').disabled=true;el('interrupt').disabled=true;await stopAudio();el('start').disabled=false;state('idle');status('未连接')}
+el('start').onclick=begin;el('stop').onclick=()=>void finish(true);el('interrupt').onclick=()=>sendInterrupt();el('mute').onclick=()=>{muted=!muted;el('mute').textContent=muted?'恢复麦克风':'静音麦克风'};
 setInterval(()=>{if(ws?.readyState===WebSocket.OPEN){pingAt=performance.now();ws.send(JSON.stringify({type:'ping'}))}},5000);
-window.addEventListener('beforeunload',()=>finish(true));
+window.addEventListener('beforeunload',()=>void finish(true));
 </script>
 </body>
 </html>
