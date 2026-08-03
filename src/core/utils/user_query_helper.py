@@ -65,6 +65,7 @@ class UserQueryHelper:
         user_id: str,
         nickname: str | None = None,
         cardname: str | None = None,
+        canonical_person_key: str | None = None,
     ) -> tuple["PersonInfo", bool]:
         """获取或创建用户信息
 
@@ -73,6 +74,7 @@ class UserQueryHelper:
             user_id: 平台内部用户ID
             nickname: 用户昵称（创建时使用）
             cardname: 群名片（创建时使用）
+            canonical_person_key: 由显式账号映射提供的跨平台人物键
 
         Returns:
             (用户信息, 是否为新创建)
@@ -83,13 +85,18 @@ class UserQueryHelper:
         existing = await self.person_crud.get_by(person_id=person_id)
         if existing:
             # 2. 更新最后交互时间
+            update_data: dict[str, object] = {
+                "last_interaction": time.time(),
+                "interaction_count": existing.interaction_count + 1,
+            }
+            if canonical_person_key:
+                update_data["canonical_person_key"] = canonical_person_key
             await self.person_crud.update(
                 existing.id,
-                {
-                    "last_interaction": time.time(),
-                    "interaction_count": existing.interaction_count + 1,
-                },
+                update_data,
             )
+            if canonical_person_key:
+                existing.canonical_person_key = canonical_person_key
             return existing, False
 
         # 3. 创建新用户
@@ -98,6 +105,7 @@ class UserQueryHelper:
             "person_id": person_id,
             "platform": platform,
             "user_id": user_id,
+            "canonical_person_key": canonical_person_key or None,
             "nickname": nickname,
             "cardname": cardname,
             "first_interaction": now,
@@ -119,6 +127,7 @@ class UserQueryHelper:
         user_id: str,
         nickname: str | None = None,
         cardname: str | None = None,
+        canonical_person_key: str | None = None,
     ) -> bool:
         """更新用户信息
 
@@ -127,6 +136,7 @@ class UserQueryHelper:
             user_id: 平台内部用户ID
             nickname: 用户昵称
             cardname: 群名片
+            canonical_person_key: 由显式账号映射提供的跨平台人物键
 
         Returns:
             是否更新成功
@@ -135,7 +145,13 @@ class UserQueryHelper:
 
         person = await self.person_crud.get_by(person_id=person_id)
         if not person:
-            await self.get_or_create_person(platform, user_id, nickname, cardname)
+            await self.get_or_create_person(
+                platform,
+                user_id,
+                nickname,
+                cardname,
+                canonical_person_key,
+            )
             logger.info(f"用户不存在，已创建新用户：{person_id} ({nickname})")
             return True
 
@@ -149,10 +165,28 @@ class UserQueryHelper:
             update_data["nickname"] = nickname
         if cardname is not None:
             update_data["cardname"] = cardname
+        if canonical_person_key:
+            update_data["canonical_person_key"] = canonical_person_key
 
         await self.person_crud.update(person.id, update_data)
         logger.info(f"更新用户信息：{person_id} ({nickname})")
         return True
+
+    async def get_accounts_for_canonical_person(
+        self,
+        canonical_person_key: str,
+    ) -> list["PersonInfo"]:
+        """Return all explicitly linked platform accounts for one person."""
+        normalized = str(canonical_person_key or "").strip()
+        if not normalized:
+            return []
+        rows = await (
+            QueryBuilder(self._PersonInfo)
+            .filter(canonical_person_key=normalized)
+            .order_by("platform", "user_id")
+            .all()
+        )
+        return cast(list["PersonInfo"], rows)
         
     async def get_user_streams(
         self,

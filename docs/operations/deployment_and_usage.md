@@ -440,7 +440,8 @@ SOUL.md 不可用，life_chatter 拒绝生成回复
 | 机器人发送和回复消息 | `im:message:send_as_bot` | 当前验收需要 | 用于发送私聊回复及 reply API |
 | 读取消息及下载图片资源 | `im:message:readonly` | 图片查看需要，推荐 | 最小只读方案；资源 API 会据此读取消息中的 `image_key` 内容 |
 | 群聊中接收 @ 消息 | `im:message.group_at_msg:readonly` | 可选，当前未验收 | 只在后续验收群聊时开通 |
-| 解析用户真实昵称 | `contact:user.base:readonly` | 可选 | 未开通时仍可聊天，只是显示名可能退化为配置别名或 ID |
+| 解析用户真实昵称 | `contact:user.base:readonly` | 可选 | 未开通时仍可聊天；无显式别名时显示为稳定的“身份未解析用户” |
+| 从当前群解析成员昵称 | `im:chat.members:read` | 群聊身份识别推荐 | 通讯录不可见时的最小只读兜底；缺失时返回 `99991672` |
 
 飞书图片资源下载曾真实返回：
 
@@ -458,13 +459,14 @@ SOUL.md 不可用，life_chatter 拒绝生成回复
     "tenant": [
       "im:message.p2p_msg:readonly",
       "im:message:send_as_bot",
-      "im:message:readonly"
+      "im:message:readonly",
+      "im:chat.members:read"
     ]
   }
 }
 ```
 
-以上均为应用身份权限，不要求用户身份授权。若之后验收群聊或真实昵称，再分别增加 `im:message.group_at_msg:readonly`、`contact:user.base:readonly`，不要提前扩大权限范围。
+以上均为应用身份权限，不要求用户身份授权。若之后验收群聊事件或通讯录真实昵称，再分别增加 `im:message.group_at_msg:readonly`、`contact:user.base:readonly`，不要提前扩大权限范围。`im:chat.members:read` 只读取机器人所在会话的成员信息，是当前群聊身份解析的最小推荐权限。
 
 3. 在“事件与回调”中选择“长连接”，添加事件：
 
@@ -520,9 +522,13 @@ private_list = []
 
 [identity]
 user_name_aliases = []
+canonical_identity_aliases = []
 resolve_display_names = true
 display_name_cache_ttl = 21600.0
+display_name_negative_cache_ttl = 300.0
 ```
+
+`user_name_aliases` 使用 `open_id或union_id=显示名`；同一账号的两种 ID 应映射到同一个名字。`canonical_identity_aliases` 使用 `open_id或union_id=人物键`，QQ 适配器中的同一人物也配置相同人物键。人物键只能来自人工确认，禁止按昵称或消息内容自动建立跨平台关系。
 
 安全要求：
 

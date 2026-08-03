@@ -16,13 +16,15 @@ from src.kernel.concurrency import get_task_manager
 
 if TYPE_CHECKING:
     from ..client import NapCatClient
-    from ..config import NapcatAdapterConfig
 
 logger = get_logger("napcat_adapter")
 
 
 class MetaEventHandler:
     """处理 NapCat 元事件（心跳、生命周期）。"""
+
+    _HEARTBEAT_TIMEOUT_MULTIPLIER = 3.0
+    _MIN_HEARTBEAT_TIMEOUT_SECONDS = 45.0
 
     def __init__(self, client: "NapCatClient", get_config: Any) -> None:
         self._client = client
@@ -33,6 +35,7 @@ class MetaEventHandler:
         self._checking: bool = False
         self._heartbeat_task: Any | None = None
         self._reconnecting: bool = False
+        self._reported_status_degraded: bool = False
 
         # 由 adapter 注入的重连回调
         self._reconnect_callback: Any | None = None
@@ -49,31 +52,54 @@ class MetaEventHandler:
             sub_type = raw.get("sub_type")
             if sub_type == "connect":
                 self_id = raw.get("self_id")
-                self._last_heartbeat = time.time()
+                self._last_heartbeat = time.monotonic()
+                self._reported_status_degraded = False
                 logger.info(f"Bot {self_id} 连接成功")
             return None
 
         elif event_type == "heartbeat":
             status = raw.get("status", {})
-            if status.get("online") and status.get("good"):
-                self_id = raw.get("self_id")
-                interval = raw.get("interval")
-                if interval:
-                    self._interval = interval / 1000
+            if not isinstance(status, dict):
+                status = {}
+            self_id = raw.get("self_id")
+            interval = raw.get("interval")
+            if interval:
+                try:
+                    parsed_interval = float(interval) / 1000.0
+                except (TypeError, ValueError):
+                    parsed_interval = 0.0
+                if parsed_interval > 0:
+                    self._interval = parsed_interval
 
-                if not self._checking and self_id:
-                    # 首次收到心跳，启动心跳检查任务
-                    tm = get_task_manager()
-                    self._heartbeat_task = tm.create_task(
-                        self._check_heartbeat_loop(self_id),
-                        name="napcat_heartbeat_check",
-                        daemon=True,
-                    )
-                self._last_heartbeat = time.time()
-            else:
-                self_id = raw.get("self_id")
-                logger.warning(f"Bot {self_id} NapCat 端状态异常！")
-                await self._trigger_reconnect(self_id, "心跳状态异常")
+            # Every heartbeat proves that the Elysium <-> NapCat WebSocket is
+            # alive. ``status.online`` is an advisory QQ session field and is
+            # known to be false even while OneBot APIs and message transport are
+            # healthy; it must never restart the transport by itself.
+            self._last_heartbeat = time.monotonic()
+            if not self._checking and self_id:
+                # Claim ownership before scheduling so back-to-back heartbeat
+                # events cannot create duplicate checker tasks.
+                self._checking = True
+                tm = get_task_manager()
+                self._heartbeat_task = tm.create_task(
+                    self._check_heartbeat_loop(self_id),
+                    name="napcat_heartbeat_check",
+                    daemon=True,
+                )
+
+            status_degraded = (
+                status.get("online") is False or status.get("good") is False
+            )
+            if status_degraded and not self._reported_status_degraded:
+                logger.warning(
+                    f"Bot {self_id} NapCat 上报会话状态降级 "
+                    f"(online={status.get('online')}, good={status.get('good')})；"
+                    "WebSocket 心跳仍正常，本次不重启适配器"
+                )
+                self._reported_status_degraded = True
+            elif not status_degraded and self._reported_status_degraded:
+                logger.info(f"Bot {self_id} NapCat 上报会话状态已恢复")
+                self._reported_status_degraded = False
 
             return None
 
@@ -99,14 +125,28 @@ class MetaEventHandler:
         self._checking = True
         try:
             while True:
-                now = time.time()
-                if now - self._last_heartbeat > self._interval * 2:
-                    await self._trigger_reconnect(bot_id, "心跳超时")
+                await asyncio.sleep(max(self._interval, 1.0))
+                now = time.monotonic()
+                if now - self._last_heartbeat > self._heartbeat_timeout_seconds():
+                    # Reconnect from a separate owned task. Calling reconnect()
+                    # inside the checker would cancel the checker from stop(),
+                    # interrupting the lifecycle halfway through.
+                    tm = get_task_manager()
+                    tm.create_task(
+                        self._trigger_reconnect(bot_id, "OneBot 心跳超时"),
+                        name="napcat_heartbeat_reconnect",
+                        daemon=True,
+                    )
                     break
-                await asyncio.sleep(self._interval)
         finally:
             self._checking = False
             self._heartbeat_task = None
+
+    def _heartbeat_timeout_seconds(self) -> float:
+        return max(
+            self._MIN_HEARTBEAT_TIMEOUT_SECONDS,
+            self._interval * self._HEARTBEAT_TIMEOUT_MULTIPLIER,
+        )
 
     def stop(self) -> None:
         """停止心跳检查。"""
@@ -114,3 +154,5 @@ class MetaEventHandler:
             self._heartbeat_task.cancel()
             self._heartbeat_task = None
         self._checking = False
+        self._last_heartbeat = 0.0
+        self._reported_status_degraded = False

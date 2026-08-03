@@ -135,6 +135,10 @@ def life_event_from_legacy(event: LifeEngineEvent) -> LifeEvent:
             "source": event.source,
             "chat_type": event.chat_type,
             "sender": event.sender,
+            "sender_id": event.sender_id,
+            "sender_platform_account_key": event.sender_platform_account_key,
+            "canonical_person_key": event.canonical_person_key,
+            "identity_resolution_status": event.identity_resolution_status,
         }
 
     metadata: dict[str, Any] = {
@@ -144,6 +148,15 @@ def life_event_from_legacy(event: LifeEngineEvent) -> LifeEvent:
     }
     if event.sender is not None:
         metadata["sender"] = event.sender
+    for field_name in (
+        "sender_id",
+        "sender_platform_account_key",
+        "canonical_person_key",
+        "identity_resolution_status",
+    ):
+        value = getattr(event, field_name, None)
+        if value is not None:
+            metadata[field_name] = value
     if event.chat_type is not None:
         metadata["chat_type"] = event.chat_type
     if event.heartbeat_index is not None:

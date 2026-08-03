@@ -50,6 +50,9 @@ class FeishuRouter(BaseRouter):
                     config.connection.subscription_mode if config is not None else None
                 ),
                 "connected": adapter.is_connected() if adapter is not None else False,
+                "identity": (
+                    adapter.identity_health_snapshot() if adapter is not None else None
+                ),
                 "time": time.time(),
             }
 

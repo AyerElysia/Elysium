@@ -305,9 +305,27 @@ class NapcatAdapterConfig(BaseConfig):
             order=2
         )
 
+    @config_section("identity", title="身份映射", tag="user", order=60)
+    class IdentitySection(SectionBase):
+        """Explicit QQ account to canonical-person mappings."""
+
+        account_identity_aliases: list[str] = Field(
+            default_factory=list,
+            description=(
+                "QQ 账号到跨平台人物键的显式映射，格式为 "
+                "'QQ号=canonical_person_key'；禁止按昵称或消息内容自动合并人物"
+            ),
+            label="跨平台人物映射",
+            input_type="list",
+            item_type="str",
+            tag="user",
+            order=0,
+        )
+
     plugin: PluginSection = Field(default_factory=PluginSection)
     bot: BotSection = Field(default_factory=BotSection)
     napcat_server: NapcatServerSection = Field(default_factory=NapcatServerSection)
     features: FeaturesSection = Field(default_factory=FeaturesSection)
     events: EventsSection = Field(default_factory=EventsSection)
     request_handling: RequestHandlingSection = Field(default_factory=RequestHandlingSection)
+    identity: IdentitySection = Field(default_factory=IdentitySection)

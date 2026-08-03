@@ -463,6 +463,28 @@ async def test_feishu_user_name_alias_maps_sender_display_name() -> None:
     assert extra["feishu_union_id"] == "on_ayer"
 
 
+async def test_feishu_explicit_identity_mapping_reaches_envelope() -> None:
+    config = FeishuAdapterConfig()
+    config.identity.user_name_aliases = ["ou_peach=Wander Hunter（桃子哥）"]
+    config.identity.canonical_identity_aliases = [
+        "ou_peach=wander_hunter",
+        "on_peach=wander_hunter",
+    ]
+    adapter = make_adapter(config)
+
+    envelope = await adapter.from_platform_message(
+        _event(open_id="ou_peach", union_id="on_peach", message_id="om_identity")
+    )
+
+    assert envelope is not None
+    extra = envelope["message_info"]["extra"]
+    assert _nickname(envelope) == "Wander Hunter（桃子哥）"
+    assert extra["sender_platform_account_key"] == "feishu:ou_peach"
+    assert extra["canonical_person_key"] == "wander_hunter"
+    assert extra["identity_resolution_status"] == "resolved"
+    assert extra["identity_display_name_source"] == "configured_alias"
+
+
 async def test_feishu_deduplicates_by_message_id() -> None:
     adapter = make_adapter()
 
@@ -692,6 +714,7 @@ def test_feishu_router_status_reports_connection_mode() -> None:
     data = response.json()
     assert data["subscription_mode"] == "long_connection"
     assert data["connected"] is False
+    assert data["identity"]["status"] == "unknown"
     set_feishu_adapter(None)
 
 
@@ -859,20 +882,27 @@ async def test_failed_resolution_keeps_raw_id_and_negative_caches(
         _event(open_id="ou_peach", union_id="on_peach", message_id="om_2")
     )
 
-    # 取名失败绝不能丢消息，兜底仍是原来的 ID
+    # 取名失败绝不能丢消息，但也不能继续把原始 ID 伪装成人名。
     assert first is not None
     assert second is not None
-    assert _nickname(first) == "on_peach"
-    assert _nickname(second) == "on_peach"
+    assert _nickname(first) == _nickname(second)
+    assert _nickname(first).startswith("身份未解析的飞书用户")
+    assert "on_peach" not in _nickname(first)
+    assert first["message_info"]["extra"]["identity_resolution_status"] == "unresolved"
     # 负缓存生效：第二条不再打接口
     assert api.contact_calls == 1
     assert api.member_calls == 1
+    health = adapter.identity_health_snapshot()
+    assert health["status"] == "degraded"
+    assert health["unresolved_messages"] == 2
+    assert health["negative_cache_entries"] == 2
+    assert health["last_failure_reason"] == "chat_members:permission_denied"
 
 
 async def test_negative_cache_expires_after_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
     """TTL 过期后允许重试——权限后来补上了也能自己恢复。"""
     config = _credentialed_config()
-    config.identity.display_name_cache_ttl = 60.0
+    config.identity.display_name_negative_cache_ttl = 60.0
     adapter = make_adapter(config)
     api = FakeApi(contact=None, members=None)
     monkeypatch.setattr(adapter, "_get_json", api)
@@ -946,7 +976,7 @@ async def test_alias_still_wins_over_api_resolution(
 
 
 async def test_resolution_disabled_skips_api(monkeypatch: pytest.MonkeyPatch) -> None:
-    """开关关掉后回落原始 ID，一个接口都不打。"""
+    """开关关掉后使用未解析标签，一个接口都不打。"""
     config = _credentialed_config()
     config.identity.resolve_display_names = False
     adapter = make_adapter(config)
@@ -958,7 +988,8 @@ async def test_resolution_disabled_skips_api(monkeypatch: pytest.MonkeyPatch) ->
     )
 
     assert envelope is not None
-    assert _nickname(envelope) == "on_peach"
+    assert _nickname(envelope).startswith("身份未解析的飞书用户")
+    assert envelope["message_info"]["extra"]["identity_resolution_status"] == "unresolved"
     assert api.paths == []
 
 
@@ -977,7 +1008,7 @@ async def test_missing_credentials_skip_api_without_negative_cache(
         _event(open_id="ou_peach", union_id="on_peach", message_id="om_1")
     )
     assert envelope is not None
-    assert _nickname(envelope) == "on_peach"
+    assert _nickname(envelope).startswith("身份未解析的飞书用户")
     assert api.paths == []
     assert adapter._display_name_cache == {}
 

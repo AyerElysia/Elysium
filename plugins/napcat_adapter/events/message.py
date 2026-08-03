@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import orjson
 from mofox_wire import MessageBuilder, SegPayload
@@ -45,6 +45,23 @@ class MessageEventHandler:
 
     def _config(self) -> "NapcatAdapterConfig | None":
         return self._get_config()
+
+    def _canonical_person_key(self, user_id: str) -> str:
+        """Return an explicitly configured cross-platform person key."""
+        config = self._config()
+        if config is None:
+            return ""
+        aliases: dict[str, str] = {}
+        for item in config.identity.account_identity_aliases:
+            raw = str(item or "").strip()
+            if not raw or "=" not in raw:
+                continue
+            account_id, canonical_key = raw.split("=", 1)
+            account_id = account_id.strip()
+            canonical_key = canonical_key.strip()
+            if account_id and canonical_key:
+                aliases[account_id] = canonical_key
+        return aliases.get(str(user_id or "").strip(), "")
 
     # ------------------------------------------------------------------
     # 主入口
@@ -136,7 +153,21 @@ class MessageEventHandler:
         )
         msg_builder.seg_list(seg_list)
 
-        return msg_builder.build()
+        envelope = msg_builder.build()
+        sender_id = str(sender.get("user_id", "") or "").strip()
+        canonical_person_key = self._canonical_person_key(sender_id)
+        message_info = envelope["message_info"]
+        extra = message_info.get("extra")
+        if not isinstance(extra, dict):
+            extra = {}
+            message_info["extra"] = extra
+        extra.update({
+            "sender_platform_account_key": f"qq:{sender_id}" if sender_id else "",
+            "canonical_person_key": canonical_person_key,
+            "identity_resolution_status": "resolved",
+            "identity_display_name_source": "onebot_sender",
+        })
+        return envelope
 
     # ------------------------------------------------------------------
     # 消息段分发

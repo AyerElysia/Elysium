@@ -274,6 +274,24 @@ class NapcatAdapter(BaseAdapter):
             "platform": self.platform,
         }
 
+    async def health_check(self) -> bool:
+        """Check the resource this adapter actually owns.
+
+        In reverse-WebSocket mode Elysium owns the listening server while
+        NapCat owns reconnecting the client. Restarting the whole adapter just
+        because no client is attached races NapCat's reconnect loop and cannot
+        repair the QQ session. OneBot heartbeat timeout handles a genuinely
+        stale attached client separately.
+        """
+        config = self._get_config()
+        if config and config.napcat_server.mode == "reverse":
+            server = self._ws_server
+            if server is None:
+                return False
+            is_serving = getattr(server, "is_serving", None)
+            return bool(is_serving()) if callable(is_serving) else True
+        return self.is_connected()
+
     # ------------------------------------------------------------------
     # 向后兼容 API
     # ------------------------------------------------------------------

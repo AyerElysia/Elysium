@@ -90,6 +90,26 @@ class TestUserQueryHelper:
             assert is_new is True
             helper.person_crud.create.assert_called_once()
 
+    def test_get_or_create_person_persists_explicit_canonical_key(self):
+        import asyncio
+
+        with patch("src.core.utils.user_query_helper.CRUDBase"):
+            helper = UserQueryHelper()
+            helper.person_crud.get_by = AsyncMock(return_value=None)
+            helper.person_crud.create = AsyncMock(return_value=MagicMock(id=1))
+
+            asyncio.run(
+                helper.get_or_create_person(
+                    "feishu",
+                    "ou_peach",
+                    nickname="Wander Hunter（桃子哥）",
+                    canonical_person_key="wander_hunter",
+                )
+            )
+
+            created = helper.person_crud.create.await_args.args[0]
+            assert created["canonical_person_key"] == "wander_hunter"
+
     @patch("src.core.utils.user_query_helper.QueryBuilder")
     def test_get_user_streams(self, mock_query_builder):
         """测试获取用户聊天流。"""
@@ -266,7 +286,7 @@ class TestGetUserQueryHelper:
     def test_singleton_persistence(self):
         """测试单例持久性。"""
         with patch("src.core.utils.user_query_helper.UserQueryHelper"):
-            helper = get_user_query_helper()
+            get_user_query_helper()
             # 全局变量应该被设置
             from src.core.utils.user_query_helper import _user_query_helper
             assert _user_query_helper is not None

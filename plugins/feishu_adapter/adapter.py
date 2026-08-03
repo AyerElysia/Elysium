@@ -10,7 +10,6 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 import threading
 import time
 import uuid
@@ -183,6 +182,12 @@ class FeishuAdapter(BaseAdapter):
         # 用负缓存避免每条消息都去撞一次没权限的接口。
         self._display_name_cache: dict[str, str] = {}
         self._display_name_cached_at: dict[str, float] = {}
+        self._identity_resolved_message_count = 0
+        self._identity_unresolved_message_count = 0
+        self._identity_last_success_at = 0.0
+        self._identity_last_failure_at = 0.0
+        self._identity_last_failure_reason = ""
+        self._identity_warned_failures: set[str] = set()
         # 已收到私聊消息的用户 -> p2p chat_id。对当前会话的回复优先按 chat_id
         # 发送，避免被飞书按“向用户主动推送”路径限制。
         self._private_chat_ids: dict[str, str] = {}
@@ -227,6 +232,7 @@ class FeishuAdapter(BaseAdapter):
         self._private_chat_ids.clear()
         self._display_name_cache.clear()
         self._display_name_cached_at.clear()
+        self._identity_warned_failures.clear()
         logger.info("FeishuAdapter 已关闭")
 
     async def health_check(self) -> bool:
@@ -625,6 +631,19 @@ class FeishuAdapter(BaseAdapter):
             user_id = normalized.get("user_id", "")
             union_id = normalized.get("union_id", "")
             sender_name = normalized["sender_name"]
+            stable_account_id = open_id or union_id or user_id
+            canonical_person_key = self._canonical_person_key(
+                open_id=open_id,
+                union_id=union_id,
+                user_id=user_id,
+            )
+            configured_alias = self._configured_display_alias(
+                open_id=open_id,
+                union_id=union_id,
+                user_id=user_id,
+            )
+            identity_status = "resolved"
+            identity_source = "configured_alias" if configured_alias else "event"
 
             # @ 段里飞书会直接带 name，白捡的映射先收进缓存
             self._harvest_mention_names(normalized.get("mentions") or [])
@@ -632,7 +651,11 @@ class FeishuAdapter(BaseAdapter):
             # 没配 alias 的用户，_sender_name 只能退回 union_id/open_id 这种原始 ID。
             # 她看到的"人名"就成了 on_41a2efd3...，同一个群里几个人全是这种串，
             # 自然认不出谁是谁。这里补一次真名解析。
-            if self._looks_like_raw_id(sender_name):
+            if configured_alias:
+                # An exact account mapping is an authored identity fact and is
+                # therefore authoritative over any incidental event label.
+                sender_name = configured_alias
+            elif self._looks_like_raw_id(sender_name):
                 resolved = await self._resolve_display_name(
                     open_id=open_id,
                     union_id=union_id,
@@ -641,6 +664,16 @@ class FeishuAdapter(BaseAdapter):
                 )
                 if resolved:
                     sender_name = resolved
+                    identity_source = "directory_or_cache"
+                else:
+                    sender_name = self._unresolved_sender_label(stable_account_id)
+                    identity_status = "unresolved"
+                    identity_source = "unresolved"
+
+            if identity_status == "resolved":
+                self._record_identity_resolution_success()
+            else:
+                self._identity_unresolved_message_count += 1
 
             content = normalized["content"]
             timestamp = normalized["timestamp"]
@@ -656,6 +689,12 @@ class FeishuAdapter(BaseAdapter):
                 "feishu_open_id": open_id,
                 "feishu_user_id": user_id,
                 "feishu_union_id": union_id,
+                "sender_platform_account_key": (
+                    f"{PLATFORM}:{stable_account_id}" if stable_account_id else ""
+                ),
+                "canonical_person_key": canonical_person_key,
+                "identity_resolution_status": identity_status,
+                "identity_display_name_source": identity_source,
                 "sender_type": normalized.get("sender_type", ""),
                 "feishu_message_type": normalized.get("message_type", ""),
                 "format_info": {"accept_format": ["text", "image"]},
@@ -1098,6 +1137,42 @@ class FeishuAdapter(BaseAdapter):
                 return aliases[value]
         return ""
 
+    def _configured_display_alias(
+        self,
+        *,
+        open_id: str,
+        union_id: str,
+        user_id: str,
+    ) -> str:
+        """Return a display alias only when an exact platform ID is configured."""
+        aliases = self._parse_user_name_aliases(
+            self._config().identity.user_name_aliases
+        )
+        for key in (open_id, union_id, user_id):
+            if key and key in aliases:
+                return aliases[key]
+        return ""
+
+    def _canonical_person_key(
+        self,
+        *,
+        open_id: str,
+        union_id: str,
+        user_id: str,
+    ) -> str:
+        """Resolve an explicitly authored cross-platform person key.
+
+        This mapping is an identity fact. It deliberately does not fall back to
+        display-name similarity or message content.
+        """
+        aliases = self._parse_user_name_aliases(
+            self._config().identity.canonical_identity_aliases
+        )
+        for key in (open_id, union_id, user_id):
+            if key and key in aliases:
+                return aliases[key]
+        return ""
+
     @staticmethod
     def _parse_user_name_aliases(items: list[str]) -> dict[str, str]:
         aliases: dict[str, str] = {}
@@ -1126,6 +1201,16 @@ class FeishuAdapter(BaseAdapter):
             return True
         return value.startswith(_RAW_ID_PREFIXES)
 
+    @staticmethod
+    def _unresolved_sender_label(stable_account_id: str) -> str:
+        """Build a stable, non-identifying label for an unresolved account."""
+        normalized = str(stable_account_id or "").strip()
+        suffix = normalized[-6:] if normalized else "unknown"
+        return (
+            f"身份未解析的飞书用户（账号…{suffix}；"
+            "不可根据消息内容推断为任何已知人物）"
+        )
+
     def _cache_display_name(self, key: str, name: str) -> None:
         """写入显示名缓存；``name`` 为空表示负缓存。"""
         if not key:
@@ -1137,13 +1222,85 @@ class FeishuAdapter(BaseAdapter):
         """读显示名缓存，超过 TTL 视为未命中。返回 None 表示未命中。"""
         if not key or key not in self._display_name_cache:
             return None
-        ttl = float(self._config().identity.display_name_cache_ttl)
+        cached_value = self._display_name_cache[key]
+        identity_config = self._config().identity
+        ttl = float(
+            identity_config.display_name_cache_ttl
+            if cached_value
+            else identity_config.display_name_negative_cache_ttl
+        )
         cached_at = self._display_name_cached_at.get(key, 0.0)
         if ttl > 0 and time.time() - cached_at > ttl:
             self._display_name_cache.pop(key, None)
             self._display_name_cached_at.pop(key, None)
             return None
-        return self._display_name_cache[key]
+        return cached_value
+
+    def _record_identity_resolution_success(self) -> None:
+        self._identity_resolved_message_count += 1
+        self._identity_last_success_at = time.time()
+
+    def _record_identity_lookup_failure(self, source: str, exc: Exception) -> None:
+        reason = self._identity_failure_reason(source, exc)
+        self._identity_last_failure_at = time.time()
+        self._identity_last_failure_reason = reason
+        warning_key = "permission_denied" if reason.endswith(":permission_denied") else reason
+        if warning_key in self._identity_warned_failures:
+            return
+        self._identity_warned_failures.add(warning_key)
+        logger.warning(
+            "飞书身份解析已降级: "
+            f"source={source} reason={reason}; "
+            "请配置确定性身份别名，或为飞书应用授予并发布 im:chat.members:read 权限"
+        )
+
+    @staticmethod
+    def _identity_failure_reason(source: str, exc: Exception) -> str:
+        text = str(exc).lower()
+        if any(
+            marker in text
+            for marker in (
+                "99991672",
+                "41050",
+                "access denied",
+                "no user authority",
+                "permission",
+            )
+        ):
+            return f"{source}:permission_denied"
+        return f"{source}:{type(exc).__name__}"
+
+    def identity_health_snapshot(self) -> dict[str, Any]:
+        """Return read-only, privacy-safe identity resolution health."""
+        config = self._config().identity
+        if not config.resolve_display_names:
+            status = "disabled"
+        elif (
+            self._identity_last_failure_at > self._identity_last_success_at
+            and self._identity_unresolved_message_count > 0
+        ):
+            status = "degraded"
+        elif self._identity_resolved_message_count > 0:
+            status = "ok"
+        else:
+            status = "unknown"
+        return {
+            "status": status,
+            "configured_display_aliases": len(
+                self._parse_user_name_aliases(config.user_name_aliases)
+            ),
+            "configured_canonical_identities": len(
+                set(self._parse_user_name_aliases(config.canonical_identity_aliases).values())
+            ),
+            "resolved_messages": self._identity_resolved_message_count,
+            "unresolved_messages": self._identity_unresolved_message_count,
+            "negative_cache_entries": sum(
+                1 for value in self._display_name_cache.values() if not value
+            ),
+            "last_success_at": self._identity_last_success_at or None,
+            "last_failure_at": self._identity_last_failure_at or None,
+            "last_failure_reason": self._identity_last_failure_reason or None,
+        }
 
     def _harvest_mention_names(self, mentions: list[Any]) -> None:
         """从 @ 段里白捡显示名。
@@ -1229,6 +1386,7 @@ class FeishuAdapter(BaseAdapter):
                 f"/open-apis/contact/v3/users/{open_id}?user_id_type=open_id"
             )
         except Exception as exc:
+            self._record_identity_lookup_failure("contact", exc)
             logger.debug(f"飞书通讯录查名失败: open_id={open_id} error={exc}")
             return ""
         user = (data.get("data") or {}).get("user") or {}
@@ -1250,6 +1408,7 @@ class FeishuAdapter(BaseAdapter):
                 "?member_id_type=open_id&page_size=100"
             )
         except Exception as exc:
+            self._record_identity_lookup_failure("chat_members", exc)
             logger.debug(f"飞书群成员查名失败: chat_id={chat_id} error={exc}")
             return ""
 

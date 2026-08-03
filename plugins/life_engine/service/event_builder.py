@@ -48,6 +48,10 @@ class LifeEngineEvent:
 
     # 消息特有字段
     sender: str | None = None
+    sender_id: str | None = None
+    sender_platform_account_key: str | None = None
+    canonical_person_key: str | None = None
+    identity_resolution_status: str | None = None
     chat_type: str | None = None
     stream_id: str | None = None
 
@@ -313,6 +317,16 @@ class EventBuilder:
             content=content,
             content_type=message_type,
             sender=sender_display,
+            sender_id=sender_id or None,
+            sender_platform_account_key=(
+                str(extra.get("sender_platform_account_key") or "").strip() or None
+            ),
+            canonical_person_key=(
+                str(extra.get("canonical_person_key") or "").strip() or None
+            ),
+            identity_resolution_status=(
+                str(extra.get("identity_resolution_status") or "").strip() or None
+            ),
             chat_type=chat_type,
             stream_id=stream_id,
             source_instance_id=str(extra.get("consciousness_instance_id") or "") or None,

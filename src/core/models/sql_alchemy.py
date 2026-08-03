@@ -403,6 +403,14 @@ class PersonInfo(Base):
         index=True,
         comment="平台内部用户ID"
     )
+    canonical_person_key: Mapped[str | None] = mapped_column(
+        get_string_field(100),
+        nullable=True,
+        index=True,
+        comment=(
+            "由显式账号映射提供的跨平台人物键；不得通过昵称、相似度或消息内容推断"
+        ),
+    )
 
     # 名称信息（冗余存储，快速访问）
     nickname: Mapped[str | None] = mapped_column(

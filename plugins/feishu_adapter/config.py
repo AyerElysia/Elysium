@@ -199,6 +199,19 @@ class FeishuAdapterConfig(BaseConfig):
             tag="user",
             order=0,
         )
+        canonical_identity_aliases: list[str] = Field(
+            default_factory=list,
+            description=(
+                "飞书账号到跨平台人物键的显式映射，格式为 "
+                "'open_id或union_id=canonical_person_key'。人物键只表示确定的账号归属，"
+                "不得通过昵称或消息内容自动推断"
+            ),
+            label="跨平台人物映射",
+            input_type="list",
+            item_type="str",
+            tag="user",
+            order=1,
+        )
         resolve_display_names: bool = Field(
             default=True,
             description=(
@@ -207,7 +220,7 @@ class FeishuAdapterConfig(BaseConfig):
             ),
             label="自动解析真实昵称",
             tag="user",
-            order=1,
+            order=2,
         )
         display_name_cache_ttl: float = Field(
             default=21600.0,
@@ -215,7 +228,20 @@ class FeishuAdapterConfig(BaseConfig):
             label="昵称缓存时长(秒)",
             input_type="number",
             tag="user",
-            order=2,
+            ge=0.0,
+            order=3,
+        )
+        display_name_negative_cache_ttl: float = Field(
+            default=300.0,
+            description=(
+                "昵称查询失败结果的缓存秒数。失败缓存应短于成功缓存，"
+                "确保补齐飞书权限后能够较快自动恢复"
+            ),
+            label="昵称失败缓存时长(秒)",
+            input_type="number",
+            tag="user",
+            ge=0.0,
+            order=4,
         )
 
     plugin: PluginSection = Field(default_factory=PluginSection)

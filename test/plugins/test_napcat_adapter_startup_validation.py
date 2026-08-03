@@ -10,7 +10,12 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from plugins.napcat_adapter.config import NapcatAdapterConfig
-from plugins.napcat_adapter.plugin import NapcatAdapter, NapcatAdapterPlugin, _validate_bot_identity
+from plugins.napcat_adapter.events.meta import MetaEventHandler
+from plugins.napcat_adapter.plugin import (
+    NapcatAdapter,
+    NapcatAdapterPlugin,
+    _validate_bot_identity,
+)
 
 
 def test_disabled_napcat_plugin_registers_no_adapter_component() -> None:
@@ -504,12 +509,13 @@ def test_handle_raw_message_keeps_normal_private_message() -> None:
     assert envelope is not None
 
 
-async def test_meta_event_handler_reconnects_on_unhealthy_heartbeat() -> None:
-    """OneBot 明确报告异常心跳时应触发适配器重连。"""
+async def test_meta_event_handler_does_not_reconnect_on_advisory_status() -> None:
+    """online/good 是 QQ 会话建议状态，不是 WebSocket 断线证据。"""
     plugin = _build_napcat_plugin()
     adapter = NapcatAdapter(core_sink=cast(Any, _FakeCoreSink()), plugin=plugin)
     adapter.reconnect = AsyncMock()
     adapter._router.meta_handler.set_reconnect_callback(adapter.reconnect)
+    adapter._router.meta_handler._checking = True
 
     await adapter._router.meta_handler.handle(
         {
@@ -521,7 +527,8 @@ async def test_meta_event_handler_reconnects_on_unhealthy_heartbeat() -> None:
         }
     )
 
-    adapter.reconnect.assert_awaited_once()
+    adapter.reconnect.assert_not_awaited()
+    assert adapter._router.meta_handler._reported_status_degraded is True
 
 
 async def test_get_close_wait_sockets_keeps_only_matching_pid_and_fd(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -573,3 +580,132 @@ def test_napcat_health_does_not_use_business_message_inactivity() -> None:
     assert not hasattr(adapter, "_activity_timeout")
     assert not hasattr(adapter, "_last_message_time")
     assert not hasattr(adapter, "_watchdog_thread")
+
+
+async def test_advisory_offline_heartbeat_refreshes_transport_liveness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = MetaEventHandler(cast(Any, object()), lambda: None)
+    handler._checking = True
+    monkeypatch.setattr(
+        "plugins.napcat_adapter.events.meta.time.monotonic",
+        lambda: 123.0,
+    )
+
+    await handler.handle(
+        {
+            "meta_event_type": "heartbeat",
+            "self_id": 3427056465,
+            "interval": 30000,
+            "status": {"online": False, "good": True},
+        }
+    )
+
+    assert handler._last_heartbeat == 123.0
+    assert handler._interval == 30.0
+
+
+async def test_back_to_back_heartbeats_create_one_checker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = MetaEventHandler(cast(Any, object()), lambda: None)
+    scheduled: list[Any] = []
+
+    class _TaskManager:
+        def create_task(self, coroutine: Any, **_kwargs: Any) -> Mock:
+            scheduled.append(coroutine)
+            return Mock()
+
+    monkeypatch.setattr(
+        "plugins.napcat_adapter.events.meta.get_task_manager",
+        lambda: _TaskManager(),
+    )
+
+    event = {
+        "meta_event_type": "heartbeat",
+        "self_id": 3427056465,
+        "interval": 30000,
+        "status": {"online": True, "good": True},
+    }
+    await handler.handle(event)
+    await handler.handle(event)
+
+    assert handler._checking is True
+    assert len(scheduled) == 1
+    scheduled[0].close()
+
+
+async def test_healthy_heartbeat_clears_advisory_degraded_state() -> None:
+    handler = MetaEventHandler(cast(Any, object()), lambda: None)
+    handler._checking = True
+    handler._reported_status_degraded = True
+
+    await handler.handle(
+        {
+            "meta_event_type": "heartbeat",
+            "self_id": 3427056465,
+            "status": {"online": True, "good": True},
+        }
+    )
+
+    assert handler._reported_status_degraded is False
+
+
+def test_heartbeat_timeout_allows_three_reporting_periods() -> None:
+    handler = MetaEventHandler(cast(Any, object()), lambda: None)
+    handler._interval = 30.0
+
+    assert handler._heartbeat_timeout_seconds() == 90.0
+
+
+async def test_reverse_mode_health_owns_listener_not_client_connection() -> None:
+    adapter = NapcatAdapter(
+        core_sink=cast(Any, _FakeCoreSink()),
+        plugin=_build_napcat_plugin(),
+    )
+    adapter._ws = None
+    adapter._ws_server = SimpleNamespace(is_serving=lambda: True)
+
+    assert await adapter.health_check() is True
+
+
+async def test_reverse_mode_health_fails_when_listener_is_missing() -> None:
+    adapter = NapcatAdapter(
+        core_sink=cast(Any, _FakeCoreSink()),
+        plugin=_build_napcat_plugin(),
+    )
+    adapter._ws = None
+    adapter._ws_server = None
+
+    assert await adapter.health_check() is False
+
+
+async def test_qq_explicit_identity_mapping_reaches_envelope() -> None:
+    plugin = _build_napcat_plugin()
+    plugin.config.identity.account_identity_aliases = [
+        "1419893769=wander_hunter"
+    ]
+    adapter = NapcatAdapter(
+        core_sink=cast(Any, _FakeCoreSink()),
+        plugin=plugin,
+    )
+
+    envelope = await adapter.from_platform_message(
+        {
+            "post_type": "message",
+            "self_id": "3427056465",
+            "message_id": 1003,
+            "message_type": "private",
+            "sender": {
+                "user_id": "1419893769",
+                "nickname": "Wandering Hunter",
+            },
+            "message": [{"type": "text", "data": {"text": "hello"}}],
+        }
+    )
+
+    assert envelope is not None
+    extra = envelope["message_info"]["extra"]
+    assert extra["sender_platform_account_key"] == "qq:1419893769"
+    assert extra["canonical_person_key"] == "wander_hunter"
+    assert extra["identity_resolution_status"] == "resolved"

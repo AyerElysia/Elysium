@@ -160,11 +160,15 @@ class MessageReceiver:
         from src.core.utils.user_query_helper import get_user_query_helper
 
         # 1. 更新用户信息
+        extra = getattr(message, "extra", {}) or {}
         await get_user_query_helper().update_person_info(
             platform=message.platform,
             user_id=message.sender_id,
             nickname=message.sender_name,
             cardname=message.sender_cardname,
+            canonical_person_key=(
+                str(extra.get("canonical_person_key") or "").strip() or None
+            ),
         )
 
     # ──────────────────────────────────────────

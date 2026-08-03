@@ -137,6 +137,9 @@ def test_message_ledger_preserves_full_content_and_instance_attribution() -> Non
         extra={
             "consciousness_instance_id": "instance:voice",
             "episode_id": "episode:one",
+            "sender_platform_account_key": "voice_live:owner:1",
+            "canonical_person_key": "ayer",
+            "identity_resolution_status": "resolved",
         },
         sender_cardname="",
         sender_name="owner",
@@ -155,11 +158,19 @@ def test_message_ledger_preserves_full_content_and_instance_attribution() -> Non
     assert raw.content == full_content
     assert raw.source_instance_id == "instance:voice"
     assert raw.correlation_id == "episode:one"
+    assert raw.metadata["sender_id"] == "owner:1"
+    assert raw.metadata["sender_platform_account_key"] == "voice_live:owner:1"
+    assert raw.metadata["canonical_person_key"] == "ayer"
+    assert raw.metadata["identity_resolution_status"] == "resolved"
 
     restored = event_from_dict(event_to_dict(legacy))
     assert restored.raw_content == full_content
     assert restored.source_instance_id == "instance:voice"
     assert restored.correlation_id == "episode:one"
+    assert restored.sender_id == "owner:1"
+    assert restored.sender_platform_account_key == "voice_live:owner:1"
+    assert restored.canonical_person_key == "ayer"
+    assert restored.identity_resolution_status == "resolved"
 
 
 def test_corrupt_legacy_registry_is_preserved_and_blocks_empty_reset(

@@ -1,7 +1,7 @@
 # 平台适配器（Platform Adapters）
 
-> 文档状态：权威文档，与代码同步截至 2026-07-31。
-> 代码位置：`plugins/napcat_adapter/`（22 文件，5134 行）+ `plugins/feishu_adapter/`（6 文件，2166 行）+ `plugins/neko_surface/`（7 文件，1723 行）。
+> 文档状态：权威文档；有效性由当前契约测试与代码共同证明，不以日期或行数作为验收证据。
+> 代码位置：`plugins/napcat_adapter/`、`plugins/feishu_adapter/`、`plugins/neko_surface/`。
 > 本文是平台适配器层的权威文档；凡与本文冲突，以本文和当前代码为准。
 
 ---
@@ -16,9 +16,9 @@
 
 | 适配器 | 平台 | 协议 | 代码量 | 特点 |
 |--------|------|------|--------|------|
-| NapcatAdapter | QQ | OneBot 11 (WebSocket) | 5134 行 | 60+ API、群聊/私聊、文件/图片/语音 |
-| FeishuAdapter | 飞书 | REST + 事件订阅 | 2166 行 | 消息/群组/文件/通讯录 20 个操作 |
-| NekoSurfaceAdapter | N.E.K.O | 自定义 WebSocket | 1723 行 | 展示面协议、多客户端、背压控制 |
+| NapcatAdapter | QQ | OneBot 11 (WebSocket) | QQ 原生身份、群聊/私聊、文件/图片/语音 |
+| FeishuAdapter | 飞书 | REST + 事件订阅 | 确定性身份解析、消息/群组/文件/通讯录 |
+| NekoSurfaceAdapter | N.E.K.O | 自定义 WebSocket | 展示面协议、多客户端、背压控制 |
 
 ---
 
@@ -82,6 +82,14 @@
 | `features` | 功能开关（60+ 个 API 的细粒度控制） |
 | `events` | 事件过滤规则 |
 | `request_handling` | 好友/入群申请自动处理策略 |
+| `identity` | QQ 账号到跨平台人物键的显式映射 |
+
+### 2.5 心跳与恢复语义
+
+- OneBot 心跳事件到达本身证明 Elysium 与 NapCat 之间的 WebSocket 仍然存活。
+- `status.online` / `status.good` 是 NapCat 上报的 QQ 会话状态，不是传输层断线证明；单次或持续的 `online=false` 不得触发适配器重启。
+- 只有 OneBot 心跳超过三个上报周期仍未到达时，才允许重建连接；WebSocket 的 ping/pong 继续由传输层负责。
+- 反向 WebSocket 模式下，Elysium 拥有监听端口，NapCat 拥有客户端重连。没有客户端连接时重启监听器不能修复 QQ 会话，反而会与 NapCat 的重连竞争。
 
 ---
 
@@ -124,6 +132,21 @@
 | `bot` | 机器人名称、头像 |
 | `behavior` | 行为策略（自动回复、群聊规则） |
 | `identity` | 身份映射（飞书用户 ↔ 内部用户） |
+
+### 3.4 身份契约
+
+身份解析按以下确定性顺序执行：
+
+1. `user_name_aliases` 的精确账号映射；
+2. 飞书事件自带的可读姓名；
+3. 正缓存、通讯录 API、群成员 API；
+4. 身份未解析标签。
+
+第四步必须保留稳定的平台账号键，但不得把 `open_id` / `union_id` 当作人名，也不得根据话题、昵称相似度或旧记忆猜成某个已知人物。`canonical_identity_aliases` 只接受人工确认的账号归属，同一人物在 QQ 与飞书配置相同的 `canonical_person_key` 后，事件账本会同时保留平台账号、解析状态和跨平台人物键。
+
+昵称查询成功缓存与失败缓存分离：成功结果可长时间缓存，权限/网络失败默认只缓存 5 分钟。`/feishu/api/status` 的 `identity` 字段公开脱敏后的解析状态、成功/失败时间、负缓存数量和降级原因，不包含用户原文或完整账号 ID。
+
+自动解析群成员姓名至少需要飞书应用权限 `im:chat.members:read`，授权后必须发布新应用版本才会生效。权限缺失时可使用显式别名维持确定身份，但健康状态仍会报告 API 降级。
 
 ---
 
