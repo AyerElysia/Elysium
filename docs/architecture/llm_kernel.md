@@ -1,7 +1,7 @@
 # LLM 内核（LLM Kernel）
 
-> 文档状态：权威文档，与代码同步截至 2026-08-03。
-> 代码位置：`src/kernel/llm/`（6803 行，含 policy 子包）。
+> 文档状态：权威文档。
+> 代码位置：`src/kernel/llm/` 与 `src/kernel/config/models_loader.py`。
 > 本文是 LLM 基础设施的权威文档；凡与本文冲突，以本文和当前代码为准。
 
 ---
@@ -44,25 +44,19 @@ LLM 内核是所有模型调用的统一基础设施：负责模型注册与任�
 
 ## 2. 模型注册与任务路由
 
-### 2.1 双格式配置
+### 2.1 单一生产路由权威
 
-系统支持两种模型配置格式，新格式是运行时任务路由的第一权威：
+`config/models.toml` 是生产环境自动任务路由的唯一权威，定义 Provider、模型注册和每个任务的有序主备链。`config/models.toml.example` 是不含密钥的可提交基线。
 
-| 优先级 | 格式 | 文件 | 说明 |
-| --- | --- | --- | --- |
-| 1 | 新格式（LiteLLM 风格） | `config/models.toml` | 所有运行时模型、主备链、思考参数与任务预算 |
-| 2 | 统一配置 | `config/elysium.toml` | 桥接用 |
-| 3 | 老格式（兼容回退） | `config/model.toml` | 为旧调用者保留，不得覆写新格式注册表 |
-
-`config/models.toml.example` 是不含密钥的可提交基线。`init_model_config()` 只读取旧格式 `config/model.toml`；如果将新格式注册表误传给它，加载器会拒绝并保持原文件不变。
+旧 `config/model.toml` 只保留给显式迁移工具和独立旧 API，生产启动流程不再读取它；运行时组件、快捷 `chat()/stream()` 以及插件任务 API 全部直接使用 `models.toml`，不得在新注册表出错时静默切换到旧文件。缺文件、TOML 非法、未知字段、Provider/模型引用错误、重复候选、预算非法或缺少生产任务都会让启动显式失败。
 
 ### 2.2 解析链
 
 ```python
 def _resolve_model_set(routing_name: str) -> list[dict]:
-    # 1. models.toml → mc.get_task(routing_name)
-    # 2. elysium.toml → cfg.llm.routing[routing_name]
-    # 3. model.toml → ModelConfig.get_task(task_name)
+    # models.toml task → 按数组顺序返回主备链
+    # models.toml registered model → 返回单模型集合
+    # 未定义 → 显式失败，并报告安全的 snapshot digest
 ```
 
 ### 2.3 ModelEntry 结构
@@ -87,25 +81,35 @@ class ModelEntry(TypedDict):
     tool_call_compat: bool     # 工具调用兼容模式
     extra_params: dict         # 额外参数
     media_capabilities: dict   # 模态能力声明
+    routing_task: str          # 规范任务名（任务路由时存在）
+    routing_model_alias: str   # models.toml 中的模型键
+    routing_priority: int      # 原始任务数组下标
+    routing_snapshot: str      # 不含密钥的路由快照摘要
 ```
 
 ### 2.4 当前任务路由（models.toml）
 
 | 任务 | 输出预算 | 模型列表（按主备序） |
 | --- | ---: | --- |
-| core | 32000 | MiMo-V2.5-Pro, grok-4.5, gpt-5.6-sol, claude-sonnet-5, gpt-5.6-terra, MiMo-V2.5 |
-| expression | 32000 | MiMo-V2.5-Pro, gpt-5.6-terra, MiMo-V2.5, grok-4.5, gpt-5.6-sol, claude-sonnet-5, qwen3.7-plus, gemini-3.5-flash |
-| witness | 16000 | MiMo-V2.5, gpt-5.6-luna, deepseek-v4-flash, qwen3.7-plus |
-| agent | 32000 | gpt-5.6-luna, MiMo-V2.5, deepseek-v4-flash, qwen3.7-plus |
-| utility | 16000 | MiMo-V2.5, qwen3.7-plus, deepseek-v4-flash, gpt-5.6-luna |
-| vision | 16000 | MiMo-V2.5, gpt-5.6-luna, gemini-3.5-flash, gpt-5.6-sol |
+| core | 32000 | MiMo-V2.5-Pro, grok-4.5, claude-sonnet-5, MiMo-V2.5 |
+| expression | 32000 | MiMo-V2.5-Pro, MiMo-V2.5, grok-4.5, claude-sonnet-5, qwen3.7-plus, gemini-3.5-flash |
+| witness | 16000 | MiMo-V2.5, deepseek-v4-flash, qwen3.7-plus |
+| agent | 32000 | MiMo-V2.5, deepseek-v4-flash, qwen3.7-plus |
+| utility | 16000 | MiMo-V2.5, qwen3.7-plus, deepseek-v4-flash |
+| vision | 16000 | MiMo-V2.5, gemini-3.5-flash |
 | voice | 8192 | sensevoice-small（非生成型，该上限不用于思考） |
 | embedding | 8192 | bge-m3（非生成型，该上限不用于思考） |
-| router | 8192 | MiMo-V2.5, gpt-5.6-luna, deepseek-v4-flash, qwen3.7-plus（云端优先，保留思考） |
-| router_context_projection | 16000 | MiMo-V2.5, gpt-5.6-luna, deepseek-v4-flash, qwen3.7-plus（权威文件变化时生成派生投影） |
-| live | 32000 | MiMo-V2.5-Pro, gpt-5.6-terra, MiMo-V2.5, grok-4.5, gpt-5.6-sol, claude-sonnet-5 |
+| router | 8192 | MiMo-V2.5, deepseek-v4-flash, qwen3.7-plus（云端优先，保留思考） |
+| router_context_projection | 16000 | MiMo-V2.5, deepseek-v4-flash, qwen3.7-plus（权威文件变化时生成派生投影） |
+| live | 32000 | MiMo-V2.5-Pro, MiMo-V2.5, grok-4.5, claude-sonnet-5 |
 
 生成型任务的 `tokens` 同时覆盖隐式思考与最终正文；Router 因此不再使用 200 token 的紧缩上限。上下文压缩触发线是输入窗口策略，与输出思考预算分开配置。
+
+### 2.5 验证、原子发布与可观测性
+
+加载器先在局部变量中完成整份文件的结构和引用验证，全部通过后才原子替换全局注册表。显式重载失败时，上一代有效快照继续保留；启动阶段首次加载失败则终止启动，不存在部分路由。
+
+快照内部不可变，并生成只依赖已启用任务链、任务预算与温度、模型能力以及 Provider 重试策略的摘要；API Key、端点和未启用模型不进入摘要或路由日志。启动日志输出一次完整任务优先链。每个任务条目携带 `routing_task`、`routing_priority` 和 `routing_snapshot`，选择日志与训练轨迹因此能够回答“配置首选是谁、实际选择谁、哪些模型因冷却被跳过”。启动预检只检查快照中自动任务实际引用的 Provider，不再检查旧配置或未启用 Provider。
 
 ---
 
@@ -194,6 +198,10 @@ class PolicySession(Protocol):
 可恢复的网络错误、超时、限流与普通 HTTP 5xx 会按 `request_name + provider + endpoint + model` 进入跨请求冷却。首次冷却为 30 秒，连续失败按 30/60/120/240/300 秒渐进退避，成功探测后立即清零。这使本地中转站的短暂 503 不会造成五分钟假宕机，又不会在上游持续故障时高频重试。鉴权、配置等永久错误不进入冷却，每次请求都会明确暴露。
 
 本地 New API 返回结构化错误码 `system_cpu_overloaded`、`system_memory_overloaded` 或 `system_disk_overloaded` 时，故障范围是整个 `provider + endpoint`，不是某个模型。策略会对该网关建立跨 `request_name` 冷却，跳过所有仍指向同一中转端点的候选；只有配置了不同端点时才继续故障转移。原始状态码和错误码继续向上保留，周期任务据此延迟重试，不把暂时过载伪装成空结果。
+
+正常请求仍从任务数组第一个模型开始。若前置模型处于冷却期，策略按原顺序选择第一个可用候选，并在 INFO 日志中记录任务、快照摘要、配置首选、实际选择、原始优先级和被跳过模型；无跳过的普通选择只记录 DEBUG。所有候选冷却异常同样携带任务与快照摘要，因此“没有从第一模型开始”始终可以追溯到具体路由代次和健康状态。
+
+Conversation Router 的 `router → agent` 技术降级保留任务身份，但传输失败后不会再次请求 Provider、端点和模型 ID 都相同的候选。备用任务只有包含新的传输候选时才继续；如果前一任务只是返回空正文或非法决策结构而非传输失败，仍允许使用备用任务的不同预算重新判断。
 
 开发测试与运行系统可能共处同一台 WSL 主机。默认 pytest worker 固定为 2，避免 `-n auto` 占满全部 CPU 并触发 New API 的资源保护；独立 CI 如需更高并行度可以在命令行显式覆盖。
 

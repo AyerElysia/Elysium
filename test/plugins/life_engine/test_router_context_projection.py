@@ -34,9 +34,7 @@ class _Response:
 class _Request:
     def __init__(self, response: _Response) -> None:
         self.response = response
-        self.model_set = [
-            {"model_identifier": "cloud-test", "max_context": 100_000}
-        ]
+        self.model_set = [{"model_identifier": "cloud-test", "max_context": 100_000}]
         self.payloads: list[object] = []
 
     def add_payload(self, payload: object) -> None:
@@ -127,9 +125,7 @@ async def test_router_rejects_string_boolean_and_uses_fallback() -> None:
             "router": _Response(
                 '{"reason":"not a real bool","should_respond":"false"}'
             ),
-            "agent": _Response(
-                '{"reason":"hand to expression","should_respond":true}'
-            ),
+            "agent": _Response('{"reason":"hand to expression","should_respond":true}'),
         }
     )
 
@@ -172,6 +168,126 @@ async def test_router_exhaustion_preserves_message_for_subject() -> None:
 
     assert result["should_respond"] is True
     assert "主体判断" in result["reason"]
+
+
+@pytest.mark.asyncio
+async def test_router_skips_duplicate_transport_fallback_chain() -> None:
+    sends: list[tuple[str, list[str]]] = []
+    info_logs: list[str] = []
+
+    class TransportRequest(_Request):
+        def __init__(self, task: str) -> None:
+            super().__init__(_Response(""))
+            self.task = task
+            self.model_set = [
+                {
+                    "api_provider": "gateway",
+                    "base_url": "http://127.0.0.1:3000/v1",
+                    "model_identifier": "same-model",
+                    "max_context": 100_000,
+                }
+            ]
+
+        async def send(self, *, stream: bool = False) -> _Response:
+            sends.append(
+                (
+                    self.task,
+                    [str(model["model_identifier"]) for model in self.model_set],
+                )
+            )
+            raise RuntimeError("gateway unavailable")
+
+    class TransportChatter:
+        def create_request(
+            self,
+            task: str = "expression",
+            sub_task: str = "",
+            *,
+            with_reminder: str = "",
+        ) -> TransportRequest:
+            del sub_task, with_reminder
+            return TransportRequest(task)
+
+    result = await router.route_should_respond(
+        chatter=TransportChatter(),
+        logger=SimpleNamespace(
+            debug=lambda *_: None,
+            info=lambda message: info_logs.append(str(message)),
+            warning=lambda *_: None,
+            error=lambda *_: None,
+        ),
+        unreads_text="new message",
+        chat_stream=_stream(),
+    )
+
+    assert result["should_respond"] is True
+    assert sends == [("router", ["same-model"])]
+    assert any("传输候选完全重复" in message for message in info_logs)
+
+
+@pytest.mark.asyncio
+async def test_router_fallback_keeps_only_new_transport_candidates() -> None:
+    sends: list[tuple[str, list[str]]] = []
+
+    def model(identifier: str) -> dict[str, object]:
+        return {
+            "api_provider": "gateway",
+            "base_url": "http://127.0.0.1:3000/v1",
+            "model_identifier": identifier,
+            "max_context": 100_000,
+        }
+
+    class TransportRequest(_Request):
+        def __init__(self, task: str) -> None:
+            super().__init__(
+                _Response('{"reason":"new backup","should_respond":false}')
+            )
+            self.task = task
+            self.model_set = (
+                [model("failed")]
+                if task == "router"
+                else [model("failed"), model("new-backup")]
+            )
+
+        async def send(self, *, stream: bool = False) -> _Response:
+            sends.append(
+                (
+                    self.task,
+                    [str(item["model_identifier"]) for item in self.model_set],
+                )
+            )
+            if self.task == "router":
+                raise RuntimeError("gateway unavailable")
+            return self.response
+
+    class TransportChatter:
+        def create_request(
+            self,
+            task: str = "expression",
+            sub_task: str = "",
+            *,
+            with_reminder: str = "",
+        ) -> TransportRequest:
+            del sub_task, with_reminder
+            return TransportRequest(task)
+
+    result = await router.route_should_respond(
+        chatter=TransportChatter(),
+        logger=SimpleNamespace(
+            debug=lambda *_: None,
+            info=lambda *_: None,
+            warning=lambda *_: None,
+            error=lambda *_: None,
+        ),
+        unreads_text="new message",
+        chat_stream=_stream(),
+    )
+
+    assert result["should_respond"] is False
+    assert sends == [
+        ("router", ["failed"]),
+        ("agent", ["new-backup"]),
+    ]
 
 
 def _write_sources(workspace: Path, *, user: str = "USER v1") -> None:

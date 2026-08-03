@@ -36,7 +36,9 @@ class LLMResponseConsumedError(LLMError):
 class LLMRateLimitError(LLMError):
     """速率限制错误。"""
 
-    def __init__(self, message: str, retry_after: float | None = None, model: str | None = None):
+    def __init__(
+        self, message: str, retry_after: float | None = None, model: str | None = None
+    ):
         super().__init__(message)
         self.retry_after = retry_after
         self.model = model
@@ -45,7 +47,9 @@ class LLMRateLimitError(LLMError):
 class LLMTimeoutError(LLMError):
     """超时错误。"""
 
-    def __init__(self, message: str, timeout: float | None = None, model: str | None = None):
+    def __init__(
+        self, message: str, timeout: float | None = None, model: str | None = None
+    ):
         super().__init__(message)
         self.timeout = timeout
         self.model = model
@@ -54,7 +58,9 @@ class LLMTimeoutError(LLMError):
 class LLMContentFilterError(LLMError):
     """内容过滤错误（内容违反安全策略）。"""
 
-    def __init__(self, message: str, filter_type: str | None = None, model: str | None = None):
+    def __init__(
+        self, message: str, filter_type: str | None = None, model: str | None = None
+    ):
         super().__init__(message)
         self.filter_type = filter_type
         self.model = model
@@ -63,7 +69,13 @@ class LLMContentFilterError(LLMError):
 class LLMTokenLimitError(LLMError):
     """Token 超限错误。"""
 
-    def __init__(self, message: str, max_tokens: int | None = None, requested_tokens: int | None = None, model: str | None = None):
+    def __init__(
+        self,
+        message: str,
+        max_tokens: int | None = None,
+        requested_tokens: int | None = None,
+        model: str | None = None,
+    ):
         super().__init__(message)
         self.max_tokens = max_tokens
         self.requested_tokens = requested_tokens
@@ -105,13 +117,24 @@ class LLMModelsCoolingDownError(LLMError):
         request_name: str,
         retry_after: float,
         models: tuple[str, ...] = (),
+        routing_task: str = "",
+        routing_snapshot: str = "",
     ) -> None:
         self.request_name = request_name or "__default__"
         self.retry_after = max(1.0, float(retry_after))
         self.models = models
+        self.routing_task = routing_task
+        self.routing_snapshot = routing_snapshot
+        route_context = ""
+        if routing_task or routing_snapshot:
+            route_context = (
+                f", routing_task={routing_task or '<direct>'}, "
+                f"snapshot={routing_snapshot or '<none>'}"
+            )
         super().__init__(
             "all candidate models are cooling down: "
             f"request={self.request_name}, retry_after={self.retry_after:.1f}s"
+            f"{route_context}"
         )
 
 
@@ -223,7 +246,11 @@ def classify_exception(error: BaseException, model: str | None = None) -> BaseEx
 
         if isinstance(error, BadRequestError):
             # 检查是否是 token 限制
-            if "maximum context length" in error_msg or "token" in error_msg and "limit" in error_msg:
+            if (
+                "maximum context length" in error_msg
+                or "token" in error_msg
+                and "limit" in error_msg
+            ):
                 return LLMTokenLimitError(str(error), model=model)
             # 检查是否是内容过滤
             if "content_filter" in error_msg or "content policy" in error_msg:
@@ -232,7 +259,9 @@ def classify_exception(error: BaseException, model: str | None = None) -> BaseEx
         if isinstance(error, APIError):
             status_code = getattr(error, "status_code", None)
             error_code = getattr(error, "code", None)
-            return LLMAPIError(str(error), status_code=status_code, error_code=error_code, model=model)
+            return LLMAPIError(
+                str(error), status_code=status_code, error_code=error_code, model=model
+            )
 
     except ImportError:
         pass
@@ -269,16 +298,29 @@ def classify_exception(error: BaseException, model: str | None = None) -> BaseEx
             return LLMAuthenticationError(str(error), model=model)
 
         if isinstance(error, AnthropicBadRequestError):
-            if "maximum context length" in error_msg or "token" in error_msg and "limit" in error_msg:
+            if (
+                "maximum context length" in error_msg
+                or "token" in error_msg
+                and "limit" in error_msg
+            ):
                 return LLMTokenLimitError(str(error), model=model)
-            if "content" in error_msg and ("filter" in error_msg or "policy" in error_msg):
+            if "content" in error_msg and (
+                "filter" in error_msg or "policy" in error_msg
+            ):
                 return LLMContentFilterError(str(error), model=model)
 
         for error_type in (AnthropicAPIStatusError, AnthropicAPIError):
             if isinstance(error, error_type):
                 status_code = getattr(error, "status_code", None)
-                error_code = getattr(error, "type", None) or getattr(error, "error_code", None)
-                return LLMAPIError(str(error), status_code=status_code, error_code=error_code, model=model)
+                error_code = getattr(error, "type", None) or getattr(
+                    error, "error_code", None
+                )
+                return LLMAPIError(
+                    str(error),
+                    status_code=status_code,
+                    error_code=error_code,
+                    model=model,
+                )
 
     except ImportError:
         pass
@@ -290,7 +332,11 @@ def classify_exception(error: BaseException, model: str | None = None) -> BaseEx
     if "timeout" in error_msg or "timed out" in error_msg:
         return LLMTimeoutError(str(error), model=model)
 
-    if "authentication" in error_msg or "unauthorized" in error_msg or "api key" in error_msg:
+    if (
+        "authentication" in error_msg
+        or "unauthorized" in error_msg
+        or "api key" in error_msg
+    ):
         return LLMAuthenticationError(str(error), model=model)
 
     if "token" in error_msg and "limit" in error_msg:

@@ -1,4 +1,3 @@
-
 import pytest
 
 from src.kernel.llm.exceptions import LLMAPIError, LLMModelsCoolingDownError
@@ -60,7 +59,9 @@ async def test_retry_is_driven_by_policy_switch_or_retry():
     model_set = [_model("a", max_retry=0), _model("b", max_retry=0)]
 
     dummy = DummyClient()
-    req = LLMRequest(model_set, request_name="req", clients=ModelClientRegistry(openai=dummy))
+    req = LLMRequest(
+        model_set, request_name="req", clients=ModelClientRegistry(openai=dummy)
+    )
 
     resp = await req.send(stream=False)
     assert resp.message == "ok"
@@ -123,6 +124,78 @@ async def test_transient_failure_cools_model_for_matching_future_requests():
         ("life_memory_witness", "a"),
         ("life_memory_witness", "b"),
     ]
+
+
+async def test_cooldown_skip_logs_authoritative_route_context(monkeypatch):
+    """A skipped primary must be explainable without exposing credentials."""
+
+    model_set = [
+        {
+            **_model("a", max_retry=0),
+            "routing_task": "expression",
+            "routing_model_alias": "primary",
+            "routing_priority": 0,
+            "routing_snapshot": "snapshot-1234",
+        },
+        {
+            **_model("b", max_retry=0),
+            "routing_task": "expression",
+            "routing_model_alias": "backup",
+            "routing_priority": 1,
+            "routing_snapshot": "snapshot-1234",
+        },
+    ]
+
+    class CoolingClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def create(
+            self,
+            *,
+            model_name: str,
+            payloads,
+            tools,
+            request_name: str,
+            model_set,
+            stream: bool,
+        ):
+            self.calls.append(model_name)
+            if model_name == "a":
+                raise LLMAPIError("upstream unavailable", status_code=500)
+            return "ok", [], None
+
+    info_logs: list[str] = []
+    monkeypatch.setattr(
+        "src.kernel.llm.request.logger.info",
+        lambda message: info_logs.append(str(message)),
+    )
+    client = CoolingClient()
+    clients = ModelClientRegistry(openai=client)
+    first = LLMRequest(
+        model_set,
+        request_name="life_chatter",
+        clients=clients,
+        policy=FailoverPolicy(),
+    )
+    second = LLMRequest(
+        model_set,
+        request_name="life_chatter",
+        clients=clients,
+        policy=FailoverPolicy(),
+    )
+
+    assert (await first.send(stream=False)).message == "ok"
+    assert (await second.send(stream=False)).message == "ok"
+    assert client.calls == ["a", "b", "b"]
+    assert any(
+        "configured_primary=a" in message
+        and "selected=b" in message
+        and "configured_priority=1" in message
+        and "snapshot=snapshot-1234" in message
+        and "skipped=['a']" in message
+        for message in info_logs
+    )
 
 
 async def test_gateway_resource_overload_skips_models_on_same_endpoint():
@@ -268,7 +341,18 @@ async def test_permanent_failure_does_not_enter_transient_cooldown():
 async def test_all_cooling_models_are_not_probed_before_expiry():
     """A fully failed chain must not be hammered by each new request."""
 
-    model_set = [_model("a", max_retry=0), _model("b", max_retry=0)]
+    model_set = [
+        {
+            **_model("a", max_retry=0),
+            "routing_task": "witness",
+            "routing_snapshot": "snapshot-cooling",
+        },
+        {
+            **_model("b", max_retry=0),
+            "routing_task": "witness",
+            "routing_snapshot": "snapshot-cooling",
+        },
+    ]
 
     class FailingClient:
         def __init__(self) -> None:
@@ -309,6 +393,9 @@ async def test_all_cooling_models_are_not_probed_before_expiry():
         await second.send(stream=False)
 
     assert 29 < exc_info.value.retry_after <= 30
+    assert exc_info.value.routing_task == "witness"
+    assert exc_info.value.routing_snapshot == "snapshot-cooling"
+    assert "snapshot=snapshot-cooling" in str(exc_info.value)
     assert client.calls == ["a", "b"]
 
 
@@ -379,7 +466,9 @@ async def test_forced_stream_collection_error_is_retried_inside_request():
             return "ok", [], None
 
     dummy = DummyClient()
-    req = LLMRequest(model_set, request_name="req", clients=ModelClientRegistry(openai=dummy))
+    req = LLMRequest(
+        model_set, request_name="req", clients=ModelClientRegistry(openai=dummy)
+    )
 
     resp = await req.send(stream=False)
 
@@ -408,7 +497,9 @@ async def test_forced_stream_precollection_keeps_response_awaitable():
             assert stream is True
             return None, None, stream_ok()
 
-    req = LLMRequest(model_set, request_name="req", clients=ModelClientRegistry(openai=DummyClient()))
+    req = LLMRequest(
+        model_set, request_name="req", clients=ModelClientRegistry(openai=DummyClient())
+    )
     req.add_payload(LLMPayload(ROLE.USER, Text("hello")))
 
     resp = await req.send(stream=False)
@@ -439,7 +530,9 @@ async def test_retry_skips_permanent_404_and_switches_model():
             return "ok", [], None
 
     dummy = DummyClient()
-    req = LLMRequest(model_set, request_name="req", clients=ModelClientRegistry(openai=dummy))
+    req = LLMRequest(
+        model_set, request_name="req", clients=ModelClientRegistry(openai=dummy)
+    )
 
     resp = await req.send(stream=False)
     assert resp.message == "ok"

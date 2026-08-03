@@ -4,7 +4,7 @@
 """
 
 from enum import Enum
-from typing import Any, TypeAlias, TypedDict
+from typing import Any, NotRequired, TypeAlias, TypedDict
 
 
 class RedactedSecret(str):
@@ -31,9 +31,10 @@ class RequestType(str, Enum):
 
 class ModelEntry(TypedDict, total=True):
     """模型配置条目
-    
+
     定义单个 LLM 模型的完整配置信息。
     """
+
     api_provider: str
     base_url: str
     model_identifier: str
@@ -50,6 +51,11 @@ class ModelEntry(TypedDict, total=True):
     tool_call_compat: bool
     extra_params: dict[str, Any]
     media_capabilities: dict[str, Any]
+    force_stream_mode: NotRequired[bool]
+    routing_task: NotRequired[str]
+    routing_model_alias: NotRequired[str]
+    routing_priority: NotRequired[int]
+    routing_snapshot: NotRequired[str]
 
 
 # 模型集合类型：一组可用的模型配置

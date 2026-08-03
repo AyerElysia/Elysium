@@ -18,8 +18,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Self
 
-from src.kernel.logger import get_logger
 from src.kernel.llm.payload.tooling import LLMUsable
+from src.kernel.logger import get_logger
 
 from .context import LLMContextManager
 from .exceptions import (
@@ -50,6 +50,7 @@ from .policy import create_default_policy
 from .policy.base import Policy
 from .response import LLMResponse
 from .roles import ROLE
+from .token_counter import count_payload_tokens
 from .trajectory_collector import record_trajectory
 from .trajectory_types import (
     derive_task_tags,
@@ -58,8 +59,6 @@ from .trajectory_types import (
     utc_timestamp,
 )
 from .types import ModelEntry, ModelSet, RequestType, redact_secret
-from .token_counter import count_payload_tokens
-
 
 logger = get_logger("kernel.llm.request", display="LLM 请求")
 
@@ -311,7 +310,12 @@ def _split_reasoning_result(
 ) -> tuple[str | None, list[ReasoningText] | None]:
     """将 provider 返回的 reasoning 结果拆分为文本摘要和结构化 block。"""
     if isinstance(reasoning_result, list):
-        text = "".join(part.text for part in reasoning_result if isinstance(part.text, str)) or None
+        text = (
+            "".join(
+                part.text for part in reasoning_result if isinstance(part.text, str)
+            )
+            or None
+        )
         return text, reasoning_result
     return reasoning_result, None
 
@@ -452,7 +456,7 @@ class LLMRequest:
         """
         if not self.context_manager:
             return payloads
-        
+
         budget = self._compute_context_compression_trigger(model)
         model_identifier = model.get("model_identifier")
 
@@ -521,7 +525,12 @@ class LLMRequest:
 
         # Caller-supplied metadata is sanitized by the collector before persistence.
         request_metadata = dict(self.trajectory_metadata or {})
-        request_metadata.setdefault("request_type", self.request_type.value if hasattr(self.request_type, "value") else str(self.request_type))
+        request_metadata.setdefault(
+            "request_type",
+            self.request_type.value
+            if hasattr(self.request_type, "value")
+            else str(self.request_type),
+        )
 
         def record_attempt(
             *,
@@ -625,6 +634,33 @@ class LLMRequest:
         last_error: BaseException | None = None
         retry_count = 0
         step = session.first()
+        if step.model is not None:
+            selected_model = str(step.model.get("model_identifier") or "<unknown>")
+            configured_primary = str(
+                model_set[0].get("model_identifier") or "<unknown>"
+            )
+            skipped_cooling = tuple(
+                str(item) for item in step.meta.get("cooldown_skipped", ())
+            )
+            route_context = (
+                f"task={step.meta.get('routing_task') or '<direct>'}, "
+                f"snapshot={step.meta.get('routing_snapshot') or '<none>'}, "
+                f"configured_primary={configured_primary}, "
+                f"selected={selected_model}, "
+                f"configured_priority={step.meta.get('routing_priority', 0)}"
+            )
+            if skipped_cooling:
+                logger.info(
+                    "LLM 路由已跳过冷却模型: "
+                    f"request={self.request_name or '__default__'}, "
+                    f"{route_context}, skipped={list(skipped_cooling)}"
+                )
+            else:
+                logger.debug(
+                    "LLM 路由已选择: "
+                    f"request={self.request_name or '__default__'}, "
+                    f"{route_context}"
+                )
 
         # 循环直到找到可用模型或耗尽重试机会
         while step.model is not None:
@@ -676,16 +712,26 @@ class LLMRequest:
                         isinstance(timeout_seconds, (int, float))
                         and timeout_seconds > 0
                     ):
-                        message, tool_calls, stream_iter, reasoning_content, request_record_id = _normalize_client_create_result(
+                        (
+                            message,
+                            tool_calls,
+                            stream_iter,
+                            reasoning_content,
+                            request_record_id,
+                        ) = _normalize_client_create_result(
                             await asyncio.wait_for(
                                 create_task,
                                 timeout=float(timeout_seconds),
                             )
                         )
                     else:
-                        message, tool_calls, stream_iter, reasoning_content, request_record_id = _normalize_client_create_result(
-                            await create_task
-                        )
+                        (
+                            message,
+                            tool_calls,
+                            stream_iter,
+                            reasoning_content,
+                            request_record_id,
+                        ) = _normalize_client_create_result(await create_task)
 
                 provider_usage: dict[str, Any] = {}
                 pop_last_usage = getattr(client, "pop_last_usage", None)
@@ -697,7 +743,9 @@ class LLMRequest:
                     except Exception:
                         provider_usage = {}
 
-                reasoning_text, reasoning_parts = _split_reasoning_result(reasoning_content)
+                reasoning_text, reasoning_parts = _split_reasoning_result(
+                    reasoning_content
+                )
 
                 resp = LLMResponse(
                     _stream=stream_iter,
@@ -753,9 +801,13 @@ class LLMRequest:
                     if provider_usage:
                         metrics_extra["provider_usage"] = provider_usage
                         if "cache_read_input_tokens" in provider_usage:
-                            metrics_extra["cache_read_input_tokens"] = provider_usage["cache_read_input_tokens"]
+                            metrics_extra["cache_read_input_tokens"] = provider_usage[
+                                "cache_read_input_tokens"
+                            ]
                         if "cache_creation_input_tokens" in provider_usage:
-                            metrics_extra["cache_creation_input_tokens"] = provider_usage["cache_creation_input_tokens"]
+                            metrics_extra["cache_creation_input_tokens"] = (
+                                provider_usage["cache_creation_input_tokens"]
+                            )
 
                     metrics = RequestMetrics(
                         model_name=model_identifier,
@@ -837,11 +889,21 @@ class LLMRequest:
                         exc_info=True,
                     )
                 elif (
-                    isinstance(classified_error, (LLMTimeoutError, LLMRateLimitError, TimeoutError))
+                    isinstance(
+                        classified_error,
+                        (LLMTimeoutError, LLMRateLimitError, TimeoutError),
+                    )
                     or _5xx_status_code is not None
-                    or (isinstance(classified_error, LLMAPIError) and classified_error.status_code is None)
+                    or (
+                        isinstance(classified_error, LLMAPIError)
+                        and classified_error.status_code is None
+                    )
                 ):
-                    _status_hint = f", status_code={_5xx_status_code}" if _5xx_status_code is not None else ""
+                    _status_hint = (
+                        f", status_code={_5xx_status_code}"
+                        if _5xx_status_code is not None
+                        else ""
+                    )
                     logger.warning(
                         f"LLM 请求暂时失败: model={model_identifier}, "
                         f"request={self.request_name or '__default__'}, error_type={_err_type}{_status_hint}"
@@ -906,12 +968,17 @@ class LLMRequest:
                     next_model_identifier = next_step.model.get("model_identifier")
                     next_model_name = (
                         next_model_identifier
-                        if isinstance(next_model_identifier, str) and next_model_identifier
+                        if isinstance(next_model_identifier, str)
+                        and next_model_identifier
                         else "<unknown>"
                     )
                     logger.warning(
                         f"LLM 请求将进行下一步重试: request={self.request_name or '__default__'}, "
                         f"retry_count={retry_count}, next_model={next_model_name}, "
+                        f"configured_priority={next_step.meta.get('routing_priority', 0)}, "
+                        f"routing_task={next_step.meta.get('routing_task') or '<direct>'}, "
+                        f"snapshot={next_step.meta.get('routing_snapshot') or '<none>'}, "
+                        f"skipped_cooling={list(next_step.meta.get('cooldown_skipped', ()))}, "
                         f"delay_seconds={float(next_step.delay_seconds):.2f}"
                     )
 
@@ -921,6 +988,7 @@ class LLMRequest:
             raise step.error
         assert last_error is not None
         raise last_error
+
 
 def _validate_model_entry(model: dict[str, Any]) -> ModelEntry:
     """验证模型配置项的完整性和正确性，返回一个标准化的 ModelEntry 对象。"""
@@ -956,7 +1024,10 @@ def _validate_model_entry(model: dict[str, Any]) -> ModelEntry:
         model.get("force_stream_mode"), bool
     ):
         raise LLMConfigurationError("model.force_stream_mode 必须是 bool")
-    if not isinstance(model.get("max_context"), int) or model.get("max_context", 0) <= 0:
+    if (
+        not isinstance(model.get("max_context"), int)
+        or model.get("max_context", 0) <= 0
+    ):
         raise LLMConfigurationError("model.max_context 必须是正整数")
 
     extra_params = model.get("extra_params", {})

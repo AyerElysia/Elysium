@@ -10,6 +10,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.types import TaskType
+from src.core.utils.llm_tool_call import (
+    exec_llm_usable,
+    run_tool_call,
+)
+from src.kernel.config.models_loader import get_models_config
 from src.kernel.llm import (
     EmbeddingRequest,
     LLMContextManager,
@@ -18,11 +23,6 @@ from src.kernel.llm import (
     ModelSet,
     RerankRequest,
     ToolRegistry,
-)
-from src.core.config import get_model_config
-from src.core.utils.llm_tool_call import (
-    exec_llm_usable,
-    run_tool_call,
 )
 
 __all__ = [
@@ -65,7 +65,9 @@ def create_llm_request(
     )
 
     if with_reminder is not None and request.context_manager is not None:
-        request.context_manager.reminder_bucket(str(with_reminder), wrap_with_system_tag=True)
+        request.context_manager.reminder_bucket(
+            str(with_reminder), wrap_with_system_tag=True
+        )
 
     return request
 
@@ -119,6 +121,7 @@ def create_rerank_request(
         top_n=top_n,
     )
 
+
 def get_model_set_by_task(name: str) -> ModelSet:
     """根据任务名称获取 ModelSet
 
@@ -128,7 +131,7 @@ def get_model_set_by_task(name: str) -> ModelSet:
     Returns:
         ModelSet 实例
     """
-    return get_model_config().get_task(name)
+    return get_models_config().get_task(name)
 
 
 def get_model_set_by_name(
@@ -138,34 +141,39 @@ def get_model_set_by_name(
     max_tokens: int | None = None,
 ) -> ModelSet:
     """根据模型名称获取 ModelSet
-    
+
     通过模型内部标识符直接获取可用于 LLMRequest 的 ModelSet，
     无需预先配置任务。所有参数都是可选的，None 时使用合理的默认值。
-    
+
     Args:
-        model_name: 模型名称（config/model.toml 中 models 列表里的 name）
+        model_name: 模型名称（config/models.toml 中 [models] 的键）
         temperature: 温度参数，None 时使用默认值 0.7
         max_tokens: 最大输出 token 数，None 时使用默认值 800
-        
+
     Returns:
         ModelSet: 包含单个模型配置的列表
-        
+
     Raises:
         KeyError: 如果模型或其提供商未找到
-        
+
     Examples:
         ```python
         from src.app.plugin_system.api import llm_api
-        
+
         model_set = llm_api.get_model_set_by_name("gpt-4")
         request = llm_api.create_llm_request(model_set, request_name="chat")
         ```
     """
-    return get_model_config().get_model_set_by_name(
+    from src.kernel.config.models_loader import get_models_config
+
+    model = get_models_config().get_model_entry(
         model_name,
         temperature=temperature,
         max_tokens=max_tokens,
     )
+    if model is None:
+        raise KeyError(f"模型 '{model_name}' 未在 config/models.toml 中注册")
+    return [model]
 
 
 def create_tool_registry(tools: list[type[LLMUsable]] | None = None) -> ToolRegistry:

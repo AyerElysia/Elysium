@@ -72,6 +72,18 @@ def _safe_count_tokens(text: str, model_identifier: str) -> int:
         return 0
 
 
+def _transport_candidate_key(model: object) -> tuple[str, str, str] | None:
+    """Return a stable transport identity without exposing it to logs."""
+
+    if not isinstance(model, dict):
+        return None
+    return (
+        str(model.get("api_provider") or "").strip().lower(),
+        str(model.get("base_url") or "").strip().rstrip("/").lower(),
+        str(model.get("model_identifier") or "").strip(),
+    )
+
+
 def _trim_text_suffix_by_budget(
     text: str,
     model_identifier: str,
@@ -260,6 +272,7 @@ async def route_should_respond(
         logger.debug("Router 熔断器打开，暂时跳过专用 router 任务")
 
     last_error = "没有可用任务"
+    transport_failed_candidates: set[tuple[str, str, str]] = set()
     for task in tasks_to_try:
         try:
             request = chatter.create_request(
@@ -275,6 +288,25 @@ async def route_should_respond(
             last_error = f"{task} 没有可用模型"
             continue
 
+        configured_models = list(request.model_set)
+        if transport_failed_candidates:
+            unseen_models = [
+                model
+                for model in configured_models
+                if _transport_candidate_key(model) not in transport_failed_candidates
+            ]
+            if not unseen_models:
+                last_error = f"{task} 没有新增传输候选模型"
+                logger.info(
+                    f"Router[{task}] 与已失败任务的传输候选完全重复，跳过无效备用链"
+                )
+                continue
+            request.model_set = unseen_models
+            logger.info(
+                f"Router[{task}] 已剔除上一任务中失败的重复传输候选: "
+                f"configured={len(configured_models)}, unseen={len(unseen_models)}"
+            )
+
         fitted_unreads = _fit_unreads_to_budget(request, unreads_text)
         if len(fitted_unreads) < len(unreads_text):
             logger.info(
@@ -284,16 +316,16 @@ async def route_should_respond(
 
         user_parts: list[str] = []
         if fitted_history:
-            user_parts.append(
-                f"<chat_history>\n{fitted_history}\n</chat_history>"
-            )
+            user_parts.append(f"<chat_history>\n{fitted_history}\n</chat_history>")
         user_parts.append(f"<new_messages>\n{fitted_unreads}\n</new_messages>")
         user_parts.append("只判断是否把这批新消息交给表达层继续处理。")
 
         request.add_payload(
             LLMPayload(
                 ROLE.SYSTEM,
-                Text(_fit_system_prompt_to_budget(system_prompt, request, logger, task)),
+                Text(
+                    _fit_system_prompt_to_budget(system_prompt, request, logger, task)
+                ),
             )
         )
         request.add_payload(LLMPayload(ROLE.USER, Text("\n\n".join(user_parts))))
@@ -303,6 +335,11 @@ async def route_should_respond(
             awaited_text = await response
         except Exception as exc:  # noqa: BLE001
             last_error = f"{task} 调用失败: {exc}"
+            transport_failed_candidates.update(
+                candidate
+                for model in request.model_set
+                if (candidate := _transport_candidate_key(model)) is not None
+            )
             logger.warning(f"Router {last_error}，尝试下一个云端任务")
             if task == "router":
                 _circuit_record_failure()
@@ -311,9 +348,7 @@ async def route_should_respond(
         content = str(response.message or awaited_text or "").strip()
         if not content:
             last_error = f"{task} 返回空正文"
-            logger.warning(
-                f"Router[{task}] 返回空正文，尝试下一个云端任务"
-            )
+            logger.warning(f"Router[{task}] 返回空正文，尝试下一个云端任务")
             if task == "router":
                 _circuit_record_failure()
             continue
@@ -326,16 +361,12 @@ async def route_should_respond(
 
         last_error = f"{task} 返回的决策结构无效"
         logger.warning(
-            f"Router[{task}] 没有有效决策 JSON，尝试下一个云端任务: "
-            f"{content[:200]}..."
+            f"Router[{task}] 没有有效决策 JSON，尝试下一个云端任务: {content[:200]}..."
         )
         if task == "router":
             _circuit_record_failure()
 
-    logger.error(
-        f"Router 所有任务均不可用: {last_error}；"
-        "保留消息并交给主体判断"
-    )
+    logger.error(f"Router 所有任务均不可用: {last_error}；保留消息并交给主体判断")
     return {
         "should_respond": True,
         "reason": f"Router 降级：{last_error}；消息已保留并交给主体判断",

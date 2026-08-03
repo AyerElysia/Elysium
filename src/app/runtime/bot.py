@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import socket
-import tomllib
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from src.kernel.scheduler import UnifiedScheduler
     from src.kernel.storage import JSONStore
     from src.kernel.vector_db import VectorDBBase
+
 
 class Bot:
     """Elysium Bot 主类
@@ -131,9 +132,6 @@ class Bot:
             # 显示启动横幅（在进度条之前）
             self.ui.show_banner(self.bot_version, self.bot_name)
 
-            # 启动前优化 async 连接池/DNS 行为
-            await self._optimize_async_network_runtime()
-
             # 单一总体进度条贯穿全部初始化阶段
             with self.ui.startup_progress(total_steps=15):
                 # Phase 1: Kernel 初始化
@@ -171,9 +169,7 @@ class Bot:
                     f"Elysium 已苏醒，加载了 {loaded}/{total} 个插件（{failed} 个失败）"
                 )
             else:
-                self.ui.display_success(
-                    f"Elysium 已苏醒 ({total} 个插件)"
-                )
+                self.ui.display_success(f"Elysium 已苏醒 ({total} 个插件)")
 
         except Exception as e:
             self.ui.display_error(f"Initialization failed: {e}", e)
@@ -212,8 +208,14 @@ class Bot:
         self._patched_getaddrinfo = _patched_getaddrinfo
         self._patched_getnameinfo = _patched_getnameinfo
 
-        # 预解析 provider 域名，减少首包抖动
-        targets = self._extract_provider_hosts_from_model_config("config/model.toml")
+        # 只预解析权威快照实际启用的 provider，减少首包抖动。
+        from src.kernel.config.models_loader import get_models_config
+
+        registry = get_models_config()
+        targets = self._extract_active_provider_hosts(
+            registry.providers,
+            registry.snapshot.active_providers,
+        )
         if not targets:
             return
 
@@ -254,24 +256,16 @@ class Bot:
         self._patched_getnameinfo = None
 
     @staticmethod
-    def _extract_provider_hosts_from_model_config(
-        model_config_path: str,
+    def _extract_active_provider_hosts(
+        providers: Mapping[str, Mapping[str, object]],
+        active_providers: tuple[str, ...],
     ) -> list[tuple[str, int]]:
-        """从模型配置提取 provider 的 (host, port) 列表。"""
-        try:
-            with open(model_config_path, "rb") as f:
-                config = tomllib.load(f)
-        except Exception:
-            return []
-
-        providers = config.get("api_providers", [])
-        if not isinstance(providers, list):
-            return []
-
+        """从已验证快照提取活动 provider 的 (host, port) 列表。"""
         out: list[tuple[str, int]] = []
         seen: set[tuple[str, int]] = set()
-        for item in providers:
-            if not isinstance(item, dict):
+        for provider_name in active_providers:
+            item = providers.get(provider_name)
+            if item is None:
                 continue
             base_url = item.get("base_url")
             if not isinstance(base_url, str) or not base_url:
@@ -314,7 +308,7 @@ class Bot:
         self.ui.update_phase_status("内核", "初始化中...")
 
         # Step 1: Config
-        from src.core.config import init_core_config, init_mcp_config, init_model_config
+        from src.core.config import init_core_config, init_mcp_config
         from src.kernel.config.unified import init_config as init_unified_config
         from src.kernel.container import container
         from src.kernel.protocols import (
@@ -324,22 +318,27 @@ class Bot:
         )
 
         self.config = init_core_config(self.config_path)
-        init_model_config("config/model.toml")
         init_mcp_config("config/mcp.toml")
         # 架构 v2：统一配置（兼容模式，从老文件构建）
         init_unified_config("config/elysium.toml")
-        # 架构 v2：新格式模型配置（优先于老 model.toml）
-        from src.kernel.config.models_loader import init_models_config
-        init_models_config("config/models.toml")
-
         # Step 2: Logger
         from src.kernel.logger import COLOR, get_logger, initialize_logger_system
         from src.kernel.protocols import LogStoreProtocol
 
         initialize_logger_system(log_level=self.config.bot.log_level)
         self.logger = get_logger(name="console", display="控制台", color=COLOR.BLUE)
+
+        # Automatic task routing has one authoritative source.  Load it only
+        # after logging is ready so the immutable route manifest and any
+        # validation failure are always visible during startup.
+        from src.kernel.config.models_loader import init_models_config
+
+        init_models_config("config/models.toml")
+        await self._optimize_async_network_runtime()
+
         # v2: 注册 LogStore
         from src.kernel.logger.logger import _global_log_store
+
         if _global_log_store is not None:
             container.register(LogStoreProtocol, _global_log_store)
 
@@ -358,7 +357,7 @@ class Bot:
             process_workers=self.config.advanced.process_workers
         )
         container.register(type(self.task_manager), self.task_manager)  # v2
-        
+
         # 仅在启用时启动 WatchDog
         if self.config.bot.enable_watchdog:
             get_watchdog().start()
@@ -446,9 +445,13 @@ class Bot:
 
         import httpx
 
-        from src.core.config import get_model_config
+        from src.kernel.config.models_loader import get_models_config
 
-        providers = get_model_config().api_providers
+        registry = get_models_config()
+        providers = {
+            name: registry.providers[name]
+            for name in registry.snapshot.active_providers
+        }
         if not providers:
             self.ui.update_phase_status("LLM 预检", "无配置")
             return
@@ -460,28 +463,39 @@ class Bot:
         start_all = time.perf_counter()
 
         async with httpx.AsyncClient(timeout=timeout) as client:
-            async def _check_provider(provider) -> None:
-                base_url = str(provider.base_url).rstrip("/")
+
+            async def _check_provider(name: str, provider) -> None:
+                base_url = str(provider["base_url"]).rstrip("/")
                 url = f"{base_url}/models"
                 headers: dict[str, str] = {}
-                try:
-                    api_key = provider.get_api_key()
-                except Exception:
-                    api_key = ""
+                api_key = provider.get("api_key", "")
+                if isinstance(api_key, (list, tuple)):
+                    api_key = api_key[0] if api_key else ""
                 if api_key:
-                    headers["Authorization"] = f"Bearer {api_key}"
+                    if provider.get("client_type", "openai") == "anthropic":
+                        headers.update(
+                            {
+                                "x-api-key": str(api_key),
+                                "anthropic-version": "2023-06-01",
+                            }
+                        )
+                    else:
+                        headers["Authorization"] = f"Bearer {api_key}"
 
                 start = time.perf_counter()
                 try:
                     resp = await client.get(url, headers=headers)
                     elapsed = time.perf_counter() - start
-                    results.append((provider.name, resp.status_code == 200, elapsed))
+                    results.append((name, resp.status_code == 200, elapsed))
                 except Exception:
                     elapsed = time.perf_counter() - start
-                    results.append((provider.name, False, elapsed))
+                    results.append((name, False, elapsed))
 
             await asyncio.gather(
-                *(_check_provider(provider) for provider in providers),
+                *(
+                    _check_provider(name, provider)
+                    for name, provider in providers.items()
+                ),
                 return_exceptions=True,
             )
 
@@ -494,7 +508,9 @@ class Bot:
             summary = "  ".join(f"{name} OK" for name in ok_providers)
             self.logger.info(f"LLM: {summary}  ({total_elapsed:.1f}s)")
         if failed_providers and not ok_providers:
-            self.logger.warning(f"LLM 预检: 所有提供商不可用 ({', '.join(failed_providers)})")
+            self.logger.warning(
+                f"LLM 预检: 所有提供商不可用 ({', '.join(failed_providers)})"
+            )
         elif failed_providers:
             self.logger.debug(f"LLM 预检: {', '.join(failed_providers)} 不可用")
 
@@ -530,17 +546,17 @@ class Bot:
 
         # 检查是否对外开放
         is_public = host == "0.0.0.0"
-        
+
         # 检查密钥是否不安全（空或包含示例密钥）
-        has_insecure_keys = (
-            not api_keys or any(key.lower() in INSECURE_KEYS for key in api_keys)
+        has_insecure_keys = not api_keys or any(
+            key.lower() in INSECURE_KEYS for key in api_keys
         )
 
         if is_public and has_insecure_keys:
             self.logger.warning(f"HTTP 对外开放但无安全密钥 ({host})")
             self.logger.warning("建议设置 api_keys 或改为 127.0.0.1")
             self.ui.update_phase_status("HTTP服务器", "⚠️ 不安全配置")
-            
+
     async def _initialize_core(self) -> None:
         """初始化 Core 层组件
 
@@ -551,12 +567,12 @@ class Bot:
         # Step 1: 初始化 MessageReceiver 和 SinkManager
         from src.core.transport import MessageReceiver, SinkManager
         from src.core.transport.sink import set_sink_manager
-        
+
         self.message_receiver = MessageReceiver()
         self.sink_manager = SinkManager(self.message_receiver)
         set_sink_manager(self.sink_manager)
         self.ui.update_phase_status("消息接收器", "已初始化")
-        
+
         # Step 2: 导入其他manager以初始化
         from src.core.managers import (
             initialize_adapter_manager,
@@ -578,19 +594,23 @@ class Bot:
         self.mcp_manager = get_mcp_manager()
         await self.mcp_manager.initialize()
         self.ui.update_phase_status("MCP", "已初始化")
-        
+
         # Step 4: 启动 HTTP 服务器
         from src.core.transport.router.http_server import get_http_server
-        
+
         if self.config.http_router.enable_http_router:
             host = self.config.http_router.http_router_host
             port = self.config.http_router.http_router_port
             api_keys = self.config.http_router.api_keys
-            
+
             # 端口预检：避免绑定失败触发 C 扩展层 segfault
             import socket
+
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-                if probe.connect_ex((host if host != "0.0.0.0" else "127.0.0.1", port)) == 0:
+                if (
+                    probe.connect_ex((host if host != "0.0.0.0" else "127.0.0.1", port))
+                    == 0
+                ):
                     self.logger.error(
                         f"HTTP 端口 {port} 已被占用，跳过 HTTP 服务器启动。"
                         "请检查是否有残留进程（ss -tlnp | grep {port}）。"
@@ -601,13 +621,14 @@ class Bot:
 
             # 安全检查：检测对外开放且无有效密钥的情况
             await self._check_http_security(host, api_keys)
-            
+
             self.http_server = get_http_server(host=host, port=port)
             await self.http_server.start()
 
             # 挂载 LLM 请求体检视器（调试用 WebUI）
             try:
                 from src.kernel.llm.request_inspector import get_inspector
+
                 get_inspector().mount(self.http_server.app)
             except Exception:
                 pass
@@ -740,8 +761,9 @@ class Bot:
         assert self.event_bus is not None
 
         from src.core.components.types import EventType
+
         await self.event_bus.publish(EventType.ON_ALL_PLUGIN_LOADED, {})
-        
+
         return self.load_results
 
     async def run(self) -> None:
@@ -763,10 +785,11 @@ class Bot:
         # 启动调度器
         if not self.scheduler.is_running:
             raise BotRuntimeError("Scheduler stopped before runtime startup completed")
-        
+
         # 触发 ON_START 事件（所有初始化完成，系统即将进入运行状态）
         try:
             from src.core.components.types import EventType
+
             assert self.event_bus is not None
             await self.event_bus.publish(EventType.ON_START, {})
             if self.logger:
@@ -774,7 +797,7 @@ class Bot:
         except Exception as e:
             if self.logger:
                 self.logger.warning(f"触发 ON_START 事件失败: {e}")
-        
+
         # 启动实时仪表盘（如果 UI 级别为 VERBOSE）
         if self.ui.level == UILevel.VERBOSE:
             self.ui.start_live_dashboard()
@@ -833,9 +856,7 @@ class Bot:
 
         self.ui.update_dashboard_stats(stats)
 
-    async def reload_plugin(
-        self, plugin_name: str | None = None
-    ) -> dict[str, bool]:
+    async def reload_plugin(self, plugin_name: str | None = None) -> dict[str, bool]:
         """重新加载插件
 
         Args:
@@ -890,9 +911,7 @@ class Bot:
                     self.logger.info(f"插件已卸载: {plugin_name}")
             except Exception as e:
                 if self.logger:
-                    self.logger.warning(
-                        f"插件 '{plugin_name}' 卸载失败: {e}"
-                    )
+                    self.logger.warning(f"插件 '{plugin_name}' 卸载失败: {e}")
 
         # 清空统计
         self.load_results.clear()
@@ -944,9 +963,7 @@ class Bot:
         async def _run_step(name: str, operation) -> None:
             remaining = shutdown_deadline - loop.time()
             if remaining <= 0:
-                exc = TimeoutError(
-                    f"shutdown deadline exhausted before step '{name}'"
-                )
+                exc = TimeoutError(f"shutdown deadline exhausted before step '{name}'")
                 errors.append((name, exc))
                 return
 
@@ -997,11 +1014,12 @@ class Bot:
             from src.core.managers.adapter_manager import get_adapter_manager
 
             results = await get_adapter_manager().stop_all_adapters()
-            failures = [signature for signature, success in results.items() if not success]
+            failures = [
+                signature for signature, success in results.items() if not success
+            ]
             if failures:
-                message = (
-                    "适配器首次关闭未完成，将在插件卸载后重试: "
-                    + ", ".join(sorted(failures))
+                message = "适配器首次关闭未完成，将在插件卸载后重试: " + ", ".join(
+                    sorted(failures)
                 )
                 if self.logger:
                     self.logger.warning(message)

@@ -66,7 +66,8 @@ main.py
 | --- | --- |
 | `main.py` | 当前主入口 |
 | `config/core.toml` | Core、数据库、HTTP、日志、全局 LLM 行为 |
-| `config/model.toml` | Provider、模型和模型任务路由 |
+| `config/models.toml` | 生产 Provider、模型注册和有序任务路由（唯一权威） |
+| `config/model.toml` | 旧格式显式迁移兼容；生产启动不读取，也不参与任务回退 |
 | `config/mcp.toml` | MCP 服务配置 |
 | `config/plugins/life_engine/config.toml` | Life Engine、心跳、Chatter、记忆及场景能力 |
 | `config/plugins/feishu_adapter/config.toml` | 飞书应用、连接和消息行为 |
@@ -221,17 +222,15 @@ Rename-Item -LiteralPath ".venv" -NewName ".venv.broken"
 
 ## 5. 首次生成配置
 
-新克隆的仓库通常没有完整的 `config/core.toml` 和 `config/model.toml`。当前配置系统会在文件不存在时生成默认配置。
+新克隆的仓库通常没有完整的 `config/core.toml` 和 `config/models.toml`。Core 配置可以由现有配置系统补全；生产模型注册表必须在启动前由示例显式创建，因为缺失或非法注册表会阻止启动，系统不会静默回退旧配置。
 
-首次可直接运行一次：
+首次启动前先从仓库示例创建模型注册表：
 
-```powershell
-.\.venv\Scripts\python.exe main.py
+```bash
+cp config/models.toml.example config/models.toml
 ```
 
-等待配置生成后按 `Ctrl+C` 优雅退出，再编辑实际配置。
-
-也可以从仓库示例开始复制 `config/core.toml.example`，但仍必须在启动后核对自动补全的配置项。
+随后只在被 Git 忽略的 `config/models.toml` 中填写真实 Provider 地址和密钥。也可以从 `config/core.toml.example` 创建 Core 配置，但仍必须核对实际配置项。完成这一步后再手动启动 Elysium；不要依赖一次失败启动来生成模型配置。
 
 配置文件由 TOML 解析。修改后必须保存，并重新启动进程；不要只在编辑器里改完但未保存。
 
@@ -279,24 +278,23 @@ api_keys = []
 编辑：
 
 ```text
-config/model.toml
+config/models.toml
 ```
 
 ### 7.1 概念
 
-- `api_providers`：API 服务地址、密钥、客户端类型和超时。
-- `models`：外部模型标识符与 Elysium 内部模型名。
-- `model_tasks`：不同功能实际使用哪些内部模型。
+- `[providers.*]`：API 服务地址、密钥、客户端类型和超时。
+- `[models.*]`：内部模型别名、真实外部模型 ID、Provider 和能力。
+- `[tasks.*]`：不同功能的有序模型主备链、输出预算和温度。
 
-`model_tasks.*.model_list` 引用的是 `models[].name`，不是外部的 `model_identifier`。
+`tasks.*.models` 引用的是 `[models]` 下的键，不是外部 `id`。数组顺序就是 `failover` 的配置优先级；模型定义本身在文件中的先后顺序不代表优先级。
 
 ### 7.2 OpenAI-compatible Provider 模板
 
 以下仅为结构示例，禁止在文档或 Git 中写入真实密钥：
 
 ```toml
-[[api_providers]]
-name = "YourProvider"
+[providers.YourProvider]
 base_url = "https://provider.example.com/v1"
 api_key = "<YOUR_API_KEY>"
 client_type = "openai"
@@ -304,77 +302,83 @@ max_retry = 3
 timeout = 120
 retry_interval = 3
 
-[[models]]
-model_identifier = "provider-model-id"
-name = "internal-model-name"
-api_provider = "YourProvider"
-max_context = 32768
-force_stream_mode = false
+[models.internal-model-name]
+provider = "YourProvider"
+id = "provider-model-id"
+ctx = 32768
+stream = false
 tool_call_compat = false
-extra_params = {}
-anti_truncation = false
+extra = { enable_thinking = true }
+
+[tasks.expression]
+models = ["internal-model-name"]
+tokens = 32000
+temp = 0.7
 ```
 
 ### 7.3 当前文本路由原则
 
 现阶段的路由目标是：
 
-- `model_tasks.core`：Life Engine 潜意识/心跳模型。
-- `model_tasks.expression`：Life Chatter 对话表达模型。
+- `tasks.core`：Life Engine 潜意识/心跳模型。
+- `tasks.expression`：Life Chatter 对话表达模型。
 - `witness`、`agent`、`utility`、`router` 等任务：根据能力和成本选择文本模型。
 - `voice`：ASR 任务。
 - `tts`：TTS 任务。
-- `embedding`：向量模型；没有可用 embedding 模型时应保持为空，并明确相关向量能力未启用。
+- `embedding`：向量模型；当前生产注册表要求任务非空，暂不启用时应配置一个经过验证的模型或显式关闭其消费子系统，不能留下空路由。
 
 示例：
 
 ```toml
-[model_tasks.core]
-model_list = ["internal-core-model"]
-max_tokens = 800
-temperature = 0.7
-concurrency_count = 1
-secondary_pick_prob = 0.0
-embedding_dimension = 0
+[tasks.core]
+models = ["internal-core-model", "internal-core-backup"]
+tokens = 32000
+temp = 0.7
 
-[model_tasks.expression]
-model_list = ["internal-chat-model"]
-max_tokens = 800
-temperature = 0.7
-concurrency_count = 1
-secondary_pick_prob = 0.0
-embedding_dimension = 0
+[tasks.expression]
+models = ["internal-chat-model", "internal-chat-backup"]
+tokens = 32000
+temp = 0.7
 ```
 
 ### 7.4 配置检查
 
 至少检查：
 
-1. 每个 `models[].api_provider` 都能在 `api_providers[].name` 找到。
-2. 每个 `model_tasks.*.model_list` 中的名称都存在于 `models[].name`。
-3. `model_identifier` 是 Provider 接受的真实模型 ID，不要把内部前缀拼入外部模型名。
+1. 每个 `models.*.provider` 都能在 `providers.*` 找到。
+2. 每个 `tasks.*.models` 中的名称都存在于 `models.*`，并且同一任务不得重复。
+3. `models.*.id` 是 Provider 接受的真实模型 ID，不要把内部前缀拼入外部模型名。
 4. 文本模型是否支持 Tool Call；不支持时需要明确评估 `tool_call_compat`，不能盲开。
-5. `max_context` 必须与真实模型能力相符。
+5. `ctx` 必须与真实模型能力相符。
 6. 视觉、音频和视频不能只改任务名；必须配置并验证媒体能力合同和 Provider 协议。
+7. 启动日志必须出现 `模型路由快照已加载`；其中的任务链应与文件一致，摘要不得包含密钥。
+8. 若日志显示首选模型被冷却跳过，应核对 `routing_task`、`snapshot`、`configured_primary`、`selected` 和 `skipped`，不要把健康调度误判为乱序。
+9. Compact registry 的 `api_key` 必须是单个字符串；密钥轮换应由中转站或显式凭据组件负责，不接受一个实际上不会轮换的伪列表配置。
 
 ### 7.5 Embedding 与记忆索引
 
-Life Engine 的 chunk 向量索引需要一个真正支持 Embeddings API 的模型。具体 Provider、模型名称、接口地址和密钥均属于部署环境配置，不写入公共文档；请按所选 Provider 的官方说明填写 `config/model.toml`。
+Life Engine 的 chunk 向量索引需要一个真正支持 Embeddings API 的模型。具体 Provider、模型名称、接口地址和密钥均属于部署环境配置，不写入公共文档；请按所选 Provider 的官方说明填写 `config/models.toml`。
 
 通用关键项：
 
 ```toml
-[model_tasks.embedding]
-model_list = ["<内部向量模型名>"]
-embedding_dimension = <模型实际输出维度>
+[models.internal-embedding-model]
+provider = "YourProvider"
+id = "provider-embedding-model-id"
+ctx = 8192
+
+[tasks.embedding]
+models = ["internal-embedding-model"]
+tokens = 8192
+temp = 0.0
 ```
 
 关键约束：
 
-1. `model_tasks.embedding.model_list` 中的名称必须对应已定义、可实际调用的 Embedding 模型。
-2. `embedding_dimension` 必须等于模型实际输出维度，并与活动向量集合一致；更换维度前先制定索引迁移或重建方案。
+1. `tasks.embedding.models` 中的名称必须对应已定义、可实际调用的 Embedding 模型。
+2. 模型实际输出维度必须与活动向量集合一致；更换维度前先制定索引迁移或重建方案。
 3. 真实 API 冒烟必须确认返回非空向量且维度正确，但这不等于 Life Memory 全功能验收；记忆写入、索引切换、语义召回和失败恢复仍需分别验证。
-4. 不要用普通聊天模型代替 Embedding 模型。若 `model_tasks.embedding.model_list` 为空，索引器会报 `LLMConfigurationError: model_set 必须是非空 list[dict]`。
+4. 不要用普通聊天模型代替 Embedding 模型。空 `tasks.embedding.models` 会在启动验证阶段直接拒绝，而不是等索引器运行后才失败。
 5. Provider 地址、模型标识和真实密钥仅写入被 Git 忽略的本机配置，不得写入文档、测试、提交或日志示例。
 
 Life Engine 的索引 worker 默认每 60 秒处理一批，每批最多 4 个任务。历史任务因 Embedding 配置缺失而进入 `failed` 后，可在确认 API 和维度无误的前提下临时设置：
@@ -390,8 +394,8 @@ retry_failed = true
 
 语音链路的通用实现和协议要求为：
 
-- `model_tasks.voice` 必须指向兼容当前音频输入合同的音频理解或 ASR 模型。飞书入站 Opus 会先转为 16 kHz 单声道 WAV；`MediaManager` 可先尝试原生音频理解，失败后回退 ASR。
-- `model_tasks.tts` 必须指向兼容当前响应结构的 TTS 模型。聊天意识的 `action-life_send_voice` 消费该任务取得合成音频，再由飞书适配器转为 Opus、上传并发送 `audio` 消息。
+- `tasks.voice` 必须指向兼容当前音频输入合同的音频理解或 ASR 模型。飞书入站 Opus 会先转为 16 kHz 单声道 WAV；`MediaManager` 可先尝试原生音频理解，失败后回退 ASR。
+- 若部署启用任务式 TTS，必须先在 `models.toml` 显式注册并配置对应 `tasks.tts`；未配置时不得回退旧 `model.toml` 伪装为可用。聊天意识的 `action-life_send_voice` 消费该任务取得合成音频，再由飞书适配器转为 Opus、上传并发送 `audio` 消息。
 - 这条任务式 TTS 链路不经过 `tts_voice_plugin`。旧插件保持独立的 GPT-SoVITS HTTP 协议；插件停用时不会导入其 `soundfile`、`pedalboard` 等可选音频依赖。
 - 若部署环境启用 GPT-SoVITS 插件，必须另外安装并声明其音频处理依赖，配置服务地址、权重和参考音频，并单独完成离线契约与真实端到端验收；不能复用任务式 TTS 链路的验收结果。
 - QQ/NapCat 与飞书共用核心 `voice` 消息段，但出站协议不同：NapCat 映射为 OneBot `record`，飞书转为 Opus 并发送 `audio`。QQ/NapCat 语音收发尚未完成真实端到端验收。
@@ -875,7 +879,7 @@ Ctrl+C
 
 - [ ] `.venv` 中 Python 版本不低于 3.11。
 - [ ] `uv sync --dev` 成功。
-- [ ] `config/core.toml`、`config/model.toml` 已生成并保存。
+- [ ] `config/core.toml`、`config/models.toml` 已生成并保存；真实密钥未进入 Git。
 - [ ] SQLite 文件可创建或打开。
 - [ ] 启动过程无 Fatal error。
 - [ ] 仅有一个 Elysium 实例占用目标端口。
@@ -890,6 +894,7 @@ Ctrl+C
 
 - [ ] Provider 域名和端口可访问。
 - [ ] 启动预检通过。
+- [ ] 启动日志中的路由快照摘要和有序任务链与 `models.toml` 一致。
 - [ ] `core` 和 `expression` 的内部模型名都存在。
 - [ ] 日志中没有 `Model does not exist`、401、403、429 或持续超时。
 - [ ] 实际调用的外部 `model_identifier` 与 Provider 文档一致。

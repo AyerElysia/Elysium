@@ -1,6 +1,7 @@
 """Bot 生命周期故障回滚测试。"""
 
 import asyncio
+import inspect
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -8,6 +9,111 @@ import pytest
 
 from src.app.runtime.bot import Bot
 from src.app.runtime.exceptions import BotShutdownError
+
+
+def test_production_bootstrap_does_not_load_legacy_model_registry() -> None:
+    """The old migration schema must not re-enter the production startup path."""
+
+    source = inspect.getsource(Bot._initialize_kernel)
+
+    assert "init_model_config" not in source
+    assert "config/model.toml" not in source
+    assert 'init_models_config("config/models.toml")' in source
+
+
+def test_dns_warmup_uses_only_active_snapshot_providers() -> None:
+    providers = {
+        "active-http": {"base_url": "http://127.0.0.1:3000/v1"},
+        "active-https": {"base_url": "https://gateway.example/v1"},
+        "unused": {"base_url": "https://unused.example/v1"},
+    }
+
+    assert Bot._extract_active_provider_hosts(
+        providers,
+        ("active-http", "active-https"),
+    ) == [("127.0.0.1", 3000), ("gateway.example", 443)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("client_type", "expected_headers"),
+    [
+        ("openai", {"Authorization": "Bearer active-secret"}),
+        (
+            "anthropic",
+            {
+                "x-api-key": "active-secret",
+                "anthropic-version": "2023-06-01",
+            },
+        ),
+    ],
+)
+async def test_llm_preflight_uses_only_active_snapshot_providers(
+    monkeypatch: pytest.MonkeyPatch,
+    client_type: str,
+    expected_headers: dict[str, str],
+) -> None:
+    """Startup health checks must follow the authoritative task snapshot."""
+
+    bot = Bot()
+    bot.config = SimpleNamespace(
+        bot=SimpleNamespace(
+            llm_preflight_check=True,
+            llm_preflight_timeout=2.0,
+        )
+    )
+    info_logs: list[str] = []
+    bot.logger = SimpleNamespace(
+        info=lambda message: info_logs.append(str(message)),
+        warning=lambda *_: None,
+        debug=lambda *_: None,
+    )
+    registry = SimpleNamespace(
+        snapshot=SimpleNamespace(active_providers=("active",)),
+        providers={
+            "active": {
+                "base_url": "http://active.example/v1",
+                "api_key": "active-secret",
+                "client_type": client_type,
+            },
+            "unused": {
+                "base_url": "http://unused.example/v1",
+                "api_key": "unused-secret",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "src.kernel.config.models_loader.get_models_config",
+        lambda: registry,
+    )
+    calls: list[tuple[str, dict[str, str]]] = []
+
+    class FakeResponse:
+        status_code = 200
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, url: str, *, headers: dict[str, str]):
+            calls.append((url, headers))
+            return FakeResponse()
+
+    monkeypatch.setattr("httpx.AsyncClient", lambda **_kwargs: FakeClient())
+
+    await bot._preflight_llm_providers()
+
+    assert calls == [
+        (
+            "http://active.example/v1/models",
+            expected_headers,
+        )
+    ]
+    assert any("active OK" in message for message in info_logs)
+    assert all("secret" not in message for message in info_logs)
 
 
 @pytest.mark.asyncio
@@ -21,8 +127,15 @@ async def test_network_runtime_restores_loop_methods_on_shutdown(
     original_getnameinfo = loop.getnameinfo
     monkeypatch.setattr(
         bot,
-        "_extract_provider_hosts_from_model_config",
-        lambda _path: [],
+        "_extract_active_provider_hosts",
+        lambda _providers, _active: [],
+    )
+    monkeypatch.setattr(
+        "src.kernel.config.models_loader.get_models_config",
+        lambda: SimpleNamespace(
+            providers={},
+            snapshot=SimpleNamespace(active_providers=()),
+        ),
     )
 
     await bot._optimize_async_network_runtime()
@@ -67,8 +180,7 @@ async def test_shutdown_continues_after_independent_step_failure(
 
     stream_manager = SimpleNamespace(stop=AsyncMock())
     monkeypatch.setattr(
-        "src.core.transport.distribution.stream_loop_manager."
-        "get_stream_loop_manager",
+        "src.core.transport.distribution.stream_loop_manager.get_stream_loop_manager",
         lambda: stream_manager,
     )
     close_engine = AsyncMock()
@@ -121,8 +233,7 @@ async def test_shutdown_recovers_when_plugin_unload_finishes_adapter_cleanup(
         lambda: adapter_manager,
     )
     monkeypatch.setattr(
-        "src.core.transport.distribution.stream_loop_manager."
-        "get_stream_loop_manager",
+        "src.core.transport.distribution.stream_loop_manager.get_stream_loop_manager",
         lambda: SimpleNamespace(stop=AsyncMock()),
     )
     monkeypatch.setattr("src.kernel.db.close_engine", AsyncMock())
@@ -163,8 +274,7 @@ async def test_shutdown_reports_adapter_only_after_retry_is_exhausted(
         lambda: adapter_manager,
     )
     monkeypatch.setattr(
-        "src.core.transport.distribution.stream_loop_manager."
-        "get_stream_loop_manager",
+        "src.core.transport.distribution.stream_loop_manager.get_stream_loop_manager",
         lambda: SimpleNamespace(stop=AsyncMock()),
     )
     monkeypatch.setattr("src.kernel.db.close_engine", AsyncMock())
@@ -197,8 +307,7 @@ async def test_shutdown_deadline_is_hard_even_when_cleanup_delays_cancellation(
     stream_manager = SimpleNamespace(stop=AsyncMock())
     adapter_manager = SimpleNamespace(stop_all_adapters=AsyncMock(return_value={}))
     monkeypatch.setattr(
-        "src.core.transport.distribution.stream_loop_manager."
-        "get_stream_loop_manager",
+        "src.core.transport.distribution.stream_loop_manager.get_stream_loop_manager",
         lambda: stream_manager,
     )
     monkeypatch.setattr(

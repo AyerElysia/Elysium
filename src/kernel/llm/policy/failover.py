@@ -134,17 +134,13 @@ class _ModelCooldownRegistry:
                     self._gateway_entries.get(self._gateway_key(model)),
                 )
                 active_states = [
-                    state
-                    for state in states
-                    if state is not None and state.until > now
+                    state for state in states if state is not None and state.until > now
                 ]
                 if not active_states:
                     return index, tuple(skipped), 0.0
                 state = max(active_states, key=lambda item: item.until)
                 cooling.append((index, state))
-                skipped.append(
-                    str(model.get("model_identifier") or "unknown")
-                )
+                skipped.append(str(model.get("model_identifier") or "unknown"))
 
         retry_after = max(1.0, min(state.until for _, state in cooling) - now)
         return None, tuple(skipped), retry_after
@@ -162,6 +158,19 @@ _MODEL_COOLDOWNS = _ModelCooldownRegistry()
 
 def _reset_model_cooldowns_for_tests() -> None:
     _MODEL_COOLDOWNS.reset()
+
+
+def _routing_meta(model: dict[str, Any], index: int) -> dict[str, Any]:
+    """Return secret-free immutable route identity for logs and trajectories."""
+
+    return {
+        "model_index": index,
+        "model_name": model.get("model_identifier", "unknown"),
+        "routing_task": model.get("routing_task", ""),
+        "routing_model_alias": model.get("routing_model_alias", ""),
+        "routing_priority": model.get("routing_priority", index),
+        "routing_snapshot": model.get("routing_snapshot", ""),
+    }
 
 
 class FailoverPolicy(Policy):
@@ -216,9 +225,11 @@ class _FailoverSession(PolicySession):
             start=0,
         )
         if selected is None:
+            primary = self._models[0]
             return ModelStep(
                 model=None,
                 meta={
+                    **_routing_meta(primary, 0),
                     "reason": "all_models_cooling",
                     "strategy": "failover",
                     "cooldown_skipped": skipped,
@@ -228,6 +239,8 @@ class _FailoverSession(PolicySession):
                     request_name=self._request_name,
                     retry_after=retry_after,
                     models=skipped,
+                    routing_task=str(primary.get("routing_task") or ""),
+                    routing_snapshot=str(primary.get("routing_snapshot") or ""),
                 ),
             )
         self._idx = selected
@@ -236,8 +249,7 @@ class _FailoverSession(PolicySession):
         return ModelStep(
             model=model,
             meta={
-                "model_index": self._idx,
-                "model_name": model.get("model_identifier", "unknown"),
+                **_routing_meta(model, self._idx),
                 "attempt": 1,
                 "strategy": "failover",
                 "cooldown_skipped": skipped,
@@ -270,6 +282,12 @@ class _FailoverSession(PolicySession):
                         request_name=self._request_name,
                         retry_after=retry_after,
                         models=skipped,
+                        routing_task=str(
+                            self._models[self._idx].get("routing_task") or ""
+                        ),
+                        routing_snapshot=str(
+                            self._models[self._idx].get("routing_snapshot") or ""
+                        ),
                     )
                     if retry_after > 0
                     else None
@@ -297,8 +315,7 @@ class _FailoverSession(PolicySession):
             model=model,
             delay_seconds=0.0,
             meta={
-                "model_index": self._idx,
-                "model_name": model.get("model_identifier", "unknown"),
+                **_routing_meta(model, self._idx),
                 "attempt": self._attempts_used,
                 "switch": True,
                 "strategy": "failover",

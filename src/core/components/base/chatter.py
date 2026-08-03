@@ -7,26 +7,26 @@ Chatter 是 Bot 的智能核心，定义对话逻辑和流程。
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from datetime import datetime
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Literal, cast
 
-from src.core.components.types import ChatType
 from src.core.components.base.action import BaseAction
 from src.core.components.base.agent import BaseAgent
 from src.core.components.base.tool import BaseTool
+from src.core.components.types import ChatType
 from src.kernel.concurrency import get_task_manager
-from src.kernel.logger import get_logger, COLOR
+from src.kernel.logger import COLOR, get_logger
 
 if TYPE_CHECKING:
-    from src.core.prompt import SystemReminderBucket
     from src.core.components.base.action import BaseAction
     from src.core.components.base.agent import BaseAgent
-    from src.core.components.base.tool import BaseTool
     from src.core.components.base.plugin import BasePlugin
+    from src.core.components.base.tool import BaseTool
     from src.core.models.message import Message
-    from src.kernel.llm.request import LLMRequest
+    from src.core.prompt import SystemReminderBucket
     from src.kernel.llm.payload.tooling import LLMUsable, ToolRegistry
+    from src.kernel.llm.request import LLMRequest
 
 
 @dataclass
@@ -82,6 +82,7 @@ class Failure:
     error: str
     exception: Exception | None = None
 
+
 @dataclass
 class Stop:
     """停止结果。
@@ -95,6 +96,7 @@ class Stop:
     time: float | int
     direct_message_wake_enabled: bool = False
     direct_message_wake_probability: float = 0.0
+
 
 # 类型别名
 ChatterResult = Wait | Success | Failure | Stop
@@ -201,9 +203,7 @@ class BaseChatter(ABC):
         return None
 
     @abstractmethod
-    async def execute(
-        self
-    ) -> AsyncGenerator[ChatterResult, WaitResumeEvent | None]:
+    async def execute(self) -> AsyncGenerator[ChatterResult, WaitResumeEvent | None]:
         """执行聊天器的主要逻辑。
 
         使用生成器模式，通过 yield 返回执行结果。
@@ -237,8 +237,8 @@ class BaseChatter(ABC):
             >>> [MyAction, MyTool]
         """
         from src.core.components.registry import get_global_registry
-        from src.core.components.types import ComponentType, ComponentState
         from src.core.components.state_manager import get_global_state_manager
+        from src.core.components.types import ComponentState, ComponentType
 
         usables: list[type["LLMUsable"]] = []
 
@@ -290,7 +290,9 @@ class BaseChatter(ABC):
         filtered: list[type[LLMUsable]] = []
 
         for usable_cls in llm_usables:
-            usable_cls = cast(type["BaseAction|BaseAgent|BaseTool"], usable_cls)  # 类型提示
+            usable_cls = cast(
+                type["BaseAction|BaseAgent|BaseTool"], usable_cls
+            )  # 类型提示
             signature = usable_cls.get_signature() or usable_cls.__name__
 
             chatter_allow = getattr(usable_cls, "chatter_allow", [])
@@ -308,9 +310,8 @@ class BaseChatter(ABC):
                     continue
 
             if (
-                (issubclass(usable_cls, BaseAction) or issubclass(usable_cls, BaseAgent))
-                and usable_cls.associated_types
-            ):
+                issubclass(usable_cls, BaseAction) or issubclass(usable_cls, BaseAgent)
+            ) and usable_cls.associated_types:
                 if not chat_context.check_types(usable_cls.associated_types):
                     types_str = ", ".join(usable_cls.associated_types)
                     reason = f"适配器不支持（需要: {types_str}）"
@@ -324,14 +325,18 @@ class BaseChatter(ABC):
         tasks = []
         signatures = []
         for usable_cls in filtered:
-            usable_cls = cast(type["BaseAction|BaseAgent|BaseTool"], usable_cls)  # 类型提示
+            usable_cls = cast(
+                type["BaseAction|BaseAgent|BaseTool"], usable_cls
+            )  # 类型提示
             signature = usable_cls.get_signature() or usable_cls.__name__
 
             try:
                 component_plugin = self._resolve_component_plugin(signature)
                 instance: BaseAction | BaseAgent | BaseTool
                 if issubclass(usable_cls, BaseAction):
-                    instance = usable_cls(chat_stream=chat_stream, plugin=component_plugin)
+                    instance = usable_cls(
+                        chat_stream=chat_stream, plugin=component_plugin
+                    )
 
                     current_msg = chat_context.current_message
                     if current_msg:
@@ -347,7 +352,9 @@ class BaseChatter(ABC):
                         message=chat_context.current_message,
                     )
                 elif issubclass(usable_cls, BaseAgent):
-                    instance = usable_cls(stream_id=self.stream_id, plugin=component_plugin)
+                    instance = usable_cls(
+                        stream_id=self.stream_id, plugin=component_plugin
+                    )
                 else:
                     continue
 
@@ -399,7 +406,7 @@ class BaseChatter(ABC):
         available = [
             usable_cls
             for usable_cls in filtered
-            if (usable_cls.get_signature() or usable_cls.__name__) not in removal_names # type: ignore
+            if (usable_cls.get_signature() or usable_cls.__name__) not in removal_names  # type: ignore
         ]
 
         logger.info(
@@ -491,7 +498,7 @@ class BaseChatter(ABC):
         request_name 默认取 chatter_name。
 
         Args:
-            task: 模型任务名称（对应 config/model.toml 中的 task key），默认 "actor"
+            task: 模型任务名称（对应 config/models.toml 中的 task key），默认 "actor"
             request_name: LLM 请求名称，默认使用 chatter_name
             with_reminder: 可选的 system reminder bucket；传入后会自动登记到上下文管理器
 
@@ -501,11 +508,11 @@ class BaseChatter(ABC):
         Raises:
             KeyError: 当 task 在模型配置中不存在时
         """
-        from src.core.config import get_model_config
-        from src.kernel.llm.request import LLMRequest
+        from src.kernel.config.models_loader import get_models_config
         from src.kernel.llm.context import LLMContextManager
+        from src.kernel.llm.request import LLMRequest
 
-        model_set = get_model_config().get_task(task)
+        model_set = get_models_config().get_task(task)
         context_manager = LLMContextManager()
 
         _logger = get_logger("chatter")
@@ -524,10 +531,11 @@ class BaseChatter(ABC):
         )
 
         if with_reminder is not None:
-            context_manager.reminder_bucket(str(with_reminder), wrap_with_system_tag=True)
+            context_manager.reminder_bucket(
+                str(with_reminder), wrap_with_system_tag=True
+            )
 
         return request
-
 
     async def inject_usables(self, request: Any) -> "ToolRegistry":
         """将可用工具过滤后注入 LLM 请求，返回工具注册表。
@@ -541,8 +549,8 @@ class BaseChatter(ABC):
         Returns:
             ToolRegistry: 注册了所有可用工具的注册表
         """
-        from src.kernel.llm.payload.tooling import ToolRegistry
         from src.kernel.llm.payload.payload import LLMPayload
+        from src.kernel.llm.payload.tooling import ToolRegistry
         from src.kernel.llm.roles import ROLE
 
         usables = await self.get_llm_usables()
@@ -559,7 +567,9 @@ class BaseChatter(ABC):
                 try:
                     schema = tool_cls.to_schema()
                     if isinstance(schema, dict):
-                        if schema.get("type") == "function" and isinstance(schema.get("function"), dict):
+                        if schema.get("type") == "function" and isinstance(
+                            schema.get("function"), dict
+                        ):
                             name = schema["function"].get("name")
                             if isinstance(name, str) and name:
                                 return name
@@ -694,10 +704,14 @@ class BaseChatter(ABC):
 
         # 消息 ID 部分（用于 LLM 引用外部消息；本地合成 ID 不注入上下文）
         message_id = getattr(msg, "message_id", "") or ""
-        msg_id_part = f" [{message_id}]" if BaseChatter._should_show_message_id(msg) else ""
+        msg_id_part = (
+            f" [{message_id}]" if BaseChatter._should_show_message_id(msg) else ""
+        )
 
         # 消息内容
-        content = getattr(msg, "processed_plain_text", None) or str(getattr(msg, "content", ""))
+        content = getattr(msg, "processed_plain_text", None) or str(
+            getattr(msg, "content", "")
+        )
 
         return f"【{time_str}】{role_part}{id_part}{name_part}{msg_id_part}： {content}"
 
@@ -760,9 +774,7 @@ class BaseChatter(ABC):
 
         context = chat_stream.context
         pending_by_id: dict[str, Message] = {
-            msg.message_id: msg
-            for msg in unread_messages
-            if msg.message_id
+            msg.message_id: msg for msg in unread_messages if msg.message_id
         }
 
         flushed_count = 0
@@ -777,8 +789,6 @@ class BaseChatter(ABC):
 
         context.unread_messages = remained_unreads
 
-        logger.debug(
-            f"[{self.chatter_name}] flush 未读消息 {flushed_count} 条"
-        )
+        logger.debug(f"[{self.chatter_name}] flush 未读消息 {flushed_count} 条")
 
         return flushed_count

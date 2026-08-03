@@ -7,13 +7,13 @@
 import hashlib
 import random
 from abc import ABC, abstractmethod
-from typing import Annotated, Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated, Any
 from uuid import uuid4
 
 from src.core.components.types import ChatType
 from src.core.components.utils import parse_function_signature
-from src.kernel.llm.payload.tooling import LLMUsable, LLMUsableExecution
 from src.core.models.message import Message, MessageType
+from src.kernel.llm.payload.tooling import LLMUsable, LLMUsableExecution
 
 if TYPE_CHECKING:
     from src.core.components.base.plugin import BasePlugin
@@ -62,6 +62,7 @@ class BaseAction(ABC, LLMUsable):
         ...         # 实现逻辑
         ...         return True, "发送成功"
     """
+
     _plugin_: str
     _signature_: str
 
@@ -132,7 +133,7 @@ class BaseAction(ABC, LLMUsable):
             digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
             return f"action_{self.action_name}_{digest}"
         return f"action_{self.action_name}_{uuid4().hex}"
-    
+
     @classmethod
     def get_signature(cls) -> str | None:
         """获取动作组件的唯一签名。
@@ -149,7 +150,7 @@ class BaseAction(ABC, LLMUsable):
         if hasattr(cls, "_plugin_") and cls._plugin_ and cls.action_name:
             return f"{cls._plugin_}:action:{cls.action_name}"
         return None
-    
+
     @abstractmethod
     async def execute(
         self, *args: Any, **kwargs: Any
@@ -218,7 +219,9 @@ class BaseAction(ABC, LLMUsable):
             ... }
         """
         # 使用 utils 中的共同方法生成 schema，name 前缀加上组件类型
-        return parse_function_signature(cls.execute, f"action-{cls.action_name}", cls.action_description)
+        return parse_function_signature(
+            cls.execute, f"action-{cls.action_name}", cls.action_description
+        )
 
     async def go_activate(self) -> bool:
         """动作激活判定函数。
@@ -293,7 +296,11 @@ class BaseAction(ABC, LLMUsable):
         content_lines = []
         for msg in recent_messages:
             # 优先使用 processed_plain_text，其次使用 content
-            msg_text = msg.processed_plain_text if msg.processed_plain_text else str(msg.content)
+            msg_text = (
+                msg.processed_plain_text
+                if msg.processed_plain_text
+                else str(msg.content)
+            )
             # 格式：发送者名: 内容
             content_lines.append(f"{msg.sender_name}: {msg_text}")
 
@@ -325,7 +332,9 @@ class BaseAction(ABC, LLMUsable):
             return context.history_messages[-1]
         return context.current_message
 
-    def _get_context_message_for_target(self, reply_to: str | None = None) -> Message | None:
+    def _get_context_message_for_target(
+        self, reply_to: str | None = None
+    ) -> Message | None:
         """优先使用 reply_to 对应消息，否则回退到最近上下文消息。"""
         return self._find_context_message(reply_to) or self._get_last_context_message()
 
@@ -362,15 +371,15 @@ class BaseAction(ABC, LLMUsable):
         """
         import asyncio
 
-        from src.kernel.llm import LLMRequest, LLMPayload, ROLE, Text
-        from src.core.config import get_model_config
+        from src.kernel.config.models_loader import get_models_config
+        from src.kernel.llm import ROLE, LLMPayload, LLMRequest, Text
 
         try:
             # 自动获取聊天内容：使用当前聊天流的最新6条消息
             chat_content = self._get_recent_chat_content()
 
             # 获取 utils_small 模型配置
-            utils_small_set = get_model_config().get_task("utils_small")
+            utils_small_set = get_models_config().get_task("utils_small")
 
             if action_require is None:
                 action_require = action_require or []
@@ -398,7 +407,9 @@ class BaseAction(ABC, LLMUsable):
 """
 
             # 创建 LLM 请求
-            llm_request = LLMRequest(utils_small_set, request_name="ActionActivationJudge")
+            llm_request = LLMRequest(
+                utils_small_set, request_name="ActionActivationJudge"
+            )
             llm_request.add_payload(LLMPayload(ROLE.USER, Text(prompt)))
 
             # 调用 LLM 进行判断，设置 7 秒超时避免长时间等待
@@ -409,7 +420,11 @@ class BaseAction(ABC, LLMUsable):
                 )
                 # 获取响应文本（await 返回的是 str）
                 response_text = str(response).strip().lower()
-                should_activate = "是" in response_text or "yes" in response_text or "true" in response_text
+                should_activate = (
+                    "是" in response_text
+                    or "yes" in response_text
+                    or "true" in response_text
+                )
             except asyncio.TimeoutError:
                 # 超时时默认激活，交给后续决策系统处理
                 should_activate = True
@@ -455,7 +470,9 @@ class BaseAction(ABC, LLMUsable):
             from src.core.managers.stream_manager import get_stream_manager
             from src.core.utils.user_query_helper import get_user_query_helper
 
-            stream_info = await get_stream_manager().get_stream_info(self.chat_stream.stream_id)
+            stream_info = await get_stream_manager().get_stream_info(
+                self.chat_stream.stream_id
+            )
             if stream_info and stream_info.get("chat_type") == "private":
                 person_id = stream_info.get("person_id")
                 if person_id:
@@ -464,17 +481,27 @@ class BaseAction(ABC, LLMUsable):
                     )
                     if person and person.user_id:
                         target_user_id = str(person.user_id)
-                    nickname = str(getattr(person, "nickname", "") or "").strip() if person else ""
+                    nickname = (
+                        str(getattr(person, "nickname", "") or "").strip()
+                        if person
+                        else ""
+                    )
                     if nickname:
                         target_user_name = nickname
         except Exception:
             pass
 
-        context_target_user_id = str(getattr(context, "triggering_user_id", "") or "").strip() or None
+        context_target_user_id = (
+            str(getattr(context, "triggering_user_id", "") or "").strip() or None
+        )
 
         last_extra = getattr(last_msg, "extra", {}) or {}
-        extra_target_user_id = str(last_extra.get("target_user_id") or "").strip() or None
-        extra_target_user_name = str(last_extra.get("target_user_name") or "").strip() or None
+        extra_target_user_id = (
+            str(last_extra.get("target_user_id") or "").strip() or None
+        )
+        extra_target_user_name = (
+            str(last_extra.get("target_user_name") or "").strip() or None
+        )
 
         if self._is_internal_sender_id(context_target_user_id):
             context_target_user_id = None
@@ -485,16 +512,24 @@ class BaseAction(ABC, LLMUsable):
         if not target_user_id:
             target_user_id = context_target_user_id
 
-        if last_msg and extra_target_user_id and (self._is_internal_message(last_msg) or not target_user_id):
+        if (
+            last_msg
+            and extra_target_user_id
+            and (self._is_internal_message(last_msg) or not target_user_id)
+        ):
             target_user_id = extra_target_user_id
             target_user_name = extra_target_user_name or target_user_name
 
         if not target_user_id and last_msg and not self._is_internal_message(last_msg):
-            last_sender_id = str(getattr(last_msg, "sender_id", "") or "").strip() or None
+            last_sender_id = (
+                str(getattr(last_msg, "sender_id", "") or "").strip() or None
+            )
             if self._is_internal_sender_id(last_sender_id):
                 last_sender_id = None
             target_user_id = last_sender_id
-            target_user_name = str(getattr(last_msg, "sender_name", "") or "").strip() or None
+            target_user_name = (
+                str(getattr(last_msg, "sender_name", "") or "").strip() or None
+            )
 
         return target_user_id, target_user_name
 
@@ -528,8 +563,9 @@ class BaseAction(ABC, LLMUsable):
         Note:
             此方法通过 transport 层的 MessageSender 发送消息
         """
-        from src.core.transport.message_send import get_message_sender
         from src.core.managers.adapter_manager import get_adapter_manager
+        from src.core.transport.message_send import get_message_sender
+
         try:
             # 如果传入的是 Message 对象，直接发送
             if isinstance(content, Message):
@@ -542,7 +578,9 @@ class BaseAction(ABC, LLMUsable):
                 chat_type = self.chat_stream.chat_type
                 context = self.chat_stream.context
 
-                bot_info =await get_adapter_manager().get_bot_info_by_platform(platform)
+                bot_info = await get_adapter_manager().get_bot_info_by_platform(
+                    platform
+                )
 
                 # 转换 content 为字符串
                 content_str = str(content) if not isinstance(content, str) else content
@@ -556,10 +594,15 @@ class BaseAction(ABC, LLMUsable):
 
                 if chat_type == "group":
                     if last_msg:
-                        target_group_id = last_msg.extra.get("group_id") or last_msg.extra.get("target_group_id")
+                        target_group_id = last_msg.extra.get(
+                            "group_id"
+                        ) or last_msg.extra.get("target_group_id")
                         target_group_name = last_msg.extra.get("group_name")
                 else:
-                    target_user_id, target_user_name = await self._resolve_private_target_from_context(
+                    (
+                        target_user_id,
+                        target_user_name,
+                    ) = await self._resolve_private_target_from_context(
                         context,
                         last_msg,
                     )
@@ -591,9 +634,7 @@ class BaseAction(ABC, LLMUsable):
             # 获取 MessageSender 并发送消息
             sender = get_message_sender()
             success = await sender.send_message(message)
-            self._last_delivery_status = str(
-                message.extra.get("delivery_status") or ""
-            )
+            self._last_delivery_status = str(message.extra.get("delivery_status") or "")
             return success
 
         except Exception as e:

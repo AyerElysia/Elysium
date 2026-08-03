@@ -11,16 +11,16 @@
 
     # 获取配置
     config = get_model_config()
-    
+
     # 获取特定任务的模型配置
     task_config = config.model_tasks.replyer
     print(task_config.model_list)
     print(task_config.max_tokens)
-    
+
     # 获取 API 提供商信息
     provider = config.get_provider("openai")
     api_key = provider.get_api_key()
-    
+
     # 获取模型信息
     model = config.get_model("gpt-4")
     print(model.price_in)
@@ -33,7 +33,8 @@ from threading import Lock as ThreadLock
 from typing import Any, ClassVar, Literal, cast
 
 from pydantic import ConfigDict
-from src.kernel.config import ConfigBase, SectionBase, config_section, Field
+
+from src.kernel.config import ConfigBase, Field, SectionBase, config_section
 from src.kernel.llm.media_capabilities import normalize_media_capabilities
 from src.kernel.llm.types import ModelSet, redact_secret
 
@@ -45,7 +46,7 @@ from src.kernel.llm.types import ModelSet, redact_secret
 @config_section("api_providers")
 class APIProviderSection(SectionBase):
     """API 提供商配置节
-    
+
     定义单个 API 提供商的配置信息。
     """
 
@@ -61,7 +62,9 @@ class APIProviderSection(SectionBase):
         default="your-siliconflow-api-key-here",
         description="API 密钥，支持单个密钥或密钥列表轮询",
     )
-    client_type: Literal["openai", "anthropic", "gemini", "aiohttp_gemini", "bedrock"] = Field(
+    client_type: Literal[
+        "openai", "anthropic", "gemini", "aiohttp_gemini", "bedrock"
+    ] = Field(
         default="openai",
         description="客户端类型（openai/gemini/bedrock等）",
     )
@@ -99,7 +102,7 @@ class APIProviderSection(SectionBase):
         """
         if self._api_key_lock is None:
             self._api_key_lock = ThreadLock()
-            
+
         with self._api_key_lock:
             if isinstance(self.api_key, str):
                 return self.api_key
@@ -118,7 +121,7 @@ class APIProviderSection(SectionBase):
 @config_section("models")
 class ModelInfoSection(SectionBase):
     """模型信息配置节
-    
+
     定义单个模型的详细信息。
     """
 
@@ -183,7 +186,7 @@ class ModelInfoSection(SectionBase):
 @config_section("tasks")
 class TaskConfigSection(SectionBase):
     """任务配置节
-    
+
     定义单个任务的模型配置参数。
     """
 
@@ -247,23 +250,33 @@ class ModelTasksSection(SectionBase):
 
     # ========== 意识与认知 ==========
     core: TaskConfigSection = Field(
-        default_factory=lambda: TaskConfigSection(model_list=["siliconflow-deepseek-ai/DeepSeek-V3.2"]),
+        default_factory=lambda: TaskConfigSection(
+            model_list=["siliconflow-deepseek-ai/DeepSeek-V3.2"]
+        ),
         description="生命中枢：心跳循环、意识推理、核心决策",
     )
     expression: TaskConfigSection = Field(
-        default_factory=lambda: TaskConfigSection(model_list=["siliconflow-deepseek-ai/DeepSeek-V3.2"]),
+        default_factory=lambda: TaskConfigSection(
+            model_list=["siliconflow-deepseek-ai/DeepSeek-V3.2"]
+        ),
         description="表达层：chatter 对话生成、情感表达",
     )
     witness: TaskConfigSection = Field(
-        default_factory=lambda: TaskConfigSection(model_list=["siliconflow-deepseek-ai/DeepSeek-V3.2"]),
+        default_factory=lambda: TaskConfigSection(
+            model_list=["siliconflow-deepseek-ai/DeepSeek-V3.2"]
+        ),
         description="见证意识：经历沉淀、记忆凝缩",
     )
     agent: TaskConfigSection = Field(
-        default_factory=lambda: TaskConfigSection(model_list=["siliconflow-deepseek-ai/DeepSeek-V3.2"]),
+        default_factory=lambda: TaskConfigSection(
+            model_list=["siliconflow-deepseek-ai/DeepSeek-V3.2"]
+        ),
         description="子代理：编排 worker/planner、工具执行",
     )
     utility: TaskConfigSection = Field(
-        default_factory=lambda: TaskConfigSection(model_list=["siliconflow-deepseek-ai/DeepSeek-V3.2"]),
+        default_factory=lambda: TaskConfigSection(
+            model_list=["siliconflow-deepseek-ai/DeepSeek-V3.2"]
+        ),
         description="轻量杂务：降级 fallback、小组件调用",
     )
 
@@ -279,15 +292,21 @@ class ModelTasksSection(SectionBase):
 
     # ========== 基础设施 ==========
     embedding: TaskConfigSection = Field(
-        default_factory=lambda: TaskConfigSection(model_list=["bge-m3"], embedding_dimension=1024),
+        default_factory=lambda: TaskConfigSection(
+            model_list=["bge-m3"], embedding_dimension=1024
+        ),
         description="向量嵌入",
     )
     router: TaskConfigSection = Field(
-        default_factory=lambda: TaskConfigSection(model_list=["qwen3.5-2b-router"], max_tokens=80, temperature=0.3),
+        default_factory=lambda: TaskConfigSection(
+            model_list=["qwen3.5-2b-router"], max_tokens=80, temperature=0.3
+        ),
         description="本地路由决策模型",
     )
     live: TaskConfigSection = Field(
-        default_factory=lambda: TaskConfigSection(model_list=["siliconflow-deepseek-ai/DeepSeek-V3.2"]),
+        default_factory=lambda: TaskConfigSection(
+            model_list=["siliconflow-deepseek-ai/DeepSeek-V3.2"]
+        ),
         description="实时通话桥接（外部 live server）",
     )
 
@@ -325,7 +344,7 @@ class ModelTasksSection(SectionBase):
 
 class ModelConfig(ConfigBase):
     """模型配置类
-    
+
     定义 LLM 模型相关的所有配置，包括 API 提供商、模型信息和任务配置。
     """
 
@@ -403,6 +422,7 @@ class ModelConfig(ConfigBase):
     @config_section("model_tasks")
     class ModelTasksConfig(ModelTasksSection):
         """模型任务配置（内嵌类，用于 TOML 节定义）"""
+
         pass
 
     model_tasks: ModelTasksConfig = Field(
@@ -424,44 +444,42 @@ class ModelConfig(ConfigBase):
         self._api_providers_dict = {
             provider.name: provider for provider in self.api_providers
         }
-        self._models_dict = {
-            model.name: model for model in self.models
-        }
+        self._models_dict = {model.name: model for model in self.models}
 
     def get_provider(self, provider_name: str) -> APIProviderSection:
         """获取指定的 API 提供商配置
-        
+
         Args:
             provider_name: 提供商名称
-            
+
         Returns:
             APIProviderSection: 提供商配置
-            
+
         Raises:
             KeyError: 如果提供商未找到
         """
         if self._api_providers_dict is None:
             self._build_cache_dicts()
-        
+
         if provider_name not in self._api_providers_dict:  # type: ignore
             raise KeyError(f"API 提供商 '{provider_name}' 未找到")
         return self._api_providers_dict[provider_name]  # type: ignore
 
     def get_model(self, model_name: str) -> ModelInfoSection:
         """获取指定的模型配置
-        
+
         Args:
             model_name: 模型名称
-            
+
         Returns:
             ModelInfoSection: 模型配置
-            
+
         Raises:
             KeyError: 如果模型未找到
         """
         if self._models_dict is None:
             self._build_cache_dicts()
-        
+
         if model_name not in self._models_dict:  # type: ignore
             raise KeyError(f"模型 '{model_name}' 未找到")
         return self._models_dict[model_name]  # type: ignore
@@ -469,7 +487,7 @@ class ModelConfig(ConfigBase):
     @property
     def api_providers_dict(self) -> dict[str, APIProviderSection]:
         """获取 API 提供商字典
-        
+
         Returns:
             dict: 提供商名称到配置的映射
         """
@@ -480,7 +498,7 @@ class ModelConfig(ConfigBase):
     @property
     def models_dict(self) -> dict[str, ModelInfoSection]:
         """获取模型字典
-        
+
         Returns:
             dict: 模型名称到配置的映射
         """
@@ -490,12 +508,12 @@ class ModelConfig(ConfigBase):
 
     def get_task(self, task_name: str) -> ModelSet:
         """获取任务的 ModelSet（符合 kernel.llm 要求的格式）
-        
+
         返回格式符合 kernel.llm.types.ModelEntry 定义，包含完整的模型配置信息。
-        
+
         Args:
             task_name: 任务名称（如 'replyer', 'utils', 'embedding' 等）
-            
+
         Returns:
             ModelSet: ModelSet 列表，每个元素包含：
                 - api_provider: str - API 提供商名称
@@ -511,34 +529,31 @@ class ModelConfig(ConfigBase):
                 - temperature: float - 温度参数
                 - max_tokens: int - 最大 token 数
                 - extra_params: dict - 额外参数
-                
+
         Raises:
             ValueError: 如果任务未找到或未配置
             KeyError: 如果模型或提供商未找到
-            
+
         Examples:
             ```python
             from src.core.config import get_model_config
             from src.kernel.llm import LLMRequest
-            
+
             config = get_model_config()
             model_set = config.get_task("replyer")
-            
+
             # 直接用于 LLMRequest
             request = LLMRequest(model_set=model_set, request_name="chat")
             ```
         """
-        # 只有全局配置实例才允许由统一 models.toml 覆盖。独立实例（测试、
-        # 临时配置、插件沙箱）必须保持自包含，不能读取进程全局配置。
+        # Production task routing has exactly one authority: models.toml.
+        # Standalone ModelConfig instances remain self-contained for explicit
+        # legacy migration/tests, but the process-global instance must never
+        # hide a compact-registry error by silently falling back here.
         if self is _global_model_config:
-            try:
-                from src.kernel.config.models_loader import get_models_config
+            from src.kernel.config.models_loader import get_models_config
 
-                mc = get_models_config()
-                if mc.tasks:
-                    return mc.get_task(task_name)  # type: ignore[return-value]
-            except Exception:
-                pass
+            return get_models_config().get_task(task_name)  # type: ignore[return-value]
 
         # ─── 回退：旧格式 model.toml ───
         # 获取任务配置
@@ -557,7 +572,7 @@ class ModelConfig(ConfigBase):
 
             if secondary_pick_prob > 0.0 and random.random() < secondary_pick_prob:
                 model_names[0], model_names[1] = model_names[1], model_names[0]
-        
+
         # 构建 ModelSet
         model_set: list[dict[str, Any]] = []
 
@@ -572,14 +587,14 @@ class ModelConfig(ConfigBase):
             }
         except Exception:
             global_extra_params = {}
-        
+
         for model_name in model_names:
             # 获取模型信息
             model_info = self.get_model(model_name)
-            
+
             # 获取提供商信息
             provider = self.get_provider(model_info.api_provider)
-            
+
             # 构建 ModelEntry 字典
             extra_params = dict(global_extra_params)
             extra_params.update(model_info.extra_params)
@@ -605,9 +620,9 @@ class ModelConfig(ConfigBase):
                     model_info.media_capabilities
                 ),
             }
-            
+
             model_set.append(model_entry)
-        
+
         return cast(ModelSet, model_set)
 
     def get_model_set_by_name(
@@ -618,42 +633,43 @@ class ModelConfig(ConfigBase):
         max_tokens: int | None = None,
     ) -> ModelSet:
         """根据模型名称获取 ModelSet
-        
+
         通过模型内部标识符直接获取可用于 LLMRequest 的 ModelSet，
         无需预先配置任务。所有参数都是可选的，None 时使用合理的默认值。
-        
+
         Args:
             model_name: 模型名称（config/model.toml 中 models 列表里的 name）
             temperature: 温度参数，None 时使用默认值 0.7
             max_tokens: 最大输出 token 数，None 时使用默认值 800
-            
+
         Returns:
             ModelSet: 包含单个模型配置的列表
-            
+
         Raises:
             KeyError: 如果模型或其提供商未找到
-            
+
         Examples:
             ```python
             from src.core.config import get_model_config
             from src.kernel.llm import LLMRequest
-            
+
             config = get_model_config()
             model_set = config.get_model_set_by_name("gpt-4")
-            
+
             request = LLMRequest(model_set=model_set, request_name="chat")
             ```
         """
         # 获取模型信息
         model_info = self.get_model(model_name)
-        
+
         # 获取提供商信息
         provider = self.get_provider(model_info.api_provider)
-        
+
         # 获取全局额外参数
         global_extra_params: dict[str, Any] = {}
         try:
             from src.core.config import get_core_config
+
             core_config = get_core_config()
             global_extra_params = {
                 "force_sync_http": core_config.advanced.force_sync_http,
@@ -661,11 +677,11 @@ class ModelConfig(ConfigBase):
             }
         except Exception:
             global_extra_params = {}
-        
+
         # 合并额外参数
         extra_params = dict(global_extra_params)
         extra_params.update(model_info.extra_params)
-        
+
         # 构建 ModelEntry（使用配置中的默认值）
         model_entry: dict[str, Any] = {
             "api_provider": provider.name,
@@ -688,7 +704,7 @@ class ModelConfig(ConfigBase):
                 model_info.media_capabilities
             ),
         }
-        
+
         return cast(ModelSet, [model_entry])
 
 
@@ -703,37 +719,36 @@ _global_model_config: ModelConfig | None = None
 
 def get_model_config() -> ModelConfig:
     """获取全局模型配置实例
-    
+
     Returns:
         ModelConfig: 模型配置实例
-        
+
     Raises:
         RuntimeError: 如果配置未初始化
     """
     global _global_model_config
     if _global_model_config is None:
         raise RuntimeError(
-            "Model config not initialized. "
-            "Call init_model_config() first."
+            "Model config not initialized. Call init_model_config() first."
         )
     return _global_model_config
 
 
 def init_model_config(config_path: str) -> ModelConfig:
     """初始化模型配置
-    
+
     Args:
         config_path: 配置文件路径
-        
+
     Returns:
         ModelConfig: 模型配置实例
-        
+
     Examples:
         使用默认配置：
         ```python
         config = init_model_config()
         ```
-        
+
         从文件加载：
         ```python
         config = init_model_config("config/model.toml")
@@ -780,6 +795,7 @@ def init_model_config(config_path: str) -> ModelConfig:
 
         # 保存默认配置到文件
         from src.kernel.config.core import _render_toml_with_signature
+
         toml_content = _render_toml_with_signature(ModelConfig, default_config)
         path.write_text(toml_content, encoding="utf-8")
 

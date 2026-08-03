@@ -1,5 +1,8 @@
 # Elysium unified model registry (LiteLLM-style)
 # Copy to config/models.toml and replace both provider credentials locally.
+# This file is the sole authority for production automatic task routing.
+# Startup fails on invalid references; it never falls back to model.toml.
+# Priority is defined only by each tasks.*.models array, from left to right.
 
 [providers.NexusAI]
 base_url = "http://localhost:3000/v1"

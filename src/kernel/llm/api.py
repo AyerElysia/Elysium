@@ -32,7 +32,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator
 
-from ..config.unified import get_config
 from ..logger import get_logger
 
 logger = get_logger("llm.api", display="LLM-API", enable_event_broadcast=False)
@@ -70,78 +69,31 @@ class StreamChunk:
 
 
 def _resolve_model_set(routing_name: str) -> list[dict[str, Any]]:
-    """将路由名解析为 model_set（list[dict]），兼容老 LLMRequest 格式。
+    """Resolve a task or registered model from authoritative ``models.toml``.
 
-    解析优先级：
-    1. 新格式 config/models.toml（LiteLLM 风格）
-    2. 统一配置 elysium.toml 中的 llm 节
-    3. 老格式 config/model.toml（最终回退）
+    Automatic fallback to ``elysium.toml`` or legacy ``model.toml`` is
+    intentionally forbidden: a production routing error must be visible and
+    must not switch the running system to an unreviewed priority chain.
     """
-    # 1. 新格式 models.toml
-    try:
-        from ..config.models_loader import get_models_config
 
-        mc = get_models_config()
-        if mc.tasks:
-            # get_task 内部处理别名解析
-            try:
-                return mc.get_task(routing_name)
-            except ValueError:
-                pass
-            # "default"/"main" 回退到 expression
-            if routing_name in ("default", "main") and "expression" in mc.tasks:
-                return mc.get_task("expression")
-    except (ImportError, Exception):
-        pass
+    from ..config.models_loader import get_models_config
 
-    # 2. 统一配置
-    cfg = get_config()
-    model_name = cfg.llm.routing.get(routing_name, routing_name)
-    model_cfg = cfg.llm.models.get(model_name)
-    if model_cfg is not None and model_cfg.provider:
-        provider_cfg = cfg.llm.providers.get(model_cfg.provider)
-        if provider_cfg is not None:
-            api_key = provider_cfg.api_key
-            if isinstance(api_key, list):
-                api_key = api_key[0] if api_key else ""
-            entry: dict[str, Any] = {
-                "api_provider": model_cfg.provider,
-                "base_url": provider_cfg.base_url,
-                "model_identifier": model_cfg.model,
-                "api_key": api_key,
-                "client_type": provider_cfg.client_type,
-                "max_tokens": model_cfg.max_tokens,
-                "temperature": model_cfg.temperature,
-                "top_p": model_cfg.top_p,
-                "max_retry": provider_cfg.max_retry,
-                "timeout": provider_cfg.timeout,
-            }
-            entry.update(model_cfg.extra)
-            return [entry]
+    registry = get_models_config()
+    resolved_name = (
+        "expression" if routing_name in ("default", "main") else routing_name
+    )
+    if resolved_name in registry.tasks:
+        return registry.get_task(resolved_name)
 
-    # 3. 老格式回退
-    return _legacy_model_set(routing_name)
+    model = registry.get_model_entry(resolved_name)
+    if model is not None:
+        return [model]
 
-
-def _legacy_model_set(task_name: str) -> list[dict[str, Any]]:
-    """兼容回退：从老 ModelConfig 获取 model_set。"""
-    try:
-        from src.core.config.model_config import get_model_config
-
-        mc = get_model_config()
-        # 尝试直接匹配任务名
-        try:
-            return mc.get_task(task_name)
-        except (ValueError, KeyError):
-            pass
-        # 回退到 "actor" 作为默认任务
-        if task_name in ("default", "main"):
-            return mc.get_task("actor")
-        raise ValueError(f"任务 '{task_name}' 未找到")
-    except Exception as e:
-        raise ValueError(
-            f"无法解析模型路由 '{task_name}'：统一配置中未定义，老配置也不可用 ({e})"
-        )
+    raise ValueError(
+        f"模型路由 '{routing_name}' 未在权威配置 "
+        f"{registry.snapshot.source_path} 中定义 "
+        f"(snapshot={registry.snapshot.digest})"
+    )
 
 
 # ─────────────────────────────────────────────
@@ -170,9 +122,9 @@ async def chat(
     Returns:
         ChatResponse 包含 text, tool_calls, usage
     """
-    from .request import LLMRequest
-    from .payload import LLMPayload, Text, ROLE
+    from .payload import ROLE, LLMPayload, Text
     from .payload.tooling import ToolRegistry
+    from .request import LLMRequest
 
     model_set = _resolve_model_set(model)
 
@@ -195,7 +147,9 @@ async def chat(
             payloads.append(LLMPayload(role=role, content=[Text(text=content)]))
 
     # 构建请求
-    req = LLMRequest(model_set=model_set, payloads=payloads, request_name=f"chat.{model}")
+    req = LLMRequest(
+        model_set=model_set, payloads=payloads, request_name=f"chat.{model}"
+    )
 
     # 工具
     if tools:
@@ -236,9 +190,9 @@ async def stream(
     Yields:
         StreamChunk，每次包含增量文本
     """
-    from .request import LLMRequest
-    from .payload import LLMPayload, Text, ROLE
+    from .payload import ROLE, LLMPayload, Text
     from .payload.tooling import ToolRegistry
+    from .request import LLMRequest
 
     model_set = _resolve_model_set(model)
 
@@ -258,7 +212,9 @@ async def stream(
             content = msg.get("content", "")
             payloads.append(LLMPayload(role=role, content=[Text(text=content)]))
 
-    req = LLMRequest(model_set=model_set, payloads=payloads, request_name=f"stream.{model}")
+    req = LLMRequest(
+        model_set=model_set, payloads=payloads, request_name=f"stream.{model}"
+    )
 
     if tools:
         registry = ToolRegistry()

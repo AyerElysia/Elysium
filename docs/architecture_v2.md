@@ -173,7 +173,7 @@ result = await pipeline.process_incoming(message)
 
 ## 兼容性
 
-- 老配置文件（core.toml + model.toml）自动兼容
+- `core.toml` 继续兼容；生产模型路由只读取 `models.toml`，旧 `model.toml` 仅供显式迁移
 - 老插件（BasePlugin）继续运行，不受影响
 - 老 managers 继续工作，新 Registry 并行存在
 - 2725 个测试保持绿色
