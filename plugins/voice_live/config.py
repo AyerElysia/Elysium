@@ -76,6 +76,10 @@ class VoiceLiveConfig(BaseConfig):
             default="VOICE_LIVE_API_KEY",
             description="云端 API Key 所在环境变量名；密钥本身不得写入配置",
         )
+        api_key_file: str = Field(
+            default="",
+            description="云端 API Key 的 owner-only 本地文件；环境变量优先",
+        )
         model_name: str = Field(default="MiniCPM-o-4_5", description="实时模型标识")
         voice: str = Field(
             default="", description="云端 voice 标识；空值使用供应商默认语音"
@@ -122,6 +126,10 @@ class VoiceLiveConfig(BaseConfig):
             default="SEEDVC_STREAM_TOKEN",
             description="本地变声服务 bearer token 所在环境变量名；不得写入 token 本身",
         )
+        token_file: str = Field(
+            default="",
+            description="变声服务 bearer token 的 owner-only 本地文件；环境变量优先",
+        )
         profile_id: str = Field(
             default="elysia",
             description="服务端预注册的目标音色 profile ID",
@@ -163,6 +171,13 @@ class VoiceLiveConfig(BaseConfig):
         )
         cross_scene_awareness: bool = Field(
             default=True, description="感知完整 WorldState"
+        )
+
+        perception_context_max_bytes: int = Field(
+            default=32 * 1024,
+            ge=4096,
+            le=128 * 1024,
+            description="实时 Provider 单次注入的世界感知视图字节上限；完整投影仍由 LifeEngine 保留",
         )
 
     @config_section("audio", title="音频传输", tag="audio", order=40)

@@ -445,6 +445,18 @@ class CallSession:
                 return
             await provider.inject_context(prefix)
             self._pending_voice_perception = prepared
+            stats_builder = getattr(
+                self._bridge,
+                "perception_projection_stats",
+                None,
+            )
+            if callable(stats_builder):
+                stats = stats_builder()
+                if stats:
+                    await self._store.append_async(
+                        "perception.projected",
+                        stats,
+                    )
 
     async def _on_response_done(self, success: bool) -> None:
         """Commit world delivery only after one completed realtime turn."""

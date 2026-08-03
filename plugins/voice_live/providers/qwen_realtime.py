@@ -21,12 +21,40 @@ from .base import (
     TranscriptEvent,
 )
 
+_QWEN_MAX_FRAME_BYTES = 256 * 1024
+_QWEN_CONTEXT_CHUNK_BYTES = 192 * 1024
+
+
+def _split_utf8_text(text: str, *, max_bytes: int) -> list[str]:
+    """Split text without breaking UTF-8 code points or dropping content."""
+
+    if max_bytes < 4:
+        raise ValueError("max_bytes must accommodate one UTF-8 code point")
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return [text]
+
+    chunks: list[str] = []
+    offset = 0
+    while offset < len(encoded):
+        end = min(offset + max_bytes, len(encoded))
+        if end < len(encoded):
+            while end > offset and encoded[end] & 0xC0 == 0x80:
+                end -= 1
+        if end == offset:
+            raise ValueError("unable to split UTF-8 text at the requested byte limit")
+        chunks.append(encoded[offset:end].decode("utf-8"))
+        offset = end
+    return chunks
+
 
 def _url_with_model(url: str, model: str) -> str:
     parts = urlsplit(url)
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
     query.setdefault("model", model)
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+    return urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
+    )
 
 
 def _qwen_tool_schema(tool: dict[str, Any]) -> dict[str, Any]:
@@ -34,9 +62,7 @@ def _qwen_tool_schema(tool: dict[str, Any]) -> dict[str, Any]:
     if isinstance(tool.get("function"), dict):
         return dict(tool)
     function = {
-        key: tool[key]
-        for key in ("name", "description", "parameters")
-        if key in tool
+        key: tool[key] for key in ("name", "description", "parameters") if key in tool
     }
     return {"type": "function", "function": function}
 
@@ -95,7 +121,9 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
                 ),
                 timeout=self._connect_timeout,
             )
-            self._receive_task = asyncio.create_task(self._receive_loop(), name="voice-qwen-receive")
+            self._receive_task = asyncio.create_task(
+                self._receive_loop(), name="voice-qwen-receive"
+            )
             if self._model.startswith("qwen-audio-"):
                 session = {
                     "modalities": ["text", "audio"],
@@ -134,9 +162,7 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
                     self._tool_name_map[provider_name] = internal_name
                     function["name"] = provider_name
                     translated_tools.append(translated)
-                tool_session: dict[str, Any] = {
-                    "tools": translated_tools
-                }
+                tool_session: dict[str, Any] = {"tools": translated_tools}
                 if not self._model.startswith("qwen-audio-"):
                     tool_session["tool_choice"] = "auto"
                 acknowledgement = await self._update_session(tool_session)
@@ -180,7 +206,11 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
     async def disconnect(self) -> None:
         self._closed = True
         current = asyncio.current_task()
-        if self._receive_task and self._receive_task is not current and not self._receive_task.done():
+        if (
+            self._receive_task
+            and self._receive_task is not current
+            and not self._receive_task.done()
+        ):
             self._receive_task.cancel()
             try:
                 await self._receive_task
@@ -215,11 +245,11 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
                 }
             )
         await self._emit_state(
-            ProviderState.INTERRUPTED if self._response_active else ProviderState.LISTENING
+            ProviderState.INTERRUPTED
+            if self._response_active
+            else ProviderState.LISTENING
         )
-        await self._emit_interruption(
-            InterruptionEvent("client", response_id, item_id)
-        )
+        await self._emit_interruption(InterruptionEvent("client", response_id, item_id))
 
     async def send_text(self, text: str) -> None:
         await self.inject_context(text)
@@ -228,19 +258,31 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
     async def inject_context(self, text: str) -> None:
         """Append one turn context item without independently triggering speech."""
 
-        item_id = f"voice_context_{uuid.uuid4().hex}"
-        await self._send(
-            {
-                "type": "conversation.item.create",
-                "item": {
-                    "id": item_id,
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": text}],
-                },
-            }
-        )
-        self._transient_context_item_ids.append(item_id)
+        chunks = _split_utf8_text(text, max_bytes=_QWEN_CONTEXT_CHUNK_BYTES)
+        for chunk in chunks:
+            item_id = f"voice_context_{uuid.uuid4().hex}"
+            await self._send(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "id": item_id,
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": chunk}],
+                    },
+                }
+            )
+            self._transient_context_item_ids.append(item_id)
+        if len(chunks) > 1:
+            await self._emit_metrics(
+                {
+                    "context_delivery": {
+                        "bytes": len(text.encode("utf-8")),
+                        "chunks": len(chunks),
+                        "chunk_limit_bytes": _QWEN_CONTEXT_CHUNK_BYTES,
+                    }
+                }
+            )
 
     async def _delete_transient_context_items(self) -> None:
         """Remove delivered world context after the current Qwen turn."""
@@ -248,9 +290,7 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
         item_ids = self._transient_context_item_ids
         self._transient_context_item_ids = []
         for item_id in item_ids:
-            await self._send(
-                {"type": "conversation.item.delete", "item_id": item_id}
-            )
+            await self._send({"type": "conversation.item.delete", "item_id": item_id})
 
     async def submit_tool_result(self, call_id: str, result: Any) -> None:
         await self._send(
@@ -259,7 +299,9 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
                 "item": {
                     "type": "function_call_output",
                     "call_id": call_id,
-                    "output": json.dumps(result, ensure_ascii=False) if not isinstance(result, str) else result,
+                    "output": json.dumps(result, ensure_ascii=False)
+                    if not isinstance(result, str)
+                    else result,
                 },
             }
         )
@@ -271,7 +313,15 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
                 raise self._terminal_error
             raise RuntimeError("Qwen Realtime websocket is closed")
         event.setdefault("event_id", f"voice_{uuid.uuid4().hex}")
-        await self._ws.send_str(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+        payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+        payload_bytes = len(payload.encode("utf-8"))
+        if payload_bytes > _QWEN_MAX_FRAME_BYTES:
+            event_type = str(event.get("type") or "unknown")
+            raise RuntimeError(
+                "Qwen outbound websocket event exceeds the 256 KiB frame limit: "
+                f"type={event_type}, bytes={payload_bytes}"
+            )
+        await self._ws.send_str(payload)
 
     async def _update_session(self, session: dict[str, Any]) -> dict[str, Any]:
         """Apply one semantic configuration unit and await its acknowledgement."""
@@ -295,7 +345,9 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
                 if message.type == aiohttp.WSMsgType.TEXT:
                     await self._handle_event(json.loads(message.data))
                 elif message.type == aiohttp.WSMsgType.ERROR:
-                    raise RuntimeError(str(self._ws.exception() or "Qwen websocket error"))
+                    raise RuntimeError(
+                        str(self._ws.exception() or "Qwen websocket error")
+                    )
                 elif message.type in {
                     aiohttp.WSMsgType.CLOSE,
                     aiohttp.WSMsgType.CLOSED,
@@ -309,7 +361,7 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
                     )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - upstream transport boundary
             self._terminal_error = exc
             if self._updated is not None and not self._updated.done():
                 self._updated.set_exception(exc)
@@ -328,7 +380,9 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
             return
         if event_type == "input_audio_buffer.speech_started":
             await self._emit_interruption(
-                InterruptionEvent("server_vad", self._active_response_id, self._active_item_id)
+                InterruptionEvent(
+                    "server_vad", self._active_response_id, self._active_item_id
+                )
             )
             await self._emit_state(ProviderState.LISTENING)
             return
@@ -338,7 +392,9 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
         if event_type == "response.created":
             response = event.get("response") or {}
             self._response_active = True
-            self._active_response_id = str(response.get("id") or event.get("response_id") or "")
+            self._active_response_id = str(
+                response.get("id") or event.get("response_id") or ""
+            )
             await self._emit_state(ProviderState.THINKING)
             return
         if event_type in {"response.output_item.added", "conversation.item.created"}:
@@ -349,7 +405,11 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
         if event_type == "response.audio.delta" and event.get("delta"):
             await self._emit_state(ProviderState.SPEAKING)
             await self._emit_audio(
-                AudioDelta(base64.b64decode(event["delta"]), self.output_sample_rate, response_id=self._active_response_id)
+                AudioDelta(
+                    base64.b64decode(event["delta"]),
+                    self.output_sample_rate,
+                    response_id=self._active_response_id,
+                )
             )
             return
         if event_type == "response.audio_transcript.delta" and event.get("delta"):
@@ -365,7 +425,9 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
         if event_type == "conversation.item.input_audio_transcription.completed":
             text = str(event.get("transcript") or "")
             if text:
-                await self._emit_transcript(TranscriptEvent("user", text, True, event_id))
+                await self._emit_transcript(
+                    TranscriptEvent("user", text, True, event_id)
+                )
             return
         if event_type == "response.function_call_arguments.done":
             provider_name = str(event.get("name") or "")
@@ -392,7 +454,9 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
             return
         if event_type == "error":
             error = event.get("error") or {}
-            message = str(error.get("message") or event.get("message") or "Qwen Realtime error")
+            message = str(
+                error.get("message") or event.get("message") or "Qwen Realtime error"
+            )
             code = str(error.get("code") or "").strip()
             error_type = str(error.get("type") or "").strip()
             details = ", ".join(value for value in (error_type, code) if value)

@@ -8,7 +8,6 @@ import asyncio
 import hashlib
 import json
 import math
-import os
 import struct
 import sys
 import time
@@ -20,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from plugins.voice_live.audio import resample_pcm16_mono
+from plugins.voice_live.secrets import resolve_secret
 from plugins.voice_live.voice_conversion import HttpVoiceConverter
 
 
@@ -47,9 +47,13 @@ def _rms(pcm16: bytes) -> int:
 
 
 async def _run(args: argparse.Namespace) -> dict[str, object]:
-    token = os.environ.get(args.token_env, "")
+    token = resolve_secret(
+        args.token_env,
+        args.token_file,
+        label="Voice conversion",
+    )
     if not token:
-        raise RuntimeError(f"environment variable {args.token_env} is empty")
+        raise RuntimeError("Voice conversion credential is not configured")
     source_pcm, source_rate = _read_wav(args.input)
     converter = HttpVoiceConverter(
         args.url,
@@ -160,6 +164,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True)
     parser.add_argument("--token-env", default="SEEDVC_STREAM_TOKEN")
+    parser.add_argument("--token-file", default="")
     parser.add_argument("--profile-id", default="elysia")
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)

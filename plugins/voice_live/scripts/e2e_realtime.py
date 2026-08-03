@@ -8,7 +8,6 @@ import asyncio
 import hashlib
 import json
 import math
-import os
 import struct
 import sys
 import time
@@ -21,10 +20,11 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from plugins.voice_live.protocol import ProviderState  # noqa: E402
-from plugins.voice_live.providers.base import AudioDelta, TranscriptEvent  # noqa: E402
-from plugins.voice_live.providers.minicpm_omni import MiniCPMOmniProvider  # noqa: E402
-from plugins.voice_live.providers.qwen_realtime import QwenRealtimeProvider  # noqa: E402
+from plugins.voice_live.protocol import ProviderState
+from plugins.voice_live.providers.base import AudioDelta, TranscriptEvent
+from plugins.voice_live.providers.minicpm_omni import MiniCPMOmniProvider
+from plugins.voice_live.providers.qwen_realtime import QwenRealtimeProvider
+from plugins.voice_live.secrets import resolve_secret
 
 
 def _read_pcm16_mono_16k(path: Path) -> bytes:
@@ -57,9 +57,13 @@ def _pcm16_rms(pcm: bytes) -> int:
 
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
     if args.provider == "qwen_realtime":
-        api_key = os.environ.get(args.api_key_env, "")
+        api_key = resolve_secret(
+            args.api_key_env,
+            args.api_key_file,
+            label="Voice Live provider",
+        )
         if not api_key:
-            raise RuntimeError(f"environment variable {args.api_key_env} is empty")
+            raise RuntimeError("Qwen Realtime API credential is not configured")
         provider = QwenRealtimeProvider(
             args.url,
             api_key,
@@ -132,6 +136,9 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         if args.text:
             await provider.send_text(args.text)
             input_complete_at = time.monotonic()
+            await asyncio.wait_for(
+                response_finished.wait(), timeout=args.response_timeout
+            )
         else:
             source = _read_pcm16_mono_16k(args.input)
             if args.provider == "minicpm_omni" and args.mode == "turn_based":
@@ -202,6 +209,7 @@ def main() -> None:
     parser.add_argument("--model", default="qwen3.5-omni-plus-realtime")
     parser.add_argument("--voice", default="Tina")
     parser.add_argument("--api-key-env", default="VOICE_LIVE_API_KEY")
+    parser.add_argument("--api-key-file", default="")
     parser.add_argument("--input", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--text", default="")

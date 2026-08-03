@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from plugins.voice_live.config import VoiceLiveConfig
-from plugins.voice_live.context_bridge import ContextBridge
+from plugins.voice_live.context_bridge import ContextBridge, _compact_context_lines
 from plugins.voice_live.life_binding import get_running_life_service
 from plugins.voice_live.plugin import VoiceLivePlugin
 from plugins.voice_live.providers.factory import create_provider
@@ -60,7 +60,9 @@ async def test_context_bridge_separates_stable_identity_and_transient_world(
     store = VoiceEpisodeStore(tmp_path, "voice_live_episode", "episode")
     consciousness = FakeConsciousness()
     bridge = ContextBridge(config, consciousness, store)
-    monkeypatch.setattr("plugins.voice_live.context_bridge.get_core_config", _core_config)
+    monkeypatch.setattr(
+        "plugins.voice_live.context_bridge.get_core_config", _core_config
+    )
     service = FakeLifeService()
     monkeypatch.setattr(
         "plugins.life_engine.service.registry.get_life_engine_service",
@@ -90,8 +92,29 @@ async def test_context_bridge_separates_stable_identity_and_transient_world(
         await bridge.record_transcript("system", "invalid")
 
 
+def test_realtime_perception_projection_is_bounded_and_traceable() -> None:
+    content = (
+        "presence\n"
+        + "\n".join(f"- assertion-{index}: {'世界' * 40}" for index in range(2_000))
+        + "\nlatest-change"
+    )
+
+    projected, stats = _compact_context_lines(content, 4096)
+
+    assert len(projected.encode("utf-8")) <= 4096
+    assert projected.startswith("presence")
+    assert projected.endswith("latest-change")
+    assert "LifeEngine" in projected
+    assert "inner_query" in projected
+    assert stats["compacted"] is True
+    assert stats["original_bytes"] > stats["delivered_bytes"]
+    assert stats["omitted_lines"] > 0
+
+
 @pytest.mark.asyncio
-async def test_context_bridge_honors_optional_life_engine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_context_bridge_honors_optional_life_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config = VoiceLiveConfig()
     config.session.record_to_life = True
     config.session.require_life_engine = False
@@ -107,7 +130,9 @@ async def test_context_bridge_honors_optional_life_engine(tmp_path: Path, monkey
         await bridge.record_transcript("assistant", "must fail")
 
 
-def test_factory_is_explicit_and_never_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_factory_is_explicit_and_never_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = VoiceLiveConfig()
     assert isinstance(create_provider(config), MiniCPMOmniProvider)
 
@@ -128,6 +153,22 @@ def test_factory_is_explicit_and_never_falls_back(monkeypatch: pytest.MonkeyPatc
     config.full_duplex.upstream_url = ""
     with pytest.raises(RuntimeError, match="upstream_url"):
         create_provider(config)
+
+
+def test_factory_reads_owner_only_api_key_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = tmp_path / "qwen.key"
+    secret.write_text("runtime-secret\n", encoding="utf-8")
+    secret.chmod(0o600)
+    monkeypatch.delenv("VOICE_LIVE_API_KEY", raising=False)
+    config = VoiceLiveConfig()
+    config.full_duplex.provider_type = "qwen_realtime"
+    config.full_duplex.upstream_url = "wss://example.test/realtime"
+    config.full_duplex.api_key_file = str(secret)
+
+    assert isinstance(create_provider(config), QwenRealtimeProvider)
 
 
 def test_plugin_declares_only_its_router_and_event_handler() -> None:

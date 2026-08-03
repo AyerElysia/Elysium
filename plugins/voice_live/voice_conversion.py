@@ -7,12 +7,52 @@ engines and model code remain in their own service process and distribution.
 from __future__ import annotations
 
 import os
+import socket
+import struct
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 
 from .audio import resample_pcm16_mono
+from .secrets import resolve_secret
+
+
+def _default_gateway_from_route_table(route_table: str) -> str:
+    """Extract the IPv4 default gateway from Linux ``/proc/net/route``."""
+
+    for line in route_table.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 4 or fields[1] != "00000000":
+            continue
+        try:
+            flags = int(fields[3], 16)
+            gateway = int(fields[2], 16)
+        except ValueError:
+            continue
+        if flags & 0x2 and gateway:
+            return socket.inet_ntoa(struct.pack("<I", gateway))
+    raise RuntimeError("WSL Windows host gateway is unavailable")
+
+
+def resolve_service_url(service_url: str) -> str:
+    """Resolve the stable ``wsl-host`` alias without relying on DNS proxies."""
+
+    raw = str(service_url or "").strip()
+    parts = urlsplit(raw)
+    if parts.hostname != "wsl-host":
+        return raw
+    if parts.username or parts.password:
+        raise ValueError("voice-conversion service_url must not contain credentials")
+    if os.name == "nt":
+        host = "127.0.0.1"
+    else:
+        route_table = Path("/proc/net/route").read_text(encoding="ascii")
+        host = _default_gateway_from_route_table(route_table)
+    netloc = host if parts.port is None else f"{host}:{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 @dataclass(slots=True, frozen=True)
@@ -83,7 +123,7 @@ class HttpVoiceConverter:
             raise RuntimeError("voice-conversion service token is empty")
         if not profile_id.strip():
             raise ValueError("voice-conversion profile_id is required")
-        self._service_url = service_url.rstrip("/")
+        self._service_url = resolve_service_url(service_url).rstrip("/")
         self._headers = {"Authorization": f"Bearer {token}"}
         self._profile_id = profile_id
         self._connect_timeout = connect_timeout
@@ -251,7 +291,11 @@ def create_voice_converter(config: object) -> HttpVoiceConverter | None:
     section = config.voice_conversion
     if not section.enabled:
         return None
-    token = os.environ.get(str(section.token_env or ""), "")
+    token = resolve_secret(
+        section.token_env,
+        section.token_file,
+        label="Voice conversion",
+    )
     return HttpVoiceConverter(
         section.service_url,
         token,
@@ -266,4 +310,5 @@ __all__ = [
     "HttpVoiceConverter",
     "VoiceConverter",
     "create_voice_converter",
+    "resolve_service_url",
 ]

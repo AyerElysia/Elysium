@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -8,7 +9,9 @@ from aiohttp import web
 from plugins.voice_live.config import VoiceLiveConfig
 from plugins.voice_live.voice_conversion import (
     HttpVoiceConverter,
+    _default_gateway_from_route_table,
     create_voice_converter,
+    resolve_service_url,
 )
 
 
@@ -26,6 +29,29 @@ async def _start_server(
     await site.start()
     port = site._server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
     return runner, f"http://127.0.0.1:{port}"
+
+
+def test_wsl_host_alias_uses_linux_default_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    route_table = (
+        "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n"
+        "eth0 00000000 01D01AAC 0003 0 0 0 00000000 0 0 0\n"
+    )
+    assert _default_gateway_from_route_table(route_table) == "172.26.208.1"
+
+    class FakeRoute:
+        def read_text(self, *, encoding: str) -> str:
+            assert encoding == "ascii"
+            return route_table
+
+    monkeypatch.setattr(
+        "plugins.voice_live.voice_conversion.Path",
+        lambda _: FakeRoute(),
+    )
+    assert resolve_service_url("http://wsl-host:17861") == (
+        "http://172.26.208.1:17861"
+    )
 
 
 @pytest.mark.asyncio
@@ -110,6 +136,22 @@ def test_voice_converter_factory_requires_explicit_token(
     monkeypatch.delenv("VOICE_CONVERTER_TEST_TOKEN", raising=False)
     with pytest.raises(RuntimeError, match="service token is empty"):
         create_voice_converter(config)
+
+
+def test_voice_converter_factory_reads_owner_only_token_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = tmp_path / "seedvc.token"
+    token.write_text("local-token\n", encoding="utf-8")
+    token.chmod(0o600)
+    monkeypatch.delenv("VOICE_CONVERTER_TEST_TOKEN", raising=False)
+    config = VoiceLiveConfig()
+    config.voice_conversion.enabled = True
+    config.voice_conversion.token_env = "VOICE_CONVERTER_TEST_TOKEN"
+    config.voice_conversion.token_file = str(token)
+
+    assert isinstance(create_voice_converter(config), HttpVoiceConverter)
 
 
 @pytest.mark.asyncio

@@ -39,7 +39,10 @@ def test_obs_overlay_is_read_only_and_receives_audio() -> None:
     assert "m.voice_profile" in html
 
 
-def test_ticket_is_signed_single_use_and_routes_are_renderable(tmp_path: Path) -> None:
+def test_ticket_is_signed_single_use_and_routes_are_renderable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     config = VoiceLiveConfig()
     config.observability.trace_root = str(tmp_path)
     plugin = SimpleNamespace(config=config)
@@ -56,6 +59,14 @@ def test_ticket_is_signed_single_use_and_routes_are_renderable(tmp_path: Path) -
     health = client.get("/health").json()
     assert health["protocol"] == 1
     assert health["provider"] == "minicpm_omni"
+
+    monkeypatch.delenv("VOICE_LIVE_API_KEY", raising=False)
+    config.full_duplex.provider_type = "qwen_realtime"
+    config.full_duplex.api_key_file = str(tmp_path / "missing.key")
+    degraded = client.get("/health").json()
+    assert degraded["status"] == "degraded"
+    assert degraded["configured"] is False
+    assert degraded["readiness"]["provider_credential"] is False
 
 
 def test_voice_live_tree_contains_no_inline_api_key() -> None:

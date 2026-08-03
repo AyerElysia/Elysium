@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import os
-
+from ..secrets import resolve_secret
 from .base import BaseRealtimeProvider
 
 
@@ -26,7 +25,11 @@ def create_provider(config: object) -> BaseRealtimeProvider:
             connect_timeout=provider.connect_timeout_seconds,
             event_timeout=provider.event_timeout_seconds,
         )
-    api_key = os.environ.get(provider.api_key_env, "")
+    api_key = resolve_secret(
+        provider.api_key_env,
+        provider.api_key_file,
+        label="Voice Live provider",
+    )
     if provider_type == "qwen_realtime":
         from .qwen_realtime import QwenRealtimeProvider
 

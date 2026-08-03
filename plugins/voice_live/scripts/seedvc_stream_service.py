@@ -298,14 +298,34 @@ class SeedVCStream:
         return output.detach().float().cpu().numpy(), elapsed_ms
 
 
+def _read_token_file(configured_path: str) -> str:
+    """Read one token value without exposing it in process arguments."""
+
+    if not configured_path:
+        return ""
+    value = Path(configured_path).read_text(encoding="utf-8").strip()
+    if not value:
+        raise RuntimeError("Seed-VC token file is empty")
+    if "\x00" in value or "\n" in value or "\r" in value:
+        raise RuntimeError("Seed-VC token file must contain exactly one text value")
+    return value
+
+
 class SeedVCRuntime:
     """Own the CUDA model and the bounded set of active conversion streams."""
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        self.token = args.token or os.environ.get(args.token_env, "")
+        self.token = (
+            args.token
+            or os.environ.get(args.token_env, "")
+            or _read_token_file(args.token_file)
+        )
         if not self.token:
-            raise RuntimeError(f"Seed-VC service token is empty; set {args.token_env}")
+            raise RuntimeError(
+                f"Seed-VC service token is empty; set {args.token_env} "
+                "or provide --token-file"
+            )
         self.seedvc_root = Path(args.seedvc_root).resolve()
         if not (self.seedvc_root / "real-time-gui.py").is_file():
             raise FileNotFoundError(
@@ -561,6 +581,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=17861)
     parser.add_argument("--token", default="")
     parser.add_argument("--token-env", default="SEEDVC_STREAM_TOKEN")
+    parser.add_argument("--token-file", default="")
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True)

@@ -21,12 +21,19 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from plugins.voice_live.protocol import pack_audio_frame, unpack_audio_frame  # noqa: E402
+from plugins.voice_live.protocol import (
+    pack_audio_frame,
+    unpack_audio_frame,
+)
 
 
 def _read_input(path: Path) -> bytes:
     with wave.open(str(path), "rb") as source:
-        if (source.getnchannels(), source.getsampwidth(), source.getframerate()) != (1, 2, 16000):
+        if (source.getnchannels(), source.getsampwidth(), source.getframerate()) != (
+            1,
+            2,
+            16000,
+        ):
             raise ValueError("input WAV must be 16 kHz, mono, PCM16")
         return source.readframes(source.getnframes())
 
@@ -61,6 +68,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     episode_id = ""
     saw_speaking = False
     first_audio_at = 0.0
+    last_audio_at = 0.0
     input_complete_at = 0.0
     started_at = time.monotonic()
 
@@ -69,7 +77,9 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         async with client.get(f"{base}/health") as response:
             health_before = await response.json()
             response.raise_for_status()
-        async with client.post(f"{base}/ticket", headers={"Origin": origin}) as response:
+        async with client.post(
+            f"{base}/ticket", headers={"Origin": origin}
+        ) as response:
             ticket_body = await response.json()
             response.raise_for_status()
         ws_url = base.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
@@ -80,12 +90,18 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         )
 
         async def receive() -> None:
-            nonlocal episode_id, first_audio_at, sample_rate, saw_speaking
+            nonlocal \
+                episode_id, \
+                first_audio_at, \
+                last_audio_at, \
+                sample_rate, \
+                saw_speaking
             async for message in ws:
                 if message.type is aiohttp.WSMsgType.BINARY:
                     frame = unpack_audio_frame(message.data)
                     if not first_audio_at:
                         first_audio_at = time.monotonic()
+                    last_audio_at = time.monotonic()
                     sample_rate = frame.sample_rate
                     output.extend(frame.pcm16)
                     continue
@@ -142,7 +158,23 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 for _ in range(args.trailing_silence_ms // args.frame_ms):
                     await send_frame(silence)
             input_complete_at = time.monotonic()
-            await asyncio.wait_for(response_finished.wait(), timeout=args.response_timeout)
+            await asyncio.wait_for(
+                response_finished.wait(), timeout=args.response_timeout
+            )
+            response_finished_at = time.monotonic()
+            drain_deadline = time.monotonic() + args.conversion_drain_timeout
+            while time.monotonic() < drain_deadline:
+                idle_from = max(last_audio_at, response_finished_at)
+                idle_remaining = args.output_idle_seconds - (
+                    time.monotonic() - idle_from
+                )
+                if first_audio_at and idle_remaining <= 0:
+                    break
+                await asyncio.sleep(min(0.1, max(0.01, idle_remaining)))
+            else:
+                raise TimeoutError(
+                    "gateway output did not become idle before conversion drain timeout"
+                )
             await ws.send_json({"type": "stop"})
             await asyncio.wait_for(ended.wait(), timeout=15)
         finally:
@@ -174,7 +206,9 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         "output_rms": _rms(pcm16),
         "output_sha256": hashlib.sha256(pcm16).hexdigest(),
         "first_audio_latency_ms": round((first_audio_at - started_at) * 1000, 1),
-        "first_audio_after_input_ms": round((first_audio_at - input_complete_at) * 1000, 1),
+        "first_audio_after_input_ms": round(
+            (first_audio_at - input_complete_at) * 1000, 1
+        ),
     }
     if result["output_rms"] <= 0 or result["output_seconds"] <= 0.1:
         raise RuntimeError(f"gateway returned invalid audio: {result}")
@@ -194,6 +228,8 @@ def main() -> None:
     parser.add_argument("--trailing-silence-ms", type=int, default=1800)
     parser.add_argument("--connect-timeout", type=float, default=45)
     parser.add_argument("--response-timeout", type=float, default=60)
+    parser.add_argument("--output-idle-seconds", type=float, default=1.0)
+    parser.add_argument("--conversion-drain-timeout", type=float, default=30.0)
     args = parser.parse_args()
     print(json.dumps(asyncio.run(_run(args)), ensure_ascii=False, indent=2))
 

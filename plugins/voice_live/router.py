@@ -18,6 +18,7 @@ from src.kernel.logger import get_logger
 
 from .auth import TicketAuthority
 from .protocol import SessionState
+from .secrets import secret_readiness
 from .session import CallSession
 
 logger = get_logger("voice_live.router", display="Voice Live")
@@ -55,6 +56,63 @@ class VoiceLiveRouter(BaseRouter):
     def session_snapshots(self) -> list[dict[str, Any]]:
         return [session.snapshot() for session in self._sessions.values()]
 
+    def _readiness_snapshot(self) -> dict[str, Any]:
+        """Return redacted local prerequisites without contacting dependencies."""
+
+        config = self.plugin.config
+        provider = config.full_duplex
+        reasons: list[str] = []
+        provider_enabled = provider.provider_type != "disabled"
+        provider_endpoint = bool(str(provider.upstream_url or "").strip())
+        provider_credential = True
+        if provider.provider_type in {"qwen_realtime", "openai_realtime"}:
+            provider_credential, reason = secret_readiness(
+                provider.api_key_env,
+                provider.api_key_file,
+                label="Voice Live provider",
+            )
+            if reason:
+                reasons.append(reason)
+        if not provider_enabled:
+            reasons.append("Voice Live provider is disabled")
+        elif not provider_endpoint:
+            reasons.append("Voice Live provider endpoint is not configured")
+
+        conversion = config.voice_conversion
+        conversion_credential = True
+        conversion_endpoint = True
+        if conversion.enabled:
+            conversion_endpoint = bool(str(conversion.service_url or "").strip())
+            conversion_credential, reason = secret_readiness(
+                conversion.token_env,
+                conversion.token_file,
+                label="Voice conversion",
+            )
+            if not conversion_endpoint:
+                reasons.append("Voice conversion endpoint is not configured")
+            if reason:
+                reasons.append(reason)
+
+        ready = (
+            provider_enabled
+            and provider_endpoint
+            and provider_credential
+            and conversion_endpoint
+            and conversion_credential
+        )
+        return {
+            "ready": ready,
+            "provider_credential": provider_credential,
+            "voice_conversion": (
+                "disabled"
+                if not conversion.enabled
+                else "ready"
+                if conversion_endpoint and conversion_credential
+                else "degraded"
+            ),
+            "degraded_reasons": reasons,
+        }
+
     def register_endpoints(self) -> None:
         @self.app.get("/", response_class=HTMLResponse)
         async def index() -> HTMLResponse:
@@ -80,13 +138,15 @@ class VoiceLiveRouter(BaseRouter):
         @self.app.get("/health")
         async def health() -> JSONResponse:
             provider = self.plugin.config.full_duplex
+            readiness = self._readiness_snapshot()
             return JSONResponse(
                 {
-                    "status": "ok",
+                    "status": "ok" if readiness["ready"] else "degraded",
                     "protocol": 1,
                     "provider": provider.provider_type,
                     "model": provider.model_name,
-                    "configured": provider.provider_type != "disabled" and bool(provider.upstream_url),
+                    "configured": readiness["ready"],
+                    "readiness": readiness,
                     "active_sessions": self.active_session_count,
                     "sessions": self.session_snapshots(),
                     "observers": len(self._observers),

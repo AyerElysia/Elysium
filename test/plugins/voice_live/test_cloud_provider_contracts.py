@@ -11,8 +11,11 @@ from aiohttp import web
 from plugins.voice_live.providers.base import AudioDelta, TranscriptEvent
 from plugins.voice_live.providers.openai_realtime import OpenAIRealtimeProvider
 from plugins.voice_live.providers.qwen_realtime import (
+    _QWEN_CONTEXT_CHUNK_BYTES,
+    _QWEN_MAX_FRAME_BYTES,
     QwenRealtimeProvider,
     _qwen_safe_tool_name,
+    _split_utf8_text,
 )
 
 
@@ -83,9 +86,7 @@ async def test_qwen_realtime_wire_contract() -> None:
             await ws.send_json({"type": "session.updated", "session": {}})
         observed["audio"] = json.loads((await ws.receive()).data)
         pcm = b"\x01\x00" * 240
-        await ws.send_json(
-            {"type": "response.created", "response": {"id": "qwen-r1"}}
-        )
+        await ws.send_json({"type": "response.created", "response": {"id": "qwen-r1"}})
         await ws.send_json(
             {"type": "response.audio.delta", "delta": base64.b64encode(pcm).decode()}
         )
@@ -96,7 +97,9 @@ async def test_qwen_realtime_wire_contract() -> None:
                 "transcript": "已接通",
             }
         )
-        await ws.send_json({"type": "response.done", "response": {"usage": {"total_tokens": 2}}})
+        await ws.send_json(
+            {"type": "response.done", "response": {"usage": {"total_tokens": 2}}}
+        )
         done.set()
         async for _ in ws:
             pass
@@ -148,7 +151,9 @@ async def test_qwen_realtime_wire_contract() -> None:
     assert session["turn_detection"] == {"type": "semantic_vad"}
     assert session["input_audio_format"] == "pcm"
     assert observed["sessions"][1]["session"] == {"instructions": "identity"}
-    assert observed["sessions"][2]["session"]["tools"][0]["function"]["name"] == "remember"
+    assert (
+        observed["sessions"][2]["session"]["tools"][0]["function"]["name"] == "remember"
+    )
     assert len(base64.b64decode(observed["audio"]["audio"])) == 640
     assert audio[0].sample_rate == 24000
     assert transcripts[-1] == TranscriptEvent("assistant", "已接通", True, "qwen-e1")
@@ -156,6 +161,47 @@ async def test_qwen_realtime_wire_contract() -> None:
 
 def test_qwen_tool_name_mapping_is_reversible_and_protocol_safe() -> None:
     assert _qwen_safe_tool_name("action-report_state") == "action_report_state"
+
+
+def test_qwen_context_chunking_preserves_unicode_below_frame_limit() -> None:
+    text = "世界感知🌸" * 40_000
+
+    chunks = _split_utf8_text(text, max_bytes=_QWEN_CONTEXT_CHUNK_BYTES)
+
+    assert len(chunks) > 1
+    assert "".join(chunks) == text
+    assert all(
+        len(chunk.encode("utf-8")) <= _QWEN_CONTEXT_CHUNK_BYTES for chunk in chunks
+    )
+
+
+@pytest.mark.asyncio
+async def test_qwen_context_events_stay_below_upstream_frame_limit() -> None:
+    provider = QwenRealtimeProvider(
+        "ws://127.0.0.1/realtime",
+        "secret-value",
+        model="qwen-audio-3.0-realtime-plus",
+    )
+    sent: list[dict[str, Any]] = []
+
+    async def send(event: dict[str, Any]) -> None:
+        event["event_id"] = f"voice_{'a' * 32}"
+        sent.append(event)
+
+    provider._send = send  # type: ignore[method-assign]
+    text = "跨场景上下文🌸" * 40_000
+
+    await provider.inject_context(text)
+
+    delivered = "".join(event["item"]["content"][0]["text"] for event in sent)
+    assert delivered == text
+    assert all(
+        len(
+            json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
+        <= _QWEN_MAX_FRAME_BYTES
+        for event in sent
+    )
 
 
 @pytest.mark.asyncio

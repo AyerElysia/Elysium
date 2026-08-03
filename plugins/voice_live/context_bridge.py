@@ -11,14 +11,90 @@ from src.core.models.message import Message, MessageType
 
 from .runtime_store import VoiceEpisodeStore
 
+_PERCEPTION_PREFIX = "<transient_world_perception>\n"
+_PERCEPTION_SUFFIX = "\n</transient_world_perception>"
+
+
+def _compact_context_lines(content: str, max_bytes: int) -> tuple[str, dict[str, Any]]:
+    """Build a bounded head/tail view while keeping the durable source untouched."""
+
+    original_bytes = len(content.encode("utf-8"))
+    if original_bytes <= max_bytes:
+        return content, {
+            "compacted": False,
+            "original_bytes": original_bytes,
+            "delivered_bytes": original_bytes,
+            "omitted_lines": 0,
+        }
+
+    lines = content.splitlines()
+    marker_template = (
+        "[实时感知视图已压缩：LifeEngine 仍保留完整可追溯投影；"
+        "不确定时使用 inner_query / fetch_chat_history 按需回想。"
+        " original_bytes={original_bytes}; omitted_lines={omitted_lines}]"
+    )
+    provisional_marker = marker_template.format(
+        original_bytes=original_bytes,
+        omitted_lines=len(lines),
+    )
+    marker_bytes = len(provisional_marker.encode("utf-8")) + 2
+    available = max(0, max_bytes - marker_bytes)
+    head_budget = available // 3
+    tail_budget = available - head_budget
+
+    head: list[str] = []
+    head_used = 0
+    head_end = 0
+    for index, line in enumerate(lines):
+        cost = len(line.encode("utf-8")) + 1
+        if head_used + cost > head_budget:
+            break
+        head.append(line)
+        head_used += cost
+        head_end = index + 1
+
+    tail_reversed: list[str] = []
+    tail_used = 0
+    tail_start = len(lines)
+    for index in range(len(lines) - 1, head_end - 1, -1):
+        line = lines[index]
+        cost = len(line.encode("utf-8")) + 1
+        if tail_used + cost > tail_budget:
+            break
+        tail_reversed.append(line)
+        tail_used += cost
+        tail_start = index
+    tail = list(reversed(tail_reversed))
+    omitted_lines = max(0, tail_start - head_end)
+    marker = marker_template.format(
+        original_bytes=original_bytes,
+        omitted_lines=omitted_lines,
+    )
+    compacted = "\n".join([*head, marker, *tail])
+    delivered_bytes = len(compacted.encode("utf-8"))
+    if delivered_bytes > max_bytes:
+        raise RuntimeError(
+            "bounded perception projection exceeded its configured byte budget"
+        )
+    return compacted, {
+        "compacted": True,
+        "original_bytes": original_bytes,
+        "delivered_bytes": delivered_bytes,
+        "omitted_lines": omitted_lines,
+        "max_bytes": max_bytes,
+    }
+
 
 class ContextBridge:
     """Build isolated context and publish final voice turns to LifeEngine."""
 
-    def __init__(self, config: Any, consciousness: Any, store: VoiceEpisodeStore) -> None:
+    def __init__(
+        self, config: Any, consciousness: Any, store: VoiceEpisodeStore
+    ) -> None:
         self._config = config
         self._consciousness = consciousness
         self._store = store
+        self._last_perception_stats: dict[str, Any] = {}
 
     def build_system_prompt(self) -> str:
         personality = get_core_config().personality
@@ -41,7 +117,10 @@ class ContextBridge:
         ]
         transcript = self._store.transcript()
         if transcript:
-            parts.append("[本意识实例已发生的完整语音历史]\n" + json.dumps(transcript, ensure_ascii=False, indent=2))
+            parts.append(
+                "[本意识实例已发生的完整语音历史]\n"
+                + json.dumps(transcript, ensure_ascii=False, indent=2)
+            )
         instructions = str(self._config.full_duplex.instructions or "").strip()
         if instructions:
             parts.append("[用户配置的附加指令]\n" + instructions)
@@ -52,15 +131,28 @@ class ContextBridge:
 
         prepared = self._consciousness.prepare_perception()
         if prepared is None:
+            self._last_perception_stats = {}
             return "", None
+        max_bytes = int(self._config.session.perception_context_max_bytes)
+        wrapper_bytes = len((_PERCEPTION_PREFIX + _PERCEPTION_SUFFIX).encode("utf-8"))
+        content, stats = _compact_context_lines(
+            prepared.content,
+            max_bytes=max_bytes - wrapper_bytes,
+        )
+        self._last_perception_stats = stats
         return (
-            "<transient_world_perception>\n"
-            f"{prepared.content}\n"
-            "</transient_world_perception>",
+            f"{_PERCEPTION_PREFIX}{content}{_PERCEPTION_SUFFIX}",
             prepared,
         )
 
-    async def record_transcript(self, role: str, text: str, *, provider_event_id: str = "") -> None:
+    def perception_projection_stats(self) -> dict[str, Any]:
+        """Return content-free metrics for the latest transient projection."""
+
+        return dict(self._last_perception_stats)
+
+    async def record_transcript(
+        self, role: str, text: str, *, provider_event_id: str = ""
+    ) -> None:
         if role not in {"user", "assistant"}:
             raise ValueError(f"unsupported transcript role: {role}")
         if not text:
@@ -87,8 +179,12 @@ class ContextBridge:
             content=text,
             processed_plain_text=text,
             message_type=MessageType.VOICE,
-            sender_id=self._config.session.user_id if is_user else self._consciousness.instance_id,
-            sender_name=self._config.session.user_name if is_user else personality.nickname,
+            sender_id=self._config.session.user_id
+            if is_user
+            else self._consciousness.instance_id,
+            sender_name=self._config.session.user_name
+            if is_user
+            else personality.nickname,
             platform="voice_live",
             chat_type="private",
             stream_id=self._consciousness.stream_id,
@@ -98,4 +194,6 @@ class ContextBridge:
                 "provider_event_id": provider_event_id,
             },
         )
-        await service.record_message(message, direction="received" if is_user else "sent")
+        await service.record_message(
+            message, direction="received" if is_user else "sent"
+        )
