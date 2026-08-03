@@ -141,8 +141,10 @@ class TestBaseChatter:
         store = get_system_reminder_store()
         store.set("actor", "goal", "跟随最后一条", insert_type=SystemReminderInsertType.DYNAMIC)
 
-        with patch("src.core.config.get_model_config") as mock_model_config:
-            mock_model_config.return_value.get_task.return_value = []
+        with patch(
+            "src.kernel.config.models_loader.get_models_config"
+        ) as mock_models_config:
+            mock_models_config.return_value.get_task.return_value = []
 
             request = chatter.create_request("actor", with_reminder="actor")
 
@@ -158,8 +160,10 @@ class TestBaseChatter:
         store = get_system_reminder_store()
         store.set("actor", "goal", "先给结论")
 
-        with patch("src.core.config.get_model_config") as mock_model_config:
-            mock_model_config.return_value.get_task.return_value = []
+        with patch(
+            "src.kernel.config.models_loader.get_models_config"
+        ) as mock_models_config:
+            mock_models_config.return_value.get_task.return_value = []
 
             request = chatter.create_request("actor", with_reminder="actor")
 

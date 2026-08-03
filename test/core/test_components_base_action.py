@@ -187,18 +187,18 @@ class TestBaseAction:
         assert "Raw content" in content
 
     @patch("src.kernel.llm.LLMRequest")
-    @patch("src.core.config.get_model_config")
+    @patch("src.kernel.config.models_loader.get_models_config")
     def test_llm_judge_activation_positive(
-        self, mock_get_config, mock_llm_request, mock_chat_stream, mock_plugin
+        self, mock_get_models_config, mock_llm_request, mock_chat_stream, mock_plugin
     ):
         """测试 LLM 判断激活（肯定结果）。"""
         import asyncio
 
         # 设置 mock
-        mock_model_config = MagicMock()
+        mock_models_config = MagicMock()
         mock_task = MagicMock()
-        mock_model_config.get_task.return_value = mock_task
-        mock_get_config.return_value = mock_model_config
+        mock_models_config.get_task.return_value = mock_task
+        mock_get_models_config.return_value = mock_models_config
 
         mock_request_instance = MagicMock()
         mock_request_instance.send = AsyncMock(return_value="是，应该激活")
@@ -210,17 +210,17 @@ class TestBaseAction:
         assert result is True
 
     @patch("src.kernel.llm.LLMRequest")
-    @patch("src.core.config.get_model_config")
+    @patch("src.kernel.config.models_loader.get_models_config")
     def test_llm_judge_activation_negative(
-        self, mock_get_config, mock_llm_request, mock_chat_stream, mock_plugin
+        self, mock_get_models_config, mock_llm_request, mock_chat_stream, mock_plugin
     ):
         """测试 LLM 判断激活（否定结果）。"""
         import asyncio
 
-        mock_model_config = MagicMock()
+        mock_models_config = MagicMock()
         mock_task = MagicMock()
-        mock_model_config.get_task.return_value = mock_task
-        mock_get_config.return_value = mock_model_config
+        mock_models_config.get_task.return_value = mock_task
+        mock_get_models_config.return_value = mock_models_config
 
         mock_request_instance = MagicMock()
         mock_request_instance.send = AsyncMock(return_value="否，不应该激活")
@@ -232,17 +232,17 @@ class TestBaseAction:
         assert result is False
 
     @patch("src.kernel.llm.LLMRequest")
-    @patch("src.core.config.get_model_config")
+    @patch("src.kernel.config.models_loader.get_models_config")
     def test_llm_judge_activation_timeout(
-        self, mock_get_config, mock_llm_request, mock_chat_stream, mock_plugin
+        self, mock_get_models_config, mock_llm_request, mock_chat_stream, mock_plugin
     ):
         """测试 LLM 判断激活（超时）。"""
         import asyncio
 
-        mock_model_config = MagicMock()
+        mock_models_config = MagicMock()
         mock_task = MagicMock()
-        mock_model_config.get_task.return_value = mock_task
-        mock_get_config.return_value = mock_model_config
+        mock_models_config.get_task.return_value = mock_task
+        mock_get_models_config.return_value = mock_models_config
 
         mock_request_instance = MagicMock()
         mock_request_instance.send = AsyncMock(side_effect=asyncio.TimeoutError())
