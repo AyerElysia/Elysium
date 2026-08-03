@@ -2,11 +2,12 @@
 
 职责:
 - 创建和管理 SQLAlchemy 异步引擎
-- 支持 SQLite 和 PostgreSQL 数据库
+- 支持 SQLite、PostgreSQL 和 MySQL 数据库
 - 应用数据库特定的性能优化
 """
 
 import asyncio
+import ssl
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -102,7 +103,7 @@ def _infer_db_type_from_url(url: str) -> str | None:
     """
     scheme = url.split(":", 1)[0]
     backend = scheme.split("+", 1)[0].lower()
-    if backend in {"sqlite", "postgresql"}:
+    if backend in {"sqlite", "postgresql", "mysql"}:
         return backend
     return backend or None
 
@@ -174,6 +175,8 @@ async def get_engine() -> AsyncEngine:
                     _install_sqlite_optimizations(_engine)
                 elif db_type == "postgresql":
                     _install_postgresql_optimizations(_engine)
+                elif db_type == "mysql":
+                    _install_mysql_optimizations(_engine)
 
             logger.info(f"{(db_type or 'UNKNOWN').upper()} 数据库引擎初始化成功")
             return _engine
@@ -320,6 +323,100 @@ def _build_postgresql_config(
     return url, engine_kwargs
 
 
+def _build_mysql_ssl_context(
+    ssl_mode: str,
+    *,
+    ssl_ca: str = "",
+    ssl_cert: str = "",
+    ssl_key: str = "",
+) -> ssl.SSLContext | None:
+    """构建 asyncmy 使用的 TLS 上下文。
+
+    ``required`` 只要求链路加密；``verify-ca`` 验证证书链；
+    ``verify-full`` 还会验证主机名。生产环境应优先使用后两者。
+    """
+    normalized_mode = ssl_mode.strip().lower()
+    if normalized_mode == "disabled":
+        return None
+    if normalized_mode not in {"required", "verify-ca", "verify-full"}:
+        raise ValueError(f"不支持的 MySQL TLS 模式: {ssl_mode}")
+
+    context = ssl.create_default_context(cafile=ssl_ca or None)
+    if normalized_mode == "required":
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    elif normalized_mode == "verify-ca":
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_REQUIRED
+    else:
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
+
+    if ssl_cert or ssl_key:
+        if not ssl_cert or not ssl_key:
+            raise ValueError("MySQL 客户端证书和密钥必须同时配置")
+        context.load_cert_chain(certfile=ssl_cert, keyfile=ssl_key)
+    return context
+
+
+def _build_mysql_config(
+    host: str,
+    port: int,
+    user: str,
+    password: str,
+    database: str,
+    *,
+    charset: str = "utf8mb4",
+    echo: bool = False,
+    pool_size: int = 10,
+    connection_timeout: int = 30,
+    ssl_mode: str = "disabled",
+    ssl_ca: str = "",
+    ssl_cert: str = "",
+    ssl_key: str = "",
+) -> tuple[str, dict[str, Any]]:
+    """构建 MySQL 8 / asyncmy 引擎配置。"""
+    if charset.lower() != "utf8mb4":
+        raise ValueError("Elysium 的 MySQL 字符集必须为 utf8mb4")
+    if host.lower() == "localhost":
+        host = "127.0.0.1"
+
+    encoded_user = quote_plus(user)
+    encoded_password = quote_plus(password)
+    url = (
+        f"mysql+asyncmy://{encoded_user}:{encoded_password}"
+        f"@{host}:{port}/{database}?charset=utf8mb4"
+    )
+    connect_args: dict[str, Any] = {
+        "connect_timeout": connection_timeout,
+        "charset": "utf8mb4",
+    }
+    ssl_context = _build_mysql_ssl_context(
+        ssl_mode,
+        ssl_ca=ssl_ca,
+        ssl_cert=ssl_cert,
+        ssl_key=ssl_key,
+    )
+    if ssl_context is not None:
+        connect_args["ssl"] = ssl_context
+
+    engine_kwargs: dict[str, Any] = {
+        "echo": echo,
+        "future": True,
+        "pool_size": pool_size,
+        "max_overflow": pool_size * 2,
+        "pool_timeout": connection_timeout,
+        "pool_recycle": 900,
+        "pool_pre_ping": True,
+        "connect_args": connect_args,
+    }
+    logger.debug(
+        f"MySQL 配置: {user}@{host}:{port}/{database} "
+        f"(charset=utf8mb4, pool={pool_size}, ssl={ssl_mode})"
+    )
+    return url, engine_kwargs
+
+
 async def init_database_from_config(
     database_type: str,
     *,
@@ -337,6 +434,17 @@ async def init_database_from_config(
     postgresql_ssl_ca: str = "",
     postgresql_ssl_cert: str = "",
     postgresql_ssl_key: str = "",
+    # MySQL 配置；None 表示兼容旧启动器传入的 postgresql_* 槽位
+    mysql_host: str | None = None,
+    mysql_port: int | None = None,
+    mysql_database: str | None = None,
+    mysql_user: str | None = None,
+    mysql_password: str | None = None,
+    mysql_charset: str = "utf8mb4",
+    mysql_ssl_mode: str | None = None,
+    mysql_ssl_ca: str | None = None,
+    mysql_ssl_cert: str | None = None,
+    mysql_ssl_key: str | None = None,
     # 连接池配置
     connection_pool_size: int = 10,
     connection_timeout: int = 30,
@@ -348,7 +456,7 @@ async def init_database_from_config(
     这是应用层使用的便捷函数，直接从 CoreConfig 的 database 配置节初始化数据库。
 
     Args:
-        database_type: 数据库类型 ("sqlite" 或 "postgresql")
+        database_type: 数据库类型 ("sqlite"、"postgresql" 或 "mysql")
         sqlite_path: SQLite 数据库文件路径
         postgresql_host: PostgreSQL 服务器地址
         postgresql_port: PostgreSQL 服务器端口
@@ -421,10 +529,39 @@ async def init_database_from_config(
             ssl_key=postgresql_ssl_key,
         )
         configure_engine(url, engine_kwargs=engine_kwargs, db_type="postgresql")
+    elif database_type == "mysql":
+        url, engine_kwargs = _build_mysql_config(
+            host=mysql_host or postgresql_host,
+            port=mysql_port or postgresql_port,
+            user=mysql_user or postgresql_user,
+            password=(
+                mysql_password
+                if mysql_password is not None
+                else postgresql_password
+            ),
+            database=mysql_database or postgresql_database,
+            charset=mysql_charset,
+            echo=echo,
+            pool_size=connection_pool_size,
+            connection_timeout=connection_timeout,
+            ssl_mode=mysql_ssl_mode or postgresql_ssl_mode,
+            ssl_ca=(mysql_ssl_ca if mysql_ssl_ca is not None else postgresql_ssl_ca),
+            ssl_cert=(
+                mysql_ssl_cert
+                if mysql_ssl_cert is not None
+                else postgresql_ssl_cert
+            ),
+            ssl_key=(
+                mysql_ssl_key
+                if mysql_ssl_key is not None
+                else postgresql_ssl_key
+            ),
+        )
+        configure_engine(url, engine_kwargs=engine_kwargs, db_type="mysql")
     else:
         raise ValueError(
             f"不支持的数据库类型: {database_type}. "
-            f"仅支持 'sqlite' 或 'postgresql'"
+            f"仅支持 'sqlite'、'postgresql' 或 'mysql'"
         )
 
     # 立即初始化引擎（不延迟到第一次使用）
@@ -533,6 +670,15 @@ _POSTGRESQL_SESSION_STATEMENTS: tuple[str, ...] = (
     "SET lock_timeout = '5000'",
 )
 
+_MYSQL_SESSION_STATEMENTS: tuple[str, ...] = (
+    # 较 SQLite 更接近的提交后可见语义，减少长事务持有旧快照。
+    "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+    # 应用中的 datetime 统一按 UTC 解释，展示层再转换时区。
+    "SET SESSION time_zone = '+00:00'",
+    # 锁等待必须有界，失败交给调用方显式重试而不是无限悬挂。
+    "SET SESSION innodb_lock_wait_timeout = 10",
+)
+
 
 def _install_sqlite_optimizations(engine: AsyncEngine) -> None:
     """为 SQLite 引擎注册逐连接的性能优化。
@@ -554,6 +700,11 @@ def _install_postgresql_optimizations(engine: AsyncEngine) -> None:
     )
 
 
+def _install_mysql_optimizations(engine: AsyncEngine) -> None:
+    """为 MySQL 引擎注册逐连接的会话级约束。"""
+    _install_session_optimizations(engine, _MYSQL_SESSION_STATEMENTS, "MySQL")
+
+
 async def get_engine_info() -> dict:
     """获取引擎信息（用于监控和调试）
 
@@ -566,7 +717,7 @@ async def get_engine_info() -> dict:
         info = {
             "name": engine.name,
             "driver": engine.driver,
-            "url": str(engine.url).replace(str(engine.url.password or ""), "***"),
+            "url": engine.url.render_as_string(hide_password=True),
             "pool_size": getattr(engine.pool, "size", lambda: None)(),
             "pool_checked_out": getattr(engine.pool, "checked_out", lambda: 0)(),
             "pool_overflow": getattr(engine.pool, "overflow", lambda: 0)(),

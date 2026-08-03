@@ -4,8 +4,9 @@
 引擎和会话管理已移至core/engine.py和core/session.py。
 
 支持的数据库类型：
-- SQLite: 使用 Text 类型
-- PostgreSQL: 使用 Text 类型（PostgreSQL 的 Text 类型性能与 VARCHAR 相当）
+- SQLite
+- PostgreSQL
+- MySQL 8
 
 所有模型使用统一的类型注解风格：
     field_name: Mapped[PyType] = mapped_column(Type, ...)
@@ -14,10 +15,18 @@
 """
 
 import datetime
-from datetime import timezone
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Float, Index, Integer, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Double,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, declarative_base, mapped_column
 
 # 创建基类
@@ -25,23 +34,23 @@ Base = declarative_base()
 
 
 # 数据库兼容的字段类型辅助函数
-def get_string_field(*_: Any, **kwargs: Any) -> Text:
-    """
-    返回字符串字段类型（统一使用 Text）
+def get_string_field(length: int | None = None, **kwargs: Any) -> String:
+    """返回跨方言的字符串字段类型。
 
-    Text 类型适用于所有数据库：
-    - PostgreSQL: Text 性能与 VARCHAR 相当
-    - SQLite: Text 无长度限制
+    有明确协议上限的标识符使用 ``VARCHAR(length)``，正文使用 ``TEXT``。
+    这既保留 SQLite/PostgreSQL 行为，也避免 MySQL 对无前缀 ``TEXT``
+    索引和唯一约束的限制。
 
     Args:
-        *_: 保留位置参数以兼容旧调用方式
+        length: 标识符的最大字符数；为空时返回 Text。
         **kwargs: 传递给 Text 的额外参数
 
     Returns:
-        SQLAlchemy Text 类型
+        SQLAlchemy String/Text 类型
     """
-    # 统一使用 Text，避免在模块导入时访问配置
-    return Text(**kwargs)
+    if length is None:
+        return Text(**kwargs)
+    return String(length=length, **kwargs)
 
 
 class ChatStreams(Base):
@@ -54,7 +63,7 @@ class ChatStreams(Base):
 
     # 唯一标识
     stream_id: Mapped[str] = mapped_column(
-        get_string_field(64),
+        get_string_field(128),
         nullable=False,
         unique=True,
         index=True,
@@ -94,18 +103,18 @@ class ChatStreams(Base):
 
     # 时间管理
     created_at: Mapped[float] = mapped_column(
-        Float,
+        Double,
         nullable=False,
         comment="聊天流创建时间"
     )
     last_active_time: Mapped[float] = mapped_column(
-        Float,
+        Double,
         nullable=False,
         index=True,
         comment="最后活跃时间"
     )
     context_cleared_at: Mapped[float | None] = mapped_column(
-        Float,
+        Double,
         nullable=True,
         default=None,
         comment="上下文清空时间戳；加载消息时仅取此时间点之后的消息"
@@ -161,11 +170,11 @@ class LLMUsage(Base):
     total_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
 
     # 成本与性能
-    cost: Mapped[float] = mapped_column(Float, nullable=False)
-    time_cost: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cost: Mapped[float] = mapped_column(Double, nullable=False)
+    time_cost: Mapped[float | None] = mapped_column(Double, nullable=True)
 
     # 状态
-    status: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(get_string_field(32), nullable=False)
     timestamp: Mapped[datetime.datetime] = mapped_column(
         DateTime,
         nullable=False,
@@ -199,7 +208,7 @@ class Messages(Base):
 
     # 关联信息
     stream_id: Mapped[str] = mapped_column(
-        get_string_field(64),
+        get_string_field(128),
         nullable=False,
         index=True,
         comment="所属聊天流ID"
@@ -213,7 +222,7 @@ class Messages(Base):
 
     # 时间与顺序
     time: Mapped[float] = mapped_column(
-        Float,
+        Double,
         nullable=False,
         index=True,
         comment="消息时间戳（Unix timestamp）"
@@ -272,7 +281,7 @@ class ActionRecords(Base):
 
     # 关联
     stream_id: Mapped[str] = mapped_column(
-        get_string_field(64),
+        get_string_field(128),
         nullable=False,
         index=True,
         comment="关联的聊天流ID"
@@ -285,7 +294,7 @@ class ActionRecords(Base):
 
     # 时间
     time: Mapped[float] = mapped_column(
-        Float,
+        Double,
         nullable=False,
         index=True,
         comment="动作发生时间"
@@ -337,8 +346,8 @@ class Images(Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     path: Mapped[str] = mapped_column(get_string_field(500), nullable=False, unique=True)
     count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    timestamp: Mapped[float] = mapped_column(Float, nullable=False)
-    type: Mapped[str] = mapped_column(Text, nullable=False)
+    timestamp: Mapped[float] = mapped_column(Double, nullable=False)
+    type: Mapped[str] = mapped_column(get_string_field(50), nullable=False)
     vlm_processed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_banned: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
     query_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
@@ -354,10 +363,10 @@ class ImageDescriptions(Base):
     __tablename__ = "image_descriptions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    type: Mapped[str] = mapped_column(Text, nullable=False)
+    type: Mapped[str] = mapped_column(get_string_field(50), nullable=False)
     image_description_hash: Mapped[str] = mapped_column(get_string_field(64), nullable=False, index=True)
     description: Mapped[str] = mapped_column(Text, nullable=False)
-    timestamp: Mapped[float] = mapped_column(Float, nullable=False)
+    timestamp: Mapped[float] = mapped_column(Double, nullable=False)
 
     __table_args__ = (
         UniqueConstraint("image_description_hash", "type", name="uq_imagedesc_hash_type"),
@@ -448,12 +457,12 @@ class PersonInfo(Base):
 
     # 时间字段（统一为 float Unix 时间戳）
     first_interaction: Mapped[float | None] = mapped_column(
-        Float,
+        Double,
         nullable=True,
         comment="首次交互时间（Unix timestamp）"
     )
     last_interaction: Mapped[float | None] = mapped_column(
-        Float,
+        Double,
         nullable=True,
         index=True,
         comment="最后交互时间（Unix timestamp）"
@@ -475,12 +484,12 @@ class PersonInfo(Base):
 
     # 元数据
     created_at: Mapped[float] = mapped_column(
-        Float,
+        Double,
         nullable=False,
         comment="记录创建时间（Unix timestamp）"
     )
     updated_at: Mapped[float] = mapped_column(
-        Float,
+        Double,
         nullable=False,
         comment="记录最后更新时间（Unix timestamp）"
     )
@@ -563,7 +572,7 @@ class PermissionNodes(Base):
     )
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime,
-        default=lambda: datetime.datetime.now(timezone.utc),
+        default=lambda: datetime.datetime.now(datetime.UTC),
         nullable=False,
         comment="创建时间"
     )
@@ -605,7 +614,7 @@ class UserPermissions(Base):
     )
     granted_at: Mapped[datetime.datetime] = mapped_column(
         DateTime,
-        default=lambda: datetime.datetime.now(timezone.utc),
+        default=lambda: datetime.datetime.now(datetime.UTC),
         nullable=False,
         comment="授权时间"
     )
@@ -651,12 +660,12 @@ class PermissionGroups(Base):
 
     # 时间戳（使用 float Unix 时间戳）
     created_at: Mapped[float] = mapped_column(
-        Float,
+        Double,
         nullable=False,
         comment="设置时间（Unix timestamp）"
     )
     updated_at: Mapped[float] = mapped_column(
-        Float,
+        Double,
         nullable=False,
         comment="更新时间（Unix timestamp）"
     )
@@ -714,12 +723,12 @@ class CommandPermissions(Base):
 
     # 时间戳（使用 float Unix 时间戳）
     created_at: Mapped[float] = mapped_column(
-        Float,
+        Double,
         nullable=False,
         comment="创建时间（Unix timestamp）"
     )
     updated_at: Mapped[float] = mapped_column(
-        Float,
+        Double,
         nullable=False,
         comment="更新时间（Unix timestamp）"
     )

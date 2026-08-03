@@ -81,6 +81,15 @@ sqlite_path = "data/Elysium.db"
 # postgresql_database = "elysium"
 # postgresql_user = "postgres"
 # postgresql_password = ""
+# MySQL 8（推荐的核心业务数据库）：
+# database_type = "mysql"
+# mysql_host = "127.0.0.1"
+# mysql_port = 3306
+# mysql_database = "elysium"
+# mysql_user = "elysium"
+# mysql_password = "${ELYSIUM_MYSQL_PASSWORD}"
+# mysql_charset = "utf8mb4"
+# mysql_ssl_mode = "disabled"  # 远程生产库建议 verify-full
 connection_pool_size = 10
 connection_timeout = 10
 

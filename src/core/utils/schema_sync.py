@@ -203,8 +203,10 @@ async def _sync_table(
         if model_col.primary_key:
             continue
 
-        model_type = _normalize_type(str(model_col.type.compile(dialect=dialect)))
-        db_col_type = _normalize_type(str(db_col["type"]))
+        model_type = _normalize_type(
+            str(model_col.type.compile(dialect=dialect)), db_type=db_type
+        )
+        db_col_type = _normalize_type(str(db_col["type"]), db_type=db_type)
 
         if model_type != db_col_type:
             stats.type_mismatches += 1
@@ -387,7 +389,7 @@ def _quote_identifier(dialect: Dialect, name: str) -> str:
     return dialect.identifier_preparer.quote(name)
 
 
-def _normalize_type(raw: str) -> str:
+def _normalize_type(raw: str, *, db_type: str = "") -> str:
     """归一化类型字符串用于比较。"""
     value = " ".join(raw.lower().replace('"', "").split())
 
@@ -403,16 +405,22 @@ def _normalize_type(raw: str) -> str:
         "timestamp with time zone": "datetime",
         "timestamp": "datetime",
         "date": "datetime",
-        # SQLite 中 TEXT/VARCHAR/CLOB 完全等价（TEXT affinity）；
-        # ORM 模型统一使用 Text()，所以将 VARCHAR 系列也归一化为 "text"
-        "character varying": "text",
-        "varchar": "text",
-        "string": "text",
     }
 
-    if value.startswith("character varying"):
-        value = "text"
-    elif value.startswith("varchar"):
+    if "mysql" in db_type and value in {"tinyint", "tinyint(1)"}:
+        return "boolean"
+
+    # SQLite 的 REAL/FLOAT/DOUBLE 都保存 8 字节 IEEE 浮点；PostgreSQL 的
+    # DOUBLE PRECISION 也已经在 aliases 中折叠。MySQL 必须保留 DOUBLE 与
+    # FLOAT 的区别，否则会漏报会损失时间戳精度的 schema drift。
+    if "mysql" not in db_type and value == "double":
+        value = "float"
+
+    # SQLite 的 VARCHAR/TEXT 都是 TEXT affinity；这里只在 SQLite 下折叠，
+    # MySQL/PostgreSQL 必须保留长度，才能发现可能截断数据的 schema drift。
+    if "sqlite" in db_type and (
+        value.startswith(("character varying", "varchar")) or value == "string"
+    ):
         value = "text"
 
     return aliases.get(value, value)

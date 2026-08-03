@@ -9,6 +9,8 @@
 - [生命记忆系统](./architecture/life_memory_system.md) — 追加式经历、认识论本体、双时间与主体性遗忘
 - [意识实例架构](./architecture/consciousness_instances.md) — 多意识实例、潜意识协调与工具边界
 - [离线优先共享后端重构计划](./architecture/offline_first_shared_backend_plan.md) — 本地独立运行、远程近实时共享、不可变事件同步与无损迁移验收门
+- [MySQL 核心持久化边界](./architecture/mysql_core_persistence.md) — Core 关系数据、生命域本地权威库、方言契约与人工切换边界
+- [MySQL 迁移、备份与恢复手册](./operations/mysql_migration_and_backup.md) — 审计、快照、原子迁移、连续备份与恢复演练
 - [Elysium Console 前端提案](./architecture/elysium_console_frontend_proposal.md) — 已批准的插件驱动统一控制台与分阶段验收计划
 - [Elysium Console Stage 0 设计基线](./architecture/elysium_console_stage0_design.md) — 此刻、Live Ready、Live Call 与安全降级页的交互规范
 - [Elysium Console 安全模型](./architecture/elysium_console_security_model.md) — 插件页面、密钥、OBS、会话与主进程生命周期边界
@@ -18,6 +20,7 @@
 - [Voice Live 加载失败诊断（2026-08-02）](./report/voice-live-load-failure-diagnosis-2026-08-02.md) — Life Engine 并发重构中间态导致的级联失败证据与手工恢复步骤
 - [飞书 reaction processor not found 诊断（2026-08-02）](./report/feishu-reaction-processor-not-found-2026-08-02.md) — 表情回应事件已订阅但未注册处理器的影响与处理选项
 - [远程 MySQL 接入就绪审计（2026-08-03）](./report/remote-mysql-readiness-audit-2026-08-03.md) — 只读连通、TLS、权限、binlog 与正式接入阻断项
+- [MySQL 基座迁移与恢复验证（2026-08-03）](./report/mysql-foundation-validation-2026-08-03.md) — 真实数据迁移、两次安全拦截、逐表指纹、备份恢复与限制
 - [Life Engine 模块说明](../plugins/life_engine/README.md) — 生命域的代码入口与运行链路
 
 ## 当前架构与迁移

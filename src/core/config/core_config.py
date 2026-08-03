@@ -266,13 +266,13 @@ class CoreConfig(ConfigBase):
         """数据库配置节
 
         配置数据库连接和类型相关的参数。
-        支持 SQLite 和 PostgreSQL 两种数据库类型。
+        支持 SQLite、PostgreSQL 和 MySQL。
         """
 
         # ========== 数据库类型配置 ==========
-        database_type: str = Field(
+        database_type: Literal["sqlite", "postgresql", "mysql"] = Field(
             default="sqlite",
-            description='数据库类型，支持 "sqlite" 或 "postgresql"',
+            description='数据库类型，支持 "sqlite"、"postgresql" 或 "mysql"',
         )
 
         # ========== SQLite 配置（当 database_type = "sqlite" 时使用）==========
@@ -325,7 +325,51 @@ class CoreConfig(ConfigBase):
             description="SSL 客户端密钥路径",
         )
 
-        # ========== 连接池配置（PostgreSQL 有效）==========
+        # ========== MySQL 配置（当 database_type = "mysql" 时使用）==========
+        mysql_host: str = Field(
+            default="localhost",
+            description="MySQL 服务器地址",
+        )
+        mysql_port: int = Field(
+            default=3306,
+            description="MySQL 服务器端口",
+        )
+        mysql_database: str = Field(
+            default="elysium",
+            description="MySQL 数据库名",
+        )
+        mysql_user: str = Field(
+            default="elysium",
+            description="MySQL 用户名",
+        )
+        mysql_password: str = Field(
+            default="",
+            description="MySQL 密码，建议使用 ${ELYSIUM_MYSQL_PASSWORD}",
+        )
+        mysql_charset: Literal["utf8mb4"] = Field(
+            default="utf8mb4",
+            description="MySQL 字符集；Elysium 固定使用 utf8mb4 保留完整 Unicode",
+        )
+        mysql_ssl_mode: Literal[
+            "disabled", "required", "verify-ca", "verify-full"
+        ] = Field(
+            default="disabled",
+            description="MySQL TLS 模式: disabled, required, verify-ca, verify-full",
+        )
+        mysql_ssl_ca: str = Field(
+            default="",
+            description="MySQL TLS CA 证书路径",
+        )
+        mysql_ssl_cert: str = Field(
+            default="",
+            description="MySQL TLS 客户端证书路径",
+        )
+        mysql_ssl_key: str = Field(
+            default="",
+            description="MySQL TLS 客户端密钥路径",
+        )
+
+        # ========== 连接池配置（PostgreSQL/MySQL 有效）==========
         connection_pool_size: int = Field(
             default=10,
             description="连接池大小",
@@ -340,6 +384,29 @@ class CoreConfig(ConfigBase):
             default=False,
             description="是否打印 SQL 语句（用于调试）",
         )
+
+        @model_validator(mode="after")
+        def expose_mysql_settings_to_legacy_runtime(self) -> "CoreConfig.DatabaseSection":
+            """让尚未升级调用签名的启动器也能消费 MySQL 配置。
+
+            当前应用启动器仍通过历史 ``postgresql_*`` 关键字把服务型数据库
+            配置传给 kernel。这里仅在 MySQL 模式下提供兼容映射；用户配置文件
+            仍使用语义明确的 ``mysql_*`` 字段。待启动器生命周期改造完成后可
+            移除此桥接，而无需迁移用户配置。
+            """
+            if self.database_type != "mysql":
+                return self
+
+            self.postgresql_host = self.mysql_host
+            self.postgresql_port = self.mysql_port
+            self.postgresql_database = self.mysql_database
+            self.postgresql_user = self.mysql_user
+            self.postgresql_password = self.mysql_password
+            self.postgresql_ssl_mode = self.mysql_ssl_mode
+            self.postgresql_ssl_ca = self.mysql_ssl_ca
+            self.postgresql_ssl_cert = self.mysql_ssl_cert
+            self.postgresql_ssl_key = self.mysql_ssl_key
+            return self
 
     database: DatabaseSection = Field(default_factory=DatabaseSection)
 
