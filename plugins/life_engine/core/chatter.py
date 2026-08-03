@@ -121,12 +121,21 @@ _SURFACE_FAST_MAX_TOKENS_DEFAULT = 900
 _RUNTIME_ASSISTANT_INJECTION_MAX_PER_STREAM = 24
 _RUNTIME_ASSISTANT_INJECTIONS: dict[str, deque[str]] = {}
 _RUNTIME_ASSISTANT_INJECTION_LOCK = threading.Lock()
-_LIFE_CHATTER_MODEL_TURN_TIMEOUT_SECONDS = 90.0
 _RECENT_VISIBLE_TEXT_REPLY_TTL_SECONDS = 5 * 60.0
 _RECENT_VISIBLE_TEXT_REPLY_MAX_ENTRIES = 128
 _REACTION_ONLY_TEXT_PATTERN = re.compile(
     r"^(?:\s*\[(?:表情包|图片)(?:[:：][^\]]*)?\]\s*)+$"
 )
+
+
+class _LifeChatterModelTurnTimeout(TimeoutError):
+    """LifeChatter 整个模型故障转移链耗尽了流步进总预算。"""
+
+    def __init__(self, timeout_seconds: float) -> None:
+        self.timeout_seconds = float(timeout_seconds)
+        super().__init__(
+            f"life_chatter 模型轮总预算耗尽 ({self.timeout_seconds:.2f}s)"
+        )
 
 
 def _is_native_multimodal_unsupported_error(error: BaseException) -> bool:
@@ -2267,21 +2276,18 @@ class LifeChatter(BaseChatter):
 
     @staticmethod
     def _get_model_turn_timeout() -> float | None:
-        """返回严格小于聊天流步进超时的内部模型轮超时。"""
+        """从聊天流总预算派生内部模型轮预算，并为状态回滚留出余量。"""
         try:
             stream_timeout = float(get_core_config().bot.stream_step_timeout)
         except Exception:
             stream_timeout = 0.0
         if not math.isfinite(stream_timeout) or stream_timeout <= 0:
-            return _LIFE_CHATTER_MODEL_TURN_TIMEOUT_SECONDS
+            return None
 
         if stream_timeout <= 0.1:
             return stream_timeout / 2.0
         safety_margin = min(5.0, max(0.1, stream_timeout * 0.1))
-        return min(
-            _LIFE_CHATTER_MODEL_TURN_TIMEOUT_SECONDS,
-            stream_timeout - safety_margin,
-        )
+        return stream_timeout - safety_margin
 
     async def _await_with_watchdog_keepalive(
         self,
@@ -2327,17 +2333,19 @@ class LifeChatter(BaseChatter):
                 logger.debug(f"停止 watchdog keepalive 任务时忽略异常：{exc}")
 
     async def _await_model_turn(self, awaitable: Awaitable[_T]) -> _T:
-        """等待模型轮，同时持续喂 watchdog，并在内部超时后释放 chatter 状态。"""
+        """等待完整模型故障转移链，并在总预算耗尽前持续喂 watchdog。"""
         timeout = self._get_model_turn_timeout()
         keepalive_awaitable = self._await_with_watchdog_keepalive(awaitable)
         if timeout is None:
             return await keepalive_awaitable
+        deadline = asyncio.timeout(timeout)
         try:
-            return await asyncio.wait_for(keepalive_awaitable, timeout=timeout)
-        except asyncio.TimeoutError as exc:
-            raise TimeoutError(
-                f"life_chatter 模型请求超时 ({timeout:.2f}s)"
-            ) from exc
+            async with deadline:
+                return await keepalive_awaitable
+        except TimeoutError as exc:
+            if not deadline.expired():
+                raise
+            raise _LifeChatterModelTurnTimeout(timeout) from exc
 
     @staticmethod
     def _surface_fast_max_tokens() -> int:
@@ -4516,12 +4524,31 @@ class LifeChatter(BaseChatter):
                             payloads_before_model_request,
                             initial_turn=initial_turn,
                         )
-                        logger.error(f"LLM 请求失败: {error}", exc_info=True)
+                        if isinstance(error, _LifeChatterModelTurnTimeout):
+                            logger.debug(
+                                "life_chatter 模型轮总预算耗尽，已安全回滚运行态",
+                                exc_info=True,
+                            )
+                            if initial_turn:
+                                failure_message = (
+                                    "模型轮达到总预算 "
+                                    f"({error.timeout_seconds:.0f}s)，"
+                                    "待处理消息已保留，将在下一轮重试"
+                                )
+                            else:
+                                failure_message = (
+                                    "后续模型轮达到总预算 "
+                                    f"({error.timeout_seconds:.0f}s)，"
+                                    "当前任务已明确标记失败"
+                                )
+                        else:
+                            logger.error(f"LLM 请求失败: {error}", exc_info=True)
+                            failure_message = "LLM 请求失败"
                         if not initial_turn:
                             await complete_active_autonomy_as_failed(
                                 f"follow-up model failure: {error}"
                             )
-                        return Failure("LLM 请求失败", error)
+                        return Failure(failure_message, error)
 
                 pending_life_context_high_water = 0
                 if initial_turn:

@@ -1908,7 +1908,10 @@ async def test_life_chatter_watchdog_keepalive_feeds_during_long_await(monkeypat
     assert all(stream_id == "live-stream-1" for stream_id in feed_calls)
 
 
-@pytest.mark.parametrize("outer_timeout", [0.001, 0.05, 1.0, 10.0, 95.0])
+@pytest.mark.parametrize(
+    "outer_timeout",
+    [0.001, 0.05, 1.0, 10.0, 95.0, 150.0, 300.0],
+)
 def test_life_chatter_model_turn_timeout_is_strictly_inside_outer_deadline(
     monkeypatch,
     outer_timeout: float,
@@ -1927,7 +1930,7 @@ def test_life_chatter_model_turn_timeout_is_strictly_inside_outer_deadline(
 
 
 @pytest.mark.parametrize("outer_timeout", [0.0, -1.0, float("nan"), float("inf")])
-def test_life_chatter_model_turn_timeout_uses_default_without_outer_deadline(
+def test_life_chatter_model_turn_timeout_is_disabled_without_outer_deadline(
     monkeypatch,
     outer_timeout: float,
 ) -> None:
@@ -1938,7 +1941,40 @@ def test_life_chatter_model_turn_timeout_uses_default_without_outer_deadline(
         ),
     )
 
-    assert LifeChatter._get_model_turn_timeout() == 90.0
+    assert LifeChatter._get_model_turn_timeout() is None
+
+
+def test_life_chatter_model_turn_uses_configured_failover_budget(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "plugins.life_engine.core.chatter.get_core_config",
+        lambda: SimpleNamespace(
+            bot=SimpleNamespace(stream_step_timeout=300.0),
+        ),
+    )
+
+    assert LifeChatter._get_model_turn_timeout() == 295.0
+
+
+async def test_life_chatter_model_turn_preserves_inner_timeout(monkeypatch) -> None:
+    class DummyWatchDog:
+        def feed_dog(self, _stream_id: str) -> None:
+            return None
+
+    async def fail_inside_model_request() -> None:
+        raise TimeoutError("provider attempt timed out")
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.stream_id = "stream-a"
+
+    import src.kernel.concurrency as concurrency
+
+    monkeypatch.setattr(concurrency, "get_watchdog", lambda: DummyWatchDog())
+    monkeypatch.setattr(chatter, "_get_model_turn_timeout", lambda: 1.0)
+
+    with pytest.raises(TimeoutError, match="provider attempt timed out") as caught:
+        await chatter._await_model_turn(fail_inside_model_request())
+
+    assert "总预算" not in str(caught.value)
 
 
 async def test_life_chatter_model_turn_timeout_releases_runtime_owner(monkeypatch) -> None:
@@ -2000,6 +2036,7 @@ async def test_life_chatter_model_turn_timeout_releases_runtime_owner(monkeypatc
     )
 
     assert isinstance(result, Failure)
+    assert "待处理消息已保留" in result.error
     assert rt.phase == _Phase.WAIT_USER
     assert rt.active_stream_id == ""
     assert rt.active_unread_turn_key == ""

@@ -48,3 +48,18 @@ def test_router_tasks_are_cloud_first_and_keep_reasoning_budget() -> None:
         assert all(entry["max_tokens"] >= 8192 for entry in entries)
 
     assert "qwen3-0.6b-router" not in config.tasks["router"]["models"]
+
+
+def test_unverified_gpt_models_are_registered_but_not_automatic() -> None:
+    registry_path = Path(__file__).parents[2] / "config" / "models.toml.example"
+    config = ModelsConfig(registry_path)
+
+    assert {"gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"}.issubset(
+        config.models
+    )
+    automatic_models = {
+        model_name
+        for task in config.tasks.values()
+        for model_name in task["models"]
+    }
+    assert not any(name.startswith("gpt-5.6-") for name in automatic_models)

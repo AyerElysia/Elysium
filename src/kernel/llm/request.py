@@ -813,7 +813,7 @@ class LLMRequest:
                 return resp
 
             except asyncio.CancelledError:
-                logger.info(
+                logger.debug(
                     f"LLM 请求被取消: model={model_identifier}, "
                     f"request={self.request_name or '__default__'}"
                 )

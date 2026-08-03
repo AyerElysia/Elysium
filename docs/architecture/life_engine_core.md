@@ -153,7 +153,7 @@ def _configured_primary_task_name(self) -> str:
     # 兜底: "expression"
 ```
 
-当前配置：`chatter_task_name = "expression"`，以 MiMo-V2.5-Pro 为首选，后续链接 GPT、MiMo、Grok、Claude、Qwen 与 Gemini 等云端模型；输出预算为 32000 token，包含隐式思考与最终正文。
+当前配置：`chatter_task_name = "expression"`，以 MiMo-V2.5-Pro 为首选，后续链接 MiMo、Grok、Claude、Qwen 与 Gemini 等已验证云端模型；输出预算为 32000 token，包含隐式思考与最终正文。GPT 5.6 型号仍保留在模型注册表中，但本地中转站没有通过验证的 enabled ability 时不得进入自动任务；恢复渠道并完成端到端探针后才能重新加入候选链。
 
 ### 3.5 多模态准入
 
@@ -194,6 +194,17 @@ LifeChatter 内部可调用所有 `chatter_allow` 标记的工具，包括：
 ### 3.8 强制回复机制
 
 当消息明确 @bot 或直接提问时，即使路由判断犹豫，系统也会强制回复（`_should_force_reply_for_unread_batch`），避免"已读不回"。
+
+### 3.9 模型轮预算与失败恢复
+
+`bot.stream_step_timeout` 是一次 Chatter 步进的**端到端总预算**，不是单个模型的超时。默认值为 300 秒，与当前 Provider 单模型 120 秒预算配合，可容纳首选模型超时、一次完整故障转移以及恢复余量。LifeChatter 的内部模型轮预算从该值派生，并固定为外层截止时间预留最多 5 秒，用于取消传播、payload 回滚和 owner 释放；不再存在独立的 90 秒硬上限。WatchDog 的 `stream_restart_threshold` 默认 360 秒，必须严格大于步进总预算，避免恢复路径与 watchdog 重启竞争。将 `stream_step_timeout` 设为 0 或负数会同时禁用这层总预算，单模型调用仍受 Provider 自身超时约束。
+
+模型轮只有成功返回后才会 flush unread、推进运行态上下文游标或进入工具执行。若总预算耗尽：
+
+- 取消仍在运行的模型请求，并把临时 suffix、媒体和 payload 恢复到请求前快照；
+- 不消费未读消息、不推进游标，也不把失败伪装成空回复或成功；
+- 初始表达轮由下一次驱动继续重试；工具后的 follow-up 则明确标记当前自主任务失败，避免重放已有外部副作用；
+- 常规取消只记录 DEBUG，用户可见日志保留一条包含预算和恢复状态的 WARNING，不刷完整 traceback。
 
 ---
 

@@ -10,6 +10,16 @@ from src.core.config.core_config import CoreConfig, get_core_config, init_core_c
 from src.kernel.llm.policy import RoundRobinPolicy, create_default_policy, set_default_policy_factory
 
 
+class TestBotSection:
+    """测试运行时与聊天流预算配置。"""
+
+    def test_default_stream_step_budget_covers_model_failover(self) -> None:
+        config = CoreConfig.BotSection()
+
+        assert config.stream_step_timeout == 300.0
+        assert config.stream_restart_threshold > config.stream_step_timeout
+
+
 class TestChatSection:
     """测试聊天配置节。"""
 

@@ -112,33 +112,35 @@ ctx = 2048
 extra = { enable_thinking = false }
 
 # Generative budgets include hidden reasoning and final output.
+# Keep a registered model out of automatic tasks while its gateway has no
+# verified enabled ability; re-add it only after an end-to-end probe succeeds.
 [tasks.core]
-models = ["MiMo-V2.5-Pro", "grok-4.5", "gpt-5.6-sol", "claude-sonnet-5", "gpt-5.6-terra", "MiMo-V2.5"]
+models = ["MiMo-V2.5-Pro", "grok-4.5", "claude-sonnet-5", "MiMo-V2.5"]
 tokens = 32000
 temp = 0.7
 
 [tasks.expression]
-models = ["MiMo-V2.5-Pro", "gpt-5.6-terra", "MiMo-V2.5", "grok-4.5", "gpt-5.6-sol", "claude-sonnet-5", "qwen3.7-plus", "gemini-3.5-flash"]
+models = ["MiMo-V2.5-Pro", "MiMo-V2.5", "grok-4.5", "claude-sonnet-5", "qwen3.7-plus", "gemini-3.5-flash"]
 tokens = 32000
 temp = 0.8
 
 [tasks.witness]
-models = ["MiMo-V2.5", "gpt-5.6-luna", "deepseek-v4-flash", "qwen3.7-plus"]
+models = ["MiMo-V2.5", "deepseek-v4-flash", "qwen3.7-plus"]
 tokens = 16000
 temp = 0.7
 
 [tasks.agent]
-models = ["gpt-5.6-luna", "MiMo-V2.5", "deepseek-v4-flash", "qwen3.7-plus"]
+models = ["MiMo-V2.5", "deepseek-v4-flash", "qwen3.7-plus"]
 tokens = 32000
 temp = 0.7
 
 [tasks.utility]
-models = ["MiMo-V2.5", "qwen3.7-plus", "deepseek-v4-flash", "gpt-5.6-luna"]
+models = ["MiMo-V2.5", "qwen3.7-plus", "deepseek-v4-flash"]
 tokens = 16000
 temp = 0.7
 
 [tasks.vision]
-models = ["MiMo-V2.5", "gpt-5.6-luna", "gemini-3.5-flash", "gpt-5.6-sol"]
+models = ["MiMo-V2.5", "gemini-3.5-flash"]
 tokens = 16000
 temp = 0.7
 
@@ -153,16 +155,16 @@ tokens = 8192
 temp = 0.7
 
 [tasks.router]
-models = ["MiMo-V2.5", "gpt-5.6-luna", "deepseek-v4-flash", "qwen3.7-plus"]
+models = ["MiMo-V2.5", "deepseek-v4-flash", "qwen3.7-plus"]
 tokens = 8192
 temp = 0.3
 
 [tasks.router_context_projection]
-models = ["MiMo-V2.5", "gpt-5.6-luna", "deepseek-v4-flash", "qwen3.7-plus"]
+models = ["MiMo-V2.5", "deepseek-v4-flash", "qwen3.7-plus"]
 tokens = 16000
 temp = 0.2
 
 [tasks.live]
-models = ["MiMo-V2.5-Pro", "gpt-5.6-terra", "MiMo-V2.5", "grok-4.5", "gpt-5.6-sol", "claude-sonnet-5"]
+models = ["MiMo-V2.5-Pro", "MiMo-V2.5", "grok-4.5", "claude-sonnet-5"]
 tokens = 32000
 temp = 0.75

@@ -17,8 +17,8 @@ llm_preflight_timeout = 5.0
 enable_watchdog = true
 tick_interval = 5.0
 stream_warning_threshold = 100.0
-stream_restart_threshold = 200.0
-stream_step_timeout = 150.0
+stream_restart_threshold = 360.0
+stream_step_timeout = 300.0
 message_buffer_window = 8.0
 message_buffer_max_skip = 3
 

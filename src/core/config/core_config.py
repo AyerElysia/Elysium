@@ -78,13 +78,13 @@ class CoreConfig(ConfigBase):
             description="流循环警告阈值（秒），距上次心跳超过此值时输出警告",
         )
         stream_restart_threshold: float = Field(
-            default=300.0,
+            default=360.0,
             description="流循环重启阈值（秒），距上次心跳超过此值时尝试重启",
         )
         stream_step_timeout: float = Field(
-            default=90.0,
+            default=300.0,
             description=(
-                "单次聊天流步进超时时间（秒），用于保护 chatter 内部工具调用或外部 await 卡死；"
+                "单次聊天流步进总预算（秒），覆盖单个模型超时后的故障转移，也用于保护 chatter 内部工具调用或外部 await 卡死；"
                 "设为 0 或负数可禁用该保护。"
             ),
         )
