@@ -134,17 +134,77 @@ uv sync --dev
 .\.venv\Scripts\python.exe --version
 ```
 
-### 4.2 已有 `.venv` 时
+### 4.2 无可用 `uv` 时：使用项目虚拟环境安装
 
-仍建议执行：
+若当前机器暂时没有可用的 `uv`，可以使用明确的 Python 解释器创建 `.venv`，再让该环境自己的 pip 按 `pyproject.toml` 安装项目。以下命令必须在原生 PowerShell 和项目根目录执行；不要把 Windows 盘符路径传入 Git Bash 后再拼接，以免产生错误的嵌套目录。
+
+```powershell
+& "<Python解释器绝对路径>" -m venv ".venv"
+& ".\.venv\Scripts\python.exe" -m pip install --upgrade pip setuptools wheel
+& ".\.venv\Scripts\python.exe" -m pip install -e .
+```
+
+`pip install -e .` 会从当前项目的 `pyproject.toml` 安装完整运行依赖，并以 editable 方式安装 Elysium。不要只逐个安装启动时报告的顶层缺包；这会留下传递依赖不完整的环境。
+
+安装结束后必须检查依赖闭合和启动导入链：
+
+```powershell
+& ".\.venv\Scripts\python.exe" -m pip check
+& ".\.venv\Scripts\python.exe" -c "import asyncmy, annotated_types, pydantic; import main; print('Environment OK')"
+```
+
+只有 `pip check` 输出 `No broken requirements found.`，且第二条命令输出 `Environment OK`，才可认为基础运行依赖安装完成。该检查只导入 `main.py`，不会执行 `if __name__ == "__main__"` 下的正式启动。
+
+如需开发测试依赖，仍优先安装项目声明的开发组；在无法使用 `uv` 时，应以 `pyproject.toml` 当前声明为准，不能长期维护一份与项目配置分离的手写依赖清单。
+
+#### 4.2.1 为项目环境补装 `uv`
+
+插件依赖安装器会调用 `uv pip install ...`。即使项目运行依赖已经通过 pip 安装完整，只要启动进程的 `PATH` 中找不到 `uv`，插件扫描仍会把本可加载的插件判定为依赖安装失败。可以把 `uv` 安装到项目自己的 `.venv`，避免污染全局 Python：
+
+```powershell
+& ".\.venv\Scripts\python.exe" -m pip install uv
+& ".\.venv\Scripts\uv.exe" --version
+```
+
+只安装到 `.venv` 并不保证未激活环境时能通过裸命令找到它。启动 Elysium 前应激活该环境：
+
+```powershell
+& ".\.venv\Scripts\Activate.ps1"
+Get-Command uv
+uv --version
+& ".\.venv\Scripts\python.exe" ".\main.py"
+```
+
+如果不激活虚拟环境、而是通过解释器绝对路径启动，则先把 `.venv\Scripts` 显式加入当前进程的 `PATH`：
+
+```powershell
+$env:Path = "$(Resolve-Path '.\.venv\Scripts');$env:Path"
+Get-Command uv
+& ".\.venv\Scripts\python.exe" ".\main.py"
+```
+
+该 `PATH` 修改只作用于当前 PowerShell 会话及其子进程，不会创建系统级环境变量或自动启动项。验收时，`Get-Command uv` 应解析到当前项目的 `.venv\Scripts\uv.exe`，而不是其他项目或全局环境中的同名程序。
+
+### 4.3 已有或损坏的 `.venv`
+
+已有环境且依赖完整时，仍建议执行：
 
 ```powershell
 uv sync --dev
 ```
 
-不要通过全局 `pip install` 补包，以免本机环境与项目环境混淆。
+如果 `pip check` 报告大量传递依赖缺失，或安装过程中反复尝试覆盖残缺的旧文件，不要继续逐项补包。先停止 Elysium，将旧环境改名保留，再创建干净环境：
 
-### 4.3 插件依赖
+```powershell
+Rename-Item -LiteralPath ".venv" -NewName ".venv.broken"
+& "<Python解释器绝对路径>" -m venv ".venv"
+```
+
+随后按 4.1 使用 `uv sync --dev`，或按 4.2 使用新环境自己的 pip 完整安装。新环境完成 `pip check`、启动导入和一次真实启动冒烟前，不要删除旧环境；需要回退时先改名保存新环境，再把旧环境恢复为 `.venv`。
+
+不要通过全局 `pip install` 补包，以免本机环境与项目环境混淆。安装期间不要同时运行第二个 pip/uv 进程，也不要启动 Elysium，否则多个进程会并发写入或读取尚未完成的 `.venv`。
+
+### 4.4 插件依赖
 
 `config/core.toml` 的 `[plugin_deps]` 默认允许启动时按各插件 `manifest.json` 自动补装缺失依赖。飞书适配器依赖包括：
 
@@ -154,6 +214,8 @@ uv sync --dev
 - `pydantic`
 
 生产或受控环境建议仍在部署阶段通过 `uv sync` 明确安装依赖，不依赖运行时临时安装。
+
+如果日志出现 `找不到安装命令 'uv'`，这表示插件依赖安装器自身无法定位安装工具，不代表日志中列出的所有插件分别损坏。应先按 4.2.1 补装并验证 `uv` 的命令可见性，再由用户手动重启 Elysium 重新扫描插件。不要仅根据当次日志逐个补装缺失包：那只能绕过当前依赖，无法修复后续插件依赖安装。
 
 ---
 
@@ -1165,3 +1227,4 @@ config/
 | 2026-08-02 | Embedding 配置 | 补充 Embedding 通用配置、真实 API 冒烟要求、索引维度约束、历史失败任务单批重试和验收检查项 |
 | 2026-08-02 | 媒体能力接入 | 为聊天意识注册保存媒体、发送图片、发送已有语音和识别语音能力；补飞书图片出站与语音入站资源链、离线契约和真实端到端验收标准 |
 | 2026-08-02 | 飞书媒体验收与 TTS 边界 | 记录飞书图片保存/发送、语音合成发送和语音接收识别均已真实验收；明确任务式 TTS 与独立 GPT-SoVITS 插件链路分离，停用插件时不要求加载其可选音频依赖 |
+| 2026-08-03 | 依赖安装与环境恢复 | 补充无 `uv` 时通过项目 `.venv` 安装完整依赖、为插件安装器补装并暴露项目级 `uv`、`pip check` 与启动导入验收，以及损坏环境改名备份、重建和回退流程 |
