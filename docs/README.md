@@ -1,23 +1,23 @@
 # Elysium 文档
 
-- [直播系统](./architecture/livestream.md) — B站接入、同一意识导演、真实播放回执与记忆闭环
+- [直播系统](./architecture/直播系统.md) — B站接入、同一意识导演、真实播放回执与记忆闭环
 
 ## 从这里开始
 
-- [当前架构](./architecture/current_architecture.md) — **当前代码与运行边界的权威总图**
+- [当前架构](./architecture/Elysium当前架构.md) — **当前代码与运行边界的权威总图**
 - [principles.md](./principles.md) — 主体性、零规则、仿生、意识实例与渐进式披露（设计底线）
-- [生命记忆系统](./architecture/life_memory_system.md) — 追加式经历、认识论本体、双时间与主体性遗忘
-- [自主意向执行协议](./architecture/life_autonomy_execution.md) — occurrence 身份、有限租约、stream 所有权、回执幂等与崩溃恢复
-- [意识实例架构](./architecture/consciousness_instances.md) — 多意识实例、潜意识协调与工具边界
-- [离线优先共享后端重构计划](./architecture/offline_first_shared_backend_plan.md) — 本地独立运行、远程近实时共享、不可变事件同步与无损迁移验收门
-- [离线同步内核](./architecture/offline_sync_kernel.md) — 阶段二已实现的 Outbox/Inbox、幂等账本、游标、冲突、退避与隐私边界
+- [生命记忆系统](./architecture/生命记忆系统.md) — 追加式经历、认识论本体、双时间与主体性遗忘
+- [自主意向执行协议](./architecture/生命引擎自主意向执行协议.md) — occurrence 身份、有限租约、stream 所有权、回执幂等与崩溃恢复
+- [意识实例架构](./architecture/意识实例架构.md) — 多意识实例、潜意识协调与工具边界
+- [离线优先共享后端重构计划](./architecture/Elysium离线优先共享后端重构计划.md) — 本地独立运行、远程近实时共享、不可变事件同步与无损迁移验收门
+- [离线同步内核](./architecture/Elysium离线同步内核.md) — 阶段二已实现的 Outbox/Inbox、幂等账本、游标、冲突、退避与隐私边界
 - [离线同步运行手册](./operations/offline_sync_runbook.md) — 手动启用、健康检查、断网恢复、降级回退与备份核对
-- [MySQL 核心持久化边界](./architecture/mysql_core_persistence.md) — Core 关系数据、生命域本地权威库、方言契约与人工切换边界
+- [MySQL 核心持久化边界](./architecture/MySQL核心持久化边界.md) — Core 关系数据、生命域本地权威库、方言契约与人工切换边界
 - [MySQL 迁移、备份与恢复手册](./operations/mysql_migration_and_backup.md) — 审计、快照、原子迁移、连续备份与恢复演练
-- [Elysium Console 前端提案](./architecture/elysium_console_frontend_proposal.md) — 已批准的插件驱动统一控制台与分阶段验收计划
-- [Elysium Console Stage 0 设计基线](./architecture/elysium_console_stage0_design.md) — 此刻、Live Ready、Live Call 与安全降级页的交互规范
-- [Elysium Console 安全模型](./architecture/elysium_console_security_model.md) — 插件页面、密钥、OBS、会话与主进程生命周期边界
-- [Elysium Console 迁移矩阵](./architecture/elysium_console_migration_matrix.md) — 现有前端接入顺序、目标形态与验收门
+- [Elysium Console 前端提案](./architecture/Elysium控制台前端提案.md) — 已批准的插件驱动统一控制台与分阶段验收计划
+- [Elysium Console Stage 0 设计基线](./architecture/Elysium控制台阶段零交互设计.md) — 此刻、Live Ready、Live Call 与安全降级页的交互规范
+- [Elysium Console 安全模型](./architecture/Elysium控制台安全模型.md) — 插件页面、密钥、OBS、会话与主进程生命周期边界
+- [Elysium Console 迁移矩阵](./architecture/Elysium控制台页面迁移矩阵.md) — 现有前端接入顺序、目标形态与验收门
 - [Elysium Console Stage 0 原型](./prototypes/elysium_console/) — 可点击的高保真静态原型
 - [Elysium Console Stage 0 验收报告](./report/elysium-console-stage0-prototype-2026-08-02.md) — 浏览器、响应式、交互与契约验证证据
 - [Voice Live 加载失败诊断（2026-08-02）](./report/voice-live-load-failure-diagnosis-2026-08-02.md) — Life Engine 并发重构中间态导致的级联失败证据与手工恢复步骤
@@ -51,7 +51,7 @@
 - [自主性原则](./minecraft/minecraft_autonomy_principles.md)
 - [具身设计](./minecraft/minecraft_embodiment_design.md)
 - [快速上手](./minecraft/minecraft_quick_start.md)
-- [商业级具身架构](./architecture/minecraft_embodiment.md) — Agent、完全仿生、OBS 与服务器路线
+- [商业级具身架构](./architecture/Minecraft具身架构.md) — Agent、完全仿生、OBS 与服务器路线
 - [2026-08-02 商业级审计与验收报告](./report/minecraft-commercial-audit-2026-08-02.md)
 
 ## 她的日记

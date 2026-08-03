@@ -132,4 +132,4 @@ WHERE state = 'open';
 - `remote_position` 与服务端 Outbox 一一对应；
 - 开放冲突数量。
 
-完整架构见 [离线同步内核](../architecture/offline_sync_kernel.md)。
+完整架构见 [离线同步内核](../architecture/Elysium离线同步内核.md)。

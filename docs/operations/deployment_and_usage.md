@@ -10,7 +10,7 @@ Elysium 是数字生命系统，不是通用聊天机器人框架。修改配置
 
 - [`AGENTS.md`](../../AGENTS.md)
 - [`docs/principles.md`](../principles.md)
-- [`docs/architecture/current_architecture.md`](../architecture/current_architecture.md)
+- [`docs/architecture/Elysium当前架构.md`](../architecture/Elysium当前架构.md)
 
 尤其注意：工程安全限制与主体的认知裁决必须分离，不得用关键词匹配、固定阈值、默认类别、代码截断或情境自动触发替代主体判断。
 

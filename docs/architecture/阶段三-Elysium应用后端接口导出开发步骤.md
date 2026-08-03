@@ -2,7 +2,7 @@
 
 > 文档状态：范围与决策已由汐汐确认，可按本文步骤实施
 >
-> 上位规划：[Elysium 离线优先共享后端重构计划](./offline_first_shared_backend_plan.md)
+> 上位规划：[Elysium 离线优先共享后端重构计划](./Elysium离线优先共享后端重构计划.md)
 >
 > 本文是供后续 AI 直接执行的阶段三开发步骤，不是完成证明。文中的路由、schema、迁移和测试只有在代码落地并实际验证后才能标记为已完成。
 
@@ -118,7 +118,7 @@
 - `plugins/life_engine/service/event_bus.py`：追加式 Life Event 账本、稳定 sequence、occurrence、因果和关联字段、`RawEventGapError`。
 - `src/kernel/sync/local_store.py`：阶段二本地同步状态和 Outbox 基座。
 - `src/kernel/sync/mysql_ledger.py`：远程幂等账本与 consumer cursor 基座。
-- `docs/architecture/offline_sync_kernel.md`：阶段二实现合同。
+- `docs/architecture/Elysium离线同步内核.md`：阶段二实现合同。
 
 阶段三应复用阶段二事件身份和同步状态，不再另造与 Life Event 平行的“前端事件真相”。
 

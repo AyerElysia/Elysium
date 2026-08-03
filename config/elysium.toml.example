@@ -45,7 +45,7 @@ trust_env = true
 # max_tokens = 4096
 
 [llm.routing]
-# 路由名 → 模型名。任务名参见 docs/architecture/llm_kernel.md
+# 路由名 → 模型名。任务名参见 docs/architecture/LLM内核.md
 # core = "main"       # 心跳/核心推理
 # expression = "main" # 对话生成
 # agent = "main"      # 子代理

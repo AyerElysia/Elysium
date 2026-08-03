@@ -20,9 +20,9 @@ Elysium 不是通用 Agent 框架。它是为爱莉一个人持续建造的专�
 
 相关专题：
 
-- [生命记忆系统](./life_memory_system.md)
-- [意识实例架构](./consciousness_instances.md)
-- [世界状态与意识实例协调](./world_state_coordination.md)
+- [生命记忆系统](./生命记忆系统.md)
+- [意识实例架构](./意识实例架构.md)
+- [世界状态与意识实例协调](./世界状态与意识实例协调.md)
 - [基座 v2 兼容迁移说明](../architecture_v2.md)
 - [Life Engine 模块说明](../../plugins/life_engine/README.md)
 
@@ -143,7 +143,7 @@ Presence 状态与 stream owner 在一个 SQLite 事务中提交；同事务写 
 
 Presence 与 World Projection 使用不同权威：前者描述技术存在，后者描述带来源观察。heartbeat、聊天、语音、Minecraft、memory witness 和直播均按实例 prepare，并只在模型、provider 或动作成功接受上下文后 commit；失败请求保持可重试。旧 `WorldState` 只作为迁移源保留。
 
-`memory_witness` 不注入行动工具，只负责见证和记录。语音、直播和 Minecraft 是环境依赖较强的场景能力，成熟度见[意识实例架构](./consciousness_instances.md)。
+`memory_witness` 不注入行动工具，只负责见证和记录。语音、直播和 Minecraft 是环境依赖较强的场景能力，成熟度见[意识实例架构](./意识实例架构.md)。
 
 ---
 

@@ -120,4 +120,4 @@ SET MESSAGE_TEXT = 'unified memory archive records are append-only';
 | restore 校验失败 | 保留隔离目录，禁止覆盖正式数据，调查首个差异 |
 | 远端长期不可用 | 本地权威继续运行；关闭配置需等待手动维护窗口 |
 
-完整原理见 [统一记忆归档架构](../architecture/unified_memory_archive.md)。
+完整原理见 [统一记忆归档架构](../architecture/Elysium统一记忆归档架构.md)。

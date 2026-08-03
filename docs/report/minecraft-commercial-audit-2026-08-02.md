@@ -103,7 +103,7 @@ OBS Studio 32.2.1 portable 的下载 SHA-256 与官方发布值一致：`DB64A29
 - `integrations/minecraft_bridge/`：NeoForge 1.21.1 客户端模组、状态采集、Baritone/原生操作执行和真实烟雾测试；
 - `integrations/windows_native_body/`：DXcam、精确窗口绑定、SendInput、异常释放和画面/输入交叉验证；
 - `test/plugins/life_engine/minecraft/`：认证、序号、重放、租约、恢复、模型输出和启动生命周期测试；
-- `docs/architecture/minecraft_embodiment.md`：生产架构、直播、服务器与多人共玩约束。
+- `docs/architecture/Minecraft具身架构.md`：生产架构、直播、服务器与多人共玩约束。
 
 旧 Minecraft 实验模块中 27 条未使用导入和无效 f-string 告警也已机械清理。最终整个 `plugins/life_engine/minecraft`、专项测试和 Windows sidecar 均通过 Ruff，避免新生产链路通过而旧目录仍保持静态检查红灯。
 

@@ -98,4 +98,4 @@
 - 正式启用要在代码合并后配置环境变量，并由用户手动重启；
 - 当前远端账号/TLS/权限收敛与长期备份策略沿用既有后续安全计划，不在阶段二擅自扩权。
 
-架构见 [离线同步内核](../architecture/offline_sync_kernel.md)，上线步骤见 [离线同步运行手册](../operations/offline_sync_runbook.md)。
+架构见 [离线同步内核](../architecture/Elysium离线同步内核.md)，上线步骤见 [离线同步运行手册](../operations/offline_sync_runbook.md)。

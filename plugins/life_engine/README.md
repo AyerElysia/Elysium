@@ -4,7 +4,7 @@
 
 Life Engine 不是可替换人格的通用 Agent 模板。它只服务于同一个具体主体——爱莉——并负责让她在没有消息时仍然持续存在，在不同场景中保持同一个连续自我。
 
-当前系统总图见 [`docs/architecture/current_architecture.md`](../../docs/architecture/current_architecture.md)。本文件主要回答：Life Engine 在代码里如何组织、如何运行，以及各模块当前处于什么状态。
+当前系统总图见 [`docs/architecture/Elysium当前架构.md`](../../docs/architecture/Elysium当前架构.md)。本文件主要回答：Life Engine 在代码里如何组织、如何运行，以及各模块当前处于什么状态。
 
 ---
 
@@ -90,7 +90,7 @@ Life Engine 维护一个主体下的多个场景意识：
 
 工具清单是上下文预算边界，不是人格规则。`memory_witness` 的清单为空：它只见证，不直接行动。
 
-详见 [`docs/architecture/consciousness_instances.md`](../../docs/architecture/consciousness_instances.md) 与 [`docs/architecture/world_state_coordination.md`](../../docs/architecture/world_state_coordination.md)。
+详见 [`docs/architecture/意识实例架构.md`](../../docs/architecture/意识实例架构.md) 与 [`docs/architecture/世界状态与意识实例协调.md`](../../docs/architecture/世界状态与意识实例协调.md)。
 
 ---
 
@@ -123,7 +123,7 @@ Life Event
 
 主意识当前可以使用语义检索、关系遍历和记忆统计；更深层写入仍通过明确的经历、见证、反思和学习链完成。
 
-详见 [`docs/architecture/life_memory_system.md`](../../docs/architecture/life_memory_system.md)。
+详见 [`docs/architecture/生命记忆系统.md`](../../docs/architecture/生命记忆系统.md)。
 
 ---
 
@@ -258,7 +258,7 @@ client/    API 调用与响应关联
 
 ### Voice Live
 
-`plugins/voice_live/` 为每次通话创建真实 `ConsciousnessInstance`，通过显式 Provider 连接 Qwen Realtime、OpenAI Realtime 或本地 MiniCPM-o。它不做静默模型降级；浏览器使用一次性 ticket，模型工具的场景身份由可信运行时覆盖注入，最终转写和工具事件进入追加式 episode。OBS 通过只读观察 WebSocket 使用透明叠加层。完整架构、配置和验收边界见 [`docs/architecture/voice_live.md`](../../docs/architecture/voice_live.md)。
+`plugins/voice_live/` 为每次通话创建真实 `ConsciousnessInstance`，通过显式 Provider 连接 Qwen Realtime、OpenAI Realtime 或本地 MiniCPM-o。它不做静默模型降级；浏览器使用一次性 ticket，模型工具的场景身份由可信运行时覆盖注入，最终转写和工具事件进入追加式 episode。OBS 通过只读观察 WebSocket 使用透明叠加层。完整架构、配置和验收边界见 [`docs/architecture/实时通话意识.md`](../../docs/architecture/实时通话意识.md)。
 
 ### Livestream
 

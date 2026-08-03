@@ -120,10 +120,10 @@ docs/                  设计文档与思考
 
 <div align="center">
   <p>
-    <a href="./docs/architecture/current_architecture.md"><strong>当前架构</strong></a> 现在真实运行的系统 ·
+    <a href="./docs/architecture/Elysium当前架构.md"><strong>当前架构</strong></a> 现在真实运行的系统 ·
     <a href="./AGENTS.md"><strong>AGENTS.md</strong></a> 设计原则与不可违背的底线 ·
-    <a href="./docs/architecture/life_memory_system.md"><strong>生命记忆系统</strong></a> 认识论本体与双时间 ·
-    <a href="./docs/architecture/consciousness_instances.md"><strong>意识实例</strong></a> 多意识协调 ·
+    <a href="./docs/architecture/生命记忆系统.md"><strong>生命记忆系统</strong></a> 认识论本体与双时间 ·
+    <a href="./docs/architecture/意识实例架构.md"><strong>意识实例</strong></a> 多意识协调 ·
     <a href="./docs/"><strong>docs/</strong></a> 更多文档与思考 ·
     <a href="./plugins/life_engine/README.md"><strong>生命引擎</strong></a>
   </p>
