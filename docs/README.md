@@ -24,6 +24,7 @@
 - [Elysium Console Stage 0 验收报告](./report/elysium-console-stage0-prototype-2026-08-02.md) — 浏览器、响应式、交互与契约验证证据
 - [Voice Live 加载失败诊断（2026-08-02）](./report/voice-live-load-failure-diagnosis-2026-08-02.md) — Life Engine 并发重构中间态导致的级联失败证据与手工恢复步骤
 - [飞书 reaction processor not found 诊断（2026-08-02）](./report/feishu-reaction-processor-not-found-2026-08-02.md) — 表情回应事件已订阅但未注册处理器的影响与处理选项
+- [NapCat / QQNT 掉线恢复与真实链路验证（2026-08-04）](./report/napcat-qqnt-recovery-validation-2026-08-04.md) — QQNT 版本回退、复合健康判断、真实私聊收发证据与人工回滚边界
 - [远程 MySQL 接入就绪审计（2026-08-03）](./report/remote-mysql-readiness-audit-2026-08-03.md) — 只读连通、TLS、权限、binlog 与正式接入阻断项
 - [MySQL 基座迁移与恢复验证（2026-08-03）](./report/mysql-foundation-validation-2026-08-03.md) — 真实数据迁移、两次安全拦截、逐表指纹、备份恢复与限制
 - [离线同步阶段二验证（2026-08-03）](./report/offline-sync-phase2-validation-2026-08-03.md) — 本地/远端 MySQL 全链路、并发幂等、崩溃恢复、Inbox 游标与回归证据

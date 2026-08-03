@@ -1,8 +1,8 @@
 # Elysium 部署、配置、测试与使用说明
 
 > 文档状态：持续维护中
-> 当前版本：Windows 本地运行、QQ/飞书文本聊天与图片查看验收基线
-> 最后核对日期：2026-08-02
+> 当前版本：Windows/WSL 本地运行、QQ/飞书文本聊天与图片查看验收基线
+> 最后核对日期：2026-08-04
 
 本文面向第一次接手 Elysium 的开发者和维护者，目标是让接手者能够独立完成环境准备、配置、启动、验证、故障排查和日常使用，并逐步覆盖项目的全部功能。
 
@@ -29,7 +29,7 @@ Elysium 是数字生命系统，不是通用聊天机器人框架。修改配置
 | Life Chatter 文本表达 | 已验证 | 必须启用 `[chatter].enabled` 且存在非空 `SOUL.md` |
 | 飞书长连接收消息 | 已验证 | 不需要公网域名 |
 | 飞书私聊文本回复 | 已验证 | 已处理私聊 `chat_id` 路由和引用消息 ID |
-| QQ/NapCat 私聊文本聊天 | 历史已验证 | 是否启用由各部署环境自行配置；启用后应重新做当前版本冒烟 |
+| QQ/NapCat 私聊文本聊天 | 已验证（2026-08-04 WSL） | NapCat 4.18.13 + QQNT 3.2.23-44343 已完成真实私聊收发；长期稳定性仍需持续观察 |
 | QQ/NapCat 图片查看 | 历史已验证 | 是否启用由各部署环境自行配置；启用后应重新做当前版本冒烟 |
 | 飞书图片查看 | 已验证 | 图片资源下载需要消息读取权限；详见 9.1 |
 | 飞书图片保存 | 已验证 | 由主体主动调用 `nucleus_save_media` 保存到 Life Engine workspace |
@@ -689,7 +689,7 @@ Invoke-RestMethod `
 
 ## 10. 配置并启动 QQ/NapCat
 
-QQ 接入使用 NapCat + OneBot 11 **反向 WebSocket**：Elysium 启动 WebSocket 服务端并监听本机端口，NapCat 作为客户端主动连接。该链路历史上完成过 QQ 私聊文本和图片查看验收；是否启用由各部署环境自行决定，启用后应重新完成当前版本冒烟。
+QQ 接入使用 NapCat + OneBot 11 **反向 WebSocket**：Elysium 启动 WebSocket 服务端并监听本机端口，NapCat 作为客户端主动连接。该链路已完成 QQ 私聊文本和图片查看验收；是否启用由各部署环境自行决定，启用后应重新完成当前版本冒烟。2026-08-04 的 WSL 掉线恢复、版本组合、复合健康判断和真实收发证据见 [NapCat / QQNT 掉线恢复与真实链路验证](../report/napcat-qqnt-recovery-validation-2026-08-04.md)。
 
 ### 10.1 账号与目录要求
 
@@ -785,7 +785,16 @@ access_token = ""
 5. Elysium 加载 NapCat 适配器并开始监听 `127.0.0.1:<OneBot端口>` 后，NapCat 应自动建立反向 WebSocket 连接。
 6. 确认连接完成后再进行 QQ 文本和图片验收。
 
-必须通过 NapCat 官方 `launcher.bat <机器人QQ号>` 启动机器人账号，不自行替换官方启动链。
+Windows 部署必须通过 NapCat 官方 `launcher.bat <机器人QQ号>` 启动机器人账号，不自行替换官方启动链。
+
+Linux/WSL 部署使用已经完成当前版本验收的 QQNT/NapCat 入口。确认没有现存实例后，可在 QQNT 运行目录手动前台启动：
+
+```bash
+cd <QQNT运行目录>
+xvfb-run -a ./qq --no-sandbox
+```
+
+如果实例已经运行且 OneBot、反向 WebSocket 和真实消息入站均正常，不得再次执行该命令。不要同时运行两个使用同一账号与会话目录的实例。
 
 ### 10.5 启动成功判定
 
@@ -823,7 +832,7 @@ access_token = ""
 
 ### 11.1 推荐启动命令
 
-当前 NapCat 已停用，日常只启动 Elysium。后续恢复 QQ/NapCat 时，完整启动顺序以 10.4 为准：先启动 NapCat 和独立机器人 QQ，再启动 Elysium。以下命令只负责启动 Elysium 主进程。
+NapCat 是否启用由部署环境决定；2026-08-04 的 WSL 环境已启用并完成真实 QQ 私聊复验。完整启动顺序以 10.4 为准：先启动 NapCat 和独立机器人 QQ，再启动 Elysium。以下命令只负责启动 Elysium 主进程。
 
 PowerShell：
 
@@ -923,10 +932,10 @@ Ctrl+C
 - [x] 图片保存、图片发送、语音合成发送和语音接收识别已通过真实飞书端到端验收。
 - [ ] 群聊、普通文件和视频仍未验收。
 
-### 12.6 QQ/NapCat 端到端（历史验收，启用状态由部署环境决定）
+### 12.6 QQ/NapCat 端到端（2026-08-04 WSL 已复验）
 
 - [x] 使用独立机器人 QQ，与个人 QQ 安装和账号隔离。
-- [x] NapCat 通过官方 `launcher.bat <机器人QQ号>` 启动。
+- [x] NapCat 按平台使用已验收的启动链：Windows 使用官方 `launcher.bat <机器人QQ号>`，Linux/WSL 使用 10.4 所列 QQNT 入口。
 - [x] NapCat OneBot 11 WebSocket Client 指向 `ws://127.0.0.1:<OneBot端口>`。
 - [x] Elysium NapCat 适配器使用 `reverse` 模式并监听 `<OneBot端口>`。
 - [x] 启动顺序为先 NapCat、后 Elysium，连接能够自动建立。
@@ -979,10 +988,13 @@ Ctrl+C
     test/plugins/test_napcat_adapter_startup_validation.py `
     test/plugins/test_napcat_image_handler.py `
     test/plugins/test_napcat_audio_file_handler.py `
+    test/plugins/test_napcat_outgoing_sender.py `
     -q -n 0 --no-cov
 ```
 
 该组测试用于适配器离线回归，但测试通过不等于对应能力已完成端到端验收。飞书语音接收识别与语音合成发送之所以列为可用，是因为已经完成真实飞书端到端验收，而不是因为音频相关用例存在；QQ/NapCat 语音仍不能据此宣称可用。
+
+2026-08-04 在 WSL 环境运行上述飞书与 NapCat 组合清单，结果为 `77 passed`；其中四个 NapCat 测试文件的独立子集为 `41 passed`。同日另以真实 QQ 私聊完成消息入站、统一消息处理和文本回复动作验收。
 
 ### 13.3 格式检查
 
