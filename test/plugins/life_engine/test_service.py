@@ -776,6 +776,63 @@ async def test_memory_index_lifecycle_start_toggle_and_stop_close(
     assert lifecycle_events.index("witness_wait") < lifecycle_events.index("memory_close")
 
 
+async def test_shared_sync_uses_managed_lifecycle_and_closes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _make_service(tmp_path)
+    config = service.plugin.config
+    config.shared_sync.enabled = True
+    config.memory_index.enabled = False
+    config.memory_witness.enabled = False
+    config.autonomy.enabled = False
+    config.streams.enabled = False
+    config.drives.enabled = False
+    config.learning.enabled = False
+    lifecycle: list[str] = []
+
+    class FakeBridge:
+        def __init__(self, section: object, store: object) -> None:
+            assert section is config.shared_sync
+            assert store is service._get_event_bus().store
+            lifecycle.append("created")
+
+        async def run(self, stop_event: asyncio.Event) -> None:
+            lifecycle.append("running")
+            await stop_event.wait()
+            lifecycle.append("stopped")
+
+        async def close(self) -> None:
+            lifecycle.append("closed")
+
+        def health_snapshot(self) -> dict[str, object]:
+            return {"component": "offline_sync", "status": "healthy"}
+
+    async def fake_init_memory(_integration: object) -> None:
+        service._memory_service = None
+
+    monkeypatch.setattr(
+        "plugins.life_engine.service.shared_sync.SharedSyncBridge",
+        FakeBridge,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.service.integrations.MemoryIntegration.init_memory_service",
+        fake_init_memory,
+    )
+
+    await service.start()
+    await asyncio.sleep(0)
+    assert service._shared_sync_task_id is not None
+    assert lifecycle[:2] == ["created", "running"]
+    assert service.health()["shared_sync"]["status"] == "healthy"
+
+    await service.stop()
+
+    assert service._shared_sync_task_id is None
+    assert service._shared_sync_bridge is None
+    assert lifecycle == ["created", "running", "stopped", "closed"]
+
+
 async def test_memory_index_loop_survives_provider_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

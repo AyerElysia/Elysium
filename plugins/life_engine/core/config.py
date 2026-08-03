@@ -65,6 +65,20 @@ class LifeEngineConfig(BaseConfig):
             "migrate_legacy_diaries",
             "legacy_diary_path",
         },
+        "shared_sync": {
+            "enabled",
+            "remote_host",
+            "remote_port",
+            "remote_database",
+            "remote_user",
+            "remote_password_env",
+            "mysql_ssl_mode",
+            "poll_interval_seconds",
+            "batch_size",
+            "push_enabled",
+            "pull_enabled",
+            "allowed_visibilities",
+        },
         "history_retrieval": {
             "enabled",
             "default_cross_stream",
@@ -356,6 +370,79 @@ class LifeEngineConfig(BaseConfig):
         legacy_diary_path: str = Field(
             default="data/diaries",
             description="旧日记只读迁移来源；原文件不会被删除或改写。",
+        )
+
+    @config_section("shared_sync")
+    class SharedSyncSection(SectionBase):
+        """离线优先共享事件同步；默认关闭且绝不从配置文件读取明文密码。"""
+
+        enabled: bool = Field(
+            default=False,
+            description="是否启动共享事件同步 worker。默认关闭。",
+        )
+        remote_host: str = Field(default="", description="远端 MySQL 主机。")
+        remote_port: int = Field(default=3306, ge=1, le=65535, description="远端 MySQL 端口。")
+        remote_database: str = Field(default="elysium", description="共享账本数据库名。")
+        remote_user: str = Field(default="", description="共享账本数据库用户。")
+        remote_password_env: str = Field(
+            default="ELYSIUM_SYNC_MYSQL_PASSWORD",
+            description="保存远端 MySQL 密码的环境变量名；配置文件不保存密码。",
+        )
+        mysql_ssl_mode: str = Field(
+            default="disabled",
+            description="MySQL TLS 模式：disabled/required/verify-ca/verify-full。",
+        )
+        mysql_ssl_ca: str = Field(default="", description="可选 CA 证书路径。")
+        mysql_ssl_cert: str = Field(default="", description="可选客户端证书路径。")
+        mysql_ssl_key: str = Field(default="", description="可选客户端私钥路径。")
+        connect_timeout_seconds: int = Field(
+            default=5,
+            ge=1,
+            le=60,
+            description="远端连接超时秒数。",
+        )
+        poll_interval_seconds: float = Field(
+            default=1.0,
+            ge=0.1,
+            le=300.0,
+            description="同步轮询间隔秒数。",
+        )
+        batch_size: int = Field(
+            default=100,
+            ge=1,
+            le=1000,
+            description="每轮最大推送或拉取事件数。",
+        )
+        lease_seconds: float = Field(
+            default=60.0,
+            ge=1.0,
+            le=3600.0,
+            description="Outbox 投递租约秒数；进程崩溃后可自动回收。",
+        )
+        base_backoff_seconds: float = Field(
+            default=1.0,
+            ge=0.0,
+            le=60.0,
+            description="失败后的初始重试退避秒数。",
+        )
+        max_backoff_seconds: float = Field(
+            default=300.0,
+            ge=1.0,
+            le=3600.0,
+            description="重试退避上限秒数。",
+        )
+        push_enabled: bool = Field(default=True, description="是否推送明确授权共享的本地事件。")
+        pull_enabled: bool = Field(
+            default=False,
+            description="是否拉取远端事件；应用投影器完成前保持关闭。",
+        )
+        allowed_visibilities: list[str] = Field(
+            default_factory=lambda: ["shared"],
+            description="允许跨边界传输的 visibility 白名单。",
+        )
+        consumer_id: str = Field(
+            default="life_engine.shared_sync",
+            description="远端事件应用游标的消费者 ID。",
         )
 
     @config_section("autonomy")
@@ -1532,6 +1619,7 @@ class LifeEngineConfig(BaseConfig):
     model: ModelSection = Field(default_factory=ModelSection)
     memory_index: MemoryIndexSection = Field(default_factory=MemoryIndexSection)
     memory_witness: MemoryWitnessSection = Field(default_factory=MemoryWitnessSection)
+    shared_sync: SharedSyncSection = Field(default_factory=SharedSyncSection)
     curiosity: CuriositySection = Field(default_factory=CuriositySection)
     history_retrieval: HistoryRetrievalSection = Field(default_factory=HistoryRetrievalSection)
     web: WebSection = Field(default_factory=WebSection)

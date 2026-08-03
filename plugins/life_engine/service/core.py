@@ -204,6 +204,9 @@ class LifeEngineService(BaseService):
         self._memory_index_task_id: str | None = None
         self._memory_witness_task_id: str | None = None
         self._memory_witness_coordinator = None
+        self._shared_sync_task_id: str | None = None
+        self._shared_sync_bridge = None
+        self._shared_sync_error: str = ""
         self._router_context_projection_task_id: str | None = None
         self._router_context_projection: RouterContextProjection | None = None
         self._stop_event: asyncio.Event | None = None
@@ -1079,6 +1082,26 @@ class LifeEngineService(BaseService):
                 "backlog": 0,
                 "fresh": False,
                 "degraded_reason": "",
+            }
+        if self._shared_sync_bridge is not None:
+            try:
+                snapshot["shared_sync"] = self._shared_sync_bridge.health_snapshot()
+            except Exception as exc:  # noqa: BLE001
+                snapshot["shared_sync"] = {
+                    "component": "offline_sync",
+                    "status": "degraded",
+                    "running": False,
+                    "degraded_reason": f"health unavailable: {type(exc).__name__}: {exc}",
+                }
+        else:
+            sync_enabled = bool(getattr(getattr(self._cfg(), "shared_sync", None), "enabled", False))
+            snapshot["shared_sync"] = {
+                "component": "offline_sync",
+                "status": "degraded" if self._shared_sync_error else "disabled",
+                "running": False,
+                "outbox_backlog": 0,
+                "degraded_reason": self._shared_sync_error,
+                "enabled": sync_enabled,
             }
         return snapshot
 
@@ -4910,6 +4933,28 @@ class LifeEngineService(BaseService):
 
         self._stop_event = asyncio.Event()
 
+        shared_sync_cfg = getattr(cfg, "shared_sync", None)
+        if bool(getattr(shared_sync_cfg, "enabled", False)):
+            try:
+                from .shared_sync import SharedSyncBridge
+
+                self._shared_sync_bridge = SharedSyncBridge(
+                    shared_sync_cfg,
+                    self._get_event_bus().store,
+                )
+                shared_sync_task = get_task_manager().create_task(
+                    self._shared_sync_bridge.run(self._stop_event),
+                    name="life_engine_shared_sync",
+                    daemon=True,
+                )
+                self._shared_sync_task_id = shared_sync_task.task_id
+                self._shared_sync_error = ""
+            except Exception as exc:  # noqa: BLE001
+                self._shared_sync_bridge = None
+                self._shared_sync_task_id = None
+                self._shared_sync_error = f"{type(exc).__name__}: {exc}"
+                logger.error(f"life_engine 共享同步初始化失败: {self._shared_sync_error}")
+
         chatter_cfg = getattr(cfg, "chatter", None)
         projection_enabled = bool(
             chatter_cfg is not None
@@ -5041,6 +5086,16 @@ class LifeEngineService(BaseService):
         )
         self._router_context_projection_task_id = None
         self._router_context_projection = None
+
+        await self._await_managed_task(self._shared_sync_task_id, timeout=10.0)
+        self._shared_sync_task_id = None
+        if self._shared_sync_bridge is not None:
+            try:
+                await self._shared_sync_bridge.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"关闭共享同步连接失败: {exc}")
+            finally:
+                self._shared_sync_bridge = None
 
         await self._await_managed_task(self._memory_witness_task_id, timeout=10.0)
         self._memory_witness_task_id = None

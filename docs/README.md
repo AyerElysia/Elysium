@@ -10,6 +10,8 @@
 - [自主意向执行协议](./architecture/life_autonomy_execution.md) — occurrence 身份、有限租约、stream 所有权、回执幂等与崩溃恢复
 - [意识实例架构](./architecture/consciousness_instances.md) — 多意识实例、潜意识协调与工具边界
 - [离线优先共享后端重构计划](./architecture/offline_first_shared_backend_plan.md) — 本地独立运行、远程近实时共享、不可变事件同步与无损迁移验收门
+- [离线同步内核](./architecture/offline_sync_kernel.md) — 阶段二已实现的 Outbox/Inbox、幂等账本、游标、冲突、退避与隐私边界
+- [离线同步运行手册](./operations/offline_sync_runbook.md) — 手动启用、健康检查、断网恢复、降级回退与备份核对
 - [MySQL 核心持久化边界](./architecture/mysql_core_persistence.md) — Core 关系数据、生命域本地权威库、方言契约与人工切换边界
 - [MySQL 迁移、备份与恢复手册](./operations/mysql_migration_and_backup.md) — 审计、快照、原子迁移、连续备份与恢复演练
 - [Elysium Console 前端提案](./architecture/elysium_console_frontend_proposal.md) — 已批准的插件驱动统一控制台与分阶段验收计划
@@ -22,6 +24,7 @@
 - [飞书 reaction processor not found 诊断（2026-08-02）](./report/feishu-reaction-processor-not-found-2026-08-02.md) — 表情回应事件已订阅但未注册处理器的影响与处理选项
 - [远程 MySQL 接入就绪审计（2026-08-03）](./report/remote-mysql-readiness-audit-2026-08-03.md) — 只读连通、TLS、权限、binlog 与正式接入阻断项
 - [MySQL 基座迁移与恢复验证（2026-08-03）](./report/mysql-foundation-validation-2026-08-03.md) — 真实数据迁移、两次安全拦截、逐表指纹、备份恢复与限制
+- [离线同步阶段二验证（2026-08-03）](./report/offline-sync-phase2-validation-2026-08-03.md) — 本地/远端 MySQL 全链路、并发幂等、崩溃恢复、Inbox 游标与回归证据
 - [Life Engine 模块说明](../plugins/life_engine/README.md) — 生命域的代码入口与运行链路
 
 ## 当前架构与迁移
