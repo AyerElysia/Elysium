@@ -86,7 +86,9 @@
 - root hash：`3037b8f4c96fee16bcd9eef2cea3e8af5ffc6c41afa5f44988da03f613c19aeb`
 - 远端逐条复算 payload mismatch 为 0，`verified=true`。
 
-最终审计时，该主节点共有 380,597 条归档记录、380,472 个 Heads，开放冲突为 0，运行中清单为 0。Outbox 的 pending 项是给未来下游 API/事件消费者保留的投递游标，不表示正文尚未同步；归档正文和运行清单均已在 MySQL。
+交付前再次追平运行期间产生的新数据：manifest `3b6dbfa3-0c7c-46b8-9643-17e78466ba46`，扫描/accepted/conflict 为 103 / 103 / 0，payload mismatch 为 0，root hash `73e9819992124ca99cb1398d09c60608154d99cd029b2e6d5915b32b209c402e` 复算一致，`verified=true`。
+
+最终审计时，该主节点共有 380,700 条归档记录、380,557 个 Heads，开放冲突为 0，运行中清单为 0。Outbox 的 pending 项是给未来下游 API/事件消费者保留的投递游标，不表示正文尚未同步；归档正文和运行清单均已在 MySQL。
 
 ### 5.4 自动化验证
 
