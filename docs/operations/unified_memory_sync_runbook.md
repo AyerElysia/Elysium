@@ -7,6 +7,8 @@
 - 同步前逐个校验 manifest 中的文件大小和 SHA-256；任何漂移都拒绝迁移。
 - 密码只来自环境变量，不写进 TOML、文档、日志或 Git。
 - 恢复目标必须是全新隔离目录，禁止覆盖正在使用的 `data/`。
+- 归档 `archive_role` 只是工程存储分类，不是 claim authority、主体执笔权或事实状态。MySQL v1 的物理列名仍为 `authority`，不得据此决定记忆真假。
+- workspace 中未明确声明所有权的文件仍逐字节备份，但标为 `unclassified_workspace_exact_bytes`；不得因为路径、扩展名或内容相似就自动提升为主体文件。
 
 ## 2. 创建一致性备份
 
@@ -52,10 +54,16 @@ SELECT source_domain, COUNT(*)
 FROM elysium_memory_archive_records
 WHERE source_node_id = '目标节点 ID'
 GROUP BY source_domain;
+SELECT authority AS legacy_archive_role, COUNT(*)
+FROM elysium_memory_archive_records
+WHERE source_node_id = '目标节点 ID'
+GROUP BY authority;
 SELECT COUNT(*) FROM elysium_memory_archive_conflicts WHERE state = 'open';
 ```
 
 禁止直接 UPDATE/DELETE `elysium_memory_archive_records`。如果外部工具改过内容，运行清单校验必须视为事故，不得通过更新 hash “修绿”。
+
+`unclassified_storage_record` 表示出现了尚未登记归档契约的新 SQLite 表。数据已经保守保存，但必须先审查该组件的真实 schema 所有权，再通过代码和测试显式登记；禁止现场 UPDATE 旧记录或按表名猜测认知意义。
 
 ## 5. 隔离恢复演练
 

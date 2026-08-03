@@ -46,7 +46,7 @@ async def test_mysql_archive_concurrent_replay_has_one_exact_manifest_link() -> 
         source_sequence=1,
         recorded_at="2026-08-03T00:00:00+08:00",
         visibility="owner_private",
-        authority="integration_test",
+        archive_role="integration_test",
         payload={"suffix": suffix},
     )
     try:

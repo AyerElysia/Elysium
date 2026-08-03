@@ -7,6 +7,8 @@
 - [当前架构](./architecture/Elysium当前架构.md) — **当前代码与运行边界的权威总图**
 - [principles.md](./principles.md) — 主体性、零规则、仿生、意识实例与渐进式披露（设计底线）
 - [生命记忆系统](./architecture/生命记忆系统.md) — 追加式经历、认识论本体、双时间与主体性遗忘
+- [统一记忆归档架构](./architecture/Elysium统一记忆归档架构.md) — 逐行/逐字节可校验灾备、归档角色与投影边界
+- [记忆跨节点共享契约](./architecture/Elysium记忆跨节点共享契约.md) — 同一主体的事件复制、开放记忆谱系、冲突与投影重建验收门
 - [自主意向执行协议](./architecture/生命引擎自主意向执行协议.md) — occurrence 身份、有限租约、stream 所有权、回执幂等与崩溃恢复
 - [意识实例架构](./architecture/意识实例架构.md) — 多意识实例、潜意识协调与工具边界
 - [离线优先共享后端重构计划](./architecture/Elysium离线优先共享后端重构计划.md) — 本地独立运行、远程近实时共享、不可变事件同步与无损迁移验收门
@@ -25,6 +27,7 @@
 - [远程 MySQL 接入就绪审计（2026-08-03）](./report/remote-mysql-readiness-audit-2026-08-03.md) — 只读连通、TLS、权限、binlog 与正式接入阻断项
 - [MySQL 基座迁移与恢复验证（2026-08-03）](./report/mysql-foundation-validation-2026-08-03.md) — 真实数据迁移、两次安全拦截、逐表指纹、备份恢复与限制
 - [离线同步阶段二验证（2026-08-03）](./report/offline-sync-phase2-validation-2026-08-03.md) — 本地/远端 MySQL 全链路、并发幂等、崩溃恢复、Inbox 游标与回归证据
+- [记忆归档规范复审与真实数据验证（2026-08-04）](./report/memory-archive-compliance-audit-2026-08-04.md) — 383,718 条真实记录只读扫描、主体归属边界与全项目回归证据
 - [Life Engine 模块说明](../plugins/life_engine/README.md) — 生命域的代码入口与运行链路
 
 ## 当前架构与迁移

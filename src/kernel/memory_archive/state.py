@@ -16,7 +16,7 @@ def _now_iso() -> str:
 
 
 class ArchiveState:
-    """Track exact remote acknowledgements without modifying authority databases."""
+    """Track exact remote acknowledgements without modifying source databases."""
 
     def __init__(self, path: Path) -> None:
         self.path = path.resolve()

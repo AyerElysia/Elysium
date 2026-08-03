@@ -40,7 +40,11 @@ class ArchiveMode(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class ArchiveRecord:
-    """One byte-verifiable row, schema object, or workspace file version."""
+    """One byte-verifiable row, schema object, or workspace file version.
+
+    ``archive_role`` is an engineering storage classification. It never
+    expresses epistemic authority, subjective ownership, truth, or value.
+    """
 
     record_id: str
     source_node_id: str
@@ -53,7 +57,7 @@ class ArchiveRecord:
     source_sequence: int
     recorded_at: str
     visibility: str
-    authority: str
+    archive_role: str
     payload_json: str
     payload_hash: str
     schema_version: int = ARCHIVE_SCHEMA_VERSION
@@ -70,7 +74,7 @@ class ArchiveRecord:
         source_sequence: int,
         recorded_at: str,
         visibility: str,
-        authority: str,
+        archive_role: str,
         payload: Any,
         schema_version: int = ARCHIVE_SCHEMA_VERSION,
     ) -> ArchiveRecord:
@@ -99,7 +103,7 @@ class ArchiveRecord:
             source_sequence=max(0, int(source_sequence)),
             recorded_at=str(recorded_at),
             visibility=str(visibility or "owner_private").lower(),
-            authority=str(authority),
+            archive_role=str(archive_role),
             payload_json=payload_json,
             payload_hash=payload_hash,
             schema_version=int(schema_version),
@@ -111,6 +115,10 @@ class ArchiveRecord:
     def as_dict(self) -> dict[str, Any]:
         values = asdict(self)
         values["mode"] = self.mode.value
+        # The deployed MySQL v1 schema used the ambiguous physical column
+        # name ``authority``. Keep wire/storage compatibility without
+        # exposing it as the Python domain term.
+        values["authority"] = values.pop("archive_role")
         return values
 
 

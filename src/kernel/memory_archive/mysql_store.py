@@ -939,7 +939,7 @@ class RemoteMemoryArchive:
                     source_sequence=int(row["source_sequence"]),
                     recorded_at=str(row["recorded_at"]),
                     visibility=str(row["visibility"]),
-                    authority=str(row["authority"]),
+                    archive_role=str(row["authority"]),
                     payload_json=str(row["payload_json"]),
                     payload_hash=str(row["payload_hash"]),
                     schema_version=int(row["schema_version"]),

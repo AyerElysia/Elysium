@@ -123,6 +123,7 @@ class MemoryArchiveCoordinator:
                             "archive record source node does not match local state"
                         )
                     source_counts[f"observed:{record.source_domain}"] += 1
+                    source_counts[f"role:{record.archive_role}"] += 1
                 if full_snapshot:
                     selected = observed
                 else:

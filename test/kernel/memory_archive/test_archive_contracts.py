@@ -25,6 +25,7 @@ from src.kernel.memory_archive.restore import (
 from src.kernel.memory_archive.sources import (
     iter_sqlite_records,
     iter_workspace_records,
+    sqlite_table_archive_contract,
 )
 from src.kernel.memory_archive.state import ArchiveState
 
@@ -138,7 +139,7 @@ def _record(*, mode: ArchiveMode, payload: dict) -> ArchiveRecord:
         source_sequence=1,
         recorded_at="2026-08-03T00:00:00+08:00",
         visibility="owner_private",
-        authority="authoritative_history",
+        archive_role="immutable_history_replica",
         payload=payload,
     )
 
@@ -154,6 +155,24 @@ def test_archive_identity_distinguishes_immutable_conflict_from_version() -> Non
     assert immutable_one.immutable_key == immutable_two.immutable_key
     assert version_one.record_id != version_two.record_id
     assert version_one.immutable_key is None
+    wire = immutable_one.as_dict()
+    assert wire["authority"] == "immutable_history_replica"
+    assert "archive_role" not in wire
+
+
+def test_archive_contracts_never_promote_unknown_tables() -> None:
+    history = sqlite_table_archive_contract("life_memory", "memory_claims")
+    projection = sqlite_table_archive_contract(
+        "life_memory", "memory_association_projection"
+    )
+    unknown = sqlite_table_archive_contract("life_memory", "memory_future_shape")
+
+    assert history.mode is ArchiveMode.IMMUTABLE
+    assert history.archive_role == "immutable_history_replica"
+    assert projection.mode is ArchiveMode.VERSIONED
+    assert projection.archive_role == "rebuildable_projection"
+    assert unknown.mode is ArchiveMode.VERSIONED
+    assert unknown.archive_role == "unclassified_storage_record"
 
 
 @pytest.mark.asyncio
@@ -224,10 +243,27 @@ async def test_workspace_archive_restores_inline_and_chunked_files(
     large = data_root / "life_engine_workspace/received/proof.bin"
     large.parent.mkdir(parents=True)
     large.write_bytes(bytes(range(256)) * 4097)
+    external_diary = data_root / "diaries/2026-08/2026-08-04.md"
+    external_diary.parent.mkdir(parents=True)
+    external_diary.write_text("逐字节日记", encoding="utf-8")
 
     records = list(iter_workspace_records(data_root, source_node_id="node-proof"))
-    assert sum(record.record_kind == "workspace_file" for record in records) == 2
+    assert sum(record.record_kind == "workspace_file" for record in records) == 3
     assert sum(record.record_kind == "workspace_file_chunk" for record in records) >= 2
+    roles = {
+        record.payload()["path"]: record.archive_role
+        for record in records
+        if record.record_kind == "workspace_file"
+    }
+    assert roles["life_engine_workspace/SOUL.md"] == (
+        "declared_subject_artifact_exact_bytes"
+    )
+    assert roles["life_engine_workspace/received/proof.bin"] == (
+        "unclassified_workspace_exact_bytes"
+    )
+    assert roles["diaries/2026-08/2026-08-04.md"] == (
+        "declared_subject_artifact_exact_bytes"
+    )
 
     output = tmp_path / "restore"
     result = await restore_workspace(
@@ -239,7 +275,10 @@ async def test_workspace_archive_restores_inline_and_chunked_files(
     assert (
         output / "life_engine_workspace/received/proof.bin"
     ).read_bytes() == large.read_bytes()
-    assert result["files"] == 2
+    assert (output / "diaries/2026-08/2026-08-04.md").read_bytes() == (
+        external_diary.read_bytes()
+    )
+    assert result["files"] == 3
     assert result["byte_hash_check"] == "ok"
 
 
@@ -277,7 +316,7 @@ async def test_concurrent_publisher_preserves_manifest_hash_order(
             source_sequence=index,
             recorded_at="",
             visibility="owner_private",
-            authority="test",
+            archive_role="test",
             payload={"index": index},
         )
         for index in range(6)
@@ -307,6 +346,7 @@ async def test_concurrent_publisher_preserves_manifest_hash_order(
     assert remote.max_active == 3
     assert thread_bound_records.owner_thread_id != main_thread_id
     assert summary.root_hash == expected.hexdigest()
+    assert summary.source_counts["role:test"] == 6
     assert remote.finished["root_hash"] == expected.hexdigest()
     assert state.health()["known_records"] == 6
 
@@ -326,7 +366,7 @@ async def test_failed_remote_hash_cannot_remain_a_complete_manifest(
         source_sequence=1,
         recorded_at="",
         visibility="owner_private",
-        authority="test",
+        archive_role="test",
         payload={"value": 1},
     )
     remote = _VerificationFailRemote()

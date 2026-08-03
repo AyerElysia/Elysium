@@ -1,4 +1,4 @@
-"""Read-only adapters that normalize Elysium's local memory authorities.
+"""Read-only adapters that normalize Elysium's local memory stores.
 
 SQLite files are opened in URI read-only mode and workspace files are checked
 before and after each read.  The adapters never update source databases,
@@ -30,6 +30,19 @@ class SQLiteSource:
     domain: str
     relative_path: Path
     required: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class SQLiteTableArchiveContract:
+    """Engineering archive behavior for one SQLite table.
+
+    The role is deliberately open text and describes storage/rebuild
+    behavior only. It must never be consumed as evidence about truth or
+    subjective meaning.
+    """
+
+    mode: ArchiveMode
+    archive_role: str
 
 
 DEFAULT_SQLITE_SOURCES = (
@@ -93,6 +106,24 @@ _PROJECTION_TABLES = frozenset(
 )
 
 
+_VERSIONED_TABLE_ROLES: dict[tuple[str, str], str] = {
+    ("life_events", "raw_event_consumer_offsets"): "consumer_cursor_state",
+    ("life_events", "raw_event_store_meta"): "ledger_engineering_state",
+    ("life_memory", "memory_retrieval_exposures"): "versioned_retrieval_trace",
+    ("life_memory", "memory_witnesses"): "versioned_witness_record",
+}
+
+
+_DECLARED_SUBJECT_WORKSPACE_FILES = frozenset(
+    {
+        "MEMORY.md",
+        "SOUL.md",
+        "USER.md",
+    }
+)
+_DECLARED_SUBJECT_WORKSPACE_PREFIXES = ("diaries/",)
+
+
 _OPERATIONAL_PREFIXES = ("sync_",)
 _WORKSPACE_EXCLUDED_PARTS = frozenset({".git", ".memory", "__pycache__"})
 _WORKSPACE_EXCLUDED_SUFFIXES = frozenset(
@@ -111,7 +142,7 @@ def _sha256_file(path: Path) -> str:
 
 
 def verify_backup_manifest(backup_root: Path) -> dict[str, int]:
-    """Verify every authority snapshot and subject file before migration."""
+    """Verify every declared snapshot and workspace file before migration."""
 
     root = backup_root.resolve()
     manifest_path = root / "manifest.json"
@@ -209,22 +240,42 @@ def _readonly_connection(path: Path) -> sqlite3.Connection:
     return connection
 
 
-def _table_mode(domain: str, table: str) -> ArchiveMode:
-    if table in _IMMUTABLE_TABLES.get(domain, frozenset()):
-        return ArchiveMode.IMMUTABLE
-    return ArchiveMode.VERSIONED
+def sqlite_table_archive_contract(
+    domain: str,
+    table: str,
+) -> SQLiteTableArchiveContract:
+    """Return a conservative technical contract without inferring meaning."""
 
-
-def _table_authority(domain: str, table: str, mode: ArchiveMode) -> str:
     if domain == "core":
-        return "application_authority_snapshot"
+        return SQLiteTableArchiveContract(
+            mode=ArchiveMode.VERSIONED,
+            archive_role="application_storage_snapshot",
+        )
     if domain in {"consciousness_presence", "world_projection"}:
-        return "runtime_projection"
+        return SQLiteTableArchiveContract(
+            mode=ArchiveMode.VERSIONED,
+            archive_role="runtime_projection",
+        )
     if table in _PROJECTION_TABLES:
-        return "rebuildable_projection"
-    if mode is ArchiveMode.IMMUTABLE:
-        return "authoritative_history"
-    return "versioned_state"
+        return SQLiteTableArchiveContract(
+            mode=ArchiveMode.VERSIONED,
+            archive_role="rebuildable_projection",
+        )
+    if table in _IMMUTABLE_TABLES.get(domain, frozenset()):
+        return SQLiteTableArchiveContract(
+            mode=ArchiveMode.IMMUTABLE,
+            archive_role="immutable_history_replica",
+        )
+    explicit_role = _VERSIONED_TABLE_ROLES.get((domain, table))
+    if explicit_role:
+        return SQLiteTableArchiveContract(
+            mode=ArchiveMode.VERSIONED,
+            archive_role=explicit_role,
+        )
+    return SQLiteTableArchiveContract(
+        mode=ArchiveMode.VERSIONED,
+        archive_role="unclassified_storage_record",
+    )
 
 
 def _is_archivable_table(name: str) -> bool:
@@ -303,7 +354,7 @@ def _schema_records(
             source_sequence=ordinal,
             recorded_at="",
             visibility="owner_private",
-            authority="engineering_schema",
+            archive_role="engineering_schema",
             payload={
                 "name": name,
                 "table": table_name,
@@ -343,8 +394,7 @@ def iter_sqlite_records(
             if _is_archivable_table(str(row[0]))
         ]
         for table in tables:
-            mode = _table_mode(domain, table)
-            authority = _table_authority(domain, table, mode)
+            contract = sqlite_table_archive_contract(domain, table)
             pk_columns = _primary_key_columns(connection, table)
             table_sql_row = connection.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
@@ -394,11 +444,11 @@ def iter_sqlite_records(
                         source_domain=domain,
                         record_kind=f"sqlite_row:{table}",
                         logical_key=canonical_json(identity_values),
-                        mode=mode,
+                        mode=contract.mode,
                         source_sequence=source_sequence,
                         recorded_at=_row_recorded_at(row),
                         visibility=_row_visibility(row),
-                        authority=authority,
+                        archive_role=contract.archive_role,
                         payload={
                             "table": table,
                             "primary_key": identity_values,
@@ -420,12 +470,37 @@ def _workspace_file_allowed(path: Path, workspace_root: Path) -> bool:
     return not any(lowered.endswith(suffix) for suffix in _WORKSPACE_EXCLUDED_SUFFIXES)
 
 
+def workspace_file_archive_role(path: Path, data_root: Path) -> str:
+    """Classify only explicitly declared subject paths; never guess ownership."""
+
+    root = data_root.resolve()
+    resolved = path.resolve()
+    external_diaries = root / "diaries"
+    try:
+        resolved.relative_to(external_diaries)
+    except ValueError:
+        pass
+    else:
+        return "declared_subject_artifact_exact_bytes"
+
+    workspace_root = root / "life_engine_workspace"
+    try:
+        relative = resolved.relative_to(workspace_root).as_posix()
+    except ValueError:
+        return "unclassified_workspace_exact_bytes"
+    if relative in _DECLARED_SUBJECT_WORKSPACE_FILES or relative.startswith(
+        _DECLARED_SUBJECT_WORKSPACE_PREFIXES
+    ):
+        return "declared_subject_artifact_exact_bytes"
+    return "unclassified_workspace_exact_bytes"
+
+
 def iter_workspace_records(
     data_root: Path,
     *,
     source_node_id: str,
 ) -> Iterator[ArchiveRecord]:
-    """Archive byte-exact subject files without interpreting their contents."""
+    """Archive workspace bytes without inferring authorship from location."""
 
     workspace_root = data_root / "life_engine_workspace"
     roots = [workspace_root, data_root / "diaries"]
@@ -448,6 +523,7 @@ def iter_workspace_records(
                     f"workspace file changed while archiving: {path}"
                 )
             logical_path = path.relative_to(data_root).as_posix()
+            archive_role = workspace_file_archive_role(path, data_root)
             file_hash = hashlib.sha256(content).hexdigest()
             chunk_ids: list[str] = []
             inline_data = ""
@@ -475,7 +551,7 @@ def iter_workspace_records(
                             before.st_mtime, tz=UTC
                         ).isoformat(),
                         visibility="owner_private",
-                        authority="subject_file_bytes",
+                        archive_role=archive_role,
                         payload={
                             "path": logical_path,
                             "file_hash": file_hash,
@@ -495,7 +571,7 @@ def iter_workspace_records(
                 source_sequence=0,
                 recorded_at=datetime.fromtimestamp(before.st_mtime, tz=UTC).isoformat(),
                 visibility="owner_private",
-                authority="subject_file_bytes",
+                archive_role=archive_role,
                 payload={
                     "path": logical_path,
                     "bytes": len(content),

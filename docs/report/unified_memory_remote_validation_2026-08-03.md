@@ -100,3 +100,11 @@
 ## 6. 运行实例状态
 
 本次没有停止、重启或自动拉起 Elysium/NapCat。当前实例继续使用原本地权威库。持续增量 worker 默认关闭；合并代码并配置环境变量后，仍须由用户在维护窗口手动重启才会加载。
+
+## 7. 2026-08-04 主体性边界复审附记
+
+后续复审确认：2026-08-03 的逐行/逐字节迁移、哈希验证和隔离恢复结论仍然有效，没有主体内容损坏；但旧归档元数据使用了容易与认识论权威混淆的 `authority` 名称，并把全部 workspace 文件统一描述成主体文件。
+
+修订后的代码把领域术语改为开放文本 `archive_role`：只有规范明确声明的 `SOUL.md`、`USER.md`、`MEMORY.md` 和日记标注为 `declared_subject_artifact_exact_bytes`；其他 workspace 字节继续无损归档，但标为 `unclassified_workspace_exact_bytes`，不猜测作者或所有权。未知 SQLite 表使用 `unclassified_storage_record`，禁止静默晋升为权威。
+
+为了保持既有 380,700 条追加式记录的身份与哈希，MySQL v1 物理列 `authority` 不做 UPDATE 或批量回填；它仅作为旧 wire/storage 列承载 archive role。该列从未接入 claim 真值、检索排名或主体文件写入链，因此本次修订不要求删除、覆盖或重迁历史数据。
