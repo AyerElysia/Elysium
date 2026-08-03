@@ -260,7 +260,10 @@ class NapcatAdapter(BaseAdapter):
             else:
                 await self._sender.send(envelope)
         except Exception as e:
-            logger.error(f"发送消息失败: {e}")
+            if getattr(e, "delivery_unknown", False):
+                logger.debug(f"NapCat 消息投递状态未知: {e}")
+            else:
+                logger.error(f"发送消息失败: {e}")
             raise
 
     async def get_bot_info(self) -> dict[str, Any]:  # type: ignore[override]

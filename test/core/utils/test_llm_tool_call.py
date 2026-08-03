@@ -5,10 +5,13 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
-import pytest
-
 from src.core.components.base.tool import BaseTool
-from src.core.utils.llm_tool_call import run_llm_usable_executions, run_tool_call
+from src.core.components.base.action import ActionResultDetail
+from src.core.utils.llm_tool_call import (
+    ToolCallExecutionResult,
+    run_llm_usable_executions,
+    run_tool_call,
+)
 from src.kernel.llm import LLMUsableExecution, ToolCall, ToolRegistry
 
 
@@ -118,3 +121,33 @@ async def test_run_tool_call_binds_tool_runtime_stream_context() -> None:
 
     assert result == [(True, True)]
     assert response.payloads[0].content[0].value == "message-stream"
+
+
+async def test_run_tool_call_preserves_technical_outcome_without_breaking_tuple_contract() -> None:
+    class UnknownDeliveryTool(BaseTool):
+        tool_name = "unknown_delivery"
+        tool_description = "unknown delivery"
+
+        async def execute(self) -> tuple[bool, str]:
+            return False, ActionResultDetail(
+                "投递状态未知",
+                technical_outcome="delivery_unknown",
+            )
+
+    registry = ToolRegistry()
+    registry.register(UnknownDeliveryTool)
+    response = _FakeResponse()
+
+    results = await run_tool_call(
+        calls=[ToolCall(id="unknown-1", name="tool-unknown_delivery", args={})],
+        response=response,
+        usable_map=registry,
+        trigger_msg=SimpleNamespace(message_id="m1"),
+        plugin=MagicMock(),
+        stream_id="s1",
+    )
+
+    assert results == [(True, False)]
+    assert isinstance(results[0], ToolCallExecutionResult)
+    assert results[0].technical_outcome == "delivery_unknown"
+    assert response.payloads[0].content[0].value == "执行失败: 投递状态未知"

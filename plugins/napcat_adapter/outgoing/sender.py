@@ -23,6 +23,25 @@ if TYPE_CHECKING:
 
 logger = get_logger("napcat_adapter")
 
+_DEFAULT_SEND_CONFIRM_TIMEOUT_SECONDS = 20.0
+_CLIENT_TIMEOUT_MARGIN_SECONDS = 5.0
+
+
+class NapCatDeliveryUnknownError(TimeoutError):
+    """QQ accepted the send call but did not provide a terminal receipt in time."""
+
+    delivery_unknown = True
+
+    def __init__(self, *, action: str, retcode: int, part: int, total: int) -> None:
+        self.action = action
+        self.retcode = retcode
+        self.part = part
+        self.total = total
+        super().__init__(
+            "NapCat send receipt timed out; delivery status is unknown "
+            f"(action={action}, retcode={retcode}, part={part}/{total})"
+        )
+
 
 class OutgoingSender:
     """出站消息发送器：MessageEnvelope → NapCat API。"""
@@ -33,6 +52,36 @@ class OutgoingSender:
 
     def _config(self) -> "NapcatAdapterConfig | None":
         return self._get_config()
+
+    def _send_confirm_timeout_seconds(self) -> float:
+        config = self._config()
+        features = getattr(config, "features", None)
+        configured = getattr(
+            features,
+            "message_send_timeout_seconds",
+            _DEFAULT_SEND_CONFIRM_TIMEOUT_SECONDS,
+        )
+        return max(5.0, min(60.0, float(configured or 0.0)))
+
+    @staticmethod
+    def _is_send_receipt_timeout_response(response: dict[str, Any]) -> bool:
+        """Recognize NapCat's precise NT send-receipt timeout response."""
+
+        try:
+            retcode = int(response.get("retcode") or 0)
+        except (TypeError, ValueError):
+            return False
+        if response.get("status") == "ok" or retcode != 1200:
+            return False
+        detail = str(response.get("message") or response.get("wording") or "")
+        return all(
+            marker in detail
+            for marker in (
+                "Timeout: NTEvent",
+                "NodeIKernelMsgService/sendMsg",
+                "NodeIKernelMsgListener/onMsgInfoListUpdate",
+            )
+        )
 
     # ------------------------------------------------------------------
     # 主入口
@@ -88,10 +137,27 @@ class OutgoingSender:
         if len(chunks) > 1:
             logger.info(f"出站消息拆分发送: count={len(chunks)}, action={action}, target={target_id}")
 
+        send_timeout = self._send_confirm_timeout_seconds()
         for i, chunk in enumerate(chunks, 1):
             logger.debug(f"发送消息 part={i}/{len(chunks)}: {str(chunk)[:300]}")
-            resp = await self._client.call(action, {target_key: target_id, "message": chunk})
+            resp = await self._client.call(
+                action,
+                {
+                    target_key: target_id,
+                    "message": chunk,
+                    # NapCat's OneBot send API defines this value in milliseconds.
+                    "timeout": int(send_timeout * 1000),
+                },
+                timeout=send_timeout + _CLIENT_TIMEOUT_MARGIN_SECONDS,
+            )
             if resp.get("status") != "ok":
+                if self._is_send_receipt_timeout_response(resp):
+                    raise NapCatDeliveryUnknownError(
+                        action=action,
+                        retcode=int(resp.get("retcode") or 1200),
+                        part=i,
+                        total=len(chunks),
+                    )
                 raise RuntimeError(f"消息发送失败: {resp}")
 
         logger.info("消息发送成功")

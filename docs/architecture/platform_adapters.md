@@ -91,6 +91,21 @@
 - 只有 OneBot 心跳超过三个上报周期仍未到达时，才允许重建连接；WebSocket 的 ping/pong 继续由传输层负责。
 - 反向 WebSocket 模式下，Elysium 拥有监听端口，NapCat 拥有客户端重连。没有客户端连接时重启监听器不能修复 QQ 会话，反而会与 NapCat 的重连竞争。
 
+### 2.6 消息投递回执
+
+NapCat 的 `send_private_msg` / `send_group_msg` 会调用 QQ NT 内核的 `sendMsg`，并等待 `onMsgInfoListUpdate` 返回成功状态。该确认事件超过 `features.message_send_timeout_seconds` 仍未出现时，NapCat WebSocket 通常返回 `retcode=1200` 和 `Timeout: NTEvent ... sendMsg`。
+
+这个响应表示 `delivery_unknown`，不是“明确未发送”：QQ 可能已经接收消息，但 NapCat 没能在期限内证明结果。Elysium 因此遵循以下契约：
+
+- 等待时间默认 20 秒，配置范围为 5–60 秒；Elysium 的 WebSocket API 等待时间始终比 NT 确认期限多 5 秒；
+- 精确识别 `NodeIKernelMsgService/sendMsg` 与 `NodeIKernelMsgListener/onMsgInfoListUpdate` 的超时，其他 `retcode=1200` 仍按普通失败处理；
+- 状态未知只输出一次简洁 WARNING，完整异常降为 DEBUG，不用双重 ERROR 与 traceback 刷屏；
+- 不写入“已发送”历史，不发布 `ON_MESSAGE_DELIVERED`，也不把未知结果伪装成成功；
+- 当前 Life Chatter turn 立即收束；短窗口内只有同一来源 turn、目标与 payload 的再次发送会被拒绝，新的明确 turn 不会因文字相同而被误伤；
+- 不因单条发送回执超时重启 NapCat、Elysium 或 WebSocket。连接健康由独立心跳与传输状态判断。
+
+由于 QQ 与本地数据库之间不存在原子提交，这一状态不能安全自动重试。后续是否重新表达必须来自新的明确行动，而不是基础设施猜测。
+
 ---
 
 ## 3. 飞书适配器

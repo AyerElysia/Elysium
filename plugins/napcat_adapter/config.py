@@ -231,6 +231,20 @@ class NapcatAdapterConfig(BaseConfig):
             depends_value=True,
             order=13
         )
+        message_send_timeout_seconds: float = Field(
+            default=20.0,
+            description=(
+                "等待 QQ NT 内核确认消息发送结果的最长时间；超时只表示投递状态未知，"
+                "不会自动重发"
+            ),
+            label="消息发送确认超时",
+            ge=5.0,
+            le=60.0,
+            step=1.0,
+            input_type="slider",
+            tag="network",
+            order=14,
+        )
 
     @config_section("events", title="事件感知", tag="general", order=40)
     class EventsSection(SectionBase):
