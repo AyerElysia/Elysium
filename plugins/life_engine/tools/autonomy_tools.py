@@ -14,7 +14,8 @@ class LifeEngineScheduleAutonomyIntentTool(BaseTool):
     tool_description = (
         "登记一个由 life_engine 自己形成的延迟自主意向。"
         "这不是命令表达层立刻行动，也不是规则触发；只是让某个意向在 delay_minutes 后重新浮现。"
-        "如果 repeat=true，则到点后会每隔 interval_minutes 继续浮现；interval_minutes 留空时使用 delay_minutes。"
+        "如果 repeat=true，则到点后会在上一 occurrence 完整结束后按 interval_minutes 再次浮现；"
+        "interval_minutes 留空时使用 delay_minutes，并且必须提供 max_occurrences 或 lease_minutes。"
         "\n\n"
         "kind 支持：speak / reflect / silence。"
         "\n- speak：到点后把意向交给 life_chatter 重新判断是否开口。"
@@ -40,6 +41,8 @@ class LifeEngineScheduleAutonomyIntentTool(BaseTool):
         constraints: Annotated[list[str] | None, "表达层承接时应知道的约束，不是台词"] = None,
         repeat: Annotated[bool, "是否周期性重复浮现；默认 false"] = False,
         interval_minutes: Annotated[int | None, "repeat=true 时每隔多少分钟再次浮现；留空则使用 delay_minutes"] = None,
+        max_occurrences: Annotated[int | None, "repeat=true 时最多浮现多少次；与 lease_minutes 至少填写一个"] = None,
+        lease_minutes: Annotated[int | None, "repeat=true 时执行租约持续多少分钟；与 max_occurrences 至少填写一个"] = None,
     ) -> tuple[bool, str | dict]:
         service = getattr(self.plugin, "service", None)
         if service is None:
@@ -55,6 +58,41 @@ class LifeEngineScheduleAutonomyIntentTool(BaseTool):
                 constraints=constraints or [],
                 repeat=repeat,
                 interval_minutes=interval_minutes,
+                max_occurrences=max_occurrences,
+                lease_minutes=lease_minutes,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc)
+        return True, result
+
+
+class LifeEngineManageAutonomyIntentTool(BaseTool):
+    """Let the subject explicitly inspect or change intent execution lifecycle."""
+
+    tool_name = "nucleus_manage_autonomy_intent"
+    tool_description = (
+        "管理由你自己形成的自主意向。list 只读列出意向；pause 暂停后续浮现；"
+        "cancel 明确取消；renew 为周期意向增加次数租约或时间租约。"
+        "这些操作只改变执行生命周期，不改写原始动机、约束或历史。"
+    )
+    chatter_allow: list[str] = ["life_engine_internal"]
+
+    async def execute(
+        self,
+        action: Annotated[str, "list / pause / cancel / renew"],
+        intent_id: Annotated[str, "目标 intent_id；list 时可留空"] = "",
+        additional_occurrences: Annotated[int, "renew 时追加允许浮现的次数"] = 0,
+        lease_minutes: Annotated[int, "renew 时追加的时间租约（分钟）"] = 0,
+    ) -> tuple[bool, str | dict]:
+        service = getattr(self.plugin, "service", None)
+        if service is None:
+            return False, "life_engine 服务不可用"
+        try:
+            result = await service.manage_autonomy_intent(
+                action=action,
+                intent_id=intent_id,
+                additional_occurrences=additional_occurrences,
+                lease_minutes=lease_minutes,
             )
         except Exception as exc:  # noqa: BLE001
             return False, str(exc)
@@ -63,9 +101,11 @@ class LifeEngineScheduleAutonomyIntentTool(BaseTool):
 
 AUTONOMY_TOOLS = [
     LifeEngineScheduleAutonomyIntentTool,
+    LifeEngineManageAutonomyIntentTool,
 ]
 
 __all__ = [
     "AUTONOMY_TOOLS",
+    "LifeEngineManageAutonomyIntentTool",
     "LifeEngineScheduleAutonomyIntentTool",
 ]

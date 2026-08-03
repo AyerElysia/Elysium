@@ -367,6 +367,60 @@ async def test_corecall_can_bring_an_interpretation_back_into_retrieval(
     await service.close()
 
 
+async def test_document_association_expansion_loads_snippet_from_node_storage(
+    tmp_path: Path,
+) -> None:
+    service = LifeMemoryService(tmp_path)
+    service._vector_backend_enabled = False
+    await service.initialize()
+    await service.upsert_document("notes/seed.md", "seed body", title="Seed")
+    target = await service.upsert_document(
+        "notes/associated.md",
+        "associated body that must be returned as the snippet",
+        title="Associated",
+    )
+    episode = await service.begin_memory_recall(
+        query="seed",
+        context_key="life_engine/document-association",
+        random_seed=19,
+    )
+    await service.append_memory_corecall(
+        CoRecallEvent(
+            corecall_id="corecall-associated-document",
+            episode_id=episode.episode_id,
+            context_key=episode.context_key,
+            signal="共同进入意识",
+            entity_refs=(
+                "document:notes/seed.md",
+                "document:notes/associated.md",
+            ),
+            actor="life_engine",
+            reason="同一次回忆中一起出现",
+            recorded_at="2026-08-03T11:36:00+08:00",
+        )
+    )
+
+    expanded = await service.expand_living_document_associations(
+        [
+            SearchResult(
+                file_path="notes/seed.md",
+                title="Seed",
+                snippet="seed body",
+                relevance=1.0,
+                source="direct",
+            )
+        ],
+        context_key=episode.context_key,
+        random_seed=episode.random_seed,
+        limit=3,
+    )
+
+    associated = next(item for item in expanded if item.file_path == target.file_path)
+    assert "associated body" in associated.snippet
+    assert associated.source == "associated"
+    await service.close()
+
+
 def test_health_reports_living_ledgers_and_projection_drift(tmp_path: Path) -> None:
     db = _db()
     interpretation = MemoryInterpretation(

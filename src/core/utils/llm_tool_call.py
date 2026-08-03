@@ -96,6 +96,7 @@ async def create_llm_usable_execution(
     stream_id: str | None = None,
     message: "Message | None" = None,
     kwargs: dict[str, Any] | None = None,
+    tool_call_id: str = "",
 ) -> LLMUsableExecution:
     """实例化一个 LLMUsable，并返回其执行包装对象。
 
@@ -105,6 +106,7 @@ async def create_llm_usable_execution(
         stream_id: 当前对话流 ID，Action 和 Agent 可能会使用。
         message: 触发本次调用的消息，Action 会用它恢复发送上下文。
         kwargs: 传给 ``execute`` 的参数字典。
+        tool_call_id: 当前调用的稳定标识，用于外部动作的因果幂等键。
 
     Returns:
         LLMUsableExecution: 已启动到初始 ``"_WORKING"`` 状态的执行包装对象。
@@ -142,6 +144,8 @@ async def create_llm_usable_execution(
     elif issubclass(usable_cls, BaseAction):
         chat_stream = await _get_action_chat_stream(stream_id=stream_id, message=message)
         instance = usable_cls(chat_stream=chat_stream, plugin=plugin)
+        instance._trigger_message = message
+        instance._tool_call_id = str(tool_call_id or "")
         if message is not None:
             last_message = getattr(message, "processed_plain_text", None)
             instance._last_message = last_message or str(getattr(message, "content", "") or "")
@@ -304,6 +308,7 @@ async def run_tool_call(
                     stream_id=stream_id,
                     message=trigger_msg,
                     kwargs=args,
+                    tool_call_id=str(call.id or ""),
                 )
             except Exception as exc:
                 prepared_call.result_text = f"执行异常: {exc}"

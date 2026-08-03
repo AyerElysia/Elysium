@@ -53,6 +53,21 @@ class TestStreamContext:
 
         assert len(context.unread_messages) == 5
 
+    def test_duplicate_message_identity_is_not_requeued(self):
+        context = StreamContext(stream_id="test")
+        first = MagicMock()
+        first.message_id = "autonomy_intent_one_1"
+        replay = MagicMock()
+        replay.message_id = "autonomy_intent_one_1"
+
+        context.add_unread_message(first)
+        context.add_unread_message(replay)
+        context.flush_unreads_to_history()
+        context.add_unread_message(replay)
+
+        assert context.unread_messages == []
+        assert context.history_messages == [first]
+
     def test_unread_backlog_has_a_hard_limit(self):
         """Unread messages must not grow beyond the configured memory bound."""
 

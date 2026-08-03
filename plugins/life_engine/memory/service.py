@@ -1805,7 +1805,7 @@ class LifeMemoryService:
                 SearchResult(
                     file_path=path,
                     title=node.title,
-                    snippet=node.preview_content,
+                    snippet=await self._get_snippet_wrapper(node.node_id),
                     relevance=1.0 / float(self.RRF_K + index + 1),
                     source="associated",
                     association_path=list(seed_refs),

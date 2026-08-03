@@ -73,6 +73,17 @@ class StreamContext:
         Args:
             message: 消息对象
         """
+        message_id = str(getattr(message, "message_id", "") or "").strip()
+        if message_id and any(
+            str(getattr(existing, "message_id", "") or "") == message_id
+            for existing in [
+                *self.unread_messages,
+                *self.history_messages,
+                self.current_message,
+            ]
+            if existing is not None
+        ):
+            return
         if not self.has_unread_capacity:
             raise StreamBacklogFull(
                 f"stream {self.stream_id} unread backlog reached "

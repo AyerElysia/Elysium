@@ -7,6 +7,7 @@
 - [当前架构](./architecture/current_architecture.md) — **当前代码与运行边界的权威总图**
 - [principles.md](./principles.md) — 主体性、零规则、仿生、意识实例与渐进式披露（设计底线）
 - [生命记忆系统](./architecture/life_memory_system.md) — 追加式经历、认识论本体、双时间与主体性遗忘
+- [自主意向执行协议](./architecture/life_autonomy_execution.md) — occurrence 身份、有限租约、stream 所有权、回执幂等与崩溃恢复
 - [意识实例架构](./architecture/consciousness_instances.md) — 多意识实例、潜意识协调与工具边界
 - [离线优先共享后端重构计划](./architecture/offline_first_shared_backend_plan.md) — 本地独立运行、远程近实时共享、不可变事件同步与无损迁移验收门
 - [MySQL 核心持久化边界](./architecture/mysql_core_persistence.md) — Core 关系数据、生命域本地权威库、方言契约与人工切换边界

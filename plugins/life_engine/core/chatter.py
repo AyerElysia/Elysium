@@ -73,12 +73,6 @@ if TYPE_CHECKING:
 logger = get_logger("life_chatter", display="生命对话器", color=COLOR.MAGENTA)
 _T = TypeVar("_T")
 
-# ── 全局消息去重缓存 ──────────────────────────────────
-# 防止跨 wake cycle 重复发送相同内容
-_RECENT_SENT_CACHE: dict[str, float] = {}  # {content_hash: timestamp}
-_RECENT_SENT_CACHE_TTL = 60.0  # 秒
-_RECENT_SENT_CACHE_LOCK = threading.Lock()
-
 # ── 控制流常量 ────────────────────────────────────────────────
 _PASS_AND_WAIT = "action-life_pass_and_wait"
 _SEND_TEXT = "action-life_send_text"
@@ -424,10 +418,10 @@ class LifeSendTextAction(BaseAction):
         self,
         content: str,
         target: SendTarget,
+        segment_index: int = 0,
     ) -> bool:
         from src.core.managers.adapter_manager import get_adapter_manager
         from src.core.transport.message_send import get_message_sender
-        from uuid import uuid4
 
         bot_info = await get_adapter_manager().get_bot_info_by_platform(target.platform)
 
@@ -442,9 +436,10 @@ class LifeSendTextAction(BaseAction):
                 extra["target_user_id"] = target.target_user_id
             if target.target_user_name:
                 extra["target_user_name"] = target.target_user_name
+        extra.update(self._action_origin_extra())
 
         message = Message(
-            message_id=f"action_{self.action_name}_{uuid4().hex}",
+            message_id=self._action_message_id(target.stream_id, segment_index),
             content=content,
             processed_plain_text=content,
             message_type=MessageType.TEXT,
@@ -463,9 +458,14 @@ class LifeSendTextAction(BaseAction):
         content: str,
         reply_to: str | None = None,
         target: SendTarget | None = None,
+        segment_index: int = 0,
     ) -> bool:
         if target is not None:
-            return await self._send_one_segment_to_target(content, target)
+            return await self._send_one_segment_to_target(
+                content,
+                target,
+                segment_index=segment_index,
+            )
 
         if reply_to:
             target_stream_id = self.chat_stream.stream_id
@@ -474,7 +474,6 @@ class LifeSendTextAction(BaseAction):
             context = self.chat_stream.context
 
             from src.core.managers.adapter_manager import get_adapter_manager
-            from uuid import uuid4
 
             bot_info = await get_adapter_manager().get_bot_info_by_platform(platform)
 
@@ -511,9 +510,13 @@ class LifeSendTextAction(BaseAction):
                 extra["target_group_id"] = target_group_id
             if target_group_name:
                 extra["target_group_name"] = target_group_name
+            extra.update(self._action_origin_extra())
 
             message = Message(
-                message_id=f"action_{self.action_name}_{uuid4().hex}",
+                message_id=self._action_message_id(
+                    target_stream_id,
+                    segment_index,
+                ),
                 content=content,
                 processed_plain_text=content,
                 message_type=MessageType.TEXT,
@@ -531,6 +534,12 @@ class LifeSendTextAction(BaseAction):
             sender = get_message_sender()
             return await sender.send_message(message)
 
+        if self._action_origin_extra():
+            return await BaseAction._send_to_stream(
+                self,
+                content,
+                segment_index=segment_index,
+            )
         return await self._send_to_stream(content)
 
     async def execute(
@@ -577,29 +586,6 @@ class LifeSendTextAction(BaseAction):
                 return False, f"未知或不可用的发送目标 target_key: {normalized_target_key}"
 
         # ── 跨 wake 重复发送检测 ──────────────────────────────
-        combined_text = "\n".join(cleaned_segments)
-        content_hash = hashlib.sha256(combined_text.encode("utf-8")).hexdigest()[:16]
-
-        now = time.time()
-        with _RECENT_SENT_CACHE_LOCK:
-            # 清理过期条目
-            expired = [k for k, ts in _RECENT_SENT_CACHE.items() if now - ts > _RECENT_SENT_CACHE_TTL]
-            for k in expired:
-                _RECENT_SENT_CACHE.pop(k, None)
-
-            # 检测重复
-            if content_hash in _RECENT_SENT_CACHE:
-                last_sent = _RECENT_SENT_CACHE[content_hash]
-                elapsed = now - last_sent
-                if elapsed < _RECENT_SENT_CACHE_TTL:
-                    logger.warning(
-                        f"检测到重复消息（{elapsed:.1f}s前已发送），已拦截: {combined_text[:60]}..."
-                    )
-                    return False, f"该消息内容在 {elapsed:.1f}秒前已发送，已跳过重复发送"
-
-            # 记录此次发送
-            _RECENT_SENT_CACHE[content_hash] = now
-
         sent_count = 0
         for index, segment in enumerate(cleaned_segments):
             if index > 0:
@@ -612,6 +598,7 @@ class LifeSendTextAction(BaseAction):
                 segment,
                 segment_reply_to,
                 target=resolved_target,
+                segment_index=index,
             )
             if not success:
                 return False, f"第{index + 1}条消息发送失败"
@@ -3737,6 +3724,86 @@ class LifeChatter(BaseChatter):
             or cls._message_flag(message, "is_autonomy_intent_trigger")
         )
 
+    @classmethod
+    def _autonomy_occurrence_scope(
+        cls,
+        unread_msgs: list[Message],
+        stream_id: str,
+    ) -> list[dict[str, str]]:
+        """Collect causally active autonomy occurrences for the current turn."""
+
+        occurrences: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for message in unread_msgs:
+            if not cls._message_flag(message, "is_autonomy_intent_trigger"):
+                continue
+            extra = getattr(message, "extra", {}) or {}
+            intent_id = str(extra.get("autonomy_intent_id") or "").strip()
+            occurrence_id = str(extra.get("autonomy_occurrence_id") or "").strip()
+            authorized_stream_id = str(
+                extra.get("autonomy_authorized_stream_id")
+                or getattr(message, "stream_id", "")
+                or stream_id
+            ).strip()
+            key = (intent_id, occurrence_id)
+            if not intent_id or not occurrence_id or key in seen:
+                continue
+            seen.add(key)
+            occurrences.append(
+                {
+                    "intent_id": intent_id,
+                    "occurrence_id": occurrence_id,
+                    "authorized_stream_id": authorized_stream_id,
+                }
+            )
+        return occurrences
+
+    async def _validate_autonomy_action_target(
+        self,
+        call: Any,
+        occurrences: list[dict[str, str]],
+        stream_id: str,
+    ) -> tuple[bool, str]:
+        """Enforce the target capability carried by an autonomy occurrence."""
+
+        if not occurrences or not self._is_visible_reply_action(
+            str(getattr(call, "name", "") or "")
+        ):
+            return True, ""
+        authorized = {
+            str(item.get("authorized_stream_id") or "").strip()
+            for item in occurrences
+        }
+        if authorized != {str(stream_id or "").strip()}:
+            return False, "cross_stream_not_authorized"
+
+        args = getattr(call, "args", None)
+        target_key = (
+            str(args.get("target_key") or "").strip()
+            if isinstance(args, dict)
+            else ""
+        )
+        if not target_key:
+            return True, ""
+        runtime_cfg = getattr(getattr(self.plugin, "config", None), "runtime_sync", None)
+        target = await resolve_send_target_key(
+            target_key,
+            current_stream_id=stream_id,
+            limit=max(1, int(getattr(runtime_cfg, "send_targets_limit", 8) or 8)),
+            active_window_hours=max(
+                0.1,
+                float(
+                    getattr(runtime_cfg, "send_targets_window_hours", 24.0)
+                    or 24.0
+                ),
+            ),
+        )
+        if target is None:
+            return False, "unknown_target_key"
+        if str(target.stream_id or "").strip() != str(stream_id or "").strip():
+            return False, "cross_stream_not_authorized"
+        return True, ""
+
     @staticmethod
     def _message_type_value(message: Message) -> str:
         message_type = getattr(message, "message_type", "")
@@ -4199,6 +4266,18 @@ class LifeChatter(BaseChatter):
                 rt.active_stream_id = stream_id
         max_rounds = self._get_max_rounds()
 
+        async def complete_active_autonomy_as_failed(detail: str) -> None:
+            if service is None:
+                return
+            occurrences = self._autonomy_occurrence_scope(rt.unreads, stream_id)
+            if not occurrences:
+                return
+            await service.complete_autonomy_occurrences(
+                occurrences,
+                outcome="failed",
+                detail=detail,
+            )
+
         while True:
             # 每次循环都刷新当前来源流，避免等待全局锁期间新增/flush 状态变化。
             _, unread_msgs = await self.fetch_unreads()
@@ -4410,6 +4489,10 @@ class LifeChatter(BaseChatter):
                                 f"{fallback_error}",
                                 exc_info=True,
                             )
+                            if not initial_turn:
+                                await complete_active_autonomy_as_failed(
+                                    f"follow-up model failure: {fallback_error}"
+                                )
                             return Failure("LLM 请求失败", fallback_error)
                     else:
                         requeue_promoted_media()
@@ -4419,6 +4502,10 @@ class LifeChatter(BaseChatter):
                             initial_turn=initial_turn,
                         )
                         logger.error(f"LLM 请求失败: {error}", exc_info=True)
+                        if not initial_turn:
+                            await complete_active_autonomy_as_failed(
+                                f"follow-up model failure: {error}"
+                            )
                         return Failure("LLM 请求失败", error)
 
                 pending_life_context_high_water = 0
@@ -4526,6 +4613,9 @@ class LifeChatter(BaseChatter):
                         logger.warning(
                             f"已达最大轮数 ({max_rounds})，未产生可见回复，收束本轮"
                         )
+                        await complete_active_autonomy_as_failed(
+                            "life_chatter reached max rounds without a terminal choice"
+                        )
                         if rt.must_reply:
                             await self._send_must_reply_fallback(chat_stream, rt.unreads)
                             rt.must_reply = False
@@ -4568,13 +4658,37 @@ class LifeChatter(BaseChatter):
                 seen_sigs: set[str] = set()
                 pending_parallel_calls: list[Any] = []
                 trigger_msg = rt.unreads[-1] if rt.unreads else None
+                autonomy_occurrences = self._autonomy_occurrence_scope(
+                    rt.unreads,
+                    stream_id,
+                )
+                claimed_autonomy_actions: set[str] = set()
+                if trigger_msg is not None and autonomy_occurrences:
+                    trigger_msg.extra["life_turn_scope"] = {
+                        "stream_id": stream_id,
+                        "turn_key": rt.active_unread_turn_key,
+                        "autonomy_occurrences": autonomy_occurrences,
+                    }
 
-                def handle_tool_execution_result(
+                async def handle_tool_execution_result(
                     executed_call: Any,
                     appended: bool,
                     success: bool,
                 ) -> None:
                     executed_name = str(getattr(executed_call, "name", "") or "")
+                    action_id = str(getattr(executed_call, "id", "") or "")
+                    if (
+                        service is not None
+                        and autonomy_occurrences
+                        and action_id in claimed_autonomy_actions
+                        and self._is_visible_reply_action(executed_name)
+                    ):
+                        await service.complete_autonomy_occurrences(
+                            autonomy_occurrences,
+                            outcome="sent" if success else "delivery_unknown",
+                            action_id=action_id,
+                            detail="" if success else "visible action did not confirm delivery",
+                        )
                     if success and self._is_visible_reply_action(executed_name):
                         reply_entry = self._visible_text_reply_cache_entry(
                             executed_call,
@@ -4612,7 +4726,7 @@ class LifeChatter(BaseChatter):
                         results,
                         strict=False,
                     ):
-                        handle_tool_execution_result(executed_call, appended, success)
+                        await handle_tool_execution_result(executed_call, appended, success)
 
                 for call in call_list:
                     get_watchdog().feed_dog(self.stream_id)
@@ -4676,6 +4790,12 @@ class LifeChatter(BaseChatter):
                     # pass：唯一的退出信号
                     if call_name == _PASS_AND_WAIT:
                         await flush_parallel_calls()
+                        if service is not None and autonomy_occurrences:
+                            await service.complete_autonomy_occurrences(
+                                autonomy_occurrences,
+                                outcome="passed",
+                                action_id=str(getattr(call, "id", "") or ""),
+                            )
                         llm_response.add_payload(
                             LLMPayload(
                                 ROLE.TOOL_RESULT,
@@ -4684,6 +4804,62 @@ class LifeChatter(BaseChatter):
                         )
                         should_wait = True
                         continue
+
+                    if (
+                        service is not None
+                        and autonomy_occurrences
+                        and self._is_visible_reply_action(str(call_name or ""))
+                    ):
+                        target_allowed, target_reason = (
+                            await self._validate_autonomy_action_target(
+                                call,
+                                autonomy_occurrences,
+                                stream_id,
+                            )
+                        )
+                        if not target_allowed:
+                            await flush_parallel_calls()
+                            llm_response.add_payload(
+                                LLMPayload(
+                                    ROLE.TOOL_RESULT,
+                                    ToolResult(
+                                        value=(
+                                            "本轮自主意向只授权发送到它原本所属的聊天流；"
+                                            f"当前目标被拒绝: {target_reason}"
+                                        ),
+                                        call_id=call.id,
+                                        name=call_name,
+                                    ),
+                                )
+                            )
+                            logger.warning(
+                                f"[{stream_id}] 拒绝自主意向跨 stream 发送: {target_reason}"
+                            )
+                            continue
+                        claim = await service.claim_autonomy_occurrences(
+                            autonomy_occurrences,
+                            action_id=str(getattr(call, "id", "") or ""),
+                            target_stream_id=stream_id,
+                        )
+                        if not claim.get("claimed", False):
+                            await flush_parallel_calls()
+                            llm_response.add_payload(
+                                LLMPayload(
+                                    ROLE.TOOL_RESULT,
+                                    ToolResult(
+                                        value=(
+                                            "本次自主意向 occurrence 已被处理或不再可执行；"
+                                            f"已阻止重复动作: {claim.get('reason', 'claim_failed')}"
+                                        ),
+                                        call_id=call.id,
+                                        name=call_name,
+                                    ),
+                                )
+                            )
+                            continue
+                        claimed_autonomy_actions.add(
+                            str(getattr(call, "id", "") or "")
+                        )
 
                     # 执行工具（action / tool 统一处理）
                     if is_life_tool_call_parallel_safe(call):
@@ -4699,7 +4875,7 @@ class LifeChatter(BaseChatter):
                     )
                     result_list = self._normalize_tool_execution_results(raw_results, 1)
                     appended, success = result_list[0] if result_list else (False, False)
-                    handle_tool_execution_result(call, appended, success)
+                    await handle_tool_execution_result(call, appended, success)
 
                 await flush_parallel_calls()
 
@@ -4732,6 +4908,9 @@ class LifeChatter(BaseChatter):
                 if rt.follow_up_rounds >= max_rounds:
                     logger.warning(
                         f"已达最大轮数 ({max_rounds})，收束本轮"
+                    )
+                    await complete_active_autonomy_as_failed(
+                        "life_chatter reached max rounds without a terminal choice"
                     )
                     if rt.must_reply and not rt.sent_visible_reply:
                         await self._send_must_reply_fallback(chat_stream, rt.unreads)

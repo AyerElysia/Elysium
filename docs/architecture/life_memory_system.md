@@ -177,6 +177,8 @@ Learning→Epistemic 桥写入 `learning_insight` 候选和逐条 `ClaimEvidence
 
 每次工具检索返回 `recall_episode`，包含 episode id、policy version、seed、context 和是否成功持久化轨迹。历史版本、来源关系和修正通过 bundle、artifact history、interpretation provenance 与 semantic relation 查询回放。
 
+关联展开只把 `MemoryNode` 当作稳定身份与关系载体，展示片段必须通过文档存储接口按 `node_id` 读取。不能假设节点 DTO 自带 `preview_content` 等派生字段；这样可以避免索引模型与存储模型演进不同步时让整次记忆检索失败。
+
 ## 10. 索引与自愈
 
 SQLite FTS 与 Chroma 都是可重建投影。活动 chunk collection marker 保存模型、维度、集合名和版本。启动时若 marker 无效、集合缺失或 metadata 不匹配：

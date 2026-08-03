@@ -59,6 +59,8 @@ from ..autonomy import (
     build_intent,
     cleanup_autonomy_schedules,
     format_due_message,
+    occurrence_id_for,
+    recurring_lease_reason,
     restore_autonomy_intents,
     schedule_autonomy_intent as register_autonomy_schedule,
 )
@@ -2023,6 +2025,12 @@ class LifeEngineService(BaseService):
     def _autonomy_store(self) -> AutonomyIntentStore:
         return AutonomyIntentStore(self._workspace_dir())
 
+    def _autonomy_next_scheduled_at(self, intent_id: str) -> str:
+        intent = self._autonomy_store().get(intent_id)
+        if intent is None or intent.status != "scheduled":
+            return ""
+        return intent.scheduled_at
+
     def _record_life_moment(
         self,
         *,
@@ -2087,6 +2095,8 @@ class LifeEngineService(BaseService):
         constraints: list[str] | None = None,
         repeat: bool = False,
         interval_minutes: int | None = None,
+        max_occurrences: int | None = None,
+        lease_minutes: int | None = None,
     ) -> dict[str, Any]:
         """登记一个 life_engine 自主形成的延迟意向。"""
         cfg = self._cfg()
@@ -2110,6 +2120,8 @@ class LifeEngineService(BaseService):
             constraints=constraints or [],
             repeat=repeat,
             interval_minutes=interval_minutes,
+            max_occurrences=max_occurrences,
+            lease_minutes=lease_minutes,
         )
 
         async with self._get_lock():
@@ -2119,6 +2131,7 @@ class LifeEngineService(BaseService):
             except RuntimeError as exc:
                 raise RuntimeError("调度器尚未启动，稍后再登记自主意向") from exc
             store.upsert(intent)
+            store.append_event("formed", intent, detail="intent scheduled")
 
         repeat_text = f"repeat=每隔{intent.interval_minutes}分钟 " if intent.repeat else ""
         event_text = (
@@ -2154,6 +2167,8 @@ class LifeEngineService(BaseService):
             "delay_minutes": intent.delay_minutes,
             "repeat": intent.repeat,
             "interval_minutes": intent.interval_minutes,
+            "max_occurrences": intent.max_occurrences,
+            "lease_until": intent.lease_until,
             "scheduled_at": intent.scheduled_at,
             "status": intent.status,
             "target_stream_id": intent.target_stream_id,
@@ -2199,36 +2214,368 @@ class LifeEngineService(BaseService):
             logger.debug(f"列出可发送目标失败: {exc}")
             return []
 
+    async def claim_autonomy_occurrences(
+        self,
+        occurrences: list[dict[str, str]],
+        *,
+        action_id: str,
+        target_stream_id: str,
+    ) -> dict[str, Any]:
+        """Atomically claim autonomous occurrences before an external action."""
+
+        unique = {
+            (str(item.get("intent_id") or ""), str(item.get("occurrence_id") or ""))
+            for item in occurrences
+            if item.get("intent_id") and item.get("occurrence_id")
+        }
+        if not unique:
+            return {"claimed": True, "count": 0}
+
+        async with self._get_lock():
+            store = self._autonomy_store()
+            loaded: list[AutonomyIntent] = []
+            for intent_id, occurrence_id in sorted(unique):
+                intent = store.get(intent_id)
+                if intent is None:
+                    return {"claimed": False, "reason": f"intent_not_found:{intent_id}"}
+                if intent.status != "in_flight":
+                    return {"claimed": False, "reason": f"status={intent.status}"}
+                if intent.active_occurrence_id != occurrence_id:
+                    return {"claimed": False, "reason": "occurrence_mismatch"}
+                if intent.active_occurrence_status != "surfaced":
+                    return {
+                        "claimed": False,
+                        "reason": f"occurrence_status={intent.active_occurrence_status}",
+                    }
+                if str(intent.target_stream_id or "") != str(target_stream_id or ""):
+                    return {"claimed": False, "reason": "cross_stream_not_authorized"}
+                loaded.append(intent)
+
+            for intent in loaded:
+                intent.active_occurrence_status = "dispatching"
+                intent.active_action_id = str(action_id or "")
+                intent.updated_at = _now_iso()
+                store.upsert(intent)
+                store.append_event(
+                    "delivery_claimed",
+                    intent,
+                    occurrence_id=intent.active_occurrence_id,
+                    action_id=action_id,
+                )
+        return {"claimed": True, "count": len(loaded)}
+
+    async def complete_autonomy_occurrences(
+        self,
+        occurrences: list[dict[str, str]],
+        *,
+        outcome: str,
+        action_id: str = "",
+        detail: str = "",
+    ) -> dict[str, Any]:
+        """Commit terminal occurrence receipts and only then chain recurrence."""
+
+        unique = {
+            (str(item.get("intent_id") or ""), str(item.get("occurrence_id") or ""))
+            for item in occurrences
+            if item.get("intent_id") and item.get("occurrence_id")
+        }
+        if not unique:
+            return {"completed": 0, "scheduled": 0}
+
+        safe_recurrence_outcomes = {
+            "sent",
+            "passed",
+            "reflected",
+            "silence",
+            "surfaced",
+        }
+        to_schedule: list[str] = []
+        completed = 0
+        async with self._get_lock():
+            store = self._autonomy_store()
+            for intent_id, occurrence_id in sorted(unique):
+                intent = store.get(intent_id)
+                if intent is None:
+                    continue
+                if (
+                    intent.last_occurrence_id == occurrence_id
+                    and intent.last_outcome == outcome
+                ):
+                    completed += 1
+                    continue
+                if intent.active_occurrence_id != occurrence_id:
+                    continue
+                if intent.status != "in_flight":
+                    continue
+
+                intent.last_occurrence_id = occurrence_id
+                intent.last_outcome = str(outcome or "unknown")
+                intent.active_occurrence_status = str(outcome or "unknown")
+                intent.active_action_id = str(action_id or intent.active_action_id)
+                intent.last_error = str(detail or "")[:240]
+                intent.updated_at = _now_iso()
+
+                lease_reason = recurring_lease_reason(intent)
+                if intent.repeat and outcome in safe_recurrence_outcomes and not lease_reason:
+                    next_minutes = int(
+                        intent.interval_minutes or intent.delay_minutes or 1
+                    )
+                    intent.scheduled_at = (
+                        datetime.now(timezone.utc).astimezone()
+                        + timedelta(minutes=next_minutes)
+                    ).isoformat()
+                    intent.status = "scheduled"
+                    intent.renewal_reason = ""
+                    to_schedule.append(intent.intent_id)
+                elif intent.repeat:
+                    intent.status = "renewal_required"
+                    intent.renewal_reason = lease_reason or (
+                        "previous occurrence did not reach a retry-safe terminal state"
+                    )
+                else:
+                    intent.status = "triggered" if outcome in safe_recurrence_outcomes else "failed"
+
+                intent.active_occurrence_id = ""
+                intent.active_occurrence_status = ""
+                intent.active_occurrence_started_at = ""
+                store.upsert(intent)
+                store.append_event(
+                    f"occurrence_{outcome}",
+                    intent,
+                    occurrence_id=occurrence_id,
+                    action_id=action_id,
+                    detail=detail or intent.renewal_reason,
+                )
+                completed += 1
+
+        scheduled = 0
+        for intent_id in to_schedule:
+            store = self._autonomy_store()
+            intent = store.get(intent_id)
+            if intent is None or intent.status != "scheduled":
+                continue
+            try:
+                await register_autonomy_schedule(self.plugin, intent)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "自主意向下一 occurrence 调度失败，状态已保留供恢复: "
+                    f"intent_id={intent.intent_id[:12]} error={exc}"
+                )
+                continue
+            async with self._get_lock():
+                current = self._autonomy_store().get(intent.intent_id)
+                if current is None or current.status != "scheduled":
+                    continue
+                current.schedule_id = intent.schedule_id
+                current.updated_at = _now_iso()
+                self._autonomy_store().upsert(current)
+            scheduled += 1
+        return {"completed": completed, "scheduled": scheduled}
+
+    async def manage_autonomy_intent(
+        self,
+        *,
+        action: str,
+        intent_id: str = "",
+        additional_occurrences: int = 0,
+        lease_minutes: int = 0,
+    ) -> dict[str, Any]:
+        """Expose explicit subject-owned pause/cancel/renew lifecycle choices."""
+
+        normalized_action = str(action or "").strip().lower()
+        if normalized_action == "list":
+            return {
+                "intents": [
+                    {
+                        "intent_id": item.intent_id,
+                        "kind": item.kind,
+                        "motivation": item.motivation,
+                        "status": item.status,
+                        "repeat": item.repeat,
+                        "occurrence_count": item.occurrence_count,
+                        "max_occurrences": item.max_occurrences,
+                        "lease_until": item.lease_until,
+                        "scheduled_at": item.scheduled_at,
+                        "target_hint": item.target_hint,
+                        "renewal_reason": item.renewal_reason,
+                    }
+                    for item in self._autonomy_store().load()
+                ]
+            }
+        if normalized_action not in {"pause", "cancel", "renew"}:
+            raise ValueError("action must be list / pause / cancel / renew")
+
+        target_id = str(intent_id or "").strip()
+        if not target_id:
+            raise ValueError("intent_id is required")
+
+        schedule_id = ""
+        should_schedule = False
+        async with self._get_lock():
+            store = self._autonomy_store()
+            intent = store.get(target_id)
+            if intent is None:
+                raise ValueError("autonomy intent not found")
+            schedule_id = intent.schedule_id
+
+            if normalized_action in {"pause", "cancel"}:
+                active_occurrence_id = intent.active_occurrence_id
+                intent.status = "paused" if normalized_action == "pause" else "cancelled"
+                intent.renewal_reason = ""
+                intent.schedule_id = ""
+                if active_occurrence_id:
+                    intent.last_occurrence_id = active_occurrence_id
+                    intent.last_outcome = normalized_action
+                intent.active_occurrence_id = ""
+                intent.active_occurrence_status = ""
+                intent.active_occurrence_started_at = ""
+                intent.active_action_id = ""
+                intent.updated_at = _now_iso()
+                store.upsert(intent)
+                store.append_event(
+                    normalized_action,
+                    intent,
+                    occurrence_id=active_occurrence_id,
+                )
+            else:
+                if not intent.repeat:
+                    raise ValueError("only recurring intents can be renewed")
+                if intent.status == "in_flight" or intent.active_occurrence_id:
+                    raise ValueError(
+                        "cannot renew while an occurrence is in flight; "
+                        "wait for its receipt or pause/cancel it first"
+                    )
+                was_scheduled = intent.status == "scheduled"
+                additional = int(additional_occurrences or 0)
+                lease = int(lease_minutes or 0)
+                if additional <= 0 and lease <= 0:
+                    raise ValueError(
+                        "renew requires additional_occurrences or lease_minutes"
+                    )
+                if additional < 0 or additional > 10_000:
+                    raise ValueError("additional_occurrences must be between 1 and 10000")
+                if lease < 0 or lease > 7 * 24 * 60:
+                    raise ValueError("lease_minutes must be between 1 and 10080")
+                if additional > 0:
+                    intent.max_occurrences = (
+                        max(intent.max_occurrences, intent.occurrence_count)
+                        + additional
+                    )
+                    if intent.max_occurrences > 10_000:
+                        raise ValueError(
+                            "renewed max_occurrences cannot exceed 10000"
+                        )
+                if lease > 0:
+                    intent.lease_until = (
+                        datetime.now(timezone.utc).astimezone()
+                        + timedelta(minutes=lease)
+                    ).isoformat()
+                intent.status = "scheduled"
+                intent.renewal_reason = ""
+                intent.active_occurrence_id = ""
+                intent.active_occurrence_status = ""
+                intent.active_occurrence_started_at = ""
+                intent.active_action_id = ""
+                if not was_scheduled:
+                    intent.scheduled_at = (
+                        datetime.now(timezone.utc).astimezone()
+                        + timedelta(
+                            minutes=int(
+                                intent.interval_minutes or intent.delay_minutes or 1
+                            )
+                        )
+                    ).isoformat()
+                    intent.schedule_id = ""
+                else:
+                    # The registered callback resolves the latest intent state
+                    # by ID, so an active schedule needs no destructive churn.
+                    schedule_id = ""
+                intent.updated_at = _now_iso()
+                store.upsert(intent)
+                store.append_event("renewed", intent)
+                should_schedule = not was_scheduled
+
+        if schedule_id:
+            try:
+                await get_unified_scheduler().remove_schedule(schedule_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    f"移除旧自主意向调度失败 intent_id={target_id[:12]}: {exc}"
+                )
+
+        if should_schedule:
+            intent = self._autonomy_store().get(target_id)
+            if intent is None:
+                raise RuntimeError("renewed autonomy intent disappeared")
+            await register_autonomy_schedule(self.plugin, intent)
+            async with self._get_lock():
+                current = self._autonomy_store().get(target_id)
+                if current is not None and current.status == "scheduled":
+                    current.schedule_id = intent.schedule_id
+                    current.updated_at = _now_iso()
+                    self._autonomy_store().upsert(current)
+
+        current = self._autonomy_store().get(target_id)
+        return {
+            "intent_id": target_id,
+            "action": normalized_action,
+            "status": current.status if current is not None else "missing",
+            "scheduled_at": current.scheduled_at if current is not None else "",
+            "max_occurrences": current.max_occurrences if current is not None else 0,
+            "lease_until": current.lease_until if current is not None else "",
+        }
+
     async def trigger_autonomy_intent(self, intent_id: str) -> dict[str, Any]:
-        """触发到点的自主意向。"""
-        store = self._autonomy_store()
-        intent = store.get(intent_id)
-        if intent is None:
-            logger.warning(f"到点意向不存在: intent_id={intent_id}")
-            return {"triggered": False, "reason": "not_found"}
-        if intent.status != "scheduled":
-            logger.debug(
-                f"跳过非 scheduled 自主意向: intent_id={intent.intent_id[:12]} status={intent.status}"
+        """Surface one leased occurrence; never pre-schedule the next one."""
+
+        async with self._get_lock():
+            store = self._autonomy_store()
+            intent = store.get(intent_id)
+            if intent is None:
+                logger.warning(f"到点意向不存在: intent_id={intent_id}")
+                return {"triggered": False, "reason": "not_found"}
+            if intent.status != "scheduled":
+                logger.debug(
+                    f"跳过非 scheduled 自主意向: intent_id={intent.intent_id[:12]} status={intent.status}"
+                )
+                return {"triggered": False, "reason": f"status={intent.status}"}
+
+            lease_reason = recurring_lease_reason(intent)
+            if lease_reason:
+                intent.status = "renewal_required"
+                intent.renewal_reason = lease_reason
+                intent.updated_at = _now_iso()
+                store.upsert(intent)
+                store.append_event("renewal_required", intent, detail=lease_reason)
+                return {"triggered": False, "reason": lease_reason}
+
+            intent.triggered_at = _now_iso()
+            intent.occurrence_count = max(0, int(intent.occurrence_count or 0)) + 1
+            intent.active_occurrence_id = occurrence_id_for(intent)
+            intent.active_occurrence_status = "surfaced"
+            intent.active_occurrence_started_at = intent.triggered_at
+            intent.active_action_id = ""
+            intent.retry_count = 0
+            intent.last_error = ""
+            intent.schedule_id = ""
+            intent.status = "in_flight"
+            intent.updated_at = intent.triggered_at
+            store.upsert(intent)
+            store.append_event(
+                "occurrence_surfaced",
+                intent,
+                occurrence_id=intent.active_occurrence_id,
             )
-            return {"triggered": False, "reason": f"status={intent.status}"}
 
-        intent.triggered_at = _now_iso()
-        intent.occurrence_count = max(0, int(intent.occurrence_count or 0)) + 1
-        if intent.repeat:
-            next_minutes = int(intent.interval_minutes or intent.delay_minutes or 1)
-            intent.scheduled_at = (
-                datetime.now(timezone.utc).astimezone() + timedelta(minutes=next_minutes)
-            ).isoformat()
-            intent.status = "scheduled"
-        else:
-            intent.status = "triggered"
-        intent.updated_at = intent.triggered_at
-        store.upsert(intent)
-
+        occurrence_ref = [{
+            "intent_id": intent.intent_id,
+            "occurrence_id": intent.active_occurrence_id,
+        }]
         logger.info(
             "到点: "
             f"intent_id={intent.intent_id[:12]} kind={intent.kind} "
             f"repeat={intent.repeat} occurrence={intent.occurrence_count} "
+            f"occurrence_id={intent.active_occurrence_id} "
             f"stream={intent.target_stream_id or '-'}"
         )
 
@@ -2244,7 +2591,11 @@ class LifeEngineService(BaseService):
                     kind="intent",
                     summary=f"意向到点无目标，浮现给心跳：{intent.motivation[:120]}",
                     operation="surfaced",
-                    source_event_id=intent.intent_id,
+                    source_event_id=intent.active_occurrence_id,
+                )
+                await self.complete_autonomy_occurrences(
+                    occurrence_ref,
+                    outcome="surfaced",
                 )
                 logger.info(f"仲裁: downgraded intent_id={intent.intent_id[:12]} reason=no_target_stream")
                 return {
@@ -2252,15 +2603,26 @@ class LifeEngineService(BaseService):
                     "dispatch": "life_event",
                     "reason": "no_target_stream",
                     "repeat": intent.repeat,
-                    "next_scheduled_at": intent.scheduled_at if intent.repeat else "",
+                    "next_scheduled_at": self._autonomy_next_scheduled_at(
+                        intent.intent_id
+                    ),
+                    "occurrence_id": intent.active_occurrence_id,
                     "occurrence_count": intent.occurrence_count,
                 }
-            await self._wake_stream_for_autonomy(intent)
+            try:
+                await self._wake_stream_for_autonomy(intent)
+            except Exception as exc:
+                await self.complete_autonomy_occurrences(
+                    occurrence_ref,
+                    outcome="failed",
+                    detail=str(exc),
+                )
+                raise
             self._record_life_moment(
                 kind="intent",
                 summary=f"意向到点，交给表达层：{intent.motivation[:120]}",
-                operation="spoke",
-                source_event_id=intent.intent_id,
+                operation="surfaced",
+                source_event_id=intent.active_occurrence_id,
                 stream_id=intent.target_stream_id,
             )
             logger.info(f"承接: life_chatter intent_id={intent.intent_id[:12]}")
@@ -2269,7 +2631,8 @@ class LifeEngineService(BaseService):
                 "dispatch": "life_chatter",
                 "stream_id": intent.target_stream_id,
                 "repeat": intent.repeat,
-                "next_scheduled_at": intent.scheduled_at if intent.repeat else "",
+                "next_scheduled_at": "",
+                "occurrence_id": intent.active_occurrence_id,
                 "occurrence_count": intent.occurrence_count,
             }
 
@@ -2284,14 +2647,21 @@ class LifeEngineService(BaseService):
                 kind="intent",
                 summary=f"意向到点，回到心跳继续思考：{intent.motivation[:120]}",
                 operation="reflected",
-                source_event_id=intent.intent_id,
+                source_event_id=intent.active_occurrence_id,
+            )
+            await self.complete_autonomy_occurrences(
+                occurrence_ref,
+                outcome="reflected",
             )
             logger.info(f"承接: life_engine intent_id={intent.intent_id[:12]}")
             return {
                 "triggered": True,
                 "dispatch": "life_engine",
                 "repeat": intent.repeat,
-                "next_scheduled_at": intent.scheduled_at if intent.repeat else "",
+                "next_scheduled_at": self._autonomy_next_scheduled_at(
+                    intent.intent_id
+                ),
+                "occurrence_id": intent.active_occurrence_id,
                 "occurrence_count": intent.occurrence_count,
             }
 
@@ -2305,14 +2675,21 @@ class LifeEngineService(BaseService):
             kind="intent",
             summary=f"意向到点，选择沉默：{intent.motivation[:120]}",
             operation="silence",
-            source_event_id=intent.intent_id,
+            source_event_id=intent.active_occurrence_id,
+        )
+        await self.complete_autonomy_occurrences(
+            occurrence_ref,
+            outcome="silence",
         )
         logger.info(f"承接: silence intent_id={intent.intent_id[:12]}")
         return {
             "triggered": True,
             "dispatch": "silence",
             "repeat": intent.repeat,
-            "next_scheduled_at": intent.scheduled_at if intent.repeat else "",
+            "next_scheduled_at": self._autonomy_next_scheduled_at(
+                intent.intent_id
+            ),
+            "occurrence_id": intent.active_occurrence_id,
             "occurrence_count": intent.occurrence_count,
         }
 
@@ -2328,7 +2705,10 @@ class LifeEngineService(BaseService):
         target_user_id, target_user_name = self._resolve_followup_target(chat_stream)
         prompt = format_due_message(intent)
         trigger_message = Message(
-            message_id=f"autonomy_intent_{intent.intent_id[:16]}",
+            message_id=(
+                "autonomy_intent_"
+                f"{intent.intent_id[:16]}_{max(1, int(intent.occurrence_count or 0))}"
+            ),
             platform=chat_stream.platform or "unknown",
             stream_id=stream_id,
             sender_id=target_user_id or "life_engine_autonomy",
@@ -2343,6 +2723,8 @@ class LifeEngineService(BaseService):
             is_autonomy_intent_trigger=True,
             autonomy_intent_id=intent.intent_id,
             autonomy_intent_kind=intent.kind,
+            autonomy_occurrence_id=intent.active_occurrence_id,
+            autonomy_authorized_stream_id=stream_id,
         )
         context.add_unread_message(trigger_message)
         loop_mgr = get_stream_loop_manager()

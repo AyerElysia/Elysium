@@ -4,6 +4,7 @@
 动作是"主动的响应"，通过 LLM Tool Calling 调用。
 """
 
+import hashlib
 import random
 from abc import ABC, abstractmethod
 from typing import Annotated, Any, TYPE_CHECKING
@@ -74,6 +75,48 @@ class BaseAction(ABC, LLMUsable):
         self.chat_stream = chat_stream
         self.plugin = plugin
         self._last_message: str | None = None
+        self._trigger_message: Message | None = None
+        self._tool_call_id: str = ""
+
+    def _action_origin_extra(self) -> dict[str, Any]:
+        """Return trace metadata bound by the current chatter turn."""
+
+        trigger_extra = getattr(self._trigger_message, "extra", {}) or {}
+        scope = trigger_extra.get("life_turn_scope")
+        if not isinstance(scope, dict):
+            return {}
+        occurrences = scope.get("autonomy_occurrences")
+        if not isinstance(occurrences, list) or not occurrences:
+            return {}
+        return {
+            "origin_turn_key": str(scope.get("turn_key") or ""),
+            "origin_stream_id": str(scope.get("stream_id") or ""),
+            "autonomy_occurrences": occurrences,
+            "tool_call_id": self._tool_call_id,
+        }
+
+    def _action_message_id(self, target_stream_id: str, segment_index: int = 0) -> str:
+        """Build a stable idempotency key for autonomy-originated side effects."""
+
+        origin = self._action_origin_extra()
+        occurrences = origin.get("autonomy_occurrences")
+        if occurrences and self._tool_call_id:
+            occurrence_ids = sorted(
+                str(item.get("occurrence_id") or "")
+                for item in occurrences
+                if isinstance(item, dict) and item.get("occurrence_id")
+            )
+            raw = "|".join(
+                [
+                    *occurrence_ids,
+                    self._tool_call_id,
+                    str(target_stream_id or ""),
+                    str(int(segment_index)),
+                ]
+            )
+            digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+            return f"action_{self.action_name}_{digest}"
+        return f"action_{self.action_name}_{uuid4().hex}"
     
     @classmethod
     def get_signature(cls) -> str | None:
@@ -444,12 +487,14 @@ class BaseAction(ABC, LLMUsable):
         self,
         content: Message | str,
         stream_id: str | None = None,
+        segment_index: int = 0,
     ) -> bool:
         """发送任意内容到指定聊天流。
 
         Args:
             content: 要发送的内容（支持 Message 对象、字符串、或其他类型）
             stream_id: 要发送的聊天流 ID，留空则使用当前聊天流
+            segment_index: 同一动作中的分段序号，用于稳定幂等身份
 
         Returns:
             bool: 发送是否成功
@@ -513,9 +558,10 @@ class BaseAction(ABC, LLMUsable):
                     extra["target_group_id"] = target_group_id
                 if target_group_name:
                     extra["target_group_name"] = target_group_name
+                extra.update(self._action_origin_extra())
 
                 message = Message(
-                    message_id=f"action_{self.action_name}_{uuid4().hex}",
+                    message_id=self._action_message_id(target_stream_id, segment_index),
                     content=content_str,
                     processed_plain_text=content_str,
                     message_type=MessageType.TEXT,

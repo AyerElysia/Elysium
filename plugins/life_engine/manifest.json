@@ -136,6 +136,12 @@
     },
     {
       "component_type": "tool",
+      "component_name": "nucleus_manage_autonomy_intent",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "tool",
       "component_name": "nucleus_skill",
       "dependencies": [],
       "enabled": true

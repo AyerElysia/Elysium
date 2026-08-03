@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,10 +23,23 @@ from .storage_utils import atomic_write_text
 logger = log_api.get_logger("life_engine.autonomy", display="Autonomy")
 
 AutonomyIntentKind = Literal["speak", "reflect", "silence"]
-AutonomyIntentStatus = Literal["scheduled", "triggered", "expired", "cancelled", "rejected"]
+AutonomyIntentStatus = Literal[
+    "scheduled",
+    "in_flight",
+    "triggered",
+    "renewal_required",
+    "paused",
+    "expired",
+    "cancelled",
+    "rejected",
+    "failed",
+]
 
 _STORE_FILE = "autonomy_intents.json"
-_STORE_VERSION = 2
+_STORE_VERSION = 3
+_EVENT_LOG_FILE = "autonomy_intent_events.jsonl"
+_MAX_OCCURRENCES_LIMIT = 10_000
+_MAX_LEASE_MINUTES = 7 * 24 * 60
 _LOCK: asyncio.Lock | None = None
 
 
@@ -93,6 +107,17 @@ class AutonomyIntent:
     repeat: bool = False
     interval_minutes: int = 0
     occurrence_count: int = 0
+    max_occurrences: int = 0
+    lease_until: str = ""
+    active_occurrence_id: str = ""
+    active_occurrence_status: str = ""
+    active_occurrence_started_at: str = ""
+    active_action_id: str = ""
+    last_occurrence_id: str = ""
+    last_outcome: str = ""
+    renewal_reason: str = ""
+    retry_count: int = 0
+    last_error: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -132,6 +157,17 @@ class AutonomyIntent:
             repeat=repeat,
             interval_minutes=interval_minutes,
             occurrence_count=max(0, int(data.get("occurrence_count") or 0)),
+            max_occurrences=max(0, int(data.get("max_occurrences") or 0)),
+            lease_until=str(data.get("lease_until") or ""),
+            active_occurrence_id=str(data.get("active_occurrence_id") or ""),
+            active_occurrence_status=str(data.get("active_occurrence_status") or ""),
+            active_occurrence_started_at=str(data.get("active_occurrence_started_at") or ""),
+            active_action_id=str(data.get("active_action_id") or ""),
+            last_occurrence_id=str(data.get("last_occurrence_id") or ""),
+            last_outcome=_shorten(data.get("last_outcome"), max_length=80),
+            renewal_reason=_shorten(data.get("renewal_reason"), max_length=240),
+            retry_count=max(0, int(data.get("retry_count") or 0)),
+            last_error=_shorten(data.get("last_error"), max_length=240),
         )
 
 
@@ -200,6 +236,65 @@ class AutonomyIntentStore:
     def list_scheduled(self) -> list[AutonomyIntent]:
         return [intent for intent in self.load() if intent.status == "scheduled"]
 
+    def append_event(
+        self,
+        event_type: str,
+        intent: AutonomyIntent,
+        *,
+        occurrence_id: str = "",
+        action_id: str = "",
+        detail: str = "",
+    ) -> None:
+        """Append a technical lifecycle event without rewriting intent meaning."""
+
+        payload = {
+            "event_id": uuid4().hex,
+            "event_type": str(event_type or "unknown"),
+            "intent_id": intent.intent_id,
+            "occurrence_id": str(occurrence_id or intent.active_occurrence_id),
+            "occurrence_count": int(intent.occurrence_count or 0),
+            "action_id": str(action_id or ""),
+            "status": intent.status,
+            "target_stream_id": intent.target_stream_id,
+            "detail": _shorten(detail, max_length=500),
+            "created_at": iso_now(),
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        event_path = self.path.parent / _EVENT_LOG_FILE
+        with event_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
+def occurrence_id_for(intent: AutonomyIntent, occurrence_count: int | None = None) -> str:
+    """Return the stable identity for one surfaced occurrence."""
+
+    count = int(occurrence_count or intent.occurrence_count or 0)
+    return f"{intent.intent_id}:{count}"
+
+
+def recurring_lease_reason(
+    intent: AutonomyIntent,
+    *,
+    at: datetime | None = None,
+) -> str:
+    """Return an engineering-only reason why recurrence may not execute."""
+
+    if not intent.repeat:
+        return ""
+    if intent.max_occurrences <= 0 and not intent.lease_until:
+        return "recurring intent has no explicit execution lease"
+    if intent.max_occurrences > 0 and intent.occurrence_count >= intent.max_occurrences:
+        return "maximum occurrence lease reached"
+    if intent.lease_until:
+        lease_until = parse_iso_datetime(intent.lease_until)
+        if lease_until is None:
+            return "lease_until is invalid"
+        if lease_until <= (at or now_local()):
+            return "time lease expired"
+    return ""
+
 
 def build_intent(
     *,
@@ -214,6 +309,8 @@ def build_intent(
     constraints: list[str] | None = None,
     repeat: bool = False,
     interval_minutes: int | None = None,
+    max_occurrences: int | None = None,
+    lease_minutes: int | None = None,
 ) -> AutonomyIntent:
     kind_value = str(kind or "").strip().lower()
     if kind_value not in {"speak", "reflect", "silence"}:
@@ -232,6 +329,22 @@ def build_intent(
     interval = int(interval_minutes or delay)
     if repeat_value and (interval < min_delay or interval > max_delay):
         raise ValueError(f"interval_minutes 必须在 {min_delay} 到 {max_delay} 之间")
+
+    occurrence_lease = int(max_occurrences or 0)
+    time_lease_minutes = int(lease_minutes or 0)
+    if repeat_value and occurrence_lease <= 0 and time_lease_minutes <= 0:
+        raise ValueError(
+            "repeat=true requires max_occurrences or lease_minutes; "
+            "unbounded recurring intents are not allowed"
+        )
+    if occurrence_lease < 0 or occurrence_lease > _MAX_OCCURRENCES_LIMIT:
+        raise ValueError(
+            f"max_occurrences must be between 1 and {_MAX_OCCURRENCES_LIMIT}"
+        )
+    if time_lease_minutes < 0 or time_lease_minutes > _MAX_LEASE_MINUTES:
+        raise ValueError(
+            f"lease_minutes must be between 1 and {_MAX_LEASE_MINUTES}"
+        )
 
     created = iso_now()
     scheduled = (now_local() + timedelta(minutes=delay)).isoformat()
@@ -256,6 +369,12 @@ def build_intent(
         task_name=normalize_intent_task_name(intent_id),
         repeat=repeat_value,
         interval_minutes=interval if repeat_value else 0,
+        max_occurrences=occurrence_lease if repeat_value else 0,
+        lease_until=(
+            (now_local() + timedelta(minutes=time_lease_minutes)).isoformat()
+            if repeat_value and time_lease_minutes > 0
+            else ""
+        ),
     )
 
 
@@ -276,6 +395,12 @@ def format_due_message(intent: AutonomyIntent) -> str:
     if intent.repeat:
         lines.append(f"- 周期：每隔 {intent.interval_minutes or intent.delay_minutes} 分钟浮现一次")
         lines.append(f"- 浮现次数：第 {max(1, intent.occurrence_count)} 次")
+        if intent.max_occurrences > 0:
+            lines.append(f"- 执行租约：最多 {intent.max_occurrences} 次")
+        if intent.lease_until:
+            lines.append(f"- 执行租约到：{intent.lease_until}")
+    if intent.active_occurrence_id:
+        lines.append(f"- 本次 occurrence：{intent.active_occurrence_id}")
     if intent.target_hint:
         lines.append(f"- 目标提示：{intent.target_hint}")
     if intent.constraints:
@@ -298,14 +423,13 @@ async def schedule_autonomy_intent(plugin: Any, intent: AutonomyIntent) -> str:
     if scheduled_at is None:
         raise ValueError("scheduled_at 无效")
     trigger_config: dict[str, Any] = {"trigger_at": scheduled_at.replace(tzinfo=None)}
-    is_recurring = bool(intent.repeat)
-    if is_recurring:
-        trigger_config["interval_seconds"] = float(intent.interval_minutes or intent.delay_minutes) * 60.0
     schedule_id = await scheduler.create_schedule(
         callback=_callback,
         trigger_type=TriggerType.TIME,
         trigger_config=trigger_config,
-        is_recurring=is_recurring,
+        # Recurrence is chained only after a terminal occurrence receipt. A
+        # scheduler-level recurring callback can overlap an unfinished turn.
+        is_recurring=False,
         task_name=intent.task_name or normalize_intent_task_name(intent.intent_id),
         force_overwrite=True,
     )
@@ -316,18 +440,50 @@ async def schedule_autonomy_intent(plugin: Any, intent: AutonomyIntent) -> str:
 
 async def restore_autonomy_intents(plugin: Any, workspace_path: str | Path) -> int:
     store = AutonomyIntentStore(workspace_path)
-    intents = store.list_scheduled()
+    intents = store.load()
     if not intents:
         return 0
 
     scheduler = get_unified_scheduler()
-    if not scheduler.is_running:
-        logger.warning("调度器尚未运行，未恢复自主意向")
-        return 0
-
     restored = 0
     async with _get_lock():
-        for intent in store.list_scheduled():
+        for intent in store.load():
+            if intent.status == "in_flight" or intent.active_occurrence_id:
+                # The previous process cannot prove whether an external action
+                # crossed the crash boundary. Preserve it; never blindly replay.
+                occurrence_id = intent.active_occurrence_id
+                intent.status = "renewal_required"
+                intent.renewal_reason = "unfinished occurrence recovered after restart"
+                intent.active_occurrence_status = "delivery_unknown"
+                intent.updated_at = iso_now()
+                store.upsert(intent)
+                store.append_event(
+                    "recovered_delivery_unknown",
+                    intent,
+                    occurrence_id=occurrence_id,
+                    detail=intent.renewal_reason,
+                )
+                continue
+            if intent.status != "scheduled":
+                continue
+            lease_reason = recurring_lease_reason(intent)
+            if lease_reason:
+                intent.status = "renewal_required"
+                intent.renewal_reason = lease_reason
+                intent.updated_at = iso_now()
+                store.upsert(intent)
+                store.append_event(
+                    "renewal_required",
+                    intent,
+                    detail=lease_reason,
+                )
+                logger.warning(
+                    "自主意向等待主体续期: "
+                    f"intent_id={intent.intent_id[:12]} reason={lease_reason}"
+                )
+                continue
+            if not scheduler.is_running:
+                continue
             scheduled_at = parse_iso_datetime(intent.scheduled_at)
             if scheduled_at is None:
                 intent.status = "rejected"
@@ -344,6 +500,10 @@ async def restore_autonomy_intents(plugin: Any, workspace_path: str | Path) -> i
                 restored += 1
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"恢复自主意向失败: intent_id={intent.intent_id} error={exc}")
+    if not scheduler.is_running and any(
+        intent.status == "scheduled" for intent in store.load()
+    ):
+        logger.warning("调度器尚未运行，未恢复 scheduled 自主意向")
     if restored:
         logger.info(f"已恢复自主意向调度: count={restored}")
     return restored
@@ -379,6 +539,8 @@ __all__ = [
     "build_intent",
     "cleanup_autonomy_schedules",
     "format_due_message",
+    "occurrence_id_for",
+    "recurring_lease_reason",
     "restore_autonomy_intents",
     "schedule_autonomy_intent",
 ]
