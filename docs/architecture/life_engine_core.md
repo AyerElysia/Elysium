@@ -126,7 +126,7 @@ LifeChatter 是同一主体的**对外运行模式**——当有人发消息来�
 消息到达 → 适配器 → ChatStream 收集
                         │
                         ▼
-              route_should_respond()  ← 路由判断（本地小模型）
+              route_should_respond()  ← 路由判断（云端思考模型 + 轻量投影）
                         │
               should_respond = true
                         │
@@ -134,7 +134,7 @@ LifeChatter 是同一主体的**对外运行模式**——当有人发消息来�
               LifeChatter.execute()  ← 主意识接管
 ```
 
-路由判断使用 `router` 任务（本地小模型 qwen3-0.6b，低延迟），判断"这批新消息是否值得开口"。熔断器保护：本地模型连续失败后自动跳过，回退到 `agent` 任务。
+路由判断使用云端优先的 `router` 任务，判断“这批新消息是否应交给表达层”。Router 仍保留思考预算；延迟优化来自版本化的轻量上下文投影，而不是关闭思考。空正文、畸形 JSON 或调用失败都会继续尝试云端 `agent` 任务，不会把“没有结果”伪装成一次有效判断。
 
 ### 3.3 全局运行态
 
@@ -153,7 +153,7 @@ def _configured_primary_task_name(self) -> str:
     # 兜底: "expression"
 ```
 
-当前配置：`chatter_task_name = "expression"`（grok-4.5 打头，情商+智商在线的多模态模型）。
+当前配置：`chatter_task_name = "expression"`，以 MiMo-V2.5-Pro 为首选，后续链接 GPT、MiMo、Grok、Claude、Qwen 与 Gemini 等云端模型；输出预算为 32000 token，包含隐式思考与最终正文。
 
 ### 3.5 多模态准入
 
@@ -199,7 +199,7 @@ LifeChatter 内部可调用所有 `chatter_allow` 标记的工具，包括：
 
 ## 4. 消息路由（Router）
 
-**文件**：`core/router.py`
+**文件**：`core/router.py`、`core/router_context_projection.py`
 
 ### 4.1 路由决策链
 
@@ -211,10 +211,12 @@ LifeChatter 内部可调用所有 `chatter_allow` 标记的工具，包括：
     ▼
 route_should_respond()
     │
-    ├── 尝试 router 任务（本地小模型，2048 ctx）
-    │       └── 失败 → 熔断器计数
+    ├── 读取与当前 SOUL/USER/MEMORY 哈希一致的 Router 投影
     │
-    ├── 回退 agent 任务（远程模型）
+    ├── 尝试 router 任务（云端思考模型，8192 token 独立预算）
+    │       └── 空正文 / 非法结构 / 调用失败 → 熔断器计数
+    │
+    ├── 回退 agent 任务（云端模型）
     │
     ▼
 返回 SubAgentDecision { should_respond: bool, reason: str }
@@ -222,14 +224,24 @@ route_should_respond()
 
 ### 4.2 上下文预算控制
 
-路由只需近期语境，严格限制输入：
-- history 字符预算：max_context 的 ~15%（2048 → 300 字符）
-- 未读消息按模型 max_context 裁剪
-- 系统提示词硬守卫：保守 token 估计（1 字符 ≈ 1.5 token），超出直接截断
+Router 不再重复注入完整 `SOUL.md`、`USER.md` 和 `MEMORY.md`。表达层仍读取完整权威文件；Router 只读取派生投影、最近 3000 字符聊天窗口和本批新消息。未读消息与系统提示词只做瞬态传输预算收缩，不修改权威历史。
 
-### 4.3 熔断器
+投影生成任务使用 16000 token，足以容纳语义理解、冲突保留与最终 6000 字符上限的轻量投影。输入精简只发生在 Router 派生读模型，不会缩减主体的人格、记忆或任务上下文。
 
-本地 router 模型连续失败 N 次后熔断器打开，后续请求直接跳过 router 走 agent 任务，避免每条消息都等连接超时。
+### 4.3 可追溯上下文投影
+
+`RouterContextProjection` 是由 `LifeEngineService` 拥有的可重建读模型：
+
+- 权威源固定为工作空间根目录的 `SOUL.md`、`USER.md`、`MEMORY.md`；投影不反向写入这些文件。
+- 每个版本以完整源内容的 SHA-256 寻址，写入 `runtime/router_context_projection/versions/`；`latest.json` 只指向最近一次成功版本。
+- 版本清单保留每个源文件的路径、哈希、字节数、生成任务/模型和生成时间；旧版本不会被新版本覆盖。
+- 官方写文件工具在完成版本见证后立即唤醒刷新；服务同时轮询外部编辑。刷新由单一后台 owner 串行执行，启动、通知与停止均幂等；生成失败后从 30 秒开始渐进重试，无需再次修改源文件或重启插件。
+- 生成失败时保留旧版本用于追溯，但不会把与当前源哈希不一致的旧投影继续送给 Router；健康信息明确标记 `degraded`、新旧 digest、backlog、最后成功时间和失败原因。
+- 投影是导航摘要，不是新 persona、长期记忆、事实裁决或跨实例私有上下文。
+
+### 4.4 熔断与降级
+
+专用 `router` 任务连续失败后熔断器临时打开，后续请求先走云端 `agent` 任务。LLM 内核对可恢复故障从 30 秒开始渐进冷却，避免本地中转站一次短暂 503 让整条链持续五分钟不可用。所有任务均失败时采用可观测的“保留工作”降级：消息进入主表达层，由主体决定是否以及如何表达；系统不会伪造 Router 判断，也不会静默丢弃消息。
 
 ---
 

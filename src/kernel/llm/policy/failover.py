@@ -18,8 +18,12 @@ from typing import Any
 from ..exceptions import LLMModelsCoolingDownError, is_transient_llm_error
 from .base import ModelStep, Policy, PolicySession
 
-_DEFAULT_COOLDOWN_SECONDS = 300.0
-_MAX_COOLDOWN_SECONDS = 1800.0
+# A local gateway can recover from a brief channel-capacity 503 in seconds.  A
+# five-minute first cooldown made every model in a task remain unavailable long
+# after the gateway had recovered.  Keep the cross-request breaker, but probe
+# again soon and reserve the longer windows for repeated failures.
+_DEFAULT_COOLDOWN_SECONDS = 30.0
+_MAX_COOLDOWN_SECONDS = 300.0
 
 
 @dataclass(slots=True)

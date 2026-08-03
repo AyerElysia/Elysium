@@ -201,7 +201,7 @@ async def test_all_cooling_models_are_not_probed_before_expiry():
     with pytest.raises(LLMModelsCoolingDownError) as exc_info:
         await second.send(stream=False)
 
-    assert exc_info.value.retry_after > 290
+    assert 29 < exc_info.value.retry_after <= 30
     assert client.calls == ["a", "b"]
 
 

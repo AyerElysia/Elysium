@@ -45,6 +45,12 @@ from ..core.chat_history import (
 )
 from ..core.config import LifeEngineConfig
 from ..core.context_assembly import LifeChatterContextAssembler
+from ..core.router_context_projection import (
+    RouterContextDraft,
+    RouterContextProjection,
+    RouterContextSource,
+    build_router_context_projection_prompt,
+)
 from ..core.send_targets import format_send_targets_for_prompt, list_recent_send_targets
 from ..core.tool_parallel import iter_life_tool_call_batches
 from ..autonomy import (
@@ -196,6 +202,8 @@ class LifeEngineService(BaseService):
         self._memory_index_task_id: str | None = None
         self._memory_witness_task_id: str | None = None
         self._memory_witness_coordinator = None
+        self._router_context_projection_task_id: str | None = None
+        self._router_context_projection: RouterContextProjection | None = None
         self._stop_event: asyncio.Event | None = None
         self._pending_events: list[LifeEngineEvent] = []
         self._event_history: list[LifeEngineEvent] = []
@@ -1056,7 +1064,128 @@ class LifeEngineService(BaseService):
             snapshot["world_projection"] = (
                 self._world_projection.health_snapshot()
             )
+        if self._router_context_projection is not None:
+            snapshot["router_context_projection"] = (
+                self._router_context_projection.health_snapshot()
+            )
+        else:
+            snapshot["router_context_projection"] = {
+                "component": "router_context_projection",
+                "owner": "life_engine.service",
+                "status": "disabled",
+                "running": False,
+                "backlog": 0,
+                "fresh": False,
+                "degraded_reason": "",
+            }
         return snapshot
+
+    async def get_router_context_projection_prompt(self) -> str:
+        """Return a projection only when it matches current authority files."""
+
+        projection = self._router_context_projection
+        if projection is None:
+            return ""
+        return await projection.ensure_current()
+
+    def notify_router_context_source_changed(self, path: str | Path) -> bool:
+        """Notify the owned projection loop after an official workspace write."""
+
+        projection = self._router_context_projection
+        if projection is None:
+            return False
+        return projection.notify_source_changed(path)
+
+    async def _author_router_context_projection(
+        self,
+        source_digest: str,
+        sources: tuple[RouterContextSource, ...],
+    ) -> RouterContextDraft:
+        """Use cloud models in configured order and reject reasoning-only output."""
+
+        chatter_cfg = self._cfg().chatter
+        task_name = str(
+            getattr(
+                chatter_cfg,
+                "router_context_projection_task_name",
+                "router_context_projection",
+            )
+            or "router_context_projection"
+        ).strip()
+        max_chars = int(
+            getattr(chatter_cfg, "router_context_projection_max_chars", 6000)
+            or 6000
+        )
+        timeout_seconds = float(
+            getattr(chatter_cfg, "router_context_projection_timeout_seconds", 90.0)
+            or 90.0
+        )
+        system_prompt, user_prompt = build_router_context_projection_prompt(
+            source_digest,
+            sources,
+            max_chars=max_chars,
+        )
+        try:
+            model_set = get_model_set_by_task(task_name)
+        except (KeyError, ValueError):
+            fallback_task = "utility"
+            logger.warning(
+                f"Router 上下文投影任务 {task_name!r} 未配置，"
+                f"回退到云端任务 {fallback_task!r}"
+            )
+            task_name = fallback_task
+            model_set = get_model_set_by_task(task_name)
+        if not model_set:
+            raise RuntimeError(f"model task '{task_name}' has no models")
+
+        errors: list[str] = []
+        for configured_model in model_set:
+            if not isinstance(configured_model, dict):
+                continue
+            model_identifier = str(
+                configured_model.get("model_identifier") or "unknown"
+            )
+            request = create_llm_request(
+                model_set=[dict(configured_model)],
+                request_name="life_router_context_projection",
+            )
+            request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
+            request.add_payload(LLMPayload(ROLE.USER, Text(user_prompt)))
+            try:
+                response = await asyncio.wait_for(
+                    request.send(stream=False),
+                    timeout=timeout_seconds,
+                )
+                awaited_text = await asyncio.wait_for(
+                    response,
+                    timeout=timeout_seconds,
+                )
+                content = str(response.message or awaited_text or "").strip()
+                if content and len(content) <= max_chars:
+                    return RouterContextDraft(
+                        text=content,
+                        generator=f"task:{task_name}/model:{model_identifier}",
+                    )
+                if not content:
+                    errors.append(f"{model_identifier}: empty final content")
+                else:
+                    errors.append(
+                        f"{model_identifier}: final content exceeded budget "
+                        f"({len(content)} > {max_chars})"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{model_identifier}: {type(exc).__name__}: {exc}")
+                logger.warning(
+                    "Router 上下文投影云端模型失败，尝试下一模型: "
+                    f"model={model_identifier} error={type(exc).__name__}: {exc}"
+                )
+
+        detail = "; ".join(errors[-3:]) or "no valid model entry"
+        raise RuntimeError(
+            f"router context projection exhausted cloud models: {detail}"
+        )
 
     async def get_state_digest_for_dfc(self) -> str:
         """生成给 DFC 的状态摘要。"""
@@ -4398,6 +4527,45 @@ class LifeEngineService(BaseService):
                 logger.warning(f"恢复自主意向失败: {exc}")
 
         self._stop_event = asyncio.Event()
+
+        chatter_cfg = getattr(cfg, "chatter", None)
+        projection_enabled = bool(
+            chatter_cfg is not None
+            and getattr(chatter_cfg, "enabled", False)
+            and getattr(
+                chatter_cfg,
+                "router_context_projection_enabled",
+                True,
+            )
+        )
+        if projection_enabled:
+            self._router_context_projection = RouterContextProjection(
+                self._workspace_dir(),
+                author=self._author_router_context_projection,
+                max_chars=int(
+                    getattr(
+                        chatter_cfg,
+                        "router_context_projection_max_chars",
+                        6000,
+                    )
+                    or 6000
+                ),
+                poll_interval_seconds=float(
+                    getattr(
+                        chatter_cfg,
+                        "router_context_projection_poll_seconds",
+                        1.0,
+                    )
+                    or 1.0
+                ),
+            )
+            projection_task = get_task_manager().create_task(
+                self._router_context_projection.run(),
+                name="life_engine_router_context_projection",
+                daemon=True,
+            )
+            self._router_context_projection_task_id = projection_task.task_id
+
         task = get_task_manager().create_task(
             self._heartbeat_loop(),
             name="life_engine_heartbeat",
@@ -4481,6 +4649,16 @@ class LifeEngineService(BaseService):
 
         if self._stop_event is not None:
             self._stop_event.set()
+
+        if self._router_context_projection is not None:
+            self._router_context_projection.request_stop()
+
+        await self._await_managed_task(
+            self._router_context_projection_task_id,
+            timeout=5.0,
+        )
+        self._router_context_projection_task_id = None
+        self._router_context_projection = None
 
         await self._await_managed_task(self._memory_witness_task_id, timeout=10.0)
         self._memory_witness_task_id = None

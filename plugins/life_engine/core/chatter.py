@@ -2581,32 +2581,24 @@ class LifeChatter(BaseChatter):
             + self._build_sub_agent_tool_guide(),
         )
 
-    def _build_chat_router_prefix_prompt(
+    async def _build_chat_router_prefix_prompt(
         self,
         service: LifeEngineService | None,
         chat_stream: ChatStream | None = None,
     ) -> str:
-        """构建路由器前缀提示词。
+        """Return the current derived Router projection, never full authority files."""
 
-        路由器与 life_chatter 共享 SOUL/USER/MEMORY 前缀，但不注入
-        TOOLS.md 和工具定义。它只判断“要不要把消息交给表达层”，不负责
-        具体行动。
-        """
-
-        soul_text = self._load_soul_markdown(service)
-        if soul_text is None:
+        del chat_stream
+        if service is None:
             return ""
-        user_text = self._load_workspace_markdown(service, "USER.md")
-        memory_text = self._load_workspace_memory_prompt(service, mode="chat")
-
-        return LifeChatterContextAssembler.build_prefix_prompt(
-            soul_text=soul_text,
-            user_text=user_text,
-            memory_text=memory_text,
-            tools_text="",
-            live_guidance=self._build_live_scene_guidance(chat_stream),
-            primary_tool_guide="",
+        get_projection = getattr(
+            service,
+            "get_router_context_projection_prompt",
+            None,
         )
+        if not callable(get_projection):
+            return ""
+        return str(await get_projection() or "").strip()
 
     def _resolve_workspace_path(self, service: LifeEngineService | None) -> str:
         """解析 life_engine 工作空间路径。"""
@@ -2961,10 +2953,18 @@ class LifeChatter(BaseChatter):
                 if str(getattr(msg, "message_id", "") or "")
             },
         )
-        prefix_prompt = self._build_chat_router_prefix_prompt(service, chat_stream)
-        if not prefix_prompt:
+        if self._load_soul_markdown(service) is None:
             # SOUL.md 不可用——没有灵魂就不说话
             return {"reason": "SOUL.md 不可用，拒绝响应", "should_respond": False}
+        prefix_prompt = await self._build_chat_router_prefix_prompt(
+            service,
+            chat_stream,
+        )
+        if not prefix_prompt:
+            logger.warning(
+                "Router 上下文投影暂不可用，将使用轻量基础提示词；"
+                "完整人格与记忆仍由表达层读取"
+            )
 
         try:
             from plugins.life_engine.core.router import route_should_respond
@@ -2981,8 +2981,11 @@ class LifeChatter(BaseChatter):
             )
             return result
         except Exception as e:
-            logger.warning(f"router 路由失败, 默认不响应: {e}")
-            return {"reason": f"router 异常: {e}", "should_respond": False}
+            logger.warning(f"router 路由异常，保留消息并交给主体判断: {e}")
+            return {
+                "reason": f"router 异常降级: {e}；消息已交给主体判断",
+                "should_respond": True,
+            }
 
     # ── history builder ──────────────────────────────────────
 

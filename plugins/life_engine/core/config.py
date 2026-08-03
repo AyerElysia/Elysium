@@ -82,6 +82,11 @@ class LifeEngineConfig(BaseConfig):
             "max_rounds_per_chat",
             "initial_history_messages",
             "recent_history_tail_messages",
+            "router_context_projection_enabled",
+            "router_context_projection_task_name",
+            "router_context_projection_max_chars",
+            "router_context_projection_poll_seconds",
+            "router_context_projection_timeout_seconds",
             "enable_sub_agent",
             "sub_agent_task_name",
             "sub_agent_allow_mcp",
@@ -822,6 +827,40 @@ class LifeEngineConfig(BaseConfig):
                 "兼容旧配置：若 initial_history_messages 未显式配置且此值 > 0，"
                 "则回退使用该值作为首轮历史消息条数。"
             ),
+        )
+
+        router_context_projection_enabled: bool = Field(
+            default=True,
+            description=(
+                "是否为对话 Router 启用可追溯、可重建的轻量人格/记忆投影。"
+                "只影响 Router 输入，不替换表达层的完整人格与记忆。"
+            ),
+        )
+
+        router_context_projection_task_name: str = Field(
+            default="router_context_projection",
+            description="生成 Router 上下文投影时使用的云端模型任务名。",
+        )
+
+        router_context_projection_max_chars: int = Field(
+            default=6000,
+            ge=500,
+            le=20000,
+            description="单个 Router 上下文投影正文允许的最大字符数。",
+        )
+
+        router_context_projection_poll_seconds: float = Field(
+            default=1.0,
+            ge=0.2,
+            le=60.0,
+            description="检测 SOUL.md、USER.md、MEMORY.md 外部变更的轮询间隔。",
+        )
+
+        router_context_projection_timeout_seconds: float = Field(
+            default=90.0,
+            ge=5.0,
+            le=300.0,
+            description="单个云端模型生成 Router 上下文投影的超时时间。",
         )
 
         enable_sub_agent: bool = Field(

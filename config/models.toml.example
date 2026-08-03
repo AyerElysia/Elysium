@@ -1,0 +1,168 @@
+# Elysium unified model registry (LiteLLM-style)
+# Copy to config/models.toml and replace both provider credentials locally.
+
+[providers.NexusAI]
+base_url = "http://localhost:3000/v1"
+api_key = "replace-with-new-api-token"
+client_type = "openai"
+max_retry = 3
+timeout = 120
+retry_interval = 5
+
+[providers.LocalRouter]
+base_url = "http://127.0.0.1:8849/v1"
+api_key = "replace-with-local-router-token"
+client_type = "openai"
+max_retry = 1
+timeout = 5
+retry_interval = 2
+
+# Non-generative models
+[models."sensevoice-small"]
+provider = "NexusAI"
+id = "FunAudioLLM/SenseVoiceSmall"
+ctx = 4096
+
+[models."bge-m3"]
+provider = "NexusAI"
+id = "BAAI/bge-m3"
+ctx = 4096
+
+# Cloud reasoning models
+[models."gpt-5.6-luna"]
+provider = "NexusAI"
+id = "gpt-5.6-luna"
+ctx = 300000
+stream = true
+vision = true
+extra = { reasoning_effort = "high", context_compression_trigger_tokens = 200000 }
+
+[models."gpt-5.6-sol"]
+provider = "NexusAI"
+id = "gpt-5.6-sol"
+ctx = 300000
+stream = true
+vision = true
+extra = { reasoning_effort = "high", context_compression_trigger_tokens = 200000 }
+
+[models."gpt-5.6-terra"]
+provider = "NexusAI"
+id = "gpt-5.6-terra"
+ctx = 300000
+stream = true
+vision = true
+extra = { reasoning_effort = "high", context_compression_trigger_tokens = 200000 }
+
+[models."deepseek-v4-flash"]
+provider = "NexusAI"
+id = "deepseek-v4-flash"
+ctx = 1000000
+extra = { thinking = { type = "enabled" }, context_compression_trigger_tokens = 200000 }
+
+[models."MiMo-V2.5-Pro"]
+provider = "NexusAI"
+id = "mimo-v2.5-pro"
+ctx = 1000000
+extra = { context_compression_trigger_tokens = 200000, enable_thinking = true }
+
+[models."MiMo-V2.5"]
+provider = "NexusAI"
+id = "mimo-v2.5"
+ctx = 1000000
+vision = true
+audio = true
+video = true
+extra = { enable_thinking = true, context_compression_trigger_tokens = 200000 }
+
+[models."qwen3.7-plus"]
+provider = "NexusAI"
+id = "qwen3.7-plus"
+ctx = 1000000
+vision = true
+video = true
+extra = { thinking = { type = "enabled" }, context_compression_trigger_tokens = 200000 }
+
+[models."gemini-3.5-flash"]
+provider = "NexusAI"
+id = "gemini-3.5-flash"
+ctx = 1000000
+vision = true
+audio = true
+video = true
+
+[models."claude-sonnet-5"]
+provider = "NexusAI"
+id = "claude-sonnet-5"
+ctx = 1000000
+vision = true
+extra = { thinking = { budget_tokens = 16000, type = "enabled" }, context_compression_trigger_tokens = 200000 }
+
+[models."grok-4.5"]
+provider = "NexusAI"
+id = "grok-4.5"
+ctx = 500000
+vision = true
+extra = { enable_thinking = true, context_compression_trigger_tokens = 200000 }
+
+# Registered for explicit manual use. Runtime tasks remain cloud-first.
+[models."qwen3-0.6b-router"]
+provider = "LocalRouter"
+id = "qwen3-0.6b-router"
+ctx = 2048
+extra = { enable_thinking = false }
+
+# Generative budgets include hidden reasoning and final output.
+[tasks.core]
+models = ["MiMo-V2.5-Pro", "grok-4.5", "gpt-5.6-sol", "claude-sonnet-5", "gpt-5.6-terra", "MiMo-V2.5"]
+tokens = 32000
+temp = 0.7
+
+[tasks.expression]
+models = ["MiMo-V2.5-Pro", "gpt-5.6-terra", "MiMo-V2.5", "grok-4.5", "gpt-5.6-sol", "claude-sonnet-5", "qwen3.7-plus", "gemini-3.5-flash"]
+tokens = 32000
+temp = 0.8
+
+[tasks.witness]
+models = ["MiMo-V2.5", "gpt-5.6-luna", "deepseek-v4-flash", "qwen3.7-plus"]
+tokens = 16000
+temp = 0.7
+
+[tasks.agent]
+models = ["gpt-5.6-luna", "MiMo-V2.5", "deepseek-v4-flash", "qwen3.7-plus"]
+tokens = 32000
+temp = 0.7
+
+[tasks.utility]
+models = ["MiMo-V2.5", "qwen3.7-plus", "deepseek-v4-flash", "gpt-5.6-luna"]
+tokens = 16000
+temp = 0.7
+
+[tasks.vision]
+models = ["MiMo-V2.5", "gpt-5.6-luna", "gemini-3.5-flash", "gpt-5.6-sol"]
+tokens = 16000
+temp = 0.7
+
+[tasks.voice]
+models = ["sensevoice-small"]
+tokens = 8192
+temp = 0.7
+
+[tasks.embedding]
+models = ["bge-m3"]
+tokens = 8192
+temp = 0.7
+
+[tasks.router]
+models = ["MiMo-V2.5", "gpt-5.6-luna", "deepseek-v4-flash", "qwen3.7-plus"]
+tokens = 8192
+temp = 0.3
+
+[tasks.router_context_projection]
+models = ["MiMo-V2.5", "gpt-5.6-luna", "deepseek-v4-flash", "qwen3.7-plus"]
+tokens = 16000
+temp = 0.2
+
+[tasks.live]
+models = ["MiMo-V2.5-Pro", "gpt-5.6-terra", "MiMo-V2.5", "grok-4.5", "gpt-5.6-sol", "claude-sonnet-5"]
+tokens = 32000
+temp = 0.75

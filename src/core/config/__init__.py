@@ -15,7 +15,7 @@
     
     # 初始化模型配置
     from src.core.config import init_model_config, get_model_config
-    init_model_config("config/models.toml")
+    init_model_config("config/model.toml")
     
     # 获取模型配置
     model_config = get_model_config()

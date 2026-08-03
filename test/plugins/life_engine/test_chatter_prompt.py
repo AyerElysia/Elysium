@@ -92,39 +92,24 @@ def test_life_chatter_system_prompt_includes_memory_and_chatter_tools_not_heartb
     assert "reason" in prompt
 
 
-def test_life_chatter_router_prefix_excludes_tools(tmp_path) -> None:
-    """路由器共享主体前缀，但不注入 TOOLS.md 和工具定义。"""
-    (tmp_path / "SOUL.md").write_text("SOUL_CONTENT", encoding="utf-8")
-    (tmp_path / "USER.md").write_text("USER_CONTENT", encoding="utf-8")
-    (tmp_path / "MEMORY.md").write_text(
-        "\n".join(
-            [
-                "# 值得记住的事",
-                "",
-                "### Durable（持久）",
-                "- MEMORY_DURABLE",
-                "",
-                "### Active（活跃）",
-                "- MEMORY_ACTIVE",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    (tmp_path / "TOOLS.md").write_text("CHATTER_TOOLS_CONTENT", encoding="utf-8")
+@pytest.mark.asyncio
+async def test_life_chatter_router_uses_only_derived_projection() -> None:
+    """Router receives the derived read model, never full authority/tool files."""
 
-    config = LifeEngineConfig()
-    config.settings.workspace_path = str(tmp_path)
+    class _ProjectionService:
+        async def get_router_context_projection_prompt(self) -> str:
+            return "DERIVED_ROUTER_PROJECTION"
+
     chatter = LifeChatter.__new__(LifeChatter)
-    chatter.plugin = SimpleNamespace(config=config)
+    prompt = await chatter._build_chat_router_prefix_prompt(
+        service=_ProjectionService(),
+    )
 
-    prompt = chatter._build_chat_router_prefix_prompt(service=None)
-
-    assert "SOUL_CONTENT" in prompt
-    assert "USER_CONTENT" in prompt
-    assert "MEMORY_DURABLE" in prompt
-    assert "MEMORY_ACTIVE" in prompt
+    assert prompt == "DERIVED_ROUTER_PROJECTION"
+    assert "SOUL_CONTENT" not in prompt
+    assert "USER_CONTENT" not in prompt
+    assert "MEMORY_DURABLE" not in prompt
     assert "CHATTER_TOOLS_CONTENT" not in prompt
-    assert "life_send_text" not in prompt
 
 
 def test_life_chatter_persistent_user_prompt_excludes_dynamic_context() -> None:

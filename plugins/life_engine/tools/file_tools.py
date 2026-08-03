@@ -80,6 +80,15 @@ def _get_life_engine_service(plugin: Any):
     return LifeEngineService.get_instance()
 
 
+def _notify_router_context_source_changed(plugin: Any, path: str) -> None:
+    """Wake the derived Router projection after an authoritative file write."""
+
+    service = _get_life_engine_service(plugin)
+    notify = getattr(service, "notify_router_context_source_changed", None)
+    if callable(notify):
+        notify(path)
+
+
 async def _record_memory_artifact_version(
     plugin: Any,
     *,
@@ -873,6 +882,8 @@ class LifeEngineWriteFileTool(BaseTool):
                 **trace_context,
             )
 
+            _notify_router_context_source_changed(self.plugin, path)
+
             # 同步 SQLite/FTS/outbox 文档索引
             await _sync_memory_embedding_for_file(self.plugin, path, content)
 
@@ -989,6 +1000,8 @@ class LifeEngineEditFileTool(BaseTool):
                 trace_id=trace_id,
                 **trace_context,
             )
+
+            _notify_router_context_source_changed(self.plugin, path)
 
             # 同步 SQLite/FTS/outbox 文档索引
             await _sync_memory_embedding_for_file(self.plugin, path, new_content)

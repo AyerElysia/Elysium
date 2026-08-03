@@ -7,7 +7,7 @@
     from src.core.config.model_config import init_model_config, get_model_config
 
     # 初始化配置
-    init_model_config("config/models.toml")
+    init_model_config("config/model.toml")
 
     # 获取配置
     config = get_model_config()
@@ -28,6 +28,7 @@
 """
 
 import random
+import tomllib
 from threading import Lock as ThreadLock
 from typing import Any, ClassVar, Literal, cast
 
@@ -735,7 +736,7 @@ def init_model_config(config_path: str) -> ModelConfig:
         
         从文件加载：
         ```python
-        config = init_model_config("config/models.toml")
+        config = init_model_config("config/model.toml")
         ```
     """
     global _global_model_config
@@ -743,6 +744,30 @@ def init_model_config(config_path: str) -> ModelConfig:
     from pathlib import Path
 
     path = Path(config_path)
+
+    # ``ModelConfig`` is the legacy schema. Its auto-update writer must never
+    # reinterpret the compact registry and replace it with a generated legacy
+    # file. The two loaders intentionally have separate entry points because
+    # they have different persistence semantics.
+    if path.exists():
+        try:
+            with path.open("rb") as config_file:
+                raw_config = tomllib.load(config_file)
+        except tomllib.TOMLDecodeError:
+            raw_config = {}
+        is_compact_registry = (
+            isinstance(raw_config.get("providers"), dict)
+            and isinstance(raw_config.get("models"), dict)
+            and isinstance(raw_config.get("tasks"), dict)
+            and "api_providers" not in raw_config
+            and "model_tasks" not in raw_config
+        )
+        if is_compact_registry:
+            raise ValueError(
+                f"{path} uses the compact model registry schema; "
+                "load it with init_models_config() instead of the legacy "
+                "init_model_config(), which is reserved for config/model.toml"
+            )
 
     # 确保配置文件存在
     if not path.exists():

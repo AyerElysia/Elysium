@@ -1,6 +1,6 @@
 # LLM 内核（LLM Kernel）
 
-> 文档状态：权威文档，与代码同步截至 2026-07-31。
+> 文档状态：权威文档，与代码同步截至 2026-08-03。
 > 代码位置：`src/kernel/llm/`（6803 行，含 policy 子包）。
 > 本文是 LLM 基础设施的权威文档；凡与本文冲突，以本文和当前代码为准。
 
@@ -46,13 +46,15 @@ LLM 内核是所有模型调用的统一基础设施：负责模型注册与任�
 
 ### 2.1 双格式配置
 
-系统支持两种模型配置格式，按优先级解析：
+系统支持两种模型配置格式，新格式是运行时任务路由的第一权威：
 
 | 优先级 | 格式 | 文件 | 说明 |
 | --- | --- | --- | --- |
-| 1 | 新格式（LiteLLM 风格） | `config/models.toml` | 仅辅助任务（utils/actor/diary） |
+| 1 | 新格式（LiteLLM 风格） | `config/models.toml` | 所有运行时模型、主备链、思考参数与任务预算 |
 | 2 | 统一配置 | `config/elysium.toml` | 桥接用 |
-| 3 | 老格式（权威） | `config/model.toml` | 13 个模型 + 10 个任务 |
+| 3 | 老格式（兼容回退） | `config/model.toml` | 为旧调用者保留，不得覆写新格式注册表 |
+
+`config/models.toml.example` 是不含密钥的可提交基线。`init_model_config()` 只读取旧格式 `config/model.toml`；如果将新格式注册表误传给它，加载器会拒绝并保持原文件不变。
 
 ### 2.2 解析链
 
@@ -87,19 +89,23 @@ class ModelEntry(TypedDict):
     media_capabilities: dict   # 模态能力声明
 ```
 
-### 2.4 当前任务路由（model.toml）
+### 2.4 当前任务路由（models.toml）
 
-| 任务 | 模型列表（按注册序） |
-| --- | --- |
-| core | MiMo-V2.5-Pro, grok-4.5, claude-sonnet-5, gpt-5.6-terra, gpt-5.6-sol, MiMo-V2.5 |
-| expression | grok-4.5, claude-sonnet-5, gpt-5.6-terra, gpt-5.6-sol, qwen3.7-plus, gemini-3.5-flash, MiMo-V2.5 |
-| vision | gpt-5.6-sol, gpt-5.6-luna, gemini-3.5-flash |
-| witness | gpt-5.6-luna |
-| agent | gpt-5.6-luna, deepseek-v4-flash, MiMo-V2.5 |
-| utility | qwen3.7-plus, deepseek-v4-flash, MiMo-V2.5 |
-| voice | sensevoice-small |
-| embedding | bge-m3 |
-| router | qwen3-0.6b-router |
+| 任务 | 输出预算 | 模型列表（按主备序） |
+| --- | ---: | --- |
+| core | 32000 | MiMo-V2.5-Pro, grok-4.5, gpt-5.6-sol, claude-sonnet-5, gpt-5.6-terra, MiMo-V2.5 |
+| expression | 32000 | MiMo-V2.5-Pro, gpt-5.6-terra, MiMo-V2.5, grok-4.5, gpt-5.6-sol, claude-sonnet-5, qwen3.7-plus, gemini-3.5-flash |
+| witness | 16000 | MiMo-V2.5, gpt-5.6-luna, deepseek-v4-flash, qwen3.7-plus |
+| agent | 32000 | gpt-5.6-luna, MiMo-V2.5, deepseek-v4-flash, qwen3.7-plus |
+| utility | 16000 | MiMo-V2.5, qwen3.7-plus, deepseek-v4-flash, gpt-5.6-luna |
+| vision | 16000 | MiMo-V2.5, gpt-5.6-luna, gemini-3.5-flash, gpt-5.6-sol |
+| voice | 8192 | sensevoice-small（非生成型，该上限不用于思考） |
+| embedding | 8192 | bge-m3（非生成型，该上限不用于思考） |
+| router | 8192 | MiMo-V2.5, gpt-5.6-luna, deepseek-v4-flash, qwen3.7-plus（云端优先，保留思考） |
+| router_context_projection | 16000 | MiMo-V2.5, gpt-5.6-luna, deepseek-v4-flash, qwen3.7-plus（权威文件变化时生成派生投影） |
+| live | 32000 | MiMo-V2.5-Pro, gpt-5.6-terra, MiMo-V2.5, grok-4.5, gpt-5.6-sol, claude-sonnet-5 |
+
+生成型任务的 `tokens` 同时覆盖隐式思考与最终正文；Router 因此不再使用 200 token 的紧缩上限。上下文压缩触发线是输入窗口策略，与输出思考预算分开配置。
 
 ---
 
@@ -183,7 +189,11 @@ class PolicySession(Protocol):
 | `LoadBalancedPolicy` | 评分选最优，失败施加惩罚 | 多模型任务（core/expression） |
 | `RoundRobinPolicy` | 轮转 | 均匀分散 |
 
-### 4.3 LoadBalancedPolicy 评分算法
+### 4.3 FailoverPolicy 冷却与恢复
+
+可恢复的网络错误、超时、限流与 HTTP 5xx 会按 `request_name + provider + endpoint + model` 进入跨请求冷却。首次冷却为 30 秒，连续失败按 30/60/120/240/300 秒渐进退避，成功探测后立即清零。这使本地中转站的短暂 503 不会造成五分钟假宕机，又不会在上游持续故障时高频重试。鉴权、配置等永久错误不进入冷却，每次请求都会明确暴露。
+
+### 4.4 LoadBalancedPolicy 评分算法
 
 ```
 score = total_tokens
@@ -200,7 +210,7 @@ score = total_tokens
 
 评分最低者被选中。无统计数据的模型获得最高优先级（评分 0）。
 
-### 4.4 失败惩罚机制
+### 4.5 失败惩罚机制
 
 | 错误类型 | 惩罚倍率 |
 | --- | --- |

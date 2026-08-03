@@ -590,6 +590,32 @@ max_tokens = 1000
             # 恢复原状态
             model_config_module._global_model_config = original_config
 
+    def test_legacy_loader_refuses_compact_registry_without_rewriting(
+        self, temp_dir: Path
+    ):
+        """The legacy auto-updater must not destroy compact models.toml."""
+
+        config_file = temp_dir / "models.toml"
+        original = """
+[providers.gateway]
+base_url = "http://localhost:3000/v1"
+api_key = "test"
+
+[models.router]
+provider = "gateway"
+id = "router"
+
+[tasks.router]
+models = ["router"]
+tokens = 8192
+""".lstrip()
+        config_file.write_text(original, encoding="utf-8")
+
+        with pytest.raises(ValueError, match="compact model registry schema"):
+            init_model_config(str(config_file))
+
+        assert config_file.read_text(encoding="utf-8") == original
+
     def test_init_model_config_preserves_custom_task_and_backfills_builtin(
         self, temp_dir: Path
     ):
