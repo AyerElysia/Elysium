@@ -25,6 +25,30 @@ class _PreparedCall:
     execution: LLMUsableExecution | None = None
     exec_success: bool = False
     result_text: str = ""
+    technical_outcome: str = ""
+
+
+class ToolCallExecutionResult(tuple[bool, bool]):
+    """Backward-compatible two-item result with technical delivery metadata."""
+
+    def __new__(
+        cls,
+        appended: bool,
+        success: bool,
+        *,
+        technical_outcome: str = "",
+    ) -> "ToolCallExecutionResult":
+        instance = super().__new__(cls, (bool(appended), bool(success)))
+        instance.technical_outcome = str(technical_outcome or "")
+        return instance
+
+    @property
+    def appended(self) -> bool:
+        return bool(self[0])
+
+    @property
+    def success(self) -> bool:
+        return bool(self[1])
 
 
 def _normalize_execute_result(value: Any) -> tuple[bool, Any]:
@@ -257,7 +281,7 @@ async def run_tool_call(
     resolve_component_plugin: Callable[[str | None], "BasePlugin"] | None = None,
     logger_name: str = "chatter",
     display_name: str = "",
-) -> list[tuple[bool, bool]]:
+) -> list[ToolCallExecutionResult]:
     """执行一次 LLM 响应中的全部普通 tool calls。
 
     函数会先按调用顺序完成实例化，再统一调度执行。结果始终按原始
@@ -329,6 +353,9 @@ async def run_tool_call(
                     raise item.execution.exception
                 success, result = _normalize_execute_result(item.execution.result)
                 item.exec_success = success
+                item.technical_outcome = str(
+                    getattr(result, "technical_outcome", "") or ""
+                )
                 item.result_text = str(result) if success else f"执行失败: {result}"
             except Exception as exc:
                 item.result_text = f"执行异常: {exc}"
@@ -345,4 +372,11 @@ async def run_tool_call(
             )
         )
 
-    return [(True, item.exec_success) for item in prepared]
+    return [
+        ToolCallExecutionResult(
+            True,
+            item.exec_success,
+            technical_outcome=item.technical_outcome,
+        )
+        for item in prepared
+    ]

@@ -23,6 +23,7 @@ from plugins.life_engine.tools.file_tools import LifeEngineRunAgentTool, LifeEng
 from src.core.components.base.chatter import BaseChatter, Failure, Success, Wait
 from src.core.models.media import MediaAttachment
 from src.core.models.message import Message, MessageType
+from src.core.utils.llm_tool_call import ToolCallExecutionResult
 from src.kernel.llm import Image, LLMContextManager, LLMPayload, ROLE, Text, ToolResult
 import pytest
 
@@ -1306,6 +1307,85 @@ async def test_life_chatter_visible_reply_ends_turn(monkeypatch) -> None:
     assert isinstance(result, Wait)
     assert rt.phase == _Phase.WAIT_USER
     assert rt.sent_visible_reply is True
+    assert rt.must_reply is False
+    assert rt.follow_up_rounds == 0
+
+    LifeChatter.reset_global_runtime()
+
+
+async def test_life_chatter_delivery_unknown_ends_turn_without_retry(
+    monkeypatch,
+) -> None:
+    """Uncertain external delivery must not trigger another visible action."""
+
+    LifeChatter.reset_global_runtime()
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.payloads = []
+            self.call_list = [
+                SimpleNamespace(
+                    id="send-unknown",
+                    name="action-life_send_text",
+                    args={"content": "这条消息的回执超时"},
+                )
+            ]
+            self.message = ""
+
+        def add_payload(self, payload) -> None:
+            self.payloads.append(payload)
+
+    response = FakeResponse()
+    rt = _WorkflowRuntime(
+        response=response,
+        phase=_Phase.TOOL_EXEC,
+        history_merged=True,
+        unreads=[],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[],
+        active_stream_id="stream-a",
+        must_reply=True,
+    )
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=None)
+    chatter.stream_id = "stream-a"
+    send_attempts = 0
+
+    async def fake_fetch_unreads():
+        return [], []
+
+    async def fake_run_tool_call(*_args, **_kwargs):
+        nonlocal send_attempts
+        send_attempts += 1
+        return [
+            ToolCallExecutionResult(
+                True,
+                False,
+                technical_outcome="delivery_unknown",
+            )
+        ]
+
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+    monkeypatch.setattr(chatter, "run_tool_call", fake_run_tool_call)
+    monkeypatch.setattr(chatter, "_maybe_compact_runtime_context", lambda _response: None)
+    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
+    monkeypatch.setattr(
+        "src.kernel.concurrency.get_watchdog",
+        lambda: SimpleNamespace(feed_dog=lambda _stream_id: None),
+    )
+
+    result = await chatter._drive_global_runtime_until_yield(
+        SimpleNamespace(stream_id="stream-a"),
+        service=None,
+    )
+
+    assert isinstance(result, Wait)
+    assert send_attempts == 1
+    assert rt.phase == _Phase.WAIT_USER
+    assert rt.sent_visible_reply is False
     assert rt.must_reply is False
     assert rt.follow_up_rounds == 0
 

@@ -191,7 +191,11 @@ class PolicySession(Protocol):
 
 ### 4.3 FailoverPolicy 冷却与恢复
 
-可恢复的网络错误、超时、限流与 HTTP 5xx 会按 `request_name + provider + endpoint + model` 进入跨请求冷却。首次冷却为 30 秒，连续失败按 30/60/120/240/300 秒渐进退避，成功探测后立即清零。这使本地中转站的短暂 503 不会造成五分钟假宕机，又不会在上游持续故障时高频重试。鉴权、配置等永久错误不进入冷却，每次请求都会明确暴露。
+可恢复的网络错误、超时、限流与普通 HTTP 5xx 会按 `request_name + provider + endpoint + model` 进入跨请求冷却。首次冷却为 30 秒，连续失败按 30/60/120/240/300 秒渐进退避，成功探测后立即清零。这使本地中转站的短暂 503 不会造成五分钟假宕机，又不会在上游持续故障时高频重试。鉴权、配置等永久错误不进入冷却，每次请求都会明确暴露。
+
+本地 New API 返回结构化错误码 `system_cpu_overloaded`、`system_memory_overloaded` 或 `system_disk_overloaded` 时，故障范围是整个 `provider + endpoint`，不是某个模型。策略会对该网关建立跨 `request_name` 冷却，跳过所有仍指向同一中转端点的候选；只有配置了不同端点时才继续故障转移。原始状态码和错误码继续向上保留，周期任务据此延迟重试，不把暂时过载伪装成空结果。
+
+开发测试与运行系统可能共处同一台 WSL 主机。默认 pytest worker 固定为 2，避免 `-n auto` 占满全部 CPU 并触发 New API 的资源保护；独立 CI 如需更高并行度可以在命令行显式覆盖。
 
 ### 4.4 LoadBalancedPolicy 评分算法
 

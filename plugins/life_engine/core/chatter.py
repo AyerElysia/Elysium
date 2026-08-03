@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Annotated, Any, AsyncGenerator, Awaitable, Typ
 
 from src.app.plugin_system.base import BaseAction, BaseChatter, BaseTool, Failure, Stop, Success, Wait
 from src.app.plugin_system.types import ChatType
+from src.core.components.base.action import ActionResultDetail
 from src.core.config import get_core_config
 from src.core.models.message import Message, MessageType
 from src.kernel.llm import (
@@ -451,7 +452,11 @@ class LifeSendTextAction(BaseAction):
         )
         message.extra.update(extra)
 
-        return await get_message_sender().send_message(message)
+        success = await get_message_sender().send_message(message)
+        self._last_delivery_status = str(
+            message.extra.get("delivery_status") or ""
+        )
+        return success
 
     async def _send_one_segment(
         self,
@@ -532,7 +537,11 @@ class LifeSendTextAction(BaseAction):
             from src.core.transport.message_send import get_message_sender
 
             sender = get_message_sender()
-            return await sender.send_message(message)
+            success = await sender.send_message(message)
+            self._last_delivery_status = str(
+                message.extra.get("delivery_status") or ""
+            )
+            return success
 
         if self._action_origin_extra():
             return await BaseAction._send_to_stream(
@@ -561,6 +570,7 @@ class LifeSendTextAction(BaseAction):
             "才填写列表里的 target_key，禁止凭空编写。",
         ] = "",
     ) -> tuple[bool, str]:
+        self._last_delivery_status = ""
         segments = self._normalize_content_segments(content)
         cleaned_segments = [self._sanitize_segment(s) for s in segments]
         cleaned_segments = [s for s in cleaned_segments if s]
@@ -601,6 +611,11 @@ class LifeSendTextAction(BaseAction):
                 segment_index=index,
             )
             if not success:
+                if self._last_delivery_status == "unknown":
+                    return False, ActionResultDetail(
+                        f"第{index + 1}条消息投递状态未知；为避免重复，系统不会自动重发",
+                        technical_outcome="delivery_unknown",
+                    )
                 return False, f"第{index + 1}条消息发送失败"
             sent_count += 1
 
@@ -4142,7 +4157,7 @@ class LifeChatter(BaseChatter):
             and isinstance(raw_results[0], bool)
             and isinstance(raw_results[1], bool)
         ):
-            return [(raw_results[0], raw_results[1])]
+            return [raw_results]
         if isinstance(raw_results, list):
             return raw_results
         return []
@@ -4663,7 +4678,8 @@ class LifeChatter(BaseChatter):
                     stream_id,
                 )
                 claimed_autonomy_actions: set[str] = set()
-                if trigger_msg is not None and autonomy_occurrences:
+                delivery_unknown_action = False
+                if trigger_msg is not None:
                     trigger_msg.extra["life_turn_scope"] = {
                         "stream_id": stream_id,
                         "turn_key": rt.active_unread_turn_key,
@@ -4672,9 +4688,13 @@ class LifeChatter(BaseChatter):
 
                 async def handle_tool_execution_result(
                     executed_call: Any,
-                    appended: bool,
-                    success: bool,
+                    execution_result: tuple[bool, bool],
                 ) -> None:
+                    nonlocal delivery_unknown_action
+                    _, success = execution_result
+                    technical_outcome = str(
+                        getattr(execution_result, "technical_outcome", "") or ""
+                    )
                     executed_name = str(getattr(executed_call, "name", "") or "")
                     action_id = str(getattr(executed_call, "id", "") or "")
                     if (
@@ -4683,12 +4703,31 @@ class LifeChatter(BaseChatter):
                         and action_id in claimed_autonomy_actions
                         and self._is_visible_reply_action(executed_name)
                     ):
+                        occurrence_outcome = (
+                            "sent"
+                            if success
+                            else (
+                                "delivery_unknown"
+                                if technical_outcome == "delivery_unknown"
+                                else "failed"
+                            )
+                        )
                         await service.complete_autonomy_occurrences(
                             autonomy_occurrences,
-                            outcome="sent" if success else "delivery_unknown",
+                            outcome=occurrence_outcome,
                             action_id=action_id,
-                            detail="" if success else "visible action did not confirm delivery",
+                            detail=(
+                                ""
+                                if success
+                                else "visible action did not confirm delivery"
+                            ),
                         )
+                    if (
+                        technical_outcome == "delivery_unknown"
+                        and self._is_visible_reply_action(executed_name)
+                    ):
+                        delivery_unknown_action = True
+                        rt.must_reply = False
                     if success and self._is_visible_reply_action(executed_name):
                         reply_entry = self._visible_text_reply_cache_entry(
                             executed_call,
@@ -4721,12 +4760,15 @@ class LifeChatter(BaseChatter):
                         raw_results,
                         len(current_calls),
                     )
-                    for executed_call, (appended, success) in zip(
+                    for executed_call, execution_result in zip(
                         current_calls,
                         results,
                         strict=False,
                     ):
-                        await handle_tool_execution_result(executed_call, appended, success)
+                        await handle_tool_execution_result(
+                            executed_call,
+                            execution_result,
+                        )
 
                 for call in call_list:
                     get_watchdog().feed_dog(self.stream_id)
@@ -4737,6 +4779,26 @@ class LifeChatter(BaseChatter):
                     logger.debug(
                         f"LLM 调用 {call_name}，原因: {reason}，参数: {log_args}"
                     )
+
+                    if (
+                        delivery_unknown_action
+                        and self._is_visible_reply_action(str(call_name or ""))
+                    ):
+                        await flush_parallel_calls()
+                        llm_response.add_payload(
+                            LLMPayload(
+                                ROLE.TOOL_RESULT,
+                                ToolResult(
+                                    value=(
+                                        "本轮已有消息投递状态未知；为避免重复发送，"
+                                        "已阻止后续可见动作"
+                                    ),
+                                    call_id=call.id,
+                                    name=call_name,
+                                ),
+                            )
+                        )
+                        continue
 
                     # 去重
                     dedupe_args = log_args
@@ -4874,8 +4936,10 @@ class LifeChatter(BaseChatter):
                         trigger_msg,
                     )
                     result_list = self._normalize_tool_execution_results(raw_results, 1)
-                    appended, success = result_list[0] if result_list else (False, False)
-                    await handle_tool_execution_result(call, appended, success)
+                    execution_result = (
+                        result_list[0] if result_list else (False, False)
+                    )
+                    await handle_tool_execution_result(call, execution_result)
 
                 await flush_parallel_calls()
 
@@ -4884,6 +4948,20 @@ class LifeChatter(BaseChatter):
                     if self._has_tool_result_tail(llm_response):
                         llm_response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
                     self._transition(rt, _Phase.WAIT_USER, "pass_and_wait")
+                    self._maybe_compact_runtime_context(llm_response)
+                    await self._save_rolling_context_snapshot(llm_response)
+                    return Wait()
+
+                if delivery_unknown_action:
+                    if self._has_tool_result_tail(llm_response):
+                        llm_response.add_payload(
+                            LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT))
+                        )
+                    self._transition(
+                        rt,
+                        _Phase.WAIT_USER,
+                        "visible action delivery unknown",
+                    )
                     self._maybe_compact_runtime_context(llm_response)
                     await self._save_rolling_context_snapshot(llm_response)
                     return Wait()

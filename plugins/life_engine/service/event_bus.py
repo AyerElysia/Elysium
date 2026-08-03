@@ -19,6 +19,8 @@ from enum import Enum, IntEnum
 from pathlib import Path
 from typing import Any, ClassVar
 
+from src.kernel.sync.local_store import create_local_sync_schema, enqueue_in_transaction
+
 from .event_builder import EventType, LifeEngineEvent
 
 RAW_EVENT_LOG_FILE = "life_events.jsonl"
@@ -574,6 +576,7 @@ class RawEventStore(_LegacyJSONLEventStore):
             END;
             """
         )
+        create_local_sync_schema(db)
 
     @staticmethod
     def _canonical_payload(event: LifeEvent) -> dict[str, Any]:
@@ -676,6 +679,31 @@ class RawEventStore(_LegacyJSONLEventStore):
             raise RuntimeError(f"RawEventInsertLost:{occurrence_id}")
         if str(row["payload_hash"]) != payload_hash:
             raise ValueError(f"RawEventOccurrenceConflict:{occurrence_id}")
+        if inserted:
+            metadata = normalized.metadata if isinstance(normalized.metadata, dict) else {}
+            enqueue_in_transaction(
+                db,
+                event_id=occurrence_id,
+                occurred_at=normalized.timestamp,
+                recorded_at=str(row["recorded_at"]),
+                event_type=normalized.event_type,
+                payload=payload,
+                actor_id=str(
+                    metadata.get("actor_id")
+                    or metadata.get("user_id")
+                    or normalized.source
+                    or ""
+                ),
+                consciousness_instance_id=str(
+                    normalized.source_instance_id
+                    or metadata.get("consciousness_instance_id")
+                    or ""
+                ),
+                visibility=str(metadata.get("visibility") or "private"),
+                causation_id=normalized.causation_id,
+                correlation_id=normalized.correlation_id,
+                export_requested=metadata.get("sync_export") is True,
+            )
         return replace(
             normalized,
             sequence=int(row["ingest_position"]),

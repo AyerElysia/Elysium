@@ -94,5 +94,5 @@ Core SQLAlchemy 已支持 MySQL 8，现有 Core SQLite 数据已迁移到远端�
 
 - 当前账号不能读取 binlog 位点，秒级本地增量归档尚未启用；目前已具备可自动调度的事务一致性全量快照；
 - 运行实例仍使用 SQLite，最终配置切换需要用户批准的人工停写窗口；
-- 远端不可用时的完整 Core 离线写入与双向同步属于后续 Outbox/Inbox 阶段；
-- 前端应用表、API 契约和 Life Event 跨节点复制不在本次 Core MySQL 基座提交内。
+- 远端不可用时的完整 Core 关系数据离线写入仍未实现；Life Event 的 Outbox/Inbox 阶段已于同日后续完成，见 [阶段二验证报告](./offline-sync-phase2-validation-2026-08-03.md)；
+- 前端应用表和 API 契约仍不在本次 Core MySQL 基座提交内；Life Event 跨节点复制已由阶段二交付。

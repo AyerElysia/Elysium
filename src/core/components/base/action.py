@@ -21,6 +21,20 @@ if TYPE_CHECKING:
     from src.kernel.llm.payload.tooling import LLMUsable
 
 
+class ActionResultDetail(str):
+    """Human-readable action result carrying an optional technical outcome."""
+
+    def __new__(
+        cls,
+        value: str,
+        *,
+        technical_outcome: str = "",
+    ) -> "ActionResultDetail":
+        instance = super().__new__(cls, value)
+        instance.technical_outcome = str(technical_outcome or "")
+        return instance
+
+
 class BaseAction(ABC, LLMUsable):
     """动作组件基类。
 
@@ -77,6 +91,7 @@ class BaseAction(ABC, LLMUsable):
         self._last_message: str | None = None
         self._trigger_message: Message | None = None
         self._tool_call_id: str = ""
+        self._last_delivery_status: str = ""
 
     def _action_origin_extra(self) -> dict[str, Any]:
         """Return trace metadata bound by the current chatter turn."""
@@ -86,14 +101,14 @@ class BaseAction(ABC, LLMUsable):
         if not isinstance(scope, dict):
             return {}
         occurrences = scope.get("autonomy_occurrences")
-        if not isinstance(occurrences, list) or not occurrences:
-            return {}
-        return {
+        origin: dict[str, Any] = {
             "origin_turn_key": str(scope.get("turn_key") or ""),
             "origin_stream_id": str(scope.get("stream_id") or ""),
-            "autonomy_occurrences": occurrences,
             "tool_call_id": self._tool_call_id,
         }
+        if isinstance(occurrences, list) and occurrences:
+            origin["autonomy_occurrences"] = occurrences
+        return origin
 
     def _action_message_id(self, target_stream_id: str, segment_index: int = 0) -> str:
         """Build a stable idempotency key for autonomy-originated side effects."""
@@ -575,7 +590,11 @@ class BaseAction(ABC, LLMUsable):
 
             # 获取 MessageSender 并发送消息
             sender = get_message_sender()
-            return await sender.send_message(message)
+            success = await sender.send_message(message)
+            self._last_delivery_status = str(
+                message.extra.get("delivery_status") or ""
+            )
+            return success
 
         except Exception as e:
             from src.kernel.logger import get_logger

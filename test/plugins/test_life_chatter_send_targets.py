@@ -3,8 +3,6 @@ from __future__ import annotations
 import time
 from types import SimpleNamespace
 
-import pytest
-
 from plugins.life_engine.core.chatter import LifeSendTextAction
 from plugins.life_engine.core.send_targets import (
     format_send_targets_for_prompt,
@@ -206,3 +204,59 @@ async def test_life_send_text_rejects_invalid_target_key_and_cross_reply(monkeyp
     ok, result = await action.execute("你好", reply_to="msg1", target_key="g-missing")
     assert ok is False
     assert "不能同时使用 reply_to" in result
+
+
+async def test_life_send_text_surfaces_delivery_unknown_as_technical_outcome(
+    monkeypatch,
+) -> None:
+    now = time.time()
+    current_stream = ChatStream(stream_id="1" * 64, platform="qq", chat_type="private")
+    target_stream = SimpleNamespace(
+        stream_id="d" * 64,
+        platform="qq",
+        chat_type="group",
+        stream_name="始源之地",
+        last_active_time=now,
+    )
+    _install_fake_streams(
+        monkeypatch,
+        [target_stream],
+        {
+            target_stream.stream_id: {
+                "stream_id": target_stream.stream_id,
+                "platform": "qq",
+                "chat_type": "group",
+                "group_id": "100",
+                "group_name": "始源之地",
+                "last_active_time": now,
+            }
+        },
+    )
+
+    class _AdapterManager:
+        async def get_bot_info_by_platform(self, _platform: str):
+            return {"bot_id": "bot", "bot_name": "爱莉"}
+
+    class _UnknownSender:
+        async def send_message(self, message):
+            message.extra["delivery_status"] = "unknown"
+            return False
+
+    monkeypatch.setattr(
+        "src.core.managers.adapter_manager.get_adapter_manager",
+        lambda: _AdapterManager(),
+    )
+    monkeypatch.setattr(
+        "src.core.transport.message_send.get_message_sender",
+        lambda: _UnknownSender(),
+    )
+    action = LifeSendTextAction(
+        current_stream,
+        SimpleNamespace(config=SimpleNamespace(runtime_sync=_runtime_cfg())),
+    )
+
+    ok, result = await action.execute("你好", target_key="g-dddddddd")
+
+    assert ok is False
+    assert "不会自动重发" in result
+    assert result.technical_outcome == "delivery_unknown"

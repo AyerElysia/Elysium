@@ -219,10 +219,12 @@ async def test_send_timeout_suppresses_only_matching_immediate_retry(
     )
 
     assert await sender.send_message(first, adapter_signature="mock:adapter:feishu") is False
-    assert await sender.send_message(retry, adapter_signature="mock:adapter:feishu") is True
+    assert await sender.send_message(retry, adapter_signature="mock:adapter:feishu") is False
 
     adapter._send_platform_message.assert_awaited_once()
     stream_manager.add_sent_message_to_history.assert_not_awaited()
+    assert first.extra["delivery_status"] == "unknown"
+    assert retry.extra["delivery_status"] == "unknown"
     assert [args.args[0] for args in event_manager.publish_event.await_args_list] == [
         EventType.ON_MESSAGE_SENT,
         EventType.ON_MESSAGE_SENT,
@@ -295,7 +297,7 @@ async def test_timeout_fingerprint_keeps_media_and_target_identity(
     assert await sender.send_message(
         same_media_retry,
         adapter_signature="mock:adapter:feishu",
-    ) is True
+    ) is False
     assert await sender.send_message(
         different_target,
         adapter_signature="mock:adapter:feishu",
@@ -345,6 +347,48 @@ async def test_non_timeout_failure_does_not_suppress_retry(
 
     assert adapter._send_platform_message.await_count == 2
     stream_manager.add_sent_message_to_history.assert_awaited_once_with(retry)
+
+
+async def test_unknown_delivery_suppression_does_not_cross_turn_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sender = MessageSender()
+    adapter = SimpleNamespace(
+        get_bot_info=AsyncMock(return_value={}),
+        _send_platform_message=AsyncMock(
+            side_effect=[TimeoutError("read timed out"), None]
+        ),
+    )
+    sender.set_adapter_manager(SimpleNamespace(get_adapter=lambda _sig: adapter))
+    sender._converter = SimpleNamespace(  # type: ignore[assignment]
+        message_to_envelope=AsyncMock(
+            return_value=_envelope(
+                platform="qq",
+                target_user_id="user-123",
+                segments=[{"type": "text", "data": "same payload"}],
+            )
+        )
+    )
+    stream_manager = _make_stream_manager()
+    _patch_stream_manager(monkeypatch, stream_manager)
+    _patch_event_manager(
+        monkeypatch,
+        SimpleNamespace(publish_event=AsyncMock(return_value={"params": {}})),
+    )
+
+    first = _message("turn-1-message", content="same payload")
+    first.extra["origin_turn_key"] = "turn-1"
+    later_turn = _message("turn-2-message", content="same payload")
+    later_turn.extra["origin_turn_key"] = "turn-2"
+
+    assert await sender.send_message(first, adapter_signature="mock:adapter:qq") is False
+    assert await sender.send_message(
+        later_turn,
+        adapter_signature="mock:adapter:qq",
+    ) is True
+
+    assert adapter._send_platform_message.await_count == 2
+    stream_manager.add_sent_message_to_history.assert_awaited_once_with(later_turn)
 
 
 async def test_send_and_delivery_events_wrap_adapter_and_history_persistence(

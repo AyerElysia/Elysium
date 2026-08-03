@@ -148,12 +148,13 @@ class MessageSender:
                 timeout_fingerprint
                 and self._has_unknown_delivery_fingerprint(timeout_fingerprint)
             ):
-                logger.warning(
-                    "检测到投递状态未知消息的短窗重试，已跳过: "
+                message.extra["delivery_status"] = "unknown"
+                logger.debug(
+                    "检测到投递状态未知消息的短窗重试，已阻止: "
                     f"message_id={message.message_id}, platform={message.platform}, "
                     f"stream_id={message.stream_id}"
                 )
-                return True
+                return False
 
             # 7. 调用开始后的超时无法判断平台是否已收到消息。
             adapter_send_started = True
@@ -188,26 +189,29 @@ class MessageSender:
             logger.error(f"消息格式错误: {e}")
             return False
         except Exception as e:
-            logger.error(
-                f"发送消息失败: message_id={message.message_id}, error={e}",
-                exc_info=True,
-            )
             delivery_unknown = (
                 adapter_send_started
                 and not adapter_send_completed
                 and self._is_timeout_exception(e)
             )
-            if delivery_unknown and timeout_fingerprint:
-                self._remember_unknown_delivery_fingerprint(timeout_fingerprint)
+            if delivery_unknown:
+                message.extra["delivery_status"] = "unknown"
+                if timeout_fingerprint:
+                    self._remember_unknown_delivery_fingerprint(timeout_fingerprint)
                 logger.warning(
-                    "平台发送超时，投递状态未知；保留短窗指纹以抑制立即重复发送: "
-                    f"message_id={message.message_id}"
+                    "平台消息发送回执超时，投递状态未知，已停止自动重发: "
+                    f"message_id={message.message_id}, platform={message.platform}, "
+                    f"stream_id={message.stream_id}"
                 )
-            elif delivery_unknown:
-                logger.warning(
-                    "平台发送超时，投递状态未知；无法构造安全指纹，不抑制重试: "
-                    f"message_id={message.message_id}"
+                logger.debug(
+                    f"投递状态未知详情: message_id={message.message_id}, error={e}",
+                    exc_info=True,
                 )
+                return False
+            logger.error(
+                f"发送消息失败: message_id={message.message_id}, error={e}",
+                exc_info=True,
+            )
             return False
 
     @staticmethod
@@ -291,6 +295,9 @@ class MessageSender:
                 "chat_type": str(getattr(message, "chat_type", "") or ""),
                 "target": target,
                 "reply_to": str(getattr(message, "reply_to", "") or ""),
+                # Scope unknown-delivery suppression to one originating turn
+                # when the action pipeline can provide that causal identity.
+                "origin_turn_key": str(extra.get("origin_turn_key") or ""),
                 "message_type": str(
                     getattr(
                         getattr(message, "message_type", ""),
