@@ -9,6 +9,7 @@ let Seed-VC keep its dedicated Windows Python environment.
 from __future__ import annotations
 
 import argparse
+import gc
 import importlib.util
 import json
 import math
@@ -18,7 +19,9 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -35,6 +38,10 @@ from plugins.voice_live.seedvc_profile import (
     build_profile_manifest,
     validate_runtime_settings,
 )
+from plugins.voice_live.seedvc_residency import (
+    OnDemandResource,
+    ResourceLease,
+)
 
 os.environ.setdefault("OMP_NUM_THREADS", "4")
 os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
@@ -43,6 +50,7 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 import librosa
 import numpy as np
 import torch
+import yaml
 from scipy.signal import resample_poly
 from torch.nn import functional
 
@@ -74,6 +82,21 @@ def _resample_exact(
 def _pcm16(samples: np.ndarray) -> bytes:
     finite = np.nan_to_num(samples, nan=0.0, posinf=1.0, neginf=-1.0)
     return np.round(np.clip(finite, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+
+
+def _read_model_sample_rate(config_path: Path) -> int:
+    """Read the expected output rate without loading CUDA model weights."""
+
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    try:
+        sample_rate = int(payload["preprocess_params"]["sr"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Seed-VC preset does not declare preprocess_params.sr: {config_path}"
+        ) from exc
+    if sample_rate <= 0:
+        raise ValueError("Seed-VC output sample rate must be positive")
+    return sample_rate
 
 
 class SeedVCStream:
@@ -330,8 +353,28 @@ def _read_token_file(configured_path: str) -> str:
     return value
 
 
+@dataclass(slots=True)
+class _LoadedSeedVC:
+    realtime: Any
+    model_set: Any
+    output_sample_rate: int
+    warmup_ms: float = 0.0
+
+
+@dataclass(slots=True)
+class _RuntimeSession:
+    stream: SeedVCStream
+    model_lease: ResourceLease[_LoadedSeedVC]
+
+
 class SeedVCRuntime:
-    """Own the CUDA model and the bounded set of active conversion streams."""
+    """Keep the service shell alive while CUDA weights follow Voice sessions."""
+
+    _CUDA_CACHE_NAMES = (
+        "prompt_condition",
+        "mel2",
+        "style2",
+    )
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -368,6 +411,7 @@ class SeedVCRuntime:
         self.checkpoint_path = Path(args.checkpoint).resolve()
         self.config_path = Path(args.config).resolve()
         self.reference_path = Path(args.reference).resolve()
+        self.output_sample_rate = _read_model_sample_rate(self.config_path)
         self.profile_manifest = build_profile_manifest(
             profile_id=args.profile_id,
             checkpoint_path=self.checkpoint_path,
@@ -378,31 +422,124 @@ class SeedVCRuntime:
         if str(self.seedvc_root) not in sys.path:
             sys.path.insert(0, str(self.seedvc_root))
         os.chdir(self.seedvc_root)
-        torch.manual_seed(args.seed)
-        torch.cuda.manual_seed_all(args.seed)
-        self.realtime = _load_realtime_module(self.seedvc_root, args.gpu)
-        self.model_set = self.realtime.load_models(
-            SimpleNamespace(
-                checkpoint_path=str(self.checkpoint_path),
-                config_path=str(self.config_path),
-                fp16=args.fp16,
-            )
-        )
         self.model_lock = threading.Lock()
         self.session_lock = threading.Lock()
-        self.sessions: dict[str, SeedVCStream] = {}
+        self.sessions: dict[str, _RuntimeSession] = {}
+        self._session_creating = False
+        self._realtime: Any | None = None
+        self._last_warmup_ms = 0.0
+        self._cuda_allocated_bytes = 0
+        self._cuda_reserved_bytes = 0
         self.inference_telemetry = InferenceTelemetry()
         self.started_at = time.time()
-        self.warmup_ms = self._warmup()
+        self._model_residency = OnDemandResource(
+            self._load_model,
+            self._unload_model,
+            name="Seed-VC CUDA model",
+        )
 
-    @property
-    def output_sample_rate(self) -> int:
-        return int(self.model_set[-1]["sampling_rate"])
+    def _load_model(self) -> _LoadedSeedVC:
+        """Load and warm one model generation for the first Voice session."""
 
-    def _new_stream(self, *, record_telemetry: bool = True) -> SeedVCStream:
+        torch.manual_seed(self.args.seed)
+        torch.cuda.manual_seed_all(self.args.seed)
+        if self._realtime is None:
+            self._realtime = _load_realtime_module(
+                self.seedvc_root,
+                self.args.gpu,
+            )
+        model_set: Any | None = None
+        loaded: _LoadedSeedVC | None = None
+        try:
+            model_set = self._realtime.load_models(
+                SimpleNamespace(
+                    checkpoint_path=str(self.checkpoint_path),
+                    config_path=str(self.config_path),
+                    fp16=self.args.fp16,
+                )
+            )
+            actual_sample_rate = int(model_set[-1]["sampling_rate"])
+            if actual_sample_rate != self.output_sample_rate:
+                raise RuntimeError(
+                    "Seed-VC preset/model sample-rate mismatch: "
+                    f"expected {self.output_sample_rate}, got {actual_sample_rate}"
+                )
+            self.inference_telemetry = InferenceTelemetry()
+            loaded = _LoadedSeedVC(
+                realtime=self._realtime,
+                model_set=model_set,
+                output_sample_rate=actual_sample_rate,
+            )
+            loaded.warmup_ms = self._warmup(loaded)
+            self._last_warmup_ms = loaded.warmup_ms
+            self._capture_cuda_usage()
+            return loaded
+        except Exception:
+            if loaded is None and model_set is not None:
+                loaded = _LoadedSeedVC(
+                    realtime=self._realtime,
+                    model_set=model_set,
+                    output_sample_rate=self.output_sample_rate,
+                )
+            if loaded is not None:
+                self._unload_model(loaded)
+            else:
+                self._clear_realtime_caches()
+                self._release_cuda_cache()
+            raise
+
+    def _unload_model(self, loaded: _LoadedSeedVC) -> None:
+        """Drop all owned CUDA references after sessions and requests drain."""
+
+        with self.model_lock:
+            model_set = loaded.model_set
+            loaded.model_set = None
+            del model_set
+            self._clear_realtime_caches()
+            self._release_cuda_cache()
+
+    def _clear_realtime_caches(self) -> None:
+        realtime = self._realtime
+        if realtime is None:
+            return
+        for name in self._CUDA_CACHE_NAMES:
+            if hasattr(realtime, name):
+                setattr(realtime, name, None)
+        if hasattr(realtime, "reference_wav_name"):
+            realtime.reference_wav_name = None
+
+    def _release_cuda_cache(self) -> None:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(device=self.args.gpu)
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except (OSError, RuntimeError):
+                pass
+        self._capture_cuda_usage()
+
+    def _capture_cuda_usage(self) -> None:
+        if not torch.cuda.is_available():
+            self._cuda_allocated_bytes = 0
+            self._cuda_reserved_bytes = 0
+            return
+        self._cuda_allocated_bytes = int(
+            torch.cuda.memory_allocated(device=self.args.gpu)
+        )
+        self._cuda_reserved_bytes = int(
+            torch.cuda.memory_reserved(device=self.args.gpu)
+        )
+
+    def _new_stream(
+        self,
+        loaded: _LoadedSeedVC,
+        *,
+        record_telemetry: bool = True,
+    ) -> SeedVCStream:
         return SeedVCStream(
-            self.realtime,
-            self.model_set,
+            loaded.realtime,
+            loaded.model_set,
             self.reference_path,
             input_sample_rate=self.args.input_sample_rate,
             block_time=self.args.block_time,
@@ -420,8 +557,8 @@ class SeedVCRuntime:
             ),
         )
 
-    def _warmup(self) -> float:
-        stream = self._new_stream(record_telemetry=False)
+    def _warmup(self, loaded: _LoadedSeedVC) -> float:
+        stream = self._new_stream(loaded, record_telemetry=False)
         count = stream.input_block_frame
         source_length = round(
             count * stream.model_sample_rate / stream.input_sample_rate
@@ -433,29 +570,68 @@ class SeedVCRuntime:
         started = time.perf_counter()
         with self.model_lock:
             stream._convert_block(warm)
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(device=self.args.gpu)
         return round((time.perf_counter() - started) * 1000.0, 3)
 
     def create_session(self, profile_id: str) -> tuple[str, SeedVCStream]:
         if profile_id != self.args.profile_id:
             raise ValueError(f"unknown voice profile: {profile_id}")
         with self.session_lock:
-            if self.sessions:
+            if self.sessions or self._session_creating:
                 raise RuntimeError("Seed-VC stream capacity reached")
+            self._session_creating = True
+
+        lease: ResourceLease[_LoadedSeedVC] | None = None
+        try:
+            lease = self._model_residency.acquire()
+            loaded = lease.value
             torch.manual_seed(self.args.seed)
             torch.cuda.manual_seed_all(self.args.seed)
             session_id = uuid.uuid4().hex[:16]
-            stream = self._new_stream()
-            self.sessions[session_id] = stream
+            stream = self._new_stream(loaded)
+            with self.session_lock:
+                self.sessions[session_id] = _RuntimeSession(
+                    stream=stream,
+                    model_lease=lease,
+                )
+                self._session_creating = False
             return session_id, stream
+        except Exception:
+            with self.session_lock:
+                self._session_creating = False
+            if lease is not None:
+                lease.close()
+            raise
+
+    @contextmanager
+    def session_operation(self, session_id: str) -> Iterator[SeedVCStream]:
+        """Lease the model across one bounded operation, including deletion races."""
+
+        with self.session_lock:
+            entry = self.sessions.get(session_id)
+            if entry is None:
+                raise KeyError(f"unknown Seed-VC session: {session_id}")
+            operation_lease = self._model_residency.acquire()
+            stream = entry.stream
+        del entry
+        try:
+            with self.model_lock:
+                yield stream
+        finally:
+            del stream
+            operation_lease.close()
 
     def health_snapshot(self) -> dict[str, Any]:
-        """Return traceable profile identity and realtime capacity state."""
+        """Return profile, capacity and content-free model residency state."""
 
         block_time_ms = self.args.block_time * 1000.0
+        residency = self._model_residency.snapshot()
+        with self.session_lock:
+            active_sessions = len(self.sessions)
+            session_creating = self._session_creating
         return {
-            "status": "ok",
-            "protocol_version": 2,
+            "status": "ok" if residency.state != "failed" else "failed",
+            "protocol_version": 3,
             "profile_id": self.args.profile_id,
             "profile_revision": self.profile_manifest["revision"],
             "asset_fingerprints": self.profile_manifest["assets"],
@@ -469,25 +645,41 @@ class SeedVCRuntime:
             "algorithmic_latency_floor_ms": round(
                 (2.0 * self.args.block_time + self.args.extra_time_right) * 1000.0
             ),
-            "warmup_ms": self.warmup_ms,
-            "active_sessions": len(self.sessions),
+            "warmup_ms": self._last_warmup_ms,
+            "active_sessions": active_sessions,
+            "session_creating": session_creating,
             "uptime_seconds": round(time.time() - self.started_at, 3),
-            "device": str(self.realtime.device),
+            "device": f"cuda:{self.args.gpu}",
+            "model_residency": {
+                **residency.as_dict(),
+                "policy": "voice_session_leases",
+                "cuda_allocated_bytes": self._cuda_allocated_bytes,
+                "cuda_reserved_bytes": self._cuda_reserved_bytes,
+            },
             "inference": self.inference_telemetry.snapshot(
                 block_time_ms=block_time_ms
             ),
         }
 
-    def get_session(self, session_id: str) -> SeedVCStream:
-        with self.session_lock:
-            stream = self.sessions.get(session_id)
-        if stream is None:
-            raise KeyError(f"unknown Seed-VC session: {session_id}")
-        return stream
-
     def delete_session(self, session_id: str) -> None:
         with self.session_lock:
-            self.sessions.pop(session_id, None)
+            entry = self.sessions.pop(session_id, None)
+        if entry is None:
+            return
+        lease = entry.model_lease
+        del entry
+        lease.close()
+
+    def close(self) -> None:
+        """Release every owned session without touching unrelated processes."""
+
+        with self.session_lock:
+            entries = list(self.sessions.values())
+            self.sessions.clear()
+        leases = [entry.model_lease for entry in entries]
+        del entries
+        for lease in leases:
+            lease.close()
 
 
 class SeedVCHandler(BaseHTTPRequestHandler):
@@ -553,55 +745,77 @@ class SeedVCHandler(BaseHTTPRequestHandler):
             return
         path = urlsplit(self.path).path
         try:
+            if path == "/v1/auth-check":
+                self._read_body()
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "status": "authorized",
+                        "profile_id": self.runtime.args.profile_id,
+                        "profile_revision": self.runtime.profile_manifest["revision"],
+                    },
+                )
+                return
             if path == "/v1/sessions":
                 body = self._read_body()
                 data = json.loads(body or b"{}")
                 profile_id = str(data.get("profile_id") or "")
                 session_id, stream = self.runtime.create_session(profile_id)
-                self._send_json(
-                    HTTPStatus.CREATED,
-                    {
-                        "session_id": session_id,
-                        "profile_id": profile_id,
-                        "profile_revision": self.runtime.profile_manifest["revision"],
-                        "input_sample_rate": stream.input_sample_rate,
-                        "output_sample_rate": stream.model_sample_rate,
-                        "input_block_samples": stream.input_block_frame,
-                    },
-                )
+                try:
+                    self._send_json(
+                        HTTPStatus.CREATED,
+                        {
+                            "session_id": session_id,
+                            "profile_id": profile_id,
+                            "profile_revision": self.runtime.profile_manifest[
+                                "revision"
+                            ],
+                            "input_sample_rate": stream.input_sample_rate,
+                            "output_sample_rate": stream.model_sample_rate,
+                            "input_block_samples": stream.input_block_frame,
+                        },
+                    )
+                except OSError:
+                    # A client may time out during cold model activation. Its
+                    # undisclosed session must not pin the model in VRAM.
+                    del stream
+                    self.runtime.delete_session(session_id)
+                    return
                 return
             parts = [part for part in path.split("/") if part]
             if len(parts) != 4 or parts[:2] != ["v1", "sessions"]:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
             session_id, operation = parts[2], parts[3]
-            stream = self.runtime.get_session(session_id)
             if operation == "audio":
-                payload = self._read_body()
-                content_rate = int(
-                    self.headers.get(
-                        "X-Input-Sample-Rate", str(stream.input_sample_rate)
+                with self.runtime.session_operation(session_id) as stream:
+                    payload = self._read_body()
+                    content_rate = int(
+                        self.headers.get(
+                            "X-Input-Sample-Rate", str(stream.input_sample_rate)
+                        )
                     )
-                )
-                if content_rate != stream.input_sample_rate:
-                    raise ValueError(
-                        f"input sample rate must be {stream.input_sample_rate}, "
-                        f"got {content_rate}"
-                    )
-                with self.runtime.model_lock:
+                    if content_rate != stream.input_sample_rate:
+                        raise ValueError(
+                            f"input sample rate must be {stream.input_sample_rate}, "
+                            f"got {content_rate}"
+                        )
                     output, metrics = stream.push_pcm16(payload)
+                    del stream
                 self._send_audio(output, metrics)
                 return
             if operation == "flush":
-                self._read_body()
-                with self.runtime.model_lock:
+                with self.runtime.session_operation(session_id) as stream:
+                    self._read_body()
                     output, metrics = stream.flush()
+                    del stream
                 self._send_audio(output, metrics)
                 return
             if operation == "reset":
-                self._read_body()
-                with self.runtime.model_lock:
+                with self.runtime.session_operation(session_id) as stream:
+                    self._read_body()
                     stream.reset()
+                    del stream
                 self._send_json(HTTPStatus.OK, {"status": "reset"})
                 return
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -622,8 +836,11 @@ class SeedVCHandler(BaseHTTPRequestHandler):
         if len(parts) != 3 or parts[:2] != ["v1", "sessions"]:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             return
-        self.runtime.delete_session(parts[2])
-        self._send_json(HTTPStatus.OK, {"status": "deleted"})
+        try:
+            self.runtime.delete_session(parts[2])
+            self._send_json(HTTPStatus.OK, {"status": "deleted"})
+        except Exception as exc:  # noqa: BLE001 - authenticated lifecycle boundary
+            self._error(HTTPStatus.INTERNAL_SERVER_ERROR, exc)
 
 
 class SeedVCHTTPServer(ThreadingHTTPServer):
@@ -677,8 +894,8 @@ def main() -> None:
                 "profile_revision": runtime.profile_manifest["revision"],
                 "input_sample_rate": args.input_sample_rate,
                 "output_sample_rate": runtime.output_sample_rate,
-                "warmup_ms": runtime.warmup_ms,
-                "device": str(runtime.realtime.device),
+                "model_residency": runtime.health_snapshot()["model_residency"],
+                "device": f"cuda:{args.gpu}",
                 "diffusion_steps": args.diffusion_steps,
                 "block_time_ms": round(args.block_time * 1000),
                 "inference_cfg_rate": args.inference_cfg_rate,
@@ -695,6 +912,7 @@ def main() -> None:
         pass
     finally:
         server.server_close()
+        runtime.close()
 
 
 if __name__ == "__main__":

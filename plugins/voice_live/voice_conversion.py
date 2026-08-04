@@ -116,6 +116,7 @@ class HttpVoiceConverter:
         *,
         connect_timeout: float,
         request_timeout: float,
+        activation_timeout: float | None = None,
     ) -> None:
         if not service_url.strip():
             raise ValueError("voice-conversion service_url is required")
@@ -128,6 +129,9 @@ class HttpVoiceConverter:
         self._profile_id = profile_id
         self._connect_timeout = connect_timeout
         self._request_timeout = request_timeout
+        self._activation_timeout = (
+            connect_timeout if activation_timeout is None else activation_timeout
+        )
         self._http: aiohttp.ClientSession | None = None
         self._session_id = ""
         self._input_sample_rate = 0
@@ -157,12 +161,19 @@ class HttpVoiceConverter:
         if self.is_connected:
             raise RuntimeError("voice-conversion session is already connected")
         timeout = aiohttp.ClientTimeout(
-            total=self._connect_timeout,
+            total=self._request_timeout,
             connect=self._connect_timeout,
         )
         self._http = aiohttp.ClientSession(timeout=timeout)
         try:
-            async with self._http.get(f"{self._service_url}/health") as response:
+            health_timeout = aiohttp.ClientTimeout(
+                total=self._connect_timeout,
+                connect=self._connect_timeout,
+            )
+            async with self._http.get(
+                f"{self._service_url}/health",
+                timeout=health_timeout,
+            ) as response:
                 health = await self._json_response(response, expected_status=200)
             if health.get("status") != "ok":
                 raise RuntimeError(f"voice-conversion service is not ready: {health}")
@@ -183,6 +194,10 @@ class HttpVoiceConverter:
                 f"{self._service_url}/v1/sessions",
                 headers=self._headers,
                 json={"profile_id": self._profile_id},
+                timeout=aiohttp.ClientTimeout(
+                    total=self._activation_timeout,
+                    connect=self._connect_timeout,
+                ),
             ) as response:
                 created = await self._json_response(response, expected_status=201)
             self._session_id = str(created.get("session_id") or "")
@@ -375,6 +390,7 @@ def create_voice_converter(config: object) -> HttpVoiceConverter | None:
         section.profile_id,
         connect_timeout=section.connect_timeout_seconds,
         request_timeout=section.request_timeout_seconds,
+        activation_timeout=section.activation_timeout_seconds,
     )
 
 

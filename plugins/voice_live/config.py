@@ -145,6 +145,11 @@ class VoiceLiveConfig(BaseConfig):
             gt=0,
             description="变声服务连接与会话创建超时",
         )
+        activation_timeout_seconds: float = Field(
+            default=120.0,
+            gt=0,
+            description="SeedVC 首次 Voice 会话加载模型与预热的超时时间",
+        )
         request_timeout_seconds: float = Field(
             default=10.0,
             gt=0,

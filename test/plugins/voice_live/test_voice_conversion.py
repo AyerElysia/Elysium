@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -152,6 +153,50 @@ async def test_http_voice_converter_stream_contract_and_cleanup() -> None:
         await runner.cleanup()
 
     assert ("DELETE", "/v1/sessions/svc-1", b"") in observed
+
+
+@pytest.mark.asyncio
+async def test_voice_converter_uses_dedicated_cold_activation_timeout() -> None:
+    async def handler(request: web.Request) -> web.Response:
+        if request.path == "/health":
+            return web.json_response(
+                {
+                    "status": "ok",
+                    "protocol_version": 3,
+                    "profile_id": "elysia",
+                    "profile_revision": "profile-revision-1",
+                }
+            )
+        if request.method == "DELETE":
+            return web.json_response({"status": "deleted"})
+        await asyncio.sleep(0.08)
+        return web.json_response(
+            {
+                "session_id": "svc-cold",
+                "profile_id": "elysia",
+                "profile_revision": "profile-revision-1",
+                "input_sample_rate": 24000,
+                "output_sample_rate": 22050,
+                "input_block_samples": 5760,
+            },
+            status=201,
+        )
+
+    runner, url = await _start_server(handler)
+    converter = HttpVoiceConverter(
+        url,
+        "local-token",
+        "elysia",
+        connect_timeout=0.03,
+        request_timeout=0.03,
+        activation_timeout=0.5,
+    )
+    try:
+        result = await converter.connect()
+        assert result["session"]["session_id"] == "svc-cold"
+    finally:
+        await converter.close()
+        await runner.cleanup()
 
 
 def test_voice_converter_factory_requires_explicit_token(

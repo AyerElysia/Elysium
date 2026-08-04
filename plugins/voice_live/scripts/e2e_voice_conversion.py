@@ -61,6 +61,7 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
         args.profile_id,
         connect_timeout=args.connect_timeout,
         request_timeout=args.request_timeout,
+        activation_timeout=args.activation_timeout,
     )
     started = time.perf_counter()
     first_output_at = 0.0
@@ -176,6 +177,7 @@ def main() -> None:
     )
     parser.add_argument("--output-sample-rate", type=int, default=24000)
     parser.add_argument("--connect-timeout", type=float, default=10.0)
+    parser.add_argument("--activation-timeout", type=float, default=120.0)
     parser.add_argument("--request-timeout", type=float, default=10.0)
     args = parser.parse_args()
     print(json.dumps(asyncio.run(_run(args)), ensure_ascii=False, indent=2))

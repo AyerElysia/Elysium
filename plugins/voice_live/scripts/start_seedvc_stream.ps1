@@ -117,7 +117,7 @@ function Get-SeedVCCompatibilityErrors {
 
     $errors = [System.Collections.Generic.List[string]]::new()
     if ($Health.status -ne 'ok') { $errors.Add("status=$($Health.status)") }
-    if ([int]$Health.protocol_version -ne 2) {
+    if ([int]$Health.protocol_version -ne 3) {
         $errors.Add("protocol_version=$($Health.protocol_version)")
     }
     if ($Health.profile_id -ne $ProfileId) {
@@ -161,18 +161,13 @@ if ($existing) {
         throw "Port $Port has a different Seed-VC profile ($reason). Stop it manually, then rerun this launcher; no process was stopped automatically."
     }
     $headers = @{ Authorization = "Bearer $serviceToken" }
-    $created = $null
-    try {
-        $created = Invoke-RestMethod -Uri "http://${wslAddress}:$Port/v1/sessions" `
-            -Method Post -Headers $headers -ContentType 'application/json' `
-            -Body (@{ profile_id = $ProfileId } | ConvertTo-Json -Compress) `
-            -TimeoutSec 10
-    } finally {
-        if ($created.session_id) {
-            Invoke-RestMethod `
-                -Uri "http://${wslAddress}:$Port/v1/sessions/$($created.session_id)" `
-                -Method Delete -Headers $headers -TimeoutSec 10 | Out-Null
-        }
+    $authorized = Invoke-RestMethod `
+        -Uri "http://${wslAddress}:$Port/v1/auth-check" `
+        -Method Post -Headers $headers -ContentType 'application/json' `
+        -Body '{}' -TimeoutSec 10
+    if ($authorized.status -ne 'authorized' -or `
+        $authorized.profile_revision -ne $health.profile_revision) {
+        throw 'Seed-VC authenticated profile check failed.'
     }
     [pscustomobject]@{
         pid = $existing[0].OwningProcess
@@ -182,6 +177,7 @@ if ($existing) {
         block_time_ms = $health.block_time_ms
         algorithmic_latency_floor_ms = $health.algorithmic_latency_floor_ms
         inference = $health.inference
+        model_residency = $health.model_residency
         reused = $true
     } | ConvertTo-Json
     exit 0
@@ -233,6 +229,11 @@ do {
 if ($health.status -ne 'ok') {
     throw "Seed-VC health check timed out: $healthUrl"
 }
+$compatibilityErrors = @(Get-SeedVCCompatibilityErrors -Health $health)
+if ($compatibilityErrors.Count -gt 0) {
+    $reason = $compatibilityErrors -join ', '
+    throw "Started Seed-VC returned an incompatible profile ($reason)."
+}
 
 [pscustomobject]@{
     pid = $process.Id
@@ -242,6 +243,7 @@ if ($health.status -ne 'ok') {
     block_time_ms = $health.block_time_ms
     algorithmic_latency_floor_ms = $health.algorithmic_latency_floor_ms
     inference = $health.inference
+    model_residency = $health.model_residency
     warmup_ms = $health.warmup_ms
     reused = $false
 } | ConvertTo-Json
