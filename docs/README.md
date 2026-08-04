@@ -65,7 +65,8 @@
 - [具身设计](./minecraft/minecraft_embodiment_design.md)
 - [快速上手](./minecraft/minecraft_quick_start.md)
 - [商业级具身架构](./architecture/Minecraft具身架构.md) — Agent、完全仿生、OBS 与服务器路线
-- [2026-08-02 商业级审计与验收报告](./report/minecraft-commercial-audit-2026-08-02.md)
+- [Minecraft 生产运行手册](./operations/minecraft_production_runbook.md) — 固定环境、部署、就绪、烟雾测试与故障恢复
+- [2026-08-04 商业级审计与生产验收报告](./report/minecraft-commercial-audit-2026-08-02.md)
 
 ## 她的日记
 

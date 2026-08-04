@@ -1,3 +1,5 @@
+comtypes==1.4.16
 dxcam==0.3.0
+numpy==2.5.1
 Pillow==12.3.0
 websockets==17.0.1

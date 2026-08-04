@@ -29,8 +29,10 @@ import net.minecraft.client.Minecraft;
 /** Authenticated outbound WebSocket endpoint for one embodiment controller. */
 final class BridgeServer {
     static final String PROTOCOL = "elysium.minecraft.bridge/1";
+    static final String BRIDGE_VERSION = "0.2.0";
     private static final long AUTHENTICATION_DEADLINE_SECONDS = 5L;
     private static final int MAX_DROPPABLE_OUTBOUND_MESSAGES = 32;
+    private static final int MAX_TERMINAL_COMMAND_RECEIPTS = 1024;
     private static final Gson GSON = new Gson();
 
     private final BridgeConfig config;
@@ -44,6 +46,7 @@ final class BridgeServer {
     private final AtomicBoolean connecting = new AtomicBoolean();
     private final AtomicInteger outboundPending = new AtomicInteger();
     private final AtomicLong droppedObservations = new AtomicLong();
+    private final CommandLedger commandLedger = new CommandLedger(MAX_TERMINAL_COMMAND_RECEIPTS);
     private final Object outboundLock = new Object();
     private CompletableFuture<Void> outboundTail = CompletableFuture.completedFuture(null);
     private volatile boolean stopped;
@@ -170,9 +173,8 @@ final class BridgeServer {
         return true;
     }
 
-    /** Construct and send an acknowledgement or terminal action receipt. */
-    private void sendReceipt(
-            WebSocket socket,
+    /** Construct one acknowledgement or terminal action receipt envelope. */
+    private JsonObject receipt(
             String commandId,
             String intentId,
             boolean accepted,
@@ -197,7 +199,12 @@ final class BridgeServer {
         JsonObject envelope = new JsonObject();
         envelope.addProperty("type", "receipt");
         envelope.add("receipt", receipt);
-        send(socket, envelope, false);
+        return envelope;
+    }
+
+    /** Send an already constructed receipt envelope. */
+    private void sendReceipt(WebSocket socket, JsonObject receiptEnvelope) {
+        send(socket, receiptEnvelope, false);
     }
 
     /** Send a fresh authentication challenge after the connection opens. */
@@ -205,6 +212,10 @@ final class BridgeServer {
         JsonObject hello = new JsonObject();
         hello.addProperty("type", "hello");
         hello.addProperty("protocol", PROTOCOL);
+        hello.addProperty("body_type", "neoforge-agent");
+        hello.addProperty("bridge_version", BRIDGE_VERSION);
+        hello.addProperty("minecraft_version", "1.21.1");
+        hello.addProperty("neoforge_version", "21.1.219");
         hello.addProperty("nonce", state.nonce);
         hello.addProperty("instance_id", instanceId);
         com.google.gson.JsonArray capabilities = new com.google.gson.JsonArray();
@@ -302,21 +313,47 @@ final class BridgeServer {
         String operation = required(command, "operation");
         JsonObject parameters = command.has("parameters")
                 ? command.getAsJsonObject("parameters") : new JsonObject();
+        CommandLedger.Decision decision = commandLedger.begin(commandId, command);
+        switch (decision.kind()) {
+            case CONFLICT -> {
+                sendReceipt(socket, receipt(
+                        commandId, intentId, false, true, false,
+                        new JsonObject(), "command_id was already used for another payload",
+                        state.observationSequence.get()));
+                return;
+            }
+            case PENDING_REPLAY -> {
+                sendReceipt(socket, receipt(
+                        commandId, intentId, true, false, false,
+                        new JsonObject(), null, state.observationSequence.get()));
+                return;
+            }
+            case TERMINAL_REPLAY -> {
+                sendReceipt(socket, decision.terminalReceipt());
+                return;
+            }
+            case NEW -> {
+                // Continue into the single execution path below.
+            }
+        }
         if (!controls.supports(operation)) {
-            sendReceipt(
-                    socket, commandId, intentId, false, true, false,
+            JsonObject rejected = receipt(
+                    commandId, intentId, false, true, false,
                     new JsonObject(), "Unsupported operation: " + operation,
                     state.observationSequence.get());
+            commandLedger.complete(commandId, rejected);
+            sendReceipt(socket, rejected);
             return;
         }
-        sendReceipt(
-                socket, commandId, intentId, true, false, false,
-                new JsonObject(), null, state.observationSequence.get());
+        sendReceipt(socket, receipt(
+                commandId, intentId, true, false, false,
+                new JsonObject(), null, state.observationSequence.get()));
         client.execute(() -> {
+            JsonObject terminal;
             try {
                 JsonObject facts = controls.execute(operation, parameters);
-                sendReceipt(
-                        socket, commandId, intentId, true, true, false,
+                terminal = receipt(
+                        commandId, intentId, true, true, false,
                         facts, null, state.observationSequence.get());
             } catch (RuntimeException exception) {
                 JsonObject facts = new JsonObject();
@@ -330,10 +367,12 @@ final class BridgeServer {
                         operation,
                         commandId,
                         exception);
-                sendReceipt(
-                        socket, commandId, intentId, true, true, false,
+                terminal = receipt(
+                        commandId, intentId, true, true, false,
                         facts, exception.getMessage(), state.observationSequence.get());
             }
+            commandLedger.complete(commandId, terminal);
+            sendReceipt(socket, terminal);
         });
     }
 

@@ -62,14 +62,16 @@ async def test_bridge_authenticates_correlates_and_waits_for_fresh_state() -> No
                     "protocol": BRIDGE_PROTOCOL,
                     "nonce": nonce,
                     "instance_id": "minecraft-test",
+                    "body_type": "neoforge-agent",
+                    "bridge_version": "0.2.0",
+                    "minecraft_version": "1.21.1",
+                    "neoforge_version": "21.1.219",
                     "capabilities": ["baritone.goal", "native.input_batch"],
                 }
             )
         )
         authentication = json.loads(await socket.recv())
-        expected = hmac.new(
-            token.encode(), nonce.encode(), hashlib.sha256
-        ).hexdigest()
+        expected = hmac.new(token.encode(), nonce.encode(), hashlib.sha256).hexdigest()
         assert authentication["digest"] == expected
         await socket.send(_message({"type": "authentication", "accepted": True}))
         await socket.send(_message(_observation(1)))
@@ -112,6 +114,12 @@ async def test_bridge_authenticates_correlates_and_waits_for_fresh_state() -> No
     assert receipt.facts["target_position"]["x"] == 2
     assert second.sequence == 2
     assert client.capabilities == ("baritone.goal", "native.input_batch")
+    assert client.hello_metadata == {
+        "body_type": "neoforge-agent",
+        "bridge_version": "0.2.0",
+        "minecraft_version": "1.21.1",
+        "neoforge_version": "21.1.219",
+    }
 
 
 async def test_bridge_rejects_wrong_protocol_before_authentication() -> None:
@@ -141,6 +149,46 @@ async def test_bridge_rejects_wrong_protocol_before_authentication() -> None:
             await client.open()
 
 
+async def test_close_is_idempotent_after_peer_closes_normally() -> None:
+    """Normal game shutdown before cleanup cannot turn close into a failure."""
+
+    token = "peer-close-secret"
+    remote_closed = asyncio.Event()
+
+    async def handler(socket_connection: ServerConnection) -> None:
+        nonce = "peer-close-nonce"
+        await socket_connection.send(
+            _message(
+                {
+                    "type": "hello",
+                    "protocol": BRIDGE_PROTOCOL,
+                    "nonce": nonce,
+                    "instance_id": "minecraft-test",
+                    "capabilities": ["movement.input"],
+                }
+            )
+        )
+        await socket_connection.recv()
+        await socket_connection.send(
+            _message({"type": "authentication", "accepted": True})
+        )
+        await socket_connection.send(_message(_observation(1)))
+        await socket_connection.close(code=1000, reason="bridge stopping")
+        remote_closed.set()
+
+    async with serve(handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        client = MinecraftBridgeClient(
+            BridgeConfig(uri=f"ws://127.0.0.1:{port}", token=token)
+        )
+        await client.open()
+        await client.observe()
+        await remote_closed.wait()
+        await asyncio.sleep(0)
+        await client.close()
+        await client.close()
+
+
 async def test_reverse_listener_authenticates_through_transparent_relay() -> None:
     """A Windows-outbound relay preserves authentication and observations."""
 
@@ -163,9 +211,7 @@ async def test_reverse_listener_authenticates_through_transparent_relay() -> Non
             )
         )
         authentication = json.loads(await socket_connection.recv())
-        expected = hmac.new(
-            token.encode(), nonce.encode(), hashlib.sha256
-        ).hexdigest()
+        expected = hmac.new(token.encode(), nonce.encode(), hashlib.sha256).hexdigest()
         assert authentication["digest"] == expected
         await socket_connection.send(
             _message({"type": "authentication", "accepted": True})
@@ -198,26 +244,27 @@ async def test_reverse_listener_authenticates_through_transparent_relay() -> Non
         async def relay() -> None:
             """Forward each complete frame without reading protocol content."""
 
-            async with connect(
-                f"ws://127.0.0.1:{body_port}", proxy=None
-            ) as local:
-                async with connect(reverse_uri, proxy=None) as remote:
-                    async def pipe(source: Any, destination: Any) -> None:
-                        async for message in source:
-                            await destination.send(message)
+            async with (
+                connect(f"ws://127.0.0.1:{body_port}", proxy=None) as local,
+                connect(reverse_uri, proxy=None) as remote,
+            ):
 
-                    tasks = {
-                        asyncio.create_task(pipe(local, remote)),
-                        asyncio.create_task(pipe(remote, local)),
-                    }
-                    done, pending = await asyncio.wait(
-                        tasks,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    for task in pending:
-                        task.cancel()
-                    await asyncio.gather(*pending, return_exceptions=True)
-                    await asyncio.gather(*done)
+                async def pipe(source: Any, destination: Any) -> None:
+                    async for message in source:
+                        await destination.send(message)
+
+                tasks = {
+                    asyncio.create_task(pipe(local, remote)),
+                    asyncio.create_task(pipe(remote, local)),
+                }
+                done, pending = await asyncio.wait(
+                    tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                await asyncio.gather(*done)
 
         relay_task = asyncio.create_task(relay())
         await open_task

@@ -21,14 +21,14 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 import dxcam
+from command_ledger import CommandLedger, DecisionKind
 from PIL import Image
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed
 
 PROTOCOL = "elysium.minecraft.bridge/1"
-CONFIG_PATH = Path(
-    r"G:\Game\Minecraft\.minecraft\config\elysium_native_bridge.json"
-)
+BRIDGE_VERSION = "0.2.0"
+CONFIG_PATH = Path(r"G:\Game\Minecraft\.minecraft\config\elysium_native_bridge.json")
 
 USER32 = ctypes.WinDLL("user32", use_last_error=True)
 KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -60,7 +60,10 @@ USER32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
 USER32.GetWindowTextLengthW.restype = ctypes.c_int
 USER32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 USER32.GetWindowTextW.restype = ctypes.c_int
-USER32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+USER32.GetWindowThreadProcessId.argtypes = [
+    wintypes.HWND,
+    ctypes.POINTER(wintypes.DWORD),
+]
 USER32.GetWindowThreadProcessId.restype = wintypes.DWORD
 USER32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
 USER32.GetClientRect.restype = wintypes.BOOL
@@ -91,10 +94,15 @@ KERNEL32.QueryFullProcessImageNameW.argtypes = [
 ]
 KERNEL32.QueryFullProcessImageNameW.restype = wintypes.BOOL
 KERNEL32.GetCurrentThreadId.restype = wintypes.DWORD
+KERNEL32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+KERNEL32.CreateMutexW.restype = wintypes.HANDLE
+KERNEL32.CloseHandle.argtypes = [wintypes.HANDLE]
+KERNEL32.CloseHandle.restype = wintypes.BOOL
 
-if not USER32.SetProcessDpiAwarenessContext(
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
-):
+ERROR_ALREADY_EXISTS = 183
+NATIVE_BODY_MUTEX = r"Local\ElysiumMinecraftNativeBody"
+
+if not USER32.SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2):
     error_code = ctypes.get_last_error()
     if error_code != 5:
         raise ctypes.WinError(error_code)
@@ -169,9 +177,7 @@ class NativeBodyConfig:
     jpeg_quality: int = 92
     reconnect_seconds: float = 1.0
     open_timeout_seconds: float = 5.0
-    capture_directory: str = (
-        r"G:\Game\Minecraft\.minecraft\elysium_capture\biomimetic"
-    )
+    capture_directory: str = r"G:\Game\Minecraft\.minecraft\elysium_capture\biomimetic"
     wsl_capture_directory: str = (
         "/mnt/g/Game/Minecraft/.minecraft/elysium_capture/biomimetic"
     )
@@ -260,7 +266,9 @@ class WindowResolver:
         """Return one exact target and reject absent or ambiguous matches."""
 
         matches: list[WindowTarget] = []
-        callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        callback_type = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+        )
 
         @callback_type
         def callback(hwnd: int, _: int) -> bool:
@@ -278,7 +286,9 @@ class WindowResolver:
             USER32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             process_path = self._process_path(pid.value)
             executable = Path(process_path).name.casefold()
-            allowed = {item.casefold() for item in self._config.process_executable_names}
+            allowed = {
+                item.casefold() for item in self._config.process_executable_names
+            }
             if executable not in allowed:
                 return True
             rect = wintypes.RECT()
@@ -426,11 +436,16 @@ class NativeMotor:
             name = str(raw_name)
             if name in self.VK:
                 inputs.extend(
-                    (self._key(self.VK[name], down=True), self._key(self.VK[name], down=False))
+                    (
+                        self._key(self.VK[name], down=True),
+                        self._key(self.VK[name], down=False),
+                    )
                 )
             elif name in self.MOUSE:
                 down_flag, up_flag = self.MOUSE[name]
-                inputs.extend((self._mouse_button(down_flag), self._mouse_button(up_flag)))
+                inputs.extend(
+                    (self._mouse_button(down_flag), self._mouse_button(up_flag))
+                )
             else:
                 raise ValueError(f"unknown pulse control: {name}")
 
@@ -460,7 +475,9 @@ class NativeMotor:
     def release_all(self, reason: str) -> dict[str, Any]:
         """Release every held physical key and mouse button in one batch."""
 
-        inputs = [self._key(self.VK[name], down=False) for name in sorted(self._held_keys)]
+        inputs = [
+            self._key(self.VK[name], down=False) for name in sorted(self._held_keys)
+        ]
         inputs.extend(
             self._mouse_button(self.MOUSE[name][1]) for name in sorted(self._held_mouse)
         )
@@ -558,11 +575,21 @@ class NativeMotor:
     def _send_chat(self, text: str) -> None:
         """Open chat, send exact Unicode text, and submit it."""
 
-        self._send((self._key(self.VK["chat"], down=True), self._key(self.VK["chat"], down=False)))
+        self._send(
+            (
+                self._key(self.VK["chat"], down=True),
+                self._key(self.VK["chat"], down=False),
+            )
+        )
         time.sleep(0.08)
         inputs: list[INPUT] = []
         for character in text:
-            inputs.extend((self._unicode(character, down=True), self._unicode(character, down=False)))
+            inputs.extend(
+                (
+                    self._unicode(character, down=True),
+                    self._unicode(character, down=False),
+                )
+            )
         self._send(inputs)
         self._send((self._key(0x0D, down=True), self._key(0x0D, down=False)))
 
@@ -570,7 +597,9 @@ class NativeMotor:
 class FrameSensor:
     """Capture immutable first-person client-area frames through DXGI or WGC."""
 
-    def __init__(self, config: NativeBodyConfig, resolver: WindowResolver, instance_id: str) -> None:
+    def __init__(
+        self, config: NativeBodyConfig, resolver: WindowResolver, instance_id: str
+    ) -> None:
         """Initialize one hardware capture backend and session directory."""
 
         self._config = config
@@ -663,6 +692,7 @@ class NativeBodySession:
         self._resolver = WindowResolver(config)
         self._motor = NativeMotor(self._resolver)
         self._sensor = FrameSensor(config, self._resolver, self._instance_id)
+        self._command_ledger = CommandLedger()
 
     async def run_connection(self, socket: ClientConnection) -> None:
         """Authenticate and serve one outbound controller connection."""
@@ -673,6 +703,8 @@ class NativeBodySession:
                 {
                     "type": "hello",
                     "protocol": PROTOCOL,
+                    "body_type": "windows-native",
+                    "bridge_version": BRIDGE_VERSION,
                     "nonce": nonce,
                     "instance_id": self._instance_id,
                     "capabilities": list(self.CAPABILITIES),
@@ -690,7 +722,9 @@ class NativeBodySession:
             accepted = (
                 authentication.get("type") == "authenticate"
                 and authentication.get("protocol") == PROTOCOL
-                and hmac.compare_digest(str(authentication.get("digest") or ""), expected)
+                and hmac.compare_digest(
+                    str(authentication.get("digest") or ""), expected
+                )
             )
             await socket.send(
                 self._encode({"type": "authentication", "accepted": accepted})
@@ -805,19 +839,52 @@ class NativeBodySession:
         parameters = command.get("parameters")
         if not isinstance(parameters, dict):
             raise TypeError("parameters must be an object")
-        if operation not in self.CAPABILITIES:
-            await self._receipt(
-                socket, command_id, intent_id, False, True, {},
-                f"unsupported operation: {operation}",
+        decision = self._command_ledger.begin(command_id, command)
+        if decision.kind is DecisionKind.CONFLICT:
+            await self._send_receipt(
+                socket,
+                self._receipt(
+                    command_id,
+                    intent_id,
+                    False,
+                    True,
+                    {},
+                    "command_id was already used for another payload",
+                ),
             )
             return
-        await self._receipt(socket, command_id, intent_id, True, False, {}, None)
+        if decision.kind is DecisionKind.PENDING_REPLAY:
+            await self._send_receipt(
+                socket,
+                self._receipt(command_id, intent_id, True, False, {}, None),
+            )
+            return
+        if decision.kind is DecisionKind.TERMINAL_REPLAY:
+            if decision.terminal_receipt is None:
+                raise RuntimeError("terminal replay has no receipt")
+            await self._send_receipt(socket, decision.terminal_receipt)
+            return
+        if operation not in self.CAPABILITIES:
+            terminal = self._receipt(
+                command_id,
+                intent_id,
+                False,
+                True,
+                {},
+                f"unsupported operation: {operation}",
+            )
+            self._command_ledger.complete(command_id, terminal)
+            await self._send_receipt(socket, terminal)
+            return
+        await self._send_receipt(
+            socket,
+            self._receipt(command_id, intent_id, True, False, {}, None),
+        )
         try:
             facts = await asyncio.to_thread(self._motor.execute, operation, parameters)
-            await self._receipt(socket, command_id, intent_id, True, True, facts, None)
+            terminal = self._receipt(command_id, intent_id, True, True, facts, None)
         except Exception as exception:  # noqa: BLE001 - return exact motor failure
-            await self._receipt(
-                socket,
+            terminal = self._receipt(
                 command_id,
                 intent_id,
                 True,
@@ -825,18 +892,19 @@ class NativeBodySession:
                 {},
                 str(exception),
             )
+        self._command_ledger.complete(command_id, terminal)
+        await self._send_receipt(socket, terminal)
 
-    async def _receipt(
+    def _receipt(
         self,
-        socket: ClientConnection,
         command_id: str,
         intent_id: str,
         accepted: bool,
         completed: bool,
         facts: dict[str, Any],
         error: str | None,
-    ) -> None:
-        """Send one correlated factual receipt."""
+    ) -> dict[str, Any]:
+        """Construct one correlated factual receipt envelope."""
 
         receipt: dict[str, Any] = {
             "receipt_id": f"receipt_{uuid4().hex}",
@@ -850,7 +918,16 @@ class NativeBodySession:
         }
         if error:
             receipt["error"] = error
-        await socket.send(self._encode({"type": "receipt", "receipt": receipt}))
+        return {"type": "receipt", "receipt": receipt}
+
+    async def _send_receipt(
+        self,
+        socket: ClientConnection,
+        receipt: dict[str, Any],
+    ) -> None:
+        """Send an acknowledgement or a ledger-backed terminal receipt."""
+
+        await socket.send(self._encode(receipt))
 
     @staticmethod
     def _required(payload: dict[str, Any], name: str) -> str:
@@ -877,48 +954,65 @@ class NativeBodySession:
         return value
 
 
+def _acquire_process_lease() -> int:
+    """Acquire one Windows-session-wide native body lease."""
+
+    ctypes.set_last_error(0)
+    handle = KERNEL32.CreateMutexW(None, True, NATIVE_BODY_MUTEX)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        KERNEL32.CloseHandle(handle)
+        raise RuntimeError("another Elysium Minecraft native body is already running")
+    return int(handle)
+
+
 async def main() -> None:
     """Reconnect outward to the WSL controller until an operating-system stop signal."""
 
     if sys.platform != "win32":
         raise RuntimeError("the native body must run on Windows")
-    config = NativeBodyConfig.load(CONFIG_PATH)
-    session = NativeBodySession(config)
-    stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for signal_name in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(signal_name, stop.set)
-        except NotImplementedError:
-            pass
+    process_lease = _acquire_process_lease()
     try:
-        while not stop.is_set():
+        config = NativeBodyConfig.load(CONFIG_PATH)
+        session = NativeBodySession(config)
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for signal_name in (signal.SIGINT, signal.SIGTERM):
             try:
-                async with connect(
-                    config.controller_uri,
-                    max_size=16 * 1024 * 1024,
-                    open_timeout=config.open_timeout_seconds,
-                    ping_interval=10,
-                    ping_timeout=10,
-                ) as socket:
-                    print(
-                        f"Elysium native body connected to {config.controller_uri}; "
-                        f"token file: {CONFIG_PATH}",
-                        flush=True,
-                    )
-                    await session.run_connection(socket)
-            except (OSError, TimeoutError, ConnectionClosed):
+                loop.add_signal_handler(signal_name, stop.set)
+            except NotImplementedError:
                 pass
-            if not stop.is_set():
+        try:
+            while not stop.is_set():
                 try:
-                    await asyncio.wait_for(
-                        stop.wait(),
-                        timeout=config.reconnect_seconds,
-                    )
-                except TimeoutError:
+                    async with connect(
+                        config.controller_uri,
+                        max_size=16 * 1024 * 1024,
+                        open_timeout=config.open_timeout_seconds,
+                        ping_interval=10,
+                        ping_timeout=10,
+                    ) as socket:
+                        print(
+                            f"Elysium native body connected to {config.controller_uri}; "
+                            f"token file: {CONFIG_PATH}",
+                            flush=True,
+                        )
+                        await session.run_connection(socket)
+                except (OSError, TimeoutError, ConnectionClosed):
                     pass
+                if not stop.is_set():
+                    try:
+                        await asyncio.wait_for(
+                            stop.wait(),
+                            timeout=config.reconnect_seconds,
+                        )
+                    except TimeoutError:
+                        pass
+        finally:
+            await session.shutdown()
     finally:
-        await session.shutdown()
+        KERNEL32.CloseHandle(process_lease)
 
 
 if __name__ == "__main__":

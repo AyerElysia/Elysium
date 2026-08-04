@@ -1,138 +1,135 @@
-# Minecraft 商业级具身系统审计与交付报告
+# Minecraft 商业级具身系统审计与生产交付报告
 
-日期：2026-08-02
+首次审计：2026-08-02；生产复验：2026-08-04。
 
 ## 结论
 
-原实现展示了“感知—意图—行动”的正确方向，但不是可发布系统：运行时只接入了关键词驱动的会话控制器，视觉/VLA 链路没有进入正式会话；目标完成可以被模拟；每次输入都启动新的 PowerShell；启动器可能误报就绪，并能误伤其他 Java 进程；整个 Minecraft 模块没有测试。
+Minecraft 的 Agent Body 已从“存在实现但正式主体不可调用”修复为可部署、可诊断、可审计的生产链路，并完成真实游戏闭环。当前结果不是标题页截图或模拟成功：NeoForge 客户端实际进入 `Elysian Realm`，桥接读取玩家、世界、背包、实体和 Baritone 状态，执行了一次受限视角动作，收到终态回执，再由新观察精确证明 yaw 改变 5°。
 
-本次已把它重构为统一具身运行时，并完成两个真实身体的端到端验证：
+Life Engine 在 `minecraft.enabled=true` 时注册 `nucleus_minecraft` 工具，并由 `LifeEngineService` 独立持有一个 Minecraft session；该能力不再属于 Learning，也不受 `learning.enabled` 影响。正式工具链需要在代码合入后由用户手动重启 Elysium 才能载入；任何 AI 都不得代替用户重启主进程。
 
-- Agent Body：NeoForge 1.21.1 + 认证反向 WebSocket + 结构化状态 + Baritone；
-- Biomimetic Body：精确窗口绑定 + DXcam 第一人称画面 + Windows 原生输入；
-- 两者共享动态能力、行动终态、取消、租约、去重和追加式证据链；
-- OBS 已捕捉真实游戏并完成本地录像，没有开启直播。
+默认生产身体是 `agent`。`biomimetic` 已补齐可重建 sidecar、单实例保护、认证与重放账本，但它需要唯一前台窗口且当前机器存在两个旧 sidecar 进程，未在不终止用户进程的前提下重做真实键鼠验收，因此保持可选实验状态，不冒充本轮生产完成项。
 
-## 原实现的关键缺口
+## 原阻断与处置
 
-1. `do_intent` 用关键词选择动作，会把语言表象误当成主体意图。
-2. 会话默认只创建 `ConversationalMotorController`，已有视觉、VLA 和执行代码实际上不在生产链路中。
-3. 部分目标可以在没有世界证据时返回成功。
-4. Windows 输入链路按动作创建 PowerShell 进程，时序、焦点、卡键释放与恢复均不可靠；挖掘动作存在鼠标按键映射错误。
-5. 启动逻辑使用固定等待与宽泛进程判断，停止逻辑可能结束不属于本项目的 Java。
-6. 不存在认证、重放保护、背压、终态回执、可验证观测序号和 Minecraft 专项测试。
+审计确认的主要阻断包括：
 
-## 本次实现
+1. Minecraft 工具虽已定义，但 Life Engine 未注册或公开，主体无法从正式组件链启动和控制。
+2. session 曾经从 LearningScheduler 读取身体，`learning.enabled=false` 会错误隐藏 Minecraft。
+3. 启动脚本没有 quick-play 世界参数，标题页可能被误判为就绪。
+4. 启动器依赖跨 WSL 的脆弱命令行转义，窗口和进程判断可能不明确。
+5. 桥接动作过于自由，缺少同 ID/不同载荷冲突拒绝和有界重放终态。
+6. world 未加载、错误世界、旧桥接或能力缺失时，错误不够稳定可诊断。
+7. Windows sidecar 环境不可重建，且旧实例可能并发争用键鼠。
 
-### 统一运行时
+本轮分别完成了条件注册、service 独立所有权、精确预检、Windows 原生启动帮助器、类型化动作、命令账本、幂等清理、sidecar 固定依赖和专项测试。
 
-新增严格数据契约、动态能力清单、身体租约、行动幂等、超时/取消、终态证据和哈希链追踪。模型输出必须是可校验 JSON；未知动作直接拒绝，不猜测、不回退到关键词规则。
+## 生产架构
 
-### NeoForge 桥与 Agent Body
+### Life Engine 所有权
 
-桥接模组针对现有 NeoForge 21.1.219 构建，连接由 Windows 游戏端反向发往 WSL。握手使用共享密钥，消息使用 HMAC，客户端序号与动作标识防止重放。观测串行发送且有有限背压，控制结果不随普通帧丢弃。
+- `minecraft.enabled=false`：不暴露 `nucleus_minecraft`，不创建外部连接。
+- `minecraft.enabled=true`：manifest、组件签名和 `get_components()` 一致，service 创建但不提前连接身体的 session。
+- session 早于 Learning 初始化，Learning 关闭或初始化失败不影响 Minecraft 的所有权。
+- service stop 与部分初始化回滚都会调用幂等 `MinecraftSession.close()`；失败的 owner 保留供重试，同时继续释放其他资源。
+- 工具只读取 `service.minecraft_session`，不再回退到 LearningScheduler 或私有字段。
 
-Baritone 作为确定性执行器处理导航类意图；每次执行的开始、进度、停止和释放都有回执。死亡状态会暴露明确的复活动作，而不是在死亡画面上假装继续执行。
+### 启动与就绪
 
-### 原生仿生身体
+启动前检查精确的 Minecraft 版本、世界目录、PCL 脚本、quick-play 参数、Bridge 与官方 Baritone 文件名和 SHA-256。Windows 帮助器只允许托管目录，多个匹配窗口会明确失败；缺失的标准 WSLInterop 注册项会尝试恢复，不能恢复时返回可操作错误。
 
-原生 sidecar 不再按动作启动脚本，而是持久运行。它绑定精确窗口和进程，捕捉真实第一人称帧并批量发送键鼠输入；异常、取消或窗口丢失都会执行 `release_all`。模型可操作移动、鼠标、物品栏、聊天、快捷栏，以及 F1/F3/F5/F11/Tab 等客户端控制。
+真正的 ready 必须有：认证成功、Bridge 0.2.0、必需能力集合、两条连续前进观察、`world_loaded=true`、`client_paused=false`、`singleplayer_name=Elysian Realm` 和玩家 UUID。标题界面、暂停菜单、错误世界、静止观察或断线均不会返回成功。
 
-### N.E.K.O 参考审计
+### 动作与证据
 
-Project N.E.K.O 仓库中的 `game_agent_minecraft` 插件使用独立正版账号、Mineflayer、任务/聊天/物品栏消息和截图；其下载包内是 MIT 许可的 Mindcraft 源码。v0.1.1 的技能实现加入 tick 后置条件确认与重试，这一点值得吸收。
+Agent Body 只接受类型化动作：移动/视角、交互、快捷栏、丢弃、聊天、复活、等待、导航、挖掘、停止和释放。任意 Baritone 命令字符串不再是生产接口。
 
-它当前仍是实验性方案：WebSocket 监听 `0.0.0.0` 且没有认证，任务协议以自由文本和时间窗口为主，画面是 800×512、视距 6 的 Prismarine 合成渲染，也没有本系统的序号、租约和证据链。因此将它定位为可选的第三种轻量服务器身体，而不是替换可见 NeoForge 客户端。
+命令账本以命令 ID 和规范化 JSON 摘要识别重试：相同命令返回既有 ack/终态；相同 ID 配不同载荷立即拒绝；终态使用有界 LRU，pending 不会因容量清理而丢失。`accepted` 与 `completed` 分离，模型结论必须引用终态回执和后续新观察。
 
-本地仅下载并静态审计，未执行第三方代理包：
+### 生命周期
 
-- v0.1.0 SHA-256：`1808165269075F152F12E95BE712930964488EFB7366437331EA32C9C7167D53`
-- v0.1.1 SHA-256：`6C785ED34A0957933DBCCE214D167D5F70D397C75460D964D4394DB9C79D6C81`
+start、stop 和 close 均可重复调用。远端游戏先正常关闭或崩溃时，客户端会唤醒等待者并幂等清理，不把“peer 已关闭”升级成伪造的清理失败。Presence、scene 与 perception 回调兼容正式 async port；错误不会用延迟补写或旧 SQLite 回退掩盖。
 
-## 真实验收证据
+## 真实环境与固定产物
 
-### Agent Body
+- Minecraft：1.21.1
+- NeoForge：21.1.219
+- 世界：`Elysian Realm`
+- Elysium Bridge：0.2.0
+- Bridge JAR SHA-256：`AB455A1285196A7ACAFD996D32E669F1B865880DA20EE29E25481775F1A624CA`
+- Baritone：官方 NeoForge 1.11.2
+- 官方 SHA-1：`C72014178D80650DF9BBB57819D7542DA69866C2`
+- 本地固定 SHA-256：`B413CE0A2754A3C8484AAE39875CF84BE1F999DEE208E86D41B3D0D329D5CA35`
 
-- Minecraft 版本：NeoForge 1.21.1，NeoForge 21.1.219；
-- 桥接 JAR SHA-256：`AC01B0EA16FCCC66575117DA93C3FCFA96C628C35F5889AC3D246A6AB82E3566`；
-- 官方 Baritone 1.11.2 JAR SHA-256：`B413CE0AC8061D954E671492E4D826BD4539C8936641F7321A76F0679697CA35`；
-- 动态能力包含 `baritone.command`、`chat.send`、`control.release_all`、`native.input_batch`、`player.respawn`；
-- 观测序号从 1 前进到 4；
-- 真实世界坐标从 `[458.4646843141369, 68, 433.6767815407236]` 变为 `[458.48419306071474, 68, 434.2355443608967]`；水平位移 `0.5591032824092985`；
-- Baritone pathing 状态被观察为真；停止和释放均收到终态回执。
+Gradle 归档关闭时间戳并固定文件顺序；连续构建得到相同 Bridge SHA-256。部署脚本校验锁文件、JAR 内 NeoForge 元数据、官方 Baritone 摘要和唯一选中版本，旧桥接只移动到可恢复目录。
 
-### Biomimetic Body
+## 真实闭环证据
 
-- 绑定窗口标题 `Minecraft NeoForge* 1.21.1 - 单人游戏`；
-- 原生输入批次包含 3 个事件；
-- 游戏侧交叉观测到 yaw 变化 `-10.350001700000007` 度；
-- 输入前 JPEG：154,380 字节，SHA-256 `51315760AC1AB02BB6FC33D646D7692C893A4AF56412D4DC30D7E21EE03FFA16`；
-- 输入后 JPEG：153,247 字节，SHA-256 `CA97C644E5761E648E36FC543D40882372600B1E2082B48855696068C5A896F7`；
-- 最后执行释放全部输入，测试终态为完成。
+2026-08-04 的生产烟雾 session：`20260804T151244_791715Z`。
 
-### OBS
+- 游戏实例：`minecraft_0812c9b2-b701-46d8-bebd-b121f74e2d9e`
+- 身体：`agent`
+- Bridge：0.2.0
+- 世界：`Elysian Realm`，`world_loaded=true`
+- 观察能力：玩家 UUID/位置/视角、生命与饱食、完整物品栏、附近实体、维度、天气、时间、准星、控制状态、Baritone 与传输背压
+- 动作：`movement.input`，yaw `+5.0°`
+- 回执：`accepted=true`、`completed=true`、`interrupted=false`
+- 新观察：yaw 从 `-172.29694` 变为 `-167.29694`
+- 结论：`A bounded look action changed observed yaw by 5.000 degrees.`
+- 清理：`success=true`、`cleanup_pending=false`、`game_left_running=true`
+- 证据链：`data/life_engine_workspace/minecraft/traces/20260804T151244_791715Z.jsonl`
 
-OBS Studio 32.2.1 portable 的下载 SHA-256 与官方发布值一致：`DB64A2934F8261F85B1410B84BE011207A0AFDA5400D008289F1F1E211BCC7DE`。在同一 GPU 上使用 Game Capture 的全屏应用模式，预览已显示实时 Minecraft，并录制 21 秒、1280×720、16,686,545 字节的本地 MP4。未设置或使用推流密钥。
+trace 包含 `body.selected → intent.issued → observation → command.issued → command.receipt → observation → intent.conclusion`，每条记录由前后哈希串联。
+
+同一游戏进程持续运行约 38 分钟后再次重连，认证、观察、终态回执和清理仍成功；该轮同时观察到客户端停在暂停菜单。由于暂停的单人世界不能保证导航/移动推进，本轮据此把 `client_paused=true` 收紧为明确未就绪并补充回归测试，不把暂停菜单中的直接视角修改当作完整生产 ready 证据。
+
+## 现场故障与恢复
+
+第一次真实启动成功加载 Elysium Bridge 并认证，但游戏随后自行崩溃。crash report 将首个业务异常精确定位到：
+
+```text
+InventoryProfilesNext-neoforge-1.21.1-2.2.5.jar
+org.anti_ad.mc.ipnext.config.Features.getENABLE_PROFILES
+ENABLE_PROFILES$delegate is null
+```
+
+其配套库为 `libIPN-neoforge-1.21.1-6.6.3.jar`。两者属于可选背包整理 UI，不是 Elysium Bridge 或 Baritone。确认托管 Java 进程已因崩溃自行退出后，只将这两份固定摘要文件移动到：
+
+```text
+G:\Game\Minecraft\.minecraft\mods\elysium-disabled\incompatible-inventoryprofilesnext-2.2.5
+```
+
+没有删除文件、批量禁用其他模组或停止任何进程。隔离后的第二次启动与真实闭环成功，游戏继续稳定运行。
+
+## 参考包审计
+
+用户提供的两份历史包已静态审计：
+
+- `MC集成包.zip` SHA-256：`435939B3F77A264640A76D9C2F085BA8B1BD3FA81E3AA4B4F86D1031EB01F93B`
+- `MC插件源码.zip` SHA-256：`53C1D32617C104BAF29BE4311D918AA7F7FCD063803DDA176AB3DE2530E32C8A`
+
+它们提供了技能分解、tick 后置条件确认、Mineflayer/Mindcraft 等有价值思路；但包内未发现许可证文件，且参考桥接存在未认证监听、自由文本命令、时间窗口判定和可伪造完成等问题。本轮没有复制这些高风险实现，只吸收了“类型化技能 + 后置世界证据”的设计思想。
 
 ## 自动化验证
 
-- Minecraft 专项测试：15 个通过；
-- Life Engine 相关回归：110 个通过；
-- 修改/新增 Python 文件 Ruff 检查通过；
-- Windows sidecar Python 编译检查通过；
-- NeoForge 模组 Gradle 构建通过，启用 Java 编译警告即错误。
+- Minecraft 与 service 接线专项：48 passed
+- NeoForge：`clean test build` 成功，Java 契约/账本测试通过
+- Bridge 产物可复现 SHA-256：`AB455A...F1A624CA`
+- 变更 Python 文件 Ruff：通过
+- 变更 Python 源文件编译：通过
+- sidecar 固定依赖环境：安装与导入检查通过
+- 全仓单进程：3513 passed / 13 skipped，覆盖率 67.15%；另有 2 个非 Minecraft 基线超时
+- 两个超时用例（Anthropic SDK 首次导入、Scheduler `trigger_at + interval`）随后定向复验：2 passed
 
-## 商业上线前仍需用户提供的外部条件
+并行全仓还复现了团队已登记的 Scheduler recurring 30 秒时序超时，并导致 pytest-xdist 内部退出。报告保留这些失败，不以重跑把全仓描述成“全绿”；Minecraft 专项、NeoForge 构建和真实闭环均在同一提交上独立通过。
 
-1. 爱莉的第二个已授权 Minecraft 账号；否则无法和人类角色真正同时在线。
-2. 公共服务器的域名/主机、正版验证、白名单、权限、备份和治理选择。
-3. 直播平台账号与推流密钥。密钥应只放在 OBS 的本机配置或秘密管理服务中。
-4. 仿生身体若要与人在同一时刻独立操作，需要独立 Windows 会话、虚拟机或另一台设备。
+专项测试覆盖：组件 enabled/disabled、Learning 独立性、部分初始化回收、认证和元数据、错误世界/标题页、能力与版本拒绝、quick-play、产物摘要/重复 JAR、Windows 启动与歧义窗口、同 ID 重放冲突、start/stop/close 幂等、失败清理重试、正式 service session 工具读取和 native sidecar 单实例账本。
 
-在这些外部条件到位前，本地单人世界、两类身体、真实动作核验和 OBS 录像链路已经闭环。
+## 尚未冒充完成的边界
 
-## 代码交付边界
+1. 当前运行中的 Elysium 主进程尚未载入本次代码。合入后必须由用户手动重启，再通过正式 `nucleus_minecraft` 工具执行一次 start/status/intent/stop 验收。
+2. Biomimetic Body 需要用户手动关闭两个遗留 sidecar 后再做真实 DXcam/SendInput 验收；默认 Agent Body 不受影响。
+3. “你和爱莉各有一个角色并同时在线”仍需要第二个已授权 Minecraft 账号，以及服务器认证、白名单、权限与备份方案。
+4. 公开直播仍需要用户提供平台账号和推流密钥；本轮没有设置密钥或推流。
 
-本次工作落在以下生产边界中：
-
-- `plugins/life_engine/minecraft/embodiment_contracts.py`：身体、能力、意图、观测和终态回执契约；
-- `embodiment_runtime.py`、`embodiment_trace.py`：身体租约、幂等、超时/取消和追加式哈希证据链；
-- `bridge_client.py`、`bridge_body.py`：带认证、HMAC、序号和背压的持久桥接；
-- `model_planner.py`、`session.py`：动态能力驱动的模型规划和商业会话生命周期；
-- `launcher.py`、`tools.py`、Life Engine 配置与服务接线：显式身体选择、已有客户端复用和启动就绪检查；
-- `integrations/minecraft_bridge/`：NeoForge 1.21.1 客户端模组、状态采集、Baritone/原生操作执行和真实烟雾测试；
-- `integrations/windows_native_body/`：DXcam、精确窗口绑定、SendInput、异常释放和画面/输入交叉验证；
-- `test/plugins/life_engine/minecraft/`：认证、序号、重放、租约、恢复、模型输出和启动生命周期测试；
-- `docs/architecture/Minecraft具身架构.md`：生产架构、直播、服务器与多人共玩约束。
-
-旧 Minecraft 实验模块中 27 条未使用导入和无效 f-string 告警也已机械清理。最终整个 `plugins/life_engine/minecraft`、专项测试和 Windows sidecar 均通过 Ruff，避免新生产链路通过而旧目录仍保持静态检查红灯。
-
-## 本机部署产物与运行状态
-
-- 构建后的桥接模组已安装到现有 Minecraft `mods` 目录；
-- 官方 Baritone 1.11.2 已安装并按发布摘要复核；
-- Windows 原生 sidecar 使用独立虚拟环境和游戏配置中的随机令牌；
-- OBS Studio 32.2.1 portable 已按官方摘要复核并完成本地录制；
-- 第三方 N.E.K.O/Mindcraft 下载包只做静态审计，没有执行；
-- 推流密钥、账号凭据和桥接令牌均未写入仓库或报告。
-
-## 研究来源与取舍
-
-- Neuro SDK：https://github.com/VedalAI/neuro-sdk
-- Project N.E.K.O：https://github.com/Project-N-E-K-O/N.E.K.O
-- Mindcraft：https://github.com/mindcraft-bots/mindcraft
-- Mineflayer：https://github.com/PrismarineJS/mineflayer
-- Baritone：https://github.com/cabaletta/baritone
-- Voyager：https://github.com/MineDojo/Voyager
-- STEVE-1：https://arxiv.org/abs/2306.00937
-- JARVIS-1：https://arxiv.org/abs/2311.05997
-- MineStudio：https://github.com/CraftJarvis/MineStudio
-- OpenHA：https://github.com/CraftJarvis/OpenHA
-- JARVIS-VLA：https://github.com/CraftJarvis/JarvisVLA
-- MCCTP：https://github.com/lucasoyen/MCCTP
-- OBS Game Capture：https://obsproject.com/kb/game-capture-source
-- Minecraft Java 捕捉排障：https://obsproject.com/kb/minecraft-java-edition-troubleshooting
-
-Neuro-sama 的内部 Minecraft 系统是闭源的；社区讨论只能作为混合式架构的线索，不能当作已证实实现。本次取舍依赖可复现的公开 SDK、论文和源码：由模型保留意图与选择权，把高频、确定性的动作交给可验证执行器，同时保留完全第一人称的仿生身体作为通用控制面。
-
-OpenHA/MineStudio 等视觉代理是后续离线研究的重要候选，但其现有模拟器版本和现有 NeoForge 1.21.1 客户端不构成可直接替换关系。本次没有为了模型规模牺牲版本兼容、直播可见性和可验证性。
+部署、升级、故障恢复和发布门详见[《Minecraft 生产运行手册》](../operations/minecraft_production_runbook.md)。

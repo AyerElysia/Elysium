@@ -38,6 +38,19 @@ final class StateCollector {
         }
 
         facts.addProperty("world_loaded", true);
+        JsonObject world = new JsonObject();
+        if (client.hasSingleplayerServer() && client.getSingleplayerServer() != null) {
+            world.addProperty("mode", "singleplayer");
+            world.addProperty(
+                    "singleplayer_name",
+                    client.getSingleplayerServer().getWorldData().getLevelName());
+        } else if (client.getCurrentServer() != null) {
+            world.addProperty("mode", "multiplayer");
+            world.addProperty("server_address", client.getCurrentServer().ip);
+        } else {
+            world.addProperty("mode", "unknown");
+        }
+        facts.add("world", world);
         facts.addProperty("dimension", client.level.dimension().location().toString());
         facts.addProperty("game_time", client.level.getGameTime());
         facts.addProperty("day_time", client.level.getDayTime());

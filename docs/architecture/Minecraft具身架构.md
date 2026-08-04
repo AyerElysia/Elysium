@@ -40,10 +40,20 @@ NeoForge + Baritone    DXcam + SendInput
 - 由游戏主线程采集位置、视角、生命、物品栏、附近实体、Baritone 状态和动态能力；
 - 通过带共享密钥认证和 HMAC 的反向 WebSocket 主动连接 WSL，避免对外暴露游戏端口；
 - 传输层有严格序号、有限观测积压、串行发送和丢帧计数；控制与终态回执不可作为普通观测丢弃；
-- 高层移动由 Baritone 执行，低层操作也可通过经过校验的输入批次完成；
+- 高层移动由 Baritone 执行，低层操作只通过类型化、范围受限的动作完成；不向模型暴露任意 Baritone 命令；
 - 死亡时动态暴露 `player.respawn`，恢复后能力随世界状态重新生成。
 
 这条路线在长任务、导航、采集、建造与服务器协作中更稳定，同时保留真实客户端画面、模组兼容性和 OBS 捕捉能力。
+
+### 正式所有权与就绪
+
+Minecraft 是 `LifeEngineService` 独立持有的可选场景，不属于 LearningScheduler。`minecraft.enabled=true` 时才注册 `nucleus_minecraft`；Learning 关闭不会隐藏或接管它。service 的部分初始化失败和 stop 都会幂等关闭 session，失败 owner 保留以便重试，同时继续释放其他资源。
+
+“已经启动”不等于“身体就绪”。Agent Body 必须通过固定版本和摘要预检、共享令牌认证、Bridge/能力匹配、两条连续观察，并明确报告正确单人世界、`world_loaded=true`、`client_paused=false` 和玩家 UUID。标题页、暂停菜单、错误世界、过期桥接、静止观察或多个候选窗口都是显式失败。
+
+### 重放与完成语义
+
+命令账本以 command ID 和规范化载荷摘要去重。完全相同的重试复用已有 ack/终态；相同 ID 配不同载荷被拒绝；pending 不会因有界终态缓存淘汰而丢失。接单回执不代表任务完成，结论必须引用终态回执及其后的新观察。每个 session 将这些证据写成追加式哈希链。
 
 ## Biomimetic Body：完全仿生路线
 
@@ -81,7 +91,9 @@ OBS 使用 Game Capture。当前 Java 客户端在窗口枚举中不可选时，
 ## 验收门槛
 
 - 契约测试：认证、重放拒绝、序号、去重、租约、超时、中断和恢复；
-- 执行测试：真实 Baritone 位移有坐标证据，停止和释放有终态回执；
+- 执行测试：真实类型化动作或 Baritone 位移有世界证据，停止和释放有终态回执；
 - 仿生测试：真实鼠标视角变化，同时游戏结构化观测交叉确认，前后帧摘要不同；
 - 直播测试：OBS 预览无黑屏，并产生可播放的本地录制；
 - 故障测试：死亡、窗口丢失、连接重建和观测积压不会留下卡键或伪造成功。
+
+生产部署、固定摘要、真实烟雾测试和故障恢复步骤见[《Minecraft 生产运行手册》](../operations/minecraft_production_runbook.md)，2026-08-04 的实机证据见[《Minecraft 商业级具身系统审计与生产交付报告》](../report/minecraft-commercial-audit-2026-08-02.md)。

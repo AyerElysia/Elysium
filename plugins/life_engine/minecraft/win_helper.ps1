@@ -121,26 +121,21 @@ public class WinAPI {
 "@ -ReferencedAssemblies System.Drawing
 
 function Find-MinecraftWindow {
-    # Try exact title first, then partial match
-    $hwnd = [WinAPI]::FindWindow($null, "Minecraft* 1.21.1")
-    if ($hwnd -eq [IntPtr]::Zero) {
-        $hwnd = [WinAPI]::FindWindow($null, "Minecraft 1.21.1")
+    # Bind only to one exact Minecraft 1.21.1 Java client.  A generic Java
+    # window or an ambiguous pair of clients is never safe to control.
+    $matches = @(
+        Get-Process -Name "java","javaw" -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.MainWindowHandle -ne [IntPtr]::Zero -and
+                $_.MainWindowTitle -match '(?i)^Minecraft\b.*\b1\.21\.1\b'
+            }
+    )
+    $script:MinecraftWindowMatchCount = $matches.Count
+    $script:MinecraftWindowMatchPids = @($matches | ForEach-Object { $_.Id })
+    if ($matches.Count -ne 1) {
+        return [IntPtr]::Zero
     }
-    if ($hwnd -eq [IntPtr]::Zero) {
-        # Search by process
-        $proc = Get-Process -Name "java","javaw" -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero }
-        if ($proc) {
-            $hwnd = $proc.MainWindowHandle
-        }
-    }
-    if ($hwnd -eq [IntPtr]::Zero) {
-        # Try any window with "Minecraft" in title via EnumWindows
-        $procs = Get-Process | Where-Object { $_.MainWindowTitle -like "*Minecraft*" -and $_.MainWindowHandle -ne [IntPtr]::Zero }
-        if ($procs) {
-            $hwnd = $procs[0].MainWindowHandle
-        }
-    }
-    return $hwnd
+    return $matches[0].MainWindowHandle
 }
 
 function Get-WindowRect($hwnd) {
@@ -156,8 +151,16 @@ switch ($Command) {
             $rect = Get-WindowRect $hwnd
             $w = $rect.Right - $rect.Left
             $h = $rect.Bottom - $rect.Top
-            Write-Output "OK|$($hwnd.ToInt64())|$($rect.Left)|$($rect.Top)|$w|$h"
+            $proc = Get-Process | Where-Object { $_.MainWindowHandle -eq $hwnd } | Select-Object -First 1
+            $titleBytes = [System.Text.Encoding]::UTF8.GetBytes([string]$proc.MainWindowTitle)
+            $titleBase64 = [Convert]::ToBase64String($titleBytes)
+            Write-Output "OK|$($hwnd.ToInt64())|$($rect.Left)|$($rect.Top)|$w|$h|$($proc.Id)|$titleBase64"
         } else {
+            if ($script:MinecraftWindowMatchCount -gt 1) {
+                $owners = ($script:MinecraftWindowMatchPids | Sort-Object) -join ','
+                Write-Output "AMBIGUOUS|$owners"
+                exit 2
+            }
             Write-Output "NOTFOUND"
         }
     }

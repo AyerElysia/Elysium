@@ -6,7 +6,9 @@ WSL2 环境：通过 cmd.exe 调用 Windows 端的 PCL2 启动脚本。
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from typing import Any
@@ -29,7 +31,9 @@ class MCConfig:
     window_x: int = 1700
     window_y: int = 1050
     offline_username: str = "AyerElysia"
-    mc_home: Path = field(default_factory=lambda: Path("/mnt/g/Game/Minecraft/.minecraft"))
+    mc_home: Path = field(
+        default_factory=lambda: Path("/mnt/g/Game/Minecraft/.minecraft")
+    )
     # Windows 端启动脚本路径
     launch_bat: str = r"G:\Game\Minecraft\PCL\LaunchElysia.bat"
     launch_dir: str = r"G:\Game\Minecraft\PCL"
@@ -53,7 +57,18 @@ class MCConfig:
     )
     planner_task_name: str = "agent"
     bridge_ready_timeout_seconds: float = 240.0
-    intent_timeout_seconds: float | None = None
+    world_ready_timeout_seconds: float = 120.0
+    intent_timeout_seconds: float | None = 300.0
+    require_quick_play: bool = True
+    expected_bridge_version: str = "0.2.0"
+    bridge_mod_filename: str = "elysium_bridge-0.2.0.jar"
+    expected_bridge_sha256: str = (
+        "AB455A1285196A7ACAFD996D32E669F1B865880DA20EE29E25481775F1A624CA"
+    )
+    baritone_mod_filename: str = "baritone-unoptimized-neoforge-1.11.2.jar"
+    expected_baritone_sha256: str = (
+        "B413CE0A2754A3C8484AAE39875CF84BE1F999DEE208E86D41B3D0D329D5CA35"
+    )
 
 
 @dataclass(slots=True)
@@ -65,6 +80,7 @@ class LaunchResult:
     window_title: str = "Minecraft"
     error: str = ""
     reused_existing: bool = False
+    window: dict[str, Any] | None = None
 
 
 class MinecraftLauncher:
@@ -83,6 +99,7 @@ class MinecraftLauncher:
     async def check_installation(self) -> dict[str, Any]:
         """检查 MC 安装状态。"""
         mc_home = self._cfg.mc_home
+        launch_script = self._launch_script_path()
         result: dict[str, Any] = {
             "mc_home": str(mc_home),
             "exists": mc_home.exists(),
@@ -90,21 +107,81 @@ class MinecraftLauncher:
             "has_version": False,
             "java_ok": True,  # Windows 端 Java 由 PCL 管理
             "launch_bat": self._cfg.launch_bat,
+            "launch_script_path": str(launch_script),
+            "world_path": str(self.get_world_path()),
+            "world_exists": self.world_exists(),
+            "quick_play_required": self._cfg.require_quick_play,
+            "quick_play_configured": False,
+            "bridge_mod_ready": False,
+            "baritone_mod_ready": False,
         }
 
         # 检查版本
         version_dir = mc_home / "versions" / "neoforge-21.1.219"
         result["has_version"] = version_dir.exists()
 
-        # 检查启动脚本
-        bat_path = Path(self._cfg.launch_bat.replace("\\", "/").replace("G:", "/mnt/g"))
-        result["bat_exists"] = bat_path.exists()
+        # Production startup must name the exact world.  A bridge at the title
+        # screen is connectivity, not readiness.
+        result["bat_exists"] = launch_script.exists()
+        if launch_script.exists():
+            try:
+                content = launch_script.read_text(
+                    encoding="utf-8-sig", errors="replace"
+                )
+            except OSError as exc:
+                result["launch_script_error"] = str(exc)
+            else:
+                quick_play = re.search(
+                    r"--quickPlaySingleplayer(?:=|\s+)(?:\"([^\"]+)\"|'([^']+)'|([^\s]+))",
+                    content,
+                    flags=re.IGNORECASE,
+                )
+                configured_world = (
+                    next((part for part in quick_play.groups() if part), "")
+                    if quick_play
+                    else ""
+                )
+                result["quick_play_world"] = configured_world
+                result["quick_play_configured"] = (
+                    configured_world.casefold() == self._cfg.world_name.casefold()
+                )
 
         # 检查是否有可用的版本
         versions_path = mc_home / "versions"
         if versions_path.exists():
             available = [d.name for d in versions_path.iterdir() if d.is_dir()]
             result["available_versions"] = available
+
+        mods_path = mc_home / "mods"
+        bridge_candidates = (
+            sorted(mods_path.glob("elysium_bridge-*.jar")) if mods_path.is_dir() else []
+        )
+        baritone_candidates = (
+            sorted(mods_path.glob("baritone*.jar")) if mods_path.is_dir() else []
+        )
+        result["bridge_mod_candidates"] = [item.name for item in bridge_candidates]
+        result["baritone_mod_candidates"] = [item.name for item in baritone_candidates]
+        if (
+            len(bridge_candidates) == 1
+            and bridge_candidates[0].name == self._cfg.bridge_mod_filename
+        ):
+            bridge_hash = await asyncio.to_thread(self._sha256, bridge_candidates[0])
+            result["bridge_mod_sha256"] = bridge_hash
+            result["bridge_mod_ready"] = (
+                bridge_hash.casefold() == self._cfg.expected_bridge_sha256.casefold()
+            )
+        if (
+            len(baritone_candidates) == 1
+            and baritone_candidates[0].name == self._cfg.baritone_mod_filename
+        ):
+            baritone_hash = await asyncio.to_thread(
+                self._sha256, baritone_candidates[0]
+            )
+            result["baritone_mod_sha256"] = baritone_hash
+            result["baritone_mod_ready"] = (
+                baritone_hash.casefold()
+                == self._cfg.expected_baritone_sha256.casefold()
+            )
 
         return result
 
@@ -121,32 +198,24 @@ class MinecraftLauncher:
                 pid=pid,
                 window_title=str(existing.get("title") or "Minecraft"),
                 reused_existing=True,
+                window=dict(existing),
             )
 
         await asyncio.to_thread(self._configure_options)
 
-        # 通过 cmd.exe 启动 bat
-        bat_name = PureWindowsPath(self._cfg.launch_bat).name
-        launch_dir = self._cfg.launch_dir
-
-        command_line = f'cd /D "{launch_dir}" && start "" "{bat_name}"'
-        cmd = ["cmd.exe", "/d", "/s", "/c", command_line]
-
+        # Dispatch through an exact Windows-side helper to avoid WSL quoting ambiguity.
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd="/mnt/c",  # 避免 UNC 路径问题
+            dispatch_pid = await self._bridge.launch_minecraft(
+                self._cfg.launch_bat,
+                self._cfg.launch_dir,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
-            if proc.returncode != 0:
-                error = stderr.decode(errors="replace") or stdout.decode(errors="replace")
-                return LaunchResult(success=False, error=error.strip())
-            logger.info(f"Minecraft 启动命令已发送: {bat_name}")
+            logger.info(
+                "Minecraft launch dispatched through Windows helper pid=%s",
+                dispatch_pid,
+            )
             self._running = True
             return LaunchResult(success=True, window_title="Minecraft NeoForge* 1.21.1")
-        except (OSError, TimeoutError) as exc:
+        except (OSError, RuntimeError, TimeoutError) as exc:
             return LaunchResult(success=False, error=str(exc))
 
     def _configure_options(self) -> None:
@@ -157,11 +226,16 @@ class MinecraftLauncher:
 
         try:
             content = options_file.read_text(encoding="utf-8")
-            target = "pauseOnLostFocus:false" if not self._cfg.pause_on_lost_focus else "pauseOnLostFocus:true"
+            target = (
+                "pauseOnLostFocus:false"
+                if not self._cfg.pause_on_lost_focus
+                else "pauseOnLostFocus:true"
+            )
 
             if "pauseOnLostFocus:" in content:
                 # 替换现有设置
                 import re
+
                 content = re.sub(r"pauseOnLostFocus:\w+", target, content)
             else:
                 # 添加设置
@@ -175,6 +249,7 @@ class MinecraftLauncher:
     async def wait_for_window(self, timeout: float = 120.0) -> dict[str, Any] | None:
         """等待 MC 窗口出现，并定位到指定位置。"""
         import time
+
         start = time.time()
         while time.time() - start < timeout:
             win = await self._bridge.find_window()
@@ -182,8 +257,10 @@ class MinecraftLauncher:
                 logger.info(f"MC 窗口已出现: hwnd={win['hwnd']}, {win['w']}x{win['h']}")
                 # 定位窗口到指定位置（右下角小窗）
                 await self._bridge.position_window(
-                    self._cfg.window_x, self._cfg.window_y,
-                    self._cfg.window_width, self._cfg.window_height,
+                    self._cfg.window_x,
+                    self._cfg.window_y,
+                    self._cfg.window_width,
+                    self._cfg.window_height,
                 )
                 # 更新窗口信息
                 win = await self._bridge.find_window()
@@ -210,3 +287,24 @@ class MinecraftLauncher:
     def world_exists(self) -> bool:
         """检查世界是否存在。"""
         return self.get_world_path().exists()
+
+    def _launch_script_path(self) -> Path:
+        """Translate one explicit Windows launch script into its WSL path."""
+
+        windows_path = PureWindowsPath(self._cfg.launch_bat)
+        drive = windows_path.drive.rstrip(":").casefold()
+        if len(drive) != 1 or not drive.isalpha():
+            raise ValueError(
+                f"launch_bat must be an absolute drive path: {self._cfg.launch_bat}"
+            )
+        return Path(f"/mnt/{drive}", *windows_path.parts[1:])
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        """Hash one pinned deployment artifact without loading it all at once."""
+
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest().upper()

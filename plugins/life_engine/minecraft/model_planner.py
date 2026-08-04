@@ -102,7 +102,9 @@ class JsonIntentPlanner:
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError as exception:
-            raise PlannerOutputError("planner output was not strict JSON") from exception
+            raise PlannerOutputError(
+                "planner output was not strict JSON"
+            ) from exception
         if not isinstance(payload, dict):
             raise PlannerOutputError("planner output must be a JSON object")
         has_command = "command" in payload
@@ -211,17 +213,26 @@ class ElysiumModelDecisionSource:
 
 
 AGENT_BRIDGE_GUIDANCE = """\
-- baritone.command: parameters {"command": "a Baritone command without the # prefix"}.
-  Dispatch is not world-goal completion; inspect later observations. Commands
-  such as `goal x y z`, `path`, `mine minecraft:oak_log`, `follow player NAME`,
-  and `stop` are available when supported by the installed Baritone build.
-- native.input_batch: parameters may contain a complete `holds` object for
+- navigation.goto: parameters {"x": integer, "y": integer, "z": integer}.
+- navigation.follow: parameters {"player": "exact Minecraft account name"}.
+- navigation.stop: parameters {}.
+- world.mine: parameters {"block": "minecraft resource identifier"}. This
+  starts deterministic mining; later observations must prove block or inventory
+  changes before concluding that anything was collected.
+- movement.input: parameters may contain a complete `holds` object for
   forward/back/left/right/jump/sneak/sprint/attack/use/drop, a `pulses` array,
-  `look_delta` with yaw/pitch degrees, `hotbar_slot` from 0 through 8, and chat.
+  `look_delta` with bounded yaw/pitch degrees, and `hotbar_slot` from 0 through 8.
+- interaction.attack / interaction.use / item.drop: parameters {}.
+- inventory.select_hotbar: parameters {"slot": integer from 0 through 8}.
+- observation.wait: parameters {}. It performs no world action; use it to await
+  the next structured state while navigation or mining is still in progress.
 - chat.send: parameters {"message": "exact message"}.
 - player.respawn: parameters {}. Dispatch only when the latest player facts
   report dead_or_dying=true; a living player rejects this operation.
 - control.release_all: parameters {}.
+- A receipt proves only dispatch. Navigation, mining, interaction, inventory,
+  and survival outcomes require a later observation with the relevant factual
+  position, block, entity, or inventory change.
 """
 
 
