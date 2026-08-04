@@ -126,6 +126,32 @@ class _Planner:
         )
 
 
+class _AsyncRegistry:
+    """Expose the synchronous registry through awaitable Presence callbacks."""
+
+    def __init__(self, *, fail_touch: bool = False) -> None:
+        self._inner = ConsciousnessRegistry()
+        self.fail_touch = fail_touch
+        self.calls: list[str] = []
+
+    async def register(self, instance: Any) -> None:
+        self.calls.append("register")
+        self._inner.register(instance)
+
+    async def touch(self, instance_id: str, **kwargs: Any) -> None:
+        self.calls.append("touch")
+        if self.fail_touch:
+            raise RuntimeError("async Presence touch failed")
+        self._inner.touch(instance_id, **kwargs)
+
+    async def terminate(self, instance_id: str, **kwargs: Any) -> None:
+        self.calls.append("terminate")
+        self._inner.terminate(instance_id, **kwargs)
+
+    def get(self, instance_id: str) -> Any:
+        return self._inner.get(instance_id)
+
+
 async def _started_session(
     tmp_path: Path,
 ) -> tuple[MinecraftSession, _Bridge, ConsciousnessRegistry, list[dict[str, Any]]]:
@@ -211,3 +237,185 @@ async def test_session_returns_full_intention_evidence(tmp_path: Path) -> None:
     assert len(result["observations"]) == 2
     assert session.state.conclusions == [result["conclusion"]]
     assert planner.contexts[0]["transient_world_perception"] == "shared-presence"
+
+
+async def test_session_awaits_async_presence_lifecycle_callbacks(
+    tmp_path: Path,
+) -> None:
+    """Async register, touch, terminate, and save complete before API success."""
+
+    registry = _AsyncRegistry()
+    saves: list[str] = []
+
+    async def save_registry() -> None:
+        saves.append("save")
+
+    bridge = _Bridge()
+    session = MinecraftSession(
+        workspace=tmp_path,
+        mc_config=MCConfig(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
+        consciousness_registry=registry,
+        save_consciousness_registry=save_registry,
+    )
+    session._launcher = _Launcher()
+
+    async def wait_for_bridge(profile: Any) -> _Bridge:
+        return bridge
+
+    session._wait_for_bridge = wait_for_bridge
+
+    started = await session.start(body_name="agent")
+    assert started["success"] is True
+    assert registry.calls == ["register"]
+    assert saves == ["save"]
+
+    await session._on_trace("test.trace", {"source": "test"})
+    assert registry.calls == ["register", "touch"]
+    assert saves == ["save", "save"]
+
+    stopped = await session.stop()
+    assert stopped["success"] is True
+    assert registry.calls == ["register", "touch", "terminate"]
+    assert saves == ["save", "save", "save"]
+
+
+async def test_session_reports_async_presence_touch_failure(
+    tmp_path: Path,
+) -> None:
+    """A failed durable Presence touch cannot be reported as intent success."""
+
+    registry = _AsyncRegistry(fail_touch=True)
+    bridge = _Bridge()
+    session = MinecraftSession(
+        workspace=tmp_path,
+        mc_config=MCConfig(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
+        consciousness_registry=registry,
+    )
+    session._launcher = _Launcher()
+
+    async def wait_for_bridge(profile: Any) -> _Bridge:
+        return bridge
+
+    session._wait_for_bridge = wait_for_bridge
+    started = await session.start(body_name="agent")
+    assert started["success"] is True
+    session._planner = _Planner()
+
+    result = await session.do_intent("walk to x=3")
+
+    assert result["success"] is False
+    assert result["error"] == "async Presence touch failed"
+    registry.fail_touch = False
+    await session.stop()
+
+
+async def test_session_cleans_up_when_async_presence_save_fails(
+    tmp_path: Path,
+) -> None:
+    """Startup returns failure and releases the bridge after durable save failure."""
+
+    registry = _AsyncRegistry()
+    bridge = _Bridge()
+
+    async def save_registry() -> None:
+        raise RuntimeError("async Presence save failed")
+
+    session = MinecraftSession(
+        workspace=tmp_path,
+        mc_config=MCConfig(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
+        consciousness_registry=registry,
+        save_consciousness_registry=save_registry,
+    )
+    session._launcher = _Launcher()
+
+    async def wait_for_bridge(profile: Any) -> _Bridge:
+        return bridge
+
+    session._wait_for_bridge = wait_for_bridge
+
+    result = await session.start(body_name="agent")
+
+    assert result["success"] is False
+    assert "async Presence save failed" in result["error"]
+    assert session.is_active is False
+    assert bridge.closed is True
+
+
+async def test_session_awaits_async_perception_prepare_and_commit(
+    tmp_path: Path,
+) -> None:
+    """Async perception preparation is consumed and its cursor is committed."""
+
+    prepared = SimpleNamespace(content="async shared perception")
+    calls: list[str] = []
+
+    async def prepare_perception(instance_id: str) -> Any:
+        calls.append(f"prepare:{instance_id}")
+        return prepared
+
+    async def commit_perception(value: Any) -> None:
+        assert value is prepared
+        calls.append("commit")
+
+    bridge = _Bridge()
+    session = MinecraftSession(
+        workspace=tmp_path,
+        mc_config=MCConfig(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
+        prepare_perception=prepare_perception,
+        commit_perception=commit_perception,
+    )
+    session._launcher = _Launcher()
+
+    async def wait_for_bridge(profile: Any) -> _Bridge:
+        return bridge
+
+    session._wait_for_bridge = wait_for_bridge
+    started = await session.start(body_name="agent")
+    assert started["success"] is True
+    planner = _Planner()
+    session._planner = planner
+
+    result = await session.do_intent("walk to x=3")
+
+    assert result["success"] is True
+    assert planner.contexts[0]["transient_world_perception"] == prepared.content
+    assert calls == [
+        f"prepare:{session.state.consciousness_instance_id}",
+        "commit",
+    ]
+    await session.stop()
+
+
+async def test_session_reports_async_perception_commit_failure(
+    tmp_path: Path,
+) -> None:
+    """A failed async cursor commit cannot be reported as intent success."""
+
+    async def prepare_perception(instance_id: str) -> Any:
+        return SimpleNamespace(content=f"prepared:{instance_id}")
+
+    async def commit_perception(value: Any) -> None:
+        raise RuntimeError("async perception commit failed")
+
+    bridge = _Bridge()
+    session = MinecraftSession(
+        workspace=tmp_path,
+        mc_config=MCConfig(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
+        prepare_perception=prepare_perception,
+        commit_perception=commit_perception,
+    )
+    session._launcher = _Launcher()
+
+    async def wait_for_bridge(profile: Any) -> _Bridge:
+        return bridge
+
+    session._wait_for_bridge = wait_for_bridge
+    started = await session.start(body_name="agent")
+    assert started["success"] is True
+    session._planner = _Planner()
+
+    result = await session.do_intent("walk to x=3")
+
+    assert result["success"] is False
+    assert result["error"] == "async perception commit failed"
+    await session.stop()
