@@ -678,6 +678,14 @@ backend_generation = "<local-generation-id>"
 
 ### 15.7 阶段 4：主体文档版本
 
+2026-08-04 交付状态：SubjectDocumentStore 的 local/MySQL 适配、精确字节
+版本、revision/head CAS、不可变 head event、带租约 projection outbox、受控
+文件观察与 parent-hash 工作区投影已实现。在线候选快照的 1,404 份声明主体
+文档已完成 MySQL shadow 复制与反向导出，逐文件 0 差异；由于
+`writer_frozen=false` 且远端账号不能创建不可变 trigger，该副本保持不可激活。
+现有 `memory_artifact_versions` 的历史文本版本仍归 Memory 权威账本保存，后续
+复制时只做显式交叉引用；不得把历史 TEXT 伪称为已经恢复的原始字节。
+
 交付：
 
 - SubjectDocumentStore；

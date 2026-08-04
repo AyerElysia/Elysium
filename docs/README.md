@@ -21,6 +21,7 @@
 - [生命域可选 MySQL / 本地存储重构方案](./architecture/Elysium生命域可选MySQL与本地存储重构方案.md) — 单写权威、双后端合同、无损迁移与分阶段完成定义
 - [生命域存储快照与权威切换运行手册](./operations/life_storage_backend_runbook.md) — 候选快照、generation、epoch/fencing、切换门与回滚边界
 - [生命域可选存储阶段 3 / Life Event 交付报告](./report/life-storage-phase3-life-event-2026-08-04.md) — 事件账本双适配、候选复制控制、86,094 条真实影子复制与 0 差异反向导出
+- [生命域可选存储阶段 4A / 主体文档交付报告](./report/life-storage-phase4-subject-document-2026-08-04.md) — 精确字节版本、CAS/投影安全、1,404 份真实 MySQL shadow 与 0 差异反向导出
 - [Elysium Console 前端提案](./architecture/Elysium控制台前端提案.md) — 已批准的插件驱动统一控制台与分阶段验收计划
 - [Elysium Console Stage 0 设计基线](./architecture/Elysium控制台阶段零交互设计.md) — 此刻、Live Ready、Live Call 与安全降级页的交互规范
 - [Elysium Console 安全模型](./architecture/Elysium控制台安全模型.md) — 插件页面、密钥、OBS、会话与主进程生命周期边界

@@ -28,8 +28,20 @@ from .models import (
     GenerationStatus,
     StorageAvailability,
 )
+from .subject_contracts import (
+    AppendSubjectDocumentVersion,
+    SubjectDocumentCommit,
+    SubjectDocumentConflict,
+    SubjectDocumentHead,
+    SubjectDocumentNotFound,
+    SubjectDocumentStorePort,
+    SubjectDocumentVersion,
+)
+from .subject_factory import open_subject_document_store
+from .subject_workspace import SubjectWorkspaceObserver, SubjectWorkspaceProjector
 
 __all__ = [
+    "AppendSubjectDocumentVersion",
     "AuthorityProvider",
     "AuthorityToken",
     "BackendGeneration",
@@ -50,7 +62,16 @@ __all__ = [
     "StorageBackendRuntime",
     "StorageFactorySettings",
     "StorageWriterRole",
+    "SubjectDocumentCommit",
+    "SubjectDocumentConflict",
+    "SubjectDocumentHead",
+    "SubjectDocumentNotFound",
+    "SubjectDocumentStorePort",
+    "SubjectDocumentVersion",
+    "SubjectWorkspaceObserver",
+    "SubjectWorkspaceProjector",
     "open_life_event_store",
     "open_storage_backend",
+    "open_subject_document_store",
     "settings_from_life_engine_config",
 ]

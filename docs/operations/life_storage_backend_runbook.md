@@ -142,6 +142,40 @@ Life Event 旧账本迁移必须使用 exact snapshot import。禁止先反序�
 
 当前已验证的 Life Event 恢复副本位于 `C:\Temp\Data\ElysiumBackups\life-event-reverse-20260804T0735Z`。它是恢复演练资产，不是 active backend，也不授权自动切换。
 
+### 6.4 Subject Document 精确复制与工作区边界
+
+Subject Document 的候选复制使用：
+
+```bash
+uv run python scripts/migrate_life_subject_documents.py \
+  --snapshot /absolute/life-domain-candidate \
+  --run-id subject-shadow-<manifest-prefix> \
+  --reverse-export /new/subject-reverse-export
+```
+
+连接信息只能通过 `ELYSIUM_LIFE_STORAGE_MYSQL_HOST/PORT/DATABASE/USER/PASSWORD`
+环境变量提供。命令只选择明确声明的 SOUL、USER、MEMORY 与两个 diary
+命名空间，逐文件保存 `LONGBLOB` 原始字节、hash、字节长度、换行/编码诊断与
+“语义来源未知”状态。反向导出同样只允许写入此前不存在的新目录。
+
+只读独立复核使用：
+
+```bash
+uv run python scripts/audit_life_subject_shadow.py \
+  --snapshot /absolute/life-domain-candidate \
+  --reverse-export /absolute/subject-reverse-export
+```
+
+当前验证通过的恢复副本位于
+`C:\Temp\Data\ElysiumBackups\subject-reverse-20260804T0806Z`，共 1,404
+份文档、10,316,470 字节，正向/远端/反向根均为
+`d4c83a81d8df0895898ced696ba0ef63167281224faecff25ca9ce99f7cca966`。
+它仍来自 `writer_frozen=false` 快照，不是 active backend。
+
+工作区投影必须遵守 parent-hash 门：目标文件等于新版本时幂等确认；等于已知
+parent 时才允许原子替换；任何其他字节都视为外部变化并保留原文件，随后由
+observer 追加为新观察。禁止为了“让数据库和文件一致”而覆盖未知外部改动。
+
 ## 7. 正式切换验收门
 
 必须同时满足后才允许人工切换：

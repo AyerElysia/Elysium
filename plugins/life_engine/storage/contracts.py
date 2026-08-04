@@ -62,6 +62,7 @@ class StorageBackendRuntime:
     _write_fence: WriteFence | None = None
     _writer_validator: WriterValidator | None = None
     writer_role: StorageWriterRole = StorageWriterRole.ACTIVE
+    writer_epoch: int = 0
     _closed: bool = False
 
     @classmethod
