@@ -197,18 +197,17 @@ async def ensure_presence_world_schema(runtime: StorageBackendRuntime) -> None:
     if not runtime.enabled or runtime.engine is None:
         raise RuntimeError("presence/world schema requires an enabled storage runtime")
     if runtime.backend == BackendKind.MYSQL:
-        registry = runtime.authority_registry
-        token = runtime.authority_token
-        if registry is None or token is None:
-            raise RuntimeError("presence/world schema requires active authority")
-        await registry.validate(token)
+        # Active production and candidate-copy writers share one fail-closed
+        # validation surface.  This lets a fenced shadow migration create its
+        # empty schema without inventing or activating a production generation.
+        await runtime.validate_writer()
         runner = MySQLMigrationRunner(
             runtime.engine,
             table_name="life_presence_world_schema_migrations",
             lock_name="elysium:life-presence-world-schema",
         )
         await runner.apply((_MYSQL_MIGRATION,))
-        await registry.validate(token)
+        await runtime.validate_writer()
     else:
         async with runtime.unit_of_work() as uow:
             for statement in _LOCAL_STATEMENTS:

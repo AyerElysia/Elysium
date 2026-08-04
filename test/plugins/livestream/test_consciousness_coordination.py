@@ -24,12 +24,48 @@ class _Service:
     def __init__(self) -> None:
         self.consciousness_registry = ConsciousnessRegistry()
         self.observations: list[dict[str, Any]] = []
-        self.saves = 0
         self.commits: list[PreparedPerception] = []
         self.current_position = 0
+        self.lifecycle_calls: list[str] = []
 
-    def save_consciousness_registry(self) -> None:
-        self.saves += 1
+    async def register_consciousness_instance(
+        self,
+        instance: Any,
+    ) -> Any:
+        self.lifecycle_calls.append("register")
+        return self.consciousness_registry.register(instance)
+
+    async def touch_consciousness_instance(
+        self,
+        instance_id: str,
+        **kwargs: Any,
+    ) -> None:
+        self.lifecycle_calls.append("touch")
+        self.consciousness_registry.touch(instance_id, **kwargs)
+
+    async def resume_consciousness_instance(
+        self,
+        instance_id: str,
+        **kwargs: Any,
+    ) -> bool:
+        self.lifecycle_calls.append("resume")
+        return self.consciousness_registry.resume(instance_id, **kwargs)
+
+    async def suspend_consciousness_instance(
+        self,
+        instance_id: str,
+        **kwargs: Any,
+    ) -> bool:
+        self.lifecycle_calls.append("suspend")
+        return self.consciousness_registry.suspend(instance_id, **kwargs)
+
+    async def terminate_consciousness_instance(
+        self,
+        instance_id: str,
+        **kwargs: Any,
+    ) -> bool:
+        self.lifecycle_calls.append("terminate")
+        return self.consciousness_registry.terminate(instance_id, **kwargs)
 
     async def report_world_observation(
         self,
@@ -39,7 +75,7 @@ class _Service:
         self.observations.append({"report": report, **kwargs})
         return {"assertion_id": f"a-{len(self.observations)}"}
 
-    def prepare_perception(self, instance_id: str) -> PreparedPerception:
+    async def prepare_perception(self, instance_id: str) -> PreparedPerception:
         return PreparedPerception(
             instance_id=instance_id,
             from_position=self.current_position,
@@ -50,7 +86,10 @@ class _Service:
             change_positions=(5,) if self.current_position < 5 else (),
         )
 
-    def commit_perception(self, prepared: PreparedPerception) -> tuple[int, int]:
+    async def commit_perception(
+        self,
+        prepared: PreparedPerception,
+    ) -> tuple[int, int]:
         assert prepared.from_position == self.current_position
         self.current_position = prepared.through_position
         self.commits.append(prepared)
@@ -76,6 +115,7 @@ async def test_livestream_uses_presence_lease_and_observation_events() -> None:
     assert instance.is_active
     assert instance.session_id == "session-1"
     assert instance.lease_duration_seconds == 300
+    assert service.lifecycle_calls[:2] == ["register", "touch"]
     assert service.observations[-1]["source_instance_id"] == manager.instance_id
     assert service.observations[-1]["subject"] == manager.stream_id
     previous_revision = instance.revision
@@ -235,7 +275,7 @@ async def test_world_perception_checkpoint_commit_is_idempotent() -> None:
         cursor_revision=0,
     )
 
-    assert manager.commit_perception_checkpoint(checkpoint) == (5, 1)
-    assert manager.commit_perception_checkpoint(checkpoint) == (5, 1)
+    assert await manager.commit_perception_checkpoint(checkpoint) == (5, 1)
+    assert await manager.commit_perception_checkpoint(checkpoint) == (5, 1)
     assert len(service.commits) == 1
     await manager.suspend(reason="test-ended")

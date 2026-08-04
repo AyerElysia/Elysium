@@ -189,8 +189,7 @@ class LifeChatterDeliberator:
             if callable(save):
                 await save()
         if world_perception is not None:
-            await asyncio.to_thread(
-                self._consciousness.commit_perception_checkpoint,
+            await self._consciousness.commit_perception_checkpoint(
                 world_perception,
             )
 
@@ -222,7 +221,7 @@ class LifeChatterDeliberator:
         unread_lines = "\n".join(event.display_text for event in events)
         self._context_high_water = 0
         self._perception_checkpoint = None
-        prepared = await asyncio.to_thread(self._consciousness.prepare_perception)
+        prepared = await self._consciousness.prepare_perception()
         world_context = (
             "<transient_world_perception>\n"
             f"{prepared.content}\n"

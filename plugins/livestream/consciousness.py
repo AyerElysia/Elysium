@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime
 from typing import Any
 
@@ -64,7 +63,6 @@ class LivestreamConsciousnessManager:
         service = self.life_service()
         registry = service.consciousness_registry
         now = _now()
-        registry.reconcile_expired(timestamp=now)
         existing = registry.get(self.instance_id)
         if existing is not None and existing.kind != "livestream":
             raise RuntimeError(f"consciousness identity conflict: {self.instance_id}")
@@ -81,7 +79,7 @@ class LivestreamConsciousnessManager:
                 raise RuntimeError(
                     "livestream room is already owned by another active session"
                 )
-            registry.touch(
+            await service.touch_consciousness_instance(
                 self.instance_id,
                 timestamp=now,
                 reason="livestream_start_retried",
@@ -93,11 +91,15 @@ class LivestreamConsciousnessManager:
                 and existing.is_suspended
                 and existing.session_id != self.session_id
             ):
-                registry.terminate(
+                terminated = await service.terminate_consciousness_instance(
                     self.instance_id,
                     timestamp=now,
                     reason="livestream_new_session",
                 )
+                if not terminated:
+                    raise RuntimeError(
+                        "livestream could not terminate the previous suspended session"
+                    )
                 existing = registry.get(self.instance_id)
             if existing is None or existing.status == "terminated":
                 instance = ConsciousnessInstance(
@@ -120,16 +122,17 @@ class LivestreamConsciousnessManager:
                         self._config.server.presence_lease_seconds
                     ),
                 )
-                registry.register(instance)
+                instance = await service.register_consciousness_instance(instance)
             else:
-                registry.resume(
+                resumed = await service.resume_consciousness_instance(
                     self.instance_id,
                     timestamp=now,
                     reason="livestream_session_resumed",
                 )
+                if not resumed:
+                    raise RuntimeError("livestream suspended session could not resume")
                 instance = existing
 
-        await asyncio.to_thread(service.save_consciousness_registry)
         self._instance = instance
         await self.report_state("直播已由操作员手动开始")
         return instance
@@ -140,12 +143,11 @@ class LivestreamConsciousnessManager:
         if not self.is_active:
             raise RuntimeError("livestream consciousness is not active")
         service = self.life_service()
-        service.consciousness_registry.touch(
+        await service.touch_consciousness_instance(
             self.instance_id,
             timestamp=_now(),
             reason="livestream_lease_renewal",
         )
-        await asyncio.to_thread(service.save_consciousness_registry)
 
     async def report_state(self, state_text: str) -> dict[str, Any]:
         """Append one attributed observation without mutating a world snapshot."""
@@ -157,12 +159,11 @@ class LivestreamConsciousnessManager:
             raise RuntimeError("livestream consciousness is not active")
         service = self.life_service()
         now = _now()
-        service.consciousness_registry.touch(
+        await service.touch_consciousness_instance(
             self.instance_id,
             timestamp=now,
             reason="livestream_state_reported",
         )
-        await asyncio.to_thread(service.save_consciousness_registry)
         return await service.report_world_observation(
             text,
             source_instance_id=self.instance_id,
@@ -173,14 +174,14 @@ class LivestreamConsciousnessManager:
             observed_at=now,
         )
 
-    def prepare_perception(self) -> PreparedPerception:
+    async def prepare_perception(self) -> PreparedPerception:
         """Prepare this room's transient world view without moving its cursor."""
 
         if not self.is_active:
             raise RuntimeError("livestream consciousness is not active")
-        return self.life_service().prepare_perception(self.instance_id)
+        return await self.life_service().prepare_perception(self.instance_id)
 
-    def commit_perception_checkpoint(
+    async def commit_perception_checkpoint(
         self,
         checkpoint: WorldPerceptionCheckpoint,
     ) -> tuple[int, int]:
@@ -189,7 +190,7 @@ class LivestreamConsciousnessManager:
         if checkpoint.instance_id != self.instance_id:
             raise RuntimeError("world perception checkpoint belongs to another instance")
         service = self.life_service()
-        current = service.prepare_perception(self.instance_id)
+        current = await service.prepare_perception(self.instance_id)
         if current.from_position >= checkpoint.through_position:
             return current.from_position, current.cursor_revision
         if current.from_position != checkpoint.from_position:
@@ -205,7 +206,7 @@ class LivestreamConsciousnessManager:
             assertion_ids=(),
             change_positions=(),
         )
-        return service.commit_perception(prepared)
+        return await service.commit_perception(prepared)
 
     async def suspend(self, *, reason: str = "manual stop") -> None:
         """Append the closing observation and release the room stream claim."""
@@ -215,10 +216,11 @@ class LivestreamConsciousnessManager:
             return
         service = self.life_service()
         await self.report_state(f"直播已结束：{reason}")
-        service.consciousness_registry.suspend(
+        suspended = await service.suspend_consciousness_instance(
             self.instance_id,
             timestamp=_now(),
             reason=reason,
         )
-        await asyncio.to_thread(service.save_consciousness_registry)
+        if not suspended:
+            raise RuntimeError("livestream presence could not be suspended")
         self._instance = None

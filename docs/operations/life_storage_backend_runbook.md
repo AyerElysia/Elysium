@@ -1,13 +1,15 @@
 # 生命域存储快照与权威切换运行手册
 
-本手册服务于 Elysium 生命域可选本地/MySQL 存储。它不包含真实主机、用户名、密码或 fencing token。Memory 的六 Port、local/MySQL 适配与 MySQL schema 已实现，但完整生命域适配、正式数据复制校验、恢复演练和人工切换尚未完成，因此本手册中的正式切换步骤是**验收门**，不是当前可以执行的上线指令。
+本手册服务于 Elysium 生命域可选本地/MySQL 存储。它不包含真实主机、用户名、密码或 fencing token。Life Event、Memory、Subject Document、Presence、World、Learning 的 Port/adapter、`LifeEngineService` 单 runtime 接线、未冻结候选复制和反向恢复均已实现；正式冻结复制、隔离 MySQL 破坏性合同、数据库级不可变保护和人工切换尚未完成，因此本手册中的正式切换步骤是**验收门**，不是当前可以执行的上线指令。
 
 ## 1. 当前安全状态
 
 - `storage.enabled = false` 是默认值，也是当前生产要求；
 - 正式权威仍为既有本地 SQLite、Markdown、JSON/JSONL 与媒体文件；
 - 新的存储 runtime 不会自动创建、注册、激活或切换 generation；
+- `LifeEngineService` 是唯一 runtime owner；各子域只消费注入对象，禁止自行再次打开或关闭 runtime；
 - 后端打开失败时 fail closed，不会从 MySQL 静默回退到 local，也不会反向回退；
+- enabled 模式不打开或双写旧 Life Event、Presence、World SQLite，也不回写 `.life_learning`；disabled 模式保持原 local 行为；
 - 快照、迁移和校验器没有删除、移动、截断或覆盖源数据的权限；
 - Elysium 只能由用户手动启动。脚本不会停止或重启 Elysium。
 
@@ -111,7 +113,21 @@ Memory 的本地合同测试不需要外部服务；真实 MySQL 合同测试必
 - `ELYSIUM_TEST_MYSQL_PASSWORD`
 - `ELYSIUM_TEST_MYSQL_SSL_MODE`
 
-未提供必要变量时，真实 MySQL 用例必须明确显示为 skipped；不得借用正式数据库，也不得把 skipped 记作真实远程验收通过。测试会创建 Memory v1-v6 schema、注册隔离 generation、取得短租约 authority 并在结束时清理本次稳定身份；schema 初始化尚未完成时不得尝试清理尚不存在的领域表。
+未提供必要变量时，真实 MySQL 用例必须明确显示为 skipped；不得借用正式数据库，也不得把 skipped 记作真实远程验收通过。测试会创建 Memory v1-v8 schema、注册隔离 generation、取得短租约 authority 并在结束时清理本次稳定身份；schema 初始化尚未完成时不得尝试清理尚不存在的领域表。
+
+### 6.2 Presence/World 隔离合同验证
+
+本地与 fake 合同验证覆盖数据库时间 lease、过期回收/takeover、revision/stream 并发、lifecycle outbox、World frontier/rebuild/cursor；service 级合同还会分别模拟 local/mysql 选择，证明单 runtime 注入、禁止旧 SQLite、重启恢复与失败关闭。真实 MySQL Presence/World 合同除通用 `ELYSIUM_TEST_MYSQL_*` 外，还必须显式设置：
+
+```text
+ELYSIUM_TEST_MYSQL_PRESENCE_WORLD_ISOLATED=1
+```
+
+该标志表示目标是允许整表 rebuild/cleanup 的专用隔离库，不得指向正式库。业务启动一律以 `initialize_schema=false` 打开 adapter；缺表必须失败，不能让 Elysium 启动流程代替迁移器建表。
+
+### 6.3 单 runtime 启动与关闭顺序
+
+enabled 模式的固定顺序是：service 打开并拥有一个 runtime → 注入 Memory → 从同一 runtime 构造 Life Event/Presence/World/Subject/Learning → 启动上层消费者。Learning 只消费注入的 `LearningStorePort` 与同一 `SubjectDocumentStorePort`，不得另开 store。关闭顺序相反：先停止上层任务 → flush/关闭 Learning、Memory 等消费者 → flush Presence outbox 并追平 World → 最后且仅一次关闭 runtime。任一消费者关闭失败都不得阻止后续消费者和 runtime 释放；最终以聚合异常报告，不静默吞掉。启动中途失败同样执行这一逆序清理。
 
 本阶段只验证适配器合同，不会修改 `storage.enabled`、不会迁移正式数据、不会注册或激活正式 generation，也不会启动或停止 Elysium、NapCat 或其他运行进程。
 
@@ -142,11 +158,147 @@ Life Event 旧账本迁移必须使用 exact snapshot import。禁止先反序�
 
 当前已验证的 Life Event 恢复副本位于 `C:\Temp\Data\ElysiumBackups\life-event-reverse-20260804T0735Z`。它是恢复演练资产，不是 active backend，也不授权自动切换。
 
+### 6.4 Subject Document 精确复制与工作区边界
+
+Subject Document 的候选复制使用：
+
+```bash
+uv run python scripts/migrate_life_subject_documents.py \
+  --snapshot /absolute/life-domain-candidate \
+  --run-id subject-shadow-<manifest-prefix> \
+  --reverse-export /new/subject-reverse-export
+```
+
+连接信息只能通过 `ELYSIUM_LIFE_STORAGE_MYSQL_HOST/PORT/DATABASE/USER/PASSWORD`
+环境变量提供。命令只选择明确声明的 SOUL、USER、MEMORY 与两个 diary
+命名空间，逐文件保存 `LONGBLOB` 原始字节、hash、字节长度、换行/编码诊断与
+“语义来源未知”状态。反向导出同样只允许写入此前不存在的新目录。
+
+只读独立复核使用：
+
+```bash
+uv run python scripts/audit_life_subject_shadow.py \
+  --snapshot /absolute/life-domain-candidate \
+  --reverse-export /absolute/subject-reverse-export
+```
+
+当前验证通过的恢复副本位于
+`C:\Temp\Data\ElysiumBackups\subject-reverse-20260804T0806Z`，共 1,404
+份文档、10,316,470 字节，正向/远端/反向根均为
+`d4c83a81d8df0895898ced696ba0ef63167281224faecff25ca9ce99f7cca966`。
+它仍来自 `writer_frozen=false` 快照，不是 active backend。
+
+工作区投影必须遵守 parent-hash 门：目标文件等于新版本时幂等确认；等于已知
+parent 时才允许原子替换；任何其他字节都视为外部变化并保留原文件，随后由
+observer 追加为新观察。禁止为了“让数据库和文件一致”而覆盖未知外部改动。
+
+selected storage 启用后，`nucleus_write_file`、`nucleus_edit_file` 与 Memory
+Witness 的声明路径必须先调用 service 的 Subject 写入口，再执行工作区投影。
+通用 `nucleus_bash` 无法证明任意 shell 命令的写前入账，因此在该模式下 fail
+closed；读取或修改应使用专用 file/领域工具。disabled/local 模式保持原行为。
+
+### 6.5 Life Memory 无损候选复制
+
+Life Memory 使用显式的 32 表选择合同，不复制 SQLite FTS 内部影子表，也不把
+Chroma 当作权威。候选复制命令为：
+
+```bash
+uv run python scripts/migrate_life_memory.py \
+  --snapshot /absolute/life-domain-candidate \
+  --run-id life-memory-shadow-<manifest-prefix> \
+  --reverse-export /new/life-memory-reverse-export
+```
+
+连接信息只允许通过 `ELYSIUM_LIFE_STORAGE_MYSQL_HOST/PORT/DATABASE/USER/PASSWORD`
+环境变量提供。Memory schema v7 保留节点删除历史、事件日期、旧 FTS/embedding
+可逆投影字段；v8 把开放元数据保存为规范 JSON 的 `LONGTEXT` 原文，避免 MySQL
+原生 JSON 改写高精度小数。见证投影路径使用 SHA-256 作为可索引派生列，但查询
+命中后必须核对完整路径，hash 永远不替代路径身份。
+
+只读独立复核使用：
+
+```bash
+uv run python scripts/audit_life_memory_shadow.py \
+  --snapshot /absolute/life-domain-candidate \
+  --reverse-export /absolute/life-memory-reverse-export
+```
+
+当前已验证恢复副本位于
+`C:\Temp\Data\ElysiumBackups\life-memory-reverse-20260804T0920Z-v2`。
+源 SQLite、MySQL 与反向 SQLite 均包含 32 张显式表、210,104 条记录，总根均为
+`4703c2dc18470d16b9e4363f8b8c6a8b3d0f8cfda433baf1deddb9787951cf9c`；
+76 个删除节点及其 1,936 条关联边完整保留。该快照仍是
+`writer_frozen=false`，远端账号也不能创建数据库级不可变 trigger，因此只可作为
+不可激活的 shadow，不得据此切换生产。
+
+### 6.6 Presence / World 候选复制与反向恢复
+
+Presence 与 World 从一致性快照复制，命令为：
+
+```bash
+uv run python scripts/migrate_life_presence_world.py \
+  --snapshot /absolute/life-domain-candidate \
+  --run-id life-presence-world-shadow-<manifest-prefix> \
+  --reverse-export /new/presence-world-reverse-export
+```
+
+独立只读复核为：
+
+```bash
+uv run python scripts/audit_life_presence_world_shadow.py \
+  --snapshot /absolute/life-domain-candidate \
+  --reverse-export /absolute/presence-world-reverse-export
+```
+
+迁移器只选择 Presence snapshot/stream owner/lifecycle outbox 和 World
+projector meta/assertion/change/perception cursor。World 的 projection policy、schema
+version 与 rebuild state 由运行合同生成，不能冒充源记录；其余源字段逐行规范化
+并计算稳定根。只有源 World 完全空白且唯一差异是初始化的 synthetic frontier=0
+时，迁移器才允许把 frontier 修复为源值，并把该动作计入 copied record；任何已有
+assertion/change/cursor 的目标都必须冲突失败，禁止覆盖。
+
+当前验证通过的反向副本位于
+`C:\Temp\Data\ElysiumBackups\life-presence-world-reverse-20260804T1030Z`。
+源、MySQL 与反向副本共 2,031 条源记录，聚合根均为
+`abd4f799f8208bc9edafdc3fb67a486486ba7746d599afd4fd5b0a341e5a2214`；
+批次 `life-presence-world-shadow-v3-77435387f4acc59e` 为 `copied`。
+它来自 `writer_frozen=false` 快照，只是恢复证据，不是 active generation。
+
+### 6.7 Learning 候选复制与反向恢复
+
+Learning 迁移只能从完整快照中的 `.life_learning` 读取，不能直接扫描仍在运行的正式工作区：
+
+```bash
+uv run python scripts/migrate_life_learning.py \
+  --snapshot /absolute/life-domain-candidate \
+  --run-id life-learning-shadow-<manifest-prefix> \
+  --reverse-export /new/life-learning-reverse-export
+```
+
+连接信息只允许通过 `ELYSIUM_LIFE_STORAGE_MYSQL_HOST/PORT/DATABASE/USER/PASSWORD`
+环境变量提供。迁移器会先逐文件核对 snapshot manifest，再把每个旧文件的精确原始
+字节拆为不超过 1 MiB 的 immutable chunk events，追加完整 manifest/completion
+证据并生成可重建投影。校验必须证明源文件集合、大小、SHA-256、逐 chunk hash、
+重组字节与完成事件完全一致。反向导出只允许写入此前不存在的新目录，失败目录保留
+incomplete 标记，不得覆盖源目录。
+
+该脚本固定使用 copy authority 与 `CANDIDATE_COPY` runtime，不能激活 generation，
+也不会修改 `storage.enabled`。业务启动固定 `initialize_schema=false`；缺少 Learning
+schema 时必须拒绝启动，不能由 Elysium 运行进程临时建表。真实 MySQL 合同测试必须
+使用专用隔离库并显式设置：
+
+```text
+ELYSIUM_TEST_MYSQL_LEARNING_ISOLATED=1
+```
+
+未设置时用例必须显示为 skipped；不得把 skipped 当作远程 MySQL 验收通过。Learning
+候选复制尚未对正式数据执行，也没有 active Learning generation。
+
 ## 7. 正式切换验收门
 
 必须同时满足后才允许人工切换：
 
-1. Life Event、Memory、Subject Document、Presence、World、cursor/outbox 的 local/MySQL 适配器全部通过同一合同测试；
+1. Life Event、Memory、Subject Document、Presence、World、Learning、cursor/outbox 的 local/MySQL 适配器全部通过同一合同测试；
 2. 已冻结快照通过逐记录、逐文件、谱系、frontier、visibility 与引用完整性校验；
 3. MySQL 复制副本在隔离环境通过读写、并发、死锁重试、断连恢复和恢复演练；
 4. 旧 writer 已人工停止，旧 authority token 已撤销，只有一个新 epoch 被激活；

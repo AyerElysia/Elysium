@@ -604,6 +604,7 @@ def open_mysql_copy_runtime(
         _write_fence=write_fence,
         _writer_validator=validate_writer,
         writer_role=StorageWriterRole.CANDIDATE_COPY,
+        writer_epoch=token.authority_epoch,
     )
 
 

@@ -17,7 +17,9 @@ Life Memory 已从“业务服务隐式拥有 SQLite 连接”推进为一个内
 
 local adapter 保留既有 SQLite 行为；MySQL adapter 使用显式领域表、版本化 migration 和平台 `StorageBackendRuntime`。同一个 Bundle 必须来自同一 backend generation，禁止按 repository 混搭 local/MySQL。
 
-当前生产路径仍构造 local Bundle。MySQL factory 只能由显式调用者打开，不提供静默回退，不自动创建正式 generation，也不改变 `[storage].enabled=false` 的安全基线。
+现役 `LifeMemoryService` 已消费 `LifeEngineService` 唯一拥有的 `StorageBackendRuntime`。当 `[storage].enabled=true` 时，Life Engine 必须先打开 coherent runtime，再将同一个 runtime 注入 Memory；未注入、runtime 未启动或任一 Memory Port 不可用都会 fail closed，禁止静默回退 SQLite。MySQL 模式不会打开或写入 `.memory/memory.db`，Memory 关闭时也不会关闭共享 runtime；统一关闭仍由 Life Engine 负责。`[storage].enabled=false` 保持既有 local SQLite 行为。
+
+文档索引、启动恢复、Experience、Witness、Living Memory、Epistemic 与 legacy graph 的现役权威读写均已改走六个 Port。SQLite FTS 与 Chroma 只保留为 local/可重建投影，不获得跨 backend 的权威地位。
 
 ## 2. 领域行为合同
 
@@ -54,13 +56,15 @@ local 的不可变性继续由既有事务与 SQLite trigger 保护；MySQL 适�
 - occurrence 幂等、artifact head 陈旧 writer、witness cursor 陈旧 writer和倒退拒绝；
 - MySQL migration 顺序、版本与关键领域表；
 - 真实 MySQL 的 document、experience、witness、artifact 与 epistemic 基础闭环。
+- 服务级 backend 选择：缺少共享 runtime 时 fail closed、MySQL 模式不创建 SQLite、Memory 不关闭共享 runtime、默认 local 跨重启保持兼容。
 
 真实 MySQL 用例是显式 opt-in：只有配置专用 `ELYSIUM_TEST_MYSQL_*` 环境时运行；缺少隔离测试库时必须显示 skipped。该 skipped 不代表真实远程 MySQL 已验收。
 
 本次交付验证结果：
 
-- Memory 定向回归：234 passed、1 skipped；跳过项为未配置隔离测试库的真实 MySQL 用例。
-- 全仓串行回归：3373 passed、9 skipped。
+- Memory 定向回归：251 passed、1 skipped；跳过项为未配置隔离测试库的真实 MySQL 用例。
+- Life Engine 领域回归：800 passed、4 skipped。
+- 全仓回归：3394 passed、10 skipped。
 - Ruff、Python compileall 与 `git diff --check`：通过。
 
 ## 6. 尚未完成与切换门

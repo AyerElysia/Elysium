@@ -7,13 +7,29 @@ from .manifest import (
     snapshot_manifest_sha256,
 )
 from .snapshot import LifeStorageLayout, create_local_snapshot
+from .subject_copy import (
+    SubjectDocumentCopyError,
+    SubjectDocumentCopyReport,
+    copy_subject_documents_from_snapshot,
+)
+from .subject_export import (
+    SubjectDocumentExportError,
+    SubjectDocumentExportReport,
+    export_subject_documents,
+)
 from .verify import verify_local_snapshot
 
 __all__ = [
     "LifeSnapshotError",
     "LifeStorageLayout",
+    "SubjectDocumentCopyError",
+    "SubjectDocumentCopyReport",
+    "SubjectDocumentExportError",
+    "SubjectDocumentExportReport",
     "build_backend_generation",
+    "copy_subject_documents_from_snapshot",
     "create_local_snapshot",
+    "export_subject_documents",
     "load_snapshot_manifest",
     "snapshot_manifest_sha256",
     "verify_local_snapshot",

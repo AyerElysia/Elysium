@@ -44,9 +44,9 @@ def _mysql_config() -> MySQLStorageConfig:
 
 def _generation() -> BackendGeneration:
     return BackendGeneration(
-        generation_id="mysql-life-memory-contract-v6",
+        generation_id="mysql-life-memory-contract-v8",
         backend=BackendKind.MYSQL,
-        schema_version=6,
+        schema_version=8,
         source_snapshot_sha256="7" * 64,
         root_hashes={"life-memory": "8" * 64},
         frontiers={"experience": 0, "witness": 0, "living": 0},
@@ -92,7 +92,7 @@ async def test_mysql_memory_bundle_preserves_identity_and_cas_contracts() -> Non
                 enabled=True,
                 authoritative_backend=BackendKind.MYSQL,
                 backend_generation=generation.generation_id,
-                schema_version=6,
+                schema_version=8,
                 registry_id="life-memory-integration",
                 authority_provider="mysql",
                 authority_epoch=token.authority_epoch,

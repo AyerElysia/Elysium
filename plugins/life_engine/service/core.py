@@ -117,7 +117,12 @@ from .subconscious_context import (
     SubconsciousSummary,
 )
 from .chat_events import build_chat_message_event, build_chat_provider_notice_event
-from .consciousness import ConsciousnessRegistry
+from .world_state import WorldState
+from .async_presence import (
+    AsyncConsciousnessRegistry,
+    flush_presence_lifecycle_events,
+)
+from .consciousness import ConsciousnessInstance, ConsciousnessRegistry
 from .event_bus import (
     LifeEvent,
     LifeEventBus,
@@ -126,8 +131,11 @@ from .event_bus import (
     RawEventStore,
     life_event_from_legacy,
 )
-from .world_state import WorldState
-from .perception_gateway import PerceptionGateway, PreparedPerception
+from .perception_gateway import (
+    AsyncPerceptionGateway,
+    PerceptionGateway,
+    PreparedPerception,
+)
 from .world_projection import (
     WORLD_LEGACY_IMPORT_EVENT,
     WORLD_OBSERVATION_EVENT,
@@ -208,6 +216,7 @@ class LifeEngineService(BaseService):
 
     def __init__(self, plugin) -> None:
         super().__init__(plugin)
+        self._legacy_config_warning_emitted: bool = False
         self._state = LifeEngineState()
         self._state_dirty: bool = False
         self._heartbeat_task_id: str | None = None
@@ -265,6 +274,32 @@ class LifeEngineService(BaseService):
         self._self_pause_skip_logged: bool = False
         self._memory_service: LifeMemoryService | None = None
         self._last_decay_date: str | None = None
+        from ..storage.factory import settings_from_life_engine_config
+
+        self._storage_factory_settings = settings_from_life_engine_config(
+            self._cfg()
+        )
+        self._selectable_storage_enabled = bool(
+            self._storage_factory_settings.enabled
+        )
+        self._storage_runtime: Any | None = None
+        self._presence_world_stores: Any | None = None
+        self._life_event_store: Any | None = None
+        self._learning_stores: Any | None = None
+        self._subject_document_store: Any | None = None
+        self._subject_workspace_observer: Any | None = None
+        self._subject_workspace_projector: Any | None = None
+        self._storage_health_cache: dict[str, Any] = {
+            "status": (
+                "initializing" if self._selectable_storage_enabled else "disabled"
+            ),
+            "backend": self._storage_factory_settings.authoritative_backend.value,
+            "reason": (
+                "selected storage has not started"
+                if self._selectable_storage_enabled
+                else "selectable storage runtime is not enabled"
+            ),
+        }
 
         # 结构化世界模型（潜意识共享内在世界）
         self._world_state: WorldState = WorldState.load(
@@ -272,9 +307,15 @@ class LifeEngineService(BaseService):
         )
 
         # 意识实例注册表（多意识协调）
-        self._consciousness_registry: ConsciousnessRegistry = ConsciousnessRegistry.load(
-            self._workspace_dir() / "runtime" / "consciousness_registry.json"
+        self._consciousness_registry: (
+            ConsciousnessRegistry | AsyncConsciousnessRegistry | None
         )
+        if self._selectable_storage_enabled:
+            self._consciousness_registry = None
+        else:
+            self._consciousness_registry = ConsciousnessRegistry.load(
+                self._workspace_dir() / "runtime" / "consciousness_registry.json"
+            )
 
         # 集成管理器
         self._dfc_integration: DFCIntegration | None = None
@@ -299,11 +340,10 @@ class LifeEngineService(BaseService):
         # 状态持久化
         self._state_persistence: StatePersistence | None = None
         self._event_bus: LifeEventBus | None = None
-        self._world_projection: WorldProjectionStore | None = None
-        self._perception_gateway: PerceptionGateway | None = None
+        self._world_projection: Any | None = None
+        self._perception_gateway: PerceptionGateway | AsyncPerceptionGateway | None = None
         self._pending_chatter_perceptions: dict[str, PreparedPerception] = {}
         self._attention_router: AttentionRouter | None = None
-        self._legacy_config_warning_emitted: bool = False
         self._last_memory_maintenance_prompt_at: str | None = None
         self._followup_states: dict[str, FollowupState] = {}
         self._scheduler = None
@@ -314,6 +354,12 @@ class LifeEngineService(BaseService):
         return self._memory_service
 
     @property
+    def selected_subject_storage_enabled(self) -> bool:
+        """Return whether subject files require the selected durable writer."""
+
+        return self._selectable_storage_enabled
+
+    @property
     def world_state(self) -> WorldState:
         """Return the non-authoritative legacy migration snapshot."""
         return self._world_state
@@ -321,6 +367,10 @@ class LifeEngineService(BaseService):
     def save_world_state(self) -> None:
         """Export the derived world projection for read-only diagnostics."""
 
+        if self._selectable_storage_enabled:
+            raise RuntimeError(
+                "SelectedWorldExportRequiresAwait: use the async World Port"
+            )
         self._get_perception_gateway()
         projection = self._get_world_projection()
         target = self._workspace_dir() / "runtime" / "world_projection.json"
@@ -337,20 +387,166 @@ class LifeEngineService(BaseService):
         temporary.replace(target)
 
     @property
-    def consciousness_registry(self) -> ConsciousnessRegistry:
-        """意识实例注册表（多意识协调）。"""
+    def consciousness_registry(
+        self,
+    ) -> ConsciousnessRegistry | AsyncConsciousnessRegistry:
+        """Return the initialized operational Presence registry."""
+
+        if self._consciousness_registry is None:
+            raise RuntimeError(
+                "SelectedPresenceNotStarted: await LifeEngineService.start() first"
+            )
         return self._consciousness_registry
 
     def save_consciousness_registry(self) -> None:
-        """将意识注册表持久化到磁盘。"""
-        self._consciousness_registry.save(
+        """Persist the disabled-mode compatibility registry synchronously."""
+
+        if self._selectable_storage_enabled:
+            raise RuntimeError(
+                "SelectedPresenceRequiresAwait: use "
+                "save_consciousness_registry_async()"
+            )
+        registry = self.consciousness_registry
+        assert isinstance(registry, ConsciousnessRegistry)
+        registry.save(
             self._workspace_dir() / "runtime" / "consciousness_registry.json"
         )
-        self._consciousness_registry.flush_lifecycle_events(
+        registry.flush_lifecycle_events(
             self._get_event_bus().store.append_sync
         )
         if self._world_projection is not None:
             self._world_projection.catch_up(self._get_event_bus().store)
+
+    async def save_consciousness_registry_async(self) -> None:
+        """Flush lifecycle evidence through the active backend contract."""
+
+        if not self._selectable_storage_enabled:
+            await asyncio.to_thread(self.save_consciousness_registry)
+            return
+        stores = self._require_presence_world_stores()
+        ledger = self._get_life_event_store()
+        await flush_presence_lifecycle_events(stores.presence, ledger)
+        await self.catch_up_world_projection()
+
+    async def register_consciousness_instance(
+        self,
+        instance: ConsciousnessInstance,
+    ) -> ConsciousnessInstance:
+        """Register one runtime window and durably publish its lifecycle."""
+
+        registry = self.consciousness_registry
+        if isinstance(registry, AsyncConsciousnessRegistry):
+            result = await registry.register(instance)
+        else:
+            result = await asyncio.to_thread(registry.register, instance)
+        await self.save_consciousness_registry_async()
+        return result
+
+    async def touch_consciousness_instance(
+        self,
+        instance_id: str,
+        *,
+        timestamp: str = "",
+        reason: str = "activity",
+    ) -> None:
+        """Commit liveness before returning to the current runtime."""
+
+        registry = self.consciousness_registry
+        if isinstance(registry, AsyncConsciousnessRegistry):
+            await registry.touch(
+                instance_id,
+                timestamp=timestamp,
+                reason=reason,
+            )
+        else:
+            await asyncio.to_thread(
+                registry.touch,
+                instance_id,
+                timestamp=timestamp,
+                reason=reason,
+            )
+        await self.save_consciousness_registry_async()
+
+    async def resume_consciousness_instance(
+        self,
+        instance_id: str,
+        *,
+        timestamp: str = "",
+        reason: str = "requested",
+    ) -> bool:
+        """Resume one suspended runtime and durably reclaim its streams."""
+
+        registry = self.consciousness_registry
+        if isinstance(registry, AsyncConsciousnessRegistry):
+            changed = await registry.resume(
+                instance_id,
+                timestamp=timestamp,
+                reason=reason,
+            )
+        else:
+            changed = await asyncio.to_thread(
+                registry.resume,
+                instance_id,
+                timestamp=timestamp,
+                reason=reason,
+            )
+        if changed:
+            await self.save_consciousness_registry_async()
+        return changed
+
+    async def suspend_consciousness_instance(
+        self,
+        instance_id: str,
+        *,
+        timestamp: str = "",
+        reason: str = "requested",
+    ) -> bool:
+        """Suspend one runtime and durably release its stream claims."""
+
+        registry = self.consciousness_registry
+        if isinstance(registry, AsyncConsciousnessRegistry):
+            changed = await registry.suspend(
+                instance_id,
+                timestamp=timestamp,
+                reason=reason,
+            )
+        else:
+            changed = await asyncio.to_thread(
+                registry.suspend,
+                instance_id,
+                timestamp=timestamp,
+                reason=reason,
+            )
+        if changed:
+            await self.save_consciousness_registry_async()
+        return changed
+
+    async def terminate_consciousness_instance(
+        self,
+        instance_id: str,
+        *,
+        timestamp: str = "",
+        reason: str = "requested",
+    ) -> bool:
+        """Commit termination and release stream ownership before returning."""
+
+        registry = self.consciousness_registry
+        if isinstance(registry, AsyncConsciousnessRegistry):
+            changed = await registry.terminate(
+                instance_id,
+                timestamp=timestamp,
+                reason=reason,
+            )
+        else:
+            changed = await asyncio.to_thread(
+                registry.terminate,
+                instance_id,
+                timestamp=timestamp,
+                reason=reason,
+            )
+        if changed:
+            await self.save_consciousness_registry_async()
+        return changed
 
     def _get_lock(self) -> asyncio.Lock:
         """获取懒加载锁。"""
@@ -358,18 +554,396 @@ class LifeEngineService(BaseService):
             self._lock = asyncio.Lock()
         return self._lock
 
+    @property
+    def storage_runtime(self) -> Any | None:
+        """Expose the one service-owned selected runtime to domain consumers."""
+
+        if not self._selectable_storage_enabled:
+            return None
+        if self._storage_runtime is None:
+            raise RuntimeError(
+                "SelectedStorageRuntimeNotStarted: LifeEngineService must open "
+                "the coherent runtime before injecting domain consumers"
+            )
+        return self._storage_runtime
+
+    async def _open_selected_storage_runtime(self) -> None:
+        """Open the selected runtime exactly once under service ownership."""
+
+        if not self._selectable_storage_enabled or self._storage_runtime is not None:
+            return
+        from ..storage.factory import open_storage_backend
+
+        self._storage_runtime = await open_storage_backend(
+            self._storage_factory_settings
+        )
+
+    def _require_selected_memory_service(self) -> None:
+        """Fail closed when selected storage could not attach the memory domain."""
+
+        if self._selectable_storage_enabled and self._memory_service is None:
+            raise RuntimeError(
+                "SelectedMemoryStorageInitializationFailed: selected storage "
+                "must attach Memory to the LifeEngineService-owned runtime"
+            )
+
+    async def _start_selected_storage(self) -> None:
+        """Attach all selected life domains to the service-owned runtime."""
+
+        if (
+            not self._selectable_storage_enabled
+            or self._presence_world_stores is not None
+        ):
+            return
+        from ..storage.domain_factory import open_presence_world_stores
+        from ..storage.event_factory import open_life_event_store
+        from ..storage.learning_factory import open_learning_stores
+        from ..storage.subject_factory import open_subject_document_store
+        from ..storage.subject_workspace import (
+            SubjectWorkspaceObserver,
+            SubjectWorkspaceProjector,
+        )
+
+        await self._open_selected_storage_runtime()
+        runtime = self.storage_runtime
+        ledger = await open_life_event_store(
+            runtime,
+            initialize_schema=False,
+        )
+        stores = await open_presence_world_stores(
+            runtime,
+            initialize_schema=False,
+        )
+        subject_store = await open_subject_document_store(
+            runtime,
+            initialize_schema=False,
+        )
+        learning_cfg = getattr(self._cfg(), "learning", None)
+        learning_stores = None
+        if learning_cfg is None or getattr(learning_cfg, "enabled", True):
+            learning_stores = await open_learning_stores(
+                runtime,
+                initialize_schema=False,
+            )
+        workspace = Path(self._cfg().settings.workspace_path).resolve()
+        subject_projector = SubjectWorkspaceProjector(
+            subject_store,
+            data_root=workspace.parent,
+            worker_id=(
+                f"{self._storage_factory_settings.authority_owner_id}:"
+                "subject-workspace"
+            ),
+        )
+        subject_observer = SubjectWorkspaceObserver(
+            subject_store,
+            data_root=workspace.parent,
+            recorded_source="workspace-observer:life-engine",
+        )
+        registry = await AsyncConsciousnessRegistry.load(stores.presence)
+        event_bus = LifeEventBus(ledger)
+        gateway = AsyncPerceptionGateway(
+            registry,
+            ledger,
+            stores.world,
+        )
+        await flush_presence_lifecycle_events(stores.presence, ledger)
+        await gateway.catch_up()
+        self._life_event_store = ledger
+        self._learning_stores = learning_stores
+        self._presence_world_stores = stores
+        self._subject_document_store = subject_store
+        self._subject_workspace_observer = subject_observer
+        self._subject_workspace_projector = subject_projector
+        self._consciousness_registry = registry
+        self._event_bus = event_bus
+        self._world_projection = stores.world
+        self._perception_gateway = gateway
+        await self.refresh_storage_health()
+
+    async def _close_selected_storage(self) -> None:
+        """Flush owned async work and close the single selected runtime."""
+
+        if not self._selectable_storage_enabled:
+            return
+        errors: list[Exception] = []
+        if (
+            self._presence_world_stores is not None
+            and self._life_event_store is not None
+        ):
+            try:
+                await flush_presence_lifecycle_events(
+                    self._presence_world_stores.presence,
+                    self._life_event_store,
+                )
+            except Exception as exc:  # noqa: BLE001 - aggregate owned cleanup
+                errors.append(exc)
+            if isinstance(self._perception_gateway, AsyncPerceptionGateway):
+                try:
+                    await self._perception_gateway.catch_up()
+                except Exception as exc:  # noqa: BLE001 - aggregate owned cleanup
+                    errors.append(exc)
+        runtime = self._storage_runtime
+        self._subject_workspace_observer = None
+        self._subject_workspace_projector = None
+        self._subject_document_store = None
+        self._learning_stores = None
+        if runtime is not None:
+            try:
+                await runtime.close()
+            except Exception as exc:  # noqa: BLE001 - aggregate owned cleanup
+                errors.append(exc)
+        self._storage_runtime = None
+        self._presence_world_stores = None
+        self._life_event_store = None
+        self._event_bus = None
+        self._world_projection = None
+        self._perception_gateway = None
+        self._consciousness_registry = None
+        self._storage_health_cache = {
+            "status": "closed" if not errors else "failed",
+            "backend": self._storage_factory_settings.authoritative_backend.value,
+            "reason": (
+                "selected storage runtime closed"
+                if not errors
+                else "selected storage close reported errors"
+            ),
+        }
+        if errors:
+            raise ExceptionGroup(
+                "selected Presence/World storage shutdown failed",
+                errors,
+            )
+
+    async def _project_subject_version(
+        self,
+        *,
+        logical_path: str,
+        version_id: str,
+        max_tasks: int,
+    ) -> dict[str, Any]:
+        """Drain one subject path until the requested durable head is visible."""
+
+        projector = self._subject_workspace_projector
+        if projector is None:
+            raise RuntimeError("SelectedSubjectProjectorNotStarted")
+        for _ in range(max(1, int(max_tasks))):
+            result = await projector.project_one(logical_path=logical_path)
+            if result.status == "idle":
+                raise RuntimeError(
+                    f"SubjectProjectionMissing: {logical_path}:{version_id}"
+                )
+            if result.status == "failed" and result.version_id == version_id:
+                raise RuntimeError(
+                    f"SubjectProjectionFailed: {logical_path}: {result.detail}"
+                )
+            if result.version_id == version_id and result.status in {
+                "projected",
+                "confirmed_existing",
+            }:
+                return {
+                    "status": result.status,
+                    "logical_path": result.logical_path,
+                    "version_id": result.version_id,
+                }
+        raise RuntimeError(f"SubjectProjectionBacklogExceeded: {logical_path}")
+
+    async def write_selected_subject_document(
+        self,
+        *,
+        workspace_relative_path: str,
+        content_bytes: bytes,
+        occurrence_id: str,
+        recorded_by: str,
+        recorded_source: str,
+        encoding: str | None,
+        semantic_actor_id: str | None = None,
+        semantic_source_id: str | None = None,
+        reason: str = "",
+    ) -> dict[str, Any] | None:
+        """Commit a declared subject file before changing its workspace projection.
+
+        Disabled storage returns ``None`` so the legacy file path remains a
+        first-class local backend.  Enabled storage fails closed: the file is
+        never written ahead of its immutable SubjectDocument version.
+        """
+
+        if not self._selectable_storage_enabled:
+            return None
+        from ..storage.subject_contracts import AppendSubjectDocumentVersion
+        from ..storage.subject_workspace import subject_path_from_workspace_relative
+
+        logical_path = subject_path_from_workspace_relative(workspace_relative_path)
+        if logical_path is None:
+            return None
+        workspace = Path(self._cfg().settings.workspace_path).resolve()
+        if workspace.name != "life_engine_workspace":
+            raise RuntimeError(
+                "SelectedSubjectWorkspaceMismatch: selected Subject storage "
+                "requires a life_engine_workspace root"
+            )
+        store = self._subject_document_store
+        observer = self._subject_workspace_observer
+        if store is None or observer is None:
+            raise RuntimeError("SelectedSubjectStorageNotStarted")
+
+        projection: dict[str, Any] | None = None
+        head = await store.get_head(logical_path)
+        if head is not None:
+            task = await store.get_projection_task(
+                logical_path,
+                head.current_version_id,
+            )
+            if task is None:
+                raise RuntimeError(
+                    f"SubjectProjectionStateMissing: {logical_path}:"
+                    f"{head.current_version_id}"
+                )
+            if task.state == "failed":
+                raise RuntimeError(
+                    f"SubjectProjectionRequiresRepair: {logical_path}:"
+                    f"{head.current_version_id}"
+                )
+            if task.state == "pending":
+                try:
+                    projection = await self._project_subject_version(
+                        logical_path=logical_path,
+                        version_id=head.current_version_id,
+                        max_tasks=head.revision + 1,
+                    )
+                except RuntimeError as exc:
+                    detail = str(exc)
+                    external_divergence = any(
+                        marker in detail
+                        for marker in (
+                            "workspace bytes diverged from the authoritative parent",
+                            "new authoritative document would overwrite bytes",
+                        )
+                    )
+                    if not external_divergence:
+                        raise
+            elif task.state != "confirmed":
+                raise RuntimeError(
+                    f"SubjectProjectionStateInvalid: {logical_path}:{task.state}"
+                )
+
+        if projection is None:
+            observed = await observer.observe_file(logical_path)
+            if observed.status == "changed_during_read":
+                raise RuntimeError(
+                    f"SubjectWorkspaceChangedDuringRead: {logical_path}"
+                )
+            if observed.commit is not None:
+                projection = await self._project_subject_version(
+                    logical_path=logical_path,
+                    version_id=observed.commit.version.version_id,
+                    max_tasks=observed.commit.head.revision + 1,
+                )
+            elif head is not None and observed.status == "missing":
+                raise RuntimeError(f"SubjectWorkspaceMissing: {logical_path}")
+
+        head = await store.get_head(logical_path)
+        if head is not None:
+            current = await store.get_version(head.current_version_id)
+            if current.content_bytes == bytes(content_bytes):
+                if projection is None:
+                    projection = {
+                        "status": "confirmed_existing",
+                        "logical_path": logical_path,
+                        "version_id": current.version_id,
+                    }
+                return {
+                    "status": "unchanged",
+                    "logical_path": logical_path,
+                    "version_id": current.version_id,
+                    "revision": head.revision,
+                    "projection": projection,
+                }
+            expected_revision = head.revision
+            expected_head = head.current_version_id
+            declared_owner = head.declared_owner
+        else:
+            expected_revision = 0
+            expected_head = ""
+            declared_owner = "elysia"
+        commit = await store.append_version(
+            AppendSubjectDocumentVersion(
+                logical_path=logical_path,
+                expected_revision=expected_revision,
+                expected_head_version_id=expected_head,
+                content_bytes=bytes(content_bytes),
+                occurrence_id=str(occurrence_id),
+                recorded_by=str(recorded_by),
+                recorded_source=str(recorded_source),
+                declared_owner=declared_owner,
+                semantic_actor_id=semantic_actor_id,
+                semantic_source_id=semantic_source_id,
+                provenance_status=(
+                    "complete" if semantic_source_id else "semantic_source_missing"
+                ),
+                byte_fidelity="exact_bytes",
+                encoding=encoding,
+                newline_style=None,
+                change_context={
+                    "operation": "workspace_file_write",
+                    "reason": str(reason),
+                },
+            )
+        )
+        projection = await self._project_subject_version(
+            logical_path=logical_path,
+            version_id=commit.version.version_id,
+            max_tasks=commit.head.revision + 1,
+        )
+        self.notify_subject_context_source_changed(workspace_relative_path)
+        return {
+            "status": "committed",
+            "logical_path": logical_path,
+            "version_id": commit.version.version_id,
+            "revision": commit.head.revision,
+            "projection": projection,
+        }
+
+    def _require_presence_world_stores(self) -> Any:
+        if self._presence_world_stores is None:
+            raise RuntimeError(
+                "SelectedPresenceWorldNotStarted: await LifeEngineService.start()"
+            )
+        return self._presence_world_stores
+
+    def _get_life_event_store(self) -> Any:
+        if self._selectable_storage_enabled:
+            if self._life_event_store is None:
+                raise RuntimeError(
+                    "SelectedLifeEventStoreNotStarted: await "
+                    "LifeEngineService.start()"
+                )
+            return self._life_event_store
+        return self._get_event_bus().store
+
     def _get_event_bus(self) -> LifeEventBus:
         if self._event_bus is None:
+            if self._selectable_storage_enabled:
+                raise RuntimeError(
+                    "SelectedLifeEventStoreNotStarted: await "
+                    "LifeEngineService.start()"
+                )
+            registry = self.consciousness_registry
+            assert isinstance(registry, ConsciousnessRegistry)
             self._event_bus = LifeEventBus(RawEventStore(self._workspace_dir()))
-            self._consciousness_registry.flush_lifecycle_events(
+            registry.flush_lifecycle_events(
                 self._event_bus.store.append_sync
             )
         return self._event_bus
 
-    def _get_world_projection(self) -> WorldProjectionStore:
+    def _get_world_projection(self) -> Any:
         """Return the rebuildable subjective world read model."""
 
         if self._world_projection is None:
+            if self._selectable_storage_enabled:
+                raise RuntimeError(
+                    "SelectedWorldProjectionNotStarted: await "
+                    "LifeEngineService.start()"
+                )
             self._world_projection = WorldProjectionStore(
                 self._workspace_dir() / "runtime" / WORLD_PROJECTION_DB_FILE
             )
@@ -378,6 +952,11 @@ class LifeEngineService(BaseService):
     def _migrate_legacy_world_state(self) -> None:
         """Append the legacy JSON snapshot once as migration evidence."""
 
+        if self._selectable_storage_enabled:
+            raise RuntimeError(
+                "legacy World migration is explicit and cannot run during "
+                "selected storage startup"
+            )
         projection = self._get_world_projection()
         if projection.legacy_imported():
             projection.catch_up(self._get_event_bus().store)
@@ -419,26 +998,33 @@ class LifeEngineService(BaseService):
         projection.catch_up(self._get_event_bus().store)
         projection.mark_legacy_imported(snapshot_hash)
 
-    def _get_perception_gateway(self) -> PerceptionGateway:
+    def _get_perception_gateway(
+        self,
+    ) -> PerceptionGateway | AsyncPerceptionGateway:
         """Return the reliable per-instance perception delivery gateway."""
 
         if self._perception_gateway is None:
+            if self._selectable_storage_enabled:
+                raise RuntimeError(
+                    "SelectedPerceptionGatewayNotStarted: await "
+                    "LifeEngineService.start()"
+                )
             self._migrate_legacy_world_state()
             self._perception_gateway = PerceptionGateway(
-                self._consciousness_registry,
+                self.consciousness_registry,
                 self._get_event_bus().store,
                 self._get_world_projection(),
             )
         return self._perception_gateway
 
     @property
-    def perception_gateway(self) -> PerceptionGateway:
+    def perception_gateway(self) -> PerceptionGateway | AsyncPerceptionGateway:
         """Expose the supported cross-instance perception integration point."""
 
         return self._get_perception_gateway()
 
     @property
-    def world_projection(self) -> WorldProjectionStore:
+    def world_projection(self) -> Any:
         """Expose the rebuildable world projection for diagnostics and queries."""
 
         self._get_perception_gateway()
@@ -447,10 +1033,46 @@ class LifeEngineService(BaseService):
     def resolve_consciousness_instance(self, stream_id: str = "") -> str:
         """Resolve a trusted runtime instance from current stream ownership."""
 
-        owner = self._consciousness_registry.get_for_stream(
+        owner = self.consciousness_registry.get_for_stream(
             str(stream_id or "").strip()
         )
         return owner.instance_id if owner is not None else "chat_global"
+
+    async def _current_learning_subject_revision(self) -> str:
+        """Read the exact unified subject revision without authoring a projection."""
+
+        from ..core.router_context_projection import read_subject_authority_sources
+
+        _, revision = await asyncio.to_thread(
+            read_subject_authority_sources,
+            self._workspace_dir(),
+        )
+        return revision
+
+    async def _project_learning_subject_authority_commit(
+        self,
+        target_path: Any,
+        commit: Any,
+    ) -> None:
+        """Make an accepted selected-store revision visible in the workspace."""
+
+        from ..storage.subject_contracts import subject_authority_logical_path
+
+        logical_path = subject_authority_logical_path(target_path)
+        await self._project_subject_version(
+            logical_path=logical_path,
+            version_id=str(commit.document_version_id),
+            max_tasks=int(commit.document_revision) + 1,
+        )
+        self.notify_subject_context_source_changed(
+            self._workspace_dir() / str(target_path)
+        )
+
+    async def _validate_learning_decision_actor(self, instance_id: str) -> bool:
+        """Validate that a learning decision comes from an active runtime window."""
+
+        instance = self.consciousness_registry.get(str(instance_id or "").strip())
+        return bool(instance is not None and instance.is_active)
 
     def report_world_observation_sync(
         self,
@@ -471,6 +1093,11 @@ class LifeEngineService(BaseService):
     ) -> dict[str, Any]:
         """Append one attributed observation and project it synchronously."""
 
+        if self._selectable_storage_enabled:
+            raise RuntimeError(
+                "SelectedWorldObservationRequiresAwait: use "
+                "report_world_observation()"
+            )
         report_text = str(report or "").strip()
         instance_id = str(source_instance_id or "").strip()
         assertion_subject = str(subject or "").strip()
@@ -479,7 +1106,7 @@ class LifeEngineService(BaseService):
             raise ValueError("world observation report must not be empty")
         if not instance_id:
             raise ValueError("world observation source_instance_id must not be empty")
-        if self._consciousness_registry.get(instance_id) is None:
+        if self.consciousness_registry.get(instance_id) is None:
             raise ValueError(
                 f"world observation source instance is not registered: {instance_id}"
             )
@@ -539,33 +1166,160 @@ class LifeEngineService(BaseService):
     async def report_world_observation(
         self,
         report: str,
-        **kwargs: Any,
+        *,
+        source_instance_id: str,
+        subject: str,
+        predicate: str = "state_report",
+        domain: str = "",
+        status: str = "",
+        stream_id: str = "",
+        observed_at: str = "",
+        valid_from: str = "",
+        valid_to: str = "",
+        supersedes_assertion_id: str = "",
+        retracts_assertion_id: str = "",
+        value: Any | None = None,
     ) -> dict[str, Any]:
         """Append one attributed observation without blocking the event loop."""
 
-        return await asyncio.to_thread(
-            self.report_world_observation_sync,
-            report,
-            **kwargs,
+        if not self._selectable_storage_enabled:
+            return await asyncio.to_thread(
+                self.report_world_observation_sync,
+                report,
+                source_instance_id=source_instance_id,
+                subject=subject,
+                predicate=predicate,
+                domain=domain,
+                status=status,
+                stream_id=stream_id,
+                observed_at=observed_at,
+                valid_from=valid_from,
+                valid_to=valid_to,
+                supersedes_assertion_id=supersedes_assertion_id,
+                retracts_assertion_id=retracts_assertion_id,
+                value=value,
+            )
+        registry = self.consciousness_registry
+        assert isinstance(registry, AsyncConsciousnessRegistry)
+        await registry.refresh()
+        report_text = str(report or "").strip()
+        instance_id = str(source_instance_id or "").strip()
+        assertion_subject = str(subject or "").strip()
+        assertion_predicate = str(predicate or "").strip()
+        if not report_text:
+            raise ValueError("world observation report must not be empty")
+        if not instance_id:
+            raise ValueError(
+                "world observation source_instance_id must not be empty"
+            )
+        if registry.get(instance_id) is None:
+            raise ValueError(
+                f"world observation source instance is not registered: {instance_id}"
+            )
+        if not assertion_subject or not assertion_predicate:
+            raise ValueError(
+                "world observation subject and predicate must not be empty"
+            )
+        now = str(observed_at or "") or _now_iso()
+        assertion_id = "assertion_" + uuid4().hex
+        event_id = "world_observation_" + uuid4().hex
+        assertion: dict[str, Any] = {
+            "assertion_id": assertion_id,
+            "subject": assertion_subject,
+            "predicate": assertion_predicate,
+            "value": report_text if value is None else value,
+            "domain": str(domain or ""),
+            "status": str(status or ""),
+            "source_instance_id": instance_id,
+            "observed_at": now,
+            "valid_from": str(valid_from or "") or now,
+            "valid_to": str(valid_to or ""),
+            "supersedes_assertion_id": str(supersedes_assertion_id or ""),
+            "retracts_assertion_id": str(retracts_assertion_id or ""),
+            "report": report_text,
+        }
+        event = LifeEvent(
+            event_id=event_id,
+            sequence=0,
+            timestamp=now,
+            source="consciousness.report_state",
+            channel=LifeEventChannel.LIFE.value,
+            event_type=WORLD_OBSERVATION_EVENT,
+            content=json.dumps(
+                {"assertion": assertion},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            stream_id=str(stream_id or ""),
+            priority=int(LifeEventPriority.NORMAL),
+            salience=0.8,
+            occurrence_id=event_id,
+            source_instance_id=instance_id,
+            metadata={"assertion_id": assertion_id},
         )
+        persisted = await self._get_life_event_store().append(event)
+        frontier = await self.catch_up_world_projection()
+        return {
+            "event_id": persisted.event_id,
+            "occurrence_id": persisted.occurrence_id,
+            "assertion_id": assertion_id,
+            "ingest_position": persisted.sequence,
+            "projection_as_of": frontier,
+            "source_instance_id": instance_id,
+        }
 
-    def prepare_perception(self, instance_id: str) -> PreparedPerception:
+    async def prepare_perception(
+        self,
+        instance_id: str,
+    ) -> PreparedPerception:
         """Prepare a retryable transient world delivery for one instance."""
 
-        return self._get_perception_gateway().prepare(instance_id)
+        gateway = self._get_perception_gateway()
+        if isinstance(gateway, AsyncPerceptionGateway):
+            return await gateway.prepare(instance_id)
+        return await asyncio.to_thread(gateway.prepare, instance_id)
 
-    def commit_perception(
+    async def commit_perception(
         self,
         prepared: PreparedPerception,
     ) -> tuple[int, int]:
         """Commit a world delivery after its runtime accepted the context."""
 
-        return self._get_perception_gateway().commit(prepared)
+        gateway = self._get_perception_gateway()
+        if isinstance(gateway, AsyncPerceptionGateway):
+            return await gateway.commit(prepared)
+        return await asyncio.to_thread(gateway.commit, prepared)
 
-    def query_world(self, instance_id: str, query: str) -> str:
+    async def query_world(self, instance_id: str, query: str) -> str:
         """Return the full provenance-aware projection for reflective judgment."""
 
-        return self._get_perception_gateway().query(instance_id, query)
+        gateway = self._get_perception_gateway()
+        if isinstance(gateway, AsyncPerceptionGateway):
+            return await gateway.query(instance_id, query)
+        return await asyncio.to_thread(gateway.query, instance_id, query)
+
+    async def catch_up_world_projection(self) -> int:
+        """Advance the selected or legacy projection without blocking the loop."""
+
+        gateway = self._get_perception_gateway()
+        if isinstance(gateway, AsyncPerceptionGateway):
+            return await gateway.catch_up()
+        return await asyncio.to_thread(
+            self._get_world_projection().catch_up,
+            self._get_event_bus().store,
+        )
+
+    async def rebuild_world_projection(self) -> int:
+        """Explicitly replay World projection while preserving delivery cursors."""
+
+        gateway = self._get_perception_gateway()
+        if isinstance(gateway, AsyncPerceptionGateway):
+            return await gateway.rebuild()
+        return await asyncio.to_thread(
+            self._get_world_projection().rebuild,
+            self._get_event_bus().store,
+        )
 
     def _get_attention_router(self) -> AttentionRouter:
         if self._attention_router is None:
@@ -883,22 +1637,22 @@ class LifeEngineService(BaseService):
         """Mirror legacy service events into the unified raw event log."""
         if not events:
             return
+        registry = self.consciousness_registry
+        if isinstance(registry, AsyncConsciousnessRegistry):
+            await registry.refresh()
         for event in events:
             if event.source_instance_id or event.event_type != EventType.MESSAGE:
                 continue
             stream_id = str(event.stream_id or "").strip()
             if not stream_id:
                 continue
-            owner = self._consciousness_registry.get_for_stream(stream_id)
+            owner = registry.get_for_stream(stream_id)
             if owner is not None:
                 event.source_instance_id = owner.instance_id
                 event.correlation_id = event.correlation_id or owner.session_id or None
         await self._get_event_bus().publish_legacy_events(events)
         if self._world_projection is not None:
-            await asyncio.to_thread(
-                self._world_projection.catch_up,
-                self._get_event_bus().store,
-            )
+            await self.catch_up_world_projection()
 
     async def _publish_message_facts(
         self,
@@ -924,10 +1678,7 @@ class LifeEngineService(BaseService):
             [life_event_from_legacy(legacy_event), chat_fact]
         )
         if self._world_projection is not None:
-            await asyncio.to_thread(
-                self._world_projection.catch_up,
-                self._get_event_bus().store,
-            )
+            await self.catch_up_world_projection()
 
     async def record_send_requested(
         self,
@@ -948,10 +1699,7 @@ class LifeEngineService(BaseService):
         )
         await self._get_event_bus().publish(event)
         if self._world_projection is not None:
-            await asyncio.to_thread(
-                self._world_projection.catch_up,
-                self._get_event_bus().store,
-            )
+            await self.catch_up_world_projection()
 
     async def record_delivery_status(
         self,
@@ -974,10 +1722,7 @@ class LifeEngineService(BaseService):
         )
         await self._get_event_bus().publish(event)
         if self._world_projection is not None:
-            await asyncio.to_thread(
-                self._world_projection.catch_up,
-                self._get_event_bus().store,
-            )
+            await self.catch_up_world_projection()
 
     async def record_provider_notice(
         self,
@@ -995,10 +1740,7 @@ class LifeEngineService(BaseService):
         )
         await self._get_event_bus().publish(event)
         if self._world_projection is not None:
-            await asyncio.to_thread(
-                self._world_projection.catch_up,
-                self._get_event_bus().store,
-            )
+            await self.catch_up_world_projection()
 
     async def _queue_pending_event(
         self,
@@ -1173,18 +1915,101 @@ class LifeEngineService(BaseService):
             },
         }
 
+    async def refresh_storage_health(self) -> dict[str, Any]:
+        """Refresh read-only async Port diagnostics into the sync health cache."""
+
+        if not self._selectable_storage_enabled:
+            return dict(self._storage_health_cache)
+        if (
+            self._storage_runtime is None
+            or self._life_event_store is None
+            or self._presence_world_stores is None
+            or self._subject_document_store is None
+        ):
+            return dict(self._storage_health_cache)
+        component_checks: list[tuple[str, Any]] = [
+            ("runtime", self._storage_runtime.health()),
+            ("life_event", self._life_event_store.health_snapshot()),
+            ("presence", self._presence_world_stores.presence.health_snapshot()),
+            ("world", self._presence_world_stores.world.health_snapshot()),
+            ("subject_document", self._subject_document_store.health_snapshot()),
+        ]
+        if self._learning_stores is not None:
+            component_checks.append(
+                ("learning", self._learning_stores.store.health_snapshot())
+            )
+        results = await asyncio.gather(
+            *(check for _, check in component_checks),
+            return_exceptions=True,
+        )
+
+        def normalized(name: str, value: Any) -> dict[str, Any]:
+            if isinstance(value, BaseException):
+                return {
+                    "component": name,
+                    "status": "failed",
+                    "reason": type(value).__name__,
+                }
+            return dict(value)
+
+        components = {
+            name: normalized(name, result)
+            for (name, _), result in zip(component_checks, results, strict=True)
+        }
+        statuses = {
+            str(item.get("status") or "healthy") for item in components.values()
+        }
+        if "failed" in statuses:
+            status = "failed"
+        elif "degraded" in statuses:
+            status = "degraded"
+        else:
+            status = "healthy"
+        self._storage_health_cache = {
+            "status": status,
+            "backend": self._storage_factory_settings.authoritative_backend.value,
+            "components": components,
+        }
+        return dict(self._storage_health_cache)
+
     def health(self) -> dict[str, Any]:
         """返回一个轻量健康信息。"""
         snapshot = self.snapshot()
-        if self._event_bus is not None:
-            snapshot["raw_event_ledger"] = self._event_bus.store.health_snapshot()
-        snapshot["consciousness_presence"] = (
-            self._consciousness_registry.health_snapshot()
+        snapshot["storage_runtime"] = dict(self._storage_health_cache)
+        snapshot["learning"] = (
+            self._learning_scheduler.get_state()
+            if self._learning_scheduler is not None
+            else {
+                "status": "disabled",
+                "reason": "learning scheduler is not active",
+            }
         )
-        if self._world_projection is not None:
-            snapshot["world_projection"] = (
-                self._world_projection.health_snapshot()
+        if self._selectable_storage_enabled:
+            components = self._storage_health_cache.get("components") or {}
+            snapshot["raw_event_ledger"] = dict(
+                components.get("life_event") or {}
             )
+            snapshot["consciousness_presence"] = dict(
+                components.get("presence") or {}
+            )
+            snapshot["world_projection"] = dict(
+                components.get("world") or {}
+            )
+            snapshot["subject_document"] = dict(
+                components.get("subject_document") or {}
+            )
+        else:
+            if self._event_bus is not None:
+                snapshot["raw_event_ledger"] = (
+                    self._event_bus.store.health_snapshot()
+                )
+            snapshot["consciousness_presence"] = (
+                self.consciousness_registry.health_snapshot()
+            )
+            if self._world_projection is not None:
+                snapshot["world_projection"] = (
+                    self._world_projection.health_snapshot()
+                )
         if self._router_context_projection is not None:
             snapshot["router_context_projection"] = (
                 self._router_context_projection.health_snapshot()
@@ -3379,8 +4204,15 @@ class LifeEngineService(BaseService):
 
     async def _prepare_heartbeat_context(self) -> PreparedHeartbeatContext:
         """Drain pending events and prepare one fixed heartbeat snapshot."""
-        self._consciousness_registry.reconcile_expired(timestamp=_now_iso())
-        self.save_consciousness_registry()
+        registry = self.consciousness_registry
+        if isinstance(registry, AsyncConsciousnessRegistry):
+            await registry.reconcile_expired()
+        else:
+            await asyncio.to_thread(
+                registry.reconcile_expired,
+                timestamp=_now_iso(),
+            )
+        await self.save_consciousness_registry_async()
 
         pending = await self.drain_pending_events()
         if pending:
@@ -3397,9 +4229,8 @@ class LifeEngineService(BaseService):
             cursor=cursor,
             existing_summary=summary,
         )
-        prepared.world_perception = await asyncio.to_thread(
-            self.prepare_perception,
-            "life_engine_subconscious",
+        prepared.world_perception = await self.prepare_perception(
+            "life_engine_subconscious"
         )
         prepared.content = (
             "<transient_world_perception>\n"
@@ -3523,10 +4354,7 @@ class LifeEngineService(BaseService):
         if heartbeat_event is not None:
             await self._publish_raw_events([heartbeat_event])
         if isinstance(prepared.world_perception, PreparedPerception):
-            await asyncio.to_thread(
-                self.commit_perception,
-                prepared.world_perception,
-            )
+            await self.commit_perception(prepared.world_perception)
         await self._save_runtime_context()
 
     async def _prepare_and_commit_heartbeat_context(
@@ -3755,7 +4583,7 @@ class LifeEngineService(BaseService):
                 )
         prepared = self._pending_chatter_perceptions.get(sid)
         if prepared is not None:
-            await asyncio.to_thread(self.commit_perception, prepared)
+            await self.commit_perception(prepared)
             if self._pending_chatter_perceptions.get(sid) is prepared:
                 self._pending_chatter_perceptions.pop(sid, None)
 
@@ -4190,10 +5018,7 @@ class LifeEngineService(BaseService):
         sections: list[str] = []
 
         instance_id = self.resolve_consciousness_instance(stream_id)
-        world_perception = await asyncio.to_thread(
-            self.prepare_perception,
-            instance_id,
-        )
+        world_perception = await self.prepare_perception(instance_id)
         sections.append(
             "### 潜意识协调的瞬时世界感知\n"
             f"{world_perception.content}"
@@ -4297,7 +5122,7 @@ class LifeEngineService(BaseService):
             sections.append(f"### 最近关键活动\n{salient_body}")
             new_event_high_water = max(new_event_high_water, salient_high_water)
 
-        # 学习系统注入：技能目录 + 自我认知（边界提醒，修复 chatter 反馈缺口）
+        # 学习系统只注入可质疑的派生账本；主体权威仍唯一来自 SOUL+USER+MEMORY。
         learning_cfg = getattr(cfg, "learning", None)
         if (
             self._learning_scheduler is not None
@@ -4308,12 +5133,18 @@ class LifeEngineService(BaseService):
                 max_chars=int(getattr(learning_cfg, "skill_catalog_max_chars", 600) or 600)
             )
             if skill_catalog:
-                sections.append(f"### 我的做事方式\n{skill_catalog}")
+                sections.append(
+                    "### 程序性学习账本（可质疑，非主体权威）\n"
+                    f"{skill_catalog}"
+                )
             knowledge_text = self._learning_scheduler.get_knowledge_for_prompt(
                 max_chars=int(getattr(learning_cfg, "knowledge_max_chars", 2000) or 2000)
             )
             if knowledge_text:
-                sections.append(f"### 自我认知\n{knowledge_text}")
+                sections.append(
+                    "### 学习观察账本（可质疑，非主体权威）\n"
+                    f"{knowledge_text}"
+                )
 
         # thought delta cursor 在渲染阶段直接提交（不等待 LLM 调用成功）
         if commit_cursors and new_thought_revision > thought_cursor:
@@ -5147,7 +5978,7 @@ class LifeEngineService(BaseService):
             try:
                 await self._learning_scheduler.on_heartbeat()
             except Exception as exc:  # noqa: BLE001
-                logger.debug(f"学习系统心跳异常: {exc}")
+                logger.debug("学习系统心跳异常: %s", type(exc).__name__)
 
         if not last_text:
             if tool_event_count > 0:
@@ -5200,6 +6031,21 @@ class LifeEngineService(BaseService):
         self._event_history = history
 
     async def start(self) -> None:
+        """Start all consumers, rolling back them before the owned runtime."""
+
+        try:
+            await self._start_impl()
+        except BaseException as primary:
+            try:
+                await self.stop()
+            except Exception as cleanup_error:  # noqa: BLE001 - preserve primary
+                primary.add_note(
+                    "LifeEngineService startup cleanup also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
+
+    async def _start_impl(self) -> None:
         """启动心跳。"""
         from .registry import register_life_engine_service
 
@@ -5221,9 +6067,12 @@ class LifeEngineService(BaseService):
                 "请使用 HH:MM 格式，且 sleep_time 与 wake_time 不可相同。"
             )
 
+        await self._open_selected_storage_runtime()
+
         # 初始化集成管理器
         self._memory_integration = MemoryIntegration(self)
         await self._memory_integration.init_memory_service()
+        self._require_selected_memory_service()
 
         self._dfc_integration = DFCIntegration(self)
 
@@ -5252,17 +6101,45 @@ class LifeEngineService(BaseService):
             self._impulse_engine = ImpulseEngine(list(DEFAULT_RULES))
             logger.info("冲动引擎已初始化")
 
+        await self._start_selected_storage()
+
         # 初始化三环自学习系统
         learning_cfg = getattr(cfg, "learning", None)
         if learning_cfg is None or getattr(learning_cfg, "enabled", True):
             try:
                 from ..learning.scheduler import LearningScheduler
 
+                if self._selectable_storage_enabled and self._learning_stores is None:
+                    raise RuntimeError("SelectedLearningStorageNotStarted")
                 self._learning_scheduler = LearningScheduler(
                     workspace_path=cfg.settings.workspace_path,
                     model_task_name=getattr(cfg.model, "task_name", "core"),
-                    # 反思环需要记忆服务：把"我之前理解错了"落成显式修正记录
+                    # 反思候选可进入记忆检索；只有显式归属活跃意识实例的
+                    # 主动反思才写 subject-authored interpretation。
                     memory_service=self._memory_service,
+                    learning_store=(
+                        self._learning_stores.store
+                        if self._learning_stores is not None
+                        else None
+                    ),
+                    subject_authority=(
+                        self._subject_document_store
+                        if self._selectable_storage_enabled
+                        else None
+                    ),
+                    project_subject_commit=(
+                        self._project_learning_subject_authority_commit
+                        if self._selectable_storage_enabled
+                        else None
+                    ),
+                    current_subject_revision=(
+                        None
+                        if self._selectable_storage_enabled
+                        else self._current_learning_subject_revision
+                    ),
+                    validate_active_consciousness_instance=(
+                        self._validate_learning_decision_actor
+                    ),
                     audit_interval_hours=float(getattr(learning_cfg, "audit_interval_hours", 6.0) if learning_cfg else 6.0),
                     audit_batch_size=int(getattr(learning_cfg, "audit_batch_size", 3) if learning_cfg else 3),
                     compress_trigger_count=int(getattr(learning_cfg, "compress_trigger_count", 5) if learning_cfg else 5),
@@ -5271,8 +6148,10 @@ class LifeEngineService(BaseService):
                     skill_distill_trigger_count=int(getattr(learning_cfg, "skill_distill_trigger_count", 3) if learning_cfg else 3),
                     skill_distill_interval_hours=float(getattr(learning_cfg, "skill_distill_interval_hours", 24.0) if learning_cfg else 24.0),
                     minecraft_enabled=bool(getattr(cfg, "minecraft", None) and cfg.minecraft.enabled),
-                    consciousness_registry=self._consciousness_registry,
-                    save_consciousness_registry=self.save_consciousness_registry,
+                    consciousness_registry=self.consciousness_registry,
+                    save_consciousness_registry=(
+                        self.save_consciousness_registry_async
+                    ),
                     prepare_perception=self.prepare_perception,
                     commit_perception=self.commit_perception,
                     report_world_observation=self.report_world_observation,
@@ -5296,10 +6175,18 @@ class LifeEngineService(BaseService):
                         "intent_timeout_seconds": cfg.minecraft.intent_timeout_seconds,
                     } if getattr(cfg, "minecraft", None) and cfg.minecraft.enabled else None,
                 )
+                await self._learning_scheduler.initialize()
                 logger.info("三环自学习系统已初始化")
             except Exception as exc:  # noqa: BLE001
-                logger.warning(f"三环自学习系统初始化失败: {exc}")
+                logger.warning(
+                    "三环自学习系统初始化失败: %s",
+                    type(exc).__name__,
+                )
                 self._learning_scheduler = None
+                if self._selectable_storage_enabled:
+                    raise RuntimeError(
+                        "SelectedLearningStorageInitializationFailed"
+                    ) from exc
 
         self._state.running = True
         self._state.started_at = _now_iso()
@@ -5323,6 +6210,11 @@ class LifeEngineService(BaseService):
             try:
                 from .shared_sync import SharedSyncBridge
 
+                if self._selectable_storage_enabled:
+                    raise RuntimeError(
+                        "legacy shared_sync cannot bind a selected authoritative "
+                        "Life Event backend"
+                    )
                 self._shared_sync_bridge = SharedSyncBridge(
                     shared_sync_cfg,
                     self._get_event_bus().store,
@@ -5426,7 +6318,7 @@ class LifeEngineService(BaseService):
             from .memory_witness import MemoryWitnessCoordinator
 
             self._memory_witness_coordinator = MemoryWitnessCoordinator(self)
-            self._memory_witness_coordinator.ensure_instance()
+            await self._memory_witness_coordinator.ensure_instance()
             witness_task = get_task_manager().create_task(
                 self._memory_witness_coordinator.loop(),
                 name="life_engine_memory_witness",
@@ -5482,6 +6374,7 @@ class LifeEngineService(BaseService):
         from .registry import unregister_life_engine_service
 
         pending_before_stop = len(self._pending_events)
+        shutdown_errors: list[Exception] = []
         self._state.running = False
 
         if self._stop_event is not None:
@@ -5528,11 +6421,25 @@ class LifeEngineService(BaseService):
         await self._await_managed_task(self._heartbeat_task_id, timeout=5.0)
         self._heartbeat_task_id = None
 
+        learning_scheduler = self._learning_scheduler
+        if learning_scheduler is not None:
+            try:
+                await learning_scheduler.close()
+            except Exception as exc:  # noqa: BLE001 - continue owned cleanup
+                shutdown_errors.append(exc)
+                logger.error(
+                    "关闭学习系统失败",
+                    exc_info=True,
+                )  # noqa: G201 - project Logger has no exception()
+            finally:
+                self._learning_scheduler = None
+
         memory_service = self._memory_service
         if memory_service is not None:
             try:
                 await memory_service.close()
             except Exception as exc:  # noqa: BLE001
+                shutdown_errors.append(exc)
                 logger.error(f"关闭记忆服务失败: {exc}", exc_info=True)
             finally:
                 self._memory_service = None
@@ -5544,6 +6451,14 @@ class LifeEngineService(BaseService):
         self._stop_event = None
         unregister_life_engine_service()
         await self._save_runtime_context()
+        try:
+            await self._close_selected_storage()
+        except Exception as exc:  # noqa: BLE001 - finish remaining shutdown
+            shutdown_errors.append(exc)
+            logger.error(
+                "关闭 selected Presence/World storage 失败",
+                exc_info=True,
+            )  # noqa: G201 - project Logger has no exception()
 
         logger.info("life_engine 已停止")
         log_lifecycle(
@@ -5552,6 +6467,11 @@ class LifeEngineService(BaseService):
             heartbeat_count=self._state.heartbeat_count,
             log_file_path=str(get_life_log_file()),
         )
+        if shutdown_errors:
+            raise ExceptionGroup(
+                "LifeEngineService shutdown reported consumer failures",
+                shutdown_errors,
+            )
 
     async def _run_heartbeat_round(
         self,

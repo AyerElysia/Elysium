@@ -595,10 +595,10 @@ class ContextBridge:
         self._prompt_bundle = VoicePromptBundle(prompt, subject_metadata, layers)
         return self._prompt_bundle
 
-    def build_llm_context_prefix(self) -> tuple[str, Any | None]:
+    async def build_llm_context_prefix(self) -> tuple[str, Any | None]:
         """Build one transient world context and its uncommitted delivery."""
 
-        prepared = self._consciousness.prepare_perception()
+        prepared = await self._consciousness.prepare_perception()
         if prepared is None:
             self._last_perception_stats = {}
             return "", None

@@ -78,12 +78,16 @@ async def test_reflection_appends_source_linked_interpretation(
         user_prompt="reflect",
         source_event_ids=["event-42"],
         reflection_type="interaction",
+        actor_consciousness_instance_id="consciousness-1",
     )
 
     assert len(created) == 1
     interpretation, sources = memory.interpretations[0]
     assert interpretation.content == payload["insights"][0]["claim"]
     assert interpretation.subject_id == "learning_topic:沉默"
+    assert interpretation.authored_by == "consciousness-1"
+    assert interpretation.consciousness_instance_id == "consciousness-1"
+    assert interpretation.metadata["authority"] == "active_consciousness_reflection"
     assert {item.entity_ref for item in sources} == {
         "life_event:event-42",
         "event-42",
@@ -118,6 +122,7 @@ async def test_only_explicit_reinforces_merges_evidence(tmp_path, monkeypatch) -
         user_prompt="reflect",
         source_event_ids=["event-2"],
         reflection_type="interaction",
+        actor_consciousness_instance_id="consciousness-1",
     )
 
     assert created == []
@@ -156,7 +161,9 @@ async def test_similar_text_without_explicit_relation_stays_distinct(
         user_prompt="reflect",
         source_event_ids=["event-3"],
         reflection_type="interaction",
+        actor_consciousness_instance_id="",
     )
 
     assert len(created) == 1
     assert len(engine._store.list_all()) == 2
+    assert memory.interpretations == []

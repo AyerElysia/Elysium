@@ -29,7 +29,9 @@ class _FakeCollection:
         self.delete_calls.append(ids)
 
 
-def _snapshot(db: sqlite3.Connection) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
+def _snapshot(
+    db: sqlite3.Connection,
+) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
     cursor = db.cursor()
     cursor.execute(
         """
@@ -157,7 +159,9 @@ async def test_vector_search_filters_stale_ids_without_collection_mutation(
     async def _fake_embed(_: str) -> list[float]:
         return [0.1]
 
-    async def _filter(scores: list[tuple[str, float]]) -> tuple[list[tuple[str, float]], list[str]]:
+    async def _filter(
+        scores: list[tuple[str, float]],
+    ) -> tuple[list[tuple[str, float]], list[str]]:
         return [scores[0]], ["stale"]
 
     monkeypatch.setattr("plugins.life_engine.memory.search.embed_text", _fake_embed)
@@ -167,7 +171,9 @@ async def test_vector_search_filters_stale_ids_without_collection_mutation(
     assert collection.delete_calls == []
 
 
-async def test_dream_walk_default_does_not_create_or_update_edges(tmp_path: Path) -> None:
+async def test_dream_walk_default_does_not_create_or_update_edges(
+    tmp_path: Path,
+) -> None:
     service = await _make_service(tmp_path)
     node_a = await service.get_or_create_file_node("notes/a.md", title="A")
     node_b = await service.get_or_create_file_node("notes/b.md", title="B")
@@ -333,14 +339,18 @@ async def test_canonical_resolver_rejects_runtime_path_without_reading_graph(
     service = await _make_service(tmp_path)
     before = _snapshot(service._db)
 
-    result = await service.resolve_canonical_path("runtime/state.json", allow_heuristic=True)
+    result = await service.resolve_canonical_path(
+        "runtime/state.json", allow_heuristic=True
+    )
 
     assert result["resolved"] is False
     assert result["note"] == "不是可用于记忆演化的文档: unsupported_suffix"
     assert _snapshot(service._db) == before
 
 
-async def test_memory_bundles_exclude_legacy_runtime_lineage_nodes(tmp_path: Path) -> None:
+async def test_memory_bundles_exclude_legacy_runtime_lineage_nodes(
+    tmp_path: Path,
+) -> None:
     service = await _make_service(tmp_path)
     memory_path = "notes/kept.md"
     file_path = tmp_path / memory_path
@@ -493,21 +503,22 @@ async def test_memory_bundles_batch_lineage_reads_and_path_checks(
     assess_threads: list[str] = []
     loop_thread = threading.current_thread().name
 
-    real_views = service_module.get_lineage_node_views
+    graph_store = service._require_memory_storage().legacy_graph
+    real_views = graph_store.get_lineage_node_views
     real_assess = service_module._assess_bundle_paths
 
-    async def _counting_views(db: Any, node_ids: Any) -> Any:
+    async def _counting_views(node_ids: Any) -> Any:
         """统计血缘节点批量查询次数。"""
         nonlocal view_calls
         view_calls += 1
-        return await real_views(db, node_ids)
+        return await real_views(node_ids)
 
     def _recording_assess(workspace: Any, paths: Any) -> Any:
         """记录路径判定所在线程。"""
         assess_threads.append(threading.current_thread().name)
         return real_assess(workspace, paths)
 
-    monkeypatch.setattr(service_module, "get_lineage_node_views", _counting_views)
+    monkeypatch.setattr(graph_store, "get_lineage_node_views", _counting_views)
     monkeypatch.setattr(service_module, "_assess_bundle_paths", _recording_assess)
 
     bundles = await service.build_memory_bundles(

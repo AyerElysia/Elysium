@@ -57,7 +57,16 @@ async def test_compressor_exposes_all_rejected_counterexamples(tmp_path) -> None
     compressor._compress = compress  # type: ignore[method-assign]
     compressor._selection_gate = reject_gate  # type: ignore[method-assign]
 
-    assert await compressor.run_compression() is False
+    # A rejected background gate still produces an immutable, unpromoted
+    # proposal.  The return value means "proposal persisted", never
+    # "subject authority accepted".
+    assert await compressor.run_compression() is True
+    manifest = store.load_knowledge_manifest()
+    assert manifest["current_version"] == 0
+    assert manifest["versions"][0]["promoted"] is False
+    assert manifest["versions"][0]["selection_reason"] == (
+        "independent_gate_not_recommended"
+    )
     assert [item.claim for item in observed_rejected] == [
         f"Rejected counterexample {index}." for index in range(8)
     ]

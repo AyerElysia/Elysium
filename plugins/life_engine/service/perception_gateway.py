@@ -194,3 +194,162 @@ class PerceptionGateway:
             f"{prepared.content}\n\n"
             "请由当前意识实例结合来源、时间与矛盾记录自行判断；查询本身不会改写投影。"
         )
+
+
+class AsyncPerceptionGateway(PerceptionGateway):
+    """Async selected-backend perception with bounded, gap-intolerant replay."""
+
+    def __init__(
+        self,
+        registry: Any,
+        ledger: Any,
+        projection: Any,
+    ) -> None:
+        self._registry = registry
+        self._ledger = ledger
+        self._projection = projection
+
+    @property
+    def projection(self) -> Any:
+        """Expose the selected async World Port for diagnostics."""
+
+        return self._projection
+
+    @staticmethod
+    def _ensure_deliverable(contract: dict[str, Any]) -> None:
+        state = str(contract.get("rebuild_state") or "")
+        if state != "idle":
+            from .world_projection import WorldProjectionUnavailable
+
+            raise WorldProjectionUnavailable(
+                "world projection is not deliverable: "
+                f"rebuild_state={state or '<missing>'}"
+            )
+
+    async def catch_up(
+        self,
+        *,
+        batch_size: int = 500,
+        max_batches: int = 1000,
+    ) -> int:
+        """Replay a bounded ledger prefix without skipping any position."""
+
+        if batch_size <= 0 or max_batches <= 0:
+            raise ValueError("world catch-up limits must be positive")
+        contract = await self._projection.projector_contract()
+        self._ensure_deliverable(contract)
+        position = int(contract.get("as_of_ingest_position") or 0)
+        for _ in range(max_batches):
+            batch = await self._ledger.read_since(position, limit=batch_size)
+            if not batch:
+                return position
+            position = await self._projection.apply_events(batch)
+        raise RuntimeError(
+            "WorldProjectionCatchUpLimit: ledger backlog exceeded the bounded replay "
+            f"window after position {position}"
+        )
+
+    async def rebuild(
+        self,
+        *,
+        batch_size: int = 500,
+        max_batches: int = 1000,
+    ) -> int:
+        """Explicitly rebuild derived World rows while preserving cursors."""
+
+        if batch_size <= 0 or max_batches <= 0:
+            raise ValueError("world rebuild limits must be positive")
+        await self._projection.begin_rebuild()
+        position = 0
+        try:
+            for _ in range(max_batches):
+                batch = await self._ledger.read_since(position, limit=batch_size)
+                if not batch:
+                    await self._projection.finish_rebuild(
+                        expected_frontier=position
+                    )
+                    return position
+                position = await self._projection.apply_events(batch)
+            raise RuntimeError(
+                "WorldProjectionRebuildLimit: ledger exceeded the bounded replay "
+                f"window after position {position}"
+            )
+        except BaseException as primary:
+            try:
+                await self._projection.fail_rebuild()
+            except Exception as state_error:  # noqa: BLE001
+                primary.add_note(
+                    "world rebuild state could not be marked failed: "
+                    f"{type(state_error).__name__}"
+                )
+            raise
+
+    async def prepare(self, instance_id: str) -> PreparedPerception:
+        """Prepare one stable selected-backend snapshot without cursor advance."""
+
+        identity = str(instance_id or "").strip()
+        if not identity:
+            raise ValueError("perception instance_id must not be empty")
+        await self._registry.refresh()
+        through = await self.catch_up()
+        contract = await self._projection.projector_contract()
+        self._ensure_deliverable(contract)
+        from_position, revision = await self._projection.perception_cursor(identity)
+        assertions = await self._projection.list_assertions(include_retracted=True)
+        changes = await self._projection.changes_since(
+            from_position,
+            through_position=through,
+        )
+        sections: list[str] = []
+        sections.extend(self._render_presence(identity))
+        assertion_lines = self._render_assertions(assertions)
+        if assertion_lines:
+            sections.extend(["", *assertion_lines])
+        change_lines = self._render_changes(changes)
+        if change_lines:
+            sections.extend(["", *change_lines])
+        sections.extend(
+            [
+                "",
+                "这是一段只属于本轮的可替换运行态感知，不应原样写入长期对话历史。",
+            ]
+        )
+        return PreparedPerception(
+            instance_id=identity,
+            from_position=from_position,
+            through_position=through,
+            cursor_revision=revision,
+            content="\n".join(sections),
+            assertion_ids=tuple(item.assertion_id for item in assertions),
+            change_positions=tuple(item.ingest_position for item in changes),
+        )
+
+    async def commit(self, prepared: PreparedPerception) -> tuple[int, int]:
+        """CAS-advance exactly one successfully delivered async snapshot."""
+
+        return await self._projection.commit_perception_cursor(
+            prepared.instance_id,
+            expected_position=prepared.from_position,
+            expected_revision=prepared.cursor_revision,
+            through_position=prepared.through_position,
+        )
+
+    async def query(self, instance_id: str, query: str) -> str:
+        """Return a full attributable projection without changing its cursor."""
+
+        question = str(query or "").strip()
+        if not question:
+            raise ValueError("world query must not be empty")
+        prepared = await self.prepare(instance_id)
+        return (
+            f"当前意识窗口提出的内在查询：{question}\n\n"
+            f"{prepared.content}\n\n"
+            "请由当前意识实例结合来源、时间与矛盾记录自行判断；查询本身不会改写投影。"
+        )
+
+
+__all__ = [
+    "AsyncPerceptionGateway",
+    "PerceptionGateway",
+    "PreparedPerception",
+]

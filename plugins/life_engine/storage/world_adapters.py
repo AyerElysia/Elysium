@@ -491,11 +491,6 @@ class SQLWorldProjectionStore:
                     raise ValueError(
                         "world projection requires positive ledger positions"
                     )
-                if event.sequence > current + 1:
-                    raise WorldProjectionConflict(
-                        "world projector ledger gap: "
-                        f"expected {current + 1}, actual {event.sequence}"
-                    )
                 await self._apply_event(session, event)
                 current = max(current, event.sequence)
             await self._set_meta(

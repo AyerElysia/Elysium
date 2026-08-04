@@ -10,18 +10,20 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import hashlib
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import json_repair
 
 from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
-from src.kernel.llm import LLMPayload, ROLE, Text
+from src.kernel.llm import ROLE, LLMPayload, Text
 
-from .models import Insight, InsightNextAction, InsightStatus
+from .models import Insight, InsightStatus
+from .projection import project_learning_text
 from .prompts import (
     KNOWLEDGE_COMPRESS_SYSTEM,
     KNOWLEDGE_COMPRESS_USER,
@@ -35,12 +37,13 @@ from .store import InsightStore
 logger = logging.getLogger("life_engine.learning.knowledge")
 
 # 默认参数
-_DEFAULT_TRIGGER_COUNT = 5       # 触发压缩的 validated 数量
-_DEFAULT_INTERVAL_HOURS = 48.0   # 压缩最小间隔
+_DEFAULT_TRIGGER_COUNT = 5  # 触发压缩的 validated 数量
+_DEFAULT_INTERVAL_HOURS = 48.0  # 压缩最小间隔
 _INITIAL_KNOWLEDGE = """\
-# 自我认知
+# 学习派生观察候选
 
-这份文档是我对自己的理解——基于我验证过的经历，而非猜测。
+这份文档只是学习系统基于经历整理的可修订观察，不属于 SOUL、USER、MEMORY
+主体权威，也不替当前意识实例下结论。
 
 ## 社交模式
 
@@ -65,7 +68,7 @@ _INITIAL_KNOWLEDGE = """\
 
 
 class SelfKnowledgeCompressor:
-    """慢环：将 validated 洞察压缩为版本化自我认知文档。"""
+    """慢环：把审计支持的洞察压缩为未获授权的版本化观察候选。"""
 
     def __init__(
         self,
@@ -83,10 +86,13 @@ class SelfKnowledgeCompressor:
         self._model_task_name = str(model_task_name or "life").strip() or "life"
         self._timeout = max(30.0, float(timeout_seconds or 90.0))
         self._trigger_count = max(2, int(trigger_count or _DEFAULT_TRIGGER_COUNT))
-        self._interval_hours = max(6.0, float(interval_hours or _DEFAULT_INTERVAL_HOURS))
+        self._interval_hours = max(
+            6.0, float(interval_hours or _DEFAULT_INTERVAL_HOURS)
+        )
         # 兼容旧配置入口；认知内容的修改范围由整合过程自行判断。
         del max_edits
         self._lock = asyncio.Lock()
+        self._last_projection_stats: dict[str, Any] = {}
 
     def should_compress(self) -> bool:
         """判断是否应该触发压缩。"""
@@ -102,7 +108,7 @@ class SelfKnowledgeCompressor:
         if last_compress:
             try:
                 last_dt = datetime.fromisoformat(last_compress)
-                now = datetime.now(timezone.utc).astimezone()
+                now = datetime.now(UTC).astimezone()
                 hours_elapsed = (now - last_dt).total_seconds() / 3600.0
                 if hours_elapsed >= self._interval_hours and promotable:
                     return True
@@ -111,7 +117,7 @@ class SelfKnowledgeCompressor:
         return False
 
     async def run_compression(self) -> bool:
-        """执行一次压缩周期。返回是否成功 promote 新版本。"""
+        """Create one immutable proposal; never accept it on the subject's behalf."""
         async with self._lock:
             promotable = self._store.list_for_compression()
             if not promotable:
@@ -144,50 +150,53 @@ class SelfKnowledgeCompressor:
                 logger.info("压缩未产生变化")
                 return False
 
-            # 4. Selection Gate
-            promote = await self._selection_gate(
+            # 4. Independent assessment. This is a recommendation, not the
+            # subject's acceptance and therefore cannot promote by itself.
+            recommended = await self._selection_gate(
                 old_content=current_knowledge,
                 new_content=new_content,
                 insight_count=len(promotable),
             )
 
-            # 5. 确定版本号
+            # 5. Allocate an immutable candidate version independently from
+            # the current accepted projection head.
             manifest = self._store.load_knowledge_manifest()
-            next_version = int(manifest.get("current_version", 0)) + 1
+            version_numbers = [int(manifest.get("current_version", 0) or 0)]
+            versions = manifest.get("versions", [])
+            if isinstance(versions, list):
+                version_numbers.extend(
+                    int(item.get("version", 0) or 0)
+                    for item in versions
+                    if isinstance(item, dict)
+                )
+            next_version = max(version_numbers, default=0) + 1
 
-            # 6. 写入版本
+            # 6. Persist a proposal outside accepted self/subject authority.
             insight_ids = [ins.insight_id for ins in promotable]
             self._store.write_knowledge_version(
                 content=new_content,
                 version=next_version,
                 insight_ids=insight_ids,
                 edit_count=self._count_change_regions(current_knowledge, new_content),
-                promoted=promote,
-                reason="selection_gate_passed" if promote else "selection_gate_rejected",
+                promoted=False,
+                reason=(
+                    "independent_gate_recommended"
+                    if recommended
+                    else "independent_gate_not_recommended"
+                ),
             )
 
-            if promote:
-                # 标记已压缩的洞察为 promoted（从 promote 队列移除）
-                for ins in promotable:
-                    ins.next_action = InsightNextAction.ARCHIVE.value
-                    # 记下它进过哪个版本：万一以后她把这条拿回来重想、
-                    # 又重新验证了，压缩器能认出"这条在旧版里已有表述，
-                    # 该更新而不是再写一遍"。
-                    if next_version not in ins.knowledge_versions:
-                        ins.knowledge_versions.append(next_version)
-                    self._store.update_insight(ins)
-
-                # 更新状态
-                state = self._store.load_state()
-                state["last_compress_at"] = _now_iso()
-                state["current_knowledge_version"] = next_version
-                self._store.save_state(state)
-
-                logger.info(f"✅ 自我认知 v{next_version} 已提升")
-            else:
-                logger.info(f"⏸️ 自我认知 v{next_version} 未通过 selection gate")
-
-            return promote
+            state = self._store.load_state()
+            state["last_compress_at"] = _now_iso()
+            state["last_knowledge_candidate_version"] = next_version
+            state["last_knowledge_candidate_recommended"] = recommended
+            self._store.save_state(state)
+            logger.info(
+                "自我认知候选 v%s 已保存（独立评估=%s，尚未由主体接受）",
+                next_version,
+                recommended,
+            )
+            return True
 
     async def _compress(
         self,
@@ -199,25 +208,56 @@ class SelfKnowledgeCompressor:
     ) -> str:
         """调用 LLM 执行有界压缩。"""
         system_prompt = KNOWLEDGE_COMPRESS_SYSTEM
+        layers = {
+            "current": project_learning_text(
+                current_knowledge,
+                max_bytes=16 * 1024,
+                projection_kind="knowledge_current",
+            ),
+            "validated": project_learning_text(
+                format_insights_for_compression(
+                    [ins.to_dict() for ins in validated_insights]
+                ),
+                max_bytes=48 * 1024,
+                projection_kind="knowledge_validated_insights",
+            ),
+            "rejected": project_learning_text(
+                format_insights_for_compression(
+                    [ins.to_dict() for ins in rejected_insights]
+                ),
+                max_bytes=16 * 1024,
+                projection_kind="knowledge_rejected_insights",
+            ),
+            "reconsidered": project_learning_text(
+                format_reconsidered_for_compression(
+                    [ins.to_dict() for ins in (reconsidered_insights or [])]
+                ),
+                max_bytes=16 * 1024,
+                projection_kind="knowledge_reconsidered_insights",
+            ),
+        }
         user_prompt = KNOWLEDGE_COMPRESS_USER.format(
-            current_knowledge=current_knowledge,
-            validated_insights=format_insights_for_compression(
-                [ins.to_dict() for ins in validated_insights]
-            ),
-            rejected_insights=format_insights_for_compression(
-                [ins.to_dict() for ins in rejected_insights]
-            ),
-            reconsidered_insights=format_reconsidered_for_compression(
-                [ins.to_dict() for ins in (reconsidered_insights or [])]
-            ),
+            current_knowledge=layers["current"].text,
+            validated_insights=layers["validated"].text,
+            rejected_insights=layers["rejected"].text,
+            reconsidered_insights=layers["reconsidered"].text,
         )
+        delivered = project_learning_text(
+            user_prompt,
+            max_bytes=96 * 1024,
+            projection_kind="knowledge_compression_request",
+        )
+        self._last_projection_stats = {
+            "request": delivered.stats(),
+            "layers": {name: layer.stats() for name, layer in layers.items()},
+        }
 
         request = create_llm_request(
             get_model_set_by_task(self._model_task_name),
             request_name="life_learning_compress",
         )
         request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
-        request.add_payload(LLMPayload(ROLE.USER, Text(user_prompt)))
+        request.add_payload(LLMPayload(ROLE.USER, Text(delivered.text)))
 
         response = await asyncio.wait_for(
             request.send(auto_append_response=False, stream=False),
@@ -239,6 +279,12 @@ class SelfKnowledgeCompressor:
             new_content=new_content,
             insight_count=insight_count,
         )
+        delivered = project_learning_text(
+            user_prompt,
+            max_bytes=64 * 1024,
+            projection_kind="knowledge_gate_request",
+        )
+        self._last_projection_stats["gate"] = delivered.stats()
 
         try:
             request = create_llm_request(
@@ -246,7 +292,7 @@ class SelfKnowledgeCompressor:
                 request_name="life_learning_gate",
             )
             request.add_payload(LLMPayload(ROLE.SYSTEM, Text(SELECTION_GATE_SYSTEM)))
-            request.add_payload(LLMPayload(ROLE.USER, Text(user_prompt)))
+            request.add_payload(LLMPayload(ROLE.USER, Text(delivered.text)))
 
             response = await asyncio.wait_for(
                 request.send(auto_append_response=False, stream=False),
@@ -255,7 +301,10 @@ class SelfKnowledgeCompressor:
             raw_text = await asyncio.wait_for(response, timeout=self._timeout)
             return self._parse_gate_result(str(raw_text or ""))
         except Exception as exc:
-            logger.warning(f"Selection gate 调用失败，默认拒绝: {exc}")
+            logger.warning(
+                "Selection gate 调用失败，默认拒绝: %s",
+                type(exc).__name__,
+            )
             return False
 
     def _parse_gate_result(self, raw_text: str) -> bool:
@@ -290,18 +339,49 @@ class SelfKnowledgeCompressor:
 
         只做筛选和排序，不下结论。
         """
-        published = [ins for ins in self._store.list_reconsidered() if ins.knowledge_versions]
+        published = [
+            ins for ins in self._store.list_reconsidered() if ins.knowledge_versions
+        ]
         published.sort(key=lambda ins: ins.reconsidered_at)
         return published[-limit:] if limit > 0 else published
 
     def get_knowledge_for_prompt(self, max_chars: int = 0) -> str:
-        """获取完整自我认知文档；兼容参数不再切断内容。"""
+        """Return a bounded, explicitly non-authoritative learning projection."""
         content = self._store.read_current_knowledge()
         if not content:
             return ""
-        del max_chars
-        return content
+        framed = (
+            "[学习观察投影｜非主体权威]\n"
+            "来源：学习系统的历史派生账本；它不属于 SOUL.md、USER.md、MEMORY.md，"
+            "不能覆盖三份主体权威。\n"
+            "使用方式：只把下文当作可质疑、可重审的观察与假设；是否采纳以及如何"
+            "表述，由当前活跃意识实例决定。\n\n"
+            + content
+        )
+        projection = project_learning_text(
+            framed,
+            max_bytes=max_chars,
+            projection_kind="learning_derived_observations",
+        )
+        stats = projection.stats()
+        stats.update(
+            {
+                "authority": "derived_learning_observation",
+                "authoritative": False,
+                "content_source_sha256": hashlib.sha256(
+                    content.encode("utf-8")
+                ).hexdigest(),
+                "content_original_bytes": len(content.encode("utf-8")),
+            }
+        )
+        self._last_projection_stats["prompt"] = stats
+        return projection.text
+
+    def projection_health(self) -> dict[str, Any]:
+        """Return content-free hashes and budgets for the latest prompt layers."""
+
+        return dict(self._last_projection_stats)
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).astimezone().isoformat()
+    return datetime.now(UTC).astimezone().isoformat()

@@ -153,6 +153,20 @@ def _observation(identity: str, *, sequence: int, value: str) -> LifeEvent:
     )
 
 
+def _unprojected_event(identity: str, *, sequence: int) -> LifeEvent:
+    return LifeEvent(
+        event_id=f"event-{identity}",
+        sequence=sequence,
+        timestamp="2026-08-04T01:00:00+00:00",
+        source="contract.unprojected",
+        channel=LifeEventChannel.SYSTEM.value,
+        event_type="contract.unprojected",
+        content="{}",
+        occurrence_id=f"occurrence-{identity}",
+        recorded_at="2026-08-04T01:00:01+00:00",
+    )
+
+
 async def _assert_presence_contract(stores: PresenceWorldStores) -> None:
     presence = stores.presence
     with pytest.raises(PresenceLeaseConflict, match="database time"):
@@ -177,6 +191,18 @@ async def _assert_presence_contract(stores: PresenceWorldStores) -> None:
         refresh_lease=True,
     )
     assert owner.revision == 1
+    expirable = await presence.commit(
+        _instance(
+            "instance:background-expiry",
+            "stream:background-expiry",
+            process_epoch="epoch:background-expiry",
+            lease_seconds=1,
+        ),
+        expected_revision=None,
+        event_type="consciousness.instance_registered",
+        refresh_lease=True,
+    )
+    assert expirable.revision == 1
     with pytest.raises(StreamOwnershipConflict):
         await presence.commit(
             _instance(
@@ -217,6 +243,12 @@ async def _assert_presence_contract(stores: PresenceWorldStores) -> None:
         "instance:owner"
     ]
     assert takeover.displaced[0].instance["status"] == "suspended"
+    expired = await presence.expire_leases(limit=10)
+    assert [item.instance["instance_id"] for item in expired] == [
+        "instance:background-expiry"
+    ]
+    assert expired[0].instance["status"] == "suspended"
+    assert await presence.expire_leases(limit=10) == ()
     with pytest.raises(PresenceRevisionConflict):
         await presence.commit(
             {**takeover.displaced[0].instance, "status": "active"},
@@ -246,15 +278,17 @@ async def _assert_presence_contract(stores: PresenceWorldStores) -> None:
     pending = await presence.pending_events()
     assert [item["event_type"] for item in pending] == [
         "consciousness.instance_registered",
+        "consciousness.instance_registered",
         "consciousness.instance_lease_expired",
         "consciousness.instance_taken_over",
+        "consciousness.instance_lease_expired",
         "consciousness.instance_seen",
     ]
     await presence.acknowledge_events([item["outbox_id"] for item in pending])
     await presence.acknowledge_events([item["outbox_id"] for item in pending])
     assert await presence.pending_events() == []
     presence_health = await presence.health_snapshot()
-    assert presence_health["instance_count"] == 2
+    assert presence_health["instance_count"] == 3
     assert presence_health["active_count"] == 1
     assert presence_health["owned_stream_count"] == 1
     assert presence_health["pending_event_count"] == 0
@@ -263,10 +297,10 @@ async def _assert_presence_contract(stores: PresenceWorldStores) -> None:
 async def _assert_world_contract(stores: PresenceWorldStores) -> None:
     world = stores.world
     original = _observation("world-a", sequence=1, value="first")
+    unprojected = _unprojected_event("opaque-position", sequence=3)
     assert await world.apply_events([original]) == 1
     assert await world.apply_events([original]) == 1
-    with pytest.raises(WorldProjectionConflict, match="ledger gap"):
-        await world.apply_events([_observation("world-gap", sequence=3, value="gap")])
+    assert await world.apply_events([unprojected]) == 3
     with pytest.raises(WorldProjectionConflict, match="ingest position"):
         await world.apply_events(
             [replace(original, source_instance_id="instance:conflict")]
@@ -277,24 +311,24 @@ async def _assert_world_contract(stores: PresenceWorldStores) -> None:
         "instance:observer",
         expected_position=0,
         expected_revision=0,
-        through_position=1,
+        through_position=3,
     )
-    assert committed == (1, 1)
+    assert committed == (3, 1)
     assert (
         await world.commit_perception_cursor(
             "instance:observer",
-            expected_position=1,
+            expected_position=3,
             expected_revision=1,
-            through_position=1,
+            through_position=3,
         )
         == committed
     )
     with pytest.raises(PerceptionCursorConflict):
         await world.commit_perception_cursor(
             "instance:observer",
-            expected_position=1,
+            expected_position=3,
             expected_revision=0,
-            through_position=1,
+            through_position=3,
         )
 
     await world.begin_rebuild()
@@ -302,8 +336,8 @@ async def _assert_world_contract(stores: PresenceWorldStores) -> None:
     rebuilding = await world.projector_contract()
     assert rebuilding["as_of_ingest_position"] == 0
     assert rebuilding["rebuild_state"] == "rebuilding"
-    await world.apply_events([original])
-    await world.finish_rebuild(expected_frontier=1)
+    await world.apply_events([original, unprojected])
+    await world.finish_rebuild(expected_frontier=3)
     world_health = await world.health_snapshot()
     assert world_health["rebuild_state"] == "idle"
     assert world_health["assertion_count"] == 1
@@ -321,8 +355,8 @@ async def _assert_world_contract(stores: PresenceWorldStores) -> None:
     with pytest.raises(WorldProjectionUnavailable):
         await world.apply_events([original])
     await world.begin_rebuild()
-    await world.apply_events([original])
-    await world.finish_rebuild(expected_frontier=1)
+    await world.apply_events([original, unprojected])
+    await world.finish_rebuild(expected_frontier=3)
 
 
 @pytest.mark.asyncio
@@ -334,10 +368,11 @@ async def test_local_presence_and_world_share_backend_contract(tmp_path: Path) -
         assert [
             item["instance_id"] for item in await reopened.presence.list_instances()
         ] == [
+            "instance:background-expiry",
             "instance:claimant",
             "instance:owner",
         ]
-        assert await reopened.world.perception_cursor("instance:observer") == (1, 1)
+        assert await reopened.world.perception_cursor("instance:observer") == (3, 1)
 
 
 @pytest.mark.asyncio

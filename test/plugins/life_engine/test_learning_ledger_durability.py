@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from plugins.life_engine.learning.models import Insight
 from plugins.life_engine.learning.skill_store import SkillPattern, SkillStore
 from plugins.life_engine.learning.store import InsightStore
@@ -49,7 +51,8 @@ class TestBrokenLedgerIsNeverOverwritten:
         assert fresh.list_all() == []          # 内存里是空的
 
         # 关键：这时候写入必须被拒绝，磁盘上的残缺文件不能被"空账本"替换
-        _seed(fresh, claim="新的想法")
+        with pytest.raises(RuntimeError, match="LearningInsightStoreUnavailable"):
+            _seed(fresh, claim="新的想法")
         on_disk = store.insights_path.read_text(encoding="utf-8")
         assert on_disk == raw_before[: len(raw_before) // 2]
         # 残片里仍能看见她原来那条洞察的 id；若被空账本覆写，这里会消失
@@ -109,6 +112,44 @@ class TestUnreadableRowSurvivesCodeVersionChange:
         assert good.insight_id in ids
 
 
+class TestKnowledgeVersionsFailClosed:
+    def test_corrupt_manifest_is_not_treated_as_empty_history(self, tmp_path):
+        store = InsightStore(tmp_path)
+        store.knowledge_dir.mkdir(parents=True)
+        (store.knowledge_dir / "manifest.json").write_text(
+            "{ incomplete",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="LearningKnowledgeManifestUnavailable",
+        ):
+            store.load_knowledge_manifest()
+
+    def test_existing_knowledge_version_is_never_overwritten(self, tmp_path):
+        store = InsightStore(tmp_path)
+        store.write_knowledge_version(
+            content="first exact bytes",
+            version=1,
+            insight_ids=[],
+            edit_count=1,
+            promoted=False,
+            reason="first",
+        )
+
+        with pytest.raises(ValueError, match="KnowledgeVersionConflict"):
+            store.write_knowledge_version(
+                content="different bytes",
+                version=1,
+                insight_ids=[],
+                edit_count=1,
+                promoted=False,
+                reason="conflict",
+            )
+        assert store.read_knowledge_version(1) == "first exact bytes"
+
+
 class TestSkillsAreEquallyDurable:
     """技能档走的是同一条通道，同样不能被读失败抹掉。
 
@@ -129,7 +170,8 @@ class TestSkillsAreEquallyDurable:
         assert fresh.list_skills() == []
 
         # 写入必须被拒绝，残片留在原地
-        fresh.add_skill(SkillPattern.create(name="another", description="d"))
+        with pytest.raises(RuntimeError, match="LearningSkillStoreUnavailable"):
+            fresh.add_skill(SkillPattern.create(name="another", description="d"))
         on_disk = store.skills_path.read_text(encoding="utf-8")
         assert on_disk == raw_before[: len(raw_before) // 2]
         assert original.skill_id in on_disk

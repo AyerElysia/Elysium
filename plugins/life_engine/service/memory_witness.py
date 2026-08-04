@@ -73,15 +73,20 @@ class MemoryWitnessCoordinator:
     def config(self) -> Any:
         return getattr(self._service._cfg(), "memory_witness", None)
 
-    def ensure_instance(self) -> ConsciousnessInstance:
+    async def ensure_instance(self) -> ConsciousnessInstance:
         registry = self._service.consciousness_registry
         existing = registry.get(MEMORY_WITNESS_INSTANCE_ID)
         now = _now_iso()
         if existing is not None and existing.status != "terminated":
             if existing.status == "suspended":
-                registry.resume(MEMORY_WITNESS_INSTANCE_ID, timestamp=now)
-            registry.touch(MEMORY_WITNESS_INSTANCE_ID, timestamp=now)
-            self._service.save_consciousness_registry()
+                await self._service.resume_consciousness_instance(
+                    MEMORY_WITNESS_INSTANCE_ID,
+                    timestamp=now,
+                )
+            await self._service.touch_consciousness_instance(
+                MEMORY_WITNESS_INSTANCE_ID,
+                timestamp=now,
+            )
             return existing
         instance = ConsciousnessInstance(
             instance_id=MEMORY_WITNESS_INSTANCE_ID,
@@ -97,8 +102,7 @@ class MemoryWitnessCoordinator:
                 "reads": "immutable_experience_ledger",
             },
         )
-        registry.register(instance)
-        self._service.save_consciousness_registry()
+        await self._service.register_consciousness_instance(instance)
         return instance
 
     async def loop(self) -> None:
@@ -166,7 +170,7 @@ class MemoryWitnessCoordinator:
 
     async def run_once(self) -> WitnessRunReport:
         async with self._run_lock:
-            instance = self.ensure_instance()
+            instance = await self.ensure_instance()
             memory = self._service.memory_service
             cfg = self.config
             if memory is None or cfg is None:
@@ -176,7 +180,7 @@ class MemoryWitnessCoordinator:
             await self._retry_pending_projections()
             state = await memory.get_witness_state(instance.instance_id)
             limit = max(1, int(getattr(cfg, "max_events_per_run", 80)))
-            store = self._service._get_event_bus().store
+            store = self._service._get_life_event_store()
             get_offset = getattr(store, "get_consumer_offset", None)
             if callable(get_offset):
                 cursor = int(await get_offset(instance.instance_id))
@@ -283,11 +287,10 @@ class MemoryWitnessCoordinator:
                 expected_sequence=int(state.get("last_sequence", 0) or 0),
                 expected_revision=int(state.get("revision", 0) or 0),
             )
-            self._service.consciousness_registry.touch(
+            await self._service.touch_consciousness_instance(
                 instance.instance_id,
                 timestamp=now,
             )
-            self._service.save_consciousness_registry()
             return WitnessRunReport(
                 synced_experiences=synced,
                 considered_events=len(raw_events),
@@ -379,10 +382,7 @@ class MemoryWitnessCoordinator:
         model_set = get_model_set_by_task(task_name)
         if not model_set:
             raise RuntimeError(f"MemoryWitnessModelUnavailable:{task_name}")
-        perception = await asyncio.to_thread(
-            self._service.prepare_perception,
-            instance.instance_id,
-        )
+        perception = await self._service.prepare_perception(instance.instance_id)
         request = LLMRequest(model_set, "life_memory_witness")
         request.add_payload(
             LLMPayload(ROLE.SYSTEM, Text(self._build_system_prompt(instance)))
@@ -404,10 +404,7 @@ class MemoryWitnessCoordinator:
         timeout = max(10.0, float(getattr(cfg, "timeout_seconds", 120.0)))
         response = await asyncio.wait_for(request.send(), timeout=timeout)
         result = await response if not response.message else response.message
-        await asyncio.to_thread(
-            self._service.commit_perception,
-            perception,
-        )
+        await self._service.commit_perception(perception)
         text = str(result or "").strip().replace("**", "").replace("```", "")
         if not text or _NO_WITNESS in text.lower():
             return ""
@@ -473,7 +470,28 @@ class MemoryWitnessCoordinator:
         body = self._render_projection(witness)
         absolute = self._service._workspace_dir() / path
         try:
-            await asyncio.to_thread(_atomic_write_text, absolute, body)
+            if bool(
+                getattr(
+                    self._service,
+                    "selected_subject_storage_enabled",
+                    False,
+                )
+            ):
+                subject_commit = await self._service.write_selected_subject_document(
+                    workspace_relative_path=path,
+                    content_bytes=body.encode("utf-8"),
+                    occurrence_id=witness.witness_id,
+                    recorded_by=witness.consciousness_instance_id,
+                    recorded_source="memory-witness",
+                    encoding="utf-8",
+                    semantic_actor_id=witness.consciousness_instance_id,
+                    semantic_source_id=witness.witness_id,
+                    reason="project immutable first-person witness",
+                )
+                if subject_commit is None:
+                    raise RuntimeError("SelectedWitnessSubjectWriteNotHandled")
+            else:
+                await asyncio.to_thread(_atomic_write_text, absolute, body)
             source_mtime = await asyncio.to_thread(lambda: absolute.stat().st_mtime)
             await memory.upsert_document(
                 path,

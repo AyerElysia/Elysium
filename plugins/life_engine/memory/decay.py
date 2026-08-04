@@ -638,7 +638,7 @@ async def prune_weak_edges(
 
 async def _call_relation_callback(
     callback: Any,
-    db: sqlite3.Connection,
+    db: sqlite3.Connection | None,
     *args: Any,
     **kwargs: Any,
 ) -> Any:
@@ -705,7 +705,7 @@ def _relation_node_is_file(node: Any) -> bool:
 
 
 async def get_file_relations(
-    db: sqlite3.Connection,
+    db: sqlite3.Connection | None,
     file_path: str,
     depth: int = 1,
     min_strength: float = 0.2,

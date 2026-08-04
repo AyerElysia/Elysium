@@ -11,21 +11,53 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import logging
-from datetime import datetime, timezone
+from collections.abc import Awaitable, Callable
+from contextlib import nullcontext
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
-from .auditor import InsightAuditor
-from .models import AuditVerdict
-from .knowledge import SelfKnowledgeCompressor
-from .metrics import LearningMetrics
-from .reflection import ReflectionEngine
-from .skill_distiller import SkillDistiller
-from .skill_store import SkillStore
-from .store import InsightStore
-from ..minecraft.session import MinecraftSession
 from ..minecraft.launcher import MCConfig
+from ..minecraft.session import MinecraftSession
+from ..storage.learning_contracts import LearningStorePort
+from ..storage.subject_contracts import (
+    SubjectAuthorityCommit,
+    SubjectDocumentPath,
+)
+from .auditor import InsightAuditor
+from .decisions import LearningCandidate, LearningDecisionLedger, SubjectAuthorityPort
+from .knowledge import SelfKnowledgeCompressor
+from .maintenance import (
+    LearningMaintenanceEvent,
+    LearningMaintenanceJournalPort,
+    LearningPhase,
+    LocalLearningMaintenanceJournal,
+)
+from .metrics import LearningMetrics
+from .models import AuditVerdict, InsightNextAction
+from .reflection import ReflectionEngine
+from .reflection_queue import (
+    MAX_PENDING_REFLECTIONS,
+    REFLECTION_QUEUE_STATE_KEY,
+    LearningReflectionJob,
+    ReflectionJobKind,
+    load_reflection_jobs,
+    reflection_queue_health,
+)
+from .selectable import (
+    LearningMutationContext,
+    SelectedInsightStore,
+    SelectedLearningMaintenanceJournal,
+    SelectedLearningPersistence,
+    SelectedSkillStore,
+)
+from .skill_distiller import SkillDistiller
+from .skill_store import SkillDecisionKind, SkillStore
+from .store import InsightStore
 
 logger = logging.getLogger("life_engine.learning.scheduler")
 
@@ -79,14 +111,47 @@ class LearningScheduler:
         report_world_observation: Any | None = None,
         # 记忆服务（用于把"修正型洞察"落成显式修正记录，形成记忆演化链）
         memory_service: Any | None = None,
+        maintenance_journal: LearningMaintenanceJournalPort | None = None,
+        learning_store: LearningStorePort | None = None,
+        subject_authority: SubjectAuthorityPort | None = None,
+        project_subject_commit: (
+            Callable[[SubjectDocumentPath, SubjectAuthorityCommit], Awaitable[None]]
+            | None
+        ) = None,
+        current_subject_revision: Callable[[], Awaitable[str]] | None = None,
+        validate_active_consciousness_instance: (
+            Callable[[str], Awaitable[bool]] | None
+        ) = None,
     ) -> None:
         self._workspace = Path(workspace_path).resolve()
         self._model_task_name = model_task_name
         self._memory_service = memory_service
+        self._current_subject_revision = current_subject_revision or (
+            subject_authority.current_subject_revision
+            if subject_authority is not None
+            else None
+        )
+        self._validate_active_consciousness_instance = (
+            validate_active_consciousness_instance
+        )
 
         # 初始化核心组件
-        self.store = InsightStore(self._workspace)
-        self.skill_store = SkillStore(self._workspace)
+        self._selected_persistence: SelectedLearningPersistence | None = None
+        self.decision_ledger: LearningDecisionLedger | None = None
+        if learning_store is None:
+            self.store = InsightStore(self._workspace)
+            self.skill_store = SkillStore(self._workspace)
+        else:
+            persistence = SelectedLearningPersistence(learning_store)
+            self.store = SelectedInsightStore(self._workspace, persistence)
+            self.skill_store = SelectedSkillStore(self._workspace, persistence)
+            persistence.bind(self.store, self.skill_store)
+            self._selected_persistence = persistence
+            self.decision_ledger = LearningDecisionLedger(
+                learning_store,
+                subject_authority=subject_authority,
+                project_subject_commit=project_subject_commit,
+            )
         self.reflection = ReflectionEngine(
             store=self.store,
             workspace_path=self._workspace,
@@ -115,25 +180,44 @@ class LearningScheduler:
             model_task_name=model_task_name,
             trigger_count=skill_distill_trigger_count,
             interval_hours=skill_distill_interval_hours,
+            current_subject_revision=self._current_subject_revision,
         )
         self.metrics = LearningMetrics(store=self.store)
+        if maintenance_journal is not None:
+            self.maintenance_journal = maintenance_journal
+        elif learning_store is not None:
+            self.maintenance_journal = SelectedLearningMaintenanceJournal(
+                learning_store
+            )
+        else:
+            self.maintenance_journal = LocalLearningMaintenanceJournal(self._workspace)
 
         # 回填 knowledge_versions：v1 写在 record_knowledge_version 之前，
         # 那两条洞察不知道自己已经在知识文档里。她要是现在重新审视其中一条，
         # 修正会找不到对应表述。只搬 manifest 里的既有事实，不做判断。
         # 包起来：补账失败也不能让她起不来。
-        try:
-            self.store.reconcile_knowledge_versions()
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"回填 knowledge_versions 失败（不影响启动）: {e}")
+        if self._selected_persistence is None:
+            try:
+                self.store.reconcile_knowledge_versions()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "回填 knowledge_versions 失败（不影响启动）: %s",
+                    type(exc).__name__,
+                )
 
         # Minecraft 具身体验
         self.minecraft_session: MinecraftSession | None = None
         if minecraft_enabled:
             # 过滤掉非 MCConfig 字段（如 vla_model）
-            _mc_fields = {f.name for f in MCConfig.__dataclass_fields__.values()} if hasattr(MCConfig, "__dataclass_fields__") else set()
+            _mc_fields = (
+                {f.name for f in MCConfig.__dataclass_fields__.values()}
+                if hasattr(MCConfig, "__dataclass_fields__")
+                else set()
+            )
             _mc_raw = minecraft_config or {}
-            _mc_kwargs = {k: v for k, v in _mc_raw.items() if not _mc_fields or k in _mc_fields}
+            _mc_kwargs = {
+                k: v for k, v in _mc_raw.items() if not _mc_fields or k in _mc_fields
+            }
             mc_cfg = MCConfig(**_mc_kwargs)
 
             self.minecraft_session = MinecraftSession(
@@ -158,6 +242,112 @@ class LearningScheduler:
         self._last_metrics_at: str = ""
         self._last_staleness_check_at: str = ""
         self._epistemic_backfilled = False
+        self._maintenance_lock = asyncio.Lock()
+        self._reflection_queue_lock = asyncio.Lock()
+
+    async def initialize(self) -> None:
+        """Restore bounded maintenance health without blocking the event loop."""
+
+        if self._selected_persistence is not None:
+            await self._selected_persistence.initialize()
+            self.store.reconcile_knowledge_versions()
+            await self._selected_persistence.flush()
+        await self.maintenance_journal.initialize()
+
+    async def flush(self) -> None:
+        """Durably flush selected learning mutations at an async boundary."""
+
+        if self._selected_persistence is not None:
+            await self._selected_persistence.flush()
+
+    async def close(self) -> None:
+        """Flush learning consumers without closing the injected runtime."""
+
+        if self._selected_persistence is not None:
+            await self._selected_persistence.close()
+
+    async def decide_skill_candidate(
+        self,
+        *,
+        candidate_id: str,
+        candidate_revision: int,
+        candidate_sha256: str,
+        decision_occurrence_id: str,
+        decision_kind: SkillDecisionKind,
+        actor_consciousness_instance_id: str,
+        expected_subject_revision: str,
+        reason: str,
+        accepted_name: str = "",
+        accepted_description: str = "",
+        accepted_instructions: str = "",
+        occurred_at: str = "",
+    ) -> dict[str, Any]:
+        """Commit one active-instance decision over an exact skill candidate."""
+
+        actor = str(actor_consciousness_instance_id or "").strip()
+        if self._validate_active_consciousness_instance is None:
+            raise RuntimeError("LearningPresenceGateUnavailable")
+        if not await self._validate_active_consciousness_instance(actor):
+            raise PermissionError("LearningDecisionActorIsNotActive")
+        if self._current_subject_revision is None:
+            raise RuntimeError("LearningSubjectRevisionUnavailable")
+        current_revision = str(await self._current_subject_revision()).strip().lower()
+        expected_revision = str(expected_subject_revision).strip().lower()
+        if current_revision != expected_revision:
+            raise RuntimeError("LearningDecisionSubjectRevisionConflict")
+
+        context = (
+            self._selected_persistence.mutation_context(
+                LearningMutationContext(
+                    source="learning.subject_decision",
+                    actor_consciousness_instance_id=actor,
+                    subject_revision=current_revision,
+                    provenance={
+                        "candidate_id": candidate_id,
+                        "decision_occurrence_id": decision_occurrence_id,
+                    },
+                )
+            )
+            if self._selected_persistence is not None
+            else nullcontext()
+        )
+        with context:
+            insight_ids = self.skill_store.record_candidate_decision(
+                candidate_id=candidate_id,
+                candidate_revision=candidate_revision,
+                candidate_sha256=candidate_sha256,
+                decision_occurrence_id=decision_occurrence_id,
+                decision_kind=decision_kind,
+                actor_consciousness_instance_id=actor,
+                expected_subject_revision=expected_revision,
+                reason=reason,
+                accepted_name=accepted_name,
+                accepted_description=accepted_description,
+                accepted_instructions=accepted_instructions,
+                occurred_at=occurred_at,
+            )
+            if decision_kind == "accepted":
+                for insight_id in insight_ids:
+                    insight = self.store.get_insight(insight_id)
+                    if insight is None:
+                        raise RuntimeError(
+                            f"SkillCandidateInsightMissing: {insight_id}"
+                        )
+                    insight.next_action = InsightNextAction.ARCHIVE.value
+                    self.store.update_insight(insight)
+            await self.flush()
+        candidate = self.skill_store.get_candidate(candidate_id)
+        if candidate is None:
+            raise RuntimeError("SkillCandidateProjectionMissing")
+        return {
+            "candidate_id": candidate.candidate_id,
+            "candidate_revision": candidate.candidate_revision,
+            "candidate_sha256": candidate.candidate_sha256,
+            "status": candidate.status,
+            "decision_occurrence_id": decision_occurrence_id,
+            "actor_consciousness_instance_id": actor,
+            "subject_revision": current_revision,
+        }
 
     # ── 记忆服务晚绑定 ───────────────────────────────────────
 
@@ -174,6 +364,106 @@ class LearningScheduler:
         self.reflection.attach_memory_service(memory_service)
         logger.debug("LearningScheduler 已绑定 memory_service")
 
+    def _reflection_jobs(self) -> list[LearningReflectionJob]:
+        return load_reflection_jobs(self.store.load_state())
+
+    def _save_reflection_jobs(self, jobs: list[LearningReflectionJob]) -> None:
+        state = self.store.load_state()
+        state[REFLECTION_QUEUE_STATE_KEY] = [job.to_dict() for job in jobs]
+        self.store.save_state(state)
+
+    async def submit_reflection(
+        self,
+        *,
+        reflection_kind: ReflectionJobKind,
+        reflection_text: str,
+        context: str = "",
+        source_event_ids: list[str] | None = None,
+        actor_consciousness_instance_id: str = "",
+    ) -> list[Any] | None:
+        """Persist a reflection request before attempting its LLM work.
+
+        ``None`` means the request remains queued because the engine is cooling
+        down. An empty list means the request ran successfully and produced no
+        new insight. Failures raise only after the retry envelope is durable.
+        """
+
+        job = LearningReflectionJob.create(
+            reflection_kind=reflection_kind,
+            reflection_text=reflection_text,
+            context=context,
+            source_event_ids=source_event_ids,
+            actor_consciousness_instance_id=actor_consciousness_instance_id,
+        )
+        async with self._reflection_queue_lock:
+            jobs = self._reflection_jobs()
+            if len(jobs) >= MAX_PENDING_REFLECTIONS:
+                raise RuntimeError("LearningReflectionQueueFull")
+            jobs.append(job)
+            self._save_reflection_jobs(jobs)
+            await self.flush()
+        result = await self._run_pending_reflection(preferred_job_id=job.job_id)
+        if result is None:
+            return None
+        _, insights = result
+        return insights
+
+    def _reflection_work_due(self) -> bool:
+        return self.reflection.can_reflect and any(
+            job.due() for job in self._reflection_jobs()
+        )
+
+    def _reflection_pending_count(self) -> int:
+        return len(self._reflection_jobs())
+
+    async def _run_pending_reflection_phase(self) -> None:
+        await self._run_pending_reflection()
+
+    async def _run_pending_reflection(
+        self,
+        *,
+        preferred_job_id: str = "",
+    ) -> tuple[str, list[Any]] | None:
+        async with self._reflection_queue_lock:
+            jobs = self._reflection_jobs()
+            if not jobs or not self.reflection.can_reflect:
+                return None
+            due = [job for job in jobs if job.due()]
+            if not due:
+                return None
+            job = next(
+                (item for item in due if item.job_id == preferred_job_id),
+                due[0],
+            )
+            try:
+                if job.reflection_kind == "interaction":
+                    insights = await self.reflection.reflect_on_interaction(
+                        interaction_text=job.reflection_text,
+                        context=job.context,
+                        source_event_ids=list(job.source_event_ids),
+                        actor_consciousness_instance_id=(
+                            job.actor_consciousness_instance_id
+                        ),
+                    )
+                else:
+                    insights = await self.reflection.reflect_on_internal(
+                        internal_text=job.reflection_text,
+                        context=job.context,
+                        source_event_ids=list(job.source_event_ids),
+                        actor_consciousness_instance_id=(
+                            job.actor_consciousness_instance_id
+                        ),
+                    )
+            except Exception as exc:
+                jobs[jobs.index(job)] = job.failed(exc)
+                self._save_reflection_jobs(jobs)
+                await self.flush()
+                raise
+            jobs.remove(job)
+            self._save_reflection_jobs(jobs)
+            await self.flush()
+            return job.job_id, insights
+
     # ── 事件驱动入口 ─────────────────────────────────────────
 
     async def on_interaction_end(
@@ -182,20 +472,22 @@ class LearningScheduler:
         interaction_text: str,
         context: str = "",
         source_event_ids: list[str] | None = None,
+        actor_consciousness_instance_id: str = "",
     ) -> None:
         """交互结束事件：触发快环反思。"""
         try:
-            insights = await self.reflection.reflect_on_interaction(
-                interaction_text=interaction_text,
+            insights = await self.submit_reflection(
+                reflection_kind="interaction",
+                reflection_text=interaction_text,
                 context=context,
                 source_event_ids=source_event_ids,
+                actor_consciousness_instance_id=actor_consciousness_instance_id,
             )
             if insights:
                 logger.info(f"交互反思产生 {len(insights)} 条洞察")
-                # 反思后检查是否需要触发审计
-                await self._maybe_run_audit()
+            await self.on_heartbeat()
         except Exception as exc:
-            logger.warning(f"交互反思异常: {exc}")
+            logger.warning("交互反思异常: %s", type(exc).__name__)
 
     async def on_thought_closed(
         self,
@@ -203,18 +495,22 @@ class LearningScheduler:
         thought_summary: str,
         context: str = "",
         source_event_ids: list[str] | None = None,
+        actor_consciousness_instance_id: str = "",
     ) -> None:
         """思考流闭合事件：触发内省反思。"""
         try:
-            insights = await self.reflection.reflect_on_internal(
-                internal_text=thought_summary,
+            insights = await self.submit_reflection(
+                reflection_kind="introspection",
+                reflection_text=thought_summary,
                 context=context,
                 source_event_ids=source_event_ids,
+                actor_consciousness_instance_id=actor_consciousness_instance_id,
             )
             if insights:
                 logger.info(f"思考闭合反思产生 {len(insights)} 条洞察")
+            await self.on_heartbeat()
         except Exception as exc:
-            logger.warning(f"思考闭合反思异常: {exc}")
+            logger.warning("思考闭合反思异常: %s", type(exc).__name__)
 
     # ── 心跳驱动入口 ─────────────────────────────────────────
 
@@ -223,18 +519,188 @@ class LearningScheduler:
 
         由 life_engine 心跳周期调用（低频，不必每次心跳都调用）。
         """
+        async with self._maintenance_lock:
+            run_id = f"learning_heartbeat_{uuid4().hex}"
+            phases: tuple[
+                tuple[
+                    LearningPhase,
+                    Callable[[], bool],
+                    Callable[[], Awaitable[None]],
+                    Callable[[], int | None],
+                ],
+                ...,
+            ] = (
+                (
+                    LearningPhase.REFLECTION,
+                    self._reflection_work_due,
+                    self._run_pending_reflection_phase,
+                    self._reflection_pending_count,
+                ),
+                (
+                    LearningPhase.EPISTEMIC_BACKFILL,
+                    lambda: not self._epistemic_backfilled,
+                    self._run_epistemic_backfill,
+                    lambda: len(self.store.list_validated()),
+                ),
+                (
+                    LearningPhase.AUDIT,
+                    self._should_audit,
+                    self._maybe_run_audit,
+                    lambda: len(self.store.list_candidates_for_review()),
+                ),
+                (
+                    LearningPhase.COMPRESSION,
+                    self._compression_work_due,
+                    self._maybe_run_compression,
+                    lambda: len(self.store.list_for_compression()),
+                ),
+                (
+                    LearningPhase.DISTILLATION,
+                    self.distiller.should_distill,
+                    self._maybe_run_distillation,
+                    self.distiller.pending_count,
+                ),
+                (
+                    LearningPhase.METRICS,
+                    self._should_snapshot_metrics,
+                    self._maybe_snapshot_metrics,
+                    lambda: None,
+                ),
+                (
+                    LearningPhase.STALENESS,
+                    self._should_check_staleness,
+                    self._maybe_check_staleness,
+                    lambda: len(
+                        self.store.get_stale_insights(
+                            staleness_threshold_days=(self._staleness_threshold_days)
+                        )
+                    ),
+                ),
+            )
+            for phase, is_due, operation, pending_count in phases:
+                await self._run_maintenance_phase(
+                    run_id=run_id,
+                    phase=phase,
+                    is_due=is_due,
+                    operation=operation,
+                    pending_count=pending_count,
+                )
+            await self.flush()
+
+    async def _run_epistemic_backfill(self) -> None:
+        await self._backfill_epistemic_claims()
+        self._epistemic_backfilled = True
+
+    async def _run_maintenance_phase(
+        self,
+        *,
+        run_id: str,
+        phase: LearningPhase,
+        is_due: Callable[[], bool],
+        operation: Callable[[], Awaitable[None]],
+        pending_count: Callable[[], int | None],
+    ) -> None:
+        """Run one due phase without allowing it to starve later phases."""
+
         try:
-            # 首次心跳时回填历史验证洞察到认识论层
-            if not self._epistemic_backfilled:
-                await self._backfill_epistemic_claims()
-                self._epistemic_backfilled = True
-            await self._maybe_run_audit()
-            await self._maybe_run_compression()
-            await self._maybe_run_distillation()
-            await self._maybe_snapshot_metrics()
-            await self._maybe_check_staleness()
-        except Exception as exc:
-            logger.warning(f"学习调度心跳异常: {exc}")
+            due = bool(is_due())
+        except Exception as exc:  # noqa: BLE001 - phase evidence boundary
+            await self._record_phase_failure(
+                run_id=run_id,
+                phase=phase,
+                started_at=datetime.now(UTC),
+                pending_count=None,
+                error=exc,
+            )
+            return
+        if not due:
+            return
+
+        try:
+            count = pending_count()
+        except Exception:  # noqa: BLE001 - diagnostics must not block work
+            count = None
+        started_at = datetime.now(UTC)
+        started = LearningMaintenanceEvent.started(
+            run_id=run_id,
+            phase=phase,
+            started_at=started_at,
+            pending_count=count,
+        )
+        try:
+            await self.maintenance_journal.append(started)
+        except Exception as exc:  # noqa: BLE001 - fail this phase closed
+            logger.warning(
+                "学习维护阶段无法记录开始证据，已拒绝执行 %s: %s",
+                phase.value,
+                type(exc).__name__,
+            )
+            return
+
+        try:
+            await operation()
+            await self.flush()
+        except Exception as exc:  # noqa: BLE001 - isolate each phase
+            try:
+                await self.flush()
+            except Exception as flush_error:  # noqa: BLE001 - preserve both
+                exc.add_note(
+                    "partial learning mutations also failed to flush: "
+                    f"{type(flush_error).__name__}"
+                )
+            await self._record_phase_failure(
+                run_id=run_id,
+                phase=phase,
+                started_at=started_at,
+                pending_count=count,
+                error=exc,
+            )
+            logger.warning(
+                "学习维护阶段失败但不会阻断后续阶段 %s: %s",
+                phase.value,
+                type(exc).__name__,
+            )
+            return
+
+        succeeded = LearningMaintenanceEvent.succeeded(
+            run_id=run_id,
+            phase=phase,
+            started_at=started_at,
+            pending_count=count,
+        )
+        try:
+            await self.maintenance_journal.append(succeeded)
+        except Exception as exc:  # noqa: BLE001 - started event remains auditable
+            logger.warning(
+                "学习维护阶段完成但结果证据写入失败 %s: %s",
+                phase.value,
+                type(exc).__name__,
+            )
+
+    async def _record_phase_failure(
+        self,
+        *,
+        run_id: str,
+        phase: LearningPhase,
+        started_at: datetime,
+        pending_count: int | None,
+        error: Exception,
+    ) -> None:
+        failed = LearningMaintenanceEvent.failed(
+            run_id=run_id,
+            phase=phase,
+            started_at=started_at,
+            pending_count=pending_count,
+            error=error,
+        )
+        try:
+            await self.maintenance_journal.append(failed)
+        except Exception as journal_error:  # noqa: BLE001 - preserve original
+            logger.warning(
+                "学习维护失败证据写入失败 %s: %s",
+                phase.value,
+                type(journal_error).__name__,
+            )
 
     async def _maybe_run_audit(self) -> None:
         """检查是否到了审计时间。"""
@@ -247,43 +713,92 @@ class LearningScheduler:
             state = self.store.load_state()
             state["last_audit_at"] = self._last_audit_at
             self.store.save_state(state)
-            # 审计刚改过状态，趁现在留一个点，别等下一个 12 小时窗口
-            self._snapshot_metrics_now()
-            # 审计后检查是否需要压缩
-            await self._maybe_run_compression()
             # 将新验证的洞察投影到认识论层
             await self._project_validated_to_epistemic(records)
 
     async def _maybe_run_compression(self) -> None:
         """检查是否需要压缩。"""
-        if not self.compressor.should_compress():
-            return
-        logger.info("📝 触发慢环压缩")
-        promoted = await self.compressor.run_compression()
-        if promoted:
-            version_artifact = getattr(
-                self._memory_service,
-                "version_memory_artifact",
-                None,
-            )
-            if callable(version_artifact):
-                content = self.store.read_current_knowledge()
-                if content:
-                    await version_artifact(
-                        logical_key="learning:self_knowledge",
-                        artifact_kind="self_knowledge_document",
-                        content=content,
-                        authored_by="life_learning_compressor",
-                        consciousness_instance_id="life_engine",
-                        predicate="learning_compression_selected",
-                        reason="整合过程选择了新的自我认知文档版本",
-                        metadata={
-                            "source": "learning_compression",
-                            "selection_gate": "independent_model_assessment",
-                        },
-                    )
-            # 新版本刚落盘，指标曲线上应该有这个点
+        proposed = False
+        if self.compressor.should_compress():
+            logger.info("📝 触发慢环压缩")
+            proposed = await self.compressor.run_compression()
+        if proposed:
+            # Proposal evidence is durable, but no background service is allowed
+            # to promote it into subject or self-authoritative content.
+            await self.flush()
             self._snapshot_metrics_now()
+        await self._bridge_pending_knowledge_candidate()
+
+    def _compression_work_due(self) -> bool:
+        if self.compressor.should_compress():
+            return True
+        if self.decision_ledger is None:
+            return False
+        state = self.store.load_state()
+        return int(state.get("last_knowledge_candidate_version", 0) or 0) > int(
+            state.get("last_knowledge_candidate_ledgered_version", 0) or 0
+        )
+
+    async def _bridge_pending_knowledge_candidate(self) -> None:
+        """Persist a deterministic subject proposal without accepting it."""
+
+        if self.decision_ledger is None:
+            return
+        state = self.store.load_state()
+        version = int(state.get("last_knowledge_candidate_version", 0) or 0)
+        ledgered = int(
+            state.get("last_knowledge_candidate_ledgered_version", 0) or 0
+        )
+        if version <= 0 or version <= ledgered:
+            return
+        if self._current_subject_revision is None:
+            raise RuntimeError("LearningSubjectAuthorityRevisionUnavailable")
+        content = self.store.read_knowledge_version(version)
+        content_bytes = content.encode("utf-8")
+        content_sha256 = hashlib.sha256(content_bytes).hexdigest()
+        manifest = self.store.load_knowledge_manifest()
+        versions = manifest.get("versions", [])
+        version_record = next(
+            (
+                item
+                for item in versions
+                if isinstance(item, dict)
+                and int(item.get("version", 0) or 0) == version
+            ),
+            None,
+        )
+        if version_record is None:
+            raise RuntimeError("LearningKnowledgeCandidateManifestMissing")
+        occurred_at = str(version_record.get("timestamp", ""))
+        if not occurred_at:
+            raise RuntimeError("LearningKnowledgeCandidateTimestampMissing")
+        subject_revision = await self._current_subject_revision()
+        candidate_id = f"learning_knowledge_v{version}_{content_sha256[:16]}"
+        candidate = LearningCandidate.create(
+            candidate_id=candidate_id,
+            candidate_revision=1,
+            candidate_occurrence_id=f"learning_candidate:{candidate_id}:1",
+            candidate_kind="derived_observation_document",
+            candidate_content_bytes=content_bytes,
+            source_occurrence_id=(f"knowledge_version:{version}:{content_sha256}"),
+            source="learning.knowledge_compression",
+            subject_revision=subject_revision,
+            target_path="MEMORY.md",
+            occurred_at=occurred_at,
+            provenance={
+                "knowledge_version": version,
+                "independent_gate_recommended": bool(
+                    state.get("last_knowledge_candidate_recommended", False)
+                ),
+                "authority": "candidate_only",
+            },
+        )
+        await self.decision_ledger.append_candidate(candidate)
+        state = self.store.load_state()
+        state["last_knowledge_candidate_ledgered_version"] = version
+        state["last_knowledge_candidate_id"] = candidate_id
+        self.store.save_state(state)
+        await self.flush()
 
     async def _backfill_epistemic_claims(self) -> None:
         """一次性回填：将所有历史 validated 洞察投影到认识论层。
@@ -301,22 +816,18 @@ class LearningScheduler:
             try:
                 projected += int(await self._project_insight_to_epistemic(insight))
             except Exception as exc:
-                logger.debug(f"回填洞察投影失败: {exc}")
+                logger.debug("回填洞察投影失败: %s", type(exc).__name__)
 
         if projected:
             logger.info(f"🧠 认识论回填: {projected} 条历史验证洞察 → claims")
 
     async def _project_validated_to_epistemic(self, records: list) -> None:
-        """将审计通过的洞察投影到记忆系统认识论层。
-
-        学习系统验证一条洞察（≥ 3 证据 + 多日期）意味着它已经不再是猜测，
-        而是一项经过经验确认的自我认知。将它写入认识论层为 claim，
-        让记忆检索时能触及这些稳定认知。
-        """
+        """Project audit output as a retrievable observation, never as truth."""
         if self._memory_service is None:
             return
         validated = [
-            r for r in records
+            r
+            for r in records
             if getattr(r, "verdict", "") == AuditVerdict.VALIDATED.value
         ]
         if not validated:
@@ -335,7 +846,10 @@ class LearningScheduler:
                     )
                 )
             except Exception as exc:
-                logger.debug(f"洞察投影到认识论层失败: {exc}")
+                logger.debug(
+                    "洞察投影到认识论层失败: %s",
+                    type(exc).__name__,
+                )
 
         if projected:
             logger.info(f"🧠 认识论投影: {projected} 条验证洞察 → claims")
@@ -355,16 +869,18 @@ class LearningScheduler:
             existing = await self._memory_service.get_memory_claim_state(claim_id)
         except Exception as exc:
             logger.debug(
-                f"查询洞察投影状态失败，交由追加账本执行幂等判定 {claim_id}: {exc}"
+                "查询洞察投影状态失败，交由追加账本执行幂等判定 %s: %s",
+                claim_id,
+                type(exc).__name__,
             )
             existing = None
         created = existing is None
         if created:
             claim = new_claim(
                 claim_id=claim_id,
-                subject_key=f"insight:{insight.category or '自我认知'}",
+                subject_key=f"learning_insight:{insight.insight_id}",
                 content=insight.claim,
-                claim_kind="learning_insight",
+                claim_kind="learning_candidate_observation",
                 source="learning_system",
                 authority="learning_audit_observation",
                 metadata={
@@ -442,9 +958,18 @@ class LearningScheduler:
         （她通过工具看到的统计一直是实时读账本的，不受此影响。）
         """
         try:
-            self.metrics.snapshot()
+            if self._selected_persistence is None:
+                self.metrics.snapshot()
+            else:
+                point = self.metrics.build_snapshot()
+                self._selected_persistence.queue_audit(
+                    "learning_metrics",
+                    {"action": "snapshot", **point.to_dict()},
+                )
         except Exception as exc:
-            logger.warning(f"指标快照失败: {exc}")
+            if self._selected_persistence is not None:
+                raise
+            logger.warning("指标快照失败: %s", type(exc).__name__)
             return
         self._last_metrics_at = _now_iso()
         state = self.store.load_state()
@@ -492,7 +1017,7 @@ class LearningScheduler:
             return True
         try:
             last_dt = datetime.fromisoformat(last_audit)
-            now = datetime.now(timezone.utc).astimezone()
+            now = datetime.now(UTC).astimezone()
             hours_elapsed = (now - last_dt).total_seconds() / 3600.0
             return hours_elapsed >= self._audit_interval_hours
         except (ValueError, TypeError):
@@ -506,7 +1031,7 @@ class LearningScheduler:
             return True
         try:
             last_dt = datetime.fromisoformat(last_metrics)
-            now = datetime.now(timezone.utc).astimezone()
+            now = datetime.now(UTC).astimezone()
             hours_elapsed = (now - last_dt).total_seconds() / 3600.0
             return hours_elapsed >= self._metrics_interval_hours
         except (ValueError, TypeError):
@@ -520,7 +1045,7 @@ class LearningScheduler:
             return True
         try:
             last_dt = datetime.fromisoformat(last_check)
-            now = datetime.now(timezone.utc).astimezone()
+            now = datetime.now(UTC).astimezone()
             hours_elapsed = (now - last_dt).total_seconds() / 3600.0
             return hours_elapsed >= self._staleness_check_interval_hours
         except (ValueError, TypeError):
@@ -533,6 +1058,7 @@ class LearningScheduler:
         stats = self.store.get_stats()
         state = self.store.load_state()
         manifest = self.store.load_knowledge_manifest()
+        skill_candidates = self.skill_store.list_candidates()
         return {
             "insights": stats,
             "knowledge_version": manifest.get("current_version", 0),
@@ -540,6 +1066,30 @@ class LearningScheduler:
             "last_compress_at": state.get("last_compress_at", ""),
             "last_metrics_at": state.get("last_metrics_at", ""),
             "reflection_available": self.reflection.can_reflect,
+            "reflection_queue": reflection_queue_health(
+                load_reflection_jobs(state)
+            ),
+            "skill_candidates": {
+                "open": sum(item.status == "open" for item in skill_candidates),
+                "accepted": sum(item.status == "accepted" for item in skill_candidates),
+                "rejected": sum(item.status == "rejected" for item in skill_candidates),
+                "gate_recommended": sum(
+                    item.gate_recommended for item in skill_candidates
+                ),
+            },
+            "maintenance": self.maintenance_journal.health_snapshot(),
+            "selected_persistence": (
+                self._selected_persistence.health_snapshot()
+                if self._selected_persistence is not None
+                else {"status": "disabled", "backend": "legacy_local"}
+            ),
+            "prompt_projections": {
+                "knowledge": self.compressor.projection_health(),
+                "skills": self.skill_store.catalog_projection_health(),
+                "reflection": self.reflection.projection_health(),
+                "audit": self.auditor.projection_health(),
+                "distillation": self.distiller.projection_health(),
+            },
         }
 
     def get_knowledge_for_prompt(self, max_chars: int = 0) -> str:
@@ -556,4 +1106,4 @@ class LearningScheduler:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).astimezone().isoformat()
+    return datetime.now(UTC).astimezone().isoformat()

@@ -31,11 +31,16 @@ def _validated_insight(store: InsightStore, *, topic: str = "same-topic") -> Ins
 def _distiller(tmp_path):
     store = InsightStore(tmp_path)
     skill_store = SkillStore(tmp_path)
+
+    async def current_subject_revision() -> str:
+        return "a" * 64
+
     return (
         SkillDistiller(
             store=store,
             skill_store=skill_store,
             workspace_path=tmp_path,
+            current_subject_revision=current_subject_revision,
         ),
         store,
         skill_store,
@@ -43,7 +48,9 @@ def _distiller(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_existing_skill_is_selected_only_by_explicit_id(tmp_path) -> None:
+async def test_existing_skill_proposal_is_selected_only_by_explicit_id(
+    tmp_path,
+) -> None:
     distiller, store, skill_store = _distiller(tmp_path)
     insight = _validated_insight(store)
     first = SkillPattern.create(
@@ -75,10 +82,15 @@ async def test_existing_skill_is_selected_only_by_explicit_id(tmp_path) -> None:
 
     assert await distiller.run_distillation() is True
     assert skill_store.get_skill(first.skill_id).description == first.description
-    revised = skill_store.get_skill(second.skill_id)
-    assert revised.description == "A revised description."
-    assert insight.insight_id in revised.origin_insight_ids
-    assert store.get_insight(insight.insight_id).next_action == InsightNextAction.ARCHIVE.value
+    assert skill_store.get_skill(second.skill_id).description == second.description
+    candidates = skill_store.list_candidates(status="open")
+    assert len(candidates) == 1
+    assert candidates[0].target_skill_id == second.skill_id
+    assert candidates[0].description == "A revised description."
+    assert candidates[0].insight_ids == [insight.insight_id]
+    assert store.get_insight(insight.insight_id).next_action == (
+        InsightNextAction.PROMOTE.value
+    )
 
 
 @pytest.mark.asyncio
@@ -102,7 +114,7 @@ async def test_unknown_explicit_target_is_not_reinterpreted_as_new_skill(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_new_skill_requires_introspective_acceptance(tmp_path) -> None:
+async def test_introspective_gate_is_only_a_recorded_recommendation(tmp_path) -> None:
     distiller, store, skill_store = _distiller(tmp_path)
     insight = _validated_insight(store)
     gate_calls = 0
@@ -123,10 +135,15 @@ async def test_new_skill_requires_introspective_acceptance(tmp_path) -> None:
     distiller._distill = propose  # type: ignore[method-assign]
     distiller._introspective_gate = reject  # type: ignore[method-assign]
 
-    assert await distiller.run_distillation() is False
+    assert await distiller.run_distillation() is True
     assert gate_calls == 1
     assert skill_store.list_skills() == []
-    assert store.get_insight(insight.insight_id).next_action == InsightNextAction.PROMOTE.value
+    candidates = skill_store.list_candidates(status="open")
+    assert len(candidates) == 1
+    assert candidates[0].gate_recommended is False
+    assert store.get_insight(insight.insight_id).next_action == (
+        InsightNextAction.PROMOTE.value
+    )
 
 
 @pytest.mark.asyncio

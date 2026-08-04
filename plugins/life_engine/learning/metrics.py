@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
+
 from .models import InsightStatus, LearningMetricsPoint
 from .store import InsightStore
 
@@ -24,6 +25,13 @@ class LearningMetrics:
 
     def snapshot(self) -> LearningMetricsPoint:
         """生成当前学习状态快照并追加到 metrics.jsonl。"""
+        point = self.build_snapshot()
+        self._append(point)
+        return point
+
+    def build_snapshot(self) -> LearningMetricsPoint:
+        """Build one content-free point without choosing a persistence backend."""
+
         stats = self._store.get_stats()
         by_status = stats.get("by_status", {})
         total = stats.get("total", 0)
@@ -40,7 +48,7 @@ class LearningMetrics:
         manifest = self._store.load_knowledge_manifest()
         knowledge_version = int(manifest.get("current_version", 0))
 
-        point = LearningMetricsPoint(
+        return LearningMetricsPoint(
             timestamp=_now_iso(),
             total_insights=total,
             validated_count=validated,
@@ -51,9 +59,6 @@ class LearningMetrics:
             knowledge_version=knowledge_version,
             topic_coverage=stats.get("topics", {}),
         )
-
-        self._append(point)
-        return point
 
     def recent_points(self, limit: int = 20) -> list[LearningMetricsPoint]:
         """获取最近的学习数据点。"""
@@ -85,10 +90,11 @@ class LearningMetrics:
         kv = int(manifest.get("current_version", 0))
 
         lines = [
+            "以下仅为学习账本状态，不是主体真值或价值评分：",
             f"洞察总数: {total}",
-            f"已验证: {validated} | 已否定: {rejected} | 待审: {candidate}",
-            f"验证率: {stats.get('validation_rate', 0):.0%}",
-            f"自我认知版本: v{kv}",
+            f"审计支持: {validated} | 审计不支持: {rejected} | 待审: {candidate}",
+            f"审计支持占比: {stats.get('validation_rate', 0):.0%}",
+            f"派生观察版本: v{kv}",
         ]
 
         topics = stats.get("topics", {})
@@ -117,13 +123,13 @@ class LearningMetrics:
         if candidate > 0:
             parts.append(f"{candidate}条洞察待审")
         if validated > 0:
-            parts.append(f"{validated}条已验证")
+            parts.append(f"{validated}条获审计支持")
         if kv > 0:
-            parts.append(f"自我认知v{kv}")
+            parts.append(f"派生观察v{kv}")
 
         if not parts:
             return ""
-        return "### 学习进展\n" + "、".join(parts)
+        return "### 学习账本状态（非主体真值）\n" + "、".join(parts)
 
     def _append(self, point: LearningMetricsPoint) -> None:
         """追加数据点到 metrics.jsonl。"""

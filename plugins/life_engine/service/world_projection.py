@@ -487,11 +487,6 @@ class WorldProjectionStore:
                     if event.sequence <= current:
                         self._apply_event(db, event)
                         continue
-                    if event.sequence != current + 1:
-                        raise WorldProjectionConflict(
-                            "world projector ledger gap: "
-                            f"expected {current + 1}, actual {event.sequence}"
-                        )
                     self._apply_event(db, event)
                     current = event.sequence
                 self._set_meta(db, "as_of_ingest_position", str(current))

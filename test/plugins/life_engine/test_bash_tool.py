@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from plugins.life_engine.core.config import LifeEngineConfig
+from plugins.life_engine.tools import exec_tools
 from plugins.life_engine.tools.exec_tools import LifeEngineBashTool, _audit_command
 
 
@@ -51,3 +52,21 @@ def test_bash_tool_blocks_file_writing_redirect(tmp_path: Path) -> None:
     assert isinstance(payload, dict)
     assert "禁止输出重定向" in payload["error"]
     assert not (tmp_path / "out.txt").exists()
+
+
+def test_bash_tool_fails_closed_for_selected_subject_storage(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    tool = _make_tool(tmp_path)
+    monkeypatch.setattr(
+        exec_tools,
+        "_selected_subject_storage_enabled",
+        lambda: True,
+    )
+
+    ok, payload = asyncio.run(tool.execute("printf harmless"))
+
+    assert ok is False
+    assert isinstance(payload, dict)
+    assert "SelectedSubjectStorageShellDisabled" in payload["error"]

@@ -344,8 +344,8 @@ async def test_service_end_to_end_syncs_instances_and_preserves_full_content(
         stream_id="voice-stream",
     )
 
-    chat_view = service.prepare_perception("chat_global")
-    voice_view = service.prepare_perception(voice.instance_id)
+    chat_view = await service.prepare_perception("chat_global")
+    voice_view = await service.prepare_perception(voice.instance_id)
 
     assert voice.instance_id in chat_view.content
     assert "chat_global" in voice_view.content
@@ -354,10 +354,10 @@ async def test_service_end_to_end_syncs_instances_and_preserves_full_content(
     assert assertion.value == full_report
     assert assertion.source_instance_id == voice.instance_id
     assert assertion.assertion_id == receipt["assertion_id"]
-    service.commit_perception(voice_view)
+    await service.commit_perception(voice_view)
 
     restarted = _service(tmp_path)
-    restarted_view = restarted.prepare_perception(voice.instance_id)
+    restarted_view = await restarted.prepare_perception(voice.instance_id)
     assert restarted_view.from_position == voice_view.through_position
     assert full_report in restarted_view.content
 

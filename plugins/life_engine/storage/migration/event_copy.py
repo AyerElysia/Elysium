@@ -58,7 +58,7 @@ def _open_source(path: Path) -> sqlite3.Connection:
     if not resolved.is_file():
         raise LifeEventCopyError(f"Life Event source does not exist: {resolved}")
     connection = sqlite3.connect(
-        f"file:{resolved.as_posix()}?mode=ro&immutable=1",
+        f"file:{resolved.as_posix()}?mode=ro",
         uri=True,
         timeout=30.0,
     )
