@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shutil
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -35,9 +37,16 @@ def verify_local_snapshot(snapshot_root: str | Path) -> dict[str, Any]:
         path = _safe_snapshot_path(snapshot_root, str(item["backup_relative"]))
         try:
             actual_sha = sha256_file(path)
-            inspection = inspect_sqlite_database(path)
             if actual_sha != item["backup_sha256"]:
                 raise LifeSnapshotError("physical SQLite checksum mismatch")
+            with tempfile.TemporaryDirectory(
+                prefix="elysium-life-verify-"
+            ) as temporary:
+                staged = Path(temporary) / path.name
+                shutil.copy2(path, staged)
+                if sha256_file(staged) != actual_sha:
+                    raise LifeSnapshotError("staged SQLite checksum mismatch")
+                inspection = inspect_sqlite_database(staged)
             if inspection["database_root_sha256"] != item["database_root_sha256"]:
                 raise LifeSnapshotError("logical SQLite root mismatch")
             if inspection["tables"] != item["tables"]:

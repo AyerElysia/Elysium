@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import scripts.backup_life_data as backup_script
 from plugins.life_engine.storage.migration import (
     LifeSnapshotError,
     LifeStorageLayout,
@@ -21,6 +22,7 @@ def _fixture_data(data_root: Path) -> LifeStorageLayout:
     data_root.mkdir()
     database = data_root / "ledger.sqlite3"
     with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA journal_mode = WAL")
         connection.execute(
             "CREATE TABLE events ("
             "sequence INTEGER PRIMARY KEY, payload TEXT, raw BLOB, score REAL, optional TEXT)"
@@ -124,3 +126,57 @@ def test_snapshot_output_must_not_be_inside_source_root(tmp_path: Path) -> None:
             data_root / "nested-backup",
             layout=layout,
         )
+
+
+def test_sqlite_backup_is_complete_without_sidecar_files(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    layout = _fixture_data(data_root)
+    output = tmp_path / "snapshot"
+
+    create_local_snapshot(data_root, output, layout=layout)
+
+    backup = output / "sqlite/ledger.sqlite3"
+    assert backup.is_file()
+    assert not Path(f"{backup}-journal").exists()
+    assert not Path(f"{backup}-wal").exists()
+    with sqlite3.connect(backup) as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+    assert verify_local_snapshot(output)["verified"] is True
+
+
+def test_backup_wrapper_persists_independent_verification_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    output = tmp_path / "snapshot"
+
+    def fake_create(*_args: object, **_kwargs: object) -> dict[str, object]:
+        output.mkdir()
+        return {
+            "manifest_sha256": "a" * 64,
+            "source_snapshot_sha256": "b" * 64,
+            "writer_frozen": False,
+            "sqlite": [],
+            "exact_file_count": 0,
+        }
+
+    monkeypatch.setattr(backup_script, "create_local_snapshot", fake_create)
+    monkeypatch.setattr(
+        backup_script,
+        "verify_local_snapshot",
+        lambda _path: {
+            "verified": False,
+            "verified_at": "2026-08-04T00:00:00+00:00",
+            "failure_count": 1,
+            "failures": [{"kind": "sqlite", "reason": "checksum mismatch"}],
+        },
+    )
+
+    result = backup_script.create_life_backup(data_root, output)
+
+    marker = output / "VERIFICATION_FAILED.json"
+    assert result["generation_eligible"] is False
+    assert marker.is_file()
+    assert "checksum mismatch" in marker.read_text(encoding="utf-8")
