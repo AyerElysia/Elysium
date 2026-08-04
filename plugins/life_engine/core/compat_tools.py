@@ -5,12 +5,12 @@
 """
 
 from __future__ import annotations
+
 from typing import Annotated, Any
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import BaseAction, BaseTool
 from src.core.managers import get_plugin_manager
-
 
 logger = get_logger("life_engine.compat_tools")
 
@@ -360,6 +360,6 @@ class LifeInnerQueryTool(BaseTool):
             instance_id = service.resolve_consciousness_instance(
                 trusted_stream_id
             )
-            return True, service.query_world(instance_id, query_text)
+            return True, await service.query_world(instance_id, query_text)
         except Exception as exc:  # noqa: BLE001
             return False, f"查询内在世界失败: {exc}"

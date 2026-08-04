@@ -74,6 +74,13 @@ class PresenceStorePort(Protocol):
     ) -> PresenceTakeoverResult:
         """Atomically displace only expired stream owners and claim their streams."""
 
+    async def expire_leases(
+        self,
+        *,
+        limit: int = 200,
+    ) -> tuple[PresenceCommitResult, ...]:
+        """Suspend a bounded database-time-expired lease prefix."""
+
     async def pending_events(self, limit: int = 200) -> list[dict[str, Any]]:
         """Read unpublished lifecycle events without advancing the outbox."""
 

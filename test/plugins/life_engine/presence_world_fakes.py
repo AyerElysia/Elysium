@@ -334,6 +334,61 @@ class FakePresenceStore:
             self._next_outbox_id = len(outbox) + 1
             return PresenceTakeoverResult(committed, tuple(displaced))
 
+    async def expire_leases(
+        self,
+        *,
+        limit: int = 200,
+    ) -> tuple[PresenceCommitResult, ...]:
+        async with self._lock:
+            instances = copy.deepcopy(self._instances)
+            owners = dict(self._owners)
+            outbox = copy.deepcopy(self._outbox)
+            database_now = _now()
+            candidates = sorted(
+                (
+                    item
+                    for item in instances.values()
+                    if item["status"] == "active"
+                    and item.get("lease_duration_seconds") is not None
+                    and _parsed(item.get("lease_expires_at")) is not None
+                ),
+                key=lambda item: (
+                    _parsed(item.get("lease_expires_at")) or database_now,
+                    str(item["instance_id"]),
+                ),
+            )[: max(1, int(limit))]
+            expired: list[PresenceCommitResult] = []
+            for snapshot in candidates:
+                expiry = _parsed(snapshot.get("lease_expires_at"))
+                if expiry is None or expiry >= database_now:
+                    break
+                snapshot["status"] = "suspended"
+                snapshot["suspended_at"] = database_now.isoformat()
+                snapshot["lease_expires_at"] = ""
+                expired.append(
+                    self._commit_state(
+                        instances,
+                        owners,
+                        outbox,
+                        snapshot,
+                        expected_revision=int(snapshot["revision"]),
+                        event_type="consciousness.instance_lease_expired",
+                        event_payload={
+                            "occurred_at": database_now.isoformat(),
+                            "reason": "lease_expired_reconcile",
+                        },
+                        database_now=database_now,
+                        refresh_lease=False,
+                    )
+                )
+            self._instances, self._owners, self._outbox = (
+                instances,
+                owners,
+                outbox,
+            )
+            self._next_outbox_id = len(outbox) + 1
+            return tuple(expired)
+
     async def pending_events(self, limit: int = 200) -> list[dict[str, Any]]:
         async with self._lock:
             return [
@@ -473,8 +528,6 @@ class FakeWorldProjectionStore:
             frontier = self._frontier
             try:
                 for event in sorted(events, key=lambda item: item.sequence):
-                    if event.sequence > self._frontier + 1:
-                        raise WorldProjectionConflict("world projector ledger gap")
                     self._apply(event)
                     self._frontier = max(self._frontier, event.sequence)
             except BaseException:

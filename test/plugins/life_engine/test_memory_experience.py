@@ -24,7 +24,10 @@ from plugins.life_engine.memory.experience import (
     update_witness_state,
 )
 from plugins.life_engine.memory.tools import LifeEngineSearchMemoryTool
-from plugins.life_engine.service.consciousness import ConsciousnessRegistry
+from plugins.life_engine.service.consciousness import (
+    ConsciousnessInstance,
+    ConsciousnessRegistry,
+)
 from plugins.life_engine.service.event_bus import LifeEvent, RawEventGapError
 from plugins.life_engine.service.legacy_diary import parse_legacy_diary_file
 from plugins.life_engine.service.memory_witness import (
@@ -239,17 +242,22 @@ def test_legacy_parser_handles_adjacent_and_multiline_entries(tmp_path: Path) ->
     assert entries[0].migration_key != entries[1].migration_key
 
 
-def test_memory_witness_is_registered_as_consciousness_without_tools(
+@pytest.mark.asyncio
+async def test_memory_witness_is_registered_as_consciousness_without_tools(
     tmp_path: Path,
 ) -> None:
     registry = ConsciousnessRegistry()
+
+    async def register(instance: ConsciousnessInstance) -> ConsciousnessInstance:
+        return registry.register(instance)
+
     service = SimpleNamespace(
         consciousness_registry=registry,
-        save_consciousness_registry=lambda: None,
+        register_consciousness_instance=register,
         _cfg=lambda: SimpleNamespace(memory_witness=SimpleNamespace(enabled=True)),
     )
 
-    instance = MemoryWitnessCoordinator(service).ensure_instance()
+    instance = await MemoryWitnessCoordinator(service).ensure_instance()
 
     assert instance.instance_id == MEMORY_WITNESS_INSTANCE_ID
     assert instance.kind == "memory_witness"
@@ -331,12 +339,26 @@ def _witness_service_stub(tmp_path: Path, memory: object) -> SimpleNamespace:
         model_task_name="diary",
         migrate_legacy_diaries=False,
     )
+
+    async def _register(instance: ConsciousnessInstance) -> ConsciousnessInstance:
+        return registry.register(instance)
+
+    async def _resume(instance_id: str, **kwargs: object) -> bool:
+        return registry.resume(instance_id, **kwargs)
+
+    async def _touch(instance_id: str, **kwargs: object) -> None:
+        registry.touch(instance_id, **kwargs)
+
+    store = _RawStoreStub(event)
     return SimpleNamespace(
         consciousness_registry=registry,
         save_consciousness_registry=lambda: None,
+        register_consciousness_instance=_register,
+        resume_consciousness_instance=_resume,
+        touch_consciousness_instance=_touch,
         memory_service=memory,
         _cfg=lambda: SimpleNamespace(memory_witness=config),
-        _get_event_bus=lambda: SimpleNamespace(store=_RawStoreStub(event)),
+        _get_life_event_store=lambda: store,
         _workspace_dir=lambda: tmp_path,
     )
 
@@ -666,7 +688,7 @@ async def test_witness_refuses_to_skip_retained_event_gap(
 
     memory.get_witness_state = _get_state  # type: ignore[method-assign]
     service = _witness_service_stub(tmp_path, memory)
-    event = service._get_event_bus().store.event
+    event = service._get_life_event_store().event
     event = LifeEvent(
         event_id=event.event_id,
         sequence=4,
@@ -695,7 +717,7 @@ async def test_witness_refuses_to_skip_retained_event_gap(
             return [event]
 
     store = _GapStore()
-    service._get_event_bus = lambda: SimpleNamespace(store=store)
+    service._get_life_event_store = lambda: store
     coordinator = MemoryWitnessCoordinator(service)
 
     async def _project(_witness: object) -> None:

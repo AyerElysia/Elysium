@@ -7,8 +7,9 @@ from types import SimpleNamespace
 import pytest
 
 from plugins.life_engine.core.compat_tools import (
-    LifeThinkAction,
+    LifeInnerQueryTool,
     LifeRecordInnerMonologueAction,
+    LifeThinkAction,
 )
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.core.plugin import LifeEnginePlugin
@@ -115,6 +116,38 @@ async def test_think_action_delegates_snapshot_to_life_service(monkeypatch: pyte
             "expected_response": "她会觉得我还在认真听",
         }
     ]
+
+
+async def test_inner_query_awaits_async_world_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str]] = []
+
+    class _FakeService:
+        @staticmethod
+        def resolve_consciousness_instance(stream_id: str) -> str:
+            assert stream_id == "stream-query"
+            return "instance-query"
+
+        async def query_world(self, instance_id: str, query: str) -> str:
+            calls.append((instance_id, query))
+            return "traceable world answer"
+
+    fake_plugin = SimpleNamespace(service=_FakeService())
+    monkeypatch.setattr(
+        "plugins.life_engine.core.compat_tools.get_plugin_manager",
+        lambda: SimpleNamespace(
+            get_plugin=lambda name: fake_plugin if name == "life_engine" else None
+        ),
+    )
+    tool = LifeInnerQueryTool.__new__(LifeInnerQueryTool)
+    tool.chat_stream = SimpleNamespace(stream_id="stream-query")
+
+    ok, result = await tool.execute("what changed")
+
+    assert ok is True
+    assert result == "traceable world answer"
+    assert calls == [("instance-query", "what changed")]
 
 
 async def test_schedule_followup_message_action_delegates_to_life_service(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,13 +1,15 @@
 # 生命域存储快照与权威切换运行手册
 
-本手册服务于 Elysium 生命域可选本地/MySQL 存储。它不包含真实主机、用户名、密码或 fencing token。Memory 的六 Port、local/MySQL 适配与 MySQL schema 已实现，但完整生命域适配、正式数据复制校验、恢复演练和人工切换尚未完成，因此本手册中的正式切换步骤是**验收门**，不是当前可以执行的上线指令。
+本手册服务于 Elysium 生命域可选本地/MySQL 存储。它不包含真实主机、用户名、密码或 fencing token。Life Event、Memory、Presence、World 的 Port/adapter 与 `LifeEngineService` 单 runtime 接线已实现，但 Subject Document 全链路、正式数据复制校验、恢复演练和人工切换尚未完成，因此本手册中的正式切换步骤是**验收门**，不是当前可以执行的上线指令。
 
 ## 1. 当前安全状态
 
 - `storage.enabled = false` 是默认值，也是当前生产要求；
 - 正式权威仍为既有本地 SQLite、Markdown、JSON/JSONL 与媒体文件；
 - 新的存储 runtime 不会自动创建、注册、激活或切换 generation；
+- `LifeEngineService` 是唯一 runtime owner；各子域只消费注入对象，禁止自行再次打开或关闭 runtime；
 - 后端打开失败时 fail closed，不会从 MySQL 静默回退到 local，也不会反向回退；
+- enabled 模式不打开或双写旧 Life Event、Presence、World SQLite；disabled 模式保持原 local 行为；
 - 快照、迁移和校验器没有删除、移动、截断或覆盖源数据的权限；
 - Elysium 只能由用户手动启动。脚本不会停止或重启 Elysium。
 
@@ -112,6 +114,20 @@ Memory 的本地合同测试不需要外部服务；真实 MySQL 合同测试必
 - `ELYSIUM_TEST_MYSQL_SSL_MODE`
 
 未提供必要变量时，真实 MySQL 用例必须明确显示为 skipped；不得借用正式数据库，也不得把 skipped 记作真实远程验收通过。测试会创建 Memory v1-v6 schema、注册隔离 generation、取得短租约 authority 并在结束时清理本次稳定身份；schema 初始化尚未完成时不得尝试清理尚不存在的领域表。
+
+### 6.2 Presence/World 隔离合同验证
+
+本地与 fake 合同验证覆盖数据库时间 lease、过期回收/takeover、revision/stream 并发、lifecycle outbox、World frontier/rebuild/cursor；service 级合同还会分别模拟 local/mysql 选择，证明单 runtime 注入、禁止旧 SQLite、重启恢复与失败关闭。真实 MySQL Presence/World 合同除通用 `ELYSIUM_TEST_MYSQL_*` 外，还必须显式设置：
+
+```text
+ELYSIUM_TEST_MYSQL_PRESENCE_WORLD_ISOLATED=1
+```
+
+该标志表示目标是允许整表 rebuild/cleanup 的专用隔离库，不得指向正式库。业务启动一律以 `initialize_schema=false` 打开 adapter；缺表必须失败，不能让 Elysium 启动流程代替迁移器建表。
+
+### 6.3 单 runtime 启动与关闭顺序
+
+enabled 模式的固定顺序是：service 打开并拥有一个 runtime → 注入 Memory → 从同一 runtime 构造 Life Event/Presence/World → 启动上层消费者。关闭顺序相反：先停止上层任务 → 关闭 Memory 等消费者 → flush Presence outbox 并追平 World → 最后且仅一次关闭 runtime。任一消费者关闭失败都不得阻止后续消费者和 runtime 释放；最终以聚合异常报告，不静默吞掉。启动中途失败同样执行这一逆序清理。
 
 本阶段只验证适配器合同，不会修改 `storage.enabled`、不会迁移正式数据、不会注册或激活正式 generation，也不会启动或停止 Elysium、NapCat 或其他运行进程。
 

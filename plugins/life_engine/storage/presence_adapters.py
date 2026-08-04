@@ -599,6 +599,64 @@ class SQLPresenceStore:
 
         return await self._write(operation)
 
+    async def expire_leases(
+        self,
+        *,
+        limit: int = 200,
+    ) -> tuple[PresenceCommitResult, ...]:
+        """Suspend expired active leases using one backend-time transaction."""
+
+        bounded_limit = max(1, int(limit))
+
+        async def operation(
+            session: AsyncSession,
+        ) -> tuple[PresenceCommitResult, ...]:
+            database_now = await self._database_now(session)
+            rows = (
+                (
+                    await session.execute(
+                        text(
+                            """SELECT * FROM consciousness_presence
+                            WHERE status = 'active'
+                              AND lease_duration_seconds IS NOT NULL
+                              AND lease_expires_at IS NOT NULL
+                            ORDER BY lease_expires_at, instance_id
+                            LIMIT :limit"""
+                            + self._for_update
+                        ),
+                        {"limit": bounded_limit},
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            expired: list[PresenceCommitResult] = []
+            for row in rows:
+                snapshot = self._decode_row(row)
+                expiry = _parse_datetime(snapshot["lease_expires_at"])
+                if expiry is None or expiry >= database_now:
+                    break
+                snapshot["status"] = "suspended"
+                snapshot["suspended_at"] = database_now.isoformat()
+                snapshot["lease_expires_at"] = ""
+                expired.append(
+                    await self._persist_snapshot(
+                        session,
+                        snapshot,
+                        expected_revision=int(row["revision"]),
+                        event_type="consciousness.instance_lease_expired",
+                        event_payload={
+                            "occurred_at": database_now.isoformat(),
+                            "reason": "lease_expired_reconcile",
+                        },
+                        database_now=database_now,
+                        refresh_lease=False,
+                    )
+                )
+            return tuple(expired)
+
+        return await self._write(operation)
+
     async def pending_events(self, limit: int = 200) -> list[dict[str, Any]]:
         async with self.runtime.engine.connect() as connection:
             rows = (
