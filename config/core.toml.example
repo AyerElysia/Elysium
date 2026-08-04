@@ -104,7 +104,15 @@ strict_mode = true
 enable_http_router = true
 http_router_host = "127.0.0.1"
 http_router_port = 18000
-api_keys = []  # 生产环境请设置访问密钥
+api_keys = []  # 旧 WebUI API 密钥；不用于阶段三会话认证
+enable_app_api_v1 = false
+app_api_v1_database_path = "runtime/app_api_v1/auth.sqlite3"
+app_api_v1_allowed_origins = ["http://127.0.0.1:5173"]
+app_api_v1_max_concurrency = 32
+app_api_v1_max_websocket_connections = 64
+# 启用阶段三 API 前，还必须设置环境变量：
+# ELYSIUM_APP_API_V1_SIGNING_SECRET（至少 32 字节）
+# ELYSIUM_INSTALLATION_ID（稳定安装实例 ID）
 
 [advanced]
 force_sync_http = false

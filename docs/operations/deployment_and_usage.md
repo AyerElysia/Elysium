@@ -23,7 +23,7 @@ Elysium 是数字生命系统，不是通用聊天机器人框架。修改配置
 | 能力 | 状态 | 说明 |
 | --- | --- | --- |
 | 项目 `.venv` 本地启动 | 已验证 | 不依赖 Docker |
-| SQLite 数据库初始化 | 已验证 | 默认使用 `data/MoFox.db` |
+| Core MySQL 数据库 | 已验证 | 13 张 Core 关系表支持直接读写 MySQL；切换后仍需按部署实例做启动与读写验收 |
 | HTTP 服务 | 已验证 | 默认监听 `127.0.0.1:8000` |
 | Life Engine 心跳 | 已验证 | 使用 `model_tasks.core` |
 | Life Chatter 文本表达 | 已验证 | 必须启用 `[chatter].enabled` 且存在非空 `SOUL.md` |
@@ -244,7 +244,7 @@ cp config/models.toml.example config/models.toml
 config/core.toml
 ```
 
-最小建议配置：
+Core 使用 MySQL 时，最小配置如下（真实地址和用户名只写入本机被 Git 忽略的 `config/core.toml`；密码只由环境变量注入，不要写入本文、TOML 或提交）：
 
 ```toml
 [bot]
@@ -253,8 +253,18 @@ log_level = "INFO"
 llm_preflight_check = true
 
 [database]
-database_type = "sqlite"
-sqlite_path = "data/MoFox.db"
+database_type = "mysql"
+mysql_host = "<MYSQL_HOST>"
+mysql_port = 3306
+mysql_database = "elysium"
+mysql_user = "<MYSQL_USER>"
+mysql_password = "${ELYSIUM_MYSQL_PASSWORD}"
+mysql_charset = "utf8mb4"
+mysql_ssl_mode = "required"
+mysql_ssl_ca = "<MYSQL_CA_PATH>"
+connection_pool_size = 10
+connection_timeout = 10
+echo = false
 
 [http_router]
 enable_http_router = true
@@ -263,13 +273,109 @@ http_router_port = 8000
 api_keys = []
 ```
 
+Windows PowerShell 设置密码环境变量（只在当前用户环境变量中保存，不把密码写入 TOML）：
+
+```powershell
+[Environment]::SetEnvironmentVariable("ELYSIUM_MYSQL_PASSWORD", "<MYSQL_PASSWORD>", "User")
+```
+
+Git Bash 临时设置当前终端环境变量：
+
+```bash
+export ELYSIUM_MYSQL_PASSWORD='<MYSQL_PASSWORD>'
+```
+
 说明：
 
+- `database_type = "mysql"` 控制 Core 关系数据库；当前 13 张 Core 业务表会直接读写 MySQL。
+- `mysql_password` 支持 `${ELYSIUM_MYSQL_PASSWORD}` 环境变量插值。不要把真实密码填回 TOML、文档、日志或 Git；交互式设置环境变量时也要注意 shell 历史和终端录屏。
+- 生产环境优先使用 `mysql_ssl_mode = "required"` 或 `"verify-full"`，并填写 CA/证书路径；只有本机受控网络且明确接受明文链路时才使用 `disabled`。
+- MySQL 账号至少需要目标数据库及 Core 表的建表、读写和迁移所需权限；不要给应用账号全库管理员权限。
 - 本地单机运行建议保持 `127.0.0.1`，不要无理由监听 `0.0.0.0`。
 - 如果对外开放 HTTP，必须配置强 API Key、反向代理、HTTPS 和访问控制。
 - `llm_preflight_check = true` 会在启动时检查 Provider 网络连通性。
 - 开发调试遇到断点导致 WatchDog 误判时，可临时关闭 `enable_watchdog`；普通运行建议开启。
-- 默认 SQLite 足以完成本地部署；切换 PostgreSQL 前需单独验收连接、迁移和恢复流程。
+- Core 切换到 MySQL 不会自动迁移 Life Engine 生命域；Life Event、Life Memory、Presence、World Projection、主体文件和向量索引仍按本地优先设计运行。
+
+### 6.1 首次从 SQLite 切换到 MySQL
+
+如果目标 MySQL 尚未包含当前 Core 数据，不能只改 `database_type` 后直接启动。必须遵循以下顺序：
+
+1. 用户手工停止 Elysium，建立明确停写窗口；不要由脚本或 agent 擅自停止进程。
+2. 使用 `scripts/migrate_core_to_mysql.py snapshot` 为旧 Core SQLite 建立不可覆盖的在线快照。
+3. 将迁移连接 URL只放入 `ELYSIUM_MYSQL_URL` 环境变量，执行 `migrate` 和 `verify`。
+4. 只有逐表行数、内容 SHA-256、迁移状态和目标备份都通过后，才把 `database_type` 改为 `mysql`。
+5. 用户手工启动 Elysium，执行 Core 读写冒烟；保留旧 SQLite 快照和全部迁移 manifest，不删除。
+
+详细命令、目标库空库要求、幂等重放、备份与隔离恢复见 [MySQL 迁移、备份与恢复手册](./mysql_migration_and_backup.md)。如果部署本来就使用已经迁移并验证的 MySQL，则不应重复把旧 SQLite 强行导入。
+
+### 6.2 Life Engine 为什么仍读取本地文件
+
+Core MySQL 与 Life Engine 生命域不是同一存储合同。当前正确部署形态是：
+
+```text
+Core 关系数据 ──直接读写──> MySQL
+Life Event / Life Memory / Presence / World / 主体文件
+    └──本地读写──> SQLite、Markdown/JSON 与本地向量投影
+```
+
+本地生命域的热点检索通常比远端 MySQL 少一次网络往返；`SOUL.md`、日记和主体文件还承担逐字节版本与执笔权边界，Chroma/FTS 也不能由统一归档表直接替代。因此“爱莉仍读本地文件”不是 Core MySQL 未生效，也不能仅为追求性能把这些文件改成普通 MySQL CRUD。
+
+项目还提供两项默认关闭的可选能力：
+
+- `[shared_sync]`：只复制显式标记为 `shared` 的 Life Event；`pull_enabled` 在应用投影器完成前必须保持 `false`。
+- `[memory_archive_sync]`：把已登记的本地生命域逐行/逐字节追加到 MySQL 归档，用于灾备和隔离恢复；它不接管本地运行时读取。
+
+不要把两项 `enabled` 直接改成 `true` 来冒充“全部使用 MySQL”。启用前必须分别完成远端权限、密码环境变量、初次备份/全量清单、哈希验证、恢复演练和生命周期验收。尤其是 Core 已直接使用 MySQL 的部署，当前统一归档器仍把 `data/Elysium.db` 作为必需的 `core` 扫描源；该源不存在或已停止更新时，持续归档不能代表最新 Core 数据，必须先完成归档源接线修复。统一归档的正式流程见 [统一记忆同步与恢复手册](./unified_memory_sync_runbook.md)，共享事件流程见 [离线同步运行手册](./offline_sync_runbook.md)。
+
+### 6.3 启动和回退验收
+
+修改数据库配置不会热加载。完成配置后，由用户在维护窗口手工启动或重启，并至少检查：
+
+- 启动日志确认数据库方言为 MySQL，且没有认证、TLS、连接超时、缺表或字符集错误；
+- 查询已有聊天流/人物/图片元数据，确认不是连到了空库；
+- 通过真实消息产生一条新的 Core 记录，再只读确认写入目标 MySQL；
+- 验证四字节 Unicode、时间戳精度和连接回收；
+- 执行一次 MySQL 逻辑备份并恢复到隔离库，再做逐表指纹复核。
+
+若 MySQL 不可达，不要一边保留 MySQL 新写入一边直接把配置指回旧 SQLite。应先停止 Core 写入、备份 MySQL、核对切换后的差异，再选择恢复 MySQL 或执行经过审计的反向同步；否则会形成两份分叉的聊天和人物历史。
+
+### 6.4 阶段三 `/api/v1` 认证基座
+
+阶段三应用接口默认不挂载。只有明确需要前端或独立应用后端联调时，才在本机 `config/core.toml` 中启用：
+
+```toml
+[http_router]
+enable_http_router = true
+enable_app_api_v1 = true
+app_api_v1_database_path = "runtime/app_api_v1/auth.sqlite3"
+app_api_v1_allowed_origins = ["http://127.0.0.1:5173"]
+app_api_v1_max_concurrency = 32
+app_api_v1_max_websocket_connections = 64
+```
+
+还必须通过环境变量提供：
+
+- `ELYSIUM_APP_API_V1_SIGNING_SECRET`：至少 32 字节的稳定随机密钥；重启时必须保持一致，不得写入 TOML、日志或 Git；
+- `ELYSIUM_INSTALLATION_ID`：该部署实例的稳定非空 ID，用于绑定本机 bootstrap challenge。
+
+安全与恢复边界：
+
+- `api_keys` 是旧 WebUI 合同，不会替代 `/api/v1` 的短时 session、refresh、撤销和单次 WebSocket ticket；
+- Origin 使用精确 allowlist，不支持通配符；localhost 也不能绕过认证；
+- 认证 SQLite 必须位于 workspace 的 `runtime/` 下，只保存凭据哈希、授权、到期与撤销状态，不保存可回显明文凭据；
+- 普通请求体上限 1 MiB，受管上传上限 32 MiB，HTTP 并发和 WebSocket 连接分别受配置预算约束；
+- 当前只挂载 P3-01 的五个认证端点；bootstrap、capabilities、readiness 等领域接口属于后续步骤，不能因为 OpenAPI 可访问就宣称阶段三全部完成；
+- 受信启动器通过 `AuthStore.create_bootstrap_challenge()` 生成绑定 Origin、安装实例和短 TTL 的一次性 challenge；公共 HTTP 不提供匿名 challenge 生成端点；
+- 备份认证库时必须同时保护签名密钥；恢复后验证旧撤销 session 仍不可用、refresh 不能重放、ticket 只能消费一次。签名密钥遗失时旧 token 不可恢复，必须按凭据失效事故处理，不得临时生成密钥伪装连续会话。
+
+定向验收：
+
+```bash
+uv run --group dev python -m pytest test/api/v1 -q --no-cov -n 0
+```
+
+启用或修改该配置需要用户手工重启 Elysium。本轮开发没有启动或重启运行实例，也没有完成真实前端端到端验收。
 
 ---
 

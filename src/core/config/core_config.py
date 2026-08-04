@@ -498,7 +498,31 @@ class CoreConfig(ConfigBase):
         )
         api_keys: list[str] = Field(
             default_factory=list,
-            description="WebUI API 访问密钥列表，留空则禁用认证（不推荐）",
+            description="旧 WebUI API 访问密钥列表；不适用于 /api/v1 会话认证",
+        )
+        enable_app_api_v1: bool = Field(
+            default=False,
+            description="是否显式挂载阶段三 /api/v1；默认关闭",
+        )
+        app_api_v1_database_path: str = Field(
+            default="runtime/app_api_v1/auth.sqlite3",
+            description="阶段三认证状态 SQLite 路径，只保存哈希与撤销状态",
+        )
+        app_api_v1_allowed_origins: list[str] = Field(
+            default_factory=list,
+            description="允许本机 bootstrap 与浏览器调用的精确 Origin allowlist",
+        )
+        app_api_v1_max_concurrency: int = Field(
+            default=32,
+            ge=1,
+            le=512,
+            description="阶段三 API 同时处理的最大 HTTP 请求数",
+        )
+        app_api_v1_max_websocket_connections: int = Field(
+            default=64,
+            ge=1,
+            le=4096,
+            description="阶段三实时领域共享的最大 WebSocket 连接数",
         )
     http_router: HttpRouterSection = Field(default_factory=HttpRouterSection)
 

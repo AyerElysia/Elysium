@@ -20,7 +20,10 @@ from .console_ui import ConsoleUIManager, UILevel
 from .exceptions import BotInitializationError, BotRuntimeError, BotShutdownError
 from .signal_handler import SignalHandler
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
 if TYPE_CHECKING:
+    from src.app.api.v1.mount import APIV1Mount
     from src.core.components import PluginLoader, PluginManifest
     from src.core.config import CoreConfig
     from src.core.managers import MCPManager, PluginManager
@@ -105,6 +108,7 @@ class Bot:
         self.plugin_manager: PluginManager | None = None
         self.mcp_manager: MCPManager | None = None
         self.http_server: HTTPServer | None = None
+        self.app_api_mount: APIV1Mount | None = None
         self.load_order: list[str] = []
         self.manifests: dict[str, PluginManifest] = {}
         self.load_results: dict[str, bool] = {}
@@ -623,6 +627,23 @@ class Bot:
             await self._check_http_security(host, api_keys)
 
             self.http_server = get_http_server(host=host, port=port)
+            if self.config.http_router.enable_app_api_v1:
+                from src.app.api.v1.mount import mount_api_v1
+
+                self.app_api_mount = mount_api_v1(
+                    self.http_server.app,
+                    workspace_root=_PROJECT_ROOT,
+                    database_path=self.config.http_router.app_api_v1_database_path,
+                    allowed_origins=tuple(
+                        self.config.http_router.app_api_v1_allowed_origins
+                    ),
+                    max_concurrency=(
+                        self.config.http_router.app_api_v1_max_concurrency
+                    ),
+                    max_websocket_connections=(
+                        self.config.http_router.app_api_v1_max_websocket_connections
+                    ),
+                )
             await self.http_server.start()
 
             # 挂载 LLM 请求体检视器（调试用 WebUI）
@@ -1056,6 +1077,11 @@ class Bot:
                     self.logger.info("停止 HTTP 服务器...")
                 await self.http_server.stop()
 
+        async def _close_app_api_mount() -> None:
+            if self.app_api_mount is not None:
+                self.app_api_mount.close()
+                self.app_api_mount = None
+
         async def _cleanup_mcp() -> None:
             if self.mcp_manager is not None:
                 if self.logger:
@@ -1112,6 +1138,7 @@ class Bot:
             ("adapters_verify", _verify_adapters_stopped),
             ("scheduler", _stop_scheduler),
             ("http_server", _stop_http_server),
+            ("app_api_mount", _close_app_api_mount),
             ("mcp", _cleanup_mcp),
             ("watchdog", _stop_watchdog),
             ("tasks", _stop_tasks),

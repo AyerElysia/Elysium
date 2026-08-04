@@ -25,6 +25,7 @@
 | 是否实现应用用户体系    | 否，只验证调用方身份与 Elysium 授权范围                     | 是                         |
 | 是否实现普通业务 CRUD | 否                                            | 是                         |
 | 是否改写爱莉主体语义    | 否                                            | 否                         |
+|               |                                              |                           |
 
 以下内容不得混入阶段三：
 
@@ -511,7 +512,7 @@ attempt_count
 | ---- | -------------------------------------- | ----------------------------------- |
 | POST | `/api/v1/commands`                     | 可选通用命令入口；只接收 allowlist command type |
 | GET  | `/api/v1/commands/{command_id}`        | 查询状态、结果事件和安全错误                      |
-| POST | `/api/v1/commands/{command_id}/cancel` | 取消支持取消且未完成的命令                       |
+| POST | `/api/v1/commands/{command_id}:cancel` | 取消支持取消且未完成的命令                       |
 | GET  | `/api/v1/commands`                     | 按 actor、状态、类型和 cursor 查询，管理员受限      |
 
 建议领域路由（如 `/chat/messages:send`）内部都创建统一 command 记录；通用 `/commands` 不是任意内部工具调用器。
@@ -1181,6 +1182,8 @@ metrics:read / diagnostics:read
 
 ### P3-00：冻结边界与接口清单
 
+**实施状态：已完成（2026-08-04）。** 机器可检查的唯一接口 inventory 位于 `src/app/api/v1/inventory.py`，已覆盖本文 183 个唯一方法／路径，并为每项登记前端页面、调用身份、scope、资源授权、实现锚点和完成状态；第 29 节决策固化于 `src/app/api/v1/policy.py`。`test/api/v1/test_inventory.py` 已在本轮实际执行并通过，验证文档覆盖、元数据完整性、scope、管理身份隔离、平台 service audience、排除项、狼人杀 experimental 状态和 14 项确认决策。
+
 任务：
 
 1. 重新读取 `AGENTS.md`、`docs/principles.md`、上位规划和本文。
@@ -1193,6 +1196,8 @@ metrics:read / diagnostics:read
 验收门：接口 inventory 覆盖本文全部用户层、管理层和共用接口；每项都能指向明确前端页面，完全没有前端消费者的内部能力不得进入 inventory。
 
 ### P3-01：建立公共 schema 与错误基座
+
+**实施状态：已完成（2026-08-04）。** 已实现默认关闭、显式配置后挂载的 `/api/v1` 应用基座，包含版本化严格 schema、UTC 时间、request id、统一脱敏错误、规范 HMAC token/cursor、短时 session、refresh 轮换、幂等 logout、用户／管理员／platform service audience、session／credential 撤销、Origin 与安装实例绑定的一次性 bootstrap challenge、资源与 scope 绑定的单次 WebSocket ticket，以及请求体、上传、HTTP 并发和 WebSocket 连接预算。OpenAPI 使用稳定 operation id、Bearer 安全方案和规范化 SHA-256 快照。`test/api/v1` 与受影响的 Core 配置、HTTP 服务器和 Bot 关闭生命周期测试已在本轮实际执行通过；本轮没有启动或重启 Elysium，也没有完成真实前端端到端验收。P3-02 尚未开始。
 
 任务：
 
