@@ -5,7 +5,10 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .chat_commands import ChatTarget
 
 from plugins.life_engine.service.event_bus import (
     LifeEvent,
@@ -15,7 +18,7 @@ from plugins.life_engine.service.event_bus import (
 from src.core.models.media import MediaAttachment
 from src.kernel.llm.exceptions import MediaValidationError
 
-from .auth_store import SessionRecord
+from .auth_store import AuthStore, SessionRecord
 from .schemas.chat import (
     ChatMessage,
     ChatMessagePage,
@@ -50,6 +53,10 @@ class ChatQueryFailure(Exception):
     status_code: int
     retryable: bool = False
     recovery_cursor: str | None = None
+
+
+class ChatTargetResolutionFailure(RuntimeError):
+    """A command target cannot be resolved without disclosing hidden data."""
 
 
 class ChatQueryService:
@@ -101,7 +108,9 @@ class ChatQueryService:
         has_more = bool(await self._read_since(store, position, limit=1))
         return ChatMessagePage(
             messages=tuple(visible),
-            next_cursor=self._encode_cursor(position if position != start or cursor else 0),
+            next_cursor=self._encode_cursor(
+                position if position != start or cursor else 0
+            ),
             has_more=has_more,
             scanned_count=scanned,
         )
@@ -140,12 +149,16 @@ class ChatQueryService:
         has_more = bool(await self._read_since(store, position, limit=1))
         return ChatStreamPage(
             streams=tuple(streams),
-            next_cursor=self._encode_cursor(position if position != start or cursor else 0),
+            next_cursor=self._encode_cursor(
+                position if position != start or cursor else 0
+            ),
             has_more=has_more,
             scanned_count=scanned,
         )
 
-    async def get_stream(self, stream_id: str, session: SessionRecord) -> ChatStreamSummary:
+    async def get_stream(
+        self, stream_id: str, session: SessionRecord
+    ) -> ChatStreamSummary:
         latest: ChatMessage | None = None
         async for event in self._iter_all_events():
             if event.stream_id != stream_id or not self._is_visible(event, session):
@@ -196,7 +209,9 @@ class ChatQueryService:
         stream_id: str | None = None,
     ) -> ChatReceiptList:
         message_resources: set[tuple[str, str]] = set()
-        receipt_events: list[tuple[LifeEvent, Mapping[str, Any], Mapping[str, Any]]] = []
+        receipt_events: list[
+            tuple[LifeEvent, Mapping[str, Any], Mapping[str, Any]]
+        ] = []
         async for event in self._iter_all_events():
             metadata = self._metadata(event)
             chat = metadata.get("chat")
@@ -249,6 +264,62 @@ class ChatQueryService:
                 )
             )
         return ChatReceiptList(receipts=tuple(receipts))
+
+    async def find_stream_target(
+        self,
+        stream_id: str,
+        session: SessionRecord,
+    ) -> tuple[ChatStreamSummary, dict[str, Any]]:
+        """Resolve one visible stream plus its latest opaque provider identity."""
+
+        selected: tuple[ChatStreamSummary, dict[str, Any]] | None = None
+        async for event in self._iter_all_events():
+            if event.stream_id != stream_id or not self._is_visible(event, session):
+                continue
+            message = self._message(event)
+            metadata = self._metadata(event)
+            identity = metadata.get("provider_identity")
+            if message is None or not isinstance(identity, Mapping):
+                continue
+            selected = (self._stream_summary(message), dict(identity))
+        if selected is None:
+            raise self._not_found("请求的聊天流不存在。")
+        return selected
+
+    async def find_message_target(
+        self,
+        message_id: str,
+        session: SessionRecord,
+    ) -> tuple[ChatMessage, dict[str, Any], str]:
+        """Resolve one visible message and reject ambiguous provider identities."""
+
+        matches: dict[
+            tuple[str, str],
+            tuple[ChatMessage, dict[str, Any], str],
+        ] = {}
+        async for event in self._iter_all_events():
+            if not self._is_visible(event, session):
+                continue
+            message = self._message(event)
+            if message is None or message.message_id != message_id:
+                continue
+            metadata = self._metadata(event)
+            identity = metadata.get("provider_identity")
+            if isinstance(identity, Mapping):
+                matches[(message.provider, message.stream_id)] = (
+                    message,
+                    dict(identity),
+                    str(metadata.get("actor_id") or ""),
+                )
+        if not matches:
+            raise self._not_found("请求的消息不存在。")
+        if len(matches) > 1:
+            raise ChatQueryFailure(
+                "resource_ambiguous",
+                "消息 ID 在多个可见聊天资源中重复，不能执行命令。",
+                409,
+            )
+        return next(iter(matches.values()))
 
     async def _iter_all_events(self) -> AsyncIterator[LifeEvent]:
         store = self._require_store()
@@ -344,9 +415,7 @@ class ChatQueryService:
         if not isinstance(value, list):
             return ()
         return tuple(
-            safe
-            for raw in value
-            if (safe := cls._attachment(raw)) is not None
+            safe for raw in value if (safe := cls._attachment(raw)) is not None
         )
 
     @staticmethod
@@ -437,4 +506,118 @@ class ChatQueryService:
         return parsed.astimezone(UTC)
 
 
-__all__ = ["CHAT_CURSOR_LEDGER", "ChatQueryFailure", "ChatQueryService"]
+class LedgerChatTargetResolver:
+    """Resolve command targets from P3-05 facts and current durable authorization."""
+
+    def __init__(self, *, queries: ChatQueryService, auth_store: AuthStore) -> None:
+        self._queries = queries
+        self._auth_store = auth_store
+
+    async def resolve_stream(
+        self,
+        stream_id: str,
+        actor_id: str,
+        authorization: Mapping[str, Any],
+    ) -> ChatTarget:
+        from .chat_commands import ChatTarget
+
+        session = self._command_session(actor_id, authorization)
+        try:
+            stream, identity = await self._queries.find_stream_target(
+                stream_id, session
+            )
+        except ChatQueryFailure as exc:
+            raise ChatTargetResolutionFailure(exc.code) from exc
+        return ChatTarget(
+            stream_id=stream.stream_id,
+            platform=stream.provider,
+            chat_type=stream.chat_type,
+            adapter_signature=self._text(identity.get("adapter_signature")),
+            provider_target=self._provider_target(identity),
+        )
+
+    async def resolve_message(
+        self,
+        message_id: str,
+        actor_id: str,
+        authorization: Mapping[str, Any],
+    ) -> ChatTarget:
+        from .chat_commands import ChatTarget
+
+        session = self._command_session(actor_id, authorization)
+        try:
+            (
+                message,
+                identity,
+                message_actor_id,
+            ) = await self._queries.find_message_target(
+                message_id,
+                session,
+            )
+        except ChatQueryFailure as exc:
+            raise ChatTargetResolutionFailure(exc.code) from exc
+        return ChatTarget(
+            stream_id=message.stream_id,
+            platform=message.provider,
+            chat_type=message.chat_type,
+            adapter_signature=self._text(identity.get("adapter_signature")),
+            provider_message_id=(
+                self._text(identity.get("raw_message_id"))
+                or self._text(identity.get("feishu_message_id"))
+                or self._text(identity.get("message_id"))
+            ),
+            provider_target=self._provider_target(identity),
+            message_direction=message.direction,
+            message_actor_id=message_actor_id,
+        )
+
+    def _command_session(
+        self,
+        actor_id: str,
+        authorization: Mapping[str, Any],
+    ) -> SessionRecord:
+        session_id = authorization.get("session_id")
+        grants = authorization.get("resource_grants")
+        if not isinstance(session_id, str) or not isinstance(grants, list):
+            raise ChatTargetResolutionFailure("authorization_invalid")
+        try:
+            session = self._auth_store.get_active_session(authorization["session_id"])
+        except (KeyError, ValueError) as exc:
+            raise ChatTargetResolutionFailure("session_invalid") from exc
+        if session.actor_id != actor_id:
+            raise ChatTargetResolutionFailure("session_invalid")
+        snapshot = {str(item) for item in grants}
+        current = set(session.resource_grants)
+        if not current.issuperset(snapshot):
+            raise ChatTargetResolutionFailure("authorization_reduced")
+        return session
+
+    @staticmethod
+    def _provider_target(identity: Mapping[str, Any]) -> dict[str, Any]:
+        target: dict[str, Any] = {}
+        for source, destination in (
+            ("group_id", "group_id"),
+            ("target_group_id", "group_id"),
+            ("user_id", "user_id"),
+            ("target_user_id", "user_id"),
+            ("feishu_chat_id", "chat_id"),
+            ("feishu_open_id", "open_id"),
+        ):
+            value = identity.get(source)
+            if value not in {None, ""}:
+                target[destination] = value
+        return target
+
+    @staticmethod
+    def _text(value: Any) -> str | None:
+        text = str(value or "").strip()
+        return text or None
+
+
+__all__ = [
+    "CHAT_CURSOR_LEDGER",
+    "ChatQueryFailure",
+    "ChatQueryService",
+    "ChatTargetResolutionFailure",
+    "LedgerChatTargetResolver",
+]

@@ -27,6 +27,7 @@ from src.kernel.commands import (
 )
 
 from .auth_store import SessionRecord
+from .chat import ChatTargetResolutionFailure
 from .commands import IDEMPOTENCY_KEY_PATTERN, _response
 from .runtime import ERROR_RESPONSES, APIError
 from .schemas.chat_commands import (
@@ -76,10 +77,10 @@ USER_SCOPES: Mapping[ChatAction, frozenset[str]] = {
     ChatAction.MARK_READ: frozenset({"chat:write"}),
     ChatAction.FORWARD: frozenset({"chat:write"}),
     ChatAction.POKE: frozenset({"chat:write"}),
-    ChatAction.ANNOUNCEMENT_PUBLISH: frozenset({"chat:moderate"}),
-    ChatAction.ANNOUNCEMENT_DELETE: frozenset({"chat:moderate"}),
-    ChatAction.PIN: frozenset({"chat:moderate"}),
-    ChatAction.UNPIN: frozenset({"chat:moderate"}),
+    ChatAction.ANNOUNCEMENT_PUBLISH: frozenset({"chat:admin", "chat:moderate"}),
+    ChatAction.ANNOUNCEMENT_DELETE: frozenset({"chat:admin", "chat:moderate"}),
+    ChatAction.PIN: frozenset({"chat:admin", "chat:moderate"}),
+    ChatAction.UNPIN: frozenset({"chat:admin", "chat:moderate"}),
 }
 
 
@@ -93,15 +94,27 @@ class ChatTarget:
     adapter_signature: str | None = None
     provider_message_id: str | None = None
     provider_target: Mapping[str, Any] = field(default_factory=dict)
+    message_direction: str | None = None
+    message_actor_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "provider_target", dict(self.provider_target))
 
 
 class ChatTargetResolver(Protocol):
-    async def resolve_stream(self, stream_id: str, actor_id: str) -> ChatTarget: ...
+    async def resolve_stream(
+        self,
+        stream_id: str,
+        actor_id: str,
+        authorization: Mapping[str, Any],
+    ) -> ChatTarget: ...
 
-    async def resolve_message(self, message_id: str, actor_id: str) -> ChatTarget: ...
+    async def resolve_message(
+        self,
+        message_id: str,
+        actor_id: str,
+        authorization: Mapping[str, Any],
+    ) -> ChatTarget: ...
 
 
 class ManagedMediaResolver(Protocol):
@@ -196,6 +209,12 @@ class ChatCommandService:
                 error_code="delivery_unknown",
                 safe_error_detail="平台可能已执行操作，但未返回可靠确认。",
             )
+        except ChatTargetResolutionFailure:
+            return CommandOutcome(
+                status=CommandStatus.REJECTED,
+                error_code="resource_not_found",
+                safe_error_detail="聊天目标不存在或当前命令无权访问。",
+            )
         except RuntimeError:
             return CommandOutcome(
                 status=CommandStatus.FAILED,
@@ -211,27 +230,55 @@ class ChatCommandService:
 
     async def _send(self, command: CommandRecord, *, reply: bool) -> CommandOutcome:
         message_id = str(command.target.get("message_id") or "")
+        authorization = self._authorization(command)
+        reply_to: str | None = None
         if reply:
-            target = await self.targets.resolve_message(message_id, command.actor_id)
+            target = await self.targets.resolve_message(
+                message_id,
+                command.actor_id,
+                authorization,
+            )
+            if not target.provider_message_id:
+                raise CapabilityError("reply target has no provider identity")
+            reply_to = target.provider_message_id
         else:
             target = await self.targets.resolve_stream(
-                str(command.target["stream_id"]), command.actor_id
+                str(command.target["stream_id"]),
+                command.actor_id,
+                authorization,
             )
+            public_reply_to = command.payload.get("reply_to")
+            if public_reply_to:
+                source = await self.targets.resolve_message(
+                    str(public_reply_to),
+                    command.actor_id,
+                    authorization,
+                )
+                if source.stream_id != target.stream_id:
+                    raise ChatTargetResolutionFailure("reply_stream_mismatch")
+                if not source.provider_message_id:
+                    raise CapabilityError("reply target has no provider identity")
+                reply_to = source.provider_message_id
         parts = _parts_from_payload(command.payload)
         attachments = await self._resolve_attachments(parts, command.actor_id)
         text = "".join(part.text or "" for part in parts if part.type == "text")
         primary = next((part.type for part in parts if part.type != "text"), "text")
         message = Message(
-            message_id=str(command.payload.get("client_message_id") or f"api_{uuid4().hex}"),
+            message_id=str(
+                command.payload.get("client_message_id") or f"api_{uuid4().hex}"
+            ),
             stream_id=target.stream_id,
-            reply_to=message_id if reply else command.payload.get("reply_to"),
+            reply_to=reply_to,
             content=text or f"[{primary}]",
             processed_plain_text=text or None,
             message_type=MessageType(primary),
             platform=target.platform,
             chat_type=target.chat_type,
             attachments=attachments,
-            extra={"api_command_id": command.command_id},
+            extra={
+                "api_command_id": command.command_id,
+                "api_actor_id": command.actor_id,
+            },
         )
         succeeded = await self.sender.send_message(message, target.adapter_signature)
         if not succeeded:
@@ -272,19 +319,73 @@ class ChatCommandService:
         action: ChatAction,
     ) -> CommandOutcome:
         message_id = str(command.target.get("message_id") or "")
+        authorization = self._authorization(command)
         if message_id:
-            target = await self.targets.resolve_message(message_id, command.actor_id)
+            target = await self.targets.resolve_message(
+                message_id,
+                command.actor_id,
+                authorization,
+            )
+            if action in {ChatAction.EDIT, ChatAction.RECALL}:
+                self._require_owned_message(target, command.actor_id)
         else:
             target = await self.targets.resolve_stream(
-                str(command.target["stream_id"]), command.actor_id
+                str(command.target["stream_id"]),
+                command.actor_id,
+                authorization,
+            )
+        payload: Mapping[str, Any] = command.payload
+        if action is ChatAction.FORWARD:
+            payload = await self._forward_payload(
+                command,
+                authorization,
+                target.platform,
             )
         facade = self.providers.get(target.platform)
         if not facade.capabilities().get(action, False):
             raise CapabilityError(
                 f"provider {target.platform!r} does not support {action.value!r}"
             )
-        result = await facade.perform(action, target=target, payload=command.payload)
+        result = await facade.perform(action, target=target, payload=payload)
         return CommandOutcome(status=CommandStatus.SUCCEEDED, result=dict(result or {}))
+
+    async def _forward_payload(
+        self,
+        command: CommandRecord,
+        authorization: Mapping[str, Any],
+        destination_platform: str,
+    ) -> Mapping[str, Any]:
+        message_ids = command.payload.get("message_ids")
+        if not isinstance(message_ids, list):
+            raise TypeError("message_ids must be a list")
+        provider_ids: list[str] = []
+        for message_id in message_ids:
+            source = await self.targets.resolve_message(
+                str(message_id),
+                command.actor_id,
+                authorization,
+            )
+            if source.platform != destination_platform:
+                raise CapabilityError("cross-provider forward is not supported")
+            if not source.provider_message_id:
+                raise CapabilityError("source message has no provider identity")
+            provider_ids.append(source.provider_message_id)
+        return {**command.payload, "message_ids": provider_ids}
+
+    @staticmethod
+    def _require_owned_message(target: ChatTarget, actor_id: str) -> None:
+        if (
+            target.message_direction != "delivered"
+            or target.message_actor_id != actor_id
+        ):
+            raise ChatTargetResolutionFailure("message_not_owned")
+
+    @staticmethod
+    def _authorization(command: CommandRecord) -> Mapping[str, Any]:
+        value = command.payload.get("_authorization")
+        if not isinstance(value, Mapping):
+            raise TypeError("command authorization snapshot is missing")
+        return value
 
 
 def _parts_from_payload(payload: Mapping[str, Any]) -> tuple[MessagePart, ...]:
@@ -302,7 +403,7 @@ def create_chat_command_router(
 ) -> APIRouter:
     """Create public domain routes backed by the durable command ledger."""
 
-    router = APIRouter(prefix="/chat")
+    router = APIRouter()
 
     async def accept(
         *,
@@ -328,6 +429,11 @@ def create_chat_command_router(
             correlation_id=None,
             expected_revision=None,
         )
+        authorization = {
+            "session_id": session.session_id,
+            "resource_grants": sorted(set(session.resource_grants)),
+        }
+        stored_payload = {**payload, "_authorization": authorization}
         try:
             command, created = await asyncio.to_thread(
                 store.accept,
@@ -339,7 +445,7 @@ def create_chat_command_router(
                 caller_role=session.role,
                 scopes=session.scopes,
                 target=target,
-                payload=payload,
+                payload=stored_payload,
             )
         except IdempotencyConflict as exc:
             raise APIError(
@@ -359,59 +465,296 @@ def create_chat_command_router(
         return session
 
     async def moderate_session(
-        session: SessionRecord = Depends(require_scope("chat:moderate")),
+        session: SessionRecord = Depends(require_scope("chat:admin", "chat:moderate")),
     ) -> SessionRecord:
+        if session.role not in {"administrator", "platform_service"}:
+            raise APIError(
+                "role_required",
+                "该聊天管理操作需要管理员或受信平台服务身份。",
+                status_code=403,
+            )
         return session
 
-    @router.post("/messages:send", response_model=ChatCommandAccepted, status_code=202, operation_id="sendChatMessage", responses=ERROR_RESPONSES)
-    async def send_message(body: ChatSendRequest, response: Response, session: SessionRecord = Depends(write_session), key: str | None = Header(default=None, alias="Idempotency-Key")) -> ChatCommandAccepted:
+    @router.post(
+        "/chat/messages:send",
+        response_model=ChatCommandAccepted,
+        status_code=202,
+        operation_id="sendChatMessage",
+        responses=ERROR_RESPONSES,
+    )
+    async def send_message(
+        body: ChatSendRequest,
+        response: Response,
+        session: SessionRecord = Depends(write_session),
+        key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> ChatCommandAccepted:
         data = body.model_dump(mode="json", exclude={"schema_version"})
-        return await accept(action=ChatAction.SEND, target={"stream_id": body.stream_id}, payload=data, session=session, key=key, response=response)
+        return await accept(
+            action=ChatAction.SEND,
+            target={"stream_id": body.stream_id},
+            payload=data,
+            session=session,
+            key=key,
+            response=response,
+        )
 
-    @router.post("/messages/{message_id}:reply", response_model=ChatCommandAccepted, status_code=202, operation_id="replyChatMessage", responses=ERROR_RESPONSES)
-    async def reply_message(message_id: str, body: ChatReplyRequest, response: Response, session: SessionRecord = Depends(write_session), key: str | None = Header(default=None, alias="Idempotency-Key")) -> ChatCommandAccepted:
-        return await accept(action=ChatAction.REPLY, target={"message_id": message_id}, payload=body.model_dump(mode="json", exclude={"schema_version"}), session=session, key=key, response=response)
+    @router.post(
+        "/chat/messages/{message_id}:reply",
+        response_model=ChatCommandAccepted,
+        status_code=202,
+        operation_id="replyChatMessage",
+        responses=ERROR_RESPONSES,
+    )
+    async def reply_message(
+        message_id: str,
+        body: ChatReplyRequest,
+        response: Response,
+        session: SessionRecord = Depends(write_session),
+        key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> ChatCommandAccepted:
+        return await accept(
+            action=ChatAction.REPLY,
+            target={"message_id": message_id},
+            payload=body.model_dump(mode="json", exclude={"schema_version"}),
+            session=session,
+            key=key,
+            response=response,
+        )
 
-    @router.post("/messages/{message_id}:edit", response_model=ChatCommandAccepted, status_code=202, operation_id="editChatMessage", responses=ERROR_RESPONSES)
-    async def edit_message(message_id: str, body: ChatEditRequest, response: Response, session: SessionRecord = Depends(write_session), key: str | None = Header(default=None, alias="Idempotency-Key")) -> ChatCommandAccepted:
-        return await accept(action=ChatAction.EDIT, target={"message_id": message_id}, payload=body.model_dump(mode="json", exclude={"schema_version"}), session=session, key=key, response=response)
+    @router.post(
+        "/chat/messages/{message_id}:edit",
+        response_model=ChatCommandAccepted,
+        status_code=202,
+        operation_id="editChatMessage",
+        responses=ERROR_RESPONSES,
+    )
+    async def edit_message(
+        message_id: str,
+        body: ChatEditRequest,
+        response: Response,
+        session: SessionRecord = Depends(write_session),
+        key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> ChatCommandAccepted:
+        return await accept(
+            action=ChatAction.EDIT,
+            target={"message_id": message_id},
+            payload=body.model_dump(mode="json", exclude={"schema_version"}),
+            session=session,
+            key=key,
+            response=response,
+        )
 
-    @router.post("/messages/{message_id}:recall", response_model=ChatCommandAccepted, status_code=202, operation_id="recallChatMessage", responses=ERROR_RESPONSES)
-    async def recall_message(message_id: str, response: Response, session: SessionRecord = Depends(write_session), key: str | None = Header(default=None, alias="Idempotency-Key")) -> ChatCommandAccepted:
-        return await accept(action=ChatAction.RECALL, target={"message_id": message_id}, payload={}, session=session, key=key, response=response)
+    @router.post(
+        "/chat/messages/{message_id}:recall",
+        response_model=ChatCommandAccepted,
+        status_code=202,
+        operation_id="recallChatMessage",
+        responses=ERROR_RESPONSES,
+    )
+    async def recall_message(
+        message_id: str,
+        response: Response,
+        session: SessionRecord = Depends(write_session),
+        key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> ChatCommandAccepted:
+        return await accept(
+            action=ChatAction.RECALL,
+            target={"message_id": message_id},
+            payload={},
+            session=session,
+            key=key,
+            response=response,
+        )
 
-    @router.post("/messages/{message_id}/reactions", response_model=ChatCommandAccepted, status_code=202, operation_id="addChatReaction", responses=ERROR_RESPONSES)
-    async def add_reaction(message_id: str, body: ChatReactionRequest, response: Response, session: SessionRecord = Depends(write_session), key: str | None = Header(default=None, alias="Idempotency-Key")) -> ChatCommandAccepted:
-        return await accept(action=ChatAction.REACTION_ADD, target={"message_id": message_id}, payload={"reaction": body.reaction}, session=session, key=key, response=response)
+    @router.post(
+        "/chat/messages/{message_id}/reactions",
+        response_model=ChatCommandAccepted,
+        status_code=202,
+        operation_id="addChatReaction",
+        responses=ERROR_RESPONSES,
+    )
+    async def add_reaction(
+        message_id: str,
+        body: ChatReactionRequest,
+        response: Response,
+        session: SessionRecord = Depends(write_session),
+        key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> ChatCommandAccepted:
+        return await accept(
+            action=ChatAction.REACTION_ADD,
+            target={"message_id": message_id},
+            payload={"reaction": body.reaction},
+            session=session,
+            key=key,
+            response=response,
+        )
 
-    @router.delete("/messages/{message_id}/reactions/{reaction}", response_model=ChatCommandAccepted, status_code=202, operation_id="removeChatReaction", responses=ERROR_RESPONSES)
-    async def remove_reaction(message_id: str, reaction: str, response: Response, session: SessionRecord = Depends(write_session), key: str | None = Header(default=None, alias="Idempotency-Key")) -> ChatCommandAccepted:
-        return await accept(action=ChatAction.REACTION_REMOVE, target={"message_id": message_id}, payload={"reaction": reaction}, session=session, key=key, response=response)
+    @router.delete(
+        "/chat/messages/{message_id}/reactions/{reaction}",
+        response_model=ChatCommandAccepted,
+        status_code=202,
+        operation_id="removeChatReaction",
+        responses=ERROR_RESPONSES,
+    )
+    async def remove_reaction(
+        message_id: str,
+        reaction: str,
+        response: Response,
+        session: SessionRecord = Depends(write_session),
+        key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> ChatCommandAccepted:
+        return await accept(
+            action=ChatAction.REACTION_REMOVE,
+            target={"message_id": message_id},
+            payload={"reaction": reaction},
+            session=session,
+            key=key,
+            response=response,
+        )
 
-    @router.post("/messages/{message_id}:mark-read", response_model=ChatCommandAccepted, status_code=202, operation_id="markChatMessageRead", responses=ERROR_RESPONSES)
-    async def mark_read(message_id: str, response: Response, session: SessionRecord = Depends(write_session), key: str | None = Header(default=None, alias="Idempotency-Key")) -> ChatCommandAccepted:
-        return await accept(action=ChatAction.MARK_READ, target={"message_id": message_id}, payload={}, session=session, key=key, response=response)
+    @router.post(
+        "/chat/messages/{message_id}:mark-read",
+        response_model=ChatCommandAccepted,
+        status_code=202,
+        operation_id="markChatMessageRead",
+        responses=ERROR_RESPONSES,
+    )
+    async def mark_read(
+        message_id: str,
+        response: Response,
+        session: SessionRecord = Depends(write_session),
+        key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> ChatCommandAccepted:
+        return await accept(
+            action=ChatAction.MARK_READ,
+            target={"message_id": message_id},
+            payload={},
+            session=session,
+            key=key,
+            response=response,
+        )
 
-    @router.post("/messages:forward", response_model=ChatCommandAccepted, status_code=202, operation_id="forwardChatMessages", responses=ERROR_RESPONSES)
-    async def forward(body: ChatForwardRequest, response: Response, session: SessionRecord = Depends(write_session), key: str | None = Header(default=None, alias="Idempotency-Key")) -> ChatCommandAccepted:
-        return await accept(action=ChatAction.FORWARD, target={"stream_id": body.stream_id}, payload={"message_ids": list(body.message_ids)}, session=session, key=key, response=response)
+    @router.post(
+        "/chat/messages:forward",
+        response_model=ChatCommandAccepted,
+        status_code=202,
+        operation_id="forwardChatMessages",
+        responses=ERROR_RESPONSES,
+    )
+    async def forward(
+        body: ChatForwardRequest,
+        response: Response,
+        session: SessionRecord = Depends(write_session),
+        key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> ChatCommandAccepted:
+        return await accept(
+            action=ChatAction.FORWARD,
+            target={"stream_id": body.stream_id},
+            payload={"message_ids": list(body.message_ids)},
+            session=session,
+            key=key,
+            response=response,
+        )
 
-    @router.post("/streams/{stream_id}/poke", response_model=ChatCommandAccepted, status_code=202, operation_id="pokeChatStream", responses=ERROR_RESPONSES)
-    async def poke(stream_id: str, body: ChatPokeRequest, response: Response, session: SessionRecord = Depends(write_session), key: str | None = Header(default=None, alias="Idempotency-Key")) -> ChatCommandAccepted:
-        return await accept(action=ChatAction.POKE, target={"stream_id": stream_id}, payload={"target_id": body.target_id}, session=session, key=key, response=response)
+    @router.post(
+        "/chat/streams/{stream_id}/poke",
+        response_model=ChatCommandAccepted,
+        status_code=202,
+        operation_id="pokeChatStream",
+        responses=ERROR_RESPONSES,
+    )
+    async def poke(
+        stream_id: str,
+        body: ChatPokeRequest,
+        response: Response,
+        session: SessionRecord = Depends(write_session),
+        key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> ChatCommandAccepted:
+        return await accept(
+            action=ChatAction.POKE,
+            target={"stream_id": stream_id},
+            payload={"target_id": body.target_id},
+            session=session,
+            key=key,
+            response=response,
+        )
 
-    @router.post("/streams/{stream_id}/announcements", response_model=ChatCommandAccepted, status_code=202, operation_id="publishChatAnnouncement", responses=ERROR_RESPONSES)
-    async def announce(stream_id: str, body: ChatAnnouncementRequest, response: Response, session: SessionRecord = Depends(moderate_session), key: str | None = Header(default=None, alias="Idempotency-Key")) -> ChatCommandAccepted:
-        return await accept(action=ChatAction.ANNOUNCEMENT_PUBLISH, target={"stream_id": stream_id}, payload={"content": body.content}, session=session, key=key, response=response)
+    @router.post(
+        "/admin/chat/streams/{stream_id}/announcements",
+        response_model=ChatCommandAccepted,
+        status_code=202,
+        operation_id="publishChatAnnouncement",
+        responses=ERROR_RESPONSES,
+    )
+    async def announce(
+        stream_id: str,
+        body: ChatAnnouncementRequest,
+        response: Response,
+        session: SessionRecord = Depends(moderate_session),
+        key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> ChatCommandAccepted:
+        return await accept(
+            action=ChatAction.ANNOUNCEMENT_PUBLISH,
+            target={"stream_id": stream_id},
+            payload={"content": body.content},
+            session=session,
+            key=key,
+            response=response,
+        )
 
-    @router.delete("/streams/{stream_id}/announcements/{announcement_id}", response_model=ChatCommandAccepted, status_code=202, operation_id="deleteChatAnnouncement", responses=ERROR_RESPONSES)
-    async def delete_announcement(stream_id: str, announcement_id: str, response: Response, session: SessionRecord = Depends(moderate_session), key: str | None = Header(default=None, alias="Idempotency-Key")) -> ChatCommandAccepted:
-        return await accept(action=ChatAction.ANNOUNCEMENT_DELETE, target={"stream_id": stream_id}, payload={"announcement_id": announcement_id}, session=session, key=key, response=response)
+    @router.delete(
+        "/admin/chat/streams/{stream_id}/announcements/{announcement_id}",
+        response_model=ChatCommandAccepted,
+        status_code=202,
+        operation_id="deleteChatAnnouncement",
+        responses=ERROR_RESPONSES,
+    )
+    async def delete_announcement(
+        stream_id: str,
+        announcement_id: str,
+        response: Response,
+        session: SessionRecord = Depends(moderate_session),
+        key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> ChatCommandAccepted:
+        return await accept(
+            action=ChatAction.ANNOUNCEMENT_DELETE,
+            target={"stream_id": stream_id},
+            payload={"announcement_id": announcement_id},
+            session=session,
+            key=key,
+            response=response,
+        )
 
-    for suffix, action, operation in ((":pin", ChatAction.PIN, "pinChatMessage"), (":unpin", ChatAction.UNPIN, "unpinChatMessage")):
-        async def pin_action(message_id: str, response: Response, session: SessionRecord = Depends(moderate_session), key: str | None = Header(default=None, alias="Idempotency-Key"), _action: ChatAction = action) -> ChatCommandAccepted:
-            return await accept(action=_action, target={"message_id": message_id}, payload={}, session=session, key=key, response=response)
-        router.add_api_route(f"/messages/{{message_id}}{suffix}", pin_action, methods=["POST"], response_model=ChatCommandAccepted, status_code=202, operation_id=operation, responses=ERROR_RESPONSES)
+    for suffix, action, operation in (
+        (":pin", ChatAction.PIN, "pinChatMessage"),
+        (":unpin", ChatAction.UNPIN, "unpinChatMessage"),
+    ):
+
+        async def pin_action(
+            message_id: str,
+            response: Response,
+            session: SessionRecord = Depends(moderate_session),
+            key: str | None = Header(default=None, alias="Idempotency-Key"),
+            _action: ChatAction = action,
+        ) -> ChatCommandAccepted:
+            return await accept(
+                action=_action,
+                target={"message_id": message_id},
+                payload={},
+                session=session,
+                key=key,
+                response=response,
+            )
+
+        router.add_api_route(
+            f"/admin/chat/messages/{{message_id}}{suffix}",
+            pin_action,
+            methods=["POST"],
+            response_model=ChatCommandAccepted,
+            status_code=202,
+            operation_id=operation,
+            responses=ERROR_RESPONSES,
+        )
 
     return router
 
@@ -421,6 +764,7 @@ __all__ = [
     "ChatAction",
     "ChatCommandService",
     "ChatTarget",
+    "ChatTargetResolver",
     "DeliveryUnknownError",
     "ManagedMediaResolver",
     "PlatformChatFacade",

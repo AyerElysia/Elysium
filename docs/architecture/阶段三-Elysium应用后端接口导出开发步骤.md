@@ -1275,6 +1275,12 @@ Provider 边界必须如实保留：NapCat notice 已覆盖撤回、回应、戳
 
 ### P3-06：聊天命令与平台 capability
 
+> **实施状态（2026-08-04）：已完成离线合同与生产组装。** 已将 13 个聊天副作用动作接入 P3-04 耐久命令账本：普通路由覆盖 send、reply、edit、recall、reaction add/remove、mark read、forward、poke，管理路由覆盖 announcement publish/delete、pin/unpin。公共请求只接受严格 `MessagePart`；媒体 part 仅允许 `media_id`，禁止 path、URL、base64、裸 bytes 与 `data`。文本发送通过 `MessageSender`，reply 和 forward 会先由 P3-05 Life Event ledger 把公共 message ID 解析为 Provider identity；edit/recall 只允许 actor 自己已投递的消息。Feishu/NapCat 私有 client 已封装于显式 capability facade，Provider 不支持、未加载或 P3-07 media resolver 未接入时统一返回 `capability_disabled`，不退化为文本。
+>
+> 每个 durable command 在受理时保存内部 session/resource grant 授权快照，但公共幂等 hash 不含 session ID，响应也不暴露快照；执行时重新读取当前 session、credential、到期/撤销状态、resource grants 与目标可见性，权限缩减或目标不可见均拒绝。管理路由位于 `/api/v1/admin/chat/...`，同时要求 `chat:admin`、`chat:moderate` 和 `administrator`／`platform_service` 身份；普通用户即使持有相同 scope 也被拒绝。生产 Bot 已通过 late-bound client 接入，避免 API mount 早于插件加载时静态捕获空 Adapter。
+>
+> 本轮实际验证：`test/api/v1` 84 项、MessageSender 与聊天事件 22 项、飞书 Adapter 36 项、NapCat Adapter 41 项全部通过；P3-06 定向拆分为 20、9、10、20 项均通过，Ruff、compileall 与 `git diff --check` 通过。未启动或重启 Elysium，未完成真实前端／Provider 端到端验收；P3-07 尚未接入，因此当前真实可用边界是文本发送与 Provider 原生动作，图片、语音等媒体命令必须保持显式禁用。
+
 任务：
 
 1. 实现 message parts → `Message`／`MediaAttachment` 映射。

@@ -8,7 +8,12 @@ from fastapi.testclient import TestClient
 
 from plugins.life_engine.service.event_bus import LifeEvent, RawEventStore
 from src.app.api.v1.auth_store import AuthStore, SessionRecord
-from src.app.api.v1.chat import ChatQueryFailure, ChatQueryService
+from src.app.api.v1.chat import (
+    ChatQueryFailure,
+    ChatQueryService,
+    ChatTargetResolutionFailure,
+    LedgerChatTargetResolver,
+)
 from src.app.api.v1.policy import PLATFORM_SERVICE_AUDIENCE
 from src.app.api.v1.runtime import APIContext, create_api_app
 from src.app.api.v1.tokens import SignedValueCodec
@@ -45,8 +50,11 @@ def _chat_event(
     reply_to: str | None = None,
     attachments: list[dict] | None = None,
     provider_receipt: dict | None = None,
+    provider_identity: dict | None = None,
 ) -> LifeEvent:
-    direction = "delivered" if event_type.startswith("chat.message.delivery") else "received"
+    direction = (
+        "delivered" if event_type.startswith("chat.message.delivery") else "received"
+    )
     metadata = {
         "actor_id": actor_id,
         "visibility": {"scope": "private", "audience": []},
@@ -62,7 +70,8 @@ def _chat_event(
             "parts": [{"type": "text", "text": f"content-{message_id}"}],
             "attachments": attachments or [],
         },
-        "provider_identity": {
+        "provider_identity": provider_identity
+        or {
             "provider": provider,
             "message_id": f"raw-{message_id}",
         },
@@ -117,7 +126,10 @@ async def test_message_query_cursor_scans_hidden_events_without_leaking(
     assert [item.message_id for item in page.messages] == ["visible-message"]
     assert page.scanned_count == 2
     assert not page.has_more
-    assert codec.decode_cursor(page.next_cursor, ledger="chat-events-v1") == visible.sequence
+    assert (
+        codec.decode_cursor(page.next_cursor, ledger="chat-events-v1")
+        == visible.sequence
+    )
     assert hidden.event_id not in page.model_dump_json()
 
 
@@ -209,7 +221,9 @@ async def test_receipt_requires_visible_message_and_keeps_provider_receipt(
 
 
 @pytest.mark.asyncio
-async def test_duplicate_message_id_requires_resource_disambiguation(tmp_path: Path) -> None:
+async def test_duplicate_message_id_requires_resource_disambiguation(
+    tmp_path: Path,
+) -> None:
     store = RawEventStore(tmp_path / "life")
     await store.append(
         _chat_event(
@@ -244,6 +258,204 @@ async def test_duplicate_message_id_requires_resource_disambiguation(tmp_path: P
         stream_id="qq:group:100",
     )
     assert selected.provider == "qq"
+
+
+@pytest.mark.asyncio
+async def test_command_target_resolver_uses_current_session_and_provider_identity(
+    tmp_path: Path,
+) -> None:
+    store = RawEventStore(tmp_path / "life")
+    await store.append(
+        _chat_event(
+            "target",
+            message_id="message-1",
+            stream_id="qq:group:100",
+            provider="qq",
+            chat_type="group",
+            actor_id="actor-1",
+            provider_identity={
+                "provider": "qq",
+                "adapter_signature": "qq:adapter",
+                "raw_message_id": "9001",
+                "group_id": "100",
+            },
+        )
+    )
+    auth = AuthStore(tmp_path / "auth.sqlite3", installation_id="chat-target")
+    codec = SignedValueCodec("t" * 48)
+    credential_id = auth.add_credential(
+        actor_id="actor-1",
+        audience=PLATFORM_SERVICE_AUDIENCE,
+        role="platform_service",
+        secret="chat-target-service-secret-long-enough",
+        scopes=("chat:read", "chat:write"),
+        resource_grants=("stream:qq:group:100",),
+    )
+    session, _, _ = auth.issue_session_from_credential(
+        credential="chat-target-service-secret-long-enough",
+        audience=PLATFORM_SERVICE_AUDIENCE,
+        codec=codec,
+        access_ttl=timedelta(minutes=5),
+        refresh_ttl=timedelta(hours=1),
+    )
+    resolver = LedgerChatTargetResolver(
+        queries=ChatQueryService(codec=codec, store_provider=lambda: store),
+        auth_store=auth,
+    )
+    authorization = {
+        "session_id": session.session_id,
+        "resource_grants": list(session.resource_grants),
+    }
+    try:
+        target = await resolver.resolve_message("message-1", "actor-1", authorization)
+        assert target.adapter_signature == "qq:adapter"
+        assert target.provider_message_id == "9001"
+        assert target.provider_target == {"group_id": "100"}
+        assert target.message_direction == "received"
+        assert target.message_actor_id == "actor-1"
+
+        auth.revoke_session(session.session_id)
+        with pytest.raises(ChatTargetResolutionFailure):
+            await resolver.resolve_message("message-1", "actor-1", authorization)
+
+        replacement, _, _ = auth.issue_session_from_credential(
+            credential="chat-target-service-secret-long-enough",
+            audience=PLATFORM_SERVICE_AUDIENCE,
+            codec=codec,
+            access_ttl=timedelta(minutes=5),
+            refresh_ttl=timedelta(hours=1),
+        )
+        replacement_authorization = {
+            "session_id": replacement.session_id,
+            "resource_grants": list(replacement.resource_grants),
+        }
+        auth.revoke_credential(credential_id)
+        with pytest.raises(ChatTargetResolutionFailure):
+            await resolver.resolve_message(
+                "message-1",
+                "actor-1",
+                replacement_authorization,
+            )
+    finally:
+        auth.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_state", ["expired", "grants_reduced"])
+async def test_command_target_resolver_rejects_expired_or_reduced_authorization(
+    tmp_path: Path,
+    invalid_state: str,
+) -> None:
+    store = RawEventStore(tmp_path / "life")
+    await store.append(
+        _chat_event(
+            "authorization-target",
+            message_id="message-1",
+            stream_id="qq:group:100",
+            provider="qq",
+            chat_type="group",
+            actor_id="actor-1",
+            provider_identity={
+                "provider": "qq",
+                "adapter_signature": "qq:adapter",
+                "raw_message_id": "9001",
+                "group_id": "100",
+            },
+        )
+    )
+    auth = AuthStore(tmp_path / "auth.sqlite3", installation_id="chat-target")
+    codec = SignedValueCodec("v" * 48)
+    auth.add_credential(
+        actor_id="actor-1",
+        audience=PLATFORM_SERVICE_AUDIENCE,
+        role="platform_service",
+        secret="authorization-state-secret-long-enough",
+        scopes=("chat:read", "chat:write"),
+        resource_grants=("stream:qq:group:100",),
+    )
+    session, _, _ = auth.issue_session_from_credential(
+        credential="authorization-state-secret-long-enough",
+        audience=PLATFORM_SERVICE_AUDIENCE,
+        codec=codec,
+        access_ttl=timedelta(minutes=5),
+        refresh_ttl=timedelta(hours=1),
+    )
+    authorization = {
+        "session_id": session.session_id,
+        "resource_grants": list(session.resource_grants),
+    }
+    if invalid_state == "expired":
+        auth._connection.execute(
+            "UPDATE api_sessions SET access_expires_at = ? WHERE session_id = ?",
+            ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), session.session_id),
+        )
+    else:
+        auth._connection.execute(
+            "UPDATE api_sessions SET resource_grants_json = ? WHERE session_id = ?",
+            ("[]", session.session_id),
+        )
+    auth._connection.commit()
+    resolver = LedgerChatTargetResolver(
+        queries=ChatQueryService(codec=codec, store_provider=lambda: store),
+        auth_store=auth,
+    )
+    try:
+        with pytest.raises(ChatTargetResolutionFailure):
+            await resolver.resolve_message("message-1", "actor-1", authorization)
+    finally:
+        auth.close()
+
+
+@pytest.mark.asyncio
+async def test_command_target_resolver_hides_ambiguous_and_hidden_resources(
+    tmp_path: Path,
+) -> None:
+    store = RawEventStore(tmp_path / "life")
+    for provider, stream_id in (
+        ("feishu", "feishu:private:one"),
+        ("qq", "qq:group:100"),
+    ):
+        await store.append(
+            _chat_event(
+                f"duplicate-{provider}",
+                message_id="duplicate",
+                stream_id=stream_id,
+                provider=provider,
+                chat_type="group" if provider == "qq" else "private",
+            )
+        )
+    auth = AuthStore(tmp_path / "auth.sqlite3", installation_id="chat-target")
+    codec = SignedValueCodec("u" * 48)
+    auth.add_credential(
+        actor_id="reader",
+        audience=PLATFORM_SERVICE_AUDIENCE,
+        role="platform_service",
+        secret="chat-target-reader-secret-long-enough",
+        scopes=("chat:read", "chat:write"),
+        resource_grants=("chat:*",),
+    )
+    session, _, _ = auth.issue_session_from_credential(
+        credential="chat-target-reader-secret-long-enough",
+        audience=PLATFORM_SERVICE_AUDIENCE,
+        codec=codec,
+        access_ttl=timedelta(minutes=5),
+        refresh_ttl=timedelta(hours=1),
+    )
+    resolver = LedgerChatTargetResolver(
+        queries=ChatQueryService(codec=codec, store_provider=lambda: store),
+        auth_store=auth,
+    )
+    authorization = {
+        "session_id": session.session_id,
+        "resource_grants": list(session.resource_grants),
+    }
+    try:
+        with pytest.raises(ChatTargetResolutionFailure):
+            await resolver.resolve_message("duplicate", "reader", authorization)
+        with pytest.raises(ChatTargetResolutionFailure):
+            await resolver.resolve_stream("missing", "reader", authorization)
+    finally:
+        auth.close()
 
 
 def test_chat_http_scope_resource_hiding_and_openapi(tmp_path: Path) -> None:

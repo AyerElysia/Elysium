@@ -314,7 +314,9 @@ class AuthStore:
         """为受信本机启动器生成一次性 challenge。"""
 
         if audience == PLATFORM_SERVICE_AUDIENCE:
-            raise ValueError("bootstrap challenge cannot issue platform service sessions")
+            raise ValueError(
+                "bootstrap challenge cannot issue platform service sessions"
+            )
         if not origin.strip():
             raise ValueError("bootstrap challenge requires origin")
         normalized = self._normalize_scopes(scopes)
@@ -399,6 +401,23 @@ class AuthStore:
                 raise ValueError("access_expired")
             if not allow_revoked:
                 self._require_active_credential(row["credential_id"])
+            return self._row_to_session(row)
+
+    def get_active_session(self, session_id: str) -> SessionRecord:
+        """Read current session state and enforce revocation, expiry, and credential state."""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM api_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("session_invalid")
+            if row["revoked_at"] is not None:
+                raise ValueError("session_revoked")
+            if self._parse_time(row["access_expires_at"]) <= self._now():
+                raise ValueError("access_expired")
+            self._require_active_credential(row["credential_id"])
             return self._row_to_session(row)
 
     def revoke_session(self, session_id: str) -> bool:
@@ -680,7 +699,9 @@ class AuthStore:
             resource_grants=self._decode_values(row["resource_grants_json"]),
             access_expires_at=self._parse_time(row["access_expires_at"]),
             refresh_expires_at=self._parse_time(row["refresh_expires_at"]),
-            revoked_at=(self._parse_time(row["revoked_at"]) if row["revoked_at"] else None),
+            revoked_at=(
+                self._parse_time(row["revoked_at"]) if row["revoked_at"] else None
+            ),
             credential_id=row["credential_id"],
         )
 

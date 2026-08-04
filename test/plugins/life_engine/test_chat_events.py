@@ -103,9 +103,12 @@ def test_send_requested_fact_never_claims_delivery_success() -> None:
 
 
 def test_delivery_fact_requires_delivered_direction_and_keeps_receipt() -> None:
-    event = build_chat_message_event(_message(), direction="delivered")
+    message = _message()
+    message.extra["api_actor_id"] = "api-actor-1"
+    event = build_chat_message_event(message, direction="delivered")
 
     assert event.event_type == "chat.message.delivery_confirmed"
+    assert event.metadata["actor_id"] == "api-actor-1"
     assert event.metadata["provider_receipt"]["message_id"] == "provider-msg-1"
 
 

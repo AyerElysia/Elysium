@@ -11,9 +11,7 @@ PLAN_PATH = ROOT / "docs" / "architecture" / "阶段三-Elysium应用后端接�
 TABLE_ROUTE_PATTERN = re.compile(
     r"\|\s*(GET|POST|PUT|PATCH|DELETE|WS)\s*\|\s*`(/api/v1[^` ]*)`"
 )
-BULLET_ROUTE_PATTERN = re.compile(
-    r"`(GET|POST|PUT|PATCH|DELETE|WS)\s+(/api/v1/[^`]+)`"
-)
+BULLET_ROUTE_PATTERN = re.compile(r"`(GET|POST|PUT|PATCH|DELETE|WS)\s+(/api/v1/[^`]+)`")
 
 
 def _documented_routes() -> set[tuple[str, str]]:
@@ -35,13 +33,20 @@ def test_inventory_keys_are_unique_and_complete() -> None:
     assert len(API_INVENTORY_BY_KEY) == len(API_INVENTORY)
     for contract in API_INVENTORY:
         assert contract.method in {"GET", "POST", "PUT", "PATCH", "DELETE", "WS"}
-        assert contract.path.startswith("/api/v1/") or contract.path == "/api/v1/bootstrap"
+        assert (
+            contract.path.startswith("/api/v1/") or contract.path == "/api/v1/bootstrap"
+        )
         assert contract.frontend_pages
         assert contract.caller_identities
         assert contract.scopes
         assert contract.resource_authorization.strip()
         assert contract.implementation_anchor.strip()
-        assert contract.status in {"planned", "experimental", "implemented", "validated"}
+        assert contract.status in {
+            "planned",
+            "experimental",
+            "implemented",
+            "validated",
+        }
 
 
 def test_p3_03_event_contracts_use_sse_without_unneeded_websocket() -> None:
@@ -78,6 +83,29 @@ def test_p3_04_command_contracts_are_validated() -> None:
     assert {API_INVENTORY_BY_KEY[key].status for key in keys} == {"validated"}
 
 
+def test_p3_06_chat_command_contracts_are_validated() -> None:
+    keys = {
+        ("POST", "/api/v1/chat/messages:send"),
+        ("POST", "/api/v1/chat/messages/{id}:reply"),
+        ("POST", "/api/v1/chat/messages/{id}:edit"),
+        ("POST", "/api/v1/chat/messages/{id}:recall"),
+        ("POST", "/api/v1/chat/messages/{id}/reactions"),
+        ("DELETE", "/api/v1/chat/messages/{id}/reactions/{reaction}"),
+        ("POST", "/api/v1/chat/messages/{id}:mark-read"),
+        ("POST", "/api/v1/chat/messages:forward"),
+        ("POST", "/api/v1/chat/streams/{stream_id}/poke"),
+        ("POST", "/api/v1/admin/chat/streams/{stream_id}/announcements"),
+        (
+            "DELETE",
+            "/api/v1/admin/chat/streams/{stream_id}/announcements/{id}",
+        ),
+        ("POST", "/api/v1/admin/chat/messages/{message_id}:pin"),
+        ("POST", "/api/v1/admin/chat/messages/{message_id}:unpin"),
+    }
+
+    assert {API_INVENTORY_BY_KEY[key].status for key in keys} == {"validated"}
+
+
 def test_every_scope_is_declared_by_phase_three_policy() -> None:
     """inventory 不能暗中引入权限矩阵外的 scope。"""
 
@@ -91,7 +119,9 @@ def test_admin_routes_reject_user_frontend_identity_by_contract() -> None:
     """所有管理路由都必须排除普通用户前端身份。"""
 
     admin_routes = [
-        contract for contract in API_INVENTORY if contract.path.startswith("/api/v1/admin/")
+        contract
+        for contract in API_INVENTORY
+        if contract.path.startswith("/api/v1/admin/")
     ]
     assert admin_routes
     assert all(
@@ -104,8 +134,7 @@ def test_platform_service_can_reach_every_exported_contract() -> None:
 
     assert PHASE_THREE_POLICY.platform_service_can_request_all_exported_scopes
     assert all(
-        "platform_service" in contract.caller_identities
-        for contract in API_INVENTORY
+        "platform_service" in contract.caller_identities for contract in API_INVENTORY
     )
 
 

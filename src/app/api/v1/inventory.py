@@ -200,7 +200,8 @@ POST /api/v1/chat/streams/{stream_id}/poke
         callers=_ALL_CALLERS,
         scopes=("chat:read", "chat:write"),
         resource_authorization="校验 stream 参与者、消息可见性、actor 所有权与 provider capability",
-        anchor="src/app/plugin_system/api/send_api.py 与 MessageSender；P3-06 实现 chat command facade",
+        anchor="src/app/api/v1/chat_commands.py、chat_runtime.py 与 MessageSender",
+        status="validated",
     ),
     *_contracts(
         """
@@ -299,7 +300,14 @@ POST /api/v1/admin/sync:retry
         domain="admin_system",
         pages=("系统总览", "模块健康", "同步与积压", "安全审计"),
         callers=_ADMIN_CALLERS,
-        scopes=("admin:overview", "admin:audit", "admin:logs", "sync:read", "sync:retry", "metrics:read"),
+        scopes=(
+            "admin:overview",
+            "admin:audit",
+            "admin:logs",
+            "sync:read",
+            "sync:retry",
+            "metrics:read",
+        ),
         resource_authorization="要求全能管理员或 platform service；查询只读脱敏，重试不得跳游标",
         anchor="组件管理器、src/kernel/sync/ 与受管日志投影；需新增 admin query facade",
     ),
@@ -366,10 +374,6 @@ POST /api/v1/admin/chat/streams/{stream_id}/members/{member_id}:set-role
 POST /api/v1/admin/chat/requests/{request_id}:approve
 POST /api/v1/admin/chat/requests/{request_id}:reject
 POST /api/v1/admin/chat/messages/{message_id}:recall
-POST /api/v1/admin/chat/streams/{stream_id}/announcements
-DELETE /api/v1/admin/chat/streams/{stream_id}/announcements/{id}
-POST /api/v1/admin/chat/messages/{message_id}:pin
-POST /api/v1/admin/chat/messages/{message_id}:unpin
 """,
         domain="admin_chat",
         pages=("消息管理", "群组与成员", "公告与申请"),
@@ -377,6 +381,21 @@ POST /api/v1/admin/chat/messages/{message_id}:unpin
         scopes=("chat:admin", "chat:moderate"),
         resource_authorization="要求全能管理员，同时校验 provider capability、平台硬权限、目标与 revision",
         anchor="NapCat client、plugins/feishu_adapter/actions.py；需封装 allowlist chat admin facade",
+    ),
+    *_contracts(
+        """
+POST /api/v1/admin/chat/streams/{stream_id}/announcements
+DELETE /api/v1/admin/chat/streams/{stream_id}/announcements/{id}
+POST /api/v1/admin/chat/messages/{message_id}:pin
+POST /api/v1/admin/chat/messages/{message_id}:unpin
+""",
+        domain="admin_chat",
+        pages=("消息管理", "公告与申请"),
+        callers=_ADMIN_CALLERS,
+        scopes=("chat:admin", "chat:moderate"),
+        resource_authorization="要求全能管理员，同时重新校验 stream 或 message 可见性及 provider capability",
+        anchor="src/app/api/v1/chat_commands.py、chat_runtime.py 与 provider facade",
+        status="validated",
     ),
     *_contracts(
         """
@@ -477,7 +496,11 @@ POST /api/v1/admin/commitments/schedules/{record_id}:resume
         domain="admin_commitments",
         pages=("TODO 与承诺", "定时计划"),
         callers=_ADMIN_CALLERS,
-        scopes=("commitments:read", "commitments:operate_schedule", "commitments:suggest"),
+        scopes=(
+            "commitments:read",
+            "commitments:operate_schedule",
+            "commitments:suggest",
+        ),
         resource_authorization="要求全能管理员；建议留在主体权威外，pause／resume 只控制技术执行",
         anchor="plugins/life_engine/tools/todo_tools.py 与 schedule_tools.py；需新增只读 facade",
     ),

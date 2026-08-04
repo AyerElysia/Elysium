@@ -68,7 +68,8 @@ def build_chat_message_event(
         json.dumps(stable_identity, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     actor_id = str(
-        message.sender_id
+        extra.get("api_actor_id")
+        or message.sender_id
         or ("bot" if direction in {"requested", "delivered"} else "unknown")
     )
     metadata: dict[str, Any] = {
@@ -111,7 +112,9 @@ def build_chat_message_event(
         metadata=metadata,
         occurrence_id=f"chat:{digest}",
         source_instance_id=str(extra.get("consciousness_instance_id") or "chat_global"),
-        correlation_id=str(extra.get("correlation_id") or extra.get("episode_id") or ""),
+        correlation_id=str(
+            extra.get("correlation_id") or extra.get("episode_id") or ""
+        ),
         causation_id=str(extra.get("causation_id") or ""),
         content_ref=str(extra.get("content_ref") or ""),
     )
@@ -154,7 +157,9 @@ def _chat_payload(
         "direction": direction,
         "platform": str(message.platform or ""),
         "chat_type": str(message.chat_type or ""),
-        "message_type": getattr(message.message_type, "value", str(message.message_type)),
+        "message_type": getattr(
+            message.message_type, "value", str(message.message_type)
+        ),
         "sender": {
             "id": str(message.sender_id or ""),
             "name": str(message.sender_name or ""),
@@ -165,7 +170,9 @@ def _chat_payload(
         "parts": _parts(message),
         "attachments": [item.to_descriptor() for item in message.attachments],
     }
-    provider_kind = str(extra.get("notice_type") or extra.get("provider_notice_kind") or "")
+    provider_kind = str(
+        extra.get("notice_type") or extra.get("provider_notice_kind") or ""
+    )
     if provider_kind:
         payload["provider_kind"] = provider_kind
     for key in (
@@ -312,9 +319,7 @@ def build_chat_provider_notice_event(
     actor_id = str(user_info.get("user_id") or extra.get("user_id") or "unknown")
     occurred_at = info.get("time") or extra.get("time") or datetime.now(UTC)
     raw_identity_value = extra.get("provider_raw_identity")
-    raw_identity = (
-        raw_identity_value if isinstance(raw_identity_value, Mapping) else {}
-    )
+    raw_identity = raw_identity_value if isinstance(raw_identity_value, Mapping) else {}
     chat = {
         "message_id": str(info.get("message_id") or f"notice_{digest}"),
         "stream_id": stream_id,

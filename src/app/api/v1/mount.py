@@ -16,7 +16,7 @@ from src.kernel.commands import CommandDispatcher, CommandStore, HandlerRegistry
 from src.kernel.concurrency import TaskManager
 
 from .auth_store import AuthStore
-from .chat import ChatQueryService
+from .chat import ChatQueryService, LedgerChatTargetResolver
 from .events import EventQueryService
 from .foundation import FoundationProjection
 from .runtime import APIContext, create_api_app
@@ -84,6 +84,7 @@ def mount_api_v1(
     event_store_provider: Callable[[], RawEventStore | None] | None = None,
     command_registry: HandlerRegistry | None = None,
     chat_command_service: object | None = None,
+    chat_command_service_factory: Callable[[LedgerChatTargetResolver], object] | None = None,
     task_manager: TaskManager | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> APIV1Mount:
@@ -101,20 +102,33 @@ def mount_api_v1(
     normalized_origins = _validate_origins(allowed_origins)
     auth_path = _resolve_auth_path(workspace_root, database_path)
     store = AuthStore(auth_path, installation_id=installation_id)
-    command_store = CommandStore(auth_path)
-    registry = command_registry or HandlerRegistry()
-    if chat_command_service is not None:
-        register = getattr(chat_command_service, "register", None)
-        if not callable(register):
-            raise TypeError("chat_command_service must provide register(registry)")
-        register(registry)
-    command_dispatcher = CommandDispatcher(
-        command_store,
-        registry=registry,
-        task_manager=task_manager,
-    )
+    command_store: CommandStore | None = None
     try:
+        command_store = CommandStore(auth_path)
         codec = SignedValueCodec(signing_secret)
+        chat_queries = ChatQueryService(
+            codec=codec,
+            store_provider=event_store_provider or (lambda: None),
+        )
+        if chat_command_service is not None and chat_command_service_factory is not None:
+            raise ValueError(
+                "chat command service and factory cannot be configured together"
+            )
+        if chat_command_service_factory is not None:
+            chat_command_service = chat_command_service_factory(
+                LedgerChatTargetResolver(queries=chat_queries, auth_store=store)
+            )
+        registry = command_registry or HandlerRegistry()
+        if chat_command_service is not None:
+            register = getattr(chat_command_service, "register", None)
+            if not callable(register):
+                raise TypeError("chat_command_service must provide register(registry)")
+            register(registry)
+        command_dispatcher = CommandDispatcher(
+            command_store,
+            registry=registry,
+            task_manager=task_manager,
+        )
         context = APIContext(
             store=store,
             codec=codec,
@@ -128,10 +142,7 @@ def mount_api_v1(
                 codec=codec,
                 store_provider=event_store_provider,
             ),
-            chat=ChatQueryService(
-                codec=codec,
-                store_provider=event_store_provider or (lambda: None),
-            ),
+            chat=chat_queries,
             command_store=command_store,
             command_dispatcher=command_dispatcher,
             chat_commands_enabled=chat_command_service is not None,
@@ -153,7 +164,8 @@ def mount_api_v1(
         )
         parent.mount("/api/v1", app, name=MOUNT_NAME)
     except BaseException:
-        command_store.close()
+        if command_store is not None:
+            command_store.close()
         store.close()
         raise
     return APIV1Mount(

@@ -8,14 +8,15 @@ from unittest.mock import AsyncMock
 
 import pytest
 from pydantic import ValidationError
+
 from src.app.api.v1.chat_commands import (
     ChatAction,
     ChatCommandService,
     ChatTarget,
     ProviderFacadeRegistry,
 )
+from src.app.api.v1.chat_runtime import create_chat_command_service
 from src.app.api.v1.schemas.chat_commands import MessagePart
-
 from src.core.models.media import MediaAttachment, MediaSegmentType
 from src.kernel.commands import CommandRecord, CommandStatus, HandlerRegistry
 from src.kernel.llm.payload.media import MediaKind, MediaRef
@@ -33,7 +34,13 @@ def _command(command_type: ChatAction, *, target=None, payload=None) -> CommandR
         caller_role="user",
         scope_snapshot=("chat:write", "chat:moderate"),
         target=target or {"stream_id": "stream-1"},
-        payload=payload or {},
+        payload={
+            **(payload or {}),
+            "_authorization": {
+                "session_id": "session-1",
+                "resource_grants": ["stream:stream-1"],
+            },
+        },
         status=CommandStatus.EXECUTING,
         created_at=now,
         accepted_at=now,
@@ -53,13 +60,32 @@ def _command(command_type: ChatAction, *, target=None, payload=None) -> CommandR
 
 
 class _Targets:
-    async def resolve_stream(self, stream_id: str, actor_id: str) -> ChatTarget:
-        assert actor_id == "actor-1"
+    async def resolve_stream(
+        self,
+        stream_id: str,
+        actor_id: str,
+        authorization,
+    ) -> ChatTarget:
+        assert actor_id == "actor-1" and authorization["session_id"] == "session-1"
         return ChatTarget(stream_id, "feishu", "private", "feishu:adapter")
 
-    async def resolve_message(self, message_id: str, actor_id: str) -> ChatTarget:
+    async def resolve_message(
+        self,
+        message_id: str,
+        actor_id: str,
+        authorization,
+    ) -> ChatTarget:
         assert message_id and actor_id == "actor-1"
-        return ChatTarget("stream-1", "feishu", "private", "feishu:adapter")
+        assert authorization["session_id"] == "session-1"
+        return ChatTarget(
+            "stream-1",
+            "feishu",
+            "private",
+            "feishu:adapter",
+            provider_message_id=f"provider-{message_id}",
+            message_direction="delivered",
+            message_actor_id="actor-1",
+        )
 
 
 class _Provider:
@@ -124,14 +150,52 @@ async def test_text_send_maps_to_message_sender() -> None:
     message = sender.send_message.await_args.args[0]
     assert message.content == "hello"
     assert message.stream_id == "stream-1"
+    assert message.extra["api_actor_id"] == "actor-1"
     assert sender.send_message.await_args.args[1] == "feishu:adapter"
+
+
+@pytest.mark.asyncio
+async def test_reply_and_send_reply_to_use_provider_message_identity() -> None:
+    sender = SimpleNamespace(send_message=AsyncMock(return_value=True))
+    service = ChatCommandService(
+        sender=sender,
+        targets=_Targets(),
+        media=None,
+        providers=ProviderFacadeRegistry({}),
+    )
+    reply = await service.handle(
+        _command(
+            ChatAction.REPLY,
+            target={"message_id": "public-1"},
+            payload={"parts": [{"type": "text", "text": "reply"}]},
+        )
+    )
+    assert reply.status is CommandStatus.SUCCEEDED
+    assert sender.send_message.await_args.args[0].reply_to == "provider-public-1"
+
+    send = await service.handle(
+        _command(
+            ChatAction.SEND,
+            payload={
+                "reply_to": "public-2",
+                "parts": [{"type": "text", "text": "reply"}],
+            },
+        )
+    )
+    assert send.status is CommandStatus.SUCCEEDED
+    assert sender.send_message.await_args.args[0].reply_to == "provider-public-2"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("part_type", "segment_type", "kind", "data"),
     [
-        ("image", MediaSegmentType.IMAGE, MediaKind.IMAGE, b"\x89PNG\r\n\x1a\n" + b"0" * 32),
+        (
+            "image",
+            MediaSegmentType.IMAGE,
+            MediaKind.IMAGE,
+            b"\x89PNG\r\n\x1a\n" + b"0" * 32,
+        ),
         (
             "voice",
             MediaSegmentType.VOICE,
@@ -153,7 +217,10 @@ async def test_managed_media_is_resolved_before_send(
         providers=ProviderFacadeRegistry({}),
     )
     outcome = await service.handle(
-        _command(ChatAction.SEND, payload={"parts": [{"type": part_type, "media_id": "media-1"}]})
+        _command(
+            ChatAction.SEND,
+            payload={"parts": [{"type": part_type, "media_id": "media-1"}]},
+        )
     )
     assert outcome.status is CommandStatus.SUCCEEDED
     media.resolve_ready.assert_awaited_once_with(
@@ -171,7 +238,10 @@ async def test_media_without_p3_07_resolver_is_capability_rejection() -> None:
         providers=ProviderFacadeRegistry({}),
     )
     outcome = await service.handle(
-        _command(ChatAction.SEND, payload={"parts": [{"type": "image", "media_id": "media-1"}]})
+        _command(
+            ChatAction.SEND,
+            payload={"parts": [{"type": "image", "media_id": "media-1"}]},
+        )
     )
     assert outcome.status is CommandStatus.REJECTED
     assert outcome.error_code == "capability_disabled"
@@ -196,7 +266,9 @@ async def test_sender_delivery_results_are_observable() -> None:
         return False
 
     sender.send_message.side_effect = unknown
-    unknown_outcome = await service.handle(_command(ChatAction.SEND, payload=message_payload))
+    unknown_outcome = await service.handle(
+        _command(ChatAction.SEND, payload=message_payload)
+    )
     assert unknown_outcome.status is CommandStatus.DELIVERY_UNKNOWN
     assert unknown_outcome.error_code == "delivery_unknown"
 
@@ -233,3 +305,128 @@ async def test_supported_provider_matrix_is_executable(action: ChatAction) -> No
     outcome = await service.handle(_command(action, payload={"content": "notice"}))
     assert outcome.status is CommandStatus.SUCCEEDED
     assert outcome.result == {"provider_receipt": "receipt-1"}
+
+
+@pytest.mark.asyncio
+async def test_forward_resolves_public_message_ids_to_provider_ids() -> None:
+    provider = _Provider({ChatAction.FORWARD})
+    service = ChatCommandService(
+        sender=SimpleNamespace(send_message=AsyncMock()),
+        targets=_Targets(),
+        media=None,
+        providers=ProviderFacadeRegistry({"feishu": provider}),
+    )
+    outcome = await service.handle(
+        _command(
+            ChatAction.FORWARD,
+            payload={"message_ids": ["public-1"]},
+        )
+    )
+    assert outcome.status is CommandStatus.SUCCEEDED
+    assert provider.perform.await_args.kwargs["payload"]["message_ids"] == [
+        "provider-public-1"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cross_provider_forward_is_rejected_without_provider_call() -> None:
+    class CrossProviderTargets(_Targets):
+        async def resolve_message(self, message_id, actor_id, authorization):
+            return ChatTarget(
+                "qq:group:100",
+                "qq",
+                "group",
+                "qq:adapter",
+                provider_message_id="9001",
+            )
+
+    provider = _Provider({ChatAction.FORWARD})
+    service = ChatCommandService(
+        sender=SimpleNamespace(send_message=AsyncMock()),
+        targets=CrossProviderTargets(),
+        media=None,
+        providers=ProviderFacadeRegistry({"feishu": provider}),
+    )
+    outcome = await service.handle(
+        _command(
+            ChatAction.FORWARD,
+            payload={"message_ids": ["public-1"]},
+        )
+    )
+    assert outcome.status is CommandStatus.REJECTED
+    assert outcome.error_code == "capability_disabled"
+    provider.perform.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform", ["feishu", "qq"])
+async def test_late_bound_unloaded_adapter_is_capability_disabled(
+    platform: str,
+) -> None:
+    class PlatformTargets(_Targets):
+        async def resolve_message(self, message_id, actor_id, authorization):
+            if platform == "qq":
+                return ChatTarget(
+                    "qq:group:100",
+                    "qq",
+                    "group",
+                    "qq:adapter",
+                    provider_message_id="9001",
+                    provider_target={"group_id": "100"},
+                )
+            return await super().resolve_message(message_id, actor_id, authorization)
+
+    class EmptyManager:
+        @staticmethod
+        def get_all_adapters():
+            return {}
+
+    service = create_chat_command_service(
+        PlatformTargets(),
+        message_sender=SimpleNamespace(send_message=AsyncMock()),
+        feishu_provider=lambda: None,
+        adapter_manager_provider=lambda: EmptyManager(),
+    )
+    outcome = await service.handle(
+        _command(
+            ChatAction.REACTION_ADD,
+            target={"message_id": "public-1"},
+            payload={"reaction": "THUMBSUP" if platform == "feishu" else "128077"},
+        )
+    )
+    assert outcome.status is CommandStatus.REJECTED
+    assert outcome.error_code == "capability_disabled"
+
+
+@pytest.mark.asyncio
+async def test_edit_and_recall_require_actor_owned_delivered_message() -> None:
+    class ReceivedTargets(_Targets):
+        async def resolve_message(self, message_id, actor_id, authorization):
+            return ChatTarget(
+                "stream-1",
+                "feishu",
+                "private",
+                "feishu:adapter",
+                provider_message_id="provider-1",
+                message_direction="received",
+                message_actor_id="other",
+            )
+
+    provider = _Provider({ChatAction.EDIT, ChatAction.RECALL})
+    service = ChatCommandService(
+        sender=SimpleNamespace(send_message=AsyncMock()),
+        targets=ReceivedTargets(),
+        media=None,
+        providers=ProviderFacadeRegistry({"feishu": provider}),
+    )
+    for action in (ChatAction.EDIT, ChatAction.RECALL):
+        outcome = await service.handle(
+            _command(
+                action,
+                target={"message_id": "public-1"},
+                payload={"parts": [{"type": "text", "text": "edit"}]},
+            )
+        )
+        assert outcome.status is CommandStatus.REJECTED
+        assert outcome.error_code == "resource_not_found"
+    provider.perform.assert_not_awaited()

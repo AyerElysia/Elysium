@@ -628,6 +628,7 @@ class Bot:
 
             self.http_server = get_http_server(host=host, port=port)
             if self.config.http_router.enable_app_api_v1:
+                from src.app.api.v1.chat_runtime import create_chat_command_service
                 from src.app.api.v1.events import event_store_from_bot
                 from src.app.api.v1.foundation import (
                     FoundationProjection,
@@ -654,6 +655,7 @@ class Bot:
                     ),
                     foundation=foundation,
                     event_store_provider=lambda: event_store_from_bot(self),
+                    chat_command_service_factory=create_chat_command_service,
                     task_manager=self.task_manager,
                 )
                 await self.app_api_mount.start()
