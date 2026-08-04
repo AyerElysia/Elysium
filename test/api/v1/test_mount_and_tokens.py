@@ -125,6 +125,8 @@ def test_cursor_is_opaque_ledger_bound_and_tamper_evident() -> None:
     assert codec.decode_cursor(cursor, ledger="life-events") == 42
     with pytest.raises(SignedValueError, match="cursor_invalid"):
         codec.decode_cursor(cursor, ledger="other-ledger")
-    altered = cursor[:-1] + ("A" if cursor[-1] != "A" else "B")
+    body, signature = cursor.rsplit(".", 1)
+    replacement = "A" if signature[0] != "A" else "B"
+    altered = f"{body}.{replacement}{signature[1:]}"
     with pytest.raises(SignedValueError, match="signature_invalid"):
         codec.decode_cursor(altered, ledger="life-events")
