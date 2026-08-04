@@ -245,7 +245,7 @@ class _FakeConsciousness:
     def __init__(self) -> None:
         self.commits = []
 
-    def prepare_perception(self):
+    async def prepare_perception(self):
         return SimpleNamespace(
             instance_id="livestream_42",
             from_position=11,
@@ -254,7 +254,7 @@ class _FakeConsciousness:
             content="other-instance-is-present",
         )
 
-    def commit_perception_checkpoint(self, checkpoint):
+    async def commit_perception_checkpoint(self, checkpoint):
         self.commits.append(checkpoint)
         return checkpoint.through_position, checkpoint.cursor_revision + 1
 
