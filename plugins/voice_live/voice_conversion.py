@@ -132,6 +132,9 @@ class HttpVoiceConverter:
         self._session_id = ""
         self._input_sample_rate = 0
         self._output_sample_rate = 0
+        self._input_block_bytes = 0
+        self._pending_input = bytearray()
+        self._profile_revision = ""
 
     @property
     def is_connected(self) -> bool:
@@ -144,6 +147,10 @@ class HttpVoiceConverter:
     @property
     def output_sample_rate(self) -> int:
         return self._output_sample_rate
+
+    @property
+    def profile_revision(self) -> str:
+        return self._profile_revision
 
     async def connect(self) -> dict[str, Any]:
         """Validate the profile and allocate one remote conversion session."""
@@ -164,6 +171,14 @@ class HttpVoiceConverter:
                     "voice-conversion profile mismatch: "
                     f"expected {self._profile_id!r}, got {health.get('profile_id')!r}"
                 )
+            if int(health.get("protocol_version") or 0) < 2:
+                raise RuntimeError(
+                    "voice-conversion service protocol is obsolete; "
+                    "restart the traceable Seed-VC service manually"
+                )
+            health_revision = str(health.get("profile_revision") or "")
+            if not health_revision:
+                raise RuntimeError("voice-conversion profile revision is missing")
             async with self._http.post(
                 f"{self._service_url}/v1/sessions",
                 headers=self._headers,
@@ -173,14 +188,24 @@ class HttpVoiceConverter:
             self._session_id = str(created.get("session_id") or "")
             self._input_sample_rate = int(created.get("input_sample_rate") or 0)
             self._output_sample_rate = int(created.get("output_sample_rate") or 0)
+            input_block_samples = int(created.get("input_block_samples") or 0)
+            session_revision = str(created.get("profile_revision") or "")
             if (
                 not self._session_id
                 or self._input_sample_rate <= 0
                 or self._output_sample_rate <= 0
+                or input_block_samples <= 0
             ):
                 raise RuntimeError(
                     f"invalid voice-conversion session response: {created}"
                 )
+            if session_revision != health_revision:
+                raise RuntimeError(
+                    "voice-conversion profile changed while allocating the session"
+                )
+            self._input_block_bytes = input_block_samples * 2
+            self._profile_revision = health_revision
+            self._pending_input.clear()
             return {"health": health, "session": created}
         except Exception:
             await self.close()
@@ -193,18 +218,63 @@ class HttpVoiceConverter:
         converted_input = resample_pcm16_mono(
             pcm16, sample_rate, self._input_sample_rate
         )
-        return await self._audio_request("audio", converted_input)
+        self._pending_input.extend(converted_input)
+        complete_bytes = (
+            len(self._pending_input) // self._input_block_bytes
+        ) * self._input_block_bytes
+        if complete_bytes <= 0:
+            return ConvertedAudio(
+                b"",
+                self._output_sample_rate,
+                {
+                    "block_count": 0,
+                    "inference_ms": 0.0,
+                    "pending_samples": len(self._pending_input) // 2,
+                },
+            )
+        payload = bytes(self._pending_input[:complete_bytes])
+        del self._pending_input[:complete_bytes]
+        converted = await self._audio_request("audio", payload)
+        metrics = dict(converted.metrics)
+        metrics["pending_samples"] = (
+            int(converted.metrics.get("pending_samples", 0))
+            + len(self._pending_input) // 2
+        )
+        return ConvertedAudio(converted.data, converted.sample_rate, metrics)
 
     async def flush(self) -> ConvertedAudio:
         """Convert the remote session's remaining partial block."""
         if not self.is_connected:
             return ConvertedAudio(b"", self._output_sample_rate, {})
-        return await self._audio_request("flush", b"")
+        parts: list[bytes] = []
+        block_count = 0
+        inference_ms = 0.0
+        if self._pending_input:
+            pending = bytes(self._pending_input)
+            self._pending_input.clear()
+            submitted = await self._audio_request("audio", pending)
+            parts.append(submitted.data)
+            block_count += int(submitted.metrics.get("block_count", 0))
+            inference_ms += float(submitted.metrics.get("inference_ms", 0.0))
+        flushed = await self._audio_request("flush", b"")
+        parts.append(flushed.data)
+        block_count += int(flushed.metrics.get("block_count", 0))
+        inference_ms += float(flushed.metrics.get("inference_ms", 0.0))
+        return ConvertedAudio(
+            b"".join(parts),
+            flushed.sample_rate,
+            {
+                "block_count": block_count,
+                "inference_ms": round(inference_ms, 3),
+                "pending_samples": 0,
+            },
+        )
 
     async def reset(self) -> None:
         """Clear remote streaming context after playback interruption."""
         if not self.is_connected or self._http is None:
             return
+        self._pending_input.clear()
         async with self._http.post(
             self._session_url("reset"),
             headers=self._headers,
@@ -219,6 +289,9 @@ class HttpVoiceConverter:
         session_id = self._session_id
         self._http = None
         self._session_id = ""
+        self._input_block_bytes = 0
+        self._pending_input.clear()
+        self._profile_revision = ""
         if http is None:
             return
         if session_id and not http.closed:

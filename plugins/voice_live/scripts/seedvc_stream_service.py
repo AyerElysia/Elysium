@@ -18,12 +18,23 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlsplit
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from plugins.voice_live.seedvc_profile import (
+    InferenceTelemetry,
+    build_profile_manifest,
+    validate_runtime_settings,
+)
 
 os.environ.setdefault("OMP_NUM_THREADS", "4")
 os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
@@ -84,6 +95,8 @@ class SeedVCStream:
         inference_cfg_rate: float,
         max_prompt_length: float,
         silence_db: float,
+        output_gain_db: float,
+        on_inference: Callable[[float], None] | None = None,
     ) -> None:
         self.realtime = realtime
         self.model_set = model_set
@@ -95,6 +108,8 @@ class SeedVCStream:
         self.inference_cfg_rate = inference_cfg_rate
         self.max_prompt_length = max_prompt_length
         self.silence_amplitude = 10.0 ** (silence_db / 20.0)
+        self.output_gain = 10.0 ** (output_gain_db / 20.0)
+        self.on_inference = on_inference
         self.reference_wav, _ = librosa.load(
             str(self.reference_path), sr=self.model_sample_rate, mono=True
         )
@@ -261,6 +276,8 @@ class SeedVCStream:
             self.cd_difference,
         )
         elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if self.on_inference is not None:
+            self.on_inference(elapsed_ms)
 
         search = infer_wav[
             None, None, : self.sola_buffer_frame + self.sola_search_frame
@@ -292,6 +309,8 @@ class SeedVCStream:
         if rms < self.silence_amplitude:
             output = torch.zeros_like(output)
             self.sola_buffer.zero_()
+        elif self.output_gain != 1.0:
+            output = output * self.output_gain
 
         self.block_count += 1
         self.inference_ms += elapsed_ms
@@ -326,11 +345,36 @@ class SeedVCRuntime:
                 f"Seed-VC service token is empty; set {args.token_env} "
                 "or provide --token-file"
             )
+        settings = {
+            "input_sample_rate": args.input_sample_rate,
+            "block_time": args.block_time,
+            "crossfade_time": args.crossfade_time,
+            "extra_time_ce": args.extra_time_ce,
+            "extra_time": args.extra_time,
+            "extra_time_right": args.extra_time_right,
+            "diffusion_steps": args.diffusion_steps,
+            "inference_cfg_rate": args.inference_cfg_rate,
+            "max_prompt_length": args.max_prompt_length,
+            "silence_db": args.silence_db,
+            "output_gain_db": args.output_gain_db,
+            "seed": args.seed,
+        }
+        validate_runtime_settings(settings)
         self.seedvc_root = Path(args.seedvc_root).resolve()
         if not (self.seedvc_root / "real-time-gui.py").is_file():
             raise FileNotFoundError(
                 f"Seed-VC realtime entrypoint is missing: {self.seedvc_root}"
             )
+        self.checkpoint_path = Path(args.checkpoint).resolve()
+        self.config_path = Path(args.config).resolve()
+        self.reference_path = Path(args.reference).resolve()
+        self.profile_manifest = build_profile_manifest(
+            profile_id=args.profile_id,
+            checkpoint_path=self.checkpoint_path,
+            config_path=self.config_path,
+            reference_path=self.reference_path,
+            settings=settings,
+        )
         if str(self.seedvc_root) not in sys.path:
             sys.path.insert(0, str(self.seedvc_root))
         os.chdir(self.seedvc_root)
@@ -339,14 +383,15 @@ class SeedVCRuntime:
         self.realtime = _load_realtime_module(self.seedvc_root, args.gpu)
         self.model_set = self.realtime.load_models(
             SimpleNamespace(
-                checkpoint_path=str(Path(args.checkpoint).resolve()),
-                config_path=str(Path(args.config).resolve()),
+                checkpoint_path=str(self.checkpoint_path),
+                config_path=str(self.config_path),
                 fp16=args.fp16,
             )
         )
         self.model_lock = threading.Lock()
         self.session_lock = threading.Lock()
         self.sessions: dict[str, SeedVCStream] = {}
+        self.inference_telemetry = InferenceTelemetry()
         self.started_at = time.time()
         self.warmup_ms = self._warmup()
 
@@ -354,11 +399,11 @@ class SeedVCRuntime:
     def output_sample_rate(self) -> int:
         return int(self.model_set[-1]["sampling_rate"])
 
-    def _new_stream(self) -> SeedVCStream:
+    def _new_stream(self, *, record_telemetry: bool = True) -> SeedVCStream:
         return SeedVCStream(
             self.realtime,
             self.model_set,
-            Path(self.args.reference),
+            self.reference_path,
             input_sample_rate=self.args.input_sample_rate,
             block_time=self.args.block_time,
             crossfade_time=self.args.crossfade_time,
@@ -369,10 +414,14 @@ class SeedVCRuntime:
             inference_cfg_rate=self.args.inference_cfg_rate,
             max_prompt_length=self.args.max_prompt_length,
             silence_db=self.args.silence_db,
+            output_gain_db=self.args.output_gain_db,
+            on_inference=(
+                self.inference_telemetry.record if record_telemetry else None
+            ),
         )
 
     def _warmup(self) -> float:
-        stream = self._new_stream()
+        stream = self._new_stream(record_telemetry=False)
         count = stream.input_block_frame
         source_length = round(
             count * stream.model_sample_rate / stream.input_sample_rate
@@ -399,6 +448,35 @@ class SeedVCRuntime:
             stream = self._new_stream()
             self.sessions[session_id] = stream
             return session_id, stream
+
+    def health_snapshot(self) -> dict[str, Any]:
+        """Return traceable profile identity and realtime capacity state."""
+
+        block_time_ms = self.args.block_time * 1000.0
+        return {
+            "status": "ok",
+            "protocol_version": 2,
+            "profile_id": self.args.profile_id,
+            "profile_revision": self.profile_manifest["revision"],
+            "asset_fingerprints": self.profile_manifest["assets"],
+            "runtime_settings": self.profile_manifest["settings"],
+            "input_sample_rate": self.args.input_sample_rate,
+            "output_sample_rate": self.output_sample_rate,
+            "input_block_samples": round(
+                self.args.input_sample_rate * self.args.block_time
+            ),
+            "block_time_ms": round(block_time_ms),
+            "algorithmic_latency_floor_ms": round(
+                (2.0 * self.args.block_time + self.args.extra_time_right) * 1000.0
+            ),
+            "warmup_ms": self.warmup_ms,
+            "active_sessions": len(self.sessions),
+            "uptime_seconds": round(time.time() - self.started_at, 3),
+            "device": str(self.realtime.device),
+            "inference": self.inference_telemetry.snapshot(
+                block_time_ms=block_time_ms
+            ),
+        }
 
     def get_session(self, session_id: str) -> SeedVCStream:
         with self.session_lock:
@@ -467,22 +545,7 @@ class SeedVCHandler(BaseHTTPRequestHandler):
         if path != "/health":
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             return
-        self._send_json(
-            HTTPStatus.OK,
-            {
-                "status": "ok",
-                "profile_id": self.runtime.args.profile_id,
-                "input_sample_rate": self.runtime.args.input_sample_rate,
-                "output_sample_rate": self.runtime.output_sample_rate,
-                "block_time_ms": round(self.runtime.args.block_time * 1000),
-                "warmup_ms": self.runtime.warmup_ms,
-                "active_sessions": len(self.runtime.sessions),
-                "uptime_seconds": round(time.time() - self.runtime.started_at, 3),
-                "device": str(self.runtime.realtime.device),
-                "diffusion_steps": self.runtime.args.diffusion_steps,
-                "seed": self.runtime.args.seed,
-            },
-        )
+        self._send_json(HTTPStatus.OK, self.runtime.health_snapshot())
 
     def do_POST(self) -> None:
         if not self._authorized():
@@ -500,6 +563,7 @@ class SeedVCHandler(BaseHTTPRequestHandler):
                     {
                         "session_id": session_id,
                         "profile_id": profile_id,
+                        "profile_revision": self.runtime.profile_manifest["revision"],
                         "input_sample_rate": stream.input_sample_rate,
                         "output_sample_rate": stream.model_sample_rate,
                         "input_block_samples": stream.input_block_frame,
@@ -595,6 +659,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--inference-cfg-rate", type=float, default=0.7)
     parser.add_argument("--max-prompt-length", type=float, default=3.0)
     parser.add_argument("--silence-db", type=float, default=-70.0)
+    parser.add_argument("--output-gain-db", type=float, default=-3.0)
     parser.add_argument("--max-request-bytes", type=int, default=2 * 1024 * 1024)
     return parser
 
@@ -609,11 +674,15 @@ def main() -> None:
                 "status": "ready",
                 "address": f"http://{args.bind}:{args.port}",
                 "profile_id": args.profile_id,
+                "profile_revision": runtime.profile_manifest["revision"],
                 "input_sample_rate": args.input_sample_rate,
                 "output_sample_rate": runtime.output_sample_rate,
                 "warmup_ms": runtime.warmup_ms,
                 "device": str(runtime.realtime.device),
                 "diffusion_steps": args.diffusion_steps,
+                "block_time_ms": round(args.block_time * 1000),
+                "inference_cfg_rate": args.inference_cfg_rate,
+                "output_gain_db": args.output_gain_db,
                 "seed": args.seed,
             },
             ensure_ascii=False,
