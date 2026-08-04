@@ -10,7 +10,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any, TypeVar
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,11 +22,14 @@ from plugins.life_engine.service.event_bus import (
 )
 from src.kernel.storage import canonical_json
 
-from .contracts import StorageBackendRuntime
+from .contracts import StorageBackendRuntime, StorageWriterRole
 from .event_contracts import (
     LifeEventConsumerConflict,
     LifeEventConsumerCursor,
+    LifeEventDigest,
     LifeEventOccurrenceConflict,
+    LifeEventSnapshotCursor,
+    LifeEventSnapshotRecord,
 )
 from .models import BackendKind
 
@@ -86,6 +89,17 @@ class SQLLifeEventStore:
         if self.backend == BackendKind.MYSQL:
             return parsed.replace(tzinfo=None)
         return parsed.isoformat()
+
+    def _require_candidate_copy(self) -> None:
+        if (
+            self.runtime.writer_role != StorageWriterRole.CANDIDATE_COPY
+            or self.runtime.authority_registry is not None
+            or self.runtime.authority_token is not None
+            or self.runtime._write_fence is None
+        ):
+            raise RuntimeError(
+                "exact Life Event snapshot import requires candidate-copy authority"
+            )
 
     async def _database_now(self, session: AsyncSession) -> datetime:
         if self.backend == BackendKind.MYSQL:
@@ -296,6 +310,222 @@ class SQLLifeEventStore:
 
         return await self._write(operation)
 
+    async def import_snapshot_records(
+        self,
+        records: list[LifeEventSnapshotRecord],
+    ) -> list[LifeEventDigest]:
+        """Import byte-exact immutable rows under candidate-copy authority."""
+
+        self._require_candidate_copy()
+        if not records:
+            return []
+        positions = [int(record.ingest_position) for record in records]
+        identities = [str(record.occurrence_id) for record in records]
+        if any(position <= 0 for position in positions):
+            raise ValueError("snapshot ingest positions must be positive")
+        if positions != sorted(positions) or len(set(positions)) != len(positions):
+            raise ValueError("snapshot ingest positions must be unique and ordered")
+        if any(not identity for identity in identities) or len(set(identities)) != len(
+            identities
+        ):
+            raise ValueError(
+                "snapshot occurrence identities must be unique and nonempty"
+            )
+
+        parameters: list[dict[str, Any]] = []
+        for record in records:
+            calculated = hashlib.sha256(record.payload_json.encode()).hexdigest()
+            if calculated != record.payload_hash:
+                raise ValueError(
+                    f"snapshot payload hash mismatch: {record.occurrence_id}"
+                )
+            payload = json.loads(record.payload_json)
+            if not isinstance(payload, dict):
+                raise TypeError("snapshot Life Event payload must be an object")
+            life_event_from_dict(payload)
+            parameters.append(
+                {
+                    "ingest_position": int(record.ingest_position),
+                    "occurrence_id": str(record.occurrence_id),
+                    "source_event_id": str(record.source_event_id),
+                    "source_sequence": int(record.source_sequence),
+                    "occurred_at": self._bind_time(record.occurred_at),
+                    "recorded_at": self._bind_time(record.recorded_at),
+                    "payload_json": str(record.payload_json),
+                    "payload_hash": str(record.payload_hash),
+                }
+            )
+
+        async def operation(session: AsyncSession) -> list[LifeEventDigest]:
+            insert_sql = (
+                "INSERT IGNORE INTO raw_life_events"
+                if self.backend == BackendKind.MYSQL
+                else "INSERT OR IGNORE INTO raw_life_events"
+            )
+            await session.execute(
+                text(
+                    f"""{insert_sql} (
+                        ingest_position, occurrence_id, source_event_id,
+                        source_sequence, occurred_at, recorded_at,
+                        payload_json, payload_hash
+                    ) VALUES (
+                        :ingest_position, :occurrence_id, :source_event_id,
+                        :source_sequence, :occurred_at, :recorded_at,
+                        :payload_json, :payload_hash
+                    )"""
+                ),
+                parameters,
+            )
+            statement = text(
+                """SELECT ingest_position, occurrence_id, source_event_id,
+                source_sequence, occurred_at, recorded_at,
+                payload_json, payload_hash FROM raw_life_events
+                WHERE occurrence_id IN :occurrence_ids
+                   OR ingest_position IN :ingest_positions"""
+            ).bindparams(
+                bindparam("occurrence_ids", expanding=True),
+                bindparam("ingest_positions", expanding=True),
+            )
+            rows = (
+                (
+                    await session.execute(
+                        statement,
+                        {
+                            "occurrence_ids": identities,
+                            "ingest_positions": positions,
+                        },
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            by_occurrence = {str(row["occurrence_id"]): row for row in rows}
+            by_position = {int(row["ingest_position"]): row for row in rows}
+            digests: list[LifeEventDigest] = []
+            for record in records:
+                row = by_occurrence.get(record.occurrence_id)
+                position_row = by_position.get(record.ingest_position)
+                same_time = row is not None and all(
+                    (
+                        _parse_datetime(row["occurred_at"])
+                        == _parse_datetime(record.occurred_at),
+                        _parse_datetime(row["recorded_at"])
+                        == _parse_datetime(record.recorded_at),
+                    )
+                )
+                if (
+                    row is None
+                    or position_row is None
+                    or str(position_row["occurrence_id"]) != record.occurrence_id
+                    or int(row["ingest_position"]) != record.ingest_position
+                    or str(row["source_event_id"]) != record.source_event_id
+                    or int(row["source_sequence"]) != record.source_sequence
+                    or str(row["payload_json"]) != record.payload_json
+                    or str(row["payload_hash"]) != record.payload_hash
+                    or not same_time
+                ):
+                    raise LifeEventOccurrenceConflict(record.occurrence_id)
+                digests.append(
+                    LifeEventDigest(
+                        occurrence_id=record.occurrence_id,
+                        position=record.ingest_position,
+                        payload_hash=record.payload_hash,
+                    )
+                )
+            return digests
+
+        return await self._write(operation)
+
+    async def import_snapshot_cursors(
+        self,
+        cursors: list[LifeEventSnapshotCursor],
+        *,
+        source_frontier: int,
+    ) -> None:
+        """Import exact cursor evidence without running active consumer logic."""
+
+        self._require_candidate_copy()
+        if not cursors:
+            return
+        identities = [str(cursor.consumer_id) for cursor in cursors]
+        if any(not identity for identity in identities) or len(set(identities)) != len(
+            identities
+        ):
+            raise ValueError("snapshot cursor identities must be unique and nonempty")
+        parameters: list[dict[str, Any]] = []
+        decoded_metadata: dict[str, dict[str, Any]] = {}
+        for cursor in cursors:
+            if cursor.ingest_position < 0 or cursor.ingest_position > source_frontier:
+                raise LifeEventConsumerConflict(
+                    f"snapshot cursor exceeds source frontier: {cursor.consumer_id}"
+                )
+            if cursor.revision <= 0:
+                raise ValueError("persisted snapshot cursor revision must be positive")
+            metadata = json.loads(cursor.metadata_json)
+            if not isinstance(metadata, dict):
+                raise TypeError("snapshot cursor metadata must be an object")
+            decoded_metadata[cursor.consumer_id] = metadata
+            parameters.append(
+                {
+                    "consumer_id": cursor.consumer_id,
+                    "ingest_position": int(cursor.ingest_position),
+                    "revision": int(cursor.revision),
+                    "updated_at": self._bind_time(cursor.updated_at),
+                    "metadata_json": cursor.metadata_json,
+                }
+            )
+
+        async def operation(session: AsyncSession) -> None:
+            insert_sql = (
+                "INSERT IGNORE INTO raw_event_consumer_offsets"
+                if self.backend == BackendKind.MYSQL
+                else "INSERT OR IGNORE INTO raw_event_consumer_offsets"
+            )
+            await session.execute(
+                text(
+                    f"""{insert_sql} (
+                        consumer_id, ingest_position, revision,
+                        updated_at, metadata_json
+                    ) VALUES (
+                        :consumer_id, :ingest_position, :revision,
+                        :updated_at, :metadata_json
+                    )"""
+                ),
+                parameters,
+            )
+            statement = text(
+                """SELECT consumer_id, ingest_position, revision,
+                updated_at, metadata_json FROM raw_event_consumer_offsets
+                WHERE consumer_id IN :consumer_ids"""
+            ).bindparams(bindparam("consumer_ids", expanding=True))
+            rows = (
+                (
+                    await session.execute(
+                        statement,
+                        {"consumer_ids": identities},
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            by_identity = {str(row["consumer_id"]): row for row in rows}
+            for cursor in cursors:
+                row = by_identity.get(cursor.consumer_id)
+                if (
+                    row is None
+                    or int(row["ingest_position"]) != cursor.ingest_position
+                    or int(row["revision"]) != cursor.revision
+                    or _parse_datetime(row["updated_at"])
+                    != _parse_datetime(cursor.updated_at)
+                    or dict(_json_value(row["metadata_json"], default={}))
+                    != decoded_metadata[cursor.consumer_id]
+                ):
+                    raise LifeEventConsumerConflict(
+                        f"snapshot cursor conflict: {cursor.consumer_id}"
+                    )
+
+        await self._write(operation)
+
     async def _history_floor(self, session: AsyncSession) -> int:
         value = await session.scalar(
             text(
@@ -356,6 +586,148 @@ class SQLLifeEventStore:
                 .all()
             )
         return [self._decode_event(row) for row in reversed(rows)]
+
+    async def occurrence_digest(self, occurrence_id: str) -> LifeEventDigest | None:
+        """Read one occurrence's immutable migration identity and digest."""
+
+        identity = str(occurrence_id).strip()
+        if not identity:
+            raise ValueError("occurrence_id must not be empty")
+        async with self.runtime.unit_of_work() as uow:
+            row = (
+                (
+                    await uow.session.execute(
+                        text(
+                            """SELECT ingest_position, occurrence_id, payload_hash
+                            FROM raw_life_events
+                            WHERE occurrence_id = :occurrence_id"""
+                        ),
+                        {"occurrence_id": identity},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        if row is None:
+            return None
+        return LifeEventDigest(
+            occurrence_id=str(row["occurrence_id"]),
+            position=int(row["ingest_position"]),
+            payload_hash=str(row["payload_hash"]),
+        )
+
+    async def occurrence_digests(
+        self,
+        occurrence_ids: list[str],
+    ) -> list[LifeEventDigest]:
+        """Batch-read immutable digests without per-row database round trips."""
+
+        identities = list(
+            dict.fromkeys(
+                str(value).strip() for value in occurrence_ids if str(value).strip()
+            )
+        )
+        if not identities:
+            return []
+        statement = text(
+            """SELECT ingest_position, occurrence_id, payload_hash
+            FROM raw_life_events WHERE occurrence_id IN :occurrence_ids"""
+        ).bindparams(bindparam("occurrence_ids", expanding=True))
+        async with self.runtime.unit_of_work() as uow:
+            rows = (
+                (
+                    await uow.session.execute(
+                        statement,
+                        {"occurrence_ids": identities},
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        by_identity = {
+            str(row["occurrence_id"]): LifeEventDigest(
+                occurrence_id=str(row["occurrence_id"]),
+                position=int(row["ingest_position"]),
+                payload_hash=str(row["payload_hash"]),
+            )
+            for row in rows
+        }
+        return [by_identity[value] for value in identities if value in by_identity]
+
+    async def snapshot_records_after(
+        self,
+        position: int,
+        *,
+        limit: int,
+    ) -> list[LifeEventSnapshotRecord]:
+        """Read exact ledger rows for a bounded audited export."""
+
+        requested = max(0, int(position))
+        bounded = int(limit)
+        if bounded <= 0:
+            return []
+        async with self.runtime.unit_of_work() as uow:
+            rows = (
+                (
+                    await uow.session.execute(
+                        text(
+                            """SELECT ingest_position, occurrence_id,
+                            source_event_id, source_sequence, occurred_at,
+                            recorded_at, payload_json, payload_hash
+                            FROM raw_life_events
+                            WHERE ingest_position > :position
+                            ORDER BY ingest_position LIMIT :limit"""
+                        ),
+                        {"position": requested, "limit": bounded},
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        return [
+            LifeEventSnapshotRecord(
+                ingest_position=int(row["ingest_position"]),
+                occurrence_id=str(row["occurrence_id"]),
+                source_event_id=str(row["source_event_id"]),
+                source_sequence=int(row["source_sequence"]),
+                occurred_at=_iso(row["occurred_at"]),
+                recorded_at=_iso(row["recorded_at"]),
+                payload_json=str(row["payload_json"]),
+                payload_hash=str(row["payload_hash"]),
+            )
+            for row in rows
+        ]
+
+    async def snapshot_cursors(self) -> list[LifeEventSnapshotCursor]:
+        """Read exact durable cursor evidence for audited export."""
+
+        async with self.runtime.unit_of_work() as uow:
+            rows = (
+                (
+                    await uow.session.execute(
+                        text(
+                            """SELECT consumer_id, ingest_position, revision,
+                            updated_at, metadata_json
+                            FROM raw_event_consumer_offsets
+                            ORDER BY consumer_id"""
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        return [
+            LifeEventSnapshotCursor(
+                consumer_id=str(row["consumer_id"]),
+                ingest_position=int(row["ingest_position"]),
+                revision=int(row["revision"]),
+                updated_at=_iso(row["updated_at"]),
+                metadata_json=canonical_json(
+                    dict(_json_value(row["metadata_json"], default={}))
+                ),
+            )
+            for row in rows
+        ]
 
     @staticmethod
     def _decode_cursor(row: Any, consumer_id: str) -> LifeEventConsumerCursor:

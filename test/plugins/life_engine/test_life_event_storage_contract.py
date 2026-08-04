@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from sqlalchemy import text
@@ -16,15 +18,21 @@ from plugins.life_engine.service.event_bus import (
     LifeEvent,
     LifeEventChannel,
     RawEventGapError,
+    RawEventStore,
 )
 from plugins.life_engine.storage.authority import (
     FileAuthorityRegistry,
     StaleAuthorityToken,
 )
-from plugins.life_engine.storage.contracts import StorageBackendRuntime
+from plugins.life_engine.storage.contracts import (
+    StorageBackendRuntime,
+    StorageWriterRole,
+)
 from plugins.life_engine.storage.event_contracts import (
     LifeEventConsumerConflict,
     LifeEventOccurrenceConflict,
+    LifeEventSnapshotImportPort,
+    LifeEventSnapshotSourcePort,
     LifeEventStorePort,
 )
 from plugins.life_engine.storage.event_factory import open_life_event_store
@@ -32,6 +40,16 @@ from plugins.life_engine.storage.factory import (
     LocalBackendSettings,
     StorageFactorySettings,
     open_storage_backend,
+)
+from plugins.life_engine.storage.migration.copy_authority import (
+    CopyAuthorityToken,
+    MySQLCopyAuthorityRegistry,
+)
+from plugins.life_engine.storage.migration.event_copy import (
+    copy_life_events_from_sqlite,
+)
+from plugins.life_engine.storage.migration.event_export import (
+    export_life_events_to_sqlite,
 )
 from plugins.life_engine.storage.models import (
     BackendGeneration,
@@ -121,6 +139,25 @@ def _event(
         occurrence_id=f"occurrence:{identity}",
         source_instance_id="instance:contract",
     )
+
+
+class _CopyRegistryStub:
+    def __init__(self) -> None:
+        self.progress: list[int] = []
+        self.conflicts: list[dict[str, Any]] = []
+
+    async def set_progress(
+        self,
+        token: object,
+        *,
+        copied_records: int,
+    ) -> None:
+        del token
+        self.progress.append(int(copied_records))
+
+    async def record_conflict(self, token: object, **kwargs: Any) -> None:
+        del token
+        self.conflicts.append(dict(kwargs))
 
 
 async def test_life_event_local_contract_preserves_identity_and_atomicity(
@@ -297,3 +334,112 @@ async def test_life_event_restart_and_stale_writer_fencing(tmp_path: Path) -> No
         await registry.revoke(token)
         with pytest.raises(RuntimeError):
             await store.append(replace(_event("stale"), sequence=18))
+
+
+async def test_life_event_snapshot_copy_is_idempotent_and_root_verified(
+    tmp_path: Path,
+) -> None:
+    source = RawEventStore(tmp_path / "source")
+    source_events = await source.append_many(
+        [_event("copy-a"), _event("copy-b"), _event("copy-c")]
+    )
+    await source.commit_consumer_offset(
+        "consumer:copy",
+        source_events[-1].sequence,
+        metadata={"source": True},
+    )
+    registry = _CopyRegistryStub()
+    token = cast(CopyAuthorityToken, object())
+    async with _local_store(tmp_path / "target") as (runtime, target, _, _):
+        assert isinstance(target, LifeEventSnapshotImportPort)
+        with pytest.raises(RuntimeError, match="candidate-copy"):
+            await copy_life_events_from_sqlite(
+                source.database_path,
+                target,
+                copy_registry=cast(MySQLCopyAuthorityRegistry, registry),
+                token=token,
+                batch_size=2,
+            )
+
+        async def candidate_fence(_: object) -> None:
+            return None
+
+        async def candidate_validate() -> None:
+            return None
+
+        candidate_runtime = StorageBackendRuntime(
+            enabled=True,
+            backend=runtime.backend,
+            backend_identity=runtime.backend_identity,
+            generation=None,
+            authority_registry=None,
+            authority_token=None,
+            engine=runtime.engine,
+            session_factory=runtime.session_factory,
+            _write_fence=candidate_fence,
+            _writer_validator=candidate_validate,
+            writer_role=StorageWriterRole.CANDIDATE_COPY,
+        )
+        target = await open_life_event_store(candidate_runtime)
+        assert isinstance(target, LifeEventSnapshotImportPort)
+        first = await copy_life_events_from_sqlite(
+            source.database_path,
+            target,
+            copy_registry=cast(MySQLCopyAuthorityRegistry, registry),
+            token=token,
+            batch_size=2,
+        )
+        second = await copy_life_events_from_sqlite(
+            source.database_path,
+            target,
+            copy_registry=cast(MySQLCopyAuthorityRegistry, registry),
+            token=token,
+            batch_size=2,
+        )
+        cursor = await target.consumer_cursor("consumer:copy")
+        assert isinstance(target, LifeEventSnapshotSourcePort)
+        export_directory = tmp_path / "reverse-export"
+        export_report = await export_life_events_to_sqlite(
+            target,
+            export_directory,
+            batch_size=2,
+        )
+        with pytest.raises(FileExistsError):
+            await export_life_events_to_sqlite(target, export_directory)
+        async with runtime.unit_of_work() as uow:
+            copied_payloads = (
+                (
+                    await uow.session.execute(
+                        text(
+                            "SELECT payload_json, payload_hash FROM raw_life_events "
+                            "ORDER BY ingest_position"
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        with sqlite3.connect(source.database_path) as source_db:
+            source_payloads = source_db.execute(
+                "SELECT payload_json, payload_hash FROM raw_life_events "
+                "ORDER BY ingest_position"
+            ).fetchall()
+        with sqlite3.connect(export_report.database_path) as export_db:
+            exported_payloads = export_db.execute(
+                "SELECT payload_json, payload_hash FROM raw_life_events "
+                "ORDER BY ingest_position"
+            ).fetchall()
+    assert first == second
+    assert first.verified is True
+    assert first.copied_count == 3
+    assert first.source_root_sha256 == first.target_root_sha256
+    assert (cursor.position, cursor.revision) == (source_events[-1].sequence, 1)
+    assert registry.conflicts == []
+    assert registry.progress[-1] == 3
+    assert [tuple(row.values()) for row in copied_payloads] == [
+        tuple(row) for row in source_payloads
+    ]
+    assert exported_payloads == source_payloads
+    assert export_report.event_count == 3
+    assert export_report.root_sha256 == first.source_root_sha256
+    assert not (export_directory / "EXPORT_INCOMPLETE").exists()

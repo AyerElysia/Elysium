@@ -1,12 +1,12 @@
 # Elysium 生命域可选 MySQL / 本地存储重构方案
 
-> 状态：分阶段实施中。阶段 0（数据盘点与不变量冻结）和阶段 1（通用存储内核、后端工厂、generation/authority/fencing、无损快照与校验）已于 2026-08-04 落地；阶段 2 的 Life Memory 六 Port、local/MySQL 双适配与 MySQL 领域 schema 已落地，但尚未复制或激活正式数据。其余领域仍按各自阶段推进，当前正式运行权威仍是既有本地 SQLite/文件，禁止据此状态直接切换到 MySQL。
+> 状态：分阶段实施中。阶段 0/1 的通用存储基座已落地；阶段 2 的 Presence/World 与 Life Memory Port、local/MySQL 双适配及现役选择接线正在收口；阶段 3 的 Life Event Port、双适配、候选复制控制面、逐字节迁移与反向导出已落地。已把一份未冻结在线快照的 86,094 条 Life Event 复制到远程 MySQL 并完成 0 差异往返恢复演练，但该批次仅为 `copied`，不是 `verified`，也未激活。当前正式运行权威仍是既有本地 SQLite/文件，禁止据此状态直接切换到 MySQL。
 >
 > 目标：在不改变爱莉主体语义、不丢失不可变历史、不把 Chroma 误作权威存储的前提下，为 Elysium 建立行为等价的本地与 MySQL 两套耐久存储后端。迁移采用“复制、校验、可选切换”，绝不移动、删除或改写原 SQLite、Markdown、JSON、JSONL 与媒体数据文件。
 >
 > 适用基线：以项目实施时实际受支持的 Python、SQLAlchemy、asyncmy、MySQL 与 Chroma 版本为准；运行时版本升级或降级不属于本存储重构范围。
 
-阶段 0/1 的实现与真实数据证据见 [生命域可选存储阶段 0/1 交付报告](../report/life-storage-phase0-phase1-2026-08-04.md)，Memory 阶段 2 见 [生命域可选存储阶段 2 / Memory 交付报告](../report/life-storage-phase2-memory-2026-08-04.md)，操作边界见 [生命域存储快照与权威切换运行手册](../operations/life_storage_backend_runbook.md)。平台开关保持默认关闭；在各领域合同测试、逐记录复制校验、恢复演练和人工切换门全部通过前，`storage.enabled` 必须为 `false`。
+阶段 0/1 的实现与真实数据证据见 [生命域可选存储阶段 0/1 交付报告](../report/life-storage-phase0-phase1-2026-08-04.md)，Memory 阶段 2 见 [生命域可选存储阶段 2 / Memory 交付报告](../report/life-storage-phase2-memory-2026-08-04.md)，Life Event 阶段 3 见 [Life Event Ledger 交付报告](../report/life-storage-phase3-life-event-2026-08-04.md)，操作边界见 [生命域存储快照与权威切换运行手册](../operations/life_storage_backend_runbook.md)。平台开关保持默认关闭；在各领域合同测试、逐记录复制校验、恢复演练和人工切换门全部通过前，`storage.enabled` 必须为 `false`。
 
 ## 1. 决策摘要
 
@@ -229,7 +229,7 @@ Kernel 只拥有连接、事务、迁移 runner 和通用 outbox 等工程能力
 - 时间统一 `DATETIME(6)`，应用与会话时区固定 UTC。
 - 协议身份使用有界 `VARCHAR`，长度在迁移审计中以真实数据验证。
 - 开放认知文本不能用数据库 ENUM；使用 `VARCHAR` 或 `TEXT`。
-- JSON payload 使用 `JSON` 保存可查询结构，同时保存规范化 payload hash。
+- 普通可查询 JSON 可使用 `JSON` 并保存规范化 payload hash；不可变 Life Event 的历史 payload 还必须保留原始 JSON 文本字节，因此使用带 `JSON_VALID` 检查的 binary-collated `LONGTEXT`，禁止由当前模型重编码旧证据。
 - 原始文档内容优先使用 `LONGBLOB`，另存可为空的 `encoding` 和 `newline_style`；只有直接从文件读取的版本才能声明 `exact_bytes`。历史上仅保存为 TEXT 的版本标记为 `legacy_text_derived`，不得伪称恢复了已丢失的 BOM、编码或原始换行字节。
 - 全部表使用 InnoDB、`utf8mb4`、明确主键和必要唯一约束；身份、哈希、logical path 等技术键使用大小写敏感的 binary collation，避免默认不区分大小写造成碰撞。
 - 会话启用 strict SQL mode，明确拒绝静默截断、非法日期和非有限浮点；应用层规范 JSON、hash 算法和 canonicalization version 必须版本化。

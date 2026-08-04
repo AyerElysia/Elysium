@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
@@ -29,6 +31,17 @@ class StorageRuntimeClosed(StorageRuntimeError):
     """Raised when a consumer uses a runtime after its owned engine was closed."""
 
 
+WriteFence = Callable[[AsyncSession], Awaitable[None]]
+WriterValidator = Callable[[], Awaitable[None]]
+
+
+class StorageWriterRole(StrEnum):
+    """Limit which write surface one fenced runtime may use."""
+
+    ACTIVE = "active"
+    CANDIDATE_COPY = "candidate_copy"
+
+
 @dataclass(slots=True)
 class StorageBackendRuntime:
     """One coherent backend/generation/authority/session bundle.
@@ -46,6 +59,9 @@ class StorageBackendRuntime:
     authority_token: AuthorityToken | None
     engine: AsyncEngine | None
     session_factory: async_sessionmaker[AsyncSession] | None
+    _write_fence: WriteFence | None = None
+    _writer_validator: WriterValidator | None = None
+    writer_role: StorageWriterRole = StorageWriterRole.ACTIVE
     _closed: bool = False
 
     @classmethod
@@ -66,13 +82,16 @@ class StorageBackendRuntime:
 
         if self._closed:
             raise StorageRuntimeClosed("storage runtime is closed")
-        if (
-            not self.enabled
-            or self.session_factory is None
-            or self.authority_registry is None
-            or self.authority_token is None
-        ):
+        if not self.enabled or self.session_factory is None:
             raise StorageRuntimeDisabled("storage runtime is disabled")
+
+        if self._write_fence is not None:
+            return AsyncUnitOfWork(
+                self.session_factory,
+                before_commit=self._write_fence,
+            )
+        if self.authority_registry is None or self.authority_token is None:
+            raise StorageRuntimeDisabled("storage runtime has no writer authority")
 
         token = self.authority_token
         registry = self.authority_registry
@@ -94,6 +113,20 @@ class StorageBackendRuntime:
         raise StorageRuntimeError(
             f"unsupported authority registry: {type(registry).__name__}"
         )
+
+    async def validate_writer(self) -> None:
+        """Validate the exact active or migration writer without guessing mode."""
+
+        if self._closed:
+            raise StorageRuntimeClosed("storage runtime is closed")
+        if not self.enabled:
+            raise StorageRuntimeDisabled("storage runtime is disabled")
+        if self._writer_validator is not None:
+            await self._writer_validator()
+            return
+        if self.authority_registry is None or self.authority_token is None:
+            raise StorageRuntimeDisabled("storage runtime has no writer authority")
+        await self.authority_registry.validate(self.authority_token)
 
     async def renew_authority(self, *, lease_seconds: int) -> AuthorityToken:
         """Renew the current lease without changing backend or generation."""
@@ -172,4 +205,5 @@ __all__ = [
     "StorageRuntimeClosed",
     "StorageRuntimeDisabled",
     "StorageRuntimeError",
+    "StorageWriterRole",
 ]

@@ -13,6 +13,7 @@ async def open_life_event_store(
     runtime: StorageBackendRuntime,
     *,
     initialize_schema: bool = False,
+    require_database_immutability: bool = True,
 ) -> LifeEventStorePort:
     """Build one event adapter from the already-selected backend runtime."""
 
@@ -21,7 +22,10 @@ async def open_life_event_store(
             "Life Event adapter requires an enabled storage runtime"
         )
     if initialize_schema:
-        await ensure_life_event_schema(runtime)
+        await ensure_life_event_schema(
+            runtime,
+            require_database_immutability=require_database_immutability,
+        )
     if runtime.backend == BackendKind.LOCAL:
         return LocalLifeEventStore(runtime)
     return MySQLLifeEventStore(runtime)
