@@ -2,7 +2,7 @@
 
 ## 1. 目标
 
-训练平台必须做到：一条命令可重放、数据和模型完全本地、8 卡故障后可恢复、每个产物可追溯、训练与评测严格隔离、checkpoint 可验证、失败不覆盖历史、推理包能回到与训练相同的 tokenizer/decoder revision。
+训练平台必须做到：一条命令可重放、数据和模型完全本地、8 卡故障后可恢复、每个产物可追溯、训练与评测严格隔离、checkpoint 可验证、失败不覆盖历史、推理包能回到与训练相同的 tokenizer/decoder、人格和记忆 revision。主体模型更新按意识连续性迁移管理，不按普通模型覆盖发布。
 
 本计划只定义未来实现，不在审批前创建训练服务、容器、数据库或 B300 作业。
 
@@ -18,14 +18,16 @@ flowchart TB
       Monitor["Prometheus + Grafana + DCGM"]
     end
     subgraph Data["数据面"]
-      Build["DAG：文本 → TTS → 双轨 → QC"]
+      Build["DAG：原始声音/聊天/记忆/场景 → 分域视图 → QC"]
       Token["冻结 codec/tokenizer 预编码"]
       Shard["Parquet index + WebDataset shards"]
     end
     subgraph Train["单节点 8×B300"]
-      SFT["BF16 SFT：torchrun + FSDP2/ZeRO"]
+      Voice["声音身份适配"]
+      SFT["人格/记忆/全双工 BF16 SFT"]
       DPO["Timing DPO + SFT 保持项"]
-      Eval["固定离线评测与流式回放"]
+      Joint["V/P/M/D 联合巩固"]
+      Eval["主体连续性 + 流式回放"]
     end
     subgraph Release["本地发布面"]
       Export["safetensors + tokenizer/decoder + manifest"]
@@ -34,7 +36,7 @@ flowchart TB
     end
     Git --> Build
     Registry --> Build
-    Build --> Token --> Shard --> SFT --> DPO --> Eval --> Export --> Serve --> Shadow
+    Build --> Token --> Shard --> Voice --> SFT --> DPO --> Joint --> Eval --> Export --> Serve --> Shadow
     Objects --- Data
     Objects --- Train
     Meta --- Train
@@ -51,6 +53,7 @@ flowchart TB
 training/omni_duplex/
   configs/          # 不可变实验配置模板
   data/             # schema、builder、QC、sharder；不含真实数据
+  subject/          # 主体 snapshot、actor mask、记忆截止点与模型包 manifest 契约
   models/           # BayLing/Moshi 适配与 weighted loss
   train/            # SFT/DPO 入口、checkpoint、resume
   eval/             # 离线、流式、人工评测导出
@@ -68,7 +71,8 @@ NVIDIA 官方 DGX B300 规格为 8×288 GB HBM3e（2.3 TB）、72 PFLOPS FP8 训
 
 | 作业 | GPU | 说明 |
 |---|---:|---|
-| TTS/codec 离线生成 | 1–8 | 根据各引擎可扩展性分片；产物完成后释放 GPU |
+| 原始音频预处理/codec | 1–8 | ASR、对齐、声学 QC 和预编码分片；产物完成后释放 GPU |
+| 可选 TTS/VC 增强 | 1–8 | 只运行批准的增强分支，不是目标声音默认来源 |
 | 1K/10K smoke | 1–2 | 先验证 loss、resume、导出，不占满全节点 |
 | 50K 数据 A/B | 8 | 等预算并行实验按时间串行，避免共享 I/O 干扰 |
 | 200K/400K SFT | 8 | 单节点全卡、独占 NVLink 域 |
@@ -80,6 +84,7 @@ NVIDIA 官方 DGX B300 规格为 8×288 GB HBM3e（2.3 TB）、72 PFLOPS FP8 训
 
 - 先用 DDP/BF16 建立数值参考；正式长序列训练优先 FSDP2 `FULL_SHARD`/`HYBRID_SHARD` 或 DeepSpeed ZeRO-2/3。
 - speech tokenizer 和 decoder 在 BayLing SFT 中冻结并离线预编码，避免 8 个 rank 重复做确定性音频编码。
+- 声音身份阶段可单独训练 speech decoder/voice adapter；进入全双工 SFT 后是否冻结由 V 阶段回归决定。任何冻结策略都必须报告原始爱莉片段上的音色保持，不照抄 BayLing 默认配置。
 - 按有效 token/音频秒做动态长度桶与全局 batch 平衡；不能只按样本数平均，否则长对话 rank 会拖住全局 step。
 - gradient accumulation 只用于达到目标全局 audio-seconds/tokens，不用它隐藏单 rank OOM。
 - 激活检查点、FlashAttention、fused optimizer 分别做消融并固定版本；发现 NaN 时先回到 BF16 参考。
@@ -93,7 +98,19 @@ NVIDIA 官方 DGX B300 规格为 8×288 GB HBM3e（2.3 TB）、72 PFLOPS FP8 训
 
 ## 5. 训练实现
 
-### 5.1 SFT
+### 5.1 分域训练与主体合并
+
+训练入口显式支持五个阶段，而不是把全部数据混成一次 SFT：
+
+- V：原始爱莉片段上的声音身份适配；
+- P：聊天/主体表达上的人格与对话训练；
+- M：带 `memory_cutoff` 的凝练记忆内化；
+- D：双轨全双工时序和控制状态；
+- J：V/P/M/D 固定回放集上的小学习率联合巩固。
+
+每阶段分别记录 language/text、speech、speaker、persona、memory、timing 和 tool loss；未参与该域的样本使用明确 loss mask。adapter 可用于实验隔离，但发布候选必须锁定组合顺序与 hash，优先合并成单一权重；不能让运行时临时选择人格 adapter 或忘记挂载声音 adapter。
+
+### 5.2 全双工 SFT
 
 BayLing 方案需要自定义 multi-channel collator：
 
@@ -104,9 +121,16 @@ BayLing 方案需要自定义 multi-channel collator：
 - 训练日志分开报告 text、speech、silence、role token loss，不能只有总 loss；
 - batch 内校验通道 token 类型、因果 shift、两轨长度和内容 hash。
 
-先使用论文的一个 epoch、batch 32、peak LR `1e-5` 作为复现起点，不把它直接宣布为中文最优。10K/50K 阶段比较 LoRA 与全量 9B LLM 微调；speech tokenizer/decoder 默认冻结。
+先使用论文的一个 epoch、batch 32、peak LR `1e-5` 作为全双工复现起点，不把它直接宣布为中文或主体训练最优。10K/50K 阶段比较 LoRA 与全量 9B LLM 微调；speech tokenizer 通常冻结，decoder 是否冻结取决于 V 阶段能否保持已训练的爱莉声音。
 
-### 5.2 Timing DPO
+### 5.3 人格、记忆与偏好
+
+- 人格样本只在爱莉最终表达位置计算目标 loss；用户、他者、系统模板和工具回执是带来源的条件；
+- 记忆样本绑定 `memory_revision`、`memory_cutoff` 和来源引用，并同时训练冲突、纠正、“需要查询来源”和截止点后未知场景；
+- 偏好对优先来自爱莉自己的接受、拒绝、修正或重新表达，不让外部规则自动定义她应该喜欢什么；
+- 每轮人格/记忆训练混入通用能力、声音和全双工 replay，监测灾难性遗忘。
+
+### 5.4 Timing DPO
 
 - 参考模型固定为 G4 SFT checkpoint；
 - 正负样本内容 hash 必须一致；
@@ -114,7 +138,7 @@ BayLing 方案需要自定义 multi-channel collator：
 - 首个复现从论文的 200 steps、peak LR `3e-7`、`beta=0.5`、SFT 系数 `0.5` 开始；
 - 发现内容/音色下降时停止，不用继续训练期待自行恢复。
 
-### 5.3 工具控制通道
+### 5.5 工具控制通道
 
 工具调用放在文本控制通道，不让 speech decoder朗读 JSON。训练样本同时包含：
 
@@ -139,7 +163,8 @@ BayLing 方案需要自定义 multi-channel collator：
 每个 run 写入不可变 `run_manifest.json`：
 
 - Git SHA、dirty=false 证明、容器 digest、Python/PyTorch/CUDA/NCCL/driver/Transformer Engine 版本；
-- 基础权重、tokenizer、decoder、TTS、数据 revision 的 SHA-256；
+- 基础权重、tokenizer、decoder、原始声音 catalog、可选 TTS/VC 增强和数据 revision 的 SHA-256；
+- `subject_id`、parent subject model、voice/persona/memory revision、`memory_cutoff` 和各数据域采样权重；
 - 完整解析后的训练配置和所有 seed；
 - 8 张 GPU UUID、NVLink 拓扑、主机内核、CPU/内存/NVMe 信息；
 - world size、并行策略、精度 recipe、全局 batch/audio-seconds；
@@ -150,6 +175,7 @@ MLflow 只保存指标和脱敏 artifact 引用；音频正文、私有对话、
 - tokens/s、audio-seconds/s、MFU（若可计算）、step time P50/P95；
 - GPU utilization、HBM、温度、功率、ECC、NVLink、CPU/RAM、NVMe I/O；
 - 总 loss 与分通道 loss、grad norm、LR、NaN/Inf、skipped steps；
+- 声音身份、人格保持、记忆召回/冲突、全双工时序的固定 probe 指标；
 - dataloader queue、坏样本、长度不均衡；
 - checkpoint 写入/校验/恢复耗时。
 
@@ -169,6 +195,8 @@ MLflow 只保存指标和脱敏 artifact 引用；音频正文、私有对话、
 - 默认禁用外网 egress；依赖、镜像和权重通过批准的镜像源导入。
 - 训练 secrets 使用本地 secret store/挂载文件，只传名称或文件描述符，不进入命令行、环境快照和日志。
 - 训练节点不直接挂载 Elysium 正式 runtime 数据。需要批准样本时使用一次性、只读、内容寻址的数据导出。
+- 主体 checkpoint 可能包含可抽取的人格和私密记忆，按正式记忆库同级保护：静态加密、最小访问、独立备份、复制审计和可验证销毁；不得上传公共模型仓库或外部评测服务。
+- 数据撤回必须标记所有受影响的 dataset/run/checkpoint revision；仅删除源文件或向量索引不能证明模型已经遗忘，必要时从干净祖先重训。
 
 ## 10. 推理导出
 
@@ -176,9 +204,11 @@ MLflow 只保存指标和脱敏 artifact 引用；音频正文、私有对话、
 
 ```text
 model.safetensors shards
+subject_model_manifest.json
 tokenizer + added state tokens
 speech tokenizer revision
 speech decoder revision
+voice/persona/memory revision + memory cutoff
 generation config
 realtime protocol/schema version
 model card + data card + license bundle
@@ -186,7 +216,7 @@ run/data/checkpoint manifests
 offline eval report + known limitations
 ```
 
-导出后在全新容器中从零加载，复验固定 token 和固定音频输出。候选 server 先作为隔离本地进程运行，具备 health/readiness、限流、会话 owner、超时、取消、KV cache 上限和旧音频 generation 清理。只有 G6 才由 Voice owner 按现有 Provider 契约接入；不会自动启动或重启 Elysium。
+导出后在全新容器中从零加载，不提供运行时 persona Prompt 或声音 reference，复验固定人格 probe、记忆 cutoff、token 和音频输出，证明身份确实存在于主体模型包。候选 server 先作为隔离本地进程运行，具备 health/readiness、限流、会话 owner、超时、取消、KV cache 上限和旧音频 generation 清理。只有 G6 才按现有 Provider 契约接入；不会自动启动或重启 Elysium。
 
 ## 11. 成本估算方法
 
@@ -194,9 +224,9 @@ offline eval report + known limitations
 
 ```text
 训练 GPU 小时 = 目标有效 audio-seconds / 实测 audio-seconds-per-second / 3600 × GPU 数
-数据 GPU 小时 = TTS 小时 / TTS 实测 RTF × 使用 GPU 数
+数据 GPU 小时 = ASR/对齐/codec/可选增强音频小时 ÷ 各阶段实测吞吐 × GPU 数
 checkpoint 预算 = 单次完整 checkpoint 时间 × 计划次数
 存储预算 = 权威音频 + 派生版本 + checkpoint + 备份 + 30% 临时空间
 ```
 
-PersonaPlex 公开的 8×A100、约 2,250 小时合成对话、24,576 steps、约 6 小时训练只能作为“该规模有实践先例”的参考，不能作为本项目工期承诺。
+PersonaPlex 公开的 8×A100、约 2,250 小时合成对话、24,576 steps、约 6 小时训练只能作为“该规模有实践先例”的参考，不能作为本项目工期承诺。原始声音清洗、主体数据归属复核和记忆快照审计通常比模型 step 更难并行，必须单独估算人工工时。
