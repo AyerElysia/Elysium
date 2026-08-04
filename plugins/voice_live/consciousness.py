@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from .life_binding import (
@@ -14,12 +13,11 @@ from .life_binding import (
 )
 from .runtime_store import VoiceEpisodeStore
 
-
 _PRESENCE_LEASE_SECONDS = 180
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def build_voice_live_perception_filter() -> PerceptionFilter:
@@ -108,24 +106,27 @@ class VoiceLiveConsciousnessManager:
                 session_id=self.episode_id,
                 lease_duration_seconds=_PRESENCE_LEASE_SECONDS,
             )
-            registry.register(instance)
+            await service.register_consciousness_instance(instance)
         else:
             instance = existing
-            instance.stream_ids = [self.stream_id]
-            instance.perception_filter = build_voice_live_perception_filter()
-            instance.metadata.update(metadata)
-            instance.session_id = self.episode_id
-            instance.lease_duration_seconds = _PRESENCE_LEASE_SECONDS
             if instance.is_suspended:
-                registry.resume(self.instance_id, timestamp=now)
+                instance.stream_ids = [self.stream_id]
+                instance.perception_filter = build_voice_live_perception_filter()
+                instance.metadata.update(metadata)
+                instance.session_id = self.episode_id
+                instance.lease_duration_seconds = _PRESENCE_LEASE_SECONDS
+                await service.resume_consciousness_instance(
+                    self.instance_id,
+                    timestamp=now,
+                    reason="voice_session_activated",
+                )
             else:
-                registry.touch(
+                await service.touch_consciousness_instance(
                     self.instance_id,
                     timestamp=now,
                     reason="voice_session_activated",
                 )
 
-        await asyncio.to_thread(service.save_consciousness_registry)
         await service.report_world_observation(
             "实时通话已连接",
             source_instance_id=self.instance_id,
@@ -151,12 +152,11 @@ class VoiceLiveConsciousnessManager:
         service = self._life_service()
         now = _now()
         if service is not None:
-            service.consciousness_registry.touch(
+            await service.touch_consciousness_instance(
                 self.instance_id,
                 timestamp=now,
                 reason="voice_state_reported",
             )
-            await asyncio.to_thread(service.save_consciousness_registry)
             await service.report_world_observation(
                 summary,
                 source_instance_id=self.instance_id,
@@ -181,28 +181,27 @@ class VoiceLiveConsciousnessManager:
                 stream_id=self.stream_id,
                 observed_at=now,
             )
-            service.consciousness_registry.suspend(
+            await service.suspend_consciousness_instance(
                 self.instance_id,
                 timestamp=now,
                 reason=reason,
             )
-            await asyncio.to_thread(service.save_consciousness_registry)
         await self._store.append_async("consciousness.suspended", {"reason": reason})
         await self._store.checkpoint_async("suspended", reason=reason)
         self._instance = None
 
-    def prepare_perception(self) -> Any | None:
+    async def prepare_perception(self) -> Any | None:
         """Prepare this voice instance's transient cross-scene perception."""
 
         service = self._life_service()
         if service is None:
             return None
-        return service.prepare_perception(self.instance_id)
+        return await service.prepare_perception(self.instance_id)
 
-    def commit_perception(self, prepared: Any) -> None:
+    async def commit_perception(self, prepared: Any) -> None:
         """Acknowledge perception only after the provider accepted it."""
 
         service = self._life_service()
         if service is None:
             return
-        service.commit_perception(prepared)
+        await service.commit_perception(prepared)

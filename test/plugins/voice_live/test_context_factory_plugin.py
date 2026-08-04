@@ -84,7 +84,7 @@ class FakeConsciousness:
     instance_id = "voice_live_episode"
     stream_id = "voice_live_episode"
 
-    def prepare_perception(self) -> Any:
+    async def prepare_perception(self) -> Any:
         return SimpleNamespace(content='{"scene":"voice"}')
 
 
@@ -150,7 +150,7 @@ async def test_context_bridge_separates_stable_identity_and_transient_world(
         "USER.md",
         "MEMORY.md",
     ]
-    transient, prepared = bridge.build_llm_context_prefix()
+    transient, prepared = await bridge.build_llm_context_prefix()
     assert "scene" in transient
     assert prepared is not None
 

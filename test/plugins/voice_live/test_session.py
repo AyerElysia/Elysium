@@ -87,7 +87,7 @@ class FakeConsciousness:
         self.is_active = False
         self.reasons.append(reason)
 
-    def commit_perception(self, prepared: Any) -> None:
+    async def commit_perception(self, prepared: Any) -> None:
         self.committed_perceptions.append(prepared)
 
 
@@ -130,7 +130,7 @@ class PerceptionBridge(FakeBridge):
         super().__init__()
         self.prepared = object()
 
-    def build_llm_context_prefix(self) -> tuple[str, object]:
+    async def build_llm_context_prefix(self) -> tuple[str, object]:
         return "transient-presence", self.prepared
 
 

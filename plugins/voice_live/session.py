@@ -468,7 +468,7 @@ class CallSession:
         async with self._perception_refresh_lock:
             if self._pending_voice_perception is not None:
                 return
-            prefix, prepared = await asyncio.to_thread(builder)
+            prefix, prepared = await builder()
             if not prefix or prepared is None:
                 return
             await provider.inject_context(prefix)
@@ -498,7 +498,7 @@ class CallSession:
                     raise RuntimeError(
                         "voice consciousness cannot acknowledge world perception"
                     )
-                await asyncio.to_thread(commit, prepared)
+                await commit(prepared)
         await self._refresh_voice_perception()
 
     async def _on_transcript(self, event: TranscriptEvent) -> None:

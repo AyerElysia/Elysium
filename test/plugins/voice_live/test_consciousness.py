@@ -11,14 +11,72 @@ from plugins.voice_live.consciousness import VoiceLiveConsciousnessManager
 from plugins.voice_live.runtime_store import VoiceEpisodeStore
 
 
+class _ReadOnlyRegistrySnapshot:
+    """Selected-backend view: consumers may inspect but cannot mutate it."""
+
+    def __init__(self, registry: ConsciousnessRegistry) -> None:
+        self._registry = registry
+
+    def get(self, instance_id: str) -> Any:
+        return self._registry.get(instance_id)
+
+    def get_by_kind(self, kind: str) -> list[Any]:
+        return self._registry.get_by_kind(kind)
+
+
 class FakeLifeService:
     def __init__(self) -> None:
-        self.consciousness_registry = ConsciousnessRegistry()
+        self._registry = ConsciousnessRegistry()
+        self.consciousness_registry = _ReadOnlyRegistrySnapshot(self._registry)
         self.registry_saves = 0
+        self.lifecycle_calls: list[str] = []
         self.observations: list[dict[str, Any]] = []
+        self.prepared = object()
+        self.committed: list[Any] = []
 
-    def save_consciousness_registry(self) -> None:
+    async def register_consciousness_instance(self, instance: Any) -> Any:
+        self.lifecycle_calls.append("register")
+        result = self._registry.register(instance)
         self.registry_saves += 1
+        return result
+
+    async def touch_consciousness_instance(
+        self,
+        instance_id: str,
+        **kwargs: Any,
+    ) -> None:
+        self.lifecycle_calls.append("touch")
+        self._registry.touch(instance_id, **kwargs)
+        self.registry_saves += 1
+
+    async def resume_consciousness_instance(
+        self,
+        instance_id: str,
+        **kwargs: Any,
+    ) -> bool:
+        self.lifecycle_calls.append("resume")
+        changed = self._registry.resume(instance_id, **kwargs)
+        self.registry_saves += int(changed)
+        return changed
+
+    async def suspend_consciousness_instance(
+        self,
+        instance_id: str,
+        **kwargs: Any,
+    ) -> bool:
+        self.lifecycle_calls.append("suspend")
+        changed = self._registry.suspend(instance_id, **kwargs)
+        self.registry_saves += int(changed)
+        return changed
+
+    async def prepare_perception(self, instance_id: str) -> Any:
+        self.lifecycle_calls.append(f"prepare:{instance_id}")
+        return self.prepared
+
+    async def commit_perception(self, prepared: Any) -> tuple[int, int]:
+        self.lifecycle_calls.append("commit")
+        self.committed.append(prepared)
+        return (1, 1)
 
     async def report_world_observation(
         self,
@@ -65,6 +123,12 @@ async def test_lifecycle_is_idempotent_resumable_and_persisted(tmp_path: Path) -
     assert resumed.status == "active"
     assert service.registry_saves >= 4
     assert len(service.observations) >= 4
+    assert service.lifecycle_calls[:4] == ["register", "touch", "suspend", "resume"]
+
+    prepared = await recovered.prepare_perception()
+    await recovered.commit_perception(prepared)
+    assert prepared is service.prepared
+    assert service.committed == [service.prepared]
 
 
 @pytest.mark.asyncio
