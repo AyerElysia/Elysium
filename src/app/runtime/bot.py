@@ -1078,9 +1078,11 @@ class Bot:
                 await self.http_server.stop()
 
         async def _close_app_api_mount() -> None:
-            if self.app_api_mount is not None:
-                self.app_api_mount.close()
-                self.app_api_mount = None
+            mount = getattr(self, "app_api_mount", None)
+            if mount is None:
+                return
+            mount.close()
+            self.app_api_mount = None
 
         async def _cleanup_mcp() -> None:
             if self.mcp_manager is not None:

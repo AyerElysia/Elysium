@@ -57,13 +57,16 @@ def test_wsl_host_alias_uses_linux_default_gateway(
 @pytest.mark.asyncio
 async def test_http_voice_converter_stream_contract_and_cleanup() -> None:
     observed: list[tuple[str, str, bytes]] = []
+    remote_pending = bytearray()
 
     async def handler(request: web.Request) -> web.StreamResponse:
         if request.path == "/health":
             return web.json_response(
                 {
                     "status": "ok",
+                    "protocol_version": 2,
                     "profile_id": "elysia",
+                    "profile_revision": "profile-revision-1",
                     "input_sample_rate": 24000,
                     "output_sample_rate": 22050,
                 }
@@ -76,8 +79,10 @@ async def test_http_voice_converter_stream_contract_and_cleanup() -> None:
                 {
                     "session_id": "svc-1",
                     "profile_id": "elysia",
+                    "profile_revision": "profile-revision-1",
                     "input_sample_rate": 24000,
                     "output_sample_rate": 22050,
+                    "input_block_samples": 4,
                 },
                 status=201,
             )
@@ -86,12 +91,24 @@ async def test_http_voice_converter_stream_contract_and_cleanup() -> None:
         operation = request.match_info["operation"]
         if operation == "reset":
             return web.json_response({"status": "reset"})
-        payload = body[::-1] if operation == "audio" else b"\x01\x00"
+        if operation == "audio":
+            remote_pending.extend(body)
+            if len(remote_pending) >= 8:
+                payload = bytes(remote_pending[::-1])
+                remote_pending.clear()
+                block_count = 1
+            else:
+                payload = b""
+                block_count = 0
+        else:
+            payload = bytes(remote_pending[::-1])
+            remote_pending.clear()
+            block_count = 1 if payload else 0
         return web.Response(
             body=payload,
             headers={
                 "X-Output-Sample-Rate": "22050",
-                "X-Block-Count": "1",
+                "X-Block-Count": str(block_count),
                 "X-Inference-Ms": "12.5",
                 "X-Pending-Samples": "0",
             },
@@ -109,16 +126,27 @@ async def test_http_voice_converter_stream_contract_and_cleanup() -> None:
         info = await converter.connect()
         assert info["session"]["session_id"] == "svc-1"
         audio = await converter.process(b"\x01\x00\x02\x00", 24000)
-        assert audio.data == b"\x00\x02\x00\x01"
+        assert audio.data == b""
+        assert audio.metrics["pending_samples"] == 2
+        audio = await converter.process(b"\x03\x00\x04\x00", 24000)
+        assert audio.data == b"\x00\x04\x00\x03\x00\x02\x00\x01"
         assert audio.sample_rate == 22050
         assert audio.metrics == {
             "block_count": 1,
             "inference_ms": 12.5,
             "pending_samples": 0,
         }
+        partial = await converter.process(b"\x05\x00", 24000)
+        assert partial.data == b""
         flushed = await converter.flush()
-        assert flushed.data == b"\x01\x00"
+        assert flushed.data == b"\x00\x05"
+        pending_before_reset = await converter.process(b"\x06\x00", 24000)
+        assert pending_before_reset.metrics["pending_samples"] == 1
         await converter.reset()
+        pending_after_reset = await converter.process(b"\x07\x00", 24000)
+        assert pending_after_reset.metrics["pending_samples"] == 1
+        flushed_after_reset = await converter.flush()
+        assert flushed_after_reset.data == b"\x00\x07"
     finally:
         await converter.close()
         await runner.cleanup()
@@ -176,6 +204,74 @@ async def test_voice_converter_rejects_profile_mismatch() -> None:
     )
     try:
         with pytest.raises(RuntimeError, match="profile mismatch"):
+            await converter.connect()
+    finally:
+        await converter.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_voice_converter_rejects_untraceable_seedvc_service() -> None:
+    async def handler(request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "status": "ok",
+                "profile_id": "elysia",
+                "input_sample_rate": 24000,
+                "output_sample_rate": 22050,
+            }
+        )
+
+    runner, url = await _start_server(handler)
+    converter = HttpVoiceConverter(
+        url,
+        "local-token",
+        "elysia",
+        connect_timeout=2,
+        request_timeout=2,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="protocol is obsolete"):
+            await converter.connect()
+    finally:
+        await converter.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_voice_converter_rejects_profile_revision_drift() -> None:
+    async def handler(request: web.Request) -> web.Response:
+        if request.path == "/health":
+            return web.json_response(
+                {
+                    "status": "ok",
+                    "protocol_version": 2,
+                    "profile_id": "elysia",
+                    "profile_revision": "profile-revision-1",
+                }
+            )
+        return web.json_response(
+            {
+                "session_id": "svc-1",
+                "profile_id": "elysia",
+                "profile_revision": "profile-revision-2",
+                "input_sample_rate": 24000,
+                "output_sample_rate": 22050,
+                "input_block_samples": 4,
+            },
+            status=201,
+        )
+
+    runner, url = await _start_server(handler)
+    converter = HttpVoiceConverter(
+        url,
+        "local-token",
+        "elysia",
+        connect_timeout=2,
+        request_timeout=2,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="profile changed"):
             await converter.connect()
     finally:
         await converter.close()

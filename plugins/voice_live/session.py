@@ -130,6 +130,11 @@ class CallSession:
                 if self._voice_converter is not None
                 else ""
             ),
+            "voice_conversion_revision": (
+                str(getattr(self._voice_converter, "profile_revision", ""))
+                if self._voice_converter is not None
+                else ""
+            ),
             "voice_conversion_queue": (
                 self._conversion_queue.qsize() if self._conversion_queue else 0
             ),

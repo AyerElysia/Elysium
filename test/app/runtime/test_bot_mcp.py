@@ -6,7 +6,6 @@ import sys
 from types import ModuleType
 from unittest.mock import AsyncMock, MagicMock, patch
 
-
 from src.app.runtime.bot import Bot
 
 
@@ -37,16 +36,21 @@ async def test_initialize_core_initializes_mcp_manager() -> None:
     fake_mcp_manager = MagicMock()
     fake_mcp_manager.initialize = AsyncMock(return_value=None)
 
-    with patch("src.core.transport.MessageReceiver", return_value=MagicMock()), patch(
-        "src.core.transport.SinkManager",
-        return_value=MagicMock(),
-    ), patch("src.core.transport.sink.set_sink_manager"), patch(
-        "src.core.managers.initialize_adapter_manager"
-    ), patch("src.core.managers.initialize_router_manager"), patch(
-        "src.core.managers.initialize_event_manager"
-    ), patch("src.core.managers.initialize_distribution"), patch(
-        "src.core.managers.get_mcp_manager",
-        return_value=fake_mcp_manager,
+    with (
+        patch("src.core.transport.MessageReceiver", return_value=MagicMock()),
+        patch(
+            "src.core.transport.SinkManager",
+            return_value=MagicMock(),
+        ),
+        patch("src.core.transport.sink.set_sink_manager"),
+        patch("src.core.managers.initialize_adapter_manager"),
+        patch("src.core.managers.initialize_router_manager"),
+        patch("src.core.managers.initialize_event_manager"),
+        patch("src.core.managers.initialize_distribution"),
+        patch(
+            "src.core.managers.get_mcp_manager",
+            return_value=fake_mcp_manager,
+        ),
     ):
         await bot._initialize_core()
 
@@ -57,6 +61,7 @@ async def test_initialize_core_initializes_mcp_manager() -> None:
 async def test_shutdown_cleans_up_mcp_manager() -> None:
     """shutdown() 应关闭 MCP 客户端连接。"""
     bot = _make_bot_for_runtime_mcp()
+    assert not hasattr(bot, "app_api_mount")
     bot.mcp_manager = MagicMock()
     bot.mcp_manager.cleanup = AsyncMock(return_value=None)
 
@@ -80,3 +85,4 @@ async def test_shutdown_cleans_up_mcp_manager() -> None:
         await bot.shutdown()
 
     bot.mcp_manager.cleanup.assert_awaited_once()
+    assert not hasattr(bot, "app_api_mount")
