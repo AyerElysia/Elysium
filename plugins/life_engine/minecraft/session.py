@@ -30,6 +30,25 @@ from .model_planner import (
 )
 
 
+async def _invoke_callback(
+    callback: Any,
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Await async callbacks and offload legacy synchronous callbacks."""
+
+    async_callable_object = callable(callback) and inspect.iscoroutinefunction(
+        type(callback).__call__
+    )
+    if inspect.iscoroutinefunction(callback) or async_callable_object:
+        return await callback(*args, **kwargs)
+    result = await asyncio.to_thread(callback, *args, **kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
 @dataclass(frozen=True, slots=True)
 class BodyProfile:
     """Explicit endpoint and planning contract for one body."""
@@ -183,8 +202,33 @@ class MinecraftSession:
             session_goal=goal,
             latest_observation=observation,
         )
-        self._register_consciousness()
-        await self._report_scene("body connected")
+        try:
+            await self._register_consciousness()
+            await self._report_scene("body connected")
+        except Exception as exception:  # noqa: BLE001 - lifecycle must not look ready
+            cleanup_errors: list[str] = []
+            try:
+                await runtime.close()
+            except Exception as cleanup_exception:  # noqa: BLE001
+                cleanup_errors.append(f"body cleanup failed: {cleanup_exception}")
+            try:
+                await self._terminate_consciousness()
+            except Exception as cleanup_exception:  # noqa: BLE001
+                cleanup_errors.append(f"Presence cleanup failed: {cleanup_exception}")
+            self._state.active = False
+            self._state.last_error = str(exception)
+            self._runtime = None
+            self._bridge_client = None
+            self._planner = None
+            error = f"Minecraft session lifecycle initialization failed: {exception}"
+            if cleanup_errors:
+                error = f"{error}; {'; '.join(cleanup_errors)}"
+            return {
+                "success": False,
+                "error": error,
+                "body_name": selected_name,
+                "trace_path": str(trace.path),
+            }
         return {
             "success": True,
             "session_id": session_id,
@@ -207,7 +251,7 @@ class MinecraftSession:
             await runtime.interrupt("Minecraft session stopped")
             await runtime.close()
         await self._report_scene("session ended")
-        self._terminate_consciousness()
+        await self._terminate_consciousness()
         duration = self._state.duration_seconds
         session_id = self._state.session_id
         trace_path = str(self._trace.path) if self._trace else ""
@@ -245,7 +289,7 @@ class MinecraftSession:
             "stream_id": self._state.stream_id,
         }
         if self._prepare_perception is not None:
-            perception = await asyncio.to_thread(
+            perception = await _invoke_callback(
                 self._prepare_perception,
                 self._state.consciousness_instance_id,
             )
@@ -271,7 +315,7 @@ class MinecraftSession:
             self._execution_task = task
             result = await task
             if perception is not None and self._commit_perception is not None:
-                await asyncio.to_thread(self._commit_perception, perception)
+                await _invoke_callback(self._commit_perception, perception)
         except Exception as exception:  # noqa: BLE001 - report planner/bridge evidence failure
             self._state.last_error = str(exception)
             return {
@@ -424,15 +468,17 @@ class MinecraftSession:
         if kind == "observation":
             self._state.latest_observation = WorldObservation.from_wire(payload)
         if self._registry is not None and self._state.consciousness_instance_id:
-            self._registry.touch(
+            await _invoke_callback(
+                self._registry.touch,
                 self._state.consciousness_instance_id,
                 timestamp=datetime.now(UTC).isoformat(),
                 reason=f"minecraft_trace:{kind}",
             )
             if self._save_registry is not None:
-                await asyncio.to_thread(self._save_registry)
+                await _invoke_callback(self._save_registry)
         if self._report_world_observation is not None and self._state.stream_id:
-            result = self._report_world_observation(
+            await _invoke_callback(
+                self._report_world_observation,
                 f"Minecraft trace persisted: {kind}",
                 source_instance_id=self._state.consciousness_instance_id,
                 subject=self._state.stream_id,
@@ -441,10 +487,8 @@ class MinecraftSession:
                 stream_id=self._state.stream_id,
                 value={"trace_kind": kind, "payload": payload},
             )
-            if inspect.isawaitable(result):
-                await result
 
-    def _register_consciousness(self) -> None:
+    async def _register_consciousness(self) -> None:
         """Register an independent Minecraft consciousness scene when available."""
 
         if self._registry is None:
@@ -468,28 +512,30 @@ class MinecraftSession:
             session_id=self._state.session_id,
             lease_duration_seconds=300,
         )
-        self._registry.register(instance)
+        await _invoke_callback(self._registry.register, instance)
         if self._save_registry is not None:
-            self._save_registry()
+            await _invoke_callback(self._save_registry)
 
-    def _terminate_consciousness(self) -> None:
+    async def _terminate_consciousness(self) -> None:
         """Terminate this session's registered consciousness instance."""
 
         if self._registry is None or not self._state.consciousness_instance_id:
             return
-        self._registry.terminate(
+        await _invoke_callback(
+            self._registry.terminate,
             self._state.consciousness_instance_id,
             reason="minecraft_session_ended",
         )
         if self._save_registry is not None:
-            self._save_registry()
+            await _invoke_callback(self._save_registry)
 
     async def _report_scene(self, status: str) -> None:
         """Append factual session lifecycle as an attributed observation."""
 
         if self._report_world_observation is None or not self._state.stream_id:
             return
-        result = self._report_world_observation(
+        await _invoke_callback(
+            self._report_world_observation,
             status,
             source_instance_id=self._state.consciousness_instance_id,
             subject=self._state.stream_id,
@@ -502,5 +548,3 @@ class MinecraftSession:
                 "session_id": self._state.session_id,
             },
         )
-        if inspect.isawaitable(result):
-            await result

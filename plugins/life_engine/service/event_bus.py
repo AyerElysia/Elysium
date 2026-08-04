@@ -17,11 +17,14 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum, IntEnum
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from src.kernel.sync.local_store import create_local_sync_schema, enqueue_in_transaction
 
 from .event_builder import EventType, LifeEngineEvent
+
+if TYPE_CHECKING:
+    from plugins.life_engine.storage.event_contracts import LifeEventStorePort
 
 RAW_EVENT_LOG_FILE = "life_events.jsonl"
 RAW_EVENT_DB_FILE = "life_events.sqlite3"
@@ -249,38 +252,28 @@ def life_event_from_dict(data: dict[str, Any]) -> LifeEvent:
         event_type=str(data.get("event_type") or "unknown"),
         content=str(data.get("content") or ""),
         stream_id=str(data.get("stream_id") or ""),
-        reply_target=data.get("reply_target") if isinstance(data.get("reply_target"), dict) else None,
+        reply_target=data.get("reply_target")
+        if isinstance(data.get("reply_target"), dict)
+        else None,
         priority=int(data.get("priority") or int(LifeEventPriority.NORMAL)),
         salience=float(data.get("salience") or 0.0),
         ttl_seconds=(
-            int(data["ttl_seconds"])
-            if data.get("ttl_seconds") is not None
-            else None
+            int(data["ttl_seconds"]) if data.get("ttl_seconds") is not None else None
         ),
         metadata=metadata,
         occurrence_id=str(data.get("occurrence_id") or ""),
         source_sequence=int(data.get("source_sequence") or data.get("sequence") or 0),
         recorded_at=str(data.get("recorded_at") or ""),
         source_instance_id=str(
-            data.get("source_instance_id")
-            or metadata.get("source_instance_id")
-            or ""
+            data.get("source_instance_id") or metadata.get("source_instance_id") or ""
         ),
         causation_id=str(
-            data.get("causation_id")
-            or metadata.get("causation_id")
-            or ""
+            data.get("causation_id") or metadata.get("causation_id") or ""
         ),
         correlation_id=str(
-            data.get("correlation_id")
-            or metadata.get("correlation_id")
-            or ""
+            data.get("correlation_id") or metadata.get("correlation_id") or ""
         ),
-        content_ref=str(
-            data.get("content_ref")
-            or metadata.get("content_ref")
-            or ""
-        ),
+        content_ref=str(data.get("content_ref") or metadata.get("content_ref") or ""),
     )
 
 
@@ -680,7 +673,9 @@ class RawEventStore(_LegacyJSONLEventStore):
         if str(row["payload_hash"]) != payload_hash:
             raise ValueError(f"RawEventOccurrenceConflict:{occurrence_id}")
         if inserted:
-            metadata = normalized.metadata if isinstance(normalized.metadata, dict) else {}
+            metadata = (
+                normalized.metadata if isinstance(normalized.metadata, dict) else {}
+            )
             enqueue_in_transaction(
                 db,
                 event_id=occurrence_id,
@@ -1059,12 +1054,12 @@ class RawEventStore(_LegacyJSONLEventStore):
 class LifeEventBus:
     """Compatibility event bus that mirrors legacy events to raw storage."""
 
-    def __init__(self, store: RawEventStore) -> None:
+    def __init__(self, store: RawEventStore | LifeEventStorePort) -> None:
         self._store = store
         self._lock = asyncio.Lock()
 
     @property
-    def store(self) -> RawEventStore:
+    def store(self) -> RawEventStore | LifeEventStorePort:
         return self._store
 
     async def publish(self, event: LifeEvent) -> LifeEvent:
@@ -1080,5 +1075,9 @@ class LifeEventBus:
     async def publish_legacy_event(self, event: LifeEngineEvent) -> LifeEvent:
         return await self.publish(life_event_from_legacy(event))
 
-    async def publish_legacy_events(self, events: list[LifeEngineEvent]) -> list[LifeEvent]:
-        return await self.publish_many([life_event_from_legacy(event) for event in events])
+    async def publish_legacy_events(
+        self, events: list[LifeEngineEvent]
+    ) -> list[LifeEvent]:
+        return await self.publish_many(
+            [life_event_from_legacy(event) for event in events]
+        )

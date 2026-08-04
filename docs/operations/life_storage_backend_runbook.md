@@ -115,6 +115,33 @@ Memory 的本地合同测试不需要外部服务；真实 MySQL 合同测试必
 
 本阶段只验证适配器合同，不会修改 `storage.enabled`、不会迁移正式数据、不会注册或激活正式 generation，也不会启动或停止 Elysium、NapCat 或其他运行进程。
 
+### 6.2 候选复制控制面
+
+候选复制不得借用正式 authority。`life_storage_copy_runs` 只协调复制/导出批次，使用数据库时间租约、单调 epoch 与 fencing token；它不能注册或激活 backend generation。
+
+- 每个批次绑定不可变的 source manifest hash、source snapshot/root hash、目标后端与 `writer_frozen` 事实；
+- 进度使用绝对单调计数，崩溃重试不会重复累计；
+- 冲突证据只追加，发生冲突的批次不得标记 `verified`；
+- 已过期租约可由协调器按数据库时间收束为 `failed`，不能强制抢占仍有效的租约；
+- 即使逐条校验通过，只要 `writer_frozen=false`，状态最多为 `copied`；
+- 候选复制不得修改 `storage.enabled`、active generation 或正在运行的 Elysium。
+
+Life Event 旧账本迁移必须使用 exact snapshot import。禁止先反序列化为当前 `LifeEvent` 再序列化，因为新增可选字段也会改变原始 JSON 字节与证据哈希。MySQL 的原始事件 payload 使用带 `JSON_VALID` 检查的 binary-collated `LONGTEXT` 保存原文，同时保留 SHA-256。
+
+正式 activation 默认要求数据库级不可变 trigger。若 MySQL 账号因 binary logging / `SUPER` 权限限制无法创建 trigger，初始化必须 fail closed。仅非冻结、不可激活的影子复制可显式降级为应用层不可变，并必须在报告中记录。
+
+### 6.3 反向导出
+
+反向导出只能写入一个此前不存在的新目录：
+
+- 创建时先写 `EXPORT_INCOMPLETE`；
+- 逐条导出 identity、位置、原始 payload 字节、payload hash 与 consumer cursor；
+- SQLite `integrity_check`、逐条 hash 与聚合根全部通过后才写 manifest 并移除 incomplete 标记；
+- 失败目录保留现场且不可复用；不得覆盖迁移前 SQLite 或任何既有备份；
+- MySQL `DATETIME(6)` 导出为 UTC 规范时间，事件 payload 原文字节保持不变。
+
+当前已验证的 Life Event 恢复副本位于 `C:\Temp\Data\ElysiumBackups\life-event-reverse-20260804T0735Z`。它是恢复演练资产，不是 active backend，也不授权自动切换。
+
 ## 7. 正式切换验收门
 
 必须同时满足后才允许人工切换：
