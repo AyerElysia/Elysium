@@ -82,6 +82,7 @@ def mount_api_v1(
     foundation: FoundationProjection | None = None,
     event_store_provider: Callable[[], RawEventStore | None] | None = None,
     command_registry: HandlerRegistry | None = None,
+    chat_command_service: object | None = None,
     task_manager: TaskManager | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> APIV1Mount:
@@ -100,9 +101,15 @@ def mount_api_v1(
     auth_path = _resolve_auth_path(workspace_root, database_path)
     store = AuthStore(auth_path, installation_id=installation_id)
     command_store = CommandStore(auth_path)
+    registry = command_registry or HandlerRegistry()
+    if chat_command_service is not None:
+        register = getattr(chat_command_service, "register", None)
+        if not callable(register):
+            raise TypeError("chat_command_service must provide register(registry)")
+        register(registry)
     command_dispatcher = CommandDispatcher(
         command_store,
-        registry=command_registry,
+        registry=registry,
         task_manager=task_manager,
     )
     try:
@@ -121,6 +128,7 @@ def mount_api_v1(
             ),
             command_store=command_store,
             command_dispatcher=command_dispatcher,
+            chat_commands_enabled=chat_command_service is not None,
         )
         app = create_api_app(context)
         app.add_middleware(
