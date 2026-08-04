@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import wave
 from pathlib import Path
@@ -342,9 +343,7 @@ async def test_session_runs_audio_interrupt_transcript_tool_and_cleanup(
     assert bridge.transcripts == [("assistant", "你好", "evt")]
     await session.handle_message({"type": "interrupt", "played_audio_ms": 127})
     assert provider.interrupt_values == [127]
-    clear_count = sum(
-        event.get("type") == "playback.clear" for event in json_events
-    )
+    clear_count = sum(event.get("type") == "playback.clear" for event in json_events)
     assert clear_count == 1
     await provider._emit_interruption(
         InterruptionEvent("client", "response-1", "item-1")
@@ -561,6 +560,72 @@ async def test_conversion_backpressure_fails_closed(tmp_path: Path) -> None:
     assert session.state is SessionState.FAILED
     assert converter.closed is True
     assert any(event.get("fatal") is True for event in json_events)
+
+
+@pytest.mark.asyncio
+async def test_session_archives_training_tracks_and_transcript_cursors(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    config.observability.persist_audio = True
+    config.voice_conversion.enabled = True
+    provider = FakeProvider()
+    converter = FakeVoiceConverter()
+    store = VoiceEpisodeStore(tmp_path, "voice_training", "training")
+    session = CallSession(
+        config,
+        "training",
+        provider_factory=lambda _: provider,
+        voice_converter_factory=lambda _: converter,
+        store=store,
+        consciousness=FakeConsciousness(),
+        bridge=FakeBridge(),
+        tool_broker=FakeBroker(),
+    )
+
+    assert await session.start() is True
+    user_pcm = b"\x01\x00" * 320
+    assistant_pcm = b"\x02\x00" * 480
+    await session.handle_audio(pack_audio_frame(1, 16000, user_pcm))
+    await provider._emit_audio(
+        AudioDelta(assistant_pcm, 24000, response_id="training-response")
+    )
+    assert session._conversion_queue is not None
+    await asyncio.wait_for(session._conversion_queue.join(), timeout=1)
+    await provider._emit_transcript(
+        TranscriptEvent("assistant", "training text", True, "training-transcript")
+    )
+    await session.stop(reason="training_complete")
+
+    for name, expected in (
+        ("user_input", user_pcm),
+        ("assistant_source", assistant_pcm),
+        ("assistant_converted", assistant_pcm),
+    ):
+        with wave.open(str(store.directory / "audio" / f"{name}.wav"), "rb") as audio:
+            assert audio.readframes(audio.getnframes()) == expected
+
+    anchor = next(
+        record
+        for record in store.read_all()
+        if record.event == "audio.transcript_anchor"
+    )
+    assert anchor.payload["provider_event_id"] == "training-transcript"
+    assert anchor.payload["cursors"]["user_input"]["samples_enqueued"] == 320
+    assert anchor.payload["cursors"]["assistant_source"]["samples_enqueued"] == 480
+    assert anchor.payload["cursors"]["assistant_converted"]["samples_enqueued"] == 480
+    closed = next(
+        record for record in store.read_all() if record.event == "audio.archive.closed"
+    )
+    assert closed.payload["state"] == "closed"
+    assert all(track["sha256_pcm"] for track in closed.payload["tracks"].values())
+    manifest = json.loads(
+        (store.directory / "audio" / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["metadata"]["archive_layer"] == "L0_episode_source"
+    assert manifest["metadata"]["canonicalization"] == "not_applied"
+    assert manifest["metadata"]["training_eligibility"] == "unreviewed"
+    assert session.snapshot()["audio_archive"]["state"] == "closed"
 
 
 @pytest.mark.asyncio

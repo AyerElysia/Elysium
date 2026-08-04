@@ -242,7 +242,7 @@ class VoiceLiveConfig(BaseConfig):
         )
         persist_audio: bool = Field(
             default=False,
-            description="是否保存原始通话音频；默认关闭以保护隐私",
+            description="是否分轨保存用户输入、模型原声与 SeedVC 输出；默认关闭以保护隐私",
         )
         metrics_interval_seconds: int = Field(
             default=5, ge=1, description="向浏览器推送指标的周期"

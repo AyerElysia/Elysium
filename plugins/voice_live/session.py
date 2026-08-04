@@ -13,6 +13,7 @@ from typing import Any
 from src.kernel.logger import get_logger
 
 from .audio import resample_pcm16_mono
+from .audio_archive import AudioTrackSpec, VoiceAudioArchive
 from .config import VoiceLiveConfig
 from .consciousness import VoiceLiveConsciousnessManager
 from .context_bridge import ContextBridge, VoicePromptBundle
@@ -102,6 +103,9 @@ class CallSession:
         self._perception_refresh_lock = asyncio.Lock()
         self._pending_voice_perception: Any | None = None
         self._subject_context_audit: dict[str, Any] = {}
+        self._audio_archive: VoiceAudioArchive | None = None
+        self._audio_archive_summary: dict[str, Any] = {}
+        self._audio_capture_error = ""
 
     @property
     def state(self) -> SessionState:
@@ -149,6 +153,7 @@ class CallSession:
             "interruptions": self._interruptions,
             "age_seconds": round(time.monotonic() - self._created_monotonic, 3),
             "failure_reason": self._failure_reason,
+            "audio_archive": self._audio_archive_snapshot(),
         }
 
     def set_send_callbacks(self, send_json: Any, send_bytes: Any) -> None:
@@ -172,6 +177,9 @@ class CallSession:
         self._tool_broker = VoiceToolBroker(
             self._consciousness, self._config, self._store
         )
+        self._audio_archive = None
+        self._audio_archive_summary = {}
+        self._audio_capture_error = ""
 
     async def start(self, mode: str = "auto", *, resume_episode_id: str = "") -> bool:
         """Start the explicit provider; never switch models implicitly."""
@@ -196,6 +204,7 @@ class CallSession:
         try:
             provider = self._provider_factory(self._config)
             self._provider = provider
+            await self._start_audio_archive(provider)
             self._register_provider_callbacks(provider)
             await self._consciousness.activate(provider.provider_name)
             converter = self._voice_converter_factory(self._config)
@@ -218,6 +227,17 @@ class CallSession:
                         "service": conversion_info.get("health", {}),
                     },
                 )
+                if self._audio_archive is not None:
+                    self._audio_archive.update_metadata(
+                        voice_conversion_active=True,
+                        voice_conversion_profile=(
+                            self._config.voice_conversion.profile_id
+                        ),
+                        voice_conversion_revision=str(
+                            getattr(converter, "profile_revision", "")
+                        ),
+                        playback_track="assistant_converted",
+                    )
             schemas = self._tool_broker.schemas()
             prompt_result = self._bridge.build_system_prompt()
             if inspect.isawaitable(prompt_result):
@@ -230,6 +250,18 @@ class CallSession:
                 # Isolated test bridges may still expose the legacy string contract.
                 instructions = str(prompt_result)
                 context_layers = {}
+            if self._audio_archive is not None:
+                self._audio_archive.update_metadata(
+                    subject_context_revision=self._subject_context_audit.get(
+                        "revision", ""
+                    ),
+                    subject_context_source_digest=self._subject_context_audit.get(
+                        "source_digest", ""
+                    ),
+                    subject_context_projection_sha256=self._subject_context_audit.get(
+                        "projection_sha256", ""
+                    ),
+                )
             await self._store.append_async(
                 "provider.configuration",
                 {
@@ -275,6 +307,7 @@ class CallSession:
                 except Exception as cleanup_exc:  # noqa: BLE001
                     logger.debug(f"Provider startup cleanup failed: {cleanup_exc}")
             await self._stop_voice_conversion()
+            await self._stop_audio_archive(reason="startup_failed")
             if self._consciousness.is_active:
                 await self._consciousness.suspend(reason="startup_failed")
             await self._fail(f"启动失败: {failure}")
@@ -307,6 +340,7 @@ class CallSession:
                     if self._voice_converter is not None
                     else ""
                 ),
+                "audio_capture": self._audio_archive_snapshot(),
             }
         )
         return True
@@ -328,6 +362,10 @@ class CallSession:
             await self._stop_voice_conversion()
         except Exception as exc:  # noqa: BLE001 - lifecycle cleanup boundary
             errors.append(exc)
+        try:
+            await self._stop_audio_archive(reason=reason)
+        except Exception as exc:  # noqa: BLE001 - lifecycle cleanup boundary
+            errors.append(exc)
         if self._consciousness.is_active:
             try:
                 await self._consciousness.suspend(reason=reason)
@@ -341,6 +379,7 @@ class CallSession:
                     "reason": reason,
                     "failed": was_failed,
                     "cleanup_errors": [str(exc) for exc in errors],
+                    "audio_archive": self._audio_archive_snapshot(),
                 },
             )
             await self._store.checkpoint_async(
@@ -411,6 +450,7 @@ class CallSession:
             frame.pcm16, frame.sample_rate, self._provider.input_sample_rate
         )
         self._input_audio_bytes += len(pcm16)
+        self._archive_audio("user_input", pcm16, self._provider.input_sample_rate)
         await self._provider.send_audio(pcm16)
 
     def _register_provider_callbacks(self, provider: BaseRealtimeProvider) -> None:
@@ -424,6 +464,7 @@ class CallSession:
         provider.on_response_done(self._on_response_done)
 
     async def _on_audio(self, event: AudioDelta) -> None:
+        self._archive_audio("assistant_source", event.data, event.sample_rate)
         if self._voice_converter is not None:
             queue = self._conversion_queue
             if queue is None or self._conversion_task is None:
@@ -512,6 +553,15 @@ class CallSession:
             }
         )
         if event.is_final:
+            if self._audio_archive is not None:
+                await self._store.append_async(
+                    "audio.transcript_anchor",
+                    {
+                        "role": event.role,
+                        "provider_event_id": event.event_id,
+                        "cursors": self._audio_archive.cursor_snapshot(),
+                    },
+                )
             await self._bridge.record_transcript(
                 event.role, event.text, provider_event_id=event.event_id
             )
@@ -532,6 +582,11 @@ class CallSession:
                 "source": event.source,
                 "response_id": event.response_id,
                 "item_id": event.item_id,
+                "audio_cursors": (
+                    self._audio_archive.cursor_snapshot()
+                    if self._audio_archive is not None
+                    else {}
+                ),
             },
         )
         # Browser-originated barge-in already cleared playback, reset conversion,
@@ -587,6 +642,7 @@ class CallSession:
             except Exception as cleanup_exc:  # noqa: BLE001
                 logger.debug(f"Provider failure cleanup failed: {cleanup_exc}")
         await self._stop_voice_conversion()
+        await self._stop_audio_archive(reason="failed")
         if self._consciousness.is_active:
             await self._consciousness.suspend(reason="abnormal_exit")
         await self._store.checkpoint_async(
@@ -662,6 +718,11 @@ class CallSession:
                                 output_rate,
                             )
                             self._converted_audio_bytes += len(pcm16)
+                            self._archive_audio(
+                                "assistant_converted",
+                                pcm16,
+                                output_rate,
+                            )
                             await self._emit_audio(
                                 AudioDelta(
                                     pcm16,
@@ -716,6 +777,147 @@ class CallSession:
             await asyncio.gather(task, return_exceptions=True)
         if converter is not None:
             await converter.close()
+
+    async def _start_audio_archive(self, provider: BaseRealtimeProvider) -> None:
+        if not self._config.observability.persist_audio:
+            return
+        specs = [
+            AudioTrackSpec(
+                "user_input",
+                provider.input_sample_rate,
+                role="user",
+                stage="provider_input",
+            ),
+            AudioTrackSpec(
+                "assistant_source",
+                provider.output_sample_rate,
+                role="assistant",
+                stage="provider_output_before_voice_conversion",
+            ),
+        ]
+        if self._config.voice_conversion.enabled:
+            specs.append(
+                AudioTrackSpec(
+                    "assistant_converted",
+                    self._config.audio.output_sample_rate,
+                    role="assistant",
+                    stage="browser_playback_after_voice_conversion",
+                )
+            )
+        archive = VoiceAudioArchive(self._store)
+        try:
+            await archive.start(
+                specs,
+                metadata={
+                    "archive_layer": "L0_episode_source",
+                    "canonicalization": "not_applied",
+                    "training_eligibility": "unreviewed",
+                    "provider": provider.provider_name,
+                    "model": self._config.full_duplex.model_name,
+                    "voice": self._config.full_duplex.voice,
+                    "user_id": self._config.session.user_id,
+                    "record_to_life": self._config.session.record_to_life,
+                    "voice_conversion_configured": (
+                        self._config.voice_conversion.enabled
+                    ),
+                    "voice_conversion_profile": (
+                        self._config.voice_conversion.profile_id
+                        if self._config.voice_conversion.enabled
+                        else ""
+                    ),
+                    "playback_track": (
+                        "assistant_converted"
+                        if self._config.voice_conversion.enabled
+                        else "assistant_source"
+                    ),
+                    "retention": "until_explicitly_removed",
+                },
+            )
+        except Exception:
+            await archive.close(reason="startup_failed")
+            raise
+        self._audio_archive = archive
+        await self._store.append_async(
+            "audio.archive.started",
+            {
+                "schema_version": 1,
+                "directory": "audio",
+                "tracks": [spec.name for spec in specs],
+            },
+        )
+
+    def _archive_audio(self, track: str, pcm16: bytes, sample_rate: int) -> None:
+        archive = self._audio_archive
+        if archive is None or not pcm16:
+            return
+        try:
+            accepted = archive.append(track, pcm16, sample_rate)
+        except Exception as exc:  # noqa: BLE001 - recorder must not break Voice
+            self._audio_capture_error = f"{type(exc).__name__}: {exc}"
+            return
+        if not accepted and not self._audio_capture_error:
+            snapshot = archive.snapshot()
+            self._audio_capture_error = str(
+                snapshot.get("writer_error") or "audio archive queue overflow"
+            )
+
+    def _audio_archive_snapshot(self) -> dict[str, Any]:
+        if self._audio_archive is not None:
+            snapshot = self._audio_archive.snapshot()
+        elif self._audio_archive_summary:
+            tracks = dict(self._audio_archive_summary.get("tracks") or {})
+            snapshot = {
+                "enabled": True,
+                "state": self._audio_archive_summary.get("state", "closed"),
+                "writer_error": self._audio_archive_summary.get("writer_error", ""),
+                "tracks": {
+                    name: {
+                        "sample_rate": item.get("sample_rate"),
+                        "written_bytes": item.get("pcm_bytes", 0),
+                        "unwritten_bytes": item.get("unwritten_bytes", 0),
+                        "dropped_bytes": item.get("dropped_bytes", 0),
+                    }
+                    for name, item in tracks.items()
+                },
+            }
+        else:
+            enabled = bool(self._config.observability.persist_audio)
+            snapshot = {
+                "enabled": enabled,
+                "state": "configured" if enabled else "disabled",
+                "writer_error": "",
+                "tracks": {},
+            }
+        if self._audio_capture_error:
+            snapshot["capture_error"] = self._audio_capture_error
+        return snapshot
+
+    async def _stop_audio_archive(self, *, reason: str) -> None:
+        archive = self._audio_archive
+        if archive is None:
+            return
+        try:
+            summary = await archive.close(reason=reason)
+            self._audio_archive_summary = summary
+            await self._store.append_async(
+                "audio.archive.closed",
+                {
+                    "state": summary.get("state", ""),
+                    "reason": summary.get("reason", reason),
+                    "writer_error": summary.get("writer_error", ""),
+                    "tracks": {
+                        name: {
+                            "pcm_bytes": item.get("pcm_bytes", 0),
+                            "unwritten_bytes": item.get("unwritten_bytes", 0),
+                            "dropped_bytes": item.get("dropped_bytes", 0),
+                            "sha256_pcm": item.get("sha256_pcm", ""),
+                        }
+                        for name, item in dict(summary.get("tracks") or {}).items()
+                    },
+                },
+            )
+        finally:
+            self._audio_archive = None
 
     async def _send_error(self, message: str, *, fatal: bool = False) -> None:
         await self._send_json_safe(
