@@ -1763,13 +1763,28 @@ class LifeEngineConfig(BaseConfig):
         )
 
         mc_version: str = Field(
-            default="1.21.4",
+            default="1.21.1",
             description="Minecraft 版本。",
         )
 
         world_name: str = Field(
-            default="elysia_world",
+            default="Elysian Realm",
             description="专用存档名称。",
+        )
+
+        mc_home: str = Field(
+            default="/mnt/g/Game/Minecraft/.minecraft",
+            description="Exact WSL path of the managed Minecraft home.",
+        )
+
+        launch_bat: str = Field(
+            default=r"G:\Game\Minecraft\PCL\LaunchElysia.bat",
+            description="Exact Windows launch script for the managed client.",
+        )
+
+        launch_dir: str = Field(
+            default=r"G:\Game\Minecraft\PCL",
+            description="Exact Windows working directory for the launch script.",
         )
 
         window_width: int = Field(
@@ -1875,8 +1890,53 @@ class LifeEngineConfig(BaseConfig):
             description="Technical launch deadline for the selected body endpoint.",
         )
 
+        world_ready_timeout_seconds: float = Field(
+            default=120.0,
+            gt=0,
+            description="Deadline for a playable world and advancing observations.",
+        )
+
+        require_quick_play: bool = Field(
+            default=True,
+            description="Require the launch script to enter the exact configured world.",
+        )
+
+        expected_bridge_version: str = Field(
+            default="0.2.0",
+            min_length=1,
+            description="Exact authenticated NeoForge bridge build version.",
+        )
+
+        bridge_mod_filename: str = Field(
+            default="elysium_bridge-0.2.0.jar",
+            min_length=1,
+            description="Exact selected NeoForge bridge artifact filename.",
+        )
+
+        expected_bridge_sha256: str = Field(
+            default=(
+                "AB455A1285196A7ACAFD996D32E669F1B865880DA20EE29E25481775F1A624CA"
+            ),
+            pattern=r"^[A-Fa-f0-9]{64}$",
+            description="Pinned SHA-256 for the selected NeoForge bridge artifact.",
+        )
+
+        baritone_mod_filename: str = Field(
+            default="baritone-unoptimized-neoforge-1.11.2.jar",
+            min_length=1,
+            description="Exact official Baritone NeoForge artifact filename.",
+        )
+
+        expected_baritone_sha256: str = Field(
+            default=(
+                "B413CE0A2754A3C8484AAE39875CF84BE1F999DEE208E86D41B3D0D329D5CA35"
+            ),
+            pattern=r"^[A-Fa-f0-9]{64}$",
+            description="Pinned SHA-256 for the official Baritone artifact.",
+        )
+
         intent_timeout_seconds: float | None = Field(
-            default=None,
+            default=300.0,
             gt=0,
             description="Optional caller-owned lifetime for one game intention.",
         )

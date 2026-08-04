@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.asyncio.server import Server, ServerConnection, serve
+from websockets.exceptions import ConnectionClosed
 
 from .embodiment_contracts import (
     ActionCommand,
@@ -83,9 +84,12 @@ class MinecraftBridgeClient:
         self._config = config
         self._socket: ClientConnection | ServerConnection | None = None
         self._server: Server | None = None
-        self._accept_ready: asyncio.Future[
-            tuple[ServerConnection, str, tuple[str, ...]]
-        ] | None = None
+        self._accept_ready: (
+            asyncio.Future[
+                tuple[ServerConnection, str, tuple[str, ...], dict[str, Any]]
+            ]
+            | None
+        ) = None
         self._receiver: asyncio.Task[None] | None = None
         self._send_lock = asyncio.Lock()
         self._observation_changed = asyncio.Condition()
@@ -94,6 +98,7 @@ class MinecraftBridgeClient:
         self._latest_observation: WorldObservation | None = None
         self._instance_id: str | None = None
         self._capabilities: tuple[str, ...] = ()
+        self._hello_metadata: dict[str, Any] = {}
         self._failure: BaseException | None = None
 
     @property
@@ -118,6 +123,12 @@ class MinecraftBridgeClient:
 
         return self._capabilities
 
+    @property
+    def hello_metadata(self) -> dict[str, Any]:
+        """Return non-secret authenticated body metadata from the hello frame."""
+
+        return dict(self._hello_metadata)
+
     async def open(self) -> None:
         """Connect, authenticate a nonce, and start the receive loop."""
 
@@ -135,7 +146,7 @@ class MinecraftBridgeClient:
                 ping_timeout=10,
             )
             try:
-                instance_id, capabilities = await self._authenticate(socket)
+                instance_id, capabilities, metadata = await self._authenticate(socket)
             except BaseException:
                 await socket.close()
                 raise
@@ -143,6 +154,7 @@ class MinecraftBridgeClient:
         self._socket = socket
         self._instance_id = instance_id
         self._capabilities = capabilities
+        self._hello_metadata = metadata
         self._receiver = asyncio.create_task(
             self._receive_loop(socket),
             name=f"minecraft_bridge_receive:{instance_id}",
@@ -158,7 +170,7 @@ class MinecraftBridgeClient:
         expected_path = parsed.path or "/"
         loop = asyncio.get_running_loop()
         ready: asyncio.Future[
-            tuple[ServerConnection, str, tuple[str, ...]]
+            tuple[ServerConnection, str, tuple[str, ...], dict[str, Any]]
         ] = loop.create_future()
         self._accept_ready = ready
 
@@ -173,14 +185,16 @@ class MinecraftBridgeClient:
                 await socket.close(code=1013, reason="controller lease is occupied")
                 return
             try:
-                instance_id, capabilities = await self._authenticate(socket)
-            except BaseException as exception:
+                instance_id, capabilities, metadata = await self._authenticate(socket)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exception:  # noqa: BLE001 - auth boundary rejects all failures
                 if not ready.done():
                     ready.set_exception(exception)
                 await socket.close(code=1008, reason="bridge authentication failed")
                 return
             if not ready.done():
-                ready.set_result((socket, instance_id, capabilities))
+                ready.set_result((socket, instance_id, capabilities, metadata))
             await socket.wait_closed()
 
         self._server = await serve(
@@ -193,7 +207,7 @@ class MinecraftBridgeClient:
         )
         try:
             async with asyncio.timeout(self._config.open_timeout_seconds):
-                socket, instance_id, capabilities = await ready
+                socket, instance_id, capabilities, metadata = await ready
         except BaseException:
             self._server.close()
             await self._server.wait_closed()
@@ -203,6 +217,7 @@ class MinecraftBridgeClient:
         self._socket = socket
         self._instance_id = instance_id
         self._capabilities = capabilities
+        self._hello_metadata = metadata
         self._receiver = asyncio.create_task(
             self._receive_loop(socket),
             name=f"minecraft_reverse_bridge_receive:{instance_id}",
@@ -211,7 +226,7 @@ class MinecraftBridgeClient:
     async def _authenticate(
         self,
         socket: ClientConnection | ServerConnection,
-    ) -> tuple[str, tuple[str, ...]]:
+    ) -> tuple[str, tuple[str, ...], dict[str, Any]]:
         """Authenticate a body peer regardless of WebSocket connection direction."""
 
         hello = self._decode(await socket.recv())
@@ -236,7 +251,17 @@ class MinecraftBridgeClient:
         if response.get("type") != "authentication" or not response.get("accepted"):
             raise BridgeProtocolError("bridge authentication was rejected")
         capabilities = tuple(str(item) for item in hello.get("capabilities", []))
-        return instance_id, capabilities
+        metadata = {
+            key: hello[key]
+            for key in (
+                "body_type",
+                "bridge_version",
+                "minecraft_version",
+                "neoforge_version",
+            )
+            if key in hello
+        }
+        return instance_id, capabilities, metadata
 
     async def close(self) -> None:
         """Request control release, close the socket, and fail pending work."""
@@ -248,9 +273,25 @@ class MinecraftBridgeClient:
         self._receiver = None
         self._server = None
         self._accept_ready = None
+        close_errors: list[Exception] = []
         if socket is not None:
-            await self._send_on(socket, {"type": "release_all", "reason": "client closing"})
-            await socket.close()
+            try:
+                await self._send_on(
+                    socket, {"type": "release_all", "reason": "client closing"}
+                )
+            except ConnectionClosed:
+                # A crashed or normally exiting game may close the peer first. At
+                # that point it can no longer retain controls, so cleanup remains
+                # successful and, importantly, retry-safe.
+                pass
+            except Exception as exc:  # noqa: BLE001 - finish all cleanup first
+                close_errors.append(exc)
+            try:
+                await socket.close()
+            except ConnectionClosed:
+                pass
+            except Exception as exc:  # noqa: BLE001 - finish all cleanup first
+                close_errors.append(exc)
         if receiver is not None and receiver is not asyncio.current_task():
             receiver.cancel()
             try:
@@ -261,6 +302,8 @@ class MinecraftBridgeClient:
             server.close()
             await server.wait_closed()
         self._fail_pending(BridgeDisconnectedError("bridge closed"))
+        if close_errors:
+            raise ExceptionGroup("Minecraft bridge cleanup failed", close_errors)
 
     async def observe(self, after_sequence: int | None = None) -> WorldObservation:
         """Wait for a complete observation newer than the requested sequence."""
@@ -279,7 +322,9 @@ class MinecraftBridgeClient:
                     lambda: available() or self._failure is not None
                 )
         if self._failure is not None:
-            raise BridgeDisconnectedError("bridge receiver failed") from self._failure
+            raise BridgeDisconnectedError(
+                f"bridge receiver failed: {self._failure}"
+            ) from self._failure
         observation = self._latest_observation
         if observation is None:
             raise BridgeProtocolError("observation notification had no payload")
@@ -406,7 +451,9 @@ class MinecraftBridgeClient:
                 raise BridgeProtocolError(f"hello is missing {field_name}")
         expected = self._config.expected_instance_id
         if expected is not None and str(hello["instance_id"]) != expected:
-            raise BridgeProtocolError("connected game instance was not the configured one")
+            raise BridgeProtocolError(
+                "connected game instance was not the configured one"
+            )
 
     async def _send(self, message: Mapping[str, Any]) -> None:
         """Serialize one message on the live socket."""

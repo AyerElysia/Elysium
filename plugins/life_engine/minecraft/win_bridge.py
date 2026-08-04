@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import shutil
 from pathlib import Path
@@ -21,6 +22,7 @@ logger = logging.getLogger("life_engine.minecraft.win_bridge")
 # PowerShell 脚本在 Windows 端的缓存路径
 _WIN_TEMP = Path("/mnt/c/Users/26652/AppData/Local/Temp")
 _HELPER_SCRIPT = _WIN_TEMP / "mc_helper.ps1"
+_LAUNCH_SCRIPT = _WIN_TEMP / "mc_launch.ps1"
 _CLICK_SCRIPT = _WIN_TEMP / "mc_click3.ps1"
 _HOLDKEY_SCRIPT = _WIN_TEMP / "mc_holdkey.ps1"
 _MOUSEMOVE_SCRIPT = _WIN_TEMP / "mc_mousemove.ps1"
@@ -28,6 +30,12 @@ _SENDKEY_SCRIPT = _WIN_TEMP / "mc_sendkey.ps1"
 
 # 本模块源码目录（用于部署脚本到 Windows 端）
 _MODULE_DIR = Path(__file__).parent
+_WSL_INTEROP_ENTRY = Path("/proc/sys/fs/binfmt_misc/WSLInterop")
+_BINFMT_REGISTER = Path("/proc/sys/fs/binfmt_misc/register")
+
+
+class WindowsBridgeError(RuntimeError):
+    """Raised when the WSL-to-Windows control path is unavailable."""
 
 
 class WinBridge:
@@ -45,6 +53,7 @@ class WinBridge:
 
     async def ensure_scripts(self) -> None:
         """确保 PowerShell 脚本已部署到 Windows 端。"""
+        self._ensure_windows_interop()
         if self._scripts_deployed:
             return
 
@@ -52,7 +61,11 @@ class WinBridge:
         src = _MODULE_DIR / "win_helper.ps1"
         if src.exists():
             shutil.copy2(src, _HELPER_SCRIPT)
-            logger.info(f"已部署 win_helper.ps1 → {_HELPER_SCRIPT}")
+        launch_src = _MODULE_DIR / "win_launch.ps1"
+        if not launch_src.is_file():
+            raise WindowsBridgeError(f"Windows launch helper is missing: {launch_src}")
+        shutil.copy2(launch_src, _LAUNCH_SCRIPT)
+        logger.info("Windows helpers deployed to %s", _WIN_TEMP)
 
         # 生成点击脚本
         self._deploy_click_script()
@@ -65,6 +78,31 @@ class WinBridge:
 
         self._scripts_deployed = True
         logger.info("Windows 辅助脚本部署完成")
+
+    @staticmethod
+    def _ensure_windows_interop() -> None:
+        """Restore the standard WSL PE handler when the current boot omitted it."""
+
+        if _WSL_INTEROP_ENTRY.exists():
+            return
+        if not Path("/init").is_file() or not _BINFMT_REGISTER.exists():
+            raise WindowsBridgeError(
+                "WSL Windows interoperability is unavailable on this host"
+            )
+        try:
+            _BINFMT_REGISTER.write_text(
+                ":WSLInterop:M::MZ::/init:PF",
+                encoding="ascii",
+            )
+        except OSError as exc:
+            raise WindowsBridgeError(
+                "WSL Windows interoperability is not registered and could not be "
+                "restored; run Elysium from a WSL account allowed to register binfmt"
+            ) from exc
+        if not _WSL_INTEROP_ENTRY.exists():
+            raise WindowsBridgeError(
+                "WSL Windows interoperability registration did not become active"
+            )
 
     def _deploy_click_script(self) -> None:
         """部署鼠标点击脚本（含礼貌焦点）。"""
@@ -341,21 +379,50 @@ Write-Output "OK|$Key|$result"
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             output = stdout.decode(errors="ignore").strip()
-            if proc.returncode != 0 and not output:
-                err = stderr.decode(errors="ignore")[:300]
-                logger.warning(f"PowerShell 错误: {err}")
+            if proc.returncode != 0:
+                error = stderr.decode(errors="ignore").strip()[:300]
+                raise WindowsBridgeError(
+                    f"Windows helper {script_path.name} failed with exit code "
+                    f"{proc.returncode}: {error or output[:300]}"
+                )
             return output
-        except asyncio.TimeoutError:
-            logger.warning(f"PowerShell 超时: {script_path.name}")
-            return ""
-        except Exception as exc:
-            logger.error(f"PowerShell 执行失败: {exc}")
-            return ""
+        except TimeoutError:
+            raise WindowsBridgeError(
+                f"Windows helper {script_path.name} exceeded {timeout:.1f}s"
+            ) from None
+        except WindowsBridgeError:
+            raise
+        except OSError as exc:
+            raise WindowsBridgeError(
+                f"Windows helper {script_path.name} could not start: {exc}"
+            ) from exc
 
     async def _run_ps_command(self, command: str, *args: str, timeout: float = 15.0) -> str:
         """执行 mc_helper.ps1 的命令。"""
         await self.ensure_scripts()
         return await self._run_ps(_HELPER_SCRIPT, command, *args, timeout=timeout)
+
+    async def launch_minecraft(
+        self,
+        launch_script: str,
+        working_directory: str,
+    ) -> int:
+        """Dispatch the exact managed batch file through a Windows-native helper."""
+
+        await self.ensure_scripts()
+        output = await self._run_ps(
+            _LAUNCH_SCRIPT,
+            "-LaunchScriptPath",
+            launch_script,
+            "-WorkingDirectory",
+            working_directory,
+            timeout=15.0,
+        )
+        if not output.startswith("DISPATCHED|"):
+            raise WindowsBridgeError(
+                f"Windows launch helper returned an invalid response: {output[:120]}"
+            )
+        return int(output.split("|", maxsplit=1)[1])
 
     # === 窗口管理 ===
 
@@ -366,14 +433,23 @@ Write-Output "OK|$Key|$result"
             parts = output.split("|")
             if len(parts) >= 6:
                 self._hwnd = int(parts[1])
-                return {
+                result: dict[str, Any] = {
                     "hwnd": int(parts[1]),
                     "x": int(parts[2]),
                     "y": int(parts[3]),
                     "w": int(parts[4]),
                     "h": int(parts[5]),
                 }
-        return None
+                if len(parts) >= 7 and parts[6]:
+                    result["pid"] = int(parts[6])
+                if len(parts) >= 8 and parts[7]:
+                    result["title"] = base64.b64decode(parts[7]).decode("utf-8")
+                return result
+        if output == "NOTFOUND":
+            return None
+        raise WindowsBridgeError(
+            f"Windows helper returned an invalid find response: {output[:120]}"
+        )
 
     async def is_running(self) -> bool:
         """检查 MC 进程是否在运行。"""
@@ -423,7 +499,7 @@ Write-Output "OK|$Key|$result"
                     img = PILImage.open(img_path)
                     img.load()
                     return img
-                except Exception as exc:
+                except (OSError, ValueError) as exc:
                     logger.debug(f"读取截图失败: {exc}")
         return None
 

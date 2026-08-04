@@ -22,10 +22,8 @@ def _get_session(plugin: Any) -> Any:
     service = getattr(plugin, "service", None)
     if service is None:
         return None
-    scheduler = getattr(service, "_learning_scheduler", None)
-    if scheduler is None:
-        return None
-    return getattr(scheduler, "minecraft_session", None)
+    session = getattr(service, "minecraft_session", None)
+    return session
 
 
 class LifeEngineMinecraftTool(BaseTool):
@@ -38,7 +36,15 @@ class LifeEngineMinecraftTool(BaseTool):
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["start", "stop", "do", "interrupt", "look", "status"],
+                "enum": [
+                    "preflight",
+                    "start",
+                    "stop",
+                    "do",
+                    "interrupt",
+                    "look",
+                    "status",
+                ],
                 "description": "操作类型",
             },
             "intent": {
@@ -73,7 +79,9 @@ class LifeEngineMinecraftTool(BaseTool):
         """执行 Minecraft 操作。"""
         plugin = kwargs.get("plugin")
         if plugin is None:
-            return json.dumps({"success": False, "error": "plugin 未提供"}, ensure_ascii=False)
+            return json.dumps(
+                {"success": False, "error": "plugin 未提供"}, ensure_ascii=False
+            )
 
         session = _get_session(plugin)
         if session is None:
@@ -83,6 +91,8 @@ class LifeEngineMinecraftTool(BaseTool):
             )
 
         match action:
+            case "preflight":
+                result = await session.preflight(body_name=body_name)
             case "start":
                 result = await session.start(goal=goal, body_name=body_name)
             case "stop":

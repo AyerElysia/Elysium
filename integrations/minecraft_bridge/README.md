@@ -11,5 +11,10 @@ first start it creates
 the game log. Authentication remains mandatory; keep the generated token
 private.
 
-Build with `./gradlew build`. The distributable jar is written under
-`build/libs/`.
+Build with `./gradlew clean test build --no-daemon`. The distributable jar is
+written under `build/libs/`. Its version and digest are pinned in
+`bridge-artifact-lock.json`; use `deploy_bridge.ps1` instead of copying it by
+hand. `prepare_launcher.ps1` configures exact single-player quick play, and
+`agent_live_smoke.py` proves one safe observation/action/evidence loop. The
+full operational procedure is documented in
+`docs/operations/minecraft_production_runbook.md`.

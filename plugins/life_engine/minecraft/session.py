@@ -8,6 +8,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +59,23 @@ class BodyProfile:
     listen_uri: str | None
     token_file: Path
     planner_guidance: str
+    required_operations: frozenset[str]
+    readiness_kind: str
+
+
+class ReadinessState(StrEnum):
+    """Externally diagnosable lifecycle states for one Minecraft body."""
+
+    IDLE = "idle"
+    PREFLIGHT = "preflight"
+    LAUNCHING = "launching"
+    AWAITING_BRIDGE = "awaiting_bridge"
+    AWAITING_WORLD = "awaiting_world"
+    READY = "ready"
+    ACTIVE = "active"
+    DEGRADED = "degraded"
+    FAILED = "failed"
+    CLOSING = "closing"
 
 
 @dataclass(slots=True)
@@ -76,6 +94,12 @@ class SessionState:
     latest_observation: WorldObservation | None = None
     conclusions: list[dict[str, Any]] = field(default_factory=list)
     last_error: str | None = None
+    readiness: str = ReadinessState.IDLE
+    readiness_detail: str = ""
+    launch_pid: int | None = None
+    window: dict[str, Any] | None = None
+    game_instance_id: str | None = None
+    bridge_version: str | None = None
 
     @property
     def duration_seconds(self) -> float:
@@ -117,6 +141,9 @@ class MinecraftSession:
         self._planner: JsonIntentPlanner | None = None
         self._trace: EmbodimentTrace | None = None
         self._execution_task: asyncio.Task[ExecutionResult] | None = None
+        self._lifecycle_lock = asyncio.Lock()
+        self._presence_registered = False
+        self._scene_open = False
         # Kept in the signature for callers during migration.  Planning now uses
         # the configured model stack directly and never falls back to rule parsing.
         self._legacy_llm_helper = llm_helper
@@ -133,11 +160,91 @@ class MinecraftSession:
 
         return self._state.active
 
+    async def preflight(self, body_name: str = "") -> dict[str, Any]:
+        """Inspect deployment facts without launching or binding a body endpoint."""
+
+        selected_name = body_name.strip() or self._config.default_body
+        profile = self._body_profiles().get(selected_name)
+        if profile is None:
+            return {
+                "success": False,
+                "error": f"body is not configured: {selected_name}",
+                "configured_bodies": sorted(self._body_profiles()),
+            }
+        blockers: list[str] = []
+        try:
+            installation = await self._launcher.check_installation()
+        except Exception as exception:  # noqa: BLE001 - diagnostic API boundary
+            return {
+                "success": False,
+                "body_name": selected_name,
+                "ready_to_start": False,
+                "blockers": [f"installation inspection failed: {exception}"],
+                "installation": None,
+                "existing_window": None,
+            }
+        window_error: str | None = None
+        try:
+            window = await self._launcher.find_window()
+        except Exception as exception:  # noqa: BLE001 - diagnostic API boundary
+            window = None
+            window_error = f"Windows control bridge is unavailable: {exception}"
+            blockers.append(window_error)
+        if not installation.get("exists"):
+            blockers.append("Minecraft home is missing")
+        if not installation.get("has_version"):
+            blockers.append(
+                f"NeoForge version for {self._config.mc_version} is missing"
+            )
+        if not installation.get("bat_exists"):
+            blockers.append("launch script is missing")
+        if selected_name == "agent" and not installation.get("world_exists"):
+            blockers.append(
+                f"configured world does not exist: {self._config.world_name}"
+            )
+        if selected_name == "agent" and not installation.get("bridge_mod_ready"):
+            blockers.append(
+                "the pinned Elysium NeoForge bridge artifact is not selected"
+            )
+        if selected_name == "agent" and not installation.get("baritone_mod_ready"):
+            blockers.append(
+                "the pinned official Baritone NeoForge artifact is not selected"
+            )
+        if self._config.require_quick_play and not installation.get(
+            "quick_play_configured"
+        ):
+            blockers.append(
+                "launch script does not enter the exact configured world with "
+                "--quickPlaySingleplayer"
+            )
+        if not profile.token_file.exists():
+            blockers.append(f"body token file is missing: {profile.token_file}")
+        return {
+            "success": not blockers,
+            "body_name": selected_name,
+            "ready_to_start": not blockers,
+            "blockers": blockers,
+            "installation": installation,
+            "existing_window": window,
+            "windows_bridge_error": window_error,
+            "required_operations": sorted(profile.required_operations),
+            "expected_bridge_version": self._config.expected_bridge_version,
+        }
+
     async def start(self, goal: str = "", body_name: str = "") -> dict[str, Any]:
         """Launch Minecraft and connect one explicitly named body."""
 
-        if self._state.active:
-            return {"success": False, "error": "a Minecraft session is already active"}
+        async with self._lifecycle_lock:
+            return await self._start_locked(goal=goal, body_name=body_name)
+
+    async def _start_locked(
+        self,
+        *,
+        goal: str,
+        body_name: str,
+    ) -> dict[str, Any]:
+        """Run one serialized startup without treating connectivity as readiness."""
+
         selected_name = body_name.strip() or self._config.default_body
         profiles = self._body_profiles()
         profile = profiles.get(selected_name)
@@ -147,17 +254,99 @@ class MinecraftSession:
                 "error": f"body is not configured: {selected_name}",
                 "configured_bodies": sorted(profiles),
             }
-
-        installation = await self._launcher.check_installation()
-        if not installation.get("exists") or not installation.get("bat_exists"):
+        if self._state.active:
+            if self._state.body_name != selected_name:
+                return {
+                    "success": False,
+                    "error": "a different Minecraft body is already active",
+                    "active_body": self._state.body_name,
+                }
+            status = await self.get_status()
+            return {"success": True, "already_active": True, **status}
+        if self._has_cleanup_pending():
             return {
                 "success": False,
-                "error": "Minecraft installation or launch script is missing",
+                "error": (
+                    "the previous Minecraft session still has cleanup work; "
+                    "call stop again before starting"
+                ),
+                "readiness": str(self._state.readiness),
+                "readiness_detail": self._state.readiness_detail,
+            }
+
+        self._state = SessionState(
+            body_name=selected_name,
+            session_goal=goal,
+            readiness=ReadinessState.PREFLIGHT,
+            readiness_detail="checking installation and exact world launch contract",
+        )
+
+        try:
+            installation = await self._launcher.check_installation()
+        except Exception as exception:  # noqa: BLE001 - public lifecycle boundary
+            self._state.readiness = ReadinessState.FAILED
+            self._state.readiness_detail = (
+                f"installation inspection failed: {exception}"
+            )
+            self._state.last_error = self._state.readiness_detail
+            return {"success": False, "error": self._state.readiness_detail}
+        blockers: list[str] = []
+        if not installation.get("exists"):
+            blockers.append("Minecraft home is missing")
+        if not installation.get("has_version"):
+            blockers.append(
+                f"NeoForge version for {self._config.mc_version} is missing"
+            )
+        if not installation.get("bat_exists"):
+            blockers.append("launch script is missing")
+        if selected_name == "agent" and not installation.get("world_exists"):
+            blockers.append(
+                f"configured world does not exist: {self._config.world_name}"
+            )
+        if selected_name == "agent" and not installation.get("bridge_mod_ready"):
+            blockers.append(
+                "the pinned Elysium NeoForge bridge artifact is not selected"
+            )
+        if selected_name == "agent" and not installation.get("baritone_mod_ready"):
+            blockers.append(
+                "the pinned official Baritone NeoForge artifact is not selected"
+            )
+        if self._config.require_quick_play and not installation.get(
+            "quick_play_configured"
+        ):
+            blockers.append(
+                "launch script does not enter the exact configured world with "
+                "--quickPlaySingleplayer"
+            )
+        if blockers:
+            self._state.readiness = ReadinessState.FAILED
+            self._state.readiness_detail = "; ".join(blockers)
+            self._state.last_error = self._state.readiness_detail
+            return {
+                "success": False,
+                "error": "Minecraft preflight failed",
+                "blockers": blockers,
                 "installation": installation,
             }
-        launch = await self._launcher.launch()
+
+        self._state.readiness = ReadinessState.LAUNCHING
+        self._state.readiness_detail = (
+            "dispatching or reusing the exact Minecraft client"
+        )
+        try:
+            launch = await self._launcher.launch()
+        except Exception as exception:  # noqa: BLE001 - public lifecycle boundary
+            self._state.readiness = ReadinessState.FAILED
+            self._state.readiness_detail = f"Minecraft launch failed: {exception}"
+            self._state.last_error = self._state.readiness_detail
+            return {"success": False, "error": self._state.readiness_detail}
         if not launch.success:
+            self._state.readiness = ReadinessState.FAILED
+            self._state.readiness_detail = launch.error or "launch dispatch failed"
+            self._state.last_error = self._state.readiness_detail
             return {"success": False, "error": launch.error}
+        self._state.launch_pid = launch.pid
+        self._state.window = launch.window
 
         session_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S_%fZ")
         trace = EmbodimentTrace(
@@ -167,17 +356,50 @@ class MinecraftSession:
         runtime = EmbodimentRuntime(trace, self._on_trace)
 
         try:
+            self._state.readiness = ReadinessState.AWAITING_BRIDGE
+            self._state.readiness_detail = "waiting for authenticated body bridge"
             client = await self._wait_for_bridge(profile)
+            missing_operations = sorted(
+                profile.required_operations.difference(client.capabilities)
+            )
+            if missing_operations:
+                raise RuntimeError(
+                    "body bridge is missing required operations: "
+                    + ", ".join(missing_operations)
+                )
+            metadata = getattr(client, "hello_metadata", {})
+            bridge_version = str(metadata.get("bridge_version") or "")
+            if bridge_version != self._config.expected_bridge_version:
+                raise RuntimeError(
+                    "bridge version mismatch: "
+                    f"expected {self._config.expected_bridge_version}, "
+                    f"received {bridge_version or 'absent'}"
+                )
             body = BridgeBody(profile.name, client)
             runtime.register_body(body)
             await runtime.select_body(profile.name)
-            observation = await body.observe()
+            self._state.readiness = ReadinessState.AWAITING_WORLD
+            self._state.readiness_detail = (
+                "waiting for a playable world and advancing observations"
+            )
+            observation = await self._wait_for_playable_observation(body, profile)
         except Exception as exception:  # noqa: BLE001 - return exact readiness failure
-            await runtime.close()
+            cleanup_error = await self._cleanup_runtime(runtime)
+            if cleanup_error:
+                self._runtime = runtime
+                self._trace = trace
+            self._state.readiness = ReadinessState.FAILED
+            self._state.readiness_detail = str(exception)
+            self._state.last_error = str(exception)
+            error = f"Minecraft body did not become ready: {exception}"
+            if cleanup_error:
+                error = f"{error}; cleanup failed: {cleanup_error}"
             return {
                 "success": False,
-                "error": f"Minecraft body did not become ready: {exception}",
+                "error": error,
                 "body_name": selected_name,
+                "readiness": str(self._state.readiness),
+                "trace_path": str(trace.path),
             }
 
         planner = JsonIntentPlanner(
@@ -201,24 +423,37 @@ class MinecraftSession:
             body_name=profile.name,
             session_goal=goal,
             latest_observation=observation,
+            readiness=ReadinessState.READY,
+            readiness_detail="playable world and required body capabilities verified",
+            launch_pid=launch.pid,
+            window=launch.window,
+            game_instance_id=client.instance_id,
+            bridge_version=str(
+                getattr(client, "hello_metadata", {}).get("bridge_version") or ""
+            )
+            or None,
         )
         try:
             await self._register_consciousness()
             await self._report_scene("body connected")
+            self._scene_open = True
         except Exception as exception:  # noqa: BLE001 - lifecycle must not look ready
             cleanup_errors: list[str] = []
             try:
                 await runtime.close()
             except Exception as cleanup_exception:  # noqa: BLE001
                 cleanup_errors.append(f"body cleanup failed: {cleanup_exception}")
+            else:
+                self._runtime = None
+                self._bridge_client = None
             try:
                 await self._terminate_consciousness()
             except Exception as cleanup_exception:  # noqa: BLE001
                 cleanup_errors.append(f"Presence cleanup failed: {cleanup_exception}")
             self._state.active = False
+            self._state.readiness = ReadinessState.FAILED
+            self._state.readiness_detail = str(exception)
             self._state.last_error = str(exception)
-            self._runtime = None
-            self._bridge_client = None
             self._planner = None
             error = f"Minecraft session lifecycle initialization failed: {exception}"
             if cleanup_errors:
@@ -229,6 +464,8 @@ class MinecraftSession:
                 "body_name": selected_name,
                 "trace_path": str(trace.path),
             }
+        self._state.readiness = ReadinessState.ACTIVE
+        self._state.readiness_detail = "Minecraft embodiment session is active"
         return {
             "success": True,
             "session_id": session_id,
@@ -236,6 +473,7 @@ class MinecraftSession:
             "stream_id": stream_id,
             "consciousness_instance_id": instance_id,
             "game_instance_id": client.instance_id,
+            "bridge_version": self._state.bridge_version,
             "advertised_operations": list(client.capabilities),
             "observation": observation.to_wire(),
             "trace_path": str(trace.path),
@@ -244,30 +482,67 @@ class MinecraftSession:
     async def stop(self) -> dict[str, Any]:
         """Interrupt work, release controls, close bridges, and end the scene."""
 
-        if not self._state.active:
-            return {"success": False, "error": "no Minecraft session is active"}
+        async with self._lifecycle_lock:
+            return await self._stop_locked()
+
+    async def _stop_locked(self) -> dict[str, Any]:
+        """Stop idempotently while retaining exact cleanup diagnostics."""
+
+        if not self._state.active and not self._has_cleanup_pending():
+            self._state.readiness = ReadinessState.IDLE
+            self._state.readiness_detail = "no Minecraft session is active"
+            return {"success": True, "already_stopped": True}
+        self._state.readiness = ReadinessState.CLOSING
+        self._state.readiness_detail = "releasing controls and ending the scene"
         runtime = self._runtime
+        errors: list[str] = []
         if runtime is not None:
-            await runtime.interrupt("Minecraft session stopped")
-            await runtime.close()
-        await self._report_scene("session ended")
-        await self._terminate_consciousness()
+            try:
+                await runtime.interrupt("Minecraft session stopped")
+                await runtime.close()
+            except Exception as exception:  # noqa: BLE001
+                errors.append(f"body cleanup failed: {exception}")
+            else:
+                self._runtime = None
+                self._bridge_client = None
+        if self._scene_open:
+            try:
+                await self._report_scene("session ended")
+            except Exception as exception:  # noqa: BLE001
+                errors.append(f"World scene close failed: {exception}")
+            else:
+                self._scene_open = False
+        if self._presence_registered:
+            try:
+                await self._terminate_consciousness()
+            except Exception as exception:  # noqa: BLE001
+                errors.append(f"Presence cleanup failed: {exception}")
         duration = self._state.duration_seconds
         session_id = self._state.session_id
         trace_path = str(self._trace.path) if self._trace else ""
         self._state.active = False
-        self._runtime = None
-        self._bridge_client = None
         self._planner = None
         self._execution_task = None
+        self._state.readiness = (
+            ReadinessState.DEGRADED if errors else ReadinessState.IDLE
+        )
+        self._state.readiness_detail = "; ".join(errors) if errors else "session ended"
+        self._state.last_error = self._state.readiness_detail if errors else None
         return {
-            "success": True,
+            "success": not errors,
             "session_id": session_id,
             "duration_seconds": duration,
             "conclusions": list(self._state.conclusions),
             "trace_path": trace_path,
             "game_left_running": True,
+            "errors": errors,
+            "cleanup_pending": self._has_cleanup_pending(),
         }
+
+    async def close(self) -> dict[str, Any]:
+        """Service-owned idempotent shutdown entrypoint."""
+
+        return await self.stop()
 
     async def do_intent(
         self,
@@ -303,6 +578,8 @@ class MinecraftSession:
         execution_timeout = (
             timeout if timeout is not None else self._config.intent_timeout_seconds
         )
+        if execution_timeout is None:
+            execution_timeout = 300.0
         try:
             task = asyncio.create_task(
                 self._runtime.execute(
@@ -388,6 +665,8 @@ class MinecraftSession:
         observation = self._state.latest_observation
         return {
             "active": self._state.active,
+            "readiness": str(self._state.readiness),
+            "readiness_detail": self._state.readiness_detail,
             "session_id": self._state.session_id,
             "body_name": self._state.body_name,
             "stream_id": self._state.stream_id,
@@ -396,12 +675,115 @@ class MinecraftSession:
             "session_goal": self._state.session_goal,
             "active_intent": self._state.active_intent,
             "bridge_connected": bool(client and client.connected),
-            "game_instance_id": client.instance_id if client else None,
+            "game_instance_id": (
+                client.instance_id if client else self._state.game_instance_id
+            ),
+            "bridge_version": self._state.bridge_version,
+            "launch_pid": self._state.launch_pid,
+            "window": self._state.window,
             "advertised_operations": list(client.capabilities) if client else [],
             "latest_observation": observation.to_wire() if observation else None,
             "conclusions": list(self._state.conclusions),
             "last_error": self._state.last_error,
+            "cleanup_pending": self._has_cleanup_pending(),
         }
+
+    async def _wait_for_playable_observation(
+        self,
+        body: BridgeBody,
+        profile: BodyProfile,
+    ) -> WorldObservation:
+        """Require the selected body to produce two advancing ready observations."""
+
+        deadline = time.monotonic() + self._config.world_ready_timeout_seconds
+        observation: WorldObservation | None = None
+        last_reason = "body has not emitted an observation"
+        while time.monotonic() < deadline:
+            try:
+                observation = await body.observe(
+                    observation.sequence if observation is not None else None
+                )
+            except TimeoutError as exception:
+                last_reason = str(exception)
+                continue
+            ready, reason = self._observation_is_playable(observation, profile)
+            if not ready:
+                last_reason = reason
+                continue
+            confirmation = await body.observe(observation.sequence)
+            confirmed, confirmation_reason = self._observation_is_playable(
+                confirmation, profile
+            )
+            if confirmed:
+                return confirmation
+            observation = confirmation
+            last_reason = confirmation_reason
+        raise TimeoutError(
+            "playable Minecraft world did not become ready before the deadline: "
+            + last_reason
+        )
+
+    def _observation_is_playable(
+        self,
+        observation: WorldObservation,
+        profile: BodyProfile,
+    ) -> tuple[bool, str]:
+        """Evaluate technical body readiness without assigning subjective meaning."""
+
+        facts = observation.facts
+        if profile.readiness_kind == "structured_world":
+            if facts.get("world_loaded") is not True:
+                screen = facts.get("screen")
+                screen_name = (
+                    str(screen.get("class") or screen.get("title") or "unknown")
+                    if isinstance(screen, dict)
+                    else "unknown"
+                )
+                return (
+                    False,
+                    f"no playable world is loaded; current screen={screen_name}",
+                )
+            world = facts.get("world")
+            if not isinstance(world, dict):
+                return False, "bridge observation is missing world identity"
+            actual_name = str(world.get("singleplayer_name") or "")
+            if actual_name.casefold() != self._config.world_name.casefold():
+                return False, (
+                    "wrong singleplayer world is loaded: "
+                    f"expected {self._config.world_name}, received {actual_name or 'unknown'}"
+                )
+            if facts.get("client_paused") is True:
+                return (
+                    False,
+                    "loaded singleplayer world is paused; resume before embodiment",
+                )
+            player = facts.get("player")
+            if not isinstance(player, dict) or not str(player.get("uuid") or ""):
+                return False, "playable world observation is missing player identity"
+            return True, "structured world is ready"
+
+        frame_path = observation.frame_path
+        window = facts.get("window")
+        capture = facts.get("capture")
+        if not frame_path:
+            return False, "first-person body did not persist a frame"
+        if not isinstance(window, dict) or not window.get("visible"):
+            return False, "bound Minecraft window is not visible"
+        if not isinstance(capture, dict):
+            return False, "first-person capture metadata is missing"
+        if int(capture.get("width") or 0) <= 0 or int(capture.get("height") or 0) <= 0:
+            return False, "first-person frame dimensions are invalid"
+        return True, "first-person frame body is ready"
+
+    @staticmethod
+    async def _cleanup_runtime(runtime: EmbodimentRuntime) -> str:
+        """Close one partial runtime and return exact cleanup failure text."""
+
+        try:
+            await runtime.close()
+        except Exception as exception:  # noqa: BLE001
+            return str(exception)
+        return ""
 
     def _body_profiles(self) -> dict[str, BodyProfile]:
         """Build exact configured profiles for the two requested body routes."""
@@ -413,6 +795,18 @@ class MinecraftSession:
                 listen_uri=self._config.agent_bridge_listen_uri,
                 token_file=self._config.agent_token_file,
                 planner_guidance=AGENT_BRIDGE_GUIDANCE,
+                required_operations=frozenset(
+                    {
+                        "chat.send",
+                        "control.release_all",
+                        "movement.input",
+                        "navigation.goto",
+                        "navigation.stop",
+                        "player.respawn",
+                        "world.mine",
+                    }
+                ),
+                readiness_kind="structured_world",
             ),
             "biomimetic": BodyProfile(
                 name="biomimetic",
@@ -420,6 +814,13 @@ class MinecraftSession:
                 listen_uri=self._config.biomimetic_bridge_listen_uri,
                 token_file=self._config.biomimetic_token_file,
                 planner_guidance=BIOMIMETIC_GUIDANCE,
+                required_operations=frozenset(
+                    {
+                        "control.release_all",
+                        "native.input_batch",
+                    }
+                ),
+                readiness_kind="first_person_frame",
             ),
         }
 
@@ -431,7 +832,9 @@ class MinecraftSession:
         while time.monotonic() < deadline:
             if profile.token_file.exists():
                 try:
-                    token = await asyncio.to_thread(self._read_token, profile.token_file)
+                    token = await asyncio.to_thread(
+                        self._read_token, profile.token_file
+                    )
                     remaining = max(0.1, deadline - time.monotonic())
                     client = MinecraftBridgeClient(
                         BridgeConfig(
@@ -513,6 +916,7 @@ class MinecraftSession:
             lease_duration_seconds=300,
         )
         await _invoke_callback(self._registry.register, instance)
+        self._presence_registered = True
         if self._save_registry is not None:
             await _invoke_callback(self._save_registry)
 
@@ -520,6 +924,7 @@ class MinecraftSession:
         """Terminate this session's registered consciousness instance."""
 
         if self._registry is None or not self._state.consciousness_instance_id:
+            self._presence_registered = False
             return
         await _invoke_callback(
             self._registry.terminate,
@@ -528,6 +933,14 @@ class MinecraftSession:
         )
         if self._save_registry is not None:
             await _invoke_callback(self._save_registry)
+        self._presence_registered = False
+
+    def _has_cleanup_pending(self) -> bool:
+        """Return whether shutdown must retry any owned lifecycle resource."""
+
+        return (
+            self._runtime is not None or self._presence_registered or self._scene_open
+        )
 
     async def _report_scene(self, status: str) -> None:
         """Append factual session lifecycle as an attributed observation."""
