@@ -29,18 +29,29 @@ from .models import (
     StorageAvailability,
 )
 from .subject_contracts import (
+    SUBJECT_AUTHORITY_PATHS,
+    AcceptSubjectCandidate,
     AppendSubjectDocumentVersion,
+    SubjectAuthorityActorInactive,
+    SubjectAuthorityCommit,
+    SubjectAuthorityConflict,
+    SubjectAuthorityEvidenceError,
+    SubjectAuthorityPort,
     SubjectDocumentCommit,
     SubjectDocumentConflict,
     SubjectDocumentHead,
     SubjectDocumentNotFound,
     SubjectDocumentStorePort,
     SubjectDocumentVersion,
+    subject_authority_logical_path,
+    subject_revision_from_contents,
 )
 from .subject_factory import open_subject_document_store
 from .subject_workspace import SubjectWorkspaceObserver, SubjectWorkspaceProjector
 
 __all__ = [
+    "SUBJECT_AUTHORITY_PATHS",
+    "AcceptSubjectCandidate",
     "AppendSubjectDocumentVersion",
     "AuthorityProvider",
     "AuthorityToken",
@@ -62,6 +73,11 @@ __all__ = [
     "StorageBackendRuntime",
     "StorageFactorySettings",
     "StorageWriterRole",
+    "SubjectAuthorityActorInactive",
+    "SubjectAuthorityCommit",
+    "SubjectAuthorityConflict",
+    "SubjectAuthorityEvidenceError",
+    "SubjectAuthorityPort",
     "SubjectDocumentCommit",
     "SubjectDocumentConflict",
     "SubjectDocumentHead",
@@ -74,4 +90,6 @@ __all__ = [
     "open_storage_backend",
     "open_subject_document_store",
     "settings_from_life_engine_config",
+    "subject_authority_logical_path",
+    "subject_revision_from_contents",
 ]

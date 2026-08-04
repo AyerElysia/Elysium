@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
+
+SubjectDocumentPath = Literal["SOUL.md", "USER.md", "MEMORY.md"]
+SUBJECT_AUTHORITY_PATHS: tuple[SubjectDocumentPath, ...] = (
+    "SOUL.md",
+    "USER.md",
+    "MEMORY.md",
+)
 
 
 class SubjectDocumentConflict(RuntimeError):
@@ -12,6 +20,43 @@ class SubjectDocumentConflict(RuntimeError):
 
 class SubjectDocumentNotFound(LookupError):
     """Raised when a requested immutable document version is unavailable."""
+
+
+class SubjectAuthorityConflict(RuntimeError):
+    """Raised when unified revision, decision identity, or document CAS conflicts."""
+
+
+class SubjectAuthorityEvidenceError(RuntimeError):
+    """Raised when immutable candidate/decision evidence is absent or inconsistent."""
+
+
+class SubjectAuthorityActorInactive(RuntimeError):
+    """Raised when the accepting consciousness instance is not currently active."""
+
+
+def subject_authority_logical_path(path: SubjectDocumentPath) -> str:
+    """Map one public authority name into the selected-storage namespace."""
+
+    if path not in SUBJECT_AUTHORITY_PATHS:
+        raise ValueError(f"unsupported subject authority path: {path}")
+    return f"life_engine_workspace/{path}"
+
+
+def subject_revision_from_contents(
+    contents: dict[SubjectDocumentPath, bytes],
+) -> str:
+    """Compute the canonical unified SOUL+USER+MEMORY exact-byte revision."""
+
+    digest = hashlib.sha256()
+    for path in SUBJECT_AUTHORITY_PATHS:
+        if path not in contents:
+            raise ValueError(f"subject authority content is missing: {path}")
+        content = bytes(contents[path])
+        digest.update(path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +126,53 @@ class SubjectDocumentCommit:
 
 
 @dataclass(frozen=True, slots=True)
+class AcceptSubjectCandidate:
+    """Explicit consciousness decision submitted to subject authority."""
+
+    candidate_id: str
+    candidate_revision: int
+    candidate_sha256: str
+    candidate_occurrence_id: str
+    decision_occurrence_id: str
+    actor_consciousness_instance_id: str
+    expected_subject_revision: str
+    target_path: SubjectDocumentPath
+    accepted_content_bytes: bytes
+    accepted_content_sha256: str
+    occurred_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class SubjectAuthorityCommit:
+    """Content-free proof of one atomic subject-authority acceptance."""
+
+    authority_occurrence_id: str
+    candidate_id: str
+    decision_occurrence_id: str
+    actor_consciousness_instance_id: str
+    previous_subject_revision: str
+    new_subject_revision: str
+    document_version_id: str
+    document_revision: int
+    accepted_content_sha256: str
+    idempotent_replay: bool
+
+
+@runtime_checkable
+class SubjectAuthorityPort(Protocol):
+    """Only formal acceptance boundary for unified subject-owned documents."""
+
+    async def current_subject_revision(self) -> str:
+        """Return the exact unified SOUL+USER+MEMORY source digest."""
+
+    async def accept_candidate(
+        self,
+        command: AcceptSubjectCandidate,
+    ) -> SubjectAuthorityCommit:
+        """Validate will evidence and atomically CAS one subject document."""
+
+
+@dataclass(frozen=True, slots=True)
 class SubjectProjectionTask:
     """One leased workspace projection request."""
 
@@ -98,7 +190,7 @@ class SubjectProjectionTask:
 
 
 @runtime_checkable
-class SubjectDocumentStorePort(Protocol):
+class SubjectDocumentStorePort(SubjectAuthorityPort, Protocol):
     """Append-only subject history with a revision-CAS head projection."""
 
     async def get_head(self, logical_path: str) -> SubjectDocumentHead | None:
@@ -177,12 +269,22 @@ class SubjectDocumentStorePort(Protocol):
 
 
 __all__ = [
+    "SUBJECT_AUTHORITY_PATHS",
+    "AcceptSubjectCandidate",
     "AppendSubjectDocumentVersion",
+    "SubjectAuthorityActorInactive",
+    "SubjectAuthorityCommit",
+    "SubjectAuthorityConflict",
+    "SubjectAuthorityEvidenceError",
+    "SubjectAuthorityPort",
     "SubjectDocumentCommit",
     "SubjectDocumentConflict",
     "SubjectDocumentHead",
     "SubjectDocumentNotFound",
+    "SubjectDocumentPath",
     "SubjectDocumentStorePort",
     "SubjectDocumentVersion",
     "SubjectProjectionTask",
+    "subject_authority_logical_path",
+    "subject_revision_from_contents",
 ]

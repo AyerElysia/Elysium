@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import json
 from collections.abc import Awaitable, Callable
@@ -19,17 +21,26 @@ from src.kernel.storage import canonical_json
 from .contracts import StorageBackendRuntime
 from .models import BackendKind
 from .subject_contracts import (
+    SUBJECT_AUTHORITY_PATHS,
+    AcceptSubjectCandidate,
     AppendSubjectDocumentVersion,
+    SubjectAuthorityActorInactive,
+    SubjectAuthorityCommit,
+    SubjectAuthorityConflict,
+    SubjectAuthorityEvidenceError,
     SubjectDocumentCommit,
     SubjectDocumentConflict,
     SubjectDocumentHead,
     SubjectDocumentNotFound,
     SubjectDocumentVersion,
     SubjectProjectionTask,
+    subject_authority_logical_path,
+    subject_revision_from_contents,
 )
 
 _T = TypeVar("_T")
 _MAX_WRITE_ATTEMPTS = 3
+_MAX_SUBJECT_CANDIDATE_BYTES = 4 * 1024 * 1024
 
 
 def normalize_subject_path(value: str) -> str:
@@ -82,6 +93,46 @@ def _json_object(value: Any) -> dict[str, Any]:
     if not isinstance(decoded, dict):
         raise TypeError("subject change context must be an object")
     return decoded
+
+
+def _require_hex_digest(value: Any, *, field: str) -> str:
+    digest = str(value).strip().lower()
+    if len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise ValueError(f"{field} must be a 64-hex digest")
+    return digest
+
+
+def _required_identity(value: Any, *, field: str, maximum: int = 255) -> str:
+    identity = str(value).strip()
+    if not identity or len(identity) > maximum:
+        raise ValueError(f"{field} must be 1..{maximum} characters")
+    return identity
+
+
+def _decode_base64(value: Any, *, field: str) -> bytes:
+    try:
+        return base64.b64decode(str(value), validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise SubjectAuthorityEvidenceError(f"invalid {field} base64") from exc
+
+
+def _subject_text_format(content: bytes) -> tuple[str, str | None]:
+    encoding = "utf-8-sig" if content.startswith(b"\xef\xbb\xbf") else "utf-8"
+    try:
+        content.decode(encoding)
+    except UnicodeDecodeError as exc:
+        raise ValueError("accepted subject content must be valid UTF-8") from exc
+    crlf = content.count(b"\r\n")
+    lone_lf = content.count(b"\n") - crlf
+    lone_cr = content.count(b"\r") - crlf
+    styles = [
+        name
+        for name, count in (("crlf", crlf), ("lf", lone_lf), ("cr", lone_cr))
+        if count
+    ]
+    return encoding, styles[0] if len(styles) == 1 else ("mixed" if styles else None)
 
 
 class SQLSubjectDocumentStore:
@@ -243,6 +294,668 @@ class SQLSubjectDocumentStore:
             "change_context_json",
         )
         return ", ".join(f"{qualifier}{column} AS {column}" for column in columns)
+
+    @staticmethod
+    def _authority_occurrence_id(decision_occurrence_id: str) -> str:
+        digest = hashlib.sha256(decision_occurrence_id.encode("utf-8")).hexdigest()
+        return f"subject_authority:{digest}"
+
+    @staticmethod
+    def _authority_command_material(
+        command: AcceptSubjectCandidate,
+    ) -> dict[str, Any]:
+        candidate_id = _required_identity(command.candidate_id, field="candidate_id")
+        candidate_revision = int(command.candidate_revision)
+        if candidate_revision <= 0:
+            raise ValueError("candidate_revision must be positive")
+        candidate_occurrence = _required_identity(
+            command.candidate_occurrence_id,
+            field="candidate_occurrence_id",
+        )
+        decision_occurrence = _required_identity(
+            command.decision_occurrence_id,
+            field="decision_occurrence_id",
+        )
+        if candidate_occurrence == decision_occurrence:
+            raise ValueError("candidate and decision occurrences must differ")
+        actor = _required_identity(
+            command.actor_consciousness_instance_id,
+            field="actor_consciousness_instance_id",
+        )
+        target_path = str(command.target_path).strip()
+        if target_path not in SUBJECT_AUTHORITY_PATHS:
+            raise ValueError("target_path must be SOUL.md, USER.md, or MEMORY.md")
+        accepted_content = bytes(command.accepted_content_bytes)
+        if len(accepted_content) > _MAX_SUBJECT_CANDIDATE_BYTES:
+            raise ValueError("accepted content exceeds the explicit storage limit")
+        accepted_hash = _require_hex_digest(
+            command.accepted_content_sha256,
+            field="accepted_content_sha256",
+        )
+        if hashlib.sha256(accepted_content).hexdigest() != accepted_hash:
+            raise ValueError("accepted content hash mismatch")
+        encoding, _ = _subject_text_format(accepted_content)
+        decoded = accepted_content.decode(encoding)
+        if target_path == "SOUL.md" and not decoded.strip():
+            raise ValueError("SOUL.md cannot become empty")
+        occurred_at = _iso(command.occurred_at)
+        if not occurred_at:
+            raise ValueError("occurred_at must be an ISO timestamp")
+        return {
+            "candidate_id": candidate_id,
+            "candidate_revision": candidate_revision,
+            "candidate_sha256": _require_hex_digest(
+                command.candidate_sha256,
+                field="candidate_sha256",
+            ),
+            "candidate_occurrence_id": candidate_occurrence,
+            "decision_occurrence_id": decision_occurrence,
+            "actor_consciousness_instance_id": actor,
+            "expected_subject_revision": _require_hex_digest(
+                command.expected_subject_revision,
+                field="expected_subject_revision",
+            ),
+            "target_path": target_path,
+            "accepted_content_sha256": accepted_hash,
+            "occurred_at": occurred_at,
+        }
+
+    @staticmethod
+    def _authority_command_sha256(material: dict[str, Any]) -> str:
+        return hashlib.sha256(canonical_json(material).encode()).hexdigest()
+
+    @staticmethod
+    def _authority_commit_from_row(
+        row: Any,
+        *,
+        idempotent_replay: bool,
+    ) -> SubjectAuthorityCommit:
+        return SubjectAuthorityCommit(
+            authority_occurrence_id=str(row["authority_occurrence_id"]),
+            candidate_id=str(row["candidate_id"]),
+            decision_occurrence_id=str(row["decision_occurrence_id"]),
+            actor_consciousness_instance_id=str(row["actor_consciousness_instance_id"]),
+            previous_subject_revision=str(row["previous_subject_revision"]),
+            new_subject_revision=str(row["new_subject_revision"]),
+            document_version_id=str(row["document_version_id"]),
+            document_revision=int(row["document_revision"]),
+            accepted_content_sha256=str(row["accepted_content_sha256"]),
+            idempotent_replay=idempotent_replay,
+        )
+
+    async def _subject_authority_state(
+        self,
+        session: AsyncSession,
+        *,
+        lock: bool,
+    ) -> tuple[dict[str, SubjectDocumentCommit], str]:
+        logical_paths = {
+            path: subject_authority_logical_path(path)
+            for path in SUBJECT_AUTHORITY_PATHS
+        }
+        rows = (
+            (
+                await session.execute(
+                    text(
+                        f"""SELECT
+                        d.document_id AS head_document_id,
+                        d.logical_path AS head_logical_path,
+                        d.declared_owner AS head_declared_owner,
+                        d.current_version_id AS head_current_version_id,
+                        d.revision AS head_revision,
+                        {self._version_columns("v")}
+                        FROM subject_documents AS d
+                        JOIN subject_document_versions AS v
+                          ON v.version_id = d.current_version_id
+                        WHERE d.logical_path IN (:soul, :user, :memory)
+                        ORDER BY d.logical_path"""
+                        + (self._for_update if lock else "")
+                    ),
+                    {
+                        "soul": logical_paths["SOUL.md"],
+                        "user": logical_paths["USER.md"],
+                        "memory": logical_paths["MEMORY.md"],
+                    },
+                )
+            )
+            .mappings()
+            .all()
+        )
+        by_logical = {str(row["head_logical_path"]): row for row in rows}
+        state: dict[str, SubjectDocumentCommit] = {}
+        contents: dict[Any, bytes] = {}
+        for path in SUBJECT_AUTHORITY_PATHS:
+            logical_path = logical_paths[path]
+            row = by_logical.get(logical_path)
+            if row is None:
+                raise SubjectAuthorityEvidenceError(
+                    f"subject authority head is missing: {path}"
+                )
+            head = SubjectDocumentHead(
+                document_id=str(row["head_document_id"]),
+                logical_path=logical_path,
+                declared_owner=_optional(row["head_declared_owner"]),
+                current_version_id=str(row["head_current_version_id"]),
+                revision=int(row["head_revision"]),
+            )
+            version = self._decode_version(row)
+            if head.declared_owner != "elysia":
+                raise SubjectAuthorityEvidenceError(
+                    f"subject authority owner mismatch: {path}"
+                )
+            if (
+                version.document_id != head.document_id
+                or version.logical_path != logical_path
+                or version.version_id != head.current_version_id
+                or hashlib.sha256(version.content_bytes).hexdigest()
+                != version.content_hash
+            ):
+                raise SubjectAuthorityEvidenceError(
+                    f"subject authority head/version mismatch: {path}"
+                )
+            state[path] = SubjectDocumentCommit(version=version, head=head)
+            contents[path] = version.content_bytes
+        return state, subject_revision_from_contents(contents)
+
+    async def current_subject_revision(self) -> str:
+        """Return one coherent exact-byte revision for all three authorities."""
+
+        async with self.runtime.unit_of_work() as uow:
+            _, revision = await self._subject_authority_state(
+                uow.session,
+                lock=False,
+            )
+        return revision
+
+    @staticmethod
+    def _validate_learning_event_integrity(row: Any) -> dict[str, Any]:
+        provenance = _json_object(row["provenance_json"])
+        payload = _json_object(row["payload_json"])
+        material = {
+            "occurrence_id": str(row["occurrence_id"]),
+            "event_kind": str(row["event_kind"]),
+            "occurred_at": _iso(row["occurred_at"]),
+            "source": str(row["source"]),
+            "actor_consciousness_instance_id": str(
+                row["actor_consciousness_instance_id"] or ""
+            ),
+            "subject_revision": str(row["subject_revision"] or "").lower(),
+            "provenance": provenance,
+            "payload": payload,
+        }
+        calculated = hashlib.sha256(canonical_json(material).encode()).hexdigest()
+        if calculated != str(row["event_sha256"]):
+            raise SubjectAuthorityEvidenceError(
+                f"learning occurrence hash mismatch: {row['occurrence_id']}"
+            )
+        return material
+
+    async def _validate_active_actor(
+        self,
+        session: AsyncSession,
+        *,
+        actor: str,
+        database_now: datetime,
+    ) -> None:
+        row = (
+            (
+                await session.execute(
+                    text(
+                        """SELECT instance_id, status, lease_expires_at,
+                        lease_duration_seconds FROM consciousness_presence
+                        WHERE instance_id = :instance_id"""
+                        + self._for_update
+                    ),
+                    {"instance_id": actor},
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if row is None or str(row["status"]) != "active":
+            raise SubjectAuthorityActorInactive(actor)
+        if row["lease_duration_seconds"] is not None:
+            expiry = _parse_datetime(row["lease_expires_at"])
+            if expiry is None or expiry <= database_now:
+                raise SubjectAuthorityActorInactive(f"{actor}: active lease is expired")
+
+    async def _validate_learning_evidence(
+        self,
+        session: AsyncSession,
+        *,
+        material: dict[str, Any],
+        accepted_content: bytes,
+    ) -> None:
+        rows = (
+            (
+                await session.execute(
+                    text(
+                        """SELECT occurrence_id, event_kind, occurred_at,
+                        source, actor_consciousness_instance_id,
+                        subject_revision, provenance_json, payload_json,
+                        event_sha256 FROM learning_events
+                        WHERE occurrence_id IN (:candidate_occurrence,
+                                                :decision_occurrence)
+                        ORDER BY occurrence_id"""
+                        + self._for_update
+                    ),
+                    {
+                        "candidate_occurrence": material["candidate_occurrence_id"],
+                        "decision_occurrence": material["decision_occurrence_id"],
+                    },
+                )
+            )
+            .mappings()
+            .all()
+        )
+        events = {
+            str(row["occurrence_id"]): self._validate_learning_event_integrity(row)
+            for row in rows
+        }
+        candidate = events.get(str(material["candidate_occurrence_id"]))
+        decision = events.get(str(material["decision_occurrence_id"]))
+        if candidate is None or candidate["event_kind"] != "candidate.proposed":
+            raise SubjectAuthorityEvidenceError(
+                "immutable candidate occurrence is missing"
+            )
+        if decision is None or decision["event_kind"] != "candidate.accept_requested":
+            raise SubjectAuthorityEvidenceError(
+                "immutable accept decision occurrence is missing"
+            )
+        candidate_payload = dict(candidate["payload"])
+        decision_payload = dict(decision["payload"])
+        candidate_bytes = _decode_base64(
+            candidate_payload.get("candidate_content_base64", ""),
+            field="candidate content",
+        )
+        if not all(
+            (
+                candidate["subject_revision"] == material["expected_subject_revision"],
+                str(candidate_payload.get("candidate_id", ""))
+                == material["candidate_id"],
+                int(candidate_payload.get("candidate_revision", 0))
+                == material["candidate_revision"],
+                str(candidate_payload.get("candidate_sha256", ""))
+                == material["candidate_sha256"],
+                str(candidate_payload.get("target_path", ""))
+                == material["target_path"],
+                hashlib.sha256(candidate_bytes).hexdigest()
+                == material["candidate_sha256"],
+            )
+        ):
+            raise SubjectAuthorityEvidenceError(
+                "candidate occurrence does not match the authority command"
+            )
+        decision_bytes = _decode_base64(
+            decision_payload.get("accepted_content_base64", ""),
+            field="accepted content",
+        )
+        if not all(
+            (
+                decision["source"] == "learning.subject_decision",
+                decision["actor_consciousness_instance_id"]
+                == material["actor_consciousness_instance_id"],
+                decision["subject_revision"] == material["expected_subject_revision"],
+                decision["occurred_at"] == material["occurred_at"],
+                str(decision_payload.get("decision_kind", "")) == "accept_requested",
+                str(decision_payload.get("candidate_id", ""))
+                == material["candidate_id"],
+                int(decision_payload.get("candidate_revision", 0))
+                == material["candidate_revision"],
+                str(decision_payload.get("candidate_sha256", ""))
+                == material["candidate_sha256"],
+                str(decision_payload.get("candidate_occurrence_id", ""))
+                == material["candidate_occurrence_id"],
+                str(decision_payload.get("target_path", "")) == material["target_path"],
+                str(decision_payload.get("accepted_content_sha256", ""))
+                == material["accepted_content_sha256"],
+                decision_bytes == accepted_content,
+                hashlib.sha256(decision_bytes).hexdigest()
+                == material["accepted_content_sha256"],
+            )
+        ):
+            raise SubjectAuthorityEvidenceError(
+                "decision occurrence does not match the authority command"
+            )
+
+    @staticmethod
+    def _authority_decision_columns() -> str:
+        return """decision_occurrence_id, authority_occurrence_id,
+        candidate_id, candidate_revision, candidate_sha256,
+        candidate_occurrence_id, actor_consciousness_instance_id,
+        expected_subject_revision, target_path, accepted_content_sha256,
+        occurred_at, previous_subject_revision, new_subject_revision,
+        document_version_id, document_revision, command_sha256, committed_at"""
+
+    async def _append_authority_version(
+        self,
+        session: AsyncSession,
+        *,
+        current: SubjectDocumentCommit,
+        material: dict[str, Any],
+        content: bytes,
+        previous_subject_revision: str,
+        database_now: datetime,
+    ) -> SubjectDocumentCommit:
+        authority_occurrence = self._authority_occurrence_id(
+            str(material["decision_occurrence_id"])
+        )
+        encoding, newline_style = _subject_text_format(content)
+        command = AppendSubjectDocumentVersion(
+            logical_path=current.head.logical_path,
+            expected_revision=current.head.revision,
+            expected_head_version_id=current.head.current_version_id,
+            content_bytes=content,
+            occurrence_id=authority_occurrence,
+            recorded_by=str(material["actor_consciousness_instance_id"]),
+            recorded_source="learning.subject_authority",
+            declared_owner="elysia",
+            semantic_actor_id=str(material["actor_consciousness_instance_id"]),
+            semantic_source_id=str(material["decision_occurrence_id"]),
+            occurred_at=str(material["occurred_at"]),
+            provenance_status="complete",
+            byte_fidelity="exact_bytes",
+            encoding=encoding,
+            newline_style=newline_style,
+            change_context={
+                "operation": "accept_learning_subject_candidate",
+                "candidate_id": material["candidate_id"],
+                "candidate_revision": material["candidate_revision"],
+                "candidate_sha256": material["candidate_sha256"],
+                "candidate_occurrence_id": material["candidate_occurrence_id"],
+                "decision_occurrence_id": material["decision_occurrence_id"],
+                "previous_subject_revision": previous_subject_revision,
+            },
+        )
+        content_hash = hashlib.sha256(content).hexdigest()
+        version_id = self._version_id(
+            document_id=current.head.document_id,
+            parent_version_id=current.head.current_version_id,
+            occurrence_id=authority_occurrence,
+            content_hash=content_hash,
+            command=command,
+        )
+        head_event_id = self._head_event_id(
+            current.head.document_id,
+            authority_occurrence,
+        )
+        context_json = canonical_json(command.change_context or {})
+        await session.execute(
+            text(
+                """INSERT INTO subject_document_versions (
+                    version_id, document_id, logical_path, parent_version_id,
+                    occurrence_id, semantic_actor_id, semantic_source_id,
+                    occurred_at, recorded_by, recorded_source, recorded_at,
+                    provenance_status, content_bytes, content_hash, byte_length,
+                    byte_fidelity, encoding, newline_style, change_context_json
+                ) VALUES (
+                    :version_id, :document_id, :logical_path, :parent_version_id,
+                    :occurrence_id, :semantic_actor_id, :semantic_source_id,
+                    :occurred_at, :recorded_by, :recorded_source, :recorded_at,
+                    :provenance_status, :content_bytes, :content_hash, :byte_length,
+                    :byte_fidelity, :encoding, :newline_style, :change_context_json
+                )"""
+            ),
+            {
+                "version_id": version_id,
+                "document_id": current.head.document_id,
+                "logical_path": current.head.logical_path,
+                "parent_version_id": current.head.current_version_id,
+                "occurrence_id": authority_occurrence,
+                "semantic_actor_id": command.semantic_actor_id,
+                "semantic_source_id": command.semantic_source_id,
+                "occurred_at": self._bind_time(command.occurred_at),
+                "recorded_by": command.recorded_by,
+                "recorded_source": command.recorded_source,
+                "recorded_at": self._bind_time(database_now),
+                "provenance_status": command.provenance_status,
+                "content_bytes": content,
+                "content_hash": content_hash,
+                "byte_length": len(content),
+                "byte_fidelity": command.byte_fidelity,
+                "encoding": command.encoding,
+                "newline_style": command.newline_style,
+                "change_context_json": context_json,
+            },
+        )
+        authority_epoch = (
+            self.runtime.authority_token.authority_epoch
+            if self.runtime.authority_token is not None
+            else int(self.runtime.writer_epoch)
+        )
+        await session.execute(
+            text(
+                """INSERT INTO subject_document_head_events (
+                    head_event_id, document_id, previous_version_id,
+                    next_version_id, occurrence_id, actor_id, source_id,
+                    occurred_at, authority_epoch, change_context_json
+                ) VALUES (
+                    :head_event_id, :document_id, :previous_version_id,
+                    :next_version_id, :occurrence_id, :actor_id, :source_id,
+                    :occurred_at, :authority_epoch, :change_context_json
+                )"""
+            ),
+            {
+                "head_event_id": head_event_id,
+                "document_id": current.head.document_id,
+                "previous_version_id": current.head.current_version_id,
+                "next_version_id": version_id,
+                "occurrence_id": authority_occurrence,
+                "actor_id": command.recorded_by,
+                "source_id": command.recorded_source,
+                "occurred_at": self._bind_time(database_now),
+                "authority_epoch": authority_epoch,
+                "change_context_json": context_json,
+            },
+        )
+        next_revision = current.head.revision + 1
+        updated = await session.execute(
+            text(
+                """UPDATE subject_documents SET
+                    current_version_id = :version_id,
+                    revision = :next_revision
+                WHERE document_id = :document_id
+                  AND current_version_id = :expected_head
+                  AND revision = :expected_revision"""
+            ),
+            {
+                "version_id": version_id,
+                "next_revision": next_revision,
+                "document_id": current.head.document_id,
+                "expected_head": current.head.current_version_id,
+                "expected_revision": current.head.revision,
+            },
+        )
+        if updated.rowcount != 1:
+            raise SubjectAuthorityConflict(
+                f"subject document CAS failed: {current.head.logical_path}"
+            )
+        await session.execute(
+            text(
+                """INSERT INTO subject_projection_outbox (
+                    head_event_id, document_id, logical_path, version_id,
+                    content_hash, state, attempt_count, created_at,
+                    confirmed_at, last_error
+                ) VALUES (
+                    :head_event_id, :document_id, :logical_path, :version_id,
+                    :content_hash, 'pending', 0, :created_at,
+                    :confirmed_at, ''
+                )"""
+            ),
+            {
+                "head_event_id": head_event_id,
+                "document_id": current.head.document_id,
+                "logical_path": current.head.logical_path,
+                "version_id": version_id,
+                "content_hash": content_hash,
+                "created_at": self._bind_time(database_now),
+                "confirmed_at": (None if self.backend == BackendKind.MYSQL else ""),
+            },
+        )
+        version = SubjectDocumentVersion(
+            version_id=version_id,
+            document_id=current.head.document_id,
+            logical_path=current.head.logical_path,
+            parent_version_id=current.head.current_version_id,
+            occurrence_id=authority_occurrence,
+            semantic_actor_id=command.semantic_actor_id,
+            semantic_source_id=command.semantic_source_id,
+            occurred_at=_iso(command.occurred_at) or None,
+            recorded_by=command.recorded_by,
+            recorded_source=command.recorded_source,
+            recorded_at=database_now.isoformat(),
+            provenance_status=command.provenance_status,
+            content_bytes=content,
+            content_hash=content_hash,
+            byte_length=len(content),
+            byte_fidelity=command.byte_fidelity,
+            encoding=command.encoding,
+            newline_style=command.newline_style,
+            change_context=dict(command.change_context or {}),
+        )
+        head = SubjectDocumentHead(
+            document_id=current.head.document_id,
+            logical_path=current.head.logical_path,
+            declared_owner=current.head.declared_owner,
+            current_version_id=version_id,
+            revision=next_revision,
+        )
+        return SubjectDocumentCommit(version=version, head=head)
+
+    async def accept_candidate(
+        self,
+        command: AcceptSubjectCandidate,
+    ) -> SubjectAuthorityCommit:
+        """Commit an explicit active-instance decision under one fenced UoW."""
+
+        material = self._authority_command_material(command)
+        command_sha256 = self._authority_command_sha256(material)
+        accepted_content = bytes(command.accepted_content_bytes)
+
+        async def operation(session: AsyncSession) -> SubjectAuthorityCommit:
+            existing = (
+                (
+                    await session.execute(
+                        text(
+                            f"SELECT {self._authority_decision_columns()} "
+                            "FROM subject_authority_decisions "
+                            "WHERE decision_occurrence_id = :occurrence_id"
+                            + self._for_update
+                        ),
+                        {"occurrence_id": material["decision_occurrence_id"]},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if existing is not None:
+                if str(existing["command_sha256"]) != command_sha256:
+                    raise SubjectAuthorityConflict(
+                        "decision occurrence identity conflict"
+                    )
+                return self._authority_commit_from_row(
+                    existing,
+                    idempotent_replay=True,
+                )
+
+            database_now = await self._database_now(session)
+            await self._validate_active_actor(
+                session,
+                actor=str(material["actor_consciousness_instance_id"]),
+                database_now=database_now,
+            )
+            await self._validate_learning_evidence(
+                session,
+                material=material,
+                accepted_content=accepted_content,
+            )
+            state, previous_revision = await self._subject_authority_state(
+                session,
+                lock=True,
+            )
+            if previous_revision != material["expected_subject_revision"]:
+                raise SubjectAuthorityConflict(
+                    "unified subject revision CAS failed: expected "
+                    f"{material['expected_subject_revision']}, actual "
+                    f"{previous_revision}"
+                )
+            target = state[str(material["target_path"])]
+            committed = await self._append_authority_version(
+                session,
+                current=target,
+                material=material,
+                content=accepted_content,
+                previous_subject_revision=previous_revision,
+                database_now=database_now,
+            )
+            next_contents = {
+                path: (
+                    accepted_content
+                    if path == material["target_path"]
+                    else state[path].version.content_bytes
+                )
+                for path in SUBJECT_AUTHORITY_PATHS
+            }
+            new_revision = subject_revision_from_contents(next_contents)
+            authority_occurrence = self._authority_occurrence_id(
+                str(material["decision_occurrence_id"])
+            )
+            await session.execute(
+                text(
+                    """INSERT INTO subject_authority_decisions (
+                        decision_occurrence_id, authority_occurrence_id,
+                        candidate_id, candidate_revision, candidate_sha256,
+                        candidate_occurrence_id, actor_consciousness_instance_id,
+                        expected_subject_revision, target_path,
+                        accepted_content_sha256, occurred_at,
+                        previous_subject_revision, new_subject_revision,
+                        document_version_id, document_revision,
+                        command_sha256, committed_at
+                    ) VALUES (
+                        :decision_occurrence_id, :authority_occurrence_id,
+                        :candidate_id, :candidate_revision, :candidate_sha256,
+                        :candidate_occurrence_id, :actor,
+                        :expected_subject_revision, :target_path,
+                        :accepted_content_sha256, :occurred_at,
+                        :previous_subject_revision, :new_subject_revision,
+                        :document_version_id, :document_revision,
+                        :command_sha256, :committed_at
+                    )"""
+                ),
+                {
+                    **material,
+                    "authority_occurrence_id": authority_occurrence,
+                    "actor": material["actor_consciousness_instance_id"],
+                    "previous_subject_revision": previous_revision,
+                    "new_subject_revision": new_revision,
+                    "document_version_id": committed.version.version_id,
+                    "document_revision": committed.head.revision,
+                    "command_sha256": command_sha256,
+                    "occurred_at": self._bind_time(material["occurred_at"]),
+                    "committed_at": self._bind_time(database_now),
+                },
+            )
+            return SubjectAuthorityCommit(
+                authority_occurrence_id=authority_occurrence,
+                candidate_id=str(material["candidate_id"]),
+                decision_occurrence_id=str(material["decision_occurrence_id"]),
+                actor_consciousness_instance_id=str(
+                    material["actor_consciousness_instance_id"]
+                ),
+                previous_subject_revision=previous_revision,
+                new_subject_revision=new_revision,
+                document_version_id=committed.version.version_id,
+                document_revision=committed.head.revision,
+                accepted_content_sha256=str(material["accepted_content_sha256"]),
+                idempotent_replay=False,
+            )
+
+        try:
+            return await self._write(operation)
+        except IntegrityError as exc:
+            raise SubjectAuthorityConflict(
+                "subject authority acceptance conflicted during commit"
+            ) from exc
 
     async def get_head(self, logical_path: str) -> SubjectDocumentHead | None:
         path = normalize_subject_path(logical_path)

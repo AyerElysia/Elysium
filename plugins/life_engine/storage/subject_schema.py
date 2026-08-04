@@ -9,7 +9,7 @@ from src.kernel.storage.migration_runner import MySQLMigrationRunner, SchemaMigr
 from .contracts import StorageBackendRuntime
 from .models import BackendKind
 
-SUBJECT_SCHEMA_VERSION = 1
+SUBJECT_SCHEMA_VERSION = 4
 
 LOCAL_SUBJECT_SCHEMA_STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS subject_documents (
@@ -86,6 +86,27 @@ LOCAL_SUBJECT_SCHEMA_STATEMENTS = (
     )""",
     """CREATE INDEX IF NOT EXISTS idx_subject_projection_pending
         ON subject_projection_outbox(state, lease_until, outbox_id)""",
+    """CREATE TABLE IF NOT EXISTS subject_authority_decisions (
+        decision_occurrence_id TEXT PRIMARY KEY,
+        authority_occurrence_id TEXT NOT NULL UNIQUE,
+        candidate_id TEXT NOT NULL,
+        candidate_revision INTEGER NOT NULL,
+        candidate_sha256 TEXT NOT NULL,
+        candidate_occurrence_id TEXT NOT NULL,
+        actor_consciousness_instance_id TEXT NOT NULL,
+        expected_subject_revision TEXT NOT NULL,
+        target_path TEXT NOT NULL,
+        accepted_content_sha256 TEXT NOT NULL,
+        occurred_at TEXT NOT NULL,
+        previous_subject_revision TEXT NOT NULL,
+        new_subject_revision TEXT NOT NULL,
+        document_version_id TEXT NOT NULL,
+        document_revision INTEGER NOT NULL,
+        command_sha256 TEXT NOT NULL,
+        committed_at TEXT NOT NULL,
+        FOREIGN KEY (document_version_id)
+            REFERENCES subject_document_versions(version_id) ON DELETE RESTRICT
+    )""",
     """CREATE TRIGGER IF NOT EXISTS subject_versions_immutable_update
         BEFORE UPDATE ON subject_document_versions BEGIN
             SELECT RAISE(ABORT, 'SubjectDocumentVersionImmutable');
@@ -101,7 +122,15 @@ LOCAL_SUBJECT_SCHEMA_STATEMENTS = (
     """CREATE TRIGGER IF NOT EXISTS subject_head_events_immutable_delete
         BEFORE DELETE ON subject_document_head_events BEGIN
             SELECT RAISE(ABORT, 'SubjectDocumentHeadEventImmutable');
-        END""",
+    END""",
+    """CREATE TRIGGER IF NOT EXISTS subject_authority_decisions_immutable_update
+        BEFORE UPDATE ON subject_authority_decisions BEGIN
+            SELECT RAISE(ABORT, 'SubjectAuthorityDecisionImmutable');
+    END""",
+    """CREATE TRIGGER IF NOT EXISTS subject_authority_decisions_immutable_delete
+        BEFORE DELETE ON subject_authority_decisions BEGIN
+            SELECT RAISE(ABORT, 'SubjectAuthorityDecisionImmutable');
+    END""",
 )
 
 _MYSQL_SUBJECT_SCHEMA = SchemaMigration(
@@ -219,6 +248,55 @@ _MYSQL_SUBJECT_PROJECTION_LEASES = SchemaMigration(
     ),
 )
 
+_MYSQL_SUBJECT_AUTHORITY = SchemaMigration(
+    version=4,
+    name="subject_authority_decisions_v4",
+    statements=(
+        """CREATE TABLE IF NOT EXISTS subject_authority_decisions (
+            decision_occurrence_id VARCHAR(255) CHARACTER SET utf8mb4
+                COLLATE utf8mb4_bin NOT NULL PRIMARY KEY,
+            authority_occurrence_id VARCHAR(96) CHARACTER SET ascii
+                COLLATE ascii_bin NOT NULL,
+            candidate_id VARCHAR(255) CHARACTER SET utf8mb4
+                COLLATE utf8mb4_bin NOT NULL,
+            candidate_revision BIGINT UNSIGNED NOT NULL,
+            candidate_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            candidate_occurrence_id VARCHAR(255) CHARACTER SET utf8mb4
+                COLLATE utf8mb4_bin NOT NULL,
+            actor_consciousness_instance_id VARCHAR(255) CHARACTER SET utf8mb4
+                COLLATE utf8mb4_bin NOT NULL,
+            expected_subject_revision CHAR(64) CHARACTER SET ascii
+                COLLATE ascii_bin NOT NULL,
+            target_path VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            accepted_content_sha256 CHAR(64) CHARACTER SET ascii
+                COLLATE ascii_bin NOT NULL,
+            occurred_at DATETIME(6) NOT NULL,
+            previous_subject_revision CHAR(64) CHARACTER SET ascii
+                COLLATE ascii_bin NOT NULL,
+            new_subject_revision CHAR(64) CHARACTER SET ascii
+                COLLATE ascii_bin NOT NULL,
+            document_version_id VARCHAR(128) CHARACTER SET ascii
+                COLLATE ascii_bin NOT NULL,
+            document_revision BIGINT UNSIGNED NOT NULL,
+            command_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            committed_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_subject_authority_occurrence (authority_occurrence_id),
+            CONSTRAINT fk_subject_authority_version
+                FOREIGN KEY (document_version_id)
+                REFERENCES subject_document_versions(version_id)
+                ON DELETE RESTRICT
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci""",
+        """CREATE TRIGGER IF NOT EXISTS subject_authority_decisions_immutable_update
+        BEFORE UPDATE ON subject_authority_decisions FOR EACH ROW
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'SubjectAuthorityDecisionImmutable'""",
+        """CREATE TRIGGER IF NOT EXISTS subject_authority_decisions_immutable_delete
+        BEFORE DELETE ON subject_authority_decisions FOR EACH ROW
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'SubjectAuthorityDecisionImmutable'""",
+    ),
+)
+
 _MYSQL_SUBJECT_IMMUTABILITY = SchemaMigration(
     version=1,
     name="subject_document_immutability_v1",
@@ -260,6 +338,7 @@ async def ensure_subject_document_schema(
                 _MYSQL_SUBJECT_SCHEMA,
                 _MYSQL_SUBJECT_REFERENCES,
                 _MYSQL_SUBJECT_PROJECTION_LEASES,
+                _MYSQL_SUBJECT_AUTHORITY,
             )
         )
         if require_database_immutability:
