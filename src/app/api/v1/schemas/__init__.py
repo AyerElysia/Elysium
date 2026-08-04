@@ -9,6 +9,13 @@ from .auth import (
     WSTicketRequest,
     WSTicketResponse,
 )
+from .commands import (
+    CommandCancelResponse,
+    CommandCreateRequest,
+    CommandListResponse,
+    CommandResponse,
+    CommandStatusValue,
+)
 from .common import API_VERSION, SCHEMA_VERSION, StrictModel, VersionedModel, utc_now
 from .error import ErrorBody, ErrorResponse, RecoveryHint
 from .events import (
@@ -42,6 +49,11 @@ __all__ = [
     "CallerIdentity",
     "CapabilitiesResponse",
     "CapabilityManifest",
+    "CommandCancelResponse",
+    "CommandCreateRequest",
+    "CommandListResponse",
+    "CommandResponse",
+    "CommandStatusValue",
     "ComponentStatus",
     "ErrorBody",
     "ErrorResponse",

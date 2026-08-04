@@ -365,13 +365,16 @@ app_api_v1_max_websocket_connections = 64
 
 - `api_keys` 是旧 WebUI 合同，不会替代 `/api/v1` 的短时 session、refresh、撤销和单次 WebSocket ticket；
 - Origin 使用精确 allowlist，不支持通配符；localhost 也不能绕过认证；
-- 认证 SQLite 必须位于 workspace 的 `runtime/` 下，只保存凭据哈希、授权、到期与撤销状态，不保存可回显明文凭据；
+- API SQLite 必须位于 workspace 的 `runtime/` 下；认证部分只保存凭据哈希、授权、到期与撤销状态，不保存可回显明文凭据；同库命令账本保存请求 payload 以供耐久执行和查询，因此备份、访问控制与留存策略必须按业务数据级别保护；
 - 普通请求体上限 1 MiB，受管上传上限 32 MiB，HTTP 并发和 WebSocket 连接分别受配置预算约束；
-- 当前已挂载 P3-01 的五个认证端点、P3-02 的 `/bootstrap`、`/capabilities`、`/readiness`、`/health`，以及 P3-03 的 `/events`、`/events/{event_id}`、`/events/stream` 和 `/event-subscriptions/validate`；除 `/health` 仅用于 API 存活探测外，其余接口要求短时 Bearer 会话及对应 scope。命令和其他领域接口尚未完成，不能因为 OpenAPI 可访问就宣称阶段三全部完成；
+- 当前已挂载 P3-01 的五个认证端点、P3-02 的 `/bootstrap`、`/capabilities`、`/readiness`、`/health`，P3-03 的 `/events`、`/events/{event_id}`、`/events/stream` 和 `/event-subscriptions/validate`，以及 P3-04 的命令创建、列表、单项查询和受限取消端点；除 `/health` 仅用于 API 存活探测外，其余接口要求短时 Bearer 会话和对应 scope。其他领域接口与实际领域 command handler 仍由后续阶段完成，不能因为命令内核或 OpenAPI 可访问就宣称全部领域动作可用；
 - 事件接口以耐久 Life Event SQLite ledger 的全局 ingest position 为权威位置，cursor 不透明、签名且绑定账本；授权过滤后的 cursor 表示“已扫描位置”，不可见事件不会造成虚假历史缺口，也不会通过单事件读取泄露存在性；
 - SSE 支持 `Last-Event-ID` 或 `cursor` 断点恢复，二者不一致会显式拒绝；先补历史再轮询 tail，heartbeat 不推进业务 cursor，断线不写服务端 durable offset。当前没有明确动态订阅或 ack 消费者，因此 `/events/ws` 保持 planned，不重复实现无消费者协议；
+- 所有副作用命令必须携带 `Idempotency-Key`。同一 actor 使用同键提交相同规范请求会返回原 command；同键异请求返回 409。HTTP 受理只表示命令已耐久记录，不代表外部副作用成功，调用方必须通过命令查询读取最终状态；
+- 重启只会重新调度 `accepted`。进程退出前已经进入 `executing` 而无法证明投递结果的命令会转为 `delivery_unknown`，不得由客户端或服务端自动盲重试；应先查询外部系统或领域 receipt，再由具有明确幂等证据的领域流程决定后续动作；
+- 命令技术状态事件与状态迁移在同一 SQLite 事务进入既有 `sync_outbox`，当前保持 `private`、`held`，不复制原始 payload，也不建立第二套远程同步；备份恢复后应检查 accepted 恢复、executing 栅栏和 Outbox 连续性；
 - `/readiness` 只读聚合已经存在的内存状态，不调用插件或 Adapter 主动 health，不建立连接、不建表、不执行修复，也不访问会创建 Life Engine service 的懒加载属性；配置停用的平台显示 `disabled`，而不是失败或从列表消失；
-- `local_ready` 只表示当前已落地的本地关键路径（API 与 Life Event ledger）可用。远程同步不可用、Adapter 断开或 P3-04 command store 尚未落地会保留在脱敏诊断中并使总体状态为 `degraded`，但不会伪造本地不可用；
+- `local_ready` 只表示当前已落地的本地关键路径（API 与 Life Event ledger）可用。远程同步不可用或 Adapter 断开会保留在脱敏诊断中并使总体状态为 `degraded`，但不会伪造本地不可用；生产 API mount 存活时 command store 显示 `ready`，未挂载或已关闭时显示 `unavailable`；
 - 受信启动器通过 `AuthStore.create_bootstrap_challenge()` 生成绑定 Origin、安装实例和短 TTL 的一次性 challenge；公共 HTTP 不提供匿名 challenge 生成端点；
 - 备份认证库时必须同时保护签名密钥；恢复后验证旧撤销 session 仍不可用、refresh 不能重放、ticket 只能消费一次。签名密钥遗失时旧 token 不可恢复，必须按凭据失效事故处理，不得临时生成密钥伪装连续会话。
 - API mount 是启动过程中按配置取得的可选资源。关闭流程只关闭已经成功取得的 mount；若初始化在挂载前失败或测试使用部分构造的 `Bot`，缺少该属性必须按“从未取得”幂等跳过，不能阻断 MCP、数据库、向量库和日志等后续资源回收。
@@ -380,7 +383,7 @@ app_api_v1_max_websocket_connections = 64
 定向验收：
 
 ```bash
-uv run --group dev python -m pytest test/api/v1 -q --no-cov -n 0
+uv run --group dev python -m pytest test/api/v1 test/kernel/commands -q --no-cov -n 0
 ```
 
 启用或修改该配置需要用户手工重启 Elysium。本轮开发没有启动或重启运行实例，也没有完成真实前端端到端验收。

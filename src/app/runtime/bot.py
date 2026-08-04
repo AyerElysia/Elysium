@@ -654,7 +654,9 @@ class Bot:
                     ),
                     foundation=foundation,
                     event_store_provider=lambda: event_store_from_bot(self),
+                    task_manager=self.task_manager,
                 )
+                await self.app_api_mount.start()
             await self.http_server.start()
 
             # 挂载 LLM 请求体检视器（调试用 WebUI）
@@ -1092,7 +1094,7 @@ class Bot:
             mount = getattr(self, "app_api_mount", None)
             if mount is None:
                 return
-            mount.close()
+            await mount.aclose()
             self.app_api_mount = None
 
         async def _cleanup_mcp() -> None:

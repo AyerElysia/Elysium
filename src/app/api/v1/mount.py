@@ -10,8 +10,10 @@ from urllib.parse import urlparse
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from src.kernel.commands import CommandDispatcher, CommandStore, HandlerRegistry
 
 from plugins.life_engine.service.event_bus import RawEventStore
+from src.kernel.concurrency import TaskManager
 
 from .auth_store import AuthStore
 from .events import EventQueryService
@@ -30,18 +32,41 @@ class APIV1Mount:
 
     parent: FastAPI
     store: AuthStore
+    command_store: CommandStore
+    command_dispatcher: CommandDispatcher
     _closed: bool = field(default=False, init=False)
 
-    def close(self) -> None:
-        """幂等卸载 `/api/v1` 并关闭认证数据库连接。"""
+    async def start(self) -> None:
+        """Recover durable accepted commands after all handlers are registered."""
+
+        if self._closed:
+            raise RuntimeError("API v1 mount is closed")
+        await self.command_dispatcher.recover()
+
+    async def aclose(self) -> None:
+        """Idempotently stop commands, unmount routes, and close both stores."""
 
         if self._closed:
             return
+        await self.command_dispatcher.close()
+        self._close_resources()
+
+    def close(self) -> None:
+        """Synchronously close an unstarted mount used by setup and tests."""
+
+        if self._closed:
+            return
+        if self.command_dispatcher.has_active_tasks:
+            raise RuntimeError("active command dispatcher requires await mount.aclose()")
+        self._close_resources()
+
+    def _close_resources(self) -> None:
         self.parent.router.routes[:] = [
             route
             for route in self.parent.router.routes
             if getattr(route, "name", None) != MOUNT_NAME
         ]
+        self.command_store.close()
         self.store.close()
         self._closed = True
 
@@ -56,6 +81,8 @@ def mount_api_v1(
     max_websocket_connections: int = 64,
     foundation: FoundationProjection | None = None,
     event_store_provider: Callable[[], RawEventStore | None] | None = None,
+    command_registry: HandlerRegistry | None = None,
+    task_manager: TaskManager | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> APIV1Mount:
     """校验生产配置，创建耐久认证 store，并挂载 `/api/v1`。"""
@@ -72,6 +99,12 @@ def mount_api_v1(
     normalized_origins = _validate_origins(allowed_origins)
     auth_path = _resolve_auth_path(workspace_root, database_path)
     store = AuthStore(auth_path, installation_id=installation_id)
+    command_store = CommandStore(auth_path)
+    command_dispatcher = CommandDispatcher(
+        command_store,
+        registry=command_registry,
+        task_manager=task_manager,
+    )
     try:
         context = APIContext(
             store=store,
@@ -86,6 +119,8 @@ def mount_api_v1(
                 codec=SignedValueCodec(signing_secret),
                 store_provider=event_store_provider,
             ),
+            command_store=command_store,
+            command_dispatcher=command_dispatcher,
         )
         app = create_api_app(context)
         app.add_middleware(
@@ -93,15 +128,26 @@ def mount_api_v1(
             allow_origins=list(normalized_origins),
             allow_credentials=False,
             allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-            allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+            allow_headers=[
+                "Authorization",
+                "Content-Type",
+                "Idempotency-Key",
+                "X-Request-ID",
+            ],
             expose_headers=["X-Request-ID"],
             max_age=600,
         )
         parent.mount("/api/v1", app, name=MOUNT_NAME)
     except BaseException:
+        command_store.close()
         store.close()
         raise
-    return APIV1Mount(parent=parent, store=store)
+    return APIV1Mount(
+        parent=parent,
+        store=store,
+        command_store=command_store,
+        command_dispatcher=command_dispatcher,
+    )
 
 
 def _resolve_auth_path(workspace_root: Path, configured: str) -> Path:

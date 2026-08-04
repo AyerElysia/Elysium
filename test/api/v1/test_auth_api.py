@@ -444,5 +444,5 @@ def test_openapi_operation_ids_are_stable(
             ] == {"$ref": "#/components/schemas/ErrorResponse"}
     normalized = json.dumps(schema, sort_keys=True, separators=(",", ":")).encode()
     assert hashlib.sha256(normalized).hexdigest() == (
-        "cb93968bf912bc8d5a74c177e2ce0e43f7b0ae4d929a64d3c9fa7e1eff20633b"
+        "108e222578f617a3400d576278bbdda30adc205260a7ee018929797e8512f708"
     )
