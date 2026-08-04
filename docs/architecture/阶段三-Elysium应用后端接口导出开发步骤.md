@@ -1212,6 +1212,8 @@ metrics:read / diagnostics:read
 
 ### P3-02：实现 bootstrap、capabilities、readiness
 
+> **实施状态（2026-08-04）**：已完成。已落地 `/bootstrap`、`/capabilities`、`/readiness`、`/health` 及稳定 operation ID；生产挂载通过只读投影聚合 Bot 插件、Adapter、Life Event ledger、远程同步和 command store 状态。NapCat 配置停用明确返回 `disabled`，远程同步或尚未落地的 command store 只影响总体诊断为 `degraded`，不阻止 `local_ready=true`。健康读取不调用主动 health、连接、修复或 Life Engine 懒创建入口。定向验证：`test/api/v1` 30 项通过，Ruff、compileall 与 `git diff --check` 通过；仅保留第三方 `websockets.legacy` 弃用警告。未启动 Elysium，未进行真实前端 E2E。
+
 任务：
 
 1. 聚合插件加载状态、Adapter 状态、Life Event、同步内核和 command store 健康。

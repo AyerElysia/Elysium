@@ -107,8 +107,9 @@ GET /api/v1/health
         pages=("应用启动", "系统总览", "模块健康"),
         callers=_ALL_CALLERS,
         scopes=("system:read", "capabilities:read"),
-        resource_authorization="按部署策略校验调用身份；只返回脱敏技术投影",
-        anchor="src/core/transport/router/http_server.py 与已加载组件管理器；需新增聚合 facade",
+        resource_authorization="health 仅返回 API 存活；其余端点校验调用身份与 scope，只返回脱敏技术投影",
+        anchor="src/app/api/v1/foundation.py、runtime.py 与 schemas/foundation.py",
+        status="validated",
     ),
     *_contracts(
         """

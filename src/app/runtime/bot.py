@@ -628,8 +628,16 @@ class Bot:
 
             self.http_server = get_http_server(host=host, port=port)
             if self.config.http_router.enable_app_api_v1:
+                from src.app.api.v1.foundation import (
+                    FoundationProjection,
+                    snapshot_from_bot,
+                )
                 from src.app.api.v1.mount import mount_api_v1
 
+                foundation = FoundationProjection(
+                    node_id=self.bot_name,
+                    snapshot_provider=lambda: snapshot_from_bot(self),
+                )
                 self.app_api_mount = mount_api_v1(
                     self.http_server.app,
                     workspace_root=_PROJECT_ROOT,
@@ -643,6 +651,7 @@ class Bot:
                     max_websocket_connections=(
                         self.config.http_router.app_api_v1_max_websocket_connections
                     ),
+                    foundation=foundation,
                 )
             await self.http_server.start()
 

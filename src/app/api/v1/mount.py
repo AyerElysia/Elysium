@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .auth_store import AuthStore
+from .foundation import FoundationProjection
 from .runtime import APIContext, create_api_app
 from .tokens import SignedValueCodec
 
@@ -50,6 +51,7 @@ def mount_api_v1(
     allowed_origins: tuple[str, ...],
     max_concurrency: int,
     max_websocket_connections: int = 64,
+    foundation: FoundationProjection | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> APIV1Mount:
     """校验生产配置，创建耐久认证 store，并挂载 `/api/v1`。"""
@@ -74,6 +76,7 @@ def mount_api_v1(
             allowed_origins=normalized_origins,
             max_concurrency=max_concurrency,
             max_websocket_connections=max_websocket_connections,
+            foundation=foundation,
         )
         app = create_api_app(context)
         app.add_middleware(

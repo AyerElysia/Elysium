@@ -44,6 +44,17 @@ def test_inventory_keys_are_unique_and_complete() -> None:
         assert contract.status in {"planned", "experimental", "implemented", "validated"}
 
 
+def test_p3_02_foundation_contracts_are_validated() -> None:
+    keys = {
+        ("GET", "/api/v1/bootstrap"),
+        ("GET", "/api/v1/capabilities"),
+        ("GET", "/api/v1/readiness"),
+        ("GET", "/api/v1/health"),
+    }
+
+    assert {API_INVENTORY_BY_KEY[key].status for key in keys} == {"validated"}
+
+
 def test_every_scope_is_declared_by_phase_three_policy() -> None:
     """inventory 不能暗中引入权限矩阵外的 scope。"""
 

@@ -16,12 +16,17 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
 from .auth_store import AuthStore, SessionRecord
+from .foundation import FoundationProjection
 from .policy import ALL_EXPORTED_SCOPES
 from .schemas import (
+    BootstrapResponse,
     CallerIdentity,
+    CapabilitiesResponse,
     ErrorBody,
     ErrorResponse,
+    HealthResponse,
     LogoutResponse,
+    ReadinessResponse,
     SessionCreateRequest,
     SessionRefreshRequest,
     SessionResponse,
@@ -89,6 +94,7 @@ class APIContext:
     allowed_origins: tuple[str, ...] = ()
     max_concurrency: int = 32
     max_websocket_connections: int = 64
+    foundation: FoundationProjection | None = None
 
 
 class RequestIDMiddleware(BaseHTTPMiddleware):
@@ -357,8 +363,12 @@ def create_api_app(context: APIContext) -> FastAPI:
             APIError("internal_error", "服务内部错误。", status_code=500, retryable=True),
         )
 
-    router = APIRouter(prefix="/auth")
+    auth_router = APIRouter(prefix="/auth")
+    foundation_router = APIRouter()
     bearer = HTTPBearer(auto_error=False)
+    foundation = context.foundation or FoundationProjection(
+        node_id=context.installation_id,
+    )
 
     def current_session(
         credentials: Annotated[
@@ -417,7 +427,7 @@ def create_api_app(context: APIContext) -> FastAPI:
 
         return dependency
 
-    @router.post(
+    @auth_router.post(
         "/sessions",
         response_model=SessionResponse,
         operation_id="createAuthSession",
@@ -455,7 +465,7 @@ def create_api_app(context: APIContext) -> FastAPI:
             raise APIError("unauthenticated", "无法建立认证会话。", status_code=401) from exc
         return _session_response(session, access, refresh)
 
-    @router.get(
+    @auth_router.get(
         "/me",
         response_model=CallerIdentity,
         operation_id="getAuthMe",
@@ -466,7 +476,7 @@ def create_api_app(context: APIContext) -> FastAPI:
     ) -> CallerIdentity:
         return _identity(session)
 
-    @router.post(
+    @auth_router.post(
         "/sessions/current:refresh",
         response_model=SessionResponse,
         operation_id="refreshAuthSession",
@@ -484,7 +494,7 @@ def create_api_app(context: APIContext) -> FastAPI:
             raise APIError("unauthenticated", "刷新凭据无效或已失效。", status_code=401) from exc
         return _session_response(session, access, refresh)
 
-    @router.delete(
+    @auth_router.delete(
         "/sessions/current",
         response_model=LogoutResponse,
         operation_id="logoutAuthSession",
@@ -496,7 +506,7 @@ def create_api_app(context: APIContext) -> FastAPI:
         context.store.revoke_session(session.session_id)
         return LogoutResponse(revoked=True)
 
-    @router.post(
+    @auth_router.post(
         "/ws-tickets",
         response_model=WSTicketResponse,
         operation_id="createAuthWebsocketTicket",
@@ -534,7 +544,59 @@ def create_api_app(context: APIContext) -> FastAPI:
             scopes=ticket.scopes,
         )
 
-    app.include_router(router)
+    @foundation_router.get(
+        "/bootstrap",
+        response_model=BootstrapResponse,
+        operation_id="getBootstrap",
+        responses=ERROR_RESPONSES,
+    )
+    def get_bootstrap(
+        session: Annotated[
+            SessionRecord,
+            Depends(require_scope("system:read")),
+        ],
+    ) -> BootstrapResponse:
+        return foundation.bootstrap(session, _identity(session))
+
+    @foundation_router.get(
+        "/capabilities",
+        response_model=CapabilitiesResponse,
+        operation_id="getCapabilities",
+        responses=ERROR_RESPONSES,
+    )
+    def get_capabilities(
+        session: Annotated[
+            SessionRecord,
+            Depends(require_scope("capabilities:read")),
+        ],
+    ) -> CapabilitiesResponse:
+        return foundation.capabilities(session)
+
+    @foundation_router.get(
+        "/readiness",
+        response_model=ReadinessResponse,
+        operation_id="getReadiness",
+        responses=ERROR_RESPONSES,
+    )
+    def get_readiness(
+        _session: Annotated[
+            SessionRecord,
+            Depends(require_scope("system:read")),
+        ],
+    ) -> ReadinessResponse:
+        return foundation.readiness()
+
+    @foundation_router.get(
+        "/health",
+        response_model=HealthResponse,
+        operation_id="getHealth",
+        responses=ERROR_RESPONSES,
+    )
+    def get_health() -> HealthResponse:
+        return foundation.health()
+
+    app.include_router(auth_router)
+    app.include_router(foundation_router)
     return app
 
 

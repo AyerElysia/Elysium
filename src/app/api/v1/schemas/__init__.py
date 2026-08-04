@@ -11,14 +11,34 @@ from .auth import (
 )
 from .common import API_VERSION, SCHEMA_VERSION, StrictModel, VersionedModel, utc_now
 from .error import ErrorBody, ErrorResponse, RecoveryHint
+from .foundation import (
+    AdapterStatus,
+    BootstrapResponse,
+    CapabilitiesResponse,
+    CapabilityManifest,
+    ComponentStatus,
+    FeatureCapability,
+    HealthResponse,
+    OperationalState,
+    ReadinessResponse,
+)
 
 __all__ = [
     "API_VERSION",
     "SCHEMA_VERSION",
+    "AdapterStatus",
+    "BootstrapResponse",
     "CallerIdentity",
+    "CapabilitiesResponse",
+    "CapabilityManifest",
+    "ComponentStatus",
     "ErrorBody",
     "ErrorResponse",
+    "FeatureCapability",
+    "HealthResponse",
     "LogoutResponse",
+    "OperationalState",
+    "ReadinessResponse",
     "RecoveryHint",
     "SessionCreateRequest",
     "SessionRefreshRequest",

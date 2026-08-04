@@ -422,6 +422,10 @@ def test_openapi_operation_ids_are_stable(
         "refreshAuthSession",
         "logoutAuthSession",
         "createAuthWebsocketTicket",
+        "getBootstrap",
+        "getCapabilities",
+        "getReadiness",
+        "getHealth",
     }
     assert "HTTPBearer" in schema["components"]["securitySchemes"]
     for path in schema["paths"].values():
@@ -436,5 +440,5 @@ def test_openapi_operation_ids_are_stable(
             ] == {"$ref": "#/components/schemas/ErrorResponse"}
     normalized = json.dumps(schema, sort_keys=True, separators=(",", ":")).encode()
     assert hashlib.sha256(normalized).hexdigest() == (
-        "005023f48d9010ff17330a96eb6413f0f610efb10ef93c7b2b6af4da8a43939b"
+        "ceef6a7b0073f2b8795586e6b79226e2d28de64d8a0e8b21dd36184d20719cc4"
     )
