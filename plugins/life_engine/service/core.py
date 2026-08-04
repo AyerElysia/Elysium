@@ -51,6 +51,13 @@ from ..core.router_context_projection import (
     RouterContextSource,
     build_router_context_projection_prompt,
 )
+from ..core.subject_context_projection import (
+    SubjectContextDraft,
+    SubjectContextProjection,
+    SubjectContextSource,
+    build_subject_context_projection_prompt,
+    validate_subject_projection_text,
+)
 from ..core.send_targets import format_send_targets_for_prompt, list_recent_send_targets
 from ..core.tool_parallel import iter_life_tool_call_batches
 from ..autonomy import (
@@ -212,6 +219,9 @@ class LifeEngineService(BaseService):
         self._memory_archive_sync_error: str = ""
         self._router_context_projection_task_id: str | None = None
         self._router_context_projection: RouterContextProjection | None = None
+        self._subject_context_projections: dict[
+            tuple[str, int], SubjectContextProjection
+        ] = {}
         self._stop_event: asyncio.Event | None = None
         self._pending_events: list[LifeEngineEvent] = []
         self._event_history: list[LifeEngineEvent] = []
@@ -1086,6 +1096,27 @@ class LifeEngineService(BaseService):
                 "fresh": False,
                 "degraded_reason": "",
             }
+        subject_profiles = [
+            projection.health_snapshot()
+            for projection in self._subject_context_projections.values()
+        ]
+        subject_statuses = {
+            str(item.get("status") or "") for item in subject_profiles
+        }
+        if "degraded" in subject_statuses:
+            subject_status = "degraded"
+        elif "ready" in subject_statuses:
+            subject_status = "ready"
+        else:
+            subject_status = "idle"
+        snapshot["subject_context_projection"] = {
+            "component": "subject_context_projection",
+            "owner": "life_engine.service",
+            "status": subject_status,
+            "mode": "on_demand",
+            "profile_count": len(subject_profiles),
+            "profiles": subject_profiles,
+        }
         if self._shared_sync_bridge is not None:
             try:
                 snapshot["shared_sync"] = self._shared_sync_bridge.health_snapshot()
@@ -1149,12 +1180,92 @@ class LifeEngineService(BaseService):
         return await projection.ensure_current()
 
     def notify_router_context_source_changed(self, path: str | Path) -> bool:
-        """Notify the owned projection loop after an official workspace write."""
+        """Notify all subject-derived projections after an official workspace write."""
 
         projection = self._router_context_projection
+        router_notified = bool(
+            projection is not None and projection.notify_source_changed(path)
+        )
+        subject_notified = False
+        for subject_projection in self._subject_context_projections.values():
+            subject_notified = (
+                subject_projection.notify_source_changed(path) or subject_notified
+            )
+        return router_notified or subject_notified
+
+    def notify_subject_context_source_changed(self, path: str | Path) -> bool:
+        """Explicit alias for consumers that do not depend on router terminology."""
+
+        return self.notify_router_context_source_changed(path)
+
+    async def get_subject_context_projection_snapshot(
+        self,
+        *,
+        projection_kind: str,
+        max_bytes: int,
+        source_digest: str = "",
+        projection_version: int | None = None,
+    ) -> dict[str, Any]:
+        """Return a current or pinned immutable subject projection snapshot.
+
+        An empty ``source_digest`` first verifies all three current authority files.
+        A concrete digest loads that historical content-addressed version without
+        silently switching a resumed consciousness episode to a newer identity.
+        """
+
+        revision = str(source_digest or "").strip()
+        if not revision and projection_version is not None:
+            raise ValueError("projection_version requires a historical source_digest")
+        projection_key = (
+            str(projection_kind or "").strip().lower(),
+            int(max_bytes),
+        )
+        projection = self._subject_context_projections.get(projection_key)
         if projection is None:
-            return False
-        return projection.notify_source_changed(path)
+            projection_ref: SubjectContextProjection | None = None
+
+            async def author(
+                digest: str,
+                sources: tuple[SubjectContextSource, ...],
+            ) -> SubjectContextDraft:
+                if projection_ref is None:
+                    raise RuntimeError("subject projection owner was not initialized")
+                return await self._author_subject_context_projection(
+                    digest,
+                    sources,
+                    projection_kind=projection_ref.projection_profile,
+                    max_chars=projection_ref.max_chars,
+                    max_bytes=projection_ref.max_bytes,
+                )
+
+            projection_ref = SubjectContextProjection(
+                str(self._workspace_dir()),
+                projection_profile=projection_key[0],
+                max_bytes=projection_key[1],
+                author=author,
+            )
+            projection = projection_ref
+            projection_key = (
+                projection.projection_profile,
+                projection.max_bytes,
+            )
+            self._subject_context_projections[projection_key] = projection
+        if revision:
+            snapshot = await projection.get_snapshot(
+                revision,
+                projection_version=projection_version,
+            )
+        else:
+            snapshot = await projection.ensure_current_snapshot()
+        if snapshot is None:
+            health = projection.health_snapshot()
+            reason = str(health.get("degraded_reason") or "snapshot unavailable")
+            raise RuntimeError(
+                "subject context projection unavailable: "
+                f"kind={projection.projection_profile}, max_bytes={projection.max_bytes}, "
+                f"source_digest={revision or 'current'}, reason={reason}"
+            )
+        return dict(snapshot)
 
     async def _author_router_context_projection(
         self,
@@ -1245,6 +1356,133 @@ class LifeEngineService(BaseService):
         detail = "; ".join(errors[-3:]) or "no valid model entry"
         raise RuntimeError(
             f"router context projection exhausted cloud models: {detail}"
+        )
+
+    async def _author_subject_context_projection(
+        self,
+        source_digest: str,
+        sources: tuple[SubjectContextSource, ...],
+        *,
+        projection_kind: str,
+        max_chars: int,
+        max_bytes: int,
+    ) -> SubjectContextDraft:
+        """Author one structured projection without creating a second persona."""
+
+        chatter_cfg = self._cfg().chatter
+        task_name = str(
+            getattr(
+                chatter_cfg,
+                "subject_context_projection_task_name",
+                "router_context_projection",
+            )
+            or "router_context_projection"
+        ).strip()
+        timeout_seconds = float(
+            getattr(
+                chatter_cfg,
+                "subject_context_projection_timeout_seconds",
+                90.0,
+            )
+            or 90.0
+        )
+        system_prompt, user_prompt = build_subject_context_projection_prompt(
+            source_digest,
+            sources,
+            projection_profile=projection_kind,
+            max_chars=max_chars,
+            max_bytes=max_bytes,
+        )
+        try:
+            model_set = get_model_set_by_task(task_name)
+        except (KeyError, ValueError):
+            fallback_task = "utility"
+            logger.warning(
+                f"Subject context projection task {task_name!r} is not configured; "
+                f"falling back to cloud task {fallback_task!r}"
+            )
+            task_name = fallback_task
+            model_set = get_model_set_by_task(task_name)
+        if not model_set:
+            raise RuntimeError(f"model task '{task_name}' has no models")
+
+        errors: list[str] = []
+        content_byte_budget = max(1, max_bytes - 2048)
+        for configured_model in model_set:
+            if not isinstance(configured_model, dict):
+                continue
+            model_identifier = str(
+                configured_model.get("model_identifier") or "unknown"
+            )
+            request = create_llm_request(
+                model_set=[dict(configured_model)],
+                request_name="life_subject_context_projection",
+            )
+            request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
+            request.add_payload(LLMPayload(ROLE.USER, Text(user_prompt)))
+            try:
+                response = await asyncio.wait_for(
+                    request.send(stream=False),
+                    timeout=timeout_seconds,
+                )
+                awaited_text = await asyncio.wait_for(
+                    response,
+                    timeout=timeout_seconds,
+                )
+                content = str(response.message or awaited_text or "").strip()
+                if not content:
+                    errors.append(f"{model_identifier}: empty final content")
+                    continue
+                if len(content) > max_chars:
+                    errors.append(
+                        f"{model_identifier}: final content exceeded char budget "
+                        f"({len(content)} > {max_chars})"
+                    )
+                    continue
+                content_bytes = len(content.encode("utf-8"))
+                if content_bytes > content_byte_budget:
+                    errors.append(
+                        f"{model_identifier}: final content exceeded byte budget "
+                        f"({content_bytes} > {content_byte_budget})"
+                    )
+                    continue
+                try:
+                    sections = validate_subject_projection_text(content)
+                except RuntimeError as exc:
+                    errors.append(f"{model_identifier}: invalid coverage: {exc}")
+                    continue
+                per_source_max_bytes = max(256, (max_bytes - 2048) // 3)
+                oversized_source = next(
+                    (
+                        (path, len(section.encode("utf-8")))
+                        for path, section in sections.items()
+                        if len(section.encode("utf-8")) > per_source_max_bytes
+                    ),
+                    None,
+                )
+                if oversized_source is not None:
+                    path, delivered_bytes = oversized_source
+                    errors.append(
+                        f"{model_identifier}: source block exceeded byte budget "
+                        f"({path}: {delivered_bytes} > {per_source_max_bytes})"
+                    )
+                    continue
+                return SubjectContextDraft(
+                    text=content,
+                    generator=f"task:{task_name}/model:{model_identifier}",
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{model_identifier}: {type(exc).__name__}: {exc}")
+                logger.warning(
+                    "Subject context projection model failed; trying next model: "
+                    f"model={model_identifier} error={type(exc).__name__}: {exc}"
+                )
+
+        detail = "; ".join(errors[-3:]) or "no valid model entry"
+        raise RuntimeError(
+            f"subject context projection exhausted cloud models: {detail}"
         )
 
     async def get_state_digest_for_dfc(self) -> str:

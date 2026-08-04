@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -18,6 +19,7 @@ from typing import Any
 
 ROUTER_CONTEXT_SCHEMA_VERSION = 1
 ROUTER_CONTEXT_SOURCE_FILES = ("SOUL.md", "USER.md", "MEMORY.md")
+_SOURCE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _now_iso() -> str:
@@ -51,6 +53,10 @@ class RouterContextProjection:
     """Own the refresh loop and content-addressed router context versions."""
 
     component_name = "router_context_projection"
+    projection_kind = "derived_router_context_projection"
+    projection_title = "Router Context Projection"
+    projection_algorithm = "llm_semantic_router_projection"
+    projection_version = 1
 
     def __init__(
         self,
@@ -178,6 +184,55 @@ class RouterContextProjection:
             raise
         except Exception:  # noqa: BLE001 - unavailable projection is explicit degradation
             return ""
+
+    async def ensure_current_snapshot(self) -> dict[str, Any] | None:
+        """Capture one current immutable projection and its content-free manifest."""
+
+        rendered = await self.ensure_current()
+        if not rendered:
+            return None
+        source_digest = self._latest_source_digest
+        try:
+            return await asyncio.to_thread(
+                self._load_snapshot,
+                source_digest,
+                None,
+                self.projection_version,
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError) as exc:
+            self._degraded_reason = f"{type(exc).__name__}: {exc}"
+            await self._persist_health()
+            return None
+
+    async def get_snapshot(
+        self,
+        source_digest: str,
+        *,
+        projection_version: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Load an immutable historical projection without consulting current files."""
+
+        revision = str(source_digest or "").strip().lower()
+        if not revision:
+            return None
+        if not _SOURCE_DIGEST_RE.fullmatch(revision):
+            raise ValueError("source_digest must be a 64-character SHA-256 hex digest")
+        version = (
+            self.projection_version
+            if projection_version is None
+            else int(projection_version)
+        )
+        if version < 1:
+            raise ValueError("projection_version must be a positive integer")
+        try:
+            return await asyncio.to_thread(
+                self._load_snapshot,
+                revision,
+                None,
+                version,
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError):
+            return None
 
     async def refresh(self) -> str:
         """Build or restore the exact content-addressed source version."""
@@ -308,28 +363,42 @@ class RouterContextProjection:
         sources: tuple[RouterContextSource, ...],
         source_digest: str,
     ) -> str:
-        version_path = self.versions_dir / f"{source_digest}.md"
-        manifest_path = self.versions_dir / f"{source_digest}.json"
+        version_stem = self._version_stem(source_digest, self.projection_version)
+        version_path = self.versions_dir / f"{version_stem}.md"
+        manifest_path = self.versions_dir / f"{version_stem}.json"
         try:
             rendered = version_path.read_text(encoding="utf-8")
         except (FileNotFoundError, OSError, UnicodeError):
             return ""
         if not manifest_path.exists():
+            if not self._allow_manifest_recovery():
+                raise RuntimeError(
+                    f"immutable projection manifest is missing for {source_digest}"
+                )
             if f"source_digest: `{source_digest}`" not in rendered:
                 return ""
+            self._validate_rendered_projection(
+                rendered,
+                source_digest,
+                self.projection_version,
+            )
             recovered_manifest = {
                 "schema_version": ROUTER_CONTEXT_SCHEMA_VERSION,
-                "kind": "derived_router_context_projection",
+                "kind": self.projection_kind,
                 "authority": "derived_non_authoritative",
+                "projection_algorithm": self.projection_algorithm,
+                "projection_version": self.projection_version,
                 "source_digest": source_digest,
                 "sources": self._source_manifest_entries(sources),
                 "projection_path": str(version_path.relative_to(self.runtime_dir)),
                 "projection_sha256": hashlib.sha256(
                     rendered.encode("utf-8")
                 ).hexdigest(),
+                "budget": self._budget_stats(sources, rendered),
                 "generated_at": _now_iso(),
                 "generator": "recovered_existing_projection",
             }
+            recovered_manifest.update(self._manifest_extra(sources, rendered))
             self._write_json_atomic(manifest_path, recovered_manifest)
             self._write_json_atomic(self.latest_path, recovered_manifest)
             return rendered
@@ -339,6 +408,8 @@ class RouterContextProjection:
             return ""
         if manifest.get("schema_version") != ROUTER_CONTEXT_SCHEMA_VERSION:
             return ""
+        if not self._manifest_matches_profile(manifest, self.projection_version):
+            return ""
         if manifest.get("source_digest") != source_digest:
             return ""
         projection_digest = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
@@ -347,6 +418,15 @@ class RouterContextProjection:
         expected_sources = self._source_manifest_entries(sources)
         if manifest.get("sources") != expected_sources:
             return ""
+        expected_path = str(version_path.relative_to(self.runtime_dir))
+        if manifest.get("projection_path") != expected_path:
+            return ""
+        self._validate_rendered_projection(
+            rendered,
+            source_digest,
+            self.projection_version,
+        )
+        self._validate_snapshot_manifest(manifest, rendered)
         self._write_json_atomic(self.latest_path, manifest)
         return rendered
 
@@ -358,23 +438,39 @@ class RouterContextProjection:
         generator: str,
     ) -> None:
         self.versions_dir.mkdir(parents=True, exist_ok=True)
-        version_path = self.versions_dir / f"{source_digest}.md"
-        manifest_path = self.versions_dir / f"{source_digest}.json"
+        version_stem = self._version_stem(source_digest, self.projection_version)
+        version_path = self.versions_dir / f"{version_stem}.md"
+        manifest_path = self.versions_dir / f"{version_stem}.json"
+        version_existed = version_path.exists()
+        manifest_existed = manifest_path.exists()
+        if version_existed != manifest_existed:
+            raise RuntimeError(
+                f"incomplete immutable projection version for {source_digest}"
+            )
+        self._validate_rendered_projection(
+            rendered,
+            source_digest,
+            self.projection_version,
+        )
         projection_digest = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
         generated_at = _now_iso()
         manifest = {
             "schema_version": ROUTER_CONTEXT_SCHEMA_VERSION,
-            "kind": "derived_router_context_projection",
+            "kind": self.projection_kind,
             "authority": "derived_non_authoritative",
+            "projection_algorithm": self.projection_algorithm,
+            "projection_version": self.projection_version,
             "source_digest": source_digest,
             "sources": self._source_manifest_entries(sources),
             "projection_path": str(version_path.relative_to(self.runtime_dir)),
             "projection_sha256": projection_digest,
+            "budget": self._budget_stats(sources, rendered),
             "generated_at": generated_at,
             "generator": generator,
         }
+        manifest.update(self._manifest_extra(sources, rendered))
+        self._validate_snapshot_manifest(manifest, rendered)
 
-        version_existed = version_path.exists()
         if version_existed:
             try:
                 existing_text = version_path.read_text(encoding="utf-8")
@@ -389,7 +485,7 @@ class RouterContextProjection:
         else:
             self._write_text_atomic(version_path, rendered)
 
-        if manifest_path.exists() and version_existed:
+        if manifest_existed:
             try:
                 existing_manifest = json.loads(
                     manifest_path.read_text(encoding="utf-8")
@@ -398,16 +494,154 @@ class RouterContextProjection:
                 raise RuntimeError(
                     f"unreadable router projection manifest {source_digest}: {exc}"
                 ) from exc
-            if (
-                existing_manifest.get("source_digest") != source_digest
-                or existing_manifest.get("projection_sha256") != projection_digest
+            immutable_keys = (
+                "schema_version",
+                "kind",
+                "authority",
+                "projection_algorithm",
+                "projection_version",
+                "source_digest",
+                "sources",
+                "projection_path",
+                "projection_sha256",
+                "budget",
+            )
+            if any(
+                existing_manifest.get(key) != manifest.get(key)
+                for key in immutable_keys
+            ) or not self._manifest_matches_profile(
+                existing_manifest,
+                self.projection_version,
             ):
                 raise RuntimeError(
                     f"immutable router projection manifest conflict for {source_digest}"
                 )
+            self._validate_snapshot_manifest(existing_manifest, existing_text)
+            self._write_json_atomic(self.latest_path, existing_manifest)
+            return
 
         self._write_json_atomic(manifest_path, manifest)
         self._write_json_atomic(self.latest_path, manifest)
+
+    def _version_stem(self, source_digest: str, projection_version: int) -> str:
+        del projection_version
+        return source_digest
+
+    def _manifest_matches_profile(
+        self,
+        manifest: dict[str, Any],
+        projection_version: int,
+    ) -> bool:
+        algorithm = manifest.get("projection_algorithm")
+        version = manifest.get("projection_version", 1)
+        return (
+            manifest.get("kind") == self.projection_kind
+            and (algorithm is None or algorithm == self.projection_algorithm)
+            and isinstance(version, int)
+            and not isinstance(version, bool)
+            and version == projection_version
+        )
+
+    def _allow_manifest_recovery(self) -> bool:
+        return True
+
+    def _validate_rendered_projection(
+        self,
+        rendered: str,
+        source_digest: str,
+        projection_version: int,
+    ) -> None:
+        del rendered, source_digest, projection_version
+
+    def _validate_snapshot_manifest(
+        self,
+        manifest: dict[str, Any],
+        rendered: str,
+    ) -> None:
+        del rendered
+        if "text" in manifest:
+            raise RuntimeError("projection manifest must not contain projection text")
+
+    def _load_snapshot(
+        self,
+        source_digest: str,
+        rendered: str | None,
+        projection_version: int,
+    ) -> dict[str, Any]:
+        if not _SOURCE_DIGEST_RE.fullmatch(source_digest):
+            raise RuntimeError("projection source digest is invalid")
+        if projection_version < 1:
+            raise RuntimeError("projection version is invalid")
+        version_stem = self._version_stem(source_digest, projection_version)
+        version_path = self.versions_dir / f"{version_stem}.md"
+        manifest_path = self.versions_dir / f"{version_stem}.json"
+        projection_text = (
+            rendered
+            if rendered is not None
+            else version_path.read_text(encoding="utf-8")
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("schema_version") != ROUTER_CONTEXT_SCHEMA_VERSION:
+            raise RuntimeError("projection manifest schema is incompatible")
+        if not self._manifest_matches_profile(manifest, projection_version):
+            raise RuntimeError("projection manifest profile is incompatible")
+        if manifest.get("source_digest") != source_digest:
+            raise RuntimeError("projection manifest source digest mismatch")
+        sources = manifest.get("sources")
+        if not isinstance(sources, list) or len(sources) != len(
+            ROUTER_CONTEXT_SOURCE_FILES
+        ):
+            raise RuntimeError("projection manifest source coverage is invalid")
+        for expected_path, source in zip(
+            ROUTER_CONTEXT_SOURCE_FILES,
+            sources,
+            strict=True,
+        ):
+            if not isinstance(source, dict) or source.get("path") != expected_path:
+                raise RuntimeError("projection manifest source order is invalid")
+            source_sha = source.get("sha256")
+            size_bytes = source.get("size_bytes")
+            if (
+                not isinstance(source_sha, str)
+                or not _SOURCE_DIGEST_RE.fullmatch(source_sha)
+                or not isinstance(size_bytes, int)
+                or isinstance(size_bytes, bool)
+                or size_bytes < 0
+            ):
+                raise RuntimeError("projection manifest source metadata is invalid")
+        projection_digest = hashlib.sha256(projection_text.encode("utf-8")).hexdigest()
+        if manifest.get("projection_sha256") != projection_digest:
+            raise RuntimeError("projection content hash mismatch")
+        expected_path = str(version_path.relative_to(self.runtime_dir))
+        if manifest.get("projection_path") != expected_path:
+            raise RuntimeError("projection manifest path mismatch")
+        self._validate_rendered_projection(
+            projection_text,
+            source_digest,
+            projection_version,
+        )
+        self._validate_snapshot_manifest(manifest, projection_text)
+        return {**manifest, "text": projection_text}
+
+    def _budget_stats(
+        self,
+        sources: tuple[RouterContextSource, ...],
+        rendered: str,
+    ) -> dict[str, int]:
+        return {
+            "max_chars": self.max_chars,
+            "original_bytes": sum(source.size_bytes for source in sources),
+            "delivered_chars": len(rendered),
+            "delivered_bytes": len(rendered.encode("utf-8")),
+        }
+
+    def _manifest_extra(
+        self,
+        sources: tuple[RouterContextSource, ...],
+        rendered: str,
+    ) -> dict[str, Any]:
+        del sources, rendered
+        return {}
 
     @staticmethod
     def _source_manifest_entries(
@@ -422,8 +656,8 @@ class RouterContextProjection:
             for source in sources
         ]
 
-    @staticmethod
     def _render_projection(
+        self,
         *,
         source_digest: str,
         sources: tuple[RouterContextSource, ...],
@@ -433,10 +667,12 @@ class RouterContextProjection:
             f"{source.path}@sha256:{source.sha256[:12]}" for source in sources
         )
         return (
-            "# Router Context Projection\n\n"
+            f"# {self.projection_title}\n\n"
             "> Derived, non-authoritative and rebuildable. "
             "The referenced source files remain authoritative.\n\n"
             f"- source_digest: `{source_digest}`\n"
+            f"- projection_algorithm: `{self.projection_algorithm}`\n"
+            f"- projection_version: `{self.projection_version}`\n"
             f"- source_refs: {refs}\n\n"
             f"{projection_text.strip()}\n"
         )

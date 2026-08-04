@@ -121,6 +121,8 @@ class LifeEngineConfig(BaseConfig):
             "router_context_projection_max_chars",
             "router_context_projection_poll_seconds",
             "router_context_projection_timeout_seconds",
+            "subject_context_projection_task_name",
+            "subject_context_projection_timeout_seconds",
             "enable_sub_agent",
             "sub_agent_task_name",
             "sub_agent_allow_mcp",
@@ -1052,6 +1054,21 @@ class LifeEngineConfig(BaseConfig):
             ge=5.0,
             le=300.0,
             description="单个云端模型生成 Router 上下文投影的超时时间。",
+        )
+
+        subject_context_projection_task_name: str = Field(
+            default="router_context_projection",
+            description=(
+                "Cloud-model task used to build on-demand, bounded subject "
+                "projections from SOUL.md, USER.md and MEMORY.md."
+            ),
+        )
+
+        subject_context_projection_timeout_seconds: float = Field(
+            default=90.0,
+            ge=5.0,
+            le=300.0,
+            description="Timeout for one subject-context projection model attempt.",
         )
 
         enable_sub_agent: bool = Field(

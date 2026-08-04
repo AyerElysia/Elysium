@@ -1,5 +1,7 @@
 # Elysium 文档
 
+- [主体上下文投影](./architecture/主体上下文投影.md) — SOUL/USER/MEMORY 共同权威、按 surface/预算派生、revision 固定与不可变恢复契约
+
 - [直播系统](./architecture/直播系统.md) — B站接入、同一意识导演、真实播放回执与记忆闭环
 
 ## 从这里开始
