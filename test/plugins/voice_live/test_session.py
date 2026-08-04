@@ -342,7 +342,14 @@ async def test_session_runs_audio_interrupt_transcript_tool_and_cleanup(
     assert bridge.transcripts == [("assistant", "你好", "evt")]
     await session.handle_message({"type": "interrupt", "played_audio_ms": 127})
     assert provider.interrupt_values == [127]
-    assert any(event.get("type") == "playback.clear" for event in json_events)
+    clear_count = sum(
+        event.get("type") == "playback.clear" for event in json_events
+    )
+    assert clear_count == 1
+    await provider._emit_interruption(
+        InterruptionEvent("client", "response-1", "item-1")
+    )
+    assert sum(event.get("type") == "playback.clear" for event in json_events) == 1
 
     await provider._emit_tool_call(ToolCallEvent("call", "action-think", '{"x":1}'))
     assert provider.tool_results == [

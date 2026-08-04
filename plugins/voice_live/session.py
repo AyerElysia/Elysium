@@ -521,8 +521,6 @@ class CallSession:
             await self._fail(f"上游实时模型异常: {message}")
 
     async def _on_interruption(self, event: InterruptionEvent) -> None:
-        self._interruptions += 1
-        await self._reset_voice_conversion()
         await self._store.append_async(
             "provider.interruption",
             {
@@ -531,6 +529,13 @@ class CallSession:
                 "item_id": event.item_id,
             },
         )
+        # Browser-originated barge-in already cleared playback, reset conversion,
+        # and incremented the counter in handle_message().  The provider callback
+        # is an acknowledgement, not a second interruption.
+        if event.source == "client":
+            return
+        self._interruptions += 1
+        await self._reset_voice_conversion()
         await self._send_json_safe({"type": "playback.clear", "reason": event.source})
 
     async def _on_metrics(self, event: ProviderMetrics) -> None:

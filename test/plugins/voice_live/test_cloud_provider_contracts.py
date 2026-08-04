@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 from aiohttp import web
 
+from plugins.voice_live.protocol import ProviderState
 from plugins.voice_live.providers.base import AudioDelta, TranscriptEvent
 from plugins.voice_live.providers.openai_realtime import OpenAIRealtimeProvider
 from plugins.voice_live.providers.qwen_realtime import (
@@ -319,6 +320,37 @@ async def test_qwen_interrupt_is_idempotent_without_an_active_response() -> None
     provider._response_active = True
     provider._active_response_id = "response-1"
     provider._active_item_id = "item-1"
+    await asyncio.gather(
+        provider.interrupt(played_audio_ms=125),
+        provider.interrupt(played_audio_ms=125),
+    )
+
+    assert [event["type"] for event in websocket.events] == ["response.cancel"]
+    assert provider._response_active is False  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_qwen_omni_interrupt_truncates_only_once() -> None:
+    class FakeWebSocket:
+        closed = False
+
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        async def send_str(self, payload: str) -> None:
+            self.events.append(json.loads(payload))
+
+    provider = QwenRealtimeProvider(
+        "ws://127.0.0.1/realtime",
+        "secret-value",
+        model="qwen3.5-omni-plus-realtime",
+    )
+    websocket = FakeWebSocket()
+    provider._ws = websocket  # type: ignore[assignment]
+    provider._response_active = True
+    provider._active_response_id = "response-1"
+    provider._active_item_id = "item-1"
+
     await provider.interrupt(played_audio_ms=125)
 
     assert [event["type"] for event in websocket.events] == [
@@ -326,6 +358,74 @@ async def test_qwen_interrupt_is_idempotent_without_an_active_response() -> None
         "conversation.item.truncate",
     ]
     assert websocket.events[1]["audio_end_ms"] == 125
+
+
+@pytest.mark.asyncio
+async def test_qwen_stale_cancel_error_is_recoverable() -> None:
+    provider = QwenRealtimeProvider(
+        "ws://127.0.0.1/realtime",
+        "secret-value",
+        model="qwen-audio-3.0-realtime-plus",
+    )
+    errors: list[str] = []
+    metrics: list[dict[str, Any]] = []
+
+    async def on_error(message: str) -> None:
+        errors.append(message)
+
+    async def on_metrics(event: Any) -> None:
+        metrics.append(event.values)
+
+    provider.on_error(on_error)
+    provider.on_metrics(on_metrics)
+    provider._interrupting_response_id = "response-1"  # type: ignore[attr-defined]
+    provider._active_response_id = "response-1"  # type: ignore[attr-defined]
+    await provider._emit_state(ProviderState.INTERRUPTED)
+
+    await provider._handle_event(  # type: ignore[attr-defined]
+        {
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_value",
+                "message": "Conversation has no active response.",
+                "param": "response.cancel",
+            },
+        }
+    )
+
+    assert errors == []
+    assert metrics[-1]["interruption"]["stale_cancel_ignored"] == 1
+    assert provider._state is ProviderState.LISTENING  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_qwen_no_active_response_error_without_local_cancel_is_not_hidden() -> None:
+    provider = QwenRealtimeProvider(
+        "ws://127.0.0.1/realtime",
+        "secret-value",
+        model="qwen-audio-3.0-realtime-plus",
+    )
+    errors: list[str] = []
+
+    async def on_error(message: str) -> None:
+        errors.append(message)
+
+    provider.on_error(on_error)
+    await provider._handle_event(  # type: ignore[attr-defined]
+        {
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_value",
+                "message": "Conversation has no active response.",
+            },
+        }
+    )
+
+    assert errors == [
+        "Conversation has no active response. (invalid_request_error, invalid_value)"
+    ]
 
 
 @pytest.mark.asyncio

@@ -76,6 +76,16 @@ def _qwen_safe_tool_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_]", "_", name)
 
 
+def _is_stale_cancel_error(error: dict[str, Any]) -> bool:
+    """Recognize Qwen's harmless response.cancel completion race."""
+
+    return (
+        str(error.get("type") or "") == "invalid_request_error"
+        and str(error.get("code") or "") == "invalid_value"
+        and "no active response" in str(error.get("message") or "").lower()
+    )
+
+
 class QwenRealtimeProvider(BaseRealtimeProvider):
     provider_name = "qwen_realtime"
     input_sample_rate = 16000
@@ -109,6 +119,8 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
         self._response_active = False
         self._active_response_id = ""
         self._active_item_id = ""
+        self._interrupting_response_id = ""
+        self._interrupt_lock = asyncio.Lock()
         self._response_generation = 0
         self._transient_context_expiry: dict[str, int] = {}
         self._tool_name_map: dict[str, str] = {}
@@ -244,25 +256,33 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
         )
 
     async def interrupt(self, *, played_audio_ms: int | None = None) -> None:
-        response_id = self._active_response_id
-        item_id = self._active_item_id
-        if self._response_active:
+        async with self._interrupt_lock:
+            if not self._response_active:
+                return
+            response_id = self._active_response_id
+            item_id = self._active_item_id
+            # Claim the response before the first await so overlapping local and
+            # server barge-in signals cannot emit duplicate response.cancel events.
+            self._response_active = False
+            self._interrupting_response_id = response_id
             await self._send({"type": "response.cancel"})
-        if self._response_active and played_audio_ms is not None and item_id:
-            await self._send(
-                {
-                    "type": "conversation.item.truncate",
-                    "item_id": item_id,
-                    "content_index": 0,
-                    "audio_end_ms": max(0, played_audio_ms),
-                }
+            if (
+                not self._model.startswith("qwen-audio-")
+                and played_audio_ms is not None
+                and item_id
+            ):
+                await self._send(
+                    {
+                        "type": "conversation.item.truncate",
+                        "item_id": item_id,
+                        "content_index": 0,
+                        "audio_end_ms": max(0, played_audio_ms),
+                    }
+                )
+            await self._emit_state(ProviderState.INTERRUPTED)
+            await self._emit_interruption(
+                InterruptionEvent("client", response_id, item_id)
             )
-        await self._emit_state(
-            ProviderState.INTERRUPTED
-            if self._response_active
-            else ProviderState.LISTENING
-        )
-        await self._emit_interruption(InterruptionEvent("client", response_id, item_id))
 
     async def send_text(self, text: str) -> None:
         await self.inject_context(text)
@@ -424,6 +444,7 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
             self._active_response_id = str(
                 response.get("id") or event.get("response_id") or ""
             )
+            self._interrupting_response_id = ""
             await self._emit_state(ProviderState.THINKING)
             return
         if event_type in {"response.output_item.added", "conversation.item.created"}:
@@ -432,6 +453,8 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
                 self._active_item_id = str(item.get("id") or "")
             return
         if event_type == "response.audio.delta" and event.get("delta"):
+            if self._interrupting_response_id == self._active_response_id:
+                return
             await self._emit_state(ProviderState.SPEAKING)
             await self._emit_audio(
                 AudioDelta(
@@ -483,6 +506,22 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
             return
         if event_type == "error":
             error = event.get("error") or {}
+            if self._interrupting_response_id and _is_stale_cancel_error(error):
+                response_id = self._interrupting_response_id
+                self._response_active = False
+                self._active_response_id = ""
+                self._active_item_id = ""
+                self._interrupting_response_id = ""
+                await self._emit_metrics(
+                    {
+                        "interruption": {
+                            "stale_cancel_ignored": 1,
+                            "response_id": response_id,
+                        }
+                    }
+                )
+                await self._emit_state(ProviderState.LISTENING)
+                return
             message = str(
                 error.get("message") or event.get("message") or "Qwen Realtime error"
             )
