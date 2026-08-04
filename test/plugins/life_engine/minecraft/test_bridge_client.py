@@ -63,7 +63,7 @@ async def test_bridge_authenticates_correlates_and_waits_for_fresh_state() -> No
                     "nonce": nonce,
                     "instance_id": "minecraft-test",
                     "body_type": "neoforge-agent",
-                    "bridge_version": "0.2.0",
+                    "bridge_version": "0.2.1",
                     "minecraft_version": "1.21.1",
                     "neoforge_version": "21.1.219",
                     "capabilities": ["baritone.goal", "native.input_batch"],
@@ -116,7 +116,7 @@ async def test_bridge_authenticates_correlates_and_waits_for_fresh_state() -> No
     assert client.capabilities == ("baritone.goal", "native.input_batch")
     assert client.hello_metadata == {
         "body_type": "neoforge-agent",
-        "bridge_version": "0.2.0",
+        "bridge_version": "0.2.1",
         "minecraft_version": "1.21.1",
         "neoforge_version": "21.1.219",
     }

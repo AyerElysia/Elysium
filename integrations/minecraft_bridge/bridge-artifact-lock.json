@@ -1,7 +1,7 @@
 {
-  "file_name": "elysium_bridge-0.2.0.jar",
-  "sha256": "AB455A1285196A7ACAFD996D32E669F1B865880DA20EE29E25481775F1A624CA",
-  "bridge_version": "0.2.0",
+  "file_name": "elysium_bridge-0.2.1.jar",
+  "sha256": "F6B80E166F8C3EDA683020C8154D817DA3098873AE9ECDF6161F05C8FF8A50DC",
+  "bridge_version": "0.2.1",
   "minecraft_version": "1.21.1",
   "neoforge_version": "21.1.219",
   "baritone": {

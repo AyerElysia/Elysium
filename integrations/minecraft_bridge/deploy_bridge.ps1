@@ -1,5 +1,5 @@
 param(
-    [string]$SourceJar = (Join-Path $PSScriptRoot "build\libs\elysium_bridge-0.2.0.jar"),
+    [string]$SourceJar = (Join-Path $PSScriptRoot "build\libs\elysium_bridge-0.2.1.jar"),
     [string]$GameRoot = "G:\Game\Minecraft\.minecraft"
 )
 

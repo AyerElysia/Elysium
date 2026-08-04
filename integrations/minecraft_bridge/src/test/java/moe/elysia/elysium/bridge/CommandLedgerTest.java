@@ -2,6 +2,7 @@ package moe.elysia.elysium.bridge;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import com.google.gson.JsonObject;
 import org.junit.jupiter.api.Test;
@@ -19,6 +20,22 @@ final class CommandLedgerTest {
     }
 
     @Test
+    void pendingReplayReceivesTheOriginalTerminalReceipt() {
+        CommandLedger ledger = new CommandLedger(8);
+        JsonObject command = command("command_1", "navigation.goto", 1, 2);
+        ledger.begin("command_1", command);
+        CommandLedger.Decision replay = ledger.begin("command_1", command.deepCopy());
+        JsonObject receipt = new JsonObject();
+        receipt.addProperty("receipt_id", "receipt_original");
+
+        ledger.complete("command_1", receipt);
+
+        assertEquals(
+                "receipt_original",
+                replay.pendingCompletion().join().get("receipt_id").getAsString());
+    }
+
+    @Test
     void terminalReceiptIsReplayedExactly() {
         CommandLedger ledger = new CommandLedger(8);
         JsonObject command = command("command_1", "world.mine", 1, 2);
@@ -31,6 +48,23 @@ final class CommandLedgerTest {
 
         assertEquals(CommandLedger.DecisionKind.TERMINAL_REPLAY, replay.kind());
         assertEquals("receipt_original", replay.terminalReceipt().get("receipt_id").getAsString());
+    }
+
+    @Test
+    void terminalReceiptCannotBeReplacedAfterCompletion() {
+        CommandLedger ledger = new CommandLedger(8);
+        JsonObject command = command("command_1", "world.mine", 1, 2);
+        ledger.begin("command_1", command);
+        JsonObject original = new JsonObject();
+        original.addProperty("receipt_id", "receipt_original");
+        ledger.complete("command_1", original);
+
+        JsonObject replacement = new JsonObject();
+        replacement.addProperty("receipt_id", "receipt_replacement");
+
+        assertThrows(
+                IllegalStateException.class,
+                () -> ledger.complete("command_1", replacement));
     }
 
     @Test

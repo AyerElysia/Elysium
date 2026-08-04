@@ -65,7 +65,7 @@ class _Bridge:
             "player.respawn",
             "world.mine",
         )
-        self.hello_metadata = {"bridge_version": "0.2.0"}
+        self.hello_metadata = {"bridge_version": "0.2.1"}
         self.sequence = 0
         self.interruptions: list[tuple[str, str]] = []
         self.closed = False
@@ -534,6 +534,25 @@ async def test_preflight_rejects_launcher_without_exact_quick_play(
     assert result["success"] is False
     assert result["ready_to_start"] is False
     assert any("--quickPlaySingleplayer" in item for item in result["blockers"])
+
+
+async def test_agent_preflight_allows_first_launch_to_create_token(
+    tmp_path: Path,
+) -> None:
+    """The NeoForge bridge may atomically create its token on first launch."""
+
+    token_file = tmp_path / "not-created-yet.json"
+    session = MinecraftSession(
+        workspace=tmp_path,
+        mc_config=MCConfig(mc_home=tmp_path, agent_token_file=token_file),
+    )
+    session._launcher = _Launcher()
+
+    result = await session.preflight(body_name="agent")
+
+    assert result["success"] is True
+    assert result["ready_to_start"] is True
+    assert result["token_bootstraps_on_launch"] is True
 
 
 async def test_preflight_reports_windows_bridge_failure(tmp_path: Path) -> None:

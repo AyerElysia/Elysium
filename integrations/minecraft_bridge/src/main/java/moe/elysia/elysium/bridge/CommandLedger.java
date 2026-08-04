@@ -13,6 +13,7 @@ import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 
 /** Bounded command replay protection shared across controller reconnects. */
 final class CommandLedger {
@@ -25,7 +26,10 @@ final class CommandLedger {
         CONFLICT
     }
 
-    record Decision(DecisionKind kind, JsonObject terminalReceipt) {}
+    record Decision(
+            DecisionKind kind,
+            JsonObject terminalReceipt,
+            CompletableFuture<JsonObject> pendingCompletion) {}
 
     private final int maximumTerminalEntries;
     private final LinkedHashMap<String, Entry> entries = new LinkedHashMap<>(16, 0.75f, true);
@@ -44,17 +48,21 @@ final class CommandLedger {
         if (existing == null) {
             entries.put(commandId, new Entry(fingerprint, null));
             pruneTerminalEntries();
-            return new Decision(DecisionKind.NEW, null);
+            return new Decision(DecisionKind.NEW, null, null);
         }
         if (!MessageDigest.isEqual(
                 existing.fingerprint.getBytes(StandardCharsets.US_ASCII),
                 fingerprint.getBytes(StandardCharsets.US_ASCII))) {
-            return new Decision(DecisionKind.CONFLICT, null);
+            return new Decision(DecisionKind.CONFLICT, null, null);
         }
         if (existing.terminalReceipt == null) {
-            return new Decision(DecisionKind.PENDING_REPLAY, null);
+            return new Decision(
+                    DecisionKind.PENDING_REPLAY, null, existing.pendingCompletion);
         }
-        return new Decision(DecisionKind.TERMINAL_REPLAY, existing.terminalReceipt.deepCopy());
+        return new Decision(
+                DecisionKind.TERMINAL_REPLAY,
+                existing.terminalReceipt.deepCopy(),
+                null);
     }
 
     /** Store the exact terminal receipt returned by a successfully reserved command. */
@@ -63,7 +71,11 @@ final class CommandLedger {
         if (existing == null) {
             throw new IllegalStateException("command was not reserved: " + commandId);
         }
+        if (existing.terminalReceipt != null) {
+            throw new IllegalStateException("command already has a terminal receipt: " + commandId);
+        }
         existing.terminalReceipt = terminalReceipt.deepCopy();
+        existing.pendingCompletion.complete(existing.terminalReceipt.deepCopy());
         pruneTerminalEntries();
     }
 
@@ -127,6 +139,8 @@ final class CommandLedger {
 
     private static final class Entry {
         private final String fingerprint;
+        private final CompletableFuture<JsonObject> pendingCompletion =
+                new CompletableFuture<>();
         private JsonObject terminalReceipt;
 
         private Entry(String fingerprint, JsonObject terminalReceipt) {

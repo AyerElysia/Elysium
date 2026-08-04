@@ -6,8 +6,10 @@ import com.google.gson.annotations.SerializedName;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.security.SecureRandom;
 import java.util.Base64;
 import net.neoforged.fml.loading.FMLPaths;
@@ -51,7 +53,17 @@ final class BridgeConfig {
                 config.authenticationToken = Base64.getUrlEncoder().withoutPadding().encodeToString(token);
             }
             Files.createDirectories(path.getParent());
-            Files.writeString(path, GSON.toJson(config), StandardCharsets.UTF_8);
+            Path temporary = path.resolveSibling(path.getFileName() + ".tmp");
+            Files.writeString(temporary, GSON.toJson(config), StandardCharsets.UTF_8);
+            try {
+                Files.move(
+                        temporary,
+                        path,
+                        StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException exception) {
+                Files.move(temporary, path, StandardCopyOption.REPLACE_EXISTING);
+            }
             return config;
         } catch (IOException exception) {
             throw new IllegalStateException("Unable to load Elysium bridge configuration", exception);

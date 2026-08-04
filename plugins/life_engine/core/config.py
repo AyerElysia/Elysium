@@ -1902,20 +1902,20 @@ class LifeEngineConfig(BaseConfig):
         )
 
         expected_bridge_version: str = Field(
-            default="0.2.0",
+            default="0.2.1",
             min_length=1,
             description="Exact authenticated NeoForge bridge build version.",
         )
 
         bridge_mod_filename: str = Field(
-            default="elysium_bridge-0.2.0.jar",
+            default="elysium_bridge-0.2.1.jar",
             min_length=1,
             description="Exact selected NeoForge bridge artifact filename.",
         )
 
         expected_bridge_sha256: str = Field(
             default=(
-                "AB455A1285196A7ACAFD996D32E669F1B865880DA20EE29E25481775F1A624CA"
+                "F6B80E166F8C3EDA683020C8154D817DA3098873AE9ECDF6161F05C8FF8A50DC"
             ),
             pattern=r"^[A-Fa-f0-9]{64}$",
             description="Pinned SHA-256 for the selected NeoForge bridge artifact.",

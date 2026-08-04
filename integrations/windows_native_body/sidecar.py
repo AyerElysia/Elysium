@@ -858,6 +858,11 @@ class NativeBodySession:
                 socket,
                 self._receipt(command_id, intent_id, True, False, {}, None),
             )
+            completion = decision.pending_completion
+            if completion is None:
+                raise RuntimeError("pending replay has no completion handle")
+            terminal = await asyncio.shield(asyncio.wrap_future(completion))
+            await self._send_receipt(socket, terminal)
             return
         if decision.kind is DecisionKind.TERMINAL_REPLAY:
             if decision.terminal_receipt is None:

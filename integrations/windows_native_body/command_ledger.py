@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 from collections import OrderedDict
+from concurrent.futures import Future
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -22,6 +23,14 @@ class DecisionKind(StrEnum):
 class Decision:
     kind: DecisionKind
     terminal_receipt: dict[str, Any] | None = None
+    pending_completion: Future[dict[str, Any]] | None = None
+
+
+@dataclass(slots=True)
+class _Entry:
+    fingerprint: str
+    completion: Future[dict[str, Any]]
+    terminal_receipt: dict[str, Any] | None = None
 
 
 class CommandLedger:
@@ -31,46 +40,49 @@ class CommandLedger:
         if maximum_terminal_entries < 1:
             raise ValueError("maximum_terminal_entries must be positive")
         self._maximum_terminal_entries = maximum_terminal_entries
-        self._entries: OrderedDict[str, tuple[str, dict[str, Any] | None]] = (
-            OrderedDict()
-        )
+        self._entries: OrderedDict[str, _Entry] = OrderedDict()
 
     def begin(self, command_id: str, command: dict[str, Any]) -> Decision:
         fingerprint = self._fingerprint(command)
         existing = self._entries.get(command_id)
         if existing is None:
-            self._entries[command_id] = (fingerprint, None)
+            self._entries[command_id] = _Entry(fingerprint, Future())
             return Decision(DecisionKind.NEW)
         self._entries.move_to_end(command_id)
-        existing_fingerprint, terminal = existing
-        if not hmac.compare_digest(existing_fingerprint, fingerprint):
+        if not hmac.compare_digest(existing.fingerprint, fingerprint):
             return Decision(DecisionKind.CONFLICT)
-        if terminal is None:
-            return Decision(DecisionKind.PENDING_REPLAY)
+        if existing.terminal_receipt is None:
+            return Decision(
+                DecisionKind.PENDING_REPLAY,
+                pending_completion=existing.completion,
+            )
         return Decision(
             DecisionKind.TERMINAL_REPLAY,
-            json.loads(json.dumps(terminal)),
+            json.loads(json.dumps(existing.terminal_receipt)),
         )
 
     def complete(self, command_id: str, terminal_receipt: dict[str, Any]) -> None:
         existing = self._entries.get(command_id)
         if existing is None:
             raise RuntimeError(f"command was not reserved: {command_id}")
-        self._entries[command_id] = (
-            existing[0],
-            json.loads(json.dumps(terminal_receipt)),
-        )
+        if existing.terminal_receipt is not None:
+            raise RuntimeError(f"command already has a terminal receipt: {command_id}")
+        existing.terminal_receipt = json.loads(json.dumps(terminal_receipt))
+        if not existing.completion.done():
+            existing.completion.set_result(
+                json.loads(json.dumps(existing.terminal_receipt))
+            )
         self._entries.move_to_end(command_id)
         self._prune()
 
     def _prune(self) -> None:
         terminal_count = sum(
-            terminal is not None for _, terminal in self._entries.values()
+            entry.terminal_receipt is not None for entry in self._entries.values()
         )
         if terminal_count <= self._maximum_terminal_entries:
             return
-        for command_id, (_, terminal) in tuple(self._entries.items()):
-            if terminal is not None:
+        for command_id, entry in tuple(self._entries.items()):
+            if entry.terminal_receipt is not None:
                 del self._entries[command_id]
                 terminal_count -= 1
                 if terminal_count <= self._maximum_terminal_entries:

@@ -60,10 +60,10 @@ class MCConfig:
     world_ready_timeout_seconds: float = 120.0
     intent_timeout_seconds: float | None = 300.0
     require_quick_play: bool = True
-    expected_bridge_version: str = "0.2.0"
-    bridge_mod_filename: str = "elysium_bridge-0.2.0.jar"
+    expected_bridge_version: str = "0.2.1"
+    bridge_mod_filename: str = "elysium_bridge-0.2.1.jar"
     expected_bridge_sha256: str = (
-        "AB455A1285196A7ACAFD996D32E669F1B865880DA20EE29E25481775F1A624CA"
+        "F6B80E166F8C3EDA683020C8154D817DA3098873AE9ECDF6161F05C8FF8A50DC"
     )
     baritone_mod_filename: str = "baritone-unoptimized-neoforge-1.11.2.jar"
     expected_baritone_sha256: str = (

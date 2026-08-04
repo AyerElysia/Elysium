@@ -29,7 +29,7 @@ import net.minecraft.client.Minecraft;
 /** Authenticated outbound WebSocket endpoint for one embodiment controller. */
 final class BridgeServer {
     static final String PROTOCOL = "elysium.minecraft.bridge/1";
-    static final String BRIDGE_VERSION = "0.2.0";
+    static final String BRIDGE_VERSION = "0.2.1";
     private static final long AUTHENTICATION_DEADLINE_SECONDS = 5L;
     private static final int MAX_DROPPABLE_OUTBOUND_MESSAGES = 32;
     private static final int MAX_TERMINAL_COMMAND_RECEIPTS = 1024;
@@ -326,6 +326,8 @@ final class BridgeServer {
                 sendReceipt(socket, receipt(
                         commandId, intentId, true, false, false,
                         new JsonObject(), null, state.observationSequence.get()));
+                decision.pendingCompletion().thenAccept(
+                        terminal -> sendReceipt(socket, terminal.deepCopy()));
                 return;
             }
             case TERMINAL_REPLAY -> {

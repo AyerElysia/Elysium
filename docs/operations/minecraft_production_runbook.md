@@ -2,7 +2,7 @@
 
 ## 当前支持范围
 
-生产默认身体是 `agent`：可见的 NeoForge 1.21.1 客户端加载 Elysium Bridge 0.2.0，由游戏主动连接 WSL 中的 Life Engine。它提供结构化世界观察、经过类型校验的动作、Baritone 导航、终态回执和哈希证据链。
+生产默认身体是 `agent`：可见的 NeoForge 1.21.1 客户端加载 Elysium Bridge 0.2.1，由游戏主动连接 WSL 中的 Life Engine。它提供结构化世界观察、经过类型校验的动作、Baritone 导航、终态回执和哈希证据链。
 
 `biomimetic` 是可选实验身体，使用 DXcam 与 Windows 原生输入。它依赖唯一的前台 Minecraft 窗口，不能与人同时争用同一桌面的键鼠，也不能在旧 sidecar 仍运行时启动新实例。生产任务应保持 `default_body = "agent"`。
 
@@ -13,8 +13,8 @@
 - 世界：`Elysian Realm`
 - 游戏目录：`G:\Game\Minecraft\.minecraft`
 - 启动脚本：`G:\Game\Minecraft\PCL\LaunchElysia.bat`
-- Elysium Bridge：`elysium_bridge-0.2.0.jar`
-- Bridge SHA-256：`AB455A1285196A7ACAFD996D32E669F1B865880DA20EE29E25481775F1A624CA`
+- Elysium Bridge：`elysium_bridge-0.2.1.jar`
+- Bridge SHA-256：`F6B80E166F8C3EDA683020C8154D817DA3098873AE9ECDF6161F05C8FF8A50DC`
 - Baritone：`baritone-unoptimized-neoforge-1.11.2.jar`
 - Baritone SHA-256：`B413CE0A2754A3C8484AAE39875CF84BE1F999DEE208E86D41B3D0D329D5CA35`
 
@@ -60,12 +60,12 @@
    launch_bat = "G:\\Game\\Minecraft\\PCL\\LaunchElysia.bat"
    launch_dir = "G:\\Game\\Minecraft\\PCL"
    require_quick_play = true
-   expected_bridge_version = "0.2.0"
+   expected_bridge_version = "0.2.1"
    ```
 
    其余摘要、文件名、监听地址和超时使用代码中的已验证默认值。令牌由桥接首次启动写入 `config/elysium_bridge.json`，不得复制到仓库或日志。
 
-5. 由用户手动重启 Elysium。AI 和部署脚本均不得替用户停止、重启或拉起 Elysium、NapCat 或已有 Minecraft 进程。
+5. 由用户手动重启 Elysium。AI 和部署脚本均不得替用户停止、重启或拉起 Elysium，也不得停止或重启已有 Minecraft 进程。NapCat/QQNT 的自动恢复按根目录 `AGENTS.md` 的独立生命周期规范执行，本手册中的 Minecraft 脚本不管理它。
 
 ## 启动与就绪语义
 
@@ -85,7 +85,7 @@
 
 Agent Body 只接受显式类型动作：移动/视角、交互、快捷栏、丢弃、聊天、复活、等待、Baritone 导航与挖掘、停止和释放。任意 Baritone 命令字符串不属于生产接口。
 
-命令 ID 与规范化载荷共同进入有界重放账本：完全相同的重试复用已有 ack/终态；相同 ID 配不同载荷会被拒绝。`accepted` 只表示接单，只有终态回执加后续新观察才能支撑完成结论。
+命令 ID 与规范化载荷共同进入有界重放账本：完全相同的重试复用已有 ack/终态；若重连时原命令仍在执行，新连接会在原执行完成后收到同一份终态，而不会再次执行；相同 ID 配不同载荷会被拒绝。`accepted` 只表示接单，只有终态回执加后续新观察才能支撑完成结论。
 
 每次 session 的证据写入：
 

@@ -111,7 +111,7 @@ async def test_installation_requires_one_hash_pinned_bridge_and_baritone(
     (tmp_path / "saves" / "Elysian Realm").mkdir(parents=True)
     mods = tmp_path / "mods"
     mods.mkdir()
-    bridge = mods / "elysium_bridge-0.2.0.jar"
+    bridge = mods / "elysium_bridge-0.2.1.jar"
     baritone = mods / "baritone-unoptimized-neoforge-1.11.2.jar"
     bridge.write_bytes(b"bridge-test-artifact")
     baritone.write_bytes(b"baritone-test-artifact")

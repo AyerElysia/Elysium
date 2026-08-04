@@ -217,7 +217,8 @@ class MinecraftSession:
                 "launch script does not enter the exact configured world with "
                 "--quickPlaySingleplayer"
             )
-        if not profile.token_file.exists():
+        token_bootstraps_on_launch = selected_name == "agent" and window is None
+        if not profile.token_file.exists() and not token_bootstraps_on_launch:
             blockers.append(f"body token file is missing: {profile.token_file}")
         return {
             "success": not blockers,
@@ -229,6 +230,7 @@ class MinecraftSession:
             "windows_bridge_error": window_error,
             "required_operations": sorted(profile.required_operations),
             "expected_bridge_version": self._config.expected_bridge_version,
+            "token_bootstraps_on_launch": token_bootstraps_on_launch,
         }
 
     async def start(self, goal: str = "", body_name: str = "") -> dict[str, Any]:
@@ -848,7 +850,12 @@ class MinecraftSession:
                     return client
                 except BridgeProtocolError:
                     raise
-                except (OSError, TimeoutError, ConnectionError) as exception:
+                except (
+                    OSError,
+                    TimeoutError,
+                    ConnectionError,
+                    ValueError,
+                ) as exception:
                     last_error = exception
             await asyncio.sleep(1.0)
         raise TimeoutError(

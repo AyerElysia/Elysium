@@ -16,7 +16,7 @@ def test_production_minecraft_defaults_are_version_and_world_pinned() -> None:
     assert minecraft.mc_version == "1.21.1"
     assert minecraft.world_name == "Elysian Realm"
     assert minecraft.require_quick_play is True
-    assert minecraft.expected_bridge_version == "0.2.0"
+    assert minecraft.expected_bridge_version == "0.2.1"
     assert len(minecraft.expected_bridge_sha256) == 64
     assert len(minecraft.expected_baritone_sha256) == 64
     assert minecraft.intent_timeout_seconds == 300.0

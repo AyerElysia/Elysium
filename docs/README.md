@@ -67,6 +67,7 @@
 - [商业级具身架构](./architecture/Minecraft具身架构.md) — Agent、完全仿生、OBS 与服务器路线
 - [Minecraft 生产运行手册](./operations/minecraft_production_runbook.md) — 固定环境、部署、就绪、烟雾测试与故障恢复
 - [2026-08-04 商业级审计与生产验收报告](./report/minecraft-commercial-audit-2026-08-02.md)
+- [2026-08-04 生产具身集成验收](./report/minecraft-integration-acceptance-2026-08-04.md) — 二号独立审查、0.2.1 重放/首次启动补强与最终现场门
 
 ## 她的日记
 
