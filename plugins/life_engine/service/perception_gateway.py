@@ -139,7 +139,9 @@ class PerceptionGateway:
         identity = str(instance_id or "").strip()
         if not identity:
             raise ValueError("perception instance_id must not be empty")
+        self._projection.ensure_deliverable()
         through = self._projection.catch_up(self._ledger)
+        self._projection.ensure_deliverable()
         from_position, revision = self._projection.perception_cursor(identity)
         assertions = self._projection.list_assertions(include_retracted=True)
         changes = self._projection.changes_since(
@@ -176,6 +178,7 @@ class PerceptionGateway:
         return self._projection.commit_perception_cursor(
             prepared.instance_id,
             expected_position=prepared.from_position,
+            expected_revision=prepared.cursor_revision,
             through_position=prepared.through_position,
         )
 

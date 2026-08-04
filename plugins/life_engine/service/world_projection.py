@@ -20,17 +20,26 @@ from typing import Any, ClassVar
 from .event_bus import LifeEvent, RawEventStore
 
 WORLD_PROJECTION_DB_FILE = "world_projection.sqlite3"
-WORLD_PROJECTION_SCHEMA_VERSION = 1
+WORLD_PROJECTION_SCHEMA_VERSION = 2
+WORLD_PROJECTOR_POLICY = "source-preserving-v1"
+WORLD_PROJECTOR_SCHEMA_VERSION = 1
+WORLD_REBUILD_IDLE = "idle"
+WORLD_REBUILDING = "rebuilding"
+WORLD_REBUILD_FAILED = "failed"
 WORLD_OBSERVATION_EVENT = "world.observation_reported"
 WORLD_LEGACY_IMPORT_EVENT = "world.legacy_snapshot_imported"
 
 
 class WorldProjectionConflict(RuntimeError):
-    """Raised when one assertion identity is reused for different evidence."""
+    """Raised when one projection identity is reused for different evidence."""
 
 
 class PerceptionCursorConflict(RuntimeError):
     """Raised when a stale perception delivery attempts to advance a cursor."""
+
+
+class WorldProjectionUnavailable(RuntimeError):
+    """Raised when a projection cannot safely serve transient perception."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,13 +206,38 @@ class WorldProjectionStore:
                 );
                 """
             )
-            self._set_meta(
-                db,
-                "schema_version",
-                str(WORLD_PROJECTION_SCHEMA_VERSION),
-            )
+            schema_version = self._get_meta(db, "schema_version")
+            if schema_version is None:
+                self._set_meta(
+                    db,
+                    "schema_version",
+                    str(WORLD_PROJECTION_SCHEMA_VERSION),
+                )
+            elif int(schema_version) > WORLD_PROJECTION_SCHEMA_VERSION:
+                raise WorldProjectionConflict(
+                    "world projection schema is newer than this runtime: "
+                    f"{schema_version}"
+                )
+            elif int(schema_version) < WORLD_PROJECTION_SCHEMA_VERSION:
+                self._set_meta(
+                    db,
+                    "schema_version",
+                    str(WORLD_PROJECTION_SCHEMA_VERSION),
+                )
             if self._get_meta(db, "as_of_ingest_position") is None:
                 self._set_meta(db, "as_of_ingest_position", "0")
+            self._ensure_meta_contract(
+                db,
+                "projector_policy",
+                WORLD_PROJECTOR_POLICY,
+            )
+            self._ensure_meta_contract(
+                db,
+                "projector_schema_version",
+                str(WORLD_PROJECTOR_SCHEMA_VERSION),
+            )
+            if self._get_meta(db, "rebuild_state") is None:
+                self._set_meta(db, "rebuild_state", WORLD_REBUILD_IDLE)
 
     @staticmethod
     def _get_meta(db: sqlite3.Connection, key: str) -> str | None:
@@ -226,6 +260,24 @@ class WorldProjectionStore:
                 updated_at = excluded.updated_at""",
             (key, value, self._now_iso()),
         )
+
+    def _ensure_meta_contract(
+        self,
+        db: sqlite3.Connection,
+        key: str,
+        expected: str,
+    ) -> None:
+        """Initialize one projector contract or reject incompatible state."""
+
+        actual = self._get_meta(db, key)
+        if actual is None:
+            self._set_meta(db, key, expected)
+            return
+        if actual != expected:
+            raise WorldProjectionConflict(
+                f"world projector {key} mismatch: expected {expected!r}, "
+                f"actual {actual!r}"
+            )
 
     @staticmethod
     def _decode_object(content: str) -> dict[str, Any]:
@@ -251,7 +303,7 @@ class WorldProjectionStore:
         if supplied:
             return supplied
         occurrence = event.occurrence_id or event.event_id
-        material = f"{occurrence}:{index}".encode("utf-8")
+        material = f"{occurrence}:{index}".encode()
         return "assertion_" + hashlib.sha256(material).hexdigest()
 
     @staticmethod
@@ -281,9 +333,7 @@ class WorldProjectionStore:
         subject = str(assertion.get("subject") or "").strip()
         predicate = str(assertion.get("predicate") or "").strip()
         if not subject or not predicate:
-            raise ValueError(
-                "world assertions require non-empty subject and predicate"
-            )
+            raise ValueError("world assertions require non-empty subject and predicate")
         observed_at = str(assertion.get("observed_at") or event.timestamp)
         value = assertion.get("value")
         value_json = json.dumps(
@@ -321,10 +371,9 @@ class WorldProjectionStore:
             (assertion_id,),
         ).fetchone()
         if existing is not None:
-            if (
-                str(existing["payload_json"]) != payload_json
-                or str(existing["occurrence_id"]) != (event.occurrence_id or event.event_id)
-            ):
+            if str(existing["payload_json"]) != payload_json or str(
+                existing["occurrence_id"]
+            ) != (event.occurrence_id or event.event_id):
                 raise WorldProjectionConflict(
                     f"assertion identity reused with different evidence: {assertion_id}"
                 )
@@ -363,24 +412,41 @@ class WorldProjectionStore:
             sort_keys=True,
             separators=(",", ":"),
         )
+        values = (
+            event.sequence,
+            event.event_id,
+            event.occurrence_id or event.event_id,
+            event.event_type,
+            change_kind,
+            event.source_instance_id,
+            event.stream_id,
+            event.timestamp,
+            event.recorded_at,
+            payload_json,
+        )
+        existing = db.execute(
+            """SELECT event_id, occurrence_id, event_type, change_kind,
+                source_instance_id, stream_id, occurred_at, recorded_at,
+                payload_json FROM world_projection_changes
+                WHERE ingest_position = ?""",
+            (event.sequence,),
+        ).fetchone()
+        if existing is not None:
+            actual = tuple(str(value) for value in existing)
+            expected = tuple(str(value) for value in values[1:])
+            if actual != expected:
+                raise WorldProjectionConflict(
+                    "world ingest position reused with different evidence: "
+                    f"{event.sequence}"
+                )
+            return
         db.execute(
-            """INSERT OR IGNORE INTO world_projection_changes (
+            """INSERT INTO world_projection_changes (
                 ingest_position, event_id, occurrence_id, event_type,
                 change_kind, source_instance_id, stream_id, occurred_at,
                 recorded_at, payload_json
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                event.sequence,
-                event.event_id,
-                event.occurrence_id or event.event_id,
-                event.event_type,
-                change_kind,
-                event.source_instance_id,
-                event.stream_id,
-                event.timestamp,
-                event.recorded_at,
-                payload_json,
-            ),
+            values,
         )
 
     def _apply_event(self, db: sqlite3.Connection, event: LifeEvent) -> None:
@@ -419,7 +485,13 @@ class WorldProjectionStore:
                 current = int(self._get_meta(db, "as_of_ingest_position") or 0)
                 for event in ordered:
                     if event.sequence <= current:
+                        self._apply_event(db, event)
                         continue
+                    if event.sequence != current + 1:
+                        raise WorldProjectionConflict(
+                            "world projector ledger gap: "
+                            f"expected {current + 1}, actual {event.sequence}"
+                        )
                     self._apply_event(db, event)
                     current = event.sequence
                 self._set_meta(db, "as_of_ingest_position", str(current))
@@ -443,20 +515,56 @@ class WorldProjectionStore:
                 self.apply_events(batch)
 
     def rebuild(self, ledger: RawEventStore, *, batch_size: int = 500) -> int:
-        """Discard only derived data and replay the immutable ledger from zero."""
+        """Replay derived data while preserving independent delivery cursors."""
 
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             try:
+                self._set_meta(db, "rebuild_state", WORLD_REBUILDING)
                 db.execute("DELETE FROM world_assertions")
                 db.execute("DELETE FROM world_projection_changes")
-                db.execute("DELETE FROM world_perception_cursors")
                 self._set_meta(db, "as_of_ingest_position", "0")
                 db.commit()
             except BaseException:
                 db.rollback()
                 raise
-        return self.catch_up(ledger, batch_size=batch_size)
+        try:
+            frontier = self.catch_up(ledger, batch_size=batch_size)
+        except BaseException as primary:
+            try:
+                with self._lock, self._connect() as db:
+                    self._set_meta(db, "rebuild_state", WORLD_REBUILD_FAILED)
+            except Exception as state_error:  # noqa: BLE001 - preserve replay failure
+                primary.add_note(
+                    "world rebuild state could not be marked failed: "
+                    f"{type(state_error).__name__}"
+                )
+            raise
+        with self._lock, self._connect() as db:
+            self._set_meta(db, "rebuild_state", WORLD_REBUILD_IDLE)
+        return frontier
+
+    def projector_contract(self) -> dict[str, Any]:
+        """Return the persisted policy, schema, and rebuild state."""
+
+        with self._connect() as db:
+            return {
+                "policy": self._get_meta(db, "projector_policy") or "",
+                "schema_version": int(
+                    self._get_meta(db, "projector_schema_version") or 0
+                ),
+                "rebuild_state": self._get_meta(db, "rebuild_state") or "",
+            }
+
+    def ensure_deliverable(self) -> None:
+        """Fail closed while a rebuild is incomplete or has failed."""
+
+        contract = self.projector_contract()
+        if contract["rebuild_state"] != WORLD_REBUILD_IDLE:
+            raise WorldProjectionUnavailable(
+                "world projection is not deliverable: "
+                f"rebuild_state={contract['rebuild_state']}"
+            )
 
     def as_of_position(self) -> int:
         """Return the durable ledger frontier represented by this projection."""
@@ -528,10 +636,7 @@ class WorldProjectionStore:
     ) -> list[WorldProjectionChange]:
         """Return relevant changes within one stable cursor window."""
 
-        sql = (
-            "SELECT * FROM world_projection_changes "
-            "WHERE ingest_position > ?"
-        )
+        sql = "SELECT * FROM world_projection_changes WHERE ingest_position > ?"
         params: list[Any] = [max(0, int(ingest_position))]
         if through_position is not None:
             sql += " AND ingest_position <= ?"
@@ -559,6 +664,7 @@ class WorldProjectionStore:
         instance_id: str,
         *,
         expected_position: int,
+        expected_revision: int,
         through_position: int,
     ) -> tuple[int, int]:
         """CAS-advance one instance cursor after successful context delivery."""
@@ -566,8 +672,13 @@ class WorldProjectionStore:
         identity = str(instance_id or "").strip()
         if not identity:
             raise ValueError("perception cursor instance_id must not be empty")
-        expected = max(0, int(expected_position))
-        through = max(expected, int(through_position))
+        expected = int(expected_position)
+        expected_cursor_revision = int(expected_revision)
+        through = int(through_position)
+        if expected < 0 or expected_cursor_revision < 0 or through < 0:
+            raise ValueError("perception cursor values must not be negative")
+        if through < expected:
+            raise ValueError("perception cursor cannot move backwards")
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             try:
@@ -583,22 +694,41 @@ class WorldProjectionStore:
                 ).fetchone()
                 current = int(row["ingest_position"]) if row is not None else 0
                 revision = int(row["revision"]) if row is not None else 0
-                if current != expected:
+                if current != expected or revision != expected_cursor_revision:
                     raise PerceptionCursorConflict(
                         f"stale perception cursor for '{identity}': "
-                        f"expected {expected}, actual {current}"
+                        f"expected ({expected}, {expected_cursor_revision}), "
+                        f"actual ({current}, {revision})"
                     )
+                if through == current:
+                    db.commit()
+                    return current, revision
                 revision += 1
-                db.execute(
-                    """INSERT INTO world_perception_cursors (
-                        instance_id, ingest_position, revision, updated_at
-                    ) VALUES (?, ?, ?, ?)
-                    ON CONFLICT(instance_id) DO UPDATE SET
-                        ingest_position = excluded.ingest_position,
-                        revision = excluded.revision,
-                        updated_at = excluded.updated_at""",
-                    (identity, through, revision, self._now_iso()),
-                )
+                if row is None:
+                    db.execute(
+                        """INSERT INTO world_perception_cursors (
+                            instance_id, ingest_position, revision, updated_at
+                        ) VALUES (?, ?, ?, ?)""",
+                        (identity, through, revision, self._now_iso()),
+                    )
+                else:
+                    updated = db.execute(
+                        """UPDATE world_perception_cursors
+                        SET ingest_position = ?, revision = ?, updated_at = ?
+                        WHERE instance_id = ? AND ingest_position = ? AND revision = ?""",
+                        (
+                            through,
+                            revision,
+                            self._now_iso(),
+                            identity,
+                            expected,
+                            expected_cursor_revision,
+                        ),
+                    )
+                    if updated.rowcount != 1:
+                        raise PerceptionCursorConflict(
+                            f"concurrent perception cursor update for '{identity}'"
+                        )
                 db.commit()
             except BaseException:
                 db.rollback()
@@ -641,11 +771,17 @@ class WorldProjectionStore:
                 FROM world_perception_cursors ORDER BY instance_id"""
             ).fetchall()
             frontier = int(self._get_meta(db, "as_of_ingest_position") or 0)
+            projector_policy = self._get_meta(db, "projector_policy") or ""
+            projector_schema = int(self._get_meta(db, "projector_schema_version") or 0)
+            rebuild_state = self._get_meta(db, "rebuild_state") or ""
         return {
             "database_path": str(self.path),
             "as_of_ingest_position": frontier,
             "assertion_count": int(assertions["total"] if assertions else 0),
             "change_count": int(changes["total"] if changes else 0),
+            "projector_policy": projector_policy,
+            "projector_schema_version": projector_schema,
+            "rebuild_state": rebuild_state,
             "cursors": [
                 {
                     "instance_id": str(row["instance_id"]),

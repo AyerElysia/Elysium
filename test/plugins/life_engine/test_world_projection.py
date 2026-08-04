@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,9 +23,13 @@ from plugins.life_engine.service.event_bus import (
 from plugins.life_engine.service.perception_gateway import PerceptionGateway
 from plugins.life_engine.service.tool_manifests import get_tool_manifest
 from plugins.life_engine.service.world_projection import (
-    PerceptionCursorConflict,
     WORLD_OBSERVATION_EVENT,
+    WORLD_PROJECTOR_POLICY,
+    WORLD_PROJECTOR_SCHEMA_VERSION,
+    PerceptionCursorConflict,
+    WorldProjectionConflict,
     WorldProjectionStore,
+    WorldProjectionUnavailable,
 )
 from plugins.life_engine.service.world_state import (
     RelationshipState,
@@ -94,9 +98,7 @@ def test_projection_retains_contradictions_provenance_and_explicit_retraction(
     ledger.append_sync(
         _observation("a", source_instance_id="chat_global", value="calm")
     )
-    ledger.append_sync(
-        _observation("b", source_instance_id="voice_1", value="worried")
-    )
+    ledger.append_sync(_observation("b", source_instance_id="voice_1", value="worried"))
     ledger.append_sync(
         _observation(
             "c",
@@ -140,6 +142,125 @@ def test_projection_rebuild_is_equivalent_and_idempotent(tmp_path: Path) -> None
 
     assert rebuilt.canonical_snapshot() == expected
     assert len(rebuilt.list_assertions()) == 1
+
+
+def test_projection_rebuild_preserves_delivery_cursor_and_contract(
+    tmp_path: Path,
+) -> None:
+    """A derived rebuild must not erase independently committed perception."""
+
+    ledger = RawEventStore(tmp_path)
+    ledger.append_sync(
+        _observation("cursor-stable", source_instance_id="chat_global", value="seen")
+    )
+    projection = WorldProjectionStore(tmp_path / "projection.sqlite3")
+    frontier = projection.catch_up(ledger)
+    committed = projection.commit_perception_cursor(
+        "voice_1",
+        expected_position=0,
+        expected_revision=0,
+        through_position=frontier,
+    )
+
+    assert projection.rebuild(ledger) == frontier
+    assert projection.perception_cursor("voice_1") == committed
+    assert projection.projector_contract() == {
+        "policy": WORLD_PROJECTOR_POLICY,
+        "schema_version": WORLD_PROJECTOR_SCHEMA_VERSION,
+        "rebuild_state": "idle",
+    }
+
+
+def test_projection_rejects_same_position_with_different_evidence(
+    tmp_path: Path,
+) -> None:
+    """Idempotency accepts exact replay but never masks ledger corruption."""
+
+    ledger = RawEventStore(tmp_path)
+    stored = ledger.append_sync(
+        _observation("position-a", source_instance_id="chat_global", value="first")
+    )
+    projection = WorldProjectionStore(tmp_path / "projection.sqlite3")
+
+    assert projection.apply_events([stored]) == stored.sequence
+    assert projection.apply_events([stored]) == stored.sequence
+    conflicting = replace(
+        stored,
+        source_instance_id="voice_position_conflict",
+    )
+    with pytest.raises(WorldProjectionConflict, match="ingest position"):
+        projection.apply_events([conflicting])
+
+
+def test_perception_cursor_uses_position_revision_cas_and_stable_noop(
+    tmp_path: Path,
+) -> None:
+    """No-op delivery stays idempotent while stale revisions fail closed."""
+
+    ledger = RawEventStore(tmp_path)
+    ledger.append_sync(
+        _observation("cursor-cas", source_instance_id="chat_global", value="new")
+    )
+    projection = WorldProjectionStore(tmp_path / "projection.sqlite3")
+    frontier = projection.catch_up(ledger)
+    position, revision = projection.commit_perception_cursor(
+        "voice_1",
+        expected_position=0,
+        expected_revision=0,
+        through_position=frontier,
+    )
+
+    assert projection.commit_perception_cursor(
+        "voice_1",
+        expected_position=position,
+        expected_revision=revision,
+        through_position=position,
+    ) == (position, revision)
+    with pytest.raises(PerceptionCursorConflict):
+        projection.commit_perception_cursor(
+            "voice_1",
+            expected_position=position,
+            expected_revision=revision - 1,
+            through_position=position,
+        )
+    with pytest.raises(ValueError, match="move backwards"):
+        projection.commit_perception_cursor(
+            "voice_1",
+            expected_position=position,
+            expected_revision=revision,
+            through_position=position - 1,
+        )
+
+
+def test_failed_rebuild_is_persisted_and_blocks_delivery(tmp_path: Path) -> None:
+    """An interrupted replay remains diagnosable and never serves partial truth."""
+
+    ledger = RawEventStore(tmp_path)
+    ledger.append_sync(
+        _observation("rebuild-failure", source_instance_id="chat_global", value="old")
+    )
+    projection = WorldProjectionStore(tmp_path / "projection.sqlite3")
+    frontier = projection.catch_up(ledger)
+    cursor = projection.commit_perception_cursor(
+        "voice_1",
+        expected_position=0,
+        expected_revision=0,
+        through_position=frontier,
+    )
+
+    class _FailingLedger:
+        @staticmethod
+        def read_since_sync(_position: int, *, limit: int) -> list[LifeEvent]:
+            del limit
+            raise RuntimeError("contract replay failure")
+
+    with pytest.raises(RuntimeError, match="contract replay failure"):
+        projection.rebuild(_FailingLedger())  # type: ignore[arg-type]
+
+    assert projection.projector_contract()["rebuild_state"] == "failed"
+    assert projection.perception_cursor("voice_1") == cursor
+    with pytest.raises(WorldProjectionUnavailable):
+        projection.ensure_deliverable()
 
 
 def test_gateway_cursor_is_commit_after_delivery_and_survives_restart(
