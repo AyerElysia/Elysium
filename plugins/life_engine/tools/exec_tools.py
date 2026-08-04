@@ -43,6 +43,18 @@ _SENSITIVE_ENV_TOKENS = (
     "SSH_",
 )
 
+
+def _selected_subject_storage_enabled() -> bool:
+    """Fail closed when generic shell could bypass SubjectDocument authority."""
+
+    from ..service import LifeEngineService
+
+    service = LifeEngineService.get_instance()
+    return bool(
+        service is not None
+        and getattr(service, "selected_subject_storage_enabled", False)
+    )
+
 def _resolve_cwd(plugin: Any, cwd: str) -> tuple[bool, Path | str]:
     """把 cwd 解析到 workspace 内的实际目录。"""
     workspace = _get_workspace(plugin)
@@ -174,6 +186,15 @@ class LifeEngineBashTool(BaseTool):
         audit_error = _audit_command(command_text)
         if audit_error:
             return False, {"error": audit_error, "command": command_text}
+
+        if _selected_subject_storage_enabled():
+            return False, {
+                "error": (
+                    "SelectedSubjectStorageShellDisabled: 通用 shell 在可选主体存储启用时"
+                    "无法证明写前入账，因此已关闭。读取或修改文件请使用专用 file 工具。"
+                ),
+                "command": command_text,
+            }
 
         try:
             timeout_seconds = max(1, min(_MAX_TIMEOUT_SECONDS, int(timeout_seconds)))

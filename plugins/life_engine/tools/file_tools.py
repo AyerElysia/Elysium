@@ -335,6 +335,35 @@ def _tool_trace_context(tool: Any) -> dict[str, str]:
     }
 
 
+async def _write_selected_subject_document(
+    tool: Any,
+    *,
+    path: str,
+    content: str,
+    encoding: str,
+    reason: str,
+    trace_context: dict[str, str],
+) -> dict[str, Any] | None:
+    """Route declared subject files through the selected immutable ledger."""
+
+    service = _get_life_engine_service(tool.plugin)
+    writer = getattr(service, "write_selected_subject_document", None)
+    if not callable(writer):
+        return None
+    source_event_id = str(trace_context.get("source_event_id") or "")
+    return await writer(
+        workspace_relative_path=path,
+        content_bytes=content.encode(encoding),
+        occurrence_id=f"subject:file-tool:{uuid4().hex}",
+        recorded_by="life-engine-file-tool",
+        recorded_source=f"tool:{tool.tool_name}",
+        encoding=encoding,
+        semantic_actor_id="elysia",
+        semantic_source_id=source_event_id or None,
+        reason=reason,
+    )
+
+
 async def _resolve_tell_dfc_target(
     plugin: Any,
     stream_manager: Any,
@@ -853,9 +882,18 @@ class LifeEngineWriteFileTool(BaseTool):
 
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            await asyncio.to_thread(target.write_text, content, encoding=encoding)
-            stat = target.stat()
             trace_context = _tool_trace_context(self)
+            subject_commit = await _write_selected_subject_document(
+                self,
+                path=path,
+                content=content,
+                encoding=encoding,
+                reason=reason,
+                trace_context=trace_context,
+            )
+            if subject_commit is None:
+                await asyncio.to_thread(target.write_text, content, encoding=encoding)
+            stat = target.stat()
             trace_id = _record_file_trace(
                 self.plugin,
                 path=path,
@@ -890,6 +928,7 @@ class LifeEngineWriteFileTool(BaseTool):
                 "created": not existed,
                 "trace_id": trace_id,
                 "artifact_version_id": artifact_id,
+                "subject_document": subject_commit or {},
                 **(
                     {"warning": warning}
                     if (warning := build_memory_write_warning(path, content)) is not None
@@ -973,8 +1012,21 @@ class LifeEngineEditFileTool(BaseTool):
                 new_content = content.replace(old_text, new_text, 1)
                 replacements = 1
 
-            await asyncio.to_thread(target.write_text, new_content, encoding=encoding)
             trace_context = _tool_trace_context(self)
+            subject_commit = await _write_selected_subject_document(
+                self,
+                path=path,
+                content=new_content,
+                encoding=encoding,
+                reason=reason,
+                trace_context=trace_context,
+            )
+            if subject_commit is None:
+                await asyncio.to_thread(
+                    target.write_text,
+                    new_content,
+                    encoding=encoding,
+                )
             trace_id = _record_file_trace(
                 self.plugin,
                 path=path,
@@ -1008,6 +1060,7 @@ class LifeEngineEditFileTool(BaseTool):
                 "replacements": replacements,
                 "trace_id": trace_id,
                 "artifact_version_id": artifact_id,
+                "subject_document": subject_commit or {},
             }
         except UnicodeDecodeError as e:
             return False, f"文件编码错误: {e}"

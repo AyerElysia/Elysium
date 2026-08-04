@@ -470,7 +470,28 @@ class MemoryWitnessCoordinator:
         body = self._render_projection(witness)
         absolute = self._service._workspace_dir() / path
         try:
-            await asyncio.to_thread(_atomic_write_text, absolute, body)
+            if bool(
+                getattr(
+                    self._service,
+                    "selected_subject_storage_enabled",
+                    False,
+                )
+            ):
+                subject_commit = await self._service.write_selected_subject_document(
+                    workspace_relative_path=path,
+                    content_bytes=body.encode("utf-8"),
+                    occurrence_id=witness.witness_id,
+                    recorded_by=witness.consciousness_instance_id,
+                    recorded_source="memory-witness",
+                    encoding="utf-8",
+                    semantic_actor_id=witness.consciousness_instance_id,
+                    semantic_source_id=witness.witness_id,
+                    reason="project immutable first-person witness",
+                )
+                if subject_commit is None:
+                    raise RuntimeError("SelectedWitnessSubjectWriteNotHandled")
+            else:
+                await asyncio.to_thread(_atomic_write_text, absolute, body)
             source_mtime = await asyncio.to_thread(lambda: absolute.stat().st_mtime)
             await memory.upsert_document(
                 path,

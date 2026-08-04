@@ -116,6 +116,17 @@ class _FakeRuntime:
         self.close_calls += 1
 
 
+class _FakeSubjectStore:
+    async def health_snapshot(self) -> dict[str, Any]:
+        return {
+            "status": "healthy",
+            "backend": "fake",
+            "documents": 0,
+            "versions": 0,
+            "projection_outbox": {},
+        }
+
+
 def _selected_service(tmp_path: Path, backend: BackendKind) -> LifeEngineService:
     config = LifeEngineConfig()
     config.settings.enabled = True
@@ -155,6 +166,7 @@ def _install_selected_factories(
 ) -> tuple[list[_FakeRuntime], list[tuple[str, bool]]]:
     runtimes: list[_FakeRuntime] = []
     factory_calls: list[tuple[str, bool]] = []
+    subject_store = _FakeSubjectStore()
 
     async def _open_runtime(_settings: Any) -> _FakeRuntime:
         runtime = _FakeRuntime(backend)
@@ -179,6 +191,17 @@ def _install_selected_factories(
         factory_calls.append(("presence-world", initialize_schema))
         return stores
 
+    async def _open_subject(
+        runtime: _FakeRuntime,
+        *,
+        initialize_schema: bool = False,
+        require_database_immutability: bool = True,
+    ) -> _FakeSubjectStore:
+        assert runtime.backend == backend
+        assert require_database_immutability is True
+        factory_calls.append(("subject", initialize_schema))
+        return subject_store
+
     monkeypatch.setattr(
         "plugins.life_engine.storage.factory.open_storage_backend",
         _open_runtime,
@@ -190,6 +213,10 @@ def _install_selected_factories(
     monkeypatch.setattr(
         "plugins.life_engine.storage.domain_factory.open_presence_world_stores",
         _open_domains,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.storage.subject_factory.open_subject_document_store",
+        _open_subject,
     )
     return runtimes, factory_calls
 
@@ -234,7 +261,11 @@ async def test_selected_service_uses_one_backend_for_presence_world_and_events(
         _ = first.storage_runtime
     await first._start_selected_storage()
 
-    assert factory_calls == [("events", False), ("presence-world", False)]
+    assert factory_calls == [
+        ("events", False),
+        ("presence-world", False),
+        ("subject", False),
+    ]
     assert first.storage_runtime is runtimes[0]
     assert first.consciousness_registry.get(CHAT_GLOBAL_INSTANCE_ID) is not None
     assert first.consciousness_registry.database_path is None
@@ -285,6 +316,7 @@ async def test_selected_service_uses_one_backend_for_presence_world_and_events(
     assert health["status"] == "healthy"
     assert health["backend"] == backend.value
     assert first.health()["world_projection"]["rebuild_state"] == "idle"
+    assert first.health()["subject_document"]["documents"] == 0
 
     await first._close_selected_storage()
     assert runtimes[0].close_calls == 1

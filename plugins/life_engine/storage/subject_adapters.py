@@ -702,17 +702,46 @@ class SQLSubjectDocumentStore:
         version_id, content_hash, state, attempt_count,
         lease_owner, lease_until, revision"""
 
+    async def get_projection_task(
+        self,
+        logical_path: str,
+        version_id: str,
+    ) -> SubjectProjectionTask | None:
+        path = normalize_subject_path(logical_path)
+        identity = str(version_id).strip()
+        if not identity:
+            raise ValueError("projection version_id must not be empty")
+        async with self.runtime.unit_of_work() as uow:
+            row = (
+                (
+                    await uow.session.execute(
+                        text(
+                            f"SELECT {self._projection_columns()} "
+                            "FROM subject_projection_outbox "
+                            "WHERE logical_path = :logical_path "
+                            "AND version_id = :version_id"
+                        ),
+                        {"logical_path": path, "version_id": identity},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        return self._decode_projection(row) if row is not None else None
+
     async def claim_projection(
         self,
         *,
         worker_id: str,
         lease_seconds: int,
+        logical_path: str | None = None,
     ) -> SubjectProjectionTask | None:
         worker = str(worker_id).strip()
         if not worker or len(worker) > 255:
             raise ValueError("projection worker_id must be 1..255 characters")
         if int(lease_seconds) <= 0:
             raise ValueError("projection lease_seconds must be positive")
+        path = normalize_subject_path(logical_path) if logical_path else ""
 
         async def operation(session: AsyncSession) -> SubjectProjectionTask | None:
             database_now = await self._database_now(session)
@@ -721,6 +750,7 @@ class SQLSubjectDocumentStore:
                 if self.backend == BackendKind.MYSQL
                 else "(lease_until IS NULL OR lease_until = '')"
             )
+            path_filter = " AND logical_path = :logical_path" if path else ""
             row = (
                 (
                     await session.execute(
@@ -730,9 +760,13 @@ class SQLSubjectDocumentStore:
                             WHERE state = 'pending'
                               AND ({lease_available}
                                    OR lease_until <= :database_now)
+                              {path_filter}
                             ORDER BY outbox_id LIMIT 1{self._for_update}"""
                         ),
-                        {"database_now": self._bind_time(database_now)},
+                        {
+                            "database_now": self._bind_time(database_now),
+                            **({"logical_path": path} if path else {}),
+                        },
                     )
                 )
                 .mappings()

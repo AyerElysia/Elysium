@@ -282,6 +282,9 @@ class LifeEngineService(BaseService):
         self._storage_runtime: Any | None = None
         self._presence_world_stores: Any | None = None
         self._life_event_store: Any | None = None
+        self._subject_document_store: Any | None = None
+        self._subject_workspace_observer: Any | None = None
+        self._subject_workspace_projector: Any | None = None
         self._storage_health_cache: dict[str, Any] = {
             "status": (
                 "initializing" if self._selectable_storage_enabled else "disabled"
@@ -345,6 +348,12 @@ class LifeEngineService(BaseService):
     def memory_service(self) -> LifeMemoryService | None:
         """兼容旧调用方的公开记忆服务访问入口。"""
         return self._memory_service
+
+    @property
+    def selected_subject_storage_enabled(self) -> bool:
+        """Return whether subject files require the selected durable writer."""
+
+        return self._selectable_storage_enabled
 
     @property
     def world_state(self) -> WorldState:
@@ -575,7 +584,7 @@ class LifeEngineService(BaseService):
             )
 
     async def _start_selected_storage(self) -> None:
-        """Attach Event, Presence, and World to the service-owned runtime."""
+        """Attach all selected life domains to the service-owned runtime."""
 
         if (
             not self._selectable_storage_enabled
@@ -584,6 +593,11 @@ class LifeEngineService(BaseService):
             return
         from ..storage.domain_factory import open_presence_world_stores
         from ..storage.event_factory import open_life_event_store
+        from ..storage.subject_factory import open_subject_document_store
+        from ..storage.subject_workspace import (
+            SubjectWorkspaceObserver,
+            SubjectWorkspaceProjector,
+        )
 
         await self._open_selected_storage_runtime()
         runtime = self.storage_runtime
@@ -594,6 +608,24 @@ class LifeEngineService(BaseService):
         stores = await open_presence_world_stores(
             runtime,
             initialize_schema=False,
+        )
+        subject_store = await open_subject_document_store(
+            runtime,
+            initialize_schema=False,
+        )
+        workspace = Path(self._cfg().settings.workspace_path).resolve()
+        subject_projector = SubjectWorkspaceProjector(
+            subject_store,
+            data_root=workspace.parent,
+            worker_id=(
+                f"{self._storage_factory_settings.authority_owner_id}:"
+                "subject-workspace"
+            ),
+        )
+        subject_observer = SubjectWorkspaceObserver(
+            subject_store,
+            data_root=workspace.parent,
+            recorded_source="workspace-observer:life-engine",
         )
         registry = await AsyncConsciousnessRegistry.load(stores.presence)
         event_bus = LifeEventBus(ledger)
@@ -606,6 +638,9 @@ class LifeEngineService(BaseService):
         await gateway.catch_up()
         self._life_event_store = ledger
         self._presence_world_stores = stores
+        self._subject_document_store = subject_store
+        self._subject_workspace_observer = subject_observer
+        self._subject_workspace_projector = subject_projector
         self._consciousness_registry = registry
         self._event_bus = event_bus
         self._world_projection = stores.world
@@ -635,6 +670,9 @@ class LifeEngineService(BaseService):
                 except Exception as exc:  # noqa: BLE001 - aggregate owned cleanup
                     errors.append(exc)
         runtime = self._storage_runtime
+        self._subject_workspace_observer = None
+        self._subject_workspace_projector = None
+        self._subject_document_store = None
         if runtime is not None:
             try:
                 await runtime.close()
@@ -661,6 +699,195 @@ class LifeEngineService(BaseService):
                 "selected Presence/World storage shutdown failed",
                 errors,
             )
+
+    async def _project_subject_version(
+        self,
+        *,
+        logical_path: str,
+        version_id: str,
+        max_tasks: int,
+    ) -> dict[str, Any]:
+        """Drain one subject path until the requested durable head is visible."""
+
+        projector = self._subject_workspace_projector
+        if projector is None:
+            raise RuntimeError("SelectedSubjectProjectorNotStarted")
+        for _ in range(max(1, int(max_tasks))):
+            result = await projector.project_one(logical_path=logical_path)
+            if result.status == "idle":
+                raise RuntimeError(
+                    f"SubjectProjectionMissing: {logical_path}:{version_id}"
+                )
+            if result.status == "failed" and result.version_id == version_id:
+                raise RuntimeError(
+                    f"SubjectProjectionFailed: {logical_path}: {result.detail}"
+                )
+            if result.version_id == version_id and result.status in {
+                "projected",
+                "confirmed_existing",
+            }:
+                return {
+                    "status": result.status,
+                    "logical_path": result.logical_path,
+                    "version_id": result.version_id,
+                }
+        raise RuntimeError(f"SubjectProjectionBacklogExceeded: {logical_path}")
+
+    async def write_selected_subject_document(
+        self,
+        *,
+        workspace_relative_path: str,
+        content_bytes: bytes,
+        occurrence_id: str,
+        recorded_by: str,
+        recorded_source: str,
+        encoding: str | None,
+        semantic_actor_id: str | None = None,
+        semantic_source_id: str | None = None,
+        reason: str = "",
+    ) -> dict[str, Any] | None:
+        """Commit a declared subject file before changing its workspace projection.
+
+        Disabled storage returns ``None`` so the legacy file path remains a
+        first-class local backend.  Enabled storage fails closed: the file is
+        never written ahead of its immutable SubjectDocument version.
+        """
+
+        if not self._selectable_storage_enabled:
+            return None
+        from ..storage.subject_contracts import AppendSubjectDocumentVersion
+        from ..storage.subject_workspace import subject_path_from_workspace_relative
+
+        logical_path = subject_path_from_workspace_relative(workspace_relative_path)
+        if logical_path is None:
+            return None
+        workspace = Path(self._cfg().settings.workspace_path).resolve()
+        if workspace.name != "life_engine_workspace":
+            raise RuntimeError(
+                "SelectedSubjectWorkspaceMismatch: selected Subject storage "
+                "requires a life_engine_workspace root"
+            )
+        store = self._subject_document_store
+        observer = self._subject_workspace_observer
+        if store is None or observer is None:
+            raise RuntimeError("SelectedSubjectStorageNotStarted")
+
+        projection: dict[str, Any] | None = None
+        head = await store.get_head(logical_path)
+        if head is not None:
+            task = await store.get_projection_task(
+                logical_path,
+                head.current_version_id,
+            )
+            if task is None:
+                raise RuntimeError(
+                    f"SubjectProjectionStateMissing: {logical_path}:"
+                    f"{head.current_version_id}"
+                )
+            if task.state == "failed":
+                raise RuntimeError(
+                    f"SubjectProjectionRequiresRepair: {logical_path}:"
+                    f"{head.current_version_id}"
+                )
+            if task.state == "pending":
+                try:
+                    projection = await self._project_subject_version(
+                        logical_path=logical_path,
+                        version_id=head.current_version_id,
+                        max_tasks=head.revision + 1,
+                    )
+                except RuntimeError as exc:
+                    detail = str(exc)
+                    external_divergence = any(
+                        marker in detail
+                        for marker in (
+                            "workspace bytes diverged from the authoritative parent",
+                            "new authoritative document would overwrite bytes",
+                        )
+                    )
+                    if not external_divergence:
+                        raise
+            elif task.state != "confirmed":
+                raise RuntimeError(
+                    f"SubjectProjectionStateInvalid: {logical_path}:{task.state}"
+                )
+
+        if projection is None:
+            observed = await observer.observe_file(logical_path)
+            if observed.status == "changed_during_read":
+                raise RuntimeError(
+                    f"SubjectWorkspaceChangedDuringRead: {logical_path}"
+                )
+            if observed.commit is not None:
+                projection = await self._project_subject_version(
+                    logical_path=logical_path,
+                    version_id=observed.commit.version.version_id,
+                    max_tasks=observed.commit.head.revision + 1,
+                )
+            elif head is not None and observed.status == "missing":
+                raise RuntimeError(f"SubjectWorkspaceMissing: {logical_path}")
+
+        head = await store.get_head(logical_path)
+        if head is not None:
+            current = await store.get_version(head.current_version_id)
+            if current.content_bytes == bytes(content_bytes):
+                if projection is None:
+                    projection = {
+                        "status": "confirmed_existing",
+                        "logical_path": logical_path,
+                        "version_id": current.version_id,
+                    }
+                return {
+                    "status": "unchanged",
+                    "logical_path": logical_path,
+                    "version_id": current.version_id,
+                    "revision": head.revision,
+                    "projection": projection,
+                }
+            expected_revision = head.revision
+            expected_head = head.current_version_id
+            declared_owner = head.declared_owner
+        else:
+            expected_revision = 0
+            expected_head = ""
+            declared_owner = "elysia"
+        commit = await store.append_version(
+            AppendSubjectDocumentVersion(
+                logical_path=logical_path,
+                expected_revision=expected_revision,
+                expected_head_version_id=expected_head,
+                content_bytes=bytes(content_bytes),
+                occurrence_id=str(occurrence_id),
+                recorded_by=str(recorded_by),
+                recorded_source=str(recorded_source),
+                declared_owner=declared_owner,
+                semantic_actor_id=semantic_actor_id,
+                semantic_source_id=semantic_source_id,
+                provenance_status=(
+                    "complete" if semantic_source_id else "semantic_source_missing"
+                ),
+                byte_fidelity="exact_bytes",
+                encoding=encoding,
+                newline_style=None,
+                change_context={
+                    "operation": "workspace_file_write",
+                    "reason": str(reason),
+                },
+            )
+        )
+        projection = await self._project_subject_version(
+            logical_path=logical_path,
+            version_id=commit.version.version_id,
+            max_tasks=commit.head.revision + 1,
+        )
+        self.notify_subject_context_source_changed(workspace_relative_path)
+        return {
+            "status": "committed",
+            "logical_path": logical_path,
+            "version_id": commit.version.version_id,
+            "revision": commit.head.revision,
+            "projection": projection,
+        }
 
     def _require_presence_world_stores(self) -> Any:
         if self._presence_world_stores is None:
@@ -1559,14 +1786,16 @@ class LifeEngineService(BaseService):
             self._storage_runtime is None
             or self._life_event_store is None
             or self._presence_world_stores is None
+            or self._subject_document_store is None
         ):
             return dict(self._storage_health_cache)
-        runtime_result, event_result, presence_result, world_result = (
+        runtime_result, event_result, presence_result, world_result, subject_result = (
             await asyncio.gather(
                 self._storage_runtime.health(),
                 self._life_event_store.health_snapshot(),
                 self._presence_world_stores.presence.health_snapshot(),
                 self._presence_world_stores.world.health_snapshot(),
+                self._subject_document_store.health_snapshot(),
                 return_exceptions=True,
             )
         )
@@ -1585,6 +1814,7 @@ class LifeEngineService(BaseService):
             "life_event": normalized("life_event_store", event_result),
             "presence": normalized("consciousness_presence", presence_result),
             "world": normalized("world_projection", world_result),
+            "subject_document": normalized("subject_document", subject_result),
         }
         statuses = {
             str(item.get("status") or "healthy") for item in components.values()
@@ -1616,6 +1846,9 @@ class LifeEngineService(BaseService):
             )
             snapshot["world_projection"] = dict(
                 components.get("world") or {}
+            )
+            snapshot["subject_document"] = dict(
+                components.get("subject_document") or {}
             )
         else:
             if self._event_bus is not None:

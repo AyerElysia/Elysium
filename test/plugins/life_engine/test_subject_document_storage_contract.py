@@ -6,11 +6,14 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
+from plugins.life_engine.core.config import LifeEngineConfig
+from plugins.life_engine.service import LifeEngineService
 from plugins.life_engine.storage.authority import (
     FileAuthorityRegistry,
     StaleAuthorityToken,
@@ -272,6 +275,9 @@ async def test_subject_projection_claim_confirmation_and_failure_are_cas(
             "confirmed": 1,
             "failed": 1,
         }
+        loaded = await store.get_projection_task("SOUL.md", failed.version_id)
+        assert loaded is not None
+        assert loaded.state == "failed"
 
 
 async def test_subject_workspace_projection_and_observation_never_overwrite_divergence(
@@ -336,6 +342,121 @@ async def test_subject_workspace_projection_and_observation_never_overwrite_dive
         assert (await observer.observe_file(logical_path)).status == "unchanged"
         assert workspace_file.read_bytes() == b"external exact bytes\r\n"
         assert len(await store.list_history(logical_path)) == 4
+        assert (await store.health_snapshot())["projection_outbox"] == {
+            "confirmed": 3,
+            "failed": 1,
+        }
+
+
+async def test_targeted_projection_and_service_write_commit_before_workspace(
+    tmp_path: Path,
+) -> None:
+    async with _local_store(tmp_path) as (_, store, _):
+        data_root = tmp_path / "data"
+        workspace = data_root / "life_engine_workspace"
+        workspace.mkdir(parents=True)
+        await store.append_version(
+            _command(
+                path="life_engine_workspace/USER.md",
+                occurrence="subject:user-v1",
+                content=b"user",
+            )
+        )
+        await store.append_version(
+            _command(
+                path="life_engine_workspace/SOUL.md",
+                occurrence="subject:soul-v1",
+                content=b"soul",
+            )
+        )
+        targeted = await store.claim_projection(
+            worker_id="targeted-projector",
+            lease_seconds=30,
+            logical_path="life_engine_workspace/USER.md",
+        )
+        assert targeted is not None
+        assert targeted.logical_path == "life_engine_workspace/USER.md"
+        await store.confirm_projection(targeted, worker_id="targeted-projector")
+
+        service = object.__new__(LifeEngineService)
+        config = LifeEngineConfig()
+        config.settings.workspace_path = str(workspace)
+        service.plugin = SimpleNamespace(config=config)
+        service._legacy_config_warning_emitted = False
+        service._selectable_storage_enabled = True
+        service._subject_document_store = store
+        service._subject_workspace_observer = SubjectWorkspaceObserver(
+            store,
+            data_root=data_root,
+            recorded_source="workspace:test",
+        )
+        service._subject_workspace_projector = SubjectWorkspaceProjector(
+            store,
+            data_root=data_root,
+            worker_id="service-projector",
+        )
+        service._router_context_projection = None
+        service._subject_context_projections = {}
+
+        result = await service.write_selected_subject_document(
+            workspace_relative_path="MEMORY.md",
+            content_bytes=b"# exact memory\r\n",
+            occurrence_id="subject:service-memory-v1",
+            recorded_by="life-engine-file-tool",
+            recorded_source="tool:nucleus_write_file",
+            encoding="utf-8",
+            semantic_actor_id="elysia",
+            semantic_source_id="event:one",
+            reason="remember this",
+        )
+
+        assert result is not None
+        assert result["status"] == "committed"
+        assert (workspace / "MEMORY.md").read_bytes() == b"# exact memory\r\n"
+        head = await store.get_head("life_engine_workspace/MEMORY.md")
+        assert head is not None and head.revision == 1
+        version = await store.get_version(head.current_version_id)
+        assert version.content_bytes == b"# exact memory\r\n"
+        assert version.semantic_actor_id == "elysia"
+        assert version.semantic_source_id == "event:one"
+
+        repeated = await service.write_selected_subject_document(
+            workspace_relative_path="MEMORY.md",
+            content_bytes=b"# exact memory\r\n",
+            occurrence_id="subject:service-memory-retry",
+            recorded_by="life-engine-file-tool",
+            recorded_source="tool:nucleus_write_file",
+            encoding="utf-8",
+        )
+        assert repeated is not None and repeated["status"] == "unchanged"
+        repeated_head = await store.get_head("life_engine_workspace/MEMORY.md")
+        assert repeated_head is not None and repeated_head.revision == 1
+
+        (workspace / "SOUL.md").write_bytes(b"external soul\n")
+        reconciled = await service.write_selected_subject_document(
+            workspace_relative_path="SOUL.md",
+            content_bytes=b"authoritative soul\n",
+            occurrence_id="subject:service-soul-v2",
+            recorded_by="life-engine-file-tool",
+            recorded_source="tool:nucleus_write_file",
+            encoding="utf-8",
+            semantic_actor_id="elysia",
+            reason="reconcile an external exact-byte change",
+        )
+        assert reconciled is not None and reconciled["status"] == "committed"
+        assert (workspace / "SOUL.md").read_bytes() == b"authoritative soul\n"
+        soul_head = await store.get_head("life_engine_workspace/SOUL.md")
+        assert soul_head is not None and soul_head.revision == 3
+        soul_history = await store.list_history("life_engine_workspace/SOUL.md")
+        assert [version.content_bytes for version in soul_history] == [
+            b"soul",
+            b"external soul\n",
+            b"authoritative soul\n",
+        ]
+        assert (await store.health_snapshot())["projection_outbox"] == {
+            "confirmed": 4,
+            "failed": 1,
+        }
 
 
 @pytest.mark.parametrize(

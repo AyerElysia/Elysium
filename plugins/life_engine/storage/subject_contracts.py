@@ -144,8 +144,16 @@ class SubjectDocumentStorePort(Protocol):
         *,
         worker_id: str,
         lease_seconds: int,
+        logical_path: str | None = None,
     ) -> SubjectProjectionTask | None:
-        """Lease one pending projection using backend database time."""
+        """Lease one pending projection, optionally for one declared path."""
+
+    async def get_projection_task(
+        self,
+        logical_path: str,
+        version_id: str,
+    ) -> SubjectProjectionTask | None:
+        """Return the durable projection state for one exact version."""
 
     async def confirm_projection(
         self,

@@ -7,7 +7,7 @@ import os
 import stat
 import tempfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .subject_adapters import normalize_subject_path
 from .subject_contracts import (
@@ -22,6 +22,23 @@ _DECLARED_ROOTS = {
     "life_engine_workspace/USER.md",
 }
 _DECLARED_PREFIXES = ("diaries/", "life_engine_workspace/diaries/")
+
+
+def subject_path_from_workspace_relative(value: str) -> str | None:
+    """Map a Life workspace path to the declared subject-document namespace."""
+
+    raw = str(value).strip()
+    if not raw or "\\" in raw:
+        return None
+    path = PurePosixPath(raw)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        return None
+    normalized = path.as_posix()
+    if normalized in {"SOUL.md", "USER.md", "MEMORY.md"} or normalized.startswith(
+        "diaries/"
+    ):
+        return f"life_engine_workspace/{normalized}"
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,10 +149,15 @@ class SubjectWorkspaceProjector:
             if temporary.exists():
                 temporary.unlink()
 
-    async def project_one(self) -> SubjectProjectionResult:
+    async def project_one(
+        self,
+        *,
+        logical_path: str | None = None,
+    ) -> SubjectProjectionResult:
         task = await self.store.claim_projection(
             worker_id=self.worker_id,
             lease_seconds=self.lease_seconds,
+            logical_path=logical_path,
         )
         if task is None:
             return SubjectProjectionResult(status="idle")
@@ -305,4 +327,5 @@ __all__ = [
     "SubjectProjectionResult",
     "SubjectWorkspaceObserver",
     "SubjectWorkspaceProjector",
+    "subject_path_from_workspace_relative",
 ]

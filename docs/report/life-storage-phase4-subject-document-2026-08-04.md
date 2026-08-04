@@ -29,6 +29,9 @@ Delivered:
 - a workspace observer: changed external bytes are appended as a new exact
   observation with unknown semantic actor/source, never treated as an edit of
   immutable history.
+- selected runtime integration: file tools and Memory Witness commit before
+  parent-hash projection; targeted outbox state is checked explicitly so a
+  terminal projection failure cannot be mistaken for an external file edit.
 
 The selected logical namespace is explicit, not inferred from arbitrary
 workspace files:
@@ -117,11 +120,14 @@ have first been observed.
 
 ## Remaining integration work
 
-- Cross-reference current subject heads with historical
-  `memory_artifact_versions` during the Memory copy. Historical text-derived
-  rows remain Memory evidence and must not be relabelled `exact_bytes`.
-- Inject the subject store, observer and projector from the one runtime owned by
-  `LifeEngineService`; they must not open or close an independent engine.
+- Current subject heads were cross-referenced without relabelling historical
+  `memory_artifact_versions`; the latter remain text-derived Memory evidence.
+- The subject store, observer and projector now consume the one runtime owned by
+  `LifeEngineService`; they neither open nor close an independent engine.
+- Declared file-tool writes and Memory Witness projections use durable
+  write-ahead followed by parent-hash workspace projection. Generic shell is
+  fail-closed while selected Subject storage is enabled because arbitrary shell
+  cannot prove write-ahead.
 - Run the shared local/MySQL contract in a disposable MySQL database with
   trigger privileges.
 - Repeat from a user-approved frozen snapshot before generation verification or

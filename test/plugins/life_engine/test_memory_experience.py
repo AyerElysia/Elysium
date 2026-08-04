@@ -15,10 +15,11 @@ from plugins.life_engine.memory.experience import (
     ExperienceAppendReport,
     ExperienceRecord,
     MemorySearchMode,
+    WitnessMemory,
     create_life_memory_schema,
+    get_witness_state,
     insert_experiences,
     insert_witness_memory,
-    get_witness_state,
     migrate_legacy_witness,
     search_witness_memories,
     update_witness_state,
@@ -279,6 +280,114 @@ def test_projection_path_is_deterministic_and_stream_scoped() -> None:
     assert same == repeated
     assert same != other
     assert "000000000001-000000000002" in same
+
+
+def _witness_projection_record() -> WitnessMemory:
+    return WitnessMemory(
+        witness_id="witness-projection-1",
+        content="我记得这段经历。",
+        consciousness_instance_id=MEMORY_WITNESS_INSTANCE_ID,
+        perspective_subject_id="elysia",
+        epistemic_kind=EpistemicKind.SUBJECTIVE_WITNESS.value,
+        source_kind="experience_window",
+        status="active",
+        stream_scope="stream-1",
+        visibility="private",
+        valid_from="2026-07-29T08:00:00+08:00",
+        valid_to="2026-07-29T08:05:00+08:00",
+        recorded_at="2026-07-29T08:06:00+08:00",
+        source_sequence_start=1,
+        source_sequence_end=2,
+        source_event_ids=("event-1", "event-2"),
+        projection_path="diaries/witness/2026-07/witness-projection-1.md",
+    )
+
+
+class _WitnessProjectionMemoryStub:
+    def __init__(self) -> None:
+        self.upserts: list[tuple[str, str, float]] = []
+        self.projections: list[tuple[str, dict[str, object]]] = []
+
+    async def upsert_document(
+        self,
+        path: str,
+        body: str,
+        *,
+        title: str,
+        source_mtime: float,
+    ) -> None:
+        assert title.startswith("第一人称经历见证")
+        self.upserts.append((path, body, source_mtime))
+
+    async def mark_witness_projection(
+        self,
+        witness_id: str,
+        **kwargs: object,
+    ) -> None:
+        self.projections.append((witness_id, kwargs))
+
+
+async def test_witness_projection_uses_subject_write_ahead_when_selected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory = _WitnessProjectionMemoryStub()
+    calls: list[dict[str, object]] = []
+
+    async def _subject_writer(**kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        target = tmp_path / str(kwargs["workspace_relative_path"])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(bytes(kwargs["content_bytes"]))
+        return {"status": "committed"}
+
+    service = SimpleNamespace(
+        memory_service=memory,
+        selected_subject_storage_enabled=True,
+        write_selected_subject_document=_subject_writer,
+        _workspace_dir=lambda: tmp_path,
+    )
+    coordinator = MemoryWitnessCoordinator(service)
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness._atomic_write_text",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("legacy write used")),
+    )
+
+    witness = _witness_projection_record()
+    await coordinator._project_witness(witness)
+
+    assert len(calls) == 1
+    assert calls[0]["occurrence_id"] == witness.witness_id
+    assert calls[0]["semantic_actor_id"] == witness.consciousness_instance_id
+    assert calls[0]["recorded_source"] == "memory-witness"
+    assert memory.upserts[0][0] == witness.projection_path
+    assert memory.projections == [
+        (
+            witness.witness_id,
+            {
+                "projection_path": witness.projection_path,
+                "status": "complete",
+            },
+        )
+    ]
+
+
+async def test_witness_projection_keeps_local_atomic_write_when_disabled(
+    tmp_path: Path,
+) -> None:
+    memory = _WitnessProjectionMemoryStub()
+    service = SimpleNamespace(
+        memory_service=memory,
+        selected_subject_storage_enabled=False,
+        _workspace_dir=lambda: tmp_path,
+    )
+    coordinator = MemoryWitnessCoordinator(service)
+    witness = _witness_projection_record()
+
+    await coordinator._project_witness(witness)
+
+    assert (tmp_path / witness.projection_path).read_text(encoding="utf-8")
+    assert memory.projections[0][1]["status"] == "complete"
 
 
 class _WitnessMemoryStub:

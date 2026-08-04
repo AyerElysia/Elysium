@@ -1,6 +1,6 @@
 # 生命域存储快照与权威切换运行手册
 
-本手册服务于 Elysium 生命域可选本地/MySQL 存储。它不包含真实主机、用户名、密码或 fencing token。Life Event、Memory、Presence、World 的 Port/adapter 与 `LifeEngineService` 单 runtime 接线已实现，但 Subject Document 全链路、正式数据复制校验、恢复演练和人工切换尚未完成，因此本手册中的正式切换步骤是**验收门**，不是当前可以执行的上线指令。
+本手册服务于 Elysium 生命域可选本地/MySQL 存储。它不包含真实主机、用户名、密码或 fencing token。Life Event、Memory、Subject Document、Presence、World 的 Port/adapter、`LifeEngineService` 单 runtime 接线、未冻结候选复制和反向恢复均已实现；正式冻结复制、隔离 MySQL 破坏性合同、数据库级不可变保护和人工切换尚未完成，因此本手册中的正式切换步骤是**验收门**，不是当前可以执行的上线指令。
 
 ## 1. 当前安全状态
 
@@ -192,6 +192,11 @@ uv run python scripts/audit_life_subject_shadow.py \
 parent 时才允许原子替换；任何其他字节都视为外部变化并保留原文件，随后由
 observer 追加为新观察。禁止为了“让数据库和文件一致”而覆盖未知外部改动。
 
+selected storage 启用后，`nucleus_write_file`、`nucleus_edit_file` 与 Memory
+Witness 的声明路径必须先调用 service 的 Subject 写入口，再执行工作区投影。
+通用 `nucleus_bash` 无法证明任意 shell 命令的写前入账，因此在该模式下 fail
+closed；读取或修改应使用专用 file/领域工具。disabled/local 模式保持原行为。
+
 ### 6.5 Life Memory 无损候选复制
 
 Life Memory 使用显式的 32 表选择合同，不复制 SQLite FTS 内部影子表，也不把
@@ -225,6 +230,39 @@ uv run python scripts/audit_life_memory_shadow.py \
 76 个删除节点及其 1,936 条关联边完整保留。该快照仍是
 `writer_frozen=false`，远端账号也不能创建数据库级不可变 trigger，因此只可作为
 不可激活的 shadow，不得据此切换生产。
+
+### 6.6 Presence / World 候选复制与反向恢复
+
+Presence 与 World 从一致性快照复制，命令为：
+
+```bash
+uv run python scripts/migrate_life_presence_world.py \
+  --snapshot /absolute/life-domain-candidate \
+  --run-id life-presence-world-shadow-<manifest-prefix> \
+  --reverse-export /new/presence-world-reverse-export
+```
+
+独立只读复核为：
+
+```bash
+uv run python scripts/audit_life_presence_world_shadow.py \
+  --snapshot /absolute/life-domain-candidate \
+  --reverse-export /absolute/presence-world-reverse-export
+```
+
+迁移器只选择 Presence snapshot/stream owner/lifecycle outbox 和 World
+projector meta/assertion/change/perception cursor。World 的 projection policy、schema
+version 与 rebuild state 由运行合同生成，不能冒充源记录；其余源字段逐行规范化
+并计算稳定根。只有源 World 完全空白且唯一差异是初始化的 synthetic frontier=0
+时，迁移器才允许把 frontier 修复为源值，并把该动作计入 copied record；任何已有
+assertion/change/cursor 的目标都必须冲突失败，禁止覆盖。
+
+当前验证通过的反向副本位于
+`C:\Temp\Data\ElysiumBackups\life-presence-world-reverse-20260804T1030Z`。
+源、MySQL 与反向副本共 2,031 条源记录，聚合根均为
+`abd4f799f8208bc9edafdc3fb67a486486ba7746d599afd4fd5b0a341e5a2214`；
+批次 `life-presence-world-shadow-v3-77435387f4acc59e` 为 `copied`。
+它来自 `writer_frozen=false` 快照，只是恢复证据，不是 active generation。
 
 ## 7. 正式切换验收门
 
