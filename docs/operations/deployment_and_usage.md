@@ -328,6 +328,8 @@ Life Event / Life Memory / Presence / World / 主体文件
 
 不要把两项 `enabled` 直接改成 `true` 来冒充“全部使用 MySQL”。启用前必须分别完成远端权限、密码环境变量、初次备份/全量清单、哈希验证、恢复演练和生命周期验收。尤其是 Core 已直接使用 MySQL 的部署，当前统一归档器仍把 `data/Elysium.db` 作为必需的 `core` 扫描源；该源不存在或已停止更新时，持续归档不能代表最新 Core 数据，必须先完成归档源接线修复。统一归档的正式流程见 [统一记忆同步与恢复手册](./unified_memory_sync_runbook.md)，共享事件流程见 [离线同步运行手册](./offline_sync_runbook.md)。
 
+未来若实施整个生命域可选本地/MySQL 后端，必须以 [Elysium 生命域可选 MySQL 与本地存储重构方案](../architecture/Elysium生命域可选MySQL与本地存储重构方案.md) 为设计基线。该文档当前仅是提案；其中的 `[storage]` 配置、复制迁移器、generation guard、authority fencing 和 MySQL Life Engine 表尚未实现，不能作为现有部署参数使用。
+
 ### 6.3 启动和回退验收
 
 修改数据库配置不会热加载。完成配置后，由用户在维护窗口手工启动或重启，并至少检查：
