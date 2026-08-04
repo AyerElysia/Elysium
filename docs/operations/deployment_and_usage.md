@@ -367,7 +367,9 @@ app_api_v1_max_websocket_connections = 64
 - Origin 使用精确 allowlist，不支持通配符；localhost 也不能绕过认证；
 - 认证 SQLite 必须位于 workspace 的 `runtime/` 下，只保存凭据哈希、授权、到期与撤销状态，不保存可回显明文凭据；
 - 普通请求体上限 1 MiB，受管上传上限 32 MiB，HTTP 并发和 WebSocket 连接分别受配置预算约束；
-- 当前已挂载 P3-01 的五个认证端点和 P3-02 的 `/bootstrap`、`/capabilities`、`/readiness`、`/health`；除 `/health` 仅用于 API 存活探测外，其余基础接口要求短时 Bearer 会话及 `system:read` 或 `capabilities:read` scope。后续事件、命令和领域接口尚未完成，不能因为 OpenAPI 可访问就宣称阶段三全部完成；
+- 当前已挂载 P3-01 的五个认证端点、P3-02 的 `/bootstrap`、`/capabilities`、`/readiness`、`/health`，以及 P3-03 的 `/events`、`/events/{event_id}`、`/events/stream` 和 `/event-subscriptions/validate`；除 `/health` 仅用于 API 存活探测外，其余接口要求短时 Bearer 会话及对应 scope。命令和其他领域接口尚未完成，不能因为 OpenAPI 可访问就宣称阶段三全部完成；
+- 事件接口以耐久 Life Event SQLite ledger 的全局 ingest position 为权威位置，cursor 不透明、签名且绑定账本；授权过滤后的 cursor 表示“已扫描位置”，不可见事件不会造成虚假历史缺口，也不会通过单事件读取泄露存在性；
+- SSE 支持 `Last-Event-ID` 或 `cursor` 断点恢复，二者不一致会显式拒绝；先补历史再轮询 tail，heartbeat 不推进业务 cursor，断线不写服务端 durable offset。当前没有明确动态订阅或 ack 消费者，因此 `/events/ws` 保持 planned，不重复实现无消费者协议；
 - `/readiness` 只读聚合已经存在的内存状态，不调用插件或 Adapter 主动 health，不建立连接、不建表、不执行修复，也不访问会创建 Life Engine service 的懒加载属性；配置停用的平台显示 `disabled`，而不是失败或从列表消失；
 - `local_ready` 只表示当前已落地的本地关键路径（API 与 Life Event ledger）可用。远程同步不可用、Adapter 断开或 P3-04 command store 尚未落地会保留在脱敏诊断中并使总体状态为 `degraded`，但不会伪造本地不可用；
 - 受信启动器通过 `AuthStore.create_bootstrap_challenge()` 生成绑定 Origin、安装实例和短 TTL 的一次性 challenge；公共 HTTP 不提供匿名 challenge 生成端点；

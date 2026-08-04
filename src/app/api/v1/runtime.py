@@ -8,14 +8,15 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, FastAPI, Request, Response
+from fastapi import APIRouter, Depends, FastAPI, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
 from .auth_store import AuthStore, SessionRecord
+from .events import EventQueryFailure, EventQueryService
 from .foundation import FoundationProjection
 from .policy import ALL_EXPORTED_SCOPES
 from .schemas import (
@@ -24,9 +25,15 @@ from .schemas import (
     CapabilitiesResponse,
     ErrorBody,
     ErrorResponse,
+    EventEnvelope,
+    EventFilter,
+    EventPage,
+    EventSubscriptionValidateRequest,
+    EventSubscriptionValidation,
     HealthResponse,
     LogoutResponse,
     ReadinessResponse,
+    RecoveryHint,
     SessionCreateRequest,
     SessionRefreshRequest,
     SessionResponse,
@@ -73,12 +80,16 @@ class APIError(Exception):
         *,
         status_code: int,
         retryable: bool = False,
+        details: dict[str, Any] | None = None,
+        recovery: dict[str, str] | None = None,
     ) -> None:
         super().__init__(code)
         self.code = code
         self.message = message
         self.status_code = status_code
         self.retryable = retryable
+        self.details = details or {}
+        self.recovery = recovery
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +106,7 @@ class APIContext:
     max_concurrency: int = 32
     max_websocket_connections: int = 64
     foundation: FoundationProjection | None = None
+    events: EventQueryService | None = None
 
 
 class RequestIDMiddleware(BaseHTTPMiddleware):
@@ -263,6 +275,8 @@ def _error_response(request: Request, error: APIError) -> JSONResponse:
             message=error.message,
             request_id=request.state.request_id,
             retryable=error.retryable,
+            details=error.details,
+            recovery=(RecoveryHint(**error.recovery) if error.recovery else None),
         )
     )
     return JSONResponse(
@@ -365,9 +379,14 @@ def create_api_app(context: APIContext) -> FastAPI:
 
     auth_router = APIRouter(prefix="/auth")
     foundation_router = APIRouter()
+    event_router = APIRouter()
     bearer = HTTPBearer(auto_error=False)
     foundation = context.foundation or FoundationProjection(
         node_id=context.installation_id,
+    )
+    events = context.events or EventQueryService(
+        node_id=context.installation_id,
+        codec=context.codec,
     )
 
     def current_session(
@@ -595,8 +614,173 @@ def create_api_app(context: APIContext) -> FastAPI:
     def get_health() -> HealthResponse:
         return foundation.health()
 
+    def event_filter(
+        event_type: Annotated[list[str] | None, Query()] = None,
+        channel: Annotated[list[str] | None, Query()] = None,
+        stream_id: str | None = None,
+        source_instance_id: str | None = None,
+        occurred_after: str | None = None,
+        occurred_before: str | None = None,
+        include_payload: bool = False,
+        projection: str = "summary",
+    ) -> EventFilter:
+        try:
+            return EventFilter(
+                event_type=tuple(event_type or ()),
+                channel=tuple(channel or ()),
+                stream_id=stream_id,
+                source_instance_id=source_instance_id,
+                occurred_after=occurred_after,
+                occurred_before=occurred_before,
+                include_payload=include_payload,
+                projection=projection,
+            )
+        except ValueError as exc:
+            raise APIError(
+                "validation_failed",
+                "事件过滤条件不符合接口协议。",
+                status_code=422,
+            ) from exc
+
+    def event_api_error(exc: EventQueryFailure) -> APIError:
+        recovery = None
+        if exc.recovery_cursor:
+            recovery = {
+                "action": "restart_from_cursor",
+                "cursor": exc.recovery_cursor,
+            }
+        return APIError(
+            exc.code,
+            exc.message,
+            status_code=exc.status_code,
+            retryable=exc.retryable,
+            recovery=recovery,
+        )
+
+    @event_router.get(
+        "/events",
+        response_model=EventPage,
+        operation_id="queryEvents",
+        responses=ERROR_RESPONSES,
+    )
+    async def query_events(
+        session: Annotated[
+            SessionRecord,
+            Depends(require_scope("events:read")),
+        ],
+        filters: Annotated[EventFilter, Depends(event_filter)],
+        cursor: str | None = None,
+        limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    ) -> EventPage:
+        try:
+            events.validate_subscription(filters, session)
+            return await events.query(
+                cursor=cursor,
+                limit=limit,
+                event_filter=filters,
+                session=session,
+            )
+        except EventQueryFailure as exc:
+            raise event_api_error(exc) from exc
+
+    @event_router.get(
+        "/events/stream",
+        operation_id="streamEvents",
+        responses=ERROR_RESPONSES,
+    )
+    async def stream_events(
+        request: Request,
+        session: Annotated[
+            SessionRecord,
+            Depends(require_scope("events:read")),
+        ],
+        filters: Annotated[EventFilter, Depends(event_filter)],
+        cursor: str | None = None,
+    ) -> StreamingResponse:
+        last_event_id = request.headers.get("last-event-id")
+        if cursor and last_event_id and cursor != last_event_id:
+            raise APIError(
+                "cursor_conflict",
+                "cursor 与 Last-Event-ID 不一致。",
+                status_code=409,
+            )
+        resume_cursor = cursor or last_event_id
+        try:
+            events.validate_subscription(filters, session)
+            await events.query(
+                cursor=resume_cursor,
+                limit=1,
+                event_filter=filters,
+                session=session,
+            )
+        except EventQueryFailure as exc:
+            raise event_api_error(exc) from exc
+
+        async def generate() -> Any:
+            try:
+                async for frame in events.stream(
+                    cursor=resume_cursor,
+                    event_filter=filters,
+                    session=session,
+                ):
+                    yield frame
+            except EventQueryFailure as exc:
+                yield events.error_frame(exc)
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @event_router.get(
+        "/events/{event_id}",
+        response_model=EventEnvelope,
+        operation_id="getEvent",
+        responses=ERROR_RESPONSES,
+    )
+    async def get_event(
+        event_id: str,
+        session: Annotated[
+            SessionRecord,
+            Depends(require_scope("events:read")),
+        ],
+        filters: Annotated[EventFilter, Depends(event_filter)],
+    ) -> EventEnvelope:
+        try:
+            events.validate_subscription(filters, session)
+            return await events.get_event(
+                event_id,
+                event_filter=filters,
+                session=session,
+            )
+        except EventQueryFailure as exc:
+            raise event_api_error(exc) from exc
+
+    @event_router.post(
+        "/event-subscriptions/validate",
+        response_model=EventSubscriptionValidation,
+        operation_id="validateEventSubscription",
+        responses=ERROR_RESPONSES,
+    )
+    def validate_event_subscription(
+        payload: EventSubscriptionValidateRequest,
+        session: Annotated[
+            SessionRecord,
+            Depends(require_scope("events:read")),
+        ],
+    ) -> EventSubscriptionValidation:
+        try:
+            return events.validate_subscription(payload, session)
+        except EventQueryFailure as exc:
+            raise event_api_error(exc) from exc
+
     app.include_router(auth_router)
     app.include_router(foundation_router)
+    app.include_router(event_router)
     return app
 
 

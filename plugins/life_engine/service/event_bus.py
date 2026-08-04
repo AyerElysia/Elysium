@@ -914,6 +914,22 @@ class RawEventStore(_LegacyJSONLEventStore):
     ) -> list[LifeEvent]:
         return await asyncio.to_thread(self._read_since_sync, sequence, limit)
 
+    def _get_by_event_id_sync(self, event_id: str) -> LifeEvent | None:
+        self._ensure_ready_sync()
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT * FROM raw_life_events
+                WHERE occurrence_id = ? OR source_event_id = ?
+                ORDER BY ingest_position DESC LIMIT 1""",
+                (str(event_id), str(event_id)),
+            ).fetchone()
+        return self._event_from_row(row) if row is not None else None
+
+    async def get_by_event_id(self, event_id: str) -> LifeEvent | None:
+        """Read one event by stable occurrence id or legacy source event id."""
+
+        return await asyncio.to_thread(self._get_by_event_id_sync, event_id)
+
     def read_since_sync(
         self,
         sequence: int,

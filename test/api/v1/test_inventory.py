@@ -44,6 +44,18 @@ def test_inventory_keys_are_unique_and_complete() -> None:
         assert contract.status in {"planned", "experimental", "implemented", "validated"}
 
 
+def test_p3_03_event_contracts_use_sse_without_unneeded_websocket() -> None:
+    validated = {
+        ("GET", "/api/v1/events"),
+        ("GET", "/api/v1/events/{event_id}"),
+        ("GET", "/api/v1/events/stream"),
+        ("POST", "/api/v1/event-subscriptions/validate"),
+    }
+
+    assert {API_INVENTORY_BY_KEY[key].status for key in validated} == {"validated"}
+    assert API_INVENTORY_BY_KEY[("WS", "/api/v1/events/ws")].status == "planned"
+
+
 def test_p3_02_foundation_contracts_are_validated() -> None:
     keys = {
         ("GET", "/api/v1/bootstrap"),

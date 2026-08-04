@@ -26,6 +26,7 @@
 | 是否实现普通业务 CRUD | 否                                            | 是                         |
 | 是否改写爱莉主体语义    | 否                                            | 否                         |
 |               |                                              |                           |
+|               |                                              |                           |
 
 以下内容不得混入阶段三：
 
@@ -1110,6 +1111,8 @@ Surface 是展示／输入端，不拥有独立人格或长期记忆。只读观
 
 阶段三不建立阶段四的业务用户体系，但必须同时支持以下调用方：
 
+
+
 - 本机用户前端：短时 session／一次性 ticket，绑定 Origin；
 - 独立应用后端：作为独立应用平台唯一受信入口，使用 service credential + mTLS 或签名 bearer token，可接入阶段三全部接口；独立应用前端不绕过自己的后端直连 Elysium；
 - 全能管理前端：使用单一全能管理员凭据，可访问全部正式导出的管理接口和数据视图；
@@ -1224,6 +1227,8 @@ metrics:read / diagnostics:read
 验收门：禁用 NapCat 不视为系统失败；远程同步不可用不阻止本地 ready；输出无凭据和原文。
 
 ### P3-03：实现统一事件 query 与 subscription
+
+> **实施状态（2026-08-04）**：已完成。已基于耐久 Life Event SQLite ledger 落地授权 `/events` cursor 分页、`/events/{event_id}`、SSE `/events/stream` 与 `/event-subscriptions/validate`；公共 sequence 明确为账本全局 ingest position，授权过滤推进已扫描位置，不可见事件与不存在事件统一返回 404。SSE 支持 `Last-Event-ID`／cursor 断点恢复、先补历史再 tail、非推进 heartbeat、结构化 gap 和取消关闭；没有明确动态订阅或 ack 消费者，因此 `/events/ws` 按任务约束保留 planned。定向契约测试覆盖切换边界并发写入、断线补收、payload 授权、存在性隐藏和 `RawEventGapError` 映射。未启动或重启 Elysium，未进行真实前端 E2E。
 
 任务：
 

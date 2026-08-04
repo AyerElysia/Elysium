@@ -128,15 +128,26 @@ GET /api/v1/openapi.json
 GET /api/v1/events
 GET /api/v1/events/{event_id}
 GET /api/v1/events/stream
-WS /api/v1/events/ws
 POST /api/v1/event-subscriptions/validate
 """,
         domain="events",
         pages=("实时事件面板", "事件审计", "断线恢复"),
         callers=_ALL_CALLERS,
         scopes=("events:read",),
-        resource_authorization="按事件 visibility、调用者资源授权和已扫描账本位置过滤",
-        anchor="plugins/life_engine/service/event_bus.py 与 src/kernel/sync/；需新增授权 query service",
+        resource_authorization="按事件 visibility、调用者资源授权和已扫描账本位置过滤；不可见与不存在统一处理",
+        anchor="src/app/api/v1/events.py、schemas/events.py 与 plugins/life_engine/service/event_bus.py",
+        status="validated",
+    ),
+    *_contracts(
+        """
+WS /api/v1/events/ws
+""",
+        domain="events",
+        pages=("实时事件面板", "事件审计", "断线恢复"),
+        callers=_ALL_CALLERS,
+        scopes=("events:read",),
+        resource_authorization="仅在出现明确动态订阅或 ack 消费者后实施，仍按事件 visibility 与资源授权过滤",
+        anchor="P3-03 当前无明确双向消费者，不重复实现 SSE 已覆盖的协议",
     ),
     *_contracts(
         """

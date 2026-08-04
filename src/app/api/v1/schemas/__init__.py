@@ -11,6 +11,17 @@ from .auth import (
 )
 from .common import API_VERSION, SCHEMA_VERSION, StrictModel, VersionedModel, utc_now
 from .error import ErrorBody, ErrorResponse, RecoveryHint
+from .events import (
+    EventActor,
+    EventEnvelope,
+    EventFilter,
+    EventPage,
+    EventReplyTarget,
+    EventSource,
+    EventSubscriptionValidateRequest,
+    EventSubscriptionValidation,
+    EventVisibility,
+)
 from .foundation import (
     AdapterStatus,
     BootstrapResponse,
@@ -34,6 +45,15 @@ __all__ = [
     "ComponentStatus",
     "ErrorBody",
     "ErrorResponse",
+    "EventActor",
+    "EventEnvelope",
+    "EventFilter",
+    "EventPage",
+    "EventReplyTarget",
+    "EventSource",
+    "EventSubscriptionValidateRequest",
+    "EventSubscriptionValidation",
+    "EventVisibility",
     "FeatureCapability",
     "HealthResponse",
     "LogoutResponse",

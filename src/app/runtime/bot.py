@@ -628,6 +628,7 @@ class Bot:
 
             self.http_server = get_http_server(host=host, port=port)
             if self.config.http_router.enable_app_api_v1:
+                from src.app.api.v1.events import event_store_from_bot
                 from src.app.api.v1.foundation import (
                     FoundationProjection,
                     snapshot_from_bot,
@@ -652,6 +653,7 @@ class Bot:
                         self.config.http_router.app_api_v1_max_websocket_connections
                     ),
                     foundation=foundation,
+                    event_store_provider=lambda: event_store_from_bot(self),
                 )
             await self.http_server.start()
 

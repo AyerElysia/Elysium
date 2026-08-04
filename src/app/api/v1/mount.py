@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
@@ -11,7 +11,10 @@ from urllib.parse import urlparse
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from plugins.life_engine.service.event_bus import RawEventStore
+
 from .auth_store import AuthStore
+from .events import EventQueryService
 from .foundation import FoundationProjection
 from .runtime import APIContext, create_api_app
 from .tokens import SignedValueCodec
@@ -52,6 +55,7 @@ def mount_api_v1(
     max_concurrency: int,
     max_websocket_connections: int = 64,
     foundation: FoundationProjection | None = None,
+    event_store_provider: Callable[[], RawEventStore | None] | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> APIV1Mount:
     """校验生产配置，创建耐久认证 store，并挂载 `/api/v1`。"""
@@ -77,6 +81,11 @@ def mount_api_v1(
             max_concurrency=max_concurrency,
             max_websocket_connections=max_websocket_connections,
             foundation=foundation,
+            events=EventQueryService(
+                node_id=installation_id,
+                codec=SignedValueCodec(signing_secret),
+                store_provider=event_store_provider,
+            ),
         )
         app = create_api_app(context)
         app.add_middleware(
