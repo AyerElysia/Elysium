@@ -65,6 +65,33 @@ class LifeEngineConfig(BaseConfig):
             "migrate_legacy_diaries",
             "legacy_diary_path",
         },
+        "storage": {
+            "enabled",
+            "authoritative_backend",
+            "backend_generation",
+            "schema_version",
+            "authority_provider",
+            "authority_epoch",
+            "authority_owner_id",
+            "require_verified_generation",
+        },
+        "storage_local": {
+            "database_path",
+            "authority_state_path",
+            "busy_timeout_seconds",
+        },
+        "storage_mysql": {
+            "host",
+            "port",
+            "database",
+            "user",
+            "password_env",
+            "ssl_mode",
+            "pool_size",
+            "max_overflow",
+            "connect_timeout_seconds",
+            "query_timeout_seconds",
+        },
         "shared_sync": {
             "enabled",
             "remote_host",
@@ -465,6 +492,134 @@ class LifeEngineConfig(BaseConfig):
         consumer_id: str = Field(
             default="life_engine.shared_sync",
             description="远端事件应用游标的消费者 ID。",
+        )
+
+    @config_section("storage")
+    class StorageSection(SectionBase):
+        """Selectable life-domain authority; disabled until a verified cutover."""
+
+        enabled: bool = Field(
+            default=False,
+            description=(
+                "Enable the selectable storage runtime. It never enables itself "
+                "during migration and never falls back automatically."
+            ),
+        )
+        authoritative_backend: str = Field(
+            default="local",
+            description="One writable authority: local or mysql.",
+        )
+        backend_generation: str = Field(
+            default="",
+            description="Explicit verified generation ID. Empty while rollout is disabled.",
+        )
+        schema_version: int = Field(
+            default=1,
+            ge=1,
+            description="Expected storage contract schema version.",
+        )
+        registry_id: str = Field(
+            default="life-domain",
+            description="Authority registry identity shared by all writers.",
+        )
+        authority_provider: str = Field(
+            default="file",
+            description=(
+                "Authority control plane: file for one host, mysql for shared MySQL writers."
+            ),
+        )
+        authority_epoch: int = Field(
+            default=0,
+            ge=0,
+            description="Explicit monotonic writer epoch; zero is not writable.",
+        )
+        authority_owner_id: str = Field(
+            default="",
+            description="Writer instance identity recorded by the authority registry.",
+        )
+        fencing_token_env: str = Field(
+            default="ELYSIUM_LIFE_STORAGE_FENCING_TOKEN",
+            description="Environment variable containing the short-lived fencing secret.",
+        )
+        require_verified_generation: bool = Field(
+            default=True,
+            description="Reject candidate or sealed generations at startup.",
+        )
+
+    @config_section("storage_local")
+    class StorageLocalSection(SectionBase):
+        """Local backend and single-host authority control plane."""
+
+        database_path: str = Field(
+            default="data/life_storage/local.sqlite3",
+            description="New managed path; existing source databases are never overwritten.",
+        )
+        authority_state_path: str = Field(
+            default="data/life_storage/authority.json",
+            description="Hash-chained local authority registry state.",
+        )
+        busy_timeout_seconds: int = Field(
+            default=10,
+            ge=1,
+            le=300,
+            description="Bounded SQLite lock wait timeout.",
+        )
+
+    @config_section("storage_mysql")
+    class StorageMySQLSection(SectionBase):
+        """MySQL backend settings; secrets are resolved only from the environment."""
+
+        host: str = Field(default="127.0.0.1", description="MySQL host.")
+        port: int = Field(default=3306, ge=1, le=65535, description="MySQL port.")
+        database: str = Field(default="elysium", description="MySQL database name.")
+        user: str = Field(default="elysium", description="MySQL user.")
+        password_env: str = Field(
+            default="ELYSIUM_LIFE_STORAGE_MYSQL_PASSWORD",
+            description="Environment variable containing the MySQL password.",
+        )
+        ssl_mode: str = Field(
+            default="disabled",
+            description="TLS mode: disabled/required/verify-ca/verify-full.",
+        )
+        ssl_ca: str = Field(default="", description="Optional CA certificate path.")
+        ssl_cert: str = Field(default="", description="Optional client certificate path.")
+        ssl_key: str = Field(default="", description="Optional client private-key path.")
+        pool_size: int = Field(default=20, ge=1, le=200, description="Base pool size.")
+        max_overflow: int = Field(
+            default=20,
+            ge=0,
+            le=200,
+            description="Bounded pool overflow.",
+        )
+        pool_recycle_seconds: int = Field(
+            default=1800,
+            ge=30,
+            le=86400,
+            description="Connection recycle interval.",
+        )
+        connect_timeout_seconds: int = Field(
+            default=5,
+            ge=1,
+            le=60,
+            description="Connection timeout.",
+        )
+        pool_timeout_seconds: int = Field(
+            default=10,
+            ge=1,
+            le=300,
+            description="Pool acquisition timeout.",
+        )
+        query_timeout_seconds: int = Field(
+            default=10,
+            ge=1,
+            le=300,
+            description="Per-statement execution timeout.",
+        )
+        lock_wait_timeout_seconds: int = Field(
+            default=5,
+            ge=1,
+            le=300,
+            description="InnoDB row-lock wait timeout.",
         )
 
     @config_section("memory_archive_sync")
@@ -1731,15 +1886,21 @@ class LifeEngineConfig(BaseConfig):
         def normalize_disabled_intent_timeout(cls, value: object) -> object:
             """Treat TOML's generated zero sentinel as an unset timeout."""
 
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                if float(value) == 0.0:
-                    return None
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and float(value) == 0.0
+            ):
+                return None
             return value
 
     settings: SettingsSection = Field(default_factory=SettingsSection)
     model: ModelSection = Field(default_factory=ModelSection)
     memory_index: MemoryIndexSection = Field(default_factory=MemoryIndexSection)
     memory_witness: MemoryWitnessSection = Field(default_factory=MemoryWitnessSection)
+    storage: StorageSection = Field(default_factory=StorageSection)
+    storage_local: StorageLocalSection = Field(default_factory=StorageLocalSection)
+    storage_mysql: StorageMySQLSection = Field(default_factory=StorageMySQLSection)
     shared_sync: SharedSyncSection = Field(default_factory=SharedSyncSection)
     memory_archive_sync: MemoryArchiveSyncSection = Field(
         default_factory=MemoryArchiveSyncSection
@@ -1764,7 +1925,7 @@ class LifeEngineConfig(BaseConfig):
 
     @field_validator("chatter")
     @classmethod
-    def validate_context_compaction_budgets(cls, v: "LifeEngineConfig.ChatterSection"):
+    def validate_context_compaction_budgets(cls, v: LifeEngineConfig.ChatterSection):
         """Ensure compaction target <= trigger and snapshot hard cap is usable."""
         trigger = int(getattr(v, "context_compaction_trigger_chars", 0) or 0)
         target = int(getattr(v, "context_compaction_target_chars", 0) or 0)

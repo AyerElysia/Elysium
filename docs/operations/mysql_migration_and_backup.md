@@ -75,21 +75,34 @@ gzip -dc /absolute/backup.sql.gz | mysql <isolated_restore_database>
 
 ## 4. 生命域本地备份
 
+完整的 generation、authority 与切换流程以 [生命域存储快照与权威切换运行手册](./life_storage_backend_runbook.md) 为准。这里保留日常备份入口。
+
 ```bash
 uv run python scripts/backup_life_data.py \
   --data-root /absolute/Elysium/data \
   --output /absolute/backup/life-domain-<timestamp>
 ```
 
-脚本使用 SQLite Online Backup API 备份：
+默认命令会创建并立即复核一个**不可激活的在线候选快照**。它不会停止 Elysium，也不会修改、移动、删除或覆盖源数据。只有在用户已经手动停止全部已知写入者后，才允许显式添加 `--writer-frozen`；该参数是人工事实声明，不是脚本自动停止进程的授权。
+
+脚本使用 SQLite Online Backup API 备份并生成逐表逻辑根、逐文件 SHA-256、frontier 与来源证据：
 
 - `Elysium.db`；
 - `.memory/memory.db`；
 - `life_events.sqlite3`；
 - `consciousness_presence.sqlite3`；
 - `world_projection.sqlite3`。
+- `.memory/archive_sync_state.sqlite3`。
 
-同时复制日记、叙事、技能、思考等生命工作区文件并生成逐文件 SHA-256。Chroma 不作为权威副本，它应从结构化记忆重建。
+同时逐字节复制日记、生命工作区非数据库文件、媒体缓存与表情媒体，并拒绝覆盖已有目标。Chroma 仍不作为权威副本，应从结构化记忆重建；既有备份目录被保留在源端，但不会递归复制进新备份。
+
+验证已有快照：
+
+```bash
+uv run python -c "from pathlib import Path; from plugins.life_engine.storage.migration import verify_local_snapshot; print(verify_local_snapshot(Path('/absolute/backup/life-domain-<timestamp>')))"
+```
+
+出现 `SNAPSHOT_INCOMPLETE`、manifest 校验失败、文件哈希不一致、SQLite 逻辑根不一致或来源在冻结窗口中变化时，快照不得注册为可写 generation。
 
 ## 5. 连续本地备份
 

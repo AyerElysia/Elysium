@@ -1,0 +1,214 @@
+"""Versioned, checksum-verified MySQL schema migration runner."""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from dataclasses import dataclass
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine
+
+_IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+
+
+class MigrationDriftError(RuntimeError):
+    """Raised when an applied migration no longer matches its source checksum."""
+
+
+class MigrationLockError(RuntimeError):
+    """Raised when the schema migration advisory lock cannot be acquired."""
+
+
+@dataclass(frozen=True, slots=True)
+class SchemaMigration:
+    """One ordered group of idempotent MySQL DDL/DML statements."""
+
+    version: int
+    name: str
+    statements: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if int(self.version) <= 0:
+            raise ValueError("migration version must be positive")
+        if not self.name.strip():
+            raise ValueError("migration name must not be empty")
+        if not self.statements or any(not item.strip() for item in self.statements):
+            raise ValueError("migration must contain non-empty idempotent statements")
+
+    @property
+    def checksum(self) -> str:
+        """Return a stable checksum over version, name, and exact statements."""
+
+        payload = "\n-- statement --\n".join(
+            (str(self.version), self.name, *self.statements)
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class MigrationResult:
+    """Secret-free result of one migration run."""
+
+    applied_versions: tuple[int, ...]
+    current_version: int
+
+
+class MySQLMigrationRunner:
+    """Serialize and verify one namespace's MySQL schema migrations.
+
+    MySQL DDL may auto-commit.  Every migration statement must therefore be
+    idempotent; a crash before the checksum row is recorded safely replays the
+    same statements instead of pretending the migration was atomic.
+    """
+
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        *,
+        table_name: str = "storage_schema_migrations",
+        lock_name: str = "elysium:life-storage-schema",
+        lock_timeout_seconds: int = 10,
+    ) -> None:
+        if not _IDENTIFIER.fullmatch(table_name):
+            raise ValueError(f"unsafe migration table name: {table_name!r}")
+        if not lock_name or len(lock_name.encode("utf-8")) > 64:
+            raise ValueError("MySQL advisory lock name must be 1..64 bytes")
+        if int(lock_timeout_seconds) < 0:
+            raise ValueError("migration lock timeout must not be negative")
+        self.engine = engine
+        self.table_name = table_name
+        self.lock_name = lock_name
+        self.lock_timeout_seconds = int(lock_timeout_seconds)
+
+    @property
+    def _create_table_sql(self) -> str:
+        return f"""CREATE TABLE IF NOT EXISTS {self.table_name} (
+            version BIGINT UNSIGNED PRIMARY KEY,
+            name VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            checksum CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            applied_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"""
+
+    @staticmethod
+    def _ordered(migrations: tuple[SchemaMigration, ...]) -> tuple[SchemaMigration, ...]:
+        ordered = tuple(sorted(migrations, key=lambda item: item.version))
+        versions = [item.version for item in ordered]
+        if len(versions) != len(set(versions)):
+            raise ValueError("migration versions must be unique")
+        return ordered
+
+    async def current(self) -> dict[int, tuple[str, str]]:
+        """Return applied version -> (name, checksum), creating metadata if needed."""
+
+        async with self.engine.connect() as connection:
+            await connection.execute(text(self._create_table_sql))
+            await connection.commit()
+            rows = (
+                await connection.execute(
+                    text(
+                        f"SELECT version, name, checksum FROM {self.table_name} "
+                        "ORDER BY version"
+                    )
+                )
+            ).mappings()
+            result = {
+                int(row["version"]): (str(row["name"]), str(row["checksum"]))
+                for row in rows
+            }
+            await connection.commit()
+            return result
+
+    async def apply(self, migrations: tuple[SchemaMigration, ...]) -> MigrationResult:
+        """Apply all missing migrations under one connection-scoped advisory lock."""
+
+        ordered = self._ordered(migrations)
+        applied_now: list[int] = []
+        async with self.engine.connect() as connection:
+            acquired = await connection.scalar(
+                text("SELECT GET_LOCK(:name, :timeout)"),
+                {"name": self.lock_name, "timeout": self.lock_timeout_seconds},
+            )
+            await connection.commit()
+            if int(acquired or 0) != 1:
+                raise MigrationLockError(
+                    f"could not acquire schema migration lock {self.lock_name!r}"
+                )
+            primary_error: BaseException | None = None
+            try:
+                await connection.execute(text(self._create_table_sql))
+                await connection.commit()
+                rows = (
+                    await connection.execute(
+                        text(
+                            f"SELECT version, name, checksum FROM {self.table_name} "
+                            "ORDER BY version"
+                        )
+                    )
+                ).mappings()
+                applied = {
+                    int(row["version"]): (str(row["name"]), str(row["checksum"]))
+                    for row in rows
+                }
+                await connection.commit()
+
+                for migration in ordered:
+                    existing = applied.get(migration.version)
+                    if existing is not None:
+                        if existing != (migration.name, migration.checksum):
+                            raise MigrationDriftError(
+                                f"migration {migration.version} checksum/name drift"
+                            )
+                        continue
+                    try:
+                        for statement in migration.statements:
+                            await connection.execute(text(statement))
+                        await connection.execute(
+                            text(
+                                f"INSERT INTO {self.table_name} "
+                                "(version, name, checksum) "
+                                "VALUES (:version, :name, :checksum)"
+                            ),
+                            {
+                                "version": migration.version,
+                                "name": migration.name,
+                                "checksum": migration.checksum,
+                            },
+                        )
+                        await connection.commit()
+                    except BaseException:
+                        await connection.rollback()
+                        raise
+                    applied[migration.version] = (
+                        migration.name,
+                        migration.checksum,
+                    )
+                    applied_now.append(migration.version)
+            except BaseException as exc:
+                primary_error = exc
+                raise
+            finally:
+                try:
+                    await connection.execute(
+                        text("SELECT RELEASE_LOCK(:name)"),
+                        {"name": self.lock_name},
+                    )
+                    await connection.commit()
+                except BaseException:
+                    await connection.rollback()
+                    if primary_error is None:
+                        raise
+
+        return MigrationResult(
+            applied_versions=tuple(applied_now),
+            current_version=max((item.version for item in ordered), default=0),
+        )
+
+
+__all__ = [
+    "MigrationDriftError",
+    "MigrationLockError",
+    "MigrationResult",
+    "MySQLMigrationRunner",
+    "SchemaMigration",
+]

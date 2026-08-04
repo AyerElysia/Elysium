@@ -18,6 +18,8 @@
 - [离线同步运行手册](./operations/offline_sync_runbook.md) — 手动启用、健康检查、断网恢复、降级回退与备份核对
 - [MySQL 核心持久化边界](./architecture/MySQL核心持久化边界.md) — Core 关系数据、生命域本地权威库、方言契约与人工切换边界
 - [MySQL 迁移、备份与恢复手册](./operations/mysql_migration_and_backup.md) — 审计、快照、原子迁移、连续备份与恢复演练
+- [生命域可选 MySQL / 本地存储重构方案](./architecture/Elysium生命域可选MySQL与本地存储重构方案.md) — 单写权威、双后端合同、无损迁移与分阶段完成定义
+- [生命域存储快照与权威切换运行手册](./operations/life_storage_backend_runbook.md) — 候选快照、generation、epoch/fencing、切换门与回滚边界
 - [Elysium Console 前端提案](./architecture/Elysium控制台前端提案.md) — 已批准的插件驱动统一控制台与分阶段验收计划
 - [Elysium Console Stage 0 设计基线](./architecture/Elysium控制台阶段零交互设计.md) — 此刻、Live Ready、Live Call 与安全降级页的交互规范
 - [Elysium Console 安全模型](./architecture/Elysium控制台安全模型.md) — 插件页面、密钥、OBS、会话与主进程生命周期边界
@@ -29,6 +31,7 @@
 - [NapCat / QQNT 掉线恢复与真实链路验证（2026-08-04）](./report/napcat-qqnt-recovery-validation-2026-08-04.md) — QQNT 版本回退、复合健康判断、真实私聊收发证据与人工回滚边界
 - [远程 MySQL 接入就绪审计（2026-08-03）](./report/remote-mysql-readiness-audit-2026-08-03.md) — 只读连通、TLS、权限、binlog 与正式接入阻断项
 - [MySQL 基座迁移与恢复验证（2026-08-03）](./report/mysql-foundation-validation-2026-08-03.md) — 真实数据迁移、两次安全拦截、逐表指纹、备份恢复与限制
+- [生命域可选存储阶段 0/1 交付（2026-08-04）](./report/life-storage-phase0-phase1-2026-08-04.md) — 六个真实 SQLite 源、精确文件资产、存储内核、远程 MySQL 控制面与未切换声明
 - [离线同步阶段二验证（2026-08-03）](./report/offline-sync-phase2-validation-2026-08-03.md) — 本地/远端 MySQL 全链路、并发幂等、崩溃恢复、Inbox 游标与回归证据
 - [记忆归档规范复审与真实数据验证（2026-08-04）](./report/memory-archive-compliance-audit-2026-08-04.md) — 383,718 条真实记录只读扫描、主体归属边界与全项目回归证据
 - [Life Engine 模块说明](../plugins/life_engine/README.md) — 生命域的代码入口与运行链路

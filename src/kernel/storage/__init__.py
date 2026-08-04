@@ -29,10 +29,58 @@
 from __future__ import annotations
 
 from .core import JSONStore, json_store
+from .engine import (
+    MySQLStorageConfig,
+    SQLiteStorageConfig,
+    create_mysql_storage_engine,
+    create_sqlite_storage_engine,
+    mysql_storage_health,
+    sqlite_storage_health,
+)
+from .migration_runner import (
+    MigrationDriftError,
+    MigrationLockError,
+    MigrationResult,
+    MySQLMigrationRunner,
+    SchemaMigration,
+)
+from .outbox_primitives import (
+    CursorConflict,
+    ImmutableIdentity,
+    StableIdentityConflict,
+    canonical_json,
+    canonical_json_sha256,
+    compare_and_advance_cursor,
+)
+from .transaction import (
+    AfterCommitError,
+    AsyncUnitOfWork,
+    UnitOfWorkState,
+)
 
 __all__ = [
-    "json_store",
+    "AfterCommitError",
+    "AsyncUnitOfWork",
+    "CursorConflict",
+    "ImmutableIdentity",
     "JSONStore",
+    "MigrationDriftError",
+    "MigrationLockError",
+    "MigrationResult",
+    "MySQLMigrationRunner",
+    "MySQLStorageConfig",
+    "SQLiteStorageConfig",
+    "SchemaMigration",
+    "StableIdentityConflict",
+    "UnitOfWorkState",
+    "canonical_json",
+    "canonical_json_sha256",
+    "compare_and_advance_cursor",
+    "create_mysql_storage_engine",
+    "create_sqlite_storage_engine",
+    "json_store",
+    "mysql_storage_health",
+    "sqlite_storage_health",
 ]
 
 # 版本信息
