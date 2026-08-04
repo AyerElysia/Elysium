@@ -368,6 +368,7 @@ app_api_v1_max_websocket_connections = 64
 - 当前只挂载 P3-01 的五个认证端点；bootstrap、capabilities、readiness 等领域接口属于后续步骤，不能因为 OpenAPI 可访问就宣称阶段三全部完成；
 - 受信启动器通过 `AuthStore.create_bootstrap_challenge()` 生成绑定 Origin、安装实例和短 TTL 的一次性 challenge；公共 HTTP 不提供匿名 challenge 生成端点；
 - 备份认证库时必须同时保护签名密钥；恢复后验证旧撤销 session 仍不可用、refresh 不能重放、ticket 只能消费一次。签名密钥遗失时旧 token 不可恢复，必须按凭据失效事故处理，不得临时生成密钥伪装连续会话。
+- API mount 是启动过程中按配置取得的可选资源。关闭流程只关闭已经成功取得的 mount；若初始化在挂载前失败或测试使用部分构造的 `Bot`，缺少该属性必须按“从未取得”幂等跳过，不能阻断 MCP、数据库、向量库和日志等后续资源回收。
 
 定向验收：
 
