@@ -15,16 +15,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import json_repair
 
 from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
-from src.kernel.llm import LLMPayload, ROLE, Text
+from src.kernel.llm import ROLE, LLMPayload, Text
 
 from .models import Evidence, EvidenceKind, Insight
+from .projection import project_learning_text
 from .prompts import (
     REFLECTION_INTERACTION_USER,
     REFLECTION_INTROSPECTION_USER,
@@ -37,6 +38,7 @@ logger = logging.getLogger("life_engine.learning.reflection")
 
 # 反思冷却（秒）
 _DEFAULT_COOLDOWN_SECONDS = 30 * 60  # 30 分钟
+
 
 class ReflectionEngine:
     """快环反思引擎：从经历中提取洞察候选。"""
@@ -61,16 +63,22 @@ class ReflectionEngine:
         self._memory_service = memory_service
         self._lock = asyncio.Lock()
         self._last_reflection_at: float = 0.0
+        self._last_projection_stats: dict[str, Any] = {}
 
     def attach_memory_service(self, memory_service: Any) -> None:
         """晚绑定记忆服务（构造顺序无法保证时使用）。"""
         if memory_service is not None:
             self._memory_service = memory_service
 
+    def projection_health(self) -> dict[str, Any]:
+        """Return content-free hashes and byte budgets for the last request."""
+
+        return dict(self._last_projection_stats)
+
     @property
     def can_reflect(self) -> bool:
         """是否在冷却期外。"""
-        now = datetime.now(timezone.utc).timestamp()
+        now = datetime.now(UTC).timestamp()
         return (now - self._last_reflection_at) >= self._cooldown_seconds
 
     async def reflect_on_interaction(
@@ -79,6 +87,7 @@ class ReflectionEngine:
         interaction_text: str,
         context: str = "",
         source_event_ids: list[str] | None = None,
+        actor_consciousness_instance_id: str = "",
     ) -> list[Insight]:
         """交互反思：从一段对话/交互中提取洞察。
 
@@ -96,16 +105,42 @@ class ReflectionEngine:
         if not interaction_text or not interaction_text.strip():
             return []
 
+        layers = {
+            "context": project_learning_text(
+                context or "（无补充上下文）",
+                max_bytes=8 * 1024,
+                projection_kind="reflection_context",
+            ),
+            "interaction": project_learning_text(
+                interaction_text,
+                max_bytes=32 * 1024,
+                projection_kind="reflection_interaction",
+            ),
+            "existing": project_learning_text(
+                self._build_existing_summary(),
+                max_bytes=16 * 1024,
+                projection_kind="reflection_existing_insights",
+            ),
+            "skills": project_learning_text(
+                self._build_skill_section(),
+                max_bytes=4 * 1024,
+                projection_kind="reflection_skills",
+            ),
+        }
         user_prompt = REFLECTION_INTERACTION_USER.format(
-            context=context or "（无补充上下文）",
-            interaction_text=interaction_text,
-            existing_summary=self._build_existing_summary(),
-            skill_section=self._build_skill_section(),
+            context=layers["context"].text,
+            interaction_text=layers["interaction"].text,
+            existing_summary=layers["existing"].text,
+            skill_section=layers["skills"].text,
         )
+        self._last_projection_stats = {
+            name: projection.stats() for name, projection in layers.items()
+        }
         return await self._run_reflection(
             user_prompt=user_prompt,
             source_event_ids=source_event_ids or [],
             reflection_type="interaction",
+            actor_consciousness_instance_id=actor_consciousness_instance_id,
         )
 
     async def reflect_on_internal(
@@ -114,6 +149,7 @@ class ReflectionEngine:
         internal_text: str,
         context: str = "",
         source_event_ids: list[str] | None = None,
+        actor_consciousness_instance_id: str = "",
     ) -> list[Insight]:
         """内省反思：从思考/梦境/自主行为中提取自我认知洞察。
 
@@ -131,15 +167,36 @@ class ReflectionEngine:
         if not internal_text or not internal_text.strip():
             return []
 
+        layers = {
+            "context": project_learning_text(
+                context or "（无补充上下文）",
+                max_bytes=8 * 1024,
+                projection_kind="introspection_context",
+            ),
+            "internal": project_learning_text(
+                internal_text,
+                max_bytes=32 * 1024,
+                projection_kind="introspection_experience",
+            ),
+            "existing": project_learning_text(
+                self._build_existing_summary(),
+                max_bytes=16 * 1024,
+                projection_kind="introspection_existing_insights",
+            ),
+        }
         user_prompt = REFLECTION_INTROSPECTION_USER.format(
-            context=context or "（无补充上下文）",
-            internal_text=internal_text,
-            existing_summary=self._build_existing_summary(),
+            context=layers["context"].text,
+            internal_text=layers["internal"].text,
+            existing_summary=layers["existing"].text,
         )
+        self._last_projection_stats = {
+            name: projection.stats() for name, projection in layers.items()
+        }
         return await self._run_reflection(
             user_prompt=user_prompt,
             source_event_ids=source_event_ids or [],
             reflection_type="introspection",
+            actor_consciousness_instance_id=actor_consciousness_instance_id,
         )
 
     async def _run_reflection(
@@ -148,16 +205,18 @@ class ReflectionEngine:
         user_prompt: str,
         source_event_ids: list[str],
         reflection_type: str,
+        actor_consciousness_instance_id: str = "",
     ) -> list[Insight]:
         """执行一次反思：调用 LLM → 解析 → 门禁 → 写入。"""
         async with self._lock:
-            self._last_reflection_at = datetime.now(timezone.utc).timestamp()
-
-        try:
-            raw_text = await self._call_llm(user_prompt)
-        except Exception as exc:
-            logger.warning(f"反思 LLM 调用失败: {exc}")
-            return []
+            if not self.can_reflect:
+                return []
+            try:
+                raw_text = await self._call_llm(user_prompt)
+            except Exception as exc:
+                logger.warning(f"反思 LLM 调用失败: {type(exc).__name__}")
+                raise
+            self._last_reflection_at = datetime.now(UTC).timestamp()
 
         candidates = self._parse_candidates(raw_text)
         if not candidates:
@@ -197,10 +256,12 @@ class ReflectionEngine:
 
         # 每次理解都作为新解释留下；是否修正、延续或推翻旧理解由意识显式
         # 写关系，代码不再从措辞或相似度猜测。
-        if persisted:
+        actor = str(actor_consciousness_instance_id or "").strip()
+        if persisted and actor:
             await self._record_memory_interpretations(
                 persisted,
                 reflection_type=reflection_type,
+                actor_consciousness_instance_id=actor,
             )
 
         return results
@@ -210,8 +271,9 @@ class ReflectionEngine:
         insights: list[Insight],
         *,
         reflection_type: str,
+        actor_consciousness_instance_id: str,
     ) -> None:
-        """Append every reflection as a source-linked, immutable interpretation."""
+        """Append an explicitly attributed, source-linked interpretation."""
 
         if self._memory_service is None or not insights:
             return
@@ -226,7 +288,10 @@ class ReflectionEngine:
                         [
                             *(f"life_event:{item}" for item in insight.source_events),
                             *(
-                                str(item.source_ref or f"learning_evidence:{item.evidence_id}")
+                                str(
+                                    item.source_ref
+                                    or f"learning_evidence:{item.evidence_id}"
+                                )
                                 for item in insight.evidence
                             ),
                         ]
@@ -240,14 +305,15 @@ class ReflectionEngine:
                         else f"learning_insight:{insight.insight_id}"
                     ),
                     content=insight.claim,
-                    authored_by="life_reflection",
-                    consciousness_instance_id="life_engine",
+                    authored_by=actor_consciousness_instance_id,
+                    consciousness_instance_id=actor_consciousness_instance_id,
                     recorded_at=insight.born_at,
                     metadata={
                         "insight_id": insight.insight_id,
                         "rationale": insight.rationale,
                         "constraints": insight.constraints,
                         "reflection_type": reflection_type,
+                        "authority": "active_consciousness_reflection",
                     },
                 )
                 sources = tuple(
@@ -264,16 +330,25 @@ class ReflectionEngine:
                     sources=sources,
                 )
             except Exception as exc:
-                logger.warning(f"反思解释写入记忆账本失败: {exc}")
+                logger.warning(
+                    "反思解释写入记忆账本失败: %s",
+                    type(exc).__name__,
+                )
 
     async def _call_llm(self, user_prompt: str) -> str:
         """调用 LLM 进行反思。"""
+        delivered = project_learning_text(
+            user_prompt,
+            max_bytes=64 * 1024,
+            projection_kind="reflection_request",
+        )
+        self._last_projection_stats["request"] = delivered.stats()
         request = create_llm_request(
             get_model_set_by_task(self._model_task_name),
             request_name="life_learning_reflection",
         )
         request.add_payload(LLMPayload(ROLE.SYSTEM, Text(REFLECTION_SYSTEM_PROMPT)))
-        request.add_payload(LLMPayload(ROLE.USER, Text(user_prompt)))
+        request.add_payload(LLMPayload(ROLE.USER, Text(delivered.text)))
 
         response = await asyncio.wait_for(
             request.send(auto_append_response=False, stream=False),
@@ -313,13 +388,15 @@ class ReflectionEngine:
             initial_evidence: list[Evidence] = []
             evidence_desc = str(item.get("initial_evidence", "") or "").strip()
             if evidence_desc:
-                initial_evidence.append(Evidence.create(
-                    kind=EvidenceKind.INTERACTION_OUTCOME,
-                    description=evidence_desc,
-                    source_ref=str(item.get("source_ref", "") or ""),
-                    supports=True,
-                    weight=1.0,
-                ))
+                initial_evidence.append(
+                    Evidence.create(
+                        kind=EvidenceKind.INTERACTION_OUTCOME,
+                        description=evidence_desc,
+                        source_ref=str(item.get("source_ref", "") or ""),
+                        supports=True,
+                        weight=1.0,
+                    )
+                )
 
             # category: 她写什么就是什么，不做映射
             category = str(item.get("category", "") or "").strip()
@@ -342,7 +419,7 @@ class ReflectionEngine:
 
     def _build_existing_summary(self) -> str:
         """构建已有洞察摘要（按 topic 分组）。
-    
+
         设计意图：
         - 按 topic 分组展示，让她更容易看到“这个桶里已经有一条了”
         - 给出 insight_id，方便她用 reinforces 字段直接挂接
@@ -352,27 +429,32 @@ class ReflectionEngine:
         all_insights = self._store.list_all()
         if not all_insights:
             return "（暂无已有洞察）"
-    
+
         # 只看还在流转中的
-        active = [ins for ins in all_insights if not ins.is_terminal] or list(all_insights)
-    
+        active = [ins for ins in all_insights if not ins.is_terminal] or list(
+            all_insights
+        )
+
         # 按 topic_key 分组
         from collections import defaultdict
+
         by_topic: dict[str, list] = defaultdict(list)
         for ins in active:
             topic = ins.topic_key or "未分类"
             by_topic[topic].append(ins)
-    
+
         lines = [
             "❗ 重要：如果你要说的和下面某条本质相同，用 reinforces 字段指向它的 insight_id。",
             "不要重新创建同一模式的改述——复现应该作为证据挂到已有洞察上。",
             "",
         ]
-    
+
         for topic, group in sorted(by_topic.items(), key=lambda x: -len(x[1])):
             lines.append(f"【{topic}】({len(group)} 条)")
             for ins in group:
-                status_mark = {"validated": "✓", "rejected": "✗", "candidate": "?"}.get(ins.status, "·")
+                status_mark = {"validated": "✓", "rejected": "✗", "candidate": "?"}.get(
+                    ins.status, "·"
+                )
                 lines.append(
                     f"  {status_mark} {ins.insight_id} 证据×{len(ins.evidence)} | {ins.claim}"
                 )
@@ -380,7 +462,7 @@ class ReflectionEngine:
                 if suggestion:
                     lines.append(f"    ↳ 审计: {suggestion}")
             lines.append("")
-    
+
         return format_existing_insights_summary("\n".join(lines))
 
     @staticmethod
@@ -396,10 +478,15 @@ class ReflectionEngine:
         """构建技能反馈段落。"""
         if self._skill_store is None:
             return ""
-        skills = getattr(self._skill_store, "list_skills", lambda: [])()
+        skills = getattr(self._skill_store, "list_skills", list)()
         if not skills:
             return ""
-        skill_names = [s.get("name", "") for s in skills if isinstance(s, dict)]
+        skill_names = [
+            str(getattr(skill, "name", "") or "").strip() for skill in skills
+        ]
+        skill_names = [name for name in skill_names if name]
+        if not skill_names:
+            return ""
         return f"\n<your_skills>\n{', '.join(skill_names)}\n</your_skills>\n"
 
     def _process_skill_feedback(self, raw_text: str) -> None:

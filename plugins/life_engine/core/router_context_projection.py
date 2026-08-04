@@ -330,33 +330,7 @@ class RouterContextProjection:
         return tuple(signature)
 
     def _read_sources(self) -> tuple[tuple[RouterContextSource, ...], str]:
-        sources: list[RouterContextSource] = []
-        digest = hashlib.sha256()
-        for name in ROUTER_CONTEXT_SOURCE_FILES:
-            path = (self.workspace / name).resolve()
-            if path.parent != self.workspace:
-                raise RuntimeError(f"router source escaped workspace: {name}")
-            try:
-                raw = path.read_bytes()
-            except FileNotFoundError:
-                if name == "SOUL.md":
-                    raise RuntimeError("SOUL.md is unavailable") from None
-                raw = b""
-            text = raw.decode("utf-8")
-            file_digest = hashlib.sha256(raw).hexdigest()
-            digest.update(name.encode("utf-8"))
-            digest.update(b"\0")
-            digest.update(len(raw).to_bytes(8, "big"))
-            digest.update(raw)
-            sources.append(
-                RouterContextSource(
-                    path=name,
-                    sha256=file_digest,
-                    size_bytes=len(raw),
-                    text=text,
-                )
-            )
-        return tuple(sources), digest.hexdigest()
+        return read_subject_authority_sources(self.workspace)
 
     def _restore_existing_version(
         self,
@@ -735,3 +709,38 @@ Compress semantically; do not select content by keywords, headings, line positio
         + "\n\n".join(source_blocks)
     )
     return system_prompt, user_prompt
+
+
+def read_subject_authority_sources(
+    workspace: str | Path,
+) -> tuple[tuple[RouterContextSource, ...], str]:
+    """Read exact SOUL+USER+MEMORY bytes and return their unified revision."""
+
+    root = Path(workspace).resolve()
+    sources: list[RouterContextSource] = []
+    digest = hashlib.sha256()
+    for name in ROUTER_CONTEXT_SOURCE_FILES:
+        path = (root / name).resolve()
+        if path.parent != root:
+            raise RuntimeError(f"subject authority source escaped workspace: {name}")
+        try:
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            if name == "SOUL.md":
+                raise RuntimeError("SOUL.md is unavailable") from None
+            raw = b""
+        text = raw.decode("utf-8")
+        file_digest = hashlib.sha256(raw).hexdigest()
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(raw)
+        sources.append(
+            RouterContextSource(
+                path=name,
+                sha256=file_digest,
+                size_bytes=len(raw),
+                text=text,
+            )
+        )
+    return tuple(sources), digest.hexdigest()

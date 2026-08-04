@@ -14,6 +14,7 @@ from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.core.router_context_projection import (
     RouterContextDraft,
     RouterContextProjection,
+    read_subject_authority_sources,
 )
 from plugins.life_engine.service import core as service_core
 from plugins.life_engine.service.core import LifeEngineService
@@ -294,6 +295,30 @@ def _write_sources(workspace: Path, *, user: str = "USER v1") -> None:
     (workspace / "SOUL.md").write_text("SOUL authority", encoding="utf-8")
     (workspace / "USER.md").write_text(user, encoding="utf-8")
     (workspace / "MEMORY.md").write_text("MEMORY authority", encoding="utf-8")
+
+
+def test_subject_authority_revision_tracks_each_exact_source(tmp_path: Path) -> None:
+    _write_sources(tmp_path)
+    sources, initial_revision = read_subject_authority_sources(tmp_path)
+
+    assert [source.path for source in sources] == ["SOUL.md", "USER.md", "MEMORY.md"]
+    assert all(len(source.sha256) == 64 for source in sources)
+    revisions = {initial_revision}
+    for name in ("SOUL.md", "USER.md", "MEMORY.md"):
+        path = tmp_path / name
+        original = path.read_bytes()
+        path.write_bytes(original + b"\nexact-change")
+        changed_sources, revision = read_subject_authority_sources(tmp_path)
+        assert revision not in revisions
+        assert next(item for item in changed_sources if item.path == name).size_bytes == len(
+            original
+        ) + len(b"\nexact-change")
+        revisions.add(revision)
+        path.write_bytes(original)
+
+    restored_sources, restored_revision = read_subject_authority_sources(tmp_path)
+    assert restored_revision == initial_revision
+    assert restored_sources == sources
 
 
 @pytest.mark.asyncio

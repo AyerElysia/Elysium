@@ -11,18 +11,21 @@ approval.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
-from datetime import datetime, timezone
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import json_repair
 
 from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
-from src.kernel.llm import LLMPayload, ROLE, Text
+from src.kernel.llm import ROLE, LLMPayload, Text
 
 from .models import Insight, InsightNextAction, InsightStatus
+from .projection import project_learning_text
 from .prompts import (
     SKILL_DISTILL_SYSTEM,
     SKILL_DISTILL_USER,
@@ -30,7 +33,7 @@ from .prompts import (
     SKILL_GATE_USER,
     format_insights_for_compression,
 )
-from .skill_store import SkillMaturity, SkillPattern, SkillStore
+from .skill_store import SkillCandidate, SkillPattern, SkillStore
 from .store import InsightStore
 
 logger = logging.getLogger("life_engine.learning.skill_distiller")
@@ -53,6 +56,7 @@ class SkillDistiller:
         trigger_count: int = _DEFAULT_TRIGGER_COUNT,
         interval_hours: float = _DEFAULT_INTERVAL_HOURS,
         max_edits: int | None = None,
+        current_subject_revision: Callable[[], Awaitable[str]] | None = None,
     ) -> None:
         self._store = store
         self._skill_store = skill_store
@@ -60,11 +64,20 @@ class SkillDistiller:
         self._model_task_name = str(model_task_name or "life").strip() or "life"
         self._timeout = max(30.0, float(timeout_seconds or 90.0))
         self._trigger_count = max(1, int(trigger_count or _DEFAULT_TRIGGER_COUNT))
-        self._interval_hours = max(6.0, float(interval_hours or _DEFAULT_INTERVAL_HOURS))
+        self._interval_hours = max(
+            6.0, float(interval_hours or _DEFAULT_INTERVAL_HOURS)
+        )
         # Retained only so old callers/configuration continue to load.  The model
         # decides the coherent scope of an edit; orchestration does not cap it.
         del max_edits
         self._lock = asyncio.Lock()
+        self._last_projection_stats: dict[str, Any] = {}
+        self._current_subject_revision = current_subject_revision
+
+    def projection_health(self) -> dict[str, Any]:
+        """Return content-free trace metadata for the last skill requests."""
+
+        return dict(self._last_projection_stats)
 
     def should_distill(self) -> bool:
         distillable = self._collect_distillable_insights()
@@ -78,13 +91,18 @@ class SkillDistiller:
         if last_distill:
             try:
                 last_dt = datetime.fromisoformat(last_distill)
-                now = datetime.now(timezone.utc).astimezone()
+                now = datetime.now(UTC).astimezone()
                 hours_elapsed = (now - last_dt).total_seconds() / 3600.0
                 if hours_elapsed >= self._interval_hours and distillable:
                     return True
             except (ValueError, TypeError):
                 pass
         return False
+
+    def pending_count(self) -> int:
+        """Return a content-free count for health and scheduling evidence."""
+
+        return len(self._collect_distillable_insights())
 
     async def run_distillation(self) -> bool:
         async with self._lock:
@@ -124,33 +142,70 @@ class SkillDistiller:
 
             old_content = self._skill_content(existing_skill)
             new_content = self._proposal_content(result)
-            promote = await self._introspective_gate(
+            gate_recommended = await self._introspective_gate(
                 old_content=old_content,
                 new_content=new_content,
                 insight_count=len(distillable),
             )
-            if not promote:
-                if existing_skill is not None:
-                    self._skill_store.append_rejected_edit(
-                        existing_skill.skill_id,
-                        edit_summary=json.dumps(result, ensure_ascii=False),
-                        reason="introspective_gate_rejected",
-                    )
-                logger.info("Skill proposal was not accepted by introspective review")
+            if self._current_subject_revision is None:
+                logger.warning(
+                    "Skill proposal cannot be recorded without an exact current "
+                    "SOUL+USER+MEMORY revision"
+                )
+                return False
+            try:
+                subject_revision = await self._current_subject_revision()
+            except Exception as exc:
+                logger.warning(
+                    "Skill proposal subject revision is unavailable: %s",
+                    type(exc).__name__,
+                )
                 return False
 
-            persisted = self._apply_proposal(
-                result=result,
-                existing_skill=existing_skill,
-                insights=distillable,
+            insight_ids = [insight.insight_id for insight in distillable]
+            source_event_ids = sorted(
+                {
+                    source_event_id
+                    for insight in distillable
+                    for source_event_id in insight.source_events
+                    if source_event_id
+                }
             )
-            if not persisted:
-                logger.warning("Accepted skill proposal could not be persisted")
-                return False
-
-            for insight in distillable:
-                insight.next_action = InsightNextAction.ARCHIVE.value
-                self._store.update_insight(insight)
+            source_material = json.dumps(
+                {
+                    "insight_ids": insight_ids,
+                    "source_event_ids": source_event_ids,
+                    "subject_revision": subject_revision,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            proposed_skill_id = (
+                existing_skill.skill_id
+                if existing_skill is not None
+                else SkillPattern.create(
+                    name=result["name"],
+                    description=result["description"],
+                    instructions=result["instructions"],
+                ).skill_id
+            )
+            candidate = SkillCandidate.create(
+                subject_revision=subject_revision,
+                source_occurrence_id=(
+                    "skill_distillation:"
+                    + hashlib.sha256(source_material.encode("utf-8")).hexdigest()
+                ),
+                target_skill_id=(existing_skill.skill_id if existing_skill else ""),
+                proposed_skill_id=proposed_skill_id,
+                name=result["name"] or (existing_skill.name if existing_skill else ""),
+                description=result["description"],
+                instructions=result["instructions"],
+                insight_ids=insight_ids,
+                source_event_ids=source_event_ids,
+                gate_recommended=gate_recommended,
+            )
+            self._skill_store.append_candidate(candidate)
 
             state = self._store.load_state()
             state["last_skill_distill_at"] = _now_iso()
@@ -158,11 +213,17 @@ class SkillDistiller:
             return True
 
     def _collect_distillable_insights(self) -> list[Insight]:
+        already_proposed = {
+            insight_id
+            for candidate in self._skill_store.list_candidates()
+            for insight_id in candidate.insight_ids
+        }
         validated = self._store.list_by_status(InsightStatus.VALIDATED)
         return [
             insight
             for insight in validated
             if insight.next_action != InsightNextAction.ARCHIVE.value
+            and insight.insight_id not in already_proposed
         ]
 
     async def _distill(
@@ -177,6 +238,12 @@ class SkillDistiller:
             ),
             existing_skills=self._format_existing_skills(existing_skills),
         )
+        delivered = project_learning_text(
+            user_prompt,
+            max_bytes=96 * 1024,
+            projection_kind="skill_distillation_request",
+        )
+        self._last_projection_stats["distillation"] = delivered.stats()
 
         try:
             request = create_llm_request(
@@ -184,7 +251,7 @@ class SkillDistiller:
                 request_name="life_skill_distill",
             )
             request.add_payload(LLMPayload(ROLE.SYSTEM, Text(SKILL_DISTILL_SYSTEM)))
-            request.add_payload(LLMPayload(ROLE.USER, Text(user_prompt)))
+            request.add_payload(LLMPayload(ROLE.USER, Text(delivered.text)))
 
             response = await asyncio.wait_for(
                 request.send(auto_append_response=False, stream=False),
@@ -193,7 +260,10 @@ class SkillDistiller:
             raw_text = await asyncio.wait_for(response, timeout=self._timeout)
             return self._parse_distill_result(str(raw_text or ""))
         except Exception as exc:
-            logger.warning("Skill distillation request failed: %s", exc)
+            logger.warning(
+                "Skill distillation request failed: %s",
+                type(exc).__name__,
+            )
             return None
 
     async def _introspective_gate(
@@ -208,6 +278,12 @@ class SkillDistiller:
             new_content=new_content,
             insight_count=insight_count,
         )
+        delivered = project_learning_text(
+            user_prompt,
+            max_bytes=64 * 1024,
+            projection_kind="skill_gate_request",
+        )
+        self._last_projection_stats["gate"] = delivered.stats()
 
         try:
             request = create_llm_request(
@@ -215,7 +291,7 @@ class SkillDistiller:
                 request_name="life_skill_gate",
             )
             request.add_payload(LLMPayload(ROLE.SYSTEM, Text(SKILL_GATE_SYSTEM)))
-            request.add_payload(LLMPayload(ROLE.USER, Text(user_prompt)))
+            request.add_payload(LLMPayload(ROLE.USER, Text(delivered.text)))
 
             response = await asyncio.wait_for(
                 request.send(auto_append_response=False, stream=False),
@@ -224,35 +300,11 @@ class SkillDistiller:
             raw_text = await asyncio.wait_for(response, timeout=self._timeout)
             return self._parse_gate_result(str(raw_text or ""))
         except Exception as exc:
-            logger.warning("Introspective skill gate failed; proposal not accepted: %s", exc)
+            logger.warning(
+                "Introspective skill gate failed; proposal not accepted: %s",
+                type(exc).__name__,
+            )
             return False
-
-    def _apply_proposal(
-        self,
-        *,
-        result: dict[str, str],
-        existing_skill: SkillPattern | None,
-        insights: list[Insight],
-    ) -> bool:
-        insight_ids = [insight.insight_id for insight in insights]
-        if existing_skill is not None:
-            existing_skill.name = result["name"] or existing_skill.name
-            existing_skill.description = result["description"]
-            existing_skill.instructions = result["instructions"]
-            existing_skill.last_refined_at = _now_iso()
-            for insight_id in insight_ids:
-                if insight_id not in existing_skill.origin_insight_ids:
-                    existing_skill.origin_insight_ids.append(insight_id)
-            return self._skill_store.update_skill(existing_skill)
-
-        new_skill = SkillPattern.create(
-            name=result["name"],
-            description=result["description"],
-            instructions=result["instructions"],
-            maturity=SkillMaturity.EMERGING,
-            origin_insight_ids=insight_ids,
-        )
-        return self._skill_store.add_skill(new_skill)
 
     @staticmethod
     def _format_existing_skills(skills: list[SkillPattern]) -> str:
@@ -309,4 +361,4 @@ class SkillDistiller:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).astimezone().isoformat()
+    return datetime.now(UTC).astimezone().isoformat()

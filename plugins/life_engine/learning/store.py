@@ -21,12 +21,12 @@ from uuid import uuid4
 from .models import (
     AuditRecord,
     Evidence,
+    EvidenceKind,
     Insight,
     InsightNextAction,
     InsightStatus,
     KnowledgeVersion,
     ValidationExperiment,
-    EvidenceKind,
 )
 
 logger = logging.getLogger("life_engine.learning.store")
@@ -94,8 +94,9 @@ class InsightStore:
             self._loaded = True
             backup = self._backup_unreadable_ledger()
             logger.error(
-                f"❌ 洞察账本读不出来，本轮不会写入以免覆盖: {exc}"
-                + (f"（原文件已备份到 {backup.name}）" if backup else "")
+                "❌ 洞察账本读不出来，本轮不会写入以免覆盖: %s%s",
+                type(exc).__name__,
+                f"（原文件已备份到 {backup.name}）" if backup else "",
             )
             return
 
@@ -110,8 +111,9 @@ class InsightStore:
                 # 一行读不动不该拖垮整个账本，更不该让这一行凭空消失
                 self._unreadable_rows.append(item)
                 logger.warning(
-                    f"跳过一条读不出来的洞察（原样保留）: "
-                    f"{item.get('insight_id', '?')} - {exc}"
+                    "跳过一条读不出来的洞察（原样保留）: %s - %s",
+                    item.get("insight_id", "?"),
+                    type(exc).__name__,
                 )
         self._insights = parsed
         self._loaded = True
@@ -129,7 +131,7 @@ class InsightStore:
             backup.write_bytes(self.insights_path.read_bytes())
             return backup
         except OSError as exc:  # noqa: BLE001
-            logger.warning(f"备份损坏账本失败: {exc}")
+            logger.warning("备份损坏账本失败: %s", type(exc).__name__)
             return None
 
     def _save(self) -> None:
@@ -140,7 +142,7 @@ class InsightStore:
         """
         if self._load_failed:
             logger.error("❌ 账本处于读失败状态，拒绝写入（保护已有记录）")
-            return
+            raise RuntimeError("LearningInsightStoreUnavailable")
         self._ensure_dirs()
         rows: list[dict[str, Any]] = [ins.to_dict() for ins in self._insights]
         rows.extend(self._unreadable_rows)
@@ -541,17 +543,28 @@ class InsightStore:
         if not manifest_path.exists():
             return {"versions": [], "current_version": 0}
         try:
-            return json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return {"versions": [], "current_version": 0}
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, UnicodeError) as exc:
+            raise RuntimeError("LearningKnowledgeManifestUnavailable") from exc
+        if not isinstance(manifest, dict) or not isinstance(
+            manifest.get("versions", []), list
+        ):
+            raise RuntimeError("LearningKnowledgeManifestCorrupt")
+        return dict(manifest)
 
     def save_knowledge_manifest(self, manifest: dict[str, Any]) -> None:
+        if not isinstance(manifest, dict) or not isinstance(
+            manifest.get("versions", []), list
+        ):
+            raise TypeError("learning knowledge manifest must be an object")
         self._ensure_dirs()
         manifest_path = self.knowledge_dir / "manifest.json"
-        manifest_path.write_text(
+        temporary = manifest_path.with_suffix(".json.tmp")
+        temporary.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        temporary.replace(manifest_path)
 
     def get_current_knowledge_path(self) -> Path:
         return self.knowledge_dir / "self_knowledge.md"
@@ -560,7 +573,24 @@ class InsightStore:
         path = self.get_current_knowledge_path()
         if not path.exists():
             return ""
-        return path.read_text(encoding="utf-8", errors="replace")
+        try:
+            return path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise RuntimeError("LearningCurrentKnowledgeUnavailable") from exc
+
+    def read_knowledge_version(self, version: int) -> str:
+        """Read one immutable local candidate version without fallback."""
+
+        identity = int(version)
+        if identity <= 0:
+            raise ValueError("knowledge version must be positive")
+        path = self.knowledge_dir / f"v{identity}.md"
+        if not path.exists():
+            raise FileNotFoundError(path)
+        try:
+            return path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise RuntimeError("LearningKnowledgeVersionUnavailable") from exc
 
     def write_knowledge_version(
         self,
@@ -573,9 +603,15 @@ class InsightStore:
     ) -> KnowledgeVersion:
         """写入新版本自我认知文档。"""
         self._ensure_dirs()
+        if int(version) <= 0:
+            raise ValueError("knowledge version must be positive")
         # 写版本文件
         version_path = self.knowledge_dir / f"v{version}.md"
-        version_path.write_text(content, encoding="utf-8")
+        if version_path.exists():
+            raise ValueError(f"KnowledgeVersionConflict:{version}")
+        version_temporary = version_path.with_suffix(".md.tmp")
+        version_temporary.write_text(content, encoding="utf-8")
+        version_temporary.replace(version_path)
 
         kv = KnowledgeVersion(
             version=version,
@@ -595,7 +631,10 @@ class InsightStore:
         if promoted:
             manifest["current_version"] = version
             # 同时写入 self_knowledge.md
-            self.get_current_knowledge_path().write_text(content, encoding="utf-8")
+            current_path = self.get_current_knowledge_path()
+            current_temporary = current_path.with_suffix(".md.tmp")
+            current_temporary.write_text(content, encoding="utf-8")
+            current_temporary.replace(current_path)
         self.save_knowledge_manifest(manifest)
 
         self._append_audit({
@@ -613,16 +652,23 @@ class InsightStore:
         if not self.state_path.exists():
             return {}
         try:
-            return json.loads(self.state_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return {}
+            state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise RuntimeError("LearningStateUnavailable") from exc
+        if not isinstance(state, dict):
+            raise RuntimeError("LearningStateCorrupt")
+        return state
 
     def save_state(self, state: dict[str, Any]) -> None:
+        if not isinstance(state, dict):
+            raise TypeError("learning state must be an object")
         self._ensure_dirs()
-        self.state_path.write_text(
+        temp = self.state_path.with_suffix(".json.tmp")
+        temp.write_text(
             json.dumps(state, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        temp.replace(self.state_path)
 
     # ── 验证实验管理 ────────────────────────────────────────────
 
@@ -648,7 +694,7 @@ class InsightStore:
                 ],
             }
         except (json.JSONDecodeError, OSError) as exc:
-            logger.warning(f"加载验证实验失败: {exc}")
+            logger.warning("加载验证实验失败: %s", type(exc).__name__)
             self._experiments = {"pending": [], "completed": []}
         self._experiments_loaded = True
 

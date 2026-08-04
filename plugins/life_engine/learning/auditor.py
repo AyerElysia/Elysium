@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -22,7 +22,7 @@ from uuid import uuid4
 import json_repair
 
 from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
-from src.kernel.llm import LLMPayload, ROLE, Text
+from src.kernel.llm import ROLE, LLMPayload, Text
 
 from .models import (
     AuditRecord,
@@ -31,6 +31,7 @@ from .models import (
     InsightNextAction,
     InsightStatus,
 )
+from .projection import project_learning_text
 from .prompts import (
     AUDITOR_SYSTEM_PROMPT,
     AUDITOR_USER_TEMPLATE,
@@ -62,6 +63,12 @@ class InsightAuditor:
         self._timeout = max(15.0, float(timeout_seconds or 60.0))
         self._batch_size = max(1, int(batch_size or _DEFAULT_BATCH_SIZE))
         self._lock = asyncio.Lock()
+        self._last_projection_stats: dict[str, Any] = {}
+
+    def projection_health(self) -> dict[str, Any]:
+        """Return content-free trace metadata for the last audit request."""
+
+        return dict(self._last_projection_stats)
 
     async def run_audit_cycle(self) -> list[AuditRecord]:
         """执行一轮审计：取出候选 → 独立审计 → 更新状态。
@@ -107,13 +114,17 @@ class InsightAuditor:
             raw_text = await self._call_llm(insight)
             verdict_data = self._parse_verdict(raw_text)
         except Exception as exc:
-            logger.warning(f"审计 LLM 调用失败 [{insight.insight_id}]: {exc}")
+            logger.warning(
+                "审计 LLM 调用失败 [%s]: %s",
+                insight.insight_id,
+                type(exc).__name__,
+            )
             # 回退为 candidate
             self._store.transition_status(
                 insight.insight_id,
                 InsightStatus.CANDIDATE,
                 next_action=InsightNextAction.AWAIT_REVIEW,
-                reason=f"审计调用失败: {exc}",
+                reason=f"审计调用失败: {type(exc).__name__}",
             )
             return None
 
@@ -125,7 +136,9 @@ class InsightAuditor:
             verdict=verdict_data.get("verdict", AuditVerdict.NEEDS_MORE_EVIDENCE.value),
             reasoning=verdict_data.get("reasoning", ""),
             bias_detected=verdict_data.get("bias_detected", []),
-            evidence_sufficiency=float(verdict_data.get("evidence_sufficiency", 0.0) or 0.0),
+            evidence_sufficiency=float(
+                verdict_data.get("evidence_sufficiency", 0.0) or 0.0
+            ),
             suggestions=verdict_data.get("suggestions", ""),
         )
 
@@ -204,13 +217,19 @@ class InsightAuditor:
             ),
             context_text="（暂无额外上下文）",
         )
+        delivered = project_learning_text(
+            user_prompt,
+            max_bytes=64 * 1024,
+            projection_kind="learning_audit_request",
+        )
+        self._last_projection_stats = delivered.stats()
 
         request = create_llm_request(
             get_model_set_by_task(self._model_task_name),
             request_name="life_learning_audit",
         )
         request.add_payload(LLMPayload(ROLE.SYSTEM, Text(AUDITOR_SYSTEM_PROMPT)))
-        request.add_payload(LLMPayload(ROLE.USER, Text(user_prompt)))
+        request.add_payload(LLMPayload(ROLE.USER, Text(delivered.text)))
 
         response = await asyncio.wait_for(
             request.send(auto_append_response=False, stream=False),
@@ -239,16 +258,22 @@ class InsightAuditor:
 
         # 规范化 bias_detected
         bias_raw = parsed.get("bias_detected")
-        bias = [str(b).strip() for b in bias_raw if b] if isinstance(bias_raw, list) else []
+        bias = (
+            [str(b).strip() for b in bias_raw if b]
+            if isinstance(bias_raw, list)
+            else []
+        )
 
         return {
             "verdict": verdict,
             "reasoning": str(parsed.get("reasoning", "") or ""),
-            "evidence_sufficiency": max(0.0, min(1.0, float(parsed.get("evidence_sufficiency", 0.0) or 0.0))),
+            "evidence_sufficiency": max(
+                0.0, min(1.0, float(parsed.get("evidence_sufficiency", 0.0) or 0.0))
+            ),
             "bias_detected": bias,
             "suggestions": str(parsed.get("suggestions", "") or ""),
         }
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).astimezone().isoformat()
+    return datetime.now(UTC).astimezone().isoformat()

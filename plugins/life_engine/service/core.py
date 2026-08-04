@@ -282,6 +282,7 @@ class LifeEngineService(BaseService):
         self._storage_runtime: Any | None = None
         self._presence_world_stores: Any | None = None
         self._life_event_store: Any | None = None
+        self._learning_stores: Any | None = None
         self._subject_document_store: Any | None = None
         self._subject_workspace_observer: Any | None = None
         self._subject_workspace_projector: Any | None = None
@@ -593,6 +594,7 @@ class LifeEngineService(BaseService):
             return
         from ..storage.domain_factory import open_presence_world_stores
         from ..storage.event_factory import open_life_event_store
+        from ..storage.learning_factory import open_learning_stores
         from ..storage.subject_factory import open_subject_document_store
         from ..storage.subject_workspace import (
             SubjectWorkspaceObserver,
@@ -613,6 +615,13 @@ class LifeEngineService(BaseService):
             runtime,
             initialize_schema=False,
         )
+        learning_cfg = getattr(self._cfg(), "learning", None)
+        learning_stores = None
+        if learning_cfg is None or getattr(learning_cfg, "enabled", True):
+            learning_stores = await open_learning_stores(
+                runtime,
+                initialize_schema=False,
+            )
         workspace = Path(self._cfg().settings.workspace_path).resolve()
         subject_projector = SubjectWorkspaceProjector(
             subject_store,
@@ -637,6 +646,7 @@ class LifeEngineService(BaseService):
         await flush_presence_lifecycle_events(stores.presence, ledger)
         await gateway.catch_up()
         self._life_event_store = ledger
+        self._learning_stores = learning_stores
         self._presence_world_stores = stores
         self._subject_document_store = subject_store
         self._subject_workspace_observer = subject_observer
@@ -673,6 +683,7 @@ class LifeEngineService(BaseService):
         self._subject_workspace_observer = None
         self._subject_workspace_projector = None
         self._subject_document_store = None
+        self._learning_stores = None
         if runtime is not None:
             try:
                 await runtime.close()
@@ -1023,6 +1034,42 @@ class LifeEngineService(BaseService):
             str(stream_id or "").strip()
         )
         return owner.instance_id if owner is not None else "chat_global"
+
+    async def _current_learning_subject_revision(self) -> str:
+        """Read the exact unified subject revision without authoring a projection."""
+
+        from ..core.router_context_projection import read_subject_authority_sources
+
+        _, revision = await asyncio.to_thread(
+            read_subject_authority_sources,
+            self._workspace_dir(),
+        )
+        return revision
+
+    async def _project_learning_subject_authority_commit(
+        self,
+        target_path: Any,
+        commit: Any,
+    ) -> None:
+        """Make an accepted selected-store revision visible in the workspace."""
+
+        from ..storage.subject_contracts import subject_authority_logical_path
+
+        logical_path = subject_authority_logical_path(target_path)
+        await self._project_subject_version(
+            logical_path=logical_path,
+            version_id=str(commit.document_version_id),
+            max_tasks=int(commit.document_revision) + 1,
+        )
+        self.notify_subject_context_source_changed(
+            self._workspace_dir() / str(target_path)
+        )
+
+    async def _validate_learning_decision_actor(self, instance_id: str) -> bool:
+        """Validate that a learning decision comes from an active runtime window."""
+
+        instance = self.consciousness_registry.get(str(instance_id or "").strip())
+        return bool(instance is not None and instance.is_active)
 
     def report_world_observation_sync(
         self,
@@ -1789,15 +1836,20 @@ class LifeEngineService(BaseService):
             or self._subject_document_store is None
         ):
             return dict(self._storage_health_cache)
-        runtime_result, event_result, presence_result, world_result, subject_result = (
-            await asyncio.gather(
-                self._storage_runtime.health(),
-                self._life_event_store.health_snapshot(),
-                self._presence_world_stores.presence.health_snapshot(),
-                self._presence_world_stores.world.health_snapshot(),
-                self._subject_document_store.health_snapshot(),
-                return_exceptions=True,
+        component_checks: list[tuple[str, Any]] = [
+            ("runtime", self._storage_runtime.health()),
+            ("life_event", self._life_event_store.health_snapshot()),
+            ("presence", self._presence_world_stores.presence.health_snapshot()),
+            ("world", self._presence_world_stores.world.health_snapshot()),
+            ("subject_document", self._subject_document_store.health_snapshot()),
+        ]
+        if self._learning_stores is not None:
+            component_checks.append(
+                ("learning", self._learning_stores.store.health_snapshot())
             )
+        results = await asyncio.gather(
+            *(check for _, check in component_checks),
+            return_exceptions=True,
         )
 
         def normalized(name: str, value: Any) -> dict[str, Any]:
@@ -1810,11 +1862,8 @@ class LifeEngineService(BaseService):
             return dict(value)
 
         components = {
-            "runtime": normalized("storage_runtime", runtime_result),
-            "life_event": normalized("life_event_store", event_result),
-            "presence": normalized("consciousness_presence", presence_result),
-            "world": normalized("world_projection", world_result),
-            "subject_document": normalized("subject_document", subject_result),
+            name: normalized(name, result)
+            for (name, _), result in zip(component_checks, results, strict=True)
         }
         statuses = {
             str(item.get("status") or "healthy") for item in components.values()
@@ -1836,6 +1885,14 @@ class LifeEngineService(BaseService):
         """返回一个轻量健康信息。"""
         snapshot = self.snapshot()
         snapshot["storage_runtime"] = dict(self._storage_health_cache)
+        snapshot["learning"] = (
+            self._learning_scheduler.get_state()
+            if self._learning_scheduler is not None
+            else {
+                "status": "disabled",
+                "reason": "learning scheduler is not active",
+            }
+        )
         if self._selectable_storage_enabled:
             components = self._storage_health_cache.get("components") or {}
             snapshot["raw_event_ledger"] = dict(
@@ -4965,7 +5022,7 @@ class LifeEngineService(BaseService):
             sections.append(f"### 最近关键活动\n{salient_body}")
             new_event_high_water = max(new_event_high_water, salient_high_water)
 
-        # 学习系统注入：技能目录 + 自我认知（边界提醒，修复 chatter 反馈缺口）
+        # 学习系统只注入可质疑的派生账本；主体权威仍唯一来自 SOUL+USER+MEMORY。
         learning_cfg = getattr(cfg, "learning", None)
         if (
             self._learning_scheduler is not None
@@ -4976,12 +5033,18 @@ class LifeEngineService(BaseService):
                 max_chars=int(getattr(learning_cfg, "skill_catalog_max_chars", 600) or 600)
             )
             if skill_catalog:
-                sections.append(f"### 我的做事方式\n{skill_catalog}")
+                sections.append(
+                    "### 程序性学习账本（可质疑，非主体权威）\n"
+                    f"{skill_catalog}"
+                )
             knowledge_text = self._learning_scheduler.get_knowledge_for_prompt(
                 max_chars=int(getattr(learning_cfg, "knowledge_max_chars", 2000) or 2000)
             )
             if knowledge_text:
-                sections.append(f"### 自我认知\n{knowledge_text}")
+                sections.append(
+                    "### 学习观察账本（可质疑，非主体权威）\n"
+                    f"{knowledge_text}"
+                )
 
         # thought delta cursor 在渲染阶段直接提交（不等待 LLM 调用成功）
         if commit_cursors and new_thought_revision > thought_cursor:
@@ -5815,7 +5878,7 @@ class LifeEngineService(BaseService):
             try:
                 await self._learning_scheduler.on_heartbeat()
             except Exception as exc:  # noqa: BLE001
-                logger.debug(f"学习系统心跳异常: {exc}")
+                logger.debug("学习系统心跳异常: %s", type(exc).__name__)
 
         if not last_text:
             if tool_event_count > 0:
@@ -5946,11 +6009,37 @@ class LifeEngineService(BaseService):
             try:
                 from ..learning.scheduler import LearningScheduler
 
+                if self._selectable_storage_enabled and self._learning_stores is None:
+                    raise RuntimeError("SelectedLearningStorageNotStarted")
                 self._learning_scheduler = LearningScheduler(
                     workspace_path=cfg.settings.workspace_path,
                     model_task_name=getattr(cfg.model, "task_name", "core"),
-                    # 反思环需要记忆服务：把"我之前理解错了"落成显式修正记录
+                    # 反思候选可进入记忆检索；只有显式归属活跃意识实例的
+                    # 主动反思才写 subject-authored interpretation。
                     memory_service=self._memory_service,
+                    learning_store=(
+                        self._learning_stores.store
+                        if self._learning_stores is not None
+                        else None
+                    ),
+                    subject_authority=(
+                        self._subject_document_store
+                        if self._selectable_storage_enabled
+                        else None
+                    ),
+                    project_subject_commit=(
+                        self._project_learning_subject_authority_commit
+                        if self._selectable_storage_enabled
+                        else None
+                    ),
+                    current_subject_revision=(
+                        None
+                        if self._selectable_storage_enabled
+                        else self._current_learning_subject_revision
+                    ),
+                    validate_active_consciousness_instance=(
+                        self._validate_learning_decision_actor
+                    ),
                     audit_interval_hours=float(getattr(learning_cfg, "audit_interval_hours", 6.0) if learning_cfg else 6.0),
                     audit_batch_size=int(getattr(learning_cfg, "audit_batch_size", 3) if learning_cfg else 3),
                     compress_trigger_count=int(getattr(learning_cfg, "compress_trigger_count", 5) if learning_cfg else 5),
@@ -5986,10 +6075,18 @@ class LifeEngineService(BaseService):
                         "intent_timeout_seconds": cfg.minecraft.intent_timeout_seconds,
                     } if getattr(cfg, "minecraft", None) and cfg.minecraft.enabled else None,
                 )
+                await self._learning_scheduler.initialize()
                 logger.info("三环自学习系统已初始化")
             except Exception as exc:  # noqa: BLE001
-                logger.warning(f"三环自学习系统初始化失败: {exc}")
+                logger.warning(
+                    "三环自学习系统初始化失败: %s",
+                    type(exc).__name__,
+                )
                 self._learning_scheduler = None
+                if self._selectable_storage_enabled:
+                    raise RuntimeError(
+                        "SelectedLearningStorageInitializationFailed"
+                    ) from exc
 
         self._state.running = True
         self._state.started_at = _now_iso()
@@ -6223,6 +6320,19 @@ class LifeEngineService(BaseService):
         self._memory_index_task_id = None
         await self._await_managed_task(self._heartbeat_task_id, timeout=5.0)
         self._heartbeat_task_id = None
+
+        learning_scheduler = self._learning_scheduler
+        if learning_scheduler is not None:
+            try:
+                await learning_scheduler.close()
+            except Exception as exc:  # noqa: BLE001 - continue owned cleanup
+                shutdown_errors.append(exc)
+                logger.error(
+                    "关闭学习系统失败",
+                    exc_info=True,
+                )  # noqa: G201 - project Logger has no exception()
+            finally:
+                self._learning_scheduler = None
 
         memory_service = self._memory_service
         if memory_service is not None:

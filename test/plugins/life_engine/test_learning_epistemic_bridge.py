@@ -98,9 +98,9 @@ async def test_first_heartbeat_backfills_validated_insight_once(tmp_path) -> Non
     assert len(memory.claims) == 1
     claim = memory.claims[0]
     assert claim.claim_id == f"insight_{insight.insight_id}"
-    assert claim.subject_key == "insight:行为模式"
+    assert claim.subject_key == f"learning_insight:{insight.insight_id}"
     assert claim.content == insight.claim
-    assert claim.claim_kind == "learning_insight"
+    assert claim.claim_kind == "learning_candidate_observation"
     assert claim.source == "learning_system"
     assert claim.authority == "learning_audit_observation"
     assert claim.metadata == {

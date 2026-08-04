@@ -345,7 +345,7 @@ class RiverReflectionSection(HeartbeatSectionProvider):
 
 
 class SelfKnowledgeSection(HeartbeatSectionProvider):
-    """压缩后的自我认知文档，作为持续的身份背景。"""
+    """可修订的学习观察投影；绝不作为主体身份权威。"""
 
     section_id = "self_knowledge"
 
@@ -370,11 +370,11 @@ class SelfKnowledgeSection(HeartbeatSectionProvider):
         )
         if not knowledge:
             return None
-        return f"### 自我认知\n{knowledge}"
+        return f"### 学习观察账本（可质疑，非主体权威）\n{knowledge}"
 
 
 class LearningProgressSection(HeartbeatSectionProvider):
-    """近期学习进展（有新 validated/rejected 时简短提示）。"""
+    """近期学习账本状态；状态不是主体真值或价值判断。"""
 
     section_id = "learning_progress"
 
@@ -396,7 +396,7 @@ class LearningProgressSection(HeartbeatSectionProvider):
 
 
 class SkillCatalogSection(HeartbeatSectionProvider):
-    """技能目录——她知道自己发展出了哪些做事方式。
+    """程序性学习账本；由当前意识决定是否采用其中的做法。
 
     只呈现目录（description + 成熟度），不呈现完整 instructions。
     她决定什么时候细看。用不用、什么时候用，完全由她在推理中自主判断。
@@ -428,7 +428,7 @@ class SkillCatalogSection(HeartbeatSectionProvider):
         catalog = scheduler.get_skill_catalog_for_prompt(max_chars=max_chars)
         if not catalog:
             return None
-        return f"### 我的做事方式\n{catalog}"
+        return f"### 程序性学习账本（可质疑，非主体权威）\n{catalog}"
 
 
 class LeisureOpportunitySection(HeartbeatSectionProvider):

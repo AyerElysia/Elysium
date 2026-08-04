@@ -127,6 +127,17 @@ class _FakeSubjectStore:
         }
 
 
+class _FakeLearningStore:
+    async def health_snapshot(self) -> dict[str, Any]:
+        return {
+            "status": "healthy",
+            "backend": "fake",
+            "event_count": 0,
+            "latest_position": 0,
+            "projection_states": {},
+        }
+
+
 def _selected_service(tmp_path: Path, backend: BackendKind) -> LifeEngineService:
     config = LifeEngineConfig()
     config.settings.enabled = True
@@ -167,6 +178,7 @@ def _install_selected_factories(
     runtimes: list[_FakeRuntime] = []
     factory_calls: list[tuple[str, bool]] = []
     subject_store = _FakeSubjectStore()
+    learning_store = _FakeLearningStore()
 
     async def _open_runtime(_settings: Any) -> _FakeRuntime:
         runtime = _FakeRuntime(backend)
@@ -202,6 +214,15 @@ def _install_selected_factories(
         factory_calls.append(("subject", initialize_schema))
         return subject_store
 
+    async def _open_learning(
+        runtime: _FakeRuntime,
+        *,
+        initialize_schema: bool = False,
+    ) -> Any:
+        assert runtime.backend == backend
+        factory_calls.append(("learning", initialize_schema))
+        return SimpleNamespace(store=learning_store)
+
     monkeypatch.setattr(
         "plugins.life_engine.storage.factory.open_storage_backend",
         _open_runtime,
@@ -217,6 +238,10 @@ def _install_selected_factories(
     monkeypatch.setattr(
         "plugins.life_engine.storage.subject_factory.open_subject_document_store",
         _open_subject,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.storage.learning_factory.open_learning_stores",
+        _open_learning,
     )
     return runtimes, factory_calls
 
@@ -265,6 +290,7 @@ async def test_selected_service_uses_one_backend_for_presence_world_and_events(
         ("events", False),
         ("presence-world", False),
         ("subject", False),
+        ("learning", False),
     ]
     assert first.storage_runtime is runtimes[0]
     assert first.consciousness_registry.get(CHAT_GLOBAL_INSTANCE_ID) is not None
@@ -317,6 +343,9 @@ async def test_selected_service_uses_one_backend_for_presence_world_and_events(
     assert health["backend"] == backend.value
     assert first.health()["world_projection"]["rebuild_state"] == "idle"
     assert first.health()["subject_document"]["documents"] == 0
+    assert first.health()["storage_runtime"]["components"]["learning"][
+        "event_count"
+    ] == 0
 
     await first._close_selected_storage()
     assert runtimes[0].close_calls == 1
@@ -395,6 +424,11 @@ async def test_service_stop_aggregates_consumer_failures_and_closes_runtime_last
             assert runtimes[0].close_calls == 0
             raise RuntimeError("injected memory consumer close failure")
 
+    class _FailingLearningConsumer:
+        async def close(self) -> None:
+            assert runtimes[0].close_calls == 0
+            raise RuntimeError("injected learning consumer close failure")
+
     async def _no_op() -> None:
         return None
 
@@ -403,6 +437,7 @@ async def test_service_stop_aggregates_consumer_failures_and_closes_runtime_last
     await registry.touch(CHAT_GLOBAL_INSTANCE_ID)
     ledger.fail_appends = True
     service._memory_service = _FailingMemoryConsumer()  # type: ignore[assignment]
+    service._learning_scheduler = _FailingLearningConsumer()
     monkeypatch.setattr(service, "_save_runtime_context", _no_op)
     monkeypatch.setattr(core_module, "cleanup_autonomy_schedules", lambda *_: _no_op())
 
@@ -411,6 +446,7 @@ async def test_service_stop_aggregates_consumer_failures_and_closes_runtime_last
 
     rendered = "\n".join(str(item) for item in captured.value.exceptions)
     assert "injected memory consumer close failure" in rendered
+    assert "injected learning consumer close failure" in rendered
     assert "selected Presence/World storage shutdown failed" in rendered
     assert runtimes[0].close_calls == 1
 
