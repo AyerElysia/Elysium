@@ -816,6 +816,38 @@ class LifeEngineConfig(BaseConfig):
             description="两次慢环压缩之间的最小间隔（小时）。",
         )
 
+        subject_review_enabled: bool = Field(
+            default=True,
+            description=(
+                "是否提供 SOUL/USER/MEMORY 的低频复盘机会。"
+                "这只控制邀请，不授权后台改写。"
+            ),
+        )
+
+        subject_review_soul_interval_hours: float = Field(
+            default=720.0,
+            ge=24.0,
+            description="SOUL.md 两次复盘时间点之间的工程间隔（小时）。",
+        )
+
+        subject_review_user_interval_hours: float = Field(
+            default=720.0,
+            ge=24.0,
+            description="USER.md 两次复盘时间点之间的工程间隔（小时）。",
+        )
+
+        subject_review_memory_interval_hours: float = Field(
+            default=168.0,
+            ge=24.0,
+            description="MEMORY.md 两次复盘时间点之间的工程间隔（小时）。",
+        )
+
+        subject_review_offer_cooldown_hours: float = Field(
+            default=24.0,
+            ge=1.0,
+            description="复盘机会出现后至少多久不重复呈现（小时）。",
+        )
+
         knowledge_max_chars: int = Field(
             default=2000,
             ge=500,

@@ -10,12 +10,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.constants import LIFE_CHATTER_GLOBAL_CURSOR_KEY
+from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.service import LifeEngineService
 from plugins.life_engine.service.event_builder import (
-    EventType,
     RUNTIME_CONTEXT_FILE,
+    EventType,
 )
 from plugins.life_engine.service.event_bus import RAW_EVENT_LOG_FILE
 from src.kernel.llm import ROLE, ToolRegistry
@@ -168,15 +168,16 @@ def test_ensure_workspace_templates_creates_user_md(tmp_path: Path) -> None:
     assert "什么时候更新" in content
 
 
-def test_heartbeat_prompt_mentions_user_profile_maintenance(tmp_path: Path) -> None:
-    """心跳态应明确知道 USER.md 可用于长期用户画像维护。"""
+def test_heartbeat_prompt_routes_subject_changes_through_review(tmp_path: Path) -> None:
+    """Heartbeat must not instruct generic tools to mutate subject authority."""
     service = _make_service(tmp_path)
 
     prompt = "\n".join(service._build_prompt_header())
 
-    assert "USER.md 长期画像维护" in prompt
-    assert "长期画像、稳定偏好和互动边界" in prompt
-    assert "一时情绪、当天事件、猜测和流水账" in prompt
+    assert "SOUL.md`、`USER.md`、`MEMORY.md` 共同属于主体权威" in prompt
+    assert "nucleus_review_subject_document" in prompt
+    assert "通用 file/bash 不能直接修改" in prompt
+    assert "可以用文件工具谨慎更新" not in prompt
 
 
 def test_memory_maintenance_prompt_emits_once_per_interval(tmp_path: Path) -> None:
@@ -198,7 +199,9 @@ def test_memory_maintenance_prompt_emits_once_per_interval(tmp_path: Path) -> No
     first = service._build_memory_maintenance_prompt_if_due()
     second = service._build_memory_maintenance_prompt_if_due()
 
-    assert "MEMORY 维护任务" in first
+    assert "MEMORY.md 结构复盘信号" in first
+    assert "邀请，不是任务" in first
+    assert "不要用 file/bash 直接修改 MEMORY.md" in first
     assert second == ""
 
 

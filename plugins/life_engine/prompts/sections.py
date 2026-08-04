@@ -395,6 +395,27 @@ class LearningProgressSection(HeartbeatSectionProvider):
         return progress or None
 
 
+class SubjectReviewOpportunitySection(HeartbeatSectionProvider):
+    """Low-frequency invitation to revisit authority documents, never a task."""
+
+    section_id = "subject_review_opportunity"
+
+    def enabled(self, ctx: SectionContext) -> bool:
+        learning_cfg = getattr(ctx.config, "learning", None)
+        return bool(
+            learning_cfg is not None
+            and getattr(learning_cfg, "enabled", True)
+            and getattr(learning_cfg, "subject_review_enabled", True)
+        )
+
+    async def render(self, ctx: SectionContext) -> str | None:
+        scheduler = getattr(ctx.service, "_learning_scheduler", None)
+        if scheduler is None:
+            return None
+        prompt = await scheduler.get_subject_review_prompt()
+        return prompt or None
+
+
 class SkillCatalogSection(HeartbeatSectionProvider):
     """程序性学习账本；由当前意识决定是否采用其中的做法。
 
@@ -539,4 +560,5 @@ DEFAULT_HEARTBEAT_SECTIONS: list[HeartbeatSectionProvider] = [
     SelfKnowledgeSection(),
     SkillCatalogSection(),
     LearningProgressSection(),
+    SubjectReviewOpportunitySection(),
 ]

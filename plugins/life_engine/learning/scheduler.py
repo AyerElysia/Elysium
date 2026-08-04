@@ -13,16 +13,19 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
+import os
 from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from ..storage.learning_contracts import LearningStorePort
 from ..storage.subject_contracts import (
+    SUBJECT_AUTHORITY_PATHS,
     SubjectAuthorityCommit,
     SubjectDocumentPath,
 )
@@ -70,6 +73,13 @@ _DEFAULT_SKILL_DISTILL_TRIGGER_COUNT = 3
 _DEFAULT_SKILL_DISTILL_INTERVAL_HOURS = 24.0
 _DEFAULT_STALENESS_CHECK_INTERVAL_HOURS = 168.0  # 每周检查一次
 _DEFAULT_STALENESS_THRESHOLD_DAYS = 90
+_DEFAULT_SUBJECT_REVIEW_INTERVAL_HOURS: dict[SubjectDocumentPath, float] = {
+    "SOUL.md": 30.0 * 24.0,
+    "USER.md": 30.0 * 24.0,
+    "MEMORY.md": 7.0 * 24.0,
+}
+_DEFAULT_SUBJECT_REVIEW_OFFER_COOLDOWN_HOURS = 24.0
+_SUBJECT_REVIEW_STATE_KEY = "subject_review_v1"
 
 
 class LearningScheduler:
@@ -99,6 +109,19 @@ class LearningScheduler:
         # 陈旧检查参数
         staleness_check_interval_hours: float = _DEFAULT_STALENESS_CHECK_INTERVAL_HOURS,
         staleness_threshold_days: int = _DEFAULT_STALENESS_THRESHOLD_DAYS,
+        subject_review_enabled: bool = True,
+        subject_review_soul_interval_hours: float = (
+            _DEFAULT_SUBJECT_REVIEW_INTERVAL_HOURS["SOUL.md"]
+        ),
+        subject_review_user_interval_hours: float = (
+            _DEFAULT_SUBJECT_REVIEW_INTERVAL_HOURS["USER.md"]
+        ),
+        subject_review_memory_interval_hours: float = (
+            _DEFAULT_SUBJECT_REVIEW_INTERVAL_HOURS["MEMORY.md"]
+        ),
+        subject_review_offer_cooldown_hours: float = (
+            _DEFAULT_SUBJECT_REVIEW_OFFER_COOLDOWN_HOURS
+        ),
         # 记忆服务（用于把"修正型洞察"落成显式修正记录，形成记忆演化链）
         memory_service: Any | None = None,
         maintenance_journal: LearningMaintenanceJournalPort | None = None,
@@ -200,6 +223,19 @@ class LearningScheduler:
         self._metrics_interval_hours = max(1.0, metrics_interval_hours)
         self._staleness_check_interval_hours = max(24.0, staleness_check_interval_hours)
         self._staleness_threshold_days = max(30, staleness_threshold_days)
+        self._subject_review_enabled = bool(subject_review_enabled)
+        self._subject_review_intervals: dict[SubjectDocumentPath, float] = {
+            "SOUL.md": max(24.0, float(subject_review_soul_interval_hours)),
+            "USER.md": max(24.0, float(subject_review_user_interval_hours)),
+            "MEMORY.md": max(24.0, float(subject_review_memory_interval_hours)),
+        }
+        self._subject_review_offer_cooldown_hours = max(
+            1.0,
+            float(subject_review_offer_cooldown_hours),
+        )
+        self._subject_review_journal_path = (
+            self._workspace / ".life_learning" / "subject_reviews.jsonl"
+        )
 
         self._running = False
         self._last_audit_at: str = ""
@@ -208,6 +244,7 @@ class LearningScheduler:
         self._epistemic_backfilled = False
         self._maintenance_lock = asyncio.Lock()
         self._reflection_queue_lock = asyncio.Lock()
+        self._subject_review_lock = asyncio.Lock()
 
     async def initialize(self) -> None:
         """Restore bounded maintenance health without blocking the event loop."""
@@ -475,6 +512,362 @@ class LearningScheduler:
             await self.on_heartbeat()
         except Exception as exc:
             logger.warning("思考闭合反思异常: %s", type(exc).__name__)
+
+    # ── 主体文档复盘机会 ─────────────────────────────────────
+
+    def _subject_review_state(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        state = self.store.load_state()
+        review = state.get(_SUBJECT_REVIEW_STATE_KEY)
+        if not isinstance(review, dict):
+            review = {"schema_version": 1, "documents": {}}
+        documents = review.get("documents")
+        if not isinstance(documents, dict):
+            documents = {}
+            review["documents"] = documents
+        return state, review
+
+    @staticmethod
+    def _parse_review_time(value: object) -> datetime | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+
+    def _review_document_snapshot(
+        self,
+        *,
+        path: SubjectDocumentPath,
+        record: dict[str, Any],
+        now: datetime,
+        mark_offered: bool,
+    ) -> tuple[dict[str, Any], bool]:
+        target = self._workspace / path
+        exists = target.exists() and target.is_file()
+        changed_at: datetime | None = None
+        size_bytes = 0
+        content_sha256 = ""
+        if exists:
+            stat = target.stat()
+            changed_at = datetime.fromtimestamp(stat.st_mtime, tz=UTC)
+            size_bytes = int(stat.st_size)
+            content_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+
+        last_reviewed = self._parse_review_time(record.get("last_reviewed_at"))
+        baseline = max(
+            (item for item in (changed_at, last_reviewed) if item is not None),
+            default=now,
+        )
+        interval_hours = self._subject_review_intervals[path]
+        due_at = baseline + timedelta(hours=interval_hours)
+        snooze_until = self._parse_review_time(record.get("snooze_until"))
+        last_offered = self._parse_review_time(record.get("last_offered_at"))
+        offer_after = (
+            last_offered
+            + timedelta(hours=self._subject_review_offer_cooldown_hours)
+            if last_offered is not None
+            else None
+        )
+        due = bool(
+            self._subject_review_enabled
+            and exists
+            and now >= due_at
+            and (snooze_until is None or now >= snooze_until)
+            and (offer_after is None or now >= offer_after)
+        )
+        changed = False
+        if due and mark_offered:
+            record["last_offered_at"] = now.isoformat()
+            changed = True
+
+        return (
+            {
+                "target_path": path,
+                "exists": exists,
+                "size_bytes": size_bytes,
+                "content_sha256": content_sha256,
+                "interval_hours": interval_hours,
+                "changed_at": changed_at.isoformat() if changed_at else "",
+                "due_at": due_at.isoformat(),
+                "due": due,
+                "last_offered_at": str(record.get("last_offered_at") or ""),
+                "last_reviewed_at": str(record.get("last_reviewed_at") or ""),
+                "last_outcome": str(record.get("last_outcome") or ""),
+                "last_actor_consciousness_instance_id": str(
+                    record.get("last_actor_consciousness_instance_id") or ""
+                ),
+                "last_subject_revision": str(
+                    record.get("last_subject_revision") or ""
+                ),
+                "last_occurrence_id": str(record.get("last_occurrence_id") or ""),
+                "last_candidate_id": str(record.get("last_candidate_id") or ""),
+                "last_candidate_sha256": str(
+                    record.get("last_candidate_sha256") or ""
+                ),
+                "last_committed_subject_revision": str(
+                    record.get("last_committed_subject_revision") or ""
+                ),
+                "last_authority_occurrence_id": str(
+                    record.get("last_authority_occurrence_id") or ""
+                ),
+                "snooze_until": str(record.get("snooze_until") or ""),
+            },
+            changed,
+        )
+
+    async def get_subject_review_snapshot(
+        self,
+        *,
+        mark_offered: bool = False,
+    ) -> dict[str, Any]:
+        """Return a content-free review invitation, never a semantic verdict."""
+
+        revision = ""
+        revision_error = ""
+        if self._current_subject_revision is None:
+            revision_error = "subject_revision_unavailable"
+        else:
+            try:
+                revision = str(await self._current_subject_revision()).strip().lower()
+            except Exception as exc:  # noqa: BLE001 - health must remain available
+                revision_error = type(exc).__name__
+
+        async with self._subject_review_lock:
+            state, review = self._subject_review_state()
+            documents = review["documents"]
+            assert isinstance(documents, dict)
+            now = datetime.now(UTC)
+            snapshots: list[dict[str, Any]] = []
+            changed = False
+            for path in SUBJECT_AUTHORITY_PATHS:
+                raw_record = documents.get(path)
+                record = dict(raw_record) if isinstance(raw_record, dict) else {}
+                snapshot, document_changed = self._review_document_snapshot(
+                    path=path,
+                    record=record,
+                    now=now,
+                    mark_offered=mark_offered,
+                )
+                snapshots.append(snapshot)
+                if document_changed or not isinstance(raw_record, dict):
+                    documents[path] = record
+                    changed = True
+            if revision and str(
+                review.get("last_observed_subject_revision") or ""
+            ) != revision:
+                review["last_observed_subject_revision"] = revision
+                review["last_observed_at"] = now.isoformat()
+                changed = True
+            if changed:
+                state[_SUBJECT_REVIEW_STATE_KEY] = review
+                self.store.save_state(state)
+                await self.flush()
+
+        due_count = sum(bool(item["due"]) for item in snapshots)
+        pending_count = sum(
+            str(item.get("last_outcome") or "")
+            in {"candidate_proposed", "kept_open"}
+            for item in snapshots
+        )
+        return {
+            "status": (
+                "disabled"
+                if not self._subject_review_enabled
+                else "ready"
+                if not revision_error
+                else "degraded"
+            ),
+            "authority_status": (
+                "selected_ready"
+                if self.decision_ledger is not None
+                else "migration_required"
+            ),
+            "direct_mutation_blocked": True,
+            "subject_revision": revision,
+            "revision_error": revision_error,
+            "due_count": due_count,
+            "pending_candidate_count": pending_count,
+            "documents": snapshots,
+        }
+
+    async def get_subject_review_prompt(self) -> str:
+        """Render a bounded invitation; silence and no-change remain valid choices."""
+
+        snapshot = await self.get_subject_review_snapshot(mark_offered=True)
+        due = [item for item in snapshot["documents"] if item.get("due")]
+        if not due:
+            return ""
+        lines = [
+            "### 主体文档复盘机会（邀请，不是任务）",
+            "",
+            "以下文件到了可以重新看一眼的工程时间点；这不表示内容有错，也不要求修改。",
+        ]
+        for item in due:
+            lines.append(
+                f"- `{item['target_path']}`：上次内容变化 {item['changed_at'] or '未知'}"
+            )
+        lines.extend(
+            [
+                "- 你可以保持原样、稍后再看，或安静结束；后台不能替你解释或改写。",
+                "- 想复盘时使用 `nucleus_review_subject_document` 查看状态并记录你的选择。",
+            ]
+        )
+        if snapshot["authority_status"] == "selected_ready":
+            lines.append(
+                "- 若你形成了完整新版本，只能先提交候选，再单独使用主体候选决定工具接受；不会自动合并或自动接受。"
+            )
+        else:
+            lines.append(
+                "- 当前正式 Subject Authority 迁移尚未完成：可以记录保持不变或稍后再看，但新版本提交会明确拒绝，绝不退回直接写文件。"
+            )
+        return "\n".join(lines)
+
+    async def validate_subject_review_context(
+        self,
+        *,
+        actor_consciousness_instance_id: str,
+        expected_subject_revision: str,
+    ) -> str:
+        actor = str(actor_consciousness_instance_id or "").strip()
+        if self._validate_active_consciousness_instance is None:
+            raise RuntimeError("LearningPresenceGateUnavailable")
+        if not await self._validate_active_consciousness_instance(actor):
+            raise PermissionError("LearningDecisionActorIsNotActive")
+        if self._current_subject_revision is None:
+            raise RuntimeError("LearningSubjectRevisionUnavailable")
+        current = str(await self._current_subject_revision()).strip().lower()
+        expected = str(expected_subject_revision or "").strip().lower()
+        if not expected or current != expected:
+            raise RuntimeError("LearningSubjectRevisionConflict")
+        return current
+
+    async def current_subject_revision(self) -> str:
+        if self._current_subject_revision is None:
+            raise RuntimeError("LearningSubjectRevisionUnavailable")
+        return str(await self._current_subject_revision()).strip().lower()
+
+    def _append_local_subject_review_event(self, payload: dict[str, Any]) -> None:
+        self._subject_review_journal_path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+        descriptor = os.open(self._subject_review_journal_path, flags, 0o600)
+        try:
+            os.write(descriptor, f"{line}\n".encode())
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    async def record_subject_review_outcome(
+        self,
+        *,
+        target_path: SubjectDocumentPath,
+        outcome: str,
+        actor_consciousness_instance_id: str,
+        subject_revision: str,
+        occurrence_id: str,
+        reason: str,
+        candidate_id: str = "",
+        candidate_sha256: str = "",
+        authority_occurrence_id: str = "",
+        snooze_hours: float = 0.0,
+        immutable_evidence_recorded: bool = False,
+    ) -> dict[str, Any]:
+        """Project an active-instance review choice into bounded health state."""
+
+        if target_path not in SUBJECT_AUTHORITY_PATHS:
+            raise ValueError("invalid subject review target")
+        normalized_outcome = str(outcome or "").strip().lower()
+        if normalized_outcome not in {
+            "unchanged",
+            "candidate_proposed",
+            "snoozed",
+            "committed",
+            "rejected",
+            "kept_open",
+        }:
+            raise ValueError("invalid subject review outcome")
+        if not str(reason or "").strip():
+            raise ValueError("subject review reason must not be empty")
+        occurred_at = datetime.now(UTC)
+        event = {
+            "schema_version": 1,
+            "occurrence_id": str(occurrence_id),
+            "occurred_at": occurred_at.isoformat(),
+            "target_path": target_path,
+            "outcome": normalized_outcome,
+            "actor_consciousness_instance_id": str(
+                actor_consciousness_instance_id
+            ),
+            "subject_revision": str(subject_revision),
+            "reason": str(reason),
+            "candidate_id": str(candidate_id),
+            "candidate_sha256": str(candidate_sha256),
+            "authority_occurrence_id": str(authority_occurrence_id),
+            "authority": "review_evidence_only",
+        }
+        async with self._subject_review_lock:
+            state, review = self._subject_review_state()
+            documents = review["documents"]
+            assert isinstance(documents, dict)
+            raw_record = documents.get(target_path)
+            record = dict(raw_record) if isinstance(raw_record, dict) else {}
+            if (
+                str(record.get("last_occurrence_id") or "") == occurrence_id
+                and str(record.get("last_outcome") or "") == normalized_outcome
+            ):
+                return record
+            if self.decision_ledger is None:
+                if normalized_outcome == "candidate_proposed":
+                    raise RuntimeError("SubjectAuthorityMigrationRequired")
+                await asyncio.to_thread(self._append_local_subject_review_event, event)
+            elif not immutable_evidence_recorded and normalized_outcome in {
+                "unchanged",
+                "candidate_proposed",
+                "committed",
+                "rejected",
+                "kept_open",
+            }:
+                raise RuntimeError("SubjectReviewImmutableEvidenceRequired")
+            record.update(
+                {
+                    "last_outcome": normalized_outcome,
+                    "last_actor_consciousness_instance_id": str(
+                        actor_consciousness_instance_id
+                    ),
+                    "last_subject_revision": str(subject_revision),
+                    "last_occurrence_id": str(occurrence_id),
+                    "last_candidate_id": str(candidate_id),
+                    "last_candidate_sha256": str(candidate_sha256),
+                }
+            )
+            if normalized_outcome != "snoozed":
+                record["last_reviewed_at"] = occurred_at.isoformat()
+                record["snooze_until"] = ""
+            else:
+                bounded = max(1.0, min(30.0 * 24.0, float(snooze_hours)))
+                record["snooze_until"] = (
+                    occurred_at + timedelta(hours=bounded)
+                ).isoformat()
+            if normalized_outcome == "committed":
+                record["last_committed_subject_revision"] = str(subject_revision)
+                record["last_authority_occurrence_id"] = str(
+                    authority_occurrence_id
+                )
+            documents[target_path] = record
+            state[_SUBJECT_REVIEW_STATE_KEY] = review
+            self.store.save_state(state)
+            await self.flush()
+            return dict(record)
 
     # ── 心跳驱动入口 ─────────────────────────────────────────
 
@@ -1017,6 +1410,70 @@ class LearningScheduler:
 
     # ── 状态 ─────────────────────────────────────────────────
 
+    def _subject_review_health_snapshot(self) -> dict[str, Any]:
+        try:
+            _, review = self._subject_review_state()
+            documents = review["documents"]
+            assert isinstance(documents, dict)
+            now = datetime.now(UTC)
+            snapshots: list[dict[str, Any]] = []
+            for path in SUBJECT_AUTHORITY_PATHS:
+                raw = documents.get(path)
+                record = dict(raw) if isinstance(raw, dict) else {}
+                snapshot, _ = self._review_document_snapshot(
+                    path=path,
+                    record=record,
+                    now=now,
+                    mark_offered=False,
+                )
+                snapshots.append(snapshot)
+            missing = sum(not bool(item["exists"]) for item in snapshots)
+            due = sum(bool(item["due"]) for item in snapshots)
+            pending = sum(
+                str(item.get("last_outcome") or "")
+                in {"candidate_proposed", "kept_open"}
+                for item in snapshots
+            )
+            status = (
+                "disabled"
+                if not self._subject_review_enabled
+                else "degraded"
+                if missing
+                else "healthy"
+            )
+            return {
+                "status": status,
+                "authority_status": (
+                    "selected_ready"
+                    if self.decision_ledger is not None
+                    else "migration_required"
+                ),
+                "direct_mutation_blocked": True,
+                "due_count": due,
+                "pending_candidate_count": pending,
+                "missing_count": missing,
+                "last_observed_subject_revision": str(
+                    review.get("last_observed_subject_revision") or ""
+                ),
+                "last_observed_at": str(review.get("last_observed_at") or ""),
+                "documents": snapshots,
+            }
+        except Exception as exc:  # noqa: BLE001 - health must not raise
+            return {
+                "status": "degraded",
+                "authority_status": (
+                    "selected_ready"
+                    if self.decision_ledger is not None
+                    else "migration_required"
+                ),
+                "direct_mutation_blocked": True,
+                "due_count": 0,
+                "pending_candidate_count": 0,
+                "missing_count": 0,
+                "error_type": type(exc).__name__,
+                "documents": [],
+            }
+
     def get_state(self) -> dict[str, Any]:
         """获取学习系统当前状态。"""
         stats = self.store.get_stats()
@@ -1042,6 +1499,7 @@ class LearningScheduler:
                 ),
             },
             "maintenance": self.maintenance_journal.health_snapshot(),
+            "subject_review": self._subject_review_health_snapshot(),
             "selected_persistence": (
                 self._selected_persistence.health_snapshot()
                 if self._selected_persistence is not None

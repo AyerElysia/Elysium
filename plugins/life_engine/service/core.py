@@ -87,7 +87,6 @@ from ..constants import (
     LIFE_CHATTER_GLOBAL_CURSOR_KEY,
 )
 from ..memory.prompting import (
-    build_memory_maintenance_prompt,
     load_memory_prompt_data,
     render_memory_prompt,
     should_emit_memory_maintenance_prompt,
@@ -5430,9 +5429,10 @@ class LifeEngineService(BaseService):
             "有界编辑：每次 refine 只调一点，渐进式成长。", "",
             "### 工具边界", "",
             "- `nucleus_search_memory` 是历史检索，不要反复重搜同一主题",
-            "- 本地文件工具只用于你的私有工作区、日记、笔记、MEMORY 维护和 USER.md 长期画像维护，不用于替用户查项目或改项目",
-            "- `USER.md` 是对方的长期画像、稳定偏好和互动边界；当外界明确表达了长期偏好、称呼、边界或希望被记住的互动方式时，可以用文件工具谨慎更新",
-            "- 不要把一时情绪、当天事件、猜测和流水账写入 `USER.md`；这些应留在聊天历史、MEMORY、notes、thoughts 或 diaries",
+            "- 本地 file 工具只用于私有工作区中的日记、笔记和普通文件，不用于替用户查项目或改项目",
+            "- `SOUL.md`、`USER.md`、`MEMORY.md` 共同属于主体权威：通用 file/bash 不能直接修改",
+            "- 复盘三份主体文件时使用 `nucleus_review_subject_document`；后台只提供机会，保持原样、稍后再看和安静结束都有效",
+            "- 只有活跃意识基于精确内容哈希与统一 revision 提出完整候选，并另行明确接受，才可能改变主体权威；迁移未就绪时必须 fail closed",
             "- `nucleus_bash` 只用于诊断 life_engine 自己的工作区或工具链问题；不要拿它查项目配置、跑用户任务或处理外部操作",
             "- `nucleus_browser_fetch` / `nucleus_web_search` 只用于私有好奇心、记忆核验或长期主题整理，不用于替用户做即时检索任务",
             "- `nucleus_view_screen` 只在用户明确把屏幕上下文交给表达层时才应由表达层使用；心跳态不要为了好奇看屏幕",
@@ -5822,7 +5822,7 @@ class LifeEngineService(BaseService):
         return len(prepared) * 2
 
     def _build_memory_maintenance_prompt_if_due(self) -> str:
-        """在 MEMORY 需要整理时，周期性提醒本轮优先做维护。"""
+        """Expose structural pressure as a review signal, never a write task."""
         workspace = Path(self._cfg().settings.workspace_path)
         try:
             memory_data = load_memory_prompt_data(workspace)
@@ -5836,10 +5836,26 @@ class LifeEngineService(BaseService):
         ):
             return ""
 
-        prompt = build_memory_maintenance_prompt(memory_data)
-        if prompt:
-            self._last_memory_maintenance_prompt_at = _now_iso()
-        return prompt
+        self._last_memory_maintenance_prompt_at = _now_iso()
+        lines = [
+            "### MEMORY.md 结构复盘信号（邀请，不是任务）",
+            "",
+            (
+                f"当前文件约 {memory_data.size_bytes / 1024:.1f} KiB；"
+                f"Durable {len(memory_data.durable_items)} 条，"
+                f"Active {len(memory_data.active_items)} 条，"
+                f"Fading {len(memory_data.fading_items)} 条。"
+            ),
+        ]
+        lines.extend(f"- {reason}" for reason in memory_data.maintenance_reasons[:3])
+        lines.extend(
+            [
+                "- 这只是结构压力信号，不表示任何记忆应被删除、改写或重新解释。",
+                "- 你可以保持原样、稍后再看或安静结束；不要用 file/bash 直接修改 MEMORY.md。",
+                "- 若你主动复盘，请通过 `nucleus_review_subject_document` 绑定精确内容哈希与统一 revision。",
+            ]
+        )
+        return "\n".join(lines)
 
     async def _run_heartbeat_model(
         self,
@@ -6214,6 +6230,11 @@ class LifeEngineService(BaseService):
                     audit_batch_size=int(getattr(learning_cfg, "audit_batch_size", 3) if learning_cfg else 3),
                     compress_trigger_count=int(getattr(learning_cfg, "compress_trigger_count", 5) if learning_cfg else 5),
                     compress_interval_hours=float(getattr(learning_cfg, "compress_interval_hours", 48.0) if learning_cfg else 48.0),
+                    subject_review_enabled=bool(getattr(learning_cfg, "subject_review_enabled", True) if learning_cfg else True),
+                    subject_review_soul_interval_hours=float(getattr(learning_cfg, "subject_review_soul_interval_hours", 720.0) if learning_cfg else 720.0),
+                    subject_review_user_interval_hours=float(getattr(learning_cfg, "subject_review_user_interval_hours", 720.0) if learning_cfg else 720.0),
+                    subject_review_memory_interval_hours=float(getattr(learning_cfg, "subject_review_memory_interval_hours", 168.0) if learning_cfg else 168.0),
+                    subject_review_offer_cooldown_hours=float(getattr(learning_cfg, "subject_review_offer_cooldown_hours", 24.0) if learning_cfg else 24.0),
                     reflection_cooldown_minutes=float(getattr(learning_cfg, "reflection_cooldown_minutes", 30.0) if learning_cfg else 30.0),
                     skill_distill_trigger_count=int(getattr(learning_cfg, "skill_distill_trigger_count", 3) if learning_cfg else 3),
                     skill_distill_interval_hours=float(getattr(learning_cfg, "skill_distill_interval_hours", 24.0) if learning_cfg else 24.0),

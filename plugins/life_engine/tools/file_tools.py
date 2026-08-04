@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 logger = log_api.get_logger("life_engine.tools")
 
 _MEMORY_READ_MAX_BYTES = DEFAULT_MAX_DOCUMENT_BYTES
+_SUBJECT_AUTHORITY_PATHS = frozenset({"SOUL.md", "USER.md", "MEMORY.md"})
 
 
 def _get_workspace_read_only(plugin: Any) -> Path:
@@ -335,32 +336,23 @@ def _tool_trace_context(tool: Any) -> dict[str, str]:
     }
 
 
-async def _write_selected_subject_document(
-    tool: Any,
-    *,
-    path: str,
-    content: str,
-    encoding: str,
-    reason: str,
-    trace_context: dict[str, str],
-) -> dict[str, Any] | None:
-    """Route declared subject files through the selected immutable ledger."""
+def _subject_authority_path(plugin: Any, target: Path) -> str | None:
+    """Recognize exact authority files after symlink/path resolution."""
 
-    service = _get_life_engine_service(tool.plugin)
-    writer = getattr(service, "write_selected_subject_document", None)
-    if not callable(writer):
+    workspace = _get_workspace(plugin)
+    try:
+        relative = target.resolve().relative_to(workspace).as_posix()
+    except ValueError:
         return None
-    source_event_id = str(trace_context.get("source_event_id") or "")
-    return await writer(
-        workspace_relative_path=path,
-        content_bytes=content.encode(encoding),
-        occurrence_id=f"subject:file-tool:{uuid4().hex}",
-        recorded_by="life-engine-file-tool",
-        recorded_source=f"tool:{tool.tool_name}",
-        encoding=encoding,
-        semantic_actor_id="elysia",
-        semantic_source_id=source_event_id or None,
-        reason=reason,
+    return relative if relative in _SUBJECT_AUTHORITY_PATHS else None
+
+
+def _subject_direct_mutation_error(path: str) -> str:
+    return (
+        f"SubjectAuthorityDirectMutationBlocked: `{path}` 是统一主体权威的一部分，"
+        "通用 file 工具不能直接修改。请使用 nucleus_review_subject_document "
+        "查看精确 revision、记录保持不变/稍后再看，或在正式 Subject Authority "
+        "可用后提交候选并另行作出接受决定。"
     )
 
 
@@ -854,6 +846,7 @@ class LifeEngineWriteFileTool(BaseTool):
         "\n"
         "**⚠️ 注意：** 如果文件已存在，其全部内容会被覆盖。"
         "修改文件的局部内容，优先使用 nucleus_edit_file。\n"
+        "SOUL.md、USER.md、MEMORY.md 不能由本工具直接修改；请走主体复盘候选与显式决定链。\n"
         "**💡 记忆提示：** 写入新文件后，想一想它和已有文件有没有关联？"
         "用 nucleus_relate_file 建立关联可以帮助未来的回忆。"
     )
@@ -877,22 +870,16 @@ class LifeEngineWriteFileTool(BaseTool):
             return False, str(result)
 
         target = result
+        subject_path = _subject_authority_path(self.plugin, target)
+        if subject_path is not None:
+            return False, _subject_direct_mutation_error(subject_path)
         existed = target.exists()
         before_content = _read_trace_before_content(target, encoding)
 
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             trace_context = _tool_trace_context(self)
-            subject_commit = await _write_selected_subject_document(
-                self,
-                path=path,
-                content=content,
-                encoding=encoding,
-                reason=reason,
-                trace_context=trace_context,
-            )
-            if subject_commit is None:
-                await asyncio.to_thread(target.write_text, content, encoding=encoding)
+            await asyncio.to_thread(target.write_text, content, encoding=encoding)
             stat = target.stat()
             trace_id = _record_file_trace(
                 self.plugin,
@@ -928,7 +915,6 @@ class LifeEngineWriteFileTool(BaseTool):
                 "created": not existed,
                 "trace_id": trace_id,
                 "artifact_version_id": artifact_id,
-                "subject_document": subject_commit or {},
                 **(
                     {"warning": warning}
                     if (warning := build_memory_write_warning(path, content)) is not None
@@ -959,7 +945,8 @@ class LifeEngineEditFileTool(BaseTool):
         "\n"
         "**何时不用：**\n"
         "- ✗ 想重写整个文件 → 用 nucleus_write_file\n"
-        "- ✗ 还没看过文件内容 → 先用 nucleus_read_file"
+        "- ✗ 还没看过文件内容 → 先用 nucleus_read_file\n"
+        "- ✗ 修改 SOUL.md、USER.md、MEMORY.md → 用主体复盘候选与显式决定链"
     )
     chatter_allow: list[str] = ["life_engine_internal"]
 
@@ -983,6 +970,9 @@ class LifeEngineEditFileTool(BaseTool):
             return False, str(result)
 
         target = result
+        subject_path = _subject_authority_path(self.plugin, target)
+        if subject_path is not None:
+            return False, _subject_direct_mutation_error(subject_path)
         if not target.exists():
             return False, f"文件不存在: {path}"
         if not target.is_file():
@@ -1013,20 +1003,11 @@ class LifeEngineEditFileTool(BaseTool):
                 replacements = 1
 
             trace_context = _tool_trace_context(self)
-            subject_commit = await _write_selected_subject_document(
-                self,
-                path=path,
-                content=new_content,
+            await asyncio.to_thread(
+                target.write_text,
+                new_content,
                 encoding=encoding,
-                reason=reason,
-                trace_context=trace_context,
             )
-            if subject_commit is None:
-                await asyncio.to_thread(
-                    target.write_text,
-                    new_content,
-                    encoding=encoding,
-                )
             trace_id = _record_file_trace(
                 self.plugin,
                 path=path,
@@ -1060,7 +1041,6 @@ class LifeEngineEditFileTool(BaseTool):
                 "replacements": replacements,
                 "trace_id": trace_id,
                 "artifact_version_id": artifact_id,
-                "subject_document": subject_commit or {},
             }
         except UnicodeDecodeError as e:
             return False, f"文件编码错误: {e}"

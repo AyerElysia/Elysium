@@ -1,18 +1,19 @@
 """life_engine 命令执行工具。
 
-提供一个 workspace-scoped 的 Bash 工具。
+提供一个 workspace-scoped、文件系统只读的 Bash 工具。
 表达层可在用户请求需要终端时使用；life_engine 心跳态只用于诊断自身工作区或工具链。
 
 注意：
-- 这是 best-effort shell，不是 OS 级强隔离沙箱
-- 工作目录限制在 workspace 内
-- 不做命令白名单过滤，命令本身保留 shell 的完整表达力
+- 使用 Bubblewrap 把根文件系统挂载为只读，只有隔离的 /tmp 可写
+- 工作目录限制在 workspace 内；缺少隔离器时 fail closed
+- 命令保留 shell 表达力，但不能改写主体文件、工作区或宿主文件系统
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import signal
 import time
 from contextlib import suppress
@@ -84,12 +85,6 @@ def _resolve_cwd(plugin: Any, cwd: str) -> tuple[bool, Path | str]:
 
 def _build_shell_env(workspace: Path, cwd: Path) -> dict[str, str]:
     """构建尽量干净的 shell 环境。"""
-    tmp_root = workspace / ".shell"
-    tmp_dir = tmp_root / "tmp"
-    xdg_home = tmp_root / "xdg"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    xdg_home.mkdir(parents=True, exist_ok=True)
-
     env: dict[str, str] = {}
     for key, value in os.environ.items():
         upper = key.upper()
@@ -97,14 +92,14 @@ def _build_shell_env(workspace: Path, cwd: Path) -> dict[str, str]:
             continue
         env[key] = value
 
-    env["HOME"] = str(workspace)
+    env["HOME"] = "/tmp/home"
     env["PWD"] = str(cwd)
-    env["TMPDIR"] = str(tmp_dir)
-    env["TEMP"] = str(tmp_dir)
-    env["TMP"] = str(tmp_dir)
-    env["XDG_CACHE_HOME"] = str(xdg_home / "cache")
-    env["XDG_CONFIG_HOME"] = str(xdg_home / "config")
-    env["XDG_DATA_HOME"] = str(xdg_home / "data")
+    env["TMPDIR"] = "/tmp"
+    env["TEMP"] = "/tmp"
+    env["TMP"] = "/tmp"
+    env["XDG_CACHE_HOME"] = "/tmp/xdg/cache"
+    env["XDG_CONFIG_HOME"] = "/tmp/xdg/config"
+    env["XDG_DATA_HOME"] = "/tmp/xdg/data"
     env["SHELL"] = "/bin/bash"
     env.setdefault("LANG", "C.UTF-8")
     env.setdefault("LC_ALL", env["LANG"])
@@ -142,11 +137,11 @@ def _stop_process(process: Any) -> None:
 
 
 class LifeEngineBashTool(BaseTool):
-    """在 workspace 内执行 bash 命令。"""
+    """在 workspace 内以只读文件系统执行 bash 命令。"""
 
     tool_name: str = "nucleus_bash"
     tool_description: str = (
-        "在 workspace 内执行 bash 命令。这个工具同时暴露给表达层和 life_engine 心跳态，"
+        "在 workspace 内以文件系统只读隔离执行 bash 命令。这个工具同时暴露给表达层和 life_engine 心跳态，"
         "两种运行态的边界不同。"
         "\n\n"
         "**life_engine 心跳态边界（重要）：**\n"
@@ -157,17 +152,18 @@ class LifeEngineBashTool(BaseTool):
         "\n"
         "**life_chatter / 表达层用法：**\n"
         "- 只有用户请求或当前对话处理确实需要终端时使用。\n"
-        "- 适合查看 workspace 内文件、日志和产物，或做轻量批处理。\n"
+        "- 适合查看 workspace 内文件、日志和产物，或在临时 /tmp 做轻量计算。\n"
         "- 优先用最少轮次拿结果，能一条命令解决就别拆成多次调用。\n"
         "\n"
         "**何时不用：**\n"
-        "- 只是想读写单个文件 → 用 file 工具\n"
+        "- 只是想读写单个文件 → 读取用 file 工具；写入只能用对应的受控专用工具\n"
         "- 只是想搜记忆或网页 → 用 memory / web 工具\n"
         "- 没必要跑命令就能回答的问题\n"
         "\n"
         "**边界：**\n"
-        "- 只保证工作目录限制在 workspace 内\n"
-        "- 这是 best-effort shell，不是 OS 级强隔离沙箱"
+        "- 工作目录限制在 workspace 内，宿主文件系统由 Bubblewrap 只读挂载\n"
+        "- SOUL.md、USER.md、MEMORY.md 以及其他工作区文件均不能由 shell 改写\n"
+        "- 只有隔离的 /tmp 可写；缺少隔离器时命令会明确拒绝"
     )
     chatter_allow: list[str] = ["life_engine_internal", "life_chatter"]
 
@@ -212,6 +208,61 @@ class LifeEngineBashTool(BaseTool):
 
         workspace = _get_workspace(self.plugin)
         env = _build_shell_env(workspace, resolved_cwd)
+        sandbox_workspace = Path("/tmp/workspace")
+        sandbox_cwd = sandbox_workspace / resolved_cwd.relative_to(workspace)
+        env["PWD"] = str(sandbox_cwd)
+        bubblewrap = shutil.which("bwrap")
+        if not bubblewrap:
+            return False, {
+                "error": (
+                    "ReadOnlyShellSandboxUnavailable: 未找到 Bubblewrap，"
+                    "为避免绕过主体文件权威，命令已 fail closed。"
+                ),
+                "command": command_text,
+            }
+
+        sandbox_command = [
+            bubblewrap,
+            "--die-with-parent",
+            "--new-session",
+            "--unshare-pid",
+            "--unshare-net",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--cap-drop",
+            "ALL",
+            "--ro-bind",
+            "/",
+            "/",
+            "--dev-bind",
+            "/dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--tmpfs",
+            "/tmp",
+            "--dir",
+            str(sandbox_workspace),
+            "--ro-bind",
+            str(workspace),
+            str(sandbox_workspace),
+            "--dir",
+            "/tmp/home",
+            "--dir",
+            "/tmp/xdg",
+            "--dir",
+            "/tmp/xdg/cache",
+            "--dir",
+            "/tmp/xdg/config",
+            "--dir",
+            "/tmp/xdg/data",
+            "--chdir",
+            str(sandbox_cwd),
+            "--clearenv",
+        ]
+        for key, value in sorted(env.items()):
+            sandbox_command.extend(("--setenv", key, value))
+        sandbox_command.extend(("bash", "-lc", command_text))
 
         logger.info(
             f"[nucleus_bash] cwd={resolved_cwd} timeout={timeout_seconds}s "
@@ -221,11 +272,9 @@ class LifeEngineBashTool(BaseTool):
         started = time.perf_counter()
         try:
             process = await asyncio.create_subprocess_exec(
-                "bash",
-                "-lc",
-                command_text,
-                cwd=str(resolved_cwd),
-                env=env,
+                *sandbox_command,
+                cwd="/",
+                env={},
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,

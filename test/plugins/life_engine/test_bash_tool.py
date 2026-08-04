@@ -54,6 +54,39 @@ def test_bash_tool_blocks_file_writing_redirect(tmp_path: Path) -> None:
     assert not (tmp_path / "out.txt").exists()
 
 
+def test_bash_tool_mounts_workspace_read_only_even_for_python(tmp_path: Path) -> None:
+    target = tmp_path / "MEMORY.md"
+    target.write_text("original\n", encoding="utf-8")
+    tool = _make_tool(tmp_path)
+
+    ok, payload = asyncio.run(
+        tool.execute(
+            "python -c \"from pathlib import Path; "
+            "Path('MEMORY.md').write_text('bypass')\""
+        )
+    )
+
+    assert ok is False
+    assert isinstance(payload, dict)
+    assert payload["exit_code"] != 0
+    assert "Read-only file system" in payload["stderr"]
+    assert target.read_text(encoding="utf-8") == "original\n"
+
+
+def test_bash_tool_fails_closed_without_bubblewrap(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    tool = _make_tool(tmp_path)
+    monkeypatch.setattr(exec_tools.shutil, "which", lambda _name: None)
+
+    ok, payload = asyncio.run(tool.execute("printf harmless"))
+
+    assert ok is False
+    assert isinstance(payload, dict)
+    assert "ReadOnlyShellSandboxUnavailable" in payload["error"]
+
+
 def test_bash_tool_fails_closed_for_selected_subject_storage(
     tmp_path: Path,
     monkeypatch,

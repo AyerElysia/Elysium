@@ -14,13 +14,14 @@ import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 from uuid import uuid4
 
 from src.app.plugin_system.api import log_api
 from src.app.plugin_system.base import BaseTool
 
-from .decisions import LearningDecision
+from ..storage.subject_contracts import SubjectDocumentPath
+from .decisions import LearningCandidate, LearningDecision
 from .models import Evidence, EvidenceKind
 from .store import InsightStore
 
@@ -112,11 +113,21 @@ def _decision_occurrence(tool: BaseTool, material: str) -> str:
     if not message_identity:
         return f"learning_skill_decision:{uuid4().hex}"
     digest = hashlib.sha256(
-        f"{message_identity}\0{tool.get_current_stream_id()}\0{material}".encode(
-            "utf-8"
-        )
+        f"{message_identity}\0{tool.get_current_stream_id()}\0{material}".encode()
     ).hexdigest()
     return f"learning_skill_decision:{digest}"
+
+
+def _subject_review_occurrence(tool: BaseTool, material: str) -> str:
+    message_identity = str(
+        getattr(tool.trigger_message, "message_id", "") or ""
+    ).strip()
+    if not message_identity:
+        return f"subject_review:{uuid4().hex}"
+    digest = hashlib.sha256(
+        f"{message_identity}\0{tool.get_current_stream_id()}\0{material}".encode()
+    ).hexdigest()
+    return f"subject_review:{digest}"
 
 
 class LifeReflectNowTool(BaseTool):
@@ -409,6 +420,259 @@ class LifeViewKnowledgeTool(BaseTool):
         return True, result
 
 
+class LifeReviewSubjectDocumentTool(BaseTool):
+    """Expose review choices without granting a generic document write path."""
+
+    tool_name = "nucleus_review_subject_document"
+    tool_description = (
+        "复盘 SOUL.md、USER.md 或 MEMORY.md。status 只查看内容哈希、统一 revision "
+        "和复盘时间；unchanged 明确记录当前版本保持不变；snooze 表示稍后再看；"
+        "propose 只提交完整新版本候选，绝不会直接写文件或自动接受。"
+    )
+    chatter_allow = ["life_engine_internal"]
+
+    async def execute(
+        self,
+        action: Annotated[str, "status|unchanged|snooze|propose"] = "status",
+        target_path: Annotated[
+            str,
+            "SOUL.md|USER.md|MEMORY.md；status 留空时返回全部",
+        ] = "",
+        expected_subject_revision: Annotated[
+            str,
+            "status 返回的统一 SOUL+USER+MEMORY revision",
+        ] = "",
+        reviewed_content_sha256: Annotated[
+            str,
+            "status 返回的目标文件精确内容 SHA-256",
+        ] = "",
+        reason: Annotated[str, "当前意识作出此复盘选择的理由"] = "",
+        proposed_content: Annotated[
+            str,
+            "仅 propose：当前意识拟议的完整目标文档，不是局部补丁",
+        ] = "",
+        snooze_hours: Annotated[
+            float,
+            "仅 snooze：延后多久再次邀请，1-720 小时",
+        ] = 24.0,
+    ) -> tuple[bool, str | dict]:
+        scheduler = _get_scheduler(self.plugin)
+        if scheduler is None:
+            return False, "学习系统未初始化。"
+        normalized = str(action or "status").strip().lower()
+        if normalized not in {"status", "unchanged", "snooze", "propose"}:
+            return False, "action 必须是 status/unchanged/snooze/propose。"
+
+        if normalized == "status":
+            try:
+                snapshot = await scheduler.get_subject_review_snapshot(
+                    mark_offered=False
+                )
+            except Exception as exc:  # noqa: BLE001 - explicit tool refusal
+                return False, f"主体复盘状态不可用: {type(exc).__name__}"
+            selected_path = str(target_path or "").strip()
+            if selected_path:
+                documents = [
+                    item
+                    for item in snapshot["documents"]
+                    if item.get("target_path") == selected_path
+                ]
+                if not documents:
+                    return False, "target_path 必须是 SOUL.md/USER.md/MEMORY.md。"
+                snapshot = {**snapshot, "documents": documents}
+            return True, {"action": "subject_review_status", **snapshot}
+
+        target = str(target_path or "").strip()
+        if target not in {"SOUL.md", "USER.md", "MEMORY.md"}:
+            return False, "target_path 必须是 SOUL.md/USER.md/MEMORY.md。"
+        if not str(reason or "").strip():
+            return False, "复盘选择必须填写 reason。"
+
+        try:
+            _, actor = _decision_actor(self)
+            current_revision = await scheduler.validate_subject_review_context(
+                actor_consciousness_instance_id=actor,
+                expected_subject_revision=str(expected_subject_revision),
+            )
+            workspace = _get_workspace(self.plugin)
+            current_bytes = (workspace / target).read_bytes()
+            current_hash = hashlib.sha256(current_bytes).hexdigest()
+            if current_hash != str(reviewed_content_sha256 or "").strip().lower():
+                return False, (
+                    "目标文件内容已变化或尚未按 status 的精确哈希复盘；"
+                    "请重新读取 status 和文件原文。"
+                )
+            occurrence = _subject_review_occurrence(
+                self,
+                "\0".join(
+                    (
+                        normalized,
+                        target,
+                        current_revision,
+                        current_hash,
+                        hashlib.sha256(
+                            str(proposed_content).encode("utf-8")
+                        ).hexdigest(),
+                    )
+                ),
+            )
+            typed_target = cast(SubjectDocumentPath, target)
+
+            if normalized == "snooze":
+                record = await scheduler.record_subject_review_outcome(
+                    target_path=typed_target,
+                    outcome="snoozed",
+                    actor_consciousness_instance_id=actor,
+                    subject_revision=current_revision,
+                    occurrence_id=occurrence,
+                    reason=str(reason),
+                    snooze_hours=max(1.0, min(720.0, float(snooze_hours))),
+                )
+                return True, {
+                    "action": "subject_review_snoozed",
+                    "target_path": target,
+                    "subject_revision": current_revision,
+                    "occurrence_id": occurrence,
+                    "snooze_until": record.get("snooze_until", ""),
+                }
+
+            ledger = getattr(scheduler, "decision_ledger", None)
+            if normalized == "propose" and ledger is None:
+                return False, (
+                    "SubjectAuthorityMigrationRequired: 正式主体存储迁移尚未完成；"
+                    "新版本候选已拒绝提交，系统不会退回直接写 SOUL/USER/MEMORY。"
+                )
+
+            candidate_content = (
+                str(proposed_content).encode("utf-8")
+                if normalized == "propose"
+                else current_bytes
+            )
+            if len(candidate_content) > 240 * 1024:
+                return False, "完整候选超过单次 240 KiB 安全上限。"
+            if (
+                normalized == "propose"
+                and target == "SOUL.md"
+                and not candidate_content.strip()
+            ):
+                return False, "SOUL.md 候选不能为空。"
+
+            if ledger is None:
+                await scheduler.record_subject_review_outcome(
+                    target_path=typed_target,
+                    outcome="unchanged",
+                    actor_consciousness_instance_id=actor,
+                    subject_revision=current_revision,
+                    occurrence_id=occurrence,
+                    reason=str(reason),
+                )
+                return True, {
+                    "action": "subject_review_unchanged",
+                    "target_path": target,
+                    "subject_revision": current_revision,
+                    "content_sha256": current_hash,
+                    "occurrence_id": occurrence,
+                    "authority_status": "migration_required",
+                }
+
+            candidate_hash = hashlib.sha256(candidate_content).hexdigest()
+            candidate_id = f"{occurrence.replace(':', '_')}_{candidate_hash[:16]}"
+            source_occurrence_id = str(
+                getattr(self.trigger_message, "message_id", "") or occurrence
+            )
+            candidate = LearningCandidate.create(
+                candidate_id=candidate_id,
+                candidate_revision=1,
+                candidate_occurrence_id=f"{occurrence}:candidate",
+                candidate_kind=(
+                    "subject_document_revision"
+                    if normalized == "propose"
+                    else "subject_review_no_change"
+                ),
+                candidate_content_bytes=candidate_content,
+                source_occurrence_id=source_occurrence_id,
+                source="subject.review.active_consciousness",
+                actor_consciousness_instance_id=actor,
+                subject_revision=current_revision,
+                target_path=typed_target,
+                provenance={
+                    "surface": "life_engine_tool",
+                    "stream_id": self.get_current_stream_id(),
+                    "reviewed_content_sha256": current_hash,
+                    "authority": "candidate_only",
+                },
+            )
+            await ledger.append_candidate(candidate)
+
+            if normalized == "unchanged":
+                decision = LearningDecision(
+                    decision_occurrence_id=f"{occurrence}:unchanged",
+                    decision_kind="kept_open",
+                    candidate_id=candidate.candidate_id,
+                    candidate_revision=candidate.candidate_revision,
+                    candidate_sha256=candidate.candidate_sha256,
+                    candidate_occurrence_id=candidate.candidate_occurrence_id,
+                    actor_consciousness_instance_id=actor,
+                    expected_subject_revision=current_revision,
+                    occurred_at=datetime.now(UTC).isoformat(),
+                    reason=str(reason),
+                    provenance={
+                        "surface": "life_engine_tool",
+                        "stream_id": self.get_current_stream_id(),
+                        "review_outcome": "unchanged",
+                    },
+                )
+                receipt = await ledger.record_decision(decision)
+                await scheduler.record_subject_review_outcome(
+                    target_path=typed_target,
+                    outcome="unchanged",
+                    actor_consciousness_instance_id=actor,
+                    subject_revision=current_revision,
+                    occurrence_id=decision.decision_occurrence_id,
+                    reason=str(reason),
+                    candidate_id=candidate.candidate_id,
+                    candidate_sha256=candidate.candidate_sha256,
+                    immutable_evidence_recorded=True,
+                )
+                return True, {
+                    "action": "subject_review_unchanged",
+                    "target_path": target,
+                    "subject_revision": current_revision,
+                    "content_sha256": current_hash,
+                    "candidate_id": candidate.candidate_id,
+                    "decision_occurrence_id": receipt.decision_occurrence_id,
+                    "authority_status": "selected_ready",
+                }
+
+            await scheduler.record_subject_review_outcome(
+                target_path=typed_target,
+                outcome="candidate_proposed",
+                actor_consciousness_instance_id=actor,
+                subject_revision=current_revision,
+                occurrence_id=candidate.candidate_occurrence_id,
+                reason=str(reason),
+                candidate_id=candidate.candidate_id,
+                candidate_sha256=candidate.candidate_sha256,
+                immutable_evidence_recorded=True,
+            )
+            return True, {
+                "action": "subject_review_candidate_proposed",
+                "target_path": target,
+                "candidate_id": candidate.candidate_id,
+                "candidate_revision": candidate.candidate_revision,
+                "candidate_sha256": candidate.candidate_sha256,
+                "candidate_occurrence_id": candidate.candidate_occurrence_id,
+                "subject_revision": current_revision,
+                "status": "open",
+                "note": (
+                    "候选仍在主体权威之外。请先重新读取候选；只有另行调用 "
+                    "nucleus_decide_subject_candidate accepted 才会尝试提交。"
+                ),
+            }
+        except Exception as exc:  # noqa: BLE001 - explicit tool refusal
+            return False, f"主体复盘选择未记录: {type(exc).__name__}"
+
+
 class LifeListSubjectCandidatesTool(BaseTool):
     """List derived document proposals outside subject authority."""
 
@@ -613,6 +877,29 @@ class LifeDecideSubjectCandidateTool(BaseTool):
             )
         except Exception as exc:  # noqa: BLE001 - explicit tool refusal
             return False, f"主体候选决定未提交: {type(exc).__name__}"
+        review_health_warning = ""
+        try:
+            recorded_revision = (
+                await scheduler.current_subject_revision()
+                if receipt.status == "committed"
+                else str(expected_subject_revision)
+            )
+            await scheduler.record_subject_review_outcome(
+                target_path=candidate.target_path,
+                outcome=(
+                    "committed" if receipt.status == "committed" else normalized
+                ),
+                actor_consciousness_instance_id=actor,
+                subject_revision=recorded_revision,
+                occurrence_id=receipt.decision_occurrence_id,
+                reason=str(reason),
+                candidate_id=receipt.candidate_id,
+                candidate_sha256=receipt.candidate_sha256,
+                authority_occurrence_id=receipt.authority_occurrence_id,
+                immutable_evidence_recorded=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - authority receipt already exists
+            review_health_warning = type(exc).__name__
         return True, {
             "action": "decide_subject_candidate",
             "candidate_id": receipt.candidate_id,
@@ -622,6 +909,11 @@ class LifeDecideSubjectCandidateTool(BaseTool):
             "decision_occurrence_id": receipt.decision_occurrence_id,
             "authority_occurrence_id": receipt.authority_occurrence_id,
             "committed": receipt.status == "committed",
+            **(
+                {"review_health_warning": review_health_warning}
+                if review_health_warning
+                else {}
+            ),
         }
 
 
@@ -1028,6 +1320,7 @@ LEARNING_TOOLS = [
     LifeChallengeInsightTool,
     LifeReconsiderInsightTool,
     LifeViewKnowledgeTool,
+    LifeReviewSubjectDocumentTool,
     LifeListSubjectCandidatesTool,
     LifeReadSubjectCandidateTool,
     LifeDecideSubjectCandidateTool,
