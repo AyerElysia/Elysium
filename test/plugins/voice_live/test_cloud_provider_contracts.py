@@ -13,10 +13,15 @@ from plugins.voice_live.providers.openai_realtime import OpenAIRealtimeProvider
 from plugins.voice_live.providers.qwen_realtime import (
     _QWEN_CONTEXT_CHUNK_BYTES,
     _QWEN_MAX_FRAME_BYTES,
+    _QWEN_WEBSOCKET_HEARTBEAT,
     QwenRealtimeProvider,
     _qwen_safe_tool_name,
     _split_utf8_text,
 )
+
+
+def test_qwen_realtime_does_not_require_upstream_pong() -> None:
+    assert _QWEN_WEBSOCKET_HEARTBEAT is None
 
 
 @pytest.mark.asyncio
@@ -407,7 +412,8 @@ async def test_qwen_audio_realtime_uses_smart_turn_contract() -> None:
     assert session["voice"] == "longanqian"
     assert session["turn_detection"] == {"type": "smart_turn"}
     assert session["max_history_turns"] == 7
-    assert "input_audio_format" not in session
+    assert session["input_audio_format"] == "pcm"
+    assert session["output_audio_format"] == "pcm"
 
 
 @pytest.mark.asyncio

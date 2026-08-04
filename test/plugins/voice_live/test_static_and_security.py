@@ -22,6 +22,14 @@ def test_browser_uses_worklet_clocked_pcm_and_immediate_barge_in() -> None:
     assert "playback.clear" in html
     assert "echoCancellation:true" in html
     assert "noiseSuppression:true" in html
+    assert "channelCountMode:'explicit'" in html
+    assert "bestEnergy" in html
+    assert "startAudioPump(generation)" in html
+    assert "MAX_MIC_QUEUE" in html
+    assert "MIC_SILENCE_MS" in html
+    assert "麦克风正在上传静音" in html
+    assert "micHealth" in html
+    assert "micRate" in html
     assert "voiceProfile" in html
     assert "voice_conversion" in html
     assert "method:'POST'" in html

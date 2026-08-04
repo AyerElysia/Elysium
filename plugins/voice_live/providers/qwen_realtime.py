@@ -1,4 +1,4 @@
-"""Alibaba Cloud Qwen3.5-Omni Realtime WebSocket provider."""
+"""Alibaba Cloud Qwen Audio/Omni Realtime WebSocket provider."""
 
 from __future__ import annotations
 
@@ -23,6 +23,10 @@ from .base import (
 
 _QWEN_MAX_FRAME_BYTES = 256 * 1024
 _QWEN_CONTEXT_CHUNK_BYTES = 192 * 1024
+# Qwen Audio does not promise WebSocket PONG replies.  ``None`` keeps aiohttp's
+# automatic reply to server PINGs but prevents client-originated heartbeat PINGs
+# from falsely terminating an otherwise healthy realtime session.
+_QWEN_WEBSOCKET_HEARTBEAT: None = None
 
 
 def _split_utf8_text(text: str, *, max_bytes: int) -> list[str]:
@@ -118,7 +122,7 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
                 self._http.ws_connect(
                     self._url,
                     headers={"Authorization": f"Bearer {self._api_key}"},
-                    heartbeat=20,
+                    heartbeat=_QWEN_WEBSOCKET_HEARTBEAT,
                 ),
                 timeout=self._connect_timeout,
             )
@@ -134,6 +138,8 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
                 session = {
                     "modalities": ["text", "audio"],
                     "voice": self._voice,
+                    "input_audio_format": "pcm",
+                    "output_audio_format": "pcm",
                     "max_history_turns": max_history_turns,
                     "turn_detection": {"type": "smart_turn"},
                 }
