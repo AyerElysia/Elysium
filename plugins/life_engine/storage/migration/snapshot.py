@@ -9,6 +9,7 @@ import math
 import os
 import shutil
 import sqlite3
+import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -216,27 +217,53 @@ def _backup_sqlite(
     *,
     writer_frozen: bool,
 ) -> dict[str, Any]:
-    evidence_before = _sqlite_source_evidence(source, include_hash=writer_frozen)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    source_connection = sqlite3.connect(f"file:{source.resolve()}?mode=ro", uri=True)
-    target_connection = sqlite3.connect(destination)
-    try:
-        quick_check = source_connection.execute("PRAGMA quick_check").fetchall()
-        if quick_check != [("ok",)]:
-            raise LifeSnapshotError(f"SQLite quick_check failed: {source}")
-        source_connection.backup(target_connection)
-    finally:
-        target_connection.close()
-        source_connection.close()
-    evidence_after = _sqlite_source_evidence(source, include_hash=writer_frozen)
-    if writer_frozen and evidence_before != evidence_after:
-        raise LifeSnapshotError(f"frozen SQLite source changed during backup: {source}")
-    inspection = inspect_sqlite_database(destination)
+    with tempfile.TemporaryDirectory(prefix="elysium-life-snapshot-") as temporary:
+        staged = Path(temporary) / source.name
+        source_connection = sqlite3.connect(
+            f"file:{source.resolve()}?mode=ro",
+            uri=True,
+        )
+        target_connection = sqlite3.connect(staged)
+        try:
+            quick_check = source_connection.execute("PRAGMA quick_check").fetchall()
+            if quick_check != [("ok",)]:
+                raise LifeSnapshotError(f"SQLite quick_check failed: {source}")
+            evidence_before = _sqlite_source_evidence(
+                source,
+                include_hash=writer_frozen,
+            )
+            source_connection.backup(target_connection)
+            evidence_after = _sqlite_source_evidence(
+                source,
+                include_hash=writer_frozen,
+            )
+            if writer_frozen and evidence_before != evidence_after:
+                raise LifeSnapshotError(
+                    f"frozen SQLite source changed during backup: {source}"
+                )
+            journal_mode = target_connection.execute(
+                "PRAGMA journal_mode = DELETE"
+            ).fetchone()
+            if journal_mode is None or str(journal_mode[0]).lower() != "delete":
+                raise LifeSnapshotError(
+                    f"SQLite backup journal normalization failed: {source}"
+                )
+            target_connection.commit()
+        finally:
+            target_connection.close()
+            source_connection.close()
+        inspection = inspect_sqlite_database(staged)
+        staged_sha256 = sha256_file(staged)
+        shutil.copy2(staged, destination)
+        backup_sha256 = sha256_file(destination)
+        if staged_sha256 != backup_sha256:
+            raise LifeSnapshotError(f"copied SQLite checksum mismatch: {source}")
     return {
         "source_evidence_before": evidence_before,
         "source_evidence_after": evidence_after,
         "backup_bytes": destination.stat().st_size,
-        "backup_sha256": sha256_file(destination),
+        "backup_sha256": backup_sha256,
         **inspection,
     }
 

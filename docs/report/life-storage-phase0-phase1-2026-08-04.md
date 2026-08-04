@@ -63,14 +63,31 @@
 
 ## 4. 验证证据
 
-- 定向本地合同与旧备份兼容：25 项功能用例通过；
+- 定向本地合同、WAL/跨文件系统快照与旧备份兼容：27 项功能用例通过；
 - 静态检查：storage kernel、Life Engine storage、配置、脚本和测试全部通过；
 - 真实远程 MySQL：使用独立测试 registry/generation/probe 表完成 schema migration、注册、激活、事务内 fencing、旧 token 拒写、续租、审计链健康和撤销，测试通过；
-- 变基到 `soul/main` 后全仓回归：3,351 passed、7 skipped，覆盖率 66.77%；
+- 快照实跑修复后全仓回归：3,353 passed、7 skipped，覆盖率 66.78%；
 - 远程测试没有写入正式生命业务表，没有激活 `life-domain` registry，不把测试 generation 作为正式候选；
 - 真实数据盘点仅用只读 SQLite URI，没有读取正文到报告，也没有写回源库。
 
 远程连接凭据仅在测试进程环境中短暂注入，没有写入源码、文档、日志或 Git。
+
+### 4.1 真实在线候选快照
+
+在不停止或重启 Elysium 的情况下，已把当前生命域数据复制到 Windows 本地独立磁盘：
+
+- 路径：`C:\Temp\Data\ElysiumBackups\life-domain-20260804T0615Z-candidate`；
+- 六个 SQLite 权威/运行源；
+- 4,151 个精确文件；
+- 独立复核 4,157 项，`failure_count=0`；
+- manifest SHA-256：`77435387f4acc59e48ffe625015d07575398465534b132e428c47e4617124862`；
+- source snapshot SHA-256：`d8f800108c71203396f9e6c39e8aa0a386ce7521d2d60ea333ee4ca13ff5a724`；
+- 完整创建并复核耗时约 4 分 36 秒；
+- `writer_frozen=false`、`generation_eligible=false`，因此只能作为在线灾备候选，不能成为可写 authority。
+
+首次跨 WSL→NTFS 实跑发现 SQLite page backup 与 WAL checkpoint 会造成性能和物理哈希不稳定。最终实现改为“WSL 临时一致性副本和逻辑根 → `journal_mode=DELETE` 规范化备份副本 → 顺序写目标 → 目标物理哈希 → 回拷临时区独立计算逻辑根”。源库 journal mode 和源内容完全不变。
+
+一份更早的实跑副本因 `memory.db` 物理哈希变化被正确拒绝，保留于 `C:\Temp\Data\ElysiumBackups\life-domain-20260804T0540Z-candidate`，并有 `VERIFICATION_FAILED.json`；它不是有效备份，不得用于恢复或 generation 注册。这个失败证据证明 manifest/独立复核没有把“文件存在”误报为“数据可恢复”。
 
 ## 5. 未完成项与明确阻断
 

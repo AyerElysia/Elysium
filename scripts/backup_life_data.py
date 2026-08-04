@@ -42,6 +42,22 @@ def create_life_backup(
         writer_frozen=writer_frozen,
     )
     verification = verify_local_snapshot(output)
+    if not verification["verified"]:
+        failure_marker = output / "VERIFICATION_FAILED.json"
+        with failure_marker.open("x", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "manifest_sha256": manifest["manifest_sha256"],
+                    "verified_at": verification["verified_at"],
+                    "failure_count": verification["failure_count"],
+                    "failures": verification["failures"],
+                },
+                handle,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            handle.write("\n")
     result = dict(manifest)
     result.update(
         {

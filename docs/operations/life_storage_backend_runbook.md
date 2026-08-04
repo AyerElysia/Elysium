@@ -30,7 +30,7 @@ uv run python scripts/backup_life_data.py \
   --output /absolute/backup/life-domain-<UTC>
 ```
 
-该命令使用 SQLite Online Backup API，并对非数据库权威文件逐字节复制。输出目录必须不存在；任一源文件在复制中发生变化、任一哈希不一致或任一必需数据库缺失都会失败并保留 `SNAPSHOT_INCOMPLETE`。在线快照即使校验通过，也只能是 candidate，不能成为可写权威。
+该命令使用 SQLite Online Backup API，并对非数据库权威文件逐字节复制。SQLite 先在本地临时副本完成一致性复制和逻辑根计算，备份副本规范化为 `journal_mode=DELETE` 后再顺序写入目标，避免跨文件系统逐页写入与 WAL checkpoint 改变已封存主文件。输出目录必须不存在；任一源文件在复制中发生变化、任一哈希不一致或任一必需数据库缺失都会失败并保留 `SNAPSHOT_INCOMPLETE`。如果复制完成但独立复核失败，则写入 `VERIFICATION_FAILED.json`。在线快照即使校验通过，也只能是 candidate，不能成为可写权威。
 
 ### 3.2 冻结写入者后的可验证快照
 
