@@ -297,12 +297,15 @@ class TestBaseChatter:
 
         chatter_plugin = MagicMock()
         chatter = ConcreteChatter("stream_123", chatter_plugin)
+        mock_logger = MagicMock()
 
         mock_stream = MagicMock()
         mock_stream.stream_id = "stream_123"
         mock_stream.context = MagicMock()
 
-        with patch("src.core.components.base.chatter.get_stream_manager") as mock_sm:
+        with patch("src.core.components.base.chatter.get_stream_manager") as mock_sm, patch(
+            "src.core.components.base.chatter.get_logger", return_value=mock_logger
+        ):
             mock_sm.return_value.get_or_create_stream = AsyncMock(return_value=mock_stream)
 
             result = await chatter.modify_llm_usables([AllowedTool, RejectedTool, OpenTool])
@@ -310,6 +313,9 @@ class TestBaseChatter:
         assert AllowedTool in result
         assert OpenTool in result
         assert RejectedTool not in result
+        info_messages = [str(call.args[0]) for call in mock_logger.info.call_args_list]
+        assert not any("移除组件:" in message for message in info_messages)
+        assert any("可用组件: 2/3" in message for message in info_messages)
 
     async def test_exec_llm_usable_uses_owner_plugin_instance(self):
         """测试执行跨插件 Tool 时向管理器传入所属插件实例。"""

@@ -396,12 +396,6 @@ class BaseChatter(ABC):
                 logger.error(f"[{chat_stream.stream_id}] 并行激活判断失败: {e}")
                 removals.extend((sig, f"并行判断失败: {e}") for sig in signatures)
 
-        if removals:
-            removals_summary = " | ".join(
-                [f"{name}({reason})" for name, reason in removals]
-            )
-            logger.info(f"[{chat_stream.stream_id}] 移除组件: {removals_summary}")
-
         removal_names = {name for name, _ in removals}
         available = [
             usable_cls
