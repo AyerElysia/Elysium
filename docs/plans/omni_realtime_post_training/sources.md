@@ -8,9 +8,9 @@
 - [BayLing-Duplex 官方代码](https://github.com/BayLing-Models/BayLing-Duplex)：当前公开推理实现、模型下载和实时运行方式。
 - [BayLing-Duplex 模型权重](https://huggingface.co/BayLing-Models/BayLing-Duplex)：公开 checkpoint 与 GLM speech tokenizer/decoder 依赖。
 - [BayLing-Duplex / GLM-4-Voice License](https://github.com/BayLing-Models/BayLing-Duplex/blob/main/LICENSE)：学术、商业登记、分发、展示和衍生模型命名要求。
-- [GLM-4-Voice 官方仓库](https://github.com/zai-org/GLM-4-Voice)：9B 中英语音底座、16 kHz/12.5 Hz speech tokenizer 与流式 decoder。
+- [GLM-4-Voice 官方仓库](https://github.com/zai-org/GLM-4-Voice)：9B 中英语音底座、16 kHz/12.5 Hz speech tokenizer 与独立流式 decoder；当前 README 提供推理，不提供目标说话人 decoder 后训练流程。
 - [Moshi 官方仓库](https://github.com/kyutai-labs/moshi)：双音频流、Mimi codec、PyTorch/Rust/浏览器实时实现和许可证。
-- [Moshi 官方后训练仓库](https://github.com/kyutai-labs/moshi-finetune)：双声道数据格式、时间戳转写、LoRA/全量微调、8 卡训练和导出。
+- [Moshi 官方后训练仓库](https://github.com/kyutai-labs/moshi-finetune)：双声道数据格式、时间戳转写、LoRA/全量微调、8 卡训练，以及不再引用基础模型的合并 `safetensors` 导出。
 - [Moshiko 模型卡](https://huggingface.co/kyutai/moshiko-pytorch-bf16)：英语、CC-BY-4.0、8B 规模和训练基础信息。
 - [NVIDIA PersonaPlex 项目页](https://research.nvidia.com/labs/adlr/personaplex/)：真正全双工、文本角色/音频 voice prompt、合成与真实对话混合的公开结论。
 - [NVIDIA PersonaPlex 模型卡](https://huggingface.co/nvidia/personaplex-7b-v1)：英语、7B、Moshi 底座、训练数据和 NVIDIA Open Model License。
@@ -35,6 +35,9 @@
 
 ## 仓库内现状
 
-- [实时通话意识](../../architecture/实时通话意识.md)：现有 Voice Live Provider、意识实例、上下文、工具、打断、Seed-VC 和手工 Elysium 生命周期契约。
+- [本地意识承载模型后训练规范](../../architecture/本地意识承载模型后训练规范.md)：主体模型、权重内人格/记忆、原始声音、意识实例绑定和 checkpoint 安全的长期规范。
+- [意识实例架构](../../architecture/意识实例架构.md)：同一持续主体、多个局部意识实例、Presence、事件和 Perception 边界。
+- [主体上下文投影](../../architecture/主体上下文投影.md)：当前 `SOUL.md`、`USER.md`、`MEMORY.md` 权威与运行时投影契约；未来迁移前仍然有效。
+- [实时通话意识](../../architecture/实时通话意识.md)：现有 Voice Live Provider、意识实例、上下文、工具、打断、Seed-VC，以及面向未来训练的三轨 L0 episode 归档契约。
 - [Voice Live 商业重建报告](../../report/voice_live-commercial-rebuild-2026-08-02.md)：当前 Qwen Realtime、MiniCPM-o、Moshi/Freeze-Omni 对比和真实链路基线。
 - [Seed-VC 集成报告](../../report/voice-live-elysia-seedvc-integration-2026-08-02.md)：现有目标音色路径、性能和资产 revision 边界。
