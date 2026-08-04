@@ -119,6 +119,7 @@ class APIContext:
     chat: ChatQueryService | None = None
     command_store: CommandStore | None = None
     command_dispatcher: CommandDispatcher | None = None
+    chat_commands_enabled: bool = False
 
 
 class RequestIDMiddleware(BaseHTTPMiddleware):
@@ -934,6 +935,16 @@ def create_api_app(context: APIContext) -> FastAPI:
                 require_scope=require_scope,
             )
         )
+        if context.chat_commands_enabled:
+            from .chat_commands import create_chat_command_router
+
+            app.include_router(
+                create_chat_command_router(
+                    store=context.command_store,
+                    dispatcher=context.command_dispatcher,
+                    require_scope=require_scope,
+                )
+            )
     return app
 
 
