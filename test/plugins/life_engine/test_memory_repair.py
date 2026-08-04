@@ -65,11 +65,13 @@ def test_repair_rebuilds_drifted_documents_and_is_idempotent(
 ) -> None:
     async def _run() -> None:
         service = await _make_service(tmp_path, monkeypatch)
-        db = service._require_db()
+        db = service._require_local_db()
         note = tmp_path / "notes" / "life.md"
         note.parent.mkdir(parents=True)
         note.write_text("# 旧版本\n\n她最初的理解。\n", encoding="utf-8")
-        upsert_document_rows(db, "notes/life.md", "# 旧版本\n\n她最初的理解。\n", "life")
+        upsert_document_rows(
+            db, "notes/life.md", "# 旧版本\n\n她最初的理解。\n", "life"
+        )
 
         note.write_text("# 新版本\n\n世界已经变化，她也知道了。\n", encoding="utf-8")
         from plugins.life_engine.memory.nodes import compute_content_hash
@@ -105,7 +107,7 @@ def test_repair_empty_document_never_enqueues_vector_job(
 ) -> None:
     async def _run() -> None:
         service = await _make_service(tmp_path, monkeypatch)
-        db = service._require_db()
+        db = service._require_local_db()
         empty = tmp_path / "notes" / "empty.md"
         empty.parent.mkdir(parents=True)
         empty.write_text("# 曾经有内容\n", encoding="utf-8")
@@ -137,7 +139,7 @@ def test_repair_removes_legacy_self_loops_and_blocks_new_ones(
 ) -> None:
     async def _run() -> None:
         service = await _make_service(tmp_path, monkeypatch)
-        db = service._require_db()
+        db = service._require_local_db()
         note = tmp_path / "notes" / "loop.md"
         note.parent.mkdir(parents=True)
         note.write_text("# 自环遗留\n", encoding="utf-8")

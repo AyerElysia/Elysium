@@ -25,6 +25,9 @@ from plugins.life_engine.memory.lineage import (
     MemoryEvidence,
 )
 from plugins.life_engine.memory.service import LifeMemoryService
+from plugins.life_engine.storage.memory.local import (
+    create_local_memory_storage_bundle,
+)
 
 
 def _service(tmp_path: Path) -> LifeMemoryService:
@@ -162,6 +165,8 @@ async def test_current_fact_search_returns_active_claim_before_document(
     service._db.row_factory = sqlite3.Row
     service._db.execute("PRAGMA foreign_keys = ON")
     create_epistemic_schema(service._db)
+    service._memory_storage = create_local_memory_storage_bundle(lambda: service._db)
+    service._initialized = True
     claim = append_claim(
         service._db,
         new_claim(

@@ -1,6 +1,6 @@
 # Elysium 生命域可选 MySQL / 本地存储重构方案
 
-> 状态：分阶段实施中。阶段 0/1 的通用存储基座已落地；阶段 2 的 Presence/World 与 Life Memory Port、local/MySQL 双适配及现役选择接线正在收口；阶段 3 的 Life Event Port、双适配、候选复制控制面、逐字节迁移与反向导出已落地。已把一份未冻结在线快照的 86,094 条 Life Event 复制到远程 MySQL 并完成 0 差异往返恢复演练，但该批次仅为 `copied`，不是 `verified`，也未激活。当前正式运行权威仍是既有本地 SQLite/文件，禁止据此状态直接切换到 MySQL。
+> 状态：分阶段实施中。阶段 0/1 的通用存储基座已落地；阶段 2 的 Presence/World 正在收口，Life Memory 六 Port、local/MySQL 双适配、MySQL 领域 schema 与现役服务接线已落地。Life Engine 唯一拥有 coherent runtime，Memory 只消费注入 runtime；启用后缺少 runtime 必须 fail closed，MySQL 模式不得回落或双写 SQLite。阶段 3 的 Life Event Port、双适配、候选复制控制面、逐字节迁移与反向导出已落地。已把一份未冻结在线快照的 86,094 条 Life Event 复制到远程 MySQL 并完成 0 差异往返恢复演练，但该批次仅为 `copied`，不是 `verified`，也未激活。当前正式运行权威仍是既有本地 SQLite/文件，禁止据此状态直接切换到 MySQL。
 >
 > 目标：在不改变爱莉主体语义、不丢失不可变历史、不把 Chroma 误作权威存储的前提下，为 Elysium 建立行为等价的本地与 MySQL 两套耐久存储后端。迁移采用“复制、校验、可选切换”，绝不移动、删除或改写原 SQLite、Markdown、JSON、JSONL 与媒体数据文件。
 >

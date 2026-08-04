@@ -265,11 +265,19 @@ class MemoryIntegration:
             cfg = self._service._cfg()
             workspace = Path(cfg.settings.workspace_path)
             index_config = getattr(cfg, "memory_index", None)
+            storage_enabled = bool(getattr(cfg.storage, "enabled", False))
+            storage_runtime = self._service.storage_runtime if storage_enabled else None
+            if storage_enabled and storage_runtime is None:
+                raise RuntimeError(
+                    "selectable Memory storage requires the Life Engine coherent runtime"
+                )
             self._service._memory_service = LifeMemoryService(
                 workspace,
                 vector_backend_enabled=bool(
                     getattr(index_config, "backend_enabled", True)
                 ),
+                storage_runtime=storage_runtime,
+                selectable_storage_enabled=storage_enabled,
             )
             await self._service._memory_service.initialize()
             logger.info("life_engine 仿生记忆服务已初始化")

@@ -10,29 +10,39 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from ...memory.edges import MemoryEdge
 from ...memory.epistemic import (
     ClaimEvidence,
+    ClaimSearchResult,
+    ClaimState,
+    CurrentFactProjection,
     EpistemicConflict,
+    MemoryAuditEntry,
     MemoryBelief,
     MemoryClaim,
+    MemoryDisposition,
     MemoryStateEvent,
     RetrievalEpisode,
     RetrievalExposure,
     RetrievalFeedback,
+    RetrievalPlasticity,
 )
 from ...memory.experience import (
     ExperienceAppendReport,
     ExperienceRecord,
     WitnessMemory,
 )
-from ...memory.indexing import DocumentIndexResult, IndexJob
+from ...memory.indexing import ChunkIndexState, DocumentIndexResult, IndexJob
 from ...memory.lineage import MemoryCorrection
 from ...memory.living import (
     ArtifactHead,
+    AssociationEvidence,
+    AssociationSelection,
     CoRecallEvent,
+    InterpretationSearchResult,
     InterpretationSource,
     MemoryArtifactVersion,
     MemoryDerivation,
@@ -42,7 +52,9 @@ from ...memory.living import (
     SemanticRelation,
 )
 from ...memory.nodes import MemoryNode
-from ..models import StorageAvailability
+from ...memory.search import DetailedSearchResult, LineageNodeView
+from ...memory.worker import IndexWorkerReport
+from ..models import BackendKind, StorageAvailability
 
 
 class MemoryStoreRole(StrEnum):
@@ -162,6 +174,68 @@ class DocumentIndexProjection(MemoryStorePort, Protocol):
         error: str = "",
     ) -> bool: ...
 
+    async def enqueue_job(self, node_id: str, content_hash: str) -> str: ...
+
+    async def list_indexed_documents(self) -> list[MemoryNode]: ...
+
+    async def mark_documents_deleted(self, node_ids: Sequence[str]) -> int: ...
+
+    async def read_chunk_index_state(self) -> ChunkIndexState | None: ...
+
+    async def invalidate_vector_projection(self) -> int: ...
+
+    async def consume_vector_tombstones(
+        self,
+        collection: Any,
+        *,
+        limit: int = 200,
+    ) -> int: ...
+
+    async def run_index_worker(
+        self,
+        *,
+        limit: int,
+        collection: Any,
+        embed_texts_func: Any,
+        collection_resolver: Any,
+        collection_upsert_func: Any,
+        retry_failed: bool,
+        reclaim_after: float | None,
+    ) -> IndexWorkerReport: ...
+
+    async def search_detailed(
+        self,
+        query: str,
+        *,
+        collection: Any,
+        chunk_collection: Any,
+        top_k: int,
+        enable_association: bool,
+        file_types: Sequence[str] | None,
+        time_range_days: int,
+        now: Any,
+        workspace_path: str | Path | None,
+        emit_visual_event: Any,
+    ) -> DetailedSearchResult: ...
+
+    async def vector_search(
+        self,
+        query: str,
+        *,
+        collection: Any,
+        chunk_collection: Any,
+        top_k: int,
+    ) -> list[tuple[Any, ...]]: ...
+
+    async def fts_search(self, query: str, *, top_k: int) -> list[tuple[Any, ...]]: ...
+
+    async def get_snippet(self, node_id: str) -> str: ...
+
+    async def filter_existing_scores(
+        self,
+        scores: Sequence[tuple[Any, ...]],
+    ) -> tuple[Any, ...]: ...
+
     async def graph_snapshot(
         self,
         *,
@@ -225,6 +299,22 @@ class WitnessLedgerStore(MemoryStorePort, Protocol):
         last_error: str | None = None,
     ) -> dict[str, Any]: ...
 
+    async def search(
+        self,
+        query: str,
+        *,
+        mode: Any,
+        top_k: int,
+        stream_scope: str | None,
+        visibility: Sequence[str],
+    ) -> list[Any]: ...
+
+    async def migrate_legacy(self, **kwargs: Any) -> WitnessMemory | None: ...
+
+    async def migration_exists(self, migration_key: str) -> bool: ...
+
+    async def record_migration(self, **kwargs: Any) -> None: ...
+
 
 @runtime_checkable
 class LivingMemoryStore(MemoryStorePort, Protocol):
@@ -245,6 +335,10 @@ class LivingMemoryStore(MemoryStorePort, Protocol):
         logical_key: str,
     ) -> list[MemoryArtifactVersion]: ...
 
+    async def list_artifact_heads(
+        self,
+    ) -> list[tuple[MemoryArtifactVersion, ArtifactHead]]: ...
+
     async def append_interpretation(
         self,
         interpretation: MemoryInterpretation,
@@ -253,6 +347,48 @@ class LivingMemoryStore(MemoryStorePort, Protocol):
     ) -> MemoryInterpretation: ...
 
     async def append_relation(self, relation: SemanticRelation) -> SemanticRelation: ...
+
+    async def list_relations(self, entity_ref: str) -> list[SemanticRelation]: ...
+
+    async def list_interpretations(
+        self,
+        subject_id: str,
+        *,
+        recorded_as_of: str = "",
+    ) -> list[MemoryInterpretation]: ...
+
+    async def search_interpretations(
+        self,
+        query: str,
+        *,
+        top_k: int,
+        stream_scope: str | None,
+        visibility: Sequence[str],
+        recorded_as_of: str = "",
+    ) -> list[InterpretationSearchResult]: ...
+
+    async def get_interpretation(
+        self,
+        interpretation_id: str,
+    ) -> tuple[MemoryInterpretation, tuple[InterpretationSource, ...]] | None: ...
+
+    async def choose_association_neighbours(
+        self,
+        seed_refs: Sequence[str],
+        *,
+        context_key: str,
+        random_seed: int,
+        limit: int,
+    ) -> list[AssociationSelection]: ...
+
+    async def list_association_evidence(
+        self,
+        entity_ref: str,
+        *,
+        context_key: str | None = None,
+    ) -> list[AssociationEvidence]: ...
+
+    async def rebuild_association_projection(self) -> int: ...
 
     async def begin_recall(self, **kwargs: Any) -> RecallEpisode: ...
 
@@ -274,7 +410,9 @@ class EpistemicMemoryStore(MemoryStorePort, Protocol):
 
     async def append_belief(self, belief: MemoryBelief) -> MemoryBelief: ...
 
-    async def append_conflict(self, conflict: EpistemicConflict) -> EpistemicConflict: ...
+    async def append_conflict(
+        self, conflict: EpistemicConflict
+    ) -> EpistemicConflict: ...
 
     async def append_state_event(self, event: MemoryStateEvent) -> MemoryStateEvent: ...
 
@@ -293,6 +431,77 @@ class EpistemicMemoryStore(MemoryStorePort, Protocol):
         feedback: RetrievalFeedback,
     ) -> RetrievalFeedback: ...
 
+    async def get_retrieval_plasticity(
+        self,
+        entity_type: str,
+        entity_id: str,
+    ) -> RetrievalPlasticity: ...
+
+    async def get_disposition(
+        self,
+        entity_type: str,
+        entity_id: str,
+        *,
+        recorded_as_of: str = "",
+    ) -> MemoryDisposition: ...
+
+    async def get_claim_state(
+        self,
+        claim_id: str,
+        *,
+        recorded_as_of: str = "",
+    ) -> ClaimState | None: ...
+
+    async def list_claim_states(
+        self,
+        subject_key: str,
+        *,
+        recorded_as_of: str = "",
+        valid_at: str = "",
+        stream_scope: str | None = None,
+        visibility: Sequence[str] = ("private",),
+    ) -> list[ClaimState]: ...
+
+    async def project_current_facts(
+        self,
+        subject_key: str,
+        *,
+        valid_at: str,
+        recorded_as_of: str = "",
+        stream_scope: str | None = None,
+        visibility: Sequence[str] = ("private",),
+    ) -> CurrentFactProjection: ...
+
+    async def get_audit_trail(
+        self,
+        entity_type: str,
+        entity_id: str,
+        *,
+        recorded_as_of: str = "",
+    ) -> list[MemoryAuditEntry]: ...
+
+    async def list_state_events(
+        self,
+        entity_type: str,
+        entity_id: str,
+        *,
+        recorded_as_of: str = "",
+    ) -> list[MemoryStateEvent]: ...
+
+    async def list_claim_evidence(self, claim_id: str) -> list[ClaimEvidence]: ...
+
+    async def search_claims(
+        self,
+        query: str,
+        *,
+        mode: str,
+        top_k: int,
+        stream_scope: str | None,
+        visibility: Sequence[str],
+        valid_at: str = "",
+        recorded_as_of: str = "",
+    ) -> list[ClaimSearchResult]: ...
+
 
 @runtime_checkable
 class LegacyGraphStore(MemoryStorePort, Protocol):
@@ -308,6 +517,11 @@ class LegacyGraphStore(MemoryStorePort, Protocol):
     async def get_node_by_file_path(self, file_path: str) -> MemoryNode | None: ...
 
     async def get_node_by_id(self, node_id: str) -> MemoryNode | None: ...
+
+    async def get_lineage_node_views(
+        self,
+        node_ids: Sequence[str],
+    ) -> dict[str, LineageNodeView]: ...
 
     async def create_or_update_edge(
         self,
@@ -329,6 +543,58 @@ class LegacyGraphStore(MemoryStorePort, Protocol):
         min_weight: float = 0.0,
     ) -> list[MemoryEdge]: ...
 
+    async def delete_edge(
+        self,
+        source_path: str,
+        target_path: str,
+        edge_type: Any = None,
+    ) -> bool: ...
+
+    async def reinforce_coactivated(
+        self,
+        node_ids: Sequence[str],
+        *,
+        learning_rate: float,
+    ) -> None: ...
+
+    async def increment_access(self, node_id: str) -> None: ...
+
+    async def spread_activation(
+        self,
+        seed_ids: Sequence[str],
+        *,
+        max_depth: int,
+        max_results: int,
+        spread_decay: float,
+        spread_threshold: float,
+        allowed_edge_types: Sequence[Any],
+    ) -> list[tuple[Any, ...]]: ...
+
+    async def insert_correction(
+        self,
+        *,
+        topic: str,
+        message: str,
+        source: str,
+        related_node_id: str | None,
+        query: str,
+        stream_id: str | None,
+    ) -> MemoryCorrection: ...
+
+    async def apply_decay(self) -> int: ...
+
+    async def stats(self) -> dict[str, Any]: ...
+
+    async def dream_walk(self, **kwargs: Any) -> dict[str, Any]: ...
+
+    async def list_dream_candidate_nodes(self, limit: int) -> list[dict[str, Any]]: ...
+
+    async def list_random_file_nodes(self, limit: int) -> list[dict[str, Any]]: ...
+
+    async def prune_weak_edges(self, threshold: float) -> int: ...
+
+    async def prune_orphan_edges(self) -> int: ...
+
     async def list_corrections(
         self,
         *,
@@ -342,6 +608,7 @@ class LegacyGraphStore(MemoryStorePort, Protocol):
 class MemoryStorageBundle:
     """One coherent set of Memory ports from the same backend generation."""
 
+    backend: BackendKind
     document_index: DocumentIndexProjection
     experiences: ExperienceLedgerStore
     witnesses: WitnessLedgerStore

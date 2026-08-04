@@ -21,69 +21,18 @@ from typing import Any, Dict, List, Optional
 
 from src.app.plugin_system.api import log_api
 
-from .nodes import (
-    MemoryNode,
-    compute_content_hash,
-    generate_file_node_id,
-    get_or_create_file_node,
-    get_node_by_file_path,
-    increment_access,
-)
-from .edges import (
-    MemoryEdge,
-    EdgeType,
-    EXPLICIT_RELATION_EDGE_TYPES,
-    create_or_update_edge,
-    get_edges_from,
-    get_edges_to,
-    delete_edge,
-    reinforce_coactivated,
-)
-from .search import (
-    DetailedSearchResult,
-    SearchResult,
-    get_chroma_collection,
-    search_memory,
-    search_memory_detailed,
-    vector_search,
-    fts_search,
-    spread_activation,
-    filter_existing_scores,
-    get_lineage_node_views,
-    get_node_by_id,
-    get_snippet,
-)
-from .lineage import (
-    CANONICAL_EDGE_TYPES,
-    LINEAGE_EDGE_TYPES,
-    MemoryBundle,
-    MemoryCorrection,
-    MemoryEvidence,
-    MemoryTrace,
-    get_lineage_edges,
-    insert_memory_correction,
-    list_memory_corrections,
-)
+from ..storage.contracts import StorageBackendRuntime
+from ..storage.memory import MemoryStorageBundle, open_mysql_memory_storage
+from ..storage.memory.local import create_local_memory_storage_bundle
+from ..storage.models import BackendKind, StorageAvailability
 from .decay import (
     compute_memory_strength,
-    apply_decay,
-    dream_walk,
-    list_dream_candidate_nodes,
-    list_random_file_nodes,
-    prune_weak_edges,
     get_file_relations,
-    get_stats,
 )
-from .indexing import (
-    ACTIVE_CHUNK_STATE_KEY,
-    ChunkIndexState,
-    DocumentIndexResult,
-    IndexJob,
-    create_memory_schema,
-    enqueue_index_job,
-    move_document_rows,
-    read_active_chunk_index_state,
-    transaction,
+from .edges import (
+    EXPLICIT_RELATION_EDGE_TYPES,
+    EdgeType,
+    MemoryEdge,
 )
 from .eligibility import (
     MEMORY_CONTENT_DIRECTORIES,
@@ -91,35 +40,15 @@ from .eligibility import (
     assess_indexed_document_path,
     assess_workspace_document,
     read_workspace_document,
-    register_indexed_path_sql_function,
     scan_workspace_documents,
 )
-from .sqlite_runtime import (
-    bind_reader_pool,
-    open_memory_connection,
-    run_db,
-    run_read,
-)
-from .health import health_snapshot_from_path as collect_health_snapshot
-from .worker import (
-    CHUNK_COLLECTION_PREFIX,
-    CHUNK_INDEX_VERSION,
-    DEFAULT_RECLAIM_AFTER,
-    IndexWorkerReport,
-    chunk_collection_metadata,
-    consume_vector_tombstones,
-    get_chunk_collection,
-    get_named_chunk_collection,
-    process_index_jobs as run_chunk_index_jobs,
-)
-
 from .epistemic import (
     ClaimEvidence,
     ClaimSearchResult,
     ClaimState,
-    MemoryAuditEntry,
     CurrentFactProjection,
     EpistemicConflict,
+    MemoryAuditEntry,
     MemoryBelief,
     MemoryClaim,
     MemoryDisposition,
@@ -128,17 +57,8 @@ from .epistemic import (
     RetrievalExposure,
     RetrievalFeedback,
     RetrievalPlasticity,
-    build_memory_audit_trail,
     create_epistemic_schema,
-    get_claim_state,
-    get_memory_disposition,
-    get_retrieval_plasticity,
-    list_claim_evidence,
-    list_claim_states,
-    list_state_events,
     new_claim,
-    project_current_facts,
-    search_epistemic_claims,
 )
 from .experience import (
     EvidenceAwareMemoryResult,
@@ -148,38 +68,60 @@ from .experience import (
     WitnessMemory,
     WitnessSearchResult,
     create_life_memory_schema,
-    migrate_legacy_witness,
-    migration_exists,
-    record_witness_migration,
-    search_witness_memories,
 )
-from ..storage.memory import MemoryStorageBundle
-from ..storage.memory.local import create_local_memory_storage_bundle
+from .health import health_snapshot_from_path as collect_health_snapshot
+from .indexing import (
+    ChunkIndexState,
+    DocumentIndexResult,
+    IndexJob,
+    create_memory_schema,
+)
+from .lineage import (
+    CANONICAL_EDGE_TYPES,
+    LINEAGE_EDGE_TYPES,
+    MemoryBundle,
+    MemoryCorrection,
+    MemoryEvidence,
+    MemoryTrace,
+)
 from .living import (
     AssociationEvidence,
     AssociationSelection,
     CoRecallEvent,
-    InterpretationSource,
     InterpretationSearchResult,
+    InterpretationSource,
     MemoryArtifactVersion,
     MemoryDerivation,
     MemoryInterpretation,
     RecallEpisode,
     RecallEvent,
     SemanticRelation,
-    append_artifact_version,
-    choose_association_neighbours,
     create_living_memory_schema,
-    get_artifact_head,
-    get_artifact_head_state,
-    get_interpretation,
-    list_artifact_heads,
-    list_association_evidence,
-    list_interpretations,
-    list_semantic_relations,
     new_artifact_version,
-    rebuild_association_projection,
-    search_interpretations,
+)
+from .nodes import (
+    MemoryNode,
+    compute_content_hash,
+    generate_file_node_id,
+)
+from .search import (
+    DetailedSearchResult,
+    SearchResult,
+    get_chroma_collection,
+)
+from .sqlite_runtime import (
+    bind_reader_pool,
+    open_memory_connection,
+    run_db,
+)
+from .worker import (
+    CHUNK_COLLECTION_PREFIX,
+    CHUNK_INDEX_VERSION,
+    DEFAULT_RECLAIM_AFTER,
+    IndexWorkerReport,
+    chunk_collection_metadata,
+    get_chunk_collection,
+    get_named_chunk_collection,
 )
 
 logger = log_api.get_logger("life_engine.memory")
@@ -187,146 +129,6 @@ logger = log_api.get_logger("life_engine.memory")
 # 启动补索引时一次性读入内存的文档数。这不是行为阈值：分批与否不改变最终被
 # 索引的文件集合，只决定峰值内存——整个工作区的正文同时驻留可能是数百 MB。
 _RECOVERY_READ_BATCH = 32
-
-
-def _select_unembedded_without_job(db: sqlite3.Connection) -> list[sqlite3.Row]:
-    """查出已存在但从未进入索引队列的文件节点。
-
-    Args:
-        db: 只读连接。
-
-    Returns:
-        list[sqlite3.Row]: 含 ``node_id`` / ``file_path`` / ``content_hash``。
-    """
-    return db.execute(
-        """
-        SELECT node_id, file_path, content_hash
-        FROM memory_nodes
-        WHERE embedding_synced = 0
-          AND is_deleted = 0
-          AND node_type = 'file'
-          AND NOT EXISTS (
-              SELECT 1 FROM memory_index_jobs j
-              WHERE j.node_id = memory_nodes.node_id
-                AND (j.status = 'pending'
-                     OR j.error = 'EmptyDocument')
-          )
-        """
-    ).fetchall()
-
-
-def _select_indexed_file_nodes(db: sqlite3.Connection) -> list[sqlite3.Row]:
-    """列出全部文件节点的路径与删除标记。
-
-    Args:
-        db: 只读连接。
-
-    Returns:
-        list[sqlite3.Row]: 含 ``node_id`` / ``file_path`` / ``content_hash`` /
-        ``is_deleted``。
-    """
-    return db.execute(
-        "SELECT node_id, file_path, content_hash, is_deleted "
-        "FROM memory_nodes WHERE node_type = 'file'"
-    ).fetchall()
-
-
-def _select_orphan_edge_ids(db: sqlite3.Connection) -> list[str]:
-    """查出两端有任一节点不存在的边。
-
-    Args:
-        db: 只读连接。
-
-    Returns:
-        list[str]: 孤立边的 ``edge_id``。
-    """
-    rows = db.execute(
-        """
-        SELECT e.edge_id FROM memory_edges e
-        LEFT JOIN memory_nodes s ON s.node_id = e.source_id
-        LEFT JOIN memory_nodes t ON t.node_id = e.target_id
-        WHERE s.node_id IS NULL OR t.node_id IS NULL
-        """
-    ).fetchall()
-    return [str(row["edge_id"]) for row in rows]
-
-
-def _mark_nodes_deleted(db: sqlite3.Connection, node_ids: Sequence[str]) -> None:
-    """把给定节点标记为已删除。
-
-    用 ``executemany`` 而非一条 ``IN (...)``：后者的参数个数受 SQLite 的
-    ``SQLITE_MAX_VARIABLE_NUMBER`` 限制，工作区一旦大批量删除文件就会直接
-    报错，而这条清理路径恰恰只在那种时候才有活干。
-
-    Args:
-        db: 写连接。
-        node_ids: 待标记的节点 ID。
-    """
-    with transaction(db) as cursor:
-        cursor.executemany(
-            "UPDATE memory_nodes SET is_deleted = 1 WHERE node_id = ?",
-            [(node_id,) for node_id in node_ids],
-        )
-
-
-def _delete_edges(db: sqlite3.Connection, edge_ids: Sequence[str]) -> None:
-    """删除给定的边。
-
-    Args:
-        db: 写连接。
-        edge_ids: 待删除的边 ID。
-    """
-    with transaction(db) as cursor:
-        cursor.executemany(
-            "DELETE FROM memory_edges WHERE edge_id = ?",
-            [(edge_id,) for edge_id in edge_ids],
-        )
-
-
-def _enqueue_jobs(
-    db: sqlite3.Connection,
-    entries: Sequence[tuple[str, str]],
-) -> int:
-    """为一批节点补建索引任务。
-
-    Args:
-        db: 写连接。
-        entries: ``(node_id, content_hash)`` 序列。
-
-    Returns:
-        int: 成功入队的数量。失败的条目只记录日志，不中断整批——启动恢复的
-        价值在于尽可能多地补齐缺口，单个坏节点不应让其余节点继续缺失。
-    """
-    enqueued = 0
-    for node_id, content_hash in entries:
-        try:
-            enqueue_index_job(db, node_id, content_hash)
-            enqueued += 1
-        except Exception as exc:
-            logger.warning(f"补 embedding 入队失败 {node_id}: {exc}")
-    return enqueued
-
-
-def _invalidate_missing_vector_projection(db: sqlite3.Connection) -> int:
-    """Discard only stale vector projection state and enqueue a full rebuild."""
-
-    rows = db.execute(
-        """SELECT node_id, content_hash FROM memory_nodes
-        WHERE node_type = 'file' AND is_deleted = 0"""
-    ).fetchall()
-    with transaction(db):
-        db.execute(
-            "DELETE FROM memory_index_state WHERE state_key = ?",
-            (ACTIVE_CHUNK_STATE_KEY,),
-        )
-        db.execute(
-            """UPDATE memory_nodes SET embedding_synced = 0
-            WHERE node_type = 'file' AND is_deleted = 0"""
-        )
-    return _enqueue_jobs(
-        db,
-        [(str(row["node_id"]), str(row["content_hash"] or "")) for row in rows],
-    )
 
 
 @dataclass(frozen=True)
@@ -362,7 +164,10 @@ def _assess_bundle_path(workspace: Path, raw_path: str) -> _BundlePathView:
     candidate = workspace / eligibility.path
     if candidate.is_symlink():
         return _BundlePathView(memory_path=None, exists=False)
-    if candidate.exists() and not assess_workspace_document(workspace, eligibility.path).eligible:
+    if (
+        candidate.exists()
+        and not assess_workspace_document(workspace, eligibility.path).eligible
+    ):
         return _BundlePathView(memory_path=None, exists=False)
     return _BundlePathView(memory_path=eligibility.path, exists=candidate.is_file())
 
@@ -380,7 +185,9 @@ def _assess_bundle_paths(
     Returns:
         dict[str, _BundlePathView]: 原始路径到判定结果的映射。
     """
-    return {raw_path: _assess_bundle_path(workspace, raw_path) for raw_path in raw_paths}
+    return {
+        raw_path: _assess_bundle_path(workspace, raw_path) for raw_path in raw_paths
+    }
 
 
 def _read_documents(
@@ -427,6 +234,9 @@ class LifeMemoryService:
         *,
         clock: Any = None,
         vector_backend_enabled: bool = True,
+        storage_runtime: StorageBackendRuntime | None = None,
+        memory_storage: MemoryStorageBundle | None = None,
+        selectable_storage_enabled: bool = False,
     ) -> None:
         """初始化记忆服务。
 
@@ -437,6 +247,13 @@ class LifeMemoryService:
         self.plugin = plugin
         self._clock = clock or datetime.now
         self._vector_backend_enabled = bool(vector_backend_enabled)
+        if storage_runtime is not None and memory_storage is not None:
+            raise ValueError(
+                "LifeMemoryService accepts storage_runtime or memory_storage, not both"
+            )
+        self._storage_runtime = storage_runtime
+        self._provided_memory_storage = memory_storage
+        self._selectable_storage_enabled = bool(selectable_storage_enabled)
         self._workspace_override: Path | None = None
         if isinstance(plugin, (str, Path)):
             self._workspace_override = Path(plugin)
@@ -483,6 +300,15 @@ class LifeMemoryService:
 
     def _get_db_path(self) -> Path:
         """获取数据库路径。"""
+        runtime = self._storage_runtime
+        if (
+            runtime is not None
+            and runtime.enabled
+            and runtime.backend == BackendKind.LOCAL
+            and runtime.engine is not None
+            and runtime.engine.url.database
+        ):
+            return Path(str(runtime.engine.url.database)).resolve()
         if self._workspace_override is not None:
             workspace = self._workspace_override
         else:
@@ -509,7 +335,9 @@ class LifeMemoryService:
     async def _get_chroma_collection(self) -> Any:
         """获取并缓存兼容旧节点向量的集合。"""
         if self._chroma_collection is None:
-            self._chroma_collection = await get_chroma_collection(self._get_vector_db_path())
+            self._chroma_collection = await get_chroma_collection(
+                self._get_vector_db_path()
+            )
         return self._chroma_collection
 
     async def _resolve_chunk_collection(
@@ -520,7 +348,10 @@ class LifeMemoryService:
     ) -> Any:
         """按 embedding 模型和维度获取本轮 worker 的候选集合。"""
         identity = (str(model_name or "unknown"), int(dimension))
-        if self._chunk_collection is not None and self._chunk_collection_identity == identity:
+        if (
+            self._chunk_collection is not None
+            and self._chunk_collection_identity == identity
+        ):
             return self._chunk_collection
         if (
             self._chunk_collection_candidate is not None
@@ -578,8 +409,9 @@ class LifeMemoryService:
                 raise ValueError(f"ChunkCollectionMetadataMismatch:{key}")
 
     async def _restore_chunk_collection(self) -> None:
-        db = self._require_db()
-        state = await run_db(read_active_chunk_index_state, db)
+        state = (
+            await self._require_memory_storage().document_index.read_chunk_index_state()
+        )
         if state is None:
             return
         self._chunk_index_state = state
@@ -596,37 +428,66 @@ class LifeMemoryService:
         logger.info(f"已恢复 chunk 向量集合: {state.collection_name}")
 
     async def initialize(self) -> None:
-        """初始化记忆服务。"""
+        """初始化唯一被选择的 Memory backend；禁止跨 backend 回退。"""
         async with self._lifecycle_lock:
             if self._initialized:
                 return
-
-            db_path = self._get_db_path()
-
-            # 连接的 journal/durability/cache 配置全部集中在 sqlite_runtime，
-            # 避免这里和读连接池、备份路径各自设一套 PRAGMA 而悄悄漂移。
-            db = await run_db(open_memory_connection, db_path, role="writer")
-            self._db = db
-            bind_reader_pool(db_path)
-
-            try:
-                await self._create_tables()
-                await run_db(create_memory_schema, db)
-                await run_db(create_life_memory_schema, db)
-                await run_db(create_epistemic_schema, db)
-                await run_db(create_living_memory_schema, db)
-                self._memory_storage = create_local_memory_storage_bundle(
-                    self._require_db
+            storage_enabled = self._selectable_storage_enabled or bool(
+                getattr(getattr(self._get_config(), "storage", None), "enabled", False)
+            )
+            if (
+                storage_enabled
+                and self._provided_memory_storage is None
+                and (self._storage_runtime is None or not self._storage_runtime.enabled)
+            ):
+                raise RuntimeError(
+                    "selectable Memory storage is enabled but no coherent runtime was injected"
                 )
+            local_db: sqlite3.Connection | None = None
+            try:
+                if self._provided_memory_storage is not None:
+                    self._memory_storage = self._provided_memory_storage
+                elif (
+                    self._storage_runtime is not None
+                    and self._storage_runtime.enabled
+                    and self._storage_runtime.backend == BackendKind.MYSQL
+                ):
+                    self._memory_storage = await open_mysql_memory_storage(
+                        self._storage_runtime,
+                        initialize_schema=False,
+                    )
+                else:
+                    db_path = self._get_db_path()
+                    local_db = await run_db(
+                        open_memory_connection,
+                        db_path,
+                        role="writer",
+                    )
+                    self._db = local_db
+                    bind_reader_pool(db_path)
+                    await self._create_tables()
+                    await run_db(create_memory_schema, local_db)
+                    await run_db(create_life_memory_schema, local_db)
+                    await run_db(create_epistemic_schema, local_db)
+                    await run_db(create_living_memory_schema, local_db)
+                    local_runtime = (
+                        self._storage_runtime
+                        if self._storage_runtime is not None
+                        and self._storage_runtime.enabled
+                        else None
+                    )
+                    self._memory_storage = create_local_memory_storage_bundle(
+                        self._require_local_db,
+                        runtime=local_runtime,
+                    )
+
+                await self._validate_storage_availability()
 
                 if self._vector_backend_enabled:
                     try:
                         await self._restore_chunk_collection()
                     except Exception as exc:
-                        requeued = await run_db(
-                            _invalidate_missing_vector_projection,
-                            db,
-                        )
+                        requeued = await self._require_memory_storage().document_index.invalidate_vector_projection()
                         self._chunk_index_state = None
                         self._chunk_collection = None
                         self._chunk_collection_identity = None
@@ -639,19 +500,43 @@ class LifeMemoryService:
 
                     self._chroma_collection = await self._get_chroma_collection()
                 else:
-                    logger.warning("Life Memory 向量后端已关闭，使用 SQLite 检索")
+                    logger.warning("Life Memory 向量后端已关闭，使用词法检索")
                 self._initialized = True
                 await self._startup_recovery()
             except BaseException:
                 self._memory_storage = None
                 self._db = None
                 bind_reader_pool(None)
-                await run_db(db.close)
+                if local_db is not None:
+                    await run_db(local_db.close)
                 raise
-            logger.info(f"记忆服务初始化完成，数据库: {db_path}")
+            backend = self._require_memory_storage().backend.value
+            logger.info(f"记忆服务初始化完成，权威后端: {backend}")
+
+    async def _validate_storage_availability(self) -> None:
+        storage = self._require_memory_storage()
+        names = (
+            "document_index",
+            "experiences",
+            "witnesses",
+            "living",
+            "epistemic",
+            "legacy_graph",
+        )
+        statuses = await asyncio.gather(
+            *(getattr(storage, name).availability() for name in names)
+        )
+        failed = [
+            f"{name}={status.value}"
+            for name, status in zip(names, statuses, strict=True)
+            if status not in {StorageAvailability.HEALTHY, StorageAvailability.DEGRADED}
+        ]
+        if failed:
+            raise RuntimeError("MemoryBackendUnavailable:" + ",".join(failed))
 
     async def _create_tables(self) -> None:
         """创建数据库表。"""
+
         def _do_db_work() -> None:
             cursor = self._db.cursor()
 
@@ -701,16 +586,24 @@ class LifeMemoryService:
             )
 
             # 索引
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_nodes_type ON memory_nodes(node_type)")
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nodes_type ON memory_nodes(node_type)"
+            )
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_nodes_activation ON memory_nodes(activation_strength DESC)"
             )
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_nodes_file_path ON memory_nodes(file_path)")
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nodes_file_path ON memory_nodes(file_path)"
+            )
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_edges_source ON memory_edges(source_id, weight DESC)"
             )
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_edges_target ON memory_edges(target_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_edges_type ON memory_edges(edge_type)")
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_edges_target ON memory_edges(target_id)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_edges_type ON memory_edges(edge_type)"
+            )
 
             # 数据库级自环防线：任何路径（含手工 SQL）都不得写入自指边。
             cursor.execute(
@@ -785,77 +678,164 @@ class LifeMemoryService:
         进程（适配器收发、心跳、调度）都在等它。现在读查询走只读连接、
         文件 IO 走线程、写入走写连接，事件循环在整个恢复过程中保持可用。
         """
+        await self._startup_recovery_via_ports()
+
+    async def _startup_recovery_via_ports(self) -> None:
+        """Reconcile workspace documents through the selected backend ports."""
+
         workspace = self._get_workspace_path()
-        db = self._db
-        if db is None:
-            return
-
-        # 0. 补 embedding 入队缺口：节点已存在但从未入队（历史遗留 / 任务丢失）
-        unembedded_no_job = await run_read(_select_unembedded_without_job)
-        if unembedded_no_job:
-            logger.info(f"启动扫描：发现 {len(unembedded_no_job)} 个有节点但无任务的未同步文件，补入队")
-            requeued = await self._requeue_unembedded(workspace, db, unembedded_no_job)
-            logger.info(f"补 embedding 入队完成：已入队 {requeued}/{len(unembedded_no_job)} 个节点")
-
-        # 1. 扫描工作区，收集已索引路径
+        storage = self._require_memory_storage()
         scan = await asyncio.to_thread(scan_workspace_documents, workspace)
-        workspace_paths: set[str] = {doc.path for doc in scan.documents}
-
-        indexed_rows = await run_read(_select_indexed_file_nodes)
-        indexed_paths: dict[str, tuple[str, int, str]] = {}
-        for row in indexed_rows:
-            fp = str(row["file_path"] or "")
-            if fp:
-                indexed_paths[fp] = (
-                    str(row["node_id"]),
-                    int(row["is_deleted"] or 0),
-                    str(row["content_hash"] or ""),
-                )
-
-        # 1a. 文件系统也是记忆输入端。捕获绕过内置工具发生的人工修改与删除，
-        # 追加到版本账本；同时刷新已有文档的 FTS/chunk 权威投影，避免“版本看见了变化，
-        # 检索正文却仍停在旧内容”的双重现实。
-        active_index_hashes = {
-            path: content_hash
-            for path, (_node_id, deleted, content_hash) in indexed_paths.items()
-            if deleted == 0 and content_hash
+        workspace_paths = {document.path for document in scan.documents}
+        indexed_nodes = await storage.document_index.list_indexed_documents()
+        indexed = {
+            str(node.file_path): node for node in indexed_nodes if node.file_path
         }
-        versioned = await self._reconcile_workspace_artifact_versions(
-            scan.documents,
+        loaded: dict[str, tuple[str, float]] = {}
+        mtimes = {document.path: document.source_mtime for document in scan.documents}
+        paths = [document.path for document in scan.documents]
+        for start in range(0, len(paths), _RECOVERY_READ_BATCH):
+            batch = paths[start : start + _RECOVERY_READ_BATCH]
+            documents = await asyncio.to_thread(_read_documents, workspace, batch)
+            for path, content in documents:
+                source_mtime = mtimes[path]
+                loaded[path] = (content, source_mtime)
+                digest = compute_content_hash(content) if content else ""
+                node = indexed.get(path)
+                if node is None:
+                    await storage.document_index.upsert_document(
+                        path,
+                        content,
+                        Path(path).stem,
+                        source_mtime,
+                    )
+                elif node.node_id != generate_file_node_id(path):
+                    legacy_hash = str(node.content_hash or "")
+                    if not node.embedding_synced and legacy_hash:
+                        await storage.document_index.enqueue_job(
+                            node.node_id,
+                            legacy_hash,
+                        )
+                    logger.warning(
+                        "启动扫描保留非规范 legacy 文档身份，等待显式迁移: "
+                        f"path={path} node_id={node.node_id}"
+                    )
+                elif str(node.content_hash or "") != digest:
+                    await storage.document_index.upsert_document(
+                        path,
+                        content,
+                        Path(path).stem,
+                        source_mtime,
+                    )
+                elif not node.embedding_synced and digest:
+                    await storage.document_index.enqueue_job(node.node_id, digest)
+
+        missing_node_ids = [
+            indexed[path].node_id for path in sorted(set(indexed) - workspace_paths)
+        ]
+        if missing_node_ids:
+            retired = await storage.document_index.mark_documents_deleted(
+                missing_node_ids
+            )
+            logger.info(f"启动清理：标记 {retired} 个 ghost 节点为已删除")
+        orphaned = await storage.legacy_graph.prune_orphan_edges()
+        if orphaned:
+            logger.info(f"启动清理：删除 {orphaned} 条孤立边")
+
+        versioned = await self._reconcile_workspace_artifact_versions_via_ports(
+            loaded,
             workspace_paths,
-            indexed_hashes=active_index_hashes,
         )
         if versioned:
             logger.info(f"启动扫描：记忆版本账本追加 {versioned} 个观察版本")
 
-        # 2. 补索引缺口：工作区有但未索引的文件
-        active_indexed_paths = {
-            path
-            for path, (_node_id, deleted, _content_hash) in indexed_paths.items()
-            if deleted == 0
-        }
-        unindexed = workspace_paths - active_indexed_paths
-        if unindexed:
-            logger.info(f"启动扫描：发现 {len(unindexed)} 个未索引文件，开始补索引")
-            enqueued = await self._index_missing_documents(workspace, db, sorted(unindexed))
-            logger.info(f"启动扫描完成：已入队 {enqueued}/{len(unindexed)} 个文件待 embedding")
+    async def _reconcile_workspace_artifact_versions_via_ports(
+        self,
+        loaded: dict[str, tuple[str, float]],
+        workspace_paths: set[str],
+    ) -> int:
+        living = self._require_memory_storage().living
+        head_records = await living.list_artifact_heads()
+        heads = {version.logical_key: (version, head) for version, head in head_records}
+        appended = 0
+        for logical_key, (content, source_mtime) in loaded.items():
+            current = heads.get(logical_key)
+            current_version = current[0] if current is not None else None
+            current_head = current[1] if current is not None else None
+            if current_version is not None and current_version.content == content:
+                continue
+            version = new_artifact_version(
+                logical_key=logical_key,
+                artifact_kind="workspace_memory_document",
+                content=content,
+                parent_artifact_ids=(current_version.artifact_id,)
+                if current_version is not None
+                else (),
+                authored_by="workspace_reconciler",
+                consciousness_instance_id="life_engine",
+                valid_from=datetime.fromtimestamp(source_mtime)
+                .astimezone()
+                .isoformat(),
+                metadata={
+                    "observation": "startup_baseline"
+                    if current_version is None
+                    else "startup_observed_change",
+                    "source_mtime": source_mtime,
+                },
+            )
+            derivations: tuple[MemoryDerivation, ...] = ()
+            if current_version is not None:
+                derivations = (
+                    MemoryDerivation(
+                        derivation_id=f"derivation_{uuid.uuid4().hex}",
+                        generated_artifact_id=version.artifact_id,
+                        used_artifact_id=current_version.artifact_id,
+                        predicate="workspace_change_observed",
+                        reason="启动时观察到工作区内容与已知版本不同",
+                        actor="workspace_reconciler",
+                        recorded_at=version.recorded_at,
+                    ),
+                )
+            await living.append_artifact(
+                version,
+                derivations=derivations,
+                expected_head_revision=current_head.revision
+                if current_head is not None
+                else 0,
+            )
+            appended += 1
 
-        # 3. 标记 ghost 节点：索引中有但工作区已删除的文件
-        ghost_paths = active_indexed_paths - workspace_paths
-        ghost_node_ids = []
-        for fp in ghost_paths:
-            nid, deleted, _content_hash = indexed_paths[fp]
-            if deleted == 0:  # 还没标记删除
-                ghost_node_ids.append(nid)
-        if ghost_node_ids:
-            await run_db(_mark_nodes_deleted, db, ghost_node_ids)
-            logger.info(f"启动清理：标记 {len(ghost_node_ids)} 个 ghost 节点为已删除")
-
-        # 4. 清理孤立边：FK 约束违反（指向已删除节点的边）
-        orphan_edge_ids = await run_read(_select_orphan_edge_ids)
-        if orphan_edge_ids:
-            await run_db(_delete_edges, db, orphan_edge_ids)
-            logger.info(f"启动清理：删除 {len(orphan_edge_ids)} 条孤立边")
+        for logical_key, (current_version, current_head) in heads.items():
+            if logical_key in workspace_paths:
+                continue
+            if current_version.artifact_kind == "workspace_memory_document_tombstone":
+                continue
+            tombstone = new_artifact_version(
+                logical_key=logical_key,
+                artifact_kind="workspace_memory_document_tombstone",
+                content="",
+                parent_artifact_ids=(current_version.artifact_id,),
+                authored_by="workspace_reconciler",
+                consciousness_instance_id="life_engine",
+                metadata={"observation": "startup_observed_deletion"},
+            )
+            await living.append_artifact(
+                tombstone,
+                derivations=(
+                    MemoryDerivation(
+                        derivation_id=f"derivation_{uuid.uuid4().hex}",
+                        generated_artifact_id=tombstone.artifact_id,
+                        used_artifact_id=current_version.artifact_id,
+                        predicate="workspace_deletion_observed",
+                        reason="启动时观察到记忆文件已不存在",
+                        actor="workspace_reconciler",
+                        recorded_at=tombstone.recorded_at,
+                    ),
+                ),
+                expected_head_revision=current_head.revision,
+            )
+            appended += 1
+        return appended
 
     async def _reconcile_workspace_artifact_versions(
         self,
@@ -866,12 +846,8 @@ class LifeMemoryService:
     ) -> int:
         """Append artifact history and refresh externally changed search rows."""
 
-        db = self._require_db()
+        loaded: dict[str, tuple[str, float]] = {}
         workspace = self._get_workspace_path()
-        heads = await run_db(list_artifact_heads, db)
-        appended = 0
-        refreshed = 0
-        known_hashes = indexed_hashes or {}
         for document in documents:
             try:
                 content, source_mtime, _size = await asyncio.to_thread(
@@ -879,177 +855,15 @@ class LifeMemoryService:
                     workspace,
                     document.path,
                 )
-            except (FileNotFoundError, OSError, ValueError) as exc:
-                logger.warning(f"记忆版本扫描读取失败 {document.path}: {exc}")
+            except (FileNotFoundError, OSError, ValueError):
                 continue
+            loaded[document.path] = (content, source_mtime)
+        return await self._reconcile_workspace_artifact_versions_via_ports(
+            loaded,
+            workspace_paths,
+        )
 
-            current_hash = compute_content_hash(content) if content else ""
-            indexed_hash = known_hashes.get(document.path)
-            if indexed_hash is not None and current_hash and indexed_hash != current_hash:
-                try:
-                    await get_or_create_file_node(
-                        db=db,
-                        file_path=document.path,
-                        title=Path(document.path).stem,
-                        content=content,
-                    )
-                    refreshed += 1
-                except Exception as exc:
-                    # 旧版非规范 node identity 不能在普通启动中偷偷迁移；留下诊断，
-                    # 但不能让一个坏节点阻止其余记忆与插件启动。
-                    logger.warning(
-                        f"刷新外部变更文档的检索投影失败 {document.path}: {exc}"
-                    )
-
-            head = heads.get(document.path)
-            if head is not None and head.content == content:
-                continue
-            parents = (head.artifact_id,) if head is not None else ()
-            version = new_artifact_version(
-                logical_key=document.path,
-                artifact_kind="workspace_memory_document",
-                content=content,
-                parent_artifact_ids=parents,
-                authored_by="workspace_reconciler",
-                consciousness_instance_id="life_engine",
-                valid_from=datetime.fromtimestamp(source_mtime).astimezone().isoformat(),
-                metadata={
-                    "observation": (
-                        "startup_baseline" if head is None else "startup_observed_change"
-                    ),
-                    "source_mtime": source_mtime,
-                },
-            )
-            derivations: tuple[MemoryDerivation, ...] = ()
-            if head is not None:
-                derivations = (
-                    MemoryDerivation(
-                        derivation_id=f"derivation_{uuid.uuid4().hex}",
-                        generated_artifact_id=version.artifact_id,
-                        used_artifact_id=head.artifact_id,
-                        predicate="workspace_change_observed",
-                        reason="启动时观察到工作区内容与已知版本不同",
-                        actor="workspace_reconciler",
-                        recorded_at=version.recorded_at,
-                    ),
-                )
-            await run_db(
-                append_artifact_version,
-                db,
-                version,
-                derivations=derivations,
-            )
-            heads[document.path] = version
-            appended += 1
-
-        for logical_key, head in heads.items():
-            if logical_key in workspace_paths:
-                continue
-            if head.artifact_kind == "workspace_memory_document_tombstone":
-                continue
-            tombstone = new_artifact_version(
-                logical_key=logical_key,
-                artifact_kind="workspace_memory_document_tombstone",
-                content="",
-                parent_artifact_ids=(head.artifact_id,),
-                authored_by="workspace_reconciler",
-                consciousness_instance_id="life_engine",
-                metadata={"observation": "startup_observed_deletion"},
-            )
-            await run_db(
-                append_artifact_version,
-                db,
-                tombstone,
-                derivations=(
-                    MemoryDerivation(
-                        derivation_id=f"derivation_{uuid.uuid4().hex}",
-                        generated_artifact_id=tombstone.artifact_id,
-                        used_artifact_id=head.artifact_id,
-                        predicate="workspace_deletion_observed",
-                        reason="启动时观察到记忆文件已不存在",
-                        actor="workspace_reconciler",
-                        recorded_at=tombstone.recorded_at,
-                    ),
-                ),
-            )
-            appended += 1
-        if refreshed:
-            logger.info(f"启动扫描：刷新 {refreshed} 个外部变更文档的检索投影")
-        return appended
-
-    async def _requeue_unembedded(
-        self,
-        workspace: Path,
-        db: sqlite3.Connection,
-        rows: Sequence[sqlite3.Row],
-    ) -> int:
-        """为已存在但从未入队的节点补建 embedding 任务。
-
-        Args:
-            workspace: 工作区根目录。
-            db: 写连接。
-            rows: ``_select_unembedded_without_job`` 的查询结果。
-
-        Returns:
-            int: 成功入队的节点数。
-        """
-        requeued = 0
-        # 有 content_hash 的直接入队，无需重读文件——先整批处理掉，避免和
-        # 昂贵的文件读取交错。
-        with_hash = [
-            (str(row["node_id"]), str(row["content_hash"]))
-            for row in rows
-            if str(row["content_hash"] or "")
-        ]
-        if with_hash:
-            requeued += await run_db(_enqueue_jobs, db, with_hash)
-
-        needs_read = [
-            str(row["file_path"] or "")
-            for row in rows
-            if not str(row["content_hash"] or "") and str(row["file_path"] or "")
-        ]
-        if needs_read:
-            requeued += await self._index_missing_documents(workspace, db, needs_read)
-        return requeued
-
-    async def _index_missing_documents(
-        self,
-        workspace: Path,
-        db: sqlite3.Connection,
-        paths: Sequence[str],
-    ) -> int:
-        """读取工作区文档并建立文件节点，文件 IO 全部在线程中完成。
-
-        文档按批读取而非一次读完：整个工作区的正文同时驻留内存可能是数百 MB，
-        分批只影响峰值内存，不改变最终被索引的文件集合。
-
-        Args:
-            workspace: 工作区根目录。
-            db: 写连接。
-            paths: 待索引的工作区相对路径。
-
-        Returns:
-            int: 成功建立节点的文件数。
-        """
-        indexed = 0
-        for start in range(0, len(paths), _RECOVERY_READ_BATCH):
-            batch = paths[start : start + _RECOVERY_READ_BATCH]
-            documents = await asyncio.to_thread(_read_documents, workspace, batch)
-            for file_path, content in documents:
-                try:
-                    await get_or_create_file_node(
-                        db=db,
-                        file_path=file_path,
-                        title=Path(file_path).stem,
-                        content=content,
-                    )
-                    indexed += 1
-                except Exception as exc:
-                    logger.warning(f"补索引失败 {file_path}: {exc}")
-        return indexed
-
-    def _require_db(self) -> sqlite3.Connection:
+    def _require_local_db(self) -> sqlite3.Connection:
         if self._db is None or self._closing:
             raise RuntimeError("记忆服务尚未初始化或正在关闭")
         return self._db
@@ -1058,7 +872,9 @@ class LifeMemoryService:
     def available(self) -> bool:
         """Whether the service can currently serve public memory operations."""
 
-        return self._db is not None and self._initialized and not self._closing
+        return (
+            self._memory_storage is not None and self._initialized and not self._closing
+        )
 
     async def read_graph_projection(
         self,
@@ -1096,9 +912,7 @@ class LifeMemoryService:
         evolution_trace: list[dict[str, Any]] = []
         for direction, edges in (("later", outgoing), ("earlier", incoming)):
             for edge in edges:
-                related_id = (
-                    edge.target_id if direction == "later" else edge.source_id
-                )
+                related_id = edge.target_id if direction == "later" else edge.source_id
                 related = await graph.get_node_by_id(related_id)
                 if related is None or not related.file_path:
                     continue
@@ -1166,11 +980,10 @@ class LifeMemoryService:
         return storage
 
     async def close(self) -> None:
-        """幂等关闭 SQLite；共享向量服务的生命周期由 kernel 管理。"""
+        """幂等释放 Memory 自有资源；注入的 coherent runtime 由 Life Engine 关闭。"""
         async with self._lifecycle_lock:
-            if self._db is None:
+            if self._db is None and self._memory_storage is None:
                 self._initialized = False
-                self._memory_storage = None
                 self._clear_cached_collections()
                 return
 
@@ -1233,8 +1046,10 @@ class LifeMemoryService:
     async def enqueue_index_job(self, node_id: str, content_hash: str) -> str:
         """加入一个待处理索引任务，不触发 embedding 或网络请求。"""
         async with self._index_write_lock:
-            db = self._require_db()
-            return await run_db(enqueue_index_job, db, node_id, content_hash)
+            return await self._require_memory_storage().document_index.enqueue_job(
+                node_id,
+                content_hash,
+            )
 
     async def process_index_jobs(self, limit: int = 10) -> List[IndexJob]:
         """领取待处理任务，交给外部 worker；本方法不执行 embedding。"""
@@ -1254,22 +1069,11 @@ class LifeMemoryService:
     ) -> IndexWorkerReport:
         """执行一批 chunk embedding 任务，不阻塞并发文档更新。"""
 
-        def _open_worker_db() -> sqlite3.Connection:
-            worker_db = sqlite3.connect(str(self._get_db_path()), check_same_thread=False)
-            worker_db.row_factory = sqlite3.Row
-            worker_db.execute("PRAGMA foreign_keys = ON")
-            worker_db.execute("PRAGMA busy_timeout = 5000")
-            register_indexed_path_sql_function(worker_db)
-            return worker_db
-
         async with self._index_worker_lock:
-            self._require_db()
-            worker_db = _open_worker_db()
             worker_task = asyncio.create_task(
-                run_chunk_index_jobs(
-                    worker_db,
-                    collection,
+                self._require_memory_storage().document_index.run_index_worker(
                     limit=limit,
+                    collection=collection,
                     embed_texts_func=embed_texts_func,
                     collection_resolver=self._resolve_chunk_collection,
                     collection_upsert_func=collection_upsert_func,
@@ -1279,22 +1083,22 @@ class LifeMemoryService:
             )
             try:
                 report = await asyncio.shield(worker_task)
-                tombstone_collection = collection or self._chunk_collection
-                if tombstone_collection is not None:
-                    try:
-                        await consume_vector_tombstones(worker_db, tombstone_collection)
-                    except Exception as exc:  # noqa: BLE001
-                        logger.debug(f"向量 tombstone 清理失败: {exc}")
             except asyncio.CancelledError:
                 await worker_task
                 raise
-            finally:
-                worker_db.close()
             if report.completed:
                 active_collection = collection or self._chunk_collection_candidate
                 if active_collection is not None:
                     self._chunk_collection = active_collection
-                    self._chunk_collection_identity = (report.model_name, report.dimension)
+                    self._chunk_collection_identity = (
+                        report.model_name,
+                        report.dimension,
+                    )
+            active_collection = collection or self._chunk_collection
+            if active_collection is not None:
+                await self._require_memory_storage().document_index.consume_vector_tombstones(
+                    active_collection
+                )
         return report
 
     async def list_index_jobs(
@@ -1366,13 +1170,10 @@ class LifeMemoryService:
         entity_id: str,
     ) -> RetrievalPlasticity:
         """读取仅用于候选排序的可塑性提示，不替代认识论判断。"""
-        async with self._index_write_lock:
-            return await run_db(
-                get_retrieval_plasticity,
-                self._require_db(),
-                entity_type,
-                entity_id,
-            )
+        return await self._require_memory_storage().epistemic.get_retrieval_plasticity(
+            entity_type,
+            entity_id,
+        )
 
     async def record_epistemic_claim(
         self,
@@ -1439,14 +1240,11 @@ class LifeMemoryService:
         recorded_as_of: str = "",
     ) -> MemoryDisposition:
         """读取主体性遗忘状态；它不影响原始记录的保留与审计。"""
-        async with self._index_write_lock:
-            return await run_db(
-                get_memory_disposition,
-                self._require_db(),
-                entity_type,
-                entity_id,
-                recorded_as_of=recorded_as_of,
-            )
+        return await self._require_memory_storage().epistemic.get_disposition(
+            entity_type,
+            entity_id,
+            recorded_as_of=recorded_as_of,
+        )
 
     async def get_memory_claim_state(
         self,
@@ -1455,13 +1253,10 @@ class LifeMemoryService:
         recorded_as_of: str = "",
     ) -> ClaimState | None:
         """从完整事件历史还原一个主张在指定记录时点的状态。"""
-        async with self._index_write_lock:
-            return await run_db(
-                get_claim_state,
-                self._require_db(),
-                claim_id,
-                recorded_as_of=recorded_as_of,
-            )
+        return await self._require_memory_storage().epistemic.get_claim_state(
+            claim_id,
+            recorded_as_of=recorded_as_of,
+        )
 
     async def list_memory_claim_states(
         self,
@@ -1473,16 +1268,13 @@ class LifeMemoryService:
         visibility: tuple[str, ...] = ("private",),
     ) -> List[ClaimState]:
         """双时间查询主张状态，默认不跨私有流。"""
-        async with self._index_write_lock:
-            return await run_db(
-                list_claim_states,
-                self._require_db(),
-                subject_key,
-                recorded_as_of=recorded_as_of,
-                valid_at=valid_at,
-                stream_scope=stream_scope,
-                visibility=visibility,
-            )
+        return await self._require_memory_storage().epistemic.list_claim_states(
+            subject_key,
+            recorded_as_of=recorded_as_of,
+            valid_at=valid_at,
+            stream_scope=stream_scope,
+            visibility=visibility,
+        )
 
     async def project_current_memory_facts(
         self,
@@ -1494,16 +1286,13 @@ class LifeMemoryService:
         visibility: tuple[str, ...] = ("private",),
     ) -> CurrentFactProjection:
         """重建一个双时间当前事实投影，冲突和不确定性始终保留。"""
-        async with self._index_write_lock:
-            return await run_db(
-                project_current_facts,
-                self._require_db(),
-                subject_key,
-                valid_at=valid_at,
-                recorded_as_of=recorded_as_of,
-                stream_scope=stream_scope,
-                visibility=visibility,
-            )
+        return await self._require_memory_storage().epistemic.project_current_facts(
+            subject_key,
+            valid_at=valid_at,
+            recorded_as_of=recorded_as_of,
+            stream_scope=stream_scope,
+            visibility=visibility,
+        )
 
     async def get_memory_audit_trail(
         self,
@@ -1513,14 +1302,11 @@ class LifeMemoryService:
         recorded_as_of: str = "",
     ) -> List[MemoryAuditEntry]:
         """返回事件、操作者、理由、因果来源与补偿关系的完整审计轨迹。"""
-        async with self._index_write_lock:
-            return await run_db(
-                build_memory_audit_trail,
-                self._require_db(),
-                entity_type,
-                entity_id,
-                recorded_as_of=recorded_as_of,
-            )
+        return await self._require_memory_storage().epistemic.get_audit_trail(
+            entity_type,
+            entity_id,
+            recorded_as_of=recorded_as_of,
+        )
 
     async def list_memory_state_events(
         self,
@@ -1530,26 +1316,20 @@ class LifeMemoryService:
         recorded_as_of: str = "",
     ) -> List[MemoryStateEvent]:
         """读取完整事件轨迹，供审计、回放和解释使用。"""
-        async with self._index_write_lock:
-            return await run_db(
-                list_state_events,
-                self._require_db(),
-                entity_type,
-                entity_id,
-                recorded_as_of=recorded_as_of,
-            )
+        return await self._require_memory_storage().epistemic.list_state_events(
+            entity_type,
+            entity_id,
+            recorded_as_of=recorded_as_of,
+        )
 
     async def list_memory_claim_evidence(
         self,
         claim_id: str,
     ) -> List[ClaimEvidence]:
         """读取一个主张的完整证据链。"""
-        async with self._index_write_lock:
-            return await run_db(
-                list_claim_evidence,
-                self._require_db(),
-                claim_id,
-            )
+        return await self._require_memory_storage().epistemic.list_claim_evidence(
+            claim_id
+        )
 
     # --------------------------------------------------------
     # 生命记忆本体：不可变经历与第一人称见证
@@ -1608,9 +1388,18 @@ class LifeMemoryService:
         """Create a new head while preserving the previous artifact version."""
 
         async with self._index_write_lock:
-            db = self._require_db()
-            head = await run_db(get_artifact_head, db, logical_key)
-            head_state = await run_db(get_artifact_head_state, db, logical_key)
+            living = self._require_memory_storage().living
+            head_state = await living.get_artifact_head(logical_key)
+            history = await living.list_artifact_history(logical_key)
+            head = next(
+                (
+                    item
+                    for item in history
+                    if head_state is not None
+                    and item.artifact_id == head_state.artifact_id
+                ),
+                None,
+            )
             parents = (head.artifact_id,) if head is not None else ()
             version = new_artifact_version(
                 logical_key=logical_key,
@@ -1637,9 +1426,7 @@ class LifeMemoryService:
                         recorded_at=version.recorded_at,
                     ),
                 )
-            return await run_db(
-                append_artifact_version,
-                db,
+            return await living.append_artifact(
                 version,
                 derivations=derivations,
                 expected_head_revision=(
@@ -1684,12 +1471,7 @@ class LifeMemoryService:
     ) -> List[SemanticRelation]:
         """Return every explicit relation touching one memory entity."""
 
-        async with self._index_write_lock:
-            return await run_db(
-                list_semantic_relations,
-                self._require_db(),
-                entity_ref,
-            )
+        return await self._require_memory_storage().living.list_relations(entity_ref)
 
     async def list_memory_interpretations(
         self,
@@ -1699,13 +1481,10 @@ class LifeMemoryService:
     ) -> List[MemoryInterpretation]:
         """Read the interpretation history available at a recorded time."""
 
-        async with self._index_write_lock:
-            return await run_db(
-                list_interpretations,
-                self._require_db(),
-                subject_id,
-                recorded_as_of=recorded_as_of,
-            )
+        return await self._require_memory_storage().living.list_interpretations(
+            subject_id,
+            recorded_as_of=recorded_as_of,
+        )
 
     async def search_memory_interpretations(
         self,
@@ -1718,16 +1497,13 @@ class LifeMemoryService:
     ) -> List[InterpretationSearchResult]:
         """Search subject-authored interpretations with their source trace."""
 
-        async with self._index_write_lock:
-            return await run_db(
-                search_interpretations,
-                self._require_db(),
-                query,
-                top_k=top_k,
-                stream_scope=stream_scope,
-                visibility=visibility,
-                recorded_as_of=recorded_as_of,
-            )
+        return await self._require_memory_storage().living.search_interpretations(
+            query,
+            top_k=top_k,
+            stream_scope=stream_scope,
+            visibility=visibility,
+            recorded_as_of=recorded_as_of,
+        )
 
     async def get_memory_interpretation(
         self,
@@ -1735,12 +1511,9 @@ class LifeMemoryService:
     ) -> tuple[MemoryInterpretation, tuple[InterpretationSource, ...]] | None:
         """Read one interpretation and its provenance by stable identity."""
 
-        async with self._index_write_lock:
-            return await run_db(
-                get_interpretation,
-                self._require_db(),
-                interpretation_id,
-            )
+        return await self._require_memory_storage().living.get_interpretation(
+            interpretation_id
+        )
 
     async def select_memory_association_neighbours(
         self,
@@ -1752,15 +1525,14 @@ class LifeMemoryService:
     ) -> List[AssociationSelection]:
         """Select replayable contextual neighbours across memory entity kinds."""
 
-        async with self._index_write_lock:
-            return await run_db(
-                choose_association_neighbours,
-                self._require_db(),
+        return (
+            await self._require_memory_storage().living.choose_association_neighbours(
                 seed_refs,
                 context_key=context_key,
                 random_seed=random_seed,
                 limit=limit,
             )
+        )
 
     async def begin_memory_recall(
         self,
@@ -1794,22 +1566,17 @@ class LifeMemoryService:
     ) -> List[AssociationEvidence]:
         """Return separate contextual association dimensions."""
 
-        async with self._index_write_lock:
-            return await run_db(
-                list_association_evidence,
-                self._require_db(),
-                entity_ref,
-                context_key=context_key,
-            )
+        return await self._require_memory_storage().living.list_association_evidence(
+            entity_ref,
+            context_key=context_key,
+        )
 
     async def rebuild_memory_association_projection(self) -> int:
         """Rebuild derived pairwise accessibility from immutable hyperedges."""
 
-        async with self._index_write_lock:
-            return await run_db(
-                rebuild_association_projection,
-                self._require_db(),
-            )
+        return (
+            await self._require_memory_storage().living.rebuild_association_projection()
+        )
 
     async def expand_living_document_associations(
         self,
@@ -1821,20 +1588,15 @@ class LifeMemoryService:
     ) -> List[SearchResult]:
         """Add replayable contextual document neighbours to direct recall."""
 
-        seed_refs = [
-            f"document:{item.file_path}"
-            for item in results
-            if item.file_path
-        ]
-        async with self._index_write_lock:
-            selections: list[AssociationSelection] = await run_db(
-                choose_association_neighbours,
-                self._require_db(),
+        seed_refs = [f"document:{item.file_path}" for item in results if item.file_path]
+        selections = (
+            await self._require_memory_storage().living.choose_association_neighbours(
                 seed_refs,
                 context_key=context_key,
                 random_seed=random_seed,
                 limit=max(0, int(limit)),
             )
+        )
         expanded = list(results)
         seen_paths = {item.file_path for item in expanded}
         for index, selection in enumerate(selections):
@@ -1973,19 +1735,18 @@ class LifeMemoryService:
         recorded_as_of: str = "",
     ) -> List[ClaimSearchResult]:
         """检索主张本体并保留状态、证据、冲突和可塑性解释。"""
-        mode_text = mode.value if isinstance(mode, MemorySearchMode) else str(mode or "")
-        async with self._index_write_lock:
-            return await run_db(
-                search_epistemic_claims,
-                self._require_db(),
-                query,
-                mode=mode_text,
-                top_k=top_k,
-                stream_scope=stream_scope,
-                visibility=visibility,
-                valid_at=valid_at,
-                recorded_as_of=recorded_as_of,
-            )
+        mode_text = (
+            mode.value if isinstance(mode, MemorySearchMode) else str(mode or "")
+        )
+        return await self._require_memory_storage().epistemic.search_claims(
+            query,
+            mode=mode_text,
+            top_k=top_k,
+            stream_scope=stream_scope,
+            visibility=visibility,
+            valid_at=valid_at,
+            recorded_as_of=recorded_as_of,
+        )
 
     async def search_evidence_aware(
         self,
@@ -2003,7 +1764,7 @@ class LifeMemoryService:
         association_random_seed: int | None = None,
     ) -> List[EvidenceAwareMemoryResult]:
         """并行召回文档与见证，并保留来源、视角和认识论边界。"""
-        if self._db is None or self._closing:
+        if not self.available:
             claim_task = asyncio.sleep(0, result=[])
         else:
             claim_task = self.search_epistemic_claims(
@@ -2031,7 +1792,7 @@ class LifeMemoryService:
             stream_scope=stream_scope,
             visibility=visibility,
         )
-        if self._db is None or self._closing:
+        if not self.available:
             interpretation_task = asyncio.sleep(0, result=[])
         else:
             interpretation_task = self.search_memory_interpretations(
@@ -2069,16 +1830,12 @@ class LifeMemoryService:
                     stream_scope=claim.stream_scope,
                     visibility=claim.visibility,
                     status=result.state.status,
-                    provenance=tuple(
-                        item.evidence_ref for item in result.evidence
-                    ),
+                    provenance=tuple(item.evidence_ref for item in result.evidence),
                     metadata={
                         "subject_key": claim.subject_key,
                         "claim_kind": claim.claim_kind,
                         "authority": claim.authority,
-                        "conflict_ids": [
-                            item.conflict_id for item in result.conflicts
-                        ],
+                        "conflict_ids": [item.conflict_id for item in result.conflicts],
                         "superseded_by": list(result.state.superseded_by),
                         "retrieval_affinity": (
                             result.plasticity.retrieval_affinity
@@ -2093,9 +1850,7 @@ class LifeMemoryService:
             )
         for result in document_results:
             if result.file_path.startswith("diaries/witness/"):
-                projected = await self.get_witness_by_projection_path(
-                    result.file_path
-                )
+                projected = await self.get_witness_by_projection_path(result.file_path)
                 if projected is None:
                     continue
                 if projected.visibility not in visibility:
@@ -2346,35 +2101,31 @@ class LifeMemoryService:
         visibility: tuple[str, ...] = ("private",),
     ) -> List[WitnessSearchResult]:
         """按明确认识论模式检索见证，rank 不等同 truth/confidence。"""
-        async with self._index_write_lock:
-            db = self._require_db()
-            return await run_db(
-                search_witness_memories,
-                db,
-                query,
-                mode=mode,
-                top_k=top_k,
-                stream_scope=stream_scope,
-                visibility=visibility,
-            )
+        return await self._require_memory_storage().witnesses.search(
+            query,
+            mode=mode,
+            top_k=top_k,
+            stream_scope=stream_scope,
+            visibility=visibility,
+        )
 
     async def migrate_legacy_witness(self, **kwargs: Any) -> WitnessMemory | None:
         """原子迁移一条旧日记；旧文件保持只读且不删除。"""
         async with self._index_write_lock:
-            db = self._require_db()
-            return await run_db(migrate_legacy_witness, db, **kwargs)
+            return await self._require_memory_storage().witnesses.migrate_legacy(
+                **kwargs
+            )
 
     async def witness_migration_exists(self, migration_key: str) -> bool:
         """检查旧日记迁移键，保证迁移幂等。"""
-        async with self._index_write_lock:
-            db = self._require_db()
-            return await run_db(migration_exists, db, migration_key)
+        return await self._require_memory_storage().witnesses.migration_exists(
+            migration_key
+        )
 
     async def record_witness_migration(self, **kwargs: Any) -> None:
         """记录旧日记来源哈希与新见证 ID，不删除旧文件。"""
         async with self._index_write_lock:
-            db = self._require_db()
-            await run_db(record_witness_migration, db, **kwargs)
+            await self._require_memory_storage().witnesses.record_migration(**kwargs)
 
     # --------------------------------------------------------
     # 节点操作（封装模块函数）
@@ -2388,12 +2139,10 @@ class LifeMemoryService:
     ) -> MemoryNode:
         """Create a reference node or atomically index one document body."""
         async with self._index_write_lock:
-            db = self._require_db()
-            return await get_or_create_file_node(
-                db=db,
-                file_path=file_path,
-                title=title,
-                content=content,
+            return await self._require_memory_storage().legacy_graph.get_or_create_file_node(
+                file_path,
+                title,
+                content,
             )
 
     async def get_or_create_workspace_document_node(self, file_path: str) -> MemoryNode:
@@ -2407,40 +2156,39 @@ class LifeMemoryService:
     ) -> Optional[MemoryNode]:
         """Read one canonical node without automatic identity migration."""
         del migrate_identity
-        db = self._require_db()
-        return await get_node_by_file_path(db=db, file_path=file_path)
+        return await self._require_memory_storage().legacy_graph.get_node_by_file_path(
+            file_path
+        )
 
     async def migrate_file_path(self, old_path: str, new_path: str) -> bool:
         """Explicitly move a canonical document identity inside SQLite."""
-        async with self._index_write_lock:
-            db = self._require_db()
-            return await run_db(move_document_rows, db, old_path, new_path)
+        return await self.move_document(old_path, new_path)
 
     async def increment_access(self, node_id: str) -> None:
         """增加节点访问计数并更新激活强度。"""
-        await increment_access(
-            db=self._db,
-            node_id=node_id,
-            emit_visual_event=self._emit_visual_event,
-        )
+        await self._require_memory_storage().legacy_graph.increment_access(node_id)
 
     async def _get_node_by_id_wrapper(self, node_id: str) -> Optional[MemoryNode]:
         """根据 ID 获取节点的包装函数。"""
-        return await get_node_by_id(self._db, node_id)
+        return await self._require_memory_storage().legacy_graph.get_node_by_id(node_id)
 
     # 保持与旧 API 兼容（router 等外部调用使用此名称）
     _get_node_by_id = _get_node_by_id_wrapper
 
     async def _get_snippet_wrapper(self, node_id: str) -> str:
         """获取摘要的包装函数。"""
-        return await get_snippet(self._db, node_id)
+        return await self._require_memory_storage().document_index.get_snippet(node_id)
 
     async def _filter_existing_scores_wrapper(
         self,
         scores: List[tuple],
     ) -> tuple:
         """过滤存在节点的包装函数。"""
-        return await filter_existing_scores(self._db, scores)
+        return (
+            await self._require_memory_storage().document_index.filter_existing_scores(
+                scores
+            )
+        )
 
     # --------------------------------------------------------
     # 边操作（封装模块函数）
@@ -2456,24 +2204,32 @@ class LifeMemoryService:
         bidirectional: bool = True,
     ) -> MemoryEdge:
         """创建或更新边。"""
-        return await create_or_update_edge(
-            db=self._db,
-            source_id=source_id,
-            target_id=target_id,
-            edge_type=edge_type,
+        return await self._require_memory_storage().legacy_graph.create_or_update_edge(
+            source_id,
+            target_id,
+            edge_type.value,
             reason=reason,
             strength=strength,
             bidirectional=bidirectional,
-            emit_visual_event=self._emit_visual_event,
         )
 
-    async def get_edges_from(self, node_id: str, min_weight: float = 0.0) -> List[MemoryEdge]:
+    async def get_edges_from(
+        self, node_id: str, min_weight: float = 0.0
+    ) -> List[MemoryEdge]:
         """获取从指定节点出发的边。"""
-        return await get_edges_from(self._db, node_id, min_weight)
+        return await self._require_memory_storage().legacy_graph.get_edges_from(
+            node_id,
+            min_weight,
+        )
 
-    async def get_edges_to(self, node_id: str, min_weight: float = 0.0) -> List[MemoryEdge]:
+    async def get_edges_to(
+        self, node_id: str, min_weight: float = 0.0
+    ) -> List[MemoryEdge]:
         """获取指向指定节点的边。"""
-        return await get_edges_to(self._db, node_id, min_weight)
+        return await self._require_memory_storage().legacy_graph.get_edges_to(
+            node_id,
+            min_weight,
+        )
 
     async def delete_edge(
         self,
@@ -2482,22 +2238,17 @@ class LifeMemoryService:
         edge_type: Optional[EdgeType] = None,
     ) -> bool:
         """删除边。"""
-        return await delete_edge(
-            db=self._db,
-            source_path=source_path,
-            target_path=target_path,
+        return await self._require_memory_storage().legacy_graph.delete_edge(
+            source_path,
+            target_path,
             edge_type=edge_type,
-            generate_file_node_id_func=generate_file_node_id,
         )
 
     async def _reinforce_coactivated_wrapper(self, node_ids: List[str]) -> None:
         """Hebbian 强化的包装函数。"""
-        await reinforce_coactivated(
-            db=self._db,
-            node_ids=node_ids,
+        await self._require_memory_storage().legacy_graph.reinforce_coactivated(
+            node_ids,
             learning_rate=self.LEARNING_RATE,
-            filter_existing_func=self._filter_existing_scores_wrapper,
-            emit_visual_event=self._emit_visual_event,
         )
 
     # --------------------------------------------------------
@@ -2532,19 +2283,21 @@ class LifeMemoryService:
             List[MemoryBundle]: 完整认知包（默认，包含演化历史）
             List[SearchResult]: 简单搜索结果（仅当 return_bundles=False）
         """
-        simple_results = await search_memory(
-            db=self._db,
-            query=query,
+        detailed = await self._require_memory_storage().document_index.search_detailed(
+            query,
             collection=self._chroma_collection,
+            chunk_collection=self._chunk_collection,
             top_k=top_k,
             enable_association=enable_association,
             file_types=file_types,
             time_range_days=time_range_days,
             emit_visual_event=self._emit_visual_event,
             now=self._clock if now is None else now,
-            workspace_path=(self._get_workspace_path() if workspace_path is None else workspace_path),
-            chunk_collection=self._chunk_collection,
+            workspace_path=(
+                self._get_workspace_path() if workspace_path is None else workspace_path
+            ),
         )
+        simple_results = detailed.results
 
         if not return_bundles:
             # 降级模式：返回简单结果列表
@@ -2569,34 +2322,36 @@ class LifeMemoryService:
         workspace_path: str | Path | None = None,
     ) -> DetailedSearchResult:
         """返回检索结果及各阶段只读诊断。"""
-        return await search_memory_detailed(
-            db=self._db,
-            query=query,
+        return await self._require_memory_storage().document_index.search_detailed(
+            query,
             collection=self._chroma_collection,
+            chunk_collection=self._chunk_collection,
             top_k=top_k,
             enable_association=enable_association,
             file_types=file_types,
             time_range_days=time_range_days,
             emit_visual_event=self._emit_visual_event,
             now=self._clock if now is None else now,
-            workspace_path=(self._get_workspace_path() if workspace_path is None else workspace_path),
-            chunk_collection=self._chunk_collection,
+            workspace_path=(
+                self._get_workspace_path() if workspace_path is None else workspace_path
+            ),
         )
 
     async def vector_search(self, query: str, top_k: int = 10) -> List[tuple]:
         """向量相似度检索，优先聚合 chunk 命中到节点。"""
-        return await vector_search(
-            query=query,
+        return await self._require_memory_storage().document_index.vector_search(
+            query,
             collection=self._chroma_collection,
-            top_k=top_k,
-            filter_existing_func=self._filter_existing_scores_wrapper,
-            db=self._db,
             chunk_collection=self._chunk_collection,
+            top_k=top_k,
         )
 
     async def fts_search(self, query: str, top_k: int = 10) -> List[tuple]:
         """全文搜索。"""
-        return await fts_search(self._db, query, top_k)
+        return await self._require_memory_storage().document_index.fts_search(
+            query,
+            top_k=top_k,
+        )
 
     async def sync_embedding(self, file_path: str, content: str) -> None:
         """Queue document indexing; only the outbox worker may touch Chroma."""
@@ -2610,9 +2365,8 @@ class LifeMemoryService:
         allowed_edge_types: Optional[List[EdgeType | str]] = None,
     ) -> List[tuple]:
         """激活扩散联想，默认只读取显式关系。"""
-        return await spread_activation(
-            db=self._db,
-            seed_ids=seed_ids,
+        return await self._require_memory_storage().legacy_graph.spread_activation(
+            seed_ids,
             max_depth=max_depth,
             max_results=max_results,
             spread_decay=self.SPREAD_DECAY,
@@ -2681,8 +2435,7 @@ class LifeMemoryService:
             canonical_paths.append(eligibility.path)
         if not canonical_paths:
             corrections.append(
-                await insert_memory_correction(
-                    db=self._db,
+                await self._require_memory_storage().legacy_graph.insert_correction(
                     topic=topic_text,
                     message=message_text,
                     source=source,
@@ -2697,8 +2450,7 @@ class LifeMemoryService:
         for path in canonical_paths:
             node = await self._get_or_create_file_node_from_workspace(path)
             corrections.append(
-                await insert_memory_correction(
-                    db=self._db,
+                await self._require_memory_storage().legacy_graph.insert_correction(
                     topic=topic_text,
                     message=message_text,
                     source=source,
@@ -2739,9 +2491,9 @@ class LifeMemoryService:
                     "related_node_id": correction.related_node_id or "",
                     "query": correction.query,
                 },
-                recorded_at=datetime.fromtimestamp(
-                    correction.created_at
-                ).astimezone().isoformat(),
+                recorded_at=datetime.fromtimestamp(correction.created_at)
+                .astimezone()
+                .isoformat(),
             )
             await self.append_memory_claim(claim)
 
@@ -2771,7 +2523,9 @@ class LifeMemoryService:
             migrate_identity=False,
         )
         if node is not None:
-            resolved = await self._resolve_canonical_from_node(node, max_depth=max_depth)
+            resolved = await self._resolve_canonical_from_node(
+                node, max_depth=max_depth
+            )
             if resolved is not None:
                 return {
                     "requested_path": requested_path,
@@ -2910,12 +2664,18 @@ class LifeMemoryService:
             trace: list[MemoryTrace] = []
             related_node_ids = [node.node_id]
 
-            outgoing, incoming = await get_lineage_edges(self._db, node.node_id)
+            outgoing, incoming = await self.read_lineage_edges(node.node_id)
             # 两个方向的邻居一次取全：节点与摘要来自同一批查询，路径判定来自
             # 同一次线程调用。循环体内因此不再有 await。
-            lineage_views = await get_lineage_node_views(
-                self._db,
-                [edge.target_id for edge in outgoing] + [edge.source_id for edge in incoming],
+            lineage_ids = list(
+                dict.fromkeys(
+                    [edge.target_id for edge in outgoing]
+                    + [edge.source_id for edge in incoming]
+                )
+            )
+
+            lineage_views = await self._require_memory_storage().legacy_graph.get_lineage_node_views(
+                lineage_ids
             )
             await _resolve_paths([view.file_path for view in lineage_views.values()])
 
@@ -2923,7 +2683,9 @@ class LifeMemoryService:
                 *((edge, "later") for edge in outgoing),
                 *((edge, "earlier") for edge in incoming),
             ):
-                neighbour_id = edge.target_id if direction == "later" else edge.source_id
+                neighbour_id = (
+                    edge.target_id if direction == "later" else edge.source_id
+                )
                 neighbour = lineage_views.get(neighbour_id)
                 if neighbour is None or not neighbour.file_path:
                     continue
@@ -2983,7 +2745,9 @@ class LifeMemoryService:
                 continue
             seen_primary_paths.add(primary_path)
 
-            if primary_path != source_path and not any(item.file_path == primary_path for item in evidence):
+            if primary_path != source_path and not any(
+                item.file_path == primary_path for item in evidence
+            ):
                 primary_node = await self.get_node_by_file_path(
                     primary_path,
                     migrate_identity=False,
@@ -2994,7 +2758,9 @@ class LifeMemoryService:
                         MemoryEvidence(
                             file_path=primary_path,
                             title=primary_node.title,
-                            snippet=await self._get_snippet_wrapper(primary_node.node_id),
+                            snippet=await self._get_snippet_wrapper(
+                                primary_node.node_id
+                            ),
                             relevance=result.relevance,
                             source="lineage",
                             relation="canonical",
@@ -3003,8 +2769,7 @@ class LifeMemoryService:
                         )
                     )
 
-            corrections = await list_memory_corrections(
-                self._db,
+            corrections = await self.read_memory_corrections(
                 query=query,
                 related_node_ids=list(dict.fromkeys(related_node_ids)),
                 limit=5,
@@ -3083,7 +2848,9 @@ class LifeMemoryService:
             return_bundles=False,
         )
 
-    async def _get_or_create_file_node_from_workspace(self, file_path: str) -> MemoryNode:
+    async def _get_or_create_file_node_from_workspace(
+        self, file_path: str
+    ) -> MemoryNode:
         """Load an eligible workspace document, or reuse an indexed historical node.
 
         This helper is used by explicit lineage and correction writes.  It must
@@ -3134,27 +2901,48 @@ class LifeMemoryService:
             return None
 
         frontier: list[
-            tuple[MemoryNode, list[dict[str, str]], frozenset[str], float, float, tuple[str, ...]]
+            tuple[
+                MemoryNode,
+                list[dict[str, str]],
+                frozenset[str],
+                float,
+                float,
+                tuple[str, ...],
+            ]
         ] = [(node, [], frozenset({node.node_id}), 0.0, 0.0, ())]
-        resolved: list[tuple[int, float, float, tuple[str, ...], str, list[dict[str, str]]]] = []
+        resolved: list[
+            tuple[int, float, float, tuple[str, ...], str, list[dict[str, str]]]
+        ] = []
 
         for depth in range(1, max_depth + 1):
             next_frontier: list[
-                tuple[MemoryNode, list[dict[str, str]], frozenset[str], float, float, tuple[str, ...]]
+                tuple[
+                    MemoryNode,
+                    list[dict[str, str]],
+                    frozenset[str],
+                    float,
+                    float,
+                    tuple[str, ...],
+                ]
             ] = []
             for current, lineage, visited, weight, created_at, edge_ids in sorted(
                 frontier,
                 key=lambda item: (-item[3], -item[4], item[5], item[0].node_id),
             ):
-                outgoing, _ = await get_lineage_edges(self._db, current.node_id)
+                outgoing, _ = await self.read_lineage_edges(current.node_id)
                 candidates = [
                     edge
                     for edge in outgoing
-                    if edge.edge_type in CANONICAL_EDGE_TYPES and edge.target_id not in visited
+                    if edge.edge_type in CANONICAL_EDGE_TYPES
+                    and edge.target_id not in visited
                 ]
                 for edge in sorted(
                     candidates,
-                    key=lambda item: (-float(item.weight), -float(item.created_at), item.edge_id),
+                    key=lambda item: (
+                        -float(item.weight),
+                        -float(item.created_at),
+                        item.edge_id,
+                    ),
                 ):
                     target = await self._get_node_by_id_wrapper(edge.target_id)
                     if target is None or not target.file_path:
@@ -3163,8 +2951,12 @@ class LifeMemoryService:
                     if not target_eligibility.eligible:
                         continue
                     target_path = target_eligibility.path
-                    current_eligibility = assess_indexed_document_path(current.file_path)
-                    current_path = current_eligibility.path if current_eligibility.eligible else ""
+                    current_eligibility = assess_indexed_document_path(
+                        current.file_path
+                    )
+                    current_path = (
+                        current_eligibility.path if current_eligibility.eligible else ""
+                    )
                     target_lineage = [
                         *lineage,
                         {
@@ -3222,7 +3014,16 @@ class LifeMemoryService:
         suffix = requested.suffix
         stem = requested.stem
         candidate_stems = {stem}
-        for marker in ("_research", "-research", "_draft", "-draft", "_old", "-old", "_notes", "-notes"):
+        for marker in (
+            "_research",
+            "-research",
+            "_draft",
+            "-draft",
+            "_old",
+            "-old",
+            "_notes",
+            "-notes",
+        ):
             if stem.endswith(marker):
                 candidate_stems.add(stem[: -len(marker)])
         candidate_stems.discard("")
@@ -3264,7 +3065,8 @@ class LifeMemoryService:
     ) -> str:
         authoritative_sources = {"user", "explicit_user", "verified", "authoritative"}
         authoritative = [
-            item for item in corrections
+            item
+            for item in corrections
             if str(item.source or "").strip().lower() in authoritative_sources
         ]
         if authoritative:
@@ -3275,7 +3077,9 @@ class LifeMemoryService:
             )[0]
             return f"已确认修正：{latest.message}"
 
-        primary = next((item for item in evidence if item.file_path == primary_path), None)
+        primary = next(
+            (item for item in evidence if item.file_path == primary_path), None
+        )
         if primary is None and evidence:
             primary = evidence[0]
         snippet = " ".join(((primary.snippet if primary else "") or "").split())
@@ -3292,12 +3096,15 @@ class LifeMemoryService:
     ) -> str:
         notes: list[str] = []
         if requested_path != primary_path:
-            notes.append("命中的早期路径已经有后续整理/迁移，回答时应同时承认早期记录和当前文件。")
+            notes.append(
+                "命中的早期路径已经有后续整理/迁移，回答时应同时承认早期记录和当前文件。"
+            )
         if any(not item.exists for item in evidence):
             notes.append("部分证据文件当前不在工作空间中，只能作为历史轨迹参考。")
         authoritative_sources = {"user", "explicit_user", "verified", "authoritative"}
         authoritative = [
-            item for item in corrections
+            item
+            for item in corrections
             if str(item.source or "").strip().lower() in authoritative_sources
         ]
         candidates = [item for item in corrections if item not in authoritative]
@@ -3319,7 +3126,7 @@ class LifeMemoryService:
 
     async def apply_decay(self) -> int:
         """应用遗忘衰减。"""
-        return await apply_decay(self._db)
+        return await self._require_memory_storage().legacy_graph.apply_decay()
 
     async def get_file_relations(
         self,
@@ -3329,7 +3136,7 @@ class LifeMemoryService:
     ) -> Dict[str, Any]:
         """获取文件的关联图谱。"""
         return await get_file_relations(
-            db=self._db,
+            db=None,
             file_path=file_path,
             depth=depth,
             min_strength=min_strength,
@@ -3341,20 +3148,56 @@ class LifeMemoryService:
 
     async def get_stats(self) -> Dict[str, Any]:
         """获取记忆系统统计信息。"""
-        return await get_stats(self._db)
+        return await self._require_memory_storage().legacy_graph.stats()
 
     async def health_snapshot(self) -> Dict[str, Any]:
         """获取隔离的只读记忆健康快照，不修复或删除任何数据。"""
         async with self._lifecycle_lock:
-            self._require_db()
-            db_path = self._get_db_path()
+            storage = self._require_memory_storage()
             collection = self._chunk_collection or self._chroma_collection
-        return await collect_health_snapshot(
-            db_path,
-            self._get_workspace_path(),
-            collection,
-            vector_expected=self._vector_backend_enabled,
+            local_db_open = self._db is not None
+        names = (
+            "document_index",
+            "experiences",
+            "witnesses",
+            "living",
+            "epistemic",
+            "legacy_graph",
         )
+        statuses = await asyncio.gather(
+            *(getattr(storage, name).availability() for name in names)
+        )
+        ports = {
+            name: status.value for name, status in zip(names, statuses, strict=True)
+        }
+        if storage.backend == BackendKind.LOCAL and local_db_open:
+            snapshot = await collect_health_snapshot(
+                self._get_db_path(),
+                self._get_workspace_path(),
+                collection,
+                vector_expected=self._vector_backend_enabled,
+            )
+            snapshot.update(backend=storage.backend.value, ports=ports)
+            return snapshot
+        runtime_health = (
+            await self._storage_runtime.health()
+            if self._storage_runtime is not None
+            else {
+                "status": "healthy"
+                if set(ports.values()) <= {"healthy", "degraded"}
+                else "failed",
+                "backend": storage.backend.value,
+                "reason": "injected MemoryStorageBundle",
+            }
+        )
+        return {
+            "status": runtime_health.get("status", "failed"),
+            "backend": storage.backend.value,
+            "ports": ports,
+            "runtime": runtime_health,
+            "vector_expected": self._vector_backend_enabled,
+            "vector_collection_loaded": collection is not None,
+        }
 
     # --------------------------------------------------------
     # 做梦系统接口（封装模块函数）
@@ -3370,8 +3213,7 @@ class LifeMemoryService:
         persist_learning: bool = False,
     ) -> Dict[str, Any]:
         """REM 做梦游走，默认只读。"""
-        return await dream_walk(
-            db=self._db,
+        return await self._require_memory_storage().legacy_graph.dream_walk(
             num_seeds=num_seeds,
             seed_ids=seed_ids,
             max_depth=max_depth,
@@ -3383,12 +3225,18 @@ class LifeMemoryService:
 
     async def list_dream_candidate_nodes(self, limit: int = 12) -> List[Dict[str, Any]]:
         """列出适合做梦选种的长期主题候选节点。"""
-        return await list_dream_candidate_nodes(self._db, limit)
+        return await self._require_memory_storage().legacy_graph.list_dream_candidate_nodes(
+            limit
+        )
 
     async def list_random_file_nodes(self, limit: int = 15) -> List[Dict[str, Any]]:
         """随机采样文件节点。"""
-        return await list_random_file_nodes(self._db, limit)
+        return await self._require_memory_storage().legacy_graph.list_random_file_nodes(
+            limit
+        )
 
     async def prune_weak_edges(self, threshold: float = 0.08) -> int:
         """修剪弱 ASSOCIATES 边。"""
-        return await prune_weak_edges(self._db, threshold)
+        return await self._require_memory_storage().legacy_graph.prune_weak_edges(
+            threshold
+        )
