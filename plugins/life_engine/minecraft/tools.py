@@ -75,19 +75,29 @@ class LifeEngineMinecraftTool(BaseTool):
         body_name: Annotated[str, "精确身体名称"] = "",
         reason: Annotated[str, "中断理由"] = "",
         **kwargs: Any,
-    ) -> str:
+    ) -> tuple[bool, str]:
         """执行 Minecraft 操作。"""
-        plugin = kwargs.get("plugin")
+        # BaseTool is constructed with its owning plugin by the production tool
+        # runtime.  Keep the explicit kwarg only as a compatibility override for
+        # direct callers and older tests.
+        plugin = kwargs.get("plugin") or self.plugin
         if plugin is None:
-            return json.dumps(
-                {"success": False, "error": "plugin 未提供"}, ensure_ascii=False
+            return (
+                False,
+                json.dumps(
+                    {"success": False, "error": "plugin 未提供"},
+                    ensure_ascii=False,
+                ),
             )
 
         session = _get_session(plugin)
         if session is None:
-            return json.dumps(
-                {"success": False, "error": "Minecraft 未启用或会话未初始化"},
-                ensure_ascii=False,
+            return (
+                False,
+                json.dumps(
+                    {"success": False, "error": "Minecraft 未启用或会话未初始化"},
+                    ensure_ascii=False,
+                ),
             )
 
         match action:
@@ -99,12 +109,18 @@ class LifeEngineMinecraftTool(BaseTool):
                 result = await session.stop()
             case "do":
                 if not intent:
-                    result = {"success": False, "error": "请提供 intent 参数"}
+                    return False, json.dumps(
+                        {"success": False, "error": "请提供 intent 参数"},
+                        ensure_ascii=False,
+                    )
                 else:
                     result = await session.do_intent(intent)
             case "interrupt":
                 if not reason:
-                    result = {"success": False, "error": "请提供 reason 参数"}
+                    return False, json.dumps(
+                        {"success": False, "error": "请提供 reason 参数"},
+                        ensure_ascii=False,
+                    )
                 else:
                     result = await session.interrupt(reason)
             case "look":
@@ -112,9 +128,16 @@ class LifeEngineMinecraftTool(BaseTool):
             case "status":
                 result = await session.get_status()
             case _:
-                result = {"success": False, "error": f"未知操作: {action}"}
+                return False, json.dumps(
+                    {"success": False, "error": f"未知操作: {action}"},
+                    ensure_ascii=False,
+                )
 
-        return json.dumps(result, ensure_ascii=False, default=str)
+        # A successful status query may legitimately report an inactive body;
+        # inactivity is state, not a tool execution failure. Other actions
+        # expose the session result through the standard BaseTool contract.
+        success = action == "status" or bool(result.get("success"))
+        return success, json.dumps(result, ensure_ascii=False, default=str)
 
 
 MINECRAFT_TOOLS = [LifeEngineMinecraftTool]
