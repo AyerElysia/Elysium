@@ -20,13 +20,20 @@ from __future__ import annotations
 
 import hashlib
 import time
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from mofox_wire import MessageBuilder, SegPayload, UserInfoPayload
 
 from src.app.plugin_system.api.log_api import get_logger
 
-from ..utils.cache import GROUP_INFO_TTL, MEMBER_INFO_TTL, SELF_INFO_TTL, STRANGER_INFO_TTL, get_cached, set_cached
+from ..utils.cache import (
+    GROUP_INFO_TTL,
+    MEMBER_INFO_TTL,
+    SELF_INFO_TTL,
+    STRANGER_INFO_TTL,
+    get_cached,
+    set_cached,
+)
 from ..utils.constants import ACCEPT_FORMAT, QQ_FACE, NoticeType, RealMessageType
 
 if TYPE_CHECKING:
@@ -39,12 +46,12 @@ logger = get_logger("napcat_adapter")
 class NoticeEventHandler:
     """处理 NapCat 通知事件（全量覆盖）。"""
 
-    def __init__(self, client: "NapCatClient", get_config: Any) -> None:
+    def __init__(self, client: NapCatClient, get_config: Any) -> None:
         self._client = client
         self._get_config = get_config
         self._last_poke_time: float = 0.0
 
-    def _config(self) -> "NapcatAdapterConfig | None":
+    def _config(self) -> NapcatAdapterConfig | None:
         return self._get_config()
 
     # ------------------------------------------------------------------
@@ -68,6 +75,8 @@ class NoticeEventHandler:
             "is_public_notice": False,
             "target_id": target_id,
             "notice_type": notice_type,
+            "sub_type": raw.get("sub_type"),
+            "provider_raw_identity": self._provider_raw_identity(raw),
         }
 
         match notice_type:
@@ -144,22 +153,27 @@ class NoticeEventHandler:
                     case NoticeType.Notify.profile_like:
                         handled_segment, user_info = await self._handle_profile_like(raw)
                     case NoticeType.Notify.input_status:
-                        # 输入状态：仅记录日志，不推送
                         logger.debug(f"用户 {user_id} 正在输入...")
-                        return None
+                        handled_segment, user_info = self._fallback_notice(
+                            raw,
+                            text="用户输入状态发生变化",
+                        )
                     case _:
                         logger.debug(f"未知 notify 子类型: {sub_type}")
-                        return None
+                        handled_segment, user_info = self._fallback_notice(raw)
 
             # ---- Bot 掉线 ----
             case NoticeType.bot_offline:
                 reason = raw.get("reason", "未知原因")
                 logger.error(f"Bot {self_id} 收到掉线通知，原因: {reason}")
-                return None
+                handled_segment, user_info = self._fallback_notice(
+                    raw,
+                    text=f"Bot 连接状态变化：{reason}",
+                )
 
             case _:
                 logger.debug(f"未处理的 notice 类型: {notice_type}")
-                return None
+                handled_segment, user_info = self._fallback_notice(raw)
 
         if not handled_segment or not user_info:
             return None
@@ -682,6 +696,50 @@ class NoticeEventHandler:
     # ------------------------------------------------------------------
     # 辅助方法
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _provider_raw_identity(raw: dict[str, Any]) -> dict[str, Any]:
+        """Retain provider identifiers without exporting the whole raw payload."""
+
+        keys = (
+            "post_type",
+            "notice_type",
+            "sub_type",
+            "time",
+            "self_id",
+            "group_id",
+            "user_id",
+            "target_id",
+            "operator_id",
+            "message_id",
+            "sender_id",
+        )
+        return {
+            key: raw[key]
+            for key in keys
+            if raw.get(key) not in {None, ""}
+        }
+
+    @staticmethod
+    def _fallback_notice(
+        raw: dict[str, Any],
+        *,
+        text: str | None = None,
+    ) -> tuple[SegPayload, UserInfoPayload]:
+        """Keep an open provider notice as a non-cognitive transport fact."""
+
+        notice_type = str(raw.get("notice_type") or "unknown")
+        sub_type = str(raw.get("sub_type") or "")
+        label = f"{notice_type}/{sub_type}" if sub_type else notice_type
+        user_id = raw.get("user_id") or raw.get("self_id") or ""
+        return (
+            {"type": "text", "data": text or f"收到平台通知：{label}"},
+            {
+                "platform": "qq",
+                "user_id": str(user_id),
+                "user_nickname": "QQ平台",
+            },
+        )
 
     async def _get_recalled_message_preview(self, message_id: Any) -> str | None:
         """尝试获取被撤回消息的内容预览。"""

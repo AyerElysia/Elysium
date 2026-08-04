@@ -87,8 +87,8 @@ class OutgoingSender:
     # 主入口
     # ------------------------------------------------------------------
 
-    async def send(self, envelope: MessageEnvelope) -> None:
-        """处理并发送一条出站消息。"""
+    async def send(self, envelope: MessageEnvelope) -> dict[str, Any] | None:
+        """处理并发送一条出站消息，返回最后一份真实平台回执。"""
         if not envelope:
             logger.warning("空消息，跳过")
             return
@@ -138,6 +138,7 @@ class OutgoingSender:
             logger.info(f"出站消息拆分发送: count={len(chunks)}, action={action}, target={target_id}")
 
         send_timeout = self._send_confirm_timeout_seconds()
+        last_response: dict[str, Any] | None = None
         for i, chunk in enumerate(chunks, 1):
             logger.debug(f"发送消息 part={i}/{len(chunks)}: {str(chunk)[:300]}")
             resp = await self._client.call(
@@ -159,8 +160,10 @@ class OutgoingSender:
                         total=len(chunks),
                     )
                 raise RuntimeError(f"消息发送失败: {resp}")
+            last_response = resp
 
         logger.info("消息发送成功")
+        return last_response
 
     # ------------------------------------------------------------------
     # 消息段递归处理

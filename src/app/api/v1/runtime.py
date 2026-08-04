@@ -12,11 +12,13 @@ from fastapi import APIRouter, Depends, FastAPI, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from src.kernel.commands import CommandDispatcher, CommandStore
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
+from src.kernel.commands import CommandDispatcher, CommandStore
+
 from .auth_store import AuthStore, SessionRecord
+from .chat import ChatQueryFailure, ChatQueryService
 from .events import EventQueryFailure, EventQueryService
 from .foundation import FoundationProjection
 from .policy import ALL_EXPORTED_SCOPES
@@ -24,6 +26,11 @@ from .schemas import (
     BootstrapResponse,
     CallerIdentity,
     CapabilitiesResponse,
+    ChatMessage,
+    ChatMessagePage,
+    ChatReceiptList,
+    ChatStreamPage,
+    ChatStreamSummary,
     ErrorBody,
     ErrorResponse,
     EventEnvelope,
@@ -109,6 +116,7 @@ class APIContext:
     max_websocket_connections: int = 64
     foundation: FoundationProjection | None = None
     events: EventQueryService | None = None
+    chat: ChatQueryService | None = None
     command_store: CommandStore | None = None
     command_dispatcher: CommandDispatcher | None = None
 
@@ -384,6 +392,7 @@ def create_api_app(context: APIContext) -> FastAPI:
     auth_router = APIRouter(prefix="/auth")
     foundation_router = APIRouter()
     event_router = APIRouter()
+    chat_router = APIRouter(prefix="/chat")
     bearer = HTTPBearer(auto_error=False)
     foundation = context.foundation or FoundationProjection(
         node_id=context.installation_id,
@@ -392,6 +401,7 @@ def create_api_app(context: APIContext) -> FastAPI:
         node_id=context.installation_id,
         codec=context.codec,
     )
+    chat = context.chat
 
     def current_session(
         credentials: Annotated[
@@ -782,9 +792,136 @@ def create_api_app(context: APIContext) -> FastAPI:
         except EventQueryFailure as exc:
             raise event_api_error(exc) from exc
 
+    def chat_service() -> ChatQueryService:
+        if chat is None:
+            raise APIError(
+                "component_unavailable",
+                "聊天历史查询当前不可用。",
+                status_code=503,
+                retryable=True,
+            )
+        return chat
+
+    def chat_api_error(exc: ChatQueryFailure) -> APIError:
+        recovery = None
+        if exc.recovery_cursor:
+            recovery = {
+                "action": "restart_from_cursor",
+                "cursor": exc.recovery_cursor,
+            }
+        return APIError(
+            exc.code,
+            exc.message,
+            status_code=exc.status_code,
+            retryable=exc.retryable,
+            recovery=recovery,
+        )
+
+    @chat_router.get(
+        "/streams",
+        response_model=ChatStreamPage,
+        operation_id="queryChatStreams",
+        responses=ERROR_RESPONSES,
+    )
+    async def query_chat_streams(
+        session: Annotated[SessionRecord, Depends(require_scope("chat:read"))],
+        cursor: str | None = None,
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    ) -> ChatStreamPage:
+        try:
+            return await chat_service().query_streams(
+                cursor=cursor,
+                limit=limit,
+                session=session,
+            )
+        except ChatQueryFailure as exc:
+            raise chat_api_error(exc) from exc
+
+    @chat_router.get(
+        "/streams/{stream_id}",
+        response_model=ChatStreamSummary,
+        operation_id="getChatStream",
+        responses=ERROR_RESPONSES,
+    )
+    async def get_chat_stream(
+        stream_id: str,
+        session: Annotated[SessionRecord, Depends(require_scope("chat:read"))],
+    ) -> ChatStreamSummary:
+        try:
+            return await chat_service().get_stream(stream_id, session)
+        except ChatQueryFailure as exc:
+            raise chat_api_error(exc) from exc
+
+    @chat_router.get(
+        "/streams/{stream_id}/messages",
+        response_model=ChatMessagePage,
+        operation_id="queryChatMessages",
+        responses=ERROR_RESPONSES,
+    )
+    async def query_chat_messages(
+        stream_id: str,
+        session: Annotated[SessionRecord, Depends(require_scope("chat:read"))],
+        cursor: str | None = None,
+        limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    ) -> ChatMessagePage:
+        try:
+            return await chat_service().query_messages(
+                stream_id=stream_id,
+                cursor=cursor,
+                limit=limit,
+                session=session,
+            )
+        except ChatQueryFailure as exc:
+            raise chat_api_error(exc) from exc
+
+    @chat_router.get(
+        "/messages/{message_id}",
+        response_model=ChatMessage,
+        operation_id="getChatMessage",
+        responses=ERROR_RESPONSES,
+    )
+    async def get_chat_message(
+        message_id: str,
+        session: Annotated[SessionRecord, Depends(require_scope("chat:read"))],
+        provider: str | None = None,
+        stream_id: str | None = None,
+    ) -> ChatMessage:
+        try:
+            return await chat_service().get_message(
+                message_id,
+                session,
+                provider=provider,
+                stream_id=stream_id,
+            )
+        except ChatQueryFailure as exc:
+            raise chat_api_error(exc) from exc
+
+    @chat_router.get(
+        "/messages/{message_id}/receipts",
+        response_model=ChatReceiptList,
+        operation_id="getChatMessageReceipts",
+        responses=ERROR_RESPONSES,
+    )
+    async def get_chat_message_receipts(
+        message_id: str,
+        session: Annotated[SessionRecord, Depends(require_scope("chat:read"))],
+        provider: str | None = None,
+        stream_id: str | None = None,
+    ) -> ChatReceiptList:
+        try:
+            return await chat_service().get_receipts(
+                message_id,
+                session,
+                provider=provider,
+                stream_id=stream_id,
+            )
+        except ChatQueryFailure as exc:
+            raise chat_api_error(exc) from exc
+
     app.include_router(auth_router)
     app.include_router(foundation_router)
     app.include_router(event_router)
+    app.include_router(chat_router)
     if (context.command_store is None) != (context.command_dispatcher is None):
         raise ValueError("command store and dispatcher must be configured together")
     if context.command_store is not None and context.command_dispatcher is not None:

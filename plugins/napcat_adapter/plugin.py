@@ -239,7 +239,10 @@ class NapcatAdapter(BaseAdapter):
 
         return await self._router.dispatch(raw)
 
-    async def _send_platform_message(self, envelope: MessageEnvelope) -> None:  # type: ignore[override]
+    async def _send_platform_message(  # type: ignore[override]
+        self,
+        envelope: MessageEnvelope,
+    ) -> dict[str, Any] | None:
         """将 MessageEnvelope 发送到 NapCat。
 
         这是核心出站方法，由 mofox-wire 的核心推送调用。
@@ -257,8 +260,8 @@ class NapcatAdapter(BaseAdapter):
         try:
             if seg_type in ("command", "adapter_command", "adapter_response"):
                 await self._command_handler.handle(envelope)
-            else:
-                await self._sender.send(envelope)
+                return None
+            return await self._sender.send(envelope)
         except Exception as e:
             if getattr(e, "delivery_unknown", False):
                 logger.debug(f"NapCat 消息投递状态未知: {e}")

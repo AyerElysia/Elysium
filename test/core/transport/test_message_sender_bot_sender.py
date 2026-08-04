@@ -108,7 +108,14 @@ async def test_send_message_overrides_sender_with_bot_info(
     sender = MessageSender()
     adapter = SimpleNamespace(
         get_bot_info=AsyncMock(return_value={"bot_id": "bot-001", "bot_name": "NeoBot"}),
-        _send_platform_message=AsyncMock(return_value=None),
+        _send_platform_message=AsyncMock(
+            return_value={
+                "status": "ok",
+                "retcode": 0,
+                "data": {"message_id": "provider-m1", "secret": "not-exported"},
+                "access_token": "not-exported",
+            }
+        ),
     )
     sender.set_adapter_manager(SimpleNamespace(get_adapter=lambda _sig: adapter))
     sender._converter = SimpleNamespace(  # type: ignore[assignment]
@@ -138,6 +145,12 @@ async def test_send_message_overrides_sender_with_bot_info(
     adapter._send_platform_message.assert_awaited_once()
     stream_manager.get_or_create_stream.assert_awaited_once()
     stream_manager.add_sent_message_to_history.assert_awaited_once_with(message)
+    assert message.extra["provider_receipt"] == {
+        "provider": "qq",
+        "status": "ok",
+        "retcode": 0,
+        "message_id": "provider-m1",
+    }
     assert [args.args[0] for args in event_manager.publish_event.await_args_list] == [
         EventType.ON_MESSAGE_SENT,
         EventType.ON_MESSAGE_DELIVERED,
@@ -227,8 +240,13 @@ async def test_send_timeout_suppresses_only_matching_immediate_retry(
     assert retry.extra["delivery_status"] == "unknown"
     assert [args.args[0] for args in event_manager.publish_event.await_args_list] == [
         EventType.ON_MESSAGE_SENT,
+        EventType.ON_MESSAGE_DELIVERY_UNKNOWN,
         EventType.ON_MESSAGE_SENT,
     ]
+    unknown_params = event_manager.publish_event.await_args_list[1].args[1]
+    assert unknown_params["message"] is first
+    assert unknown_params["delivery_status"] == "unknown"
+    assert unknown_params["error_type"] == "TimeoutError"
 
 
 async def test_timeout_fingerprint_keeps_media_and_target_identity(
@@ -447,7 +465,7 @@ async def test_send_and_delivery_events_wrap_adapter_and_history_persistence(
     assert "continue_send" not in delivered_params
 
 
-async def test_failed_adapter_send_emits_only_pre_send_event(
+async def test_failed_adapter_send_emits_pre_send_and_failed_events(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sender = MessageSender()
@@ -476,8 +494,13 @@ async def test_failed_adapter_send_emits_only_pre_send_event(
     ) is False
 
     stream_manager.add_sent_message_to_history.assert_not_awaited()
-    event_manager.publish_event.assert_awaited_once()
-    assert event_manager.publish_event.await_args.args[0] is EventType.ON_MESSAGE_SENT
+    assert [args.args[0] for args in event_manager.publish_event.await_args_list] == [
+        EventType.ON_MESSAGE_SENT,
+        EventType.ON_MESSAGE_DELIVERY_FAILED,
+    ]
+    failed_params = event_manager.publish_event.await_args_list[1].args[1]
+    assert failed_params["delivery_status"] == "failed"
+    assert failed_params["error_type"] == "RuntimeError"
 
 
 async def test_continue_send_false_intercepts_before_adapter_and_history(

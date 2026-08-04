@@ -11,7 +11,8 @@ import asyncio
 import hashlib
 import json
 import traceback
-from dataclasses import asdict
+from collections.abc import Mapping
+from dataclasses import asdict, replace
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -115,7 +116,7 @@ from .subconscious_context import (
     SubconsciousContextManager,
     SubconsciousSummary,
 )
-from .world_state import WorldState
+from .chat_events import build_chat_message_event, build_chat_provider_notice_event
 from .consciousness import ConsciousnessRegistry
 from .event_bus import (
     LifeEvent,
@@ -123,7 +124,9 @@ from .event_bus import (
     LifeEventChannel,
     LifeEventPriority,
     RawEventStore,
+    life_event_from_legacy,
 )
+from .world_state import WorldState
 from .perception_gateway import PerceptionGateway, PreparedPerception
 from .world_projection import (
     WORLD_LEGACY_IMPORT_EVENT,
@@ -897,6 +900,106 @@ class LifeEngineService(BaseService):
                 self._get_event_bus().store,
             )
 
+    async def _publish_message_facts(
+        self,
+        legacy_event: LifeEngineEvent,
+        chat_fact: LifeEvent,
+    ) -> None:
+        """Atomically append the compatibility event and stable chat fact."""
+
+        if not legacy_event.source_instance_id:
+            stream_id = str(legacy_event.stream_id or "").strip()
+            owner = self._consciousness_registry.get_for_stream(stream_id) if stream_id else None
+            if owner is not None:
+                legacy_event.source_instance_id = owner.instance_id
+                legacy_event.correlation_id = (
+                    legacy_event.correlation_id or owner.session_id or None
+                )
+                chat_fact = replace(
+                    chat_fact,
+                    source_instance_id=owner.instance_id,
+                    correlation_id=chat_fact.correlation_id or owner.session_id,
+                )
+        await self._get_event_bus().publish_many(
+            [life_event_from_legacy(legacy_event), chat_fact]
+        )
+        if self._world_projection is not None:
+            await asyncio.to_thread(
+                self._world_projection.catch_up,
+                self._get_event_bus().store,
+            )
+
+    async def record_send_requested(
+        self,
+        message: Message,
+        *,
+        envelope: Mapping[str, Any] | None = None,
+        adapter_signature: str = "",
+    ) -> None:
+        """Append a pre-send request fact without claiming delivery success."""
+
+        if not self._is_enabled():
+            return
+        event = build_chat_message_event(
+            message,
+            direction="requested",
+            envelope=envelope,
+            adapter_signature=adapter_signature,
+        )
+        await self._get_event_bus().publish(event)
+        if self._world_projection is not None:
+            await asyncio.to_thread(
+                self._world_projection.catch_up,
+                self._get_event_bus().store,
+            )
+
+    async def record_delivery_status(
+        self,
+        message: Message,
+        *,
+        status: str,
+        adapter_signature: str = "",
+    ) -> None:
+        """Append an explicit failed or unknown delivery fact."""
+
+        if not self._is_enabled():
+            return
+        if status not in {"failed", "unknown"}:
+            raise ValueError("delivery status must be failed or unknown")
+        event = build_chat_message_event(
+            message,
+            direction="delivered",
+            adapter_signature=adapter_signature,
+            delivery_status=status,
+        )
+        await self._get_event_bus().publish(event)
+        if self._world_projection is not None:
+            await asyncio.to_thread(
+                self._world_projection.catch_up,
+                self._get_event_bus().store,
+            )
+
+    async def record_provider_notice(
+        self,
+        raw: Mapping[str, Any],
+        *,
+        adapter_signature: str = "",
+    ) -> None:
+        """Append a provider notice fact without creating a cognitive queue item."""
+
+        if not self._is_enabled():
+            return
+        event = build_chat_provider_notice_event(
+            raw,
+            adapter_signature=adapter_signature,
+        )
+        await self._get_event_bus().publish(event)
+        if self._world_projection is not None:
+            await asyncio.to_thread(
+                self._world_projection.catch_up,
+                self._get_event_bus().store,
+            )
+
     async def _queue_pending_event(
         self,
         event: LifeEngineEvent,
@@ -1658,8 +1761,11 @@ class LifeEngineService(BaseService):
         self,
         message: Message,
         direction: str = "received",
+        *,
+        envelope: Mapping[str, Any] | None = None,
+        adapter_signature: str = "",
     ) -> None:
-        """记录聊天消息。"""
+        """记录聊天消息，并追加稳定的公共聊天事实。"""
         if not self._is_enabled():
             return
 
@@ -1693,7 +1799,13 @@ class LifeEngineService(BaseService):
                     state.pending_followup = None
                     state.is_waiting = False
                     state.active_check_kind = None
-        await self._publish_raw_events([event])
+        chat_fact = build_chat_message_event(
+            message,
+            direction="delivered" if direction == "sent" else "received",
+            envelope=envelope,
+            adapter_signature=adapter_signature,
+        )
+        await self._publish_message_facts(event, chat_fact)
         await self._save_runtime_context()
         if direction == "received":
             self._schedule_curiosity_review(message, event)

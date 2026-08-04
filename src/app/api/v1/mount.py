@@ -10,12 +10,13 @@ from urllib.parse import urlparse
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from src.kernel.commands import CommandDispatcher, CommandStore, HandlerRegistry
 
 from plugins.life_engine.service.event_bus import RawEventStore
+from src.kernel.commands import CommandDispatcher, CommandStore, HandlerRegistry
 from src.kernel.concurrency import TaskManager
 
 from .auth_store import AuthStore
+from .chat import ChatQueryService
 from .events import EventQueryService
 from .foundation import FoundationProjection
 from .runtime import APIContext, create_api_app
@@ -106,9 +107,10 @@ def mount_api_v1(
         task_manager=task_manager,
     )
     try:
+        codec = SignedValueCodec(signing_secret)
         context = APIContext(
             store=store,
-            codec=SignedValueCodec(signing_secret),
+            codec=codec,
             installation_id=installation_id,
             allowed_origins=normalized_origins,
             max_concurrency=max_concurrency,
@@ -116,8 +118,12 @@ def mount_api_v1(
             foundation=foundation,
             events=EventQueryService(
                 node_id=installation_id,
-                codec=SignedValueCodec(signing_secret),
+                codec=codec,
                 store_provider=event_store_provider,
+            ),
+            chat=ChatQueryService(
+                codec=codec,
+                store_provider=event_store_provider or (lambda: None),
             ),
             command_store=command_store,
             command_dispatcher=command_dispatcher,

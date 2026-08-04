@@ -1,0 +1,309 @@
+"""P3-05 authorized chat history API contracts."""
+
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from plugins.life_engine.service.event_bus import LifeEvent, RawEventStore
+from src.app.api.v1.auth_store import AuthStore, SessionRecord
+from src.app.api.v1.chat import ChatQueryFailure, ChatQueryService
+from src.app.api.v1.policy import PLATFORM_SERVICE_AUDIENCE
+from src.app.api.v1.runtime import APIContext, create_api_app
+from src.app.api.v1.tokens import SignedValueCodec
+
+
+def _session(
+    *,
+    actor_id: str = "reader",
+    role: str = "platform_service",
+    grants: tuple[str, ...] = (),
+) -> SessionRecord:
+    now = datetime.now(UTC)
+    return SessionRecord(
+        session_id=f"session-{actor_id}",
+        actor_id=actor_id,
+        audience=PLATFORM_SERVICE_AUDIENCE,
+        role=role,
+        scopes=("chat:read",),
+        resource_grants=grants,
+        access_expires_at=now + timedelta(minutes=5),
+        refresh_expires_at=now + timedelta(hours=1),
+    )
+
+
+def _chat_event(
+    event_id: str,
+    *,
+    message_id: str,
+    stream_id: str,
+    provider: str = "feishu",
+    chat_type: str = "private",
+    event_type: str = "chat.message.received",
+    actor_id: str = "sender-1",
+    reply_to: str | None = None,
+    attachments: list[dict] | None = None,
+    provider_receipt: dict | None = None,
+) -> LifeEvent:
+    direction = "delivered" if event_type.startswith("chat.message.delivery") else "received"
+    metadata = {
+        "actor_id": actor_id,
+        "visibility": {"scope": "private", "audience": []},
+        "chat": {
+            "message_id": message_id,
+            "stream_id": stream_id,
+            "direction": direction,
+            "platform": provider,
+            "chat_type": chat_type,
+            "message_type": "image" if attachments else "text",
+            "sender": {"id": actor_id, "name": "Sender"},
+            "reply_to": reply_to,
+            "parts": [{"type": "text", "text": f"content-{message_id}"}],
+            "attachments": attachments or [],
+        },
+        "provider_identity": {
+            "provider": provider,
+            "message_id": f"raw-{message_id}",
+        },
+    }
+    if provider_receipt is not None:
+        metadata["provider_receipt"] = provider_receipt
+    return LifeEvent(
+        event_id=event_id,
+        sequence=0,
+        timestamp=datetime.now(UTC).isoformat(),
+        source=f"{provider}_adapter",
+        channel="chat",
+        event_type=event_type,
+        content=f"content-{message_id}",
+        stream_id=stream_id,
+        source_instance_id="chat_global",
+        metadata=metadata,
+        occurrence_id=f"occ-{event_id}",
+    )
+
+
+@pytest.mark.asyncio
+async def test_message_query_cursor_scans_hidden_events_without_leaking(
+    tmp_path: Path,
+) -> None:
+    store = RawEventStore(tmp_path / "life")
+    hidden = await store.append(
+        _chat_event(
+            "hidden",
+            message_id="hidden-message",
+            stream_id="feishu:private:hidden",
+        )
+    )
+    visible = await store.append(
+        _chat_event(
+            "visible",
+            message_id="visible-message",
+            stream_id="feishu:private:visible",
+        )
+    )
+    codec = SignedValueCodec("c" * 48)
+    service = ChatQueryService(codec=codec, store_provider=lambda: store)
+    reader = _session(grants=("stream:feishu:private:visible",))
+
+    page = await service.query_messages(
+        stream_id=None,
+        cursor=None,
+        limit=10,
+        session=reader,
+    )
+
+    assert [item.message_id for item in page.messages] == ["visible-message"]
+    assert page.scanned_count == 2
+    assert not page.has_more
+    assert codec.decode_cursor(page.next_cursor, ledger="chat-events-v1") == visible.sequence
+    assert hidden.event_id not in page.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_private_group_reply_and_media_descriptor_authorization(
+    tmp_path: Path,
+) -> None:
+    descriptor = {
+        "segment_type": "image",
+        "media_ref": {
+            "kind": "image",
+            "mime_type": "image/png",
+            "sha256": "a" * 64,
+            "size_bytes": 128,
+            "source_message_id": "raw-image-1",
+        },
+        "metadata": {"filename": "picture.png", "resource_id": "resource-1"},
+    }
+    store = RawEventStore(tmp_path / "life")
+    await store.append(
+        _chat_event(
+            "private",
+            message_id="private-1",
+            stream_id="feishu:private:user-1",
+            reply_to="private-parent",
+            attachments=[descriptor],
+        )
+    )
+    await store.append(
+        _chat_event(
+            "group",
+            message_id="group-1",
+            stream_id="qq:group:100",
+            provider="qq",
+            chat_type="group",
+        )
+    )
+    service = ChatQueryService(
+        codec=SignedValueCodec("d" * 48),
+        store_provider=lambda: store,
+    )
+
+    private_reader = _session(grants=("stream:feishu:private:user-1",))
+    private_page = await service.query_messages(
+        stream_id="feishu:private:user-1",
+        cursor=None,
+        limit=10,
+        session=private_reader,
+    )
+    message = private_page.messages[0]
+    assert message.reply_to == "private-parent"
+    assert message.attachments[0]["segment_type"] == "image"
+    assert message.attachments[0]["media_ref"]["sha256"] == "a" * 64
+    assert message.attachments[0]["metadata"] == descriptor["metadata"]
+    assert "base64" not in message.model_dump_json().lower()
+    assert "path" not in message.model_dump_json().lower()
+
+    with pytest.raises(ChatQueryFailure) as hidden_group:
+        await service.get_message("group-1", private_reader)
+    assert hidden_group.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_receipt_requires_visible_message_and_keeps_provider_receipt(
+    tmp_path: Path,
+) -> None:
+    store = RawEventStore(tmp_path / "life")
+    await store.append(
+        _chat_event(
+            "delivered",
+            message_id="outbound-1",
+            stream_id="feishu:private:user-1",
+            event_type="chat.message.delivery_confirmed",
+            actor_id="bot",
+            provider_receipt={"message_id": "om-provider-1"},
+        )
+    )
+    service = ChatQueryService(
+        codec=SignedValueCodec("r" * 48),
+        store_provider=lambda: store,
+    )
+    reader = _session(grants=("stream:feishu:private:user-1",))
+
+    receipts = await service.get_receipts("outbound-1", reader)
+
+    assert len(receipts.receipts) == 1
+    assert receipts.receipts[0].status == "confirmed"
+    assert receipts.receipts[0].provider_receipt == {"message_id": "om-provider-1"}
+
+
+@pytest.mark.asyncio
+async def test_duplicate_message_id_requires_resource_disambiguation(tmp_path: Path) -> None:
+    store = RawEventStore(tmp_path / "life")
+    await store.append(
+        _chat_event(
+            "duplicate-feishu",
+            message_id="same-id",
+            stream_id="feishu:private:user-1",
+        )
+    )
+    await store.append(
+        _chat_event(
+            "duplicate-qq",
+            message_id="same-id",
+            stream_id="qq:group:100",
+            provider="qq",
+            chat_type="group",
+        )
+    )
+    service = ChatQueryService(
+        codec=SignedValueCodec("a" * 48),
+        store_provider=lambda: store,
+    )
+    admin = _session(role="administrator")
+
+    with pytest.raises(ChatQueryFailure) as ambiguous:
+        await service.get_message("same-id", admin)
+    assert ambiguous.value.code == "resource_ambiguous"
+
+    selected = await service.get_message(
+        "same-id",
+        admin,
+        provider="qq",
+        stream_id="qq:group:100",
+    )
+    assert selected.provider == "qq"
+
+
+def test_chat_http_scope_resource_hiding_and_openapi(tmp_path: Path) -> None:
+    store = RawEventStore(tmp_path / "life")
+    import asyncio
+
+    asyncio.run(
+        store.append(
+            _chat_event(
+                "http-message",
+                message_id="http-1",
+                stream_id="feishu:private:http",
+            )
+        )
+    )
+    auth = AuthStore(tmp_path / "auth.sqlite3", installation_id="chat-api")
+    codec = SignedValueCodec("h" * 48)
+    context = APIContext(
+        store=auth,
+        codec=codec,
+        installation_id="chat-api",
+        chat=ChatQueryService(codec=codec, store_provider=lambda: store),
+    )
+    secret = "chat-api-service-secret-long-enough"
+    auth.add_credential(
+        actor_id="http-reader",
+        audience=PLATFORM_SERVICE_AUDIENCE,
+        role="platform_service",
+        secret=secret,
+        scopes=("chat:read",),
+        resource_grants=(),
+    )
+    client = TestClient(create_api_app(context))
+    session = client.post(
+        "/auth/sessions",
+        json={
+            "grant_type": "service_credential",
+            "audience": PLATFORM_SERVICE_AUDIENCE,
+            "service_credential": secret,
+        },
+    )
+    headers = {"Authorization": f"Bearer {session.json()['access_token']}"}
+    try:
+        hidden = client.get("/chat/messages/http-1", headers=headers)
+        assert hidden.status_code == 404
+        assert hidden.json()["error"]["code"] == "resource_not_found"
+
+        openapi = client.get("/openapi.json").json()
+        operations = {
+            operation["operationId"]
+            for path in openapi["paths"].values()
+            for operation in path.values()
+            if isinstance(operation, dict) and "operationId" in operation
+        }
+        assert {
+            "queryChatStreams",
+            "getChatStream",
+            "queryChatMessages",
+            "getChatMessage",
+            "getChatMessageReceipts",
+        }.issubset(operations)
+    finally:
+        auth.close()

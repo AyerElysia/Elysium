@@ -430,6 +430,11 @@ def test_openapi_operation_ids_are_stable(
         "getEvent",
         "streamEvents",
         "validateEventSubscription",
+        "queryChatStreams",
+        "getChatStream",
+        "queryChatMessages",
+        "getChatMessage",
+        "getChatMessageReceipts",
     }
     assert "HTTPBearer" in schema["components"]["securitySchemes"]
     for path in schema["paths"].values():
@@ -444,5 +449,5 @@ def test_openapi_operation_ids_are_stable(
             ] == {"$ref": "#/components/schemas/ErrorResponse"}
     normalized = json.dumps(schema, sort_keys=True, separators=(",", ":")).encode()
     assert hashlib.sha256(normalized).hexdigest() == (
-        "108e222578f617a3400d576278bbdda30adc205260a7ee018929797e8512f708"
+        "7b35bbec8cf09c6eb4eb1800bda790980e38f22f13dbee0bb8253b1d4b6b1ae7"
     )

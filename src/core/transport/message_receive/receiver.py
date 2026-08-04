@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import OrderedDict
-from typing import Any, Dict
+from typing import Any
 
 from mofox_wire import MessageEnvelope
 from rich.markup import escape
@@ -353,9 +353,10 @@ class MessageReceiver:
 
         订阅者可以通过填充 ``params["processed"]`` 字段将消息纳入标准流程。
         """
-        params: Dict[str, Any] = {
+        params: dict[str, Any] = {
             "raw": dict(envelope),
             "processed": "",
+            "adapter_signature": adapter_signature,
         }
 
         event_manager = self._get_event_manager()
@@ -364,7 +365,7 @@ class MessageReceiver:
             params,
         )
 
-        final_params: Dict[str, Any] = result.get("params", params)
+        final_params: dict[str, Any] = result.get("params", params)
         processed: str = final_params.get("processed", "")
 
         if not processed:

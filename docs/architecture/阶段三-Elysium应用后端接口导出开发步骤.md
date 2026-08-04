@@ -1267,6 +1267,12 @@ metrics:read / diagnostics:read
 
 验收门：收文本／图片／语音／戳戳可订阅和历史补收；发送前事件不误报成功；撤回、回应、成员变化不丢失。
 
+当前实现状态：已完成。receiver、NapCat notice、send requested、delivery confirmed／failed／unknown 统一写入既有耐久 Life Event ledger；兼容 Life Engine 事件和稳定 `chat.*` fact 使用同一批事务追加。`ON_MESSAGE_SENT` 只产生 `chat.message.send_requested`，只有 Adapter 返回且历史写入完成后才产生 confirmed；超时和确定失败分别形成 unknown 与 failed。NapCat／飞书发送响应只提取真实返回的受控 receipt 字段，Provider 未返回时保持为空，不编造 message ID。
+
+已开放五个 `chat:read` 查询接口：stream 列表、stream 详情、stream 消息、单消息、消息 receipts。查询使用绑定 `chat-events-v1` 账本的签名 cursor；cursor 表示已扫描的权威 ingest position，不可见事件仍推进扫描位置。管理员、事件 actor 或持有 `stream:{stream_id}` grant 的调用者可读；不可见与不存在统一 404；跨 provider／stream 的重复 message ID 必须用 `provider` 或 `stream_id` 消歧。媒体 descriptor 在对外投影时重新校验，不导出路径、base64 或原始媒体 bytes。
+
+Provider 边界必须如实保留：NapCat notice 已覆盖撤回、回应、戳戳、成员变化及未知 notice 的耐久兜底；飞书当前长连接只注册 `im.message.receive_v1`，因此飞书撤回、回应和成员变化等 notice 尚未接入，不能宣称跨 Provider 全量验收。现阶段完成的是统一事件和查询基础合同；新增飞书 notice 订阅时应复用同一 `chat.*` 映射与授权测试。
+
 ### P3-06：聊天命令与平台 capability
 
 任务：

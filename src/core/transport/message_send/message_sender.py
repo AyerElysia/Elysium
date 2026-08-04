@@ -158,8 +158,14 @@ class MessageSender:
 
             # 7. 调用开始后的超时无法判断平台是否已收到消息。
             adapter_send_started = True
-            await adapter._send_platform_message(envelope)
+            provider_response = await adapter._send_platform_message(envelope)
             adapter_send_completed = True
+            provider_receipt = self._extract_provider_receipt(
+                provider_response,
+                platform=str(message.platform or ""),
+            )
+            if provider_receipt:
+                message.extra["provider_receipt"] = provider_receipt
 
             # 8. 写入历史消息。
             history_persisted = await self._persist_sent_message_to_history(message)
@@ -207,12 +213,52 @@ class MessageSender:
                     f"投递状态未知详情: message_id={message.message_id}, error={e}",
                     exc_info=True,
                 )
+                await self._emit_delivery_status_event(
+                    message,
+                    adapter_signature or "",
+                    status="unknown",
+                    error=e,
+                )
                 return False
+            message.extra["delivery_status"] = "failed"
+            await self._emit_delivery_status_event(
+                message,
+                adapter_signature or "",
+                status="failed",
+                error=e,
+            )
             logger.error(
                 f"发送消息失败: message_id={message.message_id}, error={e}",
                 exc_info=True,
             )
             return False
+
+    @staticmethod
+    def _extract_provider_receipt(response: Any, *, platform: str) -> dict[str, Any]:
+        """Keep only provider-returned receipt fields safe for durable history."""
+
+        if not isinstance(response, dict):
+            return {}
+        provider = platform.strip().lower()
+        receipt: dict[str, Any] = {"provider": provider} if provider else {}
+        for key in ("status", "retcode", "code", "msg"):
+            value = response.get(key)
+            if isinstance(value, (str, int, float, bool)):
+                receipt[key] = value
+        data = response.get("data")
+        if isinstance(data, dict):
+            for key in (
+                "message_id",
+                "root_id",
+                "parent_id",
+                "chat_id",
+                "create_time",
+                "update_time",
+            ):
+                value = data.get(key)
+                if isinstance(value, (str, int, float, bool)) and value != "":
+                    receipt[key] = value
+        return receipt if len(receipt) > (1 if provider else 0) else {}
 
     @staticmethod
     def _is_timeout_exception(error: BaseException) -> bool:
@@ -549,6 +595,37 @@ class MessageSender:
             )
         except Exception as e:
             logger.warning(f"触发确认投递事件失败: {e}")
+
+    async def _emit_delivery_status_event(
+        self,
+        message: "Message",
+        adapter_signature: str,
+        *,
+        status: str,
+        error: BaseException,
+    ) -> None:
+        """Publish an explicit failed or unknown delivery fact."""
+
+        try:
+            from src.core.components.types import EventType
+            from src.core.managers.event_manager import get_event_manager
+
+            event_type = (
+                EventType.ON_MESSAGE_DELIVERY_UNKNOWN
+                if status == "unknown"
+                else EventType.ON_MESSAGE_DELIVERY_FAILED
+            )
+            await get_event_manager().publish_event(
+                event_type,
+                {
+                    "message": message,
+                    "adapter_signature": adapter_signature,
+                    "delivery_status": status,
+                    "error_type": type(error).__name__,
+                },
+            )
+        except Exception as event_error:
+            logger.warning(f"触发投递状态事件失败: {event_error}")
 
 
 # 全局单例

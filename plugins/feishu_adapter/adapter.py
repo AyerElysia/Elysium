@@ -756,7 +756,7 @@ class FeishuAdapter(BaseAdapter):
     async def _send_platform_message(  # type: ignore[override]
         self,
         envelope: MessageEnvelope,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         outgoing = self._extract_outgoing_message(envelope)
         text = outgoing["text"]
         reply_to = outgoing["reply_to"]
@@ -774,36 +774,38 @@ class FeishuAdapter(BaseAdapter):
         open_id = str(user_info.get("user_id") or "")
 
         if image_data:
-            await self._send_image_message(
+            return await self._send_image_message(
                 chat_id=chat_id,
                 open_id=open_id,
                 reply_to=reply_to,
                 image_data=image_data,
             )
-            return
 
         if voice_data:
-            await self._send_audio_message(
+            return await self._send_audio_message(
                 chat_id=chat_id,
                 open_id=open_id,
                 reply_to=reply_to,
                 voice_data=voice_data,
             )
-            return
 
         if self._config().behavior.reply_to_message and reply_to:
-            await self._reply_text(reply_to, text)
+            response = await self._reply_text(reply_to, text)
             logger.info(f"飞书引用回复发送成功: reply_to={reply_to} text={text[:80]}")
-            return
+            return response
 
         if chat_id:
-            await self._send_text(receive_id_type="chat_id", receive_id=chat_id, text=text)
+            response = await self._send_text(
+                receive_id_type="chat_id",
+                receive_id=chat_id,
+                text=text,
+            )
             logger.info(f"飞书群消息发送成功: chat_id={chat_id} text={text[:80]}")
-            return
+            return response
 
         if open_id:
             receive_id_type, receive_id = self._private_receive_target(open_id)
-            await self._send_text(
+            response = await self._send_text(
                 receive_id_type=receive_id_type,
                 receive_id=receive_id,
                 text=text,
@@ -812,7 +814,7 @@ class FeishuAdapter(BaseAdapter):
                 "飞书私聊消息发送成功: "
                 f"{receive_id_type}={receive_id} text={text[:80]}"
             )
-            return
+            return response
 
         raise ValueError("飞书出站消息缺少 chat_id/open_id，无法确定发送目标")
 
@@ -1514,24 +1516,24 @@ class FeishuAdapter(BaseAdapter):
         open_id: str,
         reply_to: str,
         image_data: str,
-    ) -> None:
+    ) -> dict[str, Any]:
         image_key = await self._upload_image_data(image_data)
         if self._config().behavior.reply_to_message and reply_to:
-            await self._reply_image(reply_to, image_key)
+            response = await self._reply_image(reply_to, image_key)
             logger.info(f"飞书引用图片发送成功: reply_to={reply_to} image_key={image_key}")
-            return
+            return response
         if chat_id:
-            await self._send_image("chat_id", chat_id, image_key)
+            response = await self._send_image("chat_id", chat_id, image_key)
             logger.info(f"飞书群图片发送成功: chat_id={chat_id} image_key={image_key}")
-            return
+            return response
         if open_id:
             receive_id_type, receive_id = self._private_receive_target(open_id)
-            await self._send_image(receive_id_type, receive_id, image_key)
+            response = await self._send_image(receive_id_type, receive_id, image_key)
             logger.info(
                 "飞书私聊图片发送成功: "
                 f"{receive_id_type}={receive_id} image_key={image_key}"
             )
-            return
+            return response
         raise ValueError("飞书出站图片缺少 chat_id/open_id，无法确定发送目标")
 
     async def _upload_image_data(self, image_data: str) -> str:
@@ -1583,42 +1585,39 @@ class FeishuAdapter(BaseAdapter):
         open_id: str,
         reply_to: str,
         voice_data: str,
-    ) -> None:
+    ) -> dict[str, Any]:
         try:
             file_key, duration_ms = await self._upload_audio(voice_data)
         except Exception as exc:
             logger.error(f"飞书语音上传失败，将降级为文本提示: {exc}", exc_info=True)
             fallback_text = "[语音发送失败：飞书音频上传没有成功]"
             if self._config().behavior.reply_to_message and reply_to:
-                await self._reply_text(reply_to, fallback_text)
-                return
+                return await self._reply_text(reply_to, fallback_text)
             if chat_id:
-                await self._send_text("chat_id", chat_id, fallback_text)
-                return
+                return await self._send_text("chat_id", chat_id, fallback_text)
             if open_id:
                 receive_id_type, receive_id = self._private_receive_target(open_id)
-                await self._send_text(receive_id_type, receive_id, fallback_text)
-                return
+                return await self._send_text(receive_id_type, receive_id, fallback_text)
             raise ValueError("飞书出站语音缺少 chat_id/open_id，无法确定发送目标") from exc
 
         if self._config().behavior.reply_to_message and reply_to:
-            await self._reply_audio(reply_to, file_key, duration_ms)
+            response = await self._reply_audio(reply_to, file_key, duration_ms)
             logger.info(f"飞书引用语音发送成功: reply_to={reply_to} file_key={file_key}")
-            return
+            return response
 
         if chat_id:
-            await self._send_audio(
+            response = await self._send_audio(
                 receive_id_type="chat_id",
                 receive_id=chat_id,
                 file_key=file_key,
                 duration_ms=duration_ms,
             )
             logger.info(f"飞书群语音发送成功: chat_id={chat_id} file_key={file_key}")
-            return
+            return response
 
         if open_id:
             receive_id_type, receive_id = self._private_receive_target(open_id)
-            await self._send_audio(
+            response = await self._send_audio(
                 receive_id_type=receive_id_type,
                 receive_id=receive_id,
                 file_key=file_key,
@@ -1628,7 +1627,7 @@ class FeishuAdapter(BaseAdapter):
                 "飞书私聊语音发送成功: "
                 f"{receive_id_type}={receive_id} file_key={file_key}"
             )
-            return
+            return response
 
         raise ValueError("飞书出站语音缺少 chat_id/open_id，无法确定发送目标")
 

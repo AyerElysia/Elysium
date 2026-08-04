@@ -52,6 +52,8 @@ class EventType(str, Enum):
     ON_MESSAGE_RECEIVED = "on_message_received"
     ON_MESSAGE_SENT = "on_message_sent"
     ON_MESSAGE_DELIVERED = "on_message_delivered"
+    ON_MESSAGE_DELIVERY_FAILED = "on_message_delivery_failed"
+    ON_MESSAGE_DELIVERY_UNKNOWN = "on_message_delivery_unknown"
     ON_CHATTER_STEP = "on_chatter_step"
     ON_CHATTER_STEP_RESULT = "on_chatter_step_result"
     ON_NOTICE_RECEIVED = "on_notice_received"

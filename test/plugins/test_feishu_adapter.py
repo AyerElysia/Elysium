@@ -518,11 +518,14 @@ async def test_feishu_outgoing_group_text(monkeypatch: pytest.MonkeyPatch) -> No
 
     async def fake_post(path, body):
         calls.append((path, body))
-        return {"code": 0}
+        return {
+            "code": 0,
+            "data": {"message_id": "om_sent_1", "chat_id": "oc_1"},
+        }
 
     monkeypatch.setattr(adapter, "_post_json", fake_post)
 
-    await adapter._send_platform_message({
+    receipt = await adapter._send_platform_message({
         "direction": "outgoing",
         "message_info": {
             "platform": "feishu",
@@ -536,6 +539,10 @@ async def test_feishu_outgoing_group_text(monkeypatch: pytest.MonkeyPatch) -> No
 
     assert calls[0][0] == "/open-apis/im/v1/messages?receive_id_type=chat_id"
     assert calls[0][1]["receive_id"] == "oc_1"
+    assert receipt == {
+        "code": 0,
+        "data": {"message_id": "om_sent_1", "chat_id": "oc_1"},
+    }
 
 
 async def test_feishu_outgoing_image_uploads_and_sends(

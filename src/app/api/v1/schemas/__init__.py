@@ -9,6 +9,16 @@ from .auth import (
     WSTicketRequest,
     WSTicketResponse,
 )
+from .chat import (
+    ChatMessage,
+    ChatMessagePage,
+    ChatPart,
+    ChatReceipt,
+    ChatReceiptList,
+    ChatSender,
+    ChatStreamPage,
+    ChatStreamSummary,
+)
 from .commands import (
     CommandCancelResponse,
     CommandCreateRequest,
@@ -49,6 +59,14 @@ __all__ = [
     "CallerIdentity",
     "CapabilitiesResponse",
     "CapabilityManifest",
+    "ChatMessage",
+    "ChatMessagePage",
+    "ChatPart",
+    "ChatReceipt",
+    "ChatReceiptList",
+    "ChatSender",
+    "ChatStreamPage",
+    "ChatStreamSummary",
     "CommandCancelResponse",
     "CommandCreateRequest",
     "CommandListResponse",

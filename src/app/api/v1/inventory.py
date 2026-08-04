@@ -171,6 +171,17 @@ GET /api/v1/chat/streams/{stream_id}
 GET /api/v1/chat/streams/{stream_id}/messages
 GET /api/v1/chat/messages/{message_id}
 GET /api/v1/chat/messages/{message_id}/receipts
+""",
+        domain="chat",
+        pages=("会话列表", "聊天窗口", "消息详情"),
+        callers=_ALL_CALLERS,
+        scopes=("chat:read",),
+        resource_authorization="校验 stream 参与者与消息可见性；不可见与不存在统一处理",
+        anchor="src/app/api/v1/chat.py、schemas/chat.py 与 Life Event ledger",
+        status="validated",
+    ),
+    *_contracts(
+        """
 GET /api/v1/chat/streams/{stream_id}/members
 GET /api/v1/chat/streams/{stream_id}/announcements
 GET /api/v1/chat/streams/{stream_id}/files
@@ -189,7 +200,7 @@ POST /api/v1/chat/streams/{stream_id}/poke
         callers=_ALL_CALLERS,
         scopes=("chat:read", "chat:write"),
         resource_authorization="校验 stream 参与者、消息可见性、actor 所有权与 provider capability",
-        anchor="src/app/plugin_system/api/message_api.py、send_api.py 与 MessageSender；需新增 chat facade",
+        anchor="src/app/plugin_system/api/send_api.py 与 MessageSender；P3-06 实现 chat command facade",
     ),
     *_contracts(
         """

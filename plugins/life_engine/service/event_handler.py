@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import BaseEventHandler
@@ -22,9 +22,13 @@ class LifeEngineMessageCollectorHandler(BaseEventHandler):
     handler_description = "收集收发消息并堆积到 life_engine 队列"
     weight = 50
     intercept_message = False
-    init_subscribe: list[EventType | str] = [
+    init_subscribe: ClassVar[list[EventType | str]] = [
         EventType.ON_MESSAGE_RECEIVED,
+        EventType.ON_MESSAGE_SENT,
         EventType.ON_MESSAGE_DELIVERED,
+        EventType.ON_MESSAGE_DELIVERY_FAILED,
+        EventType.ON_MESSAGE_DELIVERY_UNKNOWN,
+        EventType.ON_RECEIVED_OTHER_MESSAGE,
     ]
 
     async def execute(
@@ -33,7 +37,11 @@ class LifeEngineMessageCollectorHandler(BaseEventHandler):
         """把已接收或已确认投递的 message 记录到 life_engine 服务队列。"""
         if event_name not in {
             EventType.ON_MESSAGE_RECEIVED.value,
+            EventType.ON_MESSAGE_SENT.value,
             EventType.ON_MESSAGE_DELIVERED.value,
+            EventType.ON_MESSAGE_DELIVERY_FAILED.value,
+            EventType.ON_MESSAGE_DELIVERY_UNKNOWN.value,
+            EventType.ON_RECEIVED_OTHER_MESSAGE.value,
         }:
             return EventDecision.PASS, params
 
@@ -42,19 +50,52 @@ class LifeEngineMessageCollectorHandler(BaseEventHandler):
             return EventDecision.PASS, params
 
         try:
+            service = getattr(plugin, "service", None)
+            if service is None:
+                return EventDecision.SUCCESS, params
+
+            if event_name == EventType.ON_RECEIVED_OTHER_MESSAGE.value:
+                raw = params.get("raw")
+                if isinstance(raw, dict):
+                    await service.record_provider_notice(
+                        raw,
+                        adapter_signature=str(params.get("adapter_signature") or ""),
+                    )
+                return EventDecision.PASS, params
+
             message = params.get("message")
             if message is None:
                 return EventDecision.SUCCESS, params
 
-            service = getattr(plugin, "service", None)
-            if service is None:
+            if event_name == EventType.ON_MESSAGE_SENT.value:
+                await service.record_send_requested(
+                    message,
+                    envelope=params.get("envelope"),
+                    adapter_signature=str(params.get("adapter_signature") or ""),
+                )
+                return EventDecision.PASS, params
+
+            if event_name in {
+                EventType.ON_MESSAGE_DELIVERY_FAILED.value,
+                EventType.ON_MESSAGE_DELIVERY_UNKNOWN.value,
+            }:
+                await service.record_delivery_status(
+                    message,
+                    status=str(params.get("delivery_status") or "unknown"),
+                    adapter_signature=str(params.get("adapter_signature") or ""),
+                )
                 return EventDecision.SUCCESS, params
 
             direction = "received"
             if event_name == EventType.ON_MESSAGE_DELIVERED.value:
                 direction = "sent"
 
-            await service.record_message(message, direction=direction)
+            await service.record_message(
+                message,
+                direction=direction,
+                envelope=params.get("envelope"),
+                adapter_signature=str(params.get("adapter_signature") or ""),
+            )
         except Exception as exc:  # noqa: BLE001
             logger.error(f"life_engine 收集消息失败: {exc}")
             log_error(

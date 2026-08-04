@@ -367,8 +367,12 @@ app_api_v1_max_websocket_connections = 64
 - Origin 使用精确 allowlist，不支持通配符；localhost 也不能绕过认证；
 - API SQLite 必须位于 workspace 的 `runtime/` 下；认证部分只保存凭据哈希、授权、到期与撤销状态，不保存可回显明文凭据；同库命令账本保存请求 payload 以供耐久执行和查询，因此备份、访问控制与留存策略必须按业务数据级别保护；
 - 普通请求体上限 1 MiB，受管上传上限 32 MiB，HTTP 并发和 WebSocket 连接分别受配置预算约束；
-- 当前已挂载 P3-01 的五个认证端点、P3-02 的 `/bootstrap`、`/capabilities`、`/readiness`、`/health`，P3-03 的 `/events`、`/events/{event_id}`、`/events/stream` 和 `/event-subscriptions/validate`，以及 P3-04 的命令创建、列表、单项查询和受限取消端点；除 `/health` 仅用于 API 存活探测外，其余接口要求短时 Bearer 会话和对应 scope。其他领域接口与实际领域 command handler 仍由后续阶段完成，不能因为命令内核或 OpenAPI 可访问就宣称全部领域动作可用；
+- 当前已挂载 P3-01 的五个认证端点、P3-02 的 `/bootstrap`、`/capabilities`、`/readiness`、`/health`，P3-03 的 `/events`、`/events/{event_id}`、`/events/stream` 和 `/event-subscriptions/validate`，P3-04 的命令创建、列表、单项查询和受限取消端点，以及 P3-05 的五个只读聊天历史端点；除 `/health` 仅用于 API 存活探测外，其余接口要求短时 Bearer 会话和对应 scope。聊天发送和平台动作仍属于 P3-06，不能因为聊天历史可读或命令内核可访问就宣称领域动作可用；
 - 事件接口以耐久 Life Event SQLite ledger 的全局 ingest position 为权威位置，cursor 不透明、签名且绑定账本；授权过滤后的 cursor 表示“已扫描位置”，不可见事件不会造成虚假历史缺口，也不会通过单事件读取泄露存在性；
+- 聊天历史接口为 `GET /api/v1/chat/streams`、`GET /api/v1/chat/streams/{stream_id}`、`GET /api/v1/chat/streams/{stream_id}/messages`、`GET /api/v1/chat/messages/{message_id}` 和 `GET /api/v1/chat/messages/{message_id}/receipts`，统一要求 `chat:read`。管理员可读全量；普通 actor 只能读取自己的事实或获授 `stream:{stream_id}`、`chat:*`、`*` 的 stream。不可见资源与不存在资源统一返回 404；同一 message ID 跨 provider／stream 冲突时返回 409，并要求使用 `provider` 或 `stream_id` 查询参数消歧；
+- 聊天分页 cursor 绑定独立 `chat-events-v1` 账本标识，仍以 Life Event 全局 ingest position 为扫描位置。聊天查询服务未注入可用事件 store 时返回 503，不会为了只读查询隐式创建 Life Engine；历史缺口返回显式 gap 错误和恢复 cursor；
+- 稳定聊天事实区分 `chat.message.send_requested`、`delivery_confirmed`、`delivery_failed` 与 `delivery_unknown`。发送前事件绝不代表平台投递成功；只有 Adapter 调用成功、发送历史写入完成后才确认。Provider 响应只提取真实返回的受控 receipt 字段，未返回时 receipts 中保持 `provider_receipt = null`，不得编造平台 message ID；
+- 聊天消息中的媒体只导出经过重新校验的 descriptor，不导出本地路径、base64、原始 bytes 或任意资源 URL。当前 NapCat notice 已进入耐久兜底；飞书长连接仍只订阅 `im.message.receive_v1`，飞书撤回、回应和成员变化等 notice 尚未接入，部署验收必须按 Provider 分开记录；
 - SSE 支持 `Last-Event-ID` 或 `cursor` 断点恢复，二者不一致会显式拒绝；先补历史再轮询 tail，heartbeat 不推进业务 cursor，断线不写服务端 durable offset。当前没有明确动态订阅或 ack 消费者，因此 `/events/ws` 保持 planned，不重复实现无消费者协议；
 - 所有副作用命令必须携带 `Idempotency-Key`。同一 actor 使用同键提交相同规范请求会返回原 command；同键异请求返回 409。HTTP 受理只表示命令已耐久记录，不代表外部副作用成功，调用方必须通过命令查询读取最终状态；
 - 重启只会重新调度 `accepted`。进程退出前已经进入 `executing` 而无法证明投递结果的命令会转为 `delivery_unknown`，不得由客户端或服务端自动盲重试；应先查询外部系统或领域 receipt，再由具有明确幂等证据的领域流程决定后续动作；
@@ -383,10 +387,10 @@ app_api_v1_max_websocket_connections = 64
 定向验收：
 
 ```bash
-uv run --group dev python -m pytest test/api/v1 test/kernel/commands -q --no-cov -n 0
+uv run --group dev python -m pytest test/api/v1 test/kernel/commands test/plugins/life_engine/test_chat_events.py test/plugins/test_message_delivery_event_handlers.py test/core/transport/test_message_sender_bot_sender.py test/plugins/test_napcat_outgoing_sender.py test/plugins/test_feishu_adapter.py -q --no-cov -n 0
 ```
 
-启用或修改该配置需要用户手工重启 Elysium。本轮开发没有启动或重启运行实例，也没有完成真实前端端到端验收。
+启用或修改该配置需要用户手工重启 Elysium。本轮开发没有启动或重启运行实例，也没有完成真实前端端到端验收。P3-05 当前结论仅来自离线契约、API 和 Adapter 回执回归；真实客户端应另外验证短时会话、scope、stream grant、断点续查和 Provider notice 支持矩阵。
 
 ---
 

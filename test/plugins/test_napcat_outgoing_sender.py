@@ -43,8 +43,13 @@ async def test_napcat_sender_passes_bounded_nt_receipt_timeout() -> None:
     )
     sender = OutgoingSender(client, lambda: _config(18.0))
 
-    await sender.send(_private_text_envelope())
+    receipt = await sender.send(_private_text_envelope())
 
+    assert receipt == {
+        "status": "ok",
+        "retcode": 0,
+        "data": {"message_id": "message-1"},
+    }
     client.call.assert_awaited_once_with(
         "send_private_msg",
         {
