@@ -367,7 +367,7 @@ app_api_v1_max_websocket_connections = 64
 - Origin 使用精确 allowlist，不支持通配符；localhost 也不能绕过认证；
 - API SQLite 必须位于 workspace 的 `runtime/` 下；认证部分只保存凭据哈希、授权、到期与撤销状态，不保存可回显明文凭据；同库命令账本保存请求 payload 以供耐久执行和查询，因此备份、访问控制与留存策略必须按业务数据级别保护；
 - 普通请求体上限 1 MiB，受管上传上限 32 MiB，HTTP 并发和 WebSocket 连接分别受配置预算约束；
-- 当前已挂载 P3-01 的五个认证端点、P3-02 的 `/bootstrap`、`/capabilities`、`/readiness`、`/health`，P3-03 的 `/events`、`/events/{event_id}`、`/events/stream` 和 `/event-subscriptions/validate`，P3-04 的命令创建、列表、单项查询和受限取消端点，P3-05 的五个只读聊天历史端点，以及 P3-06 的 13 个耐久聊天命令端点；除 `/health` 仅用于 API 存活探测外，其余接口要求短时 Bearer 会话和对应 scope；
+- 当前已挂载 P3-01 的五个认证端点、P3-02 的 `/bootstrap`、`/capabilities`、`/readiness`、`/health`，P3-03 的 `/events`、`/events/{event_id}`、`/events/stream` 和 `/event-subscriptions/validate`，P3-04 的命令创建、列表、单项查询和受限取消端点，P3-05 的五个只读聊天历史端点，P3-06 的 13 个耐久聊天命令端点，以及 P3-07 的 8 个用户媒体端点；除 `/health` 仅用于 API 存活探测外，其余接口要求短时 Bearer 会话和对应 scope；
 - 事件接口以耐久 Life Event SQLite ledger 的全局 ingest position 为权威位置，cursor 不透明、签名且绑定账本；授权过滤后的 cursor 表示“已扫描位置”，不可见事件不会造成虚假历史缺口，也不会通过单事件读取泄露存在性；
 - 聊天历史接口为 `GET /api/v1/chat/streams`、`GET /api/v1/chat/streams/{stream_id}`、`GET /api/v1/chat/streams/{stream_id}/messages`、`GET /api/v1/chat/messages/{message_id}` 和 `GET /api/v1/chat/messages/{message_id}/receipts`，统一要求 `chat:read`。管理员可读全量；普通 actor 只能读取自己的事实或获授 `stream:{stream_id}`、`chat:*`、`*` 的 stream。不可见资源与不存在资源统一返回 404；同一 message ID 跨 provider／stream 冲突时返回 409，并要求使用 `provider` 或 `stream_id` 查询参数消歧；
 - 聊天分页 cursor 绑定独立 `chat-events-v1` 账本标识，仍以 Life Event 全局 ingest position 为扫描位置。聊天查询服务未注入可用事件 store 时返回 503，不会为了只读查询隐式创建 Life Engine；历史缺口返回显式 gap 错误和恢复 cursor；
@@ -378,7 +378,11 @@ app_api_v1_max_websocket_connections = 64
 - P3-06 普通聊天命令位于 `/api/v1/chat/...`，统一要求 `chat:write`；公告发布／删除和 pin／unpin 位于 `/api/v1/admin/chat/...`，同时要求 `chat:admin`、`chat:moderate` 与 `administrator` 或受信 `platform_service` 身份。普通用户即使意外持有管理 scope，也会收到 `role_required`；
 - durable 聊天命令执行前会重新读取受理时绑定的 session，并验证当前撤销、access 到期、credential 撤销、resource grants 缩减和 P3-05 目标可见性。任一状态失效都拒绝尚未完成的操作；不能把受理时授权永久视为有效；
 - 文本 send/reply 通过 `MessageSender`；reply/forward 的公共 message ID 在执行时解析为同一 Provider 的原生 message ID，跨 Provider forward 显式拒绝。edit/recall 仅允许命令 actor 自己已投递的消息。Provider 不支持、Feishu/NapCat Adapter 尚未加载或 capability 缺失时返回 `capability_disabled`，不得改发文本或误报 `provider_failed`；
-- P3-06 媒体 part 只接受 `media_id`，禁止本地路径、任意 URL、base64、裸 bytes 和 `data`。P3-07 media resolver 接入前，图片、语音、视频、文件和 emoji 命令保持 `capability_disabled`；不能把已有主体媒体工具的本地能力误当成 `/api/v1` 受管媒体合同；
+- P3-06 媒体 part 只接受 `media_id`，禁止本地路径、任意 URL、base64、裸 bytes 和 `data`。P3-07 已为图片与语音 part 接入受管媒体 resolver：执行时使用当前重新校验的 actor/resource grants 读取对象并复核完整性；未接入 resolver 的部署仍返回 `capability_disabled`。视频、文件和 emoji 尚无聊天 resolver 映射，不能把已有主体媒体工具的本地能力误当成 `/api/v1` 受管媒体合同；
+- P3-07 用户媒体端点为 `POST /media/uploads`、`PUT /media/uploads/{upload_id}`、`POST /media/uploads/{upload_id}:complete`、`GET /media/{media_id}`、`GET /media/{media_id}/content`、`POST /media/{media_id}:save`、`POST /media/{media_id}:recognize` 和 `GET /media/{media_id}/derivatives`。分别要求 `media:write`、`media:read` 或 `media:recognize`；上传声明上限 32 MiB，内容只存于 workspace `runtime/media/`；
+- 媒体 owner 可访问自己的对象；共享对象必须绑定调用会话实际持有的精确 grant、`namespace:*` 或 `*`。非 owner 越权与不存在统一 404。下载支持 ETag 与单一 Range，无效 Range 返回 416；complete、下载和聊天发送前都会校验大小、SHA-256、MIME 与文件签名；
+- API SQLite 保存媒体对象元数据，`runtime/media/objects/` 保存内容，二者必须作为同一恢复单元备份。`runtime/media/uploads/` 是临时上传区；当前只提供只读 cleanup candidate 识别，不自动删除未知或孤儿文件。恢复后必须验证 descriptor、对象 hash、saved 状态和 `sync_outbox` 连续性；
+- 媒体 complete/save 事件复用既有 `sync_outbox`，保持 `private`、`held`，不包含 path、base64 或原始 bytes。recognize 后只持久化识别状态和文本；Provider 异常原文不会通过 API 返回；
 - 重启只会重新调度 `accepted`。进程退出前已经进入 `executing` 而无法证明投递结果的命令会转为 `delivery_unknown`，不得由客户端或服务端自动盲重试；应先查询外部系统或领域 receipt，再由具有明确幂等证据的领域流程决定后续动作；
 - 命令技术状态事件与状态迁移在同一 SQLite 事务进入既有 `sync_outbox`，当前保持 `private`、`held`，不复制原始 payload，也不建立第二套远程同步；备份恢复后应检查 accepted 恢复、executing 栅栏和 Outbox 连续性；
 - `/readiness` 只读聚合已经存在的内存状态，不调用插件或 Adapter 主动 health，不建立连接、不建表、不执行修复，也不访问会创建 Life Engine service 的懒加载属性；配置停用的平台显示 `disabled`，而不是失败或从列表消失；
@@ -394,7 +398,7 @@ app_api_v1_max_websocket_connections = 64
 uv run --group dev python -m pytest test/api/v1 test/kernel/commands test/plugins/life_engine/test_chat_events.py test/plugins/test_message_delivery_event_handlers.py test/core/transport/test_message_sender_bot_sender.py test/plugins/test_napcat_outgoing_sender.py test/plugins/test_feishu_adapter.py -q --no-cov -n 0
 ```
 
-启用或修改该配置需要用户手工重启 Elysium。本轮开发没有启动或重启运行实例，也没有完成真实前端／Provider 端到端验收。P3-05/P3-06 当前结论来自离线契约、API、MessageSender 和 Adapter 回归；真实客户端应另外验证短时会话、scope、stream grant、断点续查、命令最终状态、Provider capability 和 notice 支持矩阵。P3-07 接入前不得把媒体聊天命令标记为可用。
+启用或修改该配置需要用户手工重启 Elysium。本轮开发没有启动或重启运行实例，也没有完成真实前端／Provider 端到端验收。P3-05/P3-06/P3-07 当前结论来自离线契约、API、MessageSender 和 Adapter 回归；真实客户端应另外验证短时会话、scope、stream grant、断点续查、媒体上传/下载、聊天 `media_id` 发送、命令最终状态、Provider capability 和 notice 支持矩阵。直播和语音通话领域接口仍属于 P3-08/P3-09，不能因 P3-07 已提供媒体对象而标记完成。
 
 ---
 
@@ -1375,3 +1379,4 @@ config/
 | 2026-08-02 | 飞书媒体验收与 TTS 边界 | 记录飞书图片保存/发送、语音合成发送和语音接收识别均已真实验收；明确任务式 TTS 与独立 GPT-SoVITS 插件链路分离，停用插件时不要求加载其可选音频依赖 |
 | 2026-08-03 | 依赖安装与环境恢复 | 补充无 `uv` 时通过项目 `.venv` 安装完整依赖、为插件安装器补装并暴露项目级 `uv`、`pip check` 与启动导入验收，以及损坏环境改名备份、重建和回退流程 |
 | 2026-08-04 | TTS 现状修正 | 明确当前任务式本地 TTS 为 IndexTTS2；GPT-SoVITS/Higgs 仅属于停用的遗留兼容插件，不再作为爱莉当前 TTS 模型描述 |
+| 2026-08-04 | 阶段三 P3-07 | 接入 8 个受管媒体端点、`runtime/media/` 持久化、resource grant、完整性校验、既有 `sync_outbox` 和聊天图片/语音 `media_id` resolver；明确尚未做真实客户端/Provider E2E |

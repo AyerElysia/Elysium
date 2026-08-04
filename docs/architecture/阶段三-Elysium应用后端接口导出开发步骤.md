@@ -1279,7 +1279,7 @@ Provider 边界必须如实保留：NapCat notice 已覆盖撤回、回应、戳
 >
 > 每个 durable command 在受理时保存内部 session/resource grant 授权快照，但公共幂等 hash 不含 session ID，响应也不暴露快照；执行时重新读取当前 session、credential、到期/撤销状态、resource grants 与目标可见性，权限缩减或目标不可见均拒绝。管理路由位于 `/api/v1/admin/chat/...`，同时要求 `chat:admin`、`chat:moderate` 和 `administrator`／`platform_service` 身份；普通用户即使持有相同 scope 也被拒绝。生产 Bot 已通过 late-bound client 接入，避免 API mount 早于插件加载时静态捕获空 Adapter。
 >
-> 本轮实际验证：`test/api/v1` 84 项、MessageSender 与聊天事件 22 项、飞书 Adapter 36 项、NapCat Adapter 41 项全部通过；P3-06 定向拆分为 20、9、10、20 项均通过，Ruff、compileall 与 `git diff --check` 通过。未启动或重启 Elysium，未完成真实前端／Provider 端到端验收；P3-07 尚未接入，因此当前真实可用边界是文本发送与 Provider 原生动作，图片、语音等媒体命令必须保持显式禁用。
+> P3-07 已在生产组装中向聊天命令注入受管媒体 resolver。图片和语音 part 会在执行时使用重新校验后的 actor 与 resource grants 将 `media_id` 解析为 `MediaAttachment`；无权访问与不存在统一为 `resource_not_found`，类型不匹配为 `validation_failed`，完整性损坏为 `media_failed`。未接入 resolver 时仍保持 `capability_disabled`。这只证明离线领域合同和生产组装，不等于真实前端／Provider 端到端验收。
 
 任务：
 
@@ -1292,6 +1292,12 @@ Provider 边界必须如实保留：NapCat notice 已覆盖撤回、回应、戳
 验收门：文本、图片、语音发送及戳戳／公告的支持矩阵可自动测试；投递确认、失败和 unknown 均可观察。
 
 ### P3-07：媒体对象接口
+
+> **实施状态（2026-08-04）：已完成离线合同与生产组装。** 已实现上传会话、受管对象 descriptor、内容下载、幂等 save、recognize 和 derivatives 共 8 个用户媒体端点。公共接口仅接受 `media_id` 和受限元数据，不接受 path、任意 URL、base64、裸 bytes 字段；对象与临时上传均限定在 workspace `runtime/media/`，声明大小上限为 32 MiB。complete、下载和聊天解析都会重新校验大小、SHA-256、MIME 与文件签名。
+>
+> owner 或持有对象绑定 resource grant 的当前会话可以访问；非 owner 越权与不存在统一 404。上传者不能把对象绑定到自己未持有的 grant，管理员为显式例外。媒体完成与保存状态在同一 SQLite 事务写入既有 `sync_outbox`，事件保持 `private`／`held` 且不含路径、base64 或原始 bytes，不建立第二套同步机制。生产 `APIV1Mount` 拥有并按关闭顺序释放媒体 store，并把同一 resolver 注入 P3-06 聊天命令。
+>
+> 当前完成的是用户媒体 API 与聊天图片／语音 `media_id` 解析合同。P3-08 直播和 P3-09 语音通话领域接口尚未实现，不能声称它们已经完成统一迁移；后续实现只能复用该 `media_id` 合同。孤儿清理由本阶段提供只读、owner 可证明的 cleanup candidate 查询，实际删除仍应作为显式维护动作实施。未启动或重启 Elysium，也未完成真实前端／Provider 端到端验收。
 
 任务：
 

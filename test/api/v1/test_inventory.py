@@ -83,6 +83,21 @@ def test_p3_04_command_contracts_are_validated() -> None:
     assert {API_INVENTORY_BY_KEY[key].status for key in keys} == {"validated"}
 
 
+def test_p3_07_media_contracts_are_validated() -> None:
+    keys = {
+        ("POST", "/api/v1/media/uploads"),
+        ("PUT", "/api/v1/media/uploads/{upload_id}"),
+        ("POST", "/api/v1/media/uploads/{upload_id}:complete"),
+        ("GET", "/api/v1/media/{media_id}"),
+        ("GET", "/api/v1/media/{media_id}/content"),
+        ("POST", "/api/v1/media/{media_id}:save"),
+        ("POST", "/api/v1/media/{media_id}:recognize"),
+        ("GET", "/api/v1/media/{media_id}/derivatives"),
+    }
+
+    assert {API_INVENTORY_BY_KEY[key].status for key in keys} == {"validated"}
+
+
 def test_p3_06_chat_command_contracts_are_validated() -> None:
     keys = {
         ("POST", "/api/v1/chat/messages:send"),

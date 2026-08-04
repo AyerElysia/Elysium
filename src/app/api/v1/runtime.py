@@ -6,7 +6,7 @@ import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 from fastapi import APIRouter, Depends, FastAPI, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -49,6 +49,9 @@ from .schemas import (
     WSTicketResponse,
 )
 from .tokens import SignedValueCodec, SignedValueError
+
+if TYPE_CHECKING:
+    from .media_objects import ManagedMediaService
 
 REQUEST_ID_HEADER = "X-Request-ID"
 AUTH_HEADER = "Authorization"
@@ -117,6 +120,7 @@ class APIContext:
     foundation: FoundationProjection | None = None
     events: EventQueryService | None = None
     chat: ChatQueryService | None = None
+    media: "ManagedMediaService | None" = None
     command_store: CommandStore | None = None
     command_dispatcher: CommandDispatcher | None = None
     chat_commands_enabled: bool = False
@@ -923,6 +927,15 @@ def create_api_app(context: APIContext) -> FastAPI:
     app.include_router(foundation_router)
     app.include_router(event_router)
     app.include_router(chat_router)
+    if context.media is not None:
+        from .media_objects import create_media_router
+
+        app.include_router(
+            create_media_router(
+                service=context.media,
+                require_scope=require_scope,
+            )
+        )
     if (context.command_store is None) != (context.command_dispatcher is None):
         raise ValueError("command store and dispatcher must be configured together")
     if context.command_store is not None and context.command_dispatcher is not None:

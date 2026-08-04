@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 from pydantic import ValidationError
+from src.app.api.v1.media_contracts import ManagedMediaFailure
+from src.app.api.v1.media_objects import ManagedMediaService, MediaObjectStore
+from src.app.api.v1.schemas.media import MediaUploadCreateRequest
 
 from src.app.api.v1.chat_commands import (
     ChatAction,
@@ -224,9 +228,103 @@ async def test_managed_media_is_resolved_before_send(
     )
     assert outcome.status is CommandStatus.SUCCEEDED
     media.resolve_ready.assert_awaited_once_with(
-        "media-1", actor_id="actor-1", expected_type=part_type
+        "media-1",
+        actor_id="actor-1",
+        expected_type=part_type,
+        resource_grants=("stream:stream-1",),
     )
     assert sender.send_message.await_args.args[0].attachments == [attachment]
+
+
+@pytest.mark.asyncio
+async def test_real_managed_media_store_resolves_grant_bound_chat_attachment(
+    tmp_path,
+) -> None:
+    data = b"\x89PNG\r\n\x1a\n" + b"managed-chat-image"
+    store = MediaObjectStore(
+        tmp_path / "api.sqlite3",
+        tmp_path / "runtime" / "media",
+    )
+    try:
+        upload = store.create_upload(
+            MediaUploadCreateRequest(
+                schema_version=1,
+                kind="image",
+                mime_type="image/png",
+                size_bytes=len(data),
+                sha256=hashlib.sha256(data).hexdigest(),
+                file_name="chat.png",
+                resource_grant="stream:stream-1",
+            ),
+            actor_id="owner",
+            grants=("stream:stream-1",),
+        )
+        store.put_upload(upload.upload_id, data, actor_id="owner")
+        descriptor = store.complete_upload(upload.upload_id, actor_id="owner")
+        sender = SimpleNamespace(send_message=AsyncMock(return_value=True))
+        service = ChatCommandService(
+            sender=sender,
+            targets=_Targets(),
+            media=ManagedMediaService(store),
+            providers=ProviderFacadeRegistry({}),
+        )
+        outcome = await service.handle(
+            _command(
+                ChatAction.SEND,
+                payload={
+                    "parts": [
+                        {"type": "image", "media_id": descriptor.media_id}
+                    ]
+                },
+            )
+        )
+        assert outcome.status is CommandStatus.SUCCEEDED
+        attachment = sender.send_message.await_args.args[0].attachments[0]
+        assert attachment.resource_id == descriptor.media_id
+        assert attachment.media_ref.data == data
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "status", "error_code"),
+    [
+        (
+            ManagedMediaFailure("media_not_found", status_code=404),
+            CommandStatus.REJECTED,
+            "resource_not_found",
+        ),
+        (
+            ManagedMediaFailure("media_type_mismatch", status_code=422),
+            CommandStatus.FAILED,
+            "validation_failed",
+        ),
+        (
+            ManagedMediaFailure("media_integrity_failed", status_code=409),
+            CommandStatus.FAILED,
+            "media_failed",
+        ),
+    ],
+)
+async def test_managed_media_failures_keep_stable_command_semantics(
+    failure, status, error_code
+) -> None:
+    media = SimpleNamespace(resolve_ready=AsyncMock(side_effect=failure))
+    service = ChatCommandService(
+        sender=SimpleNamespace(send_message=AsyncMock(return_value=True)),
+        targets=_Targets(),
+        media=media,
+        providers=ProviderFacadeRegistry({}),
+    )
+    outcome = await service.handle(
+        _command(
+            ChatAction.SEND,
+            payload={"parts": [{"type": "image", "media_id": "media-1"}]},
+        )
+    )
+    assert outcome.status is status
+    assert outcome.error_code == error_code
 
 
 @pytest.mark.asyncio

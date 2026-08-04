@@ -29,6 +29,7 @@ from src.kernel.commands import (
 from .auth_store import SessionRecord
 from .chat import ChatTargetResolutionFailure
 from .commands import IDEMPOTENCY_KEY_PATTERN, _response
+from .media_contracts import ManagedMediaFailure, ManagedMediaResolver
 from .runtime import ERROR_RESPONSES, APIError
 from .schemas.chat_commands import (
     ChatAnnouncementRequest,
@@ -117,18 +118,6 @@ class ChatTargetResolver(Protocol):
     ) -> ChatTarget: ...
 
 
-class ManagedMediaResolver(Protocol):
-    """P3-07 boundary: only ready managed objects can cross into transport."""
-
-    async def resolve_ready(
-        self,
-        media_id: str,
-        *,
-        actor_id: str,
-        expected_type: str,
-    ) -> MediaAttachment: ...
-
-
 class MessageSenderProtocol(Protocol):
     async def send_message(
         self,
@@ -215,6 +204,8 @@ class ChatCommandService:
                 error_code="resource_not_found",
                 safe_error_detail="聊天目标不存在或当前命令无权访问。",
             )
+        except ManagedMediaFailure as exc:
+            return self._media_failure(exc)
         except RuntimeError:
             return CommandOutcome(
                 status=CommandStatus.FAILED,
@@ -260,7 +251,11 @@ class ChatCommandService:
                     raise CapabilityError("reply target has no provider identity")
                 reply_to = source.provider_message_id
         parts = _parts_from_payload(command.payload)
-        attachments = await self._resolve_attachments(parts, command.actor_id)
+        attachments = await self._resolve_attachments(
+            parts,
+            command.actor_id,
+            authorization,
+        )
         text = "".join(part.text or "" for part in parts if part.type == "text")
         primary = next((part.type for part in parts if part.type != "text"), "text")
         message = Message(
@@ -298,10 +293,16 @@ class ChatCommandService:
         self,
         parts: Sequence[MessagePart],
         actor_id: str,
+        authorization: Mapping[str, Any],
     ) -> list[MediaAttachment]:
         media_parts = [part for part in parts if part.type != "text"]
         if media_parts and self.media is None:
             raise CapabilityError("managed media resolver is unavailable")
+        grants = authorization.get("resource_grants")
+        if not isinstance(grants, list) or not all(
+            isinstance(grant, str) for grant in grants
+        ):
+            raise TypeError("command resource grants are invalid")
         attachments: list[MediaAttachment] = []
         for part in media_parts:
             assert self.media is not None and part.media_id is not None
@@ -309,9 +310,30 @@ class ChatCommandService:
                 part.media_id,
                 actor_id=actor_id,
                 expected_type=part.type,
+                resource_grants=tuple(grants),
             )
             attachments.append(attachment)
         return attachments
+
+    @staticmethod
+    def _media_failure(exc: ManagedMediaFailure) -> CommandOutcome:
+        if exc.code in {"media_not_found", "upload_not_found"}:
+            return CommandOutcome(
+                status=CommandStatus.REJECTED,
+                error_code="resource_not_found",
+                safe_error_detail="媒体对象不存在或当前命令无权访问。",
+            )
+        if exc.code == "media_type_mismatch":
+            return CommandOutcome(
+                status=CommandStatus.FAILED,
+                error_code="validation_failed",
+                safe_error_detail="媒体类型与消息段不匹配。",
+            )
+        return CommandOutcome(
+            status=CommandStatus.FAILED,
+            error_code="media_failed",
+            safe_error_detail="媒体对象完整性或读取校验失败。",
+        )
 
     async def _provider_action(
         self,

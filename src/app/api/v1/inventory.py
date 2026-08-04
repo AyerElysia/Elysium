@@ -218,8 +218,9 @@ GET /api/v1/media/{media_id}/derivatives
         pages=("媒体查看器", "上传与识别", "媒体资产"),
         callers=_ALL_CALLERS,
         scopes=("media:read", "media:write", "media:recognize"),
-        resource_authorization="校验媒体 owner、来源消息授权、状态、hash、MIME 与受管对象身份",
-        anchor="src/core/models/media.py 与 src/app/plugin_system/api/media_api.py；需新增受管媒体 store",
+        resource_authorization="校验媒体 owner、显式 resource grant、状态、hash、MIME 与受管对象身份；不可见与不存在统一处理",
+        anchor="src/app/api/v1/media_objects.py、media_contracts.py、schemas/media.py 与现有媒体识别服务",
+        status="validated",
     ),
     *_contracts(
         """

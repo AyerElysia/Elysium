@@ -110,13 +110,15 @@ def test_mount_factory_registers_chat_routes_and_hides_authorization_snapshot(
 
     class Factory:
         resolver = None
+        media_resolver = None
 
-        def __call__(self, resolver):
+        def __call__(self, resolver, *, media_resolver):
             self.resolver = resolver
+            self.media_resolver = media_resolver
             return ChatCommandService(
                 sender=object(),
                 targets=resolver,
-                media=None,
+                media=media_resolver,
                 providers=object(),
             )
 
@@ -132,6 +134,8 @@ def test_mount_factory_registers_chat_routes_and_hides_authorization_snapshot(
     )
     try:
         assert factory.resolver is not None
+        assert factory.media_resolver is not None
+        assert factory.media_resolver.store is mounted.media_store
         mounted_app = next(
             route.app
             for route in app.routes
@@ -302,7 +306,8 @@ def test_mount_factory_registers_chat_routes_and_hides_authorization_snapshot(
 def test_mount_closes_owned_stores_when_chat_factory_fails(tmp_path: Path) -> None:
     app = FastAPI()
 
-    def fail_factory(_resolver):
+    def fail_factory(_resolver, *, media_resolver):
+        assert media_resolver is not None
         raise RuntimeError("factory failed")
 
     with pytest.raises(RuntimeError, match="factory failed"):

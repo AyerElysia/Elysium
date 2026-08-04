@@ -14,12 +14,13 @@ from .chat_commands import (
     ProviderFacadeRegistry,
 )
 from .chat_platforms import FeishuChatFacade, NapCatChatFacade
+from .media_contracts import ManagedMediaResolver
 
 
 def create_chat_command_service(
     targets: ChatTargetResolver,
     *,
-    media_resolver: object | None = None,
+    media_resolver: ManagedMediaResolver | None = None,
     message_sender: object | None = None,
     feishu_provider: Callable[[], object | None] | None = None,
     adapter_manager_provider: Callable[[], object] | None = None,
@@ -29,7 +30,7 @@ def create_chat_command_service(
     return ChatCommandService(
         sender=message_sender or get_message_sender(),
         targets=targets,
-        media=media_resolver,  # type: ignore[arg-type]
+        media=media_resolver,
         providers=ProviderFacadeRegistry(
             {
                 "feishu": FeishuChatFacade(

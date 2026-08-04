@@ -61,6 +61,16 @@ from .foundation import (
     OperationalState,
     ReadinessResponse,
 )
+from .media import (
+    MediaDerivative,
+    MediaDerivativeList,
+    MediaObjectDescriptor,
+    MediaRecognition,
+    MediaRecognizeRequest,
+    MediaSaveResponse,
+    MediaUploadCreateRequest,
+    MediaUploadSession,
+)
 
 __all__ = [
     "API_VERSION",
@@ -106,6 +116,14 @@ __all__ = [
     "FeatureCapability",
     "HealthResponse",
     "LogoutResponse",
+    "MediaDerivative",
+    "MediaDerivativeList",
+    "MediaObjectDescriptor",
+    "MediaRecognition",
+    "MediaRecognizeRequest",
+    "MediaSaveResponse",
+    "MediaUploadCreateRequest",
+    "MediaUploadSession",
     "MessagePart",
     "OperationalState",
     "ReadinessResponse",
