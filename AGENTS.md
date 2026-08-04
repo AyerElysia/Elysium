@@ -192,12 +192,12 @@ Elysium 中所有 `ConsciousnessInstance` 都是同一持续主体的局部运�
 
 这是当前部署的明确运维不变量：
 
-- Elysium 必须由用户手动启动；
-- NapCat 必须由用户手动启动；
-- 禁止为 Elysium 或 NapCat 创建、启用或恢复 systemd、cron、登录脚本、Windows 启动项或其他自动拉起机制；
+- Elysium 必须由用户手动启动；禁止为 Elysium 创建、启用或恢复 systemd、cron、登录脚本、Windows 启动项或其他自动拉起机制；
+- NapCat/QQNT 允许由具有明确 owner 的部署机制自动启动和自动恢复，不属于 Elysium 的手工启动禁令；
+- NapCat 自动恢复必须先用复合证据确认故障并核对准确 PID、父进程、运行目录、监听端口和现存实例；禁止仅凭单次状态异常重启、制造重复实例或形成无界重启循环；
 - 本地 New API 中转站是明确例外，需要保持自动启动；
-- agent 不得擅自停止、重启或替换用户手动运行的 Elysium/NapCat 实例；
-- 必须重启才能验收时，先说明原因并等待用户授权；
+- agent 不得停止、重启或替换用户手动运行的 Elysium 实例；NapCat 进程控制必须具有当前任务授权或由已登记的生命周期 owner 执行；
+- Elysium 必须重启才能验收时，先说明原因并等待用户手动操作；NapCat 自动恢复必须保留原因、目标、结果和退避状态；
 - 任何启动前先检查已有 PID、父进程、监听端口和服务状态，避免重复实例。
 
 ## 11. 多 Agent 与 Git 协作

@@ -5,9 +5,9 @@
 
 ## 1. 启动策略
 
-Elysium 与 NapCat 都由用户手工启动。不得为它们新建或恢复 systemd service、Windows 计划任务、登录启动项、shell profile 启动命令或后台守护拉起。
+Elysium 由用户手工启动，不得为它新建或恢复 systemd service、Windows 计划任务、登录启动项、shell profile 启动命令或后台守护拉起。NapCat/QQNT 可以由具有明确 owner 的部署机制自动启动和自动恢复；本迁移工具不拥有或操作其进程生命周期。
 
-本地 New API 中转站是模型基础设施，按当前机器约定需要自动启动；它不属于 Elysium/NapCat 自启动禁令。记忆系统的请求重试仍不负责拉起该进程，启动与健康由中转站自己的生命周期配置负责。
+本地 New API 中转站是模型基础设施，按当前机器约定需要自动启动；它不属于 Elysium 自启动禁令。记忆系统的请求重试仍不负责拉起该进程，启动与健康由中转站自己的生命周期配置负责。
 
 推荐顺序：
 
@@ -118,7 +118,7 @@ ORDER BY issue_id;
 
 ## 7. 验收清单
 
-- [ ] Elysium、NapCat 没有 systemd/计划任务/登录项自启动；New API 自启动保持健康。
+- [ ] Elysium 没有 systemd/计划任务/登录项自启动；NapCat/QQNT 与 New API 的独立生命周期 owner 健康且未制造重复实例。
 - [ ] 同一个事件重放不会产生第二条 raw occurrence。
 - [ ] 生产者 sequence 重置后 ingest position 仍继续增长。
 - [ ] memory witness offset 单调且缺口时不推进。

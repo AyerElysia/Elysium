@@ -876,8 +876,8 @@ access_token = ""
 
 部署环境需要启用 QQ 接入时，先将 `config/plugins/napcat_adapter/config.toml` 的 `plugin.enabled` 设为 `true`，再按以下顺序启动：
 
-1. 打开终端并进入 NapCat 目录。
-2. 使用官方启动脚本启动独立机器人 QQ：
+1. 确认 NapCat/QQNT 的生命周期 owner 已启动或自动拉起唯一的机器人实例；需要人工启动时进入 NapCat 目录。
+2. Windows 人工启动或自动化 owner 都必须调用官方启动脚本，不得绕过官方启动链：
 
    ```bat
    cd /d <NapCat目录>
@@ -895,16 +895,16 @@ access_token = ""
 5. Elysium 加载 NapCat 适配器并开始监听 `127.0.0.1:<OneBot端口>` 后，NapCat 应自动建立反向 WebSocket 连接。
 6. 确认连接完成后再进行 QQ 文本和图片验收。
 
-Windows 部署必须通过 NapCat 官方 `launcher.bat <机器人QQ号>` 启动机器人账号，不自行替换官方启动链。
+Windows 部署必须通过 NapCat 官方 `launcher.bat <机器人QQ号>` 启动机器人账号；自动恢复也不得自行替换官方启动链。
 
-Linux/WSL 部署使用已经完成当前版本验收的 QQNT/NapCat 入口。确认没有现存实例后，可在 QQNT 运行目录手动前台启动：
+Linux/WSL 部署使用已经完成当前版本验收的 QQNT/NapCat 入口。具有明确 owner 的部署机制可以自动启动和恢复；人工前台启动可使用：
 
 ```bash
 cd <QQNT运行目录>
 xvfb-run -a ./qq --no-sandbox
 ```
 
-如果实例已经运行且 OneBot、反向 WebSocket 和真实消息入站均正常，不得再次执行该命令。不要同时运行两个使用同一账号与会话目录的实例。
+无论人工还是自动启动，都必须先确认没有现存实例。如果实例已经运行且 OneBot、反向 WebSocket 和真实消息入站均正常，不得再次执行该命令。不要同时运行两个使用同一账号与会话目录的实例。
 
 ### 10.5 启动成功判定
 
@@ -932,7 +932,7 @@ xvfb-run -a ./qq --no-sandbox
 
 - 正常停止时，先在 Elysium 前台终端按 `Ctrl+C`，等待适配器和消息流优雅关闭。
 - 再按 NapCat/QQ 的正常退出方式关闭机器人账号。
-- 完整重启仍遵循“先 NapCat，后 Elysium”。
+- 完整重启仍遵循“先确认 NapCat 健康，再由用户手动启动 Elysium”。
 - 仅重启 Elysium 时，可以保持 NapCat 与机器人 QQ 运行；Elysium 恢复监听后，NapCat WebSocket Client 应自动重连。
 - 不同时启动多个使用同一机器人 QQ 的 NapCat 实例，也不同时启动多个监听 `<OneBot端口>` 的 Elysium 实例。
 
@@ -968,11 +968,13 @@ uv run main.py
 uv run main.py
 ```
 
-### 11.2 只允许手工前台启动
+### 11.2 Elysium 只允许手工前台启动
 
-主进程必须由用户在可观察的终端或 VS Code 终端手工启动。当前部署明确禁止为 Elysium 或 NapCat 配置 systemd、Windows 服务、计划任务、登录启动项、shell profile 自动命令或其他守护拉起。某些临时后台方式还会因 stdin EOF 或会话退出造成“看似启动、很快消失”，同样不作为正式启动方式。
+Elysium 主进程必须由用户在可观察的终端或 VS Code 终端手工启动。当前部署明确禁止为 Elysium 配置 systemd、Windows 服务、计划任务、登录启动项、shell profile 自动命令或其他守护拉起。某些临时后台方式还会因 stdin EOF 或会话退出造成“看似启动、很快消失”，同样不作为 Elysium 的正式启动方式。
 
-本地 New API 中转站是 LLM 基础设施，按当前机器约定保持自动启动；它不属于 Elysium/NapCat 自启动禁令。Elysium 的重试逻辑不会自行拉起该进程。检查生命周期边界见 [活体记忆迁移与健康检查](./living_memory_migration.md)。
+NapCat/QQNT 可以由具有明确 owner 的部署机制自动启动和自动恢复。自动恢复必须使用持续的复合故障证据，核对 PID、父进程、运行目录、监听端口和现存实例，并采用有界退避；禁止仅凭单次 `online=false`、单次心跳异常或本地端口状态形成重启循环。
+
+本地 New API 中转站是 LLM 基础设施，按当前机器约定保持自动启动；它也不属于 Elysium 自启动禁令。Elysium 的重试逻辑不会自行拉起该进程。检查生命周期边界见 [活体记忆迁移与健康检查](./living_memory_migration.md)。
 
 ### 11.3 停止
 
