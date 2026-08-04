@@ -105,7 +105,8 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
         self._response_active = False
         self._active_response_id = ""
         self._active_item_id = ""
-        self._transient_context_item_ids: list[str] = []
+        self._response_generation = 0
+        self._transient_context_expiry: dict[str, int] = {}
         self._tool_name_map: dict[str, str] = {}
 
     async def connect(self, session_config: dict[str, Any]) -> None:
@@ -125,9 +126,15 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
                 self._receive_loop(), name="voice-qwen-receive"
             )
             if self._model.startswith("qwen-audio-"):
+                max_history_turns = int(
+                    session_config.get("qwen_max_history_turns") or 12
+                )
+                if not 1 <= max_history_turns <= 50:
+                    raise ValueError("Qwen max_history_turns must be between 1 and 50")
                 session = {
                     "modalities": ["text", "audio"],
                     "voice": self._voice,
+                    "max_history_turns": max_history_turns,
                     "turn_detection": {"type": "smart_turn"},
                 }
             else:
@@ -272,7 +279,7 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
                     },
                 }
             )
-            self._transient_context_item_ids.append(item_id)
+            self._track_transient_context(item_id, response_ttl=1)
         if len(chunks) > 1:
             await self._emit_metrics(
                 {
@@ -285,18 +292,30 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
             )
 
     async def _delete_transient_context_items(self) -> None:
-        """Remove delivered world context after the current Qwen turn."""
+        """Expire turn context without deleting a just-produced tool result early."""
 
-        item_ids = self._transient_context_item_ids
-        self._transient_context_item_ids = []
+        self._response_generation += 1
+        item_ids = [
+            item_id
+            for item_id, expiry in self._transient_context_expiry.items()
+            if expiry <= self._response_generation
+        ]
         for item_id in item_ids:
             await self._send({"type": "conversation.item.delete", "item_id": item_id})
+            self._transient_context_expiry.pop(item_id, None)
+
+    def _track_transient_context(self, item_id: str, *, response_ttl: int) -> None:
+        self._transient_context_expiry[item_id] = (
+            self._response_generation + max(1, int(response_ttl))
+        )
 
     async def submit_tool_result(self, call_id: str, result: Any) -> None:
+        item_id = f"voice_tool_result_{uuid.uuid4().hex}"
         await self._send(
             {
                 "type": "conversation.item.create",
                 "item": {
+                    "id": item_id,
                     "type": "function_call_output",
                     "call_id": call_id,
                     "output": json.dumps(result, ensure_ascii=False)
@@ -304,6 +323,10 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
                     else result,
                 },
             }
+        )
+        self._track_transient_context(
+            item_id,
+            response_ttl=2 if self._response_active else 1,
         )
         await self._send({"type": "response.create"})
 

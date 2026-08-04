@@ -13,7 +13,13 @@ import aiohttp
 
 from ..audio import resample_pcm16_mono
 from ..protocol import ProviderState
-from .base import AudioDelta, BaseRealtimeProvider, InterruptionEvent, ToolCallEvent, TranscriptEvent
+from .base import (
+    AudioDelta,
+    BaseRealtimeProvider,
+    InterruptionEvent,
+    ToolCallEvent,
+    TranscriptEvent,
+)
 
 
 def _url_with_model(url: str, model: str) -> str:
@@ -53,9 +59,11 @@ class OpenAIRealtimeProvider(BaseRealtimeProvider):
         self._receive_task: asyncio.Task[None] | None = None
         self._updated: asyncio.Future[dict[str, Any]] | None = None
         self._closed = False
+        self._response_active = False
         self._active_response_id = ""
         self._active_item_id = ""
-        self._transient_context_item_ids: list[str] = []
+        self._response_generation = 0
+        self._transient_context_expiry: dict[str, int] = {}
 
     async def connect(self, session_config: dict[str, Any]) -> None:
         self._session_config = dict(session_config)
@@ -166,25 +174,45 @@ class OpenAIRealtimeProvider(BaseRealtimeProvider):
                 },
             }
         )
-        self._transient_context_item_ids.append(item_id)
+        self._track_transient_context(item_id, response_ttl=1)
 
     async def _delete_transient_context_items(self) -> None:
-        """Remove delivered world context from the provider conversation."""
+        """Expire turn context without deleting a just-produced tool result early."""
 
-        item_ids = self._transient_context_item_ids
-        self._transient_context_item_ids = []
+        self._response_generation += 1
+        item_ids = [
+            item_id
+            for item_id, expiry in self._transient_context_expiry.items()
+            if expiry <= self._response_generation
+        ]
         for item_id in item_ids:
             await self._send(
                 {"type": "conversation.item.delete", "item_id": item_id}
             )
+            self._transient_context_expiry.pop(item_id, None)
+
+    def _track_transient_context(self, item_id: str, *, response_ttl: int) -> None:
+        self._transient_context_expiry[item_id] = (
+            self._response_generation + max(1, int(response_ttl))
+        )
 
     async def submit_tool_result(self, call_id: str, result: Any) -> None:
         output = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+        item_id = f"voice_tool_result_{uuid.uuid4().hex}"
         await self._send(
             {
                 "type": "conversation.item.create",
-                "item": {"type": "function_call_output", "call_id": call_id, "output": output},
+                "item": {
+                    "id": item_id,
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": output,
+                },
             }
+        )
+        self._track_transient_context(
+            item_id,
+            response_ttl=2 if self._response_active else 1,
         )
         await self._send({"type": "response.create"})
 
@@ -204,7 +232,7 @@ class OpenAIRealtimeProvider(BaseRealtimeProvider):
                     raise RuntimeError(str(self._ws.exception() or "OpenAI websocket error"))
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - upstream transport boundary
             if self._updated is not None and not self._updated.done():
                 self._updated.set_exception(exc)
             if not self._closed:
@@ -229,6 +257,7 @@ class OpenAIRealtimeProvider(BaseRealtimeProvider):
             return
         if event_type == "response.created":
             response = event.get("response") or {}
+            self._response_active = True
             self._active_response_id = str(response.get("id") or event.get("response_id") or "")
             await self._emit_state(ProviderState.THINKING)
             return
@@ -273,6 +302,7 @@ class OpenAIRealtimeProvider(BaseRealtimeProvider):
             success = status not in {"cancelled", "failed", "incomplete", "error"}
             await self._delete_transient_context_items()
             await self._emit_response_done(success)
+            self._response_active = False
             await self._emit_state(ProviderState.LISTENING)
             return
         if event_type == "error":

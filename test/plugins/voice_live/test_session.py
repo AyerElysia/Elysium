@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from plugins.voice_live.config import VoiceLiveConfig
+from plugins.voice_live.context_bridge import VoicePromptBundle
 from plugins.voice_live.protocol import (
     ProviderState,
     SessionState,
@@ -101,6 +102,25 @@ class FakeBridge:
         self, role: str, text: str, *, provider_event_id: str = ""
     ) -> None:
         self.transcripts.append((role, text, provider_event_id))
+
+
+class BundleBridge(FakeBridge):
+    async def build_system_prompt(self) -> VoicePromptBundle:
+        return VoicePromptBundle(
+            text="unified subject voice context",
+            subject_context={
+                "revision": "revision-1",
+                "source_digest": "digest-1",
+                "projection_sha256": "projection-1",
+            },
+            layers={
+                "total": {
+                    "algorithm": "voice-live-layered-v1",
+                    "delivered_bytes": 29,
+                    "max_bytes": 4096,
+                }
+            },
+        )
 
 
 class PerceptionBridge(FakeBridge):
@@ -332,6 +352,44 @@ async def test_session_runs_audio_interrupt_transcript_tool_and_cleanup(
     assert session.state is SessionState.ENDED
     assert consciousness.reasons == ["test_complete"]
     assert store.load_checkpoint()["state"] == "ended"
+
+
+@pytest.mark.asyncio
+async def test_session_persists_subject_revision_and_layer_audit(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    provider = FakeProvider()
+    store = VoiceEpisodeStore(tmp_path, "voice_bundle", "bundle")
+    session = CallSession(
+        config,
+        "bundle",
+        provider_factory=lambda _: provider,
+        store=store,
+        consciousness=FakeConsciousness(),
+        bridge=BundleBridge(),
+        tool_broker=FakeBroker(),
+    )
+
+    assert await session.start() is True
+    assert provider.connected is not None
+    assert provider.connected["instructions"] == "unified subject voice context"
+    assert provider.connected["qwen_max_history_turns"] == 12
+    snapshot = session.snapshot()
+    assert snapshot["subject_context_revision"] == "revision-1"
+    assert snapshot["subject_context_source_digest"] == "digest-1"
+    configuration = next(
+        record
+        for record in store.read_all()
+        if record.event == "provider.configuration"
+    )
+    assert configuration.payload["context_layers"]["total"]["algorithm"] == (
+        "voice-live-layered-v1"
+    )
+    assert store.load_checkpoint()["subject_context"]["projection_sha256"] == (
+        "projection-1"
+    )
+    await session.stop()
 
 
 @pytest.mark.asyncio

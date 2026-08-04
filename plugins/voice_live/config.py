@@ -109,7 +109,13 @@ class VoiceLiveConfig(BaseConfig):
         )
         instructions: str = Field(
             default="",
-            description="附加指令；会与人格、WorldState、实例历史共同组成上下文",
+            description="实时语音交互覆盖层；不是身份权威，过长时只投影到有界上下文",
+        )
+        qwen_max_history_turns: int = Field(
+            default=12,
+            ge=1,
+            le=50,
+            description="Qwen-Audio 上游保留的最近问答轮数；完整历史仍写入 episode 与 Life Event",
         )
 
     @config_section("voice_conversion", title="爱莉实时音色", tag="audio", order=25)
@@ -173,8 +179,39 @@ class VoiceLiveConfig(BaseConfig):
             default=True, description="感知完整 WorldState"
         )
 
+        subject_context_max_bytes: int = Field(
+            default=24 * 1024,
+            ge=8 * 1024,
+            le=96 * 1024,
+            description="从 SOUL/USER/MEMORY 统一权威派生的 Voice 专用主体投影预算",
+        )
+        episode_context_max_bytes: int = Field(
+            default=12 * 1024,
+            ge=2 * 1024,
+            le=64 * 1024,
+            description="重连时最近完整语音轮次的续接投影预算；完整 episode 不截断",
+        )
+        voice_instructions_max_bytes: int = Field(
+            default=4 * 1024,
+            ge=2 * 1024,
+            le=32 * 1024,
+            description="非权威实时语音交互覆盖层预算",
+        )
+        tool_result_context_max_bytes: int = Field(
+            default=8 * 1024,
+            ge=2 * 1024,
+            le=64 * 1024,
+            description="单次工具结果送入实时 Provider 的有界投影预算；原始工具来源不由该投影替代",
+        )
+        startup_context_max_bytes: int = Field(
+            default=48 * 1024,
+            ge=16 * 1024,
+            le=192 * 1024,
+            description="主体投影、episode 续接、语音覆盖层和固定契约的启动总预算",
+        )
+
         perception_context_max_bytes: int = Field(
-            default=32 * 1024,
+            default=16 * 1024,
             ge=4096,
             le=128 * 1024,
             description="实时 Provider 单次注入的世界感知视图字节上限；完整投影仍由 LifeEngine 保留",

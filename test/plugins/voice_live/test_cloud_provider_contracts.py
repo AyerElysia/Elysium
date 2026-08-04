@@ -59,6 +59,91 @@ async def test_transient_context_is_deleted_and_completion_is_reported(
     assert completions == [True]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_kind", ["openai", "qwen"])
+async def test_tool_result_ttl_survives_old_response_done_then_expires(
+    provider_kind: str,
+) -> None:
+    """A tool result created by response N remains through N and expires after N+1."""
+
+    if provider_kind == "openai":
+        provider = OpenAIRealtimeProvider("ws://example/realtime", "secret")
+    else:
+        provider = QwenRealtimeProvider(
+            "ws://example/realtime",
+            "secret",
+            model="qwen-audio-3.0-realtime-plus",
+        )
+    sent: list[dict[str, Any]] = []
+
+    async def send(event: dict[str, Any]) -> None:
+        sent.append(event)
+
+    provider._send = send  # type: ignore[method-assign]
+    provider._response_active = True  # type: ignore[attr-defined]
+    await provider.submit_tool_result("call-1", "bounded-result")
+    created = next(
+        event
+        for event in sent
+        if event.get("type") == "conversation.item.create"
+    )
+    item_id = created["item"]["id"]
+
+    await provider._handle_event(  # type: ignore[attr-defined]
+        {"type": "response.done", "response": {"status": "completed"}}
+    )
+    assert not any(
+        event.get("type") == "conversation.item.delete"
+        and event.get("item_id") == item_id
+        for event in sent
+    )
+
+    await provider._handle_event(  # type: ignore[attr-defined]
+        {"type": "response.done", "response": {"status": "completed"}}
+    )
+    assert sent[-1] == {
+        "type": "conversation.item.delete",
+        "item_id": item_id,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_kind", ["openai", "qwen"])
+async def test_frequent_tool_results_have_bounded_response_ttl(
+    provider_kind: str,
+) -> None:
+    if provider_kind == "openai":
+        provider = OpenAIRealtimeProvider("ws://example/realtime", "secret")
+    else:
+        provider = QwenRealtimeProvider(
+            "ws://example/realtime",
+            "secret",
+            model="qwen-audio-3.0-realtime-plus",
+        )
+    sent: list[dict[str, Any]] = []
+
+    async def send(event: dict[str, Any]) -> None:
+        sent.append(event)
+
+    provider._send = send  # type: ignore[method-assign]
+    provider._response_active = True  # type: ignore[attr-defined]
+    for index in range(64):
+        await provider.submit_tool_result(f"call-{index}", f"result-{index}")
+
+    assert len(provider._transient_context_expiry) == 64  # type: ignore[attr-defined]
+    await provider._handle_event(  # type: ignore[attr-defined]
+        {"type": "response.done", "response": {"status": "completed"}}
+    )
+    assert len(provider._transient_context_expiry) == 64  # type: ignore[attr-defined]
+    await provider._handle_event(  # type: ignore[attr-defined]
+        {"type": "response.done", "response": {"status": "completed"}}
+    )
+    assert provider._transient_context_expiry == {}  # type: ignore[attr-defined]
+    assert sum(
+        event.get("type") == "conversation.item.delete" for event in sent
+    ) == 64
+
+
 async def _start_server(handler: Any) -> tuple[web.AppRunner, int]:
     app = web.Application()
     app.router.add_get("/realtime", handler)
@@ -306,7 +391,13 @@ async def test_qwen_audio_realtime_uses_smart_turn_contract() -> None:
         event_timeout=2,
     )
     try:
-        await provider.connect({"instructions": "", "tools": []})
+        await provider.connect(
+            {
+                "instructions": "",
+                "tools": [],
+                "qwen_max_history_turns": 7,
+            }
+        )
     finally:
         await provider.disconnect()
         await runner.cleanup()
@@ -315,6 +406,7 @@ async def test_qwen_audio_realtime_uses_smart_turn_contract() -> None:
     session = observed["session"]["session"]
     assert session["voice"] == "longanqian"
     assert session["turn_detection"] == {"type": "smart_turn"}
+    assert session["max_history_turns"] == 7
     assert "input_audio_format" not in session
 
 

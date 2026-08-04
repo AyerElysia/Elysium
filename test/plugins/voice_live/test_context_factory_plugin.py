@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sys
 import types
 from pathlib import Path
@@ -9,7 +11,12 @@ from typing import Any
 import pytest
 
 from plugins.voice_live.config import VoiceLiveConfig
-from plugins.voice_live.context_bridge import ContextBridge, _compact_context_lines
+from plugins.voice_live.context_bridge import (
+    ContextBridge,
+    VoicePromptBundle,
+    _compact_context_lines,
+    _project_episode_transcript,
+)
 from plugins.voice_live.life_binding import get_running_life_service
 from plugins.voice_live.plugin import VoiceLivePlugin
 from plugins.voice_live.providers.factory import create_provider
@@ -19,20 +26,58 @@ from plugins.voice_live.providers.qwen_realtime import QwenRealtimeProvider
 from plugins.voice_live.runtime_store import VoiceEpisodeStore
 
 
-def _core_config() -> Any:
-    return SimpleNamespace(
-        personality=SimpleNamespace(
-            nickname="爱莉",
-            alias_names=["Elysia"],
-            personality_core="温柔而自由",
-            personality_side="好奇",
-            identity="Elysium 的意识",
-            background_story="完整背景",
-            reply_style="自然口语",
-            safety_guidelines=["尊重意志"],
-            negative_behaviors=["不冒充"],
-        )
+def _subject_snapshot(
+    *,
+    max_bytes: int,
+    source_digest: str | None = None,
+    suffix: str = "",
+) -> dict[str, Any]:
+    contents = {
+        "SOUL.md": f"统一的爱莉身份{suffix}",
+        "USER.md": f"用户赩汐与关系边界{suffix}",
+        "MEMORY.md": f"共同经历与连续记忆{suffix}",
+    }
+    text = "\n".join(
+        f'<subject-source path="{path}">\n{content}\n</subject-source>'
+        for path, content in contents.items()
     )
+    sources = []
+    coverage: dict[str, dict[str, int]] = {}
+    for path, content in contents.items():
+        content_bytes = len(content.encode("utf-8"))
+        sources.append(
+            {
+                "path": path,
+                "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                "size_bytes": content_bytes,
+            }
+        )
+        coverage[path] = {
+            "original_bytes": content_bytes,
+            "delivered_bytes": content_bytes,
+            "max_delivered_bytes": max_bytes // 3,
+        }
+    digest = source_digest or hashlib.sha256(
+        "".join(contents.values()).encode("utf-8")
+    ).hexdigest()
+    return {
+        "text": text,
+        "schema_version": 1,
+        "kind": "derived_subject_context_projection",
+        "authority": "derived_non_authoritative",
+        "projection_profile": "voice_live",
+        "projection_algorithm": "llm_semantic_subject_continuity",
+        "projection_version": 1,
+        "source_digest": digest,
+        "sources": sources,
+        "projection_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "budget": {
+            "max_bytes": max_bytes,
+            "original_bytes": sum(item["size_bytes"] for item in sources),
+            "delivered_bytes": len(text.encode("utf-8")),
+            "sources": coverage,
+        },
+    }
 
 
 class FakeConsciousness:
@@ -44,8 +89,18 @@ class FakeConsciousness:
 
 
 class FakeLifeService:
-    def __init__(self) -> None:
+    def __init__(self, snapshot: dict[str, Any] | None = None) -> None:
         self.messages: list[tuple[Any, str]] = []
+        self.snapshot = snapshot
+        self.projection_calls: list[dict[str, Any]] = []
+
+    async def get_subject_context_projection_snapshot(
+        self, **kwargs: Any
+    ) -> dict[str, Any]:
+        self.projection_calls.append(dict(kwargs))
+        if self.snapshot is None:
+            raise RuntimeError("subject projection unavailable")
+        return self.snapshot
 
     async def record_message(self, message: Any, *, direction: str) -> None:
         self.messages.append((message, direction))
@@ -60,24 +115,41 @@ async def test_context_bridge_separates_stable_identity_and_transient_world(
     store = VoiceEpisodeStore(tmp_path, "voice_live_episode", "episode")
     consciousness = FakeConsciousness()
     bridge = ContextBridge(config, consciousness, store)
-    monkeypatch.setattr(
-        "plugins.voice_live.context_bridge.get_core_config", _core_config
+    service = FakeLifeService(
+        _subject_snapshot(max_bytes=config.session.subject_context_max_bytes)
     )
-    service = FakeLifeService()
     monkeypatch.setattr(
-        "plugins.life_engine.service.registry.get_life_engine_service",
+        "plugins.voice_live.context_bridge.get_running_life_service",
         lambda: service,
     )
 
     await store.append_async(
         "transcript.final", {"role": "user", "text": "此前的完整历史"}
     )
-    prompt = bridge.build_system_prompt()
+    bundle = await bridge.build_system_prompt()
+    assert isinstance(bundle, VoicePromptBundle)
+    prompt = bundle.text
     assert all(
         value in prompt
-        for value in ("爱莉", "完整背景", "此前的完整历史", "自己的判断")
+        for value in (
+            "统一的爱莉身份",
+            "用户赩汐与关系边界",
+            "共同经历与连续记忆",
+            "此前的完整历史",
+            "自己的判断",
+        )
     )
+    assert "完整背景" not in prompt
     assert "scene" not in prompt
+    bound = [
+        record for record in store.read_all() if record.event == "subject_context.bound"
+    ][-1]
+    assert "text" not in bound.payload
+    assert [source["path"] for source in bound.payload["sources"]] == [
+        "SOUL.md",
+        "USER.md",
+        "MEMORY.md",
+    ]
     transient, prepared = bridge.build_llm_context_prefix()
     assert "scene" in transient
     assert prepared is not None
@@ -104,11 +176,131 @@ def test_realtime_perception_projection_is_bounded_and_traceable() -> None:
     assert len(projected.encode("utf-8")) <= 4096
     assert projected.startswith("presence")
     assert projected.endswith("latest-change")
-    assert "LifeEngine" in projected
-    assert "inner_query" in projected
     assert stats["compacted"] is True
+    assert stats["algorithm"] == "head-tail-lines-v1"
     assert stats["original_bytes"] > stats["delivered_bytes"]
+    assert stats["delivered_bytes"] <= stats["max_bytes"] == 4096
     assert stats["omitted_lines"] > 0
+    assert stats["projection_sha256"] == hashlib.sha256(
+        projected.encode("utf-8")
+    ).hexdigest()
+
+
+def test_single_line_and_episode_projections_never_break_utf8_budget() -> None:
+    source = '{"payload":"' + ("语音🌸\\\"" * 3_000) + '"}'
+
+    projected, stats = _compact_context_lines(source, 2048)
+
+    assert len(projected.encode("utf-8")) <= 2048
+    assert projected.startswith(source[:10])
+    assert projected.endswith(source[-10:])
+    assert stats["compacted"] is True
+
+    transcript = [{"role": "assistant", "text": source}]
+    continuation, continuation_stats = _project_episode_transcript(
+        transcript,
+        2048,
+    )
+    assert len(continuation.encode("utf-8")) <= 2048
+    records = [json.loads(line) for line in continuation.splitlines()]
+    assert records[-1]["role"] == "assistant"
+    assert records[-1]["text_suffix"]
+    assert continuation_stats["source_turns"] == 1
+    assert continuation_stats["delivered_turns"] == 1
+
+
+@pytest.mark.asyncio
+async def test_voice_prompt_projects_oversized_layers_without_truncating_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = VoiceLiveConfig()
+    config.session.subject_context_max_bytes = 8 * 1024
+    config.session.episode_context_max_bytes = 2 * 1024
+    config.session.voice_instructions_max_bytes = 2 * 1024
+    config.session.startup_context_max_bytes = 16 * 1024
+    config.session.tool_result_context_max_bytes = 2 * 1024
+    config.full_duplex.instructions = "语音覆盖层" * 5_000
+    store = VoiceEpisodeStore(tmp_path, "voice_bounded", "episode")
+    for index in range(80):
+        await store.append_async(
+            "transcript.final",
+            {"role": "user" if index % 2 == 0 else "assistant", "text": "历史" * 300},
+        )
+    service = FakeLifeService(
+        _subject_snapshot(max_bytes=config.session.subject_context_max_bytes)
+    )
+    monkeypatch.setattr(
+        "plugins.voice_live.context_bridge.get_running_life_service",
+        lambda: service,
+    )
+    bridge = ContextBridge(config, FakeConsciousness(), store)
+
+    bundle = await bridge.build_system_prompt()
+
+    assert len(bundle.text.encode("utf-8")) <= config.session.startup_context_max_bytes
+    assert bundle.layers["episode_continuation"]["compacted"] is True
+    assert bundle.layers["voice_interaction_overlay"]["compacted"] is True
+    assert len(store.transcript()) == 80
+    tool_result, tool_stats = bridge.project_tool_result({"blob": "工具" * 10_000})
+    assert len(tool_result.encode("utf-8")) <= 2 * 1024
+    assert tool_stats["original_bytes"] > tool_stats["delivered_bytes"]
+    assert tool_stats["retention"] == "provider_response_ttl"
+
+
+@pytest.mark.asyncio
+async def test_voice_episode_reconnect_reuses_exact_subject_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = VoiceLiveConfig()
+    snapshot = _subject_snapshot(max_bytes=config.session.subject_context_max_bytes)
+    service = FakeLifeService(snapshot)
+    monkeypatch.setattr(
+        "plugins.voice_live.context_bridge.get_running_life_service",
+        lambda: service,
+    )
+    store = VoiceEpisodeStore(tmp_path, "voice_resume", "episode")
+
+    first = await ContextBridge(config, FakeConsciousness(), store).build_system_prompt()
+    resumed_bundles = [
+        await ContextBridge(config, FakeConsciousness(), store).build_system_prompt()
+        for _ in range(12)
+    ]
+
+    assert all(bundle.text == first.text for bundle in resumed_bundles)
+    assert service.projection_calls[-1]["source_digest"] == snapshot["source_digest"]
+    assert service.projection_calls[-1]["projection_version"] == 1
+    assert any(
+        record.event == "subject_context.resumed" for record in store.read_all()
+    )
+
+    service.snapshot = _subject_snapshot(
+        max_bytes=config.session.subject_context_max_bytes,
+        suffix="已变化",
+    )
+    with pytest.raises(RuntimeError, match="重连"):
+        await ContextBridge(config, FakeConsciousness(), store).build_system_prompt()
+
+
+@pytest.mark.asyncio
+async def test_voice_rejects_subject_manifest_that_contains_private_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = VoiceLiveConfig()
+    snapshot = _subject_snapshot(max_bytes=config.session.subject_context_max_bytes)
+    snapshot["sources"][0]["text"] = "不得进入审计的主体正文"
+    service = FakeLifeService(snapshot)
+    monkeypatch.setattr(
+        "plugins.voice_live.context_bridge.get_running_life_service",
+        lambda: service,
+    )
+    store = VoiceEpisodeStore(tmp_path, "voice_private_manifest", "episode")
+
+    with pytest.raises(RuntimeError, match="禁止携带私密正文"):
+        await ContextBridge(config, FakeConsciousness(), store).build_system_prompt()
+
+    assert not any(
+        record.event.startswith("subject_context.") for record in store.read_all()
+    )
 
 
 @pytest.mark.asyncio
@@ -121,7 +313,7 @@ async def test_context_bridge_honors_optional_life_engine(
     store = VoiceEpisodeStore(tmp_path, "voice_live_optional", "optional")
     bridge = ContextBridge(config, FakeConsciousness(), store)
     monkeypatch.setattr(
-        "plugins.life_engine.service.registry.get_life_engine_service", lambda: None
+        "plugins.voice_live.context_bridge.get_running_life_service", lambda: None
     )
     await bridge.record_transcript("user", "still durable")
     assert store.transcript()[-1]["text"] == "still durable"

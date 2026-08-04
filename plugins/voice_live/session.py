@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 import uuid
@@ -14,7 +15,7 @@ from src.kernel.logger import get_logger
 from .audio import resample_pcm16_mono
 from .config import VoiceLiveConfig
 from .consciousness import VoiceLiveConsciousnessManager
-from .context_bridge import ContextBridge
+from .context_bridge import ContextBridge, VoicePromptBundle
 from .protocol import (
     AUDIO_MAGIC,
     ProviderState,
@@ -100,6 +101,7 @@ class CallSession:
         self._failure_reason = ""
         self._perception_refresh_lock = asyncio.Lock()
         self._pending_voice_perception: Any | None = None
+        self._subject_context_audit: dict[str, Any] = {}
 
     @property
     def state(self) -> SessionState:
@@ -133,6 +135,10 @@ class CallSession:
             ),
             "voice_conversion_blocks": self._conversion_blocks,
             "voice_conversion_inference_ms": round(self._conversion_inference_ms, 3),
+            "subject_context_revision": self._subject_context_audit.get("revision", ""),
+            "subject_context_source_digest": self._subject_context_audit.get(
+                "source_digest", ""
+            ),
             "input_audio_bytes": self._input_audio_bytes,
             "output_audio_bytes": self._output_audio_bytes,
             "interruptions": self._interruptions,
@@ -208,7 +214,17 @@ class CallSession:
                     },
                 )
             schemas = self._tool_broker.schemas()
-            instructions = self._bridge.build_system_prompt()
+            prompt_result = self._bridge.build_system_prompt()
+            if inspect.isawaitable(prompt_result):
+                prompt_result = await prompt_result
+            if isinstance(prompt_result, VoicePromptBundle):
+                instructions = prompt_result.text
+                self._subject_context_audit = dict(prompt_result.subject_context)
+                context_layers = prompt_result.layers
+            else:
+                # Isolated test bridges may still expose the legacy string contract.
+                instructions = str(prompt_result)
+                context_layers = {}
             await self._store.append_async(
                 "provider.configuration",
                 {
@@ -223,6 +239,7 @@ class CallSession:
                             separators=(",", ":"),
                         ).encode("utf-8")
                     ),
+                    "context_layers": context_layers,
                 },
             )
             await provider.connect(
@@ -230,6 +247,9 @@ class CallSession:
                     "instructions": instructions,
                     "model": self._config.full_duplex.model_name,
                     "voice": self._config.full_duplex.voice,
+                    "qwen_max_history_turns": (
+                        self._config.full_duplex.qwen_max_history_turns
+                    ),
                     "tools": schemas,
                     "provider_config": {
                         "tools_available": [schema["name"] for schema in schemas]
@@ -238,7 +258,7 @@ class CallSession:
             )
         except Exception as exc:
             failure = str(exc).strip() or type(exc).__name__
-            logger.error(
+            logger.error(  # noqa: G201 - project Logger has no exception() method
                 f"实时语音会话启动失败: {failure}",
                 exc_info=True,
             )
@@ -262,7 +282,10 @@ class CallSession:
             {"session_id": self.session_id, "provider": provider.provider_name},
         )
         await self._store.checkpoint_async(
-            "active", session_id=self.session_id, provider=provider.provider_name
+            "active",
+            session_id=self.session_id,
+            provider=provider.provider_name,
+            subject_context=self._subject_context_audit,
         )
         await self._send_json_safe(
             {
@@ -523,6 +546,17 @@ class CallSession:
             result = {"success": False, "error": str(exc)}
             await self._store.append_async(
                 "tool.failed", {"name": event.name, "error": str(exc)}
+            )
+        projector = getattr(self._bridge, "project_tool_result", None)
+        if callable(projector):
+            result, projection_stats = projector(result)
+            await self._store.append_async(
+                "tool.projected",
+                {
+                    "name": event.name,
+                    "call_id": event.call_id,
+                    **projection_stats,
+                },
             )
         if self._provider is not None:
             await self._provider.submit_tool_result(event.call_id, result)
