@@ -21,8 +21,6 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from ..minecraft.launcher import MCConfig
-from ..minecraft.session import MinecraftSession
 from ..storage.learning_contracts import LearningStorePort
 from ..storage.subject_contracts import (
     SubjectAuthorityCommit,
@@ -101,14 +99,6 @@ class LearningScheduler:
         # 陈旧检查参数
         staleness_check_interval_hours: float = _DEFAULT_STALENESS_CHECK_INTERVAL_HOURS,
         staleness_threshold_days: int = _DEFAULT_STALENESS_THRESHOLD_DAYS,
-        # Minecraft 参数
-        minecraft_enabled: bool = False,
-        minecraft_config: dict[str, Any] | None = None,
-        consciousness_registry: Any | None = None,
-        save_consciousness_registry: Any | None = None,
-        prepare_perception: Any | None = None,
-        commit_perception: Any | None = None,
-        report_world_observation: Any | None = None,
         # 记忆服务（用于把"修正型洞察"落成显式修正记录，形成记忆演化链）
         memory_service: Any | None = None,
         maintenance_journal: LearningMaintenanceJournalPort | None = None,
@@ -204,32 +194,6 @@ class LearningScheduler:
                     "回填 knowledge_versions 失败（不影响启动）: %s",
                     type(exc).__name__,
                 )
-
-        # Minecraft 具身体验
-        self.minecraft_session: MinecraftSession | None = None
-        if minecraft_enabled:
-            # 过滤掉非 MCConfig 字段（如 vla_model）
-            _mc_fields = (
-                {f.name for f in MCConfig.__dataclass_fields__.values()}
-                if hasattr(MCConfig, "__dataclass_fields__")
-                else set()
-            )
-            _mc_raw = minecraft_config or {}
-            _mc_kwargs = {
-                k: v for k, v in _mc_raw.items() if not _mc_fields or k in _mc_fields
-            }
-            mc_cfg = MCConfig(**_mc_kwargs)
-
-            self.minecraft_session = MinecraftSession(
-                workspace=self._workspace,
-                mc_config=mc_cfg,
-                consciousness_registry=consciousness_registry,
-                save_consciousness_registry=save_consciousness_registry,
-                prepare_perception=prepare_perception,
-                commit_perception=commit_perception,
-                report_world_observation=report_world_observation,
-            )
-            logger.info("Minecraft evidence-driven embodiment initialized")
 
         # 调度参数
         self._audit_interval_hours = max(1.0, audit_interval_hours)
