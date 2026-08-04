@@ -150,7 +150,8 @@ POST /api/v1/commands/{command_id}:cancel
         callers=_ALL_CALLERS,
         scopes=("jobs:read", "jobs:operate"),
         resource_authorization="普通调用者仅访问自己的命令；管理员可读取正式导出的全部命令",
-        anchor="需新增 src/kernel/commands/ 耐久账本与 dispatcher",
+        anchor="src/kernel/commands/ 与 src/app/api/v1/commands.py",
+        status="validated",
     ),
     *_contracts(
         """

@@ -1238,6 +1238,8 @@ metrics:read / diagnostics:read
 
 ### P3-04：实现命令账本与 dispatcher
 
+> **实施状态（2026-08-04）**：已完成。已新增 SQLite 耐久命令账本、`(actor_id, idempotency_key)` 唯一约束、规范请求 hash、显式 handler allowlist、项目 `TaskManager` dispatcher、受限取消和四个 `/commands` 公共接口。命令受理与副作用成功分离；同键同请求返回原命令，同键异请求返回 409；重启仅恢复 `accepted`，把遗留 `executing` 栅栏为 `delivery_unknown`，禁止盲目重发。状态迁移与脱敏技术事件在同一 SQLite 事务写入阶段二既有 `sync_outbox`，不复制原始 payload，也未新增平行同步机制。生产挂载已接入恢复与异步关闭，关闭中断后不会遗留 `executing`。本阶段只提供命令内核，不注册旧斜杠命令、LLM Action 或任意插件方法；领域 handler 由 P3-06 等后续阶段显式登记。未启动 Elysium，未进行真实领域副作用 E2E。
+
 任务：
 
 1. 新增本地耐久 command store 和幂等约束。

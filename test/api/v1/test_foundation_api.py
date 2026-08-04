@@ -87,7 +87,7 @@ def _snapshot() -> FoundationSnapshot:
                 state="unavailable",
                 enabled=True,
                 owner="kernel.commands",
-                degraded_reason="P3-04 尚未实现。",
+                degraded_reason="命令账本尚未挂载。",
             ),
             ComponentStatus(
                 component="plugin:feishu_adapter",
@@ -222,6 +222,28 @@ def test_snapshot_does_not_trigger_lazy_life_service_creation(monkeypatch) -> No
 
     states = {item.component: item.state for item in snapshot.modules}
     assert states["life_event_ledger"] == "unavailable"
+
+
+def test_snapshot_reports_mounted_command_store_as_ready(monkeypatch) -> None:
+    bot = SimpleNamespace(
+        bot_name="Elysium",
+        manifests={},
+        load_results={},
+        plugin_manager=SimpleNamespace(get_all_plugins=dict),
+        app_api_mount=SimpleNamespace(command_store=object(), _closed=False),
+    )
+    monkeypatch.setattr(
+        "src.core.managers.adapter_manager.get_adapter_manager",
+        lambda: SimpleNamespace(get_all_adapters=dict),
+    )
+
+    snapshot = snapshot_from_bot(bot)
+    commands = next(
+        item for item in snapshot.modules if item.component == "command_store"
+    )
+
+    assert commands.state == "ready"
+    assert commands.degraded_reason is None
 
 
 def test_snapshot_exposes_config_disabled_adapter_without_marking_failure(

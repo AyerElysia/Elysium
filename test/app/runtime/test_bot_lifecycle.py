@@ -160,7 +160,7 @@ async def test_shutdown_continues_after_independent_step_failure(
         publish=AsyncMock(side_effect=RuntimeError("event stop failed"))
     )
     bot.scheduler = SimpleNamespace(stop=AsyncMock())
-    app_api_mount = SimpleNamespace(close=Mock())
+    app_api_mount = SimpleNamespace(aclose=AsyncMock())
     bot.app_api_mount = app_api_mount
     shutdown_order = []
     bot._unload_all_plugins = AsyncMock(  # type: ignore[method-assign]
@@ -210,7 +210,7 @@ async def test_shutdown_continues_after_independent_step_failure(
     close_vectors.assert_awaited_once()
     close_logger.assert_awaited_once()
     network_cleanup.assert_called_once()
-    app_api_mount.close.assert_called_once()
+    app_api_mount.aclose.assert_awaited_once()
     assert bot.app_api_mount is None
 
 

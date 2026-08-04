@@ -55,6 +55,17 @@ def test_p3_02_foundation_contracts_are_validated() -> None:
     assert {API_INVENTORY_BY_KEY[key].status for key in keys} == {"validated"}
 
 
+def test_p3_04_command_contracts_are_validated() -> None:
+    keys = {
+        ("POST", "/api/v1/commands"),
+        ("GET", "/api/v1/commands"),
+        ("GET", "/api/v1/commands/{command_id}"),
+        ("POST", "/api/v1/commands/{command_id}:cancel"),
+    }
+
+    assert {API_INVENTORY_BY_KEY[key].status for key in keys} == {"validated"}
+
+
 def test_every_scope_is_declared_by_phase_three_policy() -> None:
     """inventory 不能暗中引入权限矩阵外的 scope。"""
 

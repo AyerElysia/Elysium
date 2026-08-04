@@ -1,10 +1,17 @@
 """P3-01 挂载、耐久恢复、cursor 与签名值契约。"""
 
+import asyncio
 from datetime import timedelta
 from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
+from src.kernel.commands import (
+    CommandOutcome,
+    CommandStatus,
+    CommandStore,
+    HandlerRegistry,
+)
 
 from src.app.api.v1.auth_store import AuthStore
 from src.app.api.v1.mount import mount_api_v1
@@ -88,6 +95,123 @@ def test_mount_creates_owned_store_and_api_route(tmp_path: Path) -> None:
         environ=ENVIRONMENT,
     )
     remounted.close()
+
+
+def _accept_command(mounted, *, key: str, command_type: str = "test.mount.run"):
+    request_hash = mounted.command_store.request_hash(
+        command_type=command_type,
+        schema_version=1,
+        target={},
+        payload={"value": 1},
+        correlation_id=None,
+        expected_revision=None,
+    )
+    return mounted.command_store.accept(
+        idempotency_key=key,
+        request_hash=request_hash,
+        command_type=command_type,
+        schema_version=1,
+        actor_id="actor-mount",
+        caller_role="user",
+        scopes=("jobs:operate", "jobs:read"),
+        target={},
+        payload={"value": 1},
+    )[0]
+
+
+@pytest.mark.asyncio
+async def test_mount_start_recovers_accepted_command(tmp_path: Path) -> None:
+    app = FastAPI()
+    registry = HandlerRegistry()
+    completed = asyncio.Event()
+
+    async def handler(command):
+        completed.set()
+        return CommandOutcome(
+            status=CommandStatus.SUCCEEDED,
+            result={"value": command.payload["value"]},
+        )
+
+    registry.register(
+        "test.mount.run",
+        handler,
+        required_scopes=frozenset({"jobs:operate"}),
+    )
+    mounted = mount_api_v1(
+        app,
+        workspace_root=tmp_path,
+        database_path="runtime/api/auth.sqlite3",
+        allowed_origins=("http://localhost:5173",),
+        max_concurrency=4,
+        command_registry=registry,
+        environ=ENVIRONMENT,
+    )
+    command = _accept_command(mounted, key="mount-recovery-key")
+    try:
+        await mounted.start()
+        await asyncio.wait_for(completed.wait(), timeout=1)
+        for _ in range(100):
+            finished = mounted.command_store.get(command.command_id)
+            if finished.status is CommandStatus.SUCCEEDED:
+                break
+            await asyncio.sleep(0)
+        assert finished.status is CommandStatus.SUCCEEDED
+    finally:
+        await mounted.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cancellable", "expected_status"),
+    [
+        (False, CommandStatus.DELIVERY_UNKNOWN),
+        (True, CommandStatus.CANCELLED),
+    ],
+)
+async def test_mount_async_close_persists_interrupted_execution(
+    tmp_path: Path,
+    cancellable: bool,
+    expected_status: CommandStatus,
+) -> None:
+    app = FastAPI()
+    registry = HandlerRegistry()
+    started = asyncio.Event()
+
+    async def handler(_command):
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    registry.register(
+        "test.mount.run",
+        handler,
+        required_scopes=frozenset({"jobs:operate"}),
+        cancellable=cancellable,
+    )
+    mounted = mount_api_v1(
+        app,
+        workspace_root=tmp_path,
+        database_path="runtime/api/auth.sqlite3",
+        allowed_origins=("http://localhost:5173",),
+        max_concurrency=4,
+        command_registry=registry,
+        environ=ENVIRONMENT,
+    )
+    command = _accept_command(
+        mounted,
+        key=f"mount-close-{cancellable}",
+    )
+    mounted.command_dispatcher.schedule(command.command_id)
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert mounted.command_store.get(command.command_id).status is CommandStatus.EXECUTING
+
+    await mounted.aclose()
+
+    command_store = CommandStore(tmp_path / "runtime" / "api" / "auth.sqlite3")
+    try:
+        assert command_store.get(command.command_id).status is expected_status
+    finally:
+        command_store.close()
 
 
 def test_session_revocation_survives_store_reopen(tmp_path: Path) -> None:

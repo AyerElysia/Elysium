@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from src.kernel.commands import CommandDispatcher, CommandStore
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
@@ -46,6 +47,7 @@ ERROR_RESPONSES = {
     401: {"model": ErrorResponse, "description": "认证失败"},
     403: {"model": ErrorResponse, "description": "权限不足"},
     404: {"model": ErrorResponse, "description": "能力或资源不存在"},
+    409: {"model": ErrorResponse, "description": "幂等键或资源状态冲突"},
     413: {"model": ErrorResponse, "description": "请求体超过上限"},
     415: {"model": ErrorResponse, "description": "媒体类型不受支持"},
     422: {"model": ErrorResponse, "description": "请求不符合协议"},
@@ -95,6 +97,8 @@ class APIContext:
     max_concurrency: int = 32
     max_websocket_connections: int = 64
     foundation: FoundationProjection | None = None
+    command_store: CommandStore | None = None
+    command_dispatcher: CommandDispatcher | None = None
 
 
 class RequestIDMiddleware(BaseHTTPMiddleware):
@@ -597,6 +601,18 @@ def create_api_app(context: APIContext) -> FastAPI:
 
     app.include_router(auth_router)
     app.include_router(foundation_router)
+    if (context.command_store is None) != (context.command_dispatcher is None):
+        raise ValueError("command store and dispatcher must be configured together")
+    if context.command_store is not None and context.command_dispatcher is not None:
+        from .commands import create_commands_router
+
+        app.include_router(
+            create_commands_router(
+                store=context.command_store,
+                dispatcher=context.command_dispatcher,
+                require_scope=require_scope,
+            )
+        )
     return app
 
 

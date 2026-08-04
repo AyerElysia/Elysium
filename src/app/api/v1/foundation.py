@@ -156,7 +156,7 @@ class FoundationProjection:
                     state="unavailable",
                     enabled=True,
                     owner="kernel.commands",
-                    degraded_reason="P3-04 尚未实现。",
+                    degraded_reason="运行状态源尚未接入命令账本。",
                 ),
             ),
             adapters=(),
@@ -356,13 +356,18 @@ def snapshot_from_bot(bot: Any) -> FoundationSnapshot:
         )
     )
 
+    api_mount = getattr(bot, "app_api_mount", None)
+    command_store = getattr(api_mount, "command_store", None)
+    command_ready = command_store is not None and not bool(
+        getattr(api_mount, "_closed", False)
+    )
     modules.append(
         ComponentStatus(
             component="command_store",
-            state="unavailable",
+            state="ready" if command_ready else "unavailable",
             enabled=True,
             owner="kernel.commands",
-            degraded_reason="P3-04 尚未实现。",
+            degraded_reason=None if command_ready else "命令账本尚未挂载。",
         )
     )
 
