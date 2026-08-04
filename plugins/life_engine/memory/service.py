@@ -79,16 +79,11 @@ from .indexing import (
     ChunkIndexState,
     DocumentIndexResult,
     IndexJob,
-    claim_index_jobs,
     create_memory_schema,
-    delete_document_rows,
     enqueue_index_job,
-    list_index_jobs,
     move_document_rows,
     read_active_chunk_index_state,
-    set_index_job_status,
     transaction,
-    upsert_document_rows,
 )
 from .eligibility import (
     MEMORY_CONTENT_DIRECTORIES,
@@ -133,14 +128,6 @@ from .epistemic import (
     RetrievalExposure,
     RetrievalFeedback,
     RetrievalPlasticity,
-    append_belief,
-    append_claim,
-    append_claim_evidence,
-    append_conflict,
-    append_state_event,
-    append_retrieval_episode,
-    append_retrieval_exposure,
-    append_retrieval_feedback,
     build_memory_audit_trail,
     create_epistemic_schema,
     get_claim_state,
@@ -160,21 +147,14 @@ from .experience import (
     MemorySearchMode,
     WitnessMemory,
     WitnessSearchResult,
-    append_experiences_detailed,
     create_life_memory_schema,
-    get_witness_by_projection_path,
-    get_witness_state,
-    insert_experiences,
-    insert_witness_memory,
-    list_experiences_after,
-    list_pending_witness_projections,
-    mark_witness_projection,
     migrate_legacy_witness,
     migration_exists,
     record_witness_migration,
     search_witness_memories,
-    update_witness_state,
 )
+from ..storage.memory import MemoryStorageBundle
+from ..storage.memory.local import create_local_memory_storage_bundle
 from .living import (
     AssociationEvidence,
     AssociationSelection,
@@ -188,17 +168,12 @@ from .living import (
     RecallEvent,
     SemanticRelation,
     append_artifact_version,
-    append_corecall_event,
-    append_interpretation,
-    append_recall_events,
-    append_semantic_relation,
-    begin_recall_episode,
     choose_association_neighbours,
     create_living_memory_schema,
     get_artifact_head,
+    get_artifact_head_state,
     get_interpretation,
     list_artifact_heads,
-    list_artifact_history,
     list_association_evidence,
     list_interpretations,
     list_semantic_relations,
@@ -466,6 +441,7 @@ class LifeMemoryService:
         if isinstance(plugin, (str, Path)):
             self._workspace_override = Path(plugin)
         self._db: sqlite3.Connection | None = None
+        self._memory_storage: MemoryStorageBundle | None = None
         self._initialized = False
         self._closing = False
         self._chroma_collection = None
@@ -639,6 +615,9 @@ class LifeMemoryService:
                 await run_db(create_life_memory_schema, db)
                 await run_db(create_epistemic_schema, db)
                 await run_db(create_living_memory_schema, db)
+                self._memory_storage = create_local_memory_storage_bundle(
+                    self._require_db
+                )
 
                 if self._vector_backend_enabled:
                     try:
@@ -664,6 +643,7 @@ class LifeMemoryService:
                 self._initialized = True
                 await self._startup_recovery()
             except BaseException:
+                self._memory_storage = None
                 self._db = None
                 bind_reader_pool(None)
                 await run_db(db.close)
@@ -1074,11 +1054,123 @@ class LifeMemoryService:
             raise RuntimeError("记忆服务尚未初始化或正在关闭")
         return self._db
 
+    @property
+    def available(self) -> bool:
+        """Whether the service can currently serve public memory operations."""
+
+        return self._db is not None and self._initialized and not self._closing
+
+    async def read_graph_projection(
+        self,
+        *,
+        limit_nodes: int = 80,
+        min_weight: float = 0.15,
+        focus_id: str | None = None,
+    ) -> Dict[str, Any]:
+        """Return the rebuildable legacy graph through a public service boundary."""
+
+        return await self._require_memory_storage().document_index.graph_snapshot(
+            limit_nodes=max(10, min(int(limit_nodes), 200)),
+            min_weight=max(0.0, min(float(min_weight), 1.0)),
+            focus_id=focus_id,
+        )
+
+    async def read_file_lineage_projection(
+        self,
+        file_path: str,
+    ) -> Dict[str, Any] | None:
+        """Return file evolution through the public backend-neutral boundary."""
+
+        graph = self._require_memory_storage().legacy_graph
+        node = await graph.get_node_by_file_path(file_path)
+        if node is None:
+            return None
+        outgoing, incoming, corrections = await asyncio.gather(
+            graph.get_edges_from(node.node_id, 0.0),
+            graph.get_edges_to(node.node_id, 0.0),
+            graph.list_corrections(
+                related_node_ids=(node.node_id,),
+                limit=10,
+            ),
+        )
+        evolution_trace: list[dict[str, Any]] = []
+        for direction, edges in (("later", outgoing), ("earlier", incoming)):
+            for edge in edges:
+                related_id = (
+                    edge.target_id if direction == "later" else edge.source_id
+                )
+                related = await graph.get_node_by_id(related_id)
+                if related is None or not related.file_path:
+                    continue
+                evolution_trace.append(
+                    {
+                        "direction": direction,
+                        "relation": edge.edge_type.value,
+                        "file_path": related.file_path,
+                        "title": related.title,
+                        "reason": edge.reason,
+                        "weight": round(edge.weight, 2),
+                    }
+                )
+        corrections_data = [
+            {
+                "topic": item.topic,
+                "message": item.message,
+                "source": item.source,
+                "created_at": item.created_at,
+            }
+            for item in corrections
+        ]
+        if not evolution_trace and not corrections_data:
+            return None
+        return {
+            "evolution_trace": evolution_trace,
+            "corrections": corrections_data,
+            "has_history": True,
+        }
+
+    async def read_lineage_edges(
+        self,
+        node_id: str,
+        *,
+        min_weight: float = 0.0,
+    ) -> tuple[List[MemoryEdge], List[MemoryEdge]]:
+        """Read outgoing and incoming legacy lineage edges without exposing DB."""
+
+        graph = self._require_memory_storage().legacy_graph
+        outgoing, incoming = await asyncio.gather(
+            graph.get_edges_from(node_id, min_weight),
+            graph.get_edges_to(node_id, min_weight),
+        )
+        return outgoing, incoming
+
+    async def read_memory_corrections(
+        self,
+        *,
+        query: str = "",
+        related_node_ids: Sequence[str] = (),
+        limit: int = 20,
+    ) -> List[MemoryCorrection]:
+        """Read correction history through the public storage port."""
+
+        return await self._require_memory_storage().legacy_graph.list_corrections(
+            query=query,
+            related_node_ids=related_node_ids,
+            limit=limit,
+        )
+
+    def _require_memory_storage(self) -> MemoryStorageBundle:
+        storage = self._memory_storage
+        if storage is None or self._closing:
+            raise RuntimeError("记忆存储尚未初始化或正在关闭")
+        return storage
+
     async def close(self) -> None:
         """幂等关闭 SQLite；共享向量服务的生命周期由 kernel 管理。"""
         async with self._lifecycle_lock:
             if self._db is None:
                 self._initialized = False
+                self._memory_storage = None
                 self._clear_cached_collections()
                 return
 
@@ -1087,6 +1179,7 @@ class LifeMemoryService:
                 async with self._index_worker_lock:
                     async with self._index_write_lock:
                         db = self._db
+                        self._memory_storage = None
                         self._db = None
                         # 读连接必须先于写连接释放：它们指向同一个文件，
                         # 留着会让 WAL 无法 checkpoint。
@@ -1117,30 +1210,25 @@ class LifeMemoryService:
         overlap_chars: int | None = None,
     ) -> DocumentIndexResult:
         """统一写入文档节点、分块 FTS 和待处理 outbox。"""
-        async with self._index_write_lock:
-            db = self._require_db()
-            return await run_db(
-                upsert_document_rows,
-                db,
-                path,
-                content,
-                title,
-                source_mtime,
-                **({} if max_chars is None else {"max_chars": max_chars}),
-                **({} if overlap_chars is None else {"overlap_chars": overlap_chars}),
-            )
+        return await self._require_memory_storage().document_index.upsert_document(
+            path,
+            content,
+            title,
+            source_mtime,
+            max_chars=max_chars,
+            overlap_chars=overlap_chars,
+        )
 
     async def delete_document(self, path: str) -> bool:
         """删除文档及其 SQLite 索引、分块和 outbox 记录。"""
-        async with self._index_write_lock:
-            db = self._require_db()
-            return await run_db(delete_document_rows, db, path)
+        return await self._require_memory_storage().document_index.delete_document(path)
 
     async def move_document(self, old_path: str, new_path: str) -> bool:
         """移动文档索引；目标已有节点时明确拒绝合并。"""
-        async with self._index_write_lock:
-            db = self._require_db()
-            return await run_db(move_document_rows, db, old_path, new_path)
+        return await self._require_memory_storage().document_index.move_document(
+            old_path,
+            new_path,
+        )
 
     async def enqueue_index_job(self, node_id: str, content_hash: str) -> str:
         """加入一个待处理索引任务，不触发 embedding 或网络请求。"""
@@ -1150,9 +1238,9 @@ class LifeMemoryService:
 
     async def process_index_jobs(self, limit: int = 10) -> List[IndexJob]:
         """领取待处理任务，交给外部 worker；本方法不执行 embedding。"""
-        async with self._index_write_lock:
-            db = self._require_db()
-            return await run_db(claim_index_jobs, db, limit=limit)
+        return await self._require_memory_storage().document_index.claim_jobs(
+            limit=limit
+        )
 
     async def run_index_worker(
         self,
@@ -1215,9 +1303,10 @@ class LifeMemoryService:
         limit: int = 100,
     ) -> List[IndexJob]:
         """读取 outbox 状态，供 worker 或测试观察。"""
-        async with self._index_write_lock:
-            db = self._require_db()
-            return await run_db(list_index_jobs, db, status=status, limit=limit)
+        return await self._require_memory_storage().document_index.list_jobs(
+            status=status,
+            limit=limit,
+        )
 
     async def set_index_job_status(
         self,
@@ -1226,15 +1315,11 @@ class LifeMemoryService:
         error: str = "",
     ) -> bool:
         """更新外部索引 worker 的任务状态。"""
-        async with self._index_write_lock:
-            db = self._require_db()
-            return await run_db(
-                set_index_job_status,
-                db,
-                job_id,
-                status,
-                error=error,
-            )
+        return await self._require_memory_storage().document_index.set_job_status(
+            job_id,
+            status,
+            error=error,
+        )
 
     # --------------------------------------------------------
     # 生命记忆本体：不可变经历与第一人称见证
@@ -1246,44 +1331,34 @@ class LifeMemoryService:
 
     async def append_memory_claim(self, claim: MemoryClaim) -> MemoryClaim:
         """追加主张；主张正文不可覆盖，后续认识只通过状态事件表达。"""
-        async with self._index_write_lock:
-            return await run_db(append_claim, self._require_db(), claim)
+        return await self._require_memory_storage().epistemic.append_claim(claim)
 
     async def record_retrieval_episode(
         self,
         episode: RetrievalEpisode,
     ) -> RetrievalEpisode:
         """记录一次检索上下文；候选曝光不是事实证据。"""
-        async with self._index_write_lock:
-            return await run_db(
-                append_retrieval_episode,
-                self._require_db(),
-                episode,
-            )
+        return await self._require_memory_storage().epistemic.append_retrieval_episode(
+            episode
+        )
 
     async def record_retrieval_exposure(
         self,
         exposure: RetrievalExposure,
     ) -> RetrievalExposure:
         """记录候选被展示；不自动建立语义边或提高事实状态。"""
-        async with self._index_write_lock:
-            return await run_db(
-                append_retrieval_exposure,
-                self._require_db(),
-                exposure,
-            )
+        return await self._require_memory_storage().epistemic.append_retrieval_exposure(
+            exposure
+        )
 
     async def record_retrieval_feedback(
         self,
         feedback: RetrievalFeedback,
     ) -> RetrievalFeedback:
         """追加主体对候选的采用、拒绝或修正反馈。"""
-        async with self._index_write_lock:
-            return await run_db(
-                append_retrieval_feedback,
-                self._require_db(),
-                feedback,
-            )
+        return await self._require_memory_storage().epistemic.append_retrieval_feedback(
+            feedback
+        )
 
     async def get_retrieval_plasticity(
         self,
@@ -1336,37 +1411,25 @@ class LifeMemoryService:
 
     async def append_claim_evidence(self, evidence: ClaimEvidence) -> ClaimEvidence:
         """追加一条支持、挑战或语境证据，不将其折算为真值分数。"""
-        async with self._index_write_lock:
-            return await run_db(
-                append_claim_evidence,
-                self._require_db(),
-                evidence,
-            )
+        return await self._require_memory_storage().epistemic.append_evidence(evidence)
 
     async def append_memory_belief(self, belief: MemoryBelief) -> MemoryBelief:
         """登记一个意识视角与主张的关系；认可状态由事件另行记录。"""
-        async with self._index_write_lock:
-            return await run_db(append_belief, self._require_db(), belief)
+        return await self._require_memory_storage().epistemic.append_belief(belief)
 
     async def append_epistemic_conflict(
         self,
         conflict: EpistemicConflict,
     ) -> EpistemicConflict:
         """登记冲突而不擅自裁决两个主张中的任何一个。"""
-        async with self._index_write_lock:
-            return await run_db(append_conflict, self._require_db(), conflict)
+        return await self._require_memory_storage().epistemic.append_conflict(conflict)
 
     async def append_memory_state_event(
         self,
         event: MemoryStateEvent,
     ) -> MemoryStateEvent:
         """追加可审计状态变化；权限校验和撤销关系由本体层强制。"""
-        async with self._index_write_lock:
-            return await run_db(
-                append_state_event,
-                self._require_db(),
-                event,
-            )
+        return await self._require_memory_storage().epistemic.append_state_event(event)
 
     async def get_memory_disposition(
         self,
@@ -1497,9 +1560,8 @@ class LifeMemoryService:
         records: List[ExperienceRecord],
     ) -> int:
         """幂等追加不可变经历证据，绝不覆盖已有事件。"""
-        async with self._index_write_lock:
-            db = self._require_db()
-            return await run_db(insert_experiences, db, records)
+        report = await self._require_memory_storage().experiences.append(records)
+        return report.inserted_count
 
     async def append_experiences_detailed(
         self,
@@ -1507,25 +1569,26 @@ class LifeMemoryService:
     ) -> ExperienceAppendReport:
         """Append occurrences and expose only canonical new evidence."""
 
-        async with self._index_write_lock:
-            db = self._require_db()
-            return await run_db(append_experiences_detailed, db, records)
+        return await self._require_memory_storage().experiences.append(records)
 
     async def record_memory_artifact_version(
         self,
         version: MemoryArtifactVersion,
         *,
         derivations: Sequence[MemoryDerivation] = (),
+        expected_head_revision: int | None = None,
     ) -> MemoryArtifactVersion:
         """Append one immutable memory artifact version and provenance."""
 
-        async with self._index_write_lock:
-            return await run_db(
-                append_artifact_version,
-                self._require_db(),
-                version,
-                derivations=derivations,
-            )
+        living = self._require_memory_storage().living
+        if expected_head_revision is None:
+            head = await living.get_artifact_head(version.logical_key)
+            expected_head_revision = head.revision if head is not None else 0
+        return await living.append_artifact(
+            version,
+            derivations=derivations,
+            expected_head_revision=expected_head_revision,
+        )
 
     async def version_memory_artifact(
         self,
@@ -1547,6 +1610,7 @@ class LifeMemoryService:
         async with self._index_write_lock:
             db = self._require_db()
             head = await run_db(get_artifact_head, db, logical_key)
+            head_state = await run_db(get_artifact_head_state, db, logical_key)
             parents = (head.artifact_id,) if head is not None else ()
             version = new_artifact_version(
                 logical_key=logical_key,
@@ -1578,6 +1642,9 @@ class LifeMemoryService:
                 db,
                 version,
                 derivations=derivations,
+                expected_head_revision=(
+                    head_state.revision if head_state is not None else 0
+                ),
             )
 
     async def get_memory_artifact_history(
@@ -1586,12 +1653,9 @@ class LifeMemoryService:
     ) -> List[MemoryArtifactVersion]:
         """Return every immutable version of one logical memory artifact."""
 
-        async with self._index_write_lock:
-            return await run_db(
-                list_artifact_history,
-                self._require_db(),
-                logical_key,
-            )
+        return await self._require_memory_storage().living.list_artifact_history(
+            logical_key
+        )
 
     async def record_memory_interpretation(
         self,
@@ -1601,13 +1665,10 @@ class LifeMemoryService:
     ) -> MemoryInterpretation:
         """Append one subject-authored interpretation and its sources."""
 
-        async with self._index_write_lock:
-            return await run_db(
-                append_interpretation,
-                self._require_db(),
-                interpretation,
-                sources=sources,
-            )
+        return await self._require_memory_storage().living.append_interpretation(
+            interpretation,
+            sources=sources,
+        )
 
     async def record_memory_semantic_relation(
         self,
@@ -1615,12 +1676,7 @@ class LifeMemoryService:
     ) -> SemanticRelation:
         """Append an explicit relation without a closed predicate taxonomy."""
 
-        async with self._index_write_lock:
-            return await run_db(
-                append_semantic_relation,
-                self._require_db(),
-                relation,
-            )
+        return await self._require_memory_storage().living.append_relation(relation)
 
     async def list_memory_semantic_relations(
         self,
@@ -1712,8 +1768,7 @@ class LifeMemoryService:
     ) -> RecallEpisode:
         """Start a replayable recall episode with an open retrieval intent."""
 
-        async with self._index_write_lock:
-            return await run_db(begin_recall_episode, self._require_db(), **kwargs)
+        return await self._require_memory_storage().living.begin_recall(**kwargs)
 
     async def append_memory_recall_events(
         self,
@@ -1721,12 +1776,7 @@ class LifeMemoryService:
     ) -> tuple[RecallEvent, ...]:
         """Append objective and subject-authored traces for one recall."""
 
-        async with self._index_write_lock:
-            return await run_db(
-                append_recall_events,
-                self._require_db(),
-                events,
-            )
+        return await self._require_memory_storage().living.append_recall_events(events)
 
     async def append_memory_corecall(
         self,
@@ -1734,12 +1784,7 @@ class LifeMemoryService:
     ) -> CoRecallEvent:
         """Append a contextual co-recall hyperedge and update its projection."""
 
-        async with self._index_write_lock:
-            return await run_db(
-                append_corecall_event,
-                self._require_db(),
-                event,
-            )
+        return await self._require_memory_storage().living.append_corecall(event)
 
     async def list_memory_association_evidence(
         self,
@@ -1828,21 +1873,15 @@ class LifeMemoryService:
         stream_scope: str | None = None,
     ) -> List[ExperienceRecord]:
         """按序列读取经历账本，可显式限制聊天流范围。"""
-        async with self._index_write_lock:
-            db = self._require_db()
-            return await run_db(
-                list_experiences_after,
-                db,
-                sequence,
-                limit=limit,
-                stream_scope=stream_scope,
-            )
+        return await self._require_memory_storage().experiences.list_after(
+            sequence,
+            limit=limit,
+            stream_scope=stream_scope,
+        )
 
     async def record_witness_memory(self, **kwargs: Any) -> WitnessMemory:
         """保存带完整来源链的主体见证，不把它提升为客观事实。"""
-        async with self._index_write_lock:
-            db = self._require_db()
-            return await run_db(insert_witness_memory, db, **kwargs)
+        return await self._require_memory_storage().witnesses.append(**kwargs)
 
     async def mark_witness_projection(
         self,
@@ -1853,16 +1892,12 @@ class LifeMemoryService:
         error: str = "",
     ) -> bool:
         """更新可重建 Markdown 投影状态，不修改见证正文。"""
-        async with self._index_write_lock:
-            db = self._require_db()
-            return await run_db(
-                mark_witness_projection,
-                db,
-                witness_id,
-                projection_path=projection_path,
-                status=status,
-                error=error,
-            )
+        return await self._require_memory_storage().witnesses.mark_projection(
+            witness_id,
+            projection_path=projection_path,
+            status=status,
+            error=error,
+        )
 
     async def list_pending_witness_projections(
         self,
@@ -1870,54 +1905,61 @@ class LifeMemoryService:
         limit: int = 100,
     ) -> List[WitnessMemory]:
         """读取待恢复的见证投影。"""
-        async with self._index_write_lock:
-            db = self._require_db()
-            return await run_db(
-                list_pending_witness_projections,
-                db,
-                limit=limit,
-            )
+        return await self._require_memory_storage().witnesses.list_pending(limit=limit)
 
     async def get_witness_by_projection_path(
         self,
         projection_path: str,
     ) -> WitnessMemory | None:
         """用确定性投影路径检查事件窗口是否已见证。"""
-        async with self._index_write_lock:
-            db = self._require_db()
-            return await run_db(
-                get_witness_by_projection_path,
-                db,
-                projection_path,
-            )
+        return await self._require_memory_storage().witnesses.get_by_projection_path(
+            projection_path
+        )
 
     async def get_witness_state(
         self,
         consciousness_instance_id: str,
     ) -> Dict[str, Any]:
         """读取见证意识的持久化游标与错误状态。"""
-        async with self._index_write_lock:
-            db = self._require_db()
-            return await run_db(
-                get_witness_state,
-                db,
-                consciousness_instance_id,
-            )
+        return await self._require_memory_storage().witnesses.get_state(
+            consciousness_instance_id
+        )
 
     async def update_witness_state(
         self,
         consciousness_instance_id: str,
         **kwargs: Any,
-    ) -> None:
+    ) -> Dict[str, Any]:
         """原子更新见证意识游标；调用方决定何时确认整批成功。"""
-        async with self._index_write_lock:
-            db = self._require_db()
-            await run_db(
-                update_witness_state,
-                db,
-                consciousness_instance_id,
-                **kwargs,
+        witnesses = self._require_memory_storage().witnesses
+        current = await witnesses.get_state(consciousness_instance_id)
+        expected_sequence = int(
+            kwargs.pop("expected_sequence", current["last_sequence"])
+        )
+        expected_revision = int(
+            kwargs.pop("expected_revision", current.get("revision", 0))
+        )
+        requested_sequence = kwargs.pop("last_sequence", None)
+        next_sequence = (
+            int(current["last_sequence"])
+            if requested_sequence is None
+            else int(requested_sequence)
+        )
+        allowed = {"last_run_at", "last_success_at", "last_error"}
+        unexpected = set(kwargs) - allowed
+        if unexpected:
+            raise TypeError(
+                "unsupported witness state fields: " + ", ".join(sorted(unexpected))
             )
+        return await witnesses.compare_and_advance_state(
+            consciousness_instance_id,
+            expected_sequence=expected_sequence,
+            expected_revision=expected_revision,
+            next_sequence=next_sequence,
+            last_run_at=kwargs.get("last_run_at"),
+            last_success_at=kwargs.get("last_success_at"),
+            last_error=kwargs.get("last_error"),
+        )
 
     async def search_epistemic_claims(
         self,

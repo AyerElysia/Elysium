@@ -17,6 +17,8 @@ from enum import Enum
 from typing import Any, Sequence
 from uuid import uuid4
 
+from src.kernel.storage import CursorConflict, compare_and_advance_cursor
+
 from .indexing import transaction
 
 
@@ -255,6 +257,7 @@ def create_life_memory_schema(db: sqlite3.Connection) -> None:
             CREATE TABLE IF NOT EXISTS memory_witness_state (
                 consciousness_instance_id TEXT PRIMARY KEY,
                 last_sequence INTEGER NOT NULL DEFAULT 0,
+                revision INTEGER NOT NULL DEFAULT 0,
                 last_run_at TEXT NOT NULL DEFAULT '',
                 last_success_at TEXT NOT NULL DEFAULT '',
                 last_error TEXT NOT NULL DEFAULT '',
@@ -274,6 +277,15 @@ def create_life_memory_schema(db: sqlite3.Connection) -> None:
             );
             """
         )
+        state_columns = {
+            str(row[1])
+            for row in db.execute("PRAGMA table_info(memory_witness_state)")
+        }
+        if "revision" not in state_columns:
+            db.execute(
+                "ALTER TABLE memory_witness_state "
+                "ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
+            )
 
 
 def _same_experience_occurrence(
@@ -571,6 +583,7 @@ def get_witness_state(
     return dict(row) if row is not None else {
         "consciousness_instance_id": consciousness_instance_id,
         "last_sequence": 0,
+        "revision": 0,
         "last_run_at": "",
         "last_success_at": "",
         "last_error": "",
@@ -586,31 +599,76 @@ def update_witness_state(
     last_run_at: str | None = None,
     last_success_at: str | None = None,
     last_error: str | None = None,
-) -> None:
-    current = get_witness_state(db, consciousness_instance_id)
+    expected_sequence: int | None = None,
+    expected_revision: int | None = None,
+) -> dict[str, Any]:
+    """Advance the witness mirror with position+revision CAS.
+
+    Metadata-only updates retain the cursor revision.  A caller that observed
+    an earlier state can provide both expectations; stale writers and cursor
+    regression are explicit conflicts instead of last-write-wins mirrors.
+    """
+
     with transaction(db):
+        current = get_witness_state(db, consciousness_instance_id)
+        current_sequence = int(current["last_sequence"])
+        current_revision = int(current.get("revision", 0))
+        expected_position = (
+            current_sequence
+            if expected_sequence is None
+            else max(0, int(expected_sequence))
+        )
+        expected_revision_value = (
+            current_revision
+            if expected_revision is None
+            else max(0, int(expected_revision))
+        )
+        next_sequence, next_revision = compare_and_advance_cursor(
+            current_position=current_sequence,
+            current_revision=current_revision,
+            expected_position=expected_position,
+            expected_revision=expected_revision_value,
+            next_position=(
+                current_sequence if last_sequence is None else int(last_sequence)
+            ),
+        )
         db.execute(
             """
             INSERT INTO memory_witness_state (
-                consciousness_instance_id, last_sequence, last_run_at,
+                consciousness_instance_id, last_sequence, revision, last_run_at,
                 last_success_at, last_error, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(consciousness_instance_id) DO UPDATE SET
                 last_sequence = excluded.last_sequence,
+                revision = excluded.revision,
                 last_run_at = excluded.last_run_at,
                 last_success_at = excluded.last_success_at,
                 last_error = excluded.last_error,
                 updated_at = excluded.updated_at
+            WHERE memory_witness_state.last_sequence = ?
+              AND memory_witness_state.revision = ?
             """,
             (
                 consciousness_instance_id,
-                int(current["last_sequence"] if last_sequence is None else last_sequence),
+                next_sequence,
+                next_revision,
                 current["last_run_at"] if last_run_at is None else last_run_at,
                 current["last_success_at"] if last_success_at is None else last_success_at,
                 current["last_error"] if last_error is None else last_error,
                 _now_iso(),
+                current_sequence,
+                current_revision,
             ),
         )
+        persisted = get_witness_state(db, consciousness_instance_id)
+        if (
+            int(persisted["last_sequence"]) != next_sequence
+            or int(persisted.get("revision", 0)) != next_revision
+        ):
+            raise CursorConflict(
+                "witness state changed before compare-and-swap could commit"
+            )
+    return persisted
 
 
 def _fts_query(query: str) -> str:

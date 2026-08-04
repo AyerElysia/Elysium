@@ -376,13 +376,12 @@ class MemoryRouter(BaseRouter):
             focus_id: str | None = None,
         ) -> dict[str, Any]:
             memory = get_memory_service()
-            if not memory or not memory._db:
+            if not memory or not memory.available:
                 return {"status": "disabled", "nodes": [], "links": []}
 
             safe_limit = max(10, min(int(limit_nodes), 200))
             safe_weight = max(0.0, min(float(min_weight), 1.0))
-            payload = await _read_graph_payload(
-                memory._db,
+            payload = await memory.read_graph_projection(
                 limit_nodes=safe_limit,
                 min_weight=safe_weight,
                 focus_id=focus_id,

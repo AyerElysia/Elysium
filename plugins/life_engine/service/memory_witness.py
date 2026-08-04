@@ -193,8 +193,11 @@ class MemoryWitnessCoordinator:
             if not raw_events:
                 await memory.update_witness_state(
                     instance.instance_id,
+                    last_sequence=cursor,
                     last_run_at=_now_iso(),
                     last_error="",
+                    expected_sequence=int(state.get("last_sequence", 0) or 0),
+                    expected_revision=int(state.get("revision", 0) or 0),
                 )
                 return WitnessRunReport(last_sequence=cursor)
 
@@ -264,13 +267,6 @@ class MemoryWitnessCoordinator:
                     written.append(witness.witness_id)
 
             now = _now_iso()
-            await memory.update_witness_state(
-                instance.instance_id,
-                last_sequence=max_sequence,
-                last_run_at=now,
-                last_success_at=now,
-                last_error="",
-            )
             commit_offset = getattr(store, "commit_consumer_offset", None)
             if callable(commit_offset):
                 await commit_offset(
@@ -278,6 +274,15 @@ class MemoryWitnessCoordinator:
                     max_sequence,
                     metadata={"witness_state_mirror": True},
                 )
+            await memory.update_witness_state(
+                instance.instance_id,
+                last_sequence=max_sequence,
+                last_run_at=now,
+                last_success_at=now,
+                last_error="",
+                expected_sequence=int(state.get("last_sequence", 0) or 0),
+                expected_revision=int(state.get("revision", 0) or 0),
+            )
             self._service.consciousness_registry.touch(
                 instance.instance_id,
                 timestamp=now,

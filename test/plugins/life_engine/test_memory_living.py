@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from plugins.life_engine.memory.living import (
+    ArtifactHeadConflict,
     CoRecallEvent,
     InterpretationSource,
     MemoryDerivation,
@@ -20,6 +21,7 @@ from plugins.life_engine.memory.living import (
     begin_recall_episode,
     create_living_memory_schema,
     get_artifact_head,
+    get_artifact_head_state,
     list_artifact_history,
     list_association_evidence,
     list_interpretations,
@@ -85,6 +87,36 @@ def test_artifact_revisions_preserve_old_content_and_open_provenance() -> None:
             "UPDATE memory_artifact_versions SET content = '覆盖' WHERE artifact_id = ?",
             (old.artifact_id,),
         )
+
+
+def test_artifact_head_uses_expected_revision_cas() -> None:
+    db = _db()
+    first = new_artifact_version(
+        logical_key="MEMORY.md",
+        artifact_kind="memory_document",
+        content="first",
+    )
+    append_artifact_version(db, first, expected_head_revision=0)
+    assert get_artifact_head_state(db, "MEMORY.md").revision == 1
+
+    second = new_artifact_version(
+        logical_key="MEMORY.md",
+        artifact_kind="memory_document",
+        content="second",
+        parent_artifact_ids=(first.artifact_id,),
+    )
+    with pytest.raises(ArtifactHeadConflict, match="expected=0, actual=1"):
+        append_artifact_version(db, second, expected_head_revision=0)
+    assert list_artifact_history(db, "MEMORY.md") == [first]
+
+    append_artifact_version(db, second, expected_head_revision=1)
+    head = get_artifact_head_state(db, "MEMORY.md")
+    assert head is not None
+    assert head.artifact_id == second.artifact_id
+    assert head.revision == 2
+
+    append_artifact_version(db, second, expected_head_revision=2)
+    assert get_artifact_head_state(db, "MEMORY.md").revision == 2
 
 
 def test_interpretations_can_evolve_without_resolving_each_other() -> None:

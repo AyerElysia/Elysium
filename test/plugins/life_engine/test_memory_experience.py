@@ -18,8 +18,10 @@ from plugins.life_engine.memory.experience import (
     create_life_memory_schema,
     insert_experiences,
     insert_witness_memory,
+    get_witness_state,
     migrate_legacy_witness,
     search_witness_memories,
+    update_witness_state,
 )
 from plugins.life_engine.memory.tools import LifeEngineSearchMemoryTool
 from plugins.life_engine.service.consciousness import ConsciousnessRegistry
@@ -31,6 +33,7 @@ from plugins.life_engine.service.memory_witness import (
 )
 from plugins.life_engine.service.tool_manifests import get_tool_manifest
 from src.kernel.llm.exceptions import LLMAPIError, LLMModelsCoolingDownError
+from src.kernel.storage import CursorConflict
 
 
 def _db() -> sqlite3.Connection:
@@ -93,6 +96,47 @@ def test_witness_requires_existing_source_event() -> None:
             valid_to="2026-07-29T08:00:00+08:00",
             source_event_ids=["missing"],
         )
+
+
+def test_witness_state_mirror_uses_monotonic_position_revision_cas() -> None:
+    db = _db()
+    state = update_witness_state(
+        db,
+        "memory_witness",
+        last_sequence=5,
+        expected_sequence=0,
+        expected_revision=0,
+    )
+    assert state["last_sequence"] == 5
+    assert state["revision"] == 1
+
+    with pytest.raises(CursorConflict, match="expected 0, actual 5"):
+        update_witness_state(
+            db,
+            "memory_witness",
+            last_sequence=6,
+            expected_sequence=0,
+            expected_revision=0,
+        )
+    with pytest.raises(CursorConflict, match="cannot regress"):
+        update_witness_state(
+            db,
+            "memory_witness",
+            last_sequence=4,
+            expected_sequence=5,
+            expected_revision=1,
+        )
+
+    metadata_only = update_witness_state(
+        db,
+        "memory_witness",
+        last_run_at="2026-08-04T12:00:00+08:00",
+        expected_sequence=5,
+        expected_revision=1,
+    )
+    assert metadata_only["last_sequence"] == 5
+    assert metadata_only["revision"] == 1
+    assert get_witness_state(db, "memory_witness") == metadata_only
 
 
 def test_witness_search_keeps_rank_separate_from_truth() -> None:

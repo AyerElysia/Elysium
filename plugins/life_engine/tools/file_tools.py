@@ -175,11 +175,8 @@ async def _get_file_lineage_info(
         if node is None:
             return None
 
-        from ..memory.lineage import get_lineage_edges, list_memory_corrections
-
         # 获取演化边
-        outgoing_edges, incoming_edges = await get_lineage_edges(
-            memory_service._db,
+        outgoing_edges, incoming_edges = await memory_service.read_lineage_edges(
             node.node_id,
             min_weight=0.0,
         )
@@ -213,8 +210,7 @@ async def _get_file_lineage_info(
                 })
 
         # 获取修正记录
-        corrections = await list_memory_corrections(
-            memory_service._db,
+        corrections = await memory_service.read_memory_corrections(
             query="",
             related_node_ids=[node.node_id],
             limit=10,

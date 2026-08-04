@@ -21,6 +21,10 @@ from uuid import uuid4
 from .indexing import transaction
 
 
+class ArtifactHeadConflict(RuntimeError):
+    """Raised when an artifact-head compare-and-swap loses ownership."""
+
+
 def _now_iso() -> str:
     return datetime.now(UTC).astimezone().isoformat()
 
@@ -65,6 +69,16 @@ class MemoryArtifactVersion:
     visibility: str = "private"
     parent_artifact_ids: tuple[str, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactHead:
+    """Rebuildable current pointer plus its monotonic CAS revision."""
+
+    logical_key: str
+    artifact_id: str
+    projected_at: str
+    revision: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,6 +271,7 @@ def create_living_memory_schema(db: sqlite3.Connection) -> None:
                 logical_key TEXT PRIMARY KEY,
                 artifact_id TEXT NOT NULL,
                 projected_at TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (artifact_id)
                     REFERENCES memory_artifact_versions(artifact_id)
                     ON DELETE RESTRICT
@@ -389,6 +404,15 @@ def create_living_memory_schema(db: sqlite3.Connection) -> None:
                 ON memory_association_projection(target_ref, context_key, signal);
             """
         )
+        head_columns = {
+            str(row[1])
+            for row in db.execute("PRAGMA table_info(memory_artifact_heads)")
+        }
+        if "revision" not in head_columns:
+            db.execute(
+                "ALTER TABLE memory_artifact_heads "
+                "ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
+            )
         for table in (
             "memory_artifact_versions",
             "memory_artifact_derivations",
@@ -448,8 +472,16 @@ def append_artifact_version(
     version: MemoryArtifactVersion,
     *,
     derivations: Sequence[MemoryDerivation] = (),
+    expected_head_revision: int | None = None,
 ) -> MemoryArtifactVersion:
-    """Append one version and atomically move its rebuildable head projection."""
+    """Append one version and CAS its rebuildable head projection.
+
+    ``expected_head_revision`` is required by backend-neutral callers.  The
+    optional form preserves compatibility for legacy in-process callers while
+    still taking an exact revision snapshot inside the same SQLite write
+    transaction.  A stale explicit expectation never falls back to last-write
+    wins.
+    """
 
     normalized = replace(
         version,
@@ -460,6 +492,23 @@ def append_artifact_version(
     if normalized.content_hash != _content_hash(normalized.content):
         raise ValueError(f"ArtifactContentHashMismatch:{normalized.artifact_id}")
     with transaction(db):
+        head_row = db.execute(
+            """SELECT logical_key, artifact_id, projected_at, revision
+            FROM memory_artifact_heads WHERE logical_key = ?""",
+            (normalized.logical_key,),
+        ).fetchone()
+        current_revision = int(head_row["revision"]) if head_row is not None else 0
+        expected_revision = (
+            current_revision
+            if expected_head_revision is None
+            else max(0, int(expected_head_revision))
+        )
+        if expected_revision != current_revision:
+            raise ArtifactHeadConflict(
+                "artifact head revision conflict: "
+                f"logical_key={normalized.logical_key!r}, "
+                f"expected={expected_revision}, actual={current_revision}"
+            )
         existing = db.execute(
             "SELECT * FROM memory_artifact_versions WHERE artifact_id = ?",
             (normalized.artifact_id,),
@@ -468,70 +517,92 @@ def append_artifact_version(
             persisted = _artifact_from_row(existing)
             if persisted != normalized:
                 raise ValueError(f"ArtifactIdentityConflict:{normalized.artifact_id}")
-            return persisted
-        for parent_id in normalized.parent_artifact_ids:
-            if db.execute(
-                "SELECT 1 FROM memory_artifact_versions WHERE artifact_id = ?",
-                (parent_id,),
-            ).fetchone() is None:
-                raise ValueError(f"ArtifactParentMissing:{parent_id}")
-        db.execute(
-            """INSERT INTO memory_artifact_versions (
-                artifact_id, logical_key, artifact_kind, content, content_hash,
-                recorded_at, valid_from, valid_to, authored_by,
-                consciousness_instance_id, stream_scope, visibility,
-                parent_artifact_ids_json, metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                normalized.artifact_id,
-                normalized.logical_key,
-                normalized.artifact_kind,
-                normalized.content,
-                normalized.content_hash,
-                normalized.recorded_at,
-                normalized.valid_from,
-                normalized.valid_to,
-                normalized.authored_by,
-                normalized.consciousness_instance_id,
-                normalized.stream_scope,
-                normalized.visibility,
-                json.dumps(normalized.parent_artifact_ids, ensure_ascii=False),
-                json.dumps(normalized.metadata, ensure_ascii=False),
-            ),
-        )
-        for derivation in derivations:
-            if derivation.generated_artifact_id != normalized.artifact_id:
-                raise ValueError(
-                    f"ArtifactDerivationTargetMismatch:{derivation.derivation_id}"
-                )
+        else:
+            for parent_id in normalized.parent_artifact_ids:
+                if db.execute(
+                    "SELECT 1 FROM memory_artifact_versions WHERE artifact_id = ?",
+                    (parent_id,),
+                ).fetchone() is None:
+                    raise ValueError(f"ArtifactParentMissing:{parent_id}")
             db.execute(
-                """INSERT INTO memory_artifact_derivations (
-                    derivation_id, generated_artifact_id, used_artifact_id,
-                    predicate, reason, actor, recorded_at, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO memory_artifact_versions (
+                    artifact_id, logical_key, artifact_kind, content, content_hash,
+                    recorded_at, valid_from, valid_to, authored_by,
+                    consciousness_instance_id, stream_scope, visibility,
+                    parent_artifact_ids_json, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    derivation.derivation_id,
-                    derivation.generated_artifact_id,
-                    derivation.used_artifact_id,
-                    derivation.predicate,
-                    derivation.reason,
-                    derivation.actor,
-                    derivation.recorded_at or normalized.recorded_at,
-                    json.dumps(derivation.metadata, ensure_ascii=False),
+                    normalized.artifact_id,
+                    normalized.logical_key,
+                    normalized.artifact_kind,
+                    normalized.content,
+                    normalized.content_hash,
+                    normalized.recorded_at,
+                    normalized.valid_from,
+                    normalized.valid_to,
+                    normalized.authored_by,
+                    normalized.consciousness_instance_id,
+                    normalized.stream_scope,
+                    normalized.visibility,
+                    json.dumps(normalized.parent_artifact_ids, ensure_ascii=False),
+                    json.dumps(normalized.metadata, ensure_ascii=False),
                 ),
             )
-        db.execute(
-            """INSERT INTO memory_artifact_heads
-            (logical_key, artifact_id, projected_at) VALUES (?, ?, ?)
-            ON CONFLICT(logical_key) DO UPDATE SET
-                artifact_id = excluded.artifact_id,
-                projected_at = excluded.projected_at""",
-            (
-                normalized.logical_key,
-                normalized.artifact_id,
-                normalized.recorded_at,
-            ),
-        )
+            for derivation in derivations:
+                if derivation.generated_artifact_id != normalized.artifact_id:
+                    raise ValueError(
+                        f"ArtifactDerivationTargetMismatch:{derivation.derivation_id}"
+                    )
+                db.execute(
+                    """INSERT INTO memory_artifact_derivations (
+                        derivation_id, generated_artifact_id, used_artifact_id,
+                        predicate, reason, actor, recorded_at, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        derivation.derivation_id,
+                        derivation.generated_artifact_id,
+                        derivation.used_artifact_id,
+                        derivation.predicate,
+                        derivation.reason,
+                        derivation.actor,
+                        derivation.recorded_at or normalized.recorded_at,
+                        json.dumps(derivation.metadata, ensure_ascii=False),
+                    ),
+                )
+        if head_row is not None and str(head_row["artifact_id"]) == normalized.artifact_id:
+            return normalized
+        if head_row is None:
+            try:
+                db.execute(
+                    """INSERT INTO memory_artifact_heads
+                    (logical_key, artifact_id, projected_at, revision)
+                    VALUES (?, ?, ?, 1)""",
+                    (
+                        normalized.logical_key,
+                        normalized.artifact_id,
+                        normalized.recorded_at,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ArtifactHeadConflict(
+                    f"artifact head was concurrently created: {normalized.logical_key!r}"
+                ) from exc
+        else:
+            cursor = db.execute(
+                """UPDATE memory_artifact_heads
+                SET artifact_id = ?, projected_at = ?, revision = revision + 1
+                WHERE logical_key = ? AND revision = ?""",
+                (
+                    normalized.artifact_id,
+                    normalized.recorded_at,
+                    normalized.logical_key,
+                    expected_revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ArtifactHeadConflict(
+                    f"artifact head CAS failed: {normalized.logical_key!r}"
+                )
     return normalized
 
 
@@ -590,6 +661,27 @@ def get_artifact_head(
         (logical_key,),
     ).fetchone()
     return _artifact_from_row(row) if row is not None else None
+
+
+def get_artifact_head_state(
+    db: sqlite3.Connection,
+    logical_key: str,
+) -> ArtifactHead | None:
+    """Read the current artifact pointer without loading immutable content."""
+
+    row = db.execute(
+        """SELECT logical_key, artifact_id, projected_at, revision
+        FROM memory_artifact_heads WHERE logical_key = ?""",
+        (logical_key,),
+    ).fetchone()
+    if row is None:
+        return None
+    return ArtifactHead(
+        logical_key=str(row["logical_key"]),
+        artifact_id=str(row["artifact_id"]),
+        projected_at=str(row["projected_at"]),
+        revision=int(row["revision"]),
+    )
 
 
 def list_artifact_heads(
@@ -1157,6 +1249,8 @@ def choose_association_neighbours(
 __all__ = [
     "AssociationEvidence",
     "AssociationSelection",
+    "ArtifactHead",
+    "ArtifactHeadConflict",
     "CoRecallEvent",
     "InterpretationSource",
     "InterpretationSearchResult",
@@ -1175,6 +1269,7 @@ __all__ = [
     "choose_association_neighbours",
     "create_living_memory_schema",
     "get_artifact_head",
+    "get_artifact_head_state",
     "get_interpretation",
     "list_artifact_heads",
     "list_artifact_history",

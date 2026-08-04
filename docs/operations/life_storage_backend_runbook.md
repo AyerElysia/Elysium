@@ -1,6 +1,6 @@
 # 生命域存储快照与权威切换运行手册
 
-本手册服务于 Elysium 生命域可选本地/MySQL 存储。它不包含真实主机、用户名、密码或 fencing token。当前领域适配器尚未全部实现，因此本手册中的正式切换步骤是**验收门**，不是当前可以执行的上线指令。
+本手册服务于 Elysium 生命域可选本地/MySQL 存储。它不包含真实主机、用户名、密码或 fencing token。Memory 的六 Port、local/MySQL 适配与 MySQL schema 已实现，但完整生命域适配、正式数据复制校验、恢复演练和人工切换尚未完成，因此本手册中的正式切换步骤是**验收门**，不是当前可以执行的上线指令。
 
 ## 1. 当前安全状态
 
@@ -99,6 +99,21 @@ max_overflow = 20
 ```
 
 连接密码与 fencing token 只能通过配置中指定的环境变量提供。异常和健康输出使用不含密码的 backend identity。
+
+### 6.1 Memory 隔离合同验证
+
+Memory 的本地合同测试不需要外部服务；真实 MySQL 合同测试必须显式指向专用测试库，并通过以下环境变量提供连接：
+
+- `ELYSIUM_TEST_MYSQL_HOST`
+- `ELYSIUM_TEST_MYSQL_PORT`
+- `ELYSIUM_TEST_MYSQL_DATABASE`
+- `ELYSIUM_TEST_MYSQL_USER`
+- `ELYSIUM_TEST_MYSQL_PASSWORD`
+- `ELYSIUM_TEST_MYSQL_SSL_MODE`
+
+未提供必要变量时，真实 MySQL 用例必须明确显示为 skipped；不得借用正式数据库，也不得把 skipped 记作真实远程验收通过。测试会创建 Memory v1-v6 schema、注册隔离 generation、取得短租约 authority 并在结束时清理本次稳定身份；schema 初始化尚未完成时不得尝试清理尚不存在的领域表。
+
+本阶段只验证适配器合同，不会修改 `storage.enabled`、不会迁移正式数据、不会注册或激活正式 generation，也不会启动或停止 Elysium、NapCat 或其他运行进程。
 
 ## 7. 正式切换验收门
 
