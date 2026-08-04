@@ -101,6 +101,12 @@ class LifeEnginePlugin(BasePlugin):
             *MISSION_TOOLS,
         ]
 
+        minecraft_cfg = getattr(self.config, "minecraft", None)
+        if bool(getattr(minecraft_cfg, "enabled", False)):
+            from ..minecraft.tools import MINECRAFT_TOOLS
+
+            components.extend(MINECRAFT_TOOLS)
+
         # 启用 LifeChatter 时注册对话器及其专用 Action / Tool
         if isinstance(self.config, LifeEngineConfig) and getattr(
             getattr(self.config, "chatter", None), "enabled", False

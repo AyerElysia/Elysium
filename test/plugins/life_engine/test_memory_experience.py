@@ -394,12 +394,15 @@ class _WitnessMemoryStub:
     def __init__(self, *, existing: object | None = None) -> None:
         self.existing = existing
         self.states: list[dict[str, object]] = []
+        self.appended: list[ExperienceRecord] = []
         self.recorded = 0
+        self.recorded_kwargs: list[dict[str, object]] = []
 
     async def get_witness_state(self, _instance_id: str) -> dict[str, object]:
         return {"last_sequence": 0}
 
     async def append_experiences(self, records: list[ExperienceRecord]) -> int:
+        self.appended.extend(records)
         return len(records)
 
     async def list_pending_witness_projections(self, *, limit: int) -> list[object]:
@@ -411,6 +414,7 @@ class _WitnessMemoryStub:
 
     async def record_witness_memory(self, **kwargs: object) -> object:
         self.recorded += 1
+        self.recorded_kwargs.append(kwargs)
         return SimpleNamespace(
             witness_id="witness-1",
             projection_path=kwargs["projection_path"],
@@ -421,13 +425,14 @@ class _WitnessMemoryStub:
 
 
 class _RawStoreStub:
-    def __init__(self, event: LifeEvent) -> None:
-        self.event = event
+    def __init__(self, event: LifeEvent | list[LifeEvent]) -> None:
+        self.events = list(event) if isinstance(event, list) else [event]
+        self.event = self.events[0]
 
     async def read_since(self, sequence: int, *, limit: int) -> list[LifeEvent]:
         assert sequence == 0
         assert limit == 80
-        return [self.event]
+        return list(self.events)
 
 
 def _witness_service_stub(tmp_path: Path, memory: object) -> SimpleNamespace:
@@ -470,6 +475,139 @@ def _witness_service_stub(tmp_path: Path, memory: object) -> SimpleNamespace:
         _get_life_event_store=lambda: store,
         _workspace_dir=lambda: tmp_path,
     )
+
+
+async def test_witness_self_presence_side_effect_is_persisted_without_authoring(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory = _WitnessMemoryStub()
+    service = _witness_service_stub(tmp_path, memory)
+    self_presence = LifeEvent(
+        event_id="presence-1",
+        sequence=1,
+        timestamp="2026-08-04T12:00:00+08:00",
+        source="life_engine.presence",
+        channel="system",
+        event_type="consciousness.instance_seen",
+        content="memory witness lease maintained",
+        stream_id="presence:memory_witness",
+        source_instance_id=MEMORY_WITNESS_INSTANCE_ID,
+    )
+    store = service._get_life_event_store()
+    store.event = self_presence
+    store.events = [self_presence]
+    coordinator = MemoryWitnessCoordinator(service)
+
+    async def _must_not_author(*_args: object) -> str:
+        raise AssertionError("self Presence side effect must not invoke the model")
+
+    monkeypatch.setattr(coordinator, "_author_witness", _must_not_author)
+
+    report = await coordinator.run_once()
+
+    assert [item.sequence for item in memory.appended] == [1]
+    assert memory.appended[0].event_type == "consciousness.instance_seen"
+    assert memory.appended[0].consciousness_instance_id == (MEMORY_WITNESS_INSTANCE_ID)
+    assert memory.recorded == 0
+    assert report.synced_experiences == 1
+    assert report.considered_events == 1
+    assert report.suppressed_self_echo_events == 1
+    assert report.written_witnesses == ()
+    assert report.skipped_scopes == ()
+    assert report.last_sequence == 1
+    assert memory.states[-1]["last_sequence"] == 1
+
+
+async def test_witness_mixed_window_fences_only_own_presence_side_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory = _WitnessMemoryStub()
+    service = _witness_service_stub(tmp_path, memory)
+    events = [
+        LifeEvent(
+            event_id="presence-self",
+            sequence=1,
+            timestamp="2026-08-04T12:00:00+08:00",
+            source="life_engine.presence",
+            channel="system",
+            event_type="consciousness.instance_seen",
+            content="memory witness lease maintained",
+            stream_id="stream-1",
+            source_instance_id=MEMORY_WITNESS_INSTANCE_ID,
+        ),
+        LifeEvent(
+            event_id="presence-other",
+            sequence=2,
+            timestamp="2026-08-04T12:00:01+08:00",
+            source="life_engine.presence",
+            channel="system",
+            event_type="consciousness.instance_seen",
+            content="another consciousness remains present",
+            stream_id="stream-1",
+            source_instance_id="chat_global",
+        ),
+        LifeEvent(
+            event_id="chat-1",
+            sequence=3,
+            timestamp="2026-08-04T12:00:02+08:00",
+            source="chat",
+            channel="chat",
+            event_type="text",
+            content="a retained experience",
+            stream_id="stream-1",
+            source_instance_id="chat_global",
+        ),
+        LifeEvent(
+            event_id="witness-thought-1",
+            sequence=4,
+            timestamp="2026-08-04T12:00:03+08:00",
+            source="life_engine.memory_witness",
+            channel="internal",
+            event_type="reflection",
+            content="the witness's own retained inner experience",
+            stream_id="stream-1",
+            source_instance_id=MEMORY_WITNESS_INSTANCE_ID,
+        ),
+    ]
+    store = service._get_life_event_store()
+    store.event = events[0]
+    store.events = events
+    coordinator = MemoryWitnessCoordinator(service)
+    authored: list[ExperienceRecord] = []
+
+    async def _author(
+        _instance: ConsciousnessInstance,
+        records: list[ExperienceRecord],
+    ) -> str:
+        authored.extend(records)
+        return "a first-person witness"
+
+    async def _project(_witness: object) -> None:
+        return None
+
+    monkeypatch.setattr(coordinator, "_author_witness", _author)
+    monkeypatch.setattr(coordinator, "_project_witness", _project)
+
+    report = await coordinator.run_once()
+
+    assert [item.sequence for item in memory.appended] == [1, 2, 3, 4]
+    assert [item.sequence for item in authored] == [2, 3, 4]
+    assert authored[0].consciousness_instance_id == "chat_global"
+    assert authored[-1].consciousness_instance_id == MEMORY_WITNESS_INSTANCE_ID
+    assert memory.recorded == 1
+    assert memory.recorded_kwargs[0]["source_sequence_start"] == 2
+    assert memory.recorded_kwargs[0]["source_sequence_end"] == 4
+    assert memory.recorded_kwargs[0]["source_event_ids"] == [
+        item.event_id for item in authored
+    ]
+    assert report.synced_experiences == 4
+    assert report.considered_events == 4
+    assert report.suppressed_self_echo_events == 1
+    assert report.written_witnesses == ("witness-1",)
+    assert report.last_sequence == 4
+    assert memory.states[-1]["last_sequence"] == 4
 
 
 @pytest.mark.parametrize(

@@ -337,6 +337,10 @@ class LifeEngineService(BaseService):
         # 三环自学习系统
         self._learning_scheduler = None  # LearningScheduler | None
 
+        # Minecraft 是独立具身运行时，不从属于学习系统。
+        self._minecraft_session: Any | None = None
+        self._minecraft_session_close_lock = asyncio.Lock()
+
         # 状态持久化
         self._state_persistence: StatePersistence | None = None
         self._event_bus: LifeEventBus | None = None
@@ -1029,6 +1033,68 @@ class LifeEngineService(BaseService):
 
         self._get_perception_gateway()
         return self._get_world_projection()
+
+    @property
+    def minecraft_session(self) -> Any | None:
+        """Expose the service-owned Minecraft session without transferring ownership."""
+
+        return self._minecraft_session
+
+    def _create_minecraft_session(self) -> Any:
+        """Construct one inactive Minecraft session from the validated config."""
+
+        from ..minecraft.launcher import MCConfig
+        from ..minecraft.session import MinecraftSession
+
+        section = getattr(self._cfg(), "minecraft", None)
+        if section is None or not bool(getattr(section, "enabled", False)):
+            raise RuntimeError("MinecraftSessionDisabled")
+        raw = section.model_dump() if hasattr(section, "model_dump") else vars(section)
+        fields = set(MCConfig.__dataclass_fields__)
+        values = {name: value for name, value in raw.items() if name in fields}
+        for name in ("mc_home", "agent_token_file", "biomimetic_token_file"):
+            if name in values:
+                values[name] = Path(values[name])
+        config = MCConfig(**values)
+        return MinecraftSession(
+            workspace=self._workspace_dir(),
+            mc_config=config,
+            consciousness_registry=self.consciousness_registry,
+            save_consciousness_registry=self.save_consciousness_registry_async,
+            prepare_perception=self.prepare_perception,
+            commit_perception=self.commit_perception,
+            report_world_observation=self.report_world_observation,
+        )
+
+    async def _initialize_minecraft_session(self) -> None:
+        """Acquire the optional service-owned session exactly once."""
+
+        section = getattr(self._cfg(), "minecraft", None)
+        if section is None or not bool(getattr(section, "enabled", False)):
+            return
+        if self._minecraft_session is not None:
+            return
+        session = self._create_minecraft_session()
+        self._minecraft_session = session
+        logger.info("Minecraft evidence-driven embodiment initialized")
+
+    async def _close_minecraft_session(self) -> None:
+        """Idempotently release the owned session while retaining failed cleanup."""
+
+        async with self._minecraft_session_close_lock:
+            session = self._minecraft_session
+            if session is None:
+                return
+            close = getattr(session, "close", None)
+            if callable(close):
+                result = await close()
+                if isinstance(result, dict) and result.get("success") is False:
+                    raise RuntimeError("MinecraftSessionCloseFailed")
+            else:
+                # Compatibility for the current consumer until its idempotent
+                # close() contract lands; stop() is already async.
+                await session.stop()
+            self._minecraft_session = None
 
     def resolve_consciousness_instance(self, stream_id: str = "") -> str:
         """Resolve a trusted runtime instance from current stream ownership."""
@@ -6103,6 +6169,10 @@ class LifeEngineService(BaseService):
 
         await self._start_selected_storage()
 
+        # Minecraft is a scene capability owned by the service.  It must be
+        # available even when the optional learning system is disabled.
+        await self._initialize_minecraft_session()
+
         # 初始化三环自学习系统
         learning_cfg = getattr(cfg, "learning", None)
         if learning_cfg is None or getattr(learning_cfg, "enabled", True):
@@ -6147,33 +6217,6 @@ class LifeEngineService(BaseService):
                     reflection_cooldown_minutes=float(getattr(learning_cfg, "reflection_cooldown_minutes", 30.0) if learning_cfg else 30.0),
                     skill_distill_trigger_count=int(getattr(learning_cfg, "skill_distill_trigger_count", 3) if learning_cfg else 3),
                     skill_distill_interval_hours=float(getattr(learning_cfg, "skill_distill_interval_hours", 24.0) if learning_cfg else 24.0),
-                    minecraft_enabled=bool(getattr(cfg, "minecraft", None) and cfg.minecraft.enabled),
-                    consciousness_registry=self.consciousness_registry,
-                    save_consciousness_registry=(
-                        self.save_consciousness_registry_async
-                    ),
-                    prepare_perception=self.prepare_perception,
-                    commit_perception=self.commit_perception,
-                    report_world_observation=self.report_world_observation,
-                    minecraft_config={
-                        "java_path": cfg.minecraft.java_path,
-                        "mc_version": cfg.minecraft.mc_version,
-                        "world_name": cfg.minecraft.world_name,
-                        "window_width": cfg.minecraft.window_width,
-                        "window_height": cfg.minecraft.window_height,
-                        "vla_model": cfg.minecraft.vla_model,
-                        "offline_username": cfg.minecraft.offline_username,
-                        "default_body": cfg.minecraft.default_body,
-                        "agent_bridge_uri": cfg.minecraft.agent_bridge_uri,
-                        "agent_bridge_listen_uri": cfg.minecraft.agent_bridge_listen_uri,
-                        "agent_token_file": Path(cfg.minecraft.agent_token_file),
-                        "biomimetic_bridge_uri": cfg.minecraft.biomimetic_bridge_uri,
-                        "biomimetic_bridge_listen_uri": cfg.minecraft.biomimetic_bridge_listen_uri,
-                        "biomimetic_token_file": Path(cfg.minecraft.biomimetic_token_file),
-                        "planner_task_name": cfg.minecraft.planner_task_name,
-                        "bridge_ready_timeout_seconds": cfg.minecraft.bridge_ready_timeout_seconds,
-                        "intent_timeout_seconds": cfg.minecraft.intent_timeout_seconds,
-                    } if getattr(cfg, "minecraft", None) and cfg.minecraft.enabled else None,
                 )
                 await self._learning_scheduler.initialize()
                 logger.info("三环自学习系统已初始化")
@@ -6420,6 +6463,12 @@ class LifeEngineService(BaseService):
         self._memory_index_task_id = None
         await self._await_managed_task(self._heartbeat_task_id, timeout=5.0)
         self._heartbeat_task_id = None
+
+        try:
+            await self._close_minecraft_session()
+        except Exception as exc:  # noqa: BLE001 - continue owned cleanup
+            shutdown_errors.append(exc)
+            logger.error(f"关闭 Minecraft 运行时失败: {type(exc).__name__}")
 
         learning_scheduler = self._learning_scheduler
         if learning_scheduler is not None:

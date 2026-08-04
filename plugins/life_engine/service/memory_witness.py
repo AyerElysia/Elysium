@@ -37,8 +37,25 @@ MEMORY_WITNESS_INSTANCE_ID = "memory_witness"
 _NO_WITNESS = "<no_witness>"
 _TRANSIENT_ERROR_ESCALATION_COUNT = 3
 
-# Every retained life event remains available as experience evidence.  The
-# witness consciousness, not a code whitelist, decides what deserves a diary.
+_SELF_PRESENCE_SIDE_EFFECT_EVENT_TYPES = frozenset(
+    {
+        "consciousness.instance_imported",
+        "consciousness.instance_imported_suspended",
+        "consciousness.instance_lease_expired",
+        "consciousness.instance_registered",
+        "consciousness.instance_resumed",
+        "consciousness.instance_seen",
+        "consciousness.instance_suspended",
+        "consciousness.instance_taken_over",
+        "consciousness.instance_terminated",
+    }
+)
+
+
+# Every retained life event remains available as experience evidence. Exact
+# Presence protocol events caused by the witness maintaining its own lease are
+# fenced only from that same witness's authoring window: this breaks a causal
+# feedback loop without classifying the event's semantic importance.
 def _transient_error_summary(exc: BaseException) -> str:
     """Describe an upstream failure without dumping response bodies or traces."""
 
@@ -57,6 +74,7 @@ def _transient_error_summary(exc: BaseException) -> str:
 class WitnessRunReport:
     synced_experiences: int = 0
     considered_events: int = 0
+    suppressed_self_echo_events: int = 0
     written_witnesses: tuple[str, ...] = ()
     skipped_scopes: tuple[str, ...] = ()
     last_sequence: int = 0
@@ -228,10 +246,22 @@ class MemoryWitnessCoordinator:
                 synced = await memory.append_experiences(candidates)
                 experiences = candidates
 
+            witnessable_experiences = [
+                item
+                for item in experiences
+                if not self._is_self_presence_side_effect(
+                    item,
+                    instance_id=instance.instance_id,
+                )
+            ]
+            suppressed_self_echo_events = len(experiences) - len(
+                witnessable_experiences
+            )
+
             written: list[str] = []
             skipped: list[str] = []
-            if experiences:
-                for scope, items in self._group_by_stream(experiences):
+            if witnessable_experiences:
+                for scope, items in self._group_by_stream(witnessable_experiences):
                     projection_path = self._projection_path(items)
                     existing = await memory.get_witness_by_projection_path(
                         projection_path
@@ -294,6 +324,7 @@ class MemoryWitnessCoordinator:
             return WitnessRunReport(
                 synced_experiences=synced,
                 considered_events=len(raw_events),
+                suppressed_self_echo_events=suppressed_self_echo_events,
                 written_witnesses=tuple(written),
                 skipped_scopes=tuple(skipped),
                 last_sequence=max_sequence,
@@ -371,6 +402,21 @@ class MemoryWitnessCoordinator:
             (scope, sorted(items, key=lambda item: (item.sequence, item.event_id)))
             for scope, items in sorted(buckets.items())
         ]
+
+    @staticmethod
+    def _is_self_presence_side_effect(
+        record: ExperienceRecord,
+        *,
+        instance_id: str,
+    ) -> bool:
+        """Fence only the witness's own Presence protocol feedback events."""
+
+        return (
+            record.channel == "system"
+            and record.source == "life_engine.presence"
+            and record.consciousness_instance_id == instance_id
+            and record.event_type in _SELF_PRESENCE_SIDE_EFFECT_EVENT_TYPES
+        )
 
     async def _author_witness(
         self,
