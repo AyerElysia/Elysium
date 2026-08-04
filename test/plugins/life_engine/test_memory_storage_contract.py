@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
@@ -30,6 +31,7 @@ from plugins.life_engine.storage.memory import (
     create_local_memory_storage_bundle,
     memory_store_characterizations,
 )
+from plugins.life_engine.storage.memory import mysql as mysql_memory
 from plugins.life_engine.storage.memory.schema import (
     MEMORY_MIGRATIONS,
     MEMORY_SCHEMA_VERSION,
@@ -109,8 +111,17 @@ def test_memory_characterization_is_ordered_and_engineering_only() -> None:
 
 
 def test_mysql_memory_migrations_are_explicit_and_ordered() -> None:
-    assert MEMORY_SCHEMA_VERSION == 6
-    assert tuple(item.version for item in MEMORY_MIGRATIONS) == (1, 2, 3, 4, 5, 6)
+    assert MEMORY_SCHEMA_VERSION == 8
+    assert tuple(item.version for item in MEMORY_MIGRATIONS) == (
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+    )
     ddl = "\n".join(
         statement
         for migration in MEMORY_MIGRATIONS
@@ -125,7 +136,135 @@ def test_mysql_memory_migrations_are_explicit_and_ordered() -> None:
         "memory_edges",
     ):
         assert f"CREATE TABLE IF NOT EXISTS {table}" in ddl
+    for column in (
+        "is_deleted",
+        "event_date",
+        "fts_content_hash",
+        "embedding_content_hash",
+        "embedding_model",
+        "embedding_updated_at",
+        "legacy_fts_present",
+    ):
+        assert f"ADD COLUMN {column}" in ddl
+    assert "projection_path_sha256 CHAR(64)" in ddl
+    assert "UNIQUE KEY uq_memory_witness_projection_path_hash" in ddl
+    assert "UNIQUE KEY uq_memory_witness_projection_path (projection_path)" not in ddl
+    assert ddl.count("`signal` VARCHAR(512)") == 2
+    assert (
+        "content LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL"
+        in ddl
+    )
+    assert "life_memory_lossless_json_text_v1" in {
+        migration.name for migration in MEMORY_MIGRATIONS
+    }
+    assert "MODIFY COLUMN metadata_json LONGTEXT NOT NULL" in ddl
     assert "universal" not in ddl.lower()
+
+
+@pytest.mark.asyncio
+async def test_mysql_witness_projection_path_hash_never_replaces_full_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Mappings:
+        def __init__(self, row: dict[str, str] | None) -> None:
+            self._row = row
+
+        def one_or_none(self) -> dict[str, str] | None:
+            return self._row
+
+    class _Result:
+        def __init__(self, row: dict[str, str] | None) -> None:
+            self._row = row
+
+        def mappings(self) -> _Mappings:
+            return _Mappings(self._row)
+
+    class _Session:
+        def __init__(self, row: dict[str, str] | None) -> None:
+            self._row = row
+            self.parameters: dict[str, str] = {}
+
+        async def execute(self, _statement: object, parameters: dict[str, str]) -> _Result:
+            self.parameters = parameters
+            return _Result(self._row)
+
+    monkeypatch.setattr(mysql_memory, "_sha256", lambda _value: "a" * 64)
+    free = _Session(None)
+    digest = await mysql_memory._assert_projection_path_available(
+        free,  # type: ignore[arg-type]
+        witness_id="witness-new",
+        projection_path="notes/new.md",
+    )
+    assert digest == "a" * 64
+    assert free.parameters == {"projection_path_sha256": "a" * 64}
+
+    collision = _Session(
+        {"witness_id": "witness-old", "projection_path": "notes/old.md"}
+    )
+    with pytest.raises(
+        mysql_memory.ImmutableMemoryRecordConflict,
+        match="WitnessProjectionPathHashCollision",
+    ):
+        await mysql_memory._assert_projection_path_available(
+            collision,  # type: ignore[arg-type]
+            witness_id="witness-new",
+            projection_path="notes/new.md",
+        )
+
+    same_witness_collision = _Session(
+        {"witness_id": "witness-new", "projection_path": "notes/old.md"}
+    )
+    with pytest.raises(
+        mysql_memory.ImmutableMemoryRecordConflict,
+        match="WitnessProjectionPathHashCollision",
+    ):
+        await mysql_memory._assert_projection_path_available(
+            same_witness_collision,  # type: ignore[arg-type]
+            witness_id="witness-new",
+            projection_path="notes/new.md",
+        )
+
+
+@pytest.mark.asyncio
+async def test_mysql_immutable_insert_quotes_signal_identifier() -> None:
+    class _Mappings:
+        def one_or_none(self) -> None:
+            return None
+
+    class _Result:
+        def mappings(self) -> _Mappings:
+            return _Mappings()
+
+    class _Session:
+        def __init__(self) -> None:
+            self.statements: list[str] = []
+
+        async def execute(self, statement: object, _parameters: object) -> _Result:
+            self.statements.append(str(statement))
+            return _Result()
+
+    session = _Session()
+    runtime = SimpleNamespace(
+        enabled=True,
+        backend=mysql_memory.BackendKind.MYSQL,
+        engine=object(),
+    )
+    port = mysql_memory._MySQLPort(runtime)  # type: ignore[arg-type]
+    inserted = await port._immutable_insert(
+        session,  # type: ignore[arg-type]
+        table="memory_corecall_events",
+        identity_column="corecall_id",
+        identity="corecall-1",
+        values={
+            "corecall_id": "corecall-1",
+            "signal": "co-occurrence",
+            "payload_sha256": "b" * 64,
+        },
+        payload_sha256="b" * 64,
+    )
+
+    assert inserted is True
+    assert "`signal`" in session.statements[1]
 
 
 @pytest.mark.asyncio

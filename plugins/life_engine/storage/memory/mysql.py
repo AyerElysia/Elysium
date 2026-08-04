@@ -248,9 +248,12 @@ class _MySQLPort:
                 )
             return False
         columns = tuple(values)
+        sql_columns = tuple(
+            "`signal`" if column == "signal" else column for column in columns
+        )
         await session.execute(
             text(
-                f"INSERT INTO {table} ({', '.join(columns)}) VALUES "
+                f"INSERT INTO {table} ({', '.join(sql_columns)}) VALUES "
                 f"({', '.join(':' + column for column in columns)})"
             ),
             values,
@@ -1806,6 +1809,44 @@ async def _witness_from_row(
     )
 
 
+async def _assert_projection_path_available(
+    session: AsyncSession,
+    *,
+    witness_id: str,
+    projection_path: str,
+) -> str | None:
+    """Reserve one full path by its indexable digest without trusting the digest."""
+
+    if not projection_path:
+        return None
+    projection_path_sha256 = _sha256(projection_path)
+    existing = (
+        (
+            await session.execute(
+                text(
+                    "SELECT witness_id, projection_path FROM memory_witnesses "
+                    "WHERE projection_path_sha256 = :projection_path_sha256 "
+                    "FOR UPDATE"
+                ),
+                {"projection_path_sha256": projection_path_sha256},
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if existing is None:
+        return projection_path_sha256
+    if str(existing["projection_path"] or "") != projection_path:
+        raise ImmutableMemoryRecordConflict(
+            "WitnessProjectionPathHashCollision: digest matched a different full path"
+        )
+    if str(existing["witness_id"]) == witness_id:
+        return projection_path_sha256
+    raise ImmutableMemoryRecordConflict(
+        "WitnessProjectionPathConflict: path already belongs to another witness"
+    )
+
+
 class _MySQLWitnessAppendStore(_MySQLPort):
     async def append(self, **kwargs: Any) -> WitnessMemory:
         source_ids = tuple(
@@ -1855,12 +1896,21 @@ class _MySQLWitnessAppendStore(_MySQLPort):
         payload_sha256 = _record_hash(hash_body)
 
         async def _operation(session: AsyncSession) -> WitnessMemory:
+            projection_path_sha256 = await _assert_projection_path_available(
+                session,
+                witness_id=witness_id,
+                projection_path=str(values["projection_path"] or ""),
+            )
             inserted = await self._immutable_insert(
                 session,
                 table="memory_witnesses",
                 identity_column="witness_id",
                 identity=witness_id,
-                values={**values, "payload_sha256": payload_sha256},
+                values={
+                    **values,
+                    "projection_path_sha256": projection_path_sha256,
+                    "payload_sha256": payload_sha256,
+                },
                 payload_sha256=payload_sha256,
             )
             if inserted:
@@ -2533,7 +2583,7 @@ class MySQLLivingMemoryStore(_MySQLPort):
                             "WHERE (source_ref_sha256 = :ref_hash "
                             "OR target_ref_sha256 = :ref_hash)"
                             + context_clause
-                            + " ORDER BY last_event_at DESC, event_count DESC, signal"
+                            + " ORDER BY last_event_at DESC, event_count DESC, `signal`"
                         ),
                         params,
                     )
@@ -2621,7 +2671,7 @@ class MySQLLivingMemoryStore(_MySQLPort):
                                 source_ref_sha256, source_ref,
                                 target_ref_sha256, target_ref,
                                 context_key_sha256, context_key,
-                                signal, signal_sha256, event_count, last_event_at
+                                `signal`, signal_sha256, event_count, last_event_at
                             ) VALUES (
                                 :source_hash, :source_ref,
                                 :target_hash, :target_ref,
@@ -2756,7 +2806,7 @@ class MySQLLivingMemoryStore(_MySQLPort):
                                 source_ref_sha256, source_ref,
                                 target_ref_sha256, target_ref,
                                 context_key_sha256, context_key,
-                                signal, signal_sha256, event_count, last_event_at
+                                `signal`, signal_sha256, event_count, last_event_at
                             ) VALUES (
                                 :source_hash, :source_ref,
                                 :target_hash, :target_ref,
@@ -2793,15 +2843,22 @@ class _MySQLWitnessProjectionStore(_MySQLWitnessAppendStore):
         error: str = "",
     ) -> bool:
         async def _operation(session: AsyncSession) -> bool:
+            projection_path_sha256 = await _assert_projection_path_available(
+                session,
+                witness_id=witness_id,
+                projection_path=projection_path,
+            )
             result = await session.execute(
                 text(
                     "UPDATE memory_witnesses SET projection_path = :projection_path, "
+                    "projection_path_sha256 = :projection_path_sha256, "
                     "projection_status = :status, projection_error = :error "
                     "WHERE witness_id = :witness_id"
                 ),
                 {
                     "witness_id": witness_id,
                     "projection_path": projection_path or None,
+                    "projection_path_sha256": projection_path_sha256,
                     "status": status,
                     "error": error,
                 },
@@ -4455,6 +4512,7 @@ class MySQLWitnessLedgerStore(_MySQLWitnessProjectionStore):
         self,
         projection_path: str,
     ) -> WitnessMemory | None:
+        projection_path_sha256 = _sha256(projection_path)
         assert self.runtime.engine is not None
         async with self.runtime.engine.connect() as connection:
             row = (
@@ -4462,14 +4520,18 @@ class MySQLWitnessLedgerStore(_MySQLWitnessProjectionStore):
                     await connection.execute(
                         text(
                             "SELECT * FROM memory_witnesses "
-                            "WHERE projection_path = :projection_path"
+                            "WHERE projection_path_sha256 = :projection_path_sha256"
                         ),
-                        {"projection_path": projection_path},
+                        {"projection_path_sha256": projection_path_sha256},
                     )
                 )
                 .mappings()
                 .one_or_none()
             )
+            if row is not None and str(row["projection_path"] or "") != projection_path:
+                raise ImmutableMemoryRecordConflict(
+                    "WitnessProjectionPathHashCollision: digest matched a different full path"
+                )
             return (
                 await _witness_from_row(connection, row)  # type: ignore[arg-type]
                 if row is not None

@@ -1,8 +1,10 @@
 """Versioned MySQL schema for selectable Life Memory storage.
 
-The schema deliberately keeps each memory ontology in explicit tables.  JSON
-is used only for open metadata and ordered reference collections; it is never
-used as a universal record envelope that would erase domain constraints.
+The schema deliberately keeps each memory ontology in explicit tables.
+Canonical JSON text is used only for open metadata and ordered reference
+collections; it is never used as a universal record envelope that would erase
+domain constraints.  LONGTEXT preserves the exact canonical decimal spelling
+that MySQL's native JSON binary representation would otherwise round.
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ from src.kernel.storage.migration_runner import MySQLMigrationRunner, SchemaMigr
 from ..contracts import StorageBackendRuntime
 from ..models import BackendKind
 
-MEMORY_SCHEMA_VERSION = 6
+MEMORY_SCHEMA_VERSION = 8
 
 _DOCUMENT_INDEX = SchemaMigration(
     version=1,
@@ -157,11 +159,15 @@ _WITNESS = SchemaMigration(
             source_sequence_end BIGINT UNSIGNED NOT NULL,
             model_task_name VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
             projection_path VARCHAR(1024) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL,
+            projection_path_sha256 CHAR(64)
+                CHARACTER SET ascii COLLATE ascii_bin NULL,
             projection_status VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
             projection_error TEXT NOT NULL,
             metadata_json JSON NOT NULL,
             payload_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-            UNIQUE KEY uq_memory_witness_projection_path (projection_path),
+            UNIQUE KEY uq_memory_witness_projection_path_hash (
+                projection_path_sha256
+            ),
             KEY idx_memory_witness_scope_time (stream_scope, recorded_at),
             KEY idx_memory_witness_status (status, epistemic_kind)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci""",
@@ -251,7 +257,7 @@ _LIVING = SchemaMigration(
         """CREATE TABLE IF NOT EXISTS memory_interpretations (
             interpretation_id VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
             subject_id VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
-            content LONGTEXT NOT NULL,
+            content LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
             authored_by VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
             consciousness_instance_id VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
             recorded_at VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
@@ -328,7 +334,7 @@ _LIVING = SchemaMigration(
             corecall_id VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
             episode_id VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
             context_key VARCHAR(1024) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
-            signal VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            `signal` VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
             entity_refs_json JSON NOT NULL,
             actor VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
             reason TEXT NOT NULL,
@@ -346,7 +352,7 @@ _LIVING = SchemaMigration(
             target_ref VARCHAR(1024) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
             context_key_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
             context_key VARCHAR(1024) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
-            signal VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            `signal` VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
             signal_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
             event_count BIGINT UNSIGNED NOT NULL,
             last_event_at VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
@@ -364,7 +370,7 @@ _EPISTEMIC = SchemaMigration(
             claim_id VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
             subject_key VARCHAR(1024) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
             subject_key_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-            content LONGTEXT NOT NULL,
+            content LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
             claim_kind VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
             source VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
             authority VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
@@ -535,6 +541,57 @@ _LEGACY_GRAPH = SchemaMigration(
     ),
 )
 
+_NODE_HISTORY = SchemaMigration(
+    version=7,
+    name="life_memory_node_history_v1",
+    statements=(
+        """ALTER TABLE memory_nodes
+            ADD COLUMN event_date VARCHAR(64)
+                CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL,
+            ADD COLUMN is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+            ADD COLUMN fts_content_hash CHAR(64)
+                CHARACTER SET ascii COLLATE ascii_bin NULL,
+            ADD COLUMN embedding_content_hash CHAR(64)
+                CHARACTER SET ascii COLLATE ascii_bin NULL,
+            ADD COLUMN embedding_model VARCHAR(255)
+                CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '',
+            ADD COLUMN embedding_updated_at DOUBLE NULL,
+            ADD COLUMN legacy_fts_present BOOLEAN NOT NULL DEFAULT FALSE""",
+        """CREATE INDEX idx_memory_nodes_live_type
+            ON memory_nodes (is_deleted, node_type)""",
+    ),
+)
+
+_LOSSLESS_JSON_TEXT = SchemaMigration(
+    version=8,
+    name="life_memory_lossless_json_text_v1",
+    statements=(
+        "ALTER TABLE memory_schema MODIFY COLUMN metadata_json LONGTEXT NOT NULL",
+        "ALTER TABLE memory_experiences MODIFY COLUMN metadata_json LONGTEXT NOT NULL",
+        "ALTER TABLE memory_witnesses MODIFY COLUMN metadata_json LONGTEXT NOT NULL",
+        """ALTER TABLE memory_artifact_versions
+            MODIFY COLUMN parent_artifact_ids_json LONGTEXT NOT NULL,
+            MODIFY COLUMN metadata_json LONGTEXT NOT NULL""",
+        "ALTER TABLE memory_artifact_derivations MODIFY COLUMN metadata_json LONGTEXT NOT NULL",
+        "ALTER TABLE memory_interpretations MODIFY COLUMN metadata_json LONGTEXT NOT NULL",
+        "ALTER TABLE memory_interpretation_sources MODIFY COLUMN metadata_json LONGTEXT NOT NULL",
+        "ALTER TABLE memory_semantic_relations MODIFY COLUMN metadata_json LONGTEXT NOT NULL",
+        "ALTER TABLE memory_recall_sessions MODIFY COLUMN context_json LONGTEXT NOT NULL",
+        "ALTER TABLE memory_recall_events MODIFY COLUMN metadata_json LONGTEXT NOT NULL",
+        """ALTER TABLE memory_corecall_events
+            MODIFY COLUMN entity_refs_json LONGTEXT NOT NULL,
+            MODIFY COLUMN metadata_json LONGTEXT NOT NULL""",
+        "ALTER TABLE memory_claims MODIFY COLUMN metadata_json LONGTEXT NOT NULL",
+        "ALTER TABLE memory_claim_evidence MODIFY COLUMN metadata_json LONGTEXT NOT NULL",
+        "ALTER TABLE memory_beliefs MODIFY COLUMN metadata_json LONGTEXT NOT NULL",
+        "ALTER TABLE memory_epistemic_conflicts MODIFY COLUMN metadata_json LONGTEXT NOT NULL",
+        "ALTER TABLE memory_state_events MODIFY COLUMN payload_json LONGTEXT NOT NULL",
+        "ALTER TABLE memory_retrieval_episodes MODIFY COLUMN metadata_json LONGTEXT NOT NULL",
+        "ALTER TABLE memory_retrieval_exposures MODIFY COLUMN metadata_json LONGTEXT NOT NULL",
+        "ALTER TABLE memory_retrieval_feedback MODIFY COLUMN metadata_json LONGTEXT NOT NULL",
+    ),
+)
+
 MEMORY_MIGRATIONS = (
     _DOCUMENT_INDEX,
     _EXPERIENCE,
@@ -542,6 +599,8 @@ MEMORY_MIGRATIONS = (
     _LIVING,
     _EPISTEMIC,
     _LEGACY_GRAPH,
+    _NODE_HISTORY,
+    _LOSSLESS_JSON_TEXT,
 )
 
 

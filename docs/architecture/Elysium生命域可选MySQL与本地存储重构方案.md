@@ -3,10 +3,16 @@
 > 状态：分阶段实施中。阶段 0/1 的通用存储基座已落地；阶段 2 的 Presence/World 正在收口，Life Memory 六 Port、local/MySQL 双适配、MySQL 领域 schema 与现役服务接线已落地。Life Engine 唯一拥有 coherent runtime，Memory 只消费注入 runtime；启用后缺少 runtime 必须 fail closed，MySQL 模式不得回落或双写 SQLite。阶段 3 的 Life Event Port、双适配、候选复制控制面、逐字节迁移与反向导出已落地。已把一份未冻结在线快照的 86,094 条 Life Event 复制到远程 MySQL 并完成 0 差异往返恢复演练，但该批次仅为 `copied`，不是 `verified`，也未激活。当前正式运行权威仍是既有本地 SQLite/文件，禁止据此状态直接切换到 MySQL。
 >
 > 目标：在不改变爱莉主体语义、不丢失不可变历史、不把 Chroma 误作权威存储的前提下，为 Elysium 建立行为等价的本地与 MySQL 两套耐久存储后端。迁移采用“复制、校验、可选切换”，绝不移动、删除或改写原 SQLite、Markdown、JSON、JSONL 与媒体数据文件。
+
+> Memory 迁移进展（2026-08-04）：MySQL schema 已演进到 v8，并完成真实
+> shadow 往返验证。32 张显式表、210,104 条记录、76 个删除节点及其 1,936 条
+> 关联边在源 SQLite、MySQL 与反向 SQLite 中根哈希一致。该证据来自
+> `writer_frozen=false` 快照且数据库级不可变 trigger 不可用，因此证明“可无损
+> 复制和恢复”，不证明“可激活切换”。
 >
 > 适用基线：以项目实施时实际受支持的 Python、SQLAlchemy、asyncmy、MySQL 与 Chroma 版本为准；运行时版本升级或降级不属于本存储重构范围。
 
-阶段 0/1 的实现与真实数据证据见 [生命域可选存储阶段 0/1 交付报告](../report/life-storage-phase0-phase1-2026-08-04.md)，Memory 阶段 2 见 [生命域可选存储阶段 2 / Memory 交付报告](../report/life-storage-phase2-memory-2026-08-04.md)，Life Event 阶段 3 见 [Life Event Ledger 交付报告](../report/life-storage-phase3-life-event-2026-08-04.md)，操作边界见 [生命域存储快照与权威切换运行手册](../operations/life_storage_backend_runbook.md)。平台开关保持默认关闭；在各领域合同测试、逐记录复制校验、恢复演练和人工切换门全部通过前，`storage.enabled` 必须为 `false`。
+阶段 0/1 的实现与真实数据证据见 [生命域可选存储阶段 0/1 交付报告](../report/life-storage-phase0-phase1-2026-08-04.md)，Memory 阶段 2 见 [生命域可选存储阶段 2 / Memory 交付报告](../report/life-storage-phase2-memory-2026-08-04.md)，真实 Memory 往返迁移见 [生命域可选存储阶段 2B / Memory 迁移报告](../report/life-storage-phase2b-memory-migration-2026-08-04.md)，Life Event 阶段 3 见 [Life Event Ledger 交付报告](../report/life-storage-phase3-life-event-2026-08-04.md)，操作边界见 [生命域存储快照与权威切换运行手册](../operations/life_storage_backend_runbook.md)。平台开关保持默认关闭；在各领域合同测试、逐记录复制校验、恢复演练和人工切换门全部通过前，`storage.enabled` 必须为 `false`。
 
 ## 1. 决策摘要
 

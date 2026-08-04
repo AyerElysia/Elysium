@@ -113,7 +113,7 @@ Memory 的本地合同测试不需要外部服务；真实 MySQL 合同测试必
 - `ELYSIUM_TEST_MYSQL_PASSWORD`
 - `ELYSIUM_TEST_MYSQL_SSL_MODE`
 
-未提供必要变量时，真实 MySQL 用例必须明确显示为 skipped；不得借用正式数据库，也不得把 skipped 记作真实远程验收通过。测试会创建 Memory v1-v6 schema、注册隔离 generation、取得短租约 authority 并在结束时清理本次稳定身份；schema 初始化尚未完成时不得尝试清理尚不存在的领域表。
+未提供必要变量时，真实 MySQL 用例必须明确显示为 skipped；不得借用正式数据库，也不得把 skipped 记作真实远程验收通过。测试会创建 Memory v1-v8 schema、注册隔离 generation、取得短租约 authority 并在结束时清理本次稳定身份；schema 初始化尚未完成时不得尝试清理尚不存在的领域表。
 
 ### 6.2 Presence/World 隔离合同验证
 
@@ -191,6 +191,40 @@ uv run python scripts/audit_life_subject_shadow.py \
 工作区投影必须遵守 parent-hash 门：目标文件等于新版本时幂等确认；等于已知
 parent 时才允许原子替换；任何其他字节都视为外部变化并保留原文件，随后由
 observer 追加为新观察。禁止为了“让数据库和文件一致”而覆盖未知外部改动。
+
+### 6.5 Life Memory 无损候选复制
+
+Life Memory 使用显式的 32 表选择合同，不复制 SQLite FTS 内部影子表，也不把
+Chroma 当作权威。候选复制命令为：
+
+```bash
+uv run python scripts/migrate_life_memory.py \
+  --snapshot /absolute/life-domain-candidate \
+  --run-id life-memory-shadow-<manifest-prefix> \
+  --reverse-export /new/life-memory-reverse-export
+```
+
+连接信息只允许通过 `ELYSIUM_LIFE_STORAGE_MYSQL_HOST/PORT/DATABASE/USER/PASSWORD`
+环境变量提供。Memory schema v7 保留节点删除历史、事件日期、旧 FTS/embedding
+可逆投影字段；v8 把开放元数据保存为规范 JSON 的 `LONGTEXT` 原文，避免 MySQL
+原生 JSON 改写高精度小数。见证投影路径使用 SHA-256 作为可索引派生列，但查询
+命中后必须核对完整路径，hash 永远不替代路径身份。
+
+只读独立复核使用：
+
+```bash
+uv run python scripts/audit_life_memory_shadow.py \
+  --snapshot /absolute/life-domain-candidate \
+  --reverse-export /absolute/life-memory-reverse-export
+```
+
+当前已验证恢复副本位于
+`C:\Temp\Data\ElysiumBackups\life-memory-reverse-20260804T0920Z-v2`。
+源 SQLite、MySQL 与反向 SQLite 均包含 32 张显式表、210,104 条记录，总根均为
+`4703c2dc18470d16b9e4363f8b8c6a8b3d0f8cfda433baf1deddb9787951cf9c`；
+76 个删除节点及其 1,936 条关联边完整保留。该快照仍是
+`writer_frozen=false`，远端账号也不能创建数据库级不可变 trigger，因此只可作为
+不可激活的 shadow，不得据此切换生产。
 
 ## 7. 正式切换验收门
 
