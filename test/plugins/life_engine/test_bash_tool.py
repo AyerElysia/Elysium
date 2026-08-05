@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import shlex
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -58,10 +59,12 @@ def test_bash_tool_mounts_workspace_read_only_even_for_python(tmp_path: Path) ->
     target = tmp_path / "MEMORY.md"
     target.write_text("original\n", encoding="utf-8")
     tool = _make_tool(tmp_path)
+    python3 = exec_tools.shutil.which("python3")
+    assert python3 is not None
 
     ok, payload = asyncio.run(
         tool.execute(
-            "python -c \"from pathlib import Path; "
+            f"{shlex.quote(python3)} -c \"from pathlib import Path; "
             "Path('MEMORY.md').write_text('bypass')\""
         )
     )
