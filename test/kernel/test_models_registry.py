@@ -29,6 +29,8 @@ EXPECTED_TASK_BUDGETS = {
     "router_context_projection": 16000,
     "live": 32000,
 }
+GPT_PRIORITY = ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol")
+GENERATIVE_TASKS = set(EXPECTED_TASK_BUDGETS) - {"voice", "embedding"}
 
 
 def test_models_example_is_complete_and_budgeted() -> None:
@@ -59,15 +61,13 @@ def test_router_tasks_are_cloud_first_and_keep_reasoning_budget() -> None:
     assert "qwen3-0.6b-router" not in config.tasks["router"]["models"]
 
 
-def test_unverified_gpt_models_are_registered_but_not_automatic() -> None:
+def test_qualified_gpt_models_lead_every_generative_task() -> None:
     registry_path = Path(__file__).parents[2] / "config" / "models.toml.example"
     config = ModelsConfig(registry_path)
 
-    assert {"gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"}.issubset(config.models)
-    automatic_models = {
-        model_name for task in config.tasks.values() for model_name in task["models"]
-    }
-    assert not any(name.startswith("gpt-5.6-") for name in automatic_models)
+    assert set(GPT_PRIORITY).issubset(config.models)
+    for task_name in GENERATIVE_TASKS:
+        assert config.tasks[task_name]["models"][:3] == GPT_PRIORITY
 
 
 def test_registry_excludes_failed_automatic_candidates() -> None:
@@ -81,7 +81,7 @@ def test_registry_excludes_failed_automatic_candidates() -> None:
     assert "grok-4.5" not in automatic_models
     assert "qwen3.7-plus" in config.models
     assert "qwen3.7-plus" not in automatic_models
-    assert config.tasks["expression"]["models"][:3] == (
+    assert config.tasks["expression"]["models"][3:6] == (
         "deepseek-v4-flash",
         "MiMo-V2.5-Pro",
         "gemini-3.5-flash",
@@ -94,7 +94,7 @@ def test_gpt_promotion_order_and_context_headroom_are_explicit() -> None:
     raw = tomllib.loads(registry_path.read_text(encoding="utf-8"))
     gpt_names = [name for name in raw["models"] if name.startswith("gpt-5.6-")]
 
-    assert gpt_names == ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]
+    assert gpt_names == list(GPT_PRIORITY)
     for name in gpt_names:
         model = raw["models"][name]
         trigger = model["extra"]["context_compression_trigger_tokens"]
