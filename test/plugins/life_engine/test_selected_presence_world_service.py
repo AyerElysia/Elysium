@@ -29,7 +29,6 @@ from plugins.life_engine.service.perception_gateway import (
     PreparedPerception,
 )
 from plugins.life_engine.service.presence_store import PresenceRevisionConflict
-from plugins.life_engine.service.world_projection import PerceptionCursorConflict
 from plugins.life_engine.storage.models import BackendKind
 from test.plugins.life_engine.presence_world_fakes import build_fake_stores
 
@@ -349,8 +348,10 @@ async def test_selected_service_uses_one_backend_for_presence_world_and_events(
         )
         == committed
     )
-    with pytest.raises(PerceptionCursorConflict):
-        await first.commit_perception(prepared, _exact_receipt(prepared))
+    assert await first.commit_perception(
+        prepared,
+        _exact_receipt(prepared),
+    ) == committed
 
     assert await first.rebuild_world_projection() == report["ingest_position"]
     assert await stores.world.perception_cursor(observer.instance_id) == committed

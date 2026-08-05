@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,7 +15,10 @@ import pytest
 from plugins.life_engine.constants import LIFE_CHATTER_GLOBAL_CURSOR_KEY
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.service import LifeEngineService
-from plugins.life_engine.service.core import HeartbeatModelResult
+from plugins.life_engine.service.core import (
+    ChatterRuntimeDeliveryReceipt,
+    HeartbeatModelResult,
+)
 from plugins.life_engine.service.event_builder import (
     RUNTIME_CONTEXT_FILE,
     EventType,
@@ -442,6 +446,142 @@ async def test_chatter_context_cursor_persists_across_restart(tmp_path: Path) ->
     await restored._load_runtime_context()
 
     assert restored._state.chatter_context_cursors["stream-1"] == 42
+
+
+async def test_chatter_commit_checkpoint_replays_without_prompt_text(
+    tmp_path: Path,
+) -> None:
+    service = _make_service(tmp_path)
+    service._event_history = [
+        LifeEngineEvent(
+            event_id="evt-durable-43",
+            event_type=EventType.MESSAGE,
+            timestamp="2026-08-05T12:00:00+08:00",
+            sequence=43,
+            source="life_engine",
+            source_detail="test",
+            content="DURABLE_CURSOR_43",
+            content_type="text",
+            stream_id="stream-durable",
+            sender="test",
+        )
+    ]
+    suffix, _ = await service.build_chatter_runtime_context(
+        SimpleNamespace(stream_id="stream-durable")
+    )
+    delivery = service.get_pending_chatter_runtime_delivery("stream-durable")
+    assert delivery is not None
+    effective_suffix = f"<transient_life_context>\n{suffix}\n</transient_life_context>"
+    effective_bytes = len(effective_suffix.encode("utf-8"))
+    effective_sha256 = hashlib.sha256(effective_suffix.encode("utf-8")).hexdigest()
+    checkpoint = service.create_chatter_runtime_commit_checkpoint(
+        "stream-durable",
+        delivery_id=delivery.delivery_id,
+        effective_suffix_sha256=effective_sha256,
+        effective_suffix_bytes=effective_bytes,
+    )
+    receipt = ChatterRuntimeDeliveryReceipt(
+        delivery_id=delivery.delivery_id,
+        effective_suffix_sha256=effective_sha256,
+        effective_suffix_bytes=effective_bytes,
+        exact=True,
+        transport_request_id="durable-request",
+    )
+
+    assert not hasattr(checkpoint, "content")
+    assert not hasattr(checkpoint.perception, "content")
+    committed = await service.commit_chatter_runtime_delivery(checkpoint, receipt)
+    assert committed.event_through_sequence == 43
+    assert not service.has_pending_chatter_perception("stream-durable")
+
+    restored = _make_service(tmp_path)
+    await restored._load_runtime_context()
+    assert restored._state.chatter_context_cursors["stream-durable"] == 43
+    replayed = await restored.commit_chatter_runtime_delivery(checkpoint, receipt)
+    assert replayed == committed
+
+
+async def test_chatter_checkpoint_keeps_pending_until_state_is_durable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _make_service(tmp_path)
+    service._event_history = [
+        LifeEngineEvent(
+            event_id="evt-retry-44",
+            event_type=EventType.MESSAGE,
+            timestamp="2026-08-05T12:01:00+08:00",
+            sequence=44,
+            source="life_engine",
+            source_detail="test",
+            content="RETRY_CURSOR_44",
+            content_type="text",
+            stream_id="stream-retry",
+            sender="test",
+        )
+    ]
+    suffix, _ = await service.build_chatter_runtime_context(
+        SimpleNamespace(stream_id="stream-retry")
+    )
+    delivery = service.get_pending_chatter_runtime_delivery("stream-retry")
+    assert delivery is not None
+    effective_bytes = len(suffix.encode("utf-8"))
+    effective_sha256 = hashlib.sha256(suffix.encode("utf-8")).hexdigest()
+    checkpoint = service.create_chatter_runtime_commit_checkpoint(
+        "stream-retry",
+        delivery_id=delivery.delivery_id,
+        effective_suffix_sha256=effective_sha256,
+        effective_suffix_bytes=effective_bytes,
+    )
+    receipt = ChatterRuntimeDeliveryReceipt(
+        delivery_id=delivery.delivery_id,
+        effective_suffix_sha256=effective_sha256,
+        effective_suffix_bytes=effective_bytes,
+        exact=True,
+    )
+    real_save = service._save_runtime_context
+
+    async def failed_save() -> None:
+        service._state_dirty = True
+
+    monkeypatch.setattr(service, "_save_runtime_context", failed_save)
+    with pytest.raises(RuntimeError, match="not durably persisted"):
+        await service.commit_chatter_runtime_delivery(checkpoint, receipt)
+    assert service.has_pending_chatter_perception("stream-retry")
+
+    monkeypatch.setattr(service, "_save_runtime_context", real_save)
+    committed = await service.commit_chatter_runtime_delivery(checkpoint, receipt)
+    assert committed.event_through_sequence == 44
+    assert not service.has_pending_chatter_perception("stream-retry")
+
+
+async def test_chatter_checkpoint_rejects_mismatched_final_suffix_receipt(
+    tmp_path: Path,
+) -> None:
+    service = _make_service(tmp_path)
+    suffix, _ = await service.build_chatter_runtime_context(
+        SimpleNamespace(stream_id="stream-mismatch")
+    )
+    delivery = service.get_pending_chatter_runtime_delivery("stream-mismatch")
+    assert delivery is not None
+    effective_bytes = len(suffix.encode("utf-8"))
+    effective_sha256 = hashlib.sha256(suffix.encode("utf-8")).hexdigest()
+    checkpoint = service.create_chatter_runtime_commit_checkpoint(
+        "stream-mismatch",
+        delivery_id=delivery.delivery_id,
+        effective_suffix_sha256=effective_sha256,
+        effective_suffix_bytes=effective_bytes,
+    )
+    mismatched = ChatterRuntimeDeliveryReceipt(
+        delivery_id=delivery.delivery_id,
+        effective_suffix_sha256="f" * 64,
+        effective_suffix_bytes=effective_bytes,
+        exact=True,
+    )
+
+    with pytest.raises(PerceptionDeliveryUnverified, match="does not match"):
+        await service.commit_chatter_runtime_delivery(checkpoint, mismatched)
+    assert service.has_pending_chatter_perception("stream-mismatch")
 
 
 async def test_chatter_think_snapshot_persists_across_restart(tmp_path: Path) -> None:

@@ -169,6 +169,72 @@ LIFE_CHATTER_PROJECTED_SUFFIX_MAX_BYTES = 60 * 1024
 LIFE_CHATTER_EFFECTIVE_TEXT_MAX_BYTES = 64 * 1024
 
 
+def _validate_content_free_sha256(value: str, *, field_name: str) -> str:
+    digest = str(value or "").strip().lower()
+    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise ValueError(f"{field_name} must be 64 lowercase hex characters")
+    return digest
+
+
+@dataclass(frozen=True, slots=True)
+class ChatterRuntimeDeliveryReceipt:
+    """Content-free proof that the final complete suffix reached the model."""
+
+    delivery_id: str
+    effective_suffix_sha256: str
+    effective_suffix_bytes: int
+    exact: bool
+    transport_request_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.delivery_id.strip():
+            raise ValueError("chatter receipt delivery_id must not be empty")
+        _validate_content_free_sha256(
+            self.effective_suffix_sha256,
+            field_name="chatter receipt effective_suffix_sha256",
+        )
+        if not 0 < self.effective_suffix_bytes <= LIFE_CHATTER_EFFECTIVE_TEXT_MAX_BYTES:
+            raise ValueError("chatter receipt effective suffix byte count is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ChatterRuntimeCommitCheckpoint:
+    """Durable replay identity for one World/event/thought chatter delivery."""
+
+    cursor_key: str
+    delivery_id: str
+    effective_suffix_sha256: str
+    effective_suffix_bytes: int
+    event_through_sequence: int
+    thought_through_revision: int
+    perception: PerceptionCommitCheckpoint
+
+    def __post_init__(self) -> None:
+        if not self.cursor_key.strip():
+            raise ValueError("chatter checkpoint cursor_key must not be empty")
+        if not self.delivery_id.strip():
+            raise ValueError("chatter checkpoint delivery_id must not be empty")
+        _validate_content_free_sha256(
+            self.effective_suffix_sha256,
+            field_name="chatter checkpoint effective_suffix_sha256",
+        )
+        if not 0 < self.effective_suffix_bytes <= LIFE_CHATTER_EFFECTIVE_TEXT_MAX_BYTES:
+            raise ValueError("chatter checkpoint effective suffix byte count is invalid")
+        if self.event_through_sequence < 0 or self.thought_through_revision < 0:
+            raise ValueError("chatter checkpoint frontiers must not be negative")
+
+
+@dataclass(frozen=True, slots=True)
+class ChatterRuntimeCommitResult:
+    """Content-free cursor state after one durable chatter delivery commit."""
+
+    delivery_id: str
+    event_through_sequence: int
+    thought_through_revision: int
+    world_position: int
+    world_revision: int
+
+
 @dataclass(frozen=True, slots=True)
 class ChatterRuntimeDelivery:
     """Content-free metadata for one bounded transient chatter suffix."""
@@ -182,6 +248,25 @@ class ChatterRuntimeDelivery:
     prepared_perception: PreparedPerception
     event_through_sequence: int
     thought_through_revision: int
+
+    def commit_checkpoint(
+        self,
+        *,
+        cursor_key: str,
+        effective_suffix_sha256: str,
+        effective_suffix_bytes: int,
+    ) -> ChatterRuntimeCommitCheckpoint:
+        """Bind the final complete suffix identity without retaining its text."""
+
+        return ChatterRuntimeCommitCheckpoint(
+            cursor_key=cursor_key,
+            delivery_id=self.delivery_id,
+            effective_suffix_sha256=effective_suffix_sha256,
+            effective_suffix_bytes=effective_suffix_bytes,
+            event_through_sequence=self.event_through_sequence,
+            thought_through_revision=self.thought_through_revision,
+            perception=self.prepared_perception.commit_checkpoint(),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -4957,6 +5042,105 @@ class LifeEngineService(BaseService):
         if not sid:
             return None
         return self._pending_chatter_deliveries.get(sid)
+
+    def create_chatter_runtime_commit_checkpoint(
+        self,
+        stream_id: str,
+        *,
+        delivery_id: str,
+        effective_suffix_sha256: str,
+        effective_suffix_bytes: int,
+        unified_chatter_context: bool = False,
+    ) -> ChatterRuntimeCommitCheckpoint:
+        """Freeze one pending suffix as a content-free durable checkpoint."""
+
+        sid = self._chatter_cursor_key(
+            stream_id,
+            unified_chatter_context=unified_chatter_context,
+        )
+        if not sid:
+            raise ValueError("chatter checkpoint stream identity must not be empty")
+        delivery = self._pending_chatter_deliveries.get(sid)
+        if delivery is None:
+            raise PerceptionDeliveryUnverified(
+                "no matching pending chatter runtime delivery exists"
+            )
+        if str(delivery_id or "").strip() != delivery.delivery_id:
+            raise PerceptionDeliveryUnverified(
+                "chatter checkpoint delivery identity does not match pending state"
+            )
+        return delivery.commit_checkpoint(
+            cursor_key=sid,
+            effective_suffix_sha256=effective_suffix_sha256,
+            effective_suffix_bytes=effective_suffix_bytes,
+        )
+
+    async def commit_chatter_runtime_delivery(
+        self,
+        checkpoint: ChatterRuntimeCommitCheckpoint,
+        receipt: ChatterRuntimeDeliveryReceipt | None,
+    ) -> ChatterRuntimeCommitResult:
+        """Idempotently replay one exact suffix without retaining prompt text."""
+
+        if receipt is None or not receipt.exact:
+            raise PerceptionDeliveryUnverified(
+                "chatter cursor commit requires an exact final suffix receipt"
+            )
+        if (
+            receipt.delivery_id != checkpoint.delivery_id
+            or receipt.effective_suffix_sha256
+            != checkpoint.effective_suffix_sha256
+            or receipt.effective_suffix_bytes
+            != checkpoint.effective_suffix_bytes
+        ):
+            raise PerceptionDeliveryUnverified(
+                "chatter final suffix receipt does not match its durable checkpoint"
+            )
+
+        perception = checkpoint.perception
+        world_position, world_revision = await self.commit_perception_delivery(
+            perception,
+            PerceptionDeliveryReceipt(
+                delivery_id=perception.delivery_id,
+                projection_sha256=perception.projection_sha256,
+                delivered_bytes=perception.delivered_bytes,
+                exact=True,
+                transport_request_id=receipt.transport_request_id,
+            ),
+        )
+        async with self._get_lock():
+            event_cursors = self._state.chatter_context_cursors
+            event_sequence = max(
+                int(event_cursors.get(checkpoint.cursor_key, 0) or 0),
+                checkpoint.event_through_sequence,
+            )
+            event_cursors[checkpoint.cursor_key] = event_sequence
+            thought_cursors = self._state.chatter_thought_cursors
+            thought_revision = max(
+                int(thought_cursors.get(checkpoint.cursor_key, 0) or 0),
+                checkpoint.thought_through_revision,
+            )
+            thought_cursors[checkpoint.cursor_key] = thought_revision
+            self._state_dirty = True
+
+        await self._save_runtime_context()
+        if self._state_dirty:
+            raise RuntimeError(
+                "chatter cursor state was not durably persisted; retry checkpoint"
+            )
+
+        async with self._get_lock():
+            pending = self._pending_chatter_deliveries.get(checkpoint.cursor_key)
+            if pending is not None and pending.delivery_id == checkpoint.delivery_id:
+                self._pending_chatter_deliveries.pop(checkpoint.cursor_key, None)
+                self._pending_chatter_perceptions.pop(checkpoint.cursor_key, None)
+        return ChatterRuntimeCommitResult(
+            delivery_id=checkpoint.delivery_id,
+            event_through_sequence=event_sequence,
+            thought_through_revision=thought_revision,
+            world_position=world_position,
+            world_revision=world_revision,
+        )
 
     async def mark_chatter_runtime_context_seen(
         self,

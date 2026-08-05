@@ -18,6 +18,7 @@ from typing import Any
 from .consciousness import ConsciousnessRegistry
 from .event_bus import RawEventStore
 from .world_projection import (
+    PerceptionCursorConflict,
     PromptProjectionValue,
     WorldAssertionReference,
     WorldAssertionReferencePage,
@@ -571,12 +572,21 @@ class PerceptionGateway:
         """CAS-advance from a content-free durable delivery checkpoint."""
 
         self._validate_receipt(checkpoint, receipt)
-        return self._projection.commit_perception_cursor(
-            checkpoint.instance_id,
-            expected_position=checkpoint.from_position,
-            expected_revision=checkpoint.cursor_revision,
-            through_position=checkpoint.through_position,
-        )
+        try:
+            return self._projection.commit_perception_cursor(
+                checkpoint.instance_id,
+                expected_position=checkpoint.from_position,
+                expected_revision=checkpoint.cursor_revision,
+                through_position=checkpoint.through_position,
+            )
+        except PerceptionCursorConflict:
+            current = self._projection.perception_cursor(checkpoint.instance_id)
+            replayed_revision = checkpoint.cursor_revision + int(
+                checkpoint.through_position > checkpoint.from_position
+            )
+            if current == (checkpoint.through_position, replayed_revision):
+                return current
+            raise
 
     def query(
         self,
@@ -741,12 +751,21 @@ class AsyncPerceptionGateway(PerceptionGateway):
         """CAS-advance from a content-free durable delivery checkpoint."""
 
         self._validate_receipt(checkpoint, receipt)
-        return await self._projection.commit_perception_cursor(
-            checkpoint.instance_id,
-            expected_position=checkpoint.from_position,
-            expected_revision=checkpoint.cursor_revision,
-            through_position=checkpoint.through_position,
-        )
+        try:
+            return await self._projection.commit_perception_cursor(
+                checkpoint.instance_id,
+                expected_position=checkpoint.from_position,
+                expected_revision=checkpoint.cursor_revision,
+                through_position=checkpoint.through_position,
+            )
+        except PerceptionCursorConflict:
+            current = await self._projection.perception_cursor(checkpoint.instance_id)
+            replayed_revision = checkpoint.cursor_revision + int(
+                checkpoint.through_position > checkpoint.from_position
+            )
+            if current == (checkpoint.through_position, replayed_revision):
+                return current
+            raise
 
     async def query(
         self,

@@ -333,8 +333,10 @@ def test_gateway_cursor_is_commit_after_delivery_and_survives_restart(
     )
     assert committed_position == prepared.through_position
     assert committed_revision == 1
-    with pytest.raises(PerceptionCursorConflict):
-        gateway.commit(prepared, _exact_receipt(prepared))
+    assert gateway.commit(prepared, _exact_receipt(prepared)) == (
+        committed_position,
+        committed_revision,
+    )
 
     restarted = PerceptionGateway(
         registry,
