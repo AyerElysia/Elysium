@@ -1418,6 +1418,110 @@ async def test_life_chatter_delivery_unknown_ends_turn_without_retry(
     LifeChatter.reset_global_runtime()
 
 
+@pytest.mark.parametrize(
+    ("technical_outcome", "prior_failures", "expected_failure_count"),
+    [
+        ("user_action_required", 0, 1),
+        ("invalid_argument", 2, 3),
+    ],
+)
+async def test_life_chatter_terminal_platform_failure_ends_turn(
+    monkeypatch,
+    technical_outcome: str,
+    prior_failures: int,
+    expected_failure_count: int,
+) -> None:
+    LifeChatter.reset_global_runtime()
+
+    call = SimpleNamespace(
+        id="feishu-search",
+        name="tool-platform_action",
+        args={
+            "platform": "feishu",
+            "action": "contact +search-user --as user --query AyerElysia",
+            "params": {},
+        },
+    )
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.payloads = []
+            self.call_list = [call]
+            self.message = ""
+
+        def add_payload(self, payload) -> None:
+            self.payloads.append(payload)
+
+    response = FakeResponse()
+    rt = _WorkflowRuntime(
+        response=response,
+        phase=_Phase.TOOL_EXEC,
+        history_merged=True,
+        unreads=[],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[],
+        active_stream_id="stream-a",
+    )
+    lineage_key = LifeChatter._tool_failure_lineage_key(call)
+    if prior_failures:
+        rt.tool_failure_counts[lineage_key] = prior_failures
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=None)
+    chatter.stream_id = "stream-a"
+
+    async def fake_fetch_unreads():
+        return [], []
+
+    async def fake_run_tool_call(*_args, **_kwargs):
+        return [
+            ToolCallExecutionResult(
+                True,
+                False,
+                technical_outcome=technical_outcome,
+            )
+        ]
+
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+    monkeypatch.setattr(chatter, "run_tool_call", fake_run_tool_call)
+    monkeypatch.setattr(chatter, "_maybe_compact_runtime_context", lambda _response: None)
+    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
+    monkeypatch.setattr(
+        "src.kernel.concurrency.get_watchdog",
+        lambda: SimpleNamespace(feed_dog=lambda _stream_id: None),
+    )
+
+    result = await chatter._drive_global_runtime_until_yield(
+        SimpleNamespace(stream_id="stream-a"),
+        service=None,
+    )
+
+    assert isinstance(result, Wait)
+    assert rt.phase == _Phase.WAIT_USER
+    assert rt.follow_up_rounds == 0
+    assert rt.tool_failure_counts[lineage_key] == expected_failure_count
+
+    LifeChatter.reset_global_runtime()
+
+
+def test_platform_failure_lineage_ignores_corrective_feishu_syntax() -> None:
+    calls = [
+        SimpleNamespace(
+            name="tool-platform_action",
+            args={"platform": "feishu", "action": action},
+        )
+        for action in (
+            "contact +search --query AyerElysia",
+            "contact +search-user --query AyerElysia",
+            "contact +search-user --as user --query AyerElysia",
+        )
+    ]
+
+    assert len({LifeChatter._tool_failure_lineage_key(call) for call in calls}) == 1
+
+
 async def test_life_chatter_recent_duplicate_reply_is_suppressed_and_ends_turn(monkeypatch) -> None:
     LifeChatter.reset_global_runtime()
 

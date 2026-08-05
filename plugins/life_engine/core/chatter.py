@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import shlex
 import threading
 import time
 import unicodedata
@@ -83,6 +84,14 @@ _SEND_FILE = "action-life_send_file"
 _SEND_EMOJI_MEME = "action-send_emoji_meme"
 _SUSPEND_TEXT = "__SUSPEND__"
 _GLOBAL_RUNTIME_BUSY_RETRY_SECONDS = 1.0
+_PLATFORM_ACTION_MAX_ATTEMPTS = 3
+_TERMINAL_TOOL_OUTCOMES = frozenset(
+    {
+        "policy_blocked",
+        "tool_unavailable",
+        "user_action_required",
+    }
+)
 # 默认 loop 续轮提示：模型未调用任何工具时，轻量引导继续。
 _EMPTY_TURN_NUDGE = (
     "（请继续。如需回复用户请调用 life_send_text；"
@@ -255,6 +264,7 @@ class _WorkflowRuntime:
     unreads: list[Message]
     cross_round_seen_signatures: set[str]
     unread_msgs_to_flush: list[Message]
+    tool_failure_counts: dict[str, int] = field(default_factory=dict)
     follow_up_rounds: int = 0
     pending_transient_context_text: str = ""
     pending_life_context_high_water: int = 0
@@ -3227,6 +3237,7 @@ class LifeChatter(BaseChatter):
         rt.unread_msgs_to_flush = []
         rt.unreads = []
         rt.cross_round_seen_signatures.clear()
+        rt.tool_failure_counts.clear()
         rt.follow_up_rounds = 0
         rt.media_seen.clear()
         rt.must_reply = False
@@ -4261,6 +4272,46 @@ class LifeChatter(BaseChatter):
         return []
 
     @staticmethod
+    def _tool_failure_lineage_key(call: Any) -> str:
+        """Return a stable retry lineage for one platform operation."""
+
+        if str(getattr(call, "name", "") or "") != "tool-platform_action":
+            return ""
+        args = getattr(call, "args", None)
+        if not isinstance(args, dict):
+            return ""
+
+        platform = str(args.get("platform", "qq") or "qq").strip().lower()
+        action = str(args.get("action", "") or "").strip()
+        if not action:
+            return ""
+        try:
+            parts = shlex.split(action)
+        except ValueError:
+            parts = action.split()
+        if not parts:
+            return ""
+
+        namespace = parts[0].lower()
+        target_parts: list[str] = []
+        target_flags = {
+            "--chat-id",
+            "--email",
+            "--open-id",
+            "--query",
+            "--union-id",
+            "--user-id",
+        }
+        for index, part in enumerate(parts[:-1]):
+            if part.lower() in target_flags:
+                target_parts.extend((part.lower(), parts[index + 1]))
+
+        if not target_parts:
+            target_parts.append(parts[1].lower() if len(parts) > 1 else namespace)
+        target = json.dumps(target_parts, ensure_ascii=False, separators=(",", ":"))
+        return f"tool-platform_action:{platform}:{namespace}:{target}"
+
+    @staticmethod
     def _is_tool_call_blocked_for_trigger(
         call: Any,
         usable_map: Any,
@@ -4405,6 +4456,7 @@ class LifeChatter(BaseChatter):
                     return Wait()
 
                 rt.cross_round_seen_signatures.clear()
+                rt.tool_failure_counts.clear()
                 rt.follow_up_rounds = 0
                 rt.unreads = unread_msgs
                 rt.sent_visible_reply = False
@@ -4846,6 +4898,8 @@ class LifeChatter(BaseChatter):
                 )
                 claimed_autonomy_actions: set[str] = set()
                 delivery_unknown_action = False
+                terminal_tool_failure = ""
+                terminal_tool_failure_action_id = ""
                 if trigger_msg is not None:
                     trigger_msg.extra["life_turn_scope"] = {
                         "stream_id": stream_id,
@@ -4858,12 +4912,35 @@ class LifeChatter(BaseChatter):
                     execution_result: tuple[bool, bool],
                 ) -> None:
                     nonlocal delivery_unknown_action
+                    nonlocal terminal_tool_failure, terminal_tool_failure_action_id
                     _, success = execution_result
                     technical_outcome = str(
                         getattr(execution_result, "technical_outcome", "") or ""
                     )
                     executed_name = str(getattr(executed_call, "name", "") or "")
                     action_id = str(getattr(executed_call, "id", "") or "")
+                    lineage_key = self._tool_failure_lineage_key(executed_call)
+                    failure_count = 0
+                    if lineage_key:
+                        if success:
+                            rt.tool_failure_counts.pop(lineage_key, None)
+                        else:
+                            failure_count = rt.tool_failure_counts.get(lineage_key, 0) + 1
+                            rt.tool_failure_counts[lineage_key] = failure_count
+
+                    terminal_outcome = technical_outcome in _TERMINAL_TOOL_OUTCOMES
+                    retry_limit_reached = bool(
+                        lineage_key
+                        and not success
+                        and failure_count >= _PLATFORM_ACTION_MAX_ATTEMPTS
+                    )
+                    if (terminal_outcome or retry_limit_reached) and not terminal_tool_failure:
+                        terminal_tool_failure = (
+                            technical_outcome
+                            if terminal_outcome
+                            else "retry_limit_reached"
+                        )
+                        terminal_tool_failure_action_id = action_id
                     if (
                         service is not None
                         and autonomy_occurrences
@@ -4976,6 +5053,15 @@ class LifeChatter(BaseChatter):
 
                     if dedupe_key in seen_sigs or dedupe_key in rt.cross_round_seen_signatures:
                         await flush_parallel_calls()
+                        lineage_key = self._tool_failure_lineage_key(call)
+                        if lineage_key:
+                            failure_count = rt.tool_failure_counts.get(lineage_key, 0) + 1
+                            rt.tool_failure_counts[lineage_key] = failure_count
+                            if failure_count >= _PLATFORM_ACTION_MAX_ATTEMPTS:
+                                terminal_tool_failure = "retry_limit_reached"
+                                terminal_tool_failure_action_id = str(
+                                    getattr(call, "id", "") or ""
+                                )
                         llm_response.add_payload(
                             LLMPayload(
                                 ROLE.TOOL_RESULT,
@@ -5109,6 +5195,32 @@ class LifeChatter(BaseChatter):
                     await handle_tool_execution_result(call, execution_result)
 
                 await flush_parallel_calls()
+
+                if terminal_tool_failure:
+                    if service is not None and autonomy_occurrences:
+                        await service.complete_autonomy_occurrences(
+                            autonomy_occurrences,
+                            outcome="failed",
+                            action_id=terminal_tool_failure_action_id,
+                            detail=f"platform action stopped: {terminal_tool_failure}",
+                        )
+                    if self._has_tool_result_tail(llm_response):
+                        llm_response.add_payload(
+                            LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT))
+                        )
+                    rt.must_reply = False
+                    self._transition(
+                        rt,
+                        _Phase.WAIT_USER,
+                        f"terminal tool failure: {terminal_tool_failure}",
+                    )
+                    self._maybe_compact_runtime_context(llm_response)
+                    await self._save_rolling_context_snapshot(llm_response)
+                    logger.warning(
+                        "life_chatter 已终止不可继续的工具操作: "
+                        f"{terminal_tool_failure}"
+                    )
+                    return Wait()
 
                 # pass 退出
                 if should_wait:
@@ -5247,6 +5359,7 @@ class LifeChatter(BaseChatter):
                             rt.unread_msgs_to_flush = []
                             rt.unreads = []
                             rt.cross_round_seen_signatures.clear()
+                            rt.tool_failure_counts.clear()
                             rt.follow_up_rounds = 0
                             rt.media_seen.clear()
                             rt.must_reply = False

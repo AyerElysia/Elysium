@@ -12,10 +12,10 @@ from __future__ import annotations
 import asyncio
 import json
 import shlex
-from typing import Annotated, Any
+from typing import Annotated, Any, Self
 
-from src.app.plugin_system.api.adapter_api import send_adapter_command
 from src.app.plugin_system.api import log_api
+from src.app.plugin_system.api.adapter_api import send_adapter_command
 from src.app.plugin_system.base import BaseTool
 
 from ._utils import _get_workspace
@@ -53,6 +53,29 @@ _FEISHU_BLOCKED_PATTERNS: tuple[str, ...] = (
     "config set",      # 禁止修改配置
     "config init",     # 禁止重置配置
 )
+
+_FEISHU_USER_ACTION_ERROR_TYPES = frozenset({"authentication", "authorization"})
+_FEISHU_USER_ACTION_ERROR_SUBTYPES = frozenset(
+    {
+        "token_missing",
+        "permission_denied",
+        "insufficient_scope",
+    }
+)
+
+
+class _PlatformActionResult(str):
+    """Human-readable platform result carrying a content-free outcome code."""
+
+    def __new__(
+        cls,
+        value: str,
+        *,
+        technical_outcome: str = "",
+    ) -> Self:
+        instance = super().__new__(cls, value)
+        instance.technical_outcome = str(technical_outcome or "")
+        return instance
 
 
 class PlatformActionTool(BaseTool):
@@ -165,7 +188,10 @@ class PlatformActionTool(BaseTool):
         action_lower = action.lower()
         for pattern in _FEISHU_BLOCKED_PATTERNS:
             if pattern in action_lower:
-                return False, f"命令包含被禁止的内容 '{pattern}'（安全策略）"
+                return False, _PlatformActionResult(
+                    f"命令包含被禁止的内容 '{pattern}'（安全策略）",
+                    technical_outcome="policy_blocked",
+                )
 
         # 构建命令
         try:
@@ -190,7 +216,10 @@ class PlatformActionTool(BaseTool):
             proc.kill()  # type: ignore[union-attr]
             return False, f"命令超时（{_FEISHU_TIMEOUT}s）"
         except FileNotFoundError:
-            return False, "lark-cli 未安装或不在 PATH 中"
+            return False, _PlatformActionResult(
+                "lark-cli 未安装或不在 PATH 中",
+                technical_outcome="tool_unavailable",
+            )
         except Exception as exc:
             logger.error(f"[platform_action:feishu] 执行异常: {exc}")
             return False, f"执行失败: {exc}"
@@ -201,13 +230,16 @@ class PlatformActionTool(BaseTool):
         if proc.returncode != 0:  # type: ignore[union-attr]
             err_msg = stderr_text or stdout_text or f"exit code {proc.returncode}"
             logger.warning(f"[platform_action:feishu] 失败: {err_msg[:300]}")
-            return False, f"命令失败: {err_msg[:500]}"
+            return False, _PlatformActionResult(
+                f"命令失败: {err_msg[:500]}",
+                technical_outcome=self._classify_feishu_error(err_msg),
+            )
 
         # 尝试解析 JSON 输出
         if stdout_text:
             try:
                 data = json.loads(stdout_text)
-                logger.info(f"[platform_action:feishu] 成功")
+                logger.info("[platform_action:feishu] 成功")
                 return True, data
             except (json.JSONDecodeError, TypeError):
                 pass
@@ -215,6 +247,31 @@ class PlatformActionTool(BaseTool):
             return True, stdout_text[:2000]
 
         return True, {"status": "ok"}
+
+    @staticmethod
+    def _classify_feishu_error(raw_error: str) -> str:
+        """Classify stable lark-cli JSON errors without guessing from prose."""
+
+        try:
+            payload = json.loads(raw_error)
+        except (json.JSONDecodeError, TypeError):
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        error = payload.get("error")
+        if not isinstance(error, dict):
+            return ""
+
+        error_type = str(error.get("type", "") or "").strip().lower()
+        error_subtype = str(error.get("subtype", "") or "").strip().lower()
+        if (
+            error_type in _FEISHU_USER_ACTION_ERROR_TYPES
+            and error_subtype in _FEISHU_USER_ACTION_ERROR_SUBTYPES
+        ):
+            return "user_action_required"
+        if error_type == "validation" and error_subtype == "invalid_argument":
+            return "invalid_argument"
+        return ""
 
     # ------------------------------------------------------------------
     # 能力清单（渐进式披露）
