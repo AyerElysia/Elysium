@@ -108,7 +108,9 @@ _MODEL_FIELDS = frozenset(
         "extra",
     }
 )
-_TASK_FIELDS = frozenset({"models", "tokens", "temp", "context_tokens"})
+_TASK_FIELDS = frozenset(
+    {"models", "tokens", "temp", "context_tokens", "extra", "model_extra"}
+)
 _READY_CLIENT_TYPES = frozenset({"openai", "anthropic"})
 _NON_GENERATIVE_TASKS = frozenset({"voice", "embedding"})
 
@@ -171,6 +173,8 @@ class ModelsConfig:
                     "tokens": task.get("tokens", _DEFAULTS["tokens"]),
                     "temp": task.get("temp", _DEFAULTS["temp"]),
                     "context_tokens": task.get("context_tokens"),
+                    "extra": task.get("extra", {}),
+                    "model_extra": task.get("model_extra", {}),
                 }
                 for name, task in tasks.items()
             },
@@ -426,6 +430,27 @@ class ModelsConfig:
                 raise ModelRegistryError(
                     f"tasks.{name}.models 引用未定义模型: {undefined}"
                 )
+            task_extra = task.get("extra", {})
+            if not isinstance(task_extra, dict):
+                raise ModelRegistryError(f"tasks.{name}.extra 必须是 table")
+            model_extra = task.get("model_extra", {})
+            if not isinstance(model_extra, dict):
+                raise ModelRegistryError(f"tasks.{name}.model_extra 必须是 table")
+            unknown_model_extra = sorted(set(model_extra) - set(model_names))
+            if unknown_model_extra:
+                raise ModelRegistryError(
+                    f"tasks.{name}.model_extra 引用非本任务候选模型: "
+                    f"{unknown_model_extra}"
+                )
+            invalid_model_extra = sorted(
+                model_name
+                for model_name, override in model_extra.items()
+                if not isinstance(override, dict)
+            )
+            if invalid_model_extra:
+                raise ModelRegistryError(
+                    f"tasks.{name}.model_extra 条目必须是 table: {invalid_model_extra}"
+                )
             transport_targets: dict[tuple[str, str, str], str] = {}
             duplicate_targets: list[tuple[str, str]] = []
             for model_name in model_names:
@@ -473,9 +498,7 @@ class ModelsConfig:
                 or not isinstance(context_tokens, int)
                 or context_tokens <= 0
             ):
-                raise ModelRegistryError(
-                    f"tasks.{name}.context_tokens 必须是正整数"
-                )
+                raise ModelRegistryError(f"tasks.{name}.context_tokens 必须是正整数")
             if context_tokens is not None and name not in _NON_GENERATIVE_TASKS:
                 insufficient_context = [
                     model_name
@@ -528,8 +551,7 @@ class ModelsConfig:
         )
         if missing_context_budgets:
             raise ModelRegistryError(
-                "生产生成任务缺少任务级 context_tokens: "
-                f"{missing_context_budgets}"
+                f"生产生成任务缺少任务级 context_tokens: {missing_context_budgets}"
             )
 
     def log_snapshot(self) -> None:
@@ -576,6 +598,8 @@ class ModelsConfig:
         max_tokens = int(task.get("tokens", _DEFAULTS["tokens"]))
         temperature = float(task.get("temp", _DEFAULTS["temp"]))
         context_tokens = task.get("context_tokens")
+        task_extra = self._thaw_value(task.get("extra", {}))
+        task_model_extra = task.get("model_extra", {})
         model_set: list[dict[str, Any]] = []
         for priority, name in enumerate(model_names):
             entry = self._build_model_entry(
@@ -589,6 +613,11 @@ class ModelsConfig:
                 routing_priority=priority,
             )
             if entry is not None:
+                extra_params = entry["extra_params"]
+                extra_params.update(task_extra)
+                extra_params.update(
+                    self._thaw_value(task_model_extra.get(str(name), {}))
+                )
                 model_set.append(entry)
 
         if not model_set:

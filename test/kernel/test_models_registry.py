@@ -59,8 +59,7 @@ def test_models_example_is_complete_and_budgeted() -> None:
         if task_name in GENERATIVE_TASKS:
             assert task["context_tokens"] == EXPECTED_CONTEXT_BUDGETS[task_name]
             assert all(
-                entry["context_tokens"] == task["context_tokens"]
-                for entry in entries
+                entry["context_tokens"] == task["context_tokens"] for entry in entries
             )
         else:
             assert "context_tokens" not in task
@@ -108,9 +107,38 @@ def test_task_context_budgets_replace_per_model_triggers() -> None:
         task = raw["tasks"][task_name]
         assert task["context_tokens"] == EXPECTED_CONTEXT_BUDGETS[task_name]
         for model_name in task["models"]:
-            assert task["context_tokens"] + task["tokens"] <= raw["models"][
-                model_name
-            ]["ctx"]
+            assert (
+                task["context_tokens"] + task["tokens"]
+                <= raw["models"][model_name]["ctx"]
+            )
+
+
+def test_example_task_inference_policy_is_task_specific() -> None:
+    registry_path = Path(__file__).parents[2] / "config" / "models.toml.example"
+    config = ModelsConfig(registry_path)
+
+    core = {
+        entry["routing_model_alias"]: entry["extra_params"]
+        for entry in config.get_task("core")
+    }
+    expression = {
+        entry["routing_model_alias"]: entry["extra_params"]
+        for entry in config.get_task("expression")
+    }
+    router = {
+        entry["routing_model_alias"]: entry["extra_params"]
+        for entry in config.get_task("router")
+    }
+
+    assert core["deepseek-v4-flash"]["thinking"]["type"] == "enabled"
+    assert core["gpt-5.6-luna"]["reasoning_effort"] == "high"
+    assert expression["gpt-5.6-luna"]["reasoning_effort"] == "low"
+    assert expression["gpt-5.6-terra"]["reasoning_effort"] == "low"
+    assert expression["gpt-5.6-sol"]["reasoning_effort"] == "low"
+    assert all(params["parallel_tool_calls"] is True for params in expression.values())
+    assert router["deepseek-v4-flash"]["thinking"]["type"] == "disabled"
+    assert router["gpt-5.6-luna"]["reasoning_effort"] == "low"
+    assert router["MiMo-V2.5"]["enable_thinking"] is False
 
 
 def _write_minimal_registry(
@@ -170,6 +198,42 @@ def test_registry_preserves_priority_and_attaches_snapshot_identity(
         config.tasks["expression"]["tokens"] = 1  # type: ignore[index]
 
 
+def test_task_extra_merges_over_model_defaults_without_shared_mutation(
+    tmp_path: Path,
+) -> None:
+    registry_path = tmp_path / "models.toml"
+    _write_minimal_registry(registry_path)
+    configured = registry_path.read_text(encoding="utf-8").replace(
+        "[models.backup]",
+        'extra = { reasoning_effort = "high", parallel_tool_calls = false }\n\n'
+        "[models.backup]",
+        1,
+    )
+    configured = configured.replace(
+        "context_tokens = 16000",
+        "context_tokens = 16000\n"
+        "extra = { parallel_tool_calls = true, seed = 7 }\n"
+        'model_extra = { primary = { reasoning_effort = "low" } }',
+        1,
+    )
+    registry_path.write_text(configured, encoding="utf-8")
+
+    config = ModelsConfig(registry_path)
+    entries = config.get_task("expression")
+    primary = entries[0]["extra_params"]
+    backup = entries[1]["extra_params"]
+
+    assert primary == {
+        "reasoning_effort": "low",
+        "parallel_tool_calls": True,
+        "seed": 7,
+    }
+    assert backup == {"parallel_tool_calls": True, "seed": 7}
+
+    primary["seed"] = 99
+    assert config.get_task("expression")[0]["extra_params"]["seed"] == 7
+
+
 def test_registry_digest_is_secret_free_and_route_sensitive(tmp_path: Path) -> None:
     first_path = tmp_path / "first.toml"
     second_path = tmp_path / "second.toml"
@@ -177,6 +241,7 @@ def test_registry_digest_is_secret_free_and_route_sensitive(tmp_path: Path) -> N
     budget_path = tmp_path / "budget.toml"
     context_budget_path = tmp_path / "context-budget.toml"
     endpoint_path = tmp_path / "endpoint.toml"
+    inference_path = tmp_path / "inference.toml"
     _write_minimal_registry(first_path, api_key="secret-a")
     _write_minimal_registry(second_path, api_key="secret-b")
     _write_minimal_registry(
@@ -205,6 +270,14 @@ def test_registry_digest_is_secret_free_and_route_sensitive(tmp_path: Path) -> N
         ),
         encoding="utf-8",
     )
+    _write_minimal_registry(inference_path, api_key="secret-a")
+    inference_path.write_text(
+        inference_path.read_text(encoding="utf-8").replace(
+            "context_tokens = 16000",
+            "context_tokens = 16000\nextra = { parallel_tool_calls = true }",
+        ),
+        encoding="utf-8",
+    )
 
     first = ModelsConfig(first_path)
     second = ModelsConfig(second_path)
@@ -212,13 +285,50 @@ def test_registry_digest_is_secret_free_and_route_sensitive(tmp_path: Path) -> N
     budget = ModelsConfig(budget_path)
     context_budget = ModelsConfig(context_budget_path)
     endpoint = ModelsConfig(endpoint_path)
+    inference = ModelsConfig(inference_path)
 
     assert first.snapshot.digest == second.snapshot.digest
     assert first.snapshot.digest == endpoint.snapshot.digest
     assert changed.snapshot.digest != first.snapshot.digest
     assert budget.snapshot.digest != first.snapshot.digest
     assert context_budget.snapshot.digest != first.snapshot.digest
+    assert inference.snapshot.digest != first.snapshot.digest
     assert "secret-a" not in first.snapshot.digest
+
+
+@pytest.mark.parametrize(
+    ("task_override", "message"),
+    [
+        ('extra = "invalid"', r"tasks\.expression\.extra"),
+        ('model_extra = "invalid"', r"tasks\.expression\.model_extra"),
+        (
+            "model_extra = { missing = { seed = 1 } }",
+            r"tasks\.expression\.model_extra",
+        ),
+        (
+            'model_extra = { primary = "invalid" }',
+            r"tasks\.expression\.model_extra",
+        ),
+    ],
+)
+def test_registry_rejects_invalid_task_inference_overrides(
+    tmp_path: Path,
+    task_override: str,
+    message: str,
+) -> None:
+    registry_path = tmp_path / "invalid-task-extra.toml"
+    _write_minimal_registry(registry_path)
+    registry_path.write_text(
+        registry_path.read_text(encoding="utf-8").replace(
+            "context_tokens = 16000",
+            f"context_tokens = 16000\n{task_override}",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ModelRegistryError, match=message):
+        ModelsConfig(registry_path)
 
 
 @pytest.mark.parametrize(

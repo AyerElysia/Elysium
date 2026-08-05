@@ -117,6 +117,10 @@ def test_life_chatter_system_prompt_includes_memory_and_chatter_tools_not_heartb
     assert "action-life_pass_and_wait" in prompt
     assert "life_send_text" in prompt
     assert "reason" in prompt
+    assert "不是每次行动前的仪式" in prompt
+    assert "一次能完成的事拆成两次模型调用" in prompt
+    assert "多个互不依赖的工具调用" in prompt
+    assert "安全、无副作用" in prompt
 
 
 @pytest.mark.asyncio
