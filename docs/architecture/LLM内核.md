@@ -93,7 +93,7 @@ class ModelEntry(TypedDict):
 | 任务 | 输入上下文预算 | 输出预算 | 模型列表（按主备序） |
 | --- | ---: | ---: | --- |
 | core | 100000 | 32000 | deepseek-v4-flash, gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, MiMo-V2.5-Pro, gemini-3.5-flash, MiMo-V2.5, claude-sonnet-5 |
-| expression | 200000 | 32000 | deepseek-v4-flash, gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, MiMo-V2.5-Pro, gemini-3.5-flash, MiMo-V2.5, claude-sonnet-5 |
+| expression | 200000 | 32000 | gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, gemini-3.5-flash, MiMo-V2.5, claude-sonnet-5 |
 | witness | 100000 | 16000 | deepseek-v4-flash, gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, MiMo-V2.5, gemini-3.5-flash |
 | agent | 200000 | 32000 | deepseek-v4-flash, gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, MiMo-V2.5-Pro, gemini-3.5-flash, MiMo-V2.5, claude-sonnet-5 |
 | utility | 64000 | 16000 | deepseek-v4-flash, gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, MiMo-V2.5, gemini-3.5-flash |
@@ -106,7 +106,7 @@ class ModelEntry(TypedDict):
 
 生成型任务的 `tokens` 同时覆盖隐式思考与最终正文；`context_tokens` 是任务级输入预算。预算随任务路由条目传递，故障转移到另一模型时保持不变，最终有效值取任务预算与“模型 `ctx` 减去输出保留量”的较小者。模型表只声明硬能力，不再承载任务压缩阈值。
 
-当前文本任务临时优先使用 **DeepSeek V4 Flash 正式版**。Elysium 仍使用稳定的 `deepseek-v4-flash` 公共别名，本地中转站必须把该别名映射到火山方舟 Coding Plan 的 `ark-code-latest`；直接请求上游同名模型得到的是预览版，禁止进入这条正式路由。该正式入口已通过真实 completion、重复请求与工具调用探针；视觉任务不声明其不具备的多模态能力，继续使用原视觉候选。
+当前经准入的非多模态任务临时优先使用 **DeepSeek V4 Flash 正式版**。Elysium 仍使用稳定的 `deepseek-v4-flash` 公共别名，本地中转站必须把该别名映射到火山方舟 Coding Plan 的 `ark-code-latest`；直接请求上游同名模型得到的是预览版，禁止进入这条正式路由。该正式入口已通过真实 completion、重复请求与工具调用探针。`expression` 承载聊天表达并可接收图像，其自动候选必须显式声明视觉能力；DeepSeek V4 Flash 与其他纯文本模型均不得进入 `expression` 路由。`vision` 任务同样继续使用多模态候选。
 
 GPT 5.6 的后备优先级保持 **Luna → Terra → Sol**：Luna 成本最低，Terra 与 Sol 依次作为同系列后备。三种 GPT 已通过本地中转站的模型列表、真实 completion、格式遵循、工具调用与重复转发探针；MiMo、Gemini 与 Claude 继续作为跨模型族回退。中转站内部只启用通过验收的渠道，固定失败或客户端不兼容的渠道不得为了“全部打开”而进入生产路由。
 
