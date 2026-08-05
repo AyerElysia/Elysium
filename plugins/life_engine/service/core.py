@@ -184,6 +184,14 @@ class ChatterRuntimeDelivery:
     thought_through_revision: int
 
 
+@dataclass(frozen=True, slots=True)
+class HeartbeatModelResult:
+    """One heartbeat result plus proof of its exact World context."""
+
+    text: str
+    perception_receipt: PerceptionDeliveryReceipt | None
+
+
 def _resolve_heartbeat_timeout(configured: float, model_set: Any) -> float:
     """把心跳的外层超时抬到至少两个「单模型尝试」之上。
 
@@ -4561,8 +4569,18 @@ class LifeEngineService(BaseService):
         prepared: PreparedHeartbeatContext,
         model_reply: str,
         heartbeat_run_id: str,
+        perception_receipt: PerceptionDeliveryReceipt | None,
     ) -> None:
         """Commit one successful heartbeat snapshot and advance its cursor."""
+        if isinstance(prepared.world_perception, PreparedPerception):
+            if perception_receipt is None:
+                raise PerceptionDeliveryUnverified(
+                    "heartbeat commit requires exact World delivery proof"
+                )
+            await self.commit_perception(
+                prepared.world_perception,
+                perception_receipt,
+            )
         reply_text = str(model_reply or "").strip()
         heartbeat_event: LifeEngineEvent | None = None
         if reply_text:
@@ -4645,18 +4663,22 @@ class LifeEngineService(BaseService):
 
         if heartbeat_event is not None:
             await self._publish_raw_events([heartbeat_event])
-        if isinstance(prepared.world_perception, PreparedPerception):
-            await self.commit_perception(prepared.world_perception)
         await self._save_runtime_context()
 
     async def _prepare_and_commit_heartbeat_context(
         self,
         model_reply: str,
         heartbeat_run_id: str,
+        perception_receipt: PerceptionDeliveryReceipt | None = None,
     ) -> PreparedHeartbeatContext:
         """Compatibility helper used by tests and heartbeat runners."""
         prepared = await self._prepare_heartbeat_context()
-        await self._commit_heartbeat_context(prepared, model_reply, heartbeat_run_id)
+        await self._commit_heartbeat_context(
+            prepared,
+            model_reply,
+            heartbeat_run_id,
+            perception_receipt,
+        )
         return prepared
 
     async def clear_runtime_context(self) -> None:
@@ -6221,12 +6243,46 @@ class LifeEngineService(BaseService):
         )
         return "\n".join(lines)
 
+    @staticmethod
+    def _heartbeat_perception_receipt(
+        response: Any,
+        perception: PreparedPerception,
+    ) -> PerceptionDeliveryReceipt | None:
+        """Map the final successful attempt's content-free exact receipt."""
+
+        lookup = getattr(response, "effective_context_receipt", None)
+        effective = lookup(perception.delivery_id) if callable(lookup) else None
+        if effective is None or not bool(getattr(effective, "exact_present", False)):
+            return None
+        expected_bytes = getattr(effective, "expected_utf8_bytes", None)
+        effective_bytes = getattr(effective, "effective_utf8_bytes", None)
+        expected_sha256 = getattr(effective, "expected_sha256", None)
+        effective_sha256 = getattr(effective, "effective_sha256", None)
+        if (
+            not isinstance(expected_bytes, int)
+            or expected_bytes <= 0
+            or effective_bytes != expected_bytes
+            or not isinstance(expected_sha256, str)
+            or effective_sha256 != expected_sha256
+        ):
+            return None
+        return PerceptionDeliveryReceipt(
+            delivery_id=perception.delivery_id,
+            projection_sha256=perception.projection_sha256,
+            delivered_bytes=perception.delivered_bytes,
+            exact=True,
+            transport_request_id=str(
+                getattr(response, "request_record_id", "") or ""
+            ),
+        )
+
     async def _run_heartbeat_model(
         self,
         wake_context: str,
         *,
         heartbeat_run_id: str | None = None,
-    ) -> str:
+        world_perception: PreparedPerception | None = None,
+    ) -> HeartbeatModelResult:
         """调用 life 任务模型生成内部报文；请求失败必须向上抛出。"""
         cfg = self._cfg()
         task_name = cfg.model.task_name.strip() or "core"
@@ -6239,7 +6295,7 @@ class LifeEngineService(BaseService):
         system_prompt = self._build_heartbeat_system_prompt()
         if system_prompt is None:
             # SOUL.md 不可用——没有灵魂就不说话
-            return
+            return HeartbeatModelResult("", None)
         memory_maintenance_prompt = self._build_memory_maintenance_prompt_if_due()
         section_texts = await self._render_heartbeat_sections()
         user_prompt = self._build_heartbeat_model_prompt(
@@ -6258,6 +6314,12 @@ class LifeEngineService(BaseService):
         request.add_payload(LLMPayload(ROLE.TOOL, tools))
 
         request.add_payload(LLMPayload(ROLE.USER, Text(user_prompt)))
+        if world_perception is not None:
+            request.register_context_delivery(
+                world_perception.delivery_id,
+                user_prompt,
+                marker=world_perception.delivery_marker,
+            )
 
         # 心跳请求超时与心跳间隔解耦：慢模型（长 prompt 的推理模型）单次可达上百秒，
         # 沿用间隔值会把正常的慢响应当成超时反复重试。
@@ -6304,6 +6366,12 @@ class LifeEngineService(BaseService):
                     # 复制 payloads 到 fallback request
                     for payload in request.payloads:
                         fallback_request.add_payload(payload)
+                    if world_perception is not None:
+                        fallback_request.register_context_delivery(
+                            world_perception.delivery_id,
+                            user_prompt,
+                            marker=world_perception.delivery_marker,
+                        )
                     response = await asyncio.wait_for(
                         fallback_request.send(stream=False),
                         timeout=timeout_seconds,
@@ -6319,6 +6387,15 @@ class LifeEngineService(BaseService):
         max_rounds = max(1, int(cfg.settings.max_rounds_per_heartbeat))
         last_text = ""
         tool_event_count = 0
+        perception_receipt = (
+            self._heartbeat_perception_receipt(response, world_perception)
+            if world_perception is not None
+            else None
+        )
+        if world_perception is not None and perception_receipt is None:
+            raise PerceptionDeliveryUnverified(
+                "heartbeat model did not receive the exact World projection"
+            )
 
         for _ in range(max_rounds):
             try:
@@ -6379,6 +6456,12 @@ class LifeEngineService(BaseService):
             # 之后上下文最长、最慢），少了重试等于把最脆弱的一环裸奔。
             # 重发是幂等的：response.send() 每次都带同一份累积 payload 重投。
             current_response = response
+            if world_perception is not None:
+                current_response.register_context_delivery(
+                    world_perception.delivery_id,
+                    user_prompt,
+                    marker=world_perception.delivery_marker,
+                )
 
             async def _send_followup_request() -> Any:
                 return await asyncio.wait_for(
@@ -6394,6 +6477,15 @@ class LifeEngineService(BaseService):
                     backoff_factor=1.5,
                     exceptions=(asyncio.TimeoutError,),
                 )
+                if world_perception is not None:
+                    perception_receipt = self._heartbeat_perception_receipt(
+                        response,
+                        world_perception,
+                    )
+                    if perception_receipt is None:
+                        raise PerceptionDeliveryUnverified(
+                            "heartbeat follow-up lost the exact World projection"
+                        )
             except (asyncio.TimeoutError, RetryExhaustedError) as exc:
                 logger.warning(f"life_engine heartbeat follow-up request timeout: {exc}")
                 raise TimeoutError("heartbeat follow-up request timeout") from exc
@@ -6432,7 +6524,7 @@ class LifeEngineService(BaseService):
             else:
                 last_text = "此刻很安静，但我仍在持续感受与观察。"
 
-        return last_text
+        return HeartbeatModelResult(last_text, perception_receipt)
 
     async def _save_runtime_context(self) -> None:
         """持久化当前上下文。"""
@@ -6956,10 +7048,11 @@ class LifeEngineService(BaseService):
                 )
                 _heartbeat_llm_budget = _cfg_hb_timeout * 2 + 60  # e.g. 300s @ 120s config
                 try:
-                    model_reply = await asyncio.wait_for(
+                    model_result = await asyncio.wait_for(
                         self._run_heartbeat_model(
                             prepared.content,
                             heartbeat_run_id=heartbeat_run_id,
+                            world_perception=prepared.world_perception,
                         ),
                         timeout=_heartbeat_llm_budget,
                     )
@@ -6969,6 +7062,7 @@ class LifeEngineService(BaseService):
                         f"LLM 总预算 {_heartbeat_llm_budget:.0f}s 超时，跳过本轮"
                     )
                     return "", prepared
+                model_reply = model_result.text
                 await self._record_model_reply(
                     model_reply,
                     heartbeat_run_id=heartbeat_run_id,
@@ -6978,6 +7072,7 @@ class LifeEngineService(BaseService):
                     prepared,
                     model_reply,
                     heartbeat_run_id,
+                    model_result.perception_receipt,
                 )
 
                 # 交互结束 → 触发学习系统快环反思（后台非阻塞）

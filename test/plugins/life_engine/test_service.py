@@ -7,19 +7,24 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from plugins.life_engine.constants import LIFE_CHATTER_GLOBAL_CURSOR_KEY
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.service import LifeEngineService
+from plugins.life_engine.service.core import HeartbeatModelResult
 from plugins.life_engine.service.event_builder import (
     RUNTIME_CONTEXT_FILE,
     EventType,
     LifeEngineEvent,
 )
 from plugins.life_engine.service.event_bus import RAW_EVENT_LOG_FILE
-from plugins.life_engine.service.perception_gateway import PerceptionDeliveryReceipt
+from plugins.life_engine.service.perception_gateway import (
+    PerceptionDeliveryReceipt,
+    PerceptionDeliveryUnverified,
+)
 from src.kernel.llm import ROLE, ToolRegistry
 
 
@@ -41,6 +46,19 @@ def _make_service(tmp_path: Path) -> LifeEngineService:
     config.settings.enabled = True
     config.settings.workspace_path = str(tmp_path)
     return LifeEngineService(_DummyPlugin(config=config))
+
+
+def _heartbeat_result(text: str, world_perception: Any) -> HeartbeatModelResult:
+    return HeartbeatModelResult(
+        text=text,
+        perception_receipt=PerceptionDeliveryReceipt(
+            delivery_id=world_perception.delivery_id,
+            projection_sha256=world_perception.projection_sha256,
+            delivered_bytes=world_perception.delivered_bytes,
+            exact=True,
+            transport_request_id="test-heartbeat",
+        ),
+    )
 
 
 class _FakeMemoryIndexService:
@@ -517,10 +535,11 @@ async def test_heartbeat_success_consumes_delta_without_replay(
         wake_context: str,
         *,
         heartbeat_run_id: str | None = None,
-    ) -> str:
+        world_perception: Any = None,
+    ) -> HeartbeatModelResult:
         contexts.append(wake_context)
         assert heartbeat_run_id
-        return "已处理"
+        return _heartbeat_result("已处理", world_perception)
 
     monkeypatch.setattr(service, "_run_heartbeat_model", _fake_model)
 
@@ -560,13 +579,14 @@ async def test_heartbeat_failure_keeps_delta_for_retry(
         wake_context: str,
         *,
         heartbeat_run_id: str | None = None,
-    ) -> str:
+        world_perception: Any = None,
+    ) -> HeartbeatModelResult:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise RuntimeError("model unavailable")
         retry_contexts.append(wake_context)
-        return "重试成功"
+        return _heartbeat_result("重试成功", world_perception)
 
     monkeypatch.setattr(service, "_run_heartbeat_model", _fake_model)
 
@@ -585,6 +605,36 @@ async def test_heartbeat_failure_keeps_delta_for_retry(
     assert "模型失败后必须重试这条" in retry_contexts[0]
     assert prepared.acknowledged_event_ids == [event.event_id]
     assert service._state.heartbeat_context_cursor >= event.sequence
+
+
+async def test_heartbeat_without_exact_world_receipt_keeps_delta_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _make_service(tmp_path)
+    event = service._event_builder.build_dfc_message_event(
+        "没有精确投递证明时不能推进",
+        stream_id="stream-1",
+    )
+    await service._queue_pending_event(event)
+
+    async def _unverified_model(
+        wake_context: str,
+        *,
+        heartbeat_run_id: str | None = None,
+        world_perception: Any = None,
+    ) -> HeartbeatModelResult:
+        assert wake_context and heartbeat_run_id and world_perception is not None
+        return HeartbeatModelResult("看似成功", None)
+
+    monkeypatch.setattr(service, "_run_heartbeat_model", _unverified_model)
+
+    with pytest.raises(PerceptionDeliveryUnverified):
+        await service._run_heartbeat_round(collect_background_agents=False)
+
+    assert service._state.heartbeat_context_cursor == 0
+    assert event.heartbeat_context_consumed is False
+    assert any(item.event_id == event.event_id for item in service._event_history)
 
 
 async def test_heartbeat_arrival_during_model_is_deferred_to_next_round(
@@ -610,13 +660,14 @@ async def test_heartbeat_arrival_during_model_is_deferred_to_next_round(
         wake_context: str,
         *,
         heartbeat_run_id: str | None = None,
-    ) -> str:
+        world_perception: Any = None,
+    ) -> HeartbeatModelResult:
         nonlocal calls
         calls += 1
         contexts.append(wake_context)
         if calls == 1:
             await service._queue_pending_event(arriving_event)
-        return f"reply-{calls}"
+        return _heartbeat_result(f"reply-{calls}", world_perception)
 
     monkeypatch.setattr(service, "_run_heartbeat_model", _fake_model)
 
@@ -645,13 +696,14 @@ async def test_automatic_and_manual_heartbeats_are_serialized(
         wake_context: str,
         *,
         heartbeat_run_id: str | None = None,
-    ) -> str:
+        world_perception: Any = None,
+    ) -> HeartbeatModelResult:
         nonlocal active_calls, max_active_calls
         active_calls += 1
         max_active_calls = max(max_active_calls, active_calls)
         try:
             await asyncio.sleep(0.02)
-            return "串行完成"
+            return _heartbeat_result("串行完成", world_perception)
         finally:
             active_calls -= 1
 
@@ -725,8 +777,9 @@ async def test_consumed_heartbeat_events_remain_consumed_after_restart(
         wake_context: str,
         *,
         heartbeat_run_id: str | None = None,
-    ) -> str:
-        return "已确认"
+        world_perception: Any = None,
+    ) -> HeartbeatModelResult:
+        return _heartbeat_result("已确认", world_perception)
 
     monkeypatch.setattr(service, "_run_heartbeat_model", _fake_model)
     await service._run_heartbeat_round(collect_background_agents=False)
