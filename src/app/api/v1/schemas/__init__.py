@@ -61,6 +61,16 @@ from .foundation import (
     OperationalState,
     ReadinessResponse,
 )
+from .livestream import (
+    LivestreamCommandAccepted,
+    LivestreamDanmakuRequest,
+    LivestreamEvent,
+    LivestreamEventPage,
+    LivestreamSessionPage,
+    LivestreamSessionSummary,
+    LivestreamSpeechRequest,
+    LivestreamStatus,
+)
 from .media import (
     MediaDerivative,
     MediaDerivativeList,
@@ -70,6 +80,17 @@ from .media import (
     MediaSaveResponse,
     MediaUploadCreateRequest,
     MediaUploadSession,
+)
+from .voice_call import (
+    VoiceCallCommandAccepted,
+    VoiceCallCreated,
+    VoiceCallCreateRequest,
+    VoiceCallInterruptRequest,
+    VoiceCallStatus,
+    VoiceCallTextRequest,
+    VoiceCallTicketRequest,
+    VoiceTranscriptEntry,
+    VoiceTranscriptPage,
 )
 
 __all__ = [
@@ -115,6 +136,14 @@ __all__ = [
     "EventVisibility",
     "FeatureCapability",
     "HealthResponse",
+    "LivestreamCommandAccepted",
+    "LivestreamDanmakuRequest",
+    "LivestreamEvent",
+    "LivestreamEventPage",
+    "LivestreamSessionPage",
+    "LivestreamSessionSummary",
+    "LivestreamSpeechRequest",
+    "LivestreamStatus",
     "LogoutResponse",
     "MediaDerivative",
     "MediaDerivativeList",
@@ -133,6 +162,15 @@ __all__ = [
     "SessionResponse",
     "StrictModel",
     "VersionedModel",
+    "VoiceCallCommandAccepted",
+    "VoiceCallCreateRequest",
+    "VoiceCallCreated",
+    "VoiceCallInterruptRequest",
+    "VoiceCallStatus",
+    "VoiceCallTextRequest",
+    "VoiceCallTicketRequest",
+    "VoiceTranscriptEntry",
+    "VoiceTranscriptPage",
     "WSTicketRequest",
     "WSTicketResponse",
     "utc_now",

@@ -176,6 +176,64 @@ class LivestreamRuntime:
         await self.stage.interrupt(utterance_id, reason)
         return True
 
+    async def send_danmaku(self, text: str) -> dict[str, Any]:
+        """Send one explicit operator danmaku and persist its delivery result."""
+
+        normalized = text.strip()
+        if not normalized:
+            raise ValueError("danmaku text must not be empty")
+        ledger, session_id = self._require_running()
+        request_id = uuid4().hex
+        adapter = self._adapter
+        sender = getattr(adapter, "send_danmaku", None)
+        if not callable(sender):
+            raise TypeError("livestream platform does not support danmaku sending")
+        await ledger.append(
+            record_id=f"danmaku-requested:{request_id}",
+            session_id=session_id,
+            kind="platform.danmaku_send_requested",
+            source="livestream.operator",
+            payload={"request_id": request_id, "text": normalized},
+            correlation_id=request_id,
+        )
+        try:
+            confirmed = bool(await sender(normalized))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await ledger.append(
+                record_id=f"danmaku-failed:{request_id}",
+                session_id=session_id,
+                kind="platform.danmaku_send_failed",
+                source="livestream.platform",
+                payload={"request_id": request_id, "error_type": type(exc).__name__},
+                correlation_id=request_id,
+                causation_id=f"danmaku-requested:{request_id}",
+            )
+            raise RuntimeError("livestream platform confirmed danmaku failure") from exc
+        if not confirmed:
+            await ledger.append(
+                record_id=f"danmaku-unsupported:{request_id}",
+                session_id=session_id,
+                kind="platform.danmaku_send_failed",
+                source="livestream.platform",
+                payload={"request_id": request_id, "reason": "capability_disabled"},
+                correlation_id=request_id,
+                causation_id=f"danmaku-requested:{request_id}",
+            )
+            raise RuntimeError("livestream platform does not support danmaku sending")
+        receipt_id = f"danmaku-receipt:{request_id}"
+        await ledger.append(
+            record_id=receipt_id,
+            session_id=session_id,
+            kind="platform.danmaku_sent",
+            source="livestream.platform",
+            payload={"request_id": request_id, "confirmed": True},
+            correlation_id=request_id,
+            causation_id=f"danmaku-requested:{request_id}",
+        )
+        return {"request_id": request_id, "receipt_id": receipt_id, "confirmed": True}
+
     async def health(self) -> HealthSnapshot:
         ledger = self._ledger
         session_id = self._session_id

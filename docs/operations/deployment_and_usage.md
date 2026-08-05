@@ -383,6 +383,14 @@ app_api_v1_max_websocket_connections = 64
 - 媒体 owner 可访问自己的对象；共享对象必须绑定调用会话实际持有的精确 grant、`namespace:*` 或 `*`。非 owner 越权与不存在统一 404。下载支持 ETag 与单一 Range，无效 Range 返回 416；complete、下载和聊天发送前都会校验大小、SHA-256、MIME 与文件签名；
 - API SQLite 保存媒体对象元数据，`runtime/media/objects/` 保存内容，二者必须作为同一恢复单元备份。`runtime/media/uploads/` 是临时上传区；当前只提供只读 cleanup candidate 识别，不自动删除未知或孤儿文件。恢复后必须验证 descriptor、对象 hash、saved 状态和 `sync_outbox` 连续性；
 - 媒体 complete/save 事件复用既有 `sync_outbox`，保持 `private`、`held`，不包含 path、base64 或原始 bytes。recognize 后只持久化识别状态和文本；Provider 异常原文不会通过 API 返回；
+- P3-08 直播端点为 `GET /livestream/status`、场次列表／详情／事件历史、`POST /livestream/session:start|stop|interrupt`、`POST /livestream/speech:request`、`POST /livestream/danmaku:send` 和 `WS /livestream/stage/ws`。只读端点要求 `livestream:read`；副作用端点要求 `livestream:operate` 且角色为 `administrator` 或受信 `platform_service`；
+- 直播查询只打开已经存在的 Livestream ledger，不会创建场次、连接 B站、启动 TTS 或唤醒意识实例。start 仍要求已连接 primary stage，API 挂载与查询不会自动开播，也不会自动启动或重启 Elysium；平台运行中断线时 status 显示 `degraded`；
+- 直播 stage WebSocket 复用 `/auth/ws-tickets` 的资源、Origin、subprotocol 和单次消费绑定。observer 只读且不能申请 primary 或提交播放回执；operator ticket 需同时携带 `livestream:operate`。播放副作用仍以直播 ledger 中稳定的 `playback.dispatched`／`playback.receipt` 以及 playback／utterance／chunk identity 为证据；
+- 弹幕发送先写 `platform.danmaku_send_requested`，再写 confirmed／failed 结果，命令最终状态可通过 `/commands/{command_id}` 查询。当前 Bilibili Adapter 是只读接入且不持有账号 CSRF 写凭据，因此真实弹幕发送会显式失败；不得配置成普通聊天降级或把 `False` 当成功；
+- P3-09 语音通话端点为 `POST /voice-calls`、`GET /voice-calls/{call_id}`、resume／interrupt／end／text、transcripts、tickets，以及 participant／observer WebSocket。创建只耐久登记 `call_id=episode_id`，不连接 Provider；participant WebSocket 才拥有实时会话资源；
+- 语音 participant 继续使用 Voice Live v1 PCM16 二进制帧，禁止 base64 音频。公共网关强制把 start/resume 绑定到 URL `call_id`，客户端不能切换到另一 episode；observer 只接收该 call 的 JSON 状态／字幕，不转发音频且拒绝写操作；
+- 语音 ticket 绑定 resource、subprotocol、Origin、session、credential 和 scope，单次消费；transcripts 只导出 append-only episode store 中的 final 记录，按 owner 或精确 `voice_call:{call_id}` grant 过滤；旧 `/voice-live` 路由迁移期保留；
+- Voice Live 插件或 Provider 不可用时显式返回 capability unavailable／Provider failure，不自动加载插件、不切换主体模型、不启动或重启 Elysium。当前仅完成离线 API 与网关契约测试，真实 Provider、双向音频、断线重连和客户端 E2E 仍需单独授权验收；
 - 重启只会重新调度 `accepted`。进程退出前已经进入 `executing` 而无法证明投递结果的命令会转为 `delivery_unknown`，不得由客户端或服务端自动盲重试；应先查询外部系统或领域 receipt，再由具有明确幂等证据的领域流程决定后续动作；
 - 命令技术状态事件与状态迁移在同一 SQLite 事务进入既有 `sync_outbox`，当前保持 `private`、`held`，不复制原始 payload，也不建立第二套远程同步；备份恢复后应检查 accepted 恢复、executing 栅栏和 Outbox 连续性；
 - `/readiness` 只读聚合已经存在的内存状态，不调用插件或 Adapter 主动 health，不建立连接、不建表、不执行修复，也不访问会创建 Life Engine service 的懒加载属性；配置停用的平台显示 `disabled`，而不是失败或从列表消失；
@@ -1380,3 +1388,5 @@ config/
 | 2026-08-03 | 依赖安装与环境恢复 | 补充无 `uv` 时通过项目 `.venv` 安装完整依赖、为插件安装器补装并暴露项目级 `uv`、`pip check` 与启动导入验收，以及损坏环境改名备份、重建和回退流程 |
 | 2026-08-04 | TTS 现状修正 | 明确当前任务式本地 TTS 为 IndexTTS2；GPT-SoVITS/Higgs 仅属于停用的遗留兼容插件，不再作为爱莉当前 TTS 模型描述 |
 | 2026-08-04 | 阶段三 P3-07 | 接入 8 个受管媒体端点、`runtime/media/` 持久化、resource grant、完整性校验、既有 `sync_outbox` 和聊天图片/语音 `media_id` resolver；明确尚未做真实客户端/Provider E2E |
+| 2026-08-05 | 阶段三 P3-08 | 接入直播状态、场次与事件历史、5 类耐久命令和统一 stage ticket/WS；保持手工开播、observer 只读、平台断线 degraded，并明确 B站弹幕写能力尚未具备真实凭据与 E2E |
+| 2026-08-05 | 阶段三 P3-09 | 接入语音通话耐久登记、状态/转写查询、4 类耐久命令、资源绑定 ticket 和 participant/observer WS；保留 PCM16 二进制协议与旧路由，明确真实 Provider/双向音频/重连 E2E 暂未验收 |

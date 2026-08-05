@@ -51,7 +51,9 @@ from .schemas import (
 from .tokens import SignedValueCodec, SignedValueError
 
 if TYPE_CHECKING:
+    from .livestream import LivestreamProvider
     from .media_objects import ManagedMediaService
+    from .voice_calls import VoiceCallProvider
 
 REQUEST_ID_HEADER = "X-Request-ID"
 AUTH_HEADER = "Authorization"
@@ -124,6 +126,8 @@ class APIContext:
     command_store: CommandStore | None = None
     command_dispatcher: CommandDispatcher | None = None
     chat_commands_enabled: bool = False
+    livestream: "LivestreamProvider | None" = None
+    voice_calls: "VoiceCallProvider | None" = None
 
 
 class RequestIDMiddleware(BaseHTTPMiddleware):
@@ -956,6 +960,32 @@ def create_api_app(context: APIContext) -> FastAPI:
                     store=context.command_store,
                     dispatcher=context.command_dispatcher,
                     require_scope=require_scope,
+                )
+            )
+        if context.livestream is not None:
+            from .livestream import LivestreamQueryService, create_livestream_router
+
+            app.include_router(
+                create_livestream_router(
+                    queries=LivestreamQueryService(context.livestream, context.codec),
+                    store=context.command_store,
+                    dispatcher=context.command_dispatcher,
+                    require_scope=require_scope,
+                    auth_store=context.store,
+                    codec=context.codec,
+                )
+            )
+        if context.voice_calls is not None:
+            from .voice_calls import VoiceCallQueryService, create_voice_call_router
+
+            app.include_router(
+                create_voice_call_router(
+                    queries=VoiceCallQueryService(context.voice_calls, context.codec),
+                    store=context.command_store,
+                    dispatcher=context.command_dispatcher,
+                    require_scope=require_scope,
+                    auth_store=context.store,
+                    codec=context.codec,
                 )
             )
     return app

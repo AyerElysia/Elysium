@@ -285,3 +285,9 @@ class LivestreamRouter(BaseRouter):
                 await self._runtime.stop(reason="application shutdown")
         finally:
             await self._stage.close()
+
+    @property
+    def runtime(self) -> LivestreamRuntime:
+        """Expose the owned runtime through a stable domain boundary."""
+
+        return self._runtime

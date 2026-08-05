@@ -83,6 +83,23 @@ def test_p3_04_command_contracts_are_validated() -> None:
     assert {API_INVENTORY_BY_KEY[key].status for key in keys} == {"validated"}
 
 
+def test_p3_08_livestream_contracts_are_validated() -> None:
+    keys = {
+        ("GET", "/api/v1/livestream/status"),
+        ("GET", "/api/v1/livestream/sessions"),
+        ("GET", "/api/v1/livestream/sessions/{session_id}"),
+        ("GET", "/api/v1/livestream/sessions/{session_id}/events"),
+        ("POST", "/api/v1/livestream/session:start"),
+        ("POST", "/api/v1/livestream/session:stop"),
+        ("POST", "/api/v1/livestream/session:interrupt"),
+        ("POST", "/api/v1/livestream/speech:request"),
+        ("POST", "/api/v1/livestream/danmaku:send"),
+        ("WS", "/api/v1/livestream/stage/ws"),
+    }
+
+    assert {API_INVENTORY_BY_KEY[key].status for key in keys} == {"validated"}
+
+
 def test_p3_07_media_contracts_are_validated() -> None:
     keys = {
         ("POST", "/api/v1/media/uploads"),

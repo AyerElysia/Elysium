@@ -240,7 +240,8 @@ WS /api/v1/livestream/stage/ws
         callers=_ALL_CALLERS,
         scopes=("livestream:read", "livestream:operate", "livestream:admin"),
         resource_authorization="按 session、observer/operator 身份、舞台 ticket 和平台 capability 投影",
-        anchor="plugins/livestream/runtime.py、ledger.py 与 router.py；需新增稳定 facade",
+        anchor="src/app/api/v1/livestream.py、livestream_runtime.py、schemas/livestream.py 与 plugins/livestream/runtime.py、ledger.py、stage.py",
+        status="validated",
     ),
     *_contracts(
         """
@@ -260,7 +261,8 @@ WS /api/v1/voice-calls/{call_id}/observe
         callers=_ALL_CALLERS,
         scopes=("voice_call:read", "voice_call:operate", "voice_call:observe"),
         resource_authorization="校验 call participant／observer、单次 ticket、Origin 与 transcript visibility",
-        anchor="plugins/voice_live/protocol.py、session.py 与 router.py；需补耐久元数据 facade",
+        anchor="src/app/api/v1/voice_calls.py、voice_runtime.py、schemas/voice_call.py 与 plugins/voice_live/protocol.py、session.py、runtime_store.py、router.py",
+        status="validated",
     ),
     *_contracts(
         """

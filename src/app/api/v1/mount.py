@@ -92,6 +92,8 @@ def mount_api_v1(
     command_registry: HandlerRegistry | None = None,
     chat_command_service: object | None = None,
     chat_command_service_factory: Callable[..., object] | None = None,
+    livestream_provider: object | None = None,
+    voice_call_provider: object | None = None,
     task_manager: TaskManager | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> APIV1Mount:
@@ -141,6 +143,14 @@ def mount_api_v1(
             if not callable(register):
                 raise TypeError("chat_command_service must provide register(registry)")
             register(registry)
+        if livestream_provider is not None:
+            from .livestream import LivestreamCommandService
+
+            LivestreamCommandService(livestream_provider).register(registry)
+        if voice_call_provider is not None:
+            from .voice_calls import VoiceCallCommandService
+
+            VoiceCallCommandService(voice_call_provider).register(registry)
         command_dispatcher = CommandDispatcher(
             command_store,
             registry=registry,
@@ -164,6 +174,8 @@ def mount_api_v1(
             command_store=command_store,
             command_dispatcher=command_dispatcher,
             chat_commands_enabled=chat_command_service is not None,
+            livestream=livestream_provider,
+            voice_calls=voice_call_provider,
         )
         app = create_api_app(context)
         app.add_middleware(

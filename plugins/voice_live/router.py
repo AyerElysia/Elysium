@@ -37,6 +37,7 @@ class VoiceLiveRouter(BaseRouter):
         self._sessions: dict[str, CallSession] = {}
         self._sessions_lock = asyncio.Lock()
         self._observers: set[WebSocket] = set()
+        self._public_observers: dict[str, set[WebSocket]] = {}
         config = plugin.config
         self.custom_route_path = config.server.route_path
         environment_name = str(config.server.ticket_secret_env or "").strip()
@@ -55,6 +56,114 @@ class VoiceLiveRouter(BaseRouter):
 
     def session_snapshots(self) -> list[dict[str, Any]]:
         return [session.snapshot() for session in self._sessions.values()]
+
+    def get_session(self, call_id: str) -> CallSession | None:
+        """Return the plugin-owned active session without creating resources."""
+
+        return self._sessions.get(call_id)
+
+    async def handle_public_participant(self, websocket: WebSocket, call_id: str) -> None:
+        """Own one authenticated participant socket for an existing durable call."""
+
+        config = self.plugin.config
+        session = CallSession(config, session_id=call_id)
+        async with self._sessions_lock:
+            if call_id in self._sessions:
+                await websocket.close(code=1008, reason="voice call already connected")
+                return
+            if len(self._sessions) >= config.server.max_concurrent_sessions:
+                await websocket.close(code=1013, reason="Voice Live session capacity reached")
+                return
+            self._sessions[call_id] = session
+
+        async def send_json(data: dict[str, Any]) -> None:
+            await websocket.send_json(data)
+            await self._broadcast_public(call_id, data)
+
+        session.set_send_callbacks(send_json, websocket.send_bytes)
+        reason = "disconnect"
+        try:
+            async with asyncio.timeout(config.server.max_session_minutes * 60):
+                while session.state not in {SessionState.ENDED, SessionState.FAILED}:
+                    try:
+                        message = await asyncio.wait_for(
+                            websocket.receive(), timeout=config.server.idle_timeout_seconds
+                        )
+                    except TimeoutError:
+                        reason = "idle_timeout"
+                        break
+                    if message.get("type") == "websocket.disconnect":
+                        break
+                    if message.get("bytes") is not None:
+                        await session.handle_audio(message["bytes"])
+                    elif message.get("text") is not None:
+                        payload = json.loads(message["text"])
+                        if not isinstance(payload, dict):
+                            raise ValueError("Voice Live control event must be an object")
+                        if payload.get("type") == "start":
+                            payload["resume_episode_id"] = call_id
+                        await session.handle_message(payload)
+        except WebSocketDisconnect:
+            pass
+        except TimeoutError:
+            reason = "session_limit"
+        except Exception as exc:
+            reason = "transport_error"
+            logger.exception("Voice Live public WebSocket exception")
+            try:
+                await websocket.send_json({"type": "error", "message": str(exc), "fatal": True})
+            except Exception:  # noqa: BLE001 - transport may already be closed
+                logger.debug("Voice Live public error frame could not be delivered")
+        finally:
+            await session.stop(reason=reason)
+            async with self._sessions_lock:
+                self._sessions.pop(call_id, None)
+
+    async def handle_public_observer(self, websocket: WebSocket, call_id: str) -> None:
+        """Serve a read-only state/transcript observer; never relay audio."""
+
+        observers = self._public_observers.setdefault(call_id, set())
+        observers.add(websocket)
+        session = self._sessions.get(call_id)
+        await websocket.send_json(
+            {
+                "type": "observer.ready",
+                "protocol": 1,
+                "call_id": call_id,
+                "session": session.snapshot() if session is not None else None,
+            }
+        )
+        try:
+            while True:
+                message = await websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    return
+                if message.get("bytes") is not None:
+                    await websocket.close(code=1008, reason="observer is read-only")
+                    return
+                if message.get("text"):
+                    event = json.loads(message["text"])
+                    if event.get("type") == "ping":
+                        await websocket.send_json({"type": "pong"})
+                    else:
+                        await websocket.close(code=1008, reason="observer is read-only")
+                        return
+        except WebSocketDisconnect:
+            pass
+        finally:
+            observers.discard(websocket)
+            if not observers:
+                self._public_observers.pop(call_id, None)
+
+    async def _broadcast_public(self, call_id: str, data: dict[str, Any]) -> None:
+        stale: list[WebSocket] = []
+        for observer in tuple(self._public_observers.get(call_id, ())):
+            try:
+                await observer.send_json(data)
+            except Exception:  # noqa: BLE001 - stale transport is removed
+                stale.append(observer)
+        for observer in stale:
+            self._public_observers.get(call_id, set()).discard(observer)
 
     def _readiness_snapshot(self) -> dict[str, Any]:
         """Return redacted local prerequisites without contacting dependencies."""
@@ -320,8 +429,14 @@ class VoiceLiveRouter(BaseRouter):
     async def shutdown(self) -> None:
         await self.stop_all()
         observers = tuple(self._observers)
+        public_observers = tuple(
+            observer
+            for group in self._public_observers.values()
+            for observer in group
+        )
         self._observers.clear()
-        for observer in observers:
+        self._public_observers.clear()
+        for observer in (*observers, *public_observers):
             try:
                 await observer.close(code=1001)
             except Exception:

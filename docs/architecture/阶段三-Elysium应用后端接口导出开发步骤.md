@@ -1297,7 +1297,7 @@ Provider 边界必须如实保留：NapCat notice 已覆盖撤回、回应、戳
 >
 > owner 或持有对象绑定 resource grant 的当前会话可以访问；非 owner 越权与不存在统一 404。上传者不能把对象绑定到自己未持有的 grant，管理员为显式例外。媒体完成与保存状态在同一 SQLite 事务写入既有 `sync_outbox`，事件保持 `private`／`held` 且不含路径、base64 或原始 bytes，不建立第二套同步机制。生产 `APIV1Mount` 拥有并按关闭顺序释放媒体 store，并把同一 resolver 注入 P3-06 聊天命令。
 >
-> 当前完成的是用户媒体 API 与聊天图片／语音 `media_id` 解析合同。P3-08 直播和 P3-09 语音通话领域接口尚未实现，不能声称它们已经完成统一迁移；后续实现只能复用该 `media_id` 合同。孤儿清理由本阶段提供只读、owner 可证明的 cleanup candidate 查询，实际删除仍应作为显式维护动作实施。未启动或重启 Elysium，也未完成真实前端／Provider 端到端验收。
+> 当前完成的是用户媒体 API 与聊天图片／语音 `media_id` 解析合同。P3-08 直播统一接口已于 2026-08-05 完成离线合同与生产组装，但当前直播协议没有媒体上传入参；P3-09 语音通话领域接口尚未实现，不能声称其已经完成统一迁移。后续出现直播／语音媒体入参时只能复用该 `media_id` 合同。孤儿清理由本阶段提供只读、owner 可证明的 cleanup candidate 查询，实际删除仍应作为显式维护动作实施。未启动或重启 Elysium，也未完成真实前端／Provider 端到端验收。
 
 任务：
 
@@ -1311,6 +1311,12 @@ Provider 边界必须如实保留：NapCat notice 已覆盖撤回、回应、戳
 
 ### P3-08：直播接口统一
 
+> **实施状态（2026-08-05）：已完成离线合同与生产组装。** `/api/v1/livestream` 已导出 status、场次 keyset 历史、单场次、场次事件、start／stop／interrupt／speech／danmaku 五类耐久命令及统一 stage WebSocket。查询只打开已经存在的直播 ledger，不创建场次、不连接平台；生产通过 late-bound provider 复用插件 Router 持有的同一 Runtime／Stage，不抓取平台私有客户端。
+>
+> start／stop／interrupt／speech／danmaku 统一进入既有 command ledger 和 dispatcher，要求 `livestream:operate` 且调用者为全能管理员或受信 platform service；HTTP 202 仅表示已耐久受理，最终结果通过 command 查询。弹幕发送在直播 ledger 中先记 requested，再记录 confirmed／failed；当前 Bilibili Adapter 明确不具备账号 CSRF 写权限，因此真实部署会返回可查询失败，不伪装成功也不降级为普通聊天。
+>
+> stage 使用 P3-01 资源绑定、Origin 绑定、单次消费 ticket；只持有 `livestream:read` 的 observer 不能申请 primary，也不能提交播放回执，带 `livestream:operate` 的 operator 才能参与回执。既有 `playback.dispatched`、`playback.receipt` 与稳定 playback／utterance／chunk identity 继续作为唯一舞台副作用证据。平台运行中断线会投影为 `degraded`，但不会自动开播、自动启动 Elysium 或静默重连控制面。已完成离线 API／ledger／runtime 契约测试；未启动或重启 Elysium，未做真实前端、B站账号弹幕或 OBS／浏览器舞台端到端验收。
+
 任务：
 
 1. 包装 Livestream Runtime 和 Ledger。
@@ -1322,6 +1328,18 @@ Provider 边界必须如实保留：NapCat notice 已覆盖撤回、回应、戳
 验收门：不开启自动开播；历史与实时无缺口；发送弹幕结果可查询；观察者不能操作；平台断线显示 degraded。
 
 ### P3-09：语音通话接口统一
+
+状态：**已完成代码接入与离线契约验收；真实 Provider、双向音频和客户端重连 E2E 暂未验收。**
+
+已落地：
+
+- 导出 `POST /api/v1/voice-calls`、`GET /api/v1/voice-calls/{call_id}`、transcripts、resume／interrupt／end／text、资源绑定 ticket，以及 participant／observer 两条 WebSocket；
+- REST 创建只追加 `call.created` 与 checkpoint，不连接 Provider；participant WebSocket 才取得实时会话资源，且 URL `call_id` 强制绑定同一 `episode_id`；
+- 保留 Voice Live v1 PCM16 二进制帧，不通过 JSON/base64 转发音频；observer 只接收 JSON 状态／字幕，不接收音频且不可操作；
+- final transcript 从 append-only episode store 分页投影，按 owner 或 `voice_call:{call_id}` grant 过滤；partial 不进入查询结果；
+- resume／interrupt／end／text 进入统一耐久命令账本，要求 `Idempotency-Key`，复用既有 accepted 恢复、result event 与 outbox 语义；
+- ticket 绑定 resource、subprotocol、Origin、session 与 credential，单次消费；旧 `/voice-live` 路由保留，未删除或自动接管；
+- Voice Live 插件未加载时创建返回 capability disabled，不自动加载、不启动 Elysium 或 Provider。
 
 任务：
 

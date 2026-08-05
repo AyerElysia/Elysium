@@ -393,6 +393,47 @@ class LivestreamLedger:
         rows = await cursor.fetchall()
         return [self._row_to_record(row) for row in rows]
 
+    async def read_before(
+        self,
+        sequence: int | None,
+        *,
+        kinds: Iterable[str] | None = None,
+        limit: int = 100,
+    ) -> list[LedgerRecord]:
+        """Read immutable records in descending order for keyset history pages."""
+
+        if sequence is not None and sequence <= 0:
+            raise ValueError("sequence must be positive")
+        if limit <= 0 or limit > 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        db = self._require_db()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if sequence is not None:
+            clauses.append("sequence < ?")
+            params.append(sequence)
+        kind_list = list(kinds or [])
+        if kind_list:
+            placeholders = ",".join("?" for _ in kind_list)
+            clauses.append(f"kind IN ({placeholders})")
+            params.extend(kind_list)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        cursor = await db.execute(
+            f"""
+            SELECT sequence, record_id, session_id, kind, occurred_at,
+                   source, correlation_id, causation_id, payload_json,
+                   payload_sha256, recorded_at
+            FROM livestream_records
+            {where}
+            ORDER BY sequence DESC
+            LIMIT ?
+            """,
+            params,
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_record(row) for row in rows]
+
     async def get_record(self, record_id: str) -> LedgerRecord | None:
         """Return one immutable record by stable identity."""
 

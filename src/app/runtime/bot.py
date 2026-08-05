@@ -634,7 +634,9 @@ class Bot:
                     FoundationProjection,
                     snapshot_from_bot,
                 )
+                from src.app.api.v1.livestream_runtime import MountedLivestreamProvider
                 from src.app.api.v1.mount import mount_api_v1
+                from src.app.api.v1.voice_runtime import MountedVoiceCallProvider
 
                 foundation = FoundationProjection(
                     node_id=self.bot_name,
@@ -656,6 +658,8 @@ class Bot:
                     foundation=foundation,
                     event_store_provider=lambda: event_store_from_bot(self),
                     chat_command_service_factory=create_chat_command_service,
+                    livestream_provider=MountedLivestreamProvider(),
+                    voice_call_provider=MountedVoiceCallProvider(),
                     task_manager=self.task_manager,
                 )
                 await self.app_api_mount.start()
