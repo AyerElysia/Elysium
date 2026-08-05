@@ -16,8 +16,10 @@ from plugins.life_engine.service import LifeEngineService
 from plugins.life_engine.service.event_builder import (
     RUNTIME_CONTEXT_FILE,
     EventType,
+    LifeEngineEvent,
 )
 from plugins.life_engine.service.event_bus import RAW_EVENT_LOG_FILE
+from plugins.life_engine.service.perception_gateway import PerceptionDeliveryReceipt
 from src.kernel.llm import ROLE, ToolRegistry
 
 
@@ -383,8 +385,39 @@ async def test_heartbeat_tool_execution_keeps_declared_reason_parameter(
 async def test_chatter_context_cursor_persists_across_restart(tmp_path: Path) -> None:
     """life_chatter 事件流游标应持久化，避免重启后重复注入旧事件。"""
     service = _make_service(tmp_path)
+    service._event_history = [
+        LifeEngineEvent(
+            event_id="evt-42",
+            event_type=EventType.MESSAGE,
+            timestamp="2026-04-29T12:00:00+08:00",
+            sequence=42,
+            source="life_engine",
+            source_detail="test",
+            content="CURSOR_42",
+            content_type="text",
+            stream_id="stream-1",
+            sender="test",
+        )
+    ]
+    _, high_water = await service.build_chatter_runtime_context(
+        SimpleNamespace(stream_id="stream-1")
+    )
+    delivery = service.get_pending_chatter_runtime_delivery("stream-1")
+    assert delivery is not None
+    prepared = delivery.prepared_perception
+    receipt = PerceptionDeliveryReceipt(
+        delivery_id=prepared.delivery_id,
+        projection_sha256=prepared.projection_sha256,
+        delivered_bytes=prepared.delivered_bytes,
+        exact=True,
+        transport_request_id="test-request",
+    )
 
-    await service.mark_chatter_runtime_context_seen("stream-1", 42)
+    await service.mark_chatter_runtime_context_seen(
+        "stream-1",
+        high_water,
+        receipt=receipt,
+    )
     await service._save_runtime_context()
 
     restored = _make_service(tmp_path)

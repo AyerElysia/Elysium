@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import plugins.life_engine.core.chatter as chatter_module
 
 from plugins.life_engine.core.config import LifeEngineConfig
+from plugins.life_engine.core.context_assembly import LifeChatterContextAssembler
 from plugins.life_engine.core.chatter import (
     LifeChatter,
     _GLOBAL_RUNTIME_BUSY_RETRY_SECONDS,
@@ -18,6 +19,10 @@ from plugins.life_engine.core.chatter import (
 from plugins.life_engine.constants import LIFE_CHATTER_GLOBAL_CURSOR_KEY
 from plugins.life_engine.service.core import LifeEngineService
 from plugins.life_engine.service.event_builder import EventType, LifeEngineEvent
+from plugins.life_engine.service.perception_gateway import (
+    PerceptionDeliveryReceipt,
+    PerceptionDeliveryUnverified,
+)
 from plugins.life_engine.tools.exec_tools import LifeEngineBashTool
 from plugins.life_engine.tools.file_tools import LifeEngineRunAgentTool, LifeEngineWakeDFCTool
 from src.core.components.base.chatter import BaseChatter, Failure, Success, Wait
@@ -44,6 +49,27 @@ async def _skip_snapshot_save(_response: object) -> None:
         _response: 被忽略的 LLM 响应对象。
     """
     return None
+
+
+def _exact_pending_perception_receipt(
+    service: LifeEngineService,
+    stream_id: str,
+    *,
+    unified_chatter_context: bool = False,
+) -> PerceptionDeliveryReceipt:
+    delivery = service.get_pending_chatter_runtime_delivery(
+        stream_id,
+        unified_chatter_context=unified_chatter_context,
+    )
+    assert delivery is not None
+    prepared = delivery.prepared_perception
+    return PerceptionDeliveryReceipt(
+        delivery_id=prepared.delivery_id,
+        projection_sha256=prepared.projection_sha256,
+        delivered_bytes=prepared.delivered_bytes,
+        exact=True,
+        transport_request_id="test-request",
+    )
 
 
 def test_life_chatter_system_prompt_includes_memory_and_chatter_tools_not_heartbeat_tool(tmp_path) -> None:
@@ -1809,6 +1835,105 @@ async def test_live_bridge_prompt_exposes_three_layer_aliases(monkeypatch) -> No
     assert "当前场景：B站直播间接弹幕。" in bundle["rolling_prompt"]
 
 
+def test_life_chatter_registers_exact_final_suffix_text() -> None:
+    marker = "life-chatter-runtime:delivery-1"
+    context_text = f'<life_chatter_runtime_delivery marker="{marker}">ok</life_chatter_runtime_delivery>'
+    registered: dict[str, object] = {}
+
+    class Response:
+        def register_context_delivery(
+            self,
+            delivery_id: str,
+            expected_text: str,
+            *,
+            marker: str,
+        ) -> None:
+            registered.update(
+                delivery_id=delivery_id,
+                expected_text=expected_text,
+                marker=marker,
+            )
+
+    delivery = SimpleNamespace(
+        delivery_id="delivery-1",
+        delivery_marker=marker,
+    )
+    LifeChatter._register_suffix_context_delivery(
+        Response(),
+        context_text,
+        delivery,
+    )
+
+    expected = LifeChatterContextAssembler.wrap_suffix_prompt(context_text)
+    assert expected is not None
+    assert registered == {
+        "delivery_id": "delivery-1",
+        "expected_text": expected.text,
+        "marker": marker,
+    }
+    assert len(expected.text.encode("utf-8")) <= 64 * 1024
+
+
+def test_life_chatter_rejects_effective_suffix_over_64k() -> None:
+    marker = "life-chatter-runtime:delivery-overflow"
+    context_text = f"{marker}\n" + ("界" * (64 * 1024))
+    response = SimpleNamespace(register_context_delivery=lambda *_args, **_kwargs: None)
+    delivery = SimpleNamespace(
+        delivery_id="delivery-overflow",
+        delivery_marker=marker,
+    )
+
+    with pytest.raises(RuntimeError, match="hard byte budget"):
+        LifeChatter._register_suffix_context_delivery(
+            response,
+            context_text,
+            delivery,
+        )
+
+
+def test_life_chatter_maps_only_exact_whole_suffix_receipt() -> None:
+    prepared = SimpleNamespace(
+        delivery_id="world-delivery",
+        projection_sha256="world-sha",
+        delivered_bytes=2048,
+    )
+    delivery = SimpleNamespace(
+        delivery_id="suffix-delivery",
+        prepared_perception=prepared,
+    )
+    exact = SimpleNamespace(
+        exact_present=True,
+        expected_utf8_bytes=4096,
+        effective_utf8_bytes=4096,
+        expected_sha256="suffix-sha",
+        effective_sha256="suffix-sha",
+    )
+    response = SimpleNamespace(
+        request_record_id=17,
+        effective_context_receipt=lambda delivery_id: (
+            exact if delivery_id == "suffix-delivery" else None
+        ),
+    )
+
+    receipt = LifeChatter._perception_receipt_from_model_response(
+        response,
+        delivery,
+    )
+
+    assert receipt == PerceptionDeliveryReceipt(
+        delivery_id="world-delivery",
+        projection_sha256="world-sha",
+        delivered_bytes=2048,
+        exact=True,
+        transport_request_id="17",
+    )
+    exact.exact_present = False
+    assert (
+        LifeChatter._perception_receipt_from_model_response(response, delivery)
+        is None
+    )
+
+
 async def test_life_chatter_dynamic_context_is_separate_snapshot() -> None:
     """动态上下文应能单独构建，用于本次请求 transient 注入。"""
     chatter = LifeChatter.__new__(LifeChatter)
@@ -2066,6 +2191,9 @@ async def test_life_chatter_cursor_persistence_cancellation_keeps_flushed_turn(
                 LLMPayload(ROLE.USER, Text("accepted unread")),
             ]
 
+        def register_context_delivery(self, *_args, **_kwargs) -> None:
+            return None
+
         async def send(self, *, stream: bool = False):
             assert stream is False
             self.payloads.append(
@@ -2090,7 +2218,7 @@ async def test_life_chatter_cursor_persistence_cancellation_keeps_flushed_turn(
         unread_msgs_to_flush=[unread],
         unread_payloads_before_turn=[LLMPayload(ROLE.USER, Text("older turn"))],
         unread_history_merged_before_turn=False,
-        pending_transient_context_text="TRANSIENT",
+        pending_transient_context_text="life-chatter-runtime:cancellation",
         pending_life_context_high_water=9,
         active_stream_id="stream-a",
         active_unread_turn_key="turn-1",
@@ -2103,6 +2231,19 @@ async def test_life_chatter_cursor_persistence_cancellation_keeps_flushed_turn(
             return SimpleNamespace(stream_id=stream_id)
 
     class CancellingService:
+        delivery = SimpleNamespace(
+            delivery_id="cancellation",
+            delivery_marker="life-chatter-runtime:cancellation",
+            event_through_sequence=9,
+            prepared_perception=SimpleNamespace(),
+        )
+
+        def get_pending_chatter_runtime_delivery(self, *_args, **_kwargs):
+            return self.delivery
+
+        def has_pending_chatter_perception(self, *_args, **_kwargs) -> bool:
+            return True
+
         async def mark_chatter_runtime_context_seen(self, *_args, **_kwargs) -> None:
             raise asyncio.CancelledError
 
@@ -2130,6 +2271,11 @@ async def test_life_chatter_cursor_persistence_cancellation_keeps_flushed_turn(
     monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
     monkeypatch.setattr(chatter, "flush_unreads", fake_flush_unreads)
     monkeypatch.setattr(chatter, "_await_model_turn", immediate_model_turn)
+    monkeypatch.setattr(
+        chatter,
+        "_perception_receipt_from_model_response",
+        lambda *_args, **_kwargs: object(),
+    )
 
     generator = chatter.execute()
     with pytest.raises(asyncio.CancelledError):
@@ -2327,15 +2473,32 @@ async def test_life_chatter_runtime_context_cursor_avoids_repeat_injection(tmp_p
     chat_stream = SimpleNamespace(stream_id="stream-1")
 
     first_text, first_high_water = await service.build_chatter_runtime_context(chat_stream)
-    await service.mark_chatter_runtime_context_seen(chat_stream.stream_id, 1)
+    first_receipt = _exact_pending_perception_receipt(
+        service,
+        chat_stream.stream_id,
+    )
+    with pytest.raises(PerceptionDeliveryUnverified, match="event frontier"):
+        await service.mark_chatter_runtime_context_seen(
+            chat_stream.stream_id,
+            1,
+            receipt=first_receipt,
+        )
     second_text, second_high_water = await service.build_chatter_runtime_context(chat_stream)
-    await service.mark_chatter_runtime_context_seen(chat_stream.stream_id, first_high_water)
+    second_receipt = _exact_pending_perception_receipt(
+        service,
+        chat_stream.stream_id,
+    )
+    await service.mark_chatter_runtime_context_seen(
+        chat_stream.stream_id,
+        second_high_water,
+        receipt=second_receipt,
+    )
     third_text, third_high_water = await service.build_chatter_runtime_context(chat_stream)
 
     assert "OLD_LIFE_EVENT" in first_text
     assert "NEW_LIFE_EVENT" in first_text
     assert first_high_water == 2
-    assert "OLD_LIFE_EVENT" not in second_text
+    assert "OLD_LIFE_EVENT" in second_text
     assert "NEW_LIFE_EVENT" in second_text
     assert second_high_water == 2
     assert "OLD_LIFE_EVENT" not in third_text
@@ -2384,6 +2547,11 @@ async def test_life_chatter_unified_runtime_context_uses_global_cursor(tmp_path)
         chat_stream.stream_id,
         first_high_water,
         unified_chatter_context=True,
+        receipt=_exact_pending_perception_receipt(
+            service,
+            chat_stream.stream_id,
+            unified_chatter_context=True,
+        ),
     )
     second_text, second_high_water = await service.build_chatter_runtime_context(
         chat_stream,

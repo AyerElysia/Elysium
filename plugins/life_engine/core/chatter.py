@@ -3092,6 +3092,89 @@ class LifeChatter(BaseChatter):
         LifeChatterContextAssembler.append_suffix_to_last_user(response, context_text)
 
     @staticmethod
+    def _register_suffix_context_delivery(
+        response: Any,
+        context_text: str,
+        delivery: Any,
+    ) -> None:
+        """Register the exact final suffix ``Text`` and enforce its hard limit."""
+
+        from ..service.core import LIFE_CHATTER_EFFECTIVE_TEXT_MAX_BYTES
+
+        suffix = LifeChatterContextAssembler.wrap_suffix_prompt(context_text)
+        if suffix is None:
+            raise RuntimeError("pending chatter delivery has no effective suffix Text")
+        effective_bytes = len(suffix.text.encode("utf-8"))
+        if effective_bytes > LIFE_CHATTER_EFFECTIVE_TEXT_MAX_BYTES:
+            raise RuntimeError(
+                "life chatter effective suffix exceeded its hard byte budget: "
+                f"delivered={effective_bytes}, "
+                f"max={LIFE_CHATTER_EFFECTIVE_TEXT_MAX_BYTES}"
+            )
+        delivery_id = str(getattr(delivery, "delivery_id", "") or "").strip()
+        marker = str(getattr(delivery, "delivery_marker", "") or "").strip()
+        if not delivery_id or not marker or marker not in suffix.text:
+            raise RuntimeError("pending chatter delivery identity is absent from suffix Text")
+        register = getattr(response, "register_context_delivery", None)
+        if not callable(register):
+            raise RuntimeError("LLM response does not support exact context delivery receipts")
+        register(delivery_id, suffix.text, marker=marker)
+
+    @staticmethod
+    def _perception_receipt_from_model_response(
+        response: Any,
+        delivery: Any,
+    ) -> Any | None:
+        """Map one exact whole-suffix receipt to the prepared World projection."""
+
+        from ..service.core import LIFE_CHATTER_EFFECTIVE_TEXT_MAX_BYTES
+        from ..service.perception_gateway import PerceptionDeliveryReceipt
+
+        delivery_id = str(getattr(delivery, "delivery_id", "") or "").strip()
+        lookup = getattr(response, "effective_context_receipt", None)
+        effective = lookup(delivery_id) if callable(lookup) else None
+        if effective is None or not bool(getattr(effective, "exact_present", False)):
+            logger.warning(
+                "life_chatter transient suffix exact delivery is unverified; "
+                "World/event/thought cursors remain pending: "
+                f"delivery_id={delivery_id}"
+            )
+            return None
+        expected_bytes = getattr(effective, "expected_utf8_bytes", None)
+        effective_bytes = getattr(effective, "effective_utf8_bytes", None)
+        expected_sha256 = getattr(effective, "expected_sha256", None)
+        effective_sha256 = getattr(effective, "effective_sha256", None)
+        if (
+            not isinstance(expected_bytes, int)
+            or expected_bytes > LIFE_CHATTER_EFFECTIVE_TEXT_MAX_BYTES
+            or effective_bytes != expected_bytes
+            or not isinstance(expected_sha256, str)
+            or effective_sha256 != expected_sha256
+        ):
+            logger.warning(
+                "life_chatter transient suffix receipt bytes or hash mismatch; "
+                "World/event/thought cursors remain pending: "
+                f"delivery_id={delivery_id}"
+            )
+            return None
+        prepared = getattr(delivery, "prepared_perception", None)
+        if prepared is None:
+            logger.warning(
+                "life_chatter delivery lacks PreparedPerception; cursors remain pending: "
+                f"delivery_id={delivery_id}"
+            )
+            return None
+        return PerceptionDeliveryReceipt(
+            delivery_id=prepared.delivery_id,
+            projection_sha256=prepared.projection_sha256,
+            delivered_bytes=prepared.delivered_bytes,
+            exact=True,
+            transport_request_id=str(
+                getattr(response, "request_record_id", "") or ""
+            ),
+        )
+
+    @staticmethod
     def _append_transient_context(response: Any, context_text: str) -> None:
         """兼容旧名称：动态上下文现在归类为 suffix prompt。"""
         LifeChatter._append_suffix_context(response, context_text)
@@ -3430,12 +3513,19 @@ class LifeChatter(BaseChatter):
         cls,
         rt: _WorkflowRuntime,
         suffix_context_text: str,
+        delivery: Any | None = None,
     ) -> Any:
         replaced = await cls._replace_native_media_with_observations(rt.response)
         if replaced <= 0:
             raise UnsupportedModalityError("媒体文字回退时未找到原生媒体")
 
         cls._append_suffix_context(rt.response, suffix_context_text)
+        if delivery is not None:
+            cls._register_suffix_context_delivery(
+                rt.response,
+                suffix_context_text,
+                delivery,
+            )
         response = await rt.response.send(stream=False)
         cls._strip_suffix_context(response)
         await response
@@ -4422,11 +4512,57 @@ class LifeChatter(BaseChatter):
                 # Compact before transient suffix/media injection so rollback snapshots
                 # and the current newest group remain stable.
                 self._maybe_compact_runtime_context(rt.response)
+                pending_runtime_delivery: Any | None = None
                 if initial_turn:
-                    self._append_suffix_context(
-                        rt.response,
-                        rt.pending_transient_context_text,
-                    )
+                    try:
+                        self._append_suffix_context(
+                            rt.response,
+                            rt.pending_transient_context_text,
+                        )
+                        get_delivery = getattr(
+                            service,
+                            "get_pending_chatter_runtime_delivery",
+                            None,
+                        )
+                        has_pending = getattr(
+                            service,
+                            "has_pending_chatter_perception",
+                            None,
+                        )
+                        if callable(get_delivery):
+                            pending_runtime_delivery = get_delivery(
+                                chat_stream.stream_id,
+                                unified_chatter_context=True,
+                            )
+                            if (
+                                callable(has_pending)
+                                and has_pending(
+                                    chat_stream.stream_id,
+                                    unified_chatter_context=True,
+                                )
+                                and pending_runtime_delivery is None
+                            ):
+                                raise RuntimeError(
+                                    "pending chatter perception lacks delivery metadata"
+                                )
+                        if pending_runtime_delivery is not None:
+                            self._register_suffix_context_delivery(
+                                rt.response,
+                                rt.pending_transient_context_text,
+                                pending_runtime_delivery,
+                            )
+                    except Exception as error:
+                        self._recover_failed_model_turn(
+                            rt,
+                            payloads_before_model_request,
+                            initial_turn=True,
+                        )
+                        logger.error(
+                            "life_chatter transient suffix preparation failed: "
+                            f"{error}",
+                            exc_info=True,
+                        )
+                        return Failure("life_chatter transient suffix preparation failed", error)
                 promoted_media_items = self._append_promoted_media_payload_items(
                     rt.response,
                     stream_id,
@@ -4489,6 +4625,9 @@ class LifeChatter(BaseChatter):
                                 self._retry_model_turn_with_media_text_fallback(
                                     rt,
                                     rt.pending_transient_context_text if initial_turn else "",
+                                    delivery=(
+                                        pending_runtime_delivery if initial_turn else None
+                                    ),
                                 )
                             )
                             self._strip_suffix_context(rt.response)
@@ -4550,14 +4689,19 @@ class LifeChatter(BaseChatter):
                             )
                         return Failure(failure_message, error)
 
-                pending_life_context_high_water = 0
+                perception_delivery_receipt: Any | None = None
+                if initial_turn and pending_runtime_delivery is not None:
+                    perception_delivery_receipt = (
+                        self._perception_receipt_from_model_response(
+                            rt.response,
+                            pending_runtime_delivery,
+                        )
+                    )
+
                 if initial_turn:
                     if rt.unread_msgs_to_flush:
                         await self.flush_unreads(rt.unread_msgs_to_flush)
 
-                    pending_life_context_high_water = (
-                        rt.pending_life_context_high_water
-                    )
                     rt.unread_msgs_to_flush = []
                     rt.pending_life_context_high_water = 0
                     rt.pending_transient_context_text = ""
@@ -4574,19 +4718,15 @@ class LifeChatter(BaseChatter):
                 if (
                     initial_turn
                     and service is not None
-                    and (
-                        pending_life_context_high_water > 0
-                        or service.has_pending_chatter_perception(
-                            chat_stream.stream_id,
-                            unified_chatter_context=True,
-                        )
-                    )
+                    and pending_runtime_delivery is not None
+                    and perception_delivery_receipt is not None
                 ):
                     try:
                         await service.mark_chatter_runtime_context_seen(
                             chat_stream.stream_id,
-                            pending_life_context_high_water,
+                            pending_runtime_delivery.event_through_sequence,
                             unified_chatter_context=True,
+                            receipt=perception_delivery_receipt,
                         )
                         await service._save_runtime_context()
                     except asyncio.CancelledError:
