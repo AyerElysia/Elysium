@@ -3,20 +3,22 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Callable
 
 from src.core.prompt import SystemReminderConsumeType, SystemReminderInsertType
 
+from .exceptions import LLMContextError
 from .payload import LLMPayload
 from .payload.content import Content, Text
 from .payload.tooling import LLMUsable, ToolCall, ToolResult
 from .roles import ROLE
-from .exceptions import LLMContextError
 
 CompressionHook = Callable[[list[list[LLMPayload]], list[LLMPayload]], list[LLMPayload]]
 TokenCounter = Callable[[list[LLMPayload]], int]
+_TASK_CONTEXT_TRUNCATION_MARKER = (
+    "\n\n[... context omitted to fit the task token budget ...]\n\n"
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -490,9 +492,95 @@ class LLMContextManager:
                 kept_groups.pop(0)
                 remaining_payloads = self._flatten_groups(kept_groups)
                 combined = pinned + hook_payloads + remaining_payloads
-            return combined
+            return self._fit_oversized_text_payloads(
+                combined,
+                token_budget=token_budget,
+                token_counter=token_counter,
+            )
 
-        return pinned + remaining_payloads
+        return self._fit_oversized_text_payloads(
+            pinned + remaining_payloads,
+            token_budget=token_budget,
+            token_counter=token_counter,
+        )
+
+    def _fit_oversized_text_payloads(
+        self,
+        payloads: list[LLMPayload],
+        *,
+        token_budget: int,
+        token_counter: TokenCounter,
+    ) -> list[LLMPayload]:
+        """Bound the last indivisible group without mutating caller payloads.
+
+        Full historical groups are removed first.  If the remaining current
+        group is itself too large, shrink only ordinary user/assistant ``Text``
+        parts while preserving both their beginning and newest tail.  Pinned
+        system/tool payloads and structured tool results are never silently cut.
+        """
+
+        if token_counter(payloads) <= token_budget:
+            return payloads
+
+        working = [LLMPayload(item.role, list(item.content)) for item in payloads]
+        candidates: list[tuple[int, int, int, str]] = []
+        for payload_index, payload in enumerate(working):
+            if payload.role in {ROLE.SYSTEM, ROLE.TOOL}:
+                continue
+            for content_index, part in enumerate(payload.content):
+                if isinstance(part, Text) and part.text:
+                    candidates.append(
+                        (len(part.text), payload_index, content_index, part.text)
+                    )
+        candidates.sort(reverse=True)
+
+        for _, payload_index, content_index, original in candidates:
+            if token_counter(working) <= token_budget:
+                break
+
+            working[payload_index].content[content_index] = Text(
+                self._clip_context_text(original, 0)
+            )
+            if token_counter(working) > token_budget:
+                continue
+
+            low = 0
+            high = len(original)
+            best = 0
+            while low <= high:
+                keep_chars = (low + high) // 2
+                working[payload_index].content[content_index] = Text(
+                    self._clip_context_text(original, keep_chars)
+                )
+                if token_counter(working) <= token_budget:
+                    best = keep_chars
+                    low = keep_chars + 1
+                else:
+                    high = keep_chars - 1
+            working[payload_index].content[content_index] = Text(
+                self._clip_context_text(original, best)
+            )
+
+        final_tokens = token_counter(working)
+        if final_tokens > token_budget:
+            raise LLMContextError(
+                "task context cannot fit without truncating pinned or structured "
+                f"payloads: tokens={final_tokens}, budget={token_budget}"
+            )
+        return working
+
+    @staticmethod
+    def _clip_context_text(value: str, keep_chars: int) -> str:
+        """Preserve instruction-bearing head and recent tail around one marker."""
+
+        if keep_chars >= len(value):
+            return value
+        if keep_chars <= 0:
+            return _TASK_CONTEXT_TRUNCATION_MARKER
+        head_chars = max(1, keep_chars // 4)
+        tail_chars = max(0, keep_chars - head_chars)
+        tail = value[-tail_chars:] if tail_chars else ""
+        return value[:head_chars] + _TASK_CONTEXT_TRUNCATION_MARKER + tail
 
     def _split_pinned_prefix(
         self, payloads: list[LLMPayload]

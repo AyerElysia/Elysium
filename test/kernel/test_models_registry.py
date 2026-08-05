@@ -29,6 +29,17 @@ EXPECTED_TASK_BUDGETS = {
     "router_context_projection": 16000,
     "live": 32000,
 }
+EXPECTED_CONTEXT_BUDGETS = {
+    "core": 100000,
+    "expression": 200000,
+    "witness": 100000,
+    "agent": 200000,
+    "utility": 64000,
+    "vision": 100000,
+    "router": 32000,
+    "router_context_projection": 100000,
+    "live": 100000,
+}
 GPT_PRIORITY = ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol")
 GENERATIVE_TASKS = set(EXPECTED_TASK_BUDGETS) - {"voice", "embedding"}
 
@@ -46,6 +57,15 @@ def test_models_example_is_complete_and_budgeted() -> None:
         entries = config.get_task(task_name)
         assert len(entries) == len(task["models"])
         assert all(entry["max_tokens"] == task["tokens"] for entry in entries)
+        if task_name in GENERATIVE_TASKS:
+            assert task["context_tokens"] == EXPECTED_CONTEXT_BUDGETS[task_name]
+            assert all(
+                entry["context_tokens"] == task["context_tokens"]
+                for entry in entries
+            )
+        else:
+            assert "context_tokens" not in task
+            assert all("context_tokens" not in entry for entry in entries)
 
 
 def test_router_tasks_are_cloud_first_and_keep_reasoning_budget() -> None:
@@ -89,7 +109,7 @@ def test_registry_excludes_failed_automatic_candidates() -> None:
     assert config.tasks["expression"]["models"][-1] == "claude-sonnet-5"
 
 
-def test_gpt_promotion_order_and_context_headroom_are_explicit() -> None:
+def test_task_context_budgets_replace_per_model_triggers() -> None:
     registry_path = Path(__file__).parents[2] / "config" / "models.toml.example"
     raw = tomllib.loads(registry_path.read_text(encoding="utf-8"))
     gpt_names = [name for name in raw["models"] if name.startswith("gpt-5.6-")]
@@ -97,10 +117,16 @@ def test_gpt_promotion_order_and_context_headroom_are_explicit() -> None:
     assert gpt_names == list(GPT_PRIORITY)
     for name in gpt_names:
         model = raw["models"][name]
-        trigger = model["extra"]["context_compression_trigger_tokens"]
         assert model["ctx"] == 300000
-        assert trigger == 200000
-        assert model["ctx"] - trigger >= 3 * 32000
+        assert "context_compression_trigger_tokens" not in model.get("extra", {})
+
+    for task_name in GENERATIVE_TASKS:
+        task = raw["tasks"][task_name]
+        assert task["context_tokens"] == EXPECTED_CONTEXT_BUDGETS[task_name]
+        for model_name in task["models"]:
+            assert task["context_tokens"] + task["tokens"] <= raw["models"][
+                model_name
+            ]["ctx"]
 
 
 def _write_minimal_registry(
@@ -133,6 +159,7 @@ ctx = 32000
 models = {task_models}
 tokens = 8000
 temp = 0.4
+context_tokens = 16000
 """.lstrip(),
         encoding="utf-8",
     )
@@ -164,6 +191,7 @@ def test_registry_digest_is_secret_free_and_route_sensitive(tmp_path: Path) -> N
     second_path = tmp_path / "second.toml"
     changed_path = tmp_path / "changed.toml"
     budget_path = tmp_path / "budget.toml"
+    context_budget_path = tmp_path / "context-budget.toml"
     endpoint_path = tmp_path / "endpoint.toml"
     _write_minimal_registry(first_path, api_key="secret-a")
     _write_minimal_registry(second_path, api_key="secret-b")
@@ -179,6 +207,13 @@ def test_registry_digest_is_secret_free_and_route_sensitive(tmp_path: Path) -> N
         ),
         encoding="utf-8",
     )
+    _write_minimal_registry(context_budget_path, api_key="secret-a")
+    context_budget_path.write_text(
+        context_budget_path.read_text(encoding="utf-8").replace(
+            "context_tokens = 16000", "context_tokens = 15000"
+        ),
+        encoding="utf-8",
+    )
     _write_minimal_registry(endpoint_path, api_key="secret-a")
     endpoint_path.write_text(
         endpoint_path.read_text(encoding="utf-8").replace(
@@ -191,12 +226,14 @@ def test_registry_digest_is_secret_free_and_route_sensitive(tmp_path: Path) -> N
     second = ModelsConfig(second_path)
     changed = ModelsConfig(changed_path)
     budget = ModelsConfig(budget_path)
+    context_budget = ModelsConfig(context_budget_path)
     endpoint = ModelsConfig(endpoint_path)
 
     assert first.snapshot.digest == second.snapshot.digest
     assert first.snapshot.digest == endpoint.snapshot.digest
     assert changed.snapshot.digest != first.snapshot.digest
     assert budget.snapshot.digest != first.snapshot.digest
+    assert context_budget.snapshot.digest != first.snapshot.digest
     assert "secret-a" not in first.snapshot.digest
 
 
@@ -267,6 +304,22 @@ def test_registry_rejects_schema_typos_and_fake_failover_targets(
     )
 
     with pytest.raises(ModelRegistryError, match=message):
+        ModelsConfig(registry_path)
+
+
+def test_registry_rejects_task_context_plus_output_over_model_window(
+    tmp_path: Path,
+) -> None:
+    registry_path = tmp_path / "invalid-task-context.toml"
+    _write_minimal_registry(registry_path)
+    registry_path.write_text(
+        registry_path.read_text(encoding="utf-8").replace(
+            "context_tokens = 16000", "context_tokens = 25000"
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ModelRegistryError, match=r"context_tokens \+ tokens"):
         ModelsConfig(registry_path)
 
 

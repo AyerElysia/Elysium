@@ -85,31 +85,34 @@ class ModelEntry(TypedDict):
     routing_model_alias: str   # models.toml 中的模型键
     routing_priority: int      # 原始任务数组下标
     routing_snapshot: str      # 不含密钥的路由快照摘要
+    context_tokens: int        # 任务级输入上下文预算（任务路由时存在）
 ```
 
 ### 2.4 当前任务路由（models.toml）
 
-| 任务 | 输出预算 | 模型列表（按主备序） |
-| --- | ---: | --- |
-| core | 32000 | gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, MiMo-V2.5-Pro, deepseek-v4-flash, gemini-3.5-flash, MiMo-V2.5, claude-sonnet-5 |
-| expression | 32000 | gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, deepseek-v4-flash, MiMo-V2.5-Pro, gemini-3.5-flash, MiMo-V2.5, claude-sonnet-5 |
-| witness | 16000 | gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, MiMo-V2.5, deepseek-v4-flash, gemini-3.5-flash |
-| agent | 32000 | gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, MiMo-V2.5-Pro, deepseek-v4-flash, gemini-3.5-flash, MiMo-V2.5, claude-sonnet-5 |
-| utility | 16000 | gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, deepseek-v4-flash, MiMo-V2.5, gemini-3.5-flash |
-| vision | 16000 | gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, MiMo-V2.5, gemini-3.5-flash |
-| voice | 8192 | sensevoice-small（非生成型，该上限不用于思考） |
-| embedding | 8192 | bge-m3（非生成型，该上限不用于思考） |
-| router | 8192 | gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, deepseek-v4-flash, MiMo-V2.5, gemini-3.5-flash（云端优先，保留思考） |
-| router_context_projection | 16000 | gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, MiMo-V2.5, deepseek-v4-flash, gemini-3.5-flash（权威文件变化时生成派生投影） |
-| live | 32000 | gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, deepseek-v4-flash, MiMo-V2.5-Pro, gemini-3.5-flash, MiMo-V2.5, claude-sonnet-5 |
+| 任务 | 输入上下文预算 | 输出预算 | 模型列表（按主备序） |
+| --- | ---: | ---: | --- |
+| core | 100000 | 32000 | gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, MiMo-V2.5-Pro, deepseek-v4-flash, gemini-3.5-flash, MiMo-V2.5, claude-sonnet-5 |
+| expression | 200000 | 32000 | gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, deepseek-v4-flash, MiMo-V2.5-Pro, gemini-3.5-flash, MiMo-V2.5, claude-sonnet-5 |
+| witness | 100000 | 16000 | gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, MiMo-V2.5, deepseek-v4-flash, gemini-3.5-flash |
+| agent | 200000 | 32000 | gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, MiMo-V2.5-Pro, deepseek-v4-flash, gemini-3.5-flash, MiMo-V2.5, claude-sonnet-5 |
+| utility | 64000 | 16000 | gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, deepseek-v4-flash, MiMo-V2.5, gemini-3.5-flash |
+| vision | 100000 | 16000 | gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, MiMo-V2.5, gemini-3.5-flash |
+| voice | — | 8192 | sensevoice-small（非生成型，该上限不用于思考） |
+| embedding | — | 8192 | bge-m3（非生成型，该上限不用于思考） |
+| router | 32000 | 8192 | gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, deepseek-v4-flash, MiMo-V2.5, gemini-3.5-flash（云端优先，保留思考） |
+| router_context_projection | 100000 | 16000 | gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, MiMo-V2.5, deepseek-v4-flash, gemini-3.5-flash（权威文件变化时生成派生投影） |
+| live | 100000 | 32000 | gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, deepseek-v4-flash, MiMo-V2.5-Pro, gemini-3.5-flash, MiMo-V2.5, claude-sonnet-5 |
 
-生成型任务的 `tokens` 同时覆盖隐式思考与最终正文；Router 因此不再使用 200 token 的紧缩上限。上下文压缩触发线是输入窗口策略，与输出思考预算分开配置。
+生成型任务的 `tokens` 同时覆盖隐式思考与最终正文；`context_tokens` 是任务级输入预算。预算随任务路由条目传递，故障转移到另一模型时保持不变，最终有效值取任务预算与“模型 `ctx` 减去输出保留量”的较小者。模型表只声明硬能力，不再承载任务压缩阈值。
 
-GPT 5.6 的生产优先级固定为 **Luna → Terra → Sol**：Luna 成本最低，Terra 与 Sol 依次作为同系列后备。当前三种模型已经通过本地中转站的模型列表、真实 completion、格式遵循、工具调用与重复转发探针，因此位于所有生成型任务链最前；MiMo、DeepSeek、Gemini 与 Claude 继续作为跨模型族回退。中转站内部只启用通过验收的 GPT 渠道做同模型冗余，固定失败或客户端不兼容的渠道不得为了“全部打开”而进入生产路由。
+GPT 5.6 的生产优先级固定为 **Luna → Terra → Sol**：Luna 成本最低，Terra 与 Sol 依次作为同系列后备。当前三种模型已经通过本地中转站的模型列表、真实 completion、格式遵循、工具调用与重复转发探针，因此在已准入的中短上下文任务中位于最前；MiMo、DeepSeek、Gemini 与 Claude 继续作为跨模型族回退。中转站内部只启用通过验收的 GPT 渠道做同模型冗余，固定失败或客户端不兼容的渠道不得为了“全部打开”而进入生产路由。
+
+真实心跳和记忆见证曾产生约 53 万与 99 万 prompt tokens 的单条聚合载荷，超过当前 GPT 注册的 30 万上下文窗口，并造成三个 GPT 候选连续 500/503/504 或超时。根因是心跳的潜意识正文先经过字符预算，随后追加的 `transient_world_perception` 没有共享同一总预算；两部分又被合并成唯一一条 user 消息，旧裁剪器只会删除较早的完整问答组，最后一组因此被原样发送。现在 `core` 以 100000 tokens 为硬任务预算，`expression` 使用 200000 tokens 保留主意识长对话；`witness` 同样按 100000 tokens 限制输入，因此无需为此前的超窗故障永久移除 GPT。历史组裁剪后若最后一条普通文本仍超限，内核会保留指令头与最新尾部并插入明确省略标记；若超限来自不可切断的 system、tool 或结构化结果，则请求显式失败，不再静默发送巨型载荷。
 
 模型注册和一次验收都不代表永久健康。渠道增删、端点迁移或持续 5xx/超时出现后，必须重新执行端到端探针；确认故障的 ability 应退出生产路由，恢复后再按同一准入门槛启用。这样既保留 Luna 的成本优势，也不会让单条坏渠道成为每条生命消息的固定失败前置步骤。
 
-GPT 5.6 的 `ctx=300000` 与 `context_compression_trigger_tokens=200000` 保持不变。触发线占窗口约三分之二，仍留下 100000 token 余量，足以覆盖当前最大 32000 token 的隐式思考/正文预算、工具结果增长和 tokenizer 估算误差。其他百万窗口模型沿用同一 200000 触发线是有意的稳定性取舍：让故障转移前后的输入投影保持在共同安全窗口内，并限制超长上下文的延迟与成本；它不是对模型最大窗口能力的声明。
+GPT 5.6 保留 `ctx=300000` 作为硬窗口声明。任务级预算必须给输出留出空间：当前 `expression` 的 200000 输入加 32000 输出低于 300000，`core` 的 100000 输入则更适合高频心跳。加载器会验证每个生成任务的 `context_tokens + tokens` 不超过任一候选模型的 `ctx`，并把任务预算纳入秘密无关的路由快照；改变预算会产生新的 snapshot digest，便于从日志追溯具体配置代次。
 
 ### 2.5 验证、原子发布与可观测性
 

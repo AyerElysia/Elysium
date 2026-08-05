@@ -28,7 +28,6 @@ from src.kernel.llm.policy.failover import FailoverPolicy
 from src.kernel.llm.request import LLMRequest
 from src.kernel.llm.roles import ROLE
 
-
 # ============================================================================
 # Mock Client for Testing
 # ============================================================================
@@ -576,10 +575,10 @@ class TestLLMRequestSend:
         assert len(capture_client.last_payloads) < 12
         assert len(response.payloads) == 12
 
-    async def test_send_applies_context_compression_trigger_tokens(
+    async def test_send_applies_task_context_tokens(
         self, mock_model_set: list[dict[str, Any]], monkeypatch
     ) -> None:
-        """Test that per-model trigger tokens compress before hard max_context."""
+        """Task input budget compresses before the model hard context limit."""
 
         class CaptureClient(MockChatClient):
             def __init__(self) -> None:
@@ -591,7 +590,8 @@ class TestLLMRequestSend:
                 return "ok", None, None
 
         mock_model_set[0]["max_context"] = 1000
-        mock_model_set[0]["extra_params"]["context_compression_trigger_tokens"] = 120
+        mock_model_set[0]["max_tokens"] = 20
+        mock_model_set[0]["context_tokens"] = 120
 
         request = LLMRequest(mock_model_set, "test")
         for idx in range(6):

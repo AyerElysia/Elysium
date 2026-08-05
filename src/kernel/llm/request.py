@@ -394,10 +394,17 @@ class LLMRequest:
 
         # 计算保留的上下文长度
         reserve_tokens = extra_params.get("context_reserve_tokens")
-        fixed_reserve = (
+        configured_reserve = (
             reserve_tokens
             if isinstance(reserve_tokens, int) and reserve_tokens > 0
             else 0
+        )
+        output_reserve = model.get("max_tokens")
+        fixed_reserve = max(
+            configured_reserve,
+            output_reserve
+            if isinstance(output_reserve, int) and output_reserve > 0
+            else 0,
         )
 
         # 计算比例保留的上下文长度
@@ -417,34 +424,19 @@ class LLMRequest:
     def _compute_context_compression_trigger(self, model: ModelEntry) -> int | None:
         """计算当前模型的上下文压缩触发阈值。
 
-        优先读取 ``extra_params.context_compression_trigger_tokens``，例如
-        max_context=100000 时可设为 90000。未设置时可用
-        ``extra_params.context_compression_trigger_ratio`` 指定比例；都未设置则
-        使用有效上下文预算。
+        生产任务从 ``tasks.<name>.context_tokens`` 取得统一输入预算，并随
+        路由条目携带。模型只提供硬 ``max_context``；最终预算取任务预算与
+        扣除输出保留量后的模型硬上限的较小值。显式单模型调用没有任务
+        身份时，退回模型硬上限。
         """
 
         effective_budget = self._compute_effective_context_budget(model)
         if effective_budget is None:
             return None
 
-        extra_params = model.get("extra_params")
-        if not isinstance(extra_params, dict):
-            extra_params = {}
-
-        trigger_tokens = extra_params.get("context_compression_trigger_tokens")
-        if isinstance(trigger_tokens, int) and trigger_tokens > 0:
-            return min(trigger_tokens, effective_budget)
-
-        trigger_ratio = extra_params.get("context_compression_trigger_ratio")
-        max_context = model.get("max_context")
-        if (
-            isinstance(trigger_ratio, (int, float))
-            and trigger_ratio > 0
-            and isinstance(max_context, int)
-            and max_context > 0
-        ):
-            ratio_budget = int(math.floor(max_context * float(trigger_ratio)))
-            return min(max(1, ratio_budget), effective_budget)
+        task_budget = model.get("context_tokens")
+        if isinstance(task_budget, int) and task_budget > 0:
+            return min(task_budget, effective_budget)
 
         return effective_budget
 

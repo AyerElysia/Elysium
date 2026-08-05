@@ -56,6 +56,7 @@ class ModelEntry(TypedDict, total=True):
     routing_model_alias: NotRequired[str]
     routing_priority: NotRequired[int]
     routing_snapshot: NotRequired[str]
+    context_tokens: NotRequired[int]
 
 
 # 模型集合类型：一组可用的模型配置

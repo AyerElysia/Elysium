@@ -13,9 +13,9 @@ from src.core.prompt import (
     reset_system_reminder_store,
 )
 from src.kernel.llm.context import LLMContextManager
+from src.kernel.llm.exceptions import LLMContextError
 from src.kernel.llm.payload import LLMPayload, Text, ToolCall, ToolResult
 from src.kernel.llm.request import LLMRequest
-from src.kernel.llm.exceptions import LLMContextError
 from src.kernel.llm.roles import ROLE
 
 
@@ -140,6 +140,59 @@ def test_context_manager_trims_by_token_budget() -> None:
     assert trimmed[0].role == ROLE.USER
     assert trimmed[0].content[0].text == "q3"
     assert trimmed[1].role == ROLE.ASSISTANT
+
+
+def test_context_manager_bounds_one_oversized_user_group() -> None:
+    manager = LLMContextManager()
+    original = "instruction-head:" + ("x" * 400) + ":recent-tail"
+    payloads = [
+        LLMPayload(ROLE.SYSTEM, Text("system")),
+        LLMPayload(ROLE.USER, Text(original)),
+    ]
+
+    def count_text_chars(items: list[LLMPayload]) -> int:
+        return sum(
+            len(part.text)
+            for payload in items
+            for part in payload.content
+            if isinstance(part, Text)
+        )
+
+    trimmed = manager.maybe_trim(
+        payloads,
+        max_token_budget=120,
+        token_counter=count_text_chars,
+    )
+
+    rendered = cast(Text, trimmed[1].content[0]).text
+    assert count_text_chars(trimmed) <= 120
+    assert rendered.startswith("instruction")
+    assert rendered.endswith(":recent-tail")
+    assert "context omitted to fit the task token budget" in rendered
+    assert cast(Text, payloads[1].content[0]).text == original
+
+
+def test_context_manager_rejects_oversized_pinned_payloads() -> None:
+    manager = LLMContextManager()
+    payloads = [
+        LLMPayload(ROLE.SYSTEM, Text("s" * 200)),
+        LLMPayload(ROLE.USER, Text("question")),
+    ]
+
+    def count_text_chars(items: list[LLMPayload]) -> int:
+        return sum(
+            len(part.text)
+            for payload in items
+            for part in payload.content
+            if isinstance(part, Text)
+        )
+
+    with pytest.raises(LLMContextError, match="pinned or structured"):
+        manager.maybe_trim(
+            payloads,
+            max_token_budget=100,
+            token_counter=count_text_chars,
+        )
 
 
 def test_context_manager_system_tool_equivalent_add_payload() -> None:
