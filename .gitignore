@@ -55,6 +55,7 @@ local_settings.py
 secrets.yml
 *.pem
 *.key
+/COLLABORATION.md
 
 # Data files
 *.sqlite3
