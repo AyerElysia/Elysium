@@ -31,6 +31,7 @@
       <div>SVC 块延迟 <b id="svcLatency">—</b></div>
       <div>Episode <b id="episode">—</b></div>
       <div>RTT <b id="latency">—</b></div>
+      <div>播放 <b id="playbackHealth">—</b></div>
       <div>麦克风 <b id="micHealth">—</b></div>
       <div>采集 <b id="micRate">—</b></div>
       <div>上行 <b id="uplink">0 KB</b></div>
@@ -40,9 +41,9 @@
   </section>
 </main>
 <script>
-const TARGET_RATE=16000,FRAME_MS=20,HEADER_BYTES=16,MIC_SIGNAL_RMS=.002,MIC_SILENCE_MS=5000,MAX_MIC_QUEUE=8;
+const TARGET_RATE=16000,FRAME_MS=20,HEADER_BYTES=16,MIC_SIGNAL_RMS=.002,MIC_SILENCE_MS=5000,MAX_MIC_QUEUE=8,BARGE_ARM_MS=160,BARGE_MIN_FRAMES=6,PLAYBACK_SILENCE_RMS=.0005;
 const el=id=>document.getElementById(id),labels={idle:'待机',connecting:'连接模型',listening:'正在听',thinking:'正在思考',speaking:'正在说话',interrupted:'已打断',error:'发生错误',closed:'已结束'};
-let ws=null,audioCtx=null,stream=null,micSource=null,worklet=null,silentGain=null,audioPump=null,audioGeneration=0,running=false,explicitStop=false,muted=false,inputSeq=0,outputSeq=0,uplink=0,downlink=0,nextPlayTime=0,activeSources=new Set(),playbackStartedAt=0,episodeId='',reconnects=0,pingAt=0,bargeLatched=false,noiseFloor=.004,speechFrames=0,micStartedAt=0,lastMicSignalAt=0,micWarningShown=false,micFramesGenerated=0,micWindowStartedAt=0,pcmQueue=[],partial={};
+let ws=null,audioCtx=null,stream=null,micSource=null,worklet=null,silentGain=null,audioPump=null,audioGeneration=0,running=false,explicitStop=false,muted=false,inputSeq=0,outputSeq=0,uplink=0,downlink=0,nextPlayTime=0,activeSources=new Set(),playbackStartedAt=0,episodeId='',reconnects=0,pingAt=0,bargeLatched=false,bargeSpeechFrames=0,bargeArmedAt=0,noiseFloor=.004,micStartedAt=0,lastMicSignalAt=0,micWarningShown=false,micFramesGenerated=0,micWindowStartedAt=0,pcmQueue=[],partial={},playbackChain=Promise.resolve(),responseAudibleStarted=false,silentPlaybackFrames=0;
 const pathBase=location.pathname.replace(/\/$/,'');
 
 function state(value){el('orb').className='orb '+value;el('state').textContent=labels[value]||value}
@@ -53,8 +54,9 @@ function add(role,text,final=true){
   else{let node=partial[role];if(node){node.textContent=(role==='assistant'?'爱莉：':'你：')+text;delete partial[role]}else{node=document.createElement('div');node.className='msg '+role;node.textContent=(role==='assistant'?'爱莉：':role==='user'?'你：':'')+text;box.append(node)}}box.scrollTop=box.scrollHeight
 }
 function metrics(){el('uplink').textContent=(uplink/1024).toFixed(1)+' KB';el('downlink').textContent=(downlink/1024).toFixed(1)+' KB';el('sequence').textContent=outputSeq||'—'}
+function playbackBusy(){return !!audioCtx&&(activeSources.size>0||nextPlayTime>audioCtx.currentTime+.02)}
 function clearPlayback(reason='interrupt'){
-  for(const source of activeSources){try{source.stop()}catch{}}activeSources.clear();nextPlayTime=audioCtx?audioCtx.currentTime+.015:0;playbackStartedAt=0;if(reason)add('system','播放已立即清空：'+reason)
+  const hadPlayback=playbackBusy();for(const source of activeSources){try{source.stop()}catch{}}activeSources.clear();nextPlayTime=audioCtx?audioCtx.currentTime+.015:0;playbackStartedAt=0;bargeSpeechFrames=0;bargeArmedAt=0;responseAudibleStarted=false;if(reason&&hadPlayback)add('system','播放已立即清空：'+reason);if(reason)el('playbackHealth').textContent=hadPlayback?'已打断':'等待回复'
 }
 function playedMs(){return playbackStartedAt&&audioCtx?Math.max(0,Math.round((audioCtx.currentTime-playbackStartedAt)*1000)):0}
 function sendInterrupt(source='manual'){if(!ws||ws.readyState!==WebSocket.OPEN||!running)return;const ms=playedMs();clearPlayback(source);ws.send(JSON.stringify({type:'interrupt',played_audio_ms:ms,source}))}
@@ -67,10 +69,10 @@ function startAudioPump(generation){
 }
 function stopAudioPump(){if(audioPump){clearInterval(audioPump);audioPump=null}pcmQueue.length=0}
 function handleMicFrame(samples,rms){
-  const now=performance.now(),db=rms>0?Math.round(20*Math.log10(rms)):-Infinity;el('meter').style.width=Math.min(100,rms*900)+'%';noiseFloor=rms<noiseFloor*3?noiseFloor*.985+rms*.015:noiseFloor;const threshold=Math.max(.009,noiseFloor*3.2);speechFrames=rms>threshold?speechFrames+1:0;
+  const now=performance.now(),db=rms>0?Math.round(20*Math.log10(rms)):-Infinity;el('meter').style.width=Math.min(100,rms*900)+'%';noiseFloor=rms<noiseFloor*3?noiseFloor*.985+rms*.015:noiseFloor;const threshold=Math.max(.009,noiseFloor*3.2),playbackActive=playbackBusy();
   if(!micWindowStartedAt)micWindowStartedAt=now;micFramesGenerated++;if(now-micWindowStartedAt>=2000){const fps=Math.round(micFramesGenerated*1000/(now-micWindowStartedAt));el('micRate').textContent=fps>65?`已节流 ${fps}→50 帧/秒`:`${fps} 帧/秒`;micFramesGenerated=0;micWindowStartedAt=now}
   if(rms>=MIC_SIGNAL_RMS){lastMicSignalAt=now;el('micHealth').textContent=`有声音 (${db} dB)`}else if(now-lastMicSignalAt<1000){el('micHealth').textContent='已收到声音'}else if(running&&micStartedAt&&now-micStartedAt>=MIC_SILENCE_MS&&lastMicSignalAt<micStartedAt){el('micHealth').textContent='未检测到声音';if(!micWarningShown){micWarningShown=true;add('system','麦克风正在上传静音，请检查 Windows 输入设备或浏览器麦克风权限。')}}else{el('micHealth').textContent=running?'等待声音':'检测中'}
-  if(activeSources.size&&speechFrames>=3&&!bargeLatched){bargeLatched=true;sendInterrupt('本地抢话检测')}if(rms<threshold&&speechFrames===0)bargeLatched=false;
+  if(playbackActive&&now>=bargeArmedAt){bargeSpeechFrames=rms>threshold?bargeSpeechFrames+1:0;if(bargeSpeechFrames>=BARGE_MIN_FRAMES&&!bargeLatched){bargeLatched=true;sendInterrupt('本地抢话检测')}}else{bargeSpeechFrames=0;if(!playbackActive)bargeLatched=false}
   if(!running||muted||!ws||ws.readyState!==WebSocket.OPEN)return;if(pcmQueue.length>=MAX_MIC_QUEUE)pcmQueue.shift();pcmQueue.push(samples)
 }
 async function startAudio(){
@@ -93,19 +95,19 @@ async function stopAudio(){
   if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}if(oldContext&&oldContext.state!=='closed'){try{await oldContext.close()}catch{}}
 }
 
-function playFrame(buffer){
-  const view=new DataView(buffer);if(buffer.byteLength<HEADER_BYTES||view.getUint8(0)!==86||view.getUint8(1)!==76||view.getUint8(2)!==49)throw new Error('不支持的音频帧');const seq=view.getUint32(4,true),rate=view.getUint32(8,true);if(outputSeq&&seq!==outputSeq+1)add('system',`下行音频序列跳跃 ${outputSeq} → ${seq}`);outputSeq=seq;const pcm=new Int16Array(buffer,HEADER_BYTES),floats=new Float32Array(pcm.length);for(let i=0;i<pcm.length;i++)floats[i]=pcm[i]/32768;const audio=audioCtx.createBuffer(1,floats.length,rate);audio.copyToChannel(floats,0);const source=audioCtx.createBufferSource();source.buffer=audio;source.connect(audioCtx.destination);const start=Math.max(audioCtx.currentTime+.012,nextPlayTime||0);if(!playbackStartedAt)playbackStartedAt=start;source.start(start);nextPlayTime=start+audio.duration;activeSources.add(source);source.onended=()=>{activeSources.delete(source);if(!activeSources.size)playbackStartedAt=0};downlink+=buffer.byteLength;metrics()
+async function playFrame(buffer){
+  const context=audioCtx;if(!context||context.state==='closed')return;const view=new DataView(buffer);if(buffer.byteLength<HEADER_BYTES||view.getUint8(0)!==86||view.getUint8(1)!==76||view.getUint8(2)!==49)throw new Error('不支持的音频帧');const seq=view.getUint32(4,true),rate=view.getUint32(8,true);if(outputSeq&&seq!==outputSeq+1)add('system',`下行音频序列跳跃 ${outputSeq} → ${seq}`);outputSeq=seq;const pcm=new Int16Array(buffer,HEADER_BYTES),floats=new Float32Array(pcm.length);let energy=0;for(let i=0;i<pcm.length;i++){const value=pcm[i]/32768;floats[i]=value;energy+=value*value}const rms=pcm.length?Math.sqrt(energy/pcm.length):0;downlink+=buffer.byteLength;metrics();if(!responseAudibleStarted&&rms<PLAYBACK_SILENCE_RMS){silentPlaybackFrames++;el('playbackHealth').textContent=`已消除静音预卷 ${silentPlaybackFrames} 帧`;return}responseAudibleStarted=true;if(context.state!=='running')await context.resume();if(context.state!=='running')throw new Error(`音频设备未运行 (${context.state})`);const wasBusy=playbackBusy(),audio=context.createBuffer(1,floats.length,rate);audio.copyToChannel(floats,0);const source=context.createBufferSource();source.buffer=audio;source.connect(context.destination);const start=Math.max(context.currentTime+.012,nextPlayTime||0);if(!wasBusy){bargeSpeechFrames=0;bargeLatched=false;bargeArmedAt=performance.now()+BARGE_ARM_MS}if(!playbackStartedAt)playbackStartedAt=start;source.start(start);nextPlayTime=start+audio.duration;activeSources.add(source);el('playbackHealth').textContent=`输出中 (${Math.round(20*Math.log10(Math.max(rms,1e-8)))} dB)`;source.onended=()=>{activeSources.delete(source);if(!activeSources.size){playbackStartedAt=0;el('playbackHealth').textContent='已播放'}}
 }
 
 async function getTicket(){const response=await fetch(pathBase+'/ticket',{method:'POST',cache:'no-store'});if(!response.ok)throw new Error('无法取得安全连接 ticket');return(await response.json()).ticket}
 async function connect(resume='',generation=audioGeneration){
   const ticket=await getTicket();if(generation!==audioGeneration||explicitStop)return;const proto=location.protocol==='https:'?'wss:':'ws:',socket=new WebSocket(`${proto}//${location.host}${pathBase}/ws?ticket=${encodeURIComponent(ticket)}`);ws=socket;socket.binaryType='arraybuffer';const current=()=>generation===audioGeneration&&ws===socket;
   socket.onopen=()=>{if(!current())return;status('安全连接已建立');socket.send(JSON.stringify({type:'start',resume_episode_id:resume}))};
-  socket.onmessage=event=>{if(!current())return;try{if(typeof event.data==='string')handle(JSON.parse(event.data));else playFrame(event.data)}catch(error){add('system','数据处理错误：'+error.message)}};
+  socket.onmessage=event=>{if(!current())return;try{if(typeof event.data==='string')handle(JSON.parse(event.data));else{const frame=event.data;playbackChain=playbackChain.then(()=>playFrame(frame)).catch(error=>{add('system','音频播放错误：'+error.message);el('playbackHealth').textContent='播放失败'})}}catch(error){add('system','数据处理错误：'+error.message)}};
   socket.onerror=()=>{if(current())status('连接错误')};socket.onclose=()=>{if(!current())return;ws=null;status('已断开');if(running&&!explicitStop&&reconnects<3){reconnects++;setTimeout(()=>connect(episodeId,generation),400*reconnects)}else if(!explicitStop)void finish(false)};
   function handle(msg){
     if(msg.type==='ready'){running=true;reconnects=0;micStartedAt=performance.now();lastMicSignalAt=0;micWarningShown=false;episodeId=msg.episode_id;sessionStorage.setItem('voiceLiveEpisode',episodeId);el('provider').textContent=msg.provider;el('voiceProfile').textContent=msg.voice_profile||'原生';el('episode').textContent=episodeId.slice(0,8);status('通话中');state('listening')}
-    else if(msg.type==='state')state(msg.state)
+    else if(msg.type==='state'){if(msg.state==='thinking'){responseAudibleStarted=false;silentPlaybackFrames=0}state(msg.state)}
     else if(msg.type==='transcript')add(msg.role,msg.text,msg.is_final)
     else if(msg.type==='playback.clear')clearPlayback(msg.reason||'上游打断')
     else if(msg.type==='metrics'){const svc=msg.values?.voice_conversion;if(svc){const perBlock=svc.block_count?svc.inference_ms/svc.block_count:0;el('svcLatency').textContent=svc.block_count?Math.round(perBlock)+' ms':'缓冲中'}}
@@ -115,7 +117,7 @@ async function connect(resume='',generation=audioGeneration){
   }
 }
 async function begin(){
-  explicitStop=false;muted=false;episodeId='';reconnects=0;inputSeq=0;outputSeq=0;uplink=0;downlink=0;noiseFloor=.004;speechFrames=0;bargeLatched=false;partial={};micStartedAt=0;lastMicSignalAt=0;micWarningShown=false;micFramesGenerated=0;micWindowStartedAt=0;el('mute').textContent='静音麦克风';el('micHealth').textContent='检测中';el('micRate').textContent='—';el('transcript').innerHTML='<div class="empty">正在建立实时音频链路…</div>';el('start').disabled=true;el('stop').disabled=false;el('mute').disabled=false;el('interrupt').disabled=false;state('connecting');status('请求麦克风');try{const generation=await startAudio();if(generation&&generation===audioGeneration&&!explicitStop)await connect('',generation)}catch(error){add('system','启动失败：'+error.message);void finish(false)}
+  explicitStop=false;muted=false;episodeId='';reconnects=0;inputSeq=0;outputSeq=0;uplink=0;downlink=0;noiseFloor=.004;bargeSpeechFrames=0;bargeArmedAt=0;bargeLatched=false;responseAudibleStarted=false;silentPlaybackFrames=0;playbackChain=Promise.resolve();partial={};micStartedAt=0;lastMicSignalAt=0;micWarningShown=false;micFramesGenerated=0;micWindowStartedAt=0;el('mute').textContent='静音麦克风';el('micHealth').textContent='检测中';el('micRate').textContent='—';el('playbackHealth').textContent='等待回复';el('transcript').innerHTML='<div class="empty">正在建立实时音频链路…</div>';el('start').disabled=true;el('stop').disabled=false;el('mute').disabled=false;el('interrupt').disabled=false;state('connecting');status('请求麦克风');try{const generation=await startAudio();if(generation&&generation===audioGeneration&&!explicitStop)await connect('',generation)}catch(error){add('system','启动失败：'+error.message);void finish(false)}
 }
 async function finish(sendStop=true){if(explicitStop&&!running&&!ws)return;explicitStop=true;running=false;if(sendStop&&ws?.readyState===WebSocket.OPEN)ws.send(JSON.stringify({type:'stop'}));try{ws?.close()}catch{}ws=null;el('start').disabled=true;el('stop').disabled=true;el('mute').disabled=true;el('interrupt').disabled=true;await stopAudio();el('start').disabled=false;state('idle');status('未连接')}
 el('start').onclick=begin;el('stop').onclick=()=>void finish(true);el('interrupt').onclick=()=>sendInterrupt();el('mute').onclick=()=>{muted=!muted;if(muted)pcmQueue.length=0;el('mute').textContent=muted?'恢复麦克风':'静音麦克风';el('micHealth').textContent=muted?'已静音':'等待声音'};

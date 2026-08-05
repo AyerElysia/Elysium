@@ -9,7 +9,11 @@ import pytest
 from aiohttp import web
 
 from plugins.voice_live.protocol import ProviderState
-from plugins.voice_live.providers.base import AudioDelta, TranscriptEvent
+from plugins.voice_live.providers.base import (
+    AudioDelta,
+    InterruptionEvent,
+    TranscriptEvent,
+)
 from plugins.voice_live.providers.openai_realtime import OpenAIRealtimeProvider
 from plugins.voice_live.providers.qwen_realtime import (
     _QWEN_CONTEXT_CHUNK_BYTES,
@@ -327,6 +331,37 @@ async def test_qwen_interrupt_is_idempotent_without_an_active_response() -> None
 
     assert [event["type"] for event in websocket.events] == ["response.cancel"]
     assert provider._response_active is False  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_qwen_idle_speech_start_is_not_reported_as_barge_in() -> None:
+    provider = QwenRealtimeProvider(
+        "ws://127.0.0.1/realtime",
+        "secret-value",
+        model="qwen-audio-3.0-realtime-plus",
+    )
+    interruptions: list[Any] = []
+
+    async def on_interruption(event: Any) -> None:
+        interruptions.append(event)
+
+    provider.on_interruption(on_interruption)
+
+    await provider._handle_event(  # type: ignore[attr-defined]
+        {"type": "input_audio_buffer.speech_started"}
+    )
+    assert interruptions == []
+
+    provider._response_active = True  # type: ignore[attr-defined]
+    provider._active_response_id = "response-1"  # type: ignore[attr-defined]
+    provider._active_item_id = "item-1"  # type: ignore[attr-defined]
+    await provider._handle_event(  # type: ignore[attr-defined]
+        {"type": "input_audio_buffer.speech_started"}
+    )
+
+    assert interruptions == [
+        InterruptionEvent("server_vad", "response-1", "item-1")
+    ]
 
 
 @pytest.mark.asyncio

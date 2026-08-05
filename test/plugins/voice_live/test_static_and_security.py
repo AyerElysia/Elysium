@@ -12,7 +12,7 @@ from plugins.voice_live.router import VoiceLiveRouter
 ROOT = Path(__file__).resolve().parents[3]
 
 
-def test_browser_uses_worklet_clocked_pcm_and_immediate_barge_in() -> None:
+def test_browser_uses_worklet_clocked_pcm_and_guarded_barge_in() -> None:
     html = (ROOT / "plugins/voice_live/static/voice_live.html").read_text(
         encoding="utf-8"
     )
@@ -20,6 +20,15 @@ def test_browser_uses_worklet_clocked_pcm_and_immediate_barge_in() -> None:
     assert "createScriptProcessor" not in html
     assert "nextPlayTime" in html
     assert "playback.clear" in html
+    assert "playbackBusy()" in html
+    assert "BARGE_ARM_MS" in html
+    assert "BARGE_MIN_FRAMES" in html
+    assert "bargeSpeechFrames" in html
+    assert "PLAYBACK_SILENCE_RMS" in html
+    assert "已消除静音预卷" in html
+    assert "playbackChain=playbackChain.then" in html
+    assert "context.state!=='running'" in html
+    assert "playbackHealth" in html
     assert "echoCancellation:true" in html
     assert "noiseSuppression:true" in html
     assert "channelCountMode:'explicit'" in html

@@ -428,11 +428,16 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
                 self._updated.set_result(event)
             return
         if event_type == "input_audio_buffer.speech_started":
-            await self._emit_interruption(
-                InterruptionEvent(
-                    "server_vad", self._active_response_id, self._active_item_id
+            # Qwen emits speech_started for every ordinary user turn.  It is an
+            # interruption only while an assistant response is actually active;
+            # treating an idle turn start as barge-in clears an empty playback
+            # queue and resets SeedVC immediately before the new response.
+            if self._response_active:
+                await self._emit_interruption(
+                    InterruptionEvent(
+                        "server_vad", self._active_response_id, self._active_item_id
+                    )
                 )
-            )
             await self._emit_state(ProviderState.LISTENING)
             return
         if event_type == "input_audio_buffer.speech_stopped":
