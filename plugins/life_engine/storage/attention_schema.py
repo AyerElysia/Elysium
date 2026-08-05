@@ -14,7 +14,8 @@ from src.kernel.storage.migration_runner import (
 from .contracts import StorageBackendRuntime, StorageWriterRole
 from .models import BackendKind
 
-ATTENTION_THREAD_SCHEMA_VERSION = 2
+ATTENTION_THREAD_SCHEMA_VERSION = 1
+ATTENTION_LEGACY_MIGRATION_VERSION = 2
 
 LOCAL_ATTENTION_THREAD_SCHEMA_STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS attention_thread_events (
@@ -208,7 +209,7 @@ _MYSQL_SHADOW_MIGRATION_V1 = SchemaMigration(
 )
 
 _MYSQL_LEGACY_MIGRATION_V2 = SchemaMigration(
-    version=2,
+    version=ATTENTION_LEGACY_MIGRATION_VERSION,
     name="life_attention_legacy_snapshot_storage_v2",
     statements=(
         """CREATE TABLE IF NOT EXISTS attention_legacy_snapshots (
@@ -280,7 +281,7 @@ _MYSQL_LEGACY_MIGRATION_V2 = SchemaMigration(
 )
 
 _MYSQL_LEGACY_SHADOW_MIGRATION_V2 = SchemaMigration(
-    version=2,
+    version=ATTENTION_LEGACY_MIGRATION_VERSION,
     name="life_attention_legacy_snapshot_storage_shadow_v2",
     statements=_MYSQL_LEGACY_MIGRATION_V2.statements,
 )
@@ -377,6 +378,7 @@ async def ensure_attention_thread_schema(
 
 
 __all__ = [
+    "ATTENTION_LEGACY_MIGRATION_VERSION",
     "ATTENTION_THREAD_SCHEMA_VERSION",
     "LOCAL_ATTENTION_THREAD_SCHEMA_STATEMENTS",
     "ensure_attention_thread_schema",

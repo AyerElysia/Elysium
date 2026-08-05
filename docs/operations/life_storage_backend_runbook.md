@@ -367,3 +367,28 @@ copy run。只要快照未冻结、run 不同源、状态不是 `verified`、存
 - 每份备份必须有 manifest、完整性校验和隔离恢复演练，只有压缩包不算可恢复；
 - 2026-08-05 在线候选约 2.1 GiB，独立复核 4,340 个项目且 0 失败；备份目标至少预留 10 GiB，正式迁移前按五倍增长重新测量；
 - 任何自动清理/保留策略都不能覆盖原始生命数据和尚未封存的 generation。
+
+## 10. AttentionThread / 旧 ThoughtStream 迁移
+
+旧 `thoughts/streams.json` 不得直接转换成 AttentionThread 事件。正式候选批次必须执行：
+
+```text
+python scripts/migrate_life_attention_threads.py \
+  --snapshot <冻结快照目录> \
+  --archive <新的只增归档目录> \
+  --reverse-export <新的反向导出目录> \
+  --run-id <唯一批次 ID>
+```
+
+运行前提与验收门：
+
+1. 快照 manifest 只能声明一份 `life_engine_workspace/thoughts/streams.json`，备份文件长度和 SHA-256 必须一致；
+2. `--archive` 与 `--reverse-export` 使用新目录，禁止覆盖旧归档；已存在的 archive 只有在逐字节等价时才允许幂等复用；
+3. 迁移目标必须是隔离 MySQL generation 数据库，writer 角色必须是 `CANDIDATE_COPY`，每个事务都重新校验 fencing；
+4. 旧行只进入 `attention_legacy_snapshots/candidates`，不得写 `attention_thread_events/heads/focus`；
+5. copy run 必须记录 `snapshot_only`、`no_fabricated_events`、archive manifest hash、数据库不可变状态和 canonical 空域 root；
+6. frozen run 必须完成精确导入校验与反向字节导出；在线 shadow 只可作为演练证据，不可签署 generation；
+7. 汇总审计增加 `--attention-run`。旧快照必须保持 `generation_eligible=false`，canonical authority 必须为零 event frontier、零 head、零 focus；
+8. 该命令不会修改 `storage.enabled`、不会激活 generation，也不会启动、停止或重启 Elysium/NapCat。
+
+任何一步失败时，保留源快照和带 incomplete marker 的失败归档，不清表、不覆盖、不把旧状态解释成主体决定；更换新的隔离目标或新目录后重试。

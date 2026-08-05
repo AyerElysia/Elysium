@@ -134,3 +134,11 @@ failures = 0
 8. 若任一项失败，停止新 writer，依据反向导出与保留的本地 generation 回切；不得双主运行。
 
 在上述步骤 1—7 完成前，最准确的状态仍是：**重构代码与迁移工具已完成，生产 MySQL 切换尚未完成。**
+
+## 2026-08-06 AttentionThread 补充（当前口径）
+
+本报告前文的“五域”是 2026-08-05 当时口径。当前切换汇总门已扩展为六域：Life Event、Life Memory、Subject Document、Presence/World、Life Learning、AttentionThread。`audit_life_storage_cutover.py` 新增必填 `--attention-run`，旧的五域 run 集合不再足以签署新 generation。
+
+AttentionThread 的旧源 `thoughts/streams.json` 是状态快照而不是事件账本。迁移器只做原字节 archive、snapshot-only candidate import、逐行哈希校验和原字节 reverse export；旧快照始终不可激活，也不会产生 canonical 事件。只有 frozen copy run、trigger-enforced、legacy 非激活证明和全新的 canonical event/head/focus 空域证明同时成立，AttentionThread canonical 域才可进入 generation。
+
+2026-08-06 已在本机隔离 MySQL 8.0.46 完成 Attention canonical 与 legacy migration 两项真实合同，并用 2026-08-05 在线候选快照跑通正式 CLI。在线批次按预期保持 `copied` 且不可签署；没有修改生产配置、正式数据或远程共享库。生产切换仍需新的冻结快照、新的空 MySQL generation 数据库和用户维护窗口。

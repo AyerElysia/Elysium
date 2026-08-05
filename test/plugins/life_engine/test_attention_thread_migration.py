@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -312,3 +313,28 @@ async def test_mysql_candidate_schema_requires_fence_and_applies_both_versions(
             runtime,
             require_database_immutability=False,
         )
+
+
+async def test_opt_in_real_legacy_snapshot_round_trip(tmp_path: Path) -> None:
+    configured = os.environ.get("ELYSIUM_TEST_LEGACY_ATTENTION_SNAPSHOT", "").strip()
+    if not configured:
+        pytest.skip("real legacy Attention snapshot is not configured")
+    source = Path(configured)
+    source_before = source.read_bytes()
+    archive = create_legacy_attention_archive(source, tmp_path / "archive")
+
+    async with _candidate_runtime(tmp_path) as runtime:
+        copied = await import_legacy_attention_snapshot(source, runtime)
+        verified = await verify_legacy_attention_import(source, runtime)
+        reverse = await export_legacy_attention_snapshot(
+            runtime,
+            snapshot_sha256=copied.snapshot_sha256,
+            archive_directory=tmp_path / "reverse",
+        )
+
+    assert archive.snapshot_sha256 == copied.snapshot_sha256
+    assert copied.row_count == archive.row_count
+    assert verified["verified"] is True
+    assert reverse.verified is True
+    assert (tmp_path / "reverse/streams.json").read_bytes() == source_before
+    assert source.read_bytes() == source_before

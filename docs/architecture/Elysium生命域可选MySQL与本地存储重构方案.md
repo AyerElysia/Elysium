@@ -1038,6 +1038,14 @@ shadow 没有 generation 表隔离且包含旧可变投影，最终复制必须�
 - 迁移风险被限制为“新增副本是否可用”，而不是“原数据是否被搬走或破坏”；
 - 后端差异由合同测试和性能基准暴露，不靠调用者猜测。
 
+## 28. AttentionThread 存储与旧 ThoughtStream 收口（2026-08-06）
+
+本方案新增 AttentionThread 作为已登记生命域：local/MySQL 共享主体决策、Presence 数据库时间 gate、append-only occurrence、head CAS、有界分页/chunk 与 content-free health 合同，并消费 `LifeEngineService` 唯一持有的 `StorageBackendRuntime`。
+
+旧 `streams.json` 不具备事件历史语义，因此不进入 canonical 账本。平台迁移层已落实逐字节归档、manifest、snapshot-only candidate import、幂等校验与逐字节反向导出；旧状态、分数、自动衰减和 `last_thought` 均不会被解释为主体 open/note/pause/resume/close 决定。迁移表由数据库触发器保护，候选写入必须经过 generation/copy-authority fencing。
+
+汇总切换门由五域扩展为六域，新增 `attention_thread` run。该 run 只在冻结快照、精确归档/复制/反向导出、trigger-enforced 和 canonical 空域证明同时成立时，才允许新的 AttentionThread authority 进入 generation；legacy snapshot 自身始终 `generation_eligible=false`。生产配置、正式数据和当前运行进程尚未因此自动切换。
+
 这些是设计目标。是否达到更低延迟、更高吞吐或更好召回，必须由第 17、18 节的真实基准和端到端测试证明。
 
 ## 26. 如何使用新的数据存储架构
