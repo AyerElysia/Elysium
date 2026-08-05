@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -20,13 +21,23 @@ from plugins.life_engine.service.event_bus import (
     LifeEventChannel,
     RawEventStore,
 )
-from plugins.life_engine.service.perception_gateway import PerceptionGateway
+from plugins.life_engine.service.perception_gateway import (
+    PerceptionDeliveryReceipt,
+    PerceptionDeliveryUnverified,
+    PerceptionGateway,
+    PreparedPerception,
+)
 from plugins.life_engine.service.tool_manifests import get_tool_manifest
 from plugins.life_engine.service.world_projection import (
     WORLD_OBSERVATION_EVENT,
     WORLD_PROJECTOR_POLICY,
     WORLD_PROJECTOR_SCHEMA_VERSION,
     PerceptionCursorConflict,
+    PromptProjectionPersistenceError,
+    PromptProjectionValue,
+    WorldAssertionReference,
+    WorldAssertionReferencePage,
+    WorldChangeReferencePage,
     WorldProjectionConflict,
     WorldProjectionStore,
     WorldProjectionUnavailable,
@@ -54,21 +65,34 @@ def _service(tmp_path: Path) -> LifeEngineService:
     return LifeEngineService(_Plugin(config))
 
 
+def _exact_receipt(prepared: PreparedPerception) -> PerceptionDeliveryReceipt:
+    """Build the content-free receipt an exact final provider attempt emits."""
+
+    return PerceptionDeliveryReceipt(
+        delivery_id=prepared.delivery_id,
+        projection_sha256=prepared.projection_sha256,
+        delivered_bytes=prepared.delivered_bytes,
+        exact=True,
+    )
+
+
 def _observation(
     identity: str,
     *,
     source_instance_id: str,
     value: object,
     retracts: str = "",
+    domain: str = "relationship",
+    predicate: str = "current_state",
 ) -> LifeEvent:
     """Build one immutable observation event for store-level tests."""
 
     assertion = {
         "assertion_id": identity,
         "subject": "person:ayer",
-        "predicate": "current_state",
+        "predicate": predicate,
         "value": value,
-        "domain": "relationship",
+        "domain": domain,
         "status": "observed",
         "source_instance_id": "untrusted-content-spoof",
         "observed_at": "2026-08-02T12:00:00+08:00",
@@ -289,16 +313,28 @@ def test_gateway_cursor_is_commit_after_delivery_and_survives_restart(
     )
 
     prepared = gateway.prepare(voice.instance_id)
+    retry = gateway.prepare(voice.instance_id)
 
     assert "chat_global" in prepared.content
     assert "voice_1" in prepared.content
     assert "world-a" in prepared.content
+    assert retry.delivery_id == prepared.delivery_id
+    assert retry.projection_sha256 == prepared.projection_sha256
+    assert retry.content == prepared.content
     assert gateway.projection.perception_cursor("voice_1") == (0, 0)
-    committed_position, committed_revision = gateway.commit(prepared)
+    with pytest.raises(PerceptionDeliveryUnverified):
+        gateway.commit(prepared)
+    assert gateway.projection.perception_cursor("voice_1") == (0, 0)
+    checkpoint = prepared.commit_checkpoint()
+    assert not hasattr(checkpoint, "content")
+    committed_position, committed_revision = gateway.commit_delivery(
+        checkpoint,
+        _exact_receipt(prepared),
+    )
     assert committed_position == prepared.through_position
     assert committed_revision == 1
     with pytest.raises(PerceptionCursorConflict):
-        gateway.commit(prepared)
+        gateway.commit(prepared, _exact_receipt(prepared))
 
     restarted = PerceptionGateway(
         registry,
@@ -349,17 +385,25 @@ async def test_service_end_to_end_syncs_instances_and_preserves_full_content(
 
     assert voice.instance_id in chat_view.content
     assert "chat_global" in voice_view.content
-    assert full_report in chat_view.content
+    assert full_report not in chat_view.content
+    assert f"assertion:{receipt['assertion_id']}" in chat_view.content
     assertion = service.world_projection.list_assertions()[-1]
     assert assertion.value == full_report
     assert assertion.source_instance_id == voice.instance_id
     assert assertion.assertion_id == receipt["assertion_id"]
-    await service.commit_perception(voice_view)
+    chunk = await service.read_world_assertion_value_chunk(
+        receipt["assertion_id"],
+        max_bytes=16 * 1024,
+    )
+    assert chunk.complete is True
+    assert json.loads(chunk.content) == full_report
+    await service.commit_perception(voice_view, _exact_receipt(voice_view))
 
     restarted = _service(tmp_path)
     restarted_view = await restarted.prepare_perception(voice.instance_id)
     assert restarted_view.from_position == voice_view.through_position
-    assert full_report in restarted_view.content
+    assert full_report not in restarted_view.content
+    assert f"assertion:{receipt['assertion_id']}" in restarted_view.content
 
 
 @pytest.mark.asyncio
@@ -384,15 +428,283 @@ async def test_chatter_world_cursor_commits_only_after_model_success_hook(
     ]
 
     assert "chat_global" in context
+    assert len(context.encode("utf-8")) <= 60 * 1024
+    assert service.world_projection.perception_cursor("chat_global") == (0, 0)
+    with pytest.raises(PerceptionDeliveryUnverified):
+        await service.mark_chatter_runtime_context_seen(
+            "chat-stream",
+            high_water,
+            unified_chatter_context=True,
+        )
+    assert service.has_pending_chatter_perception(
+        "chat-stream",
+        unified_chatter_context=True,
+    )
     assert service.world_projection.perception_cursor("chat_global") == (0, 0)
     await service.mark_chatter_runtime_context_seen(
         "chat-stream",
         high_water,
         unified_chatter_context=True,
+        receipt=_exact_receipt(prepared),
     )
     assert service.world_projection.perception_cursor("chat_global")[0] == (
         prepared.through_position
     )
+    assert not service.has_pending_chatter_perception(
+        "chat-stream",
+        unified_chatter_context=True,
+    )
+
+
+def test_giant_world_value_is_referenced_and_utf8_chunked_without_loss(
+    tmp_path: Path,
+) -> None:
+    """A 1.6MB+ value stays durable while the prompt remains below 32 KiB."""
+
+    ledger = RawEventStore(tmp_path)
+    registry = ConsciousnessRegistry()
+    registry.register(
+        ConsciousnessInstance(
+            instance_id="observer",
+            kind="contract",
+            stream_ids=["stream:observer"],
+        )
+    )
+    giant_value = {"transcript": "爱莉希雅" * 150_000}
+    ledger.append_sync(
+        _observation(
+            "giant-value",
+            source_instance_id="observer",
+            value=giant_value,
+        )
+    )
+    gateway = PerceptionGateway(
+        registry,
+        ledger,
+        WorldProjectionStore(tmp_path / "giant.sqlite3"),
+    )
+
+    prepared = gateway.prepare(
+        "observer",
+        projection_kind="life_chatter",
+        max_bytes=32 * 1024,
+    )
+
+    assert prepared.delivered_bytes == len(prepared.content.encode("utf-8"))
+    assert prepared.delivered_bytes <= 32 * 1024
+    assert prepared.source_payload_bytes > 1_600_000
+    assert "assertion:giant-value" in prepared.content
+    assert "爱莉希雅" * 100 not in prepared.content
+    assert (
+        prepared.projection_sha256
+        == hashlib.sha256(prepared.content.encode("utf-8")).hexdigest()
+    )
+    with pytest.raises(PerceptionDeliveryUnverified):
+        gateway.commit(
+            prepared,
+            replace(_exact_receipt(prepared), exact=False),
+        )
+    assert gateway.projection.perception_cursor("observer") == (0, 0)
+
+    chunks: list[str] = []
+    offset = 0
+    while True:
+        chunk = gateway.projection.read_assertion_value_chunk(
+            "giant-value",
+            offset_bytes=offset,
+            max_bytes=64 * 1024,
+        )
+        assert len(chunk.content.encode("utf-8")) <= 64 * 1024
+        chunks.append(chunk.content)
+        if chunk.complete:
+            break
+        assert chunk.next_offset_bytes > offset
+        offset = chunk.next_offset_bytes
+    assert json.loads("".join(chunks)) == giant_value
+
+
+@pytest.mark.asyncio
+async def test_prompt_projection_and_known_transport_echo_fail_closed(
+    tmp_path: Path,
+) -> None:
+    """New recursive prompt echoes are rejected while historical evidence remains."""
+
+    service = _service(tmp_path)
+    observer = service.consciousness_registry.register(
+        ConsciousnessInstance(
+            instance_id="minecraft:observer",
+            kind="minecraft",
+            stream_ids=["minecraft:stream"],
+        )
+    )
+    echo = {
+        "trace_kind": "intent.issued",
+        "payload": {
+            "context": {"transient_world_perception": "recursive-prompt-only-value"}
+        },
+    }
+    with pytest.raises(PromptProjectionPersistenceError):
+        await service.report_world_observation(
+            "typed projection",
+            source_instance_id=observer.instance_id,
+            subject="minecraft:trace",
+            predicate="state",
+            domain="minecraft",
+            value=PromptProjectionValue(
+                delivery_id="delivery",
+                projection_sha256="a" * 64,
+                content="prompt only",
+            ),
+        )
+    with pytest.raises(PromptProjectionPersistenceError):
+        await service.report_world_observation(
+            "trace",
+            source_instance_id=observer.instance_id,
+            subject="minecraft:trace",
+            predicate="embodied_trace",
+            domain="minecraft",
+            value=echo,
+        )
+    assert service.world_projection.list_assertions() == []
+
+    ledger = RawEventStore(tmp_path / "historical")
+    ledger.append_sync(
+        _observation(
+            "historical-echo",
+            source_instance_id=observer.instance_id,
+            value=echo,
+            domain="minecraft",
+            predicate="embodied_trace",
+        )
+    )
+    gateway = PerceptionGateway(
+        service.consciousness_registry,
+        ledger,
+        WorldProjectionStore(tmp_path / "historical.sqlite3"),
+    )
+    prepared = gateway.prepare(observer.instance_id)
+    assert "transport_echo=quarantined" in prepared.content
+    assert "recursive-prompt-only-value" not in prepared.content
+    assert gateway.projection.list_assertions()[0].value == echo
+
+
+@pytest.mark.asyncio
+async def test_stable_world_observation_identity_is_idempotent_and_conflicting(
+    tmp_path: Path,
+) -> None:
+    """A retry after append-before-project failure cannot duplicate an experience."""
+
+    service = _service(tmp_path)
+    observer = service.consciousness_registry.register(
+        ConsciousnessInstance(
+            instance_id="minecraft:retry",
+            kind="minecraft",
+            stream_ids=["minecraft:retry"],
+        )
+    )
+    kwargs = {
+        "source_instance_id": observer.instance_id,
+        "subject": "minecraft:trace",
+        "predicate": "embodied_trace_ref",
+        "domain": "minecraft",
+        "observed_at": "2026-08-05T12:00:00+08:00",
+        "occurrence_id": "minecraft-trace:projection-123",
+        "assertion_id": "minecraft-assertion:projection-123",
+        "value": {"projection_id": "projection-123"},
+    }
+
+    first = await service.report_world_observation("trace ref", **kwargs)
+    replay = await service.report_world_observation("trace ref", **kwargs)
+
+    assert replay == first
+    assertions = service.world_projection.list_assertions()
+    assert [item.assertion_id for item in assertions] == [
+        "minecraft-assertion:projection-123"
+    ]
+    with pytest.raises(ValueError, match="OccurrenceConflict"):
+        await service.report_world_observation("different trace ref", **kwargs)
+    with pytest.raises(ValueError, match="explicit observed_at"):
+        await service.report_world_observation(
+            "unstable retry",
+            source_instance_id=observer.instance_id,
+            subject="minecraft:trace",
+            occurrence_id="minecraft-trace:missing-time",
+        )
+
+
+def test_hundred_thousand_assertion_frontier_is_bounded_and_continuable(
+    tmp_path: Path,
+) -> None:
+    """Large-cardinality metadata cannot force an unbounded prompt projection."""
+
+    registry = ConsciousnessRegistry()
+    registry.register(
+        ConsciousnessInstance(
+            instance_id="observer",
+            kind="contract",
+            stream_ids=["stream:observer"],
+        )
+    )
+    gateway = PerceptionGateway(
+        registry,
+        RawEventStore(tmp_path),
+        WorldProjectionStore(tmp_path / "cardinality.sqlite3"),
+    )
+    items = tuple(
+        WorldAssertionReference(
+            assertion_id=f"assertion-{index:06d}",
+            subject="subject:self",
+            predicate="state",
+            domain="contract",
+            status="observed",
+            source_instance_id="observer",
+            source_event_id=f"event-{index:06d}",
+            occurrence_id=f"occurrence-{index:06d}",
+            observed_at=f"2026-08-05T00:{index // 60:02d}:{index % 60:02d}+00:00",
+            valid_from="",
+            valid_to="",
+            recorded_at="2026-08-05T00:00:00+00:00",
+            supersedes_assertion_id="",
+            value_bytes=4096,
+            value_inlined=False,
+            value=None,
+            transport_echo=False,
+        )
+        for index in range(256)
+    )
+    prepared = gateway._build_prepared(
+        identity="observer",
+        projection_kind="stress",
+        max_bytes=32 * 1024,
+        from_position=0,
+        cursor_revision=0,
+        source_frontier=100_000,
+        assertion_page=WorldAssertionReferencePage(
+            items=items,
+            total_items=100_000,
+            total_value_bytes=100_000 * 4096,
+            next_after_observed_at=items[-1].observed_at,
+            next_after_assertion_id=items[-1].assertion_id,
+        ),
+        change_page=WorldChangeReferencePage(
+            items=(),
+            total_items=0,
+            total_payload_bytes=0,
+            has_more=False,
+        ),
+    )
+
+    assert prepared.delivered_bytes <= 32 * 1024
+    assert prepared.omitted_assertion_count >= 99_744
+    assert prepared.snapshot_continuation_token
+    assert prepared.source_frontier == 100_000
+    assert prepared.through_position == 100_000
+    continuation = gateway.decode_snapshot_continuation_token(
+        prepared.snapshot_continuation_token
+    )
+    assert continuation["projection_kind"] == "stress"
+    assert continuation["source_frontier"] == 100_000
+    assert continuation["after_assertion_id"] == prepared.assertion_ids[-1]
 
 
 def test_legacy_world_snapshot_is_imported_once_and_source_is_preserved(

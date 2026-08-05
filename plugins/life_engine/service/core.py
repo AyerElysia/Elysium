@@ -12,7 +12,7 @@ import hashlib
 import json
 import traceback
 from collections.abc import Mapping
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -132,6 +132,10 @@ from .event_bus import (
 )
 from .perception_gateway import (
     AsyncPerceptionGateway,
+    DEFAULT_PERCEPTION_MAX_BYTES,
+    PerceptionCommitCheckpoint,
+    PerceptionDeliveryReceipt,
+    PerceptionDeliveryUnverified,
     PerceptionGateway,
     PreparedPerception,
 )
@@ -141,6 +145,7 @@ from .world_projection import (
     WORLD_PROJECTION_DB_FILE,
     WorldProjectionStore,
     legacy_snapshot_assertions,
+    reject_prompt_projection_persistence,
 )
 from .integrations import (
     DFCIntegration,
@@ -159,6 +164,24 @@ if TYPE_CHECKING:
 
 logger = get_logger("life_engine", display="life_engine")
 _USER_TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "templates" / "USER.md"
+LIFE_CHATTER_WORLD_MAX_BYTES = 32 * 1024
+LIFE_CHATTER_PROJECTED_SUFFIX_MAX_BYTES = 60 * 1024
+LIFE_CHATTER_EFFECTIVE_TEXT_MAX_BYTES = 64 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class ChatterRuntimeDelivery:
+    """Content-free metadata for one bounded transient chatter suffix."""
+
+    delivery_id: str
+    delivery_marker: str
+    projected_suffix_sha256: str
+    projected_suffix_bytes: int
+    source_bytes: int
+    omitted_bytes: int
+    prepared_perception: PreparedPerception
+    event_through_sequence: int
+    thought_through_revision: int
 
 
 def _resolve_heartbeat_timeout(configured: float, model_set: Any) -> float:
@@ -346,6 +369,7 @@ class LifeEngineService(BaseService):
         self._world_projection: Any | None = None
         self._perception_gateway: PerceptionGateway | AsyncPerceptionGateway | None = None
         self._pending_chatter_perceptions: dict[str, PreparedPerception] = {}
+        self._pending_chatter_deliveries: dict[str, ChatterRuntimeDelivery] = {}
         self._attention_router: AttentionRouter | None = None
         self._last_memory_maintenance_prompt_at: str | None = None
         self._followup_states: dict[str, FollowupState] = {}
@@ -1139,6 +1163,40 @@ class LifeEngineService(BaseService):
         instance = self.consciousness_registry.get(str(instance_id or "").strip())
         return bool(instance is not None and instance.is_active)
 
+    @staticmethod
+    def _world_observation_identities(
+        *,
+        occurrence_id: str,
+        assertion_id: str,
+        observed_at: str,
+    ) -> tuple[str, str, str]:
+        """Resolve optional stable identities for idempotent observation replay."""
+
+        occurrence = str(occurrence_id or "").strip()
+        assertion = str(assertion_id or "").strip()
+        if assertion and not occurrence:
+            raise ValueError(
+                "stable world assertion_id requires a stable occurrence_id"
+            )
+        if occurrence and not str(observed_at or "").strip():
+            raise ValueError(
+                "stable world occurrence_id requires an explicit observed_at"
+            )
+        if not occurrence:
+            event_id = "world_observation_" + uuid4().hex
+            return event_id, event_id, "assertion_" + uuid4().hex
+        event_digest = hashlib.sha256(
+            f"world-observation-event:{occurrence}".encode("utf-8")
+        ).hexdigest()
+        assertion_digest = hashlib.sha256(
+            f"world-observation-assertion:{occurrence}".encode("utf-8")
+        ).hexdigest()
+        return (
+            "world_observation_" + event_digest[:32],
+            occurrence,
+            assertion or "assertion_" + assertion_digest[:32],
+        )
+
     def report_world_observation_sync(
         self,
         report: str,
@@ -1155,6 +1213,8 @@ class LifeEngineService(BaseService):
         supersedes_assertion_id: str = "",
         retracts_assertion_id: str = "",
         value: Any | None = None,
+        occurrence_id: str = "",
+        assertion_id: str = "",
     ) -> dict[str, Any]:
         """Append one attributed observation and project it synchronously."""
 
@@ -1178,13 +1238,24 @@ class LifeEngineService(BaseService):
         if not assertion_subject or not assertion_predicate:
             raise ValueError("world observation subject and predicate must not be empty")
         now = observed_at or _now_iso()
-        assertion_id = "assertion_" + uuid4().hex
-        event_id = "world_observation_" + uuid4().hex
+        event_id, event_occurrence_id, resolved_assertion_id = (
+            self._world_observation_identities(
+                occurrence_id=occurrence_id,
+                assertion_id=assertion_id,
+                observed_at=observed_at,
+            )
+        )
+        assertion_value = report_text if value is None else value
+        reject_prompt_projection_persistence(
+            assertion_value,
+            domain=str(domain or ""),
+            predicate=assertion_predicate,
+        )
         assertion: dict[str, Any] = {
-            "assertion_id": assertion_id,
+            "assertion_id": resolved_assertion_id,
             "subject": assertion_subject,
             "predicate": assertion_predicate,
-            "value": report_text if value is None else value,
+            "value": assertion_value,
             "domain": str(domain or ""),
             "status": str(status or ""),
             "source_instance_id": instance_id,
@@ -1211,9 +1282,9 @@ class LifeEngineService(BaseService):
             stream_id=str(stream_id or ""),
             priority=int(LifeEventPriority.NORMAL),
             salience=0.8,
-            occurrence_id=event_id,
+            occurrence_id=event_occurrence_id,
             source_instance_id=instance_id,
-            metadata={"assertion_id": assertion_id},
+            metadata={"assertion_id": resolved_assertion_id},
         )
         persisted = self._get_event_bus().store.append_sync(event)
         frontier = self._get_world_projection().catch_up(
@@ -1222,7 +1293,7 @@ class LifeEngineService(BaseService):
         return {
             "event_id": persisted.event_id,
             "occurrence_id": persisted.occurrence_id,
-            "assertion_id": assertion_id,
+            "assertion_id": resolved_assertion_id,
             "ingest_position": persisted.sequence,
             "projection_as_of": frontier,
             "source_instance_id": instance_id,
@@ -1244,6 +1315,8 @@ class LifeEngineService(BaseService):
         supersedes_assertion_id: str = "",
         retracts_assertion_id: str = "",
         value: Any | None = None,
+        occurrence_id: str = "",
+        assertion_id: str = "",
     ) -> dict[str, Any]:
         """Append one attributed observation without blocking the event loop."""
 
@@ -1263,6 +1336,8 @@ class LifeEngineService(BaseService):
                 supersedes_assertion_id=supersedes_assertion_id,
                 retracts_assertion_id=retracts_assertion_id,
                 value=value,
+                occurrence_id=occurrence_id,
+                assertion_id=assertion_id,
             )
         registry = self.consciousness_registry
         assert isinstance(registry, AsyncConsciousnessRegistry)
@@ -1286,13 +1361,24 @@ class LifeEngineService(BaseService):
                 "world observation subject and predicate must not be empty"
             )
         now = str(observed_at or "") or _now_iso()
-        assertion_id = "assertion_" + uuid4().hex
-        event_id = "world_observation_" + uuid4().hex
+        event_id, event_occurrence_id, resolved_assertion_id = (
+            self._world_observation_identities(
+                occurrence_id=occurrence_id,
+                assertion_id=assertion_id,
+                observed_at=observed_at,
+            )
+        )
+        assertion_value = report_text if value is None else value
+        reject_prompt_projection_persistence(
+            assertion_value,
+            domain=str(domain or ""),
+            predicate=assertion_predicate,
+        )
         assertion: dict[str, Any] = {
-            "assertion_id": assertion_id,
+            "assertion_id": resolved_assertion_id,
             "subject": assertion_subject,
             "predicate": assertion_predicate,
-            "value": report_text if value is None else value,
+            "value": assertion_value,
             "domain": str(domain or ""),
             "status": str(status or ""),
             "source_instance_id": instance_id,
@@ -1319,16 +1405,16 @@ class LifeEngineService(BaseService):
             stream_id=str(stream_id or ""),
             priority=int(LifeEventPriority.NORMAL),
             salience=0.8,
-            occurrence_id=event_id,
+            occurrence_id=event_occurrence_id,
             source_instance_id=instance_id,
-            metadata={"assertion_id": assertion_id},
+            metadata={"assertion_id": resolved_assertion_id},
         )
         persisted = await self._get_life_event_store().append(event)
         frontier = await self.catch_up_world_projection()
         return {
             "event_id": persisted.event_id,
             "occurrence_id": persisted.occurrence_id,
-            "assertion_id": assertion_id,
+            "assertion_id": resolved_assertion_id,
             "ingest_position": persisted.sequence,
             "projection_as_of": frontier,
             "source_instance_id": instance_id,
@@ -1337,32 +1423,173 @@ class LifeEngineService(BaseService):
     async def prepare_perception(
         self,
         instance_id: str,
+        *,
+        projection_kind: str = "default",
+        max_bytes: int = DEFAULT_PERCEPTION_MAX_BYTES,
     ) -> PreparedPerception:
-        """Prepare a retryable transient world delivery for one instance."""
+        """Prepare a bounded retryable World delivery for one instance."""
 
         gateway = self._get_perception_gateway()
         if isinstance(gateway, AsyncPerceptionGateway):
-            return await gateway.prepare(instance_id)
-        return await asyncio.to_thread(gateway.prepare, instance_id)
+            return await gateway.prepare(
+                instance_id,
+                projection_kind=projection_kind,
+                max_bytes=max_bytes,
+            )
+        return await asyncio.to_thread(
+            gateway.prepare,
+            instance_id,
+            projection_kind=projection_kind,
+            max_bytes=max_bytes,
+        )
 
     async def commit_perception(
         self,
         prepared: PreparedPerception,
+        receipt: PerceptionDeliveryReceipt | None = None,
     ) -> tuple[int, int]:
-        """Commit a world delivery after its runtime accepted the context."""
+        """Commit only after an exact effective-context receipt."""
+
+        if receipt is None:
+            logger.warning(
+                "World perception receipt missing; cursor remains unchanged: "
+                f"delivery_id={prepared.delivery_id}"
+            )
+            return prepared.from_position, prepared.cursor_revision
+        gateway = self._get_perception_gateway()
+        if isinstance(gateway, AsyncPerceptionGateway):
+            return await gateway.commit(prepared, receipt)
+        return await asyncio.to_thread(gateway.commit, prepared, receipt)
+
+    async def commit_perception_delivery(
+        self,
+        checkpoint: PerceptionCommitCheckpoint,
+        receipt: PerceptionDeliveryReceipt | None = None,
+    ) -> tuple[int, int]:
+        """Replay a receipt-gated cursor CAS without persisting prompt text."""
+
+        if receipt is None:
+            logger.warning(
+                "World perception checkpoint receipt missing; cursor remains "
+                f"unchanged: delivery_id={checkpoint.delivery_id}"
+            )
+            return checkpoint.from_position, checkpoint.cursor_revision
+        gateway = self._get_perception_gateway()
+        if isinstance(gateway, AsyncPerceptionGateway):
+            return await gateway.commit_delivery(checkpoint, receipt)
+        return await asyncio.to_thread(
+            gateway.commit_delivery,
+            checkpoint,
+            receipt,
+        )
+
+    async def query_world(
+        self,
+        instance_id: str,
+        query: str,
+        *,
+        max_bytes: int = DEFAULT_PERCEPTION_MAX_BYTES,
+    ) -> str:
+        """Return a bounded provenance-aware projection for reflection."""
 
         gateway = self._get_perception_gateway()
         if isinstance(gateway, AsyncPerceptionGateway):
-            return await gateway.commit(prepared)
-        return await asyncio.to_thread(gateway.commit, prepared)
+            return await gateway.query(instance_id, query, max_bytes=max_bytes)
+        return await asyncio.to_thread(
+            gateway.query,
+            instance_id,
+            query,
+            max_bytes=max_bytes,
+        )
 
-    async def query_world(self, instance_id: str, query: str) -> str:
-        """Return the full provenance-aware projection for reflective judgment."""
+    async def list_world_assertion_references_page(
+        self,
+        *,
+        include_retracted: bool = False,
+        after_observed_at: str = "",
+        after_assertion_id: str = "",
+        continuation_token: str = "",
+        limit: int = 128,
+        inline_max_bytes: int = 1024,
+    ) -> Any:
+        """Return one stable bounded assertion page from the selected store."""
+
+        if continuation_token:
+            continuation = PerceptionGateway.decode_snapshot_continuation_token(
+                continuation_token
+            )
+            after_observed_at = str(
+                continuation.get("after_observed_at") or ""
+            )
+            after_assertion_id = str(
+                continuation.get("after_assertion_id") or ""
+            )
+        gateway = self._get_perception_gateway()
+        projection = gateway.projection
+        if isinstance(gateway, AsyncPerceptionGateway):
+            return await projection.list_assertion_references_page(
+                include_retracted=include_retracted,
+                after_observed_at=after_observed_at,
+                after_assertion_id=after_assertion_id,
+                limit=limit,
+                inline_max_bytes=inline_max_bytes,
+            )
+        return await asyncio.to_thread(
+            projection.list_assertion_references_page,
+            include_retracted=include_retracted,
+            after_observed_at=after_observed_at,
+            after_assertion_id=after_assertion_id,
+            limit=limit,
+            inline_max_bytes=inline_max_bytes,
+        )
+
+    async def read_world_assertion_value_chunk(
+        self,
+        assertion_id: str,
+        *,
+        offset_bytes: int = 0,
+        max_bytes: int = 16 * 1024,
+    ) -> Any:
+        """Read one assertion value chunk on canonical UTF-8 boundaries."""
 
         gateway = self._get_perception_gateway()
+        projection = gateway.projection
         if isinstance(gateway, AsyncPerceptionGateway):
-            return await gateway.query(instance_id, query)
-        return await asyncio.to_thread(gateway.query, instance_id, query)
+            return await projection.read_assertion_value_chunk(
+                assertion_id,
+                offset_bytes=offset_bytes,
+                max_bytes=max_bytes,
+            )
+        return await asyncio.to_thread(
+            projection.read_assertion_value_chunk,
+            assertion_id,
+            offset_bytes=offset_bytes,
+            max_bytes=max_bytes,
+        )
+
+    async def read_world_change_payload_chunk(
+        self,
+        ingest_position: int,
+        *,
+        offset_bytes: int = 0,
+        max_bytes: int = 16 * 1024,
+    ) -> Any:
+        """Read one World change payload chunk without cursor mutation."""
+
+        gateway = self._get_perception_gateway()
+        projection = gateway.projection
+        if isinstance(gateway, AsyncPerceptionGateway):
+            return await projection.read_change_payload_chunk(
+                ingest_position,
+                offset_bytes=offset_bytes,
+                max_bytes=max_bytes,
+            )
+        return await asyncio.to_thread(
+            projection.read_change_payload_chunk,
+            ingest_position,
+            offset_bytes=offset_bytes,
+            max_bytes=max_bytes,
+        )
 
     async def catch_up_world_projection(self) -> int:
         """Advance the selected or legacy projection without blocking the loop."""
@@ -4621,36 +4848,145 @@ class LifeEngineService(BaseService):
             return 0
         return int((self._state.chatter_thought_cursors or {}).get(sid, 0) or 0)
 
+    @staticmethod
+    def _build_bounded_chatter_suffix(
+        *,
+        header: str,
+        sections: list[str],
+        world_delivery_id: str,
+    ) -> tuple[str, str, str, int, int]:
+        """Project complete section lines into the hard 60 KiB suffix budget."""
+
+        body_budget = LIFE_CHATTER_PROJECTED_SUFFIX_MAX_BYTES - 512
+        parts = [header]
+        used = len(header.encode("utf-8"))
+        source_bytes = used
+        truncated = False
+        for section in sections:
+            section_text = str(section or "").strip()
+            if not section_text:
+                continue
+            section_bytes = len(section_text.encode("utf-8"))
+            source_bytes += 2 + section_bytes
+            if truncated:
+                continue
+            if used + 2 + section_bytes <= body_budget:
+                parts.append(section_text)
+                used += 2 + section_bytes
+                continue
+            digest = hashlib.sha256(section_text.encode("utf-8")).hexdigest()
+            omission = (
+                f"[section_projection_omitted bytes={section_bytes}; "
+                f"sha256={digest}]"
+            )
+            remaining = max(0, body_budget - used - 2)
+            selected_lines: list[str] = []
+            selected_bytes = 0
+            reserve = len(omission.encode("utf-8")) + 1
+            for line in section_text.splitlines():
+                addition = line if not selected_lines else f"\n{line}"
+                addition_bytes = len(addition.encode("utf-8"))
+                if selected_bytes + addition_bytes + reserve > remaining:
+                    break
+                selected_lines.append(line)
+                selected_bytes += addition_bytes
+            projected = "\n".join([*selected_lines, omission])
+            if len(projected.encode("utf-8")) <= remaining:
+                parts.append(projected)
+                used += 2 + len(projected.encode("utf-8"))
+            truncated = True
+        body = "\n\n".join(parts)
+        body_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        delivery_seed = (
+            f"life-chatter-suffix-v1:{world_delivery_id}:{body_sha256}"
+        )
+        delivery_id = hashlib.sha256(
+            delivery_seed.encode("utf-8")
+        ).hexdigest()[:32]
+        marker = f"life-chatter-runtime:{delivery_id}"
+        content = (
+            f'<life_chatter_runtime_delivery marker="{marker}" '
+            'algorithm="life-chatter-suffix-v1">\n'
+            f"{body}\n"
+            "</life_chatter_runtime_delivery>"
+        )
+        delivered_bytes = len(content.encode("utf-8"))
+        if delivered_bytes > LIFE_CHATTER_PROJECTED_SUFFIX_MAX_BYTES:
+            raise RuntimeError(
+                "life chatter suffix exceeded its hard byte budget: "
+                f"delivered={delivered_bytes}, "
+                f"max={LIFE_CHATTER_PROJECTED_SUFFIX_MAX_BYTES}"
+            )
+        omitted_bytes = max(0, source_bytes - len(body.encode("utf-8")))
+        return content, delivery_id, marker, source_bytes, omitted_bytes
+
+    def get_pending_chatter_runtime_delivery(
+        self,
+        stream_id: str,
+        *,
+        unified_chatter_context: bool = False,
+    ) -> ChatterRuntimeDelivery | None:
+        """Return content-free metadata needed to register an exact suffix."""
+
+        sid = self._chatter_cursor_key(
+            stream_id,
+            unified_chatter_context=unified_chatter_context,
+        )
+        if not sid:
+            return None
+        return self._pending_chatter_deliveries.get(sid)
+
     async def mark_chatter_runtime_context_seen(
         self,
         stream_id: str,
         sequence: int,
         *,
         unified_chatter_context: bool = False,
+        receipt: PerceptionDeliveryReceipt | None = None,
     ) -> None:
-        """标记某个聊天流已经看过的 life 事件流高水位（event cursor）。
+        """Commit one exact pending World/event/thought delivery as a unit."""
 
-        thought_revision cursor 在 build_chatter_runtime_context 渲染时已内部提交，
-        外部调用方仍只需要传 event 序列高水位。
-        """
         sid = self._chatter_cursor_key(
             stream_id,
             unified_chatter_context=unified_chatter_context,
         )
         if not sid:
             return
-        if sequence > 0:
-            async with self._get_lock():
-                cursors = self._state.chatter_context_cursors
-                cursors[sid] = max(
-                    int(cursors.get(sid, 0) or 0),
-                    int(sequence),
-                )
+        delivery = self._pending_chatter_deliveries.get(sid)
         prepared = self._pending_chatter_perceptions.get(sid)
-        if prepared is not None:
-            await self.commit_perception(prepared)
+        if delivery is None or prepared is None:
+            raise PerceptionDeliveryUnverified(
+                "no matching pending chatter runtime delivery exists"
+            )
+        if delivery.prepared_perception is not prepared:
+            raise PerceptionDeliveryUnverified(
+                "pending chatter delivery and World projection identity diverged"
+            )
+        if int(sequence) != delivery.event_through_sequence:
+            raise PerceptionDeliveryUnverified(
+                "chatter event frontier does not match the pending delivery"
+            )
+        if receipt is None:
+            raise PerceptionDeliveryUnverified(
+                "chatter runtime commit requires an exact effective-context receipt"
+            )
+
+        await self.commit_perception(prepared, receipt)
+        async with self._get_lock():
+            event_cursors = self._state.chatter_context_cursors
+            event_cursors[sid] = max(
+                int(event_cursors.get(sid, 0) or 0),
+                delivery.event_through_sequence,
+            )
+            thought_cursors = self._state.chatter_thought_cursors
+            thought_cursors[sid] = max(
+                int(thought_cursors.get(sid, 0) or 0),
+                delivery.thought_through_revision,
+            )
             if self._pending_chatter_perceptions.get(sid) is prepared:
                 self._pending_chatter_perceptions.pop(sid, None)
+            if self._pending_chatter_deliveries.get(sid) is delivery:
+                self._pending_chatter_deliveries.pop(sid, None)
 
     def has_pending_chatter_perception(
         self,
@@ -4664,7 +5000,11 @@ class LifeEngineService(BaseService):
             stream_id,
             unified_chatter_context=unified_chatter_context,
         )
-        return bool(sid and sid in self._pending_chatter_perceptions)
+        return bool(
+            sid
+            and sid in self._pending_chatter_perceptions
+            and sid in self._pending_chatter_deliveries
+        )
 
     async def _commit_chatter_thought_cursor(
         self,
@@ -5083,17 +5423,15 @@ class LifeEngineService(BaseService):
         sections: list[str] = []
 
         instance_id = self.resolve_consciousness_instance(stream_id)
-        world_perception = await self.prepare_perception(instance_id)
+        world_perception = await self.prepare_perception(
+            instance_id,
+            projection_kind="life_chatter",
+            max_bytes=LIFE_CHATTER_WORLD_MAX_BYTES,
+        )
         sections.append(
             "### 潜意识协调的瞬时世界感知\n"
             f"{world_perception.content}"
         )
-        if commit_cursors:
-            perception_key = self._chatter_cursor_key(
-                stream_id,
-                unified_chatter_context=unified_chatter_context,
-            ) or instance_id
-            self._pending_chatter_perceptions[perception_key] = world_perception
 
         new_thought_revision = thought_cursor
         if sync_streams:
@@ -5211,14 +5549,6 @@ class LifeEngineService(BaseService):
                     f"{knowledge_text}"
                 )
 
-        # thought delta cursor 在渲染阶段直接提交（不等待 LLM 调用成功）
-        if commit_cursors and new_thought_revision > thought_cursor:
-            await self._commit_chatter_thought_cursor(
-                stream_id,
-                new_thought_revision,
-                unified_chatter_context=unified_chatter_context,
-            )
-
         if not sections:
             return "", new_event_high_water
 
@@ -5226,7 +5556,41 @@ class LifeEngineService(BaseService):
             "这是同一主体 life_mode 自上次对话器读取后产生的运行态。"
             "它只在本轮临时可见，不会长期留在对话 payload。"
         )
-        return f"{header}\n\n" + "\n\n".join(sections), new_event_high_water
+        (
+            suffix,
+            delivery_id,
+            delivery_marker,
+            source_bytes,
+            omitted_bytes,
+        ) = self._build_bounded_chatter_suffix(
+            header=header,
+            sections=sections,
+            world_delivery_id=world_perception.delivery_id,
+        )
+        event_through = event_cursor if omitted_bytes else new_event_high_water
+        thought_through = thought_cursor if omitted_bytes else new_thought_revision
+        if commit_cursors:
+            perception_key = self._chatter_cursor_key(
+                stream_id,
+                unified_chatter_context=unified_chatter_context,
+            ) or instance_id
+            self._pending_chatter_perceptions[perception_key] = world_perception
+            self._pending_chatter_deliveries[perception_key] = (
+                ChatterRuntimeDelivery(
+                    delivery_id=delivery_id,
+                    delivery_marker=delivery_marker,
+                    projected_suffix_sha256=hashlib.sha256(
+                        suffix.encode("utf-8")
+                    ).hexdigest(),
+                    projected_suffix_bytes=len(suffix.encode("utf-8")),
+                    source_bytes=source_bytes,
+                    omitted_bytes=omitted_bytes,
+                    prepared_perception=world_perception,
+                    event_through_sequence=event_through,
+                    thought_through_revision=thought_through,
+                )
+            )
+        return suffix, event_through
 
     async def search_outer_memory(self, query: str, top_k: int = 5) -> str:
         """供对外运行模式深度检索 life memory。"""

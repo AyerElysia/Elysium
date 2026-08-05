@@ -24,10 +24,23 @@ from plugins.life_engine.service.consciousness import (
     ConsciousnessRegistry,
 )
 from plugins.life_engine.service.event_bus import LifeEvent
+from plugins.life_engine.service.perception_gateway import (
+    PerceptionDeliveryReceipt,
+    PreparedPerception,
+)
 from plugins.life_engine.service.presence_store import PresenceRevisionConflict
 from plugins.life_engine.service.world_projection import PerceptionCursorConflict
 from plugins.life_engine.storage.models import BackendKind
 from test.plugins.life_engine.presence_world_fakes import build_fake_stores
+
+
+def _exact_receipt(prepared: PreparedPerception) -> PerceptionDeliveryReceipt:
+    return PerceptionDeliveryReceipt(
+        delivery_id=prepared.delivery_id,
+        projection_sha256=prepared.projection_sha256,
+        delivered_bytes=prepared.delivered_bytes,
+        exact=True,
+    )
 
 
 class _FakeLifeEventStore:
@@ -322,7 +335,10 @@ async def test_selected_service_uses_one_backend_for_presence_world_and_events(
     assert prepared.through_position == report["ingest_position"]
     assert "voice:service-contract" in prepared.content
     assert await stores.world.perception_cursor(observer.instance_id) == (0, 0)
-    committed = await first.commit_perception(prepared)
+    committed = await first.commit_perception_delivery(
+        prepared.commit_checkpoint(),
+        _exact_receipt(prepared),
+    )
     assert committed == (prepared.through_position, 1)
     assert (
         await stores.world.commit_perception_cursor(
@@ -334,7 +350,7 @@ async def test_selected_service_uses_one_backend_for_presence_world_and_events(
         == committed
     )
     with pytest.raises(PerceptionCursorConflict):
-        await first.commit_perception(prepared)
+        await first.commit_perception(prepared, _exact_receipt(prepared))
 
     assert await first.rebuild_world_projection() == report["ingest_position"]
     assert await stores.world.perception_cursor(observer.instance_id) == committed
@@ -343,9 +359,9 @@ async def test_selected_service_uses_one_backend_for_presence_world_and_events(
     assert health["backend"] == backend.value
     assert first.health()["world_projection"]["rebuild_state"] == "idle"
     assert first.health()["subject_document"]["documents"] == 0
-    assert first.health()["storage_runtime"]["components"]["learning"][
-        "event_count"
-    ] == 0
+    assert (
+        first.health()["storage_runtime"]["components"]["learning"]["event_count"] == 0
+    )
 
     await first._close_selected_storage()
     assert runtimes[0].close_calls == 1

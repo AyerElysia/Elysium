@@ -26,9 +26,15 @@ from plugins.life_engine.service.world_projection import (
     WORLD_REBUILDING,
     PerceptionCursorConflict,
     WorldAssertion,
+    WorldAssertionReference,
+    WorldAssertionReferencePage,
+    WorldChangeReference,
+    WorldChangeReferencePage,
     WorldProjectionChange,
     WorldProjectionConflict,
+    WorldProjectionStore,
     WorldProjectionUnavailable,
+    WorldValueChunk,
 )
 from plugins.life_engine.storage.domain_contracts import (
     PresenceCommitResult,
@@ -578,6 +584,88 @@ class FakeWorldProjectionStore:
                 values, key=lambda item: (item.observed_at, item.assertion_id)
             )
 
+    async def list_assertion_references_page(
+        self,
+        *,
+        include_retracted: bool = False,
+        after_observed_at: str = "",
+        after_assertion_id: str = "",
+        limit: int = 128,
+        inline_max_bytes: int = 1024,
+    ) -> WorldAssertionReferencePage:
+        values = await self.list_assertions(include_retracted=include_retracted)
+        filtered = [
+            item
+            for item in values
+            if (item.observed_at, item.assertion_id)
+            > (str(after_observed_at or ""), str(after_assertion_id or ""))
+        ]
+        page_limit = max(1, min(int(limit), 1000))
+        selected = filtered[:page_limit]
+        items: list[WorldAssertionReference] = []
+        total_bytes = 0
+        for item in filtered:
+            raw = json.dumps(
+                item.value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            total_bytes += len(raw.encode("utf-8"))
+        for item in selected:
+            raw = json.dumps(
+                item.value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            value_bytes = len(raw.encode("utf-8"))
+            inlined = value_bytes <= int(inline_max_bytes)
+            value = item.value if inlined else None
+            trace = item.value if isinstance(item.value, dict) else {}
+            context = (
+                trace.get("payload", {}).get("context", {})
+                if isinstance(trace.get("payload"), dict)
+                else {}
+            )
+            transport_echo = bool(
+                item.domain == "minecraft"
+                and item.predicate == "embodied_trace"
+                and trace.get("trace_kind") == "intent.issued"
+                and isinstance(context, dict)
+                and "transient_world_perception" in context
+            )
+            items.append(
+                WorldAssertionReference(
+                    assertion_id=item.assertion_id,
+                    subject=item.subject,
+                    predicate=item.predicate,
+                    domain=item.domain,
+                    status=item.status,
+                    source_instance_id=item.source_instance_id,
+                    source_event_id=item.source_event_id,
+                    occurrence_id=item.occurrence_id,
+                    observed_at=item.observed_at,
+                    valid_from=item.valid_from,
+                    valid_to=item.valid_to,
+                    recorded_at=item.recorded_at,
+                    supersedes_assertion_id=item.supersedes_assertion_id,
+                    value_bytes=value_bytes,
+                    value_inlined=inlined,
+                    value=copy.deepcopy(value),
+                    transport_echo=transport_echo,
+                )
+            )
+        has_more = len(filtered) > page_limit
+        last = selected[-1] if selected and has_more else None
+        return WorldAssertionReferencePage(
+            items=tuple(items),
+            total_items=len(filtered),
+            total_value_bytes=total_bytes,
+            next_after_observed_at=last.observed_at if last else "",
+            next_after_assertion_id=last.assertion_id if last else "",
+        )
+
     async def changes_since(
         self,
         ingest_position: int,
@@ -591,6 +679,136 @@ class FakeWorldProjectionStore:
                 for position in sorted(self._changes)
                 if int(ingest_position) < position <= through
             ]
+
+    async def change_references_page(
+        self,
+        ingest_position: int,
+        *,
+        through_position: int,
+        limit: int = 128,
+        inline_max_bytes: int = 1024,
+    ) -> WorldChangeReferencePage:
+        values = await self.changes_since(
+            ingest_position,
+            through_position=through_position,
+        )
+        page_limit = max(1, min(int(limit), 1000))
+        total_bytes = 0
+        items: list[WorldChangeReference] = []
+        for item in values:
+            raw = json.dumps(
+                item.payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            total_bytes += len(raw.encode("utf-8"))
+        for item in values[:page_limit]:
+            raw = json.dumps(
+                item.payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            payload_bytes = len(raw.encode("utf-8"))
+            inlined = payload_bytes <= int(inline_max_bytes)
+            assertion = item.payload.get("assertion")
+            assertion_value = (
+                assertion.get("value") if isinstance(assertion, dict) else None
+            )
+            trace_payload = (
+                assertion_value.get("payload")
+                if isinstance(assertion_value, dict)
+                else None
+            )
+            context = (
+                trace_payload.get("context")
+                if isinstance(trace_payload, dict)
+                else None
+            )
+            transport_echo = bool(
+                isinstance(assertion, dict)
+                and assertion.get("domain") == "minecraft"
+                and assertion.get("predicate") == "embodied_trace"
+                and isinstance(assertion_value, dict)
+                and assertion_value.get("trace_kind") == "intent.issued"
+                and isinstance(context, dict)
+                and "transient_world_perception" in context
+            )
+            items.append(
+                WorldChangeReference(
+                    ingest_position=item.ingest_position,
+                    event_id=item.event_id,
+                    occurrence_id=item.occurrence_id,
+                    event_type=item.event_type,
+                    change_kind=item.change_kind,
+                    source_instance_id=item.source_instance_id,
+                    stream_id=item.stream_id,
+                    occurred_at=item.occurred_at,
+                    recorded_at=item.recorded_at,
+                    payload_bytes=payload_bytes,
+                    payload_inlined=inlined,
+                    payload=copy.deepcopy(item.payload) if inlined else {},
+                    transport_echo=transport_echo,
+                )
+            )
+        return WorldChangeReferencePage(
+            items=tuple(items),
+            total_items=len(values),
+            total_payload_bytes=total_bytes,
+            has_more=len(values) > page_limit,
+        )
+
+    async def read_assertion_value_chunk(
+        self,
+        assertion_id: str,
+        *,
+        offset_bytes: int = 0,
+        max_bytes: int = 16 * 1024,
+    ) -> WorldValueChunk:
+        async with self._lock:
+            item = self._assertions.get(str(assertion_id or ""))
+            if item is None:
+                raise KeyError(str(assertion_id or ""))
+            raw = json.dumps(
+                item.value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        return WorldProjectionStore._value_chunk(
+            raw,
+            reference_kind="assertion_value",
+            reference_id=item.assertion_id,
+            offset_bytes=offset_bytes,
+            max_bytes=max_bytes,
+        )
+
+    async def read_change_payload_chunk(
+        self,
+        ingest_position: int,
+        *,
+        offset_bytes: int = 0,
+        max_bytes: int = 16 * 1024,
+    ) -> WorldValueChunk:
+        position = int(ingest_position)
+        async with self._lock:
+            item = self._changes.get(position)
+            if item is None:
+                raise KeyError(str(position))
+            raw = json.dumps(
+                item.payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        return WorldProjectionStore._value_chunk(
+            raw,
+            reference_kind="change_payload",
+            reference_id=str(position),
+            offset_bytes=offset_bytes,
+            max_bytes=max_bytes,
+        )
 
     async def perception_cursor(self, instance_id: str) -> tuple[int, int]:
         async with self._lock:

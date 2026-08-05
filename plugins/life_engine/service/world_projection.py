@@ -28,6 +28,8 @@ WORLD_REBUILDING = "rebuilding"
 WORLD_REBUILD_FAILED = "failed"
 WORLD_OBSERVATION_EVENT = "world.observation_reported"
 WORLD_LEGACY_IMPORT_EVENT = "world.legacy_snapshot_imported"
+WORLD_REFERENCE_INLINE_MAX_BYTES = 1024
+WORLD_VALUE_CHUNK_MAX_BYTES = 64 * 1024
 
 
 class WorldProjectionConflict(RuntimeError):
@@ -40,6 +42,144 @@ class PerceptionCursorConflict(RuntimeError):
 
 class WorldProjectionUnavailable(RuntimeError):
     """Raised when a projection cannot safely serve transient perception."""
+
+
+class PromptProjectionPersistenceError(ValueError):
+    """Raised when one-turn prompt material is offered as durable World evidence."""
+
+
+@dataclass(frozen=True, slots=True)
+class PromptProjectionValue:
+    """Typed one-turn projection that must never enter a durable assertion."""
+
+    delivery_id: str
+    projection_sha256: str
+    content: str
+
+
+def is_known_transport_echo_value(
+    value: Any,
+    *,
+    domain: str = "",
+    predicate: str = "",
+) -> bool:
+    """Recognize the exact legacy Minecraft intent-trace recursion shape."""
+
+    if str(domain or "") != "minecraft" or str(predicate or "") != "embodied_trace":
+        return False
+    if not isinstance(value, dict) or value.get("trace_kind") != "intent.issued":
+        return False
+    payload = value.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    context = payload.get("context")
+    return isinstance(context, dict) and "transient_world_perception" in context
+
+
+def reject_prompt_projection_persistence(
+    value: Any,
+    *,
+    domain: str = "",
+    predicate: str = "",
+) -> None:
+    """Fail closed for typed prompt projections and the known recursive echo."""
+
+    pending: list[Any] = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, PromptProjectionValue):
+            raise PromptProjectionPersistenceError(
+                "prompt_projection values are transport-only and cannot be persisted"
+            )
+        if isinstance(item, dict):
+            pending.extend(item.values())
+        elif isinstance(item, (list, tuple, set)):
+            pending.extend(item)
+    if is_known_transport_echo_value(
+        value,
+        domain=domain,
+        predicate=predicate,
+    ):
+        raise PromptProjectionPersistenceError(
+            "known Minecraft transient perception echo cannot be persisted"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WorldAssertionReference:
+    """Bounded assertion descriptor; the exact value remains in the store."""
+
+    assertion_id: str
+    subject: str
+    predicate: str
+    domain: str
+    status: str
+    source_instance_id: str
+    source_event_id: str
+    occurrence_id: str
+    observed_at: str
+    valid_from: str
+    valid_to: str
+    recorded_at: str
+    supersedes_assertion_id: str
+    value_bytes: int
+    value_inlined: bool
+    value: Any
+    transport_echo: bool
+
+
+@dataclass(frozen=True, slots=True)
+class WorldAssertionReferencePage:
+    """One stable evidence-ordered assertion page with aggregate coverage."""
+
+    items: tuple[WorldAssertionReference, ...]
+    total_items: int
+    total_value_bytes: int
+    next_after_observed_at: str
+    next_after_assertion_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorldChangeReference:
+    """Bounded change descriptor; large payloads remain addressable by position."""
+
+    ingest_position: int
+    event_id: str
+    occurrence_id: str
+    event_type: str
+    change_kind: str
+    source_instance_id: str
+    stream_id: str
+    occurred_at: str
+    recorded_at: str
+    payload_bytes: int
+    payload_inlined: bool
+    payload: dict[str, Any]
+    transport_echo: bool
+
+
+@dataclass(frozen=True, slots=True)
+class WorldChangeReferencePage:
+    """One ordered change page and the exact size of its stable source window."""
+
+    items: tuple[WorldChangeReference, ...]
+    total_items: int
+    total_payload_bytes: int
+    has_more: bool
+
+
+@dataclass(frozen=True, slots=True)
+class WorldValueChunk:
+    """UTF-8-safe chunk of one canonical assertion value or change payload."""
+
+    reference_kind: str
+    reference_id: str
+    offset_bytes: int
+    next_offset_bytes: int
+    total_bytes: int
+    content: str
+    full_sha256: str
+    complete: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -606,6 +746,101 @@ class WorldProjectionStore:
             rows = db.execute(sql).fetchall()
         return [self._assertion_from_row(row) for row in rows]
 
+    def list_assertion_references_page(
+        self,
+        *,
+        include_retracted: bool = False,
+        after_observed_at: str = "",
+        after_assertion_id: str = "",
+        limit: int = 128,
+        inline_max_bytes: int = WORLD_REFERENCE_INLINE_MAX_BYTES,
+    ) -> WorldAssertionReferencePage:
+        """Read compact assertion metadata without materializing giant values."""
+
+        page_limit = max(1, min(int(limit), 1000))
+        inline_limit = max(0, min(int(inline_max_bytes), 16 * 1024))
+        predicates: list[str] = []
+        params: list[Any] = []
+        if not include_retracted:
+            predicates.append("retracted_at = ''")
+        if after_observed_at or after_assertion_id:
+            predicates.append(
+                "(observed_at > ? OR (observed_at = ? AND assertion_id > ?))"
+            )
+            params.extend(
+                [
+                    str(after_observed_at or ""),
+                    str(after_observed_at or ""),
+                    str(after_assertion_id or ""),
+                ]
+            )
+        where = f" WHERE {' AND '.join(predicates)}" if predicates else ""
+        transport_echo_sql = """
+            domain = 'minecraft' AND predicate = 'embodied_trace'
+            AND json_extract(payload_json, '$.value.trace_kind') = 'intent.issued'
+            AND json_type(
+                payload_json,
+                '$.value.payload.context.transient_world_perception'
+            ) IS NOT NULL
+        """
+        with self._connect() as db:
+            totals = db.execute(
+                "SELECT COUNT(*) AS total_items, "
+                "COALESCE(SUM(length(CAST(value_json AS BLOB))), 0) "
+                f"AS total_value_bytes FROM world_assertions{where}",
+                params,
+            ).fetchone()
+            rows = db.execute(
+                "SELECT assertion_id, subject, predicate, domain, status, "
+                "source_instance_id, source_event_id, occurrence_id, observed_at, "
+                "valid_from, valid_to, recorded_at, supersedes_assertion_id, "
+                "length(CAST(value_json AS BLOB)) AS value_bytes, "
+                "CASE WHEN length(CAST(value_json AS BLOB)) <= ? "
+                "THEN value_json ELSE NULL END AS inline_value_json, "
+                f"CASE WHEN {transport_echo_sql} THEN 1 ELSE 0 END AS transport_echo "
+                f"FROM world_assertions{where} "
+                "ORDER BY observed_at, assertion_id LIMIT ?",
+                [inline_limit, *params, page_limit + 1],
+            ).fetchall()
+        has_more = len(rows) > page_limit
+        selected = rows[:page_limit]
+        items = tuple(
+            WorldAssertionReference(
+                assertion_id=str(row["assertion_id"]),
+                subject=str(row["subject"]),
+                predicate=str(row["predicate"]),
+                domain=str(row["domain"]),
+                status=str(row["status"]),
+                source_instance_id=str(row["source_instance_id"]),
+                source_event_id=str(row["source_event_id"]),
+                occurrence_id=str(row["occurrence_id"]),
+                observed_at=str(row["observed_at"]),
+                valid_from=str(row["valid_from"]),
+                valid_to=str(row["valid_to"]),
+                recorded_at=str(row["recorded_at"]),
+                supersedes_assertion_id=str(row["supersedes_assertion_id"]),
+                value_bytes=int(row["value_bytes"]),
+                value_inlined=row["inline_value_json"] is not None,
+                value=(
+                    json.loads(str(row["inline_value_json"]))
+                    if row["inline_value_json"] is not None
+                    else None
+                ),
+                transport_echo=bool(row["transport_echo"]),
+            )
+            for row in selected
+        )
+        last = selected[-1] if selected and has_more else None
+        return WorldAssertionReferencePage(
+            items=items,
+            total_items=int(totals["total_items"] if totals is not None else 0),
+            total_value_bytes=int(
+                totals["total_value_bytes"] if totals is not None else 0
+            ),
+            next_after_observed_at=(str(last["observed_at"]) if last else ""),
+            next_after_assertion_id=(str(last["assertion_id"]) if last else ""),
+        )
+
     @staticmethod
     def _change_from_row(row: sqlite3.Row) -> WorldProjectionChange:
         """Decode one projection change row."""
@@ -640,6 +875,176 @@ class WorldProjectionStore:
         with self._connect() as db:
             rows = db.execute(sql, params).fetchall()
         return [self._change_from_row(row) for row in rows]
+
+    def change_references_page(
+        self,
+        ingest_position: int,
+        *,
+        through_position: int,
+        limit: int = 128,
+        inline_max_bytes: int = WORLD_REFERENCE_INLINE_MAX_BYTES,
+    ) -> WorldChangeReferencePage:
+        """Read one compact cursor page without loading oversized payload JSON."""
+
+        start = int(ingest_position)
+        through = int(through_position)
+        if start < 0 or through < start:
+            raise ValueError("world change reference window is invalid")
+        page_limit = max(1, min(int(limit), 1000))
+        inline_limit = max(0, min(int(inline_max_bytes), 16 * 1024))
+        transport_echo_sql = """
+            change_kind = 'world_observation'
+            AND json_extract(
+                payload_json,
+                '$.assertion.value.trace_kind'
+            ) = 'intent.issued'
+            AND json_extract(payload_json, '$.assertion.domain') = 'minecraft'
+            AND json_extract(payload_json, '$.assertion.predicate') = 'embodied_trace'
+            AND json_type(
+                payload_json,
+                '$.assertion.value.payload.context.transient_world_perception'
+            ) IS NOT NULL
+        """
+        with self._connect() as db:
+            totals = db.execute(
+                "SELECT COUNT(*) AS total_items, "
+                "COALESCE(SUM(length(CAST(payload_json AS BLOB))), 0) "
+                "AS total_payload_bytes FROM world_projection_changes "
+                "WHERE ingest_position > ? AND ingest_position <= ?",
+                (start, through),
+            ).fetchone()
+            rows = db.execute(
+                "SELECT ingest_position, event_id, occurrence_id, event_type, "
+                "change_kind, source_instance_id, stream_id, occurred_at, "
+                "recorded_at, length(CAST(payload_json AS BLOB)) AS payload_bytes, "
+                "CASE WHEN length(CAST(payload_json AS BLOB)) <= ? "
+                "THEN payload_json ELSE NULL END AS inline_payload_json, "
+                f"CASE WHEN {transport_echo_sql} THEN 1 ELSE 0 END AS transport_echo "
+                "FROM world_projection_changes WHERE ingest_position > ? "
+                "AND ingest_position <= ? ORDER BY ingest_position LIMIT ?",
+                (inline_limit, start, through, page_limit + 1),
+            ).fetchall()
+        selected = rows[:page_limit]
+        items = tuple(
+            WorldChangeReference(
+                ingest_position=int(row["ingest_position"]),
+                event_id=str(row["event_id"]),
+                occurrence_id=str(row["occurrence_id"]),
+                event_type=str(row["event_type"]),
+                change_kind=str(row["change_kind"]),
+                source_instance_id=str(row["source_instance_id"]),
+                stream_id=str(row["stream_id"]),
+                occurred_at=str(row["occurred_at"]),
+                recorded_at=str(row["recorded_at"]),
+                payload_bytes=int(row["payload_bytes"]),
+                payload_inlined=row["inline_payload_json"] is not None,
+                payload=(
+                    json.loads(str(row["inline_payload_json"]))
+                    if row["inline_payload_json"] is not None
+                    else {}
+                ),
+                transport_echo=bool(row["transport_echo"]),
+            )
+            for row in selected
+        )
+        return WorldChangeReferencePage(
+            items=items,
+            total_items=int(totals["total_items"] if totals is not None else 0),
+            total_payload_bytes=int(
+                totals["total_payload_bytes"] if totals is not None else 0
+            ),
+            has_more=len(rows) > page_limit,
+        )
+
+    @staticmethod
+    def _value_chunk(
+        raw: str,
+        *,
+        reference_kind: str,
+        reference_id: str,
+        offset_bytes: int,
+        max_bytes: int,
+    ) -> WorldValueChunk:
+        """Slice canonical JSON on UTF-8 boundaries and include its full digest."""
+
+        encoded = raw.encode("utf-8")
+        offset = int(offset_bytes)
+        limit = int(max_bytes)
+        if offset < 0 or offset > len(encoded):
+            raise ValueError("world value chunk offset is outside the source")
+        if limit < 4 or limit > WORLD_VALUE_CHUNK_MAX_BYTES:
+            raise ValueError("world value chunk max_bytes is outside the safe range")
+        if offset < len(encoded) and encoded[offset] & 0xC0 == 0x80:
+            raise ValueError("world value chunk offset must be a UTF-8 boundary")
+        end = min(len(encoded), offset + limit)
+        while end > offset and end < len(encoded) and encoded[end] & 0xC0 == 0x80:
+            end -= 1
+        content = encoded[offset:end].decode("utf-8")
+        return WorldValueChunk(
+            reference_kind=reference_kind,
+            reference_id=reference_id,
+            offset_bytes=offset,
+            next_offset_bytes=end,
+            total_bytes=len(encoded),
+            content=content,
+            full_sha256=hashlib.sha256(encoded).hexdigest(),
+            complete=end == len(encoded),
+        )
+
+    def read_assertion_value_chunk(
+        self,
+        assertion_id: str,
+        *,
+        offset_bytes: int = 0,
+        max_bytes: int = 16 * 1024,
+    ) -> WorldValueChunk:
+        """Read one explicit assertion value chunk without changing projection state."""
+
+        identity = str(assertion_id or "").strip()
+        if not identity:
+            raise ValueError("assertion_id must not be empty")
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT value_json FROM world_assertions WHERE assertion_id = ?",
+                (identity,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(identity)
+        return self._value_chunk(
+            str(row["value_json"]),
+            reference_kind="assertion_value",
+            reference_id=identity,
+            offset_bytes=offset_bytes,
+            max_bytes=max_bytes,
+        )
+
+    def read_change_payload_chunk(
+        self,
+        ingest_position: int,
+        *,
+        offset_bytes: int = 0,
+        max_bytes: int = 16 * 1024,
+    ) -> WorldValueChunk:
+        """Read one explicit change payload chunk by its stable ledger position."""
+
+        position = int(ingest_position)
+        if position < 0:
+            raise ValueError("ingest_position must not be negative")
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT payload_json FROM world_projection_changes "
+                "WHERE ingest_position = ?",
+                (position,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(str(position))
+        return self._value_chunk(
+            str(row["payload_json"]),
+            reference_kind="change_payload",
+            reference_id=str(position),
+            offset_bytes=offset_bytes,
+            max_bytes=max_bytes,
+        )
 
     def perception_cursor(self, instance_id: str) -> tuple[int, int]:
         """Return one instance's projection position and cursor revision."""

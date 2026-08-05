@@ -8,7 +8,10 @@ from typing import Any, Protocol, runtime_checkable
 from plugins.life_engine.service.event_bus import LifeEvent
 from plugins.life_engine.service.world_projection import (
     WorldAssertion,
+    WorldAssertionReferencePage,
+    WorldChangeReferencePage,
     WorldProjectionChange,
+    WorldValueChunk,
 )
 
 
@@ -117,6 +120,17 @@ class WorldProjectionStorePort(Protocol):
     ) -> list[WorldAssertion]:
         """Return attributed assertions without resolving contradictions."""
 
+    async def list_assertion_references_page(
+        self,
+        *,
+        include_retracted: bool = False,
+        after_observed_at: str = "",
+        after_assertion_id: str = "",
+        limit: int = 128,
+        inline_max_bytes: int = 1024,
+    ) -> WorldAssertionReferencePage:
+        """Return stable compact assertion references without giant values."""
+
     async def changes_since(
         self,
         ingest_position: int,
@@ -124,6 +138,34 @@ class WorldProjectionStorePort(Protocol):
         through_position: int | None = None,
     ) -> list[WorldProjectionChange]:
         """Return cursor-visible changes in one stable position window."""
+
+    async def change_references_page(
+        self,
+        ingest_position: int,
+        *,
+        through_position: int,
+        limit: int = 128,
+        inline_max_bytes: int = 1024,
+    ) -> WorldChangeReferencePage:
+        """Return one ordered compact change page in a fixed frontier window."""
+
+    async def read_assertion_value_chunk(
+        self,
+        assertion_id: str,
+        *,
+        offset_bytes: int = 0,
+        max_bytes: int = 16 * 1024,
+    ) -> WorldValueChunk:
+        """Read one canonical assertion value on UTF-8 byte boundaries."""
+
+    async def read_change_payload_chunk(
+        self,
+        ingest_position: int,
+        *,
+        offset_bytes: int = 0,
+        max_bytes: int = 16 * 1024,
+    ) -> WorldValueChunk:
+        """Read one canonical change payload on UTF-8 byte boundaries."""
 
     async def perception_cursor(self, instance_id: str) -> tuple[int, int]:
         """Return one instance's delivery position and cursor revision."""

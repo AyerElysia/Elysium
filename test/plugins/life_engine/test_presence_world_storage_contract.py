@@ -306,6 +306,50 @@ async def _assert_world_contract(stores: PresenceWorldStores) -> None:
             [replace(original, source_instance_id="instance:conflict")]
         )
     assert [item.value for item in await world.list_assertions()] == ["first"]
+    reference_page = await world.list_assertion_references_page(
+        include_retracted=True,
+        limit=1,
+        inline_max_bytes=0,
+    )
+    assert reference_page.total_items == 1
+    assert reference_page.items[0].assertion_id == "world-a"
+    assert reference_page.items[0].value_inlined is False
+    chunks = []
+    offset = 0
+    while True:
+        chunk = await world.read_assertion_value_chunk(
+            "world-a",
+            offset_bytes=offset,
+            max_bytes=4,
+        )
+        chunks.append(chunk.content)
+        if chunk.complete:
+            break
+        assert chunk.next_offset_bytes > offset
+        offset = chunk.next_offset_bytes
+    assert json.loads("".join(chunks)) == "first"
+    change_page = await world.change_references_page(
+        0,
+        through_position=3,
+        limit=1,
+        inline_max_bytes=0,
+    )
+    assert change_page.total_items == 1
+    assert change_page.items[0].ingest_position == 1
+    assert change_page.items[0].payload_inlined is False
+    change_chunks = []
+    offset = 0
+    while True:
+        chunk = await world.read_change_payload_chunk(
+            1,
+            offset_bytes=offset,
+            max_bytes=7,
+        )
+        change_chunks.append(chunk.content)
+        if chunk.complete:
+            break
+        offset = chunk.next_offset_bytes
+    assert json.loads("".join(change_chunks))["assertion"]["value"] == "first"
 
     committed = await world.commit_perception_cursor(
         "instance:observer",

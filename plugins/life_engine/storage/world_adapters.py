@@ -24,9 +24,15 @@ from plugins.life_engine.service.world_projection import (
     WORLD_REBUILDING,
     PerceptionCursorConflict,
     WorldAssertion,
+    WorldAssertionReference,
+    WorldAssertionReferencePage,
+    WorldChangeReference,
+    WorldChangeReferencePage,
     WorldProjectionChange,
     WorldProjectionConflict,
+    WorldProjectionStore,
     WorldProjectionUnavailable,
+    WorldValueChunk,
 )
 from src.kernel.storage import canonical_json
 
@@ -629,6 +635,125 @@ class SQLWorldProjectionStore:
             rows = (await connection.execute(text(sql))).mappings()
             return [self._assertion_from_row(row) for row in rows]
 
+    async def list_assertion_references_page(
+        self,
+        *,
+        include_retracted: bool = False,
+        after_observed_at: str = "",
+        after_assertion_id: str = "",
+        limit: int = 128,
+        inline_max_bytes: int = 1024,
+    ) -> WorldAssertionReferencePage:
+        """Read a compact stable page without materializing giant JSON values."""
+
+        page_limit = max(1, min(int(limit), 1000))
+        inline_limit = max(0, min(int(inline_max_bytes), 16 * 1024))
+        mysql = self.backend == BackendKind.MYSQL
+        conditions: list[str] = []
+        params: dict[str, Any] = {
+            "inline_limit": inline_limit,
+            "row_limit": page_limit + 1,
+        }
+        if not include_retracted:
+            conditions.append("retracted_at IS NULL" if mysql else "retracted_at = ''")
+        if after_observed_at or after_assertion_id:
+            conditions.append(
+                "(observed_at > :after_observed_at OR "
+                "(observed_at = :after_observed_at "
+                "AND assertion_id > :after_assertion_id))"
+            )
+            params["after_observed_at"] = (
+                _parse_datetime(after_observed_at)
+                if mysql
+                else str(after_observed_at or "")
+            )
+            params["after_assertion_id"] = str(after_assertion_id or "")
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        if mysql:
+            value_bytes = "OCTET_LENGTH(CAST(value_json AS CHAR))"
+            inline_value = (
+                "CASE WHEN OCTET_LENGTH(CAST(value_json AS CHAR)) <= :inline_limit "
+                "THEN CAST(value_json AS CHAR) ELSE NULL END"
+            )
+            transport_echo = """
+                domain = 'minecraft' AND predicate = 'embodied_trace'
+                AND JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.value.trace_kind')) = 'intent.issued'
+                AND JSON_CONTAINS_PATH(
+                    payload_json,
+                    'one',
+                    '$.value.payload.context.transient_world_perception'
+                ) = 1
+            """
+        else:
+            value_bytes = "length(CAST(value_json AS BLOB))"
+            inline_value = (
+                "CASE WHEN length(CAST(value_json AS BLOB)) <= :inline_limit "
+                "THEN value_json ELSE NULL END"
+            )
+            transport_echo = """
+                domain = 'minecraft' AND predicate = 'embodied_trace'
+                AND json_extract(payload_json, '$.value.trace_kind') = 'intent.issued'
+                AND json_type(
+                    payload_json,
+                    '$.value.payload.context.transient_world_perception'
+                ) IS NOT NULL
+            """
+        totals_sql = (
+            f"SELECT COUNT(*) AS total_items, COALESCE(SUM({value_bytes}), 0) "
+            f"AS total_value_bytes FROM world_assertions{where}"
+        )
+        page_sql = f"""
+            SELECT assertion_id, subject, predicate, domain, status,
+                source_instance_id, source_event_id, occurrence_id, observed_at,
+                valid_from, valid_to, recorded_at, supersedes_assertion_id,
+                {value_bytes} AS value_bytes,
+                {inline_value} AS inline_value_json,
+                CASE WHEN {transport_echo} THEN 1 ELSE 0 END AS transport_echo
+            FROM world_assertions{where}
+            ORDER BY observed_at, assertion_id LIMIT :row_limit
+        """
+        async with self.runtime.engine.connect() as connection:
+            totals = (
+                (await connection.execute(text(totals_sql), params)).mappings().one()
+            )
+            rows = list((await connection.execute(text(page_sql), params)).mappings())
+        has_more = len(rows) > page_limit
+        selected = rows[:page_limit]
+        items = tuple(
+            WorldAssertionReference(
+                assertion_id=str(row["assertion_id"]),
+                subject=str(row["subject"]),
+                predicate=str(row["predicate"]),
+                domain=str(row["domain"] or ""),
+                status=str(row["status"] or ""),
+                source_instance_id=str(row["source_instance_id"] or ""),
+                source_event_id=str(row["source_event_id"]),
+                occurrence_id=str(row["occurrence_id"]),
+                observed_at=_iso(row["observed_at"]),
+                valid_from=_iso(row["valid_from"]),
+                valid_to=_iso(row["valid_to"]),
+                recorded_at=_iso(row["recorded_at"]),
+                supersedes_assertion_id=str(row["supersedes_assertion_id"] or ""),
+                value_bytes=int(row["value_bytes"] or 0),
+                value_inlined=row["inline_value_json"] is not None,
+                value=(
+                    _json_value(row["inline_value_json"], default=None)
+                    if row["inline_value_json"] is not None
+                    else None
+                ),
+                transport_echo=bool(row["transport_echo"]),
+            )
+            for row in selected
+        )
+        last = selected[-1] if selected and has_more else None
+        return WorldAssertionReferencePage(
+            items=items,
+            total_items=int(totals["total_items"] or 0),
+            total_value_bytes=int(totals["total_value_bytes"] or 0),
+            next_after_observed_at=(_iso(last["observed_at"]) if last else ""),
+            next_after_assertion_id=(str(last["assertion_id"]) if last else ""),
+        )
+
     @staticmethod
     def _change_from_row(row: Any) -> WorldProjectionChange:
         return WorldProjectionChange(
@@ -665,6 +790,207 @@ class SQLWorldProjectionStore:
         async with self.runtime.engine.connect() as connection:
             rows = (await connection.execute(text(sql), params)).mappings()
             return [self._change_from_row(row) for row in rows]
+
+    async def change_references_page(
+        self,
+        ingest_position: int,
+        *,
+        through_position: int,
+        limit: int = 128,
+        inline_max_bytes: int = 1024,
+    ) -> WorldChangeReferencePage:
+        """Read a compact ordered change page within one fixed frontier."""
+
+        start = int(ingest_position)
+        through = int(through_position)
+        if start < 0 or through < start:
+            raise ValueError("world change reference window is invalid")
+        page_limit = max(1, min(int(limit), 1000))
+        inline_limit = max(0, min(int(inline_max_bytes), 16 * 1024))
+        mysql = self.backend == BackendKind.MYSQL
+        if mysql:
+            payload_bytes = "OCTET_LENGTH(CAST(payload_json AS CHAR))"
+            inline_payload = (
+                "CASE WHEN OCTET_LENGTH(CAST(payload_json AS CHAR)) <= :inline_limit "
+                "THEN CAST(payload_json AS CHAR) ELSE NULL END"
+            )
+            transport_echo = """
+                change_kind = 'world_observation'
+                AND JSON_UNQUOTE(JSON_EXTRACT(
+                    payload_json, '$.assertion.value.trace_kind'
+                )) = 'intent.issued'
+                AND JSON_UNQUOTE(JSON_EXTRACT(
+                    payload_json, '$.assertion.domain'
+                )) = 'minecraft'
+                AND JSON_UNQUOTE(JSON_EXTRACT(
+                    payload_json, '$.assertion.predicate'
+                )) = 'embodied_trace'
+                AND JSON_CONTAINS_PATH(
+                    payload_json,
+                    'one',
+                    '$.assertion.value.payload.context.transient_world_perception'
+                ) = 1
+            """
+        else:
+            payload_bytes = "length(CAST(payload_json AS BLOB))"
+            inline_payload = (
+                "CASE WHEN length(CAST(payload_json AS BLOB)) <= :inline_limit "
+                "THEN payload_json ELSE NULL END"
+            )
+            transport_echo = """
+                change_kind = 'world_observation'
+                AND json_extract(
+                    payload_json, '$.assertion.value.trace_kind'
+                ) = 'intent.issued'
+                AND json_extract(payload_json, '$.assertion.domain') = 'minecraft'
+                AND json_extract(
+                    payload_json, '$.assertion.predicate'
+                ) = 'embodied_trace'
+                AND json_type(
+                    payload_json,
+                    '$.assertion.value.payload.context.transient_world_perception'
+                ) IS NOT NULL
+            """
+        params = {
+            "start": start,
+            "through": through,
+            "inline_limit": inline_limit,
+            "row_limit": page_limit + 1,
+        }
+        totals_sql = f"""
+            SELECT COUNT(*) AS total_items,
+                COALESCE(SUM({payload_bytes}), 0) AS total_payload_bytes
+            FROM world_projection_changes
+            WHERE ingest_position > :start AND ingest_position <= :through
+        """
+        page_sql = f"""
+            SELECT ingest_position, event_id, occurrence_id, event_type,
+                change_kind, source_instance_id, stream_id, occurred_at,
+                recorded_at, {payload_bytes} AS payload_bytes,
+                {inline_payload} AS inline_payload_json,
+                CASE WHEN {transport_echo} THEN 1 ELSE 0 END AS transport_echo
+            FROM world_projection_changes
+            WHERE ingest_position > :start AND ingest_position <= :through
+            ORDER BY ingest_position LIMIT :row_limit
+        """
+        async with self.runtime.engine.connect() as connection:
+            totals = (
+                (await connection.execute(text(totals_sql), params)).mappings().one()
+            )
+            rows = list((await connection.execute(text(page_sql), params)).mappings())
+        selected = rows[:page_limit]
+        return WorldChangeReferencePage(
+            items=tuple(
+                WorldChangeReference(
+                    ingest_position=int(row["ingest_position"]),
+                    event_id=str(row["event_id"]),
+                    occurrence_id=str(row["occurrence_id"]),
+                    event_type=str(row["event_type"]),
+                    change_kind=str(row["change_kind"]),
+                    source_instance_id=str(row["source_instance_id"] or ""),
+                    stream_id=str(row["stream_id"] or ""),
+                    occurred_at=_iso(row["occurred_at"]),
+                    recorded_at=_iso(row["recorded_at"]),
+                    payload_bytes=int(row["payload_bytes"] or 0),
+                    payload_inlined=row["inline_payload_json"] is not None,
+                    payload=(
+                        dict(_json_value(row["inline_payload_json"], default={}))
+                        if row["inline_payload_json"] is not None
+                        else {}
+                    ),
+                    transport_echo=bool(row["transport_echo"]),
+                )
+                for row in selected
+            ),
+            total_items=int(totals["total_items"] or 0),
+            total_payload_bytes=int(totals["total_payload_bytes"] or 0),
+            has_more=len(rows) > page_limit,
+        )
+
+    async def read_assertion_value_chunk(
+        self,
+        assertion_id: str,
+        *,
+        offset_bytes: int = 0,
+        max_bytes: int = 16 * 1024,
+    ) -> WorldValueChunk:
+        """Read an explicit canonical assertion value chunk."""
+
+        identity = str(assertion_id or "").strip()
+        if not identity:
+            raise ValueError("assertion_id must not be empty")
+        value_expression = (
+            "CAST(value_json AS CHAR)"
+            if self.backend == BackendKind.MYSQL
+            else "value_json"
+        )
+        async with self.runtime.engine.connect() as connection:
+            row = (
+                (
+                    await connection.execute(
+                        text(
+                            f"SELECT {value_expression} AS json_text "
+                            "FROM world_assertions WHERE assertion_id = :assertion_id"
+                        ),
+                        {"assertion_id": identity},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        if row is None:
+            raise KeyError(identity)
+        raw = str(row["json_text"])
+        return WorldProjectionStore._value_chunk(
+            raw,
+            reference_kind="assertion_value",
+            reference_id=identity,
+            offset_bytes=offset_bytes,
+            max_bytes=max_bytes,
+        )
+
+    async def read_change_payload_chunk(
+        self,
+        ingest_position: int,
+        *,
+        offset_bytes: int = 0,
+        max_bytes: int = 16 * 1024,
+    ) -> WorldValueChunk:
+        """Read an explicit canonical change payload chunk."""
+
+        position = int(ingest_position)
+        if position < 0:
+            raise ValueError("ingest_position must not be negative")
+        payload_expression = (
+            "CAST(payload_json AS CHAR)"
+            if self.backend == BackendKind.MYSQL
+            else "payload_json"
+        )
+        async with self.runtime.engine.connect() as connection:
+            row = (
+                (
+                    await connection.execute(
+                        text(
+                            f"SELECT {payload_expression} AS json_text "
+                            "FROM world_projection_changes "
+                            "WHERE ingest_position = :position"
+                        ),
+                        {"position": position},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        if row is None:
+            raise KeyError(str(position))
+        raw = str(row["json_text"])
+        return WorldProjectionStore._value_chunk(
+            raw,
+            reference_kind="change_payload",
+            reference_id=str(position),
+            offset_bytes=offset_bytes,
+            max_bytes=max_bytes,
+        )
 
     async def perception_cursor(self, instance_id: str) -> tuple[int, int]:
         identity = str(instance_id or "").strip()
