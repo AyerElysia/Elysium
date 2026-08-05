@@ -320,6 +320,9 @@ from plugins.life_engine.service.event_builder import (  # noqa: E402
     EventType,
     LifeEngineEvent,
 )
+from plugins.life_engine.service.perception_gateway import (  # noqa: E402
+    PerceptionDeliveryReceipt,
+)
 from plugins.life_engine.trace.store import LifeTraceStore  # noqa: E402
 
 
@@ -367,8 +370,8 @@ async def test_build_chatter_runtime_filters_tool_call_noise() -> None:
     assert hw == 3
 
 
-async def test_build_chatter_runtime_thought_delta_cursor_dedup() -> None:
-    """同一 stream 第二次 build 不应再在 thought 块带 🔄 delta 标记。"""
+async def test_build_chatter_runtime_thought_delta_waits_for_exact_receipt() -> None:
+    """未确认送达应重投 thought delta，精确确认后才去重。"""
     service = LifeEngineService(SimpleNamespace(config=None))
     chat = SimpleNamespace(stream_id="stream-d")
     service._thought_manager = SimpleNamespace(
@@ -379,11 +382,28 @@ async def test_build_chatter_runtime_thought_delta_cursor_dedup() -> None:
     )
     service._event_history = []
 
-    first, _ = await service.build_chatter_runtime_context(chat)
-    second, _ = await service.build_chatter_runtime_context(chat)
+    first, high_water = await service.build_chatter_runtime_context(chat)
+    unconfirmed_retry, _ = await service.build_chatter_runtime_context(chat)
 
     assert "🔄" in first
-    assert "🔄" not in second
+    assert "🔄" in unconfirmed_retry
+
+    delivery = service.get_pending_chatter_runtime_delivery("stream-d")
+    assert delivery is not None
+    prepared = delivery.prepared_perception
+    await service.mark_chatter_runtime_context_seen(
+        "stream-d",
+        high_water,
+        receipt=PerceptionDeliveryReceipt(
+            delivery_id=prepared.delivery_id,
+            projection_sha256=prepared.projection_sha256,
+            delivered_bytes=prepared.delivered_bytes,
+            exact=True,
+        ),
+    )
+
+    confirmed_next, _ = await service.build_chatter_runtime_context(chat)
+    assert "🔄" not in confirmed_next
 
 
 async def test_build_chatter_runtime_includes_latest_think_and_recent_chat() -> None:
