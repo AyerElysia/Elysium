@@ -22,9 +22,29 @@ def _manifest(*, writer_frozen: bool) -> dict[str, object]:
 
 
 def _run(domain: str, *, writer_frozen: bool = True) -> dict[str, object]:
-    immutability = (
-        "fenced-cas" if domain == "presence_world" else "trigger-enforced"
-    )
+    immutability = "fenced-cas" if domain == "presence_world" else "trigger-enforced"
+    verification: dict[str, object] = {
+        "verified": True,
+        "database_immutability": immutability,
+        "copy": {"target_root_sha256": "c" * 64},
+    }
+    if domain == "attention_thread":
+        verification.update(
+            {
+                "legacy_snapshot": {
+                    "import_mode": "snapshot_only",
+                    "history_claim": "no_fabricated_events",
+                    "generation_eligible": False,
+                },
+                "canonical_authority": {
+                    "generation_eligible": True,
+                    "event_frontier": 0,
+                    "head_count": 0,
+                    "focus_count": 0,
+                    "root_sha256": "f" * 64,
+                },
+            }
+        )
     return {
         "run_id": f"{domain}:run",
         "source_manifest_sha256": "a" * 64,
@@ -34,11 +54,7 @@ def _run(domain: str, *, writer_frozen: bool = True) -> dict[str, object]:
         "copied_records": 10,
         "conflict_count": 0,
         "metadata": {"domain": domain},
-        "verification": {
-            "verified": True,
-            "database_immutability": immutability,
-            "copy": {"target_root_sha256": "c" * 64},
-        },
+        "verification": verification,
     }
 
 
@@ -51,6 +67,7 @@ def _runs() -> dict[str, dict[str, object]]:
             "subject_document",
             "presence_world",
             "life_learning",
+            "attention_thread",
         )
     }
 
@@ -74,7 +91,30 @@ def test_cutover_audit_accepts_only_complete_frozen_trigger_evidence() -> None:
         "mysql:subject_document",
         "mysql:presence_world",
         "mysql:life_learning",
+        "mysql:attention_thread",
     }
+
+
+def test_cutover_rejects_fabricated_or_activatable_legacy_attention() -> None:
+    runs = _runs()
+    attention = runs["attention_thread"]["verification"]
+    assert isinstance(attention, dict)
+    legacy = attention["legacy_snapshot"]
+    assert isinstance(legacy, dict)
+    legacy["generation_eligible"] = True
+
+    result = evaluate_cutover_runs(
+        _manifest(writer_frozen=True),
+        {
+            "verified": True,
+            "manifest_sha256": "a" * 64,
+            "verification_root_sha256": "d" * 64,
+        },
+        runs,
+    )
+
+    assert result["eligible"] is False
+    assert any("legacy Attention snapshot" in reason for reason in result["failures"])
 
 
 def test_cutover_audit_rejects_online_shadow_and_application_immutability() -> None:

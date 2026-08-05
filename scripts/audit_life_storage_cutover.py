@@ -39,9 +39,16 @@ _REQUIRED_DOMAINS = (
     "subject_document",
     "presence_world",
     "life_learning",
+    "attention_thread",
 )
 _IMMUTABLE_DOMAINS = frozenset(
-    {"life_event", "life_memory", "subject_document", "life_learning"}
+    {
+        "life_event",
+        "life_memory",
+        "subject_document",
+        "life_learning",
+        "attention_thread",
+    }
 )
 
 
@@ -60,12 +67,18 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--subject-run", required=True)
     parser.add_argument("--presence-world-run", required=True)
     parser.add_argument("--learning-run", required=True)
+    parser.add_argument("--attention-run", required=True)
     parser.add_argument("--generation-id")
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
 
 def _domain_root(domain: str, verification: dict[str, Any]) -> str:
+    if domain == "attention_thread":
+        authority = dict(verification.get("canonical_authority") or {})
+        value = str(authority.get("root_sha256") or "")
+        if len(value) == 64:
+            return value
     if domain == "life_learning":
         imported = dict(verification.get("import_verification") or {})
         value = str(imported.get("snapshot_sha256") or "")
@@ -124,6 +137,23 @@ def evaluate_cutover_runs(
         immutability = str(verification.get("database_immutability") or "")
         if domain in _IMMUTABLE_DOMAINS and immutability != "trigger-enforced":
             reasons.append("database immutability is not trigger-enforced")
+        if domain == "attention_thread":
+            legacy = dict(verification.get("legacy_snapshot") or {})
+            authority = dict(verification.get("canonical_authority") or {})
+            if legacy.get("import_mode") != "snapshot_only":
+                reasons.append("legacy Attention evidence is not snapshot-only")
+            if legacy.get("history_claim") != "no_fabricated_events":
+                reasons.append("legacy Attention history claim is unsafe")
+            if legacy.get("generation_eligible") is not False:
+                reasons.append("legacy Attention snapshot is incorrectly activatable")
+            if not bool(authority.get("generation_eligible")):
+                reasons.append("canonical Attention authority is not generation-ready")
+            if int(authority.get("event_frontier", -1)) != 0:
+                reasons.append("canonical Attention authority did not start empty")
+            if int(authority.get("head_count", -1)) != 0:
+                reasons.append("canonical Attention heads did not start empty")
+            if int(authority.get("focus_count", -1)) != 0:
+                reasons.append("canonical Attention focus did not start empty")
         domain_results[domain] = {
             "run_id": str(run.get("run_id") or ""),
             "state": str(run.get("state") or ""),
@@ -232,6 +262,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         "subject_document": args.subject_run,
         "presence_world": args.presence_world_run,
         "life_learning": args.learning_run,
+        "attention_thread": args.attention_run,
     }
     try:
         runs: dict[str, dict[str, Any]] = {}
@@ -248,7 +279,9 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         }
         if args.output is not None or args.generation_id is not None:
             if args.output is None or not str(args.generation_id or "").strip():
-                raise RuntimeError("--output and --generation-id must be provided together")
+                raise RuntimeError(
+                    "--output and --generation-id must be provided together"
+                )
             result["generation"] = _write_generation(
                 args.output,
                 generation_id=str(args.generation_id),

@@ -14,7 +14,7 @@ from src.kernel.storage.migration_runner import (
 from .contracts import StorageBackendRuntime, StorageWriterRole
 from .models import BackendKind
 
-ATTENTION_THREAD_SCHEMA_VERSION = 1
+ATTENTION_THREAD_SCHEMA_VERSION = 2
 
 LOCAL_ATTENTION_THREAD_SCHEMA_STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS attention_thread_events (
@@ -64,6 +64,36 @@ LOCAL_ATTENTION_THREAD_SCHEMA_STATEMENTS = (
         thread_id TEXT NOT NULL DEFAULT '',
         updated_at TEXT NOT NULL
     )""",
+    """CREATE TABLE IF NOT EXISTS attention_legacy_snapshots (
+        snapshot_sha256 TEXT PRIMARY KEY,
+        legacy_schema_version INTEGER NOT NULL,
+        legacy_global_revision INTEGER,
+        byte_length INTEGER NOT NULL,
+        raw_bytes BLOB NOT NULL,
+        row_count INTEGER NOT NULL,
+        status_counts_json TEXT NOT NULL,
+        rows_root_sha256 TEXT NOT NULL,
+        import_mode TEXT NOT NULL CHECK (import_mode = 'snapshot_only'),
+        generation_eligible INTEGER NOT NULL
+            CHECK (generation_eligible = 0),
+        source_label TEXT NOT NULL,
+        imported_at TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS attention_legacy_candidates (
+        snapshot_sha256 TEXT NOT NULL,
+        source_ordinal INTEGER NOT NULL,
+        legacy_stream_id TEXT NOT NULL,
+        legacy_status TEXT NOT NULL,
+        row_sha256 TEXT NOT NULL,
+        original_fields_json TEXT NOT NULL,
+        candidate_state TEXT NOT NULL
+            CHECK (candidate_state = 'snapshot_only'),
+        PRIMARY KEY (snapshot_sha256, source_ordinal),
+        UNIQUE (snapshot_sha256, legacy_stream_id),
+        FOREIGN KEY (snapshot_sha256)
+            REFERENCES attention_legacy_snapshots(snapshot_sha256)
+            ON UPDATE RESTRICT ON DELETE RESTRICT
+    )""",
     """CREATE TRIGGER IF NOT EXISTS attention_events_immutable_update_v1
         BEFORE UPDATE ON attention_thread_events BEGIN
             SELECT RAISE(ABORT, 'AttentionThreadEventImmutable');
@@ -72,10 +102,26 @@ LOCAL_ATTENTION_THREAD_SCHEMA_STATEMENTS = (
         BEFORE DELETE ON attention_thread_events BEGIN
             SELECT RAISE(ABORT, 'AttentionThreadEventImmutable');
         END""",
+    """CREATE TRIGGER IF NOT EXISTS attention_legacy_snapshots_immutable_update_v1
+        BEFORE UPDATE ON attention_legacy_snapshots BEGIN
+            SELECT RAISE(ABORT, 'AttentionLegacySnapshotImmutable');
+        END""",
+    """CREATE TRIGGER IF NOT EXISTS attention_legacy_snapshots_immutable_delete_v1
+        BEFORE DELETE ON attention_legacy_snapshots BEGIN
+            SELECT RAISE(ABORT, 'AttentionLegacySnapshotImmutable');
+        END""",
+    """CREATE TRIGGER IF NOT EXISTS attention_legacy_candidates_immutable_update_v1
+        BEFORE UPDATE ON attention_legacy_candidates BEGIN
+            SELECT RAISE(ABORT, 'AttentionLegacyCandidateImmutable');
+        END""",
+    """CREATE TRIGGER IF NOT EXISTS attention_legacy_candidates_immutable_delete_v1
+        BEFORE DELETE ON attention_legacy_candidates BEGIN
+            SELECT RAISE(ABORT, 'AttentionLegacyCandidateImmutable');
+        END""",
 )
 
-_MYSQL_MIGRATION = SchemaMigration(
-    version=ATTENTION_THREAD_SCHEMA_VERSION,
+_MYSQL_MIGRATION_V1 = SchemaMigration(
+    version=1,
     name="life_attention_thread_storage_v1",
     statements=(
         """CREATE TABLE IF NOT EXISTS attention_thread_events (
@@ -155,10 +201,88 @@ _MYSQL_MIGRATION = SchemaMigration(
     ),
 )
 
-_MYSQL_SHADOW_MIGRATION = SchemaMigration(
-    version=ATTENTION_THREAD_SCHEMA_VERSION,
+_MYSQL_SHADOW_MIGRATION_V1 = SchemaMigration(
+    version=1,
     name="life_attention_thread_storage_shadow_v1",
-    statements=_MYSQL_MIGRATION.statements[:3],
+    statements=_MYSQL_MIGRATION_V1.statements[:3],
+)
+
+_MYSQL_LEGACY_MIGRATION_V2 = SchemaMigration(
+    version=2,
+    name="life_attention_legacy_snapshot_storage_v2",
+    statements=(
+        """CREATE TABLE IF NOT EXISTS attention_legacy_snapshots (
+            snapshot_sha256 CHAR(64) CHARACTER SET ascii
+                COLLATE ascii_bin NOT NULL PRIMARY KEY,
+            legacy_schema_version BIGINT UNSIGNED NOT NULL,
+            legacy_global_revision BIGINT UNSIGNED NULL,
+            byte_length BIGINT UNSIGNED NOT NULL,
+            raw_bytes LONGBLOB NOT NULL,
+            row_count BIGINT UNSIGNED NOT NULL,
+            status_counts_json JSON NOT NULL,
+            rows_root_sha256 CHAR(64) CHARACTER SET ascii
+                COLLATE ascii_bin NOT NULL,
+            import_mode VARCHAR(32) CHARACTER SET ascii
+                COLLATE ascii_bin NOT NULL,
+            generation_eligible BOOLEAN NOT NULL DEFAULT FALSE,
+            source_label VARCHAR(512) CHARACTER SET utf8mb4
+                COLLATE utf8mb4_bin NOT NULL,
+            imported_at DATETIME(6) NOT NULL,
+            CONSTRAINT chk_attention_legacy_import_mode
+                CHECK (import_mode = 'snapshot_only'),
+            CONSTRAINT chk_attention_legacy_generation
+                CHECK (generation_eligible = FALSE),
+            CONSTRAINT chk_attention_legacy_status_counts
+                CHECK (JSON_VALID(status_counts_json))
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci""",
+        """CREATE TABLE IF NOT EXISTS attention_legacy_candidates (
+            snapshot_sha256 CHAR(64) CHARACTER SET ascii
+                COLLATE ascii_bin NOT NULL,
+            source_ordinal BIGINT UNSIGNED NOT NULL,
+            legacy_stream_id VARCHAR(255) CHARACTER SET utf8mb4
+                COLLATE utf8mb4_bin NOT NULL,
+            legacy_status VARCHAR(16) CHARACTER SET ascii
+                COLLATE ascii_bin NOT NULL,
+            row_sha256 CHAR(64) CHARACTER SET ascii
+                COLLATE ascii_bin NOT NULL,
+            original_fields_json JSON NOT NULL,
+            candidate_state VARCHAR(32) CHARACTER SET ascii
+                COLLATE ascii_bin NOT NULL,
+            PRIMARY KEY (snapshot_sha256, source_ordinal),
+            UNIQUE KEY uq_attention_legacy_stream
+                (snapshot_sha256, legacy_stream_id),
+            CONSTRAINT fk_attention_legacy_candidate_snapshot
+                FOREIGN KEY (snapshot_sha256)
+                REFERENCES attention_legacy_snapshots(snapshot_sha256)
+                ON UPDATE RESTRICT ON DELETE RESTRICT,
+            CONSTRAINT chk_attention_legacy_candidate_state
+                CHECK (candidate_state = 'snapshot_only'),
+            CONSTRAINT chk_attention_legacy_original_fields
+                CHECK (JSON_VALID(original_fields_json))
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci""",
+        """CREATE TRIGGER IF NOT EXISTS attention_legacy_snapshots_immutable_update_v1
+        BEFORE UPDATE ON attention_legacy_snapshots FOR EACH ROW
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'AttentionLegacySnapshotImmutable'""",
+        """CREATE TRIGGER IF NOT EXISTS attention_legacy_snapshots_immutable_delete_v1
+        BEFORE DELETE ON attention_legacy_snapshots FOR EACH ROW
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'AttentionLegacySnapshotImmutable'""",
+        """CREATE TRIGGER IF NOT EXISTS attention_legacy_candidates_immutable_update_v1
+        BEFORE UPDATE ON attention_legacy_candidates FOR EACH ROW
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'AttentionLegacyCandidateImmutable'""",
+        """CREATE TRIGGER IF NOT EXISTS attention_legacy_candidates_immutable_delete_v1
+        BEFORE DELETE ON attention_legacy_candidates FOR EACH ROW
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'AttentionLegacyCandidateImmutable'""",
+    ),
+)
+
+_MYSQL_LEGACY_SHADOW_MIGRATION_V2 = SchemaMigration(
+    version=2,
+    name="life_attention_legacy_snapshot_storage_shadow_v2",
+    statements=_MYSQL_LEGACY_MIGRATION_V2.statements,
 )
 
 _MYSQL_IMMUTABILITY_TRIGGERS = (
@@ -175,6 +299,34 @@ _MYSQL_IMMUTABILITY_TRIGGERS = (
         "DELETE",
         "BEFORE",
         "AttentionThreadEventImmutable",
+    ),
+    MySQLTriggerContract(
+        "attention_legacy_snapshots_immutable_update_v1",
+        "attention_legacy_snapshots",
+        "UPDATE",
+        "BEFORE",
+        "AttentionLegacySnapshotImmutable",
+    ),
+    MySQLTriggerContract(
+        "attention_legacy_snapshots_immutable_delete_v1",
+        "attention_legacy_snapshots",
+        "DELETE",
+        "BEFORE",
+        "AttentionLegacySnapshotImmutable",
+    ),
+    MySQLTriggerContract(
+        "attention_legacy_candidates_immutable_update_v1",
+        "attention_legacy_candidates",
+        "UPDATE",
+        "BEFORE",
+        "AttentionLegacyCandidateImmutable",
+    ),
+    MySQLTriggerContract(
+        "attention_legacy_candidates_immutable_delete_v1",
+        "attention_legacy_candidates",
+        "DELETE",
+        "BEFORE",
+        "AttentionLegacyCandidateImmutable",
     ),
 )
 
@@ -197,10 +349,13 @@ async def ensure_attention_thread_schema(
         )
     await runtime.validate_writer()
     if runtime.backend == BackendKind.MYSQL:
-        migration = (
-            _MYSQL_MIGRATION
+        migrations = (
+            (_MYSQL_MIGRATION_V1, _MYSQL_LEGACY_MIGRATION_V2)
             if require_database_immutability
-            else _MYSQL_SHADOW_MIGRATION
+            else (
+                _MYSQL_SHADOW_MIGRATION_V1,
+                _MYSQL_LEGACY_SHADOW_MIGRATION_V2,
+            )
         )
         suffix = "" if require_database_immutability else "_shadow"
         runner = MySQLMigrationRunner(
@@ -208,7 +363,7 @@ async def ensure_attention_thread_schema(
             table_name=f"life_attention{suffix}_schema_migrations",
             lock_name=f"elysium:life-attention{suffix.replace('_', '-')}-schema",
         )
-        await runner.apply((migration,))
+        await runner.apply(migrations)
         if require_database_immutability:
             await verify_mysql_trigger_contract(
                 runtime.engine,

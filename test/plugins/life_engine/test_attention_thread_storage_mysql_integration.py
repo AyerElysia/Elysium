@@ -2,15 +2,24 @@
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import replace
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from plugins.life_engine.attention_threads import AttentionThreadCommand
 from plugins.life_engine.storage.attention_factory import (
     open_attention_thread_stores,
+)
+from plugins.life_engine.storage.attention_migration import (
+    export_legacy_attention_snapshot,
+    import_legacy_attention_snapshot,
+    verify_legacy_attention_import,
 )
 from plugins.life_engine.storage.authority import MySQLAuthorityRegistry
 from plugins.life_engine.storage.contracts import StorageBackendRuntime
@@ -19,6 +28,10 @@ from plugins.life_engine.storage.factory import (
     MySQLBackendSettings,
     StorageFactorySettings,
     open_storage_backend,
+)
+from plugins.life_engine.storage.migration.copy_authority import (
+    MySQLCopyAuthorityRegistry,
+    open_mysql_copy_runtime,
 )
 from plugins.life_engine.storage.models import (
     BackendGeneration,
@@ -170,3 +183,98 @@ async def test_mysql_attention_actor_gate_cas_and_restart() -> None:
                     await registry.revoke(token)
             finally:
                 await engine.dispose()
+
+
+@pytest.mark.timeout(180)
+async def test_mysql_attention_legacy_snapshot_is_exact_and_immutable(
+    tmp_path: Path,
+) -> None:
+    config = _mysql_config()
+    engine = create_mysql_storage_engine(config)
+    registry = MySQLCopyAuthorityRegistry(engine)
+    runtime: StorageBackendRuntime | None = None
+    token = None
+    suffix = uuid4().hex
+    source = tmp_path / "streams.json"
+    raw = (
+        json.dumps(
+            {
+                "schema_version": 2,
+                "global_revision": 1,
+                "streams": [
+                    {
+                        "id": f"legacy:{suffix}",
+                        "title": "逐字节 MySQL 迁移🌸",
+                        "created_at": "2026-08-06T00:00:00+00:00",
+                        "last_advanced_at": "2026-08-06T00:01:00+00:00",
+                        "status": "dormant",
+                        "revision": 1,
+                    }
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\r\n"
+    ).encode()
+    source.write_bytes(raw)
+    try:
+        run_id = f"attention-legacy-integration:{suffix}"
+        run = await registry.create_run(
+            run_id=run_id,
+            source_manifest_sha256="7" * 64,
+            source_snapshot_sha256="8" * 64,
+            writer_frozen=True,
+            metadata={"domain": "attention_thread"},
+        )
+        token = await registry.acquire(
+            run_id,
+            expected_epoch=int(run["authority_epoch"]),
+            owner_id=f"attention-legacy-integration:{suffix}",
+            lease_seconds=180,
+        )
+        runtime = open_mysql_copy_runtime(
+            registry,
+            token,
+            backend_identity=config.safe_identity,
+        )
+        await open_attention_thread_stores(runtime, initialize_schema=True)
+        copied = await import_legacy_attention_snapshot(source, runtime)
+        verified = await verify_legacy_attention_import(source, runtime)
+        replay = await import_legacy_attention_snapshot(source, runtime)
+        reverse = await export_legacy_attention_snapshot(
+            runtime,
+            snapshot_sha256=copied.snapshot_sha256,
+            archive_directory=tmp_path / "reverse",
+        )
+
+        assert copied.verified is True
+        assert replay.idempotent_replay is True
+        assert verified["verified"] is True
+        assert (tmp_path / "reverse/streams.json").read_bytes() == raw
+        assert reverse.verified is True
+        with pytest.raises(DBAPIError, match="AttentionLegacySnapshotImmutable"):
+            async with runtime.unit_of_work() as uow:
+                await uow.session.execute(
+                    text(
+                        """UPDATE attention_legacy_snapshots
+                        SET source_label = 'changed'
+                        WHERE snapshot_sha256 = :snapshot_sha256"""
+                    ),
+                    {"snapshot_sha256": copied.snapshot_sha256},
+                )
+        await registry.complete(
+            token,
+            verification={
+                "verified": True,
+                "database_immutability": "trigger-enforced",
+            },
+        )
+        token = None
+    finally:
+        if token is not None:
+            await registry.fail(token, reason="integration_cleanup")
+        if runtime is not None:
+            await runtime.close()
+        else:
+            await engine.dispose()
