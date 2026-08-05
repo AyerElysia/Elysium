@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator
 from typing import Any
 
-
 _PARALLEL_SAFE_TOOL_NAMES: frozenset[str] = frozenset(
     {
         "fetch_chat_history",
@@ -40,7 +39,10 @@ def is_life_tool_call_parallel_safe(call: Any) -> bool:
     if not name or name.startswith("action-"):
         return False
 
-    if name == "nucleus_manage_thought_stream":
+    if name in {
+        "nucleus_manage_attention_thread",
+        "nucleus_manage_thought_stream",
+    }:
         return str(_tool_call_args(call).get("action", "") or "").strip().lower() == "list"
 
     return name in _PARALLEL_SAFE_TOOL_NAMES

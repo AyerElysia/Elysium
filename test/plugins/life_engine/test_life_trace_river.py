@@ -250,13 +250,13 @@ def _make_tool_env(
     return tool, captured, fake_service
 
 
-def test_retire_completed_enters_river(
+def test_legacy_retire_fails_closed_without_attention_authority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     tool, captured, service = _make_tool_env(tmp_path, monkeypatch)
     ts = service._thought_manager.create(title="那段旋律")
 
-    ok, _ = asyncio.run(
+    ok, message = asyncio.run(
         tool.execute(
             action="retire",
             stream_id=ts.id,
@@ -265,29 +265,27 @@ def test_retire_completed_enters_river(
         )
     )
 
-    assert ok
-    moments = [item for item in captured if item["kind"] == "thought_stream"]
-    assert len(moments) == 1
-    assert moments[0]["operation"] == "completed"
-    assert "那段旋律" in moments[0]["summary"]
-    assert "童谣" in moments[0]["summary"]
+    assert ok is False
+    assert "canonical AttentionThread" in message
+    assert service._thought_manager.get(ts.id).status == "active"
+    assert captured == []
 
 
-def test_absorb_curiosity_enters_river(
+def test_legacy_create_does_not_absorb_curiosity_without_attention_authority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    tool, captured, _ = _make_tool_env(tmp_path, monkeypatch)
+    tool, captured, service = _make_tool_env(tmp_path, monkeypatch)
 
-    ok, _ = asyncio.run(
+    ok, message = asyncio.run(
         tool.execute(action="create", title="旋律之谜", absorb_curiosity=True)
     )
 
-    assert ok
-    moments = [item for item in captured if item["kind"] == "curiosity"]
-    assert len(moments) == 1
-    assert moments[0]["operation"] == "absorbed"
-    assert "反复出现的旋律" in moments[0]["summary"]
-    assert "旋律之谜" in moments[0]["summary"]
+    signal = asyncio.run(service._get_curiosity_engine().load_signal())
+    assert ok is False
+    assert "canonical AttentionThread" in message
+    assert signal.active is True
+    assert service._thought_manager.list_all() == []
+    assert captured == []
 
 
 # ── 6. chatter 注入行渲染 ───────────────────────────────────

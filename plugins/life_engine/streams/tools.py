@@ -11,7 +11,7 @@ import binascii
 import hashlib
 import hmac
 import json
-from typing import Annotated, Literal
+from typing import Annotated, ClassVar, Literal
 
 from src.app.plugin_system.api import log_api
 from src.app.plugin_system.base import BaseTool
@@ -20,7 +20,7 @@ from .manager import ThoughtStreamManager
 
 logger = log_api.get_logger("life_engine.stream_tools")
 
-StreamAction = Literal["create", "list", "advance", "retire"]
+StreamAction = Literal["create", "list", "advance", "retire", "reactivate"]
 
 THOUGHT_STREAM_LIST_DEFAULT_PAGE_SIZE = 20
 THOUGHT_STREAM_LIST_MAX_PAGE_SIZE = 20
@@ -28,6 +28,8 @@ THOUGHT_STREAM_LIST_DEFAULT_MAX_BYTES = 16 * 1024
 THOUGHT_STREAM_LIST_MIN_BYTES = 2 * 1024
 THOUGHT_STREAM_LIST_MAX_BYTES = 16 * 1024
 _LIST_CURSOR_VERSION = 1
+_CANONICAL_LIST_MIN_CONTENT_BYTES = 4 * 1024
+_CANONICAL_LIST_META_RESERVE_BYTES = 5 * 1024
 
 
 class ThoughtStreamProjectionError(ValueError):
@@ -143,14 +145,7 @@ def _projection_meta(
     )
 
 
-def _render_bounded_list(
-    manager: ThoughtStreamManager,
-    *,
-    include_dormant: bool,
-    cursor: str,
-    page_size: int,
-    max_bytes: int,
-) -> str:
+def _validate_list_bounds(*, page_size: int, max_bytes: int) -> None:
     if not 1 <= page_size <= THOUGHT_STREAM_LIST_MAX_PAGE_SIZE:
         raise ThoughtStreamProjectionError(
             f"page_size must be between 1 and {THOUGHT_STREAM_LIST_MAX_PAGE_SIZE}"
@@ -160,6 +155,17 @@ def _render_bounded_list(
             "max_bytes must be between "
             f"{THOUGHT_STREAM_LIST_MIN_BYTES} and {THOUGHT_STREAM_LIST_MAX_BYTES}"
         )
+
+
+def _render_bounded_list(
+    manager: ThoughtStreamManager,
+    *,
+    include_dormant: bool,
+    cursor: str,
+    page_size: int,
+    max_bytes: int,
+) -> str:
+    _validate_list_bounds(page_size=page_size, max_bytes=max_bytes)
 
     streams = manager.list_for_projection(include_dormant=include_dormant)
     source_revision = manager.current_revision
@@ -239,6 +245,69 @@ def _render_bounded_list(
     return result
 
 
+async def _render_canonical_list(
+    tool: BaseTool,
+    service,
+    *,
+    include_dormant: bool,
+    cursor: str,
+    page_size: int,
+    max_bytes: int,
+) -> str:
+    """Render canonical AttentionThread state through the legacy tool name."""
+    from ..attention_threads import AttentionThreadPageQuery
+
+    _validate_list_bounds(page_size=page_size, max_bytes=max_bytes)
+    minimum = (
+        _CANONICAL_LIST_MIN_CONTENT_BYTES
+        + _CANONICAL_LIST_META_RESERVE_BYTES
+    )
+    if max_bytes < minimum:
+        raise ThoughtStreamProjectionError(
+            f"canonical attention list requires max_bytes >= {minimum}"
+        )
+
+    actor = service.resolve_consciousness_instance(tool.get_current_stream_id())
+    instance = service.consciousness_registry.get(actor)
+    if instance is None or not instance.is_active:
+        raise ThoughtStreamProjectionError(
+            "canonical attention list requires an active consciousness instance"
+        )
+    statuses = ("open", "paused") if include_dormant else ("open",)
+    query_budget = max_bytes - _CANONICAL_LIST_META_RESERVE_BYTES
+    try:
+        page = await service.page_attention_threads(
+            AttentionThreadPageQuery(
+                statuses=statuses,
+                continuation=cursor.strip(),
+                limit=page_size,
+                max_bytes=query_budget,
+                projection_kind="legacy_thought_stream_facade",
+                focus_instance_id=actor,
+            )
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise ThoughtStreamProjectionError(
+            f"canonical attention continuation rejected: {type(exc).__name__}"
+        ) from exc
+
+    meta = (
+        "[projection_meta authority=attention_thread "
+        f"source_frontier={page.source_frontier} "
+        f"returned={len(page.items)} "
+        f"omitted_count={page.omitted_count} "
+        f"payload_bytes={page.delivered_bytes} "
+        f"has_more={'true' if page.continuation else 'false'} "
+        f"next_cursor={page.continuation or '-'}]"
+    )
+    result = f"{page.content}\n\n{meta}"
+    if len(result.encode("utf-8")) > max_bytes:
+        raise ThoughtStreamProjectionError(
+            "canonical attention projection exceeded the legacy tool budget"
+        )
+    return result
+
+
 def _get_service():
     from ..service.registry import get_life_engine_service
 
@@ -253,70 +322,68 @@ def _get_manager() -> ThoughtStreamManager | None:
     return service._thought_manager
 
 
-
-def _record_river_moment(*, kind: str, summary: str, operation: str, reason: str = "") -> None:
-    """转折点入长河；长河故障绝不影响思考流操作。"""
-    try:
-        service = _get_service()
-        recorder = getattr(service, "_record_life_moment", None) if service else None
-        if recorder is not None:
-            recorder(kind=kind, summary=summary, operation=operation, reason=reason)
-    except Exception as e:  # noqa: BLE001
-        logger.debug(f"长河留痕失败: {e}")
+def _get_canonical_attention_service():
+    service = _get_service()
+    if service is None or getattr(service, "_attention_thread_service", None) is None:
+        return None
+    return service
 
 
-async def _absorb_curiosity_signal(stream_title: str = "") -> None:
-    """承接当前好奇牵引：刺点已被思考流接住，异步好奇层放下它。"""
-    try:
-        service = _get_service()
-        if service is None:
-            return
-        engine = service._get_curiosity_engine()
-        signal = await engine.load_signal()
-        if signal.active:
-            await engine.clear()
-            _record_river_moment(
-                kind="curiosity",
-                summary=f"好奇刺点被思考流「{stream_title}」承接：{signal.anchor[:120]}",
-                operation="absorbed",
-            )
-            logger.info(f"好奇牵引已被思考流承接并放下: {signal.anchor}")
-    except Exception as e:  # noqa: BLE001
-        logger.debug(f"承接好奇牵引失败: {e}")
+async def _execute_canonical_mutation(
+    legacy_tool: BaseTool,
+    *,
+    action: str,
+    thread_id: str,
+    expected_revision: int,
+    statement: str,
+    ignored_legacy_fields: tuple[str, ...] = (),
+) -> tuple[bool, str | dict[str, object]]:
+    """Map one explicit legacy action to the sole AttentionThread authority."""
+    from ..attention_threads.tools import LifeEngineManageAttentionThreadTool
 
+    canonical = LifeEngineManageAttentionThreadTool(legacy_tool.plugin)
+    canonical._bind_runtime_context(
+        stream_id=legacy_tool.get_current_stream_id(),
+        message=legacy_tool.trigger_message,
+    )
+    ok, result = await canonical.execute(
+        action=action,
+        thread_id=thread_id,
+        expected_revision=expected_revision,
+        statement=statement,
+    )
+    if isinstance(result, dict):
+        result = {
+            **result,
+            "legacy_facade": True,
+            "ignored_legacy_fields": list(ignored_legacy_fields),
+        }
+    return ok, result
 
 class LifeEngineManageThoughtStreamTool(BaseTool):
-    """思考流管理工具（创建/列出/推进/结束 合一）。"""
+    """Deprecated ThoughtStream name backed by canonical AttentionThread."""
 
     tool_name: str = "nucleus_manage_thought_stream"
     tool_description: str = (
-        "管理持久思考流——你持续在意的兴趣或问题。"
-        "这不是待办事项，而是'我最近一直在琢磨这件事'。"
-        "\n\n"
-        "**action=create** — 创建新的思考流。遇到有趣的话题、未解答的疑问、或反复出现的想法时使用。"
-        " 参数：title（必填）、reason（为什么感兴趣，可选）、"
-        "absorb_curiosity（若此思考流承接的是当前好奇牵引的刺点，设为 true，承接后牵引会放下）"
-        "\n\n"
-        "**action=list** — 列出当前活跃的思考流，用于选择接下来想深入哪条线索。"
-        " 参数：include_dormant（是否包含休眠中的，默认 false；不会包含 completed）、"
-        "cursor（上一页游标）、page_size（最多 20）、max_bytes（最多 16384）。"
-        "返回值始终带有 projection_meta；has_more=true 时使用 next_cursor 继续读取。"
-        "\n\n"
-        "**action=advance** — 推进一条思考流，记录你对该话题的最新想法。"
-        " 这是内心独白的核心：围绕你在意的事情深入思考。"
-        " 参数：stream_id（必填）、thought（最新想法，必填）、curiosity_delta（好奇心变化量，可选）"
-        "\n\n"
-        "**action=retire** — 结束或休眠一条思考流。有了结论或暂时不再感兴趣时使用。"
-        " 参数：stream_id（必填）、new_status（completed/dormant）、conclusion（结论或搁置原因，可选）"
+        "旧 ThoughtStream 兼容入口；新调用应使用 nucleus_manage_attention_thread。"
+        "canonical AttentionThread 可用时，create/advance/retire/reactivate 仅机械映射为"
+        " open/note/pause|close/resume，并要求 expected_revision；绝不保存隐藏推理、"
+        "curiosity_delta、自动衰减或自动状态。canonical 不可用时所有写操作明确失败。"
+        "list 在 canonical 可用时读取 open（include_dormant=true 时加 paused）；"
+        "否则仅提供旧快照的有界只读页，永不混入 completed。分页使用 cursor、"
+        "page_size（最多 20）和 max_bytes（最多 16384）。"
     )
-    chatter_allow: list[str] = ["life_engine_internal"]
+    chatter_allow: ClassVar[list[str]] = ["life_engine_internal"]
 
     def __init__(self, plugin) -> None:
         super().__init__(plugin)
 
     async def execute(
         self,
-        action: Annotated[StreamAction, "操作：create / list / advance / retire"],
+        action: Annotated[
+            StreamAction,
+            "旧操作：create / list / advance / retire / reactivate",
+        ],
         # create 参数
         title: Annotated[str, "思考流标题（action=create 时必填）"] = "",
         reason: Annotated[str, "为什么这件事引起了你的兴趣（action=create 时可选）"] = "",
@@ -332,31 +399,32 @@ class LifeEngineManageThoughtStreamTool(BaseTool):
         ] = THOUGHT_STREAM_LIST_DEFAULT_MAX_BYTES,
         # advance 参数
         stream_id: Annotated[str, "思考流ID（action=advance/retire 时必填）"] = "",
+        expected_revision: Annotated[
+            int,
+            "canonical 线索的当前 revision；advance/retire/reactivate 必填",
+        ] = 0,
         thought: Annotated[str, "对该话题的最新想法（action=advance 时必填）"] = "",
         curiosity_delta: Annotated[float, "好奇心变化量，正值=更感兴趣，负值=兴趣减退"] = 0.0,
         # retire 参数
         new_status: Annotated[str, "新状态: completed(已得出结论) 或 dormant(暂时搁置)"] = "completed",
         conclusion: Annotated[str, "最终结论或搁置原因（action=retire 时可选）"] = "",
-    ) -> tuple[bool, str]:
-        manager = _get_manager()
-        if manager is None:
-            return False, "思考流服务未初始化"
-
+    ) -> tuple[bool, str | dict[str, object]]:
         try:
-            if action == "create":
-                if not title or not title.strip():
-                    return False, "title 不能为空"
-                ts = manager.create(title=title.strip(), reason=reason.strip())
-                if absorb_curiosity:
-                    await _absorb_curiosity_signal(stream_title=ts.title)
-                return True, (
-                    f"已创建思考流「{ts.title}」({ts.id})，"
-                    f"当前活跃思考流: {len(manager.list_active())}"
-                    + ("；好奇牵引已承接放下" if absorb_curiosity else "")
-                )
-
+            canonical_service = _get_canonical_attention_service()
             if action == "list":
                 try:
+                    if canonical_service is not None:
+                        return True, await _render_canonical_list(
+                            self,
+                            canonical_service,
+                            include_dormant=include_dormant,
+                            cursor=cursor,
+                            page_size=page_size,
+                            max_bytes=max_bytes,
+                        )
+                    manager = _get_manager()
+                    if manager is None:
+                        return False, "旧思考流只读快照未初始化"
                     return True, _render_bounded_list(
                         manager,
                         include_dormant=include_dormant,
@@ -367,52 +435,80 @@ class LifeEngineManageThoughtStreamTool(BaseTool):
                 except ThoughtStreamProjectionError as exc:
                     return False, f"思考流有界查询失败: {exc}"
 
+            if canonical_service is None:
+                return False, (
+                    "旧 ThoughtStream 写入已退役；canonical AttentionThread "
+                    "authority 未启动，拒绝创建或修改第二套权威"
+                )
+
+            if action == "create":
+                if not title or not title.strip():
+                    return False, "title 不能为空"
+                return await _execute_canonical_mutation(
+                    self,
+                    action="open",
+                    thread_id="",
+                    expected_revision=0,
+                    statement=title.strip(),
+                    ignored_legacy_fields=("reason", "absorb_curiosity"),
+                )
+
             if action == "advance":
                 if not stream_id or not stream_id.strip():
                     return False, "stream_id 不能为空"
                 if not thought or not thought.strip():
                     return False, "thought 不能为空"
-                success, msg = manager.advance(
-                    stream_id=stream_id.strip(),
-                    thought=thought.strip(),
-                    curiosity_delta=curiosity_delta,
+                return await _execute_canonical_mutation(
+                    self,
+                    action="note",
+                    thread_id=stream_id.strip(),
+                    expected_revision=expected_revision,
+                    statement=thought.strip(),
+                    ignored_legacy_fields=("curiosity_delta",),
                 )
-                if success:
-                    # 探索本身有回报
-                    pass
-                return success, msg
 
             if action == "retire":
                 if not stream_id or not stream_id.strip():
                     return False, "stream_id 不能为空"
                 if new_status not in ("completed", "dormant"):
                     return False, "new_status 必须是 'completed' 或 'dormant'"
-                target = next(
-                    (ts for ts in manager.list_all() if ts.id == stream_id.strip()), None
-                )
-                stream_title = target.title if target else stream_id.strip()
-                success, msg = manager.retire(
-                    stream_id=stream_id.strip(),
-                    new_status=new_status,
-                    conclusion=conclusion.strip() if conclusion else "",
-                )
-                if success and new_status == "completed":
-                    pass
-                if success:
-                    verb = "闭合" if new_status == "completed" else "搁置"
-                    detail = conclusion.strip() if conclusion and conclusion.strip() else "（无结论）"
-                    _record_river_moment(
-                        kind="thought_stream",
-                        summary=f"{verb}思考流「{stream_title}」：{detail[:120]}",
-                        operation=new_status,
+                canonical_action = "close" if new_status == "completed" else "pause"
+                if canonical_action == "close" and not conclusion.strip():
+                    return False, (
+                        "completed 映射为主体明确 close，必须提供公开 conclusion"
                     )
-                return success, msg
+                return await _execute_canonical_mutation(
+                    self,
+                    action=canonical_action,
+                    thread_id=stream_id.strip(),
+                    expected_revision=expected_revision,
+                    statement=(
+                        conclusion.strip() if canonical_action == "close" else ""
+                    ),
+                    ignored_legacy_fields=(
+                        ("conclusion",) if canonical_action == "pause" else ()
+                    ),
+                )
 
-            return False, f"未知 action: {action}，请使用 create/list/advance/retire"
+            if action == "reactivate":
+                if not stream_id or not stream_id.strip():
+                    return False, "stream_id 不能为空"
+                return await _execute_canonical_mutation(
+                    self,
+                    action="resume",
+                    thread_id=stream_id.strip(),
+                    expected_revision=expected_revision,
+                    statement="",
+                )
+
+            return False, (
+                f"未知 action: {action}，"
+                "请使用 create/list/advance/retire/reactivate"
+            )
 
         except Exception as e:
-            logger.error(f"思考流操作失败: {e}", exc_info=True)
-            return False, f"思考流操作失败: {e}"
+            logger.exception("旧思考流兼容操作失败: error=%s", type(e).__name__)
+            return False, f"旧思考流兼容操作失败: {type(e).__name__}"
 
 
 # 工具注册列表
