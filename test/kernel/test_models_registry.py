@@ -40,8 +40,6 @@ EXPECTED_CONTEXT_BUDGETS = {
     "router_context_projection": 100000,
     "live": 100000,
 }
-GPT_PRIORITY = ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol")
-TEXT_PRIORITY = ("deepseek-v4-flash", *GPT_PRIORITY)
 GENERATIVE_TASKS = set(EXPECTED_TASK_BUDGETS) - {"voice", "embedding"}
 
 
@@ -69,27 +67,15 @@ def test_models_example_is_complete_and_budgeted() -> None:
             assert all("context_tokens" not in entry for entry in entries)
 
 
-def test_router_tasks_are_cloud_first_and_keep_reasoning_budget() -> None:
+def test_task_routes_preserve_toml_order() -> None:
     registry_path = Path(__file__).parents[2] / "config" / "models.toml.example"
     config = ModelsConfig(registry_path)
 
-    for task_name in ("router", "router_context_projection"):
+    for task_name, task in config.tasks.items():
         entries = config.get_task(task_name)
-        assert len(entries) >= 3
-        assert all(entry["api_provider"] == "NexusAI" for entry in entries)
-        assert all(entry["max_tokens"] >= 8192 for entry in entries)
-
-    assert "qwen3-0.6b-router" not in config.tasks["router"]["models"]
-
-
-def test_formal_deepseek_leads_non_multimodal_tasks() -> None:
-    registry_path = Path(__file__).parents[2] / "config" / "models.toml.example"
-    config = ModelsConfig(registry_path)
-
-    assert set(TEXT_PRIORITY).issubset(config.models)
-    for task_name in GENERATIVE_TASKS:
-        expected = GPT_PRIORITY if task_name in {"expression", "vision"} else TEXT_PRIORITY
-        assert config.tasks[task_name]["models"][: len(expected)] == expected
+        assert [entry["routing_model_alias"] for entry in entries] == list(
+            task["models"]
+        )
 
 
 def test_expression_uses_only_vision_capable_models() -> None:
@@ -98,37 +84,24 @@ def test_expression_uses_only_vision_capable_models() -> None:
 
     expression_models = config.tasks["expression"]["models"]
 
-    assert "deepseek-v4-flash" not in expression_models
     assert all(config.models[name].get("vision", False) for name in expression_models)
 
 
-def test_registry_excludes_failed_automatic_candidates() -> None:
+def test_task_routes_only_reference_unique_registered_models() -> None:
     registry_path = Path(__file__).parents[2] / "config" / "models.toml.example"
     config = ModelsConfig(registry_path)
-    automatic_models = {
-        model_name for task in config.tasks.values() for model_name in task["models"]
-    }
 
-    assert "grok-4.5" not in config.models
-    assert "grok-4.5" not in automatic_models
-    assert "qwen3.7-plus" in config.models
-    assert "qwen3.7-plus" not in automatic_models
-    assert config.tasks["expression"]["models"][:4] == (
-        *GPT_PRIORITY,
-        "gemini-3.5-flash",
-    )
-    assert config.tasks["expression"]["models"][-1] == "claude-sonnet-5"
+    for task in config.tasks.values():
+        model_names = list(task["models"])
+        assert len(model_names) == len(set(model_names))
+        assert set(model_names).issubset(config.models)
 
 
 def test_task_context_budgets_replace_per_model_triggers() -> None:
     registry_path = Path(__file__).parents[2] / "config" / "models.toml.example"
     raw = tomllib.loads(registry_path.read_text(encoding="utf-8"))
-    gpt_names = [name for name in raw["models"] if name.startswith("gpt-5.6-")]
 
-    assert gpt_names == list(GPT_PRIORITY)
-    for name in gpt_names:
-        model = raw["models"][name]
-        assert model["ctx"] == 300000
+    for model in raw["models"].values():
         assert "context_compression_trigger_tokens" not in model.get("extra", {})
 
     for task_name in GENERATIVE_TASKS:

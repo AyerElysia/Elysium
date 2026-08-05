@@ -90,25 +90,27 @@ class ModelEntry(TypedDict):
 
 ### 2.4 当前任务路由（models.toml）
 
-| 任务 | 输入上下文预算 | 输出预算 | 模型列表（按主备序） |
-| --- | ---: | ---: | --- |
-| core | 100000 | 32000 | deepseek-v4-flash, gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, MiMo-V2.5-Pro, gemini-3.5-flash, MiMo-V2.5, claude-sonnet-5 |
-| expression | 200000 | 32000 | gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, gemini-3.5-flash, MiMo-V2.5, claude-sonnet-5 |
-| witness | 100000 | 16000 | deepseek-v4-flash, gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, MiMo-V2.5, gemini-3.5-flash |
-| agent | 200000 | 32000 | deepseek-v4-flash, gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, MiMo-V2.5-Pro, gemini-3.5-flash, MiMo-V2.5, claude-sonnet-5 |
-| utility | 64000 | 16000 | deepseek-v4-flash, gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, MiMo-V2.5, gemini-3.5-flash |
-| vision | 100000 | 16000 | gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, MiMo-V2.5, gemini-3.5-flash |
-| voice | — | 8192 | sensevoice-small（非生成型，该上限不用于思考） |
-| embedding | — | 8192 | bge-m3（非生成型，该上限不用于思考） |
-| router | 32000 | 8192 | deepseek-v4-flash, gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, MiMo-V2.5, gemini-3.5-flash（云端优先，保留思考） |
-| router_context_projection | 100000 | 16000 | deepseek-v4-flash, gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, MiMo-V2.5, gemini-3.5-flash（权威文件变化时生成派生投影） |
-| live | 100000 | 32000 | deepseek-v4-flash, gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol, MiMo-V2.5-Pro, gemini-3.5-flash, MiMo-V2.5, claude-sonnet-5 |
+| 任务 | 输入上下文预算 | 输出预算 |
+| --- | ---: | ---: |
+| core | 100000 | 32000 |
+| expression | 200000 | 32000 |
+| witness | 100000 | 16000 |
+| agent | 200000 | 32000 |
+| utility | 64000 | 16000 |
+| vision | 100000 | 16000 |
+| voice | — | 8192 |
+| embedding | — | 8192 |
+| router | 32000 | 8192 |
+| router_context_projection | 100000 | 16000 |
+| live | 100000 | 32000 |
+
+具体模型身份与主备顺序只在 `config/models.toml` 的任务数组中维护；Python 常量、测试与文档不得复制另一份模型名单。测试只验证 TOML 顺序能被原样保留、所有引用有效且能力约束成立。
 
 生成型任务的 `tokens` 同时覆盖隐式思考与最终正文；`context_tokens` 是任务级输入预算。预算随任务路由条目传递，故障转移到另一模型时保持不变，最终有效值取任务预算与“模型 `ctx` 减去输出保留量”的较小者。模型表只声明硬能力，不再承载任务压缩阈值。
 
 当前经准入的非多模态任务临时优先使用 **DeepSeek V4 Flash 正式版**。Elysium 仍使用稳定的 `deepseek-v4-flash` 公共别名，本地中转站必须把该别名映射到火山方舟 Coding Plan 的 `ark-code-latest`；直接请求上游同名模型得到的是预览版，禁止进入这条正式路由。该正式入口已通过真实 completion、重复请求与工具调用探针。`expression` 承载聊天表达并可接收图像，其自动候选必须显式声明视觉能力；DeepSeek V4 Flash 与其他纯文本模型均不得进入 `expression` 路由。`vision` 任务同样继续使用多模态候选。
 
-GPT 5.6 的后备优先级保持 **Luna → Terra → Sol**：Luna 成本最低，Terra 与 Sol 依次作为同系列后备。三种 GPT 已通过本地中转站的模型列表、真实 completion、格式遵循、工具调用与重复转发探针；MiMo、Gemini 与 Claude 继续作为跨模型族回退。中转站内部只启用通过验收的渠道，固定失败或客户端不兼容的渠道不得为了“全部打开”而进入生产路由。
+具体 GPT 后备优先级与跨模型族回退顺序同样只由 `config/models.toml` 决定。候选模型必须通过本地中转站的模型列表、真实 completion、格式遵循、工具调用与重复转发探针；中转站内部只启用通过验收的渠道，固定失败或客户端不兼容的渠道不得为了“全部打开”而进入生产路由。
 
 真实心跳和记忆见证曾产生约 53 万与 99 万 prompt tokens 的单条聚合载荷，超过当前 GPT 注册的 30 万上下文窗口，并造成三个 GPT 候选连续 500/503/504 或超时。根因是心跳的潜意识正文先经过字符预算，随后追加的 `transient_world_perception` 没有共享同一总预算；两部分又被合并成唯一一条 user 消息，旧裁剪器只会删除较早的完整问答组，最后一组因此被原样发送。现在 `core` 以 100000 tokens 为硬任务预算，`expression` 使用 200000 tokens 保留主意识长对话；`witness` 同样按 100000 tokens 限制输入，因此无需为此前的超窗故障永久移除 GPT。历史组裁剪后若最后一条普通文本仍超限，内核会保留指令头与最新尾部并插入明确省略标记；若超限来自不可切断的 system、tool 或结构化结果，则请求显式失败，不再静默发送巨型载荷。
 
