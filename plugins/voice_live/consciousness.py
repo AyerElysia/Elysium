@@ -190,18 +190,27 @@ class VoiceLiveConsciousnessManager:
         await self._store.checkpoint_async("suspended", reason=reason)
         self._instance = None
 
-    async def prepare_perception(self) -> Any | None:
+    async def prepare_perception(
+        self,
+        *,
+        projection_kind: str = "voice_live",
+        max_bytes: int = 16 * 1024,
+    ) -> Any | None:
         """Prepare this voice instance's transient cross-scene perception."""
 
         service = self._life_service()
         if service is None:
             return None
-        return await service.prepare_perception(self.instance_id)
+        return await service.prepare_perception(
+            self.instance_id,
+            projection_kind=projection_kind,
+            max_bytes=max_bytes,
+        )
 
-    async def commit_perception(self, prepared: Any) -> None:
+    async def commit_perception(self, prepared: Any, receipt: Any) -> None:
         """Acknowledge perception only after the provider accepted it."""
 
         service = self._life_service()
         if service is None:
             return
-        await service.commit_perception(prepared)
+        await service.commit_perception(prepared, receipt)

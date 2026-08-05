@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
@@ -266,6 +267,114 @@ async def test_memory_witness_is_registered_as_consciousness_without_tools(
         "subjective_witness_not_objective_truth"
     )
     assert get_tool_manifest("memory_witness") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exact", [True, False])
+async def test_memory_witness_commits_only_with_final_exact_context_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exact: bool,
+) -> None:
+    perception = SimpleNamespace(
+        delivery_id="witness-world",
+        delivery_marker="world-perception:witness-world",
+        content="world-perception:witness-world\ncurrent world",
+        projection_sha256="projection-sha",
+        delivered_bytes=48,
+    )
+    commits: list[tuple[object, object]] = []
+    requests: list[object] = []
+
+    class _Response:
+        message = "我愿意记住这一刻。"
+        request_record_id = 42
+
+        def __init__(self, request: object) -> None:
+            self._request = request
+
+        def effective_context_receipt(self, delivery_id: str) -> object:
+            assert delivery_id == perception.delivery_id
+            expected_text = self._request.expected_text
+            encoded = expected_text.encode("utf-8")
+            digest = hashlib.sha256(encoded).hexdigest()
+            return SimpleNamespace(
+                exact_present=exact,
+                expected_utf8_bytes=len(encoded),
+                expected_sha256=digest,
+                effective_utf8_bytes=(len(encoded) if exact else None),
+                effective_sha256=(digest if exact else None),
+            )
+
+    class _Request:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            self.expected_text = ""
+            self.payloads: list[object] = []
+            requests.append(self)
+
+        def add_payload(self, payload: object) -> None:
+            self.payloads.append(payload)
+
+        def register_context_delivery(
+            self,
+            delivery_id: str,
+            expected_text: str,
+            *,
+            marker: str,
+        ) -> None:
+            assert delivery_id == perception.delivery_id
+            assert marker in expected_text
+            self.expected_text = expected_text
+
+        async def send(self) -> _Response:
+            return _Response(self)
+
+    async def _prepare(_instance_id: str) -> object:
+        return perception
+
+    async def _commit(prepared: object, receipt: object) -> None:
+        commits.append((prepared, receipt))
+
+    service = SimpleNamespace(
+        _cfg=lambda: SimpleNamespace(
+            memory_witness=SimpleNamespace(
+                model_task_name="witness",
+                timeout_seconds=30,
+            )
+        ),
+        prepare_perception=_prepare,
+        commit_perception=_commit,
+        _workspace_dir=lambda: tmp_path,
+        _read_workspace_text=lambda _workspace, name: f"{name} content",
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness.get_model_set_by_task",
+        lambda _task: [{"model_identifier": "test"}],
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness.LLMRequest",
+        _Request,
+    )
+    coordinator = MemoryWitnessCoordinator(service)
+    instance = ConsciousnessInstance(
+        instance_id=MEMORY_WITNESS_INSTANCE_ID,
+        kind="memory_witness",
+    )
+
+    if exact:
+        authored = await coordinator._author_witness(instance, [_experience()])
+        assert authored == "我愿意记住这一刻。"
+        assert commits[0][0] is perception
+        assert commits[0][1].delivery_id == perception.delivery_id
+        assert commits[0][1].transport_request_id == "42"
+    else:
+        with pytest.raises(
+            RuntimeError,
+            match="MemoryWitnessPerceptionDeliveryUnverified",
+        ):
+            await coordinator._author_witness(instance, [_experience()])
+        assert commits == []
+    assert len(requests) == 1
 
 
 def test_projection_path_is_deterministic_and_stream_scoped() -> None:

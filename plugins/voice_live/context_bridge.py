@@ -596,33 +596,54 @@ class ContextBridge:
         return self._prompt_bundle
 
     async def build_llm_context_prefix(self) -> tuple[str, Any | None]:
-        """Build one transient world context and its uncommitted delivery."""
+        """Build one producer-bounded World projection without a second crop."""
 
-        prepared = await self._consciousness.prepare_perception()
+        max_bytes = int(self._config.session.perception_context_max_bytes)
+        wrapper_bytes = _utf8_size(_PERCEPTION_PREFIX + _PERCEPTION_SUFFIX)
+        content_budget = max_bytes - wrapper_bytes
+        prepared = await self._consciousness.prepare_perception(
+            projection_kind="voice_live",
+            max_bytes=content_budget,
+        )
         if prepared is None:
             self._last_perception_stats = {}
             return "", None
-        max_bytes = int(self._config.session.perception_context_max_bytes)
-        wrapper_bytes = _utf8_size(_PERCEPTION_PREFIX + _PERCEPTION_SUFFIX)
-        content, stats = _compact_context_lines(
-            prepared.content,
-            max_bytes=max_bytes - wrapper_bytes,
+        content = str(getattr(prepared, "content", "") or "")
+        content_bytes = _utf8_size(content)
+        if not content or content_bytes > content_budget:
+            raise RuntimeError(
+                "LifeEngine returned an invalid Voice perception projection: "
+                f"delivered={content_bytes}, max={content_budget}"
+            )
+        declared_bytes = getattr(prepared, "delivered_bytes", None)
+        if declared_bytes is not None and int(declared_bytes) != content_bytes:
+            raise RuntimeError("Voice perception byte identity diverged from producer")
+        declared_sha256 = str(
+            getattr(prepared, "projection_sha256", "") or ""
         )
-        stats.update(
-            {
-                "projection_kind": "voice_live_perception",
-                "from_position": getattr(prepared, "from_position", None),
-                "through_position": getattr(prepared, "through_position", None),
-                "cursor_revision": getattr(prepared, "cursor_revision", None),
-                "assertion_count": len(getattr(prepared, "assertion_ids", ()) or ()),
-                "change_count": len(getattr(prepared, "change_positions", ()) or ()),
-            }
-        )
+        content_sha256 = _sha256_text(content)
+        if declared_sha256 and declared_sha256 != content_sha256:
+            raise RuntimeError("Voice perception hash identity diverged from producer")
+        prefix = f"{_PERCEPTION_PREFIX}{content}{_PERCEPTION_SUFFIX}"
+        if _utf8_size(prefix) > max_bytes:
+            raise RuntimeError("Voice perception wrapper exceeded its transport budget")
+        stats = {
+            "projection_kind": "voice_live_perception",
+            "source_bytes": int(
+                getattr(prepared, "source_payload_bytes", content_bytes)
+                or content_bytes
+            ),
+            "delivered_bytes": content_bytes,
+            "max_bytes": content_budget,
+            "projection_sha256": content_sha256,
+            "from_position": getattr(prepared, "from_position", None),
+            "through_position": getattr(prepared, "through_position", None),
+            "cursor_revision": getattr(prepared, "cursor_revision", None),
+            "assertion_count": len(getattr(prepared, "assertion_ids", ()) or ()),
+            "change_count": len(getattr(prepared, "change_positions", ()) or ()),
+        }
         self._last_perception_stats = stats
-        return (
-            f"{_PERCEPTION_PREFIX}{content}{_PERCEPTION_SUFFIX}",
-            prepared,
-        )
+        return prefix, prepared
 
     def perception_projection_stats(self) -> dict[str, Any]:
         """Return content-free metrics for the latest transient projection."""

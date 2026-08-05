@@ -17,12 +17,14 @@ from .base import (
     AudioDelta,
     BaseRealtimeProvider,
     InterruptionEvent,
+    RealtimeContextDeliveryReceipt,
     ToolCallEvent,
     TranscriptEvent,
 )
 
 _QWEN_MAX_FRAME_BYTES = 256 * 1024
 _QWEN_CONTEXT_CHUNK_BYTES = 192 * 1024
+_CONTEXT_ACK_TIMEOUT_SECONDS = 5.0
 # Qwen Audio does not promise WebSocket PONG replies.  ``None`` keeps aiohttp's
 # automatic reply to server PINGs but prevents client-originated heartbeat PINGs
 # from falsely terminating an otherwise healthy realtime session.
@@ -230,6 +232,7 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
 
     async def disconnect(self) -> None:
         self._closed = True
+        self._cancel_pending_context_item_acks()
         current = asyncio.current_task()
         if (
             self._receive_task
@@ -288,34 +291,66 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
         await self.inject_context(text)
         await self._send({"type": "response.create"})
 
-    async def inject_context(self, text: str) -> None:
-        """Append one turn context item without independently triggering speech."""
+    async def inject_context(
+        self,
+        text: str,
+    ) -> RealtimeContextDeliveryReceipt:
+        """Append context and prove the exact server-echoed UTF-8 content."""
 
         chunks = _split_utf8_text(text, max_bytes=_QWEN_CONTEXT_CHUNK_BYTES)
-        for chunk in chunks:
-            item_id = f"voice_context_{uuid.uuid4().hex}"
-            await self._send(
-                {
-                    "type": "conversation.item.create",
-                    "item": {
-                        "id": item_id,
-                        "type": "message",
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": chunk}],
-                    },
-                }
-            )
-            self._track_transient_context(item_id, response_ttl=1)
-        if len(chunks) > 1:
+        if not chunks:
+            raise ValueError("realtime context must not be empty")
+        registrations: list[
+            tuple[str, asyncio.Future[tuple[str, str | None]]]
+        ] = []
+        try:
+            for chunk in chunks:
+                item_id = f"voice_context_{uuid.uuid4().hex}"
+                future = self._begin_context_item_ack(item_id, chunk)
+                registrations.append((item_id, future))
+                await self._send(
+                    {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "id": item_id,
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": chunk}],
+                        },
+                    }
+                )
+                self._track_transient_context(item_id, response_ttl=1)
+        except BaseException:
+            self._discard_context_item_acks(registrations)
+            raise
+        receipt = await self._await_context_item_acks(
+            text,
+            registrations,
+            timeout=min(_CONTEXT_ACK_TIMEOUT_SECONDS, self._event_timeout),
+        )
+        if not receipt.exact:
             await self._emit_metrics(
                 {
                     "context_delivery": {
                         "bytes": len(text.encode("utf-8")),
                         "chunks": len(chunks),
                         "chunk_limit_bytes": _QWEN_CONTEXT_CHUNK_BYTES,
+                        "exact": False,
                     }
                 }
             )
+        elif len(chunks) > 1:
+            await self._emit_metrics(
+                {
+                    "context_delivery": {
+                        "bytes": len(text.encode("utf-8")),
+                        "chunks": len(chunks),
+                        "chunk_limit_bytes": _QWEN_CONTEXT_CHUNK_BYTES,
+                        "exact": True,
+                    }
+                }
+            )
+        return receipt
 
     async def _delete_transient_context_items(self) -> None:
         """Expire turn context without deleting a just-produced tool result early."""
@@ -452,7 +487,12 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
             self._interrupting_response_id = ""
             await self._emit_state(ProviderState.THINKING)
             return
-        if event_type in {"response.output_item.added", "conversation.item.created"}:
+        if event_type in {
+            "response.output_item.added",
+            "conversation.item.created",
+            "conversation.item.added",
+        }:
+            self._acknowledge_context_item(event)
             item = event.get("item") or {}
             if item.get("role") == "assistant":
                 self._active_item_id = str(item.get("id") or "")

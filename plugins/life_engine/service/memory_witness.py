@@ -27,6 +27,7 @@ from src.kernel.llm.exceptions import (
 from ..memory.experience import EpistemicKind, ExperienceRecord, WitnessMemory
 from .consciousness import ConsciousnessInstance
 from .event_bus import LifeEvent, RawEventGapError
+from .perception_gateway import PerceptionDeliveryReceipt
 from .world_state import PerceptionFilter
 
 if TYPE_CHECKING:
@@ -78,6 +79,41 @@ class WitnessRunReport:
     written_witnesses: tuple[str, ...] = ()
     skipped_scopes: tuple[str, ...] = ()
     last_sequence: int = 0
+
+
+def _exact_perception_receipt(
+    response: Any,
+    perception: Any,
+) -> PerceptionDeliveryReceipt | None:
+    """Map the final successful LLM attempt receipt to one World delivery."""
+
+    lookup = getattr(response, "effective_context_receipt", None)
+    effective = (
+        lookup(str(perception.delivery_id)) if callable(lookup) else None
+    )
+    if effective is None or not bool(getattr(effective, "exact_present", False)):
+        return None
+    expected_bytes = getattr(effective, "expected_utf8_bytes", None)
+    effective_bytes = getattr(effective, "effective_utf8_bytes", None)
+    expected_sha256 = getattr(effective, "expected_sha256", None)
+    effective_sha256 = getattr(effective, "effective_sha256", None)
+    if (
+        not isinstance(expected_bytes, int)
+        or expected_bytes <= 0
+        or effective_bytes != expected_bytes
+        or not isinstance(expected_sha256, str)
+        or effective_sha256 != expected_sha256
+    ):
+        return None
+    return PerceptionDeliveryReceipt(
+        delivery_id=str(perception.delivery_id),
+        projection_sha256=str(perception.projection_sha256),
+        delivered_bytes=int(perception.delivered_bytes),
+        exact=True,
+        transport_request_id=str(
+            getattr(response, "request_record_id", "") or ""
+        ),
+    )
 
 
 class MemoryWitnessCoordinator:
@@ -433,24 +469,33 @@ class MemoryWitnessCoordinator:
         request.add_payload(
             LLMPayload(ROLE.SYSTEM, Text(self._build_system_prompt(instance)))
         )
+        user_text = (
+            "请回望下面这段已经发生并被保存的经历，写下你此刻愿意留下的"
+            "第一人称见证。如果没有值得留下的主观感受，只输出 "
+            f"{_NO_WITNESS}。\n\n"
+            "<transient_world_perception>\n"
+            f"{perception.content}\n"
+            "</transient_world_perception>\n\n"
+            f"{self._format_experience_window(records)}"
+        )
         request.add_payload(
             LLMPayload(
                 ROLE.USER,
-                Text(
-                    "请回望下面这段已经发生并被保存的经历，写下你此刻愿意留下的"
-                    "第一人称见证。如果没有值得留下的主观感受，只输出 "
-                    f"{_NO_WITNESS}。\n\n"
-                    "<transient_world_perception>\n"
-                    f"{perception.content}\n"
-                    "</transient_world_perception>\n\n"
-                    f"{self._format_experience_window(records)}"
-                ),
+                Text(user_text),
             )
+        )
+        request.register_context_delivery(
+            str(perception.delivery_id),
+            user_text,
+            marker=str(perception.delivery_marker),
         )
         timeout = max(10.0, float(getattr(cfg, "timeout_seconds", 120.0)))
         response = await asyncio.wait_for(request.send(), timeout=timeout)
         result = await response if not response.message else response.message
-        await self._service.commit_perception(perception)
+        receipt = _exact_perception_receipt(response, perception)
+        if receipt is None:
+            raise RuntimeError("MemoryWitnessPerceptionDeliveryUnverified")
+        await self._service.commit_perception(perception, receipt)
         text = str(result or "").strip().replace("**", "").replace("```", "")
         if not text or _NO_WITNESS in text.lower():
             return ""

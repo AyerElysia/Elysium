@@ -32,7 +32,8 @@ class FakeLifeService:
         self.lifecycle_calls: list[str] = []
         self.observations: list[dict[str, Any]] = []
         self.prepared = object()
-        self.committed: list[Any] = []
+        self.committed: list[tuple[Any, Any]] = []
+        self.prepare_options: list[dict[str, Any]] = []
 
     async def register_consciousness_instance(self, instance: Any) -> Any:
         self.lifecycle_calls.append("register")
@@ -69,13 +70,22 @@ class FakeLifeService:
         self.registry_saves += int(changed)
         return changed
 
-    async def prepare_perception(self, instance_id: str) -> Any:
+    async def prepare_perception(
+        self,
+        instance_id: str,
+        **kwargs: Any,
+    ) -> Any:
         self.lifecycle_calls.append(f"prepare:{instance_id}")
+        self.prepare_options.append(dict(kwargs))
         return self.prepared
 
-    async def commit_perception(self, prepared: Any) -> tuple[int, int]:
+    async def commit_perception(
+        self,
+        prepared: Any,
+        receipt: Any,
+    ) -> tuple[int, int]:
         self.lifecycle_calls.append("commit")
-        self.committed.append(prepared)
+        self.committed.append((prepared, receipt))
         return (1, 1)
 
     async def report_world_observation(
@@ -126,9 +136,13 @@ async def test_lifecycle_is_idempotent_resumable_and_persisted(tmp_path: Path) -
     assert service.lifecycle_calls[:4] == ["register", "touch", "suspend", "resume"]
 
     prepared = await recovered.prepare_perception()
-    await recovered.commit_perception(prepared)
+    receipt = object()
+    await recovered.commit_perception(prepared, receipt)
     assert prepared is service.prepared
-    assert service.committed == [service.prepared]
+    assert service.prepare_options == [
+        {"projection_kind": "voice_live", "max_bytes": 16 * 1024}
+    ]
+    assert service.committed == [(service.prepared, receipt)]
 
 
 @pytest.mark.asyncio

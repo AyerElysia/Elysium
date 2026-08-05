@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -21,6 +23,7 @@ from plugins.voice_live.providers.base import (
     AudioDelta,
     BaseRealtimeProvider,
     InterruptionEvent,
+    RealtimeContextDeliveryReceipt,
     ToolCallEvent,
     TranscriptEvent,
 )
@@ -57,8 +60,22 @@ class FakeProvider(BaseRealtimeProvider):
     async def submit_tool_result(self, call_id: str, result: Any) -> None:
         self.tool_results.append((call_id, result))
 
-    async def inject_context(self, text: str) -> None:
+    async def inject_context(
+        self,
+        text: str,
+    ) -> RealtimeContextDeliveryReceipt:
         self.contexts.append(text)
+        encoded = text.encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        return RealtimeContextDeliveryReceipt(
+            item_ids=(f"fake-context-{len(self.contexts)}",),
+            exact=True,
+            expected_utf8_bytes=len(encoded),
+            expected_sha256=digest,
+            accepted_utf8_bytes=len(encoded),
+            accepted_sha256=digest,
+            transport_event_ids=(f"fake-event-{len(self.contexts)}",),
+        )
 
 
 class RejectingContextProvider(FakeProvider):
@@ -68,6 +85,24 @@ class RejectingContextProvider(FakeProvider):
         raise RuntimeError(f"context rejected: {text}")
 
 
+class UnverifiedContextProvider(FakeProvider):
+    """Accept transport writes without claiming exact upstream storage."""
+
+    async def inject_context(
+        self,
+        text: str,
+    ) -> RealtimeContextDeliveryReceipt:
+        exact = await super().inject_context(text)
+        return RealtimeContextDeliveryReceipt(
+            item_ids=exact.item_ids,
+            exact=False,
+            expected_utf8_bytes=exact.expected_utf8_bytes,
+            expected_sha256=exact.expected_sha256,
+            accepted_utf8_bytes=None,
+            accepted_sha256=None,
+        )
+
+
 class FakeConsciousness:
     instance_id = "voice_live_test"
     stream_id = "voice_live_test"
@@ -75,7 +110,7 @@ class FakeConsciousness:
     def __init__(self) -> None:
         self.is_active = False
         self.reasons: list[str] = []
-        self.committed_perceptions: list[Any] = []
+        self.committed_perceptions: list[tuple[Any, Any]] = []
 
     async def activate(self, provider_name: str) -> None:
         assert provider_name == "fake_realtime"
@@ -88,8 +123,8 @@ class FakeConsciousness:
         self.is_active = False
         self.reasons.append(reason)
 
-    async def commit_perception(self, prepared: Any) -> None:
-        self.committed_perceptions.append(prepared)
+    async def commit_perception(self, prepared: Any, receipt: Any) -> None:
+        self.committed_perceptions.append((prepared, receipt))
 
 
 class FakeBridge:
@@ -129,7 +164,14 @@ class PerceptionBridge(FakeBridge):
 
     def __init__(self) -> None:
         super().__init__()
-        self.prepared = object()
+        content = 'world-perception:test-delivery\n{"presence":"active"}'
+        encoded = content.encode("utf-8")
+        self.prepared = SimpleNamespace(
+            delivery_id="test-delivery",
+            projection_sha256=hashlib.sha256(encoded).hexdigest(),
+            delivered_bytes=len(encoded),
+            content=content,
+        )
 
     async def build_llm_context_prefix(self) -> tuple[str, object]:
         return "transient-presence", self.prepared
@@ -232,7 +274,13 @@ async def test_voice_perception_commits_only_after_completed_model_turn(
     assert provider.contexts == ["transient-presence"]
     assert consciousness.committed_perceptions == []
     await provider._emit_response_done(True)
-    assert consciousness.committed_perceptions == [bridge.prepared]
+    assert len(consciousness.committed_perceptions) == 1
+    committed, receipt = consciousness.committed_perceptions[0]
+    assert committed is bridge.prepared
+    assert receipt.delivery_id == bridge.prepared.delivery_id
+    assert receipt.projection_sha256 == bridge.prepared.projection_sha256
+    assert receipt.delivered_bytes == bridge.prepared.delivered_bytes
+    assert receipt.exact is True
     assert provider.contexts == ["transient-presence", "transient-presence"]
     await session.stop()
 
@@ -288,6 +336,41 @@ async def test_failed_voice_model_turn_keeps_perception_uncommitted(
     assert await session.start() is True
     await provider._emit_response_done(False)
     assert consciousness.committed_perceptions == []
+    assert provider.contexts == ["transient-presence", "transient-presence"]
+    await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_voice_response_done_without_exact_provider_receipt_stays_pending(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    provider = UnverifiedContextProvider()
+    consciousness = FakeConsciousness()
+    bridge = PerceptionBridge()
+    store = VoiceEpisodeStore(
+        tmp_path,
+        "voice_perception_unverified",
+        "perception-unverified",
+    )
+    session = CallSession(
+        config,
+        "perception-unverified",
+        provider_factory=lambda _: provider,
+        store=store,
+        consciousness=consciousness,
+        bridge=bridge,
+        tool_broker=FakeBroker(),
+    )
+
+    assert await session.start() is True
+    await provider._emit_response_done(True)
+
+    assert consciousness.committed_perceptions == []
+    assert any(
+        record.event == "perception.delivery_unverified"
+        for record in store.read_all()
+    )
     assert provider.contexts == ["transient-presence", "transient-presence"]
     await session.stop()
 

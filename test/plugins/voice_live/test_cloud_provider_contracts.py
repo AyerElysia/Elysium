@@ -49,14 +49,24 @@ async def test_transient_context_is_deleted_and_completion_is_reported(
 
     async def send(event: dict[str, Any]) -> None:
         sent.append(event)
+        if event.get("type") == "conversation.item.create":
+            await provider._handle_event(  # type: ignore[attr-defined]
+                {
+                    "type": "conversation.item.created",
+                    "event_id": "context-accepted",
+                    "item": dict(event["item"]),
+                }
+            )
 
     async def completed(success: bool) -> None:
         completions.append(success)
 
     provider._send = send  # type: ignore[method-assign]
     provider.on_response_done(completed)
-    await provider.inject_context("transient-world")
+    receipt = await provider.inject_context("transient-world")
     created_item = sent[0]["item"]["id"]
+    assert receipt.exact is True
+    assert receipt.transport_event_ids == ("context-accepted",)
 
     await provider._handle_event(  # type: ignore[attr-defined]
         {"type": "response.done", "response": {"status": "completed"}}
@@ -67,6 +77,39 @@ async def test_transient_context_is_deleted_and_completion_is_reported(
         "item_id": created_item,
     }
     assert completions == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_kind", ["openai", "qwen"])
+async def test_transient_context_receipt_rejects_changed_server_echo(
+    provider_kind: str,
+) -> None:
+    if provider_kind == "openai":
+        provider = OpenAIRealtimeProvider("ws://example/realtime", "secret")
+    else:
+        provider = QwenRealtimeProvider(
+            "ws://example/realtime",
+            "secret",
+            model="qwen-realtime",
+        )
+
+    async def send(event: dict[str, Any]) -> None:
+        item = dict(event["item"])
+        item["content"] = [{"type": "input_text", "text": "changed"}]
+        await provider._handle_event(  # type: ignore[attr-defined]
+            {
+                "type": "conversation.item.created",
+                "event_id": "changed-echo",
+                "item": item,
+            }
+        )
+
+    provider._send = send  # type: ignore[method-assign]
+
+    receipt = await provider.inject_context("expected")
+
+    assert receipt.exact is False
+    assert receipt.expected_sha256 != receipt.accepted_sha256
 
 
 @pytest.mark.asyncio
@@ -282,14 +325,24 @@ async def test_qwen_context_events_stay_below_upstream_frame_limit() -> None:
     async def send(event: dict[str, Any]) -> None:
         event["event_id"] = f"voice_{'a' * 32}"
         sent.append(event)
+        if event.get("type") == "conversation.item.create":
+            await provider._handle_event(  # type: ignore[attr-defined]
+                {
+                    "type": "conversation.item.created",
+                    "event_id": f"accepted-{len(sent)}",
+                    "item": dict(event["item"]),
+                }
+            )
 
     provider._send = send  # type: ignore[method-assign]
     text = "跨场景上下文🌸" * 40_000
 
-    await provider.inject_context(text)
+    receipt = await provider.inject_context(text)
 
     delivered = "".join(event["item"]["content"][0]["text"] for event in sent)
     assert delivered == text
+    assert receipt.exact is True
+    assert receipt.accepted_utf8_bytes == len(text.encode("utf-8"))
     assert all(
         len(
             json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8")

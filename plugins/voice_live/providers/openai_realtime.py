@@ -17,9 +17,12 @@ from .base import (
     AudioDelta,
     BaseRealtimeProvider,
     InterruptionEvent,
+    RealtimeContextDeliveryReceipt,
     ToolCallEvent,
     TranscriptEvent,
 )
+
+_CONTEXT_ACK_TIMEOUT_SECONDS = 5.0
 
 
 def _url_with_model(url: str, model: str) -> str:
@@ -120,6 +123,7 @@ class OpenAIRealtimeProvider(BaseRealtimeProvider):
 
     async def disconnect(self) -> None:
         self._closed = True
+        self._cancel_pending_context_item_acks()
         current = asyncio.current_task()
         if self._receive_task and self._receive_task is not current and not self._receive_task.done():
             self._receive_task.cancel()
@@ -159,22 +163,38 @@ class OpenAIRealtimeProvider(BaseRealtimeProvider):
         await self.inject_context(text)
         await self._send({"type": "response.create"})
 
-    async def inject_context(self, text: str) -> None:
-        """Append one turn context item without independently triggering speech."""
+    async def inject_context(
+        self,
+        text: str,
+    ) -> RealtimeContextDeliveryReceipt:
+        """Append context and prove the exact server-echoed UTF-8 content."""
 
+        if not text:
+            raise ValueError("realtime context must not be empty")
         item_id = f"voice_context_{uuid.uuid4().hex}"
-        await self._send(
-            {
-                "type": "conversation.item.create",
-                "item": {
-                    "id": item_id,
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": text}],
-                },
-            }
+        future = self._begin_context_item_ack(item_id, text)
+        registrations = [(item_id, future)]
+        try:
+            await self._send(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "id": item_id,
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text}],
+                    },
+                }
+            )
+            self._track_transient_context(item_id, response_ttl=1)
+        except BaseException:
+            self._discard_context_item_acks(registrations)
+            raise
+        return await self._await_context_item_acks(
+            text,
+            registrations,
+            timeout=min(_CONTEXT_ACK_TIMEOUT_SECONDS, self._event_timeout),
         )
-        self._track_transient_context(item_id, response_ttl=1)
 
     async def _delete_transient_context_items(self) -> None:
         """Expire turn context without deleting a just-produced tool result early."""
@@ -261,7 +281,12 @@ class OpenAIRealtimeProvider(BaseRealtimeProvider):
             self._active_response_id = str(response.get("id") or event.get("response_id") or "")
             await self._emit_state(ProviderState.THINKING)
             return
-        if event_type in {"response.output_item.added", "conversation.item.created"}:
+        if event_type in {
+            "response.output_item.added",
+            "conversation.item.created",
+            "conversation.item.added",
+        }:
+            self._acknowledge_context_item(event)
             item = event.get("item") or {}
             if item.get("role") == "assistant":
                 self._active_item_id = str(item.get("id") or "")

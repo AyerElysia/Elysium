@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from src.kernel.logger import get_logger
@@ -29,6 +31,7 @@ from .providers.base import (
     BaseRealtimeProvider,
     InterruptionEvent,
     ProviderMetrics,
+    RealtimeContextDeliveryReceipt,
     ToolCallEvent,
     TranscriptEvent,
 )
@@ -44,6 +47,14 @@ from .voice_conversion import (
 logger = get_logger("voice_live.session", display="Voice Call")
 ProviderFactory = Callable[[VoiceLiveConfig], BaseRealtimeProvider]
 VoiceConverterFactory = Callable[[VoiceLiveConfig], VoiceConverter | None]
+
+
+@dataclass(slots=True, frozen=True)
+class _PendingVoicePerception:
+    prepared: Any
+    prefix_utf8_bytes: int
+    prefix_sha256: str
+    provider_receipt: RealtimeContextDeliveryReceipt | None
 
 
 class CallSession:
@@ -101,7 +112,7 @@ class CallSession:
         self._created_monotonic = time.monotonic()
         self._failure_reason = ""
         self._perception_refresh_lock = asyncio.Lock()
-        self._pending_voice_perception: Any | None = None
+        self._pending_voice_perception: _PendingVoicePerception | None = None
         self._subject_context_audit: dict[str, Any] = {}
         self._audio_archive: VoiceAudioArchive | None = None
         self._audio_archive_summary: dict[str, Any] = {}
@@ -512,8 +523,14 @@ class CallSession:
             prefix, prepared = await builder()
             if not prefix or prepared is None:
                 return
-            await provider.inject_context(prefix)
-            self._pending_voice_perception = prepared
+            provider_receipt = await provider.inject_context(prefix)
+            prefix_encoded = prefix.encode("utf-8")
+            self._pending_voice_perception = _PendingVoicePerception(
+                prepared=prepared,
+                prefix_utf8_bytes=len(prefix_encoded),
+                prefix_sha256=hashlib.sha256(prefix_encoded).hexdigest(),
+                provider_receipt=provider_receipt,
+            )
             stats_builder = getattr(
                 self._bridge,
                 "perception_projection_stats",
@@ -528,18 +545,68 @@ class CallSession:
                     )
 
     async def _on_response_done(self, success: bool) -> None:
-        """Commit world delivery only after one completed realtime turn."""
+        """Commit only after exact upstream storage and a successful model turn."""
 
         async with self._perception_refresh_lock:
-            prepared = self._pending_voice_perception
+            pending = self._pending_voice_perception
             self._pending_voice_perception = None
-            if success and prepared is not None:
-                commit = getattr(self._consciousness, "commit_perception", None)
-                if not callable(commit):
-                    raise RuntimeError(
-                        "voice consciousness cannot acknowledge world perception"
+            if success and pending is not None:
+                provider_receipt = pending.provider_receipt
+                exact = bool(
+                    provider_receipt is not None
+                    and provider_receipt.exact
+                    and provider_receipt.expected_utf8_bytes
+                    == pending.prefix_utf8_bytes
+                    and provider_receipt.accepted_utf8_bytes
+                    == pending.prefix_utf8_bytes
+                    and provider_receipt.expected_sha256 == pending.prefix_sha256
+                    and provider_receipt.accepted_sha256 == pending.prefix_sha256
+                )
+                if not exact:
+                    await self._store.append_async(
+                        "perception.delivery_unverified",
+                        {
+                            "reason": "provider_exact_context_receipt_absent",
+                            "provider": self.provider_name,
+                            "prepared_delivery_id": str(
+                                getattr(pending.prepared, "delivery_id", "") or ""
+                            ),
+                        },
                     )
-                await commit(prepared)
+                    logger.warning(
+                        "Voice World perception remained pending because the "
+                        "provider did not prove exact context acceptance"
+                    )
+                else:
+                    commit = getattr(
+                        self._consciousness,
+                        "commit_perception",
+                        None,
+                    )
+                    if not callable(commit):
+                        raise RuntimeError(
+                            "voice consciousness cannot acknowledge world perception"
+                        )
+                    from plugins.life_engine.service.perception_gateway import (
+                        PerceptionDeliveryReceipt,
+                    )
+
+                    await commit(
+                        pending.prepared,
+                        PerceptionDeliveryReceipt(
+                            delivery_id=str(pending.prepared.delivery_id),
+                            projection_sha256=str(
+                                pending.prepared.projection_sha256
+                            ),
+                            delivered_bytes=int(
+                                pending.prepared.delivered_bytes
+                            ),
+                            exact=True,
+                            transport_request_id=",".join(
+                                provider_receipt.transport_event_ids
+                            ),
+                        ),
+                    )
         await self._refresh_voice_perception()
 
     async def _on_transcript(self, event: TranscriptEvent) -> None:

@@ -84,8 +84,18 @@ class FakeConsciousness:
     instance_id = "voice_live_episode"
     stream_id = "voice_live_episode"
 
-    async def prepare_perception(self) -> Any:
-        return SimpleNamespace(content='{"scene":"voice"}')
+    def __init__(self) -> None:
+        self.perception_calls: list[dict[str, Any]] = []
+
+    async def prepare_perception(self, **kwargs: Any) -> Any:
+        self.perception_calls.append(dict(kwargs))
+        content = 'world-perception:voice-test\n{"scene":"voice"}'
+        encoded = content.encode("utf-8")
+        return SimpleNamespace(
+            content=content,
+            delivered_bytes=len(encoded),
+            projection_sha256=hashlib.sha256(encoded).hexdigest(),
+        )
 
 
 class FakeLifeService:
@@ -153,6 +163,10 @@ async def test_context_bridge_separates_stable_identity_and_transient_world(
     transient, prepared = await bridge.build_llm_context_prefix()
     assert "scene" in transient
     assert prepared is not None
+    assert consciousness.perception_calls[-1]["projection_kind"] == "voice_live"
+    assert consciousness.perception_calls[-1]["max_bytes"] < (
+        config.session.perception_context_max_bytes
+    )
 
     await bridge.record_transcript("user", "你好", provider_event_id="u1")
     await bridge.record_transcript("assistant", "你好呀", provider_event_id="a1")
