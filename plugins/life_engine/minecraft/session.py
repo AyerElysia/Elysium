@@ -557,6 +557,11 @@ class MinecraftSession:
             return {"success": False, "error": "no Minecraft session is active"}
         if not intent.strip():
             return {"success": False, "error": "intent must not be empty"}
+        try:
+            await self._refresh_consciousness("minecraft_intent_requested")
+        except Exception as exception:  # noqa: BLE001 - Presence is part of success
+            self._state.last_error = str(exception)
+            return {"success": False, "error": str(exception)}
         from .embodiment_contracts import EmbodiedIntent
 
         perception = None
@@ -629,6 +634,7 @@ class MinecraftSession:
 
         if self._runtime is None:
             return {"success": False, "error": "no Minecraft session is active"}
+        await self._refresh_consciousness("minecraft_interrupt_requested")
         await self._runtime.interrupt(reason)
         return {"success": True, "reason": reason}
 
@@ -644,6 +650,7 @@ class MinecraftSession:
             return {"success": False, "error": "selected body bridge is absent"}
         observation = await body_client.observe(after)
         self._state.latest_observation = observation
+        await self._refresh_consciousness("minecraft_look")
         frame = await self._capture.grab_consciousness_frame()
         screenshot_path: str | None = None
         if frame is not None:
@@ -663,6 +670,8 @@ class MinecraftSession:
     async def get_status(self) -> dict[str, Any]:
         """Return session, body, planner, and latest evidence status."""
 
+        if self._state.active:
+            await self._refresh_consciousness("minecraft_status")
         client = self._bridge_client
         observation = self._state.latest_observation
         return {
@@ -877,15 +886,7 @@ class MinecraftSession:
 
         if kind == "observation":
             self._state.latest_observation = WorldObservation.from_wire(payload)
-        if self._registry is not None and self._state.consciousness_instance_id:
-            await _invoke_callback(
-                self._registry.touch,
-                self._state.consciousness_instance_id,
-                timestamp=datetime.now(UTC).isoformat(),
-                reason=f"minecraft_trace:{kind}",
-            )
-            if self._save_registry is not None:
-                await _invoke_callback(self._save_registry)
+        await self._refresh_consciousness(f"minecraft_trace:{kind}")
         if self._report_world_observation is not None and self._state.stream_id:
             await _invoke_callback(
                 self._report_world_observation,
@@ -897,6 +898,48 @@ class MinecraftSession:
                 stream_id=self._state.stream_id,
                 value={"trace_kind": kind, "payload": payload},
             )
+
+    async def _refresh_consciousness(self, reason: str) -> None:
+        """Resume an expired Presence lease or renew the active one durably."""
+
+        if (
+            self._registry is None
+            or not self._presence_registered
+            or not self._state.consciousness_instance_id
+        ):
+            return
+        instance_id = self._state.consciousness_instance_id
+        instance = await _invoke_callback(self._registry.get, instance_id)
+        if instance is None:
+            raise RuntimeError("Minecraft Presence instance is missing")
+        if getattr(instance, "status", "") == "terminated":
+            raise RuntimeError("Minecraft Presence instance is terminated")
+
+        timestamp = datetime.now(UTC).isoformat()
+        resumed = False
+        if bool(getattr(instance, "is_suspended", False)):
+            resume = getattr(self._registry, "resume", None)
+            if resume is None:
+                raise RuntimeError(
+                    "Minecraft Presence registry cannot resume an expired lease"
+                )
+            resumed = bool(
+                await _invoke_callback(
+                    resume,
+                    instance_id,
+                    timestamp=timestamp,
+                    reason=reason,
+                )
+            )
+        if not resumed:
+            await _invoke_callback(
+                self._registry.touch,
+                instance_id,
+                timestamp=timestamp,
+                reason=reason,
+            )
+        if self._save_registry is not None:
+            await _invoke_callback(self._save_registry)
 
     async def _register_consciousness(self) -> None:
         """Register an independent Minecraft consciousness scene when available."""

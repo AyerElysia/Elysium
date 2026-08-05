@@ -239,6 +239,10 @@ class _AsyncRegistry:
             raise RuntimeError("async Presence touch failed")
         self._inner.touch(instance_id, **kwargs)
 
+    async def resume(self, instance_id: str, **kwargs: Any) -> bool:
+        self.calls.append("resume")
+        return self._inner.resume(instance_id, **kwargs)
+
     async def terminate(self, instance_id: str, **kwargs: Any) -> None:
         self.calls.append("terminate")
         self._inner.terminate(instance_id, **kwargs)
@@ -372,6 +376,45 @@ async def test_session_awaits_async_presence_lifecycle_callbacks(
     assert stopped["success"] is True
     assert registry.calls == ["register", "touch", "terminate"]
     assert saves == ["save", "save", "save"]
+
+
+async def test_session_resumes_expired_presence_on_real_body_activity(
+    tmp_path: Path,
+) -> None:
+    """A live body action reclaims a lease-expired Presence before success."""
+
+    registry = _AsyncRegistry()
+    saves: list[str] = []
+
+    async def save_registry() -> None:
+        saves.append("save")
+
+    bridge = _Bridge()
+    session = MinecraftSession(
+        workspace=tmp_path,
+        mc_config=MCConfig(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
+        consciousness_registry=registry,
+        save_consciousness_registry=save_registry,
+    )
+    session._launcher = _Launcher()
+
+    async def wait_for_bridge(profile: Any) -> _Bridge:
+        return bridge
+
+    session._wait_for_bridge = wait_for_bridge
+    started = await session.start(body_name="agent")
+    assert started["success"] is True
+    instance_id = session.state.consciousness_instance_id
+    assert registry._inner.suspend(instance_id, reason="lease_expired") is True
+
+    session._planner = _Planner()
+    result = await session.do_intent("walk to x=3")
+
+    assert result["success"] is True
+    assert registry.get(instance_id).is_active
+    assert registry.calls[0:2] == ["register", "resume"]
+    assert saves[0:2] == ["save", "save"]
+    await session.stop()
 
 
 async def test_session_reports_async_presence_touch_failure(
