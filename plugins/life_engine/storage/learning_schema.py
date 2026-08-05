@@ -4,9 +4,14 @@ from __future__ import annotations
 
 from sqlalchemy import text
 
-from src.kernel.storage.migration_runner import MySQLMigrationRunner, SchemaMigration
+from src.kernel.storage.migration_runner import (
+    MySQLMigrationRunner,
+    MySQLTriggerContract,
+    SchemaMigration,
+    verify_mysql_trigger_contract,
+)
 
-from .contracts import StorageBackendRuntime
+from .contracts import StorageBackendRuntime, StorageWriterRole
 from .models import BackendKind
 
 LEARNING_SCHEMA_VERSION = 1
@@ -100,20 +105,66 @@ _MYSQL_SCHEMA_MIGRATION = SchemaMigration(
     ),
 )
 
+_MYSQL_SHADOW_SCHEMA_MIGRATION = SchemaMigration(
+    version=1,
+    name="life_learning_storage_shadow_v1",
+    statements=_MYSQL_SCHEMA_MIGRATION.statements[:2],
+)
 
-async def ensure_learning_schema(runtime: StorageBackendRuntime) -> None:
-    """Create learning tables only under a validated coherent writer."""
+_MYSQL_IMMUTABILITY_TRIGGERS = (
+    MySQLTriggerContract(
+        "learning_events_immutable_update_v1",
+        "learning_events",
+        "UPDATE",
+        "BEFORE",
+        "LearningEventImmutable",
+    ),
+    MySQLTriggerContract(
+        "learning_events_immutable_delete_v1",
+        "learning_events",
+        "DELETE",
+        "BEFORE",
+        "LearningEventImmutable",
+    ),
+)
+
+
+async def ensure_learning_schema(
+    runtime: StorageBackendRuntime,
+    *,
+    require_database_immutability: bool = True,
+) -> None:
+    """Create Learning tables without weakening an activatable generation."""
 
     if not runtime.enabled or runtime.engine is None:
         raise RuntimeError("learning schema requires an enabled storage runtime")
+    if (
+        not require_database_immutability
+        and runtime.writer_role != StorageWriterRole.CANDIDATE_COPY
+    ):
+        raise RuntimeError(
+            "Learning database immutability may be relaxed only for candidate copy"
+        )
     await runtime.validate_writer()
     if runtime.backend == BackendKind.MYSQL:
-        runner = MySQLMigrationRunner(
-            runtime.engine,
-            table_name="life_learning_schema_migrations",
-            lock_name="elysium:life-learning-schema",
-        )
-        await runner.apply((_MYSQL_SCHEMA_MIGRATION,))
+        if require_database_immutability:
+            runner = MySQLMigrationRunner(
+                runtime.engine,
+                table_name="life_learning_schema_migrations",
+                lock_name="elysium:life-learning-schema",
+            )
+            await runner.apply((_MYSQL_SCHEMA_MIGRATION,))
+            await verify_mysql_trigger_contract(
+                runtime.engine,
+                _MYSQL_IMMUTABILITY_TRIGGERS,
+            )
+        else:
+            runner = MySQLMigrationRunner(
+                runtime.engine,
+                table_name="life_learning_shadow_schema_migrations",
+                lock_name="elysium:life-learning-shadow-schema",
+            )
+            await runner.apply((_MYSQL_SHADOW_SCHEMA_MIGRATION,))
     else:
         async with runtime.unit_of_work() as uow:
             for statement in LOCAL_LEARNING_SCHEMA_STATEMENTS:

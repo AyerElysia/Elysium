@@ -13,6 +13,7 @@ async def open_learning_stores(
     runtime: StorageBackendRuntime,
     *,
     initialize_schema: bool = False,
+    require_database_immutability: bool = True,
 ) -> LearningStores:
     """Build learning adapters from the already-owned coherent runtime."""
 
@@ -21,7 +22,10 @@ async def open_learning_stores(
             "learning adapters require an enabled storage runtime"
         )
     if initialize_schema:
-        await ensure_learning_schema(runtime)
+        await ensure_learning_schema(
+            runtime,
+            require_database_immutability=require_database_immutability,
+        )
     if runtime.backend == BackendKind.LOCAL:
         store = LocalLearningStore(runtime)
     else:

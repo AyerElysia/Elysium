@@ -23,8 +23,11 @@ from src.kernel.storage.engine import (
     mysql_storage_health,
 )
 from src.kernel.storage.migration_runner import (
+    MigrationDriftError,
     MySQLMigrationRunner,
+    MySQLTriggerContract,
     SchemaMigration,
+    verify_mysql_trigger_contract,
 )
 
 
@@ -169,4 +172,55 @@ async def test_mysql_runtime_migrates_fences_commits_and_recovers() -> None:
             await runtime.close()
         if token is not None:
             await registry.revoke(token)
+        await engine.dispose()
+
+
+@pytest.mark.timeout(120)
+async def test_mysql_trigger_contract_detects_missing_protection() -> None:
+    config = _mysql_config_from_environment()
+    engine = create_mysql_storage_engine(config)
+    contract = MySQLTriggerContract(
+        name="storage_trigger_contract_update",
+        table="storage_trigger_contract_probe",
+        manipulation="UPDATE",
+        timing="BEFORE",
+        action_fragment="StorageTriggerContractImmutable",
+    )
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    """CREATE TABLE IF NOT EXISTS storage_trigger_contract_probe (
+                        id BIGINT UNSIGNED PRIMARY KEY,
+                        payload VARCHAR(64) NOT NULL
+                    ) ENGINE=InnoDB"""
+                )
+            )
+            await connection.execute(
+                text("DROP TRIGGER IF EXISTS storage_trigger_contract_update")
+            )
+            await connection.execute(
+                text(
+                    """CREATE TRIGGER storage_trigger_contract_update
+                    BEFORE UPDATE ON storage_trigger_contract_probe FOR EACH ROW
+                    SIGNAL SQLSTATE '45000'
+                        SET MESSAGE_TEXT = 'StorageTriggerContractImmutable'"""
+                )
+            )
+        await verify_mysql_trigger_contract(engine, (contract,))
+
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("DROP TRIGGER storage_trigger_contract_update")
+            )
+        with pytest.raises(MigrationDriftError, match="missing or drifted"):
+            await verify_mysql_trigger_contract(engine, (contract,))
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("DROP TRIGGER IF EXISTS storage_trigger_contract_update")
+            )
+            await connection.execute(
+                text("DROP TABLE IF EXISTS storage_trigger_contract_probe")
+            )
         await engine.dispose()

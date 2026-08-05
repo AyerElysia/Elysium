@@ -4,9 +4,14 @@ from __future__ import annotations
 
 from sqlalchemy import text
 
-from src.kernel.storage.migration_runner import MySQLMigrationRunner, SchemaMigration
+from src.kernel.storage.migration_runner import (
+    MySQLMigrationRunner,
+    MySQLTriggerContract,
+    SchemaMigration,
+    verify_mysql_trigger_contract,
+)
 
-from .contracts import StorageBackendRuntime
+from .contracts import StorageBackendRuntime, StorageWriterRole
 from .models import BackendKind
 
 SUBJECT_SCHEMA_VERSION = 4
@@ -286,14 +291,6 @@ _MYSQL_SUBJECT_AUTHORITY = SchemaMigration(
                 REFERENCES subject_document_versions(version_id)
                 ON DELETE RESTRICT
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci""",
-        """CREATE TRIGGER IF NOT EXISTS subject_authority_decisions_immutable_update
-        BEFORE UPDATE ON subject_authority_decisions FOR EACH ROW
-        SIGNAL SQLSTATE '45000'
-            SET MESSAGE_TEXT = 'SubjectAuthorityDecisionImmutable'""",
-        """CREATE TRIGGER IF NOT EXISTS subject_authority_decisions_immutable_delete
-        BEFORE DELETE ON subject_authority_decisions FOR EACH ROW
-        SIGNAL SQLSTATE '45000'
-            SET MESSAGE_TEXT = 'SubjectAuthorityDecisionImmutable'""",
     ),
 )
 
@@ -313,6 +310,59 @@ _MYSQL_SUBJECT_IMMUTABILITY = SchemaMigration(
         """CREATE TRIGGER IF NOT EXISTS subject_head_events_immutable_delete
         BEFORE DELETE ON subject_document_head_events FOR EACH ROW
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'SubjectDocumentHeadEventImmutable'""",
+        """CREATE TRIGGER IF NOT EXISTS subject_authority_decisions_immutable_update
+        BEFORE UPDATE ON subject_authority_decisions FOR EACH ROW
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'SubjectAuthorityDecisionImmutable'""",
+        """CREATE TRIGGER IF NOT EXISTS subject_authority_decisions_immutable_delete
+        BEFORE DELETE ON subject_authority_decisions FOR EACH ROW
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'SubjectAuthorityDecisionImmutable'""",
+    ),
+)
+
+_MYSQL_SUBJECT_IMMUTABILITY_TRIGGERS = (
+    MySQLTriggerContract(
+        "subject_versions_immutable_update",
+        "subject_document_versions",
+        "UPDATE",
+        "BEFORE",
+        "SubjectDocumentVersionImmutable",
+    ),
+    MySQLTriggerContract(
+        "subject_versions_immutable_delete",
+        "subject_document_versions",
+        "DELETE",
+        "BEFORE",
+        "SubjectDocumentVersionImmutable",
+    ),
+    MySQLTriggerContract(
+        "subject_head_events_immutable_update",
+        "subject_document_head_events",
+        "UPDATE",
+        "BEFORE",
+        "SubjectDocumentHeadEventImmutable",
+    ),
+    MySQLTriggerContract(
+        "subject_head_events_immutable_delete",
+        "subject_document_head_events",
+        "DELETE",
+        "BEFORE",
+        "SubjectDocumentHeadEventImmutable",
+    ),
+    MySQLTriggerContract(
+        "subject_authority_decisions_immutable_update",
+        "subject_authority_decisions",
+        "UPDATE",
+        "BEFORE",
+        "SubjectAuthorityDecisionImmutable",
+    ),
+    MySQLTriggerContract(
+        "subject_authority_decisions_immutable_delete",
+        "subject_authority_decisions",
+        "DELETE",
+        "BEFORE",
+        "SubjectAuthorityDecisionImmutable",
     ),
 )
 
@@ -326,6 +376,13 @@ async def ensure_subject_document_schema(
 
     if not runtime.enabled or runtime.engine is None:
         raise RuntimeError("subject document schema requires enabled storage")
+    if (
+        not require_database_immutability
+        and runtime.writer_role != StorageWriterRole.CANDIDATE_COPY
+    ):
+        raise RuntimeError(
+            "Subject database immutability may be relaxed only for candidate copy"
+        )
     if runtime.backend == BackendKind.MYSQL:
         await runtime.validate_writer()
         runner = MySQLMigrationRunner(
@@ -348,6 +405,10 @@ async def ensure_subject_document_schema(
                 lock_name="elysium:subject-document-immutability",
             )
             await immutable.apply((_MYSQL_SUBJECT_IMMUTABILITY,))
+            await verify_mysql_trigger_contract(
+                runtime.engine,
+                _MYSQL_SUBJECT_IMMUTABILITY_TRIGGERS,
+            )
         await runtime.validate_writer()
         return
     async with runtime.unit_of_work() as uow:

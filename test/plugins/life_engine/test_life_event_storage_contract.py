@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -36,6 +37,7 @@ from plugins.life_engine.storage.event_contracts import (
     LifeEventStorePort,
 )
 from plugins.life_engine.storage.event_factory import open_life_event_store
+from plugins.life_engine.storage.event_schema import ensure_life_event_schema
 from plugins.life_engine.storage.factory import (
     LocalBackendSettings,
     StorageFactorySettings,
@@ -56,6 +58,7 @@ from plugins.life_engine.storage.models import (
     BackendKind,
     GenerationStatus,
 )
+from scripts.migrate_life_events import _snapshot_event_source
 
 
 def _generation() -> BackendGeneration:
@@ -70,6 +73,40 @@ def _generation() -> BackendGeneration:
         verified_at="2026-08-04T00:01:00+00:00",
         status=GenerationStatus.VERIFIED,
     )
+
+
+def test_life_event_migration_resolves_only_manifest_declared_source(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "sqlite" / "life_engine_workspace" / "life_events.sqlite3"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"exact-ledger-bytes")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    manifest = {
+        "sqlite": [
+            {
+                "source_relative": "life_engine_workspace/life_events.sqlite3",
+                "backup_relative": "sqlite/life_engine_workspace/life_events.sqlite3",
+                "backup_sha256": digest,
+            }
+        ]
+    }
+
+    assert _snapshot_event_source(tmp_path.resolve(), manifest) == source.resolve()
+    manifest["sqlite"][0]["backup_sha256"] = "0" * 64
+    with pytest.raises(RuntimeError, match="hash mismatch"):
+        _snapshot_event_source(tmp_path.resolve(), manifest)
+
+
+async def test_active_life_event_writer_cannot_relax_database_immutability(
+    tmp_path: Path,
+) -> None:
+    async with _local_store(tmp_path) as (runtime, _, _, _):
+        with pytest.raises(RuntimeError, match="only for candidate copy"):
+            await ensure_life_event_schema(
+                runtime,
+                require_database_immutability=False,
+            )
 
 
 @asynccontextmanager

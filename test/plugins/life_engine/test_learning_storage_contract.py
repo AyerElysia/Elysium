@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, OperationalError
 
 from plugins.life_engine.learning.decisions import (
     AcceptSubjectCandidate,
@@ -63,7 +63,11 @@ from plugins.life_engine.storage.models import (
     BackendKind,
     GenerationStatus,
 )
-from scripts.migrate_life_learning import _verify_manifest_learning_files
+from scripts.migrate_life_learning import (
+    _is_transient_mysql_disconnect,
+    _retry_transient_mysql,
+    _verify_manifest_learning_files,
+)
 
 
 class _SubjectAuthority:
@@ -514,6 +518,18 @@ async def test_learning_candidate_and_non_accepting_decisions_never_write_subjec
         assert "candidate.committed" not in kinds
 
 
+async def test_learning_schema_relaxation_is_candidate_copy_only(
+    tmp_path: Path,
+) -> None:
+    async with _local_store(tmp_path) as (runtime, _, _, _):
+        with pytest.raises(RuntimeError, match="candidate copy"):
+            await open_learning_stores(
+                runtime,
+                initialize_schema=True,
+                require_database_immutability=False,
+            )
+
+
 async def test_accept_request_without_authority_remains_requested(
     tmp_path: Path,
 ) -> None:
@@ -957,6 +973,37 @@ def test_learning_migration_manifest_verification_is_exact(tmp_path: Path) -> No
     source.write_bytes(b'{"stable": false}')
     with pytest.raises(RuntimeError, match="differs from manifest"):
         _verify_manifest_learning_files(snapshot, manifest)
+
+
+async def test_learning_migration_retries_only_dropped_mysql_connections() -> None:
+    attempts = 0
+
+    async def transient_then_success() -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise OperationalError(
+                "SELECT 1",
+                {},
+                Exception(2013, "Lost connection during query"),
+            )
+        return "verified"
+
+    assert await _retry_transient_mysql(transient_then_success) == "verified"
+    assert attempts == 3
+
+    non_transient = OperationalError(
+        "SELECT 1",
+        {},
+        Exception(1045, "Access denied"),
+    )
+    assert _is_transient_mysql_disconnect(non_transient) is False
+
+    async def access_denied() -> None:
+        raise non_transient
+
+    with pytest.raises(OperationalError):
+        await _retry_transient_mysql(access_denied)
 
 
 async def test_selected_maintenance_health_is_restart_safe_and_content_free(

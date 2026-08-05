@@ -35,6 +35,7 @@ from plugins.life_engine.storage.subject_contracts import (
     SubjectDocumentStorePort,
 )
 from plugins.life_engine.storage.subject_factory import open_subject_document_store
+from plugins.life_engine.storage.subject_schema import ensure_subject_document_schema
 from plugins.life_engine.storage.subject_workspace import (
     SubjectWorkspaceObserver,
     SubjectWorkspaceProjector,
@@ -122,6 +123,17 @@ def _command(
         newline_style="crlf",
         change_context={"observation": True},
     )
+
+
+async def test_active_subject_writer_cannot_relax_database_immutability(
+    tmp_path: Path,
+) -> None:
+    async with _local_store(tmp_path) as (runtime, _, _):
+        with pytest.raises(RuntimeError, match="only for candidate copy"):
+            await ensure_subject_document_schema(
+                runtime,
+                require_database_immutability=False,
+            )
 
 
 async def test_subject_document_preserves_bytes_provenance_and_head_cas(

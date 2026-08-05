@@ -8,9 +8,12 @@ import asyncio
 import hashlib
 import os
 import sys
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, TypeVar
+
+from sqlalchemy.exc import OperationalError
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPOSITORY_ROOT) not in sys.path:
@@ -38,6 +41,8 @@ from src.kernel.storage import (
 )
 
 _LEARNING_SOURCE_PREFIX = PurePosixPath("life_engine_workspace/.life_learning")
+_TRANSIENT_MYSQL_DISCONNECT_CODES = frozenset({2006, 2013})
+_T = TypeVar("_T")
 
 
 def _required_environment(name: str) -> str:
@@ -62,6 +67,31 @@ def _arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _is_transient_mysql_disconnect(exc: OperationalError) -> bool:
+    original = getattr(exc, "orig", None)
+    arguments = getattr(original, "args", ())
+    return bool(arguments) and arguments[0] in _TRANSIENT_MYSQL_DISCONNECT_CODES
+
+
+async def _retry_transient_mysql(
+    operation: Callable[[], Awaitable[_T]],
+    *,
+    attempts: int = 3,
+) -> _T:
+    """Retry an idempotent migration phase after a dropped MySQL connection."""
+
+    if attempts <= 0:
+        raise ValueError("attempts must be positive")
+    for attempt in range(1, attempts + 1):
+        try:
+            return await operation()
+        except OperationalError as exc:
+            if attempt == attempts or not _is_transient_mysql_disconnect(exc):
+                raise
+            await asyncio.sleep(0.25 * attempt)
+    raise AssertionError("unreachable")
+
+
 def _source_workspace(snapshot: Path) -> Path:
     workspace = (snapshot.resolve() / "workspace" / "life_engine_workspace").resolve()
     if not workspace.is_dir():
@@ -76,10 +106,10 @@ def _verify_manifest_learning_files(
     expected: dict[str, tuple[Path, str, int]] = {}
     rows = manifest.get("exact_files", manifest.get("workspace_files", []))
     if not isinstance(rows, list):
-        raise RuntimeError("snapshot exact-file manifest is malformed")
+        raise TypeError("snapshot exact-file manifest is malformed")
     for row in rows:
         if not isinstance(row, dict):
-            raise RuntimeError("snapshot exact-file entry is malformed")
+            raise TypeError("snapshot exact-file entry is malformed")
         source_relative = PurePosixPath(str(row.get("source_relative", "")))
         if _LEARNING_SOURCE_PREFIX not in source_relative.parents:
             continue
@@ -123,6 +153,10 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     source_workspace = _source_workspace(snapshot)
     manifest_file_hashes = _verify_manifest_learning_files(snapshot, manifest)
     _, subject_revision = read_subject_authority_sources(source_workspace)
+    writer_frozen = bool(manifest.get("writer_frozen"))
+    database_immutability = (
+        "trigger-enforced" if writer_frozen else "application-enforced-shadow"
+    )
     config = MySQLStorageConfig(
         host=_required_environment("ELYSIUM_LIFE_STORAGE_MYSQL_HOST"),
         port=int(_required_environment("ELYSIUM_LIFE_STORAGE_MYSQL_PORT")),
@@ -146,13 +180,13 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             run_id=str(args.run_id),
             source_manifest_sha256=str(manifest["manifest_sha256"]),
             source_snapshot_sha256=str(manifest["source_snapshot_sha256"]),
-            writer_frozen=bool(manifest.get("writer_frozen")),
+            writer_frozen=writer_frozen,
             metadata={
                 "domain": "life_learning",
                 "selection_contract": "append-only-events-rebuildable-projections-v1",
                 "subject_revision": subject_revision,
                 "exact_legacy_bytes": "bounded-immutable-chunks-v1",
-                "database_immutability": "trigger-enforced",
+                "database_immutability": database_immutability,
             },
         )
         token = await registry.acquire(
@@ -166,27 +200,41 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             token,
             backend_identity=config.safe_identity,
         )
-        stores = await open_learning_stores(runtime, initialize_schema=True)
+        stores = await open_learning_stores(
+            runtime,
+            initialize_schema=True,
+            require_database_immutability=writer_frozen,
+        )
         if args.schema_only:
             verification = {
                 "verified": False,
                 "schema_only": True,
                 "generation_eligible": False,
-                "database_immutability": "trigger-enforced",
+                "database_immutability": database_immutability,
             }
             final_run = await registry.complete(token, verification=verification)
             return {"run": final_run, "verification": verification}
 
-        imported = await import_legacy_learning_snapshot(
-            source_workspace,
-            stores.store,
-            subject_revision=subject_revision,
+        imported = await _retry_transient_mysql(
+            lambda: import_legacy_learning_snapshot(
+                source_workspace,
+                stores.store,
+                subject_revision=subject_revision,
+            )
+        )
+        await registry.set_progress(
+            token,
+            copied_records=(
+                int(imported.event_count) + len(imported.projection_revisions)
+            ),
         )
         if imported.file_hashes != manifest_file_hashes:
             raise RuntimeError("imported Learning source differs from snapshot manifest")
-        import_verification = await verify_legacy_learning_import(
-            source_workspace,
-            stores.store,
+        import_verification = await _retry_transient_mysql(
+            lambda: verify_legacy_learning_import(
+                source_workspace,
+                stores.store,
+            )
         )
         reverse_report = None
         reverse_verification: dict[str, Any] = {}
@@ -210,9 +258,9 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             "reverse_export": asdict(reverse_report) if reverse_report else {},
             "reverse_verification": reverse_verification,
             "health": health,
-            "writer_frozen": bool(manifest.get("writer_frozen")),
+            "writer_frozen": writer_frozen,
             "generation_eligible": False,
-            "database_immutability": "trigger-enforced",
+            "database_immutability": database_immutability,
         }
         final_run = await registry.complete(token, verification=verification)
         return {"run": final_run, "verification": verification}

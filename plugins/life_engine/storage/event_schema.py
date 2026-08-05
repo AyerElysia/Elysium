@@ -4,9 +4,14 @@ from __future__ import annotations
 
 from sqlalchemy import text
 
-from src.kernel.storage.migration_runner import MySQLMigrationRunner, SchemaMigration
+from src.kernel.storage.migration_runner import (
+    MySQLMigrationRunner,
+    MySQLTriggerContract,
+    SchemaMigration,
+    verify_mysql_trigger_contract,
+)
 
-from .contracts import StorageBackendRuntime
+from .contracts import StorageBackendRuntime, StorageWriterRole
 from .models import BackendKind
 
 EVENT_SCHEMA_VERSION = 2
@@ -162,6 +167,37 @@ _MYSQL_IMMUTABILITY_MIGRATION = SchemaMigration(
     ),
 )
 
+_MYSQL_IMMUTABILITY_TRIGGERS = (
+    MySQLTriggerContract(
+        "raw_life_events_immutable_update_v2",
+        "raw_life_events",
+        "UPDATE",
+        "BEFORE",
+        "RawLifeEventImmutable",
+    ),
+    MySQLTriggerContract(
+        "raw_life_events_immutable_delete_v2",
+        "raw_life_events",
+        "DELETE",
+        "BEFORE",
+        "RawLifeEventImmutable",
+    ),
+    MySQLTriggerContract(
+        "raw_event_export_no_delete",
+        "raw_event_export_outbox",
+        "DELETE",
+        "BEFORE",
+        "RawEventExportDeleteForbidden",
+    ),
+    MySQLTriggerContract(
+        "raw_event_export_payload_immutable",
+        "raw_event_export_outbox",
+        "UPDATE",
+        "BEFORE",
+        "RawEventExportPayloadImmutable",
+    ),
+)
+
 
 async def ensure_life_event_schema(
     runtime: StorageBackendRuntime,
@@ -172,6 +208,13 @@ async def ensure_life_event_schema(
 
     if not runtime.enabled or runtime.engine is None:
         raise RuntimeError("Life Event schema requires an enabled storage runtime")
+    if (
+        not require_database_immutability
+        and runtime.writer_role != StorageWriterRole.CANDIDATE_COPY
+    ):
+        raise RuntimeError(
+            "Life Event database immutability may be relaxed only for candidate copy"
+        )
     if runtime.backend == BackendKind.MYSQL:
         await runtime.validate_writer()
         runner = MySQLMigrationRunner(
@@ -187,6 +230,10 @@ async def ensure_life_event_schema(
                 lock_name="elysium:life-event-immutability-schema",
             )
             await immutability_runner.apply((_MYSQL_IMMUTABILITY_MIGRATION,))
+            await verify_mysql_trigger_contract(
+                runtime.engine,
+                _MYSQL_IMMUTABILITY_TRIGGERS,
+            )
         await runtime.validate_writer()
     else:
         async with runtime.unit_of_work() as uow:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
+from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -18,6 +19,29 @@ class MigrationDriftError(RuntimeError):
 
 class MigrationLockError(RuntimeError):
     """Raised when the schema migration advisory lock cannot be acquired."""
+
+
+@dataclass(frozen=True, slots=True)
+class MySQLTriggerContract:
+    """Expected identity and bounded behavior marker for one MySQL trigger."""
+
+    name: str
+    table: str
+    manipulation: str
+    timing: str
+    action_fragment: str
+
+    def __post_init__(self) -> None:
+        if not _IDENTIFIER.fullmatch(self.name):
+            raise ValueError(f"unsafe trigger name: {self.name!r}")
+        if not _IDENTIFIER.fullmatch(self.table):
+            raise ValueError(f"unsafe trigger table: {self.table!r}")
+        if self.manipulation.upper() not in {"INSERT", "UPDATE", "DELETE"}:
+            raise ValueError("unsupported trigger manipulation")
+        if self.timing.upper() not in {"BEFORE", "AFTER"}:
+            raise ValueError("unsupported trigger timing")
+        if not self.action_fragment:
+            raise ValueError("trigger action_fragment must not be empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,10 +229,62 @@ class MySQLMigrationRunner:
         )
 
 
+async def verify_mysql_trigger_contract(
+    engine: AsyncEngine,
+    contracts: tuple[MySQLTriggerContract, ...],
+) -> None:
+    """Fail closed if required database-level trigger protection drifted."""
+
+    if not contracts:
+        raise ValueError("at least one trigger contract is required")
+    expected = {item.name: item for item in contracts}
+    if len(expected) != len(contracts):
+        raise ValueError("trigger contract names must be unique")
+    async with engine.connect() as connection:
+        rows = (
+            await connection.execute(
+                text(
+                    """SELECT TRIGGER_NAME, EVENT_OBJECT_TABLE,
+                        EVENT_MANIPULATION, ACTION_TIMING, ACTION_STATEMENT
+                    FROM information_schema.TRIGGERS
+                    WHERE TRIGGER_SCHEMA = DATABASE()"""
+                )
+            )
+        ).mappings()
+        observed: dict[str, dict[str, Any]] = {
+            str(row["TRIGGER_NAME"]): dict(row)
+            for row in rows
+            if str(row["TRIGGER_NAME"]) in expected
+        }
+    drifted: list[str] = []
+    for name, contract in expected.items():
+        row = observed.get(name)
+        if row is None:
+            drifted.append(name)
+            continue
+        action = str(row.get("ACTION_STATEMENT") or "")
+        if (
+            str(row.get("EVENT_OBJECT_TABLE") or "") != contract.table
+            or str(row.get("EVENT_MANIPULATION") or "").upper()
+            != contract.manipulation.upper()
+            or str(row.get("ACTION_TIMING") or "").upper()
+            != contract.timing.upper()
+            or contract.action_fragment not in action
+        ):
+            drifted.append(name)
+    if drifted:
+        raise MigrationDriftError(
+            "required MySQL trigger contract is missing or drifted: "
+            + ", ".join(sorted(drifted))
+        )
+
+
 __all__ = [
     "MigrationDriftError",
     "MigrationLockError",
     "MigrationResult",
     "MySQLMigrationRunner",
+    "MySQLTriggerContract",
     "SchemaMigration",
+    "verify_mysql_trigger_contract",
 ]
