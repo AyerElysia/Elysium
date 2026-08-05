@@ -17,7 +17,9 @@ from src.kernel.llm.roles import ROLE
 from src.kernel.logger import get_logger
 
 from .domain import (
+    ChatterRuntimeCheckpoint,
     DirectorDecision,
+    PerceptionCommitCheckpoint,
     PerformancePlan,
     PlatformEvent,
     WorldPerceptionCheckpoint,
@@ -100,6 +102,7 @@ class LifeChatterDeliberator:
         self._stream: Any = None
         self._context_high_water = 0
         self._perception_checkpoint: WorldPerceptionCheckpoint | None = None
+        self._runtime_checkpoint: ChatterRuntimeCheckpoint | None = None
 
     @property
     def actor(self) -> str:
@@ -160,37 +163,32 @@ class LifeChatterDeliberator:
 
     @property
     def perception_checkpoint(self) -> WorldPerceptionCheckpoint | None:
-        """Return the world delivery accepted by the last model response."""
+        """Return a legacy checkpoint only when replaying an old decision."""
 
         return self._perception_checkpoint
+
+    @property
+    def runtime_checkpoint(self) -> ChatterRuntimeCheckpoint | None:
+        """Return the exact content-free suffix accepted by the last response."""
+
+        return self._runtime_checkpoint
 
     async def commit_context(
         self,
         high_water: int,
         world_perception: WorldPerceptionCheckpoint | None = None,
+        chatter_runtime: ChatterRuntimeCheckpoint | None = None,
     ) -> None:
         """Commit both context frontiers only after the decision is durable."""
 
-        chatter, stream = self._resolve()
-        service_getter = getattr(chatter, "_get_life_service", None)
-        service = service_getter() if callable(service_getter) else None
-        if high_water > 0:
-            marker = getattr(service, "mark_chatter_runtime_context_seen", None)
-            if service is None or not callable(marker):
-                raise DirectorUnavailableError(
-                    "LifeEngine cannot commit livestream context"
-                )
-            await marker(
-                stream.stream_id,
-                high_water,
-                unified_chatter_context=True,
+        if chatter_runtime is not None:
+            await self._consciousness.commit_chatter_runtime_checkpoint(
+                chatter_runtime,
             )
-            save = getattr(service, "_save_runtime_context", None)
-            if callable(save):
-                await save()
-        if world_perception is not None:
-            await self._consciousness.commit_perception_checkpoint(
-                world_perception,
+            return
+        if high_water > 0 or world_perception is not None:
+            raise DirectorUnavailableError(
+                "legacy livestream context lacks exact durable delivery proof"
             )
 
     async def deliberate(
@@ -221,17 +219,12 @@ class LifeChatterDeliberator:
         unread_lines = "\n".join(event.display_text for event in events)
         self._context_high_water = 0
         self._perception_checkpoint = None
-        prepared = await self._consciousness.prepare_perception()
-        world_context = (
-            "<transient_world_perception>\n"
-            f"{prepared.content}\n"
-            "</transient_world_perception>"
-        )
+        self._runtime_checkpoint = None
         packet = await chatter.build_live_bridge_prompt(
             stream,
             service,
             unread_lines=unread_lines,
-            runtime_context_text=world_context,
+            runtime_context_text="",
             include_history_in_prompt=True,
             include_recent_chat_history=True,
             history_message_limit=self.history_message_limit,
@@ -265,21 +258,126 @@ class LifeChatterDeliberator:
         if dynamic_context:
             request.add_payload(LLMPayload(ROLE.SYSTEM, Text(dynamic_context)))
 
+        get_delivery = getattr(service, "get_pending_chatter_runtime_delivery", None)
+        if not callable(get_delivery):
+            raise DirectorUnavailableError(
+                "LifeEngine cannot expose exact livestream context delivery"
+            )
+        pending_delivery = get_delivery(
+            stream.stream_id,
+            unified_chatter_context=True,
+        )
+        if pending_delivery is None:
+            raise DirectorUnavailableError(
+                "LifeEngine produced no pending livestream context delivery"
+            )
+        delivery_id = str(getattr(pending_delivery, "delivery_id", "") or "")
+        delivery_marker = str(
+            getattr(pending_delivery, "delivery_marker", "") or ""
+        )
+        register_delivery = getattr(request, "register_context_delivery", None)
+        if (
+            not dynamic_context
+            or not delivery_id
+            or not delivery_marker
+            or delivery_marker not in dynamic_context
+            or not callable(register_delivery)
+        ):
+            raise DirectorUnavailableError(
+                "livestream request cannot prove the complete dynamic context"
+            )
+        register_delivery(
+            delivery_id,
+            dynamic_context,
+            marker=delivery_marker,
+        )
+        expected_bytes = len(dynamic_context.encode("utf-8"))
+        expected_sha256 = hashlib.sha256(
+            dynamic_context.encode("utf-8")
+        ).hexdigest()
+        create_checkpoint = getattr(
+            service,
+            "create_chatter_runtime_commit_checkpoint",
+            None,
+        )
+        if not callable(create_checkpoint):
+            raise DirectorUnavailableError(
+                "LifeEngine cannot create a durable livestream context checkpoint"
+            )
+        service_checkpoint = create_checkpoint(
+            stream.stream_id,
+            delivery_id=delivery_id,
+            effective_suffix_sha256=expected_sha256,
+            effective_suffix_bytes=expected_bytes,
+            unified_chatter_context=True,
+        )
+
+        async def send_and_collect() -> Any:
+            response = await request.send(stream=False)
+            await response
+            return response
+
         response = await asyncio.wait_for(
-            request.send(stream=False),
+            send_and_collect(),
             timeout=self.timeout_seconds,
         )
-        response_text = response.message or await response
+        response_text = response.message
         plan = self.parse_plan(str(response_text or ""), events)
-        self._context_high_water = max(
+        lookup_receipt = getattr(response, "effective_context_receipt", None)
+        effective = (
+            lookup_receipt(delivery_id) if callable(lookup_receipt) else None
+        )
+        if (
+            effective is None
+            or not bool(getattr(effective, "exact_present", False))
+            or getattr(effective, "expected_utf8_bytes", None) != expected_bytes
+            or getattr(effective, "effective_utf8_bytes", None) != expected_bytes
+            or getattr(effective, "expected_sha256", None) != expected_sha256
+            or getattr(effective, "effective_sha256", None) != expected_sha256
+        ):
+            raise DirectorProtocolError(
+                "livestream dynamic context was absent, duplicated, or trimmed "
+                "from the final model attempt"
+            )
+        perception = service_checkpoint.perception
+        packet_high_water = max(
             0,
             int(packet.get("life_context_high_water", 0) or 0),
         )
-        self._perception_checkpoint = WorldPerceptionCheckpoint(
-            instance_id=str(prepared.instance_id),
-            from_position=int(prepared.from_position),
-            through_position=int(prepared.through_position),
-            cursor_revision=int(prepared.cursor_revision),
+        if packet_high_water != int(service_checkpoint.event_through_sequence):
+            raise DirectorUnavailableError(
+                "livestream context frontier diverged from its durable checkpoint"
+            )
+        self._context_high_water = packet_high_water
+        self._runtime_checkpoint = ChatterRuntimeCheckpoint(
+            schema_version="livestream.chatter-runtime.v1",
+            cursor_key=str(service_checkpoint.cursor_key),
+            delivery_id=str(service_checkpoint.delivery_id),
+            effective_suffix_sha256=str(
+                service_checkpoint.effective_suffix_sha256
+            ),
+            effective_suffix_bytes=int(
+                service_checkpoint.effective_suffix_bytes
+            ),
+            event_through_sequence=int(
+                service_checkpoint.event_through_sequence
+            ),
+            thought_through_revision=int(
+                service_checkpoint.thought_through_revision
+            ),
+            perception=PerceptionCommitCheckpoint(
+                instance_id=str(perception.instance_id),
+                from_position=int(perception.from_position),
+                through_position=int(perception.through_position),
+                cursor_revision=int(perception.cursor_revision),
+                delivery_id=str(perception.delivery_id),
+                projection_sha256=str(perception.projection_sha256),
+                delivered_bytes=int(perception.delivered_bytes),
+            ),
+            exact=True,
+            transport_request_id=str(
+                getattr(response, "request_record_id", "") or ""
+            ),
         )
         return plan
 
@@ -383,6 +481,11 @@ class LivestreamDirector:
                     "perception_checkpoint",
                     None,
                 ),
+                chatter_runtime=getattr(
+                    self.deliberator,
+                    "runtime_checkpoint",
+                    None,
+                ),
                 plan=plan,
             )
             await self.ledger.append(
@@ -419,10 +522,12 @@ class LivestreamDirector:
         if callable(context_committer) and (
             decision.life_context_high_water > 0
             or decision.world_perception is not None
+            or decision.chatter_runtime is not None
         ):
             await context_committer(
                 decision.life_context_high_water,
                 decision.world_perception,
+                decision.chatter_runtime,
             )
 
         await self.ledger.commit_cursor(

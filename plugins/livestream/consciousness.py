@@ -5,9 +5,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from .domain import WorldPerceptionCheckpoint
+from .domain import ChatterRuntimeCheckpoint, WorldPerceptionCheckpoint
 from .life_binding import (
+    ChatterRuntimeCommitCheckpoint,
+    ChatterRuntimeDeliveryReceipt,
     ConsciousnessInstance,
+    PerceptionCommitCheckpoint,
     PerceptionFilter,
     PreparedPerception,
     get_running_life_service,
@@ -185,28 +188,53 @@ class LivestreamConsciousnessManager:
         self,
         checkpoint: WorldPerceptionCheckpoint,
     ) -> tuple[int, int]:
-        """Idempotently confirm a durable director decision's world delivery."""
+        """Reject legacy checkpoints that contain no exact-delivery proof."""
 
         if checkpoint.instance_id != self.instance_id:
             raise RuntimeError("world perception checkpoint belongs to another instance")
-        service = self.life_service()
-        current = await service.prepare_perception(self.instance_id)
-        if current.from_position >= checkpoint.through_position:
-            return current.from_position, current.cursor_revision
-        if current.from_position != checkpoint.from_position:
-            raise RuntimeError(
-                "world perception cursor diverged before durable acknowledgement"
-            )
-        prepared = PreparedPerception(
-            instance_id=checkpoint.instance_id,
-            from_position=checkpoint.from_position,
-            through_position=checkpoint.through_position,
-            cursor_revision=checkpoint.cursor_revision,
-            content="",
-            assertion_ids=(),
-            change_positions=(),
+        raise RuntimeError(
+            "legacy world perception checkpoint has no exact delivery receipt"
         )
-        return await service.commit_perception(prepared)
+
+    async def commit_chatter_runtime_checkpoint(
+        self,
+        checkpoint: ChatterRuntimeCheckpoint,
+    ) -> Any:
+        """Replay one exact content-free live suffix after decision durability."""
+
+        perception = checkpoint.perception
+        if perception.instance_id != self.instance_id:
+            raise RuntimeError(
+                "chatter runtime checkpoint belongs to another consciousness instance"
+            )
+        service_checkpoint = ChatterRuntimeCommitCheckpoint(
+            cursor_key=checkpoint.cursor_key,
+            delivery_id=checkpoint.delivery_id,
+            effective_suffix_sha256=checkpoint.effective_suffix_sha256,
+            effective_suffix_bytes=checkpoint.effective_suffix_bytes,
+            event_through_sequence=checkpoint.event_through_sequence,
+            thought_through_revision=checkpoint.thought_through_revision,
+            perception=PerceptionCommitCheckpoint(
+                instance_id=perception.instance_id,
+                from_position=perception.from_position,
+                through_position=perception.through_position,
+                cursor_revision=perception.cursor_revision,
+                delivery_id=perception.delivery_id,
+                projection_sha256=perception.projection_sha256,
+                delivered_bytes=perception.delivered_bytes,
+            ),
+        )
+        receipt = ChatterRuntimeDeliveryReceipt(
+            delivery_id=checkpoint.delivery_id,
+            effective_suffix_sha256=checkpoint.effective_suffix_sha256,
+            effective_suffix_bytes=checkpoint.effective_suffix_bytes,
+            exact=checkpoint.exact,
+            transport_request_id=checkpoint.transport_request_id,
+        )
+        return await self.life_service().commit_chatter_runtime_delivery(
+            service_checkpoint,
+            receipt,
+        )
 
     async def suspend(self, *, reason: str = "manual stop") -> None:
         """Append the closing observation and release the room stream claim."""

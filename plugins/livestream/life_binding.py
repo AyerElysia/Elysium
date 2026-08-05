@@ -43,14 +43,29 @@ ConsciousnessInstance = life_attr("service.consciousness", "ConsciousnessInstanc
 PerceptionFilter = life_attr("service.world_state", "PerceptionFilter")
 SceneState = life_attr("service.world_state", "SceneState")
 PreparedPerception = life_attr("service.perception_gateway", "PreparedPerception")
+PerceptionCommitCheckpoint = life_attr(
+    "service.perception_gateway",
+    "PerceptionCommitCheckpoint",
+)
+ChatterRuntimeCommitCheckpoint = life_attr(
+    "service.core",
+    "ChatterRuntimeCommitCheckpoint",
+)
+ChatterRuntimeDeliveryReceipt = life_attr(
+    "service.core",
+    "ChatterRuntimeDeliveryReceipt",
+)
 LifeEngineEvent = life_attr("service.event_builder", "LifeEngineEvent")
 LifeEventType = life_attr("service.event_builder", "EventType")
 
 
 __all__ = [
+    "ChatterRuntimeCommitCheckpoint",
+    "ChatterRuntimeDeliveryReceipt",
     "ConsciousnessInstance",
     "LifeEngineEvent",
     "LifeEventType",
+    "PerceptionCommitCheckpoint",
     "PerceptionFilter",
     "PreparedPerception",
     "SceneState",

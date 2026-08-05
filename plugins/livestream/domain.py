@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -99,7 +99,12 @@ class PerformancePlan(BaseModel):
 
 
 class WorldPerceptionCheckpoint(BaseModel):
-    """Replayable cursor window delivered to one consciousness instance."""
+    """Legacy cursor window lacking exact-delivery proof.
+
+    Existing ledger records remain readable, but new director decisions use
+    :class:`ChatterRuntimeCheckpoint`.  A legacy checkpoint must never advance
+    World because it cannot prove which effective model attempt saw its text.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -115,6 +120,43 @@ class WorldPerceptionCheckpoint(BaseModel):
         return self
 
 
+class PerceptionCommitCheckpoint(BaseModel):
+    """Content-free World cursor identity persisted with a director decision."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    instance_id: str = Field(min_length=1)
+    from_position: int = Field(ge=0)
+    through_position: int = Field(ge=0)
+    cursor_revision: int = Field(ge=0)
+    delivery_id: str = Field(min_length=1)
+    projection_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    delivered_bytes: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def validate_window(self) -> PerceptionCommitCheckpoint:
+        if self.through_position < self.from_position:
+            raise ValueError("perception commit window moves backwards")
+        return self
+
+
+class ChatterRuntimeCheckpoint(BaseModel):
+    """Exact, content-free replay identity for one complete live suffix."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["livestream.chatter-runtime.v1"]
+    cursor_key: str = Field(min_length=1)
+    delivery_id: str = Field(min_length=1)
+    effective_suffix_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    effective_suffix_bytes: int = Field(gt=0, le=64 * 1024)
+    event_through_sequence: int = Field(ge=0)
+    thought_through_revision: int = Field(ge=0)
+    perception: PerceptionCommitCheckpoint
+    exact: Literal[True]
+    transport_request_id: str = ""
+
+
 class DirectorDecision(BaseModel):
     """Auditable decision made by the livestream consciousness."""
 
@@ -128,6 +170,7 @@ class DirectorDecision(BaseModel):
     source_record_sequences: list[int]
     life_context_high_water: int = Field(default=0, ge=0)
     world_perception: WorldPerceptionCheckpoint | None = None
+    chatter_runtime: ChatterRuntimeCheckpoint | None = None
     plan: PerformancePlan
 
 

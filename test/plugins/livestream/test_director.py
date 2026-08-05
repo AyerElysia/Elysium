@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -171,25 +173,88 @@ class _FakeLifeService:
         self.mark_calls = 0
         self.saved = 0
 
-    async def mark_chatter_runtime_context_seen(
+    def get_pending_chatter_runtime_delivery(
         self,
         stream_id: str,
-        sequence: int,
         *,
         unified_chatter_context: bool,
-    ) -> None:
+    ):
+        assert stream_id == "livestream:bilibili:42"
+        assert unified_chatter_context is True
+        return SimpleNamespace(
+            delivery_id="suffix-delivery-1",
+            delivery_marker="life-chatter-runtime:suffix-delivery-1",
+        )
+
+    def create_chatter_runtime_commit_checkpoint(
+        self,
+        stream_id: str,
+        *,
+        delivery_id: str,
+        effective_suffix_sha256: str,
+        effective_suffix_bytes: int,
+        unified_chatter_context: bool,
+    ):
+        assert stream_id == "livestream:bilibili:42"
+        assert delivery_id == "suffix-delivery-1"
+        assert unified_chatter_context is True
+        return SimpleNamespace(
+            cursor_key="__life_chatter_global__",
+            delivery_id=delivery_id,
+            effective_suffix_sha256=effective_suffix_sha256,
+            effective_suffix_bytes=effective_suffix_bytes,
+            event_through_sequence=73,
+            thought_through_revision=9,
+            perception=SimpleNamespace(
+                instance_id="livestream_42",
+                from_position=11,
+                through_position=17,
+                cursor_revision=3,
+                delivery_id="world-delivery-1",
+                projection_sha256="a" * 64,
+                delivered_bytes=321,
+            ),
+        )
+
+    async def commit_runtime(self) -> None:
         self.mark_calls += 1
         decision = await self.ledger.get_latest_record("director.decision")
         assert decision is not None, "context advanced before decision was durable"
         assert decision.session_id == "session-1"
-        assert stream_id == "livestream:bilibili:42"
-        assert sequence == 73
-        assert unified_chatter_context is True
         if self.mark_calls == 1:
             raise OSError("injected LifeEngine cursor failure")
-
-    async def _save_runtime_context(self) -> None:
         self.saved += 1
+
+
+class _FakeResponse:
+    def __init__(self, request: _FakeRequest) -> None:
+        self._request = request
+        self.message = (
+            '{"should_speak":false,"reason":"I choose to listen.",'
+            '"addressed_event_ids":["event-0"]}'
+        )
+        self.request_record_id = 91
+
+    def __await__(self):
+        async def consume():
+            return self.message
+
+        return consume().__await__()
+
+    def effective_context_receipt(self, delivery_id: str):
+        expected = self._request.deliveries.get(delivery_id)
+        if expected is None:
+            return None
+        text, _marker = expected
+        encoded = text.encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        return SimpleNamespace(
+            exact_present=True,
+            expected_utf8_bytes=len(encoded),
+            expected_sha256=digest,
+            effective_utf8_bytes=len(encoded),
+            effective_sha256=digest,
+        )
 
 
 class _FakeRequest:
@@ -197,19 +262,25 @@ class _FakeRequest:
         self.trajectory_metadata: dict = {}
         self.payloads: list = []
         self.send_calls = 0
+        self.deliveries: dict[str, tuple[str, str]] = {}
 
     def add_payload(self, payload) -> None:
         self.payloads.append(payload)
 
+    def register_context_delivery(
+        self,
+        delivery_id: str,
+        text: str,
+        *,
+        marker: str,
+    ) -> None:
+        assert marker in text
+        self.deliveries[delivery_id] = (text, marker)
+
     async def send(self, *, stream: bool):
         assert stream is False
         self.send_calls += 1
-        return SimpleNamespace(
-            message=(
-                '{"should_speak":false,"reason":"I choose to listen.",'
-                '"addressed_event_ids":["event-0"]}'
-            )
-        )
+        return _FakeResponse(self)
 
 
 class _FakeChatter:
@@ -227,10 +298,16 @@ class _FakeChatter:
     async def build_live_bridge_prompt(self, _stream, _service, **kwargs):
         self.commit_cursors = kwargs["commit_cursors"]
         self.runtime_context_text = kwargs["runtime_context_text"]
+        dynamic_context = (
+            '<life_runtime_context><life_chatter_runtime_delivery '
+            'marker="life-chatter-runtime:suffix-delivery-1">'
+            "other-instance-is-present"
+            "</life_chatter_runtime_delivery></life_runtime_context>"
+        )
         return {
             "system_prompt": "same subject",
             "user_prompt": "live room",
-            "dynamic_context": "life context",
+            "dynamic_context": dynamic_context,
             "life_context_high_water": 73,
         }
 
@@ -242,28 +319,20 @@ class _FakeChatter:
 class _FakeConsciousness:
     is_active = True
 
-    def __init__(self) -> None:
+    def __init__(self, service: _FakeLifeService) -> None:
+        self.service = service
         self.commits = []
 
-    async def prepare_perception(self):
-        return SimpleNamespace(
-            instance_id="livestream_42",
-            from_position=11,
-            through_position=17,
-            cursor_revision=3,
-            content="other-instance-is-present",
-        )
-
-    async def commit_perception_checkpoint(self, checkpoint):
+    async def commit_chatter_runtime_checkpoint(self, checkpoint):
         self.commits.append(checkpoint)
-        return checkpoint.through_position, checkpoint.cursor_revision + 1
+        await self.service.commit_runtime()
 
 
 async def test_life_context_cursor_replays_after_durable_decision(tmp_path) -> None:
     ledger = await _ledger_with_events(tmp_path, count=1)
     service = _FakeLifeService(ledger)
     chatter = _FakeChatter(service)
-    consciousness = _FakeConsciousness()
+    consciousness = _FakeConsciousness(service)
     deliberator = LifeChatterDeliberator(
         room_id="42",
         consciousness=consciousness,
@@ -277,12 +346,20 @@ async def test_life_context_cursor_replays_after_durable_decision(tmp_path) -> N
     durable = await ledger.get_latest_record("director.decision")
     assert durable is not None
     assert durable.payload["life_context_high_water"] == 73
-    assert durable.payload["world_perception"] == {
+    assert durable.payload["world_perception"] is None
+    assert durable.payload["chatter_runtime"]["delivery_id"] == (
+        "suffix-delivery-1"
+    )
+    assert durable.payload["chatter_runtime"]["perception"] == {
         "instance_id": "livestream_42",
         "from_position": 11,
         "through_position": 17,
         "cursor_revision": 3,
+        "delivery_id": "world-delivery-1",
+        "projection_sha256": "a" * 64,
+        "delivered_bytes": 321,
     }
+    assert "other-instance-is-present" not in json.dumps(durable.payload)
 
     decision = await director.run_once()
     cursor = await ledger.get_cursor("session-1", "livestream.director.v1")
@@ -293,6 +370,8 @@ async def test_life_context_cursor_replays_after_durable_decision(tmp_path) -> N
     assert chatter.request.send_calls == 1
     assert service.mark_calls == 2
     assert service.saved == 1
-    assert len(consciousness.commits) == 1
-    assert "other-instance-is-present" in chatter.runtime_context_text
+    assert len(consciousness.commits) == 2
+    assert consciousness.commits[0] == consciousness.commits[1]
+    assert chatter.runtime_context_text == ""
+    assert "suffix-delivery-1" in chatter.request.deliveries
     assert cursor == 1
