@@ -11,16 +11,33 @@
 负载均衡与重试策略由 `kernel.llm.policy` 承担。
 """
 
-from .roles import ROLE
 from .context import LLMContextManager
-from .request import LLMRequest
-from .response import LLMResponse
+from .context_delivery import EffectiveContextReceipt
 from .embedding_request import EmbeddingRequest
 from .embedding_response import EmbeddingResponse
-from .rerank_request import RerankRequest
-from .rerank_response import RerankItem, RerankResponse
-from .types import ModelEntry, ModelSet, RequestType
-
+from .exceptions import (
+	LLMAPIError,
+	LLMAuthenticationError,
+	LLMConfigurationError,
+	LLMContentFilterError,
+	LLMContextError,
+	LLMError,
+	LLMRateLimitError,
+	LLMResponseConsumedError,
+	LLMTimeoutError,
+	LLMTokenLimitError,
+	MediaLimitError,
+	MediaValidationError,
+	UnsupportedModalityError,
+	classify_exception,
+)
+from .monitor import (
+	MetricsCollector,
+	ModelStats,
+	RequestMetrics,
+	RequestTimer,
+	get_global_collector,
+)
 from .payload import (
 	Audio,
 	Content,
@@ -36,36 +53,17 @@ from .payload import (
 	ReasoningText,
 	Text,
 	ToolCall,
-	ToolResult,
 	ToolRegistry,
+	ToolResult,
 	Video,
 	normalize_media_mime_type,
 )
-
-from .monitor import (
-	RequestMetrics,
-	ModelStats,
-	MetricsCollector,
-	RequestTimer,
-	get_global_collector,
-)
-
-from .exceptions import (
-	LLMError,
-	LLMContextError,
-	LLMConfigurationError,
-	MediaLimitError,
-	MediaValidationError,
-	UnsupportedModalityError,
-	LLMResponseConsumedError,
-	LLMRateLimitError,
-	LLMTimeoutError,
-	LLMContentFilterError,
-	LLMTokenLimitError,
-	LLMAuthenticationError,
-	LLMAPIError,
-	classify_exception,
-)
+from .request import LLMRequest
+from .rerank_request import RerankRequest
+from .rerank_response import RerankItem, RerankResponse
+from .response import LLMResponse
+from .roles import ROLE
+from .types import ModelEntry, ModelSet, RequestType
 
 __all__ = [
 	# 核心类
@@ -74,6 +72,7 @@ __all__ = [
 	"EmbeddingRequest",
 	"RerankRequest",
 	"LLMContextManager",
+	"EffectiveContextReceipt",
 	"LLMResponse",
 	"EmbeddingResponse",
 	"RerankResponse",

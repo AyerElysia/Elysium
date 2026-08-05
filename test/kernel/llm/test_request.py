@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -609,6 +610,101 @@ class TestLLMRequestSend:
         await request.send(stream=False)
 
         assert len(capture_client.last_payloads) <= 4
+
+    async def test_send_reports_exact_registered_context_delivery(
+        self, mock_model_set: list[dict[str, Any]]
+    ) -> None:
+        delivery_id = "delivery-exact-1"
+        suffix = f"<delivery>{delivery_id}</delivery>\nCURRENT_STATE"
+        request = LLMRequest(mock_model_set, "test")
+        request.add_payload(LLMPayload(ROLE.USER, Text(suffix)))
+        request.register_context_delivery(delivery_id, suffix, marker="<delivery>")
+        request.clients.openai = MockChatClient()
+
+        response = await request.send(stream=False)
+        receipt = response.effective_context_receipt(delivery_id)
+
+        assert receipt is not None
+        assert receipt.exact_present is True
+        assert receipt.effective_utf8_bytes == len(suffix.encode("utf-8"))
+        assert receipt.effective_sha256 == hashlib.sha256(
+            suffix.encode("utf-8")
+        ).hexdigest()
+        assert suffix not in repr(receipt)
+
+    async def test_send_reports_registered_context_trim_fail_closed(
+        self,
+        mock_model_set: list[dict[str, Any]],
+        monkeypatch,
+    ) -> None:
+        delivery_id = "delivery-trimmed-1"
+        suffix = f"<delivery>{delivery_id}</delivery>\n" + ("x" * 500)
+        mock_model_set[0]["max_context"] = 1000
+        mock_model_set[0]["max_tokens"] = 20
+        mock_model_set[0]["context_tokens"] = 120
+        request = LLMRequest(mock_model_set[:1], "test")
+        request.add_payload(LLMPayload(ROLE.USER, Text(suffix)))
+        request.register_context_delivery(delivery_id, suffix, marker="<delivery>")
+        request.clients.openai = MockChatClient()
+
+        monkeypatch.setattr(
+            "src.kernel.llm.request.count_payload_tokens",
+            lambda payloads, model_identifier: sum(
+                len(part.text)
+                for payload in payloads
+                for part in payload.content
+                if isinstance(part, Text)
+            ),
+        )
+
+        response = await request.send(stream=False)
+        receipt = response.effective_context_receipt(delivery_id)
+
+        assert receipt is not None
+        assert receipt.exact_present is False
+        assert receipt.effective_utf8_bytes is not None
+        assert receipt.effective_utf8_bytes < receipt.expected_utf8_bytes
+        assert receipt.effective_sha256 != receipt.expected_sha256
+
+    async def test_context_receipt_uses_final_successful_retry_attempt(
+        self,
+        mock_model_set: list[dict[str, Any]],
+        monkeypatch,
+    ) -> None:
+        delivery_id = "delivery-final-attempt"
+        suffix = f"<delivery>{delivery_id}</delivery>\n" + ("x" * 500)
+        first = {**mock_model_set[0], "max_retry": 0, "context_tokens": 900}
+        second = {**mock_model_set[1], "max_retry": 0, "context_tokens": 120}
+        first["max_context"] = second["max_context"] = 1000
+        first["max_tokens"] = second["max_tokens"] = 20
+        request = LLMRequest(
+            [first, second],
+            "test",
+            policy=create_policy("load_balanced"),
+        )
+        request.add_payload(LLMPayload(ROLE.USER, Text(suffix)))
+        request.register_context_delivery(delivery_id, suffix, marker="<delivery>")
+        request.clients.openai = MockChatClient(
+            responses=[LLMTimeoutError("first failed"), ("ok", None, None)]
+        )
+        monkeypatch.setattr(
+            "src.kernel.llm.request.count_payload_tokens",
+            lambda payloads, model_identifier: sum(
+                len(part.text)
+                for payload in payloads
+                for part in payload.content
+                if isinstance(part, Text)
+            ),
+        )
+
+        response = await request.send(stream=False)
+        receipt = response.effective_context_receipt(delivery_id)
+
+        assert response.message == "ok"
+        assert receipt is not None
+        assert receipt.exact_present is False
+        assert receipt.effective_utf8_bytes is not None
+        assert receipt.effective_utf8_bytes < receipt.expected_utf8_bytes
 
     async def test_send_success_streaming(
         self, mock_model_set: list[dict[str, Any]]

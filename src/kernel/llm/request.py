@@ -22,6 +22,10 @@ from src.kernel.llm.payload.tooling import LLMUsable
 from src.kernel.logger import get_logger
 
 from .context import LLMContextManager
+from .context_delivery import (
+    ContextDeliveryExpectation,
+    build_effective_context_receipts,
+)
 from .exceptions import (
     LLMAPIError,
     LLMConfigurationError,
@@ -334,6 +338,9 @@ class LLMRequest:
     context_manager: LLMContextManager | None = None
     enable_metrics: bool = True  # 是否启用指标收集
     request_type: RequestType = RequestType.COMPLETIONS
+    _context_delivery_expectations: dict[
+        str, ContextDeliveryExpectation
+    ] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         if self.payloads is None:
@@ -372,6 +379,28 @@ class LLMRequest:
             self.payloads[-1].content.extend(payload.content)
         else:
             self.payloads.append(payload)
+        return self
+
+    def register_context_delivery(
+        self,
+        delivery_id: str,
+        expected_text: str,
+        *,
+        marker: str | None = None,
+    ) -> Self:
+        """Track one exact transient ``Text`` part for the next successful send."""
+
+        expectation = ContextDeliveryExpectation.create(
+            delivery_id,
+            expected_text,
+            marker=marker,
+        )
+        existing = self._context_delivery_expectations.get(expectation.delivery_id)
+        if existing is not None and existing != expectation:
+            raise ValueError(
+                f"context delivery_id already registered: {expectation.delivery_id}"
+            )
+        self._context_delivery_expectations[expectation.delivery_id] = expectation
         return self
 
     def _compute_effective_context_budget(self, model: ModelEntry) -> int | None:
@@ -756,6 +785,10 @@ class LLMRequest:
                     reasoning_parts=reasoning_parts,
                     call_list=[],
                     request_record_id=request_record_id,
+                    effective_context_receipts=build_effective_context_receipts(
+                        self._context_delivery_expectations,
+                        list(trimmed_payloads),
+                    ),
                 )
 
                 # 非流：立即解析 tool_calls
@@ -854,6 +887,7 @@ class LLMRequest:
                     resp._on_complete = _record_success
 
                 session.record_success(latency=timer.elapsed)
+                self._context_delivery_expectations.clear()
                 return resp
 
             except asyncio.CancelledError:

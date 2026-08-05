@@ -15,7 +15,6 @@ from src.kernel.llm.request import LLMRequest
 from src.kernel.llm.response import LLMResponse, _ToolCallAccumulator
 from src.kernel.llm.roles import ROLE
 
-
 # ============================================================================
 # Mock Stream Generators
 # ============================================================================
@@ -131,6 +130,37 @@ class TestLLMResponse:
         assert response.message is None
         assert response._consumed is False
         assert len(response.payloads) == 2
+
+    async def test_chained_send_forwards_context_delivery_expectation_once(
+        self,
+        mock_model_set: list[dict[str, Any]],
+        sample_payloads: list[LLMPayload],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        delivery_id = "delivery-chain-1"
+        suffix = f"<delivery>{delivery_id}</delivery>"
+        response = LLMResponse(
+            _stream=None,
+            _upper=LLMRequest(mock_model_set, "test"),
+            _auto_append_response=False,
+            payloads=[*sample_payloads, LLMPayload(ROLE.USER, Text(suffix))],
+            model_set=mock_model_set,
+            message="previous",
+            call_list=[],
+        )
+        response.register_context_delivery(delivery_id, suffix)
+        captured: dict[str, object] = {}
+        sentinel = object()
+
+        async def fake_send(request: LLMRequest, **_kwargs: object) -> object:
+            captured.update(request._context_delivery_expectations)
+            return sentinel
+
+        monkeypatch.setattr(LLMRequest, "send", fake_send)
+
+        assert await response.send(stream=False) is sentinel
+        assert delivery_id in captured
+        assert response._context_delivery_expectations == {}
 
     def test_response_creation_without_stream(
         self, mock_model_set: list[dict[str, Any]], sample_payloads: list[LLMPayload]

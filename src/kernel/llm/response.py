@@ -13,12 +13,16 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable, Awaitable
-from dataclasses import dataclass
-from typing import Any, AsyncIterator, Self, TYPE_CHECKING
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Self
 
 from json_repair import repair_json
 
+from .context_delivery import (
+    ContextDeliveryExpectation,
+    EffectiveContextReceipt,
+)
 from .exceptions import LLMContextError, LLMResponseConsumedError
 from .model_client import StreamEvent
 from .payload import LLMPayload, ReasoningText, Text, ToolCall
@@ -26,9 +30,9 @@ from .roles import ROLE
 from .tool_call_compat import parse_tool_call_compat_response
 
 if TYPE_CHECKING:
+    from .context import LLMContextManager
     from .request import LLMRequest
     from .types import ModelSet
-    from .context import LLMContextManager
 
 
 @dataclass(slots=True)
@@ -49,7 +53,11 @@ class LLMResponse:
     call_list: list[ToolCall] | None = None
     tool_call_compat: bool = False
     request_record_id: int | None = None
+    effective_context_receipts: dict[str, EffectiveContextReceipt] | None = None
     _on_complete: Callable[["LLMResponse", BaseException | None], None] | None = None
+    _context_delivery_expectations: dict[
+        str, ContextDeliveryExpectation
+    ] | None = field(default=None, repr=False)
 
     _consumed: bool = False
     _appended_to_context: bool = False
@@ -60,6 +68,10 @@ class LLMResponse:
         """确保 message 和 call_list 不为 None，方便后续处理；如果 context_manager 为空且上层存在，则继承上层的 context_manager。"""
         if self.call_list is None:
             self.call_list = []
+        if self.effective_context_receipts is None:
+            self.effective_context_receipts = {}
+        if self._context_delivery_expectations is None:
+            self._context_delivery_expectations = {}
         if self.reasoning_parts is None:
             self.reasoning_parts = []
         elif self.reasoning_content is None:
@@ -70,6 +82,38 @@ class LLMResponse:
             ctx = getattr(self._upper, "context_manager", None)
             if ctx:
                 self.context_manager = ctx
+
+    def register_context_delivery(
+        self,
+        delivery_id: str,
+        expected_text: str,
+        *,
+        marker: str | None = None,
+    ) -> Self:
+        """Track one exact transient ``Text`` part for this response's next send."""
+
+        expectation = ContextDeliveryExpectation.create(
+            delivery_id,
+            expected_text,
+            marker=marker,
+        )
+        assert self._context_delivery_expectations is not None
+        existing = self._context_delivery_expectations.get(expectation.delivery_id)
+        if existing is not None and existing != expectation:
+            raise ValueError(
+                f"context delivery_id already registered: {expectation.delivery_id}"
+            )
+        self._context_delivery_expectations[expectation.delivery_id] = expectation
+        return self
+
+    def effective_context_receipt(
+        self,
+        delivery_id: str,
+    ) -> EffectiveContextReceipt | None:
+        """Return one content-free receipt from the final successful attempt."""
+
+        receipts = self.effective_context_receipts or {}
+        return receipts.get(str(delivery_id or "").strip())
 
     def _notify_complete(self, error: BaseException | None = None) -> None:
         """Notify the request owner once after a stream has been finalized."""
@@ -443,7 +487,15 @@ class LLMResponse:
             context_manager=self.context_manager,
         )
         req.payloads = list(self.payloads)
-        return await req.send(auto_append_response=auto_append_response, stream=stream)
+        pending = dict(self._context_delivery_expectations or {})
+        req._context_delivery_expectations = pending
+        response = await req.send(
+            auto_append_response=auto_append_response,
+            stream=stream,
+        )
+        if self._context_delivery_expectations is not None:
+            self._context_delivery_expectations.clear()
+        return response
 
     async def stream_with_callback(self, on_chunk: Callable[[str], Awaitable[None]]) -> str:
         """流式响应 + 实时回调。
