@@ -12,10 +12,11 @@ import json
 import math
 import threading
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any
 from urllib.parse import urlparse
 
 from src.kernel.logger import get_logger
@@ -107,7 +108,7 @@ _MODEL_FIELDS = frozenset(
         "extra",
     }
 )
-_TASK_FIELDS = frozenset({"models", "tokens", "temp"})
+_TASK_FIELDS = frozenset({"models", "tokens", "temp", "context_tokens"})
 _READY_CLIENT_TYPES = frozenset({"openai", "anthropic"})
 _NON_GENERATIVE_TASKS = frozenset({"voice", "embedding"})
 
@@ -169,6 +170,7 @@ class ModelsConfig:
                     "models": task_routes[name],
                     "tokens": task.get("tokens", _DEFAULTS["tokens"]),
                     "temp": task.get("temp", _DEFAULTS["temp"]),
+                    "context_tokens": task.get("context_tokens"),
                 }
                 for name, task in tasks.items()
             },
@@ -465,6 +467,27 @@ class ModelsConfig:
                 location=f"tasks.{name}.temp",
                 minimum=0.0,
             )
+            context_tokens = task.get("context_tokens")
+            if context_tokens is not None and (
+                isinstance(context_tokens, bool)
+                or not isinstance(context_tokens, int)
+                or context_tokens <= 0
+            ):
+                raise ModelRegistryError(
+                    f"tasks.{name}.context_tokens 必须是正整数"
+                )
+            if context_tokens is not None and name not in _NON_GENERATIVE_TASKS:
+                insufficient_context = [
+                    model_name
+                    for model_name in model_names
+                    if context_tokens + tokens
+                    > int(models[model_name].get("ctx", _DEFAULTS["ctx"]))
+                ]
+                if insufficient_context:
+                    raise ModelRegistryError(
+                        f"tasks.{name}.context_tokens + tokens 超过候选模型 ctx: "
+                        f"{insufficient_context}"
+                    )
 
     @classmethod
     def _freeze_value(cls, value: Any) -> Any:
@@ -498,6 +521,16 @@ class ModelsConfig:
         missing = sorted(set(required_tasks) - set(self._tasks))
         if missing:
             raise ModelRegistryError(f"模型配置缺少必需生产任务: {missing}")
+        missing_context_budgets = sorted(
+            task_name
+            for task_name in set(required_tasks) - set(_NON_GENERATIVE_TASKS)
+            if "context_tokens" not in self._tasks[task_name]
+        )
+        if missing_context_budgets:
+            raise ModelRegistryError(
+                "生产生成任务缺少任务级 context_tokens: "
+                f"{missing_context_budgets}"
+            )
 
     def log_snapshot(self) -> None:
         """Log a complete secret-free task priority manifest once at startup."""
@@ -542,12 +575,16 @@ class ModelsConfig:
         model_names = task.get("models", ())
         max_tokens = int(task.get("tokens", _DEFAULTS["tokens"]))
         temperature = float(task.get("temp", _DEFAULTS["temp"]))
+        context_tokens = task.get("context_tokens")
         model_set: list[dict[str, Any]] = []
         for priority, name in enumerate(model_names):
             entry = self._build_model_entry(
                 str(name),
                 max_tokens,
                 temperature,
+                context_tokens=(
+                    int(context_tokens) if context_tokens is not None else None
+                ),
                 routing_task=resolved,
                 routing_priority=priority,
             )
@@ -598,6 +635,7 @@ class ModelsConfig:
         max_tokens: int,
         temperature: float,
         *,
+        context_tokens: int | None = None,
         routing_task: str | None = None,
         routing_priority: int | None = None,
     ) -> dict[str, Any] | None:
@@ -648,6 +686,8 @@ class ModelsConfig:
                     "routing_snapshot": self._snapshot.digest,
                 }
             )
+            if context_tokens is not None:
+                entry["context_tokens"] = context_tokens
         return entry
 
 
