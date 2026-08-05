@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -22,6 +23,20 @@ class _Session:
     async def get_status(self) -> dict[str, Any]:
         self.calls.append(("status", {}))
         return {"active": False, "readiness": "ready"}
+
+    async def look(self) -> dict[str, Any]:
+        self.calls.append(("look", {}))
+        return {"success": True, "observation": {"sequence": len(self.calls)}}
+
+
+def _bind_turn(tool: LifeEngineMinecraftTool, turn_key: str) -> None:
+    tool._bind_runtime_context(
+        stream_id="feishu.private.mc",
+        message=SimpleNamespace(
+            stream_id="feishu.private.mc",
+            extra={"life_turn_scope": {"turn_key": turn_key}},
+        ),
+    )
 
 
 async def test_tool_consumes_service_owned_session_without_learning_scheduler() -> None:
@@ -71,6 +86,59 @@ async def test_status_query_succeeds_when_body_is_inactive() -> None:
     assert success is True
     assert json.loads(payload) == {"active": False, "readiness": "ready"}
     assert session.calls == [("status", {})]
+
+
+async def test_same_turn_semantic_operation_is_replayed_without_reexecution() -> None:
+    """Late chatter follow-ups must not execute the same embodied operation twice."""
+
+    session = _Session()
+    plugin = SimpleNamespace(service=SimpleNamespace(minecraft_session=session))
+    first_tool = LifeEngineMinecraftTool(plugin=plugin)
+    replay_tool = LifeEngineMinecraftTool(plugin=plugin)
+    _bind_turn(first_tool, "stable-unread-turn")
+    _bind_turn(replay_tool, "stable-unread-turn")
+
+    first = await first_tool.execute(action="look", reason="first wording")
+    replay = await replay_tool.execute(action="look", reason="later wording")
+
+    assert replay == first
+    assert session.calls == [("look", {})]
+
+    next_turn_tool = LifeEngineMinecraftTool(plugin=plugin)
+    _bind_turn(next_turn_tool, "next-unread-turn")
+    await next_turn_tool.execute(action="look")
+    assert session.calls == [("look", {}), ("look", {})]
+
+
+async def test_concurrent_same_turn_operation_shares_one_execution() -> None:
+    """Concurrent duplicate deliveries await one in-flight embodied operation."""
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingSession(_Session):
+        async def look(self) -> dict[str, Any]:
+            self.calls.append(("look", {}))
+            entered.set()
+            await release.wait()
+            return {"success": True, "observation": {"sequence": 7}}
+
+    session = BlockingSession()
+    plugin = SimpleNamespace(service=SimpleNamespace(minecraft_session=session))
+    first_tool = LifeEngineMinecraftTool(plugin=plugin)
+    replay_tool = LifeEngineMinecraftTool(plugin=plugin)
+    _bind_turn(first_tool, "concurrent-unread-turn")
+    _bind_turn(replay_tool, "concurrent-unread-turn")
+
+    first_task = asyncio.create_task(first_tool.execute(action="look"))
+    await entered.wait()
+    replay_task = asyncio.create_task(replay_tool.execute(action="look"))
+    await asyncio.sleep(0)
+    release.set()
+
+    first, replay = await asyncio.gather(first_task, replay_task)
+    assert replay == first
+    assert session.calls == [("look", {})]
 
 
 async def test_tool_use_injects_the_owning_plugin_without_public_plugin_argument(

@@ -55,7 +55,30 @@ data/life_engine_workspace/minecraft/traces/20260804T151244_791715Z.jsonl
 
 0.2.1 的改动仅涉及重放终态转交、令牌原子落盘和首次启动预检；由于用户当前 Minecraft 进程必须保持不动，最终 JAR 没有覆盖正在加载的 0.2.0，也没有冒充完成 0.2.1 实机验证。
 
-## 5. 运行边界与剩余现场门
+## 5. 2026-08-05 现场复验
+
+用户结束旧游戏、部署 Bridge 0.2.1 并手动重启 Elysium 后，正式 `nucleus_minecraft` 现场门已经完成。运行中的 Elysium 基线为 `d9612a30`，包含正式工具绑定修复 `f3b577e2` 与 Minecraft 活动恢复过期 Presence 的修复。预检确认：
+
+- 世界为 `Elysian Realm`，quick-play 已配置；
+- Bridge 为 0.2.1，JAR SHA-256 为 `F6B80E166F8C3EDA683020C8154D817DA3098873AE9ECDF6161F05C8FF8A50DC`；
+- Baritone 为 `baritone-unoptimized-neoforge-1.11.2.jar`，SHA-256 为 `B413CE0A2754A3C8484AAE39875CF84BE1F999DEE208E86D41B3D0D329D5CA35`；
+- 既有 Minecraft 进程 PID 54304 与单人世界窗口可用，Elysium 没有替用户启动、停止或重启游戏进程。
+
+第一条正式动作闭环使用 session `20260804T235301_830037Z`：`preflight → start → look → do → look → stop`。动作前观察 `observation_6c20f9f1-1c3d-4be9-8f9e-ea8655086ac3` 位于 `(471.6946, 71, 454.2550)`、yaw `180.9021`；命令 `command_19294465f57b4912994110c4c3d2a448` 收到完成回执 `receipt_6b268093-7d9c-4fab-a958-4aa9ea2a3489`；动作后观察 `observation_56a7efe0-2857-4478-9150-c3ba730bced1` 位置不变、yaw `185.9021`，精确向右转 `5°`，移动、跳跃、攻击与使用物品均未触发，全部控制键为 false。trace 共 7 条记录并通过 `EmbodimentTrace.verify()`，尾哈希为 `e541ef950df0bb67e157eacff4fde6b1967ac664c16e0aa7fb5cb3acf8912203`。随后相隔数分钟出现的玩家移动不属于该命令：受控命令的即时终态观察已经证明位置不变。
+
+Presence 专项复验使用 session `20260805T003635_838383Z`、意识实例 `minecraft_20260805T003635_838383Z` 与游戏实例 `minecraft_335fb687-ecd9-484c-a83f-7c6c17928379`：
+
+1. 08:38:26 注册为 active，revision 1，租约 300 秒；
+2. 08:44:08 由正式 heartbeat 按数据库时间转为 suspended，事件 `consciousness.instance_lease_expired`，revision 2；
+3. 08:49:23 在不重新 start 的情况下正式调用一次 `look`，得到 `observation_b0fd03e0-78ad-46f0-b4d7-f8e1b82b2243`、sequence 7675、`world_loaded=true`、全部控制键 false；同一实例持久化产生 `consciousness.instance_resumed`，reason `minecraft_look`，revision 3，新租约延至 08:54:23；
+4. 08:54:26 正式 `stop` 成功，返回 `game_left_running=true`、`errors=[]`、`cleanup_pending=false`，Presence 以 `minecraft_session_ended` 终止为 revision 5；18765 监听释放，而 Java PID 54304、世界与窗口继续运行并保持可响应；
+5. 本 session 的 trace 含 1 条 `body.selected` 记录并通过 `EmbodimentTrace.verify()`，尾哈希为 `b0065cf705bc8fb86ccecdf086067ddb13773d90ab94dc6630434f4579308bbf`。观察本体由 World/Presence 事件链留证，不伪装为动作 trace。
+
+现场同时暴露了一个上层重复投递风险：同一恢复验收 turn 在可见回复发送失败后的延迟 follow-up 中再次选择了 `look`，产生 revision 4 的 `consciousness.instance_seen`。第二次调用没有移动或其他游戏副作用，但证明仅靠模型指令不能保证“只调用一次”。Minecraft 工具因此增加了有界、并发安全的 turn 级语义幂等：同一稳定 unread turn 内，相同 `start/stop/do/interrupt/look` 参数共享同一执行与结果；不同 turn 仍能正常再次操作。该保护不以自然语言关键词判定意图，不改变主体选择，只约束外部副作用的工程幂等。
+
+正式 Life Chatter 首轮上下文约 52 万 token，工具结果 follow-up 约 5.5–7 万 token，导致工具意图端到端延迟达到分钟级。这是通用主体上下文与表达链的生产性能风险，不是 Minecraft Bridge、世界加载或动作协议失败；MC 现场闭环结论与该延迟风险应分别呈现。
+
+### 5.1 2026-08-04 的历史现场门（现已完成）
 
 本轮没有停止、重启或启动 Elysium、NapCat、Minecraft、Java 或 native sidecar，也没有修改运行中客户端的 mods。
 
