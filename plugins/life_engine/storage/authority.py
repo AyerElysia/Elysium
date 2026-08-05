@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import hashlib
 import json
 import os
@@ -107,8 +106,40 @@ def _empty_file_state(registry_id: str) -> dict[str, Any]:
     }
 
 
+def _lock_file(handle: Any, *, exclusive: bool) -> None:
+    """Acquire a blocking shared or exclusive advisory lock."""
+
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        mode = msvcrt.LK_LOCK if exclusive else msvcrt.LK_RLCK
+        msvcrt.locking(handle.fileno(), mode, 1)
+        return
+
+    import fcntl
+
+    mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    fcntl.flock(handle.fileno(), mode)
+
+
+def _unlock_file(handle: Any) -> None:
+    """Release a platform-specific advisory lock."""
+
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 class FileAuthorityRegistry:
-    """Host-local authority registry guarded by POSIX advisory locks.
+    """Host-local authority registry guarded by platform advisory locks.
 
     A shared lock remains held for the full local durable write.  Cutover takes
     an exclusive lock, so it cannot overtake a writer that already passed its
@@ -133,11 +164,11 @@ class FileAuthorityRegistry:
             raise AuthorityError("authority registry has not been initialized")
         mode = "a+b" if create else "rb"
         with self.lock_path.open(mode) as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            _lock_file(handle, exclusive=exclusive)
             try:
                 yield
             finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                _unlock_file(handle)
 
     def _read_state_unlocked(self, *, allow_missing: bool) -> dict[str, Any]:
         if not self.state_path.exists():
@@ -172,11 +203,12 @@ class FileAuthorityRegistry:
                 handle.flush()
                 os.fsync(handle.fileno())
             temporary.replace(self.state_path)
-            directory_fd = os.open(self.state_path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            if os.name != "nt":
+                directory_fd = os.open(self.state_path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
         finally:
             if temporary.exists():
                 temporary.unlink()
@@ -485,20 +517,20 @@ class FileAuthorityRegistry:
             raise AuthorityError("authority registry has not been initialized")
         handle = self.lock_path.open("rb")
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            _lock_file(handle, exclusive=False)
             state = self._read_state_unlocked(allow_missing=False)
             self._verify_audit_unlocked(state)
             self._assert_token_unlocked(state, token)
             return handle
         except BaseException:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            _unlock_file(handle)
             handle.close()
             raise
 
     @staticmethod
     def _release_fence_sync(handle: Any) -> None:
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            _unlock_file(handle)
         finally:
             handle.close()
 
