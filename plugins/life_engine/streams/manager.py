@@ -228,6 +228,42 @@ class ThoughtStreamManager:
         self._decay_all()
         return list(self._streams.values())
 
+    def list_for_projection(
+        self,
+        *,
+        include_dormant: bool = False,
+    ) -> list[ThoughtStream]:
+        """返回旧工具可安全投影的思考流快照。
+
+        该查询保持旧 ``include_dormant`` 参数的兼容语义，但不会把
+        ``completed`` 等终态记录混入结果。排序只依赖持久字段，供上层
+        使用 revision-bound cursor 做稳定分页；好奇心分数仍可展示，
+        但不再作为分页位置。该投影查询是纯读取，不执行衰减、休眠或
+        任何持久化写入。
+        """
+        allowed_statuses = {"active"}
+        if include_dormant:
+            allowed_statuses.add("dormant")
+
+        streams = [
+            stream
+            for stream in self._streams.values()
+            if stream.status in allowed_statuses
+        ]
+
+        def _sort_key(stream: ThoughtStream) -> tuple[int, float, str]:
+            try:
+                advanced_at = datetime.fromisoformat(
+                    stream.last_advanced_at
+                ).timestamp()
+            except (TypeError, ValueError):
+                advanced_at = 0.0
+            status_rank = 0 if stream.status == "active" else 1
+            return status_rank, -advanced_at, stream.id
+
+        streams.sort(key=_sort_key)
+        return streams
+
     def get(self, stream_id: str) -> ThoughtStream | None:
         """获取指定思考流。"""
         ts = self._streams.get(stream_id)
