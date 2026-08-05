@@ -6460,6 +6460,47 @@ class LifeEngineService(BaseService):
             ),
         )
 
+    @staticmethod
+    def _heartbeat_tool_call_counts_as_activity(
+        tool_name: str,
+        args: dict[str, Any],
+    ) -> bool:
+        """Distinguish an actual chosen action from passive opportunity reading."""
+
+        name = str(tool_name or "").strip()
+        if not name or name == "nucleus_rest_heartbeat":
+            return False
+        if name == "nucleus_manage_thought_stream":
+            return str(args.get("action") or "").strip() != "list"
+        return True
+
+    def _update_heartbeat_idle_count(
+        self,
+        tool_calls: list[tuple[str, dict[str, Any]]],
+    ) -> None:
+        """Advance idle unless this heartbeat actually chose a non-passive action."""
+
+        active_calls = [
+            (name, args)
+            for name, args in tool_calls
+            if self._heartbeat_tool_call_counts_as_activity(name, args)
+        ]
+        if active_calls:
+            self._state.idle_heartbeat_count = 0
+            return
+
+        self._state.idle_heartbeat_count += 1
+        if tool_calls:
+            logger.debug(
+                "life_engine 心跳仅观察机会或休息，空闲计数: "
+                f"{self._state.idle_heartbeat_count}"
+            )
+        else:
+            logger.debug(
+                "life_engine 心跳无实际动作，空闲计数: "
+                f"{self._state.idle_heartbeat_count}"
+            )
+
     async def _run_heartbeat_model(
         self,
         wake_context: str,
@@ -6571,6 +6612,7 @@ class LifeEngineService(BaseService):
         max_rounds = max(1, int(cfg.settings.max_rounds_per_heartbeat))
         last_text = ""
         tool_event_count = 0
+        heartbeat_tool_calls: list[tuple[str, dict[str, Any]]] = []
         perception_receipt = (
             self._heartbeat_perception_receipt(response, world_perception)
             if world_perception is not None
@@ -6604,16 +6646,14 @@ class LifeEngineService(BaseService):
                 f"{[getattr(call, 'name', '<unknown>') for call in call_list]}"
             )
 
-            # 记录本轮工具名称，用于后续 idle 判定
-            called_tool_names = [getattr(call, 'name', '') for call in call_list]
-
             for batch, can_parallel in iter_life_tool_call_batches(call_list):
                 for call in batch:
-                    args = dict(call.args) if isinstance(getattr(call, "args", None), dict) else {}
+                    tool_name, args = self._heartbeat_tool_call_metadata(call)
+                    heartbeat_tool_calls.append((tool_name, dict(args)))
                     reason = args.pop("reason", "未提供原因")
                     logger.debug(
                         f"life_engine 心跳#{self._state.heartbeat_count} "
-                        f"LLM 调用 {getattr(call, 'name', '<unknown>')}，原因: {reason}，参数: {args}"
+                        f"LLM 调用 {tool_name or '<unknown>'}，原因: {reason}，参数: {args}"
                     )
 
                 if can_parallel and len(batch) > 1:
@@ -6674,26 +6714,8 @@ class LifeEngineService(BaseService):
                 logger.warning(f"life_engine heartbeat follow-up request timeout: {exc}")
                 raise TimeoutError("heartbeat follow-up request timeout") from exc
 
-        # 更新空闲计数：休息工具调用不算有效行动
-        rest_only = (
-            tool_event_count > 0
-            and called_tool_names
-            and all(name == "nucleus_rest_heartbeat" for name in called_tool_names)
-        )
-        
-        if tool_event_count > 0 and not rest_only:
-            self._state.idle_heartbeat_count = 0
-        else:
-            # 思考流推进不算空闲——推进自己的思考流是有效行动
-            if self._thought_manager and self._thought_manager.list_active():
-                self._state.idle_heartbeat_count = 0
-                logger.debug("life_engine 心跳无工具调用但有活跃思考流，不计数为空闲")
-            else:
-                self._state.idle_heartbeat_count += 1
-                if rest_only:
-                    logger.debug(f"life_engine 心跳仅调用休息工具，空闲计数: {self._state.idle_heartbeat_count}")
-                else:
-                    logger.debug(f"life_engine 心跳无工具调用，空闲计数: {self._state.idle_heartbeat_count}")
+        # active/open 只是可见线索；只有本轮由主体实际选择的非被动动作才重置 idle。
+        self._update_heartbeat_idle_count(heartbeat_tool_calls)
 
         # 三环自学习系统心跳（低频后台任务：审计/压缩/指标）
         if self._learning_scheduler is not None:

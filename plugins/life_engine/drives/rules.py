@@ -5,39 +5,12 @@
   (curiosity/sociability/energy/diligence/contentment)
 - 改为基于当前可审计状态：思考流、好奇刺点、学习进展、
   河流回望、自主意向、紧急 todo
-- 修正 thought_pursue 逻辑互斥（有思考流时 idle 恒为 0）
+- 退役仅凭 active/open 线索周期性推动主体的旧规则
 - 保持"建议而非命令"的设计哲学
 """
 from __future__ import annotations
+
 from .impulse import ImpulseRule
-
-
-# ---- thought_deepen ----
-def _thought_deepen_condition(neuromod_state: dict, context: dict) -> bool:
-    """有活跃思考流时建议继续深入。修复原 thought_pursue 的 idle 互斥问题。"""
-    return context.get("has_active_thoughts", False)
-
-thought_deepen = ImpulseRule(
-    name="thought_deepen",
-    condition=_thought_deepen_condition,
-    suggestion="你有未完成的思考流，也许可以继续深入、联想或沉淀",
-    tools=["nucleus_manage_thought_stream"],
-    cooldown_minutes=20,
-)
-
-
-# ---- curiosity_engage ----
-def _curiosity_engage_condition(neuromod_state: dict, context: dict) -> bool:
-    """有好奇刺点时建议承接。"""
-    return context.get("has_curiosity_signal", False)
-
-curiosity_engage = ImpulseRule(
-    name="curiosity_engage",
-    condition=_curiosity_engage_condition,
-    suggestion="好奇层留下了刺点；如果你在意，可以靠近它、开思考流承接，或者放下它",
-    tools=["nucleus_manage_thought_stream", "nucleus_web_search"],
-    cooldown_minutes=45,
-)
 
 
 # ---- learning_reflect ----
@@ -97,8 +70,6 @@ todo_attend = ImpulseRule(
 
 
 DEFAULT_RULES: list[ImpulseRule] = [
-    thought_deepen,
-    curiosity_engage,
     learning_reflect,
     river_consolidate,
     intent_review,

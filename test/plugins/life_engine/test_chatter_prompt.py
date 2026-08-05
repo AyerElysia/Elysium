@@ -2842,8 +2842,6 @@ def test_impulse_rules_based_on_auditable_state() -> None:
     # 确认所有规则都不依赖 neuromod（规则 condition 函数只接受 context 参数）
     for rule in DEFAULT_RULES:
         assert rule.name in {
-            "thought_deepen",
-            "curiosity_engage",
             "learning_reflect",
             "river_consolidate",
             "intent_review",
@@ -2852,6 +2850,8 @@ def test_impulse_rules_based_on_auditable_state() -> None:
     
     # 确认社交类规则已被移除（它们依赖已删除的 sociability 调质）
     rule_names = {rule.name for rule in DEFAULT_RULES}
+    assert "thought_deepen" not in rule_names
+    assert "curiosity_engage" not in rule_names
     assert "social_reach_out" not in rule_names
     assert "break_silence" not in rule_names
 # ── loop 中收到新消息的并发回归测试 ────────────────────────────────────

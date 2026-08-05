@@ -127,6 +127,80 @@ class CuriositySection(HeartbeatSectionProvider):
         return f"{body}\n\n{guidance}"
 
 
+class AttentionOpportunitySection(HeartbeatSectionProvider):
+    """Present open thought and curiosity evidence once, without choosing an action."""
+
+    section_id = "attention_opportunity"
+
+    def enabled(self, ctx: SectionContext) -> bool:
+        streams_cfg = getattr(ctx.config, "streams", None)
+        curiosity_cfg = getattr(ctx.config, "curiosity", None)
+        streams_enabled = streams_cfg is None or bool(
+            getattr(streams_cfg, "inject_to_heartbeat", True)
+        )
+        curiosity_enabled = curiosity_cfg is None or (
+            bool(getattr(curiosity_cfg, "enabled", True))
+            and bool(getattr(curiosity_cfg, "inject_to_heartbeat", True))
+        )
+        return streams_enabled or curiosity_enabled
+
+    async def render(self, ctx: SectionContext) -> str | None:
+        service = ctx.service
+        blocks: list[str] = []
+
+        streams_cfg = getattr(ctx.config, "streams", None)
+        streams_enabled = streams_cfg is None or bool(
+            getattr(streams_cfg, "inject_to_heartbeat", True)
+        )
+        manager = getattr(service, "_thought_manager", None)
+        if streams_enabled and manager is not None:
+            focus_window = (
+                int(getattr(streams_cfg, "focus_window_minutes", 30) or 30)
+                if streams_cfg
+                else 30
+            )
+            body = manager.format_for_prompt(
+                max_items=3,
+                focus_window_minutes=focus_window,
+                grouped=False,
+                mark_delta=False,
+            )
+            if body:
+                blocks.append(f"#### 现有思考线索\n{body}")
+
+        curiosity_cfg = getattr(ctx.config, "curiosity", None)
+        curiosity_enabled = curiosity_cfg is None or (
+            bool(getattr(curiosity_cfg, "enabled", True))
+            and bool(getattr(curiosity_cfg, "inject_to_heartbeat", True))
+        )
+        if curiosity_enabled:
+            try:
+                body = await service._get_curiosity_engine().format_for_prompt(
+                    max_chars=1200
+                )
+            except Exception:  # noqa: BLE001
+                body = ""
+            if body:
+                blocks.append(
+                    body.replace("### 好奇牵引", "#### 好奇线索", 1)
+                )
+
+        if not blocks:
+            return None
+
+        lines = [
+            "### 注意机会（attention_opportunity）",
+            "",
+            "以下只是当前可见的未闭合线索投影，不是任务、命令或行动请求。",
+            "它不替你决定创建、推进、记录、搁置或关闭任何线索；是否回应、如何回应都由你自己决定。",
+            "",
+            "\n\n".join(blocks),
+            "",
+            "保持原样或安静结束本轮同样是完整决定。",
+        ]
+        return "\n".join(lines)
+
+
 class ImpulseSection(HeartbeatSectionProvider):
     """冲动引擎的建议（纯建议，可遵循可忽略）。"""
 
@@ -552,9 +626,7 @@ class LeisureOpportunitySection(HeartbeatSectionProvider):
 
 
 DEFAULT_HEARTBEAT_SECTIONS: list[HeartbeatSectionProvider] = [
-    ThoughtStreamsSection(),
-    CuriositySection(),
-    LeisureOpportunitySection(),  # 替换原 ImpulseSection
+    AttentionOpportunitySection(),
     SendTargetsSection(),
     RiverReflectionSection(),
     SelfKnowledgeSection(),
