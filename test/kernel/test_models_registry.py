@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -67,6 +68,39 @@ def test_unverified_gpt_models_are_registered_but_not_automatic() -> None:
         model_name for task in config.tasks.values() for model_name in task["models"]
     }
     assert not any(name.startswith("gpt-5.6-") for name in automatic_models)
+
+
+def test_registry_excludes_failed_automatic_candidates() -> None:
+    registry_path = Path(__file__).parents[2] / "config" / "models.toml.example"
+    config = ModelsConfig(registry_path)
+    automatic_models = {
+        model_name for task in config.tasks.values() for model_name in task["models"]
+    }
+
+    assert "grok-4.5" not in config.models
+    assert "grok-4.5" not in automatic_models
+    assert "qwen3.7-plus" in config.models
+    assert "qwen3.7-plus" not in automatic_models
+    assert config.tasks["expression"]["models"][:3] == (
+        "deepseek-v4-flash",
+        "MiMo-V2.5-Pro",
+        "gemini-3.5-flash",
+    )
+    assert config.tasks["expression"]["models"][-1] == "claude-sonnet-5"
+
+
+def test_gpt_promotion_order_and_context_headroom_are_explicit() -> None:
+    registry_path = Path(__file__).parents[2] / "config" / "models.toml.example"
+    raw = tomllib.loads(registry_path.read_text(encoding="utf-8"))
+    gpt_names = [name for name in raw["models"] if name.startswith("gpt-5.6-")]
+
+    assert gpt_names == ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]
+    for name in gpt_names:
+        model = raw["models"][name]
+        trigger = model["extra"]["context_compression_trigger_tokens"]
+        assert model["ctx"] == 300000
+        assert trigger == 200000
+        assert model["ctx"] - trigger >= 3 * 32000
 
 
 def _write_minimal_registry(

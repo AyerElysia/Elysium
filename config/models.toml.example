@@ -31,7 +31,9 @@ provider = "NexusAI"
 id = "BAAI/bge-m3"
 ctx = 4096
 
-# Cloud reasoning models
+# Cloud reasoning models. Once the local relay exposes healthy GPT abilities,
+# promote them in the order Luna -> Terra -> Sol. Registration order is only
+# documentation; automatic priority remains defined by tasks.*.models.
 [models."gpt-5.6-luna"]
 provider = "NexusAI"
 id = "gpt-5.6-luna"
@@ -40,17 +42,17 @@ stream = true
 vision = true
 extra = { reasoning_effort = "high", context_compression_trigger_tokens = 200000 }
 
-[models."gpt-5.6-sol"]
+[models."gpt-5.6-terra"]
 provider = "NexusAI"
-id = "gpt-5.6-sol"
+id = "gpt-5.6-terra"
 ctx = 300000
 stream = true
 vision = true
 extra = { reasoning_effort = "high", context_compression_trigger_tokens = 200000 }
 
-[models."gpt-5.6-terra"]
+[models."gpt-5.6-sol"]
 provider = "NexusAI"
-id = "gpt-5.6-terra"
+id = "gpt-5.6-sol"
 ctx = 300000
 stream = true
 vision = true
@@ -100,13 +102,6 @@ ctx = 1000000
 vision = true
 extra = { thinking = { budget_tokens = 16000, type = "enabled" }, context_compression_trigger_tokens = 200000 }
 
-[models."grok-4.5"]
-provider = "NexusAI"
-id = "grok-4.5"
-ctx = 500000
-vision = true
-extra = { enable_thinking = true, context_compression_trigger_tokens = 200000 }
-
 # Registered for explicit manual use. Runtime tasks remain cloud-first.
 [models."qwen3-0.6b-router"]
 provider = "LocalRouter"
@@ -114,31 +109,32 @@ id = "qwen3-0.6b-router"
 ctx = 2048
 extra = { enable_thinking = false }
 
-# Generative budgets include hidden reasoning and final output.
-# Keep a registered model out of automatic tasks while its gateway has no
-# verified enabled ability; re-add it only after an end-to-end probe succeeds.
+# Generative budgets include hidden reasoning and final output. GPT priority is
+# Luna -> Terra -> Sol after relay qualification. GPT and qwen3.7-plus remain
+# registered only for recovery probes while their relay abilities are absent or
+# unhealthy; never add them to automatic tasks without an end-to-end probe.
 [tasks.core]
-models = ["MiMo-V2.5-Pro", "grok-4.5", "claude-sonnet-5", "MiMo-V2.5"]
+models = ["MiMo-V2.5-Pro", "deepseek-v4-flash", "gemini-3.5-flash", "MiMo-V2.5", "claude-sonnet-5"]
 tokens = 32000
 temp = 0.7
 
 [tasks.expression]
-models = ["MiMo-V2.5-Pro", "MiMo-V2.5", "grok-4.5", "claude-sonnet-5", "qwen3.7-plus", "gemini-3.5-flash"]
+models = ["deepseek-v4-flash", "MiMo-V2.5-Pro", "gemini-3.5-flash", "MiMo-V2.5", "claude-sonnet-5"]
 tokens = 32000
 temp = 0.8
 
 [tasks.witness]
-models = ["MiMo-V2.5", "deepseek-v4-flash", "qwen3.7-plus"]
+models = ["MiMo-V2.5", "deepseek-v4-flash", "gemini-3.5-flash"]
 tokens = 16000
 temp = 0.7
 
 [tasks.agent]
-models = ["MiMo-V2.5", "deepseek-v4-flash", "qwen3.7-plus"]
+models = ["MiMo-V2.5-Pro", "deepseek-v4-flash", "gemini-3.5-flash", "MiMo-V2.5", "claude-sonnet-5"]
 tokens = 32000
 temp = 0.7
 
 [tasks.utility]
-models = ["MiMo-V2.5", "qwen3.7-plus", "deepseek-v4-flash"]
+models = ["deepseek-v4-flash", "MiMo-V2.5", "gemini-3.5-flash"]
 tokens = 16000
 temp = 0.7
 
@@ -158,16 +154,16 @@ tokens = 8192
 temp = 0.7
 
 [tasks.router]
-models = ["MiMo-V2.5", "deepseek-v4-flash", "qwen3.7-plus"]
+models = ["deepseek-v4-flash", "MiMo-V2.5", "gemini-3.5-flash"]
 tokens = 8192
 temp = 0.3
 
 [tasks.router_context_projection]
-models = ["MiMo-V2.5", "deepseek-v4-flash", "qwen3.7-plus"]
+models = ["MiMo-V2.5", "deepseek-v4-flash", "gemini-3.5-flash"]
 tokens = 16000
 temp = 0.2
 
 [tasks.live]
-models = ["MiMo-V2.5-Pro", "MiMo-V2.5", "grok-4.5", "claude-sonnet-5"]
+models = ["deepseek-v4-flash", "MiMo-V2.5-Pro", "gemini-3.5-flash", "MiMo-V2.5", "claude-sonnet-5"]
 tokens = 32000
 temp = 0.75

@@ -67,7 +67,7 @@ def _resolve_model_set(routing_name: str) -> list[dict]:
 class ModelEntry(TypedDict):
     api_provider: str          # 提供商标识
     base_url: str              # API 端点
-    model_identifier: str      # 模型名（如 "grok-4.5"）
+    model_identifier: str      # 模型名（如 "mimo-v2.5-pro"）
     api_key: str               # API 密钥
     client_type: str           # 客户端类型
     max_retry: int             # 最大重试次数
@@ -91,19 +91,23 @@ class ModelEntry(TypedDict):
 
 | 任务 | 输出预算 | 模型列表（按主备序） |
 | --- | ---: | --- |
-| core | 32000 | MiMo-V2.5-Pro, grok-4.5, claude-sonnet-5, MiMo-V2.5 |
-| expression | 32000 | MiMo-V2.5-Pro, MiMo-V2.5, grok-4.5, claude-sonnet-5, qwen3.7-plus, gemini-3.5-flash |
-| witness | 16000 | MiMo-V2.5, deepseek-v4-flash, qwen3.7-plus |
-| agent | 32000 | MiMo-V2.5, deepseek-v4-flash, qwen3.7-plus |
-| utility | 16000 | MiMo-V2.5, qwen3.7-plus, deepseek-v4-flash |
+| core | 32000 | MiMo-V2.5-Pro, deepseek-v4-flash, gemini-3.5-flash, MiMo-V2.5, claude-sonnet-5 |
+| expression | 32000 | deepseek-v4-flash, MiMo-V2.5-Pro, gemini-3.5-flash, MiMo-V2.5, claude-sonnet-5 |
+| witness | 16000 | MiMo-V2.5, deepseek-v4-flash, gemini-3.5-flash |
+| agent | 32000 | MiMo-V2.5-Pro, deepseek-v4-flash, gemini-3.5-flash, MiMo-V2.5, claude-sonnet-5 |
+| utility | 16000 | deepseek-v4-flash, MiMo-V2.5, gemini-3.5-flash |
 | vision | 16000 | MiMo-V2.5, gemini-3.5-flash |
 | voice | 8192 | sensevoice-small（非生成型，该上限不用于思考） |
 | embedding | 8192 | bge-m3（非生成型，该上限不用于思考） |
-| router | 8192 | MiMo-V2.5, deepseek-v4-flash, qwen3.7-plus（云端优先，保留思考） |
-| router_context_projection | 16000 | MiMo-V2.5, deepseek-v4-flash, qwen3.7-plus（权威文件变化时生成派生投影） |
-| live | 32000 | MiMo-V2.5-Pro, MiMo-V2.5, grok-4.5, claude-sonnet-5 |
+| router | 8192 | deepseek-v4-flash, MiMo-V2.5, gemini-3.5-flash（云端优先，保留思考） |
+| router_context_projection | 16000 | MiMo-V2.5, deepseek-v4-flash, gemini-3.5-flash（权威文件变化时生成派生投影） |
+| live | 32000 | deepseek-v4-flash, MiMo-V2.5-Pro, gemini-3.5-flash, MiMo-V2.5, claude-sonnet-5 |
 
 生成型任务的 `tokens` 同时覆盖隐式思考与最终正文；Router 因此不再使用 200 token 的紧缩上限。上下文压缩触发线是输入窗口策略，与输出思考预算分开配置。
+
+GPT 5.6 的准入优先级固定为 **Luna → Terra → Sol**：Luna 成本最低，恢复后应最先进入任务链；Terra 与 Sol 依次作为后备。但模型注册不等于自动准入。只有本地中转站同时在模型能力列表中暴露对应 ID，并且真实 completion、结构化输出与工具调用探针通过后，才能把它们加入 `tasks.*.models`。没有健康 ability 的注册模型只用于恢复探针，避免每条生命消息先经历一次确定性失败。
+
+GPT 5.6 的 `ctx=300000` 与 `context_compression_trigger_tokens=200000` 保持不变。触发线占窗口约三分之二，仍留下 100000 token 余量，足以覆盖当前最大 32000 token 的隐式思考/正文预算、工具结果增长和 tokenizer 估算误差。其他百万窗口模型沿用同一 200000 触发线是有意的稳定性取舍：让故障转移前后的输入投影保持在共同安全窗口内，并限制超长上下文的延迟与成本；它不是对模型最大窗口能力的声明。
 
 ### 2.5 验证、原子发布与可观测性
 
