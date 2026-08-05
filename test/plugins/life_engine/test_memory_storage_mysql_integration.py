@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from plugins.life_engine.memory.epistemic import MemoryClaim
 from plugins.life_engine.memory.experience import ExperienceRecord
@@ -32,6 +33,8 @@ def _mysql_config() -> MySQLStorageConfig:
     user = os.environ.get("ELYSIUM_TEST_MYSQL_USER", "")
     if not host or not database or not user:
         pytest.skip("isolated MySQL integration database is not configured")
+    if os.environ.get("ELYSIUM_TEST_MYSQL_MEMORY_ISOLATED") != "1":
+        pytest.skip("Memory MySQL contract requires an isolated database")
     return MySQLStorageConfig(
         host=host,
         port=int(os.environ.get("ELYSIUM_TEST_MYSQL_PORT", "3306")),
@@ -66,7 +69,6 @@ async def test_mysql_memory_bundle_preserves_identity_and_cas_contracts() -> Non
     )
     runtime = None
     token = None
-    schema_ready = False
     suffix = uuid4().hex
     event_id = f"memory-event-{suffix}"
     witness_id = f"memory-witness-{suffix}"
@@ -74,8 +76,6 @@ async def test_mysql_memory_bundle_preserves_identity_and_cas_contracts() -> Non
     claim_id = f"memory-claim-{suffix}"
     logical_key = f"memory:contract:{suffix}"
     document_path = f"notes/mysql-contract-{suffix}.md"
-    document_node_id = ""
-    artifact_id = ""
     try:
         generation = _generation()
         await registry.register_generation(generation)
@@ -113,19 +113,19 @@ async def test_mysql_memory_bundle_preserves_identity_and_cas_contracts() -> Non
             },
         )
         stores = await open_mysql_memory_storage(runtime, initialize_schema=True)
-        schema_ready = True
 
         indexed = await stores.document_index.upsert_document(
             document_path,
             "MySQL 也必须留下可追溯痕迹",
             "mysql contract",
         )
-        document_node_id = indexed.node_id
-        assert (await stores.document_index.upsert_document(
-            document_path,
-            "MySQL 也必须留下可追溯痕迹",
-            "mysql contract",
-        )).job_id == indexed.job_id
+        assert (
+            await stores.document_index.upsert_document(
+                document_path,
+                "MySQL 也必须留下可追溯痕迹",
+                "mysql contract",
+            )
+        ).job_id == indexed.job_id
 
         experience = ExperienceRecord(
             event_id=event_id,
@@ -155,6 +155,11 @@ async def test_mysql_memory_bundle_preserves_identity_and_cas_contracts() -> Non
             source_event_ids=(event_id,),
         )
         assert witness.source_event_ids == (event_id,)
+        assert await stores.witnesses.mark_projection(
+            witness_id,
+            projection_path=f"diaries/mysql-contract-{suffix}.md",
+            status="projected",
+        )
         state = await stores.witnesses.compare_and_advance_state(
             instance_id,
             expected_sequence=0,
@@ -168,9 +173,16 @@ async def test_mysql_memory_bundle_preserves_identity_and_cas_contracts() -> Non
             artifact_kind="self_narrative",
             content="MySQL 中的第一版解释",
         )
-        artifact_id = artifact.artifact_id
         await stores.living.append_artifact(artifact, expected_head_revision=0)
         assert (await stores.living.get_artifact_head(logical_key)).revision == 1  # type: ignore[union-attr]
+        next_artifact = new_artifact_version(
+            logical_key=logical_key,
+            artifact_kind="self_narrative",
+            content="MySQL ä¸­çš„ç¬¬äºŒç‰ˆè§£é‡Š",
+            parent_artifact_ids=(artifact.artifact_id,),
+        )
+        await stores.living.append_artifact(next_artifact, expected_head_revision=1)
+        assert (await stores.living.get_artifact_head(logical_key)).revision == 2  # type: ignore[union-attr]
 
         claim = MemoryClaim(
             claim_id=claim_id,
@@ -184,52 +196,32 @@ async def test_mysql_memory_bundle_preserves_identity_and_cas_contracts() -> Non
             recorded_at="2026-08-04T12:00:02+08:00",
         )
         assert await stores.epistemic.append_claim(claim) == claim
-    finally:
-        if runtime is not None and schema_ready:
+
+        with pytest.raises(DBAPIError, match="MemoryAuthorityRecordImmutable"):
             async with runtime.unit_of_work() as uow:
                 await uow.session.execute(
-                    text("DELETE FROM memory_witness_sources WHERE witness_id = :id"),
-                    {"id": witness_id},
+                    text(
+                        "UPDATE memory_experiences SET content = 'forged' "
+                        "WHERE event_id = :event_id"
+                    ),
+                    {"event_id": event_id},
                 )
-                await uow.session.execute(
-                    text("DELETE FROM memory_witnesses WHERE witness_id = :id"),
-                    {"id": witness_id},
-                )
+        with pytest.raises(DBAPIError, match="MemoryWitnessAuthorityImmutable"):
+            async with runtime.unit_of_work() as uow:
                 await uow.session.execute(
                     text(
-                        "DELETE FROM memory_witness_state "
-                        "WHERE consciousness_instance_id = :id"
+                        "UPDATE memory_witnesses SET content = 'forged' "
+                        "WHERE witness_id = :witness_id"
                     ),
-                    {"id": instance_id},
+                    {"witness_id": witness_id},
                 )
+        with pytest.raises(DBAPIError, match="MemoryAuthorityRecordImmutable"):
+            async with runtime.unit_of_work() as uow:
                 await uow.session.execute(
-                    text("DELETE FROM memory_experiences WHERE event_id = :id"),
-                    {"id": event_id},
+                    text("DELETE FROM memory_claims WHERE claim_id = :claim_id"),
+                    {"claim_id": claim_id},
                 )
-                await uow.session.execute(
-                    text(
-                        "DELETE FROM memory_artifact_heads "
-                        "WHERE logical_key_sha256 = SHA2(:logical_key, 256)"
-                    ),
-                    {"logical_key": logical_key},
-                )
-                await uow.session.execute(
-                    text("DELETE FROM memory_artifact_versions WHERE artifact_id = :id"),
-                    {"id": artifact_id},
-                )
-                await uow.session.execute(
-                    text("DELETE FROM memory_claims WHERE claim_id = :id"),
-                    {"id": claim_id},
-                )
-                if document_node_id:
-                    await uow.session.execute(
-                        text("DELETE FROM memory_nodes WHERE node_id = :id"),
-                        {"id": document_node_id},
-                    )
-                    await uow.session.execute(
-                        text("DELETE FROM memory_vector_tombstones WHERE node_id = :id"),
-                        {"id": document_node_id},
-                    )
+    finally:
         if runtime is not None:
             await runtime.close()
         if token is not None:

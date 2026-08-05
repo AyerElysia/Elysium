@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import sqlite3
 from types import SimpleNamespace
 
@@ -20,6 +21,10 @@ from plugins.life_engine.memory.living import (
     create_living_memory_schema,
     new_artifact_version,
 )
+from plugins.life_engine.storage.contracts import (
+    StorageBackendRuntime,
+    StorageWriterRole,
+)
 from plugins.life_engine.storage.memory import (
     DocumentIndexProjection,
     EpistemicMemoryStore,
@@ -31,11 +36,23 @@ from plugins.life_engine.storage.memory import (
     create_local_memory_storage_bundle,
     memory_store_characterizations,
 )
+from plugins.life_engine.storage.memory import factory as memory_factory_module
 from plugins.life_engine.storage.memory import mysql as mysql_memory
+from plugins.life_engine.storage.memory import schema as memory_schema_module
 from plugins.life_engine.storage.memory.schema import (
+    MEMORY_IMMUTABILITY_MIGRATIONS,
+    MEMORY_IMMUTABILITY_TRIGGER_CONTRACT,
+    MEMORY_IMMUTABLE_TABLE_COLUMNS,
+    MEMORY_IMMUTABLE_TABLES,
     MEMORY_MIGRATIONS,
+    MEMORY_MUTABLE_TABLES,
     MEMORY_SCHEMA_VERSION,
+    MEMORY_WITNESS_IMMUTABLE_COLUMNS,
+    MEMORY_WITNESS_MUTABLE_PROJECTION_COLUMNS,
+    MemoryDatabaseImmutabilityError,
+    MemoryImmutabilityPolicyError,
 )
+from plugins.life_engine.storage.models import BackendKind
 from src.kernel.storage import CursorConflict
 
 
@@ -150,15 +167,258 @@ def test_mysql_memory_migrations_are_explicit_and_ordered() -> None:
     assert "UNIQUE KEY uq_memory_witness_projection_path_hash" in ddl
     assert "UNIQUE KEY uq_memory_witness_projection_path (projection_path)" not in ddl
     assert ddl.count("`signal` VARCHAR(512)") == 2
-    assert (
-        "content LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL"
-        in ddl
-    )
+    assert "content LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL" in ddl
     assert "life_memory_lossless_json_text_v1" in {
         migration.name for migration in MEMORY_MIGRATIONS
     }
     assert "MODIFY COLUMN metadata_json LONGTEXT NOT NULL" in ddl
     assert "universal" not in ddl.lower()
+
+
+def test_mysql_memory_immutability_classification_is_exhaustive() -> None:
+    schema_ddl = "\n".join(
+        statement
+        for migration in MEMORY_MIGRATIONS
+        for statement in migration.statements
+    )
+    created_tables = set(
+        re.findall(r"CREATE TABLE IF NOT EXISTS ([a-z0-9_]+)", schema_ddl)
+    )
+    immutable_tables = set(MEMORY_IMMUTABLE_TABLES)
+    mutable_tables = set(MEMORY_MUTABLE_TABLES)
+
+    assert immutable_tables.isdisjoint(mutable_tables)
+    assert created_tables == immutable_tables | mutable_tables | {"memory_witnesses"}
+    assert set(MEMORY_IMMUTABLE_TABLE_COLUMNS) == immutable_tables
+
+    trigger_ddl = "\n".join(
+        statement
+        for migration in MEMORY_IMMUTABILITY_MIGRATIONS
+        for statement in migration.statements
+    )
+    for table in immutable_tables:
+        assert f"{table}_immutable_update" in trigger_ddl
+        assert f"{table}_immutable_delete" in trigger_ddl
+        for column in MEMORY_IMMUTABLE_TABLE_COLUMNS[table]:
+            assert f"OLD.`{column}` <=> NEW.`{column}`" in trigger_ddl
+    for table in mutable_tables:
+        assert f"{table}_immutable_update" not in trigger_ddl
+        assert f"{table}_immutable_delete" not in trigger_ddl
+
+    for column in MEMORY_WITNESS_IMMUTABLE_COLUMNS:
+        assert f"OLD.{column} <=> NEW.{column}" in trigger_ddl
+    for column in MEMORY_WITNESS_MUTABLE_PROJECTION_COLUMNS:
+        assert f"OLD.{column} <=> NEW.{column}" not in trigger_ddl
+    assert "memory_witnesses_immutable_delete" in trigger_ddl
+
+
+@pytest.mark.asyncio
+async def test_mysql_memory_schema_installs_separate_immutability_migration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    applications: list[tuple[str, tuple[object, ...]]] = []
+    validations = 0
+
+    class _Runner:
+        def __init__(
+            self, _engine: object, *, table_name: str, **_kwargs: object
+        ) -> None:
+            self.table_name = table_name
+
+        async def apply(self, migrations: tuple[object, ...]) -> None:
+            applications.append((self.table_name, migrations))
+
+    async def _validate() -> None:
+        nonlocal validations
+        validations += 1
+
+    async def _verify(_runtime: StorageBackendRuntime) -> None:
+        return None
+
+    monkeypatch.setattr(memory_schema_module, "MySQLMigrationRunner", _Runner)
+    monkeypatch.setattr(
+        memory_schema_module,
+        "_verify_memory_database_immutability",
+        _verify,
+    )
+    runtime = StorageBackendRuntime(
+        enabled=True,
+        backend=BackendKind.MYSQL,
+        backend_identity="mysql://memory-contract",
+        generation=None,
+        authority_registry=None,
+        authority_token=None,
+        engine=object(),  # type: ignore[arg-type]
+        session_factory=None,
+        _writer_validator=_validate,
+    )
+
+    await memory_schema_module.ensure_memory_storage_schema(runtime)
+
+    assert validations == 2
+    assert applications == [
+        ("life_memory_schema_migrations", MEMORY_MIGRATIONS),
+        (
+            "life_memory_immutability_schema_migrations",
+            MEMORY_IMMUTABILITY_MIGRATIONS,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_only_unfrozen_candidate_shadow_can_skip_memory_triggers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    applications: list[str] = []
+
+    class _Runner:
+        def __init__(
+            self, _engine: object, *, table_name: str, **_kwargs: object
+        ) -> None:
+            self.table_name = table_name
+
+        async def apply(self, _migrations: tuple[object, ...]) -> None:
+            applications.append(self.table_name)
+
+    async def _validate() -> None:
+        return None
+
+    monkeypatch.setattr(memory_schema_module, "MySQLMigrationRunner", _Runner)
+
+    def _runtime(role: StorageWriterRole) -> StorageBackendRuntime:
+        return StorageBackendRuntime(
+            enabled=True,
+            backend=BackendKind.MYSQL,
+            backend_identity="mysql://memory-contract",
+            generation=None,
+            authority_registry=None,
+            authority_token=None,
+            engine=object(),  # type: ignore[arg-type]
+            session_factory=None,
+            _writer_validator=_validate,
+            writer_role=role,
+        )
+
+    with pytest.raises(MemoryImmutabilityPolicyError, match="unfrozen"):
+        await memory_schema_module.ensure_memory_storage_schema(
+            _runtime(StorageWriterRole.ACTIVE),
+            require_database_immutability=False,
+            writer_frozen=False,
+        )
+    with pytest.raises(MemoryImmutabilityPolicyError, match="unfrozen"):
+        await memory_schema_module.ensure_memory_storage_schema(
+            _runtime(StorageWriterRole.CANDIDATE_COPY),
+            require_database_immutability=False,
+            writer_frozen=True,
+        )
+
+    await memory_schema_module.ensure_memory_storage_schema(
+        _runtime(StorageWriterRole.CANDIDATE_COPY),
+        require_database_immutability=False,
+        writer_frozen=False,
+    )
+
+    assert applications == ["life_memory_schema_migrations"]
+
+
+@pytest.mark.asyncio
+async def test_active_memory_bundle_fails_closed_when_triggers_are_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _missing(_runtime: StorageBackendRuntime) -> None:
+        raise MemoryDatabaseImmutabilityError("missing trigger contract")
+
+    monkeypatch.setattr(
+        memory_factory_module,
+        "verify_memory_storage_immutability",
+        _missing,
+    )
+    runtime = StorageBackendRuntime(
+        enabled=True,
+        backend=BackendKind.MYSQL,
+        backend_identity="mysql://memory-contract",
+        generation=None,
+        authority_registry=None,
+        authority_token=None,
+        engine=object(),  # type: ignore[arg-type]
+        session_factory=None,
+    )
+
+    with pytest.raises(MemoryDatabaseImmutabilityError, match="missing"):
+        await memory_factory_module.open_mysql_memory_storage(runtime)
+
+
+@pytest.mark.asyncio
+async def test_memory_immutability_verifier_detects_trigger_drift() -> None:
+    class _Mappings:
+        def __init__(self, rows: list[dict[str, str]]) -> None:
+            self._rows = rows
+
+        def one_or_none(self) -> dict[str, str] | None:
+            return self._rows[0] if self._rows else None
+
+        def all(self) -> list[dict[str, str]]:
+            return self._rows
+
+    class _Result:
+        def __init__(self, rows: list[dict[str, str]]) -> None:
+            self._rows = rows
+
+        def mappings(self) -> _Mappings:
+            return _Mappings(self._rows)
+
+    class _Connection:
+        async def execute(
+            self,
+            statement: object,
+            _parameters: object = None,
+        ) -> _Result:
+            if "information_schema.TRIGGERS" in str(statement):
+                rows: list[dict[str, str]] = []
+                for name, event, table in MEMORY_IMMUTABILITY_TRIGGER_CONTRACT[:-1]:
+                    marker = (
+                        "MemoryWitnessAuthorityImmutable"
+                        if table == "memory_witnesses"
+                        else "MemoryAuthorityRecordImmutable"
+                    )
+                    protected_columns = (
+                        MEMORY_WITNESS_IMMUTABLE_COLUMNS
+                        if table == "memory_witnesses"
+                        else MEMORY_IMMUTABLE_TABLE_COLUMNS[table]
+                    )
+                    comparisons = " ".join(
+                        f"OLD.{column} <=> NEW.{column}" for column in protected_columns
+                    )
+                    rows.append(
+                        {
+                            "trigger_name": name,
+                            "event_manipulation": event,
+                            "action_timing": "BEFORE",
+                            "event_object_table": table,
+                            "action_statement": f"{comparisons} {marker}",
+                        }
+                    )
+                return _Result(rows)
+            migration = MEMORY_IMMUTABILITY_MIGRATIONS[0]
+            return _Result([{"name": migration.name, "checksum": migration.checksum}])
+
+    class _ConnectionContext:
+        async def __aenter__(self) -> _Connection:
+            return _Connection()
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class _Engine:
+        def connect(self) -> _ConnectionContext:
+            return _ConnectionContext()
+
+    runtime = SimpleNamespace(engine=_Engine())
+
+    with pytest.raises(MemoryDatabaseImmutabilityError, match="missing or drifted"):
+        await memory_schema_module._verify_memory_database_immutability(
+            runtime  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.asyncio
@@ -184,7 +444,9 @@ async def test_mysql_witness_projection_path_hash_never_replaces_full_identity(
             self._row = row
             self.parameters: dict[str, str] = {}
 
-        async def execute(self, _statement: object, parameters: dict[str, str]) -> _Result:
+        async def execute(
+            self, _statement: object, parameters: dict[str, str]
+        ) -> _Result:
             self.parameters = parameters
             return _Result(self._row)
 
@@ -380,6 +642,8 @@ async def test_local_memory_bundle_satisfies_every_public_port() -> None:
             strength=0.7,
         )
         assert edge.weight == pytest.approx(0.7)
-        assert (await bundle.legacy_graph.get_edges_from(left.node_id))[0].target_id == right.node_id
+        assert (await bundle.legacy_graph.get_edges_from(left.node_id))[
+            0
+        ].target_id == right.node_id
     finally:
         await asyncio.to_thread(db.close)

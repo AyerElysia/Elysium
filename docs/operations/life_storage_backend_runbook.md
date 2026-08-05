@@ -1,6 +1,6 @@
 # 生命域存储快照与权威切换运行手册
 
-本手册服务于 Elysium 生命域可选本地/MySQL 存储。它不包含真实主机、用户名、密码或 fencing token。Life Event、Memory、Subject Document、Presence、World、Learning 的 Port/adapter、`LifeEngineService` 单 runtime 接线、未冻结候选复制和反向恢复均已实现；正式冻结复制、隔离 MySQL 破坏性合同、数据库级不可变保护和人工切换尚未完成，因此本手册中的正式切换步骤是**验收门**，不是当前可以执行的上线指令。
+本手册服务于 Elysium 生命域可选本地/MySQL 存储。它不包含真实主机、用户名、密码或 fencing token。Life Event、Memory、Subject Document、Presence、World、Learning 的 Port/adapter、`LifeEngineService` 单 runtime 接线、未冻结候选复制和反向恢复均已实现；Memory 数据库级不可变保护已实现，但正式冻结复制、隔离 MySQL 破坏性合同、跨领域整体验收和人工切换尚未完成，因此本手册中的正式切换步骤是**验收门**，不是当前可以执行的上线指令。
 
 ## 1. 当前安全状态
 
@@ -112,8 +112,9 @@ Memory 的本地合同测试不需要外部服务；真实 MySQL 合同测试必
 - `ELYSIUM_TEST_MYSQL_USER`
 - `ELYSIUM_TEST_MYSQL_PASSWORD`
 - `ELYSIUM_TEST_MYSQL_SSL_MODE`
+- `ELYSIUM_TEST_MYSQL_MEMORY_ISOLATED=1`
 
-未提供必要变量时，真实 MySQL 用例必须明确显示为 skipped；不得借用正式数据库，也不得把 skipped 记作真实远程验收通过。测试会创建 Memory v1-v8 schema、注册隔离 generation、取得短租约 authority 并在结束时清理本次稳定身份；schema 初始化尚未完成时不得尝试清理尚不存在的领域表。
+未提供必要变量时，真实 MySQL 用例必须明确显示为 skipped；不得借用正式数据库，也不得把 skipped 记作真实远程验收通过。`ELYSIUM_TEST_MYSQL_MEMORY_ISOLATED=1` 是允许安装破坏性 trigger 合同并保留随机测试历史的明确声明，绝不能指向正式库。测试会创建 Memory v1-v8 schema、安装独立 checksum 的不可变 trigger、注册隔离 generation 并取得短租约 authority；权威测试行不会用清理 `DELETE` 绕过不可变合同。
 
 ### 6.2 Presence/World 隔离合同验证
 
@@ -214,6 +215,8 @@ uv run python scripts/migrate_life_memory.py \
 可逆投影字段；v8 把开放元数据保存为规范 JSON 的 `LONGTEXT` 原文，避免 MySQL
 原生 JSON 改写高精度小数。见证投影路径使用 SHA-256 作为可索引派生列，但查询
 命中后必须核对完整路径，hash 永远不替代路径身份。
+
+Memory 权威历史 trigger 位于独立的 `life_memory_immutability_schema_migrations` namespace。Experience、Witness 来源、artifact/interpretation/recall/corecall 与 epistemic/retrieval 账本禁止原地更新和删除；`memory_witnesses` 采用列级保护，只放行投影路径、投影状态与错误信息。`memory_artifact_heads`、Witness cursor、索引任务、关联投影和 legacy graph 不属于 append-only 表，必须保留其 CAS、重建与衰减更新能力。active 或冻结 generation 无法创建这些 trigger 时初始化失败；只有非冻结 candidate-copy shadow 可显式记录降级并跳过。
 
 只读独立复核使用：
 

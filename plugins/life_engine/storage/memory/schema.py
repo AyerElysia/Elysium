@@ -9,12 +9,97 @@ that MySQL's native JSON binary representation would otherwise round.
 
 from __future__ import annotations
 
+import re
+
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
+
 from src.kernel.storage.migration_runner import MySQLMigrationRunner, SchemaMigration
 
-from ..contracts import StorageBackendRuntime
+from ..contracts import StorageBackendRuntime, StorageWriterRole
 from ..models import BackendKind
 
 MEMORY_SCHEMA_VERSION = 8
+MEMORY_IMMUTABILITY_SCHEMA_VERSION = 1
+
+# Database immutability follows the Memory Port contract, not a blanket
+# "nothing may change" rule.  These tables contain authoritative occurrences
+# whose identity and payload are append-only.  Rebuildable projections,
+# monotonic cursors and CAS heads are classified separately below.
+MEMORY_IMMUTABLE_TABLES = (
+    "memory_experiences",
+    "memory_experience_occurrence_aliases",
+    "memory_witness_sources",
+    "memory_witness_migrations",
+    "memory_artifact_versions",
+    "memory_artifact_derivations",
+    "memory_interpretations",
+    "memory_interpretation_sources",
+    "memory_semantic_relations",
+    "memory_recall_sessions",
+    "memory_recall_events",
+    "memory_corecall_events",
+    "memory_claims",
+    "memory_claim_evidence",
+    "memory_beliefs",
+    "memory_epistemic_conflicts",
+    "memory_state_events",
+    "memory_retrieval_episodes",
+    "memory_retrieval_exposures",
+    "memory_retrieval_feedback",
+)
+
+# A witness row mixes immutable first-person testimony with mutable delivery
+# bookkeeping.  Its update trigger protects only the authority columns and
+# deliberately permits the projection columns listed here.
+MEMORY_WITNESS_IMMUTABLE_COLUMNS = (
+    "witness_id",
+    "content",
+    "consciousness_instance_id",
+    "perspective_subject_id",
+    "epistemic_kind",
+    "source_kind",
+    "status",
+    "stream_scope",
+    "visibility",
+    "valid_from",
+    "valid_to",
+    "recorded_at",
+    "source_sequence_start",
+    "source_sequence_end",
+    "model_task_name",
+    "metadata_json",
+    "payload_sha256",
+)
+MEMORY_WITNESS_MUTABLE_PROJECTION_COLUMNS = (
+    "projection_path",
+    "projection_path_sha256",
+    "projection_status",
+    "projection_error",
+)
+
+MEMORY_MUTABLE_TABLES = (
+    "memory_schema",
+    "memory_nodes",
+    "memory_chunks",
+    "memory_index_jobs",
+    "memory_index_state",
+    "memory_vector_tombstones",
+    "memory_witness_state",
+    "memory_artifact_heads",
+    "memory_association_projection",
+    "memory_edges",
+    "memory_corrections",
+)
+
+
+class MemoryImmutabilityPolicyError(RuntimeError):
+    """Raised when a caller attempts to weaken an activation-safe schema."""
+
+
+class MemoryDatabaseImmutabilityError(RuntimeError):
+    """Raised when the installed MySQL authority guards are absent or drifted."""
+
 
 _DOCUMENT_INDEX = SchemaMigration(
     version=1,
@@ -604,23 +689,315 @@ MEMORY_MIGRATIONS = (
 )
 
 
-async def ensure_memory_storage_schema(runtime: StorageBackendRuntime) -> None:
-    """Create the empty MySQL Memory schema without selecting or copying data."""
+def _created_table_columns() -> dict[str, tuple[str, ...]]:
+    result: dict[str, tuple[str, ...]] = {}
+    for migration in MEMORY_MIGRATIONS:
+        for statement in migration.statements:
+            table_match = re.match(
+                r"CREATE TABLE IF NOT EXISTS ([a-z0-9_]+) \(",
+                statement,
+            )
+            if table_match is None:
+                continue
+            columns: list[str] = []
+            for line in statement.splitlines()[1:]:
+                column_match = re.match(
+                    r"^ {12}(`?[a-z][a-z0-9_]*`?)\s+",
+                    line,
+                )
+                if column_match is None:
+                    continue
+                column = column_match.group(1).strip("`")
+                if column.upper() in {
+                    "CHECK",
+                    "CONSTRAINT",
+                    "FOREIGN",
+                    "FULLTEXT",
+                    "KEY",
+                    "PRIMARY",
+                    "UNIQUE",
+                }:
+                    continue
+                columns.append(column)
+            result[table_match.group(1)] = tuple(columns)
+    return result
+
+
+_CREATED_TABLE_COLUMNS = _created_table_columns()
+MEMORY_IMMUTABLE_TABLE_COLUMNS = {
+    table: _CREATED_TABLE_COLUMNS[table] for table in MEMORY_IMMUTABLE_TABLES
+}
+
+
+def _memory_immutability_trigger_contract() -> tuple[tuple[str, str, str], ...]:
+    triggers = [
+        (f"{table}_immutable_update", "UPDATE", table)
+        for table in MEMORY_IMMUTABLE_TABLES
+    ]
+    triggers.extend(
+        (f"{table}_immutable_delete", "DELETE", table)
+        for table in MEMORY_IMMUTABLE_TABLES
+    )
+    triggers.extend(
+        (
+            (
+                "memory_witnesses_authority_immutable_update",
+                "UPDATE",
+                "memory_witnesses",
+            ),
+            (
+                "memory_witnesses_immutable_delete",
+                "DELETE",
+                "memory_witnesses",
+            ),
+        )
+    )
+    return tuple(triggers)
+
+
+MEMORY_IMMUTABILITY_TRIGGER_CONTRACT = _memory_immutability_trigger_contract()
+
+
+def _memory_immutability_statements() -> tuple[str, ...]:
+    statements: list[str] = []
+    for table in MEMORY_IMMUTABLE_TABLES:
+        immutable_predicate = "\n                    AND ".join(
+            f"OLD.`{column}` <=> NEW.`{column}`"
+            for column in MEMORY_IMMUTABLE_TABLE_COLUMNS[table]
+        )
+        statements.extend(
+            (
+                f"""CREATE TRIGGER IF NOT EXISTS {table}_immutable_update
+                BEFORE UPDATE ON {table} FOR EACH ROW
+                BEGIN
+                    IF NOT (
+                        {immutable_predicate}
+                    ) THEN
+                        SIGNAL SQLSTATE '45000'
+                            SET MESSAGE_TEXT = 'MemoryAuthorityRecordImmutable';
+                    END IF;
+                END""",
+                f"""CREATE TRIGGER IF NOT EXISTS {table}_immutable_delete
+                BEFORE DELETE ON {table} FOR EACH ROW
+                SIGNAL SQLSTATE '45000'
+                    SET MESSAGE_TEXT = 'MemoryAuthorityRecordImmutable'""",
+            )
+        )
+
+    witness_predicate = "\n                AND ".join(
+        f"OLD.{column} <=> NEW.{column}" for column in MEMORY_WITNESS_IMMUTABLE_COLUMNS
+    )
+    statements.extend(
+        (
+            f"""CREATE TRIGGER IF NOT EXISTS memory_witnesses_authority_immutable_update
+            BEFORE UPDATE ON memory_witnesses FOR EACH ROW
+            BEGIN
+                IF NOT (
+                    {witness_predicate}
+                ) THEN
+                    SIGNAL SQLSTATE '45000'
+                        SET MESSAGE_TEXT = 'MemoryWitnessAuthorityImmutable';
+                END IF;
+            END""",
+            """CREATE TRIGGER IF NOT EXISTS memory_witnesses_immutable_delete
+            BEFORE DELETE ON memory_witnesses FOR EACH ROW
+            SIGNAL SQLSTATE '45000'
+                SET MESSAGE_TEXT = 'MemoryWitnessAuthorityImmutable'""",
+        )
+    )
+    return tuple(statements)
+
+
+_MEMORY_IMMUTABILITY = SchemaMigration(
+    version=MEMORY_IMMUTABILITY_SCHEMA_VERSION,
+    name="life_memory_authority_immutability_v1",
+    statements=_memory_immutability_statements(),
+)
+
+MEMORY_IMMUTABILITY_MIGRATIONS = (_MEMORY_IMMUTABILITY,)
+
+
+def memory_database_immutability_required(
+    runtime: StorageBackendRuntime,
+    *,
+    require_database_immutability: bool,
+    writer_frozen: bool | None,
+) -> bool:
+    if require_database_immutability:
+        return True
+    if (
+        runtime.writer_role != StorageWriterRole.CANDIDATE_COPY
+        or writer_frozen is not False
+    ):
+        raise MemoryImmutabilityPolicyError(
+            "database immutability may be skipped only for an explicitly "
+            "unfrozen candidate-copy shadow"
+        )
+    return False
+
+
+async def _verify_memory_database_immutability(
+    runtime: StorageBackendRuntime,
+) -> None:
+    assert runtime.engine is not None
+    try:
+        async with runtime.engine.connect() as connection:
+            migration = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT name, checksum FROM "
+                            "life_memory_immutability_schema_migrations "
+                            "WHERE version = :version"
+                        ),
+                        {"version": MEMORY_IMMUTABILITY_SCHEMA_VERSION},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            trigger_rows = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT TRIGGER_NAME AS trigger_name, "
+                            "EVENT_MANIPULATION AS event_manipulation, "
+                            "ACTION_TIMING AS action_timing, "
+                            "EVENT_OBJECT_TABLE AS event_object_table, "
+                            "ACTION_STATEMENT AS action_statement "
+                            "FROM information_schema.TRIGGERS "
+                            "WHERE TRIGGER_SCHEMA = DATABASE()"
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+    except DBAPIError as exc:
+        raise MemoryDatabaseImmutabilityError(
+            "Memory database immutability metadata is unavailable"
+        ) from exc
+
+    expected_migration = MEMORY_IMMUTABILITY_MIGRATIONS[0]
+    if migration is None or (str(migration["name"]), str(migration["checksum"])) != (
+        expected_migration.name,
+        expected_migration.checksum,
+    ):
+        raise MemoryDatabaseImmutabilityError(
+            "Memory database immutability migration is missing or drifted"
+        )
+
+    installed = {
+        str(row["trigger_name"]).lower(): (
+            str(row["event_manipulation"]).upper(),
+            str(row["action_timing"]).upper(),
+            str(row["event_object_table"]).lower(),
+            re.sub(r"\s+", " ", str(row["action_statement"])).replace("`", "").lower(),
+        )
+        for row in trigger_rows
+    }
+    missing_or_drifted: list[str] = []
+    for name, event, table in MEMORY_IMMUTABILITY_TRIGGER_CONTRACT:
+        actual = installed.get(name)
+        if actual is None or actual[:3] != (event, "BEFORE", table):
+            missing_or_drifted.append(name)
+            continue
+        action = actual[3]
+        marker = (
+            "memorywitnessauthorityimmutable"
+            if table == "memory_witnesses"
+            else "memoryauthorityrecordimmutable"
+        )
+        if marker not in action:
+            missing_or_drifted.append(name)
+            continue
+        if event != "UPDATE":
+            continue
+        protected_columns = (
+            MEMORY_WITNESS_IMMUTABLE_COLUMNS
+            if table == "memory_witnesses"
+            else MEMORY_IMMUTABLE_TABLE_COLUMNS[table]
+        )
+        if any(
+            f"old.{column}" not in action or f"new.{column}" not in action
+            for column in protected_columns
+        ):
+            missing_or_drifted.append(name)
+    if missing_or_drifted:
+        raise MemoryDatabaseImmutabilityError(
+            "Memory database immutability triggers are missing or drifted: "
+            + ", ".join(sorted(missing_or_drifted))
+        )
+
+
+async def verify_memory_storage_immutability(
+    runtime: StorageBackendRuntime,
+) -> None:
+    """Fail closed unless the exact checksummed MySQL trigger set is present."""
+
+    if not runtime.enabled or runtime.engine is None:
+        raise RuntimeError("memory immutability requires an enabled storage runtime")
+    if runtime.backend != BackendKind.MYSQL:
+        raise RuntimeError("memory immutability verification is MySQL-only")
+    await runtime.validate_writer()
+    await _verify_memory_database_immutability(runtime)
+    await runtime.validate_writer()
+
+
+async def ensure_memory_storage_schema(
+    runtime: StorageBackendRuntime,
+    *,
+    require_database_immutability: bool = True,
+    writer_frozen: bool | None = None,
+) -> None:
+    """Create MySQL Memory schema and enforce activation-safe immutability.
+
+    The only supported downgrade is an explicit ``writer_frozen=False``
+    candidate-copy shadow.  Active writers and frozen candidates fail closed
+    if the database cannot install the independently checksummed triggers.
+    """
 
     if not runtime.enabled or runtime.engine is None:
         raise RuntimeError("memory schema requires an enabled storage runtime")
     if runtime.backend != BackendKind.MYSQL:
         raise RuntimeError("selectable SQLite Memory continues to use local schemas")
+    install_immutability = memory_database_immutability_required(
+        runtime,
+        require_database_immutability=require_database_immutability,
+        writer_frozen=writer_frozen,
+    )
+    await runtime.validate_writer()
     runner = MySQLMigrationRunner(
         runtime.engine,
         table_name="life_memory_schema_migrations",
         lock_name="elysium:life-memory-schema",
     )
     await runner.apply(MEMORY_MIGRATIONS)
+    if install_immutability:
+        immutable_runner = MySQLMigrationRunner(
+            runtime.engine,
+            table_name="life_memory_immutability_schema_migrations",
+            lock_name="elysium:life-memory-immutability",
+        )
+        await immutable_runner.apply(MEMORY_IMMUTABILITY_MIGRATIONS)
+        await _verify_memory_database_immutability(runtime)
+    await runtime.validate_writer()
 
 
 __all__ = [
+    "MEMORY_IMMUTABILITY_MIGRATIONS",
+    "MEMORY_IMMUTABILITY_SCHEMA_VERSION",
+    "MEMORY_IMMUTABILITY_TRIGGER_CONTRACT",
+    "MEMORY_IMMUTABLE_TABLES",
+    "MEMORY_IMMUTABLE_TABLE_COLUMNS",
     "MEMORY_MIGRATIONS",
+    "MEMORY_MUTABLE_TABLES",
     "MEMORY_SCHEMA_VERSION",
+    "MEMORY_WITNESS_IMMUTABLE_COLUMNS",
+    "MEMORY_WITNESS_MUTABLE_PROJECTION_COLUMNS",
+    "MemoryDatabaseImmutabilityError",
+    "MemoryImmutabilityPolicyError",
     "ensure_memory_storage_schema",
+    "memory_database_immutability_required",
+    "verify_memory_storage_immutability",
 ]

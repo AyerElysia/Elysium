@@ -653,28 +653,34 @@ _INT_COLUMNS = {
 }
 _FLOAT_FIELDS = {
     ("memory_schema", "updated_at"),
-    *(("memory_nodes", column) for column in (
-        "last_accessed_at",
-        "activation_strength",
-        "emotional_valence",
-        "emotional_arousal",
-        "importance",
-        "created_at",
-        "updated_at",
-        "source_mtime",
-        "embedding_updated_at",
-    )),
+    *(
+        ("memory_nodes", column)
+        for column in (
+            "last_accessed_at",
+            "activation_strength",
+            "emotional_valence",
+            "emotional_arousal",
+            "importance",
+            "created_at",
+            "updated_at",
+            "source_mtime",
+            "embedding_updated_at",
+        )
+    ),
     *(("memory_chunks", column) for column in ("created_at", "updated_at")),
     *(("memory_index_jobs", column) for column in ("created_at", "updated_at")),
     ("memory_index_state", "updated_at"),
     *(("memory_vector_tombstones", column) for column in ("created_at", "consumed_at")),
-    *(("memory_edges", column) for column in (
-        "weight",
-        "base_strength",
-        "reinforcement",
-        "last_activated_at",
-        "created_at",
-    )),
+    *(
+        ("memory_edges", column)
+        for column in (
+            "weight",
+            "base_strength",
+            "reinforcement",
+            "last_activated_at",
+            "created_at",
+        )
+    ),
     ("memory_corrections", "created_at"),
 }
 
@@ -747,7 +753,9 @@ def _source_database(snapshot_root: Path) -> tuple[Path, dict[str, Any]]:
     try:
         source.relative_to(snapshot_root)
     except ValueError as exc:
-        raise MemoryCopyError("Life Memory snapshot path escapes snapshot root") from exc
+        raise MemoryCopyError(
+            "Life Memory snapshot path escapes snapshot root"
+        ) from exc
     expected_hash = str(entry.get("backup_sha256") or entry.get("sha256") or "")
     if not source.is_file() or len(expected_hash) != 64:
         raise MemoryCopyError("Life Memory snapshot database is incomplete")
@@ -758,7 +766,9 @@ def _source_database(snapshot_root: Path) -> tuple[Path, dict[str, Any]]:
     return source, {"manifest": manifest, "entry": entry}
 
 
-def open_memory_source(snapshot_directory: str | Path) -> tuple[sqlite3.Connection, dict[str, Any]]:
+def open_memory_source(
+    snapshot_directory: str | Path,
+) -> tuple[sqlite3.Connection, dict[str, Any]]:
     """Open and validate the one declared read-only Memory snapshot database."""
 
     snapshot = Path(snapshot_directory).resolve()
@@ -948,9 +958,7 @@ def _transform_source_row(
             event_type=str(raw["event_type"]),
             content=str(raw["content"]),
             stream_id=str(raw.get("stream_id") or ""),
-            consciousness_instance_id=str(
-                raw.get("consciousness_instance_id") or ""
-            ),
+            consciousness_instance_id=str(raw.get("consciousness_instance_id") or ""),
             actor=str(raw.get("actor") or ""),
             visibility=str(raw.get("visibility") or "private"),
             valid_from=str(raw.get("valid_from") or ""),
@@ -1008,7 +1016,9 @@ def _transform_source_row(
     if table == "memory_witness_sources":
         return {column: raw[column] for column in TABLE_SPECS[table].columns}
     if table == "memory_witness_state":
-        revision = int(raw.get("revision") or 0) if context.witness_state_has_revision else 1
+        revision = (
+            int(raw.get("revision") or 0) if context.witness_state_has_revision else 1
+        )
         return {
             "consciousness_instance_id": str(raw["consciousness_instance_id"]),
             "last_sequence": int(raw.get("last_sequence") or 0),
@@ -1022,9 +1032,12 @@ def _transform_source_row(
         return {column: raw[column] for column in TABLE_SPECS[table].columns}
     if table == "memory_artifact_versions":
         parents = tuple(
-            dict.fromkeys(str(item) for item in _strict_json(
-                raw.get("parent_artifact_ids_json"), expected=list
-            ))
+            dict.fromkeys(
+                str(item)
+                for item in _strict_json(
+                    raw.get("parent_artifact_ids_json"), expected=list
+                )
+            )
         )
         metadata = _strict_json(raw.get("metadata_json"), expected=dict)
         record = MemoryArtifactVersion(
@@ -1037,9 +1050,7 @@ def _transform_source_row(
             valid_from=str(raw.get("valid_from") or ""),
             valid_to=str(raw.get("valid_to") or ""),
             authored_by=str(raw.get("authored_by") or ""),
-            consciousness_instance_id=str(
-                raw.get("consciousness_instance_id") or ""
-            ),
+            consciousness_instance_id=str(raw.get("consciousness_instance_id") or ""),
             stream_scope=str(raw.get("stream_scope") or ""),
             visibility=str(raw.get("visibility") or "private"),
             parent_artifact_ids=parents,
@@ -1080,7 +1091,9 @@ def _transform_source_row(
             metadata=metadata,
         )
         return {
-            **{key: value for key, value in asdict(record).items() if key != "metadata"},
+            **{
+                key: value for key, value in asdict(record).items() if key != "metadata"
+            },
             "metadata_json": canonical_json(metadata),
             "payload_sha256": _payload_hash(record),
         }
@@ -1103,9 +1116,7 @@ def _transform_source_row(
             subject_id=str(raw["subject_id"]),
             content=str(raw["content"]),
             authored_by=str(raw.get("authored_by") or ""),
-            consciousness_instance_id=str(
-                raw.get("consciousness_instance_id") or ""
-            ),
+            consciousness_instance_id=str(raw.get("consciousness_instance_id") or ""),
             recorded_at=str(raw["recorded_at"]),
             valid_from=str(raw.get("valid_from") or ""),
             valid_to=str(raw.get("valid_to") or ""),
@@ -1114,7 +1125,9 @@ def _transform_source_row(
             metadata=metadata,
         )
         return {
-            **{key: value for key, value in asdict(record).items() if key != "metadata"},
+            **{
+                key: value for key, value in asdict(record).items() if key != "metadata"
+            },
             "metadata_json": canonical_json(metadata),
             "payload_sha256": _payload_hash(record),
         }
@@ -1146,9 +1159,7 @@ def _transform_source_row(
             reason=str(raw.get("reason") or ""),
             actor=str(raw.get("actor") or ""),
             recorded_at=str(raw["recorded_at"]),
-            consciousness_instance_id=str(
-                raw.get("consciousness_instance_id") or ""
-            ),
+            consciousness_instance_id=str(raw.get("consciousness_instance_id") or ""),
             stream_scope=str(raw.get("stream_scope") or ""),
             metadata=metadata,
         )
@@ -1173,9 +1184,7 @@ def _transform_source_row(
             episode_id=str(raw["episode_id"]),
             query=str(raw["query"]),
             retrieval_intent=str(raw.get("retrieval_intent") or ""),
-            consciousness_instance_id=str(
-                raw.get("consciousness_instance_id") or ""
-            ),
+            consciousness_instance_id=str(raw.get("consciousness_instance_id") or ""),
             stream_scope=str(raw.get("stream_scope") or ""),
             context_key=str(raw.get("context_key") or ""),
             policy_version=str(raw["policy_version"]),
@@ -1202,7 +1211,9 @@ def _transform_source_row(
             metadata=metadata,
         )
         return {
-            **{key: value for key, value in asdict(record).items() if key != "metadata"},
+            **{
+                key: value for key, value in asdict(record).items() if key != "metadata"
+            },
             "metadata_json": canonical_json(metadata),
             "payload_sha256": _payload_hash(record),
         }
@@ -1269,9 +1280,7 @@ def _transform_source_row(
             recorded_at=str(raw["recorded_at"]),
             stream_scope=str(raw.get("stream_scope") or ""),
             visibility=str(raw.get("visibility") or "private"),
-            consciousness_instance_id=str(
-                raw.get("consciousness_instance_id") or ""
-            ),
+            consciousness_instance_id=str(raw.get("consciousness_instance_id") or ""),
             metadata=metadata,
         )
         return {
@@ -1335,7 +1344,9 @@ def _transform_source_row(
                 recorded_at=str(raw["recorded_at"]),
                 metadata=metadata,
             )
-            values = {key: value for key, value in asdict(record).items() if key != "metadata"}
+            values = {
+                key: value for key, value in asdict(record).items() if key != "metadata"
+            }
         elif table == "memory_epistemic_conflicts":
             record = EpistemicConflict(
                 conflict_id=str(raw["conflict_id"]),
@@ -1347,7 +1358,9 @@ def _transform_source_row(
                 detected_by=str(raw.get("detected_by") or ""),
                 metadata=metadata,
             )
-            values = {key: value for key, value in asdict(record).items() if key != "metadata"}
+            values = {
+                key: value for key, value in asdict(record).items() if key != "metadata"
+            }
         elif table == "memory_state_events":
             payload = _strict_json(raw.get("payload_json"), expected=dict)
             record = MemoryStateEvent(
@@ -1365,7 +1378,11 @@ def _transform_source_row(
                 payload=payload,
             )
             values = {
-                **{key: value for key, value in asdict(record).items() if key != "payload"},
+                **{
+                    key: value
+                    for key, value in asdict(record).items()
+                    if key != "payload"
+                },
                 "entity_id_sha256": _sha256(record.entity_id),
                 "payload_json": canonical_json(payload),
             }
@@ -1381,7 +1398,9 @@ def _transform_source_row(
                 recorded_at=str(raw["recorded_at"]),
                 metadata=metadata,
             )
-            values = {key: value for key, value in asdict(record).items() if key != "metadata"}
+            values = {
+                key: value for key, value in asdict(record).items() if key != "metadata"
+            }
         elif table == "memory_retrieval_exposures":
             record = RetrievalExposure(
                 exposure_id=str(raw["exposure_id"]),
@@ -1397,7 +1416,11 @@ def _transform_source_row(
                 metadata=metadata,
             )
             values = {
-                **{key: value for key, value in asdict(record).items() if key != "metadata"},
+                **{
+                    key: value
+                    for key, value in asdict(record).items()
+                    if key != "metadata"
+                },
                 "entity_id_sha256": _sha256(record.entity_id),
             }
         else:
@@ -1410,7 +1433,9 @@ def _transform_source_row(
                 recorded_at=str(raw["recorded_at"]),
                 metadata=metadata,
             )
-            values = {key: value for key, value in asdict(record).items() if key != "metadata"}
+            values = {
+                key: value for key, value in asdict(record).items() if key != "metadata"
+            }
         if table != "memory_state_events":
             values["metadata_json"] = canonical_json(metadata)
         values["payload_sha256"] = _payload_hash(record)
@@ -1569,11 +1594,29 @@ async def _target_table_root(
             text(f"SELECT {columns} FROM {spec.name} ORDER BY {order}")
         )
         async for row in result.mappings():
-            row_digests.append(
-                _row_digest(spec.name, normalize_target_row(spec, row))
-            )
+            row_digests.append(_row_digest(spec.name, normalize_target_row(spec, row)))
             count += 1
     return count, _table_root(row_digests)
+
+
+async def ensure_memory_copy_schema(
+    runtime: StorageBackendRuntime,
+    *,
+    copy_registry: MySQLCopyAuthorityRegistry,
+    token: CopyAuthorityToken,
+) -> bool:
+    """Apply the trigger policy bound to the immutable copy-run identity."""
+
+    if runtime.writer_role != StorageWriterRole.CANDIDATE_COPY:
+        raise MemoryCopyError("Memory schema copy requires candidate-copy authority")
+    run = await copy_registry.get_run(token.run_id)
+    writer_frozen = bool(run["writer_frozen"])
+    await ensure_memory_storage_schema(
+        runtime,
+        require_database_immutability=writer_frozen,
+        writer_frozen=writer_frozen,
+    )
+    return writer_frozen
 
 
 async def copy_memory_from_snapshot(
@@ -1591,7 +1634,11 @@ async def copy_memory_from_snapshot(
         raise ValueError("Memory copy batch/progress sizes must be positive")
     if runtime.writer_role != StorageWriterRole.CANDIDATE_COPY:
         raise MemoryCopyError("Memory snapshot copy requires candidate-copy authority")
-    await ensure_memory_storage_schema(runtime)
+    await ensure_memory_copy_schema(
+        runtime,
+        copy_registry=copy_registry,
+        token=token,
+    )
     source, evidence = open_memory_source(snapshot_directory)
     context = _source_context(source)
     copied_count = 0
@@ -1708,6 +1755,7 @@ __all__ = [
     "MemoryCopyReport",
     "MemoryTableCopyReport",
     "copy_memory_from_snapshot",
+    "ensure_memory_copy_schema",
     "iter_transformed_source_rows",
     "normalize_target_row",
     "open_memory_source",

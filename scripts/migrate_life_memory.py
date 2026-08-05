@@ -14,7 +14,6 @@ _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPOSITORY_ROOT))
 
-from plugins.life_engine.storage.memory.schema import ensure_memory_storage_schema
 from plugins.life_engine.storage.migration.copy_authority import (
     MySQLCopyAuthorityRegistry,
     open_mysql_copy_runtime,
@@ -22,6 +21,7 @@ from plugins.life_engine.storage.migration.copy_authority import (
 from plugins.life_engine.storage.migration.manifest import load_snapshot_manifest
 from plugins.life_engine.storage.migration.memory_copy import (
     copy_memory_from_snapshot,
+    ensure_memory_copy_schema,
 )
 from plugins.life_engine.storage.migration.memory_export import (
     export_memory_to_sqlite,
@@ -77,17 +77,22 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     runtime = None
     token = None
     try:
+        writer_frozen = bool(manifest.get("writer_frozen"))
         run = await registry.create_run(
             run_id=str(args.run_id),
             source_manifest_sha256=str(manifest["manifest_sha256"]),
             source_snapshot_sha256=str(manifest["source_snapshot_sha256"]),
-            writer_frozen=bool(manifest.get("writer_frozen")),
+            writer_frozen=writer_frozen,
             metadata={
                 "domain": "life_memory",
                 "selection_contract": "explicit-memory-tables-v1",
                 "deleted_nodes": "preserved",
                 "legacy_sqlite_fts": "rebuildable-visible-content",
-                "database_immutability": "application-enforced-shadow",
+                "database_immutability": (
+                    "database-trigger-required"
+                    if writer_frozen
+                    else "application-enforced-shadow"
+                ),
             },
         )
         token = await registry.acquire(
@@ -101,13 +106,21 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             token,
             backend_identity=config.safe_identity,
         )
-        await ensure_memory_storage_schema(runtime)
         if args.schema_only:
+            database_immutability = await ensure_memory_copy_schema(
+                runtime,
+                copy_registry=registry,
+                token=token,
+            )
             verification = {
                 "verified": False,
                 "schema_only": True,
                 "generation_eligible": False,
-                "database_immutability": "application-enforced-shadow",
+                "database_immutability": (
+                    "database-trigger"
+                    if database_immutability
+                    else "application-enforced-shadow"
+                ),
             }
             final_run = await registry.complete(token, verification=verification)
             return {"run": final_run, "verification": verification}
@@ -133,8 +146,10 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             "reverse_export": (
                 reverse_report.to_dict() if reverse_report is not None else {}
             ),
-            "database_immutability": "application-enforced-shadow",
-            "writer_frozen": bool(manifest.get("writer_frozen")),
+            "database_immutability": (
+                "database-trigger" if writer_frozen else "application-enforced-shadow"
+            ),
+            "writer_frozen": writer_frozen,
             "generation_eligible": False,
         }
         final_run = await registry.complete(token, verification=verification)

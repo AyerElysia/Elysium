@@ -6,13 +6,19 @@ from ..contracts import StorageBackendRuntime
 from ..models import BackendKind
 from .contracts import MemoryStorageBundle
 from .mysql import create_mysql_memory_storage_bundle
-from .schema import ensure_memory_storage_schema
+from .schema import (
+    ensure_memory_storage_schema,
+    memory_database_immutability_required,
+    verify_memory_storage_immutability,
+)
 
 
 async def open_mysql_memory_storage(
     runtime: StorageBackendRuntime,
     *,
     initialize_schema: bool = False,
+    require_database_immutability: bool = True,
+    writer_frozen: bool | None = None,
 ) -> MemoryStorageBundle:
     """Open one coherent MySQL bundle without fallback or data migration.
 
@@ -24,7 +30,17 @@ async def open_mysql_memory_storage(
     if not runtime.enabled or runtime.backend != BackendKind.MYSQL:
         raise RuntimeError("MySQL Memory storage requires the selected MySQL runtime")
     if initialize_schema:
-        await ensure_memory_storage_schema(runtime)
+        await ensure_memory_storage_schema(
+            runtime,
+            require_database_immutability=require_database_immutability,
+            writer_frozen=writer_frozen,
+        )
+    elif memory_database_immutability_required(
+        runtime,
+        require_database_immutability=require_database_immutability,
+        writer_frozen=writer_frozen,
+    ):
+        await verify_memory_storage_immutability(runtime)
     return create_mysql_memory_storage_bundle(runtime)
 
 

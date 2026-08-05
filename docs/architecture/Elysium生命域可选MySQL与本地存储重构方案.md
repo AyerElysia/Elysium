@@ -10,6 +10,11 @@
 > `writer_frozen=false` 快照且数据库级不可变 trigger 不可用，因此证明“可无损
 > 复制和恢复”，不证明“可激活切换”。
 >
+> Memory 数据库级不可变合同现已实现：权威历史 trigger 使用独立 checksum migration，
+> active/frozen generation 默认安装并在失败时 fail closed；仅显式的
+> `StorageWriterRole.CANDIDATE_COPY + writer_frozen=false` shadow 可跳过。上述既有远程
+> shadow 创建时没有该保护，历史验证结论不因此升级，仍不可激活。
+>
 > 适用基线：以项目实施时实际受支持的 Python、SQLAlchemy、asyncmy、MySQL 与 Chroma 版本为准；运行时版本升级或降级不属于本存储重构范围。
 
 阶段 0/1 的实现与真实数据证据见 [生命域可选存储阶段 0/1 交付报告](../report/life-storage-phase0-phase1-2026-08-04.md)，Memory 阶段 2 见 [生命域可选存储阶段 2 / Memory 交付报告](../report/life-storage-phase2-memory-2026-08-04.md)，真实 Memory 往返迁移见 [生命域可选存储阶段 2B / Memory 迁移报告](../report/life-storage-phase2b-memory-migration-2026-08-04.md)，Presence/World 迁移和 Subject 现役接线见 [生命域可选存储阶段 2C 交付报告](../report/life-storage-phase2c-presence-world-subject-integration-2026-08-04.md)，Life Event 阶段 3 见 [Life Event Ledger 交付报告](../report/life-storage-phase3-life-event-2026-08-04.md)，操作边界见 [生命域存储快照与权威切换运行手册](../operations/life_storage_backend_runbook.md)。平台开关保持默认关闭；在各领域合同测试、逐记录复制校验、恢复演练和人工切换门全部通过前，`storage.enabled` 必须为 `false`。

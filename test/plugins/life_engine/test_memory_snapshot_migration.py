@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import sqlite3
+from types import SimpleNamespace
+
+import pytest
 
 from plugins.life_engine.memory.epistemic import create_epistemic_schema
 from plugins.life_engine.memory.experience import create_life_memory_schema
 from plugins.life_engine.memory.indexing import create_memory_schema
 from plugins.life_engine.memory.living import create_living_memory_schema
+from plugins.life_engine.storage.contracts import StorageWriterRole
+from plugins.life_engine.storage.migration import memory_copy as memory_copy_module
 from plugins.life_engine.storage.migration.memory_copy import (
     TABLE_SPECS,
     _insert_statement,
     _source_context,
+    ensure_memory_copy_schema,
     iter_transformed_source_rows,
     normalize_target_row,
 )
@@ -74,6 +80,42 @@ def _rows(
         batch_size=10,
     )
     return [row for batch in batches for row in batch]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("writer_frozen", [False, True])
+async def test_copy_schema_binds_trigger_policy_to_frozen_run(
+    monkeypatch: pytest.MonkeyPatch,
+    writer_frozen: bool,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class _Registry:
+        async def get_run(self, run_id: str) -> dict[str, object]:
+            assert run_id == "copy-run"
+            return {"writer_frozen": writer_frozen}
+
+    async def _ensure(_runtime: object, **kwargs: object) -> None:
+        calls.append(kwargs)
+
+    monkeypatch.setattr(memory_copy_module, "ensure_memory_storage_schema", _ensure)
+    runtime = SimpleNamespace(writer_role=StorageWriterRole.CANDIDATE_COPY)
+    token = SimpleNamespace(run_id="copy-run")
+
+    assert (
+        await ensure_memory_copy_schema(
+            runtime,  # type: ignore[arg-type]
+            copy_registry=_Registry(),  # type: ignore[arg-type]
+            token=token,  # type: ignore[arg-type]
+        )
+        is writer_frozen
+    )
+    assert calls == [
+        {
+            "require_database_immutability": writer_frozen,
+            "writer_frozen": writer_frozen,
+        }
+    ]
 
 
 def test_deleted_nodes_and_their_edges_are_preserved() -> None:
