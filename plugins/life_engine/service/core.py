@@ -28,6 +28,14 @@ from src.kernel.llm import LLMPayload, ROLE, Text, ToolRegistry, ToolResult
 from src.kernel.scheduler import get_unified_scheduler, TriggerType
 
 if TYPE_CHECKING:
+    from ..attention_threads import (
+        AttentionThreadCommand,
+        AttentionThreadCommit,
+        AttentionThreadPage,
+        AttentionThreadPageQuery,
+        AttentionThreadService,
+        InstanceFocus,
+    )
     from ..memory.service import LifeMemoryService
 
 from .audit import (
@@ -401,6 +409,7 @@ class LifeEngineService(BaseService):
         self._presence_world_stores: Any | None = None
         self._life_event_store: Any | None = None
         self._learning_stores: Any | None = None
+        self._attention_thread_service: Any | None = None
         self._subject_document_store: Any | None = None
         self._subject_workspace_observer: Any | None = None
         self._subject_workspace_projector: Any | None = None
@@ -639,6 +648,7 @@ class LifeEngineService(BaseService):
             )
         if changed:
             await self.save_consciousness_registry_async()
+            await self._clear_instance_attention_focus(instance_id)
         return changed
 
     async def terminate_consciousness_instance(
@@ -666,7 +676,27 @@ class LifeEngineService(BaseService):
             )
         if changed:
             await self.save_consciousness_registry_async()
+            await self._clear_instance_attention_focus(instance_id)
         return changed
+
+    async def _clear_instance_attention_focus(self, instance_id: str) -> None:
+        """Release ephemeral focus without mutating subject thread authority."""
+
+        attention = self._attention_thread_service
+        if attention is None:
+            return
+        try:
+            focus = await attention.get_focus(instance_id)
+            if focus is not None:
+                await attention.clear_focus(
+                    instance_id,
+                    expected_revision=focus.revision,
+                )
+        except Exception as exc:  # noqa: BLE001 - lifecycle cleanup is best effort
+            logger.warning(
+                "清理意识实例临时关注焦点失败: "
+                f"instance_id={instance_id}, error={type(exc).__name__}"
+            )
 
     def _get_lock(self) -> asyncio.Lock:
         """获取懒加载锁。"""
@@ -686,6 +716,64 @@ class LifeEngineService(BaseService):
                 "the coherent runtime before injecting domain consumers"
             )
         return self._storage_runtime
+
+    @property
+    def attention_thread_service(self) -> AttentionThreadService:
+        """Return the selected subject-attention authority or fail closed."""
+
+        service = self._attention_thread_service
+        if service is None:
+            raise RuntimeError(
+                "AttentionThreadAuthorityNotStarted: persistent subject attention "
+                "requires the selected storage runtime"
+            )
+        return service
+
+    async def decide_attention_thread(
+        self,
+        command: AttentionThreadCommand,
+    ) -> AttentionThreadCommit:
+        """Submit one explicit subject decision to the canonical authority."""
+
+        commit = await self.attention_thread_service.decide(command)
+        if (
+            command.action == "close"
+            and not commit.idempotent_replay
+            and self._learning_scheduler is not None
+        ):
+            try:
+                await self._learning_scheduler.on_attention_thread_closed(
+                    public_statement=command.public_statement,
+                    source_event_ids=[
+                        commit.event_id,
+                        *command.source_occurrence_ids,
+                    ],
+                    actor_consciousness_instance_id=(
+                        command.actor_consciousness_instance_id
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 - authority already committed
+                logger.warning(
+                    "持续关注线索已提交，但派生学习未完成: "
+                    f"error={type(exc).__name__}"
+                )
+        return commit
+
+    async def page_attention_threads(
+        self,
+        query: AttentionThreadPageQuery,
+    ) -> AttentionThreadPage:
+        """Read a bounded traceable subject-attention projection."""
+
+        return await self.attention_thread_service.page(query)
+
+    async def set_instance_attention_focus(
+        self,
+        focus: InstanceFocus,
+    ) -> InstanceFocus:
+        """Set technical instance focus without changing a subject thread."""
+
+        return await self.attention_thread_service.set_focus(focus)
 
     async def _open_selected_storage_runtime(self) -> None:
         """Open the selected runtime exactly once under service ownership."""
@@ -715,6 +803,7 @@ class LifeEngineService(BaseService):
             or self._presence_world_stores is not None
         ):
             return
+        from ..storage.attention_factory import open_attention_thread_stores
         from ..storage.domain_factory import open_presence_world_stores
         from ..storage.event_factory import open_life_event_store
         from ..storage.learning_factory import open_learning_stores
@@ -738,6 +827,19 @@ class LifeEngineService(BaseService):
             runtime,
             initialize_schema=False,
         )
+        attention_stores = await open_attention_thread_stores(
+            runtime,
+            initialize_schema=False,
+        )
+        from ..attention_threads import AttentionThreadService
+
+        attention_service = AttentionThreadService(
+            attention_stores.authority,
+            attention_stores.focus,
+        )
+        # Business startup never creates schema.  Missing or incomplete
+        # migrations must fail before the selected runtime is exposed.
+        await attention_service.health_snapshot()
         learning_cfg = getattr(self._cfg(), "learning", None)
         learning_stores = None
         if learning_cfg is None or getattr(learning_cfg, "enabled", True):
@@ -770,6 +872,7 @@ class LifeEngineService(BaseService):
         await gateway.catch_up()
         self._life_event_store = ledger
         self._learning_stores = learning_stores
+        self._attention_thread_service = attention_service
         self._presence_world_stores = stores
         self._subject_document_store = subject_store
         self._subject_workspace_observer = subject_observer
@@ -807,6 +910,7 @@ class LifeEngineService(BaseService):
         self._subject_workspace_projector = None
         self._subject_document_store = None
         self._learning_stores = None
+        self._attention_thread_service = None
         if runtime is not None:
             try:
                 await runtime.close()
@@ -2310,6 +2414,7 @@ class LifeEngineService(BaseService):
             or self._life_event_store is None
             or self._presence_world_stores is None
             or self._subject_document_store is None
+            or self._attention_thread_service is None
         ):
             return dict(self._storage_health_cache)
         component_checks: list[tuple[str, Any]] = [
@@ -2318,6 +2423,7 @@ class LifeEngineService(BaseService):
             ("presence", self._presence_world_stores.presence.health_snapshot()),
             ("world", self._presence_world_stores.world.health_snapshot()),
             ("subject_document", self._subject_document_store.health_snapshot()),
+            ("attention_threads", self._attention_thread_service.health_snapshot()),
         ]
         if self._learning_stores is not None:
             component_checks.append(
@@ -2383,6 +2489,9 @@ class LifeEngineService(BaseService):
             snapshot["subject_document"] = dict(
                 components.get("subject_document") or {}
             )
+            snapshot["attention_threads"] = dict(
+                components.get("attention_threads") or {}
+            )
         else:
             if self._event_bus is not None:
                 snapshot["raw_event_ledger"] = (
@@ -2395,6 +2504,10 @@ class LifeEngineService(BaseService):
                 snapshot["world_projection"] = (
                     self._world_projection.health_snapshot()
                 )
+            snapshot["attention_threads"] = {
+                "status": "disabled",
+                "reason": "persistent attention requires selected storage",
+            }
         if self._router_context_projection is not None:
             snapshot["router_context_projection"] = (
                 self._router_context_projection.health_snapshot()
@@ -6220,22 +6333,38 @@ class LifeEngineService(BaseService):
 
     def _get_nucleus_tools(self) -> list[type]:
         """获取中枢可用的工具类列表。"""
-        from ..tools import ALL_TOOLS, TODO_TOOLS, WEB_TOOLS
+        from plugins.emoji.sender.collection_tools import EMOJI_COLLECTION_TOOLS
+
+        from ..attention_threads.tools import ATTENTION_THREAD_TOOLS
+        from ..learning.tools import LEARNING_TOOLS
         from ..memory.tools import MEMORY_TOOLS
         from ..streams.tools import STREAM_TOOLS
+        from ..tools import ALL_TOOLS, TODO_TOOLS, WEB_TOOLS
+        from ..tools.autonomy_tools import AUTONOMY_TOOLS
+        from ..tools.event_grep_tools import EVENT_GREP_TOOLS
         from ..tools.grep_tools import GREP_TOOLS
         from ..tools.schedule_tools import SCHEDULE_TOOLS
-        from ..tools.autonomy_tools import AUTONOMY_TOOLS
         from ..tools.skill_tools import SKILL_TOOLS
-        from ..tools.event_grep_tools import EVENT_GREP_TOOLS
         # 自学习工具：让她能自己查看/质疑/反思洞察账本。
         # 之前这组在 plugin.get_components() 里注册了，却没进中枢工具池，
         # 于是她只能用 nucleus_bash 去读 .life_learning/ —— 日志里有 5 次这样的尝试。
-        from ..learning.tools import LEARNING_TOOLS
         # 表情包仿生收藏工具：让她自主浏览/收藏/跳过最近收到的表情包。
-        from plugins.emoji.sender.collection_tools import EMOJI_COLLECTION_TOOLS
 
-        return ALL_TOOLS + TODO_TOOLS + MEMORY_TOOLS + GREP_TOOLS + WEB_TOOLS + STREAM_TOOLS + SCHEDULE_TOOLS + AUTONOMY_TOOLS + SKILL_TOOLS + EVENT_GREP_TOOLS + LEARNING_TOOLS + EMOJI_COLLECTION_TOOLS
+        return (
+            ALL_TOOLS
+            + TODO_TOOLS
+            + MEMORY_TOOLS
+            + GREP_TOOLS
+            + WEB_TOOLS
+            + STREAM_TOOLS
+            + SCHEDULE_TOOLS
+            + AUTONOMY_TOOLS
+            + SKILL_TOOLS
+            + EVENT_GREP_TOOLS
+            + LEARNING_TOOLS
+            + ATTENTION_THREAD_TOOLS
+            + EMOJI_COLLECTION_TOOLS
+        )
 
     @staticmethod
     def _heartbeat_tool_call_metadata(call: Any) -> tuple[str, dict[str, Any]]:

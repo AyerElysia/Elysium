@@ -5,6 +5,12 @@ from __future__ import annotations
 from src.app.plugin_system.base import BasePlugin, register_plugin
 from src.kernel.logger import get_logger
 
+from ..agents import register_builtin_agents
+from ..agents.mission_tool import MISSION_TOOLS
+from ..attention_threads.tools import ATTENTION_THREAD_TOOLS
+from ..learning.tools import LEARNING_TOOLS
+from ..memory.tools import MEMORY_TOOLS
+from ..service import LifeEngineService
 from ..service.audit import (
     get_life_log_file,
     log_lifecycle,
@@ -12,29 +18,23 @@ from ..service.audit import (
     teardown_life_audit_logger,
 )
 from ..service.command_handler import LifeEngineCommandHandler
-from .config import LifeEngineConfig
 from ..service.event_handler import LifeEngineMessageCollectorHandler
-from ..service import LifeEngineService
 from ..tools import ALL_TOOLS
-from ..tools.todo_tools import TODO_TOOLS
-from ..memory.tools import MEMORY_TOOLS
-from ..tools.grep_tools import GREP_TOOLS
-from ..tools.web_tools import WEB_TOOLS
-from ..tools.schedule_tools import SCHEDULE_TOOLS
 from ..tools.autonomy_tools import AUTONOMY_TOOLS
-from ..tools.skill_tools import SKILL_TOOLS
 from ..tools.event_grep_tools import EVENT_GREP_TOOLS
-from ..learning.tools import LEARNING_TOOLS
+from ..tools.grep_tools import GREP_TOOLS
+from ..tools.schedule_tools import SCHEDULE_TOOLS
+from ..tools.skill_tools import SKILL_TOOLS
+from ..tools.todo_tools import TODO_TOOLS
+from ..tools.web_tools import WEB_TOOLS
 from .compat_tools import (
+    LifeInnerDialogueTool,
     LifeInnerQueryTool,
+    LifeRecordInnerMonologueAction,
     LifeReportStateAction,
     LifeThinkAction,
-    LifeRecordInnerMonologueAction,
-    LifeInnerDialogueTool,
 )
-from ..agents import register_builtin_agents
-from ..agents.mission_tool import MISSION_TOOLS
-
+from .config import LifeEngineConfig
 
 logger = get_logger("life_engine", display="life_engine")
 
@@ -98,6 +98,7 @@ class LifeEnginePlugin(BasePlugin):
             *SKILL_TOOLS,
             *EVENT_GREP_TOOLS,
             *LEARNING_TOOLS,
+            *ATTENTION_THREAD_TOOLS,
             *MISSION_TOOLS,
         ]
 

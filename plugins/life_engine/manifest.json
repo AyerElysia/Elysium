@@ -148,6 +148,12 @@
     },
     {
       "component_type": "tool",
+      "component_name": "nucleus_manage_attention_thread",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "tool",
       "component_name": "nucleus_minecraft",
       "dependencies": [],
       "enabled": true

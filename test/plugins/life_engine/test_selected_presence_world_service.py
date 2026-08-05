@@ -12,6 +12,13 @@ from typing import Any
 import pytest
 
 import plugins.life_engine.service.core as core_module
+from plugins.life_engine.attention_threads import (
+    AttentionThreadCommand,
+    AttentionThreadCommit,
+    AttentionThreadPageQuery,
+    InstanceFocus,
+    build_attention_thread_projection,
+)
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.service import LifeEngineService
 from plugins.life_engine.service.async_presence import (
@@ -150,6 +157,70 @@ class _FakeLearningStore:
         }
 
 
+class _FakeAttentionStore:
+    def __init__(self) -> None:
+        self.commands: list[AttentionThreadCommand] = []
+        self.focuses: dict[str, InstanceFocus] = {}
+
+    async def decide(
+        self,
+        command: AttentionThreadCommand,
+    ) -> AttentionThreadCommit:
+        idempotent_replay = any(
+            item.occurrence_id == command.occurrence_id for item in self.commands
+        )
+        if not idempotent_replay:
+            self.commands.append(command)
+        return AttentionThreadCommit(
+            event_id="attention:event:fake",
+            occurrence_id=command.occurrence_id,
+            thread_id=command.thread_id,
+            revision=command.expected_revision + 1,
+            status={"pause": "paused", "close": "closed"}.get(
+                command.action,
+                "open",
+            ),
+            idempotent_replay=idempotent_replay,
+        )
+
+    async def page(self, query: AttentionThreadPageQuery) -> Any:
+        return build_attention_thread_projection(
+            (),
+            source_frontier=len(self.commands),
+            projection_revision=len(self.commands),
+            max_bytes=query.max_bytes,
+            projection_kind=query.projection_kind,
+        )
+
+    async def set_focus(self, focus: InstanceFocus) -> InstanceFocus:
+        self.focuses[focus.instance_id] = focus
+        return focus
+
+    async def get_focus(self, instance_id: str) -> InstanceFocus | None:
+        return self.focuses.get(instance_id)
+
+    async def clear_focus(
+        self,
+        instance_id: str,
+        *,
+        expected_revision: int,
+    ) -> None:
+        focus = self.focuses.get(instance_id)
+        if focus is None or focus.revision != expected_revision:
+            raise RuntimeError("fake focus revision conflict")
+        self.focuses.pop(instance_id)
+
+    async def health_snapshot(self) -> dict[str, Any]:
+        return {
+            "status": "healthy",
+            "event_count": len(self.commands),
+            "source_frontier": len(self.commands),
+            "threads": {"open": len(self.commands), "paused": 0, "closed": 0},
+            "instance_focus_count": len(self.focuses),
+            "schema_version": 1,
+        }
+
+
 def _selected_service(tmp_path: Path, backend: BackendKind) -> LifeEngineService:
     config = LifeEngineConfig()
     config.settings.enabled = True
@@ -191,6 +262,7 @@ def _install_selected_factories(
     factory_calls: list[tuple[str, bool]] = []
     subject_store = _FakeSubjectStore()
     learning_store = _FakeLearningStore()
+    attention_store = _FakeAttentionStore()
 
     async def _open_runtime(_settings: Any) -> _FakeRuntime:
         runtime = _FakeRuntime(backend)
@@ -235,6 +307,17 @@ def _install_selected_factories(
         factory_calls.append(("learning", initialize_schema))
         return SimpleNamespace(store=learning_store)
 
+    async def _open_attention(
+        runtime: _FakeRuntime,
+        *,
+        initialize_schema: bool = False,
+        require_database_immutability: bool = True,
+    ) -> Any:
+        assert runtime.backend == backend
+        assert require_database_immutability is True
+        factory_calls.append(("attention", initialize_schema))
+        return SimpleNamespace(authority=attention_store, focus=attention_store)
+
     monkeypatch.setattr(
         "plugins.life_engine.storage.factory.open_storage_backend",
         _open_runtime,
@@ -254,6 +337,10 @@ def _install_selected_factories(
     monkeypatch.setattr(
         "plugins.life_engine.storage.learning_factory.open_learning_stores",
         _open_learning,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.storage.attention_factory.open_attention_thread_stores",
+        _open_attention,
     )
     return runtimes, factory_calls
 
@@ -302,6 +389,7 @@ async def test_selected_service_uses_one_backend_for_presence_world_and_events(
         ("events", False),
         ("presence-world", False),
         ("subject", False),
+        ("attention", False),
         ("learning", False),
     ]
     assert first.storage_runtime is runtimes[0]
@@ -363,6 +451,12 @@ async def test_selected_service_uses_one_backend_for_presence_world_and_events(
     assert (
         first.health()["storage_runtime"]["components"]["learning"]["event_count"] == 0
     )
+    assert (
+        first.health()["storage_runtime"]["components"]["attention_threads"][
+            "event_count"
+        ]
+        == 0
+    )
 
     await first._close_selected_storage()
     assert runtimes[0].close_calls == 1
@@ -419,6 +513,101 @@ async def test_selected_service_close_releases_runtime_after_flush_failure(
     assert service.health()["storage_runtime"]["status"] == "failed"
     await service._close_selected_storage()
     assert runtimes[0].close_calls == 1
+
+
+@pytest.mark.parametrize("backend", [BackendKind.LOCAL, BackendKind.MYSQL])
+async def test_selected_service_injects_attention_and_clears_only_instance_focus(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: BackendKind,
+) -> None:
+    stores = build_fake_stores()
+    ledger = _FakeLifeEventStore()
+    runtimes, factory_calls = _install_selected_factories(
+        monkeypatch,
+        backend,
+        stores,
+        ledger,
+    )
+    service = _selected_service(tmp_path, backend)
+    await service._start_selected_storage()
+    actor = ConsciousnessInstance(
+        instance_id="attention:service:actor",
+        kind="contract",
+        stream_ids=["stream:attention:service"],
+    )
+    await service.register_consciousness_instance(actor)
+    command = AttentionThreadCommand(
+        occurrence_id="attention:service:decision:1",
+        thread_id="attention:service:thread:1",
+        action="open",
+        actor_consciousness_instance_id=actor.instance_id,
+        source_instance_id=actor.instance_id,
+        source_occurrence_ids=("life:event:attention:1",),
+        causation_occurrence_id="life:event:attention:1",
+        expected_revision=0,
+        public_statement="我明确选择跨意识实例保留这条关注。",
+        occurred_at="2026-08-06T01:02:03+00:00",
+    )
+    commit = await service.decide_attention_thread(command)
+    assert commit.thread_id == command.thread_id
+    page = await service.page_attention_threads(
+        AttentionThreadPageQuery(projection_kind="service-contract")
+    )
+    assert page.source_frontier == 1
+
+    class _LearningObserver:
+        def __init__(self) -> None:
+            self.closes: list[dict[str, Any]] = []
+
+        async def on_attention_thread_closed(self, **payload: Any) -> None:
+            self.closes.append(payload)
+
+    learning = _LearningObserver()
+    service._learning_scheduler = learning
+    close_command = replace(
+        command,
+        occurrence_id="attention:service:decision:close",
+        action="close",
+        expected_revision=1,
+        public_statement="我明确选择结束，并允许学习系统只读取这句公开表述。",
+    )
+    await service.decide_attention_thread(close_command)
+    await service.decide_attention_thread(close_command)
+    assert learning.closes == [
+        {
+            "public_statement": close_command.public_statement,
+            "source_event_ids": [
+                "attention:event:fake",
+                *close_command.source_occurrence_ids,
+            ],
+            "actor_consciousness_instance_id": actor.instance_id,
+        }
+    ]
+
+    focus = InstanceFocus(
+        instance_id=actor.instance_id,
+        focus_occurrence_id="attention:focus:service:1",
+        source_occurrence_id="life:event:attention:1",
+        entered_at="2026-08-06T01:02:03+00:00",
+        expires_at="2099-08-06T01:07:03+00:00",
+        revision=1,
+        thread_id=command.thread_id,
+    )
+    await service.set_instance_attention_focus(focus)
+    assert await service.attention_thread_service.get_focus(actor.instance_id) == focus
+    assert await service.suspend_consciousness_instance(actor.instance_id)
+    assert await service.attention_thread_service.get_focus(actor.instance_id) is None
+    # Suspending an instance clears only its ephemeral focus; the subject event
+    # and resulting thread remain untouched.
+    assert page.source_frontier == 1
+    assert (await service.refresh_storage_health())["status"] == "healthy"
+    assert ("attention", False) in factory_calls
+
+    await service._close_selected_storage()
+    assert runtimes[0].close_calls == 1
+    with pytest.raises(RuntimeError, match="AttentionThreadAuthorityNotStarted"):
+        _ = service.attention_thread_service
 
 
 async def test_service_stop_aggregates_consumer_failures_and_closes_runtime_last(

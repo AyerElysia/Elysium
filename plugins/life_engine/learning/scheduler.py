@@ -513,6 +513,39 @@ class LearningScheduler:
         except Exception as exc:
             logger.warning("思考闭合反思异常: %s", type(exc).__name__)
 
+    async def on_attention_thread_closed(
+        self,
+        *,
+        public_statement: str,
+        source_event_ids: list[str],
+        actor_consciousness_instance_id: str,
+    ) -> None:
+        """Learn only from an explicit public close statement, never raw CoT."""
+
+        statement = str(public_statement or "").strip()
+        actor = str(actor_consciousness_instance_id or "").strip()
+        sources = [str(value).strip() for value in source_event_ids if str(value).strip()]
+        if not statement or not actor or not sources:
+            raise ValueError(
+                "attention close learning requires statement, actor, and sources"
+            )
+        try:
+            insights = await self.submit_reflection(
+                reflection_kind="introspection",
+                reflection_text=statement,
+                context="主体明确关闭的持续关注线索公开表述",
+                source_event_ids=sources,
+                actor_consciousness_instance_id=actor,
+            )
+            if insights:
+                logger.info("持续关注线索闭合产生 %s 条候选洞察", len(insights))
+            await self.on_heartbeat()
+        except Exception as exc:  # noqa: BLE001 - derived learning cannot undo authority
+            logger.warning(
+                "持续关注线索闭合反思异常: %s",
+                type(exc).__name__,
+            )
+
     # ── 主体文档复盘机会 ─────────────────────────────────────
 
     def _subject_review_state(self) -> tuple[dict[str, Any], dict[str, Any]]:

@@ -133,6 +133,8 @@ class AttentionOpportunitySection(HeartbeatSectionProvider):
     section_id = "attention_opportunity"
 
     def enabled(self, ctx: SectionContext) -> bool:
+        if getattr(ctx.service, "_attention_thread_service", None) is not None:
+            return True
         streams_cfg = getattr(ctx.config, "streams", None)
         curiosity_cfg = getattr(ctx.config, "curiosity", None)
         streams_enabled = streams_cfg is None or bool(
@@ -153,7 +155,29 @@ class AttentionOpportunitySection(HeartbeatSectionProvider):
             getattr(streams_cfg, "inject_to_heartbeat", True)
         )
         manager = getattr(service, "_thought_manager", None)
-        if streams_enabled and manager is not None:
+        attention = getattr(service, "_attention_thread_service", None)
+        if attention is not None:
+            from ..attention_threads import AttentionThreadPageQuery
+
+            try:
+                page = await service.page_attention_threads(
+                    AttentionThreadPageQuery(
+                        statuses=("open", "paused"),
+                        limit=16,
+                        max_bytes=16 * 1024,
+                        projection_kind="heartbeat_attention_opportunity",
+                        focus_instance_id="chat_global",
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - health reports exact failure
+                logger.debug(
+                    "canonical attention projection unavailable: "
+                    f"{type(exc).__name__}"
+                )
+            else:
+                if page.items:
+                    blocks.append(f"#### 主体持续关注线索\n{page.content}")
+        elif streams_enabled and manager is not None:
             focus_window = (
                 int(getattr(streams_cfg, "focus_window_minutes", 30) or 30)
                 if streams_cfg
