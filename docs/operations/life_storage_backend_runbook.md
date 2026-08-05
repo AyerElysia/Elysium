@@ -1,6 +1,6 @@
 # 生命域存储快照与权威切换运行手册
 
-本手册服务于 Elysium 生命域可选本地/MySQL 存储。它不包含真实主机、用户名、密码或 fencing token。Life Event、Memory、Subject Document、Presence、World、Learning 的 Port/adapter、`LifeEngineService` 单 runtime 接线、未冻结候选复制和反向恢复均已实现；Memory 数据库级不可变保护已实现，但正式冻结复制、隔离 MySQL 破坏性合同、跨领域整体验收和人工切换尚未完成，因此本手册中的正式切换步骤是**验收门**，不是当前可以执行的上线指令。
+本手册服务于 Elysium 生命域可选本地/MySQL 存储。它不包含真实主机、用户名、密码或 fencing token。Life Event、Memory、Subject Document、Presence、World、Learning 的 Port/adapter、`LifeEngineService` 单 runtime 接线、未冻结候选复制、反向恢复、数据库不可变保护与真实隔离 MySQL 合同均已实现；正式冻结复制、五域同快照 generation 签署和用户手动启动后的跨领域验收尚未完成，因此本手册中的正式切换步骤是**验收门**，不是当前可以直接执行的上线指令。
 
 ## 1. 当前安全状态
 
@@ -132,7 +132,7 @@ enabled 模式的固定顺序是：service 打开并拥有一个 runtime → 注
 
 本阶段只验证适配器合同，不会修改 `storage.enabled`、不会迁移正式数据、不会注册或激活正式 generation，也不会启动或停止 Elysium、NapCat 或其他运行进程。
 
-### 6.2 候选复制控制面
+### 6.4 候选复制控制面
 
 候选复制不得借用正式 authority。`life_storage_copy_runs` 只协调复制/导出批次，使用数据库时间租约、单调 epoch 与 fencing token；它不能注册或激活 backend generation。
 
@@ -147,7 +147,7 @@ Life Event 旧账本迁移必须使用 exact snapshot import。禁止先反序�
 
 正式 activation 默认要求数据库级不可变 trigger。若 MySQL 账号因 binary logging / `SUPER` 权限限制无法创建 trigger，初始化必须 fail closed。仅非冻结、不可激活的影子复制可显式降级为应用层不可变，并必须在报告中记录。
 
-### 6.3 反向导出
+### 6.5 反向导出
 
 反向导出只能写入一个此前不存在的新目录：
 
@@ -159,7 +159,7 @@ Life Event 旧账本迁移必须使用 exact snapshot import。禁止先反序�
 
 当前已验证的 Life Event 恢复副本位于 `C:\Temp\Data\ElysiumBackups\life-event-reverse-20260804T0735Z`。它是恢复演练资产，不是 active backend，也不授权自动切换。
 
-### 6.4 Subject Document 精确复制与工作区边界
+### 6.6 Subject Document 精确复制与工作区边界
 
 Subject Document 的候选复制使用：
 
@@ -198,7 +198,7 @@ Witness 的声明路径必须先调用 service 的 Subject 写入口，再执行
 通用 `nucleus_bash` 无法证明任意 shell 命令的写前入账，因此在该模式下 fail
 closed；读取或修改应使用专用 file/领域工具。disabled/local 模式保持原行为。
 
-### 6.5 Life Memory 无损候选复制
+### 6.7 Life Memory 无损候选复制
 
 Life Memory 使用显式的 32 表选择合同，不复制 SQLite FTS 内部影子表，也不把
 Chroma 当作权威。候选复制命令为：
@@ -234,7 +234,7 @@ uv run python scripts/audit_life_memory_shadow.py \
 `writer_frozen=false`，远端账号也不能创建数据库级不可变 trigger，因此只可作为
 不可激活的 shadow，不得据此切换生产。
 
-### 6.6 Presence / World 候选复制与反向恢复
+### 6.8 Presence / World 候选复制与反向恢复
 
 Presence 与 World 从一致性快照复制，命令为：
 
@@ -267,7 +267,7 @@ assertion/change/cursor 的目标都必须冲突失败，禁止覆盖。
 批次 `life-presence-world-shadow-v3-77435387f4acc59e` 为 `copied`。
 它来自 `writer_frozen=false` 快照，只是恢复证据，不是 active generation。
 
-### 6.7 Learning 候选复制与反向恢复
+### 6.9 Learning 候选复制与反向恢复
 
 Learning 迁移只能从完整快照中的 `.life_learning` 读取，不能直接扫描仍在运行的正式工作区：
 
@@ -294,21 +294,61 @@ schema 时必须拒绝启动，不能由 Elysium 运行进程临时建表。真�
 ELYSIUM_TEST_MYSQL_LEARNING_ISOLATED=1
 ```
 
-未设置时用例必须显示为 skipped；不得把 skipped 当作远程 MySQL 验收通过。Learning
-候选复制尚未对正式数据执行，也没有 active Learning generation。
+未设置时用例必须显示为 skipped；不得把 skipped 当作远程 MySQL 验收通过。旧在线候选
+已经以批次 `life-learning-shadow-v2-77435387f4acc59e` 完成真实远程验证：452 条事件、
+2 个 ready 投影、10 个精确源文件，导入与反向语义投影均通过。该批次仍是
+`writer_frozen=false` 的 `copied` shadow，没有 active Learning generation。
+
+### 6.10 Life Event 候选复制与反向恢复
+
+```bash
+uv run python scripts/migrate_life_events.py \
+  --snapshot /absolute/life-domain-candidate \
+  --run-id life-event-shadow-<manifest-prefix> \
+  --reverse-export /new/life-event-reverse-export
+```
+
+迁移器只接受 manifest 唯一声明且物理 SHA-256 一致的 Life Event SQLite，逐条保留原始
+payload 文本、occurrence、position 和 consumer cursor。在线 shadow 可显式跳过生产
+trigger；冻结批次必须安装并核验 trigger。当前旧快照批次
+`life-event-cli-v1-77435387f4acc59e` 已复制 86,094 条事件，源、MySQL 与反向 SQLite
+root 一致，反向 `quick_check=ok`；它仍不可激活。
+
+### 6.11 五域汇总切换审计
+
+五个迁移批次完成后必须运行：
+
+```bash
+uv run python scripts/audit_life_storage_cutover.py \
+  --snapshot /absolute/frozen-snapshot \
+  --life-event-run <run-id> \
+  --memory-run <run-id> \
+  --subject-run <run-id> \
+  --presence-world-run <run-id> \
+  --learning-run <run-id> \
+  --generation-id <verified-generation-id> \
+  --output /new/generation-evidence-directory
+```
+
+`--generation-id` 与 `--output` 必须同时提供。审计器会先独立复核本地快照，再读取五个
+copy run。只要快照未冻结、run 不同源、状态不是 `verified`、存在冲突、任一 verification
+失败或 append-only 域不是 `trigger-enforced`，命令就拒绝签署且不创建输出目录。
 
 ## 7. 正式切换验收门
 
 必须同时满足后才允许人工切换：
 
 1. Life Event、Memory、Subject Document、Presence、World、Learning、cursor/outbox 的 local/MySQL 适配器全部通过同一合同测试；
-2. 已冻结快照通过逐记录、逐文件、谱系、frontier、visibility 与引用完整性校验；
-3. MySQL 复制副本在隔离环境通过读写、并发、死锁重试、断连恢复和恢复演练；
-4. 旧 writer 已人工停止，旧 authority token 已撤销，只有一个新 epoch 被激活；
-5. 新 runtime 的 backend、generation、schema、owner、lease、epoch 与 registry 完全匹配；
-6. Chroma/FTS/World 等派生投影从新权威重建并报告明确 frontier；
-7. 用户明确批准切换并手动启动 Elysium；
-8. 真实聊天、记忆写入、检索、见证、Presence、World 与重启恢复全链路通过。
+2. 目标是新的空 generation 数据库；禁止清空或覆盖旧 shadow 表来规避可变投影冲突；
+3. 目标数据库允许安装触发器，且启动时的 `information_schema` 漂移核验通过；
+4. 已冻结快照通过逐记录、逐文件、谱系、frontier、visibility 与引用完整性校验；
+5. MySQL 复制副本在隔离环境通过读写、并发、死锁重试、断连恢复和恢复演练；
+6. 五域汇总审计返回 eligible 并写出 verified generation；
+7. 旧 writer 已人工停止，旧 authority token 已撤销，只有一个新 epoch 被激活；
+8. 新 runtime 的 backend、generation、schema、owner、lease、epoch 与 registry 完全匹配；
+9. Chroma/FTS/World 等派生投影从新权威重建并报告明确 frontier；
+10. 用户明确批准切换并手动启动 Elysium；
+11. 真实聊天、记忆写入、检索、见证、Presence、World、Learning 与重启恢复全链路通过。
 
 任一项缺失都必须保持 `storage.enabled=false`。
 
@@ -325,5 +365,5 @@ ELYSIUM_TEST_MYSQL_LEARNING_ISOLATED=1
 
 - 本地快照与远程 MySQL 备份必须同时存在；远程库不是唯一副本；
 - 每份备份必须有 manifest、完整性校验和隔离恢复演练，只有压缩包不算可恢复；
-- 当前精确生命数据约 2.6 GB（其中媒体约 1.49 GB，六个 SQLite 约 0.61 GB，工作区聚合存在重叠），备份目标至少预留 10 GB，正式迁移前按五倍增长重新测量；
+- 2026-08-05 在线候选约 2.1 GiB，独立复核 4,340 个项目且 0 失败；备份目标至少预留 10 GiB，正式迁移前按五倍增长重新测量；
 - 任何自动清理/保留策略都不能覆盖原始生命数据和尚未封存的 generation。

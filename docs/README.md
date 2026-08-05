@@ -20,6 +20,7 @@
 - [MySQL 迁移、备份与恢复手册](./operations/mysql_migration_and_backup.md) — 审计、快照、原子迁移、连续备份与恢复演练
 - [生命域可选 MySQL / 本地存储重构方案](./architecture/Elysium生命域可选MySQL与本地存储重构方案.md) — 单写权威、双后端合同、无损迁移与分阶段完成定义
 - [生命域存储快照与权威切换运行手册](./operations/life_storage_backend_runbook.md) — 候选快照、generation、epoch/fencing、切换门与回滚边界
+- [生命域 MySQL 切换就绪度报告（2026-08-05）](./report/life-storage-cutover-readiness-2026-08-05.md) — 阶段 0—8 完成矩阵、今日 2.1 GiB 候选复核、真实隔离 MySQL 验收与剩余人工切换门
 - [生命域可选存储阶段 3 / Life Event 交付报告](./report/life-storage-phase3-life-event-2026-08-04.md) — 事件账本双适配、候选复制控制、86,094 条真实影子复制与 0 差异反向导出
 - [生命域可选存储阶段 4A / 主体文档交付报告](./report/life-storage-phase4-subject-document-2026-08-04.md) — 精确字节版本、CAS/投影安全、1,404 份真实 MySQL shadow 与 0 差异反向导出
 - [生命域可选存储阶段 2B / Memory 迁移报告](./report/life-storage-phase2b-memory-migration-2026-08-04.md) — 32 张显式表、210,104 条真实记录、删除历史保真与三方同根反向恢复

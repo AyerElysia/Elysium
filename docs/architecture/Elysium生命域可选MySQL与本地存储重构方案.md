@@ -1,6 +1,6 @@
 # Elysium 生命域可选 MySQL / 本地存储重构方案
 
-> 状态：分阶段实施中。阶段 0/1 的通用存储基座已落地；阶段 2 的 Life Memory、Presence 与 World 已完成 Port、local/MySQL 双适配、同一 service-owned runtime 现役接线、候选复制、独立审计和反向恢复。阶段 3 的 Life Event Port、双适配、候选复制控制面、逐字节迁移与反向导出已落地；阶段 4 的 Subject Document 精确字节账本、工作区投影、文件工具与 Witness 写前入账也已接入同一 runtime。所有真实远程副本都来自 `writer_frozen=false` 在线快照，只能证明无损复制/恢复，不能授权激活。当前正式运行权威仍是既有本地 SQLite/文件，`storage.enabled=false`，禁止据此状态直接切换到 MySQL。
+> 状态：阶段 0—7 的存储基座、各生命域 Port、local/MySQL 双适配、同一 service-owned runtime 现役接线、复制/校验/反向导出工具和数据库不可变门均已落地。阶段 8 的汇总审计与 generation 生成工具也已完成，但生产切换尚未执行。所有真实远程副本都来自 `writer_frozen=false` 在线快照，只能证明无损复制/恢复，不能授权激活；当前正式运行权威仍是既有本地 SQLite/文件，`storage.enabled=false`。最终仍需全新的远程 generation 数据库、触发器创建能力、用户手动停止 Elysium 后的冻结快照、五域同源复制与用户手动启动后的全链路验收。
 >
 > 目标：在不改变爱莉主体语义、不丢失不可变历史、不把 Chroma 误作权威存储的前提下，为 Elysium 建立行为等价的本地与 MySQL 两套耐久存储后端。迁移采用“复制、校验、可选切换”，绝不移动、删除或改写原 SQLite、Markdown、JSON、JSONL 与媒体数据文件。
 
@@ -17,7 +17,7 @@
 >
 > 适用基线：以项目实施时实际受支持的 Python、SQLAlchemy、asyncmy、MySQL 与 Chroma 版本为准；运行时版本升级或降级不属于本存储重构范围。
 
-阶段 0/1 的实现与真实数据证据见 [生命域可选存储阶段 0/1 交付报告](../report/life-storage-phase0-phase1-2026-08-04.md)，Memory 阶段 2 见 [生命域可选存储阶段 2 / Memory 交付报告](../report/life-storage-phase2-memory-2026-08-04.md)，真实 Memory 往返迁移见 [生命域可选存储阶段 2B / Memory 迁移报告](../report/life-storage-phase2b-memory-migration-2026-08-04.md)，Presence/World 迁移和 Subject 现役接线见 [生命域可选存储阶段 2C 交付报告](../report/life-storage-phase2c-presence-world-subject-integration-2026-08-04.md)，Life Event 阶段 3 见 [Life Event Ledger 交付报告](../report/life-storage-phase3-life-event-2026-08-04.md)，操作边界见 [生命域存储快照与权威切换运行手册](../operations/life_storage_backend_runbook.md)。平台开关保持默认关闭；在各领域合同测试、逐记录复制校验、恢复演练和人工切换门全部通过前，`storage.enabled` 必须为 `false`。
+阶段 0/1 的实现与真实数据证据见 [生命域可选存储阶段 0/1 交付报告](../report/life-storage-phase0-phase1-2026-08-04.md)，Memory 阶段 2 见 [生命域可选存储阶段 2 / Memory 交付报告](../report/life-storage-phase2-memory-2026-08-04.md)，真实 Memory 往返迁移见 [生命域可选存储阶段 2B / Memory 迁移报告](../report/life-storage-phase2b-memory-migration-2026-08-04.md)，Presence/World 迁移和 Subject 现役接线见 [生命域可选存储阶段 2C 交付报告](../report/life-storage-phase2c-presence-world-subject-integration-2026-08-04.md)，Life Event 阶段 3 见 [Life Event Ledger 交付报告](../report/life-storage-phase3-life-event-2026-08-04.md)，当前总完成度与切换阻断见 [切换就绪度报告（2026-08-05）](../report/life-storage-cutover-readiness-2026-08-05.md)，操作边界见 [生命域存储快照与权威切换运行手册](../operations/life_storage_backend_runbook.md)。平台开关保持默认关闭；在各领域合同测试、逐记录复制校验、恢复演练和人工切换门全部通过前，`storage.enabled` 必须为 `false`。
 
 ## 1. 决策摘要
 
@@ -768,6 +768,12 @@ outbox，World 108 条断言、983 条变化、7 个 perception cursor 与 front
 8. 用户如选择 MySQL，再手工将 `authoritative_backend` 和 `backend_generation` 改为已验证值并启动；
 9. 执行真实聊天、记忆形成、检索、文档版本和重启冒烟；
 10. 原数据文件、快照、迁移 manifest 与 MySQL 副本全部长期保留，不删除、不移动。
+
+阶段 8 的五域汇总审计和 generation 落盘门已由 `scripts/audit_life_storage_cutover.py`
+实现并通过 fail-closed 实测。它不会把在线 snapshot、旧 manifest 的 copy run、`copied`
+状态或 application-enforced shadow 签成 verified generation。生产执行仍未完成；当前远程
+shadow 没有 generation 表隔离且包含旧可变投影，最终复制必须进入新的空数据库，禁止清空
+或覆盖旧 shadow 来规避冲突。
 
 ## 16. 回滚、回切与副本保留
 
