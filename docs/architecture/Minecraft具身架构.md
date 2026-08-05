@@ -55,6 +55,16 @@ Minecraft 是 `LifeEngineService` 独立持有的可选场景，不属于 Learni
 
 命令账本以 command ID 和规范化载荷摘要去重。完全相同的重试复用已有 ack/终态；若重试发生在原命令仍 pending 时，新连接先得到 ack，并在原执行完成后收到同一份终态，不会重复执行或永久停在“处理中”；相同 ID 配不同载荷被拒绝；pending 不会因有界终态缓存淘汰而丢失。接单回执不代表任务完成，结论必须引用终态回执及其后的新观察。每个 session 将这些证据写成追加式哈希链。
 
+### Perception、Trace 与 World 的单向边界
+
+Minecraft 意图上下文在结构上分为 `durable_context` 与 `transient_prompt_context`。session、stream 和目标等耐久运行身份进入前者；Perception Gateway 准备的世界投影正文只进入后者，并且只有规划器的 `to_prompt()` 可以读取。`to_wire()` 和追加式 trace 不复制瞬态正文，只保存 `minecraft.perception_reference.v1`：delivery identity、内容哈希、版本、游标窗口、frontier、来源 identity 和 UTF-8 字节数。这样既能核验当时使用了哪一份感知，又不会把可替换 Prompt 投影伪装成新的世界事实。
+
+Trace listener 只接收已经 fsync 并带 sequence/hash 的 `TraceRecord`。向 World 发布的是从该 record 白名单派生的 `minecraft.embodied_trace_projection.v1` receipt，而不是原始 payload：回执包含 session/body、trace kind、sequence、hash、相关 observation/intent/command/receipt identity 和内容摘要，禁止包含 `context`、帧正文、facts/parameters 原文或 Perception 正文。每份 receipt 的规范 JSON UTF-8 硬上限为 8 KiB，projection identity 由 session、trace sequence 与 record hash 稳定派生，并作为 World observation 的稳定 `occurrence_id`；相同记录重放复用既有 event/assertion/position，异内容冲突显式失败。World 写入失败不会缓存为已送达，也不会提交 Perception cursor。未知 trace kind、非法字段或超限回执显式失败。
+
+Perception cursor 还必须通过模型传输回执门：世界投影正文以独立 `Text` part 注册 delivery identity，只有最终成功模型 attempt 返回 `exact_present=true`，且 effective UTF-8 字节数与 SHA-256 同 `minecraft.perception_reference.v1` 完全一致，session 才构造 content-free `PerceptionDeliveryReceipt` 并提交。裁剪、缺失、重复、未知回执或旧回执复用都显式失败，游标保持原位。
+
+这条单向边界专门阻止 `World → Perception → Intent → Trace → World` 递归反馈。它不使用关键词过滤：用户或爱莉的合法文本即使包含字段同名词也仍保留在其权威位置，只是不会通过 trace receipt 复制。既有历史 assertion 不由 Minecraft 生产者删除或改写；历史隔离、分页和 superseding projection 由 World/Perception owner 通过可审计契约处理。
+
 ## Biomimetic Body：完全仿生路线
 
 Windows 原生身体绑定到精确 Minecraft 窗口：

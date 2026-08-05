@@ -7,6 +7,7 @@ or deciding what Elysia should want.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -36,12 +37,127 @@ def _require_text(value: str, field_name: str) -> None:
 
 
 @dataclass(frozen=True, slots=True)
+class PerceptionReference:
+    """Content-free identity for one transient Perception delivery."""
+
+    instance_id: str
+    projection_kind: str
+    from_position: int
+    through_position: int
+    frontier: int
+    cursor_revision: int
+    content_sha256: str
+    content_bytes: int
+    assertion_ids: tuple[str, ...]
+    change_positions: tuple[int, ...]
+    delivery_id: str
+    version: str
+
+    @classmethod
+    def from_prepared(cls, prepared: Any) -> PerceptionReference:
+        """Build a stable reference without retaining transient prompt content."""
+
+        required = (
+            "instance_id",
+            "projection_kind",
+            "from_position",
+            "through_position",
+            "source_frontier",
+            "cursor_revision",
+            "content",
+            "assertion_ids",
+            "change_positions",
+            "delivery_id",
+            "projection_sha256",
+            "algorithm_version",
+            "delivered_bytes",
+        )
+        missing = [name for name in required if not hasattr(prepared, name)]
+        if missing:
+            raise ValueError(
+                "prepared perception is missing reference fields: "
+                + ", ".join(missing)
+            )
+        instance_id = str(prepared.instance_id)
+        _require_text(instance_id, "perception instance_id")
+        content = prepared.content
+        if not isinstance(content, str):
+            raise TypeError("prepared perception content must be text")
+        _require_text(content, "prepared perception content")
+        from_position = int(prepared.from_position)
+        through_position = int(prepared.through_position)
+        cursor_revision = int(prepared.cursor_revision)
+        if min(from_position, through_position, cursor_revision) < 0:
+            raise ValueError("perception positions and revision must not be negative")
+        if through_position < from_position:
+            raise ValueError("perception through_position precedes from_position")
+        assertion_ids = tuple(str(item) for item in prepared.assertion_ids)
+        change_positions = tuple(int(item) for item in prepared.change_positions)
+        if any(not item.strip() for item in assertion_ids):
+            raise ValueError("perception assertion_ids must not contain empty values")
+        content_bytes = content.encode("utf-8")
+        content_sha256 = hashlib.sha256(content_bytes).hexdigest()
+        supplied_hash = str(prepared.projection_sha256 or "")
+        if supplied_hash != content_sha256:
+            raise ValueError("prepared perception hash does not match its content")
+        supplied_bytes = int(prepared.delivered_bytes)
+        if supplied_bytes != len(content_bytes):
+            raise ValueError("prepared perception byte count does not match its content")
+        projection_kind = str(prepared.projection_kind)
+        _require_text(projection_kind, "perception projection_kind")
+        frontier = int(prepared.source_frontier)
+        if frontier < through_position:
+            raise ValueError("perception frontier precedes through_position")
+        version = str(prepared.algorithm_version)
+        _require_text(version, "perception algorithm_version")
+        delivery_id = str(prepared.delivery_id or "")
+        _require_text(delivery_id, "perception delivery_id")
+        return cls(
+            instance_id=instance_id,
+            projection_kind=projection_kind,
+            from_position=from_position,
+            through_position=through_position,
+            frontier=frontier,
+            cursor_revision=cursor_revision,
+            content_sha256=content_sha256,
+            content_bytes=len(content_bytes),
+            assertion_ids=assertion_ids,
+            change_positions=change_positions,
+            delivery_id=delivery_id,
+            version=version,
+        )
+
+    def to_wire(self) -> JsonObject:
+        """Serialize provenance and delivery identity without prompt text."""
+
+        return {
+            "schema": "minecraft.perception_reference.v1",
+            "delivery_id": self.delivery_id,
+            "hash": self.content_sha256,
+            "version": self.version,
+            "instance_id": self.instance_id,
+            "projection_kind": self.projection_kind,
+            "from": self.from_position,
+            "through": self.through_position,
+            "frontier": self.frontier,
+            "cursor_revision": self.cursor_revision,
+            "source_ids": {
+                "assertions": list(self.assertion_ids),
+                "changes": list(self.change_positions),
+            },
+            "bytes": self.content_bytes,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class EmbodiedIntent:
     """An intention authored by Elysia for one explicitly selected body."""
 
     text: str
     body_name: str
-    context: Mapping[str, Any] = field(default_factory=dict)
+    durable_context: Mapping[str, Any] = field(default_factory=dict)
+    transient_prompt_context: Mapping[str, Any] = field(default_factory=dict)
+    perception_reference: PerceptionReference | None = None
     intent_id: str = field(default_factory=lambda: _identifier("intent"))
     revision: int = 1
     issued_at: str = field(default_factory=utc_now)
@@ -54,10 +170,32 @@ class EmbodiedIntent:
         _require_text(self.intent_id, "intent_id")
         if self.revision < 1:
             raise ValueError("revision must be positive")
-        object.__setattr__(self, "context", dict(self.context))
+        durable_context = dict(self.durable_context)
+        transient_prompt_context = dict(self.transient_prompt_context)
+        overlapping = set(durable_context).intersection(transient_prompt_context)
+        if overlapping:
+            raise ValueError(
+                "durable and transient intent contexts overlap: "
+                + ", ".join(sorted(overlapping))
+            )
+        object.__setattr__(self, "durable_context", durable_context)
+        object.__setattr__(self, "transient_prompt_context", transient_prompt_context)
+
+    @property
+    def context(self) -> Mapping[str, Any]:
+        """Expose a merged prompt-only compatibility view without persistence."""
+
+        return {**self.durable_context, **self.transient_prompt_context}
+
+    def to_prompt(self) -> JsonObject:
+        """Serialize both durable and transient context for one planner call."""
+
+        value = self.to_wire()
+        value["transient_prompt_context"] = dict(self.transient_prompt_context)
+        return value
 
     def to_wire(self) -> JsonObject:
-        """Serialize the intent for a bridge or an append-only trace."""
+        """Serialize durable intent state without transient prompt projections."""
 
         return {
             "intent_id": self.intent_id,
@@ -65,7 +203,12 @@ class EmbodiedIntent:
             "issued_at": self.issued_at,
             "body_name": self.body_name,
             "text": self.text,
-            "context": dict(self.context),
+            "durable_context": dict(self.durable_context),
+            "perception_reference": (
+                self.perception_reference.to_wire()
+                if self.perception_reference is not None
+                else None
+            ),
         }
 
 

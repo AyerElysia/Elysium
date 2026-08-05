@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,7 @@ from .embodiment_contracts import (
     ActionReceipt,
     EmbodiedIntent,
     IntentConclusion,
+    PerceptionReference,
     PlannerTurn,
     WorldObservation,
 )
@@ -65,6 +68,16 @@ class PlannerOutputError(ValueError):
     """Raised when a model decision violates the planner contract."""
 
 
+@dataclass(frozen=True, slots=True)
+class VerifiedPerceptionDelivery:
+    """Content-free proof that one projection reached the effective request."""
+
+    delivery_id: str
+    projection_sha256: str
+    delivered_bytes: int
+    transport_request_id: str = ""
+
+
 class JsonIntentPlanner:
     """Convert strict model JSON into evidence-kernel planner turns."""
 
@@ -94,7 +107,7 @@ class JsonIntentPlanner:
         input_document = {
             "planner_guidance": self._planner_guidance,
             "advertised_operations": list(capabilities),
-            "intent": intent.to_wire(),
+            "intent": intent.to_prompt(),
             "observations": [item.to_wire() for item in observations],
             "receipts": [item.to_wire() for item in receipts],
         }
@@ -118,6 +131,43 @@ class JsonIntentPlanner:
         return PlannerTurn(
             command=self._parse_command(payload["command"], intent, capabilities)
         )
+
+    def reset_perception_delivery(self, reference: PerceptionReference) -> None:
+        """Discard any proof left by an earlier intent with the same reference."""
+
+        discard = getattr(self._decision_source, "discard_context_delivery", None)
+        if not callable(discard):
+            raise TypeError(
+                "Minecraft planner cannot prove transient Perception delivery"
+            )
+        discard(reference.delivery_id)
+
+    def consume_perception_delivery(
+        self,
+        reference: PerceptionReference,
+    ) -> VerifiedPerceptionDelivery:
+        """Consume and validate the proof produced by the final planner turn."""
+
+        consume = getattr(self._decision_source, "consume_context_delivery", None)
+        if not callable(consume):
+            raise TypeError(
+                "Minecraft planner cannot prove transient Perception delivery"
+            )
+        proof = consume(reference.delivery_id)
+        if not isinstance(proof, VerifiedPerceptionDelivery):
+            raise TypeError(
+                "Minecraft planner produced no exact Perception delivery proof"
+            )
+        if (
+            proof.delivery_id != reference.delivery_id
+            or proof.projection_sha256 != reference.content_sha256
+            or proof.delivered_bytes != reference.content_bytes
+        ):
+            raise RuntimeError(
+                "Minecraft planner Perception delivery proof does not match the "
+                "prepared projection"
+            )
+        return proof
 
     @staticmethod
     def _parse_conclusion(value: Any) -> IntentConclusion:
@@ -173,6 +223,22 @@ class ElysiumModelDecisionSource:
         if not model_task_name.strip():
             raise ValueError("model_task_name must not be empty")
         self._model_task_name = model_task_name
+        self._verified_context_deliveries: dict[
+            str, VerifiedPerceptionDelivery
+        ] = {}
+
+    def discard_context_delivery(self, delivery_id: str) -> None:
+        """Drop stale proof before a new intent starts using one reference."""
+
+        self._verified_context_deliveries.pop(str(delivery_id), None)
+
+    def consume_context_delivery(
+        self,
+        delivery_id: str,
+    ) -> VerifiedPerceptionDelivery | None:
+        """Return and remove one verified, content-free delivery proof."""
+
+        return self._verified_context_deliveries.pop(str(delivery_id), None)
 
     async def __call__(self, input_document: dict[str, Any]) -> str:
         """Send the complete planner document and return model text."""
@@ -186,10 +252,37 @@ class ElysiumModelDecisionSource:
             model_set=model_set,
             request_name="life_minecraft_embodiment_planner",
         )
+        (
+            durable_document,
+            perception_text,
+            perception_reference,
+        ) = self._split_transient_perception(input_document)
         request.add_payload(LLMPayload(ROLE.SYSTEM, Text(_SYSTEM_PROMPT)))
-        user_content: list[Text | Image] = [
-            Text(json.dumps(input_document, ensure_ascii=False, separators=(",", ":")))
-        ]
+        durable_text = json.dumps(
+            durable_document,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        user_content: list[Text | Image] = [Text(durable_text)]
+        if perception_text is not None and perception_reference is not None:
+            delivery_id = str(perception_reference["delivery_id"])
+            self.discard_context_delivery(delivery_id)
+            user_content.append(
+                Text(
+                    "The next Text part is the transient World Perception named by "
+                    f"perception_reference delivery_id={delivery_id}."
+                )
+            )
+            marker = self._unique_delivery_marker(
+                perception_text,
+                other_texts=(_SYSTEM_PROMPT, durable_text, user_content[-1].text),
+            )
+            user_content.append(Text(perception_text))
+            request.register_context_delivery(
+                delivery_id,
+                perception_text,
+                marker=marker,
+            )
         observations = input_document.get("observations")
         if isinstance(observations, list) and observations:
             latest = observations[-1]
@@ -209,7 +302,117 @@ class ElysiumModelDecisionSource:
         )
         response = await request.send(stream=False)
         await response
+        if perception_text is not None and perception_reference is not None:
+            delivery_id = str(perception_reference["delivery_id"])
+            receipt = response.effective_context_receipt(delivery_id)
+            expected_bytes = int(perception_reference["bytes"])
+            expected_sha256 = str(perception_reference["hash"])
+            if (
+                receipt is None
+                or not receipt.exact_present
+                or receipt.effective_utf8_bytes != expected_bytes
+                or receipt.effective_sha256 != expected_sha256
+            ):
+                raise RuntimeError(
+                    "Minecraft planner transient Perception was absent, duplicated, "
+                    "or trimmed from the effective model request"
+                )
+            request_record_id = getattr(response, "request_record_id", None)
+            self._verified_context_deliveries[delivery_id] = (
+                VerifiedPerceptionDelivery(
+                    delivery_id=delivery_id,
+                    projection_sha256=expected_sha256,
+                    delivered_bytes=expected_bytes,
+                    transport_request_id=(
+                        str(request_record_id)
+                        if request_record_id is not None
+                        else ""
+                    ),
+                )
+            )
         return str(getattr(response, "message", "") or "")
+
+    @staticmethod
+    def _split_transient_perception(
+        input_document: dict[str, Any],
+    ) -> tuple[dict[str, Any], str | None, dict[str, Any] | None]:
+        """Remove prompt-only projection text from the durable planner document."""
+
+        durable_document = dict(input_document)
+        raw_intent = durable_document.get("intent")
+        if not isinstance(raw_intent, dict):
+            raise PlannerOutputError("planner intent document must be a JSON object")
+        intent = dict(raw_intent)
+        durable_document["intent"] = intent
+        raw_transient = intent.pop("transient_prompt_context", {})
+        if not isinstance(raw_transient, dict):
+            raise PlannerOutputError(
+                "intent transient_prompt_context must be a JSON object"
+            )
+        unknown = set(raw_transient).difference({"world_perception"})
+        if unknown:
+            raise PlannerOutputError(
+                "unregistered transient planner context: "
+                + ", ".join(sorted(str(item) for item in unknown))
+            )
+        perception_text = raw_transient.get("world_perception")
+        raw_reference = intent.get("perception_reference")
+        if perception_text is None:
+            if raw_reference is not None:
+                raise PlannerOutputError(
+                    "perception_reference exists without transient projection text"
+                )
+            return durable_document, None, None
+        if not isinstance(perception_text, str) or not perception_text:
+            raise PlannerOutputError(
+                "transient world_perception must be non-empty text"
+            )
+        if not isinstance(raw_reference, dict):
+            raise PlannerOutputError(
+                "transient world_perception requires a Perception reference"
+            )
+        reference = dict(raw_reference)
+        delivery_id = str(reference.get("delivery_id") or "")
+        expected_sha256 = str(reference.get("hash") or "")
+        try:
+            expected_bytes = int(reference.get("bytes"))
+        except (TypeError, ValueError) as exception:
+            raise PlannerOutputError(
+                "Perception reference bytes must be an integer"
+            ) from exception
+        encoded = perception_text.encode("utf-8")
+        if not delivery_id:
+            raise PlannerOutputError("Perception reference delivery_id is empty")
+        if (
+            expected_bytes != len(encoded)
+            or expected_sha256 != hashlib.sha256(encoded).hexdigest()
+        ):
+            raise PlannerOutputError(
+                "transient world_perception does not match its Perception reference"
+            )
+        return durable_document, perception_text, reference
+
+    @staticmethod
+    def _unique_delivery_marker(
+        expected_text: str,
+        *,
+        other_texts: Sequence[str],
+    ) -> str:
+        """Choose a prefix that identifies only the exact transient Text part."""
+
+        candidate_lengths = (16, 32, 64, 128, 256, 512, len(expected_text))
+        seen: set[int] = set()
+        for length in candidate_lengths:
+            bounded = min(len(expected_text), length)
+            if bounded in seen:
+                continue
+            seen.add(bounded)
+            candidate = expected_text[:bounded]
+            if candidate and all(candidate not in text for text in other_texts):
+                return candidate
+        raise RuntimeError(
+            "transient Perception has no marker unique to its effective Text part"
+        )
 
 
 AGENT_BRIDGE_GUIDANCE = """\

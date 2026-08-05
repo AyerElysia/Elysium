@@ -14,7 +14,7 @@ from .embodiment_contracts import (
     PlannerTurn,
     WorldObservation,
 )
-from .embodiment_trace import EmbodimentTrace
+from .embodiment_trace import EmbodimentTrace, TraceRecord
 
 
 class EvidenceReferenceError(RuntimeError):
@@ -64,7 +64,7 @@ class IntentPlanner(Protocol):
         """Return one command or one evidence-backed conclusion."""
 
 
-TraceListener = Callable[[str, dict[str, object]], Awaitable[None] | None]
+TraceListener = Callable[[TraceRecord], Awaitable[None] | None]
 
 
 class EmbodimentRuntime:
@@ -221,7 +221,10 @@ class EmbodimentRuntime:
                     raise EvidenceReferenceError(
                         f"conclusion cites unknown evidence: {sorted(missing)}"
                     )
-                await self._record("intent.conclusion", turn.conclusion.to_wire())
+                await self._record(
+                    "intent.conclusion",
+                    {"intent_id": intent.intent_id, **turn.conclusion.to_wire()},
+                )
                 return ExecutionResult(
                     intent=intent,
                     observations=tuple(observations),
@@ -267,8 +270,8 @@ class EmbodimentRuntime:
     async def _record(self, kind: str, payload: dict[str, object]) -> None:
         """Persist and optionally publish one complete trace event."""
 
-        await self._trace.append(kind, payload)
+        record = await self._trace.append(kind, payload)
         if self._trace_listener is not None:
-            result = self._trace_listener(kind, payload)
+            result = self._trace_listener(record)
             if result is not None:
                 await result

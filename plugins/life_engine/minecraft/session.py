@@ -12,6 +12,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from ..service.perception_gateway import PerceptionDeliveryReceipt
 from .bridge_body import BridgeBody
 from .bridge_client import (
     BridgeConfig,
@@ -19,9 +20,14 @@ from .bridge_client import (
     MinecraftBridgeClient,
 )
 from .capture import WindowCapture
-from .embodiment_contracts import ExecutionResult, WorldObservation
+from .embodiment_contracts import (
+    EmbodiedIntent,
+    ExecutionResult,
+    PerceptionReference,
+    WorldObservation,
+)
 from .embodiment_runtime import EmbodimentRuntime
-from .embodiment_trace import EmbodimentTrace
+from .embodiment_trace import EmbodimentTrace, TraceRecord
 from .launcher import MCConfig, MinecraftLauncher
 from .model_planner import (
     AGENT_BRIDGE_GUIDANCE,
@@ -29,6 +35,7 @@ from .model_planner import (
     ElysiumModelDecisionSource,
     JsonIntentPlanner,
 )
+from .trace_projection import build_world_trace_receipt
 
 
 async def _invoke_callback(
@@ -142,6 +149,8 @@ class MinecraftSession:
         self._trace: EmbodimentTrace | None = None
         self._execution_task: asyncio.Task[ExecutionResult] | None = None
         self._lifecycle_lock = asyncio.Lock()
+        self._trace_projection_lock = asyncio.Lock()
+        self._projected_trace_receipts: set[str] = set()
         self._presence_registered = False
         self._scene_open = False
         # Kept in the signature for callers during migration.  Planning now uses
@@ -355,6 +364,7 @@ class MinecraftSession:
             self._workspace / "minecraft" / "traces" / f"{session_id}.jsonl"
         )
         await trace.open()
+        self._projected_trace_receipts.clear()
         runtime = EmbodimentRuntime(trace, self._on_trace)
 
         try:
@@ -562,25 +572,34 @@ class MinecraftSession:
         except Exception as exception:  # noqa: BLE001 - Presence is part of success
             self._state.last_error = str(exception)
             return {"success": False, "error": str(exception)}
-        from .embodiment_contracts import EmbodiedIntent
-
         perception = None
-        intent_context: dict[str, Any] = {
+        durable_context: dict[str, Any] = {
             "session_id": self._state.session_id,
             "session_goal": self._state.session_goal,
             "stream_id": self._state.stream_id,
         }
-        if self._prepare_perception is not None:
-            perception = await _invoke_callback(
-                self._prepare_perception,
-                self._state.consciousness_instance_id,
+        transient_prompt_context: dict[str, Any] = {}
+        perception_reference = None
+        try:
+            if self._prepare_perception is not None:
+                perception = await _invoke_callback(
+                    self._prepare_perception,
+                    self._state.consciousness_instance_id,
+                )
+                perception_reference = PerceptionReference.from_prepared(perception)
+                transient_prompt_context["world_perception"] = perception.content
+            embodied_intent = EmbodiedIntent(
+                text=intent,
+                body_name=self._state.body_name,
+                durable_context=durable_context,
+                transient_prompt_context=transient_prompt_context,
+                perception_reference=perception_reference,
             )
-            intent_context["transient_world_perception"] = perception.content
-        embodied_intent = EmbodiedIntent(
-            text=intent,
-            body_name=self._state.body_name,
-            context=intent_context,
-        )
+            if perception_reference is not None:
+                self._planner.reset_perception_delivery(perception_reference)
+        except Exception as exception:  # noqa: BLE001 - public intent boundary
+            self._state.last_error = str(exception)
+            return {"success": False, "error": str(exception)}
         self._state.active_intent = intent
         execution_timeout = (
             timeout if timeout is not None else self._config.intent_timeout_seconds
@@ -598,8 +617,22 @@ class MinecraftSession:
             )
             self._execution_task = task
             result = await task
-            if perception is not None and self._commit_perception is not None:
-                await _invoke_callback(self._commit_perception, perception)
+            if perception is not None and perception_reference is not None:
+                delivery = self._planner.consume_perception_delivery(
+                    perception_reference
+                )
+                if self._commit_perception is not None:
+                    await _invoke_callback(
+                        self._commit_perception,
+                        perception,
+                        PerceptionDeliveryReceipt(
+                            delivery_id=delivery.delivery_id,
+                            projection_sha256=delivery.projection_sha256,
+                            delivered_bytes=delivery.delivered_bytes,
+                            exact=True,
+                            transport_request_id=delivery.transport_request_id,
+                        ),
+                    )
         except Exception as exception:  # noqa: BLE001 - report planner/bridge evidence failure
             self._state.last_error = str(exception)
             return {
@@ -881,23 +914,38 @@ class MinecraftSession:
             raise ValueError(f"authentication_token is absent in {path}")
         return token
 
-    async def _on_trace(self, kind: str, payload: dict[str, object]) -> None:
-        """Update latest factual scene state after durable trace persistence."""
+    async def _on_trace(self, record: TraceRecord) -> None:
+        """Publish one bounded World receipt after durable trace persistence."""
 
-        if kind == "observation":
-            self._state.latest_observation = WorldObservation.from_wire(payload)
-        await self._refresh_consciousness(f"minecraft_trace:{kind}")
+        if record.kind == "observation":
+            self._state.latest_observation = WorldObservation.from_wire(record.payload)
+        await self._refresh_consciousness(f"minecraft_trace:{record.kind}")
         if self._report_world_observation is not None and self._state.stream_id:
-            await _invoke_callback(
-                self._report_world_observation,
-                f"Minecraft trace persisted: {kind}",
-                source_instance_id=self._state.consciousness_instance_id,
-                subject=self._state.stream_id,
-                predicate="embodied_trace",
-                domain="minecraft",
+            receipt = build_world_trace_receipt(
+                record,
+                session_id=self._state.session_id,
                 stream_id=self._state.stream_id,
-                value={"trace_kind": kind, "payload": payload},
+                body_name=self._state.body_name,
             )
+            projection_id = str(receipt["projection_id"])
+            async with self._trace_projection_lock:
+                if projection_id in self._projected_trace_receipts:
+                    return
+                await _invoke_callback(
+                    self._report_world_observation,
+                    f"Minecraft embodied trace receipt: {projection_id}",
+                    source_instance_id=self._state.consciousness_instance_id,
+                    subject=self._state.stream_id,
+                    predicate="embodied_trace",
+                    domain="minecraft",
+                    status="durable_receipt",
+                    stream_id=self._state.stream_id,
+                    observed_at=record.recorded_at,
+                    valid_from=record.recorded_at,
+                    occurrence_id=projection_id,
+                    value=receipt,
+                )
+                self._projected_trace_receipts.add(projection_id)
 
     async def _refresh_consciousness(self, reason: str) -> None:
         """Resume an expired Presence lease or renew the active one durably."""

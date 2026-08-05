@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -16,8 +18,42 @@ from plugins.life_engine.minecraft.embodiment_contracts import (
     utc_now,
 )
 from plugins.life_engine.minecraft.launcher import LaunchResult, MCConfig
+from plugins.life_engine.minecraft.model_planner import VerifiedPerceptionDelivery
 from plugins.life_engine.minecraft.session import MinecraftSession
+from plugins.life_engine.minecraft.trace_projection import (
+    WORLD_TRACE_RECEIPT_MAX_BYTES,
+    world_trace_receipt_size,
+)
 from plugins.life_engine.service.consciousness import ConsciousnessRegistry
+from plugins.life_engine.service.perception_gateway import PerceptionDeliveryReceipt
+
+
+def _prepared_perception(instance_id: str, content: str) -> SimpleNamespace:
+    """Create a complete content/reference pair used by Minecraft consumers."""
+
+    encoded = content.encode("utf-8")
+    digest = sha256(encoded).hexdigest()
+    return SimpleNamespace(
+        instance_id=instance_id,
+        projection_kind="world_perception",
+        from_position=2,
+        through_position=5,
+        source_frontier=7,
+        cursor_revision=1,
+        content=content,
+        assertion_ids=("assertion-a", "assertion-b"),
+        change_positions=(3, 5),
+        delivery_id=f"delivery-{digest[:24]}",
+        projection_sha256=digest,
+        algorithm_version="world-perception-page-v2",
+        delivered_bytes=len(encoded),
+        source_payload_bytes=len(encoded),
+        omitted_assertion_count=0,
+        omitted_change_count=0,
+        omitted_source_bytes=0,
+        snapshot_continuation_token="",
+        has_more_changes=True,
+    )
 
 
 class _Launcher:
@@ -187,8 +223,28 @@ class _BrokenWindowLauncher(_Launcher):
 class _Planner:
     """Issue one operation and then make an evidence-backed conclusion."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, prove_delivery: bool = True) -> None:
         self.contexts: list[dict[str, Any]] = []
+        self._prove_delivery = prove_delivery
+        self._deliveries: dict[str, VerifiedPerceptionDelivery] = {}
+
+    def reset_perception_delivery(self, reference: Any) -> None:
+        """Discard a prior intent's proof for the same prepared projection."""
+
+        self._deliveries.pop(reference.delivery_id, None)
+
+    def consume_perception_delivery(
+        self,
+        reference: Any,
+    ) -> VerifiedPerceptionDelivery:
+        """Return the proof created by the final fake planning turn."""
+
+        delivery = self._deliveries.pop(reference.delivery_id, None)
+        if delivery is None:
+            raise RuntimeError(
+                "Minecraft planner produced no exact Perception delivery proof"
+            )
+        return delivery
 
     async def decide(
         self,
@@ -199,6 +255,14 @@ class _Planner:
         """Act once, then cite both receipt and post-action observation."""
 
         self.contexts.append(dict(intent.context))
+        reference = intent.perception_reference
+        if self._prove_delivery and reference is not None:
+            self._deliveries[reference.delivery_id] = VerifiedPerceptionDelivery(
+                delivery_id=reference.delivery_id,
+                projection_sha256=reference.content_sha256,
+                delivered_bytes=reference.content_bytes,
+                transport_request_id="fake-request",
+            )
 
         if not receipts:
             return PlannerTurn(
@@ -267,13 +331,15 @@ async def _started_session(
         return {"assertion_id": f"assertion-{len(observations)}"}
 
     def prepare_perception(instance_id: str) -> Any:
-        return SimpleNamespace(
-            instance_id=instance_id,
-            content="shared-presence",
-        )
+        return _prepared_perception(instance_id, "shared-presence")
 
-    def commit_perception(prepared: Any) -> None:
-        observations.append({"perception_commit": prepared})
+    def commit_perception(
+        prepared: Any,
+        receipt: PerceptionDeliveryReceipt,
+    ) -> None:
+        observations.append(
+            {"perception_commit": prepared, "delivery_receipt": receipt}
+        )
 
     bridge = _Bridge()
     config = MCConfig(mc_home=tmp_path, bridge_ready_timeout_seconds=1)
@@ -335,7 +401,7 @@ async def test_session_returns_full_intention_evidence(tmp_path: Path) -> None:
     assert len(result["receipts"]) == 1
     assert len(result["observations"]) == 2
     assert session.state.conclusions == [result["conclusion"]]
-    assert planner.contexts[0]["transient_world_perception"] == "shared-presence"
+    assert planner.contexts[0]["world_perception"] == "shared-presence"
 
 
 async def test_session_awaits_async_presence_lifecycle_callbacks(
@@ -368,7 +434,9 @@ async def test_session_awaits_async_presence_lifecycle_callbacks(
     assert registry.calls == ["register"]
     assert saves == ["save"]
 
-    await session._on_trace("test.trace", {"source": "test"})
+    assert session._trace is not None
+    record = await session._trace.append("body.selected", {"body_name": "agent"})
+    await session._on_trace(record)
     assert registry.calls == ["register", "touch"]
     assert saves == ["save", "save"]
 
@@ -484,15 +552,19 @@ async def test_session_awaits_async_perception_prepare_and_commit(
 ) -> None:
     """Async perception preparation is consumed and its cursor is committed."""
 
-    prepared = SimpleNamespace(content="async shared perception")
     calls: list[str] = []
 
     async def prepare_perception(instance_id: str) -> Any:
         calls.append(f"prepare:{instance_id}")
-        return prepared
+        return _prepared_perception(instance_id, "async shared perception")
 
-    async def commit_perception(value: Any) -> None:
-        assert value is prepared
+    receipts: list[PerceptionDeliveryReceipt] = []
+
+    async def commit_perception(
+        value: Any,
+        receipt: PerceptionDeliveryReceipt,
+    ) -> None:
+        receipts.append(receipt)
         calls.append("commit")
 
     bridge = _Bridge()
@@ -516,11 +588,14 @@ async def test_session_awaits_async_perception_prepare_and_commit(
     result = await session.do_intent("walk to x=3")
 
     assert result["success"] is True
-    assert planner.contexts[0]["transient_world_perception"] == prepared.content
+    assert planner.contexts[0]["world_perception"] == "async shared perception"
     assert calls == [
         f"prepare:{session.state.consciousness_instance_id}",
         "commit",
     ]
+    assert len(receipts) == 1
+    assert receipts[0].exact is True
+    assert receipts[0].transport_request_id == "fake-request"
     await session.stop()
 
 
@@ -530,9 +605,12 @@ async def test_session_reports_async_perception_commit_failure(
     """A failed async cursor commit cannot be reported as intent success."""
 
     async def prepare_perception(instance_id: str) -> Any:
-        return SimpleNamespace(content=f"prepared:{instance_id}")
+        return _prepared_perception(instance_id, f"prepared:{instance_id}")
 
-    async def commit_perception(value: Any) -> None:
+    async def commit_perception(
+        value: Any,
+        receipt: PerceptionDeliveryReceipt,
+    ) -> None:
         raise RuntimeError("async perception commit failed")
 
     bridge = _Bridge()
@@ -556,6 +634,46 @@ async def test_session_reports_async_perception_commit_failure(
 
     assert result["success"] is False
     assert result["error"] == "async perception commit failed"
+    await session.stop()
+
+
+async def test_session_keeps_cursor_without_exact_perception_delivery(
+    tmp_path: Path,
+) -> None:
+    """Missing final-attempt proof fails closed before the cursor callback."""
+
+    commits: list[PerceptionDeliveryReceipt] = []
+
+    async def prepare_perception(instance_id: str) -> Any:
+        return _prepared_perception(instance_id, "must reach the effective request")
+
+    async def commit_perception(
+        value: Any,
+        receipt: PerceptionDeliveryReceipt,
+    ) -> None:
+        commits.append(receipt)
+
+    bridge = _Bridge()
+    session = MinecraftSession(
+        workspace=tmp_path,
+        mc_config=MCConfig(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
+        prepare_perception=prepare_perception,
+        commit_perception=commit_perception,
+    )
+    session._launcher = _Launcher()
+
+    async def wait_for_bridge(profile: Any) -> _Bridge:
+        return bridge
+
+    session._wait_for_bridge = wait_for_bridge
+    assert (await session.start(body_name="agent"))["success"] is True
+    session._planner = _Planner(prove_delivery=False)
+
+    result = await session.do_intent("inspect without a false cursor commit")
+
+    assert result["success"] is False
+    assert "no exact Perception delivery proof" in result["error"]
+    assert commits == []
     await session.stop()
 
 
@@ -775,3 +893,120 @@ async def test_failed_body_release_remains_retryable(tmp_path: Path) -> None:
     assert retried["success"] is True
     assert retried["cleanup_pending"] is False
     assert bridge.close_attempts == 2
+
+
+async def test_large_perception_cannot_recurse_through_world_receipts(
+    tmp_path: Path,
+) -> None:
+    """Repeated 1.5 MB prompt deliveries produce bounded non-growing receipts."""
+
+    session, _, _, world_events = await _started_session(tmp_path)
+    base_content = "瞬态世界投影" * 150_000
+    prepared_values: list[SimpleNamespace] = []
+
+    async def prepare_perception(instance_id: str) -> Any:
+        prior_receipts = [
+            item["value"]
+            for item in world_events
+            if item.get("predicate") == "embodied_trace"
+        ]
+        feedback = json.dumps(prior_receipts, ensure_ascii=False, sort_keys=True)
+        prepared = _prepared_perception(instance_id, base_content + feedback)
+        prepared_values.append(prepared)
+        return prepared
+
+    committed: list[tuple[SimpleNamespace, PerceptionDeliveryReceipt]] = []
+
+    async def commit_perception(
+        prepared: SimpleNamespace,
+        receipt: PerceptionDeliveryReceipt,
+    ) -> None:
+        committed.append((prepared, receipt))
+
+    session._prepare_perception = prepare_perception
+    session._commit_perception = commit_perception
+    session._planner = _Planner()
+
+    for index in range(3):
+        result = await session.do_intent(f"bounded round {index}")
+        assert result["success"] is True
+
+    trace_events = [
+        item for item in world_events if item.get("predicate") == "embodied_trace"
+    ]
+    receipts = [item["value"] for item in trace_events]
+    assert receipts
+    assert all(
+        item["occurrence_id"] == item["value"]["projection_id"]
+        for item in trace_events
+    )
+    by_kind: dict[str, list[int]] = {}
+    for receipt in receipts:
+        encoded = json.dumps(receipt, ensure_ascii=False, sort_keys=True)
+        assert "transient_prompt_context" not in encoded
+        assert "transient_world_perception" not in encoded
+        assert base_content not in encoded
+        size = world_trace_receipt_size(receipt)
+        assert size <= WORLD_TRACE_RECEIPT_MAX_BYTES
+        by_kind.setdefault(receipt["trace_kind"], []).append(size)
+    assert all(max(sizes) - min(sizes) < 128 for sizes in by_kind.values())
+    assert [prepared for prepared, _receipt in committed] == prepared_values
+    assert all(receipt.exact for _prepared, receipt in committed)
+    assert all(
+        receipt.projection_sha256 == prepared.projection_sha256
+        and receipt.delivered_bytes == prepared.delivered_bytes
+        for prepared, receipt in committed
+    )
+
+    assert session._trace is not None
+    records = await session._trace.verify()
+    intent_records = [record for record in records if record.kind == "intent.issued"]
+    assert len(intent_records) == 3
+    for record, prepared in zip(intent_records, prepared_values, strict=True):
+        serialized = json.dumps(record.to_wire(), ensure_ascii=False)
+        assert prepared.content not in serialized
+        assert "transient_prompt_context" not in record.payload
+        reference = record.payload["perception_reference"]
+        assert reference["bytes"] == len(prepared.content.encode("utf-8"))
+    await session.stop()
+
+
+async def test_failed_world_receipt_remains_retryable_and_uncommitted(
+    tmp_path: Path,
+) -> None:
+    """A World write failure is not cached, committed, or reported as success."""
+
+    session, _, _, world_events = await _started_session(tmp_path)
+    prior_commits = sum("perception_commit" in item for item in world_events)
+
+    async def fail_world(report: str, **kwargs: Any) -> None:
+        raise RuntimeError("World receipt unavailable")
+
+    session._report_world_observation = fail_world
+    session._planner = _Planner()
+    result = await session.do_intent("do not fake World delivery")
+
+    assert result["success"] is False
+    assert "World receipt unavailable" in result["error"]
+    assert sum("perception_commit" in item for item in world_events) == prior_commits
+    assert session._trace is not None
+    record = (await session._trace.verify())[-1]
+    assert record.kind == "intent.issued"
+
+    delivered: list[dict[str, Any]] = []
+
+    async def report_world(report: str, **kwargs: Any) -> None:
+        delivered.append({"report": report, **kwargs})
+
+    session._report_world_observation = report_world
+    await session._on_trace(record)
+    await session._on_trace(record)
+
+    assert len(delivered) == 1
+    assert delivered[0]["value"]["schema"].endswith("projection.v1")
+    assert (
+        delivered[0]["occurrence_id"]
+        == delivered[0]["value"]["projection_id"]
+    )
+    assert world_trace_receipt_size(delivered[0]["value"]) <= 8 * 1024
+    await session.stop()
