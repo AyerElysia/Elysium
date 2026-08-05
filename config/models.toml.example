@@ -32,8 +32,8 @@ id = "BAAI/bge-m3"
 ctx = 4096
 
 # Cloud reasoning models. The local relay currently exposes health-qualified
-# GPT abilities; admitted tasks prioritize Luna -> Terra -> Sol, with the
-# remaining models retained as cross-family fallbacks.
+# Qualified text tasks temporarily prioritize the formal DeepSeek V4 Flash
+# route, followed by Luna -> Terra -> Sol and cross-family fallbacks.
 [models."gpt-5.6-luna"]
 provider = "NexusAI"
 id = "gpt-5.6-luna"
@@ -58,6 +58,8 @@ stream = true
 vision = true
 extra = { reasoning_effort = "high" }
 
+# The local relay maps this public alias to Volcengine Coding Plan's
+# ark-code-latest. Direct upstream deepseek-v4-flash is the preview route.
 [models."deepseek-v4-flash"]
 provider = "NexusAI"
 id = "deepseek-v4-flash"
@@ -109,36 +111,37 @@ id = "qwen3-0.6b-router"
 ctx = 2048
 extra = { enable_thinking = false }
 
-# Generative budgets include hidden reasoning and final output. GPT priority is
-# Luna -> Terra -> Sol. If relay abilities become unhealthy, remove the affected
-# model from automatic tasks only after an end-to-end probe confirms the fault.
-# qwen3.7-plus remains registered for explicit recovery probes only.
+# Generative budgets include hidden reasoning and final output. Qualified text
+# tasks temporarily prefer the formal DeepSeek V4 Flash route; GPT priority then
+# remains Luna -> Terra -> Sol. Remove an unhealthy ability from automatic tasks
+# only after an end-to-end probe confirms the fault. qwen3.7-plus remains
+# registered for explicit recovery probes only.
 [tasks.core]
-models = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "MiMo-V2.5-Pro", "deepseek-v4-flash", "gemini-3.5-flash", "MiMo-V2.5", "claude-sonnet-5"]
+models = ["deepseek-v4-flash", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "MiMo-V2.5-Pro", "gemini-3.5-flash", "MiMo-V2.5", "claude-sonnet-5"]
 tokens = 32000
 temp = 0.7
 context_tokens = 100000
 
 [tasks.expression]
-models = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "deepseek-v4-flash", "MiMo-V2.5-Pro", "gemini-3.5-flash", "MiMo-V2.5", "claude-sonnet-5"]
+models = ["deepseek-v4-flash", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "MiMo-V2.5-Pro", "gemini-3.5-flash", "MiMo-V2.5", "claude-sonnet-5"]
 tokens = 32000
 temp = 0.8
 context_tokens = 200000
 
 [tasks.witness]
-models = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "MiMo-V2.5", "deepseek-v4-flash", "gemini-3.5-flash"]
+models = ["deepseek-v4-flash", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "MiMo-V2.5", "gemini-3.5-flash"]
 tokens = 16000
 temp = 0.7
 context_tokens = 100000
 
 [tasks.agent]
-models = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "MiMo-V2.5-Pro", "deepseek-v4-flash", "gemini-3.5-flash", "MiMo-V2.5", "claude-sonnet-5"]
+models = ["deepseek-v4-flash", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "MiMo-V2.5-Pro", "gemini-3.5-flash", "MiMo-V2.5", "claude-sonnet-5"]
 tokens = 32000
 temp = 0.7
 context_tokens = 200000
 
 [tasks.utility]
-models = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "deepseek-v4-flash", "MiMo-V2.5", "gemini-3.5-flash"]
+models = ["deepseek-v4-flash", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "MiMo-V2.5", "gemini-3.5-flash"]
 tokens = 16000
 temp = 0.7
 context_tokens = 64000
@@ -160,19 +163,19 @@ tokens = 8192
 temp = 0.7
 
 [tasks.router]
-models = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "deepseek-v4-flash", "MiMo-V2.5", "gemini-3.5-flash"]
+models = ["deepseek-v4-flash", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "MiMo-V2.5", "gemini-3.5-flash"]
 tokens = 8192
 temp = 0.3
 context_tokens = 32000
 
 [tasks.router_context_projection]
-models = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "MiMo-V2.5", "deepseek-v4-flash", "gemini-3.5-flash"]
+models = ["deepseek-v4-flash", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "MiMo-V2.5", "gemini-3.5-flash"]
 tokens = 16000
 temp = 0.2
 context_tokens = 100000
 
 [tasks.live]
-models = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "deepseek-v4-flash", "MiMo-V2.5-Pro", "gemini-3.5-flash", "MiMo-V2.5", "claude-sonnet-5"]
+models = ["deepseek-v4-flash", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "MiMo-V2.5-Pro", "gemini-3.5-flash", "MiMo-V2.5", "claude-sonnet-5"]
 tokens = 32000
 temp = 0.75
 context_tokens = 100000

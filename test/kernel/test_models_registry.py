@@ -41,6 +41,7 @@ EXPECTED_CONTEXT_BUDGETS = {
     "live": 100000,
 }
 GPT_PRIORITY = ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol")
+TEXT_PRIORITY = ("deepseek-v4-flash", *GPT_PRIORITY)
 GENERATIVE_TASKS = set(EXPECTED_TASK_BUDGETS) - {"voice", "embedding"}
 
 
@@ -81,13 +82,14 @@ def test_router_tasks_are_cloud_first_and_keep_reasoning_budget() -> None:
     assert "qwen3-0.6b-router" not in config.tasks["router"]["models"]
 
 
-def test_qualified_gpt_models_lead_every_generative_task() -> None:
+def test_formal_deepseek_then_qualified_gpt_lead_text_tasks() -> None:
     registry_path = Path(__file__).parents[2] / "config" / "models.toml.example"
     config = ModelsConfig(registry_path)
 
-    assert set(GPT_PRIORITY).issubset(config.models)
+    assert set(TEXT_PRIORITY).issubset(config.models)
     for task_name in GENERATIVE_TASKS:
-        assert config.tasks[task_name]["models"][:3] == GPT_PRIORITY
+        expected = GPT_PRIORITY if task_name == "vision" else TEXT_PRIORITY
+        assert config.tasks[task_name]["models"][: len(expected)] == expected
 
 
 def test_registry_excludes_failed_automatic_candidates() -> None:
@@ -101,8 +103,9 @@ def test_registry_excludes_failed_automatic_candidates() -> None:
     assert "grok-4.5" not in automatic_models
     assert "qwen3.7-plus" in config.models
     assert "qwen3.7-plus" not in automatic_models
-    assert config.tasks["expression"]["models"][3:6] == (
+    assert config.tasks["expression"]["models"][:6] == (
         "deepseek-v4-flash",
+        *GPT_PRIORITY,
         "MiMo-V2.5-Pro",
         "gemini-3.5-flash",
     )
