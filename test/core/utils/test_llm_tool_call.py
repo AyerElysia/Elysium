@@ -5,8 +5,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
-from src.core.components.base.tool import BaseTool
 from src.core.components.base.action import ActionResultDetail
+from src.core.components.base.tool import BaseTool
 from src.core.utils.llm_tool_call import (
     ToolCallExecutionResult,
     run_llm_usable_executions,
@@ -121,6 +121,33 @@ async def test_run_tool_call_binds_tool_runtime_stream_context() -> None:
 
     assert result == [(True, True)]
     assert response.payloads[0].content[0].value == "message-stream"
+
+
+async def test_run_tool_call_preserves_structured_result_for_canonical_json() -> None:
+    class StructuredTool(BaseTool):
+        tool_name = "structured"
+        tool_description = "structured"
+
+        async def execute(self) -> tuple[bool, dict[str, Any]]:
+            return True, {"schema": "example.v1", "items": [{"value": "爱莉"}]}
+
+    registry = ToolRegistry()
+    registry.register(StructuredTool)
+    response = _FakeResponse()
+
+    result = await run_tool_call(
+        calls=[ToolCall(id="1", name="tool-structured", args={})],
+        response=response,
+        usable_map=registry,
+        trigger_msg=SimpleNamespace(message_id="m1"),
+        plugin=MagicMock(),
+        stream_id="s1",
+    )
+
+    assert result == [(True, True)]
+    tool_result = response.payloads[0].content[0]
+    assert isinstance(tool_result.value, dict)
+    assert tool_result.to_text() == '{"schema": "example.v1", "items": [{"value": "爱莉"}]}'
 
 
 async def test_run_tool_call_preserves_technical_outcome_without_breaking_tuple_contract() -> None:

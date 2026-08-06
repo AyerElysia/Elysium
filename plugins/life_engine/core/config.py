@@ -977,7 +977,7 @@ class LifeEngineConfig(BaseConfig):
             default=240,
             ge=20,
             le=2000,
-            description="每个 stream 最多扫描多少条历史消息。",
+            description="兼容字段名；conversation_evidence 的 search 每页全局最多扫描多少条历史消息。",
         )
 
         tool_default_limit: int = Field(
@@ -992,6 +992,41 @@ class LifeEngineConfig(BaseConfig):
             ge=10,
             le=500,
             description="历史检索工具允许返回的最大条数。",
+        )
+
+        core_max_result_bytes: int = Field(
+            default=8192,
+            ge=2048,
+            le=65536,
+            description="core/heartbeat 单次对话证据投影的 UTF-8 硬字节上限。",
+        )
+
+        chat_max_result_bytes: int = Field(
+            default=16384,
+            ge=2048,
+            le=65536,
+            description="chat 单次对话证据投影的 UTF-8 硬字节上限。",
+        )
+
+        voice_max_result_bytes: int = Field(
+            default=8192,
+            ge=2048,
+            le=65536,
+            description="voice_live 单次对话证据投影的 UTF-8 硬字节上限。",
+        )
+
+        livestream_max_result_bytes: int = Field(
+            default=8192,
+            ge=2048,
+            le=65536,
+            description="livestream 单次对话证据投影的 UTF-8 硬字节上限。",
+        )
+
+        minecraft_max_result_bytes: int = Field(
+            default=8192,
+            ge=2048,
+            le=65536,
+            description="minecraft 单次对话证据投影的 UTF-8 硬字节上限。",
         )
 
     @config_section("web")

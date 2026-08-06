@@ -43,7 +43,7 @@ _READ_ONLY_TOOL_NAMES: frozenset[str] = frozenset({
     "nucleus_relations",
     "nucleus_memory_stats",
     "fetch_life_memory",
-    "fetch_chat_history",
+    "conversation_evidence",
     "nucleus_web_search",
     "nucleus_browser_fetch",
     "nucleus_view_screen",

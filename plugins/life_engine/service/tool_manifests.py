@@ -15,7 +15,6 @@ Design principles:
 
 from __future__ import annotations
 
-
 # Tool name format: "action-{name}" for actions, "tool-{name}" for tools.
 # These match the names as they appear in the LLM tool list.
 
@@ -32,7 +31,7 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
         "action-record_inner_monologue",
         "tool-inner_dialogue",
         "tool-inner_query",
-        "tool-fetch_chat_history",
+        "tool-conversation_evidence",
         "tool-recognize_voice",
         "tool-nucleus_save_media",
         "tool-nucleus_grep_events",
@@ -55,13 +54,13 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
         "action-think",
         "action-report_state",
         "tool-inner_query",
-        "tool-fetch_chat_history",
+        "tool-conversation_evidence",
     ],
     # 语音通话意识：实时语音交互，跨场景感知
     "voice_live": [
         "action-report_state",     # 报告通话状态到 WorldState
         "tool-inner_query",        # 向潜意识查询
-        "tool-fetch_chat_history", # 查阅历史
+        "tool-conversation_evidence", # 有界查阅对话证据
     ],
 }
 

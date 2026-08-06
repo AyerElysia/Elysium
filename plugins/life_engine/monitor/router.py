@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Any
 
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -62,18 +63,17 @@ class MessageTimelineRouter(BaseRouter):
             source_mode: str = "auto",
             include_tool_calls: bool = True,
         ) -> Any:
-            from ..tools.chat_history_tools import LifeEngineFetchChatHistoryTool
+            from ..tools.conversation_evidence import LifeEngineConversationEvidenceTool
 
             plugin: "LifeEnginePlugin" = self.plugin  # type: ignore
-            tool = LifeEngineFetchChatHistoryTool(plugin=plugin)
+            tool = LifeEngineConversationEvidenceTool(plugin=plugin)
+            tool._bind_runtime_context(stream_id=stream_id.strip())
             ok, data = await tool.execute(
+                operation="search" if query else "page",
                 query=query,
-                stream_ids=[stream_id] if stream_id.strip() else [],
-                cross_stream=cross_stream,
+                stream_ids=[stream_id] if stream_id.strip() else None,
                 limit=limit,
-                source_mode=source_mode if source_mode in {"auto", "local_db", "napcat"} else "auto",
-                include_tool_calls=include_tool_calls,
             )
             if ok:
-                return data
-            return JSONResponse(content={"error": str(data)}, status_code=400)
+                return json.loads(data)
+            return JSONResponse(content=json.loads(data), status_code=400)

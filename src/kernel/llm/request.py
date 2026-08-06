@@ -12,6 +12,7 @@ LLMRequest 支持：
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import time
@@ -221,6 +222,38 @@ def _serialize_tool_results(payloads: list[LLMPayload]) -> list[dict[str, Any]]:
                 }
             )
     return results
+
+
+def _tool_result_references(payloads: list[LLMPayload]) -> list[dict[str, Any]]:
+    """Build content-free identities for tool results delivered in this attempt."""
+
+    references: list[dict[str, Any]] = []
+    for payload in payloads:
+        for part in payload.content:
+            if not isinstance(part, ToolResult):
+                continue
+            # Hash the exact text representation providers receive.  The
+            # trajectory body is sanitized separately; this extension keeps
+            # only content-free identity and size.
+            rendered = part.to_text()
+            encoded = rendered.encode("utf-8")
+            reference: dict[str, Any] = {
+                "call_id": sanitize_text_only(part.call_id),
+                "name": sanitize_text_only(part.name),
+                "sha256": hashlib.sha256(encoded).hexdigest(),
+                "utf8_bytes": len(encoded),
+            }
+            try:
+                structured = json.loads(rendered)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                structured = None
+            if isinstance(structured, dict):
+                for key in ("schema", "delivery_id", "projection_sha256", "delivered_bytes"):
+                    value = structured.get(key)
+                    if isinstance(value, (str, int)):
+                        reference[key] = value
+            references.append(reference)
+    return references
 
 
 def _serialize_response(response: LLMResponse) -> dict[str, Any]:
@@ -616,7 +649,9 @@ class LLMRequest:
                     "model_index": (step_meta or {}).get("model_index", 0),
                     "stream": stream,
                 },
-                "extensions": {},
+                "extensions": {
+                    "tool_result_refs": _tool_result_references(trimmed),
+                },
             }
             if response_obj is not None and response_obj.call_list:
                 event["metadata"]["call_ids"] = [

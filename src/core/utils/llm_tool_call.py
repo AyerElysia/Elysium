@@ -8,7 +8,14 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from src.core.components.utils import should_strip_auto_reason_argument
-from src.kernel.llm import LLMUsable, LLMUsableExecution, LLMPayload, ROLE, ToolRegistry, ToolResult
+from src.kernel.llm import (
+    ROLE,
+    LLMPayload,
+    LLMUsable,
+    LLMUsableExecution,
+    ToolRegistry,
+    ToolResult,
+)
 from src.kernel.logger import get_logger
 
 if TYPE_CHECKING:
@@ -24,7 +31,7 @@ class _PreparedCall:
     call: "ToolCall"
     execution: LLMUsableExecution | None = None
     exec_success: bool = False
-    result_text: str = ""
+    result_value: Any = ""
     technical_outcome: str = ""
 
 
@@ -312,10 +319,10 @@ async def run_tool_call(
         prepared_call = _PreparedCall(call=call)
 
         if usable_cls is None:
-            prepared_call.result_text = f"未知的工具: {call.name}"
-            logger.warning(prepared_call.result_text)
+            prepared_call.result_value = f"未知的工具: {call.name}"
+            logger.warning(str(prepared_call.result_value))
         elif trigger_msg is None:
-            prepared_call.result_text = "无触发消息，跳过执行"
+            prepared_call.result_value = "无触发消息，跳过执行"
             prefix = f"[{display_name}] " if display_name else ""
             logger.debug(f"{prefix}无触发消息，跳过工具调用: {call.name}")
         else:
@@ -335,7 +342,7 @@ async def run_tool_call(
                     tool_call_id=str(call.id or ""),
                 )
             except Exception as exc:
-                prepared_call.result_text = f"执行异常: {exc}"
+                prepared_call.result_value = f"执行异常: {exc}"
                 logger.error(f"准备执行 {call.name} 异常: {exc}", exc_info=True)
 
         prepared.append(prepared_call)
@@ -356,16 +363,19 @@ async def run_tool_call(
                 item.technical_outcome = str(
                     getattr(result, "technical_outcome", "") or ""
                 )
-                item.result_text = str(result) if success else f"执行失败: {result}"
+                # Preserve structured tool results.  ToolResult owns the
+                # canonical JSON rendering; converting a dict with ``str``
+                # produces a Python repr and destroys its transport contract.
+                item.result_value = result if success else f"执行失败: {result}"
             except Exception as exc:
-                item.result_text = f"执行异常: {exc}"
+                item.result_value = f"执行异常: {exc}"
                 logger.error(f"执行 {item.call.name} 异常: {exc}", exc_info=True)
 
         response.add_payload(
             LLMPayload(
                 ROLE.TOOL_RESULT,
                 ToolResult(
-                    value=item.result_text,
+                    value=item.result_value,
                     call_id=item.call.id,
                     name=item.call.name,
                 ),

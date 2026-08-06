@@ -7,7 +7,7 @@ from typing import Any
 
 _PARALLEL_SAFE_TOOL_NAMES: frozenset[str] = frozenset(
     {
-        "fetch_chat_history",
+        "conversation_evidence",
         "fetch_life_memory",
         "grep_life_events",
         "nucleus_browser_fetch",

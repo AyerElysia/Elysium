@@ -6391,6 +6391,10 @@ class LifeEngineService(BaseService):
 
         try:
             tool_instance = usable_cls(plugin=self.plugin)
+            # Producer-side result budgets are task contracts.  Heartbeat has
+            # no trigger Message to infer this from, so bind its identity
+            # explicitly before executing any shared retrieval capability.
+            tool_instance._runtime_task_name = "core"
             call_args = dict(args)
             if should_strip_auto_reason_argument(tool_instance.execute, call_args):
                 call_args.pop("reason", None)

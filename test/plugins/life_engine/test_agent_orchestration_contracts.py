@@ -523,6 +523,14 @@ class TestConsciousnessManifestContracts:
 
         assert "action-life_send_text" in manifest
         assert "action-think" not in manifest
+        assert "tool-conversation_evidence" in manifest
+        assert "tool-fetch_chat_history" not in manifest
+
+    @pytest.mark.parametrize("kind", ["chat", "livestream", "voice_live"])
+    def test_conversation_evidence_replaces_unbounded_history_tool(self, kind: str) -> None:
+        manifest = set(get_tool_manifest(kind))
+        assert "tool-conversation_evidence" in manifest
+        assert "tool-fetch_chat_history" not in manifest
 
     @pytest.mark.parametrize("kind", ["minecraft", "livestream"])
     def test_non_chat_manifests_keep_legacy_think_action(self, kind: str) -> None:

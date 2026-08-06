@@ -21,12 +21,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
-from collections import Counter
-from datetime import datetime, timezone
+from collections import Counter, defaultdict
+from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -58,7 +60,7 @@ VERBOSE_TOOL_NAMES = {
 
 MIN_TOTAL_TOKENS = 10
 MAX_TOTAL_TOKENS = 100_000
-MAX_TOOL_OUTPUT_CHARS = 5_000
+MAX_TOOL_OUTPUT_BYTES = 16 * 1024
 
 
 def iter_records(lake: Path, *, include_archive: bool) -> Iterator[dict[str, Any]]:
@@ -93,7 +95,9 @@ def _usage_total(record: dict[str, Any]) -> int | None:
     return sum(numbers) if numbers else None
 
 
-def should_include_in_training(record: dict[str, Any], *, require_response: bool) -> tuple[bool, str]:
+def should_include_in_training(
+    record: dict[str, Any], *, require_response: bool
+) -> tuple[bool, str]:
     """质量门：返回 (是否保留, 拒绝原因)。"""
     if record.get("success") is False:
         return False, "failed_attempt"
@@ -118,46 +122,110 @@ def should_include_in_training(record: dict[str, Any], *, require_response: bool
     return True, ""
 
 
-def _truncate_tool_output(message: dict[str, Any]) -> dict[str, Any]:
-    """截断啰嗦工具的巨型输出，保留结构但压掉体积。"""
+def _externalize_tool_output(
+    message: dict[str, Any],
+    *,
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    """Replace oversized evidence with a verifiable content-addressed descriptor."""
     name = str(message.get("name") or "")
     content = message.get("content")
-    if (
-        name in VERBOSE_TOOL_NAMES
-        and isinstance(content, str)
-        and len(content) > MAX_TOOL_OUTPUT_CHARS
-    ):
-        clipped = dict(message)
-        clipped["content"] = (
-            content[:MAX_TOOL_OUTPUT_CHARS] + f"\n...[truncated {len(content) - MAX_TOOL_OUTPUT_CHARS} chars]"
+    if not isinstance(content, str):
+        return message
+    encoded = content.encode("utf-8")
+    threshold = 5_000 if name in VERBOSE_TOOL_NAMES else MAX_TOOL_OUTPUT_BYTES
+    if len(encoded) > threshold:
+        externalized = dict(message)
+        externalized["content"] = json.dumps(
+            {
+                "schema": "elysium.training.external_evidence_ref.v1",
+                "sha256": hashlib.sha256(encoded).hexdigest(),
+                "utf8_bytes": len(encoded),
+                "raw_trajectory_ref": {
+                    "source_file": record.get("_source_file"),
+                    "attempt_id": record.get("attempt_id"),
+                    "tool_call_id": message.get("tool_call_id"),
+                },
+                "supervision": "external_evidence_not_persona_target",
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
         )
-        clipped["truncated"] = True
-        return clipped
+        externalized["externalized"] = True
+        return externalized
     return message
+
+
+def collapse_agent_traces(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Select the final successful cumulative attempt for each stable trace."""
+
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for index, record in enumerate(records):
+        trace_id = str(
+            record.get("trace_id") or record.get("request_id") or f"unbound:{index}"
+        )
+        grouped[trace_id].append(record)
+
+    collapsed: list[dict[str, Any]] = []
+    for trace_id, candidates in grouped.items():
+        successful = [item for item in candidates if item.get("success") is not False]
+        if not successful:
+            continue
+        selected = max(
+            successful,
+            key=lambda item: (
+                str(item.get("timestamp") or ""),
+                int((item.get("metadata") or {}).get("attempt_index", 0) or 0),
+            ),
+        )
+        selected = dict(selected)
+        selected["_collapsed_trace_id"] = trace_id
+        selected["_collapsed_record_count"] = len(candidates)
+        collapsed.append(selected)
+    collapsed.sort(key=lambda item: str(item.get("timestamp") or ""))
+    return collapsed
 
 
 def to_sft_chat(record: dict[str, Any]) -> dict[str, Any] | None:
     """转成 OpenAI messages 格式的 SFT 样本。"""
     messages: list[dict[str, Any]] = []
+    seen_tool_results: dict[str, str] = {}
     for item in record.get("messages") or []:
         if not isinstance(item, dict):
             continue
-        role = item.get("role")
-        content = item.get("content")
+        cleaned = _externalize_tool_output(item, record=record)
+        role = cleaned.get("role")
+        content = cleaned.get("content")
         if role not in {"system", "user", "assistant", "tool"}:
             continue
         if not isinstance(content, str) or not content.strip():
             continue
-        messages.append({"role": role, "content": content})
+        output_message = {"role": role, "content": content}
+        if role == "tool" and cleaned.get("tool_call_id"):
+            call_id = str(cleaned["tool_call_id"])
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            previous = seen_tool_results.get(call_id)
+            if previous == digest:
+                continue
+            if previous is not None and previous != digest:
+                return None
+            seen_tool_results[call_id] = digest
+            output_message["tool_call_id"] = call_id
+            if cleaned.get("name"):
+                output_message["name"] = str(cleaned["name"])
+        messages.append(output_message)
 
     if not messages:
         return None
 
     response = record.get("response")
     reply = response.get("content") if isinstance(response, dict) else response
-    if isinstance(reply, str) and reply.strip():
-        if not messages or messages[-1]["role"] != "assistant":
-            messages.append({"role": "assistant", "content": reply})
+    if (
+        isinstance(reply, str)
+        and reply.strip()
+        and (not messages or messages[-1]["role"] != "assistant")
+    ):
+        messages.append({"role": "assistant", "content": reply})
 
     if not any(m["role"] == "assistant" for m in messages):
         return None
@@ -172,6 +240,15 @@ def to_sft_chat(record: dict[str, Any]) -> dict[str, Any] | None:
             "timestamp": record.get("timestamp"),
             "source_file": record.get("_source_file"),
             "completeness": (record.get("metadata") or {}).get("completeness"),
+            "trace_id": record.get("_collapsed_trace_id") or record.get("trace_id"),
+            "collapsed_record_count": int(
+                record.get("_collapsed_record_count", 1) or 1
+            ),
+            "supervision_boundaries": {
+                "user_messages": "observed_experience",
+                "tool_results": "external_evidence_not_persona_target",
+                "assistant_messages": "subject_output_candidate",
+            },
         },
     }
 
@@ -180,10 +257,22 @@ def to_agent_trajectory(record: dict[str, Any]) -> dict[str, Any] | None:
     """保留 tool 链路的 agent 轨迹样本。"""
     messages: list[dict[str, Any]] = []
     tool_calls = 0
+    seen_tool_results: dict[str, str] = {}
     for item in record.get("messages") or []:
         if not isinstance(item, dict):
             continue
-        cleaned = _truncate_tool_output(item)
+        cleaned = _externalize_tool_output(item, record=record)
+        if cleaned.get("role") == "tool" and cleaned.get("tool_call_id"):
+            call_id = str(cleaned["tool_call_id"])
+            digest = hashlib.sha256(
+                str(cleaned.get("content") or "").encode("utf-8")
+            ).hexdigest()
+            previous = seen_tool_results.get(call_id)
+            if previous == digest:
+                continue
+            if previous is not None and previous != digest:
+                return None
+            seen_tool_results[call_id] = digest
         if cleaned.get("tool_calls"):
             tool_calls += 1
         messages.append(cleaned)
@@ -191,11 +280,40 @@ def to_agent_trajectory(record: dict[str, Any]) -> dict[str, Any] | None:
     if not messages:
         return None
 
+    deduped_top_level_results: list[dict[str, Any]] = []
+    seen_top_level_results: dict[str, str] = {}
+    for item in record.get("tool_results") or []:
+        if not isinstance(item, dict):
+            continue
+        call_id = str(item.get("call_id") or "")
+        projected = _externalize_tool_output(
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": item.get("name"),
+                "content": item.get("content"),
+            },
+            record=record,
+        )
+        projected_content = str(projected.get("content") or "")
+        digest = hashlib.sha256(projected_content.encode("utf-8")).hexdigest()
+        previous = seen_top_level_results.get(call_id)
+        if previous == digest:
+            continue
+        if previous is not None and previous != digest:
+            return None
+        seen_top_level_results[call_id] = digest
+        projected_item = dict(item)
+        projected_item["content"] = projected_content
+        if projected.get("externalized"):
+            projected_item["externalized"] = True
+        deduped_top_level_results.append(projected_item)
+
     response = record.get("response")
     return {
         "messages": messages,
         "response": response,
-        "tool_results": record.get("tool_results") or [],
+        "tool_results": deduped_top_level_results,
         "meta": {
             "request_id": record.get("request_id"),
             "attempt_id": record.get("attempt_id"),
@@ -207,14 +325,27 @@ def to_agent_trajectory(record: dict[str, Any]) -> dict[str, Any] | None:
             "tool_call_turns": tool_calls,
             "source_file": record.get("_source_file"),
             "completeness": (record.get("metadata") or {}).get("completeness"),
+            "trace_id": record.get("_collapsed_trace_id") or record.get("trace_id"),
+            "collapsed_record_count": int(
+                record.get("_collapsed_record_count", 1) or 1
+            ),
+            "supervision_boundaries": {
+                "user_messages": "observed_experience",
+                "tool_results": "external_evidence_not_persona_target",
+                "assistant_and_action_arguments": "subject_output_candidate",
+            },
         },
     }
+
+
 def print_stats(records: list[dict[str, Any]]) -> None:
     """先看清分布，再决定导什么。"""
     names = Counter(r.get("request_name") or "<none>" for r in records)
     models = Counter(r.get("model_identifier") or "<none>" for r in records)
     success = Counter(str(r.get("success")) for r in records)
-    completeness = Counter(str((r.get("metadata") or {}).get("completeness")) for r in records)
+    completeness = Counter(
+        str((r.get("metadata") or {}).get("completeness")) for r in records
+    )
     sources = Counter(r.get("_source_file") or "<none>" for r in records)
 
     print(f"总记录数: {len(records)}")
@@ -275,6 +406,8 @@ def main() -> None:
         if not args.format:
             return
 
+    records = collapse_agent_traces(records)
+
     if args.request_name:
         allowed = set(args.request_name)
     elif args.format == "sft_chat":
@@ -285,8 +418,10 @@ def main() -> None:
     require_response = args.format == "sft_chat"
     converter = to_sft_chat if args.format == "sft_chat" else to_agent_trajectory
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    out_path = Path(args.out) if args.out else lake / "export" / f"{args.format}_{today}.jsonl"
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    out_path = (
+        Path(args.out) if args.out else lake / "export" / f"{args.format}_{today}.jsonl"
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     rejected: Counter[str] = Counter()
@@ -298,11 +433,16 @@ def main() -> None:
                 continue
 
             completeness = (record.get("metadata") or {}).get("completeness")
-            if isinstance(completeness, (int, float)) and completeness < args.min_completeness:
+            if (
+                isinstance(completeness, (int, float))
+                and completeness < args.min_completeness
+            ):
                 rejected["below_min_completeness"] += 1
                 continue
 
-            keep, reason = should_include_in_training(record, require_response=require_response)
+            keep, reason = should_include_in_training(
+                record, require_response=require_response
+            )
             if not keep:
                 rejected[reason] += 1
                 continue
