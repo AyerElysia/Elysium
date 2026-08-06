@@ -1,5 +1,19 @@
-"""Asynchronous curiosity layer for life_engine."""
+"""Sourced epistemic opportunities for life_engine."""
 
-from .engine import CuriosityEngine, CuriositySignal, format_curiosity_signal
+from .engine import (
+    CuriosityEngine,
+    CuriositySignal,
+    EpistemicOpportunity,
+    EpistemicOpportunityStateError,
+    format_curiosity_signal,
+    format_epistemic_opportunity,
+)
 
-__all__ = ["CuriosityEngine", "CuriositySignal", "format_curiosity_signal"]
+__all__ = [
+    "CuriosityEngine",
+    "CuriositySignal",
+    "EpistemicOpportunity",
+    "EpistemicOpportunityStateError",
+    "format_curiosity_signal",
+    "format_epistemic_opportunity",
+]

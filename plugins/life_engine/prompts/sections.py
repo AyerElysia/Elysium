@@ -98,7 +98,7 @@ class ThoughtStreamsSection(HeartbeatSectionProvider):
 
 
 class CuriositySection(HeartbeatSectionProvider):
-    """异步好奇层留下的刺点（含承接引导），由心跳态自行决定是否承接。"""
+    """Deprecated section exposing only an external epistemic candidate."""
 
     section_id = "curiosity"
 
@@ -117,14 +117,7 @@ class CuriositySection(HeartbeatSectionProvider):
         body = format_curiosity_signal(signal)
         if not body:
             return None
-        guidance = (
-            "如果这个刺点你确实在意，可以靠近它（联想、检索、轻轻观察），"
-            "或者用 `nucleus_manage_thought_stream`"
-            "（action=create，absorb_curiosity=true）"
-            "开一条思考流把它留住——承接之后这股牵引会自然放下。\n"
-            "如果你觉得它已经闭合、或并不重要，放下它也很好。"
-        )
-        return f"{body}\n\n{guidance}"
+        return body
 
 
 class AttentionOpportunitySection(HeartbeatSectionProvider):
@@ -205,9 +198,7 @@ class AttentionOpportunitySection(HeartbeatSectionProvider):
             except Exception:  # noqa: BLE001
                 body = ""
             if body:
-                blocks.append(
-                    body.replace("### 好奇牵引", "#### 好奇线索", 1)
-                )
+                blocks.append(body)
 
         if not blocks:
             return None

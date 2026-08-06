@@ -3183,13 +3183,13 @@ class LifeEngineService(BaseService):
         if curiosity_cfg is not None and not bool(getattr(curiosity_cfg, "enabled", True)):
             return
         if self._curiosity_inflight:
-            logger.debug("好奇异步判断仍在运行，跳过本次重复调度")
+            logger.debug("认知机会候选生成仍在运行，跳过本次重复调度")
             return
 
         self._curiosity_inflight = True
         get_task_manager().create_task(
             self._run_curiosity_review(message, event),
-            name=f"life_curiosity_{event.sequence}",
+            name=f"life_epistemic_opportunity_{event.sequence}",
             daemon=True,
             timeout=float(getattr(curiosity_cfg, "timeout_seconds", 30.0) or 30.0) + 5.0,
         )
@@ -3215,18 +3215,23 @@ class LifeEngineService(BaseService):
                 new_event_text=new_event_text,
                 source_event_id=event.event_id,
                 source_stream_id=event.stream_id or "",
+                source_instance_id=event.source_instance_id
+                or self.resolve_consciousness_instance(event.stream_id or ""),
             )
             if signal.active:
-                logger.info(f"好奇牵引已更新: {signal.anchor or signal.unknown}")
+                logger.info(
+                    "认知机会候选已生成: "
+                    f"source_event_id={event.event_id} sequence={event.sequence}"
+                )
             else:
-                logger.debug("好奇异步判断：暂无值得保留的刺点")
+                logger.debug("认知机会生成器本轮未提供新候选")
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"好奇异步判断失败: {exc}")
+            logger.warning(f"认知机会候选生成失败: {exc}")
         finally:
             self._curiosity_inflight = False
 
     async def _build_meme_awareness_text(self) -> str:
-        """构建“未浏览表情包”的轻意识文本（供好奇心参考，是提醒不是任务）。"""
+        """构建“未浏览表情包”的来源提示，供认知机会生成器参考。"""
         try:
             from src.app.plugin_system.api.service_api import get_service
 
@@ -3253,7 +3258,7 @@ class LifeEngineService(BaseService):
             memory_data = load_memory_prompt_data(workspace)
             memory_text = render_memory_prompt(memory_data, mode="chat") if memory_data.raw_text else ""
         except Exception as exc:  # noqa: BLE001
-            logger.debug(f"好奇层读取 MEMORY.md 失败: {exc}")
+            logger.debug(f"认知机会生成器读取 MEMORY.md 失败: {exc}")
 
         return LifeChatterContextAssembler.build_prefix_prompt(
             soul_text=soul_text,

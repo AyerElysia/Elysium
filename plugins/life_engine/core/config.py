@@ -884,47 +884,47 @@ class LifeEngineConfig(BaseConfig):
 
     @config_section("curiosity")
     class CuriositySection(SectionBase):
-        """异步好奇层配置。"""
+        """认知机会候选生成与投影配置（保留旧 section 名兼容）。"""
 
         enabled: bool = Field(
             default=True,
-            description="是否启用同主体异步好奇层。",
+            description="是否启用外部认知机会候选生成器。",
         )
 
         inject_to_chatter: bool = Field(
             default=True,
-            description="是否将已完成的好奇牵引注入 life_chatter suffix。",
+            description="是否将有来源的认知机会候选投影注入 life_chatter suffix。",
         )
 
         inject_to_heartbeat: bool = Field(
             default=True,
-            description="是否将好奇牵引注入心跳 prompt，让心跳态可以看到并承接刺点。",
+            description="是否将认知机会候选投影注入心跳 prompt；候选不代表主体决定。",
         )
 
         task_name: str = Field(
             default="",
-            description="好奇代理使用的模型任务名。留空时跟随 [model].task_name。",
+            description="认知机会候选生成器使用的模型任务名。留空时跟随 [model].task_name。",
         )
 
         history_messages: int = Field(
             default=20,
             ge=0,
             le=80,
-            description="好奇代理决策时携带的最近统一聊天历史条数。",
+            description="生成候选时携带的最近统一聊天历史条数。",
         )
 
         timeout_seconds: float = Field(
             default=30.0,
             ge=3.0,
             le=120.0,
-            description="单次好奇异步判断的 LLM 超时秒数。",
+            description="单次认知机会候选生成的 LLM 超时秒数。",
         )
 
         max_prompt_chars: int = Field(
             default=1200,
             ge=200,
             le=4000,
-            description="注入 chatter suffix 的好奇牵引最大字符数。",
+            description="兼容字段：认知机会 Prompt 投影的 UTF-8 硬字节预算。",
         )
 
     @config_section("history_retrieval")

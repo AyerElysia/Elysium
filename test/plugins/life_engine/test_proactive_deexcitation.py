@@ -6,15 +6,19 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.curiosity import CuriositySignal
 from plugins.life_engine.drives.rules import DEFAULT_RULES
 from plugins.life_engine.prompts.sections import (
     DEFAULT_HEARTBEAT_SECTIONS,
     AttentionOpportunitySection,
+    CuriositySection,
     SectionContext,
 )
 from plugins.life_engine.service import LifeEngineService
+from plugins.life_engine.service.event_builder import EventType, LifeEngineEvent
 from plugins.life_engine.streams.manager import ThoughtStreamManager
 
 
@@ -104,6 +108,89 @@ def test_attention_opportunity_merges_clues_without_action_choice(
     assert text.count("attention_opportunity") == 1
     assert text.count("那段旋律") == 1
     assert text.count("雨声里的停顿") == 1
+    assert "认知机会候选（epistemic_opportunity）" in text
+    assert "不是你的好奇、想法、偏好或任务" in text
+    assert "好奇牵引" not in text
     assert "nucleus_manage_thought_stream" not in text
     assert "action=create" not in text
     assert "保持原样或安静结束本轮同样是完整决定" in text
+
+
+def test_legacy_curiosity_section_has_no_subject_attribution_or_adoption_guide(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    asyncio.run(
+        service._get_curiosity_engine().save_signal(
+            CuriositySignal(
+                active=True,
+                anchor="仍有一个可检查的停顿",
+                unknown="停顿前后发生了什么？",
+            )
+        )
+    )
+    ctx = SectionContext(
+        service=service,
+        config=service.plugin.config,
+        today_str="2026-08-06",
+    )
+
+    text = asyncio.run(CuriositySection().render(ctx))
+
+    assert text is not None
+    assert "认知机会候选" in text
+    assert "不是你的好奇" in text
+    assert "同一主体" not in text
+    assert "absorb_curiosity" not in text
+    assert "nucleus_manage_thought_stream" not in text
+
+
+@pytest.mark.parametrize(
+    ("event_instance_id", "resolved_instance_id", "expected_instance_id"),
+    [
+        ("minecraft-main", "must-not-be-used", "minecraft-main"),
+        (None, "chat_global", "chat_global"),
+    ],
+)
+def test_epistemic_candidate_preserves_source_instance_or_stable_fallback(
+    tmp_path: Path,
+    event_instance_id: str | None,
+    resolved_instance_id: str,
+    expected_instance_id: str,
+) -> None:
+    service = _service(tmp_path)
+    captured: dict[str, object] = {}
+
+    class _Generator:
+        async def review(self, **kwargs: object) -> CuriositySignal:
+            captured.update(kwargs)
+            return CuriositySignal.empty()
+
+    async def _history(*_args: object, **_kwargs: object) -> str:
+        return ""
+
+    async def _meme() -> str:
+        return ""
+
+    service._get_curiosity_engine = lambda: _Generator()
+    service._build_curiosity_prefix_prompt = lambda: ""
+    service._build_curiosity_history_text = _history
+    service._build_meme_awareness_text = _meme
+    service.resolve_consciousness_instance = lambda _stream_id="": resolved_instance_id
+    event = LifeEngineEvent(
+        event_id="event-1",
+        event_type=EventType.MESSAGE,
+        timestamp="2026-08-06T12:00:00+08:00",
+        sequence=7,
+        source="test",
+        source_detail="test",
+        content="source content",
+        stream_id="stream-1",
+        source_instance_id=event_instance_id,
+    )
+
+    asyncio.run(service._run_curiosity_review(SimpleNamespace(), event))
+
+    assert captured["source_event_id"] == "event-1"
+    assert captured["source_stream_id"] == "stream-1"
+    assert captured["source_instance_id"] == expected_instance_id

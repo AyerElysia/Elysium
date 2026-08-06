@@ -1,73 +1,264 @@
+import hashlib
+import json
+
 import pytest
 
 from plugins.life_engine.curiosity.engine import (
     CuriosityEngine,
     CuriositySignal,
+    EpistemicOpportunity,
+    EpistemicOpportunityStateError,
     format_curiosity_signal,
+    format_epistemic_opportunity,
 )
+
+
+def _opportunity(
+    *, occurrence_id: str = "evt-1", question: str = "她是在确认在线，还是确认被记得？"
+) -> EpistemicOpportunity:
+    return EpistemicOpportunity.build(
+        source_occurrence_id=occurrence_id,
+        source_stream_id="stream-1",
+        source_instance_id="chat_global",
+        observed_gap="同一句确认重复出现",
+        open_question=question,
+        possible_next_look="以后可再次观察相邻语境",
+        generator_note="来源里保留了两种尚未区分的解释",
+        generated_at="2026-08-06T12:00:00+08:00",
+    )
 
 
 def test_empty_signal_formats_to_empty_text():
     assert format_curiosity_signal(CuriositySignal.empty()) == ""
+    assert format_epistemic_opportunity(None) == ""
 
 
-def test_active_signal_formats_as_non_command_suffix():
+def test_candidate_render_never_claims_subject_curiosity_or_importance():
+    text = format_epistemic_opportunity(_opportunity())
+
+    assert "### 认知机会候选（epistemic_opportunity）" in text
+    assert "不是你的好奇、想法、偏好或任务" in text
+    assert "不表示它重要" in text
+    assert "只有你此刻亲自选择" in text
+    assert "保持开放、忽略或不回应" in text
+    assert "同一句确认重复出现" in text
+    assert "好奇牵引" not in text
+    assert "置信度" not in text
+    assert "标签" not in text
+
+
+def test_legacy_renderer_uses_candidate_semantics_and_drops_scores():
     text = format_curiosity_signal(
         CuriositySignal(
             active=True,
             anchor="反复问在不在",
-            why="它不像普通问候，更像在确认关系连续性。",
-            unknown="她真正想确认的是在线状态，还是被记得。",
-            approach="如果你愿意，可以轻轻问一句她刚刚是不是在确认你还在。",
+            why="来源里仍有多种解释",
+            unknown="是在确认在线，还是确认被记得？",
+            approach="之后可以再观察",
+            confidence=0.9,
             tags=["关系牵引"],
         )
     )
-    assert "### 好奇牵引" in text
-    assert "不是命令" in text
+
+    assert "认知机会候选" in text
     assert "反复问在不在" in text
-    assert "关系牵引" in text
+    assert "0.9" not in text
+    assert "关系牵引" not in text
+    assert "同一主体的异步好奇" not in text
 
 
-def test_parse_signal_repairs_json():
+def test_generator_prompt_is_external_and_has_no_scoring_schema():
+    prompt = CuriosityEngine._build_system_prompt("主体上下文引用")
+
+    assert "系统侧的候选生成器" in prompt
+    assert "不是爱莉、不是她的内心" in prompt
+    assert "不授予你代表主体" in prompt
+    assert '"candidate_present"' in prompt
+    assert '"open_question"' in prompt
+    assert '"confidence"' not in prompt
+    assert '"tags"' not in prompt
+    assert '"priority"' not in prompt
+
+
+def test_parse_opportunity_repairs_json_and_binds_source_identity():
+    opportunity = CuriosityEngine._parse_opportunity(
+        """
+        {
+          candidate_present: true,
+          observed_gap: "图片摘要和实际气质还没有对照",
+          open_question: "它是否真的适合作为电台封面？",
+          possible_next_look: "可以直接观察原图",
+          generator_note: "当前只有文字摘要"
+        }
+        """,
+        source_occurrence_id="evt-1",
+        source_stream_id="stream-1",
+        source_instance_id="chat_global",
+    )
+
+    assert opportunity is not None
+    assert opportunity.source_occurrence_id == "evt-1"
+    assert opportunity.source_stream_id == "stream-1"
+    assert opportunity.source_instance_id == "chat_global"
+    assert opportunity.open_question == "它是否真的适合作为电台封面？"
+    assert opportunity.opportunity_id.startswith("eop_")
+    assert len(opportunity.payload_sha256) == 64
+
+
+def test_false_generator_result_does_not_materialize_candidate():
+    opportunity = CuriosityEngine._parse_opportunity(
+        '{"candidate_present": false}',
+        source_occurrence_id="evt-1",
+        source_stream_id="stream-1",
+        source_instance_id="chat_global",
+    )
+
+    assert opportunity is None
+
+
+def test_legacy_parse_adapter_does_not_preserve_score_or_tags():
     signal = CuriosityEngine._parse_signal(
         """
         {
           active: true,
           anchor: "图片气质没闭合",
-          why: "摘要说温柔，但用户在问是否适合电台封面",
-          unknown: "关键可能是气质是否像爱莉",
-          approach: "可以选择亲自看图",
+          unknown: "气质是否像爱莉",
           confidence: 0.8,
           tags: ["图片", "审美"]
         }
         """,
-        source_event_id="evt1",
-        source_stream_id="stream1",
+        source_event_id="evt-1",
+        source_stream_id="stream-1",
     )
+
     assert signal.active is True
     assert signal.anchor == "图片气质没闭合"
-    assert signal.source_event_id == "evt1"
-    assert signal.source_stream_id == "stream1"
-    assert signal.confidence == pytest.approx(0.8)
-    assert signal.tags == ["图片", "审美"]
+    assert signal.source_event_id == "evt-1"
+    assert signal.confidence == 0.0
+    assert signal.tags == []
 
 
-async def test_signal_persistence_roundtrip(tmp_path):
+@pytest.mark.asyncio
+async def test_append_only_roundtrip_and_projection_clear(tmp_path):
     engine = CuriosityEngine(workspace_path=str(tmp_path), model_task_name="life")
-    signal = CuriositySignal(
-        active=True,
-        anchor="一句话没说透",
-        why="表层是玩笑，底下像是在试探。",
-        unknown="她想被接住还是想转移话题。",
-        approach="先保留这个刺点。",
-        confidence=0.7,
-    )
-    await engine.save_signal(signal)
-    loaded = await engine.load_signal()
-    assert loaded.active is True
-    assert loaded.anchor == "一句话没说透"
-    assert loaded.confidence == pytest.approx(0.7)
+    first = _opportunity()
+    second = _opportunity(occurrence_id="evt-2", question="这次停顿来自哪里？")
+
+    await engine.save_opportunity(first)
+    await engine.save_opportunity(second)
+    assert await engine.load_opportunity() == second
+
+    ledger_before_clear = engine.ledger_path.read_bytes()
+    rows = engine.ledger_path.read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 2
+    assert [json.loads(row)["opportunity_id"] for row in rows] == [
+        first.opportunity_id,
+        second.opportunity_id,
+    ]
 
     await engine.clear()
-    cleared = await engine.load_signal()
-    assert cleared.active is False
+    assert await engine.load_opportunity() is None
+    assert engine.ledger_path.read_bytes() == ledger_before_clear
+    projection = json.loads(engine.state_path.read_text(encoding="utf-8"))
+    assert projection["current_opportunity_id"] is None
+    assert projection["reason_code"] == "legacy_adapter_clear"
+    assert set(projection) == {
+        "kind",
+        "schema_version",
+        "projection_revision",
+        "current_opportunity_id",
+        "reason_code",
+        "updated_at",
+    }
+    assert "open_question" not in projection
+    assert "generator_note" not in projection
+
+
+@pytest.mark.asyncio
+async def test_duplicate_candidate_is_idempotent(tmp_path):
+    engine = CuriosityEngine(workspace_path=str(tmp_path))
+    opportunity = _opportunity()
+    replay = EpistemicOpportunity.build(
+        source_occurrence_id="evt-1",
+        source_stream_id="stream-1",
+        source_instance_id="chat_global",
+        observed_gap="同一句确认重复出现",
+        open_question="她是在确认在线，还是确认被记得？",
+        possible_next_look="以后可再次观察相邻语境",
+        generator_note="来源里保留了两种尚未区分的解释",
+        generated_at="2026-08-06T12:05:00+08:00",
+    )
+
+    await engine.save_opportunity(opportunity)
+    await engine.save_opportunity(replay)
+
+    assert replay.opportunity_id == opportunity.opportunity_id
+    assert replay.payload_sha256 != opportunity.payload_sha256
+    assert len(engine.ledger_path.read_text(encoding="utf-8").splitlines()) == 1
+    assert await engine.load_opportunity() == opportunity
+
+
+@pytest.mark.asyncio
+async def test_legacy_snapshot_migrates_without_modifying_source(tmp_path):
+    engine = CuriosityEngine(workspace_path=str(tmp_path))
+    legacy = {
+        "active": True,
+        "anchor": "一句话没说透",
+        "why": "来源中仍有两个解释",
+        "unknown": "她想被接住还是想转移话题？",
+        "approach": "以后可以继续观察",
+        "updated_at": "2026-08-06T12:00:00+08:00",
+        "source_event_id": "legacy-event",
+        "source_stream_id": "legacy-stream",
+        "confidence": 0.7,
+        "tags": ["旧标签"],
+    }
+    raw_bytes = json.dumps(legacy, ensure_ascii=False, indent=2).encode("utf-8")
+    engine.legacy_state_path.write_bytes(raw_bytes)
+
+    opportunity = await engine.load_opportunity()
+
+    assert opportunity is not None
+    assert opportunity.provenance == "legacy_curiosity_signal"
+    assert opportunity.legacy_source_sha256 == hashlib.sha256(raw_bytes).hexdigest()
+    assert opportunity.source_occurrence_id == "legacy-event"
+    assert engine.legacy_state_path.read_bytes() == raw_bytes
+    assert len(engine.ledger_path.read_text(encoding="utf-8").splitlines()) == 1
+    legacy_view = await engine.load_signal()
+    assert legacy_view.confidence == 0.0
+    assert legacy_view.tags == []
+
+
+@pytest.mark.asyncio
+async def test_invalid_legacy_snapshot_fails_explicitly(tmp_path):
+    engine = CuriosityEngine(workspace_path=str(tmp_path))
+    engine.legacy_state_path.write_text("{broken", encoding="utf-8")
+
+    with pytest.raises(EpistemicOpportunityStateError) as exc_info:
+        await engine.load_opportunity()
+
+    assert exc_info.value.path == engine.legacy_state_path
+    assert "JSONDecodeError" in exc_info.value.reason
+
+
+@pytest.mark.asyncio
+async def test_prompt_projection_uses_hard_utf8_budget_and_marks_omission(tmp_path):
+    engine = CuriosityEngine(workspace_path=str(tmp_path))
+    opportunity = _opportunity(question="星" * 600)
+    await engine.save_opportunity(opportunity)
+
+    text = await engine.format_for_prompt(max_chars=512)
+
+    assert len(text.encode("utf-8")) <= 512
+    text.encode("utf-8").decode("utf-8")
+    assert "传输投影已按 UTF-8 字节预算省略" in text
+    assert opportunity.opportunity_id in text
+
+
+def test_candidate_field_budget_fails_instead_of_silently_cutting():
+    with pytest.raises(ValueError, match="UTF-8 byte budget"):
+        EpistemicOpportunity.build(
+            source_occurrence_id="evt-1",
+            observed_gap="星" * 2000,
+            open_question="还没闭合的是什么？",
+        )
