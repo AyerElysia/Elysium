@@ -518,6 +518,16 @@ class TestConsciousnessManifestContracts:
             "tool-platform_action",
         } <= manifest
 
+    def test_chat_manifest_sends_directly_without_legacy_think_action(self) -> None:
+        manifest = set(get_tool_manifest("chat"))
+
+        assert "action-life_send_text" in manifest
+        assert "action-think" not in manifest
+
+    @pytest.mark.parametrize("kind", ["minecraft", "livestream"])
+    def test_non_chat_manifests_keep_legacy_think_action(self, kind: str) -> None:
+        assert "action-think" in get_tool_manifest(kind)
+
     @pytest.mark.parametrize("kind", ["voice_live", "livestream"])
     def test_live_scenes_are_explicit_and_can_report_state(self, kind: str) -> None:
         assert kind in CONSCIOUSNESS_TOOL_MANIFESTS

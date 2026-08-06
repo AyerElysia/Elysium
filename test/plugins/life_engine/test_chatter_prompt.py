@@ -117,7 +117,9 @@ def test_life_chatter_system_prompt_includes_memory_and_chatter_tools_not_heartb
     assert "action-life_pass_and_wait" in prompt
     assert "life_send_text" in prompt
     assert "reason" in prompt
-    assert "不是每次行动前的仪式" in prompt
+    assert "action-think" not in LifeChatter._build_primary_tool_guide()
+    assert "需要的轻量思考应在当前模型决策内完成" in prompt
+    assert "普通回复直接调用 `life_send_text`" in prompt
     assert "一次能完成的事拆成两次模型调用" in prompt
     assert "多个互不依赖的工具调用" in prompt
     assert "安全、无副作用" in prompt
@@ -847,6 +849,30 @@ def test_surface_request_overrides_are_temporary(monkeypatch) -> None:
 
     assert response.model_set is original_model_set
     assert tool_payload.content == [ThinkTool, SendTextTool, TtsTool]
+
+
+def test_chat_manifest_filters_legacy_think_from_model_request() -> None:
+    class ThinkTool:
+        name = "think"
+
+    class SendTextTool:
+        name = "life_send_text"
+
+    tool_payload = LLMPayload(ROLE.TOOL, [ThinkTool, SendTextTool])
+    request = SimpleNamespace(payloads=[tool_payload])
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.instance_kind = "chat"
+
+    filtered = chatter._filter_usables_by_manifest(
+        {
+            "action-think": ThinkTool,
+            "action-life_send_text": SendTextTool,
+        },
+        request,
+    )
+
+    assert filtered == {"action-life_send_text": SendTextTool}
+    assert tool_payload.content == [SendTextTool]
 
 
 async def test_life_chatter_global_runtime_follow_up_stays_on_owner_stream(monkeypatch) -> None:

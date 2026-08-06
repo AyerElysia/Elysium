@@ -28,7 +28,6 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
         "action-life_send_image",
         "action-life_send_voice",
         "action-life_pass_and_wait",
-        "action-think",
         "action-report_state",
         "action-record_inner_monologue",
         "tool-inner_dialogue",
