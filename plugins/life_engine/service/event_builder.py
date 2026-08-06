@@ -119,7 +119,7 @@ class LifeEngineState:
     chatter_context_cursors: dict[str, int] = field(default_factory=dict)
     # 每个聊天流已经看过的 thought_stream 全局 revision 高水位
     chatter_thought_cursors: dict[str, int] = field(default_factory=dict)
-    # 每个聊天流最近一次 action-think 的快照
+    # 每个聊天流最近一次原子表达内在快照；字段名保留用于旧状态兼容。
     last_chatter_think_by_stream: dict[str, dict[str, str]] = field(default_factory=dict)
     # 可恢复的规范化潜意识摘要（持久化为 JSON 字典）
     subconscious_summary: dict[str, Any] = field(default_factory=dict)

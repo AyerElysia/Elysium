@@ -5,9 +5,47 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from plugins.life_engine.core.config import LifeEngineConfig
+
+
+def test_auto_update_retires_legacy_thought_authority_sections(
+    tmp_path: Path,
+) -> None:
+    """旧思考流/冲动配置不得继续成为可启用的第二套主体权威。"""
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[streams]
+enabled = true
+sync_to_chatter = true
+
+[drives]
+enabled = true
+
+[runtime_sync]
+latest_action_think_enabled = false
+recent_chat_messages = 7
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    config = LifeEngineConfig.load(config_path, auto_update=True)
+
+    assert not hasattr(config, "streams")
+    assert not hasattr(config, "drives")
+    assert config.runtime_sync.latest_expression_snapshot_enabled is False
+    assert config.runtime_sync.recent_chat_messages == 7
+
+    updated = config_path.read_text(encoding="utf-8")
+    assert "[streams]" not in updated
+    assert "[drives]" not in updated
+    assert "latest_action_think_enabled" not in updated
+    assert "latest_expression_snapshot_enabled" in updated
 
 
 def test_sleep_time_format_validation() -> None:

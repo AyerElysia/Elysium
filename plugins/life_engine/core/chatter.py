@@ -298,7 +298,7 @@ class LifeSendTextAction(BaseAction):
         "模型调用必须同时提交 mood、decision、expected_response、thought 和 content 五个键；"
         "thought 必须是本次动作真实、非空的思考；其他确实不适用的内在字段可传空字符串，"
         "禁止编造 neutral/general 等占位语义。"
-        "这些字段会与最终回复保存在同一模型轨迹中，供人格连续性与后训练使用。"
+        "这些字段会与最终回复保存在同一模型轨迹中，供主体连续性与后训练使用。"
         "content 只能是字符串；若需分多条发送，用换行符（\\n）分隔各段，"
         "例如 \"你好\\n请问你是谁？\\n找我有什么事吗？\"，将依次发出 3 条消息。"
         "content 中只能包含要发给用户的纯文本正文。"
@@ -322,7 +322,7 @@ class LifeSendTextAction(BaseAction):
     def to_schema(cls) -> dict[str, Any]:
         """Expose one atomic thought-and-expression contract to the model.
 
-        Current model requests must supply the structured persona fields together
+        Current model requests must supply the structured subject fields together
         with the visible reply.  In particular, ``thought`` is also enforced by
         ``execute`` so a provider that ignores JSON-schema ``required`` cannot
         silently send an unbound training sample.
@@ -1693,7 +1693,7 @@ class LifeChatter(BaseChatter):
             chatter_config=getattr(self._get_config(), "chatter", None),
         )
 
-        # System prompt 只放主体人格和全局工具规则，不绑定任何具体聊天流。
+        # System prompt 只放主体权威投影和全局工具规则，不绑定任何具体聊天流。
         # 直播/私聊/群聊等场景提示放到每轮 USER prompt 中，避免第一条消息的
         # stream 类型污染后续所有流。
         system_text = self._build_chat_system_prompt(service, None)
@@ -2948,7 +2948,7 @@ class LifeChatter(BaseChatter):
             "- 正确示范：用户问你问题，在同一次调用中提交 `life_send_text(thought=\"本次真实思考\", mood=\"\", decision=\"如何回应\", expected_response=\"\", content=\"你的回答\")` → 用户看到回答。\n"
             "### 对话循环规则\n"
             "- 每轮你收到的工具结果会自动回到上下文，系统默认让你继续行动——你不需要等待用户下一条消息就能继续调用工具。\n"
-            "- 需要的轻量思考应在当前模型决策内完成；使用 `life_send_text` 时要在同一个调用中提交 `mood`、`decision`、`expected_response`、`thought` 和 `content` 五个键，形成对齐的人格训练样本。\n"
+            "- 需要的轻量思考应在当前模型决策内完成；使用 `life_send_text` 时要在同一个调用中提交 `mood`、`decision`、`expected_response`、`thought` 和 `content` 五个键，形成对齐的主体表达训练样本。\n"
             "- `thought` 必须先写且不能为空；其他内在字段确实不适用时可填写空字符串，不要编造默认情绪或预期。不得从 provider reasoning 或 `content` 自动回填 `thought`。\n"
             "- 如果当前输入和上下文已足够，必须在本次模型决策中直接调用目标工具；普通回复直接调用 `life_send_text`，不要把一次能完成的事拆成两次模型调用。\n"
             "- 想结束本轮对话、等待用户回复时，调用 `action-life_pass_and_wait`。这是唯一退出循环的方式。\n"
@@ -3171,7 +3171,7 @@ class LifeChatter(BaseChatter):
         if not prefix_prompt:
             logger.warning(
                 "Router 上下文投影暂不可用，将使用轻量基础提示词；"
-                "完整人格与记忆仍由表达层读取"
+                "主体权威投影与记忆仍由表达层读取"
             )
 
         try:
@@ -5059,7 +5059,8 @@ class LifeChatter(BaseChatter):
                         self._append_follow_up_user_instruction(
                             llm_response,
                             "（系统提醒：你刚才那段文字只被记录为内心独白，**用户没有收到**。"
-                            "如果想让用户看到，必须调用 `life_send_text(content=\"...\")`。"
+                            "如果想让用户看到，必须调用 `life_send_text`，并在同一次调用中提交"
+                            "非空 `thought` 以及 `mood`、`decision`、`expected_response`、`content` 五个键。"
                             "如果本轮不打算回复，调用 `action-life_pass_and_wait` 等待。）",
                         )
                     # 连续两轮以上空轮 → 注入引导提醒

@@ -90,8 +90,6 @@ async def test_minecraft_session_initializes_when_learning_is_disabled(
 ) -> None:
     config = _config(tmp_path, minecraft=True, learning=False)
     config.autonomy.enabled = False
-    config.streams.enabled = False
-    config.drives.enabled = False
     config.memory_index.enabled = False
     config.memory_witness.enabled = False
     service = LifeEngineService(_DummyPlugin(config))

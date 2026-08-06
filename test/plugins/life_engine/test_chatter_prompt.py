@@ -127,6 +127,8 @@ def test_life_chatter_system_prompt_includes_memory_and_chatter_tools_not_heartb
     assert "life_send_text" in prompt
     assert "reason" in prompt
     assert "action-think" not in LifeChatter._build_primary_tool_guide()
+    assert "life_send_text(content=" not in prompt
+    assert "`thought` 必须先写且不能为空" in prompt
     assert "需要的轻量思考应在当前模型决策内完成" in prompt
     assert "普通回复直接调用 `life_send_text`" in prompt
     assert "一次能完成的事拆成两次模型调用" in prompt
@@ -2289,7 +2291,8 @@ async def test_life_chatter_dynamic_context_is_separate_snapshot() -> None:
     )
 
     assert "<life_runtime_context>" in dynamic
-    assert "THOUGHT_STREAM_NOW" in dynamic
+    assert "THOUGHT_STREAM_NOW" not in dynamic
+    assert "当前思考流" not in dynamic
     assert "RECENT_EVENT" in dynamic
     assert "RUNTIME_NOW" in dynamic
     assert high_water == 1

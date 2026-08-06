@@ -7,7 +7,6 @@ from typing import Protocol, TypedDict
 
 import json_repair
 
-from src.core.config import get_core_config
 from src.core.models.stream import ChatStream
 from src.core.prompt import get_prompt_manager
 from src.kernel.llm import ROLE, LLMPayload, LLMRequest, Text
@@ -17,6 +16,7 @@ from src.kernel.logger import Logger
 _CIRCUIT_FAILURE_THRESHOLD = 3
 _CIRCUIT_COOLDOWN_SECONDS = 120.0
 _HISTORY_CHAR_BUDGET = 3000
+_SUBJECT_LABEL = "当前主体"
 
 _circuit_consecutive_failures = 0
 _circuit_open_until = 0.0
@@ -234,7 +234,7 @@ async def _build_router_prompt(
     if not projection:
         return prompt
     return (
-        "以下是由权威人格/记忆文件生成的可重建路由投影。"
+        "以下是由权威主体文件生成的可重建路由投影。"
         "它只帮助导航，不是新的记忆或事实来源；如有歧义，不得自行补造。\n\n"
         f"{projection}\n\n---\n\n{prompt}"
     )
@@ -256,10 +256,9 @@ async def route_should_respond(
     SOUL/USER/MEMORY text belongs to the main expression request, not here.
     """
 
-    nickname = get_core_config().personality.nickname
     bot_id = chat_stream.bot_id or ""
     system_prompt = await _build_router_prompt(
-        nickname=nickname,
+        nickname=_SUBJECT_LABEL,
         bot_id=bot_id,
         projection_prompt=prefix_prompt,
         fallback_prompt=fallback_prompt,

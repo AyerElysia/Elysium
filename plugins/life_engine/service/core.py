@@ -80,9 +80,6 @@ from ..autonomy import (
     restore_autonomy_intents,
     schedule_autonomy_intent as register_autonomy_schedule,
 )
-from ..streams.manager import ThoughtStreamManager
-from ..drives.impulse import ImpulseEngine
-from ..drives.rules import DEFAULT_RULES
 from ..curiosity import CuriosityEngine
 from ..prompts.sections import (
     DEFAULT_HEARTBEAT_SECTIONS,
@@ -448,11 +445,10 @@ class LifeEngineService(BaseService):
         # 事件构建器
         self._event_builder = EventBuilder(self._next_sequence)
 
-        # 思考流系统
-        self._thought_manager: ThoughtStreamManager | None = None
-
-        # 冲动引擎
-        self._impulse_engine: ImpulseEngine | None = None
+        # 旧 ThoughtStream/Impulse 只保留兼容属性；运行时不得再初始化第二套
+        # 主体关注权威或按分数生成行为建议。
+        self._thought_manager: Any | None = None
+        self._impulse_engine: Any | None = None
 
         # 异步好奇层
         self._curiosity_engine: CuriosityEngine | None = None
@@ -5374,35 +5370,38 @@ class LifeEngineService(BaseService):
         detail = f"，原因：{reason}" if reason else ""
         return f"- {timestamp} {operation} {path}{detail}{trace_ref}"
 
-    def _format_chatter_thought_streams(
-        self,
-        *,
-        revision_cursor: int = 0,
-        focus_window_minutes: int = 30,
-        delta_marking: bool = True,
-        max_items: int = 5,
-    ) -> tuple[str, int]:
-        """渲染思考流块（用于 chatter transient）。
+    async def _format_chatter_attention_threads(self, instance_id: str) -> str:
+        """Render the canonical bounded subject-attention projection.
 
-        Returns:
-            (body_text_without_top_heading, current_max_revision)
+        Legacy ``streams.json`` is migration evidence only.  It must never be
+        rendered as the subject's current attention or mutate during a prompt
+        read.  When canonical storage is not active, the projection is absent
+        rather than silently falling back to the retired authority.
         """
-        if self._thought_manager is None:
-            return "", 0
-        try:
-            body = self._thought_manager.format_for_prompt(
-                max_items=max_items,
-                focus_window_minutes=focus_window_minutes,
-                revision_cursor=revision_cursor,
-                mark_delta=delta_marking,
-                grouped=True,
-            )
-            return body, int(self._thought_manager.current_revision)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(f"构建 chatter 思考流快照失败: {exc}")
-            return "", 0
 
-    def _format_latest_chatter_think(
+        if self._attention_thread_service is None:
+            return ""
+        from ..attention_threads import AttentionThreadPageQuery
+
+        try:
+            page = await self.page_attention_threads(
+                AttentionThreadPageQuery(
+                    statuses=("open", "paused"),
+                    limit=12,
+                    max_bytes=12 * 1024,
+                    projection_kind="life_chatter",
+                    focus_instance_id=instance_id,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "构建 chatter AttentionThread 有界投影失败: "
+                f"{type(exc).__name__}"
+            )
+            return ""
+        return str(page.content or "").strip()
+
+    def _format_latest_expression_snapshot(
         self,
         stream_id: str,
         *,
@@ -5637,8 +5636,9 @@ class LifeEngineService(BaseService):
         transient 注入；high_water_sequence 在 LLM 请求成功后持久化，避免重复注入。
 
         结构：
-          1. ### 当前思考流    （注意力脑区，分焦点/背景，带 🔄 delta 标记）
-          3. ### 最近一次独白/思考快照
+          1. ### 潜意识协调的瞬时世界感知
+          2. ### 主体持续关注（canonical AttentionThread 有界投影）
+          3. ### 最近一次表达内在快照
           4. ### 运行时内心独白（push_runtime_assistant_injection 队列）
           5. ### 最近聊天记录
           6. ### 新增 life 事件流（完整可追溯事件窗口）
@@ -5659,14 +5659,10 @@ class LifeEngineService(BaseService):
         _ = event_limit  # 兼容老签名；新逻辑用配置项控制条数
 
         cfg = self._cfg()
-        streams_cfg = getattr(cfg, "streams", None)
         runtime_cfg = getattr(cfg, "runtime_sync", None)
-        sync_streams = bool(streams_cfg is None or getattr(streams_cfg, "sync_to_chatter", True))
-        focus_window = int(getattr(streams_cfg, "focus_window_minutes", 30) or 30) if streams_cfg else 30
-        delta_marking = bool(streams_cfg is None or getattr(streams_cfg, "delta_marking", True))
-        latest_think_enabled = bool(
+        latest_expression_snapshot_enabled = bool(
             runtime_cfg is None
-            or getattr(runtime_cfg, "latest_action_think_enabled", True)
+            or getattr(runtime_cfg, "latest_expression_snapshot_enabled", True)
         )
         recent_chat_enabled = bool(
             runtime_cfg is None or getattr(runtime_cfg, "recent_chat_enabled", True)
@@ -5758,24 +5754,20 @@ class LifeEngineService(BaseService):
         )
 
         new_thought_revision = thought_cursor
-        if sync_streams:
-            thought_body, current_revision = self._format_chatter_thought_streams(
-                revision_cursor=thought_cursor,
-                focus_window_minutes=focus_window,
-                delta_marking=delta_marking,
-                max_items=5,
-            )
-            if thought_body:
-                sections.append(f"### 当前思考流\n{thought_body}".rstrip())
-            new_thought_revision = max(thought_cursor, current_revision)
+        attention_text = await self._format_chatter_attention_threads(instance_id)
+        if attention_text:
+            sections.append(f"### 主体持续关注\n{attention_text}".rstrip())
 
-        if latest_think_enabled:
-            latest_think_text = self._format_latest_chatter_think(
+        if latest_expression_snapshot_enabled:
+            latest_expression_snapshot = self._format_latest_expression_snapshot(
                 stream_id,
                 unified_chatter_context=unified_chatter_context,
             )
-            if latest_think_text:
-                sections.append(f"### 最近一次独白/思考快照\n{latest_think_text}")
+            if latest_expression_snapshot:
+                sections.append(
+                    "### 最近一次表达内在快照\n"
+                    f"{latest_expression_snapshot}"
+                )
 
         runtime_text = str(runtime_context_text or "").strip()
         if runtime_text:
@@ -6957,31 +6949,6 @@ class LifeEngineService(BaseService):
         self._require_selected_memory_service()
 
         self._dfc_integration = DFCIntegration(self)
-
-        # 初始化思考流管理器
-        streams_cfg = getattr(cfg, "streams", None)
-        if streams_cfg is None or getattr(streams_cfg, "enabled", True):
-            max_active = getattr(streams_cfg, "max_active_streams", 5) if streams_cfg else 5
-            dormancy_hours = getattr(streams_cfg, "dormancy_threshold_hours", 24) if streams_cfg else 24
-            half_life = float(getattr(streams_cfg, "curiosity_decay_half_life_hours", 12.0)) if streams_cfg else 12.0
-            curiosity_floor = float(getattr(streams_cfg, "curiosity_floor", 0.15)) if streams_cfg else 0.15
-            self._thought_manager = ThoughtStreamManager(
-                workspace_path=cfg.settings.workspace_path,
-                max_active=max_active,
-                dormancy_hours=dormancy_hours,
-                curiosity_decay_half_life_hours=half_life,
-                curiosity_floor=curiosity_floor,
-            )
-            logger.info(
-                f"思考流系统已初始化: max_active={max_active}, "
-                f"half_life={half_life}h, floor={curiosity_floor}"
-            )
-
-        # 初始化冲动引擎
-        drives_cfg = getattr(cfg, "drives", None)
-        if drives_cfg is None or getattr(drives_cfg, "enabled", True):
-            self._impulse_engine = ImpulseEngine(list(DEFAULT_RULES))
-            logger.info("冲动引擎已初始化")
 
         await self._start_selected_storage()
 

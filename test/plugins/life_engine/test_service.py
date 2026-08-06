@@ -952,8 +952,6 @@ async def test_memory_index_lifecycle_start_toggle_and_stop_close(
     config.memory_witness.run_on_startup = False
     config.memory_witness.migrate_legacy_diaries = False
     config.autonomy.enabled = False
-    config.streams.enabled = False
-    config.drives.enabled = False
     fake_memory = _FakeMemoryIndexService()
     lifecycle_events: list[str] = []
 
@@ -1015,8 +1013,6 @@ async def test_shared_sync_uses_managed_lifecycle_and_closes(
     config.memory_index.enabled = False
     config.memory_witness.enabled = False
     config.autonomy.enabled = False
-    config.streams.enabled = False
-    config.drives.enabled = False
     config.learning.enabled = False
     lifecycle: list[str] = []
 
@@ -1072,8 +1068,6 @@ async def test_memory_archive_sync_uses_managed_lifecycle_and_closes(
     config.memory_index.enabled = False
     config.memory_witness.enabled = False
     config.autonomy.enabled = False
-    config.streams.enabled = False
-    config.drives.enabled = False
     config.learning.enabled = False
     lifecycle: list[str] = []
 

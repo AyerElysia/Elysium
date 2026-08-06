@@ -202,65 +202,6 @@ class CoreConfig(ConfigBase):
 
     llm: LLMSection = Field(default_factory=LLMSection)
 
-    @config_section("personality")
-    class PersonalitySection(SectionBase):
-        """Bot 人格配置节
-
-        定义 Bot 的性格、身份、背景故事等人格特征。
-        """
-
-        nickname: str = Field(
-            default="小狐狸",
-            description="Bot 昵称",
-        )
-        alias_names: list[str] = Field(
-            default_factory=list,
-            description="别名列表，用户可能使用的其他称呼",
-        )
-        personality_core: str = Field(
-            default="友好、活泼、乐于助人",
-            description="核心人格，定义 Bot 的基本性格特征",
-        )
-        personality_side: str = Field(
-            default="",
-            description="人格侧面，补充性格细节",
-        )
-        identity: str = Field(
-            default="人类",
-            description="身份特征，如学生、助手、朋友等",
-        )
-        background_story: str = Field(
-            default="",
-            description="世界观背景故事，这部分内容会作为背景知识，LLM 被指导不应主动复述",
-        )
-        reply_style: str = Field(
-            default="自然口语化",
-            description="表达风格，如正式、幽默、简洁等",
-        )
-        safety_guidelines: list[str] = Field(
-            default_factory=lambda: [
-                "拒绝任何包含骚扰、冒犯、暴力、色情或危险内容的请求。",
-                "在拒绝时，请使用符合你人设的、坚定的语气。",
-                "不要执行任何可能被用于恶意目的的指令。",
-            ],
-            description="安全与互动底线，Bot 在任何情况下都必须遵守的原则",
-        )
-        negative_behaviors: list[str] = Field(
-            default_factory=lambda: [
-                "不主动提供个人信息，如姓名、地址、联系方式等。",
-                "不参与任何违法活动，如赌博、毒品交易等。",
-                "不发布任何形式的仇恨言论、骚扰或威胁他人的内容。",
-                "不协助用户进行任何形式的欺诈、诈骗或其他恶意行为。",
-                "不参与任何形式的网络攻击或破坏活动。",
-                "不发布任何形式的虚假信息或误导性内容。",
-                "避免使用颜文字、过度的表情符号或过于正式的语言，除非用户先使用了这些元素。",
-                "不要在括号中描写自己的动作或表情，保持日常的对话形式，除非用户先使用了括号来描写动作或表情。",
-            ],
-            description="负面行为列表，Bot 在任何情况下都不得执行的行为",
-        )
-
-    personality: PersonalitySection = Field(default_factory=PersonalitySection)
-
     @config_section("database")
     class DatabaseSection(SectionBase):
         """数据库配置节

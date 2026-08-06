@@ -320,9 +320,6 @@ from plugins.life_engine.service.event_builder import (  # noqa: E402
     EventType,
     LifeEngineEvent,
 )
-from plugins.life_engine.service.perception_gateway import (  # noqa: E402
-    PerceptionDeliveryReceipt,
-)
 from plugins.life_engine.trace.store import LifeTraceStore  # noqa: E402
 
 
@@ -370,40 +367,30 @@ async def test_build_chatter_runtime_filters_tool_call_noise() -> None:
     assert hw == 3
 
 
-async def test_build_chatter_runtime_thought_delta_waits_for_exact_receipt() -> None:
-    """未确认送达应重投 thought delta，精确确认后才去重。"""
+async def test_build_chatter_runtime_uses_only_canonical_attention_projection() -> None:
+    """旧 ThoughtStream 即使存在也不能再成为主体当前关注的来源。"""
     service = LifeEngineService(SimpleNamespace(config=None))
     chat = SimpleNamespace(stream_id="stream-d")
     service._thought_manager = SimpleNamespace(
-        format_for_prompt=lambda **kw: (
-            "🔄 (刚推进) idea-1" if kw.get("revision_cursor", 0) < 5 else "idea-1"
-        ),
+        format_for_prompt=lambda **kw: "LEGACY_THOUGHT_STREAM",
         current_revision=5,
     )
+    service._attention_thread_service = SimpleNamespace()
+
+    async def _page_attention_threads(query):
+        assert query.statuses == ("open", "paused")
+        assert query.max_bytes == 12 * 1024
+        return SimpleNamespace(content="CANONICAL_ATTENTION")
+
+    service.page_attention_threads = _page_attention_threads
     service._event_history = []
 
-    first, high_water = await service.build_chatter_runtime_context(chat)
-    unconfirmed_retry, _ = await service.build_chatter_runtime_context(chat)
+    text, _ = await service.build_chatter_runtime_context(chat)
 
-    assert "🔄" in first
-    assert "🔄" in unconfirmed_retry
-
-    delivery = service.get_pending_chatter_runtime_delivery("stream-d")
-    assert delivery is not None
-    prepared = delivery.prepared_perception
-    await service.mark_chatter_runtime_context_seen(
-        "stream-d",
-        high_water,
-        receipt=PerceptionDeliveryReceipt(
-            delivery_id=prepared.delivery_id,
-            projection_sha256=prepared.projection_sha256,
-            delivered_bytes=prepared.delivered_bytes,
-            exact=True,
-        ),
-    )
-
-    confirmed_next, _ = await service.build_chatter_runtime_context(chat)
-    assert "🔄" not in confirmed_next
+    assert "### 主体持续关注" in text
+    assert "CANONICAL_ATTENTION" in text
+    assert "LEGACY_THOUGHT_STREAM" not in text
+    assert "当前思考流" not in text
 
 
 async def test_build_chatter_runtime_includes_latest_think_and_recent_chat() -> None:
@@ -429,7 +416,7 @@ async def test_build_chatter_runtime_includes_latest_think_and_recent_chat() -> 
 
     text, _ = await service.build_chatter_runtime_context(chat)
 
-    assert "### 最近一次独白/思考快照" in text
+    assert "### 最近一次表达内在快照" in text
     assert "她白天喊我的名字" in text
     assert "### 最近 10 条聊天记录" in text
     assert "旧消息 1" in text

@@ -70,11 +70,6 @@ def _reset_router_circuit(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(router, "_circuit_open_until", 0.0)
     monkeypatch.setattr(
         router,
-        "get_core_config",
-        lambda: SimpleNamespace(personality=SimpleNamespace(nickname="Elysia")),
-    )
-    monkeypatch.setattr(
-        router,
         "_build_router_prompt",
         _fake_router_prompt,
     )
