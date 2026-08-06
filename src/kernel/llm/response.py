@@ -485,6 +485,13 @@ class LLMResponse:
             self.model_set,
             request_name=getattr(self._upper, "request_name", ""),
             context_manager=self.context_manager,
+            trajectory_metadata=dict(
+                getattr(self._upper, "trajectory_metadata", {}) or {}
+            ),
+            trace_id=getattr(self._upper, "trace_id", None),
+            stream_id=getattr(self._upper, "stream_id", None),
+            heartbeat_run_id=getattr(self._upper, "heartbeat_run_id", None),
+            call_id=getattr(self._upper, "call_id", None),
         )
         req.payloads = list(self.payloads)
         pending = dict(self._context_delivery_expectations or {})

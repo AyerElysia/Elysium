@@ -146,6 +146,10 @@ class LLMRequest:
     payloads: list[LLMPayload]  # 消息载荷
     policy: Policy | None       # 重试策略
     trajectory_metadata: dict   # 轨迹元数据
+    trace_id: str | None        # 跨续轮的轨迹关联身份
+    stream_id: str | None       # 主体流身份
+    heartbeat_run_id: str | None
+    call_id: str | None         # 工具/因果调用身份
 ```
 
 ### 3.2 send() 流程
@@ -178,6 +182,19 @@ send()
 - **工具调用**：`response.call_list` 获取 ToolCall 列表
 - **链式追加**：`response.add_payload()` 继续对话
 - **自动追加**：`send(auto_append_response=True)` 将回复追加到上下文
+
+#### 3.3.1 工具续轮的轨迹身份
+
+`LLMResponse.send()` 创建的是新的 `LLMRequest`，因此每一轮仍会生成独立的
+`request_id`，每次 provider 尝试也仍会生成独立的 `attempt_id`。与此同时，续轮会从
+当前 `_upper` 请求继承 `trace_id`、`stream_id`、`heartbeat_run_id`、`call_id`，并在
+实际发送时浅拷贝 `trajectory_metadata`。这使同一主体的一次 reasoning、工具参数、工具
+结果与续轮回复能够被审计为同一条轨迹，而不会把不同请求或重试尝试合并成同一个事件。
+
+继承边界只包含 content-free 关联身份与元数据；payload、reasoning、工具正文不会被注入
+`trajectory_metadata`。元数据顶层字典不共享可变引用，续轮修改不会回写上一轮。调用方可
+在调用 `response.send()` 前更新当前 `_upper.trajectory_metadata`，发送瞬间的值才是续轮
+快照。
 
 ### 3.4 上下文管理（LLMContextManager）
 

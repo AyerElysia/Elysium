@@ -503,6 +503,46 @@ class TestExtractTools:
 class TestLLMRequestSend:
     """Test cases for LLMRequest.send method."""
 
+    async def test_send_records_related_ids_without_reusing_request_or_attempt_ids(
+        self,
+        mock_model_set: list[dict[str, Any]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        captured: list[dict[str, Any]] = []
+        monkeypatch.setattr(
+            "src.kernel.llm.request.record_trajectory",
+            lambda event, **_kwargs: captured.append(dict(event)),
+        )
+        monkeypatch.setattr(
+            "src.kernel.llm.request._trajectory_settings",
+            lambda: (True, "unused", 0.0, 1, 1, 0),
+        )
+        request = LLMRequest(
+            mock_model_set,
+            "life_chatter",
+            trajectory_metadata={"consciousness_instance_id": "presence-1"},
+            trace_id="trace-1",
+            stream_id="stream-1",
+            heartbeat_run_id="heartbeat-1",
+            call_id="call-1",
+        )
+        request.add_payload(LLMPayload(ROLE.USER, Text("Hello")))
+        request.clients.openai = MockChatClient()
+
+        await request.send(stream=False)
+
+        assert len(captured) == 1
+        event = captured[0]
+        assert event["trace_id"] == "trace-1"
+        assert event["stream_id"] == "stream-1"
+        assert event["heartbeat_run_id"] == "heartbeat-1"
+        assert event["call_id"] == "call-1"
+        assert event["metadata"]["consciousness_instance_id"] == "presence-1"
+        assert event["request_id"].startswith("req_")
+        assert event["attempt_id"].startswith("attempt_")
+        assert event["request_id"] != event["trace_id"]
+        assert event["attempt_id"] != event["trace_id"]
+
     async def test_send_success_non_streaming(
         self, mock_model_set: list[dict[str, Any]]
     ) -> None:

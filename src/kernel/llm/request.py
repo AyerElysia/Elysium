@@ -331,6 +331,10 @@ class LLMRequest:
     model_set: ModelSet
     request_name: str = ""
     trajectory_metadata: dict[str, Any] = field(default_factory=dict)
+    trace_id: str | None = field(default=None, kw_only=True)
+    stream_id: str | None = field(default=None, kw_only=True)
+    heartbeat_run_id: str | None = field(default=None, kw_only=True)
+    call_id: str | None = field(default=None, kw_only=True)
 
     payloads: list[LLMPayload] = field(default_factory=list)
     policy: Policy | None = None

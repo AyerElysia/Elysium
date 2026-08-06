@@ -565,6 +565,61 @@ class TestLLMResponseAddCallReflex:
 class TestLLMResponseSend:
     """Test cases for send method (chaining)."""
 
+    async def test_send_inherits_related_trajectory_identity_without_payload_leak(
+        self,
+        mock_model_set: list[dict[str, Any]],
+        sample_payloads: list[LLMPayload],
+    ) -> None:
+        """A continuation keeps subject correlation but owns fresh request state."""
+        upper = LLMRequest(
+            mock_model_set,
+            "life_chatter",
+            trajectory_metadata={
+                "consciousness_instance_id": "presence-1",
+                "occurrence_id": "occurrence-1",
+            },
+            trace_id="trace-1",
+            stream_id="stream-1",
+            heartbeat_run_id="heartbeat-1",
+            call_id="call-1",
+        )
+        response = LLMResponse(
+            _stream=None,
+            _upper=upper,
+            _auto_append_response=False,
+            payloads=list(sample_payloads),
+            model_set=mock_model_set,
+            message="PRIVATE_PAYLOAD_BODY",
+            call_list=[],
+        )
+        # The continuation must observe metadata updates made after the response
+        # was created and immediately before the next turn is sent.
+        upper.trajectory_metadata["subject_revision"] = "revision-2"
+        captured: dict[str, LLMRequest] = {}
+        sentinel = object()
+
+        async def fake_send(request: LLMRequest, **_kwargs: object) -> object:
+            captured["request"] = request
+            return sentinel
+
+        with patch.object(LLMRequest, "send", new=fake_send):
+            assert await response.send(stream=False) is sentinel
+
+        continuation = captured["request"]
+        assert continuation is not upper
+        assert continuation.trace_id == "trace-1"
+        assert continuation.stream_id == "stream-1"
+        assert continuation.heartbeat_run_id == "heartbeat-1"
+        assert continuation.call_id == "call-1"
+        assert continuation.trajectory_metadata == upper.trajectory_metadata
+        assert continuation.trajectory_metadata is not upper.trajectory_metadata
+        assert "PRIVATE_PAYLOAD_BODY" not in repr(continuation.trajectory_metadata)
+        assert not hasattr(continuation, "request_id")
+        assert not hasattr(continuation, "attempt_id")
+
+        continuation.trajectory_metadata["subject_revision"] = "revision-3"
+        assert upper.trajectory_metadata["subject_revision"] == "revision-2"
+
     async def test_send_creates_new_request(
         self, mock_model_set: list[dict[str, Any]], sample_payloads: list[LLMPayload]
     ) -> None:
@@ -597,7 +652,7 @@ class TestLLMResponseSend:
             )
             mock_send.return_value = mock_response
 
-            result = await response.send(stream=False)
+            await response.send(stream=False)
 
             # Verify send was called with updated payloads
             assert mock_send.called
