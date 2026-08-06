@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import time
 from types import SimpleNamespace
 
@@ -158,7 +159,11 @@ async def test_life_send_text_can_send_to_target_key(monkeypatch) -> None:
         SimpleNamespace(config=SimpleNamespace(runtime_sync=_runtime_cfg())),
     )
 
-    ok, result = await action.execute("你好\n第二段", target_key="g-dddddddd")
+    ok, result = await action.execute(
+        "你好\n第二段",
+        thought="把两段问候一起送到明确目标。",
+        target_key="g-dddddddd",
+    )
 
     assert ok is True
     assert "已发送2条消息" in result
@@ -183,7 +188,10 @@ async def test_life_send_text_without_target_key_uses_legacy_stream_send(monkeyp
 
     monkeypatch.setattr(action, "_send_to_stream", fake_send_to_stream)
 
-    ok, result = await action.execute("第一段\n第二段")
+    ok, result = await action.execute(
+        "第一段\n第二段",
+        thought="保持两段内容的顺序。",
+    )
 
     assert ok is True
     assert "已发送2条消息" in result
@@ -207,6 +215,31 @@ def test_life_send_text_schema_requires_atomic_persona_sample() -> None:
         "expected_response",
         "thought",
     } <= set(parameters["properties"])
+    assert (
+        inspect.signature(LifeSendTextAction.execute).parameters["thought"].default
+        is inspect.Parameter.empty
+    )
+
+
+async def test_life_send_text_rejects_empty_thought_before_send(monkeypatch) -> None:
+    current_stream = ChatStream(stream_id="1" * 64, platform="qq", chat_type="private")
+    action = LifeSendTextAction(
+        current_stream,
+        SimpleNamespace(config=SimpleNamespace(runtime_sync=_runtime_cfg())),
+    )
+    sent_contents: list[str] = []
+
+    async def fake_send_to_stream(content: str):
+        sent_contents.append(content)
+        return True
+
+    monkeypatch.setattr(action, "_send_to_stream", fake_send_to_stream)
+
+    ok, result = await action.execute("不会发出", thought="   ")
+
+    assert ok is False
+    assert "thought 必须是非空字符串" in result
+    assert sent_contents == []
 
 
 @pytest.mark.parametrize("kind", ["chat", "minecraft", "livestream"])
@@ -214,6 +247,7 @@ def test_visible_expression_manifests_share_atomic_persona_schema(kind: str) -> 
     from plugins.life_engine.service.tool_manifests import get_tool_manifest
 
     assert "action-life_send_text" in get_tool_manifest(kind)
+    assert "action-think" not in get_tool_manifest(kind)
     required = set(
         LifeSendTextAction.to_schema()["function"]["parameters"]["required"]
     )
@@ -316,11 +350,20 @@ async def test_life_send_text_rejects_invalid_target_key_and_cross_reply(monkeyp
         SimpleNamespace(config=SimpleNamespace(runtime_sync=_runtime_cfg())),
     )
 
-    ok, result = await action.execute("你好", target_key="g-missing")
+    ok, result = await action.execute(
+        "你好",
+        thought="目标不存在时不能发送。",
+        target_key="g-missing",
+    )
     assert ok is False
     assert "未知或不可用" in result
 
-    ok, result = await action.execute("你好", reply_to="msg1", target_key="g-missing")
+    ok, result = await action.execute(
+        "你好",
+        thought="先验证互斥的目标参数。",
+        reply_to="msg1",
+        target_key="g-missing",
+    )
     assert ok is False
     assert "不能同时使用 reply_to" in result
 
@@ -374,7 +417,11 @@ async def test_life_send_text_surfaces_delivery_unknown_as_technical_outcome(
         SimpleNamespace(config=SimpleNamespace(runtime_sync=_runtime_cfg())),
     )
 
-    ok, result = await action.execute("你好", target_key="g-dddddddd")
+    ok, result = await action.execute(
+        "你好",
+        thought="发送一次并如实保留未知回执。",
+        target_key="g-dddddddd",
+    )
 
     assert ok is False
     assert "不会自动重发" in result

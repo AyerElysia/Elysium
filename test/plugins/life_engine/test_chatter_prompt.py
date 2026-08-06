@@ -29,7 +29,16 @@ from src.core.components.base.chatter import BaseChatter, Failure, Success, Wait
 from src.core.models.media import MediaAttachment
 from src.core.models.message import Message, MessageType
 from src.core.utils.llm_tool_call import ToolCallExecutionResult
-from src.kernel.llm import Image, LLMContextManager, LLMPayload, ROLE, Text, ToolResult
+from src.kernel.llm import (
+    Image,
+    LLMContextManager,
+    LLMPayload,
+    ROLE,
+    Text,
+    ToolCall,
+    ToolRegistry,
+    ToolResult,
+)
 import pytest
 
 
@@ -853,10 +862,10 @@ def test_surface_request_overrides_are_temporary(monkeypatch) -> None:
 
 def test_chat_manifest_filters_legacy_think_from_model_request() -> None:
     class ThinkTool:
-        name = "think"
+        name = "action-think"
 
     class SendTextTool:
-        name = "life_send_text"
+        name = "action-life_send_text"
 
     tool_payload = LLMPayload(ROLE.TOOL, [ThinkTool, SendTextTool])
     request = SimpleNamespace(payloads=[tool_payload])
@@ -873,6 +882,56 @@ def test_chat_manifest_filters_legacy_think_from_model_request() -> None:
 
     assert filtered == {"action-life_send_text": SendTextTool}
     assert tool_payload.content == [SendTextTool]
+
+
+def test_chat_manifest_filters_real_tool_registry() -> None:
+    class ThinkTool:
+        name = "action-think"
+
+    class SendTextTool:
+        name = "action-life_send_text"
+
+    registry = ToolRegistry()
+    registry.register(ThinkTool, name="action-think")
+    registry.register(SendTextTool, name="action-life_send_text")
+    tool_payload = LLMPayload(ROLE.TOOL, [ThinkTool, SendTextTool])
+    request = SimpleNamespace(payloads=[tool_payload])
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.instance_kind = "chat"
+
+    filtered = chatter._filter_usables_by_manifest(registry, request)
+
+    assert isinstance(filtered, ToolRegistry)
+    assert filtered.get_all_names() == ["action-life_send_text"]
+    assert tool_payload.content == [SendTextTool]
+
+
+def test_rolling_context_projection_drops_retired_think_pair() -> None:
+    payloads = [
+        LLMPayload(
+            ROLE.ASSISTANT,
+            [
+                ToolCall(id="think-1", name="action-think", args={"thought": "legacy"}),
+                ToolCall(
+                    id="send-1",
+                    name="action-life_send_text",
+                    args={"thought": "current", "content": "hello"},
+                ),
+            ],
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            [
+                ToolResult(value="legacy ok", call_id="think-1", name="action-think"),
+                ToolResult(value="sent", call_id="send-1", name="action-life_send_text"),
+            ],
+        ),
+    ]
+
+    cleaned = LifeChatter._without_retired_think_history(payloads)
+
+    assert [part.name for part in cleaned[0].content] == ["action-life_send_text"]
+    assert [part.name for part in cleaned[1].content] == ["action-life_send_text"]
 
 
 def test_life_chatter_binds_identity_to_request_and_follow_up_upper() -> None:

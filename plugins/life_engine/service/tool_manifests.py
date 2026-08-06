@@ -45,13 +45,11 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
     "minecraft": [
         "tool-nucleus_minecraft",
         "action-life_send_text",
-        "action-think",
         "action-report_state",
     ],
     # 直播意识：弹幕互动，跨场景感知
     "livestream": [
         "action-life_send_text",
-        "action-think",
         "action-report_state",
         "tool-inner_query",
         "tool-conversation_evidence",

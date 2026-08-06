@@ -32,7 +32,6 @@ from .compat_tools import (
     LifeInnerQueryTool,
     LifeRecordInnerMonologueAction,
     LifeReportStateAction,
-    LifeThinkAction,
 )
 from .config import LifeEngineConfig
 
@@ -130,7 +129,6 @@ class LifeEnginePlugin(BasePlugin):
                 LifePassAndWaitAction,
                 LifeRecognizeVoiceTool,
                 LifeSaveMediaTool,
-                LifeThinkAction,
                 LifeRecordInnerMonologueAction,
                 LifeInnerDialogueTool,
             ])

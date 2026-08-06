@@ -532,9 +532,13 @@ class TestConsciousnessManifestContracts:
         assert "tool-conversation_evidence" in manifest
         assert "tool-fetch_chat_history" not in manifest
 
-    @pytest.mark.parametrize("kind", ["minecraft", "livestream"])
-    def test_non_chat_manifests_keep_legacy_think_action(self, kind: str) -> None:
-        assert "action-think" in get_tool_manifest(kind)
+    @pytest.mark.parametrize("kind", ["chat", "minecraft", "livestream"])
+    def test_visible_expression_manifests_retire_standalone_think_action(
+        self,
+        kind: str,
+    ) -> None:
+        assert "action-life_send_text" in get_tool_manifest(kind)
+        assert "action-think" not in get_tool_manifest(kind)
 
     @pytest.mark.parametrize("kind", ["voice_live", "livestream"])
     def test_live_scenes_are_explicit_and_can_report_state(self, kind: str) -> None:

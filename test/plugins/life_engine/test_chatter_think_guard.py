@@ -120,7 +120,7 @@ def test_life_send_text_normalize_splits_escaped_newlines_in_string() -> None:
 
 def test_life_send_text_rejects_placeholder_only_content() -> None:
     action = LifeSendTextAction.__new__(LifeSendTextAction)
-    ok, message = asyncio.run(action.execute("..."))
+    ok, message = asyncio.run(action.execute("...", thought="å›žåº”å½“å‰æ¶ˆæ¯ã€‚"))
     assert ok is False
     assert "占位符" in message
 

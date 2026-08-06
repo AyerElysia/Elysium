@@ -23,7 +23,7 @@ def test_life_engine_exposes_only_active_compat_tools_when_chatter_enabled() -> 
 
     component_names = {getattr(comp, "__name__", "") for comp in plugin.get_components()}
 
-    assert "LifeThinkAction" in component_names
+    assert "LifeThinkAction" not in component_names
     assert "LifeInnerDialogueTool" in component_names
     assert "LifeRecordInnerMonologueAction" in component_names
     assert "LifeMessageNucleusTool" not in component_names

@@ -37,6 +37,7 @@ from src.kernel.llm import (
     ROLE,
     Text,
     ToolCall,
+    ToolRegistry,
     ToolResult,
     UnsupportedModalityError,
     Video,
@@ -82,6 +83,7 @@ _SEND_IMAGE = "action-life_send_image"
 _SEND_VOICE = "action-life_send_voice"
 _SEND_FILE = "action-life_send_file"
 _SEND_EMOJI_MEME = "action-send_emoji_meme"
+_RETIRED_THINK_ACTION = "action-think"
 _SUSPEND_TEXT = "__SUSPEND__"
 _GLOBAL_RUNTIME_BUSY_RETRY_SECONDS = 1.0
 _PLATFORM_ACTION_MAX_ATTEMPTS = 3
@@ -294,7 +296,8 @@ class LifeSendTextAction(BaseAction):
     action_description = (
         "在同一次动作中记录结构化内在状态并发送文本消息给用户。"
         "模型调用必须同时提交 mood、decision、expected_response、thought 和 content 五个键；"
-        "确实不适用或没有明确内容的内在字段可传空字符串，禁止编造 neutral/general 等占位语义。"
+        "thought 必须是本次动作真实、非空的思考；其他确实不适用的内在字段可传空字符串，"
+        "禁止编造 neutral/general 等占位语义。"
         "这些字段会与最终回复保存在同一模型轨迹中，供人格连续性与后训练使用。"
         "content 只能是字符串；若需分多条发送，用换行符（\\n）分隔各段，"
         "例如 \"你好\\n请问你是谁？\\n找我有什么事吗？\"，将依次发出 3 条消息。"
@@ -319,9 +322,10 @@ class LifeSendTextAction(BaseAction):
     def to_schema(cls) -> dict[str, Any]:
         """Expose one atomic thought-and-expression contract to the model.
 
-        Runtime defaults remain permissive for historical direct callers, while
-        current model requests must supply the structured persona fields together
-        with the visible reply.
+        Current model requests must supply the structured persona fields together
+        with the visible reply.  In particular, ``thought`` is also enforced by
+        ``execute`` so a provider that ignores JSON-schema ``required`` cannot
+        silently send an unbound training sample.
         """
 
         schema = super().to_schema()
@@ -606,6 +610,11 @@ class LifeSendTextAction(BaseAction):
             "多段用换行符（\\n）分隔，每段将作为独立消息依次发送。"
             "禁止把 reason/thought 等元信息写进 content。",
         ],
+        thought: Annotated[
+            str,
+            "本次主体自己选择提交的简洁内心活动。键和值都必填，必须是非空自然语言；"
+            "不得从 provider reasoning 或 content 自动回填，也不得把它当作可见正文。",
+        ],
         mood: Annotated[
             str,
             "此刻的心情或情绪状态。键必填；没有明确情绪时传空字符串，禁止编造默认情绪。",
@@ -617,11 +626,6 @@ class LifeSendTextAction(BaseAction):
         expected_response: Annotated[
             str,
             "你预期用户看到回复后的反应。键必填；没有明确预期时传空字符串。",
-        ] = "",
-        thought: Annotated[
-            str,
-            "本次主体自己选择提交的简洁内心活动。键必填；确实没有时传空字符串，"
-            "不得从 provider reasoning 或 content 自动回填，也不得把它当作可见正文。",
         ] = "",
         reply_to: Annotated[
             str | None,
@@ -635,6 +639,9 @@ class LifeSendTextAction(BaseAction):
         ] = "",
     ) -> tuple[bool, str]:
         self._last_delivery_status = ""
+        if not isinstance(thought, str) or not thought.strip():
+            return False, "thought 必须是非空字符串；请在同一次 life_send_text 调用中先写下本次思考"
+        normalized_thought = thought.strip()
         segments = self._normalize_content_segments(content)
         cleaned_segments = [self._sanitize_segment(s) for s in segments]
         cleaned_segments = [s for s in cleaned_segments if s]
@@ -663,7 +670,7 @@ class LifeSendTextAction(BaseAction):
             "mood": str(mood or "").strip(),
             "decision": str(decision or "").strip(),
             "expected_response": str(expected_response or "").strip(),
-            "thought": str(thought or "").strip(),
+            "thought": normalized_thought,
         }
         if any(structured_context.values()):
             service = getattr(getattr(self, "plugin", None), "service", None)
@@ -1797,6 +1804,22 @@ class LifeChatter(BaseChatter):
             workspace = str(Path(__file__).parent.parent.parent.parent / "data" / "life_engine_workspace")
         return Path(workspace).expanduser() / "runtime" / "life_chatter_rolling_context.json"
 
+    @staticmethod
+    def _llm_usable_schema_name(tool_def: Any) -> str:
+        """Return the exact LLM-visible name for a usable class."""
+
+        try:
+            schema = tool_def.to_schema()
+            if isinstance(schema, dict):
+                function = schema.get("function")
+                if isinstance(function, dict) and isinstance(function.get("name"), str):
+                    return function["name"]
+                if isinstance(schema.get("name"), str):
+                    return schema["name"]
+        except Exception:  # noqa: BLE001
+            pass
+        return str(getattr(tool_def, "name", "") or "")
+
     def _filter_usables_by_manifest(self, usable_map: Any, request: Any) -> Any:
         """按意识实例类型的工具清单过滤可用工具。
 
@@ -1806,15 +1829,26 @@ class LifeChatter(BaseChatter):
         from ..service.tool_manifests import get_tool_manifest
 
         manifest = get_tool_manifest(self.instance_kind)
-        if not manifest or not isinstance(usable_map, dict):
-            return usable_map
+        allowed_names = set(manifest)
 
-        # 过滤 usable_map：只保留清单内的工具
-        filtered = {
-            name: cls
-            for name, cls in usable_map.items()
-            if name in manifest
-        }
+        if isinstance(usable_map, ToolRegistry):
+            filtered: Any = ToolRegistry()
+            for name in usable_map.get_all_names():
+                usable_cls = usable_map.get(name)
+                if name in allowed_names and usable_cls is not None:
+                    filtered.register(usable_cls, name=name)
+        elif isinstance(usable_map, dict):
+            filtered = {
+                name: usable_cls
+                for name, usable_cls in usable_map.items()
+                if name in allowed_names
+            }
+        else:
+            logger.warning(
+                "life_chatter 工具 manifest 无法过滤未知 registry 类型: "
+                f"{type(usable_map).__name__}"
+            )
+            return usable_map
 
         # 同时从 request 的 tool payload 中移除非清单工具的 schema
         try:
@@ -1825,14 +1859,58 @@ class LifeChatter(BaseChatter):
                     if isinstance(content, list):
                         payload.content = [
                             tool_def for tool_def in content
-                            if getattr(tool_def, "name", "") in manifest
-                            or f"action-{getattr(tool_def, 'name', '')}" in manifest
-                            or f"tool-{getattr(tool_def, 'name', '')}" in manifest
+                            if self._llm_usable_schema_name(tool_def) in allowed_names
                         ]
         except Exception:  # noqa: BLE001
             pass  # 过滤失败不影响主流程
 
         return filtered
+
+    @classmethod
+    def _without_retired_think_history(
+        cls,
+        payloads: list[LLMPayload],
+    ) -> list[LLMPayload]:
+        """Remove retired think calls from the derived rolling projection.
+
+        Authoritative trajectories remain untouched.  The rolling snapshot is
+        only model context, where replaying the old action teaches the model to
+        split one expression into two generations.
+        """
+
+        retired_call_ids = {
+            str(part.id)
+            for payload in payloads
+            for part in (getattr(payload, "content", None) or [])
+            if isinstance(part, ToolCall)
+            and part.name == _RETIRED_THINK_ACTION
+            and part.id
+        }
+        cleaned_payloads: list[LLMPayload] = []
+        for payload in payloads:
+            content = [
+                part
+                for part in (getattr(payload, "content", None) or [])
+                if not (
+                    isinstance(part, ToolCall)
+                    and part.name == _RETIRED_THINK_ACTION
+                )
+                and not (
+                    isinstance(part, ToolResult)
+                    and (
+                        part.name == _RETIRED_THINK_ACTION
+                        or bool(part.call_id and part.call_id in retired_call_ids)
+                    )
+                )
+            ]
+            if not content:
+                continue
+            cleaned_payloads.append(
+                payload
+                if len(content) == len(getattr(payload, "content", None) or [])
+                else LLMPayload(payload.role, content)  # type: ignore[arg-type]
+            )
+        return cleaned_payloads
 
     def _bind_trajectory_identity(
         self,
@@ -2056,6 +2134,7 @@ class LifeChatter(BaseChatter):
 
     @classmethod
     def _snapshot_data_for_payloads(cls, payloads: list[LLMPayload]) -> dict[str, Any]:
+        payloads = cls._without_retired_think_history(payloads)
         serialized_payloads = [
             item
             for item in (
@@ -2247,6 +2326,7 @@ class LifeChatter(BaseChatter):
             )
             if payload is not None
         ]
+        payloads = self._without_retired_think_history(payloads)
         # v1 is accepted as-is; migration to v2 (+ digest) happens on the next
         # successful save. Do not rewrite the snapshot file from load.
         return payloads
@@ -2865,11 +2945,11 @@ class LifeChatter(BaseChatter):
             "- 你直接输出的 assistant 纯文本 **不会被发送给用户**，它只会作为你自己的内心独白记录下来。\n"
             "- 想要让用户看到的话，**必须** 通过 `life_send_text` 工具发送。\n"
             "- 错误示范：用户问你问题，你直接输出回答文本 → 用户什么都收不到。\n"
-            "- 正确示范：用户问你问题，调用 `life_send_text(content=\"你的回答\")` → 用户看到回答。\n"
+            "- 正确示范：用户问你问题，在同一次调用中提交 `life_send_text(thought=\"本次真实思考\", mood=\"\", decision=\"如何回应\", expected_response=\"\", content=\"你的回答\")` → 用户看到回答。\n"
             "### 对话循环规则\n"
             "- 每轮你收到的工具结果会自动回到上下文，系统默认让你继续行动——你不需要等待用户下一条消息就能继续调用工具。\n"
             "- 需要的轻量思考应在当前模型决策内完成；使用 `life_send_text` 时要在同一个调用中提交 `mood`、`decision`、`expected_response`、`thought` 和 `content` 五个键，形成对齐的人格训练样本。\n"
-            "- 内在字段确实不适用时填写空字符串，不要编造默认情绪或预期；不得从 provider reasoning 或 `content` 自动回填 `thought`。\n"
+            "- `thought` 必须先写且不能为空；其他内在字段确实不适用时可填写空字符串，不要编造默认情绪或预期。不得从 provider reasoning 或 `content` 自动回填 `thought`。\n"
             "- 如果当前输入和上下文已足够，必须在本次模型决策中直接调用目标工具；普通回复直接调用 `life_send_text`，不要把一次能完成的事拆成两次模型调用。\n"
             "- 想结束本轮对话、等待用户回复时，调用 `action-life_pass_and_wait`。这是唯一退出循环的方式。\n"
             "### 一轮调用多个工具\n"
