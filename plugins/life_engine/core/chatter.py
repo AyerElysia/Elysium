@@ -292,7 +292,10 @@ class LifeSendTextAction(BaseAction):
 
     action_name = "life_send_text"
     action_description = (
-        "发送文本消息给用户。"
+        "在同一次动作中记录结构化内在状态并发送文本消息给用户。"
+        "模型调用必须同时提交 mood、decision、expected_response、thought 和 content 五个键；"
+        "确实不适用或没有明确内容的内在字段可传空字符串，禁止编造 neutral/general 等占位语义。"
+        "这些字段会与最终回复保存在同一模型轨迹中，供人格连续性与后训练使用。"
         "content 只能是字符串；若需分多条发送，用换行符（\\n）分隔各段，"
         "例如 \"你好\\n请问你是谁？\\n找我有什么事吗？\"，将依次发出 3 条消息。"
         "content 中只能包含要发给用户的纯文本正文。"
@@ -304,6 +307,31 @@ class LifeSendTextAction(BaseAction):
     )
 
     chatter_allow: list[str] = ["life_chatter"]
+    _ATOMIC_RESPONSE_FIELDS: tuple[str, ...] = (
+        "content",
+        "mood",
+        "decision",
+        "expected_response",
+        "thought",
+    )
+
+    @classmethod
+    def to_schema(cls) -> dict[str, Any]:
+        """Expose one atomic thought-and-expression contract to the model.
+
+        Runtime defaults remain permissive for historical direct callers, while
+        current model requests must supply the structured persona fields together
+        with the visible reply.
+        """
+
+        schema = super().to_schema()
+        parameters = schema["function"]["parameters"]
+        required = list(parameters.get("required") or [])
+        for field_name in cls._ATOMIC_RESPONSE_FIELDS:
+            if field_name not in required:
+                required.append(field_name)
+        parameters["required"] = required
+        return schema
 
     # ── segment helpers ─────────────────────────────────────
 
@@ -578,6 +606,23 @@ class LifeSendTextAction(BaseAction):
             "多段用换行符（\\n）分隔，每段将作为独立消息依次发送。"
             "禁止把 reason/thought 等元信息写进 content。",
         ],
+        mood: Annotated[
+            str,
+            "此刻的心情或情绪状态。键必填；没有明确情绪时传空字符串，禁止编造默认情绪。",
+        ] = "",
+        decision: Annotated[
+            str,
+            "你决定如何回应或行动。键必填；确实不适用时传空字符串，不要复制 content。",
+        ] = "",
+        expected_response: Annotated[
+            str,
+            "你预期用户看到回复后的反应。键必填；没有明确预期时传空字符串。",
+        ] = "",
+        thought: Annotated[
+            str,
+            "本次主体自己选择提交的简洁内心活动。键必填；确实没有时传空字符串，"
+            "不得从 provider reasoning 或 content 自动回填，也不得把它当作可见正文。",
+        ] = "",
         reply_to: Annotated[
             str | None,
             "可选，要引用回复的目标消息 ID。私聊默认留空。",
@@ -613,6 +658,27 @@ class LifeSendTextAction(BaseAction):
             resolved_target = await self._resolve_send_target(normalized_target_key)
             if resolved_target is None:
                 return False, f"未知或不可用的发送目标 target_key: {normalized_target_key}"
+
+        structured_context = {
+            "mood": str(mood or "").strip(),
+            "decision": str(decision or "").strip(),
+            "expected_response": str(expected_response or "").strip(),
+            "thought": str(thought or "").strip(),
+        }
+        if any(structured_context.values()):
+            service = getattr(getattr(self, "plugin", None), "service", None)
+            stream_id = str(
+                getattr(getattr(self, "chat_stream", None), "stream_id", "") or ""
+            ).strip()
+            record_snapshot = getattr(service, "record_chatter_think_snapshot", None)
+            if stream_id and callable(record_snapshot):
+                try:
+                    await record_snapshot(stream_id=stream_id, **structured_context)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "记录 life_send_text 结构化思考快照失败，不阻断消息发送: "
+                        f"error_type={type(exc).__name__}"
+                    )
 
         # ── 跨 wake 重复发送检测 ──────────────────────────────
         sent_count = 0
@@ -1768,6 +1834,46 @@ class LifeChatter(BaseChatter):
 
         return filtered
 
+    def _bind_trajectory_identity(
+        self,
+        response: Any,
+        chat_stream: ChatStream | None,
+        rt: _WorkflowRuntime,
+    ) -> None:
+        """Bind content-free consciousness identity to the next model attempt."""
+
+        stream_id = str(
+            getattr(chat_stream, "stream_id", "")
+            or rt.active_stream_id
+            or ""
+        ).strip()
+        identity = {
+            "consciousness_instance_id": str(self.instance_id or "").strip(),
+            "consciousness_instance_kind": str(self.instance_kind or "").strip(),
+            "life_stream_id": stream_id,
+            "life_turn_occurrence_id": str(
+                rt.active_unread_turn_key or ""
+            ).strip(),
+        }
+
+        targets = (response, getattr(response, "_upper", None))
+        seen_targets: set[int] = set()
+        for target in targets:
+            if target is None or id(target) in seen_targets:
+                continue
+            seen_targets.add(id(target))
+            try:
+                target.stream_id = stream_id
+                current = getattr(target, "trajectory_metadata", None)
+                metadata = dict(current) if isinstance(current, dict) else {}
+                metadata.update(identity)
+                target.trajectory_metadata = metadata
+            except (AttributeError, TypeError):
+                logger.debug(
+                    "life_chatter trajectory identity binding unavailable: "
+                    f"target_type={type(target).__name__}"
+                )
+
     @staticmethod
     def _json_safe_value(value: Any) -> Any:
         try:
@@ -2762,7 +2868,8 @@ class LifeChatter(BaseChatter):
             "- 正确示范：用户问你问题，调用 `life_send_text(content=\"你的回答\")` → 用户看到回答。\n"
             "### 对话循环规则\n"
             "- 每轮你收到的工具结果会自动回到上下文，系统默认让你继续行动——你不需要等待用户下一条消息就能继续调用工具。\n"
-            "- 需要的轻量思考应在当前模型决策内完成；不要为了展示内部推理而先调用独立动作。\n"
+            "- 需要的轻量思考应在当前模型决策内完成；使用 `life_send_text` 时要在同一个调用中提交 `mood`、`decision`、`expected_response`、`thought` 和 `content` 五个键，形成对齐的人格训练样本。\n"
+            "- 内在字段确实不适用时填写空字符串，不要编造默认情绪或预期；不得从 provider reasoning 或 `content` 自动回填 `thought`。\n"
             "- 如果当前输入和上下文已足够，必须在本次模型决策中直接调用目标工具；普通回复直接调用 `life_send_text`，不要把一次能完成的事拆成两次模型调用。\n"
             "- 想结束本轮对话、等待用户回复时，调用 `action-life_pass_and_wait`。这是唯一退出循环的方式。\n"
             "### 一轮调用多个工具\n"
@@ -4628,6 +4735,11 @@ class LifeChatter(BaseChatter):
                 try:
                     async def _send_and_collect_response() -> Any:
                         source_response = rt.response
+                        self._bind_trajectory_identity(
+                            source_response,
+                            chat_stream,
+                            rt,
+                        )
                         override_state = self._apply_surface_realtime_request_overrides(
                             source_response,
                             chat_stream,

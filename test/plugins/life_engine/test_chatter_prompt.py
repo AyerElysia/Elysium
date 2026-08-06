@@ -875,6 +875,137 @@ def test_chat_manifest_filters_legacy_think_from_model_request() -> None:
     assert tool_payload.content == [SendTextTool]
 
 
+def test_life_chatter_binds_identity_to_request_and_follow_up_upper() -> None:
+    upper = SimpleNamespace(
+        trajectory_metadata={"existing": "kept"},
+        stream_id="old-stream",
+    )
+    response = SimpleNamespace(_upper=upper)
+    rt = _WorkflowRuntime(
+        response=response,
+        phase=_Phase.MODEL_TURN,
+        history_merged=True,
+        unreads=[],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[],
+        active_stream_id="stream-a",
+        active_unread_turn_key="turn-occurrence-a",
+    )
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.instance_id = "chat_global"
+    chatter.instance_kind = "chat"
+
+    chatter._bind_trajectory_identity(
+        response,
+        SimpleNamespace(stream_id="stream-a"),
+        rt,
+    )
+
+    expected = {
+        "consciousness_instance_id": "chat_global",
+        "consciousness_instance_kind": "chat",
+        "life_stream_id": "stream-a",
+        "life_turn_occurrence_id": "turn-occurrence-a",
+    }
+    assert response.stream_id == "stream-a"
+    assert upper.stream_id == "stream-a"
+    assert response.trajectory_metadata == expected
+    assert upper.trajectory_metadata == {"existing": "kept", **expected}
+    serialized = repr(response.trajectory_metadata) + repr(upper.trajectory_metadata)
+    assert "message body" not in serialized
+    assert "thought body" not in serialized
+    assert "tool args" not in serialized
+
+
+def test_life_chatter_trajectory_identity_handles_missing_fields() -> None:
+    response = SimpleNamespace()
+    rt = _WorkflowRuntime(
+        response=response,
+        phase=_Phase.FOLLOW_UP,
+        history_merged=True,
+        unreads=[],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[],
+        active_stream_id="",
+    )
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.instance_id = ""
+    chatter.instance_kind = ""
+
+    chatter._bind_trajectory_identity(response, None, rt)
+
+    assert response.stream_id == ""
+    assert response.trajectory_metadata == {
+        "consciousness_instance_id": "",
+        "consciousness_instance_kind": "",
+        "life_stream_id": "",
+        "life_turn_occurrence_id": "",
+    }
+
+
+async def test_media_fallback_reuses_bound_trajectory_identity(monkeypatch) -> None:
+    expected = {
+        "consciousness_instance_id": "minecraft:one",
+        "consciousness_instance_kind": "minecraft",
+        "life_stream_id": "stream-mc",
+        "life_turn_occurrence_id": "turn-mc",
+    }
+
+    class _Response:
+        def __init__(self) -> None:
+            self.payloads = []
+            self.trajectory_metadata: dict[str, str] = {}
+            self.stream_id = ""
+
+        async def send(self, *, stream: bool = False):
+            assert stream is False
+            assert self.stream_id == "stream-mc"
+            assert self.trajectory_metadata == expected
+            return self
+
+        def __await__(self):
+            async def done():
+                return self
+
+            return done().__await__()
+
+    response = _Response()
+    rt = _WorkflowRuntime(
+        response=response,
+        phase=_Phase.MODEL_TURN,
+        history_merged=True,
+        unreads=[],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[],
+        active_stream_id="stream-mc",
+        active_unread_turn_key="turn-mc",
+    )
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.instance_id = "minecraft:one"
+    chatter.instance_kind = "minecraft"
+    chatter._bind_trajectory_identity(
+        response,
+        SimpleNamespace(stream_id="stream-mc"),
+        rt,
+    )
+
+    async def replace_media(_cls, _response):
+        return 1
+
+    monkeypatch.setattr(
+        LifeChatter,
+        "_replace_native_media_with_observations",
+        classmethod(replace_media),
+    )
+
+    result = await LifeChatter._retry_model_turn_with_media_text_fallback(
+        rt,
+        "",
+    )
+
+    assert result is response
+
+
 async def test_life_chatter_global_runtime_follow_up_stays_on_owner_stream(monkeypatch) -> None:
     LifeChatter.reset_global_runtime()
     rt = _WorkflowRuntime(

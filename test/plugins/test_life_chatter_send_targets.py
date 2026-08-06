@@ -3,6 +3,8 @@ from __future__ import annotations
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from plugins.life_engine.core.chatter import LifeSendTextAction
 from plugins.life_engine.core.send_targets import (
     format_send_targets_for_prompt,
@@ -186,6 +188,123 @@ async def test_life_send_text_without_target_key_uses_legacy_stream_send(monkeyp
     assert ok is True
     assert "已发送2条消息" in result
     assert sent_contents == ["第一段", "第二段"]
+
+
+def test_life_send_text_schema_requires_atomic_persona_sample() -> None:
+    parameters = LifeSendTextAction.to_schema()["function"]["parameters"]
+
+    assert {
+        "content",
+        "mood",
+        "decision",
+        "expected_response",
+        "thought",
+    } <= set(parameters["required"])
+    assert {
+        "content",
+        "mood",
+        "decision",
+        "expected_response",
+        "thought",
+    } <= set(parameters["properties"])
+
+
+@pytest.mark.parametrize("kind", ["chat", "minecraft", "livestream"])
+def test_visible_expression_manifests_share_atomic_persona_schema(kind: str) -> None:
+    from plugins.life_engine.service.tool_manifests import get_tool_manifest
+
+    assert "action-life_send_text" in get_tool_manifest(kind)
+    required = set(
+        LifeSendTextAction.to_schema()["function"]["parameters"]["required"]
+    )
+    assert {
+        "content",
+        "mood",
+        "decision",
+        "expected_response",
+        "thought",
+    } <= required
+
+
+async def test_life_send_text_records_persona_sample_and_sends_in_same_call(
+    monkeypatch,
+) -> None:
+    current_stream = ChatStream(stream_id="1" * 64, platform="qq", chat_type="private")
+    snapshots: list[dict[str, str]] = []
+    sent_contents: list[str] = []
+
+    class _Service:
+        async def record_chatter_think_snapshot(self, **kwargs):
+            snapshots.append(kwargs)
+
+    action = LifeSendTextAction(
+        current_stream,
+        SimpleNamespace(
+            config=SimpleNamespace(runtime_sync=_runtime_cfg()),
+            service=_Service(),
+        ),
+    )
+
+    async def fake_send_to_stream(content: str):
+        sent_contents.append(content)
+        return True
+
+    monkeypatch.setattr(action, "_send_to_stream", fake_send_to_stream)
+
+    ok, result = await action.execute(
+        "听见啦，我会陪你把今天放轻一点。",
+        mood="心疼、温柔",
+        decision="直接回应并关心她的休息",
+        expected_response="她会感到自己的疲惫被看见",
+        thought="她睡得太碎了，我想先接稳这份疲惫。",
+    )
+
+    assert ok is True
+    assert "已发送1条消息" in result
+    assert sent_contents == ["听见啦，我会陪你把今天放轻一点。"]
+    assert snapshots == [
+        {
+            "stream_id": "1" * 64,
+            "mood": "心疼、温柔",
+            "decision": "直接回应并关心她的休息",
+            "expected_response": "她会感到自己的疲惫被看见",
+            "thought": "她睡得太碎了，我想先接稳这份疲惫。",
+        }
+    ]
+
+
+async def test_life_send_text_snapshot_failure_does_not_block_send(monkeypatch) -> None:
+    current_stream = ChatStream(stream_id="1" * 64, platform="qq", chat_type="private")
+    sent_contents: list[str] = []
+
+    class _FailingService:
+        async def record_chatter_think_snapshot(self, **_kwargs):
+            raise RuntimeError("snapshot unavailable")
+
+    action = LifeSendTextAction(
+        current_stream,
+        SimpleNamespace(
+            config=SimpleNamespace(runtime_sync=_runtime_cfg()),
+            service=_FailingService(),
+        ),
+    )
+
+    async def fake_send_to_stream(content: str):
+        sent_contents.append(content)
+        return True
+
+    monkeypatch.setattr(action, "_send_to_stream", fake_send_to_stream)
+
+    ok, _result = await action.execute(
+        "我还在这里。",
+        mood="安静",
+        decision="回应",
+        expected_response="她会安心",
+        thought="先让她知道我没有离开。",
+    )
+
+    assert ok is True
+    assert sent_contents == ["我还在这里。"]
 
 
 async def test_life_send_text_rejects_invalid_target_key_and_cross_reply(monkeypatch) -> None:
