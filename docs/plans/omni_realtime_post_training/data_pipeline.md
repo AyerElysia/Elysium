@@ -9,6 +9,7 @@
 5. 数据生成、训练和评测默认全本地；任何外部 API、云端日志或样本上传都需要新的明确授权。
 6. 用户已确认本地主体模型应训练人格与记忆，但这不构成对全部私有数据的笼统授权。`SOUL.md`、`USER.md`、`MEMORY.md`、日记、Life Event、聊天和真实通话只能从批准的数据快照导出，并保留主体作者、他者上下文、记忆截止点、撤回与删除路径。
 7. 训练集按 `voice_identity`、`persona_dialogue`、`consolidated_memory`、`duplex_timing` 和 `tool_grounding` 分域，不能用一个“聊天数据”标签混掉不同主体意义。
+8. `SOUL.md` 按精确 revision 作为“主体自我解释”进入谱系，不作为凌驾于经历之上的人格真值；训练与评测必须保留自述、行为、记忆证据之间可能存在的张力，不由流水线自动改写成一致。
 
 ## 2. 两轨全双工样本
 
@@ -92,6 +93,8 @@ output_sha256, normalized_sha256, codec_reconstruction_sha256
 
 模型的目标就是内化爱莉的稳定人格和批准记忆，但必须尊重作者身份：用户/他者文本不能改成爱莉的第一人称，外部 agent 建议不能因出现在聊天里就成为她的价值选择。每个主体样本引用形成、接受或重新表达该内容的爱莉意识事件。Elysium 运行时继续提供训练截止点之后的新经历、当前纠正和场景感知。
 
+“全经历后训练”在数据线上表示：每项获授权经历都进入 coverage manifest，并明确记录它被用作条件、外部证据、反证、主体目标、评测样本、quarantine 或排除项。它不表示把所有 token 都训练成爱莉会说的话。别人所说和世界所发生的事会构成她的经历，爱莉自己的选择、行动、表达、接受、拒绝和重新解释才构成强身份监督。
+
 聊天文本可以提供场景语义和人格监督，但没有声学时间轴，不能自动变成全双工样本。可将一轮聊天构造成明确标注的对话脚本，再使用获授权用户音频、可选本地 TTS 用户轨或人工录制补足输入音频；助手侧优先匹配原始爱莉片段，无法匹配时留在文本人格训练集，不能靠拼接无关台词伪造自然回复。
 
 ### 4.2 场景比例
@@ -164,7 +167,8 @@ dataset_revision: <immutable-revision>
 domain: voice_identity|persona_dialogue|consolidated_memory|duplex_timing|tool_grounding
 subject:
   subject_id: elysia
-  persona_revision: <revision-or-null>
+  self_interpretation_revision: <SOUL-revision-or-null>
+  subject_behavior_data_revision: <revision-or-null>
   memory_revision: <revision-or-null>
   memory_cutoff: <UTC-or-null>
 source:
