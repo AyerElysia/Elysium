@@ -3,20 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
-import plugins.life_engine.core.chatter as chatter_module
+import pytest
 
-from plugins.life_engine.core.config import LifeEngineConfig
-from plugins.life_engine.core.context_assembly import LifeChatterContextAssembler
+import plugins.life_engine.core.chatter as chatter_module
+from plugins.life_engine.constants import LIFE_CHATTER_GLOBAL_CURSOR_KEY
 from plugins.life_engine.core.chatter import (
-    LifeChatter,
     _GLOBAL_RUNTIME_BUSY_RETRY_SECONDS,
+    LifeChatter,
     _Phase,
     _WorkflowRuntime,
 )
-from plugins.life_engine.constants import LIFE_CHATTER_GLOBAL_CURSOR_KEY
+from plugins.life_engine.core.config import LifeEngineConfig
+from plugins.life_engine.core.context_assembly import LifeChatterContextAssembler
 from plugins.life_engine.service.core import LifeEngineService
 from plugins.life_engine.service.event_builder import EventType, LifeEngineEvent
 from plugins.life_engine.service.perception_gateway import (
@@ -24,23 +27,25 @@ from plugins.life_engine.service.perception_gateway import (
     PerceptionDeliveryUnverified,
 )
 from plugins.life_engine.tools.exec_tools import LifeEngineBashTool
-from plugins.life_engine.tools.file_tools import LifeEngineRunAgentTool, LifeEngineWakeDFCTool
+from plugins.life_engine.tools.file_tools import (
+    LifeEngineRunAgentTool,
+    LifeEngineWakeDFCTool,
+)
 from src.core.components.base.chatter import BaseChatter, Failure, Success, Wait
 from src.core.models.media import MediaAttachment
 from src.core.models.message import Message, MessageType
 from src.core.utils.llm_tool_call import ToolCallExecutionResult
 from src.kernel.llm import (
+    ROLE,
     Image,
     LLMContextManager,
     LLMPayload,
-    ROLE,
+    ReasoningText,
     Text,
     ToolCall,
     ToolRegistry,
     ToolResult,
 )
-import pytest
-
 
 _TEST_PNG_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
@@ -913,6 +918,8 @@ def test_rolling_context_projection_drops_retired_think_pair() -> None:
         LLMPayload(
             ROLE.ASSISTANT,
             [
+                Text("keep this live tool context"),
+                ReasoningText("keep this live tool reasoning"),
                 ToolCall(id="think-1", name="action-think", args={"thought": "legacy"}),
                 ToolCall(
                     id="send-1",
@@ -932,8 +939,197 @@ def test_rolling_context_projection_drops_retired_think_pair() -> None:
 
     cleaned = LifeChatter._without_retired_think_history(payloads)
 
-    assert [part.name for part in cleaned[0].content] == ["action-life_send_text"]
+    assert cleaned[0].content[:2] == [
+        Text("keep this live tool context"),
+        ReasoningText("keep this live tool reasoning"),
+    ]
+    assert [
+        part.name for part in cleaned[0].content if isinstance(part, ToolCall)
+    ] == ["action-life_send_text"]
     assert [part.name for part in cleaned[1].content] == ["action-life_send_text"]
+
+
+def test_rolling_context_projection_drops_whole_retired_think_assistant() -> None:
+    payloads = [
+        LLMPayload(ROLE.USER, Text("new message")),
+        LLMPayload(
+            ROLE.ASSISTANT,
+            [
+                Text("__SUSPEND__"),
+                ReasoningText("legacy provider reasoning"),
+                ToolCall(
+                    id="think-only",
+                    name="action-think",
+                    args={"thought": "legacy"},
+                ),
+            ],
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            ToolResult(
+                value="legacy ok",
+                call_id="think-only",
+                name="action-think",
+            ),
+        ),
+        LLMPayload(
+            ROLE.ASSISTANT,
+            ToolCall(
+                id="send-1",
+                name="action-life_send_text",
+                args={"thought": "current", "content": "hello"},
+            ),
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            ToolResult(
+                value="sent",
+                call_id="send-1",
+                name="action-life_send_text",
+            ),
+        ),
+        LLMPayload(ROLE.ASSISTANT, Text("__SUSPEND__")),
+    ]
+
+    cleaned = LifeChatter._without_retired_think_history(payloads)
+
+    assert [payload.role for payload in cleaned] == [
+        ROLE.USER,
+        ROLE.ASSISTANT,
+        ROLE.TOOL_RESULT,
+        ROLE.ASSISTANT,
+    ]
+    assert LifeChatter._without_retired_think_history(cleaned) == cleaned
+    assert all(
+        getattr(part, "name", None) != "action-think"
+        for payload in cleaned
+        for part in payload.content
+    )
+    result_ids = {
+        part.call_id
+        for payload in cleaned
+        for part in payload.content
+        if isinstance(part, ToolResult)
+    }
+    call_ids = {
+        part.id
+        for payload in cleaned
+        for part in payload.content
+        if isinstance(part, ToolCall)
+    }
+    assert result_ids <= call_ids
+    LLMContextManager()._validate_payloads(
+        cleaned,
+        allow_incomplete_tail=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_rolling_context_legacy_think_load_is_read_only_then_save_normalizes(
+    tmp_path,
+) -> None:
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(tmp_path)
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=config)
+    chatter.instance_id = "chat_global"
+
+    legacy_payloads = [
+        LLMPayload(ROLE.USER, Text("new message")),
+        LLMPayload(
+            ROLE.ASSISTANT,
+            [
+                Text("__SUSPEND__"),
+                ToolCall(
+                    id="think-only",
+                    name="action-think",
+                    args={"thought": "legacy"},
+                ),
+            ],
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            ToolResult(
+                value="legacy ok",
+                call_id="think-only",
+                name="action-think",
+            ),
+        ),
+        LLMPayload(
+            ROLE.ASSISTANT,
+            ToolCall(
+                id="send-1",
+                name="action-life_send_text",
+                args={"thought": "current", "content": "hello"},
+            ),
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            ToolResult(
+                value="sent",
+                call_id="send-1",
+                name="action-life_send_text",
+            ),
+        ),
+        LLMPayload(ROLE.ASSISTANT, Text("__SUSPEND__")),
+    ]
+    payload_items = [
+        item
+        for item in (
+            LifeChatter._serialize_payload(payload)
+            for payload in legacy_payloads
+        )
+        if item is not None
+    ]
+    payload_json = json.dumps(
+        payload_items,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    snapshot = {
+        "version": 2,
+        "runtime_key": LIFE_CHATTER_GLOBAL_CURSOR_KEY,
+        "payload_digest": hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+        "payloads": payload_items,
+    }
+    path = chatter._rolling_context_snapshot_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    original_bytes = path.read_bytes()
+
+    loaded = chatter._load_rolling_context_snapshot()
+
+    assert path.read_bytes() == original_bytes
+    assert [payload.role for payload in loaded] == [
+        ROLE.USER,
+        ROLE.ASSISTANT,
+        ROLE.TOOL_RESULT,
+        ROLE.ASSISTANT,
+    ]
+    LLMContextManager()._validate_payloads(
+        loaded,
+        allow_incomplete_tail=False,
+    )
+
+    await chatter._save_rolling_context_snapshot(SimpleNamespace(payloads=loaded))
+
+    normalized = json.loads(path.read_text(encoding="utf-8"))
+    normalized_payload_json = json.dumps(
+        normalized["payloads"],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    assert normalized["payload_digest"] == hashlib.sha256(
+        normalized_payload_json.encode("utf-8")
+    ).hexdigest()
+    assert all(
+        part.get("name") != "action-think"
+        for payload in normalized["payloads"]
+        for part in payload["content"]
+    )
 
 
 def test_life_chatter_binds_identity_to_request_and_follow_up_upper() -> None:
