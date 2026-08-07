@@ -25,7 +25,13 @@ from plugins.life_engine.memory.experience import (
     search_witness_memories,
     update_witness_state,
 )
-from plugins.life_engine.memory.tools import LifeEngineSearchMemoryTool
+from plugins.life_engine.memory.lineage import MemoryBundle, MemoryEvidence
+from plugins.life_engine.memory.tools import (
+    MEMORY_SEARCH_CORE_MAX_BYTES,
+    MEMORY_SEARCH_EXPRESSION_MAX_BYTES,
+    MEMORY_SEARCH_PROJECTION_VERSION,
+    LifeEngineSearchMemoryTool,
+)
 from plugins.life_engine.service.consciousness import (
     ConsciousnessInstance,
     ConsciousnessRegistry,
@@ -905,22 +911,205 @@ async def test_search_tool_returns_evidence_payload_without_fake_confidence(
     assert payload["valid_at"] == ""
     assert payload["recorded_as_of"] == ""
     assert payload["total_found"] == 1
-    assert payload["evidence_results"][0] == {
-        "record_id": "witness-1",
-        "kind": EpistemicKind.SUBJECTIVE_WITNESS.value,
-        "content": "我记得这段经历。",
-        "rank_score": 0.875,
-        "confidence": None,
-        "source": "witness_fts",
-        "valid_from": "2026-07-29T08:00:00+08:00",
-        "valid_to": "2026-07-29T08:05:00+08:00",
-        "recorded_at": "2026-07-29T08:06:00+08:00",
-        "stream_scope": "stream-1",
-        "visibility": "private",
-        "status": "active",
-        "provenance": ["event-1"],
-        "metadata": {"subjective": True},
-    }
+    projected = payload["evidence_results"][0]
+    assert projected["record_id"] == "witness-1"
+    assert projected["kind"] == EpistemicKind.SUBJECTIVE_WITNESS.value
+    assert projected["confidence"] is None
+    assert projected["content_delivery"] == "full"
+    assert "content" not in projected
+    canonical = next(
+        item
+        for item in payload["canonical_items"]
+        if item["ref"] == projected["content_ref"]
+    )
+    assert canonical["content"] == "我记得这段经历。"
+    assert canonical["content_sha256"] == hashlib.sha256(
+        "我记得这段经历。".encode("utf-8")
+    ).hexdigest()
+    assert projected["provenance_count"] == 1
+    assert projected["metadata_bytes"] > 0
+    assert payload["projection_version"] == MEMORY_SEARCH_PROJECTION_VERSION
+    assert payload["delivered_bytes"] == len(str(payload).encode("utf-8"))
+    assert payload["delivered_bytes"] <= MEMORY_SEARCH_CORE_MAX_BYTES
+
+
+async def test_search_tool_bounds_large_unicode_results_and_exposes_only_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool = LifeEngineSearchMemoryTool(plugin=SimpleNamespace())
+    tool._runtime_task_name = "core"
+    evidence = [
+        EvidenceAwareMemoryResult(
+            record_id=f"witness-{index:02d}",
+            kind=EpistemicKind.SUBJECTIVE_WITNESS.value,
+            content=(f"第{index}段珍贵经历。" + "爱莉♪" * 40000),
+            rank_score=1.0 / (index + 1),
+            confidence=None,
+            source="witness_fts",
+            provenance=(f"event-{index}",),
+            metadata={"oversized": "元" * 20000},
+        )
+        for index in range(20)
+    ]
+    exposed_pages: list[tuple[object, ...]] = []
+    corecalls: list[object] = []
+
+    class _BoundedService:
+        async def search_memory(self, *_args: object, **_kwargs: object) -> list[object]:
+            return []
+
+        async def search_evidence_aware(
+            self,
+            _query: str,
+            **_kwargs: object,
+        ) -> list[EvidenceAwareMemoryResult]:
+            return evidence
+
+        async def append_memory_recall_events(self, events: tuple[object, ...]) -> None:
+            exposed_pages.append(events)
+
+        async def append_memory_corecall(self, event: object) -> None:
+            corecalls.append(event)
+
+    async def _service() -> object:
+        return _BoundedService()
+
+    monkeypatch.setattr(tool, "_get_service", _service)
+
+    ok, first = await tool.execute("珍贵经历")
+
+    assert ok is True
+    assert first["truncated"] is True
+    assert first["continuation"]
+    assert first["original_items"] == 20
+    assert 0 < first["delivered_items"] < first["original_items"]
+    assert first["omitted_items"] > 0
+    assert first["delivered_bytes"] == len(str(first).encode("utf-8"))
+    assert first["delivered_bytes"] <= MEMORY_SEARCH_CORE_MAX_BYTES
+    assert any(item["delivery"] == "excerpt" for item in first["canonical_items"])
+    first_refs = {item["entity_ref"] for item in first["evidence_results"]}
+    assert {event.entity_ref for event in exposed_pages[0]} == first_refs
+    assert all(
+        event.metadata["content_delivery"] in {"full", "excerpt", "ref"}
+        for event in exposed_pages[0]
+    )
+    assert set(corecalls[0].entity_refs) == first_refs
+
+    ok, second = await tool.execute(
+        "珍贵经历",
+        continuation=first["continuation"],
+    )
+
+    assert ok is True
+    assert second["frontier_sha256"] == first["frontier_sha256"]
+    assert second["delivered_bytes"] == len(str(second).encode("utf-8"))
+    assert second["delivered_bytes"] <= MEMORY_SEARCH_CORE_MAX_BYTES
+    second_refs = {item["entity_ref"] for item in second["evidence_results"]}
+    assert first_refs.isdisjoint(second_refs)
+    assert {event.entity_ref for event in exposed_pages[1]} == second_refs
+
+
+async def test_search_tool_uses_task_budget_and_deduplicates_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shared = "同一段正文♪" * 5000
+    evidence = EvidenceAwareMemoryResult(
+        record_id="document-1",
+        kind="document_evidence",
+        content=shared,
+        rank_score=1.0,
+        confidence=None,
+        source="document_search",
+    )
+    bundle = MemoryBundle(
+        query="同一内容",
+        current_understanding=shared,
+        primary_path="notes/shared.md",
+        evidence=[
+            MemoryEvidence(
+                file_path="notes/shared.md",
+                title="共享",
+                snippet=shared,
+                source="direct",
+            )
+        ],
+    )
+
+    class _DeduplicatedService:
+        async def search_memory(self, *_args: object, **_kwargs: object) -> list[object]:
+            return []
+
+        async def build_memory_bundles(
+            self,
+            **_kwargs: object,
+        ) -> list[MemoryBundle]:
+            return [bundle]
+
+        async def search_evidence_aware(
+            self,
+            _query: str,
+            **_kwargs: object,
+        ) -> list[EvidenceAwareMemoryResult]:
+            return [evidence]
+
+    async def _service() -> object:
+        return _DeduplicatedService()
+
+    core = LifeEngineSearchMemoryTool(plugin=SimpleNamespace())
+    core._runtime_task_name = "core"
+    expression = LifeEngineSearchMemoryTool(plugin=SimpleNamespace())
+    expression._runtime_task_name = "expression"
+    monkeypatch.setattr(core, "_get_service", _service)
+    monkeypatch.setattr(expression, "_get_service", _service)
+
+    core_ok, core_payload = await core.execute("同一内容")
+    expression_ok, expression_payload = await expression.execute("同一内容")
+
+    assert core_ok is expression_ok is True
+    assert core_payload["budget_bytes"] == MEMORY_SEARCH_CORE_MAX_BYTES
+    assert expression_payload["budget_bytes"] == MEMORY_SEARCH_EXPRESSION_MAX_BYTES
+    assert core_payload["delivered_bytes"] <= MEMORY_SEARCH_CORE_MAX_BYTES
+    assert expression_payload["delivered_bytes"] <= MEMORY_SEARCH_EXPRESSION_MAX_BYTES
+    shared_digest = hashlib.sha256(shared.encode("utf-8")).hexdigest()
+    assert sum(
+        item["content_sha256"] == shared_digest
+        for item in expression_payload["canonical_items"]
+    ) == 1
+    evidence_ref = expression_payload["evidence_results"][0]["content_ref"]
+    assert expression_payload["direct_results"][0]["content_ref"] == evidence_ref
+    assert expression_payload["memory_bundles"][0]["current_refs"] == [evidence_ref]
+
+
+async def test_search_tool_rejects_tampered_continuation_without_exposure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool = LifeEngineSearchMemoryTool(plugin=SimpleNamespace())
+    exposures: list[tuple[object, ...]] = []
+
+    class _Service:
+        async def search_memory(self, *_args: object, **_kwargs: object) -> list[object]:
+            return []
+
+        async def search_evidence_aware(
+            self,
+            _query: str,
+            **_kwargs: object,
+        ) -> list[EvidenceAwareMemoryResult]:
+            return []
+
+        async def append_memory_recall_events(self, events: tuple[object, ...]) -> None:
+            exposures.append(events)
+
+    async def _service() -> object:
+        return _Service()
+
+    monkeypatch.setattr(tool, "_get_service", _service)
+
+    ok, payload = await tool.execute("记忆", continuation="tampered.token")
+
+    assert ok is False
+    assert "continuation" in payload["error"]
+    assert exposures == []
 
 
 async def test_projection_failure_does_not_advance_witness_cursor(
