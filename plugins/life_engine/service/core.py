@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 import traceback
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
@@ -3342,6 +3343,11 @@ class LifeEngineService(BaseService):
             direction = "received"
 
         event = self._event_builder.build_message_event(message, direction=direction)
+        # 分阶段计时：EventBus 处理器有 5 秒硬截止，超时时需要知道瓶颈在哪个阶段
+        _phase_start = time.monotonic()
+        _phase_enqueue = 0.0
+        _phase_facts = 0.0
+        _phase_context = 0.0
         unlocked_self_pause = False
         async with self._get_lock():
             self._pending_events.append(event)
@@ -3368,14 +3374,19 @@ class LifeEngineService(BaseService):
                     state.pending_followup = None
                     state.is_waiting = False
                     state.active_check_kind = None
+        _phase_enqueue = time.monotonic() - _phase_start
         chat_fact = build_chat_message_event(
             message,
             direction="delivered" if direction == "sent" else "received",
             envelope=envelope,
             adapter_signature=adapter_signature,
         )
+        _facts_start = time.monotonic()
         await self._publish_message_facts(event, chat_fact)
+        _phase_facts = time.monotonic() - _facts_start
+        _ctx_start = time.monotonic()
         await self._save_runtime_context()
+        _phase_context = time.monotonic() - _ctx_start
         if direction == "received":
             self._schedule_curiosity_review(message, event)
         if unlocked_self_pause:
@@ -3400,6 +3411,16 @@ class LifeEngineService(BaseService):
             direction=direction,
             pending_message_count=self._state.pending_event_count,
         )
+        # 接近 EventBus 5 秒硬截止时告警，暴露冷路径竞态的具体慢阶段
+        _total_elapsed = time.monotonic() - _phase_start
+        if _total_elapsed >= 4.0:
+            logger.warning(
+                f"life_engine record_message 接近 EventBus 超时阈值: "
+                f"total={_total_elapsed:.2f}s enqueue={_phase_enqueue:.2f}s "
+                f"facts={_phase_facts:.2f}s context={_phase_context:.2f}s "
+                f"message_id={event.event_id} stream_id={event.stream_id or ''} "
+                f"direction={direction}"
+            )
 
     def _get_curiosity_engine(self) -> CuriosityEngine:
         cfg = self._cfg()
@@ -7097,10 +7118,29 @@ class LifeEngineService(BaseService):
                 )
 
             async def _send_followup_request() -> Any:
-                return await asyncio.wait_for(
-                    current_response.send(stream=False),
-                    timeout=timeout_seconds,
-                )
+                from src.kernel.llm.exceptions import LLMModelsCoolingDownError
+
+                try:
+                    return await asyncio.wait_for(
+                        current_response.send(stream=False),
+                        timeout=timeout_seconds,
+                    )
+                except LLMModelsCoolingDownError as cooldown_exc:
+                    # 首次请求超时会让唯一候选进入约 30s 冷却；续轮立即重发会
+                    # 直接撞冷却窗口。按 retry_after 等待（受步进预算约束）
+                    # 后再真实重发，而不是把冷却误报为 Provider 再次超时。
+                    wait_seconds = min(cooldown_exc.retry_after, timeout_seconds)
+                    logger.info(
+                        f"life_engine heartbeat follow-up 候选模型冷却中，"
+                        f"等待 {wait_seconds:.1f}s 后重试"
+                    )
+                    await asyncio.sleep(wait_seconds)
+                    return await asyncio.wait_for(
+                        current_response.send(stream=False),
+                        timeout=timeout_seconds,
+                    )
+
+            from src.kernel.llm.exceptions import LLMModelsCoolingDownError
 
             try:
                 response = await retry_with_backoff(
@@ -7119,7 +7159,13 @@ class LifeEngineService(BaseService):
                         raise PerceptionDeliveryUnverified(
                             "heartbeat follow-up lost the exact World projection"
                         )
-            except (asyncio.TimeoutError, RetryExhaustedError) as exc:
+            except (
+                asyncio.TimeoutError,
+                RetryExhaustedError,
+                LLMModelsCoolingDownError,
+            ) as exc:
+                # 冷却窗口内二次失败同样归一化为超时，保持心跳失败合同一致，
+                # 不把冷却中的本轮伪装成成功。
                 logger.warning(f"life_engine heartbeat follow-up request timeout: {exc}")
                 raise TimeoutError("heartbeat follow-up request timeout") from exc
 

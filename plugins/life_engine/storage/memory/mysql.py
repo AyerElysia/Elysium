@@ -982,9 +982,13 @@ class MySQLDocumentIndexProjection(_MySQLPort):
             )
         if not rows:
             return 0
+        # 同一个 chunk_id 可能因多次文档替换/删除产生多条未消费墓碑；
+        # 外部向量后端（Chroma）要求单批删除内 ID 唯一，重复会使整批失败。
+        # 先去重再删，删除成功后仍逐条确认每个原始 tombstone_id，避免重复墓碑永久堆积。
+        unique_ids = list(dict.fromkeys(str(row["chunk_id"]) for row in rows))
         await _call_external(
             delete_func,
-            ids=[str(row["chunk_id"]) for row in rows],
+            ids=unique_ids,
         )
 
         async def _operation(session: AsyncSession) -> int:

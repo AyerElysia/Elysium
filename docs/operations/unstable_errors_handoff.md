@@ -8,6 +8,17 @@
 
 本文用于交接给下一位开发者。以下四个问题都保留现状，交接者应先补充观测和最小复现，再决定修复方案。
 
+## 0. 2026-08-07 后续处置记录（linux-primary 实例）
+
+| 问题 | 处置 | 内容 |
+|---|---|---|
+| #1 收集器 5 秒超时 | 补充观测 | `record_message()` 增加 enqueue/facts/context 三阶段计时，总耗时 ≥4s 时告警并附 message_id/stream_id；未改 EventBus 超时与提交顺序 |
+| #2 Session committed | 补充诊断 | `message_collect_failed` 审计与日志现携带 `error_type` 与完整 traceback，可定位异常发生阶段；根因仍待复现确认 |
+| #3 墓碑重复 ID | 已修复 | `consume_vector_tombstones()` 外部删除前对 chunk_id 去重，删除成功后仍逐条确认每个原始 tombstone_id；真实验收待运行中观察批次报告 |
+| #4 心跳撞冷却 | 已修复 | `_send_followup_request()` 捕获 `LLMModelsCoolingDownError`，按 `retry_after` 等待（受步进预算约束）后真实重发；冷却内二次失败归一化为 TimeoutError，不伪装成功 |
+
+#3/#4 尚未经真实运行验收；#1/#2 仅增加观测能力，根因未定论。
+
 ## 1. Life Engine 消息收集器偶发 5 秒超时
 
 ### 现象
