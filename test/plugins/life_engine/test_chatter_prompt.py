@@ -47,6 +47,7 @@ from src.kernel.llm import (
     ToolRegistry,
     ToolResult,
 )
+from src.kernel.storage import canonical_json_sha256
 
 _TEST_PNG_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
@@ -1167,7 +1168,7 @@ async def test_rolling_context_legacy_think_load_is_read_only_then_save_normaliz
     )
     original_bytes = path.read_bytes()
 
-    loaded = chatter._load_rolling_context_snapshot()
+    loaded = await chatter._load_rolling_context_snapshot()
 
     assert path.read_bytes() == original_bytes
     assert [payload.role for payload in loaded] == [
@@ -1184,14 +1185,9 @@ async def test_rolling_context_legacy_think_load_is_read_only_then_save_normaliz
     await chatter._save_rolling_context_snapshot(SimpleNamespace(payloads=loaded))
 
     normalized = json.loads(path.read_text(encoding="utf-8"))
-    normalized_payload_json = json.dumps(
-        normalized["payloads"],
-        ensure_ascii=False,
-        separators=(",", ":"),
+    assert normalized["payload_digest"] == canonical_json_sha256(
+        normalized["payloads"]
     )
-    assert normalized["payload_digest"] == hashlib.sha256(
-        normalized_payload_json.encode("utf-8")
-    ).hexdigest()
     assert all(
         part.get("name") != "action-think"
         for payload in normalized["payloads"]
