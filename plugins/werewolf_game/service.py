@@ -18,6 +18,12 @@ from src.core.models.stream import ChatStream
 
 from .ai_player import AIPlayerStrategy
 from .boards import board_list_text, get_board
+from .domain import (
+    DomainActionRejected,
+    DomainAuthorizationError,
+    RoomNotFound,
+    WerewolfDomainService,
+)
 from .engine import ActionResult, WerewolfEngine
 from .models import GameState, Phase, Player, Role
 from .narrator import Narrator
@@ -57,6 +63,9 @@ class WerewolfGameService(BaseService):
         self.games: dict[str, GameState] = plugin._werewolf_games
         self.ai: AIPlayerStrategy = plugin._werewolf_ai
         self.narrator: Narrator = plugin._werewolf_narrator
+        self.domain: WerewolfDomainService | None = getattr(
+            plugin, "_werewolf_domain", None
+        )
         self._timers: dict[str, asyncio.Task] = {}
 
     # ------------------------------------------------------------------
@@ -66,6 +75,9 @@ class WerewolfGameService(BaseService):
     async def handle_group_command(self, message: Message, args: list[str]) -> str:
         command = args[0] if args else "状态"
         rest = args[1:]
+        durable = await self._handle_durable_group_command(message, command, rest)
+        if durable is not None:
+            return durable
         platform = str(message.platform or "qq")
         group_id = self._group_id_from_message(message)
         if not group_id:
@@ -272,12 +284,182 @@ class WerewolfGameService(BaseService):
         return self._help_text(game)
 
     # ------------------------------------------------------------------
+    # Durable command bridge
+    # ------------------------------------------------------------------
+
+    async def _handle_durable_group_command(
+        self,
+        message: Message,
+        command: str,
+        rest: list[str],
+    ) -> str | None:
+        """Route ledger-owned rooms through the same domain used by HTTP.
+
+        Legacy in-memory rooms remain untouched and continue through the old
+        command path below. A stable platform message id is the action identity,
+        so redelivery cannot execute a second game mutation.
+        """
+
+        if self.domain is None:
+            return None
+        platform = str(message.platform or "qq")
+        group_id = self._group_id_from_message(message)
+        if not group_id:
+            return None
+        room_id = await self.domain.find_room(platform, group_id)
+        create_commands = {"开局", "创建", "create", "new"}
+        if room_id is None and command not in create_commands:
+            return None
+        action_id = self._durable_action_id(message, command, rest)
+        actor_id = str(message.sender_id)
+        try:
+            if command in create_commands:
+                if room_id is not None:
+                    return "这个群已经有一局狼人杀在进行。"
+                board_name = rest[0] if rest and "=" not in rest[0] else "12人标准屠边局"
+                outcome = await self.domain.create_room(
+                    actor_id=actor_id,
+                    display_name=self._sender_name(message),
+                    platform=platform,
+                    group_id=group_id,
+                    group_name=str(message.extra.get("group_name") or ""),
+                    group_stream_id=message.stream_id,
+                    board_name=board_name,
+                    action_id=action_id,
+                )
+                return outcome["result"]["message"]
+            assert room_id is not None
+            mapped = self._durable_group_action(command, rest)
+            if mapped is None:
+                if command in {"状态", "status", "玩家", "players"}:
+                    view = await self.domain.room_view(room_id, actor_id=actor_id)
+                    return self._format_durable_view(view)
+                if command in {"复盘", "recap", "回顾"}:
+                    view = await self.domain.replay(room_id, actor_id=actor_id)
+                    return f"游戏复盘：{view['replay']['players']}"
+                return None
+            action_type, payload = mapped
+            if action_type == "join":
+                payload["display_name"] = self._sender_name(message)
+            if "target_actor_id" in payload and payload["target_actor_id"] is not None:
+                game, _ = await asyncio.to_thread(self.domain.ledger.load_room, room_id)
+                payload["target_actor_id"] = self.engine.resolve_target(
+                    game, str(payload["target_actor_id"])
+                )
+            outcome = await self.domain.apply_action(
+                room_id=room_id,
+                actor_id=actor_id,
+                action_id=action_id,
+                action_type=action_type,
+                payload=payload,
+            )
+            for text in outcome["result"].get("public_messages", ()):
+                await send_text(text, stream_id=message.stream_id, platform=platform)
+            return str(outcome["result"]["message"])
+        except RoomNotFound:
+            return "这个群还没有狼人杀房间。发送 /狼人杀 开局 创建。"
+        except DomainAuthorizationError:
+            return "你没有权限执行这个狼人杀动作。"
+        except DomainActionRejected as exc:
+            return str(exc)
+        except Exception as exc:
+            logger.warning(f"狼人杀耐久命令失败: {exc}")
+            return "狼人杀动作未完成，请稍后查询房间状态。"
+
+    async def _handle_durable_private_command(
+        self,
+        message: Message,
+        command: str,
+        rest: list[str],
+    ) -> str | None:
+        if self.domain is None:
+            return None
+        room_id = await self.domain.find_room_for_player(str(message.sender_id))
+        if room_id is None:
+            return None
+        actor_id = str(message.sender_id)
+        if command in {"视角", "身份", "状态", "view", "status"}:
+            view = await self.domain.private_view(room_id, actor_id=actor_id)
+            private = view["private"]
+            return f"你的身份：{private['role']}；可用动作：{', '.join(private['available_actions'])}"
+        action = self._command_to_action(command)
+        target = None
+        if rest:
+            game, _ = await asyncio.to_thread(self.domain.ledger.load_room, room_id)
+            target = self.engine.resolve_target(game, rest[0])
+        try:
+            outcome = await self.domain.apply_action(
+                room_id=room_id,
+                actor_id=actor_id,
+                action_id=self._durable_action_id(message, command, rest),
+                action_type=action,
+                payload={"target_actor_id": target} if target is not None else {},
+            )
+            return str(outcome["result"]["message"])
+        except DomainActionRejected as exc:
+            return str(exc)
+
+    @staticmethod
+    def _durable_action_id(message: Message, command: str, rest: list[str]) -> str:
+        if message.message_id:
+            return f"chat:{message.platform}:{message.message_id}"
+        import hashlib
+
+        raw = f"{message.platform}|{message.stream_id}|{message.sender_id}|{message.time}|{command}|{' '.join(rest)}"
+        return "chat:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _durable_group_action(
+        self, command: str, rest: list[str]
+    ) -> tuple[str, dict[str, Any]] | None:
+        direct = {
+            "加入": "join", "join": "join",
+            "退出": "leave", "离开": "leave", "quit": "leave", "leave": "leave",
+            "开始": "start", "start": "start",
+            "结束": "end", "end": "end", "stop": "end",
+            "下一位": "next_speaker", "next": "next_speaker", "过": "next_speaker",
+            "竞选": "campaign", "参选": "campaign", "campaign": "campaign",
+            "退选": "withdraw", "withdraw": "withdraw",
+            "撕毁": "sheriff_destroy", "撕警徽": "sheriff_destroy", "destroy": "sheriff_destroy",
+            "跳过": "pass", "skip": "pass", "pass": "pass",
+        }
+        if command in direct:
+            payload = {"display_name": "群聊玩家"} if direct[command] == "join" else {}
+            return direct[command], payload
+        target_actions = {
+            "投票": "vote", "票": "vote", "vote": "vote",
+            "选警长": "sheriff_vote", "警长投票": "sheriff_vote", "sheriff_vote": "sheriff_vote",
+            "移交": "sheriff_transfer", "transfer": "sheriff_transfer",
+            "开枪": "hunter_shot", "shoot": "hunter_shot", "shot": "hunter_shot",
+        }
+        if command in target_actions:
+            return target_actions[command], {"target_actor_id": rest[0] if rest else None}
+        text_actions = {
+            "发言": "speech", "说": "speech", "speech": "speech", "speak": "speech",
+            "自爆": "self_destruct", "boom": "self_destruct", "explode": "self_destruct",
+            "遗言": "last_words", "lastwords": "last_words", "last_words": "last_words",
+        }
+        if command in text_actions:
+            return text_actions[command], {"text": " ".join(rest)}
+        return None
+
+    @staticmethod
+    def _format_durable_view(view: dict[str, Any]) -> str:
+        lines = [f"狼人杀状态：{view['phase']}（{view['board_name']}）", "玩家："]
+        for player in view["players"]:
+            state = "存活" if player["alive"] else "出局"
+            lines.append(f"{player['seat']}. {player['display_name']}（{state}）")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
     # Private command handler
     # ------------------------------------------------------------------
 
     async def handle_private_command(self, message: Message, args: list[str]) -> str:
         command = args[0] if args else "视角"
         rest = args[1:]
+        durable = await self._handle_durable_private_command(message, command, rest)
+        if durable is not None:
+            return durable
         game = self._find_game_for_player(str(message.sender_id))
         if not game:
             return "没找到你参与中的狼人杀。"

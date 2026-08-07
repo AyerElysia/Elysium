@@ -361,6 +361,7 @@ MySQL 相比 local 慢的基础成本来自网络/TLS 往返、连接池 checkou
 性能验收应分别记录冷启动总耗时、首轮回复模型调用前耗时和同一滚动链后续回复模型调用前耗时，并同时采集 MySQL `performance_schema`/slow log 的语句次数和等待时间。建议至少使用 20 次冷启动与 100 个真实文本 turn，分别报告 p50/p95；测试期间保持相同 Provider、上下文规模、TLS、网络位置和外部适配器配置。若延迟仍高，先按“模型耗时 / 数据库往返 / 外部平台发送”拆分，禁止通过关闭 TLS、跳过迁移/authority 校验、删除历史或把数据库失败伪装为空结果来换取数字。
 
 这项能力只解决“另一个合法 MySQL 写入者已存在”造成的启动拒绝，不承诺绕过真实运行冲突。例如，多进程不能绑定同一个 HTTP 端口或独占同一外部适配器会话；开发者应为各 worktree 配置不同监听端口和独立外部资源，或关闭本次不需要的组件。数据库认证、TLS、DDL/TRIGGER 权限和 schema 完整性仍是必须满足的启动条件。
+
 项目还提供 `[shared_sync]` 与 `[memory_archive_sync]` 两项同步/归档能力。它们不是存储模式开关，不得用来制造第二个可写权威。正式切换、generation 校验与 authority 激活见 [生命域存储后端运行手册](./life_storage_backend_runbook.md)；设计依据见 [Elysium 生命域可选 MySQL 与本地存储重构方案](../architecture/Elysium生命域可选MySQL与本地存储重构方案.md)。
 
 ### 6.3 启动和回退验收
@@ -426,13 +427,17 @@ app_api_v1_max_websocket_connections = 64
 - 语音 participant 继续使用 Voice Live v1 PCM16 二进制帧，禁止 base64 音频。公共网关强制把 start/resume 绑定到 URL `call_id`，客户端不能切换到另一 episode；observer 只接收该 call 的 JSON 状态／字幕，不转发音频且拒绝写操作；
 - 语音 ticket 绑定 resource、subprotocol、Origin、session、credential 和 scope，单次消费；transcripts 只导出 append-only episode store 中的 final 记录，按 owner 或精确 `voice_call:{call_id}` grant 过滤；旧 `/voice-live` 路由迁移期保留；
 - Voice Live 插件或 Provider 不可用时显式返回 capability unavailable／Provider failure，不自动加载插件、不切换主体模型、不启动或重启 Elysium。当前仅完成离线 API 与网关契约测试，真实 Provider、双向音频、断线重连和客户端 E2E 仍需单独授权验收；
+- P3-10 狼人杀用户端点为 `GET /tabletop/games`、room create/query/join/leave/start/end、授权 events、actor-bound private view、actions、replay 和 `WS /tabletop/rooms/{room_id}/ws`。读取要求 `tabletop:read`，动作要求 `tabletop:play`；服务端始终从认证 session 取得 actor，客户端不能传入 player id 冒充他人；
+- 新桌游场次保存在 `runtime/api/tabletop.sqlite3` 的追加式 ledger 和 revisioned projection 中。每个动作必须携带 `Idempotency-Key`；同一 action id 相同内容只返回原结果，同 id 异内容与 stale revision 返回 409。每次已提交状态还以仅裁判可见的 ledger snapshot event 保存，projection 损坏时可从 ledger 显式重建；数据库必须与其他 API 状态一起备份；
+- 公共、玩家、裁判和复盘视图由 `plugins/werewolf_game/projections.py` 生成；公共视图不含角色、夜间状态或私密事件，玩家视图只包含该 actor 的身份、狼队友、查验和角色资源。实时事件流沿用同一可见性过滤，不能通过序号缺口、raw payload 或错误信息探测他人夜间动作；
+- 新 API 不扫描、迁移或接管启动前已有的 `plugin._werewolf_games` 内存房间。命中 ledger 新房间的群命令与 HTTP 共用同一 domain，平台 message id 作为 action id；旧房间继续由旧生命周期处理到结束。真实前端 WebSocket、跨平台群命令和管理裁判台尚未 E2E 验收；
 - 重启只会重新调度 `accepted`。进程退出前已经进入 `executing` 而无法证明投递结果的命令会转为 `delivery_unknown`，不得由客户端或服务端自动盲重试；应先查询外部系统或领域 receipt，再由具有明确幂等证据的领域流程决定后续动作；
 - 命令技术状态事件与状态迁移在同一 SQLite 事务进入既有 `sync_outbox`，当前保持 `private`、`held`，不复制原始 payload，也不建立第二套远程同步；备份恢复后应检查 accepted 恢复、executing 栅栏和 Outbox 连续性；
 - `/readiness` 只读聚合已经存在的内存状态，不调用插件或 Adapter 主动 health，不建立连接、不建表、不执行修复，也不访问会创建 Life Engine service 的懒加载属性；配置停用的平台显示 `disabled`，而不是失败或从列表消失；
 - `local_ready` 只表示当前已落地的本地关键路径（API 与 Life Event ledger）可用。远程同步不可用或 Adapter 断开会保留在脱敏诊断中并使总体状态为 `degraded`，但不会伪造本地不可用；生产 API mount 存活时 command store 显示 `ready`，未挂载或已关闭时显示 `unavailable`；
 - 受信启动器通过 `AuthStore.create_bootstrap_challenge()` 生成绑定 Origin、安装实例和短 TTL 的一次性 challenge；公共 HTTP 不提供匿名 challenge 生成端点；
 - 备份认证库时必须同时保护签名密钥；恢复后验证旧撤销 session 仍不可用、refresh 不能重放、ticket 只能消费一次。签名密钥遗失时旧 token 不可恢复，必须按凭据失效事故处理，不得临时生成密钥伪装连续会话。
-- API mount 是启动过程中按配置取得的可选资源。关闭流程只关闭已经成功取得的 mount；若初始化在挂载前失败或测试使用部分构造的 `Bot`，缺少该属性必须按“从未取得”幂等跳过，不能阻断 MCP、数据库、向量库和日志等后续资源回收。
+- API mount 是启动过程中按配置取得的可选资源。关闭时先停止 HTTP 接收、关闭 API mount，再卸载其引用的领域插件，避免请求落入已关闭的插件 ledger；只关闭已经成功取得的 mount。若初始化在挂载前失败或测试使用部分构造的 `Bot`，缺少该属性必须按“从未取得”幂等跳过，不能阻断 MCP、数据库、向量库和日志等后续资源回收。
 - 签名值的错误语义区分结构与真实性：非规范 Base64 或无法解析的封装返回 `value_invalid`，结构规范但 HMAC 不匹配返回 `signature_invalid`。篡改测试必须修改签名中完整编码的字符，不能改动无填充 Base64 的尾部保留位后仍固定期待签名错误。
 
 定向验收：
@@ -1434,3 +1439,4 @@ config/
 | 2026-08-04 | 阶段三 P3-07 | 接入 8 个受管媒体端点、`runtime/media/` 持久化、resource grant、完整性校验、既有 `sync_outbox` 和聊天图片/语音 `media_id` resolver；明确尚未做真实客户端/Provider E2E |
 | 2026-08-05 | 阶段三 P3-08 | 接入直播状态、场次与事件历史、5 类耐久命令和统一 stage ticket/WS；保持手工开播、observer 只读、平台断线 degraded，并明确 B站弹幕写能力尚未具备真实凭据与 E2E |
 | 2026-08-05 | 阶段三 P3-09 | 接入语音通话耐久登记、状态/转写查询、4 类耐久命令、资源绑定 ticket 和 participant/observer WS；保留 PCM16 二进制协议与旧路由，明确真实 Provider/双向音频/重连 E2E 暂未验收 |
+| 2026-08-07 | 阶段三 P3-10 | 接入狼人杀四类授权投影、追加式 ledger、revision snapshot/action 幂等、ledger 恢复、用户层 REST/WS，并让新房间群命令与 HTTP 共用 domain；明确旧内存房间不迁移，管理裁判台及真实客户端/跨平台 E2E 暂未验收 |

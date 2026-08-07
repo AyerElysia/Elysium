@@ -639,6 +639,7 @@ class Bot:
                 )
                 from src.app.api.v1.livestream_runtime import MountedLivestreamProvider
                 from src.app.api.v1.mount import mount_api_v1
+                from src.app.api.v1.tabletop_runtime import MountedTabletopProvider
                 from src.app.api.v1.voice_runtime import MountedVoiceCallProvider
 
                 foundation = FoundationProjection(
@@ -663,6 +664,7 @@ class Bot:
                     chat_command_service_factory=create_chat_command_service,
                     livestream_provider=MountedLivestreamProvider(),
                     voice_call_provider=MountedVoiceCallProvider(),
+                    tabletop_provider=MountedTabletopProvider(),
                     task_manager=self.task_manager,
                 )
                 await self.app_api_mount.start()
@@ -1158,11 +1160,11 @@ class Bot:
             ("on_stop", _publish_stop),
             ("stream_loops", _stop_stream_loops),
             ("adapters", _stop_adapters),
+            ("http_server", _stop_http_server),
+            ("app_api_mount", _close_app_api_mount),
             ("plugins", self._unload_all_plugins),
             ("adapters_verify", _verify_adapters_stopped),
             ("scheduler", _stop_scheduler),
-            ("http_server", _stop_http_server),
-            ("app_api_mount", _close_app_api_mount),
             ("mcp", _cleanup_mcp),
             ("watchdog", _stop_watchdog),
             ("tasks", _stop_tasks),
