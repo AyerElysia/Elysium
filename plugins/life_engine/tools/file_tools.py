@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import hashlib
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,8 +36,13 @@ from ..memory.prompting import build_memory_write_warning
 from ..trace.store import LifeTraceStore
 from ._utils import (
     _get_workspace,
-    _resolve_path,
     _pick_latest_target_stream_id,
+    _resolve_path,
+)
+from .bounded_projection import (
+    project_bounded_items,
+    project_bounded_text,
+    sha256_json,
 )
 
 if TYPE_CHECKING:
@@ -777,6 +783,14 @@ class LifeEngineReadFileTool(BaseTool):
         offset: Annotated[int, "从第几行开始读（1-indexed），默认从头开始"] = 1,
         limit: Annotated[int, "最多读取多少行，0 表示全部"] = 0,
         encoding: Annotated[str, "文件编码，默认utf-8"] = "utf-8",
+        continuation: Annotated[
+            str,
+            "Optional continuation returned by the previous read page",
+        ] = "",
+        max_bytes: Annotated[
+            int | None,
+            "Optional result byte budget; the task hard cap still applies",
+        ] = None,
     ) -> tuple[bool, str | dict]:
         """读取文件内容，支持行号和偏移/限制。
 
@@ -795,7 +809,15 @@ class LifeEngineReadFileTool(BaseTool):
             return False, f"路径不是文件: {path}"
 
         try:
-            raw_content = target.read_text(encoding=encoding)
+            stat_before = target.stat()
+            raw_bytes = target.read_bytes()
+            stat_after = target.stat()
+            if (
+                stat_before.st_size != stat_after.st_size
+                or stat_before.st_mtime_ns != stat_after.st_mtime_ns
+            ):
+                return False, "file changed while the read page was prepared"
+            raw_content = raw_bytes.decode(encoding)
             lines = raw_content.splitlines()
             total_lines = len(lines)
 
@@ -813,18 +835,49 @@ class LifeEngineReadFileTool(BaseTool):
                 for i, line in enumerate(selected_lines)
             )
 
-            stat = target.stat()
-            result_data: dict[str, Any] = {
+            stat = stat_after
+            workspace = _get_workspace_read_only(self.plugin)
+            normalized_path = str(target.relative_to(workspace))
+            file_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+            base_payload: dict[str, Any] = {
                 "action": "read_file",
                 "path": path,
-                "content": numbered_content,
+                "normalized_path": normalized_path,
                 "total_lines": total_lines,
                 "showing": f"{start_idx + 1}-{end_idx}",
                 "size_human": _format_size(stat.st_size),
+                "source_file_bytes": stat.st_size,
+                "file_content_sha256": file_sha256,
             }
             if end_idx < total_lines:
-                result_data["truncated"] = True
-                result_data["remaining_lines"] = total_lines - end_idx
+                base_payload["source_selection_truncated"] = True
+                base_payload["remaining_lines"] = total_lines - end_idx
+
+            result_data = project_bounded_text(
+                projection_name="workspace-file-read",
+                task_name=getattr(self, "_runtime_task_name", ""),
+                requested_max_bytes=max_bytes,
+                binding={
+                    "path": normalized_path,
+                    "offset": int(offset),
+                    "limit": int(limit),
+                    "encoding": str(encoding),
+                },
+                frontier={
+                    "path": normalized_path,
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "content_sha256": file_sha256,
+                },
+                base_payload=base_payload,
+                content=numbered_content,
+                content_ref=(
+                    f"workspace-file:{normalized_path}:sha256:{file_sha256}"
+                ),
+                continuation=continuation,
+            )
+            if len(str(result_data).encode("utf-8")) > result_data["budget_bytes"]:
+                return False, "read file projection exceeded its byte budget"
 
             return True, result_data
         except UnicodeDecodeError as e:
@@ -1081,6 +1134,14 @@ class LifeEngineListFilesTool(BaseTool):
         path: Annotated[str, "相对于工作空间的目录路径，空字符串表示根目录"] = "",
         recursive: Annotated[bool, "是否递归列出子目录"] = False,
         max_depth: Annotated[int, "递归最大深度（仅recursive=True时有效）"] = 3,
+        continuation: Annotated[
+            str,
+            "Optional continuation returned by the previous directory page",
+        ] = "",
+        max_bytes: Annotated[
+            int | None,
+            "Optional result byte budget; the task hard cap still applies",
+        ] = None,
     ) -> tuple[bool, str | dict]:
         """列出目录内容。
 
@@ -1105,9 +1166,12 @@ class LifeEngineListFilesTool(BaseTool):
 
         workspace = _get_workspace(self.plugin)
 
+        directory_frontier: list[dict[str, Any]] = []
+
         def list_dir(dir_path: Path, current_depth: int) -> list[dict]:
             items = []
             try:
+                dir_stat_before = dir_path.stat()
                 for entry in sorted(dir_path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
                     rel_path = str(entry.relative_to(workspace))
                     stat = entry.stat()
@@ -1125,22 +1189,83 @@ class LifeEngineListFilesTool(BaseTool):
                         item["children"] = list_dir(entry, current_depth + 1)
 
                     items.append(item)
+                dir_stat_after = dir_path.stat()
+                if (
+                    dir_stat_before.st_mtime_ns != dir_stat_after.st_mtime_ns
+                    or dir_stat_before.st_size != dir_stat_after.st_size
+                ):
+                    raise RuntimeError(
+                        "directory changed while the list page was prepared"
+                    )
+                directory_frontier.append(
+                    {
+                        "path": str(dir_path.relative_to(workspace)),
+                        "mtime_ns": dir_stat_after.st_mtime_ns,
+                        "size": dir_stat_after.st_size,
+                    }
+                )
             except PermissionError:
                 pass
             return items
 
         try:
             items = list_dir(target, 1)
-            return True, {
-                "action": "list_files",
-                "path": path or "(root)",
-                "absolute_path": str(target),
-                "workspace": str(workspace),
-                "recursive": recursive,
-                "max_depth": max_depth if recursive else None,
-                "total_items": len(items),
-                "items": items,
-            }
+
+            def flatten(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                flattened: list[dict[str, Any]] = []
+                for entry in entries:
+                    current = {
+                        key: value
+                        for key, value in entry.items()
+                        if key != "children"
+                    }
+                    flattened.append(current)
+                    children = entry.get("children")
+                    if isinstance(children, list):
+                        flattened.extend(flatten(children))
+                return flattened
+
+            source_items = flatten(items)
+            normalized_root = str(target.relative_to(workspace)) or "."
+            item_refs = []
+            for item in source_items:
+                item_hash = sha256_json(item)
+                item_refs.append(
+                    f"workspace-entry:{item.get('path') or 'unknown'}:sha256:{item_hash}"
+                )
+            result = project_bounded_items(
+                projection_name="workspace-file-list",
+                task_name=getattr(self, "_runtime_task_name", ""),
+                requested_max_bytes=max_bytes,
+                binding={
+                    "root": normalized_root,
+                    "pattern": "",
+                    "recursive": bool(recursive),
+                    "max_depth": int(max_depth),
+                },
+                frontier={
+                    "directories": sorted(
+                        directory_frontier,
+                        key=lambda item: str(item.get("path") or ""),
+                    ),
+                    "items_sha256": sha256_json(source_items),
+                },
+                base_payload={
+                    "action": "list_files",
+                    "path": path or "(root)",
+                    "normalized_root": normalized_root,
+                    "recursive": recursive,
+                    "max_depth": max_depth if recursive else None,
+                    "total_items": len(source_items),
+                },
+                items_key="items",
+                items=source_items,
+                item_refs=item_refs,
+                continuation=continuation,
+            )
+            if len(str(result).encode("utf-8")) > result["budget_bytes"]:
+                return False, "list files projection exceeded its byte budget"
+            return True, result
         except Exception as e:
             logger.error(f"列出目录失败 {path}: {e}", exc_info=True)
             return False, f"列出目录失败: {e}"
