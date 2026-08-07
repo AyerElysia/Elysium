@@ -114,10 +114,16 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
                 # 正常退出时提交事务
                 if session.is_active:
                     await session.commit()
-            except Exception as e:
+            except BaseException as e:
                 # 发生异常时回滚
                 if session.is_active:
-                    await session.rollback()
+                    try:
+                        await session.rollback()
+                    except BaseException as rollback_error:  # noqa: BLE001
+                        e.add_note(
+                            "database rollback also failed: "
+                            f"{type(rollback_error).__name__}"
+                        )
                 
                 # 转换 SQLAlchemy 异常为内部异常
                 if isinstance(e, SQLAlchemyError):

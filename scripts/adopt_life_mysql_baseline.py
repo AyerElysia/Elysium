@@ -58,7 +58,13 @@ from plugins.life_engine.storage.models import (
 )
 from plugins.life_engine.storage.runtime_schema import (
     MYSQL_RUNTIME_EVENT_TRIGGERS,
+    MYSQL_RUNTIME_STATE_CLAIM_GUARD_MIGRATION,
+    MYSQL_RUNTIME_STATE_CLAIM_GUARD_TRIGGERS,
     MYSQL_RUNTIME_STATE_MIGRATION,
+)
+from plugins.life_engine.storage.writer_claims import (
+    MYSQL_SINGLETON_WRITER_EVENT_TRIGGERS,
+    MYSQL_SINGLETON_WRITER_MIGRATION,
 )
 from plugins.life_engine.storage.subject_schema import (
     _MYSQL_SUBJECT_IMMUTABILITY,
@@ -97,7 +103,13 @@ DOMAIN_TABLES = {
     "life_learning": ("learning_events", "learning_projections"),
 }
 
-RUNTIME_STATE_TABLES = ("runtime_states", "runtime_events")
+RUNTIME_STATE_TABLES = (
+    "runtime_states",
+    "runtime_events",
+    "runtime_singleton_writer_claims",
+    "runtime_singleton_writer_events",
+    "runtime_singleton_writer_bindings",
+)
 ATTENTION_TABLES = (
     "attention_thread_events",
     "attention_thread_heads",
@@ -502,13 +514,32 @@ async def _audit_runtime_state_tables(
 async def _install_runtime_state_schema(engine: AsyncEngine) -> None:
     """Apply only the additive runtime-state schema without changing authority."""
 
+    claim_runner = MySQLMigrationRunner(
+        engine,
+        table_name="life_singleton_writer_schema_migrations",
+        lock_name="elysium:life-singleton-writer-schema",
+    )
+    await claim_runner.apply((MYSQL_SINGLETON_WRITER_MIGRATION,))
+    await verify_mysql_trigger_contract(
+        engine,
+        MYSQL_SINGLETON_WRITER_EVENT_TRIGGERS,
+    )
     runner = MySQLMigrationRunner(
         engine,
         table_name="life_runtime_state_schema_migrations",
         lock_name="elysium:life-runtime-state-schema",
     )
-    await runner.apply((MYSQL_RUNTIME_STATE_MIGRATION,))
-    await verify_mysql_trigger_contract(engine, MYSQL_RUNTIME_EVENT_TRIGGERS)
+    await runner.apply(
+        (
+            MYSQL_RUNTIME_STATE_MIGRATION,
+            MYSQL_RUNTIME_STATE_CLAIM_GUARD_MIGRATION,
+        )
+    )
+    await verify_mysql_trigger_contract(
+        engine,
+        MYSQL_RUNTIME_EVENT_TRIGGERS
+        + MYSQL_RUNTIME_STATE_CLAIM_GUARD_TRIGGERS,
+    )
 
 
 async def _audit_attention_tables(engine: AsyncEngine) -> dict[str, Any]:

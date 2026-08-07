@@ -615,6 +615,7 @@ class StatePersistence:
         history_limit_func: Any,
         lock: asyncio.Lock | None = None,
         runtime_store: Any | None = None,
+        runtime_writer_claim: Any | None = None,
         on_persisted: Callable[[], None] | None = None,
     ) -> None:
         """初始化状态持久化管理器。
@@ -628,6 +629,7 @@ class StatePersistence:
         self._history_limit_func = history_limit_func
         self._lock = lock
         self._runtime_store = runtime_store
+        self._runtime_writer_claim = runtime_writer_claim
         self._on_persisted = on_persisted
         self._runtime_state_revision = 0
         self._commit_lock: asyncio.Lock | None = None
@@ -719,6 +721,7 @@ class StatePersistence:
                             expected_revision=self._runtime_state_revision,
                             schema_version=2,
                             payload=payload,
+                            writer_claim=self._runtime_writer_claim,
                         )
                         self._runtime_state_revision = int(record.revision)
                         if self._on_persisted is not None:

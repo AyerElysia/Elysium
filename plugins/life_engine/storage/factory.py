@@ -60,6 +60,7 @@ class MySQLBackendSettings:
     pool_timeout_seconds: int = 10
     query_timeout_seconds: int = 10
     lock_wait_timeout_seconds: int = 5
+    idle_session_timeout_seconds: int = 180
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +148,7 @@ def settings_from_life_engine_config(
             pool_timeout_seconds=int(database.mysql_pool_timeout_seconds),
             query_timeout_seconds=int(database.mysql_query_timeout_seconds),
             lock_wait_timeout_seconds=int(database.mysql_lock_wait_timeout_seconds),
+            idle_session_timeout_seconds=180,
         ),
     )
 
@@ -262,6 +264,7 @@ async def open_storage_backend(
             pool_timeout_seconds=settings.mysql.pool_timeout_seconds,
             application_query_timeout_seconds=settings.mysql.query_timeout_seconds,
             innodb_lock_wait_timeout_seconds=settings.mysql.lock_wait_timeout_seconds,
+            idle_session_timeout_seconds=settings.mysql.idle_session_timeout_seconds,
         )
         engine = create_mysql_storage_engine(mysql_config)
         backend_identity = mysql_config.safe_identity
@@ -338,6 +341,9 @@ async def open_storage_backend(
             session_factory=session_factory,
             shared_writers=shared_writers,
         )
+        from .writer_claims import SQLSingletonWriterClaimStore
+
+        runtime._singleton_writer_claims = SQLSingletonWriterClaimStore(runtime)
         if shared_writers:
 
             async def _validate_shared_before_commit(session: Any) -> None:

@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+from .writer_claims import SingletonWriterClaim
+
 
 class RuntimeStateConflict(RuntimeError):
     """Raised when a state CAS revision cannot be proven."""
@@ -64,8 +66,9 @@ class RuntimeStateStorePort(Protocol):
         expected_revision: int,
         schema_version: int,
         payload: dict[str, Any],
+        writer_claim: SingletonWriterClaim | None = None,
     ) -> RuntimeStateRecord:
-        """Create or replace one state through exact revision CAS."""
+        """Create or replace one state through exact revision CAS and claim."""
 
     async def append_event(
         self,

@@ -26,6 +26,10 @@ from plugins.life_engine.storage.runtime_contracts import (
     RuntimeStateStorePort,
 )
 from plugins.life_engine.storage.runtime_factory import open_runtime_state_store
+from plugins.life_engine.storage.writer_claims import (
+    SingletonWriterClaimConflict,
+    SingletonWriterClaimLost,
+)
 
 
 def _generation() -> BackendGeneration:
@@ -156,3 +160,106 @@ async def test_runtime_store_fails_after_owned_runtime_closes(tmp_path: Path) ->
         await runtime.close()
         with pytest.raises(StorageRuntimeClosed):
             await store.get_state("life_chatter", "chat_global")
+
+
+@pytest.mark.asyncio
+async def test_singleton_claim_fences_runtime_state_and_identifies_owner(
+    tmp_path: Path,
+) -> None:
+    async with _local_store(tmp_path) as (runtime, store):
+        claim = await runtime.acquire_singleton_writer(
+            namespace="life_engine.runtime_context",
+            state_key="global",
+            owner_instance_id="host-a:pid-100:boot-a",
+            lease_seconds=30,
+        )
+        assert claim.owner_instance_id == "host-a:pid-100:boot-a"
+        assert claim.lease_epoch == 1
+        assert "fencing_token" not in repr(claim)
+
+        first = await store.put_state(
+            namespace=claim.namespace,
+            state_key=claim.state_key,
+            expected_revision=0,
+            schema_version=2,
+            payload={"heartbeat_count": 1},
+            writer_claim=claim,
+        )
+        assert first.revision == 1
+
+        with pytest.raises(SingletonWriterClaimLost, match="ClaimRequired"):
+            await store.put_state(
+                namespace=claim.namespace,
+                state_key=claim.state_key,
+                expected_revision=1,
+                schema_version=2,
+                payload={"heartbeat_count": 2},
+            )
+
+        with pytest.raises(
+            SingletonWriterClaimConflict,
+            match="owner=host-a:pid-100:boot-a:epoch=1",
+        ):
+            await runtime._singleton_writer_claims.acquire(
+                namespace=claim.namespace,
+                state_key=claim.state_key,
+                owner_instance_id="host-b:pid-200:boot-b",
+                lease_seconds=30,
+            )
+
+        assert await runtime.release_singleton_writer(claim) is True
+        with pytest.raises(SingletonWriterClaimLost, match="ClaimLost"):
+            await store.put_state(
+                namespace=claim.namespace,
+                state_key=claim.state_key,
+                expected_revision=1,
+                schema_version=2,
+                payload={"heartbeat_count": 2},
+                writer_claim=claim,
+            )
+
+        takeover = await runtime.acquire_singleton_writer(
+            namespace=claim.namespace,
+            state_key=claim.state_key,
+            owner_instance_id="host-b:pid-200:boot-b",
+            lease_seconds=30,
+        )
+        assert takeover.lease_epoch == 2
+        second = await store.put_state(
+            namespace=takeover.namespace,
+            state_key=takeover.state_key,
+            expected_revision=1,
+            schema_version=2,
+            payload={"heartbeat_count": 2},
+            writer_claim=takeover,
+        )
+        assert second.revision == 2
+
+
+@pytest.mark.asyncio
+async def test_runtime_authority_renewal_renews_managed_singleton_claim(
+    tmp_path: Path,
+) -> None:
+    async with _local_store(tmp_path) as (runtime, store):
+        claim = await runtime.acquire_singleton_writer(
+            namespace="life_engine.runtime_context",
+            state_key="global",
+            owner_instance_id="host-a:pid-100:boot-a",
+            lease_seconds=30,
+        )
+        await runtime.renew_authority(lease_seconds=300)
+
+        # The consumer can keep its opaque original token snapshot; renewal
+        # changes only the database-time lease_until value, not its identity.
+        record = await store.put_state(
+            namespace=claim.namespace,
+            state_key=claim.state_key,
+            expected_revision=0,
+            schema_version=2,
+            payload={"heartbeat_count": 1},
+            writer_claim=claim,
+        )
+        assert record.revision == 1
+        health = await runtime._singleton_writer_claims.health_snapshot()
+        assert health["known_claim_count"] == 1
+        assert health["live_claim_count"] == 1

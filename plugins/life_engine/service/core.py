@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import time
 import traceback
 from collections.abc import Mapping
@@ -428,6 +429,11 @@ class LifeEngineService(BaseService):
         self._attention_thread_service: Any | None = None
         self._subject_document_store: Any | None = None
         self._runtime_state_store: Any | None = None
+        self._runtime_context_writer_claim: Any | None = None
+        self._storage_writer_instance_id = (
+            f"{self._storage_factory_settings.authority_owner_id}:"
+            f"pid-{os.getpid()}:{uuid4().hex[:16]}"
+        )
         self._subject_workspace_observer: Any | None = None
         self._subject_workspace_projector: Any | None = None
         self._storage_health_cache: dict[str, Any] = {
@@ -863,6 +869,12 @@ class LifeEngineService(BaseService):
             runtime,
             initialize_schema=False,
         )
+        runtime_context_writer_claim = await runtime.acquire_singleton_writer(
+            namespace="life_engine.runtime_context",
+            state_key="global",
+            owner_instance_id=self._storage_writer_instance_id,
+            lease_seconds=self._storage_factory_settings.authority_lease_seconds,
+        )
         attention_stores = await open_attention_thread_stores(
             runtime,
             initialize_schema=False,
@@ -898,6 +910,7 @@ class LifeEngineService(BaseService):
         self._presence_world_stores = stores
         self._subject_document_store = subject_store
         self._runtime_state_store = runtime_state_store
+        self._runtime_context_writer_claim = runtime_context_writer_claim
         # MySQL is the only runtime data source: subject heads remain remote and
         # no filesystem observer/projector is attached.
         self._subject_workspace_observer = None
@@ -1043,6 +1056,7 @@ class LifeEngineService(BaseService):
         self._subject_workspace_projector = None
         self._subject_document_store = None
         self._runtime_state_store = None
+        self._runtime_context_writer_claim = None
         self._learning_stores = None
         self._attention_thread_service = None
         if runtime is not None:
@@ -7209,6 +7223,7 @@ class LifeEngineService(BaseService):
                 self._history_limit,
                 self._lock,
                 runtime_store=self.runtime_state_store(),
+                runtime_writer_claim=self._runtime_context_writer_claim,
                 on_persisted=self._mark_runtime_context_persisted,
             )
         try:
@@ -7239,6 +7254,7 @@ class LifeEngineService(BaseService):
                 self._history_limit,
                 self._lock,
                 runtime_store=self.runtime_state_store(),
+                runtime_writer_claim=self._runtime_context_writer_claim,
                 on_persisted=self._mark_runtime_context_persisted,
             )
         pending, history, persisted = await self._state_persistence.load_runtime_context(

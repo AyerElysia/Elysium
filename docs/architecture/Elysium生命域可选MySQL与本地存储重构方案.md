@@ -1,6 +1,6 @@
 # Elysium 生命域可选 MySQL / 本地存储重构方案
 
-> 状态：阶段 0—8 的存储基座、各生命域 Port、local/MySQL 双适配、同一 service-owned runtime 现役接线、复制/校验/反向导出工具、汇总审计工具和数据库不可变门均已落地。全局后端由 `config/core.toml [storage].backend` 唯一选择；MySQL runtime 已支持同一 verified generation 内多个合法进程共享写入。历史远程 shadow 来自 `writer_frozen=false` 在线快照，只证明无损复制/恢复，不能作为新的生产 generation 激活证据。任何新部署或重新切换仍需使用独立目标库、触发器创建能力、冻结快照、五域同源复制、verified generation 和用户手工启动后的全链路验收。
+> 状态：阶段 0—8 的存储基座、各生命域 Port、local/MySQL 双适配、同一 service-owned runtime 现役接线、复制/校验/反向导出工具、汇总审计工具和数据库不可变门均已落地。全局后端由 `config/core.toml [storage].backend` 唯一选择；MySQL runtime 已支持同一 verified generation 内多个合法进程共享写入。对 `runtime_context/global` 这类不能由多个进程共同拥有的单例状态，现已增加 generation-scoped、数据库时间驱动的 writer claim；每次写事务同时复核 generation fencing 与 claim epoch/token，失租后失败关闭，不做自动 rebase 或最后写入覆盖。历史远程 shadow 来自 `writer_frozen=false` 在线快照，只证明无损复制/恢复，不能作为新的生产 generation 激活证据。任何新部署或重新切换仍需使用独立目标库、触发器创建能力、冻结快照、五域同源复制、verified generation 和用户手工启动后的全链路验收。
 >
 > 目标：在不改变爱莉主体语义、不丢失不可变历史、不把 Chroma 误作权威存储的前提下，为 Elysium 建立行为等价的本地与 MySQL 两套耐久存储后端。迁移采用“复制、校验、可选切换”，绝不移动、删除或改写原 SQLite、Markdown、JSON、JSONL 与媒体数据文件。
 
@@ -17,14 +17,14 @@
 >
 > 适用基线：以项目实施时实际受支持的 Python、SQLAlchemy、asyncmy、MySQL 与 Chroma 版本为准；运行时版本升级或降级不属于本存储重构范围。
 
-阶段 0/1 的实现与真实数据证据见 [生命域可选存储阶段 0/1 交付报告](../report/life-storage-phase0-phase1-2026-08-04.md)，Memory 阶段 2 见 [生命域可选存储阶段 2 / Memory 交付报告](../report/life-storage-phase2-memory-2026-08-04.md)，真实 Memory 往返迁移见 [生命域可选存储阶段 2B / Memory 迁移报告](../report/life-storage-phase2b-memory-migration-2026-08-04.md)，Presence/World 迁移和 Subject 现役接线见 [生命域可选存储阶段 2C 交付报告](../report/life-storage-phase2c-presence-world-subject-integration-2026-08-04.md)，Life Event 阶段 3 见 [Life Event Ledger 交付报告](../report/life-storage-phase3-life-event-2026-08-04.md)，历史切换阻断见 [切换就绪度报告（2026-08-05）](../report/life-storage-cutover-readiness-2026-08-05.md)，现役配置、共享写入和验收边界见 [部署与使用手册](../operations/deployment_and_usage.md) 与 [生命域存储快照、共享写入与权威切换运行手册](../operations/life_storage_backend_runbook.md)。不得依据旧报告中的 `storage.enabled` 或 shadow 状态推导现役配置；当前只认全局 `[storage].backend` 和已验证 generation。
+阶段 0/1 的实现与真实数据证据见 [生命域可选存储阶段 0/1 交付报告](../report/life-storage-phase0-phase1-2026-08-04.md)，Memory 阶段 2 见 [生命域可选存储阶段 2 / Memory 交付报告](../report/life-storage-phase2-memory-2026-08-04.md)，真实 Memory 往返迁移见 [生命域可选存储阶段 2B / Memory 迁移报告](../report/life-storage-phase2b-memory-migration-2026-08-04.md)，Presence/World 迁移和 Subject 现役接线见 [生命域可选存储阶段 2C 交付报告](../report/life-storage-phase2c-presence-world-subject-integration-2026-08-04.md)，Life Event 阶段 3 见 [Life Event Ledger 交付报告](../report/life-storage-phase3-life-event-2026-08-04.md)，历史切换阻断见 [切换就绪度报告（2026-08-05）](../report/life-storage-cutover-readiness-2026-08-05.md)，单例运行态多 writer 事故与修复证据见 [MySQL 单例运行态 writer fencing 报告（2026-08-07）](../report/mysql-runtime-singleton-writer-p0-2026-08-07.md)，现役配置、共享写入和验收边界见 [部署与使用手册](../operations/deployment_and_usage.md) 与 [生命域存储快照、共享写入与权威切换运行手册](../operations/life_storage_backend_runbook.md)。不得依据旧报告中的 `storage.enabled` 或 shadow 状态推导现役配置；当前只认全局 `[storage].backend` 和已验证 generation。
 
 ## 1. 决策摘要
 
 本方案采用以下最终架构：
 
 1. **运行后端可配置选择**：全局 `[storage].backend = "local" | "mysql"`。`local` 保留当前 SQLite/文件运行方案；`mysql` 让 Core、Life Event、Life Memory、认识论账本、主体文档版本、Presence、World Projection、游标、Outbox 和审计通过统一存储接口读写 MySQL。
-2. **任一 authority epoch 只有一个可写权威 generation**：可选择后端不等于双主。切换时由受协调的 authority registry 推进单调 epoch；所有耐久写入必须在事务中校验当前 backend、generation 与 epoch。旧 generation、旧 epoch、离线节点和陈旧配置一律拒绝写入。另一后端只能作为迁移目标、校验副本、备份或只读数据源，禁止两个后端同时接受独立业务写入后再按“最后写入”合并。**单一权威不等于单进程 writer**：同一 verified MySQL generation/epoch 可以由多个合法进程并发写入，领域冲突由事务锁、唯一身份、幂等键、revision CAS 与 outbox 合同裁决。
+2. **任一 authority epoch 只有一个可写权威 generation**：可选择后端不等于双主。切换时由受协调的 authority registry 推进单调 epoch；所有耐久写入必须在事务中校验当前 backend、generation 与 epoch。旧 generation、旧 epoch、离线节点和陈旧配置一律拒绝写入。另一后端只能作为迁移目标、校验副本、备份或只读数据源，禁止两个后端同时接受独立业务写入后再按“最后写入”合并。**单一权威不等于单进程 writer**：同一 verified MySQL generation/epoch 可以由多个合法进程并发写入，领域冲突由事务锁、唯一身份、幂等键、revision CAS 与 outbox 合同裁决；但领域合同声明为单例的 `namespace/state_key` 必须额外取得数据库时间 writer claim，不能仅凭 shared generation token 并发覆盖。
 3. **迁移永远是复制，不是移动**：迁移器从一致性快照读取原 SQLite 和文件，将完整数据复制到 MySQL，逐记录校验 identity、payload hash、版本谱系和 frontier；原数据文件永久保留，迁移器没有删除、移动、截断或覆盖源文件的权限。
 4. **本地方案是完整的一等后端**：重构后仍可在配置中选择原本地存储路径，不把 SQLite 实现降为只读 legacy reader；本地与 MySQL 必须通过同一组 Storage Port 行为合同测试。
 5. **Chroma 始终是可重建向量投影**：向量、集合 marker 和同步状态从当前 active backend 的权威历史重建，不能反向修改记忆内容或事实状态。
@@ -562,6 +562,9 @@ backend = "local"
 - 每个耐久写事务在同一事务中锁定并复核 registry 的 backend、generation 与 epoch。切换/封存推进 epoch 后，旧进程无条件拒绝写入；
 - 允许同一 generation 的多个合法 MySQL writer 启动；不得因为 registry 已存在 writer 或入口 lock 文件存在而拒绝 MySQL 模式。`local` 模式仍保持单进程锁；
 - developer/worktree 的 `authority_owner_id` 必须唯一，健康和审计保留该调用者身份，但不把 owner 当成 generation 独占租约；
+- 对 `runtime_context/global` 等单例可覆盖状态，进程必须在读取初值前按 `generation + namespace + state_key` 原子取得 writer claim。claim 记录 owner instance、单调 lease epoch、不可伪造 token 与数据库时间 lease；第二 owner 在有效租约内失败关闭，过期 takeover 产生新 epoch，旧 owner 的后续写入在同一事务内被拒绝；
+- claim 只限制该单例 key，不阻止不同领域、不同 namespace/key 的合法 writer 并发。运行时不得在冲突后自动 reload/rebase 陈旧内存状态，也不得用重试把主体决策改写为“最后写入者胜出”；
+- MySQL 对已登记 claim 的 `runtime_states` 行安装数据库 trigger 防旁路。应用事务还必须绑定当前连接与 exact claim token，并在提交前同时复核 generation 与 claim；释放后保留登记行，使旧版、无 claim 的 writer 永久无法重新写入该 key；
 - 切换到另一 backend/generation 前确认旧 generation 已停写或已被新 epoch 的事务 fence 隔离；无法证明时不激活新 generation；
 - 检测 active backend 是否落后于另一后端已知 frontier；落后时拒绝可写启动，而不是静默丢弃更新；
 - 区分 `disabled`、`degraded`、`failed`；

@@ -48,6 +48,12 @@ from .subject_contracts import (
 )
 from .subject_factory import open_subject_document_store
 from .subject_workspace import SubjectWorkspaceObserver, SubjectWorkspaceProjector
+from .writer_claims import (
+    SingletonWriterClaim,
+    SingletonWriterClaimConflict,
+    SingletonWriterClaimLost,
+    SingletonWriterClaimPort,
+)
 
 __all__ = [
     "SUBJECT_AUTHORITY_PATHS",
@@ -73,6 +79,10 @@ __all__ = [
     "StorageBackendRuntime",
     "StorageFactorySettings",
     "StorageWriterRole",
+    "SingletonWriterClaim",
+    "SingletonWriterClaimConflict",
+    "SingletonWriterClaimLost",
+    "SingletonWriterClaimPort",
     "SubjectAuthorityActorInactive",
     "SubjectAuthorityCommit",
     "SubjectAuthorityConflict",

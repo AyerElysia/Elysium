@@ -4,6 +4,8 @@ DB 模块简化测试
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from sqlalchemy import Boolean, Integer, String, Text
 from sqlalchemy.orm import Mapped, declarative_base, mapped_column
@@ -79,6 +81,61 @@ async def test_crud_create():
     finally:
         async with engine.begin() as conn:
             await conn.run_sync(lambda sync_conn: TestBase.metadata.drop_all(sync_conn))
+
+
+async def test_session_cancellation_rolls_back_before_pool_return():
+    """Task cancellation must never leave an idle transaction holding locks."""
+
+    from sqlalchemy import text
+
+    from src.kernel.db.core.session import get_db_session
+
+    engine = await get_engine()
+    async with engine.begin() as connection:
+        await connection.execute(
+            text("CREATE TABLE IF NOT EXISTS cancellation_rows (id INTEGER PRIMARY KEY)")
+        )
+        await connection.execute(text("DELETE FROM cancellation_rows"))
+
+    started = asyncio.Event()
+    never = asyncio.Event()
+
+    async def _cancelled_transaction() -> None:
+        async with get_db_session() as session:
+            await session.execute(text("INSERT INTO cancellation_rows (id) VALUES (1)"))
+            started.set()
+            await never.wait()
+
+    task = asyncio.create_task(_cancelled_transaction())
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    async with engine.connect() as connection:
+        count = int(
+            await connection.scalar(text("SELECT COUNT(*) FROM cancellation_rows"))
+            or 0
+        )
+    assert count == 0
+
+
+def test_mysql_engine_has_bounded_idle_transactions_and_pool_rollback():
+    from src.kernel.db.core.engine import (
+        _MYSQL_SESSION_STATEMENTS,
+        _build_mysql_config,
+    )
+
+    _, engine_kwargs = _build_mysql_config(
+        host="db.example",
+        port=3306,
+        user="elysium",
+        password="secret",
+        database="elysium",
+    )
+
+    assert "SET SESSION wait_timeout = 180" in _MYSQL_SESSION_STATEMENTS
+    assert engine_kwargs["pool_reset_on_return"] == "rollback"
 
 
 async def test_query_filter():

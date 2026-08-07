@@ -31,7 +31,13 @@ def test_remote_baseline_table_contract_is_explicit_and_unique() -> None:
     assert len(tables) == len(set(tables))
     assert "subject_document_versions" in tables
     assert "storage_backend_generations" not in tables
-    assert RUNTIME_STATE_TABLES == ("runtime_states", "runtime_events")
+    assert RUNTIME_STATE_TABLES == (
+        "runtime_states",
+        "runtime_events",
+        "runtime_singleton_writer_claims",
+        "runtime_singleton_writer_events",
+        "runtime_singleton_writer_bindings",
+    )
     assert ATTENTION_TABLES == (
         "attention_thread_events",
         "attention_thread_heads",

@@ -13,6 +13,7 @@ from src.kernel.storage.migration_runner import (
 
 from .contracts import StorageBackendRuntime
 from .models import BackendKind
+from .writer_claims import ensure_singleton_writer_claim_schema
 
 RUNTIME_STATE_SCHEMA_VERSION = 1
 
@@ -86,6 +87,100 @@ MYSQL_RUNTIME_STATE_MIGRATION = SchemaMigration(
     ),
 )
 
+_MYSQL_RUNTIME_STATE_CLAIM_GUARD_INSERT = """CREATE TRIGGER IF NOT EXISTS
+    runtime_states_singleton_claim_insert_v2
+    BEFORE INSERT ON runtime_states FOR EACH ROW
+    BEGIN
+        IF EXISTS (
+            SELECT 1 FROM runtime_singleton_writer_claims c
+            WHERE c.namespace = NEW.namespace AND c.state_key = NEW.state_key
+        ) AND NOT EXISTS (
+            SELECT 1
+            FROM runtime_singleton_writer_claims c
+            INNER JOIN runtime_singleton_writer_bindings b
+                ON b.generation_id = c.generation_id
+                AND b.namespace = c.namespace
+                AND b.state_key = c.state_key
+                AND b.owner_instance_id = c.owner_instance_id
+                AND b.lease_epoch = c.lease_epoch
+                AND b.fencing_token_sha256 = c.fencing_token_sha256
+            WHERE b.connection_id = CONNECTION_ID()
+                AND c.namespace = NEW.namespace
+                AND c.state_key = NEW.state_key
+                AND c.released_at IS NULL
+                AND c.lease_until > CURRENT_TIMESTAMP(6)
+        ) THEN
+            SIGNAL SQLSTATE '45000'
+                SET MESSAGE_TEXT = 'RuntimeStateSingletonWriterClaimRequired';
+        END IF;
+    END"""
+
+_MYSQL_RUNTIME_STATE_CLAIM_GUARD_UPDATE = """CREATE TRIGGER IF NOT EXISTS
+    runtime_states_singleton_claim_update_v2
+    BEFORE UPDATE ON runtime_states FOR EACH ROW
+    BEGIN
+        IF EXISTS (
+            SELECT 1 FROM runtime_singleton_writer_claims c
+            WHERE c.namespace = OLD.namespace AND c.state_key = OLD.state_key
+        ) AND NOT EXISTS (
+            SELECT 1
+            FROM runtime_singleton_writer_claims c
+            INNER JOIN runtime_singleton_writer_bindings b
+                ON b.generation_id = c.generation_id
+                AND b.namespace = c.namespace
+                AND b.state_key = c.state_key
+                AND b.owner_instance_id = c.owner_instance_id
+                AND b.lease_epoch = c.lease_epoch
+                AND b.fencing_token_sha256 = c.fencing_token_sha256
+            WHERE b.connection_id = CONNECTION_ID()
+                AND c.namespace = OLD.namespace
+                AND c.state_key = OLD.state_key
+                AND c.released_at IS NULL
+                AND c.lease_until > CURRENT_TIMESTAMP(6)
+        ) THEN
+            SIGNAL SQLSTATE '45000'
+                SET MESSAGE_TEXT = 'RuntimeStateSingletonWriterClaimRequired';
+        END IF;
+    END"""
+
+_MYSQL_RUNTIME_STATE_CLAIM_GUARD_DELETE = """CREATE TRIGGER IF NOT EXISTS
+    runtime_states_singleton_claim_delete_v2
+    BEFORE DELETE ON runtime_states FOR EACH ROW
+    BEGIN
+        IF EXISTS (
+            SELECT 1 FROM runtime_singleton_writer_claims c
+            WHERE c.namespace = OLD.namespace AND c.state_key = OLD.state_key
+        ) AND NOT EXISTS (
+            SELECT 1
+            FROM runtime_singleton_writer_claims c
+            INNER JOIN runtime_singleton_writer_bindings b
+                ON b.generation_id = c.generation_id
+                AND b.namespace = c.namespace
+                AND b.state_key = c.state_key
+                AND b.owner_instance_id = c.owner_instance_id
+                AND b.lease_epoch = c.lease_epoch
+                AND b.fencing_token_sha256 = c.fencing_token_sha256
+            WHERE b.connection_id = CONNECTION_ID()
+                AND c.namespace = OLD.namespace
+                AND c.state_key = OLD.state_key
+                AND c.released_at IS NULL
+                AND c.lease_until > CURRENT_TIMESTAMP(6)
+        ) THEN
+            SIGNAL SQLSTATE '45000'
+                SET MESSAGE_TEXT = 'RuntimeStateSingletonWriterClaimRequired';
+        END IF;
+    END"""
+
+MYSQL_RUNTIME_STATE_CLAIM_GUARD_MIGRATION = SchemaMigration(
+    version=2,
+    name="life_runtime_state_singleton_claim_guard_v2",
+    statements=(
+        _MYSQL_RUNTIME_STATE_CLAIM_GUARD_INSERT,
+        _MYSQL_RUNTIME_STATE_CLAIM_GUARD_UPDATE,
+        _MYSQL_RUNTIME_STATE_CLAIM_GUARD_DELETE,
+    ),
+)
+
 MYSQL_RUNTIME_EVENT_TRIGGERS = (
     MySQLTriggerContract(
         "runtime_events_immutable_update_v1",
@@ -103,12 +198,37 @@ MYSQL_RUNTIME_EVENT_TRIGGERS = (
     ),
 )
 
+MYSQL_RUNTIME_STATE_CLAIM_GUARD_TRIGGERS = (
+    MySQLTriggerContract(
+        "runtime_states_singleton_claim_insert_v2",
+        "runtime_states",
+        "INSERT",
+        "BEFORE",
+        "RuntimeStateSingletonWriterClaimRequired",
+    ),
+    MySQLTriggerContract(
+        "runtime_states_singleton_claim_update_v2",
+        "runtime_states",
+        "UPDATE",
+        "BEFORE",
+        "RuntimeStateSingletonWriterClaimRequired",
+    ),
+    MySQLTriggerContract(
+        "runtime_states_singleton_claim_delete_v2",
+        "runtime_states",
+        "DELETE",
+        "BEFORE",
+        "RuntimeStateSingletonWriterClaimRequired",
+    ),
+)
+
 
 async def ensure_runtime_state_schema(runtime: StorageBackendRuntime) -> None:
     """Create selected runtime-state tables under the active writer authority."""
 
     if not runtime.enabled or runtime.engine is None:
         raise RuntimeError("runtime state schema requires an enabled storage runtime")
+    await ensure_singleton_writer_claim_schema(runtime)
     await runtime.validate_writer()
     if runtime.backend == BackendKind.MYSQL:
         runner = MySQLMigrationRunner(
@@ -116,10 +236,16 @@ async def ensure_runtime_state_schema(runtime: StorageBackendRuntime) -> None:
             table_name="life_runtime_state_schema_migrations",
             lock_name="elysium:life-runtime-state-schema",
         )
-        await runner.apply((MYSQL_RUNTIME_STATE_MIGRATION,))
+        await runner.apply(
+            (
+                MYSQL_RUNTIME_STATE_MIGRATION,
+                MYSQL_RUNTIME_STATE_CLAIM_GUARD_MIGRATION,
+            )
+        )
         await verify_mysql_trigger_contract(
             runtime.engine,
-            MYSQL_RUNTIME_EVENT_TRIGGERS,
+            MYSQL_RUNTIME_EVENT_TRIGGERS
+            + MYSQL_RUNTIME_STATE_CLAIM_GUARD_TRIGGERS,
         )
     else:
         async with runtime.unit_of_work() as uow:
@@ -131,6 +257,8 @@ async def ensure_runtime_state_schema(runtime: StorageBackendRuntime) -> None:
 __all__ = [
     "LOCAL_RUNTIME_STATE_SCHEMA_STATEMENTS",
     "MYSQL_RUNTIME_EVENT_TRIGGERS",
+    "MYSQL_RUNTIME_STATE_CLAIM_GUARD_MIGRATION",
+    "MYSQL_RUNTIME_STATE_CLAIM_GUARD_TRIGGERS",
     "MYSQL_RUNTIME_STATE_MIGRATION",
     "RUNTIME_STATE_SCHEMA_VERSION",
     "ensure_runtime_state_schema",

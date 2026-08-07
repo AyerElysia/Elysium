@@ -1,9 +1,21 @@
 """测试 Life State 集成到 DFC 的功能。"""
 
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 from plugins.life_engine.service import LifeEngineService, LifeEngineEvent, EventType
+from src.core.config.core_config import CoreConfig
+
+
+def _make_plugin() -> MagicMock:
+    plugin = MagicMock()
+    plugin.config = MagicMock()
+    plugin.config.settings = MagicMock()
+    plugin.config.settings.enabled = True
+    plugin.config.settings.context_history_max_events = 300
+    plugin.global_storage_config = CoreConfig(
+        storage=CoreConfig.StorageSection(backend="local")
+    )
+    return plugin
 
 
 class TestLifeStateIntegration:
@@ -12,11 +24,7 @@ class TestLifeStateIntegration:
     async def test_get_state_digest_for_dfc_empty(self):
         """测试空状态时返回空字符串。"""
         # 创建 mock plugin
-        mock_plugin = MagicMock()
-        mock_plugin.config = MagicMock()
-        mock_plugin.config.settings = MagicMock()
-        mock_plugin.config.settings.enabled = True
-        mock_plugin.config.settings.context_history_max_events = 300
+        mock_plugin = _make_plugin()
 
         service = LifeEngineService(mock_plugin)
         service._event_history = []
@@ -27,11 +35,7 @@ class TestLifeStateIntegration:
 
     async def test_get_state_digest_for_dfc_with_heartbeats(self):
         """测试包含心跳独白的状态摘要。"""
-        mock_plugin = MagicMock()
-        mock_plugin.config = MagicMock()
-        mock_plugin.config.settings = MagicMock()
-        mock_plugin.config.settings.enabled = True
-        mock_plugin.config.settings.context_history_max_events = 300
+        mock_plugin = _make_plugin()
 
         service = LifeEngineService(mock_plugin)
 
@@ -70,11 +74,7 @@ class TestLifeStateIntegration:
 
     async def test_get_state_digest_for_dfc_with_tool_calls(self):
         """测试包含工具调用的状态摘要。"""
-        mock_plugin = MagicMock()
-        mock_plugin.config = MagicMock()
-        mock_plugin.config.settings = MagicMock()
-        mock_plugin.config.settings.enabled = True
-        mock_plugin.config.settings.context_history_max_events = 300
+        mock_plugin = _make_plugin()
 
         service = LifeEngineService(mock_plugin)
 
@@ -123,11 +123,7 @@ class TestLifeStateIntegration:
 
     async def test_get_state_digest_length_control(self):
         """测试状态摘要长度控制在合理范围内。"""
-        mock_plugin = MagicMock()
-        mock_plugin.config = MagicMock()
-        mock_plugin.config.settings = MagicMock()
-        mock_plugin.config.settings.enabled = True
-        mock_plugin.config.settings.context_history_max_events = 300
+        mock_plugin = _make_plugin()
 
         service = LifeEngineService(mock_plugin)
 

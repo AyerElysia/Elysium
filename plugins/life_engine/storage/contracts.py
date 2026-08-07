@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -17,6 +17,9 @@ from src.kernel.storage import (
 
 from .authority import AuthorityRegistry, FileAuthorityRegistry, MySQLAuthorityRegistry
 from .models import AuthorityToken, BackendGeneration, BackendKind
+
+if TYPE_CHECKING:
+    from .writer_claims import SingletonWriterClaim, SingletonWriterClaimPort
 
 
 class StorageRuntimeError(RuntimeError):
@@ -64,6 +67,10 @@ class StorageBackendRuntime:
     writer_role: StorageWriterRole = StorageWriterRole.ACTIVE
     writer_epoch: int = 0
     shared_writers: bool = False
+    _singleton_writer_claims: SingletonWriterClaimPort | None = None
+    _managed_singleton_claims: dict[
+        tuple[str, str], tuple[SingletonWriterClaim, int]
+    ] = field(default_factory=dict, repr=False)
     _closed: bool = False
 
     @classmethod
@@ -79,7 +86,11 @@ class StorageBackendRuntime:
             session_factory=None,
         )
 
-    def unit_of_work(self) -> AsyncUnitOfWork:
+    def unit_of_work(
+        self,
+        *,
+        writer_claim: SingletonWriterClaim | None = None,
+    ) -> AsyncUnitOfWork:
         """Create a fenced UoW; no unfenced write session is exposed."""
 
         if self._closed:
@@ -87,10 +98,27 @@ class StorageBackendRuntime:
         if not self.enabled or self.session_factory is None:
             raise StorageRuntimeDisabled("storage runtime is disabled")
 
+        async def _validate_claim(session: AsyncSession) -> None:
+            if writer_claim is None:
+                return
+            if self._singleton_writer_claims is None:
+                raise StorageRuntimeDisabled(
+                    "storage runtime has no singleton writer claim registry"
+                )
+            await self._singleton_writer_claims.validate_in_transaction(
+                session,
+                writer_claim,
+            )
+
         if self._write_fence is not None:
+
+            async def _validate_shared_and_claim(session: AsyncSession) -> None:
+                await self._write_fence(session)
+                await _validate_claim(session)
+
             return AsyncUnitOfWork(
                 self.session_factory,
-                before_commit=self._write_fence,
+                before_commit=_validate_shared_and_claim,
             )
         if self.authority_registry is None or self.authority_token is None:
             raise StorageRuntimeDisabled("storage runtime has no writer authority")
@@ -100,6 +128,7 @@ class StorageBackendRuntime:
         if isinstance(registry, FileAuthorityRegistry):
             return AsyncUnitOfWork(
                 self.session_factory,
+                before_commit=_validate_claim if writer_claim is not None else None,
                 scope_factory=lambda: registry.fenced(token),
             )
         if isinstance(registry, MySQLAuthorityRegistry):
@@ -107,6 +136,7 @@ class StorageBackendRuntime:
             async def _validate_before_commit(session: AsyncSession) -> None:
                 connection = await session.connection()
                 await registry.validate_in_transaction(connection, token)
+                await _validate_claim(session)
 
             return AsyncUnitOfWork(
                 self.session_factory,
@@ -115,6 +145,109 @@ class StorageBackendRuntime:
         raise StorageRuntimeError(
             f"unsupported authority registry: {type(registry).__name__}"
         )
+
+    async def acquire_singleton_writer(
+        self,
+        *,
+        namespace: str,
+        state_key: str,
+        owner_instance_id: str,
+        lease_seconds: int,
+    ) -> SingletonWriterClaim:
+        """Acquire and manage one generation-scoped singleton writer claim."""
+
+        if self._closed:
+            raise StorageRuntimeClosed("storage runtime is closed")
+        if self._singleton_writer_claims is None:
+            raise StorageRuntimeDisabled(
+                "storage runtime has no singleton writer claim registry"
+            )
+        key = (str(namespace), str(state_key))
+        if key in self._managed_singleton_claims:
+            raise StorageRuntimeError(
+                f"singleton writer is already managed locally: {key[0]}:{key[1]}"
+            )
+        claim = await self._singleton_writer_claims.acquire(
+            namespace=namespace,
+            state_key=state_key,
+            owner_instance_id=owner_instance_id,
+            lease_seconds=lease_seconds,
+        )
+        self._managed_singleton_claims[key] = (claim, int(lease_seconds))
+        return claim
+
+    async def renew_singleton_writer(
+        self,
+        claim: SingletonWriterClaim,
+        *,
+        lease_seconds: int,
+    ) -> SingletonWriterClaim:
+        """Renew an exact managed claim and replace its local lease snapshot."""
+
+        if self._closed:
+            raise StorageRuntimeClosed("storage runtime is closed")
+        if self._singleton_writer_claims is None:
+            raise StorageRuntimeDisabled(
+                "storage runtime has no singleton writer claim registry"
+            )
+        key = (claim.namespace, claim.state_key)
+        managed = self._managed_singleton_claims.get(key)
+        if managed is None or managed[0] != claim:
+            raise StorageRuntimeError(
+                f"singleton writer is not managed locally: {key[0]}:{key[1]}"
+            )
+        renewed = await self._singleton_writer_claims.renew(
+            claim,
+            lease_seconds=lease_seconds,
+        )
+        self._managed_singleton_claims[key] = (renewed, int(lease_seconds))
+        return renewed
+
+    async def release_singleton_writer(
+        self,
+        claim: SingletonWriterClaim,
+    ) -> bool:
+        """Release an exact managed claim without touching another epoch."""
+
+        if self._singleton_writer_claims is None:
+            return False
+        key = (claim.namespace, claim.state_key)
+        managed = self._managed_singleton_claims.get(key)
+        if managed is None or managed[0] != claim:
+            return False
+        released = await self._singleton_writer_claims.release(claim)
+        self._managed_singleton_claims.pop(key, None)
+        return released
+
+    async def _renew_managed_singleton_writers(self) -> None:
+        if self._singleton_writer_claims is None:
+            return
+        for key, (claim, lease_seconds) in tuple(
+            self._managed_singleton_claims.items()
+        ):
+            renewed = await self._singleton_writer_claims.renew(
+                claim,
+                lease_seconds=lease_seconds,
+            )
+            self._managed_singleton_claims[key] = (renewed, lease_seconds)
+
+    async def _release_managed_singleton_writers(self) -> None:
+        if self._singleton_writer_claims is None:
+            self._managed_singleton_claims.clear()
+            return
+        errors: list[BaseException] = []
+        for key, (claim, _) in tuple(self._managed_singleton_claims.items()):
+            try:
+                await self._singleton_writer_claims.release(claim)
+            except BaseException as exc:  # noqa: BLE001 - aggregate exact cleanup
+                errors.append(exc)
+            else:
+                self._managed_singleton_claims.pop(key, None)
+        if errors:
+            raise BaseExceptionGroup(
+                "singleton writer claim release failed",
+                errors,
+            )
 
     async def validate_writer(self) -> None:
         """Validate the exact active or migration writer without guessing mode."""
@@ -139,17 +272,20 @@ class StorageBackendRuntime:
             raise StorageRuntimeDisabled("storage runtime is disabled")
         if self.shared_writers:
             await self.validate_writer()
-            return self.authority_token
-        renewed = await self.authority_registry.renew(
-            self.authority_token,
-            lease_seconds=lease_seconds,
-        )
-        self.authority_token = renewed
+            renewed = self.authority_token
+        else:
+            renewed = await self.authority_registry.renew(
+                self.authority_token,
+                lease_seconds=lease_seconds,
+            )
+            self.authority_token = renewed
+        await self._renew_managed_singleton_writers()
         return renewed
 
     async def revoke_authority(self) -> int | None:
         """Revoke an exclusive token; shared writers only release local ownership."""
 
+        await self._release_managed_singleton_writers()
         if self.authority_registry is None or self.authority_token is None:
             return None
         if self.shared_writers:
@@ -210,6 +346,9 @@ class StorageBackendRuntime:
             "generation_id": self.generation.generation_id if self.generation else "",
             "schema_version": self.generation.schema_version if self.generation else 0,
             "writer_mode": "shared" if self.shared_writers else "exclusive",
+            "managed_singleton_writer_count": len(
+                self._managed_singleton_claims
+            ),
             "backend_health": backend_health,
             "authority_health": authority_health,
         }
@@ -219,9 +358,19 @@ class StorageBackendRuntime:
 
         if self._closed:
             return
+        errors: list[BaseException] = []
+        try:
+            await self._release_managed_singleton_writers()
+        except BaseException as exc:  # noqa: BLE001 - dispose must still run
+            errors.append(exc)
         self._closed = True
         if self.engine is not None:
-            await self.engine.dispose()
+            try:
+                await self.engine.dispose()
+            except BaseException as exc:  # noqa: BLE001 - aggregate cleanup
+                errors.append(exc)
+        if errors:
+            raise BaseExceptionGroup("storage runtime close failed", errors)
 
 
 __all__ = [

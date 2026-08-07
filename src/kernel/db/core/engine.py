@@ -408,6 +408,7 @@ def _build_mysql_config(
         "pool_timeout": connection_timeout,
         "pool_recycle": 900,
         "pool_pre_ping": True,
+        "pool_reset_on_return": "rollback",
         "connect_args": connect_args,
     }
     logger.debug(
@@ -678,6 +679,9 @@ _MYSQL_SESSION_STATEMENTS: tuple[str, ...] = (
     "SET SESSION time_zone = '+00:00'",
     # 锁等待必须有界，失败交给调用方显式重试而不是无限悬挂。
     "SET SESSION innodb_lock_wait_timeout = 10",
+    # FRP/进程异常退出后，服务端必须在有界时间内回滚遗留的 idle transaction。
+    # 正常连接由 pool_pre_ping 自动重建，不能让旧事务无限持有业务行锁。
+    "SET SESSION wait_timeout = 180",
 )
 
 

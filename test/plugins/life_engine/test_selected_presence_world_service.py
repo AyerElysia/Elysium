@@ -128,6 +128,19 @@ class _FakeRuntime:
         self.revoke_calls = 0
         self.invalidated = False
         self.renew_error: Exception | None = None
+        self.claim_calls: list[dict[str, Any]] = []
+
+    async def acquire_singleton_writer(self, **kwargs: Any) -> Any:
+        self.claim_calls.append(dict(kwargs))
+        return SimpleNamespace(
+            generation_id="fake-generation",
+            namespace=kwargs["namespace"],
+            state_key=kwargs["state_key"],
+            owner_instance_id=kwargs["owner_instance_id"],
+            lease_epoch=1,
+            lease_until="2026-08-07T23:59:59+00:00",
+            fencing_token="fake-token",
+        )
 
     async def renew_authority(self, *, lease_seconds: int) -> None:
         self.renew_calls.append(lease_seconds)

@@ -23,6 +23,7 @@ def test_mysql_config_is_secret_free_and_requires_utf8mb4() -> None:
     )
 
     assert config.safe_identity == "mysql://app@db.example:3306/elysium"
+    assert config.idle_session_timeout_seconds == 180
     assert "do-not-log" not in config.safe_identity
     with pytest.raises(ValueError):
         MySQLStorageConfig(
@@ -32,6 +33,15 @@ def test_mysql_config_is_secret_free_and_requires_utf8mb4() -> None:
             user="app",
             password="secret",
             charset="utf8",
+        )
+    with pytest.raises(ValueError, match="idle_session_timeout_seconds"):
+        MySQLStorageConfig(
+            host="db.example",
+            port=3306,
+            database="elysium",
+            user="app",
+            password="secret",
+            idle_session_timeout_seconds=0,
         )
 
 

@@ -1,6 +1,6 @@
 # 生命域存储快照、共享写入与权威切换运行手册
 
-本手册服务于 Elysium 生命域可选本地/MySQL 存储。它不包含真实主机、用户名、密码或 fencing token。Life Event、Memory、Subject Document、Presence、World、Learning 的 Port/adapter、`LifeEngineService` 单 runtime 接线、未冻结候选复制、反向恢复、数据库不可变保护与真实隔离 MySQL 合同均已实现。MySQL runtime 现支持多个合法进程加入同一个 verified generation 并发读写；这里的“单一权威”指单一 active backend/generation/epoch，不再表示只能有一个进程写入。正式冻结复制、五域同快照 generation 签署和用户手动启动后的跨领域验收尚未完成，因此本手册中的正式切换步骤仍是**验收门**，不是当前可以直接执行的上线指令。
+本手册服务于 Elysium 生命域可选本地/MySQL 存储。它不包含真实主机、用户名、密码或 fencing token。Life Event、Memory、Subject Document、Presence、World、Learning 的 Port/adapter、`LifeEngineService` 单 runtime 接线、未冻结候选复制、反向恢复、数据库不可变保护与真实隔离 MySQL 合同均已实现。MySQL runtime 支持多个合法进程加入同一个 verified generation 并发读写；这里的“单一权威”指单一 active backend/generation/epoch，不表示整个 generation 只能有一个进程。与此同时，`runtime_context/global` 等领域单例状态必须取得数据库时间 writer claim，不能由多个 shared writer 同时持有。正式冻结复制、五域同快照 generation 签署和用户手动启动后的跨领域验收仍是**验收门**，不是自动启停指令。
 
 ## 1. 当前安全状态
 
@@ -68,6 +68,9 @@ uv run python scripts/backup_life_data.py \
 - shared token 绑定 `registry_id + backend + generation + epoch`。每个耐久写事务在提交前，仍须于**同一个数据库事务**中锁定 registry 行并复核这四项；generation/epoch 改变后，旧进程立即被 fence；
 - 领域并发冲突继续由 InnoDB 行锁、唯一键、稳定 occurrence/idempotency identity、revision CAS 和事务 outbox 处理。共享 generation 不允许最后写入覆盖、跳过 parent/revision 或吞掉重复身份冲突；
 - shared writer 的周期维护是重新验证 generation/epoch，不延长或夺取一个进程独占租约；任一 shared writer 正常退出只释放自己的连接与本地 token，不撤销全局 generation，也不影响其他进程；
+- shared generation 只解决“哪些进程可以写这个 generation”，不解决“谁拥有某个单例状态”。被领域声明为 singleton 的 `namespace/state_key` 必须额外取得数据库时间 writer claim；claim 包含可审计 owner instance、单调 lease epoch、不可伪造 token 与到期时间；
+- claim 的 acquire/renew/release 与受保护写入都在事务内复核 active generation。第二 owner 在有效租约内失败关闭；租约过期 takeover 递增 epoch，旧 owner 立即被 fence。冲突后禁止自动 reload/rebase、无界重试或最后写入覆盖；
+- MySQL 已登记 claim 的 runtime state 同时受应用层 exact-claim 校验和数据库 trigger 保护。连接池事务必须临时绑定当前连接与 claim token，提交前移除绑定；释放 claim 后保留登记身份，旧版无 claim writer 不能绕过保护；
 - generation 的激活、切换、封存与审计事件继续形成哈希链。审计损坏、generation 未验证、backend/generation/epoch 不匹配时 fail closed；
 - schema migration 仍使用 MySQL advisory lock 串行执行。多个业务进程可并发启动，但不能并发执行互相冲突的 DDL；业务启动也不得把缺表或 checksum 漂移当作成功。
 
@@ -104,7 +107,7 @@ Life Engine 插件文件不再包含 `[storage]` 或 `[storage_mysql]`。它只�
 
 只有 MySQL generation、连接和 authority 控制面验收完成后，才允许把全局 `backend` 改为 `mysql`。日常 local/MySQL 切换只改这一字段：`local` 自动使用 file authority 并忽略保留在配置中的 MySQL generation，`mysql` 自动使用 MySQL authority 并严格校验该 generation。旧 `authority_provider` 字段由配置迁移自动移除，不再允许人工联动。每个 worktree/部署实例仍须提供稳定且唯一的 `authority_owner_id`；不要把真实用户名、机器绝对路径或密钥放进公共配置示例。连接密码仍只能通过配置中的环境变量提供。首个进程负责在尚未激活时创建 generation epoch；后续进程只加入同一 epoch。shared writer 不需要把 epoch、lease 或 fencing token 写入配置或环境变量，也不会通过周期维护夺取其他进程资格。异常和健康输出使用不含密码的 backend identity。
 
-MySQL 模式不使用入口级 `data/runtime/elysium.lock`；不同 worktree 可以同时启动并共享数据库。每个完整 Elysium 进程仍需拥有不冲突的 HTTP 端口、临时目录和不可共享外部适配器会话。已有合法数据库 writer 不得成为启动拒绝理由，但认证失败、TLS/权限错误、schema 漂移、generation 不匹配、端口冲突和外部会话争用仍必须显式失败，不能用静默 local 回退或空实现伪装启动成功。
+MySQL 模式不使用入口级 `data/runtime/elysium.lock`；不同 worktree 可以同时打开同一 generation，并并发处理互不冲突的领域数据。每个完整 Elysium 进程仍需拥有不冲突的 HTTP 端口、临时目录和不可共享外部适配器会话；若它们都要拥有同一个 `runtime_context/global`，只有取得 writer claim 的进程能启动到可写状态，其他进程必须显示 owner/epoch 诊断并失败关闭。认证失败、TLS/权限错误、schema 漂移、generation 不匹配、单例 claim 冲突、端口冲突和外部会话争用都不能用静默 local 回退或空实现伪装成功。
 
 ### 6.1 Memory 隔离合同验证
 
@@ -141,7 +144,20 @@ uv run python scripts/adopt_life_mysql_baseline.py \
   upgrade-runtime-state --config config/core.toml
 ```
 
-该模式只应用 checksum 受控的幂等 migration，创建/核验 `runtime_states`、`runtime_events` 与两条不可变 trigger；不登记或激活 generation，不修改 authority epoch，不导入本地运行数据，也不启动/停止 Elysium。命令重复执行必须返回同一空表/当前内容证据；若 migration checksum 或 trigger 漂移则失败。普通业务启动固定使用 `initialize_schema=false`，不能代替迁移器建表。
+该模式只应用 checksum 受控的幂等 migration，创建/核验 `runtime_states`、`runtime_events`、singleton writer claim 当前态/只追加事件/事务连接绑定表、两条 claim-event 不可变 trigger，以及三条 runtime-state claim guard trigger；不登记或激活 generation，不修改 authority epoch，不导入本地运行数据，也不启动/停止 Elysium。命令重复执行必须返回相同 schema/当前内容证据；若 migration checksum 或 trigger 漂移则失败。普通业务启动固定使用 `initialize_schema=false`，不能代替迁移器建表。
+
+已升级部署的启动顺序必须是：打开唯一 service-owned runtime → 在读取 `runtime_context/global` 前取得 singleton writer claim → 从权威 MySQL 读取当前 revision → 构造 `StatePersistence` 并携带该 claim 写入。这样，重启期间由其他实例推进的最新 revision 会先被读取；本地陈旧内存不能先写后补 claim。
+
+### 6.3.1 单例 writer 事故诊断与恢复
+
+出现 revision 持续被未知实例推进或 `Lock wait timeout exceeded` 时：
+
+1. 先记录受影响的 namespace/key、expected/actual revision、数据库更新时间、当前本机 PID 与连接数量；不得仅凭 `Sleep` 状态猜测 blocker；
+2. 只有在数据库能精确给出 blocking transaction/connection、并确认它属于已废弃实例时，才允许回滚或终止该连接。权限不足、行锁已经自然释放或连接身份不明时不执行 `KILL`；
+3. 新连接设置有界 `wait_timeout`，连接池归还时强制 rollback；任务取消也必须先 rollback 再把连接归还，降低 FRP 断链或取消路径留下长事务的风险；
+4. 检查 singleton claim 当前 owner、lease epoch、到期状态和最近 claim event。claim 冲突是正确的失败关闭，不应通过删除 claim 行、覆盖 token 或自动 rebase 绕过；
+5. 需要切换 owner 时，等待数据库时间确认旧 lease 过期后执行 takeover，或在已确认的旧 owner 正常关闭路径释放；新 epoch 生效后旧 token 永久失效；
+6. Elysium 仍由用户手工停止/启动。代码和 schema 就绪后，用户只启动预期实例；随后验证 claim owner 与本机实例一致、`runtime_context` 从最新 revision 加载、revision 不再由未知 owner 漂移，再做真实消息闭环。
 
 ### 6.4 单 runtime 启动、性能与关闭顺序
 
