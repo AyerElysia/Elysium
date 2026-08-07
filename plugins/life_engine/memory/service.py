@@ -24,6 +24,10 @@ from src.app.plugin_system.api import log_api
 from ..storage.contracts import StorageBackendRuntime
 from ..storage.memory import MemoryStorageBundle, open_mysql_memory_storage
 from ..storage.memory.local import create_local_memory_storage_bundle
+from ..storage.memory.mysql import (
+    MySQLMemoryReadinessProbeError,
+    inspect_mysql_memory_readiness,
+)
 from ..storage.models import BackendKind, StorageAvailability
 from .decay import (
     compute_memory_strength,
@@ -134,6 +138,7 @@ _RECOVERY_READ_BATCH = 32
 # Projection repair is committed in bounded batches so remote MySQL never holds
 # every ghost node and vector tombstone in one long startup transaction.
 _RECOVERY_DELETE_BATCH = 64
+_MYSQL_MEMORY_STARTUP_PROBE_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -528,6 +533,77 @@ class LifeMemoryService:
             "epistemic",
             "legacy_graph",
         )
+        runtime = self._storage_runtime
+        if (
+            storage.backend == BackendKind.MYSQL
+            and runtime is not None
+            and runtime.enabled
+            and runtime.backend == BackendKind.MYSQL
+        ):
+            try:
+                async with asyncio.timeout(
+                    _MYSQL_MEMORY_STARTUP_PROBE_TIMEOUT_SECONDS
+                ):
+                    try:
+                        shared_health = await runtime.health()
+                    except Exception as exc:  # noqa: BLE001 - sanitize backend error
+                        error_type = type(exc).__name__
+                        raise RuntimeError(
+                            "MemoryBackendUnavailable:"
+                            f"shared_runtime=failed,error_type={error_type}"
+                        ) from None
+
+                    if not isinstance(shared_health, dict):
+                        raise RuntimeError(
+                            "MemoryBackendUnavailable:shared_runtime=failed,"
+                            "error_type=InvalidHealthPayload"
+                        ) from None
+
+                    raw_status = str(shared_health.get("status") or "failed")
+                    try:
+                        shared_status = StorageAvailability(raw_status)
+                    except ValueError:
+                        raise RuntimeError(
+                            "MemoryBackendUnavailable:shared_runtime=failed,"
+                            "error_type=InvalidHealthStatus"
+                        ) from None
+                    if shared_status not in {
+                        StorageAvailability.HEALTHY,
+                        StorageAvailability.DEGRADED,
+                    }:
+                        error_type = self._storage_health_error_type(shared_health)
+                        raise RuntimeError(
+                            "MemoryBackendUnavailable:"
+                            f"shared_runtime={shared_status.value},"
+                            f"error_type={error_type}"
+                        ) from None
+
+                    try:
+                        readiness = await inspect_mysql_memory_readiness(runtime)
+                    except MySQLMemoryReadinessProbeError as exc:
+                        raise RuntimeError(
+                            "MemoryBackendUnavailable:shared_runtime=failed,"
+                            f"error_type={exc.error_type}"
+                        ) from None
+            except TimeoutError:
+                raise RuntimeError(
+                    "MemoryBackendUnavailable:shared_runtime=failed,"
+                    "error_type=TimeoutError"
+                ) from None
+
+            failed = [
+                f"{name}={readiness.get(name, StorageAvailability.FAILED).value}"
+                for name in names
+                if readiness.get(name, StorageAvailability.FAILED)
+                not in {
+                    StorageAvailability.HEALTHY,
+                    StorageAvailability.DEGRADED,
+                }
+            ]
+            if failed:
+                raise RuntimeError("MemoryBackendUnavailable:" + ",".join(failed))
+            return
+
         statuses = await asyncio.gather(
             *(getattr(storage, name).availability() for name in names)
         )
@@ -538,6 +614,20 @@ class LifeMemoryService:
         ]
         if failed:
             raise RuntimeError("MemoryBackendUnavailable:" + ",".join(failed))
+
+    @staticmethod
+    def _storage_health_error_type(health: dict[str, Any]) -> str:
+        """Extract only a bounded exception class name from shared health metadata."""
+        candidates = [health.get("error_type")]
+        for component in ("backend_health", "authority_health"):
+            detail = health.get(component)
+            if isinstance(detail, dict):
+                candidates.append(detail.get("error_type"))
+        for candidate in candidates:
+            value = str(candidate or "")
+            if value.isascii() and value.isidentifier() and len(value) <= 64:
+                return value
+        return "Unavailable"
 
     async def _create_tables(self) -> None:
         """创建数据库表。"""

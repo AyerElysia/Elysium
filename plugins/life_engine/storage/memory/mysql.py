@@ -108,6 +108,238 @@ from .contracts import MemoryStorageBundle
 _T = TypeVar("_T")
 _MAX_WRITE_ATTEMPTS = 3
 
+_MYSQL_MEMORY_READINESS_REQUIREMENTS: dict[
+    str,
+    dict[str, tuple[str, ...]],
+] = {
+    "document_index": {
+        "memory_schema": ("schema_name", "version"),
+        "memory_nodes": (
+            "node_id",
+            "document_content",
+            "index_revision",
+            "is_deleted",
+            "embedding_content_hash",
+            "legacy_fts_present",
+        ),
+        "memory_chunks": ("chunk_id", "node_id", "content_hash", "content"),
+        "memory_index_jobs": ("job_id", "node_id", "status", "index_revision"),
+        "memory_index_state": ("state_key", "collection_name", "version"),
+        "memory_vector_tombstones": (
+            "tombstone_id",
+            "node_id",
+            "chunk_id",
+            "consumed_at",
+        ),
+    },
+    "experiences": {
+        "memory_experiences": (
+            "event_id",
+            "source_event_id",
+            "sequence",
+            "payload_sha256",
+        ),
+        "memory_experience_occurrence_aliases": (
+            "occurrence_id",
+            "event_id",
+            "ingest_position",
+        ),
+    },
+    "witnesses": {
+        "memory_witnesses": (
+            "witness_id",
+            "consciousness_instance_id",
+            "projection_status",
+            "payload_sha256",
+        ),
+        "memory_witness_sources": ("witness_id", "event_id", "ordinal"),
+        "memory_witness_state": (
+            "consciousness_instance_id",
+            "last_sequence",
+            "revision",
+        ),
+        "memory_witness_migrations": (
+            "migration_key",
+            "source_hash",
+            "witness_id",
+        ),
+    },
+    "living": {
+        "memory_artifact_versions": (
+            "artifact_id",
+            "logical_key_sha256",
+            "content_hash",
+            "payload_sha256",
+        ),
+        "memory_artifact_derivations": (
+            "derivation_id",
+            "generated_artifact_id",
+            "used_artifact_id",
+            "payload_sha256",
+        ),
+        "memory_artifact_heads": (
+            "logical_key_sha256",
+            "artifact_id",
+            "revision",
+        ),
+        "memory_interpretations": (
+            "interpretation_id",
+            "subject_id",
+            "payload_sha256",
+        ),
+        "memory_interpretation_sources": (
+            "interpretation_id",
+            "entity_ref_sha256",
+            "payload_sha256",
+        ),
+        "memory_semantic_relations": (
+            "relation_id",
+            "source_ref_sha256",
+            "target_ref_sha256",
+            "payload_sha256",
+        ),
+        "memory_recall_sessions": (
+            "episode_id",
+            "consciousness_instance_id",
+            "payload_sha256",
+        ),
+        "memory_recall_events": (
+            "event_id",
+            "episode_id",
+            "ordinal",
+            "payload_sha256",
+        ),
+        "memory_corecall_events": (
+            "corecall_id",
+            "episode_id",
+            "payload_sha256",
+        ),
+        "memory_association_projection": (
+            "source_ref_sha256",
+            "target_ref_sha256",
+            "context_key_sha256",
+            "signal_sha256",
+        ),
+    },
+    "epistemic": {
+        "memory_claims": ("claim_id", "subject_key_sha256", "payload_sha256"),
+        "memory_claim_evidence": (
+            "evidence_link_id",
+            "claim_id",
+            "payload_sha256",
+        ),
+        "memory_beliefs": ("belief_id", "claim_id", "payload_sha256"),
+        "memory_epistemic_conflicts": (
+            "conflict_id",
+            "left_claim_id",
+            "right_claim_id",
+            "payload_sha256",
+        ),
+        "memory_state_events": (
+            "event_id",
+            "entity_id_sha256",
+            "payload_sha256",
+        ),
+        "memory_retrieval_episodes": (
+            "episode_id",
+            "consciousness_instance_id",
+            "payload_sha256",
+        ),
+        "memory_retrieval_exposures": (
+            "exposure_id",
+            "episode_id",
+            "entity_id_sha256",
+            "payload_sha256",
+        ),
+        "memory_retrieval_feedback": (
+            "feedback_id",
+            "exposure_id",
+            "payload_sha256",
+        ),
+    },
+    "legacy_graph": {
+        "memory_edges": ("edge_id", "source_id", "target_id", "edge_type"),
+        "memory_corrections": (
+            "correction_id",
+            "topic_sha256",
+            "message",
+        ),
+    },
+}
+
+
+class MySQLMemoryReadinessProbeError(RuntimeError):
+    """Report a content-free failure of the shared read-only schema probe."""
+
+    def __init__(self, error_type: str) -> None:
+        safe_error_type = (
+            error_type
+            if error_type.isascii()
+            and error_type.isidentifier()
+            and len(error_type) <= 64
+            else "Exception"
+        )
+        self.error_type = safe_error_type
+        super().__init__(f"MySQLMemoryReadinessProbeFailed:{safe_error_type}")
+
+
+async def inspect_mysql_memory_readiness(
+    runtime: StorageBackendRuntime,
+) -> dict[str, StorageAvailability]:
+    """Check all Memory domain tables with one read-only metadata query.
+
+    The selected runtime already owns schema activation and migrations. This probe only
+    proves that the active database exposes the tables and key columns consumed by each
+    Memory port; it never runs DDL or a second authority health check.
+    """
+    if (
+        not runtime.enabled
+        or runtime.backend != BackendKind.MYSQL
+        or runtime.engine is None
+    ):
+        raise MySQLMemoryReadinessProbeError("RuntimeUnavailable")
+
+    table_names = tuple(
+        dict.fromkeys(
+            table
+            for requirements in _MYSQL_MEMORY_READINESS_REQUIREMENTS.values()
+            for table in requirements
+        )
+    )
+    statement = text(
+        """SELECT TABLE_NAME AS table_name, COLUMN_NAME AS column_name
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME IN :table_names
+        ORDER BY TABLE_NAME, ORDINAL_POSITION"""
+    ).bindparams(bindparam("table_names", expanding=True))
+
+    try:
+        async with runtime.engine.connect() as connection:
+            rows = (
+                await connection.execute(statement, {"table_names": table_names})
+            ).mappings()
+            observed: dict[str, set[str]] = {}
+            for row in rows:
+                table = str(row["table_name"] or "").lower()
+                column = str(row["column_name"] or "").lower()
+                if table and column:
+                    observed.setdefault(table, set()).add(column)
+    except Exception as exc:  # noqa: BLE001 - hide all driver/server details
+        raise MySQLMemoryReadinessProbeError(type(exc).__name__) from None
+
+    return {
+        domain: (
+            StorageAvailability.HEALTHY
+            if all(
+                set(required_columns).issubset(observed.get(table, set()))
+                for table, required_columns in requirements.items()
+            )
+            else StorageAvailability.FAILED
+        )
+        for domain, requirements in _MYSQL_MEMORY_READINESS_REQUIREMENTS.items()
+    }
+
 
 class ImmutableMemoryRecordConflict(RuntimeError):
     """Raised when one immutable identity is replayed with different evidence."""
@@ -4905,6 +5137,8 @@ __all__ = [
     "MySQLExperienceLedgerStore",
     "MySQLLegacyGraphStore",
     "MySQLLivingMemoryStore",
+    "MySQLMemoryReadinessProbeError",
     "MySQLWitnessLedgerStore",
     "create_mysql_memory_storage_bundle",
+    "inspect_mysql_memory_readiness",
 ]
