@@ -1782,6 +1782,7 @@ class LifeEngineConfig(BaseConfig):
 
         default_body: str = Field(
             default="agent",
+            pattern=r"^(agent|bot|biomimetic)$",
             description="Explicit Minecraft body selected when start omits body_name.",
         )
 
@@ -1813,6 +1814,52 @@ class LifeEngineConfig(BaseConfig):
         biomimetic_token_file: str = Field(
             default="/mnt/g/Game/Minecraft/.minecraft/config/elysium_native_bridge.json",
             description="Native sidecar configuration containing its generated token.",
+        )
+
+        bot_bridge_uri: str = Field(
+            default="ws://127.0.0.1:18767/elysium",
+            description="Fallback URI for the headless bot body bridge.",
+        )
+
+        bot_bridge_listen_uri: str | None = Field(
+            default="ws://127.0.0.1:18767/elysium",
+            description="WSL listener for the outbound headless bot body relay.",
+        )
+
+        bot_token_file: str = Field(
+            default="minecraft/bot_bridge_token.json",
+            description="Workspace-relative token file generated for the bot body.",
+        )
+
+        bot_server_host: str = Field(
+            default="127.0.0.1",
+            min_length=1,
+            description="Minecraft server or LAN host the bot body joins.",
+        )
+
+        bot_server_port: int = Field(
+            default=25565,
+            ge=1,
+            le=65535,
+            description="Minecraft server or LAN port the bot body joins.",
+        )
+
+        bot_username: str = Field(
+            default="AyerElysia",
+            pattern=r"^[A-Za-z0-9_]{1,16}$",
+            description="In-game account name for the headless bot body.",
+        )
+
+        bot_observation_interval_ms: int = Field(
+            default=1000,
+            gt=0,
+            description="Bot observation snapshot cadence in milliseconds.",
+        )
+
+        bot_entity_radius_blocks: int = Field(
+            default=32,
+            gt=0,
+            description="Bot entity sensor radius in blocks.",
         )
 
         planner_task_name: str = Field(

@@ -1,0 +1,26 @@
+{
+  "name": "elysium-minecraft-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Headless Minecraft body for Elysia: implements the elysium.minecraft.bridge/1 body side over mineflayer so Elysia can join a server world as an independent player.",
+  "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=20.10"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "minecraft-data": "^3.76.0",
+    "mineflayer": "4.25.0",
+    "mineflayer-pathfinder": "^2.4.5",
+    "ws": "^8.18.0"
+  },
+  "overrides": {
+    "axios": "1.19.0",
+    "minecraft-protocol": "1.54.0",
+    "uuid": "11.1.1"
+  }
+}
