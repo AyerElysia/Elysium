@@ -23,6 +23,7 @@
 - [生命域存储快照与权威切换运行手册](./operations/life_storage_backend_runbook.md) — 候选快照、generation、epoch/fencing、切换门与回滚边界
 - [生命域 MySQL 切换就绪度报告（2026-08-05）](./report/life-storage-cutover-readiness-2026-08-05.md) — 阶段 0—8 完成矩阵、今日 2.1 GiB 候选复核、真实隔离 MySQL 验收与剩余人工切换门
 - [MySQL 单例运行态 writer fencing 报告（2026-08-07）](./report/mysql-runtime-singleton-writer-p0-2026-08-07.md) — 第二 writer 现场证据、数据库时间 claim、trigger 防旁路、备份与手工重启验收门
+- [学习系统运行健康审计（2026-08-07）](./report/学习系统运行健康审计_2026-08-07.md) — Learning CAS 现场证据、content-free 诊断、selected writer claim 与 fail-closed 验收门
 - [主体持续关注线索](./architecture/主体持续关注线索.md) — AttentionThread 主体决策、Presence gate、有界读取与旧 ThoughtStream snapshot-only 迁移边界
 - [生命域可选存储阶段 5 / AttentionThread 迁移报告](./report/life-storage-phase5-attention-thread-2026-08-06.md) — 原字节归档、候选复制、反向导出、六域 generation 门与未切换声明
 - [生命域可选存储阶段 3 / Life Event 交付报告](./report/life-storage-phase3-life-event-2026-08-04.md) — 事件账本双适配、候选复制控制、86,094 条真实影子复制与 0 差异反向导出

@@ -136,6 +136,7 @@ class LearningScheduler:
         validate_active_consciousness_instance: (
             Callable[[str], Awaitable[bool]] | None
         ) = None,
+        writer_instance_id: str = "",
     ) -> None:
         self._workspace = Path(workspace_path).resolve()
         self._model_task_name = model_task_name
@@ -160,11 +161,17 @@ class LearningScheduler:
         # 初始化核心组件
         self._selected_persistence: SelectedLearningPersistence | None = None
         self.decision_ledger: LearningDecisionLedger | None = None
+        self._writer_instance_id = (
+            str(writer_instance_id).strip() or f"learning_writer_{uuid4().hex}"
+        )
         if learning_store is None:
             self.store = InsightStore(self._workspace)
             self.skill_store = SkillStore(self._workspace)
         else:
-            persistence = SelectedLearningPersistence(learning_store)
+            persistence = SelectedLearningPersistence(
+                learning_store,
+                writer_instance_id=self._writer_instance_id,
+            )
             self.store = SelectedInsightStore(self._workspace, persistence)
             self.skill_store = SelectedSkillStore(self._workspace, persistence)
             persistence.bind(self.store, self.skill_store)
@@ -209,7 +216,8 @@ class LearningScheduler:
             self.maintenance_journal = maintenance_journal
         elif learning_store is not None:
             self.maintenance_journal = SelectedLearningMaintenanceJournal(
-                learning_store
+                learning_store,
+                writer_instance_id=self._writer_instance_id,
             )
         else:
             self.maintenance_journal = LocalLearningMaintenanceJournal(self._workspace)
@@ -1633,7 +1641,26 @@ class LearningScheduler:
         state = self.store.load_state()
         manifest = self.store.load_knowledge_manifest()
         skill_candidates = self.skill_store.list_candidates()
+        maintenance_health = self.maintenance_journal.health_snapshot()
+        selected_health = (
+            self._selected_persistence.health_snapshot()
+            if self._selected_persistence is not None
+            else {"status": "disabled", "backend": "legacy_local"}
+        )
+        component_statuses = {
+            str(maintenance_health.get("status") or "healthy"),
+            str(selected_health.get("status") or "healthy"),
+        }
+        if "failed" in component_statuses:
+            learning_status = "failed"
+        elif "degraded" in component_statuses:
+            learning_status = "degraded"
+        elif "initializing" in component_statuses:
+            learning_status = "initializing"
+        else:
+            learning_status = "healthy"
         return {
+            "status": learning_status,
             "insights": stats,
             "knowledge_version": manifest.get("current_version", 0),
             "last_audit_at": state.get("last_audit_at", ""),
@@ -1651,13 +1678,9 @@ class LearningScheduler:
                     item.gate_recommended for item in skill_candidates
                 ),
             },
-            "maintenance": self.maintenance_journal.health_snapshot(),
+            "maintenance": maintenance_health,
             "subject_review": self._subject_review_health_snapshot(),
-            "selected_persistence": (
-                self._selected_persistence.health_snapshot()
-                if self._selected_persistence is not None
-                else {"status": "disabled", "backend": "legacy_local"}
-            ),
+            "selected_persistence": selected_health,
             "prompt_projections": {
                 "knowledge": self.compressor.projection_health(),
                 "skills": self.skill_store.catalog_projection_health(),

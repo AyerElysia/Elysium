@@ -26,6 +26,7 @@ from .learning_contracts import (
     LearningProjectionWrite,
 )
 from .models import BackendKind
+from .writer_claims import SingletonWriterClaim, SingletonWriterClaimLost
 
 _T = TypeVar("_T")
 _MAX_WRITE_ATTEMPTS = 3
@@ -74,11 +75,17 @@ def _json_object(value: Any) -> dict[str, Any]:
 class SQLLearningStore:
     """One event/projection store bound to a coherent runtime."""
 
-    def __init__(self, runtime: StorageBackendRuntime) -> None:
+    def __init__(
+        self,
+        runtime: StorageBackendRuntime,
+        *,
+        writer_claim: SingletonWriterClaim | None = None,
+    ) -> None:
         if not runtime.enabled or runtime.engine is None:
             raise RuntimeError("learning adapter requires an enabled storage runtime")
         self.runtime = runtime
         self.backend = runtime.backend
+        self.writer_claim = writer_claim
 
     @property
     def _for_update(self) -> str:
@@ -121,9 +128,24 @@ class SQLLearningStore:
     ) -> _T:
         for attempt in range(_MAX_WRITE_ATTEMPTS):
             try:
-                async with self.runtime.unit_of_work() as uow:
-                    return await operation(uow.session)
+                async with self.runtime.unit_of_work(
+                    writer_claim=self.writer_claim
+                ) as uow:
+                    if self.writer_claim is not None:
+                        await self.runtime.bind_singleton_writer_write(
+                            uow.session,
+                            self.writer_claim,
+                        )
+                    try:
+                        return await operation(uow.session)
+                    finally:
+                        if self.writer_claim is not None:
+                            await self.runtime.clear_singleton_writer_write(uow.session)
             except DBAPIError as exc:
+                if "LearningSingletonWriterClaimRequired" in str(exc.orig):
+                    raise SingletonWriterClaimLost(
+                        "LearningSingletonWriterClaimRequired"
+                    ) from None
                 if attempt + 1 >= _MAX_WRITE_ATTEMPTS or not self._retryable(exc):
                     raise
                 await asyncio.sleep(0.02 * (attempt + 1))
@@ -384,7 +406,13 @@ class SQLLearningStore:
 
         if current is None:
             if write.expected_revision != 0 or write.expected_source_frontier != 0:
-                raise LearningProjectionConflict(write.projection_name)
+                raise LearningProjectionConflict(
+                    projection_name=write.projection_name,
+                    expected_revision=write.expected_revision,
+                    expected_source_frontier=write.expected_source_frontier,
+                    actual_revision=0,
+                    actual_source_frontier=0,
+                )
             revision = 1
             await session.execute(
                 text(
@@ -419,7 +447,14 @@ class SQLLearningStore:
                 current.revision != write.expected_revision
                 or current.source_frontier != write.expected_source_frontier
             ):
-                raise LearningProjectionConflict(write.projection_name)
+                raise LearningProjectionConflict(
+                    projection_name=write.projection_name,
+                    expected_revision=write.expected_revision,
+                    expected_source_frontier=write.expected_source_frontier,
+                    actual_revision=current.revision,
+                    actual_source_frontier=current.source_frontier,
+                    actual_projection_sha256=current.projection_sha256,
+                )
             if same_content(current):
                 return current
             revision = current.revision + 1
@@ -453,7 +488,14 @@ class SQLLearningStore:
                 },
             )
             if result.rowcount != 1:
-                raise LearningProjectionConflict(write.projection_name)
+                raise LearningProjectionConflict(
+                    projection_name=write.projection_name,
+                    expected_revision=write.expected_revision,
+                    expected_source_frontier=write.expected_source_frontier,
+                    actual_revision=current.revision,
+                    actual_source_frontier=current.source_frontier,
+                    actual_projection_sha256=current.projection_sha256,
+                )
 
         persisted = (
             (
@@ -699,6 +741,18 @@ class SQLLearningStore:
             "projection_count": len(projection_rows),
             "projection_states": states,
             "projections": projections,
+            "singleton_writer": (
+                {
+                    "status": "claimed",
+                    "generation_id": self.writer_claim.generation_id,
+                    "namespace": self.writer_claim.namespace,
+                    "state_key": self.writer_claim.state_key,
+                    "owner_instance_id": self.writer_claim.owner_instance_id,
+                    "lease_epoch": self.writer_claim.lease_epoch,
+                }
+                if self.writer_claim is not None
+                else {"status": "unclaimed"}
+            ),
         }
 
 

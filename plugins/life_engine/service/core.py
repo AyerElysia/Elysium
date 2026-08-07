@@ -430,6 +430,7 @@ class LifeEngineService(BaseService):
         self._subject_document_store: Any | None = None
         self._runtime_state_store: Any | None = None
         self._runtime_context_writer_claim: Any | None = None
+        self._learning_writer_claim: Any | None = None
         self._storage_writer_instance_id = (
             f"{self._storage_factory_settings.authority_owner_id}:"
             f"pid-{os.getpid()}:{uuid4().hex[:16]}"
@@ -891,10 +892,24 @@ class LifeEngineService(BaseService):
         learning_cfg = getattr(self._cfg(), "learning", None)
         learning_stores = None
         if learning_cfg is None or getattr(learning_cfg, "enabled", True):
+            from ..storage.learning_contracts import (
+                LEARNING_WRITER_CLAIM_NAMESPACE,
+                LEARNING_WRITER_CLAIM_STATE_KEY,
+            )
+
+            learning_writer_claim = await runtime.acquire_singleton_writer(
+                namespace=LEARNING_WRITER_CLAIM_NAMESPACE,
+                state_key=LEARNING_WRITER_CLAIM_STATE_KEY,
+                owner_instance_id=self._storage_writer_instance_id,
+                lease_seconds=self._storage_factory_settings.authority_lease_seconds,
+            )
             learning_stores = await open_learning_stores(
                 runtime,
                 initialize_schema=False,
+                writer_claim=learning_writer_claim,
             )
+        else:
+            learning_writer_claim = None
         registry = await AsyncConsciousnessRegistry.load(stores.presence)
         event_bus = LifeEventBus(ledger)
         gateway = AsyncPerceptionGateway(
@@ -911,6 +926,7 @@ class LifeEngineService(BaseService):
         self._subject_document_store = subject_store
         self._runtime_state_store = runtime_state_store
         self._runtime_context_writer_claim = runtime_context_writer_claim
+        self._learning_writer_claim = learning_writer_claim
         # MySQL is the only runtime data source: subject heads remain remote and
         # no filesystem observer/projector is attached.
         self._subject_workspace_observer = None
@@ -1057,6 +1073,7 @@ class LifeEngineService(BaseService):
         self._subject_document_store = None
         self._runtime_state_store = None
         self._runtime_context_writer_claim = None
+        self._learning_writer_claim = None
         self._learning_stores = None
         self._attention_thread_service = None
         if runtime is not None:
@@ -7390,6 +7407,7 @@ class LifeEngineService(BaseService):
                     validate_active_consciousness_instance=(
                         self._validate_learning_decision_actor
                     ),
+                    writer_instance_id=self._storage_writer_instance_id,
                     audit_interval_hours=float(getattr(learning_cfg, "audit_interval_hours", 6.0) if learning_cfg else 6.0),
                     audit_batch_size=int(getattr(learning_cfg, "audit_batch_size", 3) if learning_cfg else 3),
                     compress_trigger_count=int(getattr(learning_cfg, "compress_trigger_count", 5) if learning_cfg else 5),

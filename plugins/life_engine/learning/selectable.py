@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
@@ -13,9 +14,12 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from src.kernel.storage import canonical_json
+
 from ..storage.learning_contracts import (
     LearningEventDraft,
     LearningProjection,
+    LearningProjectionConflict,
     LearningProjectionWrite,
     LearningStorePort,
 )
@@ -33,6 +37,99 @@ _SKILL_PROJECTION = "learning_skills"
 _MAINTENANCE_PROJECTION = "learning_maintenance_health"
 _STATE_PROJECTOR_VERSION = "learning-state-compat-v1"
 _MAINTENANCE_PROJECTOR_VERSION = "learning-maintenance-health-v1"
+
+logger = logging.getLogger("life_engine.learning.persistence")
+
+
+@dataclass(frozen=True, slots=True)
+class LearningPersistenceFailure:
+    """Content-free evidence retained for the first failed CAS attempt."""
+
+    occurred_at: str
+    writer_instance_id: str
+    error_type: str
+    projection_name: str
+    expected_revision: int | None
+    expected_source_frontier: int | None
+    actual_revision: int | None
+    actual_source_frontier: int | None
+    actual_projection_sha256: str
+    attempted_projection_sha256: str
+    buffered_event_count: int
+    dirty_projections: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "occurred_at": self.occurred_at,
+            "writer_instance_id": self.writer_instance_id,
+            "error_type": self.error_type,
+            "projection_name": self.projection_name,
+            "expected_revision": self.expected_revision,
+            "expected_source_frontier": self.expected_source_frontier,
+            "actual_revision": self.actual_revision,
+            "actual_source_frontier": self.actual_source_frontier,
+            "actual_projection_sha256": self.actual_projection_sha256,
+            "attempted_projection_sha256": self.attempted_projection_sha256,
+            "buffered_event_count": self.buffered_event_count,
+            "dirty_projections": list(self.dirty_projections),
+        }
+
+    def log_summary(self) -> str:
+        return (
+            f"writer={self.writer_instance_id} "
+            f"projection={self.projection_name or 'unknown'} "
+            f"expected={self.expected_revision}/{self.expected_source_frontier} "
+            f"actual={self.actual_revision}/{self.actual_source_frontier} "
+            f"actual_sha256={self.actual_projection_sha256 or '-'} "
+            f"attempted_sha256={self.attempted_projection_sha256 or '-'} "
+            f"events={self.buffered_event_count}"
+        )
+
+
+def _payload_sha256(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _conflict_failure(
+    exc: LearningProjectionConflict,
+    *,
+    writer_instance_id: str,
+    writes: list[LearningProjectionWrite],
+    buffered_event_count: int,
+    dirty_projections: set[str],
+) -> LearningPersistenceFailure:
+    attempted = next(
+        (write for write in writes if write.projection_name == exc.projection_name),
+        None,
+    )
+    return LearningPersistenceFailure(
+        occurred_at=datetime.now(UTC).isoformat(),
+        writer_instance_id=writer_instance_id,
+        error_type=type(exc).__name__,
+        projection_name=exc.projection_name,
+        expected_revision=(
+            exc.expected_revision
+            if exc.expected_revision is not None
+            else attempted.expected_revision
+            if attempted is not None
+            else None
+        ),
+        expected_source_frontier=(
+            exc.expected_source_frontier
+            if exc.expected_source_frontier is not None
+            else attempted.expected_source_frontier
+            if attempted is not None
+            else None
+        ),
+        actual_revision=exc.actual_revision,
+        actual_source_frontier=exc.actual_source_frontier,
+        actual_projection_sha256=exc.actual_projection_sha256,
+        attempted_projection_sha256=(
+            _payload_sha256(attempted.payload) if attempted is not None else ""
+        ),
+        buffered_event_count=buffered_event_count,
+        dirty_projections=tuple(sorted(dirty_projections)),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,8 +151,16 @@ _MUTATION_CONTEXT: ContextVar[LearningMutationContext] = ContextVar(
 class SelectedLearningPersistence:
     """Buffer sync engine mutations and atomically flush event+projection state."""
 
-    def __init__(self, store: LearningStorePort) -> None:
+    def __init__(
+        self,
+        store: LearningStorePort,
+        *,
+        writer_instance_id: str = "",
+    ) -> None:
         self.store = store
+        self.writer_instance_id = (
+            str(writer_instance_id).strip() or f"learning_writer_{uuid4().hex}"
+        )
         self.insight_store: SelectedInsightStore | None = None
         self.skill_store: SelectedSkillStore | None = None
         self._projections: dict[str, LearningProjection | None] = {
@@ -66,6 +171,7 @@ class SelectedLearningPersistence:
         self._dirty: set[str] = set()
         self._initialized = False
         self._failed = False
+        self._failure: LearningPersistenceFailure | None = None
         self._flush_lock = asyncio.Lock()
         self._last_flush_at = ""
 
@@ -176,6 +282,7 @@ class SelectedLearningPersistence:
                 provenance={
                     "projection": domain,
                     **dict(context.provenance or {}),
+                    "writer_instance_id": self.writer_instance_id,
                 },
                 payload=payload,
             )
@@ -207,7 +314,7 @@ class SelectedLearningPersistence:
             # coroutine may perform a synchronous compatibility mutation while
             # this SQL commit is in flight; that later mutation must stay in the
             # next buffer instead of being erased by this flush.
-            events = list(self._pending_events)
+            pending_events = list(self._pending_events)
             dirty = set(self._dirty)
             self._pending_events.clear()
             self._dirty.clear()
@@ -230,6 +337,7 @@ class SelectedLearningPersistence:
                         "projector_version": _STATE_PROJECTOR_VERSION,
                         "trigger_source": context.source,
                         **dict(context.provenance or {}),
+                        "writer_instance_id": self.writer_instance_id,
                     },
                     payload=payload,
                 )
@@ -247,14 +355,30 @@ class SelectedLearningPersistence:
                         payload=payload,
                     )
                 )
-            events.extend(snapshot_events)
+            events = [*pending_events, *snapshot_events]
             try:
                 result = await self.store.commit(
                     events=events,
                     projections=writes,
                 )
+            except LearningProjectionConflict as exc:
+                self._pending_events[0:0] = pending_events
+                self._dirty.update(dirty)
+                self._failed = True
+                self._failure = _conflict_failure(
+                    exc,
+                    writer_instance_id=self.writer_instance_id,
+                    writes=writes,
+                    buffered_event_count=len(events),
+                    dirty_projections=dirty,
+                )
+                logger.error(
+                    "selected learning persistence failed closed after CAS: %s",
+                    self._failure.log_summary(),
+                )
+                raise
             except BaseException:
-                self._pending_events[0:0] = events
+                self._pending_events[0:0] = pending_events
                 self._dirty.update(dirty)
                 self._failed = True
                 raise
@@ -276,6 +400,9 @@ class SelectedLearningPersistence:
                 "revision": projection.revision if projection else 0,
                 "source_frontier": projection.source_frontier if projection else 0,
                 "rebuild_state": (projection.rebuild_state if projection else "ready"),
+                "projection_sha256": (
+                    projection.projection_sha256 if projection else ""
+                ),
             }
             for name, projection in sorted(self._projections.items())
         }
@@ -288,10 +415,12 @@ class SelectedLearningPersistence:
                 else "initializing"
             ),
             "backend": "selected",
+            "writer_instance_id": self.writer_instance_id,
             "initialized": self._initialized,
             "pending_events": len(self._pending_events),
             "dirty_projection_count": len(self._dirty),
             "last_flush_at": self._last_flush_at,
+            "failure": self._failure.to_dict() if self._failure else None,
             "projections": projection_health,
         }
 
@@ -565,12 +694,22 @@ class SelectedSkillStore(SkillStore):
 class SelectedLearningMaintenanceJournal(LearningMaintenanceJournalPort):
     """Maintenance evidence and health projection on the selected backend."""
 
-    def __init__(self, store: LearningStorePort) -> None:
+    def __init__(
+        self,
+        store: LearningStorePort,
+        *,
+        writer_instance_id: str = "",
+    ) -> None:
         self._store = store
+        self.writer_instance_id = (
+            str(writer_instance_id).strip() or f"learning_writer_{uuid4().hex}"
+        )
         self._projection: LearningProjection | None = None
         self._latest: dict[str, LearningMaintenanceEvent] = {}
         self._observed_events = 0
         self._initialized = False
+        self._failed = False
+        self._failure: LearningPersistenceFailure | None = None
         self._lock = asyncio.Lock()
 
     async def initialize(self) -> None:
@@ -607,6 +746,11 @@ class SelectedLearningMaintenanceJournal(LearningMaintenanceJournalPort):
     async def append(self, event: LearningMaintenanceEvent) -> None:
         await self.initialize()
         async with self._lock:
+            if self._failed:
+                raise RuntimeError(
+                    "selected maintenance journal failed closed; "
+                    "restart after diagnosis"
+                )
             previous = self._projection
             latest = dict(self._latest)
             latest[event.phase] = event
@@ -626,6 +770,7 @@ class SelectedLearningMaintenanceJournal(LearningMaintenanceJournalPort):
                 provenance={
                     "run_id": event.run_id,
                     "schema_version": event.schema_version,
+                    "writer_instance_id": self.writer_instance_id,
                 },
                 payload=event.to_dict(),
             )
@@ -638,10 +783,25 @@ class SelectedLearningMaintenanceJournal(LearningMaintenanceJournalPort):
                 rebuild_state="ready",
                 payload=payload,
             )
-            result = await self._store.commit(
-                events=[draft],
-                projections=[write],
-            )
+            try:
+                result = await self._store.commit(
+                    events=[draft],
+                    projections=[write],
+                )
+            except LearningProjectionConflict as exc:
+                self._failed = True
+                self._failure = _conflict_failure(
+                    exc,
+                    writer_instance_id=self.writer_instance_id,
+                    writes=[write],
+                    buffered_event_count=1,
+                    dirty_projections={_MAINTENANCE_PROJECTION},
+                )
+                logger.error(
+                    "selected learning maintenance failed closed after CAS: %s",
+                    self._failure.log_summary(),
+                )
+                raise
             self._projection = result.projections[0]
             self._latest = latest
             self._observed_events += 1
@@ -652,10 +812,26 @@ class SelectedLearningMaintenanceJournal(LearningMaintenanceJournalPort):
             for event in self._latest.values()
         )
         return {
-            "status": "degraded" if incomplete_or_failed else "healthy",
+            "status": (
+                "failed"
+                if self._failed
+                else "degraded"
+                if incomplete_or_failed
+                else "healthy"
+            ),
             "journal": "selected_sql",
             "initialized": self._initialized,
             "observed_events": self._observed_events,
+            "projection": {
+                "revision": self._projection.revision if self._projection else 0,
+                "source_frontier": (
+                    self._projection.source_frontier if self._projection else 0
+                ),
+                "projection_sha256": (
+                    self._projection.projection_sha256 if self._projection else ""
+                ),
+            },
+            "failure": self._failure.to_dict() if self._failure else None,
             "latest_by_phase": {
                 phase: event.to_dict() for phase, event in sorted(self._latest.items())
             },
@@ -664,6 +840,7 @@ class SelectedLearningMaintenanceJournal(LearningMaintenanceJournalPort):
 
 __all__ = [
     "LearningMutationContext",
+    "LearningPersistenceFailure",
     "SelectedInsightStore",
     "SelectedLearningMaintenanceJournal",
     "SelectedLearningPersistence",

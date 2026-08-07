@@ -377,8 +377,12 @@ def _install_selected_factories(
         runtime: _FakeRuntime,
         *,
         initialize_schema: bool = False,
+        writer_claim: Any | None = None,
     ) -> Any:
         assert runtime.backend == backend
+        assert writer_claim is not None
+        assert writer_claim.namespace == "life_engine.learning"
+        assert writer_claim.state_key == "selected_persistence"
         factory_calls.append(("learning", initialize_schema))
         return SimpleNamespace(store=learning_store)
 
@@ -473,6 +477,13 @@ async def test_selected_service_uses_one_backend_for_presence_world_and_events(
         ("learning", False),
     ]
     assert first.storage_runtime is runtimes[0]
+    assert [
+        (call["namespace"], call["state_key"]) for call in runtimes[0].claim_calls
+    ] == [
+        ("life_engine.runtime_context", "global"),
+        ("life_engine.learning", "selected_persistence"),
+    ]
+    assert len({call["owner_instance_id"] for call in runtimes[0].claim_calls}) == 1
     assert first.consciousness_registry.get(CHAT_GLOBAL_INSTANCE_ID) is not None
     assert first.consciousness_registry.database_path is None
     assert not (tmp_path / "runtime" / "consciousness_presence.sqlite3").exists()

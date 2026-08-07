@@ -5,13 +5,64 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+LEARNING_WRITER_CLAIM_NAMESPACE = "life_engine.learning"
+LEARNING_WRITER_CLAIM_STATE_KEY = "selected_persistence"
+
 
 class LearningOccurrenceConflict(RuntimeError):
     """Raised when one immutable occurrence is reused with different bytes."""
 
 
 class LearningProjectionConflict(RuntimeError):
-    """Raised when a projection revision/frontier CAS cannot be proven."""
+    """Raised when a projection revision/frontier CAS cannot be proven.
+
+    Structured fields are deliberately content-free so callers can persist or
+    log the first conflict without exposing a learning projection payload.
+    ``message`` remains supported for migration-level semantic conflicts that
+    do not originate from one SQL CAS attempt.
+    """
+
+    def __init__(
+        self,
+        message: str = "LearningProjectionConflict",
+        *,
+        projection_name: str = "",
+        expected_revision: int | None = None,
+        expected_source_frontier: int | None = None,
+        actual_revision: int | None = None,
+        actual_source_frontier: int | None = None,
+        actual_projection_sha256: str = "",
+    ) -> None:
+        self.projection_name = str(projection_name)
+        self.expected_revision = expected_revision
+        self.expected_source_frontier = expected_source_frontier
+        self.actual_revision = actual_revision
+        self.actual_source_frontier = actual_source_frontier
+        self.actual_projection_sha256 = str(actual_projection_sha256)
+        if self.projection_name:
+            message = (
+                "LearningProjectionConflict:"
+                f"projection={self.projection_name}:"
+                f"expected_revision={self.expected_revision}:"
+                f"expected_frontier={self.expected_source_frontier}:"
+                f"actual_revision={self.actual_revision}:"
+                f"actual_frontier={self.actual_source_frontier}:"
+                f"actual_sha256={self.actual_projection_sha256}"
+            )
+        super().__init__(message)
+
+    def diagnostic(self) -> dict[str, object]:
+        """Return stable content-free CAS evidence."""
+
+        return {
+            "error_type": type(self).__name__,
+            "projection_name": self.projection_name,
+            "expected_revision": self.expected_revision,
+            "expected_source_frontier": self.expected_source_frontier,
+            "actual_revision": self.actual_revision,
+            "actual_source_frontier": self.actual_source_frontier,
+            "actual_projection_sha256": self.actual_projection_sha256,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +180,8 @@ class LearningStores:
 
 
 __all__ = [
+    "LEARNING_WRITER_CLAIM_NAMESPACE",
+    "LEARNING_WRITER_CLAIM_STATE_KEY",
     "LearningCommitResult",
     "LearningEventDraft",
     "LearningEventRecord",

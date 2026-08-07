@@ -7,7 +7,9 @@ import hashlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import text
@@ -22,12 +24,19 @@ from plugins.life_engine.learning.decisions import (
     SubjectAuthorityCommit,
     SubjectAuthorityUnavailable,
 )
+from plugins.life_engine.learning.maintenance import (
+    LearningMaintenanceEvent,
+    LearningPhase,
+)
 from plugins.life_engine.learning.models import (
     Insight,
     InsightNextAction,
     InsightStatus,
 )
 from plugins.life_engine.learning.scheduler import LearningScheduler
+from plugins.life_engine.learning.selectable import (
+    SelectedLearningMaintenanceJournal,
+)
 from plugins.life_engine.learning.skill_store import (
     SkillCandidate,
     SkillPattern,
@@ -45,6 +54,8 @@ from plugins.life_engine.storage.factory import (
     open_storage_backend,
 )
 from plugins.life_engine.storage.learning_contracts import (
+    LEARNING_WRITER_CLAIM_NAMESPACE,
+    LEARNING_WRITER_CLAIM_STATE_KEY,
     LearningEventDraft,
     LearningOccurrenceConflict,
     LearningProjectionConflict,
@@ -58,11 +69,17 @@ from plugins.life_engine.storage.learning_migration import (
     verify_learning_legacy_export,
     verify_legacy_learning_import,
 )
+from plugins.life_engine.storage.learning_schema import (
+    LEARNING_SCHEMA_VERSION,
+    MYSQL_LEARNING_CLAIM_GUARD_MIGRATION,
+    MYSQL_LEARNING_CLAIM_GUARD_TRIGGERS,
+)
 from plugins.life_engine.storage.models import (
     BackendGeneration,
     BackendKind,
     GenerationStatus,
 )
+from plugins.life_engine.storage.writer_claims import SingletonWriterClaimLost
 from scripts.migrate_life_learning import (
     _is_transient_mysql_disconnect,
     _retry_transient_mysql,
@@ -220,7 +237,7 @@ async def test_learning_commit_is_atomic_idempotent_and_conflict_explicit(
             )
         assert await store.event_by_occurrence("learning:rolled-back") is None
 
-        with pytest.raises(LearningProjectionConflict):
+        with pytest.raises(LearningProjectionConflict) as raised:
             await store.commit(
                 events=[_event("cas-rolled-back")],
                 projections=[
@@ -231,6 +248,16 @@ async def test_learning_commit_is_atomic_idempotent_and_conflict_explicit(
                     )
                 ],
             )
+        diagnostic = raised.value.diagnostic()
+        assert diagnostic == {
+            "error_type": "LearningProjectionConflict",
+            "projection_name": "learning_state",
+            "expected_revision": 0,
+            "expected_source_frontier": 0,
+            "actual_revision": 1,
+            "actual_source_frontier": first.events[0].position,
+            "actual_projection_sha256": first.projections[0].projection_sha256,
+        }
         assert await store.event_by_occurrence("learning:cas-rolled-back") is None
 
 
@@ -940,6 +967,222 @@ async def test_selected_flush_keeps_mutations_arriving_during_commit(
         await restarted.initialize()
         assert restarted.store.get_insight(first.insight_id) is not None
         assert restarted.store.get_insight(second.insight_id) is not None
+
+
+async def test_selected_projection_conflict_is_content_free_and_stays_failed_closed(
+    tmp_path: Path,
+) -> None:
+    """A stale writer records exact CAS evidence and never retries blindly."""
+
+    async with _local_store(tmp_path / "backend") as (_, store, _, _):
+        winner = LearningScheduler(
+            workspace_path=tmp_path / "winner",
+            learning_store=store,
+        )
+        stale = LearningScheduler(
+            workspace_path=tmp_path / "stale",
+            learning_store=store,
+        )
+        await winner.initialize()
+        await stale.initialize()
+        assert winner.store.add_insight(
+            Insight.create(
+                category="cas",
+                claim="winner payload must not enter diagnostics",
+                rationale="winner source",
+            )
+        )
+        await winner.flush()
+        winner_projection = await store.get_projection("learning_insights")
+        assert winner_projection is not None
+
+        assert stale.store.add_insight(
+            Insight.create(
+                category="cas",
+                claim="stale payload must not enter diagnostics",
+                rationale="stale source",
+            )
+        )
+        with pytest.raises(LearningProjectionConflict):
+            await stale.flush()
+
+        state = stale.get_state()
+        assert state["status"] == "failed"
+        selected = state["selected_persistence"]
+        failure = selected["failure"]
+        assert selected["status"] == "failed"
+        assert (
+            selected["writer_instance_id"]
+            != (winner.get_state()["selected_persistence"]["writer_instance_id"])
+        )
+        assert failure["projection_name"] == "learning_insights"
+        assert failure["expected_revision"] == 0
+        assert failure["expected_source_frontier"] == 0
+        assert failure["actual_revision"] == winner_projection.revision
+        assert failure["actual_source_frontier"] == (winner_projection.source_frontier)
+        assert failure["actual_projection_sha256"] == (
+            winner_projection.projection_sha256
+        )
+        serialized = str(failure)
+        assert "winner payload" not in serialized
+        assert "stale payload" not in serialized
+
+        before = await store.health_snapshot()
+        with pytest.raises(RuntimeError, match="failed closed"):
+            await stale.flush()
+        after = await store.health_snapshot()
+        assert after["event_count"] == before["event_count"]
+        assert after["event_frontier"] == before["event_frontier"]
+
+
+async def test_selected_learning_writer_claim_fences_commit_before_restart(
+    tmp_path: Path,
+) -> None:
+    """Learning commits use the service-owned claim and never rebase on loss."""
+
+    async with _local_store(tmp_path / "backend") as (runtime, _, _, _):
+        claim = await runtime.acquire_singleton_writer(
+            namespace=LEARNING_WRITER_CLAIM_NAMESPACE,
+            state_key=LEARNING_WRITER_CLAIM_STATE_KEY,
+            owner_instance_id="life-engine:test-learning-writer",
+            lease_seconds=30,
+        )
+        claimed = (await open_learning_stores(runtime, writer_claim=claim)).store
+        first = await claimed.commit(
+            events=[_event("claimed-first")],
+            projections=[],
+        )
+        assert len(first.events) == 1
+        health = await claimed.health_snapshot()
+        assert health["singleton_writer"] == {
+            "status": "claimed",
+            "generation_id": claim.generation_id,
+            "namespace": LEARNING_WRITER_CLAIM_NAMESPACE,
+            "state_key": LEARNING_WRITER_CLAIM_STATE_KEY,
+            "owner_instance_id": "life-engine:test-learning-writer",
+            "lease_epoch": claim.lease_epoch,
+        }
+
+        assert await runtime.release_singleton_writer(claim) is True
+        with pytest.raises(SingletonWriterClaimLost):
+            await claimed.commit(
+                events=[_event("stale-after-release")],
+                projections=[],
+            )
+        assert await claimed.event_by_occurrence("stale-after-release") is None
+
+
+async def test_learning_store_rejects_claim_from_another_singleton_scope(
+    tmp_path: Path,
+) -> None:
+    """A live claim for another domain must not authorize Learning writes."""
+
+    async with _local_store(tmp_path / "backend") as (runtime, _, _, _):
+        wrong_claim = await runtime.acquire_singleton_writer(
+            namespace="life_engine.runtime_context",
+            state_key="global",
+            owner_instance_id="life-engine:test-wrong-learning-scope",
+            lease_seconds=30,
+        )
+        with pytest.raises(ValueError, match="LearningWriterClaimScopeMismatch"):
+            await open_learning_stores(runtime, writer_claim=wrong_claim)
+
+
+async def test_claimed_mysql_learning_startup_requires_trigger_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Business startup fails before store construction when guards are absent."""
+
+    async def _missing_guard(_runtime: object) -> None:
+        raise RuntimeError("missing Learning singleton trigger guard")
+
+    monkeypatch.setattr(
+        "plugins.life_engine.storage.learning_factory."
+        "verify_learning_writer_claim_guard",
+        _missing_guard,
+    )
+    runtime = SimpleNamespace(enabled=True, backend=BackendKind.MYSQL)
+    claim = SimpleNamespace(
+        namespace=LEARNING_WRITER_CLAIM_NAMESPACE,
+        state_key=LEARNING_WRITER_CLAIM_STATE_KEY,
+    )
+    with pytest.raises(RuntimeError, match="missing Learning singleton trigger"):
+        await open_learning_stores(runtime, writer_claim=claim)  # type: ignore[arg-type]
+
+
+def test_learning_mysql_claim_guard_covers_all_mutation_surfaces() -> None:
+    """A registered Learning scope blocks old adapters and direct SQL writes."""
+
+    assert LEARNING_SCHEMA_VERSION == 2
+    assert MYSQL_LEARNING_CLAIM_GUARD_MIGRATION.version == 2
+    assert {
+        (trigger.table, trigger.manipulation)
+        for trigger in MYSQL_LEARNING_CLAIM_GUARD_TRIGGERS
+    } == {
+        ("learning_events", "INSERT"),
+        ("learning_projections", "INSERT"),
+        ("learning_projections", "UPDATE"),
+        ("learning_projections", "DELETE"),
+    }
+    for statement in MYSQL_LEARNING_CLAIM_GUARD_MIGRATION.statements:
+        assert LEARNING_WRITER_CLAIM_NAMESPACE in statement
+        assert LEARNING_WRITER_CLAIM_STATE_KEY in statement
+        assert "runtime_singleton_writer_bindings" in statement
+        assert "LearningSingletonWriterClaimRequired" in statement
+
+
+async def test_selected_maintenance_conflict_stops_repeated_sql_attempts(
+    tmp_path: Path,
+) -> None:
+    """One stale journal conflict is enough; later calls stay local fail-closed."""
+
+    async with _local_store(tmp_path / "backend") as (_, store, _, _):
+        winner = SelectedLearningMaintenanceJournal(
+            store,
+            writer_instance_id="learning_writer_winner",
+        )
+        stale = SelectedLearningMaintenanceJournal(
+            store,
+            writer_instance_id="learning_writer_stale",
+        )
+        await winner.initialize()
+        await stale.initialize()
+        started_at = datetime.now(UTC)
+        await winner.append(
+            LearningMaintenanceEvent.started(
+                run_id="winner-run",
+                phase=LearningPhase.REFLECTION,
+                started_at=started_at,
+                pending_count=1,
+            )
+        )
+        with pytest.raises(LearningProjectionConflict):
+            await stale.append(
+                LearningMaintenanceEvent.started(
+                    run_id="stale-run",
+                    phase=LearningPhase.REFLECTION,
+                    started_at=started_at,
+                    pending_count=1,
+                )
+            )
+        health = stale.health_snapshot()
+        assert health["status"] == "failed"
+        assert health["failure"]["writer_instance_id"] == "learning_writer_stale"
+        assert health["failure"]["actual_revision"] == 1
+
+        before = await store.health_snapshot()
+        with pytest.raises(RuntimeError, match="failed closed"):
+            await stale.append(
+                LearningMaintenanceEvent.started(
+                    run_id="stale-run-2",
+                    phase=LearningPhase.AUDIT,
+                    started_at=started_at,
+                    pending_count=0,
+                )
+            )
+        after = await store.health_snapshot()
+        assert after["event_count"] == before["event_count"]
+        assert after["event_frontier"] == before["event_frontier"]
 
 
 def test_learning_migration_manifest_verification_is_exact(tmp_path: Path) -> None:
