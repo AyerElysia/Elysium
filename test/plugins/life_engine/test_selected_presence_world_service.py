@@ -855,6 +855,77 @@ async def test_service_stop_aggregates_consumer_failures_and_closes_runtime_last
     assert runtimes[0].close_calls == 1
 
 
+async def test_service_stop_releases_writer_when_runtime_context_save_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stores = build_fake_stores()
+    ledger = _FakeLifeEventStore()
+    runtimes, _ = _install_selected_factories(
+        monkeypatch,
+        BackendKind.MYSQL,
+        stores,
+        ledger,
+    )
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+    await service._start_selected_storage()
+
+    async def _failed_save() -> None:
+        raise RuntimeError("injected runtime-context revision conflict")
+
+    async def _no_op() -> None:
+        return None
+
+    monkeypatch.setattr(service, "_save_runtime_context", _failed_save)
+    monkeypatch.setattr(core_module, "cleanup_autonomy_schedules", lambda *_: _no_op())
+
+    with pytest.raises(ExceptionGroup, match="consumer failures") as captured:
+        await service.stop()
+
+    rendered = "\n".join(str(item) for item in captured.value.exceptions)
+    assert "injected runtime-context revision conflict" in rendered
+    assert runtimes[0].revoke_calls == 1
+    assert runtimes[0].close_calls == 1
+    assert service._storage_runtime is None
+
+
+async def test_failed_selected_storage_start_releases_partial_writer_claims(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stores = build_fake_stores()
+    ledger = _FakeLifeEventStore()
+    runtimes, _ = _install_selected_factories(
+        monkeypatch,
+        BackendKind.MYSQL,
+        stores,
+        ledger,
+    )
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+
+    async def _failed_learning_open(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("injected learning store attachment failure")
+
+    monkeypatch.setattr(
+        "plugins.life_engine.storage.learning_factory.open_learning_stores",
+        _failed_learning_open,
+    )
+
+    with pytest.raises(RuntimeError, match="attachment failure"):
+        await service._start_selected_storage()
+
+    assert len(runtimes[0].claim_calls) == 2
+    assert service._runtime_state_store is None
+    with pytest.raises(ExceptionGroup, match="consumer failures") as captured:
+        await service.stop()
+
+    rendered = "\n".join(str(item) for item in captured.value.exceptions)
+    assert "SelectedRuntimeStateStorageNotStarted" in rendered
+    assert runtimes[0].revoke_calls == 1
+    assert runtimes[0].close_calls == 1
+    assert service._storage_runtime is None
+
+
 async def test_presence_outbox_limit_fails_without_losing_remaining_evidence() -> None:
     stores = build_fake_stores()
     ledger = _FakeLifeEventStore()

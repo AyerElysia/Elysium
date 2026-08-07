@@ -7718,15 +7718,24 @@ class LifeEngineService(BaseService):
             logger.debug(f"清理自主意向调度失败: {exc}")
         self._stop_event = None
         unregister_life_engine_service()
-        await self._save_runtime_context()
         try:
-            await self._close_selected_storage()
-        except Exception as exc:  # noqa: BLE001 - finish remaining shutdown
-            shutdown_errors.append(exc)
-            logger.error(
-                "关闭 selected Presence/World storage 失败",
-                exc_info=True,
-            )  # noqa: G201 - project Logger has no exception()
+            try:
+                await self._save_runtime_context()
+            except Exception as exc:  # noqa: BLE001 - release authority regardless
+                shutdown_errors.append(exc)
+                logger.error(
+                    "保存 life_engine 运行上下文失败，继续释放 selected storage",
+                    exc_info=True,
+                )  # noqa: G201 - project Logger has no exception()
+        finally:
+            try:
+                await self._close_selected_storage()
+            except Exception as exc:  # noqa: BLE001 - finish remaining shutdown
+                shutdown_errors.append(exc)
+                logger.error(
+                    "关闭 selected Presence/World storage 失败",
+                    exc_info=True,
+                )  # noqa: G201 - project Logger has no exception()
 
         logger.info("life_engine 已停止")
         log_lifecycle(
