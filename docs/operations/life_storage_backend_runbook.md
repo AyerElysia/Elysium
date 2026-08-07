@@ -59,7 +59,7 @@ uv run python scripts/backup_life_data.py \
 
 ## 5. Authority、共享写入与 fencing
 
-权威选择与数据后端选择彼此独立；必须先区分“一个权威 generation”和“一个写入进程”：
+权威实现由全局后端选择自动派生，用户不再单独配置；同时必须区分“一个权威 generation”和“一个写入进程”：
 
 - 单一权威意味着同一 registry 在一个 epoch 内只承认一个 active backend 和 generation，禁止 local/MySQL 双主或两个 generation 独立接收业务写入；它不限制同一 MySQL generation 内合法进程的数量；
 - `local` 后端仍使用 `authority_provider = "file"` 和进程级单实例保护。SQLite、权威 Markdown/JSON 与本地投影不支持多个 Elysium 进程安全共享写入；
@@ -80,11 +80,10 @@ MySQL 的后端选择、连接、generation 与 authority 只配置在 Core 全�
 ```toml
 # config/core.toml
 [storage]
-backend = "local"  # 或 "mysql"
-backend_generation = ""
+backend = "local"  # 日常切换只改这一项；另一个合法值是 "mysql"
+backend_generation = "<VERIFIED_MYSQL_GENERATION_ID>"  # local 自动忽略
 schema_version = 1
 registry_id = "life-domain"
-authority_provider = "file"  # mysql 后端并发写入时使用 "mysql"
 authority_owner_id = "<UNIQUE_WRITER_ID>"
 require_verified_generation = true
 authority_lease_seconds = 120
@@ -103,7 +102,7 @@ connection_timeout = 10
 
 Life Engine 插件文件不再包含 `[storage]` 或 `[storage_mysql]`。它只保留 local 模式所需的 `[storage_local]` 路径；MySQL 模式会直接复用上述全局配置。
 
-只有 generation 与 authority 验收完成后，才允许把全局 `backend` 改为 `mysql`。MySQL 多进程共享写入还必须使用 `authority_provider = "mysql"`，并为每个 worktree/部署实例提供稳定且唯一的 `authority_owner_id`；不要把真实用户名、机器绝对路径或密钥放进公共配置示例。连接密码仍只能通过配置中的环境变量提供。首个进程负责在尚未激活时创建 generation epoch；后续进程只加入同一 epoch。shared writer 不需要把 epoch、lease 或 fencing token 写入配置或环境变量，也不会通过周期维护夺取其他进程资格。异常和健康输出使用不含密码的 backend identity。
+只有 MySQL generation、连接和 authority 控制面验收完成后，才允许把全局 `backend` 改为 `mysql`。日常 local/MySQL 切换只改这一字段：`local` 自动使用 file authority 并忽略保留在配置中的 MySQL generation，`mysql` 自动使用 MySQL authority 并严格校验该 generation。旧 `authority_provider` 字段由配置迁移自动移除，不再允许人工联动。每个 worktree/部署实例仍须提供稳定且唯一的 `authority_owner_id`；不要把真实用户名、机器绝对路径或密钥放进公共配置示例。连接密码仍只能通过配置中的环境变量提供。首个进程负责在尚未激活时创建 generation epoch；后续进程只加入同一 epoch。shared writer 不需要把 epoch、lease 或 fencing token 写入配置或环境变量，也不会通过周期维护夺取其他进程资格。异常和健康输出使用不含密码的 backend identity。
 
 MySQL 模式不使用入口级 `data/runtime/elysium.lock`；不同 worktree 可以同时启动并共享数据库。每个完整 Elysium 进程仍需拥有不冲突的 HTTP 端口、临时目录和不可共享外部适配器会话。已有合法数据库 writer 不得成为启动拒绝理由，但认证失败、TLS/权限错误、schema 漂移、generation 不匹配、端口冲突和外部会话争用仍必须显式失败，不能用静默 local 回退或空实现伪装启动成功。
 

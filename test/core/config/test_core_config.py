@@ -7,7 +7,11 @@ from pathlib import Path
 import pytest
 
 from src.core.config.core_config import CoreConfig, get_core_config, init_core_config
-from src.kernel.llm.policy import RoundRobinPolicy, create_default_policy, set_default_policy_factory
+from src.kernel.llm.policy import (
+    RoundRobinPolicy,
+    create_default_policy,
+    set_default_policy_factory,
+)
 
 
 class TestBotSection:
@@ -171,7 +175,7 @@ class TestPermissionSection:
 
 
 class TestChatSectionLegacyKeys:
-    """测试 ChatSection 的旧字段兼容（通过 auto_update 剔除）。"""
+    """测试旧配置字段通过迁移与 auto-update 安全移除。"""
 
     def test_init_core_config_strips_legacy_context_validation_mode(self, temp_dir: Path) -> None:
         """旧配置里残留 context_validation_mode 不应导致加载失败，并应被自动移除。"""
@@ -203,6 +207,41 @@ context_validation_mode = \"repair\"
             assert "max_context_size" not in updated
             assert "max_history_messages" in updated
             assert "max_llm_messages" not in updated
+        finally:
+            core_config_module._global_config = original_config
+
+    def test_init_core_config_strips_derived_authority_provider(
+        self,
+        temp_dir: Path,
+    ) -> None:
+        """旧 authority_provider 自动移除，运行时只由 backend 派生。"""
+
+        import src.core.config.core_config as core_config_module
+
+        original_config = core_config_module._global_config
+        core_config_module._global_config = None
+
+        try:
+            config_file = temp_dir / "core.toml"
+            config_file.write_text(
+                """
+[storage]
+backend = "local"
+backend_generation = "verified-mysql-v1"
+authority_provider = "mysql"
+""".lstrip(),
+                encoding="utf-8",
+            )
+
+            config = init_core_config(str(config_file))
+
+            assert config.storage.backend == "local"
+            assert config.storage.backend_generation == "verified-mysql-v1"
+            assert not hasattr(config.storage, "authority_provider")
+            updated = config_file.read_text(encoding="utf-8")
+            assert "authority_provider" not in updated
+            assert 'backend = "local"' in updated
+            assert 'backend_generation = "verified-mysql-v1"' in updated
         finally:
             core_config_module._global_config = original_config
 

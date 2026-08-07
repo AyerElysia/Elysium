@@ -111,10 +111,12 @@ def settings_from_life_engine_config(
     return StorageFactorySettings(
         enabled=backend == BackendKind.MYSQL,
         authoritative_backend=backend,
-        backend_generation=str(storage.backend_generation),
+        backend_generation=(
+            str(storage.backend_generation) if backend == BackendKind.MYSQL else ""
+        ),
         schema_version=int(storage.schema_version),
         registry_id=str(storage.registry_id),
-        authority_provider=cast(AuthorityProvider, str(storage.authority_provider)),
+        authority_provider=("mysql" if backend == BackendKind.MYSQL else "file"),
         authority_epoch=0,
         authority_owner_id=str(storage.authority_owner_id),
         require_verified_generation=bool(storage.require_verified_generation),

@@ -63,6 +63,26 @@ def test_global_local_mode_keeps_life_storage_runtime_inert() -> None:
     assert settings.enabled is False
     assert settings.authoritative_backend == BackendKind.LOCAL
     assert settings.backend_generation == ""
+    assert settings.authority_provider == "file"
+
+
+def test_global_local_mode_ignores_preconfigured_mysql_generation() -> None:
+    """Switching to local changes only backend and ignores MySQL-only metadata."""
+
+    settings = settings_from_life_engine_config(
+        LifeEngineConfig(),
+        global_config=CoreConfig(
+            storage=CoreConfig.StorageSection(
+                backend="local",
+                backend_generation="remote-adopted-v1",
+            )
+        ),
+    )
+
+    assert settings.authoritative_backend == BackendKind.LOCAL
+    assert settings.enabled is False
+    assert settings.backend_generation == ""
+    assert settings.authority_provider == "file"
 
 
 def test_global_mysql_mode_uses_only_core_mysql_configuration() -> None:
@@ -90,6 +110,7 @@ def test_global_mysql_mode_uses_only_core_mysql_configuration() -> None:
     assert settings.enabled is True
     assert settings.authoritative_backend == BackendKind.MYSQL
     assert settings.backend_generation == "remote-adopted-v1"
+    assert settings.authority_provider == "mysql"
     assert settings.authority_epoch == 0
     assert settings.authority_owner_id == "primary-writer"
     assert settings.mysql.host == "db.example"

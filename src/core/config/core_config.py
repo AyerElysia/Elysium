@@ -232,7 +232,10 @@ class CoreConfig(ConfigBase):
         )
         backend_generation: str = Field(
             default="",
-            description="生命域已验证的 MySQL generation ID。",
+            description=(
+                "预配置的 MySQL verified generation ID；仅在 backend=mysql 时使用，"
+                "backend=local 时自动忽略，切换模式不需要修改该字段。"
+            ),
         )
         schema_version: int = Field(
             default=1,
@@ -242,10 +245,6 @@ class CoreConfig(ConfigBase):
         registry_id: str = Field(
             default="life-domain",
             description="全局写入权威注册表身份。",
-        )
-        authority_provider: Literal["file", "mysql"] = Field(
-            default="file",
-            description="单机使用 file，多主机共享 writer 使用 mysql。",
         )
         authority_owner_id: str = Field(
             default="elysium-windows-primary",
@@ -660,7 +659,11 @@ def _migrate_legacy_core_config(config_path: "Path") -> None:
 
     storage_config = raw_config.get("storage")
     if isinstance(storage_config, dict):
-        for obsolete_key in ("authority_epoch", "fencing_token_env"):
+        for obsolete_key in (
+            "authority_epoch",
+            "authority_provider",
+            "fencing_token_env",
+        ):
             if obsolete_key in storage_config:
                 storage_config.pop(obsolete_key)
                 changed = True

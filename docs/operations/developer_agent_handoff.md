@@ -27,24 +27,33 @@
 backend = "mysql" # 或 "local"
 ```
 
-MySQL 模式下，`[storage]` 至少需要：
+`backend_generation`、连接信息、registry 和 owner 是提前配置并长期保留的 MySQL 登记信息；日常切换时不要联动修改。唯一开关是：
 
 ```toml
 [storage]
-backend = "mysql"
-backend_generation = "<VERIFIED_GENERATION_ID>"
+backend = "local"  # 切到 MySQL 时只改为 "mysql"
+backend_generation = "<VERIFIED_MYSQL_GENERATION_ID>"  # local 自动忽略
 schema_version = 1
 registry_id = "life-domain"
-authority_provider = "mysql"
 authority_owner_id = "<STABLE_INSTANCE_OWNER>"
 require_verified_generation = true
 authority_lease_seconds = 120
 authority_renew_interval_seconds = 40
 ```
 
+运行时派生合同：
+
+| `backend` | Core | Life Engine | authority | generation |
+|---|---|---|---|---|
+| `local` | SQLite | 本地 SQLite/文件 | 自动使用 `file` | 自动忽略预配置的 MySQL generation |
+| `mysql` | MySQL | MySQL selected runtime | 自动使用 `mysql` | 使用并校验预配置的 verified generation |
+
+因此从 local 切 MySQL 或切回 local 都只改 `backend`；不得再配置 `authority_provider`，也不需要清空/恢复 `backend_generation`。首次部署 MySQL 时仍须先填入并验证 generation 与连接参数，这属于初始化，不是日常模式切换。
+
 变化点：
 
 - 旧 `database.database_type` 会迁移到 `[storage].backend` 后移除。
+- 旧 `[storage].authority_provider` 会在配置迁移时自动移除，其生效值由 `backend` 派生，避免 `local + mysql authority` 等矛盾组合。
 - Life Engine 插件配置中的后端、generation、MySQL 连接配置不再是合法第二来源。
 - 旧静态 `authority_epoch`、`fencing_token_env` 不再配置。MySQL registry 尚未激活时，首个进程为已登记且 verified 的 generation 建立当前 epoch；后续进程加入该 generation，共享 generation/epoch 写入资格。
 - 每个 worktree/部署实例必须配置稳定且唯一的 `authority_owner_id`，用于审计来源；它不是独占写入锁。

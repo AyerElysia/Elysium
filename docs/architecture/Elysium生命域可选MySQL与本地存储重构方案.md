@@ -491,11 +491,10 @@ MySQL 结构化过滤
 
 ```toml
 [storage]
-backend = "mysql"  # 或 "local"
-backend_generation = "<VERIFIED_GENERATION_ID>"
+backend = "local"  # 日常切换只改这一项；另一个合法值是 "mysql"
+backend_generation = "<VERIFIED_MYSQL_GENERATION_ID>"  # local 自动忽略
 schema_version = 1
 registry_id = "life-domain"
-authority_provider = "mysql"
 authority_owner_id = "<UNIQUE_WRITER_ID>"
 require_verified_generation = true
 authority_lease_seconds = 120
@@ -514,7 +513,7 @@ connection_pool_size = 10
 connection_timeout = 10
 ```
 
-`authority_owner_id` 必须在各 worktree/部署实例之间唯一且可审计，但它只是调用者身份，不代表独占 generation。shared writer 的写资格来自 active backend/generation/epoch 的事务校验。真实密码、主机、个人端口和绝对路径不得进入公共文档或 Git。
+`backend_generation`、连接、registry 与 owner 是 MySQL 部署初始化信息，长期保留；完成初始化后，local/MySQL 日常切换只改 `backend`。local 自动使用 file authority 并忽略 MySQL generation，mysql 自动使用 MySQL authority并校验 generation；`authority_provider` 不再是配置字段。`authority_owner_id` 必须在各 worktree/部署实例之间唯一且可审计，但它只是调用者身份，不代表独占 generation。shared writer 的写资格来自 active backend/generation/epoch 的事务校验。真实密码、主机、个人端口和绝对路径不得进入公共文档或 Git。
 
 ### 13.1 日常选择本地方案
 
@@ -531,7 +530,7 @@ backend = "local"
 2. 使用 SQLite Online Backup API 和文件二进制快照复制数据到临时快照；不直接在活动源文件上做不一致扫描。
 3. 执行 `copy_verify`，将快照内容复制到空的或匹配迁移批次的 MySQL schema。
 4. 生成 manifest，校验每个数据域的 identity、payload hash、版本链、引用、frontier 和总 root hash。
-5. 只有校验成功后，用户才将 `backend` 改为 `mysql`，并填写 manifest 产生的 `backend_generation`。
+5. 只有校验成功后，先把 manifest 产生的 verified generation 写入部署初始化配置；此后用户只将 `backend` 改为 `mysql`，不再联动修改其他字段。
 6. 用户手工启动首个 Elysium 进程，完成定向和真实端到端验收；需要并行开发时，其他 worktree 使用唯一 `authority_owner_id` 加入同一 generation，并配置不冲突的 HTTP 端口和外部适配器资源。
 7. 原 SQLite、文件、JSON/JSONL、Chroma 与媒体目录保持原位置和原内容，不移动、不删除。
 
@@ -760,7 +759,7 @@ outbox，World 108 条断言、983 条变化、7 个 perception cursor 与 front
 5. 校验记录数、稳定身份、hash root、引用与 frontier；
 6. 为 local 与 MySQL 分别签发可运行的 backend generation；
 7. 默认保持用户原来选择的后端，不由迁移器自动改配置；
-8. 用户如选择 MySQL，再手工将 `[storage].backend` 和 `backend_generation` 改为已验证值并启动；
+8. generation 已在部署初始化阶段登记；用户如选择 MySQL，只手工将 `[storage].backend` 改为 `mysql` 并启动；
 9. 执行真实聊天、记忆形成、检索、文档版本和重启冒烟；
 10. 原数据文件、快照、迁移 manifest 与 MySQL 副本全部长期保留，不删除、不移动。
 

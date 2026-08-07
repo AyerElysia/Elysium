@@ -330,7 +330,7 @@ export ELYSIUM_MYSQL_PASSWORD='<MYSQL_PASSWORD>'
 
 ### 6.2 全局 local / mysql 模式
 
-当前部署不再允许 Core 和 Life Engine 独立选择后端。唯一合法形态是：
+当前部署不再允许 Core 和 Life Engine 独立选择后端。`backend_generation`、MySQL 连接、registry 与 owner 是部署初始化时预先配置并长期保留的信息；完成初始化后，日常切换只允许修改 `[storage].backend` 一个字段。authority provider 由该字段自动派生，不再是用户配置项。唯一合法形态是：
 
 ```text
 [storage].backend = "local"
@@ -342,7 +342,7 @@ export ELYSIUM_MYSQL_PASSWORD='<MYSQL_PASSWORD>'
 └── Life Engine：同一 MySQL generation；Chroma/FTS 与工作区文件仍是可重建投影
 ```
 
-Life Engine 插件配置不再包含 `[storage]` 或 `[storage_mysql]`；MySQL 的后端选择、连接、generation、authority、owner 和 fencing 参数全部只在 `config/core.toml` 配置。插件仅保留 local 模式所需的 `[storage_local]` 路径。任何插件级 `enabled`、`authoritative_backend`、generation 或 MySQL 连接字段都是旧配置，严格校验会拒绝加载。
+Life Engine 插件配置不再包含 `[storage]` 或 `[storage_mysql]`；MySQL 的连接、generation、registry 和 owner 登记只在 `config/core.toml` 配置，后端选择只看 `[storage].backend`。`backend="local"` 时系统自动使用 file authority、忽略保留的 MySQL generation；`backend="mysql"` 时系统自动使用 MySQL authority并严格校验该 generation。旧 `[storage].authority_provider` 会被配置迁移移除，切换时不要清空/恢复 generation，也不要修改第二个开关。插件仅保留 local 模式所需的 `[storage_local]` 路径。任何插件级 `enabled`、`authoritative_backend`、generation 或 MySQL 连接字段都是旧配置，严格校验会拒绝加载。
 
 MySQL 模式并不意味着把 Chroma 或媒体字节强行塞入关系表：Life Event、Life Memory、Presence、World、Learning、Attention 和主体文档版本由 MySQL 作为权威；Chroma、全文索引和工作区 Markdown 是可重建投影；图片、语音、视频和附件字节仍按受管媒体合同保存在文件或对象存储中，MySQL 保存其身份、哈希、权限和位置元数据。旧 `life_engine_workspace/thoughts/streams.json` 仅属于 local 模式和迁移证据；MySQL selected runtime 不得实例化文件型 `ThoughtStreamManager`，也不得继续修改该文件。
 
