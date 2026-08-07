@@ -9,6 +9,7 @@ import pytest
 
 from plugins.life_engine.storage.memory.mysql import (
     _MYSQL_MEMORY_READINESS_REQUIREMENTS,
+    _UPSERT_INDEX_JOB,
     MySQLMemoryReadinessProbeError,
     inspect_mysql_memory_readiness,
 )
@@ -89,6 +90,16 @@ def _runtime(connection: _Connection) -> SimpleNamespace:
         backend=BackendKind.MYSQL,
         engine=_Engine(connection),
     )
+
+
+def test_index_job_upsert_uses_modern_mysql_row_alias() -> None:
+    sql = " ".join(str(_UPSERT_INDEX_JOB).split()).upper()
+
+    assert ") AS INCOMING ON DUPLICATE KEY UPDATE" in sql
+    assert "VALUES(NODE_ID)" not in sql
+    assert "VALUES(CONTENT_HASH)" not in sql
+    assert "VALUES(UPDATED_AT)" not in sql
+    assert "VALUES(INDEX_REVISION)" not in sql
 
 
 @pytest.mark.asyncio

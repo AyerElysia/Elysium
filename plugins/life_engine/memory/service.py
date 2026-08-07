@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.app.plugin_system.api import log_api
+from src.kernel.concurrency import get_task_manager
 
 from ..storage.contracts import StorageBackendRuntime
 from ..storage.memory import MemoryStorageBundle, open_mysql_memory_storage
@@ -138,7 +139,52 @@ _RECOVERY_READ_BATCH = 32
 # Projection repair is committed in bounded batches so remote MySQL never holds
 # every ghost node and vector tombstone in one long startup transaction.
 _RECOVERY_DELETE_BATCH = 64
+_MYSQL_RECOVERY_WRITE_CONCURRENCY = 8
 _MYSQL_MEMORY_STARTUP_PROBE_TIMEOUT_SECONDS = 30.0
+
+
+@dataclass
+class _StartupRecoveryProgress:
+    """Content-free progress for the service-owned workspace recovery task."""
+
+    status: str = "idle"
+    phase: str = "idle"
+    started_at: str = ""
+    finished_at: str = ""
+    total_documents: int = 0
+    processed_documents: int = 0
+    indexed_documents: int = 0
+    requeued_documents: int = 0
+    unchanged_documents: int = 0
+    legacy_documents: int = 0
+    read_failures: int = 0
+    ghost_documents: int = 0
+    artifact_total: int = 0
+    artifact_processed: int = 0
+    artifact_versions_appended: int = 0
+    error_type: str = ""
+
+    def health_snapshot(self) -> dict[str, Any]:
+        """Return bounded technical counters without paths or document content."""
+
+        return {
+            "status": self.status,
+            "phase": self.phase,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "total_documents": self.total_documents,
+            "processed_documents": self.processed_documents,
+            "indexed_documents": self.indexed_documents,
+            "requeued_documents": self.requeued_documents,
+            "unchanged_documents": self.unchanged_documents,
+            "legacy_documents": self.legacy_documents,
+            "read_failures": self.read_failures,
+            "ghost_documents": self.ghost_documents,
+            "artifact_total": self.artifact_total,
+            "artifact_processed": self.artifact_processed,
+            "artifact_versions_appended": self.artifact_versions_appended,
+            "error_type": self.error_type,
+        }
 
 
 @dataclass(frozen=True)
@@ -280,6 +326,8 @@ class LifeMemoryService:
         self._index_write_lock = asyncio.Lock()
         self._index_worker_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
+        self._startup_recovery_task: asyncio.Task[None] | None = None
+        self._startup_recovery_progress = _StartupRecoveryProgress()
 
     def _emit_visual_event(
         self,
@@ -512,10 +560,15 @@ class LifeMemoryService:
                 else:
                     logger.warning("Life Memory 向量后端已关闭，使用词法检索")
                 self._initialized = True
-                await self._startup_recovery()
+                if self._require_memory_storage().backend == BackendKind.MYSQL:
+                    self._start_background_startup_recovery()
+                else:
+                    await self._run_startup_recovery_owned(propagate_failure=True)
             except BaseException:
+                await self._cancel_startup_recovery()
                 self._memory_storage = None
                 self._db = None
+                self._initialized = False
                 bind_reader_pool(None)
                 if local_db is not None:
                     await run_db(local_db.close)
@@ -775,6 +828,100 @@ class LifeMemoryService:
         """
         await self._startup_recovery_via_ports()
 
+    async def _run_startup_recovery_owned(self, *, propagate_failure: bool) -> None:
+        """Run one recovery generation with content-free lifecycle diagnostics."""
+
+        self._startup_recovery_progress = _StartupRecoveryProgress(
+            status="running",
+            phase="scan",
+            started_at=datetime.now().astimezone().isoformat(),
+        )
+        try:
+            await self._startup_recovery()
+        except asyncio.CancelledError:
+            progress = self._startup_recovery_progress
+            progress.status = "cancelled"
+            progress.phase = "cancelled"
+            progress.finished_at = datetime.now().astimezone().isoformat()
+            logger.info(
+                "Memory workspace recovery cancelled: "
+                f"documents={progress.processed_documents}/{progress.total_documents} "
+                f"artifacts={progress.artifact_processed}/{progress.artifact_total}"
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001 - background failure is degraded
+            progress = self._startup_recovery_progress
+            progress.status = "failed"
+            progress.phase = "failed"
+            progress.finished_at = datetime.now().astimezone().isoformat()
+            progress.error_type = self._startup_recovery_error_type(exc)
+            logger.error(
+                "Memory workspace recovery failed; authority remains available: "
+                f"error_type={progress.error_type} "
+                f"documents={progress.processed_documents}/{progress.total_documents} "
+                f"artifacts={progress.artifact_processed}/{progress.artifact_total}"
+            )
+            if propagate_failure:
+                raise
+        else:
+            progress = self._startup_recovery_progress
+            progress.status = "completed"
+            progress.phase = "completed"
+            progress.finished_at = datetime.now().astimezone().isoformat()
+            logger.info(
+                "Memory workspace recovery completed: "
+                f"documents={progress.processed_documents}/{progress.total_documents} "
+                f"indexed={progress.indexed_documents} "
+                f"requeued={progress.requeued_documents} "
+                f"artifacts={progress.artifact_versions_appended}"
+            )
+
+    @staticmethod
+    def _startup_recovery_error_type(exc: BaseException) -> str:
+        """Return one bounded leaf exception class for structured concurrency."""
+
+        current = exc
+        while isinstance(current, BaseExceptionGroup) and current.exceptions:
+            current = current.exceptions[0]
+        candidate = type(current).__name__
+        if candidate.isascii() and candidate.isidentifier() and len(candidate) <= 64:
+            return candidate
+        return "RecoveryError"
+
+    def _start_background_startup_recovery(self) -> None:
+        """Start one MySQL recovery task without delaying plugin availability."""
+
+        current = self._startup_recovery_task
+        if current is not None and not current.done():
+            return
+        self._startup_recovery_progress = _StartupRecoveryProgress(
+            status="scheduled",
+            phase="scheduled",
+            started_at=datetime.now().astimezone().isoformat(),
+        )
+        task_info = get_task_manager().create_task(
+            self._run_startup_recovery_owned(propagate_failure=False),
+            name="life_memory_startup_recovery",
+            daemon=True,
+        )
+        if task_info.task is None:
+            raise RuntimeError("MemoryStartupRecoveryTaskUnavailable")
+        self._startup_recovery_task = task_info.task
+
+    async def _cancel_startup_recovery(self) -> None:
+        """Cancel and join the exact service-owned recovery task, if any."""
+
+        task = self._startup_recovery_task
+        self._startup_recovery_task = None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
     async def _startup_recovery_via_ports(self) -> None:
         """Reconcile workspace documents through the selected backend ports."""
 
@@ -789,45 +936,93 @@ class LifeMemoryService:
         loaded: dict[str, tuple[str, float]] = {}
         mtimes = {document.path: document.source_mtime for document in scan.documents}
         paths = [document.path for document in scan.documents]
+        progress = self._startup_recovery_progress
+        progress.phase = "document_index"
+        progress.total_documents = len(paths)
+        write_concurrency = (
+            _MYSQL_RECOVERY_WRITE_CONCURRENCY
+            if storage.backend == BackendKind.MYSQL
+            else 1
+        )
+        logger.info(
+            "Memory workspace recovery started: "
+            f"documents={len(paths)} write_concurrency={write_concurrency}"
+        )
+
+        async def _reconcile_document(path: str, content: str) -> None:
+            source_mtime = mtimes[path]
+            loaded[path] = (content, source_mtime)
+            digest = compute_content_hash(content) if content else ""
+            node = indexed.get(path)
+            if node is None:
+                await storage.document_index.upsert_document(
+                    path,
+                    content,
+                    Path(path).stem,
+                    source_mtime,
+                )
+                progress.indexed_documents += 1
+            elif node.node_id != generate_file_node_id(path):
+                progress.legacy_documents += 1
+                legacy_hash = str(node.content_hash or "")
+                if not node.embedding_synced and legacy_hash:
+                    await storage.document_index.enqueue_job(
+                        node.node_id,
+                        legacy_hash,
+                    )
+                    progress.requeued_documents += 1
+                logger.warning(
+                    "启动扫描保留非规范 legacy 文档身份，等待显式迁移: "
+                    f"path={path} node_id={node.node_id}"
+                )
+            elif str(node.content_hash or "") != digest:
+                await storage.document_index.upsert_document(
+                    path,
+                    content,
+                    Path(path).stem,
+                    source_mtime,
+                )
+                progress.indexed_documents += 1
+            elif not node.embedding_synced and digest:
+                await storage.document_index.enqueue_job(node.node_id, digest)
+                progress.requeued_documents += 1
+            else:
+                progress.unchanged_documents += 1
+            progress.processed_documents += 1
+            if progress.processed_documents % 64 == 0:
+                logger.info(
+                    "Memory workspace recovery progress: "
+                    f"documents={progress.processed_documents}/"
+                    f"{progress.total_documents} indexed={progress.indexed_documents} "
+                    f"requeued={progress.requeued_documents}"
+                )
+
         for start in range(0, len(paths), _RECOVERY_READ_BATCH):
             batch = paths[start : start + _RECOVERY_READ_BATCH]
             documents = await asyncio.to_thread(_read_documents, workspace, batch)
-            for path, content in documents:
-                source_mtime = mtimes[path]
-                loaded[path] = (content, source_mtime)
-                digest = compute_content_hash(content) if content else ""
-                node = indexed.get(path)
-                if node is None:
-                    await storage.document_index.upsert_document(
-                        path,
-                        content,
-                        Path(path).stem,
-                        source_mtime,
-                    )
-                elif node.node_id != generate_file_node_id(path):
-                    legacy_hash = str(node.content_hash or "")
-                    if not node.embedding_synced and legacy_hash:
-                        await storage.document_index.enqueue_job(
-                            node.node_id,
-                            legacy_hash,
-                        )
-                    logger.warning(
-                        "启动扫描保留非规范 legacy 文档身份，等待显式迁移: "
-                        f"path={path} node_id={node.node_id}"
-                    )
-                elif str(node.content_hash or "") != digest:
-                    await storage.document_index.upsert_document(
-                        path,
-                        content,
-                        Path(path).stem,
-                        source_mtime,
-                    )
-                elif not node.embedding_synced and digest:
-                    await storage.document_index.enqueue_job(node.node_id, digest)
+            failed_reads = len(batch) - len(documents)
+            if failed_reads:
+                progress.read_failures += failed_reads
+                progress.processed_documents += failed_reads
+            if write_concurrency == 1:
+                for path, content in documents:
+                    await _reconcile_document(path, content)
+            else:
+                semaphore = asyncio.Semaphore(write_concurrency)
+
+                async def _bounded_reconcile(path: str, content: str) -> None:
+                    async with semaphore:
+                        await _reconcile_document(path, content)
+
+                async with asyncio.TaskGroup() as task_group:
+                    for path, content in documents:
+                        task_group.create_task(_bounded_reconcile(path, content))
 
         missing_node_ids = [
             indexed[path].node_id for path in sorted(set(indexed) - workspace_paths)
         ]
+        progress.phase = "projection_cleanup"
+        progress.ghost_documents = len(missing_node_ids)
         if missing_node_ids:
             retired = 0
             total = len(missing_node_ids)
@@ -975,6 +1170,10 @@ class LifeMemoryService:
         living = self._require_memory_storage().living
         head_records = await living.list_artifact_heads()
         heads = {version.logical_key: (version, head) for version, head in head_records}
+        missing_heads = [key for key in heads if key not in workspace_paths]
+        progress = self._startup_recovery_progress
+        progress.phase = "artifact_versions"
+        progress.artifact_total = len(loaded) + len(missing_heads)
         appended = 0
         for logical_key, (content, source_mtime) in loaded.items():
             current = heads.get(logical_key)
@@ -989,10 +1188,17 @@ class LifeMemoryService:
                     current_head=current[1] if current is not None else None,
                 )
             )
+            progress.artifact_processed += 1
+            progress.artifact_versions_appended = appended
+            if progress.artifact_processed % 64 == 0:
+                logger.info(
+                    "Memory artifact recovery progress: "
+                    f"artifacts={progress.artifact_processed}/"
+                    f"{progress.artifact_total} appended={appended}"
+                )
 
-        for logical_key, (current_version, current_head) in heads.items():
-            if logical_key in workspace_paths:
-                continue
+        for logical_key in missing_heads:
+            current_version, current_head = heads[logical_key]
             appended += int(
                 await self._append_workspace_observation(
                     living=living,
@@ -1004,6 +1210,14 @@ class LifeMemoryService:
                     current_head=current_head,
                 )
             )
+            progress.artifact_processed += 1
+            progress.artifact_versions_appended = appended
+            if progress.artifact_processed % 64 == 0:
+                logger.info(
+                    "Memory artifact recovery progress: "
+                    f"artifacts={progress.artifact_processed}/"
+                    f"{progress.artifact_total} appended={appended}"
+                )
         return appended
 
     async def _reconcile_workspace_artifact_versions(
@@ -1158,6 +1372,7 @@ class LifeMemoryService:
 
             self._closing = True
             try:
+                await self._cancel_startup_recovery()
                 async with self._index_worker_lock:
                     async with self._index_write_lock:
                         db = self._db
@@ -3325,6 +3540,8 @@ class LifeMemoryService:
             storage = self._require_memory_storage()
             collection = self._chunk_collection or self._chroma_collection
             local_db_open = self._db is not None
+            recovery = self._startup_recovery_progress.health_snapshot()
+            runtime = self._storage_runtime
         names = (
             "document_index",
             "experiences",
@@ -3333,6 +3550,85 @@ class LifeMemoryService:
             "epistemic",
             "legacy_graph",
         )
+        if (
+            storage.backend == BackendKind.MYSQL
+            and runtime is not None
+            and runtime.enabled
+            and runtime.backend == BackendKind.MYSQL
+        ):
+            try:
+                runtime_health = await runtime.health()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - health must be content-free
+                runtime_health = {
+                    "status": "failed",
+                    "backend": "mysql",
+                    "error_type": type(exc).__name__,
+                }
+            if not isinstance(runtime_health, dict):
+                runtime_health = {
+                    "status": "failed",
+                    "backend": "mysql",
+                    "error_type": "InvalidHealthPayload",
+                }
+            raw_status = str(runtime_health.get("status") or "failed")
+            try:
+                runtime_status = StorageAvailability(raw_status)
+            except ValueError:
+                runtime_status = StorageAvailability.FAILED
+                runtime_health = {
+                    "status": "failed",
+                    "backend": "mysql",
+                    "error_type": "InvalidHealthStatus",
+                }
+
+            if runtime_status in {
+                StorageAvailability.HEALTHY,
+                StorageAvailability.DEGRADED,
+            }:
+                try:
+                    readiness = await inspect_mysql_memory_readiness(runtime)
+                except asyncio.CancelledError:
+                    raise
+                except MySQLMemoryReadinessProbeError as exc:
+                    ports = {name: "failed" for name in names}
+                    runtime_status = StorageAvailability.FAILED
+                    runtime_health = {
+                        "status": "failed",
+                        "backend": "mysql",
+                        "error_type": exc.error_type,
+                    }
+                else:
+                    ports = {
+                        name: readiness.get(
+                            name,
+                            StorageAvailability.FAILED,
+                        ).value
+                        for name in names
+                    }
+                    if not set(ports.values()) <= {"healthy", "degraded"}:
+                        runtime_status = StorageAvailability.FAILED
+            else:
+                ports = {name: "failed" for name in names}
+
+            status = runtime_status.value
+            if status == "healthy" and recovery["status"] in {
+                "scheduled",
+                "running",
+                "failed",
+            }:
+                status = "degraded"
+            return {
+                "status": status,
+                "backend": storage.backend.value,
+                "ports": ports,
+                "runtime": runtime_health,
+                "vector_expected": self._vector_backend_enabled,
+                "vector_collection_loaded": collection is not None,
+                "startup_recovery": recovery,
+            }
+
         statuses = await asyncio.gather(
             *(getattr(storage, name).availability() for name in names)
         )
@@ -3347,6 +3643,7 @@ class LifeMemoryService:
                 vector_expected=self._vector_backend_enabled,
             )
             snapshot.update(backend=storage.backend.value, ports=ports)
+            snapshot["startup_recovery"] = recovery
             return snapshot
         runtime_health = (
             await self._storage_runtime.health()
@@ -3359,13 +3656,21 @@ class LifeMemoryService:
                 "reason": "injected MemoryStorageBundle",
             }
         )
+        status = str(runtime_health.get("status", "failed"))
+        if status == "healthy" and recovery["status"] in {
+            "scheduled",
+            "running",
+            "failed",
+        }:
+            status = "degraded"
         return {
-            "status": runtime_health.get("status", "failed"),
+            "status": status,
             "backend": storage.backend.value,
             "ports": ports,
             "runtime": runtime_health,
             "vector_expected": self._vector_backend_enabled,
             "vector_collection_loaded": collection is not None,
+            "startup_recovery": recovery,
         }
 
     # --------------------------------------------------------

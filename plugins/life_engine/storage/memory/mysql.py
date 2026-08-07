@@ -108,6 +108,21 @@ from .contracts import MemoryStorageBundle
 _T = TypeVar("_T")
 _MAX_WRITE_ATTEMPTS = 3
 
+_UPSERT_INDEX_JOB = text(
+    """INSERT INTO memory_index_jobs (
+        job_id, node_id, content_hash, status, created_at,
+        updated_at, attempts, error, index_revision
+    ) VALUES (
+        :job_id, :node_id, :content_hash, 'pending', :now,
+        :now, 0, '', :revision
+    ) AS incoming
+    ON DUPLICATE KEY UPDATE
+        node_id = incoming.node_id,
+        content_hash = incoming.content_hash,
+        status = 'pending', updated_at = incoming.updated_at,
+        error = '', index_revision = incoming.index_revision"""
+)
+
 _MYSQL_MEMORY_READINESS_REQUIREMENTS: dict[
     str,
     dict[str, tuple[str, ...]],
@@ -708,19 +723,7 @@ class MySQLDocumentIndexProjection(_MySQLPort):
         job_id = f"{node_id}:{content_hash}" if body else None
         if job_id:
             await session.execute(
-                text(
-                    """INSERT INTO memory_index_jobs (
-                        job_id, node_id, content_hash, status, created_at,
-                        updated_at, attempts, error, index_revision
-                    ) VALUES (
-                        :job_id, :node_id, :content_hash, 'pending', :now,
-                        :now, 0, '', :revision
-                    ) ON DUPLICATE KEY UPDATE
-                        node_id = VALUES(node_id),
-                        content_hash = VALUES(content_hash),
-                        status = 'pending', updated_at = VALUES(updated_at),
-                        error = '', index_revision = VALUES(index_revision)"""
-                ),
+                _UPSERT_INDEX_JOB,
                 {
                     "job_id": job_id,
                     "node_id": node_id,
@@ -1033,17 +1036,7 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                 raise ValueError("index job does not match the current document")
             now = time.time()
             await session.execute(
-                text(
-                    """INSERT INTO memory_index_jobs (
-                        job_id, node_id, content_hash, status, created_at,
-                        updated_at, attempts, error, index_revision
-                    ) VALUES (
-                        :job_id, :node_id, :content_hash, 'pending', :now,
-                        :now, 0, '', :revision
-                    ) ON DUPLICATE KEY UPDATE
-                        status = 'pending', updated_at = VALUES(updated_at),
-                        error = '', index_revision = VALUES(index_revision)"""
-                ),
+                _UPSERT_INDEX_JOB,
                 {
                     "job_id": job_id,
                     "node_id": node_id,
@@ -1160,17 +1153,7 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                     continue
                 node_id = str(row["node_id"])
                 await session.execute(
-                    text(
-                        """INSERT INTO memory_index_jobs (
-                            job_id, node_id, content_hash, status, created_at,
-                            updated_at, attempts, error, index_revision
-                        ) VALUES (
-                            :job_id, :node_id, :content_hash, 'pending', :now,
-                            :now, 0, '', :revision
-                        ) ON DUPLICATE KEY UPDATE
-                            status = 'pending', updated_at = VALUES(updated_at),
-                            error = '', index_revision = VALUES(index_revision)"""
-                    ),
+                    _UPSERT_INDEX_JOB,
                     {
                         "job_id": f"{node_id}:{content_hash}",
                         "node_id": node_id,
