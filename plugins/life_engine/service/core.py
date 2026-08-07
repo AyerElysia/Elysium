@@ -7173,11 +7173,7 @@ class LifeEngineService(BaseService):
         self._update_heartbeat_idle_count(heartbeat_tool_calls)
 
         # 三环自学习系统心跳（低频后台任务：审计/压缩/指标）
-        if self._learning_scheduler is not None:
-            try:
-                await self._learning_scheduler.on_heartbeat()
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("学习系统心跳异常: %s", type(exc).__name__)
+        await self._run_learning_heartbeat_maintenance()
 
         if not last_text:
             if tool_event_count > 0:
@@ -7186,6 +7182,17 @@ class LifeEngineService(BaseService):
                 last_text = "此刻很安静，但我仍在持续感受与观察。"
 
         return HeartbeatModelResult(last_text, perception_receipt)
+
+    async def _run_learning_heartbeat_maintenance(self) -> None:
+        """Keep derived learning maintenance isolated from the main heartbeat."""
+
+        scheduler = self._learning_scheduler
+        if scheduler is None:
+            return
+        try:
+            await scheduler.on_heartbeat()
+        except Exception as exc:  # noqa: BLE001 - derived learning is isolated
+            logger.debug(f"学习系统心跳异常: {type(exc).__name__}")
 
     def _mark_runtime_context_persisted(self) -> None:
         """Mark the exact state snapshot protected by ``self._lock`` clean."""

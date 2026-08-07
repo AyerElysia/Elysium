@@ -106,6 +106,30 @@ def test_memory_service_property_aliases_private_field(tmp_path: Path) -> None:
     assert service.memory_service is sentinel
 
 
+async def test_learning_maintenance_failure_does_not_escape_main_heartbeat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Derived learning failure must not replace the heartbeat model result."""
+
+    service = _make_service(tmp_path)
+
+    class _FailingLearningScheduler:
+        async def on_heartbeat(self) -> None:
+            raise RuntimeError("selected learning persistence failed closed")
+
+    messages: list[str] = []
+    service._learning_scheduler = _FailingLearningScheduler()  # type: ignore[assignment]
+    monkeypatch.setattr(
+        "plugins.life_engine.service.core.logger.debug",
+        messages.append,
+    )
+
+    await service._run_learning_heartbeat_maintenance()
+
+    assert messages == ["学习系统心跳异常: RuntimeError"]
+
+
 def test_cfg_auto_migrates_legacy_config_without_thresholds(tmp_path: Path) -> None:
     """旧版配置对象缺少 thresholds 时，_cfg 应自动迁移为新结构。"""
 
