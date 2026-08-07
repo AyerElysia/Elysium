@@ -299,12 +299,92 @@ class StreamManager:
         statement = getattr(query, "_stmt", None)
         if statement is not None:
             query._stmt = statement.options(defer(self._Messages.content))
+        restore_started_at = time.perf_counter()
         messages_records = await query.all()
 
-        # 转换为运行时 Message 对象
-        history_messages = []
-        for msg_record in reversed(messages_records):  # 按时间正序
-            history_messages.append(await self._db_message_to_runtime(msg_record, defer_content=True))  # type: ignore
+        # 冷启动时一次性恢复发送者投影。旧实现会对最多 1000 条历史逐条查询
+        # PersonInfo；远端 MySQL 下会形成分钟级 N+1 延迟，并阻塞该流把首条
+        # 未读消息交给 Chatter。权威消息仍由上面的单次查询完整读取，这里的
+        # cache 只负责运行时显示身份。
+        from src.core.managers.adapter_manager import get_adapter_manager
+        from src.core.utils.user_query_helper import get_user_query_helper
+
+        person_ids = sorted(
+            {
+                str(record.person_id)
+                for record in messages_records
+                if getattr(record, "person_id", None)
+                and str(record.person_id) != "bot"
+            }
+        )
+        person_cache: dict[str, Any | None] = {
+            person_id: None for person_id in person_ids
+        }
+        if person_ids:
+            try:
+                people = await get_user_query_helper().person_crud.get_multi(
+                    skip=0,
+                    limit=len(person_ids),
+                    person_id=person_ids,
+                )
+                person_cache.update(
+                    {
+                        str(person.person_id): person
+                        for person in people
+                        if getattr(person, "person_id", None)
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "批量恢复历史发送者失败，使用不可逆 person_id 占位继续建流: "
+                    f"stream_id={stream_id[:8]}, error_type={type(exc).__name__}"
+                )
+
+        bot_platforms = sorted(
+            {
+                str(record.platform)
+                for record in messages_records
+                if str(getattr(record, "person_id", "") or "") == "bot"
+                and getattr(record, "platform", None)
+            }
+        )
+        bot_info_cache: dict[str, dict[str, Any] | None] = {}
+        if bot_platforms:
+            adapter_manager = get_adapter_manager()
+
+            async def _load_bot_info(platform: str) -> tuple[str, dict[str, Any] | None]:
+                try:
+                    info = await adapter_manager.get_bot_info_by_platform(platform)
+                    return platform, info
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "批量恢复 Bot 显示身份失败: "
+                        f"platform={platform}, error_type={type(exc).__name__}"
+                    )
+                    return platform, None
+
+            bot_info_cache.update(
+                await asyncio.gather(*(_load_bot_info(platform) for platform in bot_platforms))
+            )
+
+        stream_info = {"chat_type": stream_record.chat_type}
+        history_messages = [
+            await self._db_message_to_runtime(
+                msg_record,
+                defer_content=True,
+                stream_info=stream_info,
+                person_cache=person_cache,
+                bot_info_cache=bot_info_cache,
+            )
+            for msg_record in reversed(messages_records)
+        ]
+        restore_elapsed = time.perf_counter() - restore_started_at
+        logger.info(
+            "聊天流上下文恢复完成: "
+            f"stream_id={stream_id[:8]}, messages={len(messages_records)}, "
+            f"unique_senders={len(person_ids)}, bot_platforms={len(bot_platforms)}, "
+            f"elapsed={restore_elapsed:.3f}s"
+        )
 
         # 创建 StreamContext
         context = StreamContext(
@@ -829,6 +909,10 @@ class StreamManager:
         self,
         db_message: "Messages",
         defer_content: bool = False,
+        *,
+        stream_info: dict[str, Any] | None = None,
+        person_cache: dict[str, Any | None] | None = None,
+        bot_info_cache: dict[str, dict[str, Any] | None] | None = None,
     ) -> "Message":
         """将数据库消息转换为运行时消息。
 
@@ -843,17 +927,25 @@ class StreamManager:
         from src.core.models.message import Message, MessageType
         from src.core.utils.user_query_helper import get_user_query_helper
 
-        stream_info = await get_stream_manager().get_stream_info(db_message.stream_id)
+        resolved_stream_info = stream_info
+        if resolved_stream_info is None:
+            resolved_stream_info = await get_stream_manager().get_stream_info(
+                db_message.stream_id
+            )
 
         sender_id = "system"
         sender_name = "未知用户"
         sender_cardname = ""
 
-        if db_message.person_id:
+        if db_message.person_id and db_message.person_id != "bot":
             try:
-                person = await get_user_query_helper().person_crud.get_by(
-                    person_id=db_message.person_id
-                )
+                person_id = str(db_message.person_id)
+                if person_cache is not None and person_id in person_cache:
+                    person = person_cache[person_id]
+                else:
+                    person = await get_user_query_helper().person_crud.get_by(
+                        person_id=person_id
+                    )
                 if person:
                     sender_id = str(person.user_id or person.person_id or "")
                     sender_name = person.nickname or sender_id or "未知用户"
@@ -871,11 +963,15 @@ class StreamManager:
         # person_id == "bot" 表示 Bot 发送的消息
         if db_message.person_id == "bot" and db_message.platform:
             try:
-                from src.core.managers.adapter_manager import get_adapter_manager
+                platform = str(db_message.platform)
+                if bot_info_cache is not None and platform in bot_info_cache:
+                    bot_info = bot_info_cache[platform]
+                else:
+                    from src.core.managers.adapter_manager import get_adapter_manager
 
-                bot_info = await get_adapter_manager().get_bot_info_by_platform(
-                    db_message.platform
-                )
+                    bot_info = await get_adapter_manager().get_bot_info_by_platform(
+                        platform
+                    )
                 if bot_info:
                     bot_id = str(bot_info.get("bot_id", "") or "")
                     bot_nickname = str(bot_info.get("bot_name", "") or "")
@@ -908,7 +1004,11 @@ class StreamManager:
             sender_name=sender_name,
             sender_cardname=sender_cardname,
             platform=db_message.platform or "",
-            chat_type=stream_info.get("chat_type", "private") if stream_info else "private",
+            chat_type=(
+                resolved_stream_info.get("chat_type", "private")
+                if resolved_stream_info
+                else "private"
+            ),
             stream_id=db_message.stream_id,
             raw_data=None,
             extra={},

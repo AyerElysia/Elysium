@@ -108,14 +108,14 @@ def test_life_decision_panel_maps_reasoning_message_and_tools(
     assert "内部理由" not in content
 
 
-def test_life_send_text_normalize_splits_newlines_in_plain_text() -> None:
+def test_life_send_text_normalize_preserves_newlines_in_one_message() -> None:
     result = LifeSendTextAction._normalize_content_segments("第一条\n\n第二条\r\n第三条")
-    assert result == ["第一条", "第二条", "第三条"]
+    assert result == ["第一条\n\n第二条\n第三条"]
 
 
-def test_life_send_text_normalize_splits_escaped_newlines_in_string() -> None:
+def test_life_send_text_normalize_preserves_escaped_newlines_in_one_message() -> None:
     result = LifeSendTextAction._normalize_content_segments("第一条\\n第二条\n第三条")
-    assert result == ["第一条", "第二条", "第三条"]
+    assert result == ["第一条\n第二条\n第三条"]
 
 
 def test_life_send_text_rejects_placeholder_only_content() -> None:
