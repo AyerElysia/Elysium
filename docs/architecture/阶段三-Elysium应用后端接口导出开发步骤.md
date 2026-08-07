@@ -1353,6 +1353,18 @@ Provider 边界必须如实保留：NapCat notice 已覆盖撤回、回应、戳
 
 ### P3-10：狼人杀领域 API 与耐久恢复
 
+状态：**已完成用户层代码接入与离线契约验收；管理裁判台、真实客户端 WebSocket 和跨平台群聊 E2E 暂未验收。**
+
+已落地：
+
+- 为 `WerewolfEngine` 增加 `RoomPublicView`、`PlayerPrivateView`、`ModeratorView` 和结束后 `ReplayView`，公共 API 不序列化 raw `GameState`；
+- 新增 SQLite 追加式 game event ledger、revision snapshot、action id 去重和同 id 异内容冲突；每次提交追加仅裁判可读的 snapshot event，projection 损坏时可从 ledger 重建；
+- 新 API 场次与旧 `plugin._werewolf_games` 明确隔离，不扫描、迁移或接管现存内存房间；
+- 群命令在命中 ledger 房间时与 HTTP 共用 `WerewolfDomainService`，平台 message id 作为稳定 action id，避免双重执行；旧房间仍沿原生命周期处理；
+- 导出 games、room create/query/join/leave/start/end、授权 events、actor-bound private view、actions、replay 和 ticket 约束下的实时房间事件流；
+- 私密夜间 action 与 engine event 按 actor 可见性过滤，非玩家需精确 `tabletop:{room_id}` grant；
+- 管理层 `admin/tabletop` inventory 仍保持 experimental，留待 P3-11 接入审计与裁判操作。
+
 任务：
 
 1. 先为 engine 建立 Public／Player／Moderator／Replay projection。

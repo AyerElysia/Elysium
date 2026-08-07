@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from ..service.perception_gateway import PerceptionDeliveryReceipt
+from .bot_launcher import MinecraftBotLauncher
 from .bridge_body import BridgeBody
 from .bridge_client import (
     BridgeConfig,
@@ -32,6 +33,7 @@ from .launcher import MCConfig, MinecraftLauncher
 from .model_planner import (
     AGENT_BRIDGE_GUIDANCE,
     BIOMIMETIC_GUIDANCE,
+    BOT_BRIDGE_GUIDANCE,
     ElysiumModelDecisionSource,
     JsonIntentPlanner,
 )
@@ -136,6 +138,7 @@ class MinecraftSession:
         self._workspace = workspace
         self._config = mc_config or MCConfig()
         self._launcher = MinecraftLauncher(self._config)
+        self._bot_launcher = MinecraftBotLauncher()
         self._capture = WindowCapture()
         self._registry = consciousness_registry
         self._save_registry = save_consciousness_registry
@@ -180,6 +183,8 @@ class MinecraftSession:
                 "error": f"body is not configured: {selected_name}",
                 "configured_bodies": sorted(self._body_profiles()),
             }
+        if selected_name == "bot":
+            return await self._bot_preflight(profile)
         blockers: list[str] = []
         try:
             installation = await self._launcher.check_installation()
@@ -242,6 +247,66 @@ class MinecraftSession:
             "token_bootstraps_on_launch": token_bootstraps_on_launch,
         }
 
+    async def _bot_preflight(self, profile: BodyProfile) -> dict[str, Any]:
+        """Inspect headless bot deployment facts without Windows control."""
+
+        blockers: list[str] = []
+        node_check = await self._bot_launcher.check_node()
+        if not node_check["available"]:
+            blockers.append(f"node runtime is unavailable: {node_check['error']}")
+        dependency_check = self._bot_launcher.check_dependencies()
+        if not dependency_check["entrypoint_exists"]:
+            blockers.append("bot entrypoint is missing from integrations/minecraft_bot")
+        if not dependency_check.get("lockfile_exists", False):
+            blockers.append("bot package-lock.json is missing")
+        if not dependency_check["dependencies_installed"]:
+            blockers.append(
+                "bot dependencies are not installed; run npm ci in "
+                "integrations/minecraft_bot; missing: "
+                + ", ".join(dependency_check.get("missing_modules", ()))
+            )
+        return {
+            "success": not blockers,
+            "body_name": profile.name,
+            "ready_to_start": not blockers,
+            "blockers": blockers,
+            "installation": None,
+            "existing_window": None,
+            "bot_directory": str(self._bot_launcher.directory),
+            "server_address": (
+                f"{self._config.bot_server_host}:{self._config.bot_server_port}"
+            ),
+            "required_operations": sorted(profile.required_operations),
+            "expected_bridge_version": self._config.expected_bridge_version,
+            "token_bootstraps_on_launch": True,
+        }
+
+    async def _launch_bot_body(self, profile: BodyProfile, session_id: str) -> str:
+        """Start the owned headless bot process; return exact failure text."""
+
+        try:
+            token = await asyncio.to_thread(
+                MinecraftBotLauncher.ensure_token, profile.token_file
+            )
+        except Exception as exception:  # noqa: BLE001 - launch boundary
+            return f"bot token bootstrap failed: {exception}"
+        result = await self._bot_launcher.start(
+            bridge_uri=profile.listen_uri or profile.uri,
+            token=token,
+            server_host=self._config.bot_server_host,
+            server_port=self._config.bot_server_port,
+            username=self._config.bot_username,
+            minecraft_version=self._config.mc_version,
+            instance_id=f"bot_{session_id}",
+            observation_interval_ms=self._config.bot_observation_interval_ms,
+            entity_radius_blocks=self._config.bot_entity_radius_blocks,
+        )
+        if result["success"]:
+            self._state.launch_pid = result["pid"]
+            self._state.window = None
+            return ""
+        return str(result["error"] or "bot process launch failed")
+
     async def start(self, goal: str = "", body_name: str = "") -> dict[str, Any]:
         """Launch Minecraft and connect one explicitly named body."""
 
@@ -292,16 +357,41 @@ class MinecraftSession:
             readiness_detail="checking installation and exact world launch contract",
         )
 
-        try:
-            installation = await self._launcher.check_installation()
-        except Exception as exception:  # noqa: BLE001 - public lifecycle boundary
-            self._state.readiness = ReadinessState.FAILED
-            self._state.readiness_detail = (
-                f"installation inspection failed: {exception}"
-            )
-            self._state.last_error = self._state.readiness_detail
-            return {"success": False, "error": self._state.readiness_detail}
+        if selected_name == "bot":
+            installation = {
+                "exists": True,
+                "has_version": True,
+                "bat_exists": True,
+                "quick_play_configured": True,
+            }
+        else:
+            try:
+                installation = await self._launcher.check_installation()
+            except Exception as exception:  # noqa: BLE001 - public lifecycle boundary
+                self._state.readiness = ReadinessState.FAILED
+                self._state.readiness_detail = (
+                    f"installation inspection failed: {exception}"
+                )
+                self._state.last_error = self._state.readiness_detail
+                return {"success": False, "error": self._state.readiness_detail}
         blockers: list[str] = []
+        if selected_name == "bot":
+            node_check = await self._bot_launcher.check_node()
+            if not node_check["available"]:
+                blockers.append(f"node runtime is unavailable: {node_check['error']}")
+            dependency_check = self._bot_launcher.check_dependencies()
+            if not dependency_check["entrypoint_exists"]:
+                blockers.append(
+                    "bot entrypoint is missing from integrations/minecraft_bot"
+                )
+            if not dependency_check.get("lockfile_exists", False):
+                blockers.append("bot package-lock.json is missing")
+            if not dependency_check["dependencies_installed"]:
+                blockers.append(
+                    "bot dependencies are not installed; run npm ci in "
+                    "integrations/minecraft_bot; missing: "
+                    + ", ".join(dependency_check.get("missing_modules", ()))
+                )
         if not installation.get("exists"):
             blockers.append("Minecraft home is missing")
         if not installation.get("has_version"):
@@ -341,25 +431,39 @@ class MinecraftSession:
             }
 
         self._state.readiness = ReadinessState.LAUNCHING
-        self._state.readiness_detail = (
-            "dispatching or reusing the exact Minecraft client"
-        )
-        try:
-            launch = await self._launcher.launch()
-        except Exception as exception:  # noqa: BLE001 - public lifecycle boundary
-            self._state.readiness = ReadinessState.FAILED
-            self._state.readiness_detail = f"Minecraft launch failed: {exception}"
-            self._state.last_error = self._state.readiness_detail
-            return {"success": False, "error": self._state.readiness_detail}
-        if not launch.success:
-            self._state.readiness = ReadinessState.FAILED
-            self._state.readiness_detail = launch.error or "launch dispatch failed"
-            self._state.last_error = self._state.readiness_detail
-            return {"success": False, "error": launch.error}
-        self._state.launch_pid = launch.pid
-        self._state.window = launch.window
-
         session_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S_%fZ")
+        if selected_name == "bot":
+            self._state.readiness_detail = (
+                "starting the owned headless bot body process"
+            )
+            launch_error = await self._launch_bot_body(profile, session_id)
+            if launch_error:
+                self._state.readiness = ReadinessState.FAILED
+                self._state.readiness_detail = launch_error
+                self._state.last_error = launch_error
+                return {"success": False, "error": launch_error}
+        else:
+            self._state.readiness_detail = (
+                "dispatching or reusing the exact Minecraft client"
+            )
+            try:
+                launch = await self._launcher.launch()
+            except Exception as exception:  # noqa: BLE001 - public lifecycle boundary
+                self._state.readiness = ReadinessState.FAILED
+                self._state.readiness_detail = (
+                    f"Minecraft launch failed: {exception}"
+                )
+                self._state.last_error = self._state.readiness_detail
+                return {"success": False, "error": self._state.readiness_detail}
+            if not launch.success:
+                self._state.readiness = ReadinessState.FAILED
+                self._state.readiness_detail = (
+                    launch.error or "launch dispatch failed"
+                )
+                self._state.last_error = self._state.readiness_detail
+                return {"success": False, "error": launch.error}
+            self._state.launch_pid = launch.pid
+            self._state.window = launch.window
         trace = EmbodimentTrace(
             self._workspace / "minecraft" / "traces" / f"{session_id}.jsonl"
         )
@@ -397,6 +501,9 @@ class MinecraftSession:
             observation = await self._wait_for_playable_observation(body, profile)
         except Exception as exception:  # noqa: BLE001 - return exact readiness failure
             cleanup_error = await self._cleanup_runtime(runtime)
+            bot_cleanup_error = await self._cleanup_bot_after_failed_start(
+                selected_name
+            )
             if cleanup_error:
                 self._runtime = runtime
                 self._trace = trace
@@ -406,6 +513,8 @@ class MinecraftSession:
             error = f"Minecraft body did not become ready: {exception}"
             if cleanup_error:
                 error = f"{error}; cleanup failed: {cleanup_error}"
+            if bot_cleanup_error:
+                error = f"{error}; bot cleanup failed: {bot_cleanup_error}"
             return {
                 "success": False,
                 "error": error,
@@ -437,8 +546,8 @@ class MinecraftSession:
             latest_observation=observation,
             readiness=ReadinessState.READY,
             readiness_detail="playable world and required body capabilities verified",
-            launch_pid=launch.pid,
-            window=launch.window,
+            launch_pid=self._state.launch_pid,
+            window=self._state.window,
             game_instance_id=client.instance_id,
             bridge_version=str(
                 getattr(client, "hello_metadata", {}).get("bridge_version") or ""
@@ -462,6 +571,11 @@ class MinecraftSession:
                 await self._terminate_consciousness()
             except Exception as cleanup_exception:  # noqa: BLE001
                 cleanup_errors.append(f"Presence cleanup failed: {cleanup_exception}")
+            bot_cleanup_error = await self._cleanup_bot_after_failed_start(
+                selected_name
+            )
+            if bot_cleanup_error:
+                cleanup_errors.append(f"bot cleanup failed: {bot_cleanup_error}")
             self._state.active = False
             self._state.readiness = ReadinessState.FAILED
             self._state.readiness_detail = str(exception)
@@ -529,6 +643,10 @@ class MinecraftSession:
                 await self._terminate_consciousness()
             except Exception as exception:  # noqa: BLE001
                 errors.append(f"Presence cleanup failed: {exception}")
+        if self._state.body_name == "bot":
+            bot_stop = await self._bot_launcher.stop()
+            if not bot_stop.get("success", False):
+                errors.append(f"bot process cleanup failed: {bot_stop.get('error')}")
         duration = self._state.duration_seconds
         session_id = self._state.session_id
         trace_path = str(self._trace.path) if self._trace else ""
@@ -546,7 +664,7 @@ class MinecraftSession:
             "duration_seconds": duration,
             "conclusions": list(self._state.conclusions),
             "trace_path": trace_path,
-            "game_left_running": True,
+            "game_left_running": self._state.body_name != "bot",
             "errors": errors,
             "cleanup_pending": self._has_cleanup_pending(),
         }
@@ -775,6 +893,28 @@ class MinecraftSession:
         """Evaluate technical body readiness without assigning subjective meaning."""
 
         facts = observation.facts
+        if profile.readiness_kind == "server_world":
+            if facts.get("world_loaded") is not True:
+                screen = facts.get("screen")
+                screen_name = (
+                    str(screen.get("class") or screen.get("title") or "unknown")
+                    if isinstance(screen, dict)
+                    else "unknown"
+                )
+                return (
+                    False,
+                    f"no playable server world is loaded; current screen={screen_name}",
+                )
+            world = facts.get("world")
+            if not isinstance(world, dict):
+                return False, "bridge observation is missing world identity"
+            player = facts.get("player")
+            if not isinstance(player, dict) or not str(player.get("uuid") or ""):
+                return (
+                    False,
+                    "playable world observation is missing player identity",
+                )
+            return True, "server world is ready"
         if profile.readiness_kind == "structured_world":
             if facts.get("world_loaded") is not True:
                 screen = facts.get("screen")
@@ -829,6 +969,19 @@ class MinecraftSession:
             return str(exception)
         return ""
 
+    async def _cleanup_bot_after_failed_start(self, body_name: str) -> str:
+        """Release a bot process acquired before readiness was established."""
+
+        if body_name != "bot":
+            return ""
+        try:
+            result = await self._bot_launcher.stop()
+        except Exception as exception:  # noqa: BLE001 - preserve retry state
+            return str(exception)
+        if result.get("success", False):
+            return ""
+        return str(result.get("error") or "bot process cleanup failed")
+
     def _body_profiles(self) -> dict[str, BodyProfile]:
         """Build exact configured profiles for the two requested body routes."""
 
@@ -865,6 +1018,25 @@ class MinecraftSession:
                     }
                 ),
                 readiness_kind="first_person_frame",
+            ),
+            "bot": BodyProfile(
+                name="bot",
+                uri=self._config.bot_bridge_uri,
+                listen_uri=self._config.bot_bridge_listen_uri,
+                token_file=self._workspace / self._config.bot_token_file,
+                planner_guidance=BOT_BRIDGE_GUIDANCE,
+                required_operations=frozenset(
+                    {
+                        "chat.send",
+                        "control.release_all",
+                        "movement.input",
+                        "navigation.goto",
+                        "navigation.stop",
+                        "player.respawn",
+                        "world.mine",
+                    }
+                ),
+                readiness_kind="server_world",
             ),
         }
 
@@ -1037,7 +1209,13 @@ class MinecraftSession:
         """Return whether shutdown must retry any owned lifecycle resource."""
 
         return (
-            self._runtime is not None or self._presence_registered or self._scene_open
+            self._runtime is not None
+            or self._presence_registered
+            or self._scene_open
+            or (
+                self._state.body_name == "bot"
+                and getattr(self._bot_launcher, "pid", None) is not None
+            )
         )
 
     async def _report_scene(self, status: str) -> None:

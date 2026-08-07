@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import time
 import traceback
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
@@ -70,8 +72,9 @@ from ..core.subject_context_projection import (
 from ..core.send_targets import format_send_targets_for_prompt, list_recent_send_targets
 from ..core.tool_parallel import iter_life_tool_call_batches
 from ..autonomy import (
+    AsyncLocalAutonomyIntentStore,
     AutonomyIntent,
-    AutonomyIntentStore,
+    SelectedAutonomyIntentStore,
     build_intent,
     cleanup_autonomy_schedules,
     format_due_message,
@@ -80,6 +83,9 @@ from ..autonomy import (
     restore_autonomy_intents,
     schedule_autonomy_intent as register_autonomy_schedule,
 )
+from ..streams.manager import ThoughtStreamManager
+from ..drives.impulse import ImpulseEngine
+from ..drives.rules import DEFAULT_RULES
 from ..curiosity import CuriosityEngine
 from ..prompts.sections import (
     DEFAULT_HEARTBEAT_SECTIONS,
@@ -92,11 +98,11 @@ from ..constants import (
     LIFE_CHATTER_GLOBAL_CURSOR_KEY,
 )
 from ..memory.prompting import (
-    load_memory_prompt_data,
+    analyze_memory_text,
     render_memory_prompt,
     should_emit_memory_maintenance_prompt,
 )
-from ..trace.store import LifeTraceRecord, LifeTraceStore
+from ..trace.store import LifeTraceRecord
 from .event_builder import (
     EventBuilder,
     EventType,
@@ -145,7 +151,6 @@ from .perception_gateway import (
     PreparedPerception,
 )
 from .world_projection import (
-    WORLD_ASSERTION_SCOPE_HISTORY,
     WORLD_LEGACY_IMPORT_EVENT,
     WORLD_OBSERVATION_EVENT,
     WORLD_PROJECTION_DB_FILE,
@@ -341,6 +346,7 @@ class LifeEngineService(BaseService):
         self._state = LifeEngineState()
         self._state_dirty: bool = False
         self._heartbeat_task_id: str | None = None
+        self._storage_authority_renew_task_id: str | None = None
         self._memory_index_task_id: str | None = None
         self._memory_witness_task_id: str | None = None
         self._memory_witness_coordinator = None
@@ -397,8 +403,21 @@ class LifeEngineService(BaseService):
         self._last_decay_date: str | None = None
         from ..storage.factory import settings_from_life_engine_config
 
+        if hasattr(plugin, "global_storage_config"):
+            explicit_global_config = plugin.global_storage_config
+        else:
+            # Historical embedded callers pass a lightweight plugin stub and
+            # explicitly exercise local-mode behavior outside Core bootstrap.
+            # Real LifeEnginePlugin instances always own the attribute; a
+            # missing/None real Core config therefore still fails closed.
+            from src.core.config.core_config import CoreConfig
+
+            explicit_global_config = CoreConfig(
+                storage=CoreConfig.StorageSection(backend="local")
+            )
         self._storage_factory_settings = settings_from_life_engine_config(
-            self._cfg()
+            self._cfg(),
+            global_config=explicit_global_config,
         )
         self._selectable_storage_enabled = bool(
             self._storage_factory_settings.enabled
@@ -409,6 +428,13 @@ class LifeEngineService(BaseService):
         self._learning_stores: Any | None = None
         self._attention_thread_service: Any | None = None
         self._subject_document_store: Any | None = None
+        self._runtime_state_store: Any | None = None
+        self._runtime_context_writer_claim: Any | None = None
+        self._learning_writer_claim: Any | None = None
+        self._storage_writer_instance_id = (
+            f"{self._storage_factory_settings.authority_owner_id}:"
+            f"pid-{os.getpid()}:{uuid4().hex[:16]}"
+        )
         self._subject_workspace_observer: Any | None = None
         self._subject_workspace_projector: Any | None = None
         self._storage_health_cache: dict[str, Any] = {
@@ -424,9 +450,16 @@ class LifeEngineService(BaseService):
         }
 
         # 结构化世界模型（潜意识共享内在世界）
-        self._world_state: WorldState = WorldState.load(
-            self._workspace_dir() / "runtime" / "world_state.json"
-        )
+        # 选定后端下本地 world_state.json 不是权威来源，也不是迁移源：
+        # 世界事实只能来自远端事件账本派生的 World Projection。读取本地
+        # 快照会在远端为准时引入撕裂的旧世界事实，因此这里不读。
+        self._world_state: WorldState | None
+        if self._selectable_storage_enabled:
+            self._world_state = None
+        else:
+            self._world_state = WorldState.load(
+                self._workspace_dir() / "runtime" / "world_state.json"
+            )
 
         # 意识实例注册表（多意识协调）
         self._consciousness_registry: (
@@ -446,14 +479,18 @@ class LifeEngineService(BaseService):
         # 事件构建器
         self._event_builder = EventBuilder(self._next_sequence)
 
-        # 旧 ThoughtStream/Impulse 只保留兼容属性；运行时不得再初始化第二套
-        # 主体关注权威或按分数生成行为建议。
-        self._thought_manager: Any | None = None
-        self._impulse_engine: Any | None = None
+        # 思考流系统
+        self._thought_manager: ThoughtStreamManager | None = None
+
+        # 冲动引擎
+        self._impulse_engine: ImpulseEngine | None = None
 
         # 异步好奇层
         self._curiosity_engine: CuriosityEngine | None = None
         self._curiosity_inflight: bool = False
+        self._autonomy_intent_store: Any | None = None
+        self._life_trace_store: Any | None = None
+        self._narrative_store: Any | None = None
 
         # 三环自学习系统
         self._learning_scheduler = None  # LearningScheduler | None
@@ -488,6 +525,14 @@ class LifeEngineService(BaseService):
     @property
     def world_state(self) -> WorldState:
         """Return the non-authoritative legacy migration snapshot."""
+
+        if self._world_state is None:
+            # Fail closed: under the selected backend there is no local legacy
+            # snapshot, and fabricating an empty WorldState would present a
+            # blank world as if it were a real one.
+            raise RuntimeError(
+                "SelectedWorldStateHasNoLegacySnapshot: read the World Port"
+            )
         return self._world_state
 
     def save_world_state(self) -> None:
@@ -804,11 +849,8 @@ class LifeEngineService(BaseService):
         from ..storage.domain_factory import open_presence_world_stores
         from ..storage.event_factory import open_life_event_store
         from ..storage.learning_factory import open_learning_stores
+        from ..storage.runtime_factory import open_runtime_state_store
         from ..storage.subject_factory import open_subject_document_store
-        from ..storage.subject_workspace import (
-            SubjectWorkspaceObserver,
-            SubjectWorkspaceProjector,
-        )
 
         await self._open_selected_storage_runtime()
         runtime = self.storage_runtime
@@ -824,6 +866,16 @@ class LifeEngineService(BaseService):
             runtime,
             initialize_schema=False,
         )
+        runtime_state_store = await open_runtime_state_store(
+            runtime,
+            initialize_schema=False,
+        )
+        runtime_context_writer_claim = await runtime.acquire_singleton_writer(
+            namespace="life_engine.runtime_context",
+            state_key="global",
+            owner_instance_id=self._storage_writer_instance_id,
+            lease_seconds=self._storage_factory_settings.authority_lease_seconds,
+        )
         attention_stores = await open_attention_thread_stores(
             runtime,
             initialize_schema=False,
@@ -834,30 +886,30 @@ class LifeEngineService(BaseService):
             attention_stores.authority,
             attention_stores.focus,
         )
-        # Business startup never creates schema.  Missing or incomplete
-        # migrations must fail before the selected runtime is exposed.
-        await attention_service.health_snapshot()
+        # Business startup never creates schema. Missing schema is detected by
+        # the bounded startup probes and the first actual domain read; avoid a
+        # duplicate full-table health sweep before all stores are attached.
         learning_cfg = getattr(self._cfg(), "learning", None)
         learning_stores = None
         if learning_cfg is None or getattr(learning_cfg, "enabled", True):
+            from ..storage.learning_contracts import (
+                LEARNING_WRITER_CLAIM_NAMESPACE,
+                LEARNING_WRITER_CLAIM_STATE_KEY,
+            )
+
+            learning_writer_claim = await runtime.acquire_singleton_writer(
+                namespace=LEARNING_WRITER_CLAIM_NAMESPACE,
+                state_key=LEARNING_WRITER_CLAIM_STATE_KEY,
+                owner_instance_id=self._storage_writer_instance_id,
+                lease_seconds=self._storage_factory_settings.authority_lease_seconds,
+            )
             learning_stores = await open_learning_stores(
                 runtime,
                 initialize_schema=False,
+                writer_claim=learning_writer_claim,
             )
-        workspace = Path(self._cfg().settings.workspace_path).resolve()
-        subject_projector = SubjectWorkspaceProjector(
-            subject_store,
-            data_root=workspace.parent,
-            worker_id=(
-                f"{self._storage_factory_settings.authority_owner_id}:"
-                "subject-workspace"
-            ),
-        )
-        subject_observer = SubjectWorkspaceObserver(
-            subject_store,
-            data_root=workspace.parent,
-            recorded_source="workspace-observer:life-engine",
-        )
+        else:
+            learning_writer_claim = None
         registry = await AsyncConsciousnessRegistry.load(stores.presence)
         event_bus = LifeEventBus(ledger)
         gateway = AsyncPerceptionGateway(
@@ -872,16 +924,123 @@ class LifeEngineService(BaseService):
         self._attention_thread_service = attention_service
         self._presence_world_stores = stores
         self._subject_document_store = subject_store
-        self._subject_workspace_observer = subject_observer
-        self._subject_workspace_projector = subject_projector
+        self._runtime_state_store = runtime_state_store
+        self._runtime_context_writer_claim = runtime_context_writer_claim
+        self._learning_writer_claim = learning_writer_claim
+        # MySQL is the only runtime data source: subject heads remain remote and
+        # no filesystem observer/projector is attached.
+        self._subject_workspace_observer = None
+        self._subject_workspace_projector = None
         self._consciousness_registry = registry
         self._event_bus = event_bus
         self._world_projection = stores.world
         self._perception_gateway = gateway
-        await self.refresh_storage_health()
+        self._storage_health_cache = {
+            "status": "healthy",
+            "backend": self._storage_factory_settings.authoritative_backend.value,
+            "reason": "selected storage startup probes completed; full health is on demand",
+        }
+
+    async def _renew_storage_authority_loop(self) -> None:
+        """Keep the selected writer lease current and fail closed on loss."""
+
+        interval = self._storage_factory_settings.authority_renew_interval_seconds
+        lease_seconds = self._storage_factory_settings.authority_lease_seconds
+        while self._stop_event is not None and not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
+                return
+            except asyncio.TimeoutError:
+                pass
+
+            runtime = self._storage_runtime
+            if runtime is None:
+                return
+            try:
+                await runtime.renew_authority(lease_seconds=lease_seconds)
+                await self.refresh_storage_health()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - lease loss must fail closed
+                runtime.invalidate_writer()
+                self._storage_health_cache = {
+                    "status": "failed",
+                    "backend": self._storage_factory_settings.authoritative_backend.value,
+                    "reason": f"authority lease renewal failed: {type(exc).__name__}",
+                }
+                logger.error(
+                    "life_engine storage authority renewal failed; writer disabled",
+                    exc_info=True,
+                )
+                return
+
+    def _start_storage_authority_renewal(self) -> None:
+        """Start the one service-owned renewal task after runtime acquisition."""
+
+        if not self._selectable_storage_enabled:
+            return
+        if self._stop_event is None:
+            raise RuntimeError("StorageAuthorityRenewalStopEventNotInitialized")
+        if self._storage_authority_renew_task_id is not None:
+            return
+        task = get_task_manager().create_task(
+            self._renew_storage_authority_loop(),
+            name="life_engine_storage_authority_renewal",
+            daemon=True,
+        )
+        self._storage_authority_renew_task_id = task.task_id
+
+    async def _renew_storage_authority_loop(self) -> None:
+        """Keep the selected writer lease current and fail closed on loss."""
+
+        interval = self._storage_factory_settings.authority_renew_interval_seconds
+        lease_seconds = self._storage_factory_settings.authority_lease_seconds
+        while self._stop_event is not None and not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
+                return
+            except asyncio.TimeoutError:
+                pass
+
+            runtime = self._storage_runtime
+            if runtime is None:
+                return
+            try:
+                await runtime.renew_authority(lease_seconds=lease_seconds)
+                await self.refresh_storage_health()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - lease loss must fail closed
+                runtime.invalidate_writer()
+                self._storage_health_cache = {
+                    "status": "failed",
+                    "backend": self._storage_factory_settings.authoritative_backend.value,
+                    "reason": f"authority lease renewal failed: {type(exc).__name__}",
+                }
+                logger.error(
+                    "life_engine storage authority renewal failed; writer disabled",
+                    exc_info=True,
+                )
+                return
+
+    def _start_storage_authority_renewal(self) -> None:
+        """Start the one service-owned renewal task after runtime acquisition."""
+
+        if not self._selectable_storage_enabled:
+            return
+        if self._stop_event is None:
+            raise RuntimeError("StorageAuthorityRenewalStopEventNotInitialized")
+        if self._storage_authority_renew_task_id is not None:
+            return
+        task = get_task_manager().create_task(
+            self._renew_storage_authority_loop(),
+            name="life_engine_storage_authority_renewal",
+            daemon=True,
+        )
+        self._storage_authority_renew_task_id = task.task_id
 
     async def _close_selected_storage(self) -> None:
-        """Flush owned async work and close the single selected runtime."""
+        """Flush owned async work, revoke authority, and close the runtime."""
 
         if not self._selectable_storage_enabled:
             return
@@ -903,9 +1062,18 @@ class LifeEngineService(BaseService):
                 except Exception as exc:  # noqa: BLE001 - aggregate owned cleanup
                     errors.append(exc)
         runtime = self._storage_runtime
+        if runtime is not None:
+            try:
+                await runtime.revoke_authority()
+            except Exception as exc:  # noqa: BLE001 - aggregate owned cleanup
+                runtime.invalidate_writer()
+                errors.append(exc)
         self._subject_workspace_observer = None
         self._subject_workspace_projector = None
         self._subject_document_store = None
+        self._runtime_state_store = None
+        self._runtime_context_writer_claim = None
+        self._learning_writer_claim = None
         self._learning_stores = None
         self._attention_thread_service = None
         if runtime is not None:
@@ -942,31 +1110,60 @@ class LifeEngineService(BaseService):
         version_id: str,
         max_tasks: int,
     ) -> dict[str, Any]:
-        """Drain one subject path until the requested durable head is visible."""
+        """Verify one remote current head; never project selected data to files."""
 
-        projector = self._subject_workspace_projector
-        if projector is None:
-            raise RuntimeError("SelectedSubjectProjectorNotStarted")
-        for _ in range(max(1, int(max_tasks))):
-            result = await projector.project_one(logical_path=logical_path)
-            if result.status == "idle":
-                raise RuntimeError(
-                    f"SubjectProjectionMissing: {logical_path}:{version_id}"
-                )
-            if result.status == "failed" and result.version_id == version_id:
-                raise RuntimeError(
-                    f"SubjectProjectionFailed: {logical_path}: {result.detail}"
-                )
-            if result.version_id == version_id and result.status in {
-                "projected",
-                "confirmed_existing",
-            }:
-                return {
-                    "status": result.status,
-                    "logical_path": result.logical_path,
-                    "version_id": result.version_id,
-                }
-        raise RuntimeError(f"SubjectProjectionBacklogExceeded: {logical_path}")
+        store = self._subject_document_store
+        if store is None:
+            raise RuntimeError("SelectedSubjectStorageNotStarted")
+        from ..storage.models import BackendKind
+
+        if getattr(store, "backend", None) == BackendKind.LOCAL:
+            projector = self._subject_workspace_projector
+            if projector is None:
+                raise RuntimeError("SelectedSubjectProjectorNotStarted")
+            for _ in range(max(1, int(max_tasks))):
+                result = await projector.project_one(logical_path=logical_path)
+                if result.status == "idle":
+                    raise RuntimeError(
+                        f"SubjectProjectionMissing: {logical_path}:{version_id}"
+                    )
+                if result.status == "failed" and result.version_id == version_id:
+                    raise RuntimeError(
+                        f"SubjectProjectionFailed: {logical_path}: {result.detail}"
+                    )
+                if result.version_id == version_id and result.status in {
+                    "projected",
+                    "confirmed_existing",
+                }:
+                    return {
+                        "status": result.status,
+                        "logical_path": result.logical_path,
+                        "version_id": result.version_id,
+                    }
+            raise RuntimeError(f"SubjectProjectionBacklogExceeded: {logical_path}")
+
+        del max_tasks
+        head = await store.get_head(logical_path)
+        if head is None or head.current_version_id != version_id:
+            raise RuntimeError(
+                f"SubjectRemoteHeadMismatch: {logical_path}:{version_id}"
+            )
+        version = await store.get_version(version_id)
+        if version.logical_path != logical_path:
+            raise RuntimeError(
+                f"SubjectRemoteVersionPathMismatch: {logical_path}:{version_id}"
+            )
+        task = await store.get_projection_task(logical_path, version_id)
+        if task is None or task.state != "confirmed":
+            state = "missing" if task is None else task.state
+            raise RuntimeError(
+                f"SubjectRemoteHeadNotConfirmed: {logical_path}:{version_id}:{state}"
+            )
+        return {
+            "status": "remote_current_head",
+            "logical_path": logical_path,
+            "version_id": version_id,
+        }
 
     async def write_selected_subject_document(
         self,
@@ -981,11 +1178,11 @@ class LifeEngineService(BaseService):
         semantic_source_id: str | None = None,
         reason: str = "",
     ) -> dict[str, Any] | None:
-        """Commit a declared subject file before changing its workspace projection.
+        """Commit one declared subject document to the selected remote head.
 
-        Disabled storage returns ``None`` so the legacy file path remains a
-        first-class local backend.  Enabled storage fails closed: the file is
-        never written ahead of its immutable SubjectDocument version.
+        Disabled storage returns ``None`` for explicit local mode. Under MySQL
+        the immutable version/current head is the only runtime representation;
+        no workspace Markdown is read or written as a projection.
         """
 
         if not self._selectable_storage_enabled:
@@ -996,88 +1193,62 @@ class LifeEngineService(BaseService):
         logical_path = subject_path_from_workspace_relative(workspace_relative_path)
         if logical_path is None:
             return None
-        workspace = Path(self._cfg().settings.workspace_path).resolve()
-        if workspace.name != "life_engine_workspace":
-            raise RuntimeError(
-                "SelectedSubjectWorkspaceMismatch: selected Subject storage "
-                "requires a life_engine_workspace root"
-            )
         store = self._subject_document_store
-        observer = self._subject_workspace_observer
-        if store is None or observer is None:
+        if store is None:
             raise RuntimeError("SelectedSubjectStorageNotStarted")
 
-        projection: dict[str, Any] | None = None
         head = await store.get_head(logical_path)
-        if head is not None:
-            task = await store.get_projection_task(
-                logical_path,
-                head.current_version_id,
-            )
-            if task is None:
-                raise RuntimeError(
-                    f"SubjectProjectionStateMissing: {logical_path}:"
-                    f"{head.current_version_id}"
-                )
-            if task.state == "failed":
-                raise RuntimeError(
-                    f"SubjectProjectionRequiresRepair: {logical_path}:"
-                    f"{head.current_version_id}"
-                )
-            if task.state == "pending":
-                try:
-                    projection = await self._project_subject_version(
-                        logical_path=logical_path,
-                        version_id=head.current_version_id,
-                        max_tasks=head.revision + 1,
-                    )
-                except RuntimeError as exc:
-                    detail = str(exc)
-                    external_divergence = any(
-                        marker in detail
-                        for marker in (
-                            "workspace bytes diverged from the authoritative parent",
-                            "new authoritative document would overwrite bytes",
-                        )
-                    )
-                    if not external_divergence:
-                        raise
-            elif task.state != "confirmed":
-                raise RuntimeError(
-                    f"SubjectProjectionStateInvalid: {logical_path}:{task.state}"
-                )
+        from ..storage.models import BackendKind
 
-        if projection is None:
+        if getattr(store, "backend", None) == BackendKind.LOCAL:
+            observer = self._subject_workspace_observer
+            if observer is None:
+                raise RuntimeError("SelectedSubjectObserverNotStarted")
             observed = await observer.observe_file(logical_path)
             if observed.status == "changed_during_read":
                 raise RuntimeError(
                     f"SubjectWorkspaceChangedDuringRead: {logical_path}"
                 )
             if observed.commit is not None:
-                projection = await self._project_subject_version(
+                await self._project_subject_version(
                     logical_path=logical_path,
                     version_id=observed.commit.version.version_id,
                     max_tasks=observed.commit.head.revision + 1,
                 )
-            elif head is not None and observed.status == "missing":
-                raise RuntimeError(f"SubjectWorkspaceMissing: {logical_path}")
+                head = observed.commit.head
+            elif head is not None:
+                task = await store.get_projection_task(
+                    logical_path,
+                    head.current_version_id,
+                )
+                if task is not None and task.state == "pending":
+                    await self._project_subject_version(
+                        logical_path=logical_path,
+                        version_id=head.current_version_id,
+                        max_tasks=head.revision + 1,
+                    )
 
-        head = await store.get_head(logical_path)
         if head is not None:
             current = await store.get_version(head.current_version_id)
             if current.content_bytes == bytes(content_bytes):
-                if projection is None:
-                    projection = {
+                if getattr(store, "backend", None) == BackendKind.LOCAL:
+                    confirmed_head = {
                         "status": "confirmed_existing",
                         "logical_path": logical_path,
                         "version_id": current.version_id,
                     }
+                else:
+                    confirmed_head = await self._project_subject_version(
+                        logical_path=logical_path,
+                        version_id=current.version_id,
+                        max_tasks=1,
+                    )
                 return {
                     "status": "unchanged",
                     "logical_path": logical_path,
                     "version_id": current.version_id,
                     "revision": head.revision,
-                    "projection": projection,
+                    "projection": confirmed_head,
                 }
             expected_revision = head.revision
             expected_head = head.current_version_id
@@ -1105,7 +1276,7 @@ class LifeEngineService(BaseService):
                 encoding=encoding,
                 newline_style=None,
                 change_context={
-                    "operation": "workspace_file_write",
+                    "operation": "selected_subject_write",
                     "reason": str(reason),
                 },
             )
@@ -1323,6 +1494,12 @@ class LifeEngineService(BaseService):
 
     async def _current_learning_subject_revision(self) -> str:
         """Read the exact unified subject revision without authoring a projection."""
+
+        if self._subject_document_store is not None:
+            # When a selected store is bound, it is the only authority source;
+            # the unified revision must come from the remote single-transaction
+            # snapshot instead of local Markdown polling.
+            return str(await self._subject_document_store.current_subject_revision())
 
         from ..core.router_context_projection import read_subject_authority_sources
 
@@ -1700,7 +1877,6 @@ class LifeEngineService(BaseService):
         self,
         *,
         include_retracted: bool = False,
-        delivery_scope: str = WORLD_ASSERTION_SCOPE_HISTORY,
         after_observed_at: str = "",
         after_assertion_id: str = "",
         continuation_token: str = "",
@@ -1709,7 +1885,6 @@ class LifeEngineService(BaseService):
     ) -> Any:
         """Return one stable bounded assertion page from the selected store."""
 
-        expected_frontier: int | None = None
         if continuation_token:
             continuation = PerceptionGateway.decode_snapshot_continuation_token(
                 continuation_token
@@ -1720,37 +1895,19 @@ class LifeEngineService(BaseService):
             after_assertion_id = str(
                 continuation.get("after_assertion_id") or ""
             )
-            delivery_scope = str(continuation.get("delivery_scope") or "")
-            expected_frontier = int(continuation["source_frontier"])
         gateway = self._get_perception_gateway()
         projection = gateway.projection
         if isinstance(gateway, AsyncPerceptionGateway):
-            if expected_frontier is not None:
-                contract = await projection.projector_contract()
-                actual_frontier = int(contract.get("as_of_ingest_position") or 0)
-                if actual_frontier != expected_frontier:
-                    raise ValueError(
-                        "world snapshot continuation frontier changed; restart query"
-                    )
             return await projection.list_assertion_references_page(
                 include_retracted=include_retracted,
-                delivery_scope=delivery_scope,
                 after_observed_at=after_observed_at,
                 after_assertion_id=after_assertion_id,
                 limit=limit,
                 inline_max_bytes=inline_max_bytes,
             )
-        if (
-            expected_frontier is not None
-            and projection.as_of_position() != expected_frontier
-        ):
-            raise ValueError(
-                "world snapshot continuation frontier changed; restart query"
-            )
         return await asyncio.to_thread(
             projection.list_assertion_references_page,
             include_retracted=include_retracted,
-            delivery_scope=delivery_scope,
             after_observed_at=after_observed_at,
             after_assertion_id=after_assertion_id,
             limit=limit,
@@ -2040,8 +2197,12 @@ class LifeEngineService(BaseService):
         return workspace
 
     def _ensure_workspace_templates(self) -> None:
-        """补齐可由运行态长期维护的工作空间模板文件。"""
+        """补齐显式本地模式下可由运行态长期维护的模板文件。"""
 
+        if self._selectable_storage_enabled:
+            # Selected Subject heads are remote-only; creating a local USER.md
+            # would reintroduce a second source with no authoritative revision.
+            return
         workspace = self._workspace_dir()
         user_file = workspace / "USER.md"
         if user_file.exists():
@@ -2052,6 +2213,22 @@ class LifeEngineService(BaseService):
             logger.info(f"已创建 USER.md 使用说明模板: {user_file}")
         except Exception as e:
             logger.warning(f"创建 USER.md 使用说明模板失败: {e}")
+
+    async def _validate_local_subject_authority(self) -> None:
+        """Fail before startup when the local subject snapshot is incomplete."""
+
+        if self._selectable_storage_enabled:
+            return
+
+        from ..core.router_context_projection import read_subject_authority_sources
+
+        # Missing authority must remain distinguishable from an intentionally
+        # empty document. Reading the exact snapshot here also validates UTF-8
+        # and the canonical unified revision before any runtime is acquired.
+        await asyncio.to_thread(
+            read_subject_authority_sources,
+            self._workspace_dir(),
+        )
 
     def snapshot(self) -> dict[str, Any]:
         """返回当前状态快照。"""
@@ -2431,6 +2608,7 @@ class LifeEngineService(BaseService):
             or self._life_event_store is None
             or self._presence_world_stores is None
             or self._subject_document_store is None
+            or self._runtime_state_store is None
             or self._attention_thread_service is None
         ):
             return dict(self._storage_health_cache)
@@ -2440,6 +2618,7 @@ class LifeEngineService(BaseService):
             ("presence", self._presence_world_stores.presence.health_snapshot()),
             ("world", self._presence_world_stores.world.health_snapshot()),
             ("subject_document", self._subject_document_store.health_snapshot()),
+            ("runtime_state", self._runtime_state_store.health_snapshot()),
             ("attention_threads", self._attention_thread_service.health_snapshot()),
         ]
         if self._learning_stores is not None:
@@ -2614,6 +2793,86 @@ class LifeEngineService(BaseService):
             }
         return snapshot
 
+    def runtime_state_store(self) -> Any | None:
+        """Return the selected technical runtime store or explicit local mode.
+
+        ``None`` is valid only when selectable storage is disabled. If MySQL is
+        configured but the store did not attach, callers must fail closed
+        instead of resurrecting local JSON state.
+        """
+
+        if self._runtime_state_store is not None:
+            return self._runtime_state_store
+        if self._selectable_storage_enabled:
+            raise RuntimeError("SelectedRuntimeStateStorageNotStarted")
+        return None
+
+    async def read_runtime_state(
+        self,
+        namespace: str,
+        state_key: str,
+    ) -> Any | None:
+        """Read one selected-backend technical state."""
+
+        store = self.runtime_state_store()
+        if store is None:
+            return None
+        return await store.get_state(namespace, state_key)
+
+    async def write_runtime_state(
+        self,
+        *,
+        namespace: str,
+        state_key: str,
+        expected_revision: int,
+        schema_version: int,
+        payload: dict[str, Any],
+    ) -> Any:
+        """CAS-write one selected-backend technical state."""
+
+        store = self.runtime_state_store()
+        if store is None:
+            raise RuntimeError("SelectedRuntimeStateStorageDisabled")
+        return await store.put_state(
+            namespace=namespace,
+            state_key=state_key,
+            expected_revision=expected_revision,
+            schema_version=schema_version,
+            payload=payload,
+        )
+
+    async def read_subject_authority_texts(self) -> dict[str, str]:
+        """Return SOUL/USER/MEMORY text from the single bound authority source.
+
+        Under the selected backend the remote store is the only authority: the
+        three documents are read in one consistent snapshot and a remote gap
+        fails closed instead of degrading into stale local Markdown.
+        """
+
+        store = self._subject_document_store
+        if store is not None:
+            from ..core.router_context_projection import (
+                subject_authority_sources_from_snapshot,
+            )
+
+            snapshot = await store.read_subject_authority()
+            sources, _ = subject_authority_sources_from_snapshot(snapshot)
+            return {source.path: source.text for source in sources}
+
+        if self._selectable_storage_enabled:
+            # The selected backend is configured but its store never opened;
+            # reading local files here would silently resurrect the very
+            # fallback this backend replaces.
+            raise RuntimeError("SelectedSubjectStorageNotStarted")
+
+        from ..core.router_context_projection import read_subject_authority_sources
+
+        sources, _ = await asyncio.to_thread(
+            read_subject_authority_sources,
+            self._workspace_dir(),
+        )
+        return {source.path: source.text for source in sources}
+
     async def get_router_context_projection_prompt(self) -> str:
         """Return a projection only when it matches current authority files."""
 
@@ -2686,6 +2945,8 @@ class LifeEngineService(BaseService):
                 projection_profile=projection_key[0],
                 max_bytes=projection_key[1],
                 author=author,
+                subject_store=self._subject_document_store,
+                runtime_store=self._runtime_state_store,
             )
             projection = projection_ref
             projection_key = (
@@ -3113,6 +3374,11 @@ class LifeEngineService(BaseService):
             direction = "received"
 
         event = self._event_builder.build_message_event(message, direction=direction)
+        # 分阶段计时：EventBus 处理器有 5 秒硬截止，超时时需要知道瓶颈在哪个阶段
+        _phase_start = time.monotonic()
+        _phase_enqueue = 0.0
+        _phase_facts = 0.0
+        _phase_context = 0.0
         unlocked_self_pause = False
         async with self._get_lock():
             self._pending_events.append(event)
@@ -3139,14 +3405,19 @@ class LifeEngineService(BaseService):
                     state.pending_followup = None
                     state.is_waiting = False
                     state.active_check_kind = None
+        _phase_enqueue = time.monotonic() - _phase_start
         chat_fact = build_chat_message_event(
             message,
             direction="delivered" if direction == "sent" else "received",
             envelope=envelope,
             adapter_signature=adapter_signature,
         )
+        _facts_start = time.monotonic()
         await self._publish_message_facts(event, chat_fact)
+        _phase_facts = time.monotonic() - _facts_start
+        _ctx_start = time.monotonic()
         await self._save_runtime_context()
+        _phase_context = time.monotonic() - _ctx_start
         if direction == "received":
             self._schedule_curiosity_review(message, event)
         if unlocked_self_pause:
@@ -3171,6 +3442,16 @@ class LifeEngineService(BaseService):
             direction=direction,
             pending_message_count=self._state.pending_event_count,
         )
+        # 接近 EventBus 5 秒硬截止时告警，暴露冷路径竞态的具体慢阶段
+        _total_elapsed = time.monotonic() - _phase_start
+        if _total_elapsed >= 4.0:
+            logger.warning(
+                f"life_engine record_message 接近 EventBus 超时阈值: "
+                f"total={_total_elapsed:.2f}s enqueue={_phase_enqueue:.2f}s "
+                f"facts={_phase_facts:.2f}s context={_phase_context:.2f}s "
+                f"message_id={event.event_id} stream_id={event.stream_id or ''} "
+                f"direction={direction}"
+            )
 
     def _get_curiosity_engine(self) -> CuriosityEngine:
         cfg = self._cfg()
@@ -3191,6 +3472,7 @@ class LifeEngineService(BaseService):
                 workspace_path=workspace,
                 model_task_name=task_name,
                 timeout_seconds=timeout,
+                runtime_store=self.runtime_state_store(),
             )
         return self._curiosity_engine
 
@@ -3220,7 +3502,7 @@ class LifeEngineService(BaseService):
                 if curiosity_cfg is not None
                 else 20
             )
-            prefix_prompt = self._build_curiosity_prefix_prompt()
+            prefix_prompt = await self._build_curiosity_prefix_prompt()
             history_text = await self._build_curiosity_history_text(message, max_messages=max_history)
             new_event_text = self._format_curiosity_event(event)
             meme_awareness = await self._build_meme_awareness_text()
@@ -3266,35 +3548,29 @@ class LifeEngineService(BaseService):
         except Exception:  # noqa: BLE001
             return ""
 
-    def _build_curiosity_prefix_prompt(self) -> str:
-        workspace = self._workspace_dir()
-        soul_text = self._read_workspace_text(workspace, "SOUL.md")
-        user_text = self._read_workspace_text(workspace, "USER.md")
+    async def _build_curiosity_prefix_prompt(self) -> str:
+        # 好奇层与聊天表达面对同一个主体，因此必须读同一份权威文本：
+        # 统一入口在选定后端下只认远端单事务快照，缺失时失败关闭，
+        # 不会退回本地 Markdown 让好奇层看到与表达层不同的自我。
+        texts = await self.read_subject_authority_texts()
         memory_text = ""
-        try:
-            memory_data = load_memory_prompt_data(workspace)
-            memory_text = render_memory_prompt(memory_data, mode="chat") if memory_data.raw_text else ""
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(f"认知机会生成器读取 MEMORY.md 失败: {exc}")
+        memory_raw = texts.get("MEMORY.md", "")
+        if memory_raw:
+            memory_data = analyze_memory_text(memory_raw)
+            memory_text = (
+                render_memory_prompt(memory_data, mode="chat")
+                if memory_data.raw_text
+                else ""
+            )
 
         return LifeChatterContextAssembler.build_prefix_prompt(
-            soul_text=soul_text,
-            user_text=user_text,
+            soul_text=texts.get("SOUL.md", ""),
+            user_text=texts.get("USER.md", ""),
             memory_text=memory_text,
             tools_text="",
             live_guidance="",
             primary_tool_guide="",
         )
-
-    @staticmethod
-    def _read_workspace_text(workspace: str, filename: str) -> str:
-        try:
-            path = Path(workspace) / filename
-            if path.exists() and path.is_file():
-                return path.read_text(encoding="utf-8").strip()
-        except Exception:
-            return ""
-        return ""
 
     async def _build_curiosity_history_text(self, message: Message, *, max_messages: int) -> str:
         if max_messages <= 0:
@@ -3775,16 +4051,56 @@ class LifeEngineService(BaseService):
             "channel": "proactive_opportunity",
         }
 
-    def _autonomy_store(self) -> AutonomyIntentStore:
-        return AutonomyIntentStore(self._workspace_dir())
+    def _autonomy_store(self) -> Any:
+        if self._autonomy_intent_store is None:
+            runtime_store = self.runtime_state_store()
+            if runtime_store is not None:
+                self._autonomy_intent_store = SelectedAutonomyIntentStore(
+                    runtime_store
+                )
+            else:
+                self._autonomy_intent_store = AsyncLocalAutonomyIntentStore(
+                    self._workspace_dir()
+                )
+        return self._autonomy_intent_store
 
-    def _autonomy_next_scheduled_at(self, intent_id: str) -> str:
-        intent = self._autonomy_store().get(intent_id)
+    def life_trace_store(self) -> Any:
+        if self._life_trace_store is None:
+            from ..trace.store import (
+                AsyncLocalLifeTraceStore,
+                SelectedLifeTraceStore,
+            )
+
+            runtime_store = self.runtime_state_store()
+            self._life_trace_store = (
+                SelectedLifeTraceStore(runtime_store)
+                if runtime_store is not None
+                else AsyncLocalLifeTraceStore(self._workspace_dir())
+            )
+        return self._life_trace_store
+
+    def narrative_store(self) -> Any:
+        if self._narrative_store is None:
+            from ..narrative.store import (
+                AsyncLocalNarrativeStore,
+                SelectedNarrativeStore,
+            )
+
+            runtime_store = self.runtime_state_store()
+            self._narrative_store = (
+                SelectedNarrativeStore(runtime_store)
+                if runtime_store is not None
+                else AsyncLocalNarrativeStore(self._workspace_dir())
+            )
+        return self._narrative_store
+
+    async def _autonomy_next_scheduled_at(self, intent_id: str) -> str:
+        intent = await self._autonomy_store().get(intent_id)
         if intent is None or intent.status != "scheduled":
             return ""
         return intent.scheduled_at
 
-    def _record_life_moment(
+    async def _record_life_moment(
         self,
         *,
         kind: str,
@@ -3794,9 +4110,9 @@ class LifeEngineService(BaseService):
         source_event_id: str = "",
         stream_id: str = "",
     ) -> None:
-        """转折点入长河；长河故障绝不影响主流程。"""
+        """Append one turning point to the bound river authority."""
         try:
-            LifeTraceStore(self._workspace_dir()).record_moment(
+            await self.life_trace_store().record_moment(
                 kind=kind,
                 summary=summary,
                 operation=operation,
@@ -3806,6 +4122,8 @@ class LifeEngineService(BaseService):
                 stream_id=stream_id,
             )
         except Exception as exc:  # noqa: BLE001
+            if self._selectable_storage_enabled:
+                raise
             logger.debug(f"长河留痕失败 kind={kind}: {exc}")
 
     async def _resolve_autonomy_target_stream_id(
@@ -3883,8 +4201,8 @@ class LifeEngineService(BaseService):
                 await register_autonomy_schedule(self.plugin, intent)
             except RuntimeError as exc:
                 raise RuntimeError("调度器尚未启动，稍后再登记自主意向") from exc
-            store.upsert(intent)
-            store.append_event("formed", intent, detail="intent scheduled")
+            await store.upsert(intent)
+            await store.append_event("formed", intent, detail="intent scheduled")
 
         repeat_text = f"repeat=每隔{intent.interval_minutes}分钟 " if intent.repeat else ""
         event_text = (
@@ -3898,7 +4216,7 @@ class LifeEngineService(BaseService):
             sender_name="自主意向",
         )
         await self._queue_pending_event(event)
-        self._record_life_moment(
+        await self._record_life_moment(
             kind="intent",
             summary=f"形成意向（{intent.kind}）：{intent.motivation[:120]}",
             operation="formed",
@@ -3988,7 +4306,7 @@ class LifeEngineService(BaseService):
             store = self._autonomy_store()
             loaded: list[AutonomyIntent] = []
             for intent_id, occurrence_id in sorted(unique):
-                intent = store.get(intent_id)
+                intent = await store.get(intent_id)
                 if intent is None:
                     return {"claimed": False, "reason": f"intent_not_found:{intent_id}"}
                 if intent.status != "in_flight":
@@ -4008,8 +4326,8 @@ class LifeEngineService(BaseService):
                 intent.active_occurrence_status = "dispatching"
                 intent.active_action_id = str(action_id or "")
                 intent.updated_at = _now_iso()
-                store.upsert(intent)
-                store.append_event(
+                await store.upsert(intent)
+                await store.append_event(
                     "delivery_claimed",
                     intent,
                     occurrence_id=intent.active_occurrence_id,
@@ -4047,7 +4365,7 @@ class LifeEngineService(BaseService):
         async with self._get_lock():
             store = self._autonomy_store()
             for intent_id, occurrence_id in sorted(unique):
-                intent = store.get(intent_id)
+                intent = await store.get(intent_id)
                 if intent is None:
                     continue
                 if (
@@ -4091,8 +4409,8 @@ class LifeEngineService(BaseService):
                 intent.active_occurrence_id = ""
                 intent.active_occurrence_status = ""
                 intent.active_occurrence_started_at = ""
-                store.upsert(intent)
-                store.append_event(
+                await store.upsert(intent)
+                await store.append_event(
                     f"occurrence_{outcome}",
                     intent,
                     occurrence_id=occurrence_id,
@@ -4104,7 +4422,7 @@ class LifeEngineService(BaseService):
         scheduled = 0
         for intent_id in to_schedule:
             store = self._autonomy_store()
-            intent = store.get(intent_id)
+            intent = await store.get(intent_id)
             if intent is None or intent.status != "scheduled":
                 continue
             try:
@@ -4116,12 +4434,12 @@ class LifeEngineService(BaseService):
                 )
                 continue
             async with self._get_lock():
-                current = self._autonomy_store().get(intent.intent_id)
+                current = await self._autonomy_store().get(intent.intent_id)
                 if current is None or current.status != "scheduled":
                     continue
                 current.schedule_id = intent.schedule_id
                 current.updated_at = _now_iso()
-                self._autonomy_store().upsert(current)
+                await self._autonomy_store().upsert(current)
             scheduled += 1
         return {"completed": completed, "scheduled": scheduled}
 
@@ -4137,6 +4455,7 @@ class LifeEngineService(BaseService):
 
         normalized_action = str(action or "").strip().lower()
         if normalized_action == "list":
+            intents = await self._autonomy_store().load()
             return {
                 "intents": [
                     {
@@ -4152,7 +4471,7 @@ class LifeEngineService(BaseService):
                         "target_hint": item.target_hint,
                         "renewal_reason": item.renewal_reason,
                     }
-                    for item in self._autonomy_store().load()
+                    for item in intents
                 ]
             }
         if normalized_action not in {"pause", "cancel", "renew"}:
@@ -4166,7 +4485,7 @@ class LifeEngineService(BaseService):
         should_schedule = False
         async with self._get_lock():
             store = self._autonomy_store()
-            intent = store.get(target_id)
+            intent = await store.get(target_id)
             if intent is None:
                 raise ValueError("autonomy intent not found")
             schedule_id = intent.schedule_id
@@ -4184,8 +4503,8 @@ class LifeEngineService(BaseService):
                 intent.active_occurrence_started_at = ""
                 intent.active_action_id = ""
                 intent.updated_at = _now_iso()
-                store.upsert(intent)
-                store.append_event(
+                await store.upsert(intent)
+                await store.append_event(
                     normalized_action,
                     intent,
                     occurrence_id=active_occurrence_id,
@@ -4244,8 +4563,8 @@ class LifeEngineService(BaseService):
                     # by ID, so an active schedule needs no destructive churn.
                     schedule_id = ""
                 intent.updated_at = _now_iso()
-                store.upsert(intent)
-                store.append_event("renewed", intent)
+                await store.upsert(intent)
+                await store.append_event("renewed", intent)
                 should_schedule = not was_scheduled
 
         if schedule_id:
@@ -4257,18 +4576,18 @@ class LifeEngineService(BaseService):
                 )
 
         if should_schedule:
-            intent = self._autonomy_store().get(target_id)
+            intent = await self._autonomy_store().get(target_id)
             if intent is None:
                 raise RuntimeError("renewed autonomy intent disappeared")
             await register_autonomy_schedule(self.plugin, intent)
             async with self._get_lock():
-                current = self._autonomy_store().get(target_id)
+                current = await self._autonomy_store().get(target_id)
                 if current is not None and current.status == "scheduled":
                     current.schedule_id = intent.schedule_id
                     current.updated_at = _now_iso()
-                    self._autonomy_store().upsert(current)
+                    await self._autonomy_store().upsert(current)
 
-        current = self._autonomy_store().get(target_id)
+        current = await self._autonomy_store().get(target_id)
         return {
             "intent_id": target_id,
             "action": normalized_action,
@@ -4283,7 +4602,7 @@ class LifeEngineService(BaseService):
 
         async with self._get_lock():
             store = self._autonomy_store()
-            intent = store.get(intent_id)
+            intent = await store.get(intent_id)
             if intent is None:
                 logger.warning(f"到点意向不存在: intent_id={intent_id}")
                 return {"triggered": False, "reason": "not_found"}
@@ -4298,8 +4617,8 @@ class LifeEngineService(BaseService):
                 intent.status = "renewal_required"
                 intent.renewal_reason = lease_reason
                 intent.updated_at = _now_iso()
-                store.upsert(intent)
-                store.append_event("renewal_required", intent, detail=lease_reason)
+                await store.upsert(intent)
+                await store.append_event("renewal_required", intent, detail=lease_reason)
                 return {"triggered": False, "reason": lease_reason}
 
             intent.triggered_at = _now_iso()
@@ -4313,8 +4632,8 @@ class LifeEngineService(BaseService):
             intent.schedule_id = ""
             intent.status = "in_flight"
             intent.updated_at = intent.triggered_at
-            store.upsert(intent)
-            store.append_event(
+            await store.upsert(intent)
+            await store.append_event(
                 "occurrence_surfaced",
                 intent,
                 occurrence_id=intent.active_occurrence_id,
@@ -4340,7 +4659,7 @@ class LifeEngineService(BaseService):
                     sender_name="自主意向",
                 )
                 await self._queue_pending_event(event)
-                self._record_life_moment(
+                await self._record_life_moment(
                     kind="intent",
                     summary=f"意向到点无目标，浮现给心跳：{intent.motivation[:120]}",
                     operation="surfaced",
@@ -4356,7 +4675,7 @@ class LifeEngineService(BaseService):
                     "dispatch": "life_event",
                     "reason": "no_target_stream",
                     "repeat": intent.repeat,
-                    "next_scheduled_at": self._autonomy_next_scheduled_at(
+                    "next_scheduled_at": await self._autonomy_next_scheduled_at(
                         intent.intent_id
                     ),
                     "occurrence_id": intent.active_occurrence_id,
@@ -4371,7 +4690,7 @@ class LifeEngineService(BaseService):
                     detail=str(exc),
                 )
                 raise
-            self._record_life_moment(
+            await self._record_life_moment(
                 kind="intent",
                 summary=f"意向到点，交给表达层：{intent.motivation[:120]}",
                 operation="surfaced",
@@ -4396,7 +4715,7 @@ class LifeEngineService(BaseService):
                 sender_name="自主意向",
             )
             await self._queue_pending_event(event)
-            self._record_life_moment(
+            await self._record_life_moment(
                 kind="intent",
                 summary=f"意向到点，回到心跳继续思考：{intent.motivation[:120]}",
                 operation="reflected",
@@ -4411,7 +4730,7 @@ class LifeEngineService(BaseService):
                 "triggered": True,
                 "dispatch": "life_engine",
                 "repeat": intent.repeat,
-                "next_scheduled_at": self._autonomy_next_scheduled_at(
+                "next_scheduled_at": await self._autonomy_next_scheduled_at(
                     intent.intent_id
                 ),
                 "occurrence_id": intent.active_occurrence_id,
@@ -4424,7 +4743,7 @@ class LifeEngineService(BaseService):
             sender_name="自主意向",
         )
         await self._queue_pending_event(event)
-        self._record_life_moment(
+        await self._record_life_moment(
             kind="intent",
             summary=f"意向到点，选择沉默：{intent.motivation[:120]}",
             operation="silence",
@@ -4439,7 +4758,7 @@ class LifeEngineService(BaseService):
             "triggered": True,
             "dispatch": "silence",
             "repeat": intent.repeat,
-            "next_scheduled_at": self._autonomy_next_scheduled_at(
+            "next_scheduled_at": await self._autonomy_next_scheduled_at(
                 intent.intent_id
             ),
             "occurrence_id": intent.active_occurrence_id,
@@ -5364,12 +5683,12 @@ class LifeEngineService(BaseService):
             cursors = self._state.chatter_thought_cursors
             cursors[sid] = max(int(cursors.get(sid, 0) or 0), int(revision))
 
-    def _format_chatter_trace_recent_changes(self, *, limit: int = 3) -> str:
+    async def _format_chatter_trace_recent_changes(self, *, limit: int = 3) -> str:
         """渲染长河最近留痕块（用于 chatter suffix）。"""
         if limit <= 0:
             return ""
         try:
-            records = LifeTraceStore(self._workspace_dir()).recent(limit=limit)
+            records = await self.life_trace_store().recent(limit=limit)
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"读取长河留痕失败: {exc}")
             return ""
@@ -5391,38 +5710,35 @@ class LifeEngineService(BaseService):
         detail = f"，原因：{reason}" if reason else ""
         return f"- {timestamp} {operation} {path}{detail}{trace_ref}"
 
-    async def _format_chatter_attention_threads(self, instance_id: str) -> str:
-        """Render the canonical bounded subject-attention projection.
+    def _format_chatter_thought_streams(
+        self,
+        *,
+        revision_cursor: int = 0,
+        focus_window_minutes: int = 30,
+        delta_marking: bool = True,
+        max_items: int = 5,
+    ) -> tuple[str, int]:
+        """渲染思考流块（用于 chatter transient）。
 
-        Legacy ``streams.json`` is migration evidence only.  It must never be
-        rendered as the subject's current attention or mutate during a prompt
-        read.  When canonical storage is not active, the projection is absent
-        rather than silently falling back to the retired authority.
+        Returns:
+            (body_text_without_top_heading, current_max_revision)
         """
-
-        if self._attention_thread_service is None:
-            return ""
-        from ..attention_threads import AttentionThreadPageQuery
-
+        if self._thought_manager is None:
+            return "", 0
         try:
-            page = await self.page_attention_threads(
-                AttentionThreadPageQuery(
-                    statuses=("open", "paused"),
-                    limit=12,
-                    max_bytes=12 * 1024,
-                    projection_kind="life_chatter",
-                    focus_instance_id=instance_id,
-                )
+            body = self._thought_manager.format_for_prompt(
+                max_items=max_items,
+                focus_window_minutes=focus_window_minutes,
+                revision_cursor=revision_cursor,
+                mark_delta=delta_marking,
+                grouped=True,
             )
+            return body, int(self._thought_manager.current_revision)
         except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "构建 chatter AttentionThread 有界投影失败: "
-                f"{type(exc).__name__}"
-            )
-            return ""
-        return str(page.content or "").strip()
+            logger.debug(f"构建 chatter 思考流快照失败: {exc}")
+            return "", 0
 
-    def _format_latest_expression_snapshot(
+    def _format_latest_chatter_think(
         self,
         stream_id: str,
         *,
@@ -5657,9 +5973,8 @@ class LifeEngineService(BaseService):
         transient 注入；high_water_sequence 在 LLM 请求成功后持久化，避免重复注入。
 
         结构：
-          1. ### 潜意识协调的瞬时世界感知
-          2. ### 主体持续关注（canonical AttentionThread 有界投影）
-          3. ### 最近一次表达内在快照
+          1. ### 当前思考流    （注意力脑区，分焦点/背景，带 🔄 delta 标记）
+          3. ### 最近一次独白/思考快照
           4. ### 运行时内心独白（push_runtime_assistant_injection 队列）
           5. ### 最近聊天记录
           6. ### 新增 life 事件流（完整可追溯事件窗口）
@@ -5680,10 +5995,14 @@ class LifeEngineService(BaseService):
         _ = event_limit  # 兼容老签名；新逻辑用配置项控制条数
 
         cfg = self._cfg()
+        streams_cfg = getattr(cfg, "streams", None)
         runtime_cfg = getattr(cfg, "runtime_sync", None)
-        latest_expression_snapshot_enabled = bool(
+        sync_streams = bool(streams_cfg is None or getattr(streams_cfg, "sync_to_chatter", True))
+        focus_window = int(getattr(streams_cfg, "focus_window_minutes", 30) or 30) if streams_cfg else 30
+        delta_marking = bool(streams_cfg is None or getattr(streams_cfg, "delta_marking", True))
+        latest_think_enabled = bool(
             runtime_cfg is None
-            or getattr(runtime_cfg, "latest_expression_snapshot_enabled", True)
+            or getattr(runtime_cfg, "latest_action_think_enabled", True)
         )
         recent_chat_enabled = bool(
             runtime_cfg is None or getattr(runtime_cfg, "recent_chat_enabled", True)
@@ -5775,20 +6094,24 @@ class LifeEngineService(BaseService):
         )
 
         new_thought_revision = thought_cursor
-        attention_text = await self._format_chatter_attention_threads(instance_id)
-        if attention_text:
-            sections.append(f"### 主体持续关注\n{attention_text}".rstrip())
+        if sync_streams:
+            thought_body, current_revision = self._format_chatter_thought_streams(
+                revision_cursor=thought_cursor,
+                focus_window_minutes=focus_window,
+                delta_marking=delta_marking,
+                max_items=5,
+            )
+            if thought_body:
+                sections.append(f"### 当前思考流\n{thought_body}".rstrip())
+            new_thought_revision = max(thought_cursor, current_revision)
 
-        if latest_expression_snapshot_enabled:
-            latest_expression_snapshot = self._format_latest_expression_snapshot(
+        if latest_think_enabled:
+            latest_think_text = self._format_latest_chatter_think(
                 stream_id,
                 unified_chatter_context=unified_chatter_context,
             )
-            if latest_expression_snapshot:
-                sections.append(
-                    "### 最近一次表达内在快照\n"
-                    f"{latest_expression_snapshot}"
-                )
+            if latest_think_text:
+                sections.append(f"### 最近一次独白/思考快照\n{latest_think_text}")
 
         runtime_text = str(runtime_context_text or "").strip()
         if runtime_text:
@@ -5825,7 +6148,7 @@ class LifeEngineService(BaseService):
                 )
 
         if trace_recent_enabled and trace_recent_limit > 0:
-            trace_recent_text = self._format_chatter_trace_recent_changes(
+            trace_recent_text = await self._format_chatter_trace_recent_changes(
                 limit=trace_recent_limit,
             )
             if trace_recent_text:
@@ -6290,45 +6613,31 @@ class LifeEngineService(BaseService):
             return "\n".join(boundary_lines)
         return "\n".join([*boundary_lines, "", safe_content])
 
-    def _build_heartbeat_system_prompt(self) -> str | None:
+    async def _build_heartbeat_system_prompt(self) -> str | None:
         """构造心跳模型系统提示词。
 
         Returns:
-            提示词字符串，或 None 表示 SOUL.md 不可用（应跳过本次心跳）。
+            提示词字符串，或 None 表示 SOUL 权威文本不可用（应跳过本次心跳）。
         """
         workspace = Path(self._cfg().settings.workspace_path)
 
-        soul_file = workspace / "SOUL.md"
-        soul_content = ""
-        if soul_file.exists():
-            try:
-                soul_content = soul_file.read_text(encoding="utf-8").strip()
-            except Exception as e:
-                logger.error(f"SOUL.md 读取失败，跳过本次心跳: {e}")
-                return None
-        else:
-            logger.error(f"SOUL.md 不存在 ({soul_file})，跳过本次心跳。没有灵魂就不说话。")
-            return None
-
+        # 潜意识心跳与聊天表达是同一主体的两个运行窗口，权威文本必须同源。
+        # 选定后端下这里只读远端单事务快照；远端缺口会失败关闭抛出，
+        # 由调用方跳过本轮心跳，而不是静默用本地旧文本继续跳动。
+        texts = await self.read_subject_authority_texts()
+        soul_content = texts.get("SOUL.md", "").strip()
         if not soul_content:
-            logger.error("SOUL.md 为空，跳过本次心跳。")
+            logger.error("SOUL 权威文本为空，跳过本次心跳。没有灵魂就不说话。")
             return None
 
-        user_file = workspace / "USER.md"
-        user_content = ""
-        if user_file.exists():
-            try:
-                user_content = user_file.read_text(encoding="utf-8").strip()
-            except Exception as e:
-                logger.warning(f"无法读取 USER.md: {e}")
+        user_content = texts.get("USER.md", "").strip()
 
         memory_content = ""
-        try:
-            memory_data = load_memory_prompt_data(workspace)
+        memory_raw = texts.get("MEMORY.md", "")
+        if memory_raw:
+            memory_data = analyze_memory_text(memory_raw)
             if memory_data.raw_text:
                 memory_content = render_memory_prompt(memory_data, mode="heartbeat")
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"无法读取 MEMORY.md: {e}")
 
         tool_file = workspace / "TOOL.md"
         tool_content = ""
@@ -6542,14 +6851,13 @@ class LifeEngineService(BaseService):
 
         return len(prepared) * 2
 
-    def _build_memory_maintenance_prompt_if_due(self) -> str:
+    async def _build_memory_maintenance_prompt_if_due(self) -> str:
         """Expose structural pressure as a review signal, never a write task."""
-        workspace = Path(self._cfg().settings.workspace_path)
-        try:
-            memory_data = load_memory_prompt_data(workspace)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"读取 MEMORY.md 维护状态失败: {exc}")
-            return ""
+
+        # 结构压力必须由当前权威 MEMORY 文本推导。选定后端下读远端快照，
+        # 远端缺口失败关闭；把它当成“没有压力”会让复盘信号永久沉默。
+        texts = await self.read_subject_authority_texts()
+        memory_data = analyze_memory_text(texts.get("MEMORY.md", ""))
 
         if not should_emit_memory_maintenance_prompt(
             memory_data,
@@ -6668,11 +6976,13 @@ class LifeEngineService(BaseService):
             request_name="life_engine_heartbeat",
         )
 
-        system_prompt = self._build_heartbeat_system_prompt()
+        system_prompt = await self._build_heartbeat_system_prompt()
         if system_prompt is None:
-            # SOUL.md 不可用——没有灵魂就不说话
+            # SOUL 权威文本不可用——没有灵魂就不说话
             return HeartbeatModelResult("", None)
-        memory_maintenance_prompt = self._build_memory_maintenance_prompt_if_due()
+        memory_maintenance_prompt = (
+            await self._build_memory_maintenance_prompt_if_due()
+        )
         section_texts = await self._render_heartbeat_sections()
         user_prompt = self._build_heartbeat_model_prompt(
             wake_context,
@@ -6839,10 +7149,29 @@ class LifeEngineService(BaseService):
                 )
 
             async def _send_followup_request() -> Any:
-                return await asyncio.wait_for(
-                    current_response.send(stream=False),
-                    timeout=timeout_seconds,
-                )
+                from src.kernel.llm.exceptions import LLMModelsCoolingDownError
+
+                try:
+                    return await asyncio.wait_for(
+                        current_response.send(stream=False),
+                        timeout=timeout_seconds,
+                    )
+                except LLMModelsCoolingDownError as cooldown_exc:
+                    # 首次请求超时会让唯一候选进入约 30s 冷却；续轮立即重发会
+                    # 直接撞冷却窗口。按 retry_after 等待（受步进预算约束）
+                    # 后再真实重发，而不是把冷却误报为 Provider 再次超时。
+                    wait_seconds = min(cooldown_exc.retry_after, timeout_seconds)
+                    logger.info(
+                        f"life_engine heartbeat follow-up 候选模型冷却中，"
+                        f"等待 {wait_seconds:.1f}s 后重试"
+                    )
+                    await asyncio.sleep(wait_seconds)
+                    return await asyncio.wait_for(
+                        current_response.send(stream=False),
+                        timeout=timeout_seconds,
+                    )
+
+            from src.kernel.llm.exceptions import LLMModelsCoolingDownError
 
             try:
                 response = await retry_with_backoff(
@@ -6861,7 +7190,13 @@ class LifeEngineService(BaseService):
                         raise PerceptionDeliveryUnverified(
                             "heartbeat follow-up lost the exact World projection"
                         )
-            except (asyncio.TimeoutError, RetryExhaustedError) as exc:
+            except (
+                asyncio.TimeoutError,
+                RetryExhaustedError,
+                LLMModelsCoolingDownError,
+            ) as exc:
+                # 冷却窗口内二次失败同样归一化为超时，保持心跳失败合同一致，
+                # 不把冷却中的本轮伪装成成功。
                 logger.warning(f"life_engine heartbeat follow-up request timeout: {exc}")
                 raise TimeoutError("heartbeat follow-up request timeout") from exc
 
@@ -6869,11 +7204,7 @@ class LifeEngineService(BaseService):
         self._update_heartbeat_idle_count(heartbeat_tool_calls)
 
         # 三环自学习系统心跳（低频后台任务：审计/压缩/指标）
-        if self._learning_scheduler is not None:
-            try:
-                await self._learning_scheduler.on_heartbeat()
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("学习系统心跳异常: %s", type(exc).__name__)
+        await self._run_learning_heartbeat_maintenance()
 
         if not last_text:
             if tool_event_count > 0:
@@ -6882,6 +7213,22 @@ class LifeEngineService(BaseService):
                 last_text = "此刻很安静，但我仍在持续感受与观察。"
 
         return HeartbeatModelResult(last_text, perception_receipt)
+
+    async def _run_learning_heartbeat_maintenance(self) -> None:
+        """Keep derived learning maintenance isolated from the main heartbeat."""
+
+        scheduler = self._learning_scheduler
+        if scheduler is None:
+            return
+        try:
+            await scheduler.on_heartbeat()
+        except Exception as exc:  # noqa: BLE001 - derived learning is isolated
+            logger.debug(f"学习系统心跳异常: {type(exc).__name__}")
+
+    def _mark_runtime_context_persisted(self) -> None:
+        """Mark the exact state snapshot protected by ``self._lock`` clean."""
+
+        self._state_dirty = False
 
     async def _save_runtime_context(self) -> None:
         """持久化当前上下文。"""
@@ -6892,14 +7239,18 @@ class LifeEngineService(BaseService):
                 self._cfg().settings.workspace_path,
                 self._history_limit,
                 self._lock,
+                runtime_store=self.runtime_state_store(),
+                runtime_writer_claim=self._runtime_context_writer_claim,
+                on_persisted=self._mark_runtime_context_persisted,
             )
         try:
-            await self._state_persistence.save_runtime_context(
+            cleaned_atomically = await self._state_persistence.save_runtime_context(
                 self._state,
                 self._pending_events,
                 self._event_history,
             )
-            self._state_dirty = False
+            if not cleaned_atomically:
+                self._state_dirty = False
         except PersistenceError as exc:
             self._state_dirty = True
             logger.error(f"life_engine 关键状态持久化失败: {exc}", exc_info=True)
@@ -6909,6 +7260,8 @@ class LifeEngineService(BaseService):
                 pending_count=len(self._pending_events),
                 history_count=len(self._event_history),
             )
+            if self._selectable_storage_enabled:
+                raise
 
     async def _load_runtime_context(self) -> None:
         """从持久化文件恢复上下文。"""
@@ -6917,6 +7270,9 @@ class LifeEngineService(BaseService):
                 self._cfg().settings.workspace_path,
                 self._history_limit,
                 self._lock,
+                runtime_store=self.runtime_state_store(),
+                runtime_writer_claim=self._runtime_context_writer_claim,
+                on_persisted=self._mark_runtime_context_persisted,
             )
         pending, history, persisted = await self._state_persistence.load_runtime_context(
             self._state,
@@ -6950,11 +7306,12 @@ class LifeEngineService(BaseService):
         cfg = self._cfg()
         if not cfg.settings.enabled:
             logger.info("life_engine 已禁用，跳过启动")
-            await self.clear_runtime_context()
+            if not self._selectable_storage_enabled:
+                await self.clear_runtime_context()
             return
 
         self._ensure_workspace_templates()
-        await self._load_runtime_context()
+        await self._validate_local_subject_authority()
         sleep_enabled, sleep_desc = self._sleep_window_status()
         if not sleep_enabled and sleep_desc != "disabled":
             logger.warning(
@@ -6962,7 +7319,11 @@ class LifeEngineService(BaseService):
                 "请使用 HH:MM 格式，且 sleep_time 与 wake_time 不可相同。"
             )
 
+        # The selected runtime acquires writer authority before returning. Start
+        # renewal immediately so slow Memory recovery cannot outlive that lease.
+        self._stop_event = asyncio.Event()
         await self._open_selected_storage_runtime()
+        self._start_storage_authority_renewal()
 
         # 初始化集成管理器
         self._memory_integration = MemoryIntegration(self)
@@ -6971,7 +7332,33 @@ class LifeEngineService(BaseService):
 
         self._dfc_integration = DFCIntegration(self)
 
+        # 初始化思考流管理器
+        streams_cfg = getattr(cfg, "streams", None)
+        if streams_cfg is None or getattr(streams_cfg, "enabled", True):
+            max_active = getattr(streams_cfg, "max_active_streams", 5) if streams_cfg else 5
+            dormancy_hours = getattr(streams_cfg, "dormancy_threshold_hours", 24) if streams_cfg else 24
+            half_life = float(getattr(streams_cfg, "curiosity_decay_half_life_hours", 12.0)) if streams_cfg else 12.0
+            curiosity_floor = float(getattr(streams_cfg, "curiosity_floor", 0.15)) if streams_cfg else 0.15
+            self._thought_manager = ThoughtStreamManager(
+                workspace_path=cfg.settings.workspace_path,
+                max_active=max_active,
+                dormancy_hours=dormancy_hours,
+                curiosity_decay_half_life_hours=half_life,
+                curiosity_floor=curiosity_floor,
+            )
+            logger.info(
+                f"思考流系统已初始化: max_active={max_active}, "
+                f"half_life={half_life}h, floor={curiosity_floor}"
+            )
+
+        # 初始化冲动引擎
+        drives_cfg = getattr(cfg, "drives", None)
+        if drives_cfg is None or getattr(drives_cfg, "enabled", True):
+            self._impulse_engine = ImpulseEngine(list(DEFAULT_RULES))
+            logger.info("冲动引擎已初始化")
+
         await self._start_selected_storage()
+        await self._load_runtime_context()
 
         # Minecraft is a scene capability owned by the service.  It must be
         # available even when the optional learning system is disabled.
@@ -7011,9 +7398,16 @@ class LifeEngineService(BaseService):
                         if self._selectable_storage_enabled
                         else self._current_learning_subject_revision
                     ),
+                    read_subject_authority=(
+                        self._subject_document_store.read_subject_authority
+                        if self._selectable_storage_enabled
+                        and self._subject_document_store is not None
+                        else None
+                    ),
                     validate_active_consciousness_instance=(
                         self._validate_learning_decision_actor
                     ),
+                    writer_instance_id=self._storage_writer_instance_id,
                     audit_interval_hours=float(getattr(learning_cfg, "audit_interval_hours", 6.0) if learning_cfg else 6.0),
                     audit_batch_size=int(getattr(learning_cfg, "audit_batch_size", 3) if learning_cfg else 3),
                     compress_trigger_count=int(getattr(learning_cfg, "compress_trigger_count", 5) if learning_cfg else 5),
@@ -7051,11 +7445,13 @@ class LifeEngineService(BaseService):
 
         if getattr(getattr(cfg, "autonomy", None), "enabled", True):
             try:
-                await restore_autonomy_intents(self.plugin, cfg.settings.workspace_path)
+                await restore_autonomy_intents(
+                    self.plugin,
+                    cfg.settings.workspace_path,
+                    store=self._autonomy_store(),
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"恢复自主意向失败: {exc}")
-
-        self._stop_event = asyncio.Event()
 
         shared_sync_cfg = getattr(cfg, "shared_sync", None)
         if bool(getattr(shared_sync_cfg, "enabled", False)):
@@ -7139,6 +7535,11 @@ class LifeEngineService(BaseService):
                     )
                     or 1.0
                 ),
+                # When a selected store is bound it becomes the only authority
+                # source for SOUL/USER/MEMORY; local Markdown is never read as
+                # a fallback and a remote gap fails closed instead.
+                subject_store=self._subject_document_store,
+                runtime_store=self._runtime_state_store,
             )
             projection_task = get_task_manager().create_task(
                 self._router_context_projection.run(),
@@ -7232,6 +7633,12 @@ class LifeEngineService(BaseService):
         if self._stop_event is not None:
             self._stop_event.set()
 
+        await self._await_managed_task(
+            self._storage_authority_renew_task_id,
+            timeout=5.0,
+        )
+        self._storage_authority_renew_task_id = None
+
         if self._router_context_projection is not None:
             self._router_context_projection.request_stop()
 
@@ -7303,7 +7710,10 @@ class LifeEngineService(BaseService):
                 self._memory_service = None
 
         try:
-            await cleanup_autonomy_schedules(self._cfg().settings.workspace_path)
+            await cleanup_autonomy_schedules(
+                self._cfg().settings.workspace_path,
+                store=self._autonomy_store(),
+            )
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"清理自主意向调度失败: {exc}")
         self._stop_event = None

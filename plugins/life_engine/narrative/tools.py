@@ -28,7 +28,7 @@ def _get_workspace(plugin: Any) -> Path:
     return path
 
 
-def _record_river_moment(*, summary: str, operation: str) -> None:
+async def _record_river_moment(*, summary: str, operation: str) -> None:
     """叙事写下这件事本身也是转折点，入长河；故障绝不影响沉淀。"""
     try:
         from ..service.registry import get_life_engine_service
@@ -36,7 +36,7 @@ def _record_river_moment(*, summary: str, operation: str) -> None:
         service = get_life_engine_service()
         recorder = getattr(service, "_record_life_moment", None) if service else None
         if recorder is not None:
-            recorder(kind="narrative", summary=summary, operation=operation)
+            await recorder(kind="narrative", summary=summary, operation=operation)
     except Exception as exc:  # noqa: BLE001
         logger.debug(f"长河留痕失败 kind=narrative: {exc}")
 
@@ -69,11 +69,15 @@ class LifeEngineWriteNarrativeTool(BaseTool):
             )
 
         try:
-            workspace = _get_workspace(self.plugin)
-            store = NarrativeStore(workspace)
-            pending = store.pending_moments(LifeTraceStore(workspace).recent(limit=500))
+            service = getattr(self.plugin, "service", None)
+            if service is None:
+                raise RuntimeError("LifeEngineServiceUnavailable")
+            store = service.narrative_store()
+            state = await store.load_state()
+            records = await service.life_trace_store().recent(limit=500)
+            pending = store.pending_moments(records, state)
             quiet = not text
-            entry = store.consolidate(
+            entry = await store.consolidate(
                 text=text,
                 quiet=quiet,
                 moment_count=len(pending),
@@ -82,7 +86,7 @@ class LifeEngineWriteNarrativeTool(BaseTool):
             return False, f"沉淀失败: {exc}"
 
         if quiet:
-            _record_river_moment(
+            await _record_river_moment(
                 summary="回望长河，这段时间没什么值得说的——也是一次完整的回望",
                 operation="quiet",
             )
@@ -94,14 +98,19 @@ class LifeEngineWriteNarrativeTool(BaseTool):
                 "note": "回望已完成。没什么值得说的也很好。",
             }
 
-        _record_river_moment(summary=f"写下自我叙事：{text[:120]}", operation="written")
+        await _record_river_moment(
+            summary=f"写下自我叙事：{text[:120]}",
+            operation="written",
+        )
         return True, {
             "action": "write_narrative",
             "entry_id": entry.entry_id,
             "quiet": False,
             "consolidated_moments": entry.moment_count,
-            "autobiography_path": AUTOBIOGRAPHY_REL_PATH,
-            "note": "叙事已写入你的自传。",
+            "narrative_storage": (
+                "mysql" if service.runtime_state_store() is not None else AUTOBIOGRAPHY_REL_PATH
+            ),
+            "note": "叙事已进入你的可追溯自传历史。",
         }
 
 

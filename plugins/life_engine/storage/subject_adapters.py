@@ -28,6 +28,7 @@ from .subject_contracts import (
     SubjectAuthorityCommit,
     SubjectAuthorityConflict,
     SubjectAuthorityEvidenceError,
+    SubjectAuthoritySnapshot,
     SubjectDocumentCommit,
     SubjectDocumentConflict,
     SubjectDocumentHead,
@@ -133,6 +134,29 @@ def _subject_text_format(content: bytes) -> tuple[str, str | None]:
         if count
     ]
     return encoding, styles[0] if len(styles) == 1 else ("mixed" if styles else None)
+
+
+def _subject_head_change_marker(
+    heads: dict[str, tuple[str, int]],
+) -> str:
+    marker = hashlib.sha256()
+    for path in SUBJECT_AUTHORITY_PATHS:
+        head = heads.get(path)
+        if head is None:
+            raise SubjectAuthorityEvidenceError(
+                f"subject authority head is missing: {path}"
+            )
+        version_id, revision = head
+        if not version_id or revision <= 0:
+            raise SubjectAuthorityEvidenceError(
+                f"subject authority head is invalid: {path}"
+            )
+        marker.update(path.encode("utf-8"))
+        marker.update(b"\0")
+        marker.update(version_id.encode("ascii"))
+        marker.update(b"\0")
+        marker.update(revision.to_bytes(8, "big"))
+    return marker.hexdigest()
 
 
 class SQLSubjectDocumentStore:
@@ -467,6 +491,74 @@ class SQLSubjectDocumentStore:
             )
         return revision
 
+    async def current_subject_change_marker(self) -> str:
+        """Return a lightweight marker for the current three authority heads.
+
+        This marker detects changes without transferring or decoding subject
+        content. ``read_subject_authority()`` remains the only path that mints
+        and validates the canonical exact-byte revision.
+        """
+
+        logical_paths = {
+            path: subject_authority_logical_path(path)
+            for path in SUBJECT_AUTHORITY_PATHS
+        }
+        async with self.runtime.unit_of_work() as uow:
+            rows = (
+                (
+                    await uow.session.execute(
+                        text(
+                            """SELECT logical_path, current_version_id, revision
+                            FROM subject_documents
+                            WHERE logical_path IN (:soul, :user, :memory)
+                            ORDER BY logical_path"""
+                        ),
+                        {
+                            "soul": logical_paths["SOUL.md"],
+                            "user": logical_paths["USER.md"],
+                            "memory": logical_paths["MEMORY.md"],
+                        },
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        by_logical = {str(row["logical_path"]): row for row in rows}
+        heads: dict[str, tuple[str, int]] = {}
+        for path in SUBJECT_AUTHORITY_PATHS:
+            logical_path = logical_paths[path]
+            row = by_logical.get(logical_path)
+            if row is None:
+                raise SubjectAuthorityEvidenceError(
+                    f"subject authority head is missing: {path}"
+                )
+            heads[path] = (
+                str(row["current_version_id"] or ""),
+                int(row["revision"]),
+            )
+        return _subject_head_change_marker(heads)
+
+    async def read_subject_authority(self) -> SubjectAuthoritySnapshot:
+        """Read all three authority head/version pairs in one consistent snapshot."""
+
+        async with self.runtime.unit_of_work() as uow:
+            state, revision = await self._subject_authority_state(
+                uow.session,
+                lock=False,
+            )
+        heads = {
+            path: (
+                state[path].head.current_version_id,
+                state[path].head.revision,
+            )
+            for path in SUBJECT_AUTHORITY_PATHS
+        }
+        return SubjectAuthoritySnapshot(
+            commits={path: state[path] for path in SUBJECT_AUTHORITY_PATHS},
+            revision=revision,
+            change_marker=_subject_head_change_marker(heads),
+        )
+
     @staticmethod
     def _validate_learning_event_integrity(row: Any) -> dict[str, Any]:
         provenance = _json_object(row["provenance_json"])
@@ -778,7 +870,7 @@ class SQLSubjectDocumentStore:
                     confirmed_at, last_error
                 ) VALUES (
                     :head_event_id, :document_id, :logical_path, :version_id,
-                    :content_hash, 'pending', 0, :created_at,
+                    :content_hash, :projection_state, 0, :created_at,
                     :confirmed_at, ''
                 )"""
             ),
@@ -788,8 +880,15 @@ class SQLSubjectDocumentStore:
                 "logical_path": current.head.logical_path,
                 "version_id": version_id,
                 "content_hash": content_hash,
+                "projection_state": (
+                    "confirmed" if self.backend == BackendKind.MYSQL else "pending"
+                ),
                 "created_at": self._bind_time(database_now),
-                "confirmed_at": (None if self.backend == BackendKind.MYSQL else ""),
+                "confirmed_at": (
+                    self._bind_time(database_now)
+                    if self.backend == BackendKind.MYSQL
+                    else ""
+                ),
             },
         )
         version = SubjectDocumentVersion(
@@ -1347,7 +1446,7 @@ class SQLSubjectDocumentStore:
                         confirmed_at, last_error
                     ) VALUES (
                         :head_event_id, :document_id, :logical_path, :version_id,
-                        :content_hash, 'pending', 0, :created_at,
+                        :content_hash, :projection_state, 0, :created_at,
                         :confirmed_at, ''
                     )"""
                 ),
@@ -1357,8 +1456,15 @@ class SQLSubjectDocumentStore:
                     "logical_path": path,
                     "version_id": version_id,
                     "content_hash": content_hash,
+                    "projection_state": (
+                        "confirmed" if self.backend == BackendKind.MYSQL else "pending"
+                    ),
                     "created_at": self._bind_time(database_now),
-                    "confirmed_at": (None if self.backend == BackendKind.MYSQL else ""),
+                    "confirmed_at": (
+                        self._bind_time(database_now)
+                        if self.backend == BackendKind.MYSQL
+                        else ""
+                    ),
                 },
             )
             version = SubjectDocumentVersion(

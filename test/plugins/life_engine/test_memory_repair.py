@@ -76,8 +76,9 @@ def test_repair_rebuilds_drifted_documents_and_is_idempotent(
         note.write_text("# 新版本\n\n世界已经变化，她也知道了。\n", encoding="utf-8")
         from plugins.life_engine.memory.nodes import compute_content_hash
 
+        actual_content = note.read_bytes().decode("utf-8")
         assert _stored_hash(db, "notes/life.md") != compute_content_hash(
-            "# 新版本\n\n世界已经变化，她也知道了。\n"
+            actual_content
         )
 
         first = repair_document_index(db, tmp_path)
@@ -87,7 +88,7 @@ def test_repair_rebuilds_drifted_documents_and_is_idempotent(
         assert first.foreign_key_errors == 0
         assert first.pending_jobs >= 1
         assert _stored_hash(db, "notes/life.md") == compute_content_hash(
-            "# 新版本\n\n世界已经变化，她也知道了。\n"
+            actual_content
         )
 
         second = repair_document_index(db, tmp_path)

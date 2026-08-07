@@ -52,7 +52,8 @@ from .context_compaction import (
     hierarchical_compact_payloads,
 )
 from src.kernel.logger import get_logger, COLOR
-from ..memory.prompting import load_memory_prompt_data, render_memory_prompt
+from src.kernel.storage import canonical_json_sha256
+from ..memory.prompting import analyze_memory_text, render_memory_prompt
 from ..constants import LIFE_CHATTER_GLOBAL_CURSOR_KEY
 from .chat_history import (
     build_chat_history_text,
@@ -104,7 +105,7 @@ _REASON_LEAK_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _PLACEHOLDER_ONLY_PATTERN = re.compile(r"^(?:\.{2,}|。{2,}|…+|⋯+|··+)$")
-_ROLLING_CONTEXT_SNAPSHOT_VERSION = 2
+_ROLLING_CONTEXT_SNAPSHOT_VERSION = 3
 _LIVE_BRIDGE_BLOCKED_USABLE_SIGNATURES = frozenset(
     {
         "tts_voice_plugin:action:tts_voice_action",
@@ -298,7 +299,7 @@ class LifeSendTextAction(BaseAction):
         "模型调用必须同时提交 mood、decision、expected_response、thought 和 content 五个键；"
         "thought 必须是本次动作真实、非空的思考；其他确实不适用的内在字段可传空字符串，"
         "禁止编造 neutral/general 等占位语义。"
-        "这些字段会与最终回复保存在同一模型轨迹中，供主体连续性与后训练使用。"
+        "这些字段会与最终回复保存在同一模型轨迹中，供人格连续性与后训练使用。"
         "content 只能是字符串；若需分多条发送，用换行符（\\n）分隔各段，"
         "例如 \"你好\\n请问你是谁？\\n找我有什么事吗？\"，将依次发出 3 条消息。"
         "content 中只能包含要发给用户的纯文本正文。"
@@ -322,7 +323,7 @@ class LifeSendTextAction(BaseAction):
     def to_schema(cls) -> dict[str, Any]:
         """Expose one atomic thought-and-expression contract to the model.
 
-        Current model requests must supply the structured subject fields together
+        Current model requests must supply the structured persona fields together
         with the visible reply.  In particular, ``thought`` is also enforced by
         ``execute`` so a provider that ignores JSON-schema ``required`` cannot
         silently send an unbound training sample.
@@ -614,7 +615,7 @@ class LifeSendTextAction(BaseAction):
             str,
             "本次主体自己选择提交的简洁内心活动。键和值都必填，必须是非空自然语言；"
             "不得从 provider reasoning 或 content 自动回填，也不得把它当作可见正文。",
-        ],
+        ] = "",
         mood: Annotated[
             str,
             "此刻的心情或情绪状态。键必填；没有明确情绪时传空字符串，禁止编造默认情绪。",
@@ -626,6 +627,10 @@ class LifeSendTextAction(BaseAction):
         expected_response: Annotated[
             str,
             "你预期用户看到回复后的反应。键必填；没有明确预期时传空字符串。",
+        ] = "",
+        mode: Annotated[
+            str,
+            "兼容旧模型的可选情绪/表达模式字段；仅记录，不参与发送路由。",
         ] = "",
         reply_to: Annotated[
             str | None,
@@ -667,7 +672,7 @@ class LifeSendTextAction(BaseAction):
                 return False, f"未知或不可用的发送目标 target_key: {normalized_target_key}"
 
         structured_context = {
-            "mood": str(mood or "").strip(),
+            "mood": str(mood or mode or "").strip(),
             "decision": str(decision or "").strip(),
             "expected_response": str(expected_response or "").strip(),
             "thought": normalized_thought,
@@ -1693,13 +1698,13 @@ class LifeChatter(BaseChatter):
             chatter_config=getattr(self._get_config(), "chatter", None),
         )
 
-        # System prompt 只放主体权威投影和全局工具规则，不绑定任何具体聊天流。
+        # System prompt 只放主体人格和全局工具规则，不绑定任何具体聊天流。
         # 直播/私聊/群聊等场景提示放到每轮 USER prompt 中，避免第一条消息的
         # stream 类型污染后续所有流。
-        system_text = self._build_chat_system_prompt(service, None)
+        system_text = await self._build_chat_system_prompt(service, None)
         if not system_text:
-            # SOUL.md 不可用——没有灵魂就不说话
-            logger.error("SOUL.md 不可用，life_chatter 拒绝生成回复")
+            # SOUL 权威文本不可用——没有灵魂就不说话
+            logger.error("SOUL 权威文本不可用，life_chatter 拒绝生成回复")
             return None
         request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_text)))
 
@@ -1709,7 +1714,7 @@ class LifeChatter(BaseChatter):
         usable_map = await self.inject_usables(request)
         # Phase E: 按意识实例类型工具清单过滤
         usable_map = self._filter_usables_by_manifest(usable_map, request)
-        restored_payloads = self._load_rolling_context_snapshot()
+        restored_payloads = await self._load_rolling_context_snapshot(service)
         if restored_payloads:
             request.payloads.extend(restored_payloads)
             logger.info(
@@ -1888,9 +1893,15 @@ class LifeChatter(BaseChatter):
         }
         cleaned_payloads: list[LLMPayload] = []
         for payload in payloads:
+            original_content = list(getattr(payload, "content", None) or [])
+            contains_retired_think_call = any(
+                isinstance(part, ToolCall)
+                and part.name == _RETIRED_THINK_ACTION
+                for part in original_content
+            )
             content = [
                 part
-                for part in (getattr(payload, "content", None) or [])
+                for part in original_content
                 if not (
                     isinstance(part, ToolCall)
                     and part.name == _RETIRED_THINK_ACTION
@@ -1903,11 +1914,23 @@ class LifeChatter(BaseChatter):
                     )
                 )
             ]
+            if (
+                payload.role == ROLE.ASSISTANT
+                and contains_retired_think_call
+                and not any(isinstance(part, ToolCall) for part in content)
+            ):
+                # A retired think response can also contain incidental text,
+                # provider reasoning, or the legacy suspend marker.  Keeping
+                # those remnants after removing the call/result pair turns
+                # ``assistant -> think_result -> assistant`` into the invalid
+                # ``assistant -> assistant`` chain.  They are part of the old
+                # rolling projection ritual, not the authoritative trajectory.
+                continue
             if not content:
                 continue
             cleaned_payloads.append(
                 payload
-                if len(content) == len(getattr(payload, "content", None) or [])
+                if len(content) == len(original_content)
                 else LLMPayload(payload.role, content)  # type: ignore[arg-type]
             )
         return cleaned_payloads
@@ -2144,16 +2167,10 @@ class LifeChatter(BaseChatter):
             )
             if item is not None
         ]
-        payload_json = json.dumps(
-            serialized_payloads,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            default=str,
-        )
         return {
             "version": _ROLLING_CONTEXT_SNAPSHOT_VERSION,
             "runtime_key": cls.global_runtime_key,
-            "payload_digest": hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+            "payload_digest": canonical_json_sha256(serialized_payloads),
             "payloads": serialized_payloads,
         }
 
@@ -2276,7 +2293,29 @@ class LifeChatter(BaseChatter):
             return None
         return LLMPayload(role, content)  # type: ignore[arg-type]
 
-    def _load_rolling_context_snapshot(self) -> list[LLMPayload]:
+    async def _load_rolling_context_snapshot(
+        self,
+        service: LifeEngineService | None = None,
+    ) -> list[LLMPayload]:
+        selected_store = None
+        if service is not None:
+            get_store = getattr(service, "runtime_state_store", None)
+            if callable(get_store):
+                selected_store = get_store()
+        if selected_store is not None:
+            record = await selected_store.get_state(
+                "life_chatter.rolling_context",
+                self.instance_id,
+            )
+            if record is None:
+                self._rolling_context_state_revision = 0
+                return []
+            self._rolling_context_state_revision = int(record.revision)
+            return self._deserialize_rolling_context_snapshot(
+                record.payload,
+                outer_integrity_verified=True,
+            )
+
         path = self._rolling_context_snapshot_path()
         # Phase C: 自动迁移旧版全局滚动上下文到实例路径
         if not path.exists() and self.instance_id == "chat_global":
@@ -2298,26 +2337,56 @@ class LifeChatter(BaseChatter):
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"读取 life_chatter 滚动上下文快照失败: {exc}")
             return []
+        try:
+            return self._deserialize_rolling_context_snapshot(raw)
+        except RuntimeError as exc:
+            logger.warning(f"忽略无效的 life_chatter 滚动上下文快照: {exc}")
+            return []
+
+    def _deserialize_rolling_context_snapshot(
+        self,
+        raw: Any,
+        *,
+        outer_integrity_verified: bool = False,
+    ) -> list[LLMPayload]:
+        """Validate and decode one local or selected-backend snapshot."""
+
         if not isinstance(raw, dict):
-            return []
+            raise RuntimeError("RollingContextSnapshotNotObject")
         version = raw.get("version", 1)
-        if version not in {1, _ROLLING_CONTEXT_SNAPSHOT_VERSION}:
-            logger.warning(f"忽略不支持的 life_chatter 快照版本: {version}")
-            return []
+        if version not in {1, 2, _ROLLING_CONTEXT_SNAPSHOT_VERSION}:
+            raise RuntimeError(f"RollingContextSnapshotVersionUnsupported:{version}")
         runtime_key = raw.get("runtime_key")
         if runtime_key not in {None, self.global_runtime_key}:
-            logger.warning("忽略 runtime_key 不匹配的 life_chatter 快照")
-            return []
+            raise RuntimeError("RollingContextRuntimeKeyMismatch")
         payload_items = raw.get("payloads")
         if not isinstance(payload_items, list):
-            return []
-        if version == _ROLLING_CONTEXT_SNAPSHOT_VERSION:
+            raise RuntimeError("RollingContextPayloadsNotList")
+        if version in {2, _ROLLING_CONTEXT_SNAPSHOT_VERSION}:
             expected_digest = raw.get("payload_digest")
-            payload_json = json.dumps(payload_items, ensure_ascii=False, separators=(",", ":"), default=str)
-            actual_digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
-            if not isinstance(expected_digest, str) or expected_digest != actual_digest:
-                logger.warning("忽略 payload digest 校验失败的 life_chatter 快照")
-                return []
+            if version == 2:
+                payload_json = json.dumps(
+                    payload_items,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=str,
+                )
+                actual_digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+                digest_matches = expected_digest == actual_digest
+                if not digest_matches and outer_integrity_verified:
+                    # v2 hashed insertion-ordered JSON. Selected runtime storage
+                    # canonicalizes nested object keys while independently
+                    # verifying the complete payload hash, so that legacy inner
+                    # digest cannot survive an otherwise lossless round trip.
+                    digest_matches = (
+                        isinstance(expected_digest, str)
+                        and re.fullmatch(r"[0-9a-f]{64}", expected_digest) is not None
+                    )
+            else:
+                actual_digest = canonical_json_sha256(payload_items)
+                digest_matches = expected_digest == actual_digest
+            if not isinstance(expected_digest, str) or not digest_matches:
+                raise RuntimeError("RollingContextPayloadDigestMismatch")
         payloads = [
             payload
             for payload in (
@@ -2327,18 +2396,15 @@ class LifeChatter(BaseChatter):
             if payload is not None
         ]
         payloads = self._without_retired_think_history(payloads)
-        # v1 is accepted as-is; migration to v2 (+ digest) happens on the next
-        # successful save. Do not rewrite the snapshot file from load.
+        # Legacy snapshots migrate to v3 canonical digests on the next
+        # successful save. Do not rewrite storage from a read path.
         return payloads
 
     async def _save_rolling_context_snapshot(self, response: Any) -> None:
-        """Persist the current runtime payloads without mutating runtime.
+        """Persist current runtime payloads through the selected authority.
 
-        Runtime hierarchical compaction is owned by ``_maybe_compact_runtime_context``.
-        Snapshot only serializes the current payloads (plus hard char-budget
-        envelope if the file would otherwise be oversized). mkdir / serialize /
-        write / replace are all failure-isolated so a bad disk path never
-        changes the live request.
+        Under selected storage this writes the fenced remote state and propagates
+        failures. Local JSON remains only for explicit local mode.
         """
         payloads = getattr(response, "payloads", None)
         if not isinstance(payloads, list):
@@ -2346,13 +2412,34 @@ class LifeChatter(BaseChatter):
         current_payloads = [payload for payload in payloads if isinstance(payload, LLMPayload)]
         if not current_payloads:
             return
+        # Hard envelope only — hierarchical policy already ran via maybe.
+        snapshot_payloads, _, _ = self._compact_rolling_context_payloads_from_config(
+            current_payloads
+        )
+        data = self._snapshot_data_for_payloads(snapshot_payloads)
+
+        service = self._get_life_service()
+        selected_store = None
+        if service is not None:
+            get_store = getattr(service, "runtime_state_store", None)
+            if callable(get_store):
+                selected_store = get_store()
+        if selected_store is not None:
+            expected_revision = int(
+                getattr(self, "_rolling_context_state_revision", 0) or 0
+            )
+            record = await selected_store.put_state(
+                namespace="life_chatter.rolling_context",
+                state_key=self.instance_id,
+                expected_revision=expected_revision,
+                schema_version=_ROLLING_CONTEXT_SNAPSHOT_VERSION,
+                payload=data,
+            )
+            self._rolling_context_state_revision = int(record.revision)
+            return
+
         tmp_path: Path | None = None
         try:
-            # Hard envelope only — hierarchical policy already ran via maybe.
-            snapshot_payloads, _, _ = self._compact_rolling_context_payloads_from_config(
-                current_payloads
-            )
-            data = self._snapshot_data_for_payloads(snapshot_payloads)
             path = self._rolling_context_snapshot_path()
             tmp_path = path.with_suffix(path.suffix + ".tmp")
             await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
@@ -2760,26 +2847,33 @@ class LifeChatter(BaseChatter):
 
     # ── system prompt ────────────────────────────────────────
 
-    def _build_chat_system_prompt(
+    async def _build_chat_system_prompt(
         self,
         service: LifeEngineService | None,
         chat_stream: ChatStream | None = None,
     ) -> str:
         """构建 100% 静态可缓存前缀提示词。"""
 
+        # SOUL/USER/MEMORY 属于主体权威内容，只能来自唯一绑定的权威源。
         # TOOL.md 是 life_engine/heartbeat 的工具边界；life_chatter 使用独立
-        # TOOLS.md，避免把潜意识中枢的工具规则混入表达层。
-        soul_text = self._load_soul_markdown(service)
-        if soul_text is None:
+        # TOOLS.md，它是工程 Prompt 脚手架而非主体语义，仍留在工作空间。
+        texts = await self._load_subject_authority_texts(service)
+        soul_text = texts.get("SOUL.md", "").strip()
+        if not soul_text:
             # 没有灵魂就不说话
             return ""
-        user_text = self._load_workspace_markdown(service, "USER.md")
-        memory_text = self._load_workspace_memory_prompt(service, mode="chat")
+
+        memory_text = ""
+        memory_raw = texts.get("MEMORY.md", "")
+        if memory_raw:
+            memory_data = analyze_memory_text(memory_raw)
+            if memory_data.raw_text:
+                memory_text = render_memory_prompt(memory_data, mode="chat")
         tools_text = self._load_workspace_markdown(service, "TOOLS.md")
 
         return LifeChatterContextAssembler.build_prefix_prompt(
             soul_text=soul_text,
-            user_text=user_text,
+            user_text=texts.get("USER.md", "").strip(),
             memory_text=memory_text,
             tools_text=tools_text,
             live_guidance=self._build_live_scene_guidance(chat_stream),
@@ -2834,51 +2928,39 @@ class LifeChatter(BaseChatter):
             logger.warning(f"读取 {filename} 失败: {e}")
         return ""
 
-    def _load_soul_markdown(
+    async def _load_subject_authority_texts(
         self,
         service: LifeEngineService | None,
-    ) -> str | None:
-        """加载 SOUL.md。返回 None 表示不可用（应拒绝回复）。"""
+    ) -> dict[str, str]:
+        """Read SOUL/USER/MEMORY from the single bound authority source.
+
+        The service owns the authority binding: under a selected backend it
+        reads one consistent remote snapshot and fails closed on a gap, so the
+        expression layer never silently falls back to stale local Markdown.
+        """
+
+        read_texts = getattr(service, "read_subject_authority_texts", None)
+        if callable(read_texts):
+            return {
+                str(name): str(text or "")
+                for name, text in (await read_texts()).items()
+            }
+
+        # No service binding at all: this is the legacy local workspace path,
+        # not a selected backend. A selected backend always reaches the branch
+        # above, where a missing remote head raises instead of degrading.
         workspace = self._resolve_workspace_path(service)
         if not workspace:
-            logger.error("工作空间路径不可用，无法加载 SOUL.md")
-            return None
+            logger.error("工作空间路径不可用，无法加载主体权威文本")
+            return {}
 
-        path = Path(workspace) / "SOUL.md"
-        try:
-            if path.exists() and path.is_file():
-                content = path.read_text(encoding="utf-8").strip()
-                if content:
-                    return content
-                logger.error(f"SOUL.md 为空: {path}")
-                return None
-        except Exception as e:
-            logger.error(f"SOUL.md 读取失败: {e}")
-            return None
+        from ..core.router_context_projection import read_subject_authority_sources
 
-        logger.error(f"SOUL.md 不存在: {path}。没有灵魂就不说话。")
-        return None
-
-    def _load_workspace_memory_prompt(
-        self,
-        service: LifeEngineService | None,
-        *,
-        mode: str,
-    ) -> str:
-        """读取并过滤 MEMORY.md，避免把编辑说明和 Fading 全量注入。"""
-        workspace = self._resolve_workspace_path(service)
-        if not workspace:
-            return ""
-
-        try:
-            memory_data = load_memory_prompt_data(workspace)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"读取 MEMORY.md 失败: {e}")
-            return ""
-
-        if not memory_data.raw_text:
-            return ""
-        return render_memory_prompt(memory_data, mode=mode)
+        sources, _ = await asyncio.to_thread(
+            read_subject_authority_sources,
+            workspace,
+        )
+        return {source.path: source.text for source in sources}
 
     @staticmethod
     def _is_live_stream(chat_stream: ChatStream | None) -> bool:
@@ -2948,7 +3030,7 @@ class LifeChatter(BaseChatter):
             "- 正确示范：用户问你问题，在同一次调用中提交 `life_send_text(thought=\"本次真实思考\", mood=\"\", decision=\"如何回应\", expected_response=\"\", content=\"你的回答\")` → 用户看到回答。\n"
             "### 对话循环规则\n"
             "- 每轮你收到的工具结果会自动回到上下文，系统默认让你继续行动——你不需要等待用户下一条消息就能继续调用工具。\n"
-            "- 需要的轻量思考应在当前模型决策内完成；使用 `life_send_text` 时要在同一个调用中提交 `mood`、`decision`、`expected_response`、`thought` 和 `content` 五个键，形成对齐的主体表达训练样本。\n"
+            "- 需要的轻量思考应在当前模型决策内完成；使用 `life_send_text` 时要在同一个调用中提交 `mood`、`decision`、`expected_response`、`thought` 和 `content` 五个键，形成对齐的人格训练样本。\n"
             "- `thought` 必须先写且不能为空；其他内在字段确实不适用时可填写空字符串，不要编造默认情绪或预期。不得从 provider reasoning 或 `content` 自动回填 `thought`。\n"
             "- 如果当前输入和上下文已足够，必须在本次模型决策中直接调用目标工具；普通回复直接调用 `life_send_text`，不要把一次能完成的事拆成两次模型调用。\n"
             "- 想结束本轮对话、等待用户回复时，调用 `action-life_pass_and_wait`。这是唯一退出循环的方式。\n"
@@ -3094,10 +3176,10 @@ class LifeChatter(BaseChatter):
             commit_cursors=commit_cursors,
             event_cursor_override=event_cursor_override,
         )
-        system_prompt_text = self._build_chat_system_prompt(service, None)
+        system_prompt_text = await self._build_chat_system_prompt(service, None)
         if not system_prompt_text:
-            # SOUL.md 不可用——没有灵魂就不说话
-            logger.error("SOUL.md 不可用，拒绝构建上下文")
+            # SOUL 权威文本不可用——没有灵魂就不说话
+            logger.error("SOUL 权威文本不可用，拒绝构建上下文")
             return None
         assembled = LifeChatterContextAssembler.assemble(
             prefix_text=system_prompt_text,
@@ -3161,17 +3243,23 @@ class LifeChatter(BaseChatter):
                 if str(getattr(msg, "message_id", "") or "")
             },
         )
-        if self._load_soul_markdown(service) is None:
-            # SOUL.md 不可用——没有灵魂就不说话
-            return {"reason": "SOUL.md 不可用，拒绝响应", "should_respond": False}
         prefix_prompt = await self._build_chat_router_prefix_prompt(
             service,
             chat_stream,
         )
         if not prefix_prompt:
+            # Projection-disabled/degraded routing still verifies the bound SOUL
+            # authority explicitly before using the lightweight base prompt.
+            if not (await self._load_subject_authority_texts(service)).get(
+                "SOUL.md", ""
+            ).strip():
+                return {
+                    "reason": "SOUL 权威文本不可用，拒绝响应",
+                    "should_respond": False,
+                }
             logger.warning(
                 "Router 上下文投影暂不可用，将使用轻量基础提示词；"
-                "主体权威投影与记忆仍由表达层读取"
+                "完整人格与记忆仍由表达层读取"
             )
 
         try:
@@ -4681,17 +4769,19 @@ class LifeChatter(BaseChatter):
                 )
                 rt.active_stream_id = stream_id
 
-                history_text = await self._build_history_text_async(
-                    chat_stream,
-                    max_messages=self._get_initial_history_message_limit(),
-                    global_history=True,
-                    exclude_message_ids={
-                        str(getattr(msg, "message_id", "") or "")
-                        for msg in unread_msgs
-                        if str(getattr(msg, "message_id", "") or "")
-                    },
-                )
-                include_history_in_prompt = bool(history_text and not rt.history_merged)
+                history_text = ""
+                if not rt.history_merged:
+                    history_text = await self._build_history_text_async(
+                        chat_stream,
+                        max_messages=self._get_initial_history_message_limit(),
+                        global_history=True,
+                        exclude_message_ids={
+                            str(getattr(msg, "message_id", "") or "")
+                            for msg in unread_msgs
+                            if str(getattr(msg, "message_id", "") or "")
+                        },
+                    )
+                include_history_in_prompt = bool(history_text)
 
                 # 构建 user prompt
                 user_prompt_text = self._build_chat_user_prompt(
@@ -5059,8 +5149,7 @@ class LifeChatter(BaseChatter):
                         self._append_follow_up_user_instruction(
                             llm_response,
                             "（系统提醒：你刚才那段文字只被记录为内心独白，**用户没有收到**。"
-                            "如果想让用户看到，必须调用 `life_send_text`，并在同一次调用中提交"
-                            "非空 `thought` 以及 `mood`、`decision`、`expected_response`、`content` 五个键。"
+                            "如果想让用户看到，必须调用 `life_send_text(content=\"...\")`。"
                             "如果本轮不打算回复，调用 `action-life_pass_and_wait` 等待。）",
                         )
                     # 连续两轮以上空轮 → 注入引导提醒

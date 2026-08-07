@@ -258,10 +258,11 @@ class LifeReportStateAction(BaseAction):
 
     action_name = "report_state"
     action_description = (
-        "向潜意识报告当前场景的状态变化。"
+        "向潜意识的世界模型报告当前场景或关系状态变化。"
+        "成功后写入不可变生命事件和 World assertion；它不会修改主体文档 MEMORY.md。"
         "当你完成一轮重要互动、观察到关系变化、或场景状态发生转变时使用。"
-        "例如：'小星星的胃线已闭合'、'表情包收藏完成'、'直播刚开始，观众 200 人'。"
-        "这不是给用户发消息，是向自己的内在更新世界认知。"
+        "若要改变 SOUL.md、USER.md 或 MEMORY.md，必须改走主体候选复盘与明确接受流程。"
+        "这不是给用户发消息，是向自己的内在世界更新一条有来源的观察。"
     )
 
     chatter_allow: list[str] = ["life_chatter"]
@@ -318,7 +319,8 @@ class LifeReportStateAction(BaseAction):
             return False, f"报告状态失败: {exc}"
 
         return True, (
-            "观察已写入不可变生命事件并更新内在世界投影"
+            "观察已写入不可变生命事件和 World assertion；"
+            "这不是 MEMORY.md 主体文档提交"
             f"（assertion_id={receipt['assertion_id']}, "
             f"source_instance_id={receipt['source_instance_id']}）。"
         )

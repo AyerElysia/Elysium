@@ -221,11 +221,6 @@ class AsyncConsciousnessRegistry:
     def get_active(self) -> list[ConsciousnessInstance]:
         return [item for item in self._instances.values() if item.is_active]
 
-    def get_all(self) -> list[ConsciousnessInstance]:
-        """Return the current authoritative Presence rows for bounded summaries."""
-
-        return list(self._instances.values())
-
     def get_for_stream(self, stream_id: str) -> ConsciousnessInstance | None:
         identity = str(stream_id or "").strip()
         if not identity:

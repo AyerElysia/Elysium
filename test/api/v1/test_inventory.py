@@ -193,16 +193,19 @@ def test_excluded_internal_capabilities_are_not_exported() -> None:
     }
 
 
-def test_tabletop_routes_remain_experimental_until_recovery_exists() -> None:
-    """新狼人杀 API 在耐久恢复完成前不能标为已实现或已验收。"""
+def test_tabletop_user_routes_are_validated_after_p3_10_recovery() -> None:
+    """P3-10 用户房间 API 已有 projection、ledger、幂等和恢复合同。"""
 
-    tabletop = [
-        contract
-        for contract in API_INVENTORY
-        if contract.domain in {"tabletop", "admin_tabletop"}
+    user_tabletop = [
+        contract for contract in API_INVENTORY if contract.domain == "tabletop"
     ]
-    assert tabletop
-    assert {contract.status for contract in tabletop} == {"experimental"}
+    admin_tabletop = [
+        contract for contract in API_INVENTORY if contract.domain == "admin_tabletop"
+    ]
+    assert user_tabletop
+    assert {contract.status for contract in user_tabletop} == {"validated"}
+    assert admin_tabletop
+    assert {contract.status for contract in admin_tabletop} == {"experimental"}
 
 
 def test_all_fourteen_confirmed_decisions_are_frozen() -> None:

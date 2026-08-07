@@ -61,6 +61,7 @@ class MySQLStorageConfig:
     pool_timeout_seconds: int = 10
     application_query_timeout_seconds: int = 10
     innodb_lock_wait_timeout_seconds: int = 5
+    idle_session_timeout_seconds: int = 180
     isolation_level: Literal["READ COMMITTED"] = "READ COMMITTED"
 
     def __post_init__(self) -> None:
@@ -92,6 +93,7 @@ class MySQLStorageConfig:
             "pool_timeout_seconds",
             "application_query_timeout_seconds",
             "innodb_lock_wait_timeout_seconds",
+            "idle_session_timeout_seconds",
         ):
             if int(getattr(self, name)) <= 0:
                 raise ValueError(f"{name} must be positive")
@@ -141,6 +143,7 @@ def _install_mysql_session_contract(
         "SET SESSION time_zone = '+00:00'",
         f"SET SESSION innodb_lock_wait_timeout = {int(config.innodb_lock_wait_timeout_seconds)}",
         f"SET SESSION max_execution_time = {int(config.application_query_timeout_seconds) * 1000}",
+        f"SET SESSION wait_timeout = {int(config.idle_session_timeout_seconds)}",
         f"SET SESSION sql_mode = '{strict_modes}'",
     )
 
@@ -182,6 +185,7 @@ def create_mysql_storage_engine(config: MySQLStorageConfig) -> AsyncEngine:
         pool_timeout=int(config.pool_timeout_seconds),
         pool_recycle=int(config.pool_recycle_seconds),
         pool_pre_ping=True,
+        pool_reset_on_return="rollback",
         connect_args=connect_args,
     )
     _install_mysql_session_contract(engine, config)

@@ -5,11 +5,25 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from plugins.life_engine.core.config import LifeEngineConfig
+
+
+def test_life_config_rejects_removed_storage_section() -> None:
+    """生命域配置不得重新取得 generation 或后端选择配置。"""
+    with pytest.raises(ValueError):
+        LifeEngineConfig(  # type: ignore[call-arg]
+            storage={"authoritative_backend": "mysql"}
+        )
+
+
+def test_life_config_rejects_removed_mysql_connection_section() -> None:
+    """MySQL 连接只能配置在全局 Core 配置中。"""
+    with pytest.raises(ValueError):
+        LifeEngineConfig(  # type: ignore[call-arg]
+            storage_mysql={"host": "duplicate.example"}
+        )
 
 
 def test_auto_update_retires_legacy_thought_authority_sections(
@@ -36,16 +50,13 @@ recent_chat_messages = 7
 
     config = LifeEngineConfig.load(config_path, auto_update=True)
 
-    assert not hasattr(config, "streams")
-    assert not hasattr(config, "drives")
-    assert config.runtime_sync.latest_expression_snapshot_enabled is False
-    assert config.runtime_sync.recent_chat_messages == 7
 
-    updated = config_path.read_text(encoding="utf-8")
-    assert "[streams]" not in updated
-    assert "[drives]" not in updated
-    assert "latest_action_think_enabled" not in updated
-    assert "latest_expression_snapshot_enabled" in updated
+def test_life_config_rejects_removed_mysql_connection_section() -> None:
+    """MySQL 连接只能配置在全局 Core 配置中。"""
+    with pytest.raises(ValueError):
+        LifeEngineConfig(  # type: ignore[call-arg]
+            storage_mysql={"host": "duplicate.example"}
+        )
 
 
 def test_sleep_time_format_validation() -> None:

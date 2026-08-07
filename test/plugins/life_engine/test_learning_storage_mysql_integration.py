@@ -7,6 +7,8 @@ from dataclasses import replace
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from plugins.life_engine.storage.authority import MySQLAuthorityRegistry
 from plugins.life_engine.storage.contracts import StorageBackendRuntime
@@ -16,6 +18,8 @@ from plugins.life_engine.storage.factory import (
     open_storage_backend,
 )
 from plugins.life_engine.storage.learning_contracts import (
+    LEARNING_WRITER_CLAIM_NAMESPACE,
+    LEARNING_WRITER_CLAIM_STATE_KEY,
     LearningEventDraft,
     LearningOccurrenceConflict,
     LearningProjectionWrite,
@@ -26,6 +30,7 @@ from plugins.life_engine.storage.models import (
     BackendKind,
     GenerationStatus,
 )
+from plugins.life_engine.storage.writer_claims import SingletonWriterClaimLost
 from src.kernel.storage.engine import MySQLStorageConfig, create_mysql_storage_engine
 
 
@@ -69,19 +74,10 @@ async def test_mysql_learning_event_projection_contract() -> None:
     engine = create_mysql_storage_engine(config)
     registry = MySQLAuthorityRegistry(engine, registry_id="life-learning-integration")
     runtime: StorageBackendRuntime | None = None
-    token = None
     suffix = uuid4().hex
     try:
         generation = _generation()
         await registry.register_generation(generation)
-        health = await registry.health()
-        token = await registry.activate_generation(
-            generation.generation_id,
-            expected_epoch=int(health.get("authority_epoch") or 0),
-            owner_id="life-learning-integration-writer",
-            lease_seconds=180,
-            confirm_previous_writers_stopped=True,
-        )
         runtime = await open_storage_backend(
             StorageFactorySettings(
                 enabled=True,
@@ -90,9 +86,8 @@ async def test_mysql_learning_event_projection_contract() -> None:
                 schema_version=1,
                 registry_id="life-learning-integration",
                 authority_provider="mysql",
-                authority_epoch=token.authority_epoch,
-                authority_owner_id=token.owner_id,
-                fencing_token_env="TEST_LEARNING_MYSQL_FENCE",
+                authority_owner_id="life-learning-integration-writer",
+                authority_lease_seconds=180,
                 mysql=MySQLBackendSettings(
                     host=config.host,
                     port=config.port,
@@ -102,17 +97,16 @@ async def test_mysql_learning_event_projection_contract() -> None:
                     ssl_mode=config.ssl_mode,
                 ),
             ),
-            environment={
-                "TEST_LEARNING_MYSQL_FENCE": token.fencing_token,
-                "TEST_LEARNING_MYSQL_PASSWORD": config.password,
-            },
+            environment={"TEST_LEARNING_MYSQL_PASSWORD": config.password},
         )
-        store = (
-            await open_learning_stores(
-                runtime,
-                initialize_schema=True,
-            )
-        ).store
+        await open_learning_stores(runtime, initialize_schema=True)
+        claim = await runtime.acquire_singleton_writer(
+            namespace=LEARNING_WRITER_CLAIM_NAMESPACE,
+            state_key=LEARNING_WRITER_CLAIM_STATE_KEY,
+            owner_instance_id=f"life-learning-integration:{suffix}",
+            lease_seconds=180,
+        )
+        store = (await open_learning_stores(runtime, writer_claim=claim)).store
         event = LearningEventDraft(
             occurrence_id=f"mysql-learning:{suffix}",
             event_kind="contract.observation",
@@ -148,13 +142,55 @@ async def test_mysql_learning_event_projection_contract() -> None:
         storage_health = await store.health_snapshot()
         assert storage_health["status"] == "healthy"
         assert "UTF-8 花朵" not in str(storage_health)
+
+        unclaimed = (await open_learning_stores(runtime)).store
+        blocked = replace(
+            event,
+            occurrence_id=f"mysql-learning-unclaimed:{suffix}",
+        )
+        with pytest.raises(
+            SingletonWriterClaimLost,
+            match="LearningSingletonWriterClaimRequired",
+        ):
+            await unclaimed.commit(events=[blocked], projections=[])
+        assert await store.event_by_occurrence(blocked.occurrence_id) is None
+
+        for statement in (
+            text(
+                """UPDATE learning_projections
+                SET rebuild_state = 'blocked_raw_update'
+                WHERE projection_name = :projection_name"""
+            ),
+            text(
+                """DELETE FROM learning_projections
+                WHERE projection_name = :projection_name"""
+            ),
+        ):
+            with pytest.raises(
+                DBAPIError,
+                match="LearningSingletonWriterClaimRequired",
+            ):
+                async with runtime.unit_of_work() as uow:
+                    await uow.session.execute(
+                        statement,
+                        {"projection_name": write.projection_name},
+                    )
+        assert (await store.get_projection(write.projection_name)) == first.projections[
+            0
+        ]
+
+        assert await runtime.release_singleton_writer(claim) is True
+        stale = replace(
+            event,
+            occurrence_id=f"mysql-learning-stale:{suffix}",
+        )
+        with pytest.raises(SingletonWriterClaimLost):
+            await store.commit(events=[stale], projections=[])
+        assert await store.event_by_occurrence(stale.occurrence_id) is None
     finally:
         try:
             if runtime is not None:
+                await runtime.revoke_authority()
                 await runtime.close()
         finally:
-            try:
-                if token is not None:
-                    await registry.revoke(token)
-            finally:
-                await engine.dispose()
+            await engine.dispose()

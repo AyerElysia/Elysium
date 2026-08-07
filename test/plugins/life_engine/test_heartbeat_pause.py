@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.service.core import LifeEngineService
 from plugins.life_engine.tools import LifeEngineRestHeartbeatTool
+from src.core.config.core_config import CoreConfig
 from src.core.models.message import Message
 
 
@@ -17,7 +18,14 @@ def _service(workspace_path: Path | None = None) -> LifeEngineService:
     config = LifeEngineConfig()
     if workspace_path is not None:
         config.settings.workspace_path = str(workspace_path)
-    return LifeEngineService(SimpleNamespace(config=config))
+    return LifeEngineService(
+        SimpleNamespace(
+            config=config,
+            global_storage_config=CoreConfig(
+                storage=CoreConfig.StorageSection(backend="local")
+            ),
+        )
+    )
 
 
 def test_external_silence_no_longer_exposes_pause_mechanism() -> None:

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import BasePlugin, register_plugin
 
 from .config import WerewolfConfig
+from .domain import WerewolfDomainService
 from .event_handler import WerewolfCommandEventHandler
+from .ledger import WerewolfLedger
 from .service import WerewolfGameService
 
 logger = get_logger("werewolf_game")
@@ -29,6 +33,16 @@ class WerewolfGamePlugin(BasePlugin):
         self._werewolf_games = {}
         self._werewolf_ai = None
         self._werewolf_narrator = None
+        self._werewolf_ledger = WerewolfLedger(
+            Path("runtime") / "api" / "tabletop.sqlite3"
+        )
+        self._werewolf_domain = WerewolfDomainService(self._werewolf_ledger)
+
+    async def on_plugin_unloaded(self) -> None:
+        """Release the shared durable ledger owned by this plugin instance."""
+
+        self._werewolf_ledger.close()
+        await super().on_plugin_unloaded()
 
     def get_components(self) -> list[type]:
         logger.info(

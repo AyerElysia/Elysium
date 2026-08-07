@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -423,6 +424,34 @@ async def test_feishu_image_event_falls_back_to_text_when_download_fails(
     assert envelope["message_segment"] == [{"type": "text", "data": "[图片]"}]
 
 
+async def test_feishu_persisted_identity_replaces_config_alias_requirement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = make_adapter()
+
+    async def persisted_identity(account_id: str) -> tuple[str, str]:
+        assert account_id == "ou_peach"
+        return "桃子哥", "wander_hunter"
+
+    monkeypatch.setattr(adapter, "_persisted_identity", persisted_identity)
+    monkeypatch.setattr(
+        adapter,
+        "_resolve_display_name",
+        AsyncMock(side_effect=AssertionError("directory lookup must not run")),
+    )
+
+    envelope = await adapter.from_platform_message(
+        _event(open_id="ou_peach", union_id="", message_id="om_database_identity")
+    )
+
+    assert envelope is not None
+    assert _nickname(envelope) == "桃子哥"
+    extra = envelope["message_info"]["extra"]
+    assert extra["canonical_person_key"] == "wander_hunter"
+    assert extra["identity_resolution_status"] == "resolved"
+    assert extra["identity_display_name_source"] == "person_info"
+
+
 async def test_feishu_user_name_alias_maps_sender_display_name() -> None:
     config = FeishuAdapterConfig()
     config.identity.user_name_aliases = [
@@ -543,6 +572,21 @@ async def test_feishu_outgoing_group_text(monkeypatch: pytest.MonkeyPatch) -> No
         "code": 0,
         "data": {"message_id": "om_sent_1", "chat_id": "oc_1"},
     }
+
+
+def test_feishu_oversized_image_is_compressed_for_upload() -> None:
+    from PIL import Image as PILImage
+
+    source = PILImage.effect_noise((5000, 5000), 100)
+    raw = BytesIO()
+    source.save(raw, format="JPEG", quality=100)
+    original = raw.getvalue()
+    upload, mime = FeishuAdapter._prepare_image_upload_bytes(original)
+
+    assert len(original) > feishu_adapter_module._FEISHU_IMAGE_UPLOAD_MAX_BYTES
+    assert mime == "image/jpeg"
+    assert len(upload) <= feishu_adapter_module._FEISHU_IMAGE_UPLOAD_MAX_BYTES
+    assert raw.getvalue() != upload
 
 
 async def test_feishu_outgoing_image_uploads_and_sends(

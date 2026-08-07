@@ -511,11 +511,12 @@ class VoiceAudioArchive:
         )
         os.chmod(temporary, 0o600)
         os.replace(temporary, self.manifest_path)
-        directory_fd = os.open(self.directory, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        if os.name != "nt":
+            directory_fd = os.open(self.directory, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
 
 
 __all__ = ["AudioTrackSpec", "VoiceAudioArchive"]

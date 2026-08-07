@@ -73,8 +73,196 @@ class LifeTraceRecord:
         return asdict(self)
 
 
+class SelectedLifeTraceStore:
+    """Async append-only river backed by the selected runtime event store."""
+
+    namespace = "life_trace.river"
+
+    def __init__(self, runtime_store: Any) -> None:
+        if runtime_store is None:
+            raise RuntimeError("SelectedLifeTraceStorageNotStarted")
+        self.runtime_store = runtime_store
+
+    async def record_change(
+        self,
+        *,
+        path: str,
+        before_content: str | None,
+        after_content: str | None,
+        operation: str,
+        tool_name: str,
+        actor: str = "life_engine",
+        reason: str = "",
+        source_event_id: str = "",
+        stream_id: str = "",
+    ) -> LifeTraceRecord | None:
+        before_text = before_content if before_content is not None else ""
+        after_text = after_content if after_content is not None else ""
+        before_exists = before_content is not None
+        after_exists = after_content is not None
+        before_hash = _sha256_text(before_text) if before_exists else ""
+        after_hash = _sha256_text(after_text) if after_exists else ""
+        if before_exists == after_exists and before_hash == after_hash:
+            return None
+        trace_id = f"trace_{uuid4().hex[:16]}"
+        record = LifeTraceRecord(
+            trace_id=trace_id,
+            timestamp=_now_iso(),
+            path=str(path or "").replace("\\", "/").lstrip("/"),
+            operation=str(operation or "modify"),
+            tool_name=str(tool_name or ""),
+            actor=str(actor or "life_engine"),
+            reason=str(reason or "").strip(),
+            before_exists=before_exists,
+            after_exists=after_exists,
+            before_hash=before_hash,
+            after_hash=after_hash,
+            before_size=len(before_text.encode("utf-8")) if before_exists else 0,
+            after_size=len(after_text.encode("utf-8")) if after_exists else 0,
+            diff_path="",
+            source_event_id=str(source_event_id or ""),
+            stream_id=str(stream_id or ""),
+        )
+        payload = record.to_dict()
+        payload["before_content"] = before_content
+        payload["after_content"] = after_content
+        payload["diff_text"] = _make_unified_diff(
+            rel_path=record.path,
+            before_text=before_text,
+            after_text=after_text,
+            before_exists=before_exists,
+            after_exists=after_exists,
+        )
+        await self.runtime_store.append_event(
+            namespace=self.namespace,
+            occurrence_id=trace_id,
+            event_kind=record.kind,
+            payload=payload,
+            occurred_at=record.timestamp,
+        )
+        return record
+
+    async def record_moment(
+        self,
+        *,
+        kind: str,
+        summary: str,
+        operation: str,
+        tool_name: str = "",
+        actor: str = "life_engine",
+        reason: str = "",
+        source_event_id: str = "",
+        stream_id: str = "",
+        path: str = "",
+    ) -> LifeTraceRecord:
+        if not str(kind or "").strip() or not str(summary or "").strip():
+            raise ValueError("kind and summary must not be empty")
+        record = LifeTraceRecord(
+            trace_id=f"trace_{uuid4().hex[:16]}",
+            timestamp=_now_iso(),
+            path=str(path or "").replace("\\", "/").lstrip("/"),
+            operation=str(operation or kind),
+            tool_name=str(tool_name or ""),
+            actor=str(actor or "life_engine"),
+            reason=str(reason or "").strip(),
+            before_exists=False,
+            after_exists=False,
+            before_hash="",
+            after_hash="",
+            before_size=0,
+            after_size=0,
+            diff_path="",
+            source_event_id=str(source_event_id or ""),
+            stream_id=str(stream_id or ""),
+            kind=str(kind).strip(),
+            summary=str(summary).strip(),
+        )
+        await self.runtime_store.append_event(
+            namespace=self.namespace,
+            occurrence_id=record.trace_id,
+            event_kind=record.kind,
+            payload=record.to_dict(),
+            occurred_at=record.timestamp,
+        )
+        return record
+
+    async def _events(self, limit: int = 1000) -> list[Any]:
+        return await self.runtime_store.read_events(
+            self.namespace,
+            after_position=0,
+            limit=max(1, min(int(limit), 1000)),
+        )
+
+    async def recent(
+        self,
+        *,
+        limit: int = 10,
+        path: str = "",
+        kind: str = "",
+    ) -> list[LifeTraceRecord]:
+        events = await self._events(1000)
+        records = [LifeTraceRecord.from_dict(event.payload) for event in events]
+        normalized_path = str(path or "").replace("\\", "/").lstrip("/")
+        if normalized_path:
+            records = [item for item in records if item.path == normalized_path]
+        if str(kind or "").strip():
+            records = [item for item in records if item.kind == str(kind).strip()]
+        return records[-max(0, int(limit)):][::-1]
+
+    async def get(self, trace_id: str) -> LifeTraceRecord | None:
+        ref = str(trace_id or "").strip()
+        for record in await self.recent(limit=1000):
+            if record.trace_id == ref or record.trace_id.startswith(ref):
+                return record
+        return None
+
+    async def history(self, path: str, *, limit: int = 20) -> list[LifeTraceRecord]:
+        return await self.recent(limit=limit, path=path)
+
+    async def origin(self) -> dict[str, Any]:
+        records = list(reversed(await self.recent(limit=1000)))
+        if not records:
+            return {"total": 0}
+        counts: dict[str, int] = {}
+        for record in records:
+            counts[record.kind] = counts.get(record.kind, 0) + 1
+        return {
+            "total": len(records),
+            "first_timestamp": records[0].timestamp,
+            "first_record": records[0].to_dict(),
+            "last_timestamp": records[-1].timestamp,
+            "counts_by_kind": counts,
+        }
+
+    async def _payload(self, trace_id: str) -> dict[str, Any] | None:
+        ref = str(trace_id or "").strip()
+        for event in reversed(await self._events(1000)):
+            identity = str(event.payload.get("trace_id") or "")
+            if identity == ref or identity.startswith(ref):
+                return dict(event.payload)
+        return None
+
+    async def read_diff(self, trace_id: str) -> tuple[LifeTraceRecord | None, str]:
+        payload = await self._payload(trace_id)
+        if payload is None:
+            return None, ""
+        return LifeTraceRecord.from_dict(payload), str(payload.get("diff_text") or "")
+
+    async def read_blob(self, content_hash: str) -> str | None:
+        digest = str(content_hash or "").strip()
+        for event in reversed(await self._events(1000)):
+            payload = event.payload
+            if payload.get("after_hash") == digest:
+                value = payload.get("after_content")
+                return None if value is None else str(value)
+            if payload.get("before_hash") == digest:
+                value = payload.get("before_content")
+                return None if value is None else str(value)
+        return None
+
+
 class LifeTraceStore:
-    """Append-only trace store under ``workspace/.life_trace``."""
+    """Append-only trace store for explicit local mode."""
 
     def __init__(self, workspace: Path | str) -> None:
         self.workspace = Path(workspace).resolve()
@@ -325,6 +513,53 @@ class LifeTraceStore:
 
 def _sha256_text(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+class AsyncLocalLifeTraceStore:
+    """Async wrapper for the explicit local trace store."""
+
+    def __init__(self, workspace: Path | str) -> None:
+        self.local = LifeTraceStore(workspace)
+
+    async def record_change(self, **kwargs: Any) -> LifeTraceRecord | None:
+        import asyncio
+
+        return await asyncio.to_thread(self.local.record_change, **kwargs)
+
+    async def record_moment(self, **kwargs: Any) -> LifeTraceRecord:
+        import asyncio
+
+        return await asyncio.to_thread(self.local.record_moment, **kwargs)
+
+    async def recent(self, **kwargs: Any) -> list[LifeTraceRecord]:
+        import asyncio
+
+        return await asyncio.to_thread(self.local.recent, **kwargs)
+
+    async def origin(self) -> dict[str, Any]:
+        import asyncio
+
+        return await asyncio.to_thread(self.local.origin)
+
+    async def history(self, path: str, **kwargs: Any) -> list[LifeTraceRecord]:
+        import asyncio
+
+        return await asyncio.to_thread(self.local.history, path, **kwargs)
+
+    async def get(self, trace_id: str) -> LifeTraceRecord | None:
+        import asyncio
+
+        return await asyncio.to_thread(self.local.get, trace_id)
+
+    async def read_diff(self, trace_id: str) -> tuple[LifeTraceRecord | None, str]:
+        import asyncio
+
+        return await asyncio.to_thread(self.local.read_diff, trace_id)
+
+    async def read_blob(self, content_hash: str) -> str | None:
+        import asyncio
+
+        return await asyncio.to_thread(self.local.read_blob, content_hash)
 
 
 def _now_iso() -> str:

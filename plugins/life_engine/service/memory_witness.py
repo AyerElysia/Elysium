@@ -467,7 +467,7 @@ class MemoryWitnessCoordinator:
         perception = await self._service.prepare_perception(instance.instance_id)
         request = LLMRequest(model_set, "life_memory_witness")
         request.add_payload(
-            LLMPayload(ROLE.SYSTEM, Text(self._build_system_prompt(instance)))
+            LLMPayload(ROLE.SYSTEM, Text(await self._build_system_prompt(instance)))
         )
         user_text = (
             "请回望下面这段已经发生并被保存的经历，写下你此刻愿意留下的"
@@ -501,10 +501,12 @@ class MemoryWitnessCoordinator:
             return ""
         return text
 
-    def _build_system_prompt(self, instance: ConsciousnessInstance) -> str:
-        workspace = self._service._workspace_dir()
-        soul = self._service._read_workspace_text(workspace, "SOUL.md")
-        user = self._service._read_workspace_text(workspace, "USER.md")
+    async def _build_system_prompt(self, instance: ConsciousnessInstance) -> str:
+        # 见证实例也是同一主体的运行窗口，权威文本必须与表达层同源。
+        # 选定后端下只读远端单事务快照，远端缺口失败关闭而不是退回本地。
+        texts = await self._service.read_subject_authority_texts()
+        soul = texts.get("SOUL.md", "").strip()
+        user = texts.get("USER.md", "").strip()
         if not soul:
             raise RuntimeError("MemoryWitnessSoulUnavailable")
         return f"""{soul}
@@ -581,9 +583,10 @@ class MemoryWitnessCoordinator:
                 )
                 if subject_commit is None:
                     raise RuntimeError("SelectedWitnessSubjectWriteNotHandled")
+                source_mtime = None
             else:
                 await asyncio.to_thread(_atomic_write_text, absolute, body)
-            source_mtime = await asyncio.to_thread(lambda: absolute.stat().st_mtime)
+                source_mtime = await asyncio.to_thread(lambda: absolute.stat().st_mtime)
             await memory.upsert_document(
                 path,
                 body,

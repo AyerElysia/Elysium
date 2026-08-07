@@ -33,7 +33,7 @@ Elysium 是数字生命系统，不是通用聊天机器人框架。修改配置
 | QQ/NapCat 图片查看 | 历史已验证 | 是否启用由各部署环境自行配置；启用后应重新做当前版本冒烟 |
 | 飞书图片查看 | 已验证 | 图片资源下载需要消息读取权限；详见 9.1 |
 | 飞书图片保存 | 已验证 | 由主体主动调用 `nucleus_save_media` 保存到 Life Engine workspace |
-| 飞书图片发送 | 已验证 | 由主体主动调用 `life_send_image`，适配器上传并发送图片 |
+| 飞书图片发送 | 已验证 | 由主体主动调用 `life_send_image`；超过飞书图片上传上限的静态图会只为传输生成压缩 JPEG 副本，workspace 原图保持不变 |
 | 文本与图片模型 | 需按部署环境配置 | 所选模型必须声明并实际支持所需的文本、视觉和工具调用能力 |
 | Life Memory 文本向量生成 | 需单独验收 | 向量维度必须与活动索引一致；完整记忆检索功能需单独验收 |
 | 主体媒体能力 | 图片与语音四项已验收 | 飞书图片保存/发送、语音接收识别和语音合成发送均已通过真实端到端验收；所有能力由主体主动调用 |
@@ -244,7 +244,9 @@ cp config/models.toml.example config/models.toml
 config/core.toml
 ```
 
-Core 使用 MySQL 时，最小配置如下（真实地址和用户名只写入本机被 Git 忽略的 `config/core.toml`；密码只由环境变量注入，不要写入本文、TOML 或提交）：
+Elysium 只允许通过 `config/core.toml` 配置全局存储。选择 `mysql` 时，Core 和 Life Engine 必须一起使用同一组 MySQL 连接、generation 和 authority 参数；选择 `local` 时，二者都使用本地存储。Life Engine 插件文件不再包含 MySQL 连接、generation 或后端选择，避免任何第二配置来源。
+
+MySQL 模式的最小 Core 配置如下（真实地址和用户名只写入本机被 Git 忽略的 `config/core.toml`；密码只由环境变量注入，不要写入本文、TOML 或提交；epoch/token 不需要配置）：
 
 ```toml
 [bot]
@@ -252,8 +254,10 @@ ui_level = "verbose"
 log_level = "INFO"
 llm_preflight_check = true
 
+[storage]
+backend = "mysql"
+
 [database]
-database_type = "mysql"
 mysql_host = "<MYSQL_HOST>"
 mysql_port = 3306
 mysql_database = "elysium"
@@ -287,48 +291,78 @@ export ELYSIUM_MYSQL_PASSWORD='<MYSQL_PASSWORD>'
 
 说明：
 
-- `database_type = "mysql"` 控制 Core 关系数据库；当前 13 张 Core 业务表会直接读写 MySQL。
+- `[storage].backend` 是全局唯一后端选择，只接受 `local` 或 `mysql`。`database.database_type` 与 Life Engine 的 `storage.enabled`、`storage.authoritative_backend` 已废弃；旧 Core 配置会自动迁移，若新旧选择冲突则拒绝启动。
+- `backend = "local"` 使 Core 使用 SQLite，并让 Life Engine 继续使用现有本地 SQLite、Markdown/JSON 和 Chroma 链；不要求创建 managed-local generation。Life Engine 启动前会只读校验 `data/life_engine_workspace/SOUL.md`、`USER.md`、`MEMORY.md` 三份主体权威文件；任一文件缺失、不可读或不是合法 UTF-8 都会直接拒绝启动，不会把缺失解释为空内容，也不会自动从 MySQL 回填。
+- `backend = "mysql"` 使 Core 使用 MySQL，并强制 Life Engine 打开 MySQL runtime；verified generation 和 owner 必须配置，不能悄悄退回本地。首个进程激活 generation，后续开发者进程加入同一 generation 并获得并发写入资格；进程退出只释放本地连接，不撤销其他写入者。每个开发者应配置可审计且唯一的 `authority_owner_id`。
+- MySQL 模式不使用进程级 `data/runtime/elysium.lock`，因此多个 worktree/开发者不会因另一个 Elysium 进程存在而被入口拒绝。`local` 模式仍保持单进程保护，避免多个进程并发写同一 SQLite 和本地权威文件。
+- “允许启动”不等于掩盖故障：凭据错误、MySQL 不可达、generation 未验证、schema/checksum 漂移、迁移锁超时、权限不足、端口冲突或数据约束失败仍会显式报错。部署必须修复这些真实前置条件，禁止改成静默本地回退或假成功。
 - `mysql_password` 支持 `${ELYSIUM_MYSQL_PASSWORD}` 环境变量插值。不要把真实密码填回 TOML、文档、日志或 Git；交互式设置环境变量时也要注意 shell 历史和终端录屏。
 - 生产环境优先使用 `mysql_ssl_mode = "required"` 或 `"verify-full"`，并填写 CA/证书路径；只有本机受控网络且明确接受明文链路时才使用 `disabled`。
-- MySQL 账号至少需要目标数据库及 Core 表的建表、读写和迁移所需权限；不要给应用账号全库管理员权限。
+- MySQL 账号至少需要目标数据库及 Core 表的建表、读写、迁移和 `TRIGGER` 权限；不要给应用账号全库管理员权限。
+- 正式 Life Engine activation 需要数据库级不可变触发器。若 MySQL 开启 `log_bin`，DBA 必须在维护窗口通过持久化服务端配置启用 `log_bin_trust_function_creators`，或采用等价且经过审计的管理员安装流程；业务账号不应获得 `SUPER` 或 `SYSTEM_VARIABLES_ADMIN`。该前置条件不满足时必须 fail closed，不能用空 generation 或应用层检查绕过。
 - 本地单机运行建议保持 `127.0.0.1`，不要无理由监听 `0.0.0.0`。
 - 如果对外开放 HTTP，必须配置强 API Key、反向代理、HTTPS 和访问控制。
 - `llm_preflight_check = true` 会在启动时检查 Provider 网络连通性。
 - 开发调试遇到断点导致 WatchDog 误判时，可临时关闭 `enable_watchdog`；普通运行建议开启。
-- Core 切换到 MySQL 不会自动迁移 Life Engine 生命域；Life Event、Life Memory、Presence、World Projection、主体文件和向量索引仍按本地优先设计运行。
+- 全局改为 MySQL 不会自动迁移任何数据；Core 和 Life Engine 的目标数据、generation 与 authority 必须在切换前分别验收完成。
 
 ### 6.1 首次从 SQLite 切换到 MySQL
 
-如果目标 MySQL 尚未包含当前 Core 数据，不能只改 `database_type` 后直接启动。必须遵循以下顺序：
+如果目标 MySQL 尚未包含当前 Core 和生命域数据，不能只改 `[storage].backend` 后直接启动。必须遵循以下顺序：
 
 1. 用户手工停止 Elysium，建立明确停写窗口；不要由脚本或 agent 擅自停止进程。
 2. 使用 `scripts/migrate_core_to_mysql.py snapshot` 为旧 Core SQLite 建立不可覆盖的在线快照。
 3. 将迁移连接 URL只放入 `ELYSIUM_MYSQL_URL` 环境变量，执行 `migrate` 和 `verify`。
-4. 只有逐表行数、内容 SHA-256、迁移状态和目标备份都通过后，才把 `database_type` 改为 `mysql`。
-5. 用户手工启动 Elysium，执行 Core 读写冒烟；保留旧 SQLite 快照和全部迁移 manifest，不删除。
+4. 完成 Life Engine MySQL generation 的审计、登记和 verified 签署，并确认不存在仍有效的旧 writer 租约；首次正式启动会自动取得新 authority epoch 与 fencing token，不能用测试 generation 或空 ID 冒充生产证据。
+5. 只有 Core 与生命域的逐表数量、内容 SHA-256、frontier、版本链、触发器和目标备份都通过后，才把 `[storage].backend` 改为 `mysql`。
+6. 用户手工启动 Elysium，执行 Core 与生命域读写冒烟；保留旧 SQLite/文件快照和全部迁移 manifest，不删除。
 
 详细命令、目标库空库要求、幂等重放、备份与隔离恢复见 [MySQL 迁移、备份与恢复手册](./mysql_migration_and_backup.md)。如果部署本来就使用已经迁移并验证的 MySQL，则不应重复把旧 SQLite 强行导入。
 
-### 6.2 Life Engine 为什么仍读取本地文件
+现役 MySQL generation 合并新版本后，如果启动报某个新增生命域表不存在，不得让业务启动自动建表，也不要重新执行旧 SQLite 全量迁移。先停止 Elysium，在维护窗口使用同一份 `config/core.toml` 执行对应的幂等增量升级：
 
-Core MySQL 与 Life Engine 生命域不是同一存储合同。当前正确部署形态是：
-
-```text
-Core 关系数据 ──直接读写──> MySQL
-Life Event / Life Memory / Presence / World / 主体文件
-    └──本地读写──> SQLite、Markdown/JSON 与本地向量投影
+```powershell
+& ".\.venv\Scripts\python.exe" ".\scripts\adopt_life_mysql_baseline.py" upgrade-runtime-state
+& ".\.venv\Scripts\python.exe" ".\scripts\adopt_life_mysql_baseline.py" upgrade-attention
 ```
 
-本地生命域的热点检索通常比远端 MySQL 少一次网络往返；`SOUL.md`、日记和主体文件还承担逐字节版本与执笔权边界，Chroma/FTS 也不能由统一归档表直接替代。因此“爱莉仍读本地文件”不是 Core MySQL 未生效，也不能仅为追求性能把这些文件改成普通 MySQL CRUD。
+`upgrade-runtime-state` 只安装 `runtime_states/runtime_events`；`upgrade-attention` 只安装 AttentionThread canonical/legacy 五张表、迁移账本和不可变触发器。两者都不修改 generation、authority、配置或现有领域数据，可以幂等重放。命令成功后应确认输出状态分别为 `runtime_state_schema_upgraded` 或 `attention_schema_upgraded`，目标表审计完成，再手工启动 Elysium。若失败，保留原数据库与日志，不删除表、不关闭证书校验、不改成应用层不可变。
 
-项目还提供两项默认关闭的可选能力：
+### 6.2 全局 local / mysql 模式
 
-- `[shared_sync]`：只复制显式标记为 `shared` 的 Life Event；`pull_enabled` 在应用投影器完成前必须保持 `false`。
-- `[memory_archive_sync]`：把已登记的本地生命域逐行/逐字节追加到 MySQL 归档，用于灾备和隔离恢复；它不接管本地运行时读取。
+当前部署不再允许 Core 和 Life Engine 独立选择后端。`backend_generation`、MySQL 连接、registry 与 owner 是部署初始化时预先配置并长期保留的信息；完成初始化后，日常切换只允许修改 `[storage].backend` 一个字段。authority provider 由该字段自动派生，不再是用户配置项。唯一合法形态是：
 
-不要把两项 `enabled` 直接改成 `true` 来冒充“全部使用 MySQL”。启用前必须分别完成远端权限、密码环境变量、初次备份/全量清单、哈希验证、恢复演练和生命周期验收。尤其是 Core 已直接使用 MySQL 的部署，当前统一归档器仍把 `data/Elysium.db` 作为必需的 `core` 扫描源；该源不存在或已停止更新时，持续归档不能代表最新 Core 数据，必须先完成归档源接线修复。统一归档的正式流程见 [统一记忆同步与恢复手册](./unified_memory_sync_runbook.md)，共享事件流程见 [离线同步运行手册](./offline_sync_runbook.md)。
+```text
+[storage].backend = "local"
+├── Core：SQLite
+└── Life Engine：现有本地 SQLite、Markdown/JSON 与 Chroma 投影
 
-未来若实施整个生命域可选本地/MySQL 后端，必须以 [Elysium 生命域可选 MySQL 与本地存储重构方案](../architecture/Elysium生命域可选MySQL与本地存储重构方案.md) 为设计基线。该文档当前仅是提案；其中的 `[storage]` 配置、复制迁移器、generation guard、authority fencing 和 MySQL Life Engine 表尚未实现，不能作为现有部署参数使用。
+[storage].backend = "mysql"
+├── Core：MySQL
+└── Life Engine：同一 MySQL generation；Chroma/FTS 与工作区文件仍是可重建投影
+```
+
+Life Engine 插件配置不再包含 `[storage]` 或 `[storage_mysql]`；MySQL 的连接、generation、registry 和 owner 登记只在 `config/core.toml` 配置，后端选择只看 `[storage].backend`。`backend="local"` 时系统自动使用 file authority、忽略保留的 MySQL generation；`backend="mysql"` 时系统自动使用 MySQL authority并严格校验该 generation。旧 `[storage].authority_provider` 会被配置迁移移除，切换时不要清空/恢复 generation，也不要修改第二个开关。插件仅保留 local 模式所需的 `[storage_local]` 路径。任何插件级 `enabled`、`authoritative_backend`、generation 或 MySQL 连接字段都是旧配置，严格校验会拒绝加载。
+
+MySQL 模式并不意味着把 Chroma 或媒体字节强行塞入关系表：Life Event、Life Memory、Presence、World、Learning、Attention 和主体文档版本由 MySQL 作为权威；Chroma、全文索引和工作区 Markdown 是可重建投影；图片、语音、视频和附件字节仍按受管媒体合同保存在文件或对象存储中，MySQL 保存其身份、哈希、权限和位置元数据。旧 `life_engine_workspace/thoughts/streams.json` 仅属于 local 模式和迁移证据；MySQL selected runtime 不得实例化文件型 `ThoughtStreamManager`，也不得继续修改该文件。
+
+`action-report_state` 的提交目标是不可变 Life Event 与 World assertion，用于记录有来源的场景、关系或状态观察；它不是 `MEMORY.md` 主体文档写入。要修改 MySQL 中的 `MEMORY.md` current head，聊天意识必须走下述主体候选复盘与明确接受流程，不能把 World assertion 回执表述为主体文档已更新。
+
+用户昵称、平台账号归属和跨平台人物键也属于运行数据，不应硬编码为 `config.toml` 中的个人记录。适配器配置只保留通用解析能力、权限策略和空的兼容 alias 列表；入站平台 ID、昵称、群名片及已确认的人物归属由 Core 的 `PersonInfo` 数据库记录承载。MySQL 模式下不得把插件配置 alias 当成用户数据权威；若旧部署曾填写具体 alias，应在确认相应数据库记录已存在后清空，并保留迁移/审计证据。
+
+MySQL 模式下，聊天意识可通过主体复盘工具按 UTF-8 字节窗口读取当前远端 `SOUL.md`、`USER.md` 或 `MEMORY.md`，提交完整候选，再对精确候选作 `accepted` 决定。只有活跃意识实例、当前统一 revision、候选哈希和完整接受正文全部通过校验，才会在同一 MySQL 事务中追加主体版本并推进 `MEMORY.md` current head；不会写本地 Markdown，也不会自动合并或替主体决定。普通 Life Memory 的经历、解释、关系与回忆轨迹则继续通过 Memory ports 直接写 MySQL，不需要经过 `MEMORY.md` 文档改写。
+
+
+
+MySQL runtime 采用“单一 verified generation、多进程共享写入”模型。第一次启动在 authority registry 中激活 generation；其他开发者只要连接同一库、同一 generation，便加入共享写入，不会夺走或撤销已有进程的资格。每笔提交仍在同一事务中校验 active backend、generation 和 epoch；generation 切换会使旧 token 失效。并发冲突由 InnoDB 行锁、唯一键、稳定 occurrence/idempotency identity、revision CAS 和事务 outbox 显式处理，schema migration 则继续使用连接级 advisory lock 串行执行。任一进程正常关闭都不会撤销全局 generation；健康信息会报告 `writer_mode = "shared"`。
+
+MySQL 相比 local 慢的基础成本来自网络/TLS 往返、连接池 checkout、事务提交和服务端锁；它不可能像进程内 SQLite/本地文件一样接近零延迟。现役热路径已避免几类可消除放大：authority 审计链按已验证 head 在进程内复用；Router 正常轮只读取 SOUL/USER/MEMORY 的三个 head 指针作为变更标记，标记变化才传输并校验完整主体快照；有效 Router 投影在进程内复用；全局聊天历史按 messages、streams、persons 三次批量查询恢复，不再按消息逐条查询；滚动 payload chain 已合并历史后，后续回复轮不再重复读取未使用的全局历史。上述缓存只覆盖可验证控制标记和可重建投影，不缓存后冒充新的主体权威，也不省略写事务中的 generation/epoch fence。
+
+性能验收应分别记录冷启动总耗时、首轮回复模型调用前耗时和同一滚动链后续回复模型调用前耗时，并同时采集 MySQL `performance_schema`/slow log 的语句次数和等待时间。建议至少使用 20 次冷启动与 100 个真实文本 turn，分别报告 p50/p95；测试期间保持相同 Provider、上下文规模、TLS、网络位置和外部适配器配置。若延迟仍高，先按“模型耗时 / 数据库往返 / 外部平台发送”拆分，禁止通过关闭 TLS、跳过迁移/authority 校验、删除历史或把数据库失败伪装为空结果来换取数字。
+
+这项能力只解决“另一个合法 MySQL 写入者已存在”造成的启动拒绝，不承诺绕过真实运行冲突。例如，多进程不能绑定同一个 HTTP 端口或独占同一外部适配器会话；开发者应为各 worktree 配置不同监听端口和独立外部资源，或关闭本次不需要的组件。数据库认证、TLS、DDL/TRIGGER 权限和 schema 完整性仍是必须满足的启动条件。
+
+项目还提供 `[shared_sync]` 与 `[memory_archive_sync]` 两项同步/归档能力。它们不是存储模式开关，不得用来制造第二个可写权威。正式切换、generation 校验与 authority 激活见 [生命域存储后端运行手册](./life_storage_backend_runbook.md)；设计依据见 [Elysium 生命域可选 MySQL 与本地存储重构方案](../architecture/Elysium生命域可选MySQL与本地存储重构方案.md)。
 
 ### 6.3 启动和回退验收
 
@@ -341,6 +375,8 @@ Life Event / Life Memory / Presence / World / 主体文件
 - 执行一次 MySQL 逻辑备份并恢复到隔离库，再做逐表指纹复核。
 
 若 MySQL 不可达，不要一边保留 MySQL 新写入一边直接把配置指回旧 SQLite。应先停止 Core 写入、备份 MySQL、核对切换后的差异，再选择恢复 MySQL 或执行经过审计的反向同步；否则会形成两份分叉的聊天和人物历史。
+
+local 模式启动报 `SubjectAuthoritySourceMissing: <name>` 时，含义是主体权威快照不完整，不是 SQLite 或 `[storage].backend` 解析失败。不要新建空文件、复制模板或放宽读取逻辑来绕过。恢复只能来自可信版本历史或备份，并逐字节核对目标文件的长度与 SHA-256；如果没有可证明无损的恢复源，应停止并保留现场。恢复完成后至少运行主体三源读取和 Router/LifeChatter 定向测试，再由用户手工启动 Elysium 验收。
 
 ### 6.4 阶段三 `/api/v1` 认证基座
 
@@ -391,13 +427,17 @@ app_api_v1_max_websocket_connections = 64
 - 语音 participant 继续使用 Voice Live v1 PCM16 二进制帧，禁止 base64 音频。公共网关强制把 start/resume 绑定到 URL `call_id`，客户端不能切换到另一 episode；observer 只接收该 call 的 JSON 状态／字幕，不转发音频且拒绝写操作；
 - 语音 ticket 绑定 resource、subprotocol、Origin、session、credential 和 scope，单次消费；transcripts 只导出 append-only episode store 中的 final 记录，按 owner 或精确 `voice_call:{call_id}` grant 过滤；旧 `/voice-live` 路由迁移期保留；
 - Voice Live 插件或 Provider 不可用时显式返回 capability unavailable／Provider failure，不自动加载插件、不切换主体模型、不启动或重启 Elysium。当前仅完成离线 API 与网关契约测试，真实 Provider、双向音频、断线重连和客户端 E2E 仍需单独授权验收；
+- P3-10 狼人杀用户端点为 `GET /tabletop/games`、room create/query/join/leave/start/end、授权 events、actor-bound private view、actions、replay 和 `WS /tabletop/rooms/{room_id}/ws`。读取要求 `tabletop:read`，动作要求 `tabletop:play`；服务端始终从认证 session 取得 actor，客户端不能传入 player id 冒充他人；
+- 新桌游场次保存在 `runtime/api/tabletop.sqlite3` 的追加式 ledger 和 revisioned projection 中。每个动作必须携带 `Idempotency-Key`；同一 action id 相同内容只返回原结果，同 id 异内容与 stale revision 返回 409。每次已提交状态还以仅裁判可见的 ledger snapshot event 保存，projection 损坏时可从 ledger 显式重建；数据库必须与其他 API 状态一起备份；
+- 公共、玩家、裁判和复盘视图由 `plugins/werewolf_game/projections.py` 生成；公共视图不含角色、夜间状态或私密事件，玩家视图只包含该 actor 的身份、狼队友、查验和角色资源。实时事件流沿用同一可见性过滤，不能通过序号缺口、raw payload 或错误信息探测他人夜间动作；
+- 新 API 不扫描、迁移或接管启动前已有的 `plugin._werewolf_games` 内存房间。命中 ledger 新房间的群命令与 HTTP 共用同一 domain，平台 message id 作为 action id；旧房间继续由旧生命周期处理到结束。真实前端 WebSocket、跨平台群命令和管理裁判台尚未 E2E 验收；
 - 重启只会重新调度 `accepted`。进程退出前已经进入 `executing` 而无法证明投递结果的命令会转为 `delivery_unknown`，不得由客户端或服务端自动盲重试；应先查询外部系统或领域 receipt，再由具有明确幂等证据的领域流程决定后续动作；
 - 命令技术状态事件与状态迁移在同一 SQLite 事务进入既有 `sync_outbox`，当前保持 `private`、`held`，不复制原始 payload，也不建立第二套远程同步；备份恢复后应检查 accepted 恢复、executing 栅栏和 Outbox 连续性；
 - `/readiness` 只读聚合已经存在的内存状态，不调用插件或 Adapter 主动 health，不建立连接、不建表、不执行修复，也不访问会创建 Life Engine service 的懒加载属性；配置停用的平台显示 `disabled`，而不是失败或从列表消失；
 - `local_ready` 只表示当前已落地的本地关键路径（API 与 Life Event ledger）可用。远程同步不可用或 Adapter 断开会保留在脱敏诊断中并使总体状态为 `degraded`，但不会伪造本地不可用；生产 API mount 存活时 command store 显示 `ready`，未挂载或已关闭时显示 `unavailable`；
 - 受信启动器通过 `AuthStore.create_bootstrap_challenge()` 生成绑定 Origin、安装实例和短 TTL 的一次性 challenge；公共 HTTP 不提供匿名 challenge 生成端点；
 - 备份认证库时必须同时保护签名密钥；恢复后验证旧撤销 session 仍不可用、refresh 不能重放、ticket 只能消费一次。签名密钥遗失时旧 token 不可恢复，必须按凭据失效事故处理，不得临时生成密钥伪装连续会话。
-- API mount 是启动过程中按配置取得的可选资源。关闭流程只关闭已经成功取得的 mount；若初始化在挂载前失败或测试使用部分构造的 `Bot`，缺少该属性必须按“从未取得”幂等跳过，不能阻断 MCP、数据库、向量库和日志等后续资源回收。
+- API mount 是启动过程中按配置取得的可选资源。关闭时先停止 HTTP 接收、关闭 API mount，再卸载其引用的领域插件，避免请求落入已关闭的插件 ledger；只关闭已经成功取得的 mount。若初始化在挂载前失败或测试使用部分构造的 `Bot`，缺少该属性必须按“从未取得”幂等跳过，不能阻断 MCP、数据库、向量库和日志等后续资源回收。
 - 签名值的错误语义区分结构与真实性：非规范 Base64 或无法解析的封装返回 `value_invalid`，结构规范但 HMAC 不匹配返回 `signature_invalid`。篡改测试必须修改签名中完整编码的字符，不能改动无填充 Base64 的尾部保留位后仍固定期待签名错误。
 
 定向验收：
@@ -450,6 +490,7 @@ extra = { enable_thinking = true }
 [tasks.expression]
 models = ["internal-model-name"]
 tokens = 32000
+context_tokens = 100000
 temp = 0.7
 ```
 
@@ -458,11 +499,15 @@ temp = 0.7
 现阶段的路由目标是：
 
 - `tasks.core`：Life Engine 潜意识/心跳模型。
-- `tasks.expression`：Life Chatter 对话表达模型。
-- `witness`、`agent`、`utility`、`router` 等任务：根据能力和成本选择文本模型。
+- `tasks.expression`：Life Chatter 对话表达模型；聊天请求可能直接携带图片，因此当前路由中的每个模型都必须声明并真实支持 `vision = true`，不能换成纯文本模型。
+- `witness`、`agent`、`utility`、`router`、`router_context_projection` 等任务：根据能力和成本选择纯文本模型。
+- `vision`：显式图片/视频观察任务，只能绑定经过媒体协议验收的多模态模型。
+- `live`：场景任务可能携带多模态感知；没有完成场景级媒体路由核对前，按多模态任务管理，不随纯文本模型批量切换。
 - `voice`：ASR 任务。
 - `tts`：TTS 任务。
 - `embedding`：向量模型；当前生产注册表要求任务非空，暂不启用时应配置一个经过验证的模型或显式关闭其消费子系统，不能留下空路由。
+
+切换文本 Provider 时应按任务逐项变更，不能全局替换现有模型别名。尤其要保留 `expression`、`vision`、`live`、`voice`、`tts` 和 `embedding` 的能力边界，除非新 Provider 已分别完成图片、场景媒体、ASR、TTS 与 Embeddings 契约验收。Provider 套餐若限制调用场景（例如仅授权 AI 编程工具），部署者还必须先核对服务条款；配置可解析不代表业务用途已获授权。
 
 示例：
 
@@ -470,11 +515,13 @@ temp = 0.7
 [tasks.core]
 models = ["internal-core-model", "internal-core-backup"]
 tokens = 32000
+context_tokens = 100000
 temp = 0.7
 
 [tasks.expression]
 models = ["internal-chat-model", "internal-chat-backup"]
 tokens = 32000
+context_tokens = 200000
 temp = 0.7
 ```
 
@@ -486,11 +533,13 @@ temp = 0.7
 2. 每个 `tasks.*.models` 中的名称都存在于 `models.*`，并且同一任务不得重复。
 3. `models.*.id` 是 Provider 接受的真实模型 ID，不要把内部前缀拼入外部模型名。
 4. 文本模型是否支持 Tool Call；不支持时需要明确评估 `tool_call_compat`，不能盲开。
-5. `ctx` 必须与真实模型能力相符。
+5. `ctx` 必须与真实模型能力相符；`tasks.*.context_tokens` 是该任务允许使用的输入预算，必须满足 `context_tokens + tokens <= ctx`。主体权威前缀和工具 schema 属于不可静默截断的固定输入：若日志出现 `task context cannot fit without truncating pinned or structured payloads`，先核对模型官方上下文能力和任务预算，禁止通过裁剪 SOUL、USER、MEMORY 规避错误。
 6. 视觉、音频和视频不能只改任务名；必须配置并验证媒体能力合同和 Provider 协议。
 7. 启动日志必须出现 `模型路由快照已加载`；其中的任务链应与文件一致，摘要不得包含密钥。
 8. 若日志显示首选模型被冷却跳过，应核对 `routing_task`、`snapshot`、`configured_primary`、`selected` 和 `skipped`，不要把健康调度误判为乱序。
 9. Compact registry 的 `api_key` 必须是单个字符串；密钥轮换应由中转站或显式凭据组件负责，不接受一个实际上不会轮换的伪列表配置。
+10. Provider 使用“控制台选择模型”的稳定别名时，`models.*.id` 应填写 Provider 官方要求的别名，而不是把控制台显示的底层模型名误填为预览版路由；同时按该别名官方公布的保守上下文能力设置 `ctx`，不要把某个可选底层模型的最大窗口直接冒充为稳定别名合同。
+11. 配置解析测试只证明 schema 与任务引用有效。外部 Provider 冒烟或真实端到端验收还必须分别确认账号授权范围、模型版本、Tool Call、流式输出和错误语义。
 
 ### 7.5 Embedding 与记忆索引
 
@@ -1390,3 +1439,4 @@ config/
 | 2026-08-04 | 阶段三 P3-07 | 接入 8 个受管媒体端点、`runtime/media/` 持久化、resource grant、完整性校验、既有 `sync_outbox` 和聊天图片/语音 `media_id` resolver；明确尚未做真实客户端/Provider E2E |
 | 2026-08-05 | 阶段三 P3-08 | 接入直播状态、场次与事件历史、5 类耐久命令和统一 stage ticket/WS；保持手工开播、observer 只读、平台断线 degraded，并明确 B站弹幕写能力尚未具备真实凭据与 E2E |
 | 2026-08-05 | 阶段三 P3-09 | 接入语音通话耐久登记、状态/转写查询、4 类耐久命令、资源绑定 ticket 和 participant/observer WS；保留 PCM16 二进制协议与旧路由，明确真实 Provider/双向音频/重连 E2E 暂未验收 |
+| 2026-08-07 | 阶段三 P3-10 | 接入狼人杀四类授权投影、追加式 ledger、revision snapshot/action 幂等、ledger 恢复、用户层 REST/WS，并让新房间群命令与 HTTP 共用 domain；明确旧内存房间不迁移，管理裁判台及真实客户端/跨平台 E2E 暂未验收 |

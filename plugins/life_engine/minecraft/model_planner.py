@@ -439,6 +439,35 @@ AGENT_BRIDGE_GUIDANCE = """\
 """
 
 
+BOT_BRIDGE_GUIDANCE = """\
+- This body is a headless player inside a shared server world; other players
+  (including her human) can be nearby. Observations include a bounded `chat`
+  ring buffer with recent in-game chat, join, and leave events.
+- navigation.goto: parameters {"x": integer, "y": integer, "z": integer}.
+- navigation.follow: parameters {"player": "exact in-game account name"}.
+  The player must be visible from this body; an invisible player is rejected.
+- navigation.stop: parameters {}.
+- world.mine: parameters {"block": "minecraft resource identifier"}. Finds the
+  nearest matching block within 32 blocks; later observations must prove block
+  or inventory changes before concluding that anything was collected.
+- movement.input: parameters may contain a complete `holds` object for
+  forward/back/left/right/jump/sneak/sprint, a `pulses` array,
+  `look_delta` with bounded yaw/pitch degrees, and `hotbar_slot` from 0 through 8.
+- interaction.attack / interaction.use / item.drop: parameters {}.
+- inventory.select_hotbar: parameters {"slot": integer from 0 through 8}.
+- observation.wait: parameters {}. It performs no world action; use it to await
+  the next structured state while navigation or mining is still in progress.
+- chat.send: parameters {"message": "exact message"}. In a shared world this is
+  heard by other players on the server.
+- player.respawn: parameters {}. Dispatch only when the latest player facts
+  report dead_or_dying=true; a living player rejects this operation.
+- control.release_all: parameters {}.
+- A receipt proves only dispatch. Navigation, mining, interaction, inventory,
+  and survival outcomes require a later observation with the relevant factual
+  position, block, entity, or inventory change.
+"""
+
+
 BIOMIMETIC_GUIDANCE = """\
 - native.input_batch is the motor command. Supply the complete held-control
   state on every action. Use small observable movements, inspect the following

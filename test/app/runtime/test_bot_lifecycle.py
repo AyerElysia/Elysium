@@ -21,6 +21,16 @@ def test_production_bootstrap_does_not_load_legacy_model_registry() -> None:
     assert 'init_models_config("config/models.toml")' in source
 
 
+def test_production_database_uses_only_global_storage_backend() -> None:
+    """Core database selection must derive from the one global storage mode."""
+
+    source = inspect.getsource(Bot._initialize_kernel)
+
+    assert "self.config.storage.backend" in source
+    assert "db_cfg.database_type" not in source
+    assert '"mysql" if use_mysql else "sqlite"' in source
+
+
 def test_dns_warmup_uses_only_active_snapshot_providers() -> None:
     providers = {
         "active-http": {"base_url": "http://127.0.0.1:3000/v1"},
@@ -160,9 +170,11 @@ async def test_shutdown_continues_after_independent_step_failure(
         publish=AsyncMock(side_effect=RuntimeError("event stop failed"))
     )
     bot.scheduler = SimpleNamespace(stop=AsyncMock())
-    app_api_mount = SimpleNamespace(aclose=AsyncMock())
-    bot.app_api_mount = app_api_mount
     shutdown_order = []
+    app_api_mount = SimpleNamespace(
+        aclose=AsyncMock(side_effect=lambda: shutdown_order.append("app_api_mount"))
+    )
+    bot.app_api_mount = app_api_mount
     bot._unload_all_plugins = AsyncMock(  # type: ignore[method-assign]
         side_effect=lambda: shutdown_order.append("plugins")
     )
@@ -204,7 +216,7 @@ async def test_shutdown_continues_after_independent_step_failure(
     bot.scheduler.stop.assert_awaited_once()
     adapter_manager.stop_all_adapters.assert_awaited_once()
     bot._unload_all_plugins.assert_awaited_once()
-    assert shutdown_order[:2] == ["adapters", "plugins"]
+    assert shutdown_order[:3] == ["adapters", "app_api_mount", "plugins"]
     stream_manager.stop.assert_awaited_once()
     close_engine.assert_awaited_once()
     close_vectors.assert_awaited_once()

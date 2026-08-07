@@ -55,6 +55,16 @@ class MCConfig:
             "/mnt/g/Game/Minecraft/.minecraft/config/elysium_native_bridge.json"
         )
     )
+    # Headless bot body: joins a server/LAN world as an independent player.
+    bot_bridge_uri: str = "ws://127.0.0.1:18767/elysium"
+    bot_bridge_listen_uri: str | None = "ws://127.0.0.1:18767/elysium"
+    # Workspace-relative; the session generates the token file on first start.
+    bot_token_file: str = "minecraft/bot_bridge_token.json"
+    bot_server_host: str = "127.0.0.1"
+    bot_server_port: int = 25565
+    bot_username: str = "AyerElysia"
+    bot_observation_interval_ms: int = 1000
+    bot_entity_radius_blocks: int = 32
     planner_task_name: str = "agent"
     bridge_ready_timeout_seconds: float = 240.0
     world_ready_timeout_seconds: float = 120.0
@@ -69,6 +79,28 @@ class MCConfig:
     expected_baritone_sha256: str = (
         "B413CE0A2754A3C8484AAE39875CF84BE1F999DEE208E86D41B3D0D329D5CA35"
     )
+
+    def __post_init__(self) -> None:
+        """Fail closed on unsafe or internally inconsistent body configuration."""
+
+        if self.default_body not in {"agent", "bot", "biomimetic"}:
+            raise ValueError(f"unsupported default Minecraft body: {self.default_body}")
+        normalized_token_path = self.bot_token_file.replace("\\", "/")
+        token_path = Path(normalized_token_path)
+        if (
+            token_path.is_absolute()
+            or ".." in token_path.parts
+            or ":" in normalized_token_path
+        ):
+            raise ValueError("bot_token_file must remain workspace-relative")
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,16}", self.bot_username):
+            raise ValueError("bot_username must match the Minecraft account-name contract")
+        if not 1 <= self.bot_server_port <= 65535:
+            raise ValueError("bot_server_port must be between 1 and 65535")
+        if self.bot_observation_interval_ms <= 0:
+            raise ValueError("bot_observation_interval_ms must be positive")
+        if self.bot_entity_radius_blocks <= 0:
+            raise ValueError("bot_entity_radius_blocks must be positive")
 
 
 @dataclass(slots=True)

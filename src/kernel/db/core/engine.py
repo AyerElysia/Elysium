@@ -408,6 +408,7 @@ def _build_mysql_config(
         "pool_timeout": connection_timeout,
         "pool_recycle": 900,
         "pool_pre_ping": True,
+        "pool_reset_on_return": "rollback",
         "connect_args": connect_args,
     }
     logger.debug(
@@ -486,20 +487,21 @@ async def init_database_from_config(
 
         config = get_core_config()
         db_cfg = config.database
+        use_mysql = config.storage.backend == "mysql"
 
         await init_database_from_config(
-            database_type=db_cfg.database_type,
+            database_type="mysql" if use_mysql else "sqlite",
             sqlite_path=db_cfg.sqlite_path,
-            postgresql_host=db_cfg.postgresql_host,
-            postgresql_port=db_cfg.postgresql_port,
-            postgresql_database=db_cfg.postgresql_database,
-            postgresql_user=db_cfg.postgresql_user,
-            postgresql_password=db_cfg.postgresql_password,
-            postgresql_schema=db_cfg.postgresql_schema,
-            postgresql_ssl_mode=db_cfg.postgresql_ssl_mode,
-            postgresql_ssl_ca=db_cfg.postgresql_ssl_ca,
-            postgresql_ssl_cert=db_cfg.postgresql_ssl_cert,
-            postgresql_ssl_key=db_cfg.postgresql_ssl_key,
+            mysql_host=db_cfg.mysql_host,
+            mysql_port=db_cfg.mysql_port,
+            mysql_database=db_cfg.mysql_database,
+            mysql_user=db_cfg.mysql_user,
+            mysql_password=db_cfg.mysql_password,
+            mysql_charset=db_cfg.mysql_charset,
+            mysql_ssl_mode=db_cfg.mysql_ssl_mode,
+            mysql_ssl_ca=db_cfg.mysql_ssl_ca,
+            mysql_ssl_cert=db_cfg.mysql_ssl_cert,
+            mysql_ssl_key=db_cfg.mysql_ssl_key,
             connection_pool_size=db_cfg.connection_pool_size,
             connection_timeout=db_cfg.connection_timeout,
             echo=db_cfg.echo,
@@ -677,6 +679,9 @@ _MYSQL_SESSION_STATEMENTS: tuple[str, ...] = (
     "SET SESSION time_zone = '+00:00'",
     # 锁等待必须有界，失败交给调用方显式重试而不是无限悬挂。
     "SET SESSION innodb_lock_wait_timeout = 10",
+    # FRP/进程异常退出后，服务端必须在有界时间内回滚遗留的 idle transaction。
+    # 正常连接由 pool_pre_ping 自动重建，不能让旧事务无限持有业务行锁。
+    "SET SESSION wait_timeout = 180",
 )
 
 

@@ -41,6 +41,7 @@ class APIV1Mount:
     media_store: MediaObjectStore
     command_store: CommandStore
     command_dispatcher: CommandDispatcher
+    tabletop_provider: object | None = None
     _closed: bool = field(default=False, init=False)
 
     async def start(self) -> None:
@@ -75,6 +76,10 @@ class APIV1Mount:
         ]
         self.command_store.close()
         self.media_store.close()
+        if self.tabletop_provider is not None:
+            close = getattr(self.tabletop_provider, "close", None)
+            if callable(close):
+                close()
         self.store.close()
         self._closed = True
 
@@ -94,6 +99,7 @@ def mount_api_v1(
     chat_command_service_factory: Callable[..., object] | None = None,
     livestream_provider: object | None = None,
     voice_call_provider: object | None = None,
+    tabletop_provider: object | None = None,
     task_manager: TaskManager | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> APIV1Mount:
@@ -176,6 +182,7 @@ def mount_api_v1(
             chat_commands_enabled=chat_command_service is not None,
             livestream=livestream_provider,
             voice_calls=voice_call_provider,
+            tabletop=tabletop_provider,
         )
         app = create_api_app(context)
         app.add_middleware(
@@ -206,6 +213,7 @@ def mount_api_v1(
         media_store=media_store,
         command_store=command_store,
         command_dispatcher=command_dispatcher,
+        tabletop_provider=tabletop_provider,
     )
 
 

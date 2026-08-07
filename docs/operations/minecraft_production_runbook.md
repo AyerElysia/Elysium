@@ -6,6 +6,8 @@
 
 `biomimetic` 是可选实验身体，使用 DXcam 与 Windows 原生输入。它依赖唯一的前台 Minecraft 窗口，不能与人同时争用同一桌面的键鼠，也不能在旧 sidecar 仍运行时启动新实例。生产任务应保持 `default_body = "agent"`。
 
+`bot` 是无头共享世界身体：一个 mineflayer 玩家作为独立账号加入服务器或局域网世界，与使用自己客户端的人类处在同一个世界里。它实现与 `agent` 完全相同的 `elysium.minecraft.bridge/1` 协议与操作集（导航由 pathfinder 承担 Baritone 的角色），不需要 Windows 客户端、窗口控制或 quick-play 参数。它的用途是"一起玩"，不是单人托管世界的生产默认路径。
+
 ## 固定环境
 
 - Minecraft：1.21.1
@@ -66,6 +68,51 @@
    其余摘要、文件名、监听地址和超时使用代码中的已验证默认值。令牌由桥接首次启动写入 `config/elysium_bridge.json`，不得复制到仓库或日志。
 
 5. 由用户手动重启 Elysium。AI 和部署脚本均不得替用户停止、重启或拉起 Elysium，也不得停止或重启已有 Minecraft 进程。NapCat/QQNT 的自动恢复按根目录 `AGENTS.md` 的独立生命周期规范执行，本手册中的 Minecraft 脚本不管理它。
+
+## 无头 bot 身体（共享世界）
+
+bot 身体用于和人一起玩同一个世界：人类用自己的客户端进入世界，bot 以 `bot_username` 账号加入同一世界。它与 `agent` 共用协议、操作契约、命令账本、trace 证据链与 Presence/scene 投影，只是身体侧实现换成了 mineflayer。
+
+### 部署
+
+1. 安装锁定的 Node 依赖（Node 20.10 及以上；桥接显式依赖 `ws`，不依赖 Node 22 的全局 WebSocket）：
+
+   ```bash
+   cd integrations/minecraft_bot
+   npm ci
+   ```
+
+2. 在 `config/plugins/life_engine/config.toml` 的 `[minecraft]` 段配置目标世界：
+
+   ```toml
+   bot_server_host = "127.0.0.1"
+   bot_server_port = 25565
+   bot_username = "AyerElysia"
+   ```
+
+   监听地址、观测周期、实体半径和令牌路径使用代码默认值。令牌由 session 首次启动以排他创建方式生成于 `data/life_engine_workspace/minecraft/bot_bridge_token.json`（0600），并发首次启动也不会互相覆盖；令牌不得复制到仓库或日志。启动时监听端口 18767 若被占用，监听器绑定会直接失败并返回可诊断原因，不会抢占已有进程。
+
+   当前随仓库交付的是 Mineflayer `offline` 登录路径，适用于“对局域网开放”的单人世界或 `online-mode=false` 的专用服务器。普通 `online-mode=true` 服务器需要单独购买并交互式登录一个 Microsoft/Minecraft 账号；本实现不会把昵称伪装成已认证账号。
+
+### 一起玩的操作路径
+
+1. 用户在自己的 Minecraft 客户端进入世界；若是单人存档，先"对局域网开放"，把聊天栏提示的端口填入 `bot_server_port`（每次开放的端口可能不同）；专用服务器则填服务器地址与端口。
+2. 通过正式工具调用 `nucleus_minecraft(action="start", body_name="bot")`。session 负责唯一的 bot 进程生命周期：启动 node 子进程、等待桥接认证、等待服务器世界就绪。
+3. 就绪判定为 `server_world`：`world_loaded=true`、存在 `world` 事实（mode/server_address）且玩家有 UUID。与 `agent` 不同，它不校验单人世界名称和客户端暂停状态。
+4. `stop` 由 session 终止其拥有的 bot 进程并断开桥接；`game_left_running` 对 bot 恒为 `false`，人类的游戏客户端不受任何影响。
+
+### 观测差异
+
+bot 观察 facts 与 `StateCollector` 结构对齐（world/player/players/entities/inventory/crosshair/biome 等），并额外携带有界 `chat` 环形缓冲（最近 16 条公共聊天、私聊、系统、加入、离开事件）、最多 64 名可见玩家、最多 128 个附近实体及 `bot_tasks` 执行状态。桥接出站队列有硬上限；拥塞时优先丢弃过时观察而保留命令回执，并在后续观察报告累计丢弃数。`world.mine` 会先寻路到精确目标，再校验方块未变化且可挖后执行 dig。回执语义不变：只证明接单与派发，导航、挖掘、交互结果必须由后续观察证明。
+
+## 社区实现取舍
+
+- 用户保留的 `MC集成包.zip` / `MC插件源码.zip` 已做源码级对照。其可复用核心是 Mineflayer 独立玩家、pathfinder 长任务、聊天环形缓冲、进程就绪探测和“靠后续状态确认结果”；本实现采用了这些成熟方向。没有直接搬用其静态 secret + 通用 RPC + 分散工具插件链，因为那条链缺少当前 Elysium 所要求的 HMAC 握手、命令幂等账本、统一 Presence/World、content-free durable receipt 和失败后仍可重试的资源所有权。
+- Neuro SDK 的公开契约采用“文本状态 + 注册动作 + WebSocket 执行结果”，并明确建议实时游戏把低层操作交给专门执行器。这里沿用这一分层：Life Engine 决定高层意图，Mineflayer/pathfinder 负责连续移动与挖掘，观察而非模型自述证明结果。
+- N.E.K.O. 公开仓库展示的是通用插件 SDK/市场与跨场景记忆架构；截至本实现审计时，公开资料中没有可复用、可验证的 Minecraft 专项插件源码。因此只参考其“核心主体与外部插件解耦”的边界，没有把不存在的 MC 实现当作依赖。
+- Mineflayer 提供成熟的协议、实体、背包、聊天与物理抽象，适合让爱莉作为独立玩家进入同服；Elysium 额外补上认证桥、幂等命令账本、Presence/World 投影、durable trace 与进程所有权。
+
+参考：[Mineflayer](https://github.com/PrismarineJS/mineflayer)、[Neuro SDK](https://github.com/VedalAI/neuro-sdk)、[Project N.E.K.O.](https://github.com/Project-N-E-K-O/N.E.K.O)。
 
 ## 启动与就绪语义
 

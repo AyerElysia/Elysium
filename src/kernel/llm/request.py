@@ -896,8 +896,8 @@ class LLMRequest:
                     _attempt_number: int = attempt_index,
                     _model: dict[str, Any] = model,
                     _step_meta: dict[str, Any] | None = step.meta,
-                    _trimmed: list[LLMPayload] = list(trimmed_payloads),
-                    _usage: dict[str, Any] = dict(provider_usage),
+                    _trimmed: list[LLMPayload] = list(trimmed_payloads),  # noqa: B006 - freeze closure snapshot
+                    _usage: dict[str, Any] = dict(provider_usage),  # noqa: B006 - freeze closure snapshot
                     _state: dict[str, Any] = attempt_state,
                     _started: float = attempt_started,
                 ) -> None:

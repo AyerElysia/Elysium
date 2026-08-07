@@ -308,7 +308,7 @@ async def test_subject_workspace_projection_and_observation_never_overwrite_dive
         )
         first_result = await projector.project_one()
         workspace_file = data_root / logical_path
-        assert first_result.status == "projected"
+        assert first_result.status == "projected", first_result.detail
         assert workspace_file.read_bytes() == b"first\r\n"
 
         second = await store.append_version(

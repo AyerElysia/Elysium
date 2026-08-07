@@ -265,7 +265,7 @@ class MemoryIntegration:
             cfg = self._service._cfg()
             workspace = Path(cfg.settings.workspace_path)
             index_config = getattr(cfg, "memory_index", None)
-            storage_enabled = bool(getattr(cfg.storage, "enabled", False))
+            storage_enabled = bool(self._service._selectable_storage_enabled)
             storage_runtime = self._service.storage_runtime if storage_enabled else None
             if storage_enabled and storage_runtime is None:
                 raise RuntimeError(

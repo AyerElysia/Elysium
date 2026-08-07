@@ -110,19 +110,10 @@ async def test_mysql_presence_world_adapters_share_domain_contract() -> None:
         registry_id="life-presence-world-integration",
     )
     runtime: StorageBackendRuntime | None = None
-    token = None
     stores: PresenceWorldStores | None = None
     try:
         generation = _generation()
         await registry.register_generation(generation)
-        health = await registry.health()
-        token = await registry.activate_generation(
-            generation.generation_id,
-            expected_epoch=int(health.get("authority_epoch") or 0),
-            owner_id="presence-world-integration-writer",
-            lease_seconds=120,
-            confirm_previous_writers_stopped=True,
-        )
         runtime = await open_storage_backend(
             StorageFactorySettings(
                 enabled=True,
@@ -131,9 +122,7 @@ async def test_mysql_presence_world_adapters_share_domain_contract() -> None:
                 schema_version=1,
                 registry_id="life-presence-world-integration",
                 authority_provider="mysql",
-                authority_epoch=token.authority_epoch,
-                authority_owner_id=token.owner_id,
-                fencing_token_env="TEST_PRESENCE_WORLD_MYSQL_FENCE",
+                authority_owner_id="presence-world-integration-writer",
                 mysql=MySQLBackendSettings(
                     host=config.host,
                     port=config.port,
@@ -143,10 +132,7 @@ async def test_mysql_presence_world_adapters_share_domain_contract() -> None:
                     ssl_mode=config.ssl_mode,
                 ),
             ),
-            environment={
-                "TEST_PRESENCE_WORLD_MYSQL_FENCE": token.fencing_token,
-                "TEST_STORAGE_MYSQL_PASSWORD": config.password,
-            },
+            environment={"TEST_STORAGE_MYSQL_PASSWORD": config.password},
         )
         stores = await open_presence_world_stores(runtime, initialize_schema=True)
         await _clear_contract_rows(runtime)
@@ -157,10 +143,7 @@ async def test_mysql_presence_world_adapters_share_domain_contract() -> None:
             if runtime is not None:
                 if stores is not None:
                     await _clear_contract_rows(runtime)
+                await runtime.revoke_authority()
                 await runtime.close()
         finally:
-            try:
-                if token is not None:
-                    await registry.revoke(token)
-            finally:
-                await engine.dispose()
+            await engine.dispose()

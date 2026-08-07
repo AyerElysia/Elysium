@@ -153,7 +153,11 @@ class LifeEngineMinecraftTool(BaseTool):
             },
             "body_name": {
                 "type": "string",
-                "description": "action=start 时使用的精确身体名称，如 agent 或 biomimetic",
+                "enum": ["agent", "bot", "biomimetic"],
+                "description": (
+                    "action=start 时使用的精确身体名称：agent=独自托管客户端，"
+                    "bot=作为独立玩家与 Ayer 同服，biomimetic=实验性前台视觉身体"
+                ),
             },
             "reason": {
                 "type": "string",

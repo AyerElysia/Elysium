@@ -128,6 +128,7 @@ class APIContext:
     chat_commands_enabled: bool = False
     livestream: "LivestreamProvider | None" = None
     voice_calls: "VoiceCallProvider | None" = None
+    tabletop: Any | None = None
 
 
 class RequestIDMiddleware(BaseHTTPMiddleware):
@@ -983,6 +984,17 @@ def create_api_app(context: APIContext) -> FastAPI:
                     queries=VoiceCallQueryService(context.voice_calls, context.codec),
                     store=context.command_store,
                     dispatcher=context.command_dispatcher,
+                    require_scope=require_scope,
+                    auth_store=context.store,
+                    codec=context.codec,
+                )
+            )
+        if context.tabletop is not None:
+            from .tabletop import create_tabletop_router
+
+            app.include_router(
+                create_tabletop_router(
+                    service=context.tabletop,
                     require_scope=require_scope,
                     auth_store=context.store,
                     codec=context.codec,

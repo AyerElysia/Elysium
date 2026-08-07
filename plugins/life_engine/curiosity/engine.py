@@ -27,6 +27,9 @@ EPISTEMIC_OPPORTUNITY_SCHEMA_VERSION = 1
 EPISTEMIC_OPPORTUNITY_ALGORITHM_VERSION = "epistemic-opportunity-v1"
 MAX_OPPORTUNITY_FIELD_BYTES = 4 * 1024
 MAX_OPPORTUNITY_PAYLOAD_BYTES = 16 * 1024
+_REMOTE_EVENT_NAMESPACE = "life_epistemic.opportunities"
+_REMOTE_PROJECTION_NAMESPACE = "life_epistemic.projection"
+_REMOTE_PROJECTION_KEY = "current"
 
 EPISTEMIC_OPPORTUNITY_GUIDE = """## 认知机会生成器
 - 你是系统侧的候选生成器，不是爱莉、不是她的内心，也不代表她正在好奇。
@@ -289,10 +292,14 @@ class CuriosityEngine:
         workspace_path: str,
         model_task_name: str = "life",
         timeout_seconds: float = 30.0,
+        runtime_store: Any | None = None,
     ) -> None:
         self.workspace_path = str(workspace_path or "")
         self.model_task_name = str(model_task_name or "life")
         self.timeout_seconds = max(3.0, float(timeout_seconds or 30.0))
+        self.runtime_store = runtime_store
+        self._state_revision = 0
+        self._remote_opportunity_cache: dict[str, EpistemicOpportunity] = {}
         self._lock = asyncio.Lock()
         self._opportunity_index: dict[str, tuple[int, int, str]] | None = None
 
@@ -316,10 +323,19 @@ class CuriosityEngine:
 
     async def load_opportunity(self) -> EpistemicOpportunity | None:
         async with self._lock:
+            if self.runtime_store is not None:
+                return await self._load_remote_opportunity_unlocked()
             return self._load_opportunity_unlocked()
 
     async def save_opportunity(self, opportunity: EpistemicOpportunity) -> None:
         async with self._lock:
+            if self.runtime_store is not None:
+                await self._append_remote_opportunity_unlocked(opportunity)
+                await self._write_remote_projection_unlocked(
+                    opportunity.opportunity_id,
+                    reason_code="candidate_available",
+                )
+                return
             self._append_opportunity_unlocked(opportunity)
             self._write_projection_unlocked(opportunity.opportunity_id)
 
@@ -352,6 +368,12 @@ class CuriosityEngine:
         """Retire only the transport projection; immutable candidates remain."""
 
         async with self._lock:
+            if self.runtime_store is not None:
+                await self._write_remote_projection_unlocked(
+                    None,
+                    reason_code="legacy_adapter_clear",
+                )
+                return
             self._write_projection_unlocked(None, reason_code="legacy_adapter_clear")
 
     async def review(
@@ -435,6 +457,230 @@ class CuriosityEngine:
             max_bytes=max_chars,
             opportunity_id=opportunity.opportunity_id if opportunity else "",
         )
+
+    async def _load_remote_opportunity_unlocked(
+        self,
+    ) -> EpistemicOpportunity | None:
+        record = await self.runtime_store.get_state(
+            _REMOTE_PROJECTION_NAMESPACE,
+            _REMOTE_PROJECTION_KEY,
+        )
+        if record is None:
+            self._state_revision = 0
+            return None
+        self._state_revision = int(record.revision)
+        projection = self._validate_remote_projection(record.payload, record.revision)
+        opportunity_id = projection["current_opportunity_id"]
+        event_position = projection["current_event_position"]
+        if opportunity_id is None:
+            return None
+        found = await self._find_remote_opportunity_unlocked(
+            opportunity_id,
+            event_position=event_position,
+        )
+        if found is None:
+            raise RuntimeError(
+                "EpistemicOpportunityRemoteProjectionMissingEvent:"
+                f"{opportunity_id}:{event_position}"
+            )
+        return found[0]
+
+    async def _append_remote_opportunity_unlocked(
+        self,
+        opportunity: EpistemicOpportunity,
+    ) -> int:
+        cached = self._remote_opportunity_cache.get(opportunity.opportunity_id)
+        if cached is not None:
+            if _identity_fields(cached) != _identity_fields(opportunity):
+                raise RuntimeError(
+                    "EpistemicOpportunityRemoteIdentityConflict:"
+                    f"{opportunity.opportunity_id}"
+                )
+            found = await self._find_remote_opportunity_unlocked(
+                opportunity.opportunity_id
+            )
+            if found is not None:
+                return found[1]
+
+        try:
+            record = await self.runtime_store.append_event(
+                namespace=_REMOTE_EVENT_NAMESPACE,
+                occurrence_id=opportunity.opportunity_id,
+                event_kind="epistemic_opportunity.recorded",
+                payload=opportunity.to_dict(),
+                occurred_at=opportunity.generated_at,
+            )
+        except Exception:
+            # The candidate identity intentionally excludes generated_at. A replay
+            # may therefore carry different transport bytes while representing
+            # the same immutable semantic candidate. Resolve that case from the
+            # authoritative event stream; all other storage conflicts propagate.
+            found = await self._find_remote_opportunity_unlocked(
+                opportunity.opportunity_id
+            )
+            if found is None or _identity_fields(found[0]) != _identity_fields(
+                opportunity
+            ):
+                raise
+            return found[1]
+
+        persisted = EpistemicOpportunity.from_mapping(record.payload)
+        if _identity_fields(persisted) != _identity_fields(opportunity):
+            raise RuntimeError(
+                "EpistemicOpportunityRemoteIdentityConflict:"
+                f"{opportunity.opportunity_id}"
+            )
+        self._remote_opportunity_cache[persisted.opportunity_id] = persisted
+        return int(record.position)
+
+    async def _find_remote_opportunity_unlocked(
+        self,
+        opportunity_id: str,
+        *,
+        event_position: int | None = None,
+    ) -> tuple[EpistemicOpportunity, int] | None:
+        if event_position is not None:
+            records = await self.runtime_store.read_events(
+                _REMOTE_EVENT_NAMESPACE,
+                after_position=max(0, int(event_position) - 1),
+                limit=1,
+            )
+            if not records or int(records[0].position) != int(event_position):
+                return None
+        else:
+            records = []
+            after_position = 0
+            while True:
+                page = await self.runtime_store.read_events(
+                    _REMOTE_EVENT_NAMESPACE,
+                    after_position=after_position,
+                    limit=1000,
+                )
+                if not page:
+                    break
+                records.extend(page)
+                after_position = int(page[-1].position)
+                if len(page) < 1000:
+                    break
+
+        for record in records:
+            if str(record.occurrence_id) != opportunity_id:
+                continue
+            if str(record.event_kind) != "epistemic_opportunity.recorded":
+                raise RuntimeError(
+                    "EpistemicOpportunityRemoteEventKindInvalid:"
+                    f"{opportunity_id}:{record.event_kind}"
+                )
+            opportunity = EpistemicOpportunity.from_mapping(record.payload)
+            if opportunity.opportunity_id != opportunity_id:
+                raise RuntimeError(
+                    "EpistemicOpportunityRemoteEventIdentityInvalid:"
+                    f"{opportunity_id}"
+                )
+            self._remote_opportunity_cache[opportunity_id] = opportunity
+            return opportunity, int(record.position)
+        return None
+
+    async def _write_remote_projection_unlocked(
+        self,
+        opportunity_id: str | None,
+        *,
+        reason_code: str,
+    ) -> None:
+        event_position: int | None = None
+        if opportunity_id is not None:
+            found = await self._find_remote_opportunity_unlocked(opportunity_id)
+            if found is None:
+                raise RuntimeError(
+                    "EpistemicOpportunityRemoteProjectionTargetMissing:"
+                    f"{opportunity_id}"
+                )
+            event_position = found[1]
+
+        current = await self.runtime_store.get_state(
+            _REMOTE_PROJECTION_NAMESPACE,
+            _REMOTE_PROJECTION_KEY,
+        )
+        expected_revision = int(current.revision) if current is not None else 0
+        if current is not None:
+            previous = self._validate_remote_projection(
+                current.payload,
+                current.revision,
+            )
+            if (
+                previous["current_opportunity_id"] == opportunity_id
+                and previous["current_event_position"] == event_position
+                and previous["reason_code"] == reason_code
+            ):
+                self._state_revision = expected_revision
+                return
+
+        next_revision = expected_revision + 1
+        projection = {
+            "kind": "epistemic_opportunity_projection",
+            "schema_version": 1,
+            "projection_revision": next_revision,
+            "current_opportunity_id": opportunity_id,
+            "current_event_position": event_position,
+            "reason_code": reason_code,
+            "updated_at": _now_iso(),
+        }
+        written = await self.runtime_store.put_state(
+            namespace=_REMOTE_PROJECTION_NAMESPACE,
+            state_key=_REMOTE_PROJECTION_KEY,
+            expected_revision=expected_revision,
+            schema_version=1,
+            payload=projection,
+        )
+        self._state_revision = int(written.revision)
+
+    @staticmethod
+    def _validate_remote_projection(
+        payload: Any,
+        record_revision: int,
+    ) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise TypeError("EpistemicOpportunityRemoteProjectionNotObject")
+        expected_keys = {
+            "kind",
+            "schema_version",
+            "projection_revision",
+            "current_opportunity_id",
+            "current_event_position",
+            "reason_code",
+            "updated_at",
+        }
+        if set(payload) != expected_keys:
+            raise RuntimeError("EpistemicOpportunityRemoteProjectionShapeInvalid")
+        if (
+            payload.get("kind") != "epistemic_opportunity_projection"
+            or payload.get("schema_version") != 1
+            or payload.get("projection_revision") != int(record_revision)
+        ):
+            raise RuntimeError("EpistemicOpportunityRemoteProjectionSchemaInvalid")
+        opportunity_id = payload.get("current_opportunity_id")
+        event_position = payload.get("current_event_position")
+        if opportunity_id is not None and (
+            not isinstance(opportunity_id, str) or not opportunity_id
+        ):
+            raise RuntimeError("EpistemicOpportunityRemoteProjectionIdInvalid")
+        if event_position is not None and (
+            not isinstance(event_position, int)
+            or isinstance(event_position, bool)
+            or event_position <= 0
+        ):
+            raise RuntimeError(
+                "EpistemicOpportunityRemoteProjectionPositionInvalid"
+            )
+        if (opportunity_id is None) != (event_position is None):
+            raise RuntimeError("EpistemicOpportunityRemoteProjectionPairInvalid")
+        if not isinstance(payload.get("reason_code"), str) or not isinstance(
+            payload.get("updated_at"), str
+        ):
+            raise TypeError(
+                "EpistemicOpportunityRemoteProjectionMetadataInvalid"
+            )
+        return payload
 
     def _load_opportunity_unlocked(self) -> EpistemicOpportunity | None:
         if self.state_path.exists():

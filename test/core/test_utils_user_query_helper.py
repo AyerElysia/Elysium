@@ -48,6 +48,22 @@ class TestUserQueryHelper:
         # 验证缓存工作（info 会显示缓存命中）
         assert helper.generate_person_id.cache_info().hits > 0
 
+    def test_get_person_info_is_read_only(self):
+        """平台适配器可读取数据库身份，而不更新互动计数。"""
+        import asyncio
+
+        mock_person = MagicMock()
+        with patch("src.core.utils.user_query_helper.CRUDBase"):
+            helper = UserQueryHelper()
+            helper.person_crud.get_by = AsyncMock(return_value=mock_person)
+
+            result = asyncio.run(helper.get_person_info("feishu", "ou_peach"))
+
+            assert result is mock_person
+            helper.person_crud.get_by.assert_awaited_once_with(
+                person_id=helper.generate_person_id("feishu", "ou_peach")
+            )
+
     def test_get_or_create_person_existing(self):
         """测试获取或创建用户（已存在）。"""
         import asyncio

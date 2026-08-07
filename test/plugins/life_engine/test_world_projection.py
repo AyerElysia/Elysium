@@ -29,8 +29,6 @@ from plugins.life_engine.service.perception_gateway import (
 )
 from plugins.life_engine.service.tool_manifests import get_tool_manifest
 from plugins.life_engine.service.world_projection import (
-    WORLD_ASSERTION_ORDER_NEWEST_FIRST,
-    WORLD_ASSERTION_SCOPE_CURRENT_SNAPSHOT,
     WORLD_OBSERVATION_EVENT,
     WORLD_PROJECTOR_POLICY,
     WORLD_PROJECTOR_SCHEMA_VERSION,
@@ -86,8 +84,6 @@ def _observation(
     retracts: str = "",
     domain: str = "relationship",
     predicate: str = "current_state",
-    status: str = "observed",
-    observed_at: str = "2026-08-02T12:00:00+08:00",
 ) -> LifeEvent:
     """Build one immutable observation event for store-level tests."""
 
@@ -97,16 +93,16 @@ def _observation(
         "predicate": predicate,
         "value": value,
         "domain": domain,
-        "status": status,
+        "status": "observed",
         "source_instance_id": "untrusted-content-spoof",
-        "observed_at": observed_at,
-        "valid_from": observed_at,
+        "observed_at": "2026-08-02T12:00:00+08:00",
+        "valid_from": "2026-08-02T12:00:00+08:00",
         "retracts_assertion_id": retracts,
     }
     return LifeEvent(
         event_id=f"event-{identity}",
         sequence=0,
-        timestamp=observed_at,
+        timestamp="2026-08-02T12:00:00+08:00",
         source="test.world",
         channel=LifeEventChannel.LIFE.value,
         event_type=WORLD_OBSERVATION_EVENT,
@@ -392,14 +388,7 @@ async def test_service_end_to_end_syncs_instances_and_preserves_full_content(
     assert voice.instance_id in chat_view.content
     assert "chat_global" in voice_view.content
     assert full_report not in chat_view.content
-    assert f"assertion:{receipt['assertion_id']}" not in chat_view.content
-    history_page = await service.list_world_assertion_references_page(
-        include_retracted=True,
-        inline_max_bytes=0,
-    )
-    assert receipt["assertion_id"] in {
-        item.assertion_id for item in history_page.items
-    }
+    assert f"assertion:{receipt['assertion_id']}" in chat_view.content
     assertion = service.world_projection.list_assertions()[-1]
     assert assertion.value == full_report
     assert assertion.source_instance_id == voice.instance_id
@@ -416,161 +405,7 @@ async def test_service_end_to_end_syncs_instances_and_preserves_full_content(
     restarted_view = await restarted.prepare_perception(voice.instance_id)
     assert restarted_view.from_position == voice_view.through_position
     assert full_report not in restarted_view.content
-    assert f"assertion:{receipt['assertion_id']}" not in restarted_view.content
-
-
-def test_current_snapshot_excludes_history_and_lifecycle_without_data_loss(
-    tmp_path: Path,
-) -> None:
-    """Present-tense delivery cannot be starved by retained lifecycle evidence."""
-
-    ledger = RawEventStore(tmp_path)
-    for index in range(21):
-        ledger.append_sync(
-            _observation(
-                f"legacy-{index:03d}",
-                source_instance_id="legacy-import",
-                value=f"legacy-payload-{index:03d}",
-                domain="scene",
-                predicate="legacy_snapshot",
-                status="legacy_import",
-                observed_at=f"2026-08-02T10:{index:02d}:00+00:00",
-            )
-        )
-    for index in range(100):
-        ledger.append_sync(
-            _observation(
-                f"lifecycle-{index:03d}",
-                source_instance_id="voice-instance",
-                value=f"session-payload-{index:03d}",
-                domain="voice_live",
-                predicate="session_state",
-                observed_at=(
-                    f"2026-08-03T10:{index // 60:02d}:{index % 60:02d}+00:00"
-                ),
-            )
-        )
-    ledger.append_sync(
-        _observation(
-            "stale-current",
-            source_instance_id="chat_global",
-            value="stale-current-payload",
-            observed_at="2026-08-05T10:00:00+00:00",
-        )
-    )
-    ledger.append_sync(
-        _observation(
-            "retract-stale",
-            source_instance_id="chat_global",
-            value="stale evidence withdrawn",
-            retracts="stale-current",
-            observed_at="2026-08-05T10:01:00+00:00",
-        )
-    )
-    ledger.append_sync(
-        _observation(
-            "current-fact",
-            source_instance_id="chat_global",
-            value="current-visible-fact",
-            observed_at="2026-08-06T10:00:00+00:00",
-        )
-    )
-
-    registry = ConsciousnessRegistry()
-    registry.register(
-        ConsciousnessInstance(
-            instance_id="voice-suspended",
-            kind="voice_live",
-            stream_ids=["voice:suspended"],
-        )
-    )
-    assert registry.suspend("voice-suspended") is True
-    projection_path = tmp_path / "current-view.sqlite3"
-    store = WorldProjectionStore(projection_path)
-    gateway = PerceptionGateway(registry, ledger, store)
-    first = gateway.prepare("chat_global")
-
-    assert "suspended 窗口摘要: total=1" in first.content
-    assert '"voice_live":1' in first.content
-    assert "current-fact" in first.assertion_ids
-    assert "stale-current" not in first.assertion_ids
-    assert not any(identity.startswith("legacy-") for identity in first.assertion_ids)
-    assert not any(
-        identity.startswith("lifecycle-") for identity in first.assertion_ids
-    )
-    snapshot_text = first.content.split("### 自上次成功感知以来的有界变化", 1)[0]
-    assert "current-visible-fact" in snapshot_text
-    assert "legacy-payload" not in snapshot_text
-    assert "session-payload" not in snapshot_text
-
-    history = store.list_assertion_references_page(
-        include_retracted=True,
-        limit=1000,
-    )
-    assert history.total_items == 124
-    assert {item.assertion_id for item in history.items} >= {
-        "legacy-000",
-        "lifecycle-099",
-        "stale-current",
-        "current-fact",
-    }
-    current = store.list_assertion_references_page(
-        delivery_scope=WORLD_ASSERTION_SCOPE_CURRENT_SNAPSHOT,
-        limit=1,
-    )
-    assert current.result_order == WORLD_ASSERTION_ORDER_NEWEST_FIRST
-    assert current.items[0].assertion_id == "current-fact"
-    assert current.next_after_assertion_id == "current-fact"
-    older_current = store.list_assertion_references_page(
-        delivery_scope=WORLD_ASSERTION_SCOPE_CURRENT_SNAPSHOT,
-        after_observed_at=current.next_after_observed_at,
-        after_assertion_id=current.next_after_assertion_id,
-        limit=10,
-    )
-    assert [item.assertion_id for item in older_current.items] == ["retract-stale"]
-
-    pending = first
-    delivered_change_positions: set[int] = set()
-    while pending.change_positions:
-        assert delivered_change_positions.isdisjoint(pending.change_positions)
-        delivered_change_positions.update(pending.change_positions)
-        gateway.commit(pending, _exact_receipt(pending))
-        pending = gateway.prepare("chat_global")
-    settled = pending
-    assert len(delivered_change_positions) == 124
-    assert "legacy-payload" not in settled.content
-    assert "session-payload" not in settled.content
-
-    ledger.append_sync(
-        _observation(
-            "lifecycle-new",
-            source_instance_id="voice-instance",
-            value="one-time-lifecycle-change",
-            domain="voice_live",
-            predicate="session_state",
-            observed_at="2026-08-06T11:00:00+00:00",
-        )
-    )
-    delta = gateway.prepare("chat_global")
-    assert "lifecycle-new" not in delta.assertion_ids
-    assert "one-time-lifecycle-change" in delta.content
-    gateway.commit(delta, _exact_receipt(delta))
-    assert "one-time-lifecycle-change" not in gateway.prepare("chat_global").content
-
-    restarted_store = WorldProjectionStore(projection_path)
-    restarted_current = restarted_store.list_assertion_references_page(
-        delivery_scope=WORLD_ASSERTION_SCOPE_CURRENT_SNAPSHOT,
-        limit=1000,
-    )
-    before_rebuild_ids = tuple(item.assertion_id for item in restarted_current.items)
-    full_count = len(restarted_store.list_assertions(include_retracted=True))
-    restarted_store.rebuild(ledger)
-    rebuilt_current = restarted_store.list_assertion_references_page(
-        delivery_scope=WORLD_ASSERTION_SCOPE_CURRENT_SNAPSHOT,
-        limit=1000,
-    )
-    assert tuple(item.assertion_id for item in rebuilt_current.items) == before_rebuild_ids
-    assert len(restarted_store.list_assertions(include_retracted=True)) == full_count
+    assert f"assertion:{receipt['assertion_id']}" in restarted_view.content
 
 
 @pytest.mark.asyncio

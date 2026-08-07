@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import traceback
 from typing import Any, ClassVar
 
 from src.app.plugin_system.api.log_api import get_logger
@@ -97,11 +98,18 @@ class LifeEngineMessageCollectorHandler(BaseEventHandler):
                 adapter_signature=str(params.get("adapter_signature") or ""),
             )
         except Exception as exc:  # noqa: BLE001
-            logger.error(f"life_engine 收集消息失败: {exc}")
+            # 附带异常类型与 traceback，便于定位 "session already committed" 等
+            # 事务状态错误究竟发生在哪个阶段（事实提交/EventBus/World catch-up）。
+            tb_text = traceback.format_exc(limit=12)
+            logger.error(
+                f"life_engine 收集消息失败: {type(exc).__name__}: {exc}\n{tb_text}"
+            )
             log_error(
                 "message_collect_failed",
                 str(exc),
                 event_name=event_name,
+                error_type=type(exc).__name__,
+                traceback=tb_text,
             )
 
         return EventDecision.SUCCESS, params

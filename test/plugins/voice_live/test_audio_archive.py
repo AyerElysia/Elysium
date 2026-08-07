@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
 import wave
 
@@ -58,13 +59,15 @@ async def test_audio_archive_writes_standard_tracks_and_manifest(tmp_path) -> No
             assert recording.getsampwidth() == 2
             assert recording.getframerate() == sample_rate
             assert recording.readframes(recording.getnframes()) == expected
-        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        if os.name != "nt":
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
     persisted = json.loads(
         (store.directory / "audio" / "manifest.json").read_text(encoding="utf-8")
     )
     assert persisted == manifest
-    assert stat.S_IMODE((store.directory / "audio").stat().st_mode) == 0o700
+    if os.name != "nt":
+        assert stat.S_IMODE((store.directory / "audio").stat().st_mode) == 0o700
 
 
 async def test_audio_archive_resume_appends_without_losing_prior_samples(

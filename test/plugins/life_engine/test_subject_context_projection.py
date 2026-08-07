@@ -17,6 +17,7 @@ from plugins.life_engine.core.subject_context_projection import (
 )
 from plugins.life_engine.service import core as service_core
 from plugins.life_engine.service.core import LifeEngineService
+from src.core.config.core_config import CoreConfig
 
 
 class _Response:
@@ -189,11 +190,13 @@ async def test_missing_authority_or_missing_source_block_fails_explicitly(
         max_bytes=8192,
         author=author,
     )
-    assert await projection.ensure_current_snapshot() is None
+    with pytest.raises(RuntimeError, match="USER.md"):
+        await projection.ensure_current_snapshot()
     assert "USER.md" in projection.health_snapshot()["degraded_reason"]
 
     (tmp_path / "USER.md").write_text("user", encoding="utf-8")
-    assert await projection.ensure_current_snapshot() is None
+    with pytest.raises(RuntimeError, match="exactly one ordered block"):
+        await projection.ensure_current_snapshot()
     assert (
         "exactly one ordered block" in projection.health_snapshot()["degraded_reason"]
     )
@@ -206,7 +209,14 @@ async def test_service_api_pins_revision_and_never_switches_historical_snapshot(
     _write_authorities(tmp_path)
     config = LifeEngineConfig()
     config.settings.workspace_path = str(tmp_path)
-    service = LifeEngineService(SimpleNamespace(config=config))
+    service = LifeEngineService(
+        SimpleNamespace(
+            config=config,
+            global_storage_config=CoreConfig(
+                storage=CoreConfig.StorageSection(backend="local")
+            ),
+        )
+    )
 
     async def author(
         _digest: str,
@@ -271,6 +281,81 @@ async def test_service_api_pins_revision_and_never_switches_historical_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_selected_subject_projection_uses_remote_stores_only(
+    tmp_path: Path,
+) -> None:
+    from plugins.life_engine.core.router_context_projection import (
+        _sources_from_contents,
+    )
+
+    contents = {
+        "SOUL.md": b"remote soul",
+        "USER.md": b"remote user",
+        "MEMORY.md": b"remote memory",
+    }
+    _, revision = _sources_from_contents(contents)
+    (tmp_path / "SOUL.md").write_text("LOCAL SOUL", encoding="utf-8")
+
+    class SubjectStore:
+        async def current_subject_revision(self) -> str:
+            return revision
+
+        async def read_subject_authority(self):
+            return SimpleNamespace(
+                commits={
+                    path: SimpleNamespace(
+                        version=SimpleNamespace(content_bytes=content)
+                    )
+                    for path, content in contents.items()
+                },
+                revision=revision,
+            )
+
+    class RuntimeStore:
+        def __init__(self) -> None:
+            self.states: dict[tuple[str, str], SimpleNamespace] = {}
+
+        async def get_state(self, namespace: str, state_key: str):
+            return self.states.get((namespace, state_key))
+
+        async def put_state(self, **kwargs):
+            key = (str(kwargs["namespace"]), str(kwargs["state_key"]))
+            current = self.states.get(key)
+            actual = int(current.revision) if current is not None else 0
+            assert int(kwargs["expected_revision"]) == actual
+            record = SimpleNamespace(
+                revision=actual + 1,
+                payload=dict(kwargs["payload"]),
+            )
+            self.states[key] = record
+            return record
+
+    async def author(_digest: str, sources: tuple[Any, ...]) -> SubjectContextDraft:
+        assert [source.text for source in sources] == [
+            "remote soul",
+            "remote user",
+            "remote memory",
+        ]
+        return _draft_from_sources(sources)
+
+    projection = SubjectContextProjection(
+        str(tmp_path),
+        projection_profile="voice_live",
+        max_bytes=8192,
+        author=author,
+        subject_store=SubjectStore(),
+        runtime_store=RuntimeStore(),
+    )
+
+    snapshot = await projection.ensure_current_snapshot()
+
+    assert snapshot is not None
+    assert snapshot["source_digest"] == revision
+    assert "LOCAL SOUL" not in snapshot["text"]
+    assert not projection.runtime_dir.exists()
+
+
+@pytest.mark.asyncio
 async def test_corrupt_pinned_content_fails_without_overwriting_version(
     tmp_path: Path,
 ) -> None:
@@ -296,7 +381,8 @@ async def test_corrupt_pinned_content_fails_without_overwriting_version(
     version_path.write_text(corrupted, encoding="utf-8")
 
     assert await projection.get_snapshot(revision) is None
-    assert await projection.ensure_current_snapshot() is None
+    with pytest.raises(RuntimeError, match="immutable router projection conflict"):
+        await projection.ensure_current_snapshot()
     assert version_path.read_text(encoding="utf-8") == corrupted
     assert author_calls == 2
     assert (
@@ -331,7 +417,8 @@ async def test_missing_or_corrupt_manifest_never_gets_silently_reconstructed(
     manifest_path.unlink()
 
     assert await projection.get_snapshot(revision) is None
-    assert await projection.ensure_current_snapshot() is None
+    with pytest.raises(RuntimeError, match="manifest is missing"):
+        await projection.ensure_current_snapshot()
     assert not manifest_path.exists()
     assert author_calls == 1
     assert "manifest is missing" in projection.health_snapshot()["degraded_reason"]
@@ -344,7 +431,8 @@ async def test_missing_or_corrupt_manifest_never_gets_silently_reconstructed(
         encoding="utf-8",
     )
     assert await projection.get_snapshot(revision) is None
-    assert await projection.ensure_current_snapshot() is None
+    with pytest.raises(RuntimeError, match="budget metadata mismatch"):
+        await projection.ensure_current_snapshot()
     assert author_calls == 1
     assert "budget metadata mismatch" in projection.health_snapshot()["degraded_reason"]
 
@@ -355,7 +443,8 @@ async def test_missing_or_corrupt_manifest_never_gets_silently_reconstructed(
         encoding="utf-8",
     )
     assert await projection.get_snapshot(revision) is None
-    assert await projection.ensure_current_snapshot() is None
+    with pytest.raises(RuntimeError, match="must not contain projection text"):
+        await projection.ensure_current_snapshot()
     assert author_calls == 1
     assert (
         "must not contain projection text"
@@ -372,7 +461,14 @@ async def test_subject_author_tries_next_model_after_per_source_budget_failure(
     config = LifeEngineConfig()
     config.settings.workspace_path = str(tmp_path)
     config.chatter.subject_context_projection_task_name = "subject-test"
-    service = LifeEngineService(SimpleNamespace(config=config))
+    service = LifeEngineService(
+        SimpleNamespace(
+            config=config,
+            global_storage_config=CoreConfig(
+                storage=CoreConfig.StorageSection(backend="local")
+            ),
+        )
+    )
 
     async def unused_author(
         _digest: str,

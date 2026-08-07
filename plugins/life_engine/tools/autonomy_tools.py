@@ -6,6 +6,8 @@ from typing import Annotated
 
 from src.app.plugin_system.base import BaseTool
 
+from .bounded_projection import project_bounded_items, sha256_json
+
 
 class LifeEngineScheduleAutonomyIntentTool(BaseTool):
     """Register a delayed autonomy intent."""
@@ -83,6 +85,14 @@ class LifeEngineManageAutonomyIntentTool(BaseTool):
         intent_id: Annotated[str, "目标 intent_id；list 时可留空"] = "",
         additional_occurrences: Annotated[int, "renew 时追加允许浮现的次数"] = 0,
         lease_minutes: Annotated[int, "renew 时追加的时间租约（分钟）"] = 0,
+        continuation: Annotated[
+            str,
+            "Optional list continuation returned by the previous page",
+        ] = "",
+        max_bytes: Annotated[
+            int | None,
+            "Optional list byte budget; the task hard cap still applies",
+        ] = None,
     ) -> tuple[bool, str | dict]:
         service = getattr(self.plugin, "service", None)
         if service is None:
@@ -94,6 +104,35 @@ class LifeEngineManageAutonomyIntentTool(BaseTool):
                 additional_occurrences=additional_occurrences,
                 lease_minutes=lease_minutes,
             )
+            if str(action or "").strip().lower() == "list":
+                source_items = list(result.get("intents") or [])
+                frontier = {
+                    "count": len(source_items),
+                    "intents_sha256": sha256_json(source_items),
+                }
+                item_refs = []
+                for item in source_items:
+                    item_hash = sha256_json(item)
+                    intent_ref = str(item.get("intent_id") or "").strip()
+                    item_refs.append(
+                        f"autonomy-intent:{intent_ref or 'unknown'}:sha256:{item_hash}"
+                    )
+                result = project_bounded_items(
+                    projection_name="autonomy-intent-list",
+                    task_name=getattr(self, "_runtime_task_name", ""),
+                    requested_max_bytes=max_bytes,
+                    binding={"action": "list"},
+                    frontier=frontier,
+                    base_payload={
+                        key: value
+                        for key, value in result.items()
+                        if key != "intents"
+                    },
+                    items_key="intents",
+                    items=source_items,
+                    item_refs=item_refs,
+                    continuation=continuation,
+                )
         except Exception as exc:  # noqa: BLE001
             return False, str(exc)
         return True, result

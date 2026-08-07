@@ -7,7 +7,6 @@ from typing import Any, Protocol, runtime_checkable
 
 from plugins.life_engine.service.event_bus import LifeEvent
 from plugins.life_engine.service.world_projection import (
-    WORLD_ASSERTION_SCOPE_HISTORY,
     WorldAssertion,
     WorldAssertionReferencePage,
     WorldChangeReferencePage,
@@ -125,7 +124,6 @@ class WorldProjectionStorePort(Protocol):
         self,
         *,
         include_retracted: bool = False,
-        delivery_scope: str = WORLD_ASSERTION_SCOPE_HISTORY,
         after_observed_at: str = "",
         after_assertion_id: str = "",
         limit: int = 128,

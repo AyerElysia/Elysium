@@ -20,10 +20,10 @@ from types import SimpleNamespace
 import pytest
 
 from plugins.life_engine.core.config import LifeEngineConfig
-from plugins.life_engine.narrative.store import NarrativeStore
+from plugins.life_engine.narrative.store import AsyncLocalNarrativeStore, NarrativeStore
 from plugins.life_engine.narrative.tools import LifeEngineWriteNarrativeTool
 from plugins.life_engine.prompts.sections import RiverReflectionSection, SectionContext
-from plugins.life_engine.trace.store import LifeTraceStore
+from plugins.life_engine.trace.store import AsyncLocalLifeTraceStore, LifeTraceStore
 
 
 @dataclass
@@ -104,8 +104,15 @@ def test_quiet_consolidation_advances_cursor_without_autobiography(tmp_path: Pat
 
 
 def _make_ctx(tmp_path: Path) -> SectionContext:
+    narrative_store = AsyncLocalNarrativeStore(tmp_path)
+    trace_store = AsyncLocalLifeTraceStore(tmp_path)
     return SectionContext(
-        service=SimpleNamespace(_workspace_dir=lambda: tmp_path),
+        service=SimpleNamespace(
+            _workspace_dir=lambda: tmp_path,
+            _selectable_storage_enabled=False,
+            narrative_store=lambda: narrative_store,
+            life_trace_store=lambda: trace_store,
+        ),
         config=_make_config(tmp_path),
         today_str="2026-06-11",
     )
@@ -197,14 +204,26 @@ def _make_tool(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[LifeEngineWriteNarrativeTool, list[dict]]:
     captured: list[dict] = []
+
+    async def record_moment(**kwargs):
+        captured.append(kwargs)
+
+    narrative_store = AsyncLocalNarrativeStore(tmp_path)
+    trace_store = AsyncLocalLifeTraceStore(tmp_path)
     fake_service = SimpleNamespace(
-        _record_life_moment=lambda **kwargs: captured.append(kwargs),
+        _selectable_storage_enabled=False,
+        _record_life_moment=record_moment,
+        narrative_store=lambda: narrative_store,
+        life_trace_store=lambda: trace_store,
+        runtime_state_store=lambda: None,
     )
     monkeypatch.setattr(
         "plugins.life_engine.service.registry.get_life_engine_service",
         lambda: fake_service,
     )
-    tool = LifeEngineWriteNarrativeTool(plugin=_DummyPlugin(config=_make_config(tmp_path)))
+    plugin = _DummyPlugin(config=_make_config(tmp_path))
+    plugin.service = fake_service
+    tool = LifeEngineWriteNarrativeTool(plugin=plugin)
     return tool, captured
 
 

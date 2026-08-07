@@ -37,6 +37,7 @@ from plugins.life_engine.service.perception_gateway import (
 )
 from plugins.life_engine.service.presence_store import PresenceRevisionConflict
 from plugins.life_engine.storage.models import BackendKind
+from src.core.config.core_config import CoreConfig
 from test.plugins.life_engine.presence_world_fakes import build_fake_stores
 
 
@@ -123,6 +124,35 @@ class _FakeRuntime:
         self.backend = backend
         self.backend_identity = f"{backend.value}://service-contract"
         self.close_calls = 0
+        self.renew_calls: list[int] = []
+        self.revoke_calls = 0
+        self.invalidated = False
+        self.renew_error: Exception | None = None
+        self.claim_calls: list[dict[str, Any]] = []
+
+    async def acquire_singleton_writer(self, **kwargs: Any) -> Any:
+        self.claim_calls.append(dict(kwargs))
+        return SimpleNamespace(
+            generation_id="fake-generation",
+            namespace=kwargs["namespace"],
+            state_key=kwargs["state_key"],
+            owner_instance_id=kwargs["owner_instance_id"],
+            lease_epoch=1,
+            lease_until="2026-08-07T23:59:59+00:00",
+            fencing_token="fake-token",
+        )
+
+    async def renew_authority(self, *, lease_seconds: int) -> None:
+        self.renew_calls.append(lease_seconds)
+        if self.renew_error is not None:
+            raise self.renew_error
+
+    async def revoke_authority(self) -> int:
+        self.revoke_calls += 1
+        return self.revoke_calls
+
+    def invalidate_writer(self) -> None:
+        self.invalidated = True
 
     async def health(self) -> dict[str, Any]:
         return {
@@ -143,6 +173,16 @@ class _FakeSubjectStore:
             "documents": 0,
             "versions": 0,
             "projection_outbox": {},
+        }
+
+
+class _FakeRuntimeStateStore:
+    async def health_snapshot(self) -> dict[str, Any]:
+        return {
+            "status": "healthy",
+            "backend": "fake",
+            "state_count": 0,
+            "event_count": 0,
         }
 
 
@@ -225,12 +265,16 @@ def _selected_service(tmp_path: Path, backend: BackendKind) -> LifeEngineService
     config = LifeEngineConfig()
     config.settings.enabled = True
     config.settings.workspace_path = str(tmp_path)
-    config.storage.enabled = True
-    config.storage.authoritative_backend = backend.value
-    config.storage.backend_generation = f"contract-{backend.value}-v1"
-    config.storage.authority_epoch = 1
-    config.storage.authority_owner_id = "service-contract"
-    return LifeEngineService(SimpleNamespace(config=config))
+    global_config = CoreConfig(
+        storage=CoreConfig.StorageSection(
+            backend=backend.value,
+            backend_generation=f"contract-{backend.value}-v1",
+            authority_owner_id="service-contract",
+        )
+    )
+    return LifeEngineService(
+        SimpleNamespace(config=config, global_storage_config=global_config)
+    )
 
 
 def test_selected_service_fails_closed_when_memory_did_not_attach(
@@ -252,6 +296,27 @@ def test_selected_service_fails_closed_when_memory_did_not_attach(
     disabled._require_selected_memory_service()
 
 
+def test_selected_runtime_consumers_fail_closed_before_store_attach(
+    tmp_path: Path,
+) -> None:
+    """Selected runtime consumers must never resurrect local JSON state."""
+
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+
+    for factory in (
+        service._autonomy_store,
+        service.life_trace_store,
+        service.narrative_store,
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match="SelectedRuntimeStateStorageNotStarted",
+        ):
+            factory()
+
+    assert list(tmp_path.iterdir()) == []
+
+
 def _install_selected_factories(
     monkeypatch: pytest.MonkeyPatch,
     backend: BackendKind,
@@ -261,6 +326,7 @@ def _install_selected_factories(
     runtimes: list[_FakeRuntime] = []
     factory_calls: list[tuple[str, bool]] = []
     subject_store = _FakeSubjectStore()
+    runtime_state_store = _FakeRuntimeStateStore()
     learning_store = _FakeLearningStore()
     attention_store = _FakeAttentionStore()
 
@@ -298,12 +364,25 @@ def _install_selected_factories(
         factory_calls.append(("subject", initialize_schema))
         return subject_store
 
+    async def _open_runtime_state(
+        runtime: _FakeRuntime,
+        *,
+        initialize_schema: bool = False,
+    ) -> _FakeRuntimeStateStore:
+        assert runtime.backend == backend
+        factory_calls.append(("runtime-state", initialize_schema))
+        return runtime_state_store
+
     async def _open_learning(
         runtime: _FakeRuntime,
         *,
         initialize_schema: bool = False,
+        writer_claim: Any | None = None,
     ) -> Any:
         assert runtime.backend == backend
+        assert writer_claim is not None
+        assert writer_claim.namespace == "life_engine.learning"
+        assert writer_claim.state_key == "selected_persistence"
         factory_calls.append(("learning", initialize_schema))
         return SimpleNamespace(store=learning_store)
 
@@ -335,6 +414,10 @@ def _install_selected_factories(
         _open_subject,
     )
     monkeypatch.setattr(
+        "plugins.life_engine.storage.runtime_factory.open_runtime_state_store",
+        _open_runtime_state,
+    )
+    monkeypatch.setattr(
         "plugins.life_engine.storage.learning_factory.open_learning_stores",
         _open_learning,
     )
@@ -362,7 +445,7 @@ def _forbid_legacy_stores(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(core_module, "WorldProjectionStore", _ForbiddenLegacyStore)
 
 
-@pytest.mark.parametrize("backend", [BackendKind.LOCAL, BackendKind.MYSQL])
+@pytest.mark.parametrize("backend", [BackendKind.MYSQL])
 async def test_selected_service_uses_one_backend_for_presence_world_and_events(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -389,10 +472,18 @@ async def test_selected_service_uses_one_backend_for_presence_world_and_events(
         ("events", False),
         ("presence-world", False),
         ("subject", False),
+        ("runtime-state", False),
         ("attention", False),
         ("learning", False),
     ]
     assert first.storage_runtime is runtimes[0]
+    assert [
+        (call["namespace"], call["state_key"]) for call in runtimes[0].claim_calls
+    ] == [
+        ("life_engine.runtime_context", "global"),
+        ("life_engine.learning", "selected_persistence"),
+    ]
+    assert len({call["owner_instance_id"] for call in runtimes[0].claim_calls}) == 1
     assert first.consciousness_registry.get(CHAT_GLOBAL_INSTANCE_ID) is not None
     assert first.consciousness_registry.database_path is None
     assert not (tmp_path / "runtime" / "consciousness_presence.sqlite3").exists()
@@ -459,6 +550,7 @@ async def test_selected_service_uses_one_backend_for_presence_world_and_events(
     )
 
     await first._close_selected_storage()
+    assert runtimes[0].revoke_calls == 1
     assert runtimes[0].close_calls == 1
 
     second = _selected_service(tmp_path, backend)
@@ -481,6 +573,111 @@ async def test_selected_service_uses_one_backend_for_presence_world_and_events(
     await second._close_selected_storage()
     await third._close_selected_storage()
     assert [runtime.close_calls for runtime in runtimes] == [1, 1, 1]
+
+
+async def test_storage_authority_start_requires_initialized_stop_event(
+    tmp_path: Path,
+) -> None:
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+    service._storage_runtime = _FakeRuntime(BackendKind.MYSQL)
+
+    with pytest.raises(
+        RuntimeError,
+        match="StorageAuthorityRenewalStopEventNotInitialized",
+    ):
+        service._start_storage_authority_renewal()
+
+
+async def test_service_renews_authority_while_memory_is_initializing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stores = build_fake_stores()
+    ledger = _FakeLifeEventStore()
+    runtimes, _ = _install_selected_factories(
+        monkeypatch,
+        BackendKind.MYSQL,
+        stores,
+        ledger,
+    )
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+    service._storage_factory_settings = replace(
+        service._storage_factory_settings,
+        authority_lease_seconds=3,
+        authority_renew_interval_seconds=0.01,
+    )
+    memory_init_started = asyncio.Event()
+    hold_memory_init = asyncio.Event()
+
+    async def _delayed_memory_init(_integration: object) -> None:
+        memory_init_started.set()
+        await hold_memory_init.wait()
+
+    monkeypatch.setattr(
+        "plugins.life_engine.service.integrations.MemoryIntegration.init_memory_service",
+        _delayed_memory_init,
+    )
+
+    startup = asyncio.create_task(service._start_impl())
+    await asyncio.wait_for(memory_init_started.wait(), timeout=1.0)
+    await asyncio.sleep(0.03)
+
+    assert runtimes[0].renew_calls
+    assert not startup.done()
+
+    startup.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await startup
+    service._stop_event.set()
+    await service._await_managed_task(
+        service._storage_authority_renew_task_id,
+        timeout=1.0,
+    )
+    service._storage_authority_renew_task_id = None
+    await service._close_selected_storage()
+
+
+async def test_storage_authority_loop_renews_current_writer(
+    tmp_path: Path,
+) -> None:
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+    runtime = _FakeRuntime(BackendKind.MYSQL)
+    service._storage_runtime = runtime
+    service._stop_event = asyncio.Event()
+    service._storage_factory_settings = replace(
+        service._storage_factory_settings,
+        authority_lease_seconds=3,
+        authority_renew_interval_seconds=1,
+    )
+
+    task = asyncio.create_task(service._renew_storage_authority_loop())
+    await asyncio.sleep(1.1)
+    service._stop_event.set()
+    await task
+
+    assert runtime.renew_calls == [3]
+    assert runtime.invalidated is False
+
+
+async def test_storage_authority_loop_invalidates_writer_on_renew_failure(
+    tmp_path: Path,
+) -> None:
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+    runtime = _FakeRuntime(BackendKind.MYSQL)
+    runtime.renew_error = RuntimeError("lease lost")
+    service._storage_runtime = runtime
+    service._stop_event = asyncio.Event()
+    service._storage_factory_settings = replace(
+        service._storage_factory_settings,
+        authority_lease_seconds=3,
+        authority_renew_interval_seconds=1,
+    )
+
+    await service._renew_storage_authority_loop()
+
+    assert runtime.renew_calls == [3]
+    assert runtime.invalidated is True
+    assert service.health()["storage_runtime"]["status"] == "failed"
 
 
 async def test_selected_service_close_releases_runtime_after_flush_failure(
@@ -509,13 +706,14 @@ async def test_selected_service_close_releases_runtime_after_flush_failure(
         "injected life-event append failure" in str(item)
         for item in captured.value.exceptions
     )
+    assert runtimes[0].revoke_calls == 1
     assert runtimes[0].close_calls == 1
     assert service.health()["storage_runtime"]["status"] == "failed"
     await service._close_selected_storage()
     assert runtimes[0].close_calls == 1
 
 
-@pytest.mark.parametrize("backend", [BackendKind.LOCAL, BackendKind.MYSQL])
+@pytest.mark.parametrize("backend", [BackendKind.MYSQL])
 async def test_selected_service_injects_attention_and_clears_only_instance_focus(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -618,11 +816,11 @@ async def test_service_stop_aggregates_consumer_failures_and_closes_runtime_last
     ledger = _FakeLifeEventStore()
     runtimes, _ = _install_selected_factories(
         monkeypatch,
-        BackendKind.LOCAL,
+        BackendKind.MYSQL,
         stores,
         ledger,
     )
-    service = _selected_service(tmp_path, BackendKind.LOCAL)
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
     await service._start_selected_storage()
 
     class _FailingMemoryConsumer:

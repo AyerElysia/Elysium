@@ -161,13 +161,19 @@ class MessageReceiver:
 
         # 1. 更新用户信息
         extra = getattr(message, "extra", {}) or {}
+        identity_resolved = (
+            str(extra.get("identity_resolution_status") or "").strip().lower()
+            != "unresolved"
+        )
         await get_user_query_helper().update_person_info(
             platform=message.platform,
             user_id=message.sender_id,
-            nickname=message.sender_name,
-            cardname=message.sender_cardname,
+            nickname=message.sender_name if identity_resolved else None,
+            cardname=message.sender_cardname if identity_resolved else None,
             canonical_person_key=(
                 str(extra.get("canonical_person_key") or "").strip() or None
+                if identity_resolved
+                else None
             ),
         )
 

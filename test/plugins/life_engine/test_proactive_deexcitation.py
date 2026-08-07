@@ -172,8 +172,11 @@ def test_epistemic_candidate_preserves_source_instance_or_stable_fallback(
     async def _meme() -> str:
         return ""
 
+    async def _prefix() -> str:
+        return ""
+
     service._get_curiosity_engine = lambda: _Generator()
-    service._build_curiosity_prefix_prompt = lambda: ""
+    service._build_curiosity_prefix_prompt = _prefix
     service._build_curiosity_history_text = _history
     service._build_meme_awareness_text = _meme
     service.resolve_consciousness_instance = lambda _stream_id="": resolved_instance_id

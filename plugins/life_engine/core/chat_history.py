@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime
-import math
 from typing import Any
 
 from src.app.plugin_system.base import BaseChatter
@@ -252,19 +252,11 @@ async def collect_global_chat_history_entries_from_db(
     if max_messages is not None and max_messages <= 0:
         return []
 
-    manager = stream_manager
-    if manager is None:
-        try:
-            from src.core.managers import get_stream_manager
-
-            manager = get_stream_manager()
-        except Exception:
-            manager = None
-    if manager is None:
-        return []
+    del stream_manager
 
     try:
-        from src.core.models.sql_alchemy import ChatStreams, Messages
+        from src.core.models.message import MessageType
+        from src.core.models.sql_alchemy import ChatStreams, Messages, PersonInfo
         from src.kernel.db import QueryBuilder
     except Exception:
         return []
@@ -297,9 +289,20 @@ async def collect_global_chat_history_entries_from_db(
         except Exception:
             stream_meta = {}
 
-    converter = getattr(manager, "_db_message_to_runtime", None)
-    if not callable(converter):
-        return []
+    person_ids = {
+        str(getattr(record, "person_id", "") or "")
+        for record in records
+        if str(getattr(record, "person_id", "") or "") not in {"", "bot"}
+    }
+    person_meta: dict[str, Any] = {}
+    if person_ids:
+        try:
+            person_records = await QueryBuilder(PersonInfo).filter(
+                person_id__in=list(person_ids)
+            ).all()
+            person_meta = {str(item.person_id): item for item in person_records}
+        except Exception:
+            person_meta = {}
 
     entries: list[ChatHistoryEntry] = []
     for order, record in enumerate(records):
@@ -307,19 +310,54 @@ async def collect_global_chat_history_entries_from_db(
         if message_id and message_id in excluded:
             continue
 
+        stream_id = str(getattr(record, "stream_id", "") or "")
+        meta = stream_meta.get(stream_id)
+        person_id = str(getattr(record, "person_id", "") or "")
+        person = person_meta.get(person_id)
+        if person_id == "bot":
+            sender_id = "bot"
+            sender_name = "Bot"
+            sender_cardname = ""
+        elif person is not None:
+            sender_id = str(
+                getattr(person, "user_id", "")
+                or getattr(person, "person_id", "")
+                or person_id
+            )
+            sender_name = str(getattr(person, "nickname", "") or sender_id or "未知用户")
+            sender_cardname = str(getattr(person, "cardname", "") or "")
+        else:
+            sender_id = person_id or "system"
+            sender_name = "未知用户" if person_id else "系统"
+            sender_cardname = ""
+
+        normalized_plain_text = getattr(record, "processed_plain_text", None)
+        content = getattr(record, "content", "")
+        if normalized_plain_text is None:
+            normalized_plain_text = str(content)
         try:
-            message = await converter(record)
-        except Exception:
+            message_type = MessageType(str(getattr(record, "message_type", "text")))
+        except ValueError:
             continue
+        message = Message(
+            message_id=message_id,
+            time=getattr(record, "time", 0.0),
+            reply_to=getattr(record, "reply_to", None),
+            content=content,
+            processed_plain_text=str(normalized_plain_text or ""),
+            message_type=message_type,
+            sender_id=sender_id,
+            sender_name=sender_name,
+            sender_cardname=sender_cardname,
+            platform=str(getattr(record, "platform", "") or ""),
+            chat_type=str(getattr(meta, "chat_type", "") or "private"),
+            stream_id=stream_id,
+            raw_data=None,
+            extra={},
+        )
         if not is_visible_chat_history_message(message):
             continue
 
-        stream_id = str(
-            getattr(message, "stream_id", "")
-            or getattr(record, "stream_id", "")
-            or ""
-        )
-        meta = stream_meta.get(stream_id)
         stream_name = ""
         if meta is not None:
             stream_name = str(getattr(meta, "group_name", "") or "").strip()

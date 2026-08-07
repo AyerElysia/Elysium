@@ -284,8 +284,8 @@ WS /api/v1/tabletop/rooms/{room_id}/ws
         callers=_ALL_CALLERS,
         scopes=("tabletop:read", "tabletop:play"),
         resource_authorization="由 engine 按当前 actor、房间成员、角色、阶段和事件 visibility 生成视图",
-        anchor="plugins/werewolf_game/engine.py 与 service.py；需新增 projection、ledger 和 recovery",
-        status="experimental",
+        anchor="plugins/werewolf_game/projections.py、ledger.py、domain.py 与 src/app/api/v1/tabletop.py",
+        status="validated",
     ),
     *_contracts(
         """

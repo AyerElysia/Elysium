@@ -381,19 +381,22 @@ class Bot:
         from src.kernel.db import init_database_from_config
 
         db_cfg = self.config.database
+        global_storage_backend = self.config.storage.backend
+        use_mysql = global_storage_backend == "mysql"
+        core_database_type = "mysql" if use_mysql else "sqlite"
         await init_database_from_config(
-            database_type=db_cfg.database_type,
+            database_type=core_database_type,
             sqlite_path=db_cfg.sqlite_path,
-            postgresql_host=db_cfg.postgresql_host,
-            postgresql_port=db_cfg.postgresql_port,
-            postgresql_database=db_cfg.postgresql_database,
-            postgresql_user=db_cfg.postgresql_user,
-            postgresql_password=db_cfg.postgresql_password,
-            postgresql_schema=db_cfg.postgresql_schema,
-            postgresql_ssl_mode=db_cfg.postgresql_ssl_mode,
-            postgresql_ssl_ca=db_cfg.postgresql_ssl_ca,
-            postgresql_ssl_cert=db_cfg.postgresql_ssl_cert,
-            postgresql_ssl_key=db_cfg.postgresql_ssl_key,
+            mysql_host=db_cfg.mysql_host,
+            mysql_port=db_cfg.mysql_port,
+            mysql_database=db_cfg.mysql_database,
+            mysql_user=db_cfg.mysql_user,
+            mysql_password=db_cfg.mysql_password,
+            mysql_charset=db_cfg.mysql_charset,
+            mysql_ssl_mode=db_cfg.mysql_ssl_mode,
+            mysql_ssl_ca=db_cfg.mysql_ssl_ca,
+            mysql_ssl_cert=db_cfg.mysql_ssl_cert,
+            mysql_ssl_key=db_cfg.mysql_ssl_key,
             connection_pool_size=db_cfg.connection_pool_size,
             connection_timeout=db_cfg.connection_timeout,
             echo=db_cfg.echo,
@@ -636,6 +639,7 @@ class Bot:
                 )
                 from src.app.api.v1.livestream_runtime import MountedLivestreamProvider
                 from src.app.api.v1.mount import mount_api_v1
+                from src.app.api.v1.tabletop_runtime import MountedTabletopProvider
                 from src.app.api.v1.voice_runtime import MountedVoiceCallProvider
 
                 foundation = FoundationProjection(
@@ -660,6 +664,7 @@ class Bot:
                     chat_command_service_factory=create_chat_command_service,
                     livestream_provider=MountedLivestreamProvider(),
                     voice_call_provider=MountedVoiceCallProvider(),
+                    tabletop_provider=MountedTabletopProvider(),
                     task_manager=self.task_manager,
                 )
                 await self.app_api_mount.start()
@@ -1155,11 +1160,11 @@ class Bot:
             ("on_stop", _publish_stop),
             ("stream_loops", _stop_stream_loops),
             ("adapters", _stop_adapters),
+            ("http_server", _stop_http_server),
+            ("app_api_mount", _close_app_api_mount),
             ("plugins", self._unload_all_plugins),
             ("adapters_verify", _verify_adapters_stopped),
             ("scheduler", _stop_scheduler),
-            ("http_server", _stop_http_server),
-            ("app_api_mount", _close_app_api_mount),
             ("mcp", _cleanup_mcp),
             ("watchdog", _stop_watchdog),
             ("tasks", _stop_tasks),

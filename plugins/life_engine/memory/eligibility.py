@@ -149,8 +149,51 @@ def is_eligible_indexed_document_path(file_path: str | Path | None) -> bool:
     return assess_indexed_document_path(file_path).eligible
 
 
+def _open_workspace_document_windows(
+    root: Path,
+    path: str,
+) -> tuple[int, os.stat_result]:
+    """Open a checked workspace file on Windows without opening directories."""
+
+    candidate = root.joinpath(*Path(path).parts)
+    current = root
+    before_path: os.stat_result | None = None
+    for part in Path(path).parts:
+        current = current / part
+        metadata = current.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise OSError("workspace document path contains a symlink")
+        before_path = metadata
+    if before_path is None or not stat.S_ISREG(before_path.st_mode):
+        raise OSError("workspace document is not a regular file")
+    candidate.resolve().relative_to(root)
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
+    file_fd = os.open(candidate, flags)
+    try:
+        opened = os.fstat(file_fd)
+        after_path = candidate.lstat()
+        if stat.S_ISLNK(after_path.st_mode) or not stat.S_ISREG(opened.st_mode):
+            raise OSError("workspace document is not a regular file")
+        if (
+            before_path.st_dev != opened.st_dev
+            or before_path.st_ino != opened.st_ino
+            or after_path.st_dev != opened.st_dev
+            or after_path.st_ino != opened.st_ino
+        ):
+            raise OSError("workspace document changed while opening")
+        candidate.resolve().relative_to(root)
+        return file_fd, opened
+    except BaseException:
+        os.close(file_fd)
+        raise
+
+
 def _open_workspace_document_fd(root: Path, path: str) -> tuple[int, os.stat_result]:
     """Open a canonical relative document without following any symlink."""
+    if os.name == "nt":
+        return _open_workspace_document_windows(root, path)
+
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     cloexec = getattr(os, "O_CLOEXEC", 0)

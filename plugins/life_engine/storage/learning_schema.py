@@ -12,9 +12,14 @@ from src.kernel.storage.migration_runner import (
 )
 
 from .contracts import StorageBackendRuntime, StorageWriterRole
+from .learning_contracts import (
+    LEARNING_WRITER_CLAIM_NAMESPACE,
+    LEARNING_WRITER_CLAIM_STATE_KEY,
+)
 from .models import BackendKind
+from .writer_claims import ensure_singleton_writer_claim_schema
 
-LEARNING_SCHEMA_VERSION = 1
+LEARNING_SCHEMA_VERSION = 2
 
 LOCAL_LEARNING_SCHEMA_STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS learning_events (
@@ -129,6 +134,101 @@ _MYSQL_IMMUTABILITY_TRIGGERS = (
 )
 
 
+def _mysql_learning_claim_guard(
+    *,
+    trigger_name: str,
+    table_name: str,
+    operation: str,
+) -> str:
+    return f"""CREATE TRIGGER IF NOT EXISTS {trigger_name}
+        BEFORE {operation} ON {table_name} FOR EACH ROW
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM runtime_singleton_writer_claims c
+                WHERE c.namespace = '{LEARNING_WRITER_CLAIM_NAMESPACE}'
+                    AND c.state_key = '{LEARNING_WRITER_CLAIM_STATE_KEY}'
+            ) AND NOT EXISTS (
+                SELECT 1
+                FROM runtime_singleton_writer_claims c
+                INNER JOIN runtime_singleton_writer_bindings b
+                    ON b.generation_id = c.generation_id
+                    AND b.namespace = c.namespace
+                    AND b.state_key = c.state_key
+                    AND b.owner_instance_id = c.owner_instance_id
+                    AND b.lease_epoch = c.lease_epoch
+                    AND b.fencing_token_sha256 = c.fencing_token_sha256
+                WHERE b.connection_id = CONNECTION_ID()
+                    AND c.namespace = '{LEARNING_WRITER_CLAIM_NAMESPACE}'
+                    AND c.state_key = '{LEARNING_WRITER_CLAIM_STATE_KEY}'
+                    AND c.released_at IS NULL
+                    AND c.lease_until > CURRENT_TIMESTAMP(6)
+            ) THEN
+                SIGNAL SQLSTATE '45000'
+                    SET MESSAGE_TEXT = 'LearningSingletonWriterClaimRequired';
+            END IF;
+        END"""
+
+
+MYSQL_LEARNING_CLAIM_GUARD_MIGRATION = SchemaMigration(
+    version=2,
+    name="life_learning_singleton_claim_guard_v2",
+    statements=(
+        _mysql_learning_claim_guard(
+            trigger_name="learning_events_singleton_claim_insert_v2",
+            table_name="learning_events",
+            operation="INSERT",
+        ),
+        _mysql_learning_claim_guard(
+            trigger_name="learning_projections_singleton_claim_insert_v2",
+            table_name="learning_projections",
+            operation="INSERT",
+        ),
+        _mysql_learning_claim_guard(
+            trigger_name="learning_projections_singleton_claim_update_v2",
+            table_name="learning_projections",
+            operation="UPDATE",
+        ),
+        _mysql_learning_claim_guard(
+            trigger_name="learning_projections_singleton_claim_delete_v2",
+            table_name="learning_projections",
+            operation="DELETE",
+        ),
+    ),
+)
+
+MYSQL_LEARNING_CLAIM_GUARD_TRIGGERS = tuple(
+    MySQLTriggerContract(
+        trigger_name,
+        table_name,
+        operation,
+        "BEFORE",
+        "LearningSingletonWriterClaimRequired",
+    )
+    for trigger_name, table_name, operation in (
+        (
+            "learning_events_singleton_claim_insert_v2",
+            "learning_events",
+            "INSERT",
+        ),
+        (
+            "learning_projections_singleton_claim_insert_v2",
+            "learning_projections",
+            "INSERT",
+        ),
+        (
+            "learning_projections_singleton_claim_update_v2",
+            "learning_projections",
+            "UPDATE",
+        ),
+        (
+            "learning_projections_singleton_claim_delete_v2",
+            "learning_projections",
+            "DELETE",
+        ),
+    )
+)
+
+
 async def ensure_learning_schema(
     runtime: StorageBackendRuntime,
     *,
@@ -145,6 +245,8 @@ async def ensure_learning_schema(
         raise RuntimeError(
             "Learning database immutability may be relaxed only for candidate copy"
         )
+    if require_database_immutability:
+        await ensure_singleton_writer_claim_schema(runtime)
     await runtime.validate_writer()
     if runtime.backend == BackendKind.MYSQL:
         if require_database_immutability:
@@ -153,10 +255,15 @@ async def ensure_learning_schema(
                 table_name="life_learning_schema_migrations",
                 lock_name="elysium:life-learning-schema",
             )
-            await runner.apply((_MYSQL_SCHEMA_MIGRATION,))
+            await runner.apply(
+                (
+                    _MYSQL_SCHEMA_MIGRATION,
+                    MYSQL_LEARNING_CLAIM_GUARD_MIGRATION,
+                )
+            )
             await verify_mysql_trigger_contract(
                 runtime.engine,
-                _MYSQL_IMMUTABILITY_TRIGGERS,
+                _MYSQL_IMMUTABILITY_TRIGGERS + MYSQL_LEARNING_CLAIM_GUARD_TRIGGERS,
             )
         else:
             runner = MySQLMigrationRunner(
@@ -172,8 +279,26 @@ async def ensure_learning_schema(
     await runtime.validate_writer()
 
 
+async def verify_learning_writer_claim_guard(
+    runtime: StorageBackendRuntime,
+) -> None:
+    """Fail closed when a claimed MySQL Learning writer lacks DB triggers."""
+
+    if not runtime.enabled or runtime.engine is None:
+        raise RuntimeError("learning writer guard requires an enabled storage runtime")
+    if runtime.backend != BackendKind.MYSQL:
+        return
+    await verify_mysql_trigger_contract(
+        runtime.engine,
+        MYSQL_LEARNING_CLAIM_GUARD_TRIGGERS,
+    )
+
+
 __all__ = [
     "LEARNING_SCHEMA_VERSION",
     "LOCAL_LEARNING_SCHEMA_STATEMENTS",
+    "MYSQL_LEARNING_CLAIM_GUARD_MIGRATION",
+    "MYSQL_LEARNING_CLAIM_GUARD_TRIGGERS",
     "ensure_learning_schema",
+    "verify_learning_writer_claim_guard",
 ]

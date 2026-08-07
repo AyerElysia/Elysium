@@ -1,7 +1,13 @@
-"""表情包候选感知、主体收藏、检索与发送服务。
+"""emoji_sender 服务实现。
 
-后台 VLM 只登记客观候选，不决定主体是否喜欢或收藏。收藏与跳过必须
-通过主体可见工具显式发生；旧自动人格判定入口保留为 fail-closed 兼容面。
+- 定时入库：从主程序 media cache 抽取表情包，VLM 决策是否收藏并输出标注
+- 收藏入库：复制源文件到插件 data 目录，并把描述 embedding 写入插件自有向量库
+- 检索发送：按情感 tag 过滤后，向量检索 topN 并在阈值内按温度采样表情包
+
+约束：
+- persona 提示词来自主配置 `get_core_config().personality`
+- 情感 tag 预设为插件内置常量，不进入配置
+- 每次入库任务开头固定执行 data_dir ↔ 向量库记录对齐
 """
 
 from __future__ import annotations
@@ -26,8 +32,9 @@ from src.app.plugin_system.api.llm_api import (
 )
 from src.app.plugin_system.api.send_api import send_emoji
 from src.core.components.base.service import BaseService
-from src.core.utils.base64_helper import base64_encode_bytes
+from src.core.config import get_core_config
 from src.kernel.concurrency import get_task_manager
+from src.core.utils.base64_helper import base64_encode_bytes
 from src.kernel.logger import get_logger
 from src.kernel.vector_db import get_vector_db_service
 
@@ -465,12 +472,25 @@ class EmojiSenderService(BaseService):
     
     @staticmethod
     def _build_persona_prompt():
-        """拒绝重新启用已退役的配置人格旁路。"""
+        """从主配置人格字段组装 persona 指令片段。"""
+        p = get_core_config().personality
 
-        raise RuntimeError(
-            "LegacyEmojiPersonaSourceRetired: background perception may only "
-            "produce objective candidates"
-        )
+        alias = "、".join(p.alias_names) if p.alias_names else ""
+        safety = "\n".join(f"- {x}" for x in (p.safety_guidelines or []))
+        negatives = "\n".join(f"- {x}" for x in (p.negative_behaviors or []))
+
+        parts = [
+            f"你的昵称：{p.nickname}",
+            f"你的别名：{alias}" if alias else "",
+            f"核心人格：{p.personality_core}",
+            f"人格侧面：{p.personality_side}" if p.personality_side else "",
+            f"身份：{p.identity}",
+            f"背景故事（不应主动复述）：{p.background_story}" if p.background_story else "",
+            f"回复风格：{p.reply_style}",
+            "安全与互动底线：\n" + safety if safety else "",
+            "禁止行为：\n" + negatives if negatives else "",
+        ]
+        return "\n".join([x for x in parts if x])
 
     @staticmethod
     def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -718,17 +738,10 @@ class EmojiSenderService(BaseService):
         }
 
     async def ingest_once(self) -> None:
-        """拒绝旧的自动人格判定收藏入口。
+        """执行一次入库任务。
 
-        调用方应使用 ``perception_scan`` 登记候选，再由 active consciousness
-        通过收藏工具作出显式选择。保留方法名只为让旧调用明确失败。
+        流程：对齐 → 【优先手动目录 或 随机抽取】 → 去重检查 → 图片压缩 → VLM 决策+标注 → 复制 → embedding → 写入向量库。
         """
-        raise RuntimeError(
-            "AutomaticEmojiCollectionRetired: use perception_scan and explicit "
-            "nucleus_collect_meme"
-        )
-
-        # 以下旧实现暂留作历史兼容参考，永远不会在 fail-closed 门之后执行。
         if _INGEST_LOCK.locked():
             logger.debug("上一轮入库尚未结束，跳过本轮")
             return

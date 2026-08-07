@@ -42,6 +42,28 @@ class SessionRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class CredentialRecord:
+    """不含 secret/hash 的服务凭据投影。"""
+
+    credential_id: str
+    actor_id: str
+    audience: str
+    role: str
+    scopes: tuple[str, ...]
+    resource_grants: tuple[str, ...]
+    created_at: datetime
+    revoked_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedSessionRecord:
+    """管理面使用的会话投影，补充创建时间。"""
+
+    session: SessionRecord
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class TicketRecord:
     """绑定到 session、资源和 Origin 的单次 ticket。"""
 
@@ -174,6 +196,85 @@ class AuthStore:
                 ),
             )
         return credential_id
+
+    def list_credentials(self, *, limit: int = 200) -> tuple[CredentialRecord, ...]:
+        """返回不含 secret/hash 的有界凭据投影。"""
+
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM api_credentials ORDER BY created_at DESC LIMIT ?",
+                (max(1, min(200, int(limit))),),
+            ).fetchall()
+        return tuple(self._row_to_credential(row) for row in rows)
+
+    def get_credential(self, credential_id: str) -> CredentialRecord:
+        """读取一个不含 secret/hash 的凭据投影。"""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM api_credentials WHERE credential_id = ?",
+                (credential_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError("credential_not_found")
+        return self._row_to_credential(row)
+
+    def create_credential_secret(
+        self,
+        *,
+        actor_id: str,
+        scopes: Iterable[str],
+        resource_grants: Iterable[str] = (),
+    ) -> tuple[CredentialRecord, str]:
+        """创建 service credential，并只返回一次明文 secret。"""
+
+        secret = f"elysium_{secrets.token_urlsafe(32)}"
+        credential_id = self.add_credential(
+            actor_id=actor_id,
+            audience=PLATFORM_SERVICE_AUDIENCE,
+            role="platform_service",
+            secret=secret,
+            scopes=scopes,
+            resource_grants=resource_grants,
+        )
+        return self.get_credential(credential_id), secret
+
+    def rotate_credential_secret(
+        self, credential_id: str
+    ) -> tuple[CredentialRecord, str]:
+        """撤销旧凭据并创建新身份；旧 session 随之失效。"""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM api_credentials WHERE credential_id = ?",
+                (credential_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError("credential_not_found")
+        if row["revoked_at"] is not None:
+            raise ValueError("credential_revoked")
+        self.revoke_credential(credential_id)
+        return self.create_credential_secret(
+            actor_id=row["actor_id"],
+            scopes=self._decode_values(row["scopes_json"]),
+            resource_grants=self._decode_values(row["resource_grants_json"]),
+        )
+
+    def list_sessions(self, *, limit: int = 200) -> tuple[ManagedSessionRecord, ...]:
+        """返回不含 access/refresh token 的会话投影。"""
+
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM api_sessions ORDER BY created_at DESC LIMIT ?",
+                (max(1, min(200, int(limit))),),
+            ).fetchall()
+        return tuple(
+            ManagedSessionRecord(
+                session=self._row_to_session(row),
+                created_at=self._parse_time(row["created_at"]),
+            )
+            for row in rows
+        )
 
     def revoke_credential(self, credential_id: str) -> bool:
         """撤销服务凭据，并使其派生的现有 session 立即失效。"""
@@ -688,6 +789,20 @@ class AuthStore:
         if unknown:
             raise ValueError(f"unknown_scope:{','.join(sorted(unknown))}")
         return normalized
+
+    def _row_to_credential(self, row: sqlite3.Row) -> CredentialRecord:
+        return CredentialRecord(
+            credential_id=row["credential_id"],
+            actor_id=row["actor_id"],
+            audience=row["audience"],
+            role=row["role"],
+            scopes=self._decode_values(row["scopes_json"]),
+            resource_grants=self._decode_values(row["resource_grants_json"]),
+            created_at=self._parse_time(row["created_at"]),
+            revoked_at=(
+                self._parse_time(row["revoked_at"]) if row["revoked_at"] else None
+            ),
+        )
 
     def _row_to_session(self, row: sqlite3.Row) -> SessionRecord:
         return SessionRecord(

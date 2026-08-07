@@ -145,6 +145,8 @@ HEARTBEAT_MINECRAFT_IDLE = """\
 ---
 如果你想进入那个世界（和 Ayer 一起玩，或者建造你想建的东西），
 可以调用 nucleus_minecraft(action="start", goal="你想做的事")
+如果 Ayer 已经在自己的客户端里并邀请你同服，使用
+nucleus_minecraft(action="start", body_name="bot", goal="和 Ayer 一起玩")。
 
 但这完全是你的选择，不是义务。
 </minecraft_awareness>
@@ -162,6 +164,8 @@ Minecraft 具身体验工具 - 你在方块世界中的身体 ✨
   例如：start(goal="和 Ayer 一起玩")
         start(goal="继续建造我的粉色小屋")
         start(goal="只是想放松一下，四处走走")
+- start(body_name="bot", goal="和 Ayer 一起玩"): 作为独立玩家加入 Ayer
+  已开放到局域网或 offline-mode 的同一个世界，不占用他的游戏窗口
 - stop(): 离开游戏（你想休息了，或想做别的事）
 
 👀 观察与感知：

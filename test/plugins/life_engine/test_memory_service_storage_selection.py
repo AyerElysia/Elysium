@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -10,7 +11,17 @@ import pytest
 
 from plugins.life_engine.memory.service import LifeMemoryService
 from plugins.life_engine.storage.memory import MemoryStorageBundle
+from plugins.life_engine.storage.memory.mysql import MySQLMemoryReadinessProbeError
 from plugins.life_engine.storage.models import BackendKind, StorageAvailability
+
+_MEMORY_DOMAINS = (
+    "document_index",
+    "experiences",
+    "witnesses",
+    "living",
+    "epistemic",
+    "legacy_graph",
+)
 
 
 class _AvailablePort:
@@ -19,8 +30,10 @@ class _AvailablePort:
         availability: StorageAvailability = StorageAvailability.HEALTHY,
     ) -> None:
         self._availability = availability
+        self.availability_calls = 0
 
     async def availability(self) -> StorageAvailability:
+        self.availability_calls += 1
         return self._availability
 
 
@@ -28,14 +41,65 @@ class _InjectedRuntime:
     enabled = True
     backend = BackendKind.MYSQL
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        health_status: str = "healthy",
+        health_error: Exception | None = None,
+        health_delay: float = 0.0,
+    ) -> None:
         self.close_calls = 0
+        self.health_calls = 0
+        self.health_status = health_status
+        self.health_error = health_error
+        self.health_delay = health_delay
 
     async def close(self) -> None:
         self.close_calls += 1
 
     async def health(self) -> dict[str, Any]:
-        return {"status": "healthy", "backend": "mysql"}
+        self.health_calls += 1
+        if self.health_delay:
+            await asyncio.sleep(self.health_delay)
+        if self.health_error is not None:
+            raise self.health_error
+        return {"status": self.health_status, "backend": "mysql"}
+
+
+class _ConcurrentDocumentIndex(_AvailablePort):
+    def __init__(self) -> None:
+        super().__init__()
+        self.active_writes = 0
+        self.max_active_writes = 0
+        self.upsert_calls = 0
+
+    async def list_indexed_documents(self) -> list[Any]:
+        return []
+
+    async def upsert_document(self, *_args: Any, **_kwargs: Any) -> None:
+        self.upsert_calls += 1
+        self.active_writes += 1
+        self.max_active_writes = max(self.max_active_writes, self.active_writes)
+        try:
+            await asyncio.sleep(0.01)
+        finally:
+            self.active_writes -= 1
+
+    async def mark_documents_deleted(self, _node_ids: Any) -> int:
+        return 0
+
+
+class _RecoveryLiving(_AvailablePort):
+    async def list_artifact_heads(self) -> list[Any]:
+        return []
+
+    async def append_artifact(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+class _RecoveryLegacyGraph(_AvailablePort):
+    async def prune_orphan_edges(self) -> int:
+        return 0
 
 
 def _bundle(
@@ -51,6 +115,17 @@ def _bundle(
         living=port,  # type: ignore[arg-type]
         epistemic=port,  # type: ignore[arg-type]
         legacy_graph=port,  # type: ignore[arg-type]
+    )
+
+
+@pytest.fixture(autouse=True)
+def _healthy_mysql_readiness(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _inspect(_runtime: Any) -> dict[str, StorageAvailability]:
+        return {name: StorageAvailability.HEALTHY for name in _MEMORY_DOMAINS}
+
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.inspect_mysql_memory_readiness",
+        _inspect,
     )
 
 
@@ -98,9 +173,13 @@ async def test_mysql_service_never_opens_sqlite_and_never_closes_shared_runtime(
 
     await service.initialize()
     assert service.available is True
+    assert runtime.health_calls == 1
+    assert stores.document_index.availability_calls == 0
     assert service._db is None
     assert not (tmp_path / ".memory" / "memory.db").exists()
     assert (await service.health_snapshot())["backend"] == "mysql"
+    assert runtime.health_calls == 2
+    assert stores.document_index.availability_calls == 0
 
     await service.close()
     await service.close()
@@ -108,14 +187,240 @@ async def test_mysql_service_never_opens_sqlite_and_never_closes_shared_runtime(
 
 
 @pytest.mark.asyncio
-async def test_backend_failure_is_fail_closed_and_preserves_runtime_owner(
+async def test_mysql_workspace_recovery_does_not_block_plugin_availability(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = _InjectedRuntime()
+    started = asyncio.Event()
+    release = asyncio.Event()
 
     async def _open_mysql(*_args: Any, **_kwargs: Any) -> MemoryStorageBundle:
-        return _bundle(availability=StorageAvailability.FAILED)
+        return _bundle()
+
+    async def _blocking_recovery() -> None:
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.open_mysql_memory_storage",
+        _open_mysql,
+    )
+    service = LifeMemoryService(
+        tmp_path,
+        vector_backend_enabled=False,
+        storage_runtime=runtime,  # type: ignore[arg-type]
+        selectable_storage_enabled=True,
+    )
+    monkeypatch.setattr(service, "_startup_recovery", _blocking_recovery)
+
+    await asyncio.wait_for(service.initialize(), timeout=1.0)
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+
+    assert service.available is True
+    assert service._startup_recovery_task is not None
+    assert not service._startup_recovery_task.done()
+    snapshot = await service.health_snapshot()
+    assert snapshot["status"] == "degraded"
+    assert snapshot["startup_recovery"]["status"] == "running"
+
+    release.set()
+    await asyncio.wait_for(service._startup_recovery_task, timeout=1.0)
+    assert service._startup_recovery_progress.status == "completed"
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_mysql_workspace_recovery_uses_bounded_write_concurrency(
+    tmp_path: Path,
+) -> None:
+    for index in range(24):
+        path = tmp_path / "notes" / f"recovery-{index:02d}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"workspace memory {index}", encoding="utf-8")
+
+    document_index = _ConcurrentDocumentIndex()
+    passive = _AvailablePort()
+    storage = MemoryStorageBundle(
+        backend=BackendKind.MYSQL,
+        document_index=document_index,  # type: ignore[arg-type]
+        experiences=passive,  # type: ignore[arg-type]
+        witnesses=passive,  # type: ignore[arg-type]
+        living=_RecoveryLiving(),  # type: ignore[arg-type]
+        epistemic=passive,  # type: ignore[arg-type]
+        legacy_graph=_RecoveryLegacyGraph(),  # type: ignore[arg-type]
+    )
+    service = LifeMemoryService(
+        tmp_path,
+        vector_backend_enabled=False,
+        memory_storage=storage,
+    )
+
+    await service.initialize()
+    task = service._startup_recovery_task
+    assert task is not None
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert document_index.upsert_calls == 24
+    assert 1 < document_index.max_active_writes <= 8
+    assert service._startup_recovery_progress.processed_documents == 24
+    assert service._startup_recovery_progress.artifact_processed == 24
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_mysql_workspace_recovery_is_single_flight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _InjectedRuntime()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    recovery_calls = 0
+
+    async def _open_mysql(*_args: Any, **_kwargs: Any) -> MemoryStorageBundle:
+        return _bundle()
+
+    async def _blocking_recovery() -> None:
+        nonlocal recovery_calls
+        recovery_calls += 1
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.open_mysql_memory_storage",
+        _open_mysql,
+    )
+    service = LifeMemoryService(
+        tmp_path,
+        vector_backend_enabled=False,
+        storage_runtime=runtime,  # type: ignore[arg-type]
+        selectable_storage_enabled=True,
+    )
+    monkeypatch.setattr(service, "_startup_recovery", _blocking_recovery)
+
+    await service.initialize()
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    task = service._startup_recovery_task
+    await service.initialize()
+
+    assert recovery_calls == 1
+    assert service._startup_recovery_task is task
+    release.set()
+    assert task is not None
+    await asyncio.wait_for(task, timeout=1.0)
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_and_joins_mysql_workspace_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _InjectedRuntime()
+    started = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def _open_mysql(*_args: Any, **_kwargs: Any) -> MemoryStorageBundle:
+        return _bundle()
+
+    async def _blocking_recovery() -> None:
+        started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.open_mysql_memory_storage",
+        _open_mysql,
+    )
+    service = LifeMemoryService(
+        tmp_path,
+        vector_backend_enabled=False,
+        storage_runtime=runtime,  # type: ignore[arg-type]
+        selectable_storage_enabled=True,
+    )
+    monkeypatch.setattr(service, "_startup_recovery", _blocking_recovery)
+
+    await service.initialize()
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.wait_for(service.close(), timeout=1.0)
+
+    assert finished.is_set()
+    assert service._startup_recovery_task is None
+    assert service._startup_recovery_progress.status == "cancelled"
+    assert service.available is False
+
+
+@pytest.mark.asyncio
+async def test_mysql_recovery_failure_is_content_free_degraded_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _InjectedRuntime()
+    secret = "mysql://elysia:do-not-leak@localhost/life"
+
+    async def _open_mysql(*_args: Any, **_kwargs: Any) -> MemoryStorageBundle:
+        return _bundle()
+
+    async def _failed_recovery() -> None:
+        raise OSError(secret)
+
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.open_mysql_memory_storage",
+        _open_mysql,
+    )
+    service = LifeMemoryService(
+        tmp_path,
+        vector_backend_enabled=False,
+        storage_runtime=runtime,  # type: ignore[arg-type]
+        selectable_storage_enabled=True,
+    )
+    monkeypatch.setattr(service, "_startup_recovery", _failed_recovery)
+
+    await service.initialize()
+    task = service._startup_recovery_task
+    assert task is not None
+    await asyncio.wait_for(task, timeout=1.0)
+    snapshot = await service.health_snapshot()
+
+    assert service.available is True
+    assert snapshot["status"] == "degraded"
+    assert snapshot["startup_recovery"]["status"] == "failed"
+    assert snapshot["startup_recovery"]["error_type"] == "OSError"
+    assert secret not in str(snapshot)
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_local_recovery_failure_still_fails_initialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = LifeMemoryService(tmp_path, vector_backend_enabled=False)
+
+    async def _failed_recovery() -> None:
+        raise RuntimeError("projection failed")
+
+    monkeypatch.setattr(service, "_startup_recovery", _failed_recovery)
+
+    with pytest.raises(RuntimeError, match="projection failed"):
+        await service.initialize()
+
+    assert service.available is False
+    assert service._startup_recovery_progress.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_backend_failure_is_fail_closed_and_preserves_runtime_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _InjectedRuntime(health_status="failed")
+
+    async def _open_mysql(*_args: Any, **_kwargs: Any) -> MemoryStorageBundle:
+        return _bundle()
 
     monkeypatch.setattr(
         "plugins.life_engine.memory.service.open_mysql_memory_storage",
@@ -128,13 +433,300 @@ async def test_backend_failure_is_fail_closed_and_preserves_runtime_owner(
         selectable_storage_enabled=True,
     )
 
-    with pytest.raises(RuntimeError, match="MemoryBackendUnavailable"):
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "MemoryBackendUnavailable:shared_runtime=failed,"
+            "error_type=Unavailable"
+        ),
+    ):
         await service.initialize()
 
     assert service.available is False
     assert service._db is None
     assert not (tmp_path / ".memory" / "memory.db").exists()
     assert runtime.close_calls == 0
+    assert runtime.health_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_degraded_shared_runtime_still_requires_one_readiness_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _InjectedRuntime(health_status="degraded")
+    readiness_calls = 0
+
+    async def _open_mysql(*_args: Any, **_kwargs: Any) -> MemoryStorageBundle:
+        return _bundle()
+
+    async def _inspect(_runtime: Any) -> dict[str, StorageAvailability]:
+        nonlocal readiness_calls
+        readiness_calls += 1
+        return {name: StorageAvailability.HEALTHY for name in _MEMORY_DOMAINS}
+
+    async def _skip_recovery() -> None:
+        return None
+
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.open_mysql_memory_storage",
+        _open_mysql,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.inspect_mysql_memory_readiness",
+        _inspect,
+    )
+    service = LifeMemoryService(
+        tmp_path,
+        vector_backend_enabled=False,
+        storage_runtime=runtime,  # type: ignore[arg-type]
+        selectable_storage_enabled=True,
+    )
+    monkeypatch.setattr(service, "_startup_recovery", _skip_recovery)
+
+    await service.initialize()
+
+    assert runtime.health_calls == 1
+    assert readiness_calls == 1
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_shared_runtime_failure_is_content_free_and_skips_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "mysql://elysia:do-not-leak@localhost/life"
+    runtime = _InjectedRuntime(health_error=OSError(secret))
+    readiness_calls = 0
+
+    async def _open_mysql(*_args: Any, **_kwargs: Any) -> MemoryStorageBundle:
+        return _bundle()
+
+    async def _inspect(_runtime: Any) -> dict[str, StorageAvailability]:
+        nonlocal readiness_calls
+        readiness_calls += 1
+        return {name: StorageAvailability.HEALTHY for name in _MEMORY_DOMAINS}
+
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.open_mysql_memory_storage",
+        _open_mysql,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.inspect_mysql_memory_readiness",
+        _inspect,
+    )
+    service = LifeMemoryService(
+        tmp_path,
+        vector_backend_enabled=False,
+        storage_runtime=runtime,  # type: ignore[arg-type]
+        selectable_storage_enabled=True,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        await service.initialize()
+
+    assert str(raised.value) == (
+        "MemoryBackendUnavailable:shared_runtime=failed,error_type=OSError"
+    )
+    assert secret not in str(raised.value)
+    assert readiness_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_shared_runtime_probe_has_one_total_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _InjectedRuntime(health_delay=0.2)
+
+    async def _open_mysql(*_args: Any, **_kwargs: Any) -> MemoryStorageBundle:
+        return _bundle()
+
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.open_mysql_memory_storage",
+        _open_mysql,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service._MYSQL_MEMORY_STARTUP_PROBE_TIMEOUT_SECONDS",
+        0.01,
+    )
+    service = LifeMemoryService(
+        tmp_path,
+        vector_backend_enabled=False,
+        storage_runtime=runtime,  # type: ignore[arg-type]
+        selectable_storage_enabled=True,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        await service.initialize()
+
+    assert str(raised.value) == (
+        "MemoryBackendUnavailable:shared_runtime=failed,error_type=TimeoutError"
+    )
+    assert runtime.health_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_shared_runtime_probe_propagates_cancellation_without_orphan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _InjectedRuntime()
+    started = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def _open_mysql(*_args: Any, **_kwargs: Any) -> MemoryStorageBundle:
+        return _bundle()
+
+    async def _blocking_health() -> dict[str, Any]:
+        runtime.health_calls += 1
+        started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            finished.set()
+        return {"status": "healthy"}
+
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.open_mysql_memory_storage",
+        _open_mysql,
+    )
+    monkeypatch.setattr(runtime, "health", _blocking_health)
+    service = LifeMemoryService(
+        tmp_path,
+        vector_backend_enabled=False,
+        storage_runtime=runtime,  # type: ignore[arg-type]
+        selectable_storage_enabled=True,
+    )
+
+    initialize_task = asyncio.create_task(service.initialize())
+    await started.wait()
+    initialize_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await initialize_task
+
+    assert initialize_task.done()
+    assert finished.is_set()
+    assert runtime.health_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_readiness_failure_names_only_the_missing_domain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _InjectedRuntime()
+
+    async def _open_mysql(*_args: Any, **_kwargs: Any) -> MemoryStorageBundle:
+        return _bundle()
+
+    async def _inspect(_runtime: Any) -> dict[str, StorageAvailability]:
+        result = {name: StorageAvailability.HEALTHY for name in _MEMORY_DOMAINS}
+        result["epistemic"] = StorageAvailability.FAILED
+        return result
+
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.open_mysql_memory_storage",
+        _open_mysql,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.inspect_mysql_memory_readiness",
+        _inspect,
+    )
+    service = LifeMemoryService(
+        tmp_path,
+        vector_backend_enabled=False,
+        storage_runtime=runtime,  # type: ignore[arg-type]
+        selectable_storage_enabled=True,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        await service.initialize()
+
+    assert str(raised.value) == "MemoryBackendUnavailable:epistemic=failed"
+    assert runtime.health_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_readiness_probe_error_is_content_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _InjectedRuntime()
+
+    async def _open_mysql(*_args: Any, **_kwargs: Any) -> MemoryStorageBundle:
+        return _bundle()
+
+    async def _inspect(_runtime: Any) -> dict[str, StorageAvailability]:
+        raise MySQLMemoryReadinessProbeError("OperationalError")
+
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.open_mysql_memory_storage",
+        _open_mysql,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.inspect_mysql_memory_readiness",
+        _inspect,
+    )
+    service = LifeMemoryService(
+        tmp_path,
+        vector_backend_enabled=False,
+        storage_runtime=runtime,  # type: ignore[arg-type]
+        selectable_storage_enabled=True,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        await service.initialize()
+
+    assert str(raised.value) == (
+        "MemoryBackendUnavailable:shared_runtime=failed,"
+        "error_type=OperationalError"
+    )
+
+
+@pytest.mark.asyncio
+async def test_new_service_initialization_rechecks_same_runtime_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _InjectedRuntime()
+    readiness_calls = 0
+
+    async def _open_mysql(*_args: Any, **_kwargs: Any) -> MemoryStorageBundle:
+        return _bundle()
+
+    async def _inspect(_runtime: Any) -> dict[str, StorageAvailability]:
+        nonlocal readiness_calls
+        readiness_calls += 1
+        return {name: StorageAvailability.HEALTHY for name in _MEMORY_DOMAINS}
+
+    async def _skip_recovery() -> None:
+        return None
+
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.open_mysql_memory_storage",
+        _open_mysql,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.inspect_mysql_memory_readiness",
+        _inspect,
+    )
+
+    for _ in range(2):
+        service = LifeMemoryService(
+            tmp_path,
+            vector_backend_enabled=False,
+            storage_runtime=runtime,  # type: ignore[arg-type]
+            selectable_storage_enabled=True,
+        )
+        monkeypatch.setattr(service, "_startup_recovery", _skip_recovery)
+        await service.initialize()
+        await service.close()
+
+    assert runtime.health_calls == 2
+    assert readiness_calls == 2
 
 
 @pytest.mark.asyncio
@@ -179,6 +771,7 @@ async def test_memory_integration_consumes_owner_runtime_without_opening_another
 
     class _Owner:
         _memory_service = None
+        _selectable_storage_enabled = True
 
         @property
         def storage_runtime(self) -> _InjectedRuntime:
@@ -189,7 +782,6 @@ async def test_memory_integration_consumes_owner_runtime_without_opening_another
             return SimpleNamespace(
                 settings=SimpleNamespace(workspace_path=str(tmp_path)),
                 memory_index=SimpleNamespace(backend_enabled=False),
-                storage=SimpleNamespace(enabled=True),
             )
 
     owner = _Owner()

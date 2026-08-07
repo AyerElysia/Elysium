@@ -48,6 +48,13 @@ def _config(tmp_path: Path, *, minecraft: bool, learning: bool = True) -> LifeEn
     return config
 
 
+def _write_subject_authority(tmp_path: Path) -> None:
+    """Create the complete test-only authority required by service startup."""
+
+    for name in ("SOUL.md", "USER.md", "MEMORY.md"):
+        (tmp_path / name).write_text(name, encoding="utf-8")
+
+
 def test_minecraft_tool_registration_follows_minecraft_config(tmp_path: Path) -> None:
     enabled = LifeEnginePlugin(_config(tmp_path, minecraft=True)).get_components()
     disabled = LifeEnginePlugin(_config(tmp_path, minecraft=False)).get_components()
@@ -88,8 +95,11 @@ async def test_minecraft_session_initializes_when_learning_is_disabled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _write_subject_authority(tmp_path)
     config = _config(tmp_path, minecraft=True, learning=False)
     config.autonomy.enabled = False
+    config.streams.enabled = False
+    config.drives.enabled = False
     config.memory_index.enabled = False
     config.memory_witness.enabled = False
     service = LifeEngineService(_DummyPlugin(config))

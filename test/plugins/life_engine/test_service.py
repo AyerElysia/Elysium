@@ -29,12 +29,20 @@ from plugins.life_engine.service.perception_gateway import (
     PerceptionDeliveryReceipt,
     PerceptionDeliveryUnverified,
 )
+from src.core.config.core_config import CoreConfig
 from src.kernel.llm import ROLE, ToolRegistry
 
 
 @dataclass
 class _DummyPlugin:
     config: object
+    global_storage_config: CoreConfig | None = None
+
+    def __post_init__(self) -> None:
+        if self.global_storage_config is None:
+            self.global_storage_config = CoreConfig(
+                storage=CoreConfig.StorageSection(backend="local")
+            )
 
 
 class _FakeResponse:
@@ -49,7 +57,15 @@ def _make_service(tmp_path: Path) -> LifeEngineService:
     config = LifeEngineConfig()
     config.settings.enabled = True
     config.settings.workspace_path = str(tmp_path)
-    return LifeEngineService(_DummyPlugin(config=config))
+    plugin = _DummyPlugin(config=config)
+    return LifeEngineService(plugin)
+
+
+def _write_subject_authority(tmp_path: Path) -> None:
+    """Create a complete local authority fixture for lifecycle tests."""
+
+    for name in ("SOUL.md", "USER.md", "MEMORY.md"):
+        (tmp_path / name).write_text(name, encoding="utf-8")
 
 
 def _heartbeat_result(text: str, world_perception: Any) -> HeartbeatModelResult:
@@ -90,6 +106,30 @@ def test_memory_service_property_aliases_private_field(tmp_path: Path) -> None:
     assert service.memory_service is sentinel
 
 
+async def test_learning_maintenance_failure_does_not_escape_main_heartbeat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Derived learning failure must not replace the heartbeat model result."""
+
+    service = _make_service(tmp_path)
+
+    class _FailingLearningScheduler:
+        async def on_heartbeat(self) -> None:
+            raise RuntimeError("selected learning persistence failed closed")
+
+    messages: list[str] = []
+    service._learning_scheduler = _FailingLearningScheduler()  # type: ignore[assignment]
+    monkeypatch.setattr(
+        "plugins.life_engine.service.core.logger.debug",
+        messages.append,
+    )
+
+    await service._run_learning_heartbeat_maintenance()
+
+    assert messages == ["学习系统心跳异常: RuntimeError"]
+
+
 def test_cfg_auto_migrates_legacy_config_without_thresholds(tmp_path: Path) -> None:
     """旧版配置对象缺少 thresholds 时，_cfg 应自动迁移为新结构。"""
 
@@ -124,7 +164,7 @@ def test_cfg_auto_migrates_legacy_config_without_thresholds(tmp_path: Path) -> N
     assert isinstance(plugin.config, LifeEngineConfig)
 
 
-def test_heartbeat_system_prompt_filters_memory_sections(tmp_path: Path) -> None:
+async def test_heartbeat_system_prompt_filters_memory_sections(tmp_path: Path) -> None:
     """心跳态应只注入结构化 MEMORY 摘要，不带 Fading 和编辑说明。"""
     (tmp_path / "SOUL.md").write_text("SOUL_CONTENT", encoding="utf-8")
     (tmp_path / "USER.md").write_text("USER_CONTENT", encoding="utf-8")
@@ -161,7 +201,7 @@ def test_heartbeat_system_prompt_filters_memory_sections(tmp_path: Path) -> None
     )
     service = _make_service(tmp_path)
 
-    prompt = service._build_heartbeat_system_prompt()
+    prompt = await service._build_heartbeat_system_prompt()
 
     assert "SOUL_CONTENT" in prompt
     assert "USER_CONTENT" in prompt
@@ -180,7 +220,7 @@ def test_heartbeat_system_prompt_filters_memory_sections(tmp_path: Path) -> None
 
 
 def test_ensure_workspace_templates_creates_user_md(tmp_path: Path) -> None:
-    """启动前应能为新工作空间补齐 USER.md 空模板。"""
+    """显式 local 模式应能为新工作空间补齐 USER.md 空模板。"""
     service = _make_service(tmp_path)
 
     service._ensure_workspace_templates()
@@ -190,6 +230,146 @@ def test_ensure_workspace_templates_creates_user_md(tmp_path: Path) -> None:
     assert "具体内容由爱莉" in content
     assert "爱莉可以在这里慢慢填写" in content
     assert "什么时候更新" in content
+
+
+@pytest.mark.parametrize("backend", ["local", "mysql"])
+def test_retired_thought_manager_is_not_a_runtime_authority(
+    tmp_path: Path,
+    backend: str,
+) -> None:
+    """任何存储模式都不得重新初始化 legacy streams.json 主体权威。"""
+
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(tmp_path)
+    global_config = CoreConfig(
+        storage=CoreConfig.StorageSection(
+            backend=backend,
+            backend_generation=(
+                "attention-selected-contract-v1" if backend == "mysql" else ""
+            ),
+            authority_owner_id="attention-selected-contract",
+        )
+    )
+
+    service = LifeEngineService(
+        _DummyPlugin(config=config, global_storage_config=global_config)
+    )
+
+    assert service._thought_manager is None
+    assert not hasattr(service, "_initialize_legacy_thought_manager")
+    assert not (tmp_path / "thoughts").exists()
+
+
+def test_selected_storage_does_not_create_local_subject_template(
+    tmp_path: Path,
+) -> None:
+    """MySQL selected 模式不得生成无远端 revision 的本地主体文件。"""
+
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(tmp_path)
+    global_config = CoreConfig(
+        storage=CoreConfig.StorageSection(
+            backend="mysql",
+            backend_generation="subject-template-contract-v1",
+            authority_owner_id="subject-template-contract",
+        )
+    )
+    service = LifeEngineService(
+        _DummyPlugin(config=config, global_storage_config=global_config)
+    )
+
+    service._ensure_workspace_templates()
+
+    assert not (tmp_path / "USER.md").exists()
+    assert not (tmp_path / "runtime").exists()
+
+
+async def test_local_startup_validation_requires_complete_subject_authority(
+    tmp_path: Path,
+) -> None:
+    """Local startup must fail before acquiring runtime when MEMORY is absent."""
+
+    (tmp_path / "SOUL.md").write_text("SOUL", encoding="utf-8")
+    service = _make_service(tmp_path)
+
+    service._ensure_workspace_templates()
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^SubjectAuthoritySourceMissing: MEMORY\.md$",
+    ):
+        await service._validate_local_subject_authority()
+
+    assert (tmp_path / "USER.md").is_file()
+    assert not (tmp_path / "MEMORY.md").exists()
+    assert service._stop_event is None
+    assert service._memory_integration is None
+
+
+async def test_local_start_fails_before_runtime_acquisition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An incomplete local snapshot must abort before runtime acquisition."""
+
+    (tmp_path / "SOUL.md").write_text("SOUL", encoding="utf-8")
+    service = _make_service(tmp_path)
+
+    async def forbidden_runtime_open() -> None:
+        raise AssertionError("runtime acquisition must not start")
+
+    monkeypatch.setattr(
+        service,
+        "_open_selected_storage_runtime",
+        forbidden_runtime_open,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^SubjectAuthoritySourceMissing: MEMORY\.md$",
+    ):
+        await service._start_impl()
+
+    assert service._stop_event is None
+    assert service._memory_integration is None
+
+
+async def test_local_startup_validation_accepts_exact_subject_snapshot(
+    tmp_path: Path,
+) -> None:
+    """A complete local SOUL/USER/MEMORY snapshot passes startup validation."""
+
+    for name in ("SOUL.md", "USER.md", "MEMORY.md"):
+        (tmp_path / name).write_text(name, encoding="utf-8")
+    service = _make_service(tmp_path)
+
+    await service._validate_local_subject_authority()
+
+    assert service._stop_event is None
+    assert service._memory_integration is None
+
+
+async def test_selected_storage_skips_local_subject_validation(
+    tmp_path: Path,
+) -> None:
+    """MySQL mode validates its remote snapshot after acquiring authority."""
+
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(tmp_path)
+    global_config = CoreConfig(
+        storage=CoreConfig.StorageSection(
+            backend="mysql",
+            backend_generation="subject-validation-contract-v1",
+            authority_owner_id="subject-validation-contract",
+        )
+    )
+    service = LifeEngineService(
+        _DummyPlugin(config=config, global_storage_config=global_config)
+    )
+
+    await service._validate_local_subject_authority()
+
+    assert not any(tmp_path.iterdir())
 
 
 def test_heartbeat_prompt_routes_subject_changes_through_review(tmp_path: Path) -> None:
@@ -204,8 +384,10 @@ def test_heartbeat_prompt_routes_subject_changes_through_review(tmp_path: Path) 
     assert "可以用文件工具谨慎更新" not in prompt
 
 
-def test_memory_maintenance_prompt_emits_once_per_interval(tmp_path: Path) -> None:
+async def test_memory_maintenance_prompt_emits_once_per_interval(tmp_path: Path) -> None:
     """MEMORY 超限时，维护提醒不应在短时间内重复刷屏。"""
+    (tmp_path / "SOUL.md").write_text("SOUL_CONTENT", encoding="utf-8")
+    (tmp_path / "USER.md").write_text("USER_CONTENT", encoding="utf-8")
     oversize_item = "很长的叙事内容" * 80
     (tmp_path / "MEMORY.md").write_text(
         "\n".join(
@@ -220,8 +402,8 @@ def test_memory_maintenance_prompt_emits_once_per_interval(tmp_path: Path) -> No
     )
     service = _make_service(tmp_path)
 
-    first = service._build_memory_maintenance_prompt_if_due()
-    second = service._build_memory_maintenance_prompt_if_due()
+    first = await service._build_memory_maintenance_prompt_if_due()
+    second = await service._build_memory_maintenance_prompt_if_due()
 
     assert "MEMORY.md 结构复盘信号" in first
     assert "邀请，不是任务" in first
@@ -944,6 +1126,7 @@ async def test_memory_index_lifecycle_start_toggle_and_stop_close(
     monkeypatch: pytest.MonkeyPatch,
     memory_index_enabled: bool,
 ) -> None:
+    _write_subject_authority(tmp_path)
     service = _make_service(tmp_path)
     config = service.plugin.config
     config.memory_index.enabled = memory_index_enabled
@@ -952,6 +1135,8 @@ async def test_memory_index_lifecycle_start_toggle_and_stop_close(
     config.memory_witness.run_on_startup = False
     config.memory_witness.migrate_legacy_diaries = False
     config.autonomy.enabled = False
+    config.streams.enabled = False
+    config.drives.enabled = False
     fake_memory = _FakeMemoryIndexService()
     lifecycle_events: list[str] = []
 
@@ -1007,12 +1192,15 @@ async def test_shared_sync_uses_managed_lifecycle_and_closes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _write_subject_authority(tmp_path)
     service = _make_service(tmp_path)
     config = service.plugin.config
     config.shared_sync.enabled = True
     config.memory_index.enabled = False
     config.memory_witness.enabled = False
     config.autonomy.enabled = False
+    config.streams.enabled = False
+    config.drives.enabled = False
     config.learning.enabled = False
     lifecycle: list[str] = []
 
@@ -1062,12 +1250,15 @@ async def test_memory_archive_sync_uses_managed_lifecycle_and_closes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _write_subject_authority(tmp_path)
     service = _make_service(tmp_path)
     config = service.plugin.config
     config.memory_archive_sync.enabled = True
     config.memory_index.enabled = False
     config.memory_witness.enabled = False
     config.autonomy.enabled = False
+    config.streams.enabled = False
+    config.drives.enabled = False
     config.learning.enabled = False
     lifecycle: list[str] = []
 

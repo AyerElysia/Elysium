@@ -68,7 +68,6 @@ async def test_mysql_memory_bundle_preserves_identity_and_cas_contracts() -> Non
         registry_id="life-memory-integration",
     )
     runtime = None
-    token = None
     suffix = uuid4().hex
     event_id = f"memory-event-{suffix}"
     witness_id = f"memory-witness-{suffix}"
@@ -79,14 +78,6 @@ async def test_mysql_memory_bundle_preserves_identity_and_cas_contracts() -> Non
     try:
         generation = _generation()
         await registry.register_generation(generation)
-        health = await registry.health()
-        token = await registry.activate_generation(
-            generation.generation_id,
-            expected_epoch=int(health.get("authority_epoch") or 0),
-            owner_id="life-memory-integration-writer",
-            lease_seconds=180,
-            confirm_previous_writers_stopped=True,
-        )
         runtime = await open_storage_backend(
             StorageFactorySettings(
                 enabled=True,
@@ -95,9 +86,8 @@ async def test_mysql_memory_bundle_preserves_identity_and_cas_contracts() -> Non
                 schema_version=8,
                 registry_id="life-memory-integration",
                 authority_provider="mysql",
-                authority_epoch=token.authority_epoch,
-                authority_owner_id=token.owner_id,
-                fencing_token_env="TEST_MEMORY_MYSQL_FENCE",
+                authority_owner_id="life-memory-integration-writer",
+                authority_lease_seconds=180,
                 mysql=MySQLBackendSettings(
                     host=config.host,
                     port=config.port,
@@ -107,10 +97,7 @@ async def test_mysql_memory_bundle_preserves_identity_and_cas_contracts() -> Non
                     ssl_mode=config.ssl_mode,
                 ),
             ),
-            environment={
-                "TEST_MEMORY_MYSQL_FENCE": token.fencing_token,
-                "TEST_MEMORY_MYSQL_PASSWORD": config.password,
-            },
+            environment={"TEST_MEMORY_MYSQL_PASSWORD": config.password},
         )
         stores = await open_mysql_memory_storage(runtime, initialize_schema=True)
 
@@ -223,7 +210,6 @@ async def test_mysql_memory_bundle_preserves_identity_and_cas_contracts() -> Non
                 )
     finally:
         if runtime is not None:
+            await runtime.revoke_authority()
             await runtime.close()
-        if token is not None:
-            await registry.revoke(token)
         await engine.dispose()

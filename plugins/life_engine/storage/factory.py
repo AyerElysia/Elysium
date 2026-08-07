@@ -48,6 +48,7 @@ class MySQLBackendSettings:
     database: str = "elysium"
     user: str = "elysium"
     password_env: str = "ELYSIUM_LIFE_STORAGE_MYSQL_PASSWORD"
+    password: str = field(default="", repr=False)
     ssl_mode: MySQLTLSMode = "disabled"
     ssl_ca: str = ""
     ssl_cert: str = ""
@@ -59,6 +60,7 @@ class MySQLBackendSettings:
     pool_timeout_seconds: int = 10
     query_timeout_seconds: int = 10
     lock_wait_timeout_seconds: int = 5
+    idle_session_timeout_seconds: int = 180
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,55 +77,78 @@ class StorageFactorySettings:
     authority_owner_id: str = ""
     fencing_token_env: str = "ELYSIUM_LIFE_STORAGE_FENCING_TOKEN"
     require_verified_generation: bool = True
+    authority_lease_seconds: int = 120
+    authority_renew_interval_seconds: int = 40
     local: LocalBackendSettings = field(default_factory=LocalBackendSettings)
     mysql: MySQLBackendSettings = field(default_factory=MySQLBackendSettings)
 
 
-def settings_from_life_engine_config(config: Any) -> StorageFactorySettings:
-    """Translate strict plugin config sections into the secret-free factory model."""
+def settings_from_life_engine_config(
+    config: Any,
+    *,
+    global_config: Any | None = None,
+) -> StorageFactorySettings:
+    """Build Life Engine storage from the single Core configuration source."""
 
-    storage = config.storage
     local = config.storage_local
-    mysql = config.storage_mysql
+    if global_config is None:
+        from src.core.config import get_core_config
+
+        try:
+            global_config = get_core_config()
+        except RuntimeError as exc:
+            raise StorageConfigurationError(
+                "global storage configuration is not initialized"
+            ) from exc
+
+    storage = global_config.storage
+    database = global_config.database
     try:
-        backend = BackendKind(str(storage.authoritative_backend))
+        backend = BackendKind(str(storage.backend))
     except ValueError as exc:
         raise StorageConfigurationError(
-            "authoritative_backend must be local or mysql"
+            "global storage.backend must be local or mysql"
         ) from exc
     return StorageFactorySettings(
-        enabled=bool(storage.enabled),
+        enabled=backend == BackendKind.MYSQL,
         authoritative_backend=backend,
-        backend_generation=str(storage.backend_generation),
+        backend_generation=(
+            str(storage.backend_generation) if backend == BackendKind.MYSQL else ""
+        ),
         schema_version=int(storage.schema_version),
         registry_id=str(storage.registry_id),
-        authority_provider=cast(AuthorityProvider, str(storage.authority_provider)),
-        authority_epoch=int(storage.authority_epoch),
+        authority_provider=("mysql" if backend == BackendKind.MYSQL else "file"),
+        authority_epoch=0,
         authority_owner_id=str(storage.authority_owner_id),
-        fencing_token_env=str(storage.fencing_token_env),
         require_verified_generation=bool(storage.require_verified_generation),
+        authority_lease_seconds=int(storage.authority_lease_seconds),
+        authority_renew_interval_seconds=int(
+            storage.authority_renew_interval_seconds
+        ),
         local=LocalBackendSettings(
             database_path=Path(local.database_path),
             authority_state_path=Path(local.authority_state_path),
             busy_timeout_seconds=int(local.busy_timeout_seconds),
         ),
         mysql=MySQLBackendSettings(
-            host=str(mysql.host),
-            port=int(mysql.port),
-            database=str(mysql.database),
-            user=str(mysql.user),
-            password_env=str(mysql.password_env),
-            ssl_mode=cast(MySQLTLSMode, str(mysql.ssl_mode)),
-            ssl_ca=str(mysql.ssl_ca),
-            ssl_cert=str(mysql.ssl_cert),
-            ssl_key=str(mysql.ssl_key),
-            pool_size=int(mysql.pool_size),
-            max_overflow=int(mysql.max_overflow),
-            pool_recycle_seconds=int(mysql.pool_recycle_seconds),
-            connect_timeout_seconds=int(mysql.connect_timeout_seconds),
-            pool_timeout_seconds=int(mysql.pool_timeout_seconds),
-            query_timeout_seconds=int(mysql.query_timeout_seconds),
-            lock_wait_timeout_seconds=int(mysql.lock_wait_timeout_seconds),
+            host=str(database.mysql_host),
+            port=int(database.mysql_port),
+            database=str(database.mysql_database),
+            user=str(database.mysql_user),
+            password_env="ELYSIUM_MYSQL_PASSWORD",
+            password=str(database.mysql_password),
+            ssl_mode=cast(MySQLTLSMode, str(database.mysql_ssl_mode)),
+            ssl_ca=str(database.mysql_ssl_ca),
+            ssl_cert=str(database.mysql_ssl_cert),
+            ssl_key=str(database.mysql_ssl_key),
+            pool_size=int(database.connection_pool_size),
+            max_overflow=int(database.mysql_max_overflow),
+            pool_recycle_seconds=int(database.mysql_pool_recycle_seconds),
+            connect_timeout_seconds=int(database.connection_timeout),
+            pool_timeout_seconds=int(database.mysql_pool_timeout_seconds),
+            query_timeout_seconds=int(database.mysql_query_timeout_seconds),
+            lock_wait_timeout_seconds=int(database.mysql_lock_wait_timeout_seconds),
+            idle_session_timeout_seconds=180,
         ),
     )
 
@@ -152,9 +177,9 @@ def _build_token(
     generation: BackendGeneration,
     authority_health: dict[str, object],
     environment: Mapping[str, str],
+    *,
+    authority_epoch: int | None = None,
 ) -> AuthorityToken:
-    if int(settings.authority_epoch) <= 0:
-        raise StorageConfigurationError("authority_epoch must be positive")
     if not settings.authority_owner_id.strip():
         raise StorageConfigurationError("authority_owner_id must not be empty")
     if not settings.fencing_token_env.strip():
@@ -164,10 +189,15 @@ def _build_token(
         raise StorageConfigurationError(
             f"fencing token environment variable is missing: {settings.fencing_token_env}"
         )
+    epoch = int(
+        settings.authority_epoch if authority_epoch is None else authority_epoch
+    )
+    if epoch <= 0:
+        raise StorageConfigurationError("authority epoch must be positive")
     expected = {
         "active_backend": generation.backend.value,
         "active_generation": generation.generation_id,
-        "authority_epoch": int(settings.authority_epoch),
+        "authority_epoch": epoch,
         "owner_id": settings.authority_owner_id,
     }
     for key, value in expected.items():
@@ -180,7 +210,7 @@ def _build_token(
         registry_id=settings.registry_id,
         backend=generation.backend,
         generation_id=generation.generation_id,
-        authority_epoch=int(settings.authority_epoch),
+        authority_epoch=epoch,
         owner_id=settings.authority_owner_id,
         lease_until=lease_until,
         fencing_token=fencing_token,
@@ -208,13 +238,14 @@ async def open_storage_backend(
         engine = create_sqlite_storage_engine(sqlite_config)
         backend_identity = sqlite_config.safe_identity
     elif settings.authoritative_backend == BackendKind.MYSQL:
+        password = settings.mysql.password
         password_env = settings.mysql.password_env.strip()
-        if not password_env:
-            raise StorageConfigurationError("MySQL password_env must not be empty")
-        password = environment.get(password_env, "")
+        if not password and password_env:
+            password = environment.get(password_env, "")
         if not password:
             raise StorageConfigurationError(
-                f"MySQL password environment variable is missing: {password_env}"
+                "global MySQL password is empty; configure "
+                "database.mysql_password with an environment reference"
             )
         mysql_config = MySQLStorageConfig(
             host=settings.mysql.host,
@@ -233,6 +264,7 @@ async def open_storage_backend(
             pool_timeout_seconds=settings.mysql.pool_timeout_seconds,
             application_query_timeout_seconds=settings.mysql.query_timeout_seconds,
             innodb_lock_wait_timeout_seconds=settings.mysql.lock_wait_timeout_seconds,
+            idle_session_timeout_seconds=settings.mysql.idle_session_timeout_seconds,
         )
         engine = create_mysql_storage_engine(mysql_config)
         backend_identity = mysql_config.safe_identity
@@ -266,12 +298,39 @@ async def open_storage_backend(
             )
         _guard_generation(generation, settings)
         authority_health = await registry.health()
-        if authority_health.get("status") not in {"healthy", "degraded"}:
+        authority_status = str(authority_health.get("status") or "")
+        if authority_status not in {"healthy", "degraded", "disabled"}:
             raise GenerationGuardError("authority registry is unavailable")
-        token = _build_token(settings, generation, authority_health, environment)
-        await registry.validate(token)
+
+        if settings.authority_provider == "mysql":
+            owner_id = settings.authority_owner_id.strip()
+            if not owner_id:
+                raise StorageConfigurationError(
+                    "authority_owner_id must not be empty for MySQL writers"
+                )
+            active_generation = str(authority_health.get("active_generation") or "")
+            if active_generation:
+                token = await registry.join_generation(
+                    generation.generation_id,
+                    owner_id=owner_id,
+                )
+                shared_writers = True
+            else:
+                token = await registry.activate_generation(
+                    generation.generation_id,
+                    expected_epoch=int(authority_health.get("authority_epoch") or 0),
+                    owner_id=owner_id,
+                    lease_seconds=settings.authority_lease_seconds,
+                    confirm_previous_writers_stopped=False,
+                )
+                shared_writers = True
+        else:
+            token = _build_token(settings, generation, authority_health, environment)
+            await registry.validate(token)
+            shared_writers = False
+
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
-        return StorageBackendRuntime(
+        runtime = StorageBackendRuntime(
             enabled=True,
             backend=settings.authoritative_backend,
             backend_identity=backend_identity,
@@ -280,7 +339,20 @@ async def open_storage_backend(
             authority_token=token,
             engine=engine,
             session_factory=session_factory,
+            shared_writers=shared_writers,
         )
+        from .writer_claims import SQLSingletonWriterClaimStore
+
+        runtime._singleton_writer_claims = SQLSingletonWriterClaimStore(runtime)
+        if shared_writers:
+
+            async def _validate_shared_before_commit(session: Any) -> None:
+                connection = await session.connection()
+                await registry.validate_shared_in_transaction(connection, token)
+
+            runtime._write_fence = _validate_shared_before_commit
+            runtime._writer_validator = lambda: registry.validate_shared(token)
+        return runtime
     except BaseException:
         await engine.dispose()
         raise

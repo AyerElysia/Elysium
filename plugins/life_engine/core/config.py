@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import ClassVar, Self
+from typing import ClassVar
 
 from pydantic import field_validator
 
@@ -32,47 +32,6 @@ class LifeEngineConfig(BaseConfig):
 
     config_name: ClassVar[str] = "config"
     config_description: ClassVar[str] = "生命中枢最小原型配置"
-
-    @classmethod
-    def load(
-        cls,
-        path: str | Path,
-        *,
-        auto_update: bool = False,
-    ) -> Self:
-        """Load config while preserving the old expression-snapshot switch.
-
-        ``ConfigBase`` intentionally drops unknown keys during auto-update.  A
-        precise pre-migration is needed here so an operator who explicitly
-        disabled the retired ``latest_action_think_enabled`` switch does not
-        silently get the renamed feature re-enabled by its default.
-        """
-
-        config_path = Path(path)
-        if auto_update and config_path.exists():
-            original = config_path.read_text(encoding="utf-8")
-            section_match = re.search(
-                r"(?ms)^\[runtime_sync\]\s*$.*?(?=^\[|\Z)",
-                original,
-            )
-            if section_match is not None:
-                section = section_match.group(0)
-                if "latest_expression_snapshot_enabled" not in section:
-                    migrated = re.sub(
-                        r"(?m)^(\s*)latest_action_think_enabled(\s*=)",
-                        r"\1latest_expression_snapshot_enabled\2",
-                        section,
-                        count=1,
-                    )
-                    if migrated != section:
-                        updated = (
-                            original[: section_match.start()]
-                            + migrated
-                            + original[section_match.end() :]
-                        )
-                        config_path.write_text(updated, encoding="utf-8")
-        return super().load(config_path, auto_update=auto_update)
-
     # 仅控制 WebUI 配置页暴露面；完整运行时/TOML 配置仍保留。
     __config_schema_visible_fields__: ClassVar[dict[str, set[str]]] = {
         "settings": {
@@ -106,32 +65,10 @@ class LifeEngineConfig(BaseConfig):
             "migrate_legacy_diaries",
             "legacy_diary_path",
         },
-        "storage": {
-            "enabled",
-            "authoritative_backend",
-            "backend_generation",
-            "schema_version",
-            "authority_provider",
-            "authority_epoch",
-            "authority_owner_id",
-            "require_verified_generation",
-        },
         "storage_local": {
             "database_path",
             "authority_state_path",
             "busy_timeout_seconds",
-        },
-        "storage_mysql": {
-            "host",
-            "port",
-            "database",
-            "user",
-            "password_env",
-            "ssl_mode",
-            "pool_size",
-            "max_overflow",
-            "connect_timeout_seconds",
-            "query_timeout_seconds",
         },
         "shared_sync": {
             "enabled",
@@ -220,6 +157,16 @@ class LifeEngineConfig(BaseConfig):
             "latest_path",
             "max_observation_chars",
         },
+        "drives": {
+            "enabled",
+            "inject_to_heartbeat",
+        },
+        "streams": {
+            "enabled",
+            "max_active_streams",
+            "inject_to_heartbeat",
+            "sync_to_chatter",
+        },
         "autonomy": {
             "enabled",
             "min_delay_minutes",
@@ -232,7 +179,7 @@ class LifeEngineConfig(BaseConfig):
             "history_messages",
         },
         "runtime_sync": {
-            "latest_expression_snapshot_enabled",
+            "latest_action_think_enabled",
             "recent_chat_enabled",
             "recent_chat_messages",
             "trace_recent_changes_enabled",
@@ -525,58 +472,6 @@ class LifeEngineConfig(BaseConfig):
             description="远端事件应用游标的消费者 ID。",
         )
 
-    @config_section("storage")
-    class StorageSection(SectionBase):
-        """Selectable life-domain authority; disabled until a verified cutover."""
-
-        enabled: bool = Field(
-            default=False,
-            description=(
-                "Enable the selectable storage runtime. It never enables itself "
-                "during migration and never falls back automatically."
-            ),
-        )
-        authoritative_backend: str = Field(
-            default="local",
-            description="One writable authority: local or mysql.",
-        )
-        backend_generation: str = Field(
-            default="",
-            description="Explicit verified generation ID. Empty while rollout is disabled.",
-        )
-        schema_version: int = Field(
-            default=1,
-            ge=1,
-            description="Expected storage contract schema version.",
-        )
-        registry_id: str = Field(
-            default="life-domain",
-            description="Authority registry identity shared by all writers.",
-        )
-        authority_provider: str = Field(
-            default="file",
-            description=(
-                "Authority control plane: file for one host, mysql for shared MySQL writers."
-            ),
-        )
-        authority_epoch: int = Field(
-            default=0,
-            ge=0,
-            description="Explicit monotonic writer epoch; zero is not writable.",
-        )
-        authority_owner_id: str = Field(
-            default="",
-            description="Writer instance identity recorded by the authority registry.",
-        )
-        fencing_token_env: str = Field(
-            default="ELYSIUM_LIFE_STORAGE_FENCING_TOKEN",
-            description="Environment variable containing the short-lived fencing secret.",
-        )
-        require_verified_generation: bool = Field(
-            default=True,
-            description="Reject candidate or sealed generations at startup.",
-        )
-
     @config_section("storage_local")
     class StorageLocalSection(SectionBase):
         """Local backend and single-host authority control plane."""
@@ -594,63 +489,6 @@ class LifeEngineConfig(BaseConfig):
             ge=1,
             le=300,
             description="Bounded SQLite lock wait timeout.",
-        )
-
-    @config_section("storage_mysql")
-    class StorageMySQLSection(SectionBase):
-        """MySQL backend settings; secrets are resolved only from the environment."""
-
-        host: str = Field(default="127.0.0.1", description="MySQL host.")
-        port: int = Field(default=3306, ge=1, le=65535, description="MySQL port.")
-        database: str = Field(default="elysium", description="MySQL database name.")
-        user: str = Field(default="elysium", description="MySQL user.")
-        password_env: str = Field(
-            default="ELYSIUM_LIFE_STORAGE_MYSQL_PASSWORD",
-            description="Environment variable containing the MySQL password.",
-        )
-        ssl_mode: str = Field(
-            default="disabled",
-            description="TLS mode: disabled/required/verify-ca/verify-full.",
-        )
-        ssl_ca: str = Field(default="", description="Optional CA certificate path.")
-        ssl_cert: str = Field(default="", description="Optional client certificate path.")
-        ssl_key: str = Field(default="", description="Optional client private-key path.")
-        pool_size: int = Field(default=20, ge=1, le=200, description="Base pool size.")
-        max_overflow: int = Field(
-            default=20,
-            ge=0,
-            le=200,
-            description="Bounded pool overflow.",
-        )
-        pool_recycle_seconds: int = Field(
-            default=1800,
-            ge=30,
-            le=86400,
-            description="Connection recycle interval.",
-        )
-        connect_timeout_seconds: int = Field(
-            default=5,
-            ge=1,
-            le=60,
-            description="Connection timeout.",
-        )
-        pool_timeout_seconds: int = Field(
-            default=10,
-            ge=1,
-            le=300,
-            description="Pool acquisition timeout.",
-        )
-        query_timeout_seconds: int = Field(
-            default=10,
-            ge=1,
-            le=300,
-            description="Per-statement execution timeout.",
-        )
-        lock_wait_timeout_seconds: int = Field(
-            default=5,
-            ge=1,
-            le=300,
-            description="InnoDB row-lock wait timeout.",
         )
 
     @config_section("memory_archive_sync")
@@ -1278,8 +1116,8 @@ class LifeEngineConfig(BaseConfig):
         router_context_projection_enabled: bool = Field(
             default=True,
             description=(
-                "是否为对话 Router 启用可追溯、可重建的轻量主体/记忆投影。"
-                "只影响 Router 输入，不替换表达层消费的主体权威与记忆。"
+                "是否为对话 Router 启用可追溯、可重建的轻量人格/记忆投影。"
+                "只影响 Router 输入，不替换表达层的完整人格与记忆。"
             ),
         )
 
@@ -1576,13 +1414,107 @@ class LifeEngineConfig(BaseConfig):
             description="工具返回给 LLM 的屏幕观察摘要最大字符数。",
         )
 
+    @config_section("drives")
+    class DrivesSection(SectionBase):
+        """冲动引擎配置。"""
+
+        enabled: bool = Field(
+            default=True,
+            description="是否启用冲动引擎。冲动引擎将神经调质状态转化为具体行为建议。",
+        )
+
+        inject_to_heartbeat: bool = Field(
+            default=True,
+            description="是否将冲动建议注入心跳 prompt。",
+        )
+
+        curiosity_threshold: float = Field(
+            default=0.65,
+            ge=0.3,
+            le=0.9,
+            description="好奇心冲动触发阈值。",
+        )
+
+        sociability_threshold: float = Field(
+            default=0.6,
+            ge=0.3,
+            le=0.9,
+            description="社交欲冲动触发阈值。",
+        )
+
+        silence_trigger_minutes: int = Field(
+            default=30,
+            ge=5,
+            le=120,
+            description="沉默多久后触发社交冲动（分钟）。",
+        )
+
+    @config_section("streams")
+    class StreamsSection(SectionBase):
+        """思考流系统配置。"""
+
+        enabled: bool = Field(
+            default=True,
+            description="是否启用思考流系统。思考流给爱莉持久在意的兴趣线索，让她在心跳间有事可想。",
+        )
+
+        max_active_streams: int = Field(
+            default=5,
+            ge=1,
+            le=10,
+            description="同时活跃的思考流上限。超过后自动将好奇心最低的转入休眠。",
+        )
+
+        dormancy_threshold_hours: int = Field(
+            default=24,
+            ge=1,
+            le=72,
+            description="多久不推进后自动进入休眠（小时）。",
+        )
+
+        inject_to_heartbeat: bool = Field(
+            default=True,
+            description="是否将思考流状态注入心跳 prompt。",
+        )
+
+        sync_to_chatter: bool = Field(
+            default=True,
+            description="是否将思考流作为注意力脑区同步给 life_chatter。关闭后 chatter transient 中不再注入思考流块。",
+        )
+
+        focus_window_minutes: int = Field(
+            default=30,
+            ge=1,
+            le=720,
+            description="思考流焦点窗口（分钟）。last_focused_at 在此窗口内的活跃思考流被视为'当前焦点'，否则归入'背景在意'。",
+        )
+
+        curiosity_decay_half_life_hours: float = Field(
+            default=12.0,
+            ge=0.5,
+            le=240.0,
+            description="思考流 curiosity_score 的指数衰减半衰期（小时）。lazy 衰减：每次访问时按距 last_decay_at 的小时数衰减。",
+        )
+
+        curiosity_floor: float = Field(
+            default=0.15,
+            ge=0.0,
+            le=0.9,
+            description="思考流 curiosity_score 衰减下限。低于此值不再继续衰减。",
+        )
+
+        delta_marking: bool = Field(
+            default=True,
+            description="是否在 chatter 同步中给自上次以来 revision 增长的思考流加 🔄(刚推进) 标记。",
+        )
+
     @config_section("runtime_sync")
     class RuntimeSyncSection(SectionBase):
         """life_chatter 同步层（注意力脑区）配置。"""
 
-        latest_expression_snapshot_enabled: bool = Field(
+        latest_action_think_enabled: bool = Field(
             default=True,
-            description="是否在 chatter transient 中注入当前 stream 最近一次原子表达内在快照。",
+            description="是否在 chatter transient 中注入当前 stream 最近一次独白/思考快照。",
         )
 
         recent_chat_enabled: bool = Field(
@@ -1850,6 +1782,7 @@ class LifeEngineConfig(BaseConfig):
 
         default_body: str = Field(
             default="agent",
+            pattern=r"^(agent|bot|biomimetic)$",
             description="Explicit Minecraft body selected when start omits body_name.",
         )
 
@@ -1881,6 +1814,52 @@ class LifeEngineConfig(BaseConfig):
         biomimetic_token_file: str = Field(
             default="/mnt/g/Game/Minecraft/.minecraft/config/elysium_native_bridge.json",
             description="Native sidecar configuration containing its generated token.",
+        )
+
+        bot_bridge_uri: str = Field(
+            default="ws://127.0.0.1:18767/elysium",
+            description="Fallback URI for the headless bot body bridge.",
+        )
+
+        bot_bridge_listen_uri: str | None = Field(
+            default="ws://127.0.0.1:18767/elysium",
+            description="WSL listener for the outbound headless bot body relay.",
+        )
+
+        bot_token_file: str = Field(
+            default="minecraft/bot_bridge_token.json",
+            description="Workspace-relative token file generated for the bot body.",
+        )
+
+        bot_server_host: str = Field(
+            default="127.0.0.1",
+            min_length=1,
+            description="Minecraft server or LAN host the bot body joins.",
+        )
+
+        bot_server_port: int = Field(
+            default=25565,
+            ge=1,
+            le=65535,
+            description="Minecraft server or LAN port the bot body joins.",
+        )
+
+        bot_username: str = Field(
+            default="AyerElysia",
+            pattern=r"^[A-Za-z0-9_]{1,16}$",
+            description="In-game account name for the headless bot body.",
+        )
+
+        bot_observation_interval_ms: int = Field(
+            default=1000,
+            gt=0,
+            description="Bot observation snapshot cadence in milliseconds.",
+        )
+
+        bot_entity_radius_blocks: int = Field(
+            default=32,
+            gt=0,
+            description="Bot entity sensor radius in blocks.",
         )
 
         planner_task_name: str = Field(
@@ -1962,9 +1941,7 @@ class LifeEngineConfig(BaseConfig):
     model: ModelSection = Field(default_factory=ModelSection)
     memory_index: MemoryIndexSection = Field(default_factory=MemoryIndexSection)
     memory_witness: MemoryWitnessSection = Field(default_factory=MemoryWitnessSection)
-    storage: StorageSection = Field(default_factory=StorageSection)
     storage_local: StorageLocalSection = Field(default_factory=StorageLocalSection)
-    storage_mysql: StorageMySQLSection = Field(default_factory=StorageMySQLSection)
     shared_sync: SharedSyncSection = Field(default_factory=SharedSyncSection)
     memory_archive_sync: MemoryArchiveSyncSection = Field(
         default_factory=MemoryArchiveSyncSection
@@ -1978,7 +1955,9 @@ class LifeEngineConfig(BaseConfig):
     multimodal: MultimodalSection = Field(default_factory=MultimodalSection)
     media_observer: MediaObserverSection = Field(default_factory=MediaObserverSection)
     screen: ScreenSection = Field(default_factory=ScreenSection)
+    streams: StreamsSection = Field(default_factory=StreamsSection)
     runtime_sync: RuntimeSyncSection = Field(default_factory=RuntimeSyncSection)
+    drives: DrivesSection = Field(default_factory=DrivesSection)
     minecraft: MinecraftSection = Field(default_factory=MinecraftSection)
     orchestration: OrchestrationSection = Field(default_factory=OrchestrationSection)
     autonomy: AutonomySection = Field(default_factory=AutonomySection)

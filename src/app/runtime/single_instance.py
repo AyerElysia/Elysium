@@ -34,8 +34,11 @@ class SingleInstanceLock:
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
         handle = self.path.open("a+", encoding="utf-8")
-        handle.seek(0)
-        owner = handle.read().strip()
+        try:
+            handle.seek(0)
+            owner = handle.read().strip()
+        except OSError:
+            owner = ""
         try:
             self._lock_handle(handle)
         except OSError as exc:

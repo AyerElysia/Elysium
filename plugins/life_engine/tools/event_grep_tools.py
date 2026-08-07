@@ -10,6 +10,7 @@ from src.app.plugin_system.base import BaseTool
 
 from ..service import LifeEngineService
 from ..service.event_builder import EventType
+from .bounded_projection import project_bounded_items, sha256_json
 
 logger = log_api.get_logger("life_engine.event_grep")
 
@@ -182,6 +183,14 @@ async def grep_life_events(
             "returned_matches": len(returned),
             "truncated": len(matches) > len(returned),
         },
+        "source_frontier": {
+            "event_high_water": max(
+                (int(payload.get("sequence") or 0) for payload in payloads),
+                default=0,
+            ),
+            "event_count": len(payloads),
+            "events_sha256": sha256_json(payloads),
+        },
     }
 
 
@@ -214,6 +223,14 @@ class LifeEngineGrepEventsTool(BaseTool):
         context_before: Annotated[int, "每条命中前带几条相邻事件"] = 1,
         context_after: Annotated[int, "每条命中后带几条相邻事件"] = 1,
         order: Annotated[Literal["asc", "desc"], "返回顺序：asc/desc"] = "desc",
+        continuation: Annotated[
+            str,
+            "Optional continuation returned by the previous event grep page",
+        ] = "",
+        max_bytes: Annotated[
+            int | None,
+            "Optional result byte budget; the task hard cap still applies",
+        ] = None,
     ) -> tuple[bool, dict[str, Any] | str]:
         resolved_stream_ids = [
             str(stream_id or "").strip()
@@ -231,7 +248,7 @@ class LifeEngineGrepEventsTool(BaseTool):
             bool(current_stream_id) if include_life_internal is None else include_life_internal
         )
         try:
-            return True, await grep_life_events(
+            result = await grep_life_events(
                 query=query,
                 use_regex=use_regex,
                 case_insensitive=case_insensitive,
@@ -245,6 +262,61 @@ class LifeEngineGrepEventsTool(BaseTool):
                 context_after=context_after,
                 order=order,
             )
+            source_items = list(result.get("matches") or [])
+            item_refs = []
+            for item in source_items:
+                item_hash = sha256_json(item)
+                event = item.get("event") or {}
+                event_id = str(event.get("event_id") or "").strip()
+                item_refs.append(
+                    f"life-event-match:{event_id or 'unknown'}:sha256:{item_hash}"
+                )
+            raw_stats = dict(result.get("stats") or {})
+            raw_stats["retrieved_matches"] = len(source_items)
+            raw_stats.pop("returned_matches", None)
+            raw_stats.pop("truncated", None)
+            projected = project_bounded_items(
+                projection_name="life-event-grep",
+                task_name=getattr(self, "_runtime_task_name", ""),
+                requested_max_bytes=max_bytes,
+                binding={
+                    "query": str(query),
+                    "use_regex": bool(use_regex),
+                    "case_insensitive": bool(case_insensitive),
+                    "cross_stream": bool(cross_stream),
+                    "stream_ids": sorted(resolved_stream_ids),
+                    "event_types": sorted(
+                        str(value or "").strip() for value in (event_types or [])
+                    ),
+                    "fields": [
+                        str(value or "").strip() for value in (fields or [])
+                    ],
+                    "include_pending": bool(include_pending),
+                    "include_life_internal": bool(
+                        include_internal and not cross_stream
+                    ),
+                    "limit": int(limit),
+                    "context_before": int(context_before),
+                    "context_after": int(context_after),
+                    "order": str(order),
+                },
+                frontier=result.get("source_frontier") or {},
+                base_payload={
+                    **{
+                        key: value
+                        for key, value in result.items()
+                        if key not in {"matches", "stats"}
+                    },
+                    "stats": raw_stats,
+                },
+                items_key="matches",
+                items=source_items,
+                item_refs=item_refs,
+                continuation=continuation,
+            )
+            if len(str(projected).encode("utf-8")) > projected["budget_bytes"]:
+                raise ValueError("event grep projection exceeded its byte budget")
+            return True, projected
         except re.error as exc:
             return False, f"正则表达式错误: {exc}"
         except Exception as exc:  # noqa: BLE001

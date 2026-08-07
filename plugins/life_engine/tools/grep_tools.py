@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from pathlib import Path
@@ -15,6 +16,7 @@ from src.app.plugin_system.api import log_api
 from src.app.plugin_system.base import BaseTool
 
 from ._utils import _get_workspace, _resolve_path
+from .bounded_projection import project_bounded_items, sha256_json
 
 logger = log_api.get_logger("life_engine.grep")
 
@@ -145,6 +147,14 @@ class LifeEngineGrepFileTool(BaseTool):
         case_insensitive: Annotated[bool, "是否忽略大小写"] = True,
         context_lines: Annotated[int, "匹配行前后显示几行上下文（仅 content 模式有效）"] = 0,
         max_results: Annotated[int, "最大结果数量"] = _DEFAULT_MAX_RESULTS,
+        continuation: Annotated[
+            str,
+            "Optional continuation returned by the previous file grep page",
+        ] = "",
+        max_bytes: Annotated[
+            int | None,
+            "Optional result byte budget; the task hard cap still applies",
+        ] = None,
     ) -> tuple[bool, str | dict]:
         """在 workspace 文件中搜索匹配内容。
 
@@ -193,12 +203,14 @@ class LifeEngineGrepFileTool(BaseTool):
 
         # 执行搜索
         matched_files: list[dict[str, Any]] = []
+        source_files: list[dict[str, Any]] = []
         total_match_count = 0
 
         for fpath in sorted(files_to_search):
             if total_match_count >= max_results:
                 break
 
+            stat_before = fpath.stat()
             file_matches = _grep_file(
                 fpath,
                 compiled,
@@ -209,6 +221,20 @@ class LifeEngineGrepFileTool(BaseTool):
                 continue
 
             rel_path = str(fpath.relative_to(workspace))
+            raw_bytes = fpath.read_bytes()
+            stat_after = fpath.stat()
+            if (
+                stat_before.st_size != stat_after.st_size
+                or stat_before.st_mtime_ns != stat_after.st_mtime_ns
+            ):
+                return False, "file changed while grep results were prepared"
+            source_files.append(
+                {
+                    "path": rel_path,
+                    "bytes": len(raw_bytes),
+                    "content_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+                }
+            )
             total_match_count += len(file_matches)
 
             if output_mode == "files_with_matches":
@@ -225,7 +251,7 @@ class LifeEngineGrepFileTool(BaseTool):
                 })
 
         if not matched_files:
-            return True, {
+            result: dict[str, Any] = {
                 "action": "grep_file",
                 "pattern": pattern,
                 "output_mode": output_mode,
@@ -233,22 +259,67 @@ class LifeEngineGrepFileTool(BaseTool):
                 "total_matches": 0,
                 "message": "没有找到匹配的内容",
             }
-
-        result: dict[str, Any] = {
-            "action": "grep_file",
-            "pattern": pattern,
-            "output_mode": output_mode,
-            "search_path": path or "(整个工作空间)",
-            "total_files": len(matched_files),
-            "total_matches": total_match_count,
-            "results": matched_files,
-        }
+        else:
+            result = {
+                "action": "grep_file",
+                "pattern": pattern,
+                "output_mode": output_mode,
+                "search_path": path or "(整个工作空间)",
+                "total_files": len(matched_files),
+                "total_matches": total_match_count,
+                "results": matched_files,
+            }
 
         if total_match_count >= max_results:
             result["truncated"] = True
             result["note"] = f"结果已截断，显示前 {max_results} 条匹配。可缩小搜索范围或使用 glob 过滤。"
 
-        return True, result
+        source_items = list(result.get("results") or [])
+        file_hash_by_path = {
+            str(item["path"]): str(item["content_sha256"])
+            for item in source_files
+        }
+        item_refs = []
+        for item in source_items:
+            rel_path = str(item.get("path") or "")
+            item_hash = sha256_json(item)
+            content_hash = file_hash_by_path.get(rel_path, item_hash)
+            item_refs.append(
+                f"workspace-file:{rel_path}:sha256:{content_hash}:grep:{item_hash}"
+            )
+        try:
+            projected = project_bounded_items(
+                projection_name="workspace-file-grep",
+                task_name=getattr(self, "_runtime_task_name", ""),
+                requested_max_bytes=max_bytes,
+                binding={
+                    "pattern": str(pattern),
+                    "path": str(path),
+                    "glob": str(glob),
+                    "output_mode": str(output_mode),
+                    "case_insensitive": bool(case_insensitive),
+                    "context_lines": int(context_lines),
+                    "max_results": int(max_results),
+                },
+                frontier={
+                    "files": source_files,
+                    "results_sha256": sha256_json(source_items),
+                },
+                base_payload={
+                    key: value
+                    for key, value in result.items()
+                    if key != "results"
+                },
+                items_key="results",
+                items=source_items,
+                item_refs=item_refs,
+                continuation=continuation,
+            )
+        except ValueError as exc:
+            return False, str(exc)
+        if len(str(projected).encode("utf-8")) > projected["budget_bytes"]:
+            return False, "file grep projection exceeded its byte budget"
+        return True, projected
 
 
 # 导出
