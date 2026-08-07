@@ -709,11 +709,7 @@ async def test_agent_preflight_allows_first_launch_to_create_token(
     token_file = tmp_path / "not-created-yet.json"
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(
-            mc_home=tmp_path,
-            agent_token_file=token_file,
-            shared_world_enabled=False,
-        ),
+        mc_config=MCConfig(mc_home=tmp_path, agent_token_file=token_file),
     )
     session._launcher = _Launcher()
 
@@ -731,11 +727,7 @@ async def test_preflight_reports_windows_bridge_failure(tmp_path: Path) -> None:
     token_file.write_text('{"authentication_token":"secret"}', encoding="utf-8")
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(
-            mc_home=tmp_path,
-            agent_token_file=token_file,
-            shared_world_enabled=False,
-        ),
+        mc_config=MCConfig(mc_home=tmp_path, agent_token_file=token_file),
     )
     session._launcher = _BrokenWindowLauncher()
 
@@ -1022,3 +1014,27 @@ async def test_failed_world_receipt_remains_retryable_and_uncommitted(
     )
     assert world_trace_receipt_size(delivered[0]["value"]) <= 8 * 1024
     await session.stop()
+
+
+async def test_shared_world_preflight_skips_singleplayer_quick_play(
+    tmp_path: Path,
+) -> None:
+    """Her own client joins the LAN world, so singleplayer gates do not apply."""
+
+    token_file = tmp_path / "agent-token.json"
+    token_file.write_text('{"authentication_token":"secret"}', encoding="utf-8")
+    session = MinecraftSession(
+        workspace=tmp_path,
+        mc_config=MCConfig(
+            mc_home=tmp_path,
+            agent_token_file=token_file,
+            shared_world_enabled=True,
+        ),
+    )
+    session._launcher = _MissingQuickPlayLauncher()
+
+    result = await session.preflight(body_name="agent")
+
+    blockers = result.get("blockers") or []
+    assert not any("--quickPlaySingleplayer" in item for item in blockers)
+    assert not any("configured world does not exist" in item for item in blockers)

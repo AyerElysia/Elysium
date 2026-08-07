@@ -134,3 +134,31 @@ async def test_installation_requires_one_hash_pinned_bridge_and_baritone(
     assert ready["bridge_mod_ready"] is True
     assert ready["baritone_mod_ready"] is True
     assert ambiguous["bridge_mod_ready"] is False
+
+
+def test_prepare_shared_world_bat_points_at_lan_world(tmp_path: Path) -> None:
+    """Shared mode rewrites quick play and the username for her own window."""
+
+    script = tmp_path / "LaunchElysia.bat"
+    script.write_text(
+        "java BootstrapLauncher --username AyerElysia --version neoforge "
+        '--quickPlaySingleplayer "Elysian Realm"',
+        encoding="utf-8",
+    )
+    config = MCConfig(
+        mc_home=tmp_path,
+        launch_bat=r"G:\Test\LaunchElysia.bat",
+        bot_server_host="127.0.0.1",
+        bot_server_port=25565,
+        shared_world_enabled=True,
+    )
+    launcher = MinecraftLauncher(config)
+    launcher._wsl_mount_path = lambda _path: script  # test-local mount mapping
+
+    shared = launcher.prepare_shared_world_bat()
+
+    assert str(shared).endswith("LaunchElysiaShared.bat")
+    content = (tmp_path / "LaunchElysiaShared.bat").read_text(encoding="utf-8")
+    assert '--quickPlayMultiplayer "127.0.0.1:25565"' in content
+    assert "--username Elysia" in content
+    assert "--quickPlaySingleplayer" not in content
