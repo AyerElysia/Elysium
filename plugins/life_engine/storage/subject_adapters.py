@@ -136,6 +136,29 @@ def _subject_text_format(content: bytes) -> tuple[str, str | None]:
     return encoding, styles[0] if len(styles) == 1 else ("mixed" if styles else None)
 
 
+def _subject_head_change_marker(
+    heads: dict[str, tuple[str, int]],
+) -> str:
+    marker = hashlib.sha256()
+    for path in SUBJECT_AUTHORITY_PATHS:
+        head = heads.get(path)
+        if head is None:
+            raise SubjectAuthorityEvidenceError(
+                f"subject authority head is missing: {path}"
+            )
+        version_id, revision = head
+        if not version_id or revision <= 0:
+            raise SubjectAuthorityEvidenceError(
+                f"subject authority head is invalid: {path}"
+            )
+        marker.update(path.encode("utf-8"))
+        marker.update(b"\0")
+        marker.update(version_id.encode("ascii"))
+        marker.update(b"\0")
+        marker.update(revision.to_bytes(8, "big"))
+    return marker.hexdigest()
+
+
 class SQLSubjectDocumentStore:
     """One subject ledger bound to a coherent storage runtime."""
 
@@ -468,6 +491,53 @@ class SQLSubjectDocumentStore:
             )
         return revision
 
+    async def current_subject_change_marker(self) -> str:
+        """Return a lightweight marker for the current three authority heads.
+
+        This marker detects changes without transferring or decoding subject
+        content. ``read_subject_authority()`` remains the only path that mints
+        and validates the canonical exact-byte revision.
+        """
+
+        logical_paths = {
+            path: subject_authority_logical_path(path)
+            for path in SUBJECT_AUTHORITY_PATHS
+        }
+        async with self.runtime.unit_of_work() as uow:
+            rows = (
+                (
+                    await uow.session.execute(
+                        text(
+                            """SELECT logical_path, current_version_id, revision
+                            FROM subject_documents
+                            WHERE logical_path IN (:soul, :user, :memory)
+                            ORDER BY logical_path"""
+                        ),
+                        {
+                            "soul": logical_paths["SOUL.md"],
+                            "user": logical_paths["USER.md"],
+                            "memory": logical_paths["MEMORY.md"],
+                        },
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        by_logical = {str(row["logical_path"]): row for row in rows}
+        heads: dict[str, tuple[str, int]] = {}
+        for path in SUBJECT_AUTHORITY_PATHS:
+            logical_path = logical_paths[path]
+            row = by_logical.get(logical_path)
+            if row is None:
+                raise SubjectAuthorityEvidenceError(
+                    f"subject authority head is missing: {path}"
+                )
+            heads[path] = (
+                str(row["current_version_id"] or ""),
+                int(row["revision"]),
+            )
+        return _subject_head_change_marker(heads)
+
     async def read_subject_authority(self) -> SubjectAuthoritySnapshot:
         """Read all three authority head/version pairs in one consistent snapshot."""
 
@@ -476,9 +546,17 @@ class SQLSubjectDocumentStore:
                 uow.session,
                 lock=False,
             )
+        heads = {
+            path: (
+                state[path].head.current_version_id,
+                state[path].head.revision,
+            )
+            for path in SUBJECT_AUTHORITY_PATHS
+        }
         return SubjectAuthoritySnapshot(
             commits={path: state[path] for path in SUBJECT_AUTHORITY_PATHS},
             revision=revision,
+            change_marker=_subject_head_change_marker(heads),
         )
 
     @staticmethod

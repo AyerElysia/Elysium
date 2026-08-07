@@ -1,13 +1,13 @@
-# 生命域存储快照与权威切换运行手册
+# 生命域存储快照、共享写入与权威切换运行手册
 
-本手册服务于 Elysium 生命域可选本地/MySQL 存储。它不包含真实主机、用户名、密码或 fencing token。Life Event、Memory、Subject Document、Presence、World、Learning 的 Port/adapter、`LifeEngineService` 单 runtime 接线、未冻结候选复制、反向恢复、数据库不可变保护与真实隔离 MySQL 合同均已实现；正式冻结复制、五域同快照 generation 签署和用户手动启动后的跨领域验收尚未完成，因此本手册中的正式切换步骤是**验收门**，不是当前可以直接执行的上线指令。
+本手册服务于 Elysium 生命域可选本地/MySQL 存储。它不包含真实主机、用户名、密码或 fencing token。Life Event、Memory、Subject Document、Presence、World、Learning 的 Port/adapter、`LifeEngineService` 单 runtime 接线、未冻结候选复制、反向恢复、数据库不可变保护与真实隔离 MySQL 合同均已实现。MySQL runtime 现支持多个合法进程加入同一个 verified generation 并发读写；这里的“单一权威”指单一 active backend/generation/epoch，不再表示只能有一个进程写入。正式冻结复制、五域同快照 generation 签署和用户手动启动后的跨领域验收尚未完成，因此本手册中的正式切换步骤仍是**验收门**，不是当前可以直接执行的上线指令。
 
 ## 1. 当前安全状态
 
 - `config/core.toml [storage].backend` 是 Core 与 Life Engine 的唯一后端选择，只接受 `local` 或 `mysql`；
 - Life Engine 插件配置不再拥有 `enabled` 或 `authoritative_backend` 开关；
 - 本机配置虽可选择 `mysql`，但正式 generation、authority 与 fencing 未通过时必须失败关闭，不得退回混合的 Core=MySQL、Life=local；
-- 新的存储 runtime 不会自动创建、注册、激活或切换 generation；
+- 新的存储 runtime 不会自动创建、注册或切换 generation；MySQL registry 尚未激活时，首个业务进程可以激活已登记且 verified 的目标 generation，后续进程只能加入该 generation；
 - `LifeEngineService` 是唯一 runtime owner；各子域只消费注入对象，禁止自行再次打开或关闭 runtime；
 - 后端打开失败时 fail closed，不会从 MySQL 静默回退到 local，也不会反向回退；
 - 全局 MySQL 模式不打开或双写旧 Life Event、Presence、World SQLite，也不回写 `.life_learning`；全局 local 模式保持原本地行为；
@@ -57,16 +57,21 @@ uv run python scripts/backup_life_data.py \
 
 只有“独立校验通过 + `writer_frozen=true`”的快照才能生成 `verified` generation。完全相同的 generation 重复注册是幂等成功；相同 ID 的不同 manifest 是显式冲突。
 
-## 5. Authority 与 fencing
+## 5. Authority、共享写入与 fencing
 
-权威选择与数据后端选择彼此独立：
+权威选择与数据后端选择彼此独立；必须先区分“一个权威 generation”和“一个写入进程”：
 
-- 单主机部署默认使用 `authority_provider = "file"`；即使数据后端是 MySQL，也由本机哈希链 registry 协调一次人工切换，并在完整本地事务期间持有共享 fence；
-- 多主机同时写 MySQL 才使用 `authority_provider = "mysql"`。每个写事务在提交前必须于同一数据库事务中锁定并复核 generation、epoch、owner、lease 和 fencing token；
-- `local + mysql authority` 被明确拒绝，因为它不能给本地文件提供跨主机事务 fencing；
-- MySQL 正式 runtime 的 epoch 与 fencing token 在每次进程启动时由数据库控制面原子签发，只保存在进程内；持久化状态和健康输出只保留 token hash，不暴露秘密；
-- register、activate、renew、revoke 形成哈希链审计。审计损坏时 fail closed；
-- authority 被撤销、过期或未激活时，整体 runtime 只能报告 degraded/failed，并拒绝新写。
+- 单一权威意味着同一 registry 在一个 epoch 内只承认一个 active backend 和 generation，禁止 local/MySQL 双主或两个 generation 独立接收业务写入；它不限制同一 MySQL generation 内合法进程的数量；
+- `local` 后端仍使用 `authority_provider = "file"` 和进程级单实例保护。SQLite、权威 Markdown/JSON 与本地投影不支持多个 Elysium 进程安全共享写入；
+- `mysql` 后端使用 `authority_provider = "mysql"`。首个进程在 registry 尚未激活时激活 verified generation；后续进程通过 `join_generation()` 加入当前 generation，不会因已有合法 writer 而拒绝启动；
+- 每个进程都必须配置非空且可审计的 `authority_owner_id`。该值标识调用者和诊断来源，不赋予独占权，也不能替代数据库账号、权限和业务 actor 授权；
+- shared token 绑定 `registry_id + backend + generation + epoch`。每个耐久写事务在提交前，仍须于**同一个数据库事务**中锁定 registry 行并复核这四项；generation/epoch 改变后，旧进程立即被 fence；
+- 领域并发冲突继续由 InnoDB 行锁、唯一键、稳定 occurrence/idempotency identity、revision CAS 和事务 outbox 处理。共享 generation 不允许最后写入覆盖、跳过 parent/revision 或吞掉重复身份冲突；
+- shared writer 的周期维护是重新验证 generation/epoch，不延长或夺取一个进程独占租约；任一 shared writer 正常退出只释放自己的连接与本地 token，不撤销全局 generation，也不影响其他进程；
+- generation 的激活、切换、封存与审计事件继续形成哈希链。审计损坏、generation 未验证、backend/generation/epoch 不匹配时 fail closed；
+- schema migration 仍使用 MySQL advisory lock 串行执行。多个业务进程可并发启动，但不能并发执行互相冲突的 DDL；业务启动也不得把缺表或 checksum 漂移当作成功。
+
+健康输出中的 `writer_mode = "shared"` 表示多进程共享 generation；`exclusive` 表示旧的 file authority 合同。健康信息不得暴露数据库密码或真实 fencing secret。
 
 ## 6. 配置形状
 
@@ -79,8 +84,8 @@ backend = "local"  # 或 "mysql"
 backend_generation = ""
 schema_version = 1
 registry_id = "life-domain"
-authority_provider = "file"
-authority_owner_id = "elysium-primary"
+authority_provider = "file"  # mysql 后端并发写入时使用 "mysql"
+authority_owner_id = "<UNIQUE_WRITER_ID>"
 require_verified_generation = true
 authority_lease_seconds = 120
 authority_renew_interval_seconds = 40
@@ -98,7 +103,9 @@ connection_timeout = 10
 
 Life Engine 插件文件不再包含 `[storage]` 或 `[storage_mysql]`。它只保留 local 模式所需的 `[storage_local]` 路径；MySQL 模式会直接复用上述全局配置。
 
-只有 generation 与 authority 验收完成后，才允许把全局 `backend` 改为 `mysql`。连接密码仍只能通过配置中的环境变量提供；epoch 与 fencing token 不再写入配置或环境变量，而是在每次启动时由 MySQL 控制面自动取得，并由进程内续租。异常和健康输出使用不含密码的 backend identity。
+只有 generation 与 authority 验收完成后，才允许把全局 `backend` 改为 `mysql`。MySQL 多进程共享写入还必须使用 `authority_provider = "mysql"`，并为每个 worktree/部署实例提供稳定且唯一的 `authority_owner_id`；不要把真实用户名、机器绝对路径或密钥放进公共配置示例。连接密码仍只能通过配置中的环境变量提供。首个进程负责在尚未激活时创建 generation epoch；后续进程只加入同一 epoch。shared writer 不需要把 epoch、lease 或 fencing token 写入配置或环境变量，也不会通过周期维护夺取其他进程资格。异常和健康输出使用不含密码的 backend identity。
+
+MySQL 模式不使用入口级 `data/runtime/elysium.lock`；不同 worktree 可以同时启动并共享数据库。每个完整 Elysium 进程仍需拥有不冲突的 HTTP 端口、临时目录和不可共享外部适配器会话。已有合法数据库 writer 不得成为启动拒绝理由，但认证失败、TLS/权限错误、schema 漂移、generation 不匹配、端口冲突和外部会话争用仍必须显式失败，不能用静默 local 回退或空实现伪装启动成功。
 
 ### 6.1 Memory 隔离合同验证
 
@@ -137,13 +144,34 @@ uv run python scripts/adopt_life_mysql_baseline.py \
 
 该模式只应用 checksum 受控的幂等 migration，创建/核验 `runtime_states`、`runtime_events` 与两条不可变 trigger；不登记或激活 generation，不修改 authority epoch，不导入本地运行数据，也不启动/停止 Elysium。命令重复执行必须返回同一空表/当前内容证据；若 migration checksum 或 trigger 漂移则失败。普通业务启动固定使用 `initialize_schema=false`，不能代替迁移器建表。
 
-### 6.4 单 runtime 启动与关闭顺序
+### 6.4 单 runtime 启动、性能与关闭顺序
 
-enabled 模式的固定顺序是：service 打开并拥有一个 runtime → 注入 Memory → 从同一 runtime 构造 Life Event/Presence/World/Subject/Learning → 启动上层消费者。Learning 只消费注入的 `LearningStorePort` 与同一 `SubjectDocumentStorePort`，不得另开 store。关闭顺序相反：先停止上层任务 → flush/关闭 Learning、Memory 等消费者 → flush Presence outbox 并追平 World → 最后且仅一次关闭 runtime。任一消费者关闭失败都不得阻止后续消费者和 runtime 释放；最终以聚合异常报告，不静默吞掉。启动中途失败同样执行这一逆序清理。
+每个进程内部的固定顺序仍是：service 打开并拥有一个 runtime → 注入 Memory → 从同一 runtime 构造 Life Event/Presence/World/Subject/Learning → 启动上层消费者。Learning 只消费注入的 `LearningStorePort` 与同一 `SubjectDocumentStorePort`，不得另开 store。这里的“单 runtime”表示**每个进程只有一个 runtime owner**，不是整个 MySQL generation 只能启动一个进程。
+
+启动热路径遵循以下约束：
+
+- authority migration/schema 初始化在进程内幂等；authority 审计哈希链只对新观察到的 audit head 做完整验证，同一 head 不在每次 health/join 中重复全表重放；
+- shared generation 的 generation 与 registry 状态使用一次关联查询取得，不能串行重复读取同一控制面；
+- 启动只执行形成安全可用 runtime 所必需的 generation、schema、bounded outbox flush、World catch-up 和领域恢复；昂贵的全组件 health sweep 保留为显式按需诊断，不阻塞正常 readiness；
+- 不得为了启动速度跳过 migration checksum、不可变 trigger、generation 验证、历史 frontier 或真实恢复错误。
+
+关闭顺序相反：先停止上层任务 → flush/关闭 Learning、Memory 等消费者 → flush Presence outbox 并追平 World → 最后且仅一次关闭该进程拥有的 runtime。shared writer 关闭不撤销全局 generation。任一消费者关闭失败都不得阻止后续消费者和 runtime 释放；最终以聚合异常报告，不静默吞掉。启动中途失败同样执行这一逆序清理。
+
+### 6.5 回复热路径性能合同
+
+MySQL 的网络/TLS、连接池 checkout、协议编解码、服务端调度、InnoDB 锁和 COMMIT 确认决定其单次往返通常慢于 local SQLite/文件。优化目标是消除无意义的重复往返，而不是绕过权威校验：
+
+- Router 投影由完整主体快照生成并验证；稳定状态下只读取 `SOUL.md`、`USER.md`、`MEMORY.md` 三个 head 的 `current_version_id/revision` 形成 content-free change marker；marker 不变时复用进程内不可变投影；
+- marker 变化后必须读取一个一致的三文档完整快照并验证 exact-byte revision。读取失败或投影不匹配时不得继续把旧投影冒充当前版本；
+- 有效 Router 投影已经证明其来源快照可用，Router 前不再重复拉取三份主体正文；降级或投影不可用时仍显式验证 `SOUL.md`，不能用空人格 fallback；
+- 全局聊天历史使用固定批量查询读取 messages、streams、persons，查询次数不得随消息数量线性增长；滚动 payload chain 已合并历史后，后续 turn 不再重新读取最终不会注入的全局历史；
+- 缓存只覆盖 content-free marker、不可变版本和可重建投影。每个耐久写事务仍在提交前执行 generation/epoch fence，主体权威、原始历史和权限判断不得使用过期缓存替代。
+
+性能验收应至少记录 20 次冷启动和 100 个真实文本 turn，分别报告冷启动、首轮模型调用前、同一滚动链后续模型调用前的 p50/p95，并同步采集 MySQL `performance_schema` 或 slow log 的语句次数和等待。必须保持相同 Provider、上下文规模、TLS、网络位置和适配器配置；按“模型 / 数据库 / 平台发送”拆分耗时，不能把模型或平台延迟误归因给 MySQL。
 
 本阶段只验证适配器合同，不会修改全局 `[storage].backend`、不会迁移正式数据、不会注册或激活正式 generation，也不会启动或停止 Elysium、NapCat 或其他运行进程。
 
-### 6.5 候选复制控制面
+### 6.6 候选复制控制面
 
 候选复制不得借用正式 authority。`life_storage_copy_runs` 只协调复制/导出批次，使用数据库时间租约、单调 epoch 与 fencing token；它不能注册或激活 backend generation。
 
@@ -167,7 +195,7 @@ SELECT @@GLOBAL.log_bin, @@GLOBAL.log_bin_trust_function_creators;
 
 第二条查询必须返回 `log_bin = 1`、`log_bin_trust_function_creators = 1`。若托管平台禁止 `SET PERSIST`，应在平台参数组或 `[mysqld]` 配置中持久化同名变量，并按平台要求重启或应用配置。不要临时授予 Elysium 业务账号 `SUPER` 或 `SYSTEM_VARIABLES_ADMIN` 来绕过该前置条件。
 
-### 6.6 反向导出
+### 6.7 反向导出
 
 反向导出只能写入一个此前不存在的新目录：
 
@@ -179,7 +207,7 @@ SELECT @@GLOBAL.log_bin, @@GLOBAL.log_bin_trust_function_creators;
 
 当前已验证的 Life Event 恢复副本位于 `C:\Temp\Data\ElysiumBackups\life-event-reverse-20260804T0735Z`。它是恢复演练资产，不是 active backend，也不授权自动切换。
 
-### 6.7 Subject Document 精确复制与工作区边界
+### 6.8 Subject Document 精确复制与工作区边界
 
 Subject Document 的候选复制使用：
 
@@ -218,7 +246,7 @@ Witness 的声明路径必须先调用 service 的 Subject 写入口，再执行
 通用 `nucleus_bash` 无法证明任意 shell 命令的写前入账，因此在该模式下 fail
 closed；读取或修改应使用专用 file/领域工具。disabled/local 模式保持原行为。
 
-### 6.8 Life Memory 无损候选复制
+### 6.9 Life Memory 无损候选复制
 
 Life Memory 使用显式的 32 表选择合同，不复制 SQLite FTS 内部影子表，也不把
 Chroma 当作权威。候选复制命令为：
@@ -244,7 +272,8 @@ Memory 权威历史 trigger 位于独立的 `life_memory_immutability_schema_mig
 - 工作区文档读取必须使用平台兼容的安全路径检查。Windows 不支持 POSIX 目录文件描述符打开方式，仍须逐级拒绝符号链接、边界逃逸和非普通文件，并核对读取前后文件身份；
 - 可重建的 ghost 文件节点清理必须采用有界批次和集合式 SQL，每批独立提交并记录累计进度；禁止把大规模投影修复放入单个长事务，避免长期持有 `memory_nodes` 行锁；
 - `memory_artifact_heads` 的 revision CAS 仍须严格执行。启动观察发生 head 冲突时，只允许刷新精确最新 head：若另一合法 writer 已提交等价正文或 tombstone，则幂等吸收；否则以最新版本为 parent 有界重试一次。禁止覆盖竞争版本、猜测 head 或无限重试；
-- 启动失败后的关闭流程会撤销 writer authority。再次启动前必须确认旧 writer 已撤销或租约已失效；新进程会通过 MySQL 控制面取得新的单调 epoch 与 fencing token 并在进程内续租，旧 token 不得复用。
+- shared writer 启动时加入当前 verified generation，并在恢复及每笔提交中复核 generation/epoch。另一合法 writer 正在运行不是拒绝启动的条件；generation 被切换或封存后，旧进程的下一次写入必须被 fence；
+- shared writer 的异常退出不要求等待独占租约过期，正常退出也不得撤销全局 generation。只有显式 generation 切换/封存才改变 epoch；该操作前仍须确认旧 generation 的写入已被事务 fence 隔离。
 
 验收至少包含：实际配置打开 selected runtime 并通过 writer 校验、真实 Memory 初始化成功、ghost 缺口收敛、目标行锁可立即获取并回滚、artifact CAS 并发回归通过，以及初始化进程退出后无残留连接或后台 Python 进程。
 
@@ -264,7 +293,7 @@ uv run python scripts/audit_life_memory_shadow.py \
 `writer_frozen=false`，远端账号也不能创建数据库级不可变 trigger，因此只可作为
 不可激活的 shadow，不得据此切换生产。
 
-### 6.9 Presence / World 候选复制与反向恢复
+### 6.10 Presence / World 候选复制与反向恢复
 
 Presence 与 World 从一致性快照复制，命令为：
 
@@ -297,7 +326,7 @@ assertion/change/cursor 的目标都必须冲突失败，禁止覆盖。
 批次 `life-presence-world-shadow-v3-77435387f4acc59e` 为 `copied`。
 它来自 `writer_frozen=false` 快照，只是恢复证据，不是 active generation。
 
-### 6.10 Learning 候选复制与反向恢复
+### 6.11 Learning 候选复制与反向恢复
 
 Learning 迁移只能从完整快照中的 `.life_learning` 读取，不能直接扫描仍在运行的正式工作区：
 
@@ -329,7 +358,7 @@ ELYSIUM_TEST_MYSQL_LEARNING_ISOLATED=1
 2 个 ready 投影、10 个精确源文件，导入与反向语义投影均通过。该批次仍是
 `writer_frozen=false` 的 `copied` shadow，没有 active Learning generation。
 
-### 6.11 Life Event 候选复制与反向恢复
+### 6.12 Life Event 候选复制与反向恢复
 
 ```bash
 uv run python scripts/migrate_life_events.py \
@@ -344,7 +373,7 @@ trigger；冻结批次必须安装并核验 trigger。当前旧快照批次
 `life-event-cli-v1-77435387f4acc59e` 已复制 86,094 条事件，源、MySQL 与反向 SQLite
 root 一致，反向 `quick_check=ok`；它仍不可激活。
 
-### 6.12 五域汇总切换审计
+### 6.13 五域汇总切换审计
 
 五个迁移批次完成后必须运行：
 
@@ -374,8 +403,8 @@ copy run。只要快照未冻结、run 不同源、状态不是 `verified`、存
 4. 已冻结快照通过逐记录、逐文件、谱系、frontier、visibility 与引用完整性校验；
 5. MySQL 复制副本在隔离环境通过读写、并发、死锁重试、断连恢复和恢复演练；
 6. 五域汇总审计返回 eligible 并写出 verified generation；
-7. 旧 writer 已人工停止，旧 authority token 已撤销，只有一个新 epoch 被激活；
-8. 新 runtime 的 backend、generation、schema、owner、lease、epoch 与 registry 完全匹配；
+7. 旧 backend/generation 已人工停止或已由新 epoch 的事务 fence 隔离；同一新 generation 内允许多个已验证 writer 同时存在；
+8. 新 runtime 的 backend、generation、schema、owner identity、epoch 与 registry 完全匹配，健康输出为 `writer_mode = "shared"`；
 9. Chroma/FTS/World 等派生投影从新权威重建并报告明确 frontier；
 10. 用户明确批准切换并手动启动 Elysium；
 11. 真实聊天、记忆写入、检索、见证、Presence、World、Learning 与重启恢复全链路通过。

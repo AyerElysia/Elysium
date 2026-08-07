@@ -293,7 +293,9 @@ export ELYSIUM_MYSQL_PASSWORD='<MYSQL_PASSWORD>'
 
 - `[storage].backend` 是全局唯一后端选择，只接受 `local` 或 `mysql`。`database.database_type` 与 Life Engine 的 `storage.enabled`、`storage.authoritative_backend` 已废弃；旧 Core 配置会自动迁移，若新旧选择冲突则拒绝启动。
 - `backend = "local"` 使 Core 使用 SQLite，并让 Life Engine 继续使用现有本地 SQLite、Markdown/JSON 和 Chroma 链；不要求创建 managed-local generation。Life Engine 启动前会只读校验 `data/life_engine_workspace/SOUL.md`、`USER.md`、`MEMORY.md` 三份主体权威文件；任一文件缺失、不可读或不是合法 UTF-8 都会直接拒绝启动，不会把缺失解释为空内容，也不会自动从 MySQL 回填。
-- `backend = "mysql"` 使 Core 使用 MySQL，并强制 Life Engine 打开 MySQL runtime；verified generation 和 owner 必须配置，authority epoch 与 fencing token 由 MySQL 控制面在每次启动时自动签发并在进程内续租，不能悄悄退回本地。
+- `backend = "mysql"` 使 Core 使用 MySQL，并强制 Life Engine 打开 MySQL runtime；verified generation 和 owner 必须配置，不能悄悄退回本地。首个进程激活 generation，后续开发者进程加入同一 generation 并获得并发写入资格；进程退出只释放本地连接，不撤销其他写入者。每个开发者应配置可审计且唯一的 `authority_owner_id`。
+- MySQL 模式不使用进程级 `data/runtime/elysium.lock`，因此多个 worktree/开发者不会因另一个 Elysium 进程存在而被入口拒绝。`local` 模式仍保持单进程保护，避免多个进程并发写同一 SQLite 和本地权威文件。
+- “允许启动”不等于掩盖故障：凭据错误、MySQL 不可达、generation 未验证、schema/checksum 漂移、迁移锁超时、权限不足、端口冲突或数据约束失败仍会显式报错。部署必须修复这些真实前置条件，禁止改成静默本地回退或假成功。
 - `mysql_password` 支持 `${ELYSIUM_MYSQL_PASSWORD}` 环境变量插值。不要把真实密码填回 TOML、文档、日志或 Git；交互式设置环境变量时也要注意 shell 历史和终端录屏。
 - 生产环境优先使用 `mysql_ssl_mode = "required"` 或 `"verify-full"`，并填写 CA/证书路径；只有本机受控网络且明确接受明文链路时才使用 `disabled`。
 - MySQL 账号至少需要目标数据库及 Core 表的建表、读写、迁移和 `TRIGGER` 权限；不要给应用账号全库管理员权限。
@@ -350,8 +352,15 @@ MySQL 模式并不意味着把 Chroma 或媒体字节强行塞入关系表：Lif
 
 MySQL 模式下，聊天意识可通过主体复盘工具按 UTF-8 字节窗口读取当前远端 `SOUL.md`、`USER.md` 或 `MEMORY.md`，提交完整候选，再对精确候选作 `accepted` 决定。只有活跃意识实例、当前统一 revision、候选哈希和完整接受正文全部通过校验，才会在同一 MySQL 事务中追加主体版本并推进 `MEMORY.md` current head；不会写本地 Markdown，也不会自动合并或替主体决定。普通 Life Memory 的经历、解释、关系与回忆轨迹则继续通过 Memory ports 直接写 MySQL，不需要经过 `MEMORY.md` 文档改写。
 
-正常关闭后再次启动不需要修改 epoch、token 或其他运行凭据。启动事务会从 MySQL authority registry 读取数据库时间：没有有效 writer 或旧租约已过期时自动签发新 epoch/token；检测到仍有效的其他 writer 时拒绝启动，避免双写。启动后的续租由 Life Engine 自己负责，且必须在取得 runtime token 后、执行 Memory/Subject/Attention 等领域挂载与追赶前立即开始；否则初始化超过一个租约周期会让新 token 在启动事务完成前过期。续租失败会 fail closed，旧进程不能继续写入，也不能用旧 token 恢复；应先停止旧实例，确认租约已过期且审计链有效，再由一次新启动取得新 epoch。
 
+
+MySQL runtime 采用“单一 verified generation、多进程共享写入”模型。第一次启动在 authority registry 中激活 generation；其他开发者只要连接同一库、同一 generation，便加入共享写入，不会夺走或撤销已有进程的资格。每笔提交仍在同一事务中校验 active backend、generation 和 epoch；generation 切换会使旧 token 失效。并发冲突由 InnoDB 行锁、唯一键、稳定 occurrence/idempotency identity、revision CAS 和事务 outbox 显式处理，schema migration 则继续使用连接级 advisory lock 串行执行。任一进程正常关闭都不会撤销全局 generation；健康信息会报告 `writer_mode = "shared"`。
+
+MySQL 相比 local 慢的基础成本来自网络/TLS 往返、连接池 checkout、事务提交和服务端锁；它不可能像进程内 SQLite/本地文件一样接近零延迟。现役热路径已避免几类可消除放大：authority 审计链按已验证 head 在进程内复用；Router 正常轮只读取 SOUL/USER/MEMORY 的三个 head 指针作为变更标记，标记变化才传输并校验完整主体快照；有效 Router 投影在进程内复用；全局聊天历史按 messages、streams、persons 三次批量查询恢复，不再按消息逐条查询；滚动 payload chain 已合并历史后，后续回复轮不再重复读取未使用的全局历史。上述缓存只覆盖可验证控制标记和可重建投影，不缓存后冒充新的主体权威，也不省略写事务中的 generation/epoch fence。
+
+性能验收应分别记录冷启动总耗时、首轮回复模型调用前耗时和同一滚动链后续回复模型调用前耗时，并同时采集 MySQL `performance_schema`/slow log 的语句次数和等待时间。建议至少使用 20 次冷启动与 100 个真实文本 turn，分别报告 p50/p95；测试期间保持相同 Provider、上下文规模、TLS、网络位置和外部适配器配置。若延迟仍高，先按“模型耗时 / 数据库往返 / 外部平台发送”拆分，禁止通过关闭 TLS、跳过迁移/authority 校验、删除历史或把数据库失败伪装为空结果来换取数字。
+
+这项能力只解决“另一个合法 MySQL 写入者已存在”造成的启动拒绝，不承诺绕过真实运行冲突。例如，多进程不能绑定同一个 HTTP 端口或独占同一外部适配器会话；开发者应为各 worktree 配置不同监听端口和独立外部资源，或关闭本次不需要的组件。数据库认证、TLS、DDL/TRIGGER 权限和 schema 完整性仍是必须满足的启动条件。
 项目还提供 `[shared_sync]` 与 `[memory_archive_sync]` 两项同步/归档能力。它们不是存储模式开关，不得用来制造第二个可写权威。正式切换、generation 校验与 authority 激活见 [生命域存储后端运行手册](./life_storage_backend_runbook.md)；设计依据见 [Elysium 生命域可选 MySQL 与本地存储重构方案](../architecture/Elysium生命域可选MySQL与本地存储重构方案.md)。
 
 ### 6.3 启动和回退验收

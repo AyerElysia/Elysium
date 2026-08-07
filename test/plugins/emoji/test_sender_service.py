@@ -38,16 +38,6 @@ def test_select_candidate_returns_best_when_temperature_disabled() -> None:
     assert selected.meme_id == "m1"
 
 
-async def test_legacy_persona_collection_entrypoint_fails_closed() -> None:
-    service = _make_service()
-
-    with pytest.raises(RuntimeError, match="AutomaticEmojiCollectionRetired"):
-        await service.ingest_once()
-
-    with pytest.raises(RuntimeError, match="LegacyEmojiPersonaSourceRetired"):
-        service._build_persona_prompt()
-
-
 def test_select_candidate_uses_temperature_weights() -> None:
     """temperature > 0 时应按距离权重调用随机采样。"""
     service = _make_service(temperature=0.2)

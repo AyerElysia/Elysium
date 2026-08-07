@@ -14,6 +14,7 @@ from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.core.router_context_projection import (
     RouterContextDraft,
     RouterContextProjection,
+    _sources_from_contents,
     read_subject_authority_sources,
 )
 from plugins.life_engine.service import core as service_core
@@ -69,6 +70,11 @@ class _Chatter:
 def _reset_router_circuit(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(router, "_circuit_consecutive_failures", 0)
     monkeypatch.setattr(router, "_circuit_open_until", 0.0)
+    monkeypatch.setattr(
+        router,
+        "get_core_config",
+        lambda: SimpleNamespace(personality=SimpleNamespace(nickname="Elysia")),
+    )
     monkeypatch.setattr(
         router,
         "_build_router_prompt",
@@ -366,22 +372,33 @@ async def test_selected_projection_uses_remote_subject_and_runtime_stores_only(
         "USER.md": b"REMOTE USER",
         "MEMORY.md": b"REMOTE MEMORY",
     }
-    from plugins.life_engine.core.router_context_projection import _sources_from_contents
-
     _, revision = _sources_from_contents(contents)
 
     class _SubjectStore:
-        async def current_subject_revision(self) -> str:
+        def __init__(self) -> None:
+            self.marker_calls = 0
+            self.snapshot_calls = 0
+
+        async def current_subject_change_marker(self) -> str:
+            self.marker_calls += 1
             return revision
 
+        async def current_subject_revision(self) -> str:
+            raise AssertionError("热路径应优先读取轻量 subject head marker")
+
         async def read_subject_authority(self):
+            self.snapshot_calls += 1
             commits = {
                 name: SimpleNamespace(
                     version=SimpleNamespace(content_bytes=raw)
                 )
                 for name, raw in contents.items()
             }
-            return SimpleNamespace(commits=commits, revision=revision)
+            return SimpleNamespace(
+                commits=commits,
+                revision=revision,
+                change_marker=revision,
+            )
 
     class _RuntimeStore:
         def __init__(self) -> None:
@@ -417,17 +434,20 @@ async def test_selected_projection_uses_remote_subject_and_runtime_stores_only(
         return RouterContextDraft(text="remote projection", generator="test-author")
 
     runtime_store = _RuntimeStore()
+    subject_store = _SubjectStore()
     projection = RouterContextProjection(
         tmp_path,
         author=author,
-        subject_store=_SubjectStore(),
+        subject_store=subject_store,
         runtime_store=runtime_store,
     )
 
     first = await projection.refresh()
     assert "remote projection" in first
-    assert await projection.refresh() == first
+    assert await projection.ensure_current() == first
     assert calls == 1
+    assert subject_store.snapshot_calls == 1
+    assert subject_store.marker_calls == 1
     assert not projection.runtime_dir.exists()
 
     snapshot = await projection.ensure_current_snapshot()

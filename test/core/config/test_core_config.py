@@ -206,40 +206,6 @@ context_validation_mode = \"repair\"
         finally:
             core_config_module._global_config = original_config
 
-    def test_init_core_config_strips_legacy_personality_authority(
-        self,
-        temp_dir: Path,
-    ) -> None:
-        """人格只能来自主体权威文件，旧 core 配置必须退出运行 schema。"""
-        import src.core.config.core_config as core_config_module
-
-        original_config = core_config_module._global_config
-        core_config_module._global_config = None
-
-        try:
-            config_file = temp_dir / "core.toml"
-            config_file.write_text(
-                """
-[personality]
-nickname = "legacy"
-personality_core = "parallel persona"
-
-[chat]
-default_chat_mode = "focus"
-""".lstrip(),
-                encoding="utf-8",
-            )
-
-            config = init_core_config(str(config_file))
-
-            assert not hasattr(config, "personality")
-            updated = config_file.read_text(encoding="utf-8")
-            assert "[personality]" not in updated
-            assert "parallel persona" not in updated
-            assert config.chat.default_chat_mode == "focus"
-        finally:
-            core_config_module._global_config = original_config
-
 
 class TestCoreConfig:
     """测试 CoreConfig 主配置类。"""

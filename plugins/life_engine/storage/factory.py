@@ -301,21 +301,31 @@ async def open_storage_backend(
             owner_id = settings.authority_owner_id.strip()
             if not owner_id:
                 raise StorageConfigurationError(
-                    "authority_owner_id must not be empty for MySQL acquisition"
+                    "authority_owner_id must not be empty for MySQL writers"
                 )
-            token = await registry.activate_generation(
-                generation.generation_id,
-                expected_epoch=int(authority_health.get("authority_epoch") or 0),
-                owner_id=owner_id,
-                lease_seconds=settings.authority_lease_seconds,
-                confirm_previous_writers_stopped=False,
-            )
+            active_generation = str(authority_health.get("active_generation") or "")
+            if active_generation:
+                token = await registry.join_generation(
+                    generation.generation_id,
+                    owner_id=owner_id,
+                )
+                shared_writers = True
+            else:
+                token = await registry.activate_generation(
+                    generation.generation_id,
+                    expected_epoch=int(authority_health.get("authority_epoch") or 0),
+                    owner_id=owner_id,
+                    lease_seconds=settings.authority_lease_seconds,
+                    confirm_previous_writers_stopped=False,
+                )
+                shared_writers = True
         else:
             token = _build_token(settings, generation, authority_health, environment)
             await registry.validate(token)
+            shared_writers = False
 
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
-        return StorageBackendRuntime(
+        runtime = StorageBackendRuntime(
             enabled=True,
             backend=settings.authoritative_backend,
             backend_identity=backend_identity,
@@ -324,7 +334,17 @@ async def open_storage_backend(
             authority_token=token,
             engine=engine,
             session_factory=session_factory,
+            shared_writers=shared_writers,
         )
+        if shared_writers:
+
+            async def _validate_shared_before_commit(session: Any) -> None:
+                connection = await session.connection()
+                await registry.validate_shared_in_transaction(connection, token)
+
+            runtime._write_fence = _validate_shared_before_commit
+            runtime._writer_validator = lambda: registry.validate_shared(token)
+        return runtime
     except BaseException:
         await engine.dispose()
         raise
