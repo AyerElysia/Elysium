@@ -279,7 +279,7 @@ class SQLRuntimeStateStore:
                             f"RuntimeStateRevisionConflict:{namespace}:{state_key}"
                         )
             finally:
-                await claim_store.clear_runtime_state_write(session)
+                await self.runtime.clear_singleton_writer_write(session)
         return RuntimeStateRecord(
             namespace=namespace,
             state_key=state_key,

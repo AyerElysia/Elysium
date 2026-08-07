@@ -71,6 +71,7 @@ uv run python scripts/backup_life_data.py \
 - shared generation 只解决“哪些进程可以写这个 generation”，不解决“谁拥有某个单例状态”。被领域声明为 singleton 的 `namespace/state_key` 必须额外取得数据库时间 writer claim；claim 包含可审计 owner instance、单调 lease epoch、不可伪造 token 与到期时间；
 - claim 的 acquire/renew/release 与受保护写入都在事务内复核 active generation。第二 owner 在有效租约内失败关闭；租约过期 takeover 递增 epoch，旧 owner 立即被 fence。冲突后禁止自动 reload/rebase、无界重试或最后写入覆盖；
 - MySQL 已登记 claim 的 runtime state 同时受应用层 exact-claim 校验和数据库 trigger 保护。连接池事务必须临时绑定当前连接与 claim token，提交前移除绑定；释放 claim 后保留登记身份，旧版无 claim writer 不能绕过保护；
+- 需要同样 trigger 保护的领域 adapter 只消费 runtime 公共接口：在 `unit_of_work(writer_claim=claim)` 内调用 `bind_singleton_writer_write(session, claim)`，受保护语句结束后于 `finally` 调用 `clear_singleton_writer_write(session)`。领域层不得访问 `_singleton_writer_claims`、复制 token 摘要算法或另建平行租约表；
 - generation 的激活、切换、封存与审计事件继续形成哈希链。审计损坏、generation 未验证、backend/generation/epoch 不匹配时 fail closed；
 - schema migration 仍使用 MySQL advisory lock 串行执行。多个业务进程可并发启动，但不能并发执行互相冲突的 DDL；业务启动也不得把缺表或 checksum 漂移当作成功。
 

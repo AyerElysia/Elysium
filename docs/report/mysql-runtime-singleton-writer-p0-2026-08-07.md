@@ -63,6 +63,8 @@
 
 数据库 trigger 对已经登记 claim 的 key 拒绝无 binding、错 generation/epoch/token、过期或释放后的直接 INSERT/UPDATE/DELETE。claim 当前态在 release 后保留，因此一旦 key 进入新合同，旧版无 claim writer 不能重新绕过保护。
 
+领域 adapter 不需要接触 runtime 的私有 claim store。公共 `bind_singleton_writer_write(session, claim)` / `clear_singleton_writer_write(session)` wrapper 复用相同 connection binding；调用方仍必须位于 `unit_of_work(writer_claim=claim)` 内。Learning 等单例投影可以据此给自己的表安装相同 trigger guard，而不另建 runtime、租约表或 token 算法。
+
 ### 4.3 启动顺序
 
 `LifeEngineService` 是唯一 storage runtime owner。selected storage 启动时先取得 `life_engine.runtime_context/global` claim，再读取当前权威 revision，最后把 claim 注入 `StatePersistence`。这保证用户手工重启后的新实例先读取远端 writer 已推进到的最新状态，不会用启动前的 revision 961 覆盖 revision 995。
@@ -94,7 +96,7 @@ final_revision=2
 ## 6. 自动化验证
 
 - singleton runtime、service 注入、连接/取消 rollback、baseline migration 定向合同：94 passed、1 skipped；
-- Life Engine 全集：1127 passed、13 skipped；
+- Life Engine 全集：新增公共 trigger-binding wrapper 合同后为 1128 passed、13 skipped；
 - 真实 MySQL 专用自动化用例在未设置 `ELYSIUM_TEST_MYSQL_RUNTIME_ISOLATED=1` 时明确 skipped；没有把 skip 冒充实库通过；
 - 另以正式库唯一随机 namespace 执行上述非生产、无正文的真实合同，全部 8 项通过；
 - 新 claim 模块完整 Ruff 通过；变更文件 Ruff `F,E9`、compileall 与 `git diff --check` 通过。

@@ -146,6 +146,40 @@ class StorageBackendRuntime:
             f"unsupported authority registry: {type(registry).__name__}"
         )
 
+    async def bind_singleton_writer_write(
+        self,
+        session: AsyncSession,
+        claim: SingletonWriterClaim,
+    ) -> None:
+        """Bind one transaction connection for claim-aware domain triggers.
+
+        Domain adapters must call this inside ``unit_of_work(writer_claim=claim)``
+        immediately before statements guarded by database triggers, then clear
+        the binding in ``finally``. The opaque token never leaves the shared
+        claim registry and local backends retain the same validation contract.
+        """
+
+        if self._closed:
+            raise StorageRuntimeClosed("storage runtime is closed")
+        if self._singleton_writer_claims is None:
+            raise StorageRuntimeDisabled(
+                "storage runtime has no singleton writer claim registry"
+            )
+        await self._singleton_writer_claims.bind_runtime_state_write(
+            session,
+            claim,
+        )
+
+    async def clear_singleton_writer_write(
+        self,
+        session: AsyncSession,
+    ) -> None:
+        """Clear the current transaction connection's trigger binding."""
+
+        if self._singleton_writer_claims is None:
+            return
+        await self._singleton_writer_claims.clear_runtime_state_write(session)
+
     async def acquire_singleton_writer(
         self,
         *,

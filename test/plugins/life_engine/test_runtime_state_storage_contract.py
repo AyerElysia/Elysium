@@ -263,3 +263,24 @@ async def test_runtime_authority_renewal_renews_managed_singleton_claim(
         health = await runtime._singleton_writer_claims.health_snapshot()
         assert health["known_claim_count"] == 1
         assert health["live_claim_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_exposes_trigger_binding_without_claim_store_access(
+    tmp_path: Path,
+) -> None:
+    async with _local_store(tmp_path) as (runtime, _store):
+        claim = await runtime.acquire_singleton_writer(
+            namespace="life_engine.learning",
+            state_key="selected_persistence",
+            owner_instance_id="host-a:pid-100:boot-a",
+            lease_seconds=30,
+        )
+        async with runtime.unit_of_work(writer_claim=claim) as uow:
+            await runtime.bind_singleton_writer_write(uow.session, claim)
+            await runtime.clear_singleton_writer_write(uow.session)
+
+        assert await runtime.release_singleton_writer(claim) is True
+        async with runtime.unit_of_work() as uow:
+            with pytest.raises(SingletonWriterClaimLost, match="ClaimLost"):
+                await runtime.bind_singleton_writer_write(uow.session, claim)
