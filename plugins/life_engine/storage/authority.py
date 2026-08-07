@@ -1,4 +1,4 @@
-"""Single-writer generation registry and per-transaction fencing guards."""
+"""Generation registry and transactional writer coordination."""
 
 from __future__ import annotations
 
@@ -589,8 +589,8 @@ class FileAuthorityRegistry:
 
 
 _AUTHORITY_SCHEMA = SchemaMigration(
-    version=1,
-    name="life_storage_authority_control_plane",
+    version=2,
+    name="life_storage_shared_generation_authority",
     statements=(
         """CREATE TABLE IF NOT EXISTS storage_backend_generations (
             generation_id VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin PRIMARY KEY,
@@ -651,6 +651,9 @@ class MySQLAuthorityRegistry:
             raise ValueError("authority registry_id must not be empty")
         self._schema_ready = False
         self._schema_lock = asyncio.Lock()
+        self._verified_audit_head = ""
+        self._verified_audit_count = 0
+        self._audit_lock = asyncio.Lock()
         lock_suffix = hashlib.sha256(self.registry_id.encode("utf-8")).hexdigest()[:16]
         self._activation_lock_name = f"elysium:authority:{lock_suffix}"
 
@@ -865,39 +868,53 @@ class MySQLAuthorityRegistry:
         *,
         expected_head: str,
     ) -> int:
-        rows = (
-            await connection.execute(
-                text(
-                    "SELECT event_type, authority_epoch, backend, generation_id, "
-                    "owner_id, payload_json, previous_event_hash, event_hash "
-                    "FROM storage_authority_events WHERE registry_id = :registry_id "
-                    "ORDER BY event_position"
-                ),
-                {"registry_id": self.registry_id},
-            )
-        ).mappings()
-        previous_hash = ""
-        count = 0
-        for row in rows:
-            if str(row["previous_event_hash"] or "") != previous_hash:
-                raise AuthorityError("MySQL authority audit hash chain is discontinuous")
-            calculated = self._audit_hash(
-                previous_hash=previous_hash,
-                registry_id=self.registry_id,
-                event_type=str(row["event_type"]),
-                epoch=int(row["authority_epoch"]),
-                backend=str(row["backend"] or ""),
-                generation_id=str(row["generation_id"] or ""),
-                owner_id=str(row["owner_id"] or ""),
-                payload=self._json_object(row["payload_json"]),
-            )
-            if not secrets.compare_digest(calculated, str(row["event_hash"] or "")):
-                raise AuthorityError("MySQL authority audit event hash mismatch")
-            previous_hash = calculated
-            count += 1
-        if previous_hash != expected_head:
-            raise AuthorityError("MySQL authority audit head does not match registry state")
-        return count
+        """Verify one audit head once per process, then reuse the exact proof."""
+
+        expected = str(expected_head or "")
+        async with self._audit_lock:
+            if expected == self._verified_audit_head:
+                return self._verified_audit_count
+            rows = (
+                await connection.execute(
+                    text(
+                        "SELECT event_type, authority_epoch, backend, generation_id, "
+                        "owner_id, payload_json, previous_event_hash, event_hash "
+                        "FROM storage_authority_events WHERE registry_id = :registry_id "
+                        "ORDER BY event_position"
+                    ),
+                    {"registry_id": self.registry_id},
+                )
+            ).mappings()
+            previous_hash = ""
+            count = 0
+            for row in rows:
+                if str(row["previous_event_hash"] or "") != previous_hash:
+                    raise AuthorityError(
+                        "MySQL authority audit hash chain is discontinuous"
+                    )
+                calculated = self._audit_hash(
+                    previous_hash=previous_hash,
+                    registry_id=self.registry_id,
+                    event_type=str(row["event_type"]),
+                    epoch=int(row["authority_epoch"]),
+                    backend=str(row["backend"] or ""),
+                    generation_id=str(row["generation_id"] or ""),
+                    owner_id=str(row["owner_id"] or ""),
+                    payload=self._json_object(row["payload_json"]),
+                )
+                if not secrets.compare_digest(
+                    calculated, str(row["event_hash"] or "")
+                ):
+                    raise AuthorityError("MySQL authority audit event hash mismatch")
+                previous_hash = calculated
+                count += 1
+            if previous_hash != expected:
+                raise AuthorityError(
+                    "MySQL authority audit head does not match registry state"
+                )
+            self._verified_audit_head = expected
+            self._verified_audit_count = count
+            return count
 
     async def _acquire_activation_lock(self, connection: AsyncConnection) -> None:
         acquired = await connection.scalar(
@@ -1068,6 +1085,104 @@ class MySQLAuthorityRegistry:
             lease_until=_iso(lease_until),
             fencing_token=secret,
         )
+
+    async def join_generation(
+        self,
+        generation_id: str,
+        *,
+        owner_id: str,
+    ) -> AuthorityToken:
+        """Join the active verified generation as a concurrent MySQL writer.
+
+        The token identifies the active generation revision rather than one
+        process lease. InnoDB transactions, stable identities, CAS revisions,
+        and idempotency constraints remain the write-conflict boundary.
+        """
+
+        await self.ensure_schema()
+        owner = owner_id.strip()
+        if not owner:
+            raise ValueError("authority owner_id must not be empty")
+        async with self.engine.begin() as connection:
+            row = (
+                await connection.execute(
+                    text(
+                        "SELECT g.backend, g.status, r.active_backend, "
+                        "r.active_generation, r.authority_epoch, r.last_event_hash "
+                        "FROM storage_backend_generations AS g "
+                        "JOIN storage_authority_registry AS r "
+                        "ON r.registry_id = :registry_id "
+                        "WHERE g.generation_id = :generation_id FOR SHARE"
+                    ),
+                    {
+                        "generation_id": generation_id,
+                        "registry_id": self.registry_id,
+                    },
+                )
+            ).mappings().one_or_none()
+            if row is None or str(row["status"]) != "verified":
+                raise GenerationNotVerified(
+                    f"generation is not verified: {generation_id}"
+                )
+            if not str(row["active_generation"] or ""):
+                raise AuthorityConflict("authority registry is not activated")
+            await self._verify_audit(
+                connection,
+                expected_head=str(row["last_event_hash"] or ""),
+            )
+            if str(row["active_generation"]) != generation_id:
+                raise AuthorityConflict(
+                    "configured generation is not the active shared generation"
+                )
+            if str(row["active_backend"]) != str(row["backend"]):
+                raise AuthorityConflict("active backend does not match generation")
+            epoch = int(row["authority_epoch"])
+            backend = str(row["backend"])
+        return AuthorityToken(
+            registry_id=self.registry_id,
+            backend=BackendKind(backend),
+            generation_id=generation_id,
+            authority_epoch=epoch,
+            owner_id=owner,
+            lease_until="9999-12-31T23:59:59+00:00",
+            fencing_token="shared-generation",
+        )
+
+    async def validate_shared_in_transaction(
+        self,
+        connection: AsyncConnection,
+        token: AuthorityToken,
+    ) -> None:
+        """Validate that a transaction still targets the active generation."""
+
+        row = (
+            await connection.execute(
+                text(
+                    "SELECT active_backend, active_generation, authority_epoch "
+                    "FROM storage_authority_registry "
+                    "WHERE registry_id = :registry_id FOR SHARE"
+                ),
+                {"registry_id": self.registry_id},
+            )
+        ).mappings().one_or_none()
+        if row is None:
+            raise StaleAuthorityToken("authority registry is not initialized")
+        checks = {
+            "registry_id": token.registry_id == self.registry_id,
+            "backend": str(row["active_backend"]) == token.backend.value,
+            "generation": str(row["active_generation"]) == token.generation_id,
+            "epoch": int(row["authority_epoch"]) == token.authority_epoch,
+        }
+        for name, valid in checks.items():
+            if not valid:
+                raise StaleAuthorityToken(
+                    f"shared generation token rejected by {name}"
+                )
+
+    async def validate_shared(self, token: AuthorityToken) -> None:
+        await self.ensure_schema()
+        async with self.engine.begin() as connection:
+            await self.validate_shared_in_transaction(connection, token)
 
     async def validate_in_transaction(
         self,
@@ -1261,7 +1376,7 @@ class MySQLAuthorityRegistry:
             )
             active = bool(str(row["active_generation"] or ""))
             return {
-                "status": "disabled" if not active else ("degraded" if expired else "healthy"),
+                "status": "healthy" if active else "disabled",
                 "registry_id": self.registry_id,
                 "active_backend": str(row["active_backend"] or ""),
                 "active_generation": str(row["active_generation"] or ""),

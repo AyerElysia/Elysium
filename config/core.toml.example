@@ -37,6 +37,40 @@ trajectory_queue_limit = 10000
 trajectory_raw_retention_days = 3
 trajectory_archive_retention_days = 0
 
+[personality]
+# ─── 角色身份（必填） ───────────────────────────
+nickname = "你的角色名"
+alias_names = ["昵称1", "昵称2"]
+
+# 核心人格：1-2 句话概括性格基调
+personality_core = "友好、活泼、乐于助人"
+
+# 人格侧面：补充性格细节（可多段）
+personality_side = ""
+
+# 身份特征：外在设定
+identity = "（年龄、外貌、身份等）"
+
+# 世界观背景故事（LLM 不应主动复述）
+background_story = ""
+
+# 表达风格
+reply_style = "自然口语化"
+
+# 安全底线
+safety_guidelines = [
+    "拒绝任何包含骚扰、冒犯、暴力、色情或危险内容的请求。",
+    "在拒绝时，请使用符合你人设的、坚定的语气。",
+    "不要执行任何可能被用于恶意目的的指令。",
+]
+
+# 负面行为列表
+negative_behaviors = [
+    "不主动提供个人信息。",
+    "不参与任何违法活动。",
+    "不发布任何形式的仇恨言论。",
+]
+
 [database]
 database_type = "sqlite"
 sqlite_path = "data/Elysium.db"

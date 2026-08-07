@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,8 +8,7 @@ from sqlalchemy import text
 
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.storage import factory as factory_module
-from plugins.life_engine.storage.authority import AuthorityConflict, FileAuthorityRegistry
-from plugins.life_engine.storage.models import AuthorityToken
+from plugins.life_engine.storage.authority import FileAuthorityRegistry
 from plugins.life_engine.storage.contracts import StorageRuntimeDisabled
 from plugins.life_engine.storage.factory import (
     GenerationGuardError,
@@ -230,7 +228,11 @@ async def test_mysql_factory_auto_acquires_without_static_epoch_or_token(
             return generation if generation_id == generation.generation_id else None
 
         async def health(self) -> dict[str, object]:
-            return {"status": "disabled", "authority_epoch": 7}
+            return {
+                "status": "disabled",
+                "authority_epoch": 7,
+                "active_generation": "",
+            }
 
         async def activate_generation(self, generation_id: str, **kwargs: object):
             acquired.update({"generation_id": generation_id, **kwargs})
@@ -238,6 +240,14 @@ async def test_mysql_factory_auto_acquires_without_static_epoch_or_token(
                 authority_epoch=8,
                 owner_id=str(kwargs["owner_id"]),
             )
+
+        async def validate_shared_in_transaction(
+            self, _connection: object, _token: object
+        ) -> None:
+            return None
+
+        async def validate_shared(self, _token: object) -> None:
+            return None
 
     monkeypatch.setattr(factory_module, "create_mysql_storage_engine", lambda _cfg: FakeEngine())
     monkeypatch.setattr(factory_module, "MySQLAuthorityRegistry", FakeRegistry)
@@ -258,6 +268,7 @@ async def test_mysql_factory_auto_acquires_without_static_epoch_or_token(
     )
     try:
         assert runtime.authority_token is not None
+        assert runtime.shared_writers is True
         assert acquired["expected_epoch"] == 7
         assert acquired["owner_id"] == "primary-writer"
         assert acquired["confirm_previous_writers_stopped"] is False
@@ -265,7 +276,7 @@ async def test_mysql_factory_auto_acquires_without_static_epoch_or_token(
         await runtime.close()
 
 
-async def test_mysql_factory_rejects_live_writer_conflict(
+async def test_mysql_factory_joins_live_shared_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     generation = BackendGeneration(
@@ -280,6 +291,9 @@ async def test_mysql_factory_rejects_live_writer_conflict(
         status=GenerationStatus.VERIFIED,
     )
 
+    joined: dict[str, object] = {}
+    shared_validations: list[object] = []
+
     class FakeEngine:
         async def dispose(self) -> None:
             return None
@@ -292,27 +306,50 @@ async def test_mysql_factory_rejects_live_writer_conflict(
             return generation
 
         async def health(self) -> dict[str, object]:
-            return {"status": "healthy", "authority_epoch": 9}
+            return {
+                "status": "healthy",
+                "authority_epoch": 9,
+                "active_generation": generation.generation_id,
+            }
 
-        async def activate_generation(self, _generation_id: str, **_kwargs: object):
-            raise AuthorityConflict("live authority exists")
+        async def join_generation(self, generation_id: str, **kwargs: object):
+            joined.update({"generation_id": generation_id, **kwargs})
+            return SimpleNamespace(authority_epoch=9, owner_id=kwargs["owner_id"])
+
+        async def validate_shared_in_transaction(
+            self, _connection: object, _token: object
+        ) -> None:
+            return None
+
+        async def validate_shared(self, token: object) -> None:
+            shared_validations.append(token)
 
     monkeypatch.setattr(factory_module, "create_mysql_storage_engine", lambda _cfg: FakeEngine())
     monkeypatch.setattr(factory_module, "MySQLAuthorityRegistry", FakeRegistry)
+    monkeypatch.setattr(factory_module, "async_sessionmaker", lambda *_args, **_kwargs: object())
 
-    with pytest.raises(AuthorityConflict, match="live authority exists"):
-        await open_storage_backend(
-            StorageFactorySettings(
-                enabled=True,
-                authoritative_backend=BackendKind.MYSQL,
-                backend_generation=generation.generation_id,
-                registry_id="factory-live-conflict",
-                authority_provider="mysql",
-                authority_owner_id="primary-writer",
-                mysql=MySQLBackendSettings(password="secret"),
-            ),
-            environment={},
-        )
+    runtime = await open_storage_backend(
+        StorageFactorySettings(
+            enabled=True,
+            authoritative_backend=BackendKind.MYSQL,
+            backend_generation=generation.generation_id,
+            registry_id="factory-live-shared",
+            authority_provider="mysql",
+            authority_owner_id="developer-two",
+            mysql=MySQLBackendSettings(password="secret"),
+        ),
+        environment={},
+    )
+    try:
+        assert runtime.shared_writers is True
+        assert joined == {
+            "generation_id": generation.generation_id,
+            "owner_id": "developer-two",
+        }
+        await runtime.renew_authority(lease_seconds=60)
+        assert shared_validations == [runtime.authority_token]
+    finally:
+        await runtime.close()
 
 
 async def test_factory_rejects_generation_schema_mismatch(tmp_path: Path) -> None:

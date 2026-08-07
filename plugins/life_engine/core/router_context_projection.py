@@ -96,6 +96,7 @@ class RouterContextProjection:
         ) = None
         self._current_source_digest = ""
         self._latest_source_digest = ""
+        self._latest_rendered = ""
         self._last_success_at = ""
         self._last_attempt_at = ""
         self._degraded_reason = ""
@@ -119,6 +120,7 @@ class RouterContextProjection:
         if not self.is_source_path(path):
             return False
         self._force_refresh = True
+        self._current_source_digest = ""
         self._wake_event.set()
         return True
 
@@ -195,13 +197,26 @@ class RouterContextProjection:
             await self._persist_health()
 
     async def ensure_current(self) -> str:
-        """Return only a projection matching the current source digest.
+        """Return only a projection matching the current authority marker.
 
-        Refresh failures are propagated. Returning an empty string would turn
-        an unavailable or stale projection into an apparently valid blank
-        context and conceal a remote authority gap from callers.
+        Selected remote storage performs one lightweight head-marker read on the
+        hot path. Unchanged authority then reuses the validated in-process
+        projection, avoiding repeated full document and projection-state reads.
+        A changed marker rebuilds from one coherent authority snapshot; failures
+        still propagate rather than serving the previous projection as current.
         """
 
+        if self.subject_store is not None and self._latest_rendered:
+            marker = await self._change_signature()
+            if (
+                marker == self._last_stat_signature
+                and self._latest_source_digest
+                and self._current_source_digest == self._latest_source_digest
+                and not self._force_refresh
+                and not self._degraded_reason
+            ):
+                return self._latest_rendered
+            self._last_stat_signature = marker
         return await self.refresh()
 
     async def ensure_current_snapshot(self) -> dict[str, Any] | None:
@@ -307,6 +322,7 @@ class RouterContextProjection:
                         source_digest,
                     )
                 if restored:
+                    self._latest_rendered = restored
                     self._mark_success(source_digest)
                     await self._persist_health()
                     return restored
@@ -341,6 +357,7 @@ class RouterContextProjection:
                         rendered,
                         draft.generator,
                     )
+                self._latest_rendered = rendered
                 self._mark_success(source_digest)
                 await self._persist_health()
                 return rendered
@@ -388,8 +405,16 @@ class RouterContextProjection:
         """Detect authority change from the bound source of truth only."""
 
         if self.subject_store is not None:
-            # mtime polling is meaningless without local files; the remote
-            # unified revision is the authoritative change marker.
+            marker_reader = getattr(
+                self.subject_store,
+                "current_subject_change_marker",
+                None,
+            )
+            if callable(marker_reader):
+                return str(await marker_reader())
+            # Compatibility for custom/older stores. Their revision API may be
+            # more expensive, but it preserves correctness until they implement
+            # the head-only marker contract.
             return str(await self.subject_store.current_subject_revision())
         return await asyncio.to_thread(self._source_stat_signature)
 
@@ -407,7 +432,11 @@ class RouterContextProjection:
     async def _load_sources(self) -> tuple[tuple[RouterContextSource, ...], str]:
         if self.subject_store is not None:
             snapshot = await self.subject_store.read_subject_authority()
-            return subject_authority_sources_from_snapshot(snapshot)
+            sources, source_digest = subject_authority_sources_from_snapshot(snapshot)
+            change_marker = str(getattr(snapshot, "change_marker", "") or "")
+            if change_marker:
+                self._last_stat_signature = change_marker
+            return sources, source_digest
         return await asyncio.to_thread(self._read_sources)
 
     def _read_sources(self) -> tuple[tuple[RouterContextSource, ...], str]:

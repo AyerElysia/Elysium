@@ -2,13 +2,14 @@
 
 启动 Neo-MoFox Bot 应用。
 """
+
 import asyncio
-from pathlib import Path
 import tomllib
+from contextlib import nullcontext
+from pathlib import Path
 
 from src.app.runtime.console_ui import UILevel
-from src.app.runtime.single_instance import AlreadyRunningError, SingleInstanceLock
-
+from src.app.runtime.single_instance import SingleInstanceLock
 
 _INSTANCE_LOCK_PATH = Path("data/runtime/elysium.lock")
 
@@ -49,6 +50,24 @@ def load_ui_level_from_config(config_path: str = "config/core.toml") -> UILevel:
     return level_map[ui_level_key]
 
 
+def runtime_startup_guard(
+    config_path: str = "config/core.toml",
+    *,
+    lock_path: str | Path = _INSTANCE_LOCK_PATH,
+) -> SingleInstanceLock | nullcontext[None]:
+    """Keep local SQLite single-process while allowing shared MySQL writers."""
+
+    path = Path(config_path)
+    if not path.exists():
+        return SingleInstanceLock(lock_path)
+    with path.open("rb") as f:
+        config = tomllib.load(f)
+    backend = str(config.get("storage", {}).get("backend", "local")).strip().lower()
+    if backend == "mysql":
+        return nullcontext()
+    return SingleInstanceLock(lock_path)
+
+
 async def main() -> None:
     """主函数"""
     from src.app.runtime import Bot
@@ -70,12 +89,9 @@ async def main() -> None:
 
 if __name__ == "__main__":
     try:
-        # 运行异步主函数
-        with SingleInstanceLock(_INSTANCE_LOCK_PATH):
+        # SQLite remains process-local; MySQL coordinates concurrent writers.
+        with runtime_startup_guard("config/core.toml"):
             asyncio.run(main())
-    except AlreadyRunningError as exc:
-        print(f"\n[Startup refused: {exc}]")
-        raise SystemExit(2) from exc
     except KeyboardInterrupt:
         # 用户中断（Ctrl+C）
         print("\n[Interrupted by user]")

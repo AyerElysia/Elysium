@@ -63,6 +63,7 @@ class StorageBackendRuntime:
     _writer_validator: WriterValidator | None = None
     writer_role: StorageWriterRole = StorageWriterRole.ACTIVE
     writer_epoch: int = 0
+    shared_writers: bool = False
     _closed: bool = False
 
     @classmethod
@@ -130,12 +131,15 @@ class StorageBackendRuntime:
         await self.authority_registry.validate(self.authority_token)
 
     async def renew_authority(self, *, lease_seconds: int) -> AuthorityToken:
-        """Renew the current lease without changing backend or generation."""
+        """Renew an exclusive lease or revalidate shared MySQL authority."""
 
         if self._closed:
             raise StorageRuntimeClosed("storage runtime is closed")
         if self.authority_registry is None or self.authority_token is None:
             raise StorageRuntimeDisabled("storage runtime is disabled")
+        if self.shared_writers:
+            await self.validate_writer()
+            return self.authority_token
         renewed = await self.authority_registry.renew(
             self.authority_token,
             lease_seconds=lease_seconds,
@@ -144,9 +148,12 @@ class StorageBackendRuntime:
         return renewed
 
     async def revoke_authority(self) -> int | None:
-        """Revoke this runtime's exact writer token during graceful shutdown."""
+        """Revoke an exclusive token; shared writers only release local ownership."""
 
         if self.authority_registry is None or self.authority_token is None:
+            return None
+        if self.shared_writers:
+            self.authority_token = None
             return None
         token = self.authority_token
         next_epoch = await self.authority_registry.revoke(token)
@@ -202,6 +209,7 @@ class StorageBackendRuntime:
             "backend_identity": self.backend_identity,
             "generation_id": self.generation.generation_id if self.generation else "",
             "schema_version": self.generation.schema_version if self.generation else 0,
+            "writer_mode": "shared" if self.shared_writers else "exclusive",
             "backend_health": backend_health,
             "authority_health": authority_health,
         }
