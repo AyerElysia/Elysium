@@ -615,7 +615,7 @@ class LifeSendTextAction(BaseAction):
             str,
             "本次主体自己选择提交的简洁内心活动。键和值都必填，必须是非空自然语言；"
             "不得从 provider reasoning 或 content 自动回填，也不得把它当作可见正文。",
-        ],
+        ] = "",
         mood: Annotated[
             str,
             "此刻的心情或情绪状态。键必填；没有明确情绪时传空字符串，禁止编造默认情绪。",
@@ -1893,9 +1893,15 @@ class LifeChatter(BaseChatter):
         }
         cleaned_payloads: list[LLMPayload] = []
         for payload in payloads:
+            original_content = list(getattr(payload, "content", None) or [])
+            contains_retired_think_call = any(
+                isinstance(part, ToolCall)
+                and part.name == _RETIRED_THINK_ACTION
+                for part in original_content
+            )
             content = [
                 part
-                for part in (getattr(payload, "content", None) or [])
+                for part in original_content
                 if not (
                     isinstance(part, ToolCall)
                     and part.name == _RETIRED_THINK_ACTION
@@ -1908,11 +1914,23 @@ class LifeChatter(BaseChatter):
                     )
                 )
             ]
+            if (
+                payload.role == ROLE.ASSISTANT
+                and contains_retired_think_call
+                and not any(isinstance(part, ToolCall) for part in content)
+            ):
+                # A retired think response can also contain incidental text,
+                # provider reasoning, or the legacy suspend marker.  Keeping
+                # those remnants after removing the call/result pair turns
+                # ``assistant -> think_result -> assistant`` into the invalid
+                # ``assistant -> assistant`` chain.  They are part of the old
+                # rolling projection ritual, not the authoritative trajectory.
+                continue
             if not content:
                 continue
             cleaned_payloads.append(
                 payload
-                if len(content) == len(getattr(payload, "content", None) or [])
+                if len(content) == len(original_content)
                 else LLMPayload(payload.role, content)  # type: ignore[arg-type]
             )
         return cleaned_payloads

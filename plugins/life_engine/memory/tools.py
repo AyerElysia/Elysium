@@ -9,8 +9,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import base64
+import hashlib
 import inspect
+import json
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Annotated, Any, List, Optional
 from uuid import uuid4
@@ -24,6 +27,62 @@ from .lineage import MemoryBundle
 from .service import LifeMemoryService
 
 logger = log_api.get_logger("life_engine.memory_tools")
+
+MEMORY_SEARCH_PROJECTION_VERSION = "memory-search-projection-v1"
+MEMORY_SEARCH_CORE_MAX_BYTES = 16 * 1024
+MEMORY_SEARCH_EXPRESSION_MAX_BYTES = 64 * 1024
+MEMORY_SEARCH_MAX_ITEM_EXCERPT_BYTES = 2 * 1024
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+
+
+def _sha256_json(value: Any) -> str:
+    return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+
+
+def _utf8_prefix(value: str, max_bytes: int) -> str:
+    budget = max(0, int(max_bytes))
+    encoded = str(value or "").encode("utf-8")
+    if len(encoded) <= budget:
+        return str(value or "")
+    return encoded[:budget].decode("utf-8", errors="ignore")
+
+
+def _memory_search_budget(task_name: str) -> int:
+    normalized = str(task_name or "").strip().lower()
+    if normalized in {"expression", "life_chatter"}:
+        return MEMORY_SEARCH_EXPRESSION_MAX_BYTES
+    return MEMORY_SEARCH_CORE_MAX_BYTES
+
+
+def _encode_memory_search_continuation(state: dict[str, Any]) -> str:
+    raw = _canonical_json_bytes(state)
+    body = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    checksum = hashlib.sha256(raw).hexdigest()[:16]
+    return f"{body}.{checksum}"
+
+
+def _decode_memory_search_continuation(token: str) -> dict[str, Any]:
+    try:
+        body, checksum = str(token or "").split(".", 1)
+        padded = body + "=" * (-len(body) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+        if hashlib.sha256(raw).hexdigest()[:16] != checksum:
+            raise ValueError("checksum mismatch")
+        loaded = json.loads(raw.decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError("invalid memory search continuation") from exc
+    if not isinstance(loaded, dict):
+        raise ValueError("invalid memory search continuation payload")
+    return loaded
 
 
 def _eligible_path_or_error(file_path: str) -> tuple[str | None, str | None]:
@@ -120,6 +179,334 @@ class LifeEngineSearchMemoryTool(BaseTool):
             raise RuntimeError("记忆服务未初始化")
         return service._memory_service
 
+    def _result_budget(self) -> int:
+        return _memory_search_budget(getattr(self, "_runtime_task_name", ""))
+
+    @staticmethod
+    def _projection_records(
+        evidence_results: list[Any],
+        bundles: list[MemoryBundle],
+    ) -> list[dict[str, Any]]:
+        records: dict[str, dict[str, Any]] = {}
+
+        def add_content(content: Any, link: dict[str, Any]) -> str:
+            text = str(content or "")
+            encoded = text.encode("utf-8")
+            digest = hashlib.sha256(encoded).hexdigest()
+            ref = f"memory-content:sha256:{digest}"
+            record = records.setdefault(
+                ref,
+                {
+                    "ref": ref,
+                    "content": text,
+                    "content_sha256": digest,
+                    "original_bytes": len(encoded),
+                    "links": [],
+                },
+            )
+            link_identity = _sha256_json(link)
+            if all(
+                _sha256_json(existing) != link_identity
+                for existing in record["links"]
+            ):
+                record["links"].append(link)
+            return ref
+
+        for item in evidence_results:
+            entity_ref = (
+                f"document:{item.record_id}"
+                if item.kind == "document_evidence"
+                else f"{item.kind}:{item.record_id}"
+            )
+            add_content(
+                item.content,
+                {
+                    "link_type": "evidence",
+                    "entity_ref": entity_ref,
+                    "record_id": item.record_id,
+                    "kind": item.kind,
+                    "rank_score": round(float(item.rank_score), 6),
+                    "confidence": item.confidence,
+                    "source": item.source,
+                    "valid_from": item.valid_from,
+                    "valid_to": item.valid_to,
+                    "recorded_at": item.recorded_at,
+                    "stream_scope": item.stream_scope,
+                    "visibility": item.visibility,
+                    "status": item.status,
+                    "provenance_count": len(item.provenance),
+                    "provenance_sha256": _sha256_json(list(item.provenance)),
+                    "metadata_bytes": len(_canonical_json_bytes(item.metadata)),
+                    "metadata_sha256": _sha256_json(item.metadata),
+                },
+            )
+
+        for bundle_index, bundle in enumerate(bundles):
+            bundle_id = (
+                "memory-bundle:"
+                + hashlib.sha256(
+                    f"{bundle_index}:{bundle.primary_path}".encode("utf-8")
+                ).hexdigest()
+            )
+            if bundle.current_understanding:
+                add_content(
+                    bundle.current_understanding,
+                    {
+                        "link_type": "bundle_current",
+                        "bundle_id": bundle_id,
+                        "primary_path": bundle.primary_path,
+                    },
+                )
+            for index, item in enumerate(bundle.evidence):
+                relation_reason_ref = ""
+                if item.relation_reason:
+                    relation_reason_ref = add_content(
+                        item.relation_reason,
+                        {
+                            "link_type": "bundle_relation_reason",
+                            "bundle_id": bundle_id,
+                            "ordinal": index,
+                            "file_path": item.file_path,
+                        },
+                    )
+                add_content(
+                    item.snippet,
+                    {
+                        "link_type": "bundle_evidence",
+                        "bundle_id": bundle_id,
+                        "ordinal": index,
+                        "file_path": item.file_path,
+                        "title": item.title,
+                        "relevance": round(float(item.relevance), 3),
+                        "source": item.source,
+                        "relation": item.relation,
+                        "relation_reason_ref": relation_reason_ref,
+                        "exists": bool(item.exists),
+                    },
+                )
+            for index, item in enumerate(bundle.history_trace):
+                reason_ref = ""
+                if item.reason:
+                    reason_ref = add_content(
+                        item.reason,
+                        {
+                            "link_type": "bundle_history_reason",
+                            "bundle_id": bundle_id,
+                            "ordinal": index,
+                            "file_path": item.file_path,
+                        },
+                    )
+                add_content(
+                    item.snippet,
+                    {
+                        "link_type": "bundle_history",
+                        "bundle_id": bundle_id,
+                        "ordinal": index,
+                        "direction": item.direction,
+                        "relation": item.relation,
+                        "file_path": item.file_path,
+                        "title": item.title,
+                        "reason_ref": reason_ref,
+                        "exists": bool(item.exists),
+                    },
+                )
+            for index, item in enumerate(bundle.corrections):
+                add_content(
+                    item.message,
+                    {
+                        "link_type": "bundle_correction",
+                        "bundle_id": bundle_id,
+                        "ordinal": index,
+                        "topic": item.topic,
+                        "source": item.source,
+                        "created_at": item.created_at,
+                    },
+                )
+            if bundle.uncertainty:
+                add_content(
+                    bundle.uncertainty,
+                    {
+                        "link_type": "bundle_uncertainty",
+                        "bundle_id": bundle_id,
+                    },
+                )
+        return list(records.values())
+
+    @staticmethod
+    def _project_record(
+        record: dict[str, Any],
+        *,
+        delivery: str,
+        excerpt_bytes: int = 0,
+    ) -> dict[str, Any]:
+        projected = {
+            "ref": record["ref"],
+            "content_sha256": record["content_sha256"],
+            "original_bytes": int(record["original_bytes"]),
+            "delivery": delivery,
+            "links": list(record["links"]),
+        }
+        if delivery == "full":
+            projected["content"] = record["content"]
+            projected["delivered_content_bytes"] = int(record["original_bytes"])
+        elif delivery == "excerpt":
+            excerpt = _utf8_prefix(record["content"], excerpt_bytes)
+            projected["content"] = excerpt
+            projected["delivered_content_bytes"] = len(excerpt.encode("utf-8"))
+        else:
+            projected["delivered_content_bytes"] = 0
+        return projected
+
+    @staticmethod
+    def _projection_indexes(
+        items: list[dict[str, Any]],
+    ) -> tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
+        evidence: list[dict[str, Any]] = []
+        direct: list[dict[str, Any]] = []
+        associated: list[dict[str, Any]] = []
+        bundles: dict[str, dict[str, Any]] = {}
+        for item in items:
+            content_ref = str(item["ref"])
+            delivery = str(item["delivery"])
+            for link in item["links"]:
+                kind = str(link.get("link_type") or "")
+                projected_link = {
+                    key: value
+                    for key, value in link.items()
+                    if key != "link_type"
+                }
+                projected_link.update(
+                    {
+                        "content_ref": content_ref,
+                        "content_delivery": delivery,
+                    }
+                )
+                if kind == "evidence":
+                    evidence.append(projected_link)
+                    continue
+                bundle_id = str(link.get("bundle_id") or "")
+                if not bundle_id:
+                    continue
+                bundle = bundles.setdefault(
+                    bundle_id,
+                    {
+                        "bundle_id": bundle_id,
+                        "primary_path": str(link.get("primary_path") or ""),
+                        "current_refs": [],
+                        "evidence_refs": [],
+                        "history_refs": [],
+                        "correction_refs": [],
+                        "uncertainty_refs": [],
+                        "relation_reason_refs": [],
+                    },
+                )
+                if link.get("primary_path") and not bundle["primary_path"]:
+                    bundle["primary_path"] = str(link["primary_path"])
+                if kind == "bundle_current":
+                    bundle["current_refs"].append(content_ref)
+                elif kind == "bundle_evidence":
+                    relation = dict(projected_link)
+                    bundle["evidence_refs"].append(content_ref)
+                    if str(link.get("source") or "") == "associated":
+                        associated.append(relation)
+                    else:
+                        direct.append(relation)
+                elif kind == "bundle_history":
+                    bundle["history_refs"].append(content_ref)
+                elif kind == "bundle_correction":
+                    bundle["correction_refs"].append(content_ref)
+                elif kind == "bundle_uncertainty":
+                    bundle["uncertainty_refs"].append(content_ref)
+                elif kind in {"bundle_relation_reason", "bundle_history_reason"}:
+                    bundle["relation_reason_refs"].append(content_ref)
+        return evidence, direct, associated, list(bundles.values())
+
+    @classmethod
+    def _projection_payload(
+        cls,
+        *,
+        query: str,
+        mode: str,
+        stream_scope: str | None,
+        valid_at: str,
+        recorded_as_of: str,
+        episode: Any,
+        trace_persisted: bool,
+        items: list[dict[str, Any]],
+        total_evidence: int,
+        budget: int,
+        frontier_sha256: str,
+        original_items: int,
+        original_bytes: int,
+        omitted_items: int,
+        truncated: bool,
+        continuation: str,
+    ) -> dict[str, Any]:
+        evidence, direct, associated, bundles = cls._projection_indexes(items)
+        return {
+            "action": "search_memory",
+            "query": query,
+            "query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+            "direct_results": direct,
+            "associated_results": associated,
+            "memory_bundles": bundles,
+            "search_mode": mode,
+            "stream_scope": stream_scope,
+            "valid_at": valid_at,
+            "recorded_as_of": recorded_as_of,
+            "recall_episode": {
+                "episode_id": episode.episode_id,
+                "policy_version": episode.policy_version,
+                "random_seed": episode.random_seed,
+                "context_key": episode.context_key,
+                "persisted": trace_persisted,
+            },
+            "evidence_results": evidence,
+            "canonical_items": items,
+            "total_found": total_evidence,
+            "projection_version": MEMORY_SEARCH_PROJECTION_VERSION,
+            "frontier_sha256": frontier_sha256,
+            "budget_bytes": budget,
+            "original_bytes": original_bytes,
+            "original_items": original_items,
+            "delivered_bytes": 0,
+            "delivered_items": len(items),
+            "omitted_bytes": 0,
+            "omitted_items": omitted_items,
+            "truncated": truncated,
+            "continuation": continuation,
+        }
+
+    @staticmethod
+    def _finalize_projection_bytes(
+        payload: dict[str, Any],
+        *,
+        original_bytes: int,
+        force_no_omission: bool = False,
+    ) -> dict[str, Any]:
+        finalized = dict(payload)
+        finalized["delivered_bytes"] = 0
+        finalized["omitted_bytes"] = 0
+        for _ in range(32):
+            actual = len(str(finalized).encode("utf-8"))
+            omitted = 0 if force_no_omission else max(
+                0,
+                int(original_bytes) - actual,
+            )
+            if (
+                int(finalized["delivered_bytes"]) == actual
+                and int(finalized["omitted_bytes"]) == omitted
+            ):
+                return finalized
+            finalized["delivered_bytes"] = actual
+            finalized["omitted_bytes"] = omitted
+        raise RuntimeError("memory search projection byte accounting did not converge")
+
     async def execute(
         self,
         query: Annotated[str, "搜索问题"],
@@ -143,12 +530,31 @@ class LifeEngineSearchMemoryTool(BaseTool):
             str,
             "查询系统在何时已经知道的记录；ISO 8601，留空表示当前",
         ] = "",
+        continuation: Annotated[
+            str,
+            "可选；上一页返回的稳定 continuation。查询或结果前沿变化时会显式失败。",
+        ] = "",
     ) -> tuple[bool, dict[str, Any]]:
         """执行记忆搜索。"""
         if not query or not query.strip():
             return False, {"error": "query 不能为空"}
 
         mode = str(search_mode or "").strip()
+        normalized_query = query.strip()
+        query_sha256 = hashlib.sha256(normalized_query.encode("utf-8")).hexdigest()
+        budget = self._result_budget()
+        continuation_state: dict[str, Any] | None = None
+        if continuation:
+            try:
+                continuation_state = _decode_memory_search_continuation(continuation)
+            except ValueError as exc:
+                return False, {"error": str(exc)}
+            if (
+                continuation_state.get("version") != MEMORY_SEARCH_PROJECTION_VERSION
+                or continuation_state.get("query_sha256") != query_sha256
+                or int(continuation_state.get("budget_bytes") or 0) != budget
+            ):
+                return False, {"error": "memory search continuation does not match this query/task"}
 
         try:
             service = await self._get_service()
@@ -164,7 +570,7 @@ class LifeEngineSearchMemoryTool(BaseTool):
             trace_persisted = callable(begin_recall)
             if trace_persisted:
                 episode = await begin_recall(
-                    query=query.strip(),
+                    query=normalized_query,
                     retrieval_intent=mode,
                     consciousness_instance_id="life_engine",
                     stream_scope=effective_stream,
@@ -184,8 +590,13 @@ class LifeEngineSearchMemoryTool(BaseTool):
                     random_seed=uuid4().int & ((1 << 63) - 1),
                     context_key=context_key,
                 )
+            retrieval_seed = (
+                int(continuation_state.get("random_seed") or 0)
+                if continuation_state is not None
+                else int(episode.random_seed)
+            )
             document_results = await service.search_memory(
-                query.strip(),
+                normalized_query,
                 top_k=top_k,
                 enable_association=enable_association,
                 file_types=file_types,
@@ -201,13 +612,13 @@ class LifeEngineSearchMemoryTool(BaseTool):
                 document_results = await expand_associations(
                     document_results,
                     context_key=context_key,
-                    random_seed=episode.random_seed,
+                    random_seed=retrieval_seed,
                     limit=max(0, int(top_k)),
                 )
             build_bundles = getattr(service, "build_memory_bundles", None)
             bundles = (
                 await build_bundles(
-                    query=query.strip(),
+                    query=normalized_query,
                     results=document_results,
                     top_k=top_k,
                 )
@@ -234,8 +645,8 @@ class LifeEngineSearchMemoryTool(BaseTool):
                 for item in parameters.values()
             ):
                 evidence_kwargs["association_context_key"] = context_key
-                evidence_kwargs["association_random_seed"] = episode.random_seed
-            evidence_results = await evidence_search(query.strip(), **evidence_kwargs)
+                evidence_kwargs["association_random_seed"] = retrieval_seed
+            evidence_results = await evidence_search(normalized_query, **evidence_kwargs)
 
             now_iso = datetime.now(timezone.utc).astimezone().isoformat()
 
@@ -243,6 +654,165 @@ class LifeEngineSearchMemoryTool(BaseTool):
                 prefix = "document" if item.kind == "document_evidence" else item.kind
                 return f"{prefix}:{item.record_id}"
 
+            records = self._projection_records(evidence_results, bundles)
+            frontier_sha256 = _sha256_json(
+                [
+                    {
+                        "ref": record["ref"],
+                        "links_sha256": _sha256_json(record["links"]),
+                    }
+                    for record in records
+                ]
+            )
+            if continuation_state is not None and (
+                continuation_state.get("frontier_sha256") != frontier_sha256
+                or int(continuation_state.get("random_seed") or 0) != retrieval_seed
+            ):
+                return False, {"error": "memory search continuation frontier changed"}
+            offset = (
+                int(continuation_state.get("offset") or 0)
+                if continuation_state is not None
+                else 0
+            )
+            if offset < 0 or offset > len(records):
+                return False, {"error": "memory search continuation offset is invalid"}
+
+            projection_episode = SimpleNamespace(
+                episode_id=episode.episode_id,
+                policy_version=episode.policy_version,
+                random_seed=retrieval_seed,
+                context_key=episode.context_key,
+            )
+            full_items = [
+                self._project_record(record, delivery="full")
+                for record in records
+            ]
+            original_bytes = 0
+            for _ in range(12):
+                original_payload = self._projection_payload(
+                    query=normalized_query,
+                    mode=mode,
+                    stream_scope=stream_scope,
+                    valid_at=valid_at,
+                    recorded_as_of=recorded_as_of,
+                    episode=projection_episode,
+                    trace_persisted=trace_persisted,
+                    items=full_items,
+                    total_evidence=len(evidence_results),
+                    budget=budget,
+                    frontier_sha256=frontier_sha256,
+                    original_items=len(records),
+                    original_bytes=original_bytes,
+                    omitted_items=0,
+                    truncated=False,
+                    continuation="",
+                )
+                original_payload = self._finalize_projection_bytes(
+                    original_payload,
+                    original_bytes=original_bytes,
+                    force_no_omission=True,
+                )
+                measured = int(original_payload["delivered_bytes"])
+                if measured == original_bytes:
+                    break
+                original_bytes = measured
+
+            selected_items: list[dict[str, Any]] = []
+            final_payload: dict[str, Any] | None = None
+            for index in range(offset, len(records)):
+                record = records[index]
+                variants = [self._project_record(record, delivery="full")]
+                if int(record["original_bytes"]) > MEMORY_SEARCH_MAX_ITEM_EXCERPT_BYTES:
+                    variants.append(
+                        self._project_record(
+                            record,
+                            delivery="excerpt",
+                            excerpt_bytes=MEMORY_SEARCH_MAX_ITEM_EXCERPT_BYTES,
+                        )
+                    )
+                variants.append(self._project_record(record, delivery="ref"))
+                accepted: tuple[dict[str, Any], dict[str, Any]] | None = None
+                for variant in variants:
+                    candidate_items = [*selected_items, variant]
+                    candidate_offset = index + 1
+                    candidate_continuation = ""
+                    if candidate_offset < len(records):
+                        candidate_continuation = _encode_memory_search_continuation(
+                            {
+                                "version": MEMORY_SEARCH_PROJECTION_VERSION,
+                                "query_sha256": query_sha256,
+                                "frontier_sha256": frontier_sha256,
+                                "offset": candidate_offset,
+                                "random_seed": retrieval_seed,
+                                "budget_bytes": budget,
+                            }
+                        )
+                    candidate_payload = self._projection_payload(
+                        query=normalized_query,
+                        mode=mode,
+                        stream_scope=stream_scope,
+                        valid_at=valid_at,
+                        recorded_as_of=recorded_as_of,
+                        episode=projection_episode,
+                        trace_persisted=trace_persisted,
+                        items=candidate_items,
+                        total_evidence=len(evidence_results),
+                        budget=budget,
+                        frontier_sha256=frontier_sha256,
+                        original_items=len(records),
+                        original_bytes=original_bytes,
+                        omitted_items=len(records) - candidate_offset,
+                        truncated=(
+                            candidate_offset < len(records)
+                            or any(
+                                str(item["delivery"]) != "full"
+                                for item in candidate_items
+                            )
+                        ),
+                        continuation=candidate_continuation,
+                    )
+                    candidate_payload = self._finalize_projection_bytes(
+                        candidate_payload,
+                        original_bytes=original_bytes,
+                    )
+                    if int(candidate_payload["delivered_bytes"]) <= budget:
+                        accepted = variant, candidate_payload
+                        break
+                if accepted is None:
+                    break
+                selected_items.append(accepted[0])
+                final_payload = accepted[1]
+
+            if final_payload is None:
+                if records and offset < len(records):
+                    return False, {"error": "memory search projection budget cannot fit one ref"}
+                final_payload = self._projection_payload(
+                    query=normalized_query,
+                    mode=mode,
+                    stream_scope=stream_scope,
+                    valid_at=valid_at,
+                    recorded_as_of=recorded_as_of,
+                    episode=projection_episode,
+                    trace_persisted=trace_persisted,
+                    items=[],
+                    total_evidence=len(evidence_results),
+                    budget=budget,
+                    frontier_sha256=frontier_sha256,
+                    original_items=len(records),
+                    original_bytes=original_bytes,
+                    omitted_items=0,
+                    truncated=False,
+                    continuation="",
+                )
+                final_payload = self._finalize_projection_bytes(
+                    final_payload,
+                    original_bytes=original_bytes,
+                )
+
+            delivered_evidence = {
+                str(item["entity_ref"]): item
+                for item in final_payload["evidence_results"]
+            }
             recall_events = tuple(
                 RecallEvent(
                     event_id=f"recall_event_{uuid4().hex}",
@@ -255,12 +825,20 @@ class LifeEngineSearchMemoryTool(BaseTool):
                     metadata={
                         "rank_score": item.rank_score,
                         "rank_is_not_truth": True,
+                        "projection_version": MEMORY_SEARCH_PROJECTION_VERSION,
+                        "content_delivery": delivered_evidence[_entity_ref(item)][
+                            "content_delivery"
+                        ],
+                        "content_ref": delivered_evidence[_entity_ref(item)][
+                            "content_ref"
+                        ],
                     },
                 )
                 for index, item in enumerate(evidence_results)
+                if _entity_ref(item) in delivered_evidence
             )
             append_events = getattr(service, "append_memory_recall_events", None)
-            if callable(append_events):
+            if recall_events and callable(append_events):
                 await append_events(recall_events)
             recalled_refs = tuple(
                 dict.fromkeys(event.entity_ref for event in recall_events)
@@ -269,80 +847,25 @@ class LifeEngineSearchMemoryTool(BaseTool):
                 append_corecall = getattr(service, "append_memory_corecall", None)
                 if callable(append_corecall):
                     await append_corecall(
-                    CoRecallEvent(
-                        corecall_id=f"corecall_{uuid4().hex}",
-                        episode_id=episode.episode_id,
-                        context_key=context_key,
-                        signal="co_exposed_in_recall",
-                        entity_refs=recalled_refs,
-                        actor="life_engine",
-                        reason="同一次检索中共同进入意识上下文",
-                        recorded_at=now_iso,
+                        CoRecallEvent(
+                            corecall_id=f"corecall_{uuid4().hex}",
+                            episode_id=episode.episode_id,
+                            context_key=context_key,
+                            signal="co_exposed_in_recall",
+                            entity_refs=recalled_refs,
+                            actor="life_engine",
+                            reason="同一次有界检索投影中共同交付",
+                            recorded_at=now_iso,
+                            metadata={
+                                "projection_version": MEMORY_SEARCH_PROJECTION_VERSION,
+                                "frontier_sha256": frontier_sha256,
+                            },
                         )
                     )
 
-            # 从 bundle.evidence 提取检索摘要，保持和原有 JSON 结构兼容
-            seen_paths: set[str] = set()
-            direct_results: list[dict] = []
-            associated_results: list[dict] = []
-            for bundle in bundles:
-                for ev in bundle.evidence:
-                    fp = str(getattr(ev, "file_path", "") or "").strip()
-                    if not fp or fp in seen_paths:
-                        continue
-                    seen_paths.add(fp)
-                    item: dict = {
-                        "file_path": fp,
-                        "title": getattr(ev, "title", "") or "",
-                        "snippet": getattr(ev, "snippet", "") or "",
-                        "relevance": round(float(getattr(ev, "relevance", 0) or 0), 3),
-                    }
-                    src = str(getattr(ev, "source", "") or "")
-                    if src == "associated":
-                        item["association_path"] = getattr(ev, "relation", "") or ""
-                        item["association_reason"] = getattr(ev, "relation_reason", "") or ""
-                        associated_results.append(item)
-                    else:
-                        direct_results.append(item)
-
-            return True, {
-                "action": "search_memory",
-                "query": query,
-                "direct_results": direct_results,
-                "associated_results": associated_results,
-                "memory_bundles": [_bundle_to_payload(bundle) for bundle in bundles],
-                "search_mode": mode,
-                "stream_scope": stream_scope,
-                "valid_at": valid_at,
-                "recorded_as_of": recorded_as_of,
-                "recall_episode": {
-                    "episode_id": episode.episode_id,
-                    "policy_version": episode.policy_version,
-                    "random_seed": episode.random_seed,
-                    "context_key": episode.context_key,
-                    "persisted": trace_persisted,
-                },
-                "evidence_results": [
-                    {
-                        "record_id": item.record_id,
-                        "kind": item.kind,
-                        "content": item.content,
-                        "rank_score": round(item.rank_score, 6),
-                        "confidence": item.confidence,
-                        "source": item.source,
-                        "valid_from": item.valid_from,
-                        "valid_to": item.valid_to,
-                        "recorded_at": item.recorded_at,
-                        "stream_scope": item.stream_scope,
-                        "visibility": item.visibility,
-                        "status": item.status,
-                        "provenance": list(item.provenance),
-                        "metadata": item.metadata,
-                    }
-                    for item in evidence_results
-                ],
-                "total_found": len(evidence_results),
-            }
+            if len(str(final_payload).encode("utf-8")) > budget:
+                return False, {"error": "memory search projection exceeded hard budget"}
+            return True, final_payload
 
         except Exception as e:
             logger.error(f"记忆搜索失败: {e}", exc_info=True)
