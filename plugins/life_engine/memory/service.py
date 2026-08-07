@@ -85,6 +85,8 @@ from .lineage import (
     MemoryTrace,
 )
 from .living import (
+    ArtifactHead,
+    ArtifactHeadConflict,
     AssociationEvidence,
     AssociationSelection,
     CoRecallEvent,
@@ -129,6 +131,9 @@ logger = log_api.get_logger("life_engine.memory")
 # 启动补索引时一次性读入内存的文档数。这不是行为阈值：分批与否不改变最终被
 # 索引的文件集合，只决定峰值内存——整个工作区的正文同时驻留可能是数百 MB。
 _RECOVERY_READ_BATCH = 32
+# Projection repair is committed in bounded batches so remote MySQL never holds
+# every ghost node and vector tombstone in one long startup transaction.
+_RECOVERY_DELETE_BATCH = 64
 
 
 @dataclass(frozen=True)
@@ -734,10 +739,18 @@ class LifeMemoryService:
             indexed[path].node_id for path in sorted(set(indexed) - workspace_paths)
         ]
         if missing_node_ids:
-            retired = await storage.document_index.mark_documents_deleted(
-                missing_node_ids
-            )
-            logger.info(f"启动清理：标记 {retired} 个 ghost 节点为已删除")
+            retired = 0
+            total = len(missing_node_ids)
+            logger.info(f"启动清理：发现 {total} 个 ghost 节点，开始分批修复投影")
+            for start in range(0, total, _RECOVERY_DELETE_BATCH):
+                batch = missing_node_ids[start : start + _RECOVERY_DELETE_BATCH]
+                retired += await storage.document_index.mark_documents_deleted(batch)
+                logger.info(
+                    "启动清理进度："
+                    f"已检查 {min(start + len(batch), total)}/{total}，"
+                    f"已标记 {retired} 个 ghost 节点"
+                )
+            logger.info(f"启动清理完成：标记 {retired} 个 ghost 节点为已删除")
         orphaned = await storage.legacy_graph.prune_orphan_edges()
         if orphaned:
             logger.info(f"启动清理：删除 {orphaned} 条孤立边")
@@ -748,6 +761,121 @@ class LifeMemoryService:
         )
         if versioned:
             logger.info(f"启动扫描：记忆版本账本追加 {versioned} 个观察版本")
+
+    @staticmethod
+    async def _refresh_artifact_head(
+        living: Any,
+        logical_key: str,
+    ) -> tuple[MemoryArtifactVersion | None, ArtifactHead | None]:
+        head = await living.get_artifact_head(logical_key)
+        if head is None:
+            return None, None
+        history = await living.list_artifact_history(logical_key)
+        version = next(
+            (item for item in history if item.artifact_id == head.artifact_id),
+            None,
+        )
+        if version is None:
+            raise ArtifactHeadConflict(
+                f"artifact head references missing version for {logical_key!r}"
+            )
+        return version, head
+
+    async def _append_workspace_observation(
+        self,
+        *,
+        living: Any,
+        logical_key: str,
+        content: str,
+        source_mtime: float | None,
+        deleted: bool,
+        current_version: MemoryArtifactVersion | None,
+        current_head: ArtifactHead | None,
+    ) -> bool:
+        for attempt in range(2):
+            if deleted:
+                if current_version is None or (
+                    current_version.artifact_kind
+                    == "workspace_memory_document_tombstone"
+                ):
+                    return False
+                artifact_kind = "workspace_memory_document_tombstone"
+                observed_content = ""
+                observation = "startup_observed_deletion"
+                predicate = "workspace_deletion_observed"
+                reason = "启动时观察到记忆文件已不存在"
+                valid_from = ""
+                metadata: dict[str, Any] = {"observation": observation}
+            else:
+                if current_version is not None and (
+                    current_version.artifact_kind == "workspace_memory_document"
+                    and current_version.content == content
+                ):
+                    return False
+                artifact_kind = "workspace_memory_document"
+                observed_content = content
+                observation = (
+                    "startup_baseline"
+                    if current_version is None
+                    else "startup_observed_change"
+                )
+                predicate = "workspace_change_observed"
+                reason = "启动时观察到工作区内容与已知版本不同"
+                valid_from = (
+                    datetime.fromtimestamp(source_mtime).astimezone().isoformat()
+                    if source_mtime is not None
+                    else ""
+                )
+                metadata = {
+                    "observation": observation,
+                    "source_mtime": source_mtime,
+                }
+            version = new_artifact_version(
+                logical_key=logical_key,
+                artifact_kind=artifact_kind,
+                content=observed_content,
+                parent_artifact_ids=(current_version.artifact_id,)
+                if current_version is not None
+                else (),
+                authored_by="workspace_reconciler",
+                consciousness_instance_id="life_engine",
+                valid_from=valid_from,
+                metadata=metadata,
+            )
+            derivations: tuple[MemoryDerivation, ...] = ()
+            if current_version is not None:
+                derivations = (
+                    MemoryDerivation(
+                        derivation_id=f"derivation_{uuid.uuid4().hex}",
+                        generated_artifact_id=version.artifact_id,
+                        used_artifact_id=current_version.artifact_id,
+                        predicate=predicate,
+                        reason=reason,
+                        actor="workspace_reconciler",
+                        recorded_at=version.recorded_at,
+                    ),
+                )
+            try:
+                await living.append_artifact(
+                    version,
+                    derivations=derivations,
+                    expected_head_revision=current_head.revision
+                    if current_head is not None
+                    else 0,
+                )
+                return True
+            except ArtifactHeadConflict:
+                if attempt == 1:
+                    raise
+                current_version, current_head = await self._refresh_artifact_head(
+                    living,
+                    logical_key,
+                )
+                logger.info(
+                    "启动版本对账检测到并发 head 推进，已刷新后重试一次: "
+                    f"path={logical_key}"
+                )
+        return False
 
     async def _reconcile_workspace_artifact_versions_via_ports(
         self,
@@ -760,81 +888,32 @@ class LifeMemoryService:
         appended = 0
         for logical_key, (content, source_mtime) in loaded.items():
             current = heads.get(logical_key)
-            current_version = current[0] if current is not None else None
-            current_head = current[1] if current is not None else None
-            if current_version is not None and current_version.content == content:
-                continue
-            version = new_artifact_version(
-                logical_key=logical_key,
-                artifact_kind="workspace_memory_document",
-                content=content,
-                parent_artifact_ids=(current_version.artifact_id,)
-                if current_version is not None
-                else (),
-                authored_by="workspace_reconciler",
-                consciousness_instance_id="life_engine",
-                valid_from=datetime.fromtimestamp(source_mtime)
-                .astimezone()
-                .isoformat(),
-                metadata={
-                    "observation": "startup_baseline"
-                    if current_version is None
-                    else "startup_observed_change",
-                    "source_mtime": source_mtime,
-                },
-            )
-            derivations: tuple[MemoryDerivation, ...] = ()
-            if current_version is not None:
-                derivations = (
-                    MemoryDerivation(
-                        derivation_id=f"derivation_{uuid.uuid4().hex}",
-                        generated_artifact_id=version.artifact_id,
-                        used_artifact_id=current_version.artifact_id,
-                        predicate="workspace_change_observed",
-                        reason="启动时观察到工作区内容与已知版本不同",
-                        actor="workspace_reconciler",
-                        recorded_at=version.recorded_at,
-                    ),
+            appended += int(
+                await self._append_workspace_observation(
+                    living=living,
+                    logical_key=logical_key,
+                    content=content,
+                    source_mtime=source_mtime,
+                    deleted=False,
+                    current_version=current[0] if current is not None else None,
+                    current_head=current[1] if current is not None else None,
                 )
-            await living.append_artifact(
-                version,
-                derivations=derivations,
-                expected_head_revision=current_head.revision
-                if current_head is not None
-                else 0,
             )
-            appended += 1
 
         for logical_key, (current_version, current_head) in heads.items():
             if logical_key in workspace_paths:
                 continue
-            if current_version.artifact_kind == "workspace_memory_document_tombstone":
-                continue
-            tombstone = new_artifact_version(
-                logical_key=logical_key,
-                artifact_kind="workspace_memory_document_tombstone",
-                content="",
-                parent_artifact_ids=(current_version.artifact_id,),
-                authored_by="workspace_reconciler",
-                consciousness_instance_id="life_engine",
-                metadata={"observation": "startup_observed_deletion"},
+            appended += int(
+                await self._append_workspace_observation(
+                    living=living,
+                    logical_key=logical_key,
+                    content="",
+                    source_mtime=None,
+                    deleted=True,
+                    current_version=current_version,
+                    current_head=current_head,
+                )
             )
-            await living.append_artifact(
-                tombstone,
-                derivations=(
-                    MemoryDerivation(
-                        derivation_id=f"derivation_{uuid.uuid4().hex}",
-                        generated_artifact_id=tombstone.artifact_id,
-                        used_artifact_id=current_version.artifact_id,
-                        predicate="workspace_deletion_observed",
-                        reason="启动时观察到记忆文件已不存在",
-                        actor="workspace_reconciler",
-                        recorded_at=tombstone.recorded_at,
-                    ),
-                ),
-                expected_head_revision=current_head.revision,
-            )
-            appended += 1
         return appended
 
     async def _reconcile_workspace_artifact_versions(

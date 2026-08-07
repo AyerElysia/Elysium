@@ -10,7 +10,7 @@ from plugins.life_engine.tools.file_tools import (
     LifeEngineEditFileTool,
     LifeEngineWriteFileTool,
 )
-from plugins.life_engine.trace.store import LifeTraceStore
+from plugins.life_engine.trace.store import AsyncLocalLifeTraceStore, LifeTraceStore
 from plugins.life_engine.trace.tools import (
     LifeTraceFileHistoryTool,
     LifeTracePreviewVersionTool,
@@ -22,7 +22,11 @@ from plugins.life_engine.trace.tools import (
 def _plugin(tmp_path: Path) -> SimpleNamespace:
     config = LifeEngineConfig()
     config.settings.workspace_path = str(tmp_path)
-    return SimpleNamespace(config=config)
+    service = SimpleNamespace(
+        _selectable_storage_enabled=False,
+        life_trace_store=lambda: AsyncLocalLifeTraceStore(tmp_path),
+    )
+    return SimpleNamespace(config=config, service=service)
 
 
 async def test_write_and_edit_file_records_trace(tmp_path: Path) -> None:

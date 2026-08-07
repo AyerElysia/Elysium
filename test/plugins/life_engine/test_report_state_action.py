@@ -47,6 +47,7 @@ async def test_report_state_updates_the_active_voice_scene(monkeypatch: pytest.M
 
     assert success is True
     assert "assertion-test" in result
+    assert "不是 MEMORY.md 主体文档提交" in result
     assert reports == [
         {
             "report": "工具链真实验证成功",

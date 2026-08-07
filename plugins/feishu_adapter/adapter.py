@@ -613,6 +613,33 @@ class FeishuAdapter(BaseAdapter):
             },
         }
 
+    async def _persisted_identity(
+        self,
+        account_id: str,
+    ) -> tuple[str, str]:
+        """Read an exact platform identity previously persisted by Core."""
+
+        if not account_id:
+            return "", ""
+        try:
+            from src.core.utils.user_query_helper import get_user_query_helper
+
+            person = await get_user_query_helper().get_person_info(PLATFORM, account_id)
+        except Exception as exc:  # noqa: BLE001 - identity lookup must not drop messages
+            logger.debug(f"飞书数据库身份读取失败: {type(exc).__name__}")
+            return "", ""
+        if person is None:
+            return "", ""
+        display_name = str(getattr(person, "nickname", "") or "").strip()
+        canonical_key = str(
+            getattr(person, "canonical_person_key", "") or ""
+        ).strip()
+        if self._looks_like_raw_id(display_name) or display_name.startswith(
+            "身份未解析的飞书用户"
+        ):
+            display_name = ""
+        return display_name, canonical_key
+
     async def from_platform_message(  # type: ignore[override]
         self,
         raw: dict[str, Any],
@@ -642,8 +669,19 @@ class FeishuAdapter(BaseAdapter):
                 union_id=union_id,
                 user_id=user_id,
             )
+            persisted_name, persisted_canonical_key = await self._persisted_identity(
+                stable_account_id
+            )
+            if persisted_canonical_key:
+                canonical_person_key = persisted_canonical_key
             identity_status = "resolved"
-            identity_source = "configured_alias" if configured_alias else "event"
+            identity_source = (
+                "configured_alias"
+                if configured_alias
+                else "person_info"
+                if persisted_name
+                else "event"
+            )
 
             # @ 段里飞书会直接带 name，白捡的映射先收进缓存
             self._harvest_mention_names(normalized.get("mentions") or [])
@@ -655,6 +693,8 @@ class FeishuAdapter(BaseAdapter):
                 # An exact account mapping is an authored identity fact and is
                 # therefore authoritative over any incidental event label.
                 sender_name = configured_alias
+            elif persisted_name:
+                sender_name = persisted_name
             elif self._looks_like_raw_id(sender_name):
                 resolved = await self._resolve_display_name(
                     open_id=open_id,

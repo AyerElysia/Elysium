@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from typing import Any
 
@@ -50,9 +51,14 @@ def test_wsl_host_alias_uses_linux_default_gateway(
         "plugins.voice_live.voice_conversion.Path",
         lambda _: FakeRoute(),
     )
-    assert resolve_service_url("http://wsl-host:17861") == (
-        "http://172.26.208.1:17861"
-    )
+    if os.name == "nt":
+        assert resolve_service_url("http://wsl-host:17861") == (
+            "http://127.0.0.1:17861"
+        )
+    else:
+        assert resolve_service_url("http://wsl-host:17861") == (
+            "http://172.26.208.1:17861"
+        )
 
 
 @pytest.mark.asyncio

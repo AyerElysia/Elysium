@@ -15,6 +15,12 @@ from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.learning import tools as learning_tools
 from plugins.life_engine.learning.scheduler import LearningScheduler
 from plugins.life_engine.learning.tools import LifeReviewSubjectDocumentTool
+from plugins.life_engine.storage.subject_contracts import (
+    SubjectAuthoritySnapshot,
+    SubjectDocumentCommit,
+    SubjectDocumentHead,
+    SubjectDocumentVersion,
+)
 
 
 def _workspace(tmp_path: Path) -> None:
@@ -43,6 +49,44 @@ async def _revision(character: str) -> str:
 
 async def _is_active(actor: str) -> bool:
     return actor == "consciousness-1"
+
+
+def _remote_snapshot(contents: dict[str, bytes]) -> SubjectAuthoritySnapshot:
+    commits: dict[str, SubjectDocumentCommit] = {}
+    for index, (path, content) in enumerate(contents.items(), start=1):
+        logical_path = f"life_engine_workspace/{path}"
+        version_id = f"remote-version-{index}"
+        commits[path] = SubjectDocumentCommit(
+            version=SubjectDocumentVersion(
+                version_id=version_id,
+                document_id=f"remote-document-{index}",
+                logical_path=logical_path,
+                parent_version_id="",
+                occurrence_id=f"remote-occurrence-{index}",
+                semantic_actor_id="elysia",
+                semantic_source_id="remote-test",
+                occurred_at="2026-08-06T00:00:00+00:00",
+                recorded_by="test",
+                recorded_source="mysql",
+                recorded_at="2026-08-06T00:00:00+00:00",
+                provenance_status="complete",
+                content_bytes=content,
+                content_hash=hashlib.sha256(content).hexdigest(),
+                byte_length=len(content),
+                byte_fidelity="exact_bytes",
+                encoding="utf-8",
+                newline_style="LF",
+                change_context={},
+            ),
+            head=SubjectDocumentHead(
+                document_id=f"remote-document-{index}",
+                logical_path=logical_path,
+                declared_owner="elysia",
+                current_version_id=version_id,
+                revision=1,
+            ),
+        )
+    return SubjectAuthoritySnapshot(commits=commits, revision="a" * 64)  # type: ignore[arg-type]
 
 
 class _Ledger:
@@ -242,6 +286,69 @@ async def test_selected_review_proposes_candidate_without_writing_file(
     assert getattr(candidate, "target_path") == "MEMORY.md"
     assert target.read_bytes() == current
     assert not (tmp_path / ".life_learning" / "subject_reviews.jsonl").exists()
+
+
+async def test_selected_review_reads_remote_memory_and_never_local_shadow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote = {
+        "SOUL.md": b"remote soul",
+        "USER.md": b"remote user",
+        "MEMORY.md": b"# Remote memory\nchosen continuity\n",
+    }
+    (tmp_path / "MEMORY.md").write_text("LOCAL SHADOW", encoding="utf-8")
+
+    async def read_remote() -> SubjectAuthoritySnapshot:
+        return _remote_snapshot(remote)
+
+    scheduler = LearningScheduler(
+        workspace_path=tmp_path,
+        current_subject_revision=lambda: _revision("a"),
+        read_subject_authority=read_remote,
+        validate_active_consciousness_instance=lambda actor: _is_active(actor),
+    )
+    scheduler.decision_ledger = _Ledger()  # type: ignore[assignment]
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(tmp_path)
+    tool = LifeReviewSubjectDocumentTool(plugin=SimpleNamespace(config=config))
+    monkeypatch.setattr(learning_tools, "_get_scheduler", lambda _plugin: scheduler)
+    monkeypatch.setattr(
+        learning_tools,
+        "_decision_actor",
+        lambda _tool: (None, "consciousness-1"),
+    )
+
+    ok, status = await tool.execute(action="status", target_path="MEMORY.md")
+
+    assert ok is True
+    assert isinstance(status, dict)
+    assert status["content"] == remote["MEMORY.md"].decode("utf-8")
+    assert status["documents"][0]["content_sha256"] == hashlib.sha256(
+        remote["MEMORY.md"]
+    ).hexdigest()
+    assert "LOCAL SHADOW" not in status["content"]
+
+    ok, proposed = await tool.execute(
+        action="propose",
+        target_path="MEMORY.md",
+        expected_subject_revision="a" * 64,
+        reviewed_content_sha256=hashlib.sha256(remote["MEMORY.md"]).hexdigest(),
+        reason="I choose to preserve a new memory in my remote authority.",
+        proposed_content="# Remote memory\nchosen continuity\nnew memory\n",
+    )
+
+    assert ok is True
+    assert isinstance(proposed, dict)
+    assert proposed["status"] == "open"
+    assert (tmp_path / "MEMORY.md").read_text(encoding="utf-8") == "LOCAL SHADOW"
+
+
+def test_subject_memory_tools_are_available_to_chat_consciousness() -> None:
+    assert "life_chatter" in LifeReviewSubjectDocumentTool.chatter_allow
+    assert "life_chatter" in learning_tools.LifeListSubjectCandidatesTool.chatter_allow
+    assert "life_chatter" in learning_tools.LifeReadSubjectCandidateTool.chatter_allow
+    assert "life_chatter" in learning_tools.LifeDecideSubjectCandidateTool.chatter_allow
 
 
 async def test_review_context_rejects_stale_revision_and_inactive_actor(

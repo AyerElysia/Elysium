@@ -132,6 +132,7 @@ class LearningScheduler:
             | None
         ) = None,
         current_subject_revision: Callable[[], Awaitable[str]] | None = None,
+        read_subject_authority: Callable[[], Awaitable[Any]] | None = None,
         validate_active_consciousness_instance: (
             Callable[[str], Awaitable[bool]] | None
         ) = None,
@@ -143,6 +144,14 @@ class LearningScheduler:
             subject_authority.current_subject_revision
             if subject_authority is not None
             else None
+        )
+        subject_reader = (
+            getattr(subject_authority, "read_subject_authority", None)
+            if subject_authority is not None
+            else None
+        )
+        self._read_subject_authority = read_subject_authority or (
+            subject_reader if callable(subject_reader) else None
         )
         self._validate_active_consciousness_instance = (
             validate_active_consciousness_instance
@@ -572,7 +581,43 @@ class LearningScheduler:
             parsed = parsed.replace(tzinfo=UTC)
         return parsed.astimezone(UTC)
 
-    def _review_document_snapshot(
+    @staticmethod
+    def _subject_content_from_snapshot(snapshot: Any, path: SubjectDocumentPath) -> bytes:
+        """Return one exact subject head from an authority snapshot."""
+
+        commits = getattr(snapshot, "commits", None)
+        if isinstance(commits, dict):
+            commit = commits.get(path) or commits.get(
+                f"life_engine_workspace/{path}"
+            )
+        else:
+            commit = None
+            for item in tuple(commits or ()):
+                version = getattr(item, "version", None)
+                logical_path = str(getattr(version, "logical_path", "") or "")
+                if logical_path in {path, f"life_engine_workspace/{path}"}:
+                    commit = item
+                    break
+        version = getattr(commit, "version", None)
+        content = getattr(version, "content_bytes", None)
+        if content is None:
+            raise RuntimeError(f"SubjectAuthoritySourceMissing: {path}")
+        return bytes(content)
+
+    async def read_subject_document(self, path: SubjectDocumentPath) -> bytes:
+        """Read an exact current authority document from the selected source."""
+
+        if path not in SUBJECT_AUTHORITY_PATHS:
+            raise ValueError(f"unsupported subject authority path: {path}")
+        if self._read_subject_authority is not None:
+            snapshot = await self._read_subject_authority()
+            return self._subject_content_from_snapshot(snapshot, path)
+        target = self._workspace / path
+        if not target.exists() or not target.is_file():
+            raise RuntimeError(f"SubjectAuthoritySourceMissing: {path}")
+        return target.read_bytes()
+
+    async def _review_document_snapshot(
         self,
         *,
         path: SubjectDocumentPath,
@@ -580,16 +625,27 @@ class LearningScheduler:
         now: datetime,
         mark_offered: bool,
     ) -> tuple[dict[str, Any], bool]:
-        target = self._workspace / path
-        exists = target.exists() and target.is_file()
+        exists = False
         changed_at: datetime | None = None
         size_bytes = 0
         content_sha256 = ""
-        if exists:
-            stat = target.stat()
-            changed_at = datetime.fromtimestamp(stat.st_mtime, tz=UTC)
-            size_bytes = int(stat.st_size)
-            content_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+        if self._read_subject_authority is not None:
+            try:
+                content = await self.read_subject_document(path)
+            except RuntimeError:
+                content = b""
+            else:
+                exists = True
+                size_bytes = len(content)
+                content_sha256 = hashlib.sha256(content).hexdigest()
+        else:
+            target = self._workspace / path
+            exists = target.exists() and target.is_file()
+            if exists:
+                stat = target.stat()
+                changed_at = datetime.fromtimestamp(stat.st_mtime, tz=UTC)
+                size_bytes = int(stat.st_size)
+                content_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
 
         last_reviewed = self._parse_review_time(record.get("last_reviewed_at"))
         baseline = max(
@@ -680,7 +736,7 @@ class LearningScheduler:
             for path in SUBJECT_AUTHORITY_PATHS:
                 raw_record = documents.get(path)
                 record = dict(raw_record) if isinstance(raw_record, dict) else {}
-                snapshot, document_changed = self._review_document_snapshot(
+                snapshot, document_changed = await self._review_document_snapshot(
                     path=path,
                     record=record,
                     now=now,
@@ -1448,17 +1504,81 @@ class LearningScheduler:
             _, review = self._subject_review_state()
             documents = review["documents"]
             assert isinstance(documents, dict)
+            if self._read_subject_authority is not None:
+                snapshots = [
+                    {
+                        "target_path": path,
+                        "last_reviewed_at": str(
+                            (documents.get(path) or {}).get("last_reviewed_at") or ""
+                        ),
+                        "last_outcome": str(
+                            (documents.get(path) or {}).get("last_outcome") or ""
+                        ),
+                    }
+                    for path in SUBJECT_AUTHORITY_PATHS
+                ]
+                pending = sum(
+                    str(item.get("last_outcome") or "")
+                    in {"candidate_proposed", "kept_open"}
+                    for item in snapshots
+                )
+                return {
+                    "status": (
+                        "disabled" if not self._subject_review_enabled else "healthy"
+                    ),
+                    "authority_status": (
+                        "selected_ready"
+                        if self.decision_ledger is not None
+                        else "migration_required"
+                    ),
+                    "source": "selected_subject_authority",
+                    "direct_mutation_blocked": True,
+                    "due_count": 0,
+                    "pending_candidate_count": pending,
+                    "missing_count": 0,
+                    "last_observed_subject_revision": str(
+                        review.get("last_observed_subject_revision") or ""
+                    ),
+                    "last_observed_at": str(review.get("last_observed_at") or ""),
+                    "documents": snapshots,
+                }
             now = datetime.now(UTC)
             snapshots: list[dict[str, Any]] = []
             for path in SUBJECT_AUTHORITY_PATHS:
                 raw = documents.get(path)
                 record = dict(raw) if isinstance(raw, dict) else {}
-                snapshot, _ = self._review_document_snapshot(
-                    path=path,
-                    record=record,
-                    now=now,
-                    mark_offered=False,
+                target = self._workspace / path
+                exists = target.exists() and target.is_file()
+                changed_at: datetime | None = None
+                size_bytes = 0
+                content_sha256 = ""
+                if exists:
+                    stat = target.stat()
+                    changed_at = datetime.fromtimestamp(stat.st_mtime, tz=UTC)
+                    size_bytes = int(stat.st_size)
+                    content_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+                last_reviewed = self._parse_review_time(record.get("last_reviewed_at"))
+                baseline = max(
+                    (
+                        item
+                        for item in (changed_at, last_reviewed)
+                        if item is not None
+                    ),
+                    default=now,
                 )
+                due_at = baseline + timedelta(
+                    hours=self._subject_review_intervals[path]
+                )
+                snapshot = {
+                    "target_path": path,
+                    "exists": exists,
+                    "size_bytes": size_bytes,
+                    "content_sha256": content_sha256,
+                    "due": bool(
+                        self._subject_review_enabled and exists and now >= due_at
+                    ),
+                    "last_outcome": str(record.get("last_outcome") or ""),
+                }
                 snapshots.append(snapshot)
             missing = sum(not bool(item["exists"]) for item in snapshots)
             due = sum(bool(item["due"]) for item in snapshots)

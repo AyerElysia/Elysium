@@ -52,7 +52,8 @@ from .context_compaction import (
     hierarchical_compact_payloads,
 )
 from src.kernel.logger import get_logger, COLOR
-from ..memory.prompting import load_memory_prompt_data, render_memory_prompt
+from src.kernel.storage import canonical_json_sha256
+from ..memory.prompting import analyze_memory_text, render_memory_prompt
 from ..constants import LIFE_CHATTER_GLOBAL_CURSOR_KEY
 from .chat_history import (
     build_chat_history_text,
@@ -104,7 +105,7 @@ _REASON_LEAK_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _PLACEHOLDER_ONLY_PATTERN = re.compile(r"^(?:\.{2,}|。{2,}|…+|⋯+|··+)$")
-_ROLLING_CONTEXT_SNAPSHOT_VERSION = 2
+_ROLLING_CONTEXT_SNAPSHOT_VERSION = 3
 _LIVE_BRIDGE_BLOCKED_USABLE_SIGNATURES = frozenset(
     {
         "tts_voice_plugin:action:tts_voice_action",
@@ -1696,10 +1697,10 @@ class LifeChatter(BaseChatter):
         # System prompt 只放主体权威投影和全局工具规则，不绑定任何具体聊天流。
         # 直播/私聊/群聊等场景提示放到每轮 USER prompt 中，避免第一条消息的
         # stream 类型污染后续所有流。
-        system_text = self._build_chat_system_prompt(service, None)
+        system_text = await self._build_chat_system_prompt(service, None)
         if not system_text:
-            # SOUL.md 不可用——没有灵魂就不说话
-            logger.error("SOUL.md 不可用，life_chatter 拒绝生成回复")
+            # SOUL 权威文本不可用——没有灵魂就不说话
+            logger.error("SOUL 权威文本不可用，life_chatter 拒绝生成回复")
             return None
         request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_text)))
 
@@ -1709,7 +1710,7 @@ class LifeChatter(BaseChatter):
         usable_map = await self.inject_usables(request)
         # Phase E: 按意识实例类型工具清单过滤
         usable_map = self._filter_usables_by_manifest(usable_map, request)
-        restored_payloads = self._load_rolling_context_snapshot()
+        restored_payloads = await self._load_rolling_context_snapshot(service)
         if restored_payloads:
             request.payloads.extend(restored_payloads)
             logger.info(
@@ -2144,16 +2145,10 @@ class LifeChatter(BaseChatter):
             )
             if item is not None
         ]
-        payload_json = json.dumps(
-            serialized_payloads,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            default=str,
-        )
         return {
             "version": _ROLLING_CONTEXT_SNAPSHOT_VERSION,
             "runtime_key": cls.global_runtime_key,
-            "payload_digest": hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+            "payload_digest": canonical_json_sha256(serialized_payloads),
             "payloads": serialized_payloads,
         }
 
@@ -2276,7 +2271,29 @@ class LifeChatter(BaseChatter):
             return None
         return LLMPayload(role, content)  # type: ignore[arg-type]
 
-    def _load_rolling_context_snapshot(self) -> list[LLMPayload]:
+    async def _load_rolling_context_snapshot(
+        self,
+        service: LifeEngineService | None = None,
+    ) -> list[LLMPayload]:
+        selected_store = None
+        if service is not None:
+            get_store = getattr(service, "runtime_state_store", None)
+            if callable(get_store):
+                selected_store = get_store()
+        if selected_store is not None:
+            record = await selected_store.get_state(
+                "life_chatter.rolling_context",
+                self.instance_id,
+            )
+            if record is None:
+                self._rolling_context_state_revision = 0
+                return []
+            self._rolling_context_state_revision = int(record.revision)
+            return self._deserialize_rolling_context_snapshot(
+                record.payload,
+                outer_integrity_verified=True,
+            )
+
         path = self._rolling_context_snapshot_path()
         # Phase C: 自动迁移旧版全局滚动上下文到实例路径
         if not path.exists() and self.instance_id == "chat_global":
@@ -2298,26 +2315,56 @@ class LifeChatter(BaseChatter):
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"读取 life_chatter 滚动上下文快照失败: {exc}")
             return []
+        try:
+            return self._deserialize_rolling_context_snapshot(raw)
+        except RuntimeError as exc:
+            logger.warning(f"忽略无效的 life_chatter 滚动上下文快照: {exc}")
+            return []
+
+    def _deserialize_rolling_context_snapshot(
+        self,
+        raw: Any,
+        *,
+        outer_integrity_verified: bool = False,
+    ) -> list[LLMPayload]:
+        """Validate and decode one local or selected-backend snapshot."""
+
         if not isinstance(raw, dict):
-            return []
+            raise RuntimeError("RollingContextSnapshotNotObject")
         version = raw.get("version", 1)
-        if version not in {1, _ROLLING_CONTEXT_SNAPSHOT_VERSION}:
-            logger.warning(f"忽略不支持的 life_chatter 快照版本: {version}")
-            return []
+        if version not in {1, 2, _ROLLING_CONTEXT_SNAPSHOT_VERSION}:
+            raise RuntimeError(f"RollingContextSnapshotVersionUnsupported:{version}")
         runtime_key = raw.get("runtime_key")
         if runtime_key not in {None, self.global_runtime_key}:
-            logger.warning("忽略 runtime_key 不匹配的 life_chatter 快照")
-            return []
+            raise RuntimeError("RollingContextRuntimeKeyMismatch")
         payload_items = raw.get("payloads")
         if not isinstance(payload_items, list):
-            return []
-        if version == _ROLLING_CONTEXT_SNAPSHOT_VERSION:
+            raise RuntimeError("RollingContextPayloadsNotList")
+        if version in {2, _ROLLING_CONTEXT_SNAPSHOT_VERSION}:
             expected_digest = raw.get("payload_digest")
-            payload_json = json.dumps(payload_items, ensure_ascii=False, separators=(",", ":"), default=str)
-            actual_digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
-            if not isinstance(expected_digest, str) or expected_digest != actual_digest:
-                logger.warning("忽略 payload digest 校验失败的 life_chatter 快照")
-                return []
+            if version == 2:
+                payload_json = json.dumps(
+                    payload_items,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=str,
+                )
+                actual_digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+                digest_matches = expected_digest == actual_digest
+                if not digest_matches and outer_integrity_verified:
+                    # v2 hashed insertion-ordered JSON. Selected runtime storage
+                    # canonicalizes nested object keys while independently
+                    # verifying the complete payload hash, so that legacy inner
+                    # digest cannot survive an otherwise lossless round trip.
+                    digest_matches = (
+                        isinstance(expected_digest, str)
+                        and re.fullmatch(r"[0-9a-f]{64}", expected_digest) is not None
+                    )
+            else:
+                actual_digest = canonical_json_sha256(payload_items)
+                digest_matches = expected_digest == actual_digest
+            if not isinstance(expected_digest, str) or not digest_matches:
+                raise RuntimeError("RollingContextPayloadDigestMismatch")
         payloads = [
             payload
             for payload in (
@@ -2327,18 +2374,15 @@ class LifeChatter(BaseChatter):
             if payload is not None
         ]
         payloads = self._without_retired_think_history(payloads)
-        # v1 is accepted as-is; migration to v2 (+ digest) happens on the next
-        # successful save. Do not rewrite the snapshot file from load.
+        # Legacy snapshots migrate to v3 canonical digests on the next
+        # successful save. Do not rewrite storage from a read path.
         return payloads
 
     async def _save_rolling_context_snapshot(self, response: Any) -> None:
-        """Persist the current runtime payloads without mutating runtime.
+        """Persist current runtime payloads through the selected authority.
 
-        Runtime hierarchical compaction is owned by ``_maybe_compact_runtime_context``.
-        Snapshot only serializes the current payloads (plus hard char-budget
-        envelope if the file would otherwise be oversized). mkdir / serialize /
-        write / replace are all failure-isolated so a bad disk path never
-        changes the live request.
+        Under selected storage this writes the fenced remote state and propagates
+        failures. Local JSON remains only for explicit local mode.
         """
         payloads = getattr(response, "payloads", None)
         if not isinstance(payloads, list):
@@ -2346,13 +2390,34 @@ class LifeChatter(BaseChatter):
         current_payloads = [payload for payload in payloads if isinstance(payload, LLMPayload)]
         if not current_payloads:
             return
+        # Hard envelope only — hierarchical policy already ran via maybe.
+        snapshot_payloads, _, _ = self._compact_rolling_context_payloads_from_config(
+            current_payloads
+        )
+        data = self._snapshot_data_for_payloads(snapshot_payloads)
+
+        service = self._get_life_service()
+        selected_store = None
+        if service is not None:
+            get_store = getattr(service, "runtime_state_store", None)
+            if callable(get_store):
+                selected_store = get_store()
+        if selected_store is not None:
+            expected_revision = int(
+                getattr(self, "_rolling_context_state_revision", 0) or 0
+            )
+            record = await selected_store.put_state(
+                namespace="life_chatter.rolling_context",
+                state_key=self.instance_id,
+                expected_revision=expected_revision,
+                schema_version=_ROLLING_CONTEXT_SNAPSHOT_VERSION,
+                payload=data,
+            )
+            self._rolling_context_state_revision = int(record.revision)
+            return
+
         tmp_path: Path | None = None
         try:
-            # Hard envelope only — hierarchical policy already ran via maybe.
-            snapshot_payloads, _, _ = self._compact_rolling_context_payloads_from_config(
-                current_payloads
-            )
-            data = self._snapshot_data_for_payloads(snapshot_payloads)
             path = self._rolling_context_snapshot_path()
             tmp_path = path.with_suffix(path.suffix + ".tmp")
             await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
@@ -2760,26 +2825,33 @@ class LifeChatter(BaseChatter):
 
     # ── system prompt ────────────────────────────────────────
 
-    def _build_chat_system_prompt(
+    async def _build_chat_system_prompt(
         self,
         service: LifeEngineService | None,
         chat_stream: ChatStream | None = None,
     ) -> str:
         """构建 100% 静态可缓存前缀提示词。"""
 
+        # SOUL/USER/MEMORY 属于主体权威内容，只能来自唯一绑定的权威源。
         # TOOL.md 是 life_engine/heartbeat 的工具边界；life_chatter 使用独立
-        # TOOLS.md，避免把潜意识中枢的工具规则混入表达层。
-        soul_text = self._load_soul_markdown(service)
-        if soul_text is None:
+        # TOOLS.md，它是工程 Prompt 脚手架而非主体语义，仍留在工作空间。
+        texts = await self._load_subject_authority_texts(service)
+        soul_text = texts.get("SOUL.md", "").strip()
+        if not soul_text:
             # 没有灵魂就不说话
             return ""
-        user_text = self._load_workspace_markdown(service, "USER.md")
-        memory_text = self._load_workspace_memory_prompt(service, mode="chat")
+
+        memory_text = ""
+        memory_raw = texts.get("MEMORY.md", "")
+        if memory_raw:
+            memory_data = analyze_memory_text(memory_raw)
+            if memory_data.raw_text:
+                memory_text = render_memory_prompt(memory_data, mode="chat")
         tools_text = self._load_workspace_markdown(service, "TOOLS.md")
 
         return LifeChatterContextAssembler.build_prefix_prompt(
             soul_text=soul_text,
-            user_text=user_text,
+            user_text=texts.get("USER.md", "").strip(),
             memory_text=memory_text,
             tools_text=tools_text,
             live_guidance=self._build_live_scene_guidance(chat_stream),
@@ -2834,51 +2906,39 @@ class LifeChatter(BaseChatter):
             logger.warning(f"读取 {filename} 失败: {e}")
         return ""
 
-    def _load_soul_markdown(
+    async def _load_subject_authority_texts(
         self,
         service: LifeEngineService | None,
-    ) -> str | None:
-        """加载 SOUL.md。返回 None 表示不可用（应拒绝回复）。"""
+    ) -> dict[str, str]:
+        """Read SOUL/USER/MEMORY from the single bound authority source.
+
+        The service owns the authority binding: under a selected backend it
+        reads one consistent remote snapshot and fails closed on a gap, so the
+        expression layer never silently falls back to stale local Markdown.
+        """
+
+        read_texts = getattr(service, "read_subject_authority_texts", None)
+        if callable(read_texts):
+            return {
+                str(name): str(text or "")
+                for name, text in (await read_texts()).items()
+            }
+
+        # No service binding at all: this is the legacy local workspace path,
+        # not a selected backend. A selected backend always reaches the branch
+        # above, where a missing remote head raises instead of degrading.
         workspace = self._resolve_workspace_path(service)
         if not workspace:
-            logger.error("工作空间路径不可用，无法加载 SOUL.md")
-            return None
+            logger.error("工作空间路径不可用，无法加载主体权威文本")
+            return {}
 
-        path = Path(workspace) / "SOUL.md"
-        try:
-            if path.exists() and path.is_file():
-                content = path.read_text(encoding="utf-8").strip()
-                if content:
-                    return content
-                logger.error(f"SOUL.md 为空: {path}")
-                return None
-        except Exception as e:
-            logger.error(f"SOUL.md 读取失败: {e}")
-            return None
+        from ..core.router_context_projection import read_subject_authority_sources
 
-        logger.error(f"SOUL.md 不存在: {path}。没有灵魂就不说话。")
-        return None
-
-    def _load_workspace_memory_prompt(
-        self,
-        service: LifeEngineService | None,
-        *,
-        mode: str,
-    ) -> str:
-        """读取并过滤 MEMORY.md，避免把编辑说明和 Fading 全量注入。"""
-        workspace = self._resolve_workspace_path(service)
-        if not workspace:
-            return ""
-
-        try:
-            memory_data = load_memory_prompt_data(workspace)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"读取 MEMORY.md 失败: {e}")
-            return ""
-
-        if not memory_data.raw_text:
-            return ""
-        return render_memory_prompt(memory_data, mode=mode)
+        sources, _ = await asyncio.to_thread(
+            read_subject_authority_sources,
+            workspace,
+        )
+        return {source.path: source.text for source in sources}
 
     @staticmethod
     def _is_live_stream(chat_stream: ChatStream | None) -> bool:
@@ -3094,10 +3154,10 @@ class LifeChatter(BaseChatter):
             commit_cursors=commit_cursors,
             event_cursor_override=event_cursor_override,
         )
-        system_prompt_text = self._build_chat_system_prompt(service, None)
+        system_prompt_text = await self._build_chat_system_prompt(service, None)
         if not system_prompt_text:
-            # SOUL.md 不可用——没有灵魂就不说话
-            logger.error("SOUL.md 不可用，拒绝构建上下文")
+            # SOUL 权威文本不可用——没有灵魂就不说话
+            logger.error("SOUL 权威文本不可用，拒绝构建上下文")
             return None
         assembled = LifeChatterContextAssembler.assemble(
             prefix_text=system_prompt_text,
@@ -3161,9 +3221,12 @@ class LifeChatter(BaseChatter):
                 if str(getattr(msg, "message_id", "") or "")
             },
         )
-        if self._load_soul_markdown(service) is None:
-            # SOUL.md 不可用——没有灵魂就不说话
-            return {"reason": "SOUL.md 不可用，拒绝响应", "should_respond": False}
+        # 门控前置与表达层读同一个权威源：选定后端下这里也不会退回本地。
+        if not (await self._load_subject_authority_texts(service)).get(
+            "SOUL.md", ""
+        ).strip():
+            # SOUL 权威文本不可用——没有灵魂就不说话
+            return {"reason": "SOUL 权威文本不可用，拒绝响应", "should_respond": False}
         prefix_prompt = await self._build_chat_router_prefix_prompt(
             service,
             chat_stream,

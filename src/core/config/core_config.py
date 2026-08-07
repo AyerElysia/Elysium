@@ -104,6 +104,19 @@ class CoreConfig(ConfigBase):
             ),
         )
 
+        @model_validator(mode="after")
+        def _validate_stream_timeouts(self) -> "CoreConfig.BotSection":
+            """WatchDog 重启阈值必须覆盖启用的完整 Chatter 步进预算。"""
+            if (
+                self.stream_step_timeout > 0
+                and self.stream_restart_threshold <= self.stream_step_timeout
+            ):
+                raise ValueError(
+                    "stream_restart_threshold must be greater than "
+                    "stream_step_timeout when stream step timeout is enabled"
+                )
+            return self
+
     bot: BotSection = Field(default_factory=BotSection)
 
     @config_section("chat")
@@ -202,6 +215,72 @@ class CoreConfig(ConfigBase):
 
     llm: LLMSection = Field(default_factory=LLMSection)
 
+    @config_section("storage")
+    class StorageSection(SectionBase):
+        """全局耐久存储模式。
+
+        这里只选择整套 Elysium 使用本地存储还是 MySQL。Core 与 Life Engine
+        必须共同服从该值，模块配置只能提供连接、路径和权威参数。
+        """
+
+        backend: Literal["local", "mysql"] = Field(
+            default="local",
+            description=(
+                "全局唯一存储模式：local 使 Core 与生命域都使用本地存储；"
+                "mysql 使二者都使用 MySQL，禁止模块独立覆盖。"
+            ),
+        )
+        backend_generation: str = Field(
+            default="",
+            description="生命域已验证的 MySQL generation ID。",
+        )
+        schema_version: int = Field(
+            default=1,
+            ge=1,
+            description="生命域存储合同 schema 版本。",
+        )
+        registry_id: str = Field(
+            default="life-domain",
+            description="全局写入权威注册表身份。",
+        )
+        authority_provider: Literal["file", "mysql"] = Field(
+            default="file",
+            description="单机使用 file，多主机共享 writer 使用 mysql。",
+        )
+        authority_owner_id: str = Field(
+            default="elysium-windows-primary",
+            description="当前 writer 的稳定实例身份；用于启动时安全接管过期租约。",
+        )
+        require_verified_generation: bool = Field(
+            default=True,
+            description="启动时拒绝未验证、候选或已封存 generation。",
+        )
+        authority_lease_seconds: int = Field(
+            default=120,
+            ge=30,
+            le=3600,
+            description="生命域 writer authority 租约时长（秒）。",
+        )
+        authority_renew_interval_seconds: int = Field(
+            default=40,
+            ge=5,
+            le=1200,
+            description="生命域 writer authority 自动续租间隔（秒），必须短于租约。",
+        )
+
+        @model_validator(mode="after")
+        def validate_authority_renewal_window(self) -> "CoreConfig.StorageSection":
+            """Keep enough lease headroom for fail-closed renewal."""
+
+            if self.authority_renew_interval_seconds >= self.authority_lease_seconds:
+                raise ValueError(
+                    "storage.authority_renew_interval_seconds must be shorter "
+                    "than storage.authority_lease_seconds"
+                )
+            return self
+
+    storage: StorageSection = Field(default_factory=StorageSection)
+
     @config_section("database")
     class DatabaseSection(SectionBase):
         """数据库配置节
@@ -210,19 +289,15 @@ class CoreConfig(ConfigBase):
         支持 SQLite、PostgreSQL 和 MySQL。
         """
 
-        # ========== 数据库类型配置 ==========
-        database_type: Literal["sqlite", "postgresql", "mysql"] = Field(
-            default="sqlite",
-            description='数据库类型，支持 "sqlite"、"postgresql" 或 "mysql"',
-        )
+        # 后端选择统一来自 [storage].backend；本节只保留连接与路径参数。
 
-        # ========== SQLite 配置（当 database_type = "sqlite" 时使用）==========
+        # ========== SQLite 配置（当 storage.backend = "local" 时使用）==========
         sqlite_path: str = Field(
             default="data/MoFox.db",
             description="SQLite 数据库文件路径",
         )
 
-        # ========== PostgreSQL 配置（当 database_type = "postgresql" 时使用）==========
+        # ========== PostgreSQL 兼容连接参数（当前全局模式不选择 PostgreSQL）==========
         postgresql_host: str = Field(
             default="localhost",
             description="PostgreSQL 服务器地址",
@@ -266,7 +341,7 @@ class CoreConfig(ConfigBase):
             description="SSL 客户端密钥路径",
         )
 
-        # ========== MySQL 配置（当 database_type = "mysql" 时使用）==========
+        # ========== MySQL 配置（当 storage.backend = "mysql" 时使用）==========
         mysql_host: str = Field(
             default="localhost",
             description="MySQL 服务器地址",
@@ -317,7 +392,39 @@ class CoreConfig(ConfigBase):
         )
         connection_timeout: int = Field(
             default=10,
+            ge=1,
+            le=300,
             description="连接超时时间（秒）",
+        )
+        mysql_max_overflow: int = Field(
+            default=20,
+            ge=0,
+            le=200,
+            description="Life Engine MySQL 连接池允许的额外连接数。",
+        )
+        mysql_pool_recycle_seconds: int = Field(
+            default=1800,
+            ge=30,
+            le=86400,
+            description="Life Engine MySQL 连接回收间隔（秒）。",
+        )
+        mysql_pool_timeout_seconds: int = Field(
+            default=10,
+            ge=1,
+            le=300,
+            description="Life Engine MySQL 获取连接的等待上限（秒）。",
+        )
+        mysql_query_timeout_seconds: int = Field(
+            default=10,
+            ge=1,
+            le=300,
+            description="Life Engine MySQL 单条语句执行上限（秒）。",
+        )
+        mysql_lock_wait_timeout_seconds: int = Field(
+            default=5,
+            ge=1,
+            le=300,
+            description="Life Engine InnoDB 行锁等待上限（秒）。",
         )
 
         # ========== 通用数据库配置 ==========
@@ -325,29 +432,6 @@ class CoreConfig(ConfigBase):
             default=False,
             description="是否打印 SQL 语句（用于调试）",
         )
-
-        @model_validator(mode="after")
-        def expose_mysql_settings_to_legacy_runtime(self) -> "CoreConfig.DatabaseSection":
-            """让尚未升级调用签名的启动器也能消费 MySQL 配置。
-
-            当前应用启动器仍通过历史 ``postgresql_*`` 关键字把服务型数据库
-            配置传给 kernel。这里仅在 MySQL 模式下提供兼容映射；用户配置文件
-            仍使用语义明确的 ``mysql_*`` 字段。待启动器生命周期改造完成后可
-            移除此桥接，而无需迁移用户配置。
-            """
-            if self.database_type != "mysql":
-                return self
-
-            self.postgresql_host = self.mysql_host
-            self.postgresql_port = self.mysql_port
-            self.postgresql_database = self.mysql_database
-            self.postgresql_user = self.mysql_user
-            self.postgresql_password = self.mysql_password
-            self.postgresql_ssl_mode = self.mysql_ssl_mode
-            self.postgresql_ssl_ca = self.mysql_ssl_ca
-            self.postgresql_ssl_cert = self.mysql_ssl_cert
-            self.postgresql_ssl_key = self.mysql_ssl_key
-            return self
 
     database: DatabaseSection = Field(default_factory=DatabaseSection)
 
@@ -522,8 +606,8 @@ def _inject_kernel_llm_policy(config: CoreConfig) -> None:
     set_default_policy_factory(lambda: create_policy(config.llm.default_policy))
 
 
-def _migrate_legacy_chat_context_config(config_path: "Path") -> None:
-    """迁移旧的 chat.max_context_size，并移除废弃的 chat.max_llm_messages。"""
+def _migrate_legacy_core_config(config_path: "Path") -> None:
+    """迁移旧 Core 配置并建立唯一的全局存储模式入口。"""
     import tomllib
 
     if not config_path.exists():
@@ -535,18 +619,51 @@ def _migrate_legacy_chat_context_config(config_path: "Path") -> None:
     except Exception:
         return
 
-    chat_config = raw_config.get("chat")
-    if not isinstance(chat_config, dict):
-        return
-
     changed = False
-    if "max_context_size" in chat_config:
-        legacy_value = chat_config.pop("max_context_size")
-        chat_config.setdefault("max_history_messages", legacy_value)
+    chat_config = raw_config.get("chat")
+    if isinstance(chat_config, dict):
+        if "max_context_size" in chat_config:
+            legacy_value = chat_config.pop("max_context_size")
+            chat_config.setdefault("max_history_messages", legacy_value)
+            changed = True
+        if "max_llm_messages" in chat_config:
+            chat_config.pop("max_llm_messages")
+            changed = True
+
+    storage_config = raw_config.get("storage")
+    database_config = raw_config.get("database")
+    legacy_database_type = None
+    if isinstance(database_config, dict) and "database_type" in database_config:
+        legacy_database_type = str(database_config["database_type"])
+        if legacy_database_type not in {"sqlite", "mysql"}:
+            raise ValueError(
+                "Legacy database.database_type must be sqlite or mysql before "
+                "migrating to storage.backend"
+            )
+
+    if not isinstance(storage_config, dict) or "backend" not in storage_config:
+        raw_config["storage"] = {
+            "backend": "mysql" if legacy_database_type == "mysql" else "local"
+        }
         changed = True
-    if "max_llm_messages" in chat_config:
-        chat_config.pop("max_llm_messages")
+    elif legacy_database_type is not None:
+        expected_backend = "mysql" if legacy_database_type == "mysql" else "local"
+        if str(storage_config["backend"]) != expected_backend:
+            raise ValueError(
+                "Conflicting storage selection: storage.backend and legacy "
+                "database.database_type choose different backends"
+            )
+
+    if legacy_database_type is not None:
+        database_config.pop("database_type")
         changed = True
+
+    storage_config = raw_config.get("storage")
+    if isinstance(storage_config, dict):
+        for obsolete_key in ("authority_epoch", "fencing_token_env"):
+            if obsolete_key in storage_config:
+                storage_config.pop(obsolete_key)
+                changed = True
 
     if not changed:
         return
@@ -619,7 +736,7 @@ def init_core_config(config_path: str) -> CoreConfig:
         toml_content = _render_toml_with_signature(CoreConfig, default_config)
         path.write_text(toml_content, encoding="utf-8")
 
-    _migrate_legacy_chat_context_config(path)
+    _migrate_legacy_core_config(path)
 
     _global_config = CoreConfig.load(config_path, auto_update=True)
     _inject_kernel_llm_policy(_global_config)

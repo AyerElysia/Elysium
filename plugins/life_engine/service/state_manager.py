@@ -10,7 +10,7 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from src.app.plugin_system.api.log_api import get_logger
@@ -26,6 +26,8 @@ from .event_builder import (
 )
 
 logger = get_logger("life_engine", display="life_engine")
+
+_PATH_WRITE_LOCKS: dict[str, asyncio.Lock] = {}
 
 # DFC 注入目标标识
 _TARGET_REMINDER_BUCKET = "actor"
@@ -612,6 +614,8 @@ class StatePersistence:
         workspace_path: str,
         history_limit_func: Any,
         lock: asyncio.Lock | None = None,
+        runtime_store: Any | None = None,
+        on_persisted: Callable[[], None] | None = None,
     ) -> None:
         """初始化状态持久化管理器。
 
@@ -623,6 +627,10 @@ class StatePersistence:
         self._workspace_path = workspace_path
         self._history_limit_func = history_limit_func
         self._lock = lock
+        self._runtime_store = runtime_store
+        self._on_persisted = on_persisted
+        self._runtime_state_revision = 0
+        self._commit_lock: asyncio.Lock | None = None
         self._write_lock: asyncio.Lock | None = None
 
     def _get_lock(self) -> asyncio.Lock:
@@ -631,11 +639,19 @@ class StatePersistence:
             self._lock = asyncio.Lock()
         return self._lock
 
+    def _get_commit_lock(self) -> asyncio.Lock:
+        """Serialize one selected-runtime CAS commit at a time."""
+
+        if self._commit_lock is None:
+            self._commit_lock = asyncio.Lock()
+        return self._commit_lock
+
     def _get_write_lock(self) -> asyncio.Lock:
-        """Return the lock that serializes file replacement order."""
+        """Return the process-wide lock for this exact local target path."""
 
         if self._write_lock is None:
-            self._write_lock = asyncio.Lock()
+            key = str(self._runtime_context_path())
+            self._write_lock = _PATH_WRITE_LOCKS.setdefault(key, asyncio.Lock())
         return self._write_lock
 
     def _runtime_context_path(self) -> Path:
@@ -649,57 +665,82 @@ class StatePersistence:
         state: LifeEngineState,
         pending_events: list[LifeEngineEvent],
         event_history: list[LifeEngineEvent],
-    ) -> None:
-        """持久化当前上下文（待处理事件 + 历史事件）。
+    ) -> bool:
+        """Persist the current context and report atomic dirty-state cleanup.
 
-        Args:
-            state: 当前中枢状态
-            pending_events: 待处理事件列表
-            event_history: 事件历史列表
+        ``True`` means the selected runtime commit and ``on_persisted`` callback
+        completed while the shared state lock still protected the exact
+        snapshot. Local compatibility storage returns ``False`` because its
+        file write remains outside that lock.
         """
-        async with self._get_lock():
-            payload = {
-                "version": 2,
-                "state": {
-                    "heartbeat_count": state.heartbeat_count,
-                    "event_sequence": state.event_sequence,
-                    "heartbeat_context_cursor": _safe_int(
-                        getattr(state, "heartbeat_context_cursor", 0)
-                    ),
-                    "subconscious_summary": _summary_to_dict(
-                        getattr(state, "subconscious_summary", None)
-                    ),
-                    "last_model_reply_at": state.last_model_reply_at,
-                    "last_model_reply": state.last_model_reply,
-                    "last_model_error": state.last_model_error,
-                    "last_wake_context_at": state.last_wake_context_at,
-                    "last_wake_context_size": state.last_wake_context_size,
-                    "last_external_message_at": state.last_external_message_at,
-                    "last_tell_dfc_at": state.last_tell_dfc_at,
-                    "tell_dfc_count": state.tell_dfc_count,
-                    "self_pause_until": state.self_pause_until,
-                    "self_pause_started_at": state.self_pause_started_at,
-                    "self_pause_reason": state.self_pause_reason,
-                    "self_pause_duration_minutes": state.self_pause_duration_minutes,
-                    "self_pause_checkpoint_minutes": state.self_pause_checkpoint_minutes,
-                    "consecutive_rest_count": state.consecutive_rest_count,
-                    "last_leisure_seen_at": state.last_leisure_seen_at,
-                    "chatter_context_cursors": state.chatter_context_cursors or {},
-                    "chatter_thought_cursors": state.chatter_thought_cursors or {},
-                    "last_chatter_think_by_stream": state.last_chatter_think_by_stream or {},
-                },
-                "pending_events": [event_to_dict(e) for e in pending_events],
-                "event_history": [event_to_dict(e) for e in event_history],
-            }
+        async with self._get_commit_lock():
+            async with self._get_lock():
+                payload = {
+                    "version": 2,
+                    "state": {
+                        "heartbeat_count": state.heartbeat_count,
+                        "event_sequence": state.event_sequence,
+                        "heartbeat_context_cursor": _safe_int(
+                            getattr(state, "heartbeat_context_cursor", 0)
+                        ),
+                        "subconscious_summary": _summary_to_dict(
+                            getattr(state, "subconscious_summary", None)
+                        ),
+                        "last_model_reply_at": state.last_model_reply_at,
+                        "last_model_reply": state.last_model_reply,
+                        "last_model_error": state.last_model_error,
+                        "last_wake_context_at": state.last_wake_context_at,
+                        "last_wake_context_size": state.last_wake_context_size,
+                        "last_external_message_at": state.last_external_message_at,
+                        "last_tell_dfc_at": state.last_tell_dfc_at,
+                        "tell_dfc_count": state.tell_dfc_count,
+                        "self_pause_until": state.self_pause_until,
+                        "self_pause_started_at": state.self_pause_started_at,
+                        "self_pause_reason": state.self_pause_reason,
+                        "self_pause_duration_minutes": state.self_pause_duration_minutes,
+                        "self_pause_checkpoint_minutes": state.self_pause_checkpoint_minutes,
+                        "consecutive_rest_count": state.consecutive_rest_count,
+                        "last_leisure_seen_at": state.last_leisure_seen_at,
+                        "chatter_context_cursors": state.chatter_context_cursors or {},
+                        "chatter_thought_cursors": state.chatter_thought_cursors or {},
+                        "last_chatter_think_by_stream": (
+                            state.last_chatter_think_by_stream or {}
+                        ),
+                    },
+                    "pending_events": [event_to_dict(e) for e in pending_events],
+                    "event_history": [event_to_dict(e) for e in event_history],
+                }
 
-        path = self._runtime_context_path()
-        serialized = json.dumps(payload, ensure_ascii=False, indent=2)
-        try:
-            async with self._get_write_lock():
-                await asyncio.to_thread(atomic_write_text, path, serialized)
-        except Exception as exc:
-            logger.error(f"life_engine 持久化上下文失败: {exc}")
-            raise PersistenceError(f"Failed to persist runtime context: {exc}") from exc
+                if self._runtime_store is not None:
+                    try:
+                        record = await self._runtime_store.put_state(
+                            namespace="life_engine.runtime_context",
+                            state_key="global",
+                            expected_revision=self._runtime_state_revision,
+                            schema_version=2,
+                            payload=payload,
+                        )
+                        self._runtime_state_revision = int(record.revision)
+                        if self._on_persisted is not None:
+                            self._on_persisted()
+                        return True
+                    except Exception as exc:
+                        logger.error(f"life_engine 远端上下文持久化失败: {exc}")
+                        raise PersistenceError(
+                            f"Failed to persist selected runtime context: {exc}"
+                        ) from exc
+
+            path = self._runtime_context_path()
+            serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+            try:
+                async with self._get_write_lock():
+                    await asyncio.to_thread(atomic_write_text, path, serialized)
+            except Exception as exc:
+                logger.error(f"life_engine 持久化上下文失败: {exc}")
+                raise PersistenceError(
+                    f"Failed to persist runtime context: {exc}"
+                ) from exc
+            return False
 
     async def load_runtime_context(
         self,
@@ -715,15 +756,28 @@ class StatePersistence:
         Returns:
             元组：(待处理事件列表, 事件历史列表, 持久化的子系统状态字典)
         """
-        path = self._runtime_context_path()
-        if not path.exists():
-            return [], [], {}
+        if self._runtime_store is not None:
+            record = await self._runtime_store.get_state(
+                "life_engine.runtime_context",
+                "global",
+            )
+            if record is None:
+                self._runtime_state_revision = 0
+                return [], [], {}
+            self._runtime_state_revision = int(record.revision)
+            raw = dict(record.payload)
+        else:
+            path = self._runtime_context_path()
+            if not path.exists():
+                return [], [], {}
 
-        try:
-            raw = json.loads(await asyncio.to_thread(path.read_text, encoding="utf-8"))
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"life_engine 读取上下文失败: {exc}")
-            return [], [], {}
+            try:
+                raw = json.loads(
+                    await asyncio.to_thread(path.read_text, encoding="utf-8")
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"life_engine 读取上下文失败: {exc}")
+                return [], [], {}
 
         if not isinstance(raw, dict):
             logger.warning("life_engine 上下文文件格式无效，跳过恢复")

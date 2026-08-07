@@ -26,20 +26,21 @@ async def main() -> None:
     """演示 media_api 的基础功能。"""
     init_core_config(str(REPO_ROOT / "config" / "core.toml"))
     init_model_config(str(REPO_ROOT / "config" / "models.toml"))
-    db_cfg = get_core_config().database
+    core_cfg = get_core_config()
+    db_cfg = core_cfg.database
     await init_database_from_config(
-        database_type=db_cfg.database_type,
+        database_type="mysql" if core_cfg.storage.backend == "mysql" else "sqlite",
         sqlite_path=db_cfg.sqlite_path,
-        postgresql_host=db_cfg.postgresql_host,
-        postgresql_port=db_cfg.postgresql_port,
-        postgresql_database=db_cfg.postgresql_database,
-        postgresql_user=db_cfg.postgresql_user,
-        postgresql_password=db_cfg.postgresql_password,
-        postgresql_schema=db_cfg.postgresql_schema,
-        postgresql_ssl_mode=db_cfg.postgresql_ssl_mode,
-        postgresql_ssl_ca=db_cfg.postgresql_ssl_ca,
-        postgresql_ssl_cert=db_cfg.postgresql_ssl_cert,
-        postgresql_ssl_key=db_cfg.postgresql_ssl_key,
+        mysql_host=db_cfg.mysql_host,
+        mysql_port=db_cfg.mysql_port,
+        mysql_database=db_cfg.mysql_database,
+        mysql_user=db_cfg.mysql_user,
+        mysql_password=db_cfg.mysql_password,
+        mysql_charset=db_cfg.mysql_charset,
+        mysql_ssl_mode=db_cfg.mysql_ssl_mode,
+        mysql_ssl_ca=db_cfg.mysql_ssl_ca,
+        mysql_ssl_cert=db_cfg.mysql_ssl_cert,
+        mysql_ssl_key=db_cfg.mysql_ssl_key,
         connection_pool_size=db_cfg.connection_pool_size,
         connection_timeout=db_cfg.connection_timeout,
         echo=db_cfg.echo,

@@ -30,41 +30,6 @@ WORLD_OBSERVATION_EVENT = "world.observation_reported"
 WORLD_LEGACY_IMPORT_EVENT = "world.legacy_snapshot_imported"
 WORLD_REFERENCE_INLINE_MAX_BYTES = 1024
 WORLD_VALUE_CHUNK_MAX_BYTES = 64 * 1024
-WORLD_ASSERTION_SCOPE_HISTORY = "history"
-WORLD_ASSERTION_SCOPE_CURRENT_SNAPSHOT = "current_snapshot"
-WORLD_ASSERTION_ORDER_OLDEST_FIRST = "oldest_first"
-WORLD_ASSERTION_ORDER_NEWEST_FIRST = "newest_first"
-
-
-def normalize_world_assertion_scope(value: str) -> str:
-    """Validate one explicit assertion delivery scope."""
-
-    scope = str(value or WORLD_ASSERTION_SCOPE_HISTORY).strip()
-    if scope not in {
-        WORLD_ASSERTION_SCOPE_HISTORY,
-        WORLD_ASSERTION_SCOPE_CURRENT_SNAPSHOT,
-    }:
-        raise ValueError(f"unsupported World assertion delivery scope: {scope!r}")
-    return scope
-
-
-def is_current_snapshot_eligible(
-    *,
-    predicate: str,
-    status: str,
-    retracted_at: str = "",
-) -> bool:
-    """Classify structured evidence that may describe present-tense World state."""
-
-    if str(retracted_at or ""):
-        return False
-    typed_predicate = str(predicate or "")
-    typed_status = str(status or "")
-    if typed_predicate == "session_state":
-        return False
-    return not (
-        typed_predicate == "legacy_snapshot" and typed_status == "legacy_import"
-    )
 
 
 class WorldProjectionConflict(RuntimeError):
@@ -172,8 +137,6 @@ class WorldAssertionReferencePage:
     total_value_bytes: int
     next_after_observed_at: str
     next_after_assertion_id: str
-    delivery_scope: str = WORLD_ASSERTION_SCOPE_HISTORY
-    result_order: str = WORLD_ASSERTION_ORDER_OLDEST_FIRST
 
 
 @dataclass(frozen=True, slots=True)
@@ -787,7 +750,6 @@ class WorldProjectionStore:
         self,
         *,
         include_retracted: bool = False,
-        delivery_scope: str = WORLD_ASSERTION_SCOPE_HISTORY,
         after_observed_at: str = "",
         after_assertion_id: str = "",
         limit: int = 128,
@@ -795,28 +757,15 @@ class WorldProjectionStore:
     ) -> WorldAssertionReferencePage:
         """Read compact assertion metadata without materializing giant values."""
 
-        scope = normalize_world_assertion_scope(delivery_scope)
-        current_snapshot = scope == WORLD_ASSERTION_SCOPE_CURRENT_SNAPSHOT
-        if current_snapshot and include_retracted:
-            raise ValueError("current World snapshot cannot include retracted evidence")
         page_limit = max(1, min(int(limit), 1000))
         inline_limit = max(0, min(int(inline_max_bytes), 16 * 1024))
         predicates: list[str] = []
         params: list[Any] = []
         if not include_retracted:
             predicates.append("retracted_at = ''")
-        if current_snapshot:
-            predicates.extend(
-                [
-                    "predicate <> 'session_state'",
-                    "NOT (predicate = 'legacy_snapshot' AND status = 'legacy_import')",
-                ]
-            )
         if after_observed_at or after_assertion_id:
-            operator = "<" if current_snapshot else ">"
             predicates.append(
-                f"(observed_at {operator} ? OR "
-                f"(observed_at = ? AND assertion_id {operator} ?))"
+                "(observed_at > ? OR (observed_at = ? AND assertion_id > ?))"
             )
             params.extend(
                 [
@@ -826,7 +775,6 @@ class WorldProjectionStore:
                 ]
             )
         where = f" WHERE {' AND '.join(predicates)}" if predicates else ""
-        order = "DESC" if current_snapshot else "ASC"
         transport_echo_sql = """
             domain = 'minecraft' AND predicate = 'embodied_trace'
             AND json_extract(payload_json, '$.value.trace_kind') = 'intent.issued'
@@ -851,7 +799,7 @@ class WorldProjectionStore:
                 "THEN value_json ELSE NULL END AS inline_value_json, "
                 f"CASE WHEN {transport_echo_sql} THEN 1 ELSE 0 END AS transport_echo "
                 f"FROM world_assertions{where} "
-                f"ORDER BY observed_at {order}, assertion_id {order} LIMIT ?",
+                "ORDER BY observed_at, assertion_id LIMIT ?",
                 [inline_limit, *params, page_limit + 1],
             ).fetchall()
         has_more = len(rows) > page_limit
@@ -891,12 +839,6 @@ class WorldProjectionStore:
             ),
             next_after_observed_at=(str(last["observed_at"]) if last else ""),
             next_after_assertion_id=(str(last["assertion_id"]) if last else ""),
-            delivery_scope=scope,
-            result_order=(
-                WORLD_ASSERTION_ORDER_NEWEST_FIRST
-                if current_snapshot
-                else WORLD_ASSERTION_ORDER_OLDEST_FIRST
-            ),
         )
 
     @staticmethod

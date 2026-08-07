@@ -171,7 +171,7 @@ async def create_llm_usable_execution(
 
             chat_stream = get_stream_manager()._streams.get(stream_id)
             if chat_stream is not None:
-                setattr(instance, "chat_stream", chat_stream)
+                instance.chat_stream = chat_stream
     elif issubclass(usable_cls, BaseAction):
         chat_stream = await _get_action_chat_stream(stream_id=stream_id, message=message)
         instance = usable_cls(chat_stream=chat_stream, plugin=plugin)

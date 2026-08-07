@@ -49,8 +49,104 @@ class NarrativeEntry:
         return asdict(self)
 
 
+class SelectedNarrativeStore:
+    """Async first-person narrative history on the selected runtime store."""
+
+    state_namespace = "life_narrative.state"
+    event_namespace = "life_narrative.entries"
+
+    def __init__(self, runtime_store: Any) -> None:
+        if runtime_store is None:
+            raise RuntimeError("SelectedNarrativeStorageNotStarted")
+        self.runtime_store = runtime_store
+        self._state_revision = 0
+
+    async def load_state(self) -> dict[str, str]:
+        record = await self.runtime_store.get_state(
+            self.state_namespace,
+            "current",
+        )
+        if record is None:
+            self._state_revision = 0
+            return {}
+        self._state_revision = int(record.revision)
+        if not isinstance(record.payload, dict):
+            raise RuntimeError("NarrativeRemoteStateNotObject")
+        return {str(key): str(value) for key, value in record.payload.items()}
+
+    async def _save_state(self, state: dict[str, str]) -> None:
+        record = await self.runtime_store.put_state(
+            namespace=self.state_namespace,
+            state_key="current",
+            expected_revision=self._state_revision,
+            schema_version=1,
+            payload=dict(state),
+        )
+        self._state_revision = int(record.revision)
+
+    async def mark_invited(self, *, now: datetime | None = None) -> None:
+        state = await self.load_state()
+        state["last_invited_at"] = _to_iso(now or _now())
+        await self._save_state(state)
+
+    @staticmethod
+    def pending_moments(records: list[LifeTraceRecord], state: dict[str, str]) -> list[LifeTraceRecord]:
+        cursor = _parse_iso(state.get("cursor_timestamp", ""))
+        return [
+            record
+            for record in sorted(records, key=lambda item: item.timestamp)
+            if record.kind != "narrative"
+            and _parse_iso(record.timestamp) is not None
+            and (cursor is None or _parse_iso(record.timestamp) > cursor)
+        ]
+
+    async def _load_entries(self) -> list[NarrativeEntry]:
+        events = await self.runtime_store.read_events(
+            self.event_namespace,
+            after_position=0,
+            limit=1000,
+        )
+        return [NarrativeEntry.from_dict(event.payload) for event in events]
+
+    async def last_entry(self) -> NarrativeEntry | None:
+        entries = await self._load_entries()
+        return entries[-1] if entries else None
+
+    async def consolidate(
+        self,
+        *,
+        text: str,
+        quiet: bool,
+        moment_count: int,
+        now: datetime | None = None,
+    ) -> NarrativeEntry:
+        moment = now or _now()
+        moment_iso = _to_iso(moment)
+        state = await self.load_state()
+        entry = NarrativeEntry(
+            entry_id=f"narr_{uuid4().hex[:12]}",
+            timestamp=moment_iso,
+            period_start=str(state.get("cursor_timestamp", "") or ""),
+            period_end=moment_iso,
+            moment_count=max(0, int(moment_count)),
+            quiet=bool(quiet),
+            text=str(text or "").strip(),
+        )
+        await self.runtime_store.append_event(
+            namespace=self.event_namespace,
+            occurrence_id=entry.entry_id,
+            event_kind="quiet" if entry.quiet else "written",
+            payload=entry.to_dict(),
+            occurred_at=entry.timestamp,
+        )
+        state["cursor_timestamp"] = moment_iso
+        state["last_consolidated_at"] = moment_iso
+        await self._save_state(state)
+        return entry
+
+
 class NarrativeStore:
-    """Append-only narrative store under ``workspace/.life_narrative``.
+    """Append-only narrative store for explicit local mode.
 
     自传正文（她可读可引用的版本）同时落在 ``workspace/narrative/autobiography.md``。
     """
@@ -180,6 +276,47 @@ class NarrativeStore:
         day = entry.timestamp[:10]
         with self.autobiography_path.open("a", encoding="utf-8") as handle:
             handle.write(f"\n## {day}\n\n{entry.text}\n")
+
+
+class AsyncLocalNarrativeStore:
+    """Async wrapper for explicit local narrative storage."""
+
+    def __init__(self, workspace: Path | str) -> None:
+        self.local = NarrativeStore(workspace)
+
+    async def load_state(self) -> dict[str, str]:
+        import asyncio
+
+        return await asyncio.to_thread(self.local.load_state)
+
+    async def mark_invited(self, *, now: datetime | None = None) -> None:
+        import asyncio
+
+        await asyncio.to_thread(self.local.mark_invited, now=now)
+
+    @staticmethod
+    def pending_moments(
+        records: list[LifeTraceRecord],
+        state: dict[str, str],
+    ) -> list[LifeTraceRecord]:
+        cursor = _parse_iso(state.get("cursor_timestamp", ""))
+        return [
+            record
+            for record in sorted(records, key=lambda item: item.timestamp)
+            if record.kind != "narrative"
+            and _parse_iso(record.timestamp) is not None
+            and (cursor is None or _parse_iso(record.timestamp) > cursor)
+        ]
+
+    async def last_entry(self) -> NarrativeEntry | None:
+        import asyncio
+
+        return await asyncio.to_thread(self.local.last_entry)
+
+    async def consolidate(self, **kwargs: Any) -> NarrativeEntry:
+        import asyncio
+
+        return await asyncio.to_thread(self.local.consolidate, **kwargs)
 
 
 def _now() -> datetime:

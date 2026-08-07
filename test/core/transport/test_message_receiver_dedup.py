@@ -7,6 +7,40 @@ from src.core.models.message import Message
 from src.core.transport.message_receive.receiver import MessageReceiver
 
 
+async def test_unresolved_platform_identity_does_not_overwrite_person_data() -> None:
+    receiver = MessageReceiver()
+    message = Message(
+        message_id="msg-unresolved",
+        content="hello",
+        processed_plain_text="hello",
+        sender_id="ou_known",
+        sender_name="身份未解析的飞书用户（账号…nown）",
+        platform="feishu",
+        chat_type="private",
+        stream_id="stream-identity",
+        extra={
+            "identity_resolution_status": "unresolved",
+            "canonical_person_key": "",
+        },
+    )
+    helper = MagicMock()
+    helper.update_person_info = AsyncMock(return_value=True)
+
+    with patch(
+        "src.core.utils.user_query_helper.get_user_query_helper",
+        return_value=helper,
+    ):
+        await receiver._update_person_info(message)
+
+    helper.update_person_info.assert_awaited_once_with(
+        platform="feishu",
+        user_id="ou_known",
+        nickname=None,
+        cardname=None,
+        canonical_person_key=None,
+    )
+
+
 async def test_message_claim_is_atomic_under_concurrency() -> None:
     receiver = MessageReceiver()
 

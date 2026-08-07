@@ -100,6 +100,8 @@ class SubjectContextProjection(RouterContextProjection):
         projection_profile: str,
         max_bytes: int,
         author: Any,
+        subject_store: Any | None = None,
+        runtime_store: Any | None = None,
     ) -> None:
         self.projection_profile = validate_projection_profile(projection_profile)
         self.max_bytes = validate_projection_budget(max_bytes)
@@ -109,6 +111,8 @@ class SubjectContextProjection(RouterContextProjection):
             author=author,
             max_chars=content_max_chars,
             poll_interval_seconds=60.0,
+            subject_store=subject_store,
+            runtime_store=runtime_store,
         )
         profile_dir = (
             self.workspace
@@ -132,6 +136,13 @@ class SubjectContextProjection(RouterContextProjection):
             return False
         self._current_source_digest = ""
         return True
+
+    async def _load_sources(self) -> tuple[tuple[SubjectContextSource, ...], str]:
+        sources, source_digest = await super()._load_sources()
+        soul = next(source for source in sources if source.path == "SOUL.md")
+        if not soul.text.strip():
+            raise RuntimeError("SOUL.md is empty")
+        return sources, source_digest
 
     def _read_sources(self) -> tuple[tuple[SubjectContextSource, ...], str]:
         missing = [

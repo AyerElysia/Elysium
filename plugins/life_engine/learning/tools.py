@@ -425,11 +425,11 @@ class LifeReviewSubjectDocumentTool(BaseTool):
 
     tool_name = "nucleus_review_subject_document"
     tool_description = (
-        "复盘 SOUL.md、USER.md 或 MEMORY.md。status 只查看内容哈希、统一 revision "
-        "和复盘时间；unchanged 明确记录当前版本保持不变；snooze 表示稍后再看；"
-        "propose 只提交完整新版本候选，绝不会直接写文件或自动接受。"
+        "读取并复盘当前权威 SOUL.md、USER.md 或 MEMORY.md。status 返回统一 revision、"
+        "精确内容哈希，并可按 UTF-8 字节窗口返回目标文档原文；unchanged 明确记录当前版本"
+        "保持不变；snooze 表示稍后再看；propose 只提交完整新版本候选，绝不会自动接受。"
     )
-    chatter_allow = ["life_engine_internal"]
+    chatter_allow = ["life_engine_internal", "life_chatter"]
 
     async def execute(
         self,
@@ -455,6 +455,14 @@ class LifeReviewSubjectDocumentTool(BaseTool):
             float,
             "仅 snooze：延后多久再次邀请，1-720 小时",
         ] = 24.0,
+        offset_bytes: Annotated[
+            int,
+            "仅 status 且指定 target_path：从哪个 UTF-8 字节偏移开始读取原文",
+        ] = 0,
+        max_bytes: Annotated[
+            int,
+            "仅 status 且指定 target_path：本次最多读取 1024-32768 字节",
+        ] = 16384,
     ) -> tuple[bool, str | dict]:
         scheduler = _get_scheduler(self.plugin)
         if scheduler is None:
@@ -479,7 +487,39 @@ class LifeReviewSubjectDocumentTool(BaseTool):
                 ]
                 if not documents:
                     return False, "target_path 必须是 SOUL.md/USER.md/MEMORY.md。"
-                snapshot = {**snapshot, "documents": documents}
+                raw = await scheduler.read_subject_document(
+                    cast(SubjectDocumentPath, selected_path)
+                )
+                try:
+                    raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    return False, "当前主体文档不是 UTF-8 文本，拒绝通过文本工具呈现。"
+                offset = max(0, int(offset_bytes or 0))
+                budget = max(1024, min(32768, int(max_bytes or 16384)))
+                if offset > len(raw):
+                    return False, "offset_bytes 超出主体文档原文长度。"
+                try:
+                    raw[:offset].decode("utf-8")
+                except UnicodeDecodeError:
+                    return False, "offset_bytes 必须位于 UTF-8 字符边界。"
+                end = min(len(raw), offset + budget)
+                while end > offset:
+                    try:
+                        content = raw[offset:end].decode("utf-8")
+                        break
+                    except UnicodeDecodeError:
+                        end -= 1
+                else:
+                    content = ""
+                snapshot = {
+                    **snapshot,
+                    "documents": documents,
+                    "content": content,
+                    "offset_bytes": offset,
+                    "next_offset": end if end < len(raw) else None,
+                    "has_more": end < len(raw),
+                    "total_bytes": len(raw),
+                }
             return True, {"action": "subject_review_status", **snapshot}
 
         target = str(target_path or "").strip()
@@ -494,8 +534,9 @@ class LifeReviewSubjectDocumentTool(BaseTool):
                 actor_consciousness_instance_id=actor,
                 expected_subject_revision=str(expected_subject_revision),
             )
-            workspace = _get_workspace(self.plugin)
-            current_bytes = (workspace / target).read_bytes()
+            current_bytes = await scheduler.read_subject_document(
+                cast(SubjectDocumentPath, target)
+            )
             current_hash = hashlib.sha256(current_bytes).hexdigest()
             if current_hash != str(reviewed_content_sha256 or "").strip().lower():
                 return False, (
@@ -681,7 +722,7 @@ class LifeListSubjectCandidatesTool(BaseTool):
         "查看学习系统整理出的 SOUL/USER/MEMORY 修改候选。候选不是主体结论，"
         "只有当前活跃意识实例在读完原文和候选后明确决定，才可能进入主体权威。"
     )
-    chatter_allow = ["life_engine_internal"]
+    chatter_allow = ["life_engine_internal", "life_chatter"]
 
     async def execute(
         self,
@@ -721,7 +762,7 @@ class LifeReadSubjectCandidateTool(BaseTool):
         "按 UTF-8 字节窗口读取主体修改候选。若 has_more=true，继续使用 next_offset；"
         "candidate_sha256 用于之后对精确候选作决定。"
     )
-    chatter_allow = ["life_engine_internal"]
+    chatter_allow = ["life_engine_internal", "life_chatter"]
 
     async def execute(
         self,
@@ -787,7 +828,7 @@ class LifeDecideSubjectCandidateTool(BaseTool):
         "你最终选择的完整目标文档，不会自动合并；系统会验证活跃意识、候选证据和"
         "当前 SOUL+USER+MEMORY revision，冲突时明确拒绝并要求重读。"
     )
-    chatter_allow = ["life_engine_internal"]
+    chatter_allow = ["life_engine_internal", "life_chatter"]
 
     async def execute(
         self,

@@ -65,15 +65,6 @@ class MemoryPromptData:
         return bool(self.maintenance_reasons)
 
 
-def load_memory_prompt_data(workspace: str | Path) -> MemoryPromptData:
-    """从工作空间读取并分析 MEMORY.md。"""
-    path = Path(workspace) / "MEMORY.md"
-    text = ""
-    if path.exists() and path.is_file():
-        text = path.read_text(encoding="utf-8").strip()
-    return analyze_memory_text(text)
-
-
 def analyze_memory_text(text: str) -> MemoryPromptData:
     """分析 MEMORY.md 文本，提取结构化条目和维护信号。"""
     raw_text = str(text or "").strip()

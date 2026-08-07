@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.tools import exec_tools
@@ -31,7 +35,13 @@ def test_bash_audit_blocks_file_writing_redirects() -> None:
     assert "禁止输出重定向" in error
 
 
+def _require_bubblewrap() -> None:
+    if os.name == "nt" or shutil.which("bwrap") is None:
+        pytest.skip("Bubblewrap read-only sandbox is Linux-only")
+
+
 def test_bash_tool_allows_stderr_discard_redirect(tmp_path: Path) -> None:
+    _require_bubblewrap()
     tool = _make_tool(tmp_path)
 
     ok, payload = asyncio.run(
@@ -56,6 +66,7 @@ def test_bash_tool_blocks_file_writing_redirect(tmp_path: Path) -> None:
 
 
 def test_bash_tool_mounts_workspace_read_only_even_for_python(tmp_path: Path) -> None:
+    _require_bubblewrap()
     target = tmp_path / "MEMORY.md"
     target.write_text("original\n", encoding="utf-8")
     tool = _make_tool(tmp_path)

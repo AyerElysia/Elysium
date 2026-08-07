@@ -24,12 +24,15 @@ from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.service import LifeEngineService
 from plugins.life_engine.streams.manager import ThoughtStreamManager
 from plugins.life_engine.streams.tools import LifeEngineManageThoughtStreamTool
-from plugins.life_engine.trace.store import LifeTraceStore
+from plugins.life_engine.trace.store import AsyncLocalLifeTraceStore, LifeTraceStore
+from src.core.config.core_config import CoreConfig
 
 
 @dataclass
 class _DummyPlugin:
     config: LifeEngineConfig
+    global_storage_config: CoreConfig | None = None
+    service: object | None = None
 
 
 def _make_config(tmp_path: Path) -> LifeEngineConfig:
@@ -40,7 +43,15 @@ def _make_config(tmp_path: Path) -> LifeEngineConfig:
 
 
 def _make_service(tmp_path: Path) -> LifeEngineService:
-    return LifeEngineService(_DummyPlugin(config=_make_config(tmp_path)))
+    plugin = _DummyPlugin(
+        config=_make_config(tmp_path),
+        global_storage_config=CoreConfig(
+            storage=CoreConfig.StorageSection(backend="local")
+        ),
+    )
+    service = LifeEngineService(plugin)
+    plugin.service = service
+    return service
 
 
 # ── 1. record_moment 与兼容性 ───────────────────────────────
@@ -151,7 +162,12 @@ def test_origin_overview_counts_kinds(tmp_path: Path) -> None:
 def test_file_write_records_stream_context(tmp_path: Path) -> None:
     from plugins.life_engine.tools.file_tools import LifeEngineWriteFileTool
 
-    tool = LifeEngineWriteFileTool(plugin=_DummyPlugin(config=_make_config(tmp_path)))
+    plugin = _DummyPlugin(config=_make_config(tmp_path))
+    plugin.service = SimpleNamespace(
+        _selectable_storage_enabled=False,
+        life_trace_store=lambda: AsyncLocalLifeTraceStore(tmp_path),
+    )
+    tool = LifeEngineWriteFileTool(plugin=plugin)
     tool._bind_runtime_context(
         stream_id="stream_ffff",
         message=SimpleNamespace(message_id="msg_0001", stream_id="stream_ffff"),

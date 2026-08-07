@@ -19,6 +19,29 @@ class TestBotSection:
         assert config.stream_step_timeout == 300.0
         assert config.stream_restart_threshold > config.stream_step_timeout
 
+    def test_restart_threshold_must_exceed_enabled_step_budget(self) -> None:
+        with pytest.raises(
+            ValueError,
+            match="stream_restart_threshold must be greater than stream_step_timeout",
+        ):
+            CoreConfig.BotSection(
+                stream_step_timeout=300.0,
+                stream_restart_threshold=300.0,
+            )
+
+    @pytest.mark.parametrize("step_timeout", [0.0, -1.0])
+    def test_disabled_step_budget_does_not_constrain_restart_threshold(
+        self,
+        step_timeout: float,
+    ) -> None:
+        config = CoreConfig.BotSection(
+            stream_step_timeout=step_timeout,
+            stream_restart_threshold=10.0,
+        )
+
+        assert config.stream_step_timeout == step_timeout
+        assert config.stream_restart_threshold == 10.0
+
 
 class TestChatSection:
     """测试聊天配置节。"""
@@ -74,16 +97,16 @@ class TestDatabaseSection:
     """测试数据库配置节。"""
 
     def test_default_database_config(self):
-        """测试默认数据库配置。"""
+        """数据库节只保存连接参数，不选择后端。"""
         config = CoreConfig.DatabaseSection()
 
-        assert config.database_type == "sqlite"
+        assert config.sqlite_path == "data/MoFox.db"
+        assert not hasattr(config, "database_type")
 
-    def test_postgresql_config(self):
-        """测试 PostgreSQL 配置。"""
-        config = CoreConfig.DatabaseSection(database_type="postgresql")
-
-        assert config.database_type == "postgresql"
+    def test_global_storage_config(self):
+        """全局存储节只允许 local 或 mysql。"""
+        assert CoreConfig.StorageSection().backend == "local"
+        assert CoreConfig.StorageSection(backend="mysql").backend == "mysql"
 
 
 class TestPermissionSection:
@@ -247,10 +270,12 @@ class TestCoreConfig:
     def test_database_settings(self):
         """测试数据库配置设置。"""
         config = CoreConfig(
-            database=CoreConfig.DatabaseSection(database_type="postgresql"),
+            storage=CoreConfig.StorageSection(backend="mysql"),
+            database=CoreConfig.DatabaseSection(mysql_host="db.internal"),
         )
 
-        assert config.database.database_type == "postgresql"
+        assert config.storage.backend == "mysql"
+        assert config.database.mysql_host == "db.internal"
 
     def test_permission_settings(self):
         """测试权限配置设置。"""
@@ -273,7 +298,8 @@ class TestCoreConfig:
                 max_llm_messages=0,
             ),
             llm=CoreConfig.LLMSection(default_policy="round_robin"),
-            database=CoreConfig.DatabaseSection(database_type="postgresql"),
+            storage=CoreConfig.StorageSection(backend="mysql"),
+            database=CoreConfig.DatabaseSection(mysql_host="db.internal"),
             permissions=CoreConfig.PermissionSection(
                 owner_list=["qq:123", "telegram:456"],
                 default_permission_level="operator",
@@ -286,7 +312,8 @@ class TestCoreConfig:
         assert config.chat.max_history_messages == 200
         assert not hasattr(config.chat, "max_llm_messages")
         assert config.llm.default_policy == "round_robin"
-        assert config.database.database_type == "postgresql"
+        assert config.storage.backend == "mysql"
+        assert config.database.mysql_host == "db.internal"
         assert len(config.permissions.owner_list) == 2
 
 
@@ -325,7 +352,7 @@ max_context_size = 150
 default_policy = "round_robin"
 
 [database]
-database_type = "postgresql"
+sqlite_path = "data/test.db"
 
 [permissions]
 owner_list = ["qq:123", "telegram:456"]
@@ -340,11 +367,83 @@ allow_operator_promotion = true
             assert config.chat.max_history_messages == 150
             assert not hasattr(config.chat, "max_llm_messages")
             assert config.llm.default_policy == "round_robin"
-            assert config.database.database_type == "postgresql"
+            assert config.storage.backend == "local"
+            assert config.database.sqlite_path == "data/test.db"
             assert len(config.permissions.owner_list) == 2
             assert isinstance(create_default_policy(), RoundRobinPolicy)
         finally:
             set_default_policy_factory(None)
+            core_config_module._global_config = original_config
+
+    def test_legacy_mysql_selector_migrates_to_global_storage(self, temp_dir: Path):
+        """旧 database_type 应自动迁移且从数据库节删除。"""
+        import src.core.config.core_config as core_config_module
+
+        original_config = core_config_module._global_config
+        core_config_module._global_config = None
+        try:
+            config_file = temp_dir / "core.toml"
+            config_file.write_text(
+                '[database]\ndatabase_type = "mysql"\nmysql_host = "db.internal"\n',
+                encoding="utf-8",
+            )
+
+            config = init_core_config(str(config_file))
+            updated = config_file.read_text(encoding="utf-8")
+
+            assert config.storage.backend == "mysql"
+            assert config.database.mysql_host == "db.internal"
+            assert "database_type" not in updated
+            assert '[storage]' in updated
+            assert 'backend = "mysql"' in updated
+        finally:
+            core_config_module._global_config = original_config
+
+    def test_legacy_authority_snapshot_is_removed(self, temp_dir: Path):
+        """旧 epoch/token 配置不得继续成为启动凭据。"""
+        import src.core.config.core_config as core_config_module
+
+        original_config = core_config_module._global_config
+        core_config_module._global_config = None
+        try:
+            config_file = temp_dir / "core.toml"
+            config_file.write_text(
+                '[storage]\nbackend = "mysql"\n'
+                'authority_epoch = 99\n'
+                'fencing_token_env = "OLD_TOKEN"\n',
+                encoding="utf-8",
+            )
+
+            config = init_core_config(str(config_file))
+            updated = config_file.read_text(encoding="utf-8")
+
+            assert config.storage.backend == "mysql"
+            assert not hasattr(config.storage, "authority_epoch")
+            assert not hasattr(config.storage, "fencing_token_env")
+            assert "authority_epoch" not in updated
+            assert "fencing_token_env" not in updated
+        finally:
+            core_config_module._global_config = original_config
+
+    def test_conflicting_legacy_and_global_selectors_are_rejected(
+        self, temp_dir: Path
+    ):
+        """双开关选择不一致时必须失败，不能静默混合。"""
+        import src.core.config.core_config as core_config_module
+
+        original_config = core_config_module._global_config
+        core_config_module._global_config = None
+        try:
+            config_file = temp_dir / "core.toml"
+            config_file.write_text(
+                '[storage]\nbackend = "local"\n\n'
+                '[database]\ndatabase_type = "mysql"\n',
+                encoding="utf-8",
+            )
+
+            with pytest.raises(ValueError, match="Conflicting storage selection"):
+                init_core_config(str(config_file))
+        finally:
             core_config_module._global_config = original_config
 
     def test_get_core_config_before_init_raises(self):
@@ -405,7 +504,7 @@ class TestCoreConfigScenarios:
 
         # 应该能使用所有默认值
         assert config.chat.default_chat_mode == "normal"
-        assert config.database.database_type == "sqlite"
+        assert config.storage.backend == "local"
         assert config.permissions.default_permission_level == "user"
 
     def test_strict_permissions_config(self):
@@ -449,7 +548,8 @@ class TestCoreConfigScenarios:
     def test_production_config(self):
         """测试生产环境配置。"""
         config = CoreConfig(
-            database=CoreConfig.DatabaseSection(database_type="postgresql"),
+            storage=CoreConfig.StorageSection(backend="mysql"),
+            database=CoreConfig.DatabaseSection(mysql_host="db.internal"),
             chat=CoreConfig.ChatSection(
                 default_chat_mode="priority",
                 max_history_messages=200,
@@ -464,7 +564,8 @@ class TestCoreConfigScenarios:
             ),
         )
 
-        assert config.database.database_type == "postgresql"
+        assert config.storage.backend == "mysql"
+        assert config.database.mysql_host == "db.internal"
         assert config.chat.max_history_messages == 200
         assert not hasattr(config.chat, "max_llm_messages")
         assert config.permissions.enable_permission_cache is True

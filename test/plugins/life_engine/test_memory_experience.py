@@ -335,6 +335,13 @@ async def test_memory_witness_commits_only_with_final_exact_context_receipt(
     async def _commit(prepared: object, receipt: object) -> None:
         commits.append((prepared, receipt))
 
+    async def _read_subject_authority_texts() -> dict[str, str]:
+        return {
+            "SOUL.md": "SOUL.md content",
+            "USER.md": "USER.md content",
+            "MEMORY.md": "",
+        }
+
     service = SimpleNamespace(
         _cfg=lambda: SimpleNamespace(
             memory_witness=SimpleNamespace(
@@ -344,6 +351,7 @@ async def test_memory_witness_commits_only_with_final_exact_context_receipt(
         ),
         prepare_perception=_prepare,
         commit_perception=_commit,
+        read_subject_authority_texts=_read_subject_authority_texts,
         _workspace_dir=lambda: tmp_path,
         _read_workspace_text=lambda _workspace, name: f"{name} content",
     )

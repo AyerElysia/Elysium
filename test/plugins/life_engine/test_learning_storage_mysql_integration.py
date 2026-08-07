@@ -69,19 +69,10 @@ async def test_mysql_learning_event_projection_contract() -> None:
     engine = create_mysql_storage_engine(config)
     registry = MySQLAuthorityRegistry(engine, registry_id="life-learning-integration")
     runtime: StorageBackendRuntime | None = None
-    token = None
     suffix = uuid4().hex
     try:
         generation = _generation()
         await registry.register_generation(generation)
-        health = await registry.health()
-        token = await registry.activate_generation(
-            generation.generation_id,
-            expected_epoch=int(health.get("authority_epoch") or 0),
-            owner_id="life-learning-integration-writer",
-            lease_seconds=180,
-            confirm_previous_writers_stopped=True,
-        )
         runtime = await open_storage_backend(
             StorageFactorySettings(
                 enabled=True,
@@ -90,9 +81,8 @@ async def test_mysql_learning_event_projection_contract() -> None:
                 schema_version=1,
                 registry_id="life-learning-integration",
                 authority_provider="mysql",
-                authority_epoch=token.authority_epoch,
-                authority_owner_id=token.owner_id,
-                fencing_token_env="TEST_LEARNING_MYSQL_FENCE",
+                authority_owner_id="life-learning-integration-writer",
+                authority_lease_seconds=180,
                 mysql=MySQLBackendSettings(
                     host=config.host,
                     port=config.port,
@@ -102,10 +92,7 @@ async def test_mysql_learning_event_projection_contract() -> None:
                     ssl_mode=config.ssl_mode,
                 ),
             ),
-            environment={
-                "TEST_LEARNING_MYSQL_FENCE": token.fencing_token,
-                "TEST_LEARNING_MYSQL_PASSWORD": config.password,
-            },
+            environment={"TEST_LEARNING_MYSQL_PASSWORD": config.password},
         )
         store = (
             await open_learning_stores(
@@ -151,10 +138,7 @@ async def test_mysql_learning_event_projection_contract() -> None:
     finally:
         try:
             if runtime is not None:
+                await runtime.revoke_authority()
                 await runtime.close()
         finally:
-            try:
-                if token is not None:
-                    await registry.revoke(token)
-            finally:
-                await engine.dispose()
+            await engine.dispose()

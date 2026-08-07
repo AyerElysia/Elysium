@@ -1,5 +1,6 @@
 import hashlib
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -172,6 +173,104 @@ async def test_append_only_roundtrip_and_projection_clear(tmp_path):
     }
     assert "open_question" not in projection
     assert "generator_note" not in projection
+
+
+@pytest.mark.asyncio
+async def test_selected_opportunity_uses_remote_event_and_content_free_projection(
+    tmp_path,
+):
+    class _RuntimeStore:
+        def __init__(self) -> None:
+            self.state = None
+            self.events = []
+
+        async def get_state(self, namespace: str, state_key: str):
+            assert (namespace, state_key) == (
+                "life_epistemic.projection",
+                "current",
+            )
+            return self.state
+
+        async def put_state(self, **kwargs):
+            revision = int(kwargs["expected_revision"]) + 1
+            self.state = SimpleNamespace(
+                revision=revision,
+                payload=dict(kwargs["payload"]),
+            )
+            return self.state
+
+        async def append_event(self, **kwargs):
+            existing = next(
+                (
+                    item
+                    for item in self.events
+                    if item.occurrence_id == kwargs["occurrence_id"]
+                ),
+                None,
+            )
+            if existing is not None:
+                return existing
+            record = SimpleNamespace(
+                position=len(self.events) + 1,
+                namespace=kwargs["namespace"],
+                occurrence_id=kwargs["occurrence_id"],
+                event_kind=kwargs["event_kind"],
+                payload=dict(kwargs["payload"]),
+            )
+            self.events.append(record)
+            return record
+
+        async def read_events(
+            self,
+            namespace: str,
+            *,
+            after_position: int = 0,
+            limit: int = 100,
+        ):
+            assert namespace == "life_epistemic.opportunities"
+            return [
+                item
+                for item in self.events
+                if item.position > after_position
+            ][:limit]
+
+    store = _RuntimeStore()
+    first = CuriosityEngine(
+        workspace_path=str(tmp_path),
+        model_task_name="life",
+        runtime_store=store,
+    )
+    opportunity = _opportunity()
+
+    await first.save_opportunity(opportunity)
+
+    restarted = CuriosityEngine(
+        workspace_path=str(tmp_path),
+        model_task_name="life",
+        runtime_store=store,
+    )
+    assert await restarted.load_opportunity() == opportunity
+    assert len(store.events) == 1
+    assert store.events[0].payload == opportunity.to_dict()
+    assert set(store.state.payload) == {
+        "kind",
+        "schema_version",
+        "projection_revision",
+        "current_opportunity_id",
+        "current_event_position",
+        "reason_code",
+        "updated_at",
+    }
+    assert "open_question" not in store.state.payload
+    assert "generator_note" not in store.state.payload
+    assert not first.storage_dir.exists()
+    assert not first.legacy_state_path.exists()
+
+    await restarted.clear()
+    assert await restarted.load_opportunity() is None
+    assert len(store.events) == 1
+    assert store.state.payload["current_opportunity_id"] is None
+    assert store.state.payload["current_event_position"] is None
 
 
 @pytest.mark.asyncio

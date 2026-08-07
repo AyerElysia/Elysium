@@ -140,11 +140,19 @@ class SubjectWorkspaceProjector:
             if existing_mode is not None:
                 os.chmod(temporary, existing_mode)
             os.replace(temporary, path)
-            directory_fd = os.open(path.parent, os.O_RDONLY)
             try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+                directory_fd = os.open(path.parent, os.O_RDONLY)
+            except (OSError, PermissionError):
+                # Windows does not permit opening directories with os.open.
+                # The file itself has already been flushed, fsynced and atomically
+                # replaced; directory fsync remains a best-effort POSIX durability
+                # enhancement rather than a reason to mark projection failed.
+                directory_fd = None
+            if directory_fd is not None:
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
         finally:
             if temporary.exists():
                 temporary.unlink()

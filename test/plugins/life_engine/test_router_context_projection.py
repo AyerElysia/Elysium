@@ -18,6 +18,7 @@ from plugins.life_engine.core.router_context_projection import (
 )
 from plugins.life_engine.service import core as service_core
 from plugins.life_engine.service.core import LifeEngineService
+from src.core.config.core_config import CoreConfig
 
 
 class _Response:
@@ -357,6 +358,86 @@ async def test_projection_is_content_addressed_and_keeps_old_versions(
 
 
 @pytest.mark.asyncio
+async def test_selected_projection_uses_remote_subject_and_runtime_stores_only(
+    tmp_path: Path,
+) -> None:
+    contents = {
+        "SOUL.md": b"REMOTE SOUL",
+        "USER.md": b"REMOTE USER",
+        "MEMORY.md": b"REMOTE MEMORY",
+    }
+    from plugins.life_engine.core.router_context_projection import _sources_from_contents
+
+    _, revision = _sources_from_contents(contents)
+
+    class _SubjectStore:
+        async def current_subject_revision(self) -> str:
+            return revision
+
+        async def read_subject_authority(self):
+            commits = {
+                name: SimpleNamespace(
+                    version=SimpleNamespace(content_bytes=raw)
+                )
+                for name, raw in contents.items()
+            }
+            return SimpleNamespace(commits=commits, revision=revision)
+
+    class _RuntimeStore:
+        def __init__(self) -> None:
+            self.states: dict[tuple[str, str], SimpleNamespace] = {}
+
+        async def get_state(self, namespace: str, state_key: str):
+            return self.states.get((namespace, state_key))
+
+        async def put_state(self, **kwargs):
+            key = (str(kwargs["namespace"]), str(kwargs["state_key"]))
+            current = self.states.get(key)
+            expected = int(kwargs["expected_revision"])
+            actual = int(current.revision) if current is not None else 0
+            assert expected == actual
+            record = SimpleNamespace(
+                revision=actual + 1,
+                payload=dict(kwargs["payload"]),
+            )
+            self.states[key] = record
+            return record
+
+    calls = 0
+
+    async def author(source_digest, sources):
+        nonlocal calls
+        calls += 1
+        assert source_digest == revision
+        assert [source.text for source in sources] == [
+            "REMOTE SOUL",
+            "REMOTE USER",
+            "REMOTE MEMORY",
+        ]
+        return RouterContextDraft(text="remote projection", generator="test-author")
+
+    runtime_store = _RuntimeStore()
+    projection = RouterContextProjection(
+        tmp_path,
+        author=author,
+        subject_store=_SubjectStore(),
+        runtime_store=runtime_store,
+    )
+
+    first = await projection.refresh()
+    assert "remote projection" in first
+    assert await projection.refresh() == first
+    assert calls == 1
+    assert not projection.runtime_dir.exists()
+
+    snapshot = await projection.ensure_current_snapshot()
+    assert snapshot is not None
+    assert snapshot["source_digest"] == revision
+    assert snapshot["text"] == first
+    assert await projection.get_snapshot(revision) == snapshot
+
+
+@pytest.mark.asyncio
 async def test_projection_failure_preserves_last_version_but_never_serves_it_stale(
     tmp_path: Path,
 ) -> None:
@@ -376,7 +457,8 @@ async def test_projection_failure_preserves_last_version_but_never_serves_it_sta
     should_fail = True
     (tmp_path / "MEMORY.md").write_text("changed memory", encoding="utf-8")
 
-    assert await projection.ensure_current() == ""
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        await projection.ensure_current()
     assert projection.latest_path.read_text(encoding="utf-8") == latest_before
     assert "current projection" in first
     health = projection.health_snapshot()
@@ -466,7 +548,14 @@ async def test_projection_author_tries_next_cloud_model_after_empty_final(
     config = LifeEngineConfig()
     config.settings.workspace_path = str(tmp_path)
     config.chatter.router_context_projection_task_name = "projection-test"
-    service = LifeEngineService(SimpleNamespace(config=config))
+    service = LifeEngineService(
+        SimpleNamespace(
+            config=config,
+            global_storage_config=CoreConfig(
+                storage=CoreConfig.StorageSection(backend="local")
+            ),
+        )
+    )
     projection = RouterContextProjection(
         tmp_path,
         author=service._author_router_context_projection,

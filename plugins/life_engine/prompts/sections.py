@@ -275,12 +275,18 @@ class ImpulseSection(HeartbeatSectionProvider):
             from ..trace.store import LifeTraceStore
             narrative_cfg = getattr(ctx.config, "narrative", None)
             if narrative_cfg and getattr(narrative_cfg, "enabled", True):
-                store = NarrativeStore(service._workspace_dir())
-                trace_store = LifeTraceStore(service._workspace_dir())
-                pending = store.pending_moments(trace_store.recent(limit=500))
+                store = service.narrative_store()
+                state = await store.load_state()
+                trace_store = service.life_trace_store()
+                pending = store.pending_moments(
+                    await trace_store.recent(limit=500),
+                    state,
+                )
                 min_moments = int(getattr(narrative_cfg, "min_moments", 5))
                 has_pending_river_moments = len(pending) >= min_moments
         except Exception:  # noqa: BLE001
+            if getattr(service, "_selectable_storage_enabled", False):
+                raise
             has_pending_river_moments = False
         
         # 判定自主意向（需要新增工具支持，暂时置 False）
@@ -380,9 +386,8 @@ class RiverReflectionSection(HeartbeatSectionProvider):
         from ..trace.store import LifeTraceStore
 
         cfg = ctx.config.narrative
-        workspace = ctx.service._workspace_dir()
-        store = NarrativeStore(workspace)
-        state = store.load_state()
+        store = ctx.service.narrative_store()
+        state = await store.load_state()
         now = datetime.now(timezone.utc).astimezone()
 
         last_consolidated = _parse_iso(state.get("last_consolidated_at", ""))
@@ -398,12 +403,13 @@ class RiverReflectionSection(HeartbeatSectionProvider):
                 return None
 
         pending = store.pending_moments(
-            LifeTraceStore(workspace).recent(limit=500)
+            await ctx.service.life_trace_store().recent(limit=500),
+            state,
         )
         if len(pending) < int(cfg.min_moments):
             return None
 
-        store.mark_invited(now=now)
+        await store.mark_invited(now=now)
 
         shown = pending[-int(cfg.max_moments_shown):]
         lines = [
@@ -417,7 +423,7 @@ class RiverReflectionSection(HeartbeatSectionProvider):
             lines.append(f"- {record.timestamp[:16]} [{record.kind}] {label}")
         if len(pending) > len(shown):
             lines.append(f"- ……以及更早的 {len(pending) - len(shown)} 条")
-        last_entry = store.last_entry()
+        last_entry = await store.last_entry()
         if last_entry is not None and last_entry.text:
             snippet = last_entry.text[:80]
             lines.extend(["", f"上次你写道：「{snippet}」"])
@@ -595,14 +601,19 @@ class LeisureOpportunitySection(HeartbeatSectionProvider):
             from ..trace.store import LifeTraceStore
             narrative_cfg = getattr(ctx.config, "narrative", None)
             if narrative_cfg and getattr(narrative_cfg, "enabled", True):
-                store = NarrativeStore(service._workspace_dir())
-                trace_store = LifeTraceStore(service._workspace_dir())
-                pending = store.pending_moments(trace_store.recent(limit=500))
+                store = service.narrative_store()
+                state = await store.load_state()
+                trace_store = service.life_trace_store()
+                pending = store.pending_moments(
+                    await trace_store.recent(limit=500),
+                    state,
+                )
                 min_moments = int(getattr(narrative_cfg, "min_moments", 5))
                 if len(pending) >= min_moments:
                     opportunities.append("长河里积累了一些留痕；如果愿意，可以回望并写下它对你意味着什么")
         except Exception:  # noqa: BLE001
-            pass
+            if getattr(service, "_selectable_storage_enabled", False):
+                raise
         
         # 5. 紧急 todo（作为提醒而非命令）
         try:

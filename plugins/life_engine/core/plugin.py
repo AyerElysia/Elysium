@@ -64,6 +64,16 @@ class LifeEnginePlugin(BasePlugin):
 
     def __init__(self, config: LifeEngineConfig | None = None) -> None:
         super().__init__(config)
+        from src.core.config import get_core_config
+
+        try:
+            self.global_storage_config = get_core_config()
+        except RuntimeError:
+            # Component discovery is also used by isolated contract tests before
+            # Core startup. Keep the missing value explicit: constructing the
+            # real service from this plugin still fails closed rather than
+            # guessing a storage backend.
+            self.global_storage_config = None
         self._service: LifeEngineService | None = None
         self._agent_coordinator_shutdown = False
 

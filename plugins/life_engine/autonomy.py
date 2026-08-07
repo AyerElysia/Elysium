@@ -171,8 +171,120 @@ class AutonomyIntent:
         )
 
 
+class SelectedAutonomyIntentStore:
+    """Async autonomy state/event adapter over the selected runtime store."""
+
+    def __init__(self, runtime_store: Any) -> None:
+        if runtime_store is None:
+            raise RuntimeError("SelectedAutonomyStorageNotStarted")
+        self.runtime_store = runtime_store
+        self._revision = 0
+
+    @staticmethod
+    def _decode(payload: dict[str, Any]) -> list[AutonomyIntent]:
+        if not isinstance(payload, dict):
+            raise RuntimeError("AutonomyRemoteStateNotObject")
+        items = payload.get("intents")
+        if not isinstance(items, list):
+            raise RuntimeError("AutonomyRemoteIntentsNotList")
+        return [
+            AutonomyIntent.from_dict(item)
+            for item in items
+            if isinstance(item, dict)
+        ]
+
+    async def load(self) -> list[AutonomyIntent]:
+        record = await self.runtime_store.get_state(
+            "life_autonomy.intents",
+            "current",
+        )
+        if record is None:
+            self._revision = 0
+            return []
+        self._revision = int(record.revision)
+        return self._decode(record.payload)
+
+    async def save(self, intents: list[AutonomyIntent]) -> None:
+        record = await self.runtime_store.put_state(
+            namespace="life_autonomy.intents",
+            state_key="current",
+            expected_revision=self._revision,
+            schema_version=_STORE_VERSION,
+            payload={
+                "version": _STORE_VERSION,
+                "updated_at": iso_now(),
+                "intents": [intent.to_dict() for intent in intents],
+            },
+        )
+        self._revision = int(record.revision)
+
+    async def upsert(self, intent: AutonomyIntent) -> None:
+        intents = await self.load()
+        for index, item in enumerate(intents):
+            if item.intent_id == intent.intent_id:
+                intents[index] = intent
+                break
+        else:
+            intents.append(intent)
+        await self.save(intents)
+
+    async def get(self, intent_id: str) -> AutonomyIntent | None:
+        target = str(intent_id or "").strip()
+        if not target:
+            return None
+        for intent in await self.load():
+            if intent.intent_id == target:
+                return intent
+        return None
+
+    async def list_scheduled(self) -> list[AutonomyIntent]:
+        return [
+            intent for intent in await self.load()
+            if intent.status == "scheduled"
+        ]
+
+    async def append_event(
+        self,
+        event_type: str,
+        intent: AutonomyIntent,
+        *,
+        occurrence_id: str = "",
+        action_id: str = "",
+        detail: str = "",
+    ) -> None:
+        payload = {
+            "event_type": str(event_type or "unknown"),
+            "intent_id": intent.intent_id,
+            "occurrence_id": str(occurrence_id or intent.active_occurrence_id),
+            "occurrence_count": int(intent.occurrence_count or 0),
+            "action_id": str(action_id or ""),
+            "status": intent.status,
+            "target_stream_id": intent.target_stream_id,
+            "detail": _shorten(detail, max_length=500),
+            "created_at": iso_now(),
+        }
+        identity_material = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        import hashlib
+
+        event_id = "autonomy:" + hashlib.sha256(
+            identity_material.encode("utf-8")
+        ).hexdigest()
+        await self.runtime_store.append_event(
+            namespace="life_autonomy.lifecycle",
+            occurrence_id=event_id,
+            event_kind=str(event_type or "unknown"),
+            payload=payload,
+            occurred_at=payload["created_at"],
+        )
+
+
 class AutonomyIntentStore:
-    """JSON store for autonomy intents in the life workspace."""
+    """JSON store for autonomy intents in explicit local mode."""
 
     def __init__(self, workspace_path: str | Path) -> None:
         self.path = Path(workspace_path) / _STORE_FILE
@@ -265,6 +377,46 @@ class AutonomyIntentStore:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
+
+
+class AsyncLocalAutonomyIntentStore:
+    """Async wrapper used only when global storage explicitly selects local."""
+
+    def __init__(self, workspace_path: str | Path) -> None:
+        self.local = AutonomyIntentStore(workspace_path)
+
+    async def load(self) -> list[AutonomyIntent]:
+        return await asyncio.to_thread(self.local.load)
+
+    async def save(self, intents: list[AutonomyIntent]) -> None:
+        await asyncio.to_thread(self.local.save, intents)
+
+    async def upsert(self, intent: AutonomyIntent) -> None:
+        await asyncio.to_thread(self.local.upsert, intent)
+
+    async def get(self, intent_id: str) -> AutonomyIntent | None:
+        return await asyncio.to_thread(self.local.get, intent_id)
+
+    async def list_scheduled(self) -> list[AutonomyIntent]:
+        return await asyncio.to_thread(self.local.list_scheduled)
+
+    async def append_event(
+        self,
+        event_type: str,
+        intent: AutonomyIntent,
+        *,
+        occurrence_id: str = "",
+        action_id: str = "",
+        detail: str = "",
+    ) -> None:
+        await asyncio.to_thread(
+            self.local.append_event,
+            event_type,
+            intent,
+            occurrence_id=occurrence_id,
+            action_id=action_id,
+            detail=detail,
+        )
 
 
 def occurrence_id_for(intent: AutonomyIntent, occurrence_count: int | None = None) -> str:
@@ -438,16 +590,21 @@ async def schedule_autonomy_intent(plugin: Any, intent: AutonomyIntent) -> str:
     return schedule_id
 
 
-async def restore_autonomy_intents(plugin: Any, workspace_path: str | Path) -> int:
-    store = AutonomyIntentStore(workspace_path)
-    intents = store.load()
+async def restore_autonomy_intents(
+    plugin: Any,
+    workspace_path: str | Path,
+    *,
+    store: Any | None = None,
+) -> int:
+    store = store or AsyncLocalAutonomyIntentStore(workspace_path)
+    intents = await store.load()
     if not intents:
         return 0
 
     scheduler = get_unified_scheduler()
     restored = 0
     async with _get_lock():
-        for intent in store.load():
+        for intent in await store.load():
             if intent.status == "in_flight" or intent.active_occurrence_id:
                 # The previous process cannot prove whether an external action
                 # crossed the crash boundary. Preserve it; never blindly replay.
@@ -456,8 +613,8 @@ async def restore_autonomy_intents(plugin: Any, workspace_path: str | Path) -> i
                 intent.renewal_reason = "unfinished occurrence recovered after restart"
                 intent.active_occurrence_status = "delivery_unknown"
                 intent.updated_at = iso_now()
-                store.upsert(intent)
-                store.append_event(
+                await store.upsert(intent)
+                await store.append_event(
                     "recovered_delivery_unknown",
                     intent,
                     occurrence_id=occurrence_id,
@@ -471,8 +628,8 @@ async def restore_autonomy_intents(plugin: Any, workspace_path: str | Path) -> i
                 intent.status = "renewal_required"
                 intent.renewal_reason = lease_reason
                 intent.updated_at = iso_now()
-                store.upsert(intent)
-                store.append_event(
+                await store.upsert(intent)
+                await store.append_event(
                     "renewal_required",
                     intent,
                     detail=lease_reason,
@@ -489,19 +646,20 @@ async def restore_autonomy_intents(plugin: Any, workspace_path: str | Path) -> i
                 intent.status = "rejected"
                 intent.rejected_reason = "scheduled_at 无效"
                 intent.updated_at = iso_now()
-                store.upsert(intent)
+                await store.upsert(intent)
                 continue
             if scheduled_at <= now_local():
                 # Missed while offline: surface soon, but still through the same path.
                 intent.scheduled_at = (now_local() + timedelta(seconds=5)).isoformat()
             try:
                 await schedule_autonomy_intent(plugin, intent)
-                store.upsert(intent)
+                await store.upsert(intent)
                 restored += 1
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"恢复自主意向失败: intent_id={intent.intent_id} error={exc}")
+    remaining = await store.load()
     if not scheduler.is_running and any(
-        intent.status == "scheduled" for intent in store.load()
+        intent.status == "scheduled" for intent in remaining
     ):
         logger.warning("调度器尚未运行，未恢复 scheduled 自主意向")
     if restored:
@@ -509,11 +667,15 @@ async def restore_autonomy_intents(plugin: Any, workspace_path: str | Path) -> i
     return restored
 
 
-async def cleanup_autonomy_schedules(workspace_path: str | Path) -> int:
-    store = AutonomyIntentStore(workspace_path)
+async def cleanup_autonomy_schedules(
+    workspace_path: str | Path,
+    *,
+    store: Any | None = None,
+) -> int:
+    store = store or AsyncLocalAutonomyIntentStore(workspace_path)
     scheduler = get_unified_scheduler()
     removed = 0
-    for intent in store.list_scheduled():
+    for intent in await store.list_scheduled():
         if intent.schedule_id:
             try:
                 if await scheduler.remove_schedule(intent.schedule_id):

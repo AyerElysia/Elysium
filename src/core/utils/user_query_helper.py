@@ -58,6 +58,16 @@ class UserQueryHelper:
         """
         return hashlib.sha256(f"{platform}_{user_id}".encode()).hexdigest()
 
+    async def get_person_info(
+        self,
+        platform: str,
+        user_id: str,
+    ) -> "PersonInfo | None":
+        """Read one persisted platform identity without mutating interaction state."""
+
+        person_id = self.generate_person_id(platform, user_id)
+        return await self.person_crud.get_by(person_id=person_id)
+
     @alru_cache(maxsize=256)
     async def get_or_create_person(
         self,

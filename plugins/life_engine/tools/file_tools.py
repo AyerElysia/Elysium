@@ -297,7 +297,7 @@ def _read_trace_before_content(target: Path, encoding: str) -> str | None:
         return None
 
 
-def _record_file_trace(
+async def _record_file_trace(
     plugin: Any,
     *,
     path: str,
@@ -310,7 +310,11 @@ def _record_file_trace(
     stream_id: str = "",
 ) -> str:
     try:
-        record = LifeTraceStore(_get_workspace(plugin)).record_change(
+        service = getattr(plugin, "service", None)
+        get_store = getattr(service, "life_trace_store", None)
+        if not callable(get_store):
+            raise RuntimeError("LifeTraceServiceUnavailable")
+        record = await get_store().record_change(
             path=path,
             before_content=before_content,
             after_content=after_content,
@@ -323,6 +327,8 @@ def _record_file_trace(
         )
         return record.trace_id if record is not None else ""
     except Exception as exc:  # noqa: BLE001
+        if bool(getattr(service, "_selectable_storage_enabled", False)):
+            raise
         logger.warning(f"记录 Life Trace 失败 {path}: {exc}")
         return ""
 
@@ -881,7 +887,7 @@ class LifeEngineWriteFileTool(BaseTool):
             trace_context = _tool_trace_context(self)
             await asyncio.to_thread(target.write_text, content, encoding=encoding)
             stat = target.stat()
-            trace_id = _record_file_trace(
+            trace_id = await _record_file_trace(
                 self.plugin,
                 path=path,
                 before_content=before_content,
@@ -1008,7 +1014,7 @@ class LifeEngineEditFileTool(BaseTool):
                 new_content,
                 encoding=encoding,
             )
-            trace_id = _record_file_trace(
+            trace_id = await _record_file_trace(
                 self.plugin,
                 path=path,
                 before_content=content,

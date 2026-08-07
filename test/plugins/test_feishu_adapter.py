@@ -423,6 +423,34 @@ async def test_feishu_image_event_falls_back_to_text_when_download_fails(
     assert envelope["message_segment"] == [{"type": "text", "data": "[图片]"}]
 
 
+async def test_feishu_persisted_identity_replaces_config_alias_requirement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = make_adapter()
+
+    async def persisted_identity(account_id: str) -> tuple[str, str]:
+        assert account_id == "ou_peach"
+        return "桃子哥", "wander_hunter"
+
+    monkeypatch.setattr(adapter, "_persisted_identity", persisted_identity)
+    monkeypatch.setattr(
+        adapter,
+        "_resolve_display_name",
+        AsyncMock(side_effect=AssertionError("directory lookup must not run")),
+    )
+
+    envelope = await adapter.from_platform_message(
+        _event(open_id="ou_peach", union_id="", message_id="om_database_identity")
+    )
+
+    assert envelope is not None
+    assert _nickname(envelope) == "桃子哥"
+    extra = envelope["message_info"]["extra"]
+    assert extra["canonical_person_key"] == "wander_hunter"
+    assert extra["identity_resolution_status"] == "resolved"
+    assert extra["identity_display_name_source"] == "person_info"
+
+
 async def test_feishu_user_name_alias_maps_sender_display_name() -> None:
     config = FeishuAdapterConfig()
     config.identity.user_name_aliases = [

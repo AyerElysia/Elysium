@@ -69,17 +69,8 @@ async def test_mysql_subject_document_adapter_contract() -> None:
     engine = create_mysql_storage_engine(config)
     registry = MySQLAuthorityRegistry(engine, registry_id=registry_id)
     runtime = None
-    token = None
     try:
         await registry.register_generation(generation)
-        health = await registry.health()
-        token = await registry.activate_generation(
-            generation.generation_id,
-            expected_epoch=int(health.get("authority_epoch") or 0),
-            owner_id=f"writer-{identity}",
-            lease_seconds=120,
-            confirm_previous_writers_stopped=True,
-        )
         runtime = await open_storage_backend(
             StorageFactorySettings(
                 enabled=True,
@@ -88,9 +79,7 @@ async def test_mysql_subject_document_adapter_contract() -> None:
                 schema_version=1,
                 registry_id=registry_id,
                 authority_provider="mysql",
-                authority_epoch=token.authority_epoch,
-                authority_owner_id=token.owner_id,
-                fencing_token_env="TEST_SUBJECT_MYSQL_FENCE",
+                authority_owner_id=f"writer-{identity}",
                 mysql=MySQLBackendSettings(
                     host=config.host,
                     port=config.port,
@@ -100,10 +89,7 @@ async def test_mysql_subject_document_adapter_contract() -> None:
                     ssl_mode=config.ssl_mode,
                 ),
             ),
-            environment={
-                "TEST_SUBJECT_MYSQL_FENCE": token.fencing_token,
-                "TEST_SUBJECT_MYSQL_PASSWORD": config.password,
-            },
+            environment={"TEST_SUBJECT_MYSQL_PASSWORD": config.password},
         )
         store = await open_subject_document_store(runtime, initialize_schema=True)
         command = AppendSubjectDocumentVersion(
@@ -130,7 +116,6 @@ async def test_mysql_subject_document_adapter_contract() -> None:
             )
     finally:
         if runtime is not None:
+            await runtime.revoke_authority()
             await runtime.close()
-        if token is not None:
-            await registry.revoke(token)
         await engine.dispose()

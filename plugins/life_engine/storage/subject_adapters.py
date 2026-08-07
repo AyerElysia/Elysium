@@ -28,6 +28,7 @@ from .subject_contracts import (
     SubjectAuthorityCommit,
     SubjectAuthorityConflict,
     SubjectAuthorityEvidenceError,
+    SubjectAuthoritySnapshot,
     SubjectDocumentCommit,
     SubjectDocumentConflict,
     SubjectDocumentHead,
@@ -467,6 +468,19 @@ class SQLSubjectDocumentStore:
             )
         return revision
 
+    async def read_subject_authority(self) -> SubjectAuthoritySnapshot:
+        """Read all three authority head/version pairs in one consistent snapshot."""
+
+        async with self.runtime.unit_of_work() as uow:
+            state, revision = await self._subject_authority_state(
+                uow.session,
+                lock=False,
+            )
+        return SubjectAuthoritySnapshot(
+            commits={path: state[path] for path in SUBJECT_AUTHORITY_PATHS},
+            revision=revision,
+        )
+
     @staticmethod
     def _validate_learning_event_integrity(row: Any) -> dict[str, Any]:
         provenance = _json_object(row["provenance_json"])
@@ -778,7 +792,7 @@ class SQLSubjectDocumentStore:
                     confirmed_at, last_error
                 ) VALUES (
                     :head_event_id, :document_id, :logical_path, :version_id,
-                    :content_hash, 'pending', 0, :created_at,
+                    :content_hash, :projection_state, 0, :created_at,
                     :confirmed_at, ''
                 )"""
             ),
@@ -788,8 +802,15 @@ class SQLSubjectDocumentStore:
                 "logical_path": current.head.logical_path,
                 "version_id": version_id,
                 "content_hash": content_hash,
+                "projection_state": (
+                    "confirmed" if self.backend == BackendKind.MYSQL else "pending"
+                ),
                 "created_at": self._bind_time(database_now),
-                "confirmed_at": (None if self.backend == BackendKind.MYSQL else ""),
+                "confirmed_at": (
+                    self._bind_time(database_now)
+                    if self.backend == BackendKind.MYSQL
+                    else ""
+                ),
             },
         )
         version = SubjectDocumentVersion(
@@ -1347,7 +1368,7 @@ class SQLSubjectDocumentStore:
                         confirmed_at, last_error
                     ) VALUES (
                         :head_event_id, :document_id, :logical_path, :version_id,
-                        :content_hash, 'pending', 0, :created_at,
+                        :content_hash, :projection_state, 0, :created_at,
                         :confirmed_at, ''
                     )"""
                 ),
@@ -1357,8 +1378,15 @@ class SQLSubjectDocumentStore:
                     "logical_path": path,
                     "version_id": version_id,
                     "content_hash": content_hash,
+                    "projection_state": (
+                        "confirmed" if self.backend == BackendKind.MYSQL else "pending"
+                    ),
                     "created_at": self._bind_time(database_now),
-                    "confirmed_at": (None if self.backend == BackendKind.MYSQL else ""),
+                    "confirmed_at": (
+                        self._bind_time(database_now)
+                        if self.backend == BackendKind.MYSQL
+                        else ""
+                    ),
                 },
             )
             version = SubjectDocumentVersion(

@@ -81,7 +81,6 @@ async def test_mysql_runtime_migrates_fences_commits_and_recovers() -> None:
     engine = create_mysql_storage_engine(config)
     registry = MySQLAuthorityRegistry(engine, registry_id="life-storage-integration")
     runtime = None
-    token = None
     occurrence_id = str(uuid4())
     try:
         health = await mysql_storage_health(
@@ -101,15 +100,6 @@ async def test_mysql_runtime_migrates_fences_commits_and_recovers() -> None:
         assert second.applied_versions == ()
 
         await registry.register_generation(_generation())
-        authority_health = await registry.health()
-        expected_epoch = int(authority_health.get("authority_epoch") or 0)
-        token = await registry.activate_generation(
-            "mysql-integration-contract-v1",
-            expected_epoch=expected_epoch,
-            owner_id="integration-writer",
-            lease_seconds=120,
-            confirm_previous_writers_stopped=True,
-        )
         runtime = await open_storage_backend(
             StorageFactorySettings(
                 enabled=True,
@@ -118,9 +108,7 @@ async def test_mysql_runtime_migrates_fences_commits_and_recovers() -> None:
                 schema_version=1,
                 registry_id="life-storage-integration",
                 authority_provider="mysql",
-                authority_epoch=token.authority_epoch,
                 authority_owner_id="integration-writer",
-                fencing_token_env="TEST_STORAGE_FENCE",
                 mysql=MySQLBackendSettings(
                     host=config.host,
                     port=config.port,
@@ -130,10 +118,7 @@ async def test_mysql_runtime_migrates_fences_commits_and_recovers() -> None:
                     ssl_mode=config.ssl_mode,
                 ),
             ),
-            environment={
-                "TEST_STORAGE_FENCE": token.fencing_token,
-                "TEST_STORAGE_MYSQL_PASSWORD": config.password,
-            },
+            environment={"TEST_STORAGE_MYSQL_PASSWORD": config.password},
         )
         async with runtime.unit_of_work() as uow:
             await uow.session.execute(
@@ -145,7 +130,7 @@ async def test_mysql_runtime_migrates_fences_commits_and_recovers() -> None:
                 {
                     "occurrence_id": occurrence_id,
                     "payload": "爱莉 storage contract",
-                    "authority_epoch": token.authority_epoch,
+                    "authority_epoch": runtime.authority_token.authority_epoch,
                 },
             )
         async with runtime.engine.connect() as connection:
@@ -169,9 +154,8 @@ async def test_mysql_runtime_migrates_fences_commits_and_recovers() -> None:
                         ),
                         {"occurrence_id": occurrence_id},
                     )
+            await runtime.revoke_authority()
             await runtime.close()
-        if token is not None:
-            await registry.revoke(token)
         await engine.dispose()
 
 

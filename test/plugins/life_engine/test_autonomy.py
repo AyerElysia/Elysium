@@ -18,6 +18,7 @@ from plugins.life_engine.core.chatter import LifeChatter, LifeSendTextAction
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.service.core import LifeEngineService
 from plugins.life_engine.tools.autonomy_tools import LifeEngineScheduleAutonomyIntentTool
+from src.core.config.core_config import CoreConfig
 from src.core.models.message import Message
 from src.core.models.stream import ChatStream
 
@@ -25,7 +26,12 @@ from src.core.models.stream import ChatStream
 def _make_service(tmp_path: Path) -> LifeEngineService:
     config = LifeEngineConfig()
     config.settings.workspace_path = str(tmp_path)
-    plugin = SimpleNamespace(config=config)
+    plugin = SimpleNamespace(
+        config=config,
+        global_storage_config=CoreConfig(
+            storage=CoreConfig.StorageSection(backend="local")
+        ),
+    )
     service = LifeEngineService(plugin)
     plugin.service = service
     return service

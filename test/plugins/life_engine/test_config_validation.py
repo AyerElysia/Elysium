@@ -12,6 +12,22 @@ import pytest
 from plugins.life_engine.core.config import LifeEngineConfig
 
 
+def test_life_config_rejects_removed_storage_section() -> None:
+    """生命域配置不得重新取得 generation 或后端选择配置。"""
+    with pytest.raises(ValueError):
+        LifeEngineConfig(  # type: ignore[call-arg]
+            storage={"authoritative_backend": "mysql"}
+        )
+
+
+def test_life_config_rejects_removed_mysql_connection_section() -> None:
+    """MySQL 连接只能配置在全局 Core 配置中。"""
+    with pytest.raises(ValueError):
+        LifeEngineConfig(  # type: ignore[call-arg]
+            storage_mysql={"host": "duplicate.example"}
+        )
+
+
 def test_auto_update_retires_legacy_thought_authority_sections(
     tmp_path: Path,
 ) -> None:

@@ -976,9 +976,19 @@ class MySQLAuthorityRegistry:
                         raise AuthorityConflict(
                             f"authority epoch conflict: expected {expected_epoch}, actual {actual_epoch}"
                         )
-                    if str(current["active_generation"] or "") and not confirm_previous_writers_stopped:
+                    active_generation = str(current["active_generation"] or "")
+                    lease_until = current["lease_until"]
+                    database_now = await connection.scalar(
+                        text("SELECT CURRENT_TIMESTAMP(6)")
+                    )
+                    live_authority = bool(active_generation) and (
+                        lease_until is None
+                        or database_now is None
+                        or lease_until > database_now
+                    )
+                    if live_authority and not confirm_previous_writers_stopped:
                         raise AuthorityConflict(
-                            "active authority exists; explicit writer isolation confirmation is required"
+                            "live authority exists; writer isolation is not proven"
                         )
                     next_epoch = actual_epoch + 1
                     backend = str(generation["backend"])

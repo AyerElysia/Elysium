@@ -15,10 +15,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from plugins.life_engine.service.event_bus import LifeEvent
 from plugins.life_engine.service.world_projection import (
-    WORLD_ASSERTION_ORDER_NEWEST_FIRST,
-    WORLD_ASSERTION_ORDER_OLDEST_FIRST,
-    WORLD_ASSERTION_SCOPE_CURRENT_SNAPSHOT,
-    WORLD_ASSERTION_SCOPE_HISTORY,
     WORLD_LEGACY_IMPORT_EVENT,
     WORLD_OBSERVATION_EVENT,
     WORLD_PROJECTOR_POLICY,
@@ -37,7 +33,6 @@ from plugins.life_engine.service.world_projection import (
     WorldProjectionStore,
     WorldProjectionUnavailable,
     WorldValueChunk,
-    normalize_world_assertion_scope,
 )
 from src.kernel.storage import canonical_json
 
@@ -644,7 +639,6 @@ class SQLWorldProjectionStore:
         self,
         *,
         include_retracted: bool = False,
-        delivery_scope: str = WORLD_ASSERTION_SCOPE_HISTORY,
         after_observed_at: str = "",
         after_assertion_id: str = "",
         limit: int = 128,
@@ -652,10 +646,6 @@ class SQLWorldProjectionStore:
     ) -> WorldAssertionReferencePage:
         """Read a compact stable page without materializing giant JSON values."""
 
-        scope = normalize_world_assertion_scope(delivery_scope)
-        current_snapshot = scope == WORLD_ASSERTION_SCOPE_CURRENT_SNAPSHOT
-        if current_snapshot and include_retracted:
-            raise ValueError("current World snapshot cannot include retracted evidence")
         page_limit = max(1, min(int(limit), 1000))
         inline_limit = max(0, min(int(inline_max_bytes), 16 * 1024))
         mysql = self.backend == BackendKind.MYSQL
@@ -666,19 +656,11 @@ class SQLWorldProjectionStore:
         }
         if not include_retracted:
             conditions.append("retracted_at IS NULL" if mysql else "retracted_at = ''")
-        if current_snapshot:
-            conditions.extend(
-                [
-                    "predicate <> 'session_state'",
-                    "NOT (predicate = 'legacy_snapshot' AND status = 'legacy_import')",
-                ]
-            )
         if after_observed_at or after_assertion_id:
-            operator = "<" if current_snapshot else ">"
             conditions.append(
-                f"(observed_at {operator} :after_observed_at OR "
+                "(observed_at > :after_observed_at OR "
                 "(observed_at = :after_observed_at "
-                f"AND assertion_id {operator} :after_assertion_id))"
+                "AND assertion_id > :after_assertion_id))"
             )
             params["after_observed_at"] = (
                 _parse_datetime(after_observed_at)
@@ -687,7 +669,6 @@ class SQLWorldProjectionStore:
             )
             params["after_assertion_id"] = str(after_assertion_id or "")
         where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
-        order = "DESC" if current_snapshot else "ASC"
         if mysql:
             value_bytes = "OCTET_LENGTH(CAST(value_json AS CHAR))"
             inline_value = (
@@ -729,7 +710,7 @@ class SQLWorldProjectionStore:
                 {inline_value} AS inline_value_json,
                 CASE WHEN {transport_echo} THEN 1 ELSE 0 END AS transport_echo
             FROM world_assertions{where}
-            ORDER BY observed_at {order}, assertion_id {order} LIMIT :row_limit
+            ORDER BY observed_at, assertion_id LIMIT :row_limit
         """
         async with self.runtime.engine.connect() as connection:
             totals = (
@@ -771,12 +752,6 @@ class SQLWorldProjectionStore:
             total_value_bytes=int(totals["total_value_bytes"] or 0),
             next_after_observed_at=(_iso(last["observed_at"]) if last else ""),
             next_after_assertion_id=(str(last["assertion_id"]) if last else ""),
-            delivery_scope=scope,
-            result_order=(
-                WORLD_ASSERTION_ORDER_NEWEST_FIRST
-                if current_snapshot
-                else WORLD_ASSERTION_ORDER_OLDEST_FIRST
-            ),
         )
 
     @staticmethod

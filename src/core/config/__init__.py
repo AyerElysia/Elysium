@@ -11,7 +11,7 @@
 
     # 获取配置实例
     config = get_core_config()
-    print(config.database.database_type)
+    print(config.storage.backend)
 
     # 生产模型路由由 kernel 的 models.toml 注册表负责。
     # 本模块导出的 ModelConfig/init_model_config 仅用于显式旧配置迁移。

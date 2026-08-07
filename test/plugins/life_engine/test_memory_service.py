@@ -12,6 +12,7 @@ import pytest
 
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.memory import EdgeType, EmbeddingResult, LifeMemoryService
+from plugins.life_engine.memory.living import new_artifact_version
 from plugins.life_engine.memory.nodes import (
     compute_content_hash,
     generate_file_node_id,
@@ -241,7 +242,7 @@ async def test_service_run_index_worker_uses_chunk_collection_and_updates_nodes(
     resolver_calls: list[tuple[str, int]] = []
 
     async def fake_chunk_collection(path: str, model_name: str, dimension: int) -> Any:
-        assert path.endswith("/.memory/chroma")
+        assert Path(path).parts[-2:] == (".memory", "chroma")
         resolver_calls.append((model_name, dimension))
         return chunk_collection
 
@@ -317,7 +318,7 @@ async def test_service_restart_restores_persisted_chunk_collection_and_close_is_
     named_calls: list[str] = []
 
     async def fake_named_collection(path: str, name: str) -> Any:
-        assert path.endswith("/.memory/chroma")
+        assert Path(path).parts[-2:] == (".memory", "chroma")
         named_calls.append(name)
         return chunk_collection
 
@@ -377,6 +378,147 @@ async def test_startup_reconciliation_versions_external_changes_and_deletion(
     assert history[-1].artifact_kind == "workspace_memory_document_tombstone"
     assert history[-1].metadata["observation"] == "startup_observed_deletion"
     await third.close()
+
+
+async def test_startup_reconciliation_absorbs_equivalent_concurrent_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    note = tmp_path / "notes" / "concurrent.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("old", encoding="utf-8")
+    service = _make_service(tmp_path)
+    await service.initialize()
+    try:
+        living = service._require_memory_storage().living
+        original = living.append_artifact
+        raced = False
+
+        async def _race_once(*args: Any, **kwargs: Any) -> Any:
+            nonlocal raced
+            if not raced:
+                raced = True
+                head = await living.get_artifact_head("notes/concurrent.md")
+                assert head is not None
+                concurrent = new_artifact_version(
+                    logical_key="notes/concurrent.md",
+                    artifact_kind="workspace_memory_document",
+                    content="new",
+                    parent_artifact_ids=(head.artifact_id,),
+                    authored_by="concurrent_writer",
+                )
+                await original(
+                    concurrent,
+                    expected_head_revision=head.revision,
+                )
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(living, "append_artifact", _race_once)
+        appended = await service._reconcile_workspace_artifact_versions_via_ports(
+            {"notes/concurrent.md": ("new", note.stat().st_mtime)},
+            {"notes/concurrent.md"},
+        )
+        history = await living.list_artifact_history("notes/concurrent.md")
+
+        assert appended == 0
+        assert [item.content for item in history] == ["old", "new"]
+    finally:
+        await service.close()
+
+
+async def test_startup_reconciliation_reparents_after_concurrent_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    note = tmp_path / "notes" / "concurrent.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("old", encoding="utf-8")
+    service = _make_service(tmp_path)
+    await service.initialize()
+    try:
+        living = service._require_memory_storage().living
+        original = living.append_artifact
+        raced = False
+
+        async def _race_once(*args: Any, **kwargs: Any) -> Any:
+            nonlocal raced
+            if not raced:
+                raced = True
+                head = await living.get_artifact_head("notes/concurrent.md")
+                assert head is not None
+                concurrent = new_artifact_version(
+                    logical_key="notes/concurrent.md",
+                    artifact_kind="workspace_memory_document",
+                    content="concurrent",
+                    parent_artifact_ids=(head.artifact_id,),
+                    authored_by="concurrent_writer",
+                )
+                await original(
+                    concurrent,
+                    expected_head_revision=head.revision,
+                )
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(living, "append_artifact", _race_once)
+        appended = await service._reconcile_workspace_artifact_versions_via_ports(
+            {"notes/concurrent.md": ("observed", note.stat().st_mtime)},
+            {"notes/concurrent.md"},
+        )
+        history = await living.list_artifact_history("notes/concurrent.md")
+
+        assert appended == 1
+        assert [item.content for item in history] == ["old", "concurrent", "observed"]
+        assert history[-1].parent_artifact_ids == (history[-2].artifact_id,)
+    finally:
+        await service.close()
+
+
+async def test_startup_reconciliation_absorbs_concurrent_tombstone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    note = tmp_path / "notes" / "concurrent.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("old", encoding="utf-8")
+    service = _make_service(tmp_path)
+    await service.initialize()
+    note.unlink()
+    try:
+        living = service._require_memory_storage().living
+        original = living.append_artifact
+        raced = False
+
+        async def _race_once(*args: Any, **kwargs: Any) -> Any:
+            nonlocal raced
+            if not raced:
+                raced = True
+                head = await living.get_artifact_head("notes/concurrent.md")
+                assert head is not None
+                concurrent = new_artifact_version(
+                    logical_key="notes/concurrent.md",
+                    artifact_kind="workspace_memory_document_tombstone",
+                    content="",
+                    parent_artifact_ids=(head.artifact_id,),
+                    authored_by="concurrent_writer",
+                )
+                await original(
+                    concurrent,
+                    expected_head_revision=head.revision,
+                )
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(living, "append_artifact", _race_once)
+        appended = await service._reconcile_workspace_artifact_versions_via_ports(
+            {},
+            set(),
+        )
+        history = await living.list_artifact_history("notes/concurrent.md")
+
+        assert appended == 0
+        assert history[-1].artifact_kind == "workspace_memory_document_tombstone"
+        assert len(history) == 2
+    finally:
+        await service.close()
 
 
 async def test_service_rejects_invalid_active_marker_before_backend_lookup(
@@ -794,6 +936,45 @@ async def test_startup_recovery_marks_ghost_nodes_as_deleted(tmp_path: Path) -> 
     ).fetchone()
     assert row is not None, "ghost 节点应保留在表中"
     assert row["is_deleted"] == 1, "ghost 节点应被标记为已删除"
+
+
+async def test_startup_recovery_batches_ghost_node_projection_repairs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _make_service(tmp_path)
+    await service.initialize()
+    ghost_count = 130
+    service._db.executemany(
+        """
+        INSERT INTO memory_nodes
+        (node_id, node_type, file_path, content_hash, title, created_at, updated_at, is_deleted)
+        VALUES (?, 'file', ?, '', 'deleted', 1, 1, 0)
+        """,
+        [
+            (f"file:batch-{index:04d}", f"notes/deleted-{index:04d}.md")
+            for index in range(ghost_count)
+        ],
+    )
+    service._db.commit()
+
+    projection = service._require_memory_storage().document_index
+    original = projection.mark_documents_deleted
+    batch_sizes: list[int] = []
+
+    async def _record_batches(node_ids: Sequence[str]) -> int:
+        batch_sizes.append(len(node_ids))
+        return await original(node_ids)
+
+    monkeypatch.setattr(projection, "mark_documents_deleted", _record_batches)
+
+    await service._startup_recovery()
+
+    assert batch_sizes == [64, 64, 2]
+    deleted = service._db.execute(
+        "SELECT COUNT(*) FROM memory_nodes WHERE COALESCE(is_deleted, FALSE) = TRUE"
+    ).fetchone()[0]
+    assert deleted == ghost_count
 
 
 async def test_startup_recovery_deletes_orphan_edges(tmp_path: Path) -> None:

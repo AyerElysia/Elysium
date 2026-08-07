@@ -179,6 +179,7 @@ async def test_memory_integration_consumes_owner_runtime_without_opening_another
 
     class _Owner:
         _memory_service = None
+        _selectable_storage_enabled = True
 
         @property
         def storage_runtime(self) -> _InjectedRuntime:
@@ -189,7 +190,6 @@ async def test_memory_integration_consumes_owner_runtime_without_opening_another
             return SimpleNamespace(
                 settings=SimpleNamespace(workspace_path=str(tmp_path)),
                 memory_index=SimpleNamespace(backend_enabled=False),
-                storage=SimpleNamespace(enabled=True),
             )
 
     owner = _Owner()

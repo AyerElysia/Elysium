@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,6 +28,7 @@ from plugins.life_engine.service.perception_gateway import (
 from plugins.life_engine.tools.exec_tools import LifeEngineBashTool
 from plugins.life_engine.tools.file_tools import LifeEngineRunAgentTool, LifeEngineWakeDFCTool
 from src.core.components.base.chatter import BaseChatter, Failure, Success, Wait
+from src.core.config.core_config import CoreConfig
 from src.core.models.media import MediaAttachment
 from src.core.models.message import Message, MessageType
 from src.core.utils.llm_tool_call import ToolCallExecutionResult
@@ -46,6 +49,15 @@ _TEST_PNG_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
     "AAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 )
+
+
+def _service_plugin(config: LifeEngineConfig | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        config=config,
+        global_storage_config=CoreConfig(
+            storage=CoreConfig.StorageSection(backend="local")
+        ),
+    )
 
 
 async def _skip_snapshot_save(_response: object) -> None:
@@ -81,7 +93,10 @@ def _exact_pending_perception_receipt(
     )
 
 
-def test_life_chatter_system_prompt_includes_memory_and_chatter_tools_not_heartbeat_tool(tmp_path) -> None:
+@pytest.mark.asyncio
+async def test_life_chatter_system_prompt_includes_memory_and_chatter_tools_not_heartbeat_tool(
+    tmp_path,
+) -> None:
     """聊天态应共享 SOUL/USER/MEMORY/TOOLS，并保留核心工具说明。"""
     (tmp_path / "SOUL.md").write_text("SOUL_CONTENT", encoding="utf-8")
     (tmp_path / "USER.md").write_text("USER_CONTENT", encoding="utf-8")
@@ -111,7 +126,7 @@ def test_life_chatter_system_prompt_includes_memory_and_chatter_tools_not_heartb
     config.settings.workspace_path = str(tmp_path)
     chatter = LifeChatter.__new__(LifeChatter)
     chatter.plugin = SimpleNamespace(config=config)
-    prompt = chatter._build_chat_system_prompt(service=None)
+    prompt = await chatter._build_chat_system_prompt(service=None)
 
     assert "SOUL_CONTENT" in prompt
     assert "USER_CONTENT" in prompt
@@ -335,6 +350,58 @@ def test_life_chatter_snapshot_persists_only_media_descriptor() -> None:
     assert "value" not in media_part
 
 
+def test_life_chatter_snapshot_digest_survives_canonical_storage_round_trip() -> None:
+    chatter = LifeChatter.__new__(LifeChatter)
+    snapshot = LifeChatter._snapshot_data_for_payloads(
+        [LLMPayload(ROLE.USER, Text("保持内容不变"))]
+    )
+    canonical_round_trip = json.loads(
+        json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    )
+
+    restored = chatter._deserialize_rolling_context_snapshot(canonical_round_trip)
+
+    assert len(restored) == 1
+    assert restored[0].content[0].text == "保持内容不变"
+
+
+def test_life_chatter_v2_digest_requires_verified_outer_integrity_after_canonicalization() -> None:
+    chatter = LifeChatter.__new__(LifeChatter)
+    snapshot = LifeChatter._snapshot_data_for_payloads(
+        [LLMPayload(ROLE.USER, Text("旧版快照"))]
+    )
+    snapshot["version"] = 2
+    payload_json = json.dumps(
+        snapshot["payloads"],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    snapshot["payload_digest"] = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+    canonical_round_trip = json.loads(
+        json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    )
+
+    with pytest.raises(RuntimeError, match="RollingContextPayloadDigestMismatch"):
+        chatter._deserialize_rolling_context_snapshot(canonical_round_trip)
+
+    restored = chatter._deserialize_rolling_context_snapshot(
+        canonical_round_trip,
+        outer_integrity_verified=True,
+    )
+    assert restored[0].content[0].text == "旧版快照"
+
+
+def test_life_chatter_snapshot_digest_rejects_changed_content() -> None:
+    chatter = LifeChatter.__new__(LifeChatter)
+    snapshot = LifeChatter._snapshot_data_for_payloads(
+        [LLMPayload(ROLE.USER, Text("原始内容"))]
+    )
+    snapshot["payloads"][0]["content"][0]["text"] = "被篡改的内容"
+
+    with pytest.raises(RuntimeError, match="RollingContextPayloadDigestMismatch"):
+        chatter._deserialize_rolling_context_snapshot(snapshot)
+
+
 def test_life_chatter_snapshot_media_restores_as_text_only() -> None:
     descriptor_payload = {
         "role": "user",
@@ -446,7 +513,11 @@ async def test_life_chatter_global_runtime_is_reused(monkeypatch) -> None:
 
     monkeypatch.setattr(LifeChatter, "create_request", fake_create_request)
     monkeypatch.setattr(LifeChatter, "inject_usables", fake_inject_usables)
-    monkeypatch.setattr(LifeChatter, "_build_chat_system_prompt", lambda self, *a, **kw: "test soul")
+    async def fake_system_prompt(self, *args, **kwargs):
+        del self, args, kwargs
+        return "test soul"
+
+    monkeypatch.setattr(LifeChatter, "_build_chat_system_prompt", fake_system_prompt)
 
     first = LifeChatter.__new__(LifeChatter)
     first.plugin = SimpleNamespace(config=None)
@@ -2062,6 +2133,133 @@ async def test_life_chatter_must_reply_fallback_at_max_rounds(monkeypatch) -> No
     LifeChatter.reset_global_runtime()
 
 
+@pytest.mark.asyncio
+async def test_life_chatter_selected_rolling_context_never_reads_or_writes_local(
+    tmp_path: Path,
+) -> None:
+    class _RuntimeStore:
+        def __init__(self) -> None:
+            self.record = None
+            self.writes: list[dict[str, object]] = []
+
+        async def get_state(self, namespace: str, state_key: str):
+            assert namespace == "life_chatter.rolling_context"
+            assert state_key == "chat_global"
+            return self.record
+
+        async def put_state(self, **kwargs):
+            self.writes.append(dict(kwargs))
+            self.record = SimpleNamespace(
+                revision=int(kwargs["expected_revision"]) + 1,
+                payload=dict(kwargs["payload"]),
+            )
+            return self.record
+
+    store = _RuntimeStore()
+    service = SimpleNamespace(runtime_state_store=lambda: store)
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(tmp_path)
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=config, _service=service)
+    chatter._rolling_context_state_revision = 0
+
+    local_path = chatter._rolling_context_snapshot_path()
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    local_path.write_text('{"version": 2, "payloads": "must-not-read"}', encoding="utf-8")
+
+    assert await chatter._load_rolling_context_snapshot(service) == []
+    response = SimpleNamespace(
+        payloads=[LLMPayload(ROLE.USER, [Text("remote payload")])]
+    )
+    await chatter._save_rolling_context_snapshot(response)
+
+    assert len(store.writes) == 1
+    assert store.writes[0]["namespace"] == "life_chatter.rolling_context"
+    assert store.writes[0]["state_key"] == "chat_global"
+    assert chatter._rolling_context_state_revision == 1
+    assert local_path.read_text(encoding="utf-8").endswith('"must-not-read"}')
+
+    restored = await chatter._load_rolling_context_snapshot(service)
+    assert len(restored) == 1
+    assert restored[0].role == ROLE.USER
+    assert isinstance(restored[0].content[0], Text)
+    assert restored[0].content[0].text == "remote payload"
+
+
+@pytest.mark.asyncio
+async def test_life_chatter_selected_rolling_context_migrates_canonicalized_v2(
+    tmp_path: Path,
+) -> None:
+    v3_snapshot = LifeChatter._snapshot_data_for_payloads(
+        [LLMPayload(ROLE.USER, Text("selected v2 payload"))]
+    )
+    v3_snapshot["version"] = 2
+    payload_json = json.dumps(
+        v3_snapshot["payloads"],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    v3_snapshot["payload_digest"] = hashlib.sha256(
+        payload_json.encode("utf-8")
+    ).hexdigest()
+    canonical_v2 = json.loads(
+        json.dumps(v3_snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    )
+
+    class _RuntimeStore:
+        def __init__(self) -> None:
+            self.record = SimpleNamespace(revision=7, payload=canonical_v2)
+            self.write = None
+
+        async def get_state(self, namespace: str, state_key: str):
+            assert (namespace, state_key) == (
+                "life_chatter.rolling_context",
+                "chat_global",
+            )
+            return self.record
+
+        async def put_state(self, **kwargs):
+            self.write = dict(kwargs)
+            return SimpleNamespace(revision=8, payload=dict(kwargs["payload"]))
+
+    store = _RuntimeStore()
+    service = SimpleNamespace(runtime_state_store=lambda: store)
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(tmp_path)
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=config, _service=service)
+    chatter._rolling_context_state_revision = 0
+
+    restored = await chatter._load_rolling_context_snapshot(service)
+    assert restored[0].content[0].text == "selected v2 payload"
+    assert chatter._rolling_context_state_revision == 7
+
+    await chatter._save_rolling_context_snapshot(SimpleNamespace(payloads=restored))
+    assert store.write is not None
+    assert store.write["expected_revision"] == 7
+    assert store.write["schema_version"] == 3
+    assert store.write["payload"]["version"] == 3
+
+
+@pytest.mark.asyncio
+async def test_life_chatter_selected_rolling_context_propagates_store_failure(
+    tmp_path: Path,
+) -> None:
+    class _FailingStore:
+        async def get_state(self, namespace: str, state_key: str):
+            del namespace, state_key
+            raise RuntimeError("remote runtime unavailable")
+
+    service = SimpleNamespace(runtime_state_store=lambda: _FailingStore())
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(tmp_path)
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=config, _service=service)
+
+    with pytest.raises(RuntimeError, match="remote runtime unavailable"):
+        await chatter._load_rolling_context_snapshot(service)
+
+
 def test_life_chatter_wait_transition_releases_native_media_and_owner() -> None:
     image = Image(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
@@ -2095,7 +2293,8 @@ def test_life_chatter_wait_transition_releases_native_media_and_owner() -> None:
     assert "message-1" in response.payloads[0].content[1].text
 
 
-def test_life_chatter_live_system_prompt_adds_broadcast_guidance(tmp_path) -> None:
+@pytest.mark.asyncio
+async def test_life_chatter_live_system_prompt_adds_broadcast_guidance(tmp_path) -> None:
     (tmp_path / "SOUL.md").write_text("SOUL_CONTENT", encoding="utf-8")
     (tmp_path / "USER.md").write_text("USER_CONTENT", encoding="utf-8")
     (tmp_path / "MEMORY.md").write_text("", encoding="utf-8")
@@ -2105,7 +2304,7 @@ def test_life_chatter_live_system_prompt_adds_broadcast_guidance(tmp_path) -> No
     chatter = LifeChatter.__new__(LifeChatter)
     chatter.plugin = SimpleNamespace(config=config)
 
-    prompt = chatter._build_chat_system_prompt(
+    prompt = await chatter._build_chat_system_prompt(
         service=None,
         chat_stream=SimpleNamespace(platform="live"),
     )
@@ -2137,7 +2336,11 @@ def test_life_chatter_live_user_prompt_mentions_broadcast_context() -> None:
 
 async def test_live_bridge_prompt_exposes_three_layer_aliases(monkeypatch) -> None:
     # SOUL.md 加载不是本测试目标（CI 无 config/workspace），mock 系统提示词构建
-    monkeypatch.setattr(LifeChatter, "_build_chat_system_prompt", lambda self, *a, **kw: "test soul prompt")
+    async def fake_system_prompt(self, *args, **kwargs):
+        del self, args, kwargs
+        return "test soul prompt"
+
+    monkeypatch.setattr(LifeChatter, "_build_chat_system_prompt", fake_system_prompt)
     chatter = LifeChatter.__new__(LifeChatter)
     chatter.plugin = SimpleNamespace(config=LifeEngineConfig())
     chat_stream = SimpleNamespace(
@@ -2264,7 +2467,7 @@ async def test_life_chatter_dynamic_context_is_separate_snapshot() -> None:
     """动态上下文应能单独构建，用于本次请求 transient 注入。"""
     chatter = LifeChatter.__new__(LifeChatter)
     chat_stream = SimpleNamespace(stream_id="stream-1")
-    service = LifeEngineService(SimpleNamespace(config=None))
+    service = LifeEngineService(_service_plugin())
     service._thought_manager = SimpleNamespace(
         format_for_prompt=lambda **kwargs: "THOUGHT_STREAM_NOW",
         current_revision=1,
@@ -2770,7 +2973,7 @@ async def test_life_chatter_outer_cancellation_closes_tool_call_tail(
 async def test_life_chatter_runtime_context_cursor_avoids_repeat_injection(tmp_path) -> None:
     config = LifeEngineConfig()
     config.settings.workspace_path = str(tmp_path)
-    service = LifeEngineService(SimpleNamespace(config=config))
+    service = LifeEngineService(_service_plugin(config))
     service._event_history = [
         LifeEngineEvent(
             event_id="evt-1",
@@ -2837,7 +3040,7 @@ async def test_life_chatter_runtime_context_cursor_avoids_repeat_injection(tmp_p
 async def test_life_chatter_unified_runtime_context_uses_global_cursor(tmp_path) -> None:
     config = LifeEngineConfig()
     config.settings.workspace_path = str(tmp_path)
-    service = LifeEngineService(SimpleNamespace(config=config))
+    service = LifeEngineService(_service_plugin(config))
     service._event_history = [
         LifeEngineEvent(
             event_id="evt-a",
@@ -2896,7 +3099,7 @@ async def test_life_chatter_unified_runtime_context_uses_global_cursor(tmp_path)
 
 
 async def test_life_chatter_unified_runtime_context_summarizes_event_flood() -> None:
-    service = LifeEngineService(SimpleNamespace(config=None))
+    service = LifeEngineService(_service_plugin())
     service._event_history = [
         LifeEngineEvent(
             event_id=f"evt-{index}",
@@ -3034,7 +3237,7 @@ def test_heartbeat_prompt_bounds_tell_dfc_to_context_gap(tmp_path) -> None:
     """心跳 prompt 应把 nucleus_tell_dfc 限定为补信息差，而不是指导表达层。"""
     config = LifeEngineConfig()
     config.settings.workspace_path = str(tmp_path)
-    service = LifeEngineService(SimpleNamespace(config=config))
+    service = LifeEngineService(_service_plugin(config))
 
     prompt = "\n".join(service._build_prompt_header())
 

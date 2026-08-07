@@ -21,6 +21,16 @@ def test_production_bootstrap_does_not_load_legacy_model_registry() -> None:
     assert 'init_models_config("config/models.toml")' in source
 
 
+def test_production_database_uses_only_global_storage_backend() -> None:
+    """Core database selection must derive from the one global storage mode."""
+
+    source = inspect.getsource(Bot._initialize_kernel)
+
+    assert "self.config.storage.backend" in source
+    assert "db_cfg.database_type" not in source
+    assert '"mysql" if use_mysql else "sqlite"' in source
+
+
 def test_dns_warmup_uses_only_active_snapshot_providers() -> None:
     providers = {
         "active-http": {"base_url": "http://127.0.0.1:3000/v1"},

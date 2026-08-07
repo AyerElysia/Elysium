@@ -165,11 +165,22 @@ class SubjectAuthorityPort(Protocol):
     async def current_subject_revision(self) -> str:
         """Return the exact unified SOUL+USER+MEMORY source digest."""
 
+    async def read_subject_authority(self) -> SubjectAuthoritySnapshot:
+        """Read all three authority head/version pairs in one consistent snapshot."""
+
     async def accept_candidate(
         self,
         command: AcceptSubjectCandidate,
     ) -> SubjectAuthorityCommit:
         """Validate will evidence and atomically CAS one subject document."""
+
+
+@dataclass(frozen=True, slots=True)
+class SubjectAuthoritySnapshot:
+    """One coherent single-transaction read of all three subject authorities."""
+
+    commits: dict[SubjectDocumentPath, SubjectDocumentCommit]
+    revision: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,6 +288,7 @@ __all__ = [
     "SubjectAuthorityConflict",
     "SubjectAuthorityEvidenceError",
     "SubjectAuthorityPort",
+    "SubjectAuthoritySnapshot",
     "SubjectDocumentCommit",
     "SubjectDocumentConflict",
     "SubjectDocumentHead",

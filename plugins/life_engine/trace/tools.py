@@ -14,8 +14,12 @@ from .store import LifeTraceRecord, LifeTraceStore
 _TRACE_CHATTER_ALLOW = ["life_engine_internal", "life_chatter", "default_chatter"]
 
 
-def _store(plugin: Any) -> LifeTraceStore:
-    return LifeTraceStore(_get_workspace(plugin))
+def _store(plugin: Any) -> Any:
+    service = getattr(plugin, "service", None)
+    get_store = getattr(service, "life_trace_store", None)
+    if not callable(get_store):
+        raise RuntimeError("LifeTraceServiceUnavailable")
+    return get_store()
 
 
 def _get_workspace(plugin: Any) -> Path:
@@ -69,7 +73,7 @@ class LifeTraceRecentChangesTool(BaseTool):
         kind: Annotated[str, "可选：只看某类留痕（file_change/intent/thought_stream/curiosity）"] = "",
     ) -> tuple[bool, str | dict]:
         try:
-            records = _store(self.plugin).recent(
+            records = await _store(self.plugin).recent(
                 limit=max(1, min(int(limit or 10), 50)),
                 path=path,
                 kind=kind,
@@ -96,7 +100,7 @@ class LifeTraceOriginTool(BaseTool):
 
     async def execute(self) -> tuple[bool, str | dict]:
         try:
-            overview = _store(self.plugin).origin()
+            overview = await _store(self.plugin).origin()
         except Exception as exc:  # noqa: BLE001
             return False, f"读取长河源头失败: {exc}"
         if not overview.get("total"):
@@ -124,7 +128,7 @@ class LifeTraceFileHistoryTool(BaseTool):
         limit: Annotated[int, "最多返回多少条，默认 20"] = 20,
     ) -> tuple[bool, str | dict]:
         try:
-            records = _store(self.plugin).history(
+            records = await _store(self.plugin).history(
                 path,
                 limit=max(1, min(int(limit or 20), 100)),
             )
@@ -154,7 +158,7 @@ class LifeTraceShowDiffTool(BaseTool):
         max_chars: Annotated[int, "diff 最大返回字符数，默认 8000"] = 8000,
     ) -> tuple[bool, str | dict]:
         store = _store(self.plugin)
-        record, diff_text = store.read_diff(trace_id)
+        record, diff_text = await store.read_diff(trace_id)
         if record is None:
             return False, f"找不到追溯记录: {trace_id}"
         max_len = max(500, min(int(max_chars or 8000), 30000))
@@ -186,14 +190,14 @@ class LifeTracePreviewVersionTool(BaseTool):
         max_chars: Annotated[int, "内容最大返回字符数，默认 12000"] = 12000,
     ) -> tuple[bool, str | dict]:
         store = _store(self.plugin)
-        record = store.get(trace_id)
+        record = await store.get(trace_id)
         if record is None:
             return False, f"找不到追溯记录: {trace_id}"
         normalized_side = str(side or "before").strip().lower()
         if normalized_side not in {"before", "after"}:
             return False, "side 仅支持 before/after"
         digest = record.before_hash if normalized_side == "before" else record.after_hash
-        content = store.read_blob(digest)
+        content = await store.read_blob(digest)
         if content is None:
             return False, f"该记录没有 {normalized_side} 版本内容"
         max_len = max(500, min(int(max_chars or 12000), 50000))

@@ -143,6 +143,21 @@ class StorageBackendRuntime:
         self.authority_token = renewed
         return renewed
 
+    async def revoke_authority(self) -> int | None:
+        """Revoke this runtime's exact writer token during graceful shutdown."""
+
+        if self.authority_registry is None or self.authority_token is None:
+            return None
+        token = self.authority_token
+        next_epoch = await self.authority_registry.revoke(token)
+        self.authority_token = None
+        return next_epoch
+
+    def invalidate_writer(self) -> None:
+        """Fail closed locally after lease renewal can no longer be proven."""
+
+        self.authority_token = None
+
     async def health(self) -> dict[str, Any]:
         """Return secret-free backend, generation and authority diagnostics."""
 

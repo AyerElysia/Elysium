@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 from uuid import uuid4
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -845,48 +845,29 @@ class MySQLDocumentIndexProjection(_MySQLPort):
             return 0
 
         async def _operation(session: AsyncSession) -> int:
-            changed = 0
             now = time.time()
-            for node_id in identifiers:
-                chunks = (
-                    (
-                        await session.execute(
-                            text(
-                                "SELECT chunk_id FROM memory_chunks "
-                                "WHERE node_id = :node_id"
-                            ),
-                            {"node_id": node_id},
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
-                result = await session.execute(
-                    text(
-                        "UPDATE memory_nodes SET is_deleted = TRUE, "
-                        "embedding_synced = FALSE, updated_at = :now "
-                        "WHERE node_id = :node_id "
-                        "AND COALESCE(is_deleted, FALSE) = FALSE"
-                    ),
-                    {"node_id": node_id, "now": now},
-                )
-                if result.rowcount != 1:
-                    continue
-                changed += 1
-                for chunk_id in chunks:
-                    await session.execute(
-                        text(
-                            "INSERT INTO memory_vector_tombstones "
-                            "(node_id, chunk_id, collection_name, created_at) "
-                            "VALUES (:node_id, :chunk_id, '', :created_at)"
-                        ),
-                        {
-                            "node_id": node_id,
-                            "chunk_id": str(chunk_id),
-                            "created_at": now,
-                        },
-                    )
-            return changed
+            expanding_ids = bindparam("node_ids", expanding=True)
+            await session.execute(
+                text(
+                    "INSERT INTO memory_vector_tombstones "
+                    "(node_id, chunk_id, collection_name, created_at) "
+                    "SELECT c.node_id, c.chunk_id, '', :created_at "
+                    "FROM memory_chunks c JOIN memory_nodes n ON n.node_id = c.node_id "
+                    "WHERE c.node_id IN :node_ids "
+                    "AND COALESCE(n.is_deleted, FALSE) = FALSE"
+                ).bindparams(expanding_ids),
+                {"node_ids": identifiers, "created_at": now},
+            )
+            result = await session.execute(
+                text(
+                    "UPDATE memory_nodes SET is_deleted = TRUE, "
+                    "embedding_synced = FALSE, updated_at = :now "
+                    "WHERE node_id IN :node_ids "
+                    "AND COALESCE(is_deleted, FALSE) = FALSE"
+                ).bindparams(expanding_ids),
+                {"node_ids": identifiers, "now": now},
+            )
+            return max(0, int(result.rowcount))
 
         return await self._write(_operation)
 

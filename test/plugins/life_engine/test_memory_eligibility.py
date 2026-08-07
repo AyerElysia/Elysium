@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,6 +16,7 @@ from plugins.life_engine.memory.eligibility import (
     assess_document_path,
     assess_indexed_document_path,
     assess_workspace_document,
+    read_workspace_document,
     register_indexed_path_sql_function,
     scan_workspace_documents,
 )
@@ -77,6 +79,21 @@ def test_workspace_scan_does_not_recurse_rejected_runtime_or_hidden_trees(
         "root_not_whitelisted": 1,
     }
     assert {item.path for item in scan.rejected} == {".life_trace", "large.md", "runtime"}
+
+
+def test_workspace_document_read_uses_checked_file_on_current_platform(
+    tmp_path: Path,
+) -> None:
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    document = notes / "entry.md"
+    document.write_text("current body", encoding="utf-8")
+
+    content, source_mtime, size = read_workspace_document(tmp_path, "notes/entry.md")
+
+    assert content == "current body"
+    assert source_mtime == document.stat().st_mtime
+    assert size == len("current body")
 
 
 def test_workspace_eligibility_rejects_symlink_and_oversized_file(tmp_path: Path) -> None:
@@ -187,6 +204,7 @@ def test_stored_document_paths_must_already_be_canonical(path: str, reason: str)
     assert decision.reason == reason
 
 
+@pytest.mark.skipif(os.name == "nt", reason="literal backslash filename is POSIX-only")
 async def test_file_tool_syncs_only_canonical_safe_workspace_document(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -228,6 +246,15 @@ async def test_file_tool_syncs_only_canonical_safe_workspace_document(
     assert args.args[:2] == ("notes/entry.md", "authoritative content")
     assert args.kwargs["title"] == "entry"
     assert isinstance(args.kwargs["source_mtime"], float)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path normalization contract")
+def test_windows_backslash_path_is_rejected_as_noncanonical() -> None:
+    decision = assess_indexed_document_path("notes\\entry.md")
+
+    assert decision.eligible is False
+    assert decision.path == "notes/entry.md"
+    assert decision.reason == "noncanonical_path"
 
 
 async def test_fetch_memory_rejects_noncanonical_paths_without_creating_workspace(

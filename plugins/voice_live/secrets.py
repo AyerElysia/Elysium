@@ -51,7 +51,7 @@ def resolve_secret(
         raise SecretConfigurationError(
             f"{label} secret file must be owned by the current user"
         )
-    if metadata.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+    if os.name != "nt" and metadata.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
         raise SecretConfigurationError(
             f"{label} secret file permissions must be owner-only"
         )

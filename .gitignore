@@ -21,6 +21,7 @@ pip-delete-this-directory.txt
 .pytest_cache/
 coverage/
 .coverage
+.coverage.*
 htmlcov/
 
 # Virtual environments
@@ -83,6 +84,7 @@ reports/
 *.exe
 *.dll
 *.so
+/integrations/minecraft_bridge/bin/
 
 # Ignore temporary files
 *.tmp
