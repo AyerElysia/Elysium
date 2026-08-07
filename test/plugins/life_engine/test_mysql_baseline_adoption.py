@@ -6,9 +6,11 @@ from decimal import Decimal
 import pytest
 
 from plugins.life_engine.storage.models import BackendKind, GenerationStatus
+from scripts import adopt_life_mysql_baseline as baseline
 from scripts.adopt_life_mysql_baseline import (
     ATTENTION_TABLES,
     DOMAIN_TABLES,
+    LEARNING_TABLES,
     RUNTIME_STATE_TABLES,
     TableEvidence,
     _domain_root,
@@ -38,6 +40,7 @@ def test_remote_baseline_table_contract_is_explicit_and_unique() -> None:
         "runtime_singleton_writer_events",
         "runtime_singleton_writer_bindings",
     )
+    assert LEARNING_TABLES == DOMAIN_TABLES["life_learning"]
     assert ATTENTION_TABLES == (
         "attention_thread_events",
         "attention_thread_heads",
@@ -48,6 +51,69 @@ def test_remote_baseline_table_contract_is_explicit_and_unique() -> None:
     assert not set(RUNTIME_STATE_TABLES).intersection(tables)
     assert not set(ATTENTION_TABLES).intersection(tables)
     assert not set(ATTENTION_TABLES).intersection(RUNTIME_STATE_TABLES)
+
+
+@pytest.mark.asyncio
+async def test_learning_upgrade_orders_claim_and_learning_migrations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+
+    class _Runner:
+        def __init__(self, _engine: object, *, table_name: str, lock_name: str):
+            calls.append(("runner", table_name, lock_name))
+
+        async def apply(self, migrations: tuple[object, ...]) -> None:
+            calls.append(
+                (
+                    "apply",
+                    tuple(
+                        (migration.version, migration.name)  # type: ignore[attr-defined]
+                        for migration in migrations
+                    ),
+                )
+            )
+
+    async def _verify(_engine: object, contracts: tuple[object, ...]) -> None:
+        calls.append(
+            (
+                "verify",
+                tuple(contract.name for contract in contracts),  # type: ignore[attr-defined]
+            )
+        )
+
+    monkeypatch.setattr(baseline, "MySQLMigrationRunner", _Runner)
+    monkeypatch.setattr(baseline, "verify_mysql_trigger_contract", _verify)
+
+    await baseline._install_learning_schema(object())  # type: ignore[arg-type]
+
+    assert calls[0] == (
+        "runner",
+        "life_singleton_writer_schema_migrations",
+        "elysium:life-singleton-writer-schema",
+    )
+    assert calls[1] == ("apply", ((1, "life_singleton_writer_claim_v1"),))
+    assert calls[3] == (
+        "runner",
+        "life_learning_schema_migrations",
+        "elysium:life-learning-schema",
+    )
+    assert calls[4] == (
+        "apply",
+        (
+            (1, "life_learning_storage_v1"),
+            (2, "life_learning_singleton_claim_guard_v2"),
+        ),
+    )
+    assert calls[5][0] == "verify"
+    assert set(calls[5][1]) == {
+        "learning_events_immutable_update_v1",
+        "learning_events_immutable_delete_v1",
+        "learning_events_singleton_claim_insert_v2",
+        "learning_projections_singleton_claim_insert_v2",
+        "learning_projections_singleton_claim_update_v2",
+        "learning_projections_singleton_claim_delete_v2",
+    }
 
 
 def test_evidence_value_encoding_preserves_type_and_exact_bytes() -> None:

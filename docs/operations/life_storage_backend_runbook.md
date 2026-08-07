@@ -160,6 +160,19 @@ uv run python scripts/adopt_life_mysql_baseline.py \
 5. 需要切换 owner 时，等待数据库时间确认旧 lease 过期后执行 takeover，或在已确认的旧 owner 正常关闭路径释放；新 epoch 生效后旧 token 永久失效；
 6. Elysium 仍由用户手工停止/启动。代码和 schema 就绪后，用户只启动预期实例；随后验证 claim owner 与本机实例一致、`runtime_context` 从最新 revision 加载、revision 不再由未知 owner 漂移，再做真实消息闭环。
 
+### 6.3.2 Learning singleton guard 升级
+
+Learning selected persistence 使用固定 claim scope `life_engine.learning/selected_persistence`。业务启动只核验 schema，不创建 trigger；新部署或 v1 升级必须先在 Elysium 停止/不重启窗口运行：
+
+```bash
+uv run python scripts/adopt_life_mysql_baseline.py \
+  upgrade-learning --config config/core.toml
+```
+
+该命令只幂等核验/安装 generic claim schema、`life_learning_schema_migrations` v1/v2、既有两条 Learning event 不可变 trigger 与四条 singleton guard（event INSERT，projection INSERT/UPDATE/DELETE），随后输出 Learning 表的 content-free 行数/root hash。它不取得 Learning claim、不写 `learning_events`/`learning_projections`、不修改 runtime state、generation/epoch 或 claim 业务行，也不启动/停止进程。配置中的 MySQL 密码仍须使用环境变量引用；命令不会接受或打印明文密码。
+
+升级后必须只读验证 migration checksum、四条 trigger body 与 transaction binding 为空。缺失或漂移时业务启动 fail closed；不得通过关闭 trigger 校验、删除 claim 或回退旧 adapter 绕过。
+
 ### 6.4 单 runtime 启动、性能与关闭顺序
 
 每个进程内部的固定顺序仍是：service 打开并拥有一个 runtime → 注入 Memory → 从同一 runtime 构造 Life Event/Presence/World/Subject/Learning → 启动上层消费者。Learning 只消费注入的 `LearningStorePort` 与同一 `SubjectDocumentStorePort`，不得另开 store。这里的“单 runtime”表示**每个进程只有一个 runtime owner**，不是整个 MySQL generation 只能启动一个进程。

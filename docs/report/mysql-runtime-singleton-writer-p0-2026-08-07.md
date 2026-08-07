@@ -115,3 +115,49 @@ final_revision=2
 6. 不再出现未定位的 `chat_streams` 长事务锁等待。
 
 完成这六项之前，结论应表述为“代码、schema 与隔离实库合同已完成；现役进程激活验收待用户手工重启”，不能表述为生产闭环已经完成。
+
+## 8. Learning singleton guard v2 正式生产门
+
+`126cfd9` 将 Learning selected persistence 接入 `life_engine.learning/selected_persistence` claim，并在业务启动时要求数据库四条 guard 完整。平台侧于 2026-08-07 完成正式库技术 schema 安装；Elysium 全程未重启。
+
+### 8.1 安装前证据与备份
+
+安装前正式库只有 `life_learning_storage_v1`，以及 event UPDATE/DELETE 两条不可变 trigger；四条 singleton guard 不存在。只读估算当时为 642 条 Learning event、3 条 projection，随后旧 writer 继续运行，迁移事务开始前精确计数已到 891/3。
+
+可恢复备份：
+
+- 路径：`/root/Elysia/Elysium/data/life_storage/backups/learning-singleton-v2-pre-20260807T225855.sql`
+- 权限：`0600`
+- 大小：118,918,181 bytes
+- SHA-256：`d0320754238feaa567e0eab5edad0b964a7ab7ca5e009edfe95e51c79ea05fc7`
+- 范围：Learning event/projection、Learning migration、generic claim current/event/binding 与 claim migration；包含 trigger 定义，不包含其他业务域。
+
+### 8.2 正式库安装与只读核验
+
+安装通过 `ensure_learning_schema(... require_database_immutability=True)` 执行，并再次调用启动同款 `verify_learning_writer_claim_guard()`：
+
+- v1 checksum：`c497c9ab184b753afb8e33ebd48f0183fdfd292605aca65f04cf3ec8433aa461`
+- v2 checksum：`83c699bc34f0795615b3cb050dc4e1a8660034f5c43a53b73827a3142062222c`
+- 四条 guard：4/4 存在，4/4 trigger body 含 `LearningSingletonWriterClaimRequired`
+- Learning event：891 → 891
+- Learning projection：3 → 3
+- Learning claim row：0
+- transaction binding：0
+
+因此迁移只改变 migration/trigger 技术 schema，没有改写 Learning、runtime state 或 claim 业务行。claim row 保持 0 是刻意的：现役旧进程不会热获得 claim；首次 claim 必须发生在用户手工确认单实例并重启的新代码启动路径。
+
+### 8.3 隔离 MySQL 真实合同
+
+机器既有本地 MySQL 上创建了唯一临时数据库和临时账号，未安装新服务。首次运行准确暴露本地测试实例 `log_bin_trust_function_creators=0` 的 trigger 权限门；随后只在测试窗口临时设为 1，并在 `finally` 恢复为 0。最终结果：
+
+- `test_learning_storage_mysql_integration.py`：1 passed
+- claimed event/projection commit 成功
+- unclaimed old adapter 被 `LearningSingletonWriterClaimRequired` 拒绝
+- raw projection UPDATE/DELETE 被数据库 trigger 拒绝
+- release 后 stale claim 被拒绝
+- 测试数据库、账号均已删除；本地 trust gate 已恢复为 0，残留数据库/账号均为 0
+- 平台运维入口与文档补齐后的最终全仓：3899 passed、20 skipped、3 warnings
+
+### 8.4 当前生产门结论
+
+**已经达到用户手工单实例重启门。** 重启前仍须确认只保留预期 Elysium 实例；禁止 reload、自动拉起或用陈旧状态覆盖。用户手工重启后，还需只读核验 runtime 与 Learning 两个 claim owner、最新 revision 加载、旧 writer trigger 拒绝和真实消息/学习闭环，才能宣称生产闭环完成。

@@ -43,6 +43,10 @@ from plugins.life_engine.storage.learning_schema import (
 from plugins.life_engine.storage.learning_schema import (
     _MYSQL_SCHEMA_MIGRATION as _LEARNING_MIGRATION,
 )
+from plugins.life_engine.storage.learning_schema import (
+    MYSQL_LEARNING_CLAIM_GUARD_MIGRATION,
+    MYSQL_LEARNING_CLAIM_GUARD_TRIGGERS,
+)
 from plugins.life_engine.storage.memory.schema import (
     MEMORY_IMMUTABILITY_MIGRATIONS,
     MEMORY_IMMUTABILITY_TRIGGER_CONTRACT,
@@ -62,13 +66,13 @@ from plugins.life_engine.storage.runtime_schema import (
     MYSQL_RUNTIME_STATE_CLAIM_GUARD_TRIGGERS,
     MYSQL_RUNTIME_STATE_MIGRATION,
 )
-from plugins.life_engine.storage.writer_claims import (
-    MYSQL_SINGLETON_WRITER_EVENT_TRIGGERS,
-    MYSQL_SINGLETON_WRITER_MIGRATION,
-)
 from plugins.life_engine.storage.subject_schema import (
     _MYSQL_SUBJECT_IMMUTABILITY,
     _MYSQL_SUBJECT_IMMUTABILITY_TRIGGERS,
+)
+from plugins.life_engine.storage.writer_claims import (
+    MYSQL_SINGLETON_WRITER_EVENT_TRIGGERS,
+    MYSQL_SINGLETON_WRITER_MIGRATION,
 )
 from src.kernel.storage import (
     MySQLMigrationRunner,
@@ -110,6 +114,7 @@ RUNTIME_STATE_TABLES = (
     "runtime_singleton_writer_events",
     "runtime_singleton_writer_bindings",
 )
+LEARNING_TABLES = ("learning_events", "learning_projections")
 ATTENTION_TABLES = (
     "attention_thread_events",
     "attention_thread_heads",
@@ -145,7 +150,13 @@ def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "mode",
-        choices=("audit", "activate", "upgrade-runtime-state", "upgrade-attention"),
+        choices=(
+            "audit",
+            "activate",
+            "upgrade-runtime-state",
+            "upgrade-learning",
+            "upgrade-attention",
+        ),
     )
     parser.add_argument("--config", type=Path, default=_ROOT / "config" / "core.toml")
     parser.add_argument("--generation-id")
@@ -542,6 +553,51 @@ async def _install_runtime_state_schema(engine: AsyncEngine) -> None:
     )
 
 
+async def _audit_learning_tables(engine: AsyncEngine) -> dict[str, Any]:
+    """Return content-free evidence for the additive Learning schema."""
+
+    async with engine.connect() as connection:
+        tables = [
+            await _audit_table(connection, table_name) for table_name in LEARNING_TABLES
+        ]
+        await connection.rollback()
+    return {
+        "root_sha256": _domain_root(tables),
+        "row_count": sum(item.row_count for item in tables),
+        "tables": [item.to_dict() for item in tables],
+    }
+
+
+async def _install_learning_schema(engine: AsyncEngine) -> None:
+    """Apply only Learning technical guards without changing authority/data."""
+
+    claim_runner = MySQLMigrationRunner(
+        engine,
+        table_name="life_singleton_writer_schema_migrations",
+        lock_name="elysium:life-singleton-writer-schema",
+    )
+    await claim_runner.apply((MYSQL_SINGLETON_WRITER_MIGRATION,))
+    await verify_mysql_trigger_contract(
+        engine,
+        MYSQL_SINGLETON_WRITER_EVENT_TRIGGERS,
+    )
+    runner = MySQLMigrationRunner(
+        engine,
+        table_name="life_learning_schema_migrations",
+        lock_name="elysium:life-learning-schema",
+    )
+    await runner.apply(
+        (
+            _LEARNING_MIGRATION,
+            MYSQL_LEARNING_CLAIM_GUARD_MIGRATION,
+        )
+    )
+    await verify_mysql_trigger_contract(
+        engine,
+        _LEARNING_TRIGGERS + MYSQL_LEARNING_CLAIM_GUARD_TRIGGERS,
+    )
+
+
 async def _audit_attention_tables(engine: AsyncEngine) -> dict[str, Any]:
     """Return content-free evidence for the additive AttentionThread schema."""
 
@@ -764,6 +820,13 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 "status": "attention_schema_upgraded",
                 "backend_identity": config.safe_identity,
                 "attention": await _audit_attention_tables(engine),
+            }
+        if args.mode == "upgrade-learning":
+            await _install_learning_schema(engine)
+            return {
+                "status": "learning_schema_upgraded",
+                "backend_identity": config.safe_identity,
+                "learning": await _audit_learning_tables(engine),
             }
         if args.mode == "audit":
             evidence = await audit_remote_baseline(engine)
