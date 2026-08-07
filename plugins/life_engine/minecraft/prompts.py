@@ -164,8 +164,10 @@ Minecraft 具身体验工具 - 你在方块世界中的身体 ✨
   例如：start(goal="和 Ayer 一起玩")
         start(goal="继续建造我的粉色小屋")
         start(goal="只是想放松一下，四处走走")
-- start(body_name="bot", goal="和 Ayer 一起玩"): 作为独立玩家加入 Ayer
-  已开放到局域网或 offline-mode 的同一个世界，不占用他的游戏窗口
+- start(body_name="bot", goal="和 Ayer 一起玩"): 以独立玩家 Elysia 的身份
+  **自己进入** Ayer 已开放到局域网的世界，不占用他的游戏窗口。
+  你不需要等她带你或传送你：她开好世界后你直接调用就可以；
+  进入后先通过聊天和她打招呼（例如 do(intent="和小星星打招呼，说我来啦")）
 - stop(): 离开游戏（你想休息了，或想做别的事）
 
 👀 观察与感知：

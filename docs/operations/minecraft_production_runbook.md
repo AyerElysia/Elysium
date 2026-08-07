@@ -85,19 +85,19 @@ bot 身体用于和人一起玩同一个世界：人类用自己的客户端进�
 2. 在 `config/plugins/life_engine/config.toml` 的 `[minecraft]` 段配置目标世界：
 
    ```toml
-   bot_server_host = "127.0.0.1"
+   bot_server_host = "auto"
    bot_server_port = 25565
-   bot_username = "AyerElysia"
+   bot_username = "Elysia"
    ```
 
-   监听地址、观测周期、实体半径和令牌路径使用代码默认值。令牌由 session 首次启动以排他创建方式生成于 `data/life_engine_workspace/minecraft/bot_bridge_token.json`（0600），并发首次启动也不会互相覆盖；令牌不得复制到仓库或日志。启动时监听端口 18767 若被占用，监听器绑定会直接失败并返回可诊断原因，不会抢占已有进程。
+   `bot_server_host = "auto"` 会在启动时自动解析 WSL 默认网关（即 Windows 宿主机），WSL 重启后 IP 变化也无需改配置；`bot_username` 必须与人类玩家的游戏名不同。监听地址、观测周期、实体半径和令牌路径使用代码默认值。令牌由 session 首次启动以排他创建方式生成于 `data/life_engine_workspace/minecraft/bot_bridge_token.json`（0600），并发首次启动也不会互相覆盖；令牌不得复制到仓库或日志。启动时监听端口 18767 若被占用，监听器绑定会直接失败并返回可诊断原因，不会抢占已有进程。
 
    当前随仓库交付的是 Mineflayer `offline` 登录路径，适用于“对局域网开放”的单人世界或 `online-mode=false` 的专用服务器。普通 `online-mode=true` 服务器需要单独购买并交互式登录一个 Microsoft/Minecraft 账号；本实现不会把昵称伪装成已认证账号。
 
 ### 一起玩的操作路径
 
-1. 用户在自己的 Minecraft 客户端进入世界；若是单人存档，先"对局域网开放"，把聊天栏提示的端口填入 `bot_server_port`（每次开放的端口可能不同）；专用服务器则填服务器地址与端口。
-2. 通过正式工具调用 `nucleus_minecraft(action="start", body_name="bot")`。session 负责唯一的 bot 进程生命周期：启动 node 子进程、等待桥接认证、等待服务器世界就绪。
+1. 用户在自己的 Minecraft 客户端进入世界；若是单人存档，先"对局域网开放"，在端口号框里**固定填写 `25565`**（红字为无效端口，白字才能创建；必须与 `bot_server_port` 一致），配置只需设置一次；专用服务器则填服务器地址与端口。
+2. 通过正式工具调用 `nucleus_minecraft(action="start", body_name="bot")`。该工具同时注册在 chat 意识清单中，她在聊天对话里就能直接调用，不需要切换到其他意识。session 负责唯一的 bot 进程生命周期：启动 node 子进程、等待桥接认证、等待服务器世界就绪。
 3. 就绪判定为 `server_world`：`world_loaded=true`、存在 `world` 事实（mode/server_address）且玩家有 UUID。与 `agent` 不同，它不校验单人世界名称和客户端暂停状态。
 4. `stop` 由 session 终止其拥有的 bot 进程并断开桥接；`game_left_running` 对 bot 恒为 `false`，人类的游戏客户端不受任何影响。
 

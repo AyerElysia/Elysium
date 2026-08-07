@@ -21,7 +21,9 @@ from __future__ import annotations
 CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
     # 记忆见证意识只读取经历账本，不注入聊天或行动工具。
     "memory_witness": [],
-    # 全局聊天意识：私聊、群聊、所有日常对话
+    # 全局聊天意识：私聊、群聊、所有日常对话。
+    # nucleus_minecraft 保留在聊天清单里：进入共享世界的邀请常在聊天中发生，
+    # 她必须能在对话里自主调用进入工具，而不是等别人带她。
     "chat": [
         "action-life_send_text",
         "action-life_send_image",
@@ -40,6 +42,7 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
         "tool-nucleus_memory_stats",
         "action-send_emoji_meme",
         "tool-platform_action",
+        "tool-nucleus_minecraft",
     ],
     # 我的世界意识：具身交互，纯视觉→键鼠
     "minecraft": [

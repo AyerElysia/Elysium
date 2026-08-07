@@ -686,7 +686,11 @@ async def test_preflight_rejects_launcher_without_exact_quick_play(
     token_file.write_text('{"authentication_token":"secret"}', encoding="utf-8")
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(mc_home=tmp_path, agent_token_file=token_file),
+        mc_config=MCConfig(
+            mc_home=tmp_path,
+            agent_token_file=token_file,
+            shared_world_enabled=False,
+        ),
     )
     session._launcher = _MissingQuickPlayLauncher()
 
@@ -705,7 +709,11 @@ async def test_agent_preflight_allows_first_launch_to_create_token(
     token_file = tmp_path / "not-created-yet.json"
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(mc_home=tmp_path, agent_token_file=token_file),
+        mc_config=MCConfig(
+            mc_home=tmp_path,
+            agent_token_file=token_file,
+            shared_world_enabled=False,
+        ),
     )
     session._launcher = _Launcher()
 
@@ -723,7 +731,11 @@ async def test_preflight_reports_windows_bridge_failure(tmp_path: Path) -> None:
     token_file.write_text('{"authentication_token":"secret"}', encoding="utf-8")
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(mc_home=tmp_path, agent_token_file=token_file),
+        mc_config=MCConfig(
+            mc_home=tmp_path,
+            agent_token_file=token_file,
+            shared_world_enabled=False,
+        ),
     )
     session._launcher = _BrokenWindowLauncher()
 

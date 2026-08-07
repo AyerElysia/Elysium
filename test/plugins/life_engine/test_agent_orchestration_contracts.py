@@ -516,6 +516,7 @@ class TestConsciousnessManifestContracts:
             "tool-recognize_voice",
             "tool-nucleus_save_media",
             "tool-platform_action",
+            "tool-nucleus_minecraft",
         } <= manifest
 
     def test_chat_manifest_sends_directly_without_legacy_think_action(self) -> None:

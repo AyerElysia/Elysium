@@ -62,7 +62,7 @@ async def test_launcher_dispatches_through_windows_native_helper(
 ) -> None:
     """A new client avoids fragile cmd.exe command-line composition in WSL."""
 
-    config = MCConfig(mc_home=tmp_path)
+    config = MCConfig(mc_home=tmp_path, shared_world_enabled=False)
     launcher = MinecraftLauncher(config)
     bridge = _NoWindowBridge()
     launcher._bridge = bridge

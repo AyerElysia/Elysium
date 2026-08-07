@@ -1832,9 +1832,12 @@ class LifeEngineConfig(BaseConfig):
         )
 
         bot_server_host: str = Field(
-            default="127.0.0.1",
+            default="auto",
             min_length=1,
-            description="Minecraft server or LAN host the bot body joins.",
+            description=(
+                "Minecraft server or LAN host the bot body joins; \"auto\" "
+                "resolves the WSL default gateway at launch time."
+            ),
         )
 
         bot_server_port: int = Field(
@@ -1845,9 +1848,12 @@ class LifeEngineConfig(BaseConfig):
         )
 
         bot_username: str = Field(
-            default="AyerElysia",
+            default="Elysia",
             pattern=r"^[A-Za-z0-9_]{1,16}$",
-            description="In-game account name for the headless bot body.",
+            description=(
+                "In-game account name for the headless bot body; must differ "
+                "from the human player's account name."
+            ),
         )
 
         bot_observation_interval_ms: int = Field(

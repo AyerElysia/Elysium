@@ -7000,6 +7000,9 @@ class LifeEngineService(BaseService):
         request.add_payload(LLMPayload(ROLE.TOOL, tools))
 
         request.add_payload(LLMPayload(ROLE.USER, Text(user_prompt)))
+        vision_payload = await self._build_minecraft_vision_payload()
+        if vision_payload is not None:
+            request.add_payload(vision_payload)
         if world_perception is not None:
             request.register_context_delivery(
                 world_perception.delivery_id,
@@ -7213,6 +7216,41 @@ class LifeEngineService(BaseService):
                 last_text = "此刻很安静，但我仍在持续感受与观察。"
 
         return HeartbeatModelResult(last_text, perception_receipt)
+
+    async def _build_minecraft_vision_payload(self) -> Any | None:
+        """Attach her live first-person game frame to the heartbeat request.
+
+        Her LLM is natively multimodal: the frame is attached as an image
+        payload so she truly sees the game.  Any failure degrades silently to
+        "no vision this round" — the heartbeat must never break because of it.
+        """
+        session = self.minecraft_session
+        if session is None:
+            return None
+        try:
+            frame_bytes = await session.grab_vision_frame_bytes()
+        except Exception:  # noqa: BLE001
+            return None
+        if not frame_bytes:
+            return None
+        try:
+            from src.kernel.llm.payload.media import MediaPart, MediaRef
+
+            media_ref = MediaRef.from_bytes(
+                frame_bytes,
+                kind="image",
+                mime_type="image/jpeg",
+                origin="minecraft_vision",
+            )
+            return LLMPayload(
+                ROLE.USER,
+                [
+                    Text("（这是你此刻在 Minecraft 里亲眼看到的画面。）"),
+                    MediaPart(media_ref),
+                ],
+            )
+        except Exception:  # noqa: BLE001 - never fail the heartbeat for vision
+            return None
 
     async def _run_learning_heartbeat_maintenance(self) -> None:
         """Keep derived learning maintenance isolated from the main heartbeat."""

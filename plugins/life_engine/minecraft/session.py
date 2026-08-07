@@ -212,7 +212,11 @@ class MinecraftSession:
             )
         if not installation.get("bat_exists"):
             blockers.append("launch script is missing")
-        if selected_name == "agent" and not installation.get("world_exists"):
+        if (
+            selected_name == "agent"
+            and not self._in_shared_world_mode()
+            and not installation.get("world_exists")
+        ):
             blockers.append(
                 f"configured world does not exist: {self._config.world_name}"
             )
@@ -224,8 +228,10 @@ class MinecraftSession:
             blockers.append(
                 "the pinned official Baritone NeoForge artifact is not selected"
             )
-        if self._config.require_quick_play and not installation.get(
-            "quick_play_configured"
+        if (
+            self._config.require_quick_play
+            and not self._in_shared_world_mode()
+            and not installation.get("quick_play_configured")
         ):
             blockers.append(
                 "launch script does not enter the exact configured world with "
@@ -400,7 +406,11 @@ class MinecraftSession:
             )
         if not installation.get("bat_exists"):
             blockers.append("launch script is missing")
-        if selected_name == "agent" and not installation.get("world_exists"):
+        if (
+            selected_name == "agent"
+            and not self._in_shared_world_mode()
+            and not installation.get("world_exists")
+        ):
             blockers.append(
                 f"configured world does not exist: {self._config.world_name}"
             )
@@ -412,8 +422,10 @@ class MinecraftSession:
             blockers.append(
                 "the pinned official Baritone NeoForge artifact is not selected"
             )
-        if self._config.require_quick_play and not installation.get(
-            "quick_play_configured"
+        if (
+            self._config.require_quick_play
+            and not self._in_shared_world_mode()
+            and not installation.get("quick_play_configured")
         ):
             blockers.append(
                 "launch script does not enter the exact configured world with "
@@ -817,6 +829,50 @@ class MinecraftSession:
             "observation": observation.to_wire(),
             "screenshot_path": screenshot_path,
         }
+
+    def _in_shared_world_mode(self) -> bool:
+        """True when her own client joins the human player's LAN world."""
+
+        return bool(getattr(self._config, "shared_world_enabled", False))
+
+    async def grab_vision_frame_bytes(self) -> bytes | None:
+        """Return the latest first-person frame as JPEG bytes for her own eyes.
+
+        The bytes feed her native multimodal model directly (image payload);
+        nothing is translated into words first.  Returns None when no session
+        is active or no renderable window exists (e.g. headless bot body).
+        """
+
+        if not self._state.active or self._runtime is None:
+            return None
+        try:
+            frame = await self._capture.grab_consciousness_frame()
+        except Exception:  # noqa: BLE001 - vision must never break heartbeat
+            return None
+        if frame is None:
+            return None
+
+        def _encode() -> bytes:
+            import io
+
+            from PIL import Image as PILImage
+
+            image = frame.image
+            if image.width > 1280:
+                ratio = 1280 / image.width
+                image = image.resize(
+                    (1280, max(1, int(image.height * ratio))), PILImage.LANCZOS
+                )
+            if image.mode not in ("RGB", "L"):
+                image = image.convert("RGB")
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=85)
+            return buffer.getvalue()
+
+        try:
+            return await asyncio.to_thread(_encode)
+        except Exception:  # noqa: BLE001
+            return None
 
     async def get_status(self) -> dict[str, Any]:
         """Return session, body, planner, and latest evidence status."""
