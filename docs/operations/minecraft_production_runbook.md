@@ -69,6 +69,13 @@
 
 5. 由用户手动重启 Elysium。AI 和部署脚本均不得替用户停止、重启或拉起 Elysium，也不得停止或重启已有 Minecraft 进程。NapCat/QQNT 的自动恢复按根目录 `AGENTS.md` 的独立生命周期规范执行，本手册中的 Minecraft 脚本不管理它。
 
+## agent 身体共享世界与原生视觉
+
+- `shared_world_enabled = true`（默认）时，agent 身体不再进入本地单人世界，而是通过自动生成的 `LaunchElysiaShared.bat` 以 `--quickPlayMultiplayer "<WSL网关>:<bot_server_port>"` 直连人类玩家开放的局域网世界；游戏内用户名为 `agent_shared_username`（默认 `Elysia`，必须与人类玩家区分）。
+- 该模式下 preflight 跳过单人世界与 `--quickPlaySingleplayer` 校验（改为共享世界语义）。
+- 她拥有自己的客户端窗口，即她自己的眼睛：心跳轮次中 `session.grab_vision_frame_bytes()` 截取第一人称画面，`core._build_minecraft_vision_payload()` 将其作为原生图像 payload（MediaPart）注入她的多模态大脑请求。**不做任何文字转述——画面以像素直接进入她的模型**；想法来自她，执行层（bridge 命令 / VLA）只忠实执行。
+- 无窗口可截时（如 bot 身体）静默降级为无视觉，不影响心跳。
+
 ## 无头 bot 身体（共享世界）
 
 bot 身体用于和人一起玩同一个世界：人类用自己的客户端进入世界，bot 以 `bot_username` 账号加入同一世界。它与 `agent` 共用协议、操作契约、命令账本、trace 证据链与 Presence/scene 投影，只是身体侧实现换成了 mineflayer。
