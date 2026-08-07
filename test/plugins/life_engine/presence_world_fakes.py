@@ -17,6 +17,10 @@ from plugins.life_engine.service.presence_store import (
     StreamOwnershipConflict,
 )
 from plugins.life_engine.service.world_projection import (
+    WORLD_ASSERTION_ORDER_NEWEST_FIRST,
+    WORLD_ASSERTION_ORDER_OLDEST_FIRST,
+    WORLD_ASSERTION_SCOPE_CURRENT_SNAPSHOT,
+    WORLD_ASSERTION_SCOPE_HISTORY,
     WORLD_LEGACY_IMPORT_EVENT,
     WORLD_OBSERVATION_EVENT,
     WORLD_PROJECTOR_POLICY,
@@ -35,6 +39,8 @@ from plugins.life_engine.service.world_projection import (
     WorldProjectionStore,
     WorldProjectionUnavailable,
     WorldValueChunk,
+    is_current_snapshot_eligible,
+    normalize_world_assertion_scope,
 )
 from plugins.life_engine.storage.domain_contracts import (
     PresenceCommitResult,
@@ -588,17 +594,42 @@ class FakeWorldProjectionStore:
         self,
         *,
         include_retracted: bool = False,
+        delivery_scope: str = WORLD_ASSERTION_SCOPE_HISTORY,
         after_observed_at: str = "",
         after_assertion_id: str = "",
         limit: int = 128,
         inline_max_bytes: int = 1024,
     ) -> WorldAssertionReferencePage:
+        scope = normalize_world_assertion_scope(delivery_scope)
+        current_snapshot = scope == WORLD_ASSERTION_SCOPE_CURRENT_SNAPSHOT
+        if current_snapshot and include_retracted:
+            raise ValueError("current World snapshot cannot include retracted evidence")
         values = await self.list_assertions(include_retracted=include_retracted)
+        if current_snapshot:
+            values = [
+                item
+                for item in values
+                if is_current_snapshot_eligible(
+                    predicate=item.predicate,
+                    status=item.status,
+                    retracted_at=item.retracted_at,
+                )
+            ]
+            values = sorted(
+                values,
+                key=lambda item: (item.observed_at, item.assertion_id),
+                reverse=True,
+            )
+        cursor = (str(after_observed_at or ""), str(after_assertion_id or ""))
         filtered = [
             item
             for item in values
-            if (item.observed_at, item.assertion_id)
-            > (str(after_observed_at or ""), str(after_assertion_id or ""))
+            if not any(cursor)
+            or (
+                (item.observed_at, item.assertion_id) < cursor
+                if current_snapshot
+                else (item.observed_at, item.assertion_id) > cursor
+            )
         ]
         page_limit = max(1, min(int(limit), 1000))
         selected = filtered[:page_limit]
@@ -664,6 +695,12 @@ class FakeWorldProjectionStore:
             total_value_bytes=total_bytes,
             next_after_observed_at=last.observed_at if last else "",
             next_after_assertion_id=last.assertion_id if last else "",
+            delivery_scope=scope,
+            result_order=(
+                WORLD_ASSERTION_ORDER_NEWEST_FIRST
+                if current_snapshot
+                else WORLD_ASSERTION_ORDER_OLDEST_FIRST
+            ),
         )
 
     async def changes_since(

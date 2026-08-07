@@ -145,6 +145,7 @@ from .perception_gateway import (
     PreparedPerception,
 )
 from .world_projection import (
+    WORLD_ASSERTION_SCOPE_HISTORY,
     WORLD_LEGACY_IMPORT_EVENT,
     WORLD_OBSERVATION_EVENT,
     WORLD_PROJECTION_DB_FILE,
@@ -1699,6 +1700,7 @@ class LifeEngineService(BaseService):
         self,
         *,
         include_retracted: bool = False,
+        delivery_scope: str = WORLD_ASSERTION_SCOPE_HISTORY,
         after_observed_at: str = "",
         after_assertion_id: str = "",
         continuation_token: str = "",
@@ -1707,6 +1709,7 @@ class LifeEngineService(BaseService):
     ) -> Any:
         """Return one stable bounded assertion page from the selected store."""
 
+        expected_frontier: int | None = None
         if continuation_token:
             continuation = PerceptionGateway.decode_snapshot_continuation_token(
                 continuation_token
@@ -1717,19 +1720,37 @@ class LifeEngineService(BaseService):
             after_assertion_id = str(
                 continuation.get("after_assertion_id") or ""
             )
+            delivery_scope = str(continuation.get("delivery_scope") or "")
+            expected_frontier = int(continuation["source_frontier"])
         gateway = self._get_perception_gateway()
         projection = gateway.projection
         if isinstance(gateway, AsyncPerceptionGateway):
+            if expected_frontier is not None:
+                contract = await projection.projector_contract()
+                actual_frontier = int(contract.get("as_of_ingest_position") or 0)
+                if actual_frontier != expected_frontier:
+                    raise ValueError(
+                        "world snapshot continuation frontier changed; restart query"
+                    )
             return await projection.list_assertion_references_page(
                 include_retracted=include_retracted,
+                delivery_scope=delivery_scope,
                 after_observed_at=after_observed_at,
                 after_assertion_id=after_assertion_id,
                 limit=limit,
                 inline_max_bytes=inline_max_bytes,
             )
+        if (
+            expected_frontier is not None
+            and projection.as_of_position() != expected_frontier
+        ):
+            raise ValueError(
+                "world snapshot continuation frontier changed; restart query"
+            )
         return await asyncio.to_thread(
             projection.list_assertion_references_page,
             include_retracted=include_retracted,
+            delivery_scope=delivery_scope,
             after_observed_at=after_observed_at,
             after_assertion_id=after_assertion_id,
             limit=limit,

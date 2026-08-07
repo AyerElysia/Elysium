@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -18,6 +19,10 @@ from typing import Any
 from .consciousness import ConsciousnessRegistry
 from .event_bus import RawEventStore
 from .world_projection import (
+    WORLD_ASSERTION_ORDER_NEWEST_FIRST,
+    WORLD_ASSERTION_ORDER_OLDEST_FIRST,
+    WORLD_ASSERTION_SCOPE_CURRENT_SNAPSHOT,
+    WORLD_ASSERTION_SCOPE_HISTORY,
     PerceptionCursorConflict,
     PromptProjectionValue,
     WorldAssertionReference,
@@ -27,7 +32,7 @@ from .world_projection import (
     WorldProjectionStore,
 )
 
-PERCEPTION_PROJECTION_ALGORITHM = "world-perception-page-v2"
+PERCEPTION_PROJECTION_ALGORITHM = "world-perception-page-v3"
 DEFAULT_PERCEPTION_MAX_BYTES = 32 * 1024
 MIN_PERCEPTION_MAX_BYTES = 4 * 1024
 _REFERENCE_INLINE_BYTES = 512
@@ -200,9 +205,13 @@ class PerceptionGateway:
         return selected, used
 
     def _presence_lines(self, instance_id: str) -> list[str]:
+        all_instances = self._registry.get_all()
         active = sorted(
-            self._registry.get_active(),
+            (item for item in all_instances if item.is_active),
             key=lambda item: item.instance_id,
+        )
+        suspended_by_kind = Counter(
+            item.kind for item in all_instances if item.is_suspended
         )
         lines = [
             "### 同一主体当前存在的意识窗口",
@@ -221,6 +230,12 @@ class PerceptionGateway:
             )
         if not active:
             lines.append("- 当前 Presence Registry 没有 active 窗口。")
+        suspended_total = sum(suspended_by_kind.values())
+        suspended_summary = self._json(dict(sorted(suspended_by_kind.items())))
+        lines.append(
+            "- 可恢复的 suspended 窗口摘要: "
+            f"total={suspended_total}; by_kind={self._bounded_field(suspended_summary)}"
+        )
         return lines
 
     def _assertion_line(self, item: WorldAssertionReference) -> str:
@@ -276,6 +291,8 @@ class PerceptionGateway:
         *,
         projection_kind: str,
         source_frontier: int,
+        delivery_scope: str,
+        result_order: str,
         observed_at: str,
         assertion_id: str,
     ) -> str:
@@ -286,6 +303,8 @@ class PerceptionGateway:
                 "algorithm": PERCEPTION_PROJECTION_ALGORITHM,
                 "projection_kind": projection_kind,
                 "source_frontier": source_frontier,
+                "delivery_scope": delivery_scope,
+                "result_order": result_order,
                 "after_observed_at": observed_at,
                 "after_assertion_id": assertion_id,
             }
@@ -317,6 +336,16 @@ class PerceptionGateway:
             raise ValueError("world snapshot continuation projection_kind is missing")
         if int(payload.get("source_frontier") or -1) < 0:
             raise ValueError("world snapshot continuation frontier is invalid")
+        scope = str(payload.get("delivery_scope") or "")
+        result_order = str(payload.get("result_order") or "")
+        expected_order = {
+            WORLD_ASSERTION_SCOPE_CURRENT_SNAPSHOT: WORLD_ASSERTION_ORDER_NEWEST_FIRST,
+            WORLD_ASSERTION_SCOPE_HISTORY: WORLD_ASSERTION_ORDER_OLDEST_FIRST,
+        }.get(scope)
+        if expected_order is None:
+            raise ValueError("world snapshot continuation scope is unsupported")
+        if result_order != expected_order:
+            raise ValueError("world snapshot continuation order is unsupported")
         if not str(payload.get("after_assertion_id") or "").strip():
             raise ValueError("world snapshot continuation assertion cursor is missing")
         return payload
@@ -446,6 +475,8 @@ class PerceptionGateway:
             continuation = self._continuation_token(
                 projection_kind=projection_kind,
                 source_frontier=source_frontier,
+                delivery_scope=assertion_page.delivery_scope,
+                result_order=assertion_page.result_order,
                 observed_at=last_assertion.observed_at if last_assertion else "",
                 assertion_id=last_assertion.assertion_id if last_assertion else "",
             )
@@ -534,7 +565,8 @@ class PerceptionGateway:
         self._projection.ensure_deliverable()
         from_position, revision = self._projection.perception_cursor(identity)
         assertion_page = self._projection.list_assertion_references_page(
-            include_retracted=True,
+            include_retracted=False,
+            delivery_scope=WORLD_ASSERTION_SCOPE_CURRENT_SNAPSHOT,
             limit=_REFERENCE_PAGE_SIZE,
             inline_max_bytes=_REFERENCE_INLINE_BYTES,
         )
@@ -713,7 +745,8 @@ class AsyncPerceptionGateway(PerceptionGateway):
         self._ensure_deliverable(contract)
         from_position, revision = await self._projection.perception_cursor(identity)
         assertion_page = await self._projection.list_assertion_references_page(
-            include_retracted=True,
+            include_retracted=False,
+            delivery_scope=WORLD_ASSERTION_SCOPE_CURRENT_SNAPSHOT,
             limit=_REFERENCE_PAGE_SIZE,
             inline_max_bytes=_REFERENCE_INLINE_BYTES,
         )

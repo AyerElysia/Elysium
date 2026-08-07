@@ -19,6 +19,8 @@ from plugins.life_engine.service.presence_store import (
     StreamOwnershipConflict,
 )
 from plugins.life_engine.service.world_projection import (
+    WORLD_ASSERTION_ORDER_NEWEST_FIRST,
+    WORLD_ASSERTION_SCOPE_CURRENT_SNAPSHOT,
     WORLD_OBSERVATION_EVENT,
     PerceptionCursorConflict,
     WorldProjectionConflict,
@@ -127,11 +129,19 @@ def _instance(
     }
 
 
-def _observation(identity: str, *, sequence: int, value: str) -> LifeEvent:
+def _observation(
+    identity: str,
+    *,
+    sequence: int,
+    value: str,
+    predicate: str = "state",
+    status: str = "",
+    observed_at: str = "2026-08-04T01:00:00+00:00",
+) -> LifeEvent:
     return LifeEvent(
         event_id=f"event-{identity}",
         sequence=sequence,
-        timestamp="2026-08-04T01:00:00+00:00",
+        timestamp=observed_at,
         source="contract.world",
         channel=LifeEventChannel.LIFE.value,
         event_type=WORLD_OBSERVATION_EVENT,
@@ -140,9 +150,10 @@ def _observation(identity: str, *, sequence: int, value: str) -> LifeEvent:
                 "assertion": {
                     "assertion_id": identity,
                     "subject": "subject:contract",
-                    "predicate": "state",
+                    "predicate": predicate,
                     "value": value,
-                    "observed_at": "2026-08-04T01:00:00+00:00",
+                    "status": status,
+                    "observed_at": observed_at,
                 }
             }
         ),
@@ -401,6 +412,49 @@ async def _assert_world_contract(stores: PresenceWorldStores) -> None:
     await world.begin_rebuild()
     await world.apply_events([original, unprojected])
     await world.finish_rebuild(expected_frontier=3)
+    lifecycle = _observation(
+        "world-lifecycle",
+        sequence=4,
+        value="historical-session",
+        predicate="session_state",
+        observed_at="2026-08-04T02:00:00+00:00",
+    )
+    legacy = _observation(
+        "world-legacy",
+        sequence=5,
+        value="historical-import",
+        predicate="legacy_snapshot",
+        status="legacy_import",
+        observed_at="2026-08-04T03:00:00+00:00",
+    )
+    current = _observation(
+        "world-current",
+        sequence=6,
+        value="present-fact",
+        observed_at="2026-08-04T04:00:00+00:00",
+    )
+    assert await world.apply_events([lifecycle, legacy, current]) == 6
+    current_page = await world.list_assertion_references_page(
+        delivery_scope=WORLD_ASSERTION_SCOPE_CURRENT_SNAPSHOT,
+        limit=1,
+    )
+    assert current_page.result_order == WORLD_ASSERTION_ORDER_NEWEST_FIRST
+    assert current_page.items[0].assertion_id == "world-current"
+    history_page = await world.list_assertion_references_page(
+        include_retracted=True,
+        limit=10,
+    )
+    assert {item.assertion_id for item in history_page.items} == {
+        "world-a",
+        "world-lifecycle",
+        "world-legacy",
+        "world-current",
+    }
+    with pytest.raises(ValueError, match="cannot include retracted"):
+        await world.list_assertion_references_page(
+            include_retracted=True,
+            delivery_scope=WORLD_ASSERTION_SCOPE_CURRENT_SNAPSHOT,
+        )
 
 
 @pytest.mark.asyncio
