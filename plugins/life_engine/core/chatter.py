@@ -614,7 +614,7 @@ class LifeSendTextAction(BaseAction):
             str,
             "本次主体自己选择提交的简洁内心活动。键和值都必填，必须是非空自然语言；"
             "不得从 provider reasoning 或 content 自动回填，也不得把它当作可见正文。",
-        ],
+        ] = "",
         mood: Annotated[
             str,
             "此刻的心情或情绪状态。键必填；没有明确情绪时传空字符串，禁止编造默认情绪。",
