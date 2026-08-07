@@ -628,6 +628,10 @@ class LifeSendTextAction(BaseAction):
             str,
             "你预期用户看到回复后的反应。键必填；没有明确预期时传空字符串。",
         ] = "",
+        mode: Annotated[
+            str,
+            "兼容旧模型的可选情绪/表达模式字段；仅记录，不参与发送路由。",
+        ] = "",
         reply_to: Annotated[
             str | None,
             "可选，要引用回复的目标消息 ID。私聊默认留空。",
@@ -668,7 +672,7 @@ class LifeSendTextAction(BaseAction):
                 return False, f"未知或不可用的发送目标 target_key: {normalized_target_key}"
 
         structured_context = {
-            "mood": str(mood or "").strip(),
+            "mood": str(mood or mode or "").strip(),
             "decision": str(decision or "").strip(),
             "expected_response": str(expected_response or "").strip(),
             "thought": normalized_thought,

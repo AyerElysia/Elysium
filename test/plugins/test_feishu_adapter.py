@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -571,6 +572,21 @@ async def test_feishu_outgoing_group_text(monkeypatch: pytest.MonkeyPatch) -> No
         "code": 0,
         "data": {"message_id": "om_sent_1", "chat_id": "oc_1"},
     }
+
+
+def test_feishu_oversized_image_is_compressed_for_upload() -> None:
+    from PIL import Image as PILImage
+
+    source = PILImage.effect_noise((5000, 5000), 100)
+    raw = BytesIO()
+    source.save(raw, format="JPEG", quality=100)
+    original = raw.getvalue()
+    upload, mime = FeishuAdapter._prepare_image_upload_bytes(original)
+
+    assert len(original) > feishu_adapter_module._FEISHU_IMAGE_UPLOAD_MAX_BYTES
+    assert mime == "image/jpeg"
+    assert len(upload) <= feishu_adapter_module._FEISHU_IMAGE_UPLOAD_MAX_BYTES
+    assert raw.getvalue() != upload
 
 
 async def test_feishu_outgoing_image_uploads_and_sends(

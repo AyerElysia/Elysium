@@ -256,7 +256,16 @@ async def route_should_respond(
     SOUL/USER/MEMORY text belongs to the main expression request, not here.
     """
 
-    nickname = get_core_config().personality.nickname
+    # CoreConfig no longer requires a parallel personality section. Keep a
+    # compatibility read for older test/config providers, then use the stream
+    # transport nickname as a non-authoritative routing label.
+    config = get_core_config()
+    personality = getattr(config, "personality", None)
+    nickname = str(
+        getattr(personality, "nickname", "")
+        or getattr(chat_stream, "bot_nickname", "")
+        or "爱莉"
+    )
     bot_id = chat_stream.bot_id or ""
     system_prompt = await _build_router_prompt(
         nickname=nickname,

@@ -13,11 +13,13 @@ import subprocess
 import threading
 import time
 import uuid
+from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
 
 import httpx
 from mofox_wire import CoreSink, MessageEnvelope
+from PIL import Image as PILImage
 
 from src.core.components.base.adapter import BaseAdapter
 from src.core.utils.audio_transcode import (
@@ -44,6 +46,9 @@ _LARK_REPEATED_ERROR_LOGS = (
     "ping failed, err:",
 )
 _LARK_REPEAT_LOG_INTERVAL_SECONDS = 300.0
+# 飞书图片消息上传接口的实际限制低于媒体动作允许保存的上限。
+# 发送前只压缩传输副本，不能改写主体已保存的原始媒体。
+_FEISHU_IMAGE_UPLOAD_MAX_BYTES = 9 * 1024 * 1024
 
 
 def _redact_lark_sdk_log_message(message: str) -> str:
@@ -1576,8 +1581,38 @@ class FeishuAdapter(BaseAdapter):
             return response
         raise ValueError("飞书出站图片缺少 chat_id/open_id，无法确定发送目标")
 
+    @staticmethod
+    def _prepare_image_upload_bytes(image_bytes: bytes) -> tuple[bytes, str]:
+        """Return an upload-safe image copy without modifying the saved original."""
+        if len(image_bytes) <= _FEISHU_IMAGE_UPLOAD_MAX_BYTES:
+            return image_bytes, "application/octet-stream"
+        try:
+            with PILImage.open(BytesIO(image_bytes)) as source:
+                image = source.convert("RGB")
+                # Resize oversized raster images before quality reduction. The
+                # original bytes remain in the workspace and are never replaced.
+                max_dimension = 4096
+                if max(image.size) > max_dimension:
+                    scale = max_dimension / max(image.size)
+                    image = image.resize(
+                        (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
+                        PILImage.Resampling.LANCZOS,
+                    )
+                for quality in (85, 75, 65, 55, 45):
+                    output = BytesIO()
+                    image.save(output, format="JPEG", quality=quality, optimize=True)
+                    candidate = output.getvalue()
+                    if len(candidate) <= _FEISHU_IMAGE_UPLOAD_MAX_BYTES:
+                        return candidate, "image/jpeg"
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError("飞书图片超过上传限制，且无法生成压缩传输副本") from exc
+        raise ValueError(
+            f"飞书图片压缩后仍超过上传限制 {_FEISHU_IMAGE_UPLOAD_MAX_BYTES} bytes"
+        )
+
     async def _upload_image_data(self, image_data: str) -> str:
         image_bytes = self._decode_media_data(image_data, media_label="图片")
+        image_bytes, image_mime = self._prepare_image_upload_bytes(image_bytes)
         token = await self._get_tenant_access_token()
         resp = await self._request_with_retry(
             "POST",
@@ -1585,7 +1620,13 @@ class FeishuAdapter(BaseAdapter):
             timeout=30.0,
             headers={"Authorization": f"Bearer {token}"},
             data={"image_type": "message"},
-            files={"image": ("image.png", image_bytes, "application/octet-stream")},
+            files={
+                "image": (
+                    "image.jpg" if image_mime == "image/jpeg" else "image.png",
+                    image_bytes,
+                    image_mime,
+                )
+            },
         )
         payload = self._decode_response(resp)
         image_key = str((payload.get("data") or {}).get("image_key") or "")

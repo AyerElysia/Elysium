@@ -173,6 +173,30 @@ async def test_life_send_text_can_send_to_target_key(monkeypatch) -> None:
     assert all(message.extra["target_group_id"] == "100" for message in sent_messages)
 
 
+async def test_life_send_text_accepts_legacy_mode_argument(monkeypatch) -> None:
+    current_stream = ChatStream(stream_id="1" * 64, platform="qq", chat_type="private")
+    action = LifeSendTextAction(
+        current_stream,
+        SimpleNamespace(config=SimpleNamespace(runtime_sync=_runtime_cfg())),
+    )
+    sent_contents: list[str] = []
+
+    async def fake_send(content: str) -> bool:
+        sent_contents.append(content)
+        return True
+
+    monkeypatch.setattr(action, "_send_one_segment", lambda *args, **kwargs: fake_send(args[0]))
+    ok, result = await action.execute(
+        "兼容旧模型参数",
+        thought="验证旧模型传入 mode 时仍能发送。",
+        mode="轻松",
+    )
+
+    assert ok is True
+    assert "已发送1条消息" in result
+    assert sent_contents == ["兼容旧模型参数"]
+
+
 async def test_life_send_text_without_target_key_uses_legacy_stream_send(monkeypatch) -> None:
     current_stream = ChatStream(stream_id="1" * 64, platform="qq", chat_type="private")
     action = LifeSendTextAction(
