@@ -1868,6 +1868,34 @@ class LifeEngineConfig(BaseConfig):
             description="Bot entity sensor radius in blocks.",
         )
 
+        shared_world_enabled: bool = Field(
+            default=True,
+            description=(
+                "Her own client window joins the human player's LAN world, "
+                "giving her a true first-person view; disabled falls back to "
+                "the configured singleplayer world."
+            ),
+        )
+
+        agent_shared_username: str = Field(
+            default="Elysia",
+            pattern=r"^[A-Za-z0-9_]{1,16}$",
+            description=(
+                "In-game account name of her own client in the shared world; "
+                "must differ from the human player's account name."
+            ),
+        )
+
+        game_turn_interval_seconds: int = Field(
+            default=5,
+            ge=1,
+            description=(
+                "Her continuous play cadence while a Minecraft session is "
+                "active; the heartbeat loop accelerates to this interval so "
+                "she keeps playing instead of waiting between chat turns."
+            ),
+        )
+
         planner_task_name: str = Field(
             default="agent",
             description="Configured Elysium model task used for game execution planning.",
