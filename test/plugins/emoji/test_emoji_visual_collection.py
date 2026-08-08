@@ -6,8 +6,6 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
-
 from plugins.emoji.config import EmojiConfig
 from plugins.emoji.sender.meme_store import MemeCandidate as StoreCandidate
 from plugins.emoji.sender.service import EmojiSenderService

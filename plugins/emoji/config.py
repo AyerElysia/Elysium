@@ -8,7 +8,12 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-from src.core.components.base.config import BaseConfig, Field, SectionBase, config_section
+from src.core.components.base.config import (
+    BaseConfig,
+    Field,
+    SectionBase,
+    config_section,
+)
 
 
 class EmojiConfig(BaseConfig):
