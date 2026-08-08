@@ -854,6 +854,48 @@ class LifeEngineService(BaseService):
 
         await self._open_selected_storage_runtime()
         runtime = self.storage_runtime
+        claim_retry_interval_seconds = 1.0
+        claim_deadline = (
+            time.monotonic()
+            + self._storage_factory_settings.authority_lease_seconds
+            + claim_retry_interval_seconds
+        )
+
+        async def _acquire_writer_claim(
+            *,
+            namespace: str,
+            state_key: str,
+        ) -> Any:
+            """Wait for one crash-left lease without weakening DB-time fencing."""
+
+            from ..storage import SingletonWriterClaimConflict
+
+            logged_wait = False
+            while True:
+                try:
+                    return await runtime.acquire_singleton_writer(
+                        namespace=namespace,
+                        state_key=state_key,
+                        owner_instance_id=self._storage_writer_instance_id,
+                        lease_seconds=(
+                            self._storage_factory_settings.authority_lease_seconds
+                        ),
+                    )
+                except SingletonWriterClaimConflict:
+                    remaining = claim_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    if not logged_wait:
+                        logger.warning(
+                            "selected storage writer claim is still leased; "
+                            f"waiting up to {remaining:.1f}s for DB-time takeover: "
+                            f"namespace={namespace} state_key={state_key}"
+                        )
+                        logged_wait = True
+                    await asyncio.sleep(
+                        min(claim_retry_interval_seconds, remaining)
+                    )
+
         ledger = await open_life_event_store(
             runtime,
             initialize_schema=False,
@@ -870,11 +912,9 @@ class LifeEngineService(BaseService):
             runtime,
             initialize_schema=False,
         )
-        runtime_context_writer_claim = await runtime.acquire_singleton_writer(
+        runtime_context_writer_claim = await _acquire_writer_claim(
             namespace="life_engine.runtime_context",
             state_key="global",
-            owner_instance_id=self._storage_writer_instance_id,
-            lease_seconds=self._storage_factory_settings.authority_lease_seconds,
         )
         attention_stores = await open_attention_thread_stores(
             runtime,
@@ -897,11 +937,9 @@ class LifeEngineService(BaseService):
                 LEARNING_WRITER_CLAIM_STATE_KEY,
             )
 
-            learning_writer_claim = await runtime.acquire_singleton_writer(
+            learning_writer_claim = await _acquire_writer_claim(
                 namespace=LEARNING_WRITER_CLAIM_NAMESPACE,
                 state_key=LEARNING_WRITER_CLAIM_STATE_KEY,
-                owner_instance_id=self._storage_writer_instance_id,
-                lease_seconds=self._storage_factory_settings.authority_lease_seconds,
             )
             learning_stores = await open_learning_stores(
                 runtime,
@@ -7758,7 +7796,11 @@ class LifeEngineService(BaseService):
         unregister_life_engine_service()
         try:
             try:
-                await self._save_runtime_context()
+                if (
+                    not self._selectable_storage_enabled
+                    or self._runtime_state_store is not None
+                ):
+                    await self._save_runtime_context()
             except Exception as exc:  # noqa: BLE001 - release authority regardless
                 shutdown_errors.append(exc)
                 logger.error(
