@@ -8317,18 +8317,18 @@ class LifeEngineService(BaseService):
             logger.debug(f"清理自主意向调度失败: {exc}")
         self._stop_event = None
         unregister_life_engine_service()
-        # 关闭路径的最终 checkpoint：双实例同时关闭时冲突属合法竞争，可恢复，
-        # 避免关闭流程被 RuntimeStateConflict 打断刷 ERROR。
-        await self._save_runtime_context(
-            recoverable_on_shared_conflict=True
-        )
         try:
             try:
                 if (
                     not self._selectable_storage_enabled
                     or self._runtime_state_store is not None
                 ):
-                    await self._save_runtime_context()
+                    # 关闭路径的最终 checkpoint：双实例同时关闭时冲突属合法
+                    # 竞争，可恢复，避免关闭流程被 RuntimeStateConflict 打断
+                    # 刷 ERROR。
+                    await self._save_runtime_context(
+                        recoverable_on_shared_conflict=True
+                    )
             except Exception as exc:  # noqa: BLE001 - release authority regardless
                 shutdown_errors.append(exc)
                 logger.error(

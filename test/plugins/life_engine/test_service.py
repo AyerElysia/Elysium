@@ -920,6 +920,7 @@ async def test_heartbeat_perception_cursor_conflict_keeps_model_output(
         *,
         heartbeat_run_id: str | None = None,
         world_perception: Any = None,
+        heartbeat_deadline: float | None = None,
     ) -> HeartbeatModelResult:
         return _heartbeat_result("竞争时保留的独白", world_perception)
 

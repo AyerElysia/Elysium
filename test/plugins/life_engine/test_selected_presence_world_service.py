@@ -878,14 +878,21 @@ async def test_service_stop_releases_writer_when_runtime_context_save_fails(
     service = _selected_service(tmp_path, BackendKind.MYSQL)
     await service._start_selected_storage()
 
-    async def _failed_save() -> None:
+    async def _failed_save(
+        *,
+        recoverable_on_shared_conflict: bool = False,
+    ) -> None:
         raise RuntimeError("injected runtime-context revision conflict")
 
     async def _no_op() -> None:
         return None
 
     monkeypatch.setattr(service, "_save_runtime_context", _failed_save)
-    monkeypatch.setattr(core_module, "cleanup_autonomy_schedules", lambda *_: _no_op())
+    monkeypatch.setattr(
+        core_module,
+        "cleanup_autonomy_schedules",
+        lambda *_args, **_kwargs: _no_op(),
+    )
 
     with pytest.raises(ExceptionGroup, match="consumer failures") as captured:
         await service.stop()
