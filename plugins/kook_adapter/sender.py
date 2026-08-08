@@ -9,6 +9,8 @@
 """
 from __future__ import annotations
 
+import json
+
 from typing import Any, Callable
 
 from mofox_wire import MessageEnvelope
@@ -240,6 +242,12 @@ class KookSender:
             return []
         flat: list[dict[str, Any]] = []
         for seg in segments:
+            if isinstance(seg, str):
+                try:
+                    seg = json.loads(seg)
+                except (ValueError, TypeError):
+                    logger.warning("KOOK 丢弃无法解析的段字符串: %s", seg[:60])
+                    continue
             if not isinstance(seg, dict):
                 continue
             if seg.get("type") == "seglist":
