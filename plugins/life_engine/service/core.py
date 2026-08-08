@@ -7283,7 +7283,7 @@ class LifeEngineService(BaseService):
             return LLMPayload(
                 ROLE.USER,
                 [
-                    Text("（这是你此刻在 Minecraft 里亲眼看到的画面。）"),
+                    Text("（这是你此刻在 Minecraft 里亲眼看到的画面。你正在游戏中，这是你连续游玩的一个回合。）"),
                     MediaPart(media_ref),
                 ],
             )
@@ -7984,13 +7984,27 @@ class LifeEngineService(BaseService):
         finally:
             logger.info("life_engine 记忆索引循环已停止")
 
+    def _effective_heartbeat_interval(self) -> int:
+        """Accelerate heartbeat turns into continuous play while in game."""
+
+        base_interval = max(1, int(self._cfg().settings.heartbeat_interval_seconds))
+        session = self.minecraft_session
+        if session is None or not getattr(session, "is_active", False):
+            return base_interval
+        mc_section = getattr(self._cfg(), "minecraft", None)
+        game_interval = getattr(mc_section, "game_turn_interval_seconds", None)
+        if game_interval is None:
+            return base_interval
+        return max(1, int(game_interval))
+
     async def _heartbeat_loop(self) -> None:
         """心跳循环。"""
-        interval = max(1, int(self._cfg().settings.heartbeat_interval_seconds))
+        interval = self._effective_heartbeat_interval()
         should_log_heartbeat = bool(self._cfg().settings.log_heartbeat)
 
         try:
             while self._state.running:
+                interval = self._effective_heartbeat_interval()
                 if self._stop_event is not None:
                     try:
                         await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
