@@ -13,7 +13,7 @@ import json
 import os
 import time
 import traceback
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
@@ -70,7 +70,10 @@ from ..core.subject_context_projection import (
     validate_subject_projection_text,
 )
 from ..core.send_targets import format_send_targets_for_prompt, list_recent_send_targets
-from ..core.tool_parallel import iter_life_tool_call_batches
+from ..core.tool_parallel import (
+    is_life_tool_call_parallel_safe,
+    iter_life_tool_call_batches,
+)
 from ..autonomy import (
     AsyncLocalAutonomyIntentStore,
     AutonomyIntent,
@@ -288,6 +291,29 @@ class HeartbeatModelResult:
     perception_receipt: PerceptionDeliveryReceipt | None
 
 
+HEARTBEAT_TOTAL_BUDGET_MAX_SECONDS = 300.0
+HEARTBEAT_FINALIZE_RESERVE_SECONDS = 5.0
+
+
+class HeartbeatBudgetExhausted(TimeoutError):
+    """The shared heartbeat deadline was exhausted at a content-free stage."""
+
+    def __init__(self, stage: str) -> None:
+        self.stage = str(stage or "unknown")
+        super().__init__(f"heartbeat total deadline exhausted at {self.stage}")
+
+
+@dataclass(frozen=True, slots=True)
+class HeartbeatToolRoundProgress:
+    """Content-free progress evidence for one completed heartbeat tool round."""
+
+    fingerprint: str
+    failure_fingerprint: str
+    has_success: bool
+    has_successful_mutation: bool
+    has_protocol_failure: bool
+
+
 def _resolve_heartbeat_timeout(configured: float, model_set: Any) -> float:
     """把心跳的外层超时抬到至少两个「单模型尝试」之上。
 
@@ -320,6 +346,159 @@ def _resolve_heartbeat_timeout(configured: float, model_set: Any) -> float:
         budget = max(budget, per_attempt * 2 + 15.0)
 
     return max(10.0, min(900.0, budget))
+
+
+def _resolve_heartbeat_total_budget(configured: float) -> float:
+    """Resolve one bounded budget shared by every model step in a heartbeat."""
+
+    return max(
+        10.0,
+        min(HEARTBEAT_TOTAL_BUDGET_MAX_SECONDS, float(configured) * 2 + 60.0),
+    )
+
+
+def _heartbeat_remaining_seconds(
+    deadline: float,
+    *,
+    reserve_seconds: float = HEARTBEAT_FINALIZE_RESERVE_SECONDS,
+) -> float:
+    """Return usable monotonic time while preserving the finalization reserve."""
+
+    return deadline - asyncio.get_running_loop().time() - max(0.0, reserve_seconds)
+
+
+async def _await_with_heartbeat_deadline(
+    factory: Callable[[], Awaitable[Any]],
+    *,
+    deadline: float,
+    stage: str,
+    per_call_timeout: float | None = None,
+    reserve_seconds: float = HEARTBEAT_FINALIZE_RESERVE_SECONDS,
+) -> Any:
+    """Await one step within the heartbeat's single monotonic deadline."""
+
+    remaining = _heartbeat_remaining_seconds(
+        deadline,
+        reserve_seconds=reserve_seconds,
+    )
+    if remaining <= 0:
+        raise HeartbeatBudgetExhausted(stage)
+    timeout = remaining
+    deadline_limited = True
+    if per_call_timeout is not None and per_call_timeout > 0:
+        timeout = min(remaining, float(per_call_timeout))
+        deadline_limited = remaining <= float(per_call_timeout)
+    try:
+        return await asyncio.wait_for(factory(), timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        if deadline_limited:
+            raise HeartbeatBudgetExhausted(stage) from exc
+        raise
+
+
+async def _sleep_with_heartbeat_deadline(
+    delay_seconds: float,
+    *,
+    deadline: float,
+    stage: str,
+) -> None:
+    """Sleep only when the full delay fits before the finalization reserve."""
+
+    delay = max(0.0, float(delay_seconds))
+    if delay > _heartbeat_remaining_seconds(deadline):
+        raise HeartbeatBudgetExhausted(stage)
+    await asyncio.sleep(delay)
+
+
+def _heartbeat_tool_results(response: Any) -> list[ToolResult]:
+    """Return tool-result parts without retaining or logging their text."""
+
+    results: list[ToolResult] = []
+    for payload in list(getattr(response, "payloads", []) or []):
+        if getattr(payload, "role", None) != ROLE.TOOL_RESULT:
+            continue
+        for part in list(getattr(payload, "content", []) or []):
+            if isinstance(part, ToolResult):
+                results.append(part)
+    return results
+
+
+def _heartbeat_tool_round_progress(
+    calls: list[Any],
+    results: list[ToolResult],
+) -> HeartbeatToolRoundProgress:
+    """Hash one tool round and classify only technical protocol failures."""
+
+    rows: list[dict[str, Any]] = []
+    failed_rows: list[dict[str, Any]] = []
+    has_success = False
+    has_successful_mutation = False
+    has_protocol_failure = False
+    protocol_markers = (
+        "invalid",
+        "continuation",
+        "cursor",
+        "argument",
+        "parameter",
+        "required",
+        "unknown tool",
+        "checksum",
+        "参数",
+        "游标",
+        "未知工具",
+        "缺少",
+    )
+
+    for index, call in enumerate(calls):
+        tool_name, args = LifeEngineService._heartbeat_tool_call_metadata(call)
+        args.pop("reason", None)
+        args_json = json.dumps(
+            args,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        result = results[index] if index < len(results) else None
+        result_text = result.to_text() if result is not None else "<missing-tool-result>"
+        failed = result is None or result_text.startswith(
+            ("执行失败:", "执行异常:", "未知工具:")
+        )
+        row = {
+            "tool": tool_name,
+            "args_sha256": hashlib.sha256(args_json.encode("utf-8")).hexdigest(),
+            "result_sha256": hashlib.sha256(result_text.encode("utf-8")).hexdigest(),
+            "success": not failed,
+        }
+        rows.append(row)
+        if failed:
+            failed_rows.append(row)
+            folded = result_text.casefold()
+            has_protocol_failure = has_protocol_failure or any(
+                marker in folded for marker in protocol_markers
+            )
+            continue
+        has_success = True
+        if not is_life_tool_call_parallel_safe(call):
+            has_successful_mutation = True
+
+    canonical = json.dumps(rows, sort_keys=True, separators=(",", ":"))
+    failed_canonical = json.dumps(
+        failed_rows,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return HeartbeatToolRoundProgress(
+        fingerprint=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        failure_fingerprint=(
+            hashlib.sha256(failed_canonical.encode("utf-8")).hexdigest()
+            if failed_rows
+            else ""
+        ),
+        has_success=has_success,
+        has_successful_mutation=has_successful_mutation,
+        has_protocol_failure=has_protocol_failure,
+    )
 
 
 class LifeEngineService(BaseService):
@@ -7004,9 +7183,17 @@ class LifeEngineService(BaseService):
         *,
         heartbeat_run_id: str | None = None,
         world_perception: PreparedPerception | None = None,
+        heartbeat_deadline: float | None = None,
     ) -> HeartbeatModelResult:
         """调用 life 任务模型生成内部报文；请求失败必须向上抛出。"""
         cfg = self._cfg()
+        configured_timeout = float(
+            getattr(cfg.settings, "heartbeat_timeout_seconds", 0)
+            or cfg.settings.heartbeat_interval_seconds
+        )
+        total_budget = _resolve_heartbeat_total_budget(configured_timeout)
+        if heartbeat_deadline is None:
+            heartbeat_deadline = asyncio.get_running_loop().time() + total_budget
         task_name = cfg.model.task_name.strip() or "core"
         model_set = get_model_set_by_task(task_name)
         request = create_llm_request(
@@ -7050,10 +7237,6 @@ class LifeEngineService(BaseService):
 
         # 心跳请求超时与心跳间隔解耦：慢模型（长 prompt 的推理模型）单次可达上百秒，
         # 沿用间隔值会把正常的慢响应当成超时反复重试。
-        configured_timeout = float(
-            getattr(cfg.settings, "heartbeat_timeout_seconds", 0)
-            or cfg.settings.heartbeat_interval_seconds
-        )
         timeout_seconds = _resolve_heartbeat_timeout(configured_timeout, model_set)
 
         logger.debug(
@@ -7063,21 +7246,18 @@ class LifeEngineService(BaseService):
             f"tools_count={len(tools)}"
         )
 
-        from .error_handling import RetryExhaustedError, retry_with_backoff
-
         async def _send_heartbeat_request() -> Any:
-            return await asyncio.wait_for(
-                request.send(stream=False), timeout=timeout_seconds
+            return await _await_with_heartbeat_deadline(
+                lambda: request.send(stream=False),
+                deadline=heartbeat_deadline,
+                stage="initial_request",
+                per_call_timeout=timeout_seconds,
             )
 
         try:
-            response = await retry_with_backoff(
-                _send_heartbeat_request,
-                max_retries=0,
-                initial_delay=2.0,
-                backoff_factor=1.5,
-                exceptions=(asyncio.TimeoutError,),
-            )
+            response = await _send_heartbeat_request()
+        except HeartbeatBudgetExhausted:
+            raise
         except Exception as e:
             # 主模型失败，尝试轻量模型降级（utils task 通常路由到更快的 provider）
             if task_name != "utility":
@@ -7099,11 +7279,15 @@ class LifeEngineService(BaseService):
                             user_prompt,
                             marker=world_perception.delivery_marker,
                         )
-                    response = await asyncio.wait_for(
-                        fallback_request.send(stream=False),
-                        timeout=timeout_seconds,
+                    response = await _await_with_heartbeat_deadline(
+                        lambda: fallback_request.send(stream=False),
+                        deadline=heartbeat_deadline,
+                        stage="fallback_request",
+                        per_call_timeout=timeout_seconds,
                     )
                     logger.info("life_engine 心跳降级成功(utils)")
+                except HeartbeatBudgetExhausted:
+                    raise
                 except Exception as fallback_exc:
                     logger.error(f"Heartbeat fallback also failed: {fallback_exc}")
                     raise e from fallback_exc
@@ -7115,6 +7299,17 @@ class LifeEngineService(BaseService):
         last_text = ""
         tool_event_count = 0
         heartbeat_tool_calls: list[tuple[str, dict[str, Any]]] = []
+        previous_successful_round_fingerprint = ""
+        previous_failure_fingerprint = ""
+        consecutive_no_progress = 0
+        consecutive_protocol_failures = 0
+        consecutive_same_failure = 0
+        stall_limit = max(
+            1,
+            int(cfg.settings.max_consecutive_tool_stalls_per_heartbeat),
+        )
+        stop_reason = ""
+        stop_stage = ""
         perception_receipt = (
             self._heartbeat_perception_receipt(response, world_perception)
             if world_perception is not None
@@ -7125,9 +7320,16 @@ class LifeEngineService(BaseService):
                 "heartbeat model did not receive the exact World projection"
             )
 
-        for _ in range(max_rounds):
+        for turn_index in range(max_rounds):
             try:
-                response_text = await asyncio.wait_for(response, timeout=timeout_seconds)
+                response_text = await _await_with_heartbeat_deadline(
+                    lambda: response,
+                    deadline=heartbeat_deadline,
+                    stage="response_read",
+                    per_call_timeout=timeout_seconds,
+                )
+            except HeartbeatBudgetExhausted:
+                raise
             except asyncio.TimeoutError as exc:
                 logger.warning("life_engine heartbeat response read timeout")
                 raise TimeoutError("heartbeat response read timeout") from exc
@@ -7148,14 +7350,16 @@ class LifeEngineService(BaseService):
                 f"{[getattr(call, 'name', '<unknown>') for call in call_list]}"
             )
 
+            result_count_before = len(_heartbeat_tool_results(response))
             for batch, can_parallel in iter_life_tool_call_batches(call_list):
                 for call in batch:
                     tool_name, args = self._heartbeat_tool_call_metadata(call)
                     heartbeat_tool_calls.append((tool_name, dict(args)))
-                    reason = args.pop("reason", "未提供原因")
+                    args.pop("reason", None)
                     logger.debug(
                         f"life_engine 心跳#{self._state.heartbeat_count} "
-                        f"LLM 调用 {tool_name or '<unknown>'}，原因: {reason}，参数: {args}"
+                        f"LLM 调用 {tool_name or '<unknown>'}，"
+                        f"参数键: {sorted(args)}"
                     )
 
                 if can_parallel and len(batch) > 1:
@@ -7176,6 +7380,47 @@ class LifeEngineService(BaseService):
                     )
                     tool_event_count += 2
 
+            round_results = _heartbeat_tool_results(response)[result_count_before:]
+            progress = _heartbeat_tool_round_progress(call_list, round_results)
+            successful_progress = progress.has_successful_mutation or (
+                progress.has_success
+                and progress.fingerprint != previous_successful_round_fingerprint
+            )
+            if successful_progress:
+                consecutive_no_progress = 0
+                previous_successful_round_fingerprint = progress.fingerprint
+            else:
+                consecutive_no_progress += 1
+
+            if progress.has_protocol_failure:
+                consecutive_protocol_failures += 1
+            else:
+                consecutive_protocol_failures = 0
+
+            if progress.failure_fingerprint:
+                if progress.failure_fingerprint == previous_failure_fingerprint:
+                    consecutive_same_failure += 1
+                else:
+                    consecutive_same_failure = 1
+                    previous_failure_fingerprint = progress.failure_fingerprint
+            else:
+                consecutive_same_failure = 0
+                previous_failure_fingerprint = ""
+
+            if max(
+                consecutive_no_progress,
+                consecutive_protocol_failures,
+                consecutive_same_failure,
+            ) >= stall_limit:
+                stop_reason = "consecutive_tool_stalls"
+                stop_stage = "tool_round"
+                break
+
+            if turn_index + 1 >= max_rounds:
+                stop_reason = "max_model_turns"
+                stop_stage = "tool_round"
+                break
+
             # 工具轮之后的续问必须和首次请求同等强度地重试：这里原本是裸的
             # wait_for，首个模型一挂就直接把整个心跳判死，而首次请求那边有
             # retry_with_backoff。心跳的绝大多数超时都发生在这一步（工具执行
@@ -7193,9 +7438,11 @@ class LifeEngineService(BaseService):
                 from src.kernel.llm.exceptions import LLMModelsCoolingDownError
 
                 try:
-                    return await asyncio.wait_for(
-                        current_response.send(stream=False),
-                        timeout=timeout_seconds,
+                    return await _await_with_heartbeat_deadline(
+                        lambda: current_response.send(stream=False),
+                        deadline=heartbeat_deadline,
+                        stage="followup_request",
+                        per_call_timeout=timeout_seconds,
                     )
                 except LLMModelsCoolingDownError as cooldown_exc:
                     # 首次请求超时会让唯一候选进入约 30s 冷却；续轮立即重发会
@@ -7206,22 +7453,30 @@ class LifeEngineService(BaseService):
                         f"life_engine heartbeat follow-up 候选模型冷却中，"
                         f"等待 {wait_seconds:.1f}s 后重试"
                     )
-                    await asyncio.sleep(wait_seconds)
-                    return await asyncio.wait_for(
-                        current_response.send(stream=False),
-                        timeout=timeout_seconds,
+                    await _sleep_with_heartbeat_deadline(
+                        wait_seconds,
+                        deadline=heartbeat_deadline,
+                        stage="followup_cooldown",
+                    )
+                    return await _await_with_heartbeat_deadline(
+                        lambda: current_response.send(stream=False),
+                        deadline=heartbeat_deadline,
+                        stage="followup_after_cooldown",
+                        per_call_timeout=timeout_seconds,
                     )
 
             from src.kernel.llm.exceptions import LLMModelsCoolingDownError
 
             try:
-                response = await retry_with_backoff(
-                    _send_followup_request,
-                    max_retries=1,
-                    initial_delay=2.0,
-                    backoff_factor=1.5,
-                    exceptions=(asyncio.TimeoutError,),
-                )
+                try:
+                    response = await _send_followup_request()
+                except asyncio.TimeoutError:
+                    await _sleep_with_heartbeat_deadline(
+                        2.0,
+                        deadline=heartbeat_deadline,
+                        stage="followup_backoff",
+                    )
+                    response = await _send_followup_request()
                 if world_perception is not None:
                     perception_receipt = self._heartbeat_perception_receipt(
                         response,
@@ -7231,9 +7486,12 @@ class LifeEngineService(BaseService):
                         raise PerceptionDeliveryUnverified(
                             "heartbeat follow-up lost the exact World projection"
                         )
+            except HeartbeatBudgetExhausted as exc:
+                stop_reason = "deadline_exhausted"
+                stop_stage = exc.stage
+                break
             except (
                 asyncio.TimeoutError,
-                RetryExhaustedError,
                 LLMModelsCoolingDownError,
             ) as exc:
                 # 冷却窗口内二次失败同样归一化为超时，保持心跳失败合同一致，
@@ -7241,11 +7499,38 @@ class LifeEngineService(BaseService):
                 logger.warning(f"life_engine heartbeat follow-up request timeout: {exc}")
                 raise TimeoutError("heartbeat follow-up request timeout") from exc
 
+        if stop_reason:
+            logger.warning(
+                "life_engine 心跳工具续轮有序结束: "
+                f"reason={stop_reason} stage={stop_stage} "
+                f"model_turns={turn_index + 1} "
+                f"consecutive_no_progress={consecutive_no_progress} "
+                f"consecutive_protocol_failures={consecutive_protocol_failures}"
+            )
+            log_heartbeat_event(
+                event="heartbeat_tool_loop_stopped",
+                heartbeat_count=self._state.heartbeat_count,
+                heartbeat_run_id=heartbeat_run_id or "",
+                stop_reason=stop_reason,
+                stop_stage=stop_stage,
+                model_turns=turn_index + 1,
+                consecutive_no_progress=consecutive_no_progress,
+                consecutive_protocol_failures=consecutive_protocol_failures,
+                consecutive_same_failure=consecutive_same_failure,
+            )
+
         # active/open 只是可见线索；只有本轮由主体实际选择的非被动动作才重置 idle。
         self._update_heartbeat_idle_count(heartbeat_tool_calls)
 
         # 三环自学习系统心跳（低频后台任务：审计/压缩/指标）
-        await self._run_learning_heartbeat_maintenance()
+        try:
+            await _await_with_heartbeat_deadline(
+                self._run_learning_heartbeat_maintenance,
+                deadline=heartbeat_deadline,
+                stage="learning_maintenance",
+            )
+        except HeartbeatBudgetExhausted:
+            logger.debug("life_engine 心跳剩余预算不足，跳过本轮学习维护")
 
         if not last_text:
             if tool_event_count > 0:
@@ -7871,26 +8156,42 @@ class LifeEngineService(BaseService):
                     last_wake_context_at=self._state.last_wake_context_at,
                     last_wake_context_size=self._state.last_wake_context_size,
                 )
-                # 心跳 LLM 总预算：防止单次心跳因重试/模型挂起而冻结超过 N 分钟。
-                # 公式：heartbeat_timeout_seconds × 2 + 60，覆盖"1次完整尝试 + fallback降级"，
-                # 超出时记录警告并跳过本轮（下一轮30s后自动触发）。
+                # 心跳 LLM 总预算由整轮共享；首轮、fallback、续轮、冷却与退避
+                # 都只能消费同一个 monotonic deadline。外层 wait_for 仅是最后保险。
                 _cfg_hb_timeout = float(
                     getattr(self._cfg().settings, "heartbeat_timeout_seconds", 120) or 120
                 )
-                _heartbeat_llm_budget = _cfg_hb_timeout * 2 + 60  # e.g. 300s @ 120s config
+                _heartbeat_llm_budget = _resolve_heartbeat_total_budget(_cfg_hb_timeout)
+                _heartbeat_deadline = (
+                    asyncio.get_running_loop().time() + _heartbeat_llm_budget
+                )
                 try:
                     model_result = await asyncio.wait_for(
                         self._run_heartbeat_model(
                             prepared.content,
                             heartbeat_run_id=heartbeat_run_id,
                             world_perception=prepared.world_perception,
+                            heartbeat_deadline=_heartbeat_deadline,
                         ),
                         timeout=_heartbeat_llm_budget,
                     )
-                except asyncio.TimeoutError as _te:
+                except HeartbeatBudgetExhausted as exc:
                     logger.warning(
                         f"life_engine 心跳 #{self._state.heartbeat_count} "
-                        f"LLM 总预算 {_heartbeat_llm_budget:.0f}s 超时，跳过本轮"
+                        f"共享 LLM 预算已耗尽: stage={exc.stage}"
+                    )
+                    log_heartbeat_event(
+                        event="heartbeat_model_budget_exhausted",
+                        heartbeat_count=self._state.heartbeat_count,
+                        heartbeat_run_id=heartbeat_run_id,
+                        stop_stage=exc.stage,
+                        budget_seconds=_heartbeat_llm_budget,
+                    )
+                    return "", prepared
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"life_engine 心跳 #{self._state.heartbeat_count} "
+                        f"外层保险超时 {_heartbeat_llm_budget:.0f}s，跳过本轮"
                     )
                     return "", prepared
                 model_reply = model_result.text

@@ -858,6 +858,7 @@ async def test_heartbeat_success_consumes_delta_without_replay(
         *,
         heartbeat_run_id: str | None = None,
         world_perception: Any = None,
+        heartbeat_deadline: float | None = None,
     ) -> HeartbeatModelResult:
         contexts.append(wake_context)
         assert heartbeat_run_id
@@ -902,6 +903,7 @@ async def test_heartbeat_failure_keeps_delta_for_retry(
         *,
         heartbeat_run_id: str | None = None,
         world_perception: Any = None,
+        heartbeat_deadline: float | None = None,
     ) -> HeartbeatModelResult:
         nonlocal attempts
         attempts += 1
@@ -945,6 +947,7 @@ async def test_heartbeat_without_exact_world_receipt_keeps_delta_pending(
         *,
         heartbeat_run_id: str | None = None,
         world_perception: Any = None,
+        heartbeat_deadline: float | None = None,
     ) -> HeartbeatModelResult:
         assert wake_context and heartbeat_run_id and world_perception is not None
         return HeartbeatModelResult("看似成功", None)
@@ -983,6 +986,7 @@ async def test_heartbeat_arrival_during_model_is_deferred_to_next_round(
         *,
         heartbeat_run_id: str | None = None,
         world_perception: Any = None,
+        heartbeat_deadline: float | None = None,
     ) -> HeartbeatModelResult:
         nonlocal calls
         calls += 1
@@ -1019,6 +1023,7 @@ async def test_automatic_and_manual_heartbeats_are_serialized(
         *,
         heartbeat_run_id: str | None = None,
         world_perception: Any = None,
+        heartbeat_deadline: float | None = None,
     ) -> HeartbeatModelResult:
         nonlocal active_calls, max_active_calls
         active_calls += 1
@@ -1100,6 +1105,7 @@ async def test_consumed_heartbeat_events_remain_consumed_after_restart(
         *,
         heartbeat_run_id: str | None = None,
         world_perception: Any = None,
+        heartbeat_deadline: float | None = None,
     ) -> HeartbeatModelResult:
         return _heartbeat_result("已确认", world_perception)
 
