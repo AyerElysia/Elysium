@@ -80,7 +80,7 @@ class KookAdapter(BaseAdapter):
         logger.info(f"KOOK Bot 已认证: {bot_name} (id={self._bot_id})")
 
         # 初始化事件处理器和发送器
-        self._event_handler = KookEventHandler(self._get_config, self._bot_id)
+        self._event_handler = KookEventHandler(self._get_config, self._bot_id, self._client)
         self._sender = KookSender(self._client, self._get_config)
 
         # 初始化 Gateway 并连接
@@ -132,6 +132,15 @@ class KookAdapter(BaseAdapter):
             "bot_name": (config.bot.bot_name if config else "") or "KOOK Bot",
             "platform": self.platform,
         }
+
+    async def health_check(self) -> bool:
+        """健康检查：返回 KOOK Gateway 的真实连接状态。
+
+        本适配器未使用 mofox_wire 内置传输层，基类默认的 is_connected()
+        恒为 False，会导致框架每 30 秒误判"不健康"并触发 reconnect，
+        进而把适配器停掉。此处以 Gateway 实际连接状态为准。
+        """
+        return self._gateway is not None and self._gateway.connected
 
     # ─── 内部 ───────────────────────────────────────────────
 
