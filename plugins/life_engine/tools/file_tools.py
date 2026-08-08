@@ -33,13 +33,13 @@ from ..memory.eligibility import (
     read_workspace_document,
 )
 from ..memory.prompting import build_memory_write_warning
-from ..trace.store import LifeTraceStore
 from ._utils import (
     _get_workspace,
     _pick_latest_target_stream_id,
     _resolve_path,
 )
 from .bounded_projection import (
+    BoundedContinuationError,
     project_bounded_items,
     project_bounded_text,
     sha256_json,
@@ -880,6 +880,12 @@ class LifeEngineReadFileTool(BaseTool):
                 return False, "read file projection exceeded its byte budget"
 
             return True, result_data
+        except BoundedContinuationError as e:
+            logger.warning(
+                "读取文件续读游标已拒绝: "
+                f"error_type={type(e).__name__}"
+            )
+            return False, f"读取文件失败: {e}"
         except UnicodeDecodeError as e:
             return False, f"文件编码错误，请尝试其他编码: {e}"
         except Exception as e:
@@ -1266,6 +1272,12 @@ class LifeEngineListFilesTool(BaseTool):
             if len(str(result).encode("utf-8")) > result["budget_bytes"]:
                 return False, "list files projection exceeded its byte budget"
             return True, result
+        except BoundedContinuationError as e:
+            logger.warning(
+                "列出目录续读游标已拒绝: "
+                f"error_type={type(e).__name__}"
+            )
+            return False, f"列出目录失败: {e}"
         except Exception as e:
             logger.error(f"列出目录失败 {path}: {e}", exc_info=True)
             return False, f"列出目录失败: {e}"

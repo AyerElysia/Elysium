@@ -4,15 +4,21 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 BOUNDED_TOOL_PROJECTION_SCHEMA = "life_engine.bounded_tool_result"
 BOUNDED_TOOL_PROJECTION_VERSION = "bounded-tool-result-v1"
+BOUNDED_TOOL_CURSOR_VERSION = "brc1"
 CORE_TOOL_RESULT_MAX_BYTES = 8 * 1024
 CHAT_TOOL_RESULT_MAX_BYTES = 16 * 1024
 MIN_TOOL_RESULT_MAX_BYTES = 1024
+
+
+class BoundedContinuationError(ValueError):
+    """A malformed, stale, or query-mismatched model-visible continuation."""
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -71,14 +77,14 @@ def resolve_tool_result_budget(
     return task_bucket, min(requested, cap)
 
 
-def _encode_cursor(state: Mapping[str, Any]) -> str:
+def _encode_legacy_cursor(state: Mapping[str, Any]) -> str:
     raw = canonical_json_bytes(dict(state))
     body = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
     checksum = hashlib.sha256(raw).hexdigest()[:16]
     return f"{body}.{checksum}"
 
 
-def _decode_cursor(token: str) -> dict[str, Any]:
+def _decode_legacy_cursor(token: str) -> dict[str, Any]:
     try:
         body, checksum = str(token or "").split(".", 1)
         raw = base64.urlsafe_b64decode(
@@ -88,10 +94,98 @@ def _decode_cursor(token: str) -> dict[str, Any]:
             raise ValueError("checksum mismatch")
         loaded = json.loads(raw.decode("utf-8"))
     except Exception as exc:
-        raise ValueError("invalid bounded-result continuation") from exc
+        raise BoundedContinuationError(
+            "invalid bounded-result continuation"
+        ) from exc
     if not isinstance(loaded, dict):
-        raise TypeError("invalid bounded-result continuation payload")
+        raise BoundedContinuationError(
+            "invalid bounded-result continuation payload"
+        )
     return loaded
+
+
+def _cursor_checksum(
+    identity: Mapping[str, Any],
+    *,
+    offset_field: str,
+    offset: int,
+) -> str:
+    return sha256_json(
+        {
+            "cursor_version": BOUNDED_TOOL_CURSOR_VERSION,
+            "identity": dict(identity),
+            "offset_field": offset_field,
+            "offset": int(offset),
+        }
+    )[:16]
+
+
+def _encode_cursor(
+    identity: Mapping[str, Any],
+    *,
+    offset_field: str,
+    offset: int,
+) -> str:
+    """Encode a short, model-copyable cursor bound to the full source identity."""
+
+    field_code = {"offset": "i", "byte_offset": "b"}.get(offset_field)
+    if field_code is None:
+        raise ValueError("unsupported bounded-result cursor offset field")
+    checksum = _cursor_checksum(
+        identity,
+        offset_field=offset_field,
+        offset=offset,
+    )
+    return f"{BOUNDED_TOOL_CURSOR_VERSION}.{field_code}.{int(offset)}.{checksum}"
+
+
+def _decode_cursor(
+    token: str,
+    *,
+    identity: Mapping[str, Any],
+    offset_field: str,
+) -> int:
+    """Decode compact cursors while accepting already-issued legacy cursors."""
+
+    normalized = str(token or "")
+    if normalized.startswith(f"{BOUNDED_TOOL_CURSOR_VERSION}."):
+        try:
+            version, field_code, raw_offset, checksum = normalized.split(".")
+            expected_field_code = {"offset": "i", "byte_offset": "b"}[
+                offset_field
+            ]
+            if version != BOUNDED_TOOL_CURSOR_VERSION:
+                raise ValueError("cursor version mismatch")
+            if field_code != expected_field_code:
+                raise ValueError("cursor offset field mismatch")
+            offset = int(raw_offset)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise BoundedContinuationError(
+                "invalid bounded-result continuation"
+            ) from exc
+        expected_checksum = _cursor_checksum(
+            identity,
+            offset_field=offset_field,
+            offset=offset,
+        )
+        if not hmac.compare_digest(checksum, expected_checksum):
+            raise BoundedContinuationError(
+                "bounded-result continuation does not match query/task/frontier"
+            )
+        return offset
+
+    state = _decode_legacy_cursor(normalized)
+    for field, expected in identity.items():
+        if state.get(field) != expected:
+            raise BoundedContinuationError(
+                "bounded-result continuation does not match query/task/frontier"
+            )
+    try:
+        return int(state.get(offset_field))
+    except (TypeError, ValueError) as exc:
+        raise BoundedContinuationError(
+            "bounded-result continuation offset is invalid"
+        ) from exc
 
 
 def _finalize_delivered_bytes(payload: dict[str, Any]) -> int:
@@ -160,18 +254,15 @@ def project_bounded_items(
 
     start = 0
     if continuation:
-        state = _decode_cursor(continuation)
-        for field, expected in cursor_identity.items():
-            if state.get(field) != expected:
-                raise ValueError(
-                    "bounded-result continuation does not match query/task/frontier"
-                )
-        try:
-            start = int(state.get("offset"))
-        except (TypeError, ValueError) as exc:
-            raise ValueError("bounded-result continuation offset is invalid") from exc
+        start = _decode_cursor(
+            continuation,
+            identity=cursor_identity,
+            offset_field="offset",
+        )
         if start < 0 or start > len(source_items):
-            raise ValueError("bounded-result continuation offset is invalid")
+            raise BoundedContinuationError(
+                "bounded-result continuation offset is invalid"
+            )
 
     source_sizes = [serialized_utf8_bytes(item) for item in source_items]
     source_hashes = [sha256_json(item) for item in source_items]
@@ -181,7 +272,11 @@ def project_bounded_items(
     def cursor_for(offset: int) -> str:
         if offset >= original_items:
             return ""
-        return _encode_cursor({**cursor_identity, "offset": offset})
+        return _encode_cursor(
+            cursor_identity,
+            offset_field="offset",
+            offset=offset,
+        )
 
     def build_payload(
         delivered: list[dict[str, Any]],
@@ -353,22 +448,19 @@ def project_bounded_text(
     }
     start = 0
     if continuation:
-        state = _decode_cursor(continuation)
-        for field, expected in cursor_identity.items():
-            if state.get(field) != expected:
-                raise ValueError(
-                    "bounded-text continuation does not match query/task/frontier"
-                )
-        try:
-            start = int(state.get("byte_offset"))
-        except (TypeError, ValueError) as exc:
-            raise ValueError("bounded-text continuation offset is invalid") from exc
+        start = _decode_cursor(
+            continuation,
+            identity=cursor_identity,
+            offset_field="byte_offset",
+        )
         if start < 0 or start > len(source_bytes):
-            raise ValueError("bounded-text continuation offset is invalid")
+            raise BoundedContinuationError(
+                "bounded-text continuation offset is invalid"
+            )
         try:
             source_bytes[:start].decode("utf-8")
         except UnicodeDecodeError as exc:
-            raise ValueError(
+            raise BoundedContinuationError(
                 "bounded-text continuation is not on a UTF-8 boundary"
             ) from exc
 
@@ -377,7 +469,11 @@ def project_bounded_text(
     def cursor_for(end: int) -> str:
         if end >= len(source_bytes):
             return ""
-        return _encode_cursor({**cursor_identity, "byte_offset": end})
+        return _encode_cursor(
+            cursor_identity,
+            offset_field="byte_offset",
+            offset=end,
+        )
 
     def build_payload(chunk: str, end: int) -> dict[str, Any]:
         chunk_bytes = len(chunk.encode("utf-8"))
@@ -454,6 +550,8 @@ def project_bounded_text(
 __all__ = [
     "BOUNDED_TOOL_PROJECTION_SCHEMA",
     "BOUNDED_TOOL_PROJECTION_VERSION",
+    "BOUNDED_TOOL_CURSOR_VERSION",
+    "BoundedContinuationError",
     "CHAT_TOOL_RESULT_MAX_BYTES",
     "CORE_TOOL_RESULT_MAX_BYTES",
     "MIN_TOOL_RESULT_MAX_BYTES",
