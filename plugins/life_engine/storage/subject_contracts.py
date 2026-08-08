@@ -279,6 +279,19 @@ class SubjectDocumentStorePort(SubjectAuthorityPort, Protocol):
     ) -> None:
         """Persist a bounded projection failure without changing history."""
 
+    async def heal_projection(
+        self,
+        task: SubjectProjectionTask,
+        *,
+        worker_id: str,
+    ) -> None:
+        """Rebuild a legacy pending/failed projection outbox row as confirmed.
+
+        MySQL-only self-healing for reconstructible projection state; the
+        authoritative version bytes are already persisted. LOCAL backend keeps
+        ``failed`` as a legitimate terminal state and never calls this.
+        """
+
     async def health_snapshot(self) -> dict[str, Any]:
         """Return bounded counts and projection backlog diagnostics."""
 

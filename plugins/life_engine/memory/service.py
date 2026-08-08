@@ -990,7 +990,7 @@ class LifeMemoryService:
                 progress.unchanged_documents += 1
             progress.processed_documents += 1
             if progress.processed_documents % 64 == 0:
-                logger.info(
+                logger.debug(
                     "Memory workspace recovery progress: "
                     f"documents={progress.processed_documents}/"
                     f"{progress.total_documents} indexed={progress.indexed_documents} "
@@ -1191,7 +1191,7 @@ class LifeMemoryService:
             progress.artifact_processed += 1
             progress.artifact_versions_appended = appended
             if progress.artifact_processed % 64 == 0:
-                logger.info(
+                logger.debug(
                     "Memory artifact recovery progress: "
                     f"artifacts={progress.artifact_processed}/"
                     f"{progress.artifact_total} appended={appended}"
@@ -1213,7 +1213,7 @@ class LifeMemoryService:
             progress.artifact_processed += 1
             progress.artifact_versions_appended = appended
             if progress.artifact_processed % 64 == 0:
-                logger.info(
+                logger.debug(
                     "Memory artifact recovery progress: "
                     f"artifacts={progress.artifact_processed}/"
                     f"{progress.artifact_total} appended={appended}"
@@ -1361,6 +1361,15 @@ class LifeMemoryService:
         if storage is None or self._closing:
             raise RuntimeError("记忆存储尚未初始化或正在关闭")
         return storage
+
+    async def read_chunk_index_state(self) -> ChunkIndexState | None:
+        """返回权威 chunk 索引配置（model/dimension）。
+
+        投影 frontier 的 config_digest 必须让空批次（report 无 model/dimension）
+        观察到与真实批次相同的配置；本方法提供该权威来源。生产 MySQL 后端
+        通过 ``document_index.read_chunk_index_state()`` 读取 memory_index_state。
+        """
+        return await self._require_memory_storage().document_index.read_chunk_index_state()
 
     async def close(self) -> None:
         """幂等释放 Memory 自有资源；注入的 coherent runtime 由 Life Engine 关闭。"""

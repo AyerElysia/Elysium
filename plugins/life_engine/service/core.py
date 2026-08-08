@@ -154,6 +154,7 @@ from .world_projection import (
     WORLD_LEGACY_IMPORT_EVENT,
     WORLD_OBSERVATION_EVENT,
     WORLD_PROJECTION_DB_FILE,
+    PerceptionCursorConflict,
     WorldProjectionStore,
     legacy_snapshot_assertions,
     reject_prompt_projection_persistence,
@@ -178,6 +179,29 @@ _USER_TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "templates" / "USER.
 LIFE_CHATTER_WORLD_MAX_BYTES = 32 * 1024
 LIFE_CHATTER_PROJECTED_SUFFIX_MAX_BYTES = 60 * 1024
 LIFE_CHATTER_EFFECTIVE_TEXT_MAX_BYTES = 64 * 1024
+
+
+def _stable_text_digest(text: str) -> str:
+    """Content-free digest for one heartbeat model reply."""
+    return hashlib.sha256(
+        str(text or "").encode("utf-8", errors="replace")
+    ).hexdigest()
+
+
+# 多写者心跳被其他实例认领（或已完成）时返回的空准备上下文。
+# 调用方仅读取 content/selected_event_ids 用于日志，绝不提交。
+_SKIPPED_HEARTBEAT_PREPARED = PreparedHeartbeatContext(
+    content="",
+    snapshot_high_water=0,
+    selected_event_ids=[],
+    acknowledged_event_ids=[],
+    summary_event_ids=[],
+    before_chars=0,
+    after_chars=0,
+    dropped_count=0,
+    target_reached=False,
+    updated_summary=SubconsciousSummary(),
+)
 
 
 def _validate_content_free_sha256(value: str, *, field_name: str) -> str:
@@ -435,6 +459,12 @@ class LifeEngineService(BaseService):
             f"{self._storage_factory_settings.authority_owner_id}:"
             f"pid-{os.getpid()}:{uuid4().hex[:16]}"
         )
+        self._multi_writer_bridge: Any | None = None
+        self._inbound_fact_hook: Any | None = None
+        self._outbox_intent_hook: Any | None = None
+        self._outbox_settle_hook: Any | None = None
+        # 本节点记忆索引投影的连续 frontier（进程内计数，严格 +1 推进）。
+        self._projection_frontier: int = 0
         self._subject_workspace_observer: Any | None = None
         self._subject_workspace_projector: Any | None = None
         self._storage_health_cache: dict[str, Any] = {
@@ -854,6 +884,38 @@ class LifeEngineService(BaseService):
 
         await self._open_selected_storage_runtime()
         runtime = self.storage_runtime
+        multi_writer_enabled = bool(
+            self._storage_factory_settings.multi_writer_enabled
+        )
+        if multi_writer_enabled:
+            from ..storage.multi_writer_protocol import (
+                MULTI_WRITER_HOT_PATHS_READY,
+                MULTI_WRITER_PROTOCOL_VERSION,
+                MultiWriterProtocolConfig,
+                observe_multi_writer_state,
+                validate_multi_writer_readiness,
+            )
+
+            observed = await observe_multi_writer_state(runtime)
+            generation_schema_version = int(
+                getattr(getattr(runtime, "generation", None), "schema_version", 0)
+            )
+            # Generation 尚无独立持久化的 protocol_version 字段，观测值只能用
+            # 工程内固定协议合同版本，不得用节点配置自证；配置与合同不一致时
+            # 由 MultiWriterProtocolConfig.validate() 拒绝。
+            validate_multi_writer_readiness(
+                config=MultiWriterProtocolConfig(
+                    protocol_version=(
+                        self._storage_factory_settings.multi_writer_protocol_version
+                    ),
+                    require_singleton_retired=True,
+                    allow_legacy_global_snapshot_writer=False,
+                ),
+                generation_schema_version=generation_schema_version,
+                observed_protocol_version=MULTI_WRITER_PROTOCOL_VERSION,
+                singleton_retired=observed.legacy_singleton_retired,
+                hot_paths_ready=MULTI_WRITER_HOT_PATHS_READY,
+            )
         ledger = await open_life_event_store(
             runtime,
             initialize_schema=False,
@@ -870,12 +932,14 @@ class LifeEngineService(BaseService):
             runtime,
             initialize_schema=False,
         )
-        runtime_context_writer_claim = await runtime.acquire_singleton_writer(
-            namespace="life_engine.runtime_context",
-            state_key="global",
-            owner_instance_id=self._storage_writer_instance_id,
-            lease_seconds=self._storage_factory_settings.authority_lease_seconds,
-        )
+        runtime_context_writer_claim = None
+        if not multi_writer_enabled:
+            runtime_context_writer_claim = await runtime.acquire_singleton_writer(
+                namespace="life_engine.runtime_context",
+                state_key="global",
+                owner_instance_id=self._storage_writer_instance_id,
+                lease_seconds=self._storage_factory_settings.authority_lease_seconds,
+            )
         attention_stores = await open_attention_thread_stores(
             runtime,
             initialize_schema=False,
@@ -897,12 +961,20 @@ class LifeEngineService(BaseService):
                 LEARNING_WRITER_CLAIM_STATE_KEY,
             )
 
-            learning_writer_claim = await runtime.acquire_singleton_writer(
-                namespace=LEARNING_WRITER_CLAIM_NAMESPACE,
-                state_key=LEARNING_WRITER_CLAIM_STATE_KEY,
-                owner_instance_id=self._storage_writer_instance_id,
-                lease_seconds=self._storage_factory_settings.authority_lease_seconds,
-            )
+            # Multi-writer generations share the learning domain across nodes
+            # (spec 5.2 / 16.2): the generation-scoped singleton claim and its
+            # database guard are retired, so no claim is acquired and no
+            # binding is verified.  Occurrence identity and projection
+            # revision/CAS remain the write-conflict boundary.
+            if not multi_writer_enabled:
+                learning_writer_claim = await runtime.acquire_singleton_writer(
+                    namespace=LEARNING_WRITER_CLAIM_NAMESPACE,
+                    state_key=LEARNING_WRITER_CLAIM_STATE_KEY,
+                    owner_instance_id=self._storage_writer_instance_id,
+                    lease_seconds=self._storage_factory_settings.authority_lease_seconds,
+                )
+            else:
+                learning_writer_claim = None
             learning_stores = await open_learning_stores(
                 runtime,
                 initialize_schema=False,
@@ -935,11 +1007,73 @@ class LifeEngineService(BaseService):
         self._event_bus = event_bus
         self._world_projection = stores.world
         self._perception_gateway = gateway
+        if multi_writer_enabled:
+            await self._attach_multi_writer_bridge(runtime)
         self._storage_health_cache = {
             "status": "healthy",
             "backend": self._storage_factory_settings.authoritative_backend.value,
             "reason": "selected storage startup probes completed; full health is on demand",
         }
+
+    async def _attach_multi_writer_bridge(self, runtime: Any) -> None:
+        """Create the hot-path bridge and register core transport hooks.
+
+        The bridge is the only surface through which production hot paths
+        touch the multi-writer stores.  It is registered into the core
+        transport hook slots so inbound facts and outbox intents are recorded
+        without core depending on the plugin; shutdown unregisters them.
+        """
+        from src.core.transport.multi_writer_hooks import (
+            register_inbound_fact_hook,
+            register_outbox_intent_hook,
+            register_outbox_settle_hook,
+        )
+        from ..storage import (
+            MULTI_WRITER_PROTOCOL_VERSION,
+            InstanceIdentity,
+            MultiWriterHotPathBridge,
+            compute_config_digest,
+            generate_boot_id,
+        )
+
+        identity = InstanceIdentity(
+            deployment_id=str(
+                self._storage_factory_settings.authority_owner_id or "elysium"
+            ),
+            instance_id=self._storage_writer_instance_id,
+            boot_id=generate_boot_id(),
+            owner_id=str(
+                self._storage_factory_settings.authority_owner_id or "elysium"
+            ),
+            protocol_version=int(MULTI_WRITER_PROTOCOL_VERSION),
+            schema_generation=str(
+                getattr(getattr(runtime, "generation", None), "generation_id", "")
+                or "unknown"
+            ),
+            config_digest=compute_config_digest(
+                {
+                    "backend": self._storage_factory_settings.authoritative_backend.value,
+                    "backend_generation": self._storage_factory_settings.backend_generation,
+                    "protocol_version": self._storage_factory_settings.multi_writer_protocol_version,
+                    "registry_id": self._storage_factory_settings.registry_id,
+                    "schema_version": self._storage_factory_settings.schema_version,
+                }
+            ),
+            workspace_revision="workspace-v1",
+        )
+        identity.validate()
+        bridge = MultiWriterHotPathBridge(runtime, identity)
+        self._multi_writer_bridge = bridge
+        self._inbound_fact_hook = bridge.record_inbound_message
+        self._outbox_intent_hook = bridge.enqueue_outbox_action
+        self._outbox_settle_hook = bridge.settle_outbox_action
+        register_inbound_fact_hook(self._inbound_fact_hook)
+        register_outbox_intent_hook(self._outbox_intent_hook)
+        register_outbox_settle_hook(self._outbox_settle_hook)
+        logger.info(
+            "multi-writer hot-path bridge attached: "
+            f"owner={identity.short_owner}, node={bridge.node_id}"
+        )
 
     async def _renew_storage_authority_loop(self) -> None:
         """Keep the selected writer lease current and fail closed on loss."""
@@ -1076,6 +1210,26 @@ class LifeEngineService(BaseService):
         self._learning_writer_claim = None
         self._learning_stores = None
         self._attention_thread_service = None
+        if self._multi_writer_bridge is not None:
+            try:
+                from src.core.transport.multi_writer_hooks import (
+                    unregister_inbound_fact_hook,
+                    unregister_outbox_intent_hook,
+                    unregister_outbox_settle_hook,
+                )
+
+                if self._inbound_fact_hook is not None:
+                    unregister_inbound_fact_hook(self._inbound_fact_hook)
+                if self._outbox_intent_hook is not None:
+                    unregister_outbox_intent_hook(self._outbox_intent_hook)
+                if self._outbox_settle_hook is not None:
+                    unregister_outbox_settle_hook(self._outbox_settle_hook)
+            except Exception as exc:  # noqa: BLE001 - aggregate owned cleanup
+                errors.append(exc)
+            self._multi_writer_bridge = None
+            self._inbound_fact_hook = None
+            self._outbox_intent_hook = None
+            self._outbox_settle_hook = None
         if runtime is not None:
             try:
                 await runtime.close()
@@ -1156,6 +1310,21 @@ class LifeEngineService(BaseService):
         task = await store.get_projection_task(logical_path, version_id)
         if task is None or task.state != "confirmed":
             state = "missing" if task is None else task.state
+            # MySQL 后端不运行 workspace projector：outbox 由 append 时直接
+            # 写为 confirmed。遗留的 failed/pending 是历史迁移残留或异常数据，
+            # 权威版本字节已在 subject_document_versions 中，属于可重建投影损坏。
+            # 这里自愈为 confirmed（重建投影），避免调用方无限重试刷屏。
+            if getattr(store, "backend", None) == BackendKind.MYSQL:
+                if task is not None and task.state in {"pending", "failed"}:
+                    await store.heal_projection(
+                        task, worker_id="projection-self-heal"
+                    )
+                return {
+                    "status": "remote_current_head",
+                    "logical_path": logical_path,
+                    "version_id": version_id,
+                    "projection_self_healed": True,
+                }
             raise RuntimeError(
                 f"SubjectRemoteHeadNotConfirmed: {logical_path}:{version_id}:{state}"
             )
@@ -2152,7 +2321,10 @@ class LifeEngineService(BaseService):
             changed = self._clear_self_pause_state()
         if changed:
             self._self_pause_skip_logged = False
-            await self._save_runtime_context()
+            # 手动解除休息锁已在本实例生效，持久化冲突属双实例合法竞争，可恢复。
+            await self._save_runtime_context(
+                recoverable_on_shared_conflict=True
+            )
             logger.info(f"life_engine 主动休息锁已解除: source={source}")
         return changed
 
@@ -2170,7 +2342,9 @@ class LifeEngineService(BaseService):
                 reason=reason,
             )
 
-        await self._save_runtime_context()
+        await self._save_runtime_context(
+            recoverable_on_shared_conflict=True
+        )
         # 进入休息只报一次；心跳循环里用此标记静默跳过，不再每 tick 刷 remaining。
         self._self_pause_skip_logged = True
         logger.info(
@@ -2437,7 +2611,11 @@ class LifeEngineService(BaseService):
             self._state.pending_event_count = len(self._pending_events)
         await self._publish_raw_events([event])
         if persist:
-            await self._save_runtime_context()
+            # 事件事实已通过 raw bus / multi-writer bridge 持久化，这里只是本地
+            # pending 队列 checkpoint；共享多写者模式下冲突属合法竞争，可恢复。
+            await self._save_runtime_context(
+                recoverable_on_shared_conflict=True
+            )
 
     def _serialize_stream_message(
         self,
@@ -3416,7 +3594,13 @@ class LifeEngineService(BaseService):
         await self._publish_message_facts(event, chat_fact)
         _phase_facts = time.monotonic() - _facts_start
         _ctx_start = time.monotonic()
-        await self._save_runtime_context()
+        # 消息事实已通过 multi-writer bridge 的 operation/fact 持久化，这里
+        # 保存的只是本地技术 checkpoint（global revision 推进）。双实例共享
+        # MySQL 下该 key 必然并发竞争，冲突属合法竞争，走 recoverable 语义，
+        # 避免并发提交把消息收集路径打成 message_collect_failed。
+        await self._save_runtime_context(
+            recoverable_on_shared_conflict=True
+        )
         _phase_context = time.monotonic() - _ctx_start
         if direction == "received":
             self._schedule_curiosity_review(message, event)
@@ -4892,7 +5076,11 @@ class LifeEngineService(BaseService):
             latest[sid] = compact_snapshot
             latest[LIFE_CHATTER_GLOBAL_CURSOR_KEY] = compact_snapshot
             self._state.last_chatter_think_by_stream = latest
-        await self._save_runtime_context()
+        # chatter 思考快照属可重建投影；共享多写者模式并发冲突时可恢复，
+        # 采纳远端值不会丢失权威消息事实。
+        await self._save_runtime_context(
+            recoverable_on_shared_conflict=True
+        )
 
         return {
             "stream_id": sid,
@@ -5026,7 +5214,12 @@ class LifeEngineService(BaseService):
         publish_raw: bool = True,
         persist: bool = True,
     ) -> None:
-        """将事件追加到原始历史；确认后的压缩由 heartbeat commit 统一执行。"""
+        """将事件追加到原始历史；确认后的压缩由 heartbeat commit 统一执行。
+
+        ``persist=True`` 仅被心跳 round 内调用方使用（后台智能体/使命结果、
+        心跳模型回复），共享多写者模式下 CAS 冲突是可恢复的合法竞争，因此
+        持久化走 recoverable 语义，避免并发提交导致整轮心跳失败。
+        """
         if not events:
             return
 
@@ -5039,7 +5232,9 @@ class LifeEngineService(BaseService):
         if publish_raw:
             await self._publish_raw_events(events)
         if persist:
-            await self._save_runtime_context()
+            await self._save_runtime_context(
+                recoverable_on_shared_conflict=True
+            )
 
     async def _prepare_heartbeat_context(self) -> PreparedHeartbeatContext:
         """Drain pending events and prepare one fixed heartbeat snapshot."""
@@ -5056,7 +5251,9 @@ class LifeEngineService(BaseService):
         pending = await self.drain_pending_events()
         if pending:
             await self._append_history(pending, publish_raw=False, persist=False)
-            await self._save_runtime_context()
+            await self._save_runtime_context(
+                recoverable_on_shared_conflict=True
+            )
 
         async with self._get_lock():
             snapshot_events = list(self._event_history)
@@ -5116,10 +5313,22 @@ class LifeEngineService(BaseService):
                 raise PerceptionDeliveryUnverified(
                     "heartbeat commit requires exact World delivery proof"
                 )
-            await self.commit_perception(
-                prepared.world_perception,
-                perception_receipt,
-            )
+            try:
+                await self.commit_perception(
+                    prepared.world_perception,
+                    perception_receipt,
+                )
+            except PerceptionCursorConflict as conflict:
+                # 多写者合法竞争：另一个实例已推进同一感知游标（双实例各自
+                # 维护 heartbeat_count，并行心跳共享 life_engine_subconscious
+                # 游标，必然交错）。本实例的感知交付已过时，跳过提交即可；
+                # 模型输出是主体真实产出，必须照常写入事件时间线，不能被
+                # 竞争误判为心跳失败而丢弃（否则 heartbeat operation 被标
+                # failed，下轮重放同一 sequence 导致重复模型调用）。
+                logger.info(
+                    "life_engine 感知游标已被其他实例推进，跳过本轮感知提交: "
+                    f"{conflict}"
+                )
         reply_text = str(model_reply or "").strip()
         heartbeat_event: LifeEngineEvent | None = None
         if reply_text:
@@ -5202,7 +5411,9 @@ class LifeEngineService(BaseService):
 
         if heartbeat_event is not None:
             await self._publish_raw_events([heartbeat_event])
-        await self._save_runtime_context()
+        await self._save_runtime_context(
+            recoverable_on_shared_conflict=True
+        )
 
     async def _prepare_and_commit_heartbeat_context(
         self,
@@ -5230,7 +5441,10 @@ class LifeEngineService(BaseService):
             self._state.event_sequence = 0
             self._state.heartbeat_context_cursor = 0
             self._state.subconscious_summary = {}
-        await self._save_runtime_context()
+        # 清理上下文属技术 checkpoint，共享多写者模式冲突可恢复。
+        await self._save_runtime_context(
+            recoverable_on_shared_conflict=True
+        )
 
     def _build_wake_context_text(self, events: list[LifeEngineEvent]) -> str:
         """把事件流拼成可注入的上下文文本。
@@ -5631,7 +5845,17 @@ class LifeEngineService(BaseService):
                 "chatter runtime commit requires an exact effective-context receipt"
             )
 
-        await self.commit_perception(prepared, receipt)
+        try:
+            await self.commit_perception(prepared, receipt)
+        except PerceptionCursorConflict as conflict:
+            # 双实例共享 MySQL 时 chat_global 感知游标必然交错；本实例感知
+            # 提交若发现游标已被另一实例推进，属合法竞争。表达消息已通过
+            # bridge/event 事实落库，感知游标只是可重建投影指针——跳过感知
+            # 提交、保留主体产出即可，不能把竞争误判为表达失败刷 ERROR。
+            logger.warning(
+                "life_chatter 感知游标已被其他实例推进，跳过本轮感知提交: "
+                f"{conflict}"
+            )
         async with self._get_lock():
             event_cursors = self._state.chatter_context_cursors
             event_cursors[sid] = max(
@@ -7230,8 +7454,21 @@ class LifeEngineService(BaseService):
 
         self._state_dirty = False
 
-    async def _save_runtime_context(self) -> None:
-        """持久化当前上下文。"""
+    async def _save_runtime_context(
+        self,
+        *,
+        recoverable_on_shared_conflict: bool = False,
+    ) -> None:
+        """持久化当前上下文。
+
+        Args:
+            recoverable_on_shared_conflict: 透传给
+                ``StatePersistence.save_runtime_context``。仅 shared 多写者
+                模式生效：为 True 时合并重试窗口内的 CAS 冲突视为合法竞争
+                （采纳远端最新值，不抛错、不置脏），供心跳等可恢复技术
+                checkpoint 使用；为 False 时保持精确持久化语义，供 chatter
+                checkpoint 等必须耐久写入的路径使用。
+        """
         from .state_manager import PersistenceError
 
         if self._state_persistence is None:
@@ -7248,6 +7485,7 @@ class LifeEngineService(BaseService):
                 self._state,
                 self._pending_events,
                 self._event_history,
+                recoverable_on_shared_conflict=recoverable_on_shared_conflict,
             )
             if not cleaned_atomically:
                 self._state_dirty = False
@@ -7718,7 +7956,11 @@ class LifeEngineService(BaseService):
             logger.debug(f"清理自主意向调度失败: {exc}")
         self._stop_event = None
         unregister_life_engine_service()
-        await self._save_runtime_context()
+        # 关闭路径的最终 checkpoint：双实例同时关闭时冲突属合法竞争，可恢复，
+        # 避免关闭流程被 RuntimeStateConflict 打断刷 ERROR。
+        await self._save_runtime_context(
+            recoverable_on_shared_conflict=True
+        )
         try:
             await self._close_selected_storage()
         except Exception as exc:  # noqa: BLE001 - finish remaining shutdown
@@ -7753,6 +7995,44 @@ class LifeEngineService(BaseService):
             heartbeat_run_id = (
                 f"heartbeat-{self._state.heartbeat_count}-{uuid4().hex[:12]}"
             )
+
+            # 多写者：注册并认领本序列的 heartbeat operation。同一
+            # consciousness instance 的同一 sequence 只有一个 owner；被其他
+            # 实例认领（或已完成）时本实例跳过本轮，避免重复模型调用。
+            bridge = self._multi_writer_bridge
+            heartbeat_claim = None
+            heartbeat_input_cursor = int(self._state.heartbeat_context_cursor or 0)
+            if bridge is not None and getattr(bridge, "enabled", False):
+                try:
+                    await bridge.register_heartbeat_operation(
+                        consciousness_instance_id="chat_global",
+                        sequence=self._state.heartbeat_count,
+                        input_frontier={
+                            "sequence": self._state.heartbeat_count,
+                            "cursor": heartbeat_input_cursor,
+                            "pending": int(self._state.pending_event_count or 0),
+                            "node": bridge.node_id,
+                        },
+                        prepared_context_digest="",
+                    )
+                    heartbeat_claim = await bridge.claim_heartbeat_operation(
+                        consciousness_instance_id="chat_global",
+                        sequence=self._state.heartbeat_count,
+                        lease_seconds=(
+                            self._storage_factory_settings.authority_lease_seconds
+                        ),
+                    )
+                except Exception as exc:  # noqa: BLE001 - degrade to legacy path
+                    logger.warning(
+                        f"多写者 heartbeat operation 认领异常，继续单实例路径: {exc}"
+                    )
+                    heartbeat_claim = None
+                if heartbeat_claim is None:
+                    logger.info(
+                        f"life_engine heartbeat #{self._state.heartbeat_count} "
+                        f"已被其他实例认领或已完成，跳过本轮"
+                    )
+                    return "", _SKIPPED_HEARTBEAT_PREPARED
 
             try:
                 if self._memory_integration is not None:
@@ -7803,6 +8083,18 @@ class LifeEngineService(BaseService):
                         f"life_engine 心跳 #{self._state.heartbeat_count} "
                         f"LLM 总预算 {_heartbeat_llm_budget:.0f}s 超时，跳过本轮"
                     )
+                    if heartbeat_claim is not None and bridge is not None:
+                        try:
+                            await bridge.mark_heartbeat_operation_failed(
+                                consciousness_instance_id="chat_global",
+                                sequence=self._state.heartbeat_count,
+                                claim_epoch=heartbeat_claim.claim_epoch,
+                                retryable=True,
+                            )
+                        except Exception as mark_exc:  # noqa: BLE001
+                            logger.warning(
+                                f"多写者 heartbeat 超时释放异常: {mark_exc}"
+                            )
                     return "", prepared
                 model_reply = model_result.text
                 await self._record_model_reply(
@@ -7816,6 +8108,26 @@ class LifeEngineService(BaseService):
                     heartbeat_run_id,
                     model_result.perception_receipt,
                 )
+                # 多写者：提交 heartbeat checkpoint（失败不推进 frontier，
+                # 已完成的重试返回既有结果）。
+                if heartbeat_claim is not None and bridge is not None:
+                    committed = await bridge.commit_heartbeat_operation(
+                        consciousness_instance_id="chat_global",
+                        sequence=self._state.heartbeat_count,
+                        claim_epoch=heartbeat_claim.claim_epoch,
+                        input_frontier=heartbeat_input_cursor,
+                        committed_frontier=int(
+                            self._state.heartbeat_context_cursor or 0
+                        ),
+                        result_ref=f"heartbeat://{heartbeat_run_id}",
+                        result_digest=_stable_text_digest(str(model_reply or "")),
+                    )
+                    if committed is None:
+                        logger.warning(
+                            "多写者 heartbeat checkpoint 提交失败"
+                            f"（#{self._state.heartbeat_count}），frontier 未推进；"
+                            "结果仍按单实例语义落库，下次心跳可重放"
+                        )
 
                 # 交互结束 → 触发学习系统快环反思（后台非阻塞）
                 if (
@@ -7841,8 +8153,81 @@ class LifeEngineService(BaseService):
                 raise
             except Exception as exc:  # noqa: BLE001
                 self._state.last_model_error = str(exc)
-                await self._save_runtime_context()
+                await self._save_runtime_context(
+                    recoverable_on_shared_conflict=True
+                )
+                if heartbeat_claim is not None and bridge is not None:
+                    try:
+                        await bridge.mark_heartbeat_operation_failed(
+                            consciousness_instance_id="chat_global",
+                            sequence=self._state.heartbeat_count,
+                            claim_epoch=heartbeat_claim.claim_epoch,
+                            retryable=True,
+                        )
+                    except Exception as mark_exc:  # noqa: BLE001
+                        logger.warning(
+                            f"多写者 heartbeat 失败标记异常: {mark_exc}"
+                        )
                 raise
+
+    async def _advance_memory_projection(self, report: Any) -> None:
+        """Record this node's memory-index projection frontier (strict +1)."""
+        bridge = self._multi_writer_bridge
+        if bridge is None or not getattr(bridge, "enabled", False):
+            return
+        try:
+            backlog = 0
+            try:
+                pending_jobs = await self._memory_service.list_index_jobs(
+                    status="pending"
+                )
+                backlog = len(pending_jobs)
+            except Exception:  # noqa: BLE001 - backlog is advisory only
+                backlog = 0
+            source_digest = _stable_text_digest(
+                "memory_index"
+                f":claimed={int(getattr(report, 'claimed', 0) or 0)}"
+                f":completed={sorted(getattr(report, 'completed', ()) or ())}"
+                f":failed={sorted(getattr(report, 'failed', ()) or ())}"
+                f":stale={sorted(getattr(report, 'stale', ()) or ())}"
+            )
+            # config_digest 必须来自稳定的索引状态（memory_index_state），
+            # 而不是当前批次的 report：空批次（claimed=0 / 全 stale）时
+            # report.model_name/dimension 为空/0，若用它算 digest 会在批次
+            # 之间波动，导致投影推进被 ProjectionProgressConflict 永久拒绝。
+            model_name = str(getattr(report, "model_name", "") or "")
+            dimension = int(getattr(report, "dimension", 0) or 0)
+            if not model_name or dimension <= 0:
+                try:
+                    index_state = await self._memory_service.read_chunk_index_state()
+                except Exception:  # noqa: BLE001 - fall back to batch report
+                    index_state = None
+                if index_state is not None:
+                    model_name = str(index_state.model_name or model_name)
+                    dimension = int(index_state.dimension or dimension)
+            config_digest = _stable_text_digest(
+                "memory_index"
+                f":model={model_name}"
+                f":dim={dimension}"
+                ":workspace=workspace-v1"
+            )
+            advanced = await bridge.advance_projection(
+                projection_name="memory_index",
+                expected_frontier=self._projection_frontier,
+                next_frontier=self._projection_frontier + 1,
+                source_digest=source_digest,
+                config_digest=config_digest,
+                backlog=backlog,
+            )
+            if advanced is not None:
+                self._projection_frontier += 1
+            else:
+                logger.warning(
+                    "多写者记忆索引投影推进被拒绝（frontier 冲突或配置变化），"
+                    f"节点进度保持在 {self._projection_frontier}"
+                )
+        except Exception as exc:  # noqa: BLE001 - projection is best-effort
+            logger.warning(f"多写者记忆索引投影推进异常: {exc}")
 
     async def _memory_index_loop(self) -> None:
         """独立运行 chunk 向量索引，每轮最多处理一批。"""
@@ -7882,6 +8267,9 @@ class LifeEngineService(BaseService):
                         f"claimed={report.claimed} completed={len(report.completed)} "
                         f"failed={len(report.failed)} stale={len(report.stale)}"
                     )
+                    # 多写者：推进本节点记忆索引投影进度（frontier 严格 +1）。
+                    # 每个节点的 Chroma/FTS 是本地投影，进度行由该节点独占推进。
+                    await self._advance_memory_projection(report)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001

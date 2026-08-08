@@ -1702,6 +1702,54 @@ class SQLSubjectDocumentStore:
 
         await self._write(operation)
 
+    async def heal_projection(
+        self,
+        task: SubjectProjectionTask,
+        *,
+        worker_id: str,
+    ) -> None:
+        """Mark a legacy pending/failed projection as confirmed.
+
+        MySQL backend never runs a workspace projector: ``append_version`` writes
+        outbox rows directly as ``confirmed``. Rows left in ``pending``/``failed``
+        are historical migration residue or abnormal data; the authoritative
+        version bytes already live in ``subject_document_versions``. This healing
+        rebuilds the (reconstructible) projection outbox state without touching
+        history. LOCAL backend must keep ``failed`` as a legitimate terminal
+        state, so this method is intentionally only used under MySQL.
+        """
+        worker = str(worker_id).strip()
+        if not worker or len(worker) > 255:
+            raise ValueError("projection worker_id must be 1..255 characters")
+
+        async def operation(session: AsyncSession) -> None:
+            database_now = await self._database_now(session)
+            updated = await session.execute(
+                text(
+                    """UPDATE subject_projection_outbox SET
+                    state = 'confirmed', confirmed_at = :confirmed_at,
+                    lease_owner = '', lease_until = :empty_lease,
+                    last_error = '', revision = revision + 1
+                    WHERE outbox_id = :outbox_id
+                      AND state IN ('pending', 'failed')
+                      AND version_id = :version_id
+                      AND content_hash = :content_hash"""
+                ),
+                {
+                    "confirmed_at": self._bind_time(database_now),
+                    "empty_lease": (None if self.backend == BackendKind.MYSQL else ""),
+                    "outbox_id": task.outbox_id,
+                    "version_id": task.version_id,
+                    "content_hash": task.content_hash,
+                },
+            )
+            if updated.rowcount != 1:
+                raise SubjectDocumentConflict(
+                    "projection self-heal CAS failed"
+                )
+
+        await self._write(operation)
+
     async def health_snapshot(self) -> dict[str, Any]:
         async with self.runtime.unit_of_work() as uow:
             documents = int(

@@ -21,6 +21,58 @@ from .factory import (
     open_storage_backend,
     settings_from_life_engine_config,
 )
+from .multi_writer_protocol import (
+    LEGACY_RUNTIME_CONTEXT_NAMESPACE,
+    LEGACY_RUNTIME_CONTEXT_STATE_KEY,
+    MULTI_WRITER_PROTOCOL_VERSION,
+    MultiWriterProtocolConfig,
+    MultiWriterProtocolError,
+    MultiWriterRuntimeState,
+    observe_multi_writer_state,
+    validate_multi_writer_readiness,
+)
+from .heartbeat_adapters import SQLHeartbeatStore
+from .heartbeat_contracts import HeartbeatClaimLost, HeartbeatConflict, HeartbeatOperation, HeartbeatStatus
+from .message_stream_adapters import SQLMessageStreamStore
+from .message_stream_contracts import InboundMessage, MessageConflict, StreamTurn, TurnClaimLost, TurnStatus
+from .projection_progress import (
+    ProjectionProgress,
+    ProjectionProgressConflict,
+    SQLProjectionProgressStore,
+)
+from .outbox_contracts import (
+    OutboxAction,
+    OutboxClaimLost,
+    OutboxConflict,
+    OutboxStatus,
+    OutboxStorePort,
+    UnknownOutboxAction,
+)
+from .outbox_adapters import SQLOutboxStore
+from .operation_contracts import (
+    OperationClaimLost,
+    OperationConflict,
+    OperationReceipt,
+    OperationRecord,
+    OperationStatus,
+    RuntimeDelta,
+    RuntimeDeltaConflict,
+)
+from .operation_factory import open_operation_store
+from .multi_writer_health import (
+    MultiWriterHealthSnapshot,
+    ProjectionReadiness,
+    observe_multi_writer_health,
+)
+from .instance_identity import (
+    InstanceIdentity,
+    InstanceIdentityError,
+    assert_protocol_compatible,
+    compute_config_digest,
+    generate_boot_id,
+    json_identity_digest,
+)
+from .hot_path_bridge import MultiWriterHotPathBridge
 from .models import (
     AuthorityToken,
     BackendGeneration,
@@ -74,7 +126,53 @@ __all__ = [
     "LifeEventSnapshotSourcePort",
     "LifeEventStorePort",
     "LocalBackendSettings",
+    "MULTI_WRITER_PROTOCOL_VERSION",
+    "LEGACY_RUNTIME_CONTEXT_NAMESPACE",
+    "LEGACY_RUNTIME_CONTEXT_STATE_KEY",
+    "MultiWriterProtocolConfig",
+    "MultiWriterProtocolError",
+    "MultiWriterRuntimeState",
+    "MultiWriterHealthSnapshot",
+    "observe_multi_writer_health",
+    "observe_multi_writer_state",
+    "validate_multi_writer_readiness",
+    "ProjectionReadiness",
+    "HeartbeatClaimLost",
+    "HeartbeatConflict",
+    "HeartbeatOperation",
+    "HeartbeatStatus",
+    "SQLHeartbeatStore",
+    "InboundMessage",
+    "InstanceIdentity",
+    "InstanceIdentityError",
+    "assert_protocol_compatible",
+    "compute_config_digest",
+    "generate_boot_id",
+    "json_identity_digest",
+    "MessageConflict",
+    "MultiWriterHotPathBridge",
+    "SQLMessageStreamStore",
+    "StreamTurn",
+    "TurnClaimLost",
+    "TurnStatus",
     "MySQLBackendSettings",
+    "OutboxAction",
+    "OutboxClaimLost",
+    "OutboxConflict",
+    "OutboxStatus",
+    "OutboxStorePort",
+    "SQLOutboxStore",
+    "UnknownOutboxAction",
+    "OperationClaimLost",
+    "OperationConflict",
+    "OperationReceipt",
+    "OperationRecord",
+    "OperationStatus",
+    "ProjectionProgress",
+    "ProjectionProgressConflict",
+    "SQLProjectionProgressStore",
+    "RuntimeDelta",
+    "RuntimeDeltaConflict",
     "StorageAvailability",
     "StorageBackendRuntime",
     "StorageFactorySettings",
@@ -97,6 +195,7 @@ __all__ = [
     "SubjectWorkspaceObserver",
     "SubjectWorkspaceProjector",
     "open_life_event_store",
+    "open_operation_store",
     "open_storage_backend",
     "open_subject_document_store",
     "settings_from_life_engine_config",

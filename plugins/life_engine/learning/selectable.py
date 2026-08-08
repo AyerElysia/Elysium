@@ -372,8 +372,12 @@ class SelectedLearningPersistence:
                     buffered_event_count=len(events),
                     dirty_projections=dirty,
                 )
-                logger.error(
-                    "selected learning persistence failed closed after CAS: %s",
+                # 双实例共享 MySQL 时学习持久化投影的 CAS 冲突是合法竞争，
+                # 事件已放回缓冲保留待处理，属可恢复路径，用 WARNING 而非
+                # ERROR 避免后台持久化把日志刷成错误。
+                logger.warning(
+                    "selected learning persistence CAS 竞争（可恢复），"
+                    "事件保留待重试: %s",
                     self._failure.log_summary(),
                 )
                 raise
@@ -797,8 +801,12 @@ class SelectedLearningMaintenanceJournal(LearningMaintenanceJournalPort):
                     buffered_event_count=1,
                     dirty_projections={_MAINTENANCE_PROJECTION},
                 )
-                logger.error(
-                    "selected learning maintenance failed closed after CAS: %s",
+                # 双实例共享 MySQL 时学习维护投影的 CAS 冲突是合法竞争
+                # （两实例各自推进同一 projection revision），属可恢复路径，
+                # 用 WARNING 而非 ERROR 避免后台维护把日志刷成错误。
+                logger.warning(
+                    "selected learning maintenance CAS 竞争（可恢复），"
+                    "保留待处理工作: %s",
                     self._failure.log_summary(),
                 )
                 raise

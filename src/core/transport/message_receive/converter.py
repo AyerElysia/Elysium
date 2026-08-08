@@ -72,7 +72,22 @@ def _is_internal_target_id(value: Any) -> bool:
         raw in {"life_engine_nucleus", "system"}
         or raw.startswith("life_engine_")
         or raw.startswith(("p-", "g-"))
+        or _is_bot_placeholder_id(raw)
     )
+
+
+def _is_bot_placeholder_id(value: str) -> bool:
+    """识别适配器未配置真实 bot id 时的平台占位符。
+
+    例如飞书 `bot_open_id` 未配置时 `get_bot_info()` 返回
+    `"feishu_bot"`。这类 id 是 bot 自己，绝不能作为发送目标。
+    真实平台 id（如 kook `self._bot_id`、napcat `qq_id`）不含
+    `_bot` 后缀，不会被误判。
+    """
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return False
+    return raw == "bot" or raw.endswith("_bot")
 
 
 def _safe_copy_media_data(value: Any, memo: dict[int, Any] | None = None) -> Any:

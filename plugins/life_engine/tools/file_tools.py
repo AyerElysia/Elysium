@@ -880,6 +880,52 @@ class LifeEngineReadFileTool(BaseTool):
                 return False, "read file projection exceeded its byte budget"
 
             return True, result_data
+        except ValueError as e:
+            if str(e) != "bounded-text continuation does not match query/task/frontier":
+                logger.error(f"读取文件失败 {path}: {e}", exc_info=True)
+                return False, f"读取文件失败: {e}"
+            # continuation 过期（任务切换 / 文件变更 / frontier 变化）：
+            # 丢弃 cursor 从头重新投影一次，而不是让整个工具调用失败。
+            logger.debug(
+                f"读取文件 continuation 过期，已重置从头读取: path={path}"
+            )
+            try:
+                result_data = project_bounded_text(
+                    projection_name="workspace-file-read",
+                    task_name=getattr(self, "_runtime_task_name", ""),
+                    requested_max_bytes=max_bytes,
+                    binding={
+                        "path": normalized_path,
+                        "offset": int(offset),
+                        "limit": int(limit),
+                        "encoding": str(encoding),
+                    },
+                    frontier={
+                        "path": normalized_path,
+                        "size": stat.st_size,
+                        "mtime_ns": stat.st_mtime_ns,
+                        "content_sha256": file_sha256,
+                    },
+                    base_payload={
+                        **base_payload,
+                        "continuation_discarded": True,
+                    },
+                    content=numbered_content,
+                    content_ref=(
+                        f"workspace-file:{normalized_path}:sha256:{file_sha256}"
+                    ),
+                    continuation="",
+                )
+                if len(str(result_data).encode("utf-8")) > result_data["budget_bytes"]:
+                    return False, "read file projection exceeded its byte budget"
+                return True, result_data
+            except Exception as retry_error:  # noqa: BLE001
+                logger.error(
+                    f"读取文件失败 {path}（continuation 重置后仍失败）: "
+                    f"{retry_error}",
+                    exc_info=True,
+                )
+                return False, f"读取文件失败: {retry_error}"
         except UnicodeDecodeError as e:
             return False, f"文件编码错误，请尝试其他编码: {e}"
         except Exception as e:

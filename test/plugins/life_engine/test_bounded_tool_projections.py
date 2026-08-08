@@ -279,9 +279,10 @@ async def test_read_file_limit_zero_uses_utf8_safe_bounded_pages(
 
 
 @pytest.mark.asyncio
-async def test_read_file_rejects_continuation_after_file_change(
+async def test_read_file_resets_continuation_after_file_change(
     tmp_path: Path,
 ) -> None:
+    """文件变更后旧 continuation 失效：工具丢弃 cursor 从头重读，不整体失败。"""
     target = tmp_path / "changing.txt"
     target.write_text("旧内容" * 10000, encoding="utf-8")
     tool = LifeEngineReadFileTool(plugin=_workspace_plugin(tmp_path))
@@ -293,13 +294,16 @@ async def test_read_file_rejects_continuation_after_file_change(
     assert first["continuation"]
     target.write_text("新内容" * 10000, encoding="utf-8")
 
-    ok, error = await tool.execute(
+    ok, payload = await tool.execute(
         path="changing.txt",
         limit=0,
         continuation=first["continuation"],
     )
-    assert ok is False
-    assert "query/task/frontier" in str(error)
+    assert ok is True
+    assert isinstance(payload, dict)
+    # cursor 已丢弃并从头重读，payload 明确标注，模型可感知分页已重置。
+    assert payload.get("continuation_discarded") is True
+    assert payload["content"].startswith("1\t新内容")
 
 
 @pytest.mark.asyncio

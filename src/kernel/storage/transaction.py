@@ -9,6 +9,7 @@ from enum import StrEnum
 from types import TracebackType
 from typing import Any, Self
 
+from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 AfterCommit = Callable[[], Awaitable[None] | None]
@@ -112,10 +113,20 @@ class AsyncUnitOfWork:
             raise AfterCommitError(failures)
 
     async def rollback(self) -> None:
-        """Roll back one active transaction; repeated rollback is harmless."""
+        """Roll back one active transaction; repeated rollback is harmless.
 
+        A transaction may already be finished underneath this unit of work
+        (for example ``commit()`` reached the driver but raised afterwards, or
+        the server rolled it back).  In that case the rollback is a no-op and
+        must never raise a second exception that would hide the caller's
+        original failure.
+        """
         if self.state == UnitOfWorkState.ACTIVE and self._transaction is not None:
-            await self._transaction.rollback()
+            try:
+                await self._transaction.rollback()
+            except InvalidRequestError:
+                # 底层事务已结束（已提交/已关闭/不在事务中）：无需也无法回滚。
+                pass
             self.state = UnitOfWorkState.ROLLED_BACK
 
     async def close(self) -> None:
@@ -145,7 +156,17 @@ class AsyncUnitOfWork:
             else:
                 await self.rollback()
         finally:
-            await self.close()
+            # close() 的失败绝不能覆盖 commit()/rollback() 抛出的原始异常：
+            # 若 close 二次异常，附加到原始异常上继续传播。
+            try:
+                await self.close()
+            except BaseException as close_error:  # noqa: BLE001
+                if exc is None:
+                    raise close_error
+                try:
+                    exc.add_note(f"unit of work close failed: {close_error}")
+                except BaseException:  # noqa: BLE001 - notes may be unsupported
+                    pass
         return False
 
 

@@ -97,3 +97,70 @@ async def test_message_to_envelope_private_target_drops_internal_route_key(
     user_info = message_info.get("user_info")
     assert isinstance(user_info, dict)
     assert user_info.get("user_id") is None
+
+
+async def test_message_to_envelope_drops_bot_placeholder_sender_as_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """bot 占位 id（feishu_bot）绝不能被兜底为私聊发送目标。
+
+    回归：主动流（如 s-proactive）无真实目标时，若 sender_id 是
+    feishu_bot 占位符，converter 兜底必须跳过它，否则会把消息
+    发给 bot 自己（飞书 99992351 invalid open_id）。
+    """
+    converter = MessageConverter()
+    fake_stream_manager = SimpleNamespace(get_stream_info=AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        "src.core.managers.stream_manager.get_stream_manager",
+        lambda: fake_stream_manager,
+    )
+
+    message = Message(
+        message_id="m-bot-placeholder",
+        content="hello",
+        message_type=MessageType.TEXT,
+        sender_id="feishu_bot",
+        sender_name="爱莉",
+        platform="feishu",
+        chat_type="private",
+        stream_id="s-proactive",
+    )
+
+    envelope = await converter.message_to_envelope(message)
+
+    message_info = envelope.get("message_info")
+    assert isinstance(message_info, dict)
+    user_info = message_info.get("user_info")
+    assert isinstance(user_info, dict)
+    assert user_info.get("user_id") is None
+
+
+async def test_message_to_envelope_keeps_real_platform_id_as_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实平台用户 id（非 bot 占位）仍可作私聊兜底目标。"""
+    converter = MessageConverter()
+    fake_stream_manager = SimpleNamespace(get_stream_info=AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        "src.core.managers.stream_manager.get_stream_manager",
+        lambda: fake_stream_manager,
+    )
+
+    message = Message(
+        message_id="m-real-user",
+        content="hello",
+        message_type=MessageType.TEXT,
+        sender_id="ou_da5c1234567890",
+        sender_name="Alice",
+        platform="feishu",
+        chat_type="private",
+        stream_id="stream-private-3",
+    )
+
+    envelope = await converter.message_to_envelope(message)
+
+    message_info = envelope.get("message_info")
+    assert isinstance(message_info, dict)
+    user_info = message_info.get("user_info")
+    assert isinstance(user_info, dict)
+    assert user_info.get("user_id") == "ou_da5c1234567890"

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -29,6 +30,7 @@ from plugins.life_engine.service.perception_gateway import (
     PerceptionDeliveryReceipt,
     PerceptionDeliveryUnverified,
 )
+from plugins.life_engine.service.world_projection import PerceptionCursorConflict
 from src.core.config.core_config import CoreConfig
 from src.kernel.llm import ROLE, ToolRegistry
 
@@ -882,6 +884,64 @@ async def test_heartbeat_success_consumes_delta_without_replay(
     assert service._state.heartbeat_context_cursor >= event.sequence
 
 
+async def test_heartbeat_perception_cursor_conflict_keeps_model_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """多写者感知游标被其他实例推进时，心跳模型输出必须保留。
+
+    双实例各自维护 heartbeat_count，并行心跳共享 life_engine_subconscious
+    感知游标必然交错；commit_perception 抛 PerceptionCursorConflict 只说明
+    本实例的感知交付已过时，不应被误判为心跳失败——模型独白照常写入事件
+    时间线、delta 照常消费、heartbeat operation 正常提交，而不是丢输出 +
+    标 failed + 下轮重放同一 sequence 导致重复模型调用。
+    """
+    service = _make_service(tmp_path)
+    event = service._event_builder.build_dfc_message_event(
+        "竞争发生时这条 delta 仍应被消费",
+        stream_id="stream-1",
+    )
+    await service._queue_pending_event(event)
+
+    async def _conflicted_commit(
+        prepared: Any,
+        receipt: Any = None,
+    ) -> tuple[int, int]:
+        raise PerceptionCursorConflict(
+            "stale perception cursor for 'life_engine_subconscious': "
+            "expected (1, 1), actual (2, 2)"
+        )
+
+    monkeypatch.setattr(service, "commit_perception", _conflicted_commit)
+
+    async def _fake_model(
+        wake_context: str,
+        *,
+        heartbeat_run_id: str | None = None,
+        world_perception: Any = None,
+    ) -> HeartbeatModelResult:
+        return _heartbeat_result("竞争时保留的独白", world_perception)
+
+    monkeypatch.setattr(service, "_run_heartbeat_model", _fake_model)
+
+    reply, prepared = await service._run_heartbeat_round(
+        collect_background_agents=False,
+    )
+
+    assert reply == "竞争时保留的独白"
+    assert service._state.last_model_error is None
+    # 模型独白以 heartbeat 事件进入时间线，未被竞争丢弃
+    assert any(
+        item.content == "竞争时保留的独白"
+        and item.event_type == EventType.HEARTBEAT
+        for item in service._event_history
+    )
+    # 本轮 delta 被正常消费，游标推进
+    assert prepared.acknowledged_event_ids == [event.event_id]
+    assert event.heartbeat_context_consumed is True
+    assert service._state.heartbeat_context_cursor >= event.sequence
+
+
 async def test_heartbeat_failure_keeps_delta_for_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1341,3 +1401,112 @@ async def test_memory_index_loop_survives_provider_failure(
     await asyncio.wait_for(service._memory_index_loop(), timeout=1.0)
 
     assert fake_memory.run_calls == 2
+
+
+async def test_advance_memory_projection_builds_digest_and_advances(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """回归：_advance_memory_projection 必须把多字段拼成单个字符串再 digest。
+
+    此前把多个位置参数直接传给 _stable_text_digest(text)，导致
+    "takes 1 positional argument but 9 were given"，投影永远无法推进。
+    """
+    service = _make_service(tmp_path)
+
+    advanced: list[dict[str, object]] = []
+
+    class _FakeBridge:
+        enabled = True
+        node_id = "test-node"
+
+        async def advance_projection(self, **kwargs: object) -> object:
+            advanced.append(kwargs)
+            return SimpleNamespace(projection_name=kwargs["projection_name"])
+
+    service._multi_writer_bridge = _FakeBridge()  # type: ignore[assignment]
+
+    report = SimpleNamespace(
+        claimed=4,
+        completed=["a", "b"],
+        failed=["c"],
+        stale=[],
+        model_name="mimo-v2.5",
+        dimension=1024,
+    )
+
+    await service._advance_memory_projection(report)
+
+    assert len(advanced) == 1
+    call = advanced[0]
+    assert call["projection_name"] == "memory_index"
+    assert call["expected_frontier"] == 0
+    assert call["next_frontier"] == 1
+    assert isinstance(call["source_digest"], str) and call["source_digest"]
+    assert isinstance(call["config_digest"], str) and call["config_digest"]
+    assert call["source_digest"] != call["config_digest"]
+    # digest 应为 sha256 hex（64 字符）
+    assert len(call["source_digest"]) == 64
+    assert len(call["config_digest"]) == 64
+    assert service._projection_frontier == 1
+
+
+async def test_advance_memory_projection_config_digest_stable_on_empty_batches(
+    tmp_path: Path,
+) -> None:
+    """空批次（report 无 model/dimension）时 config_digest 必须与真实批次一致。
+
+    此前 config_digest 直接用 report.model_name/dimension，空批次（claimed=0
+    或全 stale）时为空/0，与有 embedding 的批次 digest 不同，导致投影推进
+    被 ProjectionProgressConflict 永久拒绝（"节点进度保持在 N"）。
+    """
+    service = _make_service(tmp_path)
+    advanced: list[dict[str, object]] = []
+
+    class _FakeBridge:
+        enabled = True
+        node_id = "test-node"
+
+        async def advance_projection(self, **kwargs: object) -> object:
+            advanced.append(kwargs)
+            return SimpleNamespace(projection_name=kwargs["projection_name"])
+
+    class _FakeMemory:
+        async def read_chunk_index_state(self) -> object:
+            return SimpleNamespace(model_name="mimo-v2.5", dimension=1024)
+
+    service._multi_writer_bridge = _FakeBridge()  # type: ignore[assignment]
+    service._memory_service = _FakeMemory()  # type: ignore[assignment]
+
+    empty_report = SimpleNamespace(claimed=0, completed=(), failed=(), stale=())
+    await service._advance_memory_projection(empty_report)
+    digest_empty = advanced[0]["config_digest"]
+    assert isinstance(digest_empty, str) and digest_empty
+
+    real_report = SimpleNamespace(
+        claimed=4,
+        completed=["a"],
+        failed=[],
+        stale=[],
+        model_name="mimo-v2.5",
+        dimension=1024,
+    )
+    await service._advance_memory_projection(real_report)
+    digest_real = advanced[1]["config_digest"]
+
+    # 空批次与真实批次的 config_digest 必须一致（来源稳定）。
+    assert digest_empty == digest_real
+
+
+async def test_advance_memory_projection_skips_when_bridge_disabled(
+    tmp_path: Path,
+) -> None:
+    """bridge 未启用时投影推进应直接跳过。"""
+    service = _make_service(tmp_path)
+    service._multi_writer_bridge = SimpleNamespace(  # type: ignore[assignment]
+        enabled=False,
+        advance_projection=AsyncMock(),
+    )
+    report = SimpleNamespace(claimed=0, completed=(), failed=(), stale=())
+    await service._advance_memory_projection(report)
+    service._multi_writer_bridge.advance_projection.assert_not_awaited()  # type: ignore[attr-defined]

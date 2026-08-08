@@ -1569,6 +1569,10 @@ class LifeChatter(BaseChatter):
     _GLOBAL_RUNTIME_LOCK_LOOP: asyncio.AbstractEventLoop | None = None
     _GLOBAL_RUNTIME: _WorkflowRuntime | None = None
     _GLOBAL_USABLE_MAP: Any | None = None
+    # 与 _GLOBAL_RUNTIME 同生命周期缓存的滚动上下文 DB revision。
+    # 多个聊天流共享同一主意识，后续流复用缓存后不再走加载分支，
+    # 必须从类属性取当前 revision，否则保存时 CAS 会与 DB 实际值冲突。
+    _GLOBAL_ROLLING_CONTEXT_REVISION: int = 0
 
     # ── helpers ──────────────────────────────────────────────
 
@@ -1590,6 +1594,7 @@ class LifeChatter(BaseChatter):
         """清空 life_chatter 全局 LLM 上下文。插件卸载或测试可调用。"""
         cls._GLOBAL_RUNTIME = None
         cls._GLOBAL_USABLE_MAP = None
+        cls._GLOBAL_ROLLING_CONTEXT_REVISION = 0
 
     def _configured_primary_task_name(self) -> str:
         """返回 life_chatter 主任务名；优先读 chatter_task_name，留空时跟随 task_name，再留空用 expression。"""
@@ -2308,9 +2313,12 @@ class LifeChatter(BaseChatter):
                 self.instance_id,
             )
             if record is None:
+                self.__class__._GLOBAL_ROLLING_CONTEXT_REVISION = 0
                 self._rolling_context_state_revision = 0
                 return []
-            self._rolling_context_state_revision = int(record.revision)
+            revision = int(record.revision)
+            self.__class__._GLOBAL_ROLLING_CONTEXT_REVISION = revision
+            self._rolling_context_state_revision = revision
             return self._deserialize_rolling_context_snapshot(
                 record.payload,
                 outer_integrity_verified=True,
@@ -2426,7 +2434,7 @@ class LifeChatter(BaseChatter):
                 selected_store = get_store()
         if selected_store is not None:
             expected_revision = int(
-                getattr(self, "_rolling_context_state_revision", 0) or 0
+                self.__class__._GLOBAL_ROLLING_CONTEXT_REVISION
             )
             record = await selected_store.put_state(
                 namespace="life_chatter.rolling_context",
@@ -2435,6 +2443,7 @@ class LifeChatter(BaseChatter):
                 schema_version=_ROLLING_CONTEXT_SNAPSHOT_VERSION,
                 payload=data,
             )
+            self.__class__._GLOBAL_ROLLING_CONTEXT_REVISION = int(record.revision)
             self._rolling_context_state_revision = int(record.revision)
             return
 
@@ -4286,6 +4295,86 @@ class LifeChatter(BaseChatter):
         raw_key = "\u241f".join(components)
         return hashlib.sha256(raw_key.encode("utf-8", errors="replace")).hexdigest()
 
+    # ── multi-writer stream turn commit (no-op when the bridge is disabled) ──
+
+    def _get_multi_writer_bridge(self, service: Any | None = None) -> Any | None:
+        """Return the attached hot-path bridge, if the service has one."""
+        if service is None:
+            service = self._get_life_service()
+        if service is None:
+            return None
+        return getattr(service, "_multi_writer_bridge", None)
+
+    def _collect_pending_stream_turns(self, unread_msgs: list[Any]) -> None:
+        """Collect claimed stream-turn metadata from unread messages.
+
+        Turn identities were attached by the distributor's inbound fact hook
+        (``message.extra["multi_writer_turn"]``).  Each turn is committed once
+        its message leaves the stream's unread queue (i.e. is consumed).
+        """
+        pending = getattr(self, "_pending_turn_commits", None)
+        if pending is None:
+            pending = self._pending_turn_commits = {}
+        for msg in unread_msgs or []:
+            extra = getattr(msg, "extra", None) or {}
+            if not isinstance(extra, dict):
+                continue
+            turn = extra.get("multi_writer_turn")
+            if not isinstance(turn, dict):
+                continue
+            turn_id = str(turn.get("turn_id") or "").strip()
+            if not turn_id:
+                continue
+            if turn_id in pending:
+                continue
+            pending[turn_id] = (
+                str(turn.get("message_id") or "").strip(),
+                int(turn.get("claim_epoch") or 0),
+            )
+
+    async def _commit_consumed_stream_turns(
+        self,
+        chat_stream: Any,
+        service: LifeEngineService | None,
+    ) -> None:
+        """Commit stream turns whose messages have left the unread queue.
+
+        Committing is idempotent per operation; fenced (stale) commits and
+        already-completed turns are dropped silently, so a crashed owner's
+        claim is naturally released for takeover via lease expiry.
+        """
+        pending = getattr(self, "_pending_turn_commits", None)
+        if not pending:
+            return
+        bridge = self._get_multi_writer_bridge(service)
+        if bridge is None or not getattr(bridge, "enabled", False):
+            self._pending_turn_commits = {}
+            return
+        context = getattr(chat_stream, "context", None)
+        unread_ids: set[str] = set()
+        if context is not None:
+            unread_ids = {
+                str(getattr(msg, "message_id", "") or "")
+                for msg in context.unread_messages
+                if str(getattr(msg, "message_id", "") or "")
+            }
+        for turn_id, (message_id, claim_epoch) in tuple(pending.items()):
+            if message_id and message_id in unread_ids:
+                continue  # 消息仍在未读队列，尚未消费
+            try:
+                committed = await bridge.commit_stream_turn(
+                    turn_id=turn_id,
+                    claim_epoch=claim_epoch,
+                    message_id=message_id,
+                )
+            except Exception as exc:  # noqa: BLE001 - never break the drive loop
+                logger.debug(
+                    f"stream turn commit 异常，按已完成处理: turn_id={turn_id}, error={exc}"
+                )
+                committed = True
+            if committed:
+                pending.pop(turn_id, None)
+
     @staticmethod
     def _visible_text_reply_cache_entry(
         call: Any,
@@ -5597,6 +5686,8 @@ class LifeChatter(BaseChatter):
 
             # 无未读时不争抢全局锁，让其它聊天流可以立刻推进共享主意识。
             _, unread_msgs = await self.fetch_unreads()
+            # 多写者：收集带 stream turn 元数据的未读消息，供消费后 commit。
+            self._collect_pending_stream_turns(unread_msgs)
             rt = self.__class__._GLOBAL_RUNTIME
             if rt is not None and rt.phase != _Phase.WAIT_USER:
                 active_stream_id = str(getattr(rt, "active_stream_id", "") or "").strip()
@@ -5657,5 +5748,8 @@ class LifeChatter(BaseChatter):
                 except (ValueError, KeyError) as error:
                     logger.error(f"获取模型配置失败: {error}")
                     result = Failure(f"模型配置错误: {error}")
+
+            # 多写者：本轮驱动结束后，commit 已消费消息对应的 stream turn。
+            await self._commit_consumed_stream_turns(chat_stream, service)
 
             yield result

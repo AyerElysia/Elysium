@@ -635,6 +635,14 @@ class SQLSingletonWriterClaimStore:
         if claim is not None:
             await self.bind_runtime_state_write(session, claim)
             return
+        # Multi-writer generations retired the generation-scoped singleton
+        # claim for runtime context (spec 5.2 / 16.2).  Concurrent nodes write
+        # the shared technical state through typed deltas or CAS without a
+        # global claim, so the legacy "registered key must be claimed" rule
+        # must not apply on a shared-writer runtime.
+        if bool(getattr(self.runtime, "shared_writers", False)):
+            await self.clear_runtime_state_write(session)
+            return
         registered = await session.scalar(
             text(
                 """SELECT 1 FROM runtime_singleton_writer_claims

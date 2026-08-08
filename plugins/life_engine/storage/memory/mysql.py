@@ -1092,6 +1092,17 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                 ).bindparams(expanding_ids),
                 {"node_ids": identifiers, "now": now},
             )
+            # 已删除节点的索引任务不再有处理意义，原子标记 stale（保留审计），
+            # 避免它们停留在 pending/processing/failed 被反复认领空转。
+            await session.execute(
+                text(
+                    "UPDATE memory_index_jobs SET status = 'stale', "
+                    "error = 'InvalidDocumentIdentity', updated_at = :now "
+                    "WHERE node_id IN :node_ids AND status IN "
+                    "('pending', 'processing', 'failed')"
+                ).bindparams(expanding_ids),
+                {"node_ids": identifiers, "now": now},
+            )
             return max(0, int(result.rowcount))
 
         return await self._write(_operation)
@@ -1270,9 +1281,15 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                     .mappings()
                     .one_or_none()
                 )
+                is_deleted = bool(node.get("is_deleted")) if node is not None else False
+                if node is None or is_deleted:
+                    # 节点不存在或已删除：立即归类 stale，不做 chunks 检查，
+                    # 避免已删除文档的 job 反复空转（InvalidDocumentIdentity）。
+                    stale.append(job.job_id)
+                    errors[job.job_id] = "InvalidDocumentIdentity"
+                    continue
                 if (
-                    node is None
-                    or str(node["node_type"]) != "file"
+                    str(node["node_type"]) != "file"
                     or str(node["content_hash"] or "") != job.content_hash
                     or int(node["index_revision"]) != int(job.index_revision)
                 ):
@@ -1351,11 +1368,11 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                     )
             if collection is None:
                 raise RuntimeError("CollectionUnavailable")
-            registry = self.runtime.authority_registry
-            token = self.runtime.authority_token
-            if registry is None or token is None:
-                raise RuntimeError("MemoryAuthorityUnavailable")
-            await registry.validate(token)
+            # 共享写者模式下必须走 shared 校验（backend/generation/epoch），
+            # 不能用全量 validate：join_generation 的 shared token 是常量
+            # "shared-generation"，与激活时写入的随机 fencing token hash
+            # 永远不匹配，会导致双实例下每个批次都 failed。
+            await self.runtime.validate_writer()
             upsert_kwargs = {
                 "ids": [item[1].chunk_id for item in payloads],
                 "embeddings": vectors,

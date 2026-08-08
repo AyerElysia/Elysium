@@ -242,6 +242,18 @@ class CoreConfig(ConfigBase):
             ge=1,
             description="生命域存储合同 schema 版本。",
         )
+        multi_writer_enabled: bool = Field(
+            default=False,
+            description=(
+                "是否启用多后端实例共享数据库写入协议；默认关闭，启用前必须完成 "
+                "schema v3 迁移和 runtime_context/global singleton 退场。"
+            ),
+        )
+        multi_writer_protocol_version: int = Field(
+            default=1,
+            ge=1,
+            description="多写者共享数据库协议版本；节点与 generation 必须完全一致。",
+        )
         registry_id: str = Field(
             default="life-domain",
             description="全局写入权威注册表身份。",

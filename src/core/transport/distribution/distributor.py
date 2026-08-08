@@ -66,6 +66,34 @@ def _has_unread_capacity(context: object) -> bool:
     return bool(getattr(context, "has_unread_capacity", True))
 
 
+async def _record_inbound_multi_writer_fact(message: Message) -> bool:
+    """Record the inbound fact and claim the stream turn (multi-writer only).
+
+    Without an active hook this is a strict no-op returning ``True``.  When a
+    hook is active, a ``False`` result means the message must not enter this
+    instance's rolling context (fact conflict or the turn is owned elsewhere).
+
+    The turn metadata is attached to ``message.extra`` so the chatter can
+    commit the turn once the message is consumed.
+    """
+    from src.core.transport.multi_writer_hooks import invoke_inbound_fact_hook
+
+    hook_result = await invoke_inbound_fact_hook(message)
+    if hook_result is not True:
+        # None → no hook (legacy path); False → fact conflict or recording
+        # failure; both mean the message should not be distributed here.
+        return hook_result is None
+
+    # Hook recorded the fact; attempt the per-message stream turn claim.  The
+    # bridge stores the turn identity in message.extra when it succeeds.
+    turn_result = getattr(message, "extra", {}).get("multi_writer_turn")
+    if turn_result is None:
+        # Bridge did not attach a turn (already owned elsewhere or completed):
+        # the owning instance is responsible for this message.
+        return False
+    return True
+
+
 async def _wait_for_unread_capacity(context, stream_id: str) -> None:
     """Apply lossless backpressure until a stream consumes unread messages."""
 
@@ -179,6 +207,21 @@ async def _on_message_received(_: str, params: dict) -> tuple[EventDecision, dic
                 ):
                     await slm.start_stream_loop(stream_id)
                 await _wait_for_unread_capacity(context, stream_id)
+
+            # 多写者协调：入站消息事实幂等落库，并认领本条消息的 stream turn。
+            # 默认（无钩子）为严格无操作；启用时事实冲突或 turn 已被其他实例
+            # 持有，则本条消息不进入本实例的滚动上下文（由持有实例处理）。
+            inbound_fact_ok = await _record_inbound_multi_writer_fact(message)
+            if not inbound_fact_ok:
+                logger.debug(
+                    "多写者入站事实记录失败或 turn 已被其他实例持有，跳过分发: "
+                    f"message_id={message.message_id}, stream_id={stream_id[:8]}"
+                )
+                try:
+                    await sm.add_message(message, add_to_unread=False)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(f"持久化入站消息失败: {exc}", exc_info=True)
+                return
 
             context.add_unread_message(message)
             chat_stream.update_active_time()

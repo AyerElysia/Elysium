@@ -71,6 +71,8 @@ class StorageFactorySettings:
     authoritative_backend: BackendKind = BackendKind.LOCAL
     backend_generation: str = ""
     schema_version: int = 1
+    multi_writer_enabled: bool = False
+    multi_writer_protocol_version: int = 1
     registry_id: str = "life-domain"
     authority_provider: AuthorityProvider = "file"
     authority_epoch: int = 0
@@ -116,6 +118,8 @@ def settings_from_life_engine_config(
             str(storage.backend_generation) if backend == BackendKind.MYSQL else ""
         ),
         schema_version=int(storage.schema_version),
+        multi_writer_enabled=bool(storage.multi_writer_enabled),
+        multi_writer_protocol_version=int(storage.multi_writer_protocol_version),
         registry_id=str(storage.registry_id),
         authority_provider=("mysql" if backend == BackendKind.MYSQL else "file"),
         authority_epoch=0,

@@ -95,6 +95,32 @@ async def test_initialize_skips_chroma_when_vector_backend_disabled(
         await service.close()
 
 
+async def test_read_chunk_index_state_delegates_to_document_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """LifeMemoryService 必须暴露 read_chunk_index_state（委托 document_index）。
+
+    回归保护：core._advance_memory_projection 在空批次（report 无 model/dimension）
+    时调用本方法获取权威配置来算 config_digest。此前该方法不存在，
+    AttributeError 被吞掉后 digest 永远按空配置计算，与真实批次不一致，
+    导致投影推进被 ProjectionProgressConflict 永久拒绝（节点进度停止）。
+    """
+    service = _make_service(tmp_path)
+
+    class _FakeDocIndex:
+        async def read_chunk_index_state(self) -> object:
+            return SimpleNamespace(model_name="mimo-v2.5", dimension=1024)
+
+    service._memory_storage = SimpleNamespace(  # type: ignore[assignment]
+        document_index=_FakeDocIndex()
+    )
+    state = await service.read_chunk_index_state()
+    assert state is not None
+    assert state.model_name == "mimo-v2.5"
+    assert state.dimension == 1024
+    await service.close()
+
+
 def test_migrate_file_path_keeps_edges_and_fts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

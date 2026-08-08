@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from src.app.plugin_system.api.log_api import get_logger
 
+from ..storage.runtime_contracts import RuntimeStateConflict
 from ..storage_utils import atomic_write_text
 from .event_builder import (
     RUNTIME_CONTEXT_FILE,
@@ -667,6 +668,8 @@ class StatePersistence:
         state: LifeEngineState,
         pending_events: list[LifeEngineEvent],
         event_history: list[LifeEngineEvent],
+        *,
+        recoverable_on_shared_conflict: bool = False,
     ) -> bool:
         """Persist the current context and report atomic dirty-state cleanup.
 
@@ -674,6 +677,13 @@ class StatePersistence:
         completed while the shared state lock still protected the exact
         snapshot. Local compatibility storage returns ``False`` because its
         file write remains outside that lock.
+
+        Args:
+            recoverable_on_shared_conflict: 仅对 shared 多写者模式生效。为
+                True 时，合并重试窗口内再次发生 CAS 冲突视为合法竞争（采纳
+                远端最新值并返回成功，不抛错、不置脏）；为 False（默认）时
+                保持抛 ``PersistenceError`` 的精确持久化语义，供 chatter
+                checkpoint 等必须耐久写入的路径使用。
         """
         async with self._get_commit_lock():
             async with self._get_lock():
@@ -727,6 +737,65 @@ class StatePersistence:
                         if self._on_persisted is not None:
                             self._on_persisted()
                         return True
+                    except RuntimeStateConflict as exc:
+                        # 单写者模式：CAS 冲突是真实错误，保持原行为。
+                        # shared 多写者模式：另一个实例推进了 global revision，
+                        # 重读最新并基于最新 revision 合并重试一次，避免心跳
+                        # 因并发提交反复崩溃（global 是技术 checkpoint，heartbeat
+                        # 等已通过 operation 持久化，冲突可恢复）。
+                        if self._runtime_writer_claim is not None:
+                            logger.error(f"life_engine 远端上下文持久化失败: {exc}")
+                            raise PersistenceError(
+                                f"Failed to persist selected runtime context: {exc}"
+                            ) from exc
+                        merged = await self._merge_shared_global(payload)
+                        if merged is None:
+                            logger.error(f"life_engine 远端上下文持久化失败: {exc}")
+                            raise PersistenceError(
+                                f"Failed to persist selected runtime context: {exc}"
+                            ) from exc
+                        try:
+                            record = await self._runtime_store.put_state(
+                                namespace="life_engine.runtime_context",
+                                state_key="global",
+                                expected_revision=merged["_revision"],
+                                schema_version=2,
+                                payload=merged["_payload"],
+                                writer_claim=self._runtime_writer_claim,
+                            )
+                        except RuntimeStateConflict as retry_exc:
+                            # 更新本地 revision 到实际最新值，下一轮重读即可成功。
+                            self._runtime_state_revision = int(
+                                merged["_revision"]
+                            )
+                            if recoverable_on_shared_conflict:
+                                # shared 多写者模式下，合并重试窗口内再次被推进
+                                # 是合法竞争：global 只是技术 checkpoint，
+                                # heartbeat 与感知状态已通过 operation 持久化，
+                                # 本实例无需覆盖另一实例刚写入的更新。采纳远端
+                                # 最新值并返回成功（不抛错、不置脏）。
+                                logger.warning(
+                                    "life_engine shared runtime context 合并重试"
+                                    "仍冲突，按合法竞争处理，采纳远端最新值: "
+                                    f"{retry_exc}"
+                                )
+                                if self._on_persisted is not None:
+                                    self._on_persisted()
+                                return True
+                            # 必须精确持久化的路径（如 chatter checkpoint）：
+                            # 保持可见失败，由调用方重试。
+                            logger.warning(
+                                "life_engine shared runtime context 合并重试仍冲突: "
+                                f"{retry_exc}"
+                            )
+                            raise PersistenceError(
+                                "Failed to persist selected runtime context: "
+                                f"{retry_exc}"
+                            ) from retry_exc
+                        self._runtime_state_revision = int(record.revision)
+                        if self._on_persisted is not None:
+                            self._on_persisted()
+                        return True
                     except Exception as exc:
                         logger.error(f"life_engine 远端上下文持久化失败: {exc}")
                         raise PersistenceError(
@@ -744,6 +813,58 @@ class StatePersistence:
                     f"Failed to persist runtime context: {exc}"
                 ) from exc
             return False
+
+    async def _merge_shared_global(
+        self,
+        local_payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """重读 shared global 最新记录，与本地快照合并后返回重试凭据。
+
+        shared 多写者模式下另一个实例可能已推进 global revision。本方法：
+        1. get_state 拉取最新 record（含最新 revision 与 payload）；
+        2. 技术 checkpoint 字段（heartbeat_count / event_sequence /
+           heartbeat_context_cursor）取两侧最大值，避免倒退；
+        3. 其余业务字段以本地快照为准（global 只是技术 checkpoint，
+           heartbeat/pause 等状态已通过 operation 持久化）。
+
+        Returns:
+            {"_revision": int, "_payload": dict}；远端不可读或不可合并返回 None。
+        """
+        try:
+            record = await self._runtime_store.get_state(
+                "life_engine.runtime_context",
+                "global",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"life_engine shared runtime context 重读失败: {exc}")
+            return None
+        if record is None:
+            return None
+
+        latest = dict(record.payload or {})
+        latest_state = dict(latest.get("state") or {})
+        local_state = dict(local_payload.get("state") or {})
+        # 本地覆盖远端；技术 checkpoint 字段再取 max 防倒退。
+        merged_state = {**latest_state, **local_state}
+        for key in (
+            "heartbeat_count",
+            "event_sequence",
+            "heartbeat_context_cursor",
+        ):
+            if key in latest_state and key in local_state:
+                try:
+                    merged_state[key] = max(
+                        int(latest_state[key]), int(local_state[key])
+                    )
+                except (TypeError, ValueError):
+                    merged_state[key] = local_state[key]
+
+        merged = dict(local_payload)
+        merged["state"] = merged_state
+        return {
+            "_revision": int(record.revision),
+            "_payload": merged,
+        }
 
     async def load_runtime_context(
         self,

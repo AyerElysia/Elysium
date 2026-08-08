@@ -138,6 +138,16 @@ class MessageSender:
                 logger.info(f"消息被事件处理器拦截，取消发送: {message.message_id}")
                 return True
 
+            # 5.1 多写者 outbox：平台调用前先持久化发送意图（默认无钩子时放行）。
+            # 意图落库失败必须 fail closed——没有审计记录的发送在崩溃后无法恢复。
+            outbox_ok = await self._record_outbox_intent(message)
+            if outbox_ok is False:
+                logger.error(
+                    "多写者 outbox 意图落库失败，已阻止平台发送: "
+                    f"message_id={message.message_id}, platform={message.platform}"
+                )
+                return False
+
             # 6. 仅在前置处理器允许发送后检查投递状态未知的短窗重试。
             timeout_fingerprint = self._build_dedupe_fingerprint(
                 message,
@@ -166,6 +176,13 @@ class MessageSender:
             )
             if provider_receipt:
                 message.extra["provider_receipt"] = provider_receipt
+
+            # 7.1 多写者 outbox：平台调用完成后以回执收尾发送意图。
+            # 收尾失败只影响审计状态，不改变"平台已发送"这一事实。
+            await self._settle_outbox_intent(
+                message,
+                provider_receipt=provider_receipt,
+            )
 
             # 8. 写入历史消息。
             history_persisted = await self._persist_sent_message_to_history(message)
@@ -219,6 +236,11 @@ class MessageSender:
                     status="unknown",
                     error=e,
                 )
+                await self._settle_outbox_intent(
+                    message,
+                    delivery_unknown=True,
+                    error_type=type(e).__name__,
+                )
                 return False
             message.extra["delivery_status"] = "failed"
             await self._emit_delivery_status_event(
@@ -227,11 +249,65 @@ class MessageSender:
                 status="failed",
                 error=e,
             )
+            await self._settle_outbox_intent(
+                message,
+                error_type=type(e).__name__,
+            )
             logger.error(
                 f"发送消息失败: message_id={message.message_id}, error={e}",
                 exc_info=True,
             )
             return False
+
+    async def _record_outbox_intent(self, message: "Message") -> bool | None:
+        """Persist a durable send intent before the platform call.
+
+        Returns:
+            True when the intent was durably recorded (send may proceed);
+            False when recording failed and the send must fail closed;
+            None when no multi-writer outbox hook is registered (legacy path).
+        """
+        try:
+            from src.core.transport.multi_writer_hooks import (
+                invoke_outbox_intent_hook,
+            )
+
+            return await invoke_outbox_intent_hook(message)
+        except Exception as exc:  # noqa: BLE001 - never break the send path
+            logger.warning(
+                f"多写者 outbox 意图检查异常，按未启用处理: message_id={message.message_id}, error={exc}"
+            )
+            return None
+
+    async def _settle_outbox_intent(
+        self,
+        message: "Message",
+        *,
+        provider_receipt: dict[str, Any] | None = None,
+        error_type: str = "",
+        delivery_unknown: bool = False,
+    ) -> None:
+        """Finalize the outbox action after the platform call.
+
+        Settlement never changes the send outcome; a failure here only loses
+        the audit transition (already-sent fact stays authoritative in history).
+        """
+        try:
+            from src.core.transport.multi_writer_hooks import (
+                invoke_outbox_settle_hook,
+            )
+
+            await invoke_outbox_settle_hook(
+                message,
+                provider_receipt=provider_receipt,
+                error_type=error_type,
+                delivery_unknown=delivery_unknown,
+            )
+        except Exception as exc:  # noqa: BLE001 - never break the send path
+            logger.warning(
+                "多写者 outbox 收尾异常（不影响发送结果）: "
+                f"message_id={message.message_id}, error={exc}"
+            )
 
     @staticmethod
     def _extract_provider_receipt(response: Any, *, platform: str) -> dict[str, Any]:

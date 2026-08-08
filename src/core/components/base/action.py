@@ -437,14 +437,19 @@ class BaseAction(ABC, LLMUsable):
 
     @staticmethod
     def _is_internal_sender_id(sender_id: Any) -> bool:
-        """判断 sender_id 是否为内部系统标识。"""
+        """判断 sender_id 是否为内部系统标识或 bot 占位 id。"""
         raw = str(sender_id or "").strip()
         if not raw:
             return False
+        from src.core.transport.message_receive.converter import (
+            _is_bot_placeholder_id,
+        )
+
         return (
             raw in {"life_engine_nucleus", "system"}
             or raw.startswith("life_engine_")
             or raw.startswith(("p-", "g-"))
+            or _is_bot_placeholder_id(raw)
         )
 
     @classmethod

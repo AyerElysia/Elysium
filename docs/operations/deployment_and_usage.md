@@ -16,6 +16,29 @@ Elysium 是数字生命系统，不是通用聊天机器人框架。修改配置
 
 ---
 
+## 多后端共享数据库协议（实施状态）
+
+当前已落地多写者基础协议与全部生产热路径：operation identity、claim/lease、operation receipt、typed runtime delta、带 claim fencing 的 outbox 状态存储、按节点隔离且连续推进的 projection progress，以及 MySQL/SQLite 共用 schema（v3）。`unknown` 外部发送结果不会被重新认领，单节点投影完成不会让其他节点伪完成。该协议只协调具体 operation，不把全局 Life Engine singleton writer 作为新增 operation 的前提。热路径接入状态：
+
+- 入站消息：Distributor 在分发前经 core transport 的 inbound fact hook 落库不可变消息事实，并原子认领对应 stream turn（`UNIQUE(source_message_id)`，同一事件到达两个实例时只有一个能认领）；Chatter 消费后按 per-message turn 提交，fencing 拒绝陈旧 owner。
+- Heartbeat：每轮先注册并认领本序列 heartbeat operation，被其他实例认领/已完成时跳过本轮；模型失败或超时释放为 retryable，成功提交 checkpoint（frontier 不推进时保留可重放语义）。
+- 外部发送：平台调用前先落 outbox 意图（落库失败 fail-closed 阻止发送），发送完成后按回执收尾为 `sent`，明确失败为 `retryable`，结果不确定为 `unknown`（禁止盲目重发）。
+- 记忆索引：worker 继续使用本地 SQLite 原子认领（多 worker 安全），每轮完成后推进本节点共享 projection progress（frontier 严格 +1，配置变化拒绝）。
+
+协议启动门已接入 `[storage]` 配置与 selected storage 启动路径：`multi_writer_enabled` 默认关闭，旧路径仍申请 `life_engine.runtime_context/global` singleton claim，行为不变；显式启用时先做数据库只读观测（legacy singleton 是否退场、多写者锚表是否部署），并校验 schema >= 3、协议版本匹配、热路径就绪（`MULTI_WRITER_HOT_PATHS_READY`），任一不满足即 fail-closed，不会申请任何 claim 或 attach 任何域 store。当前热路径迁移已完成（`MULTI_WRITER_HOT_PATHS_READY=True`）。阶段 0 字段审计已产出 `docs/architecture/多后端共享数据库-runtime_context字段审计.md`（`global` full snapshot 的 25 个字段的 authority/owner/merge contract/迁移目标）。多实例身份合同已落地（`InstanceIdentity`：deployment_id/instance_id/boot_id/owner_id/protocol_version/schema_generation/config_digest/workspace_revision，boot_id 每次启动变化并用于 claim fencing，claim owner 格式为 `deployment:instance:boot`）。content-free 健康观测已落地（`observe_multi_writer_health`：operation/outbox 状态分布、过期 claim、本实例 claim 数、projection readiness、最近成功提交时间，缺失表降级为 not_ready，连接失败为 failed，绝不输出 payload/正文/密钥）。
+
+维护窗口（规范 16.2）已按下列动作执行过一次，并已提交代码与配置：
+
+- 新增 runtime schema v4 迁移 `life_runtime_state_singleton_claim_guard_retirement_v4`：幂等 DROP `runtime_states_singleton_claim_{insert,update,delete}_v2` 三个 claim-guard 触发器。
+- 新增 learning schema v3 迁移 `life_learning_singleton_claim_guard_retirement_v3`：幂等 DROP learning 域 4 个 claim-guard 触发器。
+- `ensure_runtime_state_schema` 迁移顺序为 v1→v3→v2→v4，之后只验证 append-only immutable 触发器合同；`ensure_learning_schema` 同理只验证 immutability 触发器。
+- `writer_claims.prepare_runtime_state_write` 在 `shared_writers`（多写者 generation）运行时不再要求已注册 key 必须携带 claim；旧单写者路径行为不变。
+- Life Engine 启动在 `multi_writer_enabled=true` 时不再为 learning 域申请 generation-scoped singleton claim（learning 触发器和 runtime_context/global 一样已退场）。
+- 维护窗口执行脚本：`runtime/retire_singleton_multi_writer.py`（默认 dry-run，`--confirm` 才执行；执行前校验无 live claim；创建多写者 schema、DROP 退役触发器、清理已退役 claim 行、注册新 generation `schema_version=3`、推进 authority epoch 并轮换 fencing token）。
+- 启动门验证脚本：`runtime/verify_multi_writer_startup_gate.py`（只读：`_guard_generation`、`join_generation`、`observe_multi_writer_state`、`validate_multi_writer_readiness`、读取 `runtime_context/global` checkpoint）。
+
+配置语义：`multi_writer_enabled=true` 要求 `schema_version=3`、`backend_generation` 指向已激活的多写者 generation（注册时 `schema_version=3`）、`multi_writer_protocol_version` 与 generation 一致。旧单写者 generation（`schema_version=1`）仍在注册表中保留为只读历史，不允许作为运行 generation 复用（`register_generation` 以 manifest SHA-256 防 reuse）。
+
 ## 1. 当前验收状态
 
 以下状态以 2026-08-02 的 Windows 本地真实验收为准。

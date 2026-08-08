@@ -291,6 +291,18 @@ async def test_subject_projection_claim_confirmation_and_failure_are_cas(
         assert loaded is not None
         assert loaded.state == "failed"
 
+        # MySQL 后端自愈语义：遗留 pending/failed 投影可重建为 confirmed。
+        # 权威版本字节仍在版本表，这里只重建投影 outbox 状态，不触碰历史。
+        await store.heal_projection(loaded, worker_id="projection-self-heal")
+        healed = await store.get_projection_task("SOUL.md", failed.version_id)
+        assert healed is not None and healed.state == "confirmed"
+        # 再次 heal 幂等：已 confirmed 的任务不再匹配 pending/failed 条件。
+        with pytest.raises(SubjectDocumentConflict, match="self-heal CAS"):
+            await store.heal_projection(healed, worker_id="projection-self-heal")
+        assert (await store.health_snapshot())["projection_outbox"] == {
+            "confirmed": 2,
+        }
+
 
 async def test_subject_workspace_projection_and_observation_never_overwrite_divergence(
     tmp_path: Path,
@@ -482,3 +494,98 @@ async def test_subject_document_rejects_unsafe_paths(
     async with _local_store(tmp_path) as (_, store, _):
         with pytest.raises(ValueError, match="logical_path"):
             await store.append_version(_command(path=path))
+
+
+async def test_mysql_subject_remote_head_self_heals_legacy_failed_projection(
+    tmp_path: Path,
+) -> None:
+    """MySQL 后端遇到遗留 failed/pending 投影时自愈，不再抛致命错误。
+
+    权威版本字节已在 subject_document_versions 表；遗留 failed 是历史迁移
+    残留（本地模式写 workspace 文件失败留下）。MySQL 不运行 workspace
+    projector，failed 是不可达死状态，应重建为 confirmed。
+    """
+    from plugins.life_engine.service import LifeEngineService
+    from plugins.life_engine.storage.subject_contracts import (
+        SubjectDocumentHead,
+        SubjectDocumentVersion,
+        SubjectProjectionTask,
+    )
+
+    logical_path = "life_engine_workspace/diaries/witness/2026-08/x.md"
+    version_id = "ver_legacyfailed_0001"
+    healed_calls: list[str] = []
+
+    class _MySQLFakeSubjectStore:
+        backend = BackendKind.MYSQL
+
+        async def get_head(self, path: str):
+            assert path == logical_path
+            return SubjectDocumentHead(
+                document_id="doc-1",
+                logical_path=logical_path,
+                declared_owner="elysia",
+                current_version_id=version_id,
+                revision=1,
+            )
+
+        async def get_version(self, vid: str):
+            assert vid == version_id
+            return SubjectDocumentVersion(
+                version_id=version_id,
+                document_id="doc-1",
+                logical_path=logical_path,
+                parent_version_id="",
+                occurrence_id="occ:legacy",
+                semantic_actor_id=None,
+                semantic_source_id=None,
+                occurred_at=None,
+                recorded_by="memory-witness",
+                recorded_source="legacy",
+                recorded_at="2026-08-06T01:35:00+08:00",
+                provenance_status="semantic_source_missing",
+                content_bytes=b"legacy witness body",
+                content_hash="c" * 64,
+                byte_length=17,
+                byte_fidelity="exact_bytes",
+                encoding="utf-8",
+                newline_style=None,
+                change_context={},
+            )
+
+        async def get_projection_task(self, path: str, vid: str):
+            assert path == logical_path and vid == version_id
+            return SubjectProjectionTask(
+                outbox_id=1405,
+                head_event_id="head:legacy",
+                document_id="doc-1",
+                logical_path=logical_path,
+                version_id=version_id,
+                content_hash="c" * 64,
+                state="failed",
+                attempt_count=1,
+                lease_owner="",
+                lease_until="",
+                revision=1,
+            )
+
+        async def heal_projection(self, task, *, worker_id: str):
+            healed_calls.append(worker_id)
+            assert task.state == "failed"
+
+    service = object.__new__(LifeEngineService)
+    service._subject_document_store = _MySQLFakeSubjectStore()
+    service._subject_workspace_projector = None
+    service._subject_workspace_observer = None
+    service._router_context_projection = None
+    service._subject_context_projections = {}
+    service._selectable_storage_enabled = True
+
+    result = await service._project_subject_version(
+        logical_path=logical_path,
+        version_id=version_id,
+        max_tasks=1,
+    )
+    assert result["status"] == "remote_current_head"
+    assert result["projection_self_healed"] is True
+    assert healed_calls == ["projection-self-heal"]

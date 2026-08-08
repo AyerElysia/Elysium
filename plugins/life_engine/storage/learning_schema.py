@@ -228,6 +228,21 @@ MYSQL_LEARNING_CLAIM_GUARD_TRIGGERS = tuple(
     )
 )
 
+# Multi-writer retirement: the generation-scoped singleton claim guard for the
+# whole learning domain must leave the database once several nodes share the
+# generation.  ``learning_events`` keeps its append-only immutability triggers;
+# only the claim guards are dropped, idempotently.
+MYSQL_LEARNING_CLAIM_GUARD_RETIREMENT = SchemaMigration(
+    version=3,
+    name="life_learning_singleton_claim_guard_retirement_v3",
+    statements=(
+        """DROP TRIGGER IF EXISTS learning_events_singleton_claim_insert_v2""",
+        """DROP TRIGGER IF EXISTS learning_projections_singleton_claim_insert_v2""",
+        """DROP TRIGGER IF EXISTS learning_projections_singleton_claim_update_v2""",
+        """DROP TRIGGER IF EXISTS learning_projections_singleton_claim_delete_v2""",
+    ),
+)
+
 
 async def ensure_learning_schema(
     runtime: StorageBackendRuntime,
@@ -259,11 +274,12 @@ async def ensure_learning_schema(
                 (
                     _MYSQL_SCHEMA_MIGRATION,
                     MYSQL_LEARNING_CLAIM_GUARD_MIGRATION,
+                    MYSQL_LEARNING_CLAIM_GUARD_RETIREMENT,
                 )
             )
             await verify_mysql_trigger_contract(
                 runtime.engine,
-                _MYSQL_IMMUTABILITY_TRIGGERS + MYSQL_LEARNING_CLAIM_GUARD_TRIGGERS,
+                _MYSQL_IMMUTABILITY_TRIGGERS,
             )
         else:
             runner = MySQLMigrationRunner(
@@ -298,6 +314,7 @@ __all__ = [
     "LEARNING_SCHEMA_VERSION",
     "LOCAL_LEARNING_SCHEMA_STATEMENTS",
     "MYSQL_LEARNING_CLAIM_GUARD_MIGRATION",
+    "MYSQL_LEARNING_CLAIM_GUARD_RETIREMENT",
     "MYSQL_LEARNING_CLAIM_GUARD_TRIGGERS",
     "ensure_learning_schema",
     "verify_learning_writer_claim_guard",

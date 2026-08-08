@@ -37,6 +37,10 @@ from plugins.life_engine.service.perception_gateway import (
 )
 from plugins.life_engine.service.presence_store import PresenceRevisionConflict
 from plugins.life_engine.storage.models import BackendKind
+from plugins.life_engine.storage.multi_writer_protocol import (
+    MultiWriterProtocolError,
+    MultiWriterRuntimeState,
+)
 from src.core.config.core_config import CoreConfig
 from test.plugins.life_engine.presence_world_fakes import build_fake_stores
 
@@ -379,10 +383,10 @@ def _install_selected_factories(
         initialize_schema: bool = False,
         writer_claim: Any | None = None,
     ) -> Any:
+        # The legacy generation-scoped singleton claim is retired on the
+        # multi-writer path (writer_claim=None); per-test assertions on claim
+        # scopes live in the individual tests, not here.
         assert runtime.backend == backend
-        assert writer_claim is not None
-        assert writer_claim.namespace == "life_engine.learning"
-        assert writer_claim.state_key == "selected_persistence"
         factory_calls.append(("learning", initialize_schema))
         return SimpleNamespace(store=learning_store)
 
@@ -833,8 +837,11 @@ async def test_service_stop_aggregates_consumer_failures_and_closes_runtime_last
             assert runtimes[0].close_calls == 0
             raise RuntimeError("injected learning consumer close failure")
 
-    async def _no_op() -> None:
+    async def _no_op(*, recoverable_on_shared_conflict: bool = False) -> None:
         return None
+
+    async def _noop_cleanup(_workspace_path: Any, *, store: Any | None = None) -> int:
+        return 0
 
     registry = service.consciousness_registry
     assert isinstance(registry, AsyncConsciousnessRegistry)
@@ -843,7 +850,7 @@ async def test_service_stop_aggregates_consumer_failures_and_closes_runtime_last
     service._memory_service = _FailingMemoryConsumer()  # type: ignore[assignment]
     service._learning_scheduler = _FailingLearningConsumer()
     monkeypatch.setattr(service, "_save_runtime_context", _no_op)
-    monkeypatch.setattr(core_module, "cleanup_autonomy_schedules", lambda *_: _no_op())
+    monkeypatch.setattr(core_module, "cleanup_autonomy_schedules", _noop_cleanup)
 
     with pytest.raises(ExceptionGroup, match="consumer failures") as captured:
         await service.stop()
@@ -874,3 +881,185 @@ async def test_presence_outbox_limit_fails_without_losing_remaining_evidence() -
 
     assert len(await ledger.read_since(0)) == 2
     assert len(await stores.presence.pending_events()) == 1
+
+
+async def test_multi_writer_gate_default_keeps_legacy_global_singleton_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default configuration must not change the legacy startup posture."""
+
+    stores = build_fake_stores()
+    ledger = _FakeLifeEventStore()
+    runtimes, factory_calls = _install_selected_factories(
+        monkeypatch,
+        BackendKind.MYSQL,
+        stores,
+        ledger,
+    )
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+    assert service._storage_factory_settings.multi_writer_enabled is False
+
+    await service._start_selected_storage()
+
+    claim_scopes = {
+        (call["namespace"], call["state_key"]) for call in runtimes[0].claim_calls
+    }
+    assert ("life_engine.runtime_context", "global") in claim_scopes
+    assert ("life_engine.learning", "selected_persistence") in claim_scopes
+    assert factory_calls
+
+
+async def test_multi_writer_gate_fails_closed_before_any_claim_or_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicitly enabled multi-writer must refuse startup while hot paths are
+    not migrated, before acquiring any claim or attaching any domain store."""
+
+    stores = build_fake_stores()
+    ledger = _FakeLifeEventStore()
+    runtimes, factory_calls = _install_selected_factories(
+        monkeypatch,
+        BackendKind.MYSQL,
+        stores,
+        ledger,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.storage.multi_writer_protocol.MULTI_WRITER_HOT_PATHS_READY",
+        False,
+    )
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+    service._storage_factory_settings = replace(
+        service._storage_factory_settings,
+        multi_writer_enabled=True,
+        multi_writer_protocol_version=1,
+    )
+
+    with pytest.raises(
+        MultiWriterProtocolError,
+        match="hot paths are not fully migrated",
+    ):
+        await service._start_selected_storage()
+
+    assert runtimes[0].claim_calls == []
+    assert factory_calls == []
+
+
+async def test_multi_writer_gate_fails_closed_on_unretired_singleton(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even with hot paths ready, an explicitly enabled node refuses startup
+    while the legacy global singleton writer still holds a live claim."""
+
+    stores = build_fake_stores()
+    ledger = _FakeLifeEventStore()
+    runtimes, factory_calls = _install_selected_factories(
+        monkeypatch,
+        BackendKind.MYSQL,
+        stores,
+        ledger,
+    )
+
+    async def _fake_observe(_runtime: Any) -> MultiWriterRuntimeState:
+        return MultiWriterRuntimeState(
+            legacy_singleton_table_present=True,
+            total_legacy_global_claims=1,
+            live_legacy_global_claims=1,
+            multi_writer_tables_present=True,
+        )
+
+    monkeypatch.setattr(
+        "plugins.life_engine.storage.multi_writer_protocol.observe_multi_writer_state",
+        _fake_observe,
+    )
+
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+    runtime = _FakeRuntime(BackendKind.MYSQL)
+    runtime.generation = SimpleNamespace(
+        generation_id="contract-g",
+        schema_version=3,
+    )
+    service._storage_runtime = runtime
+    service._storage_factory_settings = replace(
+        service._storage_factory_settings,
+        multi_writer_enabled=True,
+        multi_writer_protocol_version=1,
+    )
+
+    with pytest.raises(
+        MultiWriterProtocolError,
+        match="global singleton writer has not been retired",
+    ):
+        await service._start_selected_storage()
+
+    assert runtime.claim_calls == []
+    assert factory_calls == []
+
+
+async def test_multi_writer_gate_ready_retires_all_legacy_singleton_claims(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fully migrated node must skip the legacy runtime-context singleton
+    claim and the generation-scoped learning singleton claim: both domains
+    are shared across nodes in the multi-writer generation (spec 5.2 / 16.2),
+    with occurrence identity and projection revision/CAS as the write-conflict
+    boundary."""
+
+    stores = build_fake_stores()
+    ledger = _FakeLifeEventStore()
+    _runtimes, _factory_calls = _install_selected_factories(
+        monkeypatch,
+        BackendKind.MYSQL,
+        stores,
+        ledger,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.storage.multi_writer_protocol.MULTI_WRITER_HOT_PATHS_READY",
+        True,
+    )
+
+    async def _fake_observe(_runtime: Any) -> MultiWriterRuntimeState:
+        return MultiWriterRuntimeState(
+            legacy_singleton_table_present=True,
+            total_legacy_global_claims=0,
+            live_legacy_global_claims=0,
+            multi_writer_tables_present=True,
+        )
+
+    monkeypatch.setattr(
+        "plugins.life_engine.storage.multi_writer_protocol.observe_multi_writer_state",
+        _fake_observe,
+    )
+
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+    runtime = _FakeRuntime(BackendKind.MYSQL)
+    runtime.generation = SimpleNamespace(
+        generation_id="contract-g",
+        schema_version=3,
+    )
+    service._storage_runtime = runtime
+    service._storage_factory_settings = replace(
+        service._storage_factory_settings,
+        multi_writer_enabled=True,
+        multi_writer_protocol_version=1,
+    )
+
+    await service._start_selected_storage()
+
+    assert runtime.claim_calls == []
+
+    # The ready path attaches a hot-path bridge and registers global transport
+    # hook slots; teardown must fully unregister them so later tests never
+    # observe a stale bridge from this service instance.
+    await service._close_selected_storage()
+
+    assert service._multi_writer_bridge is None
+    assert runtime.close_calls == 1
+    from src.core.transport import multi_writer_hooks as _mw_hooks
+
+    assert _mw_hooks._inbound_fact_hook is None
+    assert _mw_hooks._outbox_intent_hook is None
+    assert _mw_hooks._outbox_settle_hook is None

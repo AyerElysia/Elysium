@@ -339,7 +339,28 @@ async def run_chat_stream(
                     logger.debug(f"[驱动器] stream={stream_id[:8]}, 会话生成器已结束 (return)")
                     manager._chatter_genes.pop(stream_id, None)
                 except Exception as e:
-                    logger.error(f"[驱动器] stream={stream_id[:8]}, 执行 Chatter 出错: {e}")
+                    try:
+                        from plugins.life_engine.storage.runtime_contracts import (
+                            RuntimeStateConflict,
+                        )
+                    except Exception:  # noqa: BLE001
+                        RuntimeStateConflict = None
+                    if RuntimeStateConflict is not None and isinstance(
+                        e, RuntimeStateConflict
+                    ):
+                        # 双实例共享 MySQL 时 life_chatter.rolling_context 的
+                        # CAS revision 冲突是合法竞争：另一实例推进了同一 key
+                        # 的 revision。重置 _GLOBAL_RUNTIME 后下轮会重读最新
+                        # revision 重建，属可恢复路径，用 WARNING 而非 ERROR
+                        # 避免双实例并发把驱动器刷成错误。
+                        logger.warning(
+                            f"[驱动器] stream={stream_id[:8]}, "
+                            f"执行 Chatter 出现运行时状态竞争 "
+                            f"({type(e).__name__})，已重置 _GLOBAL_RUNTIME，"
+                            f"下轮将从头重建"
+                        )
+                    else:
+                        logger.error(f"[驱动器] stream={stream_id[:8]}, 执行 Chatter 出错: {e}")
                     manager._chatter_genes.pop(stream_id, None)
                     manager._stats["total_failures"] += 1
                     # 当执行出错时（例如 TimeoutError 或 LLMContextError 导致生成器销毁），
@@ -347,10 +368,13 @@ async def run_chat_stream(
                     try:
                         from plugins.life_engine.core.chatter import LifeChatter
                         LifeChatter.reset_global_runtime()
-                        logger.warning(
-                            f"[驱动器] stream={stream_id[:8]}, "
-                            f"执行出错 ({type(e).__name__})，已重置 _GLOBAL_RUNTIME，下轮将从头重建"
-                        )
+                        if RuntimeStateConflict is None or not isinstance(
+                            e, RuntimeStateConflict
+                        ):
+                            logger.warning(
+                                f"[驱动器] stream={stream_id[:8]}, "
+                                f"执行出错 ({type(e).__name__})，已重置 _GLOBAL_RUNTIME，下轮将从头重建"
+                            )
                     except Exception:
                         pass
                 finally:
