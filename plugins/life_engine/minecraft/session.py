@@ -845,6 +845,11 @@ class MinecraftSession:
 
         if not self._state.active or self._runtime is None:
             return None
+        if self._state.body_name == "bot":
+            # The headless bot body renders nothing; capturing here would
+            # steal whichever desktop window matches the title rule and
+            # inject the human player's perspective as her own eyes.
+            return None
         try:
             frame = await self._capture.grab_consciousness_frame()
         except Exception:  # noqa: BLE001 - vision must never break heartbeat
@@ -1041,6 +1046,9 @@ class MinecraftSession:
     def _body_profiles(self) -> dict[str, BodyProfile]:
         """Build exact configured profiles for the two requested body routes."""
 
+        agent_readiness_kind = (
+            "server_world" if self._in_shared_world_mode() else "structured_world"
+        )
         return {
             "agent": BodyProfile(
                 name="agent",
@@ -1059,7 +1067,7 @@ class MinecraftSession:
                         "world.mine",
                     }
                 ),
-                readiness_kind="structured_world",
+                readiness_kind=agent_readiness_kind,
             ),
             "biomimetic": BodyProfile(
                 name="biomimetic",

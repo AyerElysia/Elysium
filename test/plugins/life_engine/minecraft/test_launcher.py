@@ -6,6 +6,8 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from plugins.life_engine.minecraft.launcher import MCConfig, MinecraftLauncher
 
 
@@ -134,6 +136,13 @@ async def test_installation_requires_one_hash_pinned_bridge_and_baritone(
     assert ready["bridge_mod_ready"] is True
     assert ready["baritone_mod_ready"] is True
     assert ambiguous["bridge_mod_ready"] is False
+
+
+def test_game_turn_interval_must_be_positive(tmp_path: Path) -> None:
+    """Continuous play cadence must remain a real positive interval."""
+
+    with pytest.raises(ValueError):
+        MCConfig(mc_home=tmp_path, game_turn_interval_seconds=0)
 
 
 def test_prepare_shared_world_bat_points_at_lan_world(tmp_path: Path) -> None:

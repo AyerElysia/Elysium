@@ -78,3 +78,36 @@ class TestHeartbeatVisionPayload:
     async def test_no_session_means_no_vision(self) -> None:
         service = SimpleNamespace(minecraft_session=None)
         assert await LifeEngineService._build_minecraft_vision_payload(service) is None
+
+
+class TestContinuousPlayCadence:
+    """While she is in game, heartbeat turns accelerate into continuous play."""
+
+    def _service(self, session: object | None, game_interval: int | None) -> object:
+        minecraft = None
+        if game_interval is not None:
+            minecraft = SimpleNamespace(game_turn_interval_seconds=game_interval)
+        cfg = SimpleNamespace(
+            settings=SimpleNamespace(heartbeat_interval_seconds=30),
+            minecraft=minecraft,
+        )
+        return SimpleNamespace(minecraft_session=session, _cfg=lambda: cfg)
+
+    def test_idle_keeps_base_interval(self) -> None:
+        service = self._service(session=None, game_interval=5)
+        assert LifeEngineService._effective_heartbeat_interval(service) == 30
+
+    def test_active_session_accelerates_to_game_turns(self) -> None:
+        session = _bare_session(active=True, frame=None)
+        service = self._service(session=session, game_interval=5)
+        assert LifeEngineService._effective_heartbeat_interval(service) == 5
+
+    def test_inactive_session_keeps_base_interval(self) -> None:
+        session = _bare_session(active=False, frame=None)
+        service = self._service(session=session, game_interval=5)
+        assert LifeEngineService._effective_heartbeat_interval(service) == 30
+
+    def test_missing_minecraft_section_keeps_base_interval(self) -> None:
+        session = _bare_session(active=True, frame=None)
+        service = self._service(session=session, game_interval=None)
+        assert LifeEngineService._effective_heartbeat_interval(service) == 30

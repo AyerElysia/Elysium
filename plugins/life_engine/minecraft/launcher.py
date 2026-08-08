@@ -70,6 +70,9 @@ class MCConfig:
     # When disabled she launches the configured singleplayer world instead.
     shared_world_enabled: bool = True
     agent_shared_username: str = "Elysia"
+    # Her continuous play cadence while a session is active; the service
+    # heartbeat loop accelerates to this interval during play.
+    game_turn_interval_seconds: int = 5
     bot_observation_interval_ms: int = 1000
     bot_entity_radius_blocks: int = 32
     planner_task_name: str = "agent"
@@ -108,6 +111,8 @@ class MCConfig:
             raise ValueError("bot_observation_interval_ms must be positive")
         if self.bot_entity_radius_blocks <= 0:
             raise ValueError("bot_entity_radius_blocks must be positive")
+        if self.game_turn_interval_seconds <= 0:
+            raise ValueError("game_turn_interval_seconds must be positive")
 
 
 @dataclass(slots=True)

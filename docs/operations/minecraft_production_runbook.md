@@ -63,6 +63,9 @@
    launch_dir = "G:\\Game\\Minecraft\\PCL"
    require_quick_play = true
    expected_bridge_version = "0.2.1"
+   shared_world_enabled = true
+   agent_shared_username = "Elysia"
+   game_turn_interval_seconds = 5
    ```
 
    其余摘要、文件名、监听地址和超时使用代码中的已验证默认值。令牌由桥接首次启动写入 `config/elysium_bridge.json`，不得复制到仓库或日志。
@@ -75,6 +78,7 @@
 - 该模式下 preflight 跳过单人世界与 `--quickPlaySingleplayer` 校验（改为共享世界语义）。
 - 她拥有自己的客户端窗口，即她自己的眼睛：心跳轮次中 `session.grab_vision_frame_bytes()` 截取第一人称画面，`core._build_minecraft_vision_payload()` 将其作为原生图像 payload（MediaPart）注入她的多模态大脑请求。**不做任何文字转述——画面以像素直接进入她的模型**；想法来自她，执行层（bridge 命令 / VLA）只忠实执行。
 - 无窗口可截时（如 bot 身体）静默降级为无视觉，不影响心跳。
+- 她在游戏中时是连续游玩而不是等待聊天：心跳循环检测到 Minecraft session 活跃后自动加速到 `game_turn_interval_seconds`（默认 5 秒）一个回合，每个回合带着新鲜的第一人称画面直接进入她的大脑；退出游戏（session 停止）后自动恢复普通心跳节奏。回合严格串行：上一回合模型请求未完成时不会并发下一回合，模型变慢只会拉长单回合而不是堆积请求。
 
 ## 无头 bot 身体（共享世界）
 
@@ -130,7 +134,7 @@ bot 观察 facts 与 `StateCollector` 结构对齐（world/player/players/entiti
 - 精确的启动脚本、世界目录、Bridge 与 Baritone 摘要通过预检；
 - Windows/WSL 互操作可用，且没有多个匹配的 Minecraft 窗口；
 - 桥接完成共享令牌认证，协议版本与必需能力完全匹配；
-- 游戏报告 `world_loaded=true`、`client_paused=false`、单人世界名称为 `Elysian Realm`，并提供玩家 UUID；
+- 就绪判定按模式区分：单人模式（`shared_world_enabled = false`）要求游戏报告 `world_loaded=true`、`client_paused=false`、单人世界名称为 `Elysian Realm`，并提供玩家 UUID；共享世界模式（默认）采用 `server_world` 语义，只要求 `world_loaded=true`、存在世界标识与玩家 UUID，不校验单人世界名称与暂停状态；
 - 收到至少两条连续前进的完整观察。
 
 标题界面、暂停菜单、错误世界、旧桥接、缺失能力、静止观察或断线都会返回可诊断失败，不能伪装成就绪。已经运行的合规客户端会被复用，不会再启动第三个客户端。
