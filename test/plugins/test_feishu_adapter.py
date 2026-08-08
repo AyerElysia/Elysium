@@ -115,7 +115,7 @@ def test_lark_sdk_log_filter_rate_limits_repeated_errors(
 
 
 async def test_feishu_long_connection_uses_dedicated_sdk_event_loop(monkeypatch) -> None:
-    """The SDK must not run its blocking loop on the bot's main event loop."""
+    """SDK session must own and cleanly finish its dedicated event loop."""
     import lark_oapi.ws.client as ws_client_module
 
     config = FeishuAdapterConfig()
@@ -126,13 +126,32 @@ async def test_feishu_long_connection_uses_dedicated_sdk_event_loop(monkeypatch)
 
     class FakeClient:
         def __init__(self, **_: object) -> None:
-            pass
+            self._conn = None
+            self._auto_reconnect = True
+            self.on_reconnecting = lambda: None
+            self.on_reconnected = lambda: None
 
-        def start(self) -> None:
-            sdk_loop = ws_client_module.loop
-            observed_loops.append(sdk_loop)
-            sdk_loop.run_until_complete(asyncio.sleep(0))
+        async def _connect(self) -> None:
+            observed_loops.append(asyncio.get_running_loop())
+            self._conn = object()
             adapter._feishu_stop_event.set()
+            assert adapter._long_connection_stop_signal is not None
+            adapter._long_connection_stop_signal.set()
+
+        async def _receive_message_loop(self) -> None:
+            await asyncio.Event().wait()
+
+        async def _handle_message(self, _: bytes) -> None:
+            return None
+
+        async def _write_message(self, _: bytes) -> None:
+            return None
+
+        async def _ping_loop(self) -> None:
+            await asyncio.Event().wait()
+
+        async def _disconnect(self) -> None:
+            self._conn = None
 
     main_loop = asyncio.get_running_loop()
     previous_sdk_loop = ws_client_module.loop
@@ -151,6 +170,80 @@ async def test_feishu_long_connection_uses_dedicated_sdk_event_loop(monkeypatch)
     assert observed_loops
     assert observed_loops[0] is not main_loop
     assert observed_loops[0].is_closed()
+    assert adapter._long_connection_state == "stopped"
+
+
+async def test_feishu_long_connection_stops_via_owner_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shutdown must not stop the SDK loop underneath run_until_complete()."""
+    import lark_oapi.ws.client as ws_client_module
+
+    config = FeishuAdapterConfig()
+    config.app.app_id = "cli_test"
+    config.app.app_secret = "secret_test"
+    adapter = make_adapter(config)
+    clients: list[object] = []
+
+    class FakeClient:
+        def __init__(self, **_: object) -> None:
+            self._conn = None
+            self._auto_reconnect = True
+            self.on_reconnecting = lambda: None
+            self.on_reconnected = lambda: None
+            clients.append(self)
+
+        async def _connect(self) -> None:
+            self._conn = object()
+            asyncio.create_task(self._receive_message_loop())
+
+        async def _receive_message_loop(self) -> None:
+            await asyncio.Event().wait()
+
+        async def _handle_message(self, _: bytes) -> None:
+            return None
+
+        async def _write_message(self, _: bytes) -> None:
+            return None
+
+        async def _ping_loop(self) -> None:
+            await asyncio.Event().wait()
+
+        async def _disconnect(self) -> None:
+            self._conn = None
+
+    previous_sdk_loop = ws_client_module.loop
+    monkeypatch.setattr(
+        feishu_adapter_module,
+        "_lark_oapi_ws_module",
+        SimpleNamespace(Client=FakeClient),
+    )
+    monkeypatch.setattr(adapter, "_build_lark_event_handler", lambda _: object())
+
+    try:
+        adapter._start_long_connection()
+        for _ in range(100):
+            if adapter.is_connected():
+                break
+            await asyncio.sleep(0.01)
+
+        owner_thread = adapter._long_connection_thread
+        assert clients
+        assert owner_thread is not None and owner_thread.is_alive()
+        assert adapter.is_connected() is True
+
+        await adapter._stop_long_connection()
+
+        assert owner_thread.is_alive() is False
+        assert adapter._long_connection_thread is None
+        assert adapter._long_connection_client is None
+        assert adapter._long_connection_state == "stopped"
+        assert ws_client_module.loop is previous_sdk_loop
+    finally:
+        adapter._feishu_stop_event.set()
+        if adapter._long_connection_thread is not None:
+            await adapter._stop_long_connection()
+        ws_client_module.loop = previous_sdk_loop
 
 
 async def test_feishu_http_client_is_reused_and_closed() -> None:
@@ -191,18 +284,115 @@ async def test_feishu_token_refresh_is_single_flight(
     request.assert_awaited_once()
 
 
-def test_feishu_watchdog_refuses_duplicate_client_for_stuck_thread(
+def test_feishu_watchdog_does_not_touch_a_live_owner_thread(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """旧 SDK 线程未退出时不能再启动第二个共享事件循环客户端。"""
+    """Quiet traffic and unrelated sockets cannot authorize a forced restart."""
     adapter = make_adapter()
     adapter._long_connection_thread = MagicMock(is_alive=lambda: True)
     start = MagicMock()
     monkeypatch.setattr(adapter, "_start_long_connection", start)
+    monkeypatch.setattr(
+        adapter._feishu_stop_event,
+        "wait",
+        MagicMock(side_effect=[False, True]),
+    )
 
-    adapter._force_restart_long_connection()
+    adapter._feishu_watchdog_loop()
 
     start.assert_not_called()
+    assert not hasattr(adapter, "_detect_feishu_close_wait")
+    assert not hasattr(adapter, "_force_restart_long_connection")
+
+
+def test_feishu_watchdog_restarts_only_after_owner_thread_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = make_adapter()
+    adapter._long_connection_thread = MagicMock(is_alive=lambda: False)
+    start = MagicMock()
+    monkeypatch.setattr(adapter, "_start_long_connection", start)
+    monkeypatch.setattr(
+        adapter._feishu_stop_event,
+        "wait",
+        MagicMock(side_effect=[False, True]),
+    )
+
+    adapter._feishu_watchdog_loop()
+
+    start.assert_called_once_with()
+
+
+async def test_feishu_transport_activity_comes_from_sdk_frames_and_ping() -> None:
+    adapter = make_adapter()
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self._conn = None
+            self.on_reconnecting = lambda: None
+            self.on_reconnected = lambda: None
+
+        async def _connect(self) -> None:
+            self._conn = object()
+
+        async def _receive_message_loop(self) -> None:
+            return None
+
+        async def _handle_message(self, _: bytes) -> None:
+            return None
+
+        async def _write_message(self, _: bytes) -> None:
+            return None
+
+    client = FakeClient()
+    receive_failed = asyncio.Event()
+    adapter._instrument_lark_client(client, receive_failed)
+
+    await client._connect()
+    assert adapter._long_connection_state == "connected"
+    connected_at = adapter._last_lark_transport_activity_monotonic
+    assert connected_at > 0.0
+
+    client.on_reconnecting()
+    assert adapter._long_connection_state == "reconnecting"
+    await client._write_message(b"sdk ping")
+    assert adapter._long_connection_state == "connected"
+    ping_at = adapter._last_lark_transport_activity_monotonic
+    assert ping_at >= connected_at
+
+    await client._handle_message(b"sdk pong or data")
+    assert adapter._last_lark_transport_activity_monotonic >= ping_at
+    assert receive_failed.is_set() is False
+
+
+async def test_feishu_receive_failure_is_explicit_without_forcing_loop_stop() -> None:
+    adapter = make_adapter()
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self._conn = object()
+
+        async def _connect(self) -> None:
+            return None
+
+        async def _receive_message_loop(self) -> None:
+            raise RuntimeError("transport failed")
+
+        async def _handle_message(self, _: bytes) -> None:
+            return None
+
+        async def _write_message(self, _: bytes) -> None:
+            return None
+
+    client = FakeClient()
+    receive_failed = asyncio.Event()
+    adapter._instrument_lark_client(client, receive_failed)
+
+    with pytest.raises(RuntimeError, match="transport failed"):
+        await client._receive_message_loop()
+
+    assert receive_failed.is_set() is True
+    assert adapter._long_connection_state == "failed"
 
 
 async def test_feishu_text_event_to_envelope() -> None:
