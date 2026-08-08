@@ -52,6 +52,28 @@ class MinecraftBotLauncher:
             return None
         return process.pid
 
+    @staticmethod
+    def resolve_server_host(configured: str) -> str:
+        """Resolve the WSL default gateway when configured as ``auto``."""
+
+        if configured != "auto":
+            return configured
+        try:
+            with open("/proc/net/route", encoding="ascii") as route_file:
+                for line in route_file.read().splitlines()[1:]:
+                    fields = line.split()
+                    if len(fields) >= 3 and fields[1] == "00000000":
+                        gateway = fields[2]
+                        if gateway == "00000000":
+                            break
+                        return ".".join(
+                            str(int(gateway[i : i + 2], 16))
+                            for i in (6, 4, 2, 0)
+                        )
+        except OSError:
+            pass
+        return "127.0.0.1"
+
     async def check_node(self) -> dict[str, object]:
         """Inspect node availability without launching anything."""
 
@@ -206,6 +228,8 @@ class MinecraftBotLauncher:
         if stale is not None:
             await self._finish_stderr_task()
             self._process = None
+        if server_host == "auto":
+            server_host = self.resolve_server_host(server_host)
         node_check = await self.check_node()
         if not node_check["available"]:
             return {

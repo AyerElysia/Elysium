@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import httpx
@@ -137,6 +138,49 @@ class KookAPIClient:
         return url
 
     # ─── 用户/频道信息 ──────────────────────────────────────
+
+    # ─── 媒体下载 ───────────────────────────────────────────
+
+    async def download_media_bytes(self, url: str, timeout: float = 30.0) -> bytes:
+        """下载媒体资源（KOOK CDN 或外部 URL）。
+
+        使用独立于 API 客户端的连接（不带 Bot 鉴权头），超时与重定向自动跟随。
+        """
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            return resp.content
+
+    async def upload_asset_from_base64(self, b64_data: str, filename: str) -> str:
+        """解码 base64（兼容 base64| 前缀与 data: URL）并上传，返回 CDN URL。"""
+        import base64 as _base64
+
+        raw = b64_data
+        if raw.startswith("data:"):
+            raw = raw.split(",", 1)[1] if "," in raw else ""
+        elif raw.startswith("base64|"):
+            raw = raw[len("base64|"):]
+        elif raw.startswith("base64://"):
+            raw = raw[len("base64://"):]
+        file_data = _base64.b64decode(raw)
+        return await self.upload_asset(file_data, filename)
+
+    async def resolve_and_upload(self, data: str, filename: str) -> str:
+        """将任意来源媒体（base64 / http(s) URL / 本地路径）上传到 KOOK CDN。
+
+        KOOK 要求消息中的媒体资源必须由本 Bot 上传（否则"找不到资源"），
+        因此外部 URL 需先下载再转存。
+        """
+        if not data:
+            raise ValueError("媒体数据为空")
+        if data.startswith(("http://", "https://")):
+            file_data = await self.download_media_bytes(data)
+            return await self.upload_asset(file_data, filename)
+        if data.startswith(("base64|", "base64://", "data:")) or not os.path.exists(data):
+            return await self.upload_asset_from_base64(data, filename)
+        # 本地文件路径
+        with open(data, "rb") as f:
+            return await self.upload_asset(f.read(), filename)
 
     async def get_me(self) -> dict[str, Any]:
         """获取当前 Bot 信息。"""

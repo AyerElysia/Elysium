@@ -1,0 +1,26 @@
+{
+  "name": "kook_adapter",
+  "version": "1.0.0",
+  "description": "KOOK 平台适配器（WebSocket 直连，频道+私信）",
+  "author": "Elysium",
+  "license": "GPL-3.0",
+  "dependencies": {
+    "plugins": [],
+    "components": []
+  },
+  "include": [
+    {
+      "component_type": "adapter",
+      "component_name": "kook_adapter",
+      "dependencies": [],
+      "enabled": true
+    }
+  ],
+  "entry_point": "plugin.py",
+  "min_core_version": "1.0.0",
+  "python_dependencies": [
+    "httpx",
+    "websockets"
+  ],
+  "dependencies_required": true
+}

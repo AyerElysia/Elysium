@@ -104,6 +104,8 @@ class NapcatAdapter(BaseAdapter):
         # QQ 消息”代替连接本身的存活时间，否则正常的安静时段也会触发清理。
         self._close_wait_seen_at: dict[tuple[str, int], float] = {}
         self._watchdog_task: TaskInfo | None = None
+        # NapCat 连接状态跟踪：用于避免“未连接”稳定状态下重复刷 WARNING。
+        self._napcat_present: bool = False
 
     def _get_config(self) -> NapcatAdapterConfig | None:
         """获取当前插件配置。"""
@@ -374,13 +376,22 @@ class NapcatAdapter(BaseAdapter):
         napcat_pid = await self._find_napcat_pid(ws_port)
 
         if napcat_pid is None:
-            # NapCat 还没连接，或连接在其他端口，暂时跳过
-            if silence_secs > self._SILENCE_WARN_THRESHOLD:
-                logger.warning(
-                    f"[NapCat Watchdog] QQ 消息已静默 {silence_secs:.0f}s，"
-                    f"且未能检测到 NapCat 进程（WS port={ws_port}）"
+            # NapCat 未连接（未启动或已退出）。这是一个稳定状态，不应每轮刷
+            # WARNING。仅在连接状态由“已连接”变为“未连接”时记录一次 INFO；
+            # 长时间无变化时保持安静。真正的僵尸连接（CLOSE-WAIT）检测只在
+            # NapCat 已连接时进行，因此此处直接返回即可。
+            if self._napcat_present:
+                logger.info(
+                    f"[NapCat Watchdog] NapCat 已断开（WS port={ws_port}），"
+                    f"QQ 消息已静默 {silence_secs:.0f}s"
                 )
+                self._napcat_present = False
             return
+
+        # NapCat 已连接：首次检测到时记录一次恢复，避免静默无感知。
+        if not self._napcat_present:
+            logger.info(f"[NapCat Watchdog] NapCat 已连接（pid={napcat_pid}）")
+            self._napcat_present = True
 
         # 2. 查该 PID 的 CLOSE-WAIT 外部连接
         close_wait_sockets = await self._get_close_wait_sockets(napcat_pid)

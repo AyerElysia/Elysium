@@ -686,7 +686,11 @@ async def test_preflight_rejects_launcher_without_exact_quick_play(
     token_file.write_text('{"authentication_token":"secret"}', encoding="utf-8")
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(mc_home=tmp_path, agent_token_file=token_file),
+        mc_config=MCConfig(
+            mc_home=tmp_path,
+            agent_token_file=token_file,
+            shared_world_enabled=False,
+        ),
     )
     session._launcher = _MissingQuickPlayLauncher()
 
@@ -743,6 +747,7 @@ async def test_session_rejects_authenticated_title_screen(tmp_path: Path) -> Non
             mc_home=tmp_path,
             bridge_ready_timeout_seconds=1,
             world_ready_timeout_seconds=0.01,
+            shared_world_enabled=False,
         ),
     )
     session._launcher = _Launcher()
@@ -770,6 +775,7 @@ async def test_session_rejects_wrong_singleplayer_world(tmp_path: Path) -> None:
             mc_home=tmp_path,
             bridge_ready_timeout_seconds=1,
             world_ready_timeout_seconds=0.01,
+            shared_world_enabled=False,
         ),
     )
     session._launcher = _Launcher()
@@ -795,6 +801,7 @@ async def test_session_rejects_paused_singleplayer_world(tmp_path: Path) -> None
             mc_home=tmp_path,
             bridge_ready_timeout_seconds=1,
             world_ready_timeout_seconds=0.01,
+            shared_world_enabled=False,
         ),
     )
     session._launcher = _Launcher()
@@ -1010,3 +1017,45 @@ async def test_failed_world_receipt_remains_retryable_and_uncommitted(
     )
     assert world_trace_receipt_size(delivered[0]["value"]) <= 8 * 1024
     await session.stop()
+
+
+async def test_shared_world_preflight_skips_singleplayer_quick_play(
+    tmp_path: Path,
+) -> None:
+    """Her own client joins the LAN world, so singleplayer gates do not apply."""
+
+    token_file = tmp_path / "agent-token.json"
+    token_file.write_text('{"authentication_token":"secret"}', encoding="utf-8")
+    session = MinecraftSession(
+        workspace=tmp_path,
+        mc_config=MCConfig(
+            mc_home=tmp_path,
+            agent_token_file=token_file,
+            shared_world_enabled=True,
+        ),
+    )
+    session._launcher = _MissingQuickPlayLauncher()
+
+    result = await session.preflight(body_name="agent")
+
+    blockers = result.get("blockers") or []
+    assert not any("--quickPlaySingleplayer" in item for item in blockers)
+    assert not any("configured world does not exist" in item for item in blockers)
+
+
+async def test_shared_world_agent_readiness_uses_server_semantics(
+    tmp_path: Path,
+) -> None:
+    """Shared-world agents must not be blocked by singleplayer world name."""
+
+    session = MinecraftSession(
+        workspace=tmp_path,
+        mc_config=MCConfig(mc_home=tmp_path, shared_world_enabled=True),
+    )
+    assert session._body_profiles()["agent"].readiness_kind == "server_world"
+
+    solo = MinecraftSession(
+        workspace=tmp_path,
+        mc_config=MCConfig(mc_home=tmp_path, shared_world_enabled=False),
+    )
+    assert solo._body_profiles()["agent"].readiness_kind == "structured_world"

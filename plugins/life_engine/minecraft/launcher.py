@@ -60,9 +60,19 @@ class MCConfig:
     bot_bridge_listen_uri: str | None = "ws://127.0.0.1:18767/elysium"
     # Workspace-relative; the session generates the token file on first start.
     bot_token_file: str = "minecraft/bot_bridge_token.json"
-    bot_server_host: str = "127.0.0.1"
+    # "auto" resolves the WSL default gateway (Windows host) at launch time.
+    bot_server_host: str = "auto"
     bot_server_port: int = 25565
-    bot_username: str = "AyerElysia"
+    # Must differ from the human player's in-game account name.
+    bot_username: str = "Elysia"
+    # Shared-world mode: her own client window joins the LAN world opened by
+    # the human player, giving her a true first-person view (her own eyes).
+    # When disabled she launches the configured singleplayer world instead.
+    shared_world_enabled: bool = True
+    agent_shared_username: str = "Elysia"
+    # Her continuous play cadence while a session is active; the service
+    # heartbeat loop accelerates to this interval during play.
+    game_turn_interval_seconds: int = 5
     bot_observation_interval_ms: int = 1000
     bot_entity_radius_blocks: int = 32
     planner_task_name: str = "agent"
@@ -101,6 +111,8 @@ class MCConfig:
             raise ValueError("bot_observation_interval_ms must be positive")
         if self.bot_entity_radius_blocks <= 0:
             raise ValueError("bot_entity_radius_blocks must be positive")
+        if self.game_turn_interval_seconds <= 0:
+            raise ValueError("game_turn_interval_seconds must be positive")
 
 
 @dataclass(slots=True)
@@ -235,10 +247,14 @@ class MinecraftLauncher:
 
         await asyncio.to_thread(self._configure_options)
 
+        launch_bat = self._cfg.launch_bat
+        if self._cfg.shared_world_enabled:
+            launch_bat = str(self.prepare_shared_world_bat())
+
         # Dispatch through an exact Windows-side helper to avoid WSL quoting ambiguity.
         try:
             dispatch_pid = await self._bridge.launch_minecraft(
-                self._cfg.launch_bat,
+                launch_bat,
                 self._cfg.launch_dir,
             )
             logger.info(
@@ -319,6 +335,54 @@ class MinecraftLauncher:
     def world_exists(self) -> bool:
         """检查世界是否存在。"""
         return self.get_world_path().exists()
+
+    @staticmethod
+    def _wsl_mount_path(windows_path: str) -> Path:
+        """Map a Windows drive path onto the WSL /mnt mount."""
+
+        pure = PureWindowsPath(windows_path)
+        drive = pure.drive[:1].lower()
+        if not drive:
+            raise ValueError(f"launch_bat must be an absolute drive path: {windows_path}")
+        return Path(f"/mnt/{drive}") / Path(*pure.parts[1:])
+
+    def prepare_shared_world_bat(self) -> PureWindowsPath:
+        """Derive a shared-world launch script from the configured template.
+
+        The shared script points her client at the LAN world opened by the
+        human player (quickPlayMultiplayer) and plays under her own username,
+        so the window that WinBridge captures is genuinely her point of view.
+        """
+        from .bot_launcher import MinecraftBotLauncher
+
+        template_path = self._wsl_mount_path(self._cfg.launch_bat)
+        template = template_path.read_text(encoding="utf-8", errors="replace")
+
+        host = MinecraftBotLauncher.resolve_server_host(self._cfg.bot_server_host)
+        address = f"{host}:{self._cfg.bot_server_port}"
+
+        multiplayer, replaced = re.subn(
+            r'''--quickPlaySingleplayer(?:=|\s+)(?:"[^"]*"|'[^']*'|\S+)''',
+            f'--quickPlayMultiplayer "{address}"',
+            template,
+            count=1,
+        )
+        if replaced != 1:
+            raise ValueError(
+                "launch template has no --quickPlaySingleplayer entry to convert"
+            )
+        multiplayer, replaced = re.subn(
+            r"--username\s+\S+",
+            f"--username {self._cfg.agent_shared_username}",
+            multiplayer,
+            count=1,
+        )
+        if replaced != 1:
+            raise ValueError("launch template has no --username entry to convert")
+
+        shared_path = template_path.with_name("LaunchElysiaShared.bat")
+        shared_path.write_text(multiplayer, encoding="utf-8")
+        return PureWindowsPath(self._cfg.launch_bat).parent / shared_path.name
 
     def _launch_script_path(self) -> Path:
         """Translate one explicit Windows launch script into its WSL path."""

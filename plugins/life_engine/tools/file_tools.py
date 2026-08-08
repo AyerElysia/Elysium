@@ -33,13 +33,13 @@ from ..memory.eligibility import (
     read_workspace_document,
 )
 from ..memory.prompting import build_memory_write_warning
-from ..trace.store import LifeTraceStore
 from ._utils import (
     _get_workspace,
     _pick_latest_target_stream_id,
     _resolve_path,
 )
 from .bounded_projection import (
+    BoundedContinuationError,
     project_bounded_items,
     project_bounded_text,
     sha256_json,
@@ -880,52 +880,12 @@ class LifeEngineReadFileTool(BaseTool):
                 return False, "read file projection exceeded its byte budget"
 
             return True, result_data
-        except ValueError as e:
-            if str(e) != "bounded-text continuation does not match query/task/frontier":
-                logger.error(f"读取文件失败 {path}: {e}", exc_info=True)
-                return False, f"读取文件失败: {e}"
-            # continuation 过期（任务切换 / 文件变更 / frontier 变化）：
-            # 丢弃 cursor 从头重新投影一次，而不是让整个工具调用失败。
-            logger.debug(
-                f"读取文件 continuation 过期，已重置从头读取: path={path}"
+        except BoundedContinuationError as e:
+            logger.warning(
+                "读取文件续读游标已拒绝: "
+                f"error_type={type(e).__name__}"
             )
-            try:
-                result_data = project_bounded_text(
-                    projection_name="workspace-file-read",
-                    task_name=getattr(self, "_runtime_task_name", ""),
-                    requested_max_bytes=max_bytes,
-                    binding={
-                        "path": normalized_path,
-                        "offset": int(offset),
-                        "limit": int(limit),
-                        "encoding": str(encoding),
-                    },
-                    frontier={
-                        "path": normalized_path,
-                        "size": stat.st_size,
-                        "mtime_ns": stat.st_mtime_ns,
-                        "content_sha256": file_sha256,
-                    },
-                    base_payload={
-                        **base_payload,
-                        "continuation_discarded": True,
-                    },
-                    content=numbered_content,
-                    content_ref=(
-                        f"workspace-file:{normalized_path}:sha256:{file_sha256}"
-                    ),
-                    continuation="",
-                )
-                if len(str(result_data).encode("utf-8")) > result_data["budget_bytes"]:
-                    return False, "read file projection exceeded its byte budget"
-                return True, result_data
-            except Exception as retry_error:  # noqa: BLE001
-                logger.error(
-                    f"读取文件失败 {path}（continuation 重置后仍失败）: "
-                    f"{retry_error}",
-                    exc_info=True,
-                )
-                return False, f"读取文件失败: {retry_error}"
+            return False, f"读取文件失败: {e}"
         except UnicodeDecodeError as e:
             return False, f"文件编码错误，请尝试其他编码: {e}"
         except Exception as e:
@@ -1312,6 +1272,12 @@ class LifeEngineListFilesTool(BaseTool):
             if len(str(result).encode("utf-8")) > result["budget_bytes"]:
                 return False, "list files projection exceeded its byte budget"
             return True, result
+        except BoundedContinuationError as e:
+            logger.warning(
+                "列出目录续读游标已拒绝: "
+                f"error_type={type(e).__name__}"
+            )
+            return False, f"列出目录失败: {e}"
         except Exception as e:
             logger.error(f"列出目录失败 {path}: {e}", exc_info=True)
             return False, f"列出目录失败: {e}"

@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import queue
+import select
 import sys
 import threading
 from typing import TYPE_CHECKING, Any, Callable
@@ -64,7 +66,20 @@ class CommandParser:
         """后台读取标准输入并写入队列。"""
         while not self._input_stop_event.is_set():
             try:
-                line = input("")
+                if os.name != "nt":
+                    try:
+                        ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+                    except (OSError, TypeError, ValueError) as exc:
+                        self._input_queue.put(exc)
+                        break
+                    if not ready:
+                        continue
+                    line = sys.stdin.readline()
+                    if line == "":
+                        raise EOFError
+                    line = line.rstrip("\n")
+                else:
+                    line = input("")
                 self._input_queue.put(line)
             except EOFError as exc:
                 self._input_queue.put(exc)
@@ -79,6 +94,13 @@ class CommandParser:
     def close(self) -> None:
         """关闭命令解析器资源。"""
         self._input_stop_event.set()
+        input_thread = getattr(self, "_input_thread", None)
+        if (
+            input_thread is not None
+            and input_thread is not threading.current_thread()
+            and input_thread.is_alive()
+        ):
+            input_thread.join(timeout=0.5)
 
     async def _get_next_input(
         self, timeout: float = 0.2

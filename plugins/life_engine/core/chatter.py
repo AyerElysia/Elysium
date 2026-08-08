@@ -300,11 +300,10 @@ class LifeSendTextAction(BaseAction):
         "thought 必须是本次动作真实、非空的思考；其他确实不适用的内在字段可传空字符串，"
         "禁止编造 neutral/general 等占位语义。"
         "这些字段会与最终回复保存在同一模型轨迹中，供人格连续性与后训练使用。"
-        "content 只能是字符串；若需分多条发送，用换行符（\\n）分隔各段，"
-        "例如 \"你好\\n请问你是谁？\\n找我有什么事吗？\"，将依次发出 3 条消息。"
+        "content 只能是字符串；换行符（\\n）只负责同一条消息内的排版，"
+        "不会把一次 life_send_text 动作拆成多次平台发送。"
         "content 中只能包含要发给用户的纯文本正文。"
         "严禁把 reason/thought/expected_reaction 等元信息写进 content。"
-        "分段消息会按顺序发送，并自动模拟段间打字延迟。"
         "私聊场景下 reply_to 默认不要使用，除非确实需要引用某条历史消息来避免歧义。"
         "target_key 通常留空，表示回复当前聊天；只有明确要发到后缀提示词"
         "“可发送目标”列表中的其他聊天时，才填写列表给出的 target_key。"
@@ -354,7 +353,8 @@ class LifeSendTextAction(BaseAction):
             return []
         normalized = text.replace("\r\n", "\n").replace("\r", "\n")
         normalized = normalized.replace("\\n", "\n")
-        return [part.strip() for part in re.split(r"\n+", normalized) if part.strip()]
+        normalized = normalized.strip()
+        return [normalized] if normalized else []
 
     @staticmethod
     def _extract_leading_json_array(text: str) -> str | None:
@@ -608,7 +608,7 @@ class LifeSendTextAction(BaseAction):
         content: Annotated[
             str,
             "要发送给用户的纯文本内容。仅允许 string；"
-            "多段用换行符（\\n）分隔，每段将作为独立消息依次发送。"
+            "换行符（\\n）只用于同一条消息内的排版，不会拆分为多次发送。"
             "禁止把 reason/thought 等元信息写进 content。",
         ],
         thought: Annotated[

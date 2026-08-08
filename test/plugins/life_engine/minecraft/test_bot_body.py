@@ -308,6 +308,16 @@ endpoint.start();
             await process.wait()
 
 
+def test_resolve_server_host_auto_returns_ipv4() -> None:
+    """Auto host resolution yields a concrete IPv4 address, never "auto"."""
+
+    resolved = MinecraftBotLauncher.resolve_server_host("auto")
+    parts = resolved.split(".")
+    assert len(parts) == 4
+    assert all(part.isdigit() for part in parts)
+    assert MinecraftBotLauncher.resolve_server_host("192.0.2.10") == "192.0.2.10"
+
+
 def test_ensure_token_is_idempotent(tmp_path: Path) -> None:
     """Token bootstrap never replaces an existing generated token."""
 
@@ -358,7 +368,7 @@ async def test_bot_start_and_stop_own_the_process(tmp_path: Path) -> None:
     assert len(launcher.starts) == 1
     start_request = launcher.starts[0]
     assert start_request["bridge_uri"] == "ws://127.0.0.1:18767/elysium"
-    assert start_request["server_host"] == "127.0.0.1"
+    assert start_request["server_host"] == "auto"
     assert start_request["server_port"] == 25565
     assert start_request["token"]
 

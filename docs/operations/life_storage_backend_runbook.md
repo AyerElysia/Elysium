@@ -110,6 +110,8 @@ Life Engine 插件文件不再包含 `[storage]` 或 `[storage_mysql]`。它只�
 
 MySQL 模式不使用入口级 `data/runtime/elysium.lock`；不同 worktree 可以同时打开同一 generation，并并发处理互不冲突的领域数据。每个完整 Elysium 进程仍需拥有不冲突的 HTTP 端口、临时目录和不可共享外部适配器会话；若它们都要拥有同一个 `runtime_context/global`，只有取得 writer claim 的进程能启动到可写状态，其他进程必须显示 owner/epoch 诊断并失败关闭。认证失败、TLS/权限错误、schema 漂移、generation 不匹配、单例 claim 冲突、端口冲突和外部会话争用都不能用静默 local 回退或空实现伪装成功。
 
+正常关闭和插件启动回滚都必须在 `finally` 路径释放当前进程已经取得的 singleton writer claims；运行上下文保存冲突、消费者关闭失败或领域 store 尚未完成挂载，均不得跳过 claim 撤销与 runtime 关闭。`LifeEngineService` 启动时，`runtime_context` 与 `learning` 两个 claim 共用一个最长为一个 lease 周期加单次短轮询余量的 monotonic deadline：上一实例异常退出但 lease 尚未自然到期时，新实例只轮询调用原子 acquire，由数据库时间判定到期并 takeover；若真实 owner 持续 renew，则到期保留 owner/epoch 诊断并 fail closed。两个 claim 不得各自重置 deadline；取消、非冲突错误和第二 claim 失败都必须立即传播并释放已取得的第一 claim。遇到 `SingletonWriterAlreadyClaimed` 时，不得删除 claim 行、强制改 epoch、解析 owner PID 后抢占或自动修改 token：可只读核对 owner、数据库时间的 `lease_until` 与只追加 claim events，但 lease 是否过期只由 acquire 事务内的数据库时间裁决。正常退出应产生 `released` 事件，异常退出则只能在租约自然过期后 takeover。
+
 ### 6.1 Memory 隔离合同验证
 
 Memory 的本地合同测试不需要外部服务；真实 MySQL 合同测试必须显式指向专用测试库，并通过以下环境变量提供连接：

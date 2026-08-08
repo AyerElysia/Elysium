@@ -41,6 +41,7 @@ from plugins.life_engine.storage.multi_writer_protocol import (
     MultiWriterProtocolError,
     MultiWriterRuntimeState,
 )
+from plugins.life_engine.storage.writer_claims import SingletonWriterClaimConflict
 from src.core.config.core_config import CoreConfig
 from test.plugins.life_engine.presence_world_fakes import build_fake_stores
 
@@ -860,6 +861,265 @@ async def test_service_stop_aggregates_consumer_failures_and_closes_runtime_last
     assert "injected learning consumer close failure" in rendered
     assert "selected Presence/World storage shutdown failed" in rendered
     assert runtimes[0].close_calls == 1
+
+
+async def test_service_stop_releases_writer_when_runtime_context_save_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stores = build_fake_stores()
+    ledger = _FakeLifeEventStore()
+    runtimes, _ = _install_selected_factories(
+        monkeypatch,
+        BackendKind.MYSQL,
+        stores,
+        ledger,
+    )
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+    await service._start_selected_storage()
+
+    async def _failed_save() -> None:
+        raise RuntimeError("injected runtime-context revision conflict")
+
+    async def _no_op() -> None:
+        return None
+
+    monkeypatch.setattr(service, "_save_runtime_context", _failed_save)
+    monkeypatch.setattr(core_module, "cleanup_autonomy_schedules", lambda *_: _no_op())
+
+    with pytest.raises(ExceptionGroup, match="consumer failures") as captured:
+        await service.stop()
+
+    rendered = "\n".join(str(item) for item in captured.value.exceptions)
+    assert "injected runtime-context revision conflict" in rendered
+    assert runtimes[0].revoke_calls == 1
+    assert runtimes[0].close_calls == 1
+    assert service._storage_runtime is None
+
+
+async def test_failed_selected_storage_start_releases_partial_writer_claims(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stores = build_fake_stores()
+    ledger = _FakeLifeEventStore()
+    runtimes, _ = _install_selected_factories(
+        monkeypatch,
+        BackendKind.MYSQL,
+        stores,
+        ledger,
+    )
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+
+    async def _failed_learning_open(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("injected learning store attachment failure")
+
+    monkeypatch.setattr(
+        "plugins.life_engine.storage.learning_factory.open_learning_stores",
+        _failed_learning_open,
+    )
+
+    with pytest.raises(RuntimeError, match="attachment failure"):
+        await service._start_selected_storage()
+
+    assert len(runtimes[0].claim_calls) == 2
+    assert service._runtime_state_store is None
+    await service.stop()
+
+    assert runtimes[0].revoke_calls == 1
+    assert runtimes[0].close_calls == 1
+    assert service._storage_runtime is None
+
+
+async def test_selected_storage_waits_for_crash_left_claim_then_takes_over(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stores = build_fake_stores()
+    ledger = _FakeLifeEventStore()
+    runtimes, _ = _install_selected_factories(
+        monkeypatch,
+        BackendKind.MYSQL,
+        stores,
+        ledger,
+    )
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+    await service._open_selected_storage_runtime()
+    runtime = runtimes[0]
+    original_acquire = runtime.acquire_singleton_writer
+    runtime_context_attempts = 0
+
+    async def _acquire_after_expiry(**kwargs: Any) -> Any:
+        nonlocal runtime_context_attempts
+        if kwargs["namespace"] == "life_engine.runtime_context":
+            runtime_context_attempts += 1
+            if runtime_context_attempts < 3:
+                raise SingletonWriterClaimConflict(
+                    "SingletonWriterAlreadyClaimed:life_engine.runtime_context:"
+                    "global:owner=previous:epoch=9"
+                )
+        return await original_acquire(**kwargs)
+
+    async def _fast_sleep(_delay: float) -> None:
+        return None
+
+    runtime.acquire_singleton_writer = _acquire_after_expiry
+    monkeypatch.setattr(core_module.asyncio, "sleep", _fast_sleep)
+
+    await service._start_selected_storage()
+
+    assert runtime_context_attempts == 3
+    assert [call["namespace"] for call in runtime.claim_calls] == [
+        "life_engine.runtime_context",
+        "life_engine.learning",
+    ]
+    await service._close_selected_storage()
+
+
+async def test_selected_storage_live_claim_times_out_without_stealing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stores = build_fake_stores()
+    ledger = _FakeLifeEventStore()
+    runtimes, _ = _install_selected_factories(
+        monkeypatch,
+        BackendKind.MYSQL,
+        stores,
+        ledger,
+    )
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+    await service._open_selected_storage_runtime()
+    runtime = runtimes[0]
+    attempts = 0
+
+    async def _always_conflict(**_kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        raise SingletonWriterClaimConflict(
+            "SingletonWriterAlreadyClaimed:life_engine.runtime_context:"
+            "global:owner=live:epoch=10"
+        )
+
+    async def _fast_sleep(_delay: float) -> None:
+        return None
+
+    runtime.acquire_singleton_writer = _always_conflict
+    monotonic_values = iter((100.0, 100.0, 221.1))
+    monkeypatch.setattr(
+        core_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(monotonic_values)),
+    )
+    monkeypatch.setattr(core_module.asyncio, "sleep", _fast_sleep)
+
+    async def _start_selected_only() -> None:
+        await service._start_selected_storage()
+
+    monkeypatch.setattr(service, "_start_impl", _start_selected_only)
+
+    with pytest.raises(SingletonWriterClaimConflict, match="owner=live:epoch=10"):
+        await service.start()
+
+    assert attempts == 2
+    assert runtime.revoke_calls == 1
+    assert runtime.close_calls == 1
+
+
+async def test_selected_storage_claim_wait_is_cancellable_and_cleans_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stores = build_fake_stores()
+    ledger = _FakeLifeEventStore()
+    runtimes, _ = _install_selected_factories(
+        monkeypatch,
+        BackendKind.MYSQL,
+        stores,
+        ledger,
+    )
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+    await service._open_selected_storage_runtime()
+    runtime = runtimes[0]
+    conflict_seen = asyncio.Event()
+    sleep_started = asyncio.Event()
+
+    async def _always_conflict(**_kwargs: Any) -> Any:
+        conflict_seen.set()
+        raise SingletonWriterClaimConflict(
+            "SingletonWriterAlreadyClaimed:life_engine.runtime_context:"
+            "global:owner=previous:epoch=9"
+        )
+
+    async def _cancellable_sleep(_delay: float) -> None:
+        sleep_started.set()
+        await asyncio.Event().wait()
+
+    runtime.acquire_singleton_writer = _always_conflict
+    monkeypatch.setattr(core_module.asyncio, "sleep", _cancellable_sleep)
+
+    async def _start_selected_only() -> None:
+        await service._start_selected_storage()
+
+    monkeypatch.setattr(service, "_start_impl", _start_selected_only)
+
+    startup = asyncio.create_task(service.start())
+    await asyncio.wait_for(conflict_seen.wait(), timeout=1.0)
+    await asyncio.wait_for(sleep_started.wait(), timeout=1.0)
+    startup.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await startup
+
+    assert runtime.revoke_calls == 1
+    assert runtime.close_calls == 1
+
+
+async def test_selected_storage_claims_share_one_startup_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stores = build_fake_stores()
+    ledger = _FakeLifeEventStore()
+    runtimes, _ = _install_selected_factories(
+        monkeypatch,
+        BackendKind.MYSQL,
+        stores,
+        ledger,
+    )
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+    await service._open_selected_storage_runtime()
+    runtime = runtimes[0]
+    original_acquire = runtime.acquire_singleton_writer
+    learning_attempts = 0
+
+    async def _learning_conflict(**kwargs: Any) -> Any:
+        nonlocal learning_attempts
+        if kwargs["namespace"] == "life_engine.learning":
+            learning_attempts += 1
+            raise SingletonWriterClaimConflict(
+                "SingletonWriterAlreadyClaimed:life_engine.learning:"
+                "selected_persistence:owner=live:epoch=4"
+            )
+        return await original_acquire(**kwargs)
+
+    runtime.acquire_singleton_writer = _learning_conflict
+    monotonic_values = iter((100.0, 221.1))
+    monkeypatch.setattr(
+        core_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(monotonic_values)),
+    )
+
+    async def _start_selected_only() -> None:
+        await service._start_selected_storage()
+
+    monkeypatch.setattr(service, "_start_impl", _start_selected_only)
+    with pytest.raises(SingletonWriterClaimConflict, match="epoch=4"):
+        await service.start()
+
+    assert learning_attempts == 1
+    assert runtime.revoke_calls == 1
+    assert runtime.close_calls == 1
 
 
 async def test_presence_outbox_limit_fails_without_losing_remaining_evidence() -> None:

@@ -66,6 +66,12 @@ im.message.receive_v1
 不会再打印带 `access_key` / `ticket` 的完整连接地址。持续连接失败仍会保留首条诊断，
 相同错误最多每 5 分钟输出一次。
 
+长连接健康由当前 Lark SDK 客户端自己的连接、帧收发和重连状态证明。没有新聊天消息
+不代表连接失活；SDK ping/pong 仍属于有效传输活动。监控线程只会在唯一的长连接 owner
+线程已经退出后创建替代客户端，不扫描或关闭进程内其他 HTTPS `CLOSE-WAIT` socket，
+也不会从外部强停 SDK 事件循环。关闭适配器时，owner loop 先断开客户端、取消其任务并
+正常返回，避免产生 `Event loop stopped before Future completed`。
+
 ## 可选：HTTP 回调接入
 
 如果你有公网 HTTPS 域名，也可以设置：

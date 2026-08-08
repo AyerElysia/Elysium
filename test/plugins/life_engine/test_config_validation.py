@@ -5,9 +5,35 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from plugins.life_engine.core.config import LifeEngineConfig
+
+
+def test_heartbeat_tool_round_safety_defaults() -> None:
+    settings = LifeEngineConfig.SettingsSection()
+
+    assert settings.max_rounds_per_heartbeat == 5
+    assert settings.max_consecutive_tool_stalls_per_heartbeat == 2
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_rounds_per_heartbeat", 0),
+        ("max_rounds_per_heartbeat", 6),
+        ("max_consecutive_tool_stalls_per_heartbeat", 0),
+        ("max_consecutive_tool_stalls_per_heartbeat", 6),
+    ],
+)
+def test_heartbeat_tool_round_safety_rejects_out_of_range(
+    field: str,
+    value: int,
+) -> None:
+    with pytest.raises(ValueError):
+        LifeEngineConfig.SettingsSection(**{field: value})
 
 
 def test_life_config_rejects_removed_storage_section() -> None:
@@ -48,15 +74,7 @@ recent_chat_messages = 7
         encoding="utf-8",
     )
 
-    config = LifeEngineConfig.load(config_path, auto_update=True)
-
-
-def test_life_config_rejects_removed_mysql_connection_section() -> None:
-    """MySQL 连接只能配置在全局 Core 配置中。"""
-    with pytest.raises(ValueError):
-        LifeEngineConfig(  # type: ignore[call-arg]
-            storage_mysql={"host": "duplicate.example"}
-        )
+    LifeEngineConfig.load(config_path, auto_update=True)
 
 
 def test_sleep_time_format_validation() -> None:

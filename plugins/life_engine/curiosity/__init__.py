@@ -5,6 +5,7 @@ from .engine import (
     CuriositySignal,
     EpistemicOpportunity,
     EpistemicOpportunityStateError,
+    EpistemicOpportunityTimeoutError,
     format_curiosity_signal,
     format_epistemic_opportunity,
 )
@@ -14,6 +15,7 @@ __all__ = [
     "CuriositySignal",
     "EpistemicOpportunity",
     "EpistemicOpportunityStateError",
+    "EpistemicOpportunityTimeoutError",
     "format_curiosity_signal",
     "format_epistemic_opportunity",
 ]

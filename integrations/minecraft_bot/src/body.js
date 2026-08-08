@@ -376,7 +376,13 @@ export class MineflayerBody {
     const bot = this.bot;
     const result = {};
     for (const name of [...HELD_CONTROL_NAMES, "attack", "use"]) {
-      result[name] = Boolean(bot.getControlState(name));
+      try {
+        result[name] = Boolean(bot.getControlState(name));
+      } catch {
+        // attack/use are pulse actions (bot.attack / activateBlock) and
+        // expose no held control state in mineflayer.
+        result[name] = false;
+      }
     }
     return result;
   }

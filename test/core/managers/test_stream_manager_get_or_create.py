@@ -396,6 +396,112 @@ async def test_load_stream_context_respects_context_cleared_at(monkeypatch) -> N
     assert fake_query.limit_value == 20
 
 
+async def test_load_stream_context_bulk_hydrates_repeated_senders(monkeypatch) -> None:
+    """冷启动恢复的数据库查询数应按唯一身份计，而不是按历史消息数增长。"""
+    from src.core.managers.stream_manager import StreamManager
+
+    manager = StreamManager()
+    manager._streams_crud.get_by = AsyncMock(
+        return_value=SimpleNamespace(
+            stream_id="stream-bulk-restore-001",
+            chat_type="group",
+            context_cleared_at=None,
+        )
+    )
+
+    def _record(index: int, *, person_id: str, platform: str = "qq") -> SimpleNamespace:
+        return SimpleNamespace(
+            message_id=f"message-{index}",
+            stream_id="stream-bulk-restore-001",
+            person_id=person_id,
+            time=float(index),
+            reply_to=None,
+            content=f"content-{index}",
+            processed_plain_text=f"text-{index}",
+            message_type="text",
+            platform=platform,
+        )
+
+    chronological_records = [
+        *(_record(index, person_id="person-a") for index in range(300)),
+        *(_record(index + 300, person_id="person-b") for index in range(300)),
+        *(_record(index + 600, person_id="bot") for index in range(100)),
+    ]
+    records = list(reversed(chronological_records))
+
+    class _FakeQuery:
+        def filter(self, **_kwargs):
+            return self
+
+        def order_by(self, _value: str):
+            return self
+
+        def limit(self, _value: int):
+            return self
+
+        async def all(self):
+            return records
+
+    monkeypatch.setattr(
+        "src.core.managers.stream_manager.QueryBuilder",
+        lambda _model: _FakeQuery(),
+    )
+
+    people = [
+        SimpleNamespace(
+            person_id="person-a",
+            user_id="user-a",
+            nickname="Alice",
+            cardname="A",
+        ),
+        SimpleNamespace(
+            person_id="person-b",
+            user_id="user-b",
+            nickname="Bob",
+            cardname="B",
+        ),
+    ]
+    person_crud = SimpleNamespace(
+        get_multi=AsyncMock(return_value=people),
+        get_by=AsyncMock(side_effect=AssertionError("per-message lookup is forbidden")),
+    )
+    monkeypatch.setattr(
+        "src.core.utils.user_query_helper.get_user_query_helper",
+        lambda: SimpleNamespace(person_crud=person_crud),
+    )
+
+    adapter_manager = SimpleNamespace(
+        get_bot_info_by_platform=AsyncMock(
+            return_value={"bot_id": "bot-id", "bot_name": "Elysia"}
+        )
+    )
+    monkeypatch.setattr(
+        "src.core.managers.adapter_manager.get_adapter_manager",
+        lambda: adapter_manager,
+    )
+    manager.get_stream_info = AsyncMock(  # type: ignore[method-assign]
+        side_effect=AssertionError("stream metadata must be reused")
+    )
+
+    context = await manager.load_stream_context(
+        "stream-bulk-restore-001",
+        max_messages=1000,
+    )
+
+    assert len(context.history_messages) == 700
+    assert context.history_messages[0].sender_name == "Alice"
+    assert context.history_messages[300].sender_name == "Bob"
+    assert context.history_messages[600].sender_name == "Elysia"
+    person_crud.get_multi.assert_awaited_once_with(
+        skip=0,
+        limit=2,
+        person_id=["person-a", "person-b"],
+    )
+    person_crud.get_by.assert_not_awaited()
+    manager.get_stream_info.assert_not_awaited()
+    adapter_manager.get_bot_info_by_platform.assert_awaited_once_with("qq")
+
+
 async def test_bulk_clear_streams_clears_matching_cached_streams(monkeypatch) -> None:
     """批量清空应只影响匹配类型的内存流，并持久化到数据库。"""
     from src.core.managers.stream_manager import StreamManager

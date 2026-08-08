@@ -14,9 +14,14 @@ from plugins.life_engine.tools.autonomy_tools import (
     LifeEngineManageAutonomyIntentTool,
 )
 from plugins.life_engine.tools.bounded_projection import (
+    BOUNDED_TOOL_CURSOR_VERSION,
+    BOUNDED_TOOL_PROJECTION_VERSION,
     CHAT_TOOL_RESULT_MAX_BYTES,
     CORE_TOOL_RESULT_MAX_BYTES,
+    _encode_legacy_cursor,
     project_bounded_items,
+    project_bounded_text,
+    sha256_json,
 )
 from plugins.life_engine.tools.event_grep_tools import LifeEngineGrepEventsTool
 from plugins.life_engine.tools.file_tools import (
@@ -24,6 +29,7 @@ from plugins.life_engine.tools.file_tools import (
     LifeEngineReadFileTool,
 )
 from plugins.life_engine.tools.grep_tools import LifeEngineGrepFileTool
+from src.kernel.llm.trajectory_types import sanitize_text_only
 
 
 def _serialized_bytes(payload: object) -> int:
@@ -118,6 +124,9 @@ def test_bounded_items_reject_tampered_or_stale_continuations() -> None:
     first = project_bounded_items(**kwargs)
     cursor = first["continuation"]
     assert cursor
+    assert cursor.startswith(f"{BOUNDED_TOOL_CURSOR_VERSION}.i.")
+    assert len(cursor.encode("utf-8")) <= 48
+    assert sanitize_text_only(cursor) == cursor
 
     replacement = "A" if cursor[-1] != "A" else "B"
     with pytest.raises(ValueError, match="continuation"):
@@ -126,6 +135,70 @@ def test_bounded_items_reject_tampered_or_stale_continuations() -> None:
     with pytest.raises(ValueError, match="query/task/frontier"):
         project_bounded_items(
             **{**kwargs, "frontier": {"revision": 2}},
+            continuation=cursor,
+        )
+
+
+def test_bounded_items_accept_already_issued_legacy_continuation() -> None:
+    kwargs = {
+        "projection_name": "legacy-cursor",
+        "task_name": "core",
+        "requested_max_bytes": 2048,
+        "binding": {"query": "q"},
+        "frontier": {"revision": 1},
+        "base_payload": {},
+        "items_key": "items",
+        "items": [{"value": "内容" * 1500}, {"value": "下一项"}],
+        "item_refs": ["item:1", "item:2"],
+    }
+    first = project_bounded_items(**kwargs)
+    identity = {
+        "version": BOUNDED_TOOL_PROJECTION_VERSION,
+        "projection": "legacy-cursor",
+        "task": "core",
+        "budget_bytes": 2048,
+        "binding_sha256": sha256_json(
+            {
+                "projection": "legacy-cursor",
+                "binding": {"query": "q"},
+                "task": "core",
+                "budget_bytes": 2048,
+            }
+        ),
+        "frontier_sha256": sha256_json({"revision": 1}),
+    }
+    legacy = _encode_legacy_cursor(
+        {**identity, "offset": first["delivered_items"]}
+    )
+
+    second = project_bounded_items(**kwargs, continuation=legacy)
+
+    assert second["page_offset"] == first["delivered_items"]
+
+
+def test_bounded_text_cursor_is_short_copyable_and_source_bound() -> None:
+    kwargs = {
+        "projection_name": "text-cursor",
+        "task_name": "core",
+        "requested_max_bytes": 2048,
+        "binding": {"path": "notes/example.md"},
+        "frontier": {"content_sha256": "source-v1"},
+        "base_payload": {"action": "read_file"},
+        "content": "星光与故事" * 5000,
+        "content_ref": "workspace-file:notes/example.md:sha256:source-v1",
+    }
+    first = project_bounded_text(**kwargs)
+    cursor = first["continuation"]
+
+    assert cursor.startswith(f"{BOUNDED_TOOL_CURSOR_VERSION}.b.")
+    assert len(cursor.encode("utf-8")) <= 48
+    assert sanitize_text_only(cursor) == cursor
+    second = project_bounded_text(**kwargs, continuation=cursor)
+    assert second["page_start_byte"] == first["page_end_byte"]
+
+    with pytest.raises(ValueError, match="query/task/frontier"):
+        project_bounded_text(
+            **{**kwargs, "frontier": {"content_sha256": "source-v2"}},
             continuation=cursor,
         )
 
@@ -279,10 +352,10 @@ async def test_read_file_limit_zero_uses_utf8_safe_bounded_pages(
 
 
 @pytest.mark.asyncio
-async def test_read_file_resets_continuation_after_file_change(
+async def test_read_file_rejects_continuation_after_file_change(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """文件变更后旧 continuation 失效：工具丢弃 cursor 从头重读，不整体失败。"""
     target = tmp_path / "changing.txt"
     target.write_text("旧内容" * 10000, encoding="utf-8")
     tool = LifeEngineReadFileTool(plugin=_workspace_plugin(tmp_path))
@@ -294,16 +367,14 @@ async def test_read_file_resets_continuation_after_file_change(
     assert first["continuation"]
     target.write_text("新内容" * 10000, encoding="utf-8")
 
-    ok, payload = await tool.execute(
+    ok, error = await tool.execute(
         path="changing.txt",
         limit=0,
         continuation=first["continuation"],
     )
-    assert ok is True
-    assert isinstance(payload, dict)
-    # cursor 已丢弃并从头重读，payload 明确标注，模型可感知分页已重置。
-    assert payload.get("continuation_discarded") is True
-    assert payload["content"].startswith("1\t新内容")
+    assert ok is False
+    assert "query/task/frontier" in str(error)
+    assert not [record for record in caplog.records if record.levelname == "ERROR"]
 
 
 @pytest.mark.asyncio

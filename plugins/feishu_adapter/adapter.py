@@ -6,7 +6,6 @@ import asyncio
 import base64
 import json
 import logging
-import os
 import re
 import shutil
 import subprocess
@@ -181,8 +180,12 @@ class FeishuAdapter(BaseAdapter):
         self._seen_event_ids: list[str] = []
         self._main_loop: asyncio.AbstractEventLoop | None = None
         self._long_connection_loop: asyncio.AbstractEventLoop | None = None
+        self._long_connection_stop_signal: asyncio.Event | None = None
         self._long_connection_thread: threading.Thread | None = None
         self._long_connection_client: Any | None = None
+        self._long_connection_state = "stopped"
+        self._long_connection_state_lock = threading.Lock()
+        self._last_lark_transport_activity_monotonic = 0.0
         # open_id/union_id -> 真实显示名。值为 "" 表示查过但查不到，
         # 用负缓存避免每条消息都去撞一次没权限的接口。
         self._display_name_cache: dict[str, str] = {}
@@ -198,7 +201,6 @@ class FeishuAdapter(BaseAdapter):
         self._private_chat_ids: dict[str, str] = {}
         # Feishu 连接监控
         self._feishu_stop_event = threading.Event()
-        self._last_feishu_ws_time: float = 0.0      # 最后一次收到 WS 事件的时间
         self._feishu_watchdog_thread: threading.Thread | None = None
         set_feishu_adapter(self)
         logger.info("FeishuAdapter 初始化完成")
@@ -211,7 +213,6 @@ class FeishuAdapter(BaseAdapter):
         if not config.app.app_id or not config.app.app_secret:
             logger.warning("FeishuAdapter 缺少 app_id/app_secret；入站可接收，出站发送会失败")
         self._feishu_stop_event.clear()
-        self._last_feishu_ws_time = time.time()
         if (
             config.connection.subscription_mode == "long_connection"
             and config.connection.auto_start_long_connection
@@ -249,7 +250,9 @@ class FeishuAdapter(BaseAdapter):
             return False
         if config.connection.subscription_mode == "long_connection":
             thread = self._long_connection_thread
-            return bool(thread and thread.is_alive())
+            with self._long_connection_state_lock:
+                state = self._long_connection_state
+            return bool(thread and thread.is_alive() and state == "connected")
         return True
 
     async def get_bot_info(self) -> dict[str, str]:  # type: ignore[override]
@@ -292,7 +295,7 @@ class FeishuAdapter(BaseAdapter):
         return raw_message
 
     def _start_feishu_watchdog(self) -> None:
-        """启动 Feishu 连接监控线程，专门检测 CLOSE-WAIT 僵尸连接并强制重连。"""
+        """启动 Feishu owner 线程监控。"""
         if self._feishu_watchdog_thread and self._feishu_watchdog_thread.is_alive():
             return
         thread = threading.Thread(
@@ -305,95 +308,23 @@ class FeishuAdapter(BaseAdapter):
         logger.info("[Feishu Watchdog] 飞书连接监控线程已启动")
 
     def _feishu_watchdog_loop(self) -> None:
-        """监控飞书 WebSocket 连接健康状态。
+        """仅在单一 owner 线程已经退出后恢复它。
 
-        每 60 秒检查一次：
-        1. 连接线程死了 → 重启
-        2. 线程活着但 TCP 连接卡在 CLOSE-WAIT → 强制重连
+        SDK 自身负责 ping/pong 和自动重连。进程内的 ``:443`` ``CLOSE-WAIT``
+        无法证明 socket 属于飞书，因此不能授权 watchdog 关闭一个仍存活的 SDK。
         """
-        CHECK_INTERVAL = 60       # 每 60 秒检查一次
-        STALE_THRESHOLD = 300     # 5 分钟无任何 WS 活动才触发 CLOSE-WAIT 检测
-
-        while not self._feishu_stop_event.wait(timeout=CHECK_INTERVAL):
+        while not self._feishu_stop_event.wait(timeout=60.0):
             try:
                 thread = self._long_connection_thread
                 if thread is None:
                     continue
-
-                # 1. 线程已死 → 重启
                 if not thread.is_alive():
-                    logger.warning("[Feishu Watchdog] 长连接线程已停止，重启中...")
+                    logger.warning(
+                        "[Feishu Watchdog] 长连接 owner 线程已退出，重新创建单一客户端"
+                    )
                     self._start_long_connection()
-                    continue
-
-                # 2. 线程活着但可能是 CLOSE-WAIT 僵尸
-                idle_secs = time.time() - self._last_feishu_ws_time
-                if idle_secs > STALE_THRESHOLD:
-                    if self._detect_feishu_close_wait():
-                        logger.warning(
-                            f"[Feishu Watchdog] 检测到 CLOSE-WAIT 僵尸连接"
-                            f"（已 {idle_secs:.0f}s 无 WS 活动），强制重连..."
-                        )
-                        self._force_restart_long_connection()
-                    else:
-                        logger.debug(
-                            f"[Feishu Watchdog] 已 {idle_secs:.0f}s 无 WS 活动，"
-                            f"未检测到 CLOSE-WAIT，连接状态正常"
-                        )
-
             except Exception as exc:
                 logger.error(f"[Feishu Watchdog] 监控循环异常: {exc}", exc_info=True)
-
-    def _detect_feishu_close_wait(self) -> bool:
-        """检测本进程是否存在到 Feishu 服务器 443 端口的 CLOSE-WAIT 连接。"""
-        try:
-            pid = str(os.getpid())
-            result = subprocess.run(
-                ["ss", "-tnp", "state", "close-wait"],
-                capture_output=True, text=True, timeout=5,
-            )
-            for line in result.stdout.splitlines():
-                if f"pid={pid}" in line and ":443" in line:
-                    return True
-        except Exception as exc:
-            logger.debug(f"[Feishu Watchdog] CLOSE-WAIT 检测失败: {exc}")
-        return False
-
-    def _force_restart_long_connection(self) -> None:
-        """强制停止旧连接线程并启动新连接。
-
-        必须先确认旧 SDK 线程已经退出。lark-oapi 使用模块级事件循环，
-        直接遗弃旧线程再启动新线程会让两个客户端争用同一个全局 loop。
-        """
-        old_thread = self._long_connection_thread
-        try:
-            main_loop = self._main_loop
-            if main_loop is not None and main_loop.is_running():
-                future = asyncio.run_coroutine_threadsafe(
-                    self._stop_long_connection(),
-                    main_loop,
-                )
-                future.result(timeout=12)
-            elif self._long_connection_client is not None:
-                self._run_sdk_disconnect(
-                    self._long_connection_client,
-                    self._long_connection_loop,
-                )
-                if old_thread is not None:
-                    old_thread.join(timeout=5)
-        except Exception as exc:
-            logger.error(f"[Feishu Watchdog] 旧长连接关闭失败: {exc}")
-
-        if old_thread is not None and old_thread.is_alive():
-            logger.error(
-                "[Feishu Watchdog] 旧长连接线程仍未退出，本轮不启动重复客户端"
-            )
-            return
-
-        self._long_connection_thread = None
-        self._long_connection_client = None
-        self._last_feishu_ws_time = time.time()  # 重置时间，避免立即再次触发
-        self._start_long_connection()
 
     def _start_long_connection(self) -> None:
         config = self._config()
@@ -419,56 +350,137 @@ class FeishuAdapter(BaseAdapter):
         logger.info("飞书长连接后台线程已启动")
 
     async def _stop_long_connection(self) -> None:
-        client = self._long_connection_client
-        self._long_connection_client = None
+        self._feishu_stop_event.set()
+        self._set_long_connection_state("stopping")
         thread = self._long_connection_thread
-        # lark-oapi 的 ws.Client 当前没有公开 stop()。这里尽力断开底层连接；
-        # daemon 线程会在进程退出时自动释放，插件重载时由运行状态检查避免重复启动。
-        if client is not None:
-            try:
-                disconnect = getattr(client, "_disconnect", None)
-                if disconnect is not None:
-                    await asyncio.to_thread(
-                        self._run_sdk_disconnect,
-                        client,
-                        self._long_connection_loop,
-                    )
-            except Exception as exc:
-                logger.warning(f"飞书长连接关闭失败: {exc}")
+        sdk_loop = self._long_connection_loop
+        stop_signal = self._long_connection_stop_signal
+
+        if (
+            sdk_loop is not None
+            and sdk_loop.is_running()
+            and stop_signal is not None
+        ):
+            sdk_loop.call_soon_threadsafe(stop_signal.set)
 
         if thread is not None and thread.is_alive():
-            await asyncio.to_thread(thread.join, 5)
+            await asyncio.to_thread(thread.join, 15)
         if thread is not None and thread.is_alive():
-            logger.warning("飞书长连接线程在 5 秒内未退出")
+            logger.warning("飞书长连接 owner 线程在 15 秒内未退出")
         elif self._long_connection_thread is thread:
             self._long_connection_thread = None
+            self._long_connection_client = None
+            self._set_long_connection_state("stopped")
 
-    @staticmethod
-    def _run_sdk_disconnect(
-        client: Any,
-        sdk_loop: asyncio.AbstractEventLoop | None,
+    def _set_long_connection_state(
+        self,
+        state: str,
+        *,
+        transport_activity: bool = False,
     ) -> None:
-        """在飞书 SDK 所属事件循环中关闭长连接。"""
+        """在线程间发布 content-free 的 SDK 连接状态。"""
+        with self._long_connection_state_lock:
+            self._long_connection_state = state
+            if transport_activity:
+                self._last_lark_transport_activity_monotonic = time.monotonic()
+
+    def _record_lark_transport_activity(self) -> None:
+        """记录由当前 Lark 客户端证明的收发活动。"""
+        self._set_long_connection_state("connected", transport_activity=True)
+
+    def _instrument_lark_client(
+        self,
+        client: Any,
+        receive_failed: asyncio.Event,
+    ) -> None:
+        """把连接状态绑定到这个 SDK client 的真实 transport 操作。"""
+        original_connect = client._connect
+        original_receive_message_loop = client._receive_message_loop
+        original_handle_message = client._handle_message
+        original_write_message = client._write_message
+
+        async def observed_connect() -> Any:
+            self._set_long_connection_state("connecting")
+            result = await original_connect()
+            if getattr(client, "_conn", None) is not None:
+                self._record_lark_transport_activity()
+            return result
+
+        async def observed_receive_message_loop() -> Any:
+            try:
+                return await original_receive_message_loop()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if not self._feishu_stop_event.is_set():
+                    self._set_long_connection_state("failed")
+                    receive_failed.set()
+                raise
+
+        async def observed_handle_message(message: bytes) -> Any:
+            self._record_lark_transport_activity()
+            return await original_handle_message(message)
+
+        async def observed_write_message(data: bytes) -> Any:
+            result = await original_write_message(data)
+            self._record_lark_transport_activity()
+            return result
+
+        client._connect = observed_connect
+        client._receive_message_loop = observed_receive_message_loop
+        client._handle_message = observed_handle_message
+        client._write_message = observed_write_message
+        if hasattr(client, "on_reconnecting"):
+            client.on_reconnecting = lambda: self._set_long_connection_state(
+                "reconnecting"
+            )
+        if hasattr(client, "on_reconnected"):
+            client.on_reconnected = self._record_lark_transport_activity
+
+    async def _run_lark_client_session(self, client: Any) -> None:
+        """在 owner loop 内运行一个可正常结束的 Lark SDK session。"""
+        stop_signal = asyncio.Event()
+        receive_failed = asyncio.Event()
+        self._long_connection_stop_signal = stop_signal
+        self._instrument_lark_client(client, receive_failed)
+
         try:
-            disconnect = getattr(client, "_disconnect", None)
-            if disconnect is None:
-                return
+            await client._connect()
+            asyncio.create_task(client._ping_loop(), name="feishu_sdk_ping")
+            stop_wait = asyncio.create_task(
+                stop_signal.wait(),
+                name="feishu_sdk_stop_wait",
+            )
+            failure_wait = asyncio.create_task(
+                receive_failed.wait(),
+                name="feishu_sdk_failure_wait",
+            )
+            done, _ = await asyncio.wait(
+                {stop_wait, failure_wait},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if failure_wait in done and not self._feishu_stop_event.is_set():
+                raise RuntimeError("Feishu SDK receive loop exited")
+        finally:
+            client._auto_reconnect = False
+            try:
+                await client._disconnect()
+            except Exception as exc:
+                safe_error = _redact_lark_sdk_log_message(str(exc))
+                logger.warning(f"飞书 SDK 连接清理失败: {safe_error}")
 
-            ws_client_module = _lark_oapi_ws_client_module
-            if ws_client_module is None:
-                raise RuntimeError("lark-oapi ws client module is unavailable")
-
-            if sdk_loop is not None and sdk_loop.is_running():
-                future = asyncio.run_coroutine_threadsafe(disconnect(), sdk_loop)
-                try:
-                    future.result(timeout=5)
-                finally:
-                    sdk_loop.call_soon_threadsafe(sdk_loop.stop)
-                return
-
-            ws_client_module.loop.run_until_complete(disconnect())
-        except Exception:
-            raise
+            current_task = asyncio.current_task()
+            pending_tasks = [
+                task
+                for task in asyncio.all_tasks()
+                if task is not current_task and not task.done()
+            ]
+            for task in pending_tasks:
+                task.cancel()
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+            if self._long_connection_stop_signal is stop_signal:
+                self._long_connection_stop_signal = None
 
     def _run_long_connection_client(self) -> None:
         # 使用模块级已导入的 lark_oapi（见文件头注释）。绝对不要在这里做首次导入：
@@ -515,14 +527,15 @@ class FeishuAdapter(BaseAdapter):
                     source="neo-mofox-feishu-adapter",
                 )
                 self._long_connection_client = client
-                self._last_feishu_ws_time = time.time()
+                self._set_long_connection_state("connecting")
                 logger.info("飞书长连接正在连接开放平台")
                 try:
-                    client.start()
-                    # client.start() 正常返回说明连接已关闭
-                    logger.info("飞书长连接 client.start() 已返回")
+                    sdk_loop.run_until_complete(
+                        self._run_lark_client_session(client)
+                    )
                 except Exception as exc:
                     if not self._feishu_stop_event.is_set():
+                        self._set_long_connection_state("failed")
                         safe_error = _redact_lark_sdk_log_message(str(exc))
                         logger.error(f"飞书长连接已退出: {safe_error}")
 
@@ -530,6 +543,7 @@ class FeishuAdapter(BaseAdapter):
                     break
 
                 logger.info(f"飞书长连接断开，{retry_delay:.0f}s 后重连...")
+                self._set_long_connection_state("reconnecting")
                 self._feishu_stop_event.wait(timeout=retry_delay)
                 retry_delay = min(retry_delay * 2, 60.0)  # 指数退避，最大 60s
         finally:
@@ -546,12 +560,16 @@ class FeishuAdapter(BaseAdapter):
                 ws_client_module.loop = previous_sdk_loop
             if self._long_connection_loop is sdk_loop:
                 self._long_connection_loop = None
+            self._long_connection_stop_signal = None
+            self._long_connection_client = None
+            self._set_long_connection_state(
+                "stopped" if self._feishu_stop_event.is_set() else "failed"
+            )
 
     def _build_lark_event_handler(self, lark_module: Any) -> Any:
         config = self._config()
 
         def on_message(event: Any) -> None:
-            self._last_feishu_ws_time = time.time()  # 更新 WS 活动时间戳
             payload = self._lark_event_to_payload(event)
             loop = self._main_loop
             if loop and loop.is_running():

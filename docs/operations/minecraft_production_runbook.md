@@ -63,11 +63,22 @@
    launch_dir = "G:\\Game\\Minecraft\\PCL"
    require_quick_play = true
    expected_bridge_version = "0.2.1"
+   shared_world_enabled = true
+   agent_shared_username = "Elysia"
+   game_turn_interval_seconds = 5
    ```
 
    其余摘要、文件名、监听地址和超时使用代码中的已验证默认值。令牌由桥接首次启动写入 `config/elysium_bridge.json`，不得复制到仓库或日志。
 
 5. 由用户手动重启 Elysium。AI 和部署脚本均不得替用户停止、重启或拉起 Elysium，也不得停止或重启已有 Minecraft 进程。NapCat/QQNT 的自动恢复按根目录 `AGENTS.md` 的独立生命周期规范执行，本手册中的 Minecraft 脚本不管理它。
+
+## agent 身体共享世界与原生视觉
+
+- `shared_world_enabled = true`（默认）时，agent 身体不再进入本地单人世界，而是通过自动生成的 `LaunchElysiaShared.bat` 以 `--quickPlayMultiplayer "<WSL网关>:<bot_server_port>"` 直连人类玩家开放的局域网世界；游戏内用户名为 `agent_shared_username`（默认 `Elysia`，必须与人类玩家区分）。
+- 该模式下 preflight 跳过单人世界与 `--quickPlaySingleplayer` 校验（改为共享世界语义）。
+- 她拥有自己的客户端窗口，即她自己的眼睛：心跳轮次中 `session.grab_vision_frame_bytes()` 截取第一人称画面，`core._build_minecraft_vision_payload()` 将其作为原生图像 payload（MediaPart）注入她的多模态大脑请求。**不做任何文字转述——画面以像素直接进入她的模型**；想法来自她，执行层（bridge 命令 / VLA）只忠实执行。
+- 无窗口可截时（如 bot 身体）静默降级为无视觉，不影响心跳。
+- 她在游戏中时是连续游玩而不是等待聊天：心跳循环检测到 Minecraft session 活跃后自动加速到 `game_turn_interval_seconds`（默认 5 秒）一个回合，每个回合带着新鲜的第一人称画面直接进入她的大脑；退出游戏（session 停止）后自动恢复普通心跳节奏。回合严格串行：上一回合模型请求未完成时不会并发下一回合，模型变慢只会拉长单回合而不是堆积请求。
 
 ## 无头 bot 身体（共享世界）
 
@@ -85,19 +96,19 @@ bot 身体用于和人一起玩同一个世界：人类用自己的客户端进�
 2. 在 `config/plugins/life_engine/config.toml` 的 `[minecraft]` 段配置目标世界：
 
    ```toml
-   bot_server_host = "127.0.0.1"
+   bot_server_host = "auto"
    bot_server_port = 25565
-   bot_username = "AyerElysia"
+   bot_username = "Elysia"
    ```
 
-   监听地址、观测周期、实体半径和令牌路径使用代码默认值。令牌由 session 首次启动以排他创建方式生成于 `data/life_engine_workspace/minecraft/bot_bridge_token.json`（0600），并发首次启动也不会互相覆盖；令牌不得复制到仓库或日志。启动时监听端口 18767 若被占用，监听器绑定会直接失败并返回可诊断原因，不会抢占已有进程。
+   `bot_server_host = "auto"` 会在启动时自动解析 WSL 默认网关（即 Windows 宿主机），WSL 重启后 IP 变化也无需改配置；`bot_username` 必须与人类玩家的游戏名不同。监听地址、观测周期、实体半径和令牌路径使用代码默认值。令牌由 session 首次启动以排他创建方式生成于 `data/life_engine_workspace/minecraft/bot_bridge_token.json`（0600），并发首次启动也不会互相覆盖；令牌不得复制到仓库或日志。启动时监听端口 18767 若被占用，监听器绑定会直接失败并返回可诊断原因，不会抢占已有进程。
 
    当前随仓库交付的是 Mineflayer `offline` 登录路径，适用于“对局域网开放”的单人世界或 `online-mode=false` 的专用服务器。普通 `online-mode=true` 服务器需要单独购买并交互式登录一个 Microsoft/Minecraft 账号；本实现不会把昵称伪装成已认证账号。
 
 ### 一起玩的操作路径
 
-1. 用户在自己的 Minecraft 客户端进入世界；若是单人存档，先"对局域网开放"，把聊天栏提示的端口填入 `bot_server_port`（每次开放的端口可能不同）；专用服务器则填服务器地址与端口。
-2. 通过正式工具调用 `nucleus_minecraft(action="start", body_name="bot")`。session 负责唯一的 bot 进程生命周期：启动 node 子进程、等待桥接认证、等待服务器世界就绪。
+1. 用户在自己的 Minecraft 客户端进入世界；若是单人存档，先"对局域网开放"，在端口号框里**固定填写 `25565`**（红字为无效端口，白字才能创建；必须与 `bot_server_port` 一致），配置只需设置一次；专用服务器则填服务器地址与端口。
+2. 通过正式工具调用 `nucleus_minecraft(action="start", body_name="bot")`。该工具同时注册在 chat 意识清单中，她在聊天对话里就能直接调用，不需要切换到其他意识。session 负责唯一的 bot 进程生命周期：启动 node 子进程、等待桥接认证、等待服务器世界就绪。
 3. 就绪判定为 `server_world`：`world_loaded=true`、存在 `world` 事实（mode/server_address）且玩家有 UUID。与 `agent` 不同，它不校验单人世界名称和客户端暂停状态。
 4. `stop` 由 session 终止其拥有的 bot 进程并断开桥接；`game_left_running` 对 bot 恒为 `false`，人类的游戏客户端不受任何影响。
 
@@ -123,7 +134,7 @@ bot 观察 facts 与 `StateCollector` 结构对齐（world/player/players/entiti
 - 精确的启动脚本、世界目录、Bridge 与 Baritone 摘要通过预检；
 - Windows/WSL 互操作可用，且没有多个匹配的 Minecraft 窗口；
 - 桥接完成共享令牌认证，协议版本与必需能力完全匹配；
-- 游戏报告 `world_loaded=true`、`client_paused=false`、单人世界名称为 `Elysian Realm`，并提供玩家 UUID；
+- 就绪判定按模式区分：单人模式（`shared_world_enabled = false`）要求游戏报告 `world_loaded=true`、`client_paused=false`、单人世界名称为 `Elysian Realm`，并提供玩家 UUID；共享世界模式（默认）采用 `server_world` 语义，只要求 `world_loaded=true`、存在世界标识与玩家 UUID，不校验单人世界名称与暂停状态；
 - 收到至少两条连续前进的完整观察。
 
 标题界面、暂停菜单、错误世界、旧桥接、缺失能力、静止观察或断线都会返回可诊断失败，不能伪装成就绪。已经运行的合规客户端会被复用，不会再启动第三个客户端。

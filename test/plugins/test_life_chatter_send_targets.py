@@ -166,8 +166,9 @@ async def test_life_send_text_can_send_to_target_key(monkeypatch) -> None:
     )
 
     assert ok is True
-    assert "已发送2条消息" in result
-    assert len(sent_messages) == 2
+    assert "已发送1条消息" in result
+    assert len(sent_messages) == 1
+    assert sent_messages[0].content == "你好\n第二段"
     assert all(message.stream_id == target_stream.stream_id for message in sent_messages)
     assert all(message.chat_type == "group" for message in sent_messages)
     assert all(message.extra["target_group_id"] == "100" for message in sent_messages)
@@ -218,8 +219,8 @@ async def test_life_send_text_without_target_key_uses_legacy_stream_send(monkeyp
     )
 
     assert ok is True
-    assert "已发送2条消息" in result
-    assert sent_contents == ["第一段", "第二段"]
+    assert "已发送1条消息" in result
+    assert sent_contents == ["第一段\n第二段"]
 
 
 def test_life_send_text_schema_requires_atomic_persona_sample() -> None:

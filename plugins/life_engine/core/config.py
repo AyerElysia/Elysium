@@ -42,6 +42,7 @@ class LifeEngineConfig(BaseConfig):
             "wake_time",
             "workspace_path",
             "max_rounds_per_heartbeat",
+            "max_consecutive_tool_stalls_per_heartbeat",
         },
         "model": {"task_name", "chatter_task_name"},
         "memory_index": {
@@ -254,9 +255,17 @@ class LifeEngineConfig(BaseConfig):
         )
 
         max_rounds_per_heartbeat: int = Field(
-            default=3,
+            default=5,
             ge=1,
-            description="单次心跳内允许模型连续进行工具调用的最大轮数（防止死循环）。",
+            le=5,
+            description="单次心跳内允许的模型轮数硬上限；独立工具优先在同一轮并行调用。",
+        )
+
+        max_consecutive_tool_stalls_per_heartbeat: int = Field(
+            default=2,
+            ge=1,
+            le=5,
+            description="连续无进展或协议/参数/游标失败达到该次数时，有序结束本轮心跳。",
         )
 
         subconscious_context_max_chars: int = Field(
@@ -771,8 +780,8 @@ class LifeEngineConfig(BaseConfig):
         )
 
         task_name: str = Field(
-            default="",
-            description="认知机会候选生成器使用的模型任务名。留空时跟随 [model].task_name。",
+            default="utility",
+            description="认知机会候选生成器使用的模型任务名；外部候选生成默认走 utility，不冒充主体 core 推理。",
         )
 
         history_messages: int = Field(
@@ -783,7 +792,7 @@ class LifeEngineConfig(BaseConfig):
         )
 
         timeout_seconds: float = Field(
-            default=30.0,
+            default=45.0,
             ge=3.0,
             le=120.0,
             description="单次认知机会候选生成的 LLM 超时秒数。",
@@ -1832,9 +1841,12 @@ class LifeEngineConfig(BaseConfig):
         )
 
         bot_server_host: str = Field(
-            default="127.0.0.1",
+            default="auto",
             min_length=1,
-            description="Minecraft server or LAN host the bot body joins.",
+            description=(
+                "Minecraft server or LAN host the bot body joins; \"auto\" "
+                "resolves the WSL default gateway at launch time."
+            ),
         )
 
         bot_server_port: int = Field(
@@ -1845,9 +1857,12 @@ class LifeEngineConfig(BaseConfig):
         )
 
         bot_username: str = Field(
-            default="AyerElysia",
+            default="Elysia",
             pattern=r"^[A-Za-z0-9_]{1,16}$",
-            description="In-game account name for the headless bot body.",
+            description=(
+                "In-game account name for the headless bot body; must differ "
+                "from the human player's account name."
+            ),
         )
 
         bot_observation_interval_ms: int = Field(
@@ -1860,6 +1875,34 @@ class LifeEngineConfig(BaseConfig):
             default=32,
             gt=0,
             description="Bot entity sensor radius in blocks.",
+        )
+
+        shared_world_enabled: bool = Field(
+            default=True,
+            description=(
+                "Her own client window joins the human player's LAN world, "
+                "giving her a true first-person view; disabled falls back to "
+                "the configured singleplayer world."
+            ),
+        )
+
+        agent_shared_username: str = Field(
+            default="Elysia",
+            pattern=r"^[A-Za-z0-9_]{1,16}$",
+            description=(
+                "In-game account name of her own client in the shared world; "
+                "must differ from the human player's account name."
+            ),
+        )
+
+        game_turn_interval_seconds: int = Field(
+            default=5,
+            ge=1,
+            description=(
+                "Her continuous play cadence while a Minecraft session is "
+                "active; the heartbeat loop accelerates to this interval so "
+                "she keeps playing instead of waiting between chat turns."
+            ),
         )
 
         planner_task_name: str = Field(
