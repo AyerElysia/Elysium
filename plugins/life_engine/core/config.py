@@ -42,6 +42,7 @@ class LifeEngineConfig(BaseConfig):
             "wake_time",
             "workspace_path",
             "max_rounds_per_heartbeat",
+            "max_consecutive_tool_stalls_per_heartbeat",
         },
         "model": {"task_name", "chatter_task_name"},
         "memory_index": {
@@ -254,9 +255,17 @@ class LifeEngineConfig(BaseConfig):
         )
 
         max_rounds_per_heartbeat: int = Field(
-            default=3,
+            default=5,
             ge=1,
-            description="单次心跳内允许模型连续进行工具调用的最大轮数（防止死循环）。",
+            le=5,
+            description="单次心跳内允许的模型轮数硬上限；独立工具优先在同一轮并行调用。",
+        )
+
+        max_consecutive_tool_stalls_per_heartbeat: int = Field(
+            default=2,
+            ge=1,
+            le=5,
+            description="连续无进展或协议/参数/游标失败达到该次数时，有序结束本轮心跳。",
         )
 
         subconscious_context_max_chars: int = Field(
