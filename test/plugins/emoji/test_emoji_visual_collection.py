@@ -54,6 +54,12 @@ def _mock_embedder() -> MagicMock:
     return embedder
 
 
+def test_visual_embedding_timeout_covers_cold_model_load() -> None:
+    config = EmojiConfig()
+
+    assert config.sender.visual.request_timeout == 60.0
+
+
 # ── 纯视觉检索 ──────────────────────────────────────────────────
 
 
