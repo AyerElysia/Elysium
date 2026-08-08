@@ -52,6 +52,28 @@ class EpistemicOpportunityStateError(RuntimeError):
         )
 
 
+class EpistemicOpportunityTimeoutError(TimeoutError):
+    """Content-free timeout raised when candidate generation exhausts its deadline."""
+
+    def __init__(
+        self,
+        *,
+        configured_timeout: float,
+        task_name: str,
+        source_occurrence_id: str,
+    ) -> None:
+        self.configured_timeout = configured_timeout
+        self.task_name = task_name
+        self.source_occurrence_id = source_occurrence_id
+        super().__init__(
+            "epistemic opportunity generation timed out: "
+            "error_type=TimeoutError "
+            f"configured_timeout={configured_timeout:.3f}s "
+            f"task_name={task_name or '-'} "
+            f"source_occurrence_id={source_occurrence_id or '-'}"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class EpistemicOpportunity:
     """An immutable, sourced candidate offered to an active consciousness.
@@ -430,11 +452,21 @@ class CuriosityEngine:
                 ),
             )
         )
-        response = await asyncio.wait_for(
-            request.send(auto_append_response=False, stream=False),
-            timeout=self.timeout_seconds,
-        )
-        raw_text = await asyncio.wait_for(response, timeout=self.timeout_seconds)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.timeout_seconds
+        try:
+            async with asyncio.timeout_at(deadline):
+                response = await request.send(
+                    auto_append_response=False,
+                    stream=False,
+                )
+                raw_text = await response
+        except TimeoutError as exc:
+            raise EpistemicOpportunityTimeoutError(
+                configured_timeout=self.timeout_seconds,
+                task_name=self.model_task_name,
+                source_occurrence_id=source_occurrence_id,
+            ) from exc
         opportunity = self._parse_opportunity(
             raw_text,
             source_occurrence_id=source_occurrence_id,

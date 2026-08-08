@@ -1,14 +1,18 @@
+import asyncio
 import hashlib
 import json
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.curiosity.engine import (
     CuriosityEngine,
     CuriositySignal,
     EpistemicOpportunity,
     EpistemicOpportunityStateError,
+    EpistemicOpportunityTimeoutError,
     format_curiosity_signal,
     format_epistemic_opportunity,
 )
@@ -361,3 +365,101 @@ def test_candidate_field_budget_fails_instead_of_silently_cutting():
             observed_gap="星" * 2000,
             open_question="还没闭合的是什么？",
         )
+
+
+def test_epistemic_opportunity_defaults_to_utility_with_realistic_deadline():
+    config = LifeEngineConfig()
+
+    assert config.curiosity.task_name == "utility"
+    assert config.curiosity.timeout_seconds == 45.0
+
+
+@pytest.mark.asyncio
+async def test_generation_uses_one_deadline_across_send_and_response(tmp_path):
+    engine = CuriosityEngine(
+        workspace_path=str(tmp_path),
+        model_task_name="utility",
+    )
+    engine.timeout_seconds = 0.03
+    request = MagicMock()
+    cleaned = asyncio.Event()
+
+    async def response():
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            cleaned.set()
+
+    async def send(**_kwargs):
+        await asyncio.sleep(0.02)
+        return response()
+
+    request.send = send
+    started = asyncio.get_running_loop().time()
+    with (
+        patch(
+            "plugins.life_engine.curiosity.engine.get_model_set_by_task",
+            return_value=("utility-model",),
+        ) as model_set,
+        patch(
+            "plugins.life_engine.curiosity.engine.create_llm_request",
+            return_value=request,
+        ),
+        pytest.raises(EpistemicOpportunityTimeoutError) as exc_info,
+    ):
+        await engine.review_opportunity(
+            prefix_prompt="private-prefix",
+            history_text="private-history",
+            new_event_text="private-event",
+            source_occurrence_id="evt-deadline",
+        )
+
+    elapsed = asyncio.get_running_loop().time() - started
+    assert elapsed < 0.15
+    assert cleaned.is_set()
+    model_set.assert_called_once_with("utility")
+    message = str(exc_info.value)
+    assert "configured_timeout=0.030s" in message
+    assert "task_name=utility" in message
+    assert "source_occurrence_id=evt-deadline" in message
+    assert "private-prefix" not in message
+    assert "private-history" not in message
+    assert "private-event" not in message
+
+
+@pytest.mark.asyncio
+async def test_send_stage_timeout_preserves_previous_candidate(tmp_path):
+    engine = CuriosityEngine(workspace_path=str(tmp_path), model_task_name="utility")
+    engine.timeout_seconds = 0.02
+    previous = _opportunity(occurrence_id="evt-previous")
+    await engine.save_opportunity(previous)
+    request = MagicMock()
+    cleaned = asyncio.Event()
+
+    async def send(**_kwargs):
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            cleaned.set()
+
+    request.send = send
+    with (
+        patch(
+            "plugins.life_engine.curiosity.engine.get_model_set_by_task",
+            return_value=("utility-model",),
+        ),
+        patch(
+            "plugins.life_engine.curiosity.engine.create_llm_request",
+            return_value=request,
+        ),
+        pytest.raises(EpistemicOpportunityTimeoutError),
+    ):
+        await engine.review_opportunity(
+            prefix_prompt="",
+            history_text="",
+            new_event_text="",
+            source_occurrence_id="evt-send-timeout",
+        )
+
+    assert cleaned.is_set()
+    assert await engine.load_opportunity() == previous

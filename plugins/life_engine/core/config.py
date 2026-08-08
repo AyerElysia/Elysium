@@ -771,8 +771,8 @@ class LifeEngineConfig(BaseConfig):
         )
 
         task_name: str = Field(
-            default="",
-            description="认知机会候选生成器使用的模型任务名。留空时跟随 [model].task_name。",
+            default="utility",
+            description="认知机会候选生成器使用的模型任务名；外部候选生成默认走 utility，不冒充主体 core 推理。",
         )
 
         history_messages: int = Field(
@@ -783,7 +783,7 @@ class LifeEngineConfig(BaseConfig):
         )
 
         timeout_seconds: float = Field(
-            default=30.0,
+            default=45.0,
             ge=3.0,
             le=120.0,
             description="单次认知机会候选生成的 LLM 超时秒数。",
