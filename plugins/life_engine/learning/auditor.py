@@ -38,11 +38,43 @@ from .prompts import (
     format_evidence_for_auditor,
 )
 from .store import InsightStore
+from .timeouts import resolve_timeout_seconds, send_with_deadline
 
 logger = logging.getLogger("life_engine.learning.auditor")
 
 # 每次审计最多处理的洞察数
 _DEFAULT_BATCH_SIZE = 3
+
+# 审计 LLM 调用超时（秒）。数字的来历见 timeouts 模块：60s 下成功样本
+# p99=57.7s、max=58.0s，分布右侧被削掉，300/313 次审计以 TimeoutError 回滚。
+_DEFAULT_TIMEOUT_SECONDS = 180.0
+_MIN_TIMEOUT_SECONDS = 15.0
+_TIMEOUT_ENV_VAR = "ELYSIUM_AUDIT_TIMEOUT_SECONDS"
+
+
+def _resolve_timeout_seconds(explicit: float | None) -> float:
+    """Resolve the audit LLM timeout from an explicit value or the env var.
+
+    Thin binding of :func:`~.timeouts.resolve_timeout_seconds` to this ring's
+    env var and defaults.
+
+    Args:
+        explicit: Caller-supplied timeout in seconds, or ``None`` to resolve
+            from the environment.
+
+    Returns:
+        The timeout in seconds, never below :data:`_MIN_TIMEOUT_SECONDS`.
+
+    Raises:
+        ValueError: If the env var is set but is not a positive finite number.
+    """
+
+    return resolve_timeout_seconds(
+        explicit,
+        env_var=_TIMEOUT_ENV_VAR,
+        default=_DEFAULT_TIMEOUT_SECONDS,
+        minimum=_MIN_TIMEOUT_SECONDS,
+    )
 
 
 class InsightAuditor:
@@ -54,13 +86,13 @@ class InsightAuditor:
         store: InsightStore,
         workspace_path: str | Path,
         model_task_name: str = "life",
-        timeout_seconds: float = 60.0,
+        timeout_seconds: float | None = None,
         batch_size: int = _DEFAULT_BATCH_SIZE,
     ) -> None:
         self._store = store
         self._workspace = Path(workspace_path).resolve()
         self._model_task_name = str(model_task_name or "life").strip() or "life"
-        self._timeout = max(15.0, float(timeout_seconds or 60.0))
+        self._timeout = _resolve_timeout_seconds(timeout_seconds)
         self._batch_size = max(1, int(batch_size or _DEFAULT_BATCH_SIZE))
         self._lock = asyncio.Lock()
         self._last_projection_stats: dict[str, Any] = {}
@@ -77,6 +109,7 @@ class InsightAuditor:
             本轮产生的审计记录列表
         """
         async with self._lock:
+            self._reclaim_stranded_reviews()
             candidates = self._store.list_candidates_for_review()
             if not candidates:
                 logger.debug("无待审洞察")
@@ -101,7 +134,66 @@ class InsightAuditor:
                 )
             return records
 
-    async def _audit_single(self, insight: Insight) -> AuditRecord | None:
+    async def reclaim_stranded_reviews(self) -> int:
+        """Reclaim orphaned ``under_review`` insights under the audit lock.
+
+        The scheduler must call this *before* it decides whether to audit. Its
+        gate requires a non-empty candidate list, and a stranded insight is by
+        definition absent from that list, so a system whose only remaining work
+        is stranded would never open an audit cycle — the recovery path and the
+        gate would wait on each other forever.
+
+        Returns:
+            The number of insights returned to the queue.
+        """
+
+        async with self._lock:
+            return self._reclaim_stranded_reviews()
+
+    def _reclaim_stranded_reviews(self) -> int:
+        """Return insights stuck in ``under_review`` to the audit queue.
+
+        ``under_review`` is written in exactly one place — the moment before this
+        ring dispatches its LLM call — and cleared when the verdict lands or the
+        call fails. So a lingering ``under_review`` means the audit was cut off
+        between those two writes: the process was killed, or the heartbeat task
+        was cancelled. ``CancelledError`` derives from ``BaseException``, so the
+        rollback in :meth:`_audit_single` never used to run for it.
+
+        That leaves the insight invisible: ``can_review`` only admits
+        ``candidate`` and ``needs_more_evidence``, so a stranded belief can never
+        be audited again — in production 5 of 313 dispatches ended this way and
+        sat unreachable for over 87 hours.
+
+        This is crash recovery, not a judgement. It restores exactly the state
+        this ring's own failure path writes (``candidate`` + ``await_review``),
+        re-offering the insight for review without touching its content,
+        verdict, confidence, or history. Callers must hold :attr:`_lock`, which
+        is what makes a surviving ``under_review`` provably orphaned rather than
+        an audit in flight.
+
+        Returns:
+            The number of insights returned to the queue.
+        """
+
+        stranded = self._store.list_by_status(InsightStatus.UNDER_REVIEW)
+        if not stranded:
+            return 0
+
+        for insight in stranded:
+            self._store.transition_status(
+                insight.insight_id,
+                InsightStatus.CANDIDATE,
+                next_action=InsightNextAction.AWAIT_REVIEW,
+                reason="审计中断遗留，回到待审队列",
+            )
+        logger.warning(
+            "回收审计中断遗留的洞察: %d 条重新进入待审队列",
+            len(stranded),
+        )
+        return len(stranded)
+
+    async def _audit_single(self, insight: Insight) -> AuditRecord:
         """审计单条洞察。"""
         # 标记为 under_review
         self._store.transition_status(
@@ -113,7 +205,10 @@ class InsightAuditor:
         try:
             raw_text = await self._call_llm(insight)
             verdict_data = self._parse_verdict(raw_text)
-        except Exception as exc:
+        except BaseException as exc:
+            # 必须接 BaseException：CancelledError 不是 Exception，而进程关停时
+            # 心跳任务正是被 cancel 的。漏掉它，这条洞察就永久卡在 under_review，
+            # 而 can_review 不收 under_review——等于这段信念再也不会被审视。
             logger.warning(
                 "审计 LLM 调用失败 [%s]: %s",
                 insight.insight_id,
@@ -126,7 +221,10 @@ class InsightAuditor:
                 next_action=InsightNextAction.AWAIT_REVIEW,
                 reason=f"审计调用失败: {type(exc).__name__}",
             )
-            return None
+            # 取消和普通失败都继续向上传播：前者维持结构化关停，后者让
+            # LearningMaintenanceEvent 正确记录 failed，而不是伪造 succeeded。
+            # 状态已经回滚，所以传播不会留下 under_review 残留。
+            raise
 
         # 构建审计记录
         record = AuditRecord(
@@ -231,12 +329,7 @@ class InsightAuditor:
         request.add_payload(LLMPayload(ROLE.SYSTEM, Text(AUDITOR_SYSTEM_PROMPT)))
         request.add_payload(LLMPayload(ROLE.USER, Text(delivered.text)))
 
-        response = await asyncio.wait_for(
-            request.send(auto_append_response=False, stream=False),
-            timeout=self._timeout,
-        )
-        raw_text = await asyncio.wait_for(response, timeout=self._timeout)
-        return str(raw_text or "")
+        return await send_with_deadline(request, self._timeout)
 
     def _parse_verdict(self, raw_text: str) -> dict[str, Any]:
         """解析审计 LLM 输出。"""

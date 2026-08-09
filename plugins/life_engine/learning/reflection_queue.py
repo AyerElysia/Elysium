@@ -10,6 +10,7 @@ from uuid import uuid4
 
 ReflectionJobKind = Literal["interaction", "introspection"]
 REFLECTION_QUEUE_STATE_KEY = "pending_reflections_v1"
+REFLECTION_RUNTIME_STATE_KEY = "reflection_runtime_v1"
 MAX_PENDING_REFLECTIONS = 512
 MAX_REFLECTION_JOB_BYTES = 256 * 1024
 MAX_REFLECTION_SOURCE_EVENTS = 256
@@ -71,7 +72,9 @@ class LearningReflectionJob:
             raise ValueError("reflection source event identity exceeds limit")
         if len(source_ids) > MAX_REFLECTION_SOURCE_EVENTS:
             raise ValueError("reflection source event count exceeds the explicit limit")
-        now = _timestamp(created_at or datetime.now(UTC).isoformat(), field="created_at")
+        now = _timestamp(
+            created_at or datetime.now(UTC).isoformat(), field="created_at"
+        )
         identity = job_id or f"learning_reflection_{uuid4().hex}"
         actor = str(actor_consciousness_instance_id or "").strip()
         if len(identity) > 255 or len(actor) > 255:
@@ -116,15 +119,16 @@ class LearningReflectionJob:
             raise ValueError("reflection job identity/kind is invalid")
         if len(job.job_id) > 255 or len(job.actor_consciousness_instance_id) > 255:
             raise ValueError("reflection job/actor identity exceeds limit")
-        if not job.reflection_text.strip() or any(not item for item in job.source_event_ids):
+        if not job.reflection_text.strip() or any(
+            not item for item in job.source_event_ids
+        ):
             raise ValueError("reflection job content/source identity is invalid")
         if any(len(item) > 255 for item in job.source_event_ids):
             raise ValueError("reflection source event identity exceeds limit")
         if job.attempt_count < 0:
             raise ValueError("reflection attempt_count must be non-negative")
         if len(job.source_event_ids) > MAX_REFLECTION_SOURCE_EVENTS or (
-            len(job.reflection_text.encode("utf-8"))
-            + len(job.context.encode("utf-8"))
+            len(job.reflection_text.encode("utf-8")) + len(job.context.encode("utf-8"))
             > MAX_REFLECTION_JOB_BYTES
         ):
             raise ValueError("reflection job exceeds its explicit storage limit")
@@ -151,7 +155,9 @@ class LearningReflectionJob:
         return replace(
             self,
             attempt_count=attempts,
-            next_attempt_at=(datetime.now(UTC) + timedelta(seconds=delay_seconds)).isoformat(),
+            next_attempt_at=(
+                datetime.now(UTC) + timedelta(seconds=delay_seconds)
+            ).isoformat(),
             last_error_type=type(error).__name__,
             last_error_fingerprint=fingerprint,
         )
@@ -172,20 +178,80 @@ def load_reflection_jobs(state: dict[str, Any]) -> list[LearningReflectionJob]:
     return jobs
 
 
-def reflection_queue_health(jobs: list[LearningReflectionJob]) -> dict[str, Any]:
+def reflection_queue_health(
+    jobs: list[LearningReflectionJob],
+    *,
+    runtime_state: dict[str, Any] | None = None,
+    cooldown_minutes: float = 5.0,
+) -> dict[str, Any]:
     """Return content-free backlog/retry evidence."""
 
+    runtime = runtime_state if isinstance(runtime_state, dict) else {}
+    now = datetime.now(UTC)
+    due_count = sum(job.due(now) for job in jobs)
+    never_attempted_count = sum(job.attempt_count == 0 for job in jobs)
+    oldest_created_at = min((job.created_at for job in jobs), default="")
+    oldest_age_seconds = 0.0
+    if oldest_created_at:
+        oldest = datetime.fromisoformat(oldest_created_at)
+        if oldest.tzinfo is None:
+            oldest = oldest.replace(tzinfo=UTC)
+        oldest_age_seconds = max(0.0, (now - oldest.astimezone(UTC)).total_seconds())
+    global_next_attempt_at = str(runtime.get("global_next_attempt_at") or "")
+    breaker_open = False
+    if global_next_attempt_at:
+        try:
+            retry_at = datetime.fromisoformat(global_next_attempt_at)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            breaker_open = retry_at.astimezone(UTC) > now
+        except ValueError:
+            breaker_open = True
+    reasons: list[str] = []
+    if len(jobs) >= MAX_PENDING_REFLECTIONS:
+        reasons.append("queue_at_capacity")
+    elif len(jobs) >= int(MAX_PENDING_REFLECTIONS * 0.8):
+        reasons.append("queue_near_capacity")
+    if oldest_age_seconds >= 3_600:
+        reasons.append("oldest_job_stalled")
+    if breaker_open:
+        reasons.append("provider_circuit_open")
+    if int(runtime.get("consecutive_failure_count", 0) or 0) > 0:
+        reasons.append("recent_attempt_failed")
+    nominal_capacity_per_day = 1_440.0 / max(0.1, float(cooldown_minutes))
     return {
-        "status": "degraded" if any(job.attempt_count for job in jobs) else "healthy",
+        "status": "degraded" if reasons else "healthy",
+        "reasons": reasons,
         "pending_count": len(jobs),
-        "oldest_created_at": min((job.created_at for job in jobs), default=""),
+        "capacity": MAX_PENDING_REFLECTIONS,
+        "capacity_utilization": round(len(jobs) / MAX_PENDING_REFLECTIONS, 4),
+        "due_count": due_count,
+        "never_attempted_count": never_attempted_count,
+        "oldest_created_at": oldest_created_at,
+        "oldest_age_seconds": round(oldest_age_seconds, 3),
         "next_attempt_at": min((job.next_attempt_at for job in jobs), default=""),
         "max_attempt_count": max((job.attempt_count for job in jobs), default=0),
-        "last_error_type": next(
+        "nominal_drain_capacity_per_day": round(nominal_capacity_per_day, 3),
+        "estimated_backlog_days": round(len(jobs) / nominal_capacity_per_day, 3),
+        "circuit_state": "open" if breaker_open else "closed",
+        "global_next_attempt_at": global_next_attempt_at,
+        "consecutive_failure_count": int(
+            runtime.get("consecutive_failure_count", 0) or 0
+        ),
+        "total_enqueued_count": int(runtime.get("total_enqueued_count", 0) or 0),
+        "total_completed_count": int(runtime.get("total_completed_count", 0) or 0),
+        "total_failed_attempt_count": int(
+            runtime.get("total_failed_attempt_count", 0) or 0
+        ),
+        "last_attempt_at": str(runtime.get("last_attempt_at") or ""),
+        "last_success_at": str(runtime.get("last_success_at") or ""),
+        "last_error_type": str(runtime.get("last_error_type") or "")
+        or next(
             (job.last_error_type for job in reversed(jobs) if job.last_error_type),
             "",
         ),
-        "last_error_fingerprint": next(
+        "last_error_fingerprint": str(runtime.get("last_error_fingerprint") or "")
+        or next(
             (
                 job.last_error_fingerprint
                 for job in reversed(jobs)
@@ -199,6 +265,7 @@ def reflection_queue_health(jobs: list[LearningReflectionJob]) -> dict[str, Any]
 __all__ = [
     "LearningReflectionJob",
     "MAX_PENDING_REFLECTIONS",
+    "REFLECTION_RUNTIME_STATE_KEY",
     "REFLECTION_QUEUE_STATE_KEY",
     "ReflectionJobKind",
     "load_reflection_jobs",

@@ -108,28 +108,28 @@ def test_memory_service_property_aliases_private_field(tmp_path: Path) -> None:
     assert service.memory_service is sentinel
 
 
-async def test_learning_maintenance_failure_does_not_escape_main_heartbeat(
+async def test_learning_maintenance_only_wakes_independent_worker(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Derived learning failure must not replace the heartbeat model result."""
+    """The foreground heartbeat must not execute a learning model phase."""
 
     service = _make_service(tmp_path)
 
-    class _FailingLearningScheduler:
-        async def on_heartbeat(self) -> None:
-            raise RuntimeError("selected learning persistence failed closed")
+    class _LearningScheduler:
+        wake_count = 0
 
-    messages: list[str] = []
-    service._learning_scheduler = _FailingLearningScheduler()  # type: ignore[assignment]
-    monkeypatch.setattr(
-        "plugins.life_engine.service.core.logger.debug",
-        messages.append,
-    )
+        def request_maintenance(self) -> None:
+            self.wake_count += 1
+
+        async def on_heartbeat(self) -> None:
+            raise AssertionError("foreground heartbeat must not execute learning")
+
+    scheduler = _LearningScheduler()
+    service._learning_scheduler = scheduler  # type: ignore[assignment]
 
     await service._run_learning_heartbeat_maintenance()
 
-    assert messages == ["学习系统心跳异常: RuntimeError"]
+    assert scheduler.wake_count == 1
 
 
 def test_cfg_auto_migrates_legacy_config_without_thresholds(tmp_path: Path) -> None:

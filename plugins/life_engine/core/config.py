@@ -663,10 +663,25 @@ class LifeEngineConfig(BaseConfig):
             description="是否在心跳 prompt 中注入自我认知文档和学习进展。",
         )
 
+        maintenance_poll_seconds: float = Field(
+            default=15.0,
+            ge=1.0,
+            le=300.0,
+            description=(
+                "独立学习维护 worker 的最长轮询间隔（秒）。交互入队会立即唤醒，"
+                "该间隔只保证没有新事件时仍会检查退避到期和维护工作。"
+            ),
+        )
+
         reflection_cooldown_minutes: float = Field(
-            default=30.0,
+            default=5.0,
             ge=5.0,
-            description="快环反思冷却时间（分钟）。两次反思之间的最小间隔。",
+            description=(
+                "快环反思冷却时间（分钟）。两次反思之间的最小间隔。"
+                "这个值直接决定反思队列的排空上限：30 分钟意味着一天最多 48 次，"
+                "而实测到达率约 164 次/天，队列只会单调增长到上限然后开始丢弃经历。"
+                "5 分钟给出约 288 次/天的上限，能在到达率之上留出排空余量。"
+            ),
         )
 
         audit_interval_hours: float = Field(

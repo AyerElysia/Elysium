@@ -35,11 +35,19 @@ from .prompts import (
 )
 from .skill_store import SkillCandidate, SkillPattern, SkillStore
 from .store import InsightStore
+from .timeouts import send_with_deadline
 
 logger = logging.getLogger("life_engine.learning.skill_distiller")
 
 _DEFAULT_TRIGGER_COUNT = 3
 _DEFAULT_INTERVAL_HOURS = 24.0
+
+# 蒸馏 / 门禁 LLM 调用超时（秒）。数字的来历见 timeouts 模块。此前写 90s，但两段
+# 等待各自计时，真实上界一直是 180s——而 life_skill_distill 的成功样本 max=88.9s
+# 正贴着 90s。所以收成单一截止时间的同时必须把预算写成 180s：否则等于凭空把这条
+# 链路收紧一倍，把眼下刚好跑完的调用变成超时。
+_DEFAULT_TIMEOUT_SECONDS = 180.0
+_MIN_TIMEOUT_SECONDS = 30.0
 
 
 class SkillDistiller:
@@ -52,7 +60,7 @@ class SkillDistiller:
         skill_store: SkillStore,
         workspace_path: str | Path,
         model_task_name: str = "life",
-        timeout_seconds: float = 90.0,
+        timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
         trigger_count: int = _DEFAULT_TRIGGER_COUNT,
         interval_hours: float = _DEFAULT_INTERVAL_HOURS,
         max_edits: int | None = None,
@@ -62,7 +70,9 @@ class SkillDistiller:
         self._skill_store = skill_store
         self._workspace = Path(workspace_path).resolve()
         self._model_task_name = str(model_task_name or "life").strip() or "life"
-        self._timeout = max(30.0, float(timeout_seconds or 90.0))
+        self._timeout = max(
+            _MIN_TIMEOUT_SECONDS, float(timeout_seconds or _DEFAULT_TIMEOUT_SECONDS)
+        )
         self._trigger_count = max(1, int(trigger_count or _DEFAULT_TRIGGER_COUNT))
         self._interval_hours = max(
             6.0, float(interval_hours or _DEFAULT_INTERVAL_HOURS)
@@ -253,18 +263,14 @@ class SkillDistiller:
             request.add_payload(LLMPayload(ROLE.SYSTEM, Text(SKILL_DISTILL_SYSTEM)))
             request.add_payload(LLMPayload(ROLE.USER, Text(delivered.text)))
 
-            response = await asyncio.wait_for(
-                request.send(auto_append_response=False, stream=False),
-                timeout=self._timeout,
-            )
-            raw_text = await asyncio.wait_for(response, timeout=self._timeout)
-            return self._parse_distill_result(str(raw_text or ""))
+            raw_text = await send_with_deadline(request, self._timeout)
+            return self._parse_distill_result(raw_text)
         except Exception as exc:
             logger.warning(
                 "Skill distillation request failed: %s",
                 type(exc).__name__,
             )
-            return None
+            raise
 
     async def _introspective_gate(
         self,
@@ -293,18 +299,14 @@ class SkillDistiller:
             request.add_payload(LLMPayload(ROLE.SYSTEM, Text(SKILL_GATE_SYSTEM)))
             request.add_payload(LLMPayload(ROLE.USER, Text(delivered.text)))
 
-            response = await asyncio.wait_for(
-                request.send(auto_append_response=False, stream=False),
-                timeout=self._timeout,
-            )
-            raw_text = await asyncio.wait_for(response, timeout=self._timeout)
-            return self._parse_gate_result(str(raw_text or ""))
+            raw_text = await send_with_deadline(request, self._timeout)
+            return self._parse_gate_result(raw_text)
         except Exception as exc:
             logger.warning(
-                "Introspective skill gate failed; proposal not accepted: %s",
+                "Introspective skill gate failed: %s",
                 type(exc).__name__,
             )
-            return False
+            raise
 
     @staticmethod
     def _format_existing_skills(skills: list[SkillPattern]) -> str:
@@ -335,11 +337,11 @@ class SkillDistiller:
             parsed = json_repair.repair_json(raw_text, return_objects=True)
 
         if not isinstance(parsed, dict):
-            return None
+            raise ValueError("SkillDistillationOutputMustBeObject")
         description = str(parsed.get("description", "") or "").strip()
         instructions = str(parsed.get("instructions", "") or "").strip()
         if not description or not instructions:
-            return None
+            raise ValueError("SkillDistillationProposalMissingFields")
         return {
             "target_skill_id": str(parsed.get("target_skill_id", "") or "").strip(),
             "name": str(parsed.get("name", "") or "").strip(),
@@ -356,8 +358,10 @@ class SkillDistiller:
             parsed = json_repair.repair_json(raw_text, return_objects=True)
 
         if not isinstance(parsed, dict):
-            return False
-        return parsed.get("promote") is True
+            raise ValueError("SkillGateOutputMustBeObject")
+        if parsed.get("promote") not in {True, False}:
+            raise ValueError("SkillGateDecisionMissing")
+        return parsed["promote"] is True
 
 
 def _now_iso() -> str:

@@ -33,12 +33,23 @@ from .prompts import (
     format_reconsidered_for_compression,
 )
 from .store import InsightStore
+from .timeouts import send_with_deadline
 
 logger = logging.getLogger("life_engine.learning.knowledge")
 
 # 默认参数
 _DEFAULT_TRIGGER_COUNT = 5  # 触发压缩的 validated 数量
 _DEFAULT_INTERVAL_HOURS = 48.0  # 压缩最小间隔
+
+# 压缩 / 门禁 LLM 调用超时（秒）。数字的来历见 timeouts 模块。
+#
+# 这里从 90s 改成 180s 不是放宽：此前"发请求"和"读回复"各自 wait_for(90)，
+# 真实上界本来就是 180s。收拢成一个截止时间后，如果仍写 90s，反而是把现有
+# 预算砍半——同一 provider 上 life_skill_distill 的成功样本已经跑到 88.9s，
+# 砍半会凭空造出新的超时。180s 保持今天的真实行为不变，只是让配置里的数字
+# 终于说的是实话。
+_DEFAULT_TIMEOUT_SECONDS = 180.0
+_MIN_TIMEOUT_SECONDS = 30.0
 _INITIAL_KNOWLEDGE = """\
 # 学习派生观察候选
 
@@ -76,7 +87,7 @@ class SelfKnowledgeCompressor:
         store: InsightStore,
         workspace_path: str | Path,
         model_task_name: str = "life",
-        timeout_seconds: float = 90.0,
+        timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
         trigger_count: int = _DEFAULT_TRIGGER_COUNT,
         interval_hours: float = _DEFAULT_INTERVAL_HOURS,
         max_edits: int | None = None,
@@ -84,7 +95,9 @@ class SelfKnowledgeCompressor:
         self._store = store
         self._workspace = Path(workspace_path).resolve()
         self._model_task_name = str(model_task_name or "life").strip() or "life"
-        self._timeout = max(30.0, float(timeout_seconds or 90.0))
+        self._timeout = max(
+            _MIN_TIMEOUT_SECONDS, float(timeout_seconds or _DEFAULT_TIMEOUT_SECONDS)
+        )
         self._trigger_count = max(2, int(trigger_count or _DEFAULT_TRIGGER_COUNT))
         self._interval_hours = max(
             6.0, float(interval_hours or _DEFAULT_INTERVAL_HOURS)
@@ -259,12 +272,8 @@ class SelfKnowledgeCompressor:
         request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
         request.add_payload(LLMPayload(ROLE.USER, Text(delivered.text)))
 
-        response = await asyncio.wait_for(
-            request.send(auto_append_response=False, stream=False),
-            timeout=self._timeout,
-        )
-        raw_text = await asyncio.wait_for(response, timeout=self._timeout)
-        return str(raw_text or "").strip()
+        raw_text = await send_with_deadline(request, self._timeout)
+        return raw_text.strip()
 
     async def _selection_gate(
         self,
@@ -294,18 +303,14 @@ class SelfKnowledgeCompressor:
             request.add_payload(LLMPayload(ROLE.SYSTEM, Text(SELECTION_GATE_SYSTEM)))
             request.add_payload(LLMPayload(ROLE.USER, Text(delivered.text)))
 
-            response = await asyncio.wait_for(
-                request.send(auto_append_response=False, stream=False),
-                timeout=self._timeout,
-            )
-            raw_text = await asyncio.wait_for(response, timeout=self._timeout)
-            return self._parse_gate_result(str(raw_text or ""))
+            raw_text = await send_with_deadline(request, self._timeout)
+            return self._parse_gate_result(raw_text)
         except Exception as exc:
             logger.warning(
-                "Selection gate 调用失败，默认拒绝: %s",
+                "Selection gate 调用失败: %s",
                 type(exc).__name__,
             )
-            return False
+            raise
 
     def _parse_gate_result(self, raw_text: str) -> bool:
         """解析 selection gate 结果。"""
@@ -316,8 +321,10 @@ class SelfKnowledgeCompressor:
             parsed = json_repair.repair_json(raw_text, return_objects=True)
 
         if not isinstance(parsed, dict):
-            return False
-        return bool(parsed.get("promote", False))
+            raise ValueError("KnowledgeSelectionGateOutputMustBeObject")
+        if parsed.get("promote") not in {True, False}:
+            raise ValueError("KnowledgeSelectionGateDecisionMissing")
+        return parsed["promote"] is True
 
     @staticmethod
     def _count_change_regions(old_content: str, new_content: str) -> int:
@@ -355,8 +362,7 @@ class SelfKnowledgeCompressor:
             "来源：学习系统的历史派生账本；它不属于 SOUL.md、USER.md、MEMORY.md，"
             "不能覆盖三份主体权威。\n"
             "使用方式：只把下文当作可质疑、可重审的观察与假设；是否采纳以及如何"
-            "表述，由当前活跃意识实例决定。\n\n"
-            + content
+            "表述，由当前活跃意识实例决定。\n\n" + content
         )
         projection = project_learning_text(
             framed,

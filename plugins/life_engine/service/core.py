@@ -549,6 +549,7 @@ class LifeEngineService(BaseService):
         self._state = LifeEngineState()
         self._state_dirty: bool = False
         self._heartbeat_task_id: str | None = None
+        self._learning_maintenance_task_id: str | None = None
         self._storage_authority_renew_task_id: str | None = None
         self._memory_index_task_id: str | None = None
         self._memory_witness_task_id: str | None = None
@@ -629,6 +630,7 @@ class LifeEngineService(BaseService):
         self._presence_world_stores: Any | None = None
         self._life_event_store: Any | None = None
         self._learning_stores: Any | None = None
+        self._learning_event_store: Any | None = None
         self._attention_thread_service: Any | None = None
         self._subject_document_store: Any | None = None
         self._runtime_state_store: Any | None = None
@@ -1174,24 +1176,26 @@ class LifeEngineService(BaseService):
         # duplicate full-table health sweep before all stores are attached.
         learning_cfg = getattr(self._cfg(), "learning", None)
         learning_stores = None
+        learning_event_store = None
         if learning_cfg is None or getattr(learning_cfg, "enabled", True):
             from ..storage.learning_contracts import (
                 LEARNING_WRITER_CLAIM_NAMESPACE,
                 LEARNING_WRITER_CLAIM_STATE_KEY,
             )
 
-            # Multi-writer generations share the learning domain across nodes
-            # (spec 5.2 / 16.2): the generation-scoped singleton claim and its
-            # database guard are retired, so no claim is acquired and no
-            # binding is verified.  Occurrence identity and projection
-            # revision/CAS remain the write-conflict boundary.
-            if not multi_writer_enabled:
-                learning_writer_claim = await _acquire_writer_claim(
-                    namespace=LEARNING_WRITER_CLAIM_NAMESPACE,
-                    state_key=LEARNING_WRITER_CLAIM_STATE_KEY,
-                )
-            else:
-                learning_writer_claim = None
+            # Every generation writer may append immutable learning evidence
+            # through the unclaimed handle. Only this service-owned singleton
+            # projector may update global selected projections/maintenance.
+            learning_event_stores = await open_learning_stores(
+                runtime,
+                initialize_schema=False,
+                writer_claim=None,
+            )
+            learning_event_store = learning_event_stores.store
+            learning_writer_claim = await _acquire_writer_claim(
+                namespace=LEARNING_WRITER_CLAIM_NAMESPACE,
+                state_key=LEARNING_WRITER_CLAIM_STATE_KEY,
+            )
             learning_stores = await open_learning_stores(
                 runtime,
                 initialize_schema=False,
@@ -1210,6 +1214,7 @@ class LifeEngineService(BaseService):
         await gateway.catch_up()
         self._life_event_store = ledger
         self._learning_stores = learning_stores
+        self._learning_event_store = learning_event_store
         self._attention_thread_service = attention_service
         self._presence_world_stores = stores
         self._subject_document_store = subject_store
@@ -1426,6 +1431,7 @@ class LifeEngineService(BaseService):
         self._runtime_context_writer_claim = None
         self._learning_writer_claim = None
         self._learning_stores = None
+        self._learning_event_store = None
         self._attention_thread_service = None
         if self._multi_writer_bridge is not None:
             try:
@@ -7800,15 +7806,12 @@ class LifeEngineService(BaseService):
             return None
 
     async def _run_learning_heartbeat_maintenance(self) -> None:
-        """Keep derived learning maintenance isolated from the main heartbeat."""
+        """Wake derived learning without spending foreground heartbeat budget."""
 
         scheduler = self._learning_scheduler
         if scheduler is None:
             return
-        try:
-            await scheduler.on_heartbeat()
-        except Exception as exc:  # noqa: BLE001 - derived learning is isolated
-            logger.debug(f"学习系统心跳异常: {type(exc).__name__}")
+        scheduler.request_maintenance()
 
     def _mark_runtime_context_persisted(self) -> None:
         """Mark the exact state snapshot protected by ``self._lock`` clean."""
@@ -7982,6 +7985,11 @@ class LifeEngineService(BaseService):
                         if self._learning_stores is not None
                         else None
                     ),
+                    learning_event_store=(
+                        self._learning_event_store
+                        if self._selectable_storage_enabled
+                        else None
+                    ),
                     subject_authority=(
                         self._subject_document_store
                         if self._selectable_storage_enabled
@@ -8016,7 +8024,7 @@ class LifeEngineService(BaseService):
                     subject_review_user_interval_hours=float(getattr(learning_cfg, "subject_review_user_interval_hours", 720.0) if learning_cfg else 720.0),
                     subject_review_memory_interval_hours=float(getattr(learning_cfg, "subject_review_memory_interval_hours", 168.0) if learning_cfg else 168.0),
                     subject_review_offer_cooldown_hours=float(getattr(learning_cfg, "subject_review_offer_cooldown_hours", 24.0) if learning_cfg else 24.0),
-                    reflection_cooldown_minutes=float(getattr(learning_cfg, "reflection_cooldown_minutes", 30.0) if learning_cfg else 30.0),
+                    reflection_cooldown_minutes=float(getattr(learning_cfg, "reflection_cooldown_minutes", 5.0) if learning_cfg else 5.0),
                     skill_distill_trigger_count=int(getattr(learning_cfg, "skill_distill_trigger_count", 3) if learning_cfg else 3),
                     skill_distill_interval_hours=float(getattr(learning_cfg, "skill_distill_interval_hours", 24.0) if learning_cfg else 24.0),
                 )
@@ -8146,6 +8154,25 @@ class LifeEngineService(BaseService):
                 daemon=True,
             )
             self._router_context_projection_task_id = projection_task.task_id
+
+        if self._learning_scheduler is not None:
+            learning_cfg = getattr(cfg, "learning", None)
+            learning_task = get_task_manager().create_task(
+                self._learning_scheduler.run(
+                    self._stop_event,
+                    poll_interval_seconds=float(
+                        getattr(
+                            learning_cfg,
+                            "maintenance_poll_seconds",
+                            15.0,
+                        )
+                        or 15.0
+                    ),
+                ),
+                name="life_engine_learning_maintenance",
+                daemon=True,
+            )
+            self._learning_maintenance_task_id = learning_task.task_id
 
         task = get_task_manager().create_task(
             self._heartbeat_loop(),
@@ -8278,6 +8305,11 @@ class LifeEngineService(BaseService):
         self._memory_index_task_id = None
         await self._await_managed_task(self._heartbeat_task_id, timeout=5.0)
         self._heartbeat_task_id = None
+        await self._await_managed_task(
+            self._learning_maintenance_task_id,
+            timeout=10.0,
+        )
+        self._learning_maintenance_task_id = None
 
         try:
             await self._close_minecraft_session()
@@ -8534,6 +8566,7 @@ class LifeEngineService(BaseService):
                             interaction_text=interaction_text,
                             context=context_text,
                             source_event_ids=event_ids,
+                            actor_consciousness_instance_id="chat_global",
                         ),
                         name=f"life_learning_reflect_{self._state.heartbeat_count}",
                         daemon=True,

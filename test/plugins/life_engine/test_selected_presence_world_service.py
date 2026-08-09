@@ -134,6 +134,7 @@ class _FakeRuntime:
         self.invalidated = False
         self.renew_error: Exception | None = None
         self.claim_calls: list[dict[str, Any]] = []
+        self.learning_open_writer_claims: list[Any | None] = []
 
     async def acquire_singleton_writer(self, **kwargs: Any) -> Any:
         self.claim_calls.append(dict(kwargs))
@@ -384,10 +385,10 @@ def _install_selected_factories(
         initialize_schema: bool = False,
         writer_claim: Any | None = None,
     ) -> Any:
-        # The legacy generation-scoped singleton claim is retired on the
-        # multi-writer path (writer_claim=None); per-test assertions on claim
-        # scopes live in the individual tests, not here.
+        # Immutable evidence and singleton projections deliberately use two
+        # handles from the same runtime with different write capabilities.
         assert runtime.backend == backend
+        runtime.learning_open_writer_claims.append(writer_claim)
         factory_calls.append(("learning", initialize_schema))
         return SimpleNamespace(store=learning_store)
 
@@ -480,6 +481,7 @@ async def test_selected_service_uses_one_backend_for_presence_world_and_events(
         ("runtime-state", False),
         ("attention", False),
         ("learning", False),
+        ("learning", False),
     ]
     assert first.storage_runtime is runtimes[0]
     assert [
@@ -489,6 +491,11 @@ async def test_selected_service_uses_one_backend_for_presence_world_and_events(
         ("life_engine.learning", "selected_persistence"),
     ]
     assert len({call["owner_instance_id"] for call in runtimes[0].claim_calls}) == 1
+    assert runtimes[0].learning_open_writer_claims[0] is None
+    assert (
+        runtimes[0].learning_open_writer_claims[1]
+        is first._learning_writer_claim
+    )
     assert first.consciousness_registry.get(CHAT_GLOBAL_INSTANCE_ID) is not None
     assert first.consciousness_registry.database_path is None
     assert not (tmp_path / "runtime" / "consciousness_presence.sqlite3").exists()
@@ -918,8 +925,14 @@ async def test_failed_selected_storage_start_releases_partial_writer_claims(
     )
     service = _selected_service(tmp_path, BackendKind.MYSQL)
 
-    async def _failed_learning_open(*_args: Any, **_kwargs: Any) -> Any:
-        raise RuntimeError("injected learning store attachment failure")
+    async def _failed_learning_open(
+        *_args: Any,
+        writer_claim: Any | None = None,
+        **_kwargs: Any,
+    ) -> Any:
+        if writer_claim is not None:
+            raise RuntimeError("injected learning store attachment failure")
+        return SimpleNamespace(store=_FakeLearningStore())
 
     monkeypatch.setattr(
         "plugins.life_engine.storage.learning_factory.open_learning_stores",
@@ -1265,15 +1278,14 @@ async def test_multi_writer_gate_fails_closed_on_unretired_singleton(
     assert factory_calls == []
 
 
-async def test_multi_writer_gate_ready_retires_all_legacy_singleton_claims(
+async def test_multi_writer_gate_keeps_learning_projector_singleton(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A fully migrated node must skip the legacy runtime-context singleton
-    claim and the generation-scoped learning singleton claim: both domains
-    are shared across nodes in the multi-writer generation (spec 5.2 / 16.2),
-    with occurrence identity and projection revision/CAS as the write-conflict
-    boundary."""
+    """Multi-writer retires runtime-context serialization, not Learning's
+    dedicated projector owner. Evidence remains multi-writer while the global
+    selected projection and maintenance loop retain one database-fenced owner.
+    """
 
     stores = build_fake_stores()
     ledger = _FakeLifeEventStore()
@@ -1316,7 +1328,14 @@ async def test_multi_writer_gate_ready_retires_all_legacy_singleton_claims(
 
     await service._start_selected_storage()
 
-    assert runtime.claim_calls == []
+    assert [
+        (call["namespace"], call["state_key"])
+        for call in runtime.claim_calls
+    ] == [("life_engine.learning", "selected_persistence")]
+    assert runtime.learning_open_writer_claims == [
+        None,
+        service._learning_writer_claim,
+    ]
 
     # The ready path attaches a hot-path bridge and registers global transport
     # hook slots; teardown must fully unregister them so later tests never

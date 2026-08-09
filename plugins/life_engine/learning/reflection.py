@@ -33,11 +33,42 @@ from .prompts import (
     format_existing_insights_summary,
 )
 from .store import InsightStore
+from .timeouts import resolve_timeout_seconds, send_with_deadline
 
 logger = logging.getLogger("life_engine.learning.reflection")
 
 # 反思冷却（秒）
-_DEFAULT_COOLDOWN_SECONDS = 30 * 60  # 30 分钟
+_DEFAULT_COOLDOWN_SECONDS = 5 * 60  # 5 分钟
+
+# 反思 LLM 调用超时（秒）。数字的来历与"为什么 45s 是错的"见 timeouts 模块。
+_DEFAULT_TIMEOUT_SECONDS = 180.0
+_MIN_TIMEOUT_SECONDS = 10.0
+_TIMEOUT_ENV_VAR = "ELYSIUM_REFLECTION_TIMEOUT_SECONDS"
+
+
+def _resolve_timeout_seconds(explicit: float | None) -> float:
+    """Resolve the reflection LLM timeout from an explicit value or the env var.
+
+    Thin binding of :func:`~.timeouts.resolve_timeout_seconds` to this ring's
+    env var and defaults.
+
+    Args:
+        explicit: Caller-supplied timeout in seconds, or ``None`` to resolve
+            from the environment.
+
+    Returns:
+        The timeout in seconds, never below :data:`_MIN_TIMEOUT_SECONDS`.
+
+    Raises:
+        ValueError: If the env var is set but is not a positive finite number.
+    """
+
+    return resolve_timeout_seconds(
+        explicit,
+        env_var=_TIMEOUT_ENV_VAR,
+        default=_DEFAULT_TIMEOUT_SECONDS,
+        minimum=_MIN_TIMEOUT_SECONDS,
+    )
 
 
 class ReflectionEngine:
@@ -49,7 +80,7 @@ class ReflectionEngine:
         store: InsightStore,
         workspace_path: str | Path,
         model_task_name: str = "life",
-        timeout_seconds: float = 45.0,
+        timeout_seconds: float | None = None,
         cooldown_seconds: float = _DEFAULT_COOLDOWN_SECONDS,
         skill_store: Any | None = None,
         memory_service: Any | None = None,
@@ -57,7 +88,7 @@ class ReflectionEngine:
         self._store = store
         self._workspace = Path(workspace_path).resolve()
         self._model_task_name = str(model_task_name or "life").strip() or "life"
-        self._timeout = max(10.0, float(timeout_seconds or 45.0))
+        self._timeout = _resolve_timeout_seconds(timeout_seconds)
         self._cooldown_seconds = max(60.0, float(cooldown_seconds))
         self._skill_store = skill_store
         self._memory_service = memory_service
@@ -80,6 +111,19 @@ class ReflectionEngine:
         """是否在冷却期外。"""
         now = datetime.now(UTC).timestamp()
         return (now - self._last_reflection_at) >= self._cooldown_seconds
+
+    @property
+    def last_reflection_at(self) -> float:
+        """Unix timestamp of the last reflection that actually reached the LLM.
+
+        Callers need this to tell "reflected, found nothing" apart from "declined,
+        still cooling down": both return an empty insight list, but only the first
+        one means the experience has been considered. This watermark advances only
+        after a successful LLM call, so a caller can compare it across the call and
+        keep the request queued when it did not move.
+        """
+
+        return self._last_reflection_at
 
     async def reflect_on_interaction(
         self,
@@ -350,12 +394,7 @@ class ReflectionEngine:
         request.add_payload(LLMPayload(ROLE.SYSTEM, Text(REFLECTION_SYSTEM_PROMPT)))
         request.add_payload(LLMPayload(ROLE.USER, Text(delivered.text)))
 
-        response = await asyncio.wait_for(
-            request.send(auto_append_response=False, stream=False),
-            timeout=self._timeout,
-        )
-        raw_text = await asyncio.wait_for(response, timeout=self._timeout)
-        return str(raw_text or "")
+        return await send_with_deadline(request, self._timeout)
 
     def _parse_candidates(self, raw_text: str) -> list[tuple[Insight, str]]:
         """解析 LLM 输出为洞察候选列表。

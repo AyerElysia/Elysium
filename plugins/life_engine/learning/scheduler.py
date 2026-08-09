@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from ..storage.learning_contracts import LearningStorePort
+from ..storage.learning_contracts import LearningEventDraft, LearningStorePort
 from ..storage.subject_contracts import (
     SUBJECT_AUTHORITY_PATHS,
     SubjectAuthorityCommit,
@@ -44,6 +44,7 @@ from .reflection import ReflectionEngine
 from .reflection_queue import (
     MAX_PENDING_REFLECTIONS,
     REFLECTION_QUEUE_STATE_KEY,
+    REFLECTION_RUNTIME_STATE_KEY,
     LearningReflectionJob,
     ReflectionJobKind,
     load_reflection_jobs,
@@ -67,7 +68,11 @@ _DEFAULT_AUDIT_INTERVAL_HOURS = 6.0
 _DEFAULT_AUDIT_BATCH_SIZE = 3
 _DEFAULT_COMPRESS_TRIGGER_COUNT = 5
 _DEFAULT_COMPRESS_INTERVAL_HOURS = 48.0
-_DEFAULT_REFLECTION_COOLDOWN_MINUTES = 30.0
+# 30 分钟冷却算不过来账：一次反思一次机会，一天上限 48 次，而实测到达率是
+# 107~164 段经历/天。差额不是"稍微慢一点"，是每天一百多段经历排进队列再也出不来，
+# 队列 5 天从 16 涨到 310，撞满 512 上限之后新的经历会被直接拒收。5 分钟对应
+# 288 次/天，既盖住到达率也留出排空积压的余量。
+_DEFAULT_REFLECTION_COOLDOWN_MINUTES = 5.0
 _DEFAULT_METRICS_INTERVAL_HOURS = 12.0
 _DEFAULT_SKILL_DISTILL_TRIGGER_COUNT = 3
 _DEFAULT_SKILL_DISTILL_INTERVAL_HOURS = 24.0
@@ -80,6 +85,12 @@ _DEFAULT_SUBJECT_REVIEW_INTERVAL_HOURS: dict[SubjectDocumentPath, float] = {
 }
 _DEFAULT_SUBJECT_REVIEW_OFFER_COOLDOWN_HOURS = 24.0
 _SUBJECT_REVIEW_STATE_KEY = "subject_review_v1"
+_DEFAULT_MAINTENANCE_POLL_SECONDS = 15.0
+_REFLECTION_FAILURE_BACKOFF_BASE_SECONDS = 30.0
+_REFLECTION_FAILURE_BACKOFF_MAX_SECONDS = 15.0 * 60.0
+_REFLECTION_EVENT_CURSOR_STATE_KEY = "reflection_event_cursor_v1"
+_REFLECTION_ENQUEUED_EVENT_KIND = "reflection.enqueued"
+_REFLECTION_EVENT_PAGE_SIZE = 500
 
 
 class LearningScheduler:
@@ -126,6 +137,7 @@ class LearningScheduler:
         memory_service: Any | None = None,
         maintenance_journal: LearningMaintenanceJournalPort | None = None,
         learning_store: LearningStorePort | None = None,
+        learning_event_store: LearningStorePort | None = None,
         subject_authority: SubjectAuthorityPort | None = None,
         project_subject_commit: (
             Callable[[SubjectDocumentPath, SubjectAuthorityCommit], Awaitable[None]]
@@ -160,6 +172,7 @@ class LearningScheduler:
 
         # 初始化核心组件
         self._selected_persistence: SelectedLearningPersistence | None = None
+        self._learning_event_store = learning_event_store
         self.decision_ledger: LearningDecisionLedger | None = None
         self._writer_instance_id = (
             str(writer_instance_id).strip() or f"learning_writer_{uuid4().hex}"
@@ -260,8 +273,21 @@ class LearningScheduler:
         self._last_staleness_check_at: str = ""
         self._epistemic_backfilled = False
         self._maintenance_lock = asyncio.Lock()
+        # 队列锁只护住"读改写 pending_reflections"这几步，不再跨 LLM 调用。
+        # 反思本身由 _reflection_runner_lock 串行化：提交路径发现它被占用就把
+        # 请求留在队列里，不排队等一次 180s 的调用。
         self._reflection_queue_lock = asyncio.Lock()
+        self._reflection_runner_lock = asyncio.Lock()
         self._subject_review_lock = asyncio.Lock()
+        self._reflection_cooldown_minutes = max(
+            0.1,
+            float(reflection_cooldown_minutes),
+        )
+        self._maintenance_wakeup = asyncio.Event()
+        self._worker_running = False
+        self._worker_last_started_at = ""
+        self._worker_last_completed_at = ""
+        self._worker_last_error_type = ""
 
     async def initialize(self) -> None:
         """Restore bounded maintenance health without blocking the event loop."""
@@ -281,8 +307,59 @@ class LearningScheduler:
     async def close(self) -> None:
         """Flush learning consumers without closing the injected runtime."""
 
+        self._maintenance_wakeup.set()
         if self._selected_persistence is not None:
             await self._selected_persistence.close()
+
+    def request_maintenance(self) -> None:
+        """Wake the independent learning worker without awaiting LLM work."""
+
+        self._maintenance_wakeup.set()
+
+    async def run(
+        self,
+        stop_event: asyncio.Event,
+        *,
+        poll_interval_seconds: float = _DEFAULT_MAINTENANCE_POLL_SECONDS,
+    ) -> None:
+        """Run derived learning outside the subject's foreground heartbeat.
+
+        Event handlers only append immutable work and wake this loop. A slow or
+        unavailable learning model can therefore degrade learning health without
+        consuming the main heartbeat's response budget or delaying expression.
+        """
+
+        poll_seconds = max(1.0, float(poll_interval_seconds))
+        self._worker_running = True
+        self.request_maintenance()
+        try:
+            while not stop_event.is_set():
+                self._maintenance_wakeup.clear()
+                self._worker_last_started_at = _now_iso()
+                try:
+                    await self.on_heartbeat()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - keep the worker alive
+                    self._worker_last_error_type = type(exc).__name__
+                    logger.warning(
+                        "learning maintenance worker cycle failed: %s",
+                        type(exc).__name__,
+                    )
+                else:
+                    self._worker_last_completed_at = _now_iso()
+                    self._worker_last_error_type = ""
+                if stop_event.is_set():
+                    break
+                try:
+                    await asyncio.wait_for(
+                        self._maintenance_wakeup.wait(),
+                        timeout=poll_seconds,
+                    )
+                except TimeoutError:
+                    pass
+        finally:
+            self._worker_running = False
 
     async def decide_skill_candidate(
         self,
@@ -385,10 +462,87 @@ class LearningScheduler:
     def _reflection_jobs(self) -> list[LearningReflectionJob]:
         return load_reflection_jobs(self.store.load_state())
 
-    def _save_reflection_jobs(self, jobs: list[LearningReflectionJob]) -> None:
-        state = self.store.load_state()
+    @staticmethod
+    def _reflection_runtime_state(state: dict[str, Any]) -> dict[str, Any]:
+        raw = state.get(REFLECTION_RUNTIME_STATE_KEY)
+        runtime = dict(raw) if isinstance(raw, dict) else {}
+        runtime.setdefault("schema_version", 1)
+        return runtime
+
+    def _save_reflection_jobs(
+        self,
+        jobs: list[LearningReflectionJob],
+        *,
+        state: dict[str, Any] | None = None,
+        runtime: dict[str, Any] | None = None,
+    ) -> None:
+        state = self.store.load_state() if state is None else state
         state[REFLECTION_QUEUE_STATE_KEY] = [job.to_dict() for job in jobs]
+        if runtime is not None:
+            state[REFLECTION_RUNTIME_STATE_KEY] = runtime
         self.store.save_state(state)
+
+    async def enqueue_reflection(
+        self,
+        *,
+        reflection_kind: ReflectionJobKind,
+        reflection_text: str,
+        context: str = "",
+        source_event_ids: list[str] | None = None,
+        actor_consciousness_instance_id: str = "",
+    ) -> str:
+        """Durably enqueue one experience and return without running its LLM."""
+
+        job = LearningReflectionJob.create(
+            reflection_kind=reflection_kind,
+            reflection_text=reflection_text,
+            context=context,
+            source_event_ids=source_event_ids,
+            actor_consciousness_instance_id=actor_consciousness_instance_id,
+        )
+        if self._learning_event_store is not None:
+            draft = LearningEventDraft(
+                occurrence_id=job.job_id,
+                event_kind=_REFLECTION_ENQUEUED_EVENT_KIND,
+                occurred_at=job.created_at,
+                source=f"learning.{job.reflection_kind}",
+                actor_consciousness_instance_id=(
+                    job.actor_consciousness_instance_id
+                ),
+                subject_revision="",
+                provenance={
+                    "schema_version": 1,
+                    "queue": REFLECTION_QUEUE_STATE_KEY,
+                    "writer_instance_id": self._writer_instance_id,
+                },
+                payload=job.to_dict(),
+            )
+            await self._learning_event_store.commit(
+                events=[draft],
+                projections=[],
+            )
+            self.request_maintenance()
+            return job.job_id
+        async with self._reflection_queue_lock:
+            state = self.store.load_state()
+            jobs = load_reflection_jobs(state)
+            if len(jobs) >= MAX_PENDING_REFLECTIONS:
+                logger.error(
+                    "反思队列已满，本次经历无法入队：pending=%d cap=%d",
+                    len(jobs),
+                    MAX_PENDING_REFLECTIONS,
+                )
+                raise RuntimeError("LearningReflectionQueueFull")
+            runtime = self._reflection_runtime_state(state)
+            runtime["total_enqueued_count"] = (
+                int(runtime.get("total_enqueued_count", 0) or 0) + 1
+            )
+            runtime["last_enqueued_at"] = _now_iso()
+            jobs.append(job)
+            self._save_reflection_jobs(jobs, state=state, runtime=runtime)
+            await self.flush()
+        self.request_maintenance()
+        return job.job_id
 
     async def submit_reflection(
         self,
@@ -401,34 +555,44 @@ class LearningScheduler:
     ) -> list[Any] | None:
         """Persist a reflection request before attempting its LLM work.
 
-        ``None`` means the request remains queued because the engine is cooling
-        down. An empty list means the request ran successfully and produced no
-        new insight. Failures raise only after the retry envelope is durable.
+        ``None`` means the request remains queued: the engine is cooling down,
+        or another reflection is already in flight. An empty list means the
+        request ran successfully and produced no new insight. Failures raise
+        only after the retry envelope is durable.
         """
 
-        job = LearningReflectionJob.create(
+        job_id = await self.enqueue_reflection(
             reflection_kind=reflection_kind,
             reflection_text=reflection_text,
             context=context,
             source_event_ids=source_event_ids,
             actor_consciousness_instance_id=actor_consciousness_instance_id,
         )
-        async with self._reflection_queue_lock:
-            jobs = self._reflection_jobs()
-            if len(jobs) >= MAX_PENDING_REFLECTIONS:
-                raise RuntimeError("LearningReflectionQueueFull")
-            jobs.append(job)
-            self._save_reflection_jobs(jobs)
-            await self.flush()
-        result = await self._run_pending_reflection(preferred_job_id=job.job_id)
+        if self._learning_event_store is not None:
+            await self._ingest_reflection_events()
+        result = await self._run_pending_reflection()
         if result is None:
+            return None
+        if result[0] != job_id:
             return None
         _, insights = result
         return insights
 
     def _reflection_work_due(self) -> bool:
+        state = self.store.load_state()
+        runtime = self._reflection_runtime_state(state)
+        retry_at = str(runtime.get("global_next_attempt_at") or "")
+        if retry_at:
+            try:
+                retry_time = datetime.fromisoformat(retry_at)
+            except ValueError:
+                return False
+            if retry_time.tzinfo is None:
+                retry_time = retry_time.replace(tzinfo=UTC)
+            if retry_time.astimezone(UTC) > datetime.now(UTC):
+                return False
         return self.reflection.can_reflect and any(
-            job.due() for job in self._reflection_jobs()
+            job.due() for job in load_reflection_jobs(state)
         )
 
     def _reflection_pending_count(self) -> int:
@@ -437,22 +601,224 @@ class LearningScheduler:
     async def _run_pending_reflection_phase(self) -> None:
         await self._run_pending_reflection()
 
-    async def _run_pending_reflection(
-        self,
-        *,
-        preferred_job_id: str = "",
-    ) -> tuple[str, list[Any]] | None:
+    async def _ingest_reflection_events(self) -> int:
+        """Project immutable cross-node enqueue facts into the owner queue."""
+
+        if self._learning_event_store is None:
+            return 0
+        ingested = 0
         async with self._reflection_queue_lock:
-            jobs = self._reflection_jobs()
+            state = self.store.load_state()
+            jobs = load_reflection_jobs(state)
+            known = {job.job_id for job in jobs}
+            runtime = self._reflection_runtime_state(state)
+            cursor = max(
+                0,
+                int(state.get(_REFLECTION_EVENT_CURSOR_STATE_KEY, 0) or 0),
+            )
+            original_cursor = cursor
+            while True:
+                page = await self._learning_event_store.read_events(
+                    cursor,
+                    limit=_REFLECTION_EVENT_PAGE_SIZE,
+                )
+                if not page:
+                    break
+                stopped_at_capacity = False
+                for record in page:
+                    if record.event_kind == _REFLECTION_ENQUEUED_EVENT_KIND:
+                        job = LearningReflectionJob.from_dict(record.payload)
+                        if job.job_id != record.occurrence_id:
+                            raise RuntimeError(
+                                "LearningReflectionOccurrenceIdentityMismatch"
+                            )
+                        if job.job_id not in known:
+                            if len(jobs) >= MAX_PENDING_REFLECTIONS:
+                                stopped_at_capacity = True
+                                break
+                            jobs.append(job)
+                            known.add(job.job_id)
+                            ingested += 1
+                            runtime["total_enqueued_count"] = (
+                                int(runtime.get("total_enqueued_count", 0) or 0)
+                                + 1
+                            )
+                            runtime["last_enqueued_at"] = job.created_at
+                    cursor = record.position
+                if stopped_at_capacity:
+                    break
+                if len(page) < _REFLECTION_EVENT_PAGE_SIZE:
+                    break
+            if cursor == original_cursor and not ingested:
+                return 0
+            state[_REFLECTION_EVENT_CURSOR_STATE_KEY] = cursor
+            runtime["event_cursor"] = cursor
+            self._save_reflection_jobs(
+                jobs,
+                state=state,
+                runtime=runtime,
+            )
+            await self.flush()
+        if ingested:
+            logger.info("ingested %d immutable reflection enqueue events", ingested)
+        return ingested
+
+    @staticmethod
+    def _reflection_order_key(job: LearningReflectionJob) -> tuple[datetime, datetime]:
+        """Order due reflection jobs by readiness, then by arrival.
+
+        Insertion order is the wrong queue discipline here. The durable list only
+        ever grows at the tail, so always taking the head hands every attempt to
+        the same few oldest jobs: in production one job had burned 65 attempts
+        while 131 jobs had never been tried once. Sorting by ``next_attempt_at``
+        puts whatever is actually ready first, and a never-attempted job carries
+        ``next_attempt_at == created_at`` so it naturally outranks a job whose
+        backoff was just pushed forward. ``created_at`` breaks ties so equal
+        readiness still drains oldest-experience-first.
+
+        Args:
+            job: The queued reflection job being ranked.
+
+        Returns:
+            Sort key of ``(next_attempt_at, created_at)`` as aware datetimes.
+        """
+
+        return (
+            datetime.fromisoformat(job.next_attempt_at),
+            datetime.fromisoformat(job.created_at),
+        )
+
+    async def _claim_pending_reflection(self) -> LearningReflectionJob | None:
+        """Pick one due reflection job under the queue lock.
+
+        The claimed job deliberately stays in the durable queue. If the process
+        dies mid-call the experience is re-offered on restart rather than lost;
+        the runner lock, not removal, is what keeps two callers off the same job.
+
+        Returns:
+            The claimed job, or ``None`` when nothing is runnable right now.
+        """
+
+        async with self._reflection_queue_lock:
+            state = self.store.load_state()
+            jobs = load_reflection_jobs(state)
             if not jobs or not self.reflection.can_reflect:
                 return None
-            due = [job for job in jobs if job.due()]
+            runtime = self._reflection_runtime_state(state)
+            retry_at = str(runtime.get("global_next_attempt_at") or "")
+            if retry_at:
+                try:
+                    retry_time = datetime.fromisoformat(retry_at)
+                except ValueError as exc:
+                    raise RuntimeError("LearningReflectionCircuitStateCorrupt") from exc
+                if retry_time.tzinfo is None:
+                    retry_time = retry_time.replace(tzinfo=UTC)
+                if retry_time.astimezone(UTC) > datetime.now(UTC):
+                    return None
+            due = sorted(
+                (job for job in jobs if job.due()),
+                key=self._reflection_order_key,
+            )
             if not due:
                 return None
-            job = next(
-                (item for item in due if item.job_id == preferred_job_id),
-                due[0],
+            runtime["last_attempt_at"] = _now_iso()
+            self._save_reflection_jobs(jobs, state=state, runtime=runtime)
+            await self.flush()
+            return due[0]
+
+    async def _record_reflection_failure(
+        self,
+        job: LearningReflectionJob,
+        error: Exception,
+    ) -> None:
+        """Persist the retry envelope for a failed reflection job."""
+
+        async with self._reflection_queue_lock:
+            state = self.store.load_state()
+            jobs = load_reflection_jobs(state)
+            index = next(
+                (
+                    position
+                    for position, item in enumerate(jobs)
+                    if item.job_id == job.job_id
+                ),
+                -1,
             )
+            if index < 0:
+                return
+            jobs[index] = jobs[index].failed(error)
+            runtime = self._reflection_runtime_state(state)
+            failures = int(runtime.get("consecutive_failure_count", 0) or 0) + 1
+            delay_seconds = min(
+                _REFLECTION_FAILURE_BACKOFF_MAX_SECONDS,
+                _REFLECTION_FAILURE_BACKOFF_BASE_SECONDS * (2 ** min(failures - 1, 5)),
+            )
+            fingerprint = hashlib.sha256(
+                f"{type(error).__module__}:{type(error).__qualname__}".encode("utf-8")
+            ).hexdigest()
+            runtime.update(
+                {
+                    "consecutive_failure_count": failures,
+                    "total_failed_attempt_count": int(
+                        runtime.get("total_failed_attempt_count", 0) or 0
+                    )
+                    + 1,
+                    "global_next_attempt_at": (
+                        datetime.now(UTC) + timedelta(seconds=delay_seconds)
+                    ).isoformat(),
+                    "last_error_type": type(error).__name__,
+                    "last_error_fingerprint": fingerprint,
+                }
+            )
+            self._save_reflection_jobs(jobs, state=state, runtime=runtime)
+            await self.flush()
+
+    async def _retire_reflection_job(self, job: LearningReflectionJob) -> None:
+        """Drop a completed reflection job from the durable queue."""
+
+        async with self._reflection_queue_lock:
+            state = self.store.load_state()
+            jobs = load_reflection_jobs(state)
+            remaining = [item for item in jobs if item.job_id != job.job_id]
+            if len(remaining) == len(jobs):
+                return
+            runtime = self._reflection_runtime_state(state)
+            runtime.update(
+                {
+                    "consecutive_failure_count": 0,
+                    "global_next_attempt_at": "",
+                    "last_success_at": _now_iso(),
+                    "last_error_type": "",
+                    "last_error_fingerprint": "",
+                    "total_completed_count": int(
+                        runtime.get("total_completed_count", 0) or 0
+                    )
+                    + 1,
+                }
+            )
+            self._save_reflection_jobs(remaining, state=state, runtime=runtime)
+            await self.flush()
+
+    async def _run_pending_reflection(self) -> tuple[str, list[Any]] | None:
+        """Run at most one due reflection without holding the queue lock.
+
+        The LLM call used to happen inside ``_reflection_queue_lock``, so every
+        ``submit_reflection`` from a live interaction blocked behind a reflection
+        that could legitimately run for minutes. The lock now only covers durable
+        reads and writes; ``_reflection_runner_lock`` serializes the calls, and a
+        caller who finds it held leaves its request queued instead of waiting.
+
+        Returns:
+            ``(job_id, insights)`` when a reflection ran, else ``None``.
+        """
+
+        if self._reflection_runner_lock.locked():
+            return None
+        async with self._reflection_runner_lock:
+            job = await self._claim_pending_reflection()
+            if job is None:
+                return None
+            watermark = self.reflection.last_reflection_at
             try:
                 if job.reflection_kind == "interaction":
                     insights = await self.reflection.reflect_on_interaction(
@@ -473,13 +839,23 @@ class LearningScheduler:
                         ),
                     )
             except Exception as exc:
-                jobs[jobs.index(job)] = job.failed(exc)
-                self._save_reflection_jobs(jobs)
-                await self.flush()
+                # The original failure stays authoritative: a bookkeeping error
+                # must not replace the reason the reflection actually failed.
+                try:
+                    await self._record_reflection_failure(job, exc)
+                except Exception as record_exc:  # noqa: BLE001
+                    logger.warning(
+                        "反思失败记账失败: %s",
+                        type(record_exc).__name__,
+                    )
                 raise
-            jobs.remove(job)
-            self._save_reflection_jobs(jobs)
-            await self.flush()
+            if not insights and self.reflection.last_reflection_at <= watermark:
+                # 引擎自己也有冷却门禁，关上时它返回空列表——和"想过了但没有新
+                # 洞察"是同一个返回值。用水位线把两者分开：水位没动就说明这段
+                # 经历根本没被想过，退休它等于静默丢掉一段经历，所以留在队列里。
+                logger.debug("反思引擎未执行（冷却门禁），保留 job 待下一轮")
+                return None
+            await self._retire_reflection_job(job)
             return job.job_id, insights
 
     # ── 事件驱动入口 ─────────────────────────────────────────
@@ -494,18 +870,15 @@ class LearningScheduler:
     ) -> None:
         """交互结束事件：触发快环反思。"""
         try:
-            insights = await self.submit_reflection(
+            await self.enqueue_reflection(
                 reflection_kind="interaction",
                 reflection_text=interaction_text,
                 context=context,
                 source_event_ids=source_event_ids,
                 actor_consciousness_instance_id=actor_consciousness_instance_id,
             )
-            if insights:
-                logger.info(f"交互反思产生 {len(insights)} 条洞察")
-            await self.on_heartbeat()
         except Exception as exc:
-            logger.warning("交互反思异常: %s", type(exc).__name__)
+            logger.warning("交互反思入队异常: %s", type(exc).__name__)
 
     async def on_thought_closed(
         self,
@@ -517,18 +890,15 @@ class LearningScheduler:
     ) -> None:
         """思考流闭合事件：触发内省反思。"""
         try:
-            insights = await self.submit_reflection(
+            await self.enqueue_reflection(
                 reflection_kind="introspection",
                 reflection_text=thought_summary,
                 context=context,
                 source_event_ids=source_event_ids,
                 actor_consciousness_instance_id=actor_consciousness_instance_id,
             )
-            if insights:
-                logger.info(f"思考闭合反思产生 {len(insights)} 条洞察")
-            await self.on_heartbeat()
         except Exception as exc:
-            logger.warning("思考闭合反思异常: %s", type(exc).__name__)
+            logger.warning("思考闭合反思入队异常: %s", type(exc).__name__)
 
     async def on_attention_thread_closed(
         self,
@@ -541,25 +911,24 @@ class LearningScheduler:
 
         statement = str(public_statement or "").strip()
         actor = str(actor_consciousness_instance_id or "").strip()
-        sources = [str(value).strip() for value in source_event_ids if str(value).strip()]
+        sources = [
+            str(value).strip() for value in source_event_ids if str(value).strip()
+        ]
         if not statement or not actor or not sources:
             raise ValueError(
                 "attention close learning requires statement, actor, and sources"
             )
         try:
-            insights = await self.submit_reflection(
+            await self.enqueue_reflection(
                 reflection_kind="introspection",
                 reflection_text=statement,
                 context="主体明确关闭的持续关注线索公开表述",
                 source_event_ids=sources,
                 actor_consciousness_instance_id=actor,
             )
-            if insights:
-                logger.info("持续关注线索闭合产生 %s 条候选洞察", len(insights))
-            await self.on_heartbeat()
         except Exception as exc:  # noqa: BLE001 - derived learning cannot undo authority
             logger.warning(
-                "持续关注线索闭合反思异常: %s",
+                "持续关注线索闭合反思入队异常: %s",
                 type(exc).__name__,
             )
 
@@ -590,14 +959,14 @@ class LearningScheduler:
         return parsed.astimezone(UTC)
 
     @staticmethod
-    def _subject_content_from_snapshot(snapshot: Any, path: SubjectDocumentPath) -> bytes:
+    def _subject_content_from_snapshot(
+        snapshot: Any, path: SubjectDocumentPath
+    ) -> bytes:
         """Return one exact subject head from an authority snapshot."""
 
         commits = getattr(snapshot, "commits", None)
         if isinstance(commits, dict):
-            commit = commits.get(path) or commits.get(
-                f"life_engine_workspace/{path}"
-            )
+            commit = commits.get(path) or commits.get(f"life_engine_workspace/{path}")
         else:
             commit = None
             for item in tuple(commits or ()):
@@ -665,8 +1034,7 @@ class LearningScheduler:
         snooze_until = self._parse_review_time(record.get("snooze_until"))
         last_offered = self._parse_review_time(record.get("last_offered_at"))
         offer_after = (
-            last_offered
-            + timedelta(hours=self._subject_review_offer_cooldown_hours)
+            last_offered + timedelta(hours=self._subject_review_offer_cooldown_hours)
             if last_offered is not None
             else None
         )
@@ -698,14 +1066,10 @@ class LearningScheduler:
                 "last_actor_consciousness_instance_id": str(
                     record.get("last_actor_consciousness_instance_id") or ""
                 ),
-                "last_subject_revision": str(
-                    record.get("last_subject_revision") or ""
-                ),
+                "last_subject_revision": str(record.get("last_subject_revision") or ""),
                 "last_occurrence_id": str(record.get("last_occurrence_id") or ""),
                 "last_candidate_id": str(record.get("last_candidate_id") or ""),
-                "last_candidate_sha256": str(
-                    record.get("last_candidate_sha256") or ""
-                ),
+                "last_candidate_sha256": str(record.get("last_candidate_sha256") or ""),
                 "last_committed_subject_revision": str(
                     record.get("last_committed_subject_revision") or ""
                 ),
@@ -754,9 +1118,10 @@ class LearningScheduler:
                 if document_changed or not isinstance(raw_record, dict):
                     documents[path] = record
                     changed = True
-            if revision and str(
-                review.get("last_observed_subject_revision") or ""
-            ) != revision:
+            if (
+                revision
+                and str(review.get("last_observed_subject_revision") or "") != revision
+            ):
                 review["last_observed_subject_revision"] = revision
                 review["last_observed_at"] = now.isoformat()
                 changed = True
@@ -767,8 +1132,7 @@ class LearningScheduler:
 
         due_count = sum(bool(item["due"]) for item in snapshots)
         pending_count = sum(
-            str(item.get("last_outcome") or "")
-            in {"candidate_proposed", "kept_open"}
+            str(item.get("last_outcome") or "") in {"candidate_proposed", "kept_open"}
             for item in snapshots
         )
         return {
@@ -902,9 +1266,7 @@ class LearningScheduler:
             "occurred_at": occurred_at.isoformat(),
             "target_path": target_path,
             "outcome": normalized_outcome,
-            "actor_consciousness_instance_id": str(
-                actor_consciousness_instance_id
-            ),
+            "actor_consciousness_instance_id": str(actor_consciousness_instance_id),
             "subject_revision": str(subject_revision),
             "reason": str(reason),
             "candidate_id": str(candidate_id),
@@ -957,9 +1319,7 @@ class LearningScheduler:
                 ).isoformat()
             if normalized_outcome == "committed":
                 record["last_committed_subject_revision"] = str(subject_revision)
-                record["last_authority_occurrence_id"] = str(
-                    authority_occurrence_id
-                )
+                record["last_authority_occurrence_id"] = str(authority_occurrence_id)
             documents[target_path] = record
             state[_SUBJECT_REVIEW_STATE_KEY] = review
             self.store.save_state(state)
@@ -974,6 +1334,7 @@ class LearningScheduler:
         由 life_engine 心跳周期调用（低频，不必每次心跳都调用）。
         """
         async with self._maintenance_lock:
+            await self._ingest_reflection_events()
             run_id = f"learning_heartbeat_{uuid4().hex}"
             phases: tuple[
                 tuple[
@@ -1158,6 +1519,12 @@ class LearningScheduler:
 
     async def _maybe_run_audit(self) -> None:
         """检查是否到了审计时间。"""
+        # 回收必须在门禁之前：_should_audit 要求候选非空，而卡在 under_review 的
+        # 洞察恰好不算候选。放在门禁之后，遗留洞察就永远等不到被回收的那一轮。
+        try:
+            await self.auditor.reclaim_stranded_reviews()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("回收审计遗留洞察失败: %s", type(exc).__name__)
         if not self._should_audit():
             return
         logger.info("🔍 触发审计环")
@@ -1200,9 +1567,7 @@ class LearningScheduler:
             return
         state = self.store.load_state()
         version = int(state.get("last_knowledge_candidate_version", 0) or 0)
-        ledgered = int(
-            state.get("last_knowledge_candidate_ledgered_version", 0) or 0
-        )
+        ledgered = int(state.get("last_knowledge_candidate_ledgered_version", 0) or 0)
         if version <= 0 or version <= ledgered:
             return
         if self._current_subject_revision is None:
@@ -1567,11 +1932,7 @@ class LearningScheduler:
                     content_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
                 last_reviewed = self._parse_review_time(record.get("last_reviewed_at"))
                 baseline = max(
-                    (
-                        item
-                        for item in (changed_at, last_reviewed)
-                        if item is not None
-                    ),
+                    (item for item in (changed_at, last_reviewed) if item is not None),
                     default=now,
                 )
                 due_at = baseline + timedelta(
@@ -1647,9 +2008,31 @@ class LearningScheduler:
             if self._selected_persistence is not None
             else {"status": "disabled", "backend": "legacy_local"}
         )
+        reflection_health = reflection_queue_health(
+            load_reflection_jobs(state),
+            runtime_state=self._reflection_runtime_state(state),
+            cooldown_minutes=self._reflection_cooldown_minutes,
+        )
+        subject_review_health = self._subject_review_health_snapshot()
+        worker_health = {
+            "status": (
+                "healthy"
+                if self._worker_running
+                else "degraded"
+                if self._worker_last_started_at
+                else "initializing"
+            ),
+            "running": self._worker_running,
+            "last_started_at": self._worker_last_started_at,
+            "last_completed_at": self._worker_last_completed_at,
+            "last_error_type": self._worker_last_error_type,
+        }
         component_statuses = {
             str(maintenance_health.get("status") or "healthy"),
             str(selected_health.get("status") or "healthy"),
+            str(reflection_health.get("status") or "healthy"),
+            str(subject_review_health.get("status") or "healthy"),
+            str(worker_health.get("status") or "healthy"),
         }
         if "failed" in component_statuses:
             learning_status = "failed"
@@ -1667,9 +2050,7 @@ class LearningScheduler:
             "last_compress_at": state.get("last_compress_at", ""),
             "last_metrics_at": state.get("last_metrics_at", ""),
             "reflection_available": self.reflection.can_reflect,
-            "reflection_queue": reflection_queue_health(
-                load_reflection_jobs(state)
-            ),
+            "reflection_queue": reflection_health,
             "skill_candidates": {
                 "open": sum(item.status == "open" for item in skill_candidates),
                 "accepted": sum(item.status == "accepted" for item in skill_candidates),
@@ -1679,7 +2060,8 @@ class LearningScheduler:
                 ),
             },
             "maintenance": maintenance_health,
-            "subject_review": self._subject_review_health_snapshot(),
+            "subject_review": subject_review_health,
+            "worker": worker_health,
             "selected_persistence": selected_health,
             "prompt_projections": {
                 "knowledge": self.compressor.projection_health(),
