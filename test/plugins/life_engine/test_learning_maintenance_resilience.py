@@ -31,7 +31,10 @@ from plugins.life_engine.learning.reflection import (
     ReflectionEngine,
     _resolve_timeout_seconds,
 )
-from plugins.life_engine.learning.reflection_queue import LearningReflectionJob
+from plugins.life_engine.learning.reflection_queue import (
+    MAX_PENDING_REFLECTIONS,
+    LearningReflectionJob,
+)
 from plugins.life_engine.learning.scheduler import LearningScheduler
 from plugins.life_engine.learning.skill_distiller import SkillDistiller
 from plugins.life_engine.learning.skill_store import SkillPattern, SkillStore
@@ -379,6 +382,13 @@ async def test_cross_node_enqueue_is_event_only_and_owner_projects_once(
         workspace_path=tmp_path / "owner",
         learning_event_store=event_store,
     )
+    flush_calls = 0
+
+    async def _flush() -> None:
+        nonlocal flush_calls
+        flush_calls += 1
+
+    owner.flush = _flush  # type: ignore[method-assign]
 
     job_id = await producer.enqueue_reflection(
         reflection_kind="interaction",
@@ -398,11 +408,49 @@ async def test_cross_node_enqueue_is_event_only_and_owner_projects_once(
     assert len(projected) == 1
     assert projected[0].job_id == job_id
     assert projected[0].actor_consciousness_instance_id == "chat_global"
+    assert flush_calls == 1
     assert await owner._ingest_reflection_events() == 0
+    assert flush_calls == 1
     assert len(owner._reflection_jobs()) == 1
     assert (
         owner.store.load_state()["reflection_runtime_v1"]["event_cursor"] == 1
     )
+
+
+async def test_event_cursor_stops_before_capacity_without_losing_evidence(
+    tmp_path: Path,
+) -> None:
+    """A full derived queue never acknowledges an unprojected immutable fact."""
+
+    event_store = _SharedLearningEventStore()
+    producer = LearningScheduler(
+        workspace_path=tmp_path / "producer",
+        learning_event_store=event_store,
+    )
+    owner = LearningScheduler(
+        workspace_path=tmp_path / "owner",
+        learning_event_store=event_store,
+    )
+    for index in range(MAX_PENDING_REFLECTIONS + 1):
+        await producer.enqueue_reflection(
+            reflection_kind="interaction",
+            reflection_text=f"bounded experience {index}",
+            source_event_ids=[f"life-event:capacity:{index}"],
+            actor_consciousness_instance_id="chat_global",
+        )
+
+    assert await owner._ingest_reflection_events() == MAX_PENDING_REFLECTIONS
+    state = owner.store.load_state()
+    assert len(owner._reflection_jobs()) == MAX_PENDING_REFLECTIONS
+    assert state["reflection_event_cursor_v1"] == MAX_PENDING_REFLECTIONS
+    assert len(event_store.records) == MAX_PENDING_REFLECTIONS + 1
+
+    _queue_jobs(owner, owner._reflection_jobs()[1:])
+    assert await owner._ingest_reflection_events() == 1
+    state = owner.store.load_state()
+    assert len(owner._reflection_jobs()) == MAX_PENDING_REFLECTIONS
+    assert state["reflection_event_cursor_v1"] == MAX_PENDING_REFLECTIONS + 1
+    assert len(event_store.records) == MAX_PENDING_REFLECTIONS + 1
 
 
 async def test_independent_worker_runs_without_foreground_heartbeat(
