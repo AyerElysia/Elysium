@@ -41,7 +41,7 @@
   </section>
 </main>
 <script>
-const TARGET_RATE=16000,FRAME_MS=20,HEADER_BYTES=16,MIC_SIGNAL_RMS=.002,MIC_SILENCE_MS=5000,MAX_MIC_QUEUE=8,BARGE_ARM_MS=160,BARGE_MIN_FRAMES=6,PLAYBACK_SILENCE_RMS=.0005;
+const TARGET_RATE=16000,FRAME_MS=20,HEADER_BYTES=16,MIC_SIGNAL_RMS=.002,MIC_SILENCE_MS=5000,MAX_MIC_QUEUE=8,BARGE_ARM_MS=360,BARGE_MIN_FRAMES=10,PLAYBACK_SILENCE_RMS=.0005;
 const el=id=>document.getElementById(id),labels={idle:'待机',connecting:'连接模型',listening:'正在听',thinking:'正在思考',speaking:'正在说话',interrupted:'已打断',error:'发生错误',closed:'已结束'};
 let ws=null,audioCtx=null,stream=null,micSource=null,worklet=null,silentGain=null,audioPump=null,audioGeneration=0,running=false,explicitStop=false,muted=false,inputSeq=0,outputSeq=0,uplink=0,downlink=0,nextPlayTime=0,activeSources=new Set(),playbackStartedAt=0,episodeId='',reconnects=0,pingAt=0,bargeLatched=false,bargeSpeechFrames=0,bargeArmedAt=0,noiseFloor=.004,micStartedAt=0,lastMicSignalAt=0,micWarningShown=false,micFramesGenerated=0,micWindowStartedAt=0,pcmQueue=[],partial={},playbackChain=Promise.resolve(),responseAudibleStarted=false,silentPlaybackFrames=0;
 const pathBase=location.pathname.replace(/\/$/,'');
@@ -69,7 +69,7 @@ function startAudioPump(generation){
 }
 function stopAudioPump(){if(audioPump){clearInterval(audioPump);audioPump=null}pcmQueue.length=0}
 function handleMicFrame(samples,rms){
-  const now=performance.now(),db=rms>0?Math.round(20*Math.log10(rms)):-Infinity;el('meter').style.width=Math.min(100,rms*900)+'%';noiseFloor=rms<noiseFloor*3?noiseFloor*.985+rms*.015:noiseFloor;const threshold=Math.max(.009,noiseFloor*3.2),playbackActive=playbackBusy();
+  const now=performance.now(),db=rms>0?Math.round(20*Math.log10(rms)):-Infinity;el('meter').style.width=Math.min(100,rms*900)+'%';noiseFloor=rms<noiseFloor*3?noiseFloor*.985+rms*.015:noiseFloor;const threshold=Math.max(.015,noiseFloor*4.5),playbackActive=playbackBusy();
   if(!micWindowStartedAt)micWindowStartedAt=now;micFramesGenerated++;if(now-micWindowStartedAt>=2000){const fps=Math.round(micFramesGenerated*1000/(now-micWindowStartedAt));el('micRate').textContent=fps>65?`已节流 ${fps}→50 帧/秒`:`${fps} 帧/秒`;micFramesGenerated=0;micWindowStartedAt=now}
   if(rms>=MIC_SIGNAL_RMS){lastMicSignalAt=now;el('micHealth').textContent=`有声音 (${db} dB)`}else if(now-lastMicSignalAt<1000){el('micHealth').textContent='已收到声音'}else if(running&&micStartedAt&&now-micStartedAt>=MIC_SILENCE_MS&&lastMicSignalAt<micStartedAt){el('micHealth').textContent='未检测到声音';if(!micWarningShown){micWarningShown=true;add('system','麦克风正在上传静音，请检查 Windows 输入设备或浏览器麦克风权限。')}}else{el('micHealth').textContent=running?'等待声音':'检测中'}
   if(playbackActive&&now>=bargeArmedAt){bargeSpeechFrames=rms>threshold?bargeSpeechFrames+1:0;if(bargeSpeechFrames>=BARGE_MIN_FRAMES&&!bargeLatched){bargeLatched=true;sendInterrupt('本地抢话检测')}}else{bargeSpeechFrames=0;if(!playbackActive)bargeLatched=false}

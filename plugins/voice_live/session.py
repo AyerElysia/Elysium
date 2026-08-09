@@ -113,6 +113,11 @@ class CallSession:
         self._failure_reason = ""
         self._perception_refresh_lock = asyncio.Lock()
         self._pending_voice_perception: _PendingVoicePerception | None = None
+        self._provider_starting = False
+        self._unverified_perception_signature: tuple[str, str] | None = None
+        self._state_report_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
+        self._state_report_task: asyncio.Task[None] | None = None
+        self._state_reports_enabled = False
         self._subject_context_audit: dict[str, Any] = {}
         self._audio_archive: VoiceAudioArchive | None = None
         self._audio_archive_summary: dict[str, Any] = {}
@@ -218,6 +223,7 @@ class CallSession:
             await self._start_audio_archive(provider)
             self._register_provider_callbacks(provider)
             await self._consciousness.activate(provider.provider_name)
+            self._state_reports_enabled = True
             converter = self._voice_converter_factory(self._config)
             if converter is not None:
                 self._voice_converter = converter
@@ -290,20 +296,43 @@ class CallSession:
                     "context_layers": context_layers,
                 },
             )
-            await provider.connect(
-                {
-                    "instructions": instructions,
-                    "model": self._config.full_duplex.model_name,
-                    "voice": self._config.full_duplex.voice,
-                    "qwen_max_history_turns": (
-                        self._config.full_duplex.qwen_max_history_turns
-                    ),
-                    "tools": schemas,
-                    "provider_config": {
-                        "tools_available": [schema["name"] for schema in schemas]
-                    },
-                }
-            )
+            perception_task: asyncio.Task[tuple[str, Any | None]] | None = None
+            if self._config.session.cross_scene_awareness:
+                builder = getattr(self._bridge, "build_llm_context_prefix", None)
+                if callable(builder):
+                    perception_task = asyncio.create_task(
+                        builder(),
+                        name=f"voice-perception-prepare-{self.session_id}",
+                    )
+            self._provider_starting = True
+            try:
+                try:
+                    await provider.connect(
+                        {
+                            "instructions": instructions,
+                            "model": self._config.full_duplex.model_name,
+                            "voice": self._config.full_duplex.voice,
+                            "qwen_max_history_turns": (
+                                self._config.full_duplex.qwen_max_history_turns
+                            ),
+                            "tools": schemas,
+                            "provider_config": {
+                                "tools_available": [
+                                    schema["name"] for schema in schemas
+                                ]
+                            },
+                        }
+                    )
+                except BaseException:
+                    if perception_task is not None and not perception_task.done():
+                        perception_task.cancel()
+                    if perception_task is not None:
+                        await asyncio.gather(perception_task, return_exceptions=True)
+                    raise
+                if perception_task is not None:
+                    await self._deliver_voice_perception(*(await perception_task))
+            finally:
+                self._provider_starting = False
         except Exception as exc:
             failure = str(exc).strip() or type(exc).__name__
             logger.error(  # noqa: G201 - project Logger has no exception() method
@@ -317,6 +346,7 @@ class CallSession:
                     await provider.disconnect()
                 except Exception as cleanup_exc:  # noqa: BLE001
                     logger.debug(f"Provider startup cleanup failed: {cleanup_exc}")
+            await self._stop_state_reports()
             await self._stop_voice_conversion()
             await self._stop_audio_archive(reason="startup_failed")
             if self._consciousness.is_active:
@@ -325,7 +355,7 @@ class CallSession:
             return False
 
         self._state = SessionState.ACTIVE
-        await self._consciousness.report_state("实时通话已连接，正在倾听")
+        self._queue_state_report("实时通话已连接，正在倾听")
         await self._store.append_async(
             "session.ready",
             {"session_id": self.session_id, "provider": provider.provider_name},
@@ -362,6 +392,7 @@ class CallSession:
         was_failed = self._state is SessionState.FAILED
         self._state = SessionState.STOPPING
         errors: list[Exception] = []
+        await self._stop_state_reports()
         provider = self._provider
         self._provider = None
         if provider is not None:
@@ -502,11 +533,66 @@ class CallSession:
     async def _on_provider_state(self, state: ProviderState) -> None:
         if state is ProviderState.LISTENING:
             await self._queue_conversion_control("flush")
-            await self._refresh_voice_perception()
+            if not self._provider_starting:
+                await self._refresh_voice_perception()
         await self._send_json_safe({"type": "state", "state": state.value})
         await self._store.append_async("provider.state", {"state": state.value})
         if self._consciousness.is_active:
-            await self._consciousness.report_state(f"实时通话状态：{state.value}")
+            self._queue_state_report(f"实时通话状态：{state.value}")
+
+    def _queue_state_report(self, summary: str) -> None:
+        """Coalesce slow World state writes outside the realtime callback path."""
+
+        if not self._state_reports_enabled or not summary:
+            return
+        if self._state_report_queue.full():
+            try:
+                self._state_report_queue.get_nowait()
+                self._state_report_queue.task_done()
+            except asyncio.QueueEmpty:
+                pass
+        self._state_report_queue.put_nowait(summary)
+        if self._state_report_task is None or self._state_report_task.done():
+            self._state_report_task = asyncio.create_task(
+                self._state_report_loop(),
+                name=f"voice-state-report-{self.session_id}",
+            )
+
+    async def _state_report_loop(self) -> None:
+        while self._state_reports_enabled:
+            summary = await self._state_report_queue.get()
+            try:
+                await self._consciousness.report_state(summary)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - non-critical World projection
+                logger.warning(
+                    "Voice state projection failed outside the media path: "
+                    f"{type(exc).__name__}"
+                )
+                await self._store.append_async(
+                    "consciousness.state_report_failed",
+                    {"error_type": type(exc).__name__},
+                )
+            finally:
+                self._state_report_queue.task_done()
+
+    async def _stop_state_reports(self) -> None:
+        self._state_reports_enabled = False
+        task = self._state_report_task
+        self._state_report_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        while True:
+            try:
+                self._state_report_queue.get_nowait()
+                self._state_report_queue.task_done()
+            except asyncio.QueueEmpty:
+                break
 
     async def _refresh_voice_perception(self) -> None:
         """Deliver current world context once per provider listening frontier."""
@@ -517,11 +603,29 @@ class CallSession:
         builder = getattr(self._bridge, "build_llm_context_prefix", None)
         if provider is None or not callable(builder):
             return
+        prefix, prepared = await builder()
+        await self._deliver_voice_perception(prefix, prepared)
+
+    async def _deliver_voice_perception(
+        self,
+        prefix: str,
+        prepared: Any | None,
+    ) -> None:
+        """Inject one already prepared projection and retain its exact receipt."""
+
+        if not prefix or prepared is None:
+            return
         async with self._perception_refresh_lock:
             if self._pending_voice_perception is not None:
                 return
-            prefix, prepared = await builder()
-            if not prefix or prepared is None:
+            signature = (
+                str(getattr(prepared, "delivery_id", "") or ""),
+                str(getattr(prepared, "projection_sha256", "") or ""),
+            )
+            if signature == self._unverified_perception_signature:
+                return
+            provider = self._provider
+            if provider is None:
                 return
             provider_receipt = await provider.inject_context(prefix)
             prefix_encoded = prefix.encode("utf-8")
@@ -563,6 +667,12 @@ class CallSession:
                     and provider_receipt.accepted_sha256 == pending.prefix_sha256
                 )
                 if not exact:
+                    self._unverified_perception_signature = (
+                        str(getattr(pending.prepared, "delivery_id", "") or ""),
+                        str(
+                            getattr(pending.prepared, "projection_sha256", "") or ""
+                        ),
+                    )
                     await self._store.append_async(
                         "perception.delivery_unverified",
                         {
@@ -578,6 +688,7 @@ class CallSession:
                         "provider did not prove exact context acceptance"
                     )
                 else:
+                    self._unverified_perception_signature = None
                     commit = getattr(
                         self._consciousness,
                         "commit_perception",
@@ -708,6 +819,7 @@ class CallSession:
                 await provider.disconnect()
             except Exception as cleanup_exc:  # noqa: BLE001
                 logger.debug(f"Provider failure cleanup failed: {cleanup_exc}")
+        await self._stop_state_reports()
         await self._stop_voice_conversion()
         await self._stop_audio_archive(reason="failed")
         if self._consciousness.is_active:

@@ -8,7 +8,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from plugins.voice_live.config import VoiceLiveConfig
-from plugins.voice_live.event_handler import VOICE_LIVE_COMMAND_EVENT, VoiceLiveEventHandler
+from plugins.voice_live.event_handler import (
+    VOICE_LIVE_COMMAND_EVENT,
+    VoiceLiveEventHandler,
+)
 from plugins.voice_live.protocol import SessionState
 from plugins.voice_live.router import VoiceLiveRouter
 from plugins.voice_live.runtime_store import VoiceEpisodeStore
@@ -23,6 +26,48 @@ class FakeBus:
 
     async def publish(self, name: str, payload: dict[str, Any]) -> None:
         self.events.append((name, payload))
+
+
+@pytest.mark.asyncio
+async def test_router_prewarms_subject_projection_without_persisting_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = VoiceLiveConfig()
+    calls: list[dict[str, Any]] = []
+
+    class Service:
+        async def get_subject_context_projection_snapshot(
+            self,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            calls.append(kwargs)
+            return {
+                "text": "must-not-enter-router-health",
+                "revision": "revision-1",
+                "source_digest": "a" * 64,
+                "projection_sha256": "b" * 64,
+                "budget": {"delivered_bytes": 1024},
+            }
+
+    monkeypatch.setattr(
+        "plugins.voice_live.router.get_running_life_service",
+        lambda: Service(),
+    )
+    router = VoiceLiveRouter(SimpleNamespace(config=config))
+
+    await router._prewarm_subject_context()
+
+    assert calls == [
+        {
+            "projection_kind": "voice_live",
+            "max_bytes": config.session.subject_context_max_bytes,
+        }
+    ]
+    status = router._readiness_snapshot()["subject_context_prewarm"]
+    assert status["status"] == "ready"
+    assert status["revision"] == "revision-1"
+    assert "text" not in status
+    assert "must-not-enter-router-health" not in str(status)
 
 
 @pytest.mark.asyncio

@@ -23,6 +23,9 @@ def test_browser_uses_worklet_clocked_pcm_and_guarded_barge_in() -> None:
     assert "playbackBusy()" in html
     assert "BARGE_ARM_MS" in html
     assert "BARGE_MIN_FRAMES" in html
+    assert "BARGE_ARM_MS=360" in html
+    assert "BARGE_MIN_FRAMES=10" in html
+    assert "Math.max(.015,noiseFloor*4.5)" in html
     assert "bargeSpeechFrames" in html
     assert "PLAYBACK_SILENCE_RMS" in html
     assert "已消除静音预卷" in html
@@ -45,6 +48,9 @@ def test_browser_uses_worklet_clocked_pcm_and_guarded_barge_in() -> None:
     assert (
         "VL1" not in html
     )  # The binary magic is emitted as exact bytes, not text guessing.
+
+    config = VoiceLiveConfig()
+    assert config.session.perception_context_max_bytes == 8 * 1024
 
 
 def test_browser_fully_retires_previous_audio_generation() -> None:

@@ -319,6 +319,16 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
                         },
                     }
                 )
+                # Qwen's create acknowledgement may omit message content.  The
+                # documented retrieve event returns the stored item and gives
+                # us the exact bytes required by the World receipt contract.
+                if not future.done():
+                    await self._send(
+                        {
+                            "type": "conversation.item.retrieve",
+                            "item_id": item_id,
+                        }
+                    )
                 self._track_transient_context(item_id, response_ttl=1)
         except BaseException:
             self._discard_context_item_acks(registrations)
@@ -491,6 +501,7 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
             "response.output_item.added",
             "conversation.item.created",
             "conversation.item.added",
+            "conversation.item.retrieved",
         }:
             self._acknowledge_context_item(event)
             item = event.get("item") or {}

@@ -113,6 +113,54 @@ async def test_transient_context_receipt_rejects_changed_server_echo(
 
 
 @pytest.mark.asyncio
+async def test_qwen_retrieves_context_when_create_ack_omits_content() -> None:
+    provider = QwenRealtimeProvider(
+        "ws://example/realtime",
+        "secret",
+        model="qwen-audio-3.0-realtime-plus",
+    )
+    sent: list[dict[str, Any]] = []
+    stored_items: dict[str, dict[str, Any]] = {}
+
+    async def send(event: dict[str, Any]) -> None:
+        sent.append(event)
+        if event.get("type") == "conversation.item.create":
+            item = dict(event["item"])
+            stored_items[str(item["id"])] = item
+            await provider._handle_event(  # type: ignore[attr-defined]
+                {
+                    "type": "conversation.item.created",
+                    "event_id": "created-without-content",
+                    "item": {
+                        "id": item["id"],
+                        "type": "message",
+                        "role": "user",
+                    },
+                }
+            )
+        elif event.get("type") == "conversation.item.retrieve":
+            item_id = str(event["item_id"])
+            await provider._handle_event(  # type: ignore[attr-defined]
+                {
+                    "type": "conversation.item.retrieved",
+                    "event_id": "retrieved-full-item",
+                    "item": stored_items[item_id],
+                }
+            )
+
+    provider._send = send  # type: ignore[method-assign]
+
+    receipt = await provider.inject_context("精确世界胶囊")
+
+    assert [event["type"] for event in sent] == [
+        "conversation.item.create",
+        "conversation.item.retrieve",
+    ]
+    assert receipt.exact is True
+    assert receipt.transport_event_ids == ("retrieved-full-item",)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("provider_kind", ["openai", "qwen"])
 async def test_tool_result_ttl_survives_old_response_done_then_expires(
     provider_kind: str,

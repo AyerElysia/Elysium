@@ -210,9 +210,13 @@ class BaseRealtimeProvider(ABC):
             and isinstance(content[0].get("text"), str)
         ):
             accepted_text = content[0]["text"]
-        pending.future.set_result(
-            (str(event.get("event_id") or ""), accepted_text)
-        )
+        # A create acknowledgement without the full item only proves that the
+        # request was observed.  It cannot prove byte-identical context
+        # storage, so leave the future pending for a provider-specific retrieve
+        # response instead of manufacturing a negative receipt too early.
+        if accepted_text is None:
+            return False
+        pending.future.set_result((str(event.get("event_id") or ""), accepted_text))
         return True
 
     async def _await_context_item_acks(

@@ -216,10 +216,10 @@ class VoiceLiveConfig(BaseConfig):
         )
 
         perception_context_max_bytes: int = Field(
-            default=16 * 1024,
+            default=8 * 1024,
             ge=4096,
             le=128 * 1024,
-            description="实时 Provider 单次注入的世界感知视图字节上限；完整投影仍由 LifeEngine 保留",
+            description="实时 Provider 单次注入的低延迟世界感知胶囊字节上限；完整投影仍由 LifeEngine 保留",
         )
 
     @config_section("audio", title="音频传输", tag="audio", order=40)

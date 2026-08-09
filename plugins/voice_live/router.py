@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import secrets
+import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -17,6 +20,7 @@ from src.core.components.base.router import BaseRouter
 from src.kernel.logger import get_logger
 
 from .auth import TicketAuthority
+from .life_binding import get_running_life_service
 from .protocol import SessionState
 from .secrets import secret_readiness
 from .session import CallSession
@@ -41,6 +45,8 @@ class VoiceLiveRouter(BaseRouter):
         self._sessions_lock = asyncio.Lock()
         self._observers: set[WebSocket] = set()
         self._public_observers: dict[str, set[WebSocket]] = {}
+        self._subject_prewarm_task: asyncio.Task[None] | None = None
+        self._subject_prewarm_status: dict[str, Any] = {"status": "idle"}
         config = plugin.config
         self.custom_route_path = config.server.route_path
         environment_name = str(config.server.ticket_secret_env or "").strip()
@@ -223,7 +229,86 @@ class VoiceLiveRouter(BaseRouter):
                 else "degraded"
             ),
             "degraded_reasons": reasons,
+            "subject_context_prewarm": dict(self._subject_prewarm_status),
         }
+
+    async def _prewarm_subject_context(self) -> None:
+        """Build the bounded Voice identity projection before a user calls."""
+
+        started = time.monotonic()
+        self._subject_prewarm_status = {"status": "waiting_for_life_engine"}
+        try:
+            service = None
+            for _ in range(60):
+                service = get_running_life_service()
+                if service is not None:
+                    break
+                await asyncio.sleep(2)
+            if service is None:
+                self._subject_prewarm_status = {
+                    "status": "unavailable",
+                    "error_type": "LifeEngineUnavailable",
+                }
+                return
+            getter = getattr(service, "get_subject_context_projection_snapshot", None)
+            if not callable(getter):
+                raise TypeError("LifeEngine subject projection API is unavailable")
+            self._subject_prewarm_status = {"status": "building"}
+            snapshot = getter(
+                projection_kind="voice_live",
+                max_bytes=int(self.plugin.config.session.subject_context_max_bytes),
+            )
+            if inspect.isawaitable(snapshot):
+                snapshot = await snapshot
+            if snapshot is None:
+                raise RuntimeError("LifeEngine returned no Voice subject projection")
+            if isinstance(snapshot, Mapping):
+                raw_metadata = snapshot.get("metadata", {})
+                metadata = (
+                    dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+                )
+                for field in (
+                    "revision",
+                    "source_digest",
+                    "projection_sha256",
+                    "delivered_bytes",
+                    "budget",
+                ):
+                    if field in snapshot and field not in metadata:
+                        metadata[field] = snapshot[field]
+            else:
+                raw_metadata = getattr(snapshot, "metadata", {})
+                metadata = (
+                    dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+                )
+            budget = metadata.get("budget")
+            if isinstance(budget, Mapping) and "delivered_bytes" not in metadata:
+                metadata["delivered_bytes"] = budget.get("delivered_bytes", 0)
+            self._subject_prewarm_status = {
+                "status": "ready",
+                "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
+                "revision": str(
+                    metadata.get("revision") or metadata.get("source_digest") or ""
+                ),
+                "source_digest": str(metadata.get("source_digest") or ""),
+                "projection_sha256": str(metadata.get("projection_sha256") or ""),
+                "delivered_bytes": int(metadata.get("delivered_bytes") or 0),
+            }
+            logger.info(
+                "Voice subject context prewarmed in "
+                f"{self._subject_prewarm_status['elapsed_ms']:.1f} ms"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - optional latency preparation
+            self._subject_prewarm_status = {
+                "status": "failed",
+                "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
+                "error_type": type(exc).__name__,
+            }
+            logger.warning(
+                f"Voice subject context prewarm failed: {type(exc).__name__}"
+            )
 
     def register_endpoints(self) -> None:
         @self.app.get("/", response_class=HTMLResponse)
@@ -425,11 +510,24 @@ class VoiceLiveRouter(BaseRouter):
         )
 
     async def startup(self) -> None:
+        if self._subject_prewarm_task is None or self._subject_prewarm_task.done():
+            self._subject_prewarm_task = asyncio.create_task(
+                self._prewarm_subject_context(),
+                name="voice-subject-context-prewarm",
+            )
         logger.info(
             f"Voice Live 路由已启动: provider={self.plugin.config.full_duplex.provider_type}"
         )
 
     async def shutdown(self) -> None:
+        prewarm_task = self._subject_prewarm_task
+        self._subject_prewarm_task = None
+        if prewarm_task is not None and not prewarm_task.done():
+            prewarm_task.cancel()
+            try:
+                await prewarm_task
+            except asyncio.CancelledError:
+                pass
         await self.stop_all()
         observers = tuple(self._observers)
         public_observers = tuple(

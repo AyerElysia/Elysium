@@ -127,6 +127,18 @@ class FakeConsciousness:
         self.committed_perceptions.append((prepared, receipt))
 
 
+class BlockingStateConsciousness(FakeConsciousness):
+    def __init__(self) -> None:
+        super().__init__()
+        self.report_started = asyncio.Event()
+        self.report_release = asyncio.Event()
+
+    async def report_state(self, summary: str) -> None:
+        assert summary
+        self.report_started.set()
+        await self.report_release.wait()
+
+
 class FakeBridge:
     def __init__(self) -> None:
         self.transcripts: list[tuple[str, str, str]] = []
@@ -175,6 +187,39 @@ class PerceptionBridge(FakeBridge):
 
     async def build_llm_context_prefix(self) -> tuple[str, object]:
         return "transient-presence", self.prepared
+
+
+class CoordinatedPerceptionBridge(PerceptionBridge):
+    def __init__(
+        self,
+        provider_started: asyncio.Event,
+        perception_started: asyncio.Event,
+    ) -> None:
+        super().__init__()
+        self._provider_started = provider_started
+        self._perception_started = perception_started
+
+    async def build_llm_context_prefix(self) -> tuple[str, object]:
+        self._perception_started.set()
+        await self._provider_started.wait()
+        return await super().build_llm_context_prefix()
+
+
+class CoordinatedProvider(FakeProvider):
+    def __init__(
+        self,
+        provider_started: asyncio.Event,
+        perception_started: asyncio.Event,
+    ) -> None:
+        super().__init__()
+        self._provider_started = provider_started
+        self._perception_started = perception_started
+
+    async def connect(self, session_config: dict[str, Any]) -> None:
+        self.connected = session_config
+        self._provider_started.set()
+        await self._perception_started.wait()
+        await self._emit_state(ProviderState.LISTENING)
 
 
 class FakeBroker:
@@ -250,6 +295,63 @@ def make_config(tmp_path: Path) -> VoiceLiveConfig:
     config.session.require_life_engine = False
     config.session.record_to_life = False
     return config
+
+
+@pytest.mark.asyncio
+async def test_slow_world_state_report_does_not_delay_session_ready(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    provider = FakeProvider()
+    consciousness = BlockingStateConsciousness()
+    session = CallSession(
+        config,
+        "nonblocking-state",
+        provider_factory=lambda _: provider,
+        store=VoiceEpisodeStore(
+            tmp_path,
+            "voice_nonblocking_state",
+            "nonblocking-state",
+        ),
+        consciousness=consciousness,
+        bridge=FakeBridge(),
+        tool_broker=FakeBroker(),
+    )
+
+    assert await asyncio.wait_for(session.start(), timeout=2) is True
+    await asyncio.wait_for(consciousness.report_started.wait(), timeout=1)
+    assert session.state is SessionState.ACTIVE
+
+    consciousness.report_release.set()
+    await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_provider_connect_and_world_prepare_overlap_during_startup(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    provider_started = asyncio.Event()
+    perception_started = asyncio.Event()
+    provider = CoordinatedProvider(provider_started, perception_started)
+    bridge = CoordinatedPerceptionBridge(provider_started, perception_started)
+    session = CallSession(
+        config,
+        "parallel-startup",
+        provider_factory=lambda _: provider,
+        store=VoiceEpisodeStore(
+            tmp_path,
+            "voice_parallel_startup",
+            "parallel-startup",
+        ),
+        consciousness=FakeConsciousness(),
+        bridge=bridge,
+        tool_broker=FakeBroker(),
+    )
+
+    assert await asyncio.wait_for(session.start(), timeout=2) is True
+    assert provider.contexts == ["transient-presence"]
+    await session.stop()
 
 
 @pytest.mark.asyncio
@@ -371,7 +473,7 @@ async def test_voice_response_done_without_exact_provider_receipt_stays_pending(
         record.event == "perception.delivery_unverified"
         for record in store.read_all()
     )
-    assert provider.contexts == ["transient-presence", "transient-presence"]
+    assert provider.contexts == ["transient-presence"]
     await session.stop()
 
 
