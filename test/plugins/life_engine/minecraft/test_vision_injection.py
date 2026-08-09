@@ -34,7 +34,7 @@ class _CaptureStub:
 
 def _bare_session(active: bool, frame: Frame | None) -> MinecraftSession:
     session = object.__new__(MinecraftSession)
-    session._state = SimpleNamespace(active=active)
+    session._state = SimpleNamespace(active=active, body_name="agent")
     session._runtime = object() if active else None
     session._capture = _CaptureStub(frame)
     return session
