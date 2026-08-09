@@ -8,12 +8,11 @@ import json
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from plugins.life_engine.service.event_bus import (
     LifeEvent,
     RawEventGapError,
-    RawEventStore,
 )
 
 from .auth_store import SessionRecord
@@ -32,6 +31,28 @@ from .tokens import SignedValueCodec, SignedValueError
 EVENT_CURSOR_LEDGER = "life-events-v1"
 _MAX_SCAN_PER_PAGE = 10_000
 _SCAN_BATCH = 500
+
+
+@runtime_checkable
+class LifeEventLedgerReader(Protocol):
+    """只读 Life Event ledger 的最小读取面。
+
+    查询服务需要 ``read_since`` 推进 cursor 扫描，以及 ``read_tail``
+    从尾部向前定位最近事件（避免全账本线性扫描）。旧 ``RawEventStore``
+    与阶段二新 ``LifeEventStorePort``（Local/MySQL）都满足该读取面，
+    因此这里不使用任何具体类型判定，避免把新存储后端误判为不可用。
+    """
+
+    async def read_since(
+        self,
+        position: int,
+        *,
+        limit: int | None = None,
+    ) -> list[LifeEvent]:
+        """Read events after an opaque monotonic position."""
+
+    async def read_tail(self, limit: int = 100) -> list[LifeEvent]:
+        """Read a bounded tail of the most recent events (ascending order)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,7 +74,7 @@ class EventQueryService:
         *,
         node_id: str,
         codec: SignedValueCodec,
-        store_provider: Callable[[], RawEventStore | None] | None = None,
+        store_provider: Callable[[], LifeEventLedgerReader | None] | None = None,
         poll_interval: float = 0.25,
         heartbeat_interval: float = 15.0,
     ) -> None:
@@ -224,7 +245,7 @@ class EventQueryService:
             }
         return self._sse_event(event="error", cursor=None, data=payload)
 
-    def _require_store(self) -> RawEventStore:
+    def _require_store(self) -> LifeEventLedgerReader:
         store = self._store_provider()
         if store is None:
             raise EventQueryFailure(
@@ -332,8 +353,7 @@ class EventQueryService:
         if event_filter.occurred_after and occurred_at <= event_filter.occurred_after:
             return False
         return not (
-            event_filter.occurred_before
-            and occurred_at >= event_filter.occurred_before
+            event_filter.occurred_before and occurred_at >= event_filter.occurred_before
         )
 
     def _project(
@@ -447,8 +467,13 @@ class EventQueryService:
         return "\n".join(lines) + "\n\n"
 
 
-def event_store_from_bot(bot: Any) -> RawEventStore | None:
-    """只读取已初始化的 Life Engine ledger，不触发懒创建。"""
+def event_store_from_bot(bot: Any) -> LifeEventLedgerReader | None:
+    """只读取已初始化的 Life Engine ledger，不触发懒创建。
+
+    判定基于最小读取面（``read_since``），而不是某个具体类型：旧
+    ``RawEventStore`` 与阶段二新 ``LifeEventStorePort``（Local/MySQL）都能
+    通过，避免 MySQL 共享多写者部署下把可用账本误判为不可用。
+    """
 
     manager = getattr(bot, "plugin_manager", None)
     get_all = getattr(manager, "get_all_plugins", None)
@@ -458,7 +483,9 @@ def event_store_from_bot(bot: Any) -> RawEventStore | None:
     service = getattr(plugin, "_service", None)
     event_bus = getattr(service, "_event_bus", None)
     store = getattr(event_bus, "store", None)
-    return store if isinstance(store, RawEventStore) else None
+    if callable(getattr(store, "read_since", None)):
+        return store
+    return None
 
 
 __all__ = [

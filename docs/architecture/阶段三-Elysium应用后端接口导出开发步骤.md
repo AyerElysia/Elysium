@@ -548,6 +548,9 @@ attempt_count
 | POST   | `/api/v1/chat/messages/{id}:mark-read`            | `chat.message.mark_read` | provider 支持时更新当前 actor 的已读状态       |
 | POST   | `/api/v1/chat/messages:forward`                   | `chat.message.forward`   | 转发当前 actor 有权读取的消息                 |
 | POST   | `/api/v1/chat/streams/{stream_id}/poke`           | `chat.poke.send`         | 向允许互动的目标发送戳戳，不模拟为文本                |
+| POST   | `/api/v1/chat/messages:inject`                    | `chat.message.inject`    | 把独立应用收到的用户消息注入标准接收管线，触发主链思考       |
+
+> **`POST /chat/messages:inject`（入站注入）**：独立应用闭环的入站侧。应用收到用户消息后调用它，把消息交给 Elysium 标准管线（`ON_MESSAGE_RECEIVED` → Distributor → Chatter）触发爱莉思考；回复由 `messages:send`/`messages/{id}:reply` 命令端点发回应用侧。本端点不产生对外发送、不依赖任何平台 Adapter，因此是同步端点而非命令账本操作，不需要 `Idempotency-Key`。请求体 `{stream_id, content, sender_name?, sender_id?, sender_cardname?, chat_type?, platform?}`；scope 为 `chat:write`；`stream_id` 不存在返回 404，账本不可用返回 503。实现见 `src/app/api/v1/inbound_messages.py` 与 `schemas/inbound_message.py`。
 
 公告发布／删除、跨用户撤回、消息置顶／精华和成员管理不属于普通用户命令，统一使用第 15 节管理接口。所有副作用均要求 `Idempotency-Key`；平台不支持时返回 `capability_disabled`，不能自动降级为发送文本。
 
