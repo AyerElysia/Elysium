@@ -13,8 +13,10 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from plugins.life_engine.service.event_bus import LifeEvent
-from plugins.life_engine.service.world_projection import (
+from src.kernel.storage import canonical_json
+
+from ..service.event_bus import LifeEvent
+from ..service.world_projection import (
     WORLD_LEGACY_IMPORT_EVENT,
     WORLD_OBSERVATION_EVENT,
     WORLD_PROJECTOR_POLICY,
@@ -34,8 +36,6 @@ from plugins.life_engine.service.world_projection import (
     WorldProjectionUnavailable,
     WorldValueChunk,
 )
-from src.kernel.storage import canonical_json
-
 from .contracts import StorageBackendRuntime
 from .models import BackendKind
 
