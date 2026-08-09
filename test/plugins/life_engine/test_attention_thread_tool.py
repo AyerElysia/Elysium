@@ -141,15 +141,15 @@ async def test_learning_consumes_only_explicit_close_statement(
     captured: list[dict[str, Any]] = []
     heartbeat_calls = 0
 
-    async def _submit(**payload: Any) -> list[Any]:
+    async def _enqueue(**payload: Any) -> str:
         captured.append(payload)
-        return []
+        return "reflection:attention-close"
 
     async def _heartbeat() -> None:
         nonlocal heartbeat_calls
         heartbeat_calls += 1
 
-    monkeypatch.setattr(scheduler, "submit_reflection", _submit)
+    monkeypatch.setattr(scheduler, "enqueue_reflection", _enqueue)
     monkeypatch.setattr(scheduler, "on_heartbeat", _heartbeat)
     await scheduler.on_attention_thread_closed(
         public_statement="我选择结束这条关注，这是我愿意公开保留的表述。",
@@ -165,7 +165,7 @@ async def test_learning_consumes_only_explicit_close_statement(
             "actor_consciousness_instance_id": "consciousness:attention-tool",
         }
     ]
-    assert heartbeat_calls == 1
+    assert heartbeat_calls == 0
     with pytest.raises(ValueError, match="requires statement"):
         await scheduler.on_attention_thread_closed(
             public_statement="",

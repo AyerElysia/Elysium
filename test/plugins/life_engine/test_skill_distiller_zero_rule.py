@@ -184,6 +184,8 @@ def test_existing_skill_context_keeps_complete_history() -> None:
 
 
 def test_malformed_gate_response_never_means_acceptance() -> None:
-    assert SkillDistiller._parse_gate_result("not-json") is False
-    assert SkillDistiller._parse_gate_result('{"reason": "missing decision"}') is False
+    with pytest.raises(ValueError, match="SkillGateOutputMustBeObject"):
+        SkillDistiller._parse_gate_result("not-json")
+    with pytest.raises(ValueError, match="SkillGateDecisionMissing"):
+        SkillDistiller._parse_gate_result('{"reason": "missing decision"}')
     assert SkillDistiller._parse_gate_result('{"promote": true}') is True
