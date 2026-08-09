@@ -109,6 +109,7 @@ ALL_EXPORTED_SCOPES = frozenset(
         "abilities:read",
         "surface:read",
         "surface:connect",
+        "surface:input",
         "surface:admin",
         "metrics:read",
         "diagnostics:read",

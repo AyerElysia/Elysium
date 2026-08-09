@@ -7,8 +7,9 @@ import hmac
 import os
 import time
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any
 from uuid import uuid4
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -16,7 +17,12 @@ from fastapi import WebSocket, WebSocketDisconnect
 from src.core.components.base.service import BaseService
 from src.kernel.logger import get_logger
 
-from .protocol import CLIENT_EVENT_TYPES, SCHEMA_VERSION, SurfaceEvent, SurfaceProtocolError
+from .protocol import (
+    CLIENT_EVENT_TYPES,
+    SCHEMA_VERSION,
+    SurfaceEvent,
+    SurfaceProtocolError,
+)
 
 logger = get_logger("NekoSurfaceGateway", color="#F5A6C8")
 
@@ -57,7 +63,7 @@ class SurfaceGatewayConfig:
     mirror_all: bool = False
 
     @classmethod
-    def from_env(cls) -> "SurfaceGatewayConfig":
+    def from_env(cls) -> SurfaceGatewayConfig:
         return cls(
             token=os.environ.get("NEKO_SURFACE_TOKEN", "").strip(),
             queue_size=_env_int("NEKO_SURFACE_QUEUE_SIZE", 128),
@@ -242,8 +248,103 @@ class NekoSurfaceGateway:
             await state.queue.close()
             try:
                 await state.websocket.close(code=1001)
-            except Exception:
-                pass
+            except (RuntimeError, ConnectionError) as exc:
+                logger.debug(f"Surface shutdown close failed: {exc}")
+
+    async def serve_authorized(
+        self,
+        websocket: WebSocket,
+        *,
+        expected_surface_id: str,
+        input_enabled: bool,
+        actor_id: str,
+    ) -> None:
+        """Serve a v1 connection after API ticket authentication.
+
+        The existing gateway remains the owner of Surface queues and protocol
+        lifecycle.  This entry point only binds the already-authenticated API
+        grant to the first hello and temporarily restricts input dispatch.
+        """
+        del actor_id
+        state: SurfaceClientState | None = None
+        writer_task: asyncio.Task[None] | None = None
+        try:
+            raw_hello = await asyncio.wait_for(
+                websocket.receive_json(), timeout=self.config.handshake_timeout
+            )
+            hello = SurfaceEvent.from_dict(raw_hello, allowed_types=CLIENT_EVENT_TYPES)
+            if hello.type != "hello" or hello.surface_id != expected_surface_id:
+                raise SurfaceProtocolError("surface_mismatch", "hello surface_id is not authorized")
+            state = await self._register(websocket, hello)
+            writer_task = asyncio.create_task(
+                self._writer(state), name=f"neko_surface_authorized_writer:{expected_surface_id}"
+            )
+            await self._send_to(
+                state,
+                "ready",
+                payload={
+                    "accepted_schema": SCHEMA_VERSION,
+                    "accepted_events": sorted(CLIENT_EVENT_TYPES - {"hello"})
+                    if input_enabled
+                    else ["ack", "playback.started", "playback.ended", "state"],
+                    "queue_size": self.config.queue_size,
+                },
+                priority=9,
+            )
+            while True:
+                raw = await websocket.receive_json()
+                if not input_enabled:
+                    event_type = str(raw.get("type") or "") if isinstance(raw, dict) else ""
+                    if event_type in {"user.text", "user.transcript.final", "user.audio", "user.screen", "user.interaction"}:
+                        await self._send_error(state, "surface_input_forbidden", "Surface ticket is observer-only")
+                        continue
+                await self._handle_client_event(state, raw)
+        except TimeoutError:
+            await websocket.close(code=4408)
+        except (SurfaceProtocolError, WebSocketDisconnect):
+            if state is not None:
+                await self._send_error(state, "surface_protocol_error", "Surface protocol rejected the event")
+        finally:
+            if writer_task is not None:
+                writer_task.cancel()
+                try:
+                    await writer_task
+                except asyncio.CancelledError:
+                    pass
+            if state is not None:
+                await self._unregister(state)
+
+    async def connection_summaries(self, surface_id: str) -> list[dict[str, Any]]:
+        async with self._clients_lock:
+            clients = [item for item in self._clients.values() if item.surface_id == surface_id]
+        return [
+            {
+                "connection_id": item.connection_id,
+                "surface_id": item.surface_id,
+                "character": item.character,
+                "session_id": item.session_id,
+                "connected_at": item.connected_at,
+                "queued_events": len(item.queue),
+                "dropped_events": item.dropped_events,
+                "last_received_sequence": item.last_received_sequence,
+                "last_acknowledged_sequence": item.last_acknowledged_sequence,
+            }
+            for item in clients
+        ]
+
+    async def disconnect_connection(self, surface_id: str, connection_id: str, *, reason: str) -> bool:
+        del reason
+        async with self._clients_lock:
+            state = self._clients.get(connection_id)
+            if state is None or state.surface_id != surface_id:
+                return False
+            self._clients.pop(connection_id, None)
+        await state.queue.close()
+        try:
+            await state.websocket.close(code=1000)
+        except (RuntimeError, ConnectionError) as exc:
+            logger.debug(f"Surface disconnect close failed: {exc}")
+        return True
 
     async def serve(self, websocket: WebSocket) -> None:
         provided_token = extract_access_token(websocket)
@@ -285,7 +386,7 @@ class NekoSurfaceGateway:
             while True:
                 raw = await websocket.receive_json()
                 await self._handle_client_event(state, raw)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             await websocket.send_json(
                 self._standalone_error("handshake_timeout", "hello was not received in time")
             )
@@ -300,7 +401,7 @@ class NekoSurfaceGateway:
             pass
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(f"Surface connection failed: {exc}", exc_info=True)
             if state is not None:
                 await self._send_error(state, "internal_error", "surface connection failed")
@@ -375,8 +476,8 @@ class NekoSurfaceGateway:
             await old.queue.close()
             try:
                 await old.websocket.close(code=1012)
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                logger.debug(f"Surface replacement close was already complete: {exc}")
         logger.info(f"Surface connected: id={state.surface_id} character={state.character}")
         return state
 
@@ -447,8 +548,8 @@ class NekoSurfaceGateway:
             await self._send_ack(state, event)
         except SurfaceProtocolError as exc:
             await self._send_error(state, exc.code, exc.detail)
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"Surface input dispatch failed: {exc}", exc_info=True)
+        except Exception:
+            logger.exception("Surface input dispatch failed")
             await self._send_error(state, "dispatch_failed", "surface input was not accepted")
 
     async def _enqueue(

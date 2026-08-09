@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     from .admin import AdminFacade
     from .livestream import LivestreamProvider
     from .media_objects import ManagedMediaService
+    from .p312 import P312Providers
     from .voice_calls import VoiceCallProvider
 
 REQUEST_ID_HEADER = "X-Request-ID"
@@ -131,6 +132,7 @@ class APIContext:
     voice_calls: "VoiceCallProvider | None" = None
     tabletop: Any | None = None
     admin: "AdminFacade | None" = None
+    p312: "P312Providers | None" = None
 
 
 class RequestIDMiddleware(BaseHTTPMiddleware):
@@ -941,6 +943,17 @@ def create_api_app(context: APIContext) -> FastAPI:
             create_admin_router(
                 facade=context.admin,
                 require_scope=require_scope,
+            )
+        )
+    if context.p312 is not None:
+        from .p312 import create_p312_router
+
+        app.include_router(
+            create_p312_router(
+                providers=context.p312,
+                require_scope=require_scope,
+                auth_store=context.store,
+                codec=context.codec,
             )
         )
     if context.media is not None:

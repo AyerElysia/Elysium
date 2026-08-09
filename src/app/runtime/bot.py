@@ -639,6 +639,7 @@ class Bot:
                 )
                 from src.app.api.v1.livestream_runtime import MountedLivestreamProvider
                 from src.app.api.v1.mount import mount_api_v1
+                from src.app.api.v1.p312_runtime import create_runtime_p312_providers
                 from src.app.api.v1.tabletop_runtime import MountedTabletopProvider
                 from src.app.api.v1.voice_runtime import MountedVoiceCallProvider
 
@@ -665,6 +666,7 @@ class Bot:
                     livestream_provider=MountedLivestreamProvider(),
                     voice_call_provider=MountedVoiceCallProvider(),
                     tabletop_provider=MountedTabletopProvider(),
+                    p312_providers=create_runtime_p312_providers(),
                     task_manager=self.task_manager,
                 )
                 await self.app_api_mount.start()

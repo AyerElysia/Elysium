@@ -26,6 +26,7 @@ from .media_objects import (
     MediaObjectStore,
     default_media_recognizer,
 )
+from .p312 import P312Providers
 from .runtime import APIContext, create_api_app
 from .tokens import SignedValueCodec
 
@@ -104,6 +105,7 @@ def mount_api_v1(
     livestream_provider: object | None = None,
     voice_call_provider: object | None = None,
     tabletop_provider: object | None = None,
+    p312_providers: P312Providers | None = None,
     task_manager: TaskManager | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> APIV1Mount:
@@ -195,6 +197,7 @@ def mount_api_v1(
             voice_calls=voice_call_provider,
             tabletop=tabletop_provider,
             admin=admin_facade,
+            p312=p312_providers,
         )
         app = create_api_app(context)
         app.add_middleware(
