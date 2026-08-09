@@ -51,6 +51,7 @@ from .schemas import (
 from .tokens import SignedValueCodec, SignedValueError
 
 if TYPE_CHECKING:
+    from .admin import AdminFacade
     from .livestream import LivestreamProvider
     from .media_objects import ManagedMediaService
     from .voice_calls import VoiceCallProvider
@@ -129,6 +130,7 @@ class APIContext:
     livestream: "LivestreamProvider | None" = None
     voice_calls: "VoiceCallProvider | None" = None
     tabletop: Any | None = None
+    admin: "AdminFacade | None" = None
 
 
 class RequestIDMiddleware(BaseHTTPMiddleware):
@@ -932,6 +934,15 @@ def create_api_app(context: APIContext) -> FastAPI:
     app.include_router(foundation_router)
     app.include_router(event_router)
     app.include_router(chat_router)
+    if context.admin is not None:
+        from .admin import create_admin_router
+
+        app.include_router(
+            create_admin_router(
+                facade=context.admin,
+                require_scope=require_scope,
+            )
+        )
     if context.media is not None:
         from .media_objects import create_media_router
 

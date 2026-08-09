@@ -312,7 +312,8 @@ POST /api/v1/admin/sync:retry
             "metrics:read",
         ),
         resource_authorization="要求全能管理员或 platform service；查询只读脱敏，重试不得跳游标",
-        anchor="组件管理器、src/kernel/sync/ 与受管日志投影；需新增 admin query facade",
+        anchor="src/app/api/v1/admin.py、admin_store.py、foundation.py 与命令账本；sync retry 尚待 owner 接入",
+        status="experimental",
     ),
     *_contracts(
         """
@@ -331,7 +332,8 @@ POST /api/v1/admin/settings:validate
         callers=_ADMIN_CALLERS,
         scopes=("admin:session", "admin:credential", "admin:settings"),
         resource_authorization="要求全能管理员；凭据按 id 撤销，设置限 allowlist 与 expected revision",
-        anchor="需新增 auth credential store、session store 与 allowlist settings facade",
+        anchor="src/app/api/v1/auth_store.py、admin_store.py 与 admin.py",
+        status="validated",
     ),
     *_contracts(
         """
@@ -345,7 +347,8 @@ POST /api/v1/admin/integrations/{id}:test
         callers=_ADMIN_CALLERS,
         scopes=("integration:read", "integration:test"),
         resource_authorization="要求全能管理员；test 只能调用登记 owner 的无副作用或最小副作用检查",
-        anchor="Adapter／插件生命周期和 capability；需新增 integration facade，不导出 reconnect",
+        anchor="src/app/api/v1/admin.py、foundation.py 与受控 integration test owner",
+        status="validated",
     ),
     *_contracts(
         """
@@ -359,7 +362,8 @@ POST /api/v1/admin/jobs/{job_id}:retry
         callers=_ADMIN_CALLERS,
         scopes=("jobs:read", "jobs:operate"),
         resource_authorization="要求全能管理员并校验 job 状态机、owner、可取消与幂等重试资格",
-        anchor="项目任务管理器与各领域 job owner；需新增耐久 job projection",
+        anchor="src/app/api/v1/admin.py 与 src/kernel/commands/",
+        status="experimental",
     ),
     *_contracts(
         """

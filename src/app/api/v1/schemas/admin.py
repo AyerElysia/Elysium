@@ -113,7 +113,7 @@ class AdminSetting(VersionedModel):
     source: Literal["default", "admin"]
     revision: int = Field(ge=0)
     restart_required: bool
-    value_schema: dict[str, Any] = Field(alias="schema", serialization_alias="schema")
+    value_schema: dict[str, Any] = Field(serialization_alias="schema")
 
 
 class AdminSettings(VersionedModel):

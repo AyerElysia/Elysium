@@ -15,6 +15,8 @@ from plugins.life_engine.service.event_bus import RawEventStore
 from src.kernel.commands import CommandDispatcher, CommandStore, HandlerRegistry
 from src.kernel.concurrency import TaskManager
 
+from .admin import AdminFacade
+from .admin_store import AdminStore
 from .auth_store import AuthStore
 from .chat import ChatQueryService, LedgerChatTargetResolver
 from .events import EventQueryService
@@ -38,6 +40,7 @@ class APIV1Mount:
 
     parent: FastAPI
     store: AuthStore
+    admin_store: AdminStore
     media_store: MediaObjectStore
     command_store: CommandStore
     command_dispatcher: CommandDispatcher
@@ -76,6 +79,7 @@ class APIV1Mount:
         ]
         self.command_store.close()
         self.media_store.close()
+        self.admin_store.close()
         if self.tabletop_provider is not None:
             close = getattr(self.tabletop_provider, "close", None)
             if callable(close):
@@ -117,6 +121,7 @@ def mount_api_v1(
     normalized_origins = _validate_origins(allowed_origins)
     auth_path = _resolve_auth_path(workspace_root, database_path)
     store = AuthStore(auth_path, installation_id=installation_id)
+    admin_store = AdminStore(auth_path)
     media_store: MediaObjectStore | None = None
     command_store: CommandStore | None = None
     try:
@@ -162,6 +167,12 @@ def mount_api_v1(
             registry=registry,
             task_manager=task_manager,
         )
+        admin_facade = AdminFacade(
+            foundation=foundation or FoundationProjection(node_id=installation_id),
+            auth=store,
+            admin=admin_store,
+            commands=command_store,
+        )
         context = APIContext(
             store=store,
             codec=codec,
@@ -183,6 +194,7 @@ def mount_api_v1(
             livestream=livestream_provider,
             voice_calls=voice_call_provider,
             tabletop=tabletop_provider,
+            admin=admin_facade,
         )
         app = create_api_app(context)
         app.add_middleware(
@@ -205,11 +217,13 @@ def mount_api_v1(
             command_store.close()
         if media_store is not None:
             media_store.close()
+        admin_store.close()
         store.close()
         raise
     return APIV1Mount(
         parent=parent,
         store=store,
+        admin_store=admin_store,
         media_store=media_store,
         command_store=command_store,
         command_dispatcher=command_dispatcher,
