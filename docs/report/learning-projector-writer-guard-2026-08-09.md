@@ -27,7 +27,6 @@ Learning consumer 应让 evidence append 使用无 projector claim 的写事务�
 - Learning schema/迁移定向：`33 passed`；
 - 本机临时隔离 MySQL 8.0.46：`1 passed`，覆盖首次 claim 前无旁路、claimed projection 成功、无 claim 事件追加成功、未绑定 projection 拒绝；退出后 `log_bin_trust_function_creators=0`，临时数据库与用户计数均为 `0`；
 - Ruff 确定性检查、变更代码编译、变更范围 diff-check 通过；未格式化两个存在历史格式漂移的整文件；
-- Life Engine 串行全集：`1242 passed / 14 skipped / 3 failed`；
-- 全仓串行：`4028 passed / 20 skipped / 3 failed / 2 warnings`。
+- 最终提交 `8522c02f` 全仓串行：`4035 passed / 20 skipped / 3 failed / 2 warnings`。
 
-两轮全集的三个失败完全相同，均位于 `test/plugins/life_engine/minecraft/test_vision_injection.py`：主线测试夹具构造的 `_state` 缺少生产代码现已读取的 `body_name`，导致两个 `AttributeError` 和一个派生的空 payload 断言失败。本提交未修改 Minecraft 文件，不将该独立主线缺陷冒充为 Learning 回归通过，也不越权修复其 owner 文件。
+最终提交的三个失败均位于 `test/plugins/life_engine/minecraft/test_vision_injection.py`：主线测试夹具构造的 `_state` 缺少生产代码现已读取的 `body_name`，导致两个 `AttributeError` 和一个派生的空 payload 断言失败。本提交未修改 Minecraft 文件，不将该独立主线缺陷冒充为 Learning 回归通过，也不越权修复其 owner 文件。
