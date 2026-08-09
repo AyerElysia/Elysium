@@ -606,6 +606,17 @@ class LearningScheduler:
 
         if self._learning_event_store is None:
             return 0
+        source_health = await self._learning_event_store.health_snapshot()
+        source_frontier = max(
+            0,
+            int(
+                source_health.get(
+                    "event_frontier",
+                    source_health.get("latest_position", 0),
+                )
+                or 0
+            ),
+        )
         ingested = 0
         async with self._reflection_queue_lock:
             state = self.store.load_state()
@@ -649,10 +660,17 @@ class LearningScheduler:
                     break
                 if len(page) < _REFLECTION_EVENT_PAGE_SIZE:
                     break
-            if cursor == original_cursor and not ingested:
+            source_frontier = max(source_frontier, cursor)
+            previous_frontier = int(runtime.get("event_frontier", 0) or 0)
+            if (
+                cursor == original_cursor
+                and not ingested
+                and source_frontier == previous_frontier
+            ):
                 return 0
             state[_REFLECTION_EVENT_CURSOR_STATE_KEY] = cursor
             runtime["event_cursor"] = cursor
+            runtime["event_frontier"] = source_frontier
             self._save_reflection_jobs(
                 jobs,
                 state=state,

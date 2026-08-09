@@ -117,6 +117,13 @@ class _SharedLearningEventStore:
         ]
         return rows[:limit]
 
+    async def health_snapshot(self) -> dict[str, Any]:
+        return {
+            "status": "healthy",
+            "event_count": len(self.records),
+            "event_frontier": len(self.records),
+        }
+
 
 def _scheduler(tmp_path: Path, journal: Any) -> LearningScheduler:
     scheduler = LearningScheduler(
@@ -444,6 +451,14 @@ async def test_event_cursor_stops_before_capacity_without_losing_evidence(
     assert len(owner._reflection_jobs()) == MAX_PENDING_REFLECTIONS
     assert state["reflection_event_cursor_v1"] == MAX_PENDING_REFLECTIONS
     assert len(event_store.records) == MAX_PENDING_REFLECTIONS + 1
+    queue_health = owner.get_state()["reflection_queue"]
+    assert queue_health["event_cursor"] == MAX_PENDING_REFLECTIONS
+    assert queue_health["event_frontier"] == MAX_PENDING_REFLECTIONS + 1
+    assert queue_health["unprojected_event_count"] == 1
+    assert queue_health["total_pending_evidence_count"] == (
+        MAX_PENDING_REFLECTIONS + 1
+    )
+    assert "event_projection_lag" in queue_health["reasons"]
 
     _queue_jobs(owner, owner._reflection_jobs()[1:])
     assert await owner._ingest_reflection_events() == 1
@@ -451,6 +466,9 @@ async def test_event_cursor_stops_before_capacity_without_losing_evidence(
     assert len(owner._reflection_jobs()) == MAX_PENDING_REFLECTIONS
     assert state["reflection_event_cursor_v1"] == MAX_PENDING_REFLECTIONS + 1
     assert len(event_store.records) == MAX_PENDING_REFLECTIONS + 1
+    queue_health = owner.get_state()["reflection_queue"]
+    assert queue_health["unprojected_event_count"] == 0
+    assert "event_projection_lag" not in queue_health["reasons"]
 
 
 async def test_independent_worker_runs_without_foreground_heartbeat(

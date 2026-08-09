@@ -218,11 +218,24 @@ def reflection_queue_health(
         reasons.append("provider_circuit_open")
     if int(runtime.get("consecutive_failure_count", 0) or 0) > 0:
         reasons.append("recent_attempt_failed")
+    event_cursor = max(0, int(runtime.get("event_cursor", 0) or 0))
+    event_frontier = max(
+        event_cursor,
+        int(runtime.get("event_frontier", event_cursor) or event_cursor),
+    )
+    unprojected_event_count = event_frontier - event_cursor
+    if unprojected_event_count:
+        reasons.append("event_projection_lag")
     nominal_capacity_per_day = 1_440.0 / max(0.1, float(cooldown_minutes))
+    total_pending_evidence_count = len(jobs) + unprojected_event_count
     return {
         "status": "degraded" if reasons else "healthy",
         "reasons": reasons,
         "pending_count": len(jobs),
+        "total_pending_evidence_count": total_pending_evidence_count,
+        "event_cursor": event_cursor,
+        "event_frontier": event_frontier,
+        "unprojected_event_count": unprojected_event_count,
         "capacity": MAX_PENDING_REFLECTIONS,
         "capacity_utilization": round(len(jobs) / MAX_PENDING_REFLECTIONS, 4),
         "due_count": due_count,
@@ -232,7 +245,10 @@ def reflection_queue_health(
         "next_attempt_at": min((job.next_attempt_at for job in jobs), default=""),
         "max_attempt_count": max((job.attempt_count for job in jobs), default=0),
         "nominal_drain_capacity_per_day": round(nominal_capacity_per_day, 3),
-        "estimated_backlog_days": round(len(jobs) / nominal_capacity_per_day, 3),
+        "estimated_backlog_days": round(
+            total_pending_evidence_count / nominal_capacity_per_day,
+            3,
+        ),
         "circuit_state": "open" if breaker_open else "closed",
         "global_next_attempt_at": global_next_attempt_at,
         "consecutive_failure_count": int(
