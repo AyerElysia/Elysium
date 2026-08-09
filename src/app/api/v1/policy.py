@@ -112,6 +112,8 @@ ALL_EXPORTED_SCOPES = frozenset(
         "surface:admin",
         "metrics:read",
         "diagnostics:read",
+        "admin:jobs",
+        "admin:integrations",
     }
 )
 
