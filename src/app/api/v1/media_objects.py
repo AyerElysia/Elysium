@@ -741,13 +741,13 @@ def create_media_router(
     ) -> Response:
         data = bytearray()
         async for chunk in request.stream():
-            data.extend(chunk)
-            if len(data) > MAX_UPLOAD_BYTES:
+            if len(data) + len(chunk) > MAX_UPLOAD_BYTES:
                 raise APIError(
                     "body_too_large",
                     "请求体超过允许上限。",
                     status_code=413,
                 )
+            data.extend(chunk)
         try:
             await asyncio.to_thread(
                 service.store.put_upload,

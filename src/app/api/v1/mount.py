@@ -92,6 +92,10 @@ def mount_api_v1(
     allowed_origins: tuple[str, ...],
     max_concurrency: int,
     max_websocket_connections: int = 64,
+    rate_limit_requests_per_minute: int = 600,
+    rate_limit_burst: int = 60,
+    max_command_concurrency: int = 8,
+    max_command_backlog: int = 1000,
     foundation: FoundationProjection | None = None,
     event_store_provider: Callable[[], RawEventStore | None] | None = None,
     command_registry: HandlerRegistry | None = None,
@@ -161,6 +165,8 @@ def mount_api_v1(
             command_store,
             registry=registry,
             task_manager=task_manager,
+            max_concurrency=max_command_concurrency,
+            max_backlog=max_command_backlog,
         )
         context = APIContext(
             store=store,
@@ -169,6 +175,10 @@ def mount_api_v1(
             allowed_origins=normalized_origins,
             max_concurrency=max_concurrency,
             max_websocket_connections=max_websocket_connections,
+            rate_limit_requests_per_minute=rate_limit_requests_per_minute,
+            rate_limit_burst=rate_limit_burst,
+            max_command_concurrency=max_command_concurrency,
+            max_command_backlog=max_command_backlog,
             foundation=foundation,
             events=EventQueryService(
                 node_id=installation_id,

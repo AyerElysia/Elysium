@@ -659,6 +659,18 @@ class Bot:
                     max_websocket_connections=(
                         self.config.http_router.app_api_v1_max_websocket_connections
                     ),
+                    rate_limit_requests_per_minute=(
+                        self.config.http_router.app_api_v1_rate_limit_requests_per_minute
+                    ),
+                    rate_limit_burst=(
+                        self.config.http_router.app_api_v1_rate_limit_burst
+                    ),
+                    max_command_concurrency=(
+                        self.config.http_router.app_api_v1_max_command_concurrency
+                    ),
+                    max_command_backlog=(
+                        self.config.http_router.app_api_v1_max_command_backlog
+                    ),
                     foundation=foundation,
                     event_store_provider=lambda: event_store_from_bot(self),
                     chat_command_service_factory=create_chat_command_service,

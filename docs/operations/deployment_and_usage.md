@@ -390,6 +390,10 @@ app_api_v1_database_path = "runtime/app_api_v1/auth.sqlite3"
 app_api_v1_allowed_origins = ["http://127.0.0.1:5173"]
 app_api_v1_max_concurrency = 32
 app_api_v1_max_websocket_connections = 64
+app_api_v1_rate_limit_requests_per_minute = 600
+app_api_v1_rate_limit_burst = 60
+app_api_v1_max_command_concurrency = 8
+app_api_v1_max_command_backlog = 1000
 ```
 
 还必须通过环境变量提供：
@@ -402,7 +406,7 @@ app_api_v1_max_websocket_connections = 64
 - `api_keys` 是旧 WebUI 合同，不会替代 `/api/v1` 的短时 session、refresh、撤销和单次 WebSocket ticket；
 - Origin 使用精确 allowlist，不支持通配符；localhost 也不能绕过认证；
 - API SQLite 必须位于 workspace 的 `runtime/` 下；认证部分只保存凭据哈希、授权、到期与撤销状态，不保存可回显明文凭据；同库命令账本保存请求 payload 以供耐久执行和查询，因此备份、访问控制与留存策略必须按业务数据级别保护；
-- 普通请求体上限 1 MiB，受管上传上限 32 MiB，HTTP 并发和 WebSocket 连接分别受配置预算约束；
+- 普通请求体上限 1 MiB，受管上传上限 32 MiB，HTTP 并发和 WebSocket 连接分别受配置预算约束；API 请求按脱敏调用方键执行有界 token-bucket 限流，命令 backlog 在耐久受理事务内原子检查，预算耗尽时不会写入一个随后又返回 429 的命令；
 - 当前已挂载 P3-01 的五个认证端点、P3-02 的 `/bootstrap`、`/capabilities`、`/readiness`、`/health`，P3-03 的 `/events`、`/events/{event_id}`、`/events/stream` 和 `/event-subscriptions/validate`，P3-04 的命令创建、列表、单项查询和受限取消端点，P3-05 的五个只读聊天历史端点，P3-06 的 13 个耐久聊天命令端点，以及 P3-07 的 8 个用户媒体端点；除 `/health` 仅用于 API 存活探测外，其余接口要求短时 Bearer 会话和对应 scope；
 - 事件接口以耐久 Life Event SQLite ledger 的全局 ingest position 为权威位置，cursor 不透明、签名且绑定账本；授权过滤后的 cursor 表示“已扫描位置”，不可见事件不会造成虚假历史缺口，也不会通过单事件读取泄露存在性；
 - 聊天历史接口为 `GET /api/v1/chat/streams`、`GET /api/v1/chat/streams/{stream_id}`、`GET /api/v1/chat/streams/{stream_id}/messages`、`GET /api/v1/chat/messages/{message_id}` 和 `GET /api/v1/chat/messages/{message_id}/receipts`，统一要求 `chat:read`。管理员可读全量；普通 actor 只能读取自己的事实或获授 `stream:{stream_id}`、`chat:*`、`*` 的 stream。不可见资源与不存在资源统一返回 404；同一 message ID 跨 provider／stream 冲突时返回 409，并要求使用 `provider` 或 `stream_id` 查询参数消歧；

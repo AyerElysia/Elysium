@@ -7,7 +7,9 @@ import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+
 from src.kernel.commands import (
+    CommandBacklogFull,
     CommandDispatcher,
     CommandNotCancellable,
     CommandOutcome,
@@ -16,11 +18,16 @@ from src.kernel.commands import (
     HandlerRegistry,
     IdempotencyConflict,
 )
-
 from src.kernel.concurrency import TaskManager
 
 
-def _accept(store: CommandStore, *, key: str = "request-key-001", value: int = 1):
+def _accept(
+    store: CommandStore,
+    *,
+    key: str = "request-key-001",
+    value: int = 1,
+    max_pending: int | None = None,
+):
     request_hash = store.request_hash(
         command_type="test.command.run",
         schema_version=1,
@@ -41,6 +48,7 @@ def _accept(store: CommandStore, *, key: str = "request-key-001", value: int = 1
         payload={"value": value},
         correlation_id="corr-1",
         expected_revision=7,
+        max_pending=max_pending,
     )
 
 
@@ -100,6 +108,37 @@ def test_concurrent_idempotent_accept_returns_one_command(tmp_path) -> None:
 
     assert len({command_id for command_id, _created in results}) == 1
     assert sum(created for _command_id, created in results) == 1
+
+
+def test_backlog_budget_rejects_before_insert_but_allows_idempotent_replay(
+    tmp_path,
+) -> None:
+    store = CommandStore(tmp_path / "commands.sqlite3")
+    try:
+        first, created = _accept(store)
+        assert created is True
+        replay, replay_created = store.accept(
+            idempotency_key=first.idempotency_key,
+            request_hash=first.request_hash,
+            command_type=first.command_type,
+            schema_version=first.schema_version,
+            actor_id=first.actor_id,
+            caller_role=first.caller_role,
+            scopes=first.scope_snapshot,
+            target=first.target,
+            payload=first.payload,
+            correlation_id=first.correlation_id,
+            expected_revision=first.expected_revision,
+            max_pending=1,
+        )
+        assert replay_created is False
+        assert replay.command_id == first.command_id
+
+        with pytest.raises(CommandBacklogFull):
+            _accept(store, key="second-key-001", value=2, max_pending=1)
+        assert len(store.list(actor_id=None)) == 1
+    finally:
+        store.close()
 
 
 def test_accept_and_transition_events_share_existing_sync_outbox(tmp_path) -> None:

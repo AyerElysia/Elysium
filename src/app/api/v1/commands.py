@@ -5,8 +5,10 @@ from collections.abc import Callable
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, Query, Response
+
 from src.kernel.commands import (
     TERMINAL_STATUSES,
+    CommandBacklogFull,
     CommandDispatcher,
     CommandNotCancellable,
     CommandNotFound,
@@ -83,7 +85,15 @@ def create_commands_router(
                 payload=payload.payload,
                 correlation_id=payload.correlation_id,
                 expected_revision=payload.expected_revision,
+                max_pending=dispatcher.max_backlog,
             )
+        except CommandBacklogFull as exc:
+            raise APIError(
+                "command_backlog_full",
+                "命令积压已达到技术上限，请稍后重试。",
+                status_code=429,
+                retryable=True,
+            ) from exc
         except IdempotencyConflict as exc:
             raise APIError(
                 "idempotency_conflict",
@@ -91,7 +101,15 @@ def create_commands_router(
                 status_code=409,
             ) from exc
         if created:
-            dispatcher.schedule(command.command_id)
+            try:
+                dispatcher.schedule(command.command_id)
+            except RuntimeError as exc:
+                raise APIError(
+                    "command_backlog_full",
+                    "命令积压已达到技术上限，请稍后重试。",
+                    status_code=429,
+                    retryable=True,
+                ) from exc
         else:
             response.status_code = 200
         return _response(command)
