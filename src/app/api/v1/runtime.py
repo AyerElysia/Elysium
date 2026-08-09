@@ -48,6 +48,7 @@ from .schemas import (
     WSTicketRequest,
     WSTicketResponse,
 )
+from .security import TokenBucketRateLimiter, sanitize_public_value
 from .tokens import SignedValueCodec, SignedValueError
 
 if TYPE_CHECKING:
@@ -121,6 +122,10 @@ class APIContext:
     allowed_origins: tuple[str, ...] = ()
     max_concurrency: int = 32
     max_websocket_connections: int = 64
+    rate_limit_requests_per_minute: int = 600
+    rate_limit_burst: int = 60
+    max_command_concurrency: int = 8
+    max_command_backlog: int = 1000
     foundation: FoundationProjection | None = None
     events: EventQueryService | None = None
     chat: ChatQueryService | None = None
@@ -189,6 +194,76 @@ class WebSocketConnectionBudget:
         self._active -= 1
 
 
+class WebSocketBudgetMiddleware:
+    """Reserve and release the application-wide WebSocket connection budget."""
+
+    def __init__(self, app: Any, budget: WebSocketConnectionBudget) -> None:
+        self.app = app
+        self.budget = budget
+
+    async def __call__(self, scope: dict[str, Any], receive, send) -> None:
+        if scope.get("type") != "websocket":
+            await self.app(scope, receive, send)
+            return
+        try:
+            await self.budget.acquire()
+        except APIError as error:
+            # Refuse before accept; clients receive a policy close frame.
+            await send(
+                {
+                    "type": "websocket.close",
+                    "code": 1013,
+                    "reason": error.code,
+                }
+            )
+            return
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            self.budget.release()
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """Apply a bounded token bucket without retaining bearer credentials."""
+
+    def __init__(
+        self,
+        app: Any,
+        *,
+        requests_per_minute: int,
+        burst: int,
+    ) -> None:
+        super().__init__(app)
+        self._limiter = TokenBucketRateLimiter(
+            requests_per_minute=requests_per_minute,
+            burst=burst,
+        )
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: RequestResponseEndpoint,
+    ) -> Response:
+        key = self._limiter.request_key(
+            request.headers.get(AUTH_HEADER),
+            request.client.host if request.client else None,
+        )
+        allowed, retry_after = await self._limiter.consume(key)
+        if not allowed:
+            response = _error_response(
+                request,
+                APIError(
+                    "rate_limited",
+                    "请求频率超过允许上限。",
+                    status_code=429,
+                    retryable=True,
+                ),
+            )
+            response.headers["Retry-After"] = str(retry_after)
+            return response
+        return await call_next(request)
+
+
 class ConcurrencyLimitMiddleware(BaseHTTPMiddleware):
     """严格限制应用内并发请求，不建立无界等待队列。"""
 
@@ -255,9 +330,26 @@ class BodyLimitMiddleware(BaseHTTPMiddleware):
             except ValueError:
                 return self._reject(request)
         if request.method in {"POST", "PUT", "PATCH"}:
-            if not request.url.path.startswith("/media/uploads"):
+            chunks: list[bytes] = []
+            size = 0
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > limit:
+                    return self._reject(request)
+                chunks.append(chunk)
+            body = b"".join(chunks)
+            request._body = body
+            # Action endpoints (e.g. `:rotate`) legitimately carry no body.
+            # Only requests that actually carry a body are required to be JSON.
+            if body and not request.url.path.startswith("/media/uploads"):
                 media_type = request.headers.get("content-type", "").split(";", 1)[0]
                 if media_type != "application/json":
+                    request_id = getattr(
+                        request.state,
+                        "request_id",
+                        f"req_{secrets.token_urlsafe(16)}",
+                    )
+                    request.state.request_id = request_id
                     return _error_response(
                         request,
                         APIError(
@@ -266,14 +358,6 @@ class BodyLimitMiddleware(BaseHTTPMiddleware):
                             status_code=415,
                         ),
                     )
-            chunks: list[bytes] = []
-            size = 0
-            async for chunk in request.stream():
-                size += len(chunk)
-                if size > limit:
-                    return self._reject(request)
-                chunks.append(chunk)
-            request._body = b"".join(chunks)
         return await call_next(request)
 
     @staticmethod
@@ -301,7 +385,7 @@ def _error_response(request: Request, error: APIError) -> JSONResponse:
             message=error.message,
             request_id=request.state.request_id,
             retryable=error.retryable,
-            details=error.details,
+            details=sanitize_public_value(error.details),
             recovery=(RecoveryHint(**error.recovery) if error.recovery else None),
         )
     )
@@ -355,6 +439,15 @@ def create_api_app(context: APIContext) -> FastAPI:
     app.state.api_context = context
     app.state.websocket_connection_budget = WebSocketConnectionBudget(
         context.max_websocket_connections
+    )
+    app.add_middleware(
+        WebSocketBudgetMiddleware,
+        budget=app.state.websocket_connection_budget,
+    )
+    app.add_middleware(
+        RateLimitMiddleware,
+        requests_per_minute=context.rate_limit_requests_per_minute,
+        burst=context.rate_limit_burst,
     )
     app.add_middleware(
         ConcurrencyLimitMiddleware,
@@ -1042,7 +1135,9 @@ __all__ = [
     "APIContext",
     "APIError",
     "BodyLimitMiddleware",
+    "RateLimitMiddleware",
     "RequestIDMiddleware",
+    "WebSocketBudgetMiddleware",
     "WebSocketConnectionBudget",
     "create_api_app",
 ]

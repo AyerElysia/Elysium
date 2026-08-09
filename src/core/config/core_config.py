@@ -560,6 +560,30 @@ class CoreConfig(ConfigBase):
             le=4096,
             description="阶段三实时领域共享的最大 WebSocket 连接数",
         )
+        app_api_v1_rate_limit_requests_per_minute: int = Field(
+            default=600,
+            ge=1,
+            le=1_000_000,
+            description="阶段三 API 每个调用方每分钟允许的请求数",
+        )
+        app_api_v1_rate_limit_burst: int = Field(
+            default=60,
+            ge=1,
+            le=100_000,
+            description="阶段三 API 每个调用方允许的瞬时突发请求数",
+        )
+        app_api_v1_max_command_concurrency: int = Field(
+            default=8,
+            ge=1,
+            le=512,
+            description="阶段三命令 dispatcher 同时执行的最大命令数",
+        )
+        app_api_v1_max_command_backlog: int = Field(
+            default=1000,
+            ge=1,
+            le=1_000_000,
+            description="阶段三命令 ledger 允许等待调度的最大 accepted 数",
+        )
     http_router: HttpRouterSection = Field(default_factory=HttpRouterSection)
 
     @config_section("advanced")

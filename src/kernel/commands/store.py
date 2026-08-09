@@ -15,6 +15,7 @@ from src.kernel.sync.local_store import create_local_sync_schema, enqueue_in_tra
 
 from .models import (
     TERMINAL_STATUSES,
+    CommandBacklogFull,
     CommandNotCancellable,
     CommandNotFound,
     CommandRecord,
@@ -149,6 +150,7 @@ class CommandStore:
         correlation_id: str | None = None,
         causation_id: str | None = None,
         expected_revision: int | None = None,
+        max_pending: int | None = None,
     ) -> tuple[CommandRecord, bool]:
         """Durably accept a command or return its idempotent predecessor."""
 
@@ -163,6 +165,12 @@ class CommandStore:
                 if str(existing["request_hash"]) != request_hash:
                     raise IdempotencyConflict(idempotency_key)
                 return self._record(existing), False
+            if max_pending is not None:
+                pending = db.execute(
+                    "SELECT COUNT(*) AS count FROM api_commands WHERE status IN ('accepted', 'executing')"
+                ).fetchone()
+                if int(pending["count"]) >= max_pending:
+                    raise CommandBacklogFull(max_pending)
             db.execute(
                 """
                 INSERT INTO api_commands (

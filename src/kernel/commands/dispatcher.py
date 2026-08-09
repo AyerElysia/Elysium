@@ -88,12 +88,24 @@ class CommandDispatcher:
         *,
         registry: HandlerRegistry | None = None,
         task_manager: TaskOwner | None = None,
+        max_concurrency: int = 8,
+        max_backlog: int = 1000,
     ) -> None:
+        if max_concurrency < 1 or max_backlog < 1:
+            raise ValueError("command budgets must be positive")
         self.store = store
         self.registry = registry or HandlerRegistry()
         self.task_manager = task_manager or TaskManager()
         self._tasks: dict[str, object] = {}
         self._closing = False
+        self._max_backlog = max_backlog
+        self._execution_budget = asyncio.Semaphore(max_concurrency)
+
+    @property
+    def max_backlog(self) -> int:
+        """Return the durable pending-command budget."""
+
+        return self._max_backlog
 
     @property
     def has_active_tasks(self) -> bool:
@@ -116,6 +128,8 @@ class CommandDispatcher:
 
         if self._closing or command_id in self._tasks:
             return
+        if len(self._tasks) >= self._max_backlog:
+            raise RuntimeError("command backlog limit reached")
         task_info = self.task_manager.create_task(
             self._execute(command_id),
             name=f"api-command:{command_id}",
@@ -169,6 +183,10 @@ class CommandDispatcher:
         self._tasks.clear()
 
     async def _execute(self, command_id: str) -> None:
+        async with self._execution_budget:
+            await self._execute_bounded(command_id)
+
+    async def _execute_bounded(self, command_id: str) -> None:
         command = await asyncio.to_thread(self.store.get, command_id)
         spec = self.registry.get(command.command_type)
         if spec is None or not spec.required_scopes.issubset(command.scope_snapshot):

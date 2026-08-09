@@ -87,6 +87,10 @@ class IdempotencyConflict(RuntimeError):
     """The actor reused an idempotency key with different content."""
 
 
+class CommandBacklogFull(RuntimeError):
+    """The durable pending-command budget is exhausted."""
+
+
 class CommandNotFound(KeyError):
     """The command is absent or intentionally hidden from the caller."""
 
@@ -97,6 +101,7 @@ class CommandNotCancellable(RuntimeError):
 
 __all__ = [
     "TERMINAL_STATUSES",
+    "CommandBacklogFull",
     "CommandNotCancellable",
     "CommandNotFound",
     "CommandOutcome",

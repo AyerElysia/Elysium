@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, Header, Response
 from src.core.models.media import MediaAttachment
 from src.core.models.message import Message, MessageType
 from src.kernel.commands import (
+    CommandBacklogFull,
     CommandDispatcher,
     CommandOutcome,
     CommandRecord,
@@ -468,7 +469,15 @@ def create_chat_command_router(
                 scopes=session.scopes,
                 target=target,
                 payload=stored_payload,
+                max_pending=dispatcher.max_backlog,
             )
+        except CommandBacklogFull as exc:
+            raise APIError(
+                "command_backlog_full",
+                "命令积压已达到技术上限，请稍后重试。",
+                status_code=429,
+                retryable=True,
+            ) from exc
         except IdempotencyConflict as exc:
             raise APIError(
                 "idempotency_conflict",
@@ -476,7 +485,15 @@ def create_chat_command_router(
                 status_code=409,
             ) from exc
         if created:
-            dispatcher.schedule(command.command_id)
+            try:
+                dispatcher.schedule(command.command_id)
+            except RuntimeError as exc:
+                raise APIError(
+                    "command_backlog_full",
+                    "命令积压已达到技术上限，请稍后重试。",
+                    status_code=429,
+                    retryable=True,
+                ) from exc
         else:
             response.status_code = 200
         return ChatCommandAccepted(command=_response(command))

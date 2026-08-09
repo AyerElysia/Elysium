@@ -25,6 +25,7 @@ from fastapi import (
 
 from plugins.livestream.ledger import LedgerRecord, LivestreamLedger
 from src.kernel.commands import (
+    CommandBacklogFull,
     CommandDispatcher,
     CommandOutcome,
     CommandRecord,
@@ -355,11 +356,27 @@ def create_livestream_router(
                 scopes=session.scopes,
                 target={"domain": "livestream"},
                 payload=payload,
+                max_pending=dispatcher.max_backlog,
             )
+        except CommandBacklogFull as exc:
+            raise APIError(
+                "command_backlog_full",
+                "命令积压已达到技术上限，请稍后重试。",
+                status_code=429,
+                retryable=True,
+            ) from exc
         except IdempotencyConflict as exc:
             raise APIError("idempotency_conflict", "该 Idempotency-Key 已用于不同命令。", status_code=409) from exc
         if created:
-            dispatcher.schedule(command.command_id)
+            try:
+                dispatcher.schedule(command.command_id)
+            except RuntimeError as exc:
+                raise APIError(
+                    "command_backlog_full",
+                    "命令积压已达到技术上限，请稍后重试。",
+                    status_code=429,
+                    retryable=True,
+                ) from exc
         else:
             response.status_code = 200
         return LivestreamCommandAccepted(command=_response(command))
