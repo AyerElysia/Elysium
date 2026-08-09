@@ -149,6 +149,7 @@ schema_generation    兼容的协议/数据库 generation
 | Presence | instance/session/revision | 按实例/stream mutation | revision/owner/lease 合同 | 局部 stream 可有 owner |
 | World projection | event frontier + projection | 按 frontier 原子推进 | 缺口停住，不跳过 | 否 |
 | Memory index job | job identity + lease | 数据库原子认领 | 完成/失败/过期可重放 | 否 |
+| Learning | append-only evidence + selected projection | 所有合法实例按 occurrence 追加事实；单一 fenced projector/maintenance owner 推进 projection | 事实同 ID 异内容冲突；projection revision CAS，失租 fail closed 且不自动 rebase | 仅 projection/maintenance 使用局部 claim |
 | 外部发送 | outbox action + platform receipt | action claim | sent/unknown/retryable 分开 | 否，按 action claim |
 | Chroma/FTS | 可重建投影 | 每实例或共享服务 | 从权威历史重建 | 否 |
 | `runtime_context/global` 过渡态 | 过渡兼容快照 | 最新读取 + delta 合并 | 按字段/事件语义合并 | 否 |

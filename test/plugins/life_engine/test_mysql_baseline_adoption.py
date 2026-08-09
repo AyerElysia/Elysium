@@ -103,16 +103,17 @@ async def test_learning_upgrade_orders_claim_and_learning_migrations(
         (
             (1, "life_learning_storage_v1"),
             (2, "life_learning_singleton_claim_guard_v2"),
+            (3, "life_learning_singleton_claim_guard_retirement_v3"),
+            (4, "life_learning_projector_claim_guard_v4"),
         ),
     )
     assert calls[5][0] == "verify"
     assert set(calls[5][1]) == {
         "learning_events_immutable_update_v1",
         "learning_events_immutable_delete_v1",
-        "learning_events_singleton_claim_insert_v2",
-        "learning_projections_singleton_claim_insert_v2",
-        "learning_projections_singleton_claim_update_v2",
-        "learning_projections_singleton_claim_delete_v2",
+        "learning_projections_projector_claim_insert_v4",
+        "learning_projections_projector_claim_update_v4",
+        "learning_projections_projector_claim_delete_v4",
     }
 
 

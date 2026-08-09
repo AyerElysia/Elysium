@@ -45,7 +45,9 @@ from plugins.life_engine.storage.learning_schema import (
 )
 from plugins.life_engine.storage.learning_schema import (
     MYSQL_LEARNING_CLAIM_GUARD_MIGRATION,
-    MYSQL_LEARNING_CLAIM_GUARD_TRIGGERS,
+    MYSQL_LEARNING_CLAIM_GUARD_RETIREMENT,
+    MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_MIGRATION,
+    MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_TRIGGERS,
 )
 from plugins.life_engine.storage.memory.schema import (
     MEMORY_IMMUTABILITY_MIGRATIONS,
@@ -590,11 +592,13 @@ async def _install_learning_schema(engine: AsyncEngine) -> None:
         (
             _LEARNING_MIGRATION,
             MYSQL_LEARNING_CLAIM_GUARD_MIGRATION,
+            MYSQL_LEARNING_CLAIM_GUARD_RETIREMENT,
+            MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_MIGRATION,
         )
     )
     await verify_mysql_trigger_contract(
         engine,
-        _LEARNING_TRIGGERS + MYSQL_LEARNING_CLAIM_GUARD_TRIGGERS,
+        _LEARNING_TRIGGERS + MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_TRIGGERS,
     )
 
 

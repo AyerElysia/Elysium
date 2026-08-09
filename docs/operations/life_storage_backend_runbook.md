@@ -162,18 +162,18 @@ uv run python scripts/adopt_life_mysql_baseline.py \
 5. 需要切换 owner 时，等待数据库时间确认旧 lease 过期后执行 takeover，或在已确认的旧 owner 正常关闭路径释放；新 epoch 生效后旧 token 永久失效；
 6. Elysium 仍由用户手工停止/启动。代码和 schema 就绪后，用户只启动预期实例；随后验证 claim owner 与本机实例一致、`runtime_context` 从最新 revision 加载、revision 不再由未知 owner 漂移，再做真实消息闭环。
 
-### 6.3.2 Learning singleton guard 升级
+### 6.3.2 Learning projector guard 升级
 
-Learning selected persistence 使用固定 claim scope `life_engine.learning/selected_persistence`。业务启动只核验 schema，不创建 trigger；新部署或 v1 升级必须先在 Elysium 停止/不重启窗口运行：
+Learning 的不可变经历事实允许同一 generation 的所有合法实例以 occurrence 幂等追加；`selected_persistence` projection 与 maintenance 则使用固定 claim scope `life_engine.learning/selected_persistence`，同一时刻只有一个数据库时间 fenced owner。业务启动只核验 schema，不创建 trigger；新部署或旧 schema 升级必须先在 Elysium 停止/不重启窗口运行：
 
 ```bash
 uv run python scripts/adopt_life_mysql_baseline.py \
   upgrade-learning --config config/core.toml
 ```
 
-该命令只幂等核验/安装 generic claim schema、`life_learning_schema_migrations` v1/v2、既有两条 Learning event 不可变 trigger 与四条 singleton guard（event INSERT，projection INSERT/UPDATE/DELETE），随后输出 Learning 表的 content-free 行数/root hash。它不取得 Learning claim、不写 `learning_events`/`learning_projections`、不修改 runtime state、generation/epoch 或 claim 业务行，也不启动/停止进程。配置中的 MySQL 密码仍须使用环境变量引用；命令不会接受或打印明文密码。
+该命令只幂等核验/安装 generic claim schema、`life_learning_schema_migrations` v1-v4、两条 Learning event 不可变 trigger，并先通过 v3 退役旧的全域 singleton guard，再由 v4 安装三条仅覆盖 projection INSERT/UPDATE/DELETE 的 projector guard；随后输出 Learning 表的 content-free 行数/root hash。它不取得 Learning claim、不写 `learning_events`/`learning_projections`、不修改 runtime state、generation/epoch 或 claim 业务行，也不启动/停止进程。配置中的 MySQL 密码仍须使用环境变量引用；命令不会接受或打印明文密码。
 
-升级后必须只读验证 migration checksum、四条 trigger body 与 transaction binding 为空。缺失或漂移时业务启动 fail closed；不得通过关闭 trigger 校验、删除 claim 或回退旧 adapter 绕过。
+升级后必须只读验证 migration checksum、两条不可变 trigger、三条 projector guard body 与 transaction binding 为空。没有 claim 的合法实例仍可追加 immutable `learning_events`，但任何未绑定、失租或旧 epoch 连接对 `learning_projections` 的 INSERT/UPDATE/DELETE 都必须被数据库拒绝。缺失或漂移时 projector 启动 fail closed；不得通过关闭 trigger 校验、删除 claim、自动 rebase projection 或回退旧 adapter 绕过。
 
 ### 6.4 单 runtime 启动、性能与关闭顺序
 

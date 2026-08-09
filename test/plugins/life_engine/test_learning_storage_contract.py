@@ -72,7 +72,10 @@ from plugins.life_engine.storage.learning_migration import (
 from plugins.life_engine.storage.learning_schema import (
     LEARNING_SCHEMA_VERSION,
     MYSQL_LEARNING_CLAIM_GUARD_MIGRATION,
+    MYSQL_LEARNING_CLAIM_GUARD_RETIREMENT,
     MYSQL_LEARNING_CLAIM_GUARD_TRIGGERS,
+    MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_MIGRATION,
+    MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_TRIGGERS,
 )
 from plugins.life_engine.storage.models import (
     BackendGeneration,
@@ -1110,25 +1113,34 @@ async def test_claimed_mysql_learning_startup_requires_trigger_guard(
         await open_learning_stores(runtime, writer_claim=claim)  # type: ignore[arg-type]
 
 
-def test_learning_mysql_claim_guard_covers_all_mutation_surfaces() -> None:
-    """A registered Learning scope blocks old adapters and direct SQL writes."""
+def test_learning_mysql_claim_guard_is_projection_only_after_retirement() -> None:
+    """All writers append evidence; one fenced owner mutates projections."""
 
-    assert LEARNING_SCHEMA_VERSION == 2
+    assert LEARNING_SCHEMA_VERSION == 4
     assert MYSQL_LEARNING_CLAIM_GUARD_MIGRATION.version == 2
+    assert MYSQL_LEARNING_CLAIM_GUARD_RETIREMENT.version == 3
+    assert MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_MIGRATION.version == 4
     assert {
         (trigger.table, trigger.manipulation)
-        for trigger in MYSQL_LEARNING_CLAIM_GUARD_TRIGGERS
+        for trigger in MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_TRIGGERS
     } == {
-        ("learning_events", "INSERT"),
         ("learning_projections", "INSERT"),
         ("learning_projections", "UPDATE"),
         ("learning_projections", "DELETE"),
     }
-    for statement in MYSQL_LEARNING_CLAIM_GUARD_MIGRATION.statements:
+    assert any(
+        "learning_events_singleton_claim_insert_v2" in statement
+        for statement in MYSQL_LEARNING_CLAIM_GUARD_RETIREMENT.statements
+    )
+    assert {trigger.name for trigger in MYSQL_LEARNING_CLAIM_GUARD_TRIGGERS}.isdisjoint(
+        trigger.name for trigger in MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_TRIGGERS
+    )
+    for statement in MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_MIGRATION.statements:
         assert LEARNING_WRITER_CLAIM_NAMESPACE in statement
         assert LEARNING_WRITER_CLAIM_STATE_KEY in statement
         assert "runtime_singleton_writer_bindings" in statement
         assert "LearningSingletonWriterClaimRequired" in statement
+        assert "IF EXISTS (" not in statement
 
 
 async def test_selected_maintenance_conflict_stops_repeated_sql_attempts(

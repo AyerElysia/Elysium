@@ -100,6 +100,26 @@ async def test_mysql_learning_event_projection_contract() -> None:
             environment={"TEST_LEARNING_MYSQL_PASSWORD": config.password},
         )
         await open_learning_stores(runtime, initialize_schema=True)
+        preclaim_store = (await open_learning_stores(runtime)).store
+        preclaim_projection = LearningProjectionWrite(
+            projection_name=f"mysql_learning_preclaim_{suffix}",
+            expected_revision=0,
+            expected_source_frontier=0,
+            schema_version=1,
+            projector_version="mysql-contract-v1",
+            rebuild_state="ready",
+            payload={"phase": "before-claim"},
+        )
+        with pytest.raises(
+            SingletonWriterClaimLost,
+            match="LearningSingletonWriterClaimRequired",
+        ):
+            await preclaim_store.commit(events=[], projections=[preclaim_projection])
+        assert (
+            await preclaim_store.get_projection(preclaim_projection.projection_name)
+            is None
+        )
+
         claim = await runtime.acquire_singleton_writer(
             namespace=LEARNING_WRITER_CLAIM_NAMESPACE,
             state_key=LEARNING_WRITER_CLAIM_STATE_KEY,
@@ -148,12 +168,23 @@ async def test_mysql_learning_event_projection_contract() -> None:
             event,
             occurrence_id=f"mysql-learning-unclaimed:{suffix}",
         )
+        unclaimed_event_commit = await unclaimed.commit(
+            events=[blocked],
+            projections=[],
+        )
+        assert unclaimed_event_commit.events[0].occurrence_id == blocked.occurrence_id
+        unclaimed_projection = replace(
+            write,
+            projection_name=f"mysql-learning-unclaimed-projection:{suffix}",
+            payload={"occurrence_id": blocked.occurrence_id},
+        )
         with pytest.raises(
             SingletonWriterClaimLost,
             match="LearningSingletonWriterClaimRequired",
         ):
-            await unclaimed.commit(events=[blocked], projections=[])
-        assert await store.event_by_occurrence(blocked.occurrence_id) is None
+            await unclaimed.commit(events=[], projections=[unclaimed_projection])
+        assert await store.event_by_occurrence(blocked.occurrence_id) is not None
+        assert await store.get_projection(unclaimed_projection.projection_name) is None
 
         for statement in (
             text(

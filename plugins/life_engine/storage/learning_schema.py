@@ -19,7 +19,7 @@ from .learning_contracts import (
 from .models import BackendKind
 from .writer_claims import ensure_singleton_writer_claim_schema
 
-LEARNING_SCHEMA_VERSION = 2
+LEARNING_SCHEMA_VERSION = 4
 
 LOCAL_LEARNING_SCHEMA_STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS learning_events (
@@ -244,6 +244,73 @@ MYSQL_LEARNING_CLAIM_GUARD_RETIREMENT = SchemaMigration(
 )
 
 
+def _mysql_learning_projector_claim_guard(
+    *,
+    trigger_name: str,
+    operation: str,
+) -> str:
+    """Require the active Learning projector claim on every projection write."""
+
+    return f"""CREATE TRIGGER IF NOT EXISTS {trigger_name}
+        BEFORE {operation} ON learning_projections FOR EACH ROW
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM runtime_singleton_writer_claims c
+                INNER JOIN runtime_singleton_writer_bindings b
+                    ON b.generation_id = c.generation_id
+                    AND b.namespace = c.namespace
+                    AND b.state_key = c.state_key
+                    AND b.owner_instance_id = c.owner_instance_id
+                    AND b.lease_epoch = c.lease_epoch
+                    AND b.fencing_token_sha256 = c.fencing_token_sha256
+                WHERE b.connection_id = CONNECTION_ID()
+                    AND c.namespace = '{LEARNING_WRITER_CLAIM_NAMESPACE}'
+                    AND c.state_key = '{LEARNING_WRITER_CLAIM_STATE_KEY}'
+                    AND c.released_at IS NULL
+                    AND c.lease_until > CURRENT_TIMESTAMP(6)
+            ) THEN
+                SIGNAL SQLSTATE '45000'
+                    SET MESSAGE_TEXT = 'LearningSingletonWriterClaimRequired';
+            END IF;
+        END"""
+
+
+# Multi-writer Learning keeps immutable evidence appendable by every valid
+# generation writer. Only the mutable selected projections are serialized by
+# one database-time, generation-scoped projector/maintenance owner.
+MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_MIGRATION = SchemaMigration(
+    version=4,
+    name="life_learning_projector_claim_guard_v4",
+    statements=tuple(
+        _mysql_learning_projector_claim_guard(
+            trigger_name=trigger_name,
+            operation=operation,
+        )
+        for trigger_name, operation in (
+            ("learning_projections_projector_claim_insert_v4", "INSERT"),
+            ("learning_projections_projector_claim_update_v4", "UPDATE"),
+            ("learning_projections_projector_claim_delete_v4", "DELETE"),
+        )
+    ),
+)
+
+MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_TRIGGERS = tuple(
+    MySQLTriggerContract(
+        trigger_name,
+        "learning_projections",
+        operation,
+        "BEFORE",
+        "LearningSingletonWriterClaimRequired",
+    )
+    for trigger_name, operation in (
+        ("learning_projections_projector_claim_insert_v4", "INSERT"),
+        ("learning_projections_projector_claim_update_v4", "UPDATE"),
+        ("learning_projections_projector_claim_delete_v4", "DELETE"),
+    )
+)
+
+
 async def ensure_learning_schema(
     runtime: StorageBackendRuntime,
     *,
@@ -275,6 +342,7 @@ async def ensure_learning_schema(
                     _MYSQL_SCHEMA_MIGRATION,
                     MYSQL_LEARNING_CLAIM_GUARD_MIGRATION,
                     MYSQL_LEARNING_CLAIM_GUARD_RETIREMENT,
+                    MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_MIGRATION,
                 )
             )
             await verify_mysql_trigger_contract(
@@ -306,7 +374,7 @@ async def verify_learning_writer_claim_guard(
         return
     await verify_mysql_trigger_contract(
         runtime.engine,
-        MYSQL_LEARNING_CLAIM_GUARD_TRIGGERS,
+        MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_TRIGGERS,
     )
 
 
@@ -316,6 +384,8 @@ __all__ = [
     "MYSQL_LEARNING_CLAIM_GUARD_MIGRATION",
     "MYSQL_LEARNING_CLAIM_GUARD_RETIREMENT",
     "MYSQL_LEARNING_CLAIM_GUARD_TRIGGERS",
+    "MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_MIGRATION",
+    "MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_TRIGGERS",
     "ensure_learning_schema",
     "verify_learning_writer_claim_guard",
 ]
