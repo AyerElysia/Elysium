@@ -9,8 +9,11 @@ from src.core.components.base.router import BaseRouter
 
 class NekoSurfaceRouter(BaseRouter):
     router_name = "neko_surface"
-    router_description = "Authenticated elysia.surface.v1 gateway"
+    router_description = "Authenticated elysia.surface.v1 gateway（旧路由，已由 /api/v1/surfaces 取代）"
     custom_route_path = "/api/neko-surface"
+    deprecation_notice = "已被 /api/v1/surfaces 统一接口取代，请迁移；迁移期保留"
+    deprecation_sunset_date = "2027-02-01"
+    deprecation_migration_link = "https://github.com/AyerElysia/Elysium/tree/main/docs/api"
 
     def register_endpoints(self) -> None:
         gateway = self.plugin.gateway

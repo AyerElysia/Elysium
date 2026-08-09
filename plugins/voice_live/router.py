@@ -29,9 +29,12 @@ class VoiceLiveRouter(BaseRouter):
     """Issue single-use tickets and own calls plus read-only OBS observers."""
 
     router_name = "voice_live"
-    router_description = "商业级全双工实时语音通话"
+    router_description = "商业级全双工实时语音通话（旧路由，已由 /api/v1/voice-calls 取代）"
     custom_route_path = "/voice-live"
     cors_origins: list[str] | None = None
+    deprecation_notice = "已被 /api/v1/voice-calls 统一接口取代，请迁移；迁移期保留"
+    deprecation_sunset_date = "2027-02-01"
+    deprecation_migration_link = "https://github.com/AyerElysia/Elysium/tree/main/docs/api"
 
     def __init__(self, plugin: Any) -> None:
         self._sessions: dict[str, CallSession] = {}

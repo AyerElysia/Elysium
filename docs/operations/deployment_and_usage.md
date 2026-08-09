@@ -1,8 +1,8 @@
 # Elysium 部署、配置、测试与使用说明
 
 > 文档状态：持续维护中
-> 当前版本：Windows/WSL 本地运行、QQ/飞书文本聊天与图片查看验收基线
-> 最后核对日期：2026-08-04
+> 当前版本：Windows/WSL 本地运行、QQ/飞书文本聊天与图片查看验收基线；阶段三 `/api/v1` 应用接口
+> 最后核对日期：2026-08-09
 
 本文面向第一次接手 Elysium 的开发者和维护者，目标是让接手者能够独立完成环境准备、配置、启动、验证、故障排查和日常使用，并逐步覆盖项目的全部功能。
 
@@ -431,6 +431,7 @@ app_api_v1_max_command_backlog = 1000
 - API SQLite 必须位于 workspace 的 `runtime/` 下；认证部分只保存凭据哈希、授权、到期与撤销状态，不保存可回显明文凭据；同库命令账本保存请求 payload 以供耐久执行和查询，因此备份、访问控制与留存策略必须按业务数据级别保护；
 - 普通请求体上限 1 MiB，受管上传上限 32 MiB，HTTP 并发和 WebSocket 连接分别受配置预算约束；API 请求按脱敏调用方键执行有界 token-bucket 限流，命令 backlog 在耐久受理事务内原子检查，预算耗尽时不会写入一个随后又返回 429 的命令；
 - 当前已挂载 P3-01 的五个认证端点、P3-02 的 `/bootstrap`、`/capabilities`、`/readiness`、`/health`，P3-03 的 `/events`、`/events/{event_id}`、`/events/stream` 和 `/event-subscriptions/validate`，P3-04 的命令创建、列表、单项查询和受限取消端点，P3-05 的五个只读聊天历史端点，P3-06 的 13 个耐久聊天命令端点，以及 P3-07 的 8 个用户媒体端点；除 `/health` 仅用于 API 存活探测外，其余接口要求短时 Bearer 会话和对应 scope；
+- P3-08 直播端点为 `GET /livestream/status`、场次列表／详情／事件历史、`POST /livestream/session:start|stop|interrupt`、`POST /livestream/speech:request`、`POST /livestream/danmaku:send` 和 `WS /livestream/stage/ws`；P3-09 语音通话端点为 `POST /voice-calls`、`GET /voice-calls/{call_id}`、resume／interrupt／end／text、transcripts、tickets，以及 participant／observer WebSocket；P3-10 狼人杀用户端点为 `GET /tabletop/games`、room create/query/join/leave/start/end、授权 events、actor-bound private view、actions、replay 和 `WS /tabletop/rooms/{room_id}/ws`；P3-11 管理端点覆盖 overview／components／metrics／incidents／audit／logs／sync、session 撤销、credential 创建轮换撤销、allowlist settings、integrations、jobs，以及 chat 公告与 pin／unpin；P3-12 端点覆盖 consciousness 状态与受保护 suspend/resume/drain、world 断言/变化/观察/投影重建、memory 只读投影与 projection rebuild、commitments／autonomy 只读状态与外部 suggestion、Neko Surface 用户连接与管理连接，以及安全能力目录 `/abilities`；P3-13 引入统一权限矩阵、限流、并发/上传/WS 预算、秘密扫描与故障恢复测试；当前 OpenAPI schema（`docs/api/openapi.json`）覆盖已注册的 134 个操作，无重复 operation id，WebSocket 端点不进入 OpenAPI `paths`（见 `docs/api/permissions.md`）；
 - 事件接口以耐久 Life Event SQLite ledger 的全局 ingest position 为权威位置，cursor 不透明、签名且绑定账本；授权过滤后的 cursor 表示“已扫描位置”，不可见事件不会造成虚假历史缺口，也不会通过单事件读取泄露存在性；
 - 聊天历史接口为 `GET /api/v1/chat/streams`、`GET /api/v1/chat/streams/{stream_id}`、`GET /api/v1/chat/streams/{stream_id}/messages`、`GET /api/v1/chat/messages/{message_id}` 和 `GET /api/v1/chat/messages/{message_id}/receipts`，统一要求 `chat:read`。管理员可读全量；普通 actor 只能读取自己的事实或获授 `stream:{stream_id}`、`chat:*`、`*` 的 stream。不可见资源与不存在资源统一返回 404；同一 message ID 跨 provider／stream 冲突时返回 409，并要求使用 `provider` 或 `stream_id` 查询参数消歧；
 - 聊天分页 cursor 绑定独立 `chat-events-v1` 账本标识，仍以 Life Event 全局 ingest position 为扫描位置。聊天查询服务未注入可用事件 store 时返回 503，不会为了只读查询隐式创建 Life Engine；历史缺口返回显式 gap 错误和恢复 cursor；
@@ -474,6 +475,36 @@ uv run --group dev python -m pytest test/api/v1 test/kernel/commands test/plugin
 ```
 
 启用或修改该配置需要用户手工重启 Elysium。本轮开发没有启动或重启运行实例，也没有完成真实前端／Provider 端到端验收。P3-05/P3-06/P3-07 当前结论来自离线契约、API、MessageSender 和 Adapter 回归；真实客户端应另外验证短时会话、scope、stream grant、断点续查、媒体上传/下载、聊天 `media_id` 发送、命令最终状态、Provider capability 和 notice 支持矩阵。直播和语音通话领域接口仍属于 P3-08/P3-09，不能因 P3-07 已提供媒体对象而标记完成。
+
+### 6.5 旧插件路由弃用与迁移期
+
+阶段三统一接口由 `/api/v1` 取代的四组旧插件路由保留运行，但已声明弃用（P3-14）。旧路由仍可用，响应自动附加 `Deprecation`、`Sunset` 与 `Link` 头；`Sunset` 是建议迁移期限，不强制执行删除，也未设置自动下线。
+
+| 旧路由组 | 取代者 | 迁移期限 |
+| --- | --- | --- |
+| `plugins/livestream/router.py` 的 `/livestream/*` | `/api/v1/livestream/*` | 2027-02-01 |
+| `plugins/voice_live/router.py` 的 `/voice-live/*` | `/api/v1/voice-calls/*` | 2027-02-01 |
+| `plugins/neko_surface/router.py` 的 `/api/neko-surface/*` | `/api/v1/surfaces/*` | 2027-02-01 |
+| `plugins/life_engine/memory/router.py` 的 `/memory_vis/*` | `/api/v1/admin/memory/*` | 2027-02-01 |
+
+约定：
+
+- 弃用标记在 `BaseRouter` 基类声明（`deprecation_notice`／`deprecation_sunset_date`／`deprecation_migration_link`），由中间件自动附加响应头；提示文本按 RFC 5987 编码，避免非 latin-1 字符破坏 header；
+- 弃用标记不改变旧路由的状态码、payload 或授权语义；迁移期旧客户端不受影响；
+- `/api/v1` 路由不继承旧插件的弃用头；
+- 迁移期结束后是否删除旧路由需另行决策，当前不自动删除；删除前必须保证新路由功能与授权等价（阶段三 §24 铁律）。
+
+### 6.6 阶段三文档产物
+
+- `docs/api/openapi.json`：完整 OpenAPI schema（由 `scripts/generate_api_openapi.py` 生成，只注册路由不执行 endpoint）；
+- `docs/api/events.md`：事件目录；
+- `docs/api/errors.md`：错误码目录；
+- `docs/api/permissions.md`：权限矩阵与实现状态；
+- `docs/api/frontend-example.md`：前端最小参考实现；
+- `docs/api/README.md`：目录索引与生成/校验命令；
+- `docs/api/verification.md`：阶段三 P3-14 验证报告（已验收/暂不验收/已回退）。
+
+以上文档与实现冲突时以实现为准并更新文档；schema 不含凭据、路径、私聊原文或运行数据。
 
 ---
 
@@ -1467,3 +1498,5 @@ config/
 | 2026-08-05 | 阶段三 P3-08 | 接入直播状态、场次与事件历史、5 类耐久命令和统一 stage ticket/WS；保持手工开播、observer 只读、平台断线 degraded，并明确 B站弹幕写能力尚未具备真实凭据与 E2E |
 | 2026-08-05 | 阶段三 P3-09 | 接入语音通话耐久登记、状态/转写查询、4 类耐久命令、资源绑定 ticket 和 participant/observer WS；保留 PCM16 二进制协议与旧路由，明确真实 Provider/双向音频/重连 E2E 暂未验收 |
 | 2026-08-07 | 阶段三 P3-10 | 接入狼人杀四类授权投影、追加式 ledger、revision snapshot/action 幂等、ledger 恢复、用户层 REST/WS，并让新房间群命令与 HTTP 共用 domain；明确旧内存房间不迁移，管理裁判台及真实客户端/跨平台 E2E 暂未验收 |
+| 2026-08-09 | 阶段三 P3-11/P3-12/P3-13 | 接入管理总览/访问/集成/jobs 与 consciousness/world/memory/commitments/autonomy/surfaces/abilities 端点，补全 scope×resource 权限矩阵、限流与并发/上传/WS 预算、秘密扫描与故障恢复测试；管理路由要求全能管理员身份；明确部分管理领域（chat 管理、voice 监督、media 管理、tabletop 裁判台、memory 详情）仍为 planned/experimental |
+| 2026-08-09 | 阶段三 P3-14 | 旧插件路由声明弃用并附加 Deprecation/Sunset/Link 头（迁移期至 2027-02-01，不自动删除）；生成完整 OpenAPI（134 操作、无重复 operation id）与事件目录/错误码/权限矩阵/前端示例文档；本轮仅离线契约与文档，未做真实前端/Provider E2E |

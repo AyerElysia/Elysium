@@ -35,9 +35,12 @@ class LivestreamRouter(BaseRouter):
     """Expose read-only health and authenticated, manual state mutations."""
 
     router_name = "livestream"
-    router_description = "B站直播导演、舞台与回放控制面"
+    router_description = "B站直播导演、舞台与回放控制面（旧路由，已由 /api/v1/livestream 取代）"
     custom_route_path = "/livestream"
     cors_origins: list[str] | None = None
+    deprecation_notice = "已被 /api/v1/livestream 统一接口取代，请迁移；迁移期保留"
+    deprecation_sunset_date = "2027-02-01"
+    deprecation_migration_link = "https://github.com/AyerElysia/Elysium/tree/main/docs/api"
 
     def __init__(
         self,

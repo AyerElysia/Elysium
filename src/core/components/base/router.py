@@ -6,14 +6,49 @@ Router 提供基于 FastAPI 的 HTTP 路由接口。
 
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote_from_bytes
 
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
 
 
 if TYPE_CHECKING:
     from src.core.components.base.plugin import BasePlugin
+
+
+def _rfc5987(value: str) -> str:
+    """把可能包含非 latin-1 字符的提示文本编码为 RFC 5987 header 值。"""
+    return f"UTF-8''{quote_from_bytes(value.encode('utf-8'), safe='')}"
+
+
+class _DeprecationHeaderMiddleware(BaseHTTPMiddleware):
+    """为阶段三迁移期的旧插件路由附加 Deprecation / Sunset / Link 响应头。
+
+    响应头只声明路由的弃用状态与迁移去向，不改变旧路由的请求处理、
+    鉴权或返回内容，也不参与任何主体认知裁决。
+    """
+
+    def __init__(self, app: FastAPI, *, router: "BaseRouter") -> None:
+        super().__init__(app)
+        self._router = router
+
+    async def dispatch(self, request: Request, call_next: Any) -> Response:
+        response = await call_next(request)
+        notice = self._router.deprecation_notice
+        if notice:
+            response.headers["Deprecation"] = "true"
+            response.headers["Deprecation-Notice"] = _rfc5987(notice)
+        if self._router.deprecation_sunset_date:
+            response.headers["Sunset"] = self._router.deprecation_sunset_date
+        if self._router.deprecation_migration_link:
+            response.headers["Link"] = (
+                f'<{self._router.deprecation_migration_link}>; rel="deprecation"'
+            )
+        return response
 
 
 class BaseRouter(ABC):
@@ -50,6 +85,13 @@ class BaseRouter(ABC):
     custom_route_path: str | None = None
     cors_origins: list[str] | None = None
 
+    # 弃用标记（阶段三迁移期）：若设置，则该 Router 的所有 HTTP 响应
+    # 都会携带 Deprecation / Sunset / Link 头，提示迁移到统一 /api/v1 合同。
+    # 只用于标记被阶段三新接口取代的旧插件路由，不删除旧路由本身。
+    deprecation_notice: str | None = None  # 例如 "被 /api/v1/... 取代，请迁移"
+    deprecation_sunset_date: str | None = None  # 例如 "2027-02-01"
+    deprecation_migration_link: str | None = None  # 例如 "https://.../docs/api/"
+
     # 组件级依赖（精确到组件签名）
     dependencies: list[str] = []  # 例如 ["other_plugin:service:auth"]
 
@@ -79,6 +121,10 @@ class BaseRouter(ABC):
                 allow_methods=["*"],
                 allow_headers=["*"],
             )
+
+        # 阶段三迁移期：为被新 /api/v1 取代的旧路由附加弃用响应头
+        if self.deprecation_notice:
+            self.app.add_middleware(_DeprecationHeaderMiddleware, router=self)
 
         # 注册端点
         self.register_endpoints()

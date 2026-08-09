@@ -1427,6 +1427,8 @@ Provider 边界必须如实保留：NapCat notice 已覆盖撤回、回应、戳
 
 验收门：第 25 节矩阵有当前执行证据；旧客户端在迁移期可用；无未经授权的自动启动／重启。
 
+> **实施状态（2026-08-09）：已完成，全部离线验证。** 四组旧插件路由已保留并标记弃用（`BaseRouter` 类属性 + RFC 5987 弃用 header，迁移期限 2027-02-01）；部署文档更新配置/启动/冒烟/故障恢复/安全说明且不含本机私密配置；OpenAPI（131 paths / 134 operations，无重复 operation id）、事件目录、错误码、权限矩阵与前端最小示例均已生成于 `docs/api/`；定向测试 8 passed、API v1＋命令完整测试 135 passed、风险范围测试 58 passed，Ruff（本轮改动文件通过，预存错误未动）、compileall、`git diff --check` 均通过。详细结论见 `docs/api/verification.md`。未启动或重启 Elysium，未进行真实前端/Provider 端到端验收。
+
 ## 23. 文件级修改计划
 
 以下是建议边界，不要求机械地创建每个文件：

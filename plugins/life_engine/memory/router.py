@@ -339,8 +339,11 @@ class MemoryRouter(BaseRouter):
     """仿生记忆系统可视化路由。"""
 
     router_name = "memory"
-    router_description = "Bionic Memory System Visualization"
+    router_description = "Bionic Memory System Visualization（旧路由，已由 /api/v1/admin/memory 取代）"
     custom_route_path = "/memory_vis"
+    deprecation_notice = "已被 /api/v1/admin/memory 统一接口取代，请迁移；迁移期保留为诊断兼容"
+    deprecation_sunset_date = "2027-02-01"
+    deprecation_migration_link = "https://github.com/AyerElysia/Elysium/tree/main/docs/api"
 
     _subscribers: ClassVar[list[asyncio.Queue[dict[str, Any] | None]]] = []
 
