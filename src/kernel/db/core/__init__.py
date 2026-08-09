@@ -3,6 +3,9 @@
 包含引擎、会话与异常定义。
 """
 
+# Base 并非 kernel/db 的硬性能力边界；此处仅作为占位导出，避免破坏现有对外 API。
+from typing import Any
+
 from src.kernel.db.core.engine import (
     close_engine,
     configure_engine,
@@ -17,15 +20,13 @@ from src.kernel.db.core.exceptions import (
     DatabaseInitializationError,
     DatabaseQueryError,
     DatabaseTransactionError,
+    is_database_disconnect,
 )
 from src.kernel.db.core.session import (
     get_db_session,
     get_session_factory,
     reset_session_factory,
 )
-
-# Base 并非 kernel/db 的硬性能力边界；此处仅作为占位导出，避免破坏现有对外 API。
-from typing import Any
 
 Base = Any
 
@@ -47,6 +48,7 @@ __all__ = [
     "DatabaseConnectionError",
     "DatabaseQueryError",
     "DatabaseTransactionError",
+    "is_database_disconnect",
     # 模型基类
     "Base",
 ]

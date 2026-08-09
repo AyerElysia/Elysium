@@ -21,7 +21,12 @@ from sqlalchemy import update as sa_update
 
 from src.core.config import get_core_config
 from src.core.models.media import redact_media_sources
-from src.kernel.db import CRUDBase, QueryBuilder, get_db_session
+from src.kernel.db import (
+    CRUDBase,
+    QueryBuilder,
+    get_db_session,
+    is_database_disconnect,
+)
 from src.kernel.logger import get_logger
 
 if TYPE_CHECKING:
@@ -35,6 +40,8 @@ logger = get_logger("stream_manager", display="StreamMgr")
 _MEDIA_MESSAGE_TYPES: frozenset[str] = frozenset(
     {"image", "emoji", "voice", "video", "file"}
 )
+_MESSAGE_PERSISTENCE_ATTEMPTS = 3
+_MESSAGE_PERSISTENCE_RETRY_SECONDS = 0.05
 
 
 def _serialize_content_for_db(content: Any, message_type: Any = None) -> str:
@@ -450,23 +457,41 @@ class StreamManager:
                 "platform": message.platform,
             }
 
-            # 持久化到数据库
-            db_message = await self._messages_crud.get_by(
-                message_id=message.message_id, 
-                platform=message.platform,
-                stream_id=stream_id
-            )
-            if not db_message:
-                db_message = await self._messages_crud.create(message_data)
+            # The message_id unique key makes the complete persistence sequence
+            # replay-safe even when a disconnect makes COMMIT outcome unknown.
+            # Always start a fresh CRUD session on retry; never reuse the dead
+            # transaction or claim success before the active-time write finishes.
+            for attempt in range(_MESSAGE_PERSISTENCE_ATTEMPTS):
+                try:
+                    db_message = await self._messages_crud.get_by(
+                        message_id=message.message_id,
+                        platform=message.platform,
+                        stream_id=stream_id,
+                    )
+                    if not db_message:
+                        db_message = await self._messages_crud.create(message_data)
+                    await self._update_stream_active_time(stream_id)
+                    break
+                except Exception as exc:  # noqa: BLE001 - retry only proven disconnects
+                    if (
+                        not is_database_disconnect(exc)
+                        or attempt + 1 >= _MESSAGE_PERSISTENCE_ATTEMPTS
+                    ):
+                        raise
+                    logger.warning(
+                        "消息持久化连接中断，使用消息幂等键重试: "
+                        f"attempt={attempt + 1}, "
+                        f"error_type={type(exc).__name__}, "
+                        f"stream_id={stream_id[:8]}"
+                    )
+                    await asyncio.sleep(_MESSAGE_PERSISTENCE_RETRY_SECONDS)
 
-            # 更新流实例内容
+            # Update volatile state only after the durable sequence succeeds, so
+            # a retry after active-time failure cannot duplicate unread delivery.
             chat_stream = self._streams.get(stream_id)
             if chat_stream and add_to_unread:
                 chat_stream.context.add_unread_message(message)
                 chat_stream.update_active_time()
-
-            # 更新流活跃时间
-            await self._update_stream_active_time(stream_id)
 
             return db_message
 

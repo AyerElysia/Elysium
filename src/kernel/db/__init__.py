@@ -13,6 +13,12 @@ API 层 (api/)：
 """
 
 # 核心
+# API
+from src.kernel.db.api import (
+    AggregateQuery,
+    CRUDBase,
+    QueryBuilder,
+)
 from src.kernel.db.core import (
     Base,
     close_engine,
@@ -20,17 +26,10 @@ from src.kernel.db.core import (
     get_db_session,
     get_engine,
     get_engine_info,
-    init_database_from_config,
     get_session_factory,
+    init_database_from_config,
     reset_engine_state,
     reset_session_factory,
-)
-
-# API
-from src.kernel.db.api import (
-    AggregateQuery,
-    CRUDBase,
-    QueryBuilder,
 )
 
 # 异常
@@ -40,6 +39,7 @@ from src.kernel.db.core.exceptions import (
     DatabaseInitializationError,
     DatabaseQueryError,
     DatabaseTransactionError,
+    is_database_disconnect,
 )
 
 __all__ = [
@@ -64,4 +64,5 @@ __all__ = [
     "DatabaseConnectionError",
     "DatabaseQueryError",
     "DatabaseTransactionError",
+    "is_database_disconnect",
 ]

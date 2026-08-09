@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from src.kernel.logger import get_logger
 
-from .exceptions import DatabaseInitializationError
+from .exceptions import DatabaseInitializationError, is_database_disconnect
 
 logger = get_logger("database.engine", display="DB 引擎")
 
@@ -630,8 +630,15 @@ def _install_session_optimizations(
             for statement in statements:
                 try:
                     cursor.execute(statement)
-                except Exception as exc:  # noqa: BLE001 - 单条调优失败不应阻断连接
-                    # 保持既有语义：调优失败降级为默认配置而不是让连接建不起来。
+                except Exception as exc:  # noqa: BLE001 - distinguish capability from disconnect
+                    if is_database_disconnect(exc):
+                        logger.warning(
+                            f"{label} 会话初始化期间连接已断开: "
+                            f"error_type={type(exc).__name__}"
+                        )
+                        raise
+                    # Unsupported optional settings degrade to database defaults;
+                    # a disconnected connection must never escape this hook.
                     # 例如旧版 PostgreSQL 没有 idle_in_transaction_session_timeout。
                     if statement not in reported:
                         reported.add(statement)
