@@ -133,6 +133,7 @@ class APIContext:
     command_store: CommandStore | None = None
     command_dispatcher: CommandDispatcher | None = None
     chat_commands_enabled: bool = False
+    inbound_injector: Any | None = None
     livestream: "LivestreamProvider | None" = None
     voice_calls: "VoiceCallProvider | None" = None
     tabletop: Any | None = None
@@ -1060,6 +1061,15 @@ def create_api_app(context: APIContext) -> FastAPI:
         )
     if (context.command_store is None) != (context.command_dispatcher is None):
         raise ValueError("command store and dispatcher must be configured together")
+    if context.inbound_injector is not None:
+        from .inbound_messages import create_inbound_inject_router
+
+        app.include_router(
+            create_inbound_inject_router(
+                injector=context.inbound_injector,
+                require_scope=require_scope,
+            )
+        )
     if context.command_store is not None and context.command_dispatcher is not None:
         from .commands import create_commands_router
 

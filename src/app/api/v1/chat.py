@@ -13,12 +13,12 @@ if TYPE_CHECKING:
 from plugins.life_engine.service.event_bus import (
     LifeEvent,
     RawEventGapError,
-    RawEventStore,
 )
 from src.core.models.media import MediaAttachment
 from src.kernel.llm.exceptions import MediaValidationError
 
 from .auth_store import AuthStore, SessionRecord
+from .events import LifeEventLedgerReader
 from .schemas.chat import (
     ChatMessage,
     ChatMessagePage,
@@ -37,6 +37,10 @@ _MAX_SCAN_PER_PAGE = 10_000
 _MESSAGE_FACTS = {
     "chat.message.received",
     "chat.message.delivery_confirmed",
+    # 旧通道以 event_type="text" 且 channel="chat" 归一化的聊天事件（如
+    # inject 注入的消息、旧 QQ/飞书 adapter 的 text 归一化）。这类事件没有
+    # ``metadata.chat`` 结构，靠顶层 stream_id/content/reply_target 投影。
+    "text",
 }
 _RECEIPT_STATUS = {
     "chat.message.delivery_confirmed": "confirmed",
@@ -66,7 +70,7 @@ class ChatQueryService:
         self,
         *,
         codec: SignedValueCodec,
-        store_provider: Callable[[], RawEventStore | None],
+        store_provider: Callable[[], LifeEventLedgerReader | None],
     ) -> None:
         self._codec = codec
         self._store_provider = store_provider
@@ -83,33 +87,35 @@ class ChatQueryService:
         start = position
         visible: list[ChatMessage] = []
         scanned = 0
-        store = self._require_store()
-        while len(visible) < limit and scanned < _MAX_SCAN_PER_PAGE:
-            read_limit = min(_SCAN_BATCH, _MAX_SCAN_PER_PAGE - scanned)
-            batch = await self._read_since(store, position, limit=read_limit)
-            if not batch:
+        max_position = position
+        min_position = 0
+        # 首次查询（无 cursor）从尾部向前捞最近消息（聊天事件集中在尾部，
+        # 一次 read_tail 即命中，避免全账本线性扫描跨远程 MySQL 超时）；
+        # 带 cursor 时保持向后扫描语义推进分页。
+        iterator = self._iter_tail_events() if not cursor else self._iter_all_events()
+        async for event in iterator:
+            scanned += 1
+            position = event.sequence
+            max_position = max(max_position, position)
+            min_position = position if not min_position else min(min_position, position)
+            if scanned > _MAX_SCAN_PER_PAGE:
                 break
-            for event in batch:
-                position = event.sequence
-                scanned += 1
-                if event.event_type not in _MESSAGE_FACTS:
-                    continue
-                if stream_id and event.stream_id != stream_id:
-                    continue
-                if not self._is_visible(event, session):
-                    continue
-                projected = self._message(event)
-                if projected is not None:
-                    visible.append(projected)
-                if len(visible) >= limit:
-                    break
-            if len(batch) < read_limit or len(visible) >= limit:
+            if event.event_type not in _MESSAGE_FACTS:
+                continue
+            if stream_id and event.stream_id != stream_id:
+                continue
+            if not self._is_visible(event, session):
+                continue
+            projected = self._message(event)
+            if projected is not None:
+                visible.append(projected)
+            if len(visible) >= limit:
                 break
-        has_more = bool(await self._read_since(store, position, limit=1))
+        has_more = min_position > 1
         return ChatMessagePage(
             messages=tuple(visible),
             next_cursor=self._encode_cursor(
-                position if position != start or cursor else 0
+                max_position if max_position != start or cursor else 0
             ),
             has_more=has_more,
             scanned_count=scanned,
@@ -125,32 +131,34 @@ class ChatQueryService:
         position = self._decode_cursor(cursor)
         start = position
         scanned = 0
+        max_position = position
+        min_position = 0
         by_stream: dict[str, ChatStreamSummary] = {}
-        store = self._require_store()
-        while len(by_stream) < limit and scanned < _MAX_SCAN_PER_PAGE:
-            read_limit = min(_SCAN_BATCH, _MAX_SCAN_PER_PAGE - scanned)
-            batch = await self._read_since(store, position, limit=read_limit)
-            if not batch:
+        # 首次查询（无 cursor）从尾部向前捞最近事件（聊天消息集中在尾部，
+        # 一次 read_tail 即命中，避免全账本线性扫描跨远程 MySQL 超时）；
+        # 带 cursor 时保持向后扫描语义推进分页。
+        iterator = self._iter_tail_events() if not cursor else self._iter_all_events()
+        async for event in iterator:
+            scanned += 1
+            position = event.sequence
+            max_position = max(max_position, position)
+            min_position = position if not min_position else min(min_position, position)
+            if scanned > _MAX_SCAN_PER_PAGE:
                 break
-            for event in batch:
-                position = event.sequence
-                scanned += 1
-                message = self._message(event)
-                if message is None or not self._is_visible(event, session):
-                    continue
-                by_stream[message.stream_id] = self._stream_summary(message)
-                if len(by_stream) >= limit:
-                    break
-            if len(batch) < read_limit or len(by_stream) >= limit:
+            message = self._message(event)
+            if message is None or not self._is_visible(event, session):
+                continue
+            by_stream[message.stream_id] = self._stream_summary(message)
+            if len(by_stream) >= limit:
                 break
         streams = sorted(
             by_stream.values(), key=lambda item: item.last_active_at, reverse=True
         )
-        has_more = bool(await self._read_since(store, position, limit=1))
+        has_more = min_position > 1
         return ChatStreamPage(
             streams=tuple(streams),
             next_cursor=self._encode_cursor(
-                position if position != start or cursor else 0
+                max_position if max_position != start or cursor else 0
             ),
             has_more=has_more,
             scanned_count=scanned,
@@ -160,12 +168,13 @@ class ChatQueryService:
         self, stream_id: str, session: SessionRecord
     ) -> ChatStreamSummary:
         latest: ChatMessage | None = None
-        async for event in self._iter_all_events():
+        async for event in self._iter_tail_events():
             if event.stream_id != stream_id or not self._is_visible(event, session):
                 continue
             message = self._message(event)
             if message is not None:
                 latest = message
+                break
         if latest is None:
             raise self._not_found("请求的聊天流不存在。")
         return self._stream_summary(latest)
@@ -179,7 +188,7 @@ class ChatQueryService:
         stream_id: str | None = None,
     ) -> ChatMessage:
         matches: dict[tuple[str, str], ChatMessage] = {}
-        async for event in self._iter_all_events():
+        async for event in self._iter_tail_events():
             if not self._is_visible(event, session):
                 continue
             projected = self._message(event)
@@ -212,7 +221,7 @@ class ChatQueryService:
         receipt_events: list[
             tuple[LifeEvent, Mapping[str, Any], Mapping[str, Any]]
         ] = []
-        async for event in self._iter_all_events():
+        async for event in self._iter_tail_events():
             metadata = self._metadata(event)
             chat = metadata.get("chat")
             if not isinstance(chat, Mapping):
@@ -273,15 +282,23 @@ class ChatQueryService:
         """Resolve one visible stream plus its latest opaque provider identity."""
 
         selected: tuple[ChatStreamSummary, dict[str, Any]] | None = None
-        async for event in self._iter_all_events():
+        async for event in self._iter_tail_events():
             if event.stream_id != stream_id or not self._is_visible(event, session):
                 continue
             message = self._message(event)
             metadata = self._metadata(event)
             identity = metadata.get("provider_identity")
-            if message is None or not isinstance(identity, Mapping):
+            if message is None:
                 continue
-            selected = (self._stream_summary(message), dict(identity))
+            if isinstance(identity, Mapping) and identity:
+                selected = (self._stream_summary(message), dict(identity))
+                break
+            # text 事件没有 metadata.provider_identity，用消息投影里的
+            # provider_identity（来自 reply_target/顶层字段）兜底。
+            projected_identity = message.provider_identity
+            if projected_identity:
+                selected = (self._stream_summary(message), dict(projected_identity))
+                break
         if selected is None:
             raise self._not_found("请求的聊天流不存在。")
         return selected
@@ -297,7 +314,7 @@ class ChatQueryService:
             tuple[str, str],
             tuple[ChatMessage, dict[str, Any], str],
         ] = {}
-        async for event in self._iter_all_events():
+        async for event in self._iter_tail_events():
             if not self._is_visible(event, session):
                 continue
             message = self._message(event)
@@ -305,10 +322,16 @@ class ChatQueryService:
                 continue
             metadata = self._metadata(event)
             identity = metadata.get("provider_identity")
-            if isinstance(identity, Mapping):
+            if isinstance(identity, Mapping) and identity:
                 matches[(message.provider, message.stream_id)] = (
                     message,
                     dict(identity),
+                    str(metadata.get("actor_id") or ""),
+                )
+            elif message.provider_identity:
+                matches[(message.provider, message.stream_id)] = (
+                    message,
+                    dict(message.provider_identity),
                     str(metadata.get("actor_id") or ""),
                 )
         if not matches:
@@ -334,9 +357,26 @@ class ChatQueryService:
             if len(batch) < _SCAN_BATCH:
                 return
 
+    async def _iter_tail_events(
+        self,
+        *,
+        scan: int = _MAX_SCAN_PER_PAGE,
+    ) -> AsyncIterator[LifeEvent]:
+        """从账本尾部向前产出最近事件（新→旧）。
+
+        查询按消息/流定位时，聊天事件总在账本尾部（旧通道 text 与
+        chat.message.* 都集中在尾部），从尾部向前扫一次 ``read_tail``
+        即可命中，避免 ``_iter_all_events`` 从 seq=0 全账本线性扫描
+        （跨远程 MySQL 时每条 500 条分批网络往返，导致 HTTP 超时）。
+        """
+        store = self._require_store()
+        tail = await store.read_tail(limit=max(1, int(scan)))
+        for event in reversed(tail):
+            yield event
+
     async def _read_since(
         self,
-        store: RawEventStore,
+        store: LifeEventLedgerReader,
         position: int,
         *,
         limit: int,
@@ -350,6 +390,10 @@ class ChatQueryService:
         if event.event_type not in _MESSAGE_FACTS:
             return None
         metadata = self._metadata(event)
+        # 旧通道 text 事件没有 metadata.chat 结构：event_type=="text" 且
+        # channel=="chat" 时从顶层字段 + metadata + reply_target 投影。
+        if event.event_type == "text":
+            return self._legacy_text_message(event, metadata)
         chat = metadata.get("chat")
         provider_identity = metadata.get("provider_identity")
         if not isinstance(chat, Mapping) or not isinstance(provider_identity, Mapping):
@@ -389,6 +433,70 @@ class ChatQueryService:
             attachments=attachments,
             provider_identity=dict(provider_identity),
             detail_url=f"/api/v1/chat/messages/{message_id}",
+        )
+
+    def _legacy_text_message(
+        self,
+        event: LifeEvent,
+        metadata: Mapping[str, Any],
+    ) -> ChatMessage | None:
+        """投影旧通道 ``text``/``channel=chat`` 事件为聊天消息。
+
+        这类事件来自 message_collector 归一化的入站文本（含 inject 注入），
+        结构：顶层 ``stream_id``/``content``/``reply_target``，
+        ``metadata.sender``/``sender_id``/``chat_type``，``source`` 为平台。
+        """
+        if event.channel != "chat":
+            return None
+        stream_id = str(event.stream_id or "").strip()
+        content = str(event.content or "").strip()
+        if not stream_id or not content:
+            return None
+        sender_id = str(metadata.get("sender_id") or "").strip()
+        sender_name = str(metadata.get("sender") or "").strip()
+        platform = str(event.source or "").strip() or "unknown"
+        chat_type = str(metadata.get("chat_type") or "").strip() or "private"
+        message_id = str(event.event_id or "").strip()
+        reply_target = (
+            event.reply_target if isinstance(event.reply_target, Mapping) else {}
+        )
+        provider_identity: dict[str, Any] = {}
+        for key in (
+            "adapter_signature",
+            "message_id",
+            "feishu_chat_id",
+            "feishu_open_id",
+            "open_id",
+            "chat_id",
+            "group_id",
+            "target_user_id",
+            "user_id",
+            "provider",
+        ):
+            value = reply_target.get(key) if key in reply_target else metadata.get(key)
+            if value not in {None, ""}:
+                provider_identity[key] = str(value)
+        if "provider" not in provider_identity:
+            provider_identity["provider"] = platform
+        return ChatMessage(
+            message_id=message_id or f"legacy-{event.occurrence_id or event.sequence}",
+            stream_id=stream_id,
+            provider=platform,
+            chat_type=chat_type,
+            direction="received",  # type: ignore[arg-type]
+            message_type="text",
+            sender=ChatSender(
+                id=sender_id or sender_name or "unknown",
+                name=sender_name or sender_id or "unknown",
+                card_name=None,
+                role=None,
+            ),
+            occurred_at=self._parse_time(event.timestamp),
+            reply_to=None,
+            parts=(ChatPart(type="text", text=content),),
+            attachments=(),
+            provider_identity=provider_identity,
+            detail_url=(f"/api/v1/chat/messages/{message_id}" if message_id else None),
         )
 
     @classmethod
@@ -464,7 +572,7 @@ class ChatQueryService:
     def _metadata(event: LifeEvent) -> Mapping[str, Any]:
         return event.metadata if isinstance(event.metadata, Mapping) else {}
 
-    def _require_store(self) -> RawEventStore:
+    def _require_store(self) -> LifeEventLedgerReader:
         store = self._store_provider()
         if store is None:
             raise ChatQueryFailure(

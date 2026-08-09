@@ -21,6 +21,7 @@ from .auth_store import AuthStore
 from .chat import ChatQueryService, LedgerChatTargetResolver
 from .events import EventQueryService
 from .foundation import FoundationProjection
+from .inbound_messages import InboundInjector
 from .media_objects import (
     ManagedMediaService,
     MediaObjectStore,
@@ -181,6 +182,9 @@ def mount_api_v1(
             admin=admin_store,
             commands=command_store,
         )
+        inbound_injector: InboundInjector | None = None
+        if chat_queries is not None:
+            inbound_injector = InboundInjector(queries=chat_queries)
         context = APIContext(
             store=store,
             codec=codec,
@@ -203,6 +207,7 @@ def mount_api_v1(
             command_store=command_store,
             command_dispatcher=command_dispatcher,
             chat_commands_enabled=chat_command_service is not None,
+            inbound_injector=inbound_injector,
             livestream=livestream_provider,
             voice_calls=voice_call_provider,
             tabletop=tabletop_provider,

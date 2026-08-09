@@ -387,7 +387,10 @@ async def test_command_target_resolver_rejects_expired_or_reduced_authorization(
     if invalid_state == "expired":
         auth._connection.execute(
             "UPDATE api_sessions SET access_expires_at = ? WHERE session_id = ?",
-            ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), session.session_id),
+            (
+                (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+                session.session_id,
+            ),
         )
     else:
         auth._connection.execute(
@@ -519,3 +522,137 @@ def test_chat_http_scope_resource_hiding_and_openapi(tmp_path: Path) -> None:
         }.issubset(operations)
     finally:
         auth.close()
+
+
+def _legacy_text_event(
+    sequence: int,
+    *,
+    event_id: str,
+    stream_id: str,
+    content: str,
+    source: str = "feishu",
+    chat_type: str = "private",
+    sender: str = "独立应用",
+    sender_id: str = "api_user",
+) -> LifeEvent:
+    """构造旧通道 ``text``/``channel=chat`` 归一化事件（同 inject 消息形态）。"""
+    return LifeEvent(
+        event_id=event_id,
+        sequence=sequence,
+        timestamp="2026-08-09T13:00:00+00:00",
+        source=source,
+        channel="chat",
+        event_type="text",
+        content=content,
+        stream_id=stream_id,
+        reply_target={
+            "stream_id": stream_id,
+            "source": source,
+            "chat_type": chat_type,
+            "sender": sender,
+            "sender_id": sender_id,
+        },
+        source_instance_id="chat_global",
+        occurrence_id=f"occ-{event_id}",
+        metadata={
+            "actor_id": sender_id,
+            "visibility": {"scope": "private", "audience": []},
+            "chat_type": chat_type,
+            "sender": sender,
+            "sender_id": sender_id,
+            "content_type": "text",
+            "legacy_event_type": "message",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_text_message_projectable_through_tail(tmp_path: Path) -> None:
+    """旧通道 text 事件能经尾部优先投影为聊天消息，供独立应用查询。"""
+    store = RawEventStore(tmp_path / "life")
+    await store.append(
+        _chat_event(
+            "modern",
+            message_id="modern-msg",
+            stream_id="feishu:private:modern",
+            provider="feishu",
+        )
+    )
+    await store.append(
+        _legacy_text_event(
+            2,
+            event_id="inject_abc123",
+            stream_id="6a994480bc44405a7f0311bc37b25b33a5dffdaf1a47de679cf630271d840a65",
+            content="来自独立应用的测试消息",
+            source="feishu",
+        )
+    )
+    codec = SignedValueCodec("c" * 48)
+    service = ChatQueryService(codec=codec, store_provider=lambda: store)
+    reader = _session(actor_id="reader", grants=("*",))
+
+    # 无 cursor：尾部优先应同时捞出 chat.message.* 与 text 事件
+    page = await service.query_messages(
+        stream_id=None,
+        cursor=None,
+        limit=10,
+        session=reader,
+    )
+    message_ids = {item.message_id for item in page.messages}
+    assert "modern-msg" in message_ids
+    assert "inject_abc123" in message_ids
+
+    # 按流定位：get_stream 尾部优先命中 text 事件投影的流
+    stream = await service.get_stream(
+        "6a994480bc44405a7f0311bc37b25b33a5dffdaf1a47de679cf630271d840a65",
+        reader,
+    )
+    assert stream.stream_id == (
+        "6a994480bc44405a7f0311bc37b25b33a5dffdaf1a47de679cf630271d840a65"
+    )
+    assert stream.provider == "feishu"
+    assert stream.last_message_text == "来自独立应用的测试消息"
+
+    # 按消息定位：get_message 尾部优先命中 text 事件消息
+    message = await service.get_message("inject_abc123", reader)
+    assert message.provider == "feishu"
+    assert message.chat_type == "private"
+    assert message.direction == "received"
+    assert message.parts[0].text == "来自独立应用的测试消息"
+
+
+@pytest.mark.asyncio
+async def test_find_stream_target_tail_first_uses_text_projection(
+    tmp_path: Path,
+) -> None:
+    """find_stream_target 尾部优先，text 事件用其投影的 provider_identity 兜底。"""
+    store = RawEventStore(tmp_path / "life")
+    # 先写一个无关旧事件，再写 text 聊天事件，确认不依赖从头扫描
+    await store.append(
+        _chat_event(
+            "early",
+            message_id="early-msg",
+            stream_id="feishu:private:other",
+            provider="feishu",
+        )
+    )
+    await store.append(
+        _legacy_text_event(
+            2,
+            event_id="inject_xyz789",
+            stream_id="feishu:private:target",
+            content="嗨",
+            source="feishu",
+        )
+    )
+    codec = SignedValueCodec("c" * 48)
+    service = ChatQueryService(codec=codec, store_provider=lambda: store)
+    reader = _session(actor_id="reader", grants=("*",))
+
+    summary, identity = await service.find_stream_target(
+        "feishu:private:target", reader
+    )
+    assert summary.stream_id == "feishu:private:target"
+    assert summary.provider == "feishu"
+    # text 事件无 metadata.provider_identity，用投影兜底（含 provider）
+    assert identity.get("provider") == "feishu"

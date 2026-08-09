@@ -186,6 +186,7 @@ GET /api/v1/chat/streams/{stream_id}/members
 GET /api/v1/chat/streams/{stream_id}/announcements
 GET /api/v1/chat/streams/{stream_id}/files
 POST /api/v1/chat/messages:send
+POST /api/v1/chat/messages:inject
 POST /api/v1/chat/messages/{id}:reply
 POST /api/v1/chat/messages/{id}:edit
 POST /api/v1/chat/messages/{id}:recall
