@@ -500,6 +500,8 @@ python scripts/migrate_life_attention_threads.py \
 - 连接恢复且 claim 仍有效时允许正常续租；若已过期，下一次数据库校验必须给出确证失租并让该领域停写；
 - 当前实现禁止在运行中自动重新 acquire 已失去的 singleton claim。恢复动作需要新的受控启动周期，且 Elysium 仍只能由用户手动启动。
 
-Learning 未取得 `life_engine.learning/selected_persistence` claim 时，只允许 event-only 能力；projector/maintenance 必须 disabled，禁止回退到 `.life_learning` 或另一套 local projection。该门由 Learning 领域集成实现并通过健康状态暴露。
+Learning 未取得 `life_engine.learning/selected_persistence` claim 时，只允许 event-only 能力；projector/maintenance 必须 disabled，禁止回退到 `.life_learning` 或另一套 local projection。当前实现使用注入同一 runtime 的 `LearningEventOnlyRecorder`，只追加 `reflection.enqueued` 且固定 `projections=[]`；prompt 中不暴露陈旧洞察、技能、进度或主体复盘机会。健康状态必须显示 `mode=event_only`、`projector_owner=false`、`event_append_available` 及失租原因。
 
-本节的平台回归位于 `test/plugins/life_engine/test_runtime_state_storage_contract.py`，覆盖瞬时连接异常原样传播、Lost/Conflict 结构化作用域、精确当前 claim 本地失效、旧快照拒绝与取消传播。该合同不需要 schema migration，不修改正式数据，也不需要重启现有实例才能落库；消费端代码生效仍需用户下一次手动启动 Elysium。
+本节的平台回归位于 `test/plugins/life_engine/test_runtime_state_storage_contract.py`，消费端回归位于 `test/plugins/life_engine/test_selected_presence_world_service.py` 与 `test/plugins/life_engine/test_learning_event_only.py`。它们覆盖瞬时连接异常原样传播与恢复、Lost/Conflict 结构化作用域、精确当前 claim 本地失效、其他 scope 不受影响、取消传播、event-only 不建立本地投影，以及聊天经历在降级期间仍只追加不可变事件。该合同不需要 schema migration，不修改正式数据，也不会热修改当前实例；消费端代码生效仍需用户下一次手动启动 Elysium。
+
+上线后的验收不能只看“进程启动成功”。应确认：`authority_renewal` 至少完成一次成功续租；Learning 为预期 owner 时显示 `mode=projector/projector_owner=true`，非 owner 时明确为 `event_only`；制造一次隔离环境连接瞬断后能进入 `renewal_unknown` 并恢复，期间 managed claim 未被本地清除；若数据库明确拒绝 Learning claim，则只有 Learning 转为 event-only，其他 storage 组件继续健康。不得通过删除 claim、手工推进 projection revision 或重写事件来制造全绿。

@@ -110,6 +110,8 @@ class LearningScheduler:
     集成入口：由 life_engine 心跳或事件触发调用。
     """
 
+    projector_owner = True
+
     def __init__(
         self,
         *,
@@ -309,6 +311,10 @@ class LearningScheduler:
         self._worker_last_started_at = ""
         self._worker_last_completed_at = ""
         self._worker_last_error_type = ""
+        self._projector_quiesced = False
+        self._projector_quiesced_at = ""
+        self._projector_quiesce_reason = ""
+        self._projector_quiesce_error_type = ""
 
     async def initialize(self) -> None:
         """Restore bounded maintenance health without blocking the event loop."""
@@ -329,8 +335,23 @@ class LearningScheduler:
         """Flush learning consumers without closing the injected runtime."""
 
         self._maintenance_wakeup.set()
-        if self._selected_persistence is not None:
+        if self._selected_persistence is not None and not self._projector_quiesced:
             await self._selected_persistence.close()
+
+    def quiesce_projector(self, *, reason: str, error_type: str) -> None:
+        """Stop derived writes after the exact singleton owner is lost.
+
+        Immutable enqueue events use a separate unclaimed store and remain
+        appendable. This transition never flushes, rebases, reacquires, or
+        releases the lost claim; the service and storage runtime own fencing.
+        """
+
+        self._projector_quiesced = True
+        self._projector_quiesced_at = _now_iso()
+        self._projector_quiesce_reason = str(reason).strip()
+        self._projector_quiesce_error_type = str(error_type).strip()
+        self._pending_subject_review_offer = None
+        self._maintenance_wakeup.set()
 
     def request_maintenance(self) -> None:
         """Wake the independent learning worker without awaiting LLM work."""
@@ -355,6 +376,8 @@ class LearningScheduler:
         self.request_maintenance()
         try:
             while not stop_event.is_set():
+                if self._projector_quiesced:
+                    return
                 self._maintenance_wakeup.clear()
                 self._worker_last_started_at = _now_iso()
                 try:
@@ -587,6 +610,8 @@ class LearningScheduler:
             source_event_ids=source_event_ids,
             actor_consciousness_instance_id=actor_consciousness_instance_id,
         )
+        if self._projector_quiesced:
+            return None
         if self._learning_event_store is not None:
             await self._ingest_reflection_events()
         result = await self._run_pending_reflection()
@@ -1437,6 +1462,8 @@ class LearningScheduler:
     async def get_subject_review_prompt(self) -> str:
         """Render a bounded invitation; silence and no-change remain valid choices."""
 
+        if self._projector_quiesced:
+            return ""
         snapshot = await self.get_subject_review_snapshot(mark_offered=False)
         due = [item for item in snapshot["documents"] if item.get("due")]
         if not due:
@@ -2188,6 +2215,8 @@ class LearningScheduler:
 
         由 life_engine 心跳周期调用（低频，不必每次心跳都调用）。
         """
+        if self._projector_quiesced:
+            return
         async with self._maintenance_lock:
             await self._ingest_reflection_events()
             run_id = f"learning_heartbeat_{uuid4().hex}"
@@ -2968,6 +2997,30 @@ class LearningScheduler:
 
     def get_state(self) -> dict[str, Any]:
         """获取学习系统当前状态。"""
+        if self._projector_quiesced:
+            return {
+                "status": "degraded",
+                "mode": "event_only",
+                "projector_owner": False,
+                "event_append_available": self._learning_event_store is not None,
+                "reason": self._projector_quiesce_reason,
+                "error_type": self._projector_quiesce_error_type,
+                "quiesced_at": self._projector_quiesced_at,
+                "reflection_available": False,
+                "maintenance": {
+                    "status": "disabled",
+                    "reason": "singleton projector ownership was lost",
+                },
+                "worker": {"status": "disabled", "running": False},
+                "selected_persistence": {
+                    "status": "disabled",
+                    "projector_owner": False,
+                },
+                "prompt_projections": {
+                    "status": "disabled",
+                    "reason": "stale projections are not exposed after owner loss",
+                },
+            }
         stats = self.store.get_stats()
         state = self.store.load_state()
         manifest = self.store.load_knowledge_manifest()
@@ -3014,6 +3067,9 @@ class LearningScheduler:
             learning_status = "healthy"
         return {
             "status": learning_status,
+            "mode": "projector",
+            "projector_owner": True,
+            "event_append_available": self._learning_event_store is not None,
             "insights": stats,
             "knowledge_version": manifest.get("current_version", 0),
             "last_audit_at": state.get("last_audit_at", ""),
@@ -3044,14 +3100,20 @@ class LearningScheduler:
 
     def get_knowledge_for_prompt(self, max_chars: int = 0) -> str:
         """获取自我认知文档（供 prompt 注入）。"""
+        if self._projector_quiesced:
+            return ""
         return self.compressor.get_knowledge_for_prompt(max_chars=max_chars)
 
     def get_skill_catalog_for_prompt(self, max_chars: int = 0) -> str:
         """获取技能目录文本（L1，供 prompt 注入）。"""
+        if self._projector_quiesced:
+            return ""
         return self.skill_store.get_catalog_text(max_chars=max_chars)
 
     def get_progress_for_prompt(self) -> str:
         """获取学习进展（供 prompt 注入）。"""
+        if self._projector_quiesced:
+            return ""
         return self.metrics.format_progress_for_prompt()
 
 

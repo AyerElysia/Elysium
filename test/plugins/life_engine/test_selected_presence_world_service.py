@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 import plugins.life_engine.service.core as core_module
 from plugins.life_engine.attention_threads import (
@@ -36,12 +37,17 @@ from plugins.life_engine.service.perception_gateway import (
     PreparedPerception,
 )
 from plugins.life_engine.service.presence_store import PresenceRevisionConflict
+from plugins.life_engine.storage.contracts import ManagedSingletonWriterClaimLost
 from plugins.life_engine.storage.models import BackendKind
 from plugins.life_engine.storage.multi_writer_protocol import (
     MultiWriterProtocolError,
     MultiWriterRuntimeState,
 )
-from plugins.life_engine.storage.writer_claims import SingletonWriterClaimConflict
+from plugins.life_engine.storage.writer_claims import (
+    SingletonWriterClaim,
+    SingletonWriterClaimConflict,
+    SingletonWriterClaimLost,
+)
 from src.core.config.core_config import CoreConfig
 from test.plugins.life_engine.presence_world_fakes import build_fake_stores
 
@@ -135,6 +141,7 @@ class _FakeRuntime:
         self.renew_error: Exception | None = None
         self.claim_calls: list[dict[str, Any]] = []
         self.learning_open_writer_claims: list[Any | None] = []
+        self.invalidated_claims: list[Any] = []
 
     async def acquire_singleton_writer(self, **kwargs: Any) -> Any:
         self.claim_calls.append(dict(kwargs))
@@ -159,6 +166,10 @@ class _FakeRuntime:
 
     def invalidate_writer(self) -> None:
         self.invalidated = True
+
+    def invalidate_managed_singleton_writer(self, claim: Any) -> bool:
+        self.invalidated_claims.append(claim)
+        return True
 
     async def health(self) -> dict[str, Any]:
         return {
@@ -692,6 +703,177 @@ async def test_storage_authority_loop_invalidates_writer_on_renew_failure(
     assert service.health()["storage_runtime"]["status"] == "failed"
 
 
+async def test_storage_authority_loop_retries_connectivity_unknown_without_invalidation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+    runtime = _FakeRuntime(BackendKind.MYSQL)
+    service._storage_runtime = runtime
+    service._stop_event = asyncio.Event()
+    service._storage_factory_settings = replace(
+        service._storage_factory_settings,
+        authority_lease_seconds=3,
+        authority_renew_interval_seconds=0,
+    )
+    attempts = 0
+
+    async def _renew(*, lease_seconds: int) -> None:
+        nonlocal attempts
+        runtime.renew_calls.append(lease_seconds)
+        attempts += 1
+        if attempts == 1:
+            raise OperationalError("SELECT 1", {}, ConnectionError("lost"))
+        service._stop_event.set()
+
+    runtime.renew_authority = _renew  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        core_module,
+        "_storage_renewal_backoff_seconds",
+        lambda *_args, **_kwargs: 0.0,
+    )
+
+    await service._renew_storage_authority_loop()
+
+    assert runtime.renew_calls == [3, 3]
+    assert runtime.invalidated is False
+    renewal = service.health()["storage_runtime"]["authority_renewal"]
+    assert renewal["status"] == "healthy"
+    assert renewal["consecutive_failures"] == 0
+    assert renewal["last_success_at"]
+
+
+async def test_storage_authority_loop_exposes_connectivity_unknown_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+    runtime = _FakeRuntime(BackendKind.MYSQL)
+    service._storage_runtime = runtime
+    service._stop_event = asyncio.Event()
+    service._storage_factory_settings = replace(
+        service._storage_factory_settings,
+        authority_lease_seconds=3,
+        authority_renew_interval_seconds=0,
+    )
+
+    async def _renew(*, lease_seconds: int) -> None:
+        runtime.renew_calls.append(lease_seconds)
+        service._stop_event.set()
+        raise OperationalError("SELECT 1", {}, ConnectionError("lost"))
+
+    runtime.renew_authority = _renew  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        core_module,
+        "_storage_renewal_backoff_seconds",
+        lambda *_args, **_kwargs: 4.25,
+    )
+
+    await service._renew_storage_authority_loop()
+
+    health = service.health()["storage_runtime"]
+    assert runtime.invalidated is False
+    assert health["status"] == "degraded"
+    assert health["authority_renewal"]["reason"] == "renewal_unknown"
+    assert health["authority_renewal"]["error_type"] == "OperationalError"
+    assert health["authority_renewal"]["retry_in_seconds"] == 4.25
+    assert health["authority_renewal"]["next_retry_at"]
+
+
+async def test_storage_authority_loop_propagates_cancellation_without_invalidation(
+    tmp_path: Path,
+) -> None:
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+    runtime = _FakeRuntime(BackendKind.MYSQL)
+    service._storage_runtime = runtime
+    service._stop_event = asyncio.Event()
+    service._storage_factory_settings = replace(
+        service._storage_factory_settings,
+        authority_lease_seconds=3,
+        authority_renew_interval_seconds=0,
+    )
+
+    async def _renew(*, lease_seconds: int) -> None:
+        runtime.renew_calls.append(lease_seconds)
+        raise asyncio.CancelledError
+
+    runtime.renew_authority = _renew  # type: ignore[method-assign]
+
+    with pytest.raises(asyncio.CancelledError):
+        await service._renew_storage_authority_loop()
+
+    assert runtime.invalidated is False
+    assert runtime.invalidated_claims == []
+
+
+async def test_learning_claim_loss_quiesces_only_projector_and_keeps_events(
+    tmp_path: Path,
+) -> None:
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+    runtime = _FakeRuntime(BackendKind.MYSQL)
+    service._storage_runtime = runtime
+    service._stop_event = asyncio.Event()
+    service._storage_factory_settings = replace(
+        service._storage_factory_settings,
+        authority_lease_seconds=3,
+        authority_renew_interval_seconds=0,
+    )
+    claim = SingletonWriterClaim(
+        generation_id="generation-a",
+        namespace="life_engine.learning",
+        state_key="selected_persistence",
+        owner_instance_id="writer-a",
+        lease_epoch=7,
+        lease_until="2026-08-11T00:00:00+00:00",
+        fencing_token="opaque",
+    )
+    loss = ManagedSingletonWriterClaimLost(
+        claim,
+        SingletonWriterClaimLost("expired"),
+    )
+    attempts = 0
+
+    async def _renew(*, lease_seconds: int) -> None:
+        nonlocal attempts
+        runtime.renew_calls.append(lease_seconds)
+        attempts += 1
+        if attempts == 1:
+            raise loss
+        service._stop_event.set()
+
+    class _OwnedScheduler:
+        projector_owner = True
+
+        def __init__(self) -> None:
+            self.quiesced = False
+
+        def quiesce_projector(self, **_kwargs: Any) -> None:
+            self.quiesced = True
+
+    owned_scheduler = _OwnedScheduler()
+    event_store = _FakeLearningStore()
+    runtime.renew_authority = _renew  # type: ignore[method-assign]
+    service._learning_writer_claim = claim
+    service._learning_event_store = event_store
+    service._learning_stores = SimpleNamespace(store=event_store)
+    service._learning_scheduler = owned_scheduler
+
+    await service._renew_storage_authority_loop()
+
+    assert runtime.invalidated is False
+    assert runtime.invalidated_claims == [claim]
+    assert owned_scheduler.quiesced is True
+    assert service._learning_writer_claim is None
+    assert service._learning_stores is None
+    assert service._learning_event_store is event_store
+    assert service._learning_scheduler.projector_owner is False
+    assert not hasattr(service._learning_scheduler, "store")
+    learning_health = service.health()["storage_runtime"]["learning"]
+    assert learning_health["status"] == "degraded"
+    assert learning_health["projector_owner"] is False
+    assert learning_health["event_append_available"] is True
+
+
 async def test_selected_service_close_releases_runtime_after_flush_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1153,6 +1335,10 @@ async def test_selected_storage_learning_claim_degrades_when_other_owner_holds_i
     # Immutable evidence handle stays attached so this instance keeps
     # appending learning events; the projector handle is dropped.
     assert service._learning_event_store is not None
+    event_only = service._build_learning_runtime(workspace_path=tmp_path)
+    assert event_only.projector_owner is False
+    assert not hasattr(event_only, "store")
+    assert event_only.get_state()["event_append_available"] is True
     # The fake records the unclaimed handle only (writer_claim=None).
     assert runtime.learning_open_writer_claims == [None]
     # The runtime-context claim (legacy path) was acquired successfully and is

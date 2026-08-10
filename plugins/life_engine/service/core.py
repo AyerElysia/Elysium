@@ -20,6 +20,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+from sqlalchemy.exc import (
+    DBAPIError,
+    DisconnectionError,
+    InterfaceError,
+    OperationalError,
+    TimeoutError as SQLAlchemyTimeoutError,
+)
+
 from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import BaseService
@@ -28,6 +36,47 @@ from src.core.models.message import Message, MessageType
 from src.kernel.concurrency import get_task_manager
 from src.kernel.llm import LLMPayload, ROLE, Text, ToolRegistry, ToolResult
 from src.kernel.scheduler import get_unified_scheduler, TriggerType
+
+_STORAGE_RENEWAL_BACKOFF_BASE_SECONDS = 1.0
+_STORAGE_RENEWAL_BACKOFF_MAX_SECONDS = 30.0
+
+
+def _storage_renewal_backoff_seconds(
+    failure_count: int,
+    *,
+    owner_instance_id: str,
+) -> float:
+    """Return bounded deterministic jitter for one renewal owner."""
+
+    exponent = min(max(0, int(failure_count) - 1), 8)
+    base = min(
+        _STORAGE_RENEWAL_BACKOFF_MAX_SECONDS,
+        _STORAGE_RENEWAL_BACKOFF_BASE_SECONDS * (2**exponent),
+    )
+    digest = hashlib.sha256(
+        f"{owner_instance_id}:{failure_count}".encode()
+    ).digest()
+    fraction = int.from_bytes(digest[:2], "big") / 65535
+    jittered = base * (0.8 + (0.4 * fraction))
+    return min(_STORAGE_RENEWAL_BACKOFF_MAX_SECONDS, max(0.1, jittered))
+
+
+def _is_storage_renewal_connectivity_unknown(exc: BaseException) -> bool:
+    """Classify only transport/pool failures as an unknown renewal outcome."""
+
+    if isinstance(
+        exc,
+        (
+            OperationalError,
+            InterfaceError,
+            DisconnectionError,
+            SQLAlchemyTimeoutError,
+            TimeoutError,
+            ConnectionError,
+        ),
+    ):
+        return True
+    return isinstance(exc, DBAPIError) and bool(exc.connection_invalidated)
 
 if TYPE_CHECKING:
     from ..attention_threads import (
@@ -648,6 +697,28 @@ class LifeEngineService(BaseService):
         self._runtime_state_store: Any | None = None
         self._runtime_context_writer_claim: Any | None = None
         self._learning_writer_claim: Any | None = None
+        self._storage_renewal_health: dict[str, Any] = {
+            "status": (
+                "initializing" if self._selectable_storage_enabled else "disabled"
+            ),
+            "last_success_at": "",
+            "next_retry_at": "",
+            "error_type": "",
+            "consecutive_failures": 0,
+        }
+        self._lost_singleton_health: dict[tuple[str, str], dict[str, Any]] = {}
+        self._learning_storage_health: dict[str, Any] = {
+            "status": (
+                "initializing" if self._selectable_storage_enabled else "disabled"
+            ),
+            "projector_owner": False,
+            "event_append_available": False,
+            "reason": (
+                "selected learning storage has not started"
+                if self._selectable_storage_enabled
+                else "selected storage is disabled"
+            ),
+        }
         self._storage_writer_instance_id = (
             f"{self._storage_factory_settings.authority_owner_id}:"
             f"pid-{os.getpid()}:{uuid4().hex[:16]}"
@@ -1254,6 +1325,23 @@ class LifeEngineService(BaseService):
         self._runtime_state_store = runtime_state_store
         self._runtime_context_writer_claim = runtime_context_writer_claim
         self._learning_writer_claim = learning_writer_claim
+        self._storage_renewal_health = {
+            "status": "healthy",
+            "last_success_at": "",
+            "next_retry_at": "",
+            "error_type": "",
+            "consecutive_failures": 0,
+        }
+        self._learning_storage_health = {
+            "status": "healthy" if learning_writer_claim is not None else "degraded",
+            "projector_owner": learning_writer_claim is not None,
+            "event_append_available": learning_event_store is not None,
+            "reason": (
+                "singleton learning projector is owned by this instance"
+                if learning_writer_claim is not None
+                else "immutable events only; singleton projector is owned elsewhere"
+            ),
+        }
         # MySQL is the only runtime data source: subject heads remain remote and
         # no filesystem observer/projector is attached.
         self._subject_workspace_observer = None
@@ -1265,9 +1353,13 @@ class LifeEngineService(BaseService):
         if multi_writer_enabled:
             await self._attach_multi_writer_bridge(runtime)
         self._storage_health_cache = {
-            "status": "healthy",
+            "status": (
+                "healthy" if learning_writer_claim is not None else "degraded"
+            ),
             "backend": self._storage_factory_settings.authoritative_backend.value,
             "reason": "selected storage startup probes completed; full health is on demand",
+            "authority_renewal": dict(self._storage_renewal_health),
+            "learning": dict(self._learning_storage_health),
         }
 
     async def _attach_multi_writer_bridge(self, runtime: Any) -> None:
@@ -1330,63 +1422,187 @@ class LifeEngineService(BaseService):
             f"owner={identity.short_owner}, node={bridge.node_id}"
         )
 
-    async def _renew_storage_authority_loop(self) -> None:
-        """Keep the selected writer lease current and fail closed on loss."""
+    def _new_event_only_learning_recorder(
+        self,
+        *,
+        reason: str,
+        error_type: str = "",
+    ) -> Any:
+        """Build the canonical immutable-event-only Learning consumer."""
 
-        interval = self._storage_factory_settings.authority_renew_interval_seconds
-        lease_seconds = self._storage_factory_settings.authority_lease_seconds
-        while self._stop_event is not None and not self._stop_event.is_set():
-            try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
-                return
-            except asyncio.TimeoutError:
-                pass
+        if self._learning_event_store is None:
+            raise RuntimeError("LearningEventStoreUnavailable")
+        from ..learning.event_only import LearningEventOnlyRecorder
 
-            runtime = self._storage_runtime
-            if runtime is None:
-                return
-            try:
-                await runtime.renew_authority(lease_seconds=lease_seconds)
-                await self.refresh_storage_health()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - lease loss must fail closed
-                runtime.invalidate_writer()
-                self._storage_health_cache = {
-                    "status": "failed",
-                    "backend": self._storage_factory_settings.authoritative_backend.value,
-                    "reason": f"authority lease renewal failed: {type(exc).__name__}",
-                }
-                logger.error(
-                    "life_engine storage authority renewal failed; writer disabled",
-                    exc_info=True,
-                )
-                return
-
-    def _start_storage_authority_renewal(self) -> None:
-        """Start the one service-owned renewal task after runtime acquisition."""
-
-        if not self._selectable_storage_enabled:
-            return
-        if self._stop_event is None:
-            raise RuntimeError("StorageAuthorityRenewalStopEventNotInitialized")
-        if self._storage_authority_renew_task_id is not None:
-            return
-        task = get_task_manager().create_task(
-            self._renew_storage_authority_loop(),
-            name="life_engine_storage_authority_renewal",
-            daemon=True,
+        return LearningEventOnlyRecorder(
+            self._learning_event_store,
+            writer_instance_id=self._storage_writer_instance_id,
+            reason=reason,
+            error_type=error_type,
         )
-        self._storage_authority_renew_task_id = task.task_id
+
+    def _build_learning_runtime(self, **scheduler_kwargs: Any) -> Any:
+        """Choose one selected projector or the immutable event-only consumer."""
+
+        if self._selectable_storage_enabled and self._learning_stores is None:
+            return self._new_event_only_learning_recorder(
+                reason="immutable events only; singleton projector is not owned",
+                error_type="SingletonWriterClaimConflict",
+            )
+        from ..learning.scheduler import LearningScheduler
+
+        return LearningScheduler(**scheduler_kwargs)
+
+    def _cache_storage_renewal_state(
+        self,
+        *,
+        status: str,
+        reason: str,
+    ) -> None:
+        cache = dict(self._storage_health_cache)
+        cache["status"] = status
+        cache["backend"] = (
+            self._storage_factory_settings.authoritative_backend.value
+        )
+        cache["reason"] = reason
+        cache["authority_renewal"] = dict(self._storage_renewal_health)
+        cache["learning"] = dict(self._learning_storage_health)
+        if self._lost_singleton_health:
+            cache["lost_singletons"] = [
+                dict(item)
+                for _, item in sorted(self._lost_singleton_health.items())
+            ]
+        self._storage_health_cache = cache
+
+    async def _quiesce_learning_projector(
+        self,
+        *,
+        reason: str,
+        error_type: str,
+    ) -> None:
+        """Stop derived Learning work and retain immutable event intake."""
+
+        scheduler = self._learning_scheduler
+        quiesce = getattr(scheduler, "quiesce_projector", None)
+        if callable(quiesce):
+            quiesce(reason=reason, error_type=error_type)
+
+        task_id = self._learning_maintenance_task_id
+        if task_id is not None:
+            get_task_manager().cancel_task(task_id)
+            await self._await_managed_task(task_id, timeout=1.0)
+            self._learning_maintenance_task_id = None
+
+        recorder = self._new_event_only_learning_recorder(
+            reason=reason,
+            error_type=error_type,
+        )
+        await recorder.initialize()
+        self._learning_scheduler = recorder
+        self._learning_stores = None
+        self._learning_writer_claim = None
+        self._learning_storage_health = {
+            "status": "degraded",
+            "projector_owner": False,
+            "event_append_available": True,
+            "reason": reason,
+            "error_type": error_type,
+        }
+
+    async def _handle_managed_singleton_loss(self, exc: Any) -> bool:
+        """Detach only the exact confirmed-lost singleton domain."""
+
+        from ..storage.learning_contracts import (
+            LEARNING_WRITER_CLAIM_NAMESPACE,
+            LEARNING_WRITER_CLAIM_STATE_KEY,
+        )
+
+        runtime = self._storage_runtime
+        if runtime is None:
+            return False
+        claim = exc.claim
+        removed = runtime.invalidate_managed_singleton_writer(claim)
+        key = (str(exc.namespace), str(exc.state_key))
+        domain_status = "degraded" if key == (
+            LEARNING_WRITER_CLAIM_NAMESPACE,
+            LEARNING_WRITER_CLAIM_STATE_KEY,
+        ) else "failed"
+        self._lost_singleton_health[key] = {
+            "status": domain_status,
+            "namespace": key[0],
+            "state_key": key[1],
+            "generation_id": str(exc.generation_id),
+            "owner_instance_id": str(exc.owner_instance_id),
+            "lease_epoch": int(exc.lease_epoch),
+            "error_type": str(exc.failure_type),
+            "local_claim_invalidated": bool(removed),
+        }
+        if not removed:
+            self._cache_storage_renewal_state(
+                status="failed",
+                reason="managed singleton loss did not match the local snapshot",
+            )
+            return False
+        if key == (
+            LEARNING_WRITER_CLAIM_NAMESPACE,
+            LEARNING_WRITER_CLAIM_STATE_KEY,
+        ):
+            await self._quiesce_learning_projector(
+                reason="learning singleton writer lease was lost",
+                error_type=str(exc.failure_type),
+            )
+        elif key == ("life_engine.runtime_context", "global"):
+            self._runtime_context_writer_claim = None
+        return True
+
+    def _fail_storage_authority(self, exc: BaseException) -> None:
+        runtime = self._storage_runtime
+        if runtime is not None:
+            runtime.invalidate_writer()
+        self._storage_renewal_health = {
+            "status": "failed",
+            "last_success_at": self._storage_renewal_health.get(
+                "last_success_at", ""
+            ),
+            "next_retry_at": "",
+            "error_type": type(exc).__name__,
+            "consecutive_failures": int(
+                self._storage_renewal_health.get("consecutive_failures", 0) or 0
+            )
+            + 1,
+        }
+        self._cache_storage_renewal_state(
+            status="failed",
+            reason=f"authority lease renewal failed: {type(exc).__name__}",
+        )
+        logger.error(
+            "life_engine storage authority was conclusively lost; writer disabled",
+            exc_info=True,
+        )  # noqa: G201 - project Logger has no exception()
 
     async def _renew_storage_authority_loop(self) -> None:
-        """Keep the selected writer lease current and fail closed on loss."""
+        """Renew authority without turning connectivity unknown into lease loss."""
 
-        interval = self._storage_factory_settings.authority_renew_interval_seconds
+        from ..storage.authority import (
+            AuthorityConflict,
+            GenerationConflict,
+            GenerationNotVerified,
+            StaleAuthorityToken,
+        )
+        from ..storage.contracts import ManagedSingletonWriterClaimLost
+
+        interval = max(
+            0.0,
+            float(
+                self._storage_factory_settings.authority_renew_interval_seconds
+            ),
+        )
         lease_seconds = self._storage_factory_settings.authority_lease_seconds
+        next_delay = interval
+        transient_failures = 0
         while self._stop_event is not None and not self._stop_event.is_set():
             try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
+                await asyncio.wait_for(self._stop_event.wait(), timeout=next_delay)
                 return
             except asyncio.TimeoutError:
                 pass
@@ -1396,21 +1612,108 @@ class LifeEngineService(BaseService):
                 return
             try:
                 await runtime.renew_authority(lease_seconds=lease_seconds)
+            except asyncio.CancelledError:
+                raise
+            except ManagedSingletonWriterClaimLost as exc:
+                if not await self._handle_managed_singleton_loss(exc):
+                    self._fail_storage_authority(
+                        RuntimeError("ManagedSingletonLossSnapshotMismatch")
+                    )
+                    return
+                transient_failures = 0
+                next_delay = interval
+                self._storage_renewal_health = {
+                    "status": "degraded",
+                    "last_success_at": self._storage_renewal_health.get(
+                        "last_success_at", ""
+                    ),
+                    "next_retry_at": "",
+                    "error_type": type(exc).__name__,
+                    "consecutive_failures": 0,
+                }
+                self._cache_storage_renewal_state(
+                    status="degraded",
+                    reason="one managed singleton domain lost its writer lease",
+                )
+                logger.error(
+                    "managed singleton writer lease was lost; only its domain "
+                    f"was quiesced: namespace={exc.namespace} "
+                    f"state_key={exc.state_key} epoch={exc.lease_epoch}"
+                )
+                continue
+            except (
+                AuthorityConflict,
+                StaleAuthorityToken,
+                GenerationConflict,
+                GenerationNotVerified,
+            ) as exc:
+                self._fail_storage_authority(exc)
+                return
+            except Exception as exc:  # noqa: BLE001 - classify before failing closed
+                if not _is_storage_renewal_connectivity_unknown(exc):
+                    self._fail_storage_authority(exc)
+                    return
+                transient_failures += 1
+                next_delay = _storage_renewal_backoff_seconds(
+                    transient_failures,
+                    owner_instance_id=self._storage_writer_instance_id,
+                )
+                self._storage_renewal_health = {
+                    "status": "degraded",
+                    "reason": "renewal_unknown",
+                    "last_success_at": self._storage_renewal_health.get(
+                        "last_success_at", ""
+                    ),
+                    "next_retry_at": (
+                        datetime.now(timezone.utc) + timedelta(seconds=next_delay)
+                    ).isoformat(),
+                    "retry_in_seconds": round(next_delay, 3),
+                    "error_type": type(exc).__name__,
+                    "consecutive_failures": transient_failures,
+                }
+                self._cache_storage_renewal_state(
+                    status="degraded",
+                    reason="storage authority renewal is unknown; retrying",
+                )
+                logger.warning(
+                    "life_engine storage authority renewal is unknown after a "
+                    f"connectivity failure; retaining claims and retrying in "
+                    f"{next_delay:.1f}s: error_type={type(exc).__name__}"
+                )
+                continue
+
+            transient_failures = 0
+            next_delay = interval
+            self._storage_renewal_health = {
+                "status": "healthy",
+                "last_success_at": _now_iso(),
+                "next_retry_at": "",
+                "error_type": "",
+                "consecutive_failures": 0,
+            }
+            lost_statuses = {
+                str(item.get("status") or "failed")
+                for item in self._lost_singleton_health.values()
+            }
+            if "failed" in lost_statuses:
+                cache_status = "failed"
+            elif lost_statuses:
+                cache_status = "degraded"
+            else:
+                cache_status = "healthy"
+            self._cache_storage_renewal_state(
+                status=cache_status,
+                reason="storage authority renewal succeeded",
+            )
+            try:
                 await self.refresh_storage_health()
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # noqa: BLE001 - lease loss must fail closed
-                runtime.invalidate_writer()
-                self._storage_health_cache = {
-                    "status": "failed",
-                    "backend": self._storage_factory_settings.authoritative_backend.value,
-                    "reason": f"authority lease renewal failed: {type(exc).__name__}",
-                }
-                logger.error(
-                    "life_engine storage authority renewal failed; writer disabled",
-                    exc_info=True,
+            except Exception as exc:  # noqa: BLE001 - renewal already succeeded
+                self._cache_storage_renewal_state(
+                    status="degraded",
+                    reason=f"storage health refresh failed: {type(exc).__name__}",
                 )
-                return
 
     def _start_storage_authority_renewal(self) -> None:
         """Start the one service-owned renewal task after runtime acquisition."""
@@ -3081,9 +3384,14 @@ class LifeEngineService(BaseService):
             ("runtime_state", self._runtime_state_store.health_snapshot()),
             ("attention_threads", self._attention_thread_service.health_snapshot()),
         ]
-        if self._learning_stores is not None:
+        learning_health_store = (
+            self._learning_stores.store
+            if self._learning_stores is not None
+            else self._learning_event_store
+        )
+        if learning_health_store is not None:
             component_checks.append(
-                ("learning", self._learning_stores.store.health_snapshot())
+                ("learning", learning_health_store.health_snapshot())
             )
         results = await asyncio.gather(
             *(check for _, check in component_checks),
@@ -3103,6 +3411,17 @@ class LifeEngineService(BaseService):
             name: normalized(name, result)
             for (name, _), result in zip(component_checks, results, strict=True)
         }
+        learning_component = components.get("learning")
+        if learning_component is not None:
+            store_status = str(learning_component.get("status") or "healthy")
+            learning_component.update(self._learning_storage_health)
+            if store_status == "failed":
+                learning_component["status"] = "failed"
+        components["authority_renewal"] = dict(self._storage_renewal_health)
+        for (namespace, state_key), item in sorted(
+            self._lost_singleton_health.items()
+        ):
+            components[f"singleton:{namespace}:{state_key}"] = dict(item)
         statuses = {
             str(item.get("status") or "healthy") for item in components.values()
         }
@@ -3116,6 +3435,8 @@ class LifeEngineService(BaseService):
             "status": status,
             "backend": self._storage_factory_settings.authoritative_backend.value,
             "components": components,
+            "authority_renewal": dict(self._storage_renewal_health),
+            "learning": dict(self._learning_storage_health),
         }
         return dict(self._storage_health_cache)
 
@@ -7630,7 +7951,9 @@ class LifeEngineService(BaseService):
         memory_maintenance_prompt = await self._build_memory_maintenance_prompt_if_due()
         section_texts = await self._render_heartbeat_sections()
         subject_review_offer: dict[str, Any] | None = None
-        if self._learning_scheduler is not None:
+        if self._learning_scheduler is not None and bool(
+            getattr(self._learning_scheduler, "projector_owner", True)
+        ):
             get_offer = getattr(
                 self._learning_scheduler,
                 "get_pending_subject_review_offer",
@@ -8231,22 +8554,19 @@ class LifeEngineService(BaseService):
         learning_cfg = getattr(cfg, "learning", None)
         if learning_cfg is None or getattr(learning_cfg, "enabled", True):
             try:
-                from ..learning.scheduler import LearningScheduler
-
-                # Multi-writer second instance may lack the singleton learning
-                # projector claim; LearningScheduler degrades to local stores
-                # while immutable learning events remain appendable.
+                # A non-owner keeps only the canonical immutable event port.
+                # It never constructs local insights, skills, maintenance, or
+                # prompt projections beside the selected database authority.
                 if (
                     self._selectable_storage_enabled
                     and self._learning_stores is None
                 ):
                     logger.warning(
-                        "learning scheduler starts without selected projection "
-                        "stores (projector owned by another instance); "
-                        "reflection/knowledge use local stores, events append "
-                        "through the unclaimed handle"
+                        "learning starts in immutable event-only mode; selected "
+                        "projection and maintenance remain disabled because "
+                        "this instance does not own the singleton projector"
                     )
-                self._learning_scheduler = LearningScheduler(
+                self._learning_scheduler = self._build_learning_runtime(
                     workspace_path=cfg.settings.workspace_path,
                     model_task_name=(
                         str(
@@ -8496,7 +8816,9 @@ class LifeEngineService(BaseService):
             )
             self._router_context_projection_task_id = projection_task.task_id
 
-        if self._learning_scheduler is not None:
+        if self._learning_scheduler is not None and bool(
+            getattr(self._learning_scheduler, "projector_owner", True)
+        ):
             learning_cfg = getattr(cfg, "learning", None)
             learning_task = get_task_manager().create_task(
                 self._learning_scheduler.run(
