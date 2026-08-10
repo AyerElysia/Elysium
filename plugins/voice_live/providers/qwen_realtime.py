@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import re
+import time
 import uuid
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -29,6 +30,7 @@ _CONTEXT_ACK_TIMEOUT_SECONDS = 5.0
 # automatic reply to server PINGs but prevents client-originated heartbeat PINGs
 # from falsely terminating an otherwise healthy realtime session.
 _QWEN_WEBSOCKET_HEARTBEAT: None = None
+_QWEN_TURN_DETECTION_MODES = frozenset({"server_vad", "smart_turn"})
 
 
 def _split_utf8_text(text: str, *, max_bytes: int) -> list[str]:
@@ -126,9 +128,28 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
         self._response_generation = 0
         self._transient_context_expiry: dict[str, int] = {}
         self._tool_name_map: dict[str, str] = {}
+        self._turn_detection_mode = ""
+        self._input_audio_samples = 0
+        self._speech_started_audio_ms: int | None = None
+        self._speech_stopped_at = 0.0
+        self._response_created_at = 0.0
+        self._first_audio_response_id = ""
+        self._monotonic = time.monotonic
 
     async def connect(self, session_config: dict[str, Any]) -> None:
         self._session_config = dict(session_config)
+        self._closed = False
+        self._terminal_error = None
+        self._response_active = False
+        self._active_response_id = ""
+        self._active_item_id = ""
+        self._interrupting_response_id = ""
+        self._turn_detection_mode = ""
+        self._input_audio_samples = 0
+        self._speech_started_audio_ms = None
+        self._speech_stopped_at = 0.0
+        self._response_created_at = 0.0
+        self._first_audio_response_id = ""
         await self._emit_state(ProviderState.CONNECTING)
         self._http = aiohttp.ClientSession()
         try:
@@ -145,19 +166,48 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
             )
             if self._model.startswith("qwen-audio-"):
                 max_history_turns = int(
-                    session_config.get("qwen_max_history_turns") or 12
+                    session_config.get("qwen_max_history_turns") or 8
                 )
                 if not 1 <= max_history_turns <= 50:
                     raise ValueError("Qwen max_history_turns must be between 1 and 50")
+                turn_detection_mode = str(
+                    session_config.get("qwen_turn_detection") or "server_vad"
+                )
+                if turn_detection_mode not in _QWEN_TURN_DETECTION_MODES:
+                    raise ValueError(
+                        "Qwen turn detection must be server_vad or smart_turn"
+                    )
+                if turn_detection_mode == "server_vad":
+                    vad_threshold = float(
+                        session_config.get("qwen_vad_threshold", 0.5)
+                    )
+                    vad_silence_ms = int(
+                        session_config.get("qwen_vad_silence_duration_ms", 400)
+                    )
+                    if not -1.0 <= vad_threshold <= 1.0:
+                        raise ValueError("Qwen VAD threshold must be between -1 and 1")
+                    if not 200 <= vad_silence_ms <= 6000:
+                        raise ValueError(
+                            "Qwen VAD silence duration must be between 200 and 6000ms"
+                        )
+                    turn_detection: dict[str, Any] = {
+                        "type": "server_vad",
+                        "threshold": vad_threshold,
+                        "silence_duration_ms": vad_silence_ms,
+                    }
+                else:
+                    turn_detection = {"type": "smart_turn"}
+                self._turn_detection_mode = turn_detection_mode
                 session = {
                     "modalities": ["text", "audio"],
                     "voice": self._voice,
                     "input_audio_format": "pcm",
                     "output_audio_format": "pcm",
                     "max_history_turns": max_history_turns,
-                    "turn_detection": {"type": "smart_turn"},
+                    "turn_detection": turn_detection,
                 }
             else:
+                self._turn_detection_mode = "semantic_vad"
                 session = {
                     "modalities": ["text", "audio"],
                     "voice": self._voice,
@@ -167,6 +217,17 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
                     "turn_detection": {"type": "semantic_vad"},
                 }
             await self._update_session(session)
+            await self._emit_metrics(
+                {
+                    "turn_detection": {
+                        "mode": self._turn_detection_mode,
+                        "threshold": session["turn_detection"].get("threshold"),
+                        "silence_duration_ms": session["turn_detection"].get(
+                            "silence_duration_ms"
+                        ),
+                    }
+                }
+            )
 
             instructions = str(session_config.get("instructions") or "")
             if instructions:
@@ -257,6 +318,7 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
                 "audio": base64.b64encode(pcm16).decode("ascii"),
             }
         )
+        self._input_audio_samples += len(pcm16) // 2
 
     async def interrupt(self, *, played_audio_ms: int | None = None) -> None:
         async with self._interrupt_lock:
@@ -483,9 +545,37 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
                         "server_vad", self._active_response_id, self._active_item_id
                     )
                 )
+            audio_start_ms = event.get("audio_start_ms")
+            self._speech_started_audio_ms = (
+                int(audio_start_ms) if isinstance(audio_start_ms, int | float) else None
+            )
             await self._emit_state(ProviderState.LISTENING)
             return
         if event_type == "input_audio_buffer.speech_stopped":
+            audio_end_ms = event.get("audio_end_ms")
+            end_ms = int(audio_end_ms) if isinstance(audio_end_ms, int | float) else None
+            sent_audio_ms = round(
+                self._input_audio_samples * 1000 / self.input_sample_rate
+            )
+            self._speech_stopped_at = self._monotonic()
+            endpoint_tail_ms = (
+                max(0, sent_audio_ms - end_ms) if end_ms is not None else None
+            )
+            speech_duration_ms = (
+                max(0, end_ms - self._speech_started_audio_ms)
+                if end_ms is not None and self._speech_started_audio_ms is not None
+                else None
+            )
+            await self._emit_metrics(
+                {
+                    "realtime_latency": {
+                        "phase": "turn_end",
+                        "vad_mode": self._turn_detection_mode,
+                        "speech_duration_ms": speech_duration_ms,
+                        "endpoint_audio_tail_ms": endpoint_tail_ms,
+                    }
+                }
+            )
             await self._emit_state(ProviderState.THINKING)
             return
         if event_type == "response.created":
@@ -494,6 +584,8 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
             self._active_response_id = str(
                 response.get("id") or event.get("response_id") or ""
             )
+            self._response_created_at = self._monotonic()
+            self._first_audio_response_id = ""
             self._interrupting_response_id = ""
             await self._emit_state(ProviderState.THINKING)
             return
@@ -511,7 +603,10 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
         if event_type == "response.audio.delta" and event.get("delta"):
             if self._interrupting_response_id == self._active_response_id:
                 return
-            await self._emit_state(ProviderState.SPEAKING)
+            first_audio = self._first_audio_response_id != self._active_response_id
+            now = self._monotonic()
+            if first_audio:
+                self._first_audio_response_id = self._active_response_id
             await self._emit_audio(
                 AudioDelta(
                     base64.b64decode(event["delta"]),
@@ -519,6 +614,26 @@ class QwenRealtimeProvider(BaseRealtimeProvider):
                     response_id=self._active_response_id,
                 )
             )
+            await self._emit_state(ProviderState.SPEAKING)
+            if first_audio:
+                await self._emit_metrics(
+                    {
+                        "realtime_latency": {
+                            "phase": "first_audio",
+                            "vad_mode": self._turn_detection_mode,
+                            "turn_end_to_first_audio_ms": (
+                                round((now - self._speech_stopped_at) * 1000, 1)
+                                if self._speech_stopped_at
+                                else None
+                            ),
+                            "model_to_first_audio_ms": (
+                                round((now - self._response_created_at) * 1000, 1)
+                                if self._response_created_at
+                                else None
+                            ),
+                        }
+                    }
+                )
             return
         if event_type == "response.audio_transcript.delta" and event.get("delta"):
             await self._emit_transcript(

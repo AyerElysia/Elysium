@@ -36,8 +36,19 @@ def test_browser_uses_worklet_clocked_pcm_and_guarded_barge_in() -> None:
     assert "noiseSuppression:true" in html
     assert "channelCountMode:'explicit'" in html
     assert "bestEnergy" in html
-    assert "startAudioPump(generation)" in html
-    assert "MAX_MIC_QUEUE" in html
+    assert "createMediaStreamDestination()" in html
+    assert "nextSource.connect(nextWorklet).connect(nextSink)" in html
+    assert "silentGain" not in html
+    assert "startAudioPump" not in html
+    assert "MAX_UPLINK_BUFFER_BYTES" in html
+    assert "ws.bufferedAmount>MAX_UPLINK_BUFFER_BYTES" in html
+    assert "sendMicFrame(samples)" in html
+    assert "PLAYBACK_PREROLL_MS=80" in html
+    assert "PLAYBACK_RECOVERY_MS=60" in html
+    assert "trimLeadingSilence" in html
+    assert "playbackUnderruns" in html
+    assert "turnLatency" in html
+    assert "audioClock" in html
     assert "MIC_SILENCE_MS" in html
     assert "麦克风正在上传静音" in html
     assert "micHealth" in html
@@ -51,6 +62,10 @@ def test_browser_uses_worklet_clocked_pcm_and_guarded_barge_in() -> None:
 
     config = VoiceLiveConfig()
     assert config.session.perception_context_max_bytes == 8 * 1024
+    assert config.full_duplex.qwen_max_history_turns == 8
+    assert config.full_duplex.qwen_turn_detection == "server_vad"
+    assert config.full_duplex.qwen_vad_threshold == 0.5
+    assert config.full_duplex.qwen_vad_silence_duration_ms == 400
 
 
 def test_browser_fully_retires_previous_audio_generation() -> None:

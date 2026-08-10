@@ -112,10 +112,26 @@ class VoiceLiveConfig(BaseConfig):
             description="实时语音交互覆盖层；不是身份权威，过长时只投影到有界上下文",
         )
         qwen_max_history_turns: int = Field(
-            default=12,
+            default=8,
             ge=1,
             le=50,
             description="Qwen-Audio 上游保留的最近问答轮数；完整历史仍写入 episode 与 Life Event",
+        )
+        qwen_turn_detection: Literal["server_vad", "smart_turn"] = Field(
+            default="server_vad",
+            description="Qwen-Audio 轮次检测；低延迟通话使用可调节的 server_vad",
+        )
+        qwen_vad_threshold: float = Field(
+            default=0.5,
+            ge=-1.0,
+            le=1.0,
+            description="Qwen server_vad 灵敏度；仅在 server_vad 模式生效",
+        )
+        qwen_vad_silence_duration_ms: int = Field(
+            default=400,
+            ge=200,
+            le=6000,
+            description="Qwen server_vad 判定说完前需要的连续静音毫秒数",
         )
 
     @config_section("voice_conversion", title="爱莉实时音色", tag="audio", order=25)

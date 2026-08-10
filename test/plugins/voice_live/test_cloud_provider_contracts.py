@@ -608,7 +608,7 @@ async def test_qwen_realtime_surfaces_initialization_error_immediately() -> None
 
 
 @pytest.mark.asyncio
-async def test_qwen_audio_realtime_uses_smart_turn_contract() -> None:
+async def test_qwen_audio_realtime_uses_low_latency_server_vad_contract() -> None:
     observed: dict[str, Any] = {}
 
     async def websocket(request: web.Request) -> web.WebSocketResponse:
@@ -637,6 +637,9 @@ async def test_qwen_audio_realtime_uses_smart_turn_contract() -> None:
                 "instructions": "",
                 "tools": [],
                 "qwen_max_history_turns": 7,
+                "qwen_turn_detection": "server_vad",
+                "qwen_vad_threshold": 0.45,
+                "qwen_vad_silence_duration_ms": 400,
             }
         )
     finally:
@@ -646,10 +649,128 @@ async def test_qwen_audio_realtime_uses_smart_turn_contract() -> None:
     assert observed["model"] == "qwen-audio-3.0-realtime-plus"
     session = observed["session"]["session"]
     assert session["voice"] == "longanqian"
-    assert session["turn_detection"] == {"type": "smart_turn"}
+    assert session["turn_detection"] == {
+        "type": "server_vad",
+        "threshold": 0.45,
+        "silence_duration_ms": 400,
+    }
     assert session["max_history_turns"] == 7
     assert session["input_audio_format"] == "pcm"
     assert session["output_audio_format"] == "pcm"
+
+
+@pytest.mark.asyncio
+async def test_qwen_audio_realtime_keeps_smart_turn_as_explicit_option() -> None:
+    observed: dict[str, Any] = {}
+
+    async def websocket(request: web.Request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.send_json({"type": "session.created", "session": {}})
+        observed["session"] = json.loads((await ws.receive()).data)
+        await ws.send_json({"type": "session.updated", "session": {}})
+        async for _ in ws:
+            pass
+        return ws
+
+    runner, port = await _start_server(websocket)
+    provider = QwenRealtimeProvider(
+        f"ws://127.0.0.1:{port}/realtime",
+        "secret-value",
+        model="qwen-audio-3.0-realtime-plus",
+        connect_timeout=2,
+        event_timeout=2,
+    )
+    try:
+        await provider.connect(
+            {
+                "instructions": "",
+                "tools": [],
+                "qwen_turn_detection": "smart_turn",
+                "qwen_vad_threshold": -0.5,
+                "qwen_vad_silence_duration_ms": 200,
+            }
+        )
+    finally:
+        await provider.disconnect()
+        await runner.cleanup()
+
+    assert observed["session"]["session"]["turn_detection"] == {
+        "type": "smart_turn"
+    }
+
+
+@pytest.mark.asyncio
+async def test_qwen_emits_content_free_turn_and_first_audio_latency_metrics(
+) -> None:
+    provider = QwenRealtimeProvider(
+        "ws://127.0.0.1/realtime",
+        "secret-value",
+        model="qwen-audio-3.0-realtime-plus",
+    )
+    sent: list[dict[str, Any]] = []
+    metrics: list[dict[str, Any]] = []
+    audio: list[bytes] = []
+    monotonic_values = iter((10.0, 10.25, 10.4))
+
+    async def send(event: dict[str, Any]) -> None:
+        sent.append(event)
+
+    async def on_metrics(event: Any) -> None:
+        metrics.append(event.values)
+
+    async def on_audio(event: AudioDelta) -> None:
+        audio.append(event.data)
+
+    provider._send = send  # type: ignore[method-assign]
+    provider.on_metrics(on_metrics)
+    provider.on_audio_delta(on_audio)
+    provider._turn_detection_mode = "server_vad"  # type: ignore[attr-defined]
+    provider._monotonic = lambda: next(monotonic_values)  # type: ignore[attr-defined]
+
+    await provider.send_audio(b"\x00\x00" * 16_000)
+    await provider._handle_event(  # type: ignore[attr-defined]
+        {
+            "type": "input_audio_buffer.speech_started",
+            "audio_start_ms": 100,
+        }
+    )
+    await provider._handle_event(  # type: ignore[attr-defined]
+        {
+            "type": "input_audio_buffer.speech_stopped",
+            "audio_end_ms": 600,
+        }
+    )
+    await provider._handle_event(  # type: ignore[attr-defined]
+        {"type": "response.created", "response": {"id": "response-1"}}
+    )
+    await provider._handle_event(  # type: ignore[attr-defined]
+        {
+            "type": "response.audio.delta",
+            "delta": base64.b64encode(b"\x01\x00" * 240).decode(),
+        }
+    )
+
+    assert sent[0]["type"] == "input_audio_buffer.append"
+    assert audio == [b"\x01\x00" * 240]
+    assert metrics == [
+        {
+            "realtime_latency": {
+                "phase": "turn_end",
+                "vad_mode": "server_vad",
+                "speech_duration_ms": 500,
+                "endpoint_audio_tail_ms": 400,
+            }
+        },
+        {
+            "realtime_latency": {
+                "phase": "first_audio",
+                "vad_mode": "server_vad",
+                "turn_end_to_first_audio_ms": 400.0,
+                "model_to_first_audio_ms": 150.0,
+            }
+        },
+    ]
 
 
 @pytest.mark.asyncio

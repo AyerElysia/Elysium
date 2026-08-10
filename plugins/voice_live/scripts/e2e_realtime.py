@@ -12,6 +12,7 @@ import struct
 import sys
 import time
 import wave
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +89,8 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     transcripts: list[dict[str, Any]] = []
     states: list[str] = []
     errors: list[str] = []
+    provider_metrics: list[dict[str, Any]] = []
+    audio_arrivals: list[float] = []
     response_finished = asyncio.Event()
     first_audio_at = 0.0
     input_complete_at = 0.0
@@ -96,8 +99,10 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
 
     async def on_audio(event: AudioDelta) -> None:
         nonlocal first_audio_at
+        arrived_at = time.monotonic()
         if not first_audio_at:
-            first_audio_at = time.monotonic()
+            first_audio_at = arrived_at
+        audio_arrivals.append(arrived_at)
         output.extend(event.data)
 
     async def on_transcript(event: TranscriptEvent) -> None:
@@ -122,15 +127,22 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         errors.append(message)
         response_finished.set()
 
+    async def on_metrics(event: Any) -> None:
+        provider_metrics.append(dict(event.values))
+
     provider.on_audio_delta(on_audio)
     provider.on_transcript(on_transcript)
     provider.on_state_change(on_state)
     provider.on_error(on_error)
+    provider.on_metrics(on_metrics)
     try:
         await provider.connect(
             {
                 "instructions": args.instructions,
                 "tools": [],
+                "qwen_turn_detection": args.qwen_turn_detection,
+                "qwen_vad_threshold": args.qwen_vad_threshold,
+                "qwen_vad_silence_duration_ms": args.qwen_vad_silence_ms,
             }
         )
         if args.text:
@@ -173,6 +185,11 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("provider returned no audio")
     _write_pcm16_mono(args.output, pcm, provider.output_sample_rate)
     duration = len(pcm) / (provider.output_sample_rate * 2)
+    audio_gaps_ms = [
+        (current - previous) * 1000
+        for previous, current in pairwise(audio_arrivals)
+    ]
+    sorted_audio_gaps_ms = sorted(audio_gaps_ms)
     result = {
         "provider": provider.provider_name,
         "model": args.model,
@@ -184,13 +201,43 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         "output_seconds": round(duration, 3),
         "output_rms": _pcm16_rms(pcm),
         "output_sha256": hashlib.sha256(pcm).hexdigest(),
+        "audio_chunk_count": len(audio_arrivals),
+        "audio_interarrival_p95_ms": (
+            round(
+                sorted_audio_gaps_ms[
+                    max(0, math.ceil(len(sorted_audio_gaps_ms) * 0.95) - 1)
+                ],
+                1,
+            )
+            if sorted_audio_gaps_ms
+            else None
+        ),
+        "audio_interarrival_max_ms": (
+            round(max(audio_gaps_ms), 1) if audio_gaps_ms else None
+        ),
+        "provider_metrics": provider_metrics,
         "first_audio_latency_ms": (
             round((first_audio_at - started_at) * 1000, 1) if first_audio_at else None
         ),
+        # With upstream VAD the first response may legitimately arrive while
+        # the probe is still streaming trailing audio.  Comparing it with the
+        # end of the local file then produces a misleading negative latency;
+        # the provider's speech-stop metrics are the authoritative measure.
         "first_audio_after_input_ms": (
             round((first_audio_at - input_complete_at) * 1000, 1)
-            if first_audio_at and input_complete_at
+            if first_audio_at
+            and input_complete_at
+            and (args.text or args.mode == "turn_based")
             else None
+        ),
+        "latency_reference": (
+            "text_submitted"
+            if args.text
+            else (
+                "turn_audio_submitted"
+                if args.mode == "turn_based"
+                else "provider_vad_metrics"
+            )
         ),
     }
     if result["output_rms"] <= 0 or result["output_seconds"] <= 0.1:
@@ -220,6 +267,13 @@ def main() -> None:
     parser.add_argument("--tts-reference-audio", default="")
     parser.add_argument("--upstream-chunk-ms", type=int, default=1000)
     parser.add_argument("--trailing-silence-ms", type=int, default=1800)
+    parser.add_argument(
+        "--qwen-turn-detection",
+        choices=("server_vad", "smart_turn"),
+        default="server_vad",
+    )
+    parser.add_argument("--qwen-vad-threshold", type=float, default=0.5)
+    parser.add_argument("--qwen-vad-silence-ms", type=int, default=400)
     parser.add_argument("--connect-timeout", type=float, default=20.0)
     parser.add_argument("--event-timeout", type=float, default=30.0)
     parser.add_argument("--response-timeout", type=float, default=45.0)

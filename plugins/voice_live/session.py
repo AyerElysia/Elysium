@@ -315,6 +315,15 @@ class CallSession:
                             "qwen_max_history_turns": (
                                 self._config.full_duplex.qwen_max_history_turns
                             ),
+                            "qwen_turn_detection": (
+                                self._config.full_duplex.qwen_turn_detection
+                            ),
+                            "qwen_vad_threshold": (
+                                self._config.full_duplex.qwen_vad_threshold
+                            ),
+                            "qwen_vad_silence_duration_ms": (
+                                self._config.full_duplex.qwen_vad_silence_duration_ms
+                            ),
                             "tools": schemas,
                             "provider_config": {
                                 "tools_available": [

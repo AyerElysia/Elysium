@@ -565,7 +565,10 @@ async def test_session_persists_subject_revision_and_layer_audit(
     assert await session.start() is True
     assert provider.connected is not None
     assert provider.connected["instructions"] == "unified subject voice context"
-    assert provider.connected["qwen_max_history_turns"] == 12
+    assert provider.connected["qwen_max_history_turns"] == 8
+    assert provider.connected["qwen_turn_detection"] == "server_vad"
+    assert provider.connected["qwen_vad_threshold"] == 0.5
+    assert provider.connected["qwen_vad_silence_duration_ms"] == 400
     snapshot = session.snapshot()
     assert snapshot["subject_context_revision"] == "revision-1"
     assert snapshot["subject_context_source_digest"] == "digest-1"
