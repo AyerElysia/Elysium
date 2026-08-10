@@ -19,6 +19,43 @@ def test_heartbeat_tool_round_safety_defaults() -> None:
     assert settings.max_consecutive_tool_stalls_per_heartbeat == 2
 
 
+def test_background_cognition_uses_quality_first_total_deadlines() -> None:
+    config = LifeEngineConfig()
+
+    assert config.memory_witness.timeout_seconds == 600.0
+    assert config.curiosity.timeout_seconds == 300.0
+
+
+@pytest.mark.parametrize(
+    "section_type",
+    [
+        LifeEngineConfig.MemoryWitnessSection,
+        LifeEngineConfig.CuriositySection,
+    ],
+)
+def test_background_cognition_deadlines_allow_up_to_fifteen_minutes(
+    section_type: type,
+) -> None:
+    assert section_type(timeout_seconds=900.0).timeout_seconds == 900.0
+    with pytest.raises(ValueError):
+        section_type(timeout_seconds=900.1)
+
+
+def test_learning_uses_quality_first_background_model_contract() -> None:
+    learning = LifeEngineConfig.LearningSection()
+
+    assert learning.model_task_name == "learning"
+    assert learning.llm_timeout_seconds == 900.0
+    visible = LifeEngineConfig.__config_schema_visible_fields__["learning"]
+    assert {"model_task_name", "llm_timeout_seconds"} <= visible
+
+
+@pytest.mark.parametrize("timeout", [29.0, 3601.0])
+def test_learning_rejects_out_of_range_llm_timeout(timeout: float) -> None:
+    with pytest.raises(ValueError):
+        LifeEngineConfig.LearningSection(llm_timeout_seconds=timeout)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

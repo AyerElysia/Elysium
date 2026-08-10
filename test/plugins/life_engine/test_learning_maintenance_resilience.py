@@ -136,6 +136,25 @@ def _scheduler(tmp_path: Path, journal: Any) -> LearningScheduler:
     return scheduler
 
 
+def test_scheduler_propagates_one_background_llm_contract(tmp_path: Path) -> None:
+    scheduler = LearningScheduler(
+        workspace_path=tmp_path,
+        model_task_name="learning",
+        llm_timeout_seconds=900.0,
+    )
+
+    assert scheduler._model_task_name == "learning"
+    assert scheduler._llm_timeout_seconds == 900.0
+    for component in (
+        scheduler.reflection,
+        scheduler.auditor,
+        scheduler.compressor,
+        scheduler.distiller,
+    ):
+        assert component._model_task_name == "learning"
+        assert component._timeout == 900.0
+
+
 def _set_due_phases(scheduler: LearningScheduler) -> None:
     scheduler._should_audit = lambda: True  # type: ignore[method-assign]
     scheduler.compressor.should_compress = lambda: True  # type: ignore[method-assign]
@@ -844,7 +863,7 @@ def test_reflection_timeout_reads_deployment_override(monkeypatch) -> None:
     """The timeout is deployment-tunable and fails loudly when malformed."""
 
     monkeypatch.delenv("ELYSIUM_REFLECTION_TIMEOUT_SECONDS", raising=False)
-    assert _resolve_timeout_seconds(None) == 180.0
+    assert _resolve_timeout_seconds(None) == 900.0
 
     monkeypatch.setenv("ELYSIUM_REFLECTION_TIMEOUT_SECONDS", "240")
     assert _resolve_timeout_seconds(None) == 240.0
@@ -924,7 +943,7 @@ def test_audit_timeout_reads_deployment_override(monkeypatch) -> None:
     """The audit ceiling is deployment-tunable and fails loudly when malformed."""
 
     monkeypatch.delenv("ELYSIUM_AUDIT_TIMEOUT_SECONDS", raising=False)
-    assert _resolve_audit_timeout_seconds(None) == 180.0
+    assert _resolve_audit_timeout_seconds(None) == 900.0
 
     monkeypatch.setenv("ELYSIUM_AUDIT_TIMEOUT_SECONDS", "240")
     assert _resolve_audit_timeout_seconds(None) == 240.0

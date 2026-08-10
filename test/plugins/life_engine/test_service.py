@@ -132,6 +132,64 @@ async def test_learning_maintenance_only_wakes_independent_worker(
     assert scheduler.wake_count == 1
 
 
+async def test_service_uses_learning_specific_model_and_total_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_subject_authority(tmp_path)
+    service = _make_service(tmp_path)
+    config = service.plugin.config
+    config.learning.model_task_name = "learning_test"
+    config.learning.llm_timeout_seconds = 777.0
+    config.memory_index.enabled = False
+    config.memory_witness.enabled = False
+    config.autonomy.enabled = False
+    config.streams.enabled = False
+    config.drives.enabled = False
+    captured: dict[str, object] = {}
+
+    class _LearningScheduler:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        async def initialize(self) -> None:
+            return None
+
+        def request_maintenance(self) -> None:
+            return None
+
+        async def run(
+            self,
+            stop_event: asyncio.Event,
+            *,
+            poll_interval_seconds: float,
+        ) -> None:
+            del poll_interval_seconds
+            await stop_event.wait()
+
+        async def close(self) -> None:
+            return None
+
+    async def fake_init_memory(_integration: object) -> None:
+        service._memory_service = None
+
+    monkeypatch.setattr(
+        "plugins.life_engine.learning.scheduler.LearningScheduler",
+        _LearningScheduler,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.service.integrations.MemoryIntegration.init_memory_service",
+        fake_init_memory,
+    )
+
+    await service.start()
+    try:
+        assert captured["model_task_name"] == "learning_test"
+        assert captured["llm_timeout_seconds"] == 777.0
+    finally:
+        await service.stop()
+
+
 def test_cfg_auto_migrates_legacy_config_without_thresholds(tmp_path: Path) -> None:
     """旧版配置对象缺少 thresholds 时，_cfg 应自动迁移为新结构。"""
 

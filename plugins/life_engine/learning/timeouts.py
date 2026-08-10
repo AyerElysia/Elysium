@@ -3,13 +3,11 @@
 这里只做两件事：把"这条链路最多等多久"从散落各处的字面量收拢成一处可覆盖的
 配置，以及保证一次"发请求 + 读回复"只受一个截止时间约束。
 
-为什么值得单独一个模块：反思环曾经配 45s，而同一 provider 上成功样本的
-p50=23.4s、p90=39.1s、max=44.5s——分布右侧正好被 45s 削掉。审计环配 60s，
-成功样本 p99=57.7s、max=58.0s，同一个削法。被削掉的调用不是"慢"，是根本
-没机会写完，于是那段经历只能一轮轮重试到退避的尽头。同一 provider 上
-life_memory_witness 的成功样本能跑到 180.3s，说明 180s 才是这条链路真实的
-上界。这类数字不是"偏保守"，是错的，而且只看均值时完全看不出来——收拢到
-一处，是为了下次再有人调这些数字时先读到这段话。
+Learning 是不可被前台感知延迟约束的后台认知链，质量与完整完成优先。旧的
+180s 总预算会让首选模型在 120s 处超时后只剩约 60s 给备用模型，无法容纳一次
+完整 failover。默认 900s 是整次 Learning 请求往返的硬上限，不是无限等待；单飞、耐久
+积压、失败传播与取消语义仍负责约束资源。收拢到一处，是为了避免不同学习环
+再次各自缩短同一后台契约。
 """
 
 from __future__ import annotations
@@ -20,7 +18,13 @@ import os
 from collections.abc import Awaitable
 from typing import Any, Protocol
 
-__all__ = ["resolve_timeout_seconds", "send_with_deadline"]
+DEFAULT_LEARNING_LLM_TIMEOUT_SECONDS = 900.0
+
+__all__ = [
+    "DEFAULT_LEARNING_LLM_TIMEOUT_SECONDS",
+    "resolve_timeout_seconds",
+    "send_with_deadline",
+]
 
 
 class _SendableRequest(Protocol):

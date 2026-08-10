@@ -35,18 +35,16 @@ from .prompts import (
 )
 from .skill_store import SkillCandidate, SkillPattern, SkillStore
 from .store import InsightStore
-from .timeouts import send_with_deadline
+from .timeouts import DEFAULT_LEARNING_LLM_TIMEOUT_SECONDS, send_with_deadline
 
 logger = logging.getLogger("life_engine.learning.skill_distiller")
 
 _DEFAULT_TRIGGER_COUNT = 3
 _DEFAULT_INTERVAL_HOURS = 24.0
 
-# 蒸馏 / 门禁 LLM 调用超时（秒）。数字的来历见 timeouts 模块。此前写 90s，但两段
-# 等待各自计时，真实上界一直是 180s——而 life_skill_distill 的成功样本 max=88.9s
-# 正贴着 90s。所以收成单一截止时间的同时必须把预算写成 180s：否则等于凭空把这条
-# 链路收紧一倍，把眼下刚好跑完的调用变成超时。
-_DEFAULT_TIMEOUT_SECONDS = 180.0
+# 后台技能蒸馏 / 门禁的单次 LLM 往返总预算；质量优先且仍保持有界。
+# 两次独立模型往返各自领取一份预算，单次往返内部仍只有一个 monotonic deadline。
+_DEFAULT_TIMEOUT_SECONDS = DEFAULT_LEARNING_LLM_TIMEOUT_SECONDS
 _MIN_TIMEOUT_SECONDS = 30.0
 
 

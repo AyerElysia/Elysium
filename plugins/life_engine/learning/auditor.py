@@ -38,16 +38,19 @@ from .prompts import (
     format_evidence_for_auditor,
 )
 from .store import InsightStore
-from .timeouts import resolve_timeout_seconds, send_with_deadline
+from .timeouts import (
+    DEFAULT_LEARNING_LLM_TIMEOUT_SECONDS,
+    resolve_timeout_seconds,
+    send_with_deadline,
+)
 
 logger = logging.getLogger("life_engine.learning.auditor")
 
 # 每次审计最多处理的洞察数
 _DEFAULT_BATCH_SIZE = 3
 
-# 审计 LLM 调用超时（秒）。数字的来历见 timeouts 模块：60s 下成功样本
-# p99=57.7s、max=58.0s，分布右侧被削掉，300/313 次审计以 TimeoutError 回滚。
-_DEFAULT_TIMEOUT_SECONDS = 180.0
+# 后台独立审计的单次 LLM 往返总预算；质量优先且仍保持有界，见 timeouts 模块。
+_DEFAULT_TIMEOUT_SECONDS = DEFAULT_LEARNING_LLM_TIMEOUT_SECONDS
 _MIN_TIMEOUT_SECONDS = 15.0
 _TIMEOUT_ENV_VAR = "ELYSIUM_AUDIT_TIMEOUT_SECONDS"
 

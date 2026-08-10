@@ -60,6 +60,7 @@ from .selectable import (
 from .skill_distiller import SkillDistiller
 from .skill_store import SkillDecisionKind, SkillStore
 from .store import InsightStore
+from .timeouts import DEFAULT_LEARNING_LLM_TIMEOUT_SECONDS
 
 logger = logging.getLogger("life_engine.learning.scheduler")
 
@@ -104,6 +105,7 @@ class LearningScheduler:
         *,
         workspace_path: str | Path,
         model_task_name: str = "life",
+        llm_timeout_seconds: float = DEFAULT_LEARNING_LLM_TIMEOUT_SECONDS,
         # 审计参数
         audit_interval_hours: float = _DEFAULT_AUDIT_INTERVAL_HOURS,
         audit_batch_size: int = _DEFAULT_AUDIT_BATCH_SIZE,
@@ -152,6 +154,12 @@ class LearningScheduler:
     ) -> None:
         self._workspace = Path(workspace_path).resolve()
         self._model_task_name = model_task_name
+        self._llm_timeout_seconds = max(
+            30.0,
+            float(
+                llm_timeout_seconds or DEFAULT_LEARNING_LLM_TIMEOUT_SECONDS
+            ),
+        )
         self._memory_service = memory_service
         self._current_subject_revision = current_subject_revision or (
             subject_authority.current_subject_revision
@@ -198,6 +206,7 @@ class LearningScheduler:
             store=self.store,
             workspace_path=self._workspace,
             model_task_name=model_task_name,
+            timeout_seconds=self._llm_timeout_seconds,
             cooldown_seconds=reflection_cooldown_minutes * 60,
             skill_store=self.skill_store,
             memory_service=memory_service,
@@ -206,12 +215,14 @@ class LearningScheduler:
             store=self.store,
             workspace_path=self._workspace,
             model_task_name=model_task_name,
+            timeout_seconds=self._llm_timeout_seconds,
             batch_size=audit_batch_size,
         )
         self.compressor = SelfKnowledgeCompressor(
             store=self.store,
             workspace_path=self._workspace,
             model_task_name=model_task_name,
+            timeout_seconds=self._llm_timeout_seconds,
             trigger_count=compress_trigger_count,
             interval_hours=compress_interval_hours,
         )
@@ -220,6 +231,7 @@ class LearningScheduler:
             skill_store=self.skill_store,
             workspace_path=self._workspace,
             model_task_name=model_task_name,
+            timeout_seconds=self._llm_timeout_seconds,
             trigger_count=skill_distill_trigger_count,
             interval_hours=skill_distill_interval_hours,
             current_subject_revision=self._current_subject_revision,

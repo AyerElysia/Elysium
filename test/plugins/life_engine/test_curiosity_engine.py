@@ -371,7 +371,7 @@ def test_epistemic_opportunity_defaults_to_utility_with_realistic_deadline():
     config = LifeEngineConfig()
 
     assert config.curiosity.task_name == "utility"
-    assert config.curiosity.timeout_seconds == 45.0
+    assert config.curiosity.timeout_seconds == 300.0
 
 
 @pytest.mark.asyncio

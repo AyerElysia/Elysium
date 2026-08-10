@@ -489,9 +489,23 @@ class MemoryWitnessCoordinator:
             user_text,
             marker=str(perception.delivery_marker),
         )
-        timeout = max(10.0, float(getattr(cfg, "timeout_seconds", 120.0)))
-        response = await asyncio.wait_for(request.send(), timeout=timeout)
-        result = await response if not response.message else response.message
+        timeout = max(10.0, float(getattr(cfg, "timeout_seconds", 600.0)))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        timeout_scope = asyncio.timeout_at(deadline)
+        try:
+            async with timeout_scope:
+                response = await request.send()
+                result = await response if not response.message else response.message
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError as exc:
+            if not timeout_scope.expired():
+                raise
+            raise TimeoutError(
+                "MemoryWitnessAuthoringDeadlineExceeded:"
+                f"configured_timeout={timeout:.3f}:task_name={task_name}"
+            ) from exc
         receipt = _exact_perception_receipt(response, perception)
         if receipt is None:
             raise RuntimeError("MemoryWitnessPerceptionDeliveryUnverified")

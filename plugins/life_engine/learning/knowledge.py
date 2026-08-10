@@ -33,7 +33,7 @@ from .prompts import (
     format_reconsidered_for_compression,
 )
 from .store import InsightStore
-from .timeouts import send_with_deadline
+from .timeouts import DEFAULT_LEARNING_LLM_TIMEOUT_SECONDS, send_with_deadline
 
 logger = logging.getLogger("life_engine.learning.knowledge")
 
@@ -41,14 +41,9 @@ logger = logging.getLogger("life_engine.learning.knowledge")
 _DEFAULT_TRIGGER_COUNT = 5  # 触发压缩的 validated 数量
 _DEFAULT_INTERVAL_HOURS = 48.0  # 压缩最小间隔
 
-# 压缩 / 门禁 LLM 调用超时（秒）。数字的来历见 timeouts 模块。
-#
-# 这里从 90s 改成 180s 不是放宽：此前"发请求"和"读回复"各自 wait_for(90)，
-# 真实上界本来就是 180s。收拢成一个截止时间后，如果仍写 90s，反而是把现有
-# 预算砍半——同一 provider 上 life_skill_distill 的成功样本已经跑到 88.9s，
-# 砍半会凭空造出新的超时。180s 保持今天的真实行为不变，只是让配置里的数字
-# 终于说的是实话。
-_DEFAULT_TIMEOUT_SECONDS = 180.0
+# 后台知识整合 / 门禁的单次 LLM 往返总预算；质量优先且仍保持有界。
+# 两次独立模型往返各自领取一份预算，单次往返内部仍只有一个 monotonic deadline。
+_DEFAULT_TIMEOUT_SECONDS = DEFAULT_LEARNING_LLM_TIMEOUT_SECONDS
 _MIN_TIMEOUT_SECONDS = 30.0
 _INITIAL_KNOWLEDGE = """\
 # 学习派生观察候选

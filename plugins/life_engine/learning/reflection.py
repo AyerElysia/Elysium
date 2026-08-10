@@ -33,15 +33,19 @@ from .prompts import (
     format_existing_insights_summary,
 )
 from .store import InsightStore
-from .timeouts import resolve_timeout_seconds, send_with_deadline
+from .timeouts import (
+    DEFAULT_LEARNING_LLM_TIMEOUT_SECONDS,
+    resolve_timeout_seconds,
+    send_with_deadline,
+)
 
 logger = logging.getLogger("life_engine.learning.reflection")
 
 # 反思冷却（秒）
 _DEFAULT_COOLDOWN_SECONDS = 5 * 60  # 5 分钟
 
-# 反思 LLM 调用超时（秒）。数字的来历与"为什么 45s 是错的"见 timeouts 模块。
-_DEFAULT_TIMEOUT_SECONDS = 180.0
+# 后台反思的单次 LLM 往返总预算；质量优先且仍保持有界，见 timeouts 模块。
+_DEFAULT_TIMEOUT_SECONDS = DEFAULT_LEARNING_LLM_TIMEOUT_SECONDS
 _MIN_TIMEOUT_SECONDS = 10.0
 _TIMEOUT_ENV_VAR = "ELYSIUM_REFLECTION_TIMEOUT_SECONDS"
 

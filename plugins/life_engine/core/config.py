@@ -193,6 +193,8 @@ class LifeEngineConfig(BaseConfig):
         "learning": {
             "enabled",
             "inject_to_heartbeat",
+            "model_task_name",
+            "llm_timeout_seconds",
             "reflection_cooldown_minutes",
             "audit_interval_hours",
             "compress_trigger_count",
@@ -382,10 +384,10 @@ class LifeEngineConfig(BaseConfig):
             description="每次苏醒最多读取的原始事件数（含操作噪音，游标推进用）。",
         )
         timeout_seconds: float = Field(
-            default=120.0,
+            default=600.0,
             ge=10.0,
             le=900.0,
-            description="单次见证模型调用的外层超时秒数。",
+            description="一次见证模型请求从 send 到最终响应消费共用的总硬时限（秒）；不是单个模型 attempt 的时限。",
         )
         retry_delay_seconds: int = Field(
             default=60,
@@ -663,6 +665,25 @@ class LifeEngineConfig(BaseConfig):
             description="是否在心跳 prompt 中注入自我认知文档和学习进展。",
         )
 
+        model_task_name: str = Field(
+            default="learning",
+            min_length=1,
+            description=(
+                "后台学习认知链使用的专用模型任务名；与前台表达和心跳 core "
+                "路由分离。"
+            ),
+        )
+
+        llm_timeout_seconds: float = Field(
+            default=900.0,
+            ge=30.0,
+            le=3600.0,
+            description=(
+                "反思、独立审计、知识整合与技能蒸馏每次 LLM 往返共享的单一"
+                "总截止时间（秒）；后台质量优先，但仍保持有界。"
+            ),
+        )
+
         maintenance_poll_seconds: float = Field(
             default=15.0,
             ge=1.0,
@@ -807,10 +828,10 @@ class LifeEngineConfig(BaseConfig):
         )
 
         timeout_seconds: float = Field(
-            default=45.0,
+            default=300.0,
             ge=3.0,
-            le=120.0,
-            description="单次认知机会候选生成的 LLM 超时秒数。",
+            le=900.0,
+            description="一次认知机会候选请求从 send 到最终响应消费共用的总硬时限（秒）；不是单个模型 attempt 的时限。",
         )
 
         max_prompt_chars: int = Field(

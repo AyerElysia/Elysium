@@ -7976,7 +7976,19 @@ class LifeEngineService(BaseService):
                     raise RuntimeError("SelectedLearningStorageNotStarted")
                 self._learning_scheduler = LearningScheduler(
                     workspace_path=cfg.settings.workspace_path,
-                    model_task_name=getattr(cfg.model, "task_name", "core"),
+                    model_task_name=(
+                        str(
+                            getattr(
+                                learning_cfg, "model_task_name", "learning"
+                            )
+                            or "learning"
+                        ).strip()
+                        or "learning"
+                    ),
+                    llm_timeout_seconds=float(
+                        getattr(learning_cfg, "llm_timeout_seconds", 900.0)
+                        or 900.0
+                    ),
                     # 反思候选可进入记忆检索；只有显式归属活跃意识实例的
                     # 主动反思才写 subject-authored interpretation。
                     memory_service=self._memory_service,

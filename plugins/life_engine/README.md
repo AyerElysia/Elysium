@@ -90,6 +90,8 @@ Life Engine 维护一个主体下的多个场景意识：
 
 工具清单是上下文预算边界，不是人格规则。`memory_witness` 的清单为空：它只见证，不直接行动。
 
+`memory_witness.timeout_seconds` 默认 600 秒，表示后台见证请求从 `send` 到最终响应消费共用的单一 monotonic 总硬时限，而不是单个模型 attempt 的时限。见证以质量优先，但失败仍保持有界：超时或外部取消不会提交 World perception receipt、不会推进 Life Event 消费游标，尚未见证的来源会留给后续重试。
+
 详见 [`docs/architecture/意识实例架构.md`](../../docs/architecture/意识实例架构.md) 与 [`docs/architecture/世界状态与意识实例协调.md`](../../docs/architecture/世界状态与意识实例协调.md)。
 
 ---
