@@ -135,8 +135,13 @@ _RUNTIME_ASSISTANT_INJECTIONS: dict[str, deque[str]] = {}
 _RUNTIME_ASSISTANT_INJECTION_LOCK = threading.Lock()
 _RECENT_VISIBLE_TEXT_REPLY_TTL_SECONDS = 5 * 60.0
 _RECENT_VISIBLE_TEXT_REPLY_MAX_ENTRIES = 128
-_REACTION_ONLY_TEXT_PATTERN = re.compile(
-    r"^(?:\s*\[(?:表情包|图片)(?:[:：][^\]]*)?\]\s*)+$"
+_RETIRED_REACTION_HINT_SUFFIX = (
+    "\n\n<reaction_only_hint>\n"
+    "这批新消息只有表情或图片，没有用户输入的实质文字。它很可能是对上一轮回复的反应。"
+    "只处理这次反应，不要重发、复述或重新回答上一轮的问题。"
+    "如果无需补充，可以调用 action-life_pass_and_wait；"
+    "如果图片本身表达了新内容，可以针对图片简短回应。\n"
+    "</reaction_only_hint>"
 )
 
 
@@ -280,8 +285,6 @@ class _WorkflowRuntime:
     must_reply: bool = False
     # sent_visible_reply: 本轮 loop 中是否已产生可见回复（跨 follow-up 轮累计）
     sent_visible_reply: bool = False
-    # reaction_only: 当前批次只有表情/图片自动描述，允许空响应直接收束。
-    reaction_only: bool = False
     # 当前未读批次指纹。可见文本去重只在同一触发批次内生效。
     active_unread_turn_key: str = ""
     # 最近成功发送的文本回复；按触发批次和目标 stream 隔离，防止同轮重答。
@@ -1940,6 +1943,49 @@ class LifeChatter(BaseChatter):
             )
         return cleaned_payloads
 
+    @classmethod
+    def _without_retired_reaction_guidance(
+        cls,
+        payloads: list[LLMPayload],
+    ) -> list[LLMPayload]:
+        """Remove the retired message-type directive from model context.
+
+        The tag was a transport-only instruction added by Life Chatter.  It
+        taught the expression model to treat emoji/image input as a reason to
+        remain silent.  Authoritative messages and trajectories are untouched;
+        only the derived rolling-context projection is normalized.
+        """
+
+        cleaned_payloads: list[LLMPayload] = []
+        for payload in payloads:
+            original_content = list(getattr(payload, "content", None) or [])
+            if payload.role != ROLE.USER:
+                cleaned_payloads.append(payload)
+                continue
+            changed = False
+            content: list[Any] = []
+            for part in original_content:
+                if not isinstance(part, Text):
+                    content.append(part)
+                    continue
+                if not part.text.endswith(_RETIRED_REACTION_HINT_SUFFIX):
+                    content.append(part)
+                    continue
+                cleaned_text = part.text[: -len(_RETIRED_REACTION_HINT_SUFFIX)]
+                if not cleaned_text:
+                    # An exact standalone tag may be user-authored.  Historical
+                    # injection always followed a non-empty rolling prompt.
+                    content.append(part)
+                    continue
+                changed = True
+                content.append(Text(cleaned_text))
+            cleaned_payloads.append(
+                payload
+                if not changed
+                else LLMPayload(payload.role, content)  # type: ignore[arg-type]
+            )
+        return cleaned_payloads
+
     def _bind_trajectory_identity(
         self,
         response: Any,
@@ -2163,6 +2209,7 @@ class LifeChatter(BaseChatter):
     @classmethod
     def _snapshot_data_for_payloads(cls, payloads: list[LLMPayload]) -> dict[str, Any]:
         payloads = cls._without_retired_think_history(payloads)
+        payloads = cls._without_retired_reaction_guidance(payloads)
         serialized_payloads = [
             item
             for item in (
@@ -2404,6 +2451,7 @@ class LifeChatter(BaseChatter):
             if payload is not None
         ]
         payloads = self._without_retired_think_history(payloads)
+        payloads = self._without_retired_reaction_guidance(payloads)
         # Legacy snapshots migrate to v3 canonical digests on the next
         # successful save. Do not rewrite storage from a read path.
         return payloads
@@ -3527,7 +3575,6 @@ class LifeChatter(BaseChatter):
         rt.media_seen.clear()
         rt.must_reply = False
         rt.sent_visible_reply = False
-        rt.reaction_only = False
         cls._transition(rt, _Phase.WAIT_USER, "model turn failed or cancelled")
 
     @staticmethod
@@ -3622,7 +3669,6 @@ class LifeChatter(BaseChatter):
             rt.unreads,
             str(getattr(chat_stream, "stream_id", "") or self.stream_id or ""),
         )
-        rt.reaction_only = self._is_reaction_only_batch(rt.unreads)
 
         # 如果 delta 里有真实外部消息，且当前不是 must_reply，重新评估
         # （路由只在 WAIT_USER 跑过一次；新消息可能改变"必须回复"判定）
@@ -4214,56 +4260,6 @@ class LifeChatter(BaseChatter):
         return True, ""
 
     @staticmethod
-    def _message_type_value(message: Message) -> str:
-        message_type = getattr(message, "message_type", "")
-        return str(getattr(message_type, "value", message_type) or "").strip().lower()
-
-    @classmethod
-    def _is_reaction_only_message(cls, message: Message) -> bool:
-        """判断消息是否仅含表情/图片自动描述，没有用户输入的实质文本。"""
-
-        if cls._is_proactive_trigger_message(message):
-            return False
-        if str(getattr(message, "sender_role", "") or "").lower() == "bot":
-            return False
-        if cls._message_type_value(message) not in {
-            MessageType.EMOJI.value,
-            MessageType.IMAGE.value,
-        }:
-            return False
-
-        plain_text = str(
-            getattr(message, "processed_plain_text", None) or ""
-        ).strip()
-        if not plain_text:
-            return True
-        return bool(_REACTION_ONLY_TEXT_PATTERN.fullmatch(plain_text))
-
-    @classmethod
-    def _is_reaction_only_batch(cls, unread_msgs: list[Message]) -> bool:
-        external_msgs = [
-            msg
-            for msg in unread_msgs
-            if not cls._is_proactive_trigger_message(msg)
-            and str(getattr(msg, "sender_role", "") or "").lower() != "bot"
-        ]
-        return bool(external_msgs) and all(
-            cls._is_reaction_only_message(msg) for msg in external_msgs
-        )
-
-    @staticmethod
-    def _append_reaction_only_instruction(prompt: str) -> str:
-        return (
-            f"{prompt}\n\n"
-            "<reaction_only_hint>\n"
-            "这批新消息只有表情或图片，没有用户输入的实质文字。它很可能是对上一轮回复的反应。"
-            "只处理这次反应，不要重发、复述或重新回答上一轮的问题。"
-            "如果无需补充，可以调用 action-life_pass_and_wait；"
-            "如果图片本身表达了新内容，可以针对图片简短回应。\n"
-            "</reaction_only_hint>"
-        )
-
-    @staticmethod
     def _unread_turn_key(unread_msgs: list[Message], stream_id: str) -> str:
         """Build a stable key for the exact unread batch that triggered a turn."""
         components: list[str] = [str(stream_id or "").strip()]
@@ -4449,8 +4445,6 @@ class LifeChatter(BaseChatter):
 
     @classmethod
     def _should_force_reply_for_unread_batch(cls, unread_msgs: list[Message]) -> bool:
-        if cls._is_reaction_only_batch(unread_msgs):
-            return False
         for msg in unread_msgs:
             if cls._is_proactive_trigger_message(msg):
                 continue
@@ -4825,7 +4819,6 @@ class LifeChatter(BaseChatter):
                 rt.follow_up_rounds = 0
                 rt.unreads = unread_msgs
                 rt.sent_visible_reply = False
-                rt.reaction_only = self._is_reaction_only_batch(unread_msgs)
                 rt.active_unread_turn_key = self._unread_turn_key(unread_msgs, stream_id)
 
                 unread_lines = "\n".join(
@@ -4878,10 +4871,6 @@ class LifeChatter(BaseChatter):
                     unread_lines=unread_lines,
                     history_text=history_text if include_history_in_prompt else "",
                 )
-                if rt.reaction_only:
-                    user_prompt_text = self._append_reaction_only_instruction(
-                        user_prompt_text
-                    )
                 (
                     rt.pending_transient_context_text,
                     rt.pending_life_context_high_water,
@@ -5198,21 +5187,6 @@ class LifeChatter(BaseChatter):
                         )
                     else:
                         logger.debug("life_chatter 本轮空响应，继续 loop")
-
-                    if rt.reaction_only:
-                        rt.must_reply = False
-                        if self._has_tool_result_tail(llm_response):
-                            llm_response.add_payload(
-                                LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT))
-                            )
-                        self._transition(
-                            rt,
-                            _Phase.WAIT_USER,
-                            "reaction-only turn needs no visible reply",
-                        )
-                        self._maybe_compact_runtime_context(llm_response)
-                        await self._save_rolling_context_snapshot(llm_response)
-                        return Wait()
 
                     rt.follow_up_rounds += 1
                     if rt.follow_up_rounds >= max_rounds:
@@ -5738,7 +5712,6 @@ class LifeChatter(BaseChatter):
                             rt.media_seen.clear()
                             rt.must_reply = False
                             rt.sent_visible_reply = False
-                            rt.reaction_only = False
                             self._transition(
                                 rt,
                                 _Phase.WAIT_USER,

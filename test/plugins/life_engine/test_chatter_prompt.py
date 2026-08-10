@@ -1092,6 +1092,43 @@ def test_rolling_context_projection_drops_whole_retired_think_assistant() -> Non
     )
 
 
+def test_rolling_context_projection_drops_retired_reaction_guidance() -> None:
+    legacy_hint = (
+        "incoming emoji remains visible"
+        + chatter_module._RETIRED_REACTION_HINT_SUFFIX
+    )
+    payloads = [
+        LLMPayload(
+            ROLE.USER,
+            Text(
+                "<reaction_only_hint>\n"
+                "user-authored text must remain\n"
+                "</reaction_only_hint>"
+            ),
+        ),
+        LLMPayload(
+            ROLE.ASSISTANT,
+            Text("assistant context" + chatter_module._RETIRED_REACTION_HINT_SUFFIX),
+        ),
+        LLMPayload(ROLE.USER, Text(legacy_hint)),
+        LLMPayload(ROLE.ASSISTANT, Text("keep assistant response")),
+    ]
+
+    cleaned = LifeChatter._without_retired_reaction_guidance(payloads)
+
+    assert cleaned[0] is payloads[0]
+    assert cleaned[1] is payloads[1]
+    assert [part.text for part in cleaned[2].content] == [
+        "incoming emoji remains visible"
+    ]
+    assert cleaned[3] is payloads[3]
+    assert LifeChatter._without_retired_reaction_guidance(cleaned) == cleaned
+    LLMContextManager()._validate_payloads(
+        cleaned,
+        allow_incomplete_tail=False,
+    )
+
+
 @pytest.mark.asyncio
 async def test_rolling_context_legacy_think_load_is_read_only_then_save_normalizes(
     tmp_path,
@@ -1103,7 +1140,13 @@ async def test_rolling_context_legacy_think_load_is_read_only_then_save_normaliz
     chatter.instance_id = "chat_global"
 
     legacy_payloads = [
-        LLMPayload(ROLE.USER, Text("new message")),
+        LLMPayload(
+            ROLE.USER,
+            Text(
+                "new message"
+                + chatter_module._RETIRED_REACTION_HINT_SUFFIX
+            ),
+        ),
         LLMPayload(
             ROLE.ASSISTANT,
             [
@@ -1177,6 +1220,7 @@ async def test_rolling_context_legacy_think_load_is_read_only_then_save_normaliz
         ROLE.TOOL_RESULT,
         ROLE.ASSISTANT,
     ]
+    assert [part.text for part in loaded[0].content] == ["new message"]
     LLMContextManager()._validate_payloads(
         loaded,
         allow_incomplete_tail=False,
@@ -1192,6 +1236,10 @@ async def test_rolling_context_legacy_think_load_is_read_only_then_save_normaliz
         part.get("name") != "action-think"
         for payload in normalized["payloads"]
         for part in payload["content"]
+    )
+    assert "reaction_only_hint" not in json.dumps(
+        normalized,
+        ensure_ascii=False,
     )
 
 
@@ -2073,7 +2121,7 @@ async def test_life_chatter_recent_duplicate_reply_is_suppressed_and_ends_turn(m
     LifeChatter.reset_global_runtime()
 
 
-async def test_life_chatter_reaction_only_empty_turn_ends_without_fallback(monkeypatch) -> None:
+async def test_life_chatter_external_media_empty_turn_uses_standard_follow_up(monkeypatch) -> None:
     LifeChatter.reset_global_runtime()
 
     class FakeResponse:
@@ -2089,12 +2137,18 @@ async def test_life_chatter_reaction_only_empty_turn_ends_without_fallback(monke
         response=FakeResponse(),
         phase=_Phase.TOOL_EXEC,
         history_merged=True,
-        unreads=[],
+        unreads=[
+            Message(
+                content="base64-data",
+                processed_plain_text="[表情包:害羞]",
+                message_type=MessageType.EMOJI,
+                sender_role="other",
+            )
+        ],
         cross_round_seen_signatures=set(),
         unread_msgs_to_flush=[],
         active_stream_id="stream-a",
-        must_reply=False,
-        reaction_only=True,
+        must_reply=True,
     )
     LifeChatter._GLOBAL_RUNTIME = rt
     LifeChatter._GLOBAL_USABLE_MAP = {}
@@ -2107,7 +2161,7 @@ async def test_life_chatter_reaction_only_empty_turn_ends_without_fallback(monke
         return [], []
 
     async def fail_fallback(*_args, **_kwargs):
-        raise AssertionError("reaction-only empty turn must not send fallback")
+        raise AssertionError("a first empty turn must schedule a normal follow-up")
 
     monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
     monkeypatch.setattr(chatter, "_send_must_reply_fallback", fail_fallback)
@@ -2118,9 +2172,10 @@ async def test_life_chatter_reaction_only_empty_turn_ends_without_fallback(monke
         service=None,
     )
 
-    assert isinstance(result, Wait)
-    assert rt.phase == _Phase.WAIT_USER
-    assert rt.follow_up_rounds == 0
+    assert isinstance(result, Success)
+    assert rt.phase == _Phase.FOLLOW_UP
+    assert rt.follow_up_rounds == 1
+    assert rt.must_reply is True
 
     LifeChatter.reset_global_runtime()
 
@@ -2175,7 +2230,7 @@ async def test_life_chatter_empty_turn_continues_loop_until_max_rounds(monkeypat
     LifeChatter.reset_global_runtime()
 
 
-def test_life_chatter_reaction_only_batch_does_not_force_reply() -> None:
+def test_life_chatter_external_media_uses_same_reply_commitment_as_text() -> None:
     reaction = Message(
         content="base64-data",
         processed_plain_text="[表情包:害羞]",
@@ -2188,11 +2243,37 @@ def test_life_chatter_reaction_only_batch_does_not_force_reply() -> None:
         message_type=MessageType.IMAGE,
         sender_role="other",
     )
+    text = Message(
+        content="hello",
+        processed_plain_text="hello",
+        message_type=MessageType.TEXT,
+        sender_role="other",
+    )
+    voice = Message(
+        content="voice-data",
+        processed_plain_text="[voice transcript]",
+        message_type=MessageType.VOICE,
+        sender_role="other",
+    )
 
-    assert LifeChatter._is_reaction_only_batch([reaction]) is True
-    assert LifeChatter._should_force_reply_for_unread_batch([reaction]) is False
-    assert LifeChatter._is_reaction_only_batch([image_with_text]) is False
+    assert LifeChatter._should_force_reply_for_unread_batch([reaction]) is True
     assert LifeChatter._should_force_reply_for_unread_batch([image_with_text]) is True
+    assert LifeChatter._should_force_reply_for_unread_batch([text]) is True
+    assert LifeChatter._should_force_reply_for_unread_batch([voice]) is True
+    assert (
+        LifeChatter._should_force_reply_for_decision(
+            {"should_respond": False},
+            [reaction],
+        )
+        is False
+    )
+    assert (
+        LifeChatter._should_force_reply_for_decision(
+            {"should_respond": True},
+            [reaction],
+        )
+        is True
+    )
 
 
 def test_life_chatter_recent_visible_text_reply_cache_is_scoped_and_expires() -> None:
@@ -2853,7 +2934,6 @@ async def test_life_chatter_model_turn_timeout_releases_runtime_owner(monkeypatc
         active_stream_id="stream-a",
         must_reply=True,
         sent_visible_reply=True,
-        reaction_only=True,
         active_unread_turn_key="turn-1",
     )
     LifeChatter._GLOBAL_RUNTIME = rt
@@ -2890,7 +2970,6 @@ async def test_life_chatter_model_turn_timeout_releases_runtime_owner(monkeypatc
     assert rt.media_seen == set()
     assert rt.must_reply is False
     assert rt.sent_visible_reply is False
-    assert rt.reaction_only is False
     assert [part.text for part in request.payloads[0].content] == ["existing"]
 
     LifeChatter.reset_global_runtime()
