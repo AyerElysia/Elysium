@@ -1085,8 +1085,16 @@ class LifeEngineService(BaseService):
             *,
             namespace: str,
             state_key: str,
+            required: bool = True,
         ) -> Any:
-            """Wait for one crash-left lease without weakening DB-time fencing."""
+            """Wait for one crash-left lease without weakening DB-time fencing.
+
+            When ``required`` is False (multi-writer second instance), a claim
+            that stays leased past the deadline degrades to ``None`` instead of
+            failing the whole plugin startup.  The owning instance keeps the
+            projection/maintenance writer; non-owners append immutable events
+            through the unclaimed handle only.
+            """
 
             from ..storage import SingletonWriterClaimConflict
 
@@ -1104,7 +1112,15 @@ class LifeEngineService(BaseService):
                 except SingletonWriterClaimConflict:
                     remaining = claim_deadline - time.monotonic()
                     if remaining <= 0:
-                        raise
+                        if required:
+                            raise
+                        logger.warning(
+                            "selected storage writer claim is not owned by this "
+                            "instance; degrading singleton domain to avoid "
+                            f"blocking plugin startup: namespace={namespace} "
+                            f"state_key={state_key}"
+                        )
+                        return None
                     if not logged_wait:
                         logger.warning(
                             "selected storage writer claim is still leased; "
@@ -1199,12 +1215,25 @@ class LifeEngineService(BaseService):
             learning_writer_claim = await _acquire_writer_claim(
                 namespace=LEARNING_WRITER_CLAIM_NAMESPACE,
                 state_key=LEARNING_WRITER_CLAIM_STATE_KEY,
+                required=False,
             )
-            learning_stores = await open_learning_stores(
-                runtime,
-                initialize_schema=False,
-                writer_claim=learning_writer_claim,
-            )
+            # Multi-writer: when another instance owns the singleton learning
+            # projector claim, this instance degrades the mutable projection
+            # domain instead of failing plugin startup.  Immutable learning
+            # events stay appendable through the unclaimed handle above.
+            if learning_writer_claim is None:
+                logger.warning(
+                    "learning projector claim not acquired; this instance "
+                    "appends immutable learning events but does not own "
+                    "selected projections/maintenance"
+                )
+                learning_stores = None
+            else:
+                learning_stores = await open_learning_stores(
+                    runtime,
+                    initialize_schema=False,
+                    writer_claim=learning_writer_claim,
+                )
         else:
             learning_writer_claim = None
         registry = await AsyncConsciousnessRegistry.load(stores.presence)
@@ -8204,8 +8233,19 @@ class LifeEngineService(BaseService):
             try:
                 from ..learning.scheduler import LearningScheduler
 
-                if self._selectable_storage_enabled and self._learning_stores is None:
-                    raise RuntimeError("SelectedLearningStorageNotStarted")
+                # Multi-writer second instance may lack the singleton learning
+                # projector claim; LearningScheduler degrades to local stores
+                # while immutable learning events remain appendable.
+                if (
+                    self._selectable_storage_enabled
+                    and self._learning_stores is None
+                ):
+                    logger.warning(
+                        "learning scheduler starts without selected projection "
+                        "stores (projector owned by another instance); "
+                        "reflection/knowledge use local stores, events append "
+                        "through the unclaimed handle"
+                    )
                 self._learning_scheduler = LearningScheduler(
                     workspace_path=cfg.settings.workspace_path,
                     model_task_name=(

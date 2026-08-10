@@ -1094,10 +1094,16 @@ async def test_selected_storage_claim_wait_is_cancellable_and_cleans_runtime(
     assert runtime.close_calls == 1
 
 
-async def test_selected_storage_claims_share_one_startup_deadline(
+async def test_selected_storage_learning_claim_degrades_when_other_owner_holds_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A second instance never blocks plugin startup over the Learning
+    projector singleton.  When another live owner holds the claim past the
+    shared deadline, this instance degrades the mutable selected
+    projections/maintenance domain to ``None`` while immutable learning
+    evidence stays appendable through the unclaimed handle."""
+
     stores = build_fake_stores()
     ledger = _FakeLifeEventStore()
     runtimes, _ = _install_selected_factories(
@@ -1123,6 +1129,9 @@ async def test_selected_storage_claims_share_one_startup_deadline(
         return await original_acquire(**kwargs)
 
     runtime.acquire_singleton_writer = _learning_conflict
+    # 100.0 = claim_deadline base; 221.1 > 100.0 + 121.0 so the learning claim
+    # hits the shared deadline on its first conflict and degrades to None
+    # instead of raising and failing plugin startup.
     monotonic_values = iter((100.0, 221.1))
     monkeypatch.setattr(
         core_module,
@@ -1134,12 +1143,22 @@ async def test_selected_storage_claims_share_one_startup_deadline(
         await service._start_selected_storage()
 
     monkeypatch.setattr(service, "_start_impl", _start_selected_only)
-    with pytest.raises(SingletonWriterClaimConflict, match="epoch=4"):
-        await service.start()
+
+    # Startup must succeed despite the live other-owner learning claim.
+    await service.start()
 
     assert learning_attempts == 1
-    assert runtime.revoke_calls == 1
-    assert runtime.close_calls == 1
+    assert service._learning_writer_claim is None
+    assert service._learning_stores is None
+    # Immutable evidence handle stays attached so this instance keeps
+    # appending learning events; the projector handle is dropped.
+    assert service._learning_event_store is not None
+    # The fake records the unclaimed handle only (writer_claim=None).
+    assert runtime.learning_open_writer_claims == [None]
+    # The runtime-context claim (legacy path) was acquired successfully and is
+    # still owned, so no revoke/close happens during a normal startup.
+    assert runtime.revoke_calls == 0
+    assert runtime.close_calls == 0
 
 
 async def test_presence_outbox_limit_fails_without_losing_remaining_evidence() -> None:
