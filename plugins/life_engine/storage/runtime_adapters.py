@@ -217,68 +217,67 @@ class SQLRuntimeStateStore:
                 state_key=state_key,
                 claim=writer_claim,
             )
-            try:
-                row = (
-                    await session.execute(
-                        text(
-                            """SELECT namespace, state_key, revision, schema_version,
-                                payload_json, payload_sha256, updated_at
-                            FROM runtime_states
-                            WHERE namespace = :namespace AND state_key = :state_key"""
-                            + self._for_update
-                        ),
-                        {"namespace": namespace, "state_key": state_key},
-                    )
-                ).mappings().first()
-                current_revision = int(row["revision"]) if row is not None else 0
-                if current_revision != expected_revision:
+            row = (
+                await session.execute(
+                    text(
+                        """SELECT namespace, state_key, revision, schema_version,
+                            payload_json, payload_sha256, updated_at
+                        FROM runtime_states
+                        WHERE namespace = :namespace AND state_key = :state_key"""
+                        + self._for_update
+                    ),
+                    {"namespace": namespace, "state_key": state_key},
+                )
+            ).mappings().first()
+            current_revision = int(row["revision"]) if row is not None else 0
+            if current_revision != expected_revision:
+                raise RuntimeStateConflict(
+                    f"RuntimeStateRevisionConflict:{namespace}:{state_key}:"
+                    f"expected={expected_revision}:actual={current_revision}"
+                )
+            now = await self._database_now(session)
+            revision = current_revision + 1
+            parameters = {
+                "namespace": namespace,
+                "state_key": state_key,
+                "revision": revision,
+                "schema_version": schema_version,
+                "payload_json": payload_json,
+                "payload_sha256": payload_sha256,
+                "updated_at": self._bind_time(now),
+            }
+            if row is None:
+                await session.execute(
+                    text(
+                        """INSERT INTO runtime_states (
+                            namespace, state_key, revision, schema_version,
+                            payload_json, payload_sha256, updated_at
+                        ) VALUES (
+                            :namespace, :state_key, :revision, :schema_version,
+                            :payload_json, :payload_sha256, :updated_at
+                        )"""
+                    ),
+                    parameters,
+                )
+            else:
+                result = await session.execute(
+                    text(
+                        """UPDATE runtime_states SET
+                            revision = :revision,
+                            schema_version = :schema_version,
+                            payload_json = :payload_json,
+                            payload_sha256 = :payload_sha256,
+                            updated_at = :updated_at
+                        WHERE namespace = :namespace AND state_key = :state_key
+                            AND revision = :expected_revision"""
+                    ),
+                    {**parameters, "expected_revision": expected_revision},
+                )
+                if result.rowcount != 1:
                     raise RuntimeStateConflict(
-                        f"RuntimeStateRevisionConflict:{namespace}:{state_key}:"
-                        f"expected={expected_revision}:actual={current_revision}"
+                        f"RuntimeStateRevisionConflict:{namespace}:{state_key}"
                     )
-                now = await self._database_now(session)
-                revision = current_revision + 1
-                parameters = {
-                    "namespace": namespace,
-                    "state_key": state_key,
-                    "revision": revision,
-                    "schema_version": schema_version,
-                    "payload_json": payload_json,
-                    "payload_sha256": payload_sha256,
-                    "updated_at": self._bind_time(now),
-                }
-                if row is None:
-                    await session.execute(
-                        text(
-                            """INSERT INTO runtime_states (
-                                namespace, state_key, revision, schema_version,
-                                payload_json, payload_sha256, updated_at
-                            ) VALUES (
-                                :namespace, :state_key, :revision, :schema_version,
-                                :payload_json, :payload_sha256, :updated_at
-                            )"""
-                        ),
-                        parameters,
-                    )
-                else:
-                    result = await session.execute(
-                        text(
-                            """UPDATE runtime_states SET
-                                revision = :revision,
-                                schema_version = :schema_version,
-                                payload_json = :payload_json,
-                                payload_sha256 = :payload_sha256,
-                                updated_at = :updated_at
-                            WHERE namespace = :namespace AND state_key = :state_key
-                                AND revision = :expected_revision"""
-                        ),
-                        {**parameters, "expected_revision": expected_revision},
-                    )
-                    if result.rowcount != 1:
-                        raise RuntimeStateConflict(
-                            f"RuntimeStateRevisionConflict:{namespace}:{state_key}"
-                        )
-            finally:
+            if writer_claim is not None:
                 await self.runtime.clear_singleton_writer_write(session)
         return RuntimeStateRecord(
             namespace=namespace,

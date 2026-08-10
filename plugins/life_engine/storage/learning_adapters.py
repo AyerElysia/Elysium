@@ -136,11 +136,10 @@ class SQLLearningStore:
                             uow.session,
                             self.writer_claim,
                         )
-                    try:
-                        return await operation(uow.session)
-                    finally:
-                        if self.writer_claim is not None:
-                            await self.runtime.clear_singleton_writer_write(uow.session)
+                    result = await operation(uow.session)
+                    if self.writer_claim is not None:
+                        await self.runtime.clear_singleton_writer_write(uow.session)
+                    return result
             except DBAPIError as exc:
                 if "LearningSingletonWriterClaimRequired" in str(exc.orig):
                     raise SingletonWriterClaimLost(

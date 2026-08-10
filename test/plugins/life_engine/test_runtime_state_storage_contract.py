@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
+from sqlalchemy.exc import OperationalError, PendingRollbackError
 
-from plugins.life_engine.storage.authority import FileAuthorityRegistry, StaleAuthorityToken
-from plugins.life_engine.storage.contracts import StorageBackendRuntime, StorageRuntimeClosed
+from plugins.life_engine.storage.authority import (
+    FileAuthorityRegistry,
+    StaleAuthorityToken,
+)
+from plugins.life_engine.storage.contracts import (
+    StorageBackendRuntime,
+    StorageRuntimeClosed,
+)
 from plugins.life_engine.storage.factory import (
     LocalBackendSettings,
     StorageFactorySettings,
@@ -120,6 +128,180 @@ async def test_runtime_state_uses_exact_revision_cas(tmp_path: Path) -> None:
                 schema_version=2,
                 payload={"payloads": []},
             )
+
+
+@pytest.mark.asyncio
+async def test_runtime_failed_write_preserves_original_dbapi_without_clear(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _local_store(tmp_path) as (runtime, store):
+        original = OperationalError(
+            "SELECT CURRENT_TIMESTAMP(6)",
+            {},
+            RuntimeError("connection invalidated during runtime state write"),
+        )
+        clear_calls = 0
+
+        async def fail_database_now(_session: object) -> None:
+            raise original
+
+        async def forbidden_clear(_runtime: object, _session: object) -> None:
+            nonlocal clear_calls
+            clear_calls += 1
+            raise PendingRollbackError("secondary cleanup masked primary error")
+
+        monkeypatch.setattr(store, "_database_now", fail_database_now)
+        monkeypatch.setattr(
+            type(runtime),
+            "clear_singleton_writer_write",
+            forbidden_clear,
+        )
+
+        with pytest.raises(OperationalError) as raised:
+            await store.put_state(
+                namespace="life_chatter",
+                state_key="chat_global",
+                expected_revision=0,
+                schema_version=2,
+                payload={"heartbeat_count": 1},
+            )
+
+        assert raised.value is original
+        assert clear_calls == 0
+        assert await store.get_state("life_chatter", "chat_global") is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_cancelled_write_does_not_run_cleanup_sql(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _local_store(tmp_path) as (runtime, store):
+        clear_calls = 0
+
+        async def cancel_database_now(_session: object) -> None:
+            raise asyncio.CancelledError
+
+        async def forbidden_clear(_runtime: object, _session: object) -> None:
+            nonlocal clear_calls
+            clear_calls += 1
+
+        monkeypatch.setattr(store, "_database_now", cancel_database_now)
+        monkeypatch.setattr(
+            type(runtime),
+            "clear_singleton_writer_write",
+            forbidden_clear,
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await store.put_state(
+                namespace="life_chatter",
+                state_key="chat_global",
+                expected_revision=0,
+                schema_version=2,
+                payload={"heartbeat_count": 1},
+            )
+
+        assert clear_calls == 0
+        assert await store.get_state("life_chatter", "chat_global") is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_unclaimed_success_skips_redundant_tail_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _local_store(tmp_path) as (runtime, store):
+        clear_calls = 0
+
+        async def unexpected_clear(_runtime: object, _session: object) -> None:
+            nonlocal clear_calls
+            clear_calls += 1
+
+        monkeypatch.setattr(
+            type(runtime),
+            "clear_singleton_writer_write",
+            unexpected_clear,
+        )
+        record = await store.put_state(
+            namespace="life_chatter",
+            state_key="chat_global",
+            expected_revision=0,
+            schema_version=2,
+            payload={"heartbeat_count": 1},
+        )
+
+        assert record.revision == 1
+        assert clear_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_runtime_claimed_success_clears_once_and_clear_failure_rolls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _local_store(tmp_path) as (runtime, store):
+        claim = await runtime.acquire_singleton_writer(
+            namespace="life_engine.runtime_context",
+            state_key="global",
+            owner_instance_id="runtime-cleanup-contract",
+            lease_seconds=30,
+        )
+        original_clear = type(runtime).clear_singleton_writer_write
+        clear_calls = 0
+
+        async def fail_clear(_runtime: object, session: object) -> None:
+            nonlocal clear_calls
+            clear_calls += 1
+            raise OperationalError(
+                "DELETE runtime_singleton_writer_bindings",
+                {},
+                RuntimeError("cleanup connection lost"),
+            )
+
+        monkeypatch.setattr(
+            type(runtime),
+            "clear_singleton_writer_write",
+            fail_clear,
+        )
+        with pytest.raises(OperationalError, match="cleanup connection lost"):
+            await store.put_state(
+                namespace=claim.namespace,
+                state_key=claim.state_key,
+                expected_revision=0,
+                schema_version=2,
+                payload={"heartbeat_count": 1},
+                writer_claim=claim,
+            )
+        assert clear_calls == 1
+        monkeypatch.setattr(
+            type(runtime),
+            "clear_singleton_writer_write",
+            original_clear,
+        )
+        assert await store.get_state(claim.namespace, claim.state_key) is None
+
+        async def count_clear(runtime_instance: object, session: object) -> None:
+            nonlocal clear_calls
+            clear_calls += 1
+            await original_clear(runtime_instance, session)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(
+            type(runtime),
+            "clear_singleton_writer_write",
+            count_clear,
+        )
+        record = await store.put_state(
+            namespace=claim.namespace,
+            state_key=claim.state_key,
+            expected_revision=0,
+            schema_version=2,
+            payload={"heartbeat_count": 2},
+            writer_claim=claim,
+        )
+        assert record.revision == 1
+        assert clear_calls == 2
 
 
 @pytest.mark.asyncio

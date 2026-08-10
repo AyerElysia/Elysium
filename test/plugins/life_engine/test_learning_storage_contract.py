@@ -204,6 +204,27 @@ def _projection(
     )
 
 
+async def _create_binding_probe(runtime: StorageBackendRuntime) -> None:
+    async with runtime.unit_of_work() as uow:
+        await uow.session.execute(
+            text(
+                """CREATE TABLE learning_binding_rollback_probe (
+                    marker INTEGER NOT NULL
+                )"""
+            )
+        )
+
+
+async def _binding_probe_count(runtime: StorageBackendRuntime) -> int:
+    async with runtime.unit_of_work() as uow:
+        return int(
+            await uow.session.scalar(
+                text("SELECT COUNT(*) FROM learning_binding_rollback_probe")
+            )
+            or 0
+        )
+
+
 async def test_learning_commit_is_atomic_idempotent_and_conflict_explicit(
     tmp_path: Path,
 ) -> None:
@@ -262,6 +283,247 @@ async def test_learning_commit_is_atomic_idempotent_and_conflict_explicit(
             "actual_projection_sha256": first.projections[0].projection_sha256,
         }
         assert await store.event_by_occurrence("learning:cas-rolled-back") is None
+
+
+async def test_learning_failed_write_preserves_original_dbapi_and_rolls_back_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _local_store(tmp_path) as (runtime, store, _, _):
+        await _create_binding_probe(runtime)
+        claim = await runtime.acquire_singleton_writer(
+            namespace=LEARNING_WRITER_CLAIM_NAMESPACE,
+            state_key=LEARNING_WRITER_CLAIM_STATE_KEY,
+            owner_instance_id="learning-cleanup-contract",
+            lease_seconds=30,
+        )
+        monkeypatch.setattr(store, "writer_claim", claim)
+        original_bind = type(runtime).bind_singleton_writer_write
+        clear_calls = 0
+
+        async def bind_with_probe(
+            runtime_instance: object,
+            session: object,
+            bound_claim: object,
+        ) -> None:
+            await original_bind(  # type: ignore[arg-type]
+                runtime_instance,
+                session,
+                bound_claim,
+            )
+            await session.execute(  # type: ignore[attr-defined]
+                text("INSERT INTO learning_binding_rollback_probe VALUES (1)")
+            )
+
+        async def forbidden_clear(_runtime: object, _session: object) -> None:
+            nonlocal clear_calls
+            clear_calls += 1
+            raise OperationalError(
+                "DELETE runtime_singleton_writer_bindings",
+                {},
+                RuntimeError("secondary cleanup masked primary error"),
+            )
+
+        original = OperationalError(
+            "INSERT learning_events",
+            {},
+            RuntimeError("connection invalidated during learning write"),
+        )
+
+        async def fail_operation(_session: object) -> None:
+            raise original
+
+        monkeypatch.setattr(
+            type(runtime),
+            "bind_singleton_writer_write",
+            bind_with_probe,
+        )
+        monkeypatch.setattr(
+            type(runtime),
+            "clear_singleton_writer_write",
+            forbidden_clear,
+        )
+
+        with pytest.raises(OperationalError) as raised:
+            await store._write(fail_operation)  # type: ignore[attr-defined]
+
+        assert raised.value is original
+        assert clear_calls == 0
+        assert await _binding_probe_count(runtime) == 0
+
+
+async def test_learning_cancelled_write_rolls_back_without_cleanup_sql(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _local_store(tmp_path) as (runtime, store, _, _):
+        await _create_binding_probe(runtime)
+        claim = await runtime.acquire_singleton_writer(
+            namespace=LEARNING_WRITER_CLAIM_NAMESPACE,
+            state_key=LEARNING_WRITER_CLAIM_STATE_KEY,
+            owner_instance_id="learning-cancel-contract",
+            lease_seconds=30,
+        )
+        monkeypatch.setattr(store, "writer_claim", claim)
+        original_bind = type(runtime).bind_singleton_writer_write
+        clear_calls = 0
+
+        async def bind_with_probe(
+            runtime_instance: object,
+            session: object,
+            bound_claim: object,
+        ) -> None:
+            await original_bind(  # type: ignore[arg-type]
+                runtime_instance,
+                session,
+                bound_claim,
+            )
+            await session.execute(  # type: ignore[attr-defined]
+                text("INSERT INTO learning_binding_rollback_probe VALUES (1)")
+            )
+
+        async def count_clear(_runtime: object, _session: object) -> None:
+            nonlocal clear_calls
+            clear_calls += 1
+
+        async def cancel_operation(_session: object) -> None:
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(
+            type(runtime),
+            "bind_singleton_writer_write",
+            bind_with_probe,
+        )
+        monkeypatch.setattr(
+            type(runtime),
+            "clear_singleton_writer_write",
+            count_clear,
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await store._write(cancel_operation)  # type: ignore[attr-defined]
+
+        assert clear_calls == 0
+        assert await _binding_probe_count(runtime) == 0
+
+
+async def test_learning_retry_rebinds_and_only_successful_attempt_clears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _local_store(tmp_path) as (runtime, store, _, _):
+        await _create_binding_probe(runtime)
+        claim = await runtime.acquire_singleton_writer(
+            namespace=LEARNING_WRITER_CLAIM_NAMESPACE,
+            state_key=LEARNING_WRITER_CLAIM_STATE_KEY,
+            owner_instance_id="learning-retry-contract",
+            lease_seconds=30,
+        )
+        monkeypatch.setattr(store, "writer_claim", claim)
+        original_bind = type(runtime).bind_singleton_writer_write
+        original_clear = type(runtime).clear_singleton_writer_write
+        bind_calls = 0
+        clear_calls = 0
+        operation_calls = 0
+
+        async def bind_with_probe(
+            runtime_instance: object,
+            session: object,
+            bound_claim: object,
+        ) -> None:
+            nonlocal bind_calls
+            bind_calls += 1
+            await original_bind(  # type: ignore[arg-type]
+                runtime_instance,
+                session,
+                bound_claim,
+            )
+            await session.execute(  # type: ignore[attr-defined]
+                text("INSERT INTO learning_binding_rollback_probe VALUES (1)")
+            )
+
+        async def clear_with_probe(
+            runtime_instance: object,
+            session: object,
+        ) -> None:
+            nonlocal clear_calls
+            clear_calls += 1
+            await session.execute(  # type: ignore[attr-defined]
+                text("DELETE FROM learning_binding_rollback_probe")
+            )
+            await original_clear(  # type: ignore[arg-type]
+                runtime_instance,
+                session,
+            )
+
+        async def deadlock_then_succeed(_session: object) -> str:
+            nonlocal operation_calls
+            operation_calls += 1
+            if operation_calls == 1:
+                raise OperationalError(
+                    "INSERT learning_events",
+                    {},
+                    RuntimeError(1213, "deadlock found"),
+                )
+            return "committed"
+
+        monkeypatch.setattr(
+            type(runtime),
+            "bind_singleton_writer_write",
+            bind_with_probe,
+        )
+        monkeypatch.setattr(
+            type(runtime),
+            "clear_singleton_writer_write",
+            clear_with_probe,
+        )
+        result = await store._write(deadlock_then_succeed)  # type: ignore[attr-defined]
+
+        assert result == "committed"
+        assert operation_calls == 2
+        assert bind_calls == 2
+        assert clear_calls == 1
+        assert await _binding_probe_count(runtime) == 0
+
+
+async def test_learning_successful_operation_clear_failure_rolls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _local_store(tmp_path) as (runtime, store, _, _):
+        claim = await runtime.acquire_singleton_writer(
+            namespace=LEARNING_WRITER_CLAIM_NAMESPACE,
+            state_key=LEARNING_WRITER_CLAIM_STATE_KEY,
+            owner_instance_id="learning-clear-contract",
+            lease_seconds=30,
+        )
+        monkeypatch.setattr(store, "writer_claim", claim)
+        original_clear = type(runtime).clear_singleton_writer_write
+        clear_calls = 0
+
+        async def fail_clear(_runtime: object, _session: object) -> None:
+            nonlocal clear_calls
+            clear_calls += 1
+            raise OperationalError(
+                "DELETE runtime_singleton_writer_bindings",
+                {},
+                RuntimeError("learning cleanup connection lost"),
+            )
+
+        monkeypatch.setattr(
+            type(runtime),
+            "clear_singleton_writer_write",
+            fail_clear,
+        )
+        with pytest.raises(OperationalError, match="learning cleanup connection lost"):
+            await store.commit(events=[_event("clear-failed")], projections=[])
+        assert clear_calls == 1
+        monkeypatch.setattr(
+            type(runtime),
+            "clear_singleton_writer_write",
+            original_clear,
+        )
+        assert await store.event_by_occurrence("learning:clear-failed") is None
 
 
 async def test_learning_projection_revision_frontier_and_rebuild_state(
