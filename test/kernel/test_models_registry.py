@@ -78,16 +78,13 @@ def test_models_example_is_complete_and_budgeted() -> None:
         assert all(entry["timeout"] == expected_timeout for entry in entries)
 
 
-def test_production_and_example_share_background_attempt_timeout_policy() -> None:
+def test_example_defines_background_attempt_timeout_policy() -> None:
+    # 仅依赖入库的 models.toml.example（CI 自包含、不含真实密钥）；
+    # 生产 config/models.toml 被 .gitignore 忽略，绝不能作为 CI 测试输入。
     config_dir = Path(__file__).parents[2] / "config"
-    production = ModelsConfig(config_dir / "models.toml")
     example = ModelsConfig(config_dir / "models.toml.example")
 
     assert "learning" in PRODUCTION_MODEL_TASKS
-    assert {
-        task_name: production.tasks[task_name].get("attempt_timeout_seconds")
-        for task_name in EXPECTED_ATTEMPT_TIMEOUTS
-    } == EXPECTED_ATTEMPT_TIMEOUTS
     assert {
         task_name: example.tasks[task_name].get("attempt_timeout_seconds")
         for task_name in EXPECTED_ATTEMPT_TIMEOUTS
