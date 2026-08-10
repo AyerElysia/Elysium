@@ -65,6 +65,7 @@ class _SharedLearningEventStore:
     def __init__(self) -> None:
         self.records: list[LearningEventRecord] = []
         self.projection_write_count = 0
+        self.read_calls: list[tuple[int, int, tuple[str, ...]]] = []
 
     async def commit(self, *, events, projections) -> LearningCommitResult:
         self.projection_write_count += len(projections)
@@ -109,6 +110,7 @@ class _SharedLearningEventStore:
         limit: int = 100,
         event_kinds: tuple[str, ...] = (),
     ) -> list[LearningEventRecord]:
+        self.read_calls.append((after_position, limit, event_kinds))
         rows = [
             record
             for record in self.records
@@ -422,6 +424,147 @@ async def test_cross_node_enqueue_is_event_only_and_owner_projects_once(
     assert (
         owner.store.load_state()["reflection_runtime_v1"]["event_cursor"] == 1
     )
+    assert all(
+        event_kinds == ("reflection.enqueued",)
+        for _, _, event_kinds in event_store.read_calls
+    )
+
+
+async def test_legacy_missing_cursor_filters_large_unrelated_events(
+    tmp_path: Path,
+) -> None:
+    """A legacy projection never materializes unrelated snapshot payloads."""
+
+    event_store = _SharedLearningEventStore()
+    event_store.records.append(
+        LearningEventRecord(
+            position=1,
+            occurrence_id="snapshot-1",
+            event_kind="learning_insights.snapshot",
+            occurred_at="2026-08-10T00:00:00+00:00",
+            recorded_at="2026-08-10T00:00:00+00:00",
+            source="learning.projector",
+            actor_consciousness_instance_id="",
+            subject_revision="",
+            provenance={},
+            payload={"oversized": "x" * (1024 * 1024)},
+            event_sha256="0" * 64,
+        )
+    )
+    producer = LearningScheduler(
+        workspace_path=tmp_path / "producer",
+        learning_event_store=event_store,
+    )
+    owner = LearningScheduler(
+        workspace_path=tmp_path / "owner",
+        learning_event_store=event_store,
+    )
+    job_id = await producer.enqueue_reflection(
+        reflection_kind="interaction",
+        reflection_text="one bounded reflection",
+        source_event_ids=["life-event:filtered"],
+        actor_consciousness_instance_id="chat_global",
+    )
+
+    assert await owner._ingest_reflection_events() == 1
+    assert owner._reflection_jobs()[0].job_id == job_id
+    assert event_store.read_calls == [(0, 500, ("reflection.enqueued",))]
+    assert owner.store.load_state()["reflection_event_cursor_v1"] == 2
+
+
+async def test_reflection_cursor_uses_opaque_source_frontier(
+    tmp_path: Path,
+) -> None:
+    """Sparse positions advance to the captured authority high-water."""
+
+    event_store = _SharedLearningEventStore()
+    producer = LearningScheduler(
+        workspace_path=tmp_path / "producer",
+        learning_event_store=event_store,
+    )
+    owner = LearningScheduler(
+        workspace_path=tmp_path / "owner",
+        learning_event_store=event_store,
+    )
+    await producer.enqueue_reflection(
+        reflection_kind="interaction",
+        reflection_text="one sparse-position reflection",
+        source_event_ids=["life-event:sparse"],
+        actor_consciousness_instance_id="chat_global",
+    )
+    event_store.records[0] = replace(event_store.records[0], position=800)
+
+    async def sparse_health() -> dict[str, Any]:
+        return {"status": "healthy", "event_count": 1, "event_frontier": 900}
+
+    event_store.health_snapshot = sparse_health  # type: ignore[method-assign]
+
+    assert await owner._ingest_reflection_events() == 1
+    state = owner.store.load_state()
+    assert state["reflection_event_cursor_v1"] == 900
+    assert state["reflection_runtime_v1"]["event_frontier"] == 900
+
+
+async def test_concurrent_reflection_after_frontier_waits_for_next_pass(
+    tmp_path: Path,
+) -> None:
+    """A post-frontier append cannot leak into the captured delivery window."""
+
+    event_store = _SharedLearningEventStore()
+    event_store.records.append(
+        LearningEventRecord(
+            position=1,
+            occurrence_id="unrelated-1",
+            event_kind="learning_skills.snapshot",
+            occurred_at="2026-08-10T00:00:00+00:00",
+            recorded_at="2026-08-10T00:00:00+00:00",
+            source="learning.projector",
+            actor_consciousness_instance_id="",
+            subject_revision="",
+            provenance={},
+            payload={},
+            event_sha256="0" * 64,
+        )
+    )
+    producer = LearningScheduler(
+        workspace_path=tmp_path / "producer",
+        learning_event_store=event_store,
+    )
+    owner = LearningScheduler(
+        workspace_path=tmp_path / "owner",
+        learning_event_store=event_store,
+    )
+    original_read = event_store.read_events
+    appended_job_id = ""
+
+    async def append_during_first_read(
+        after_position: int,
+        *,
+        limit: int = 100,
+        event_kinds: tuple[str, ...] = (),
+    ) -> list[LearningEventRecord]:
+        nonlocal appended_job_id
+        if not appended_job_id:
+            appended_job_id = await producer.enqueue_reflection(
+                reflection_kind="interaction",
+                reflection_text="one concurrent reflection",
+                source_event_ids=["life-event:concurrent"],
+                actor_consciousness_instance_id="chat_global",
+            )
+        return await original_read(
+            after_position,
+            limit=limit,
+            event_kinds=event_kinds,
+        )
+
+    event_store.read_events = append_during_first_read  # type: ignore[method-assign]
+
+    assert await owner._ingest_reflection_events() == 0
+    assert owner.store.load_state()["reflection_event_cursor_v1"] == 1
+    assert owner._reflection_jobs() == []
+    assert await owner._ingest_reflection_events() == 1
+    assert owner._reflection_jobs()[0].job_id == appended_job_id
+    assert owner.store.load_state()["reflection_event_cursor_v1"] == 2
 
 
 async def test_event_cursor_stops_before_capacity_without_losing_evidence(

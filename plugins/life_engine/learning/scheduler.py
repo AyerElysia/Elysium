@@ -627,38 +627,55 @@ class LearningScheduler:
                 0,
                 int(state.get(_REFLECTION_EVENT_CURSOR_STATE_KEY, 0) or 0),
             )
+            source_frontier = max(source_frontier, cursor)
             original_cursor = cursor
             while True:
                 page = await self._learning_event_store.read_events(
                     cursor,
                     limit=_REFLECTION_EVENT_PAGE_SIZE,
+                    event_kinds=(_REFLECTION_ENQUEUED_EVENT_KIND,),
                 )
-                if not page:
-                    break
+                # ``source_frontier`` is captured before paging.  A concurrent
+                # append may therefore appear in ``page`` but must remain for
+                # the next pass instead of leaking across this delivery
+                # window.  Non-reflection learning events are intentionally
+                # excluded at the store so legacy projections without a cursor
+                # never materialize large snapshot payloads just to skip them.
+                window = [
+                    record for record in page if record.position <= source_frontier
+                ]
                 stopped_at_capacity = False
-                for record in page:
-                    if record.event_kind == _REFLECTION_ENQUEUED_EVENT_KIND:
-                        job = LearningReflectionJob.from_dict(record.payload)
-                        if job.job_id != record.occurrence_id:
-                            raise RuntimeError(
-                                "LearningReflectionOccurrenceIdentityMismatch"
-                            )
-                        if job.job_id not in known:
-                            if len(jobs) >= MAX_PENDING_REFLECTIONS:
-                                stopped_at_capacity = True
-                                break
-                            jobs.append(job)
-                            known.add(job.job_id)
-                            ingested += 1
-                            runtime["total_enqueued_count"] = (
-                                int(runtime.get("total_enqueued_count", 0) or 0)
-                                + 1
-                            )
-                            runtime["last_enqueued_at"] = job.created_at
+                for record in window:
+                    job = LearningReflectionJob.from_dict(record.payload)
+                    if job.job_id != record.occurrence_id:
+                        raise RuntimeError(
+                            "LearningReflectionOccurrenceIdentityMismatch"
+                        )
+                    if job.job_id not in known:
+                        if len(jobs) >= MAX_PENDING_REFLECTIONS:
+                            stopped_at_capacity = True
+                            break
+                        jobs.append(job)
+                        known.add(job.job_id)
+                        ingested += 1
+                        runtime["total_enqueued_count"] = (
+                            int(runtime.get("total_enqueued_count", 0) or 0)
+                            + 1
+                        )
+                        runtime["last_enqueued_at"] = job.created_at
                     cursor = record.position
                 if stopped_at_capacity:
                     break
-                if len(page) < _REFLECTION_EVENT_PAGE_SIZE:
+                if (
+                    not page
+                    or len(page) < _REFLECTION_EVENT_PAGE_SIZE
+                    or len(window) < len(page)
+                ):
+                    # Every relevant event in the captured window was consumed;
+                    # skipped positions belong to other immutable event kinds.
+                    # Advancing to the authoritative high-water is therefore
+                    # lossless and prevents repeated scans across sparse logs.
+                    cursor = source_frontier
                     break
             source_frontier = max(source_frontier, cursor)
             previous_frontier = int(runtime.get("event_frontier", 0) or 0)
