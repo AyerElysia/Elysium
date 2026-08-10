@@ -34,6 +34,36 @@ class StorageRuntimeClosed(StorageRuntimeError):
     """Raised when a consumer uses a runtime after its owned engine was closed."""
 
 
+class ManagedSingletonWriterClaimLost(StorageRuntimeError):
+    """Identify the exact managed singleton whose database lease was lost.
+
+    Connectivity failures are deliberately not wrapped in this exception.  It
+    is raised only after the claim store has positively rejected the exact
+    generation/epoch/token (or reported a conflicting live owner), allowing a
+    service to quiesce one singleton domain without invalidating unrelated
+    writers.  The opaque fencing token is never included in the message.
+    """
+
+    def __init__(
+        self,
+        claim: SingletonWriterClaim,
+        cause: BaseException,
+    ) -> None:
+        self.claim = claim
+        self.generation_id = claim.generation_id
+        self.namespace = claim.namespace
+        self.state_key = claim.state_key
+        self.owner_instance_id = claim.owner_instance_id
+        self.lease_epoch = int(claim.lease_epoch)
+        self.failure_type = type(cause).__name__
+        super().__init__(
+            "ManagedSingletonWriterClaimLost:"
+            f"{self.namespace}:{self.state_key}:"
+            f"owner={self.owner_instance_id}:epoch={self.lease_epoch}:"
+            f"cause={self.failure_type}"
+        )
+
+
 WriteFence = Callable[[AsyncSession], Awaitable[None]]
 WriterValidator = Callable[[], Awaitable[None]]
 
@@ -237,6 +267,24 @@ class StorageBackendRuntime:
         self._managed_singleton_claims[key] = (renewed, int(lease_seconds))
         return renewed
 
+    def invalidate_managed_singleton_writer(
+        self,
+        claim: SingletonWriterClaim,
+    ) -> bool:
+        """Forget one exact, positively lost claim without database activity.
+
+        This is not release or takeover.  Callers must use the exact claim
+        carried by :class:`ManagedSingletonWriterClaimLost`; a stale local
+        snapshot cannot remove a newer managed lease.
+        """
+
+        key = (claim.namespace, claim.state_key)
+        managed = self._managed_singleton_claims.get(key)
+        if managed is None or managed[0] != claim:
+            return False
+        self._managed_singleton_claims.pop(key, None)
+        return True
+
     async def release_singleton_writer(
         self,
         claim: SingletonWriterClaim,
@@ -254,15 +302,23 @@ class StorageBackendRuntime:
         return released
 
     async def _renew_managed_singleton_writers(self) -> None:
+        from .writer_claims import (
+            SingletonWriterClaimConflict,
+            SingletonWriterClaimLost,
+        )
+
         if self._singleton_writer_claims is None:
             return
         for key, (claim, lease_seconds) in tuple(
             self._managed_singleton_claims.items()
         ):
-            renewed = await self._singleton_writer_claims.renew(
-                claim,
-                lease_seconds=lease_seconds,
-            )
+            try:
+                renewed = await self._singleton_writer_claims.renew(
+                    claim,
+                    lease_seconds=lease_seconds,
+                )
+            except (SingletonWriterClaimLost, SingletonWriterClaimConflict) as exc:
+                raise ManagedSingletonWriterClaimLost(claim, exc) from exc
             self._managed_singleton_claims[key] = (renewed, lease_seconds)
 
     async def _release_managed_singleton_writers(self) -> None:
@@ -408,6 +464,7 @@ class StorageBackendRuntime:
 
 
 __all__ = [
+    "ManagedSingletonWriterClaimLost",
     "StorageBackendRuntime",
     "StorageRuntimeClosed",
     "StorageRuntimeDisabled",

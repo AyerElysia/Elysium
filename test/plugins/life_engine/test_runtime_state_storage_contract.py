@@ -15,6 +15,7 @@ from plugins.life_engine.storage.authority import (
     StaleAuthorityToken,
 )
 from plugins.life_engine.storage.contracts import (
+    ManagedSingletonWriterClaimLost,
     StorageBackendRuntime,
     StorageRuntimeClosed,
 )
@@ -445,6 +446,178 @@ async def test_runtime_authority_renewal_renews_managed_singleton_claim(
         health = await runtime._singleton_writer_claims.health_snapshot()
         assert health["known_claim_count"] == 1
         assert health["live_claim_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_managed_claim_renewal_preserves_transient_connectivity_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _local_store(tmp_path) as (runtime, _store):
+        claim = await runtime.acquire_singleton_writer(
+            namespace="life_engine.learning",
+            state_key="selected_persistence",
+            owner_instance_id="host-a:pid-100:boot-a",
+            lease_seconds=30,
+        )
+        claim_store = runtime._singleton_writer_claims
+        assert claim_store is not None
+        original = OperationalError(
+            "UPDATE runtime_singleton_writer_claims",
+            {},
+            RuntimeError("temporary connection loss"),
+        )
+
+        async def fail_renew(
+            renewed_claim: object,
+            *,
+            lease_seconds: int,
+        ) -> object:
+            assert renewed_claim == claim
+            assert lease_seconds == 30
+            raise original
+
+        monkeypatch.setattr(claim_store, "renew", fail_renew)
+
+        with pytest.raises(OperationalError) as raised:
+            await runtime.renew_authority(lease_seconds=300)
+
+        assert raised.value is original
+        assert runtime.authority_token is not None
+        assert (
+            runtime._managed_singleton_claims[(claim.namespace, claim.state_key)][0]
+            == claim
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_type",
+    [SingletonWriterClaimLost, SingletonWriterClaimConflict],
+)
+async def test_managed_claim_renewal_reports_exact_positive_loss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[Exception],
+) -> None:
+    release_calls = 0
+    async with _local_store(tmp_path) as (runtime, _store):
+        claim = await runtime.acquire_singleton_writer(
+            namespace="life_engine.learning",
+            state_key="selected_persistence",
+            owner_instance_id="host-a:pid-100:boot-a",
+            lease_seconds=30,
+        )
+        claim_store = runtime._singleton_writer_claims
+        assert claim_store is not None
+        original = failure_type("database-time exact claim rejected")
+        other_claim = await runtime.acquire_singleton_writer(
+            namespace="life_engine.runtime_context",
+            state_key="global",
+            owner_instance_id="host-a:pid-100:boot-a",
+            lease_seconds=30,
+        )
+
+        async def fail_renew(
+            renewed_claim: object,
+            *,
+            lease_seconds: int,
+        ) -> object:
+            assert lease_seconds == 30
+            if renewed_claim == claim:
+                raise original
+            return renewed_claim
+
+        async def count_release(released_claim: object) -> bool:
+            nonlocal release_calls
+            release_calls += 1
+            assert released_claim == claim
+            return True
+
+        monkeypatch.setattr(claim_store, "renew", fail_renew)
+        monkeypatch.setattr(claim_store, "release", count_release)
+
+        with pytest.raises(ManagedSingletonWriterClaimLost) as raised:
+            await runtime.renew_authority(lease_seconds=300)
+
+        failure = raised.value
+        assert failure.__cause__ is original
+        assert failure.claim == claim
+        assert failure.generation_id == claim.generation_id
+        assert failure.namespace == claim.namespace
+        assert failure.state_key == claim.state_key
+        assert failure.owner_instance_id == claim.owner_instance_id
+        assert failure.lease_epoch == claim.lease_epoch
+        assert failure.failure_type == failure_type.__name__
+        assert claim.fencing_token not in str(failure)
+        assert runtime.authority_token is not None
+        assert runtime.invalidate_managed_singleton_writer(failure.claim) is True
+        assert runtime.invalidate_managed_singleton_writer(failure.claim) is False
+        assert (
+            runtime._managed_singleton_claims[
+                (other_claim.namespace, other_claim.state_key)
+            ][0]
+            == other_claim
+        )
+        assert runtime.invalidate_managed_singleton_writer(other_claim) is True
+        assert release_calls == 0
+
+    assert release_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_managed_claim_invalidation_rejects_stale_snapshot(
+    tmp_path: Path,
+) -> None:
+    async with _local_store(tmp_path) as (runtime, _store):
+        original = await runtime.acquire_singleton_writer(
+            namespace="life_engine.learning",
+            state_key="selected_persistence",
+            owner_instance_id="host-a:pid-100:boot-a",
+            lease_seconds=30,
+        )
+        renewed = await runtime.renew_singleton_writer(
+            original,
+            lease_seconds=60,
+        )
+
+        assert runtime.invalidate_managed_singleton_writer(original) is False
+        assert runtime.invalidate_managed_singleton_writer(renewed) is True
+
+
+@pytest.mark.asyncio
+async def test_managed_claim_renewal_propagates_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _local_store(tmp_path) as (runtime, _store):
+        claim = await runtime.acquire_singleton_writer(
+            namespace="life_engine.learning",
+            state_key="selected_persistence",
+            owner_instance_id="host-a:pid-100:boot-a",
+            lease_seconds=30,
+        )
+        claim_store = runtime._singleton_writer_claims
+        assert claim_store is not None
+
+        async def cancel_renew(
+            renewed_claim: object,
+            *,
+            lease_seconds: int,
+        ) -> object:
+            assert renewed_claim == claim
+            assert lease_seconds == 30
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(claim_store, "renew", cancel_renew)
+
+        with pytest.raises(asyncio.CancelledError):
+            await runtime.renew_authority(lease_seconds=300)
+
+        assert (
+            runtime._managed_singleton_claims[(claim.namespace, claim.state_key)][0]
+            == claim
+        )
 
 
 @pytest.mark.asyncio

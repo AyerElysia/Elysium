@@ -482,3 +482,24 @@ python scripts/migrate_life_attention_threads.py \
 8. 该命令不会修改 `storage.enabled`、不会激活 generation，也不会启动、停止或重启 Elysium/NapCat。
 
 任何一步失败时，保留源快照和带 incomplete marker 的失败归档，不清表、不覆盖、不把旧状态解释成主体决定；更换新的隔离目标或新目录后重试。
+
+## 16. 单例续租瞬断诊断与处置
+
+当 Learning、runtime context 或其他 singleton projector 在续租窗口遇到 MySQL 异常时，先区分以下两类信号：
+
+1. `OperationalError`、连接超时、连接池失败或传输中断：所有权**未知**，不是确证失租。不得调用全局 `invalidate_writer()`，不得 release、acquire、takeover、reload 或 rebase；保留当前 claim，在配置的有界退避内重试。每次业务写仍由同事务 exact-claim 校验和数据库 trigger 裁决，不能绕过 fencing。
+2. `ManagedSingletonWriterClaimLost`：数据库已明确拒绝 exact claim。日志可记录 generation、namespace、state key、owner、epoch 和 failure type，但禁止输出 token。消费者只停止该 scope 的 projector/maintenance，使用异常中的 `claim` 调用 `invalidate_managed_singleton_writer()`，并把健康状态标记为 fail-closed；其他 singleton scope 与 generation authority 不受影响。
+
+取消必须立即传播，不能转成重试。若基础 generation/epoch 的 authority 校验明确失败，则仍按整套 runtime fail closed 处理，这与单个 managed claim 的作用域失效不同。
+
+排障顺序：
+
+- 先记录异常类别、scope、owner、epoch、最近成功续租时间和数据库连接健康；
+- 不从 PID、错误文本或本地时钟猜测 claim 是否仍有效；
+- 检查后续写事务是被连接错误阻断，还是被 exact claim/trigger 明确拒绝；
+- 连接恢复且 claim 仍有效时允许正常续租；若已过期，下一次数据库校验必须给出确证失租并让该领域停写；
+- 当前实现禁止在运行中自动重新 acquire 已失去的 singleton claim。恢复动作需要新的受控启动周期，且 Elysium 仍只能由用户手动启动。
+
+Learning 未取得 `life_engine.learning/selected_persistence` claim 时，只允许 event-only 能力；projector/maintenance 必须 disabled，禁止回退到 `.life_learning` 或另一套 local projection。该门由 Learning 领域集成实现并通过健康状态暴露。
+
+本节的平台回归位于 `test/plugins/life_engine/test_runtime_state_storage_contract.py`，覆盖瞬时连接异常原样传播、Lost/Conflict 结构化作用域、精确当前 claim 本地失效、旧快照拒绝与取消传播。该合同不需要 schema migration，不修改正式数据，也不需要重启现有实例才能落库；消费端代码生效仍需用户下一次手动启动 Elysium。

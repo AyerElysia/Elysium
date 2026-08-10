@@ -1177,3 +1177,19 @@ Chroma：从 active backend 重建的向量投影
 ```
 
 这套方案既能获得 MySQL 的共享、并发、统一查询和事务能力，又保留本地方案的简洁、离线能力和原始数据安全。真正实施时，应把“local 与 MySQL 同合同、复制不破坏源、单 active writer、generation 防误切”视为四个不可妥协的完成条件。
+
+### 14.7 单例 writer 续租的“未知”与“确证失租”边界
+
+`StorageBackendRuntime` 必须把网络可达性与租约所有权分成两个不同事实。SQL 连接中断、超时、连接池 checkout 失败等只证明“本次续租结果未知”，不得被包装成失租，也不得据此清空全局 authority 或其他单例领域的本地资格。每个受保护写事务仍在提交前使用数据库时间和 exact claim 校验；连接恢复后可以继续续租，若租约已实际过期，数据库会在下一次 renew 或写事务中给出确证失租。
+
+只有 claim store 明确返回 `SingletonWriterClaimLost` 或 `SingletonWriterClaimConflict` 时，runtime 才上抛结构化 `ManagedSingletonWriterClaimLost`。该异常提供 generation、namespace、state key、owner instance、lease epoch 与原始异常类型，但不暴露 fencing token。领域消费者据此只 quiesce 对应 projector/maintenance writer；不得解析异常字符串、自动 acquire、rebase、takeover 或覆盖当前 head。
+
+runtime 同时提供精确的本地失效操作 `invalidate_managed_singleton_writer(claim)`：
+
+- 只接受异常携带的当前完整 claim 快照；
+- 旧 `lease_until` 快照、旧 epoch 或不同 token 不能移除已续租的新 claim；
+- 操作不访问数据库，不执行 release，也不改变 generation authority；
+- 未命中的调用是稳定 `False`，便于并发 quiesce 幂等收口；
+- 连接故障和任务取消不调用该操作，原异常必须原样传播。
+
+该平台合同只提供可判定的作用域事实。`LifeEngineService` 的续租循环仍由领域集成负责：瞬时数据库异常进入有界、可取消退避并标记 `renewal_unknown/degraded`；结构化确证失租只停对应领域；基础 generation authority 确证失效才使整个 runtime fail closed。Learning 未取得 projector claim 时只允许保留不可变 event 写入能力，禁止静默打开 legacy local 认知投影形成第二套视图。

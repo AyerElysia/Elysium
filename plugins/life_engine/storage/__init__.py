@@ -1,6 +1,10 @@
 """Selectable life-domain storage contracts and infrastructure adapters."""
 
-from .contracts import StorageBackendRuntime, StorageWriterRole
+from .contracts import (
+    ManagedSingletonWriterClaimLost,
+    StorageBackendRuntime,
+    StorageWriterRole,
+)
 from .event_contracts import (
     LifeEventConsumerConflict,
     LifeEventConsumerCursor,
@@ -126,6 +130,7 @@ __all__ = [
     "LifeEventSnapshotSourcePort",
     "LifeEventStorePort",
     "LocalBackendSettings",
+    "ManagedSingletonWriterClaimLost",
     "MULTI_WRITER_PROTOCOL_VERSION",
     "LEGACY_RUNTIME_CONTEXT_NAMESPACE",
     "LEGACY_RUNTIME_CONTEXT_STATE_KEY",
