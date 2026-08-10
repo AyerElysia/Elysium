@@ -1,10 +1,14 @@
+import asyncio
+
 import pytest
 
+from src.kernel.llm import request as request_module
 from src.kernel.llm.exceptions import LLMAPIError, LLMModelsCoolingDownError
 from src.kernel.llm.model_client import ModelClientRegistry, StreamEvent
 from src.kernel.llm.payload import LLMPayload, Text
 from src.kernel.llm.policy.failover import FailoverPolicy
 from src.kernel.llm.request import LLMRequest
+from src.kernel.llm.response import LLMResponse
 from src.kernel.llm.roles import ROLE
 
 
@@ -505,6 +509,278 @@ async def test_forced_stream_precollection_keeps_response_awaitable():
     resp = await req.send(stream=False)
     assert resp.message == "hello world"
     assert await resp == "hello world"
+
+
+def test_attempt_deadline_reports_only_monotonic_remaining_budget(monkeypatch):
+    moments = iter((100.0, 103.5, 109.0, 110.0))
+    monkeypatch.setattr(request_module, "_monotonic", lambda: next(moments))
+
+    deadline = request_module._new_attempt_deadline(10.0)
+
+    assert deadline == 110.0
+    assert request_module._remaining_attempt_timeout(deadline) == 6.5
+    assert request_module._remaining_attempt_timeout(deadline) == 1.0
+    with pytest.raises(asyncio.TimeoutError):
+        request_module._remaining_attempt_timeout(deadline)
+
+
+async def test_forced_stream_precollection_reuses_create_attempt_deadline(
+    monkeypatch,
+):
+    model_set = [
+        {
+            **_model("shared-deadline", max_retry=0),
+            "force_stream_mode": True,
+            "timeout": 10.0,
+        }
+    ]
+    moments = iter((100.0, 102.0, 106.0))
+    observed_timeouts: list[float] = []
+    real_remaining = request_module._remaining_attempt_timeout
+    monkeypatch.setattr(request_module, "_monotonic", lambda: next(moments))
+
+    def observing_remaining(deadline):
+        remaining = real_remaining(deadline)
+        assert remaining is not None
+        observed_timeouts.append(remaining)
+        return remaining
+
+    monkeypatch.setattr(
+        request_module,
+        "_remaining_attempt_timeout",
+        observing_remaining,
+    )
+
+    async def stream_ok():
+        yield StreamEvent(text_delta="ok")
+
+    class DummyClient:
+        async def create(self, **kwargs):
+            assert kwargs["stream"] is True
+            return None, None, stream_ok()
+
+    req = LLMRequest(
+        model_set,
+        request_name="shared_attempt_deadline",
+        clients=ModelClientRegistry(openai=DummyClient()),
+    )
+
+    await req.send(stream=False)
+
+    assert observed_timeouts == [8.0, 4.0]
+
+
+async def test_expired_attempt_does_not_start_forced_stream_precollection(
+    monkeypatch,
+):
+    model_set = [
+        {
+            **_model("expired-before-precollect", max_retry=0),
+            "force_stream_mode": True,
+            "timeout": 10.0,
+        }
+    ]
+    moments = iter((100.0, 100.0, 110.0))
+    precollect_calls = 0
+    monkeypatch.setattr(request_module, "_monotonic", lambda: next(moments))
+
+    async def must_not_precollect(self):
+        nonlocal precollect_calls
+        precollect_calls += 1
+
+    monkeypatch.setattr(
+        LLMResponse,
+        "precollect_stream_for_non_stream",
+        must_not_precollect,
+    )
+
+    async def stream_ok():
+        yield StreamEvent(text_delta="too late")
+
+    class DummyClient:
+        async def create(self, **kwargs):
+            return None, None, stream_ok()
+
+    req = LLMRequest(
+        model_set,
+        request_name="expired_before_precollect",
+        clients=ModelClientRegistry(openai=DummyClient()),
+    )
+
+    with pytest.raises(asyncio.TimeoutError):
+        await req.send(stream=False)
+    assert precollect_calls == 0
+
+
+async def test_attempt_deadline_cancels_stalled_create():
+    model_set = [
+        {**_model("create-timeout", max_retry=0), "timeout": 0.02}
+    ]
+    create_cancelled = asyncio.Event()
+
+    class DummyClient:
+        async def create(self, **kwargs):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                create_cancelled.set()
+
+    req = LLMRequest(
+        model_set,
+        request_name="create_attempt_timeout",
+        clients=ModelClientRegistry(openai=DummyClient()),
+    )
+
+    with pytest.raises(asyncio.TimeoutError):
+        await req.send(stream=False)
+    assert create_cancelled.is_set()
+
+
+async def test_forced_stream_timeout_cancels_stream_and_preserves_failover_identity(
+    monkeypatch,
+):
+    model_set = [
+        {
+            **_model("precollect-timeout", max_retry=0),
+            "force_stream_mode": True,
+            "timeout": 0.03,
+        },
+        {**_model("fallback", max_retry=0), "timeout": 1.0},
+    ]
+    stream_started = asyncio.Event()
+    stream_cancelled = asyncio.Event()
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        request_module,
+        "_trajectory_settings",
+        lambda: (True, "unused", 0.0, 1, 1, 0),
+    )
+    monkeypatch.setattr(
+        request_module,
+        "record_trajectory",
+        lambda event, **_kwargs: captured.append(dict(event)),
+    )
+
+    async def stalled_stream():
+        try:
+            stream_started.set()
+            await asyncio.Event().wait()
+            yield StreamEvent(text_delta="unreachable")
+        finally:
+            stream_cancelled.set()
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, bool]] = []
+
+        async def create(self, **kwargs):
+            self.calls.append((kwargs["model_name"], kwargs["stream"]))
+            if kwargs["model_name"] == "precollect-timeout":
+                return None, None, stalled_stream()
+            return "fallback ok", [], None
+
+    client = DummyClient()
+    req = LLMRequest(
+        model_set,
+        request_name="precollect_attempt_timeout",
+        clients=ModelClientRegistry(openai=client),
+        trace_id="trace-shared",
+    )
+
+    response = await req.send(stream=False)
+
+    assert response.message == "fallback ok"
+    assert stream_started.is_set()
+    assert stream_cancelled.is_set()
+    assert client.calls == [
+        ("precollect-timeout", True),
+        ("fallback", False),
+    ]
+    assert len(captured) == 2
+    assert [event["success"] for event in captured] == [False, True]
+    assert {event["request_id"] for event in captured} == {captured[0]["request_id"]}
+    assert {event["trace_id"] for event in captured} == {"trace-shared"}
+    assert captured[0]["attempt_id"] != captured[1]["attempt_id"]
+    assert captured[1]["parent_attempt_id"] == captured[0]["attempt_id"]
+
+
+async def test_external_cancel_during_precollection_does_not_fail_over():
+    model_set = [
+        {
+            **_model("cancel-precollect", max_retry=0),
+            "force_stream_mode": True,
+            "timeout": 1.0,
+        },
+        _model("must-not-run", max_retry=0),
+    ]
+    stream_started = asyncio.Event()
+    stream_cancelled = asyncio.Event()
+
+    async def stalled_stream():
+        try:
+            stream_started.set()
+            await asyncio.Event().wait()
+            yield StreamEvent(text_delta="unreachable")
+        finally:
+            stream_cancelled.set()
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def create(self, **kwargs):
+            self.calls.append(kwargs["model_name"])
+            return None, None, stalled_stream()
+
+    client = DummyClient()
+    req = LLMRequest(
+        model_set,
+        request_name="cancel_during_precollect",
+        clients=ModelClientRegistry(openai=client),
+    )
+    pending = asyncio.create_task(req.send(stream=False))
+    await asyncio.wait_for(stream_started.wait(), timeout=1.0)
+
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+
+    assert stream_cancelled.is_set()
+    assert client.calls == ["cancel-precollect"]
+
+
+async def test_caller_stream_consumption_is_not_capped_by_attempt_deadline():
+    model_set = [
+        {
+            **_model("caller-stream", max_retry=0),
+            "force_stream_mode": True,
+            "timeout": 0.1,
+        }
+    ]
+    stream_started = asyncio.Event()
+
+    async def delayed_stream():
+        stream_started.set()
+        await asyncio.sleep(0.15)
+        yield StreamEvent(text_delta="later")
+
+    class DummyClient:
+        async def create(self, **kwargs):
+            assert kwargs["stream"] is True
+            return None, None, delayed_stream()
+
+    req = LLMRequest(
+        model_set,
+        request_name="caller_owned_stream",
+        clients=ModelClientRegistry(openai=DummyClient()),
+    )
+    req.add_payload(LLMPayload(ROLE.USER, Text("hello")))
+
+    response = await req.send(stream=True)
+
+    assert not stream_started.is_set()
+    assert await response == "later"
+    assert stream_started.is_set()
 
 
 async def test_retry_skips_permanent_404_and_switches_model():

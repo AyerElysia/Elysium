@@ -66,6 +66,24 @@ from .trajectory_types import (
 from .types import ModelEntry, ModelSet, RequestType, redact_secret
 
 logger = get_logger("kernel.llm.request", display="LLM 请求")
+_monotonic = time.monotonic
+
+
+def _new_attempt_deadline(timeout_seconds: object) -> float | None:
+    """Return one monotonic deadline for all transport phases of an attempt."""
+    if isinstance(timeout_seconds, (int, float)) and timeout_seconds > 0:
+        return _monotonic() + float(timeout_seconds)
+    return None
+
+
+def _remaining_attempt_timeout(deadline: float | None) -> float | None:
+    """Return remaining attempt budget, failing before a new phase if exhausted."""
+    if deadline is None:
+        return None
+    remaining = deadline - _monotonic()
+    if remaining <= 0:
+        raise asyncio.TimeoutError
+    return remaining
 
 
 def _trajectory_settings() -> tuple[bool, str, float, int, int, int]:
@@ -759,7 +777,9 @@ class LLMRequest:
                     timeout_seconds = model.get("timeout")
                     force_stream_mode = bool(model.get("force_stream_mode", False))
                     effective_stream = stream or force_stream_mode
-                    create_task = client.create(
+                    attempt_deadline = _new_attempt_deadline(timeout_seconds)
+                    create_timeout = _remaining_attempt_timeout(attempt_deadline)
+                    create_awaitable = client.create(
                         model_name=model_identifier,
                         payloads=trimmed_payloads,
                         tools=tools,
@@ -768,10 +788,7 @@ class LLMRequest:
                         stream=effective_stream,
                     )
 
-                    if (
-                        isinstance(timeout_seconds, (int, float))
-                        and timeout_seconds > 0
-                    ):
+                    if create_timeout is not None:
                         (
                             message,
                             tool_calls,
@@ -780,8 +797,8 @@ class LLMRequest:
                             request_record_id,
                         ) = _normalize_client_create_result(
                             await asyncio.wait_for(
-                                create_task,
-                                timeout=float(timeout_seconds),
+                                create_awaitable,
+                                timeout=create_timeout,
                             )
                         )
                     else:
@@ -791,7 +808,7 @@ class LLMRequest:
                             stream_iter,
                             reasoning_content,
                             request_record_id,
-                        ) = _normalize_client_create_result(await create_task)
+                        ) = _normalize_client_create_result(await create_awaitable)
 
                 provider_usage: dict[str, Any] = {}
                 pop_last_usage = getattr(client, "pop_last_usage", None)
@@ -844,17 +861,15 @@ class LLMRequest:
                     ]
 
                 if not stream and stream_iter is not None:
-                    collect_stream = resp.precollect_stream_for_non_stream()
-                    if (
-                        isinstance(timeout_seconds, (int, float))
-                        and timeout_seconds > 0
-                    ):
+                    collect_timeout = _remaining_attempt_timeout(attempt_deadline)
+                    if collect_timeout is not None:
+                        collect_stream = resp.precollect_stream_for_non_stream()
                         await asyncio.wait_for(
                             collect_stream,
-                            timeout=float(timeout_seconds),
+                            timeout=collect_timeout,
                         )
                     else:
-                        await collect_stream
+                        await resp.precollect_stream_for_non_stream()
                 resp.attach_to_inspector()
 
                 # 记录成功指标

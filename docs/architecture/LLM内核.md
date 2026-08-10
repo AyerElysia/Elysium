@@ -111,6 +111,8 @@ class ModelEntry(TypedDict):
 
 `tasks.<name>.attempt_timeout_seconds` 是该任务中**单个候选模型的一次尝试上限**。它存在时覆盖 Provider 的通用 `timeout`，并应用到该任务的全部候选；不存在时继续继承 Provider 值。它不是一次逻辑任务的总 deadline，也不会作为 `extra_params` 发送给上游。后台认知任务可以据此获得更充足的单次推理时间，而前台表达、路由和实时链路不随之被全局放慢。字段只接受正有限整数或浮点数；布尔值、字符串、零、负数和 NaN/Inf 均在加载时 fail closed。
 
+单候选 attempt 使用唯一的 monotonic 绝对 deadline。对于 `force_stream_mode` 模型的非流式调用，`client.create()` 与随后的流预收集共同消耗这一份预算，预收集只能使用剩余时间，不能重新领取完整时限；预算耗尽时不会再创建下一阶段协程。调用方明确请求 `stream=True` 时，attempt 只约束连接建立与响应握手，返回后的长流仍由调用方消费，并继续使用既有流读取保护。
+
 一次后台逻辑任务仍须由领域消费者持有独立、可取消的 monotonic 总 deadline。单候选 attempt、模型故障转移、响应消费和退避只能共同消耗该总预算，不能在每一阶段重新领取完整时限。`learning` 是独立的后台高强度认知路由；`core` 继续服务高频 Heartbeat，二者不再因为共享任务名而被迫使用同一完成时限。
 
 推理强度和请求级能力也由任务配置统一管理。`tasks.<name>.extra` 会合并到该任务的所有候选，`tasks.<name>.model_extra` 用于同一任务内不同协议的精确覆盖；优先级为 `models.<name>.extra < tasks.<name>.extra < tasks.<name>.model_extra.<model>`。覆盖只能引用本任务已注册候选，并与预算一起进入路由快照摘要；不得在 Python 中按模型名硬编码另一套任务策略。
