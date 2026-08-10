@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 
-from .payload import LLMPayload, Text
+from .payload import LLMPayload, Text, ToolResult
 
 
 def _utf8_fingerprint(value: str) -> tuple[int, str]:
@@ -22,6 +22,7 @@ class ContextDeliveryExpectation:
     expected_text: str = field(repr=False)
     expected_utf8_bytes: int
     expected_sha256: str
+    part_kind: str = "text"
 
     @classmethod
     def create(
@@ -30,14 +31,18 @@ class ContextDeliveryExpectation:
         expected_text: str,
         *,
         marker: str | None = None,
+        part_kind: str = "text",
     ) -> "ContextDeliveryExpectation":
         identity = str(delivery_id or "").strip()
         text = str(expected_text or "")
         marker_text = str(marker if marker is not None else identity)
+        normalized_part_kind = str(part_kind or "text").strip().lower()
         if not identity:
             raise ValueError("context delivery_id must not be empty")
         if not text:
             raise ValueError("context delivery expected_text must not be empty")
+        if normalized_part_kind not in {"text", "tool_result"}:
+            raise ValueError("context delivery part_kind is unsupported")
         if not marker_text or marker_text not in text:
             raise ValueError("context delivery marker must occur in expected_text")
         expected_bytes, expected_sha256 = _utf8_fingerprint(text)
@@ -47,6 +52,7 @@ class ContextDeliveryExpectation:
             expected_text=text,
             expected_utf8_bytes=expected_bytes,
             expected_sha256=expected_sha256,
+            part_kind=normalized_part_kind,
         )
 
 
@@ -66,6 +72,7 @@ class EffectiveContextReceipt:
     expected_sha256: str
     effective_utf8_bytes: int | None
     effective_sha256: str | None
+    part_kind: str = "text"
 
 
 def build_effective_context_receipts(
@@ -80,11 +87,18 @@ def build_effective_context_receipts(
         for part in payload.content
         if isinstance(part, Text)
     ]
+    tool_result_parts = [
+        part.to_text()
+        for payload in payloads
+        for part in payload.content
+        if isinstance(part, ToolResult)
+    ]
     receipts: dict[str, EffectiveContextReceipt] = {}
     for delivery_id, expectation in expectations.items():
-        candidates = [
-            value for value in text_parts if expectation.marker in value
-        ]
+        source_parts = (
+            tool_result_parts if expectation.part_kind == "tool_result" else text_parts
+        )
+        candidates = [value for value in source_parts if expectation.marker in value]
         effective_text = candidates[0] if len(candidates) == 1 else None
         effective_bytes: int | None = None
         effective_sha256: str | None = None
@@ -102,6 +116,7 @@ def build_effective_context_receipts(
             expected_sha256=expectation.expected_sha256,
             effective_utf8_bytes=effective_bytes,
             effective_sha256=effective_sha256,
+            part_kind=expectation.part_kind,
         )
     return receipts
 

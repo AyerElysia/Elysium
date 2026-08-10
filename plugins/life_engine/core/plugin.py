@@ -9,6 +9,7 @@ from ..agents import register_builtin_agents
 from ..agents.mission_tool import MISSION_TOOLS
 from ..attention_threads.tools import ATTENTION_THREAD_TOOLS
 from ..learning.tools import LEARNING_TOOLS
+from ..memory.boundary_tools import MEMORY_BOUNDARY_TOOLS
 from ..memory.tools import MEMORY_TOOLS
 from ..service import LifeEngineService
 from ..service.audit import (
@@ -100,6 +101,7 @@ class LifeEnginePlugin(BasePlugin):
             *ALL_TOOLS,
             *TODO_TOOLS,
             *MEMORY_TOOLS,
+            *MEMORY_BOUNDARY_TOOLS,
             *GREP_TOOLS,
             *WEB_TOOLS,
             *SCHEDULE_TOOLS,
@@ -131,17 +133,19 @@ class LifeEnginePlugin(BasePlugin):
                 LifeSendVoiceAction,
             )
 
-            components.extend([
-                LifeChatter,
-                LifeSendTextAction,
-                LifeSendImageAction,
-                LifeSendVoiceAction,
-                LifePassAndWaitAction,
-                LifeRecognizeVoiceTool,
-                LifeSaveMediaTool,
-                LifeRecordInnerMonologueAction,
-                LifeInnerDialogueTool,
-            ])
+            components.extend(
+                [
+                    LifeChatter,
+                    LifeSendTextAction,
+                    LifeSendImageAction,
+                    LifeSendVoiceAction,
+                    LifePassAndWaitAction,
+                    LifeRecognizeVoiceTool,
+                    LifeSaveMediaTool,
+                    LifeRecordInnerMonologueAction,
+                    LifeInnerDialogueTool,
+                ]
+            )
 
         return components
 
@@ -154,7 +158,10 @@ class LifeEnginePlugin(BasePlugin):
             if "already registered" not in str(exc):
                 raise
         setup_life_audit_logger()
-        if isinstance(self.config, LifeEngineConfig) and not self.config.settings.enabled:
+        if (
+            isinstance(self.config, LifeEngineConfig)
+            and not self.config.settings.enabled
+        ):
             logger.info("life_engine 已禁用，未启动")
             log_lifecycle(
                 "disabled",

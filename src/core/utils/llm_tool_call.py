@@ -165,6 +165,7 @@ async def create_llm_usable_execution(
                 else str(stream_id or "").strip()
             ),
             message=message,
+            tool_call_id=str(tool_call_id or ""),
         )
         if stream_id:
             from src.core.managers.stream_manager import get_stream_manager
@@ -173,13 +174,17 @@ async def create_llm_usable_execution(
             if chat_stream is not None:
                 instance.chat_stream = chat_stream
     elif issubclass(usable_cls, BaseAction):
-        chat_stream = await _get_action_chat_stream(stream_id=stream_id, message=message)
+        chat_stream = await _get_action_chat_stream(
+            stream_id=stream_id, message=message
+        )
         instance = usable_cls(chat_stream=chat_stream, plugin=plugin)
         instance._trigger_message = message
         instance._tool_call_id = str(tool_call_id or "")
         if message is not None:
             last_message = getattr(message, "processed_plain_text", None)
-            instance._last_message = last_message or str(getattr(message, "content", "") or "")
+            instance._last_message = last_message or str(
+                getattr(message, "content", "") or ""
+            )
     elif issubclass(usable_cls, BaseAgent):
         if not stream_id:
             stream_id = getattr(message, "stream_id", "")
@@ -240,7 +245,10 @@ async def run_llm_usable_executions(
         BaseException: 执行对象在推进过程中抛出的异常会保留在对象上，并在
             ``wait_done`` 时重新抛出。
     """
-    while any(execution is not None and execution._status != "_DONE" for execution in executions):
+    while any(
+        execution is not None and execution._status != "_DONE"
+        for execution in executions
+    ):
         progressed = False
 
         for index, execution in enumerate(executions):

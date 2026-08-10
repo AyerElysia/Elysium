@@ -18,7 +18,14 @@ from src.kernel.llm.exceptions import (
 from src.kernel.llm.model_client.base import StreamEvent
 from src.kernel.llm.model_client.registry import ModelClientRegistry
 from src.kernel.llm.monitor import get_global_collector
-from src.kernel.llm.payload import Image, LLMPayload, LLMUsable, Text, ToolResult
+from src.kernel.llm.payload import (
+    Image,
+    LLMPayload,
+    LLMUsable,
+    Text,
+    ToolCall,
+    ToolResult,
+)
 from src.kernel.llm.policy import (
     RoundRobinPolicy,
     create_default_policy,
@@ -57,7 +64,9 @@ class MockChatClient:
         request_name: str,
         model_set: Any,
         stream: bool,
-    ) -> tuple[str | None, list[dict[str, Any]] | None, AsyncIterator[StreamEvent] | None]:
+    ) -> tuple[
+        str | None, list[dict[str, Any]] | None, AsyncIterator[StreamEvent] | None
+    ]:
         """Return predefined response or default success response."""
         if self.call_count < len(self.responses):
             response = self.responses[self.call_count]
@@ -68,9 +77,11 @@ class MockChatClient:
 
         # Default success response
         if stream:
+
             async def stream_gen():
                 for chunk in ["Hello", " world", "!"]:
                     yield StreamEvent(text_delta=chunk)
+
             return None, None, stream_gen()
         else:
             return "Success response!", None, None
@@ -219,9 +230,7 @@ class TestLLMRequest:
         assert request.payloads[1].content[0].text == "Third"
         assert request.payloads[2].content[0].text == "Second"
 
-    def test_chaining_add_payload(
-        self, mock_model_set: list[dict[str, Any]]
-    ) -> None:
+    def test_chaining_add_payload(self, mock_model_set: list[dict[str, Any]]) -> None:
         """Test chaining add_payload calls."""
         request = (
             LLMRequest(mock_model_set, "test")
@@ -281,21 +290,27 @@ class TestValidateModelSet:
         """Test validation of empty model set."""
         from src.kernel.llm.request import _validate_model_set
 
-        with pytest.raises(LLMConfigurationError, match="model_set 必须是非空 list\\[dict\\]"):
+        with pytest.raises(
+            LLMConfigurationError, match="model_set 必须是非空 list\\[dict\\]"
+        ):
             _validate_model_set([])
 
     def test_model_set_not_a_list(self) -> None:
         """Test validation when model_set is not a list."""
         from src.kernel.llm.request import _validate_model_set
 
-        with pytest.raises(LLMConfigurationError, match="model_set 必须是非空 list\\[dict\\]"):
+        with pytest.raises(
+            LLMConfigurationError, match="model_set 必须是非空 list\\[dict\\]"
+        ):
             _validate_model_set("not_a_list")  # type: ignore
 
     def test_model_set_with_non_dict_elements(self) -> None:
         """Test validation when model_set contains non-dict elements."""
         from src.kernel.llm.request import _validate_model_set
 
-        with pytest.raises(LLMConfigurationError, match="model_set 必须是 list\\[dict\\]"):
+        with pytest.raises(
+            LLMConfigurationError, match="model_set 必须是 list\\[dict\\]"
+        ):
             _validate_model_set([1, 2, 3])  # type: ignore
 
 
@@ -355,7 +370,9 @@ class TestValidateModelEntry:
             "max_context": 32768,
             "extra_params": "not_a_dict",  # type: ignore
         }
-        with pytest.raises(LLMConfigurationError, match="model.extra_params 必须是 dict"):
+        with pytest.raises(
+            LLMConfigurationError, match="model.extra_params 必须是 dict"
+        ):
             _validate_model_entry(model)
 
     def test_invalid_tool_call_compat(self) -> None:
@@ -379,7 +396,9 @@ class TestValidateModelEntry:
             "tool_call_compat": "true",  # type: ignore
             "extra_params": {},
         }
-        with pytest.raises(LLMConfigurationError, match="model.tool_call_compat 必须是 bool"):
+        with pytest.raises(
+            LLMConfigurationError, match="model.tool_call_compat 必须是 bool"
+        ):
             _validate_model_entry(model)
 
 
@@ -667,9 +686,10 @@ class TestLLMRequestSend:
         assert receipt is not None
         assert receipt.exact_present is True
         assert receipt.effective_utf8_bytes == len(suffix.encode("utf-8"))
-        assert receipt.effective_sha256 == hashlib.sha256(
-            suffix.encode("utf-8")
-        ).hexdigest()
+        assert (
+            receipt.effective_sha256
+            == hashlib.sha256(suffix.encode("utf-8")).hexdigest()
+        )
         assert suffix not in repr(receipt)
 
     async def test_send_reports_registered_context_trim_fail_closed(
@@ -705,6 +725,48 @@ class TestLLMRequestSend:
         assert receipt.effective_utf8_bytes is not None
         assert receipt.effective_utf8_bytes < receipt.expected_utf8_bytes
         assert receipt.effective_sha256 != receipt.expected_sha256
+
+    async def test_send_reports_exact_registered_tool_result_delivery(
+        self, mock_model_set: list[dict[str, Any]]
+    ) -> None:
+        delivery_id = "memory-recall-delivery-1"
+        result = ToolResult(
+            value={"memory_recall_delivery_id": delivery_id, "content": "完整正文"},
+            call_id="call-memory-1",
+            name="tool-nucleus_read_memory_boundary",
+        )
+        expected = result.to_text()
+        request = LLMRequest(mock_model_set, "test")
+        request.add_payload(LLMPayload(ROLE.USER, Text("read the exact memory")))
+        request.add_payload(
+            LLMPayload(
+                ROLE.ASSISTANT,
+                ToolCall(
+                    id="call-memory-1",
+                    name="tool-nucleus_read_memory_boundary",
+                    args={},
+                ),
+            )
+        )
+        request.add_payload(LLMPayload(ROLE.TOOL_RESULT, result))
+        request.register_context_delivery(
+            delivery_id,
+            expected,
+            marker=delivery_id,
+            part_kind="tool_result",
+        )
+        request.clients.openai = MockChatClient()
+
+        response = await request.send(stream=False)
+        receipt = response.effective_context_receipt(delivery_id)
+
+        assert receipt is not None
+        assert receipt.exact_present is True
+        assert receipt.part_kind == "tool_result"
+        assert (
+            receipt.expected_sha256
+            == hashlib.sha256(expected.encode("utf-8")).hexdigest()
+        )
 
     async def test_context_receipt_uses_final_successful_retry_attempt(
         self,
@@ -778,8 +840,16 @@ class TestLLMRequestSend:
                 (
                     "Let me check that",
                     [
-                        {"id": "call_123", "name": "get_weather", "args": {"location": "Tokyo"}},
-                        {"id": "call_456", "name": "get_time", "args": {"timezone": "UTC"}},
+                        {
+                            "id": "call_123",
+                            "name": "get_weather",
+                            "args": {"location": "Tokyo"},
+                        },
+                        {
+                            "id": "call_456",
+                            "name": "get_time",
+                            "args": {"timezone": "UTC"},
+                        },
                     ],
                     None,
                 )
@@ -845,7 +915,10 @@ class TestLLMRequestSend:
     ) -> None:
         """Test switching to next model after retries exhausted (LoadBalancedPolicy)."""
         from src.kernel.llm.policy import create_policy
-        request = LLMRequest(mock_model_set, "test", policy=create_policy("load_balanced"))
+
+        request = LLMRequest(
+            mock_model_set, "test", policy=create_policy("load_balanced")
+        )
         request.add_payload(LLMPayload(ROLE.USER, Text("Hello")))
 
         # First model fails all retries, second succeeds
@@ -901,7 +974,10 @@ class TestLLMRequestSend:
     ) -> None:
         """Test that delay is applied between retries (LoadBalancedPolicy)."""
         from src.kernel.llm.policy import create_policy
-        request = LLMRequest(mock_model_set, "test", policy=create_policy("load_balanced"))
+
+        request = LLMRequest(
+            mock_model_set, "test", policy=create_policy("load_balanced")
+        )
         request.add_payload(LLMPayload(ROLE.USER, Text("Hello")))
 
         mock_client = MockChatClient(
@@ -989,7 +1065,9 @@ class TestLLMRequestSend:
         request = LLMRequest(invalid_model_set, "test")
         request.add_payload(LLMPayload(ROLE.USER, Text("Hello")))
 
-        with pytest.raises(LLMConfigurationError, match="model.model_identifier 必须是非空字符串"):
+        with pytest.raises(
+            LLMConfigurationError, match="model.model_identifier 必须是非空字符串"
+        ):
             await request.send(stream=False)
 
     async def test_send_exception_classification(
@@ -997,9 +1075,7 @@ class TestLLMRequestSend:
     ) -> None:
         """Test that exceptions are properly classified."""
         # Create a model set with max_retry=0 to ensure exception is raised immediately
-        no_retry_model_set = [
-            {**model, "max_retry": 0} for model in mock_model_set[:1]
-        ]
+        no_retry_model_set = [{**model, "max_retry": 0} for model in mock_model_set[:1]]
         request = LLMRequest(no_retry_model_set, "test")
         request.add_payload(LLMPayload(ROLE.USER, Text("Hello")))
 
@@ -1020,7 +1096,9 @@ class TestLLMRequestErrorLogging:
     """Test that per-attempt errors are logged at the correct level."""
 
     @staticmethod
-    def _no_retry_model_set(mock_model_set: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _no_retry_model_set(
+        mock_model_set: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
         """Return a single-model set with max_retry=0 for immediate failure."""
         return [{**mock_model_set[0], "max_retry": 0}]
 

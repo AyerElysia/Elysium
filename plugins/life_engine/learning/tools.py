@@ -407,8 +407,7 @@ class LifeViewKnowledgeTool(BaseTool):
             "version": version,
             "authority": "derived_learning_observation",
             "authoritative": False,
-            "knowledge": knowledge
-            or "（还没有形成学习派生观察账本。）",
+            "knowledge": knowledge or "（还没有形成学习派生观察账本。）",
         }
 
         if show_stats:
@@ -640,6 +639,9 @@ class LifeReviewSubjectDocumentTool(BaseTool):
                     "surface": "life_engine_tool",
                     "stream_id": self.get_current_stream_id(),
                     "reviewed_content_sha256": current_hash,
+                    "review_reason_sha256": hashlib.sha256(
+                        str(reason).strip().encode("utf-8")
+                    ).hexdigest(),
                     "authority": "candidate_only",
                 },
             )
@@ -673,7 +675,6 @@ class LifeReviewSubjectDocumentTool(BaseTool):
                     reason=str(reason),
                     candidate_id=candidate.candidate_id,
                     candidate_sha256=candidate.candidate_sha256,
-                    immutable_evidence_recorded=True,
                 )
                 return True, {
                     "action": "subject_review_unchanged",
@@ -694,7 +695,6 @@ class LifeReviewSubjectDocumentTool(BaseTool):
                 reason=str(reason),
                 candidate_id=candidate.candidate_id,
                 candidate_sha256=candidate.candidate_sha256,
-                immutable_evidence_recorded=True,
             )
             return True, {
                 "action": "subject_review_candidate_proposed",
@@ -826,7 +826,8 @@ class LifeDecideSubjectCandidateTool(BaseTool):
     tool_description = (
         "对精确主体候选作出 accepted/rejected/kept_open 决定。accepted_content 必须是"
         "你最终选择的完整目标文档，不会自动合并；系统会验证活跃意识、候选证据和"
-        "当前 SOUL+USER+MEMORY revision，冲突时明确拒绝并要求重读。"
+        "当前 SOUL+USER+MEMORY revision，冲突时明确拒绝并要求重读。长期记忆连续性候选"
+        "只能逐字接受；若要再改，必须提交一个新候选。"
     )
     chatter_allow = ["life_engine_internal", "life_chatter"]
 
@@ -867,6 +868,13 @@ class LifeDecideSubjectCandidateTool(BaseTool):
                     return False, "accepted 必须提供完整 accepted_content。"
                 if len(content_bytes) > 240 * 1024:
                     return False, "accepted_content 超过单次 240 KiB 安全上限。"
+                if (
+                    candidate.candidate_kind == "memory_continuity_document_revision"
+                    and content_bytes != candidate.candidate_content_bytes
+                ):
+                    return False, (
+                        "长期记忆连续性候选只能逐字接受；任何改写都必须先提交为新候选。"
+                    )
             elif content_bytes:
                 return False, "rejected/kept_open 不能携带 accepted_content。"
             _, actor = _decision_actor(self)
@@ -927,9 +935,7 @@ class LifeDecideSubjectCandidateTool(BaseTool):
             )
             await scheduler.record_subject_review_outcome(
                 target_path=candidate.target_path,
-                outcome=(
-                    "committed" if receipt.status == "committed" else normalized
-                ),
+                outcome=("committed" if receipt.status == "committed" else normalized),
                 actor_consciousness_instance_id=actor,
                 subject_revision=recorded_revision,
                 occurrence_id=receipt.decision_occurrence_id,
@@ -937,7 +943,6 @@ class LifeDecideSubjectCandidateTool(BaseTool):
                 candidate_id=receipt.candidate_id,
                 candidate_sha256=receipt.candidate_sha256,
                 authority_occurrence_id=receipt.authority_occurrence_id,
-                immutable_evidence_recorded=True,
             )
         except Exception as exc:  # noqa: BLE001 - authority receipt already exists
             review_health_warning = type(exc).__name__

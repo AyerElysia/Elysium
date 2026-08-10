@@ -125,7 +125,9 @@ Life Event
 
 主意识当前可以使用语义检索、关系遍历和记忆统计；更深层写入仍通过明确的经历、见证、反思和学习链完成。
 
-详见 [`docs/architecture/生命记忆系统.md`](../../docs/architecture/生命记忆系统.md)。
+`MEMORY.md` 只承载当前连续性所需的主体文字和显式长记忆索引。长正文可由活动意识保存成不可变 Memory Boundary，再通过 `nucleus_propose_memory_continuity_revision` 提交完整 `MEMORY.md` 候选；候选不会自动接受，索引移除也不会删除正文和历史。读取使用 `nucleus_read_memory_boundary` 的 overview/context/provenance/segment/history 有界模式；只有最终成功模型 attempt 精确接收未经裁剪的完整 ToolResult 后才幂等记录 recall/co-recall，来源标签默认保持 `external_unverified`。工程压力只邀请复盘，不判断重要性；邀请也只有精确送达后才进入冷却。
+
+详见 [`docs/architecture/生命记忆系统.md`](../../docs/architecture/生命记忆系统.md) 与 [`docs/architecture/主体长期记忆治理与索引.md`](../../docs/architecture/主体长期记忆治理与索引.md)。
 
 ---
 

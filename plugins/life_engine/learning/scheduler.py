@@ -23,7 +23,16 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from ..storage.learning_contracts import LearningEventDraft, LearningStorePort
+from ..memory.continuity_index import (
+    CONTINUITY_MEMORY_REVIEW_GROWTH_BYTES,
+    CONTINUITY_MEMORY_REVIEW_PRESSURE_BYTES,
+    CONTINUITY_MEMORY_SOFT_TARGET_BYTES,
+)
+from ..storage.learning_contracts import (
+    LearningEventDraft,
+    LearningOccurrenceConflict,
+    LearningStorePort,
+)
 from ..storage.subject_contracts import (
     SUBJECT_AUTHORITY_PATHS,
     SubjectAuthorityCommit,
@@ -86,6 +95,7 @@ _DEFAULT_SUBJECT_REVIEW_INTERVAL_HOURS: dict[SubjectDocumentPath, float] = {
 }
 _DEFAULT_SUBJECT_REVIEW_OFFER_COOLDOWN_HOURS = 24.0
 _SUBJECT_REVIEW_STATE_KEY = "subject_review_v1"
+_SUBJECT_REVIEW_SNOOZED_EVENT_KIND = "subject_review.snoozed"
 _DEFAULT_MAINTENANCE_POLL_SECONDS = 15.0
 _REFLECTION_FAILURE_BACKOFF_BASE_SECONDS = 30.0
 _REFLECTION_FAILURE_BACKOFF_MAX_SECONDS = 15.0 * 60.0
@@ -156,9 +166,7 @@ class LearningScheduler:
         self._model_task_name = model_task_name
         self._llm_timeout_seconds = max(
             30.0,
-            float(
-                llm_timeout_seconds or DEFAULT_LEARNING_LLM_TIMEOUT_SECONDS
-            ),
+            float(llm_timeout_seconds or DEFAULT_LEARNING_LLM_TIMEOUT_SECONDS),
         )
         self._memory_service = memory_service
         self._current_subject_revision = current_subject_revision or (
@@ -291,6 +299,7 @@ class LearningScheduler:
         self._reflection_queue_lock = asyncio.Lock()
         self._reflection_runner_lock = asyncio.Lock()
         self._subject_review_lock = asyncio.Lock()
+        self._pending_subject_review_offer: dict[str, Any] | None = None
         self._reflection_cooldown_minutes = max(
             0.1,
             float(reflection_cooldown_minutes),
@@ -518,9 +527,7 @@ class LearningScheduler:
                 event_kind=_REFLECTION_ENQUEUED_EVENT_KIND,
                 occurred_at=job.created_at,
                 source=f"learning.{job.reflection_kind}",
-                actor_consciousness_instance_id=(
-                    job.actor_consciousness_instance_id
-                ),
+                actor_consciousness_instance_id=(job.actor_consciousness_instance_id),
                 subject_revision="",
                 provenance={
                     "schema_version": 1,
@@ -671,8 +678,7 @@ class LearningScheduler:
                         known.add(job.job_id)
                         ingested += 1
                         runtime["total_enqueued_count"] = (
-                            int(runtime.get("total_enqueued_count", 0) or 0)
-                            + 1
+                            int(runtime.get("total_enqueued_count", 0) or 0) + 1
                         )
                         runtime["last_enqueued_at"] = job.created_at
                     cursor = record.position
@@ -1006,10 +1012,8 @@ class LearningScheduler:
         return parsed.astimezone(UTC)
 
     @staticmethod
-    def _subject_content_from_snapshot(
-        snapshot: Any, path: SubjectDocumentPath
-    ) -> bytes:
-        """Return one exact subject head from an authority snapshot."""
+    def _subject_commit_from_snapshot(snapshot: Any, path: SubjectDocumentPath) -> Any:
+        """Resolve one exact subject commit from a coherent authority snapshot."""
 
         commits = getattr(snapshot, "commits", None)
         if isinstance(commits, dict):
@@ -1022,11 +1026,48 @@ class LearningScheduler:
                 if logical_path in {path, f"life_engine_workspace/{path}"}:
                     commit = item
                     break
+        return commit
+
+    @classmethod
+    def _subject_observation_from_snapshot(
+        cls,
+        snapshot: Any,
+        path: SubjectDocumentPath,
+    ) -> tuple[bytes, str]:
+        """Return exact bytes and a content-free per-document head marker."""
+
+        commit = cls._subject_commit_from_snapshot(snapshot, path)
         version = getattr(commit, "version", None)
         content = getattr(version, "content_bytes", None)
         if content is None:
             raise RuntimeError(f"SubjectAuthoritySourceMissing: {path}")
-        return bytes(content)
+        head = getattr(commit, "head", None)
+        marker_material = json.dumps(
+            {
+                "document_id": str(getattr(head, "document_id", "") or ""),
+                "current_version_id": str(
+                    getattr(head, "current_version_id", "") or ""
+                ),
+                "head_revision": int(getattr(head, "revision", 0) or 0),
+                "version_id": str(getattr(version, "version_id", "") or ""),
+                "content_hash": str(getattr(version, "content_hash", "") or ""),
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return bytes(content), hashlib.sha256(marker_material).hexdigest()
+
+    @classmethod
+    def _subject_content_from_snapshot(
+        cls,
+        snapshot: Any,
+        path: SubjectDocumentPath,
+    ) -> bytes:
+        """Return one exact subject head from an authority snapshot."""
+
+        content, _ = cls._subject_observation_from_snapshot(snapshot, path)
+        return content
 
     async def read_subject_document(self, path: SubjectDocumentPath) -> bytes:
         """Read an exact current authority document from the selected source."""
@@ -1041,6 +1082,86 @@ class LearningScheduler:
             raise RuntimeError(f"SubjectAuthoritySourceMissing: {path}")
         return target.read_bytes()
 
+    async def read_subject_document_with_identity(
+        self,
+        path: SubjectDocumentPath,
+    ) -> tuple[bytes, str, str]:
+        """Read one exact document with its immutable version and subject revision.
+
+        Selected storage is sampled once, so callers never combine bytes from one
+        authority snapshot with a revision from another.  The local compatibility
+        path derives a content-addressed version identity without writing anything.
+        """
+
+        if path not in SUBJECT_AUTHORITY_PATHS:
+            raise ValueError(f"unsupported subject authority path: {path}")
+        if self._read_subject_authority is not None:
+            snapshot = await self._read_subject_authority()
+            content, _ = self._subject_observation_from_snapshot(snapshot, path)
+            commit = self._subject_commit_from_snapshot(snapshot, path)
+            version = getattr(commit, "version", None)
+            version_id = str(getattr(version, "version_id", "") or "").strip()
+            revision = str(getattr(snapshot, "revision", "") or "").strip().lower()
+            if not version_id:
+                raise RuntimeError(f"SubjectAuthorityVersionMissing: {path}")
+            if not revision:
+                raise RuntimeError("LearningSubjectRevisionUnavailable")
+            return content, version_id, revision
+
+        content = await self.read_subject_document(path)
+        revision = await self.current_subject_revision()
+        return (
+            content,
+            (
+                f"workspace-{Path(path).stem.lower()}-sha256:"
+                f"{hashlib.sha256(content).hexdigest()}"
+            ),
+            revision,
+        )
+
+    @staticmethod
+    def _continuity_memory_pressure(
+        *,
+        path: SubjectDocumentPath,
+        size_bytes: int,
+        record: dict[str, Any],
+    ) -> dict[str, int | bool | str]:
+        """Describe technical MEMORY pressure without ranking its meaning."""
+
+        if path != "MEMORY.md":
+            return {
+                "soft_target_bytes": 0,
+                "review_pressure_bytes": 0,
+                "review_growth_bytes": 0,
+                "soft_target_exceeded": False,
+                "review_pressure_reached": False,
+                "review_pressure_acknowledged": False,
+                "review_pressure_due": False,
+                "pressure_semantics": "not_applicable",
+            }
+        last_acknowledged_size = max(
+            0,
+            int(record.get("last_pressure_acknowledged_size_bytes") or 0),
+        )
+        reached = size_bytes >= CONTINUITY_MEMORY_REVIEW_PRESSURE_BYTES
+        acknowledged = bool(
+            reached
+            and last_acknowledged_size >= CONTINUITY_MEMORY_REVIEW_PRESSURE_BYTES
+            and size_bytes >= last_acknowledged_size
+            and size_bytes
+            < last_acknowledged_size + CONTINUITY_MEMORY_REVIEW_GROWTH_BYTES
+        )
+        return {
+            "soft_target_bytes": CONTINUITY_MEMORY_SOFT_TARGET_BYTES,
+            "review_pressure_bytes": CONTINUITY_MEMORY_REVIEW_PRESSURE_BYTES,
+            "review_growth_bytes": CONTINUITY_MEMORY_REVIEW_GROWTH_BYTES,
+            "soft_target_exceeded": (size_bytes > CONTINUITY_MEMORY_SOFT_TARGET_BYTES),
+            "review_pressure_reached": reached,
+            "review_pressure_acknowledged": acknowledged,
+            "review_pressure_due": bool(reached and not acknowledged),
+            "pressure_semantics": "engineering_review_only",
+        }
+
     async def _review_document_snapshot(
         self,
         *,
@@ -1048,20 +1169,25 @@ class LearningScheduler:
         record: dict[str, Any],
         now: datetime,
         mark_offered: bool,
+        subject_revision: str,
+        authority_snapshot: Any | None = None,
     ) -> tuple[dict[str, Any], bool]:
         exists = False
         changed_at: datetime | None = None
         size_bytes = 0
         content_sha256 = ""
+        change_marker = ""
+        changed = False
         if self._read_subject_authority is not None:
-            try:
-                content = await self.read_subject_document(path)
-            except RuntimeError:
-                content = b""
-            else:
-                exists = True
-                size_bytes = len(content)
-                content_sha256 = hashlib.sha256(content).hexdigest()
+            if authority_snapshot is None:
+                raise RuntimeError("SubjectAuthoritySnapshotUnavailable")
+            content, change_marker = self._subject_observation_from_snapshot(
+                authority_snapshot,
+                path,
+            )
+            exists = True
+            size_bytes = len(content)
+            content_sha256 = hashlib.sha256(content).hexdigest()
         else:
             target = self._workspace / path
             exists = target.exists() and target.is_file()
@@ -1072,10 +1198,57 @@ class LearningScheduler:
                 content_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
 
         last_reviewed = self._parse_review_time(record.get("last_reviewed_at"))
-        baseline = max(
-            (item for item in (changed_at, last_reviewed) if item is not None),
-            default=now,
-        )
+        if self._read_subject_authority is not None:
+            baseline = self._parse_review_time(record.get("review_baseline_at"))
+            baseline_hash = str(record.get("review_baseline_content_sha256") or "")
+            baseline_marker = str(record.get("review_baseline_change_marker") or "")
+            reset_baseline = baseline is None or (
+                exists
+                and (
+                    baseline_hash != content_sha256
+                    or bool(
+                        change_marker
+                        and baseline_marker
+                        and change_marker != baseline_marker
+                    )
+                )
+            )
+            if reset_baseline:
+                baseline = now
+                record.update(
+                    {
+                        "review_baseline_at": now.isoformat(),
+                        "review_baseline_content_sha256": content_sha256,
+                        "review_baseline_change_marker": change_marker,
+                        "review_baseline_subject_revision": subject_revision,
+                        # An offer or snooze is bound to the prior exact head.
+                        "last_offered_at": "",
+                        "snooze_until": "",
+                    }
+                )
+                changed = True
+            elif change_marker and not baseline_marker:
+                # A backend upgraded to expose head identity.  Preserve the
+                # established clock while binding future changes to the marker.
+                record["review_baseline_change_marker"] = change_marker
+                changed = True
+            observed_exists = record.get("last_observed_exists")
+            if observed_exists is not exists:
+                record["last_observed_exists"] = exists
+                record["last_observed_at"] = now.isoformat()
+                changed = True
+            if int(record.get("last_observed_size_bytes") or 0) != size_bytes:
+                record["last_observed_size_bytes"] = size_bytes
+                changed = True
+            baseline = max(
+                (item for item in (baseline, last_reviewed) if item is not None),
+                default=now,
+            )
+        else:
+            baseline = max(
+                (item for item in (changed_at, last_reviewed) if item is not None),
+                default=now,
+            )
         interval_hours = self._subject_review_intervals[path]
         due_at = baseline + timedelta(hours=interval_hours)
         snooze_until = self._parse_review_time(record.get("snooze_until"))
@@ -1085,14 +1258,20 @@ class LearningScheduler:
             if last_offered is not None
             else None
         )
+        pressure = self._continuity_memory_pressure(
+            path=path,
+            size_bytes=size_bytes,
+            record=record,
+        )
+        interval_due = now >= due_at
+        pressure_due = bool(pressure["review_pressure_due"])
         due = bool(
             self._subject_review_enabled
             and exists
-            and now >= due_at
+            and (interval_due or pressure_due)
             and (snooze_until is None or now >= snooze_until)
             and (offer_after is None or now >= offer_after)
         )
-        changed = False
         if due and mark_offered:
             record["last_offered_at"] = now.isoformat()
             changed = True
@@ -1105,8 +1284,19 @@ class LearningScheduler:
                 "content_sha256": content_sha256,
                 "interval_hours": interval_hours,
                 "changed_at": changed_at.isoformat() if changed_at else "",
+                "review_baseline_at": str(record.get("review_baseline_at") or ""),
+                "change_marker": change_marker,
                 "due_at": due_at.isoformat(),
                 "due": due,
+                "due_reasons": [
+                    reason
+                    for reason, active in (
+                        ("interval", interval_due),
+                        ("engineering_pressure", pressure_due),
+                    )
+                    if active
+                ],
+                **pressure,
                 "last_offered_at": str(record.get("last_offered_at") or ""),
                 "last_reviewed_at": str(record.get("last_reviewed_at") or ""),
                 "last_outcome": str(record.get("last_outcome") or ""),
@@ -1137,13 +1327,52 @@ class LearningScheduler:
 
         revision = ""
         revision_error = ""
-        if self._current_subject_revision is None:
+        authority_snapshot: Any | None = None
+        if self._read_subject_authority is not None:
+            try:
+                authority_snapshot = await self._read_subject_authority()
+                revision = (
+                    str(getattr(authority_snapshot, "revision", "") or "")
+                    .strip()
+                    .lower()
+                )
+                if len(revision) != 64 or any(
+                    character not in "0123456789abcdef" for character in revision
+                ):
+                    raise RuntimeError("LearningSubjectRevisionUnavailable")
+            except Exception as exc:  # noqa: BLE001 - health must remain available
+                revision_error = type(exc).__name__
+        elif self._current_subject_revision is None:
             revision_error = "subject_revision_unavailable"
         else:
             try:
                 revision = str(await self._current_subject_revision()).strip().lower()
             except Exception as exc:  # noqa: BLE001 - health must remain available
                 revision_error = type(exc).__name__
+
+        if self._read_subject_authority is not None and authority_snapshot is None:
+            health = self._subject_review_health_snapshot()
+            documents = [
+                {**dict(item), "due": False, "due_reasons": []}
+                for item in health.get("documents", [])
+                if isinstance(item, dict)
+            ]
+            return {
+                "status": "degraded",
+                "authority_status": (
+                    "selected_ready"
+                    if self.decision_ledger is not None
+                    else "migration_required"
+                ),
+                "direct_mutation_blocked": True,
+                "subject_revision": "",
+                "revision_error": revision_error,
+                "due_count": 0,
+                "pending_candidate_count": int(
+                    health.get("pending_candidate_count", 0) or 0
+                ),
+                "documents": documents,
+            }
 
         async with self._subject_review_lock:
             state, review = self._subject_review_state()
@@ -1160,6 +1389,8 @@ class LearningScheduler:
                     record=record,
                     now=now,
                     mark_offered=mark_offered,
+                    subject_revision=revision,
+                    authority_snapshot=authority_snapshot,
                 )
                 snapshots.append(snapshot)
                 if document_changed or not isinstance(raw_record, dict):
@@ -1206,25 +1437,70 @@ class LearningScheduler:
     async def get_subject_review_prompt(self) -> str:
         """Render a bounded invitation; silence and no-change remain valid choices."""
 
-        snapshot = await self.get_subject_review_snapshot(mark_offered=True)
+        snapshot = await self.get_subject_review_snapshot(mark_offered=False)
         due = [item for item in snapshot["documents"] if item.get("due")]
         if not due:
+            self._pending_subject_review_offer = None
             return ""
+        offer_material = {
+            "subject_revision": snapshot["subject_revision"],
+            "documents": [
+                {
+                    "target_path": item["target_path"],
+                    "content_sha256": item["content_sha256"],
+                    "change_marker": item["change_marker"],
+                    "due_reasons": list(item["due_reasons"]),
+                }
+                for item in due
+            ],
+        }
+        delivery_id = (
+            "subject_review_offer_"
+            + hashlib.sha256(
+                json.dumps(
+                    offer_material,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+        delivery_marker = f"<subject_review_offer delivery_id={delivery_id}>"
+        self._pending_subject_review_offer = {
+            "delivery_id": delivery_id,
+            "delivery_marker": delivery_marker,
+            **offer_material,
+        }
         lines = [
+            delivery_marker,
             "### 主体文档复盘机会（邀请，不是任务）",
             "",
             "以下文件到了可以重新看一眼的工程时间点；这不表示内容有错，也不要求修改。",
         ]
         for item in due:
-            lines.append(
-                f"- `{item['target_path']}`：上次内容变化 {item['changed_at'] or '未知'}"
-            )
+            if "engineering_pressure" in item.get("due_reasons", []):
+                lines.append(
+                    f"- `{item['target_path']}`：当前 {item['size_bytes']} bytes，"
+                    f"达到 {item['review_pressure_bytes']} bytes 工程复盘线；"
+                    "这不表示任何条目不重要，也不授权自动删除。"
+                )
+            else:
+                lines.append(
+                    f"- `{item['target_path']}`：上次内容变化 "
+                    f"{item['changed_at'] or '未知'}"
+                )
         lines.extend(
             [
                 "- 你可以保持原样、稍后再看，或安静结束；后台不能替你解释或改写。",
                 "- 想复盘时使用 `nucleus_review_subject_document` 查看状态并记录你的选择。",
             ]
         )
+        if any(item["target_path"] == "MEMORY.md" for item in due):
+            lines.append(
+                "- 很长但仍需保留的记忆可以先用 "
+                "`nucleus_create_memory_boundary` 保存完整不可变正文，再由你把返回的"
+                "精确索引写进完整 MEMORY.md 候选；移除索引不会删除历史正文。"
+            )
         if snapshot["authority_status"] == "selected_ready":
             lines.append(
                 "- 若你形成了完整新版本，只能先提交候选，再单独使用主体候选决定工具接受；不会自动合并或自动接受。"
@@ -1234,6 +1510,92 @@ class LearningScheduler:
                 "- 当前正式 Subject Authority 迁移尚未完成：可以记录保持不变或稍后再看，但新版本提交会明确拒绝，绝不退回直接写文件。"
             )
         return "\n".join(lines)
+
+    def get_pending_subject_review_offer(self) -> dict[str, Any] | None:
+        """Return content-free metadata for the prompt rendered this heartbeat."""
+
+        pending = self._pending_subject_review_offer
+        return dict(pending) if isinstance(pending, dict) else None
+
+    async def commit_subject_review_offer_delivery(
+        self,
+        delivery_id: str,
+        receipt: Any,
+    ) -> bool:
+        """Start cooldown only after exact final-attempt prompt delivery."""
+
+        pending = self._pending_subject_review_offer
+        identity = str(delivery_id or "").strip()
+        if not isinstance(pending, dict) or pending.get("delivery_id") != identity:
+            return False
+        exact = bool(getattr(receipt, "exact_present", False))
+        expected_bytes = getattr(receipt, "expected_utf8_bytes", None)
+        effective_bytes = getattr(receipt, "effective_utf8_bytes", None)
+        if not all(
+            (
+                str(getattr(receipt, "delivery_id", "") or "") == identity,
+                str(getattr(receipt, "part_kind", "") or "") == "text",
+                exact,
+                isinstance(expected_bytes, int),
+                isinstance(effective_bytes, int),
+                expected_bytes == effective_bytes,
+                str(getattr(receipt, "expected_sha256", "") or "")
+                == str(getattr(receipt, "effective_sha256", "") or ""),
+            )
+        ):
+            self._pending_subject_review_offer = None
+            return False
+
+        snapshot = await self.get_subject_review_snapshot(mark_offered=False)
+        if str(snapshot.get("subject_revision") or "") != str(
+            pending.get("subject_revision") or ""
+        ):
+            self._pending_subject_review_offer = None
+            return False
+        current_by_path = {
+            str(item.get("target_path") or ""): item
+            for item in snapshot.get("documents", [])
+            if isinstance(item, dict)
+        }
+        prepared_documents = pending.get("documents")
+        if not isinstance(prepared_documents, list) or not prepared_documents:
+            self._pending_subject_review_offer = None
+            return False
+        for prepared in prepared_documents:
+            if not isinstance(prepared, dict):
+                self._pending_subject_review_offer = None
+                return False
+            current = current_by_path.get(str(prepared.get("target_path") or ""))
+            if current is None or not all(
+                (
+                    bool(current.get("due")),
+                    str(current.get("content_sha256") or "")
+                    == str(prepared.get("content_sha256") or ""),
+                    str(current.get("change_marker") or "")
+                    == str(prepared.get("change_marker") or ""),
+                )
+            ):
+                self._pending_subject_review_offer = None
+                return False
+
+        offered_at = datetime.now(UTC).isoformat()
+        async with self._subject_review_lock:
+            state, review = self._subject_review_state()
+            documents = review["documents"]
+            assert isinstance(documents, dict)
+            for prepared in prepared_documents:
+                path = str(prepared["target_path"])
+                raw_record = documents.get(path)
+                record = dict(raw_record) if isinstance(raw_record, dict) else {}
+                record["last_offered_at"] = offered_at
+                record["last_offered_content_sha256"] = str(prepared["content_sha256"])
+                record["last_offered_delivery_id"] = identity
+                documents[path] = record
+            state[_SUBJECT_REVIEW_STATE_KEY] = review
+            self.store.save_state(state)
+            await self.flush()
+        self._pending_subject_review_offer = None
+        return True
 
     async def validate_subject_review_context(
         self,
@@ -1275,6 +1637,303 @@ class LearningScheduler:
         finally:
             os.close(descriptor)
 
+    @classmethod
+    def _validate_selected_snooze_event(
+        cls,
+        record: Any,
+        *,
+        occurrence_id: str,
+        target_path: SubjectDocumentPath,
+        actor_consciousness_instance_id: str,
+        subject_revision: str,
+        current_content_sha256: str,
+        reason: str,
+        snooze_hours: float,
+    ) -> tuple[datetime, datetime]:
+        """Validate and recover the immutable clock of one snooze occurrence."""
+
+        payload = getattr(record, "payload", None)
+        provenance = getattr(record, "provenance", None)
+        expected_payload = {
+            "schema_version": 1,
+            "target_path": target_path,
+            "outcome": "snoozed",
+            "actor_consciousness_instance_id": actor_consciousness_instance_id,
+            "subject_revision": subject_revision,
+            "current_content_sha256": current_content_sha256,
+            "source_occurrence_id": occurrence_id,
+            "reason": reason,
+            "snooze_hours": snooze_hours,
+            "authority": "review_evidence_only",
+        }
+        identity_matches = all(
+            (
+                str(getattr(record, "occurrence_id", "") or "") == occurrence_id,
+                str(getattr(record, "event_kind", "") or "")
+                == _SUBJECT_REVIEW_SNOOZED_EVENT_KIND,
+                str(getattr(record, "source", "") or "")
+                == "subject.review.active_consciousness",
+                str(getattr(record, "actor_consciousness_instance_id", "") or "")
+                == actor_consciousness_instance_id,
+                str(getattr(record, "subject_revision", "") or "") == subject_revision,
+                isinstance(payload, dict),
+                isinstance(provenance, dict),
+            )
+        )
+        if not identity_matches or any(
+            payload.get(key) != value for key, value in expected_payload.items()
+        ):
+            raise LearningOccurrenceConflict("SubjectReviewSnoozeOccurrenceConflict")
+        if (
+            provenance.get("source_occurrence_id") != occurrence_id
+            or provenance.get("current_content_sha256") != current_content_sha256
+        ):
+            raise LearningOccurrenceConflict("SubjectReviewSnoozeOccurrenceConflict")
+        occurred_at = cls._parse_review_time(getattr(record, "occurred_at", ""))
+        snooze_until = cls._parse_review_time(payload.get("snooze_until"))
+        if occurred_at is None or snooze_until is None:
+            raise LearningOccurrenceConflict("SubjectReviewSnoozeOccurrenceConflict")
+        expected_until = occurred_at + timedelta(hours=snooze_hours)
+        if snooze_until != expected_until:
+            raise LearningOccurrenceConflict("SubjectReviewSnoozeOccurrenceConflict")
+        return occurred_at, snooze_until
+
+    async def _append_selected_snooze_event(
+        self,
+        *,
+        occurrence_id: str,
+        target_path: SubjectDocumentPath,
+        actor_consciousness_instance_id: str,
+        subject_revision: str,
+        current_content_sha256: str,
+        reason: str,
+        snooze_hours: float,
+    ) -> tuple[datetime, datetime, str]:
+        """Append one selected snooze event before updating its projection."""
+
+        if self._learning_event_store is None:
+            raise RuntimeError("SubjectReviewImmutableEvidenceRequired")
+        existing = await self._learning_event_store.event_by_occurrence(occurrence_id)
+        if existing is not None:
+            occurred_at, snooze_until = self._validate_selected_snooze_event(
+                existing,
+                occurrence_id=occurrence_id,
+                target_path=target_path,
+                actor_consciousness_instance_id=actor_consciousness_instance_id,
+                subject_revision=subject_revision,
+                current_content_sha256=current_content_sha256,
+                reason=reason,
+                snooze_hours=snooze_hours,
+            )
+            return occurred_at, snooze_until, str(existing.event_sha256)
+
+        occurred_at = datetime.now(UTC)
+        snooze_until = occurred_at + timedelta(hours=snooze_hours)
+        draft = LearningEventDraft(
+            occurrence_id=occurrence_id,
+            event_kind=_SUBJECT_REVIEW_SNOOZED_EVENT_KIND,
+            occurred_at=occurred_at.isoformat(),
+            source="subject.review.active_consciousness",
+            actor_consciousness_instance_id=actor_consciousness_instance_id,
+            subject_revision=subject_revision,
+            provenance={
+                "schema_version": 1,
+                "source_occurrence_id": occurrence_id,
+                "target_path": target_path,
+                "current_content_sha256": current_content_sha256,
+                "authority": "review_evidence_only",
+                "writer_instance_id": self._writer_instance_id,
+            },
+            payload={
+                "schema_version": 1,
+                "target_path": target_path,
+                "outcome": "snoozed",
+                "actor_consciousness_instance_id": (actor_consciousness_instance_id),
+                "subject_revision": subject_revision,
+                "current_content_sha256": current_content_sha256,
+                "source_occurrence_id": occurrence_id,
+                "reason": reason,
+                "snooze_hours": snooze_hours,
+                "snooze_until": snooze_until.isoformat(),
+                "authority": "review_evidence_only",
+            },
+        )
+        try:
+            result = await self._learning_event_store.commit(
+                events=[draft],
+                projections=[],
+            )
+        except LearningOccurrenceConflict:
+            # A concurrent replay may have won between the lookup and append.
+            existing = await self._learning_event_store.event_by_occurrence(
+                occurrence_id
+            )
+            if existing is None:
+                raise
+            occurred_at, snooze_until = self._validate_selected_snooze_event(
+                existing,
+                occurrence_id=occurrence_id,
+                target_path=target_path,
+                actor_consciousness_instance_id=actor_consciousness_instance_id,
+                subject_revision=subject_revision,
+                current_content_sha256=current_content_sha256,
+                reason=reason,
+                snooze_hours=snooze_hours,
+            )
+            return occurred_at, snooze_until, str(existing.event_sha256)
+        if len(result.events) != 1:
+            raise RuntimeError("SubjectReviewImmutableEvidenceMissing")
+        occurred_at, snooze_until = self._validate_selected_snooze_event(
+            result.events[0],
+            occurrence_id=occurrence_id,
+            target_path=target_path,
+            actor_consciousness_instance_id=actor_consciousness_instance_id,
+            subject_revision=subject_revision,
+            current_content_sha256=current_content_sha256,
+            reason=reason,
+            snooze_hours=snooze_hours,
+        )
+        return occurred_at, snooze_until, str(result.events[0].event_sha256)
+
+    @staticmethod
+    def _require_review_event_hash(record: Any) -> str:
+        digest = str(getattr(record, "event_sha256", "") or "").strip().lower()
+        if len(digest) != 64 or any(
+            character not in "0123456789abcdef" for character in digest
+        ):
+            raise RuntimeError("SubjectReviewImmutableEvidenceHashMissing")
+        return digest
+
+    async def _verify_selected_review_evidence(
+        self,
+        *,
+        target_path: SubjectDocumentPath,
+        outcome: str,
+        actor_consciousness_instance_id: str,
+        subject_revision: str,
+        occurrence_id: str,
+        reason: str,
+        candidate_id: str,
+        candidate_sha256: str,
+        authority_occurrence_id: str,
+    ) -> tuple[datetime, str]:
+        """Derive one review projection input from immutable Learning evidence."""
+
+        if self._learning_event_store is None:
+            raise RuntimeError("SubjectReviewImmutableEvidenceRequired")
+        event = await self._learning_event_store.event_by_occurrence(occurrence_id)
+        if event is None:
+            raise RuntimeError("SubjectReviewImmutableEvidenceMissing")
+        payload = getattr(event, "payload", None)
+        provenance = getattr(event, "provenance", None)
+        if not isinstance(payload, dict) or not isinstance(provenance, dict):
+            raise RuntimeError("SubjectReviewImmutableEvidenceCorrupt")
+
+        actor = str(actor_consciousness_instance_id)
+        candidate = str(candidate_id)
+        candidate_hash = str(candidate_sha256).lower()
+        reason_hash = hashlib.sha256(reason.encode("utf-8")).hexdigest()
+        common_matches = all(
+            (
+                str(getattr(event, "occurrence_id", "") or "") == occurrence_id,
+                str(getattr(event, "actor_consciousness_instance_id", "") or "")
+                == actor,
+                str(payload.get("candidate_id") or "") == candidate,
+                str(payload.get("candidate_sha256") or "").lower() == candidate_hash,
+                str(payload.get("target_path") or "") == target_path,
+            )
+        )
+        if outcome == "candidate_proposed":
+            matches = all(
+                (
+                    common_matches,
+                    str(getattr(event, "event_kind", "") or "") == "candidate.proposed",
+                    str(getattr(event, "subject_revision", "") or "").lower()
+                    == subject_revision,
+                    str(provenance.get("review_reason_sha256") or "").lower()
+                    == reason_hash,
+                )
+            )
+        else:
+            expected_kind = {
+                "unchanged": "candidate.kept_open",
+                "rejected": "candidate.rejected",
+                "kept_open": "candidate.kept_open",
+                "committed": "candidate.accept_requested",
+            }.get(outcome)
+            matches = all(
+                (
+                    common_matches,
+                    bool(expected_kind),
+                    str(getattr(event, "event_kind", "") or "") == expected_kind,
+                    str(payload.get("reason") or "") == reason,
+                    str(getattr(event, "source", "") or "")
+                    == "learning.subject_decision",
+                )
+            )
+            if outcome == "unchanged":
+                matches = bool(
+                    matches and provenance.get("review_outcome") == "unchanged"
+                )
+            elif outcome != "committed":
+                matches = bool(
+                    matches
+                    and str(getattr(event, "subject_revision", "") or "").lower()
+                    == subject_revision
+                )
+        if not matches:
+            raise LearningOccurrenceConflict("SubjectReviewEvidenceConflict")
+
+        evidence_hash = self._require_review_event_hash(event)
+        occurred_at = self._parse_review_time(getattr(event, "occurred_at", ""))
+        if occurred_at is None:
+            raise RuntimeError("SubjectReviewImmutableEvidenceTimeMissing")
+        if outcome != "committed":
+            return occurred_at, evidence_hash
+
+        authority_identity = str(authority_occurrence_id or "").strip()
+        if not authority_identity:
+            raise RuntimeError("SubjectReviewAuthorityEvidenceRequired")
+        authority_event = await self._learning_event_store.event_by_occurrence(
+            f"learning_authority:{authority_identity}"
+        )
+        if authority_event is None:
+            raise RuntimeError("SubjectReviewAuthorityEvidenceMissing")
+        authority_payload = getattr(authority_event, "payload", None)
+        authority_provenance = getattr(authority_event, "provenance", None)
+        if not isinstance(authority_payload, dict) or not isinstance(
+            authority_provenance, dict
+        ):
+            raise RuntimeError("SubjectReviewAuthorityEvidenceCorrupt")
+        if not all(
+            (
+                str(getattr(authority_event, "event_kind", "") or "")
+                == "candidate.committed",
+                str(getattr(authority_event, "subject_revision", "") or "").lower()
+                == subject_revision,
+                str(authority_payload.get("candidate_id") or "") == candidate,
+                str(authority_payload.get("decision_occurrence_id") or "")
+                == occurrence_id,
+                str(authority_payload.get("new_subject_revision") or "").lower()
+                == subject_revision,
+                str(authority_provenance.get("authority_occurrence_id") or "")
+                == authority_identity,
+                str(authority_provenance.get("decision_occurrence_id") or "")
+                == occurrence_id,
+            )
+        ):
+            raise LearningOccurrenceConflict("SubjectReviewAuthorityEvidenceConflict")
+        authority_hash = self._require_review_event_hash(authority_event)
+        authority_time = self._parse_review_time(
+            getattr(authority_event, "occurred_at", "")
+        )
+        if authority_time is None:
+            raise RuntimeError("SubjectReviewAuthorityEvidenceTimeMissing")
+        combined = hashlib.sha256(
+            f"{evidence_hash}\0{authority_hash}".encode("ascii")
+        ).hexdigest()
+        return authority_time, combined
+
     async def record_subject_review_outcome(
         self,
         *,
@@ -1288,7 +1947,6 @@ class LearningScheduler:
         candidate_sha256: str = "",
         authority_occurrence_id: str = "",
         snooze_hours: float = 0.0,
-        immutable_evidence_recorded: bool = False,
     ) -> dict[str, Any]:
         """Project an active-instance review choice into bounded health state."""
 
@@ -1304,18 +1962,24 @@ class LearningScheduler:
             "kept_open",
         }:
             raise ValueError("invalid subject review outcome")
-        if not str(reason or "").strip():
+        reason_text = str(reason or "").strip()
+        occurrence_text = str(occurrence_id or "").strip()
+        actor = str(actor_consciousness_instance_id or "").strip()
+        revision = str(subject_revision or "").strip().lower()
+        if not reason_text:
             raise ValueError("subject review reason must not be empty")
+        if not occurrence_text:
+            raise ValueError("subject review occurrence must not be empty")
         occurred_at = datetime.now(UTC)
         event = {
             "schema_version": 1,
-            "occurrence_id": str(occurrence_id),
+            "occurrence_id": occurrence_text,
             "occurred_at": occurred_at.isoformat(),
             "target_path": target_path,
             "outcome": normalized_outcome,
-            "actor_consciousness_instance_id": str(actor_consciousness_instance_id),
-            "subject_revision": str(subject_revision),
-            "reason": str(reason),
+            "actor_consciousness_instance_id": actor,
+            "subject_revision": revision,
+            "reason": reason_text,
             "candidate_id": str(candidate_id),
             "candidate_sha256": str(candidate_sha256),
             "authority_occurrence_id": str(authority_occurrence_id),
@@ -1327,45 +1991,189 @@ class LearningScheduler:
             assert isinstance(documents, dict)
             raw_record = documents.get(target_path)
             record = dict(raw_record) if isinstance(raw_record, dict) else {}
-            if (
-                str(record.get("last_occurrence_id") or "") == occurrence_id
+            replayed = bool(
+                str(record.get("last_occurrence_id") or "") == occurrence_text
                 and str(record.get("last_outcome") or "") == normalized_outcome
-            ):
+            )
+            selected_review_mode = bool(
+                self._read_subject_authority is not None
+                or self._selected_persistence is not None
+                or self.decision_ledger is not None
+            )
+            reason_sha256 = hashlib.sha256(reason_text.encode("utf-8")).hexdigest()
+            if replayed and not selected_review_mode:
+                replay_matches = all(
+                    (
+                        str(record.get("last_actor_consciousness_instance_id") or "")
+                        == actor,
+                        str(record.get("last_subject_revision") or "").lower()
+                        == revision,
+                        str(record.get("last_candidate_id") or "") == str(candidate_id),
+                        str(record.get("last_candidate_sha256") or "").lower()
+                        == str(candidate_sha256).lower(),
+                        str(record.get("last_authority_occurrence_id") or "")
+                        == str(authority_occurrence_id),
+                        str(record.get("last_review_reason_sha256") or "").lower()
+                        == reason_sha256,
+                    )
+                )
+                if not replay_matches:
+                    raise LearningOccurrenceConflict(
+                        "SubjectReviewProjectionReplayConflict"
+                    )
                 return record
-            if self.decision_ledger is None:
+            current_content_sha256 = ""
+            current_size_bytes = 0
+            snooze_until: datetime | None = None
+            evidence_sha256 = ""
+            if normalized_outcome == "snoozed":
+                if selected_review_mode and self._read_subject_authority is None:
+                    raise RuntimeError("SelectedSubjectAuthorityReaderRequired")
+                revision = await self.validate_subject_review_context(
+                    actor_consciousness_instance_id=actor,
+                    expected_subject_revision=revision,
+                )
+                if self._read_subject_authority is not None:
+                    authority_snapshot = await self._read_subject_authority()
+                    snapshot_revision = (
+                        str(getattr(authority_snapshot, "revision", "") or "")
+                        .strip()
+                        .lower()
+                    )
+                    if snapshot_revision and snapshot_revision != revision:
+                        raise RuntimeError("LearningSubjectRevisionConflict")
+                    current_content, _ = self._subject_observation_from_snapshot(
+                        authority_snapshot,
+                        target_path,
+                    )
+                else:
+                    current_content = await self.read_subject_document(target_path)
+                current_content_sha256 = hashlib.sha256(current_content).hexdigest()
+                current_size_bytes = len(current_content)
+                bounded_snooze_hours = max(
+                    1.0,
+                    min(30.0 * 24.0, float(snooze_hours)),
+                )
+                if selected_review_mode:
+                    (
+                        occurred_at,
+                        snooze_until,
+                        evidence_sha256,
+                    ) = await self._append_selected_snooze_event(
+                        occurrence_id=occurrence_text,
+                        target_path=target_path,
+                        actor_consciousness_instance_id=actor,
+                        subject_revision=revision,
+                        current_content_sha256=current_content_sha256,
+                        reason=reason_text,
+                        snooze_hours=bounded_snooze_hours,
+                    )
+                else:
+                    snooze_until = occurred_at + timedelta(hours=bounded_snooze_hours)
+                    event.update(
+                        {
+                            "occurred_at": occurred_at.isoformat(),
+                            "current_content_sha256": current_content_sha256,
+                            "source_occurrence_id": occurrence_text,
+                            "snooze_hours": bounded_snooze_hours,
+                            "snooze_until": snooze_until.isoformat(),
+                        }
+                    )
+                    evidence_sha256 = hashlib.sha256(
+                        json.dumps(
+                            event,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+            else:
+                current_content = await self.read_subject_document(target_path)
+                current_content_sha256 = hashlib.sha256(current_content).hexdigest()
+                current_size_bytes = len(current_content)
+                if selected_review_mode:
+                    (
+                        occurred_at,
+                        evidence_sha256,
+                    ) = await self._verify_selected_review_evidence(
+                        target_path=target_path,
+                        outcome=normalized_outcome,
+                        actor_consciousness_instance_id=actor,
+                        subject_revision=revision,
+                        occurrence_id=occurrence_text,
+                        reason=reason_text,
+                        candidate_id=str(candidate_id),
+                        candidate_sha256=str(candidate_sha256),
+                        authority_occurrence_id=str(authority_occurrence_id),
+                    )
+                else:
+                    evidence_sha256 = hashlib.sha256(
+                        json.dumps(
+                            event,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+
+            if replayed:
+                if str(record.get("last_evidence_sha256") or "") != evidence_sha256:
+                    raise LearningOccurrenceConflict(
+                        "SubjectReviewProjectionReplayConflict"
+                    )
+                return record
+            last_evidence_at = self._parse_review_time(
+                record.get("last_evidence_occurred_at")
+            )
+            if last_evidence_at is not None and occurred_at <= last_evidence_at:
+                # The immutable occurrence is valid but older than the current
+                # projection. Replaying it must never roll the review clock back.
+                return record
+
+            if not selected_review_mode:
                 if normalized_outcome == "candidate_proposed":
                     raise RuntimeError("SubjectAuthorityMigrationRequired")
-                await asyncio.to_thread(self._append_local_subject_review_event, event)
-            elif not immutable_evidence_recorded and normalized_outcome in {
-                "unchanged",
-                "candidate_proposed",
-                "committed",
-                "rejected",
-                "kept_open",
-            }:
-                raise RuntimeError("SubjectReviewImmutableEvidenceRequired")
+                if normalized_outcome != "snoozed":
+                    await asyncio.to_thread(
+                        self._append_local_subject_review_event,
+                        event,
+                    )
+                elif evidence_sha256:
+                    await asyncio.to_thread(
+                        self._append_local_subject_review_event,
+                        event,
+                    )
             record.update(
                 {
                     "last_outcome": normalized_outcome,
-                    "last_actor_consciousness_instance_id": str(
-                        actor_consciousness_instance_id
-                    ),
-                    "last_subject_revision": str(subject_revision),
-                    "last_occurrence_id": str(occurrence_id),
+                    "last_actor_consciousness_instance_id": actor,
+                    "last_subject_revision": revision,
+                    "last_occurrence_id": occurrence_text,
                     "last_candidate_id": str(candidate_id),
                     "last_candidate_sha256": str(candidate_sha256),
+                    "last_evidence_sha256": evidence_sha256,
+                    "last_evidence_occurred_at": occurred_at.isoformat(),
+                    "last_review_reason_sha256": reason_sha256,
                 }
             )
             if normalized_outcome != "snoozed":
                 record["last_reviewed_at"] = occurred_at.isoformat()
+                record["last_reviewed_content_sha256"] = current_content_sha256
+                record["last_reviewed_size_bytes"] = current_size_bytes
+                if target_path == "MEMORY.md":
+                    record["last_pressure_acknowledged_size_bytes"] = current_size_bytes
                 record["snooze_until"] = ""
             else:
-                bounded = max(1.0, min(30.0 * 24.0, float(snooze_hours)))
-                record["snooze_until"] = (
-                    occurred_at + timedelta(hours=bounded)
-                ).isoformat()
+                if snooze_until is None:
+                    raise RuntimeError("SubjectReviewImmutableEvidenceMissing")
+                record["snooze_until"] = snooze_until.isoformat()
+                record["last_reviewed_content_sha256"] = current_content_sha256
+                record["last_snoozed_size_bytes"] = current_size_bytes
+                record["last_reason_sha256"] = hashlib.sha256(
+                    reason_text.encode("utf-8")
+                ).hexdigest()
             if normalized_outcome == "committed":
-                record["last_committed_subject_revision"] = str(subject_revision)
+                record["last_committed_subject_revision"] = revision
                 record["last_authority_occurrence_id"] = str(authority_occurrence_id)
             documents[target_path] = record
             state[_SUBJECT_REVIEW_STATE_KEY] = review
@@ -1925,26 +2733,109 @@ class LearningScheduler:
             documents = review["documents"]
             assert isinstance(documents, dict)
             if self._read_subject_authority is not None:
-                snapshots = [
-                    {
-                        "target_path": path,
-                        "last_reviewed_at": str(
-                            (documents.get(path) or {}).get("last_reviewed_at") or ""
+                now = datetime.now(UTC)
+                snapshots: list[dict[str, Any]] = []
+                for path in SUBJECT_AUTHORITY_PATHS:
+                    raw = documents.get(path)
+                    record = dict(raw) if isinstance(raw, dict) else {}
+                    observed_exists = record.get("last_observed_exists")
+                    observation_known = isinstance(observed_exists, bool)
+                    exists = bool(observed_exists) if observation_known else False
+                    baseline = self._parse_review_time(record.get("review_baseline_at"))
+                    last_reviewed = self._parse_review_time(
+                        record.get("last_reviewed_at")
+                    )
+                    effective_baseline = max(
+                        (
+                            item
+                            for item in (baseline, last_reviewed)
+                            if item is not None
                         ),
-                        "last_outcome": str(
-                            (documents.get(path) or {}).get("last_outcome") or ""
-                        ),
-                    }
-                    for path in SUBJECT_AUTHORITY_PATHS
-                ]
+                        default=None,
+                    )
+                    due_at = (
+                        effective_baseline
+                        + timedelta(hours=self._subject_review_intervals[path])
+                        if effective_baseline is not None
+                        else None
+                    )
+                    snooze_until = self._parse_review_time(record.get("snooze_until"))
+                    last_offered = self._parse_review_time(
+                        record.get("last_offered_at")
+                    )
+                    offer_after = (
+                        last_offered
+                        + timedelta(hours=self._subject_review_offer_cooldown_hours)
+                        if last_offered is not None
+                        else None
+                    )
+                    size_bytes = max(
+                        0,
+                        int(record.get("last_observed_size_bytes") or 0),
+                    )
+                    pressure = self._continuity_memory_pressure(
+                        path=path,
+                        size_bytes=size_bytes,
+                        record=record,
+                    )
+                    interval_due = bool(due_at is not None and now >= due_at)
+                    pressure_due = bool(pressure["review_pressure_due"])
+                    snapshots.append(
+                        {
+                            "target_path": path,
+                            "exists": exists,
+                            "observation_known": observation_known,
+                            "size_bytes": size_bytes,
+                            "content_sha256": str(
+                                record.get("review_baseline_content_sha256") or ""
+                            ),
+                            "review_baseline_at": str(
+                                record.get("review_baseline_at") or ""
+                            ),
+                            "due_at": due_at.isoformat() if due_at else "",
+                            "due": bool(
+                                self._subject_review_enabled
+                                and observation_known
+                                and exists
+                                and (interval_due or pressure_due)
+                                and (snooze_until is None or now >= snooze_until)
+                                and (offer_after is None or now >= offer_after)
+                            ),
+                            "due_reasons": [
+                                reason
+                                for reason, active in (
+                                    ("interval", interval_due),
+                                    ("engineering_pressure", pressure_due),
+                                )
+                                if active
+                            ],
+                            **pressure,
+                            "last_reviewed_at": str(
+                                record.get("last_reviewed_at") or ""
+                            ),
+                            "last_outcome": str(record.get("last_outcome") or ""),
+                        }
+                    )
                 pending = sum(
                     str(item.get("last_outcome") or "")
                     in {"candidate_proposed", "kept_open"}
                     for item in snapshots
                 )
+                due = sum(bool(item["due"]) for item in snapshots)
+                missing = sum(
+                    bool(item["observation_known"] and not item["exists"])
+                    for item in snapshots
+                )
+                unobserved = sum(
+                    not bool(item["observation_known"]) for item in snapshots
+                )
                 return {
                     "status": (
-                        "disabled" if not self._subject_review_enabled else "healthy"
+                        "disabled"
+                        if not self._subject_review_enabled
+                        else "degraded"
+                        if missing
+                        else "healthy"
                     ),
                     "authority_status": (
                         "selected_ready"
@@ -1953,9 +2844,11 @@ class LearningScheduler:
                     ),
                     "source": "selected_subject_authority",
                     "direct_mutation_blocked": True,
-                    "due_count": 0,
+                    "due_count": due,
+                    "due_count_known": unobserved == 0,
                     "pending_candidate_count": pending,
-                    "missing_count": 0,
+                    "missing_count": missing,
+                    "unobserved_count": unobserved,
                     "last_observed_subject_revision": str(
                         review.get("last_observed_subject_revision") or ""
                     ),
@@ -1985,14 +2878,42 @@ class LearningScheduler:
                 due_at = baseline + timedelta(
                     hours=self._subject_review_intervals[path]
                 )
+                snooze_until = self._parse_review_time(record.get("snooze_until"))
+                last_offered = self._parse_review_time(record.get("last_offered_at"))
+                offer_after = (
+                    last_offered
+                    + timedelta(hours=self._subject_review_offer_cooldown_hours)
+                    if last_offered is not None
+                    else None
+                )
+                pressure = self._continuity_memory_pressure(
+                    path=path,
+                    size_bytes=size_bytes,
+                    record=record,
+                )
+                interval_due = now >= due_at
+                pressure_due = bool(pressure["review_pressure_due"])
                 snapshot = {
                     "target_path": path,
                     "exists": exists,
                     "size_bytes": size_bytes,
                     "content_sha256": content_sha256,
                     "due": bool(
-                        self._subject_review_enabled and exists and now >= due_at
+                        self._subject_review_enabled
+                        and exists
+                        and (interval_due or pressure_due)
+                        and (snooze_until is None or now >= snooze_until)
+                        and (offer_after is None or now >= offer_after)
                     ),
+                    "due_reasons": [
+                        reason
+                        for reason, active in (
+                            ("interval", interval_due),
+                            ("engineering_pressure", pressure_due),
+                        )
+                        if active
+                    ],
+                    **pressure,
                     "last_outcome": str(record.get("last_outcome") or ""),
                 }
                 snapshots.append(snapshot)
@@ -2019,6 +2940,7 @@ class LearningScheduler:
                 ),
                 "direct_mutation_blocked": True,
                 "due_count": due,
+                "due_count_known": True,
                 "pending_candidate_count": pending,
                 "missing_count": missing,
                 "last_observed_subject_revision": str(
@@ -2036,7 +2958,8 @@ class LearningScheduler:
                     else "migration_required"
                 ),
                 "direct_mutation_blocked": True,
-                "due_count": 0,
+                "due_count": None,
+                "due_count_known": False,
                 "pending_candidate_count": 0,
                 "missing_count": 0,
                 "error_type": type(exc).__name__,

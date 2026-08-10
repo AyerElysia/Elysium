@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from src.core.components.base.plugin import BasePlugin
     from src.core.models.message import Message
 
+
 class BaseTool(ABC, LLMUsable):
     """工具组件基类。
 
@@ -41,6 +42,7 @@ class BaseTool(ABC, LLMUsable):
         ...         except Exception as e:
         ...         return False, f"计算错误: {e}"
     """
+
     _plugin_: str
     _signature_: str
 
@@ -65,22 +67,27 @@ class BaseTool(ABC, LLMUsable):
         self.plugin = plugin
         self.stream_id: str = ""
         self.trigger_message: "Message | None" = None
+        self._tool_call_id: str = ""
 
     def _bind_runtime_context(
         self,
         *,
         stream_id: str | None = None,
         message: "Message | None" = None,
+        tool_call_id: str = "",
     ) -> None:
         """绑定本次工具调用的运行态上下文。"""
 
         self.stream_id = str(stream_id or "").strip()
         self.trigger_message = message
+        self._tool_call_id = str(tool_call_id or "").strip()
 
     def get_current_stream_id(self) -> str:
         """获取当前工具调用所在的 stream id。"""
 
-        message_stream_id = str(getattr(self.trigger_message, "stream_id", "") or "").strip()
+        message_stream_id = str(
+            getattr(self.trigger_message, "stream_id", "") or ""
+        ).strip()
         if message_stream_id:
             return message_stream_id
         return str(self.stream_id or "").strip()
@@ -101,7 +108,7 @@ class BaseTool(ABC, LLMUsable):
         if hasattr(cls, "_plugin_") and cls._plugin_ and cls.tool_name:
             return f"{cls._plugin_}:tool:{cls.tool_name}"
         return None
-    
+
     @abstractmethod
     async def execute(
         self, *args: Any, **kwargs: Any
@@ -173,4 +180,6 @@ class BaseTool(ABC, LLMUsable):
             ... }
         """
         # 使用 utils 中的共同方法生成 schema，name 前缀加上组件类型
-        return parse_function_signature(cls.execute, f"tool-{cls.tool_name}", cls.tool_description)
+        return parse_function_signature(
+            cls.execute, f"tool-{cls.tool_name}", cls.tool_description
+        )

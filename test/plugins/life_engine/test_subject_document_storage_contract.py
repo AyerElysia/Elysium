@@ -37,6 +37,7 @@ from plugins.life_engine.storage.subject_contracts import (
 from plugins.life_engine.storage.subject_factory import open_subject_document_store
 from plugins.life_engine.storage.subject_schema import ensure_subject_document_schema
 from plugins.life_engine.storage.subject_workspace import (
+    RootSubjectAuthorityRequired,
     SubjectWorkspaceObserver,
     SubjectWorkspaceProjector,
 )
@@ -123,6 +124,35 @@ def _command(
         newline_style="crlf",
         change_context={"observation": True},
     )
+
+
+def _selected_local_service(
+    store: SubjectDocumentStorePort,
+    *,
+    data_root: Path,
+) -> LifeEngineService:
+    workspace = data_root / "life_engine_workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    service = object.__new__(LifeEngineService)
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(workspace)
+    service.plugin = SimpleNamespace(config=config)
+    service._legacy_config_warning_emitted = False
+    service._selectable_storage_enabled = True
+    service._subject_document_store = store
+    service._subject_workspace_observer = SubjectWorkspaceObserver(
+        store,
+        data_root=data_root,
+        recorded_source="workspace:test",
+    )
+    service._subject_workspace_projector = SubjectWorkspaceProjector(
+        store,
+        data_root=data_root,
+        worker_id="service-projector",
+    )
+    service._router_context_projection = None
+    service._subject_context_projections = {}
+    return service
 
 
 async def test_active_subject_writer_cannot_relax_database_immutability(
@@ -372,7 +402,7 @@ async def test_subject_workspace_projection_and_observation_never_overwrite_dive
         }
 
 
-async def test_targeted_projection_and_service_write_commit_before_workspace(
+async def test_targeted_projection_and_auxiliary_write_commit_before_workspace(
     tmp_path: Path,
 ) -> None:
     async with _local_store(tmp_path) as (_, store, _):
@@ -402,85 +432,155 @@ async def test_targeted_projection_and_service_write_commit_before_workspace(
         assert targeted.logical_path == "life_engine_workspace/USER.md"
         await store.confirm_projection(targeted, worker_id="targeted-projector")
 
-        service = object.__new__(LifeEngineService)
-        config = LifeEngineConfig()
-        config.settings.workspace_path = str(workspace)
-        service.plugin = SimpleNamespace(config=config)
-        service._legacy_config_warning_emitted = False
-        service._selectable_storage_enabled = True
-        service._subject_document_store = store
-        service._subject_workspace_observer = SubjectWorkspaceObserver(
-            store,
-            data_root=data_root,
-            recorded_source="workspace:test",
-        )
-        service._subject_workspace_projector = SubjectWorkspaceProjector(
-            store,
-            data_root=data_root,
-            worker_id="service-projector",
-        )
-        service._router_context_projection = None
-        service._subject_context_projections = {}
+        service = _selected_local_service(store, data_root=data_root)
+        relative_path = "diaries/witness/2026-08/exact-memory.md"
+        logical_path = f"life_engine_workspace/{relative_path}"
+        workspace_file = workspace / relative_path
 
         result = await service.write_selected_subject_document(
-            workspace_relative_path="MEMORY.md",
-            content_bytes=b"# exact memory\r\n",
-            occurrence_id="subject:service-memory-v1",
-            recorded_by="life-engine-file-tool",
-            recorded_source="tool:nucleus_write_file",
+            workspace_relative_path=relative_path,
+            content_bytes=b"# exact witness\r\n",
+            occurrence_id="subject:service-witness-v1",
+            recorded_by="memory-witness",
+            recorded_source="memory-witness",
             encoding="utf-8",
             semantic_actor_id="elysia",
             semantic_source_id="event:one",
-            reason="remember this",
+            reason="project immutable first-person witness",
         )
 
         assert result is not None
         assert result["status"] == "committed"
-        assert (workspace / "MEMORY.md").read_bytes() == b"# exact memory\r\n"
-        head = await store.get_head("life_engine_workspace/MEMORY.md")
+        assert workspace_file.read_bytes() == b"# exact witness\r\n"
+        head = await store.get_head(logical_path)
         assert head is not None and head.revision == 1
         version = await store.get_version(head.current_version_id)
-        assert version.content_bytes == b"# exact memory\r\n"
+        assert version.content_bytes == b"# exact witness\r\n"
         assert version.semantic_actor_id == "elysia"
         assert version.semantic_source_id == "event:one"
 
         repeated = await service.write_selected_subject_document(
-            workspace_relative_path="MEMORY.md",
-            content_bytes=b"# exact memory\r\n",
-            occurrence_id="subject:service-memory-retry",
-            recorded_by="life-engine-file-tool",
-            recorded_source="tool:nucleus_write_file",
+            workspace_relative_path=relative_path,
+            content_bytes=b"# exact witness\r\n",
+            occurrence_id="subject:service-witness-retry",
+            recorded_by="memory-witness",
+            recorded_source="memory-witness",
             encoding="utf-8",
         )
         assert repeated is not None and repeated["status"] == "unchanged"
-        repeated_head = await store.get_head("life_engine_workspace/MEMORY.md")
+        repeated_head = await store.get_head(logical_path)
         assert repeated_head is not None and repeated_head.revision == 1
 
-        (workspace / "SOUL.md").write_bytes(b"external soul\n")
+        workspace_file.write_bytes(b"external exact witness\n")
         reconciled = await service.write_selected_subject_document(
-            workspace_relative_path="SOUL.md",
-            content_bytes=b"authoritative soul\n",
-            occurrence_id="subject:service-soul-v2",
-            recorded_by="life-engine-file-tool",
-            recorded_source="tool:nucleus_write_file",
+            workspace_relative_path=relative_path,
+            content_bytes=b"authoritative witness\n",
+            occurrence_id="subject:service-witness-v3",
+            recorded_by="memory-witness",
+            recorded_source="memory-witness",
             encoding="utf-8",
             semantic_actor_id="elysia",
-            reason="reconcile an external exact-byte change",
+            reason="project immutable first-person witness",
         )
         assert reconciled is not None and reconciled["status"] == "committed"
-        assert (workspace / "SOUL.md").read_bytes() == b"authoritative soul\n"
-        soul_head = await store.get_head("life_engine_workspace/SOUL.md")
-        assert soul_head is not None and soul_head.revision == 3
-        soul_history = await store.list_history("life_engine_workspace/SOUL.md")
-        assert [version.content_bytes for version in soul_history] == [
-            b"soul",
-            b"external soul\n",
-            b"authoritative soul\n",
+        assert workspace_file.read_bytes() == b"authoritative witness\n"
+        witness_head = await store.get_head(logical_path)
+        assert witness_head is not None and witness_head.revision == 3
+        witness_history = await store.list_history(logical_path)
+        assert [version.content_bytes for version in witness_history] == [
+            b"# exact witness\r\n",
+            b"external exact witness\n",
+            b"authoritative witness\n",
         ]
         assert (await store.health_snapshot())["projection_outbox"] == {
             "confirmed": 4,
-            "failed": 1,
+            "pending": 1,
         }
+
+
+@pytest.mark.parametrize("root_name", ["SOUL.md", "USER.md", "MEMORY.md"])
+async def test_generic_subject_writer_rejects_root_authority_without_mutation(
+    tmp_path: Path,
+    root_name: str,
+) -> None:
+    async with _local_store(tmp_path) as (_, store, _):
+        data_root = tmp_path / "data"
+        workspace = data_root / "life_engine_workspace"
+        logical_path = f"life_engine_workspace/{root_name}"
+        original = f"original {root_name}\n".encode()
+        await store.append_version(
+            _command(
+                path=logical_path,
+                occurrence=f"subject:original:{root_name}",
+                content=original,
+            )
+        )
+        service = _selected_local_service(store, data_root=data_root)
+        projector = service._subject_workspace_projector
+        assert projector is not None
+        projected = await projector.project_one(logical_path=logical_path)
+        assert projected.status == "projected", projected.detail
+
+        before_head = await store.get_head(logical_path)
+        before_history = await store.list_history(logical_path)
+        before_outbox = (await store.health_snapshot())["projection_outbox"]
+
+        with pytest.raises(RootSubjectAuthorityRequired) as raised:
+            await service.write_selected_subject_document(
+                workspace_relative_path=root_name,
+                content_bytes=b"private replacement bytes must not be exposed",
+                occurrence_id="subject:generic-root-write",
+                recorded_by="generic-writer",
+                recorded_source="generic-writer",
+                encoding="utf-8",
+                semantic_actor_id="elysia",
+                semantic_source_id="event:root-write",
+                reason="must not enter the exception",
+            )
+
+        assert str(raised.value) == "RootSubjectAuthorityRequired"
+        assert await store.get_head(logical_path) == before_head
+        assert await store.list_history(logical_path) == before_history
+        assert (await store.health_snapshot())["projection_outbox"] == before_outbox
+        assert (workspace / root_name).read_bytes() == original
+
+
+async def test_root_authority_guard_precedes_disabled_local_fallback() -> None:
+    service = object.__new__(LifeEngineService)
+    service._selectable_storage_enabled = False
+
+    for root_name in (
+        "SOUL.md",
+        "USER.md",
+        "MEMORY.md",
+        "life_engine_workspace/SOUL.md",
+        "life_engine_workspace/USER.md",
+        "life_engine_workspace/MEMORY.md",
+    ):
+        with pytest.raises(
+            RootSubjectAuthorityRequired,
+            match="^RootSubjectAuthorityRequired$",
+        ):
+            await service.write_selected_subject_document(
+                workspace_relative_path=root_name,
+                content_bytes=b"rejected",
+                occurrence_id="subject:disabled-root-write",
+                recorded_by="generic-writer",
+                recorded_source="generic-writer",
+                encoding="utf-8",
+            )
+
+    assert (
+        await service.write_selected_subject_document(
+            workspace_relative_path="diaries/witness/2026-08/local.md",
+            content_bytes=b"handled by explicit local writer",
+            occurrence_id="subject:disabled-auxiliary-write",
+            recorded_by="memory-witness",
+            recorded_source="memory-witness",
+            encoding="utf-8",
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(

@@ -385,18 +385,14 @@ class LearningDecisionLedger:
             values.append(
                 {
                     "candidate_id": str(candidate_id),
-                    "candidate_revision": int(
-                        candidate.get("candidate_revision", 0)
-                    ),
+                    "candidate_revision": int(candidate.get("candidate_revision", 0)),
                     "candidate_sha256": str(candidate.get("candidate_sha256", "")),
                     "candidate_occurrence_id": str(
                         candidate.get("candidate_occurrence_id", "")
                     ),
                     "candidate_kind": str(candidate.get("candidate_kind", "")),
                     "target_path": str(candidate.get("target_path", "")),
-                    "subject_revision": str(
-                        candidate.get("subject_revision", "")
-                    ),
+                    "subject_revision": str(candidate.get("subject_revision", "")),
                     "status": candidate_status,
                     "decision_occurrence_id": str(
                         candidate.get("decision_occurrence_id", "")
@@ -462,13 +458,9 @@ class LearningDecisionLedger:
             candidate_revision=int(event_payload["candidate_revision"]),
             candidate_kind=str(event_payload.get("candidate_kind", "")),
             candidate_occurrence_id=event.occurrence_id,
-            source_occurrence_id=str(
-                event.provenance.get("source_occurrence_id", "")
-            ),
+            source_occurrence_id=str(event.provenance.get("source_occurrence_id", "")),
             source=event.source,
-            actor_consciousness_instance_id=(
-                event.actor_consciousness_instance_id
-            ),
+            actor_consciousness_instance_id=(event.actor_consciousness_instance_id),
             subject_revision=event.subject_revision,
             target_path=cast(SubjectDocumentPath | None, target),
             candidate_content_bytes=content,
@@ -515,6 +507,15 @@ class LearningDecisionLedger:
             accepted_hash = hashlib.sha256(decision.accepted_content_bytes).hexdigest()
             if accepted_hash != decision.accepted_content_sha256:
                 raise ValueError("accepted content hash mismatch")
+            if str(
+                candidate.get("candidate_kind", "")
+            ) == "memory_continuity_document_revision" and accepted_hash != str(
+                candidate.get("candidate_sha256", "")
+            ):
+                raise LearningDecisionConflict(
+                    "memory continuity candidates must be accepted byte-for-byte; "
+                    "submit a new candidate for any rewrite"
+                )
             if len(decision.accepted_content_bytes) > _MAX_CANDIDATE_BYTES:
                 raise ValueError("accepted content exceeds the explicit storage limit")
             accepted_base64 = base64.b64encode(decision.accepted_content_bytes).decode(

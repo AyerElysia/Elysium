@@ -44,6 +44,7 @@ from ...memory.living import (
     CoRecallEvent,
     InterpretationSearchResult,
     InterpretationSource,
+    MemoryArtifactDescriptor,
     MemoryArtifactVersion,
     MemoryDerivation,
     MemoryInterpretation,
@@ -329,6 +330,16 @@ class LivingMemoryStore(MemoryStorePort, Protocol):
     ) -> MemoryArtifactVersion: ...
 
     async def get_artifact_head(self, logical_key: str) -> ArtifactHead | None: ...
+
+    async def get_artifact_version(
+        self,
+        artifact_id: str,
+    ) -> MemoryArtifactVersion | None: ...
+
+    async def list_artifact_descriptors(
+        self,
+        logical_key: str,
+    ) -> list[MemoryArtifactDescriptor]: ...
 
     async def list_artifact_history(
         self,

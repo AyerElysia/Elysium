@@ -24,6 +24,13 @@ _DECLARED_ROOTS = {
 _DECLARED_PREFIXES = ("diaries/", "life_engine_workspace/diaries/")
 
 
+class RootSubjectAuthorityRequired(RuntimeError):
+    """Reject generic writes to the unified root subject documents."""
+
+    def __init__(self) -> None:
+        super().__init__("RootSubjectAuthorityRequired")
+
+
 def subject_path_from_workspace_relative(value: str) -> str | None:
     """Map a Life workspace path to the declared subject-document namespace."""
 
@@ -34,11 +41,28 @@ def subject_path_from_workspace_relative(value: str) -> str | None:
     if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
         return None
     normalized = path.as_posix()
+    if normalized.startswith("life_engine_workspace/"):
+        normalized = normalized.removeprefix("life_engine_workspace/")
     if normalized in {"SOUL.md", "USER.md", "MEMORY.md"} or normalized.startswith(
         "diaries/"
     ):
         return f"life_engine_workspace/{normalized}"
     return None
+
+
+def auxiliary_subject_path_from_workspace_relative(value: str) -> str | None:
+    """Map an auxiliary subject path while excluding root authority documents.
+
+    ``SOUL.md``, ``USER.md`` and ``MEMORY.md`` may only change through
+    ``SubjectAuthorityPort.accept_candidate``. This guard intentionally runs
+    before storage-mode branching so disabled/local callers cannot turn a
+    rejected root write into an implicit filesystem fallback.
+    """
+
+    logical_path = subject_path_from_workspace_relative(value)
+    if logical_path in _DECLARED_ROOTS:
+        raise RootSubjectAuthorityRequired()
+    return logical_path
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,9 +355,11 @@ class SubjectWorkspaceObserver:
 
 
 __all__ = [
+    "RootSubjectAuthorityRequired",
     "SubjectObservationResult",
     "SubjectProjectionResult",
     "SubjectWorkspaceObserver",
     "SubjectWorkspaceProjector",
+    "auxiliary_subject_path_from_workspace_relative",
     "subject_path_from_workspace_relative",
 ]

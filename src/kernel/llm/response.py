@@ -55,9 +55,9 @@ class LLMResponse:
     request_record_id: int | None = None
     effective_context_receipts: dict[str, EffectiveContextReceipt] | None = None
     _on_complete: Callable[["LLMResponse", BaseException | None], None] | None = None
-    _context_delivery_expectations: dict[
-        str, ContextDeliveryExpectation
-    ] | None = field(default=None, repr=False)
+    _context_delivery_expectations: dict[str, ContextDeliveryExpectation] | None = (
+        field(default=None, repr=False)
+    )
 
     _consumed: bool = False
     _appended_to_context: bool = False
@@ -76,7 +76,12 @@ class LLMResponse:
             self.reasoning_parts = []
         elif self.reasoning_content is None:
             self.reasoning_content = (
-                "".join(part.text for part in self.reasoning_parts if isinstance(part.text, str)) or None
+                "".join(
+                    part.text
+                    for part in self.reasoning_parts
+                    if isinstance(part.text, str)
+                )
+                or None
             )
         if self.context_manager is None:
             ctx = getattr(self._upper, "context_manager", None)
@@ -89,6 +94,7 @@ class LLMResponse:
         expected_text: str,
         *,
         marker: str | None = None,
+        part_kind: str = "text",
     ) -> Self:
         """Track one exact transient ``Text`` part for this response's next send."""
 
@@ -96,6 +102,7 @@ class LLMResponse:
             delivery_id,
             expected_text,
             marker=marker,
+            part_kind=part_kind,
         )
         assert self._context_delivery_expectations is not None
         existing = self._context_delivery_expectations.get(expectation.delivery_id)
@@ -138,7 +145,9 @@ class LLMResponse:
         parsed_message, parsed_calls = parse_tool_call_compat_response(self.message)
         self.message = parsed_message
         self.call_list = [
-            ToolCall(id=call.get("id"), name=call.get("name", ""), args=call.get("args", {}))
+            ToolCall(
+                id=call.get("id"), name=call.get("name", ""), args=call.get("args", {})
+            )
             for call in parsed_calls
         ]
 
@@ -161,7 +170,9 @@ class LLMResponse:
                     "type": "function",
                     "function": {
                         "name": call.name,
-                        "arguments": json.dumps(call.args, ensure_ascii=False, default=str),
+                        "arguments": json.dumps(
+                            call.args, ensure_ascii=False, default=str
+                        ),
                     },
                 }
                 for call in self.call_list
@@ -171,6 +182,7 @@ class LLMResponse:
             return
         try:
             from src.kernel.llm.request_inspector import attach_response
+
             if attach_response(self.request_record_id, response):
                 self._inspector_response_attached = True
         except Exception:
@@ -211,7 +223,11 @@ class LLMResponse:
                     if event.text_delta:
                         full_content.append(event.text_delta)
                         yield event.text_delta
-                    if event.reasoning_block_type or event.reasoning_delta or event.reasoning_signature_delta:
+                    if (
+                        event.reasoning_block_type
+                        or event.reasoning_delta
+                        or event.reasoning_signature_delta
+                    ):
                         reasoning_acc.apply(event)
                     if event.tool_name or event.tool_args_delta or event.tool_call_id:
                         tool_acc.apply(event)
@@ -226,12 +242,17 @@ class LLMResponse:
                     yield chunk
         except asyncio.TimeoutError:
             from .exceptions import LLMTimeoutError
-            stream_error = LLMTimeoutError(f"Stream 消费超时 ({STREAM_TOTAL_TIMEOUT:.0f}s)")
+
+            stream_error = LLMTimeoutError(
+                f"Stream 消费超时 ({STREAM_TOTAL_TIMEOUT:.0f}s)"
+            )
 
         self.message = "".join(full_content)
         self.reasoning_parts = reasoning_acc.finalize() or self.reasoning_parts
         if self.reasoning_parts and not self.reasoning_content:
-            self.reasoning_content = "".join(part.text for part in self.reasoning_parts) or None
+            self.reasoning_content = (
+                "".join(part.text for part in self.reasoning_parts) or None
+            )
         self.call_list = tool_acc.finalize()
         self._maybe_apply_tool_call_compat()
         self.attach_to_inspector()
@@ -264,11 +285,16 @@ class LLMResponse:
         STREAM_TOTAL_TIMEOUT = 300.0
 
         try:
+
             async def _consume():
                 async for event in self._stream:
                     if event.text_delta:
                         full_content.append(event.text_delta)
-                    if event.reasoning_block_type or event.reasoning_delta or event.reasoning_signature_delta:
+                    if (
+                        event.reasoning_block_type
+                        or event.reasoning_delta
+                        or event.reasoning_signature_delta
+                    ):
                         reasoning_acc.apply(event)
                     if event.tool_name or event.tool_args_delta or event.tool_call_id:
                         tool_acc.apply(event)
@@ -276,7 +302,10 @@ class LLMResponse:
             await asyncio.wait_for(_consume(), timeout=STREAM_TOTAL_TIMEOUT)
         except asyncio.TimeoutError:
             from .exceptions import LLMTimeoutError
-            stream_error = LLMTimeoutError(f"Stream 消费超时 ({STREAM_TOTAL_TIMEOUT:.0f}s)")
+
+            stream_error = LLMTimeoutError(
+                f"Stream 消费超时 ({STREAM_TOTAL_TIMEOUT:.0f}s)"
+            )
         except Exception as e:
             # 部分 provider/SDK 会在流尾抛出"连接关闭"等异常。
             # 先记录异常，确保已收集的内容能正确落库，再重新抛出。
@@ -285,7 +314,9 @@ class LLMResponse:
         self.message = "".join(full_content)
         self.reasoning_parts = reasoning_acc.finalize() or self.reasoning_parts
         if self.reasoning_parts and not self.reasoning_content:
-            self.reasoning_content = "".join(part.text for part in self.reasoning_parts) or None
+            self.reasoning_content = (
+                "".join(part.text for part in self.reasoning_parts) or None
+            )
         self.call_list = tool_acc.finalize()
         self._maybe_apply_tool_call_compat()
         self.attach_to_inspector()
@@ -318,11 +349,16 @@ class LLMResponse:
         STREAM_TOTAL_TIMEOUT = 300.0
 
         try:
+
             async def _consume():
                 async for event in self._stream:
                     if event.text_delta:
                         full_content.append(event.text_delta)
-                    if event.reasoning_block_type or event.reasoning_delta or event.reasoning_signature_delta:
+                    if (
+                        event.reasoning_block_type
+                        or event.reasoning_delta
+                        or event.reasoning_signature_delta
+                    ):
                         reasoning_acc.apply(event)
                     if event.tool_name or event.tool_args_delta or event.tool_call_id:
                         tool_acc.apply(event)
@@ -330,14 +366,19 @@ class LLMResponse:
             await asyncio.wait_for(_consume(), timeout=STREAM_TOTAL_TIMEOUT)
         except asyncio.TimeoutError:
             from .exceptions import LLMTimeoutError
-            stream_error = LLMTimeoutError(f"Stream 消费超时 ({STREAM_TOTAL_TIMEOUT:.0f}s)")
+
+            stream_error = LLMTimeoutError(
+                f"Stream 消费超时 ({STREAM_TOTAL_TIMEOUT:.0f}s)"
+            )
         except Exception as e:
             stream_error = e
 
         self.message = "".join(full_content)
         self.reasoning_parts = reasoning_acc.finalize() or self.reasoning_parts
         if self.reasoning_parts and not self.reasoning_content:
-            self.reasoning_content = "".join(part.text for part in self.reasoning_parts) or None
+            self.reasoning_content = (
+                "".join(part.text for part in self.reasoning_parts) or None
+            )
         self.call_list = tool_acc.finalize()
         self._maybe_apply_tool_call_compat()
         self._stream = None
@@ -376,7 +417,9 @@ class LLMResponse:
 
         assistant_payload = LLMPayload(ROLE.ASSISTANT, content_parts)  # type: ignore[arg-type]
         if self.context_manager is not None:
-            self.payloads = self.context_manager.add_payload(self.payloads, assistant_payload)
+            self.payloads = self.context_manager.add_payload(
+                self.payloads, assistant_payload
+            )
             self._appended_to_context = True
             return
 
@@ -448,7 +491,9 @@ class LLMResponse:
         if self.context_manager is not None:
             for payload in results:
                 try:
-                    self.payloads = self.context_manager.add_payload(self.payloads, payload)
+                    self.payloads = self.context_manager.add_payload(
+                        self.payloads, payload
+                    )
                 except LLMContextError:
                     continue
             return self
@@ -458,7 +503,9 @@ class LLMResponse:
         self._maybe_apply_context_manager()
         return self
 
-    async def send(self, auto_append_response: bool = True, *, stream: bool = True) -> "LLMResponse":
+    async def send(
+        self, auto_append_response: bool = True, *, stream: bool = True
+    ) -> "LLMResponse":
         """
         将当前响应作为新的请求发送，适用于需要基于当前响应继续对话的场景。
 
@@ -504,7 +551,9 @@ class LLMResponse:
             self._context_delivery_expectations.clear()
         return response
 
-    async def stream_with_callback(self, on_chunk: Callable[[str], Awaitable[None]]) -> str:
+    async def stream_with_callback(
+        self, on_chunk: Callable[[str], Awaitable[None]]
+    ) -> str:
         """流式响应 + 实时回调。
 
         适用场景：需要在接收到每个 chunk 时立即执行某些操作（如 UI 更新）。
@@ -540,7 +589,11 @@ class LLMResponse:
                 if event.text_delta:
                     full_content.append(event.text_delta)
                     await on_chunk(event.text_delta)
-                if event.reasoning_block_type or event.reasoning_delta or event.reasoning_signature_delta:
+                if (
+                    event.reasoning_block_type
+                    or event.reasoning_delta
+                    or event.reasoning_signature_delta
+                ):
                     reasoning_acc.apply(event)
                 if event.tool_name or event.tool_args_delta or event.tool_call_id:
                     tool_acc.apply(event)
@@ -550,7 +603,9 @@ class LLMResponse:
         self.message = "".join(full_content)
         self.reasoning_parts = reasoning_acc.finalize() or self.reasoning_parts
         if self.reasoning_parts and not self.reasoning_content:
-            self.reasoning_content = "".join(part.text for part in self.reasoning_parts) or None
+            self.reasoning_content = (
+                "".join(part.text for part in self.reasoning_parts) or None
+            )
         self.call_list = tool_acc.finalize()
         self._maybe_apply_tool_call_compat()
         self.attach_to_inspector()
@@ -607,7 +662,11 @@ class LLMResponse:
                         buffer.clear()
                         buffer_len = 0
 
-                if event.reasoning_block_type or event.reasoning_delta or event.reasoning_signature_delta:
+                if (
+                    event.reasoning_block_type
+                    or event.reasoning_delta
+                    or event.reasoning_signature_delta
+                ):
                     reasoning_acc.apply(event)
                 if event.tool_name or event.tool_args_delta or event.tool_call_id:
                     tool_acc.apply(event)
@@ -624,7 +683,9 @@ class LLMResponse:
         self.message = "".join(full_content)
         self.reasoning_parts = reasoning_acc.finalize() or self.reasoning_parts
         if self.reasoning_parts and not self.reasoning_content:
-            self.reasoning_content = "".join(part.text for part in self.reasoning_parts) or None
+            self.reasoning_content = (
+                "".join(part.text for part in self.reasoning_parts) or None
+            )
         self.call_list = tool_acc.finalize()
         self._maybe_apply_tool_call_compat()
         self.attach_to_inspector()
@@ -724,7 +785,9 @@ class _ReasoningBlockAccumulator:
         if event.reasoning_signature_delta:
             if self._current_type is None:
                 self._current_type = "thinking"
-            self._current_signature = (self._current_signature or "") + event.reasoning_signature_delta
+            self._current_signature = (
+                self._current_signature or ""
+            ) + event.reasoning_signature_delta
 
     def finalize(self) -> list[ReasoningText]:
         """返回所有已累积的 reasoning block。"""
@@ -741,7 +804,9 @@ class _ReasoningBlockAccumulator:
                     )
                 )
         elif self._current_type == "redacted_thinking" and self._current_signature:
-            self._blocks.append(ReasoningText("", redacted_data=self._current_signature))
+            self._blocks.append(
+                ReasoningText("", redacted_data=self._current_signature)
+            )
 
         self._current_type = None
         self._current_text = []

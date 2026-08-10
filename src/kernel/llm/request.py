@@ -266,7 +266,12 @@ def _tool_result_references(payloads: list[LLMPayload]) -> list[dict[str, Any]]:
             except (TypeError, ValueError, json.JSONDecodeError):
                 structured = None
             if isinstance(structured, dict):
-                for key in ("schema", "delivery_id", "projection_sha256", "delivered_bytes"):
+                for key in (
+                    "schema",
+                    "delivery_id",
+                    "projection_sha256",
+                    "delivered_bytes",
+                ):
                     value = structured.get(key)
                     if isinstance(value, (str, int)):
                         reference[key] = value
@@ -393,9 +398,9 @@ class LLMRequest:
     context_manager: LLMContextManager | None = None
     enable_metrics: bool = True  # 是否启用指标收集
     request_type: RequestType = RequestType.COMPLETIONS
-    _context_delivery_expectations: dict[
-        str, ContextDeliveryExpectation
-    ] = field(default_factory=dict, repr=False)
+    _context_delivery_expectations: dict[str, ContextDeliveryExpectation] = field(
+        default_factory=dict, repr=False
+    )
 
     def __post_init__(self) -> None:
         if self.payloads is None:
@@ -442,6 +447,7 @@ class LLMRequest:
         expected_text: str,
         *,
         marker: str | None = None,
+        part_kind: str = "text",
     ) -> Self:
         """Track one exact transient ``Text`` part for the next successful send."""
 
@@ -449,6 +455,7 @@ class LLMRequest:
             delivery_id,
             expected_text,
             marker=marker,
+            part_kind=part_kind,
         )
         existing = self._context_delivery_expectations.get(expectation.delivery_id)
         if existing is not None and existing != expectation:

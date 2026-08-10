@@ -38,6 +38,7 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
         "tool-nucleus_save_media",
         "tool-nucleus_grep_events",
         "tool-nucleus_search_memory",
+        "tool-nucleus_read_memory_boundary",
         "tool-nucleus_view_relations",
         "tool-nucleus_memory_stats",
         "action-send_emoji_meme",
@@ -59,11 +60,12 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
     ],
     # 语音通话意识：实时语音交互，跨场景感知
     "voice_live": [
-        "action-report_state",     # 报告通话状态到 WorldState
-        "tool-inner_query",        # 向潜意识查询
-        "tool-conversation_evidence", # 有界查阅对话证据
+        "action-report_state",  # 报告通话状态到 WorldState
+        "tool-inner_query",  # 向潜意识查询
+        "tool-conversation_evidence",  # 有界查阅对话证据
     ],
 }
+
 
 def get_tool_manifest(kind: str) -> list[str]:
     """Get the tool manifest for a consciousness instance kind.
@@ -74,9 +76,7 @@ def get_tool_manifest(kind: str) -> list[str]:
 
     normalized = str(kind or "").strip()
     if normalized not in CONSCIOUSNESS_TOOL_MANIFESTS:
-        raise KeyError(
-            f"consciousness tool manifest is not declared: {normalized!r}"
-        )
+        raise KeyError(f"consciousness tool manifest is not declared: {normalized!r}")
     return list(CONSCIOUSNESS_TOOL_MANIFESTS[normalized])
 
 

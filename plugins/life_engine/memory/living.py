@@ -72,6 +72,24 @@ class MemoryArtifactVersion:
 
 
 @dataclass(frozen=True, slots=True)
+class MemoryArtifactDescriptor:
+    """Content-free immutable artifact metadata for bounded lineage reads."""
+
+    artifact_id: str
+    logical_key: str
+    artifact_kind: str
+    content_hash: str
+    content_byte_length: int
+    recorded_at: str
+    authored_by: str = ""
+    consciousness_instance_id: str = ""
+    stream_scope: str = ""
+    visibility: str = "private"
+    parent_artifact_ids: tuple[str, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class ArtifactHead:
     """Rebuildable current pointer plus its monotonic CAS revision."""
 
@@ -467,6 +485,23 @@ def _artifact_from_row(row: sqlite3.Row) -> MemoryArtifactVersion:
     )
 
 
+def _artifact_descriptor_from_row(row: sqlite3.Row) -> MemoryArtifactDescriptor:
+    return MemoryArtifactDescriptor(
+        artifact_id=str(row["artifact_id"]),
+        logical_key=str(row["logical_key"]),
+        artifact_kind=str(row["artifact_kind"]),
+        content_hash=str(row["content_hash"]),
+        content_byte_length=int(row["content_byte_length"]),
+        recorded_at=str(row["recorded_at"]),
+        authored_by=str(row["authored_by"]),
+        consciousness_instance_id=str(row["consciousness_instance_id"]),
+        stream_scope=str(row["stream_scope"]),
+        visibility=str(row["visibility"]),
+        parent_artifact_ids=_json_array(row["parent_artifact_ids_json"]),
+        metadata=_json_object(row["metadata_json"]),
+    )
+
+
 def append_artifact_version(
     db: sqlite3.Connection,
     version: MemoryArtifactVersion,
@@ -519,10 +554,13 @@ def append_artifact_version(
                 raise ValueError(f"ArtifactIdentityConflict:{normalized.artifact_id}")
         else:
             for parent_id in normalized.parent_artifact_ids:
-                if db.execute(
-                    "SELECT 1 FROM memory_artifact_versions WHERE artifact_id = ?",
-                    (parent_id,),
-                ).fetchone() is None:
+                if (
+                    db.execute(
+                        "SELECT 1 FROM memory_artifact_versions WHERE artifact_id = ?",
+                        (parent_id,),
+                    ).fetchone()
+                    is None
+                ):
                     raise ValueError(f"ArtifactParentMissing:{parent_id}")
             db.execute(
                 """INSERT INTO memory_artifact_versions (
@@ -569,7 +607,10 @@ def append_artifact_version(
                         json.dumps(derivation.metadata, ensure_ascii=False),
                     ),
                 )
-        if head_row is not None and str(head_row["artifact_id"]) == normalized.artifact_id:
+        if (
+            head_row is not None
+            and str(head_row["artifact_id"]) == normalized.artifact_id
+        ):
             return normalized
         if head_row is None:
             try:
@@ -648,6 +689,37 @@ def list_artifact_history(
     return [_artifact_from_row(row) for row in rows]
 
 
+def get_artifact_version(
+    db: sqlite3.Connection,
+    artifact_id: str,
+) -> MemoryArtifactVersion | None:
+    """Read one immutable artifact by identity without scanning its lineage."""
+
+    row = db.execute(
+        "SELECT * FROM memory_artifact_versions WHERE artifact_id = ?",
+        (str(artifact_id),),
+    ).fetchone()
+    return _artifact_from_row(row) if row is not None else None
+
+
+def list_artifact_descriptors(
+    db: sqlite3.Connection,
+    logical_key: str,
+) -> list[MemoryArtifactDescriptor]:
+    """Return content-free lineage rows; immutable content is never loaded."""
+
+    rows = db.execute(
+        """SELECT artifact_id, logical_key, artifact_kind, content_hash,
+        LENGTH(CAST(content AS BLOB)) AS content_byte_length,
+        recorded_at, authored_by, consciousness_instance_id, stream_scope,
+        visibility, parent_artifact_ids_json, metadata_json
+        FROM memory_artifact_versions WHERE logical_key = ?
+        ORDER BY recorded_at, artifact_id""",
+        (logical_key,),
+    ).fetchall()
+    return [_artifact_descriptor_from_row(row) for row in rows]
+
+
 def get_artifact_head(
     db: sqlite3.Connection,
     logical_key: str,
@@ -694,10 +766,7 @@ def list_artifact_heads(
         JOIN memory_artifact_versions v ON v.artifact_id = h.artifact_id
         ORDER BY h.logical_key"""
     ).fetchall()
-    return {
-        str(row["logical_key"]): _artifact_from_row(row)
-        for row in rows
-    }
+    return {str(row["logical_key"]): _artifact_from_row(row) for row in rows}
 
 
 def append_interpretation(
@@ -917,17 +986,22 @@ def search_interpretations(
     """Search living interpretations while preserving source links and scope."""
 
     query_text = str(query or "").strip()
-    if db.execute(
-        """SELECT 1 FROM sqlite_master
+    if (
+        db.execute(
+            """SELECT 1 FROM sqlite_master
         WHERE type IN ('table', 'virtual table')
           AND name = 'memory_interpretation_fts'"""
-    ).fetchone() is None:
+        ).fetchone()
+        is None
+    ):
         return []
     visible = tuple(dict.fromkeys(str(item) for item in visibility if str(item)))
     if not query_text or not visible or top_k <= 0:
         return []
     marks = ",".join("?" for _ in visible)
-    scope_sql = "i.stream_scope = ''" if stream_scope is None else "i.stream_scope IN ('', ?)"
+    scope_sql = (
+        "i.stream_scope = ''" if stream_scope is None else "i.stream_scope IN ('', ?)"
+    )
     scope_params: list[Any] = [] if stream_scope is None else [stream_scope]
     time_sql = " AND i.recorded_at <= ?" if recorded_as_of else ""
     time_params: list[Any] = [recorded_as_of] if recorded_as_of else []
@@ -1002,7 +1076,11 @@ def begin_recall_episode(
 ) -> RecallEpisode:
     """Begin a replayable recall episode with open retrieval intent."""
 
-    seed = int(random_seed if random_seed is not None else random.SystemRandom().getrandbits(63))
+    seed = int(
+        random_seed
+        if random_seed is not None
+        else random.SystemRandom().getrandbits(63)
+    )
     episode = RecallEpisode(
         episode_id=episode_id or f"recall_{uuid4().hex}",
         query=query,
@@ -1016,6 +1094,26 @@ def begin_recall_episode(
         context=context or {},
     )
     with transaction(db):
+        existing = db.execute(
+            "SELECT * FROM memory_recall_sessions WHERE episode_id = ?",
+            (episode.episode_id,),
+        ).fetchone()
+        if existing is not None:
+            persisted = RecallEpisode(
+                episode_id=str(existing["episode_id"]),
+                query=str(existing["query"]),
+                retrieval_intent=str(existing["retrieval_intent"]),
+                consciousness_instance_id=str(existing["consciousness_instance_id"]),
+                stream_scope=str(existing["stream_scope"]),
+                context_key=str(existing["context_key"]),
+                policy_version=str(existing["policy_version"]),
+                random_seed=int(existing["random_seed"]),
+                recorded_at=str(existing["recorded_at"]),
+                context=_json_object(existing["context_json"]),
+            )
+            if persisted != episode:
+                raise ValueError(f"RecallEpisodeIdentityConflict:{episode.episode_id}")
+            return persisted
         db.execute(
             """INSERT INTO memory_recall_sessions (
                 episode_id, query, retrieval_intent,
@@ -1046,13 +1144,38 @@ def append_recall_events(
 
     if not events:
         return ()
+    normalized_events = tuple(
+        replace(event, recorded_at=event.recorded_at or _now_iso()) for event in events
+    )
     with transaction(db):
-        for event in events:
-            if db.execute(
-                "SELECT 1 FROM memory_recall_sessions WHERE episode_id = ?",
-                (event.episode_id,),
-            ).fetchone() is None:
+        for event in normalized_events:
+            if (
+                db.execute(
+                    "SELECT 1 FROM memory_recall_sessions WHERE episode_id = ?",
+                    (event.episode_id,),
+                ).fetchone()
+                is None
+            ):
                 raise ValueError(f"RecallEpisodeMissing:{event.episode_id}")
+            existing = db.execute(
+                "SELECT * FROM memory_recall_events WHERE event_id = ?",
+                (event.event_id,),
+            ).fetchone()
+            if existing is not None:
+                persisted = RecallEvent(
+                    event_id=str(existing["event_id"]),
+                    episode_id=str(existing["episode_id"]),
+                    action=str(existing["action"]),
+                    recorded_at=str(existing["recorded_at"]),
+                    entity_ref=str(existing["entity_ref"]),
+                    ordinal=int(existing["ordinal"]),
+                    source=str(existing["source"]),
+                    reason=str(existing["reason"]),
+                    metadata=_json_object(existing["metadata_json"]),
+                )
+                if persisted != event:
+                    raise ValueError(f"RecallEventIdentityConflict:{event.event_id}")
+                continue
             db.execute(
                 """INSERT INTO memory_recall_events (
                     event_id, episode_id, action, entity_ref, ordinal, source,
@@ -1066,11 +1189,11 @@ def append_recall_events(
                     int(event.ordinal),
                     event.source,
                     event.reason,
-                    event.recorded_at or _now_iso(),
+                    event.recorded_at,
                     json.dumps(event.metadata, ensure_ascii=False),
                 ),
             )
-    return tuple(events)
+    return normalized_events
 
 
 def append_corecall_event(
@@ -1088,11 +1211,33 @@ def append_corecall_event(
         recorded_at=event.recorded_at or _now_iso(),
     )
     with transaction(db):
-        if db.execute(
-            "SELECT 1 FROM memory_recall_sessions WHERE episode_id = ?",
-            (normalized.episode_id,),
-        ).fetchone() is None:
+        if (
+            db.execute(
+                "SELECT 1 FROM memory_recall_sessions WHERE episode_id = ?",
+                (normalized.episode_id,),
+            ).fetchone()
+            is None
+        ):
             raise ValueError(f"RecallEpisodeMissing:{normalized.episode_id}")
+        existing = db.execute(
+            "SELECT * FROM memory_corecall_events WHERE corecall_id = ?",
+            (normalized.corecall_id,),
+        ).fetchone()
+        if existing is not None:
+            persisted = CoRecallEvent(
+                corecall_id=str(existing["corecall_id"]),
+                episode_id=str(existing["episode_id"]),
+                context_key=str(existing["context_key"]),
+                signal=str(existing["signal"]),
+                entity_refs=_json_array(existing["entity_refs_json"]),
+                actor=str(existing["actor"]),
+                reason=str(existing["reason"]),
+                recorded_at=str(existing["recorded_at"]),
+                metadata=_json_object(existing["metadata_json"]),
+            )
+            if persisted != normalized:
+                raise ValueError(f"CoRecallIdentityConflict:{normalized.corecall_id}")
+            return persisted
         db.execute(
             """INSERT INTO memory_corecall_events (
                 corecall_id, episode_id, context_key, signal,
@@ -1254,6 +1399,7 @@ __all__ = [
     "CoRecallEvent",
     "InterpretationSource",
     "InterpretationSearchResult",
+    "MemoryArtifactDescriptor",
     "MemoryArtifactVersion",
     "MemoryDerivation",
     "MemoryInterpretation",
@@ -1270,7 +1416,9 @@ __all__ = [
     "create_living_memory_schema",
     "get_artifact_head",
     "get_artifact_head_state",
+    "get_artifact_version",
     "get_interpretation",
+    "list_artifact_descriptors",
     "list_artifact_heads",
     "list_artifact_history",
     "list_association_evidence",

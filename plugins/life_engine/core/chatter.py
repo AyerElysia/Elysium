@@ -23,7 +23,15 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, AsyncGenerator, Awaitable, TypeVar
 
-from src.app.plugin_system.base import BaseAction, BaseChatter, BaseTool, Failure, Stop, Success, Wait
+from src.app.plugin_system.base import (
+    BaseAction,
+    BaseChatter,
+    BaseTool,
+    Failure,
+    Stop,
+    Success,
+    Wait,
+)
 from src.app.plugin_system.types import ChatType
 from src.core.components.base.action import ActionResultDetail
 from src.core.config import get_core_config
@@ -150,9 +158,7 @@ class _LifeChatterModelTurnTimeout(TimeoutError):
 
     def __init__(self, timeout_seconds: float) -> None:
         self.timeout_seconds = float(timeout_seconds)
-        super().__init__(
-            f"life_chatter 模型轮总预算耗尽 ({self.timeout_seconds:.2f}s)"
-        )
+        super().__init__(f"life_chatter 模型轮总预算耗尽 ({self.timeout_seconds:.2f}s)")
 
 
 def _is_native_multimodal_unsupported_error(error: BaseException) -> bool:
@@ -254,7 +260,9 @@ def consume_runtime_assistant_injections(
             _RUNTIME_ASSISTANT_INJECTIONS.pop(sid, None)
         return result
 
+
 # ── FSM 相位 ──────────────────────────────────────────────────
+
 
 class _Phase(str, Enum):
     WAIT_USER = "wait_user"
@@ -266,6 +274,7 @@ class _Phase(str, Enum):
 @dataclass
 class _WorkflowRuntime:
     """enhanced 模式运行时状态。"""
+
     response: Any  # LLMRequest | LLMResponse
     phase: _Phase
     history_merged: bool
@@ -288,10 +297,13 @@ class _WorkflowRuntime:
     # 当前未读批次指纹。可见文本去重只在同一触发批次内生效。
     active_unread_turn_key: str = ""
     # 最近成功发送的文本回复；按触发批次和目标 stream 隔离，防止同轮重答。
-    recent_visible_text_replies: deque[tuple[float, str, str, str]] = field(default_factory=deque)
+    recent_visible_text_replies: deque[tuple[float, str, str, str]] = field(
+        default_factory=deque
+    )
 
 
 # ── Actions ───────────────────────────────────────────────────
+
 
 class LifeSendTextAction(BaseAction):
     """发送文本消息（life_chatter 专用）。"""
@@ -425,7 +437,9 @@ class LifeSendTextAction(BaseAction):
         stripped = content.strip()
         if not stripped:
             return []
-        first_block = re.split(r"<br\s*/?>", stripped, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+        first_block = re.split(r"<br\s*/?>", stripped, maxsplit=1, flags=re.IGNORECASE)[
+            0
+        ].strip()
         if not first_block:
             return []
         parsed_segments = cls._try_parse_segments_from_text(first_block)
@@ -458,7 +472,9 @@ class LifeSendTextAction(BaseAction):
         cfg = getattr(self.plugin, "config", None)
         runtime_cfg = getattr(cfg, "runtime_sync", None)
         limit = int(getattr(runtime_cfg, "send_targets_limit", 8) or 8)
-        window_hours = float(getattr(runtime_cfg, "send_targets_window_hours", 24.0) or 24.0)
+        window_hours = float(
+            getattr(runtime_cfg, "send_targets_window_hours", 24.0) or 24.0
+        )
         return max(1, limit), max(0.1, window_hours)
 
     async def _resolve_send_target(self, target_key: str) -> SendTarget | None:
@@ -508,9 +524,7 @@ class LifeSendTextAction(BaseAction):
         message.extra.update(extra)
 
         success = await get_message_sender().send_message(message)
-        self._last_delivery_status = str(
-            message.extra.get("delivery_status") or ""
-        )
+        self._last_delivery_status = str(message.extra.get("delivery_status") or "")
         return success
 
     async def _send_one_segment(
@@ -556,7 +570,10 @@ class LifeSendTextAction(BaseAction):
                     target_group_id = last_msg.extra.get("group_id")
                     target_group_name = last_msg.extra.get("group_name")
             else:
-                target_user_id, target_user_name = await self._resolve_private_target_from_context(
+                (
+                    target_user_id,
+                    target_user_name,
+                ) = await self._resolve_private_target_from_context(
                     context,
                     last_msg,
                 )
@@ -593,9 +610,7 @@ class LifeSendTextAction(BaseAction):
 
             sender = get_message_sender()
             success = await sender.send_message(message)
-            self._last_delivery_status = str(
-                message.extra.get("delivery_status") or ""
-            )
+            self._last_delivery_status = str(message.extra.get("delivery_status") or "")
             return success
 
         if self._action_origin_extra():
@@ -648,7 +663,10 @@ class LifeSendTextAction(BaseAction):
     ) -> tuple[bool, str]:
         self._last_delivery_status = ""
         if not isinstance(thought, str) or not thought.strip():
-            return False, "thought 必须是非空字符串；请在同一次 life_send_text 调用中先写下本次思考"
+            return (
+                False,
+                "thought 必须是非空字符串；请在同一次 life_send_text 调用中先写下本次思考",
+            )
         normalized_thought = thought.strip()
         segments = self._normalize_content_segments(content)
         cleaned_segments = [self._sanitize_segment(s) for s in segments]
@@ -658,7 +676,8 @@ class LifeSendTextAction(BaseAction):
             return False, "发送内容为空"
 
         cleaned_segments = [
-            segment for segment in cleaned_segments
+            segment
+            for segment in cleaned_segments
             if not self._is_placeholder_only_segment(segment)
         ]
         if not cleaned_segments:
@@ -669,10 +688,16 @@ class LifeSendTextAction(BaseAction):
         normalized_target_key = str(target_key or "").strip()
         if normalized_target_key:
             if reply_to:
-                return False, "跨聊天发送不能同时使用 reply_to；请去掉 reply_to 或不填 target_key"
+                return (
+                    False,
+                    "跨聊天发送不能同时使用 reply_to；请去掉 reply_to 或不填 target_key",
+                )
             resolved_target = await self._resolve_send_target(normalized_target_key)
             if resolved_target is None:
-                return False, f"未知或不可用的发送目标 target_key: {normalized_target_key}"
+                return (
+                    False,
+                    f"未知或不可用的发送目标 target_key: {normalized_target_key}",
+                )
 
         structured_context = {
             "mood": str(mood or mode or "").strip(),
@@ -752,7 +777,10 @@ class _LifeSendMediaAction(BaseAction):
         suffix = resolved.suffix.lower()
         if suffix not in cls.allowed_suffixes:
             allowed = ", ".join(sorted(cls.allowed_suffixes))
-            return None, f"不支持的{cls.media_label}格式 {suffix or '<无扩展名>'}；支持: {allowed}"
+            return (
+                None,
+                f"不支持的{cls.media_label}格式 {suffix or '<无扩展名>'}；支持: {allowed}",
+            )
         try:
             size = resolved.stat().st_size
         except OSError as exc:
@@ -760,7 +788,10 @@ class _LifeSendMediaAction(BaseAction):
         if size <= 0:
             return None, f"{cls.media_label}文件为空: {resolved}"
         if size > cls.max_file_bytes:
-            return None, f"{cls.media_label}文件过大: {size} bytes；上限 {cls.max_file_bytes} bytes"
+            return (
+                None,
+                f"{cls.media_label}文件过大: {size} bytes；上限 {cls.max_file_bytes} bytes",
+            )
         return resolved, ""
 
     async def _send_path(self, path: str) -> tuple[bool, str]:
@@ -817,7 +848,9 @@ class LifeSendVoiceAction(_LifeSendMediaAction):
     chatter_allow: list[str] = ["life_chatter"]
     media_type = MessageType.VOICE
     media_label = "语音"
-    allowed_suffixes = frozenset({".wav", ".mp3", ".ogg", ".opus", ".m4a", ".aac", ".flac"})
+    allowed_suffixes = frozenset(
+        {".wav", ".mp3", ".ogg", ".opus", ".m4a", ".aac", ".flac"}
+    )
     max_file_bytes = 30 * 1024 * 1024
 
     async def execute(
@@ -849,13 +882,17 @@ class LifeSendVoiceAction(_LifeSendMediaAction):
         try:
             from src.app.plugin_system.api.llm_api import get_model_set_by_task
             from src.app.plugin_system.api.send_api import send_voice
-            from src.kernel.llm.model_client.registry import get_default_model_client_registry
+            from src.kernel.llm.model_client.registry import (
+                get_default_model_client_registry,
+            )
 
             model_set = get_model_set_by_task("tts")
             if not isinstance(model_set, list) or not model_set:
                 return False, "未配置 model_tasks.tts，无法合成语音"
             model_entry = model_set[0]
-            client = get_default_model_client_registry().get_speech_client_for_model(model_entry)
+            client = get_default_model_client_registry().get_speech_client_for_model(
+                model_entry
+            )
             audio_bytes = await client.create_speech(
                 model_name=str(model_entry.get("model_identifier") or ""),
                 text=normalized_text,
@@ -969,10 +1006,17 @@ class LifeSendFileAction(BaseAction):
         if chat_type == "group":
             if last_msg:
                 last_extra = getattr(last_msg, "extra", {}) or {}
-                target_group_id = last_extra.get("group_id") or last_extra.get("target_group_id")
-                target_group_name = last_extra.get("group_name") or last_extra.get("target_group_name")
+                target_group_id = last_extra.get("group_id") or last_extra.get(
+                    "target_group_id"
+                )
+                target_group_name = last_extra.get("group_name") or last_extra.get(
+                    "target_group_name"
+                )
         else:
-            target_user_id, target_user_name = await self._resolve_private_target_from_context(
+            (
+                target_user_id,
+                target_user_name,
+            ) = await self._resolve_private_target_from_context(
                 context,
                 last_msg,
             )
@@ -1090,18 +1134,30 @@ class LifeInspectMediaTool(BaseTool):
         if cfg is not None and not bool(getattr(cfg, "enabled", True)):
             return False, "媒体观察工具已禁用"
 
-        normalized_type = self._normalize_choice(media_type, self._VALID_MEDIA_TYPES, "auto")
-        normalized_detail = self._normalize_choice(detail_level, self._VALID_DETAIL_LEVELS, "normal")
-        focus_text = str(focus or "").strip() or "观察这条媒体里与当前对话最相关的信息。"
+        normalized_type = self._normalize_choice(
+            media_type, self._VALID_MEDIA_TYPES, "auto"
+        )
+        normalized_detail = self._normalize_choice(
+            detail_level, self._VALID_DETAIL_LEVELS, "normal"
+        )
+        focus_text = (
+            str(focus or "").strip() or "观察这条媒体里与当前对话最相关的信息。"
+        )
 
-        selected = self._select_media(str(target or "latest").strip() or "latest", normalized_type)
+        selected = self._select_media(
+            str(target or "latest").strip() or "latest", normalized_type
+        )
         if selected is None:
             return False, "当前会话没有找到可观察的媒体，或指定 message_id 不存在"
 
         if not selected.data_for_native:
-            plain_text = str(getattr(selected.message, "processed_plain_text", "") or "").strip()
+            plain_text = str(
+                getattr(selected.message, "processed_plain_text", "") or ""
+            ).strip()
             if plain_text:
-                return True, self._format_plaintext_only_result(selected, plain_text, focus_text)
+                return True, self._format_plaintext_only_result(
+                    selected, plain_text, focus_text
+                )
             return False, "找到了媒体记录，但原始媒体数据已不在当前运行态，无法观察"
 
         max_bytes = self._max_bytes_for_kind(cfg, selected.kind)
@@ -1127,7 +1183,9 @@ class LifeInspectMediaTool(BaseTool):
             return False, f"媒体无法作为原生多模态输入：{exc}"
 
         self._queue_promoted_media(stream_id, promoted)
-        return True, self._format_promoted_result(selected, focus_text, normalized_detail)
+        return True, self._format_promoted_result(
+            selected, focus_text, normalized_detail
+        )
 
     def _get_cfg(self) -> Any:
         plugin_cfg = getattr(getattr(self, "plugin", None), "config", None)
@@ -1154,7 +1212,9 @@ class LifeInspectMediaTool(BaseTool):
             queue.append(promoted)
 
     @staticmethod
-    def _consume_promoted_media(stream_id: str, *, max_items: int = 4) -> list[_PromotedNativeMedia]:
+    def _consume_promoted_media(
+        stream_id: str, *, max_items: int = 4
+    ) -> list[_PromotedNativeMedia]:
         sid = str(stream_id or "").strip()
         if not sid:
             return []
@@ -1198,15 +1258,21 @@ class LifeInspectMediaTool(BaseTool):
                 )
             )
             if selected.kind == "video":
-                content.append(Video(selected.data_for_native, mime_type=selected.mime_type))
+                content.append(
+                    Video(selected.data_for_native, mime_type=selected.mime_type)
+                )
             elif selected.kind == "audio":
-                content.append(Audio(selected.data_for_native, mime_type=selected.mime_type))
+                content.append(
+                    Audio(selected.data_for_native, mime_type=selected.mime_type)
+                )
             else:
                 content.append(Image(selected.data_for_native))
         return content
 
     def _select_media(self, target: str, media_type: str) -> _SelectedMedia | None:
-        expected_message_id = "" if target.lower() in {"", "latest", "recent"} else target
+        expected_message_id = (
+            "" if target.lower() in {"", "latest", "recent"} else target
+        )
         seen_messages: set[str] = set()
 
         for message in self._iter_candidate_messages():
@@ -1252,9 +1318,18 @@ class LifeInspectMediaTool(BaseTool):
         if media_list:
             return media_list
 
-        msg_type = str(getattr(getattr(message, "message_type", None), "value", "") or "").lower()
+        msg_type = str(
+            getattr(getattr(message, "message_type", None), "value", "") or ""
+        ).lower()
         content = getattr(message, "content", None)
-        if msg_type in {"image", "emoji", "voice", "audio", "record", "video"} and isinstance(content, str):
+        if msg_type in {
+            "image",
+            "emoji",
+            "voice",
+            "audio",
+            "record",
+            "video",
+        } and isinstance(content, str):
             return [{"type": msg_type, "data": content}]
         return []
 
@@ -1314,7 +1389,16 @@ class LifeInspectMediaTool(BaseTool):
         if isinstance(data, str):
             return data.strip()
         if isinstance(data, dict):
-            for key in ("base64", "data", "video_base64", "audio_base64", "image_base64", "url", "path", "file"):
+            for key in (
+                "base64",
+                "data",
+                "video_base64",
+                "audio_base64",
+                "image_base64",
+                "url",
+                "path",
+                "file",
+            ):
                 value = data.get(key)
                 if isinstance(value, str) and value.strip():
                     return value.strip()
@@ -1324,15 +1408,19 @@ class LifeInspectMediaTool(BaseTool):
     def _guess_mime_type(media: dict[str, Any], kind: str, original_type: str) -> str:
         data = media.get("data")
         nested: dict[str, Any] = data if isinstance(data, dict) else {}
-        raw = str(
-            media.get("mime")
-            or media.get("mime_type")
-            or nested.get("mime")
-            or nested.get("mime_type")
-            or media.get("format")
-            or nested.get("format")
-            or ""
-        ).strip().lower()
+        raw = (
+            str(
+                media.get("mime")
+                or media.get("mime_type")
+                or nested.get("mime")
+                or nested.get("mime_type")
+                or media.get("format")
+                or nested.get("format")
+                or ""
+            )
+            .strip()
+            .lower()
+        )
         if raw.startswith(("image/", "video/", "audio/")):
             return raw
         if kind == "video":
@@ -1378,10 +1466,22 @@ class LifeInspectMediaTool(BaseTool):
     @staticmethod
     def _max_bytes_for_kind(cfg: Any, kind: str) -> int:
         if kind == "video":
-            return int(getattr(cfg, "max_video_bytes", 200 * 1024 * 1024) if cfg is not None else 200 * 1024 * 1024)
+            return int(
+                getattr(cfg, "max_video_bytes", 200 * 1024 * 1024)
+                if cfg is not None
+                else 200 * 1024 * 1024
+            )
         if kind == "audio":
-            return int(getattr(cfg, "max_audio_bytes", 30 * 1024 * 1024) if cfg is not None else 30 * 1024 * 1024)
-        return int(getattr(cfg, "max_image_bytes", 12 * 1024 * 1024) if cfg is not None else 12 * 1024 * 1024)
+            return int(
+                getattr(cfg, "max_audio_bytes", 30 * 1024 * 1024)
+                if cfg is not None
+                else 30 * 1024 * 1024
+            )
+        return int(
+            getattr(cfg, "max_image_bytes", 12 * 1024 * 1024)
+            if cfg is not None
+            else 12 * 1024 * 1024
+        )
 
     @staticmethod
     def _format_promoted_result(
@@ -1515,7 +1615,9 @@ class LifeSaveMediaTool(LifeInspectMediaTool):
         mime = selected.mime_type or ""
         ext = mimetypes.guess_extension(mime.split(";")[0].strip()) or ""
         if ext in (".ksh", ".bat", ""):
-            ext = {"image": ".png", "video": ".mp4", "audio": ".mp3"}.get(selected.kind, ".bin")
+            ext = {"image": ".png", "video": ".mp4", "audio": ".mp3"}.get(
+                selected.kind, ".bin"
+            )
 
         workspace = _get_workspace(self.plugin)
 
@@ -1539,7 +1641,11 @@ class LifeSaveMediaTool(LifeInspectMediaTool):
         await asyncio.to_thread(dest.write_bytes, image_bytes)
 
         size = len(image_bytes)
-        size_str = f"{size / 1024:.1f} KB" if size < 1024 * 1024 else f"{size / 1024 / 1024:.1f} MB"
+        size_str = (
+            f"{size / 1024:.1f} KB"
+            if size < 1024 * 1024
+            else f"{size / 1024 / 1024:.1f} MB"
+        )
         rel = str(dest.relative_to(workspace))
 
         return True, {
@@ -1553,6 +1659,7 @@ class LifeSaveMediaTool(LifeInspectMediaTool):
 
 
 # ── LifeChatter ───────────────────────────────────────────────
+
 
 class LifeChatter(BaseChatter):
     """生命中枢统一意识实例 - 同一主体的对外运行模式。"""
@@ -1587,7 +1694,10 @@ class LifeChatter(BaseChatter):
         LLM payload 链，避免同一主意识被并发写入。
         """
         loop = asyncio.get_running_loop()
-        if cls._GLOBAL_RUNTIME_LOCK is None or cls._GLOBAL_RUNTIME_LOCK_LOOP is not loop:
+        if (
+            cls._GLOBAL_RUNTIME_LOCK is None
+            or cls._GLOBAL_RUNTIME_LOCK_LOOP is not loop
+        ):
             cls._GLOBAL_RUNTIME_LOCK = asyncio.Lock()
             cls._GLOBAL_RUNTIME_LOCK_LOOP = loop
         return cls._GLOBAL_RUNTIME_LOCK
@@ -1697,7 +1807,10 @@ class LifeChatter(BaseChatter):
         chat_stream: ChatStream,
     ) -> tuple[_WorkflowRuntime, Any]:
         """懒创建统一主意识的 LLM 请求、工具注册表和 FSM 状态。"""
-        if self.__class__._GLOBAL_RUNTIME is not None and self.__class__._GLOBAL_USABLE_MAP is not None:
+        if (
+            self.__class__._GLOBAL_RUNTIME is not None
+            and self.__class__._GLOBAL_USABLE_MAP is not None
+        ):
             return self.__class__._GLOBAL_RUNTIME, self.__class__._GLOBAL_USABLE_MAP
 
         request = self._create_global_request()
@@ -1726,8 +1839,7 @@ class LifeChatter(BaseChatter):
         if restored_payloads:
             request.payloads.extend(restored_payloads)
             logger.info(
-                "已恢复 life_chatter 滚动上下文快照: "
-                f"payloads={len(restored_payloads)}"
+                f"已恢复 life_chatter 滚动上下文快照: payloads={len(restored_payloads)}"
             )
 
         runtime = _WorkflowRuntime(
@@ -1804,9 +1916,19 @@ class LifeChatter(BaseChatter):
         settings = getattr(cfg, "settings", None)
         workspace = str(getattr(settings, "workspace_path", "") or "").strip()
         if not workspace:
-            workspace = str(Path(__file__).parent.parent.parent.parent / "data" / "life_engine_workspace")
+            workspace = str(
+                Path(__file__).parent.parent.parent.parent
+                / "data"
+                / "life_engine_workspace"
+            )
         base = Path(workspace).expanduser()
-        return base / "runtime" / "consciousness" / self.instance_id / "rolling_context.json"
+        return (
+            base
+            / "runtime"
+            / "consciousness"
+            / self.instance_id
+            / "rolling_context.json"
+        )
 
     def _legacy_rolling_context_path(self) -> Path:
         """旧版全局滚动上下文路径（用于迁移）。"""
@@ -1814,8 +1936,16 @@ class LifeChatter(BaseChatter):
         settings = getattr(cfg, "settings", None)
         workspace = str(getattr(settings, "workspace_path", "") or "").strip()
         if not workspace:
-            workspace = str(Path(__file__).parent.parent.parent.parent / "data" / "life_engine_workspace")
-        return Path(workspace).expanduser() / "runtime" / "life_chatter_rolling_context.json"
+            workspace = str(
+                Path(__file__).parent.parent.parent.parent
+                / "data"
+                / "life_engine_workspace"
+            )
+        return (
+            Path(workspace).expanduser()
+            / "runtime"
+            / "life_chatter_rolling_context.json"
+        )
 
     @staticmethod
     def _llm_usable_schema_name(tool_def: Any) -> str:
@@ -1871,7 +2001,8 @@ class LifeChatter(BaseChatter):
                     content = getattr(payload, "content", None)
                     if isinstance(content, list):
                         payload.content = [
-                            tool_def for tool_def in content
+                            tool_def
+                            for tool_def in content
                             if self._llm_usable_schema_name(tool_def) in allowed_names
                         ]
         except Exception:  # noqa: BLE001
@@ -1903,16 +2034,14 @@ class LifeChatter(BaseChatter):
         for payload in payloads:
             original_content = list(getattr(payload, "content", None) or [])
             contains_retired_think_call = any(
-                isinstance(part, ToolCall)
-                and part.name == _RETIRED_THINK_ACTION
+                isinstance(part, ToolCall) and part.name == _RETIRED_THINK_ACTION
                 for part in original_content
             )
             content = [
                 part
                 for part in original_content
                 if not (
-                    isinstance(part, ToolCall)
-                    and part.name == _RETIRED_THINK_ACTION
+                    isinstance(part, ToolCall) and part.name == _RETIRED_THINK_ACTION
                 )
                 and not (
                     isinstance(part, ToolResult)
@@ -1995,17 +2124,13 @@ class LifeChatter(BaseChatter):
         """Bind content-free consciousness identity to the next model attempt."""
 
         stream_id = str(
-            getattr(chat_stream, "stream_id", "")
-            or rt.active_stream_id
-            or ""
+            getattr(chat_stream, "stream_id", "") or rt.active_stream_id or ""
         ).strip()
         identity = {
             "consciousness_instance_id": str(self.instance_id or "").strip(),
             "consciousness_instance_kind": str(self.instance_kind or "").strip(),
             "life_stream_id": stream_id,
-            "life_turn_occurrence_id": str(
-                rt.active_unread_turn_key or ""
-            ).strip(),
+            "life_turn_occurrence_id": str(rt.active_unread_turn_key or "").strip(),
         }
 
         targets = (response, getattr(response, "_upper", None))
@@ -2143,20 +2268,30 @@ class LifeChatter(BaseChatter):
             if part_type == "reasoning_text":
                 return ReasoningText(
                     str(data.get("text") or ""),
-                    signature=data.get("signature") if isinstance(data.get("signature"), str) else None,
-                    redacted_data=data.get("redacted_data") if isinstance(data.get("redacted_data"), str) else None,
+                    signature=data.get("signature")
+                    if isinstance(data.get("signature"), str)
+                    else None,
+                    redacted_data=data.get("redacted_data")
+                    if isinstance(data.get("redacted_data"), str)
+                    else None,
                 )
             if part_type == "tool_call":
                 return ToolCall(
                     id=data.get("id") if isinstance(data.get("id"), str) else None,
                     name=str(data.get("name") or ""),
-                    args=data.get("args") if isinstance(data.get("args"), (dict, str)) else {},
+                    args=data.get("args")
+                    if isinstance(data.get("args"), (dict, str))
+                    else {},
                 )
             if part_type == "tool_result":
                 return ToolResult(
                     value=data.get("value"),
-                    call_id=data.get("call_id") if isinstance(data.get("call_id"), str) else None,
-                    name=data.get("name") if isinstance(data.get("name"), str) else None,
+                    call_id=data.get("call_id")
+                    if isinstance(data.get("call_id"), str)
+                    else None,
+                    name=data.get("name")
+                    if isinstance(data.get("name"), str)
+                    else None,
                 )
             if part_type == "media_descriptor":
                 descriptor = data.get("descriptor")
@@ -2259,16 +2394,62 @@ class LifeChatter(BaseChatter):
             max_part_chars=max(1, int(max_part_chars)),
         )
 
-    def _rolling_context_compaction_options(self) -> tuple[int, int, int, int, int, int, bool]:
+    def _rolling_context_compaction_options(
+        self,
+    ) -> tuple[int, int, int, int, int, int, bool]:
         """Resolve runtime/snapshot compaction settings with legacy-safe defaults."""
         chatter = getattr(self._get_config(), "chatter", None)
         return (
-            max(1, int(getattr(chatter, "rolling_context_snapshot_char_budget", _ROLLING_CONTEXT_SNAPSHOT_CHAR_BUDGET) or _ROLLING_CONTEXT_SNAPSHOT_CHAR_BUDGET)),
-            max(1, int(getattr(chatter, "context_compression_max_groups", _CONTEXT_COMPRESSION_MAX_GROUPS) or _CONTEXT_COMPRESSION_MAX_GROUPS)),
-            max(1, int(getattr(chatter, "context_compression_max_part_chars", _CONTEXT_COMPRESSION_MAX_PART_CHARS) or _CONTEXT_COMPRESSION_MAX_PART_CHARS)),
-            max(1, int(getattr(chatter, "context_compaction_trigger_chars", 120_000) or 120_000)),
-            max(1, int(getattr(chatter, "context_compaction_target_chars", 80_000) or 80_000)),
-            max(1, int(getattr(chatter, "context_compaction_min_recent_groups", 2) or 2)),
+            max(
+                1,
+                int(
+                    getattr(
+                        chatter,
+                        "rolling_context_snapshot_char_budget",
+                        _ROLLING_CONTEXT_SNAPSHOT_CHAR_BUDGET,
+                    )
+                    or _ROLLING_CONTEXT_SNAPSHOT_CHAR_BUDGET
+                ),
+            ),
+            max(
+                1,
+                int(
+                    getattr(
+                        chatter,
+                        "context_compression_max_groups",
+                        _CONTEXT_COMPRESSION_MAX_GROUPS,
+                    )
+                    or _CONTEXT_COMPRESSION_MAX_GROUPS
+                ),
+            ),
+            max(
+                1,
+                int(
+                    getattr(
+                        chatter,
+                        "context_compression_max_part_chars",
+                        _CONTEXT_COMPRESSION_MAX_PART_CHARS,
+                    )
+                    or _CONTEXT_COMPRESSION_MAX_PART_CHARS
+                ),
+            ),
+            max(
+                1,
+                int(
+                    getattr(chatter, "context_compaction_trigger_chars", 120_000)
+                    or 120_000
+                ),
+            ),
+            max(
+                1,
+                int(
+                    getattr(chatter, "context_compaction_target_chars", 80_000)
+                    or 80_000
+                ),
+            ),
+            max(
+                1, int(getattr(chatter, "context_compaction_min_recent_groups", 2) or 2)
+            ),
             bool(getattr(chatter, "context_compaction_enabled", True)),
         )
 
@@ -2276,9 +2457,17 @@ class LifeChatter(BaseChatter):
         self,
         payloads: list[LLMPayload],
     ) -> tuple[list[LLMPayload], int, int]:
-        budget, max_groups, max_part_chars, trigger, target, min_recent, enabled = self._rolling_context_compaction_options()
+        budget, max_groups, max_part_chars, trigger, target, min_recent, enabled = (
+            self._rolling_context_compaction_options()
+        )
         chatter = getattr(self._get_config(), "chatter", None)
-        summary_max = max(200, int(getattr(chatter, "context_compaction_summary_max_chars", 12_000) or 12_000))
+        summary_max = max(
+            200,
+            int(
+                getattr(chatter, "context_compaction_summary_max_chars", 12_000)
+                or 12_000
+            ),
+        )
         return compact_payloads(
             payloads,
             estimate=self._estimate_payload_chars,
@@ -2296,11 +2485,19 @@ class LifeChatter(BaseChatter):
         payloads = getattr(response, "payloads", None)
         if not isinstance(payloads, list):
             return None
-        _, _, max_part_chars, trigger, target, min_recent, enabled = self._rolling_context_compaction_options()
+        _, _, max_part_chars, trigger, target, min_recent, enabled = (
+            self._rolling_context_compaction_options()
+        )
         if not enabled:
             return None
         chatter = getattr(self._get_config(), "chatter", None)
-        summary_max = max(200, int(getattr(chatter, "context_compaction_summary_max_chars", 12_000) or 12_000))
+        summary_max = max(
+            200,
+            int(
+                getattr(chatter, "context_compaction_summary_max_chars", 12_000)
+                or 12_000
+            ),
+        )
         result = hierarchical_compact_payloads(
             [p for p in payloads if isinstance(p, LLMPayload)],
             estimate=self._estimate_payload_chars,
@@ -2379,10 +2576,9 @@ class LifeChatter(BaseChatter):
                 try:
                     path.parent.mkdir(parents=True, exist_ok=True)
                     import shutil
+
                     shutil.move(str(legacy), str(path))
-                    logger.info(
-                        f"意识实例迁移: {legacy.name} -> {path}"
-                    )
+                    logger.info(f"意识实例迁移: {legacy.name} -> {path}")
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(f"滚动上下文迁移失败: {exc}")
         if not path.exists():
@@ -2444,10 +2640,7 @@ class LifeChatter(BaseChatter):
                 raise RuntimeError("RollingContextPayloadDigestMismatch")
         payloads = [
             payload
-            for payload in (
-                self._deserialize_payload(item)
-                for item in payload_items
-            )
+            for payload in (self._deserialize_payload(item) for item in payload_items)
             if payload is not None
         ]
         payloads = self._without_retired_think_history(payloads)
@@ -2465,7 +2658,9 @@ class LifeChatter(BaseChatter):
         payloads = getattr(response, "payloads", None)
         if not isinstance(payloads, list):
             return
-        current_payloads = [payload for payload in payloads if isinstance(payload, LLMPayload)]
+        current_payloads = [
+            payload for payload in payloads if isinstance(payload, LLMPayload)
+        ]
         if not current_payloads:
             return
         # Hard envelope only — hierarchical policy already ran via maybe.
@@ -2481,9 +2676,7 @@ class LifeChatter(BaseChatter):
             if callable(get_store):
                 selected_store = get_store()
         if selected_store is not None:
-            expected_revision = int(
-                self.__class__._GLOBAL_ROLLING_CONTEXT_REVISION
-            )
+            expected_revision = int(self.__class__._GLOBAL_ROLLING_CONTEXT_REVISION)
             record = await selected_store.put_state(
                 namespace="life_chatter.rolling_context",
                 state_key=self.instance_id,
@@ -2502,7 +2695,9 @@ class LifeChatter(BaseChatter):
             await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
             await asyncio.to_thread(
                 tmp_path.write_text,
-                json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=str),
+                json.dumps(
+                    data, ensure_ascii=False, separators=(",", ":"), default=str
+                ),
                 encoding="utf-8",
             )
             await asyncio.to_thread(os.replace, tmp_path, path)
@@ -2589,7 +2784,9 @@ class LifeChatter(BaseChatter):
                 stream_id=str(getattr(chat_stream, "stream_id", "") or ""),
                 platform=str(getattr(chat_stream, "platform", "") or ""),
                 chat_type=str(getattr(chat_stream, "chat_type", "") or ""),
-                sender_name=str(getattr(chat_stream, "bot_nickname", "") or "当前对话器"),
+                sender_name=str(
+                    getattr(chat_stream, "bot_nickname", "") or "当前对话器"
+                ),
                 topic="assistant_plain_text_monologue",
             )
         except Exception as exc:  # noqa: BLE001
@@ -2650,7 +2847,9 @@ class LifeChatter(BaseChatter):
             watchdog.feed_dog(self.stream_id)
             while True:
                 try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=keepalive_interval)
+                    await asyncio.wait_for(
+                        stop_event.wait(), timeout=keepalive_interval
+                    )
                     return
                 except asyncio.TimeoutError:
                     watchdog.feed_dog(self.stream_id)
@@ -2691,7 +2890,11 @@ class LifeChatter(BaseChatter):
     def _surface_fast_max_tokens() -> int:
         raw = os.environ.get(_SURFACE_FAST_MAX_TOKENS_ENV)
         try:
-            parsed = int(str(raw).strip()) if raw is not None else _SURFACE_FAST_MAX_TOKENS_DEFAULT
+            parsed = (
+                int(str(raw).strip())
+                if raw is not None
+                else _SURFACE_FAST_MAX_TOKENS_DEFAULT
+            )
         except (TypeError, ValueError):
             parsed = _SURFACE_FAST_MAX_TOKENS_DEFAULT
         return max(128, min(parsed, 3200))
@@ -2825,7 +3028,9 @@ class LifeChatter(BaseChatter):
             return True
 
         schema = usable_cls.to_schema()
-        function_name = schema.get("function", {}).get("name") if isinstance(schema, dict) else None
+        function_name = (
+            schema.get("function", {}).get("name") if isinstance(schema, dict) else None
+        )
         return isinstance(function_name, str) and function_name.startswith("mcp-")
 
     def _filter_mcp_usables(self, usables: list[type[Any]]) -> list[type[Any]]:
@@ -2856,10 +3061,15 @@ class LifeChatter(BaseChatter):
             removed_names: list[str] = []
             for usable_cls in usables:
                 if usable_cls in deferred_classes:
-                    schema = usable_cls.to_schema() if hasattr(usable_cls, "to_schema") else {}
+                    schema = (
+                        usable_cls.to_schema()
+                        if hasattr(usable_cls, "to_schema")
+                        else {}
+                    )
                     fn_name = (
                         schema.get("function", {}).get("name")
-                        if isinstance(schema, dict) else None
+                        if isinstance(schema, dict)
+                        else None
                     )
                     removed_names.append(str(fn_name or usable_cls.__name__))
                     continue
@@ -2876,10 +3086,13 @@ class LifeChatter(BaseChatter):
         removed_all: list[str] = []
         for usable_cls in usables:
             if self._is_mcp_usable_class(usable_cls):
-                schema = usable_cls.to_schema() if hasattr(usable_cls, "to_schema") else {}
+                schema = (
+                    usable_cls.to_schema() if hasattr(usable_cls, "to_schema") else {}
+                )
                 fn_name = (
                     schema.get("function", {}).get("name")
-                    if isinstance(schema, dict) else None
+                    if isinstance(schema, dict)
+                    else None
                 )
                 removed_all.append(str(fn_name or usable_cls.__name__))
                 continue
@@ -2894,7 +3107,11 @@ class LifeChatter(BaseChatter):
     def _get_chatter_config_section(self) -> Any:
         """读取 life_engine.chatter 配置段，失败时返回 None。"""
         plugin_config = getattr(self, "plugin", None)
-        config = getattr(plugin_config, "config", None) if plugin_config is not None else None
+        config = (
+            getattr(plugin_config, "config", None)
+            if plugin_config is not None
+            else None
+        )
         return getattr(config, "chatter", None) if config is not None else None
 
     def _is_sub_agent_enabled(self) -> bool:
@@ -3042,7 +3259,9 @@ class LifeChatter(BaseChatter):
 
     @classmethod
     def _is_surface_low_latency_stream(cls, chat_stream: ChatStream | None) -> bool:
-        return cls._is_surface_stream(chat_stream) and cls._surface_low_latency_enabled()
+        return (
+            cls._is_surface_stream(chat_stream) and cls._surface_low_latency_enabled()
+        )
 
     @classmethod
     def _build_surface_realtime_guidance(cls, chat_stream: ChatStream | None) -> str:
@@ -3084,7 +3303,7 @@ class LifeChatter(BaseChatter):
             "- 你直接输出的 assistant 纯文本 **不会被发送给用户**，它只会作为你自己的内心独白记录下来。\n"
             "- 想要让用户看到的话，**必须** 通过 `life_send_text` 工具发送。\n"
             "- 错误示范：用户问你问题，你直接输出回答文本 → 用户什么都收不到。\n"
-            "- 正确示范：用户问你问题，在同一次调用中提交 `life_send_text(thought=\"本次真实思考\", mood=\"\", decision=\"如何回应\", expected_response=\"\", content=\"你的回答\")` → 用户看到回答。\n"
+            '- 正确示范：用户问你问题，在同一次调用中提交 `life_send_text(thought="本次真实思考", mood="", decision="如何回应", expected_response="", content="你的回答")` → 用户看到回答。\n'
             "### 对话循环规则\n"
             "- 每轮你收到的工具结果会自动回到上下文，系统默认让你继续行动——你不需要等待用户下一条消息就能继续调用工具。\n"
             "- 需要的轻量思考应在当前模型决策内完成；使用 `life_send_text` 时要在同一个调用中提交 `mood`、`decision`、`expected_response`、`thought` 和 `content` 五个键，形成对齐的人格训练样本。\n"
@@ -3184,9 +3403,7 @@ class LifeChatter(BaseChatter):
         if not context_text:
             return "", high_water
         return (
-            "<life_runtime_context>\n"
-            f"{context_text}\n"
-            "</life_runtime_context>",
+            f"<life_runtime_context>\n{context_text}\n</life_runtime_context>",
             high_water,
         )
 
@@ -3273,7 +3490,9 @@ class LifeChatter(BaseChatter):
 
         # 内部主动机会/自主意向 → 交给主模型重新判断。
         # 这不是强制回复，只是让表达层看到这个机会。
-        if unread_msgs and all(self._is_proactive_trigger_message(msg) for msg in unread_msgs):
+        if unread_msgs and all(
+            self._is_proactive_trigger_message(msg) for msg in unread_msgs
+        ):
             return {
                 "reason": "内部主动机会或自主意向浮现，交给表达层判断",
                 "should_respond": True,
@@ -3307,9 +3526,11 @@ class LifeChatter(BaseChatter):
         if not prefix_prompt:
             # Projection-disabled/degraded routing still verifies the bound SOUL
             # authority explicitly before using the lightweight base prompt.
-            if not (await self._load_subject_authority_texts(service)).get(
-                "SOUL.md", ""
-            ).strip():
+            if (
+                not (await self._load_subject_authority_texts(service))
+                .get("SOUL.md", "")
+                .strip()
+            ):
                 return {
                     "reason": "SOUL 权威文本不可用，拒绝响应",
                     "should_respond": False,
@@ -3457,11 +3678,86 @@ class LifeChatter(BaseChatter):
         delivery_id = str(getattr(delivery, "delivery_id", "") or "").strip()
         marker = str(getattr(delivery, "delivery_marker", "") or "").strip()
         if not delivery_id or not marker or marker not in suffix.text:
-            raise RuntimeError("pending chatter delivery identity is absent from suffix Text")
+            raise RuntimeError(
+                "pending chatter delivery identity is absent from suffix Text"
+            )
         register = getattr(response, "register_context_delivery", None)
         if not callable(register):
-            raise RuntimeError("LLM response does not support exact context delivery receipts")
+            raise RuntimeError(
+                "LLM response does not support exact context delivery receipts"
+            )
         register(delivery_id, suffix.text, marker=marker)
+
+    @staticmethod
+    def _register_pending_memory_recall_deliveries(response: Any) -> tuple[str, ...]:
+        """Bind pending boundary traces to their exact final ``ToolResult``."""
+
+        from ..memory.boundary_resolver import (
+            get_memory_boundary_recall_coordinator,
+        )
+
+        register = getattr(response, "register_context_delivery", None)
+        payloads = getattr(response, "payloads", None)
+        if not callable(register) or not isinstance(payloads, list):
+            return ()
+        coordinator = get_memory_boundary_recall_coordinator()
+        deliveries: dict[str, str] = {}
+        for payload in payloads:
+            if getattr(payload, "role", None) != ROLE.TOOL_RESULT:
+                continue
+            for part in getattr(payload, "content", ()):
+                if not isinstance(part, ToolResult) or not isinstance(part.value, dict):
+                    continue
+                delivery_id = str(
+                    part.value.get("memory_recall_delivery_id") or ""
+                ).strip()
+                if not delivery_id or not coordinator.has_pending(delivery_id):
+                    continue
+                expected = part.to_text()
+                previous = deliveries.get(delivery_id)
+                if previous is not None and previous != expected:
+                    raise RuntimeError(
+                        f"MemoryBoundaryRecallToolResultConflict:{delivery_id}"
+                    )
+                deliveries[delivery_id] = expected
+        for delivery_id, expected in deliveries.items():
+            register(
+                delivery_id,
+                expected,
+                marker=delivery_id,
+                part_kind="tool_result",
+            )
+        return tuple(deliveries)
+
+    @staticmethod
+    async def _commit_memory_recall_deliveries(
+        response: Any,
+        delivery_ids: tuple[str, ...],
+    ) -> None:
+        """Commit accessibility traces after the successful attempt proves delivery."""
+
+        if not delivery_ids:
+            return
+        from ..memory.boundary_resolver import (
+            get_memory_boundary_recall_coordinator,
+        )
+
+        coordinator = get_memory_boundary_recall_coordinator()
+        lookup = getattr(response, "effective_context_receipt", None)
+        for delivery_id in delivery_ids:
+            receipt = lookup(delivery_id) if callable(lookup) else None
+            if receipt is None:
+                coordinator.discard(delivery_id)
+                continue
+            try:
+                await coordinator.commit_exact(delivery_id, receipt)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - derived trace can retry later
+                logger.warning(
+                    "memory boundary exact-delivery trace commit failed: "
+                    f"delivery_id={delivery_id}, error_type={type(error).__name__}"
+                )
 
     @staticmethod
     def _perception_receipt_from_model_response(
@@ -3512,9 +3808,7 @@ class LifeChatter(BaseChatter):
             projection_sha256=prepared.projection_sha256,
             delivered_bytes=prepared.delivered_bytes,
             exact=True,
-            transport_request_id=str(
-                getattr(response, "request_record_id", "") or ""
-            ),
+            transport_request_id=str(getattr(response, "request_record_id", "") or ""),
         )
 
     @staticmethod
@@ -3632,9 +3926,7 @@ class LifeChatter(BaseChatter):
         if not delta:
             return []
 
-        logger.info(
-            f"loop 中检测到 {len(delta)} 条新未读，注入到下一次 LLM 请求"
-        )
+        logger.info(f"loop 中检测到 {len(delta)} 条新未读，注入到下一次 LLM 请求")
 
         # 构造新消息片段（轻量，不重复 chat_history）
         unread_lines = "\n".join(self.format_message_line(msg) for msg in delta)
@@ -3820,14 +4112,16 @@ class LifeChatter(BaseChatter):
                 key = (observer_kind, part.sha256)
                 if key not in observed_by_hash:
                     if observer_kind == "emoji":
-                        observed_by_hash[key] = await cls._describe_native_media_for_fallback(
+                        observed_by_hash[
+                            key
+                        ] = await cls._describe_native_media_for_fallback(
                             part,
                             observer_kind="emoji",
                         )
                     else:
-                        observed_by_hash[key] = await cls._describe_native_media_for_fallback(
-                            part
-                        )
+                        observed_by_hash[
+                            key
+                        ] = await cls._describe_native_media_for_fallback(part)
                 observed_text = observed_by_hash[key]
                 label = labels.get(observer_kind, "媒体")
                 if observed_text:
@@ -3950,7 +4244,10 @@ class LifeChatter(BaseChatter):
         enable_image = bool(getattr(cfg, "native_image", True))
         enable_emoji = bool(getattr(cfg, "native_emoji", True))
         audio_max_seconds = int(getattr(cfg, "audio_max_seconds", 60) or 60)
-        if bool(getattr(cfg, "include_history_media", False)) and chat_stream is not None:
+        if (
+            bool(getattr(cfg, "include_history_media", False))
+            and chat_stream is not None
+        ):
             context = getattr(chat_stream, "context", None)
             history_msgs = list(getattr(context, "history_messages", []) or [])
             try:
@@ -3983,7 +4280,9 @@ class LifeChatter(BaseChatter):
         if not fresh:
             return [Text(user_prompt_text)]
 
-        placeholder = str(getattr(cfg, "unsupported_audio_placeholder", "[语音消息]") or "[语音消息]")
+        placeholder = str(
+            getattr(cfg, "unsupported_audio_placeholder", "[语音消息]") or "[语音消息]"
+        )
         return build_multimodal_content(
             user_prompt_text,
             fresh,
@@ -4052,7 +4351,10 @@ class LifeChatter(BaseChatter):
             return
 
         index = len(conversation) - 1
-        while index >= 0 and getattr(conversation[index], "role", None) == ROLE.TOOL_RESULT:
+        while (
+            index >= 0
+            and getattr(conversation[index], "role", None) == ROLE.TOOL_RESULT
+        ):
             index -= 1
         if index < 0 or getattr(conversation[index], "role", None) != ROLE.ASSISTANT:
             return
@@ -4078,7 +4380,9 @@ class LifeChatter(BaseChatter):
             if isinstance(part, ToolResult) and part.call_id
         }
         missing_calls = [
-            call for call in calls if str(getattr(call, "id", "") or "") not in completed_ids
+            call
+            for call in calls
+            if str(getattr(call, "id", "") or "") not in completed_ids
         ]
         if missing_calls:
             cancelled_payload = LLMPayload(
@@ -4140,7 +4444,9 @@ class LifeChatter(BaseChatter):
             if not joined:
                 break
             cleaned = joined.replace(_SUSPEND_TEXT, "").strip()
-            cleaned = cleaned.replace("<thinking>", "").replace("</thinking>", "").strip()
+            cleaned = (
+                cleaned.replace("<thinking>", "").replace("</thinking>", "").strip()
+            )
             if cleaned:
                 break
             payloads.pop()
@@ -4226,31 +4532,27 @@ class LifeChatter(BaseChatter):
         ):
             return True, ""
         authorized = {
-            str(item.get("authorized_stream_id") or "").strip()
-            for item in occurrences
+            str(item.get("authorized_stream_id") or "").strip() for item in occurrences
         }
         if authorized != {str(stream_id or "").strip()}:
             return False, "cross_stream_not_authorized"
 
         args = getattr(call, "args", None)
         target_key = (
-            str(args.get("target_key") or "").strip()
-            if isinstance(args, dict)
-            else ""
+            str(args.get("target_key") or "").strip() if isinstance(args, dict) else ""
         )
         if not target_key:
             return True, ""
-        runtime_cfg = getattr(getattr(self.plugin, "config", None), "runtime_sync", None)
+        runtime_cfg = getattr(
+            getattr(self.plugin, "config", None), "runtime_sync", None
+        )
         target = await resolve_send_target_key(
             target_key,
             current_stream_id=stream_id,
             limit=max(1, int(getattr(runtime_cfg, "send_targets_limit", 8) or 8)),
             active_window_hours=max(
                 0.1,
-                float(
-                    getattr(runtime_cfg, "send_targets_window_hours", 24.0)
-                    or 24.0
-                ),
+                float(getattr(runtime_cfg, "send_targets_window_hours", 24.0) or 24.0),
             ),
         )
         if target is None:
@@ -4284,7 +4586,9 @@ class LifeChatter(BaseChatter):
                         str(getattr(message, "platform", "") or ""),
                         str(getattr(message, "sender_id", "") or ""),
                         str(getattr(message, "time", "") or ""),
-                        hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest(),
+                        hashlib.sha256(
+                            text.encode("utf-8", errors="replace")
+                        ).hexdigest(),
                     )
                 )
             )
@@ -4383,8 +4687,12 @@ class LifeChatter(BaseChatter):
         args = getattr(call, "args", None)
         if not isinstance(args, dict):
             return None
-        segments = LifeSendTextAction._normalize_content_segments(args.get("content", ""))
-        cleaned = [LifeSendTextAction._sanitize_segment(segment) for segment in segments]
+        segments = LifeSendTextAction._normalize_content_segments(
+            args.get("content", "")
+        )
+        cleaned = [
+            LifeSendTextAction._sanitize_segment(segment) for segment in segments
+        ]
         cleaned = [segment for segment in cleaned if segment]
         if not cleaned:
             return None
@@ -4437,10 +4745,13 @@ class LifeChatter(BaseChatter):
         rt.recent_visible_text_replies = deque(
             (timestamp, cached_turn_key, cached_scope, cached_content)
             for timestamp, cached_turn_key, cached_scope, cached_content in rt.recent_visible_text_replies
-            if (cached_turn_key, cached_scope, cached_content) != (turn_key, scope, content)
+            if (cached_turn_key, cached_scope, cached_content)
+            != (turn_key, scope, content)
         )
         rt.recent_visible_text_replies.append((recorded_at, turn_key, scope, content))
-        while len(rt.recent_visible_text_replies) > _RECENT_VISIBLE_TEXT_REPLY_MAX_ENTRIES:
+        while (
+            len(rt.recent_visible_text_replies) > _RECENT_VISIBLE_TEXT_REPLY_MAX_ENTRIES
+        ):
             rt.recent_visible_text_replies.popleft()
 
     @classmethod
@@ -4508,11 +4819,14 @@ class LifeChatter(BaseChatter):
         if not stream_id:
             return False
 
-        platform = str(
-            getattr(chat_stream, "platform", "")
-            or (getattr(unread_msgs[-1], "platform", "") if unread_msgs else "")
-            or ""
-        ).strip() or None
+        platform = (
+            str(
+                getattr(chat_stream, "platform", "")
+                or (getattr(unread_msgs[-1], "platform", "") if unread_msgs else "")
+                or ""
+            ).strip()
+            or None
+        )
         content = self._build_must_reply_fallback_text(unread_msgs)
 
         try:
@@ -4538,7 +4852,9 @@ class LifeChatter(BaseChatter):
                 continue
 
             base = raw_id or "tooluse"
-            safe_name = re.sub(r"[^a-zA-Z0-9_]+", "_", str(getattr(call, "name", "") or "tool"))
+            safe_name = re.sub(
+                r"[^a-zA-Z0-9_]+", "_", str(getattr(call, "name", "") or "tool")
+            )
             new_id = f"{base}_{safe_name}_{index}"
             suffix = 1
             while new_id in seen:
@@ -4579,7 +4895,9 @@ class LifeChatter(BaseChatter):
             or getattr(chat_stream, "stream_id", "")
             or "未知聊天流"
         )
-        thought = str(getattr(response, "reasoning_content", "") or "").strip() or "（无）"
+        thought = (
+            str(getattr(response, "reasoning_content", "") or "").strip() or "（无）"
+        )
         monologue = str(getattr(response, "message", "") or "").strip() or "（无）"
 
         tool_lines: list[str] = []
@@ -4728,7 +5046,9 @@ class LifeChatter(BaseChatter):
                     usable_map,
                     trigger_msg,
                 ):
-                    platform = str(getattr(trigger_msg, "platform", "") or "").strip().lower()
+                    platform = (
+                        str(getattr(trigger_msg, "platform", "") or "").strip().lower()
+                    )
                     blocked_detail = (
                         "当前 N.E.K.O 表现窗口由 Surface 自动处理语音，请改用文字回复。"
                         if platform == "neko.surface"
@@ -4748,7 +5068,9 @@ class LifeChatter(BaseChatter):
                     continue
 
                 raw_result = await self._await_with_watchdog_keepalive(
-                    super().run_tool_call([current_call], response, usable_map, trigger_msg)
+                    super().run_tool_call(
+                        [current_call], response, usable_map, trigger_msg
+                    )
                 )
                 normalized = self._normalize_tool_execution_results(raw_result, 1)
                 results.append(normalized[0] if normalized else (False, False))
@@ -4777,7 +5099,9 @@ class LifeChatter(BaseChatter):
 
         self._active_chat_stream = chat_stream
         rt, usable_map = await self._get_or_create_global_runtime(service, chat_stream)
-        stream_id = str(getattr(chat_stream, "stream_id", "") or self.stream_id or "").strip()
+        stream_id = str(
+            getattr(chat_stream, "stream_id", "") or self.stream_id or ""
+        ).strip()
         if rt.phase != _Phase.WAIT_USER:
             active_stream_id = str(getattr(rt, "active_stream_id", "") or "").strip()
             if active_stream_id and active_stream_id != stream_id:
@@ -4832,7 +5156,9 @@ class LifeChatter(BaseChatter):
                 # 路由：是否把这批消息交给表达层继续处理。router 只读纯文本，
                 # 因此不能用它的 false 丢弃 planner 已确认可观察的真实媒体。
                 decision = await self._should_respond(
-                    unread_lines, unread_msgs, chat_stream,
+                    unread_lines,
+                    unread_msgs,
+                    chat_stream,
                 )
                 logger.info(
                     f"路由: {decision.get('reason', '')} (响应: {decision.get('should_respond', False)})"
@@ -4970,10 +5296,15 @@ class LifeChatter(BaseChatter):
                             f"{error}",
                             exc_info=True,
                         )
-                        return Failure("life_chatter transient suffix preparation failed", error)
+                        return Failure(
+                            "life_chatter transient suffix preparation failed", error
+                        )
                 promoted_media_items = self._append_promoted_media_payload_items(
                     rt.response,
                     stream_id,
+                )
+                pending_memory_recall_delivery_ids = (
+                    self._register_pending_memory_recall_deliveries(rt.response)
                 )
 
                 def requeue_promoted_media() -> None:
@@ -4981,6 +5312,7 @@ class LifeChatter(BaseChatter):
                         LifeInspectMediaTool._queue_promoted_media(stream_id, promoted)
 
                 try:
+
                     async def _send_and_collect_response() -> Any:
                         source_response = rt.response
                         self._bind_trajectory_identity(
@@ -5014,6 +5346,10 @@ class LifeChatter(BaseChatter):
                         _send_and_collect_response()
                     )
                     self._strip_suffix_context(rt.response)
+                    await self._commit_memory_recall_deliveries(
+                        rt.response,
+                        pending_memory_recall_delivery_ids,
+                    )
 
                 except asyncio.CancelledError:
                     requeue_promoted_media()
@@ -5025,10 +5361,9 @@ class LifeChatter(BaseChatter):
                     raise
                 except Exception as error:
                     self._strip_suffix_context(rt.response)
-                    if (
-                        _is_native_multimodal_unsupported_error(error)
-                        and self._has_native_media(rt.response)
-                    ):
+                    if _is_native_multimodal_unsupported_error(
+                        error
+                    ) and self._has_native_media(rt.response):
                         logger.warning(
                             "当前模型不支持原生多模态输入，改用媒体观察文字结果重试: "
                             f"{error}"
@@ -5037,13 +5372,21 @@ class LifeChatter(BaseChatter):
                             rt.response = await self._await_model_turn(
                                 self._retry_model_turn_with_media_text_fallback(
                                     rt,
-                                    rt.pending_transient_context_text if initial_turn else "",
+                                    rt.pending_transient_context_text
+                                    if initial_turn
+                                    else "",
                                     delivery=(
-                                        pending_runtime_delivery if initial_turn else None
+                                        pending_runtime_delivery
+                                        if initial_turn
+                                        else None
                                     ),
                                 )
                             )
                             self._strip_suffix_context(rt.response)
+                            await self._commit_memory_recall_deliveries(
+                                rt.response,
+                                pending_memory_recall_delivery_ids,
+                            )
                         except asyncio.CancelledError:
                             requeue_promoted_media()
                             self._recover_failed_model_turn(
@@ -5168,7 +5511,10 @@ class LifeChatter(BaseChatter):
                     response_text = str(response_msg or "").strip()
                     is_suspend_echo = bool(response_text) and (
                         _SUSPEND_TEXT in response_text
-                        or response_text.replace("<thinking>", "").replace("</thinking>", "").strip() == ""
+                        or response_text.replace("<thinking>", "")
+                        .replace("</thinking>", "")
+                        .strip()
+                        == ""
                     )
                     recorded_monologue = False
                     # 清除 SUSPEND echo，避免模型继续模仿
@@ -5197,7 +5543,9 @@ class LifeChatter(BaseChatter):
                             "life_chatter reached max rounds without a terminal choice"
                         )
                         if rt.must_reply:
-                            await self._send_must_reply_fallback(chat_stream, rt.unreads)
+                            await self._send_must_reply_fallback(
+                                chat_stream, rt.unreads
+                            )
                             rt.must_reply = False
                         if self._has_tool_result_tail(llm_response):
                             llm_response.add_payload(
@@ -5208,11 +5556,15 @@ class LifeChatter(BaseChatter):
                         await self._save_rolling_context_snapshot(llm_response)
                         return Wait()
                     # must_reply 且本轮输出了独白却没发消息 → 立即提醒
-                    if rt.must_reply and recorded_monologue and not rt.sent_visible_reply:
+                    if (
+                        rt.must_reply
+                        and recorded_monologue
+                        and not rt.sent_visible_reply
+                    ):
                         self._append_follow_up_user_instruction(
                             llm_response,
                             "（系统提醒：你刚才那段文字只被记录为内心独白，**用户没有收到**。"
-                            "如果想让用户看到，必须调用 `life_send_text(content=\"...\")`。"
+                            '如果想让用户看到，必须调用 `life_send_text(content="...")`。'
                             "如果本轮不打算回复，调用 `action-life_pass_and_wait` 等待。）",
                         )
                     # 连续两轮以上空轮 → 注入引导提醒
@@ -5226,7 +5578,10 @@ class LifeChatter(BaseChatter):
                     self._transition(rt, _Phase.FOLLOW_UP, "empty turn, continue loop")
                     self._maybe_compact_runtime_context(llm_response)
                     await self._save_rolling_context_snapshot(llm_response)
-                    if self._is_surface_low_latency_stream(chat_stream) and rt.must_reply:
+                    if (
+                        self._is_surface_low_latency_stream(chat_stream)
+                        and rt.must_reply
+                    ):
                         continue
                     return Success("follow-up scheduled")
 
@@ -5271,7 +5626,9 @@ class LifeChatter(BaseChatter):
                         if success:
                             rt.tool_failure_counts.pop(lineage_key, None)
                         else:
-                            failure_count = rt.tool_failure_counts.get(lineage_key, 0) + 1
+                            failure_count = (
+                                rt.tool_failure_counts.get(lineage_key, 0) + 1
+                            )
                             rt.tool_failure_counts[lineage_key] = failure_count
 
                     terminal_outcome = technical_outcome in _TERMINAL_TOOL_OUTCOMES
@@ -5280,7 +5637,9 @@ class LifeChatter(BaseChatter):
                         and not success
                         and failure_count >= _PLATFORM_ACTION_MAX_ATTEMPTS
                     )
-                    if (terminal_outcome or retry_limit_reached) and not terminal_tool_failure:
+                    if (
+                        terminal_outcome or retry_limit_reached
+                    ) and not terminal_tool_failure:
                         terminal_tool_failure = (
                             technical_outcome
                             if terminal_outcome
@@ -5364,15 +5723,18 @@ class LifeChatter(BaseChatter):
                     get_watchdog().feed_dog(self.stream_id)
 
                     call_name = getattr(call, "name", "<unknown>")
-                    log_args = dict(call.args) if isinstance(getattr(call, "args", None), dict) else {}
+                    log_args = (
+                        dict(call.args)
+                        if isinstance(getattr(call, "args", None), dict)
+                        else {}
+                    )
                     reason = log_args.pop("reason", "未提供原因")
                     logger.debug(
                         f"LLM 调用 {call_name}，原因: {reason}，参数: {log_args}"
                     )
 
-                    if (
-                        delivery_unknown_action
-                        and self._is_visible_reply_action(str(call_name or ""))
+                    if delivery_unknown_action and self._is_visible_reply_action(
+                        str(call_name or "")
                     ):
                         await flush_parallel_calls()
                         llm_response.add_payload(
@@ -5397,11 +5759,16 @@ class LifeChatter(BaseChatter):
                     except TypeError:
                         dedupe_key = f"{call_name}:{dedupe_args}"
 
-                    if dedupe_key in seen_sigs or dedupe_key in rt.cross_round_seen_signatures:
+                    if (
+                        dedupe_key in seen_sigs
+                        or dedupe_key in rt.cross_round_seen_signatures
+                    ):
                         await flush_parallel_calls()
                         lineage_key = self._tool_failure_lineage_key(call)
                         if lineage_key:
-                            failure_count = rt.tool_failure_counts.get(lineage_key, 0) + 1
+                            failure_count = (
+                                rt.tool_failure_counts.get(lineage_key, 0) + 1
+                            )
                             rt.tool_failure_counts[lineage_key] = failure_count
                             if failure_count >= _PLATFORM_ACTION_MAX_ATTEMPTS:
                                 terminal_tool_failure = "retry_limit_reached"
@@ -5411,7 +5778,11 @@ class LifeChatter(BaseChatter):
                         llm_response.add_payload(
                             LLMPayload(
                                 ROLE.TOOL_RESULT,
-                                ToolResult(value="检测到重复工具调用，已跳过", call_id=call.id, name=call_name),
+                                ToolResult(
+                                    value="检测到重复工具调用，已跳过",
+                                    call_id=call.id,
+                                    name=call_name,
+                                ),
                             )
                         )
                         continue
@@ -5423,9 +5794,8 @@ class LifeChatter(BaseChatter):
                         stream_id,
                         turn_key=rt.active_unread_turn_key,
                     )
-                    if (
-                        reply_entry is not None
-                        and self._was_recent_visible_text_reply(rt, reply_entry)
+                    if reply_entry is not None and self._was_recent_visible_text_reply(
+                        rt, reply_entry
                     ):
                         await flush_parallel_calls()
                         llm_response.add_payload(
@@ -5471,12 +5841,13 @@ class LifeChatter(BaseChatter):
                         and autonomy_occurrences
                         and self._is_visible_reply_action(str(call_name or ""))
                     ):
-                        target_allowed, target_reason = (
-                            await self._validate_autonomy_action_target(
-                                call,
-                                autonomy_occurrences,
-                                stream_id,
-                            )
+                        (
+                            target_allowed,
+                            target_reason,
+                        ) = await self._validate_autonomy_action_target(
+                            call,
+                            autonomy_occurrences,
+                            stream_id,
                         )
                         if not target_allowed:
                             await flush_parallel_calls()
@@ -5518,9 +5889,7 @@ class LifeChatter(BaseChatter):
                                 )
                             )
                             continue
-                        claimed_autonomy_actions.add(
-                            str(getattr(call, "id", "") or "")
-                        )
+                        claimed_autonomy_actions.add(str(getattr(call, "id", "") or ""))
 
                     # 执行工具（action / tool 统一处理）
                     if is_life_tool_call_parallel_safe(call):
@@ -5535,9 +5904,7 @@ class LifeChatter(BaseChatter):
                         trigger_msg,
                     )
                     result_list = self._normalize_tool_execution_results(raw_results, 1)
-                    execution_result = (
-                        result_list[0] if result_list else (False, False)
-                    )
+                    execution_result = result_list[0] if result_list else (False, False)
                     await handle_tool_execution_result(call, execution_result)
 
                 await flush_parallel_calls()
@@ -5571,7 +5938,9 @@ class LifeChatter(BaseChatter):
                 # pass 退出
                 if should_wait:
                     if self._has_tool_result_tail(llm_response):
-                        llm_response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
+                        llm_response.add_payload(
+                            LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT))
+                        )
                     self._transition(rt, _Phase.WAIT_USER, "pass_and_wait")
                     self._maybe_compact_runtime_context(llm_response)
                     await self._save_rolling_context_snapshot(llm_response)
@@ -5595,7 +5964,9 @@ class LifeChatter(BaseChatter):
                 # 继续 follow-up 会再次询问模型，容易对同一事件生成二次回复。
                 if rt.sent_visible_reply or suppressed_recent_reply:
                     if self._has_tool_result_tail(llm_response):
-                        llm_response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
+                        llm_response.add_payload(
+                            LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT))
+                        )
                     reason = (
                         "recent visible reply suppressed"
                         if suppressed_recent_reply and not rt.sent_visible_reply
@@ -5609,9 +5980,7 @@ class LifeChatter(BaseChatter):
                 # 默认继续 loop：检查 max_rounds 安全阀
                 rt.follow_up_rounds += 1
                 if rt.follow_up_rounds >= max_rounds:
-                    logger.warning(
-                        f"已达最大轮数 ({max_rounds})，收束本轮"
-                    )
+                    logger.warning(f"已达最大轮数 ({max_rounds})，收束本轮")
                     await complete_active_autonomy_as_failed(
                         "life_chatter reached max rounds without a terminal choice"
                     )
@@ -5619,7 +5988,9 @@ class LifeChatter(BaseChatter):
                         await self._send_must_reply_fallback(chat_stream, rt.unreads)
                         rt.must_reply = False
                     if self._has_tool_result_tail(llm_response):
-                        llm_response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
+                        llm_response.add_payload(
+                            LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT))
+                        )
                     self._transition(rt, _Phase.WAIT_USER, "max rounds reached")
                     self._maybe_compact_runtime_context(llm_response)
                     await self._save_rolling_context_snapshot(llm_response)
@@ -5627,7 +5998,9 @@ class LifeChatter(BaseChatter):
 
                 # 补 ASSISTANT 占位：TOOL_RESULT 尾部必须接 ASSISTANT 才能接下一轮 USER/请求。
                 if self._has_tool_result_tail(llm_response):
-                    llm_response.add_payload(LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT)))
+                    llm_response.add_payload(
+                        LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT))
+                    )
 
                 self._transition(rt, _Phase.FOLLOW_UP, "default loop continue")
                 self._maybe_compact_runtime_context(llm_response)
@@ -5664,7 +6037,9 @@ class LifeChatter(BaseChatter):
             self._collect_pending_stream_turns(unread_msgs)
             rt = self.__class__._GLOBAL_RUNTIME
             if rt is not None and rt.phase != _Phase.WAIT_USER:
-                active_stream_id = str(getattr(rt, "active_stream_id", "") or "").strip()
+                active_stream_id = str(
+                    getattr(rt, "active_stream_id", "") or ""
+                ).strip()
                 if active_stream_id and active_stream_id != self.stream_id:
                     logger.debug(
                         f"[{self.stream_id}] 统一 life_chatter runtime 正由 {active_stream_id} 推进，稍后重试"

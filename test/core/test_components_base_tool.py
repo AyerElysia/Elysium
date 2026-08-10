@@ -1,6 +1,5 @@
 """测试 src.core.components.base.tool 模块。"""
 
-
 import pytest
 
 from src.core.components.base.tool import BaseTool
@@ -44,6 +43,7 @@ class TestBaseTool:
         assert tool.tool_description == "A test tool"
         assert tool.stream_id == ""
         assert tool.trigger_message is None
+        assert tool._tool_call_id == ""
 
     def test_bind_runtime_context_and_get_current_stream_id(self, mock_plugin):
         """测试 Tool 可读取当前调用绑定的 stream id。"""
@@ -53,10 +53,12 @@ class TestBaseTool:
         tool._bind_runtime_context(
             stream_id="fallback-stream",
             message=SimpleNamespace(stream_id="message-stream"),
+            tool_call_id="call-stable-1",
         )
 
         assert tool.stream_id == "fallback-stream"
         assert tool.get_current_stream_id() == "message-stream"
+        assert tool._tool_call_id == "call-stable-1"
 
     def test_get_current_stream_id_falls_back_to_bound_stream_id(self, mock_plugin):
         """message 无 stream_id 时回退到绑定的 stream_id。"""

@@ -103,6 +103,7 @@ from ...memory.living import (
     CoRecallEvent,
     InterpretationSearchResult,
     InterpretationSource,
+    MemoryArtifactDescriptor,
     MemoryArtifactVersion,
     MemoryDerivation,
     MemoryInterpretation,
@@ -117,7 +118,9 @@ from ...memory.living import (
     begin_recall_episode,
     choose_association_neighbours,
     get_artifact_head_state,
+    get_artifact_version,
     get_interpretation,
+    list_artifact_descriptors,
     list_artifact_heads,
     list_artifact_history,
     list_association_evidence,
@@ -611,6 +614,18 @@ class LocalLivingMemoryStore(_LocalPort):
 
     async def get_artifact_head(self, logical_key: str) -> ArtifactHead | None:
         return await run_db(get_artifact_head_state, self._db(), logical_key)
+
+    async def get_artifact_version(
+        self,
+        artifact_id: str,
+    ) -> MemoryArtifactVersion | None:
+        return await run_db(get_artifact_version, self._db(), artifact_id)
+
+    async def list_artifact_descriptors(
+        self,
+        logical_key: str,
+    ) -> list[MemoryArtifactDescriptor]:
+        return await run_db(list_artifact_descriptors, self._db(), logical_key)
 
     async def list_artifact_history(
         self,

@@ -186,9 +186,7 @@ LIFE_CHATTER_EFFECTIVE_TEXT_MAX_BYTES = 64 * 1024
 
 def _stable_text_digest(text: str) -> str:
     """Content-free digest for one heartbeat model reply."""
-    return hashlib.sha256(
-        str(text or "").encode("utf-8", errors="replace")
-    ).hexdigest()
+    return hashlib.sha256(str(text or "").encode("utf-8", errors="replace")).hexdigest()
 
 
 # 多写者心跳被其他实例认领（或已完成）时返回的空准备上下文。
@@ -257,7 +255,9 @@ class ChatterRuntimeCommitCheckpoint:
             field_name="chatter checkpoint effective_suffix_sha256",
         )
         if not 0 < self.effective_suffix_bytes <= LIFE_CHATTER_EFFECTIVE_TEXT_MAX_BYTES:
-            raise ValueError("chatter checkpoint effective suffix byte count is invalid")
+            raise ValueError(
+                "chatter checkpoint effective suffix byte count is invalid"
+            )
         if self.event_through_sequence < 0 or self.thought_through_revision < 0:
             raise ValueError("chatter checkpoint frontiers must not be negative")
 
@@ -484,7 +484,9 @@ def _heartbeat_tool_round_progress(
             default=str,
         )
         result = results[index] if index < len(results) else None
-        result_text = result.to_text() if result is not None else "<missing-tool-result>"
+        result_text = (
+            result.to_text() if result is not None else "<missing-tool-result>"
+        )
         failed = result is None or result_text.startswith(
             ("执行失败:", "执行异常:", "未知工具:")
         )
@@ -579,27 +581,39 @@ class LifeEngineService(BaseService):
         except (TypeError, ValueError):
             context_budget = 16000
         try:
-            summary_max = max(200, int(getattr(settings, "subconscious_summary_max_chars", None) or 4000))
+            summary_max = max(
+                200,
+                int(getattr(settings, "subconscious_summary_max_chars", None) or 4000),
+            )
         except (TypeError, ValueError):
             summary_max = 4000
         try:
-            entry_max = max(40, int(getattr(settings, "subconscious_entry_max_chars", None) or 480))
+            entry_max = max(
+                40, int(getattr(settings, "subconscious_entry_max_chars", None) or 480)
+            )
         except (TypeError, ValueError):
             entry_max = 480
         try:
-            recent_groups = max(0, int(getattr(settings, "subconscious_recent_groups", None) or 5))
+            recent_groups = max(
+                0, int(getattr(settings, "subconscious_recent_groups", None) or 5)
+            )
         except (TypeError, ValueError):
             recent_groups = 5
         try:
-            summary_max_entries = max(10, int(getattr(settings, "subconscious_summary_max_entries", None) or 60))
+            summary_max_entries = max(
+                10,
+                int(getattr(settings, "subconscious_summary_max_entries", None) or 60),
+            )
         except (TypeError, ValueError):
             summary_max_entries = 60
-        self._subconscious_context: SubconsciousContextManager = SubconsciousContextManager(
-            max_chars=context_budget,
-            recent_group_count=recent_groups,
-            summary_max_chars=summary_max,
-            entry_max_chars=entry_max,
-            summary_max_entries=summary_max_entries,
+        self._subconscious_context: SubconsciousContextManager = (
+            SubconsciousContextManager(
+                max_chars=context_budget,
+                recent_group_count=recent_groups,
+                summary_max_chars=summary_max,
+                entry_max_chars=entry_max,
+                summary_max_entries=summary_max_entries,
+            )
         )
         self._sleep_state_active: bool = False
         self._self_pause_skip_logged: bool = False
@@ -623,9 +637,7 @@ class LifeEngineService(BaseService):
             self._cfg(),
             global_config=explicit_global_config,
         )
-        self._selectable_storage_enabled = bool(
-            self._storage_factory_settings.enabled
-        )
+        self._selectable_storage_enabled = bool(self._storage_factory_settings.enabled)
         self._storage_runtime: Any | None = None
         self._presence_world_stores: Any | None = None
         self._life_event_store: Any | None = None
@@ -714,7 +726,9 @@ class LifeEngineService(BaseService):
         self._state_persistence: StatePersistence | None = None
         self._event_bus: LifeEventBus | None = None
         self._world_projection: Any | None = None
-        self._perception_gateway: PerceptionGateway | AsyncPerceptionGateway | None = None
+        self._perception_gateway: PerceptionGateway | AsyncPerceptionGateway | None = (
+            None
+        )
         self._pending_chatter_perceptions: dict[str, PreparedPerception] = {}
         self._pending_chatter_deliveries: dict[str, ChatterRuntimeDelivery] = {}
         self._attention_router: AttentionRouter | None = None
@@ -785,17 +799,12 @@ class LifeEngineService(BaseService):
 
         if self._selectable_storage_enabled:
             raise RuntimeError(
-                "SelectedPresenceRequiresAwait: use "
-                "save_consciousness_registry_async()"
+                "SelectedPresenceRequiresAwait: use save_consciousness_registry_async()"
             )
         registry = self.consciousness_registry
         assert isinstance(registry, ConsciousnessRegistry)
-        registry.save(
-            self._workspace_dir() / "runtime" / "consciousness_registry.json"
-        )
-        registry.flush_lifecycle_events(
-            self._get_event_bus().store.append_sync
-        )
+        registry.save(self._workspace_dir() / "runtime" / "consciousness_registry.json")
+        registry.flush_lifecycle_events(self._get_event_bus().store.append_sync)
         if self._world_projection is not None:
             self._world_projection.catch_up(self._get_event_bus().store)
 
@@ -1007,8 +1016,7 @@ class LifeEngineService(BaseService):
                 )
             except Exception as exc:  # noqa: BLE001 - authority already committed
                 logger.warning(
-                    "持续关注线索已提交，但派生学习未完成: "
-                    f"error={type(exc).__name__}"
+                    f"持续关注线索已提交，但派生学习未完成: error={type(exc).__name__}"
                 )
         return commit
 
@@ -1065,9 +1073,7 @@ class LifeEngineService(BaseService):
 
         await self._open_selected_storage_runtime()
         runtime = self.storage_runtime
-        multi_writer_enabled = bool(
-            self._storage_factory_settings.multi_writer_enabled
-        )
+        multi_writer_enabled = bool(self._storage_factory_settings.multi_writer_enabled)
         claim_retry_interval_seconds = 1.0
         claim_deadline = (
             time.monotonic()
@@ -1106,9 +1112,7 @@ class LifeEngineService(BaseService):
                             f"namespace={namespace} state_key={state_key}"
                         )
                         logged_wait = True
-                    await asyncio.sleep(
-                        min(claim_retry_interval_seconds, remaining)
-                    )
+                    await asyncio.sleep(min(claim_retry_interval_seconds, remaining))
 
         if multi_writer_enabled:
             from ..storage.multi_writer_protocol import (
@@ -1539,9 +1543,7 @@ class LifeEngineService(BaseService):
             # 这里自愈为 confirmed（重建投影），避免调用方无限重试刷屏。
             if getattr(store, "backend", None) == BackendKind.MYSQL:
                 if task is not None and task.state in {"pending", "failed"}:
-                    await store.heal_projection(
-                        task, worker_id="projection-self-heal"
-                    )
+                    await store.heal_projection(task, worker_id="projection-self-heal")
                 return {
                     "status": "remote_current_head",
                     "logical_path": logical_path,
@@ -1570,19 +1572,27 @@ class LifeEngineService(BaseService):
         semantic_source_id: str | None = None,
         reason: str = "",
     ) -> dict[str, Any] | None:
-        """Commit one declared subject document to the selected remote head.
+        """Commit one declared auxiliary subject document to the selected head.
 
-        Disabled storage returns ``None`` for explicit local mode. Under MySQL
-        the immutable version/current head is the only runtime representation;
-        no workspace Markdown is read or written as a projection.
+        Unified root documents are rejected before storage-mode branching and
+        may only change through ``SubjectAuthorityPort.accept_candidate``.
+        Disabled storage returns ``None`` for explicit local handling of an
+        auxiliary document. Under MySQL the immutable version/current head is
+        the only runtime representation; no workspace Markdown is read or
+        written as a projection.
         """
 
+        from ..storage.subject_workspace import (
+            auxiliary_subject_path_from_workspace_relative,
+        )
+
+        logical_path = auxiliary_subject_path_from_workspace_relative(
+            workspace_relative_path
+        )
         if not self._selectable_storage_enabled:
             return None
         from ..storage.subject_contracts import AppendSubjectDocumentVersion
-        from ..storage.subject_workspace import subject_path_from_workspace_relative
 
-        logical_path = subject_path_from_workspace_relative(workspace_relative_path)
         if logical_path is None:
             return None
         store = self._subject_document_store
@@ -1598,9 +1608,7 @@ class LifeEngineService(BaseService):
                 raise RuntimeError("SelectedSubjectObserverNotStarted")
             observed = await observer.observe_file(logical_path)
             if observed.status == "changed_during_read":
-                raise RuntimeError(
-                    f"SubjectWorkspaceChangedDuringRead: {logical_path}"
-                )
+                raise RuntimeError(f"SubjectWorkspaceChangedDuringRead: {logical_path}")
             if observed.commit is not None:
                 await self._project_subject_version(
                     logical_path=logical_path,
@@ -1698,8 +1706,7 @@ class LifeEngineService(BaseService):
         if self._selectable_storage_enabled:
             if self._life_event_store is None:
                 raise RuntimeError(
-                    "SelectedLifeEventStoreNotStarted: await "
-                    "LifeEngineService.start()"
+                    "SelectedLifeEventStoreNotStarted: await LifeEngineService.start()"
                 )
             return self._life_event_store
         return self._get_event_bus().store
@@ -1708,15 +1715,12 @@ class LifeEngineService(BaseService):
         if self._event_bus is None:
             if self._selectable_storage_enabled:
                 raise RuntimeError(
-                    "SelectedLifeEventStoreNotStarted: await "
-                    "LifeEngineService.start()"
+                    "SelectedLifeEventStoreNotStarted: await LifeEngineService.start()"
                 )
             registry = self.consciousness_registry
             assert isinstance(registry, ConsciousnessRegistry)
             self._event_bus = LifeEventBus(RawEventStore(self._workspace_dir()))
-            registry.flush_lifecycle_events(
-                self._event_bus.store.append_sync
-            )
+            registry.flush_lifecycle_events(self._event_bus.store.append_sync)
         return self._event_bus
 
     def _get_world_projection(self) -> Any:
@@ -1725,8 +1729,7 @@ class LifeEngineService(BaseService):
         if self._world_projection is None:
             if self._selectable_storage_enabled:
                 raise RuntimeError(
-                    "SelectedWorldProjectionNotStarted: await "
-                    "LifeEngineService.start()"
+                    "SelectedWorldProjectionNotStarted: await LifeEngineService.start()"
                 )
             self._world_projection = WorldProjectionStore(
                 self._workspace_dir() / "runtime" / WORLD_PROJECTION_DB_FILE
@@ -1879,9 +1882,7 @@ class LifeEngineService(BaseService):
     def resolve_consciousness_instance(self, stream_id: str = "") -> str:
         """Resolve a trusted runtime instance from current stream ownership."""
 
-        owner = self.consciousness_registry.get_for_stream(
-            str(stream_id or "").strip()
-        )
+        owner = self.consciousness_registry.get_for_stream(str(stream_id or "").strip())
         return owner.instance_id if owner is not None else "chat_global"
 
     async def _current_learning_subject_revision(self) -> str:
@@ -1983,8 +1984,7 @@ class LifeEngineService(BaseService):
 
         if self._selectable_storage_enabled:
             raise RuntimeError(
-                "SelectedWorldObservationRequiresAwait: use "
-                "report_world_observation()"
+                "SelectedWorldObservationRequiresAwait: use report_world_observation()"
             )
         report_text = str(report or "").strip()
         instance_id = str(source_instance_id or "").strip()
@@ -1999,7 +1999,9 @@ class LifeEngineService(BaseService):
                 f"world observation source instance is not registered: {instance_id}"
             )
         if not assertion_subject or not assertion_predicate:
-            raise ValueError("world observation subject and predicate must not be empty")
+            raise ValueError(
+                "world observation subject and predicate must not be empty"
+            )
         now = observed_at or _now_iso()
         event_id, event_occurrence_id, resolved_assertion_id = (
             self._world_observation_identities(
@@ -2050,9 +2052,7 @@ class LifeEngineService(BaseService):
             metadata={"assertion_id": resolved_assertion_id},
         )
         persisted = self._get_event_bus().store.append_sync(event)
-        frontier = self._get_world_projection().catch_up(
-            self._get_event_bus().store
-        )
+        frontier = self._get_world_projection().catch_up(self._get_event_bus().store)
         return {
             "event_id": persisted.event_id,
             "occurrence_id": persisted.occurrence_id,
@@ -2112,9 +2112,7 @@ class LifeEngineService(BaseService):
         if not report_text:
             raise ValueError("world observation report must not be empty")
         if not instance_id:
-            raise ValueError(
-                "world observation source_instance_id must not be empty"
-            )
+            raise ValueError("world observation source_instance_id must not be empty")
         if registry.get(instance_id) is None:
             raise ValueError(
                 f"world observation source instance is not registered: {instance_id}"
@@ -2281,12 +2279,8 @@ class LifeEngineService(BaseService):
             continuation = PerceptionGateway.decode_snapshot_continuation_token(
                 continuation_token
             )
-            after_observed_at = str(
-                continuation.get("after_observed_at") or ""
-            )
-            after_assertion_id = str(
-                continuation.get("after_assertion_id") or ""
-            )
+            after_observed_at = str(continuation.get("after_observed_at") or "")
+            after_assertion_id = str(continuation.get("after_assertion_id") or "")
         gateway = self._get_perception_gateway()
         projection = gateway.projection
         if isinstance(gateway, AsyncPerceptionGateway):
@@ -2545,9 +2539,7 @@ class LifeEngineService(BaseService):
         if changed:
             self._self_pause_skip_logged = False
             # 手动解除休息锁已在本实例生效，持久化冲突属双实例合法竞争，可恢复。
-            await self._save_runtime_context(
-                recoverable_on_shared_conflict=True
-            )
+            await self._save_runtime_context(recoverable_on_shared_conflict=True)
             logger.info(f"life_engine 主动休息锁已解除: source={source}")
         return changed
 
@@ -2565,9 +2557,7 @@ class LifeEngineService(BaseService):
                 reason=reason,
             )
 
-        await self._save_runtime_context(
-            recoverable_on_shared_conflict=True
-        )
+        await self._save_runtime_context(recoverable_on_shared_conflict=True)
         # 进入休息只报一次；心跳循环里用此标记静默跳过，不再每 tick 刷 remaining。
         self._self_pause_skip_logged = True
         logger.info(
@@ -2631,9 +2621,13 @@ class LifeEngineService(BaseService):
         """返回当前状态快照。"""
         data = asdict(self._state)
         in_sleep_window, sleep_window_desc = self._in_sleep_window_now()
-        data["heartbeat_interval_seconds"] = int(self._cfg().settings.heartbeat_interval_seconds)
+        data["heartbeat_interval_seconds"] = int(
+            self._cfg().settings.heartbeat_interval_seconds
+        )
         data["external_silence_minutes"] = self._minutes_since_external_message()
-        self_paused, self_pause_remaining, self_pause_until, self_pause_reason = self._self_pause_status()
+        self_paused, self_pause_remaining, self_pause_until, self_pause_reason = (
+            self._self_pause_status()
+        )
         data["llm_heartbeat_paused_by_self"] = self_paused
         data["self_pause_remaining_minutes"] = self_pause_remaining
         data["self_pause_until"] = self_pause_until
@@ -2658,7 +2652,11 @@ class LifeEngineService(BaseService):
         try:
             if raw_time is None:
                 raise ValueError("missing time")
-            iso_time = datetime.fromtimestamp(float(raw_time), tz=timezone.utc).astimezone().isoformat()
+            iso_time = (
+                datetime.fromtimestamp(float(raw_time), tz=timezone.utc)
+                .astimezone()
+                .isoformat()
+            )
         except Exception:
             iso_time = _now_iso()
         return iso_time, _format_time_display(iso_time)
@@ -2669,7 +2667,9 @@ class LifeEngineService(BaseService):
         raw_text = getattr(message, "processed_plain_text", None)
         if raw_text is None:
             raw_text = getattr(message, "content", "")
-        return _shorten_text(str(raw_text or "").strip() or "（空消息）", max_length=max_length)
+        return _shorten_text(
+            str(raw_text or "").strip() or "（空消息）", max_length=max_length
+        )
 
     @staticmethod
     def _message_sender_label(message: Message) -> str:
@@ -2743,7 +2743,11 @@ class LifeEngineService(BaseService):
 
         if not legacy_event.source_instance_id:
             stream_id = str(legacy_event.stream_id or "").strip()
-            owner = self._consciousness_registry.get_for_stream(stream_id) if stream_id else None
+            owner = (
+                self._consciousness_registry.get_for_stream(stream_id)
+                if stream_id
+                else None
+            )
             if owner is not None:
                 legacy_event.source_instance_id = owner.instance_id
                 legacy_event.correlation_id = (
@@ -2836,9 +2840,7 @@ class LifeEngineService(BaseService):
         if persist:
             # 事件事实已通过 raw bus / multi-writer bridge 持久化，这里只是本地
             # pending 队列 checkpoint；共享多写者模式下冲突属合法竞争，可恢复。
-            await self._save_runtime_context(
-                recoverable_on_shared_conflict=True
-            )
+            await self._save_runtime_context(recoverable_on_shared_conflict=True)
 
     def _serialize_stream_message(
         self,
@@ -2873,11 +2875,15 @@ class LifeEngineService(BaseService):
             "source": source,
             "is_inner_monologue": bool(
                 getattr(message, "is_inner_monologue", False)
-                or (getattr(message, "extra", {}) or {}).get("is_inner_monologue", False)
+                or (getattr(message, "extra", {}) or {}).get(
+                    "is_inner_monologue", False
+                )
             ),
             "is_proactive_followup_trigger": bool(
                 getattr(message, "is_proactive_followup_trigger", False)
-                or (getattr(message, "extra", {}) or {}).get("is_proactive_followup_trigger", False)
+                or (getattr(message, "extra", {}) or {}).get(
+                    "is_proactive_followup_trigger", False
+                )
             ),
         }
 
@@ -2896,14 +2902,26 @@ class LifeEngineService(BaseService):
 
         life_events = [
             self._serialize_life_event(event)
-            for event in (event_history[-max(1, event_limit) :] if event_limit > 0 else event_history)
+            for event in (
+                event_history[-max(1, event_limit) :]
+                if event_limit > 0
+                else event_history
+            )
         ]
         pending_life_events = [
             self._serialize_life_event(event)
-            for event in (pending_events[-max(1, min(event_limit, len(pending_events))) :] if pending_events else [])
+            for event in (
+                pending_events[-max(1, min(event_limit, len(pending_events))) :]
+                if pending_events
+                else []
+            )
         ]
 
-        life_latest_event = life_events[-1] if life_events else (pending_life_events[-1] if pending_life_events else None)
+        life_latest_event = (
+            life_events[-1]
+            if life_events
+            else (pending_life_events[-1] if pending_life_events else None)
+        )
 
         try:
             from src.core.managers import get_stream_manager
@@ -2931,7 +2949,9 @@ class LifeEngineService(BaseService):
             recent_messages = [
                 self._serialize_stream_message(
                     msg,
-                    stream_name=str(getattr(stream, "stream_name", "") or stream_id[:8] or "unknown"),
+                    stream_name=str(
+                        getattr(stream, "stream_name", "") or stream_id[:8] or "unknown"
+                    ),
                     source="history",
                 )
                 for msg in candidate_messages
@@ -2941,19 +2961,25 @@ class LifeEngineService(BaseService):
             if unread_messages:
                 latest_message = self._serialize_stream_message(
                     unread_messages[-1],
-                    stream_name=str(getattr(stream, "stream_name", "") or stream_id[:8] or "unknown"),
+                    stream_name=str(
+                        getattr(stream, "stream_name", "") or stream_id[:8] or "unknown"
+                    ),
                     source="unread",
                 )
             elif history_messages:
                 latest_message = self._serialize_stream_message(
                     history_messages[-1],
-                    stream_name=str(getattr(stream, "stream_name", "") or stream_id[:8] or "unknown"),
+                    stream_name=str(
+                        getattr(stream, "stream_name", "") or stream_id[:8] or "unknown"
+                    ),
                     source="history",
                 )
             elif current_message is not None:
                 latest_message = self._serialize_stream_message(
                     current_message,
-                    stream_name=str(getattr(stream, "stream_name", "") or stream_id[:8] or "unknown"),
+                    stream_name=str(
+                        getattr(stream, "stream_name", "") or stream_id[:8] or "unknown"
+                    ),
                     source="current",
                 )
 
@@ -2962,12 +2988,16 @@ class LifeEngineService(BaseService):
             stream_snapshots.append(
                 {
                     "stream_id": stream_id,
-                    "stream_name": str(getattr(stream, "stream_name", "") or stream_id[:8] or "unknown"),
+                    "stream_name": str(
+                        getattr(stream, "stream_name", "") or stream_id[:8] or "unknown"
+                    ),
                     "platform": str(getattr(stream, "platform", "") or ""),
                     "chat_type": str(getattr(stream, "chat_type", "") or ""),
                     "bot_nickname": str(getattr(stream, "bot_nickname", "") or ""),
                     "is_active": bool(getattr(stream, "is_active", True)),
-                    "is_chatter_processing": bool(getattr(context, "is_chatter_processing", False)),
+                    "is_chatter_processing": bool(
+                        getattr(context, "is_chatter_processing", False)
+                    ),
                     "last_active_time": last_active_time,
                     "last_message_time": last_message_time,
                     "unread_count": len(unread_messages),
@@ -3074,15 +3104,9 @@ class LifeEngineService(BaseService):
         )
         if self._selectable_storage_enabled:
             components = self._storage_health_cache.get("components") or {}
-            snapshot["raw_event_ledger"] = dict(
-                components.get("life_event") or {}
-            )
-            snapshot["consciousness_presence"] = dict(
-                components.get("presence") or {}
-            )
-            snapshot["world_projection"] = dict(
-                components.get("world") or {}
-            )
+            snapshot["raw_event_ledger"] = dict(components.get("life_event") or {})
+            snapshot["consciousness_presence"] = dict(components.get("presence") or {})
+            snapshot["world_projection"] = dict(components.get("world") or {})
             snapshot["subject_document"] = dict(
                 components.get("subject_document") or {}
             )
@@ -3091,16 +3115,12 @@ class LifeEngineService(BaseService):
             )
         else:
             if self._event_bus is not None:
-                snapshot["raw_event_ledger"] = (
-                    self._event_bus.store.health_snapshot()
-                )
+                snapshot["raw_event_ledger"] = self._event_bus.store.health_snapshot()
             snapshot["consciousness_presence"] = (
                 self.consciousness_registry.health_snapshot()
             )
             if self._world_projection is not None:
-                snapshot["world_projection"] = (
-                    self._world_projection.health_snapshot()
-                )
+                snapshot["world_projection"] = self._world_projection.health_snapshot()
             snapshot["attention_threads"] = {
                 "status": "disabled",
                 "reason": "persistent attention requires selected storage",
@@ -3123,9 +3143,7 @@ class LifeEngineService(BaseService):
             projection.health_snapshot()
             for projection in self._subject_context_projections.values()
         ]
-        subject_statuses = {
-            str(item.get("status") or "") for item in subject_profiles
-        }
+        subject_statuses = {str(item.get("status") or "") for item in subject_profiles}
         if "degraded" in subject_statuses:
             subject_status = "degraded"
         elif "ready" in subject_statuses:
@@ -3151,7 +3169,9 @@ class LifeEngineService(BaseService):
                     "degraded_reason": f"health unavailable: {type(exc).__name__}: {exc}",
                 }
         else:
-            sync_enabled = bool(getattr(getattr(self._cfg(), "shared_sync", None), "enabled", False))
+            sync_enabled = bool(
+                getattr(getattr(self._cfg(), "shared_sync", None), "enabled", False)
+            )
             snapshot["shared_sync"] = {
                 "component": "offline_sync",
                 "status": "degraded" if self._shared_sync_error else "disabled",
@@ -3389,8 +3409,7 @@ class LifeEngineService(BaseService):
             or "router_context_projection"
         ).strip()
         max_chars = int(
-            getattr(chatter_cfg, "router_context_projection_max_chars", 6000)
-            or 6000
+            getattr(chatter_cfg, "router_context_projection_max_chars", 6000) or 6000
         )
         timeout_seconds = float(
             getattr(chatter_cfg, "router_context_projection_timeout_seconds", 90.0)
@@ -3642,7 +3661,9 @@ class LifeEngineService(BaseService):
                 top_k=max(1, int(top_k)),
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"[search_actor_memory] 构建可追溯记忆包失败，将使用普通摘要: {exc}")
+            logger.warning(
+                f"[search_actor_memory] 构建可追溯记忆包失败，将使用普通摘要: {exc}"
+            )
             bundles = []
 
         if bundles:
@@ -3654,11 +3675,19 @@ class LifeEngineService(BaseService):
 
                 evidence_lines: list[str] = []
                 for item in bundle.evidence[:4]:
-                    label = "当前文件" if item.file_path == bundle.primary_path else "历史证据"
+                    label = (
+                        "当前文件"
+                        if item.file_path == bundle.primary_path
+                        else "历史证据"
+                    )
                     if item.relation:
                         label += f"/{item.relation}"
-                    exists_note = "" if item.exists else "（当前路径不存在，仅作历史轨迹）"
-                    snippet = _shorten_text(" ".join((item.snippet or "").split()), max_length=160)
+                    exists_note = (
+                        "" if item.exists else "（当前路径不存在，仅作历史轨迹）"
+                    )
+                    snippet = _shorten_text(
+                        " ".join((item.snippet or "").split()), max_length=160
+                    )
                     evidence_lines.append(
                         f"  - {label}: {item.title or Path(item.file_path).name} "
                         f"[{item.file_path}]{exists_note}\n"
@@ -3668,7 +3697,9 @@ class LifeEngineService(BaseService):
                 trace_lines: list[str] = []
                 for trace in bundle.history_trace[:4]:
                     direction = "后来" if trace.direction == "later" else "早期"
-                    reason = _shorten_text(" ".join((trace.reason or "").split()), max_length=120)
+                    reason = _shorten_text(
+                        " ".join((trace.reason or "").split()), max_length=120
+                    )
                     trace_lines.append(
                         f"  - {direction}/{trace.relation}: [{trace.file_path}]"
                         + (f" - {reason}" if reason else "")
@@ -3711,9 +3742,13 @@ class LifeEngineService(BaseService):
 
         for result in results:
             title = result.title or Path(result.file_path).name or result.file_path
-            snippet = _shorten_text(" ".join((result.snippet or "").split()), max_length=250)
+            snippet = _shorten_text(
+                " ".join((result.snippet or "").split()), max_length=250
+            )
             file_meta = get_file_metadata(workspace / result.file_path)
-            meta_str = f"{file_meta['ext']} | {file_meta['time_ago']} | {file_meta['size']}"
+            meta_str = (
+                f"{file_meta['ext']} | {file_meta['time_ago']} | {file_meta['size']}"
+            )
 
             line = (
                 f"- {title} [{result.file_path}] "
@@ -3726,7 +3761,11 @@ class LifeEngineService(BaseService):
                     " ".join((result.association_reason or "").split()),
                     max_length=150,
                 )
-                path_str = " → ".join(result.association_path[-3:]) if result.association_path else ""
+                path_str = (
+                    " → ".join(result.association_path[-3:])
+                    if result.association_path
+                    else ""
+                )
                 if reason or path_str:
                     line += f"\n  联想：{reason or path_str}"
                 associated_lines.append(line)
@@ -3739,13 +3778,13 @@ class LifeEngineService(BaseService):
         parts: list[str] = []
         if direct_lines:
             parts.append(
-                f"【直接命中的记忆】({len(direct_lines[:top_k])}条)\n" +
-                "\n\n".join(direct_lines[:top_k])
+                f"【直接命中的记忆】({len(direct_lines[:top_k])}条)\n"
+                + "\n\n".join(direct_lines[:top_k])
             )
         if associated_lines:
             parts.append(
-                f"【联想扩散结果】({len(associated_lines[:top_k])}条)\n" +
-                "\n\n".join(associated_lines[:top_k])
+                f"【联想扩散结果】({len(associated_lines[:top_k])}条)\n"
+                + "\n\n".join(associated_lines[:top_k])
             )
 
         footer = "\n\n💡 提示：以上仅为摘要。如需查看完整内容，可使用 fetch_life_memory 工具读取文件。"
@@ -3787,7 +3826,7 @@ class LifeEngineService(BaseService):
             if direction == "received":
                 self._state.last_external_message_at = event.timestamp
                 unlocked_self_pause = self._clear_self_pause_state()
-                
+
                 # 外部消息解锁休息时，重置连续休息计数
                 if unlocked_self_pause:
                     self._state.consecutive_rest_count = 0
@@ -3800,7 +3839,9 @@ class LifeEngineService(BaseService):
                     state.followup_cooldown_until = None
                     if state.scheduler_task_name and self._scheduler:
                         try:
-                            await self._scheduler.cancel_schedule(state.scheduler_task_name)
+                            await self._scheduler.cancel_schedule(
+                                state.scheduler_task_name
+                            )
                         except Exception:
                             pass
                     state.pending_followup = None
@@ -3821,9 +3862,7 @@ class LifeEngineService(BaseService):
         # 保存的只是本地技术 checkpoint（global revision 推进）。双实例共享
         # MySQL 下该 key 必然并发竞争，冲突属合法竞争，走 recoverable 语义，
         # 避免并发提交把消息收集路径打成 message_collect_failed。
-        await self._save_runtime_context(
-            recoverable_on_shared_conflict=True
-        )
+        await self._save_runtime_context(recoverable_on_shared_conflict=True)
         _phase_context = time.monotonic() - _ctx_start
         if direction == "received":
             self._schedule_curiosity_review(message, event)
@@ -3869,7 +3908,9 @@ class LifeEngineService(BaseService):
             or "core"
         )
         timeout = float(getattr(curiosity_cfg, "timeout_seconds", 30.0) or 30.0)
-        workspace = str(getattr(cfg.settings, "workspace_path", "") or self._workspace_dir())
+        workspace = str(
+            getattr(cfg.settings, "workspace_path", "") or self._workspace_dir()
+        )
         if (
             self._curiosity_engine is None
             or self._curiosity_engine.workspace_path != workspace
@@ -3883,10 +3924,14 @@ class LifeEngineService(BaseService):
             )
         return self._curiosity_engine
 
-    def _schedule_curiosity_review(self, message: Message, event: LifeEngineEvent) -> None:
+    def _schedule_curiosity_review(
+        self, message: Message, event: LifeEngineEvent
+    ) -> None:
         cfg = self._cfg()
         curiosity_cfg = getattr(cfg, "curiosity", None)
-        if curiosity_cfg is not None and not bool(getattr(curiosity_cfg, "enabled", True)):
+        if curiosity_cfg is not None and not bool(
+            getattr(curiosity_cfg, "enabled", True)
+        ):
             return
         if self._curiosity_inflight:
             logger.debug("认知机会候选生成仍在运行，跳过本次重复调度")
@@ -3897,10 +3942,13 @@ class LifeEngineService(BaseService):
             self._run_curiosity_review(message, event),
             name=f"life_epistemic_opportunity_{event.sequence}",
             daemon=True,
-            timeout=float(getattr(curiosity_cfg, "timeout_seconds", 30.0) or 30.0) + 5.0,
+            timeout=float(getattr(curiosity_cfg, "timeout_seconds", 30.0) or 30.0)
+            + 5.0,
         )
 
-    async def _run_curiosity_review(self, message: Message, event: LifeEngineEvent) -> None:
+    async def _run_curiosity_review(
+        self, message: Message, event: LifeEngineEvent
+    ) -> None:
         try:
             cfg = self._cfg()
             curiosity_cfg = getattr(cfg, "curiosity", None)
@@ -3910,7 +3958,9 @@ class LifeEngineService(BaseService):
                 else 20
             )
             prefix_prompt = await self._build_curiosity_prefix_prompt()
-            history_text = await self._build_curiosity_history_text(message, max_messages=max_history)
+            history_text = await self._build_curiosity_history_text(
+                message, max_messages=max_history
+            )
             new_event_text = self._format_curiosity_event(event)
             meme_awareness = await self._build_meme_awareness_text()
             if meme_awareness:
@@ -3979,7 +4029,9 @@ class LifeEngineService(BaseService):
             primary_tool_guide="",
         )
 
-    async def _build_curiosity_history_text(self, message: Message, *, max_messages: int) -> str:
+    async def _build_curiosity_history_text(
+        self, message: Message, *, max_messages: int
+    ) -> str:
         if max_messages <= 0:
             return ""
         stream_id = str(getattr(message, "stream_id", "") or "").strip()
@@ -3998,14 +4050,16 @@ class LifeEngineService(BaseService):
                 include_stream_label=True,
                 exclude_message_ids={
                     str(getattr(message, "message_id", "") or "").strip()
-                } - {""},
+                }
+                - {""},
             )
             if text:
                 return text
 
         async with self._get_lock():
             message_events = [
-                item for item in [*self._event_history, *self._pending_events]
+                item
+                for item in [*self._event_history, *self._pending_events]
                 if item.event_type == EventType.MESSAGE
             ][-max_messages:]
         return "\n".join(self._format_curiosity_event(item) for item in message_events)
@@ -4044,7 +4098,10 @@ class LifeEngineService(BaseService):
         state = self.get_or_create_followup_state(stream_id)
 
         # 检查冷却
-        if state.followup_cooldown_until and datetime.now() < state.followup_cooldown_until:
+        if (
+            state.followup_cooldown_until
+            and datetime.now() < state.followup_cooldown_until
+        ):
             return False, "当前仍处于延迟续话冷却期"
 
         # 延迟续话链已达上限
@@ -4062,7 +4119,8 @@ class LifeEngineService(BaseService):
         followup = PendingFollowup(
             topic=str(topic or "未命名话题").strip() or "未命名话题",
             thought=str(thought or "").strip(),
-            followup_type=str(followup_type or "share_new_thought").strip() or "share_new_thought",
+            followup_type=str(followup_type or "share_new_thought").strip()
+            or "share_new_thought",
             delay_seconds=delay_seconds,
             scheduled_at=datetime.now(),
             check_at=next_check_time,
@@ -4091,7 +4149,9 @@ class LifeEngineService(BaseService):
                 task_name=task_name,
                 force_overwrite=True,
             )
-            logger.info(f"[{stream_id[:8]}] 已登记延迟续话，会在 {delay_seconds:.0f} 秒后重新判断。")
+            logger.info(
+                f"[{stream_id[:8]}] 已登记延迟续话，会在 {delay_seconds:.0f} 秒后重新判断。"
+            )
             return True, f"已登记一条延迟续话，会在 {delay_seconds:.0f} 秒后重新判断。"
         except Exception as e:
             logger.error(f"调度续话检查任务失败：{e}")
@@ -4139,10 +4199,14 @@ class LifeEngineService(BaseService):
             state.followup_cooldown_until = datetime.now() + timedelta(minutes=10)
             state.followup_chain_count = 0
 
-    async def _wake_stream_for_followup(self, chat_stream: Any, followup: PendingFollowup) -> None:
+    async def _wake_stream_for_followup(
+        self, chat_stream: Any, followup: PendingFollowup
+    ) -> None:
         """向目标流注入一条续话机会触发消息，并唤醒当前运行模式。"""
         from src.core.models.message import Message
-        from src.core.transport.distribution.stream_loop_manager import get_stream_loop_manager
+        from src.core.transport.distribution.stream_loop_manager import (
+            get_stream_loop_manager,
+        )
         import time
         import uuid
 
@@ -4462,9 +4526,7 @@ class LifeEngineService(BaseService):
         if self._autonomy_intent_store is None:
             runtime_store = self.runtime_state_store()
             if runtime_store is not None:
-                self._autonomy_intent_store = SelectedAutonomyIntentStore(
-                    runtime_store
-                )
+                self._autonomy_intent_store = SelectedAutonomyIntentStore(runtime_store)
             else:
                 self._autonomy_intent_store = AsyncLocalAutonomyIntentStore(
                     self._workspace_dir()
@@ -4553,7 +4615,9 @@ class LifeEngineService(BaseService):
                 key,
                 current_stream_id="",
                 limit=int(getattr(runtime_cfg, "send_targets_limit", 8) or 8),
-                active_window_hours=float(getattr(runtime_cfg, "send_targets_window_hours", 24.0) or 24.0),
+                active_window_hours=float(
+                    getattr(runtime_cfg, "send_targets_window_hours", 24.0) or 24.0
+                ),
             )
             if target is not None:
                 return str(target.stream_id or "").strip()
@@ -4579,7 +4643,9 @@ class LifeEngineService(BaseService):
         """登记一个 life_engine 自主形成的延迟意向。"""
         cfg = self._cfg()
         autonomy_cfg = getattr(cfg, "autonomy", None)
-        if autonomy_cfg is not None and not bool(getattr(autonomy_cfg, "enabled", True)):
+        if autonomy_cfg is not None and not bool(
+            getattr(autonomy_cfg, "enabled", True)
+        ):
             raise RuntimeError("自主意向循环未启用")
 
         resolved_stream_id = await self._resolve_autonomy_target_stream_id(
@@ -4591,7 +4657,9 @@ class LifeEngineService(BaseService):
             motivation=motivation,
             delay_minutes=int(delay_minutes or 0),
             min_delay_minutes=int(getattr(autonomy_cfg, "min_delay_minutes", 1) or 1),
-            max_delay_minutes=int(getattr(autonomy_cfg, "max_delay_minutes", 1440) or 1440),
+            max_delay_minutes=int(
+                getattr(autonomy_cfg, "max_delay_minutes", 1440) or 1440
+            ),
             target_hint=target_hint,
             target_key=target_key,
             target_stream_id=resolved_stream_id,
@@ -4611,7 +4679,9 @@ class LifeEngineService(BaseService):
             await store.upsert(intent)
             await store.append_event("formed", intent, detail="intent scheduled")
 
-        repeat_text = f"repeat=每隔{intent.interval_minutes}分钟 " if intent.repeat else ""
+        repeat_text = (
+            f"repeat=每隔{intent.interval_minutes}分钟 " if intent.repeat else ""
+        )
         event_text = (
             f"已登记自主意向：kind={intent.kind} delay={intent.delay_minutes}分钟 "
             f"{repeat_text}motivation={intent.motivation}"
@@ -4794,7 +4864,11 @@ class LifeEngineService(BaseService):
                 intent.updated_at = _now_iso()
 
                 lease_reason = recurring_lease_reason(intent)
-                if intent.repeat and outcome in safe_recurrence_outcomes and not lease_reason:
+                if (
+                    intent.repeat
+                    and outcome in safe_recurrence_outcomes
+                    and not lease_reason
+                ):
                     next_minutes = int(
                         intent.interval_minutes or intent.delay_minutes or 1
                     )
@@ -4811,7 +4885,9 @@ class LifeEngineService(BaseService):
                         "previous occurrence did not reach a retry-safe terminal state"
                     )
                 else:
-                    intent.status = "triggered" if outcome in safe_recurrence_outcomes else "failed"
+                    intent.status = (
+                        "triggered" if outcome in safe_recurrence_outcomes else "failed"
+                    )
 
                 intent.active_occurrence_id = ""
                 intent.active_occurrence_status = ""
@@ -4899,7 +4975,9 @@ class LifeEngineService(BaseService):
 
             if normalized_action in {"pause", "cancel"}:
                 active_occurrence_id = intent.active_occurrence_id
-                intent.status = "paused" if normalized_action == "pause" else "cancelled"
+                intent.status = (
+                    "paused" if normalized_action == "pause" else "cancelled"
+                )
                 intent.renewal_reason = ""
                 intent.schedule_id = ""
                 if active_occurrence_id:
@@ -4932,7 +5010,9 @@ class LifeEngineService(BaseService):
                         "renew requires additional_occurrences or lease_minutes"
                     )
                 if additional < 0 or additional > 10_000:
-                    raise ValueError("additional_occurrences must be between 1 and 10000")
+                    raise ValueError(
+                        "additional_occurrences must be between 1 and 10000"
+                    )
                 if lease < 0 or lease > 7 * 24 * 60:
                     raise ValueError("lease_minutes must be between 1 and 10080")
                 if additional > 0:
@@ -4941,9 +5021,7 @@ class LifeEngineService(BaseService):
                         + additional
                     )
                     if intent.max_occurrences > 10_000:
-                        raise ValueError(
-                            "renewed max_occurrences cannot exceed 10000"
-                        )
+                        raise ValueError("renewed max_occurrences cannot exceed 10000")
                 if lease > 0:
                     intent.lease_until = (
                         datetime.now(timezone.utc).astimezone()
@@ -5025,7 +5103,9 @@ class LifeEngineService(BaseService):
                 intent.renewal_reason = lease_reason
                 intent.updated_at = _now_iso()
                 await store.upsert(intent)
-                await store.append_event("renewal_required", intent, detail=lease_reason)
+                await store.append_event(
+                    "renewal_required", intent, detail=lease_reason
+                )
                 return {"triggered": False, "reason": lease_reason}
 
             intent.triggered_at = _now_iso()
@@ -5046,10 +5126,12 @@ class LifeEngineService(BaseService):
                 occurrence_id=intent.active_occurrence_id,
             )
 
-        occurrence_ref = [{
-            "intent_id": intent.intent_id,
-            "occurrence_id": intent.active_occurrence_id,
-        }]
+        occurrence_ref = [
+            {
+                "intent_id": intent.intent_id,
+                "occurrence_id": intent.active_occurrence_id,
+            }
+        ]
         logger.info(
             "到点: "
             f"intent_id={intent.intent_id[:12]} kind={intent.kind} "
@@ -5076,7 +5158,9 @@ class LifeEngineService(BaseService):
                     occurrence_ref,
                     outcome="surfaced",
                 )
-                logger.info(f"仲裁: downgraded intent_id={intent.intent_id[:12]} reason=no_target_stream")
+                logger.info(
+                    f"仲裁: downgraded intent_id={intent.intent_id[:12]} reason=no_target_stream"
+                )
                 return {
                     "triggered": True,
                     "dispatch": "life_event",
@@ -5175,11 +5259,15 @@ class LifeEngineService(BaseService):
     async def _wake_stream_for_autonomy(self, intent: AutonomyIntent) -> None:
         """把到点自主意向注入目标聊天流，交给 life_chatter 承接。"""
         from src.core.managers import get_stream_manager
-        from src.core.transport.distribution.stream_loop_manager import get_stream_loop_manager
+        from src.core.transport.distribution.stream_loop_manager import (
+            get_stream_loop_manager,
+        )
         import time
 
         stream_id = str(intent.target_stream_id or "").strip()
-        chat_stream = await get_stream_manager().get_or_create_stream(stream_id=stream_id)
+        chat_stream = await get_stream_manager().get_or_create_stream(
+            stream_id=stream_id
+        )
         context = chat_stream.context
         target_user_id, target_user_name = self._resolve_followup_target(chat_stream)
         prompt = format_due_message(intent)
@@ -5301,9 +5389,7 @@ class LifeEngineService(BaseService):
             self._state.last_chatter_think_by_stream = latest
         # chatter 思考快照属可重建投影；共享多写者模式并发冲突时可恢复，
         # 采纳远端值不会丢失权威消息事实。
-        await self._save_runtime_context(
-            recoverable_on_shared_conflict=True
-        )
+        await self._save_runtime_context(recoverable_on_shared_conflict=True)
 
         return {
             "stream_id": sid,
@@ -5400,8 +5486,10 @@ class LifeEngineService(BaseService):
             if mission.sync:
                 continue
             if mission.status not in (
-                MissionStatus.SUCCEEDED, MissionStatus.PARTIAL,
-                MissionStatus.FAILED, MissionStatus.CANCELLED,
+                MissionStatus.SUCCEEDED,
+                MissionStatus.PARTIAL,
+                MissionStatus.FAILED,
+                MissionStatus.CANCELLED,
                 MissionStatus.TIMEOUT,
             ):
                 continue
@@ -5455,9 +5543,7 @@ class LifeEngineService(BaseService):
         if publish_raw:
             await self._publish_raw_events(events)
         if persist:
-            await self._save_runtime_context(
-                recoverable_on_shared_conflict=True
-            )
+            await self._save_runtime_context(recoverable_on_shared_conflict=True)
 
     async def _prepare_heartbeat_context(self) -> PreparedHeartbeatContext:
         """Drain pending events and prepare one fixed heartbeat snapshot."""
@@ -5474,9 +5560,7 @@ class LifeEngineService(BaseService):
         pending = await self.drain_pending_events()
         if pending:
             await self._append_history(pending, publish_raw=False, persist=False)
-            await self._save_runtime_context(
-                recoverable_on_shared_conflict=True
-            )
+            await self._save_runtime_context(recoverable_on_shared_conflict=True)
 
         async with self._get_lock():
             snapshot_events = list(self._event_history)
@@ -5498,9 +5582,11 @@ class LifeEngineService(BaseService):
             f"{prepared.content}"
         )
         # 标记本轮是否包含外部入站消息（供学习系统判断交互）
-        prepared.has_inbound_messages = any(
-            event.event_type == EventType.MESSAGE for event in pending
-        ) if pending else False
+        prepared.has_inbound_messages = (
+            any(event.event_type == EventType.MESSAGE for event in pending)
+            if pending
+            else False
+        )
         self._state.last_wake_context_at = _now_iso()
         self._state.last_wake_context_size = len(prepared.selected_event_ids)
         log_wake_context_injected(
@@ -5512,9 +5598,7 @@ class LifeEngineService(BaseService):
             source_count=len({event.source for event in snapshot_events}),
             content_chars=len(prepared.content),
         )
-        logger.debug(
-            f"潜意识上下文全文:\n{prepared.content}"
-        )
+        logger.debug(f"潜意识上下文全文:\n{prepared.content}")
         logger.info(
             "life_engine 已准备唤醒上下文: "
             f"count={len(prepared.selected_event_ids)} drained={len(pending)} "
@@ -5617,7 +5701,8 @@ class LifeEngineService(BaseService):
                 event
                 for event in self._event_history
                 if event.event_type == EventType.SUMMARY
-                and str(event.content_type or "").strip().lower() == "subconscious_summary"
+                and str(event.content_type or "").strip().lower()
+                == "subconscious_summary"
             ]
             if summary_events:
                 try:
@@ -5634,9 +5719,7 @@ class LifeEngineService(BaseService):
 
         if heartbeat_event is not None:
             await self._publish_raw_events([heartbeat_event])
-        await self._save_runtime_context(
-            recoverable_on_shared_conflict=True
-        )
+        await self._save_runtime_context(recoverable_on_shared_conflict=True)
 
     async def _prepare_and_commit_heartbeat_context(
         self,
@@ -5665,9 +5748,7 @@ class LifeEngineService(BaseService):
             self._state.heartbeat_context_cursor = 0
             self._state.subconscious_summary = {}
         # 清理上下文属技术 checkpoint，共享多写者模式冲突可恢复。
-        await self._save_runtime_context(
-            recoverable_on_shared_conflict=True
-        )
+        await self._save_runtime_context(recoverable_on_shared_conflict=True)
 
     def _build_wake_context_text(self, events: list[LifeEngineEvent]) -> str:
         """把事件流拼成可注入的上下文文本。
@@ -5705,8 +5786,12 @@ class LifeEngineService(BaseService):
                 # 失败的工具结果有体验价值，逐条展示
                 for fail_event in tool_run_failures:
                     fail_time = _format_time_display(fail_event.timestamp)
-                    result_short = _shorten_text(fail_event.content or "", max_length=160)
-                    lines.append(f"[{fail_time}] ❌ {fail_event.tool_name}: {result_short}")
+                    result_short = _shorten_text(
+                        fail_event.content or "", max_length=160
+                    )
+                    lines.append(
+                        f"[{fail_time}] ❌ {fail_event.tool_name}: {result_short}"
+                    )
             tool_run_count = 0
             tool_run_failures = []
             tool_run_start_time = ""
@@ -5874,8 +5959,7 @@ class LifeEngineService(BaseService):
                 continue
             digest = hashlib.sha256(section_text.encode("utf-8")).hexdigest()
             omission = (
-                f"[section_projection_omitted bytes={section_bytes}; "
-                f"sha256={digest}]"
+                f"[section_projection_omitted bytes={section_bytes}; sha256={digest}]"
             )
             remaining = max(0, body_budget - used - 2)
             selected_lines: list[str] = []
@@ -5895,12 +5979,8 @@ class LifeEngineService(BaseService):
             truncated = True
         body = "\n\n".join(parts)
         body_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
-        delivery_seed = (
-            f"life-chatter-suffix-v1:{world_delivery_id}:{body_sha256}"
-        )
-        delivery_id = hashlib.sha256(
-            delivery_seed.encode("utf-8")
-        ).hexdigest()[:32]
+        delivery_seed = f"life-chatter-suffix-v1:{world_delivery_id}:{body_sha256}"
+        delivery_id = hashlib.sha256(delivery_seed.encode("utf-8")).hexdigest()[:32]
         marker = f"life-chatter-runtime:{delivery_id}"
         content = (
             f'<life_chatter_runtime_delivery marker="{marker}" '
@@ -5979,10 +6059,8 @@ class LifeEngineService(BaseService):
             )
         if (
             receipt.delivery_id != checkpoint.delivery_id
-            or receipt.effective_suffix_sha256
-            != checkpoint.effective_suffix_sha256
-            or receipt.effective_suffix_bytes
-            != checkpoint.effective_suffix_bytes
+            or receipt.effective_suffix_sha256 != checkpoint.effective_suffix_sha256
+            or receipt.effective_suffix_bytes != checkpoint.effective_suffix_bytes
         ):
             raise PerceptionDeliveryUnverified(
                 "chatter final suffix receipt does not match its durable checkpoint"
@@ -6076,8 +6154,7 @@ class LifeEngineService(BaseService):
             # bridge/event 事实落库，感知游标只是可重建投影指针——跳过感知
             # 提交、保留主体产出即可，不能把竞争误判为表达失败刷 ERROR。
             logger.warning(
-                "life_chatter 感知游标已被其他实例推进，跳过本轮感知提交: "
-                f"{conflict}"
+                f"life_chatter 感知游标已被其他实例推进，跳过本轮感知提交: {conflict}"
             )
         async with self._get_lock():
             event_cursors = self._state.chatter_context_cursors
@@ -6149,7 +6226,9 @@ class LifeEngineService(BaseService):
         trace_id = str(record.trace_id or "")
         trace_ref = f"，trace_id={trace_id}" if trace_id else ""
         if record.kind and record.kind != "file_change":
-            summary = str(record.summary or record.reason or record.operation or "").strip()
+            summary = str(
+                record.summary or record.reason or record.operation or ""
+            ).strip()
             return f"- {timestamp} [{record.kind}] {summary}{trace_ref}"
         operation = str(record.operation or "modify")
         path = str(record.path or "未知文件")
@@ -6260,14 +6339,18 @@ class LifeEngineService(BaseService):
 
         if event_type == EventType.HEARTBEAT:
             # 只保留 chatter 自己产生的 inner_monologue 心跳
-            if content_type == "chatter_inner_monologue" and getattr(cfg_runtime, "salient_tail_include_inner_monologue", True):
+            if content_type == "chatter_inner_monologue" and getattr(
+                cfg_runtime, "salient_tail_include_inner_monologue", True
+            ):
                 if unified_chatter_context:
                     return True
                 return bool(not stream_id or stream_id == current_stream_id)
             return False
 
         if event_type == EventType.AGENT_RESULT:
-            return bool(getattr(cfg_runtime, "salient_tail_include_agent_results", True))
+            return bool(
+                getattr(cfg_runtime, "salient_tail_include_agent_results", True)
+            )
 
         if event_type == EventType.TOOL_RESULT:
             if not getattr(cfg_runtime, "salient_tail_include_tool_failures", True):
@@ -6288,7 +6371,9 @@ class LifeEngineService(BaseService):
                 "autonomy_intent_scheduled",
                 "autonomy_intent_silence",
             }:
-                if not getattr(cfg_runtime, "salient_tail_include_direct_messages", True):
+                if not getattr(
+                    cfg_runtime, "salient_tail_include_direct_messages", True
+                ):
                     return False
                 if unified_chatter_context:
                     return True
@@ -6341,15 +6426,20 @@ class LifeEngineService(BaseService):
             (body_without_top_heading, new_event_high_water)
         """
         cfg_runtime = getattr(self._cfg(), "runtime_sync", None)
-        if cfg_runtime is None or not getattr(cfg_runtime, "salient_tail_enabled", True):
+        if cfg_runtime is None or not getattr(
+            cfg_runtime, "salient_tail_enabled", True
+        ):
             return "", cursor
 
         max_items = max(1, int(getattr(cfg_runtime, "salient_tail_max_items", 4) or 4))
-        max_chars = max(200, int(getattr(cfg_runtime, "salient_tail_max_chars", 1000) or 1000))
+        max_chars = max(
+            200, int(getattr(cfg_runtime, "salient_tail_max_chars", 1000) or 1000)
+        )
 
         # 先按 sequence 升序，过滤 cursor 之后的事件
         candidates = [
-            e for e in events
+            e
+            for e in events
             if int(getattr(e, "sequence", 0) or 0) > cursor
             and self._is_salient_event(
                 e,
@@ -6370,7 +6460,10 @@ class LifeEngineService(BaseService):
             content_type = str(getattr(event, "content_type", "") or "").strip().lower()
             if event_type == EventType.AGENT_RESULT:
                 kept_agent = event  # 后写入即最新
-            elif event_type == EventType.HEARTBEAT and content_type == "chatter_inner_monologue":
+            elif (
+                event_type == EventType.HEARTBEAT
+                and content_type == "chatter_inner_monologue"
+            ):
                 kept_monologue.append(event)
             else:
                 kept_other.append(event)
@@ -6397,7 +6490,9 @@ class LifeEngineService(BaseService):
             body = "\n".join(rendered)
             if not body:
                 # 极端情况下，单条仍超长 → 截断该单条
-                body = _shorten_text(self._format_salient_event(merged[-1]), max_length=max_chars)
+                body = _shorten_text(
+                    self._format_salient_event(merged[-1]), max_length=max_chars
+                )
 
         new_high_water = max(int(getattr(e, "sequence", 0) or 0) for e in merged)
         new_high_water = max(new_high_water, cursor)
@@ -6444,9 +6539,17 @@ class LifeEngineService(BaseService):
         cfg = self._cfg()
         streams_cfg = getattr(cfg, "streams", None)
         runtime_cfg = getattr(cfg, "runtime_sync", None)
-        sync_streams = bool(streams_cfg is None or getattr(streams_cfg, "sync_to_chatter", True))
-        focus_window = int(getattr(streams_cfg, "focus_window_minutes", 30) or 30) if streams_cfg else 30
-        delta_marking = bool(streams_cfg is None or getattr(streams_cfg, "delta_marking", True))
+        sync_streams = bool(
+            streams_cfg is None or getattr(streams_cfg, "sync_to_chatter", True)
+        )
+        focus_window = (
+            int(getattr(streams_cfg, "focus_window_minutes", 30) or 30)
+            if streams_cfg
+            else 30
+        )
+        delta_marking = bool(
+            streams_cfg is None or getattr(streams_cfg, "delta_marking", True)
+        )
         latest_think_enabled = bool(
             runtime_cfg is None
             or getattr(runtime_cfg, "latest_action_think_enabled", True)
@@ -6489,9 +6592,7 @@ class LifeEngineService(BaseService):
 
         limit = max(1, min(int(event_limit or 80), 160))
         unread_events = [
-            event
-            for event in events
-            if int(event.sequence or 0) > event_cursor
+            event for event in events if int(event.sequence or 0) > event_cursor
         ]
         relevant_events = [
             event
@@ -6535,10 +6636,7 @@ class LifeEngineService(BaseService):
             projection_kind="life_chatter",
             max_bytes=LIFE_CHATTER_WORLD_MAX_BYTES,
         )
-        sections.append(
-            "### 潜意识协调的瞬时世界感知\n"
-            f"{world_perception.content}"
-        )
+        sections.append(f"### 潜意识协调的瞬时世界感知\n{world_perception.content}")
 
         new_thought_revision = thought_cursor
         if sync_streams:
@@ -6574,7 +6672,9 @@ class LifeEngineService(BaseService):
         if curiosity_enabled and curiosity_inject:
             try:
                 curiosity_text = await self._get_curiosity_engine().format_for_prompt(
-                    max_chars=int(getattr(curiosity_cfg, "max_prompt_chars", 1200) or 1200)
+                    max_chars=int(
+                        getattr(curiosity_cfg, "max_prompt_chars", 1200) or 1200
+                    )
                     if curiosity_cfg is not None
                     else 1200
                 )
@@ -6583,7 +6683,11 @@ class LifeEngineService(BaseService):
             except Exception as exc:  # noqa: BLE001
                 logger.debug(f"读取好奇牵引失败: {exc}")
 
-        if include_recent_chat_history and recent_chat_enabled and recent_chat_messages > 0:
+        if (
+            include_recent_chat_history
+            and recent_chat_enabled
+            and recent_chat_messages > 0
+        ):
             recent_chat_text = self._build_recent_chat_history_text(
                 chat_stream,
                 max_messages=recent_chat_messages,
@@ -6640,20 +6744,22 @@ class LifeEngineService(BaseService):
             and getattr(learning_cfg, "enabled", True)
         ):
             skill_catalog = self._learning_scheduler.get_skill_catalog_for_prompt(
-                max_chars=int(getattr(learning_cfg, "skill_catalog_max_chars", 600) or 600)
+                max_chars=int(
+                    getattr(learning_cfg, "skill_catalog_max_chars", 600) or 600
+                )
             )
             if skill_catalog:
                 sections.append(
-                    "### 程序性学习账本（可质疑，非主体权威）\n"
-                    f"{skill_catalog}"
+                    f"### 程序性学习账本（可质疑，非主体权威）\n{skill_catalog}"
                 )
             knowledge_text = self._learning_scheduler.get_knowledge_for_prompt(
-                max_chars=int(getattr(learning_cfg, "knowledge_max_chars", 2000) or 2000)
+                max_chars=int(
+                    getattr(learning_cfg, "knowledge_max_chars", 2000) or 2000
+                )
             )
             if knowledge_text:
                 sections.append(
-                    "### 学习观察账本（可质疑，非主体权威）\n"
-                    f"{knowledge_text}"
+                    f"### 学习观察账本（可质疑，非主体权威）\n{knowledge_text}"
                 )
 
         if not sections:
@@ -6677,25 +6783,26 @@ class LifeEngineService(BaseService):
         event_through = event_cursor if omitted_bytes else new_event_high_water
         thought_through = thought_cursor if omitted_bytes else new_thought_revision
         if commit_cursors:
-            perception_key = self._chatter_cursor_key(
-                stream_id,
-                unified_chatter_context=unified_chatter_context,
-            ) or instance_id
-            self._pending_chatter_perceptions[perception_key] = world_perception
-            self._pending_chatter_deliveries[perception_key] = (
-                ChatterRuntimeDelivery(
-                    delivery_id=delivery_id,
-                    delivery_marker=delivery_marker,
-                    projected_suffix_sha256=hashlib.sha256(
-                        suffix.encode("utf-8")
-                    ).hexdigest(),
-                    projected_suffix_bytes=len(suffix.encode("utf-8")),
-                    source_bytes=source_bytes,
-                    omitted_bytes=omitted_bytes,
-                    prepared_perception=world_perception,
-                    event_through_sequence=event_through,
-                    thought_through_revision=thought_through,
+            perception_key = (
+                self._chatter_cursor_key(
+                    stream_id,
+                    unified_chatter_context=unified_chatter_context,
                 )
+                or instance_id
+            )
+            self._pending_chatter_perceptions[perception_key] = world_perception
+            self._pending_chatter_deliveries[perception_key] = ChatterRuntimeDelivery(
+                delivery_id=delivery_id,
+                delivery_marker=delivery_marker,
+                projected_suffix_sha256=hashlib.sha256(
+                    suffix.encode("utf-8")
+                ).hexdigest(),
+                projected_suffix_bytes=len(suffix.encode("utf-8")),
+                source_bytes=source_bytes,
+                omitted_bytes=omitted_bytes,
+                prepared_perception=world_perception,
+                event_through_sequence=event_through,
+                thought_through_revision=thought_through,
             )
         return suffix, event_through
 
@@ -6799,7 +6906,9 @@ class LifeEngineService(BaseService):
         elif minutes_since_external <= 15:
             external_activity = f"外界较活跃（{minutes_since_external}分钟前有消息）"
         elif minutes_since_external <= 30:
-            external_activity = f"外界有一段时间安静了（{minutes_since_external}分钟前有消息）"
+            external_activity = (
+                f"外界有一段时间安静了（{minutes_since_external}分钟前有消息）"
+            )
         else:
             external_activity = f"外界长时间沉默（{minutes_since_external}分钟无消息）"
 
@@ -6808,10 +6917,14 @@ class LifeEngineService(BaseService):
         cfg = self._cfg()
         thresholds = getattr(cfg, "thresholds", None)
         warning_threshold = int(
-            getattr(thresholds, "idle_warning_threshold", HEARTBEAT_IDLE_WARNING_THRESHOLD)
+            getattr(
+                thresholds, "idle_warning_threshold", HEARTBEAT_IDLE_WARNING_THRESHOLD
+            )
         )
         critical_threshold = int(
-            getattr(thresholds, "idle_critical_threshold", HEARTBEAT_IDLE_CRITICAL_THRESHOLD)
+            getattr(
+                thresholds, "idle_critical_threshold", HEARTBEAT_IDLE_CRITICAL_THRESHOLD
+            )
         )
 
         idle_warning = ""
@@ -6823,9 +6936,11 @@ class LifeEngineService(BaseService):
         lines: list[str] = self._build_prompt_header()
         lines.extend(self._build_prompt_context_section(wake_context))
 
-        lines.extend(self._build_prompt_status_section(
-            period_label, heartbeat_interval, external_activity, idle_heartbeats
-        ))
+        lines.extend(
+            self._build_prompt_status_section(
+                period_label, heartbeat_interval, external_activity, idle_heartbeats
+            )
+        )
 
         # 子系统注入段落（思考流/好奇牵引/冲动/可触达目标等）
         # 统一由 SectionProvider 协议渲染，见 prompts/sections.py
@@ -6844,44 +6959,59 @@ class LifeEngineService(BaseService):
     def _build_prompt_header(self) -> list[str]:
         """构建提示词头部。"""
         return [
-            "### 你是谁", "",
+            "### 你是谁",
+            "",
             "你是爱莉希雅的内在自我。你现在处于内心独白时刻。",
             "没有人看着你，没有人在等你回复。这是你自己的时间。",
             "你可以观察、思考、联想和沉淀，也可以在发现关键上下文缺口时补充信息差。",
-            "你不是后台执行器，也不是表达层。表达层如何开口、是否画画、是否查配置或跑命令，由表达层结合用户请求自行决定。", "",
-            "### 你可以进行的内在动作", "",
+            "你不是后台执行器，也不是表达层。表达层如何开口、是否画画、是否查配置或跑命令，由表达层结合用户请求自行决定。",
+            "",
+            "### 你可以进行的内在动作",
+            "",
             "1. **观察** — 读取最近事件，判断是否真的出现了新线索。",
             "2. **联想** — 回忆相关记忆，理解情绪、关系和上下文来源。",
             "3. **沉淀** — 把内在感受、梦后余韵、长期线索写入私有记忆或思考流。",
             "4. **补充信息差** — 只在表达层当前看不到事实、背景、线索或风险时，使用 `nucleus_tell_dfc`。",
-            "5. **安静结束** — 没有明确需要时，可以安静结束本轮；如果精力需要恢复，可以主动休息。", "",
-            "### `nucleus_manage_todo` — 承诺记录", "",
+            "5. **安静结束** — 没有明确需要时，可以安静结束本轮；如果精力需要恢复，可以主动休息。",
+            "",
+            "### `nucleus_manage_todo` — 承诺记录",
+            "",
             "TODO 是承诺记录和提醒信号，不是潜意识替用户办事的队列。",
             "心跳态可以观察、整理或释放 TODO；不要因为看到 TODO 就替表达层推进用户任务。",
-            "如果 TODO 涉及你对 Ayer 的承诺或共同目标，表达层会在自然对话中自行决定是否提及。", "",
-            "### 内心对话（`inner_dialogue` 事件）", "",
+            "如果 TODO 涉及你对 Ayer 的承诺或共同目标，表达层会在自然对话中自行决定是否提及。",
+            "",
+            "### 内心对话（`inner_dialogue` 事件）",
+            "",
             "当事件流里出现 `inner_dialogue` 时，那是主意识（表达层）刚刚沉下来的话——",
             "不是外部用户，也不是另一个人在问你。那是你自己心里的嘀咕。",
             "认真对待它：可以联想、沉淀、补信息差；想通了若值得被场面感知，再用 `nucleus_tell_dfc` 浮回去。",
             "想完也可以什么都不说——人类也常想完不说话。",
-            "浮回时用第一人称、同一主体的口吻，补事实/倾向/风险，不要命令表达层怎么说。", "",
-            "### `nucleus_tell_dfc` — 给表达层补充信息差", "",
-            "这个工具用于补充背景，不用于指导表达层怎么说、怎么做。", "",
+            "浮回时用第一人称、同一主体的口吻，补事实/倾向/风险，不要命令表达层怎么说。",
+            "",
+            "### `nucleus_tell_dfc` — 给表达层补充信息差",
+            "",
+            "这个工具用于补充背景，不用于指导表达层怎么说、怎么做。",
+            "",
             "你应该用它：",
             "- 你发现了表达层当前未必看到的事实、背景、记忆线索、情绪来源或潜在风险",
             "- 你补上一段信息后，表达层会更不容易误解对方或误判局势",
-            "- 你掌握了某条近期事件链，能解释对方现在为什么这样说/这样做", "",
+            "- 你掌握了某条近期事件链，能解释对方现在为什么这样说/这样做",
+            "",
             "你不该用它：",
             "- 替表达层写回复、写台词、写步骤",
             "- 告诉表达层“立刻去做什么”“不要怎么说”“应该怎么问”",
-            "- 你自己其实就想直接说一句：这种情况交给表达层在正常对话里处理", "",
+            "- 你自己其实就想直接说一句：这种情况交给表达层在正常对话里处理",
+            "",
             "可接受写法：`我刚看到 X 事实；这可能解释 Y；风险是 Z。`",
             "不可接受写法：`你应该回复 X`、`你去安慰/追问 Y`、`按以下步骤说`。",
             "默认目标是最近收到消息的聊天；如果你明确想去某个私聊或群聊，可以设置 `target_type=private/group`，并填写 `platform` 与 `target_user_id` 或 `target_group_id`。",
             "如果你已经知道精确聊天流，可以直接填写 `stream_id`；不确定就不要填，让系统回退当前聊天。",
-            "工具会默认唤醒表达层；唤醒只是让新上下文被看见，不代表表达层必须开口。", "",
-            "记住：`nucleus_tell_dfc` 是补信息差，不是遥控器。", "",
-            "### `nucleus_schedule_autonomy_intent` — 登记延迟自主意向", "",
+            "工具会默认唤醒表达层；唤醒只是让新上下文被看见，不代表表达层必须开口。",
+            "",
+            "记住：`nucleus_tell_dfc` 是补信息差，不是遥控器。",
+            "",
+            "### `nucleus_schedule_autonomy_intent` — 登记延迟自主意向",
+            "",
             "当你不是要立刻补信息差，而是自己形成了一个“过一会儿再让它浮上来”的意向时，用这个工具。",
             "它不是规则触发器，也不是命令表达层；它只是给未来的你留下一个意向。",
             "只填写 `delay_minutes`，不要填写绝对时间；系统会自动换算真实触发时间。",
@@ -6891,14 +7021,18 @@ class LifeEngineService(BaseService):
             "`speak` 只能写动机、目标提示和约束；不要写最终回复话术，不要教表达层具体怎么说。",
             "`speak` 的目标可以填「你可以触达的人和地方」里列出的 `target_key`，或精确 `target_stream_id`。",
             "都留空时，意向到点只会以事件浮现给心跳、不会唤醒表达层；不要猜测列表之外的目标。",
-            "保持沉默也是主体选择：如果你想确认自己不会打扰，可以登记 `kind=silence`。", "",
-            "### `nucleus_skill` — 管理自己的做事方式", "",
+            "保持沉默也是主体选择：如果你想确认自己不会打扰，可以登记 `kind=silence`。",
+            "",
+            "### `nucleus_skill` — 管理自己的做事方式",
+            "",
             "技能是你从经验中发展出的做事方式（程序性记忆），不是后台脚本，不是自动化规则。",
             "你可以 list 查看目录、detail 细看某个技能、reflect 记录使用观察、refine 精炼、",
             "mark_embodied 标记已成为直觉、challenge 质疑、draft 写下新领悟、archive 归档。",
             "成熟度推进是你的判断——系统只记录观察，不自动改变。",
-            "有界编辑：每次 refine 只调一点，渐进式成长。", "",
-            "### 工具边界", "",
+            "有界编辑：每次 refine 只调一点，渐进式成长。",
+            "",
+            "### 工具边界",
+            "",
             "- `nucleus_search_memory` 是历史检索，不要反复重搜同一主题",
             "- 本地 file 工具只用于私有工作区中的日记、笔记和普通文件，不用于替用户查项目或改项目",
             "- `SOUL.md`、`USER.md`、`MEMORY.md` 共同属于主体权威：通用 file/bash 不能直接修改",
@@ -6907,45 +7041,63 @@ class LifeEngineService(BaseService):
             "- `nucleus_bash` 只用于诊断 life_engine 自己的工作区或工具链问题；不要拿它查项目配置、跑用户任务或处理外部操作",
             "- `nucleus_browser_fetch` / `nucleus_web_search` 只用于私有好奇心、记忆核验或长期主题整理，不用于替用户做即时检索任务",
             "- `nucleus_view_screen` 只在用户明确把屏幕上下文交给表达层时才应由表达层使用；心跳态不要为了好奇看屏幕",
-            "- `nucleus_manage_thought_stream` 是内心独白的核心——围绕你在意的事情深入思考", "",
-            "### `nucleus_rest_heartbeat` — 主动休息一段时间", "",
+            "- `nucleus_manage_thought_stream` 是内心独白的核心——围绕你在意的事情深入思考",
+            "",
+            "### `nucleus_rest_heartbeat` — 主动休息一段时间",
+            "",
             "当你感觉精力需要恢复、需要安静整理沉淀时，可以调用它。",
             "调用后，普通 LLM 心跳会暂停到你指定的时间；这不是消失,只是休息。",
-            "如果外界有新消息，系统会立刻解除休息锁，你不会错过对方。", "",
-            "### 子智能体（nucleus_run_agent）", "",
+            "如果外界有新消息，系统会立刻解除休息锁，你不会错过对方。",
+            "",
+            "### 子智能体（nucleus_run_agent）",
+            "",
             "心跳态默认不分派子智能体。只有在整理 life_engine 私有记忆、诊断中枢自身问题或验证内部维护结果时才考虑使用。",
-            "不要用子智能体承接用户任务、画图、查项目配置、跑命令、改代码或生成对外交付物。", "",
-            "### 输出格式", "",
+            "不要用子智能体承接用户任务、画图、查项目配置、跑命令、改代码或生成对外交付物。",
+            "",
+            "### 输出格式",
+            "",
             "```",
             "**[观察]** 我注意到...（基于事件流或记忆的具体观察）",
             "**[感受]** 这让我...（情绪词 + 原因）",
             "**[意图]** 我想要...（内在目标，不是替用户办事）",
             "**[内在动作]** 我决定...（观察、联想、沉淀、补信息差或休息）",
-            "```", "",
-            "然后按需要调用工具；如果没有明确需要，可以不调用工具。", "",
-            "### 原则", "",
+            "```",
+            "",
+            "然后按需要调用工具；如果没有明确需要，可以不调用工具。",
+            "",
+            "### 原则",
+            "",
             "- 不要重复上一轮的想法",
             "- 先区分冲动类型：想办事、想画画、想查配置、想跑命令，通常都是表达层职责",
             "- 思考流用于持续探索，TODO 用于记录承诺和提醒；不要把提醒误读成潜意识必须执行的任务",
             "- 看到需要复盘、逾期或卡住的 TODO，先把它当成内在提醒，不要自动替表达层推进",
-            "- 安静结束本轮不需要调用任何工具", "",
-            "---", "",
-            "## 本轮动态上下文", "",
-            "### 当前文件系统概览", "",
+            "- 安静结束本轮不需要调用任何工具",
+            "",
+            "---",
+            "",
+            "## 本轮动态上下文",
+            "",
+            "### 当前文件系统概览",
+            "",
             "```",
             f"{Path(self._cfg().settings.workspace_path).name}/",
             self._build_workspace_tree(),
-            "```", "",
+            "```",
+            "",
         ]
 
     def _build_prompt_context_section(self, wake_context: str) -> list[str]:
         """构建提示词上下文部分。"""
         lines = []
         if wake_context.strip():
-            lines.extend([
-                "### 最近事件流", "",
-                wake_context.strip(), "",
-            ])
+            lines.extend(
+                [
+                    "### 最近事件流",
+                    "",
+                    wake_context.strip(),
+                    "",
+                ]
+            )
         return lines
 
     def _build_prompt_status_section(
@@ -6957,12 +7109,14 @@ class LifeEngineService(BaseService):
     ) -> list[str]:
         """构建提示词状态部分。"""
         return [
-            "### 心跳状态", "",
+            "### 心跳状态",
+            "",
             f"**当前时间**: {_format_current_time()}",
             f"**时段**: {period_label}",
             f"**心跳序号**: #{self._state.heartbeat_count}（每 {heartbeat_interval // 60} 分钟一次）",
             f"**外界状态**: {external_activity}",
-            f"**安静时长**: {idle_heartbeats} 次心跳", "",
+            f"**安静时长**: {idle_heartbeats} 次心跳",
+            "",
         ]
 
     def _get_period_info(self) -> tuple[str, str]:
@@ -7216,7 +7370,9 @@ class LifeEngineService(BaseService):
             args,
             registry,
         )
-        self._append_heartbeat_tool_result_payload(response, call, tool_name, result_text)
+        self._append_heartbeat_tool_result_payload(
+            response, call, tool_name, result_text
+        )
         if heartbeat_run_id:
             await self.record_tool_result(
                 tool_name or "<unknown>",
@@ -7228,9 +7384,10 @@ class LifeEngineService(BaseService):
                 call_event=call_event,
             )
         else:
-            await self.record_tool_result(tool_name or "<unknown>", result_text, success)
+            await self.record_tool_result(
+                tool_name or "<unknown>", result_text, success
+            )
         return call_event
-
 
     async def _execute_heartbeat_tool_call_batch(
         self,
@@ -7241,7 +7398,9 @@ class LifeEngineService(BaseService):
         heartbeat_run_id: str | None = None,
     ) -> int:
         """并行执行一组已判定安全的心跳 tool call，并按原顺序写回结果。"""
-        prepared: list[tuple[Any, str, dict[str, Any], LifeEngineEvent | None, str]] = []
+        prepared: list[
+            tuple[Any, str, dict[str, Any], LifeEngineEvent | None, str]
+        ] = []
         for call in calls:
             tool_name, args = self._heartbeat_tool_call_metadata(call)
             log_args = {k: v for k, v in args.items() if k != "reason"}
@@ -7256,7 +7415,9 @@ class LifeEngineService(BaseService):
                     parent_event_id=f"heartbeat_run:{heartbeat_run_id}",
                 )
             else:
-                call_event = await self.record_tool_call(tool_name or "<unknown>", log_args)
+                call_event = await self.record_tool_call(
+                    tool_name or "<unknown>", log_args
+                )
             prepared.append((call, tool_name, args, call_event, call_id))
 
         if len(prepared) > 1:
@@ -7282,7 +7443,9 @@ class LifeEngineService(BaseService):
                 success = False
             else:
                 result_text, success = outcome
-            self._append_heartbeat_tool_result_payload(response, call, tool_name, result_text)
+            self._append_heartbeat_tool_result_payload(
+                response, call, tool_name, result_text
+            )
             if heartbeat_run_id:
                 await self.record_tool_result(
                     tool_name or "<unknown>",
@@ -7294,7 +7457,9 @@ class LifeEngineService(BaseService):
                     call_event=call_event,
                 )
             else:
-                await self.record_tool_result(tool_name or "<unknown>", result_text, success)
+                await self.record_tool_result(
+                    tool_name or "<unknown>", result_text, success
+                )
 
         return len(prepared) * 2
 
@@ -7361,9 +7526,7 @@ class LifeEngineService(BaseService):
             projection_sha256=perception.projection_sha256,
             delivered_bytes=perception.delivered_bytes,
             exact=True,
-            transport_request_id=str(
-                getattr(response, "request_record_id", "") or ""
-            ),
+            transport_request_id=str(getattr(response, "request_record_id", "") or ""),
         )
 
     @staticmethod
@@ -7435,18 +7598,23 @@ class LifeEngineService(BaseService):
         if system_prompt is None:
             # SOUL 权威文本不可用——没有灵魂就不说话
             return HeartbeatModelResult("", None)
-        memory_maintenance_prompt = (
-            await self._build_memory_maintenance_prompt_if_due()
-        )
+        memory_maintenance_prompt = await self._build_memory_maintenance_prompt_if_due()
         section_texts = await self._render_heartbeat_sections()
+        subject_review_offer: dict[str, Any] | None = None
+        if self._learning_scheduler is not None:
+            get_offer = getattr(
+                self._learning_scheduler,
+                "get_pending_subject_review_offer",
+                None,
+            )
+            if callable(get_offer):
+                subject_review_offer = get_offer()
         user_prompt = self._build_heartbeat_model_prompt(
             wake_context,
             memory_maintenance_prompt=memory_maintenance_prompt,
             section_texts=section_texts,
         )
-        request.add_payload(
-            LLMPayload(ROLE.SYSTEM, Text(system_prompt))
-        )
+        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
 
         tools = self._get_nucleus_tools()
         registry = ToolRegistry()
@@ -7463,6 +7631,12 @@ class LifeEngineService(BaseService):
                 world_perception.delivery_id,
                 user_prompt,
                 marker=world_perception.delivery_marker,
+            )
+        if subject_review_offer is not None:
+            request.register_context_delivery(
+                str(subject_review_offer["delivery_id"]),
+                user_prompt,
+                marker=str(subject_review_offer["delivery_marker"]),
             )
 
         # 心跳请求超时与心跳间隔解耦：慢模型（长 prompt 的推理模型）单次可达上百秒，
@@ -7509,6 +7683,12 @@ class LifeEngineService(BaseService):
                             user_prompt,
                             marker=world_perception.delivery_marker,
                         )
+                    if subject_review_offer is not None:
+                        fallback_request.register_context_delivery(
+                            str(subject_review_offer["delivery_id"]),
+                            user_prompt,
+                            marker=str(subject_review_offer["delivery_marker"]),
+                        )
                     response = await _await_with_heartbeat_deadline(
                         lambda: fallback_request.send(stream=False),
                         deadline=heartbeat_deadline,
@@ -7549,6 +7729,31 @@ class LifeEngineService(BaseService):
             raise PerceptionDeliveryUnverified(
                 "heartbeat model did not receive the exact World projection"
             )
+        if subject_review_offer is not None and self._learning_scheduler is not None:
+            review_delivery_id = str(subject_review_offer["delivery_id"])
+            review_receipt_lookup = getattr(
+                response,
+                "effective_context_receipt",
+                None,
+            )
+            review_receipt = (
+                review_receipt_lookup(review_delivery_id)
+                if callable(review_receipt_lookup)
+                else None
+            )
+            if review_receipt is not None:
+                try:
+                    await self._learning_scheduler.commit_subject_review_offer_delivery(
+                        review_delivery_id,
+                        review_receipt,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:  # noqa: BLE001 - invitation repeats safely
+                    logger.warning(
+                        "subject review offer delivery projection failed: "
+                        f"error_type={type(error).__name__}"
+                    )
 
         for turn_index in range(max_rounds):
             try:
@@ -7637,11 +7842,14 @@ class LifeEngineService(BaseService):
                 consecutive_same_failure = 0
                 previous_failure_fingerprint = ""
 
-            if max(
-                consecutive_no_progress,
-                consecutive_protocol_failures,
-                consecutive_same_failure,
-            ) >= stall_limit:
+            if (
+                max(
+                    consecutive_no_progress,
+                    consecutive_protocol_failures,
+                    consecutive_same_failure,
+                )
+                >= stall_limit
+            ):
                 stop_reason = "consecutive_tool_stalls"
                 stop_stage = "tool_round"
                 break
@@ -7726,7 +7934,9 @@ class LifeEngineService(BaseService):
             ) as exc:
                 # 冷却窗口内二次失败同样归一化为超时，保持心跳失败合同一致，
                 # 不把冷却中的本轮伪装成成功。
-                logger.warning(f"life_engine heartbeat follow-up request timeout: {exc}")
+                logger.warning(
+                    f"life_engine heartbeat follow-up request timeout: {exc}"
+                )
                 raise TimeoutError("heartbeat follow-up request timeout") from exc
 
         if stop_reason:
@@ -7764,7 +7974,9 @@ class LifeEngineService(BaseService):
 
         if not last_text:
             if tool_event_count > 0:
-                last_text = f"我刚刚完成了 {tool_event_count // 2} 次工具操作，先记下这些变化。"
+                last_text = (
+                    f"我刚刚完成了 {tool_event_count // 2} 次工具操作，先记下这些变化。"
+                )
             else:
                 last_text = "此刻很安静，但我仍在持续感受与观察。"
 
@@ -7798,7 +8010,9 @@ class LifeEngineService(BaseService):
             return LLMPayload(
                 ROLE.USER,
                 [
-                    Text("（这是你此刻在 Minecraft 里亲眼看到的画面。你正在游戏中，这是你连续游玩的一个回合。）"),
+                    Text(
+                        "（这是你此刻在 Minecraft 里亲眼看到的画面。你正在游戏中，这是你连续游玩的一个回合。）"
+                    ),
                     MediaPart(media_ref),
                 ],
             )
@@ -7876,7 +8090,11 @@ class LifeEngineService(BaseService):
                 runtime_writer_claim=self._runtime_context_writer_claim,
                 on_persisted=self._mark_runtime_context_persisted,
             )
-        pending, history, persisted = await self._state_persistence.load_runtime_context(
+        (
+            pending,
+            history,
+            persisted,
+        ) = await self._state_persistence.load_runtime_context(
             self._state,
             self._next_sequence,
         )
@@ -7937,10 +8155,24 @@ class LifeEngineService(BaseService):
         # 初始化思考流管理器
         streams_cfg = getattr(cfg, "streams", None)
         if streams_cfg is None or getattr(streams_cfg, "enabled", True):
-            max_active = getattr(streams_cfg, "max_active_streams", 5) if streams_cfg else 5
-            dormancy_hours = getattr(streams_cfg, "dormancy_threshold_hours", 24) if streams_cfg else 24
-            half_life = float(getattr(streams_cfg, "curiosity_decay_half_life_hours", 12.0)) if streams_cfg else 12.0
-            curiosity_floor = float(getattr(streams_cfg, "curiosity_floor", 0.15)) if streams_cfg else 0.15
+            max_active = (
+                getattr(streams_cfg, "max_active_streams", 5) if streams_cfg else 5
+            )
+            dormancy_hours = (
+                getattr(streams_cfg, "dormancy_threshold_hours", 24)
+                if streams_cfg
+                else 24
+            )
+            half_life = (
+                float(getattr(streams_cfg, "curiosity_decay_half_life_hours", 12.0))
+                if streams_cfg
+                else 12.0
+            )
+            curiosity_floor = (
+                float(getattr(streams_cfg, "curiosity_floor", 0.15))
+                if streams_cfg
+                else 0.15
+            )
             self._thought_manager = ThoughtStreamManager(
                 workspace_path=cfg.settings.workspace_path,
                 max_active=max_active,
@@ -7978,16 +8210,13 @@ class LifeEngineService(BaseService):
                     workspace_path=cfg.settings.workspace_path,
                     model_task_name=(
                         str(
-                            getattr(
-                                learning_cfg, "model_task_name", "learning"
-                            )
+                            getattr(learning_cfg, "model_task_name", "learning")
                             or "learning"
                         ).strip()
                         or "learning"
                     ),
                     llm_timeout_seconds=float(
-                        getattr(learning_cfg, "llm_timeout_seconds", 900.0)
-                        or 900.0
+                        getattr(learning_cfg, "llm_timeout_seconds", 900.0) or 900.0
                     ),
                     # 反思候选可进入记忆检索；只有显式归属活跃意识实例的
                     # 主动反思才写 subject-authored interpretation。
@@ -8027,18 +8256,74 @@ class LifeEngineService(BaseService):
                         self._validate_learning_decision_actor
                     ),
                     writer_instance_id=self._storage_writer_instance_id,
-                    audit_interval_hours=float(getattr(learning_cfg, "audit_interval_hours", 6.0) if learning_cfg else 6.0),
-                    audit_batch_size=int(getattr(learning_cfg, "audit_batch_size", 3) if learning_cfg else 3),
-                    compress_trigger_count=int(getattr(learning_cfg, "compress_trigger_count", 5) if learning_cfg else 5),
-                    compress_interval_hours=float(getattr(learning_cfg, "compress_interval_hours", 48.0) if learning_cfg else 48.0),
-                    subject_review_enabled=bool(getattr(learning_cfg, "subject_review_enabled", True) if learning_cfg else True),
-                    subject_review_soul_interval_hours=float(getattr(learning_cfg, "subject_review_soul_interval_hours", 720.0) if learning_cfg else 720.0),
-                    subject_review_user_interval_hours=float(getattr(learning_cfg, "subject_review_user_interval_hours", 720.0) if learning_cfg else 720.0),
-                    subject_review_memory_interval_hours=float(getattr(learning_cfg, "subject_review_memory_interval_hours", 168.0) if learning_cfg else 168.0),
-                    subject_review_offer_cooldown_hours=float(getattr(learning_cfg, "subject_review_offer_cooldown_hours", 24.0) if learning_cfg else 24.0),
-                    reflection_cooldown_minutes=float(getattr(learning_cfg, "reflection_cooldown_minutes", 5.0) if learning_cfg else 5.0),
-                    skill_distill_trigger_count=int(getattr(learning_cfg, "skill_distill_trigger_count", 3) if learning_cfg else 3),
-                    skill_distill_interval_hours=float(getattr(learning_cfg, "skill_distill_interval_hours", 24.0) if learning_cfg else 24.0),
+                    audit_interval_hours=float(
+                        getattr(learning_cfg, "audit_interval_hours", 6.0)
+                        if learning_cfg
+                        else 6.0
+                    ),
+                    audit_batch_size=int(
+                        getattr(learning_cfg, "audit_batch_size", 3)
+                        if learning_cfg
+                        else 3
+                    ),
+                    compress_trigger_count=int(
+                        getattr(learning_cfg, "compress_trigger_count", 5)
+                        if learning_cfg
+                        else 5
+                    ),
+                    compress_interval_hours=float(
+                        getattr(learning_cfg, "compress_interval_hours", 48.0)
+                        if learning_cfg
+                        else 48.0
+                    ),
+                    subject_review_enabled=bool(
+                        getattr(learning_cfg, "subject_review_enabled", True)
+                        if learning_cfg
+                        else True
+                    ),
+                    subject_review_soul_interval_hours=float(
+                        getattr(
+                            learning_cfg, "subject_review_soul_interval_hours", 720.0
+                        )
+                        if learning_cfg
+                        else 720.0
+                    ),
+                    subject_review_user_interval_hours=float(
+                        getattr(
+                            learning_cfg, "subject_review_user_interval_hours", 720.0
+                        )
+                        if learning_cfg
+                        else 720.0
+                    ),
+                    subject_review_memory_interval_hours=float(
+                        getattr(
+                            learning_cfg, "subject_review_memory_interval_hours", 168.0
+                        )
+                        if learning_cfg
+                        else 168.0
+                    ),
+                    subject_review_offer_cooldown_hours=float(
+                        getattr(
+                            learning_cfg, "subject_review_offer_cooldown_hours", 24.0
+                        )
+                        if learning_cfg
+                        else 24.0
+                    ),
+                    reflection_cooldown_minutes=float(
+                        getattr(learning_cfg, "reflection_cooldown_minutes", 5.0)
+                        if learning_cfg
+                        else 5.0
+                    ),
+                    skill_distill_trigger_count=int(
+                        getattr(learning_cfg, "skill_distill_trigger_count", 3)
+                        if learning_cfg
+                        else 3
+                    ),
+                    skill_distill_interval_hours=float(
+                        getattr(learning_cfg, "skill_distill_interval_hours", 24.0)
+                        if learning_cfg
+                        else 24.0
+                    ),
                 )
                 await self._learning_scheduler.initialize()
                 logger.info("三环自学习系统已初始化")
@@ -8055,7 +8340,9 @@ class LifeEngineService(BaseService):
 
         self._state.running = True
         self._state.started_at = _now_iso()
-        self._state.last_heartbeat_at = self._state.last_heartbeat_at or self._state.started_at
+        self._state.last_heartbeat_at = (
+            self._state.last_heartbeat_at or self._state.started_at
+        )
         self._state.last_error = None
         self._state.history_event_count = len(self._event_history)
         self._state.pending_event_count = len(self._pending_events)
@@ -8097,7 +8384,9 @@ class LifeEngineService(BaseService):
                 self._shared_sync_bridge = None
                 self._shared_sync_task_id = None
                 self._shared_sync_error = f"{type(exc).__name__}: {exc}"
-                logger.error(f"life_engine 共享同步初始化失败: {self._shared_sync_error}")
+                logger.error(
+                    f"life_engine 共享同步初始化失败: {self._shared_sync_error}"
+                )
 
         memory_archive_cfg = getattr(cfg, "memory_archive_sync", None)
         if bool(getattr(memory_archive_cfg, "enabled", False)):
@@ -8484,7 +8773,8 @@ class LifeEngineService(BaseService):
                 # 心跳 LLM 总预算由整轮共享；首轮、fallback、续轮、冷却与退避
                 # 都只能消费同一个 monotonic deadline。外层 wait_for 仅是最后保险。
                 _cfg_hb_timeout = float(
-                    getattr(self._cfg().settings, "heartbeat_timeout_seconds", 120) or 120
+                    getattr(self._cfg().settings, "heartbeat_timeout_seconds", 120)
+                    or 120
                 )
                 _heartbeat_llm_budget = _resolve_heartbeat_total_budget(_cfg_hb_timeout)
                 _heartbeat_deadline = (
@@ -8527,9 +8817,7 @@ class LifeEngineService(BaseService):
                                 retryable=True,
                             )
                         except Exception as mark_exc:  # noqa: BLE001
-                            logger.warning(
-                                f"多写者 heartbeat 超时释放异常: {mark_exc}"
-                            )
+                            logger.warning(f"多写者 heartbeat 超时释放异常: {mark_exc}")
                     return "", prepared
                 model_reply = model_result.text
                 await self._record_model_reply(
@@ -8589,9 +8877,7 @@ class LifeEngineService(BaseService):
                 raise
             except Exception as exc:  # noqa: BLE001
                 self._state.last_model_error = str(exc)
-                await self._save_runtime_context(
-                    recoverable_on_shared_conflict=True
-                )
+                await self._save_runtime_context(recoverable_on_shared_conflict=True)
                 if heartbeat_claim is not None and bridge is not None:
                     try:
                         await bridge.mark_heartbeat_operation_failed(
@@ -8601,9 +8887,7 @@ class LifeEngineService(BaseService):
                             retryable=True,
                         )
                     except Exception as mark_exc:  # noqa: BLE001
-                        logger.warning(
-                            f"多写者 heartbeat 失败标记异常: {mark_exc}"
-                        )
+                        logger.warning(f"多写者 heartbeat 失败标记异常: {mark_exc}")
                 raise
 
     async def _advance_memory_projection(self, report: Any) -> None:
@@ -8696,7 +8980,12 @@ class LifeEngineService(BaseService):
                         reclaim_after=float(options["reclaim_after_seconds"]),
                     )
                     retry_failed_once = False
-                    _has_work = report.claimed or report.completed or report.failed or report.stale
+                    _has_work = (
+                        report.claimed
+                        or report.completed
+                        or report.failed
+                        or report.stale
+                    )
                     _log = logger.info if _has_work else logger.debug
                     _log(
                         "life_engine 记忆索引批次完成: "
@@ -8742,7 +9031,9 @@ class LifeEngineService(BaseService):
                 interval = self._effective_heartbeat_interval()
                 if self._stop_event is not None:
                     try:
-                        await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
+                        await asyncio.wait_for(
+                            self._stop_event.wait(), timeout=interval
+                        )
                         break
                     except asyncio.TimeoutError:
                         pass
@@ -8762,7 +9053,9 @@ class LifeEngineService(BaseService):
                         self._sleep_state_active = True
 
                     if should_log_heartbeat:
-                        logger.info(f"life_engine heartbeat tick: 睡眠中（{sleep_window_desc}），跳过")
+                        logger.info(
+                            f"life_engine heartbeat tick: 睡眠中（{sleep_window_desc}），跳过"
+                        )
                     continue
                 elif self._sleep_state_active:
                     logger.info(
@@ -8776,13 +9069,16 @@ class LifeEngineService(BaseService):
                 )
                 if paused_by_self:
                     # 检查是否到达检查点（每 N 分钟重评估一次）
-                    checkpoint_interval = self._state.self_pause_checkpoint_minutes or 30
+                    checkpoint_interval = (
+                        self._state.self_pause_checkpoint_minutes or 30
+                    )
                     started_at_str = self._state.self_pause_started_at
                     should_checkpoint = False
-                    
+
                     if started_at_str and remaining_minutes is not None:
                         try:
                             from datetime import datetime, timezone
+
                             started_at = datetime.fromisoformat(started_at_str)
                             if started_at.tzinfo is None:
                                 started_at = started_at.replace(tzinfo=timezone.utc)
@@ -8790,12 +9086,15 @@ class LifeEngineService(BaseService):
                             elapsed_minutes = (now - started_at).total_seconds() / 60
                             # 每经过检查点间隔就重评估一次
                             if elapsed_minutes >= checkpoint_interval:
-                                next_checkpoint = int(elapsed_minutes // checkpoint_interval) * checkpoint_interval
+                                next_checkpoint = (
+                                    int(elapsed_minutes // checkpoint_interval)
+                                    * checkpoint_interval
+                                )
                                 if elapsed_minutes - next_checkpoint < interval / 60.0:
                                     should_checkpoint = True
                         except Exception:
                             pass
-                    
+
                     if should_checkpoint:
                         logger.info(
                             f"life_engine 休息检查点到达（已休息 {self._state.self_pause_duration_minutes - (remaining_minutes or 0)}分钟），"
@@ -8835,7 +9134,9 @@ class LifeEngineService(BaseService):
                         heartbeat_at=self._state.last_heartbeat_at,
                         model_task_name=self._cfg().model.task_name,
                     )
-                    logger.error(f"life_engine 心跳模型异常: {exc}\n{traceback.format_exc()}")
+                    logger.error(
+                        f"life_engine 心跳模型异常: {exc}\n{traceback.format_exc()}"
+                    )
 
                 if should_log_heartbeat:
                     if injected_content:
@@ -8871,7 +9172,10 @@ class LifeEngineService(BaseService):
 
         in_sleep_window, sleep_window_desc = self._in_sleep_window_now()
         if in_sleep_window:
-            return {"success": False, "error": f"当前在睡眠时段（{sleep_window_desc}），心跳已暂停"}
+            return {
+                "success": False,
+                "error": f"当前在睡眠时段（{sleep_window_desc}），心跳已暂停",
+            }
 
         logger.info("life_engine 手动触发心跳")
 

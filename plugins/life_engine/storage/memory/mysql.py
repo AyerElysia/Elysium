@@ -75,6 +75,7 @@ from ...memory.living import (
     CoRecallEvent,
     InterpretationSearchResult,
     InterpretationSource,
+    MemoryArtifactDescriptor,
     MemoryArtifactVersion,
     MemoryDerivation,
     MemoryInterpretation,
@@ -2188,6 +2189,26 @@ def _artifact_from_row(row: Any) -> MemoryArtifactVersion:
     )
 
 
+def _artifact_descriptor_from_row(row: Any) -> MemoryArtifactDescriptor:
+    return MemoryArtifactDescriptor(
+        artifact_id=str(row["artifact_id"]),
+        logical_key=str(row["logical_key"]),
+        artifact_kind=str(row["artifact_kind"]),
+        content_hash=str(row["content_hash"]),
+        content_byte_length=int(row["content_byte_length"]),
+        recorded_at=str(row["recorded_at"]),
+        authored_by=str(row["authored_by"]),
+        consciousness_instance_id=str(row["consciousness_instance_id"]),
+        stream_scope=str(row["stream_scope"]),
+        visibility=str(row["visibility"]),
+        parent_artifact_ids=tuple(
+            str(item)
+            for item in _json_value(row["parent_artifact_ids_json"], default=[])
+        ),
+        metadata=dict(_json_value(row["metadata_json"], default={})),
+    )
+
+
 def _interpretation_from_row(row: Any) -> MemoryInterpretation:
     return MemoryInterpretation(
         interpretation_id=str(row["interpretation_id"]),
@@ -2422,6 +2443,52 @@ class MySQLLivingMemoryStore(_MySQLPort):
             projected_at=str(row["projected_at"]),
             revision=int(row["revision"]),
         )
+
+    async def get_artifact_version(
+        self,
+        artifact_id: str,
+    ) -> MemoryArtifactVersion | None:
+        assert self.runtime.engine is not None
+        async with self.runtime.engine.connect() as connection:
+            row = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT * FROM memory_artifact_versions "
+                            "WHERE artifact_id = :artifact_id"
+                        ),
+                        {"artifact_id": str(artifact_id)},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        return _artifact_from_row(row) if row is not None else None
+
+    async def list_artifact_descriptors(
+        self,
+        logical_key: str,
+    ) -> list[MemoryArtifactDescriptor]:
+        assert self.runtime.engine is not None
+        async with self.runtime.engine.connect() as connection:
+            rows = (
+                await connection.execute(
+                    text(
+                        "SELECT artifact_id, logical_key, artifact_kind, "
+                        "content_hash, OCTET_LENGTH(content) AS content_byte_length, "
+                        "recorded_at, authored_by, consciousness_instance_id, "
+                        "stream_scope, visibility, parent_artifact_ids_json, "
+                        "metadata_json FROM memory_artifact_versions "
+                        "WHERE logical_key_sha256 = :logical_hash "
+                        "ORDER BY recorded_at, artifact_id"
+                    ),
+                    {"logical_hash": _sha256(logical_key)},
+                )
+            ).mappings()
+            result = [_artifact_descriptor_from_row(row) for row in rows]
+        if any(item.logical_key != logical_key for item in result):
+            raise ArtifactHeadConflict("artifact logical-key hash collision")
+        return result
 
     async def list_artifact_history(
         self,
