@@ -18,6 +18,7 @@ from src.kernel.llm.api import _resolve_model_set
 
 EXPECTED_TASK_BUDGETS = {
     "core": 32000,
+    "learning": 32000,
     "expression": 32000,
     "witness": 16000,
     "agent": 32000,
@@ -31,6 +32,7 @@ EXPECTED_TASK_BUDGETS = {
 }
 EXPECTED_CONTEXT_BUDGETS = {
     "core": 100000,
+    "learning": 100000,
     "expression": 200000,
     "witness": 100000,
     "agent": 200000,
@@ -39,6 +41,13 @@ EXPECTED_CONTEXT_BUDGETS = {
     "router": 32000,
     "router_context_projection": 100000,
     "live": 100000,
+}
+EXPECTED_ATTEMPT_TIMEOUTS = {
+    "core": 180,
+    "learning": 300,
+    "witness": 300,
+    "agent": 300,
+    "utility": 180,
 }
 GENERATIVE_TASKS = set(EXPECTED_TASK_BUDGETS) - {"voice", "embedding"}
 
@@ -64,6 +73,25 @@ def test_models_example_is_complete_and_budgeted() -> None:
         else:
             assert "context_tokens" not in task
             assert all("context_tokens" not in entry for entry in entries)
+
+        expected_timeout = EXPECTED_ATTEMPT_TIMEOUTS.get(task_name, 120)
+        assert all(entry["timeout"] == expected_timeout for entry in entries)
+
+
+def test_production_and_example_share_background_attempt_timeout_policy() -> None:
+    config_dir = Path(__file__).parents[2] / "config"
+    production = ModelsConfig(config_dir / "models.toml")
+    example = ModelsConfig(config_dir / "models.toml.example")
+
+    assert "learning" in PRODUCTION_MODEL_TASKS
+    assert {
+        task_name: production.tasks[task_name].get("attempt_timeout_seconds")
+        for task_name in EXPECTED_ATTEMPT_TIMEOUTS
+    } == EXPECTED_ATTEMPT_TIMEOUTS
+    assert {
+        task_name: example.tasks[task_name].get("attempt_timeout_seconds")
+        for task_name in EXPECTED_ATTEMPT_TIMEOUTS
+    } == EXPECTED_ATTEMPT_TIMEOUTS
 
 
 def test_task_routes_preserve_toml_order() -> None:
@@ -198,6 +226,67 @@ def test_registry_preserves_priority_and_attaches_snapshot_identity(
         config.tasks["expression"]["tokens"] = 1  # type: ignore[index]
 
 
+def test_task_attempt_timeout_overrides_provider_for_every_candidate_and_alias(
+    tmp_path: Path,
+) -> None:
+    registry_path = tmp_path / "models.toml"
+    _write_minimal_registry(registry_path)
+    registry_path.write_text(
+        registry_path.read_text(encoding="utf-8").replace(
+            "context_tokens = 16000",
+            "context_tokens = 16000\nattempt_timeout_seconds = 240.5",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    config = ModelsConfig(registry_path)
+
+    assert {entry["timeout"] for entry in config.get_task("expression")} == {240.5}
+    assert {entry["timeout"] for entry in config.get_task("actor")} == {240.5}
+    assert {entry["routing_task"] for entry in config.get_task("actor")} == {
+        "expression"
+    }
+    assert all(
+        "attempt_timeout_seconds" not in entry["extra_params"]
+        for entry in config.get_task("expression")
+    )
+
+
+def test_task_without_attempt_timeout_inherits_provider_value(tmp_path: Path) -> None:
+    registry_path = tmp_path / "models.toml"
+    _write_minimal_registry(registry_path)
+
+    config = ModelsConfig(registry_path)
+
+    assert {entry["timeout"] for entry in config.get_task("expression")} == {120}
+
+
+@pytest.mark.parametrize(
+    "value", ["true", "0", "-1", '"120"', "nan", "inf", "-inf"]
+)
+def test_registry_rejects_invalid_task_attempt_timeout(
+    tmp_path: Path,
+    value: str,
+) -> None:
+    registry_path = tmp_path / "invalid-task-timeout.toml"
+    _write_minimal_registry(registry_path)
+    registry_path.write_text(
+        registry_path.read_text(encoding="utf-8").replace(
+            "context_tokens = 16000",
+            f"context_tokens = 16000\nattempt_timeout_seconds = {value}",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ModelRegistryError,
+        match=r"tasks\.expression\.attempt_timeout_seconds",
+    ):
+        ModelsConfig(registry_path)
+
+
 def test_task_extra_merges_over_model_defaults_without_shared_mutation(
     tmp_path: Path,
 ) -> None:
@@ -240,6 +329,7 @@ def test_registry_digest_is_secret_free_and_route_sensitive(tmp_path: Path) -> N
     changed_path = tmp_path / "changed.toml"
     budget_path = tmp_path / "budget.toml"
     context_budget_path = tmp_path / "context-budget.toml"
+    attempt_timeout_path = tmp_path / "attempt-timeout.toml"
     endpoint_path = tmp_path / "endpoint.toml"
     inference_path = tmp_path / "inference.toml"
     _write_minimal_registry(first_path, api_key="secret-a")
@@ -260,6 +350,14 @@ def test_registry_digest_is_secret_free_and_route_sensitive(tmp_path: Path) -> N
     context_budget_path.write_text(
         context_budget_path.read_text(encoding="utf-8").replace(
             "context_tokens = 16000", "context_tokens = 15000"
+        ),
+        encoding="utf-8",
+    )
+    _write_minimal_registry(attempt_timeout_path, api_key="secret-a")
+    attempt_timeout_path.write_text(
+        attempt_timeout_path.read_text(encoding="utf-8").replace(
+            "context_tokens = 16000",
+            "context_tokens = 16000\nattempt_timeout_seconds = 240",
         ),
         encoding="utf-8",
     )
@@ -284,6 +382,7 @@ def test_registry_digest_is_secret_free_and_route_sensitive(tmp_path: Path) -> N
     changed = ModelsConfig(changed_path)
     budget = ModelsConfig(budget_path)
     context_budget = ModelsConfig(context_budget_path)
+    attempt_timeout = ModelsConfig(attempt_timeout_path)
     endpoint = ModelsConfig(endpoint_path)
     inference = ModelsConfig(inference_path)
 
@@ -292,6 +391,7 @@ def test_registry_digest_is_secret_free_and_route_sensitive(tmp_path: Path) -> N
     assert changed.snapshot.digest != first.snapshot.digest
     assert budget.snapshot.digest != first.snapshot.digest
     assert context_budget.snapshot.digest != first.snapshot.digest
+    assert attempt_timeout.snapshot.digest != first.snapshot.digest
     assert inference.snapshot.digest != first.snapshot.digest
     assert "secret-a" not in first.snapshot.digest
 

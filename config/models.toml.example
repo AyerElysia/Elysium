@@ -122,6 +122,15 @@ models = ["deepseek-v4-flash", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "
 tokens = 32000
 temp = 0.7
 context_tokens = 100000
+attempt_timeout_seconds = 180
+model_extra = { "deepseek-v4-flash" = { thinking = { type = "enabled" } }, "gpt-5.6-luna" = { reasoning_effort = "high" }, "gpt-5.6-terra" = { reasoning_effort = "high" }, "gpt-5.6-sol" = { reasoning_effort = "high" }, "MiMo-V2.5-Pro" = { enable_thinking = true }, "MiMo-V2.5" = { enable_thinking = true }, "claude-sonnet-5" = { thinking = { budget_tokens = 16000, type = "enabled" } } }
+
+[tasks.learning]
+models = ["deepseek-v4-flash", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "MiMo-V2.5-Pro", "gemini-3.5-flash", "MiMo-V2.5", "claude-sonnet-5"]
+tokens = 32000
+temp = 0.7
+context_tokens = 100000
+attempt_timeout_seconds = 300
 model_extra = { "deepseek-v4-flash" = { thinking = { type = "enabled" } }, "gpt-5.6-luna" = { reasoning_effort = "high" }, "gpt-5.6-terra" = { reasoning_effort = "high" }, "gpt-5.6-sol" = { reasoning_effort = "high" }, "MiMo-V2.5-Pro" = { enable_thinking = true }, "MiMo-V2.5" = { enable_thinking = true }, "claude-sonnet-5" = { thinking = { budget_tokens = 16000, type = "enabled" } } }
 
 [tasks.expression]
@@ -137,18 +146,21 @@ models = ["deepseek-v4-flash", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "
 tokens = 16000
 temp = 0.7
 context_tokens = 100000
+attempt_timeout_seconds = 300
 
 [tasks.agent]
 models = ["deepseek-v4-flash", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "MiMo-V2.5-Pro", "gemini-3.5-flash", "MiMo-V2.5", "claude-sonnet-5"]
 tokens = 32000
 temp = 0.7
 context_tokens = 200000
+attempt_timeout_seconds = 300
 
 [tasks.utility]
 models = ["deepseek-v4-flash", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "MiMo-V2.5", "gemini-3.5-flash"]
 tokens = 16000
 temp = 0.7
 context_tokens = 64000
+attempt_timeout_seconds = 180
 
 [tasks.vision]
 models = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "MiMo-V2.5", "gemini-3.5-flash"]

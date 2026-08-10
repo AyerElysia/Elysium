@@ -71,7 +71,7 @@ class ModelEntry(TypedDict):
     api_key: str               # API 密钥
     client_type: str           # 客户端类型
     max_retry: int             # 最大重试次数
-    timeout: float             # 超时（秒）
+    timeout: float             # 单候选 attempt 超时（秒；task 可覆盖 Provider）
     retry_interval: float      # 重试间隔
     price_in: float            # 输入价格
     price_out: float           # 输出价格
@@ -90,23 +90,28 @@ class ModelEntry(TypedDict):
 
 ### 2.4 当前任务路由（models.toml）
 
-| 任务 | 输入上下文预算 | 输出预算 |
-| --- | ---: | ---: |
-| core | 100000 | 32000 |
-| expression | 200000 | 32000 |
-| witness | 100000 | 16000 |
-| agent | 200000 | 32000 |
-| utility | 64000 | 16000 |
-| vision | 100000 | 16000 |
-| voice | — | 8192 |
-| embedding | — | 8192 |
-| router | 32000 | 8192 |
-| router_context_projection | 100000 | 16000 |
-| live | 100000 | 32000 |
+| 任务 | 输入上下文预算 | 输出预算 | 单候选 attempt 上限 |
+| --- | ---: | ---: | ---: |
+| core | 100000 | 32000 | 180 s |
+| learning | 100000 | 32000 | 300 s |
+| expression | 200000 | 32000 | Provider 默认值 |
+| witness | 100000 | 16000 | 300 s |
+| agent | 200000 | 32000 | 300 s |
+| utility | 64000 | 16000 | 180 s |
+| vision | 100000 | 16000 | Provider 默认值 |
+| voice | — | 8192 | Provider 默认值 |
+| embedding | — | 8192 | Provider 默认值 |
+| router | 32000 | 8192 | Provider 默认值 |
+| router_context_projection | 100000 | 16000 | Provider 默认值 |
+| live | 100000 | 32000 | Provider 默认值 |
 
 具体模型身份与主备顺序只在 `config/models.toml` 的任务数组中维护；Python 常量、测试与文档不得复制另一份模型名单。测试只验证 TOML 顺序能被原样保留、所有引用有效且能力约束成立。
 
 生成型任务的 `tokens` 同时覆盖隐式思考与最终正文；`context_tokens` 是任务级输入预算。预算随任务路由条目传递，故障转移到另一模型时保持不变，最终有效值取任务预算与“模型 `ctx` 减去输出保留量”的较小者。模型表只声明硬能力，不再承载任务压缩阈值。
+
+`tasks.<name>.attempt_timeout_seconds` 是该任务中**单个候选模型的一次尝试上限**。它存在时覆盖 Provider 的通用 `timeout`，并应用到该任务的全部候选；不存在时继续继承 Provider 值。它不是一次逻辑任务的总 deadline，也不会作为 `extra_params` 发送给上游。后台认知任务可以据此获得更充足的单次推理时间，而前台表达、路由和实时链路不随之被全局放慢。字段只接受正有限整数或浮点数；布尔值、字符串、零、负数和 NaN/Inf 均在加载时 fail closed。
+
+一次后台逻辑任务仍须由领域消费者持有独立、可取消的 monotonic 总 deadline。单候选 attempt、模型故障转移、响应消费和退避只能共同消耗该总预算，不能在每一阶段重新领取完整时限。`learning` 是独立的后台高强度认知路由；`core` 继续服务高频 Heartbeat，二者不再因为共享任务名而被迫使用同一完成时限。
 
 推理强度和请求级能力也由任务配置统一管理。`tasks.<name>.extra` 会合并到该任务的所有候选，`tasks.<name>.model_extra` 用于同一任务内不同协议的精确覆盖；优先级为 `models.<name>.extra < tasks.<name>.extra < tasks.<name>.model_extra.<model>`。覆盖只能引用本任务已注册候选，并与预算一起进入路由快照摘要；不得在 Python 中按模型名硬编码另一套任务策略。
 
@@ -128,7 +133,7 @@ GPT 5.6 保留 `ctx=300000` 作为硬窗口声明。任务级预算必须给输�
 
 加载器先在局部变量中完成整份文件的结构和引用验证，全部通过后才原子替换全局注册表。显式重载失败时，上一代有效快照继续保留；启动阶段首次加载失败则终止启动，不存在部分路由。
 
-快照内部不可变，并生成只依赖已启用任务链、任务预算与温度、任务推理/并发参数、模型能力以及 Provider 重试策略的摘要；API Key、端点和未启用模型不进入摘要或路由日志。启动日志输出一次完整任务优先链。每个任务条目携带 `routing_task`、`routing_priority` 和 `routing_snapshot`，选择日志与训练轨迹因此能够回答“配置首选是谁、实际选择谁、哪些模型因冷却被跳过”。启动预检只检查快照中自动任务实际引用的 Provider，不再检查旧配置或未启用 Provider。
+快照内部不可变，并生成只依赖已启用任务链、任务预算与温度、任务级 attempt 上限、任务推理/并发参数、模型能力以及 Provider 重试策略的摘要；API Key、端点和未启用模型不进入摘要或路由日志。启动日志输出一次完整任务优先链。每个任务条目携带 `routing_task`、`routing_priority` 和 `routing_snapshot`，选择日志与训练轨迹因此能够回答“配置首选是谁、实际选择谁、哪些模型因冷却被跳过”。启动预检只检查快照中自动任务实际引用的 Provider，不再检查旧配置或未启用 Provider。
 
 ---
 

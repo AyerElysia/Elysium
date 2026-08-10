@@ -43,6 +43,7 @@ class ModelRoutingSnapshot:
 PRODUCTION_MODEL_TASKS = frozenset(
     {
         "core",
+        "learning",
         "expression",
         "witness",
         "agent",
@@ -109,7 +110,15 @@ _MODEL_FIELDS = frozenset(
     }
 )
 _TASK_FIELDS = frozenset(
-    {"models", "tokens", "temp", "context_tokens", "extra", "model_extra"}
+    {
+        "models",
+        "tokens",
+        "temp",
+        "context_tokens",
+        "attempt_timeout_seconds",
+        "extra",
+        "model_extra",
+    }
 )
 _READY_CLIENT_TYPES = frozenset({"openai", "anthropic"})
 _NON_GENERATIVE_TASKS = frozenset({"voice", "embedding"})
@@ -173,6 +182,9 @@ class ModelsConfig:
                     "tokens": task.get("tokens", _DEFAULTS["tokens"]),
                     "temp": task.get("temp", _DEFAULTS["temp"]),
                     "context_tokens": task.get("context_tokens"),
+                    "attempt_timeout_seconds": task.get(
+                        "attempt_timeout_seconds"
+                    ),
                     "extra": task.get("extra", {}),
                     "model_extra": task.get("model_extra", {}),
                 }
@@ -499,6 +511,14 @@ class ModelsConfig:
                 or context_tokens <= 0
             ):
                 raise ModelRegistryError(f"tasks.{name}.context_tokens 必须是正整数")
+            attempt_timeout_seconds = task.get("attempt_timeout_seconds")
+            if attempt_timeout_seconds is not None:
+                cls._validate_number(
+                    attempt_timeout_seconds,
+                    location=f"tasks.{name}.attempt_timeout_seconds",
+                    minimum=0.0,
+                    strict=True,
+                )
             if context_tokens is not None and name not in _NON_GENERATIVE_TASKS:
                 insufficient_context = [
                     model_name
@@ -598,6 +618,7 @@ class ModelsConfig:
         max_tokens = int(task.get("tokens", _DEFAULTS["tokens"]))
         temperature = float(task.get("temp", _DEFAULTS["temp"]))
         context_tokens = task.get("context_tokens")
+        attempt_timeout_seconds = task.get("attempt_timeout_seconds")
         task_extra = self._thaw_value(task.get("extra", {}))
         task_model_extra = task.get("model_extra", {})
         model_set: list[dict[str, Any]] = []
@@ -613,6 +634,8 @@ class ModelsConfig:
                 routing_priority=priority,
             )
             if entry is not None:
+                if attempt_timeout_seconds is not None:
+                    entry["timeout"] = float(attempt_timeout_seconds)
                 extra_params = entry["extra_params"]
                 extra_params.update(task_extra)
                 extra_params.update(
