@@ -7,8 +7,12 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
-from plugins.life_engine.memory.experience import ExperienceRecord
+from plugins.life_engine.memory.experience import (
+    ExperienceAppendReport,
+    ExperienceRecord,
+)
 from plugins.life_engine.service.consciousness import (
     ConsciousnessInstance,
     ConsciousnessRegistry,
@@ -357,6 +361,158 @@ async def test_witness_loop_recovers_presence_conflict_without_losing_cursor(
     assert sequence_updates == [1]
     assert len(warning_records) == 1
     assert warning_records[0][1]["exc_info"].__class__ is PresenceRevisionConflict
+
+
+@pytest.mark.asyncio
+async def test_witness_loop_retries_mysql_2013_with_same_experience_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A selected-MySQL disconnect keeps the exact cursor window retryable."""
+
+    service, _memory, event_store, _perception_commits = _service(timeout_seconds=600.0)
+
+    class _RetryMemory(_MemoryStub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.append_calls = 0
+
+        async def append_experiences_detailed(
+            self,
+            records: list[ExperienceRecord],
+        ) -> ExperienceAppendReport:
+            self.append_calls += 1
+            canonical = tuple(records)
+            if self.append_calls == 1:
+                return ExperienceAppendReport(inserted=canonical)
+            return ExperienceAppendReport(existing=canonical)
+
+    memory = _RetryMemory()
+    service.memory_service = memory
+    coordinator = MemoryWitnessCoordinator(service)
+    author_windows: list[tuple[str, ...]] = []
+    delays: list[float] = []
+    warnings: list[str] = []
+    errors: list[str] = []
+    infos: list[str] = []
+
+    async def author(
+        _instance: ConsciousnessInstance,
+        records: list[ExperienceRecord],
+    ) -> str:
+        author_windows.append(tuple(item.event_id for item in records))
+        if len(author_windows) == 1:
+            raise OperationalError(
+                "SELECT selected presence",
+                {},
+                OSError(2013, "Lost connection to MySQL server during query"),
+                connection_invalidated=True,
+            )
+        service._state.running = False
+        return ""
+
+    async def no_wait(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(coordinator, "_author_witness", author)
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness.asyncio.sleep",
+        no_wait,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness.logger.warning",
+        warnings.append,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness.logger.error",
+        errors.append,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness.logger.info",
+        infos.append,
+    )
+
+    await coordinator.loop()
+
+    assert memory.append_calls == 2
+    assert author_windows == [("occ-private",), ("occ-private",)]
+    assert event_store.read_cursors == [0, 0]
+    assert event_store.offset_commits == [1]
+    assert delays == [10]
+    assert errors == []
+    assert len(warnings) == 1
+    assert "待处理经历已保留" in warnings[0]
+    assert "OperationalError(code=2013)" in warnings[0]
+    assert infos == ["记忆见证上游已恢复: previous_failures=1"]
+    sequence_updates = [
+        item["last_sequence"]
+        for item in memory.state_updates
+        if "last_sequence" in item
+    ]
+    assert sequence_updates == [1]
+
+
+@pytest.mark.asyncio
+async def test_witness_tail_presence_conflict_keeps_committed_run_successful(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-commit Presence CAS race cannot invalidate durable witness work."""
+
+    service, memory, event_store, _perception_commits = _service(timeout_seconds=600.0)
+    coordinator = MemoryWitnessCoordinator(service)
+    touch_calls = 0
+    refresh_calls = 0
+    projected: list[str] = []
+    warnings: list[str] = []
+
+    async def author(*_args: object) -> str:
+        return "committed first-person witness"
+
+    async def record_witness_memory(**kwargs: object) -> object:
+        return SimpleNamespace(
+            witness_id="witness-committed",
+            projection_path=kwargs["projection_path"],
+        )
+
+    async def project(witness: object) -> None:
+        projected.append(str(witness.witness_id))
+
+    async def touch(_instance_id: str, **_kwargs: object) -> None:
+        nonlocal touch_calls
+        touch_calls += 1
+        assert event_store.offset_commits == [1]
+        assert memory.state_updates[-1]["last_sequence"] == 1
+        assert memory.state_updates[-1]["last_error"] == ""
+        raise PresenceRevisionConflict("stale post-commit presence")
+
+    async def refresh() -> None:
+        nonlocal refresh_calls
+        refresh_calls += 1
+
+    memory.record_witness_memory = record_witness_memory  # type: ignore[attr-defined]
+    service.touch_consciousness_instance = touch
+    service.consciousness_registry.refresh = refresh
+    monkeypatch.setattr(coordinator, "_author_witness", author)
+    monkeypatch.setattr(coordinator, "_project_witness", project)
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness.logger.warning",
+        warnings.append,
+    )
+
+    report = await coordinator.run_once()
+
+    assert report.written_witnesses == ("witness-committed",)
+    assert report.last_sequence == 1
+    assert projected == ["witness-committed"]
+    assert event_store.offset_commits == [1]
+    assert touch_calls == 2
+    assert refresh_calls == 2
+    assert warnings == [
+        (
+            "记忆见证已提交，Presence 尾触摸仍有 CAS 冲突，"
+            "本轮成功状态保持不变: retry_count=1, "
+            "error=PresenceRevisionConflict"
+        )
+    ]
 
 
 @pytest.mark.asyncio

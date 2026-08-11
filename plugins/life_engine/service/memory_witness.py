@@ -16,6 +16,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from sqlalchemy.exc import DBAPIError
+
 from src.app.plugin_system.api.llm_api import get_model_set_by_task
 from src.app.plugin_system.api.log_api import get_logger
 from src.kernel.llm import ROLE, LLMPayload, LLMRequest, Text
@@ -40,6 +42,7 @@ MEMORY_WITNESS_INSTANCE_ID = "memory_witness"
 _NO_WITNESS = "<no_witness>"
 _TRANSIENT_ERROR_ESCALATION_COUNT = 3
 _CONCURRENCY_ERROR_ESCALATION_COUNT = 3
+_MYSQL_LOST_CONNECTION_ERROR_CODE = 2013
 
 _SELF_PRESENCE_SIDE_EFFECT_EVENT_TYPES = frozenset(
     {
@@ -69,9 +72,34 @@ def _transient_error_summary(exc: BaseException) -> str:
             details.append(f"status={exc.status_code}")
         if exc.error_code:
             details.append(f"code={exc.error_code}")
+    elif isinstance(exc, DBAPIError):
+        code = _dbapi_error_code(exc)
+        if code is not None:
+            details.append(f"code={code}")
     if len(details) == 1:
         return details[0]
     return f"{details[0]}({', '.join(details[1:])})"
+
+
+def _dbapi_error_code(exc: DBAPIError) -> int | None:
+    """Return a numeric DBAPI code without copying SQL or server text."""
+
+    for value in getattr(exc.orig, "args", ()):
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdecimal():
+            return int(value)
+    return None
+
+
+def _is_transient_mysql_disconnect(exc: BaseException) -> bool:
+    """Recognize the observed selected-MySQL connection-loss condition."""
+
+    return isinstance(exc, DBAPIError) and (
+        _dbapi_error_code(exc) == _MYSQL_LOST_CONNECTION_ERROR_CODE
+    )
 
 
 def _safe_log(
@@ -287,7 +315,9 @@ class MemoryWitnessCoordinator:
                     continue
 
                 concurrency_failures = 0
-                if not is_transient_llm_error(exc):
+                if not (
+                    is_transient_llm_error(exc) or _is_transient_mysql_disconnect(exc)
+                ):
                     transient_failures = 0
                     _safe_log("error", "记忆见证意识运行失败", exc_info=exc)
                     continue
@@ -456,7 +486,7 @@ class MemoryWitnessCoordinator:
                 expected_sequence=int(state.get("last_sequence", 0) or 0),
                 expected_revision=int(state.get("revision", 0) or 0),
             )
-            await self._service.touch_consciousness_instance(
+            await self._touch_presence_after_commit(
                 instance.instance_id,
                 timestamp=now,
             )
@@ -526,6 +556,48 @@ class MemoryWitnessCoordinator:
                 "error",
                 f"记忆见证 Presence 快照刷新失败: error={type(refresh_error).__name__}",
                 exc_info=refresh_error,
+            )
+
+    async def _touch_presence_after_commit(
+        self,
+        instance_id: str,
+        *,
+        timestamp: str,
+    ) -> None:
+        """Refresh one stale Presence snapshot without undoing committed work.
+
+        The Life Event offset, witness ledger/projection, and witness-state mirror
+        are already committed before this auxiliary activity touch.  A Presence
+        CAS race therefore cannot turn that durable success into a failed witness
+        run.  One refresh/retry is attempted; a repeated conflict is retained as
+        a content-free warning and the latest read snapshot is refreshed again.
+        """
+
+        try:
+            await self._service.touch_consciousness_instance(
+                instance_id,
+                timestamp=timestamp,
+            )
+            return
+        except asyncio.CancelledError:
+            raise
+        except PresenceRevisionConflict:
+            await self._refresh_presence_snapshot_safely()
+
+        try:
+            await self._service.touch_consciousness_instance(
+                instance_id,
+                timestamp=timestamp,
+            )
+        except asyncio.CancelledError:
+            raise
+        except PresenceRevisionConflict:
+            await self._refresh_presence_snapshot_safely()
+            _safe_log(
+                "warning",
+                "记忆见证已提交，Presence 尾触摸仍有 CAS 冲突，"
+                "本轮成功状态保持不变: retry_count=1, "
+                "error=PresenceRevisionConflict",
             )
 
     async def _retry_pending_projections(self) -> None:
