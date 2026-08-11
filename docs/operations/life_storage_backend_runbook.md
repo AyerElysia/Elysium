@@ -126,6 +126,40 @@ Memory 的本地合同测试不需要外部服务；真实 MySQL 合同测试必
 
 未提供必要变量时，真实 MySQL 用例必须明确显示为 skipped；不得借用正式数据库，也不得把 skipped 记作真实远程验收通过。`ELYSIUM_TEST_MYSQL_MEMORY_ISOLATED=1` 是允许安装破坏性 trigger 合同并保留随机测试历史的明确声明，绝不能指向正式库。测试会创建 Memory v1-v9 schema、安装两个独立 checksum 版本的不可变 trigger、注册隔离 generation 并取得短租约 authority；权威测试行不会用清理 `DELETE` 绕过不可变合同。
 
+### 6.1.1 已激活正式库的 Memory 增量升级
+
+Memory 的正常业务启动固定使用 `initialize_schema=false`：它只验证当前代码要求的 schema migration checksum 与数据库级 trigger，不会也不得在启动期间升级正式库。代码提高 `MEMORY_SCHEMA_VERSION` 或 `MEMORY_IMMUTABILITY_SCHEMA_VERSION` 后，必须先在 Elysium 完全停止、singleton writer claim 均已释放或过期的维护窗口执行独立升级：
+
+```bash
+uv run python scripts/adopt_life_mysql_baseline.py \
+  upgrade-memory \
+  --config config/core.toml \
+  --registry-id life-domain \
+  --confirm-memory-upgrade \
+  --output /new/evidence/memory-upgrade-<UTC>
+```
+
+`--output` 必须指向此前不存在的新目录。命令执行以下有界步骤：
+
+1. 在只读一致快照中记录原有 32 张 Memory 表的逐表行数、内容根与总根；
+2. 记录 active generation、authority epoch、owner、authority event head，以及数据库时间下仍存活的 singleton claims；存在活动 claim 时在 DDL 前失败；
+3. 分别取得 `elysium:life-memory-schema` 与 `elysium:life-memory-immutability` 正式 advisory lock，按 checksum 顺序应用全部已知 Memory migration；
+4. 核验完整的 Memory trigger 合同；当前 v9/v2 必须存在 44 条预期 trigger，其中 workspace projection event ledger 的 UPDATE/DELETE 均由数据库拒绝；
+5. 再次计算原有 32 张表的内容根并核对 authority。任一既有数据、generation、epoch、owner 或 authority event head 变化都失败关闭；本轮新建表必须初始为空；
+6. 写出 `memory-before.json`、`memory-after.json` 与 `memory-upgrade.json`。失败时另写不含凭据和业务正文的 `failure.json`。
+
+该模式不会注册或激活 generation，不会修改 authority，不会导入本地数据，也不会启动或停止 Elysium。MySQL DDL 可能自动提交：中途失败时保留证据目录，排除仍在写入的实例后重跑同一幂等命令；禁止手工补 migration row、删除 trigger 或以 candidate-copy 绕过正式升级。
+
+升级命令成功只证明数据库达到了启动前置条件，不等于运行验收完成。用户随后必须手动启动 Elysium，并至少确认：Life Engine 与 Memory 插件加载成功、Memory schema/immutability 校验通过、workspace owner/root 建立、Witness/索引 worker 没有因缺表或 trigger 漂移退出。没有这组真实启动证据时，相关代码提交只能保留在本地，禁止推送。
+
+破坏性升级合同只能运行在额外声明了以下安全门的专用隔离 MySQL 数据库：
+
+```text
+ELYSIUM_TEST_MYSQL_MEMORY_UPGRADE_ISOLATED=1
+```
+
+该数据库不得与正式库、其他共享测试或灾备副本复用。测试会把 Memory schema 明确降到 v8/v1 再执行 v9/v2 升级，并验证新 ledger 的数据库级 UPDATE/DELETE 拒绝。
+
 ### 6.2 Presence/World 隔离合同验证
 
 本地与 fake 合同验证覆盖数据库时间 lease、过期回收/takeover、revision/stream 并发、lifecycle outbox、World frontier/rebuild/cursor；service 级合同还会分别模拟 local/mysql 选择，证明单 runtime 注入、禁止旧 SQLite、重启恢复与失败关闭。真实 MySQL Presence/World 合同除通用 `ELYSIUM_TEST_MYSQL_*` 外，还必须显式设置：

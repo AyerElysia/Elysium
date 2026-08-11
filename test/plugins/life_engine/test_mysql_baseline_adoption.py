@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+import sys
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -115,6 +117,266 @@ async def test_learning_upgrade_orders_claim_and_learning_migrations(
         "learning_projections_projector_claim_update_v4",
         "learning_projections_projector_claim_delete_v4",
     }
+
+
+@pytest.mark.asyncio
+async def test_memory_upgrade_orders_schema_immutability_and_trigger_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+
+    class _Runner:
+        def __init__(self, _engine: object, *, table_name: str, lock_name: str):
+            calls.append(("runner", table_name, lock_name))
+
+        async def apply(self, migrations: tuple[object, ...]) -> None:
+            calls.append(
+                (
+                    "apply",
+                    tuple(
+                        (migration.version, migration.name)  # type: ignore[attr-defined]
+                        for migration in migrations
+                    ),
+                )
+            )
+
+    async def _verify(_engine: object, contracts: tuple[object, ...]) -> None:
+        calls.append(
+            (
+                "verify",
+                tuple(contract.name for contract in contracts),  # type: ignore[attr-defined]
+            )
+        )
+
+    monkeypatch.setattr(baseline, "MySQLMigrationRunner", _Runner)
+    monkeypatch.setattr(baseline, "verify_mysql_trigger_contract", _verify)
+
+    await baseline._install_memory_schema(object())  # type: ignore[arg-type]
+
+    assert calls[:4] == [
+        (
+            "runner",
+            "life_memory_schema_migrations",
+            "elysium:life-memory-schema",
+        ),
+        (
+            "apply",
+            tuple((item.version, item.name) for item in baseline.MEMORY_MIGRATIONS),
+        ),
+        (
+            "runner",
+            "life_memory_immutability_schema_migrations",
+            "elysium:life-memory-immutability",
+        ),
+        (
+            "apply",
+            tuple(
+                (item.version, item.name)
+                for item in baseline.MEMORY_IMMUTABILITY_MIGRATIONS
+            ),
+        ),
+    ]
+    assert calls[4][0] == "verify"
+    assert len(calls[4][1]) == 44
+    assert {
+        "memory_workspace_projection_events_immutable_update",
+        "memory_workspace_projection_events_immutable_delete",
+    }.issubset(set(calls[4][1]))
+
+
+def _memory_upgrade_snapshot(*, new_tables_present: bool) -> dict[str, object]:
+    existing = TableEvidence(
+        "memory_experiences",
+        3,
+        "a" * 64,
+        ("event_id",),
+        "InnoDB",
+        "utf8mb4_bin",
+    )
+    projection_tables = (
+        [
+            TableEvidence(
+                table_name,
+                0,
+                hashlib_empty,
+                (
+                    ("event_sha256",)
+                    if table_name.endswith("events")
+                    else ("storage_generation_id",)
+                ),
+                "InnoDB",
+                "utf8mb4_bin",
+            ).to_dict()
+            for table_name in baseline.MEMORY_UPGRADE_NEW_TABLES
+        ]
+        if new_tables_present
+        else []
+    )
+    authority = {
+        "registry_id": "life-domain",
+        "active_backend": "mysql",
+        "active_generation": "generation-1",
+        "authority_epoch": 7,
+        "owner_id": "owner-1",
+        "last_event_hash": "b" * 64,
+        "authority_event_count": 4,
+        "generation_backend": "mysql",
+        "generation_status": "verified",
+        "generation_manifest_sha256": "c" * 64,
+    }
+    return {
+        "existing_memory": {
+            "root_sha256": baseline._domain_root([existing]),
+            "row_count": 3,
+            "tables": [existing.to_dict()],
+        },
+        "workspace_projection": {
+            "present_tables": [item["table_name"] for item in projection_tables],
+            "root_sha256": "d" * 64,
+            "row_count": 0,
+            "tables": projection_tables,
+        },
+        "schema_migrations": baseline._expected_migration_evidence(
+            baseline.MEMORY_MIGRATIONS
+        ),
+        "immutability_migrations": baseline._expected_migration_evidence(
+            baseline.MEMORY_IMMUTABILITY_MIGRATIONS
+        ),
+        "installed_memory_trigger_names": sorted(
+            contract.name for contract in baseline._memory_trigger_contracts()
+        ),
+        "active_singleton_claims": [],
+        "local_elysium_processes": [],
+        "authority": authority,
+    }
+
+
+hashlib_empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+
+def test_memory_upgrade_invariants_accept_additive_empty_tables() -> None:
+    before = _memory_upgrade_snapshot(new_tables_present=False)
+    after = _memory_upgrade_snapshot(new_tables_present=True)
+
+    baseline._assert_memory_upgrade_invariants(before, after)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        (
+            lambda value: value["existing_memory"].update(root_sha256="f" * 64),
+            "existing Memory content changed",
+        ),
+        (
+            lambda value: value["authority"].update(authority_epoch=8),
+            "authority generation/epoch/owner changed",
+        ),
+        (
+            lambda value: value["workspace_projection"]["tables"][0].update(
+                row_count=1
+            ),
+            "new Memory table was not initialized empty",
+        ),
+    ),
+)
+def test_memory_upgrade_invariants_reject_data_or_authority_changes(
+    mutation: object,
+    message: str,
+) -> None:
+    before = _memory_upgrade_snapshot(new_tables_present=False)
+    after = _memory_upgrade_snapshot(new_tables_present=True)
+
+    mutation(after)  # type: ignore[operator]
+
+    with pytest.raises(RuntimeError, match=message):
+        baseline._assert_memory_upgrade_invariants(before, after)
+
+
+def test_memory_upgrade_invariants_reject_live_writer_claim() -> None:
+    before = _memory_upgrade_snapshot(new_tables_present=False)
+    after = _memory_upgrade_snapshot(new_tables_present=True)
+    before["active_singleton_claims"] = [{"namespace": "life_engine.runtime_context"}]
+
+    with pytest.raises(RuntimeError, match="all Elysium writers to be stopped"):
+        baseline._assert_memory_upgrade_invariants(before, after)
+
+
+def test_memory_upgrade_invariants_reject_local_elysium_process() -> None:
+    before = _memory_upgrade_snapshot(new_tables_present=False)
+    after = _memory_upgrade_snapshot(new_tables_present=True)
+    before["local_elysium_processes"] = [{"pid": 42}]
+
+    with pytest.raises(RuntimeError, match="local Elysium process to stop"):
+        baseline._assert_memory_upgrade_invariants(before, after)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        (
+            lambda value: value["schema_migrations"].pop(),
+            "schema migration contract is incomplete",
+        ),
+        (
+            lambda value: value["immutability_migrations"].pop(),
+            "immutability migration contract is incomplete",
+        ),
+        (
+            lambda value: value["installed_memory_trigger_names"].pop(),
+            "trigger contract is incomplete",
+        ),
+    ),
+)
+def test_memory_upgrade_invariants_reject_incomplete_installation(
+    mutation: object,
+    message: str,
+) -> None:
+    before = _memory_upgrade_snapshot(new_tables_present=False)
+    after = _memory_upgrade_snapshot(new_tables_present=True)
+
+    mutation(after)  # type: ignore[operator]
+
+    with pytest.raises(RuntimeError, match=message):
+        baseline._assert_memory_upgrade_invariants(before, after)
+
+
+def test_cli_exposes_explicit_memory_upgrade_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "adopt_life_mysql_baseline.py",
+            "upgrade-memory",
+            "--confirm-memory-upgrade",
+            "--output",
+            "evidence",
+        ],
+    )
+
+    args = baseline._arguments()
+
+    assert args.mode == "upgrade-memory"
+    assert args.confirm_memory_upgrade is True
+    assert args.output.name == "evidence"
+
+
+@pytest.mark.asyncio
+async def test_memory_upgrade_rejects_missing_confirmation(tmp_path: object) -> None:
+    args = argparse.Namespace(
+        confirm_memory_upgrade=False,
+        output=tmp_path,
+        registry_id="life-domain",
+    )
+
+    with pytest.raises(RuntimeError, match="--confirm-memory-upgrade"):
+        await baseline._upgrade_memory(
+            args,
+            object(),  # type: ignore[arg-type]
+            backend_identity="mysql://redacted",
+        )
 
 
 def test_evidence_value_encoding_preserves_type_and_exact_bytes() -> None:

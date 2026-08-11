@@ -16,6 +16,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import psutil
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
@@ -52,6 +53,7 @@ from plugins.life_engine.storage.learning_schema import (
 from plugins.life_engine.storage.memory.schema import (
     MEMORY_IMMUTABILITY_MIGRATIONS,
     MEMORY_IMMUTABILITY_TRIGGER_CONTRACT,
+    MEMORY_MIGRATIONS,
 )
 from plugins.life_engine.storage.migration.domain_copy import (
     TABLE_ORDER as PRESENCE_WORLD_TABLES,
@@ -125,6 +127,12 @@ ATTENTION_TABLES = (
     "attention_legacy_candidates",
 )
 
+MEMORY_UPGRADE_EXISTING_TABLES = tuple(SOURCE_TABLE_ORDER)
+MEMORY_UPGRADE_NEW_TABLES = (
+    "memory_workspace_projection_events",
+    "memory_workspace_projection_heads",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class TableEvidence:
@@ -158,6 +166,7 @@ def _arguments() -> argparse.Namespace:
             "upgrade-runtime-state",
             "upgrade-learning",
             "upgrade-attention",
+            "upgrade-memory",
         ),
     )
     parser.add_argument("--config", type=Path, default=_ROOT / "config" / "core.toml")
@@ -167,7 +176,36 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--lease-seconds", type=int, default=3600)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--confirm-remote-baseline", action="store_true")
+    parser.add_argument("--confirm-memory-upgrade", action="store_true")
     return parser.parse_args()
+
+
+def _local_elysium_processes() -> list[dict[str, int]]:
+    """Return content-free identities for locally running Elysium entrypoints."""
+
+    matches: list[dict[str, int]] = []
+    for process in psutil.process_iter(("pid", "cmdline", "cwd")):
+        if process.pid == os.getpid():
+            continue
+        try:
+            command = [str(item) for item in (process.info.get("cmdline") or [])]
+            cwd = str(process.info.get("cwd") or "")
+        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+            continue
+        if not any(Path(item).name == "main.py" for item in command):
+            continue
+        if not cwd:
+            continue
+        root = Path(cwd)
+        try:
+            is_elysium = (root / "AGENTS.md").is_file() and (
+                root / "plugins" / "life_engine"
+            ).is_dir()
+        except OSError:
+            continue
+        if is_elysium:
+            matches.append({"pid": int(process.pid)})
+    return sorted(matches, key=lambda item: item["pid"])
 
 
 def _load_database_config(path: Path) -> MySQLStorageConfig:
@@ -181,7 +219,9 @@ def _load_database_config(path: Path) -> MySQLStorageConfig:
         raise RuntimeError("database.mysql_password must be an environment reference")
     password = os.environ.get(match.group(1), "")
     if not password:
-        raise RuntimeError(f"required environment variable is missing: {match.group(1)}")
+        raise RuntimeError(
+            f"required environment variable is missing: {match.group(1)}"
+        )
     return MySQLStorageConfig(
         host=str(database.get("mysql_host") or ""),
         port=int(database.get("mysql_port") or 0),
@@ -284,10 +324,14 @@ async def _table_metadata(
     normalized_columns = tuple(str(item) for item in columns)
     normalized_keys = tuple(str(item) for item in keys)
     if not normalized_columns or not normalized_keys:
-        raise RuntimeError(f"required MySQL table has no stable primary key: {table_name}")
+        raise RuntimeError(
+            f"required MySQL table has no stable primary key: {table_name}"
+        )
     identifiers = (*normalized_columns, *normalized_keys)
     if any(not _IDENTIFIER.fullmatch(item) for item in identifiers):
-        raise RuntimeError(f"required MySQL table has an unsafe identifier: {table_name}")
+        raise RuntimeError(
+            f"required MySQL table has an unsafe identifier: {table_name}"
+        )
     return (
         normalized_columns,
         normalized_keys,
@@ -359,14 +403,18 @@ async def audit_remote_baseline(engine: AsyncEngine) -> dict[str, Any]:
             database_now = await connection.scalar(text("SELECT CURRENT_TIMESTAMP(6)"))
             server_version = str(await connection.scalar(text("SELECT VERSION()")))
             server_policy = (
-                await connection.execute(
-                    text(
-                        "SELECT @@GLOBAL.log_bin AS log_bin, "
-                        "@@GLOBAL.log_bin_trust_function_creators "
-                        "AS log_bin_trust_function_creators"
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT @@GLOBAL.log_bin AS log_bin, "
+                            "@@GLOBAL.log_bin_trust_function_creators "
+                            "AS log_bin_trust_function_creators"
+                        )
                     )
                 )
-            ).mappings().one()
+                .mappings()
+                .one()
+            )
             account = str(await connection.scalar(text("SELECT CURRENT_USER()")))
             raw_grants = (await connection.execute(text("SHOW GRANTS"))).scalars().all()
             grants = " ".join(str(item).upper() for item in raw_grants)
@@ -388,13 +436,17 @@ async def audit_remote_baseline(engine: AsyncEngine) -> dict[str, Any]:
             active_authorities = 0
             if "storage_backend_generations" in control_tables:
                 generation_rows = (
-                    await connection.execute(
-                        text(
-                            "SELECT generation_id, backend, status, manifest_sha256 "
-                            "FROM storage_backend_generations ORDER BY generation_id"
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT generation_id, backend, status, manifest_sha256 "
+                                "FROM storage_backend_generations ORDER BY generation_id"
+                            )
                         )
                     )
-                ).mappings().all()
+                    .mappings()
+                    .all()
+                )
                 registered_generations = len(generation_rows)
                 generation_summaries = [
                     {
@@ -550,8 +602,7 @@ async def _install_runtime_state_schema(engine: AsyncEngine) -> None:
     )
     await verify_mysql_trigger_contract(
         engine,
-        MYSQL_RUNTIME_EVENT_TRIGGERS
-        + MYSQL_RUNTIME_STATE_CLAIM_GUARD_TRIGGERS,
+        MYSQL_RUNTIME_EVENT_TRIGGERS + MYSQL_RUNTIME_STATE_CLAIM_GUARD_TRIGGERS,
     )
 
 
@@ -616,6 +667,342 @@ async def _audit_attention_tables(engine: AsyncEngine) -> dict[str, Any]:
         "row_count": sum(item.row_count for item in tables),
         "tables": [item.to_dict() for item in tables],
     }
+
+
+def _memory_trigger_contracts() -> tuple[MySQLTriggerContract, ...]:
+    return tuple(
+        MySQLTriggerContract(
+            name=name,
+            table=table,
+            manipulation=event_name,
+            timing="BEFORE",
+            action_fragment=(
+                "MemoryWitnessAuthorityImmutable"
+                if table == "memory_witnesses"
+                else "MemoryAuthorityRecordImmutable"
+            ),
+        )
+        for name, event_name, table in MEMORY_IMMUTABILITY_TRIGGER_CONTRACT
+    )
+
+
+async def _table_exists(connection: AsyncConnection, table_name: str) -> bool:
+    if not _IDENTIFIER.fullmatch(table_name):
+        raise ValueError(f"unsafe table name: {table_name!r}")
+    return bool(
+        await connection.scalar(
+            text(
+                "SELECT COUNT(*) FROM information_schema.TABLES "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table_name"
+            ),
+            {"table_name": table_name},
+        )
+    )
+
+
+async def _migration_evidence(
+    connection: AsyncConnection,
+    table_name: str,
+) -> list[dict[str, Any]]:
+    if not _IDENTIFIER.fullmatch(table_name):
+        raise ValueError(f"unsafe migration table name: {table_name!r}")
+    if not await _table_exists(connection, table_name):
+        return []
+    rows = (
+        await connection.execute(
+            text(f"SELECT version, name, checksum FROM `{table_name}` ORDER BY version")
+        )
+    ).mappings()
+    return [
+        {
+            "version": int(row["version"]),
+            "name": str(row["name"]),
+            "checksum": str(row["checksum"]),
+        }
+        for row in rows
+    ]
+
+
+async def _authority_evidence(
+    connection: AsyncConnection,
+    *,
+    registry_id: str,
+) -> dict[str, Any]:
+    row = (
+        (
+            await connection.execute(
+                text(
+                    "SELECT active_backend, active_generation, authority_epoch, "
+                    "owner_id, last_event_hash FROM storage_authority_registry "
+                    "WHERE registry_id = :registry_id"
+                ),
+                {"registry_id": registry_id},
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None or not str(row["active_generation"] or ""):
+        raise RuntimeError("Memory upgrade requires an active authority generation")
+    generation = (
+        (
+            await connection.execute(
+                text(
+                    "SELECT backend, status, manifest_sha256 "
+                    "FROM storage_backend_generations WHERE generation_id = :generation_id"
+                ),
+                {"generation_id": str(row["active_generation"])},
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if generation is None:
+        raise RuntimeError("active authority generation manifest is missing")
+    event_count = int(
+        await connection.scalar(
+            text(
+                "SELECT COUNT(*) FROM storage_authority_events "
+                "WHERE registry_id = :registry_id"
+            ),
+            {"registry_id": registry_id},
+        )
+        or 0
+    )
+    return {
+        "registry_id": registry_id,
+        "active_backend": str(row["active_backend"]),
+        "active_generation": str(row["active_generation"]),
+        "authority_epoch": int(row["authority_epoch"]),
+        "owner_id": str(row["owner_id"]),
+        "last_event_hash": str(row["last_event_hash"]),
+        "authority_event_count": event_count,
+        "generation_backend": str(generation["backend"]),
+        "generation_status": str(generation["status"]),
+        "generation_manifest_sha256": str(generation["manifest_sha256"]),
+    }
+
+
+async def _active_singleton_claims(
+    connection: AsyncConnection,
+) -> list[dict[str, Any]]:
+    if not await _table_exists(connection, "runtime_singleton_writer_claims"):
+        raise RuntimeError("singleton writer claim table is missing")
+    rows = (
+        await connection.execute(
+            text(
+                "SELECT generation_id, namespace, state_key, owner_instance_id, "
+                "lease_epoch, lease_until FROM runtime_singleton_writer_claims "
+                "WHERE released_at IS NULL AND lease_until > CURRENT_TIMESTAMP(6) "
+                "ORDER BY generation_id, namespace, state_key"
+            )
+        )
+    ).mappings()
+    claims: list[dict[str, Any]] = []
+    for row in rows:
+        lease_until = row["lease_until"]
+        claims.append(
+            {
+                "generation_id": str(row["generation_id"]),
+                "namespace": str(row["namespace"]),
+                "state_key": str(row["state_key"]),
+                "owner_instance_id": str(row["owner_instance_id"]),
+                "lease_epoch": int(row["lease_epoch"]),
+                "lease_until": (
+                    lease_until.isoformat()
+                    if isinstance(lease_until, (date, datetime, time))
+                    else str(lease_until)
+                ),
+            }
+        )
+    return claims
+
+
+async def _memory_upgrade_evidence(
+    engine: AsyncEngine,
+    *,
+    registry_id: str,
+) -> dict[str, Any]:
+    async with engine.connect() as connection:
+        await connection.execute(
+            text("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        )
+        await connection.execute(
+            text("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
+        )
+        try:
+            existing = [
+                await _audit_table(connection, table_name)
+                for table_name in MEMORY_UPGRADE_EXISTING_TABLES
+            ]
+            projection_tables = [
+                await _audit_table(connection, table_name)
+                for table_name in MEMORY_UPGRADE_NEW_TABLES
+                if await _table_exists(connection, table_name)
+            ]
+            authority = await _authority_evidence(
+                connection,
+                registry_id=registry_id,
+            )
+            claims = await _active_singleton_claims(connection)
+            schema_migrations = await _migration_evidence(
+                connection,
+                "life_memory_schema_migrations",
+            )
+            immutability_migrations = await _migration_evidence(
+                connection,
+                "life_memory_immutability_schema_migrations",
+            )
+            trigger_names = {
+                str(item)
+                for item in (
+                    await connection.execute(
+                        text(
+                            "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS "
+                            "WHERE TRIGGER_SCHEMA = DATABASE()"
+                        )
+                    )
+                ).scalars()
+            }
+            server_policy = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT @@GLOBAL.log_bin AS log_bin, "
+                            "@@GLOBAL.log_bin_trust_function_creators "
+                            "AS log_bin_trust_function_creators"
+                        )
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            grants = " ".join(
+                str(item).upper()
+                for item in (await connection.execute(text("SHOW GRANTS"))).scalars()
+            )
+            database_now = await connection.scalar(text("SELECT CURRENT_TIMESTAMP(6)"))
+        finally:
+            await connection.rollback()
+    expected_trigger_names = {contract.name for contract in _memory_trigger_contracts()}
+    return {
+        "schema_version": 1,
+        "audited_at": (
+            database_now.replace(tzinfo=database_now.tzinfo or UTC).isoformat()
+            if isinstance(database_now, datetime)
+            else datetime.now(UTC).isoformat()
+        ),
+        "existing_memory": {
+            "root_sha256": _domain_root(existing),
+            "row_count": sum(item.row_count for item in existing),
+            "tables": [item.to_dict() for item in existing],
+        },
+        "workspace_projection": {
+            "present_tables": [item.table_name for item in projection_tables],
+            "root_sha256": _domain_root(projection_tables),
+            "row_count": sum(item.row_count for item in projection_tables),
+            "tables": [item.to_dict() for item in projection_tables],
+        },
+        "schema_migrations": schema_migrations,
+        "immutability_migrations": immutability_migrations,
+        "installed_memory_trigger_names": sorted(
+            expected_trigger_names & trigger_names
+        ),
+        "expected_memory_trigger_count": len(expected_trigger_names),
+        "active_singleton_claims": claims,
+        "authority": authority,
+        "local_elysium_processes": _local_elysium_processes(),
+        "server_policy": {
+            "log_bin": bool(server_policy["log_bin"]),
+            "log_bin_trust_function_creators": bool(
+                server_policy["log_bin_trust_function_creators"]
+            ),
+            "trigger_privilege": "TRIGGER" in grants or "ALL PRIVILEGES" in grants,
+        },
+    }
+
+
+def _expected_migration_evidence(
+    migrations: tuple[Any, ...],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "version": int(migration.version),
+            "name": str(migration.name),
+            "checksum": str(migration.checksum),
+        }
+        for migration in migrations
+    ]
+
+
+def _assert_memory_upgrade_invariants(
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> None:
+    if list(before.get("local_elysium_processes") or []):
+        raise RuntimeError("Memory upgrade requires the local Elysium process to stop")
+    if list(before.get("active_singleton_claims") or []):
+        raise RuntimeError("Memory upgrade requires all Elysium writers to be stopped")
+    if list(after.get("local_elysium_processes") or []):
+        raise RuntimeError("a local Elysium process appeared during Memory upgrade")
+    if list(after.get("active_singleton_claims") or []):
+        raise RuntimeError("an Elysium writer appeared during Memory upgrade")
+    if before["authority"] != after["authority"]:
+        raise RuntimeError(
+            "authority generation/epoch/owner changed during Memory upgrade"
+        )
+    if before["existing_memory"] != after["existing_memory"]:
+        raise RuntimeError("existing Memory content changed during schema upgrade")
+    if after["schema_migrations"] != _expected_migration_evidence(MEMORY_MIGRATIONS):
+        raise RuntimeError("Memory schema migration contract is incomplete or drifted")
+    if after["immutability_migrations"] != _expected_migration_evidence(
+        MEMORY_IMMUTABILITY_MIGRATIONS
+    ):
+        raise RuntimeError(
+            "Memory immutability migration contract is incomplete or drifted"
+        )
+    expected_triggers = sorted(
+        contract.name for contract in _memory_trigger_contracts()
+    )
+    if after["installed_memory_trigger_names"] != expected_triggers:
+        raise RuntimeError("Memory trigger contract is incomplete after upgrade")
+    before_tables = {
+        str(item["table_name"]): item
+        for item in before["workspace_projection"]["tables"]
+    }
+    after_tables = {
+        str(item["table_name"]): item
+        for item in after["workspace_projection"]["tables"]
+    }
+    if set(after_tables) != set(MEMORY_UPGRADE_NEW_TABLES):
+        raise RuntimeError("Memory workspace projection tables are incomplete")
+    for table_name in MEMORY_UPGRADE_NEW_TABLES:
+        if table_name not in before_tables:
+            if int(after_tables[table_name]["row_count"]) != 0:
+                raise RuntimeError(
+                    f"new Memory table was not initialized empty: {table_name}"
+                )
+            continue
+        if before_tables[table_name] != after_tables[table_name]:
+            raise RuntimeError(
+                f"existing Memory workspace projection table changed: {table_name}"
+            )
+
+
+async def _install_memory_schema(engine: AsyncEngine) -> None:
+    schema_runner = MySQLMigrationRunner(
+        engine,
+        table_name="life_memory_schema_migrations",
+        lock_name="elysium:life-memory-schema",
+    )
+    await schema_runner.apply(MEMORY_MIGRATIONS)
+    immutability_runner = MySQLMigrationRunner(
+        engine,
+        table_name="life_memory_immutability_schema_migrations",
+        lock_name="elysium:life-memory-immutability",
+    )
+    await immutability_runner.apply(MEMORY_IMMUTABILITY_MIGRATIONS)
+    await verify_mysql_trigger_contract(engine, _memory_trigger_contracts())
 
 
 async def _install_attention_schema(engine: AsyncEngine) -> None:
@@ -706,6 +1093,70 @@ async def _install_immutability(engine: AsyncEngine) -> None:
             ) from exc
 
 
+async def _upgrade_memory(
+    args: argparse.Namespace,
+    engine: AsyncEngine,
+    *,
+    backend_identity: str,
+) -> dict[str, Any]:
+    if not args.confirm_memory_upgrade:
+        raise RuntimeError("Memory upgrade requires --confirm-memory-upgrade")
+    if args.output is None:
+        raise RuntimeError("Memory upgrade requires --output")
+    output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    try:
+        before = await _memory_upgrade_evidence(
+            engine,
+            registry_id=str(args.registry_id),
+        )
+        _write_json(output / "memory-before.json", before)
+        if list(before.get("local_elysium_processes") or []):
+            raise RuntimeError(
+                "Memory upgrade requires the local Elysium process to stop"
+            )
+        if list(before.get("active_singleton_claims") or []):
+            raise RuntimeError(
+                "Memory upgrade requires all Elysium writers to be stopped"
+            )
+        _guard_trigger_installation(before)
+    except Exception as exc:
+        _write_json(output / "failure.json", _safe_failure(exc, stage="memory_before"))
+        raise
+    try:
+        await _install_memory_schema(engine)
+    except Exception as exc:
+        _write_json(
+            output / "failure.json", _safe_failure(exc, stage="memory_migrations")
+        )
+        raise
+    try:
+        after = await _memory_upgrade_evidence(
+            engine,
+            registry_id=str(args.registry_id),
+        )
+        _write_json(output / "memory-after.json", after)
+        _assert_memory_upgrade_invariants(before, after)
+    except Exception as exc:
+        _write_json(output / "failure.json", _safe_failure(exc, stage="memory_after"))
+        raise
+    result = {
+        "status": "memory_schema_upgraded",
+        "backend_identity": backend_identity,
+        "schema_versions": [item["version"] for item in after["schema_migrations"]],
+        "immutability_versions": [
+            item["version"] for item in after["immutability_migrations"]
+        ],
+        "verified_memory_trigger_count": len(after["installed_memory_trigger_names"]),
+        "existing_memory_root_sha256": after["existing_memory"]["root_sha256"],
+        "existing_memory_row_count": after["existing_memory"]["row_count"],
+        "authority": after["authority"],
+        "evidence_directory": str(output),
+    }
+    _write_json(output / "memory-upgrade.json", result)
+    return result
+
+
 def _write_json(path: Path, value: dict[str, Any]) -> None:
     path.write_text(canonical_json(value) + "\n", encoding="utf-8")
 
@@ -745,7 +1196,9 @@ async def _activate(args: argparse.Namespace, engine: AsyncEngine) -> dict[str, 
         before = await audit_remote_baseline(engine)
         _write_json(output / "baseline-before.json", before)
     except Exception as exc:
-        _write_json(output / "failure.json", _safe_failure(exc, stage="baseline_before"))
+        _write_json(
+            output / "failure.json", _safe_failure(exc, stage="baseline_before")
+        )
         raise
     try:
         _guard_trigger_installation(before)
@@ -755,14 +1208,20 @@ async def _activate(args: argparse.Namespace, engine: AsyncEngine) -> dict[str, 
     try:
         await _install_immutability(engine)
     except Exception as exc:
-        stage = str(exc) if str(exc).startswith("immutability stage failed:") else "immutability"
+        stage = (
+            str(exc)
+            if str(exc).startswith("immutability stage failed:")
+            else "immutability"
+        )
         _write_json(output / "failure.json", _safe_failure(exc, stage=stage))
         raise
     try:
         after = await audit_remote_baseline(engine)
         _write_json(output / "baseline-after.json", after)
         if before["global_root_sha256"] != after["global_root_sha256"]:
-            raise RuntimeError("remote baseline changed while immutability was installed")
+            raise RuntimeError(
+                "remote baseline changed while immutability was installed"
+            )
     except Exception as exc:
         _write_json(output / "failure.json", _safe_failure(exc, stage="baseline_after"))
         raise
@@ -811,6 +1270,12 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     config = _load_database_config(args.config)
     engine = create_mysql_storage_engine(config)
     try:
+        if args.mode == "upgrade-memory":
+            return await _upgrade_memory(
+                args,
+                engine,
+                backend_identity=config.safe_identity,
+            )
         if args.mode == "upgrade-runtime-state":
             await _install_runtime_state_schema(engine)
             return {

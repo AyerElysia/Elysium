@@ -232,6 +232,8 @@ Elysium 中所有 `ConsciousnessInstance` 都是同一持续主体的局部运�
 - 只显式暂存本任务文件；混合所有权文件使用 hunk、隔离工作树或精确 index patch；
 - 提交前必须检查 `git diff --cached --name-status` 和 `git diff --cached --check`；
 - 推送前 fetch 并检查远端分叉，禁止用 force push 覆盖并发提交；
+- 任何提交在推送前必须先完成与变更风险相称的真实启动验收；尚未验证启动时只能保留为本地提交，禁止推送；
+- 涉及 Elysium 启动、配置、存储、迁移、插件加载或运行时的变更，必须由用户手动启动 Elysium，并以启动成功及关键链路日志作为验收证据；agent 不得自动启动 Elysium 代替验收。若启动仍被故障阻断，修复提交必须留在本地，待验收通过后再推送；
 - 不得提交 `.git.zip`、`runtime/`、数据库、日志、缓存、密钥或用户临时文件；
 - 不得使用 `git reset --hard`、宽范围 checkout/restore 或递归删除来处理未知修改；
 - 修改已经完成并获授权提交时，提交信息应描述真实边界，推送后核对本地与远端一致。
