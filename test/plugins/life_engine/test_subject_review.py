@@ -367,7 +367,10 @@ async def test_memory_engineering_pressure_invites_review_without_auto_deletion(
     )
 
     assert item["due"] is True
-    assert item["due_reasons"] == ["engineering_pressure"]
+    assert item["due_reasons"] == [
+        "engineering_pressure",
+        "continuity_index_review",
+    ]
     assert item["soft_target_bytes"] == CONTINUITY_MEMORY_SOFT_TARGET_BYTES
     assert item["review_pressure_bytes"] == (CONTINUITY_MEMORY_REVIEW_PRESSURE_BYTES)
     assert item["review_pressure_reached"] is True
@@ -376,6 +379,141 @@ async def test_memory_engineering_pressure_invites_review_without_auto_deletion(
     assert "不授权自动删除" in prompt
     assert "nucleus_create_memory_boundary" in prompt
     assert memory.exists()
+
+
+async def test_memory_above_soft_target_without_index_invites_structural_review(
+    tmp_path: Path,
+) -> None:
+    for path in ("SOUL.md", "USER.md"):
+        (tmp_path / path).write_text(f"# {path}\ncurrent\n", encoding="utf-8")
+    memory = tmp_path / "MEMORY.md"
+    memory.write_bytes(b"# MEMORY\n" + b"x" * (CONTINUITY_MEMORY_SOFT_TARGET_BYTES + 1))
+    scheduler = LearningScheduler(
+        workspace_path=tmp_path,
+        current_subject_revision=lambda: _revision("a"),
+        validate_active_consciousness_instance=lambda actor: _is_active(actor),
+        subject_review_soul_interval_hours=720.0,
+        subject_review_user_interval_hours=720.0,
+        subject_review_memory_interval_hours=720.0,
+    )
+
+    snapshot = await scheduler.get_subject_review_snapshot()
+    item = next(
+        document
+        for document in snapshot["documents"]
+        if document["target_path"] == "MEMORY.md"
+    )
+
+    assert item["due"] is True
+    assert item["due_reasons"] == ["continuity_index_review"]
+    assert item["continuity_index_state"] == "absent"
+    assert item["continuity_index_semantics"] == "structural_review_only"
+    assert item["review_pressure_reached"] is False
+    health_item = next(
+        document
+        for document in scheduler.get_state()["subject_review"]["documents"]
+        if document["target_path"] == "MEMORY.md"
+    )
+    assert health_item["due"] is True
+    assert health_item["continuity_index_state"] == "absent"
+    prompt = await scheduler.get_subject_review_prompt()
+    assert "不判断任何记忆是否重要" in prompt
+    assert "nucleus_create_memory_boundary_from_subject_range" in prompt
+
+    await scheduler.record_subject_review_outcome(
+        target_path="MEMORY.md",
+        outcome="unchanged",
+        actor_consciousness_instance_id="consciousness-1",
+        subject_revision="a" * 64,
+        occurrence_id="review:memory:index-not-needed-now",
+        reason="I reviewed this exact version and choose not to add an index now.",
+    )
+    acknowledged = await scheduler.get_subject_review_snapshot()
+    acknowledged_item = next(
+        document
+        for document in acknowledged["documents"]
+        if document["target_path"] == "MEMORY.md"
+    )
+    assert acknowledged_item["continuity_index_review_due"] is False
+    assert acknowledged_item["due"] is False
+
+
+async def test_explicit_boundary_index_suppresses_absence_review_signal(
+    tmp_path: Path,
+) -> None:
+    for path in ("SOUL.md", "USER.md"):
+        (tmp_path / path).write_text(f"# {path}\ncurrent\n", encoding="utf-8")
+    uri = "memory://boundary/kept-memory@artifact_" + "b" * 64 + "#sha256=" + "a" * 64
+    memory = tmp_path / "MEMORY.md"
+    memory.write_text(
+        "# MEMORY\n\n[完整记忆](" + uri + ")\n" + "x" * 17000,
+        encoding="utf-8",
+    )
+    scheduler = LearningScheduler(
+        workspace_path=tmp_path,
+        current_subject_revision=lambda: _revision("a"),
+        subject_review_memory_interval_hours=720.0,
+    )
+
+    snapshot = await scheduler.get_subject_review_snapshot()
+    item = next(
+        document
+        for document in snapshot["documents"]
+        if document["target_path"] == "MEMORY.md"
+    )
+
+    assert item["continuity_index_entry_count"] == 1
+    assert item["continuity_index_state"] == "present"
+    assert item["continuity_index_review_due"] is False
+    assert item["due"] is False
+
+
+async def test_open_subject_candidate_is_reoffered_only_after_exact_delivery(
+    tmp_path: Path,
+) -> None:
+    for path in ("SOUL.md", "USER.md", "MEMORY.md"):
+        (tmp_path / path).write_text(f"# {path}\ncurrent\n", encoding="utf-8")
+    scheduler = LearningScheduler(
+        workspace_path=tmp_path,
+        current_subject_revision=lambda: _revision("a"),
+        subject_review_soul_interval_hours=720.0,
+        subject_review_user_interval_hours=720.0,
+        subject_review_memory_interval_hours=720.0,
+        subject_review_offer_cooldown_hours=24.0,
+    )
+    state, review = scheduler._subject_review_state()
+    review["documents"]["MEMORY.md"] = {
+        "last_outcome": "candidate_proposed",
+        "last_candidate_id": "subject-candidate-memory-1",
+        "last_candidate_sha256": "c" * 64,
+    }
+    state["subject_review_v1"] = review
+    scheduler.store.save_state(state)
+
+    snapshot = await scheduler.get_subject_review_snapshot()
+    memory = next(
+        item for item in snapshot["documents"] if item["target_path"] == "MEMORY.md"
+    )
+    assert memory["due"] is True
+    assert memory["due_reasons"] == ["candidate_decision_pending"]
+    prompt = await scheduler.get_subject_review_prompt()
+    pending = scheduler.get_pending_subject_review_offer()
+    assert "保持开放、拒绝或接受都有效" in prompt
+    assert "nucleus_read_subject_candidate" in prompt
+    assert pending is not None
+
+    identity = str(pending["delivery_id"])
+    receipt = EffectiveContextReceipt(
+        delivery_id=identity,
+        exact_present=True,
+        expected_utf8_bytes=100,
+        expected_sha256="d" * 64,
+        effective_utf8_bytes=100,
+        effective_sha256="d" * 64,
+        part_kind="text",
+    )
+    assert await scheduler.commit_subject_review_offer_delivery(identity, receipt)
+    assert (await scheduler.get_subject_review_snapshot())["due_count"] == 0
 
 
 async def test_review_invitation_cooldown_starts_only_after_exact_delivery(
@@ -535,6 +673,13 @@ async def test_selected_document_identity_is_from_one_authority_snapshot(
     assert version_id == "remote-version-3-1"
     assert revision == "a" * 64
 
+    snapshot = await scheduler.read_subject_document_snapshot("MEMORY.md")
+    assert snapshot.content_bytes == b"remote memory"
+    assert snapshot.version_id == "remote-version-3-1"
+    assert snapshot.source_occurrence_id == "remote-occurrence-3"
+    assert snapshot.unified_subject_revision == "a" * 64
+    assert snapshot.provenance_status == "complete"
+
 
 async def test_selected_review_snapshot_reads_one_coherent_authority_snapshot(
     tmp_path: Path,
@@ -565,6 +710,11 @@ async def test_selected_review_snapshot_reads_one_coherent_authority_snapshot(
     assert {item["size_bytes"] for item in snapshot["documents"]} == {
         len(value) for value in remote.values()
     }
+    memory = next(
+        item for item in snapshot["documents"] if item["target_path"] == "MEMORY.md"
+    )
+    assert memory["version_id"] == "remote-version-3-1"
+    assert memory["source_occurrence_id"] == "remote-occurrence-3"
 
 
 async def test_selected_review_baseline_survives_checks_restart_and_head_changes(

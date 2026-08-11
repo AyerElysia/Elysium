@@ -7,6 +7,7 @@ import json
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from typing import Annotated, Any, ClassVar
+from urllib.parse import quote
 
 from src.app.plugin_system.api import log_api
 from src.app.plugin_system.base import BaseTool
@@ -201,6 +202,81 @@ def _segment_from_payload(
     )
 
 
+def _segment_from_subject_range(
+    payload: dict[str, Any],
+    *,
+    memory_bytes: bytes,
+    memory_version_id: str,
+    memory_sha256: str,
+    source_occurrence_id: str,
+    default_scope: str,
+    default_visibility: str,
+    previous_end: int,
+) -> tuple[MemoryBoundarySegment, int, dict[str, Any]]:
+    """Build one exact segment without accepting model-supplied source text."""
+
+    allowed = {
+        "segment_id",
+        "title",
+        "byte_start",
+        "byte_end",
+        "scope",
+        "visibility",
+    }
+    unexpected = sorted(set(payload) - allowed)
+    if unexpected:
+        raise ValueError(
+            "MemoryBoundaryReviewedRangeFieldsInvalid:" + ",".join(unexpected)
+        )
+    byte_start = payload.get("byte_start")
+    byte_end = payload.get("byte_end")
+    if (
+        isinstance(byte_start, bool)
+        or not isinstance(byte_start, int)
+        or isinstance(byte_end, bool)
+        or not isinstance(byte_end, int)
+        or byte_start < 0
+        or byte_end <= byte_start
+        or byte_end > len(memory_bytes)
+    ):
+        raise ValueError("MemoryBoundaryReviewedRangeInvalid")
+    if byte_start < previous_end:
+        raise ValueError("MemoryBoundaryReviewedRangesOverlapOrUnordered")
+    try:
+        content = memory_bytes[byte_start:byte_end].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("MemoryBoundaryReviewedRangeNotUtf8Boundary") from exc
+    range_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    source_ref = (
+        "subject://life_engine_workspace/MEMORY.md@"
+        + quote(memory_version_id, safe="._:-")
+        + f"#sha256={memory_sha256}"
+        + f"&bytes={byte_start}-{byte_end}"
+        + f"&range_sha256={range_sha256}"
+    )
+    segment = MemoryBoundarySegment.create(
+        segment_id=str(payload.get("segment_id") or ""),
+        title=str(payload.get("title") or ""),
+        content=content,
+        source_refs=(source_ref,),
+        source_occurrence_ids=(source_occurrence_id,),
+        scope=str(payload.get("scope") or default_scope),
+        visibility=str(payload.get("visibility") or default_visibility),
+    )
+    return (
+        segment,
+        byte_end,
+        {
+            "segment_id": segment.segment_id,
+            "byte_start": byte_start,
+            "byte_end": byte_end,
+            "byte_length": segment.byte_length,
+            "content_sha256": segment.content_sha256,
+            "source_ref_sha256": hashlib.sha256(source_ref.encode("utf-8")).hexdigest(),
+        },
+    )
+
+
 class LifeCreateMemoryBoundaryTool(BaseTool):
     """Create or revise one complete immutable long-memory boundary."""
 
@@ -310,6 +386,158 @@ class LifeCreateMemoryBoundaryTool(BaseTool):
             }
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"长期记忆边界记录失败: error_type={type(exc).__name__}")
+            return False, {"error": type(exc).__name__, "detail": str(exc)}
+
+
+class LifeCreateMemoryBoundaryFromSubjectRangeTool(BaseTool):
+    """Seal exact reviewed MEMORY bytes into an immutable boundary."""
+
+    tool_name = "nucleus_create_memory_boundary_from_subject_range"
+    tool_description = (
+        "从你刚用 nucleus_review_subject_document 读过的权威 MEMORY.md 精确字节范围"
+        "创建不可变 Boundary。正文由服务端按 version/hash/UTF-8 范围直接截取，禁止"
+        "重新转写；标题、边界与当前理解仍由你表达。它只保存 Boundary，不修改 "
+        "MEMORY.md，不提出或接受候选。"
+    )
+    chatter_allow: ClassVar[list[str]] = ["life_engine_internal", "life_chatter"]
+
+    async def execute(
+        self,
+        boundary_id: Annotated[str, "稳定的技术边界 ID；ASCII 字母数字开头"],
+        title: Annotated[str, "由你书写的边界标题"],
+        scope: Annotated[str, "这段记忆覆盖什么、不覆盖什么"],
+        current_meaning: Annotated[str, "你目前如何理解它；不是客观事实判定"],
+        non_generalization: Annotated[str, "这段记忆不应被自动泛化成什么"],
+        segments: Annotated[
+            list[dict[str, Any]],
+            "有序精确范围：segment_id/title/byte_start/byte_end，可选 scope/visibility；不得传 content/source_refs",
+        ],
+        expected_subject_revision: Annotated[
+            str, "status 返回的统一 SOUL+USER+MEMORY revision"
+        ],
+        reviewed_memory_version_id: Annotated[
+            str, "status 返回的 MEMORY.md 精确 version_id"
+        ],
+        reviewed_content_sha256: Annotated[
+            str, "status 返回的 MEMORY.md 完整内容 SHA-256"
+        ],
+        expected_head_revision: Annotated[
+            int, "新建为 0；更新使用 history 返回的 head revision"
+        ] = 0,
+        visibility: Annotated[str, "开放文本可见范围"] = "private",
+    ) -> tuple[bool, dict[str, Any]]:
+        try:
+            runtime = await _resolve_runtime(self)
+            validated_revision = (
+                await runtime.scheduler.validate_subject_review_context(
+                    actor_consciousness_instance_id=(
+                        runtime.actor_consciousness_instance_id
+                    ),
+                    expected_subject_revision=str(expected_subject_revision),
+                )
+            )
+            snapshot = await runtime.scheduler.read_subject_document_snapshot(
+                "MEMORY.md"
+            )
+            if snapshot.unified_subject_revision != validated_revision:
+                raise RuntimeError("LearningSubjectRevisionConflict")
+            reviewed_version = str(reviewed_memory_version_id or "").strip()
+            if reviewed_version != snapshot.version_id:
+                raise RuntimeError("MemoryBoundarySourceVersionConflict")
+            reviewed_hash = str(reviewed_content_sha256 or "").strip().lower()
+            if reviewed_hash != snapshot.content_sha256:
+                raise RuntimeError("MemoryBoundarySourceContentHashConflict")
+            try:
+                snapshot.content_bytes.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("MemoryBoundarySourceDocumentNotUtf8") from exc
+            if not isinstance(segments, list) or not segments:
+                return False, {"error": "MemoryBoundaryReviewedRangesRequired"}
+
+            parsed_segments: list[MemoryBoundarySegment] = []
+            range_receipts: list[dict[str, Any]] = []
+            previous_end = 0
+            for payload in segments:
+                if not isinstance(payload, dict):
+                    return False, {"error": "MemoryBoundaryReviewedRangeObjectRequired"}
+                segment, previous_end, receipt = _segment_from_subject_range(
+                    payload,
+                    memory_bytes=snapshot.content_bytes,
+                    memory_version_id=snapshot.version_id,
+                    memory_sha256=snapshot.content_sha256,
+                    source_occurrence_id=snapshot.source_occurrence_id,
+                    default_scope=str(scope),
+                    default_visibility=str(visibility),
+                    previous_end=previous_end,
+                )
+                parsed_segments.append(segment)
+                range_receipts.append(receipt)
+
+            occurrence = _stable_occurrence(
+                self,
+                "memory_boundary_subject_range_operation",
+                {
+                    "boundary_id": boundary_id,
+                    "title": title,
+                    "scope": scope,
+                    "current_meaning": current_meaning,
+                    "non_generalization": non_generalization,
+                    "ranges": range_receipts,
+                    "expected_head_revision": expected_head_revision,
+                    "source_memory_version_id": snapshot.version_id,
+                    "source_memory_sha256": snapshot.content_sha256,
+                    "subject_revision": validated_revision,
+                    "visibility": visibility,
+                },
+            )
+            manifest = MemoryBoundaryManifest(
+                boundary_id=str(boundary_id),
+                manifest_revision=int(expected_head_revision) + 1,
+                operation_occurrence_id=occurrence,
+                title=str(title),
+                scope=str(scope),
+                current_meaning=str(current_meaning),
+                non_generalization=str(non_generalization),
+                actor_id=runtime.actor_consciousness_instance_id,
+                consciousness_instance_id=(runtime.actor_consciousness_instance_id),
+                stream_scope=runtime.stream_scope,
+                decision_occurrence_id=f"{occurrence}:subject_action",
+                source_occurrence_id=snapshot.source_occurrence_id,
+                subject_revision=validated_revision,
+                segments=tuple(parsed_segments),
+                visibility=str(visibility),
+            )
+            stored = await runtime.repository.append(
+                manifest,
+                expected_head_revision=int(expected_head_revision),
+            )
+            return True, {
+                "action": "memory_boundary_recorded_from_subject_range",
+                "boundary_id": stored.manifest.boundary_id,
+                "manifest_revision": stored.manifest.manifest_revision,
+                "head_revision": stored.head_revision,
+                "artifact_id": stored.artifact.artifact_id,
+                "root_sha256": stored.manifest.root_sha256,
+                "exact_uri": stored.exact_uri,
+                "canonical_bytes": len(stored.manifest.canonical_bytes),
+                "segment_count": len(stored.manifest.segments),
+                "source_memory_version_id": snapshot.version_id,
+                "source_memory_sha256": snapshot.content_sha256,
+                "source_occurrence_id": snapshot.source_occurrence_id,
+                "source_provenance_status": snapshot.provenance_status,
+                "ranges": range_receipts,
+                "operation_occurrence_id": (stored.manifest.operation_occurrence_id),
+                "subject_revision": stored.manifest.subject_revision,
+                "authority": "immutable_memory_artifact_not_MEMORY_md",
+                "next_step": (
+                    "若你愿意让它常驻连续性，请把 exact_uri 写入完整 MEMORY.md "
+                    "候选；本工具不会自动提出或接受候选。"
+                ),
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"权威 MEMORY 精确范围封存失败: error_type={type(exc).__name__}"
+            )
             return False, {"error": type(exc).__name__, "detail": str(exc)}
 
 
@@ -688,6 +916,7 @@ class LifeProposeMemoryContinuityRevisionTool(BaseTool):
 
 MEMORY_BOUNDARY_TOOLS = [
     LifeCreateMemoryBoundaryTool,
+    LifeCreateMemoryBoundaryFromSubjectRangeTool,
     LifeReadMemoryBoundaryTool,
     LifeInspectMemoryContinuityTool,
     LifeProposeMemoryContinuityRevisionTool,
@@ -696,6 +925,7 @@ MEMORY_BOUNDARY_TOOLS = [
 
 __all__ = [
     "MEMORY_BOUNDARY_TOOLS",
+    "LifeCreateMemoryBoundaryFromSubjectRangeTool",
     "LifeCreateMemoryBoundaryTool",
     "LifeInspectMemoryContinuityTool",
     "LifeProposeMemoryContinuityRevisionTool",

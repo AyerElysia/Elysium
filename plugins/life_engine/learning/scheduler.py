@@ -18,6 +18,7 @@ import logging
 import os
 from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ from ..memory.continuity_index import (
     CONTINUITY_MEMORY_REVIEW_GROWTH_BYTES,
     CONTINUITY_MEMORY_REVIEW_PRESSURE_BYTES,
     CONTINUITY_MEMORY_SOFT_TARGET_BYTES,
+    diagnose_continuity_memory_index,
 )
 from ..storage.learning_contracts import (
     LearningEventDraft,
@@ -102,6 +104,19 @@ _REFLECTION_FAILURE_BACKOFF_MAX_SECONDS = 15.0 * 60.0
 _REFLECTION_EVENT_CURSOR_STATE_KEY = "reflection_event_cursor_v1"
 _REFLECTION_ENQUEUED_EVENT_KIND = "reflection.enqueued"
 _REFLECTION_EVENT_PAGE_SIZE = 500
+
+
+@dataclass(frozen=True, slots=True)
+class SubjectDocumentReadSnapshot:
+    """One coherent, exact subject-document read with immutable provenance."""
+
+    content_bytes: bytes
+    version_id: str
+    source_occurrence_id: str
+    unified_subject_revision: str
+    content_sha256: str
+    byte_length: int
+    provenance_status: str
 
 
 class LearningScheduler:
@@ -1054,6 +1069,48 @@ class LearningScheduler:
         return commit
 
     @classmethod
+    def _subject_read_from_authority_snapshot(
+        cls,
+        snapshot: Any,
+        path: SubjectDocumentPath,
+    ) -> SubjectDocumentReadSnapshot:
+        """Validate and expose one exact document from one authority snapshot."""
+
+        commit = cls._subject_commit_from_snapshot(snapshot, path)
+        version = getattr(commit, "version", None)
+        content = getattr(version, "content_bytes", None)
+        if content is None:
+            raise RuntimeError(f"SubjectAuthoritySourceMissing: {path}")
+        exact_content = bytes(content)
+        version_id = str(getattr(version, "version_id", "") or "").strip()
+        occurrence_id = str(getattr(version, "occurrence_id", "") or "").strip()
+        revision = str(getattr(snapshot, "revision", "") or "").strip().lower()
+        expected_hash = str(getattr(version, "content_hash", "") or "").lower()
+        actual_hash = hashlib.sha256(exact_content).hexdigest()
+        expected_length = getattr(version, "byte_length", None)
+        if not version_id:
+            raise RuntimeError(f"SubjectAuthorityVersionMissing: {path}")
+        if not occurrence_id:
+            raise RuntimeError(f"SubjectAuthorityOccurrenceMissing: {path}")
+        if not revision:
+            raise RuntimeError("LearningSubjectRevisionUnavailable")
+        if expected_hash != actual_hash:
+            raise RuntimeError(f"SubjectAuthorityContentHashMismatch: {path}")
+        if isinstance(expected_length, bool) or expected_length != len(exact_content):
+            raise RuntimeError(f"SubjectAuthorityByteLengthMismatch: {path}")
+        return SubjectDocumentReadSnapshot(
+            content_bytes=exact_content,
+            version_id=version_id,
+            source_occurrence_id=occurrence_id,
+            unified_subject_revision=revision,
+            content_sha256=actual_hash,
+            byte_length=len(exact_content),
+            provenance_status=str(
+                getattr(version, "provenance_status", "") or "unknown"
+            ),
+        )
+
+    @classmethod
     def _subject_observation_from_snapshot(
         cls,
         snapshot: Any,
@@ -1061,11 +1118,9 @@ class LearningScheduler:
     ) -> tuple[bytes, str]:
         """Return exact bytes and a content-free per-document head marker."""
 
+        document = cls._subject_read_from_authority_snapshot(snapshot, path)
         commit = cls._subject_commit_from_snapshot(snapshot, path)
         version = getattr(commit, "version", None)
-        content = getattr(version, "content_bytes", None)
-        if content is None:
-            raise RuntimeError(f"SubjectAuthoritySourceMissing: {path}")
         head = getattr(commit, "head", None)
         marker_material = json.dumps(
             {
@@ -1081,7 +1136,7 @@ class LearningScheduler:
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
-        return bytes(content), hashlib.sha256(marker_material).hexdigest()
+        return document.content_bytes, hashlib.sha256(marker_material).hexdigest()
 
     @classmethod
     def _subject_content_from_snapshot(
@@ -1101,11 +1156,40 @@ class LearningScheduler:
             raise ValueError(f"unsupported subject authority path: {path}")
         if self._read_subject_authority is not None:
             snapshot = await self._read_subject_authority()
-            return self._subject_content_from_snapshot(snapshot, path)
+            return self._subject_read_from_authority_snapshot(
+                snapshot,
+                path,
+            ).content_bytes
         target = self._workspace / path
         if not target.exists() or not target.is_file():
             raise RuntimeError(f"SubjectAuthoritySourceMissing: {path}")
         return target.read_bytes()
+
+    async def read_subject_document_snapshot(
+        self,
+        path: SubjectDocumentPath,
+    ) -> SubjectDocumentReadSnapshot:
+        """Read exact bytes and immutable provenance from one coherent source."""
+
+        if path not in SUBJECT_AUTHORITY_PATHS:
+            raise ValueError(f"unsupported subject authority path: {path}")
+        if self._read_subject_authority is not None:
+            snapshot = await self._read_subject_authority()
+            return self._subject_read_from_authority_snapshot(snapshot, path)
+
+        content = await self.read_subject_document(path)
+        revision = await self.current_subject_revision()
+        digest = hashlib.sha256(content).hexdigest()
+        version_id = f"workspace-{Path(path).stem.lower()}-sha256:{digest}"
+        return SubjectDocumentReadSnapshot(
+            content_bytes=content,
+            version_id=version_id,
+            source_occurrence_id=f"workspace-observation:{digest}",
+            unified_subject_revision=revision,
+            content_sha256=digest,
+            byte_length=len(content),
+            provenance_status="local_workspace_observation",
+        )
 
     async def read_subject_document_with_identity(
         self,
@@ -1118,30 +1202,11 @@ class LearningScheduler:
         path derives a content-addressed version identity without writing anything.
         """
 
-        if path not in SUBJECT_AUTHORITY_PATHS:
-            raise ValueError(f"unsupported subject authority path: {path}")
-        if self._read_subject_authority is not None:
-            snapshot = await self._read_subject_authority()
-            content, _ = self._subject_observation_from_snapshot(snapshot, path)
-            commit = self._subject_commit_from_snapshot(snapshot, path)
-            version = getattr(commit, "version", None)
-            version_id = str(getattr(version, "version_id", "") or "").strip()
-            revision = str(getattr(snapshot, "revision", "") or "").strip().lower()
-            if not version_id:
-                raise RuntimeError(f"SubjectAuthorityVersionMissing: {path}")
-            if not revision:
-                raise RuntimeError("LearningSubjectRevisionUnavailable")
-            return content, version_id, revision
-
-        content = await self.read_subject_document(path)
-        revision = await self.current_subject_revision()
+        document = await self.read_subject_document_snapshot(path)
         return (
-            content,
-            (
-                f"workspace-{Path(path).stem.lower()}-sha256:"
-                f"{hashlib.sha256(content).hexdigest()}"
-            ),
-            revision,
+            document.content_bytes,
+            document.version_id,
+            document.unified_subject_revision,
         )
 
     @staticmethod
@@ -1187,6 +1252,77 @@ class LearningScheduler:
             "pressure_semantics": "engineering_review_only",
         }
 
+    @staticmethod
+    def _continuity_memory_index_review(
+        *,
+        path: SubjectDocumentPath,
+        content: bytes,
+        version_id: str,
+        subject_revision: str,
+        record: dict[str, Any],
+    ) -> dict[str, int | bool | str]:
+        """Invite structural review without inferring memory importance."""
+
+        if path != "MEMORY.md":
+            return {
+                "continuity_index_entry_count": 0,
+                "continuity_index_issue_count": 0,
+                "continuity_index_absent": False,
+                "continuity_index_review_due": False,
+                "continuity_index_state": "not_applicable",
+                "continuity_index_semantics": "not_applicable",
+            }
+        content_sha256 = hashlib.sha256(content).hexdigest()
+        projection_revision = str(subject_revision or "").strip().lower()
+        if len(projection_revision) != 64 or any(
+            character not in "0123456789abcdef" for character in projection_revision
+        ):
+            projection_revision = "0" * 64
+        projection_version = str(version_id or "").strip() or (
+            f"subject-review-memory-sha256:{content_sha256}"
+        )
+        diagnostics = diagnose_continuity_memory_index(
+            content,
+            subject_document_version_id=projection_version,
+            unified_subject_revision=projection_revision,
+        )
+        entry_count = len(diagnostics.index.entries)
+        issue_count = len(diagnostics.issues)
+        absent = entry_count == 0
+        last_outcome = str(record.get("last_outcome") or "").strip().lower()
+        exact_version_acknowledged = bool(
+            last_outcome != "snoozed"
+            and str(record.get("last_reviewed_content_sha256") or "").lower()
+            == content_sha256
+        )
+        last_reviewed_size = max(
+            0,
+            int(record.get("last_reviewed_size_bytes") or 0),
+        )
+        absence_acknowledged = bool(
+            last_outcome != "snoozed"
+            and last_reviewed_size > CONTINUITY_MEMORY_SOFT_TARGET_BYTES
+            and len(content)
+            < last_reviewed_size + CONTINUITY_MEMORY_REVIEW_GROWTH_BYTES
+        )
+        review_due = bool(
+            (issue_count > 0 and not exact_version_acknowledged)
+            or (
+                len(content) > CONTINUITY_MEMORY_SOFT_TARGET_BYTES
+                and absent
+                and not absence_acknowledged
+            )
+        )
+        state = "invalid" if issue_count else "absent" if absent else "present"
+        return {
+            "continuity_index_entry_count": entry_count,
+            "continuity_index_issue_count": issue_count,
+            "continuity_index_absent": absent,
+            "continuity_index_review_due": review_due,
+            "continuity_index_state": state,
+            "continuity_index_semantics": "structural_review_only",
+        }
+
     async def _review_document_snapshot(
         self,
         *,
@@ -1199,28 +1335,45 @@ class LearningScheduler:
     ) -> tuple[dict[str, Any], bool]:
         exists = False
         changed_at: datetime | None = None
+        content = b""
         size_bytes = 0
         content_sha256 = ""
         change_marker = ""
+        version_id = ""
+        source_occurrence_id = ""
+        source_provenance_status = ""
         changed = False
         if self._read_subject_authority is not None:
             if authority_snapshot is None:
                 raise RuntimeError("SubjectAuthoritySnapshotUnavailable")
+            document = self._subject_read_from_authority_snapshot(
+                authority_snapshot,
+                path,
+            )
             content, change_marker = self._subject_observation_from_snapshot(
                 authority_snapshot,
                 path,
             )
             exists = True
-            size_bytes = len(content)
-            content_sha256 = hashlib.sha256(content).hexdigest()
+            size_bytes = document.byte_length
+            content_sha256 = document.content_sha256
+            version_id = document.version_id
+            source_occurrence_id = document.source_occurrence_id
+            source_provenance_status = document.provenance_status
         else:
             target = self._workspace / path
             exists = target.exists() and target.is_file()
             if exists:
                 stat = target.stat()
                 changed_at = datetime.fromtimestamp(stat.st_mtime, tz=UTC)
-                size_bytes = int(stat.st_size)
-                content_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+                content = target.read_bytes()
+                size_bytes = len(content)
+                content_sha256 = hashlib.sha256(content).hexdigest()
+                version_id = (
+                    f"workspace-{Path(path).stem.lower()}-sha256:{content_sha256}"
+                )
+                source_occurrence_id = f"workspace-observation:{content_sha256}"
+                source_provenance_status = "local_workspace_observation"
 
         last_reviewed = self._parse_review_time(record.get("last_reviewed_at"))
         if self._read_subject_authority is not None:
@@ -1288,12 +1441,40 @@ class LearningScheduler:
             size_bytes=size_bytes,
             record=record,
         )
+        index_review = self._continuity_memory_index_review(
+            path=path,
+            content=content,
+            version_id=version_id,
+            subject_revision=subject_revision,
+            record=record,
+        )
+        observed_projection = {
+            "last_observed_version_id": version_id,
+            "last_observed_source_occurrence_id": source_occurrence_id,
+            "last_observed_source_provenance_status": source_provenance_status,
+            **index_review,
+        }
+        for key, value in observed_projection.items():
+            if record.get(key) != value:
+                record[key] = value
+                changed = True
         interval_due = now >= due_at
         pressure_due = bool(pressure["review_pressure_due"])
+        index_review_due = bool(index_review["continuity_index_review_due"])
+        pending_candidate_due = bool(
+            str(record.get("last_outcome") or "").strip().lower()
+            == "candidate_proposed"
+            and str(record.get("last_candidate_id") or "").strip()
+        )
         due = bool(
             self._subject_review_enabled
             and exists
-            and (interval_due or pressure_due)
+            and (
+                interval_due
+                or pressure_due
+                or index_review_due
+                or pending_candidate_due
+            )
             and (snooze_until is None or now >= snooze_until)
             and (offer_after is None or now >= offer_after)
         )
@@ -1307,6 +1488,9 @@ class LearningScheduler:
                 "exists": exists,
                 "size_bytes": size_bytes,
                 "content_sha256": content_sha256,
+                "version_id": version_id,
+                "source_occurrence_id": source_occurrence_id,
+                "source_provenance_status": source_provenance_status,
                 "interval_hours": interval_hours,
                 "changed_at": changed_at.isoformat() if changed_at else "",
                 "review_baseline_at": str(record.get("review_baseline_at") or ""),
@@ -1318,10 +1502,13 @@ class LearningScheduler:
                     for reason, active in (
                         ("interval", interval_due),
                         ("engineering_pressure", pressure_due),
+                        ("continuity_index_review", index_review_due),
+                        ("candidate_decision_pending", pending_candidate_due),
                     )
                     if active
                 ],
                 **pressure,
+                **index_review,
                 "last_offered_at": str(record.get("last_offered_at") or ""),
                 "last_reviewed_at": str(record.get("last_reviewed_at") or ""),
                 "last_outcome": str(record.get("last_outcome") or ""),
@@ -1475,8 +1662,11 @@ class LearningScheduler:
                 {
                     "target_path": item["target_path"],
                     "content_sha256": item["content_sha256"],
+                    "version_id": item["version_id"],
                     "change_marker": item["change_marker"],
                     "due_reasons": list(item["due_reasons"]),
+                    "candidate_id": item["last_candidate_id"],
+                    "candidate_sha256": item["last_candidate_sha256"],
                 }
                 for item in due
             ],
@@ -1505,11 +1695,23 @@ class LearningScheduler:
             "以下文件到了可以重新看一眼的工程时间点；这不表示内容有错，也不要求修改。",
         ]
         for item in due:
-            if "engineering_pressure" in item.get("due_reasons", []):
+            reasons = item.get("due_reasons", [])
+            if "candidate_decision_pending" in reasons:
+                lines.append(
+                    f"- `{item['target_path']}`：候选 `{item['last_candidate_id']}` "
+                    "仍在等待你的独立决定；保持开放、拒绝或接受都有效，后台不会替你选择。"
+                )
+            elif "engineering_pressure" in reasons:
                 lines.append(
                     f"- `{item['target_path']}`：当前 {item['size_bytes']} bytes，"
                     f"达到 {item['review_pressure_bytes']} bytes 工程复盘线；"
                     "这不表示任何条目不重要，也不授权自动删除。"
+                )
+            elif "continuity_index_review" in reasons:
+                lines.append(
+                    f"- `{item['target_path']}`：当前 {item['size_bytes']} bytes，"
+                    "尚无显式长记忆 Boundary 索引或索引格式需要复核；"
+                    "这只是结构性提醒，不判断任何记忆是否重要。"
                 )
             else:
                 lines.append(
@@ -1524,9 +1726,20 @@ class LearningScheduler:
         )
         if any(item["target_path"] == "MEMORY.md" for item in due):
             lines.append(
-                "- 很长但仍需保留的记忆可以先用 "
-                "`nucleus_create_memory_boundary` 保存完整不可变正文，再由你把返回的"
-                "精确索引写进完整 MEMORY.md 候选；移除索引不会删除历史正文。"
+                "- 先用 `nucleus_review_subject_document` 分页看完当前精确 MEMORY；"
+                "对其中很长但仍需保留的原文，优先用 "
+                "`nucleus_create_memory_boundary_from_subject_range` 按 UTF-8 字节范围"
+                "直接封存，避免重新转写；不来自当前 MEMORY 的完整经历仍可用 "
+                "`nucleus_create_memory_boundary`。之后只能由你把返回的精确索引写进"
+                "完整 MEMORY.md 候选；移除索引不会删除历史正文。"
+            )
+        if any(
+            "candidate_decision_pending" in item.get("due_reasons", []) for item in due
+        ):
+            lines.append(
+                "- 使用 `nucleus_list_subject_candidates` 和 "
+                "`nucleus_read_subject_candidate` 重新核对候选；只有另行调用 "
+                "`nucleus_decide_subject_candidate` 才会形成决定。"
             )
         if snapshot["authority_status"] == "selected_ready":
             lines.append(
@@ -1598,8 +1811,14 @@ class LearningScheduler:
                     bool(current.get("due")),
                     str(current.get("content_sha256") or "")
                     == str(prepared.get("content_sha256") or ""),
+                    str(current.get("version_id") or "")
+                    == str(prepared.get("version_id") or ""),
                     str(current.get("change_marker") or "")
                     == str(prepared.get("change_marker") or ""),
+                    str(current.get("last_candidate_id") or "")
+                    == str(prepared.get("candidate_id") or ""),
+                    str(current.get("last_candidate_sha256") or "")
+                    == str(prepared.get("candidate_sha256") or ""),
                 )
             ):
                 self._pending_subject_review_offer = None
@@ -2807,8 +3026,35 @@ class LearningScheduler:
                         size_bytes=size_bytes,
                         record=record,
                     )
+                    index_review = {
+                        "continuity_index_entry_count": int(
+                            record.get("continuity_index_entry_count") or 0
+                        ),
+                        "continuity_index_issue_count": int(
+                            record.get("continuity_index_issue_count") or 0
+                        ),
+                        "continuity_index_absent": bool(
+                            record.get("continuity_index_absent", False)
+                        ),
+                        "continuity_index_review_due": bool(
+                            record.get("continuity_index_review_due", False)
+                        ),
+                        "continuity_index_state": str(
+                            record.get("continuity_index_state") or "unobserved"
+                        ),
+                        "continuity_index_semantics": str(
+                            record.get("continuity_index_semantics")
+                            or "structural_review_only"
+                        ),
+                    }
                     interval_due = bool(due_at is not None and now >= due_at)
                     pressure_due = bool(pressure["review_pressure_due"])
+                    index_review_due = bool(index_review["continuity_index_review_due"])
+                    pending_candidate_due = bool(
+                        str(record.get("last_outcome") or "").strip().lower()
+                        == "candidate_proposed"
+                        and str(record.get("last_candidate_id") or "").strip()
+                    )
                     snapshots.append(
                         {
                             "target_path": path,
@@ -2818,6 +3064,16 @@ class LearningScheduler:
                             "content_sha256": str(
                                 record.get("review_baseline_content_sha256") or ""
                             ),
+                            "version_id": str(
+                                record.get("last_observed_version_id") or ""
+                            ),
+                            "source_occurrence_id": str(
+                                record.get("last_observed_source_occurrence_id") or ""
+                            ),
+                            "source_provenance_status": str(
+                                record.get("last_observed_source_provenance_status")
+                                or ""
+                            ),
                             "review_baseline_at": str(
                                 record.get("review_baseline_at") or ""
                             ),
@@ -2826,7 +3082,12 @@ class LearningScheduler:
                                 self._subject_review_enabled
                                 and observation_known
                                 and exists
-                                and (interval_due or pressure_due)
+                                and (
+                                    interval_due
+                                    or pressure_due
+                                    or index_review_due
+                                    or pending_candidate_due
+                                )
                                 and (snooze_until is None or now >= snooze_until)
                                 and (offer_after is None or now >= offer_after)
                             ),
@@ -2835,10 +3096,19 @@ class LearningScheduler:
                                 for reason, active in (
                                     ("interval", interval_due),
                                     ("engineering_pressure", pressure_due),
+                                    (
+                                        "continuity_index_review",
+                                        index_review_due,
+                                    ),
+                                    (
+                                        "candidate_decision_pending",
+                                        pending_candidate_due,
+                                    ),
                                 )
                                 if active
                             ],
                             **pressure,
+                            **index_review,
                             "last_reviewed_at": str(
                                 record.get("last_reviewed_at") or ""
                             ),
@@ -2892,13 +3162,19 @@ class LearningScheduler:
                 target = self._workspace / path
                 exists = target.exists() and target.is_file()
                 changed_at: datetime | None = None
+                content = b""
                 size_bytes = 0
                 content_sha256 = ""
+                version_id = ""
                 if exists:
                     stat = target.stat()
                     changed_at = datetime.fromtimestamp(stat.st_mtime, tz=UTC)
-                    size_bytes = int(stat.st_size)
-                    content_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+                    content = target.read_bytes()
+                    size_bytes = len(content)
+                    content_sha256 = hashlib.sha256(content).hexdigest()
+                    version_id = (
+                        f"workspace-{Path(path).stem.lower()}-sha256:{content_sha256}"
+                    )
                 last_reviewed = self._parse_review_time(record.get("last_reviewed_at"))
                 baseline = max(
                     (item for item in (changed_at, last_reviewed) if item is not None),
@@ -2920,17 +3196,46 @@ class LearningScheduler:
                     size_bytes=size_bytes,
                     record=record,
                 )
+                index_review = self._continuity_memory_index_review(
+                    path=path,
+                    content=content,
+                    version_id=version_id,
+                    subject_revision=str(
+                        review.get("last_observed_subject_revision") or ""
+                    ),
+                    record=record,
+                )
                 interval_due = now >= due_at
                 pressure_due = bool(pressure["review_pressure_due"])
+                index_review_due = bool(index_review["continuity_index_review_due"])
+                pending_candidate_due = bool(
+                    str(record.get("last_outcome") or "").strip().lower()
+                    == "candidate_proposed"
+                    and str(record.get("last_candidate_id") or "").strip()
+                )
                 snapshot = {
                     "target_path": path,
                     "exists": exists,
                     "size_bytes": size_bytes,
                     "content_sha256": content_sha256,
+                    "version_id": version_id,
+                    "source_occurrence_id": (
+                        f"workspace-observation:{content_sha256}"
+                        if content_sha256
+                        else ""
+                    ),
+                    "source_provenance_status": (
+                        "local_workspace_observation" if exists else ""
+                    ),
                     "due": bool(
                         self._subject_review_enabled
                         and exists
-                        and (interval_due or pressure_due)
+                        and (
+                            interval_due
+                            or pressure_due
+                            or index_review_due
+                            or pending_candidate_due
+                        )
                         and (snooze_until is None or now >= snooze_until)
                         and (offer_after is None or now >= offer_after)
                     ),
@@ -2939,10 +3244,16 @@ class LearningScheduler:
                         for reason, active in (
                             ("interval", interval_due),
                             ("engineering_pressure", pressure_due),
+                            ("continuity_index_review", index_review_due),
+                            (
+                                "candidate_decision_pending",
+                                pending_candidate_due,
+                            ),
                         )
                         if active
                     ],
                     **pressure,
+                    **index_review,
                     "last_outcome": str(record.get("last_outcome") or ""),
                 }
                 snapshots.append(snapshot)

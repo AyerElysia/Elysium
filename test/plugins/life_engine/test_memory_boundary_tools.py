@@ -23,6 +23,7 @@ from plugins.life_engine.memory.boundary import (
 )
 from plugins.life_engine.memory.boundary_tools import (
     MEMORY_BOUNDARY_TOOLS,
+    LifeCreateMemoryBoundaryFromSubjectRangeTool,
     LifeCreateMemoryBoundaryTool,
     LifeInspectMemoryContinuityTool,
     LifeProposeMemoryContinuityRevisionTool,
@@ -116,6 +117,18 @@ class _Scheduler:
         assert path == "MEMORY.md"
         return self.memory, "subject-memory-version-3", SUBJECT_REVISION
 
+    async def read_subject_document_snapshot(self, path: str) -> SimpleNamespace:
+        assert path == "MEMORY.md"
+        return SimpleNamespace(
+            content_bytes=self.memory,
+            version_id="subject-memory-version-3",
+            source_occurrence_id="subject-memory-occurrence-3",
+            unified_subject_revision=SUBJECT_REVISION,
+            content_sha256=hashlib.sha256(self.memory).hexdigest(),
+            byte_length=len(self.memory),
+            provenance_status="complete",
+        )
+
     async def current_subject_revision(self) -> str:
         return SUBJECT_REVISION
 
@@ -208,6 +221,179 @@ async def test_create_boundary_records_active_actor_but_never_writes_memory(
     assert manifest.consciousness_instance_id == "chat-main"
     assert manifest.subject_revision == SUBJECT_REVISION
     assert scheduler.memory == b"# MEMORY\n"
+
+
+async def test_create_boundary_from_reviewed_ranges_preserves_exact_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = _Repository()
+    prefix = "# MEMORY\n\n常驻线索。\n\n".encode()
+    first = "这是一段需要完整保留的旧看法。\n".encode()
+    separator = b"\n"
+    second = "这是后来出现的新解释。\n".encode()
+    memory = prefix + first + separator + second
+    scheduler = _Scheduler(memory)
+
+    async def resolve(_tool):
+        return _runtime(repository, scheduler)
+
+    monkeypatch.setattr(boundary_tools, "_resolve_runtime", resolve)
+    first_start = len(prefix)
+    first_end = first_start + len(first)
+    second_start = first_end + len(separator)
+    second_end = second_start + len(second)
+    success, payload = await _tool(
+        LifeCreateMemoryBoundaryFromSubjectRangeTool
+    ).execute(
+        boundary_id="changing-view",
+        title="一次看法的变化",
+        scope="旧看法与后来解释的边界",
+        current_meaning="我愿意保留两次理解之间的差异。",
+        non_generalization="不把这一次变化泛化成所有未来。",
+        segments=[
+            {
+                "segment_id": "earlier-view",
+                "title": "当时的看法",
+                "byte_start": first_start,
+                "byte_end": first_end,
+            },
+            {
+                "segment_id": "later-meaning",
+                "title": "后来的解释",
+                "byte_start": second_start,
+                "byte_end": second_end,
+            },
+        ],
+        expected_subject_revision=SUBJECT_REVISION,
+        reviewed_memory_version_id="subject-memory-version-3",
+        reviewed_content_sha256=hashlib.sha256(memory).hexdigest(),
+    )
+
+    assert success is True
+    assert payload["authority"] == "immutable_memory_artifact_not_MEMORY_md"
+    assert payload["source_memory_version_id"] == "subject-memory-version-3"
+    assert payload["source_occurrence_id"] == "subject-memory-occurrence-3"
+    assert payload["segment_count"] == 2
+    assert scheduler.memory == memory
+    manifest = repository.appended[0]
+    assert [segment.content.encode() for segment in manifest.segments] == [
+        first,
+        second,
+    ]
+    assert manifest.source_occurrence_id == "subject-memory-occurrence-3"
+    for segment, receipt in zip(manifest.segments, payload["ranges"], strict=True):
+        source_ref = segment.source_refs[0]
+        assert "subject-memory-version-3" in source_ref
+        assert f"sha256={hashlib.sha256(memory).hexdigest()}" in source_ref
+        assert f"range_sha256={segment.content_sha256}" in source_ref
+        assert receipt["content_sha256"] == segment.content_sha256
+
+
+@pytest.mark.parametrize(
+    ("version_id", "content_sha256", "expected_error"),
+    [
+        ("stale-version", None, "MemoryBoundarySourceVersionConflict"),
+        (
+            "subject-memory-version-3",
+            "f" * 64,
+            "MemoryBoundarySourceContentHashConflict",
+        ),
+    ],
+)
+async def test_create_boundary_from_reviewed_ranges_rejects_stale_source(
+    monkeypatch: pytest.MonkeyPatch,
+    version_id: str,
+    content_sha256: str | None,
+    expected_error: str,
+) -> None:
+    repository = _Repository()
+    memory = "# MEMORY\n精确正文\n".encode()
+    scheduler = _Scheduler(memory)
+
+    async def resolve(_tool):
+        return _runtime(repository, scheduler)
+
+    monkeypatch.setattr(boundary_tools, "_resolve_runtime", resolve)
+    success, payload = await _tool(
+        LifeCreateMemoryBoundaryFromSubjectRangeTool
+    ).execute(
+        boundary_id="stale-source",
+        title="不会保存",
+        scope="测试",
+        current_meaning="测试",
+        non_generalization="测试",
+        segments=[
+            {
+                "segment_id": "exact",
+                "title": "正文",
+                "byte_start": len(b"# MEMORY\n"),
+                "byte_end": len(memory),
+            }
+        ],
+        expected_subject_revision=SUBJECT_REVISION,
+        reviewed_memory_version_id=version_id,
+        reviewed_content_sha256=(content_sha256 or hashlib.sha256(memory).hexdigest()),
+    )
+
+    assert success is False
+    assert payload["detail"] == expected_error
+    assert repository.appended == []
+
+
+async def test_create_boundary_from_reviewed_ranges_rejects_utf8_split_and_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = _Repository()
+    memory = "甲乙".encode()
+    scheduler = _Scheduler(memory)
+
+    async def resolve(_tool):
+        return _runtime(repository, scheduler)
+
+    monkeypatch.setattr(boundary_tools, "_resolve_runtime", resolve)
+    base = {
+        "boundary_id": "invalid-range",
+        "title": "不会保存",
+        "scope": "测试",
+        "current_meaning": "测试",
+        "non_generalization": "测试",
+        "expected_subject_revision": SUBJECT_REVISION,
+        "reviewed_memory_version_id": "subject-memory-version-3",
+        "reviewed_content_sha256": hashlib.sha256(memory).hexdigest(),
+    }
+    success, payload = await _tool(
+        LifeCreateMemoryBoundaryFromSubjectRangeTool
+    ).execute(
+        **base,
+        segments=[
+            {
+                "segment_id": "split",
+                "title": "错误边界",
+                "byte_start": 1,
+                "byte_end": len(memory),
+            }
+        ],
+    )
+    assert success is False
+    assert payload["detail"] == "MemoryBoundaryReviewedRangeNotUtf8Boundary"
+
+    success, payload = await _tool(
+        LifeCreateMemoryBoundaryFromSubjectRangeTool
+    ).execute(
+        **base,
+        segments=[
+            {
+                "segment_id": "rewritten",
+                "title": "禁止回传正文",
+                "byte_start": 0,
+                "byte_end": len(memory),
+                "content": "模型改写过的正文",
+            }
+        ],
+    )
+    assert success is False
+    assert payload["detail"] == "MemoryBoundaryReviewedRangeFieldsInvalid:content"
+    assert repository.appended == []
 
 
 async def test_inspection_reports_exact_and_broken_links_without_deleting(
@@ -394,6 +580,7 @@ async def test_proposed_candidate_survives_review_health_projection_failure(
 def test_all_boundary_tools_have_valid_schemas_and_are_registered() -> None:
     assert [item.tool_name for item in MEMORY_BOUNDARY_TOOLS] == [
         "nucleus_create_memory_boundary",
+        "nucleus_create_memory_boundary_from_subject_range",
         "nucleus_read_memory_boundary",
         "nucleus_inspect_memory_continuity",
         "nucleus_propose_memory_continuity_revision",
@@ -408,4 +595,5 @@ def test_chat_can_follow_a_continuity_link_without_loading_maintenance_tools() -
 
     assert "tool-nucleus_read_memory_boundary" in manifest
     assert "tool-nucleus_create_memory_boundary" not in manifest
+    assert "tool-nucleus_create_memory_boundary_from_subject_range" not in manifest
     assert "tool-nucleus_propose_memory_continuity_revision" not in manifest
