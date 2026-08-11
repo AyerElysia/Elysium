@@ -51,6 +51,15 @@ class LearningEventOnlyRecorder:
     async def close(self) -> None:
         """Release no resources; the service owns the injected runtime."""
 
+    def request_maintenance(self) -> None:
+        """No-op: event-only mode has no derived worker to wake.
+
+        The heartbeat maintenance hook calls this unconditionally on whatever
+        learning runtime is installed.  An event-only recorder (a guest that
+        does not own the singleton projector) has no maintenance worker, so the
+        request is intentionally dropped.
+        """
+
     async def enqueue_reflection(
         self,
         *,

@@ -108,3 +108,27 @@ async def test_event_only_recorder_accepts_service_interaction_contract() -> Non
     )
     assert attention_close.payload["source_event_ids"] == ["event-3"]
     assert all(commit["projections"] == [] for commit in store.commits)
+
+
+async def test_event_only_recorder_request_maintenance_is_a_contractual_noop() -> None:
+    """The heartbeat hook calls request_maintenance on any learning runtime.
+
+    An event-only recorder (guest that does not own the singleton projector)
+    has no derived maintenance worker to wake, so the request must be dropped
+    as a no-op instead of raising AttributeError inside the heartbeat round.
+    """
+
+    store = _RecordingLearningStore()
+    recorder = LearningEventOnlyRecorder(
+        store,
+        writer_instance_id="test-writer",
+        reason="linux holds the projector",
+    )
+    await recorder.initialize()
+    # The heartbeat maintenance hook calls this unconditionally; it must be
+    # present on the event-only recorder and be inert.
+    recorder.request_maintenance()
+    assert store.commits == []
+    # Contract surface parity with LearningScheduler: still a callable.
+    assert callable(recorder.request_maintenance)
+    await recorder.close()
