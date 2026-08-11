@@ -21,6 +21,10 @@ from plugins.life_engine.storage.migration.memory_copy import (
     iter_transformed_source_rows,
     normalize_target_row,
 )
+from plugins.life_engine.storage.migration.memory_export import (
+    _create_source_schema,
+    _source_row,
+)
 
 
 def _source() -> sqlite3.Connection:
@@ -195,6 +199,210 @@ def test_deleted_nodes_and_their_edges_are_preserved() -> None:
         ]
     finally:
         database.close()
+
+
+def test_index_recovery_copy_preserves_compensation_and_resets_foreign_lease() -> None:
+    database = _source()
+    try:
+        database.execute(
+            """INSERT INTO memory_nodes (
+                node_id, node_type, file_path, content_hash, title,
+                created_at, updated_at, index_revision
+            ) VALUES ('file:index', 'file', 'notes/index.md', 'doc-hash',
+                'index', 1.0, 2.0, 7)"""
+        )
+        database.execute(
+            """INSERT INTO memory_index_jobs (
+                job_id, node_id, content_hash, status, created_at, updated_at,
+                attempts, error, index_revision, claim_token
+            ) VALUES ('job-index', 'file:index', 'doc-hash', 'processing',
+                1.0, 2.0, 4, 'provider-timeout', 7, 'foreign-lease')"""
+        )
+        database.execute(
+            """INSERT INTO memory_vector_tombstones (
+                node_id, chunk_id, created_at, collection_name, force_delete
+            ) VALUES ('file:index', 'file:index:0:chunk-hash',
+                3.0, 'chunks-v1', 1)"""
+        )
+
+        [job] = _rows(database, "memory_index_jobs")
+        [tombstone] = _rows(database, "memory_vector_tombstones")
+
+        assert TABLE_SPECS["memory_index_jobs"].key_columns == (
+            "job_id",
+            "index_revision",
+        )
+        assert job["status"] == "pending"
+        assert job["claim_token"] == ""
+        assert job["attempts"] == 4
+        assert job["error"] == "provider-timeout|RecoveryLeaseReset"
+        assert tombstone["collection_name"] == "chunks-v1"
+        assert tombstone["force_delete"] is True
+    finally:
+        database.close()
+
+
+def test_reverse_export_round_trip_preserves_job_and_tombstone_histories() -> None:
+    template = _source()
+    exported = sqlite3.connect(":memory:")
+    exported.row_factory = sqlite3.Row
+    try:
+        columns = _create_source_schema(template, exported)
+        exported.execute("PRAGMA foreign_keys = ON")
+        exported.execute(
+            """INSERT INTO memory_nodes (
+                node_id, node_type, file_path, title, created_at, updated_at
+            ) VALUES ('node-1', 'file', 'notes/node-1.md', 'node-1', 1.0, 1.0)"""
+        )
+        job_spec = TABLE_SPECS["memory_index_jobs"]
+        job_rows = (
+            {
+                "job_id": "node-1:hash-a",
+                "node_id": "node-1",
+                "content_hash": "hash-a",
+                "status": "completed",
+                "created_at": 1.0,
+                "updated_at": 2.0,
+                "attempts": 1,
+                "error": "",
+                "index_revision": 1,
+                "claim_token": "",
+            },
+            {
+                "job_id": "node-1:hash-a",
+                "node_id": "node-1",
+                "content_hash": "hash-a",
+                "status": "processing",
+                "created_at": 3.0,
+                "updated_at": 4.0,
+                "attempts": 6,
+                "error": "late-worker",
+                "index_revision": 3,
+                "claim_token": "foreign-lease",
+            },
+        )
+        job_insert = (
+            "INSERT INTO memory_index_jobs ("
+            + ", ".join(columns["memory_index_jobs"])
+            + ") VALUES ("
+            + ", ".join("?" for _ in columns["memory_index_jobs"])
+            + ")"
+        )
+        exported.executemany(
+            job_insert,
+            [
+                _source_row(
+                    "memory_index_jobs",
+                    normalize_target_row(job_spec, row),
+                    columns["memory_index_jobs"],
+                )
+                for row in job_rows
+            ],
+        )
+
+        tombstone_spec = TABLE_SPECS["memory_vector_tombstones"]
+        tombstone_rows = (
+            {
+                "tombstone_id": 10,
+                "node_id": "node-1",
+                "chunk_id": "node-1:0:chunk-a",
+                "collection_name": "chunks-v1",
+                "created_at": 5.0,
+                "consumed_at": 6.0,
+                "force_delete": False,
+            },
+            {
+                "tombstone_id": 11,
+                "node_id": "node-1",
+                "chunk_id": "node-1:0:chunk-a",
+                "collection_name": "chunks-v2",
+                "created_at": 7.0,
+                "consumed_at": None,
+                "force_delete": True,
+            },
+        )
+        tombstone_insert = (
+            "INSERT INTO memory_vector_tombstones ("
+            + ", ".join(columns["memory_vector_tombstones"])
+            + ") VALUES ("
+            + ", ".join("?" for _ in columns["memory_vector_tombstones"])
+            + ")"
+        )
+        exported.executemany(
+            tombstone_insert,
+            [
+                _source_row(
+                    "memory_vector_tombstones",
+                    normalize_target_row(tombstone_spec, row),
+                    columns["memory_vector_tombstones"],
+                )
+                for row in tombstone_rows
+            ],
+        )
+        exported.commit()
+
+        round_trip_jobs = _rows(exported, "memory_index_jobs")
+        round_trip_tombstones = _rows(exported, "memory_vector_tombstones")
+        assert [(row["job_id"], row["index_revision"]) for row in round_trip_jobs] == [
+            ("node-1:hash-a", 1),
+            ("node-1:hash-a", 3),
+        ]
+        assert round_trip_jobs[1]["status"] == "pending"
+        assert round_trip_jobs[1]["claim_token"] == ""
+        assert round_trip_jobs[1]["attempts"] == 6
+        assert round_trip_jobs[1]["error"] == "late-worker|RecoveryLeaseReset"
+        assert [row["tombstone_id"] for row in round_trip_tombstones] == [10, 11]
+        assert [row["chunk_id"] for row in round_trip_tombstones] == [
+            "node-1:0:chunk-a",
+            "node-1:0:chunk-a",
+        ]
+        assert round_trip_tombstones[0]["consumed_at"] == 6.0
+        assert round_trip_tombstones[1]["collection_name"] == "chunks-v2"
+        assert round_trip_tombstones[1]["force_delete"] is True
+
+        job_pk = {
+            str(row["name"]): int(row["pk"])
+            for row in exported.execute("PRAGMA table_info(memory_index_jobs)")
+            if int(row["pk"] or 0) > 0
+        }
+        tombstone_pk = {
+            str(row["name"]): int(row["pk"])
+            for row in exported.execute(
+                "PRAGMA table_info(memory_vector_tombstones)"
+            )
+            if int(row["pk"] or 0) > 0
+        }
+        assert job_pk == {"job_id": 1, "index_revision": 2}
+        assert tombstone_pk == {"tombstone_id": 1}
+        job_foreign_keys = [
+            dict(row)
+            for row in exported.execute("PRAGMA foreign_key_list(memory_index_jobs)")
+        ]
+        assert len(job_foreign_keys) == 1
+        assert job_foreign_keys[0]["table"] == "memory_nodes"
+        assert job_foreign_keys[0]["from"] == "node_id"
+        assert job_foreign_keys[0]["to"] == "node_id"
+        assert job_foreign_keys[0]["on_delete"] == "CASCADE"
+
+        exported.execute("DELETE FROM memory_nodes WHERE node_id = 'node-1'")
+        assert exported.execute(
+            "SELECT COUNT(*) FROM memory_index_jobs WHERE node_id = 'node-1'"
+        ).fetchone()[0] == 0
+
+        exported.execute(
+            "DELETE FROM memory_vector_tombstones WHERE tombstone_id = 11"
+        )
+        exported.execute(
+            """INSERT INTO memory_vector_tombstones (
+                node_id, chunk_id, collection_name, created_at, force_delete
+            ) VALUES ('node-1', 'node-1:1:chunk-b', 'chunks-v3', 8.0, 1)"""
+        )
+        assert exported.execute(
+            "SELECT MAX(tombstone_id) FROM memory_vector_tombstones"
+        ).fetchone()[0] == 12
+    finally:
+        exported.close()
+        template.close()
 
 
 def test_legacy_experience_identity_remains_replay_compatible() -> None:

@@ -14,8 +14,10 @@ from plugins.life_engine.memory import worker as worker_module
 from plugins.life_engine.memory.indexing import (
     claim_index_jobs,
     create_memory_schema,
+    enqueue_index_job,
     read_active_chunk_index_state,
     upsert_document_rows,
+    write_active_chunk_index_state,
 )
 from plugins.life_engine.memory.search import EmbeddingResult
 from plugins.life_engine.memory.worker import (
@@ -44,11 +46,313 @@ def _db(tmp_path: Path) -> sqlite3.Connection:
     return db
 
 
+def _reported(job_id: str, revision: int = 1) -> str:
+    return f"{job_id}@index_revision={revision}"
+
+
+def _activate_collection(
+    db: sqlite3.Connection,
+    name: str = "test-collection",
+) -> None:
+    write_active_chunk_index_state(db, name, "fake/model-v1", 2, 1, now=1.5)
+
+
 async def _embed_ok(texts: Sequence[str]) -> EmbeddingResult:
     return EmbeddingResult(
         embeddings=[[float(index), float(len(text))] for index, text in enumerate(texts)],
         model_name="fake/model-v1",
     )
+
+
+def test_local_mtime_only_observation_does_not_rebuild_projection(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    first = upsert_document_rows(
+        db,
+        "notes/mtime.md",
+        "stable body",
+        "Stable",
+        source_mtime=10.0,
+        now=2.0,
+    )
+    db.execute(
+        "UPDATE memory_nodes SET embedding_synced = 1 WHERE node_id = ?",
+        (first.node_id,),
+    )
+    db.execute(
+        "UPDATE memory_index_jobs SET status = 'completed', attempts = 4, error = 'kept' "
+        "WHERE job_id = ? AND index_revision = 1",
+        (first.job_id,),
+    )
+    before_chunks = db.execute(
+        "SELECT chunk_id, created_at FROM memory_chunks WHERE node_id = ?",
+        (first.node_id,),
+    ).fetchall()
+    second = upsert_document_rows(
+        db,
+        "notes/mtime.md",
+        "stable body",
+        "Stable",
+        source_mtime=20.0,
+        now=3.0,
+    )
+
+    node = db.execute(
+        "SELECT index_revision, source_mtime, embedding_synced FROM memory_nodes "
+        "WHERE node_id = ?",
+        (first.node_id,),
+    ).fetchone()
+    job = db.execute(
+        "SELECT status, attempts, error FROM memory_index_jobs "
+        "WHERE job_id = ? AND index_revision = 1",
+        (first.job_id,),
+    ).fetchone()
+    after_chunks = db.execute(
+        "SELECT chunk_id, created_at FROM memory_chunks WHERE node_id = ?",
+        (first.node_id,),
+    ).fetchall()
+    assert second.job_id is None
+    assert tuple(before_chunks) == tuple(after_chunks)
+    assert tuple(node) == (1, 20.0, 1)
+    assert tuple(job) == ("completed", 4, "kept")
+    assert db.execute(
+        "SELECT COUNT(*) FROM memory_vector_tombstones"
+    ).fetchone()[0] == 0
+
+
+def test_local_unchanged_unsynced_projection_recreates_only_missing_job(
+    tmp_path: Path,
+) -> None:
+    db = _db(tmp_path)
+    indexed = upsert_document_rows(
+        db, "notes/recover-job.md", "stable recovery body", now=2.0
+    )
+    chunks_before = db.execute(
+        "SELECT chunk_id, created_at FROM memory_chunks WHERE node_id = ?",
+        (indexed.node_id,),
+    ).fetchall()
+    db.execute(
+        "DELETE FROM memory_index_jobs WHERE job_id = ? AND index_revision = 1",
+        (indexed.job_id,),
+    )
+    recovered = upsert_document_rows(
+        db, "notes/recover-job.md", "stable recovery body", now=3.0
+    )
+
+    job = db.execute(
+        "SELECT status, attempts, index_revision FROM memory_index_jobs "
+        "WHERE job_id = ? AND index_revision = 1",
+        (indexed.job_id,),
+    ).fetchone()
+    node_revision = db.execute(
+        "SELECT index_revision FROM memory_nodes WHERE node_id = ?",
+        (indexed.node_id,),
+    ).fetchone()[0]
+    chunks_after = db.execute(
+        "SELECT chunk_id, created_at FROM memory_chunks WHERE node_id = ?",
+        (indexed.node_id,),
+    ).fetchall()
+    assert recovered.job_id == indexed.job_id
+    assert tuple(job) == ("pending", 0, 1)
+    assert node_revision == 1
+    assert tuple(chunks_before) == tuple(chunks_after)
+    assert db.execute(
+        "SELECT COUNT(*) FROM memory_vector_tombstones"
+    ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("terminal_status", ["completed", "failed", "stale"])
+def test_local_unchanged_unsynced_projection_requeues_terminal_job(
+    tmp_path: Path,
+    terminal_status: str,
+) -> None:
+    db = _db(tmp_path)
+    indexed = upsert_document_rows(
+        db,
+        "notes/recover-terminal-job.md",
+        "stable recovery body",
+        source_mtime=10.0,
+        now=2.0,
+    )
+    db.execute(
+        "UPDATE memory_index_jobs SET status = ?, attempts = 3, error = 'old' "
+        "WHERE job_id = ? AND index_revision = 1",
+        (terminal_status, indexed.job_id),
+    )
+
+    recovered = upsert_document_rows(
+        db,
+        "notes/recover-terminal-job.md",
+        "stable recovery body",
+        source_mtime=20.0,
+        now=3.0,
+    )
+
+    job = db.execute(
+        "SELECT status, attempts, error, index_revision, claim_token "
+        "FROM memory_index_jobs WHERE job_id = ? AND index_revision = 1",
+        (indexed.job_id,),
+    ).fetchone()
+    node = db.execute(
+        "SELECT index_revision, source_mtime, embedding_synced "
+        "FROM memory_nodes WHERE node_id = ?",
+        (indexed.node_id,),
+    ).fetchone()
+    assert recovered.job_id == indexed.job_id
+    assert tuple(job) == ("pending", 3, "old", 1, "")
+    assert tuple(node) == (1, 20.0, 0)
+    assert db.execute(
+        "SELECT COUNT(*) FROM memory_vector_tombstones"
+    ).fetchone()[0] == 0
+
+
+def test_local_a_b_a_history_and_claim_are_revision_scoped(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    first_a = upsert_document_rows(db, "notes/aba.md", "content A", now=1.0)
+    db.execute(
+        "UPDATE memory_index_jobs SET status = 'completed', attempts = 2 "
+        "WHERE job_id = ? AND index_revision = 1",
+        (first_a.job_id,),
+    )
+    content_b = upsert_document_rows(db, "notes/aba.md", "content B", now=2.0)
+    db.execute(
+        "UPDATE memory_index_jobs SET status = 'completed' "
+        "WHERE job_id = ? AND index_revision = 2",
+        (content_b.job_id,),
+    )
+    second_a = upsert_document_rows(db, "notes/aba.md", "content A", now=3.0)
+    assert second_a.job_id == first_a.job_id
+
+    a_rows = db.execute(
+        "SELECT index_revision, status, attempts FROM memory_index_jobs "
+        "WHERE job_id = ? ORDER BY index_revision",
+        (first_a.job_id,),
+    ).fetchall()
+    assert [tuple(row) for row in a_rows] == [
+        (1, "stale", 2),
+        (3, "pending", 0),
+    ]
+
+    db.execute(
+        "UPDATE memory_index_jobs SET status = 'pending' "
+        "WHERE job_id = ? AND index_revision = 1",
+        (first_a.job_id,),
+    )
+    claimed = claim_index_jobs(db, limit=10, now=4.0)
+    assert [(job.job_id, job.index_revision) for job in claimed] == [
+        (first_a.job_id, 3)
+    ]
+    history = db.execute(
+        "SELECT status, attempts, claim_token FROM memory_index_jobs "
+        "WHERE job_id = ? AND index_revision = 1",
+        (first_a.job_id,),
+    ).fetchone()
+    assert tuple(history) == ("pending", 2, "")
+
+
+def test_explicit_local_enqueue_requeues_only_current_terminal_revision(
+    tmp_path: Path,
+) -> None:
+    db = _db(tmp_path)
+    first_a = upsert_document_rows(db, "notes/aba-enqueue.md", "A", now=1.0)
+    upsert_document_rows(db, "notes/aba-enqueue.md", "B", now=2.0)
+    current = upsert_document_rows(db, "notes/aba-enqueue.md", "A", now=3.0)
+    db.execute(
+        "UPDATE memory_index_jobs SET status = 'failed', attempts = 5, error = 'old' "
+        "WHERE job_id = ? AND index_revision = 1",
+        (first_a.job_id,),
+    )
+    db.execute(
+        "UPDATE memory_index_jobs SET status = 'completed', attempts = 7, error = 'current' "
+        "WHERE job_id = ? AND index_revision = 3",
+        (current.job_id,),
+    )
+    assert current.content_hash is not None
+
+    enqueue_index_job(db, current.node_id, current.content_hash, now=4.0)
+
+    rows = db.execute(
+        "SELECT index_revision, status, attempts, error FROM memory_index_jobs "
+        "WHERE job_id = ? ORDER BY index_revision",
+        (current.job_id,),
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        (1, "failed", 5, "old"),
+        (3, "pending", 7, "current"),
+    ]
+
+
+def test_late_local_lease_completion_persists_force_delete_and_requeue(
+    tmp_path: Path,
+) -> None:
+    db = _db(tmp_path)
+    indexed = upsert_document_rows(
+        db, "notes/late-lease.md", "stable vector body", now=1.0
+    )
+    [worker_one] = claim_index_jobs(db, limit=1, now=2.0)
+    [worker_two] = claim_index_jobs(
+        db,
+        limit=1,
+        now=20.0,
+        reclaim_after=5.0,
+    )
+    assert worker_one.claim_token != worker_two.claim_token
+    db.execute(
+        "UPDATE memory_index_jobs SET status = 'completed', claim_token = '' "
+        "WHERE job_id = ? AND index_revision = ? AND claim_token = ?",
+        (worker_two.job_id, worker_two.index_revision, worker_two.claim_token),
+    )
+    db.execute(
+        "UPDATE memory_nodes SET embedding_synced = 1, "
+        "embedding_content_hash = content_hash, embedding_model = 'fake/model-v1' "
+        "WHERE node_id = ? AND index_revision = ?",
+        (indexed.node_id, worker_two.index_revision),
+    )
+    db.commit()
+    chunk_ids = tuple(
+        str(row["chunk_id"])
+        for row in db.execute(
+            "SELECT chunk_id FROM memory_chunks WHERE node_id = ?",
+            (indexed.node_id,),
+        )
+    )
+    identity = _reported(indexed.job_id, worker_one.index_revision)
+
+    completed, stale, errors = worker_module._complete_jobs(
+        db,
+        [worker_one],
+        vector_chunk_ids={
+            (worker_one.job_id, int(worker_one.index_revision)): chunk_ids
+        },
+        collection_name="collection-late",
+        model_name="fake/model-v1",
+        dimension=2,
+        now=30.0,
+    )
+
+    assert completed == []
+    assert stale == [identity]
+    assert errors == {identity: "ClaimLeaseLostRequeued"}
+    job = db.execute(
+        "SELECT status, attempts, claim_token FROM memory_index_jobs "
+        "WHERE job_id = ? AND index_revision = ?",
+        (indexed.job_id, worker_one.index_revision),
+    ).fetchone()
+    node = db.execute(
+        "SELECT embedding_synced, embedding_content_hash FROM memory_nodes "
+        "WHERE node_id = ?",
+        (indexed.node_id,),
+    ).fetchone()
+    tombstones = db.execute(
+        "SELECT chunk_id, collection_name, force_delete, consumed_at "
+        "FROM memory_vector_tombstones WHERE node_id = ?",
+        (indexed.node_id,),
+    ).fetchall()
+    assert tuple(job) == ("pending", 2, "")
+    assert tuple(node) == (0, None)
+    assert {(row["chunk_id"], row["collection_name"]) for row in tombstones} == {
+        (chunk_id, "collection-late") for chunk_id in chunk_ids
+    }
+    assert all(row["force_delete"] == 1 and row["consumed_at"] is None for row in tombstones)
 
 
 def test_chunk_collection_identity_is_versioned_by_model_and_dimension() -> None:
@@ -148,7 +452,10 @@ async def test_worker_batches_embeddings_and_one_off_loop_upsert(tmp_path: Path)
     assert report.claimed == 2
     assert report.embedded_chunks == len(expected_rows)
     assert report.upserted_chunks == len(expected_rows)
-    assert set(report.completed) == {first.job_id, second.job_id}
+    assert set(report.completed) == {
+        _reported(first.job_id),
+        _reported(second.job_id),
+    }
     assert report.failed == ()
     assert report.stale == ()
     assert report.model_name == "fake/model-v1"
@@ -211,8 +518,9 @@ async def test_worker_retries_failed_embedding_job(tmp_path: Path) -> None:
         "SELECT status, attempts, error FROM memory_index_jobs WHERE job_id = ?",
         (indexed.job_id,),
     ).fetchone()
-    assert failed.failed == (indexed.job_id,)
-    assert failed.errors[indexed.job_id] == "RuntimeError"
+    identity = _reported(indexed.job_id)
+    assert failed.failed == (identity,)
+    assert failed.errors[identity] == "RuntimeError"
     assert (row["status"], row["attempts"], row["error"]) == (
         "failed",
         1,
@@ -232,7 +540,7 @@ async def test_worker_retries_failed_embedding_job(tmp_path: Path) -> None:
         "SELECT status, attempts, error FROM memory_index_jobs WHERE job_id = ?",
         (indexed.job_id,),
     ).fetchone()
-    assert completed.completed == (indexed.job_id,)
+    assert completed.completed == (identity,)
     assert (row["status"], row["attempts"], row["error"]) == (
         "completed",
         2,
@@ -254,7 +562,7 @@ async def test_worker_rejects_embedding_identity_drift_after_activation(
         collection_upsert_func=recorder.upsert,
         now=10.0,
     )
-    assert activated.completed == (first.job_id,)
+    assert activated.completed == (_reported(first.job_id),)
     active_before = read_active_chunk_index_state(db)
 
     second = upsert_document_rows(db, "notes/second.md", "second body", now=11.0)
@@ -274,8 +582,9 @@ async def test_worker_rejects_embedding_identity_drift_after_activation(
         now=20.0,
     )
 
-    assert rejected.failed == (second.job_id,)
-    assert rejected.errors[second.job_id] == "ActiveCollectionIdentityMismatch"
+    second_identity = _reported(second.job_id)
+    assert rejected.failed == (second_identity,)
+    assert rejected.errors[second_identity] == "ActiveCollectionIdentityMismatch"
     assert read_active_chunk_index_state(db) == active_before
     assert len(recorder.calls) == 1
 
@@ -291,7 +600,7 @@ async def test_worker_rejects_collection_name_drift_before_upsert(tmp_path: Path
         collection_upsert_func=recorder.upsert,
         now=10.0,
     )
-    assert activated.completed == (first.job_id,)
+    assert activated.completed == (_reported(first.job_id),)
     active_before = read_active_chunk_index_state(db)
 
     second = upsert_document_rows(db, "notes/second.md", "second body", now=11.0)
@@ -308,8 +617,9 @@ async def test_worker_rejects_collection_name_drift_before_upsert(tmp_path: Path
         now=20.0,
     )
 
-    assert rejected.failed == (second.job_id,)
-    assert rejected.errors[second.job_id] == "ActiveCollectionIdentityMismatch"
+    second_identity = _reported(second.job_id)
+    assert rejected.failed == (second_identity,)
+    assert rejected.errors[second_identity] == "ActiveCollectionIdentityMismatch"
     assert read_active_chunk_index_state(db) == active_before
     assert len(recorder.calls) == 1
 
@@ -334,7 +644,7 @@ async def test_worker_reclaims_abandoned_processing_job(tmp_path: Path) -> None:
         "SELECT status, attempts FROM memory_index_jobs WHERE job_id = ?",
         (indexed.job_id,),
     ).fetchone()
-    assert report.completed == (indexed.job_id,)
+    assert report.completed == (_reported(indexed.job_id),)
     assert (row["status"], row["attempts"]) == ("completed", 2)
 
 
@@ -356,8 +666,9 @@ async def test_worker_marks_collection_resolver_errors_failed(tmp_path: Path) ->
         "SELECT status, error FROM memory_index_jobs WHERE job_id = ?",
         (indexed.job_id,),
     ).fetchone()
-    assert report.failed == (indexed.job_id,)
-    assert report.errors[indexed.job_id] == "LookupError"
+    identity = _reported(indexed.job_id)
+    assert report.failed == (identity,)
+    assert report.errors[identity] == "LookupError"
     assert (row["status"], row["error"]) == ("failed", "LookupError")
 
 
@@ -401,7 +712,7 @@ async def test_worker_drops_payload_updated_while_embedding(tmp_path: Path) -> N
     release.set()
     report = await task
 
-    assert old.job_id in report.stale
+    assert _reported(old.job_id) in report.stale
     assert report.upserted_chunks == 0
     assert recorder.calls == []
     old_row = db.execute(
@@ -523,22 +834,22 @@ async def test_worker_exports_only_valid_document_bodies(tmp_path: Path) -> None
     assert valid_body in upserted_documents
     assert all(body not in embedded_texts for body in invalid_bodies)
     assert all(body not in upserted_documents for body in invalid_bodies)
-    assert report.completed == (valid.job_id,)
+    assert report.completed == (_reported(valid.job_id),)
     assert report.failed == ()
-    invalid_job_ids = {
-        noncanonical.job_id,
-        deleted.job_id,
-        concept.job_id,
-        wrong_job_id,
+    invalid_jobs = {
+        _reported(noncanonical.job_id): noncanonical.job_id,
+        _reported(deleted.job_id): deleted.job_id,
+        _reported(concept.job_id): concept.job_id,
+        _reported(wrong_job_id): wrong_job_id,
     }
-    assert set(report.stale) == invalid_job_ids
+    assert set(report.stale) == set(invalid_jobs)
 
-    for job_id in invalid_job_ids:
+    for identity, job_id in invalid_jobs.items():
         row = db.execute(
             "SELECT status, error FROM memory_index_jobs WHERE job_id = ?",
             (job_id,),
         ).fetchone()
-        assert report.errors[job_id] == "InvalidDocumentIdentity"
+        assert report.errors[identity] == "InvalidDocumentIdentity"
         assert row is not None
         assert (row["status"], row["error"]) == (
             "stale",
@@ -572,8 +883,9 @@ async def test_worker_never_exports_malformed_chunk_identity(tmp_path: Path) -> 
         now=10.0,
     )
 
-    assert report.stale == (indexed.job_id,)
-    assert report.errors[indexed.job_id] == "InvalidChunkIdentity"
+    identity = _reported(indexed.job_id)
+    assert report.stale == (identity,)
+    assert report.errors[identity] == "InvalidChunkIdentity"
     assert recorder.calls == []
 
 
@@ -622,8 +934,9 @@ async def test_worker_revalidates_invalid_identity_after_delayed_embedding(
         (indexed.job_id,),
     ).fetchone()
     assert embed_calls == [[body]]
-    assert report.stale == (indexed.job_id,)
-    assert report.errors[indexed.job_id] == "InvalidDocumentIdentity"
+    identity = _reported(indexed.job_id)
+    assert report.stale == (identity,)
+    assert report.errors[identity] == "InvalidDocumentIdentity"
     assert report.upserted_chunks == 0
     assert recorder.calls == []
     assert row is not None
@@ -673,8 +986,9 @@ async def test_worker_revalidates_deleted_identity_before_embedding(
         "SELECT status, error FROM memory_index_jobs WHERE job_id = ?",
         (indexed.job_id,),
     ).fetchone()
-    assert report.stale == (indexed.job_id,)
-    assert report.errors[indexed.job_id] == "InvalidDocumentIdentity"
+    identity = _reported(indexed.job_id)
+    assert report.stale == (identity,)
+    assert report.errors[identity] == "InvalidDocumentIdentity"
     assert report.embedded_chunks == 0
     assert report.upserted_chunks == 0
     assert recorder.calls == []
@@ -709,6 +1023,7 @@ async def test_consume_tombstones_calls_collection_delete(tmp_path: Path) -> Non
     from plugins.life_engine.memory.worker import consume_vector_tombstones
 
     db = _db(tmp_path)
+    _activate_collection(db)
     upsert_document_rows(db, "notes/tomb.md", "old content to be superseded here", "Tomb")
     old_ids = [
         row["chunk_id"]
@@ -720,14 +1035,20 @@ async def test_consume_tombstones_calls_collection_delete(tmp_path: Path) -> Non
     deleted_ids: list[str] = []
 
     class FakeCollection:
+        name = "test-collection"
+
         def delete(self, *, ids: list[str]) -> None:
             deleted_ids.extend(ids)
 
     cleared = await consume_vector_tombstones(db, FakeCollection())
     assert cleared == len(old_ids)
     assert set(deleted_ids) == set(old_ids)
-    rows = db.execute("SELECT chunk_id FROM memory_vector_tombstones").fetchall()
-    assert rows == []
+    assert db.execute(
+        "SELECT COUNT(*) FROM memory_vector_tombstones WHERE consumed_at IS NULL"
+    ).fetchone()[0] == 0
+    assert db.execute(
+        "SELECT COUNT(*) FROM memory_vector_tombstones"
+    ).fetchone()[0] == len(old_ids)
 
 
 async def test_consume_tombstones_keeps_revived_content_addressed_chunks(
@@ -738,6 +1059,7 @@ async def test_consume_tombstones_keeps_revived_content_addressed_chunks(
     from plugins.life_engine.memory.worker import consume_vector_tombstones
 
     db = _db(tmp_path)
+    _activate_collection(db)
     path = "notes/revived.md"
     content = "the exact memory returned without changing its body"
     upsert_document_rows(db, path, content, "Revived")
@@ -752,6 +1074,8 @@ async def test_consume_tombstones_keeps_revived_content_addressed_chunks(
     deleted_ids: list[str] = []
 
     class FakeCollection:
+        name = "test-collection"
+
         def delete(self, *, ids: list[str]) -> None:
             deleted_ids.extend(ids)
 
@@ -760,7 +1084,7 @@ async def test_consume_tombstones_keeps_revived_content_addressed_chunks(
     assert cleared == len(live_ids)
     assert deleted_ids == []
     assert db.execute(
-        "SELECT COUNT(*) FROM memory_vector_tombstones"
+        "SELECT COUNT(*) FROM memory_vector_tombstones WHERE consumed_at IS NULL"
     ).fetchone()[0] == 0
 
 
@@ -772,12 +1096,15 @@ async def test_tombstone_delete_requeues_a_chunk_revived_during_external_io(
     from plugins.life_engine.memory.worker import consume_vector_tombstones
 
     db = _db(tmp_path)
+    _activate_collection(db)
     path = "notes/racing-revival.md"
     content = "the same content becomes live while Chroma deletion is in flight"
     upsert_document_rows(db, path, content, "Racing revival")
     delete_document_rows(db, path)
 
     class RacingCollection:
+        name = "test-collection"
+
         async def delete(self, *, ids: list[str]) -> None:
             assert ids
             revived = upsert_document_rows(db, path, content, "Racing revival")
@@ -809,7 +1136,7 @@ async def test_tombstone_delete_requeues_a_chunk_revived_during_external_io(
     ).fetchone()
     assert job is not None and job["status"] == "pending"
     assert db.execute(
-        "SELECT COUNT(*) FROM memory_vector_tombstones"
+        "SELECT COUNT(*) FROM memory_vector_tombstones WHERE consumed_at IS NULL"
     ).fetchone()[0] == 0
 
 
@@ -819,10 +1146,13 @@ async def test_consume_tombstones_handles_collection_delete_error(tmp_path: Path
     from plugins.life_engine.memory.worker import consume_vector_tombstones
 
     db = _db(tmp_path)
+    _activate_collection(db)
     upsert_document_rows(db, "notes/errortomb.md", "content that will be deleted", "ErrTomb")
     delete_document_rows(db, "notes/errortomb.md")
 
     class FailingCollection:
+        name = "test-collection"
+
         def delete(self, *, ids: list[str]) -> None:
             raise RuntimeError("Chroma is down")
 
@@ -830,3 +1160,63 @@ async def test_consume_tombstones_handles_collection_delete_error(tmp_path: Path
     assert cleared == 0
     rows = db.execute("SELECT chunk_id FROM memory_vector_tombstones").fetchall()
     assert len(rows) > 0
+
+
+async def test_local_tombstone_consumption_is_bound_to_exact_collection(
+    tmp_path: Path,
+) -> None:
+    from plugins.life_engine.memory.worker import consume_vector_tombstones
+
+    db = _db(tmp_path)
+    db.execute(
+        """INSERT INTO memory_vector_tombstones (
+            node_id, chunk_id, collection_name, created_at, consumed_at, force_delete
+        ) VALUES ('node-cross', 'node-cross:0:hash', 'collection-a', 1.0, NULL, 1)"""
+    )
+    db.commit()
+    deleted: list[tuple[str, tuple[str, ...]]] = []
+
+    class Collection:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def delete(self, *, ids: list[str]) -> None:
+            deleted.append((self.name, tuple(ids)))
+
+    assert await consume_vector_tombstones(db, Collection("collection-b")) == 0
+    assert deleted == []
+    assert db.execute(
+        "SELECT consumed_at FROM memory_vector_tombstones WHERE tombstone_id = 1"
+    ).fetchone()[0] is None
+
+    assert await consume_vector_tombstones(db, Collection("collection-a"), now=2.0) == 1
+    assert deleted == [("collection-a", ("node-cross:0:hash",))]
+    assert db.execute(
+        "SELECT consumed_at FROM memory_vector_tombstones WHERE tombstone_id = 1"
+    ).fetchone()[0] == 2.0
+
+
+async def test_legacy_unnamed_tombstone_requires_matching_active_collection(
+    tmp_path: Path,
+) -> None:
+    from plugins.life_engine.memory.worker import consume_vector_tombstones
+
+    db = _db(tmp_path)
+    db.execute(
+        """INSERT INTO memory_vector_tombstones (
+            node_id, chunk_id, collection_name, created_at, consumed_at, force_delete
+        ) VALUES ('node-legacy', 'node-legacy:0:hash', '', 1.0, NULL, 1)"""
+    )
+    db.commit()
+    deleted: list[str] = []
+
+    class Collection:
+        name = "legacy-active"
+
+        def delete(self, *, ids: list[str]) -> None:
+            deleted.extend(ids)
+
+    assert await consume_vector_tombstones(db, Collection()) == 0
+    _activate_collection(db, "legacy-active")
+    assert await consume_vector_tombstones(db, Collection(), now=3.0) == 1
+    assert deleted == ["node-legacy:0:hash"]

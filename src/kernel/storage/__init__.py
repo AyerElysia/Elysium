@@ -40,6 +40,7 @@ from .engine import (
 from .migration_runner import (
     MigrationDriftError,
     MigrationLockError,
+    MigrationPostconditionError,
     MigrationResult,
     MySQLMigrationRunner,
     SchemaMigration,
@@ -66,6 +67,7 @@ __all__ = [
     "JSONStore",
     "MigrationDriftError",
     "MigrationLockError",
+    "MigrationPostconditionError",
     "MigrationResult",
     "MySQLMigrationRunner",
     "MySQLStorageConfig",

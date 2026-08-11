@@ -34,6 +34,33 @@ _FTS_TABLES = (
     "memory_interpretation_fts",
 )
 
+_LATEST_SOURCE_DDL = {
+    "memory_index_jobs": """CREATE TABLE memory_index_jobs (
+        job_id TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        error TEXT NOT NULL DEFAULT '',
+        index_revision INTEGER NOT NULL DEFAULT 0,
+        claim_token TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (job_id, index_revision),
+        UNIQUE (node_id, index_revision),
+        FOREIGN KEY (node_id) REFERENCES memory_nodes(node_id) ON DELETE CASCADE
+    )""",
+    "memory_vector_tombstones": """CREATE TABLE memory_vector_tombstones (
+        tombstone_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        node_id TEXT NOT NULL,
+        chunk_id TEXT NOT NULL,
+        collection_name TEXT NOT NULL DEFAULT '',
+        created_at REAL NOT NULL,
+        consumed_at REAL,
+        force_delete INTEGER NOT NULL DEFAULT 0
+    )""",
+}
+
 
 class MemoryExportError(RuntimeError):
     """Raised when a reverse export cannot prove domain equivalence."""
@@ -60,6 +87,10 @@ def _create_source_schema(
 ) -> dict[str, tuple[str, ...]]:
     columns: dict[str, tuple[str, ...]] = {}
     for spec in _SPECS:
+        if spec.name in _LATEST_SOURCE_DDL:
+            destination.execute(_LATEST_SOURCE_DDL[spec.name])
+            columns[spec.name] = tuple(spec.columns)
+            continue
         schema_row = template.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
             (spec.name,),

@@ -19,7 +19,7 @@ from src.kernel.storage.migration_runner import MySQLMigrationRunner, SchemaMigr
 from ..contracts import StorageBackendRuntime, StorageWriterRole
 from ..models import BackendKind
 
-MEMORY_SCHEMA_VERSION = 9
+MEMORY_SCHEMA_VERSION = 11
 MEMORY_IMMUTABILITY_SCHEMA_VERSION = 2
 
 # Database immutability follows the Memory Port contract, not a blanket
@@ -726,6 +726,74 @@ _WORKSPACE_PROJECTION_IDENTITY = SchemaMigration(
     ),
 )
 
+_INDEX_JOB_LEASE = SchemaMigration(
+    version=10,
+    name="life_memory_index_job_lease_v1",
+    statements=(
+        """ALTER TABLE memory_index_jobs
+            ADD COLUMN claim_token CHAR(32)
+                CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
+            DROP PRIMARY KEY,
+            ADD PRIMARY KEY (job_id, index_revision),
+            ADD UNIQUE KEY uq_memory_jobs_node_revision
+                (node_id, index_revision)""",
+    ),
+    completion_checks=(
+        """SELECT CASE WHEN COUNT(*) = 1 THEN 1 ELSE 0 END
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'memory_index_jobs'
+          AND COLUMN_NAME = 'claim_token'
+          AND DATA_TYPE = 'char'
+          AND CHARACTER_MAXIMUM_LENGTH = 32
+          AND IS_NULLABLE = 'NO'
+          AND COLUMN_DEFAULT = ''
+          AND CHARACTER_SET_NAME = 'ascii'
+          AND COLLATION_NAME = 'ascii_bin'""",
+        """SELECT CASE WHEN COUNT(*) = 2
+          AND MIN(NON_UNIQUE) = 0 AND MAX(NON_UNIQUE) = 0
+          AND SUM(CASE WHEN SEQ_IN_INDEX = 1 AND COLUMN_NAME = 'job_id'
+                       THEN 1 ELSE 0 END) = 1
+          AND SUM(CASE WHEN SEQ_IN_INDEX = 2 AND COLUMN_NAME = 'index_revision'
+                       THEN 1 ELSE 0 END) = 1
+          THEN 1 ELSE 0 END
+        FROM INFORMATION_SCHEMA.STATISTICS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'memory_index_jobs'
+          AND INDEX_NAME = 'PRIMARY'""",
+        """SELECT CASE WHEN COUNT(*) = 2
+          AND MIN(NON_UNIQUE) = 0 AND MAX(NON_UNIQUE) = 0
+          AND SUM(CASE WHEN SEQ_IN_INDEX = 1 AND COLUMN_NAME = 'node_id'
+                       THEN 1 ELSE 0 END) = 1
+          AND SUM(CASE WHEN SEQ_IN_INDEX = 2 AND COLUMN_NAME = 'index_revision'
+                       THEN 1 ELSE 0 END) = 1
+          THEN 1 ELSE 0 END
+        FROM INFORMATION_SCHEMA.STATISTICS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'memory_index_jobs'
+          AND INDEX_NAME = 'uq_memory_jobs_node_revision'""",
+    ),
+)
+
+_VECTOR_TOMBSTONE_FORCE_DELETE = SchemaMigration(
+    version=11,
+    name="life_memory_vector_tombstone_force_delete_v1",
+    statements=(
+        """ALTER TABLE memory_vector_tombstones
+            ADD COLUMN force_delete BOOLEAN NOT NULL DEFAULT FALSE""",
+    ),
+    completion_checks=(
+        """SELECT CASE WHEN COUNT(*) = 1 THEN 1 ELSE 0 END
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'memory_vector_tombstones'
+          AND COLUMN_NAME = 'force_delete'
+          AND DATA_TYPE = 'tinyint'
+          AND IS_NULLABLE = 'NO'
+          AND COLUMN_DEFAULT = '0'""",
+    ),
+)
+
 MEMORY_MIGRATIONS = (
     _DOCUMENT_INDEX,
     _EXPERIENCE,
@@ -736,6 +804,8 @@ MEMORY_MIGRATIONS = (
     _NODE_HISTORY,
     _LOSSLESS_JSON_TEXT,
     _WORKSPACE_PROJECTION_IDENTITY,
+    _INDEX_JOB_LEASE,
+    _VECTOR_TOMBSTONE_FORCE_DELETE,
 )
 
 

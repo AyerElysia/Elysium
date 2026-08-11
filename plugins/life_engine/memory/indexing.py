@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Sequence
+from uuid import uuid4
 
 from .eligibility import (
     assess_document_path,
@@ -29,10 +30,11 @@ from .nodes import (
 from .temporal import extract_document_date
 
 INDEX_SCHEMA_NAME = "document_index"
-INDEX_SCHEMA_VERSION = 4
+INDEX_SCHEMA_VERSION = 6
 ACTIVE_CHUNK_STATE_KEY = "active_chunk_collection"
 DEFAULT_CHUNK_SIZE = 900
 DEFAULT_CHUNK_OVERLAP = 120
+_INDEX_JOB_TERMINAL_STATUSES = frozenset({"completed", "failed", "stale"})
 
 # ``check_same_thread=False`` lets service tasks use one connection from the
 # executor. SQLite savepoints are connection-scoped, so concurrent root scopes
@@ -81,6 +83,13 @@ class IndexJob:
     attempts: int = 0
     error: str = ""
     index_revision: int = 0
+    claim_token: str = ""
+
+
+def index_job_report_identity(job: IndexJob) -> str:
+    """Return the revision-qualified public identity used in worker reports."""
+
+    return f"{job.job_id}@index_revision={int(job.index_revision)}"
 
 
 @dataclass(frozen=True)
@@ -115,6 +124,125 @@ def _configure_connection(db: sqlite3.Connection) -> None:
 def _ensure_column(db: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     if column not in _columns(db, table):
         db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _ensure_index_job_composite_identity(db: sqlite3.Connection) -> None:
+    """Upgrade the legacy job-id PK to the revision-scoped local contract."""
+
+    primary = {
+        str(row[1]): int(row[5] or 0)
+        for row in db.execute("PRAGMA table_info(memory_index_jobs)").fetchall()
+        if int(row[5] or 0) > 0
+    }
+    if primary == {"job_id": 1, "index_revision": 2}:
+        return
+    db.execute("DROP TABLE IF EXISTS memory_index_jobs_v6")
+    db.execute(
+        """CREATE TABLE memory_index_jobs_v6 (
+            job_id TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            error TEXT NOT NULL DEFAULT '',
+            index_revision INTEGER NOT NULL DEFAULT 0,
+            claim_token TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (job_id, index_revision),
+            UNIQUE (node_id, index_revision),
+            FOREIGN KEY (node_id) REFERENCES memory_nodes(node_id) ON DELETE CASCADE
+        )"""
+    )
+    db.execute(
+        """INSERT INTO memory_index_jobs_v6 (
+            job_id, node_id, content_hash, status, created_at, updated_at,
+            attempts, error, index_revision, claim_token
+        ) SELECT job_id, node_id, content_hash, status, created_at, updated_at,
+            attempts, error, index_revision, claim_token
+        FROM memory_index_jobs"""
+    )
+    db.execute("DROP TABLE memory_index_jobs")
+    db.execute("ALTER TABLE memory_index_jobs_v6 RENAME TO memory_index_jobs")
+
+
+def _tombstone_node_id(chunk_id: str) -> str:
+    parts = str(chunk_id or "").rsplit(":", 2)
+    if len(parts) != 3 or not parts[0]:
+        raise ValueError(f"invalid chunk tombstone identity: {chunk_id}")
+    return parts[0]
+
+
+def _ensure_vector_tombstone_history(db: sqlite3.Connection) -> None:
+    """Upgrade one-row-per-chunk tombstones to an append-only history."""
+
+    info = db.execute("PRAGMA table_info(memory_vector_tombstones)").fetchall()
+    columns = {str(row[1]) for row in info}
+    primary = {
+        str(row[1]): int(row[5] or 0)
+        for row in info
+        if int(row[5] or 0) > 0
+    }
+    required = {
+        "tombstone_id",
+        "node_id",
+        "chunk_id",
+        "collection_name",
+        "created_at",
+        "consumed_at",
+        "force_delete",
+    }
+    if primary == {"tombstone_id": 1} and required.issubset(columns):
+        return
+
+    rows = db.execute(
+        "SELECT * FROM memory_vector_tombstones ORDER BY created_at, chunk_id"
+    ).fetchall()
+    db.execute("DROP TABLE IF EXISTS memory_vector_tombstones_v6")
+    db.execute(
+        """CREATE TABLE memory_vector_tombstones_v6 (
+            tombstone_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_id TEXT NOT NULL,
+            chunk_id TEXT NOT NULL,
+            collection_name TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL,
+            consumed_at REAL,
+            force_delete INTEGER NOT NULL DEFAULT 0
+        )"""
+    )
+    used_ids: set[int] = set()
+    for row in rows:
+        row_columns = set(row.keys())
+        chunk_id = str(row["chunk_id"] or "")
+        raw_id = int(row["tombstone_id"] or 0) if "tombstone_id" in row_columns else 0
+        tombstone_id = raw_id if raw_id > 0 and raw_id not in used_ids else None
+        if tombstone_id is not None:
+            used_ids.add(tombstone_id)
+        db.execute(
+            """INSERT INTO memory_vector_tombstones_v6 (
+                tombstone_id, node_id, chunk_id, collection_name,
+                created_at, consumed_at, force_delete
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                tombstone_id,
+                str(row["node_id"] or "")
+                if "node_id" in row_columns
+                else _tombstone_node_id(chunk_id),
+                chunk_id,
+                str(row["collection_name"] or "")
+                if "collection_name" in row_columns
+                else "",
+                float(row["created_at"] or 0.0),
+                row["consumed_at"] if "consumed_at" in row_columns else None,
+                int(row["force_delete"] or 0)
+                if "force_delete" in row_columns
+                else 0,
+            ),
+        )
+    db.execute("DROP TABLE memory_vector_tombstones")
+    db.execute(
+        "ALTER TABLE memory_vector_tombstones_v6 RENAME TO memory_vector_tombstones"
+    )
 
 
 def _ensure_index_tables(db: sqlite3.Connection) -> None:
@@ -379,7 +507,7 @@ def create_memory_schema(db: sqlite3.Connection, *, now: float | None = None) ->
         db.execute(
             """
             CREATE TABLE IF NOT EXISTS memory_index_jobs (
-                job_id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL,
                 node_id TEXT NOT NULL,
                 content_hash TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
@@ -388,6 +516,9 @@ def create_memory_schema(db: sqlite3.Connection, *, now: float | None = None) ->
                 attempts INTEGER NOT NULL DEFAULT 0,
                 error TEXT NOT NULL DEFAULT '',
                 index_revision INTEGER NOT NULL DEFAULT 0,
+                claim_token TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (job_id, index_revision),
+                UNIQUE (node_id, index_revision),
                 FOREIGN KEY (node_id) REFERENCES memory_nodes(node_id) ON DELETE CASCADE
             )
             """
@@ -401,9 +532,15 @@ def create_memory_schema(db: sqlite3.Connection, *, now: float | None = None) ->
         _ensure_column(db, "memory_index_jobs", "attempts", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(db, "memory_index_jobs", "error", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(db, "memory_index_jobs", "index_revision", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(db, "memory_index_jobs", "claim_token", "TEXT NOT NULL DEFAULT ''")
+        _ensure_index_job_composite_identity(db)
         db.execute(
             "CREATE INDEX IF NOT EXISTS idx_memory_index_jobs_status "
             "ON memory_index_jobs(status, created_at)"
+        )
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_index_jobs_node_revision "
+            "ON memory_index_jobs(node_id, index_revision)"
         )
         db.execute(
             """
@@ -425,16 +562,20 @@ def create_memory_schema(db: sqlite3.Connection, *, now: float | None = None) ->
         db.execute(
             """
             CREATE TABLE IF NOT EXISTS memory_vector_tombstones (
-                chunk_id TEXT PRIMARY KEY,
-                created_at REAL NOT NULL
+                tombstone_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT NOT NULL,
+                chunk_id TEXT NOT NULL,
+                collection_name TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                consumed_at REAL,
+                force_delete INTEGER NOT NULL DEFAULT 0
             )
             """
         )
-        _ensure_column(db, "memory_vector_tombstones", "chunk_id", "TEXT NOT NULL DEFAULT ''")
-        _ensure_column(db, "memory_vector_tombstones", "created_at", "REAL NOT NULL DEFAULT 0")
+        _ensure_vector_tombstone_history(db)
         db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_memory_vector_tombstones_created "
-            "ON memory_vector_tombstones(created_at)"
+            "CREATE INDEX IF NOT EXISTS idx_memory_vector_tombstones_pending "
+            "ON memory_vector_tombstones(consumed_at, tombstone_id)"
         )
         tokenizer = _try_create_chunks_fts(db)
         if not tokenizer:
@@ -589,6 +730,7 @@ def _enqueue_index_job_in_transaction(
     now: float,
     status: str = "pending",
     index_revision: int | None = None,
+    requeue_statuses: frozenset[str] = frozenset(),
 ) -> str:
     job_id = f"{node_id}:{content_hash}"
     if index_revision is None:
@@ -597,25 +739,40 @@ def _enqueue_index_job_in_transaction(
             (node_id,),
         ).fetchone()
         index_revision = int(row[0] or 0) if row else 0
+    revision = int(index_revision)
     existing = db.execute(
-        "SELECT 1 FROM memory_index_jobs WHERE job_id = ? LIMIT 1",
-        (job_id,),
+        "SELECT node_id, content_hash, status FROM memory_index_jobs "
+        "WHERE job_id = ? AND index_revision = ?",
+        (job_id, revision),
     ).fetchone()
     if existing:
-        db.execute(
-            "UPDATE memory_index_jobs SET node_id = ?, content_hash = ?, status = ?, "
-            "index_revision = ?, updated_at = ?, error = '' WHERE job_id = ?",
-            (node_id, content_hash, status, int(index_revision), now, job_id),
-        )
+        if (
+            str(existing["node_id"] or "") != node_id
+            or str(existing["content_hash"] or "") != content_hash
+        ):
+            raise DocumentIdentityConflict("index job revision identity conflict")
+        if str(existing["status"] or "") in requeue_statuses:
+            db.execute(
+                "UPDATE memory_index_jobs SET status = ?, updated_at = ?, "
+                "claim_token = '' WHERE job_id = ? AND index_revision = ? "
+                "AND status = ?",
+                (
+                    status,
+                    now,
+                    job_id,
+                    revision,
+                    str(existing["status"] or ""),
+                ),
+            )
     else:
         db.execute(
             """
             INSERT INTO memory_index_jobs
                 (job_id, node_id, content_hash, status, created_at, updated_at, attempts, error,
-                 index_revision)
-            VALUES (?, ?, ?, ?, ?, ?, 0, '', ?)
+                 index_revision, claim_token)
+            VALUES (?, ?, ?, ?, ?, ?, 0, '', ?, '')
             """,
-            (job_id, node_id, content_hash, status, now, now, int(index_revision)),
+            (job_id, node_id, content_hash, status, now, now, revision),
         )
     return job_id
 
@@ -635,7 +792,12 @@ def enqueue_index_job(
     timestamp = float(time.time() if now is None else now)
     with transaction(db):
         return _enqueue_index_job_in_transaction(
-            db, node_id, content_hash, now=timestamp, status=status
+            db,
+            node_id,
+            content_hash,
+            now=timestamp,
+            status=status,
+            requeue_statuses=_INDEX_JOB_TERMINAL_STATUSES,
         )
 
 
@@ -678,9 +840,16 @@ def _insert_chunk_tombstones(
     ids = [str(cid) for cid in chunk_ids if cid]
     if not ids or not _table_exists(db, "memory_vector_tombstones"):
         return
+    state = db.execute(
+        "SELECT collection_name FROM memory_index_state WHERE state_key = ?",
+        (ACTIVE_CHUNK_STATE_KEY,),
+    ).fetchone()
+    collection_name = str(state[0] or "") if state is not None else ""
     db.executemany(
-        "INSERT OR IGNORE INTO memory_vector_tombstones(chunk_id, created_at) VALUES (?, ?)",
-        [(cid, now) for cid in ids],
+        """INSERT INTO memory_vector_tombstones (
+            node_id, chunk_id, collection_name, created_at, consumed_at, force_delete
+        ) VALUES (?, ?, ?, ?, NULL, 0)""",
+        [(_tombstone_node_id(cid), cid, collection_name, now) for cid in ids],
     )
 
 
@@ -795,6 +964,87 @@ def upsert_document_rows(
             node_id=node_id,
         ):
             raise DocumentIdentityConflict("document path is already claimed by another node")
+        existing_chunks = tuple(
+            DocumentChunk(
+                chunk_id=str(row["chunk_id"]),
+                node_id=str(row["node_id"]),
+                chunk_index=int(row["chunk_index"]),
+                content_hash=str(row["content_hash"]),
+                content=str(row["content"]),
+                title=str(row["title"] or ""),
+            )
+            for row in db.execute(
+                "SELECT chunk_id, node_id, chunk_index, content_hash, content, title "
+                "FROM memory_chunks WHERE node_id = ? ORDER BY chunk_index, chunk_id",
+                (node_id,),
+            ).fetchall()
+        )
+        existing_chunk_fts = tuple(
+            (
+                str(row["chunk_id"]),
+                str(row["node_id"]),
+                str(row["content"]),
+                str(row["title"] or ""),
+            )
+            for row in db.execute(
+                "SELECT chunk_id, node_id, content, title FROM memory_chunks_fts "
+                "WHERE node_id = ? ORDER BY chunk_id",
+                (node_id,),
+            ).fetchall()
+        )
+        expected_chunk_fts = tuple(
+            sorted(
+                (
+                    chunk.chunk_id,
+                    chunk.node_id,
+                    chunk.content,
+                    chunk.title,
+                )
+                for chunk in chunks
+            )
+        )
+        projection_unchanged = bool(
+            existing is not None
+            and not bool(existing["is_deleted"])
+            and existing["content_hash"] == content_hash
+            and str(existing["title"] or "") == document_title
+            and existing["event_date"] == event_date_text
+            and existing["fts_content_hash"] == content_hash
+            and existing_chunks == chunks
+            and existing_chunk_fts == expected_chunk_fts
+        )
+        if projection_unchanged:
+            db.execute(
+                "UPDATE memory_nodes SET source_mtime = COALESCE(?, source_mtime), "
+                "updated_at = ? WHERE node_id = ? AND index_revision = ?",
+                (
+                    source_mtime,
+                    timestamp,
+                    node_id,
+                    int(existing["index_revision"] or 0),
+                ),
+            )
+            if content_hash and not bool(existing["embedding_synced"]):
+                job_id = _enqueue_index_job_in_transaction(
+                    db,
+                    node_id,
+                    content_hash,
+                    now=timestamp,
+                    index_revision=int(existing["index_revision"] or 0),
+                    requeue_statuses=_INDEX_JOB_TERMINAL_STATUSES,
+                )
+            return DocumentIndexResult(
+                node_id=node_id,
+                file_path=normalized_path,
+                content_hash=content_hash,
+                chunks=existing_chunks,
+                job_id=job_id,
+                source_mtime=(
+                    source_mtime
+                    if source_mtime is not None
+                    else existing["source_mtime"]
+                ),
+            )
         created_at = (
             float(existing["created_at"])
             if existing is not None and existing["created_at"] is not None
@@ -1404,10 +1654,10 @@ def list_index_jobs(
     rows = db.execute(
         """
         SELECT job_id, node_id, content_hash, status, created_at, updated_at, attempts, error,
-               index_revision
+               index_revision, claim_token
         FROM memory_index_jobs
         WHERE status = ?
-        ORDER BY created_at, job_id
+        ORDER BY created_at, job_id, index_revision
         LIMIT ?
         """,
         (status, max(0, int(limit))),
@@ -1423,6 +1673,7 @@ def list_index_jobs(
             attempts=int(row["attempts"] or 0),
             error=str(row["error"] or ""),
             index_revision=int(row["index_revision"] or 0),
+            claim_token=str(row["claim_token"] or ""),
         )
         for row in rows
     ]
@@ -1439,70 +1690,111 @@ def claim_index_jobs(
     """Claim eligible jobs, optionally retrying failed or abandoned work."""
     _ensure_index_tables(db)
     timestamp = float(time.time() if now is None else now)
-    clauses = ["status = 'pending'"]
+    clauses = ["j.status = 'pending'"]
     params: list[object] = []
     if retry_failed:
         # 排除永久性失败（EmptyDocument）——空文档不会因重试而变非空
-        clauses.append("(status = 'failed' AND error != 'EmptyDocument')")
+        clauses.append("(j.status = 'failed' AND j.error != 'EmptyDocument')")
     if reclaim_after is not None:
-        clauses.append("(status = 'processing' AND updated_at <= ?)")
+        clauses.append("(j.status = 'processing' AND j.updated_at <= ?)")
         params.append(timestamp - max(0.0, float(reclaim_after)))
 
     with transaction(db):
         rows = db.execute(
-            "SELECT job_id FROM memory_index_jobs WHERE ("
+            "SELECT j.job_id, j.index_revision, j.status, j.updated_at "
+            "FROM memory_index_jobs j JOIN memory_nodes n ON n.node_id = j.node_id "
+            "AND n.index_revision = j.index_revision "
+            "AND n.content_hash = j.content_hash "
+            "WHERE ("
             + " OR ".join(clauses)
-            + ") ORDER BY created_at, job_id LIMIT ?",
+            + ") "
+            "ORDER BY j.created_at, j.job_id, j.index_revision LIMIT ?",
             [*params, max(0, int(limit))],
         ).fetchall()
-        ids = [str(row[0]) for row in rows]
-        if not ids:
+        if not rows:
             return []
-        placeholders = ",".join("?" for _ in ids)
-        db.execute(
-            f"UPDATE memory_index_jobs SET status = 'processing', updated_at = ?, "
-            f"attempts = attempts + 1, error = '' WHERE job_id IN ({placeholders})",
-            [timestamp, *ids],
-        )
-        rows = db.execute(
-            """
-            SELECT job_id, node_id, content_hash, status, created_at, updated_at, attempts, error,
-                   index_revision
-            FROM memory_index_jobs
-            WHERE status = 'processing' AND job_id IN (""" + placeholders + ") ORDER BY created_at, job_id",
-            ids,
-        ).fetchall()
-        return [
-            IndexJob(
-                job_id=str(row["job_id"]),
-                node_id=str(row["node_id"]),
-                content_hash=str(row["content_hash"]),
-                status=str(row["status"]),
-                created_at=float(row["created_at"]),
-                updated_at=float(row["updated_at"]),
-                attempts=int(row["attempts"] or 0),
-                error=str(row["error"] or ""),
-                index_revision=int(row["index_revision"] or 0),
+        claimed: list[IndexJob] = []
+        for row in rows:
+            job_id = str(row["job_id"])
+            revision = int(row["index_revision"] or 0)
+            expected_status = str(row["status"])
+            expected_updated_at = float(row["updated_at"] or 0.0)
+            claim_token = uuid4().hex
+            cursor = db.execute(
+                "UPDATE memory_index_jobs SET status = 'processing', updated_at = ?, "
+                "attempts = attempts + 1, error = '', claim_token = ? "
+                "WHERE job_id = ? AND index_revision = ? "
+                "AND status = ? AND updated_at = ?",
+                (
+                    timestamp,
+                    claim_token,
+                    job_id,
+                    revision,
+                    expected_status,
+                    expected_updated_at,
+                ),
             )
-            for row in rows
-        ]
+            if cursor.rowcount == 1:
+                claimed_row = db.execute(
+                    """SELECT job_id, node_id, content_hash, status, created_at,
+                              updated_at, attempts, error, index_revision, claim_token
+                       FROM memory_index_jobs
+                       WHERE job_id = ? AND index_revision = ?
+                         AND status = 'processing' AND claim_token = ?""",
+                    (job_id, revision, claim_token),
+                ).fetchone()
+                if claimed_row is not None:
+                    claimed.append(
+                        IndexJob(
+                            job_id=str(claimed_row["job_id"]),
+                            node_id=str(claimed_row["node_id"]),
+                            content_hash=str(claimed_row["content_hash"]),
+                            status=str(claimed_row["status"]),
+                            created_at=float(claimed_row["created_at"]),
+                            updated_at=float(claimed_row["updated_at"]),
+                            attempts=int(claimed_row["attempts"] or 0),
+                            error=str(claimed_row["error"] or ""),
+                            index_revision=int(claimed_row["index_revision"] or 0),
+                            claim_token=str(claimed_row["claim_token"] or ""),
+                        )
+                    )
+        return claimed
 
 
 def set_index_job_status(
     db: sqlite3.Connection,
-    job_id: str,
+    job: IndexJob | str,
     status: str,
     *,
     error: str = "",
     now: float | None = None,
 ) -> bool:
-    """Update one outbox state for an external worker."""
+    """CAS one externally claimed job; legacy tokenless calls fail closed."""
     _ensure_index_tables(db)
+    if (
+        isinstance(job, str)
+        or not job.claim_token
+        or int(job.index_revision) < 0
+        or str(status) not in {"pending", "completed", "failed", "stale"}
+    ):
+        return False
     timestamp = float(time.time() if now is None else now)
     with transaction(db):
         cursor = db.execute(
-            "UPDATE memory_index_jobs SET status = ?, updated_at = ?, error = ? WHERE job_id = ?",
-            (str(status), timestamp, str(error or ""), job_id),
+            "UPDATE memory_index_jobs SET status = ?, updated_at = ?, error = ?, "
+            "claim_token = '' WHERE job_id = ? AND node_id = ? "
+            "AND content_hash = ? AND index_revision = ? "
+            "AND status = 'processing' AND claim_token = ?",
+            (
+                str(status),
+                timestamp,
+                str(error or ""),
+                job.job_id,
+                job.node_id,
+                job.content_hash,
+                int(job.index_revision),
+                job.claim_token,
+            ),
         )
     return cursor.rowcount > 0
 
@@ -1517,6 +1809,7 @@ __all__ = [
     "INDEX_SCHEMA_NAME",
     "INDEX_SCHEMA_VERSION",
     "IndexJob",
+    "index_job_report_identity",
     "claim_index_jobs",
     "chunk_document",
     "create_index_schema",

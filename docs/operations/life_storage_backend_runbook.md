@@ -2,6 +2,16 @@
 
 本手册服务于 Elysium 生命域可选本地/MySQL 存储。它不包含真实主机、用户名、密码或 fencing token。Life Event、Memory、Subject Document、Presence、World、Learning 的 Port/adapter、`LifeEngineService` 单 runtime 接线、未冻结候选复制、反向恢复、数据库不可变保护与真实隔离 MySQL 合同均已实现。MySQL runtime 支持多个合法进程加入同一个 verified generation 并发读写；这里的“单一权威”指单一 active backend/generation/epoch，不表示整个 generation 只能有一个进程。与此同时，`runtime_context/global` 等领域单例状态必须取得数据库时间 writer claim，不能由多个 shared writer 同时持有。正式冻结复制、五域同快照 generation 签署和用户手动启动后的跨领域验收仍是**验收门**，不是自动启停指令。
 
+> Memory 文档索引 schema 当前最高版本为 11。v10 将任务身份升级为 `(job_id,index_revision)` 并增加 claim token；v11 增加 force-delete 向量补偿。版本常量必须等于 migration 最大版本，任何缺列、默认值漂移、主键/唯一键顺序漂移或 checksum 漂移都阻断启动。
+
+### Memory 索引迁移、反向导出与恢复
+
+- migration runner 会先执行只读 completion checks。全部结构已经精确存在而 migration 账本缺失时，只补写 checksum 记录，不重放 DDL；部分结构、探针错误或 DDL 后检查失败时回滚可回滚部分并 fail closed。不得手工补 migration 表来绕过检查。
+- 反向 SQLite 导出使用当前 source-compatible schema，不复用旧模板中的单列主键：`memory_index_jobs` 保留同一 `job_id` 的所有 revision，`memory_vector_tombstones` 保留同一 `chunk_id` 的所有 collection/时间记录和 `force_delete`。导出验证按完整显式行计算 root，不能只导当前行或静默去重。
+- claim token 不跨环境恢复。导入或反向导出遇到 processing 时，保留 attempts，把状态归一为 pending，清空 token，并在 error 中追加一次 `RecoveryLeaseReset`；其余状态不重开。这样不会留下 `processing + 空 token` 的永久任务，也不会把外部进程的 lease 当成可继承权威。
+- tombstone 的 `collection_name`、`consumed_at` 与 `force_delete` 必须无损往返。消费只能确认确实在目标 collection 执行的行；跨 collection 的记录保持 pending。空 collection 仅按 active collection marker 兼容，marker 缺失或不匹配时保持不消费。
+- 若任何旧快照无法表达上述两类历史，迁移必须停止并报告 schema 不兼容。禁止通过丢弃可重建投影来规避，除非另行执行带 writer quiescence、显式 rebuild manifest、源/目标 root 与完整测试的受控重建流程。
+
 ## 1. 当前安全状态
 
 - `config/core.toml [storage].backend` 是 Core 与 Life Engine 的唯一后端选择，只接受 `local` 或 `mysql`；

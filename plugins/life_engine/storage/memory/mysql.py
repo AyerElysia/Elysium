@@ -115,22 +115,10 @@ from ..models import BackendKind, StorageAvailability
 from .contracts import MemoryStorageBundle
 
 _T = TypeVar("_T")
+_IndexJobIdentity = tuple[str, int]
 _MAX_WRITE_ATTEMPTS = 3
-
-_UPSERT_INDEX_JOB = text(
-    """INSERT INTO memory_index_jobs (
-        job_id, node_id, content_hash, status, created_at,
-        updated_at, attempts, error, index_revision
-    ) VALUES (
-        :job_id, :node_id, :content_hash, 'pending', :now,
-        :now, 0, '', :revision
-    ) AS incoming
-    ON DUPLICATE KEY UPDATE
-        node_id = incoming.node_id,
-        content_hash = incoming.content_hash,
-        status = 'pending', updated_at = incoming.updated_at,
-        error = '', index_revision = incoming.index_revision"""
-)
+_INDEX_JOB_TERMINAL_STATUSES = frozenset({"completed", "failed", "stale"})
+_INDEX_JOB_STATUSES = _INDEX_JOB_TERMINAL_STATUSES | {"pending", "processing"}
 
 _MYSQL_MEMORY_READINESS_REQUIREMENTS: dict[
     str,
@@ -147,13 +135,21 @@ _MYSQL_MEMORY_READINESS_REQUIREMENTS: dict[
             "legacy_fts_present",
         ),
         "memory_chunks": ("chunk_id", "node_id", "content_hash", "content"),
-        "memory_index_jobs": ("job_id", "node_id", "status", "index_revision"),
+        "memory_index_jobs": (
+            "job_id",
+            "node_id",
+            "status",
+            "index_revision",
+            "claim_token",
+        ),
         "memory_index_state": ("state_key", "collection_name", "version"),
         "memory_vector_tombstones": (
             "tombstone_id",
             "node_id",
             "chunk_id",
+            "collection_name",
             "consumed_at",
+            "force_delete",
         ),
         "memory_workspace_projection_events": (
             "event_sha256",
@@ -304,6 +300,48 @@ _MYSQL_MEMORY_READINESS_REQUIREMENTS: dict[
     },
 }
 
+_MYSQL_MEMORY_READINESS_COLUMN_CONTRACTS: dict[
+    str,
+    dict[
+        tuple[str, str],
+        tuple[str, int | None, str, str | None, str | None, str | None],
+    ],
+] = {
+    "document_index": {
+        ("memory_index_jobs", "claim_token"): (
+            "char",
+            32,
+            "no",
+            "",
+            "ascii",
+            "ascii_bin",
+        ),
+        ("memory_vector_tombstones", "force_delete"): (
+            "tinyint",
+            None,
+            "no",
+            "0",
+            None,
+            None,
+        ),
+    }
+}
+
+_MYSQL_MEMORY_READINESS_INDEX_REQUIREMENTS: dict[
+    str,
+    dict[str, dict[str, tuple[int, tuple[str, ...]]]],
+] = {
+    "document_index": {
+        "memory_index_jobs": {
+            "primary": (0, ("job_id", "index_revision")),
+            "uq_memory_jobs_node_revision": (
+                0,
+                ("node_id", "index_revision"),
+            ),
+        },
+    },
+}
+
 
 class MySQLMemoryReadinessProbeError(RuntimeError):
     """Report a content-free failure of the shared read-only schema probe."""
@@ -343,25 +381,111 @@ async def inspect_mysql_memory_readiness(
             for table in requirements
         )
     )
+    index_table_names = tuple(
+        dict.fromkeys(
+            table
+            for requirements in _MYSQL_MEMORY_READINESS_INDEX_REQUIREMENTS.values()
+            for table in requirements
+        )
+    )
     statement = text(
-        """SELECT TABLE_NAME AS table_name, COLUMN_NAME AS column_name
+        """SELECT 'column' AS metadata_kind, TABLE_NAME AS table_name,
+               COLUMN_NAME AS metadata_name, NULL AS non_unique,
+               NULL AS seq_in_index, NULL AS index_column_name,
+               DATA_TYPE AS data_type,
+               CHARACTER_MAXIMUM_LENGTH AS character_maximum_length,
+               IS_NULLABLE AS is_nullable, COLUMN_DEFAULT AS column_default,
+               CHARACTER_SET_NAME AS character_set_name,
+               COLLATION_NAME AS collation_name
         FROM INFORMATION_SCHEMA.COLUMNS
         WHERE TABLE_SCHEMA = DATABASE()
-          AND TABLE_NAME IN :table_names
-        ORDER BY TABLE_NAME, ORDINAL_POSITION"""
-    ).bindparams(bindparam("table_names", expanding=True))
+          AND TABLE_NAME IN :column_table_names
+        UNION ALL
+        SELECT 'index' AS metadata_kind, TABLE_NAME AS table_name,
+               INDEX_NAME AS metadata_name, NON_UNIQUE AS non_unique,
+               SEQ_IN_INDEX AS seq_in_index, COLUMN_NAME AS index_column_name,
+               NULL AS data_type, NULL AS character_maximum_length,
+               NULL AS is_nullable, NULL AS column_default,
+               NULL AS character_set_name, NULL AS collation_name
+        FROM INFORMATION_SCHEMA.STATISTICS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME IN :index_table_names
+        ORDER BY table_name, metadata_kind, metadata_name, seq_in_index"""
+    ).bindparams(
+        bindparam("column_table_names", expanding=True),
+        bindparam("index_table_names", expanding=True),
+    )
 
     try:
         async with runtime.engine.connect() as connection:
             rows = (
-                await connection.execute(statement, {"table_names": table_names})
+                await connection.execute(
+                    statement,
+                    {
+                        "column_table_names": table_names,
+                        "index_table_names": index_table_names,
+                    },
+                )
             ).mappings()
-            observed: dict[str, set[str]] = {}
+            observed_columns: dict[str, set[str]] = {}
+            observed_column_contracts: dict[
+                tuple[str, str],
+                tuple[
+                    str,
+                    int | None,
+                    str,
+                    str | None,
+                    str | None,
+                    str | None,
+                ],
+            ] = {}
+            observed_indexes: dict[
+                str,
+                dict[str, list[tuple[int, str, int]]],
+            ] = {}
             for row in rows:
                 table = str(row["table_name"] or "").lower()
-                column = str(row["column_name"] or "").lower()
-                if table and column:
-                    observed.setdefault(table, set()).add(column)
+                name = str(row["metadata_name"] or "").lower()
+                kind = str(row["metadata_kind"] or "").lower()
+                if not table or not name:
+                    continue
+                if kind == "column":
+                    observed_columns.setdefault(table, set()).add(name)
+                    observed_column_contracts[(table, name)] = (
+                        str(row.get("data_type") or "").lower(),
+                        (
+                            int(row["character_maximum_length"])
+                            if row.get("character_maximum_length") is not None
+                            else None
+                        ),
+                        str(row.get("is_nullable") or "").lower(),
+                        (
+                            str(row["column_default"])
+                            if row.get("column_default") is not None
+                            else None
+                        ),
+                        (
+                            str(row["character_set_name"]).lower()
+                            if row.get("character_set_name") is not None
+                            else None
+                        ),
+                        (
+                            str(row["collation_name"]).lower()
+                            if row.get("collation_name") is not None
+                            else None
+                        ),
+                    )
+                elif kind == "index":
+                    observed_indexes.setdefault(table, {}).setdefault(
+                        name,
+                        [],
+                    ).append(
+                        (
+                            int(row["seq_in_index"] or 0),
+                            str(row["index_column_name"] or "").lower(),
+                            int(row["non_unique"] or 0),
+                        )
+                    )
     except Exception as exc:  # noqa: BLE001 - hide all driver/server details
         raise MySQLMemoryReadinessProbeError(type(exc).__name__) from None
 
@@ -369,8 +493,47 @@ async def inspect_mysql_memory_readiness(
         domain: (
             StorageAvailability.HEALTHY
             if all(
-                set(required_columns).issubset(observed.get(table, set()))
+                set(required_columns).issubset(
+                    observed_columns.get(table, set())
+                )
                 for table, required_columns in requirements.items()
+            )
+            and all(
+                observed_column_contracts.get(identity) == contract
+                for identity, contract in (
+                    _MYSQL_MEMORY_READINESS_COLUMN_CONTRACTS.get(
+                        domain,
+                        {},
+                    ).items()
+                )
+            )
+            and all(
+                all(
+                    tuple(
+                        (sequence, non_unique, column)
+                        for sequence, column, non_unique in sorted(
+                            observed_indexes.get(table, {}).get(index_name, []),
+                            key=lambda item: item[0],
+                        )
+                    )
+                    == tuple(
+                        (sequence, required_non_unique, column)
+                        for sequence, column in enumerate(
+                            required_columns,
+                            start=1,
+                        )
+                    )
+                    for index_name, (
+                        required_non_unique,
+                        required_columns,
+                    ) in required_indexes.items()
+                )
+                for table, required_indexes in (
+                    _MYSQL_MEMORY_READINESS_INDEX_REQUIREMENTS.get(
+                        domain,
+                        {},
+                    ).items()
+                )
             )
             else StorageAvailability.FAILED
         )
@@ -388,6 +551,34 @@ def _now_iso() -> str:
 
 def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _index_job_id(node_id: str, content_hash: str) -> str:
+    """Return the backward-compatible public portion of a job identity.
+
+    MySQL identifies the durable row by ``(job_id, index_revision)``.  Keeping
+    the historical ``node_id:content_hash`` value lets existing external
+    workers continue treating ``job_id`` as an opaque, content-bound handle.
+    """
+
+    return f"{node_id}:{content_hash}"
+
+
+def _index_job_identity(job: IndexJob) -> _IndexJobIdentity:
+    return job.job_id, int(job.index_revision)
+
+
+def _index_job_report_labels(
+    jobs: Sequence[IndexJob],
+) -> dict[_IndexJobIdentity, str]:
+    """Expose the same stable composite identity for every report entry."""
+
+    return {
+        _index_job_identity(job): (
+            f"{job.job_id}@index_revision={int(job.index_revision)}"
+        )
+        for job in jobs
+    }
 
 
 def _json_value(value: Any, *, default: Any) -> Any:
@@ -775,7 +966,93 @@ class MySQLDocumentIndexProjection(_MySQLPort):
             attempts=int(row["attempts"]),
             error=str(row["error"] or ""),
             index_revision=int(row["index_revision"]),
+            claim_token=str(row.get("claim_token") or ""),
         )
+
+    @staticmethod
+    async def _ensure_index_job_in_session(
+        session: AsyncSession,
+        *,
+        node_id: str,
+        content_hash: str,
+        index_revision: int,
+        now: float,
+        requeue_statuses: frozenset[str] = frozenset(),
+        revoke_processing: bool = False,
+    ) -> str:
+        """Ensure one revision-scoped job without reopening it by accident.
+
+        The caller must already hold the corresponding ``memory_nodes`` row
+        lock.  That serializes first insertion with document revision changes;
+        the unique ``(node_id, index_revision)`` key is the database backstop.
+        """
+
+        existing = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT * FROM memory_index_jobs "
+                        "WHERE node_id = :node_id AND index_revision = :revision "
+                        "FOR UPDATE"
+                    ),
+                    {"node_id": node_id, "revision": int(index_revision)},
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if existing is not None:
+            if str(existing["content_hash"] or "") != content_hash:
+                raise CursorConflict(
+                    "index job revision is bound to different document content"
+                )
+            status = str(existing["status"] or "")
+            should_requeue = status in requeue_statuses or (
+                revoke_processing and status == "processing"
+            )
+            if should_requeue:
+                result = await session.execute(
+                    text(
+                        "UPDATE memory_index_jobs SET status = 'pending', "
+                        "updated_at = :now, claim_token = '' "
+                        "WHERE job_id = :job_id AND index_revision = :revision "
+                        "AND status = :expected_status "
+                        "AND claim_token = :expected_claim_token"
+                    ),
+                    {
+                        "now": now,
+                        "job_id": str(existing["job_id"]),
+                        "revision": int(index_revision),
+                        "expected_status": status,
+                        "expected_claim_token": str(
+                            existing.get("claim_token") or ""
+                        ),
+                    },
+                )
+                if result.rowcount != 1:
+                    raise CursorConflict("index job changed while being requeued")
+            return str(existing["job_id"])
+
+        job_id = _index_job_id(node_id, content_hash)
+        await session.execute(
+            text(
+                """INSERT INTO memory_index_jobs (
+                    job_id, node_id, content_hash, status, created_at,
+                    updated_at, attempts, error, index_revision, claim_token
+                ) VALUES (
+                    :job_id, :node_id, :content_hash, 'pending', :now,
+                    :now, 0, '', :revision, ''
+                )"""
+            ),
+            {
+                "job_id": job_id,
+                "node_id": node_id,
+                "content_hash": content_hash,
+                "now": now,
+                "revision": int(index_revision),
+            },
+        )
+        return job_id
 
     async def _load_chunks(
         self,
@@ -848,7 +1125,12 @@ class MySQLDocumentIndexProjection(_MySQLPort):
         if existing is not None and str(existing["file_path"] or "") != canonical_path:
             raise DocumentIdentityConflict("document node ID belongs to another path")
 
-        unchanged = bool(
+        existing_chunks = (
+            await self._load_chunks(session, node_id)
+            if existing is not None
+            else ()
+        )
+        projection_unchanged = bool(
             existing is not None
             and not bool(existing.get("is_deleted"))
             and str(existing["content_hash"] or "") == content_hash
@@ -859,7 +1141,10 @@ class MySQLDocumentIndexProjection(_MySQLPort):
             )
             and not bool(existing["legacy_fts_present"])
             and str(existing["title"] or "") == str(title or "")
-            and (
+            and existing_chunks == chunks
+        )
+        if projection_unchanged:
+            observed_mtime_unchanged = bool(
                 (existing["source_mtime"] is None and source_mtime is None)
                 or (
                     existing["source_mtime"] is not None
@@ -867,22 +1152,58 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                     and float(existing["source_mtime"]) == float(source_mtime)
                 )
             )
-        )
-        if unchanged:
-            existing_job_id = await session.scalar(
-                text(
-                    "SELECT job_id FROM memory_index_jobs "
-                    "WHERE node_id = :node_id AND content_hash = :content_hash "
-                    "ORDER BY created_at LIMIT 1"
-                ),
-                {"node_id": node_id, "content_hash": content_hash},
-            )
+            if not observed_mtime_unchanged:
+                observed = await session.execute(
+                    text(
+                        "UPDATE memory_nodes SET source_mtime = :source_mtime, "
+                        "updated_at = :now WHERE node_id = :node_id "
+                        "AND index_revision = :revision "
+                        "AND content_hash = :content_hash"
+                    ),
+                    {
+                        "source_mtime": source_mtime,
+                        "now": now,
+                        "node_id": node_id,
+                        "revision": int(existing["index_revision"]),
+                        "content_hash": content_hash,
+                    },
+                )
+                if observed.rowcount != 1:
+                    raise CursorConflict(
+                        "document observation changed concurrently"
+                    )
+            existing_job_id: str | None
+            if body and not bool(existing["embedding_synced"]):
+                existing_job_id = await self._ensure_index_job_in_session(
+                    session,
+                    node_id=node_id,
+                    content_hash=content_hash,
+                    index_revision=int(existing["index_revision"]),
+                    now=now,
+                )
+            else:
+                job_id_value = await session.scalar(
+                    text(
+                        "SELECT job_id FROM memory_index_jobs "
+                        "WHERE node_id = :node_id AND content_hash = :content_hash "
+                        "AND index_revision = :revision "
+                        "ORDER BY created_at LIMIT 1"
+                    ),
+                    {
+                        "node_id": node_id,
+                        "content_hash": content_hash,
+                        "revision": int(existing["index_revision"]),
+                    },
+                )
+                existing_job_id = (
+                    str(job_id_value) if job_id_value is not None else None
+                )
             return DocumentIndexResult(
                 node_id=node_id,
                 file_path=canonical_path,
                 content_hash=content_hash,
-                chunks=await self._load_chunks(session, node_id),
-                job_id=str(existing_job_id) if existing_job_id is not None else None,
+                chunks=existing_chunks,
+                job_id=existing_job_id,
                 source_mtime=source_mtime,
             )
 
@@ -977,17 +1298,14 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                 {**asdict(chunk), "now": now},
             )
 
-        job_id = f"{node_id}:{content_hash}" if body else None
-        if job_id:
-            await session.execute(
-                _UPSERT_INDEX_JOB,
-                {
-                    "job_id": job_id,
-                    "node_id": node_id,
-                    "content_hash": content_hash,
-                    "now": now,
-                    "revision": revision,
-                },
+        job_id = None
+        if body:
+            job_id = await self._ensure_index_job_in_session(
+                session,
+                node_id=node_id,
+                content_hash=content_hash,
+                index_revision=revision,
+                now=now,
             )
         return DocumentIndexResult(
             node_id=node_id,
@@ -1202,7 +1520,7 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                 await connection.execute(
                     text(
                         f"SELECT * FROM memory_index_jobs {clause} "
-                        "ORDER BY updated_at, job_id LIMIT :limit"
+                        "ORDER BY updated_at, job_id, index_revision LIMIT :limit"
                     ),
                     params,
                 )
@@ -1215,8 +1533,12 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                 (
                     await session.execute(
                         text(
-                            "SELECT * FROM memory_index_jobs WHERE status = 'pending' "
-                            "ORDER BY updated_at, job_id LIMIT :limit "
+                            "SELECT j.* FROM memory_index_jobs j "
+                            "JOIN memory_nodes n ON n.node_id = j.node_id "
+                            "AND n.index_revision = j.index_revision "
+                            "AND n.content_hash = j.content_hash "
+                            "WHERE j.status = 'pending' "
+                            "ORDER BY j.updated_at, j.job_id, j.index_revision LIMIT :limit "
                             "FOR UPDATE SKIP LOCKED"
                         ),
                         {"limit": _safe_limit(limit)},
@@ -1226,46 +1548,74 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                 .all()
             )
             now = time.time()
+            claimed: list[IndexJob] = []
             for row in rows:
-                await session.execute(
+                claim_token = uuid4().hex
+                result = await session.execute(
                     text(
                         "UPDATE memory_index_jobs SET status = 'processing', "
-                        "attempts = attempts + 1, updated_at = :now, error = '' "
-                        "WHERE job_id = :job_id"
+                        "attempts = attempts + 1, updated_at = :now, error = '', "
+                        "claim_token = :claim_token "
+                        "WHERE job_id = :job_id AND index_revision = :revision "
+                        "AND status = 'pending'"
                     ),
-                    {"now": now, "job_id": str(row["job_id"])},
+                    {
+                        "now": now,
+                        "claim_token": claim_token,
+                        "job_id": str(row["job_id"]),
+                        "revision": int(row["index_revision"]),
+                    },
                 )
-            return [
-                replace(
-                    self._job_from_row(row),
-                    status="processing",
-                    attempts=int(row["attempts"]) + 1,
-                    updated_at=now,
-                    error="",
+                if result.rowcount != 1:
+                    continue
+                claimed.append(
+                    replace(
+                        self._job_from_row(row),
+                        status="processing",
+                        attempts=int(row["attempts"]) + 1,
+                        updated_at=now,
+                        error="",
+                        claim_token=claim_token,
+                    )
                 )
-                for row in rows
-            ]
+            return claimed
 
         return await self._write(_operation)
 
     async def set_job_status(
         self,
-        job_id: str,
+        job: IndexJob | str,
         status: str,
         *,
         error: str = "",
     ) -> bool:
+        if isinstance(job, str):
+            # A legacy opaque ID cannot prove which revision/attempt it owns.
+            return False
+        if status not in _INDEX_JOB_STATUSES or status == "processing":
+            # Only claim_jobs may create a processing lease.
+            return False
+        if not job.claim_token:
+            return False
+
         async def _operation(session: AsyncSession) -> bool:
             result = await session.execute(
                 text(
-                    "UPDATE memory_index_jobs SET status = :status, error = :error, "
-                    "updated_at = :updated_at WHERE job_id = :job_id"
+                    "UPDATE memory_index_jobs SET status = :status, "
+                    "error = :error, updated_at = :updated_at, claim_token = '' "
+                    "WHERE job_id = :job_id AND index_revision = :revision "
+                    "AND node_id = :node_id AND content_hash = :content_hash "
+                    "AND status = 'processing' AND claim_token = :claim_token"
                 ),
                 {
                     "status": status,
                     "error": error,
                     "updated_at": time.time(),
-                    "job_id": job_id,
+                    "job_id": job.job_id,
+                    "revision": int(job.index_revision),
+                    "node_id": job.node_id,
+                    "content_hash": job.content_hash,
+                    "claim_token": job.claim_token,
                 },
             )
             return result.rowcount == 1
@@ -1273,8 +1623,6 @@ class MySQLDocumentIndexProjection(_MySQLPort):
         return await self._write(_operation)
 
     async def enqueue_job(self, node_id: str, content_hash: str) -> str:
-        job_id = f"{node_id}:{content_hash}"
-
         async def _operation(session: AsyncSession) -> str:
             row = (
                 (
@@ -1291,18 +1639,14 @@ class MySQLDocumentIndexProjection(_MySQLPort):
             )
             if row is None or str(row["content_hash"] or "") != content_hash:
                 raise ValueError("index job does not match the current document")
-            now = time.time()
-            await session.execute(
-                _UPSERT_INDEX_JOB,
-                {
-                    "job_id": job_id,
-                    "node_id": node_id,
-                    "content_hash": content_hash,
-                    "now": now,
-                    "revision": int(row["index_revision"]),
-                },
+            return await self._ensure_index_job_in_session(
+                session,
+                node_id=node_id,
+                content_hash=content_hash,
+                index_revision=int(row["index_revision"]),
+                now=time.time(),
+                requeue_statuses=_INDEX_JOB_TERMINAL_STATUSES,
             )
-            return job_id
 
         return await self._write(_operation)
 
@@ -1354,7 +1698,8 @@ class MySQLDocumentIndexProjection(_MySQLPort):
             await session.execute(
                 text(
                     "UPDATE memory_index_jobs SET status = 'stale', "
-                    "error = 'InvalidDocumentIdentity', updated_at = :now "
+                    "error = 'InvalidDocumentIdentity', updated_at = :now, "
+                    "claim_token = '' "
                     "WHERE node_id IN :node_ids AND status IN "
                     "('pending', 'processing', 'failed')"
                 ).bindparams(expanding_ids),
@@ -1420,15 +1765,14 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                 if not content_hash:
                     continue
                 node_id = str(row["node_id"])
-                await session.execute(
-                    _UPSERT_INDEX_JOB,
-                    {
-                        "job_id": f"{node_id}:{content_hash}",
-                        "node_id": node_id,
-                        "content_hash": content_hash,
-                        "now": now,
-                        "revision": int(row["index_revision"]),
-                    },
+                await self._ensure_index_job_in_session(
+                    session,
+                    node_id=node_id,
+                    content_hash=content_hash,
+                    index_revision=int(row["index_revision"]),
+                    now=now,
+                    requeue_statuses=_INDEX_JOB_TERMINAL_STATUSES,
+                    revoke_processing=True,
                 )
                 count += 1
             return count
@@ -1446,22 +1790,40 @@ class MySQLDocumentIndexProjection(_MySQLPort):
         delete_func = getattr(collection, "delete", None)
         if not callable(delete_func):
             return 0
+        target_collection_name = str(
+            getattr(collection, "name", "") or ""
+        ).strip()
+        if not target_collection_name:
+            # Without an exact external collection identity, consuming a
+            # tombstone would be an irreversible acknowledgement of a delete
+            # that may have run against the wrong backend collection.
+            return 0
         assert self.runtime.engine is not None
         async with self.runtime.engine.connect() as connection:
             rows = (
                 (
                     await connection.execute(
                         text(
-                            "SELECT t.tombstone_id, t.chunk_id, "
+                            "SELECT t.tombstone_id, t.chunk_id, t.force_delete, "
+                            "t.collection_name, "
                             "EXISTS(SELECT 1 FROM memory_chunks c "
                             "JOIN memory_nodes n ON n.node_id = c.node_id "
                             "WHERE c.chunk_id = t.chunk_id "
                             "AND COALESCE(n.is_deleted, FALSE) = FALSE) AS is_live "
                             "FROM memory_vector_tombstones t "
                             "WHERE t.consumed_at IS NULL "
+                            "AND (t.collection_name = :collection_name OR ("
+                            "t.collection_name = '' AND EXISTS ("
+                            "SELECT 1 FROM memory_index_state s "
+                            "WHERE s.state_key = :state_key "
+                            "AND s.collection_name = :collection_name))) "
                             "ORDER BY t.tombstone_id LIMIT :limit"
                         ),
-                        {"limit": _safe_limit(limit)},
+                        {
+                            "limit": _safe_limit(limit),
+                            "collection_name": target_collection_name,
+                            "state_key": ACTIVE_CHUNK_STATE_KEY,
+                        },
                     )
                 )
                 .mappings()
@@ -1477,7 +1839,7 @@ class MySQLDocumentIndexProjection(_MySQLPort):
             dict.fromkeys(
                 str(row["chunk_id"])
                 for row in rows
-                if not bool(row["is_live"])
+                if bool(row["force_delete"]) or not bool(row["is_live"])
             )
         )
         if obsolete_ids:
@@ -1536,15 +1898,14 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                     )
                     if result.rowcount != 1:
                         continue
-                    await session.execute(
-                        _UPSERT_INDEX_JOB,
-                        {
-                            "job_id": f"{node_id}:{content_hash}",
-                            "node_id": node_id,
-                            "content_hash": content_hash,
-                            "now": consumed_at,
-                            "revision": revision,
-                        },
+                    await self._ensure_index_job_in_session(
+                        session,
+                        node_id=node_id,
+                        content_hash=content_hash,
+                        index_revision=revision,
+                        now=consumed_at,
+                        requeue_statuses=_INDEX_JOB_TERMINAL_STATUSES,
+                        revoke_processing=True,
                     )
             for row in rows:
                 result = await session.execute(
@@ -1562,6 +1923,269 @@ class MySQLDocumentIndexProjection(_MySQLPort):
 
         return await self._write(_operation)
 
+    @classmethod
+    async def _schedule_vector_compensation(
+        cls,
+        session: AsyncSession,
+        *,
+        node_id: str,
+        locked_node: Any | None,
+        collection_name: str,
+        now: float,
+    ) -> None:
+        """Persist delete-before-rebuild work for a possibly late vector write.
+
+        Tombstones are retained after consumption, so reactivating every known
+        chunk for the node also covers a historical worker that wrote after an
+        earlier revision tombstone had already been consumed.  Current chunks
+        are force-deleted as well; the exact current revision is then requeued
+        under the already-held node lock.
+        """
+
+        # A tombstone acknowledges a delete against one exact external
+        # collection.  A legacy empty collection is its own fail-closed
+        # identity; it must never suppress or reactivate a named collection's
+        # compensation row.
+        await session.execute(
+            text(
+                "UPDATE memory_vector_tombstones SET consumed_at = NULL, "
+                "force_delete = TRUE, created_at = :now "
+                "WHERE node_id = :node_id "
+                "AND collection_name = :collection_name"
+            ),
+            {
+                "node_id": node_id,
+                "collection_name": collection_name,
+                "now": now,
+            },
+        )
+        await session.execute(
+            text(
+                """INSERT INTO memory_vector_tombstones (
+                    node_id, chunk_id, collection_name, created_at, force_delete
+                )
+                SELECT candidates.node_id, candidates.chunk_id,
+                    :collection_name, :now, TRUE
+                FROM (
+                    SELECT c.node_id, c.chunk_id
+                    FROM memory_chunks c
+                    WHERE c.node_id = :node_id
+                    UNION
+                    SELECT historical.node_id, historical.chunk_id
+                    FROM memory_vector_tombstones historical
+                    WHERE historical.node_id = :node_id
+                ) candidates
+                WHERE candidates.node_id = :node_id
+                  AND NOT EXISTS (
+                      SELECT 1 FROM memory_vector_tombstones t
+                      WHERE t.node_id = candidates.node_id
+                        AND t.chunk_id = candidates.chunk_id
+                        AND t.collection_name = :collection_name
+                        AND t.consumed_at IS NULL AND t.force_delete = TRUE
+                  )"""
+            ),
+            {
+                "node_id": node_id,
+                "collection_name": collection_name,
+                "now": now,
+            },
+        )
+        if (
+            locked_node is None
+            or bool(locked_node.get("is_deleted"))
+            or str(locked_node.get("node_type") or "") != "file"
+        ):
+            return
+        current_hash = str(locked_node.get("content_hash") or "")
+        current_revision = int(locked_node.get("index_revision") or 0)
+        if not current_hash or current_revision <= 0:
+            return
+        current_node = await session.execute(
+            text(
+                "UPDATE memory_nodes SET embedding_synced = FALSE, "
+                "embedding_content_hash = NULL, embedding_model = '', "
+                "embedding_updated_at = NULL WHERE node_id = :node_id "
+                "AND content_hash = :content_hash AND index_revision = :revision"
+            ),
+            {
+                "node_id": node_id,
+                "content_hash": current_hash,
+                "revision": current_revision,
+            },
+        )
+        if current_node.rowcount != 1:
+            raise CursorConflict(
+                "current document changed while scheduling vector compensation"
+            )
+        await cls._ensure_index_job_in_session(
+            session,
+            node_id=node_id,
+            content_hash=current_hash,
+            index_revision=current_revision,
+            now=now,
+            requeue_statuses=_INDEX_JOB_TERMINAL_STATUSES,
+            revoke_processing=True,
+        )
+
+    @classmethod
+    async def _requeue_current_retryable_jobs(
+        cls,
+        session: AsyncSession,
+        *,
+        retry_failed: bool,
+        reclaim_after: float | None,
+        now: float,
+    ) -> int:
+        """Requeue current work and converge expired historical attempts.
+
+        Current exact failed/expired jobs become pending.  An expired
+        historical processing lease becomes stale and schedules force-delete
+        tombstones plus a rebuild of the current revision.  Historical failed
+        rows remain audit history and are never revived.
+        """
+
+        clauses: list[str] = []
+        params: dict[str, Any] = {}
+        if retry_failed:
+            clauses.append("j.status = 'failed'")
+        if reclaim_after is not None:
+            clauses.append(
+                "(j.status = 'processing' AND j.updated_at <= :reclaim_cutoff)"
+            )
+            params["reclaim_cutoff"] = now - max(
+                0.0, float(reclaim_after)
+            )
+        if not clauses:
+            return 0
+
+        candidates = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT j.job_id, j.node_id, j.index_revision, "
+                        "j.status, j.updated_at, j.claim_token "
+                        "FROM memory_index_jobs j WHERE ("
+                        + " OR ".join(clauses)
+                        + ") ORDER BY j.updated_at, j.job_id, j.index_revision"
+                    ),
+                    params,
+                )
+            )
+            .mappings()
+            .all()
+        )
+        changed = 0
+        for candidate in candidates:
+            node_id = str(candidate["node_id"])
+            revision = int(candidate["index_revision"])
+            locked_node = (
+                (
+                    await session.execute(
+                        text(
+                            "SELECT node_id, content_hash, index_revision, "
+                            "node_type, is_deleted FROM memory_nodes "
+                            "WHERE node_id = :node_id FOR UPDATE"
+                        ),
+                        {"node_id": node_id},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            locked_job = (
+                (
+                    await session.execute(
+                        text(
+                            "SELECT job_id, node_id, content_hash, status, "
+                            "updated_at, index_revision, claim_token "
+                            "FROM memory_index_jobs WHERE job_id = :job_id "
+                            "AND index_revision = :revision FOR UPDATE"
+                        ),
+                        {
+                            "job_id": str(candidate["job_id"]),
+                            "revision": revision,
+                        },
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if (
+                locked_job is None
+                or str(locked_job.get("node_id") or "") != node_id
+                or int(locked_job.get("index_revision") or 0) != revision
+            ):
+                continue
+            status = str(locked_job.get("status") or "")
+            retryable = bool(retry_failed and status == "failed")
+            if reclaim_after is not None and status == "processing":
+                retryable = retryable or float(
+                    locked_job.get("updated_at") or 0.0
+                ) <= float(params["reclaim_cutoff"])
+            if not retryable:
+                continue
+            claim_token = str(locked_job.get("claim_token") or "")
+            current_exact = bool(
+                locked_node is not None
+                and str(locked_node.get("node_type") or "") == "file"
+                and not bool(locked_node.get("is_deleted"))
+                and str(locked_job.get("content_hash") or "")
+                == str(locked_node.get("content_hash") or "")
+                and int(locked_node.get("index_revision") or 0) == revision
+            )
+            if not current_exact:
+                if status != "processing":
+                    # Never revive an old failed row, including A -> B -> A.
+                    continue
+                result = await session.execute(
+                    text(
+                        "UPDATE memory_index_jobs SET status = 'stale', "
+                        "updated_at = :now, error = 'HistoricalLeaseExpired', "
+                        "claim_token = '' WHERE job_id = :job_id "
+                        "AND index_revision = :revision AND status = 'processing' "
+                        "AND claim_token = :expected_claim_token"
+                    ),
+                    {
+                        "now": now,
+                        "job_id": str(locked_job["job_id"]),
+                        "revision": revision,
+                        "expected_claim_token": claim_token,
+                    },
+                )
+                if result.rowcount != 1:
+                    raise CursorConflict(
+                        "historical index lease changed while converging"
+                    )
+                await cls._schedule_vector_compensation(
+                    session,
+                    node_id=node_id,
+                    locked_node=locked_node,
+                    collection_name="",
+                    now=now,
+                )
+                changed += 1
+                continue
+            result = await session.execute(
+                text(
+                    "UPDATE memory_index_jobs SET status = 'pending', "
+                    "updated_at = :now, claim_token = '' "
+                    "WHERE job_id = :job_id AND index_revision = :revision "
+                    "AND status = :expected_status "
+                    "AND claim_token = :expected_claim_token"
+                ),
+                {
+                    "now": now,
+                    "job_id": str(locked_job["job_id"]),
+                    "revision": revision,
+                    "expected_status": status,
+                    "expected_claim_token": claim_token,
+                },
+            )
+            if result.rowcount != 1:
+                raise CursorConflict("index retry lease changed concurrently")
+            changed += 1
+        return changed
+
     async def run_index_worker(
         self,
         *,
@@ -1573,17 +2197,15 @@ class MySQLDocumentIndexProjection(_MySQLPort):
         retry_failed: bool,
         reclaim_after: float | None,
     ) -> IndexWorkerReport:
-        if retry_failed:
-            cutoff = time.time() - max(0.0, float(reclaim_after or 0.0))
+        if retry_failed or reclaim_after is not None:
+            now = time.time()
 
-            async def _requeue(session: AsyncSession) -> None:
-                await session.execute(
-                    text(
-                        "UPDATE memory_index_jobs SET status = 'pending', error = '' "
-                        "WHERE status = 'failed' OR "
-                        "(status = 'processing' AND updated_at <= :cutoff)"
-                    ),
-                    {"cutoff": cutoff},
+            async def _requeue(session: AsyncSession) -> int:
+                return await self._requeue_current_retryable_jobs(
+                    session,
+                    retry_failed=retry_failed,
+                    reclaim_after=reclaim_after,
+                    now=now,
                 )
 
             await self._write(_requeue)
@@ -1591,12 +2213,32 @@ class MySQLDocumentIndexProjection(_MySQLPort):
         if not jobs:
             return IndexWorkerReport()
 
+        jobs_by_identity = {_index_job_identity(job): job for job in jobs}
+        report_labels = _index_job_report_labels(jobs)
+
+        def _reported_ids(
+            identities: Sequence[_IndexJobIdentity],
+        ) -> tuple[str, ...]:
+            return tuple(
+                report_labels[identity]
+                for identity in dict.fromkeys(identities)
+            )
+
+        def _reported_errors(
+            values: dict[_IndexJobIdentity, str],
+        ) -> dict[str, str]:
+            return {
+                report_labels[identity]: error
+                for identity, error in values.items()
+            }
+
         assert self.runtime.engine is not None
         payloads: list[tuple[IndexJob, DocumentChunk, str, str]] = []
-        stale: list[str] = []
-        errors: dict[str, str] = {}
+        stale: list[_IndexJobIdentity] = []
+        errors: dict[_IndexJobIdentity, str] = {}
         async with self.runtime.engine.connect() as connection:
             for job in jobs:
+                identity = _index_job_identity(job)
                 node = (
                     (
                         await connection.execute(
@@ -1611,16 +2253,16 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                 if node is None or is_deleted:
                     # 节点不存在或已删除：立即归类 stale，不做 chunks 检查，
                     # 避免已删除文档的 job 反复空转（InvalidDocumentIdentity）。
-                    stale.append(job.job_id)
-                    errors[job.job_id] = "InvalidDocumentIdentity"
+                    stale.append(identity)
+                    errors[identity] = "InvalidDocumentIdentity"
                     continue
                 if (
                     str(node["node_type"]) != "file"
                     or str(node["content_hash"] or "") != job.content_hash
                     or int(node["index_revision"]) != int(job.index_revision)
                 ):
-                    stale.append(job.job_id)
-                    errors[job.job_id] = "StaleRevision"
+                    stale.append(identity)
+                    errors[identity] = "StaleRevision"
                     continue
                 chunks = (
                     (
@@ -1636,28 +2278,46 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                     .all()
                 )
                 if not chunks:
-                    stale.append(job.job_id)
-                    errors[job.job_id] = "EmptyDocument"
+                    stale.append(identity)
+                    errors[identity] = "EmptyDocument"
                     continue
-                for row in chunks:
+                job_payloads: list[tuple[IndexJob, DocumentChunk, str, str]] = []
+                for expected_index, row in enumerate(chunks):
                     chunk = self._chunk_from_row(row)
-                    if compute_content_hash(chunk.content) != chunk.content_hash:
-                        stale.append(job.job_id)
-                        errors[job.job_id] = "InvalidChunkIdentity"
+                    if (
+                        chunk.node_id != job.node_id
+                        or chunk.chunk_index != expected_index
+                        or compute_content_hash(chunk.content) != chunk.content_hash
+                        or chunk.chunk_id
+                        != f"{job.node_id}:{expected_index}:{chunk.content_hash}"
+                    ):
+                        stale.append(identity)
+                        errors[identity] = "InvalidChunkIdentity"
                         break
-                    payloads.append(
+                    job_payloads.append(
                         (job, chunk, str(node["file_path"]), str(node["title"] or ""))
                     )
+                else:
+                    # Publish a job's chunks as one validation unit.  A late
+                    # corrupt chunk must not leave earlier chunks exportable.
+                    payloads.extend(job_payloads)
 
-        for job_id in stale:
-            await self.set_job_status(job_id, "stale", error=errors[job_id])
-        live_ids = {item[0].job_id for item in payloads}
-        live_jobs = [job for job in jobs if job.job_id in live_ids]
+        for identity in dict.fromkeys(stale):
+            job = jobs_by_identity[identity]
+            await self.set_job_status(
+                job,
+                "stale",
+                error=errors[identity],
+            )
+        live_identities = {_index_job_identity(item[0]) for item in payloads}
+        live_jobs = [
+            job for job in jobs if _index_job_identity(job) in live_identities
+        ]
         if not live_jobs:
             return IndexWorkerReport(
                 claimed=len(jobs),
-                stale=tuple(dict.fromkeys(stale)),
-                errors=errors,
+                stale=_reported_ids(stale),
+                errors=_reported_errors(errors),
             )
 
         embedder = embed_texts_func
@@ -1725,101 +2385,262 @@ class MySQLDocumentIndexProjection(_MySQLPort):
         except Exception as exc:  # noqa: BLE001 - isolate external embedding/vector providers
             error_type = type(exc).__name__ if not str(exc) else str(exc)
             for job in live_jobs:
-                await self.set_job_status(job.job_id, "failed", error=error_type)
-                errors[job.job_id] = error_type
+                identity = _index_job_identity(job)
+                await self.set_job_status(
+                    job,
+                    "failed",
+                    error=error_type,
+                )
+                errors[identity] = error_type
             return IndexWorkerReport(
                 claimed=len(jobs),
                 embedded_chunks=0,
-                failed=tuple(job.job_id for job in live_jobs),
-                stale=tuple(dict.fromkeys(stale)),
-                errors=errors,
+                failed=_reported_ids(
+                    [_index_job_identity(job) for job in live_jobs]
+                ),
+                stale=_reported_ids(stale),
+                errors=_reported_errors(errors),
             )
 
         collection_name = str(getattr(collection, "name", "") or "")
         if not collection_name:
             collection_name = chunk_collection_name(model_name, dimension)
 
-        async def _complete(session: AsyncSession) -> tuple[list[str], list[str]]:
-            completed: list[str] = []
-            post_stale: list[str] = []
+        async def _complete(
+            session: AsyncSession,
+        ) -> tuple[
+            list[_IndexJobIdentity],
+            list[_IndexJobIdentity],
+            dict[_IndexJobIdentity, str],
+        ]:
+            completed: list[_IndexJobIdentity] = []
+            post_stale: list[_IndexJobIdentity] = []
+            post_errors: dict[_IndexJobIdentity, str] = {}
             now = time.time()
             for job in live_jobs:
-                result = await session.execute(
-                    text(
-                        """UPDATE memory_index_jobs j
-                        JOIN memory_nodes n ON n.node_id = j.node_id
-                        SET j.status = 'completed', j.updated_at = :now, j.error = '',
-                            n.embedding_synced = TRUE,
-                            n.embedding_content_hash = :content_hash,
-                            n.embedding_model = :model_name,
-                            n.embedding_updated_at = :now
-                        WHERE j.job_id = :job_id AND j.status = 'processing'
-                          AND j.content_hash = :content_hash
-                          AND j.index_revision = :revision
-                          AND n.content_hash = :content_hash
-                          AND n.index_revision = :revision"""
-                    ),
-                    {
-                        "now": now,
-                        "job_id": job.job_id,
-                        "content_hash": job.content_hash,
-                        "revision": job.index_revision,
-                        "model_name": model_name,
-                    },
+                identity = _index_job_identity(job)
+                # All document mutation/requeue paths lock node then job.  Keep
+                # the same order here so N -> N+1 races cannot create a lock
+                # inversion between completion and document upsert.
+                locked_node = (
+                    (
+                        await session.execute(
+                            text(
+                                "SELECT node_id, node_type, content_hash, "
+                                "index_revision, is_deleted "
+                                "FROM memory_nodes WHERE node_id = :node_id FOR UPDATE"
+                            ),
+                            {"node_id": job.node_id},
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
                 )
-                # MySQL reports changed rows across every table in a multi-table
-                # UPDATE.  A successful exact completion can therefore report 1
-                # (only the job changed) or 2 (the job and node provenance changed).
-                # Zero remains the fail-closed stale/revision-mismatch signal.
-                if result.rowcount >= 1:
-                    completed.append(job.job_id)
-                else:
-                    post_stale.append(job.job_id)
+                locked_job = (
+                    (
+                        await session.execute(
+                            text(
+                                "SELECT job_id, node_id, content_hash, status, "
+                                "index_revision, claim_token "
+                                "FROM memory_index_jobs WHERE job_id = :job_id "
+                                "AND index_revision = :revision FOR UPDATE"
+                            ),
+                            {
+                                "job_id": job.job_id,
+                                "revision": job.index_revision,
+                            },
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                owns_claim = bool(
+                    locked_job is not None
+                    and str(locked_job["node_id"]) == job.node_id
+                    and str(locked_job["content_hash"] or "") == job.content_hash
+                    and str(locked_job["status"] or "") == "processing"
+                    and int(locked_job["index_revision"]) == job.index_revision
+                    and str(locked_job.get("claim_token") or "")
+                    == job.claim_token
+                )
+                node_is_exact = bool(
+                    locked_node is not None
+                    and not bool(locked_node.get("is_deleted"))
+                    and str(locked_node["content_hash"] or "") == job.content_hash
+                    and int(locked_node["index_revision"]) == job.index_revision
+                )
+                if owns_claim and node_is_exact:
+                    node_result = await session.execute(
+                        text(
+                            "UPDATE memory_nodes SET embedding_synced = TRUE, "
+                            "embedding_content_hash = :content_hash, "
+                            "embedding_model = :model_name, "
+                            "embedding_updated_at = :now "
+                            "WHERE node_id = :node_id "
+                            "AND content_hash = :content_hash "
+                            "AND index_revision = :revision"
+                        ),
+                        {
+                            "now": now,
+                            "node_id": job.node_id,
+                            "content_hash": job.content_hash,
+                            "revision": job.index_revision,
+                            "model_name": model_name,
+                        },
+                    )
+                    if node_result.rowcount != 1:
+                        raise CursorConflict(
+                            "document changed while completing vector projection"
+                        )
+                    job_result = await session.execute(
+                        text(
+                            "UPDATE memory_index_jobs SET status = 'completed', "
+                            "updated_at = :now, error = '', claim_token = '' "
+                            "WHERE job_id = :job_id AND index_revision = :revision "
+                            "AND status = 'processing' AND claim_token = :claim_token"
+                        ),
+                        {
+                            "now": now,
+                            "job_id": job.job_id,
+                            "revision": job.index_revision,
+                            "claim_token": job.claim_token,
+                        },
+                    )
+                    if job_result.rowcount != 1:
+                        raise CursorConflict(
+                            "index job lease changed while completing projection"
+                        )
+                    completed.append(identity)
+                    continue
+
+                post_stale.append(identity)
+                if owns_claim:
                     await session.execute(
                         text(
                             "UPDATE memory_index_jobs SET status = 'stale', "
-                            "updated_at = :now, error = 'StaleRevision' "
-                            "WHERE job_id = :job_id AND status = 'processing'"
+                            "updated_at = :now, error = 'StaleRevision', "
+                            "claim_token = '' WHERE job_id = :job_id "
+                            "AND index_revision = :revision "
+                            "AND status = 'processing' AND claim_token = :claim_token"
                         ),
-                        {"now": now, "job_id": job.job_id},
+                        {
+                            "now": now,
+                            "job_id": job.job_id,
+                            "revision": job.index_revision,
+                            "claim_token": job.claim_token,
+                        },
                     )
-            await session.execute(
-                text(
-                    """INSERT INTO memory_index_state (
-                        state_key, collection_name, model_name, dimension,
-                        version, updated_at
-                    ) VALUES (
-                        :state_key, :collection_name, :model_name, :dimension,
-                        :version, :updated_at
-                    ) ON DUPLICATE KEY UPDATE
-                        collection_name = VALUES(collection_name),
-                        model_name = VALUES(model_name),
-                        dimension = VALUES(dimension), version = VALUES(version),
-                        updated_at = VALUES(updated_at)"""
-                ),
-                {
-                    "state_key": ACTIVE_CHUNK_STATE_KEY,
-                    "collection_name": collection_name,
-                    "model_name": model_name,
-                    "dimension": dimension,
-                    "version": CHUNK_INDEX_VERSION,
-                    "updated_at": now,
-                },
-            )
-            return completed, post_stale
 
-        completed, post_stale = await self._write(_complete)
+                post_errors[identity] = (
+                    "ClaimLeaseLostRequeued" if node_is_exact else "StaleRevision"
+                )
+                # The external vector side effect happened before the lease
+                # CAS.  Even the same revision is not safe: a late W1 can
+                # overwrite W2's payload.  Persist delete-before-rebuild work
+                # and revoke/requeue the exact current revision.
+                await self._schedule_vector_compensation(
+                    session,
+                    node_id=job.node_id,
+                    locked_node=locked_node,
+                    collection_name=collection_name,
+                    now=now,
+                )
+            if completed:
+                state = (
+                    (
+                        await session.execute(
+                            text(
+                                "SELECT collection_name, model_name, dimension, version "
+                                "FROM memory_index_state WHERE state_key = :state_key "
+                                "FOR UPDATE"
+                            ),
+                            {"state_key": ACTIVE_CHUNK_STATE_KEY},
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                state_matches = bool(
+                    state is None
+                    or (
+                        str(state["collection_name"] or "") == collection_name
+                        and str(state["model_name"] or "") == model_name
+                        and int(state["dimension"] or 0) == dimension
+                        and int(state["version"] or 0) == CHUNK_INDEX_VERSION
+                    )
+                )
+                if not state_matches:
+                    for identity in tuple(completed):
+                        job = jobs_by_identity[identity]
+                        locked_node = (
+                            (
+                                await session.execute(
+                                    text(
+                                        "SELECT node_id, node_type, content_hash, "
+                                        "index_revision, is_deleted FROM memory_nodes "
+                                        "WHERE node_id = :node_id FOR UPDATE"
+                                    ),
+                                    {"node_id": job.node_id},
+                                )
+                            )
+                            .mappings()
+                            .one_or_none()
+                        )
+                        await self._schedule_vector_compensation(
+                            session,
+                            node_id=job.node_id,
+                            locked_node=locked_node,
+                            collection_name=collection_name,
+                            now=now,
+                        )
+                        post_stale.append(identity)
+                        post_errors[identity] = "ActiveCollectionIdentityMismatch"
+                    completed.clear()
+                elif state is None:
+                    await session.execute(
+                        text(
+                            """INSERT INTO memory_index_state (
+                                state_key, collection_name, model_name, dimension,
+                                version, updated_at
+                            ) VALUES (
+                                :state_key, :collection_name, :model_name, :dimension,
+                                :version, :updated_at
+                            )"""
+                        ),
+                        {
+                            "state_key": ACTIVE_CHUNK_STATE_KEY,
+                            "collection_name": collection_name,
+                            "model_name": model_name,
+                            "dimension": dimension,
+                            "version": CHUNK_INDEX_VERSION,
+                            "updated_at": now,
+                        },
+                    )
+                else:
+                    await session.execute(
+                        text(
+                            "UPDATE memory_index_state SET updated_at = :updated_at "
+                            "WHERE state_key = :state_key"
+                        ),
+                        {
+                            "state_key": ACTIVE_CHUNK_STATE_KEY,
+                            "updated_at": now,
+                        },
+                    )
+            return completed, post_stale, post_errors
+
+        completed, post_stale, post_errors = await self._write(_complete)
         stale.extend(post_stale)
-        errors.update({job_id: "StaleRevision" for job_id in post_stale})
+        errors.update(post_errors)
         return IndexWorkerReport(
             claimed=len(jobs),
             embedded_chunks=len(payloads),
             upserted_chunks=len(payloads),
-            completed=tuple(completed),
-            stale=tuple(dict.fromkeys(stale)),
+            completed=_reported_ids(completed),
+            stale=_reported_ids(stale),
             model_name=model_name,
             dimension=dimension,
-            errors=errors,
+            errors=_reported_errors(errors),
         )
 
     async def fts_search(self, query: str, *, top_k: int) -> list[tuple[Any, ...]]:

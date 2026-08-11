@@ -17,9 +17,11 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .eligibility import assess_indexed_document_path
 from .indexing import (
+    ACTIVE_CHUNK_STATE_KEY,
     IndexJob,
     _enqueue_index_job_in_transaction,
     claim_index_jobs,
+    index_job_report_identity,
     read_active_chunk_index_state,
     transaction,
     write_active_chunk_index_state,
@@ -31,6 +33,7 @@ from .sqlite_runtime import run_db
 CHUNK_INDEX_VERSION = 1
 CHUNK_COLLECTION_PREFIX = "life_memory_chunks"
 DEFAULT_RECLAIM_AFTER = 600.0
+_IndexJobIdentity = tuple[str, int]
 
 
 @dataclass(frozen=True)
@@ -45,6 +48,14 @@ class _ChunkPayload:
     chunk_index: int
     chunk_hash: str
     content: str
+
+
+def _job_identity(job: IndexJob) -> _IndexJobIdentity:
+    return job.job_id, int(job.index_revision)
+
+
+def _payload_identity(payload: _ChunkPayload) -> _IndexJobIdentity:
+    return payload.job_id, int(payload.index_revision)
 
 
 @dataclass(frozen=True)
@@ -193,8 +204,9 @@ def _tombstone_table_exists(db: sqlite3.Connection) -> bool:
 def _read_pending_tombstones(
     db: sqlite3.Connection,
     *,
+    collection_name: str,
     limit: int,
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
     """Partition pending tombstones into obsolete and currently live IDs.
 
     A document can be deleted and later revived with the same content.  Chunk
@@ -205,11 +217,24 @@ def _read_pending_tombstones(
     """
     if not _tombstone_table_exists(db):
         return [], []
+    target = str(collection_name or "").strip()
+    if not target:
+        return [], []
     rows = db.execute(
-        "SELECT chunk_id FROM memory_vector_tombstones ORDER BY created_at LIMIT ?",
-        (max(0, int(limit)),),
+        """SELECT tombstone_id, chunk_id, force_delete
+           FROM memory_vector_tombstones
+           WHERE consumed_at IS NULL AND (
+               collection_name = ? OR (
+                   collection_name = '' AND EXISTS (
+                       SELECT 1 FROM memory_index_state
+                       WHERE state_key = ? AND collection_name = ?
+                   )
+               )
+           )
+           ORDER BY tombstone_id LIMIT ?""",
+        (target, ACTIVE_CHUNK_STATE_KEY, target, max(0, int(limit))),
     ).fetchall()
-    chunk_ids = list(dict.fromkeys(str(row[0]) for row in rows if row[0]))
+    chunk_ids = list(dict.fromkeys(str(row[1]) for row in rows if row[1]))
     if not chunk_ids:
         return [], []
     placeholders = ",".join("?" for _ in chunk_ids)
@@ -221,23 +246,31 @@ def _read_pending_tombstones(
         chunk_ids,
     ).fetchall()
     live = {str(row[0]) for row in live_rows if row[0]}
-    return (
-        [chunk_id for chunk_id in chunk_ids if chunk_id not in live],
-        [chunk_id for chunk_id in chunk_ids if chunk_id in live],
-    )
+    to_delete: list[tuple[int, str]] = []
+    acknowledge: list[tuple[int, str]] = []
+    for row in rows:
+        tombstone = (int(row[0]), str(row[1]))
+        if bool(row[2]) or tombstone[1] not in live:
+            to_delete.append(tombstone)
+        else:
+            acknowledge.append(tombstone)
+    return to_delete, acknowledge
 
 
 def _remove_processed_tombstones(
     db: sqlite3.Connection,
-    chunk_ids: Sequence[str],
+    tombstone_ids: Sequence[int],
+    *,
+    now: float,
 ) -> None:
-    """Delete consumed tombstone rows inside an already-open transaction."""
-    if not chunk_ids or not _tombstone_table_exists(db):
+    """Acknowledge only rows consumed against the exact target collection."""
+    if not tombstone_ids or not _tombstone_table_exists(db):
         return
-    placeholders = ",".join("?" for _ in chunk_ids)
+    placeholders = ",".join("?" for _ in tombstone_ids)
     db.execute(
-        f"DELETE FROM memory_vector_tombstones WHERE chunk_id IN ({placeholders})",
-        list(chunk_ids),
+        "UPDATE memory_vector_tombstones SET consumed_at = ? "
+        f"WHERE consumed_at IS NULL AND tombstone_id IN ({placeholders})",
+        [now, *tombstone_ids],
     )
 
 
@@ -312,7 +345,7 @@ def _current_revision(node: sqlite3.Row, job: IndexJob) -> tuple[int | None, str
     """Return the compatible outbox revision or a non-exportable identity error."""
     try:
         revision = int(node["index_revision"] or 0)
-        expected = int(job.index_revision or revision)
+        expected = int(job.index_revision)
     except (TypeError, ValueError):
         return None, "InvalidJobIdentity"
     if revision < 0 or expected < 0:
@@ -380,32 +413,33 @@ def _load_job_payloads(
     stale: list[str] = []
     errors: dict[str, str] = {}
     for job in jobs:
+        identity = index_job_report_identity(job)
         node = db.execute(
             "SELECT node_id, node_type, file_path, title, content_hash, index_revision, is_deleted "
             "FROM memory_nodes WHERE node_id = ?",
             (job.node_id,),
         ).fetchone()
         if not _is_active_embeddable_file_node(node):
-            stale.append(job.job_id)
-            errors[job.job_id] = "InvalidDocumentIdentity"
+            stale.append(identity)
+            errors[identity] = "InvalidDocumentIdentity"
             continue
         if _job_identity_error(job) is not None:
-            stale.append(job.job_id)
-            errors[job.job_id] = "InvalidJobIdentity"
+            stale.append(identity)
+            errors[identity] = "InvalidJobIdentity"
             continue
         assert node is not None
         job_revision, revision_error = _current_revision(node, job)
         if revision_error:
-            stale.append(job.job_id)
-            errors[job.job_id] = revision_error
+            stale.append(identity)
+            errors[identity] = revision_error
             continue
         assert job_revision is not None
         if (
             str(node["content_hash"] or "") != job.content_hash
             or int(node["index_revision"] or 0) != job_revision
         ):
-            stale.append(job.job_id)
-            errors[job.job_id] = "StaleRevision"
+            stale.append(identity)
+            errors[identity] = "StaleRevision"
             continue
         job_payloads, payload_error = _payloads_for_job(
             db,
@@ -414,12 +448,12 @@ def _load_job_payloads(
             index_revision=job_revision,
         )
         if payload_error == "EmptyDocument":
-            stale.append(job.job_id)  # 永久空文档 → stale 而非 failed，避免 retry 循环
-            errors[job.job_id] = payload_error
+            stale.append(identity)  # 永久空文档 → stale 而非 failed，避免 retry 循环
+            errors[identity] = payload_error
             continue
         if payload_error:
-            stale.append(job.job_id)
-            errors[job.job_id] = payload_error
+            stale.append(identity)
+            errors[identity] = payload_error
             continue
         payloads.extend(job_payloads)
     return payloads, stale, errors
@@ -427,24 +461,35 @@ def _load_job_payloads(
 
 def _mark_jobs(
     db: sqlite3.Connection,
-    job_ids: Iterable[str],
+    jobs: Iterable[IndexJob],
     status: str,
     errors: Mapping[str, str] | None = None,
     *,
     now: float | None = None,
 ) -> None:
     """Update only jobs still owned by this worker pass."""
-    ids = list(dict.fromkeys(str(job_id) for job_id in job_ids))
-    if not ids:
+    claimed = {index_job_report_identity(job): job for job in jobs}
+    if not claimed:
         return
     timestamp = float(time.time() if now is None else now)
     with transaction(db):
         db.executemany(
-            "UPDATE memory_index_jobs SET status = ?, updated_at = ?, error = ? "
-            "WHERE job_id = ? AND status = 'processing'",
+            "UPDATE memory_index_jobs SET status = ?, updated_at = ?, error = ?, "
+            "claim_token = '' WHERE job_id = ? AND node_id = ? "
+            "AND content_hash = ? AND index_revision = ? "
+            "AND status = 'processing' AND claim_token = ?",
             [
-                (status, timestamp, str((errors or {}).get(job_id, "")), job_id)
-                for job_id in ids
+                (
+                    status,
+                    timestamp,
+                    str((errors or {}).get(index_job_report_identity(job), "")),
+                    job.job_id,
+                    job.node_id,
+                    job.content_hash,
+                    int(job.index_revision),
+                    job.claim_token,
+                )
+                for job in claimed.values()
             ],
         )
 
@@ -457,24 +502,26 @@ def _revalidate_payloads(
     now: float,
 ) -> tuple[list[_ChunkPayload], list[int], list[IndexJob], list[str], dict[str, str]]:
     """Keep only payloads that still match strict current SQLite identity."""
-    payloads_by_job: dict[str, list[_ChunkPayload]] = {}
+    payloads_by_job: dict[_IndexJobIdentity, list[_ChunkPayload]] = {}
     for payload in payloads:
-        payloads_by_job.setdefault(payload.job_id, []).append(payload)
+        payloads_by_job.setdefault(_payload_identity(payload), []).append(payload)
 
-    valid_job_ids: set[str] = set()
+    valid_jobs_by_identity: dict[_IndexJobIdentity, IndexJob] = {}
     stale: list[str] = []
     errors: dict[str, str] = {}
     with transaction(db):
         for job in jobs:
+            identity = _job_identity(job)
+            report_identity = index_job_report_identity(job)
             node = db.execute(
                 "SELECT node_id, node_type, file_path, title, content_hash, index_revision, is_deleted "
                 "FROM memory_nodes WHERE node_id = ?",
                 (job.node_id,),
             ).fetchone()
             job_row = db.execute(
-                "SELECT job_id, node_id, status, content_hash, index_revision "
-                "FROM memory_index_jobs WHERE job_id = ?",
-                (job.job_id,),
+                "SELECT job_id, node_id, status, content_hash, index_revision, claim_token "
+                "FROM memory_index_jobs WHERE job_id = ? AND index_revision = ?",
+                (job.job_id, int(job.index_revision)),
             ).fetchone()
             error_type: str | None = None
             if not _is_active_embeddable_file_node(node):
@@ -492,7 +539,11 @@ def _revalidate_payloads(
                     or int(node["index_revision"] or 0) != job_revision
                 ):
                     error_type = "StaleRevision"
-                elif job_row is None or str(job_row["status"] or "") != "processing":
+                elif (
+                    job_row is None
+                    or str(job_row["status"] or "") != "processing"
+                    or str(job_row["claim_token"] or "") != job.claim_token
+                ):
                     error_type = "JobStateChanged"
                 elif (
                     str(job_row["job_id"] or "") != job.job_id
@@ -510,36 +561,41 @@ def _revalidate_payloads(
                     )
                     if payload_error:
                         error_type = payload_error
-                    elif current_payloads != payloads_by_job.get(job.job_id, []):
+                    elif current_payloads != payloads_by_job.get(identity, []):
                         error_type = "StalePayload"
 
             if error_type:
                 if job_row is not None and str(job_row["status"] or "") == "processing":
                     db.execute(
                         "UPDATE memory_index_jobs SET status = 'stale', updated_at = ?, error = ? "
-                        "WHERE job_id = ? AND status = 'processing'",
-                        (now, error_type, job.job_id),
+                        "WHERE job_id = ? AND index_revision = ? "
+                        "AND status = 'processing' AND claim_token = ?",
+                        (
+                            now,
+                            error_type,
+                            job.job_id,
+                            int(job.index_revision),
+                            job.claim_token,
+                        ),
                     )
-                stale.append(job.job_id)
-                errors[job.job_id] = error_type
+                stale.append(report_identity)
+                errors[report_identity] = error_type
                 continue
 
             assert job_row is not None and job_revision is not None
-            if int(job_row["index_revision"] or 0) == 0 and job_revision:
-                db.execute(
-                    "UPDATE memory_index_jobs SET index_revision = ? "
-                    "WHERE job_id = ? AND status = 'processing' AND index_revision = 0",
-                    (job_revision, job.job_id),
-                )
-            valid_job_ids.add(job.job_id)
+            valid_jobs_by_identity[identity] = job
 
     valid_payloads: list[_ChunkPayload] = []
     embedding_indices: list[int] = []
     for index, payload in enumerate(payloads):
-        if payload.job_id in valid_job_ids:
+        if _payload_identity(payload) in valid_jobs_by_identity:
             valid_payloads.append(payload)
             embedding_indices.append(index)
-    valid_jobs = [job for job in jobs if job.job_id in valid_job_ids]
+    valid_jobs = [
+        valid_jobs_by_identity[_job_identity(job)]
+        for job in jobs
+        if _job_identity(job) in valid_jobs_by_identity
+    ]
     return valid_payloads, embedding_indices, valid_jobs, stale, errors
 
 
@@ -547,6 +603,7 @@ def _complete_jobs(
     db: sqlite3.Connection,
     jobs: Sequence[IndexJob],
     *,
+    vector_chunk_ids: Mapping[_IndexJobIdentity, Sequence[str]],
     collection_name: str,
     model_name: str,
     dimension: int,
@@ -556,8 +613,50 @@ def _complete_jobs(
     completed: list[str] = []
     stale: list[str] = []
     errors: dict[str, str] = {}
+
+    def compensate(
+        job: IndexJob,
+        identity: _IndexJobIdentity,
+        report_identity: str,
+        reason: str,
+    ) -> None:
+        chunk_ids = tuple(dict.fromkeys(vector_chunk_ids.get(identity, ())))
+        db.executemany(
+            """INSERT INTO memory_vector_tombstones (
+                node_id, chunk_id, collection_name, created_at, consumed_at, force_delete
+            ) VALUES (?, ?, ?, ?, NULL, 1)""",
+            [(job.node_id, chunk_id, collection_name, now) for chunk_id in chunk_ids],
+        )
+        current = db.execute(
+            "SELECT content_hash, index_revision FROM memory_nodes "
+            "WHERE node_id = ? AND COALESCE(is_deleted, 0) = 0",
+            (job.node_id,),
+        ).fetchone()
+        if current is None or not str(current["content_hash"] or ""):
+            return
+        current_hash = str(current["content_hash"])
+        current_revision = int(current["index_revision"] or 0)
+        db.execute(
+            "UPDATE memory_nodes SET embedding_synced = 0, "
+            "embedding_content_hash = NULL, embedding_model = NULL, "
+            "embedding_updated_at = NULL WHERE node_id = ? "
+            "AND content_hash = ? AND index_revision = ?",
+            (job.node_id, current_hash, current_revision),
+        )
+        _enqueue_index_job_in_transaction(
+            db,
+            job.node_id,
+            current_hash,
+            now=now,
+            index_revision=current_revision,
+            requeue_statuses=frozenset({"completed", "failed", "stale"}),
+        )
+        errors[report_identity] = reason
+
     with transaction(db):
         for job in jobs:
+            identity = _job_identity(job)
+            report_identity = index_job_report_identity(job)
             node_row = db.execute(
                 "SELECT node_id, node_type, file_path, title, content_hash, index_revision, is_deleted "
                 "FROM memory_nodes WHERE node_id = ?",
@@ -582,18 +681,27 @@ def _complete_jobs(
             if error_type:
                 db.execute(
                     "UPDATE memory_index_jobs SET status = 'stale', updated_at = ?, error = ? "
-                    "WHERE job_id = ? AND status = 'processing'",
-                    (now, error_type, job.job_id),
+                    "WHERE job_id = ? AND index_revision = ? "
+                    "AND status = 'processing' AND claim_token = ?",
+                    (
+                        now,
+                        error_type,
+                        job.job_id,
+                        int(job.index_revision),
+                        job.claim_token,
+                    ),
                 )
-                stale.append(job.job_id)
-                errors[job.job_id] = error_type
+                stale.append(report_identity)
+                errors[report_identity] = error_type
+                compensate(job, identity, report_identity, error_type)
                 continue
 
             assert expected_revision is not None
             job_cursor = db.execute(
-                "UPDATE memory_index_jobs SET status = 'completed', updated_at = ?, error = '' "
+                "UPDATE memory_index_jobs SET status = 'completed', updated_at = ?, "
+                "error = '', claim_token = '' "
                 "WHERE job_id = ? AND node_id = ? AND status = 'processing' AND content_hash = ? "
-                "AND index_revision = ? AND EXISTS ("
+                "AND index_revision = ? AND claim_token = ? AND EXISTS ("
                 "SELECT 1 FROM memory_nodes WHERE node_id = ? AND node_type = ? "
                 "AND is_deleted = 0 AND file_path = ? AND content_hash = ? "
                 "AND index_revision = ?)",
@@ -603,6 +711,7 @@ def _complete_jobs(
                     job.node_id,
                     job.content_hash,
                     expected_revision,
+                    job.claim_token,
                     job.node_id,
                     NodeType.FILE.value,
                     str(node_row["file_path"]),
@@ -611,8 +720,14 @@ def _complete_jobs(
                 ),
             )
             if job_cursor.rowcount != 1:
-                stale.append(job.job_id)
-                errors[job.job_id] = "JobStateChanged"
+                stale.append(report_identity)
+                errors[report_identity] = "JobStateChanged"
+                compensate(
+                    job,
+                    identity,
+                    report_identity,
+                    "ClaimLeaseLostRequeued",
+                )
                 continue
             node_cursor = db.execute(
                 "UPDATE memory_nodes SET embedding_synced = 1, "
@@ -628,15 +743,21 @@ def _complete_jobs(
                 ),
             )
             if node_cursor.rowcount == 1:
-                completed.append(job.job_id)
+                completed.append(report_identity)
             else:
                 db.execute(
                     "UPDATE memory_index_jobs SET status = 'stale', error = 'StaleRevision' "
-                    "WHERE job_id = ? AND status = 'completed'",
-                    (job.job_id,),
+                    "WHERE job_id = ? AND index_revision = ? AND status = 'completed'",
+                    (job.job_id, expected_revision),
                 )
-                stale.append(job.job_id)
-                errors[job.job_id] = "StaleRevision"
+                stale.append(report_identity)
+                errors[report_identity] = "StaleRevision"
+                compensate(
+                    job,
+                    identity,
+                    report_identity,
+                    "StaleRevisionRequeued",
+                )
         if completed:
             write_active_chunk_index_state(
                 db,
@@ -659,13 +780,19 @@ async def consume_vector_tombstones(
     """Delete superseded chunk vectors from Chroma and clear tombstone records."""
     if collection is None:
         return 0
-    obsolete_ids, live_ids = await _db_call(
+    collection_name = str(getattr(collection, "name", "") or "").strip()
+    if not collection_name:
+        return 0
+    delete_rows, acknowledge_rows = await _db_call(
         _read_pending_tombstones,
         db,
+        collection_name=collection_name,
         limit=limit,
     )
-    if not obsolete_ids and not live_ids:
+    if not delete_rows and not acknowledge_rows:
         return 0
+
+    obsolete_ids = list(dict.fromkeys(chunk_id for _, chunk_id in delete_rows))
 
     delete_func = getattr(collection, "delete", None)
     if not callable(delete_func):
@@ -715,11 +842,16 @@ async def consume_vector_tombstones(
                         content_hash,
                         now=requeue_at,
                         index_revision=revision,
+                        requeue_statuses=frozenset({"completed", "failed", "stale"}),
                     )
-            _remove_processed_tombstones(db_, [*obsolete_ids, *live_ids])
+            _remove_processed_tombstones(
+                db_,
+                [row_id for row_id, _ in [*delete_rows, *acknowledge_rows]],
+                now=float(time.time() if now is None else now),
+            )
 
     await _db_call(_clear, db)
-    return len(obsolete_ids) + len(live_ids)
+    return len(delete_rows) + len(acknowledge_rows)
 
 
 async def process_index_jobs(
@@ -758,12 +890,12 @@ async def process_index_jobs(
         payloads, initial_stale, load_errors = await _db_call(_load_job_payloads, db, jobs)
     except Exception as exc:
         error_type = type(exc).__name__
-        failed_ids = [job.job_id for job in jobs]
+        failed_ids = [index_job_report_identity(job) for job in jobs]
         errors = {job_id: error_type for job_id in failed_ids}
         await _db_call(
             _mark_jobs,
             db,
-            failed_ids,
+            jobs,
             "failed",
             errors,
             now=timestamp,
@@ -777,36 +909,40 @@ async def process_index_jobs(
     stale_ids = list(initial_stale)
     error_map = dict(load_errors)
     if stale_ids:
+        stale_set = set(stale_ids)
         await _db_call(
             _mark_jobs,
             db,
-            stale_ids,
+            (job for job in jobs if index_job_report_identity(job) in stale_set),
             "stale",
             error_map,
             now=timestamp,
         )
 
-    payload_job_ids = {payload.job_id for payload in payloads}
+    payload_job_ids = {_payload_identity(payload) for payload in payloads}
     failed_without_payload = [
         job
         for job in jobs
-        if job.job_id not in payload_job_ids and job.job_id not in stale_ids
+        if _job_identity(job) not in payload_job_ids
+        and index_job_report_identity(job) not in stale_ids
     ]
     if failed_without_payload:
         await _db_call(
             _mark_jobs,
             db,
-            (job.job_id for job in failed_without_payload),
+            failed_without_payload,
             "failed",
             error_map,
             now=timestamp,
         )
 
-    live_jobs = [job for job in jobs if job.job_id in payload_job_ids]
+    live_jobs = [
+        job for job in jobs if _job_identity(job) in payload_job_ids
+    ]
     if not live_jobs:
         return IndexWorkerReport(
             claimed=len(jobs),
-            failed=tuple(job.job_id for job in failed_without_payload),
+            failed=tuple(index_job_report_identity(job) for job in failed_without_payload),
             stale=tuple(stale_ids),
             errors=error_map,
         )
@@ -826,7 +962,7 @@ async def process_index_jobs(
     if not live_jobs:
         return IndexWorkerReport(
             claimed=len(jobs),
-            failed=tuple(job.job_id for job in failed_without_payload),
+            failed=tuple(index_job_report_identity(job) for job in failed_without_payload),
             stale=tuple(dict.fromkeys(stale_ids)),
             errors=error_map,
         )
@@ -838,11 +974,11 @@ async def process_index_jobs(
         embedding_result = _normalize_embedding_result(embedding_value, len(texts))
     except Exception as exc:
         error_type = type(exc).__name__
-        failed_ids = [job.job_id for job in live_jobs]
+        failed_ids = [index_job_report_identity(job) for job in live_jobs]
         await _db_call(
             _mark_jobs,
             db,
-            failed_ids,
+            live_jobs,
             "failed",
             {job_id: error_type for job_id in failed_ids},
             now=timestamp,
@@ -850,7 +986,12 @@ async def process_index_jobs(
         error_map.update({job_id: error_type for job_id in failed_ids})
         return IndexWorkerReport(
             claimed=len(jobs),
-            failed=tuple(failed_ids + [job.job_id for job in failed_without_payload]),
+            failed=tuple(
+                [
+                    *failed_ids,
+                    *(index_job_report_identity(job) for job in failed_without_payload),
+                ]
+            ),
             stale=tuple(stale_ids),
             errors=error_map,
         )
@@ -866,11 +1007,11 @@ async def process_index_jobs(
         or active_state.dimension != dimension
     ):
         error_type = "ActiveCollectionIdentityMismatch"
-        failed_ids = [job.job_id for job in live_jobs]
+        failed_ids = [index_job_report_identity(job) for job in live_jobs]
         await _db_call(
             _mark_jobs,
             db,
-            failed_ids,
+            live_jobs,
             "failed",
             {job_id: error_type for job_id in failed_ids},
             now=timestamp,
@@ -879,7 +1020,12 @@ async def process_index_jobs(
         return IndexWorkerReport(
             claimed=len(jobs),
             embedded_chunks=embedded_chunk_count,
-            failed=tuple(failed_ids + [job.job_id for job in failed_without_payload]),
+            failed=tuple(
+                [
+                    *failed_ids,
+                    *(index_job_report_identity(job) for job in failed_without_payload),
+                ]
+            ),
             stale=tuple(dict.fromkeys(stale_ids)),
             model_name=model_name,
             dimension=dimension,
@@ -900,7 +1046,7 @@ async def process_index_jobs(
         return IndexWorkerReport(
             claimed=len(jobs),
             embedded_chunks=embedded_chunk_count,
-            failed=tuple(job.job_id for job in failed_without_payload),
+            failed=tuple(index_job_report_identity(job) for job in failed_without_payload),
             stale=tuple(dict.fromkeys(stale_ids)),
             model_name=model_name,
             dimension=dimension,
@@ -926,11 +1072,11 @@ async def process_index_jobs(
             if str(exc) == "CollectionUnavailable"
             else type(exc).__name__
         )
-        failed_ids = [job.job_id for job in live_jobs]
+        failed_ids = [index_job_report_identity(job) for job in live_jobs]
         await _db_call(
             _mark_jobs,
             db,
-            failed_ids,
+            live_jobs,
             "failed",
             {job_id: error_type for job_id in failed_ids},
             now=timestamp,
@@ -939,7 +1085,12 @@ async def process_index_jobs(
         return IndexWorkerReport(
             claimed=len(jobs),
             embedded_chunks=embedded_chunk_count,
-            failed=tuple(failed_ids + [job.job_id for job in failed_without_payload]),
+            failed=tuple(
+                [
+                    *failed_ids,
+                    *(index_job_report_identity(job) for job in failed_without_payload),
+                ]
+            ),
             stale=tuple(dict.fromkeys(stale_ids)),
             model_name=model_name,
             dimension=dimension,
@@ -962,7 +1113,7 @@ async def process_index_jobs(
         return IndexWorkerReport(
             claimed=len(jobs),
             embedded_chunks=embedded_chunk_count,
-            failed=tuple(job.job_id for job in failed_without_payload),
+            failed=tuple(index_job_report_identity(job) for job in failed_without_payload),
             stale=tuple(dict.fromkeys(stale_ids)),
             model_name=model_name,
             dimension=dimension,
@@ -974,11 +1125,11 @@ async def process_index_jobs(
         active_collection_name = chunk_collection_name(model_name, dimension)
     if active_state is not None and active_state.collection_name != active_collection_name:
         error_type = "ActiveCollectionIdentityMismatch"
-        failed_ids = [job.job_id for job in live_jobs]
+        failed_ids = [index_job_report_identity(job) for job in live_jobs]
         await _db_call(
             _mark_jobs,
             db,
-            failed_ids,
+            live_jobs,
             "failed",
             {job_id: error_type for job_id in failed_ids},
             now=timestamp,
@@ -987,7 +1138,12 @@ async def process_index_jobs(
         return IndexWorkerReport(
             claimed=len(jobs),
             embedded_chunks=embedded_chunk_count,
-            failed=tuple(failed_ids + [job.job_id for job in failed_without_payload]),
+            failed=tuple(
+                [
+                    *failed_ids,
+                    *(index_job_report_identity(job) for job in failed_without_payload),
+                ]
+            ),
             stale=tuple(dict.fromkeys(stale_ids)),
             model_name=model_name,
             dimension=dimension,
@@ -1025,11 +1181,11 @@ async def process_index_jobs(
             await asyncio.to_thread(collection.upsert, **kwargs)
     except Exception as exc:
         error_type = type(exc).__name__
-        failed_ids = [job.job_id for job in live_jobs]
+        failed_ids = [index_job_report_identity(job) for job in live_jobs]
         await _db_call(
             _mark_jobs,
             db,
-            failed_ids,
+            live_jobs,
             "failed",
             {job_id: error_type for job_id in failed_ids},
             now=timestamp,
@@ -1038,7 +1194,12 @@ async def process_index_jobs(
         return IndexWorkerReport(
             claimed=len(jobs),
             embedded_chunks=embedded_chunk_count,
-            failed=tuple(failed_ids + [job.job_id for job in failed_without_payload]),
+            failed=tuple(
+                [
+                    *failed_ids,
+                    *(index_job_report_identity(job) for job in failed_without_payload),
+                ]
+            ),
             stale=tuple(dict.fromkeys(stale_ids)),
             model_name=model_name,
             dimension=dimension,
@@ -1050,6 +1211,14 @@ async def process_index_jobs(
         _complete_jobs,
         db,
         live_jobs,
+        vector_chunk_ids={
+            identity: tuple(
+                payload.chunk_id
+                for payload in payloads
+                if _payload_identity(payload) == identity
+            )
+            for identity in {_job_identity(job) for job in live_jobs}
+        },
         collection_name=active_collection_name,
         model_name=model_name,
         dimension=dimension,
@@ -1069,7 +1238,7 @@ async def process_index_jobs(
         embedded_chunks=embedded_chunk_count,
         upserted_chunks=len(ids),
         completed=tuple(completed),
-        failed=tuple(job.job_id for job in failed_without_payload),
+        failed=tuple(index_job_report_identity(job) for job in failed_without_payload),
         stale=tuple(dict.fromkeys(stale_ids)),
         model_name=model_name,
         dimension=dimension,

@@ -170,11 +170,17 @@ class DocumentIndexProjection(MemoryStorePort, Protocol):
 
     async def set_job_status(
         self,
-        job_id: str,
+        job: IndexJob | str,
         status: str,
         *,
         error: str = "",
-    ) -> bool: ...
+    ) -> bool:
+        """CAS a claimed job by its revision and lease token.
+
+        ``str`` remains accepted for source compatibility but must fail
+        closed because it cannot prove ownership of a processing attempt.
+        """
+        ...
 
     async def enqueue_job(self, node_id: str, content_hash: str) -> str: ...
 

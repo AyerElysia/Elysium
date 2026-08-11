@@ -78,8 +78,36 @@ async def _prepare_v8_database(engine: object) -> None:
         await connection.execute(
             text("DROP TABLE IF EXISTS memory_workspace_projection_events")
         )
+        index_exists = await connection.scalar(
+            text(
+                "SELECT 1 FROM information_schema.statistics "
+                "WHERE table_schema = DATABASE() "
+                "AND table_name = 'memory_index_jobs' "
+                "AND index_name = 'uq_memory_jobs_node_revision' LIMIT 1"
+            )
+        )
+        if index_exists is not None:
+            await connection.execute(
+                text(
+                    "ALTER TABLE memory_index_jobs "
+                    "DROP INDEX uq_memory_jobs_node_revision, "
+                    "DROP PRIMARY KEY, ADD PRIMARY KEY (job_id)"
+                )
+            )
+        claim_column_exists = await connection.scalar(
+            text(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = DATABASE() "
+                "AND table_name = 'memory_index_jobs' "
+                "AND column_name = 'claim_token' LIMIT 1"
+            )
+        )
+        if claim_column_exists is not None:
+            await connection.execute(
+                text("ALTER TABLE memory_index_jobs DROP COLUMN claim_token")
+            )
         await connection.execute(
-            text("DELETE FROM life_memory_schema_migrations WHERE version = 9")
+            text("DELETE FROM life_memory_schema_migrations WHERE version >= 9")
         )
         await connection.execute(
             text(
@@ -91,7 +119,7 @@ async def _prepare_v8_database(engine: object) -> None:
         engine,  # type: ignore[arg-type]
         table_name="life_memory_schema_migrations",
         lock_name="elysium:life-memory-schema",
-    ).apply(MEMORY_MIGRATIONS[:-1])
+    ).apply(MEMORY_MIGRATIONS[:8])
     await MySQLMigrationRunner(
         engine,  # type: ignore[arg-type]
         table_name="life_memory_immutability_schema_migrations",
@@ -105,7 +133,7 @@ async def _prepare_v8_database(engine: object) -> None:
 
 
 @pytest.mark.timeout(300)
-async def test_real_mysql_memory_v8_to_v9_upgrade_is_additive_and_guarded(
+async def test_real_mysql_memory_v8_to_current_upgrade_is_additive_and_guarded(
     tmp_path: Path,
 ) -> None:
     config = _mysql_config()
@@ -138,7 +166,7 @@ async def test_real_mysql_memory_v8_to_v9_upgrade_is_additive_and_guarded(
             backend_identity=config.safe_identity,
         )
 
-        assert result["schema_versions"] == list(range(1, 10))
+        assert result["schema_versions"] == list(range(1, 11))
         assert result["immutability_versions"] == [1, 2]
         assert result["verified_memory_trigger_count"] == 44
         before = json.loads((args.output / "memory-before.json").read_text())
@@ -147,6 +175,25 @@ async def test_real_mysql_memory_v8_to_v9_upgrade_is_additive_and_guarded(
         assert before["authority"] == after["authority"]
         assert before["workspace_projection"]["present_tables"] == []
         assert after["workspace_projection"]["row_count"] == 0
+        async with engine.connect() as connection:
+            claim_column_count = await connection.scalar(
+                text(
+                    "SELECT COUNT(*) FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() "
+                    "AND table_name = 'memory_index_jobs' "
+                    "AND column_name = 'claim_token'"
+                )
+            )
+            revision_index_count = await connection.scalar(
+                text(
+                    "SELECT COUNT(*) FROM information_schema.statistics "
+                    "WHERE table_schema = DATABASE() "
+                    "AND table_name = 'memory_index_jobs' "
+                    "AND index_name = 'uq_memory_jobs_node_revision'"
+                )
+            )
+        assert int(claim_column_count or 0) == 1
+        assert int(revision_index_count or 0) == 2
 
         event_sha256 = suffix * 2
         insert = text(

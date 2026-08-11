@@ -20,9 +20,8 @@ from plugins.life_engine.memory.indexing import (
     upsert_document_rows,
 )
 from plugins.life_engine.memory.nodes import compute_content_hash, generate_file_node_id
-from scripts.reconcile_life_memory import MemoryDatabaseInUseError
+from scripts.reconcile_life_memory import MemoryDatabaseInUseError, reconcile
 from scripts.reconcile_life_memory import main as reconcile_main
-from scripts.reconcile_life_memory import reconcile
 
 
 class _FakeCollection:
@@ -137,14 +136,14 @@ async def test_health_reports_integrity_schema_counts_orphans_jobs_and_edges(
     )
     db.execute(
         "INSERT INTO memory_index_jobs"
-        "(job_id, node_id, content_hash, status, created_at, updated_at, attempts, error)"
-        "VALUES (?, ?, ?, 'processing', 1, 1, 1, '')",
+        "(job_id, node_id, content_hash, status, created_at, updated_at, attempts, error, "
+        "index_revision) VALUES (?, ?, ?, 'processing', 1, 1, 1, '', 1)",
         ("job-processing", indexed.node_id, "hash-processing"),
     )
     db.execute(
         "INSERT INTO memory_index_jobs"
-        "(job_id, node_id, content_hash, status, created_at, updated_at, attempts, error)"
-        "VALUES (?, ?, ?, 'failed', 1, 1, 1, 'failed')",
+        "(job_id, node_id, content_hash, status, created_at, updated_at, attempts, error, "
+        "index_revision) VALUES (?, ?, ?, 'failed', 1, 1, 1, 'failed', 2)",
         ("job-failed", indexed.node_id, "hash-failed"),
     )
     _insert_edge(db, "edge-assoc", indexed.node_id, missing.node_id, "associates")
@@ -193,7 +192,7 @@ async def test_health_reports_integrity_schema_counts_orphans_jobs_and_edges(
 
     assert snapshot["integrity_check"] == "ok"
     assert snapshot["foreign_key_check_count"] >= 2
-    assert snapshot["schema_version"] == 4
+    assert snapshot["schema_version"] == 6
     assert snapshot["tokenizer"] in {"trigram", "unicode61"}
     assert snapshot["counts"]["nodes"] == 2
     assert snapshot["counts"]["chunks"] == 3

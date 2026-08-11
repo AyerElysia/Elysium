@@ -285,7 +285,7 @@ async def test_service_run_index_worker_uses_chunk_collection_and_updates_nodes(
 
     report = await service.run_index_worker(embed_texts_func=embed)
 
-    assert report.completed == (indexed.job_id,)
+    assert report.completed == (f"{indexed.job_id}@index_revision=1",)
     assert resolver_calls == [("service/fake", 2)]
     assert len(chunk_collection.calls) == 1
     assert service._chunk_collection is chunk_collection
@@ -333,7 +333,7 @@ async def test_service_restart_restores_persisted_chunk_collection_and_close_is_
         collection=chunk_collection,
         embed_texts_func=embed,
     )
-    assert report.completed == (indexed.job_id,)
+    assert report.completed == (f"{indexed.job_id}@index_revision=1",)
     await service.close()
     await service.close()
     assert service._db is None
@@ -642,7 +642,7 @@ async def test_service_rejects_restored_collection_without_identity_metadata(
 
     report = await restored.run_index_worker(embed_texts_func=embed)
 
-    assert report.completed == (indexed.job_id,)
+    assert report.completed == (f"{indexed.job_id}@index_revision=1",)
     assert report.failed == ()
     assert named_calls == [collection_name]
     assert create_calls == [("service/fake", 2)]
@@ -687,11 +687,12 @@ async def test_service_worker_does_not_block_concurrent_document_update(
     release.set()
     report = await worker
 
-    assert old.job_id in report.stale
+    assert f"{old.job_id}@index_revision=1" in report.stale
     assert report.upserted_chunks == 0
     assert upserts == []
     assert service._db.execute(
-        "SELECT status FROM memory_index_jobs WHERE job_id = ?", (new.job_id,)
+        "SELECT status FROM memory_index_jobs WHERE job_id = ? AND index_revision = ?",
+        (new.job_id, 2),
     ).fetchone()[0] == "pending"
 
 

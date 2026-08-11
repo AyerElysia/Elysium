@@ -331,7 +331,7 @@ class LocalDocumentIndexProjection(_LocalPort):
 
     async def set_job_status(
         self,
-        job_id: str,
+        job: IndexJob | str,
         status: str,
         *,
         error: str = "",
@@ -340,7 +340,7 @@ class LocalDocumentIndexProjection(_LocalPort):
             return await run_db(
                 set_index_job_status,
                 self._db(),
-                job_id,
+                job,
                 status,
                 error=error,
             )

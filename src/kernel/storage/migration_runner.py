@@ -21,6 +21,10 @@ class MigrationLockError(RuntimeError):
     """Raised when the schema migration advisory lock cannot be acquired."""
 
 
+class MigrationPostconditionError(RuntimeError):
+    """Raised when recoverable DDL does not satisfy its declared structure."""
+
+
 @dataclass(frozen=True, slots=True)
 class MySQLTriggerContract:
     """Expected identity and bounded behavior marker for one MySQL trigger."""
@@ -46,11 +50,20 @@ class MySQLTriggerContract:
 
 @dataclass(frozen=True, slots=True)
 class SchemaMigration:
-    """One ordered group of idempotent MySQL DDL/DML statements."""
+    """One ordered group of idempotent or postcondition-recoverable statements.
+
+    ``completion_checks`` are read-only scalar SQL queries.  Every query must
+    return exactly ``1`` only when the complete migration structure is already
+    present.  This lets the runner adopt MySQL DDL that auto-committed before
+    the checksum row was recorded, without blindly replaying a non-idempotent
+    ``ALTER TABLE``.  A migration without checks retains the stricter legacy
+    contract: every statement must itself be replay-safe.
+    """
 
     version: int
     name: str
     statements: tuple[str, ...]
+    completion_checks: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if int(self.version) <= 0:
@@ -59,6 +72,8 @@ class SchemaMigration:
             raise ValueError("migration name must not be empty")
         if not self.statements or any(not item.strip() for item in self.statements):
             raise ValueError("migration must contain non-empty idempotent statements")
+        if any(not item.strip() for item in self.completion_checks):
+            raise ValueError("migration completion checks must not be empty")
 
     @property
     def checksum(self) -> str:
@@ -67,6 +82,10 @@ class SchemaMigration:
         payload = "\n-- statement --\n".join(
             (str(self.version), self.name, *self.statements)
         )
+        if self.completion_checks:
+            payload += "\n-- completion-check --\n" + (
+                "\n-- completion-check --\n".join(self.completion_checks)
+            )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -121,6 +140,41 @@ class MySQLMigrationRunner:
         if len(versions) != len(set(versions)):
             raise ValueError("migration versions must be unique")
         return ordered
+
+    @staticmethod
+    async def _completion_satisfied(
+        connection: Any,
+        migration: SchemaMigration,
+    ) -> bool:
+        """Return whether every declared structural postcondition is exact."""
+
+        if not migration.completion_checks:
+            return False
+        results: list[bool] = []
+        for statement in migration.completion_checks:
+            value = await connection.scalar(text(statement))
+            results.append(int(value or 0) == 1)
+        if all(results):
+            return True
+        if any(results):
+            raise MigrationPostconditionError(
+                f"migration {migration.version} is only partially applied"
+            )
+        return False
+
+    async def _record_migration(self, connection: Any, migration: SchemaMigration) -> None:
+        await connection.execute(
+            text(
+                f"INSERT INTO {self.table_name} "
+                "(version, name, checksum) "
+                "VALUES (:version, :name, :checksum)"
+            ),
+            {
+                "version": migration.version,
+                "name": migration.name,
+                "checksum": migration.checksum,
+            },
+        )
 
     async def current(self) -> dict[int, tuple[str, str]]:
         """Return applied version -> (name, checksum), creating metadata if needed."""
@@ -185,20 +239,21 @@ class MySQLMigrationRunner:
                             )
                         continue
                     try:
-                        for statement in migration.statements:
-                            await connection.execute(text(statement))
-                        await connection.execute(
-                            text(
-                                f"INSERT INTO {self.table_name} "
-                                "(version, name, checksum) "
-                                "VALUES (:version, :name, :checksum)"
-                            ),
-                            {
-                                "version": migration.version,
-                                "name": migration.name,
-                                "checksum": migration.checksum,
-                            },
+                        already_complete = await self._completion_satisfied(
+                            connection,
+                            migration,
                         )
+                        if not already_complete:
+                            for statement in migration.statements:
+                                await connection.execute(text(statement))
+                            if migration.completion_checks and not await self._completion_satisfied(
+                                connection,
+                                migration,
+                            ):
+                                raise MigrationPostconditionError(
+                                    f"migration {migration.version} postcondition failed"
+                                )
+                        await self._record_migration(connection, migration)
                         await connection.commit()
                     except BaseException:
                         await connection.rollback()
@@ -282,6 +337,7 @@ async def verify_mysql_trigger_contract(
 __all__ = [
     "MigrationDriftError",
     "MigrationLockError",
+    "MigrationPostconditionError",
     "MigrationResult",
     "MySQLMigrationRunner",
     "MySQLTriggerContract",

@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from plugins.life_engine.memory.indexing import IndexJob
 from plugins.life_engine.memory.service import LifeMemoryService
 from plugins.life_engine.memory.workspace_projection_identity import (
     WorkspaceProjectionDeleteEvidenceError,
@@ -97,6 +98,22 @@ class _ConcurrentDocumentIndex(_AvailablePort):
         return 0
 
 
+class _LeaseDocumentIndex(_AvailablePort):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple[IndexJob | str, str, str]] = []
+
+    async def set_job_status(
+        self,
+        job: IndexJob | str,
+        status: str,
+        *,
+        error: str = "",
+    ) -> bool:
+        self.calls.append((job, status, error))
+        return isinstance(job, IndexJob) and bool(job.claim_token)
+
+
 class _RecoveryLiving(_AvailablePort):
     async def list_artifact_heads(self) -> list[Any]:
         return []
@@ -142,6 +159,48 @@ def _bundle(
         legacy_graph=port,  # type: ignore[arg-type]
         workspace_projection=_ProjectionBindingStore(),
     )
+
+
+@pytest.mark.asyncio
+async def test_service_forwards_full_index_job_lease_and_legacy_id_fails_closed(
+    tmp_path: Path,
+) -> None:
+    document_index = _LeaseDocumentIndex()
+    passive = _AvailablePort()
+    storage = MemoryStorageBundle(
+        backend=BackendKind.MYSQL,
+        document_index=document_index,  # type: ignore[arg-type]
+        experiences=passive,  # type: ignore[arg-type]
+        witnesses=passive,  # type: ignore[arg-type]
+        living=passive,  # type: ignore[arg-type]
+        epistemic=passive,  # type: ignore[arg-type]
+        legacy_graph=passive,  # type: ignore[arg-type]
+    )
+    service = LifeMemoryService(
+        tmp_path,
+        vector_backend_enabled=False,
+        memory_storage=storage,
+    )
+    service._memory_storage = storage
+    service._initialized = True
+    claimed = IndexJob(
+        job_id="job-1",
+        node_id="node-1",
+        content_hash="a" * 64,
+        status="processing",
+        created_at=1.0,
+        updated_at=2.0,
+        attempts=1,
+        index_revision=7,
+        claim_token="lease-7",
+    )
+
+    assert await service.set_index_job_status(claimed, "completed")
+    assert not await service.set_index_job_status("job-1", "completed")
+    assert document_index.calls == [
+        (claimed, "completed", ""),
+        ("job-1", "completed", ""),
+    ]
 
 
 @pytest.fixture(autouse=True)

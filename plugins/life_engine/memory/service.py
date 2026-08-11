@@ -1665,13 +1665,13 @@ class LifeMemoryService:
 
     async def set_index_job_status(
         self,
-        job_id: str,
+        job: IndexJob | str,
         status: str,
         error: str = "",
     ) -> bool:
         """更新外部索引 worker 的任务状态。"""
         return await self._require_memory_storage().document_index.set_job_status(
-            job_id,
+            job,
             status,
             error=error,
         )

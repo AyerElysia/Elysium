@@ -163,8 +163,9 @@ _SPECS = (
             "attempts",
             "error",
             "index_revision",
+            "claim_token",
         ),
-        ("job_id",),
+        ("job_id", "index_revision"),
     ),
     _TableSpec(
         "memory_index_state",
@@ -187,6 +188,7 @@ _SPECS = (
             "collection_name",
             "created_at",
             "consumed_at",
+            "force_delete",
         ),
         ("tombstone_id",),
     ),
@@ -630,6 +632,7 @@ _BOOL_COLUMNS = {
     "is_deleted",
     "legacy_fts_present",
     "bidirectional",
+    "force_delete",
 }
 _INT_COLUMNS = {
     "version",
@@ -685,7 +688,6 @@ _FLOAT_FIELDS = {
 }
 
 _SOURCE_ORDER = {
-    "memory_vector_tombstones": ("chunk_id",),
     "memory_artifact_heads": ("logical_key",),
     "memory_interpretation_sources": (
         "interpretation_id",
@@ -930,7 +932,22 @@ def _transform_source_row(
             ),
             "legacy_fts_present": node_id in context.fts_content,
         }
-    if table in {"memory_chunks", "memory_index_jobs", "memory_index_state"}:
+    if table == "memory_index_jobs":
+        values = {
+            column: (raw[column] if column in raw.keys() else "")
+            for column in TABLE_SPECS[table].columns
+        }
+        values["claim_token"] = ""
+        if str(values["status"] or "") == "processing":
+            values["status"] = "pending"
+            previous_error = str(values["error"] or "")
+            values["error"] = (
+                f"{previous_error}|RecoveryLeaseReset"
+                if previous_error
+                else "RecoveryLeaseReset"
+            )
+        return values
+    if table in {"memory_chunks", "memory_index_state"}:
         return {column: raw[column] for column in TABLE_SPECS[table].columns}
     if table == "memory_vector_tombstones":
         chunk_id = str(raw["chunk_id"])
@@ -938,12 +955,29 @@ def _transform_source_row(
         if len(parts) != 3 or not parts[0]:
             raise MemoryCopyError(f"cannot derive tombstone node: {chunk_id}")
         return {
-            "tombstone_id": ordinal,
-            "node_id": parts[0],
+            "tombstone_id": int(
+                raw["tombstone_id"]
+                if "tombstone_id" in raw.keys()
+                else ordinal
+            ),
+            "node_id": str(
+                raw["node_id"] if "node_id" in raw.keys() else parts[0]
+            ),
             "chunk_id": chunk_id,
-            "collection_name": context.vector_collection_name,
+            "collection_name": str(
+                raw["collection_name"]
+                if "collection_name" in raw.keys()
+                else context.vector_collection_name
+            ),
             "created_at": float(raw["created_at"]),
-            "consumed_at": None,
+            "consumed_at": (
+                float(raw["consumed_at"])
+                if "consumed_at" in raw.keys() and raw["consumed_at"] is not None
+                else None
+            ),
+            "force_delete": bool(
+                raw["force_delete"] if "force_delete" in raw.keys() else False
+            ),
         }
     if table == "memory_experiences":
         metadata = _strict_json(raw.get("metadata_json"), expected=dict)
@@ -1488,7 +1522,20 @@ def iter_transformed_source_rows(
     *,
     batch_size: int,
 ) -> Iterable[list[dict[str, Any]]]:
-    order = ", ".join(_SOURCE_ORDER.get(spec.name, spec.key_columns))
+    order_columns = _SOURCE_ORDER.get(spec.name, spec.key_columns)
+    if spec.name == "memory_vector_tombstones":
+        source_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(memory_vector_tombstones)"
+            )
+        }
+        order_columns = (
+            ("tombstone_id",)
+            if "tombstone_id" in source_columns
+            else ("created_at", "chunk_id")
+        )
+    order = ", ".join(order_columns)
     cursor = connection.execute(f"SELECT * FROM {spec.name} ORDER BY {order}")
     ordinal = 0
     while True:
@@ -1537,6 +1584,16 @@ def normalize_target_row(spec: _TableSpec, row: Any) -> dict[str, Any]:
             normalized[column] = bytes(value).decode("utf-8")
         else:
             normalized[column] = str(value)
+    if spec.name == "memory_index_jobs":
+        normalized["claim_token"] = ""
+        if str(normalized["status"] or "") == "processing":
+            normalized["status"] = "pending"
+            previous_error = str(normalized["error"] or "")
+            marker = "RecoveryLeaseReset"
+            if marker not in previous_error.split("|"):
+                normalized["error"] = (
+                    f"{previous_error}|{marker}" if previous_error else marker
+                )
     return normalized
 
 

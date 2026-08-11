@@ -128,17 +128,11 @@ def test_memory_characterization_is_ordered_and_engineering_only() -> None:
 
 
 def test_mysql_memory_migrations_are_explicit_and_ordered() -> None:
-    assert MEMORY_SCHEMA_VERSION == 9
-    assert tuple(item.version for item in MEMORY_MIGRATIONS) == (
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        8,
-        9,
+    assert MEMORY_SCHEMA_VERSION == max(
+        migration.version for migration in MEMORY_MIGRATIONS
+    )
+    assert tuple(item.version for item in MEMORY_MIGRATIONS) == tuple(
+        range(1, MEMORY_SCHEMA_VERSION + 1)
     )
     ddl = "\n".join(
         statement
@@ -164,6 +158,7 @@ def test_mysql_memory_migrations_are_explicit_and_ordered() -> None:
         "embedding_model",
         "embedding_updated_at",
         "legacy_fts_present",
+        "claim_token",
     ):
         assert f"ADD COLUMN {column}" in ddl
     assert "projection_path_sha256 CHAR(64)" in ddl
@@ -175,6 +170,8 @@ def test_mysql_memory_migrations_are_explicit_and_ordered() -> None:
         migration.name for migration in MEMORY_MIGRATIONS
     }
     assert "MODIFY COLUMN metadata_json LONGTEXT NOT NULL" in ddl
+    assert "ADD PRIMARY KEY (job_id, index_revision)" in ddl
+    assert "UNIQUE KEY uq_memory_jobs_node_revision" in ddl
     assert "universal" not in ddl.lower()
 
 
