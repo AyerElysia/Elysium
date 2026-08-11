@@ -55,6 +55,7 @@ from ...memory.living import (
 from ...memory.nodes import MemoryNode
 from ...memory.search import DetailedSearchResult, LineageNodeView
 from ...memory.worker import IndexWorkerReport
+from ...memory.workspace_projection_identity import WorkspaceProjectionBindingStore
 from ..models import BackendKind, StorageAvailability
 
 
@@ -626,3 +627,4 @@ class MemoryStorageBundle:
     living: LivingMemoryStore
     epistemic: EpistemicMemoryStore
     legacy_graph: LegacyGraphStore
+    workspace_projection: WorkspaceProjectionBindingStore | None = None

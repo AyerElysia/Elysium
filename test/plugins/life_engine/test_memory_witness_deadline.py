@@ -15,6 +15,7 @@ from plugins.life_engine.service.consciousness import (
 )
 from plugins.life_engine.service.event_bus import LifeEvent
 from plugins.life_engine.service.memory_witness import MemoryWitnessCoordinator
+from plugins.life_engine.service.presence_store import PresenceRevisionConflict
 
 
 class _MemoryStub:
@@ -48,6 +49,8 @@ class _MemoryStub:
 class _EventStoreStub:
     def __init__(self) -> None:
         self.offset_commits: list[int] = []
+        self.consumer_offset = 0
+        self.read_cursors: list[int] = []
         self.event = LifeEvent(
             event_id="event-private",
             sequence=1,
@@ -61,12 +64,12 @@ class _EventStoreStub:
         )
 
     async def get_consumer_offset(self, _consumer_id: str) -> int:
-        return 0
+        return self.consumer_offset
 
     async def read_since(self, sequence: int, *, limit: int) -> list[LifeEvent]:
-        assert sequence == 0
+        self.read_cursors.append(sequence)
         assert limit == 80
-        return [self.event]
+        return [self.event] if sequence < self.event.sequence else []
 
     async def commit_consumer_offset(
         self,
@@ -77,6 +80,7 @@ class _EventStoreStub:
     ) -> None:
         assert metadata == {"witness_state_mirror": True}
         self.offset_commits.append(sequence)
+        self.consumer_offset = sequence
 
 
 class _Response:
@@ -142,6 +146,9 @@ def _service(
 
     config = SimpleNamespace(
         enabled=True,
+        run_on_startup=True,
+        interval_seconds=60,
+        retry_delay_seconds=10,
         max_events_per_run=80,
         model_task_name="witness",
         timeout_seconds=timeout_seconds,
@@ -158,6 +165,8 @@ def _service(
         prepare_perception=prepare_perception,
         commit_perception=commit_perception,
         read_subject_authority_texts=read_subject_authority_texts,
+        _state=SimpleNamespace(running=True),
+        _stop_event=None,
     )
     return service, memory, event_store, perception_commits
 
@@ -200,9 +209,7 @@ def _request_type(
 async def test_witness_uses_one_total_deadline_and_preserves_cursor_on_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service, memory, event_store, perception_commits = _service(
-        timeout_seconds=10.0
-    )
+    service, memory, event_store, perception_commits = _service(timeout_seconds=10.0)
     response_started = asyncio.Event()
     response_cleaned = asyncio.Event()
     timeout_deadlines: list[float] = []
@@ -264,9 +271,7 @@ async def test_witness_uses_one_total_deadline_and_preserves_cursor_on_timeout(
 async def test_witness_external_cancellation_propagates_without_commit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service, memory, event_store, perception_commits = _service(
-        timeout_seconds=600.0
-    )
+    service, memory, event_store, perception_commits = _service(timeout_seconds=600.0)
     response_started = asyncio.Event()
     response_cleaned = asyncio.Event()
     monkeypatch.setattr(
@@ -291,3 +296,156 @@ async def test_witness_external_cancellation_propagates_without_commit(
     assert perception_commits == []
     assert event_store.offset_commits == []
     assert not any("last_sequence" in item for item in memory.state_updates)
+
+
+@pytest.mark.asyncio
+async def test_witness_loop_recovers_presence_conflict_without_losing_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, memory, event_store, _perception_commits = _service(timeout_seconds=600.0)
+    coordinator = MemoryWitnessCoordinator(service)
+    author_attempts = 0
+    refresh_calls = 0
+    delays: list[float] = []
+    warning_records: list[tuple[str, dict[str, Any]]] = []
+
+    async def refresh() -> None:
+        nonlocal refresh_calls
+        refresh_calls += 1
+
+    async def author(*_args: object) -> str:
+        nonlocal author_attempts
+        author_attempts += 1
+        if author_attempts == 1:
+            raise PresenceRevisionConflict("stale witness presence")
+        service._state.running = False
+        return ""
+
+    async def no_wait(delay: float) -> None:
+        delays.append(delay)
+
+    def capture_warning(message: str, **metadata: Any) -> None:
+        warning_records.append((message, metadata))
+
+    service.consciousness_registry.refresh = refresh
+    monkeypatch.setattr(coordinator, "_author_witness", author)
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness.asyncio.sleep",
+        no_wait,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness.logger.warning",
+        capture_warning,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness.logger.info",
+        lambda *_args, **_kwargs: None,
+    )
+
+    await coordinator.loop()
+
+    assert author_attempts == 2
+    assert refresh_calls == 1
+    assert delays == [10]
+    assert event_store.read_cursors == [0, 0]
+    assert event_store.offset_commits == [1]
+    sequence_updates = [
+        item["last_sequence"]
+        for item in memory.state_updates
+        if "last_sequence" in item
+    ]
+    assert sequence_updates == [1]
+    assert len(warning_records) == 1
+    assert warning_records[0][1]["exc_info"].__class__ is PresenceRevisionConflict
+
+
+@pytest.mark.asyncio
+async def test_witness_loop_logs_unclassified_failure_with_exc_info_and_continues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _memory, _event_store, _perception_commits = _service(
+        timeout_seconds=600.0
+    )
+    coordinator = MemoryWitnessCoordinator(service)
+    failure = RuntimeError("injected witness failure")
+    run_count = 0
+    delays: list[float] = []
+    error_records: list[tuple[str, dict[str, Any]]] = []
+
+    async def run_once() -> None:
+        nonlocal run_count
+        run_count += 1
+        if run_count == 1:
+            raise failure
+        service._state.running = False
+
+    async def no_wait(delay: float) -> None:
+        delays.append(delay)
+
+    def capture_error(message: str, **metadata: Any) -> None:
+        error_records.append((message, metadata))
+
+    monkeypatch.setattr(coordinator, "run_once", run_once)
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness.asyncio.sleep",
+        no_wait,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness.logger.error",
+        capture_error,
+    )
+
+    await coordinator.loop()
+
+    assert run_count == 2
+    assert delays == [60]
+    assert len(error_records) == 1
+    assert error_records[0][1]["exc_info"] is failure
+
+
+@pytest.mark.asyncio
+async def test_witness_loop_survives_diagnostic_and_logger_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _memory, _event_store, _perception_commits = _service(
+        timeout_seconds=600.0
+    )
+    coordinator = MemoryWitnessCoordinator(service)
+    run_count = 0
+    delays: list[float] = []
+    log_attempts = 0
+
+    async def run_once() -> None:
+        nonlocal run_count
+        run_count += 1
+        if run_count == 1:
+            raise RuntimeError("primary failure")
+        service._state.running = False
+
+    async def broken_record_error(_exc: Exception) -> None:
+        raise RuntimeError("diagnostic state failure")
+
+    async def no_wait(delay: float) -> None:
+        delays.append(delay)
+
+    def broken_logger(*_args: object, **_kwargs: object) -> None:
+        nonlocal log_attempts
+        log_attempts += 1
+        raise RuntimeError("logger sink failure")
+
+    monkeypatch.setattr(coordinator, "run_once", run_once)
+    monkeypatch.setattr(coordinator, "_record_error", broken_record_error)
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness.asyncio.sleep",
+        no_wait,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness.logger.error",
+        broken_logger,
+    )
+
+    await coordinator.loop()
+
+    assert run_count == 2
+    assert delays == [60]
+    assert log_attempts == 2

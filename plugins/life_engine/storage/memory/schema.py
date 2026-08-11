@@ -19,14 +19,14 @@ from src.kernel.storage.migration_runner import MySQLMigrationRunner, SchemaMigr
 from ..contracts import StorageBackendRuntime, StorageWriterRole
 from ..models import BackendKind
 
-MEMORY_SCHEMA_VERSION = 8
-MEMORY_IMMUTABILITY_SCHEMA_VERSION = 1
+MEMORY_SCHEMA_VERSION = 9
+MEMORY_IMMUTABILITY_SCHEMA_VERSION = 2
 
 # Database immutability follows the Memory Port contract, not a blanket
 # "nothing may change" rule.  These tables contain authoritative occurrences
 # whose identity and payload are append-only.  Rebuildable projections,
 # monotonic cursors and CAS heads are classified separately below.
-MEMORY_IMMUTABLE_TABLES = (
+_MEMORY_IMMUTABLE_TABLES_V1 = (
     "memory_experiences",
     "memory_experience_occurrence_aliases",
     "memory_witness_sources",
@@ -47,6 +47,10 @@ MEMORY_IMMUTABLE_TABLES = (
     "memory_retrieval_episodes",
     "memory_retrieval_exposures",
     "memory_retrieval_feedback",
+)
+MEMORY_IMMUTABLE_TABLES = (
+    *_MEMORY_IMMUTABLE_TABLES_V1,
+    "memory_workspace_projection_events",
 )
 
 # A witness row mixes immutable first-person testimony with mutable delivery
@@ -90,6 +94,7 @@ MEMORY_MUTABLE_TABLES = (
     "memory_association_projection",
     "memory_edges",
     "memory_corrections",
+    "memory_workspace_projection_heads",
 )
 
 
@@ -677,6 +682,50 @@ _LOSSLESS_JSON_TEXT = SchemaMigration(
     ),
 )
 
+_WORKSPACE_PROJECTION_IDENTITY = SchemaMigration(
+    version=9,
+    name="life_memory_workspace_projection_identity_v1",
+    statements=(
+        """CREATE TABLE IF NOT EXISTS memory_workspace_projection_events (
+            event_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+            event_kind VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            storage_generation_id VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            projection_generation_id VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            previous_projection_generation_id VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            owner_id VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            previous_owner_id VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            workspace_root_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            previous_workspace_root_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            source_root_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            eligible_inventory_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            revision BIGINT UNSIGNED NOT NULL,
+            expected_revision BIGINT UNSIGNED NOT NULL,
+            actor_id VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            audit_occurrence_id VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            reason_code VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            occurred_at VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            previous_event_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            payload_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            UNIQUE KEY uq_memory_workspace_projection_revision
+                (storage_generation_id, revision),
+            KEY idx_memory_workspace_projection_occurrence
+                (audit_occurrence_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci""",
+        """CREATE TABLE IF NOT EXISTS memory_workspace_projection_heads (
+            storage_generation_id VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+            projection_generation_id VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            owner_id VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            workspace_root_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            source_root_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            eligible_inventory_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            revision BIGINT UNSIGNED NOT NULL,
+            last_event_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            updated_at VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            KEY idx_memory_workspace_projection_owner (owner_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci""",
+    ),
+)
+
 MEMORY_MIGRATIONS = (
     _DOCUMENT_INDEX,
     _EXPERIENCE,
@@ -686,6 +735,7 @@ MEMORY_MIGRATIONS = (
     _LEGACY_GRAPH,
     _NODE_HISTORY,
     _LOSSLESS_JSON_TEXT,
+    _WORKSPACE_PROJECTION_IDENTITY,
 )
 
 
@@ -758,9 +808,11 @@ def _memory_immutability_trigger_contract() -> tuple[tuple[str, str, str], ...]:
 MEMORY_IMMUTABILITY_TRIGGER_CONTRACT = _memory_immutability_trigger_contract()
 
 
-def _memory_immutability_statements() -> tuple[str, ...]:
+def _memory_immutability_statements_v1() -> tuple[str, ...]:
+    """Return the checksum-frozen v1 trigger statements."""
+
     statements: list[str] = []
-    for table in MEMORY_IMMUTABLE_TABLES:
+    for table in _MEMORY_IMMUTABLE_TABLES_V1:
         immutable_predicate = "\n                    AND ".join(
             f"OLD.`{column}` <=> NEW.`{column}`"
             for column in MEMORY_IMMUTABLE_TABLE_COLUMNS[table]
@@ -808,13 +860,53 @@ def _memory_immutability_statements() -> tuple[str, ...]:
     return tuple(statements)
 
 
-_MEMORY_IMMUTABILITY = SchemaMigration(
-    version=MEMORY_IMMUTABILITY_SCHEMA_VERSION,
+def _memory_immutability_extension_statements(
+    tables: tuple[str, ...],
+) -> tuple[str, ...]:
+    statements: list[str] = []
+    for table in tables:
+        immutable_predicate = "\n                    AND ".join(
+            f"OLD.`{column}` <=> NEW.`{column}`"
+            for column in MEMORY_IMMUTABLE_TABLE_COLUMNS[table]
+        )
+        statements.extend(
+            (
+                f"""CREATE TRIGGER IF NOT EXISTS {table}_immutable_update
+                BEFORE UPDATE ON {table} FOR EACH ROW
+                BEGIN
+                    IF NOT (
+                        {immutable_predicate}
+                    ) THEN
+                        SIGNAL SQLSTATE '45000'
+                            SET MESSAGE_TEXT = 'MemoryAuthorityRecordImmutable';
+                    END IF;
+                END""",
+                f"""CREATE TRIGGER IF NOT EXISTS {table}_immutable_delete
+                BEFORE DELETE ON {table} FOR EACH ROW
+                SIGNAL SQLSTATE '45000'
+                    SET MESSAGE_TEXT = 'MemoryAuthorityRecordImmutable'""",
+            )
+        )
+    return tuple(statements)
+
+
+_MEMORY_IMMUTABILITY_V1 = SchemaMigration(
+    version=1,
     name="life_memory_authority_immutability_v1",
-    statements=_memory_immutability_statements(),
+    statements=_memory_immutability_statements_v1(),
+)
+_MEMORY_IMMUTABILITY_V2 = SchemaMigration(
+    version=2,
+    name="life_memory_workspace_projection_immutability_v1",
+    statements=_memory_immutability_extension_statements(
+        ("memory_workspace_projection_events",)
+    ),
 )
 
-MEMORY_IMMUTABILITY_MIGRATIONS = (_MEMORY_IMMUTABILITY,)
+MEMORY_IMMUTABILITY_MIGRATIONS = (
+    _MEMORY_IMMUTABILITY_V1,
+    _MEMORY_IMMUTABILITY_V2,
+)
 
 
 def memory_database_immutability_required(
@@ -842,19 +934,18 @@ async def _verify_memory_database_immutability(
     assert runtime.engine is not None
     try:
         async with runtime.engine.connect() as connection:
-            migration = (
+            migrations = (
                 (
                     await connection.execute(
                         text(
-                            "SELECT name, checksum FROM "
+                            "SELECT version, name, checksum FROM "
                             "life_memory_immutability_schema_migrations "
-                            "WHERE version = :version"
-                        ),
-                        {"version": MEMORY_IMMUTABILITY_SCHEMA_VERSION},
+                            "ORDER BY version"
+                        )
                     )
                 )
                 .mappings()
-                .one_or_none()
+                .all()
             )
             trigger_rows = (
                 (
@@ -878,10 +969,17 @@ async def _verify_memory_database_immutability(
             "Memory database immutability metadata is unavailable"
         ) from exc
 
-    expected_migration = MEMORY_IMMUTABILITY_MIGRATIONS[0]
-    if migration is None or (str(migration["name"]), str(migration["checksum"])) != (
-        expected_migration.name,
-        expected_migration.checksum,
+    observed_migrations = {
+        int(row["version"]): (str(row["name"]), str(row["checksum"]))
+        for row in migrations
+    }
+    expected_migrations = {
+        migration.version: (migration.name, migration.checksum)
+        for migration in MEMORY_IMMUTABILITY_MIGRATIONS
+    }
+    if any(
+        observed_migrations.get(version) != expected
+        for version, expected in expected_migrations.items()
     ):
         raise MemoryDatabaseImmutabilityError(
             "Memory database immutability migration is missing or drifted"

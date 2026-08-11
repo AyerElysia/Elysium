@@ -10,6 +10,11 @@ from typing import Any
 import pytest
 
 from plugins.life_engine.memory.service import LifeMemoryService
+from plugins.life_engine.memory.workspace_projection_identity import (
+    WorkspaceProjectionDeleteEvidenceError,
+    WorkspaceProjectionEventKind,
+    WorkspaceProjectionRebuildRequired,
+)
 from plugins.life_engine.storage.memory import MemoryStorageBundle
 from plugins.life_engine.storage.memory.mysql import MySQLMemoryReadinessProbeError
 from plugins.life_engine.storage.models import BackendKind, StorageAvailability
@@ -53,6 +58,8 @@ class _InjectedRuntime:
         self.health_status = health_status
         self.health_error = health_error
         self.health_delay = health_delay
+        self.generation = SimpleNamespace(generation_id="test-memory-generation")
+        self.authority_token = SimpleNamespace(owner_id="test-memory-owner")
 
     async def close(self) -> None:
         self.close_calls += 1
@@ -102,6 +109,23 @@ class _RecoveryLegacyGraph(_AvailablePort):
         return 0
 
 
+class _ProjectionBindingStore:
+    def __init__(self) -> None:
+        self.binding: Any = None
+        self.events: list[Any] = []
+
+    async def load_binding(self, _storage_generation_id: str) -> Any:
+        return self.binding
+
+    async def commit_transition(self, transition: Any) -> Any:
+        self.binding = transition.binding
+        self.events.append(transition.event)
+        return self.binding
+
+    async def list_events(self, *_args: Any, **_kwargs: Any) -> list[Any]:
+        return list(self.events)
+
+
 def _bundle(
     *,
     availability: StorageAvailability = StorageAvailability.HEALTHY,
@@ -115,6 +139,7 @@ def _bundle(
         living=port,  # type: ignore[arg-type]
         epistemic=port,  # type: ignore[arg-type]
         legacy_graph=port,  # type: ignore[arg-type]
+        workspace_projection=_ProjectionBindingStore(),
     )
 
 
@@ -184,6 +209,96 @@ async def test_mysql_service_never_opens_sqlite_and_never_closes_shared_runtime(
     await service.close()
     await service.close()
     assert runtime.close_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_mysql_projection_binding_rejects_a_different_workspace_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _InjectedRuntime()
+    stores = _bundle()
+
+    async def _open_mysql(*_args: Any, **_kwargs: Any) -> MemoryStorageBundle:
+        return stores
+
+    async def _skip_recovery() -> None:
+        return None
+
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.open_mysql_memory_storage",
+        _open_mysql,
+    )
+    first_root = tmp_path / "workspace-a"
+    second_root = tmp_path / "workspace-b"
+    first_root.mkdir()
+    second_root.mkdir()
+    first = LifeMemoryService(
+        first_root,
+        vector_backend_enabled=False,
+        storage_runtime=runtime,  # type: ignore[arg-type]
+        selectable_storage_enabled=True,
+    )
+    monkeypatch.setattr(first, "_startup_recovery", _skip_recovery)
+    await first.initialize()
+    await first.close()
+
+    second = LifeMemoryService(
+        second_root,
+        vector_backend_enabled=False,
+        storage_runtime=runtime,  # type: ignore[arg-type]
+        selectable_storage_enabled=True,
+    )
+    monkeypatch.setattr(second, "_startup_recovery", _skip_recovery)
+
+    with pytest.raises(WorkspaceProjectionRebuildRequired):
+        await second.initialize()
+
+    binding_store = stores.workspace_projection
+    assert isinstance(binding_store, _ProjectionBindingStore)
+    assert len(binding_store.events) == 1
+    assert second.available is False
+
+
+@pytest.mark.asyncio
+async def test_selected_workspace_destructive_projection_mutations_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _InjectedRuntime()
+    stores = _bundle()
+
+    async def _open_mysql(*_args: Any, **_kwargs: Any) -> MemoryStorageBundle:
+        return stores
+
+    async def _skip_recovery() -> None:
+        return None
+
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.open_mysql_memory_storage",
+        _open_mysql,
+    )
+    service = LifeMemoryService(
+        tmp_path,
+        vector_backend_enabled=False,
+        storage_runtime=runtime,  # type: ignore[arg-type]
+        selectable_storage_enabled=True,
+    )
+    monkeypatch.setattr(service, "_startup_recovery", _skip_recovery)
+    await service.initialize()
+
+    with pytest.raises(
+        WorkspaceProjectionDeleteEvidenceError,
+        match="occurrence-bound audited deletion port",
+    ):
+        await service.delete_document("notes/old.md")
+    with pytest.raises(
+        WorkspaceProjectionDeleteEvidenceError,
+        match="occurrence-bound audited port",
+    ):
+        await service.move_document("notes/old.md", "notes/new.md")
+
+    await service.close()
 
 
 @pytest.mark.asyncio
@@ -265,6 +380,57 @@ async def test_mysql_workspace_recovery_uses_bounded_write_concurrency(
     assert 1 < document_index.max_active_writes <= 8
     assert service._startup_recovery_progress.processed_documents == 24
     assert service._startup_recovery_progress.artifact_processed == 24
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_mysql_successful_recovery_appends_inventory_commit_after_bind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = tmp_path / "notes" / "continuity.md"
+    document.parent.mkdir(parents=True)
+    document.write_text("one stable memory", encoding="utf-8")
+    runtime = _InjectedRuntime()
+    binding_store = _ProjectionBindingStore()
+    passive = _AvailablePort()
+    stores = MemoryStorageBundle(
+        backend=BackendKind.MYSQL,
+        document_index=_ConcurrentDocumentIndex(),  # type: ignore[arg-type]
+        experiences=passive,  # type: ignore[arg-type]
+        witnesses=passive,  # type: ignore[arg-type]
+        living=_RecoveryLiving(),  # type: ignore[arg-type]
+        epistemic=passive,  # type: ignore[arg-type]
+        legacy_graph=_RecoveryLegacyGraph(),  # type: ignore[arg-type]
+        workspace_projection=binding_store,
+    )
+
+    async def _open_mysql(*_args: Any, **_kwargs: Any) -> MemoryStorageBundle:
+        return stores
+
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.open_mysql_memory_storage",
+        _open_mysql,
+    )
+    service = LifeMemoryService(
+        tmp_path,
+        vector_backend_enabled=False,
+        storage_runtime=runtime,  # type: ignore[arg-type]
+        selectable_storage_enabled=True,
+    )
+
+    await service.initialize()
+    task = service._startup_recovery_task
+    if task is not None:
+        await asyncio.wait_for(task, timeout=2.0)
+
+    assert [event.event_kind for event in binding_store.events] == [
+        WorkspaceProjectionEventKind.OWNER_BOUND,
+        WorkspaceProjectionEventKind.INVENTORY_COMMITTED,
+    ]
+    assert binding_store.events[-1].eligible_inventory_sha256 == (
+        binding_store.events[0].eligible_inventory_sha256
+    )
     await service.close()
 
 

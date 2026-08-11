@@ -124,7 +124,7 @@ Memory 的本地合同测试不需要外部服务；真实 MySQL 合同测试必
 - `ELYSIUM_TEST_MYSQL_SSL_MODE`
 - `ELYSIUM_TEST_MYSQL_MEMORY_ISOLATED=1`
 
-未提供必要变量时，真实 MySQL 用例必须明确显示为 skipped；不得借用正式数据库，也不得把 skipped 记作真实远程验收通过。`ELYSIUM_TEST_MYSQL_MEMORY_ISOLATED=1` 是允许安装破坏性 trigger 合同并保留随机测试历史的明确声明，绝不能指向正式库。测试会创建 Memory v1-v8 schema、安装独立 checksum 的不可变 trigger、注册隔离 generation 并取得短租约 authority；权威测试行不会用清理 `DELETE` 绕过不可变合同。
+未提供必要变量时，真实 MySQL 用例必须明确显示为 skipped；不得借用正式数据库，也不得把 skipped 记作真实远程验收通过。`ELYSIUM_TEST_MYSQL_MEMORY_ISOLATED=1` 是允许安装破坏性 trigger 合同并保留随机测试历史的明确声明，绝不能指向正式库。测试会创建 Memory v1-v9 schema、安装两个独立 checksum 版本的不可变 trigger、注册隔离 generation 并取得短租约 authority；权威测试行不会用清理 `DELETE` 绕过不可变合同。
 
 ### 6.2 Presence/World 隔离合同验证
 
@@ -279,8 +279,9 @@ closed；读取或修改应使用专用 file/领域工具。disabled/local 模�
 
 ### 6.9 Life Memory 无损候选复制
 
-Life Memory 使用显式的 32 表选择合同，不复制 SQLite FTS 内部影子表，也不把
-Chroma 当作权威。候选复制命令为：
+Life Memory 的 v1-v8 领域合同包含 32 张显式表；v9 另增 2 张 content-free workspace
+projection ownership 表。它不复制 SQLite FTS 内部影子表，也不把 Chroma 当作权威。
+候选复制命令为：
 
 ```bash
 uv run python scripts/migrate_life_memory.py \
@@ -295,18 +296,27 @@ uv run python scripts/migrate_life_memory.py \
 原生 JSON 改写高精度小数。见证投影路径使用 SHA-256 作为可索引派生列，但查询
 命中后必须核对完整路径，hash 永远不替代路径身份。
 
+v9 的 `memory_workspace_projection_heads` 以 revision CAS 绑定 storage generation、projection
+generation、稳定 writer owner 与规范工作区根 hash；`memory_workspace_projection_events`
+保留不可变 hash chain。表内只保存 digest、数量、字节数和技术标识，不保存绝对路径或正文。
+不可变保护 migration v2 只追加这张 event 表的 UPDATE/DELETE trigger，既有 v1 checksum
+必须保持原样；任何 checksum/trigger 漂移都阻断 active writer。
+
 Memory 权威历史 trigger 位于独立的 `life_memory_immutability_schema_migrations` namespace。Experience、Witness 来源、artifact/interpretation/recall/corecall 与 epistemic/retrieval 账本禁止原地更新和删除；`memory_witnesses` 采用列级保护，只放行投影路径、投影状态与错误信息。`memory_artifact_heads`、Witness cursor、索引任务、关联投影和 legacy graph 不属于 append-only 表，必须保留其 CAS、重建与衰减更新能力。active 或冻结 generation 无法创建这些 trigger 时初始化失败；只有非冻结 candidate-copy shadow 可显式记录降级并跳过。
 
 生产 MySQL 的 Memory 启动恢复还必须遵守以下工程合同：
 
 - Memory 只能挂载 `LifeEngineService` 已打开并持有的 selected-storage runtime，不得从插件旧配置重新推导或另开权威后端；
 - 工作区文档读取必须使用平台兼容的安全路径检查。Windows 不支持 POSIX 目录文件描述符打开方式，仍须逐级拒绝符号链接、边界逃逸和非普通文件，并核对读取前后文件身份；
-- 可重建的 ghost 文件节点清理必须采用有界批次和集合式 SQL，每批独立提交并记录累计进度；禁止把大规模投影修复放入单个长事务，避免长期持有 `memory_nodes` 行锁；
+- 启动扫描缺席不得清理 ghost、标记 `is_deleted`、追加 artifact tombstone 或删除向量；缺席只能形成 content-free 诊断。真正删除必须消费显式 occurrence-bound deletion permit，并同时匹配 actor、路径、预期正文 SHA-256、预期 index revision 与当前 workspace write fence；
+- projection upsert 必须核对活动状态、正文/FTS/embedding provenance。误墓碑或 provenance 漂移要以有界事务恢复并重新入队；vector tombstone 只有在目标 chunk 当前不再 live 时才可调用外部删除，外部删除返回后还必须二次锁定并检查该 ID，网络 I/O 期间复活的节点要清除 synced 声明并原子重入 outbox；
 - `memory_artifact_heads` 的 revision CAS 仍须严格执行。启动观察发生 head 冲突时，只允许刷新精确最新 head：若另一合法 writer 已提交等价正文或 tombstone，则幂等吸收；否则以最新版本为 parent 有界重试一次。禁止覆盖竞争版本、猜测 head 或无限重试；
 - shared writer 启动时加入当前 verified generation，并在恢复及每笔提交中复核 generation/epoch。另一合法 writer 正在运行不是拒绝启动的条件；generation 被切换或封存后，旧进程的下一次写入必须被 fence；
 - shared writer 的异常退出不要求等待独占租约过期，正常退出也不得撤销全局 generation。只有显式 generation 切换/封存才改变 epoch；该操作前仍须确认旧 generation 的写入已被事务 fence 隔离。
 
-验收至少包含：实际配置打开 selected runtime 并通过 writer 校验、真实 Memory 初始化成功、ghost 缺口收敛、目标行锁可立即获取并回滚、artifact CAS 并发回归通过，以及初始化进程退出后无残留连接或后台 Python 进程。
+当前 selected MySQL 的高层文档删除与移动入口保持 fail closed，直到 occurrence-bound deletion/move 审计 Port 能原子核对 actor、来源 occurrence、正文 SHA-256、index revision 与 workspace write fence；不得直接调用底层 projection adapter 绕过这道门。
+
+验收至少包含：实际配置打开 selected runtime 并通过 writer 校验、真实 Memory 初始化成功、workspace owner/root 绑定成立、每次成功恢复都有独立 `inventory_committed` 事件、不同工作区在首笔索引写入前 fail closed、scan-absent 不产生墓碑、误墓碑/FTS/embedding 漂移可收敛、外部 tombstone 删除期间复活的 chunk 被可靠重入 outbox、live chunk 不被历史 tombstone 删除、目标行锁可立即获取并回滚、artifact CAS 与 Witness Presence/cursor 冲突恢复通过，以及初始化进程退出后无残留连接或后台 Python 进程。
 
 只读独立复核使用：
 
