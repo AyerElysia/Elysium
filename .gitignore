@@ -112,6 +112,7 @@ data/life_engine_workspace/*
 .claude/
 .workbuddy/
 .vscode/
+.codex/
 /config/*
 !/config/*.example
 
