@@ -153,15 +153,7 @@ class MemoryWitnessCoordinator:
         existing = registry.get(MEMORY_WITNESS_INSTANCE_ID)
         now = _now_iso()
         if existing is not None and existing.status != "terminated":
-            if existing.status == "suspended":
-                await self._service.resume_consciousness_instance(
-                    MEMORY_WITNESS_INSTANCE_ID,
-                    timestamp=now,
-                )
-            await self._service.touch_consciousness_instance(
-                MEMORY_WITNESS_INSTANCE_ID,
-                timestamp=now,
-            )
+            await self._ensure_presence_liveness(existing, timestamp=now)
             return existing
         instance = ConsciousnessInstance(
             instance_id=MEMORY_WITNESS_INSTANCE_ID,
@@ -177,8 +169,70 @@ class MemoryWitnessCoordinator:
                 "reads": "immutable_experience_ledger",
             },
         )
-        await self._service.register_consciousness_instance(instance)
+        try:
+            await self._service.register_consciousness_instance(instance)
+        except PresenceRevisionConflict:
+            # A concurrent node registered the same witness between our local
+            # snapshot and the durable commit.  Refresh and treat it as the
+            # existing live instance instead of failing plugin startup.
+            await self._refresh_presence_snapshot_safely()
+            live = self._service.consciousness_registry.get(
+                MEMORY_WITNESS_INSTANCE_ID
+            )
+            if live is not None and live.status != "terminated":
+                await self._ensure_presence_liveness(live, timestamp=now)
+                return live
+            logger.warning(
+                "memory witness presence could not be registered under "
+                "concurrent ownership; continuing with a local read-only "
+                "instance handle"
+            )
         return instance
+
+    async def _ensure_presence_liveness(
+        self,
+        instance: ConsciousnessInstance,
+        *,
+        timestamp: str,
+    ) -> None:
+        """Boundedly renew the witness presence, degrading on contention.
+
+        In a multi-writer deployment the resident Linux node keeps touching the
+        shared ``memory_witness`` presence row, so an occasional Windows guest
+        frequently races a ``PresenceRevisionConflict`` on its startup touch.
+        That is transient ownership competition, not a storage failure: refresh
+        the snapshot and retry a bounded number of times, then degrade to a
+        local read-only handle instead of failing plugin startup.
+        """
+
+        for attempt in range(3):
+            try:
+                if instance.status == "suspended":
+                    await self._service.resume_consciousness_instance(
+                        MEMORY_WITNESS_INSTANCE_ID,
+                        timestamp=timestamp,
+                    )
+                await self._service.touch_consciousness_instance(
+                    MEMORY_WITNESS_INSTANCE_ID,
+                    timestamp=timestamp,
+                )
+                return
+            except PresenceRevisionConflict:
+                if attempt >= 2:
+                    logger.warning(
+                        "memory witness presence remains contended after retries; "
+                        "continuing with a local read-only instance handle: "
+                        f"attempts={attempt + 1}"
+                    )
+                    return
+                await self._refresh_presence_snapshot_safely()
+                refreshed = self._service.consciousness_registry.get(
+                    MEMORY_WITNESS_INSTANCE_ID
+                )
+                if refreshed is None or refreshed.status == "terminated":
+                    # The concurrent owner retired the instance; re-register.
+                    return
+                instance = refreshed
 
     async def loop(self) -> None:
         cfg = self.config

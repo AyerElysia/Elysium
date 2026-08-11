@@ -133,7 +133,9 @@ from .worker import (
 )
 from .workspace_projection_identity import (
     WorkspaceProjectionBinding,
+    WorkspaceProjectionBindingConflict,
     WorkspaceProjectionDeleteEvidenceError,
+    WorkspaceProjectionRebuildRequired,
     WorkspaceProjectionRevisionConflict,
     WorkspaceProjectionWritePermit,
     authorize_workspace_projection_write,
@@ -479,13 +481,49 @@ class LifeMemoryService:
                     if binding is None:
                         raise
 
-            permit = authorize_workspace_projection_write(
-                binding,
-                identity,
-                storage_generation_id=storage_generation_id,
-                projection_generation_id=binding.projection_generation_id,
-                owner_id=owner_id,
-            )
+            try:
+                permit = authorize_workspace_projection_write(
+                    binding,
+                    identity,
+                    storage_generation_id=storage_generation_id,
+                    projection_generation_id=binding.projection_generation_id,
+                    owner_id=owner_id,
+                )
+            except WorkspaceProjectionRebuildRequired as exc:
+                # A different source root needs a new projection generation.
+                # A second node must never rewrite the bound source root; the
+                # resident owner owns that migration. Degrade to a read-only
+                # projection handle instead of failing plugin startup.
+                if not self._selectable_storage_enabled:
+                    raise
+                logger.warning(
+                    "workspace root differs from the bound projection source; "
+                    "degrading to read-only projection for this node: "
+                    f"reason={type(exc).__name__}: {exc}"
+                )
+                self._workspace_projection_binding = None
+                self._workspace_projection_permit = None
+                return None
+            except WorkspaceProjectionBindingConflict as exc:
+                # A second node (multi-writer deployment, occasional Windows
+                # guest against a resident Linux primary) is not allowed to
+                # take over the projection owner.  Degrade to a read-only
+                # projection handle instead of failing plugin startup: memory
+                # read/write through the unclaimed handle still works, only the
+                # projection inventory commit is skipped.  Fail-closed only on
+                # real storage errors, never on a healthy foreign ownership.
+                if not self._selectable_storage_enabled:
+                    raise
+                logger.warning(
+                    "workspace projection is owned by another instance; "
+                    "degrading to read-only projection for this node: "
+                    f"owner_id={getattr(binding, 'owner_id', None)!r} "
+                    f"configured_owner={owner_id!r} "
+                    f"reason={type(exc).__name__}: {exc}"
+                )
+                self._workspace_projection_binding = None
+                self._workspace_projection_permit = None
+                return None
             self._workspace_projection_binding = binding
             self._workspace_projection_permit = permit
             return identity, binding, permit

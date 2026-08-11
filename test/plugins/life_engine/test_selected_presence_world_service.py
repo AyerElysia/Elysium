@@ -1347,6 +1347,186 @@ async def test_selected_storage_learning_claim_degrades_when_other_owner_holds_i
     assert runtime.close_calls == 0
 
 
+def _mysql_lock_wait_timeout() -> OperationalError:
+    """Build a MySQL 1205 row-lock wait timeout wrapped by SQLAlchemy."""
+    return OperationalError(
+        "SELECT ... FOR UPDATE",
+        {},
+        Exception(
+            1205,
+            "Lock wait timeout exceeded; try restarting transaction",
+        ),
+    )
+
+
+async def test_selected_storage_1205_retries_then_succeeds_within_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MySQL 1205 is transient row-lock contention, not ownership evidence.
+
+    A second node racing the same singleton claim row must wait out the
+    transient lock timeout and take over as soon as the owning session
+    releases the row -- exactly like SingletonWriterClaimConflict.
+    """
+
+    stores = build_fake_stores()
+    ledger = _FakeLifeEventStore()
+    runtimes, _ = _install_selected_factories(
+        monkeypatch,
+        BackendKind.MYSQL,
+        stores,
+        ledger,
+    )
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+    await service._open_selected_storage_runtime()
+    runtime = runtimes[0]
+    original_acquire = runtime.acquire_singleton_writer
+    runtime_context_attempts = 0
+
+    async def _acquire_1205_then_succeed(**kwargs: Any) -> Any:
+        nonlocal runtime_context_attempts
+        if kwargs["namespace"] == "life_engine.runtime_context":
+            runtime_context_attempts += 1
+            if runtime_context_attempts < 3:
+                raise _mysql_lock_wait_timeout()
+        return await original_acquire(**kwargs)
+
+    async def _fast_sleep(_delay: float) -> None:
+        return None
+
+    runtime.acquire_singleton_writer = _acquire_1205_then_succeed
+    monkeypatch.setattr(core_module.asyncio, "sleep", _fast_sleep)
+
+    await service._start_selected_storage()
+
+    assert runtime_context_attempts == 3
+    assert [call["namespace"] for call in runtime.claim_calls] == [
+        "life_engine.runtime_context",
+        "life_engine.learning",
+    ]
+    await service._close_selected_storage()
+
+
+async def test_selected_storage_learning_claim_1205_degrades_not_fails_startup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persistent MySQL 1205 on the learning claim must not fail startup.
+
+    The owning Linux instance holds the claim and keeps renewing it with short
+    ``FOR UPDATE`` transactions.  An occasional Windows guest can hit 1205 on
+    every attempt; past the shared deadline it degrades the mutable selected
+    projections/maintenance domain to ``None`` while immutable learning
+    evidence stays appendable through the unclaimed handle.
+    """
+
+    stores = build_fake_stores()
+    ledger = _FakeLifeEventStore()
+    runtimes, _ = _install_selected_factories(
+        monkeypatch,
+        BackendKind.MYSQL,
+        stores,
+        ledger,
+    )
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+    await service._open_selected_storage_runtime()
+    runtime = runtimes[0]
+    original_acquire = runtime.acquire_singleton_writer
+    learning_attempts = 0
+
+    async def _learning_1205(**kwargs: Any) -> Any:
+        nonlocal learning_attempts
+        if kwargs["namespace"] == "life_engine.learning":
+            learning_attempts += 1
+            raise _mysql_lock_wait_timeout()
+        return await original_acquire(**kwargs)
+
+    runtime.acquire_singleton_writer = _learning_1205
+    # 100.0 = claim_deadline base; 221.1 > 100.0 + 121.0 so the learning claim
+    # hits the shared deadline on its first conflict and degrades to None
+    # instead of raising and failing plugin startup.
+    monotonic_values = iter((100.0, 221.1))
+    monkeypatch.setattr(
+        core_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(monotonic_values)),
+    )
+
+    async def _start_selected_only() -> None:
+        await service._start_selected_storage()
+
+    monkeypatch.setattr(service, "_start_impl", _start_selected_only)
+
+    # Startup must succeed despite the live other-owner learning claim.
+    await service.start()
+
+    assert learning_attempts == 1
+    assert service._learning_writer_claim is None
+    assert service._learning_stores is None
+    # Immutable evidence handle stays attached so this instance keeps
+    # appending learning events; the projector handle is dropped.
+    assert service._learning_event_store is not None
+    event_only = service._build_learning_runtime(workspace_path=tmp_path)
+    assert event_only.projector_owner is False
+    assert not hasattr(event_only, "store")
+    assert event_only.get_state()["event_append_available"] is True
+    assert runtime.learning_open_writer_claims == [None]
+    assert runtime.revoke_calls == 0
+    assert runtime.close_calls == 0
+
+
+async def test_selected_storage_1205_never_swallows_unrelated_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only MySQL 1205 joins the wait-then-degrade path.
+
+    A different SQLAlchemy OperationalError (e.g. 2006 server gone away,
+    1064 syntax) must propagate unchanged instead of being mistaken for
+    transient row-lock contention.
+    """
+
+    stores = build_fake_stores()
+    ledger = _FakeLifeEventStore()
+    runtimes, _ = _install_selected_factories(
+        monkeypatch,
+        BackendKind.MYSQL,
+        stores,
+        ledger,
+    )
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+    await service._open_selected_storage_runtime()
+    runtime = runtimes[0]
+
+    async def _unrelated_error(**_kwargs: Any) -> Any:
+        raise OperationalError(
+            "SELECT ... FOR UPDATE",
+            {},
+            Exception(
+                2006,
+                "MySQL server has gone away",
+            ),
+        )
+
+    async def _fast_sleep(_delay: float) -> None:
+        return None
+
+    runtime.acquire_singleton_writer = _unrelated_error
+    monkeypatch.setattr(core_module.asyncio, "sleep", _fast_sleep)
+
+    async def _start_selected_only() -> None:
+        await service._start_selected_storage()
+
+    monkeypatch.setattr(service, "_start_impl", _start_selected_only)
+
+    with pytest.raises(OperationalError, match="MySQL server has gone away"):
+        await service.start()
+
+    assert runtime.revoke_calls == 1
+    assert runtime.close_calls == 1
+
+
 async def test_presence_outbox_limit_fails_without_losing_remaining_evidence() -> None:
     stores = build_fake_stores()
     ledger = _FakeLifeEventStore()

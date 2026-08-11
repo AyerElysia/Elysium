@@ -1165,9 +1165,27 @@ class LifeEngineService(BaseService):
             failing the whole plugin startup.  The owning instance keeps the
             projection/maintenance writer; non-owners append immutable events
             through the unclaimed handle only.
+
+            MySQL error 1205 (row-lock wait timeout) is semantically identical
+            to ``SingletonWriterClaimConflict`` here: two nodes racing the same
+            singleton claim row with ``SELECT ... FOR UPDATE`` make the waiting
+            session abort after the session ``innodb_lock_wait_timeout``.  It
+            therefore feeds the same wait-then-degrade path instead of failing
+            plugin startup.
             """
 
             from ..storage import SingletonWriterClaimConflict
+            from sqlalchemy.exc import OperationalError as SAOperationalError
+
+            def _is_lock_wait_timeout(exc: BaseException) -> bool:
+                """Detect MySQL 1205 row-lock wait timeout (transient contention)."""
+                if not isinstance(exc, SAOperationalError):
+                    return False
+                orig = getattr(exc, "orig", None)
+                try:
+                    return int(orig.args[0]) == 1205
+                except (AttributeError, TypeError, IndexError, ValueError):
+                    return False
 
             logged_wait = False
             while True:
@@ -1180,26 +1198,31 @@ class LifeEngineService(BaseService):
                             self._storage_factory_settings.authority_lease_seconds
                         ),
                     )
-                except SingletonWriterClaimConflict:
-                    remaining = claim_deadline - time.monotonic()
-                    if remaining <= 0:
-                        if required:
-                            raise
-                        logger.warning(
-                            "selected storage writer claim is not owned by this "
-                            "instance; degrading singleton domain to avoid "
-                            f"blocking plugin startup: namespace={namespace} "
-                            f"state_key={state_key}"
-                        )
-                        return None
-                    if not logged_wait:
-                        logger.warning(
-                            "selected storage writer claim is still leased; "
-                            f"waiting up to {remaining:.1f}s for DB-time takeover: "
-                            f"namespace={namespace} state_key={state_key}"
-                        )
-                        logged_wait = True
-                    await asyncio.sleep(min(claim_retry_interval_seconds, remaining))
+                except SingletonWriterClaimConflict as exc:
+                    last_exc = exc
+                except SAOperationalError as exc:
+                    if not _is_lock_wait_timeout(exc):
+                        raise
+                    last_exc = exc
+                remaining = claim_deadline - time.monotonic()
+                if remaining <= 0:
+                    if required:
+                        raise last_exc
+                    logger.warning(
+                        "selected storage writer claim is not owned by this "
+                        "instance; degrading singleton domain to avoid blocking "
+                        f"plugin startup: namespace={namespace} "
+                        f"state_key={state_key} error_type={type(last_exc).__name__}"
+                    )
+                    return None
+                if not logged_wait:
+                    logger.warning(
+                        "selected storage writer claim is still leased; "
+                        f"waiting up to {remaining:.1f}s for DB-time takeover: "
+                        f"namespace={namespace} state_key={state_key}"
+                    )
+                    logged_wait = True
+                await asyncio.sleep(min(claim_retry_interval_seconds, remaining))
 
         if multi_writer_enabled:
             from ..storage.multi_writer_protocol import (

@@ -13,7 +13,6 @@ from plugins.life_engine.memory.service import LifeMemoryService
 from plugins.life_engine.memory.workspace_projection_identity import (
     WorkspaceProjectionDeleteEvidenceError,
     WorkspaceProjectionEventKind,
-    WorkspaceProjectionRebuildRequired,
 )
 from plugins.life_engine.storage.memory import MemoryStorageBundle
 from plugins.life_engine.storage.memory.mysql import MySQLMemoryReadinessProbeError
@@ -52,14 +51,16 @@ class _InjectedRuntime:
         health_status: str = "healthy",
         health_error: Exception | None = None,
         health_delay: float = 0.0,
+        generation_id: str = "test-memory-generation",
+        owner_id: str = "test-memory-owner",
     ) -> None:
         self.close_calls = 0
         self.health_calls = 0
         self.health_status = health_status
         self.health_error = health_error
         self.health_delay = health_delay
-        self.generation = SimpleNamespace(generation_id="test-memory-generation")
-        self.authority_token = SimpleNamespace(owner_id="test-memory-owner")
+        self.generation = SimpleNamespace(generation_id=generation_id)
+        self.authority_token = SimpleNamespace(owner_id=owner_id)
 
     async def close(self) -> None:
         self.close_calls += 1
@@ -212,10 +213,19 @@ async def test_mysql_service_never_opens_sqlite_and_never_closes_shared_runtime(
 
 
 @pytest.mark.asyncio
-async def test_mysql_projection_binding_rejects_a_different_workspace_root(
+async def test_mysql_projection_binding_degrades_on_a_different_workspace_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A second node with a different workspace root must not fail startup.
+
+    Linux is the resident owner and bound the projection to its workspace root.
+    An occasional Windows guest has a different root; it must degrade to a
+    read-only projection handle (memory read/write still works, only the
+    projection inventory commit is skipped) instead of raising
+    WorkspaceProjectionRebuildRequired and failing plugin startup.
+    """
+
     runtime = _InjectedRuntime()
     stores = _bundle()
 
@@ -251,13 +261,93 @@ async def test_mysql_projection_binding_rejects_a_different_workspace_root(
     )
     monkeypatch.setattr(second, "_startup_recovery", _skip_recovery)
 
-    with pytest.raises(WorkspaceProjectionRebuildRequired):
-        await second.initialize()
+    # The different-root guest degrades to a read-only projection instead of
+    # failing startup: memory stays available, only the projection owner
+    # handle is dropped.
+    await second.initialize()
+    assert second.available is True
+    assert second._workspace_projection_binding is None
+    assert second._workspace_projection_permit is None
 
     binding_store = stores.workspace_projection
     assert isinstance(binding_store, _ProjectionBindingStore)
+    # Only the first (owning) instance appended its initial bind event; the
+    # degraded guest never appends a projection transition.
     assert len(binding_store.events) == 1
-    assert second.available is False
+
+    await second.close()
+
+
+@pytest.mark.asyncio
+async def test_mysql_projection_binding_degrades_when_other_owner_holds_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second node sharing the workspace must not fail over the owner.
+
+    The resident Linux instance already owns the projection for this exact
+    workspace root.  An occasional Windows guest is configured with a
+    different authority owner but the same storage generation; it must degrade
+    to a read-only projection (memory stays available) instead of raising
+    WorkspaceProjectionBindingConflict and failing plugin startup.
+    """
+
+    linux_runtime = _InjectedRuntime(owner_id="elysium-linux-primary")
+    binding_store = _ProjectionBindingStore()
+    passive = _AvailablePort()
+    stores = MemoryStorageBundle(
+        backend=BackendKind.MYSQL,
+        document_index=_ConcurrentDocumentIndex(),  # type: ignore[arg-type]
+        experiences=passive,  # type: ignore[arg-type]
+        witnesses=passive,  # type: ignore[arg-type]
+        living=_RecoveryLiving(),  # type: ignore[arg-type]
+        epistemic=passive,  # type: ignore[arg-type]
+        legacy_graph=_RecoveryLegacyGraph(),  # type: ignore[arg-type]
+        workspace_projection=binding_store,
+    )
+
+    async def _open_mysql(*_args: Any, **_kwargs: Any) -> MemoryStorageBundle:
+        return stores
+
+    async def _skip_recovery() -> None:
+        return None
+
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.service.open_mysql_memory_storage",
+        _open_mysql,
+    )
+    workspace = tmp_path / "shared-workspace"
+    workspace.mkdir()
+    owner = LifeMemoryService(
+        workspace,
+        vector_backend_enabled=False,
+        storage_runtime=linux_runtime,  # type: ignore[arg-type]
+        selectable_storage_enabled=True,
+    )
+    monkeypatch.setattr(owner, "_startup_recovery", _skip_recovery)
+    await owner.initialize()
+    await owner.close()
+    assert len(binding_store.events) == 1
+
+    windows_runtime = _InjectedRuntime(owner_id="elysium-windows-primary")
+    guest = LifeMemoryService(
+        workspace,
+        vector_backend_enabled=False,
+        storage_runtime=windows_runtime,  # type: ignore[arg-type]
+        selectable_storage_enabled=True,
+    )
+    monkeypatch.setattr(guest, "_startup_recovery", _skip_recovery)
+
+    # The guest with a different owner but the same root degrades to a
+    # read-only projection instead of failing startup.
+    await guest.initialize()
+    assert guest.available is True
+    assert guest._workspace_projection_binding is None
+    assert guest._workspace_projection_permit is None
+    # The degraded guest never appends a projection transition.
+    assert len(binding_store.events) == 1
+
+    await guest.close()
 
 
 @pytest.mark.asyncio

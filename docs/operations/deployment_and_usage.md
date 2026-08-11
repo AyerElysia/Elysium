@@ -180,6 +180,8 @@ uv sync --dev
 
 只有 `pip check` 输出 `No broken requirements found.`，且第二条命令输出 `Environment OK`，才可认为基础运行依赖安装完成。该检查只导入 `main.py`，不会执行 `if __name__ == "__main__"` 下的正式启动。
 
+> **SQLAlchemy 版本要求**：MySQL 异步引擎（`pool_pre_ping=True`）依赖 SQLAlchemy ≥ **2.0.50**。2.0.46 及更早版本在 `pymysql` 代码 ≥ 1.2.0（其 `Connection.ping(reconnect=False)` 带默认值）时会触发已知 bug（SQLAlchemy issue #13306）：`_send_false_to_ping` 判定翻转导致 `do_ping` 零参调用 asyncmy 适配连接的 `ping()`，而该适配连接无默认参数，插件启动时报 `AsyncAdapt_asyncmy_connection.ping() missing 1 required positional argument: 'reconnect'`，`life_engine` 等插件加载失败。2.0.50+ 已修复。若从旧版升级时被本机安全工具拦截导致 SQLAlchemy 半卸载（dist-info 缺失、import 失败），用 `uv pip install --upgrade --link-mode=copy "sqlalchemy[asyncio]>=2.0.50"` 重新安装。`pymysql` 属于 SQLAlchemy 探测性依赖（`pyproject.toml` 未直接声明），若 site-packages 出现代码版本与 dist-info 元数据不一致的脏安装，应 `--force-reinstall` 干净重装该包。
+
 如需开发测试依赖，仍优先安装项目声明的开发组；在无法使用 `uv` 时，应以 `pyproject.toml` 当前声明为准，不能长期维护一份与项目配置分离的手写依赖清单。
 
 #### 4.2.1 为项目环境补装 `uv`
@@ -1531,3 +1533,4 @@ config/
 | 2026-08-07 | 阶段三 P3-10 | 接入狼人杀四类授权投影、追加式 ledger、revision snapshot/action 幂等、ledger 恢复、用户层 REST/WS，并让新房间群命令与 HTTP 共用 domain；明确旧内存房间不迁移，管理裁判台及真实客户端/跨平台 E2E 暂未验收 |
 | 2026-08-09 | 阶段三 P3-11/P3-12/P3-13 | 接入管理总览/访问/集成/jobs 与 consciousness/world/memory/commitments/autonomy/surfaces/abilities 端点，补全 scope×resource 权限矩阵、限流与并发/上传/WS 预算、秘密扫描与故障恢复测试；管理路由要求全能管理员身份；明确部分管理领域（chat 管理、voice 监督、media 管理、tabletop 裁判台、memory 详情）仍为 planned/experimental |
 | 2026-08-09 | 阶段三 P3-14 | 旧插件路由声明弃用并附加 Deprecation/Sunset/Link 头（迁移期至 2027-02-01，不自动删除）；生成完整 OpenAPI（134 操作、无重复 operation id）与事件目录/错误码/权限矩阵/前端示例文档；本轮仅离线契约与文档，未做真实前端/Provider E2E |
+| 2026-08-11 | 依赖修复 | `life_engine` 加载失败修复：SQLAlchemy 2.0.46 的 asyncmy pre-ping 缺参 bug（issue #13306）已通过升级到 2.0.51 解决；在 4.2 补充 SQLAlchemy ≥2.0.50 版本要求与脏 pymysql 环境说明 |

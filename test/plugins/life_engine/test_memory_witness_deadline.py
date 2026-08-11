@@ -449,3 +449,109 @@ async def test_witness_loop_survives_diagnostic_and_logger_failures(
     assert run_count == 2
     assert delays == [60]
     assert log_attempts == 2
+
+
+def _witness_instance() -> ConsciousnessInstance:
+    from plugins.life_engine.service.world_state import PerceptionFilter
+
+    return ConsciousnessInstance(
+        instance_id="memory_witness",
+        kind="memory_witness",
+        display_name="爱莉的记忆见证意识",
+        status="active",
+        created_at="2026-08-11T12:00:00+08:00",
+        last_active_at="2026-08-11T12:00:00+08:00",
+        perception_filter=PerceptionFilter.full(),
+        metadata={
+            "role": "first_person_experience_witness",
+            "epistemic_boundary": "subjective_witness_not_objective_truth",
+            "reads": "immutable_experience_ledger",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_witness_ensure_instance_degrades_on_presence_contention() -> None:
+    """A contended memory_witness presence must not fail plugin startup.
+
+    In a multi-writer deployment the resident Linux node keeps touching the
+    shared ``memory_witness`` presence row, so an occasional Windows guest
+    frequently races a PresenceRevisionConflict on its startup touch.  The
+    coordinator refreshes the snapshot and retries a bounded number of times,
+    then degrades to a local read-only instance handle instead of raising.
+    """
+
+    service, memory, event_store, _perception_commits = _service(timeout_seconds=10.0)
+    witness = _witness_instance()
+    service.consciousness_registry.register(witness)
+
+    touch_attempts = 0
+    refresh_calls = 0
+
+    async def contended_touch(_instance_id: str, **kwargs: Any) -> None:
+        nonlocal touch_attempts
+        touch_attempts += 1
+        raise PresenceRevisionConflict(
+            "presence revision conflict for 'memory_witness': "
+            "expected 1637, actual 1638"
+        )
+
+    async def noop_refresh() -> None:
+        nonlocal refresh_calls
+        refresh_calls += 1
+
+    service.touch_consciousness_instance = contended_touch
+    service.consciousness_registry.refresh = noop_refresh  # type: ignore[method-assign]
+
+    coordinator = MemoryWitnessCoordinator(service)
+    result = await coordinator.ensure_instance()
+
+    assert result.instance_id == "memory_witness"
+    assert touch_attempts == 3
+    assert refresh_calls == 2
+    assert service.consciousness_registry.get("memory_witness") is not None
+
+
+@pytest.mark.asyncio
+async def test_witness_ensure_instance_recovers_after_refresh() -> None:
+    """A transient contention recovers once the snapshot catches up."""
+
+    service, memory, event_store, _perception_commits = _service(timeout_seconds=10.0)
+    witness = _witness_instance()
+    service.consciousness_registry.register(witness)
+
+    touch_attempts = 0
+
+    async def contended_then_ok(_instance_id: str, **kwargs: Any) -> None:
+        nonlocal touch_attempts
+        touch_attempts += 1
+        if touch_attempts < 2:
+            raise PresenceRevisionConflict(
+                "presence revision conflict for 'memory_witness': "
+                "expected 1637, actual 1638"
+            )
+
+    async def noop_refresh() -> None:
+        return None
+
+    service.touch_consciousness_instance = contended_then_ok
+    service.consciousness_registry.refresh = noop_refresh  # type: ignore[method-assign]
+
+    coordinator = MemoryWitnessCoordinator(service)
+    result = await coordinator.ensure_instance()
+
+    assert result.instance_id == "memory_witness"
+    assert touch_attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_witness_ensure_instance_registers_when_absent() -> None:
+    """A fresh witness registers normally when no concurrent owner exists."""
+
+    service, memory, event_store, _perception_commits = _service(timeout_seconds=10.0)
+    coordinator = MemoryWitnessCoordinator(service)
+    result = await coordinator.ensure_instance()
+
+    assert result.instance_id == "memory_witness"
+    assert service.consciousness_registry.get("memory_witness") is not None
+    assert result.status == "active"
