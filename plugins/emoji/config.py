@@ -8,7 +8,12 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-from src.core.components.base.config import BaseConfig, Field, SectionBase, config_section
+from src.core.components.base.config import (
+    BaseConfig,
+    Field,
+    SectionBase,
+    config_section,
+)
 
 
 class EmojiConfig(BaseConfig):
@@ -133,7 +138,7 @@ class EmojiConfig(BaseConfig):
                 description="检索 query 的指令前缀（指令感知，提升文本意图→图像匹配效果）",
             )
             request_timeout: float = Field(
-                default=30.0,
+                default=60.0,
                 description="调用视觉嵌入服务的超时时间（秒）",
             )
             match_min_cosine: float = Field(

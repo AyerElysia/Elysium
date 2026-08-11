@@ -6,8 +6,6 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
-
 from plugins.emoji.config import EmojiConfig
 from plugins.emoji.sender.meme_store import MemeCandidate as StoreCandidate
 from plugins.emoji.sender.service import EmojiSenderService
@@ -52,6 +50,12 @@ def _mock_embedder() -> MagicMock:
     embedder.embed_text = AsyncMock(return_value=[0.1] * 16)
     embedder.embed_image_bytes = AsyncMock(return_value=[0.2] * 16)
     return embedder
+
+
+def test_visual_embedding_timeout_covers_cold_model_load() -> None:
+    config = EmojiConfig()
+
+    assert config.sender.visual.request_timeout == 60.0
 
 
 # ── 纯视觉检索 ──────────────────────────────────────────────────

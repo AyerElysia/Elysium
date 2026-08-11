@@ -1,0 +1,24 @@
+[Unit]
+Description=Elysium visual embedding sidecar (Qwen3-VL-Embedding-2B)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/Elysia/Elysium/services/visual_embedding
+ExecStart=/root/Elysia/Elysium/services/visual_embedding/.venv/bin/python /root/Elysia/Elysium/services/visual_embedding/server.py --model-path /root/models/Qwen3-VL-Embedding-2B --host 127.0.0.1 --port 8848 --idle-timeout 180
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=0
+TimeoutStopSec=60
+KillSignal=SIGINT
+Environment=TZ=Asia/Shanghai
+Environment=HF_HUB_OFFLINE=1
+StandardOutput=append:/root/Elysia/Elysium/logs/visual_embedding.log
+StandardError=append:/root/Elysia/Elysium/logs/visual_embedding.log
+
+[Install]
+WantedBy=multi-user.target

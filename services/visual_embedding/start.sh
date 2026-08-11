@@ -31,7 +31,10 @@ if [ ! -d "$VENV_DIR" ]; then
 fi
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
-python -m pip install --upgrade pip >/dev/null
+if python -c "import fastapi, numpy, PIL, torch, uvicorn" 2>/dev/null; then
+    echo "==> dependencies ready; skipping installation"
+else
+    python -m pip install --upgrade pip >/dev/null
 
 # 2. 安装 torch CUDA 版（RTX 5090 / Blackwell 需 cu128）
 echo "==> 安装 torch（CUDA: $TORCH_CUDA_INDEX）"
@@ -40,6 +43,7 @@ pip install torch torchvision --index-url "$TORCH_CUDA_INDEX"
 # 3. 安装其余依赖
 echo "==> 安装服务依赖"
 pip install -r requirements.txt
+fi
 
 if [ "${1:-}" = "--setup-only" ]; then
     echo "==> 环境安装完成（--setup-only）"
@@ -48,7 +52,11 @@ fi
 
 # 4. 下载模型
 echo "==> 下载/校验模型"
-python download_model.py --local-dir "$MODEL_PATH"
+if [ -f "$MODEL_PATH/config.json" ] && find "$MODEL_PATH" -maxdepth 1 -name '*.safetensors' -print -quit | grep -q .; then
+    echo "==> model ready; skipping download"
+else
+    python download_model.py --local-dir "$MODEL_PATH"
+fi
 
 # 5. 启动服务
 echo "==> 启动服务 (port=$PORT)"
