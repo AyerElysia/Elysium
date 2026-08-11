@@ -1767,7 +1767,11 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                         "model_name": model_name,
                     },
                 )
-                if result.rowcount == 1:
+                # MySQL reports changed rows across every table in a multi-table
+                # UPDATE.  A successful exact completion can therefore report 1
+                # (only the job changed) or 2 (the job and node provenance changed).
+                # Zero remains the fail-closed stale/revision-mismatch signal.
+                if result.rowcount >= 1:
                     completed.append(job.job_id)
                 else:
                     post_stale.append(job.job_id)

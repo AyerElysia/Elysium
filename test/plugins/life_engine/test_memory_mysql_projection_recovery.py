@@ -174,8 +174,9 @@ class _Engine:
 
 
 class _CompletionSession:
-    def __init__(self) -> None:
+    def __init__(self, *, completion_rowcount: int = 1) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.completion_rowcount = completion_rowcount
 
     async def execute(
         self,
@@ -184,11 +185,20 @@ class _CompletionSession:
     ) -> _Result:
         sql = " ".join(str(statement).split())
         self.calls.append((sql, dict(parameters)))
+        if sql.startswith("UPDATE memory_index_jobs j"):
+            return _Result(rowcount=self.completion_rowcount)
         return _Result(rowcount=1)
 
 
 @pytest.mark.asyncio
-async def test_mysql_worker_records_exact_embedding_provenance() -> None:
+@pytest.mark.parametrize(
+    ("completion_rowcount", "expected_completed"),
+    [(0, False), (1, True), (2, True)],
+)
+async def test_mysql_worker_interprets_multitable_completion_rowcount(
+    completion_rowcount: int,
+    expected_completed: bool,
+) -> None:
     body = "one exact chunk"
     digest = compute_content_hash(body)
     node = {
@@ -232,7 +242,7 @@ async def test_mysql_worker_records_exact_embedding_provenance() -> None:
     port.runtime = runtime
     port.claim_jobs = lambda **_kwargs: _async_value([job])  # type: ignore[method-assign]
     port.read_chunk_index_state = lambda: _async_value(None)  # type: ignore[method-assign]
-    completion = _CompletionSession()
+    completion = _CompletionSession(completion_rowcount=completion_rowcount)
 
     async def _write(operation):  # type: ignore[no-untyped-def]
         return await operation(completion)
@@ -267,7 +277,8 @@ async def test_mysql_worker_records_exact_embedding_provenance() -> None:
     assert "n.embedding_model =" in completion_sql
     assert "n.embedding_updated_at =" in completion_sql
     assert completion_params["model_name"] == "test/model-v1"
-    assert report.completed == (job.job_id,)
+    assert report.completed == ((job.job_id,) if expected_completed else ())
+    assert report.stale == (() if expected_completed else (job.job_id,))
 
 
 @pytest.mark.asyncio

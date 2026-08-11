@@ -7,7 +7,7 @@ import json
 import sqlite3
 import time
 import uuid
-from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar
+from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar, Literal
 
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
@@ -54,6 +54,47 @@ class MemoryHealthResponse(BaseModel):
     edges: dict[str, Any] = Field(default_factory=dict)
     living_memory: dict[str, Any] = Field(default_factory=dict)
     vector: VectorHealthResponse
+
+
+class _SelectedVectorHealthSource(BaseModel):
+    """Strict source fields used to project selected-backend vector health."""
+
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    backend: Literal["mysql"]
+    vector_expected: bool
+    vector_collection_loaded: bool
+
+
+def _prepare_health_response(snapshot: Any) -> dict[str, Any]:
+    """Return a public health payload without weakening the required vector contract.
+
+    Local health snapshots already expose the complete ``vector`` section and are
+    copied unchanged.  The selected MySQL service exposes the two source booleans
+    instead; both are required and strictly typed before deriving the public
+    projection.  Any unknown or incomplete shape is left to fail validation rather
+    than being presented as healthy.
+    """
+
+    if not isinstance(snapshot, dict):
+        raise TypeError("memory health snapshot must be a dictionary")
+
+    payload = dict(snapshot)
+    if "vector" in payload:
+        return payload
+
+    source = _SelectedVectorHealthSource.model_validate(payload)
+    vector_degraded = source.vector_expected and not source.vector_collection_loaded
+    payload["vector"] = {
+        "available": source.vector_collection_loaded,
+        "expected": source.vector_expected,
+        "disabled": not source.vector_expected,
+        "degraded": vector_degraded,
+        "collection_loaded": source.vector_collection_loaded,
+    }
+    if vector_degraded and payload.get("status") in {"healthy", "ok"}:
+        payload["status"] = "degraded"
+    return payload
 
 
 def _table_exists(db: sqlite3.Connection, table: str) -> bool:
@@ -449,7 +490,7 @@ class MemoryRouter(BaseRouter):
             memory = get_memory_service()
             if not memory:
                 return JSONResponse(content={"status": "disabled"}, status_code=503)
-            return await memory.health_snapshot()
+            return _prepare_health_response(await memory.health_snapshot())
 
         @self.app.get("/api/graph")
         async def get_graph(

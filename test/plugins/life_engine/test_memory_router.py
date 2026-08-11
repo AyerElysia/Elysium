@@ -230,3 +230,134 @@ def test_health_endpoint_exports_response_schema() -> None:
     assert {"status", "sqlite", "index", "outbox", "living_memory", "vector"} <= set(
         health_schema["properties"]
     )
+    assert "vector" in health_schema["required"]
+
+
+class _SelectedHealthMemory:
+    def __init__(self, snapshot: dict[str, Any]) -> None:
+        self._snapshot = snapshot
+
+    async def health_snapshot(self) -> dict[str, Any]:
+        return dict(self._snapshot)
+
+
+def test_health_endpoint_projects_selected_vector_state_and_degrades_when_unavailable() -> None:
+    memory = _SelectedHealthMemory(
+        {
+            "status": "healthy",
+            "backend": "mysql",
+            "ports": {"document_index": "healthy"},
+            "runtime": {"status": "healthy", "backend": "mysql"},
+            "vector_expected": True,
+            "vector_collection_loaded": False,
+            "startup_recovery": {"status": "completed"},
+        }
+    )
+    plugin = SimpleNamespace(service=SimpleNamespace(_memory_service=memory))
+    router = MemoryRouter(plugin=plugin)
+
+    with TestClient(router.app, raise_server_exceptions=False) as client:
+        response = client.get("/api/health")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "degraded"
+    assert payload["backend"] == "mysql"
+    assert payload["vector_expected"] is True
+    assert payload["vector_collection_loaded"] is False
+    assert payload["vector"] == {
+        "available": False,
+        "expected": True,
+        "disabled": False,
+        "degraded": True,
+        "collection_loaded": False,
+    }
+
+
+def test_health_endpoint_preserves_local_health_response() -> None:
+    local_snapshot = {
+        "status": "ok",
+        "sqlite": {"available": True, "integrity_ok": True},
+        "index": {"indexed": 4},
+        "outbox": {"backlog": 0},
+        "edges": {"orphan_count": 0},
+        "living_memory": {"enabled": True},
+        "vector": {
+            "available": True,
+            "expected": True,
+            "disabled": False,
+            "degraded": False,
+            "collection_loaded": True,
+            "kind": "chunk",
+            "count": 7,
+        },
+        "fts": {"available": True},
+    }
+    memory = _SelectedHealthMemory(local_snapshot)
+    plugin = SimpleNamespace(service=SimpleNamespace(_memory_service=memory))
+    router = MemoryRouter(plugin=plugin)
+
+    with TestClient(router.app) as client:
+        response = client.get("/api/health")
+
+    assert response.status_code == 200
+    assert response.json() == local_snapshot
+
+
+def test_health_endpoint_reports_intentionally_disabled_selected_vector() -> None:
+    memory = _SelectedHealthMemory(
+        {
+            "status": "healthy",
+            "backend": "mysql",
+            "vector_expected": False,
+            "vector_collection_loaded": False,
+        }
+    )
+    plugin = SimpleNamespace(service=SimpleNamespace(_memory_service=memory))
+    router = MemoryRouter(plugin=plugin)
+
+    with TestClient(router.app) as client:
+        response = client.get("/api/health")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "healthy"
+    assert payload["vector"] == {
+        "available": False,
+        "expected": False,
+        "disabled": True,
+        "degraded": False,
+        "collection_loaded": False,
+    }
+
+
+def test_health_endpoint_rejects_incomplete_or_malformed_selected_vector_source() -> None:
+    invalid_snapshots: tuple[dict[str, Any], ...] = (
+        {
+            "status": "healthy",
+            "backend": "mysql",
+            "vector_expected": True,
+        },
+        {
+            "status": "healthy",
+            "backend": "mysql",
+            "vector_expected": "true",
+            "vector_collection_loaded": False,
+        },
+        {
+            "status": "healthy",
+            "backend": "unknown",
+            "vector_expected": True,
+            "vector_collection_loaded": True,
+        },
+    )
+
+    for snapshot in invalid_snapshots:
+        memory = _SelectedHealthMemory(snapshot)
+        plugin = SimpleNamespace(service=SimpleNamespace(_memory_service=memory))
+        router = MemoryRouter(plugin=plugin)
+
+        with TestClient(router.app, raise_server_exceptions=False) as client:
+            response = client.get("/api/health")
+
+        assert response.status_code == 500
