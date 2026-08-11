@@ -57,6 +57,10 @@ class MemoryNode:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     embedding_synced: bool = False
+    fts_content_hash: str | None = None
+    embedding_content_hash: str | None = None
+    embedding_model: str = ""
+    legacy_fts_present: bool = False
 
 
 # ============================================================
@@ -112,6 +116,7 @@ def compute_content_hash(content: str) -> str:
 
 def row_to_node(row: sqlite3.Row) -> MemoryNode:
     """将数据库行转换为 MemoryNode。"""
+    columns = set(row.keys())
     return MemoryNode(
         node_id=row["node_id"],
         node_type=NodeType(row["node_type"]),
@@ -127,6 +132,28 @@ def row_to_node(row: sqlite3.Row) -> MemoryNode:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         embedding_synced=bool(row["embedding_synced"]),
+        fts_content_hash=(
+            str(row["fts_content_hash"])
+            if "fts_content_hash" in columns
+            and row["fts_content_hash"] is not None
+            else None
+        ),
+        embedding_content_hash=(
+            str(row["embedding_content_hash"])
+            if "embedding_content_hash" in columns
+            and row["embedding_content_hash"] is not None
+            else None
+        ),
+        embedding_model=(
+            str(row["embedding_model"] or "")
+            if "embedding_model" in columns
+            else ""
+        ),
+        legacy_fts_present=(
+            bool(row["legacy_fts_present"])
+            if "legacy_fts_present" in columns
+            else False
+        ),
     )
 
 

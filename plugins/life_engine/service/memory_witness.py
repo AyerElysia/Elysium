@@ -23,11 +23,13 @@ from src.kernel.llm.exceptions import (
     LLMAPIError,
     is_transient_llm_error,
 )
+from src.kernel.storage import CursorConflict
 
 from ..memory.experience import EpistemicKind, ExperienceRecord, WitnessMemory
 from .consciousness import ConsciousnessInstance
 from .event_bus import LifeEvent, RawEventGapError
 from .perception_gateway import PerceptionDeliveryReceipt
+from .presence_store import PresenceRevisionConflict
 from .world_state import PerceptionFilter
 
 if TYPE_CHECKING:
@@ -37,6 +39,7 @@ logger = get_logger("life_engine.memory_witness")
 MEMORY_WITNESS_INSTANCE_ID = "memory_witness"
 _NO_WITNESS = "<no_witness>"
 _TRANSIENT_ERROR_ESCALATION_COUNT = 3
+_CONCURRENCY_ERROR_ESCALATION_COUNT = 3
 
 _SELF_PRESENCE_SIDE_EFFECT_EVENT_TYPES = frozenset(
     {
@@ -71,6 +74,28 @@ def _transient_error_summary(exc: BaseException) -> str:
     return f"{details[0]}({', '.join(details[1:])})"
 
 
+def _safe_log(
+    level: str,
+    message: str,
+    *,
+    exc_info: BaseException | None = None,
+) -> None:
+    """Emit one diagnostic without letting a logging failure kill the worker."""
+
+    log_method = getattr(logger, level, None)
+    if not callable(log_method):
+        return
+    try:
+        if exc_info is None:
+            log_method(message)
+        else:
+            log_method(message, exc_info=exc_info)
+    except Exception:  # noqa: BLE001 - observability must not own worker life
+        # The witness owns durable work, while the logger is an observability
+        # projection.  A broken sink must not terminate the only consumer.
+        return
+
+
 @dataclass(frozen=True, slots=True)
 class WitnessRunReport:
     synced_experiences: int = 0
@@ -88,9 +113,7 @@ def _exact_perception_receipt(
     """Map the final successful LLM attempt receipt to one World delivery."""
 
     lookup = getattr(response, "effective_context_receipt", None)
-    effective = (
-        lookup(str(perception.delivery_id)) if callable(lookup) else None
-    )
+    effective = lookup(str(perception.delivery_id)) if callable(lookup) else None
     if effective is None or not bool(getattr(effective, "exact_present", False)):
         return None
     expected_bytes = getattr(effective, "expected_utf8_bytes", None)
@@ -110,9 +133,7 @@ def _exact_perception_receipt(
         projection_sha256=str(perception.projection_sha256),
         delivered_bytes=int(perception.delivered_bytes),
         exact=True,
-        transport_request_id=str(
-            getattr(response, "request_record_id", "") or ""
-        ),
+        transport_request_id=str(getattr(response, "request_record_id", "") or ""),
     )
 
 
@@ -171,6 +192,7 @@ class MemoryWitnessCoordinator:
         )
         next_delay = 0 if run_immediately else interval
         transient_failures = 0
+        concurrency_failures = 0
         while self._service._state.running:
             if next_delay > 0:
                 stop_event = self._service._stop_event
@@ -189,11 +211,31 @@ class MemoryWitnessCoordinator:
                 await self.run_once()
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
-                await self._record_error(exc)
+            except Exception as exc:  # noqa: BLE001 - managed worker boundary
+                await self._record_error_safely(exc)
+                if isinstance(exc, (PresenceRevisionConflict, CursorConflict)):
+                    transient_failures = 0
+                    concurrency_failures += 1
+                    next_delay = retry_delay
+                    if isinstance(exc, PresenceRevisionConflict):
+                        await self._refresh_presence_snapshot_safely()
+                    message = (
+                        "记忆见证遇到可恢复并发冲突，待处理经历已保留: "
+                        f"failure_count={concurrency_failures}, "
+                        f"retry_in={next_delay}s, error={type(exc).__name__}"
+                    )
+                    if concurrency_failures == 1:
+                        _safe_log("warning", message, exc_info=exc)
+                    elif concurrency_failures == _CONCURRENCY_ERROR_ESCALATION_COUNT:
+                        _safe_log("error", message, exc_info=exc)
+                    else:
+                        _safe_log("debug", message)
+                    continue
+
+                concurrency_failures = 0
                 if not is_transient_llm_error(exc):
                     transient_failures = 0
-                    logger.exception("记忆见证意识运行失败")
+                    _safe_log("error", "记忆见证意识运行失败", exc_info=exc)
                     continue
 
                 transient_failures += 1
@@ -209,18 +251,25 @@ class MemoryWitnessCoordinator:
                     f"retry_in={next_delay}s, error={summary}"
                 )
                 if transient_failures == _TRANSIENT_ERROR_ESCALATION_COUNT:
-                    logger.error(message)
+                    _safe_log("error", message)
                 elif transient_failures == 1:
-                    logger.warning(message)
+                    _safe_log("warning", message)
                 else:
-                    logger.debug(message)
+                    _safe_log("debug", message)
             else:
                 if transient_failures:
-                    logger.info(
-                        "记忆见证上游已恢复: "
-                        f"previous_failures={transient_failures}"
+                    _safe_log(
+                        "info",
+                        f"记忆见证上游已恢复: previous_failures={transient_failures}",
+                    )
+                if concurrency_failures:
+                    _safe_log(
+                        "info",
+                        "记忆见证并发冲突已恢复: "
+                        f"previous_failures={concurrency_failures}",
                     )
                 transient_failures = 0
+                concurrency_failures = 0
 
     async def run_once(self) -> WitnessRunReport:
         async with self._run_lock:
@@ -369,9 +418,7 @@ class MemoryWitnessCoordinator:
     async def _migrate_legacy_diaries(self) -> None:
         cfg = self.config
         memory = self._service.memory_service
-        if memory is None or not bool(
-            getattr(cfg, "migrate_legacy_diaries", True)
-        ):
+        if memory is None or not bool(getattr(cfg, "migrate_legacy_diaries", True)):
             return
         from .legacy_diary import migrate_legacy_diaries
 
@@ -393,6 +440,39 @@ class MemoryWitnessCoordinator:
             last_run_at=_now_iso(),
             last_error=type(exc).__name__,
         )
+
+    async def _record_error_safely(self, exc: Exception) -> None:
+        """Best-effort diagnostics must never replace the primary failure."""
+
+        try:
+            await self._record_error(exc)
+        except asyncio.CancelledError:
+            raise
+        except Exception as record_error:  # noqa: BLE001 - diagnostic boundary
+            _safe_log(
+                "error",
+                "记忆见证错误状态记录失败: "
+                f"primary_error={type(exc).__name__}, "
+                f"record_error={type(record_error).__name__}",
+                exc_info=record_error,
+            )
+
+    async def _refresh_presence_snapshot_safely(self) -> None:
+        """Refresh stale Presence state after CAS conflict, without looping."""
+
+        refresh = getattr(self._service.consciousness_registry, "refresh", None)
+        if not callable(refresh):
+            return
+        try:
+            await refresh()
+        except asyncio.CancelledError:
+            raise
+        except Exception as refresh_error:  # noqa: BLE001 - recovery boundary
+            _safe_log(
+                "error",
+                f"记忆见证 Presence 快照刷新失败: error={type(refresh_error).__name__}",
+                exc_info=refresh_error,
+            )
 
     async def _retry_pending_projections(self) -> None:
         memory = self._service.memory_service

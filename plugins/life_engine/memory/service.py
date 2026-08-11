@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import sqlite3
 import uuid
 from collections.abc import Sequence
@@ -130,15 +131,22 @@ from .worker import (
     get_chunk_collection,
     get_named_chunk_collection,
 )
+from .workspace_projection_identity import (
+    WorkspaceProjectionBinding,
+    WorkspaceProjectionDeleteEvidenceError,
+    WorkspaceProjectionRevisionConflict,
+    WorkspaceProjectionWritePermit,
+    authorize_workspace_projection_write,
+    bind_workspace_projection,
+    build_workspace_projection_identity,
+    commit_workspace_projection_inventory,
+)
 
 logger = log_api.get_logger("life_engine.memory")
 
 # 启动补索引时一次性读入内存的文档数。这不是行为阈值：分批与否不改变最终被
 # 索引的文件集合，只决定峰值内存——整个工作区的正文同时驻留可能是数百 MB。
 _RECOVERY_READ_BATCH = 32
-# Projection repair is committed in bounded batches so remote MySQL never holds
-# every ghost node and vector tombstone in one long startup transaction.
-_RECOVERY_DELETE_BATCH = 64
 _MYSQL_RECOVERY_WRITE_CONCURRENCY = 8
 _MYSQL_MEMORY_STARTUP_PROBE_TIMEOUT_SECONDS = 30.0
 
@@ -328,6 +336,9 @@ class LifeMemoryService:
         self._lifecycle_lock = asyncio.Lock()
         self._startup_recovery_task: asyncio.Task[None] | None = None
         self._startup_recovery_progress = _StartupRecoveryProgress()
+        self._workspace_projection_lock = asyncio.Lock()
+        self._workspace_projection_binding: WorkspaceProjectionBinding | None = None
+        self._workspace_projection_permit: WorkspaceProjectionWritePermit | None = None
 
     def _emit_visual_event(
         self,
@@ -389,6 +400,132 @@ class LifeMemoryService:
             return self._workspace_override
         config = self._get_config()
         return Path(config.settings.workspace_path)
+
+    def _selected_workspace_projection_owner(self) -> tuple[str, str]:
+        """Return the exact storage generation and stable writer owner."""
+
+        runtime = self._storage_runtime
+        if (
+            runtime is None
+            or not runtime.enabled
+            or runtime.backend != BackendKind.MYSQL
+            or runtime.generation is None
+            or runtime.authority_token is None
+        ):
+            raise RuntimeError("WorkspaceProjectionAuthorityUnavailable")
+        return (
+            str(runtime.generation.generation_id),
+            str(runtime.authority_token.owner_id),
+        )
+
+    @staticmethod
+    def _workspace_projection_occurrence(
+        kind: str,
+        *parts: str,
+    ) -> str:
+        digest = hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()[:32]
+        return f"workspace-{kind}-{digest}"
+
+    async def _prepare_workspace_projection(
+        self,
+        *,
+        scan: Any = None,
+    ) -> tuple[Any, WorkspaceProjectionBinding, WorkspaceProjectionWritePermit] | None:
+        """Bind one MySQL generation to this exact workspace before any write."""
+
+        storage = self._require_memory_storage()
+        if storage.backend != BackendKind.MYSQL:
+            return None
+        binding_store = storage.workspace_projection
+        if binding_store is None:
+            # A selected remote projection without a durable source binding can
+            # reproduce the cross-workspace mass-retirement incident. Never
+            # fall back to an unbound write path.
+            if self._storage_runtime is not None and self._storage_runtime.enabled:
+                raise RuntimeError("WorkspaceProjectionBindingStoreUnavailable")
+            return None
+
+        identity = await asyncio.to_thread(
+            build_workspace_projection_identity,
+            self._get_workspace_path(),
+            scan=scan,
+        )
+        storage_generation_id, owner_id = self._selected_workspace_projection_owner()
+        projection_generation_id = (
+            "workspace-documents-v1-" + identity.canonical_root_sha256[:24]
+        )
+        async with self._workspace_projection_lock:
+            binding = await binding_store.load_binding(storage_generation_id)
+            if binding is None:
+                occurred_at = datetime.now().astimezone().isoformat()
+                transition = bind_workspace_projection(
+                    identity,
+                    storage_generation_id=storage_generation_id,
+                    projection_generation_id=projection_generation_id,
+                    owner_id=owner_id,
+                    actor_id=owner_id,
+                    audit_occurrence_id=self._workspace_projection_occurrence(
+                        "bind",
+                        storage_generation_id,
+                        identity.canonical_root_sha256,
+                    ),
+                    reason_code="initial-workspace-projection-bind",
+                    occurred_at=occurred_at,
+                )
+                try:
+                    binding = await binding_store.commit_transition(transition)
+                except WorkspaceProjectionRevisionConflict:
+                    binding = await binding_store.load_binding(storage_generation_id)
+                    if binding is None:
+                        raise
+
+            permit = authorize_workspace_projection_write(
+                binding,
+                identity,
+                storage_generation_id=storage_generation_id,
+                projection_generation_id=binding.projection_generation_id,
+                owner_id=owner_id,
+            )
+            self._workspace_projection_binding = binding
+            self._workspace_projection_permit = permit
+            return identity, binding, permit
+
+    async def _commit_workspace_projection_inventory(
+        self,
+        identity: Any,
+        binding: WorkspaceProjectionBinding,
+    ) -> WorkspaceProjectionBinding:
+        """Append one content-free inventory observation after successful writes."""
+
+        storage_generation_id, owner_id = self._selected_workspace_projection_owner()
+        store = self._require_memory_storage().workspace_projection
+        if store is None:
+            raise RuntimeError("WorkspaceProjectionBindingStoreUnavailable")
+        transition = commit_workspace_projection_inventory(
+            binding,
+            identity,
+            expected_revision=binding.revision,
+            owner_id=owner_id,
+            actor_id=owner_id,
+            audit_occurrence_id=self._workspace_projection_occurrence(
+                "inventory",
+                storage_generation_id,
+                identity.source_root_sha256,
+                str(binding.revision + 1),
+            ),
+            reason_code="present-documents-reconciled",
+            occurred_at=datetime.now().astimezone().isoformat(),
+        )
+        committed = await store.commit_transition(transition)
+        self._workspace_projection_binding = committed
+        self._workspace_projection_permit = authorize_workspace_projection_write(
+            committed,
+            identity,
+            storage_generation_id=storage_generation_id,
+            projection_generation_id=committed.projection_generation_id,
+            owner_id=owner_id,
+        )
+        return committed
 
     async def _get_chroma_collection(self) -> Any:
         """获取并缓存兼容旧节点向量的集合。"""
@@ -540,6 +677,8 @@ class LifeMemoryService:
                     )
 
                 await self._validate_storage_availability()
+                if self._require_memory_storage().backend == BackendKind.MYSQL:
+                    await self._prepare_workspace_projection()
 
                 if self._vector_backend_enabled:
                     try:
@@ -569,6 +708,8 @@ class LifeMemoryService:
                 self._memory_storage = None
                 self._db = None
                 self._initialized = False
+                self._workspace_projection_binding = None
+                self._workspace_projection_permit = None
                 bind_reader_pool(None)
                 if local_db is not None:
                     await run_db(local_db.close)
@@ -928,6 +1069,7 @@ class LifeMemoryService:
         workspace = self._get_workspace_path()
         storage = self._require_memory_storage()
         scan = await asyncio.to_thread(scan_workspace_documents, workspace)
+        projection_context = await self._prepare_workspace_projection(scan=scan)
         workspace_paths = {document.path for document in scan.documents}
         indexed_nodes = await storage.document_index.list_indexed_documents()
         indexed = {
@@ -947,6 +1089,9 @@ class LifeMemoryService:
         logger.info(
             "Memory workspace recovery started: "
             f"documents={len(paths)} write_concurrency={write_concurrency}"
+        )
+        write_semaphore = (
+            asyncio.Semaphore(write_concurrency) if write_concurrency > 1 else None
         )
 
         async def _reconcile_document(path: str, content: str) -> None:
@@ -975,7 +1120,15 @@ class LifeMemoryService:
                     "启动扫描保留非规范 legacy 文档身份，等待显式迁移: "
                     f"path={path} node_id={node.node_id}"
                 )
-            elif str(node.content_hash or "") != digest:
+            elif (
+                str(node.content_hash or "") != digest
+                or str(node.fts_content_hash or "") != digest
+                or bool(node.legacy_fts_present)
+                or (
+                    node.embedding_synced
+                    and str(node.embedding_content_hash or "") != digest
+                )
+            ):
                 await storage.document_index.upsert_document(
                     path,
                     content,
@@ -997,6 +1150,13 @@ class LifeMemoryService:
                     f"requeued={progress.requeued_documents}"
                 )
 
+        async def _bounded_reconcile(path: str, content: str) -> None:
+            if write_semaphore is None:
+                await _reconcile_document(path, content)
+                return
+            async with write_semaphore:
+                await _reconcile_document(path, content)
+
         for start in range(0, len(paths), _RECOVERY_READ_BATCH):
             batch = paths[start : start + _RECOVERY_READ_BATCH]
             documents = await asyncio.to_thread(_read_documents, workspace, batch)
@@ -1008,12 +1168,6 @@ class LifeMemoryService:
                 for path, content in documents:
                     await _reconcile_document(path, content)
             else:
-                semaphore = asyncio.Semaphore(write_concurrency)
-
-                async def _bounded_reconcile(path: str, content: str) -> None:
-                    async with semaphore:
-                        await _reconcile_document(path, content)
-
                 async with asyncio.TaskGroup() as task_group:
                     for path, content in documents:
                         task_group.create_task(_bounded_reconcile(path, content))
@@ -1024,18 +1178,13 @@ class LifeMemoryService:
         progress.phase = "projection_cleanup"
         progress.ghost_documents = len(missing_node_ids)
         if missing_node_ids:
-            retired = 0
-            total = len(missing_node_ids)
-            logger.info(f"启动清理：发现 {total} 个 ghost 节点，开始分批修复投影")
-            for start in range(0, total, _RECOVERY_DELETE_BATCH):
-                batch = missing_node_ids[start : start + _RECOVERY_DELETE_BATCH]
-                retired += await storage.document_index.mark_documents_deleted(batch)
-                logger.info(
-                    "启动清理进度："
-                    f"已检查 {min(start + len(batch), total)}/{total}，"
-                    f"已标记 {retired} 个 ghost 节点"
-                )
-            logger.info(f"启动清理完成：标记 {retired} 个 ghost 节点为已删除")
+            # Absence in a scan is not deletion evidence. A second workspace,
+            # a partial mount or a transient read failure must never create
+            # authority-looking tombstones or erase a searchable projection.
+            logger.warning(
+                "Memory workspace recovery retained scan-absent documents: "
+                f"count={len(missing_node_ids)}; explicit deletion evidence required"
+            )
         orphaned = await storage.legacy_graph.prune_orphan_edges()
         if orphaned:
             logger.info(f"启动清理：删除 {orphaned} 条孤立边")
@@ -1046,6 +1195,9 @@ class LifeMemoryService:
         )
         if versioned:
             logger.info(f"启动扫描：记忆版本账本追加 {versioned} 个观察版本")
+        if projection_context is not None:
+            identity, binding, _permit = projection_context
+            await self._commit_workspace_projection_inventory(identity, binding)
 
     @staticmethod
     async def _refresh_artifact_head(
@@ -1073,59 +1225,39 @@ class LifeMemoryService:
         logical_key: str,
         content: str,
         source_mtime: float | None,
-        deleted: bool,
         current_version: MemoryArtifactVersion | None,
         current_head: ArtifactHead | None,
     ) -> bool:
         for attempt in range(2):
-            if deleted:
-                if current_version is None or (
-                    current_version.artifact_kind
-                    == "workspace_memory_document_tombstone"
-                ):
-                    return False
-                artifact_kind = "workspace_memory_document_tombstone"
-                observed_content = ""
-                observation = "startup_observed_deletion"
-                predicate = "workspace_deletion_observed"
-                reason = "启动时观察到记忆文件已不存在"
-                valid_from = ""
-                metadata: dict[str, Any] = {"observation": observation}
-            else:
-                if current_version is not None and (
-                    current_version.artifact_kind == "workspace_memory_document"
-                    and current_version.content == content
-                ):
-                    return False
-                artifact_kind = "workspace_memory_document"
-                observed_content = content
-                observation = (
-                    "startup_baseline"
-                    if current_version is None
-                    else "startup_observed_change"
-                )
-                predicate = "workspace_change_observed"
-                reason = "启动时观察到工作区内容与已知版本不同"
-                valid_from = (
-                    datetime.fromtimestamp(source_mtime).astimezone().isoformat()
-                    if source_mtime is not None
-                    else ""
-                )
-                metadata = {
-                    "observation": observation,
-                    "source_mtime": source_mtime,
-                }
+            if current_version is not None and (
+                current_version.artifact_kind == "workspace_memory_document"
+                and current_version.content == content
+            ):
+                return False
+            observation = (
+                "startup_baseline"
+                if current_version is None
+                else "startup_observed_change"
+            )
+            valid_from = (
+                datetime.fromtimestamp(source_mtime).astimezone().isoformat()
+                if source_mtime is not None
+                else ""
+            )
             version = new_artifact_version(
                 logical_key=logical_key,
-                artifact_kind=artifact_kind,
-                content=observed_content,
+                artifact_kind="workspace_memory_document",
+                content=content,
                 parent_artifact_ids=(current_version.artifact_id,)
                 if current_version is not None
                 else (),
                 authored_by="workspace_reconciler",
                 consciousness_instance_id="life_engine",
                 valid_from=valid_from,
-                metadata=metadata,
+                metadata={
+                    "observation": observation,
+                    "source_mtime": source_mtime,
+                },
             )
             derivations: tuple[MemoryDerivation, ...] = ()
             if current_version is not None:
@@ -1134,8 +1266,8 @@ class LifeMemoryService:
                         derivation_id=f"derivation_{uuid.uuid4().hex}",
                         generated_artifact_id=version.artifact_id,
                         used_artifact_id=current_version.artifact_id,
-                        predicate=predicate,
-                        reason=reason,
+                        predicate="workspace_change_observed",
+                        reason="启动时观察到工作区内容与已知版本不同",
                         actor="workspace_reconciler",
                         recorded_at=version.recorded_at,
                     ),
@@ -1167,13 +1299,13 @@ class LifeMemoryService:
         loaded: dict[str, tuple[str, float]],
         workspace_paths: set[str],
     ) -> int:
+        del workspace_paths  # Scan absence is not an authorized deletion event.
         living = self._require_memory_storage().living
         head_records = await living.list_artifact_heads()
         heads = {version.logical_key: (version, head) for version, head in head_records}
-        missing_heads = [key for key in heads if key not in workspace_paths]
         progress = self._startup_recovery_progress
         progress.phase = "artifact_versions"
-        progress.artifact_total = len(loaded) + len(missing_heads)
+        progress.artifact_total = len(loaded)
         appended = 0
         for logical_key, (content, source_mtime) in loaded.items():
             current = heads.get(logical_key)
@@ -1183,7 +1315,6 @@ class LifeMemoryService:
                     logical_key=logical_key,
                     content=content,
                     source_mtime=source_mtime,
-                    deleted=False,
                     current_version=current[0] if current is not None else None,
                     current_head=current[1] if current is not None else None,
                 )
@@ -1197,27 +1328,6 @@ class LifeMemoryService:
                     f"{progress.artifact_total} appended={appended}"
                 )
 
-        for logical_key in missing_heads:
-            current_version, current_head = heads[logical_key]
-            appended += int(
-                await self._append_workspace_observation(
-                    living=living,
-                    logical_key=logical_key,
-                    content="",
-                    source_mtime=None,
-                    deleted=True,
-                    current_version=current_version,
-                    current_head=current_head,
-                )
-            )
-            progress.artifact_processed += 1
-            progress.artifact_versions_appended = appended
-            if progress.artifact_processed % 64 == 0:
-                logger.debug(
-                    "Memory artifact recovery progress: "
-                    f"artifacts={progress.artifact_processed}/"
-                    f"{progress.artifact_total} appended={appended}"
-                )
         return appended
 
     async def _reconcile_workspace_artifact_versions(
@@ -1395,6 +1505,8 @@ class LifeMemoryService:
             finally:
                 self._initialized = False
                 self._closing = False
+                self._workspace_projection_binding = None
+                self._workspace_projection_permit = None
                 self._clear_cached_collections()
 
     def _clear_cached_collections(self) -> None:
@@ -1427,14 +1539,22 @@ class LifeMemoryService:
 
     async def delete_document(self, path: str) -> bool:
         """删除文档及其 SQLite 索引、分块和 outbox 记录。"""
-        return await self._require_memory_storage().document_index.delete_document(path)
+        storage = self._require_memory_storage()
+        if storage.backend == BackendKind.MYSQL:
+            raise WorkspaceProjectionDeleteEvidenceError(
+                "selected workspace deletion requires an occurrence-bound "
+                "audited deletion port"
+            )
+        return await storage.document_index.delete_document(path)
 
     async def move_document(self, old_path: str, new_path: str) -> bool:
         """移动文档索引；目标已有节点时明确拒绝合并。"""
-        return await self._require_memory_storage().document_index.move_document(
-            old_path,
-            new_path,
-        )
+        storage = self._require_memory_storage()
+        if storage.backend == BackendKind.MYSQL:
+            raise WorkspaceProjectionDeleteEvidenceError(
+                "selected workspace moves require an occurrence-bound audited port"
+            )
+        return await storage.document_index.move_document(old_path, new_path)
 
     async def enqueue_index_job(self, node_id: str, content_hash: str) -> str:
         """加入一个待处理索引任务，不触发 embedding 或网络请求。"""

@@ -102,6 +102,14 @@ from ...memory.worker import (
     chunk_collection_metadata,
     chunk_collection_name,
 )
+from ...memory.workspace_projection_identity import (
+    WorkspaceProjectionBinding,
+    WorkspaceProjectionBindingConflict,
+    WorkspaceProjectionEventKind,
+    WorkspaceProjectionOwnershipEvent,
+    WorkspaceProjectionRevisionConflict,
+    WorkspaceProjectionTransition,
+)
 from ..contracts import StorageBackendRuntime
 from ..models import BackendKind, StorageAvailability
 from .contracts import MemoryStorageBundle
@@ -146,6 +154,19 @@ _MYSQL_MEMORY_READINESS_REQUIREMENTS: dict[
             "node_id",
             "chunk_id",
             "consumed_at",
+        ),
+        "memory_workspace_projection_events": (
+            "event_sha256",
+            "storage_generation_id",
+            "revision",
+            "payload_sha256",
+        ),
+        "memory_workspace_projection_heads": (
+            "storage_generation_id",
+            "projection_generation_id",
+            "owner_id",
+            "revision",
+            "last_event_sha256",
         ),
     },
     "experiences": {
@@ -509,6 +530,227 @@ class _MySQLPort:
         return True
 
 
+def _workspace_projection_binding_from_row(row: Any) -> WorkspaceProjectionBinding:
+    return WorkspaceProjectionBinding(
+        storage_generation_id=str(row["storage_generation_id"]),
+        projection_generation_id=str(row["projection_generation_id"]),
+        owner_id=str(row["owner_id"]),
+        workspace_root_sha256=str(row["workspace_root_sha256"]),
+        source_root_sha256=str(row["source_root_sha256"]),
+        eligible_inventory_sha256=str(row["eligible_inventory_sha256"]),
+        revision=int(row["revision"]),
+        last_event_sha256=str(row["last_event_sha256"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _workspace_projection_event_from_row(
+    row: Any,
+) -> WorkspaceProjectionOwnershipEvent:
+    return WorkspaceProjectionOwnershipEvent(
+        event_kind=WorkspaceProjectionEventKind(str(row["event_kind"])),
+        storage_generation_id=str(row["storage_generation_id"]),
+        projection_generation_id=str(row["projection_generation_id"]),
+        previous_projection_generation_id=str(
+            row["previous_projection_generation_id"] or ""
+        ),
+        owner_id=str(row["owner_id"]),
+        previous_owner_id=str(row["previous_owner_id"] or ""),
+        workspace_root_sha256=str(row["workspace_root_sha256"]),
+        previous_workspace_root_sha256=str(
+            row["previous_workspace_root_sha256"] or ""
+        ),
+        source_root_sha256=str(row["source_root_sha256"]),
+        eligible_inventory_sha256=str(row["eligible_inventory_sha256"]),
+        revision=int(row["revision"]),
+        expected_revision=int(row["expected_revision"]),
+        actor_id=str(row["actor_id"]),
+        audit_occurrence_id=str(row["audit_occurrence_id"]),
+        reason_code=str(row["reason_code"]),
+        occurred_at=str(row["occurred_at"]),
+        previous_event_sha256=str(row["previous_event_sha256"] or ""),
+    )
+
+
+class MySQLWorkspaceProjectionBindingStore(_MySQLPort):
+    """Persist one generation-scoped workspace owner and immutable audit chain."""
+
+    async def load_binding(
+        self,
+        storage_generation_id: str,
+    ) -> WorkspaceProjectionBinding | None:
+        assert self.runtime.engine is not None
+        async with self.runtime.engine.connect() as connection:
+            row = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT * FROM memory_workspace_projection_heads "
+                            "WHERE storage_generation_id = :generation_id"
+                        ),
+                        {"generation_id": str(storage_generation_id)},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        return (
+            _workspace_projection_binding_from_row(row)
+            if row is not None
+            else None
+        )
+
+    async def commit_transition(
+        self,
+        transition: WorkspaceProjectionTransition,
+    ) -> WorkspaceProjectionBinding:
+        event = transition.event
+        binding = transition.binding
+        if event.event_kind == WorkspaceProjectionEventKind.GENERATION_REBUILT:
+            raise WorkspaceProjectionBindingConflict(
+                "projection generation rebuild requires physically isolated rows"
+            )
+
+        async def _operation(session: AsyncSession) -> WorkspaceProjectionBinding:
+            current_row = (
+                (
+                    await session.execute(
+                        text(
+                            "SELECT * FROM memory_workspace_projection_heads "
+                            "WHERE storage_generation_id = :generation_id FOR UPDATE"
+                        ),
+                        {"generation_id": event.storage_generation_id},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            current = (
+                _workspace_projection_binding_from_row(current_row)
+                if current_row is not None
+                else None
+            )
+            if current is not None and (
+                current.revision == binding.revision
+                and current.last_event_sha256 == event.event_sha256
+            ):
+                return current
+            actual_revision = current.revision if current is not None else 0
+            actual_event = current.last_event_sha256 if current is not None else ""
+            if (
+                actual_revision != event.expected_revision
+                or actual_event != event.previous_event_sha256
+            ):
+                raise WorkspaceProjectionRevisionConflict(
+                    "workspace projection binding changed concurrently"
+                )
+
+            values = {
+                **event.to_dict(),
+                "event_sha256": event.event_sha256,
+                "payload_sha256": event.event_sha256,
+            }
+            await session.execute(
+                text(
+                    """INSERT INTO memory_workspace_projection_events (
+                        event_sha256, event_kind, storage_generation_id,
+                        projection_generation_id, previous_projection_generation_id,
+                        owner_id, previous_owner_id, workspace_root_sha256,
+                        previous_workspace_root_sha256, source_root_sha256,
+                        eligible_inventory_sha256, revision, expected_revision,
+                        actor_id, audit_occurrence_id, reason_code, occurred_at,
+                        previous_event_sha256, payload_sha256
+                    ) VALUES (
+                        :event_sha256, :event_kind, :storage_generation_id,
+                        :projection_generation_id, :previous_projection_generation_id,
+                        :owner_id, :previous_owner_id, :workspace_root_sha256,
+                        :previous_workspace_root_sha256, :source_root_sha256,
+                        :eligible_inventory_sha256, :revision, :expected_revision,
+                        :actor_id, :audit_occurrence_id, :reason_code, :occurred_at,
+                        :previous_event_sha256, :payload_sha256
+                    )"""
+                ),
+                values,
+            )
+            head_values = binding.safe_dict()
+            if current is None:
+                await session.execute(
+                    text(
+                        """INSERT INTO memory_workspace_projection_heads (
+                            storage_generation_id, projection_generation_id, owner_id,
+                            workspace_root_sha256, source_root_sha256,
+                            eligible_inventory_sha256, revision, last_event_sha256,
+                            updated_at
+                        ) VALUES (
+                            :storage_generation_id, :projection_generation_id, :owner_id,
+                            :workspace_root_sha256, :source_root_sha256,
+                            :eligible_inventory_sha256, :revision, :last_event_sha256,
+                            :updated_at
+                        )"""
+                    ),
+                    head_values,
+                )
+            else:
+                result = await session.execute(
+                    text(
+                        """UPDATE memory_workspace_projection_heads SET
+                            projection_generation_id = :projection_generation_id,
+                            owner_id = :owner_id,
+                            workspace_root_sha256 = :workspace_root_sha256,
+                            source_root_sha256 = :source_root_sha256,
+                            eligible_inventory_sha256 = :eligible_inventory_sha256,
+                            revision = :revision,
+                            last_event_sha256 = :last_event_sha256,
+                            updated_at = :updated_at
+                        WHERE storage_generation_id = :storage_generation_id
+                          AND revision = :expected_revision
+                          AND last_event_sha256 = :previous_event_sha256"""
+                    ),
+                    {
+                        **head_values,
+                        "expected_revision": event.expected_revision,
+                        "previous_event_sha256": event.previous_event_sha256,
+                    },
+                )
+                if result.rowcount != 1:
+                    raise WorkspaceProjectionRevisionConflict(
+                        "workspace projection head CAS failed"
+                    )
+            return binding
+
+        return await self._write(_operation)
+
+    async def list_events(
+        self,
+        storage_generation_id: str,
+        *,
+        after_revision: int = 0,
+        limit: int = 100,
+    ) -> tuple[WorkspaceProjectionOwnershipEvent, ...]:
+        assert self.runtime.engine is not None
+        async with self.runtime.engine.connect() as connection:
+            rows = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT * FROM memory_workspace_projection_events "
+                            "WHERE storage_generation_id = :generation_id "
+                            "AND revision > :after_revision "
+                            "ORDER BY revision LIMIT :limit"
+                        ),
+                        {
+                            "generation_id": str(storage_generation_id),
+                            "after_revision": max(0, int(after_revision)),
+                            "limit": _safe_limit(limit),
+                        },
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        return tuple(_workspace_projection_event_from_row(row) for row in rows)
+
+
 class MySQLDocumentIndexProjection(_MySQLPort):
     @staticmethod
     def _chunk_from_row(row: Any) -> DocumentChunk:
@@ -608,7 +850,14 @@ class MySQLDocumentIndexProjection(_MySQLPort):
 
         unchanged = bool(
             existing is not None
+            and not bool(existing.get("is_deleted"))
             and str(existing["content_hash"] or "") == content_hash
+            and str(existing["fts_content_hash"] or "") == content_hash
+            and (
+                not bool(existing["embedding_synced"])
+                or str(existing["embedding_content_hash"] or "") == content_hash
+            )
+            and not bool(existing["legacy_fts_present"])
             and str(existing["title"] or "") == str(title or "")
             and (
                 (existing["source_mtime"] is None and source_mtime is None)
@@ -645,11 +894,13 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                     """INSERT INTO memory_nodes (
                         node_id, node_type, file_path, file_path_sha256,
                         content_hash, document_content, title, created_at,
-                        updated_at, source_mtime, index_revision
+                        updated_at, source_mtime, index_revision, is_deleted,
+                        fts_content_hash, legacy_fts_present
                     ) VALUES (
                         :node_id, 'file', :file_path, :path_hash,
                         :content_hash, :content, :title, :now,
-                        :now, :source_mtime, :revision
+                        :now, :source_mtime, :revision, FALSE,
+                        :content_hash, FALSE
                     )"""
                 ),
                 {
@@ -670,7 +921,12 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                     """UPDATE memory_nodes SET content_hash = :content_hash,
                         document_content = :content, title = :title,
                         updated_at = :now, source_mtime = :source_mtime,
-                        embedding_synced = FALSE, index_revision = :revision
+                        embedding_synced = FALSE,
+                        embedding_content_hash = NULL,
+                        embedding_model = '', embedding_updated_at = NULL,
+                        index_revision = :revision, is_deleted = FALSE,
+                        fts_content_hash = :content_hash,
+                        legacy_fts_present = FALSE
                     WHERE node_id = :node_id AND index_revision = :previous_revision"""
                 ),
                 {
@@ -1196,10 +1452,14 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                 (
                     await connection.execute(
                         text(
-                            "SELECT tombstone_id, chunk_id "
-                            "FROM memory_vector_tombstones "
-                            "WHERE consumed_at IS NULL "
-                            "ORDER BY tombstone_id LIMIT :limit"
+                            "SELECT t.tombstone_id, t.chunk_id, "
+                            "EXISTS(SELECT 1 FROM memory_chunks c "
+                            "JOIN memory_nodes n ON n.node_id = c.node_id "
+                            "WHERE c.chunk_id = t.chunk_id "
+                            "AND COALESCE(n.is_deleted, FALSE) = FALSE) AS is_live "
+                            "FROM memory_vector_tombstones t "
+                            "WHERE t.consumed_at IS NULL "
+                            "ORDER BY t.tombstone_id LIMIT :limit"
                         ),
                         {"limit": _safe_limit(limit)},
                     )
@@ -1211,16 +1471,81 @@ class MySQLDocumentIndexProjection(_MySQLPort):
             return 0
         # 同一个 chunk_id 可能因多次文档替换/删除产生多条未消费墓碑；
         # 外部向量后端（Chroma）要求单批删除内 ID 唯一，重复会使整批失败。
-        # 先去重再删，删除成功后仍逐条确认每个原始 tombstone_id，避免重复墓碑永久堆积。
-        unique_ids = list(dict.fromkeys(str(row["chunk_id"]) for row in rows))
-        await _call_external(
-            delete_func,
-            ids=unique_ids,
+        # 内容寻址的 ID 也可能在文档复活后重新成为当前分块。这样的墓碑只需确认，
+        # 绝不能在新向量 upsert 完成后再次删除当前分块。
+        obsolete_ids = list(
+            dict.fromkeys(
+                str(row["chunk_id"])
+                for row in rows
+                if not bool(row["is_live"])
+            )
         )
+        if obsolete_ids:
+            await _call_external(
+                delete_func,
+                ids=obsolete_ids,
+            )
 
         async def _operation(session: AsyncSession) -> int:
             changed = 0
             consumed_at = time.time()
+            if obsolete_ids:
+                revived_query = text(
+                    "SELECT n.node_id, n.content_hash, n.index_revision "
+                    "FROM memory_chunks c "
+                    "JOIN memory_nodes n ON n.node_id = c.node_id "
+                    "WHERE c.chunk_id IN :chunk_ids "
+                    "AND COALESCE(n.is_deleted, FALSE) = FALSE FOR UPDATE"
+                ).bindparams(bindparam("chunk_ids", expanding=True))
+                revived_rows = (
+                    (
+                        await session.execute(
+                            revived_query,
+                            {"chunk_ids": obsolete_ids},
+                        )
+                    )
+                    .mappings()
+                    .all()
+                )
+                seen_nodes: set[str] = set()
+                for revived in revived_rows:
+                    node_id = str(revived["node_id"] or "")
+                    content_hash = str(revived["content_hash"] or "")
+                    revision = int(revived["index_revision"] or 0)
+                    if (
+                        not node_id
+                        or node_id in seen_nodes
+                        or not content_hash
+                        or revision <= 0
+                    ):
+                        continue
+                    seen_nodes.add(node_id)
+                    result = await session.execute(
+                        text(
+                            "UPDATE memory_nodes SET embedding_synced = FALSE, "
+                            "embedding_content_hash = NULL, embedding_model = '', "
+                            "embedding_updated_at = NULL WHERE node_id = :node_id "
+                            "AND content_hash = :content_hash "
+                            "AND index_revision = :revision"
+                        ),
+                        {
+                            "node_id": node_id,
+                            "content_hash": content_hash,
+                            "revision": revision,
+                        },
+                    )
+                    if result.rowcount != 1:
+                        continue
+                    await session.execute(
+                        _UPSERT_INDEX_JOB,
+                        {
+                            "job_id": f"{node_id}:{content_hash}",
+                            "node_id": node_id,
+                            "content_hash": content_hash,
+                            "now": consumed_at,
+                            "revision": revision,
+                        },
+                    )
             for row in rows:
                 result = await session.execute(
                     text(
@@ -1424,7 +1749,10 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                         """UPDATE memory_index_jobs j
                         JOIN memory_nodes n ON n.node_id = j.node_id
                         SET j.status = 'completed', j.updated_at = :now, j.error = '',
-                            n.embedding_synced = TRUE
+                            n.embedding_synced = TRUE,
+                            n.embedding_content_hash = :content_hash,
+                            n.embedding_model = :model_name,
+                            n.embedding_updated_at = :now
                         WHERE j.job_id = :job_id AND j.status = 'processing'
                           AND j.content_hash = :content_hash
                           AND j.index_revision = :revision
@@ -1436,6 +1764,7 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                         "job_id": job.job_id,
                         "content_hash": job.content_hash,
                         "revision": job.index_revision,
+                        "model_name": model_name,
                     },
                 )
                 if result.rowcount == 1:
@@ -3922,6 +4251,18 @@ def _node_from_row(row: Any) -> MemoryNode:
         created_at=float(row["created_at"]),
         updated_at=float(row["updated_at"]),
         embedding_synced=bool(row["embedding_synced"]),
+        fts_content_hash=(
+            str(row["fts_content_hash"])
+            if row.get("fts_content_hash") is not None
+            else None
+        ),
+        embedding_content_hash=(
+            str(row["embedding_content_hash"])
+            if row.get("embedding_content_hash") is not None
+            else None
+        ),
+        embedding_model=str(row.get("embedding_model") or ""),
+        legacy_fts_present=bool(row.get("legacy_fts_present")),
     )
 
 
@@ -5194,6 +5535,7 @@ def create_mysql_memory_storage_bundle(
         living=MySQLLivingMemoryStore(runtime),
         epistemic=MySQLEpistemicMemoryStore(runtime),
         legacy_graph=MySQLLegacyGraphStore(runtime, document_index),
+        workspace_projection=MySQLWorkspaceProjectionBindingStore(runtime),
     )
 
 
@@ -5206,6 +5548,7 @@ __all__ = [
     "MySQLLivingMemoryStore",
     "MySQLMemoryReadinessProbeError",
     "MySQLWitnessLedgerStore",
+    "MySQLWorkspaceProjectionBindingStore",
     "create_mysql_memory_storage_bundle",
     "inspect_mysql_memory_readiness",
 ]

@@ -18,6 +18,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from .eligibility import assess_indexed_document_path
 from .indexing import (
     IndexJob,
+    _enqueue_index_job_in_transaction,
     claim_index_jobs,
     read_active_chunk_index_state,
     transaction,
@@ -189,15 +190,41 @@ def _tombstone_table_exists(db: sqlite3.Connection) -> bool:
     return row is not None
 
 
-def _read_pending_tombstones(db: sqlite3.Connection, *, limit: int) -> list[str]:
-    """Return up to *limit* chunk_ids awaiting Chroma deletion."""
+def _read_pending_tombstones(
+    db: sqlite3.Connection,
+    *,
+    limit: int,
+) -> tuple[list[str], list[str]]:
+    """Partition pending tombstones into obsolete and currently live IDs.
+
+    A document can be deleted and later revived with the same content.  Chunk
+    IDs are content-addressed, so an old tombstone may then name the exact
+    current chunk.  Deleting it after the replacement vector was upserted
+    would make the SQL projection claim success while Chroma silently lost the
+    vector.  Live IDs are therefore acknowledged without an external delete.
+    """
     if not _tombstone_table_exists(db):
-        return []
+        return [], []
     rows = db.execute(
         "SELECT chunk_id FROM memory_vector_tombstones ORDER BY created_at LIMIT ?",
         (max(0, int(limit)),),
     ).fetchall()
-    return [str(row[0]) for row in rows if row[0]]
+    chunk_ids = list(dict.fromkeys(str(row[0]) for row in rows if row[0]))
+    if not chunk_ids:
+        return [], []
+    placeholders = ",".join("?" for _ in chunk_ids)
+    live_rows = db.execute(
+        "SELECT c.chunk_id FROM memory_chunks c "
+        "JOIN memory_nodes n ON n.node_id = c.node_id "
+        f"WHERE c.chunk_id IN ({placeholders}) "
+        "AND COALESCE(n.is_deleted, 0) = 0",
+        chunk_ids,
+    ).fetchall()
+    live = {str(row[0]) for row in live_rows if row[0]}
+    return (
+        [chunk_id for chunk_id in chunk_ids if chunk_id not in live],
+        [chunk_id for chunk_id in chunk_ids if chunk_id in live],
+    )
 
 
 def _remove_processed_tombstones(
@@ -632,30 +659,67 @@ async def consume_vector_tombstones(
     """Delete superseded chunk vectors from Chroma and clear tombstone records."""
     if collection is None:
         return 0
-    chunk_ids = await _db_call(_read_pending_tombstones, db, limit=limit)
-    if not chunk_ids:
+    obsolete_ids, live_ids = await _db_call(
+        _read_pending_tombstones,
+        db,
+        limit=limit,
+    )
+    if not obsolete_ids and not live_ids:
         return 0
 
     delete_func = getattr(collection, "delete", None)
     if not callable(delete_func):
         return 0
 
-    try:
-        await _call_external(delete_func, ids=chunk_ids)
-    except Exception as exc:  # noqa: BLE001
-        import logging
+    if obsolete_ids:
+        try:
+            await _call_external(delete_func, ids=obsolete_ids)
+        except Exception as exc:  # noqa: BLE001
+            import logging
 
-        logging.getLogger("life_engine.memory.worker").warning(
-            f"向量 tombstone 清理失败 ({len(chunk_ids)} ids): {type(exc).__name__}: {exc}"
-        )
-        return 0
+            logging.getLogger("life_engine.memory.worker").warning(
+                "向量 tombstone 清理失败 "
+                f"({len(obsolete_ids)} ids): {type(exc).__name__}: {exc}"
+            )
+            return 0
 
     def _clear(db_: sqlite3.Connection) -> None:
         with transaction(db_):
-            _remove_processed_tombstones(db_, chunk_ids)
+            if obsolete_ids:
+                placeholders = ",".join("?" for _ in obsolete_ids)
+                revived_rows = db_.execute(
+                    "SELECT DISTINCT n.node_id, n.content_hash, n.index_revision "
+                    "FROM memory_chunks c "
+                    "JOIN memory_nodes n ON n.node_id = c.node_id "
+                    f"WHERE c.chunk_id IN ({placeholders}) "
+                    "AND COALESCE(n.is_deleted, 0) = 0",
+                    obsolete_ids,
+                ).fetchall()
+                requeue_at = time.time()
+                for row in revived_rows:
+                    node_id = str(row[0] or "")
+                    content_hash = str(row[1] or "")
+                    revision = int(row[2] or 0)
+                    if not node_id or not content_hash or revision <= 0:
+                        continue
+                    db_.execute(
+                        "UPDATE memory_nodes SET embedding_synced = 0, "
+                        "embedding_content_hash = NULL, embedding_model = NULL, "
+                        "embedding_updated_at = NULL WHERE node_id = ? "
+                        "AND content_hash = ? AND index_revision = ?",
+                        (node_id, content_hash, revision),
+                    )
+                    _enqueue_index_job_in_transaction(
+                        db_,
+                        node_id,
+                        content_hash,
+                        now=requeue_at,
+                        index_revision=revision,
+                    )
+            _remove_processed_tombstones(db_, [*obsolete_ids, *live_ids])
 
     await _db_call(_clear, db)
-    return len(chunk_ids)
+    return len(obsolete_ids) + len(live_ids)
 
 
 async def process_index_jobs(

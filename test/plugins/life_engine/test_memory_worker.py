@@ -730,6 +730,89 @@ async def test_consume_tombstones_calls_collection_delete(tmp_path: Path) -> Non
     assert rows == []
 
 
+async def test_consume_tombstones_keeps_revived_content_addressed_chunks(
+    tmp_path: Path,
+) -> None:
+    """An old delete marker must not erase the same live chunk after revival."""
+    from plugins.life_engine.memory.indexing import delete_document_rows
+    from plugins.life_engine.memory.worker import consume_vector_tombstones
+
+    db = _db(tmp_path)
+    path = "notes/revived.md"
+    content = "the exact memory returned without changing its body"
+    upsert_document_rows(db, path, content, "Revived")
+    live_ids = {
+        str(row["chunk_id"])
+        for row in db.execute("SELECT chunk_id FROM memory_chunks").fetchall()
+    }
+    assert live_ids
+    delete_document_rows(db, path)
+    upsert_document_rows(db, path, content, "Revived")
+
+    deleted_ids: list[str] = []
+
+    class FakeCollection:
+        def delete(self, *, ids: list[str]) -> None:
+            deleted_ids.extend(ids)
+
+    cleared = await consume_vector_tombstones(db, FakeCollection())
+
+    assert cleared == len(live_ids)
+    assert deleted_ids == []
+    assert db.execute(
+        "SELECT COUNT(*) FROM memory_vector_tombstones"
+    ).fetchone()[0] == 0
+
+
+async def test_tombstone_delete_requeues_a_chunk_revived_during_external_io(
+    tmp_path: Path,
+) -> None:
+    """A revival racing with external delete is re-enqueued after revalidation."""
+    from plugins.life_engine.memory.indexing import delete_document_rows
+    from plugins.life_engine.memory.worker import consume_vector_tombstones
+
+    db = _db(tmp_path)
+    path = "notes/racing-revival.md"
+    content = "the same content becomes live while Chroma deletion is in flight"
+    upsert_document_rows(db, path, content, "Racing revival")
+    delete_document_rows(db, path)
+
+    class RacingCollection:
+        async def delete(self, *, ids: list[str]) -> None:
+            assert ids
+            revived = upsert_document_rows(db, path, content, "Racing revival")
+            db.execute(
+                "UPDATE memory_nodes SET embedding_synced = 1, "
+                "embedding_content_hash = content_hash, embedding_model = 'race/model' "
+                "WHERE node_id = ?",
+                (revived.node_id,),
+            )
+            db.execute(
+                "UPDATE memory_index_jobs SET status = 'completed' WHERE node_id = ?",
+                (revived.node_id,),
+            )
+            db.commit()
+
+    cleared = await consume_vector_tombstones(db, RacingCollection())
+
+    assert cleared > 0
+    node = db.execute(
+        "SELECT node_id, embedding_synced, embedding_content_hash FROM memory_nodes "
+        "WHERE file_path = ?",
+        (path,),
+    ).fetchone()
+    assert node is not None
+    assert (node["embedding_synced"], node["embedding_content_hash"]) == (0, None)
+    job = db.execute(
+        "SELECT status FROM memory_index_jobs WHERE node_id = ?",
+        (node["node_id"],),
+    ).fetchone()
+    assert job is not None and job["status"] == "pending"
+    assert db.execute(
+        "SELECT COUNT(*) FROM memory_vector_tombstones"
+    ).fetchone()[0] == 0
+
+
 async def test_consume_tombstones_handles_collection_delete_error(tmp_path: Path) -> None:
     """consume_vector_tombstones swallows collection.delete errors gracefully."""
     from plugins.life_engine.memory.indexing import delete_document_rows

@@ -360,7 +360,7 @@ async def test_service_restart_restores_persisted_chunk_collection_and_close_is_
     await restored.close()
 
 
-async def test_startup_reconciliation_versions_external_changes_and_deletion(
+async def test_startup_reconciliation_versions_external_changes_and_scan_absence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -399,10 +399,8 @@ async def test_startup_reconciliation_versions_external_changes_and_deletion(
     assert [item.content for item in history] == [
         "old understanding",
         "new understanding",
-        "",
     ]
-    assert history[-1].artifact_kind == "workspace_memory_document_tombstone"
-    assert history[-1].metadata["observation"] == "startup_observed_deletion"
+    assert history[-1].artifact_kind == "workspace_memory_document"
     await third.close()
 
 
@@ -499,9 +497,8 @@ async def test_startup_reconciliation_reparents_after_concurrent_head(
         await service.close()
 
 
-async def test_startup_reconciliation_absorbs_concurrent_tombstone(
+async def test_startup_reconciliation_does_not_infer_tombstone_from_absence(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     note = tmp_path / "notes" / "concurrent.md"
     note.parent.mkdir(parents=True)
@@ -511,29 +508,6 @@ async def test_startup_reconciliation_absorbs_concurrent_tombstone(
     note.unlink()
     try:
         living = service._require_memory_storage().living
-        original = living.append_artifact
-        raced = False
-
-        async def _race_once(*args: Any, **kwargs: Any) -> Any:
-            nonlocal raced
-            if not raced:
-                raced = True
-                head = await living.get_artifact_head("notes/concurrent.md")
-                assert head is not None
-                concurrent = new_artifact_version(
-                    logical_key="notes/concurrent.md",
-                    artifact_kind="workspace_memory_document_tombstone",
-                    content="",
-                    parent_artifact_ids=(head.artifact_id,),
-                    authored_by="concurrent_writer",
-                )
-                await original(
-                    concurrent,
-                    expected_head_revision=head.revision,
-                )
-            return await original(*args, **kwargs)
-
-        monkeypatch.setattr(living, "append_artifact", _race_once)
         appended = await service._reconcile_workspace_artifact_versions_via_ports(
             {},
             set(),
@@ -541,8 +515,8 @@ async def test_startup_reconciliation_absorbs_concurrent_tombstone(
         history = await living.list_artifact_history("notes/concurrent.md")
 
         assert appended == 0
-        assert history[-1].artifact_kind == "workspace_memory_document_tombstone"
-        assert len(history) == 2
+        assert history[-1].artifact_kind == "workspace_memory_document"
+        assert len(history) == 1
     finally:
         await service.close()
 
@@ -906,7 +880,9 @@ async def test_startup_recovery_refreshes_externally_changed_document(tmp_path: 
     assert versions == 2
 
 
-async def test_startup_recovery_revives_reappeared_document(tmp_path: Path) -> None:
+async def test_startup_recovery_survives_transient_absence_then_refreshes(
+    tmp_path: Path,
+) -> None:
     service = _make_service(tmp_path)
     await service.initialize()
     path = tmp_path / "notes" / "reappeared.md"
@@ -920,7 +896,7 @@ async def test_startup_recovery_revives_reappeared_document(tmp_path: Path) -> N
         "SELECT is_deleted FROM memory_nodes WHERE file_path = ?",
         ("notes/reappeared.md",),
     ).fetchone()
-    assert deleted["is_deleted"] == 1
+    assert deleted["is_deleted"] == 0
 
     path.write_text("returned body", encoding="utf-8")
     await service._startup_recovery()
@@ -932,8 +908,8 @@ async def test_startup_recovery_revives_reappeared_document(tmp_path: Path) -> N
     assert revived["content_hash"] == compute_content_hash("returned body")
 
 
-async def test_startup_recovery_marks_ghost_nodes_as_deleted(tmp_path: Path) -> None:
-    """索引里有但工作区已删除的文件，应被标记为 is_deleted=1。"""
+async def test_startup_recovery_retains_scan_absent_nodes(tmp_path: Path) -> None:
+    """A scan miss alone is not immutable evidence of document deletion."""
     service = _make_service(tmp_path)
     await service.initialize()
 
@@ -961,10 +937,10 @@ async def test_startup_recovery_marks_ghost_nodes_as_deleted(tmp_path: Path) -> 
         "SELECT is_deleted FROM memory_nodes WHERE node_id = ?", (ghost_node_id,)
     ).fetchone()
     assert row is not None, "ghost 节点应保留在表中"
-    assert row["is_deleted"] == 1, "ghost 节点应被标记为已删除"
+    assert row["is_deleted"] == 0
 
 
-async def test_startup_recovery_batches_ghost_node_projection_repairs(
+async def test_startup_recovery_never_batches_scan_absence_as_deletion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -996,11 +972,11 @@ async def test_startup_recovery_batches_ghost_node_projection_repairs(
 
     await service._startup_recovery()
 
-    assert batch_sizes == [64, 64, 2]
+    assert batch_sizes == []
     deleted = service._db.execute(
         "SELECT COUNT(*) FROM memory_nodes WHERE COALESCE(is_deleted, FALSE) = TRUE"
     ).fetchone()[0]
-    assert deleted == ghost_count
+    assert deleted == 0
 
 
 async def test_startup_recovery_deletes_orphan_edges(tmp_path: Path) -> None:

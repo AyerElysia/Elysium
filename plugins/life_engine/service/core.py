@@ -9315,6 +9315,7 @@ class LifeEngineService(BaseService):
         """独立运行 chunk 向量索引，每轮最多处理一批。"""
         options = self._memory_index_options()
         interval = int(options["interval_seconds"])
+        batch_size = max(1, int(options["batch_size"]))
         run_immediately = bool(options["run_on_startup"])
         retry_failed_once = bool(options["retry_failed"])
 
@@ -9335,9 +9336,10 @@ class LifeEngineService(BaseService):
                 if not self._state.running or self._memory_service is None:
                     break
 
+                continue_catchup = False
                 try:
                     report = await self._memory_service.run_index_worker(
-                        limit=int(options["batch_size"]),
+                        limit=batch_size,
                         retry_failed=retry_failed_once,
                         reclaim_after=float(options["reclaim_after_seconds"]),
                     )
@@ -9357,6 +9359,19 @@ class LifeEngineService(BaseService):
                     # 多写者：推进本节点记忆索引投影进度（frontier 严格 +1）。
                     # 每个节点的 Chroma/FTS 是本地投影，进度行由该节点独占推进。
                     await self._advance_memory_projection(report)
+                    # A full, successful batch proves that the bounded outbox may
+                    # still contain work. Continue after one cooperative yield
+                    # instead of imposing the steady-state polling interval on
+                    # every recovery batch. Any failure or incomplete claim
+                    # restores normal backoff, so an unhealthy provider is never
+                    # hammered; stale jobs count only after safe consumption.
+                    completed_count = len(report.completed)
+                    stale_count = len(report.stale)
+                    continue_catchup = bool(
+                        report.claimed >= batch_size
+                        and not report.failed
+                        and completed_count + stale_count >= report.claimed
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001
@@ -9365,6 +9380,9 @@ class LifeEngineService(BaseService):
 
                 if self._stop_event is not None and self._stop_event.is_set():
                     break
+                if continue_catchup:
+                    run_immediately = True
+                    await asyncio.sleep(0)
         except asyncio.CancelledError:
             raise
         finally:

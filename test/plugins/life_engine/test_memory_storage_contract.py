@@ -128,7 +128,7 @@ def test_memory_characterization_is_ordered_and_engineering_only() -> None:
 
 
 def test_mysql_memory_migrations_are_explicit_and_ordered() -> None:
-    assert MEMORY_SCHEMA_VERSION == 8
+    assert MEMORY_SCHEMA_VERSION == 9
     assert tuple(item.version for item in MEMORY_MIGRATIONS) == (
         1,
         2,
@@ -138,6 +138,7 @@ def test_mysql_memory_migrations_are_explicit_and_ordered() -> None:
         6,
         7,
         8,
+        9,
     )
     ddl = "\n".join(
         statement
@@ -151,6 +152,8 @@ def test_mysql_memory_migrations_are_explicit_and_ordered() -> None:
         "memory_artifact_versions",
         "memory_claims",
         "memory_edges",
+        "memory_workspace_projection_events",
+        "memory_workspace_projection_heads",
     ):
         assert f"CREATE TABLE IF NOT EXISTS {table}" in ddl
     for column in (
@@ -399,8 +402,16 @@ async def test_memory_immutability_verifier_detects_trigger_drift() -> None:
                         }
                     )
                 return _Result(rows)
-            migration = MEMORY_IMMUTABILITY_MIGRATIONS[0]
-            return _Result([{"name": migration.name, "checksum": migration.checksum}])
+            return _Result(
+                [
+                    {
+                        "version": str(migration.version),
+                        "name": migration.name,
+                        "checksum": migration.checksum,
+                    }
+                    for migration in MEMORY_IMMUTABILITY_MIGRATIONS
+                ]
+            )
 
     class _ConnectionContext:
         async def __aenter__(self) -> _Connection:

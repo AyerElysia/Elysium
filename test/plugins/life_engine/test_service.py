@@ -1468,6 +1468,47 @@ async def test_memory_index_loop_survives_provider_failure(
     assert fake_memory.run_calls == 2
 
 
+async def test_memory_index_loop_drains_full_batches_without_poll_delay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _make_service(tmp_path)
+    service._state.running = True
+    service._stop_event = asyncio.Event()
+
+    class BackloggedMemory(_FakeMemoryIndexService):
+        async def run_index_worker(self, **_: object) -> object:
+            self.run_calls += 1
+            if self.run_calls == 1:
+                return SimpleNamespace(
+                    claimed=2,
+                    completed=("job-1", "job-2"),
+                    failed=(),
+                    stale=(),
+                )
+            service._stop_event.set()
+            return SimpleNamespace(claimed=0, completed=(), failed=(), stale=())
+
+    fake_memory = BackloggedMemory()
+    service._memory_service = fake_memory  # type: ignore[assignment]
+    monkeypatch.setattr(
+        service,
+        "_memory_index_options",
+        lambda: {
+            "enabled": True,
+            "interval_seconds": 3600,
+            "batch_size": 2,
+            "run_on_startup": True,
+            "retry_failed": False,
+            "reclaim_after_seconds": 60,
+        },
+    )
+
+    await asyncio.wait_for(service._memory_index_loop(), timeout=1.0)
+
+    assert fake_memory.run_calls == 2
+
+
 async def test_advance_memory_projection_builds_digest_and_advances(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
