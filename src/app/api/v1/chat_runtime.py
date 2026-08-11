@@ -13,7 +13,7 @@ from .chat_commands import (
     ChatTargetResolver,
     ProviderFacadeRegistry,
 )
-from .chat_platforms import FeishuChatFacade, NapCatChatFacade
+from .chat_platforms import AylaChatFacade, FeishuChatFacade, NapCatChatFacade
 from .media_contracts import ManagedMediaResolver
 
 
@@ -39,6 +39,7 @@ def create_chat_command_service(
                 "qq": NapCatChatFacade(
                     _LateBoundNapCatClient(adapter_manager_provider or _adapter_manager)
                 ),
+                "ayla": AylaChatFacade(),
             }
         ),
     )

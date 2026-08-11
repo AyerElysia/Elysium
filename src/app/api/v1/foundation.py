@@ -93,6 +93,7 @@ _KNOWN_ADAPTER_PLUGINS = {
     "feishu_adapter": "feishu",
     "napcat_adapter": "qq",
     "neko_surface": "neko",
+    "ayla_adapter": "ayla",
 }
 _REQUIRED_LOCAL_COMPONENTS = {"api", "life_event_ledger"}
 

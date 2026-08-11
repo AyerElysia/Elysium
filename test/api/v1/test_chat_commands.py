@@ -20,6 +20,7 @@ from src.app.api.v1.chat_commands import (
     ProviderFacadeRegistry,
 )
 from src.app.api.v1.chat_runtime import create_chat_command_service
+from src.app.api.v1.chat_platforms import AylaChatFacade
 from src.app.api.v1.schemas.chat_commands import MessagePart
 from src.core.models.media import MediaAttachment, MediaSegmentType
 from src.kernel.commands import CommandRecord, CommandStatus, HandlerRegistry
@@ -455,6 +456,43 @@ async def test_cross_provider_forward_is_rejected_without_provider_call() -> Non
     assert outcome.error_code == "capability_disabled"
     provider.perform.assert_not_awaited()
 
+
+@pytest.mark.asyncio
+async def test_ayla_provider_action_is_capability_disabled() -> None:
+    """Ayla 命令操作由应用内处理；Elysium 命令端点以 capability_disabled 拒绝。"""
+
+    class AylaTargets(_Targets):
+        async def resolve_message(self, message_id, actor_id, authorization):
+            return ChatTarget(
+                "stream-ayla",
+                "ayla",
+                "private",
+                "ayla_adapter:adapter:ayla_adapter",
+                provider_message_id="provider-1",
+                message_direction="delivered",
+                message_actor_id="actor-1",
+            )
+
+    service = create_chat_command_service(
+        AylaTargets(),
+        message_sender=SimpleNamespace(send_message=AsyncMock()),
+    )
+    outcome = await service.handle(
+        _command(
+            ChatAction.RECALL,
+            target={"message_id": "public-1"},
+        )
+    )
+    assert outcome.status is CommandStatus.REJECTED
+    assert outcome.error_code == "capability_disabled"
+
+
+def test_ayla_facade_capabilities_are_all_disabled() -> None:
+    facade = AylaChatFacade()
+    assert facade.platform == "ayla"
+    assert all(not supported for supported in facade.capabilities().values())
+    for action in ChatAction:
+        assert facade.capabilities()[action] is False
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("platform", ["feishu", "qq"])

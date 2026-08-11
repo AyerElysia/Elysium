@@ -216,6 +216,32 @@ class NapCatChatFacade:
         return dict(result)
 
 
+@dataclass(slots=True)
+class AylaChatFacade:
+    """Ayla 应用通道命令 facade（本期能力空）。
+
+    Ayla 是独立应用聊天通道：撤回/已读/表情等命令操作由 Ayla 应用内
+    自有逻辑处理，Elysium 命令端点不代为执行。本期 `capabilities()` 全
+    False，保证命令端点对 ayla 流以 `capability_disabled` 拒绝、可观测，
+    不误路由到其它平台 facade。
+    """
+
+    client: Any | None = None
+    platform: str = "ayla"
+
+    def capabilities(self) -> Mapping[ChatAction, bool]:
+        return {action: False for action in ChatAction}
+
+    async def perform(
+        self,
+        action: ChatAction,
+        *,
+        target: ChatTarget,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any] | None:
+        raise CapabilityError(f"Ayla does not support {action.value!r}")
+
+
 def _message_id(target: ChatTarget) -> str:
     value = target.provider_message_id
     if value is None or not str(value).strip():
@@ -265,4 +291,4 @@ def _text_parts(payload: Mapping[str, Any]) -> str:
     return text
 
 
-__all__ = ["FeishuChatFacade", "NapCatChatFacade"]
+__all__ = ["FeishuChatFacade", "NapCatChatFacade", "AylaChatFacade"]

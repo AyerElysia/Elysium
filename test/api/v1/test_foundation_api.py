@@ -307,3 +307,34 @@ def test_openapi_contains_stable_foundation_operation_ids() -> None:
         assert schema["paths"]["/health"]["get"]["operationId"] == "getHealth"
     finally:
         store.close()
+
+
+def test_snapshot_recognizes_ayla_adapter_plugin(monkeypatch) -> None:
+    """foundation 能识别 ayla_adapter 插件并映射 provider=ayla。"""
+    bot = SimpleNamespace(
+        bot_name="Elysium",
+        manifests={
+            "ayla_adapter": SimpleNamespace(enabled=True),
+        },
+        load_results={"ayla_adapter": True},
+        plugin_manager=SimpleNamespace(
+            get_all_plugins=lambda: {
+                "ayla_adapter": SimpleNamespace(
+                    config=SimpleNamespace(
+                        plugin=SimpleNamespace(enabled=True),
+                    ),
+                ),
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        "src.core.managers.adapter_manager.get_adapter_manager",
+        lambda: SimpleNamespace(get_all_adapters=dict),
+    )
+
+    snapshot = snapshot_from_bot(bot)
+    adapters = {item.provider: item for item in snapshot.adapters}
+
+    assert adapters["ayla"].component == "ayla_adapter:adapter"
+    assert adapters["ayla"].enabled is True
+    assert adapters["ayla"].state == "unavailable"
