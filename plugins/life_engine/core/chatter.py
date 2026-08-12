@@ -1061,12 +1061,24 @@ class LifePassAndWaitAction(BaseAction):
     action_description = (
         "跳过本次动作，不进行任何操作，但保持对话继续，等待用户新消息。"
         "若当前不需要回复，就使用本工具等待用户的下一条消息。"
+        "调用时必须用 reason 参数说明为什么选择沉默等待。"
     )
 
     chatter_allow: list[str] = ["life_chatter"]
 
-    async def execute(self) -> tuple[bool, str]:
-        return True, "已跳过，等待新消息"
+    async def execute(self, reason: str) -> tuple[bool, str]:
+        """跳过本轮动作并等待新消息。
+
+        Args:
+            reason: 本次选择沉默等待的原因。必须如实、具体地说明为什么
+                不回复/不行动（例如"凌晨五点对方可能在睡，不想打扰"、
+                "上一轮已回应完整，没有新的信息差"、"当前情绪状态更想
+                安静陪伴"）。原因会原样记录，作为主体决策的留痕。
+        """
+        logger.info(
+            f"life_pass_and_wait 调用，原因: {reason}"
+        )
+        return True, f"已跳过，等待新消息。原因: {reason}"
 
 
 @dataclass(slots=True)
