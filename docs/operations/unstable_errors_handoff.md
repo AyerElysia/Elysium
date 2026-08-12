@@ -427,3 +427,33 @@ sqlite3.IntegrityError: NOT NULL constraint failed: raw_event_consumer_offsets.r
 
 - learning_events 10.8GB 未回迁（远端保留），本地重新积累后可通过 sync 通道补同步。
 - frp 隧道偶发瞬断（7.2）在 local 模式下不再影响主运行，只影响同步速率。
+
+### 8.6 Clash 直连域名清单（重要，新增业务域名必须登记）
+
+Clash Verge TUN 模式会劫持 WSL 全部流量并返回 fake-ip。**凡是 Elysium 需要长连接/直连的域名，必须同时登记两处**（否则表现为偶发断连、启动失败、认证异常）：
+
+| 域名 | 用途 | 登记时间 |
+|---|---|---|
+| `frp-one.com` | 远端 MySQL（frp 隧道） | 2026-08-12 上午 |
+| `kookapp.cn` / `kookapp.com` | KOOK API + WebSocket Gateway | 2026-08-12 晚 |
+
+登记位置（当前订阅 `R7k9CaxLtblM`）：
+
+1. **rules 扩展** `r5yXhN2t3jTK.yaml` 的 `prepend`：
+   ```yaml
+   prepend:
+     - DOMAIN-SUFFIX,frp-one.com,DIRECT
+     - DOMAIN-SUFFIX,kookapp.cn,DIRECT
+     - DOMAIN-SUFFIX,kookapp.com,DIRECT
+   ```
+2. **merge 扩展** `mgKpMFTxdNnf.yaml` 的 `dns.fake-ip-filter`：
+   ```yaml
+   dns:
+     fake-ip-filter:
+       - "+.frp-one.com"
+       - "+.kookapp.cn"
+       - "+.kookapp.com"
+   ```
+3. 改完重启 Clash Verge；验证 `getent hosts <域名>` 返回真实 IP（非 198.18.x.x）。
+
+**判定方法**：`getent hosts <域名>` 若返回 `198.18.*`（fake-ip 段）即被劫持。KOOK 症状：Gateway `no close frame` / `timed out during opening handshake`、适配器启动失败（异常消息为空）、`curl -H "Authorization: Bot <token>" https://www.kookapp.cn/api/v3/user/me` 非 200。
