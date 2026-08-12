@@ -149,6 +149,12 @@ def test_mysql_mode_reads_idle_session_timeout_from_config() -> None:
     assert settings.mysql.idle_session_timeout_seconds == 240
 
 
+def test_mysql_backend_defaults_satisfy_recycle_guard() -> None:
+    settings = MySQLBackendSettings()
+
+    assert settings.pool_recycle_seconds < settings.idle_session_timeout_seconds
+
+
 async def test_mysql_mode_rejects_recycle_not_below_wait_timeout() -> None:
     """recycle >= wait_timeout is a startup error: idle connections would be
     killed by the server before the pool recycles them (MySQL 2013)."""

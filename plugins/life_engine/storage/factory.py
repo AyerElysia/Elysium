@@ -55,7 +55,10 @@ class MySQLBackendSettings:
     ssl_key: str = ""
     pool_size: int = 20
     max_overflow: int = 20
-    pool_recycle_seconds: int = 1800
+    # Must remain below ``idle_session_timeout_seconds``.  Keeping the safe
+    # relationship in the dataclass default matters for isolated services and
+    # contract tests that construct settings without the global Core config.
+    pool_recycle_seconds: int = 120
     connect_timeout_seconds: int = 5
     pool_timeout_seconds: int = 10
     query_timeout_seconds: int = 10
