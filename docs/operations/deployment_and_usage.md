@@ -1206,6 +1206,16 @@ Ctrl+C
 - [x] 入站可观测日志：`AylaAdapter | INFO | 收到 Ayla 消息…` / `消息接收器 | INFO | <ayla> 汐汐: …` / `UserQuery | INFO | …`（2026-08-12 起）。
 - [x] SSE 长连接稳定：heartbeat 独立于 `has_more`，不再 60 秒读超时断线；Elysium 重启后 bridge 走 `reset_session` secret 重签恢复（2026-08-12 起）。
 
+### 12.7.1 Ayla 后端启动（launcher，2026-08-12 起）
+
+Ayla 后端（`Ayla/backend`）一键启动入口为 `python launcher.py`（Windows 双击仓库根目录 `start_ayla.bat`），是 `runserver`（默认 `127.0.0.1:8100`，`--noreload`）与 `run_bridge`（SSE 出站投影）两个子进程的 owner：
+
+- **依赖**：Elysium 运行在 `ELYSIA_BASE_URL`（Ayla `.env`，默认 `http://127.0.0.1:8000`）；service credential 落盘 `runtime/elysia_credential.json`（Git 忽略）；Elysium 未启动时 `run_bridge` 有界退避重试，不崩溃。
+- **端口占用**：launcher 启动前检查 `AYLA_PORT`（默认 8100），被占用则报告监听 PID 并拒绝启动（不偷偷起第二实例）。
+- **关闭**：Ctrl+C 一并退出两个子进程（各自 SIGINT 处理，launcher 超时兜底 terminate/kill）；任一子进程退出即整体退出（owner 语义）。
+- **拆分调试**：`manage.py runserver 127.0.0.1:8100 --noreload` 与 `manage.py run_bridge` 可分开运行（排障用）。
+- **冒烟**：`curl http://127.0.0.1:8100/api/v1/health/` 返回 200；bridge 日志出现 `POST /auth/sessions 200` + `GET /events/stream 200` 即 SSE 订阅成功。
+
 ---
 
 ## 13. 自动化测试
