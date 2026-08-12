@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .presence_store import (
+from plugins.life_engine.service.presence_store import (
     PRESENCE_DB_FILE,
     SQLitePresenceStore,
     StreamOwnershipConflict,

@@ -31,7 +31,7 @@ from ..memory.experience import EpistemicKind, ExperienceRecord, WitnessMemory
 from .consciousness import ConsciousnessInstance
 from .event_bus import LifeEvent, RawEventGapError
 from .perception_gateway import PerceptionDeliveryReceipt
-from .presence_store import PresenceRevisionConflict
+from plugins.life_engine.service.presence_store import PresenceRevisionConflict
 from .world_state import PerceptionFilter
 
 if TYPE_CHECKING:

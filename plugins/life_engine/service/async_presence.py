@@ -20,7 +20,10 @@ from .consciousness import (
     ConsciousnessRegistry,
 )
 from .event_bus import LifeEvent, LifeEventChannel, LifeEventPriority
-from .presence_store import PresenceRevisionConflict, StreamOwnershipConflict
+from plugins.life_engine.service.presence_store import (
+    PresenceRevisionConflict,
+    StreamOwnershipConflict,
+)
 from .world_state import PerceptionFilter
 
 
