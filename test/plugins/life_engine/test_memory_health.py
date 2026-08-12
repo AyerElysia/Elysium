@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -322,6 +323,216 @@ async def test_disabled_vector_backend_is_reported_as_expected_absence(
     assert snapshot["vector"]["expected"] is False
     assert snapshot["vector"]["disabled"] is True
     assert snapshot["vector_degraded"] is False
+
+
+def _node_with_pending_job(
+    db: sqlite3.Connection,
+    tmp_path: Path,
+    *,
+    pending_created_at: float,
+) -> str:
+    """Create one healthy indexed document whose outbox job is still pending."""
+    notes = tmp_path / "notes"
+    notes.mkdir(exist_ok=True)
+    (notes / "live.md").write_text("live body", encoding="utf-8")
+    indexed = upsert_document_rows(db, "notes/live.md", "live body", "Live", now=2.0)
+    db.execute(
+        "UPDATE memory_index_jobs SET status = 'pending', created_at = ?, updated_at = ? "
+        "WHERE node_id = ?",
+        (pending_created_at, pending_created_at, indexed.node_id),
+    )
+    db.commit()
+    return indexed.node_id
+
+
+async def test_disabled_index_worker_with_backlog_is_reported_as_degraded(
+    tmp_path: Path,
+) -> None:
+    """A disabled consumer plus a growing backlog must never report ``ok``.
+
+    The producer enqueues index jobs inside the write transaction regardless of
+    configuration, so switching the worker off silently converts the outbox
+    into an unbounded queue.  That is a degradation, not an expected absence.
+    """
+    db = _db(tmp_path)
+    five_days_ago = time.time() - 5 * 86400.0
+    _node_with_pending_job(db, tmp_path, pending_created_at=five_days_ago)
+
+    snapshot = await health_snapshot(
+        db,
+        tmp_path,
+        None,
+        vector_expected=False,
+        index_worker_expected=False,
+    )
+
+    outbox = snapshot["outbox"]
+    assert outbox["pending"] == 1
+    assert outbox["backlog"] == 1
+    assert outbox["backlog_status"] == "disabled_backlog"
+    assert outbox["degraded"] is True
+    assert outbox["disabled"] is True
+    assert outbox["index_worker_expected"] is False
+    assert outbox["owner"]
+    assert outbox["oldest_pending_age_seconds"] > 4 * 86400.0
+    assert "re-enabled" in outbox["degradation_reason"]
+
+    # The regression this closes: the snapshot used to stay "ok" because
+    # issue_count only counted processing/failed jobs, never pending ones.
+    assert snapshot["status"] == "degraded"
+
+    degradations = snapshot["degradations"]
+    assert len(degradations) == 1
+    assert degradations[0]["component"] == "outbox"
+    assert degradations[0]["status"] == "disabled_backlog"
+    assert degradations[0]["backlog"] == 1
+    assert degradations[0]["owner"] == outbox["owner"]
+    json.dumps(snapshot)
+
+
+async def test_disabled_index_worker_with_empty_outbox_is_an_expected_absence(
+    tmp_path: Path,
+) -> None:
+    db = _db(tmp_path)
+    node_id = _node_with_pending_job(db, tmp_path, pending_created_at=time.time())
+    db.execute("DELETE FROM memory_index_jobs WHERE node_id = ?", (node_id,))
+    db.commit()
+
+    snapshot = await health_snapshot(
+        db,
+        tmp_path,
+        None,
+        vector_expected=False,
+        index_worker_expected=False,
+    )
+
+    outbox = snapshot["outbox"]
+    assert outbox["backlog"] == 0
+    assert outbox["backlog_status"] == "disabled"
+    assert outbox["degraded"] is False
+    assert outbox["disabled"] is True
+    assert outbox["degradation_reason"] is None
+    assert snapshot["status"] == "ok"
+    assert snapshot["degradations"] == []
+
+
+async def test_fresh_backlog_with_a_running_worker_is_not_a_degradation(
+    tmp_path: Path,
+) -> None:
+    db = _db(tmp_path)
+    _node_with_pending_job(db, tmp_path, pending_created_at=time.time() - 60.0)
+
+    snapshot = await health_snapshot(
+        db,
+        tmp_path,
+        None,
+        vector_expected=False,
+        index_worker_expected=True,
+    )
+
+    outbox = snapshot["outbox"]
+    assert outbox["backlog"] == 1
+    assert outbox["backlog_status"] == "ok"
+    assert outbox["degraded"] is False
+    assert outbox["disabled"] is False
+    assert outbox["degradation_reason"] is None
+    assert snapshot["status"] == "ok"
+    assert snapshot["degradations"] == []
+
+
+async def test_stalled_backlog_is_reported_when_the_worker_is_expected(
+    tmp_path: Path,
+) -> None:
+    db = _db(tmp_path)
+    _node_with_pending_job(db, tmp_path, pending_created_at=time.time() - 100_000.0)
+
+    snapshot = await health_snapshot(
+        db,
+        tmp_path,
+        None,
+        vector_expected=False,
+        index_worker_expected=True,
+    )
+
+    outbox = snapshot["outbox"]
+    assert outbox["backlog_status"] == "stalled"
+    assert outbox["degraded"] is True
+    assert outbox["disabled"] is False
+    assert outbox["stall_threshold_seconds"] == 3600.0
+    assert "not draining" in outbox["degradation_reason"]
+    assert snapshot["status"] == "degraded"
+    assert snapshot["degradations"][0]["status"] == "stalled"
+
+
+async def test_stall_threshold_is_configurable_by_the_caller(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    _node_with_pending_job(db, tmp_path, pending_created_at=time.time() - 600.0)
+
+    tolerant = await health_snapshot(
+        db,
+        tmp_path,
+        None,
+        vector_expected=False,
+        outbox_stall_seconds=86400.0,
+    )
+    strict = await health_snapshot(
+        db,
+        tmp_path,
+        None,
+        vector_expected=False,
+        outbox_stall_seconds=10.0,
+    )
+
+    assert tolerant["outbox"]["backlog_status"] == "ok"
+    assert tolerant["status"] == "ok"
+    assert strict["outbox"]["backlog_status"] == "stalled"
+    assert strict["status"] == "degraded"
+
+
+async def test_outbox_surfaces_stale_reasons_and_last_completed_success(
+    tmp_path: Path,
+) -> None:
+    """Stale supersession and the last drain time are part of the contract.
+
+    ``stale`` rows are written by the producer when newer content supersedes a
+    queued hash, so they accumulate even while the consumer is down.  Operators
+    need the reason breakdown and the last successful drain to tell "never ran"
+    apart from "ran, then stopped".
+    """
+    db = _db(tmp_path)
+    node_id = _node_with_pending_job(db, tmp_path, pending_created_at=time.time() - 7200.0)
+    db.execute(
+        "INSERT INTO memory_index_jobs"
+        "(job_id, node_id, content_hash, status, created_at, updated_at, attempts, error) "
+        "VALUES (?, ?, ?, 'stale', 1, 1, 0, 'SupersededContent')",
+        ("job-stale", node_id, "hash-stale"),
+    )
+    db.execute(
+        "INSERT INTO memory_index_jobs"
+        "(job_id, node_id, content_hash, status, created_at, updated_at, attempts, error) "
+        "VALUES (?, ?, ?, 'completed', 1, 1234.5, 1, '')",
+        ("job-done", node_id, "hash-done"),
+    )
+    db.commit()
+
+    snapshot = await health_snapshot(
+        db,
+        tmp_path,
+        None,
+        vector_expected=False,
+        index_worker_expected=False,
+    )
+
+    outbox = snapshot["outbox"]
+    assert outbox["pending"] == 1
+    assert outbox["stale"] == 1
+    assert outbox["backlog"] == 2
+    assert outbox["stale_reason_counts"] == {"SupersededContent": 1}
+    assert outbox["last_completed_at"] == 1234.5
+    assert outbox["status_counts"]["completed"] == 1
+    assert outbox["backlog_status"] == "disabled_backlog"
+    assert snapshot["degradations"][0]["last_success_at"] == 1234.5
+    json.dumps(snapshot)
 
 
 async def test_health_requires_exact_stored_identity_for_coverage_and_vectors(

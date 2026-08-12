@@ -329,7 +329,14 @@ class Bot:
         from src.kernel.logger import COLOR, get_logger, initialize_logger_system
         from src.kernel.protocols import LogStoreProtocol
 
-        initialize_logger_system(log_level=self.config.bot.log_level)
+        # ``log_dir`` was accepted, stored and then never read, so the console
+        # was the only live sink and it dies with the terminal that started
+        # Elysium (AGENTS.md §10 runs it by hand).  Pass it through so every
+        # run also leaves a durable, greppable text mirror on disk.
+        initialize_logger_system(
+            log_level=self.config.bot.log_level,
+            log_dir=self.log_dir,
+        )
         self.logger = get_logger(name="console", display="控制台", color=COLOR.BLUE)
 
         # Automatic task routing has one authoritative source.  Load it only

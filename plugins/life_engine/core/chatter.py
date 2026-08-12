@@ -2676,16 +2676,82 @@ class LifeChatter(BaseChatter):
             if callable(get_store):
                 selected_store = get_store()
         if selected_store is not None:
-            expected_revision = int(self.__class__._GLOBAL_ROLLING_CONTEXT_REVISION)
-            record = await selected_store.put_state(
-                namespace="life_chatter.rolling_context",
-                state_key=self.instance_id,
-                expected_revision=expected_revision,
-                schema_version=_ROLLING_CONTEXT_SNAPSHOT_VERSION,
-                payload=data,
-            )
-            self.__class__._GLOBAL_ROLLING_CONTEXT_REVISION = int(record.revision)
-            self._rolling_context_state_revision = int(record.revision)
+            runtime = getattr(service, "storage_runtime", None)
+            claim = None
+            if runtime is not None and getattr(
+                runtime, "acquire_singleton_writer", None
+            ) is not None:
+                try:
+                    claim = await runtime.acquire_singleton_writer(
+                        namespace="life_chatter.rolling_context",
+                        state_key=self.instance_id,
+                        owner_instance_id=(
+                            getattr(
+                                service,
+                                "_storage_writer_instance_id",
+                                "life_chatter",
+                            )
+                            or "life_chatter"
+                        ),
+                        lease_seconds=30,
+                    )
+                except Exception as exc:
+                    from ..storage import SingletonWriterClaimConflict
+
+                    if isinstance(exc, SingletonWriterClaimConflict):
+                        # 另一实例持有滚动上下文写租约：跳过本轮保存，
+                        # 同步本地 revision 缓存到数据库最新值，避免下轮
+                        # 再次 CAS 冲突。
+                        try:
+                            latest = await selected_store.get_state(
+                                "life_chatter.rolling_context",
+                                self.instance_id,
+                            )
+                            if latest is not None:
+                                self.__class__._GLOBAL_ROLLING_CONTEXT_REVISION = (
+                                    int(latest.revision)
+                                )
+                                self._rolling_context_state_revision = int(
+                                    latest.revision
+                                )
+                        except Exception:  # noqa: BLE001
+                            pass
+                        logger.warning(
+                            f"滚动上下文写租约被其他实例持有，跳过本轮保存: "
+                            f"namespace=life_chatter.rolling_context "
+                            f"state_key={self.instance_id} "
+                            f"error_type={type(exc).__name__}"
+                        )
+                        return
+                    raise
+            try:
+                # 持租约后重读最新 revision：本地缓存可能已过期（另一实例
+                # 曾推进），但此刻租约在手不会有并发写入，读到的一定是最新。
+                latest = await selected_store.get_state(
+                    "life_chatter.rolling_context",
+                    self.instance_id,
+                )
+                expected_revision = (
+                    int(latest.revision) if latest is not None else 0
+                )
+                self.__class__._GLOBAL_ROLLING_CONTEXT_REVISION = expected_revision
+                self._rolling_context_state_revision = expected_revision
+                record = await selected_store.put_state(
+                    namespace="life_chatter.rolling_context",
+                    state_key=self.instance_id,
+                    expected_revision=expected_revision,
+                    schema_version=_ROLLING_CONTEXT_SNAPSHOT_VERSION,
+                    payload=data,
+                    writer_claim=claim,
+                )
+                self.__class__._GLOBAL_ROLLING_CONTEXT_REVISION = int(record.revision)
+                self._rolling_context_state_revision = int(record.revision)
+            finally:
+                if claim is not None and runtime is not None:
+                    try:
+                        await runtime.release_singleton_writer(claim)
+                    except Exception:  # noqa: BLE001
+                        pass
             return
 
         tmp_path: Path | None = None

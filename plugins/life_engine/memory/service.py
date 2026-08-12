@@ -300,6 +300,7 @@ class LifeMemoryService:
         *,
         clock: Any = None,
         vector_backend_enabled: bool = True,
+        index_worker_enabled: bool = True,
         storage_runtime: StorageBackendRuntime | None = None,
         memory_storage: MemoryStorageBundle | None = None,
         selectable_storage_enabled: bool = False,
@@ -313,6 +314,11 @@ class LifeMemoryService:
         self.plugin = plugin
         self._clock = clock or datetime.now
         self._vector_backend_enabled = bool(vector_backend_enabled)
+        # The outbox producer always enqueues; the consumer loop is gated on
+        # `memory_index.enabled`. Health must know which one to expect so a
+        # disabled worker reads as an expected absence and a disabled worker
+        # with a backlog reads as a degradation (AGENTS.md §8).
+        self._index_worker_enabled = bool(index_worker_enabled)
         if storage_runtime is not None and memory_storage is not None:
             raise ValueError(
                 "LifeMemoryService accepts storage_runtime or memory_storage, not both"
@@ -3808,6 +3814,7 @@ class LifeMemoryService:
                 self._get_workspace_path(),
                 collection,
                 vector_expected=self._vector_backend_enabled,
+                index_worker_expected=self._index_worker_enabled,
             )
             snapshot.update(backend=storage.backend.value, ports=ports)
             snapshot["startup_recovery"] = recovery

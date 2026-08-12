@@ -316,6 +316,181 @@ class TestLogStore:
 
 
 # ---------------------------------------------------------------------------
+# LogStore 文件镜像
+# ---------------------------------------------------------------------------
+
+
+class _BrokenHandle:
+    """A file-like object whose writes always fail."""
+
+    closed = False
+
+    def write(self, _text: str) -> int:
+        raise OSError("mirror handle is broken")
+
+    def flush(self) -> None:
+        raise OSError("mirror handle is broken")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class TestLogStoreFileMirror:
+    """手动启动的进程把控制台写到 pty，会话结束后那份输出就没有了。
+    文件镜像是「进程已退出之后仍可按天审计」的唯一保证，所以它的存在、
+    滚动、保留与降级都必须是契约。
+    """
+
+    def test_absent_log_dir_creates_no_file(self, tmp_path: Path) -> None:
+        """log_dir 为 None 时不得创建目录或句柄（测试不落文件）。"""
+        store = LogStore(db_path=tmp_path / "nomirror.db")
+        store.write("INFO", "mod", "no mirror please")
+        time.sleep(1.5)
+        store.close()
+
+        assert store.stats()["file_log_dir"] == ""
+        assert not (tmp_path / "logs").exists()
+        assert list(tmp_path.glob("elysium-*.log")) == []
+
+    def test_mirror_receives_written_entries(self, tmp_path: Path) -> None:
+        """启用 log_dir 后，每条日志都落到按日期命名的镜像里。"""
+        log_dir = tmp_path / "logs"
+        store = LogStore(db_path=tmp_path / "mirror.db", log_dir=log_dir)
+        store.write("INFO", "mod.a", "hello mirror")
+        store.write("ERROR", "mod.b", "boom", metadata={"k": "v"})
+        time.sleep(1.5)
+        store.close()
+
+        files = sorted(p.name for p in log_dir.glob("elysium-*.log"))
+        assert len(files) == 1
+        content = (log_dir / files[0]).read_text(encoding="utf-8")
+        assert "| INFO     | mod.a | hello mirror" in content
+        assert "| ERROR    | mod.b | boom" in content
+        # 元数据跟在自己那条记录后面，不与消息挤在同一行。
+        assert '{"k": "v"}' in content
+
+        stats = store.stats()
+        assert stats["file_written_count"] == 2
+        assert stats["file_failure_count"] == 0
+        assert stats["file_log_dir"] == str(log_dir)
+
+    def test_batch_spanning_midnight_splits_by_entry_date(
+        self, tmp_path: Path
+    ) -> None:
+        """一批日志可能跨越午夜；每条记录必须落进它自己那天的文件。"""
+        log_dir = tmp_path / "logs"
+        store = LogStore(db_path=tmp_path / "roll.db", log_dir=log_dir)
+        store.close()  # writer 退出后由测试独占调用，避免与后台线程竞争
+
+        store._mirror_batch_to_file(
+            [
+                {
+                    "timestamp": "2020-01-01T23:59:59.999",
+                    "level": "INFO",
+                    "module": "m",
+                    "message": "before midnight",
+                    "metadata": "{}",
+                },
+                {
+                    "timestamp": "2020-01-02T00:00:00.001",
+                    "level": "INFO",
+                    "module": "m",
+                    "message": "after midnight",
+                    "metadata": "{}",
+                },
+            ]
+        )
+        store._close_file_handle()
+
+        assert (log_dir / "elysium-2020-01-01.log").exists()
+        assert (log_dir / "elysium-2020-01-02.log").exists()
+        assert "before midnight" in (
+            log_dir / "elysium-2020-01-01.log"
+        ).read_text(encoding="utf-8")
+        assert "after midnight" in (
+            log_dir / "elysium-2020-01-02.log"
+        ).read_text(encoding="utf-8")
+
+    def test_prune_only_removes_this_stores_own_naming(
+        self, tmp_path: Path
+    ) -> None:
+        """保留策略的范围最小：只删本 store 自己命名的过期镜像。"""
+        log_dir = tmp_path / "logs"
+        store = LogStore(
+            db_path=tmp_path / "prune.db",
+            retention_info_days=1,
+            log_dir=log_dir,
+        )
+        store.close()
+
+        expired = ["elysium-2020-01-01.log", "elysium-2020-06-30.log"]
+        foreign = ["unrelated.log", "elysium-not-a-date.log", "notes.txt"]
+        for name in expired + foreign:
+            (log_dir / name).write_text("x", encoding="utf-8")
+
+        removed = store.prune_file_mirrors()
+
+        assert removed == len(expired)
+        for name in expired:
+            assert not (log_dir / name).exists()
+        for name in foreign:
+            assert (log_dir / name).exists(), f"{name} 不属于本 store，不得删除"
+
+    def test_mirror_failure_never_degrades_the_db_sink(
+        self, tmp_path: Path
+    ) -> None:
+        """镜像失败只增加自己的失败计数，SQLite sink 与调用方不受影响。"""
+        log_dir = tmp_path / "logs"
+        store = LogStore(db_path=tmp_path / "degrade.db", log_dir=log_dir)
+        store.write("INFO", "mod", "lands in sqlite")
+        time.sleep(1.5)
+        store.close()
+
+        assert store.stats()["written_count"] == 1
+        before = store.stats()["file_failure_count"]
+
+        broken = _BrokenHandle()
+        store._file_handle = broken
+        store._file_date = "2026-08-09"
+        store._mirror_batch_to_file(
+            [
+                {
+                    "timestamp": "2026-08-09T00:00:00.000",
+                    "level": "INFO",
+                    "module": "m",
+                    "message": "cannot be mirrored",
+                    "metadata": "{}",
+                }
+            ]
+        )
+
+        stats = store.stats()
+        assert stats["file_failure_count"] == before + 1
+        # SQLite 侧不受影响，且损坏的句柄被丢弃以便下一批重开。
+        assert stats["written_count"] == 1
+        assert store._file_handle is None
+        assert len(store.query()) == 1
+
+    def test_unwritable_log_dir_degrades_to_sqlite_only(
+        self, tmp_path: Path
+    ) -> None:
+        """目录建不起来时降级为纯 SQLite sink，绝不阻断启动。"""
+        # 父路径是一个普通文件，mkdir 必然失败（NotADirectoryError ⊂ OSError）。
+        # 不 monkeypatch Path.mkdir：那会连 db_path 自己的建目录一起打断。
+        blocker = tmp_path / "blocker"
+        blocker.write_text("not a directory", encoding="utf-8")
+
+        store = LogStore(db_path=tmp_path / "degraded.db", log_dir=blocker / "logs")
+        try:
+            store.write("INFO", "mod", "sqlite still works")
+            time.sleep(1.5)
+            assert store.stats()["file_log_dir"] == ""
+            assert store.stats()["written_count"] == 1
+        finally:
+            store.close()
+
+
+# ---------------------------------------------------------------------------
 # stdlib bridge
 # ---------------------------------------------------------------------------
 
