@@ -138,7 +138,8 @@ def _get_default_logger_color_by_name(name: str) -> str:
 def _strip_rich_markup(message: str) -> str:
     """移除 Rich markup 标签，返回纯文本。
 
-    该函数仅用于文件日志输出，避免将控制台样式标签写入日志文件。
+    用于所有非控制台 sink（SQLite 与按日期滚动的文件镜像），避免把控制台
+    样式标签写进持久记录。控制台仍然渲染 markup。
 
     Args:
         message: 可能包含 Rich markup 的日志消息
@@ -153,7 +154,8 @@ def _strip_rich_markup(message: str) -> str:
 
 # 全局配置
 _global_config: dict[str, Any] = {
-    "log_dir": "logs",
+    # 空字符串表示不写文件镜像；由 initialize_logger_system(log_dir=...) 设置。
+    "log_dir": "",
     "log_level": "DEBUG",  # DEBUG, INFO, WARNING, ERROR, CRITICAL
     "enable_db": False,
     "db_path": "data/logs.db",
@@ -573,6 +575,7 @@ def initialize_logger_system(
     retention_debug_days: int = 3,
     retention_info_days: int = 30,
     enable_event_broadcast: bool = True,
+    log_dir: str | Path | None = None,
     **_legacy: Any,
 ) -> None:
     """初始化日志系统全局配置
@@ -589,6 +592,8 @@ def initialize_logger_system(
         retention_debug_days: DEBUG 级别日志保留天数
         retention_info_days: INFO+ 级别日志保留天数
         enable_event_broadcast: 是否默认启用事件广播
+        log_dir: 按日期滚动的纯文本镜像目录；``None`` 表示不写文件镜像。
+            调用方必须显式传入，测试因此不会意外在仓库里落下日志文件。
 
     Example:
         >>> from src.kernel.logger import initialize_logger_system
@@ -604,6 +609,8 @@ def initialize_logger_system(
         _global_config["retention_debug_days"] = retention_debug_days
         _global_config["retention_info_days"] = retention_info_days
         _global_config["enable_event_broadcast"] = enable_event_broadcast
+        # 以前这个键只是被声明、从来没有人读；现在它是文件镜像的唯一来源。
+        _global_config["log_dir"] = str(log_dir) if log_dir is not None else ""
 
     # 创建或重新创建全局 LogStore，并确保 stdlib bridge 只有一个。
     from .stdlib_bridge import install_stdlib_bridge, uninstall_stdlib_bridge
@@ -621,6 +628,7 @@ def initialize_logger_system(
                 db_path=db_path,
                 retention_debug_days=retention_debug_days,
                 retention_info_days=retention_info_days,
+                log_dir=log_dir,
             )
 
     if _global_log_store is not None:

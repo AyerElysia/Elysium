@@ -5,12 +5,13 @@ WAL 模式 + 后台写入队列 + FTS5 全文索引 + 自动保留策略。
 
 from __future__ import annotations
 
+import contextlib
 import json
 import queue
 import sqlite3
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -25,6 +26,11 @@ _FLUSH_INTERVAL = 1.0  # 秒
 _LEGACY_COMPACT_MIN_BYTES = 64 * 1024 * 1024
 _LEGACY_COMPACT_FREE_RATIO = 0.25
 _INCREMENTAL_VACUUM_PAGES = 8192
+
+# 按日期滚动的纯文本镜像。手动启动的 Elysium 把控制台写到 pty，会话结束后
+# 那份输出就不存在了；文件镜像让「进程已经退出」之后仍然可以按天审计。
+_FILE_LOG_PREFIX = "elysium-"
+_FILE_LOG_SUFFIX = ".log"
 
 
 class LogStore:
@@ -43,6 +49,7 @@ class LogStore:
         db_path: str | Path = "data/logs.db",
         retention_debug_days: int = 3,
         retention_info_days: int = 30,
+        log_dir: str | Path | None = None,
     ) -> None:
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -57,6 +64,20 @@ class LogStore:
         self._written_count = 0
         self._dropped_count = 0
         self._write_failure_count = 0
+
+        # 文件镜像。句柄和 SQLite 连接一样只被 writer 线程持有和关闭，
+        # 保证单一 owner；``log_dir`` 为 None 时完全不创建目录或句柄。
+        self._log_dir = Path(log_dir) if log_dir is not None else None
+        self._file_handle: Any = None
+        self._file_date: str = ""
+        self._file_written_count = 0
+        self._file_failure_count = 0
+        if self._log_dir is not None:
+            try:
+                self._log_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                # 目录不可创建时降级为纯 SQLite sink，绝不让日志阻断启动。
+                self._log_dir = None
 
         # 初始化数据库。清理必须发生在 writer 启动前，避免启动阶段两个
         # SQLite 连接互相争用写锁。
@@ -193,8 +214,11 @@ class LogStore:
             self._conn.close()
             self._conn = None
 
+        # 文件句柄与 SQLite 连接同一个 owner，在同一处回收。
+        self._close_file_handle()
+
     def _flush_batch(self, batch: list[dict[str, Any]]) -> None:
-        """批量写入数据库。"""
+        """批量写入数据库，并镜像到按日期滚动的文本文件。"""
         try:
             conn = self._get_conn()
             conn.executemany(
@@ -209,6 +233,69 @@ class LogStore:
             # 写入失败不影响主程序，但必须可观测。
             with self._metrics_lock:
                 self._write_failure_count += len(batch)
+
+        # 两个 sink 相互独立：SQLite 失败不得让文件镜像也丢掉这一批，
+        # 反之亦然。任何一侧的失败都只增加自己的失败计数。
+        self._mirror_batch_to_file(batch)
+
+    def _file_path_for(self, date: str) -> Path:
+        """Return the rolling text-mirror path for one ``YYYY-MM-DD`` date."""
+        assert self._log_dir is not None
+        return self._log_dir / f"{_FILE_LOG_PREFIX}{date}{_FILE_LOG_SUFFIX}"
+
+    def _mirror_batch_to_file(self, batch: list[dict[str, Any]]) -> None:
+        """Append one batch to today's text mirror, rolling over at midnight.
+
+        Only the writer thread calls this, so the handle needs no extra lock.
+        A failure here degrades the mirror alone — the SQLite sink and the
+        calling program are never affected.
+        """
+        if self._log_dir is None or not batch:
+            return
+        try:
+            # 一批日志可能跨越午夜，按每条记录自己的日期分组落盘。
+            for entry in batch:
+                timestamp = str(entry.get("timestamp") or "")
+                date = timestamp[:10] or datetime.now().strftime("%Y-%m-%d")
+                if self._file_handle is None or self._file_date != date:
+                    if self._file_handle is not None:
+                        self._file_handle.close()
+                        self._file_handle = None
+                    self._file_handle = self._file_path_for(date).open(
+                        "a", encoding="utf-8"
+                    )
+                    self._file_date = date
+                module = str(entry.get("module") or "")
+                level = str(entry.get("level") or "")
+                message = str(entry.get("message") or "")
+                self._file_handle.write(
+                    f"{timestamp} | {level:<8} | {module} | {message}\n"
+                )
+                metadata = str(entry.get("metadata") or "")
+                if metadata and metadata != "{}":
+                    self._file_handle.write(f"{' ' * 23} | {'':<8} | {metadata}\n")
+            self._file_handle.flush()
+            with self._metrics_lock:
+                self._file_written_count += len(batch)
+        except Exception:
+            with self._metrics_lock:
+                self._file_failure_count += len(batch)
+            # 句柄可能已经损坏，丢弃后下一批重新打开。
+            with contextlib.suppress(Exception):
+                if self._file_handle is not None:
+                    self._file_handle.close()
+            self._file_handle = None
+            self._file_date = ""
+
+    def _close_file_handle(self) -> None:
+        """Close the text mirror handle from its owning writer thread."""
+        if self._file_handle is None:
+            return
+        with contextlib.suppress(Exception):
+            self._file_handle.flush()
+            self._file_handle.close()
+        self._file_handle = None
+        self._file_date = ""
 
     def write(
         self,
@@ -360,6 +447,38 @@ class LogStore:
         finally:
             if conn is not None:
                 conn.close()
+            # 文件镜像的保留策略与 SQLite 同一个窗口，否则 logs/ 无界增长。
+            self.prune_file_mirrors()
+
+    def prune_file_mirrors(self) -> int:
+        """Delete text mirrors older than the INFO retention window.
+
+        Returns the number of files removed.  Only files matching this store's
+        own ``elysium-YYYY-MM-DD.log`` naming are considered, so unrelated files
+        in ``log_dir`` are never touched.
+        """
+        if self._log_dir is None:
+            return 0
+        cutoff = (
+            datetime.now() - timedelta(days=max(0, int(self._retention_info_days)))
+        ).strftime("%Y-%m-%d")
+        removed = 0
+        try:
+            candidates = sorted(
+                self._log_dir.glob(f"{_FILE_LOG_PREFIX}*{_FILE_LOG_SUFFIX}")
+            )
+        except OSError:
+            return 0
+        for path in candidates:
+            date = path.name[len(_FILE_LOG_PREFIX) : -len(_FILE_LOG_SUFFIX)]
+            if len(date) != 10 or date >= cutoff:
+                continue
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                continue
+        return removed
 
     def stats(self) -> dict[str, Any]:
         """获取日志存储统计信息。"""
@@ -377,6 +496,10 @@ class LogStore:
                     "written_count": self._written_count,
                     "dropped_count": self._dropped_count,
                     "write_failure_count": self._write_failure_count,
+                    # 文件镜像是独立 sink，必须能单独看出它是禁用还是在降级。
+                    "file_log_dir": str(self._log_dir) if self._log_dir else "",
+                    "file_written_count": self._file_written_count,
+                    "file_failure_count": self._file_failure_count,
                 }
             return {
                 "total_entries": total,
@@ -394,6 +517,10 @@ class LogStore:
                     "written_count": self._written_count,
                     "dropped_count": self._dropped_count,
                     "write_failure_count": self._write_failure_count,
+                    # 文件镜像是独立 sink，必须能单独看出它是禁用还是在降级。
+                    "file_log_dir": str(self._log_dir) if self._log_dir else "",
+                    "file_written_count": self._file_written_count,
+                    "file_failure_count": self._file_failure_count,
                 }
             return {
                 "total_entries": 0,

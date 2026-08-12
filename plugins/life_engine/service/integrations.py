@@ -276,6 +276,11 @@ class MemoryIntegration:
                 vector_backend_enabled=bool(
                     getattr(index_config, "backend_enabled", True)
                 ),
+                # The outbox consumer loop is gated on `memory_index.enabled`
+                # (see service/core.py). Health must know whether the consumer
+                # is expected to run, otherwise a disabled worker with a
+                # growing backlog reports as a silent `ok`.
+                index_worker_enabled=bool(getattr(index_config, "enabled", True)),
                 storage_runtime=storage_runtime,
                 selectable_storage_enabled=storage_enabled,
             )

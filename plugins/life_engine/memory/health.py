@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,26 @@ from .sqlite_runtime import run_db
 SUPPORTED_WORKSPACE_SUFFIXES = SUPPORTED_DOCUMENT_SUFFIXES
 MAX_REPORTED_PATHS = 1000
 MAX_VECTOR_IDS = 5000
+# Outbox jobs that remain pending/processing longer than this are reported as
+# stalled even when the index worker is expected to be running.
+OUTBOX_STALL_SECONDS = 3600.0
+# Named owner for the index outbox, so a degradation report says who to ask.
+OUTBOX_OWNER = "life_engine.memory_index worker"
+
+
+def _safe_error_reason(s: str | None, max_len: int = 64) -> str:
+    """Return a sanitised, length-capped copy of an error reason string.
+
+    Avoids importing ``re`` — only alphanumerics, spaces, and a small set of
+    safe punctuation characters are preserved.
+    """
+    if not s:
+        return ""
+    safe_chars = set(" _-.:/()")
+    cleaned = "".join(
+        c for c in str(s) if c.isalnum() or c in safe_chars
+    )
+    return cleaned[:max_len]
 
 
 def _table_exists(db: sqlite3.Connection, name: str) -> bool:
@@ -384,14 +405,20 @@ def _correction_snapshot(db: sqlite3.Connection) -> dict[str, int]:
     return result
 
 
-def _outbox_snapshot(db: sqlite3.Connection) -> dict[str, Any]:
+def _outbox_snapshot(db: sqlite3.Connection, now: float) -> dict[str, Any]:
     result: dict[str, Any] = {
         "pending": 0,
         "processing": 0,
         "failed": 0,
+        "stale": 0,
         "total": 0,
         "orphan_node_count": 0,
         "status_counts": {},
+        "oldest_pending_created_at": None,
+        "oldest_pending_age_seconds": None,
+        "newest_pending_created_at": None,
+        "last_completed_at": None,
+        "stale_reason_counts": {},
     }
     if not _table_exists(db, "memory_index_jobs"):
         return result
@@ -407,7 +434,7 @@ def _outbox_snapshot(db: sqlite3.Connection) -> dict[str, Any]:
             status_name = str(status)
             status_count = int(count or 0)
             result["status_counts"][status_name] = status_count
-            if status_name in {"pending", "processing", "failed"}:
+            if status_name in {"pending", "processing", "failed", "stale"}:
                 result[status_name] = status_count
         result["total"] = _count(db, "memory_index_jobs")
         if "node_id" in columns:
@@ -422,6 +449,54 @@ def _outbox_snapshot(db: sqlite3.Connection) -> dict[str, Any]:
                 )
             else:
                 result["orphan_node_count"] = result["total"]
+
+        # Pending age signals — require created_at column (Unix epoch float/int).
+        if "created_at" in columns:
+            age_row = db.execute(
+                "SELECT MIN(created_at), MAX(created_at) FROM memory_index_jobs "
+                "WHERE lower(COALESCE(status, '')) = 'pending'"
+            ).fetchone()
+            if age_row and age_row[0] is not None:
+                oldest_ts = float(age_row[0])
+                newest_ts = float(age_row[1])
+                result["oldest_pending_created_at"] = oldest_ts
+                result["newest_pending_created_at"] = newest_ts
+                result["oldest_pending_age_seconds"] = max(0.0, now - oldest_ts)
+
+        # Last completed timestamp.  The shipped schema uses ``updated_at``;
+        # ``last_updated`` is tolerated for forward compatibility only.
+        last_completed_col = (
+            "updated_at" if "updated_at" in columns else
+            "last_updated" if "last_updated" in columns else
+            None
+        )
+        if last_completed_col:
+            done_row = db.execute(
+                f"SELECT MAX({last_completed_col}) FROM memory_index_jobs "
+                "WHERE lower(COALESCE(status, '')) = 'completed'"
+            ).fetchone()
+            if done_row and done_row[0] is not None:
+                result["last_completed_at"] = float(done_row[0])
+
+        # Stale reason breakdown.  The shipped schema stores the reason in
+        # ``error``; ``error_reason`` is tolerated for forward compatibility.
+        reason_col = (
+            "error" if "error" in columns else
+            "error_reason" if "error_reason" in columns else
+            None
+        )
+        if reason_col:
+            stale_rows = db.execute(
+                f"SELECT COALESCE({reason_col}, ''), COUNT(*) FROM memory_index_jobs "
+                "WHERE lower(COALESCE(status, '')) = 'stale' "
+                f"GROUP BY COALESCE({reason_col}, '')"
+            ).fetchall()
+            for raw_reason, cnt in stale_rows:
+                key = _safe_error_reason(raw_reason) or "unknown"
+                result["stale_reason_counts"][key] = (
+                    result["stale_reason_counts"].get(key, 0) + int(cnt or 0)
+                )
+
     except sqlite3.Error:
         result["error_type"] = "OutboxReadError"
     return result
@@ -524,8 +599,11 @@ def _living_memory_snapshot(db: sqlite3.Connection) -> dict[str, Any]:
 def collect_health_snapshot(
     db: sqlite3.Connection | None,
     workspace_path: str | Path,
+    *,
+    now: float | None = None,
 ) -> dict[str, Any]:
     """Collect SQLite/workspace health data synchronously without mutations."""
+    _now = now if now is not None else time.time()
     workspace = Path(workspace_path)
     empty_sqlite = {
         "available": db is not None,
@@ -556,9 +634,15 @@ def collect_health_snapshot(
         "pending": 0,
         "processing": 0,
         "failed": 0,
+        "stale": 0,
         "total": 0,
         "orphan_node_count": 0,
         "status_counts": {},
+        "oldest_pending_created_at": None,
+        "oldest_pending_age_seconds": None,
+        "newest_pending_created_at": None,
+        "last_completed_at": None,
+        "stale_reason_counts": {},
     }
     corrections: dict[str, Any] = {
         "total": 0,
@@ -611,7 +695,7 @@ def collect_health_snapshot(
                 if row.get("node_id") is not None
             }
             orphans = _fts_orphan_snapshot(db)
-            outbox = _outbox_snapshot(db)
+            outbox = _outbox_snapshot(db, _now)
             corrections = _correction_snapshot(db)
             edges = _relation_snapshot(db, node_ids)
             living_memory = _living_memory_snapshot(db)
@@ -992,6 +1076,8 @@ async def _finish_health_snapshot(
     collection: Any,
     *,
     vector_expected: bool = True,
+    index_worker_expected: bool = True,
+    outbox_stall_seconds: float = OUTBOX_STALL_SECONDS,
 ) -> dict[str, Any]:
     """Attach vector diagnostics and compute one final snapshot status."""
     node_ids, embedded_node_ids, chunk_ids, expected_chunk_ids = id_sets
@@ -1036,6 +1122,67 @@ async def _finish_health_snapshot(
     correction_section = snapshot.get("corrections", {})
     sqlite_ok = sqlite_section.get("integrity_ok") is True
     fk_ok = sqlite_section.get("foreign_key_check_ok") is True
+
+    # --- Outbox consumer visibility (AGENTS.md §8) ---
+    # The producer enqueues index jobs unconditionally inside the write
+    # transaction, while the consumer loop is gated on `memory_index.enabled`.
+    # A disabled consumer is an expected absence, but a disabled consumer with
+    # a growing backlog is a degradation that must stay visible instead of
+    # being reported as a silent `ok`.
+    degradations: list[dict[str, Any]] = []
+    outbox_section["owner"] = OUTBOX_OWNER
+    outbox_section["index_worker_expected"] = bool(index_worker_expected)
+    outbox_section["stall_threshold_seconds"] = float(outbox_stall_seconds)
+    pending_count = int(outbox_section.get("pending", 0) or 0)
+    stale_count = int(outbox_section.get("stale", 0) or 0)
+    backlog_count = pending_count + stale_count
+    outbox_section["backlog"] = backlog_count
+    oldest_age = outbox_section.get("oldest_pending_age_seconds")
+    backlog_age = float(oldest_age) if oldest_age is not None else None
+    backlog_is_old = backlog_age is not None and backlog_age > float(outbox_stall_seconds)
+
+    if not index_worker_expected:
+        backlog_status = "disabled_backlog" if backlog_count else "disabled"
+    elif backlog_count == 0:
+        backlog_status = "empty"
+    elif backlog_is_old:
+        backlog_status = "stalled"
+    else:
+        backlog_status = "ok"
+    outbox_section["backlog_status"] = backlog_status
+    outbox_degraded = backlog_status in {"disabled_backlog", "stalled"}
+    outbox_section["degraded"] = outbox_degraded
+    outbox_section["disabled"] = not bool(index_worker_expected)
+
+    degradation_reason: str | None = None
+    if backlog_status == "disabled_backlog":
+        degradation_reason = (
+            "index worker disabled while the outbox still holds "
+            f"{backlog_count} job(s); vector projections cannot catch up "
+            "until the consumer is re-enabled"
+        )
+    elif backlog_status == "stalled":
+        degradation_reason = (
+            f"index worker expected but the oldest pending job is "
+            f"{backlog_age:.0f}s old (threshold {float(outbox_stall_seconds):.0f}s); "
+            "the consumer is not draining the outbox"
+        )
+    outbox_section["degradation_reason"] = degradation_reason
+    # Re-attach in case the collector produced a snapshot without the section.
+    snapshot["outbox"] = outbox_section
+    if degradation_reason is not None:
+        degradations.append(
+            {
+                "component": "outbox",
+                "owner": OUTBOX_OWNER,
+                "status": backlog_status,
+                "backlog": backlog_count,
+                "last_success_at": outbox_section.get("last_completed_at"),
+                "reason": degradation_reason,
+            }
+        )
+    snapshot["degradations"] = degradations
+
     issue_count = sum(
         int(index_section.get(key, 0) or 0)
         for key in (
@@ -1056,6 +1203,11 @@ async def _finish_health_snapshot(
     issue_count += int(correction_section.get("orphan_related_node_count", 0) or 0)
     issue_count += int(outbox_section.get("processing", 0) or 0)
     issue_count += int(outbox_section.get("failed", 0) or 0)
+    # A backlog counts as exactly one issue, not one per job: the size is
+    # already reported in `outbox.backlog`, and a five-figure backlog must not
+    # drown the other diagnostics in the aggregate counter.
+    if outbox_degraded:
+        issue_count += 1
     if vector_expected:
         vector_issue_keys = ["orphan_count"]
         vector_issue_keys.append(
@@ -1095,6 +1247,8 @@ async def health_snapshot(
     collection: Any = None,
     *,
     vector_expected: bool = True,
+    index_worker_expected: bool = True,
+    outbox_stall_seconds: float = OUTBOX_STALL_SECONDS,
 ) -> dict[str, Any]:
     """Return a JSON-serializable, read-only caller-owned health snapshot."""
     snapshot, id_sets = await _async_db_snapshot(db, workspace_path)
@@ -1103,6 +1257,8 @@ async def health_snapshot(
         id_sets,
         collection,
         vector_expected=vector_expected,
+        index_worker_expected=index_worker_expected,
+        outbox_stall_seconds=outbox_stall_seconds,
     )
 
 
@@ -1112,6 +1268,8 @@ async def health_snapshot_from_path(
     collection: Any = None,
     *,
     vector_expected: bool = True,
+    index_worker_expected: bool = True,
+    outbox_stall_seconds: float = OUTBOX_STALL_SECONDS,
 ) -> dict[str, Any]:
     """Collect health through an isolated read-only SQLite connection."""
     try:
@@ -1127,6 +1285,8 @@ async def health_snapshot_from_path(
         id_sets,
         collection,
         vector_expected=vector_expected,
+        index_worker_expected=index_worker_expected,
+        outbox_stall_seconds=outbox_stall_seconds,
     )
 
 

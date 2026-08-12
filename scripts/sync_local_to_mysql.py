@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import sqlite3
 import subprocess
+import os
 import sys
 
 SQLITE_PATH = "data/Elysium.db"

@@ -345,9 +345,12 @@ async def run_chat_stream(
                         )
                     except Exception:  # noqa: BLE001
                         RuntimeStateConflict = None
-                    if RuntimeStateConflict is not None and isinstance(
-                        e, RuntimeStateConflict
-                    ):
+                    # import 可能因插件加载时序失败；用类型名兜底识别
+                    # 双实例共享 MySQL 的合法 CAS 竞争。
+                    if (
+                        RuntimeStateConflict is not None
+                        and isinstance(e, RuntimeStateConflict)
+                    ) or type(e).__name__ == "RuntimeStateConflict":
                         # 双实例共享 MySQL 时 life_chatter.rolling_context 的
                         # CAS revision 冲突是合法竞争：另一实例推进了同一 key
                         # 的 revision。重置 _GLOBAL_RUNTIME 后下轮会重读最新
@@ -368,9 +371,12 @@ async def run_chat_stream(
                     try:
                         from plugins.life_engine.core.chatter import LifeChatter
                         LifeChatter.reset_global_runtime()
-                        if RuntimeStateConflict is None or not isinstance(
-                            e, RuntimeStateConflict
-                        ):
+                        is_runtime_conflict = (
+                            (RuntimeStateConflict is not None
+                             and isinstance(e, RuntimeStateConflict))
+                            or type(e).__name__ == "RuntimeStateConflict"
+                        )
+                        if not is_runtime_conflict:
                             logger.warning(
                                 f"[驱动器] stream={stream_id[:8]}, "
                                 f"执行出错 ({type(e).__name__})，已重置 _GLOBAL_RUNTIME，下轮将从头重建"
