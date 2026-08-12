@@ -411,7 +411,25 @@ class Bot:
 
         from src.core.utils.schema_sync import enforce_database_schema_consistency
 
-        sync_stats = await enforce_database_schema_consistency()
+        # frp 隧道对快速并发连接偶发瞬断（2013 Lost connection），
+        # schema 对齐是启动期的长事务，撞上瞬断会整体失败；加重试。
+        sync_stats = None
+        last_error: Exception | None = None
+        for _attempt in range(3):
+            try:
+                sync_stats = await enforce_database_schema_consistency()
+                break
+            except Exception as exc:  # noqa: BLE001 - retry transient DB outage
+                last_error = exc
+                if self.logger:
+                    self.logger.warning(
+                        f"数据库结构对齐失败，重试中: {type(exc).__name__}: {exc}"
+                    )
+                await asyncio.sleep(2.0 * (_attempt + 1))
+        if sync_stats is None:
+            raise last_error or RuntimeError(
+                "数据库结构对齐失败（重试耗尽）"
+            )
         if self.logger:
             self.logger.debug(
                 "数据库结构已对齐: "
