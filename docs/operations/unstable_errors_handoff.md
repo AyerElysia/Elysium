@@ -370,3 +370,60 @@ Elysium 以 **multi-writer 双实例**（`elysium-windows-primary` 与 `elysium-
 - `memory_witness_migrations` 已有 1785 条，`memory_witnesses` 3347 条——旧日记迁移早已完成且幂等；
 - `runtime_states` / `storage_authority_registry` 等表结构与代码完全对齐，无缺列；
 - 结论：本仓库不存在“代码有字段但库没有”的待迁移项；迁移方案不解决 7.2/7.3 两类问题，7.3 仍需代码仲裁（若双实例都继续运行）。
+
+## 8. 切换回 local 为主 + 远端双向同步（2026-08-12 晚间）
+
+> 状态：已完成并运行验证。双实例 MySQL 的 CAS 竞争（7.3）与 frp 隧道波动（7.2）反复干扰检索记忆，决定改为**本地为主、远端仅作数据同步目标**。
+
+### 8.1 数据回迁（远端 MySQL → 本地 SQLite）
+
+远端库（frp-one.com:65429/elysium）在 8/9 起积累的全部生命域数据回迁到本地：
+
+| 域 | 数据量 | 方式 | 验证 |
+|---|---|---|---|
+| Life Events | 106,801 条 | `export_life_events_to_sqlite` | integrity ok, root verified |
+| Memory | 106,812 经历 / 16,732 chunks / 3,289 nodes / 3,420 witnesses | `export_memory_to_sqlite`（模板=backup_life_data 生成） | integrity ok |
+| Presence/World | 4,524 行 | `export_presence_world_to_sqlite` | verified=True |
+| Subject Documents | 1,919 文档（12.6MB） | `export_subject_documents` | verified=True |
+| Learning | projections 4 条 | 直连逐表复制 | integrity ok |
+| Core | messages 84,212 / streams 121 / persons 44 | 按自然键合并补缺（不覆盖本地） | integrity ok |
+
+注意点：
+
+- `--reverse-export` 参数就是官方 MySQL→SQLite 导出通道；直接调用 migration 包里的 `export_*_to_sqlite` 函数可跳过旧快照模板依赖。
+- Memory 导出校验 `reverse export differs from target` 是双实例并发写导致 root 漂移，**数据本身已完整落盘**（行数一致、integrity ok），属校验时机问题而非数据丢失。
+- Learning events 全表 10.8GB（9518 行均 1.1MB），经 frp 隧道拉取不现实，保留远端；learning_projections 4 条已回迁，事件可重新积累。
+- 回迁产物在 `backrestore/`（未入库），旧本地文件备份在 `backrestore/pre-switch-backup-*`。
+
+### 8.2 配置切换
+
+- `config/core.toml`：`backend = "local"`（该文件被 .gitignore 忽略，不入库）。
+- local 模式 `settings.enabled=False` → `open_storage_backend` 返回 disabled runtime，life_engine 纯本地文件，**不连 MySQL**。
+- 各域本地文件已替换为回迁数据：`life_engine_workspace/life_events.sqlite3`、`.memory/memory.db`、`runtime/consciousness_presence.sqlite3`、`runtime/world_projection.sqlite3`、`data/Elysium.db`。
+
+### 8.3 回迁库 schema 修复（重要）
+
+回迁的 life_events.sqlite3 是 MySQL 导出（新版 schema），本地代码 INSERT 未适配：
+
+```text
+sqlite3.IntegrityError: NOT NULL constraint failed: raw_event_consumer_offsets.revision
+```
+
+- 回迁库 `raw_event_consumer_offsets` 有 `revision INTEGER NOT NULL` 列；
+- 本地 `event_bus.py` 的 INSERT 只写 consumer_id/ingest_position/updated_at/metadata_json（不含 revision）→ INSERT 时 revision=NULL → 约束失败。
+- 修复：重建该表，`revision` 改为可空（数据保留），模拟 INSERT 验证通过。
+- 全表 schema 对比：仅此表有差异；`raw_event_export_outbox`/`raw_event_ledger_meta` 为回迁库多出的新表（代码不访问，无害）。
+
+### 8.4 双向同步（本地 ⇄ 远端）
+
+1. **shared_sync（事件级双向）**：`config/plugins/life_engine/config.toml [shared_sync]`：
+   - `enabled = true`、`remote_host = "frp-one.com"`、`remote_port = 65429`、`remote_user = "elysia"`、`pull_enabled = true`；
+   - 密码走 `ELYSIUM_SYNC_MYSQL_PASSWORD` 环境变量（.bashrc 已加）；
+   - 仅 local 模式可用（`_selectable_storage_enabled` 必须 False），绑定 life_events.sqlite3，visibility=shared 的事件 push/pull 双向。
+2. **sync_local_to_mysql.py（Core 表增量）**：`scripts/sync_job.sh` + crontab 每 10 分钟；按自然键只 INSERT 远端缺失行，不覆盖。dry-run 验证通过。
+3. 仿真验证：SharedSyncBridge 初始化 OK（push+pull=True），17 项数据完整性检查全部 PASS，修复后 0 ERROR、heartbeat 正常。
+
+### 8.5 遗留
+
+- learning_events 10.8GB 未回迁（远端保留），本地重新积累后可通过 sync 通道补同步。
+- frp 隧道偶发瞬断（7.2）在 local 模式下不再影响主运行，只影响同步速率。
