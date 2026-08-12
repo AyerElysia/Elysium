@@ -254,6 +254,68 @@ async def test_stream_history_to_live_boundary_is_complete_and_resumable(
 
 
 @pytest.mark.asyncio
+async def test_stream_heartbeat_survives_busy_tail(tmp_path: Path) -> None:
+    """尾部持续有新事件（has_more 恒 True）时，heartbeat 仍按时发出。
+
+    复现真实缺陷：事件库尾部持续产生不匹配过滤的事件（如 heartbeat），
+    query 的 probe 恒返回结果 → has_more 恒为 True → stream 循环永不执行
+    heartbeat 分支 → 长连接读超时误判断线。修复后 heartbeat 独立于
+    has_more，只要超过间隔没有产出事件就必须发心跳帧。
+    """
+
+    class BusyStore:
+        """read_since 恒返回一条不匹配事件（has_more 恒 True），永不 exhausted。"""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def read_since(self, sequence: int, *, limit: int | None = None):
+            del sequence, limit
+            self.calls += 1
+            return [
+                _life_event(
+                    f"heartbeat-{self.calls}",
+                    event_type="life_engine.heartbeat",
+                    stream_id="other-stream",
+                )
+            ]
+
+        async def read_tail(self, limit: int = 100):
+            del limit
+            return []
+
+    context, auth, _ = _context(tmp_path, RawEventStore(tmp_path / "unused"))
+    service = EventQueryService(
+        node_id="node-events",
+        codec=context.codec,
+        store_provider=lambda: BusyStore(),  # type: ignore[return-value]
+        poll_interval=0.01,
+        heartbeat_interval=0.05,
+    )
+    secret = _register_service(auth, actor_id="actor-heartbeat")
+    session, _, _ = auth.issue_session_from_credential(
+        credential=secret,
+        audience=PLATFORM_SERVICE_AUDIENCE,
+        codec=context.codec,
+        access_ttl=timedelta(minutes=5),
+        refresh_ttl=timedelta(hours=1),
+    )
+    stream = service.stream(
+        cursor=None,
+        event_filter=EventFilter(event_type=("chat.message",)),
+        session=session,
+    )
+    try:
+        # 事件流里的 heartbeat 事件不匹配 chat.message 过滤 → 不会 yield；
+        # 但 has_more 恒 True 时也必须按时产出 heartbeat 注释帧。
+        frame = await asyncio.wait_for(anext(stream), timeout=1)
+        assert frame.startswith(": heartbeat")
+    finally:
+        await stream.aclose()
+        auth.close()
+
+
+@pytest.mark.asyncio
 async def test_history_gap_maps_to_safe_recovery_cursor(tmp_path: Path) -> None:
     class GapStore:
         async def read_since(self, sequence: int, *, limit: int | None = None):

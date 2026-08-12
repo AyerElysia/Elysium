@@ -219,13 +219,18 @@ class EventQueryService:
                 )
                 last_emission = asyncio.get_running_loop().time()
             position = next_position
-            if page.has_more:
-                await asyncio.sleep(0)
-                continue
+            # heartbeat 独立于 has_more：即使尾部持续有新事件导致
+            # has_more 恒为 True（query 只在读到空页/耗尽扫描预算时才为 False），
+            # 只要超过 heartbeat 间隔没有 yield 事件，就必须发出心跳注释帧，
+            # 否则长连接的读超时会误判断线（见运行观察：chat.message 过滤下
+            # 尾部 heartbeat 事件每 60s 引发一次 ReadTimeout）。
             elapsed = asyncio.get_running_loop().time() - last_emission
             if elapsed >= self._heartbeat_interval:
                 yield ": heartbeat\n\n"
                 last_emission = asyncio.get_running_loop().time()
+            if page.has_more:
+                await asyncio.sleep(0)
+                continue
             await asyncio.sleep(self._poll_interval)
 
     def error_frame(self, failure: EventQueryFailure) -> str:
