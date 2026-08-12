@@ -4,16 +4,27 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from typing import Annotated, Any, ClassVar
+from urllib.parse import quote
 
 from src.app.plugin_system.api import log_api
 from src.app.plugin_system.base import BaseTool
 
 from ..tools.bounded_projection import project_bounded_items
-from .boundary import MemoryBoundaryRepository
+from .boundary import (
+    MemoryBoundaryManifest,
+    MemoryBoundaryRepository,
+    MemoryBoundarySegment,
+    memory_boundary_uri,
+)
 from .boundary_resolver import MemoryBoundaryResolver
+from .continuity_index import (
+    build_continuity_memory_index_health,
+    diagnose_continuity_memory_index,
+)
+from .continuity_stewardship import ContinuityMemoryStewardship
 
 logger = log_api.get_logger("life_engine.memory_boundary_tools")
 
@@ -327,6 +338,10 @@ def _segment_from_subject_range(
     )
 
 
+# Compatibility quarantine only.  These legacy classes are intentionally not
+# exported or registered; the formal authoring/inspection/decision surface is
+# nucleus_memory_continuity_review.  Keeping the class bodies importable avoids
+# breaking old serialized references while preventing a second authority path.
 class LifeCreateMemoryBoundaryTool(BaseTool):
     """Create or revise one complete immutable long-memory boundary."""
 

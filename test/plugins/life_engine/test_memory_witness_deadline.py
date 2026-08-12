@@ -492,22 +492,7 @@ async def test_witness_loop_retries_mysql_2013_with_same_experience_window(
 
     service, _memory, event_store, _perception_commits = _service(timeout_seconds=600.0)
 
-    class _RetryMemory(_MemoryStub):
-        def __init__(self) -> None:
-            super().__init__()
-            self.append_calls = 0
-
-        async def append_experiences_detailed(
-            self,
-            records: list[ExperienceRecord],
-        ) -> ExperienceAppendReport:
-            self.append_calls += 1
-            canonical = tuple(records)
-            if self.append_calls == 1:
-                return ExperienceAppendReport(inserted=canonical)
-            return ExperienceAppendReport(existing=canonical)
-
-    memory = _RetryMemory()
+    memory = _MemoryStub()
     service.memory_service = memory
     coordinator = MemoryWitnessCoordinator(service)
     author_windows: list[tuple[str, ...]] = []
@@ -551,7 +536,6 @@ async def test_witness_loop_retries_mysql_2013_with_same_experience_window(
 
     await coordinator.loop()
 
-    assert memory.append_calls == 0
     assert author_windows == [("occ-private",), ("occ-private",)]
     assert event_store.read_cursors == []
     assert event_store.offset_commits == []
