@@ -520,7 +520,9 @@ class LifeMemoryService:
                 # real storage errors, never on a healthy foreign ownership.
                 if not self._selectable_storage_enabled:
                     raise
-                logger.warning(
+                # 多节点部署的正常形态：非 owner 节点降级只读投影（健康的外国所有权，
+                # 非故障，见上方契约注释）→ INFO，不刷 WARNING。
+                logger.info(
                     "workspace projection is owned by another instance; "
                     "degrading to read-only projection for this node: "
                     f"owner_id={getattr(binding, 'owner_id', None)!r} "
@@ -1225,7 +1227,8 @@ class LifeMemoryService:
             # Absence in a scan is not deletion evidence. A second workspace,
             # a partial mount or a transient read failure must never create
             # authority-looking tombstones or erase a searchable projection.
-            logger.warning(
+            # 这是设计行为（保守保留，防误删权威文档），不是故障 → INFO。
+            logger.info(
                 "Memory workspace recovery retained scan-absent documents: "
                 f"count={len(missing_node_ids)}; explicit deletion evidence required"
             )

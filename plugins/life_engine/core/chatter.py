@@ -3389,6 +3389,7 @@ class LifeChatter(BaseChatter):
             "- `nucleus_manage_todo`：创建 TODO。\n"
             "- `inner_dialogue`：把念头沉进心里慢慢想（异步；想通了会自己浮回）。\n"
             "- `tool-inspect_media`：把图片/视频/语音提升为原生多模态输入。\n"
+            "- **工具名不带 `tool-` 前缀**（`tool-` 前缀仅限 `tool-inspect_media` 等平台工具）；普通工具直接使用 `nucleus_bash`、`nucleus_grep_file` 这类名字，不要加前缀。\n"
             "- 不要把 `reason`、`thought` 等元信息写进 `content`。"
         )
 

@@ -47,6 +47,94 @@ def _install_fake_streams(monkeypatch, streams: list[object], info_by_stream: di
     monkeypatch.setattr("src.core.utils.user_query_helper.get_user_query_helper", lambda: _FakeUserQueryHelper())
 
 
+class _FakeEventStore:
+    def __init__(self, events: list[object]) -> None:
+        self._events = events
+
+    async def read_tail(self, limit: int = 100) -> list[object]:
+        del limit
+        return self._events
+
+
+class _FakeLifeService:
+    def __init__(self, events: list[object]) -> None:
+        self._store = _FakeEventStore(events)
+
+    def _get_life_event_store(self) -> _FakeEventStore:
+        return self._store
+
+
+def _chat_event(stream_id: str, source: str, timestamp: str, sender_id: str) -> object:
+    return SimpleNamespace(
+        stream_id=stream_id,
+        channel="chat",
+        source=source,
+        timestamp=timestamp,
+        metadata={"chat_type": "private", "sender_id": sender_id},
+    )
+
+
+async def test_send_targets_recover_from_event_ledger_after_restart(monkeypatch) -> None:
+    """进程重启后内存流为空时，从事件账本恢复最近私聊流（飞书/Ayla 都可达）。
+
+    真实缺陷（2026-08-12）：重启后飞书流未重建，心跳「你可以触达的人和地方」
+    只剩 ayla 流，爱莉想主动找飞书对话却找不到流。
+    """
+    _install_fake_streams(monkeypatch, [], {})  # 重启后内存流为空
+    monkeypatch.setattr("src.core.utils.user_query_helper.get_user_query_helper", lambda: _FakeUserQueryHelper())
+    from datetime import UTC, datetime, timedelta
+
+    recent = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+    old = (datetime.now(UTC) - timedelta(hours=30)).isoformat()
+    events = [
+        _chat_event("f" * 64, "feishu", recent, "person_ayer"),
+        _chat_event("g" * 64, "feishu", old, "person_ayer"),  # 超窗：应被过滤
+    ]
+    monkeypatch.setattr(
+        "plugins.life_engine.service.registry.get_life_engine_service",
+        lambda: _FakeLifeService(events),
+    )
+
+    from plugins.life_engine.core.send_targets import list_recent_send_targets
+
+    targets = await list_recent_send_targets()
+    stream_ids = {target.stream_id for target in targets}
+    assert "f" * 64 in stream_ids, "重启后应从事件账本恢复最近飞书流"
+    assert "g" * 64 not in stream_ids, "超窗事件不应恢复"
+    feishu = [t for t in targets if t.stream_id == "f" * 64][0]
+    assert feishu.platform == "feishu"
+    assert feishu.chat_type == "private"
+    assert feishu.target_user_id == "2665253325"
+    assert feishu.display_name == "AyerElysia"
+
+
+async def test_send_targets_event_recovery_skips_when_memory_has_stream(monkeypatch) -> None:
+    """内存流已有时，事件兜底不重复添加同 stream。"""
+    now = time.time()
+    _install_fake_streams(
+        monkeypatch,
+        [
+            SimpleNamespace(
+                stream_id="b" * 64,
+                platform="qq",
+                chat_type="private",
+                stream_name="AyerElysia",
+                last_active_time=now,
+            )
+        ],
+        {"b" * 64: {"person_id": "person_ayer"}},
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.service.registry.get_life_engine_service",
+        lambda: _FakeLifeService([]),
+    )
+
+    from plugins.life_engine.core.send_targets import list_recent_send_targets
+
+    targets = await list_recent_send_targets()
+    assert len([t for t in targets if t.stream_id == "b" * 64]) == 1
+
+
 async def test_send_target_prompt_lists_recent_current_group_and_private(monkeypatch) -> None:
     now = time.time()
     group_stream = SimpleNamespace(

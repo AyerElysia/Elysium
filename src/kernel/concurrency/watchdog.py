@@ -114,8 +114,12 @@ class WatchDog:
                     tick_delta = (now - self._last_tick_time).total_seconds()
                     expected_interval = self._tick_interval
 
-                    # 检查 tick 间隔是否异常
-                    if tick_delta > expected_interval * 2:
+                    # 检查 tick 间隔是否异常。
+                    # 阈值 3 倍（此前 2 倍）：WatchDog 独立线程用 time.sleep 同步
+                    # 循环，主线程心跳工具轮等同步 IO（MySQL/文件）短暂占用 GIL 时
+                    # 线程调度会被延迟 1~2s——这是正常抖动（实测 2.1~2.9s 偶发，
+                    # 看门狗功能不受影响），仅真实卡顿（>=3 倍间隔）才 WARNING。
+                    if tick_delta > expected_interval * 3:
                         logger.warning(
                             f"WatchDog tick 间隔异常: {tick_delta:.2f}s "
                             f"(预期 {expected_interval}s)",

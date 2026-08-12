@@ -324,6 +324,20 @@ async def run_tool_call(
     for call in calls:
         args = dict(call.args) if isinstance(call.args, dict) else {}
         usable_cls = usable_map.get(call.name)
+        # 工具名双向容错：BaseTool 注册名统一带 `tool-` 前缀（tool-{tool_name}），
+        # 平台特殊工具（tool-inspect_media / tool-platform_action）也带前缀；
+        # 模型容易在裸名（nucleus_bash）与带前缀名（tool-nucleus_bash）之间记混。
+        # 直接命中失败时，缺前缀则补前缀、多前缀则剥前缀，再查一次（真实日志：
+        # tool-nucleus_grep_file / tool-nucleus_bash → "未知的工具"，2026-08-12）。
+        if usable_cls is None:
+            raw_name = str(call.name)
+            if raw_name.startswith("tool-"):
+                alt_name = raw_name[len("tool-"):]
+            else:
+                alt_name = f"tool-{raw_name}"
+            usable_cls = usable_map.get(alt_name)
+            if usable_cls is not None:
+                logger.warning(f"工具名前缀容错: {call.name} → {alt_name}")
         prepared_call = _PreparedCall(call=call)
 
         if usable_cls is None:

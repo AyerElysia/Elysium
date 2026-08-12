@@ -44,6 +44,26 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
         "action-send_emoji_meme",
         "tool-platform_action",
         "tool-nucleus_minecraft",
+        # 基础能力（文件/终端/屏幕/任务/日程/联网/子代理/媒体）：
+        # 与 chatter._build_primary_tool_guide 静态文案对齐——文案列出的工具必须
+        # 在 chat manifest 里，否则模型照文案调用会被过滤成"未知的工具"
+        # （真实日志：tool-nucleus_grep_file / tool-nucleus_bash，2026-08-12）。
+        "tool-inspect_media",
+        "tool-life_run_agent",
+        "tool-nucleus_bash",
+        "tool-nucleus_browser_fetch",
+        "tool-nucleus_download",
+        "tool-nucleus_edit_file",
+        "tool-nucleus_grep_file",
+        "tool-nucleus_list_files",
+        "tool-nucleus_list_todos",
+        "tool-nucleus_manage_todo",
+        "tool-nucleus_mkdir",
+        "tool-nucleus_read_file",
+        "tool-nucleus_run_agent",
+        "tool-nucleus_view_screen",
+        "tool-nucleus_web_search",
+        "tool-nucleus_write_file",
     ],
     # 我的世界意识：具身交互，纯视觉→键鼠
     "minecraft": [

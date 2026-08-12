@@ -178,3 +178,65 @@ async def test_run_tool_call_preserves_technical_outcome_without_breaking_tuple_
     assert isinstance(results[0], ToolCallExecutionResult)
     assert results[0].technical_outcome == "delivery_unknown"
     assert response.payloads[0].content[0].value == "执行失败: 投递状态未知"
+
+
+async def test_tool_call_name_prefix_fallback_accepts_bare_name() -> None:
+    """工具名前缀容错：模型用裸名调用（注册名是 tool-{name}）也能命中执行。
+
+    真实缺陷（2026-08-12）：BaseTool 注册名统一带 tool- 前缀，模型记混时用
+    裸名/前缀名调用都会报"未知的工具"；容错做双向归一（剥前缀/补前缀再查）。
+    """
+    executed: list[str] = []
+
+    class GuardedTool(BaseTool):
+        tool_name = "guarded_op"
+        tool_description = "guarded"
+
+        async def execute(self) -> tuple[bool, str]:
+            executed.append("guarded_op")
+            return True, "guarded-ok"
+
+    registry = ToolRegistry()
+    registry.register(GuardedTool)  # 注册 key = "tool-guarded_op"（BaseTool schema 名）
+    response = _FakeResponse()
+
+    # 裸名调用（缺少 tool- 前缀）→ 容错补前缀命中
+    result = await run_tool_call(
+        calls=[ToolCall(id="1", name="guarded_op", args={})],
+        response=response,
+        usable_map=registry,
+        trigger_msg=SimpleNamespace(message_id="m1"),
+        plugin=MagicMock(),
+        stream_id="s1",
+    )
+
+    assert result == [(True, True)]
+    assert executed == ["guarded_op"]
+    assert response.payloads[0].content[0].value == "guarded-ok"
+
+
+async def test_tool_call_name_prefix_fallback_accepts_prefixed_name() -> None:
+    """工具名前缀容错：带 tool- 前缀的正常调用不受影响（直接命中）。"""
+    registry = ToolRegistry()
+
+    class PrefixedTool(BaseTool):
+        tool_name = "prefixed_op"
+        tool_description = "prefixed"
+
+        async def execute(self) -> tuple[bool, str]:
+            return True, "prefixed-ok"
+
+    registry.register(PrefixedTool)
+    response = _FakeResponse()
+
+    result = await run_tool_call(
+        calls=[ToolCall(id="1", name="tool-prefixed_op", args={})],
+        response=response,
+        usable_map=registry,
+        trigger_msg=SimpleNamespace(message_id="m1"),
+        plugin=MagicMock(),
+        stream_id="s1",
+    )
+
+    assert result == [(True, True)]
+    assert response.payloads[0].content[0].value == "prefixed-ok"

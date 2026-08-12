@@ -12,6 +12,7 @@ from plugins.life_engine.service.event_bus import (
     RawEventGapError,
     RawEventStore,
 )
+from plugins.life_engine.storage.contracts import StorageRuntimeClosed
 from src.app.api.v1.auth_store import AuthStore
 from src.app.api.v1.events import EventQueryFailure, EventQueryService
 from src.app.api.v1.policy import PLATFORM_SERVICE_AUDIENCE
@@ -310,6 +311,100 @@ async def test_stream_heartbeat_survives_busy_tail(tmp_path: Path) -> None:
         # 但 has_more 恒 True 时也必须按时产出 heartbeat 注释帧。
         frame = await asyncio.wait_for(anext(stream), timeout=1)
         assert frame.startswith(": heartbeat")
+    finally:
+        await stream.aclose()
+        auth.close()
+
+
+@pytest.mark.asyncio
+async def test_stream_ends_gracefully_on_storage_closed(tmp_path: Path) -> None:
+    """存储引擎已关闭（进程关闭窗口）时，订阅流优雅结束而非抛 ASGI Exception Group。
+
+    复现真实缺陷：Elysium 关闭时 SSE 订阅仍在查询，read_since 抛
+    StorageRuntimeClosed → stream 生成器把它抛成 unhandled TaskGroup error
+    刷到控制台。修复后捕获并 return（生成器结束，anext 抛 StopAsyncIteration）。
+    """
+
+    class ClosingStore:
+        async def read_since(self, sequence: int, *, limit: int | None = None):
+            del sequence, limit
+            raise StorageRuntimeClosed("storage runtime is closed")
+
+        async def read_tail(self, limit: int = 100):
+            del limit
+            return []
+
+    context, auth, _ = _context(tmp_path, RawEventStore(tmp_path / "unused"))
+    service = EventQueryService(
+        node_id="node-events",
+        codec=context.codec,
+        store_provider=lambda: ClosingStore(),  # type: ignore[return-value]
+    )
+    secret = _register_service(auth, actor_id="actor-closing")
+    session, _, _ = auth.issue_session_from_credential(
+        credential=secret,
+        audience=PLATFORM_SERVICE_AUDIENCE,
+        codec=context.codec,
+        access_ttl=timedelta(minutes=5),
+        refresh_ttl=timedelta(hours=1),
+    )
+    stream = service.stream(
+        cursor=None,
+        event_filter=EventFilter(),
+        session=session,
+    )
+    try:
+        # 优雅结束：生成器 return → StopAsyncIteration（不是 StorageRuntimeClosed 上抛）
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(anext(stream), timeout=1)
+    finally:
+        await stream.aclose()
+        auth.close()
+
+
+@pytest.mark.asyncio
+async def test_stream_ends_gracefully_on_alien_storage_closed_class(tmp_path: Path) -> None:
+    """双模块路径下的 StorageRuntimeClosed 也要优雅结束（按异常名+消息识别）。
+
+    实测（2026-08-12）：运行进程里 storage.contracts 以 life_engine.*（插件目录
+    进 sys.path）加载，与 src 侧 plugins.life_engine.* 是两个类对象，except
+    StorageRuntimeClosed 匹配不到；兜底按类名+消息识别关闭竞态。
+    """
+
+    class StorageRuntimeClosed(Exception):
+        """模拟另一模块路径的同名异常类（与真实类同名但非同一类对象）。"""
+
+    class ClosingAlienStore:
+        async def read_since(self, sequence: int, *, limit: int | None = None):
+            del sequence, limit
+            raise StorageRuntimeClosed("storage runtime is closed")
+
+        async def read_tail(self, limit: int = 100):
+            del limit
+            return []
+
+    context, auth, _ = _context(tmp_path, RawEventStore(tmp_path / "unused"))
+    service = EventQueryService(
+        node_id="node-events",
+        codec=context.codec,
+        store_provider=lambda: ClosingAlienStore(),  # type: ignore[return-value]
+    )
+    secret = _register_service(auth, actor_id="actor-alien-closing")
+    session, _, _ = auth.issue_session_from_credential(
+        credential=secret,
+        audience=PLATFORM_SERVICE_AUDIENCE,
+        codec=context.codec,
+        access_ttl=timedelta(minutes=5),
+        refresh_ttl=timedelta(hours=1),
+    )
+    stream = service.stream(
+        cursor=None,
+        event_filter=EventFilter(),
+        session=session,
+    )
+    try:
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(anext(stream), timeout=1)
     finally:
         await stream.aclose()
         auth.close()

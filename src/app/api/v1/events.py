@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -14,6 +15,7 @@ from plugins.life_engine.service.event_bus import (
     LifeEvent,
     RawEventGapError,
 )
+from plugins.life_engine.storage.contracts import StorageRuntimeClosed
 
 from .auth_store import SessionRecord
 from .schemas.events import (
@@ -31,6 +33,8 @@ from .tokens import SignedValueCodec, SignedValueError
 EVENT_CURSOR_LEDGER = "life-events-v1"
 _MAX_SCAN_PER_PAGE = 10_000
 _SCAN_BATCH = 500
+
+logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -201,12 +205,33 @@ class EventQueryService:
         position = self._decode_cursor(cursor)
         last_emission = asyncio.get_running_loop().time()
         while True:
-            page = await self.query(
-                cursor=self._encode_cursor(position),
-                limit=500,
-                event_filter=event_filter,
-                session=session,
-            )
+            try:
+                page = await self.query(
+                    cursor=self._encode_cursor(position),
+                    limit=500,
+                    event_filter=event_filter,
+                    session=session,
+                )
+            except StorageRuntimeClosed:
+                # 进程关闭窗口的正常竞态：存储引擎已关闭，订阅流不再有可读数据。
+                # 优雅结束流（生成器 return），而不是把 StorageRuntimeClosed
+                # 抛成 ASGI Exception Group 刷到控制台（关闭时的常见噪音）。
+                logger.info("storage runtime closed during stream, ending gracefully")
+                return
+            except Exception as exc:
+                # 双模块路径兜底（实测 2026-08-12）：运行进程里 storage.contracts
+                # 以 life_engine.storage.contracts（插件目录进 sys.path）加载，
+                # 与 src 侧 plugins.life_engine.storage.contracts 是两个类对象，
+                # 上面的 except 匹配不到 → 按异常名+消息识别关闭竞态并优雅结束。
+                if (
+                    type(exc).__name__ == "StorageRuntimeClosed"
+                    and "storage runtime is closed" in str(exc)
+                ):
+                    logger.info(
+                        "storage runtime closed during stream, ending gracefully"
+                    )
+                    return
+                raise
             next_position = self._decode_cursor(page.next_cursor)
             for visible_index, event in enumerate(page.events, start=1):
                 event_position = event.sequence

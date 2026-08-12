@@ -121,6 +121,93 @@ async def _stream_to_target(stream: Any, *, current_stream_id: str) -> SendTarge
     )
 
 
+def _event_timestamp_epoch(event: Any) -> float:
+    """LifeEvent.timestamp（ISO 字符串）→ epoch 秒；解析失败返回 0。"""
+    raw = str(getattr(event, "timestamp", "") or "")
+    if not raw:
+        return 0.0
+    try:
+        from datetime import datetime, timezone
+
+        normalized = raw.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except Exception:
+        return 0.0
+
+
+async def _recover_targets_from_event_ledger(
+    *,
+    limit: int = 8,
+    active_window_hours: float = 24.0,
+) -> list[SendTarget]:
+    """从 Life Event 账本恢复最近活跃流（进程重启后内存流缺失时的兜底）。
+
+    真实场景（2026-08-12）：重启后飞书流未重建（stream_manager 内存 _streams 为空），
+    心跳「你可以触达的人和地方」只剩内存里活着的 ayla 流——想主动找飞书对话却
+    找不到流。事件账本是权威历史，按 stream_id 恢复最近聊过的私聊流。
+    """
+    try:
+        from ..service.registry import get_life_engine_service
+
+        service = get_life_engine_service()
+        if service is None:
+            return []
+        events = await service._get_life_event_store().read_tail(limit=500)
+    except Exception:
+        return []
+
+    now = time.time()
+    cutoff = now - max(0.1, float(active_window_hours or 24.0)) * 3600.0
+    best_by_stream: dict[str, Any] = {}
+    for event in events:
+        stream_id = str(getattr(event, "stream_id", "") or "").strip()
+        if not stream_id or stream_id.startswith("life_engine"):
+            continue
+        if str(getattr(event, "channel", "") or "") != "chat":
+            continue
+        event_ts = _event_timestamp_epoch(event)
+        if event_ts <= 0.0 or event_ts < cutoff:
+            continue
+        prev = best_by_stream.get(stream_id)
+        if prev is None or _event_timestamp_epoch(prev) < event_ts:
+            best_by_stream[stream_id] = event
+
+    targets: list[SendTarget] = []
+    for stream_id, event in best_by_stream.items():
+        metadata = getattr(event, "metadata", None) or {}
+        chat_type = str(metadata.get("chat_type") or "").lower()
+        platform = str(getattr(event, "source", "") or "").strip()
+        if not platform or chat_type not in {"private", "group"}:
+            continue
+        event_ts = _event_timestamp_epoch(event)
+        if chat_type == "private":
+            person_id = str(metadata.get("sender_id") or "").strip()
+            target_user_id, target_user_name = await _private_user_for_person_id(
+                platform, person_id
+            )
+            if not target_user_id:
+                continue
+            display_name = target_user_name or f"私聊 {target_user_id}"
+            targets.append(
+                SendTarget(
+                    target_key="",
+                    stream_id=stream_id,
+                    platform=platform,
+                    chat_type=chat_type,
+                    display_name=display_name,
+                    target_user_id=target_user_id,
+                    target_user_name=target_user_name,
+                    last_active_time=event_ts,
+                )
+            )
+        # 群聊：事件缺少 group_id/name 完整信息，恢复留给内存流路径（不硬造占位）
+    targets.sort(key=lambda item: -float(item.last_active_time or 0.0))
+    return targets[: max(1, int(limit or 8))]
+
+
 async def list_recent_send_targets(
     *,
     current_stream_id: str = "",
@@ -132,7 +219,7 @@ async def list_recent_send_targets(
 
         streams = list(getattr(get_stream_manager(), "_streams", {}).values())
     except Exception:
-        return []
+        streams = []
 
     now = time.time()
     cutoff = now - max(0.1, float(active_window_hours or 24.0)) * 3600.0
@@ -146,6 +233,18 @@ async def list_recent_send_targets(
         ):
             continue
         targets.append(target)
+
+    # 事件账本兜底：进程重启后内存流缺失的最近流（如飞书）从这里恢复，
+    # 保证心跳「你可以触达的人和地方」不因重启而只剩单个流。
+    recovered = await _recover_targets_from_event_ledger(
+        limit=limit,
+        active_window_hours=active_window_hours,
+    )
+    known_streams = {target.stream_id for target in targets}
+    for recovered_target in recovered:
+        if recovered_target.stream_id not in known_streams:
+            targets.append(recovered_target)
+            known_streams.add(recovered_target.stream_id)
 
     targets.sort(key=lambda item: (not item.is_current, -float(item.last_active_time or 0.0)))
     targets = targets[: max(1, int(limit or 8))]

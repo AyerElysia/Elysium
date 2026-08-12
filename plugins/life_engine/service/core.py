@@ -4226,6 +4226,12 @@ class LifeEngineService(BaseService):
             self._state.pending_event_count = len(self._pending_events)
             if direction == "received":
                 self._state.last_external_message_at = event.timestamp
+                self._state.last_external_stream_id = str(
+                    getattr(event, "stream_id", "") or ""
+                )
+                self._state.last_external_source = str(
+                    getattr(event, "source", "") or ""
+                )
                 unlocked_self_pause = self._clear_self_pause_state()
 
                 # 外部消息解锁休息时，重置连续休息计数
@@ -7312,16 +7318,35 @@ class LifeEngineService(BaseService):
 
         if minutes_since_external is None:
             external_activity = "暂无外部消息记录"
-        elif minutes_since_external <= 5:
-            external_activity = f"外界非常活跃（{minutes_since_external}分钟前有消息）"
-        elif minutes_since_external <= 15:
-            external_activity = f"外界较活跃（{minutes_since_external}分钟前有消息）"
-        elif minutes_since_external <= 30:
-            external_activity = (
-                f"外界有一段时间安静了（{minutes_since_external}分钟前有消息）"
-            )
         else:
-            external_activity = f"外界长时间沉默（{minutes_since_external}分钟无消息）"
+            _external_where = ""
+            _external_stream = str(
+                self._state.last_external_stream_id or ""
+            ).strip()
+            _external_source = str(self._state.last_external_source or "").strip()
+            if _external_stream:
+                _external_where = (
+                    f"（来源 {_external_source or '未知平台'}，"
+                    f"流 {_external_stream[:8]}…）"
+                )
+            if minutes_since_external <= 5:
+                external_activity = (
+                    f"外界非常活跃（{minutes_since_external}分钟前有消息{_external_where}）"
+                )
+            elif minutes_since_external <= 15:
+                external_activity = (
+                    f"外界较活跃（{minutes_since_external}分钟前有消息{_external_where}）"
+                )
+            elif minutes_since_external <= 30:
+                external_activity = (
+                    f"外界有一段时间安静了"
+                    f"（{minutes_since_external}分钟前有消息{_external_where}）"
+                )
+            else:
+                external_activity = (
+                    f"外界长时间沉默"
+                    f"（{minutes_since_external}分钟无消息）"
+                )
 
         period_label, suggested_activities = self._get_period_info()
 

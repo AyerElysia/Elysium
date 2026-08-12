@@ -101,6 +101,10 @@ class LifeEngineState:
     last_error: str | None = None
     # 跟踪最后一次外部消息和传话时间
     last_external_message_at: str | None = None
+    # 最后一次外部消息来自哪个流/平台（心跳只知道"X分钟前有消息"不知道是哪个流，
+    # 导致主动聊天时找不到目标流，见 send_targets 心跳段落）
+    last_external_stream_id: str = ""
+    last_external_source: str = ""
     last_tell_dfc_at: str | None = None
     tell_dfc_count: int = 0  # 本次运行期间传话总次数
     # 空闲心跳追踪：连续没有工具调用的心跳数
